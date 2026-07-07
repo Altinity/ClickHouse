@@ -41,6 +41,7 @@ namespace DB::ErrorCodes
 extern const int BAD_ARGUMENTS;
 extern const int LOGICAL_ERROR;
 extern const int LIMIT_EXCEEDED;
+extern const int DATALAKE_DATABASE_ERROR;
 }
 
 namespace DB::DataLakeStorageSetting
@@ -442,6 +443,10 @@ static bool writeMetadataFiles(
         }
     };
 
+    /// Becomes true when the catalog's commit response was lost (CommitOutcome::Unknown): the
+    /// commit may have already landed, so retrying would double-apply the mutation.
+    bool commit_outcome_unknown = false;
+
     try
     {
         for (const auto & [partition_key, delete_filename] : delete_filenames.delete_file)
@@ -545,16 +550,32 @@ static bool writeMetadataFiles(
             {
                 auto catalog_filename = path_resolver.resolveForCatalog(metadata_info.path);
                 const auto & [namespace_name, table_name] = DataLake::parseTableName(table_id.getTableName());
-                if (!catalog->updateMetadata(namespace_name, table_name, catalog_filename, new_snapshot))
+                const auto outcome = catalog->updateMetadata(namespace_name, table_name, catalog_filename, new_snapshot);
+                if (outcome == DataLake::CommitOutcome::RejectedCleanly)
                 {
                     cleanup();
                     return false;
+                }
+                if (outcome == DataLake::CommitOutcome::Unknown)
+                {
+                    commit_outcome_unknown = true;
+                    throw Exception(
+                        ErrorCodes::DATALAKE_DATABASE_ERROR,
+                        "Iceberg mutation commit for {}.{} is of unknown status after a lost response; "
+                        "the commit may have already landed, so it is not safe to retry. "
+                        "Written files are preserved and manual verification against the catalog "
+                        "is required before retrying.",
+                        namespace_name, table_name);
                 }
             }
         }
     }
     catch (...)
     {
+        if (commit_outcome_unknown)
+        {
+            throw;
+        }
         cleanup();
         throw;
     }
@@ -1417,7 +1438,8 @@ ExpireSnapshotsResult expireSnapshots(
         {
             auto catalog_filename = persistent_table_components.path_resolver.resolveForCatalog(metadata_info.path);
             const auto & [namespace_name, parsed_table_name] = DataLake::parseTableName(table_name);
-            if (!catalog->updateMetadata(namespace_name, parsed_table_name, catalog_filename, nullptr))
+            const auto outcome = catalog->updateMetadata(namespace_name, parsed_table_name, catalog_filename, nullptr);
+            if (outcome != DataLake::CommitOutcome::Committed)
             {
                 throw Exception(
                     ErrorCodes::LOGICAL_ERROR,

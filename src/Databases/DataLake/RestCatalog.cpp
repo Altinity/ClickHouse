@@ -1,10 +1,13 @@
+#include <Poco/Exception.h>
 #include <Poco/JSON/Object.h>
 #include <Poco/JSON/Stringifier.h>
 #include <Poco/Net/HTTPRequest.h>
 #include <Common/Exception.h>
+#include <Common/NetException.h>
 #include <Common/logger_useful.h>
 #include <Common/setThreadName.h>
 #include <Common/CurrentThread.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergWrites.h>
 #include <mutex>
 #include <chrono>
@@ -41,6 +44,7 @@
 #include <Poco/JSON/Parser.h>
 #include <Poco/Net/HTTPClientSession.h>
 #include <Poco/Net/HTTPResponse.h>
+#include <Poco/Net/NetException.h>
 #include <Poco/Net/HTTPSClientSession.h>
 #include <Poco/Net/SSLManager.h>
 #include <Poco/StreamCopier.h>
@@ -1170,7 +1174,7 @@ void RestCatalog::createTable(const String & namespace_name, const String & tabl
 }
 
 
-bool RestCatalog::updateMetadata(const String & namespace_name, const String & table_name, const String & /*new_metadata_path*/, Poco::JSON::Object::Ptr new_snapshot) const
+CommitOutcome RestCatalog::updateMetadata(const String & namespace_name, const String & table_name, const String & /*new_metadata_path*/, Poco::JSON::Object::Ptr new_snapshot) const
 {
     const std::string endpoint = base_url / config.prefix / "namespaces" / namespace_name / "tables" / table_name;
 
@@ -1232,9 +1236,142 @@ bool RestCatalog::updateMetadata(const String & namespace_name, const String & t
     }
     catch (const DB::HTTPException &)
     {
-        return false;
+        return classifyCommitOutcomeAfterFailure(namespace_name, table_name, new_snapshot);
     }
-    return true;
+    catch (const DB::NetException &)
+    {
+        return classifyCommitOutcomeAfterFailure(namespace_name, table_name, new_snapshot);
+    }
+    catch (const Poco::Net::NetException &)
+    {
+        return classifyCommitOutcomeAfterFailure(namespace_name, table_name, new_snapshot);
+    }
+    /// Deliberately four narrow catches rather than one catch (Poco::Exception &):
+    /// only failure modes that can mean "response lost" should be re-classified;
+    /// anything else (auth logic bugs, parse errors) must keep propagating loudly.
+    catch (const Poco::TimeoutException &)
+    {
+        return classifyCommitOutcomeAfterFailure(namespace_name, table_name, new_snapshot);
+    }
+    return CommitOutcome::Committed;
+}
+
+Poco::JSON::Object::Ptr RestCatalog::getRawTableMetadataObject(
+    const std::string & namespace_name,
+    const std::string & table_name,
+    DB::ContextPtr /*context_*/) const
+{
+    const std::string endpoint = std::filesystem::path(NAMESPACES_ENDPOINT) / encodeNamespaceForURI(namespace_name) / "tables" / table_name;
+
+    String json_str;
+    {
+        /// Always a fresh network GET: this read path consults no metadata cache, so it
+        /// reflects the catalog's current server-side state (required to classify a commit).
+        auto buf = createReadBuffer(config.prefix / endpoint);
+        if (buf->eof())
+            return nullptr;
+        readJSONObjectPossiblyInvalid(json_str, *buf);
+    }
+
+    Poco::JSON::Parser parser;
+    Poco::Dynamic::Var json = parser.parse(json_str);
+    const Poco::JSON::Object::Ptr & object = json.extract<Poco::JSON::Object::Ptr>();
+    if (!object || !object->has("metadata"))
+        return nullptr;
+    return object->get("metadata").extract<Poco::JSON::Object::Ptr>();
+}
+
+CommitOutcome RestCatalog::classifyCommitOutcomeAfterFailure(
+    const std::string & namespace_name,
+    const std::string & table_name,
+    Poco::JSON::Object::Ptr new_snapshot) const
+{
+    /// Snapshot-expiration commits pass no snapshot (nullptr); there is no id to confirm,
+    /// so we cannot prove the commit landed or was rejected -> preserve files.
+    if (!new_snapshot || !new_snapshot->has(DB::Iceberg::f_metadata_snapshot_id))
+        return CommitOutcome::Unknown;
+
+    const Int64 our_snapshot_id = new_snapshot->getValue<Int64>(DB::Iceberg::f_metadata_snapshot_id);
+
+    Poco::JSON::Object::Ptr metadata_object;
+    try
+    {
+        metadata_object = getRawTableMetadataObject(namespace_name, table_name, getContext());
+    }
+    catch (...)
+    {
+        LOG_WARNING(
+            log,
+            "Commit response lost and post-failure re-read of table {}.{} also failed; "
+            "classifying snapshot {} as Unknown to preserve files: {}",
+            namespace_name, table_name, our_snapshot_id, DB::getCurrentExceptionMessage(false));
+        return CommitOutcome::Unknown;
+    }
+
+    if (!metadata_object)
+    {
+        LOG_WARNING(
+            log,
+            "Post-failure re-read of table {}.{} returned no metadata; "
+            "classifying snapshot {} as Unknown",
+            namespace_name, table_name, our_snapshot_id);
+        return CommitOutcome::Unknown;
+    }
+
+    /// Our snapshot is the current ref target: the commit landed and only its response was lost.
+    bool had_current_snapshot_id = metadata_object->has(DB::Iceberg::f_current_snapshot_id)
+        && !metadata_object->get(DB::Iceberg::f_current_snapshot_id).isEmpty();
+    if (had_current_snapshot_id)
+    {
+        const Int64 current_snapshot_id = metadata_object->getValue<Int64>(DB::Iceberg::f_current_snapshot_id);
+        if (current_snapshot_id == our_snapshot_id)
+        {
+            LOG_DEBUG(
+                log, "Commit confirmed: snapshot {} is current in catalog for {}.{}",
+                our_snapshot_id, namespace_name, table_name);
+            return CommitOutcome::Committed;
+        }
+    }
+
+    /// Our snapshot is in the history but no longer current: we landed, then a concurrent
+    /// writer superseded us. We test membership rather than equality with current, because
+    /// otherwise a later concurrent commit would make our real commit look rejected.
+    bool had_snapshots_array = false;
+    if (auto snapshots = metadata_object->getArray(DB::Iceberg::f_snapshots))
+    {
+        had_snapshots_array = true;
+        for (UInt32 i = 0; i < snapshots->size(); ++i)
+        {
+            auto snapshot = snapshots->getObject(i);
+            if (snapshot
+                && snapshot->has(DB::Iceberg::f_metadata_snapshot_id)
+                && snapshot->getValue<Int64>(DB::Iceberg::f_metadata_snapshot_id) == our_snapshot_id)
+            {
+                LOG_DEBUG(
+                    log,
+                    "Commit confirmed: snapshot {} present in catalog history for {}.{} "
+                    "(superseded by a later snapshot)",
+                    our_snapshot_id, namespace_name, table_name);
+                return CommitOutcome::Committed;
+            }
+        }
+    }
+
+    if (had_current_snapshot_id || had_snapshots_array)
+    {
+        LOG_DEBUG(
+            log, "Commit cleanly rejected: snapshot {} absent from catalog state for {}.{}",
+            our_snapshot_id, namespace_name, table_name);
+        return CommitOutcome::RejectedCleanly;
+    }
+
+    /// The response carried no snapshot state at all, so we cannot prove anything: preserve files.
+    LOG_WARNING(
+        log,
+        "Post-failure re-read of table {}.{} carried no snapshot state; "
+        "classifying snapshot {} as Unknown",
+        namespace_name, table_name, our_snapshot_id);
+    return CommitOutcome::Unknown;
 }
 
 void RestCatalog::dropTable(const String & namespace_name, const String & table_name) const

@@ -113,6 +113,7 @@ extern const int S3_ERROR;
 extern const int TABLE_ALREADY_EXISTS;
 extern const int SUPPORT_IS_DISABLED;
 extern const int INCORRECT_DATA;
+extern const int DATALAKE_DATABASE_ERROR;
 }
 
 namespace Setting
@@ -719,9 +720,12 @@ void IcebergMetadata::truncate(ContextPtr context, std::shared_ptr<DataLake::ICa
     if (catalog)
     {
         const auto & [namespace_name, table_name] = DataLake::parseTableName(storage_id.getTableName());
-        if (!catalog->updateMetadata(namespace_name, table_name, path_resolver.resolveForCatalog(metadata_info.path), new_snapshot))
+        /// Truncate performs no destructive file cleanup here, so anything other than a
+        /// confirmed commit is surfaced as a failure (preserving files).
+        const auto outcome = catalog->updateMetadata(namespace_name, table_name, path_resolver.resolveForCatalog(metadata_info.path), new_snapshot);
+        if (outcome != DataLake::CommitOutcome::Committed)
             throw Exception(ErrorCodes::INCORRECT_DATA,
-                "Failed to commit Iceberg truncate update to catalog.");
+                "Failed to commit Iceberg truncate update to catalog (commit was not confirmed).");
     }
 }
 
@@ -1645,6 +1649,9 @@ bool IcebergMetadata::commitImportPartitionTransactionImpl(
     /// snapshot and must NOT be deleted by the outer failure cleanup, otherwise the
     /// already-published snapshot becomes unreadable.
     bool published = false;
+    /// Becomes true when the catalog's commit response was lost (CommitOutcome::Unknown): the
+    /// commit may have already landed, so retrying would risk double-applying it.
+    bool commit_outcome_unknown = false;
 
     auto cleanup = [&](bool retry_because_of_metadata_conflict)
     {
@@ -1811,10 +1818,22 @@ bool IcebergMetadata::commitImportPartitionTransactionImpl(
                 auto catalog_filename = resolver.resolveForCatalog(metadata_info.path);
 
                 const auto & [namespace_name, table_name] = DataLake::parseTableName(table_id.getTableName());
-                if (!catalog->updateMetadata(namespace_name, table_name, catalog_filename, new_snapshot))
+                const auto outcome = catalog->updateMetadata(namespace_name, table_name, catalog_filename, new_snapshot);
+                if (outcome == DataLake::CommitOutcome::RejectedCleanly)
                 {
                     cleanup(true);
                     return false;
+                }
+                if (outcome == DataLake::CommitOutcome::Unknown)
+                {
+                    commit_outcome_unknown = true;
+                    throw Exception(
+                        ErrorCodes::DATALAKE_DATABASE_ERROR,
+                        "Iceberg commit for {}.{} is of unknown status after a lost response; "
+                        "the commit may have already landed, so it is not safe to retry. "
+                        "Written files are preserved and manual verification against the catalog "
+                        "is required before retrying.",
+                        namespace_name, table_name);
                 }
 
                 /// Catalog has accepted the commit - the new snapshot is now live and references
@@ -1851,6 +1870,12 @@ bool IcebergMetadata::commitImportPartitionTransactionImpl(
     }
     catch (...)
     {
+        if (commit_outcome_unknown)
+        {
+            /// The commit outcome is ambiguous, not confirmed - do not swallow this into a
+            /// retry, and do not clean up files that may belong to an already-landed commit.
+            throw;
+        }
         if (published)
         {
             /// Commit has already become visible to readers. The failure is in trailing

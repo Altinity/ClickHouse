@@ -87,7 +87,7 @@ public:
 
     void createTable(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr metadata_content) const override;
 
-    bool updateMetadata(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr new_snapshot) const override;
+    CommitOutcome updateMetadata(const String & namespace_name, const String & table_name, const String & new_metadata_path, Poco::JSON::Object::Ptr new_snapshot) const override;
 
     bool isTransactional() const override { return true; }
 
@@ -203,6 +203,20 @@ protected:
         const std::string & table_name,
         DB::ContextPtr context_,
         TableMetadata & result) const;
+
+    Poco::JSON::Object::Ptr getRawTableMetadataObject(
+        const std::string & namespace_name,
+        const std::string & table_name,
+        DB::ContextPtr context_) const;
+
+    /// After a failed commit POST, re-reads the catalog and classifies whether our snapshot
+    /// nonetheless became live (lost-response case) or was cleanly rejected. See the four
+    /// classification arms in the implementation. Never returns `RejectedCleanly` unless the
+    /// re-read succeeded and our snapshot id is provably absent from populated snapshot state.
+    CommitOutcome classifyCommitOutcomeAfterFailure(
+        const std::string & namespace_name,
+        const std::string & table_name,
+        Poco::JSON::Object::Ptr new_snapshot) const;
 
     Config loadConfig();
     virtual DB::HTTPHeaderEntries getAuthHeaders(

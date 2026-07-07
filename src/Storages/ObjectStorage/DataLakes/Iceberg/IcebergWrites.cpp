@@ -103,6 +103,7 @@ namespace ErrorCodes
     extern const int BAD_ARGUMENTS;
     extern const int NOT_IMPLEMENTED;
     extern const int ICEBERG_SPECIFICATION_VIOLATION;
+    extern const int DATALAKE_DATABASE_ERROR;
 }
 
 namespace FailPoints
@@ -1300,6 +1301,14 @@ bool IcebergStorageSink::initializeMetadata()
         }
     };
 
+    /// Becomes true once the catalog has confirmed the commit (the snapshot is live and
+    /// references the manifest entry / manifest list we wrote). From that point any failure
+    /// must NOT delete those files, otherwise the live snapshot is corrupted.
+    bool published = false;
+    /// Becomes true when the catalog's commit response was lost (CommitOutcome::Unknown): the
+    /// commit may have already landed, so retrying would risk double-applying it.
+    bool commit_outcome_unknown = false;
+
     try
     {
         for (const auto & [partition_key, writer] : writer_per_partition_key)
@@ -1392,11 +1401,25 @@ bool IcebergStorageSink::initializeMetadata()
                 auto catalog_filename = resolver.resolveForCatalog(metadata_info.path);
 
                 const auto & [namespace_name, table_name] = DataLake::parseTableName(table_id.getTableName());
-                if (!catalog->updateMetadata(namespace_name, table_name, catalog_filename, new_snapshot))
+                const auto outcome = catalog->updateMetadata(namespace_name, table_name, catalog_filename, new_snapshot);
+                if (outcome == DataLake::CommitOutcome::RejectedCleanly)
                 {
                     cleanup(true);
                     return false;
                 }
+                if (outcome == DataLake::CommitOutcome::Unknown)
+                {
+                    commit_outcome_unknown = true;
+                    throw Exception(
+                        ErrorCodes::DATALAKE_DATABASE_ERROR,
+                        "Iceberg commit for {}.{} is of unknown status after a lost response; "
+                        "the commit may have already landed, so it is not safe to retry. "
+                        "Written files are preserved and manual verification against the catalog "
+                        "is required before retrying.",
+                        namespace_name, table_name);
+                }
+                /// Committed: the snapshot is now live.
+                published = true;
             }
         }
 
@@ -1412,6 +1435,21 @@ bool IcebergStorageSink::initializeMetadata()
     }
     catch (...)
     {
+        if (commit_outcome_unknown)
+        {
+            throw;
+        }
+        if (published)
+        {
+            /// The commit is already live in the catalog. A failure in trailing post-publish
+            /// work (e.g. metadata-cache invalidation) must NOT delete the manifest files the
+            /// live snapshot references.
+            tryLogCurrentException(
+                log,
+                "Post-publish work failed after Iceberg snapshot was committed; "
+                "skipping cleanup to preserve the published snapshot");
+            return true;
+        }
         cleanup(false);
         throw;
     }
