@@ -747,3 +747,38 @@ re-emit (`sab_rebuilddropedge`); `INV_NO_DANGLE` is checked over `landed ∪ fol
 dropped edge is caught even though the rebuild itself doesn't retain it. `sab_rebuildkeepretired`
 and `sab_rebuildlowround` are the other two rebuild sabotages; `W_RebuildHappens` and
 `W_CopyForwardHappens` are the corresponding reachability witnesses.
+
+---
+
+## Area 12 — Resurrect re-upload orphan (2026-07-07) {#area-resurrect-reupload-orphan}
+
+### `CaGcResurrectReuploadOrphan.tla` — resurrect-replaced incarnation orphan {#cagcresurrectreuploadorphan}
+
+**Files:** `CaGcResurrectReuploadOrphan.tla`, `CaGcResurrectReuploadOrphan_bug.cfg`,
+`CaGcResurrectReuploadOrphan_fix.cfg`
+
+**What it proves.** A focused reproduction of the `RESURRECT-REUPLOAD-ORPHAN` leak found in the
+ca-soak S30 create/drop churn scenario (root-caused via `system.content_addressed_log`; see
+`utils/ca-soak/scenarios/BACKLOG.md`). The liveness property `NoLeakForever` — a present, ever-edged,
+unreferenced incarnation is eventually deleted or referenced again, under weak fairness of the GC
+fold/delete — is **VIOLATED** with `FixReCondemnCurrentToken = FALSE` (shipped behavior) and **HOLDS**
+with `TRUE` (the fix). TLC v2.19, 194 distinct states; the bug counterexample is a lasso: a condemned
+token is replaced by a resurrect re-upload (new token at the same content-hash key), the old token's
+exact-token delete finds the newer token and skips (`replaced`), and the fold — being touch-gated for
+fresh condemn and hash-keyed for settling the prior entry — never re-condemns the replaced token, which
+then stutters present forever.
+
+**Why the canonical model missed it (model-vs-code faithfulness gap).** `CaIncarnationCore`'s `GRetire`
+condemns by **(hash, CURRENT token)** — guard `~\E e \in retired : e.h = h /\ e.t = tokOf[h]` — so after
+a resurrect changes the token it re-condemns the new incarnation, and `NoLeakForever` (checked at
+`stage2_live`) genuinely holds there (its one lasso was a `MaxRound=2` bound artifact, §Area 1). In
+other words the canonical model already encodes the CORRECT algorithm. The shipped C++ `closeBlob`
+(`CasBlobInDegree.cpp` ~L225–251) diverged: it keys the "already retired?" decision on the **hash only**
+(a prior retired entry for the hash takes the `settleEntry` branch and NEVER reaches the fresh-condemn
+path for the current token), and the fold only visits blobs touched in the current window. No model was
+faithful to that drifted code. This model is that faithful variant; the fix (`FixReCondemnCurrentToken`)
+re-condemns the current token when settling a prior entry whose token differs from the present
+object — i.e. it makes the code match `CaIncarnationCore`'s already-proven `GRetire`.
+
+**Code currency:** CURRENT (reproduces shipped `CasBlobInDegree.cpp` behavior). The C++ fix is pending;
+this model is the design gate for it.
