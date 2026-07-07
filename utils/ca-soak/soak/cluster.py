@@ -82,6 +82,16 @@ class QueryError(RuntimeError):
             return False
         return any(("Code: %d." % c) in b for c in NODE_DOWN_CODES)
 
+# Port/container convention for replica i (1-based): ch1=8123, ch2=8124, ..., chN=8122+N;
+# container ca-soak-ch{i}-1. Matches docker-compose.yml (2 nodes) and docker-compose-10replicas.yml
+# (ch1..ch10 -> 8123..8132). Per-node overrides via env CA_SOAK_NODE{i}_{HOST,PORT,CONTAINER}.
+def _node_cfg(i: int, field: str, default):
+    env = os.environ.get(f"CA_SOAK_NODE{i}_{field.upper()}")
+    if env is not None:
+        return type(default)(env) if not isinstance(default, str) else env
+    return default
+
+
 _DEFAULTS = {
     "node1_host": "localhost", "node1_port": 8123, "node1_container": "ca-soak-ch1-1",
     "node2_host": "localhost", "node2_port": 8124, "node2_container": "ca-soak-ch2-1",
@@ -261,7 +271,12 @@ def retry_on_transport(fn, *, attempts: int, backoff_s: float = 0.5, max_backoff
 
 
 class Cluster:
-    def __init__(self, **kw):
+    """N-replica cluster over the shared CA pool. Default 2 nodes (ch1/ch2) for the standard soak +
+    the 2-node scenarios; `node_count` (or env CA_SOAK_NODE_COUNT) selects N for multi-replica
+    scenarios such as S12 (10 replicas, docker-compose-10replicas.yml). `node1`/`node2` stay valid
+    for all the 2-node callers; `nodes()` returns the full tuple so N-aware code addresses ch1..chN."""
+
+    def __init__(self, node_count: int | None = None, **kw):
         def cfg(name):
             env = os.environ.get("CA_SOAK_" + name.upper())
             if env is not None:
@@ -269,20 +284,30 @@ class Cluster:
                 return type(d)(env) if not isinstance(d, str) else env
             return kw.get(name, _DEFAULTS[name])
 
-        self._node1 = Node(cfg("node1_host"), cfg("node1_port"), cfg("node1_container"))
-        self._node2 = Node(cfg("node2_host"), cfg("node2_port"), cfg("node2_container"))
+        if node_count is None:
+            node_count = int(os.environ.get("CA_SOAK_NODE_COUNT", "2"))
+        if node_count < 1:
+            raise ValueError(f"node_count must be >= 1, got {node_count}")
+        self.node_count = node_count
+        self._nodes = [
+            Node(_node_cfg(i, "host", kw.get(f"node{i}_host", "localhost")),
+                 _node_cfg(i, "port", kw.get(f"node{i}_port", 8122 + i)),
+                 _node_cfg(i, "container", kw.get(f"node{i}_container", f"ca-soak-ch{i}-1")))
+            for i in range(1, node_count + 1)
+        ]
         self.gc_interval_s = cfg("gc_interval_s")
 
     def nodes(self):
-        return (self._node1, self._node2)
+        return tuple(self._nodes)
 
     @property
     def node1(self) -> Node:
-        return self._node1
+        return self._nodes[0]
 
     @property
     def node2(self) -> Node:
-        return self._node2
+        # For a 1-node cluster this aliases node1 (no second replica exists).
+        return self._nodes[1] if len(self._nodes) > 1 else self._nodes[0]
 
     def docker_exec(self, container: str, args: list[str]):
         """Run `docker exec <container> <args...>`; return (rc, stdout, stderr)."""

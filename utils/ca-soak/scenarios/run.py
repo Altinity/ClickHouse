@@ -73,7 +73,7 @@ def run_one(cls, *, seed, duration_s, scale, overrides, no_reset, variant_overri
                     raise RuntimeError("cluster did not become healthy after reset")
             else:
                 cluster_boot.ensure_up(variant, log_fn=ctx.log)
-            ctx.cluster = Cluster()
+            ctx.cluster = Cluster(node_count=cluster_boot.node_count_for(variant))
             ctx.snapshot_config(compose_variant=variant)
             ctx.extra["since_event_time"] = _now_str(ctx.cluster)
             scen.run(ctx, result)
