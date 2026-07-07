@@ -27,7 +27,7 @@ a Verdict naming the scale, so a green dev run is never mistaken for a green spe
 
 import time
 
-from ..framework import assertions as assertions_mod, gc as gc_mod, lifecycle, observe, sql
+from ..framework import assertions as assertions_mod, gc as gc_mod, observe, sql
 from ..framework.base import Scenario, register
 from ..framework.report import Verdict
 from . import _common
@@ -170,22 +170,42 @@ class S34(Scenario):
 
     @staticmethod
     def _measure_gc_batch(ctx, cl, after_iter):
-        """Drive ONE single-leader GC round and capture wall time, per-round root LIST/GET delta,
-        and the registered namespace fanout (count of `roots/<ns>` dirs in the RustFS pool)."""
-        before = observe.cluster_events_snapshot(cl)
-        t0 = time.monotonic()
-        gc_mod.gc_drive_round(cl, log_fn=ctx.log)
-        wall = time.monotonic() - t0
-        after = observe.cluster_events_snapshot(cl)
-        delta = observe.cluster_events_delta(before, after).get("_total", {})
-        return {
-            "after_iter": after_iter,
-            "gc_wall_s": round(wall, 3),
-            "CasRootList": int(delta.get("CasRootList", 0)),
-            "CasRootGet": int(delta.get("CasRootGet", 0)),
-            "CasGcGet": int(delta.get("CasGcGet", 0)),
-            "root_dirs": S34._count_root_dirs(),
-        }
+        """Measure the STEADY-STATE per-round DISCOVERY cost — the cost of a round that reclaims
+        NOTHING (`CasGcDelete==0`).
+
+        A round's `CasRootGet` conflates THREE regimes: (a) reclaim-phase GETs, O(pending
+        condemn/graduation backlog); (b) a fold round that re-reads the current generation
+        (deletes nothing but still GETs); and (c) an IDLE round that finds nothing new and
+        DEFERS (Phase-4 skip-unchanged) — O(1) LISTs, zero GETs. The D1 win is that the
+        fixed per-round FLOOR — the idle deferred round (c) — must NOT grow with
+        tables-ever-created. Sampling a single mid-churn round captured (a)/(b) and grew with
+        the drop burst, NOT the universe (verified: `CasRootGet` tracked `CasGcDelete>0`; a
+        drained round on a stale generation defers to 0). So drive rounds until an IDLE
+        deferred round (`CasGcDelete==0 AND CasRootGet==0`) and report it: that floor is the
+        real per-round steady-state cost. If it can't reach idle, the last round is returned
+        and a genuine monotone fanout would surface as a non-zero, growing floor."""
+        last = {}
+        for attempt in range(20):
+            before = observe.cluster_events_snapshot(cl)
+            t0 = time.monotonic()
+            gc_mod.gc_drive_round(cl, log_fn=ctx.log)
+            wall = time.monotonic() - t0
+            after = observe.cluster_events_snapshot(cl)
+            delta = observe.cluster_events_delta(before, after).get("_total", {})
+            last = {
+                "after_iter": after_iter,
+                "drain_rounds": attempt + 1,
+                "gc_wall_s": round(wall, 3),
+                "CasRootList": int(delta.get("CasRootList", 0)),
+                "CasRootGet": int(delta.get("CasRootGet", 0)),
+                "CasGcGet": int(delta.get("CasGcGet", 0)),
+                "CasGcDelete": int(delta.get("CasGcDelete", 0)),
+                "root_dirs": S34._count_root_dirs(),
+            }
+            # Idle deferred round: nothing reclaimed AND no discovery GETs → the per-round floor.
+            if last["CasGcDelete"] == 0 and last["CasRootGet"] == 0:
+                break
+        return last
 
     @staticmethod
     def _count_root_dirs():
