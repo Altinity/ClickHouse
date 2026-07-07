@@ -1145,10 +1145,23 @@ Full writeup: `docs/superpowers/worklogs/2026-07-06-scenario-validation-night.md
 After the `Gc::previewDeletes` (F3) fix, resume closing the S13–S32 inconclusives that are still
 infra/measurement gaps (not CA defects — all had dangling=0 + agreement):
 
+**RESUME STATE (2026-07-07 night — where we stopped; continue next night):**
+- **S15 gc_shards=8: INFRA BUILT + COMMITTED, clean re-run PENDING.** Done: `storage_conf_gc_shards8_ch{1,2}.xml`
+  (gc_shards=8), `docker-compose-gc_shards8.yml`, variant registered in `cluster_boot`, S15 card
+  `_VARIANTS` now `(("default",1),("gc_shards2",2),("gc_shards8",8))` + hardcoded inconclusive removed +
+  comparison text updated. NOT yet run clean (the launch collided with another run and was killed). NEXT:
+  `python3 -m scenarios.run --scenario S15 --scale dev --seed 20260707` (runs 3 variants; slow).
+- **S23 (1/10-server) + S16/S20 (counters) + S21/S29 (ci-scale): NOT STARTED** (see below).
+- **graduation-drain DECISION PENDING:** `gc.drain_condemned_pipeline` + class-aware `assert_no_leftovers`
+  are committed and correct, but the drain adds ~110–150s per checkpoint that has a condemned residual
+  (drains early if healthy). Open: run a full sweep to measure the cost, and decide whether to lower
+  `mount_renew_period` on the stand (faster floor advance → faster drain; risk = affects mount-lease /
+  fence-out timing). Also: the class-aware oracle now correctly FAILs S30 + recurring-hash churn cards on
+  the real `RESURRECT-REUPLOAD-ORPHAN` leak (below) — expected until that product bug is fixed.
+- **Chosen next work: FIX RESURRECT-REUPLOAD-ORPHAN (option 1)** — started 2026-07-07 night.
+
 1. **Build S15 + S23 infra:**
-   - **S15 (GC target-shard comparison):** needs a `gc_shards=8` compose variant (only default=1 and
-     `gc_shards2`=2 exist today). Add `storage_conf_gc_shards8_ch{1,2}.xml` + `docker-compose-gc_shards8.yml`
-     + register the variant in `cluster_boot._VARIANT_FILE/_VARIANT_NODES`, mirroring the gc_shards2 wiring.
+   - **S15 (GC target-shard comparison):** DONE (infra built + committed; re-run pending — see RESUME STATE).
    - **S23 (idle shared-pool baseline):** needs a 1-server baseline and a 10-server baseline; the
      10-server case can REUSE the tenreplicas compose (`Cluster(node_count=10)`); the 1-server case
      needs a 1-node compose (or run against ch1 only). Wire both so the card measures real idle-pool
