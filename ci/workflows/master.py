@@ -1,5 +1,6 @@
 from praktika import Workflow
 
+from ci.defs.altinity_jobs import AltinityArtifactConfigs, AltinityJobConfigs
 from ci.defs.defs import (
     BASE_BRANCH,
     BINARIES_WITH_LONG_RETENTION,
@@ -20,8 +21,16 @@ for artifact in ArtifactConfigs.clickhouse_binaries + ArtifactConfigs.clickhouse
 
 workflow = Workflow.Config(
     name="MasterCI",
-    event=Workflow.Event.PUSH,
-    branches=[BASE_BRANCH, "releases/*", "antalya-*"],
+    event=Workflow.Event.DISPATCH,
+    inputs=[
+        Workflow.Config.InputConfig(
+            name="no_cache",
+            description="Run without cache",
+            is_required=False,
+            input_type="boolean",
+            default_value="false",
+        ),
+    ],
     jobs=[
         # *JobConfigs.tidy_build_arm_jobs,
         *JobConfigs.build_jobs,
@@ -40,6 +49,8 @@ workflow = Workflow.Config(
         JobConfigs.docker_server,
         JobConfigs.docker_keeper,
         *JobConfigs.install_check_master_jobs,
+        *AltinityJobConfigs.sign_release_jobs,
+        AltinityJobConfigs.source_upload_job,
         *JobConfigs.compatibility_test_jobs,
         *JobConfigs.functional_tests_jobs,
         # *JobConfigs.functional_test_llvm_coverage_jobs, # NOTE (strtgbb): Not configured yet. Determine if useful first.
@@ -65,9 +76,7 @@ workflow = Workflow.Config(
     additional_jobs=[
         "GrypeScan",
         "Regression",
-        "SignRelease",
         "CIReport",
-        "SourceUpload",
     ],
     artifacts=[
         *ArtifactConfigs.unittests_binaries,
@@ -76,6 +85,7 @@ workflow = Workflow.Config(
         *ArtifactConfigs.clickhouse_debians,
         *ArtifactConfigs.clickhouse_rpms,
         *ArtifactConfigs.clickhouse_tgzs,
+        *AltinityArtifactConfigs.signed_hashes,
         ArtifactConfigs.fuzzers,
         ArtifactConfigs.fuzzers_corpus,
         ArtifactConfigs.parser_memory_profiler,
@@ -93,7 +103,7 @@ workflow = Workflow.Config(
     enable_commit_status_on_failure=True,
     enable_slack_feed=False,
     pre_hooks=[
-        "python3 ./ci/jobs/scripts/workflow_hooks/store_data.py",
+        # "python3 ./ci/jobs/scripts/workflow_hooks/store_data.py", # NOTE (carlosfelipeor): we don't use this in master CI
         "python3 ./ci/jobs/scripts/workflow_hooks/version_log.py",
         "python3 ./ci/jobs/scripts/workflow_hooks/parse_ci_tags.py",
         # "python3 ./ci/jobs/scripts/workflow_hooks/merge_sync_pr.py", # NOTE (strtgbb): we don't do this
