@@ -1208,11 +1208,23 @@ infra/measurement gaps (not CA defects — all had dangling=0 + agreement):
   after the guarded skip, so a recurring-hash churn workload slowly orphans re-uploaded incarnations.
 - **Impact:** small permanent leak of tiny recurring-hash blobs under churn; INV-2 violation. Real
   workloads with unique content hit it far less (needs the content hash to recur across the condemn window).
-- **Fix direction (design-sensitive — resurrect/condemn interaction; do NOT rush):** when the exact-token
-  delete finds a REPLACED (newer) incarnation, GC should re-observe/re-fold that incarnation's current
-  in-degree so a zero-in-degree token B is re-condemned rather than dropped from tracking; OR the resurrect
-  re-upload should register the new incarnation into the same shard's in-degree accounting so a later
-  indeg_zero condemns it. Relates to [[feedback_ca_resurrect_invariant]] and the B140-dangle lineage.
+- **PRECISE fold-state mechanism (CasBlobInDegree.cpp `closeBlob`/`settleEntry`, ~L225-251):** in-degree
+  is per-HASH (source-edges `(blob_hash, source_id)`), condemn/retire is per-TOKEN. When a hash has a prior
+  retired entry (token A) AND cur_edges==0, `closeBlob` takes the `prior_retired[ri].hash == cur_blob`
+  branch → `settleEntry(A, 0)` → A graduates (delete_pending → exact-token delete). It NEVER reaches the
+  `else` fresh-condemn path (L238) that would `head_blob` the CURRENT token and condemn it. So the token B
+  present at the key (from the resurrect re-upload) is never condemned. Under rapid churn B's transient
+  source-edges (create→insert-adopt→drop within one fold window) net to ABSENT, so the hash's in-degree
+  reads 0 throughout → A is never `spared` (L198-199) → A graduates → exact-token delete of A finds B →
+  `outcome=replaced` skip → B orphaned. `settleEntry` settles the OLD token without re-observing that the
+  physical object is now a NEWER token.
+- **Fix direction (design-sensitive — TLA+-gated core; do NOT rush):** in `closeBlob`, when settling a
+  prior retired entry that is about to graduate/delete with cur_edges==0, `head_blob` the current token; if
+  it DIFFERS from the retired entry's token (a resurrect replaced it), condemn the current token as a FRESH
+  entry (condemn_round=this round) instead of graduating the stale one — so B enters the pipeline. (Alt:
+  at exact-token delete, on `replaced`, re-condemn the observed token.) Touches the fold retire-merge +
+  MonotoneGC/ack-floor invariants → needs a spec + TLA+ gate (CaGcRootLocalPartManifestCore.tla) before
+  C++. Relates to [[feedback_ca_resurrect_invariant]] and the B140-dangle lineage.
 - **Oracle:** the improved class-aware `assert_no_leftovers` + graduation-drain CORRECTLY surfaces this
   (unaccounted/unreachable ⇒ leak ⇒ FAIL) — it was previously MASKED by the "fsck detail unavailable"
   inconclusive. So S30 (and any recurring-hash churn card) now FAILs on this real residual until fixed.
