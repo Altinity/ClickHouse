@@ -112,7 +112,9 @@ protected:
     NamesAndTypesList hive_partition_columns_to_read_from_file_path;
 
 private:
-    static ClusterPtr getClusterImpl(ContextPtr context, const String & cluster_name_, size_t max_hosts = 0);
+    // With 'allow_null=true' returns nullptr when cluster does not exist or empty
+    // With 'allow_null=false' throws exception
+    static ClusterPtr getClusterImpl(ContextPtr context, const String & cluster_name_, size_t max_hosts = 0, bool allow_null = false);
 
     virtual bool isClusterSupported() const { return true; }
 

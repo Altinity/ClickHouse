@@ -64,6 +64,7 @@ namespace Setting
     extern const SettingsBool object_storage_remote_initiator;
     extern const SettingsString object_storage_remote_initiator_cluster;
     extern const SettingsObjectStorageClusterJoinMode object_storage_cluster_join_mode;
+    extern const SettingsBool object_storage_cluster_fallback_if_empty;
 }
 
 namespace ErrorCodes
@@ -373,7 +374,22 @@ void IStorageCluster::read(
     const auto & settings = context->getSettingsRef();
     ASTPtr query_to_send = query_info.query;
 
-    if (cluster_name_from_settings.empty())
+    ClusterPtr cluster = nullptr;
+
+    bool fallback_to_pure = cluster_name_from_settings.empty();
+
+    if (!fallback_to_pure && settings[Setting::object_storage_cluster_fallback_if_empty])
+    {
+        cluster = getClusterImpl(
+            context,
+            cluster_name_from_settings,
+            isObjectStorage() ? settings[Setting::object_storage_max_nodes] : 0,
+            /*allow_null*/ true);
+        if (!cluster)
+            fallback_to_pure = true;
+    }
+
+    if (fallback_to_pure)
     {
         if (settings[Setting::object_storage_remote_initiator])
         {
@@ -448,7 +464,8 @@ void IStorageCluster::read(
         return;
     }
 
-    auto cluster = getClusterImpl(context, cluster_name_from_settings, isObjectStorage() ? settings[Setting::object_storage_max_nodes] : 0);
+    if (!cluster)
+        cluster = getClusterImpl(context, cluster_name_from_settings, isObjectStorage() ? settings[Setting::object_storage_max_nodes] : 0);
 
     RestoreQualifiedNamesVisitor::Data data;
     data.distributed_table = DatabaseAndTableWithAlias(*getTableExpression(query_to_send->as<ASTSelectQuery &>(), 0));
@@ -743,9 +760,18 @@ ContextPtr ReadFromCluster::updateSettings(const Settings & settings)
     return new_context;
 }
 
-ClusterPtr IStorageCluster::getClusterImpl(ContextPtr context, const String & cluster_name_, size_t max_hosts)
+ClusterPtr IStorageCluster::getClusterImpl(ContextPtr context, const String & cluster_name_, size_t max_hosts, bool allow_null)
 {
-    return context->getCluster(cluster_name_)->getClusterWithReplicasAsShards(context->getSettingsRef(), /* max_replicas_from_shard */ 0, max_hosts);
+    ClusterPtr cluster = nullptr;
+    if (allow_null)
+    {
+        cluster = context->tryGetCluster(cluster_name_);
+        if (!cluster || !cluster->getAllNodeCount())
+            return nullptr;
+    }
+    else
+        cluster = context->getCluster(cluster_name_);
+    return cluster->getClusterWithReplicasAsShards(context->getSettingsRef(), /* max_replicas_from_shard */ 0, max_hosts);
 }
 
 }

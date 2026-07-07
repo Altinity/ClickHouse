@@ -8302,6 +8302,9 @@ Trigger processor to spill data into external storage adpatively. grace join is 
     DECLARE(String, object_storage_cluster, "", R"(
 Cluster to make distributed requests to object storages with alternative syntax.
 )", EXPERIMENTAL) \
+    DECLARE(Bool, object_storage_cluster_fallback_if_empty, false, R"(
+Use non-cluster request if 'object_storage_cluster' is set but empty or unknown.
+)", EXPERIMENTAL) \
     DECLARE(UInt64, object_storage_max_nodes, 0, R"(
 Limit for hosts used for request in object storage cluster table functions - azureBlobStorageCluster, s3Cluster, hdfsCluster, etc.
 Possible values:
