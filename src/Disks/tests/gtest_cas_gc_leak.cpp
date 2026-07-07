@@ -301,6 +301,66 @@ TEST(CasGcLeak, DroppedPartFullyReclaimed)
     EXPECT_EQ(inDegreeOf(*b, s->layout(), u128Of("drop-mark")), 0) << "no stranded positive in-degree";
 }
 
+/// NO-LEAK (resurrect-reupload): a blob incarnation A is published, dropped, and condemned by ONE GC
+/// round (retired, NOT yet deleted — it is still mid-pipeline). A fresh build then dedup-hits the SAME
+/// content hash: `putBlob` HEADs A, sees it condemned via `retireView().isCondemnedToken`, and — per
+/// INV-1 (revival-from-source) — re-uploads a DISTINCT incarnation B at the same content-addressed key
+/// (fresh `incarnation_tag`, never a GET of the dying object A). B is referenced by a second ref, then
+/// that ref is dropped too. GC must fold B's own activation/removal exactly like any other incarnation
+/// and reclaim it to a fixpoint: no blob object may remain for the content hash and the in-degree
+/// generation must hold no stranded positive counter.
+///
+/// This reproduces RESURRECT-REUPLOAD-ORPHAN: if GC's bookkeeping keys off the content hash rather than
+/// the (hash, token) incarnation identity, it may treat the hash as "already handled" from A's retire
+/// cycle and never open a fresh condemn cycle for B once B's in-degree drops to zero — B then orphans
+/// forever (unreachable > 0, its body never deleted).
+TEST(CasGcLeak, ResurrectReplacedIncarnationReclaimed)
+{
+    std::shared_ptr<InMemoryBackend> b;
+    auto s = openTestStore(b);
+    const RootNamespace ns{"test/tbl"};
+    const String P = "resurrect-payload";
+
+    /// 1. Publish ref r1 -> token A referenced; capture A.
+    publishOneBlobPart(s, ns, "r1", P);
+    const HeadResult hA = b->head(s->layout().blobKey(idOf(P)));
+    ASSERT_TRUE(hA.exists);
+
+    /// 2. Drop r1 -> A dereferenced.
+    s->dropRef(ns, "r1");
+    s->renewWatermarkOnce();   /// advance the floor so A is not spared as in-flight
+
+    /// 3. ONE GC round: A transitions to in-degree 0 and is condemned (retired), NOT yet deleted.
+    Gc gc(s, hexToU128("00000000000000000000000000000004"));
+    gc.runRegularRound();
+    s->retireView().refresh();
+    ASSERT_TRUE(s->retireView().isCondemnedToken(ObjectKind::Blob, u128Of(P), hA.token))
+        << "precondition: token A must be condemned before the resurrect";
+    ASSERT_TRUE(blobPresent(b, s->layout(), P)) << "A not yet deleted (still in the pipeline)";
+
+    /// 4. RESURRECT: a fresh build dedup-hits P; putBlob sees A condemned -> re-uploads a DISTINCT
+    /// incarnation B at the same content-addressed key (INV-1 revival-from-source).
+    publishOneBlobPart(s, ns, "r2", P);
+    const HeadResult hB = b->head(s->layout().blobKey(idOf(P)));
+    ASSERT_TRUE(hB.exists);
+    ASSERT_NE(hB.token.value, hA.token.value) << "resurrect must mint a new incarnation token B";
+
+    /// 5. Drop r2 -> B dereferenced.
+    s->dropRef(ns, "r2");
+    s->renewWatermarkOnce();
+
+    /// 6. Run GC to fixpoint. The replaced incarnation B MUST be reclaimed.
+    runGcToFixpoint(s, gc);
+
+    const FsckReport after = runFsck(*s, /*detail=*/false);
+    EXPECT_EQ(after.dangling, 0u) << "resurrect INV-NO-LOSS: nothing reachable was lost";
+    EXPECT_EQ(after.unreachable, 0u)
+        << "resurrect INV-NO-LEAK: the resurrect-replaced incarnation B must not orphan "
+           "(unreachable=" << after.unreachable << ")";
+    EXPECT_FALSE(blobPresent(b, s->layout(), P)) << "B's object must be deleted";
+    EXPECT_EQ(inDegreeOf(*b, s->layout(), u128Of(P)), 0) << "no stranded positive in-degree";
+}
+
 /// NO-LEAK (abandon): a build stages a manifest, precommitAdds it (activating +1 for its OWN unique
 /// blob, body present), uploads that blob, then VANISHES (crash: never promoted, never abandoned). GC's
 /// automatic precommit-reclaim (B8) judges the build dead via the watermark and appends a PrecommitRemove
