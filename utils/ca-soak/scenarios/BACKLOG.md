@@ -1251,6 +1251,21 @@ infra/measurement gaps (not CA defects — all had dangling=0 + agreement):
   visible (ch2: `precommit=36`, `build_publish=35`, `build_abort=0` → 1 build precommitted, never
   published/aborted). **FIX = the precommit-abandon/cleanup path** (own brainstorming→spec→plan cycle,
   started 2026-07-07). Separate from the committed blob fix.
+- **RESOLVED 2026-07-08 (branch `cas-gc-rebuild`).** Root cause was not the writer abandon path but the
+  GC-side reclaim being parked by the token-diff `Skip`: `reclaimAbandonedPrecommit` only runs on a
+  fold-visit, and a content-static shard holding the abandoned precommit is Skip-parked, so reclaim never
+  re-runs once the watermark proves the precommit dead. Fix (TLA+-gated by
+  `SkipParksDeadPrecommit`/`LiveDeadPrecommitReclaimed`, see `docs/superpowers/cas/06-tla-models.md`
+  §Area 7): `Gc::computeDiscoverDecisions` force-Reads a token-stable shard whose sealed minimal live
+  precommit `isPrecommitDead` vs the mount watermark, so `reclaimAbandonedPrecommit` runs, emits the
+  owner-removal, the fold folds the `-1`, and R6 deletes the manifest. Commits: TLA+ `3a836c24364` +
+  sibling-cfg `5fe74bd373e`; RED test `910646891e0`; `isPrecommitDead` `180a6f2cc0e`; `ShardCoverage`
+  field `10981183d19`; the fix `c1479a8553c`; guard tests `7c06bcfdde2`. Verification: unit
+  `CasDanglingPrecommit.*` (deterministic), regression 170/170, and S30 — pre-fix 1 `_manifests` orphan
+  (FAIL) → post-fix ×4 seeds all PASS residual 0 (`reclaimAbandonedPrecommit` seen firing live in one
+  seed via the normal Read path; the parked-static-shard force-Read timing is a rare race proven
+  deterministically only by the unit test). Follow-ups `PROMOTE-OVER-COMMITTED-LEAK` +
+  `ABANDON-RETIRE-ORDERING` remain (below).
 
 ## INTROSPECTION-1 (2026-07-07): manifest/precommit lifecycle audit gap in `system.content_addressed_log`
 
@@ -1282,3 +1297,19 @@ infra/measurement gaps (not CA defects — all had dangling=0 + agreement):
   detail to report the "why" per key (`reachable-via` / `spared-by-precommit` / `eligible`) so leaks like this
   surface directly. Ends hand hex-decoding of the bucket.
 
+
+## PROMOTE-OVER-COMMITTED-LEAK (2026-07-08, write-path audit) — MEDIUM, real reachable leak + fail-close gap
+
+- **Logged (UTC):** 2026-07-08
+- **Severity:** suspected-bug (over-count / permanent leak + owner↔refs divergence; NOT a dangle — `INV_NO_DANGLE`/`INV_NO_LOSS`/`INV_COMMIT_FAILCLOSED` hold). Distinct from DANGLING-PRECOMMIT.
+- **Confirmed in code:** `CasBuild.cpp` `Build::promote` (~L896-907) appends a Δ=0 owner-move (`old=Precommit(R,bld,T)`, `new=Committed(R,T)`) then `root.refs[R] = RootRef{...}` UNCONDITIONALLY — never reads the prior `refs[R]`, never emits a repoint `-1` for a pre-existing committed `T_old`. The in-closure gate only proves THIS build's precommit is still live (`seen_removal && !present_in_live`), not that a different committed owner already holds `R`. So a promote over an existing committed ref leaves `Com(R,T_old)` live in the journal with no `-1` ⇒ `T_old`'s manifest body + uniquely-owned blobs pinned forever (in-degree stuck ≥1); the journal holds two live `Committed` bindings for `R`; a later `dropRef(R)` removes only `Com(T_new)`, leaving `Com(T_old)` live with no `refs[R]` entry (owner↔refs divergence).
+- **Reachability (upgraded):** NOT just "unique-part-names externally violated". `republishRef` (primitive behind DETACH/ATTACH rename + RENAME TABLE, `ContentAddressedTransaction.cpp:167-174`) does `stageManifest → precommitAdd → promote(dst) → dropRef(src)` and is advertised idempotent/re-drivable. A crash/throw AFTER `promote(dst)` and BEFORE `dropRef(src)`, then re-driven, mints a FRESH `ManifestId T_b` (`stageManifest` bumps ordinal; new build ⇒ new build_seq), so the second `promote` overwrites `refs[dst]=Com(T_b)` and leaks `Com(dst,T_a)`. The `moveDirectory` idempotency claim holds only when the prior attempt did nothing or completed through `dropRef(src)`; the "dst published, src not dropped" intermediate re-drives into a leak.
+- **Fix (own brainstorm→spec→plan cycle):** in `promote`, before overwriting `refs[final_ref_name]`, inspect it: if it names a DIFFERENT committed `T_old` → emit a proper repoint (`old_binding = Committed(R,T_old)`) so GC folds the `-1`, OR throw `LOGICAL_ERROR` (fail closed). Repoint event shape already defined in `CasRootShardCodec.h`. Equivalently `republishRef` could `dropRef(src)` before/atomically, or make the dst promote idempotent when `refs[dst]` already names a manifest over the same entries.
+- **Interaction with DANGLING-PRECOMMIT fix (cas-gc-rebuild):** independent locus (writer-side promote vs GC-side discover/fold reclaim); does not block that fix.
+
+## ABANDON-RETIRE-ORDERING (2026-07-08, write-path audit) — LOW, latent robustness
+
+- **Logged (UTC):** 2026-07-08
+- **Severity:** finding (benign today). `Build::abandon` calls `retireBuildSeq(build_seq)` BEFORE appending the precommit-removal `mutateShard`, opening a window where `min_active` advances and GC's `reclaimAbandonedPrecommit` races `abandon`'s removal (double removal of the same precommit binding). Safe today ONLY because in-degree is an idempotent source-edge SET (H1b) and no committed ref is involved — but it contradicts the ordering discipline the function documents. `Build::promote` already does the safe order (retire AFTER its CAS, `CasBuild.cpp:911`).
+- **Relevance to DANGLING-PRECOMMIT fix:** that fix force-Reads Skip-parked shards, INCREASING `reclaimAbandonedPrecommit` firing frequency → the abandon-vs-reclaim double-removal window is exercised more. Still safe (idempotent set), but raises the priority of moving `retireBuildSeq` to AFTER the removal `mutateShard`.
+- **Fix:** move `retireBuildSeq` after the removal CAS in `Build::abandon`, mirroring `promote`.

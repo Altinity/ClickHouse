@@ -446,6 +446,42 @@ Full table in `CaGcRootLocalPartManifestCore_RESULTS.md`.
 the fence/recheck phases it models are SUPERSEDED by Area 11 (controls kept as historical evidence).
 The largest and most comprehensive model in the corpus.
 
+### `SkipParksDeadPrecommit` — dangling-precommit orphan gate (C++ fix LANDED) {#skipparksdeadprecommit}
+
+**Files:** `CaGcRootLocalPartManifestCore.tla` + `CaGcRootLocalPartManifestCore_sab_skipparksdeadprecommit.cfg`
+(bug) / `_fix_skipparksdeadprecommit.cfg` (fix).
+
+**What it proves.** The `DANGLING-PRECOMMIT` manifest orphan found in the `utils/ca-soak` S30 churn
+scenario (2026-07-07): an abandoned precommit (activated body, never promoted, never removed) sits on a
+content-static ref-shard; the token-diff `Skip` parks the shard, so the fold-visit
+`reclaimAbandonedPrecommit` never re-runs, and the precommit — provably dead once the watermark advances
+past its `build_sequence` — orphans its manifest forever (the orphan sweep spares it because
+`activeManifestKeys` keeps the un-removed precommit binding live). The liveness property
+`LiveDeadPrecommitReclaimed` (a present, body-present, still-bound, watermark-dead abandoned precommit is
+eventually reclaimed, under `WF` of `GReclaimDeadPrecommit`) is **VIOLATED** with
+`SabotageSkipParksDeadPrecommit = TRUE` (the shipped bug — the static shard is parked forever) and
+**HOLDS** with `= FALSE` (the fix: `CanSkipShard` force-Reads a shard holding a watermark-dead live
+precommit, keyed on the same durable death fact `reclaimAbandonedPrecommit` uses). TLC v2.19: bug cfg
+violated (174,024 distinct states); fix cfg no error (800,072 states). `GReclaimDeadPrecommit` refines
+`WAbandonPrecommit` (introduces no new reachable state), so the fix only restricts WHEN reclaim fires.
+All four `EnableTokenDiff = TRUE` sibling cfgs re-verified with the added constant — no counterexample
+masked; `sab_skipchangedshard` still violates `INV_NO_DANGLE`.
+
+**C++ fix (LANDED, branch `cas-gc-rebuild`).** `Gc::computeDiscoverDecisions` overrides a would-be `Skip`
+to Read when the sealed `ShardCoverage`'s minimal live precommit `isPrecommitDead` vs the namespace mount
+watermark (`ProfileEvents::CasGcPrecommitRevisitForced`); `Gc::fold` stamps the minimal live precommit
+into the coverage; the shared `isPrecommitDead` helper is used by both the guard and
+`reclaimAbandonedPrecommit`. Unit test `CasDanglingPrecommit.*` (deterministic: reclaim after the
+watermark advances; idempotency; Skip preserved for live/no precommit; double-removal idempotency). S30
+regression: pre-fix left 1 `_manifests` orphan (FAIL); post-fix ×4 seeds all PASS with residual 0
+(`reclaimAbandonedPrecommit` observed firing live in one seed via the normal Read path — the specific
+force-Read/parked-static-shard timing is a rare race exercised deterministically only by the unit test).
+
+**Follow-up (out of scope, backlogged):** the write-path `PROMOTE-OVER-COMMITTED-LEAK` (a distinct
+writer-side leak reachable via a `republishRef` crash re-drive) and `ABANDON-RETIRE-ORDERING`.
+
+**Code currency:** CURRENT (the C++ fix matches this gate).
+
 ---
 
 ## Area 8 — In-degree re-fold undercount (B-indeg fix) {#area-indeg-refold}
