@@ -394,9 +394,27 @@ void IStorageCluster::read(
         if (settings[Setting::object_storage_remote_initiator])
         {
             auto remote_initiator_cluster_name = settings[Setting::object_storage_remote_initiator_cluster].value;
-            if (remote_initiator_cluster_name.empty())
+            ClusterPtr remote_initiator_cluster;
+            if (!remote_initiator_cluster_name.empty())
+            {
+                remote_initiator_cluster = getClusterImpl(
+                    context,
+                    remote_initiator_cluster_name,
+                    /*max_hosts*/ 0,
+                    /*allow_null*/ settings[Setting::object_storage_cluster_fallback_if_empty]);
+            }
+            if (remote_initiator_cluster_name.empty() || !remote_initiator_cluster)
+            {
+                if (settings[Setting::object_storage_cluster_fallback_if_empty])
+                {
+                    readFallBackToPure(query_plan, column_names, storage_snapshot, query_info, context, processed_stage, max_block_size, num_streams);
+                    return;
+                }
+                // remote_initiator_cluster can be nullptr only when object_storage_cluster_fallback_if_empty is set
+                // so this exception is thrown only with empty remote_initiator_cluster_name
                 throw Exception(ErrorCodes::BAD_ARGUMENTS,
                     "Setting 'object_storage_remote_initiator' can be used only with 'object_storage_remote_initiator_cluster', 'object_storage_cluster', or cluster name in arguments");
+            }
 
             /// rewrite query to execute `remote('remote_host', s3(...))`
             /// remote_host can execute query itself or make on-cluster query depends on own `object_storage_cluster` setting
@@ -404,7 +422,6 @@ void IStorageCluster::read(
             updateQueryWithJoinToSendIfNeeded(query_to_send, query_info, context);
             updateQueryToSendIfNeeded(query_to_send, storage_snapshot, context, /*make_cluster_function*/ false);
 
-            auto remote_initiator_cluster = getClusterImpl(context, remote_initiator_cluster_name);
             auto storage_and_context = convertToRemote(remote_initiator_cluster, context, remote_initiator_cluster_name, query_to_send);
             auto src_distributed = std::dynamic_pointer_cast<StorageDistributed>(storage_and_context.storage);
             auto modified_query_info = query_info;
@@ -592,6 +609,8 @@ SinkToStoragePtr IStorageCluster::write(
 {
     auto cluster_name_from_settings = getClusterName(context);
 
+    // Intentionally do not apply object_storage_cluster_fallback_if_empty here.
+    // Cluster write is not supported; applying fallback would make INSERT depend on cluster availability.
     if (cluster_name_from_settings.empty())
         return writeFallBackToPure(query, metadata_snapshot, context, async_insert);
 
