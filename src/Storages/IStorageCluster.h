@@ -111,6 +111,18 @@ protected:
 
     NamesAndTypesList hive_partition_columns_to_read_from_file_path;
 
+    struct ResolvedClusterRead
+    {
+        /// True when read() should use readFallBackToPure() or remote-initiator fallback branch.
+        bool fallback_to_pure = false;
+        /// Pre-resolved object-storage cluster when object_storage_cluster_fallback_if_empty prefetch was done.
+        ClusterPtr object_storage_cluster;
+        /// Resolved remote-initiator cluster when object_storage_remote_initiator is enabled in fallback branch.
+        ClusterPtr remote_initiator_cluster;
+    };
+
+    ResolvedClusterRead resolveClusterRead(ContextPtr context) const;
+
 private:
     // With 'allow_null=true' returns nullptr when cluster does not exist or empty
     // With 'allow_null=false' throws exception

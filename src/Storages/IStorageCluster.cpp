@@ -353,6 +353,59 @@ void IStorageCluster::updateQueryWithJoinToSendIfNeeded(
     }
 }
 
+IStorageCluster::ResolvedClusterRead IStorageCluster::resolveClusterRead(ContextPtr context) const
+{
+    ResolvedClusterRead result;
+
+    if (!isClusterSupported())
+    {
+        result.fallback_to_pure = true;
+        return result;
+    }
+
+    auto cluster_name_from_settings = getClusterName(context);
+    const auto & settings = context->getSettingsRef();
+
+    /// When both remote-initiator settings are set, object_storage_cluster may be defined only on the remote node.
+    /// In this case object_storage_cluster must not be resolved locally.
+    const bool defer_object_storage_cluster_resolution
+        = settings[Setting::object_storage_remote_initiator]
+        && !settings[Setting::object_storage_remote_initiator_cluster].value.empty();
+
+    if (defer_object_storage_cluster_resolution)
+        result.fallback_to_pure = false;
+    else
+        result.fallback_to_pure = cluster_name_from_settings.empty();
+
+    if (!defer_object_storage_cluster_resolution
+        && !result.fallback_to_pure
+        && settings[Setting::object_storage_cluster_fallback_if_empty])
+    {
+        result.object_storage_cluster = getClusterImpl(
+            context,
+            cluster_name_from_settings,
+            isObjectStorage() ? settings[Setting::object_storage_max_nodes] : 0,
+            /*allow_null*/ true);
+        if (!result.object_storage_cluster)
+            result.fallback_to_pure = true;
+    }
+
+    if (result.fallback_to_pure && settings[Setting::object_storage_remote_initiator])
+    {
+        auto remote_initiator_cluster_name = settings[Setting::object_storage_remote_initiator_cluster].value;
+        if (!remote_initiator_cluster_name.empty())
+        {
+            result.remote_initiator_cluster = getClusterImpl(
+                context,
+                remote_initiator_cluster_name,
+                /*max_hosts*/ 0,
+                /*allow_null*/ settings[Setting::object_storage_cluster_fallback_if_empty]);
+        }
+    }
+
+    return result;
+}
+
 /// The code executes on initiator
 void IStorageCluster::read(
     QueryPlan & query_plan,
@@ -374,47 +427,25 @@ void IStorageCluster::read(
     const auto & settings = context->getSettingsRef();
     ASTPtr query_to_send = query_info.query;
 
-    ClusterPtr cluster = nullptr;
+    auto resolved = resolveClusterRead(context);
+    ClusterPtr cluster = resolved.object_storage_cluster;
 
-    bool fallback_to_pure = cluster_name_from_settings.empty();
-
-    if (!fallback_to_pure && settings[Setting::object_storage_cluster_fallback_if_empty])
-    {
-        cluster = getClusterImpl(
-            context,
-            cluster_name_from_settings,
-            isObjectStorage() ? settings[Setting::object_storage_max_nodes] : 0,
-            /*allow_null*/ true);
-        if (!cluster)
-            fallback_to_pure = true;
-    }
-
-    if (fallback_to_pure)
+    if (resolved.fallback_to_pure)
     {
         if (settings[Setting::object_storage_remote_initiator])
         {
-            auto remote_initiator_cluster_name = settings[Setting::object_storage_remote_initiator_cluster].value;
-            ClusterPtr remote_initiator_cluster;
-            if (!remote_initiator_cluster_name.empty())
-            {
-                remote_initiator_cluster = getClusterImpl(
-                    context,
-                    remote_initiator_cluster_name,
-                    /*max_hosts*/ 0,
-                    /*allow_null*/ settings[Setting::object_storage_cluster_fallback_if_empty]);
-            }
-            if (remote_initiator_cluster_name.empty() || !remote_initiator_cluster)
+            if (!resolved.remote_initiator_cluster)
             {
                 if (settings[Setting::object_storage_cluster_fallback_if_empty])
                 {
                     readFallBackToPure(query_plan, column_names, storage_snapshot, query_info, context, processed_stage, max_block_size, num_streams);
                     return;
                 }
-                // remote_initiator_cluster can be nullptr only when object_storage_cluster_fallback_if_empty is set
-                // so this exception is thrown only with empty remote_initiator_cluster_name
                 throw Exception(ErrorCodes::BAD_ARGUMENTS,
                     "Setting 'object_storage_remote_initiator' can be used only with 'object_storage_remote_initiator_cluster', 'object_storage_cluster', or cluster name in arguments");
             }
+
+            auto remote_initiator_cluster_name = settings[Setting::object_storage_remote_initiator_cluster].value;
 
             /// rewrite query to execute `remote('remote_host', s3(...))`
             /// remote_host can execute query itself or make on-cluster query depends on own `object_storage_cluster` setting
@@ -422,7 +453,7 @@ void IStorageCluster::read(
             updateQueryWithJoinToSendIfNeeded(query_to_send, query_info, context);
             updateQueryToSendIfNeeded(query_to_send, storage_snapshot, context, /*make_cluster_function*/ false);
 
-            auto storage_and_context = convertToRemote(remote_initiator_cluster, context, remote_initiator_cluster_name, query_to_send);
+            auto storage_and_context = convertToRemote(resolved.remote_initiator_cluster, context, remote_initiator_cluster_name, query_to_send);
             auto src_distributed = std::dynamic_pointer_cast<StorageDistributed>(storage_and_context.storage);
             auto modified_query_info = query_info;
             modified_query_info.cluster = src_distributed->getCluster();

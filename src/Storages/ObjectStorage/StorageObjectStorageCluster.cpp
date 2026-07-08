@@ -45,6 +45,7 @@ namespace Setting
     extern const SettingsInt64 delta_lake_snapshot_end_version;
     extern const SettingsUInt64 lock_object_storage_task_distribution_ms;
     extern const SettingsBool allow_experimental_iceberg_read_optimization;
+    extern const SettingsBool object_storage_cluster_fallback_if_empty;
 }
 
 namespace ErrorCodes
@@ -743,15 +744,26 @@ QueryProcessingStage::Enum StorageObjectStorageCluster::getQueryProcessingStage(
     if (!isClusterSupported())
         return QueryProcessingStage::Enum::FetchColumns;
 
-    /// Full query if fall back to pure storage.
-    if (getClusterName(context).empty()  // Not cluster request
-        && context->getSettingsRef()[Setting::object_storage_remote_initiator_cluster].value.empty()) // Not request with remote initiator
-    {
-        if (context->getSettingsRef()[Setting::object_storage_remote_initiator])
-            throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                "Setting 'object_storage_remote_initiator' can be used only with 'object_storage_remote_initiator_cluster', 'object_storage_cluster', or cluster name in arguments");
+    auto resolved = resolveClusterRead(context);
+    const auto & settings = context->getSettingsRef();
 
-        return QueryProcessingStage::Enum::FetchColumns;
+    if (resolved.fallback_to_pure)
+    {
+        if (settings[Setting::object_storage_remote_initiator])
+        {
+            if (!resolved.remote_initiator_cluster)
+            {
+                if (!settings[Setting::object_storage_cluster_fallback_if_empty])
+                    throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                        "Setting 'object_storage_remote_initiator' can be used only with 'object_storage_remote_initiator_cluster', 'object_storage_cluster', or cluster name in arguments");
+
+                return QueryProcessingStage::Enum::FetchColumns;
+            }
+        }
+        else
+        {
+            return QueryProcessingStage::Enum::FetchColumns;
+        }
     }
 
     /// Distributed storage.
