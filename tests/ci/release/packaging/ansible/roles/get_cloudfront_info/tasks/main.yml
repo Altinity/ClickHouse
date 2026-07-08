@@ -20,7 +20,7 @@
 - name: Update the active site, when push_to_active is defined
   set_fact:
     new_cloudfront_origin_path: "{{ cloudfront_origin_path }}"
-  when: 'push_to_active|default(false)'
+  when: 'push_to_active|default(false)|bool'
 
 - name: Calculate the target S3 path
   set_fact:
