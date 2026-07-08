@@ -47,8 +47,9 @@ jobs:
 
       - name: Install ansible and required collections
         run: |
-          pip install --user ansible
-          ansible-galaxy collection install amazon.aws community.aws
+          sudo apt-get update
+          sudo apt-add-repository --yes --update ppa:ansible/ansible
+          sudo apt-get install -y ansible
 
       - name: Set up GPG passphrase
         env:
