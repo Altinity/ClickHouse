@@ -678,8 +678,11 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// events, no counters.
     const auto peek_head = [&](const UInt128 & hash) -> std::optional<HeadResult>
     {
-        const HeadResult hr = backend.head(blobKeyOf(layout, hash));
-        return hr.exists ? std::optional<HeadResult>(hr) : std::nullopt;
+        HeadResult hr = backend.head(blobKeyOf(layout, hash));
+        if (!hr.exists)
+            return std::nullopt;
+        hr.size = retiredLogicalSize(ObjectKind::Blob, hr.size, store->poolMeta().blob_header_len);
+        return hr;
     };
 
     const uint64_t new_generation = state.snap_generation + 1;
