@@ -1368,3 +1368,39 @@ infra/measurement gaps (not CA defects — all had dangling=0 + agreement):
   block; `alive = false` stays early), mirroring `promote`. The precommit becomes watermark-dead only after
   its removal is durably committed, so `reclaimAbandonedPrecommit` can never observe a live-and-dead
   precommit to double-remove. Regression test `CasPromoteRepublish.AbandonEmitsRemovalBeforeRetire`.
+
+## STATELESS-04286-getmountpoint-eisdir: existsFile mountpoint probe throws "Is a directory" on the LOCAL CA backend
+
+- **Logged (UTC):** 2026-07-08
+- **Severity:** finding (pre-existing; NOT caused by the part-folder-cache Phase 1 work — verified the
+  `existsFile` mountpoint branch + `getMountpointObject`/`casGetObject` are untouched by that change).
+- **Run:** `Stateless tests (arm_binary, parallel) --test 04286_content_addressed_remote_data_paths`
+  (isolated re-run reproduces).
+- **Observed:** `SELECT count() >= 0 FROM system.remote_data_paths WHERE disk_name='...' SETTINGS
+  traverse_shadow_remote_data_paths=1` throws `Code 74 CANNOT_READ_FROM_FILE_DESCRIPTOR: Cannot read
+  from file <pool>/ca/roots/<srv>/store: Is a directory (errno 21)`. Stack:
+  `existsFile` (mountpoint branch, `ContentAddressedMetadataStorage.cpp:537`) → `Store::getMountpointObject`
+  → `Store::casGetObject` → `readObjectRanged` opens the pool subdir `store` as a file. The test
+  explicitly pins (per B38) that this traversal must NOT throw "Is a directory".
+- **Analysis:** LOCAL/Emulated object-storage backend specific — a GET on a key that collides with a
+  directory prefix (`store/`) raises EISDIR instead of behaving like an absent object (S3 returns 404).
+  On S3/RustFS this path likely won't reproduce. B38 fixed an earlier incarnation; it has regressed on
+  the branch independently of Phase 1.
+- **Proposed action:** make `Cas::readObjectRanged` / `casGetObject` treat an EISDIR open on the LOCAL
+  backend as object-absent (fail-closed nullopt) for the mountpoint-probe path, OR have
+  `getMountpointObject` HEAD-then-GET. Needs a fail-closed-semantics decision in Core — deferred (not
+  obvious/small). Re-check on the RustFS/S3 stateless job (Task 3c) where it may not reproduce.
+
+## STATELESS-05009-event-log-enabled: content_addressed_log enabled in local stateless env breaks the default-off test
+
+- **Logged (UTC):** 2026-07-08
+- **Severity:** finding (environment/config; NOT a code regression — Phase 1 does not touch log config).
+- **Observed:** `05009_content_addressed_event_log` asserts `system.content_addressed_log` does NOT
+  exist by default (stateless config doesn't enable it). In the local run the table EXISTS (returns 354
+  rows), so `EXISTS TABLE` → 1 and the `serverError UNKNOWN_TABLE` assertion fails.
+- **Analysis:** the local stateless server config has `<content_addressed_log>` enabled (source: the
+  local `tests/config` or harness overlay), contradicting the test's default-off contract. Orthogonal
+  to Phase 1 and to the file-cache work.
+- **Proposed action:** confirm on the CI stateless job whether the default config enables the log; if
+  the local overlay enables it, either the overlay or the test's expectation needs reconciling. Re-check
+  under Task 3c. Low priority.
