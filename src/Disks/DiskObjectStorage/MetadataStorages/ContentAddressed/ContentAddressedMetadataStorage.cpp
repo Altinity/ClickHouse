@@ -41,28 +41,6 @@ namespace ErrorCodes
 namespace
 {
 
-/// Wiring-reserved RefPayload.mutable_files keys (never real MergeTree files — dot-prefixed).
-/// The publish wall-clock is now carried by the typed `RefPayload.published_at_ms` field (epoch ms).
-bool isReservedMutableName(const std::string & name)
-{
-    return name.starts_with(".ca_");
-}
-
-/// A projection DIRECTORY is recognized by its LAST path component (.proj / .tmp_proj) — the same
-/// recognizer the PoC used (B64: also matches the nested detached-staging shape). `file` here is
-/// the ROUTED in-tree file path (the detached part prefix already split away).
-std::optional<std::string> projectionDirPrefix(const std::string & file)
-{
-    if (file.empty())
-        return std::nullopt;
-    const auto last_slash = file.find_last_of('/');
-    const std::string_view last_component
-        = last_slash == std::string::npos ? std::string_view(file) : std::string_view(file).substr(last_slash + 1);
-    if (last_component.ends_with(".proj") || last_component.ends_with(".tmp_proj"))
-        return file + "/";
-    return std::nullopt;
-}
-
 /// Canonical disk-relative path: components joined by single '/', no leading/trailing slashes.
 /// Callers hand paths in both shapes (the Unfreezer walks shadow dirs WITH a trailing slash);
 /// namespace strings and prefix matching need the canonical form.
@@ -527,14 +505,15 @@ ContentAddressedMetadataStorage::route(const ContentAddressed::PartFilePath & p)
     return r;
 }
 
-std::optional<std::pair<Cas::Resolved, Cas::PartManifest>>
+std::shared_ptr<const ContentAddressed::PartFolderView>
 ContentAddressedMetadataStorage::resolveRouted(const Route & r) const
 {
     auto resolved = store()->resolveRef(r.ns, r.ref, /*allow_stale=*/true);
     if (!resolved)
-        return std::nullopt;
+        return nullptr;
     /// A live ref to a missing/corrupt manifest throws (INV-NO-DANGLE surfaced, never substituted).
-    return std::make_pair(*resolved, store()->readManifest(resolved->manifest_id));
+    return ContentAddressed::PartFolderView::make(
+        r.refKey(), *resolved, store()->readManifestShared(resolved->manifest_id));
 }
 
 std::vector<std::string> ContentAddressedMetadataStorage::detachedRefNames(const Cas::RootNamespace & ns) const
@@ -569,13 +548,12 @@ bool ContentAddressedMetadataStorage::existsFile(const std::string & path) const
     {
         /// Force-fresh (Pillar B): read-your-writes for a just-written mutable file — no TTL-stale manifest.
         auto resolved = store()->resolveRef(r->ns, r->ref);
-        return resolved && !isReservedMutableName(r->file) && resolved->mutable_files.contains(r->file);
+        return resolved && !ContentAddressed::PartFolderView::isReservedMutableName(r->file)
+            && resolved->mutable_files.contains(r->file);
     }
 
-    auto rt = resolveRouted(*r);
-    if (!rt)
-        return false;
-    return store()->lookupPath(rt->second, r->file).has_value();
+    auto view = resolveRouted(*r);
+    return view && view->findFile(r->file);
 }
 
 bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) const
@@ -619,18 +597,10 @@ bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) 
         /// A projection dir: at least one tree entry (or mutable file) under its prefix.
         if (r && !r->ref.empty())
         {
-            if (auto prefix = projectionDirPrefix(r->file))
+            if (auto prefix = ContentAddressed::PartFolderView::projectionDirPrefix(r->file))
             {
-                auto rt = resolveRouted(*r);
-                if (!rt)
-                    return false;
-                for (const auto & entry : rt->second.entries)
-                    if (entry.path.starts_with(*prefix))
-                        return true;
-                for (const auto & [file, _] : rt->first.mutable_files)
-                    if (file.starts_with(*prefix))
-                        return true;
-                return false;
+                auto view = resolveRouted(*r);
+                return view && view->hasDirectory(*prefix);
             }
         }
     }
@@ -676,11 +646,11 @@ uint64_t ContentAddressedMetadataStorage::getFileSize(const std::string & path) 
     if (!r || r->file.empty())
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: not a part file path: {}", path);
 
-    auto rt = resolveRouted(*r);
-    if (!rt)
+    auto view = resolveRouted(*r);
+    if (!view)
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no ref for {}", path);
-    if (auto entry = store()->lookupPath(rt->second, r->file))
-        return entry->placement == Cas::EntryPlacement::Inline ? entry->inline_bytes.size() : entry->blob_size;
+    if (auto size = view->fileSize(r->file))
+        return *size;
     throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: file {} not in manifest of {}", r->file, path);
 }
 
@@ -721,16 +691,8 @@ std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const st
         /// Shadow PART dir: the frozen part's file names (first components).
         if (auto p = ContentAddressed::parsePartFilePath(path); p && !p->backup_name.empty() && p->file.empty())
         {
-            auto rt = resolveRouted(Route{shadowNamespace(p->shadow_table_dir), p->part_name, ""});
-            if (!rt)
-                return {};
-            std::unordered_set<std::string> result;
-            for (const auto & entry : rt->second.entries)
-                addFirstComponent(result, entry.path);
-            for (const auto & [file, _] : rt->first.mutable_files)
-                if (!isReservedMutableName(file))
-                    addFirstComponent(result, file);
-            return toVector(std::move(result));
+            auto view = resolveRouted(Route{shadowNamespace(p->shadow_table_dir), p->part_name, ""});
+            return view ? view->listChildren("") : std::vector<std::string>{};
         }
         /// Shadow TABLE dir: the frozen part names.
         if (ContentAddressed::endsWithTableUuidPair(path))
@@ -788,33 +750,16 @@ std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const st
         /// keys collapsed to their first component (projections surface as ONE <proj>.proj entry).
         if (r && !r->ref.empty() && r->file.empty())
         {
-            auto rt = resolveRouted(*r);
-            if (!rt)
-                return {};
-            std::unordered_set<std::string> result;
-            for (const auto & entry : rt->second.entries)
-                addFirstComponent(result, entry.path);
-            for (const auto & [file, _] : rt->first.mutable_files)
-                if (!isReservedMutableName(file))
-                    addFirstComponent(result, file);
-            return toVector(std::move(result));
+            auto view = resolveRouted(*r);
+            return view ? view->listChildren("") : std::vector<std::string>{};
         }
         /// A projection dir: inner names with the <proj>.proj/ prefix stripped.
         if (r && !r->ref.empty())
         {
-            if (auto prefix = projectionDirPrefix(r->file))
+            if (auto prefix = ContentAddressed::PartFolderView::projectionDirPrefix(r->file))
             {
-                auto rt = resolveRouted(*r);
-                if (!rt)
-                    return {};
-                std::unordered_set<std::string> result;
-                for (const auto & entry : rt->second.entries)
-                    if (entry.path.starts_with(*prefix))
-                        result.emplace(entry.path.substr(prefix->size()));
-                for (const auto & [file, _] : rt->first.mutable_files)
-                    if (!isReservedMutableName(file) && file.starts_with(*prefix))
-                        result.emplace(file.substr(prefix->size()));
-                return toVector(std::move(result));
+                auto view = resolveRouted(*r);
+                return view ? view->listChildren(*prefix) : std::vector<std::string>{};
             }
         }
     }
@@ -859,7 +804,7 @@ bool ContentAddressedMetadataStorage::isDirectoryEmpty(const std::string & path)
         auto r = route(*p);
         if (r && !r->ref.empty() && r->file.empty())
             return true;
-        if (r && !r->ref.empty() && projectionDirPrefix(r->file))
+        if (r && !r->ref.empty() && ContentAddressed::PartFolderView::projectionDirPrefix(r->file))
             return true;
     }
     return !iterateDirectory(path)->isValid();
@@ -894,10 +839,10 @@ StoredObjects ContentAddressedMetadataStorage::getStorageObjects(const std::stri
     if (!r || r->file.empty())
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: not a part file path: {}", path);
 
-    auto rt = resolveRouted(*r);
-    if (!rt)
+    auto view = resolveRouted(*r);
+    if (!view)
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no ref for {}", path);
-    if (auto entry = store()->lookupPath(rt->second, r->file))
+    if (const auto * entry = view->findFile(r->file))
     {
         const auto location = store()->locate(*entry);
         /// StoredObject carries no range (the recorded upstream delta) — the PAYLOAD length is the
@@ -931,7 +876,7 @@ std::optional<String> ContentAddressedMetadataStorage::tryGetInManifestBytes(con
     {
         /// Force-fresh (Pillar B): MVCC txn_version / mutable-file read — must not serve a TTL-stale manifest.
         auto resolved = store()->resolveRef(r->ns, r->ref);
-        if (!resolved || isReservedMutableName(r->file))
+        if (!resolved || ContentAddressed::PartFolderView::isReservedMutableName(r->file))
             return std::nullopt;
         auto it = resolved->mutable_files.find(r->file);
         if (it == resolved->mutable_files.end())
@@ -939,13 +884,10 @@ std::optional<String> ContentAddressedMetadataStorage::tryGetInManifestBytes(con
         return it->second;
     }
 
-    auto rt = resolveRouted(*r);
-    if (!rt)
+    auto view = resolveRouted(*r);
+    if (!view)
         return std::nullopt;
-    if (auto entry = store()->lookupPath(rt->second, r->file);
-        entry && entry->placement == Cas::EntryPlacement::Inline)
-        return entry->inline_bytes;
-    return std::nullopt;
+    return view->inlineBytes(r->file);
 }
 
 bool ContentAddressedMetadataStorage::prepareInManifestRead(
@@ -978,10 +920,10 @@ std::optional<ContentAddressedMetadataStorage::BlobViewPlan> ContentAddressedMet
     auto r = route(*p);
     if (!r || r->file.empty())
         return std::nullopt;
-    auto rt = resolveRouted(*r);
-    if (!rt)
+    auto view = resolveRouted(*r);
+    if (!view)
         return std::nullopt;
-    if (auto entry = store()->lookupPath(rt->second, r->file))
+    if (const auto * entry = view->findFile(r->file))
     {
         const auto location = store()->locate(*entry);
         BlobViewPlan plan;
@@ -1027,8 +969,7 @@ std::optional<String> ContentAddressedMetadataStorage::getPartManifestBytes(cons
     if (!resolved)
         return std::nullopt;
 
-    const Cas::PartManifest manifest = store()->readManifest(resolved->manifest_id);
-    return Cas::encodePartManifest(manifest);
+    return Cas::encodePartManifest(*store()->readManifestShared(resolved->manifest_id));
 }
 
 bool ContentAddressedMetadataStorage::adoptPartFromManifest(

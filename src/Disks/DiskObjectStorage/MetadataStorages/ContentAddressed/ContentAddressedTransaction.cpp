@@ -153,7 +153,7 @@ bool ContentAddressedTransaction::republishRef(
     auto resolved = metadata_storage.store()->resolveRef(src_ns, src_ref);
     if (!resolved)
         return false;
-    const Cas::PartManifest src_manifest = metadata_storage.store()->readManifest(resolved->manifest_id);
+    const auto src_manifest = metadata_storage.store()->readManifestShared(resolved->manifest_id);
 
     /// BUG 1c: idempotent re-drive. If dst is ALREADY committed, the prior attempt's promote landed and
     /// only dropRef(src) was interrupted. Compare CONTENT (path-sorted `entries`, not the whole manifest —
@@ -164,8 +164,8 @@ bool ContentAddressedTransaction::republishRef(
     /// `txn_version.txt` rewrite) — re-sync it onto dst below rather than assuming the caller froze src.
     if (auto dst_resolved = metadata_storage.store()->resolveRef(dst_ns, dst_ref))
     {
-        const Cas::PartManifest dst_manifest = metadata_storage.store()->readManifest(dst_resolved->manifest_id);
-        if (dst_manifest.entries != src_manifest.entries)
+        const auto dst_manifest = metadata_storage.store()->readManifestShared(dst_resolved->manifest_id);
+        if (dst_manifest->entries != src_manifest->entries)
             throw Exception(ErrorCodes::ABORTED,
                 "republishRef: destination '{}' is already committed with different content — refusing "
                 "(rename/attach conflict)", dst_ns.string() + "/" + dst_ref);
@@ -188,11 +188,11 @@ bool ContentAddressedTransaction::republishRef(
     /// Record a TOKENLESS W-EVIDENCE dep for every blob the source manifest names — NO HEAD before
     /// precommit. promote re-proves each dep fail-closed. Inline entries record nothing (adoptEvidence
     /// skips them).
-    for (const auto & entry : src_manifest.entries)
+    for (const auto & entry : src_manifest->entries)
         build->adoptEvidence(entry);
 
     /// Stage a fresh dst manifest over the SAME entries (same blob hashes), then move ownership in.
-    const Cas::ManifestId id = build->stageManifest(src_manifest.entries);
+    const Cas::ManifestId id = build->stageManifest(src_manifest->entries);
     build->precommitAdd(dst_ns, dst_ref, id);
     /// Mutable files carry over (a rename is not a new part). promote stamps the dst publish wall-clock.
     build->setPendingMutableFiles(resolved->mutable_files);
@@ -851,8 +851,8 @@ void ContentAddressedTransaction::createHardLink(const std::string & path_from, 
     if (!resolved)
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
             "ContentAddressed: createHardLink source part missing: {}", path_from);
-    const Cas::PartManifest src_manifest = metadata_storage.store()->readManifest(resolved->manifest_id);
-    auto src_entry = metadata_storage.store()->lookupPath(src_manifest, src->file);
+    const auto src_manifest = metadata_storage.store()->readManifestShared(resolved->manifest_id);
+    const auto * src_entry = Cas::findEntry(src_manifest->entries, src->file);
     if (!src_entry)
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
             "ContentAddressed: createHardLink source file missing in manifest: {}", path_from);

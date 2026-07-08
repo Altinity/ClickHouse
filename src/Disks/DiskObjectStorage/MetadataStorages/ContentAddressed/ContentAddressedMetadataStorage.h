@@ -4,6 +4,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedExchange.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartPathParser.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartRefKey.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartFolderView.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/CasGcScheduler.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include <Interpreters/Context_fwd.h>
@@ -238,10 +239,10 @@ private:
         return physical_key_prefix + "/" + key;
     }
 
-    /// resolveRef + readManifest for a routed path; nullopt when the ref is absent. Throws on a
-    /// present-but-corrupt manifest (fail closed, INV-NO-DANGLE surfaced).
-    std::optional<std::pair<Cas::Resolved, Cas::PartManifest>>
-    resolveRouted(const Route & r) const;
+    /// resolveRef + readManifestShared for a routed path, joined into an immutable view; nullptr
+    /// when the ref is absent. Throws on a present-but-corrupt manifest (fail closed, INV-NO-DANGLE
+    /// surfaced). Phase-1 shape: built per call; the Phase-2 facade replaces this method.
+    std::shared_ptr<const ContentAddressed::PartFolderView> resolveRouted(const Route & r) const;
 
     /// Build the GC round sink: the std::function the scheduler calls per Start/Finish. Captures the
     /// ContextPtr, converts the POD GcRoundLogRecord into a ContentAddressedGarbageCollectionLogElement,
