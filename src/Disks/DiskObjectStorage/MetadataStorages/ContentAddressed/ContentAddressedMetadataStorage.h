@@ -61,7 +61,10 @@ public:
         uint64_t manifest_soft_limit_ = 16ULL << 20,
         uint64_t manifest_hard_limit_ = 64ULL << 20,
         uint64_t manifest_max_delay_ms_ = 1000,
-        uint64_t gc_max_conditional_put_bytes_ = 1ULL << 30);
+        uint64_t gc_max_conditional_put_bytes_ = 1ULL << 30,
+        uint64_t cas_part_folder_cache_bytes_ = 64ULL << 20,
+        uint64_t cas_part_folder_cache_max_entries_ = 10000,
+        uint64_t cas_part_folder_cache_max_entry_bytes_ = 16ULL << 20);
 
     /// Test/diagnostics: one synchronous GC round (creates an ad-hoc scheduler when disabled).
     void runOneGcRoundForTest();
@@ -224,6 +227,11 @@ private:
     /// GCS single-PUT budget for conditional writes (generation-token stores only): threaded into
     /// the ObjectStorageBackend construction site in startup(). Irrelevant on ETag stores (AWS et al).
     const uint64_t gc_max_conditional_put_bytes;
+    /// Part-folder view cache settings (spec 2026-07-08-cas-part-folder-cache), threaded into the
+    /// facade construction in startup(). `cas_part_folder_cache_bytes == 0` disables retention.
+    const uint64_t cas_part_folder_cache_bytes;
+    const uint64_t cas_part_folder_cache_max_entries;
+    const uint64_t cas_part_folder_cache_max_entry_bytes;
 
     /// Set by startup (Store::open is fail-closed; empty store == not started).
     Cas::StorePtr cas_store;

@@ -137,7 +137,10 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     uint64_t manifest_soft_limit_,
     uint64_t manifest_hard_limit_,
     uint64_t manifest_max_delay_ms_,
-    uint64_t gc_max_conditional_put_bytes_)
+    uint64_t gc_max_conditional_put_bytes_,
+    uint64_t cas_part_folder_cache_bytes_,
+    uint64_t cas_part_folder_cache_max_entries_,
+    uint64_t cas_part_folder_cache_max_entry_bytes_)
     : object_storage(std::move(object_storage_))
     , storage_path_prefix(std::move(storage_path_prefix_))
     , storage_path_full(fs::path(object_storage->getRootPrefix()) / storage_path_prefix)
@@ -159,6 +162,9 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     , manifest_hard_limit(manifest_hard_limit_)
     , manifest_max_delay_ms(manifest_max_delay_ms_)
     , gc_max_conditional_put_bytes(gc_max_conditional_put_bytes_)
+    , cas_part_folder_cache_bytes(cas_part_folder_cache_bytes_)
+    , cas_part_folder_cache_max_entries(cas_part_folder_cache_max_entries_)
+    , cas_part_folder_cache_max_entry_bytes(cas_part_folder_cache_max_entry_bytes_)
 {
 }
 
@@ -384,7 +390,11 @@ void ContentAddressedMetadataStorage::startup()
     pool_config.manifest_max_delay_ms = manifest_max_delay_ms;
     cas_store = Cas::Store::open(std::move(backend), std::move(pool_config));
     pool_uuid = Cas::u128ToHex(cas_store->poolMeta().pool_id);
-    part_access = std::make_unique<ContentAddressed::CachedPartFolderAccess>(cas_store);
+    part_access = std::make_unique<ContentAddressed::CachedPartFolderAccess>(cas_store,
+        ContentAddressed::CachedPartFolderAccess::CacheParams{
+            .cache_bytes = cas_part_folder_cache_bytes,
+            .max_entries = cas_part_folder_cache_max_entries,
+            .max_entry_bytes = cas_part_folder_cache_max_entry_bytes});
 
     /// B170: bridge per-event CAS decisions to system.content_addressed_log (null sink when context
     /// is absent, e.g. unit tests — emitEvent is then a no-op single branch in the Core).
