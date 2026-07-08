@@ -897,7 +897,7 @@ HasDeadLivePrecommit(n) ==
         /\ m[1] = n
         /\ owner[m] \in Builds             \* still a precommit owner (never promoted/removed)
         /\ mBody[m]                         \* body present (classification 1, skip-eligible), not the clamped-4 path
-        /\ BuildDead(n, m)                  \* the same watermark death predicate the sweep-side reclaim uses
+        /\ BuildDead(n, m)                  \* the fence-barrier death fact (see BuildDead above); the C++ side keys reclaim/guard on the analogous durable-watermark predicate isPrecommitDead/prefixEligible
 \* A token-stable shard is skip-eligible ONLY when it does not hold a live precommit the watermark has
 \* already proven dead — forcing a re-Read so reclaimAbandonedPrecommit can run. SabotageSkipParksDeadPrecommit
 \* DROPS this conjunct = the shipped bug (the static shard is parked forever and its dead precommit is never
