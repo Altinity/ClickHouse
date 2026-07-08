@@ -548,15 +548,6 @@ void ExportPartitionManifestUpdatingTask::poll()
             const auto destination_file_paths_per_part = readDestinationFilePathsPerPart(
                 zk, fs::path(entry_path), key, storage.log.load());
 
-            const bool status_changed = local_entry->status != *status;
-
-            std::optional<ExportReplicatedMergeTreePartitionCommitInfoEntry> commit_info;
-            if (status_changed && *status == ExportReplicatedMergeTreePartitionTaskEntry::Status::COMPLETED)
-            {
-                commit_info = readCommitInfo(
-                    zk, fs::path(entry_path), key, storage.log.load());
-            }
-
             /// If we hold the cleanup lock, enforce the task timeout and recover uncommitted exports.
             /// Entries are never removed here, so we always fall through to refresh / addTask below.
             if (cleanup_lock)
@@ -575,9 +566,17 @@ void ExportPartitionManifestUpdatingTask::poll()
 
             if (!has_local_entry)
             {
-                addTask(metadata, *status, std::move(last_exception_per_replica), std::move(destination_file_paths_per_part), std::move(commit_info),key, entries_by_key);
+                addTask(metadata, *status, std::move(last_exception_per_replica), std::move(destination_file_paths_per_part), readCommitInfo(zk, fs::path(entry_path), key, storage.log.load()), key, entries_by_key);
                 LOG_INFO(storage.log, "ExportPartition Manifest Updating Task: Added new entry for task {}", key);
                 continue;
+            }
+
+            const bool status_changed = local_entry->status != *status;
+
+            /// A silly optimization to avoid reading the commit info if the status is not COMPLETED
+            if (status_changed && *status == ExportReplicatedMergeTreePartitionTaskEntry::Status::COMPLETED)
+            {
+                local_entry->commit_info = readCommitInfo(zk, fs::path(entry_path), key, storage.log.load());
             }
 
             /// If we already have the local entry, we need to update it
