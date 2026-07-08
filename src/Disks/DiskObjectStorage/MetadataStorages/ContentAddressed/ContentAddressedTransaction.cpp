@@ -48,7 +48,6 @@ namespace DB
 
 namespace ErrorCodes
 {
-    extern const int ABORTED;
     extern const int FILE_DOESNT_EXIST;
     extern const int LOGICAL_ERROR;
     extern const int NOT_IMPLEMENTED;
@@ -131,67 +130,6 @@ Cas::Build & ContentAddressedTransaction::buildFor(
             Cas::BuildInfo{.intended_ref = r.ns.string() + "/" + r.ref,
                            .intended_namespace = r.ns, .op = Cas::ProvenanceOp::Insert});
     return *st.build;
-}
-
-bool ContentAddressedTransaction::republishRef(
-    const Cas::RootNamespace & src_ns, const std::string & src_ref,
-    const Cas::RootNamespace & dst_ns, const std::string & dst_ref)
-{
-    /// Move a COMMITTED ref (rev. 15 §republish): content addressing has no rename. Read the SOURCE
-    /// manifest's entries, stage a FRESH dst part manifest over the SAME blob hashes (only blobs are
-    /// content-addressed; a part is a single-owner ManifestId, so dst gets its own id), precommitAdd +
-    /// promote it, then drop the source ref. Returns false (nothing written) when the source is absent.
-    /// Force-fresh (Pillar B): RENAME/move source read — stale mutable_files must not carry to dst.
-    auto resolved = metadata_storage.store()->resolveRef(src_ns, src_ref);
-    if (!resolved)
-        return false;
-    const auto src_manifest = metadata_storage.store()->readManifestShared(resolved->manifest_id);
-
-    /// BUG 1c: idempotent re-drive. If dst is ALREADY committed, the prior attempt's promote landed and
-    /// only dropRef(src) was interrupted. Compare CONTENT (path-sorted `entries`, not the whole manifest —
-    /// ref/namespace/digest legitimately differ): same content => finish the rename by dropping src; a
-    /// different-content dst is a genuine conflict => fail closed (never silently drop src's content).
-    /// `entries` is the idempotency key; `mutable_files` is NOT part of it and can legitimately have
-    /// drifted on src between the crashed promote(dst) and this re-drive (e.g. a `metadata_version.txt`/
-    /// `txn_version.txt` rewrite) — re-sync it onto dst below rather than assuming the caller froze src.
-    if (auto dst_resolved = metadata_storage.store()->resolveRef(dst_ns, dst_ref))
-    {
-        const auto dst_manifest = metadata_storage.store()->readManifestShared(dst_resolved->manifest_id);
-        if (dst_manifest->entries != src_manifest->entries)
-            throw Exception(ErrorCodes::ABORTED,
-                "republishRef: destination '{}' is already committed with different content — refusing "
-                "(rename/attach conflict)", dst_ns.string() + "/" + dst_ref);
-        if (dst_resolved->mutable_files != resolved->mutable_files)
-        {
-            const std::map<String, String> current_mutable_files = resolved->mutable_files;
-            metadata_storage.store()->updateRefPayload(dst_ns, dst_ref, [&](Cas::RootRef & payload)
-            {
-                payload.mutable_files = current_mutable_files;
-            });
-        }
-        metadata_storage.store()->dropRef(src_ns, src_ref);
-        return true;
-    }
-
-    auto build = metadata_storage.store()->startBuild(
-        Cas::BuildInfo{.intended_ref = dst_ns.string() + "/" + dst_ref,
-                       .intended_namespace = dst_ns, .op = Cas::ProvenanceOp::Other});
-
-    /// Record a TOKENLESS W-EVIDENCE dep for every blob the source manifest names — NO HEAD before
-    /// precommit. promote re-proves each dep fail-closed. Inline entries record nothing (adoptEvidence
-    /// skips them).
-    for (const auto & entry : src_manifest->entries)
-        build->adoptEvidence(entry);
-
-    /// Stage a fresh dst manifest over the SAME entries (same blob hashes), then move ownership in.
-    const Cas::ManifestId id = build->stageManifest(src_manifest->entries);
-    build->precommitAdd(dst_ns, dst_ref, id);
-    /// Mutable files carry over (a rename is not a new part). promote stamps the dst publish wall-clock.
-    build->setPendingMutableFiles(resolved->mutable_files);
-    build->promote(dst_ns, dst_ref, build->buildId(), id);
-
-    metadata_storage.store()->dropRef(src_ns, src_ref);
-    return true;
 }
 
 ContentAddressedTransaction::PartStaging * ContentAddressedTransaction::findStaging(
@@ -872,7 +810,7 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
             try
             {
                 for (const auto & [ref, _] : metadata_storage.store()->listRefs(from_ns))
-                    republishRef(from_ns, ref, to_ns, ref);
+                    metadata_storage.partAccess().republishRef({from_ns, ref}, {to_ns, ref});
                 for (const auto & name : metadata_storage.store()->listNamespaceFiles(from_ns))
                     if (auto bytes = metadata_storage.store()->getNamespaceFile(from_ns, name))
                         metadata_storage.store()->putNamespaceFile(to_ns, name, *bytes);
@@ -1026,7 +964,7 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
         /// Move any COMMITTED source ref (a merge/mutation result rename, DETACH, ATTACH, a
         /// delete_tmp_ rename, an early-committed child ref being renamed away). Absent = a pure
         /// staged/tmp move - nothing durable to touch.
-        republishRef(src->ns, src->ref, dst->ns, dst->ref);
+        metadata_storage.partAccess().republishRef(src->refKey(), dst->refKey());
         return;
     }
 

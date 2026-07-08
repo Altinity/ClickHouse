@@ -6,6 +6,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <vector>
 
 namespace DB::Cas { class Build; }
 
@@ -43,6 +44,13 @@ public:
     /// The transaction's terminal publish: pending mutable payload + the atomic owner move.
     void promoteBuild(Cas::Build & build, const PartRefKey & key, UInt128 build_id,
                       const Cas::ManifestId & manifest_id, std::map<String, String> mutable_files);
+    /// The shared committed-publish sequence (spec §Two-Level API, level 2): adopt-evidence over
+    /// `entries`, stage a FRESH manifest, precommit, promote. Used by republishRef and by
+    /// adoptPartFromManifest (their bodies were near-duplicates).
+    void publishEntries(const PartRefKey & dst, const std::vector<Cas::ManifestEntry> & entries,
+                        std::map<String, String> mutable_files, Cas::ProvenanceOp op);
+    /// Move a COMMITTED ref by republish + drop-source. false = absent source (nothing written).
+    bool republishRef(const PartRefKey & src, const PartRefKey & dst);
     /// Mutable-only committed update (autocommit one-shots on a COMMITTED part). NO journal event.
     void updateMutableFiles(const PartRefKey & key, std::function<void(Cas::RootRef &)> mutator);
     void dropRef(const PartRefKey & key);

@@ -118,3 +118,44 @@ TEST(CasPartFolderAccess, WritePrimitivesRoundTrip)
     access.dropNamespace(ns);
     EXPECT_FALSE(access.existsRef({ns, "part_2"}, ContentAddressed::Freshness::ForceFresh));
 }
+
+TEST(CasPartFolderAccess, RepublishRefMovesCommittedRef)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openStoreForTest(backend);
+    const Cas::RootNamespace ns{"srv/t1"};
+    ContentAddressed::CachedPartFolderAccess access(store);
+    publishPart(store, ns, "src_part", {inlineEntry("checksums.txt", "cs")}, {{"txn_version.txt", "v1"}});
+
+    EXPECT_FALSE(access.republishRef({ns, "absent"}, {ns, "dst"}));   /// absent source: nothing written
+
+    ASSERT_TRUE(access.republishRef({ns, "src_part"}, {ns, "dst_part"}));
+    EXPECT_FALSE(access.existsRef({ns, "src_part"}, ContentAddressed::Freshness::ForceFresh));
+    auto view = access.getView({ns, "dst_part"}, ContentAddressed::Freshness::ForceFresh);
+    ASSERT_NE(view, nullptr);
+    EXPECT_NE(view->findFile("checksums.txt"), nullptr);
+    EXPECT_EQ(view->mutableBytes("txn_version.txt"), std::optional<String>("v1"));   /// carried over
+}
+
+TEST(CasPartFolderAccess, RepublishRefIdempotentRedriveAndConflict)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openStoreForTest(backend);
+    const Cas::RootNamespace ns{"srv/t1"};
+    ContentAddressed::CachedPartFolderAccess access(store);
+
+    /// Re-drive: dst already committed with the SAME content (a prior attempt's promote landed,
+    /// only dropRef(src) was interrupted), and src's mutable payload drifted afterwards.
+    publishPart(store, ns, "src", {inlineEntry("f", "same")}, {{"txn_version.txt", "v2"}});
+    publishPart(store, ns, "dst", {inlineEntry("f", "same")}, {{"txn_version.txt", "v1"}});
+    ASSERT_TRUE(access.republishRef({ns, "src"}, {ns, "dst"}));
+    EXPECT_FALSE(access.existsRef({ns, "src"}, ContentAddressed::Freshness::ForceFresh));
+    auto resolved = access.resolve({ns, "dst"}, ContentAddressed::Freshness::ForceFresh);
+    EXPECT_EQ(resolved->mutable_files.at("txn_version.txt"), "v2");   /// re-synced from src
+
+    /// Conflict: dst committed with DIFFERENT content — fail closed, src untouched.
+    publishPart(store, ns, "src2", {inlineEntry("f", "one")});
+    publishPart(store, ns, "dst2", {inlineEntry("f", "two")});
+    expectThrowsCode(ErrorCodes::ABORTED, [&] { access.republishRef({ns, "src2"}, {ns, "dst2"}); });
+    EXPECT_TRUE(access.existsRef({ns, "src2"}, ContentAddressed::Freshness::ForceFresh));
+}

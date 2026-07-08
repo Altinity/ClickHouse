@@ -1069,22 +1069,11 @@ bool ContentAddressedMetadataStorage::adoptPartFromManifest(
 
     try
     {
-        auto build = store()->startBuild(
-            Cas::BuildInfo{.intended_ref = receiver_ns.string() + "/" + part_name,
-                           .intended_namespace = receiver_ns, .op = Cas::ProvenanceOp::Attach});
-
-        /// Tokenless W-EVIDENCE dep per entry — NO pool HEAD/GET before precommit; promote re-proves
-        /// each fail-closed. Inline entries record nothing (adoptEvidence skips them). The blobs are
-        /// already in the shared pool (referenced by hash), so we never putBlob here.
-        for (const auto & entry : decoded.entries)
-            build->adoptEvidence(entry);
-
-        /// Stage a FRESH receiver-local manifest over the SAME entries (its ManifestRef is RANDOM under
-        /// receiver_ns — NOT the sender's identity), then move ownership in.
-        const Cas::ManifestId id = build->stageManifest(decoded.entries);
-        build->precommitAdd(receiver_ns, part_name, id);
-        build->setPendingMutableFiles(mutable_files);
-        build->promote(receiver_ns, part_name, build->buildId(), id);
+        /// Sender identity is NON-AUTHORITATIVE: only the entries are used. The blobs are already
+        /// in the shared pool (referenced by hash) — publishEntries adopts them as tokenless
+        /// W-EVIDENCE and promote re-proves each fail-closed (the proven republish sequence).
+        partAccess().publishEntries({receiver_ns, part_name}, decoded.entries, mutable_files,
+                                    Cas::ProvenanceOp::Attach);
         return true;
     }
     catch (const Exception & e)
