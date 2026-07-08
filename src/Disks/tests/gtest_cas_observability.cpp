@@ -3,6 +3,8 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEvent.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcFormats.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInspect.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
 #include <Common/ProfileEvents.h>
@@ -235,4 +237,83 @@ TEST(CasObservability, ResurrectSupersedeEmitsOnlyRetireReplacedWithOldToken)
     EXPECT_EQ(it->size, P.size())
         << "supersede must persist the LOGICAL size (payload length, header stripped), matching what "
            "a fresh condemn of the same blob would carry -- not the raw physical (header-included) size";
+}
+
+/// Task 3 (Part B, `clickhouse-disks ca-inspect`): `caInspectToJson` is a FREE function (no
+/// disk/backend involved) that decodes any CA bucket object at `key` and renders it as JSON, purely
+/// by matching `key` against `Layout`'s prefixes/key-shapes and calling the matching `decode*`.
+/// These tests drive it directly against real encoder output (one per recognized key shape) plus the
+/// unknown-key fail-closed path — the same function the CLI command (`CommandCaInspect.cpp`) calls.
+
+TEST(CasObservability, CaInspectDecodesRootShardToJson)
+{
+    Layout layout("p");
+    RootShard root;
+    root.shard_version = 7;
+    root.refs["all_0_0_0"] = RootRef{
+        .ref_name = "all_0_0_0",
+        .manifest_ref = ManifestRef{.writer_epoch = 1, .build_sequence = 2, .manifest_ordinal = 1},
+        .mutable_files = {},
+        .published_at_ms = 0};
+    const String key = layout.rootShardKey(RootNamespace{"srv/tbl@cas@"}, 0);
+    const String json = caInspectToJson(layout, key, encodeRootShard(root));
+    EXPECT_NE(json.find("\"shard_version\""), String::npos);
+    EXPECT_NE(json.find("7"), String::npos);
+    EXPECT_NE(json.find("all_0_0_0"), String::npos);
+}
+
+TEST(CasObservability, CaInspectDecodesPartManifestToJson)
+{
+    Layout layout("p");
+    const RootNamespace ns{"srv/tbl@cas@"};
+
+    PartManifest m;
+    m.ref = ManifestRef{.writer_epoch = 1, .build_sequence = 2, .manifest_ordinal = 3};
+    m.root_namespace_id = ns;
+    ManifestEntry e;
+    e.path = "data.bin";
+    e.placement = EntryPlacement::Inline;
+    e.inline_bytes = "hello";
+    m.entries = {e};
+
+    const ManifestId id{.root_namespace = ns, .ref = m.ref};
+    const String key = layout.manifestKey(id);
+    const String json = caInspectToJson(layout, key, encodePartManifest(m));
+    EXPECT_NE(json.find("\"root_namespace_id\""), String::npos);
+    EXPECT_NE(json.find("data.bin"), String::npos);
+    EXPECT_NE(json.find("\"manifest_ordinal\":3"), String::npos);
+}
+
+TEST(CasObservability, CaInspectDecodesMountLeaseToJson)
+{
+    Layout layout("p");
+    MountLease lease;
+    lease.server_uuid = hexToU128("000000000000000000000000000000ab");
+    lease.writer_epoch = 5;
+    lease.hostname = "host1";
+    lease.pid = 123;
+
+    const String key = layout.mountKey("srid1");
+    const String json = caInspectToJson(layout, key, encodeMountLease(lease));
+    EXPECT_NE(json.find("\"writer_epoch\":5"), String::npos);
+    EXPECT_NE(json.find("host1"), String::npos);
+}
+
+TEST(CasObservability, CaInspectDecodesGcStateToJson)
+{
+    Layout layout("p");
+    GcState state;
+    state.round = 42;
+    state.gc_shards = 4;
+
+    const String key = layout.gcStateKey();
+    const String json = caInspectToJson(layout, key, encodeGcState(state));
+    EXPECT_NE(json.find("\"round\":42"), String::npos);
+    EXPECT_NE(json.find("\"gc_shards\":4"), String::npos);
+}
+
+TEST(CasObservability, CaInspectUnknownKeyThrows)
+{
+    Layout layout("p");
+    EXPECT_THROW(caInspectToJson(layout, "p/not/a/ca/object", "xxxx"), DB::Exception);   /// BAD_ARGUMENTS
 }

@@ -134,6 +134,7 @@ DB::CommandPtr makeCommandTouch();
 DB::CommandPtr makeCommandFsck();
 DB::CommandPtr makeCommandCaGcDryRun();
 DB::CommandPtr makeCommandCaGcRebuild();
+DB::CommandPtr makeCommandCaInspect();
 #if CLICKHOUSE_CLOUD
 DB::CommandPtr makeCommandPackedIO();
 #endif
