@@ -146,6 +146,13 @@ PartManifest decodePartManifest(std::string_view data)
         {
             if (have_prev && path == prev_path)
                 throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: duplicate path '{}'", path);
+            /// Strict ascending canonical order (spec 2026-07-08-cas-part-folder-cache): the encoder
+            /// has always written sorted entries; enforcing it here makes duplicate detection sound
+            /// for non-adjacent duplicates AND establishes the ordering invariant `findEntry` /
+            /// `PartFolderView` binary search rely on.
+            if (have_prev && path < prev_path)
+                throw Exception(ErrorCodes::CORRUPTED_DATA,
+                    "PartManifest: entries out of canonical order ('{}' after '{}')", path, prev_path);
             m.entries.push_back(decodeEntryPayload(path, payload));
             prev_path = path;
             have_prev = true;
