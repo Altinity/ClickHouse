@@ -93,13 +93,13 @@ jobs:
 
           echo "Deploying static site assets (installer.sh, landing page, CloudFront routing) to ${{ inputs.release_environment }}..."
           echo "Push to active bucket: ${{ inputs.push_to_active }}"
-          if ! ansible-playbook -i release/packaging/ansible/inventory/localhost.yml \
+          if ! ansible-playbook -i tests/ci/release/packaging/ansible/inventory/localhost.yml \
             -e aws_region="$AWS_REGION" \
             -e repo_dns_name="$REPO_DNS_NAME" \
             -e repo_name="$REPO_NAME" \
             -e repo_subtitle="$REPO_SUBTITLE" \
             -e push_to_active=${{ inputs.push_to_active }} \
-            release/packaging/ansible/deploy-static.yml; then
+            tests/ci/release/packaging/ansible/deploy-static.yml; then
             echo "Ansible playbook failed"
             exit 1
           fi
