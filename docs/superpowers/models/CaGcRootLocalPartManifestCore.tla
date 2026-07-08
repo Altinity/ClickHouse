@@ -1210,6 +1210,12 @@ SingleManifestOwner ==
     /\ extraShared = {}
     /\ \A m1, m2 \in ManifestIds :
         (owner[m1] # None /\ owner[m1] = owner[m2] /\ m1 # m2) => owner[m1] \in Builds
+\* BUG 1 (promote-over-committed): a ref owns AT MOST ONE committed manifest. The WPromote /
+\* WPublishCommitted RefFreeFor guard maintains this; the shipped C++ promote diverged by not enforcing
+\* it (silent overwrite -> two committed bindings for one ref -> the old manifest T_old is leaked). This
+\* invariant makes the property TLC-checked so the model is a regression gate for the C++ fail-close fix.
+AtMostOneCommittedManifestPerRef ==
+    \A r \in Refs : Cardinality({m \in ManifestIds : owner[m] = r}) <= 1
 CommittedManifestBodyRequired ==
     \A m \in ManifestIds : (owner[m] \in Refs) => (mBody[m] /\ BodyValid(m))
 PrecommitMayReferenceMissingManifest == TRUE   \* witnessed reachable, not an invariant to hold
