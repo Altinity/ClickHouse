@@ -187,3 +187,26 @@ TEST(CasPartFolderAccess, ExplainRecordsDecisions)
               ContentAddressed::CachedPartFolderAccess::LastDecision::Invalidated);
     EXPECT_GT(access.explain(key).estimated_bytes, 0u);
 }
+
+TEST(CasPartFolderAccess, BaselineRequestCountsWithoutRetention)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openStoreForTest(backend);
+    const Cas::Layout layout("p");
+    const Cas::RootNamespace ns{"srv/t1"};
+    ContentAddressed::CachedPartFolderAccess access(store);
+    const auto id = publishPart(store, ns, "part_1", {inlineEntry("checksums.txt", "cs")});
+    const ContentAddressed::PartRefKey key{ns, "part_1"};
+    const String manifest_key = layout.manifestKey(id);
+
+    backend->resetCounts();
+    constexpr int n = 5;
+    for (int i = 0; i < n; ++i)
+        ASSERT_NE(access.getView(key, ContentAddressed::Freshness::CachedForLoad), nullptr);
+
+    /// The Phase-3 baseline (retention off): one manifest-body GET (the decode cache absorbs the
+    /// rest) but a mandatory manifest HEAD per call. Phase 4's validated hits remove the HEADs;
+    /// this test pins the numbers Phase 4 improves.
+    EXPECT_EQ(backend->getCount(manifest_key), 1u);
+    EXPECT_EQ(backend->headCount(manifest_key), static_cast<uint64_t>(n));
+}
