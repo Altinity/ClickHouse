@@ -17,10 +17,14 @@ PartFolderView::PartFolderView(PartRefKey key_, Cas::ManifestId manifest_id_, ui
     , manifest_body(std::move(manifest_))
 {
     chassert(manifest_body);
-    /// The binary-search contract: decodePartManifest enforces this for every decoded body; a
+    /// The binary-search contract: entries must be STRICTLY ascending by `path` (sorted AND unique) —
+    /// `decodePartManifest` enforces exactly this for every decoded body, and `findEntry`'s binary
+    /// search assumes uniqueness. `adjacent_find` with `!(a.path < b.path)` flags any adjacent pair
+    /// that is out-of-order OR duplicate (stronger than `is_sorted`, which permits duplicates); a
     /// hand-constructed manifest (tests) must honor it too.
-    chassert(std::is_sorted(manifest_body->entries.begin(), manifest_body->entries.end(),
-        [](const Cas::ManifestEntry & a, const Cas::ManifestEntry & b) { return a.path < b.path; }));
+    chassert(std::adjacent_find(manifest_body->entries.begin(), manifest_body->entries.end(),
+        [](const Cas::ManifestEntry & a, const Cas::ManifestEntry & b) { return !(a.path < b.path); })
+        == manifest_body->entries.end());
 }
 
 std::shared_ptr<const PartFolderView> PartFolderView::make(
@@ -57,6 +61,10 @@ bool PartFolderView::hasFile(const String & path) const
 
 std::optional<uint64_t> PartFolderView::fileSize(const String & path) const
 {
+    /// NOTE: the mutable-file branch is currently unreachable via the sole production caller
+    /// (`getFileSize` short-circuits every mutable-named path through `tryGetInManifestBytes`'s
+    /// force-fresh resolve before it ever reaches a view). It is kept for view-API completeness and
+    /// future direct callers; if a caller relies on it, add coverage for the mutable path.
     if (auto mb = mutableBytes(path))
         return mb->size();
     if (const auto * e = findFile(path))
@@ -84,10 +92,12 @@ std::optional<String> PartFolderView::mutableBytes(const String & path) const
 
 std::vector<String> PartFolderView::listChildren(const String & dir_prefix) const
 {
-    /// First-component collapse over entries + non-reserved mutables. NOTE (deliberate, safe
-    /// normalization vs the pre-view code): projection-dir listings are collapsed too; projection
-    /// contents are flat in every real layout, and collapsing is the correct directory semantic
-    /// for a hypothetical nested one.
+    /// First-component collapse over entries + non-reserved mutables. This is bit-identical to the
+    /// pre-view code for every real manifest: a part directory always needed first-component collapse,
+    /// and a projection directory is STRUCTURALLY FLAT in MergeTree — a projection part folder holds
+    /// only column/checksum/metadata files, never a nested subdirectory — so for a projection prefix
+    /// the collapse equals the old uncollapsed `substr(prefix)` (no further '/' to collapse). The
+    /// collapse is therefore an invariant-preserving unification, not a behavior change.
     std::unordered_set<String> names;
     auto add = [&](const String & full)
     {
