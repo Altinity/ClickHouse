@@ -936,8 +936,6 @@ void Build::promote(const RootNamespace & target_ns, const String & final_ref_na
 void Build::abandon()
 {
     requireAlive();
-    /// No longer in-flight: retire the seq so the GC watermark floor can advance (idempotent).
-    store->retireBuildSeq(build_seq);
     alive = false;
 
     /// BUG 2 / TLA+ `WAbandonPrecommit`: if this build made a manifest a LIVE precommit owner input
@@ -965,6 +963,13 @@ void Build::abandon()
         }, nullptr, RootMutationOrigin::Writer, RootMutationKind::Abandon);
         precommitted = false;
     }
+
+    /// No longer in-flight: retire the seq so the GC watermark floor can advance (idempotent). This runs
+    /// AFTER the precommit removal above (mirrors `Build::promote`, which retires after its CAS) so
+    /// `min_active` can never advance — and let GC's `reclaimAbandonedPrecommit` observe a live precommit
+    /// past the watermark — before the removal is durably committed; retiring first would open a window
+    /// for a double removal race between this call and GC's reclaim.
+    store->retireBuildSeq(build_seq);
 
     /// Best-effort writer cleanup of THIS build's pre-precommit/staged `_manifests` debris (spec
     /// §Pre-Precommit Part-Manifest Debris). The common case is writer cleanup; a missed object is

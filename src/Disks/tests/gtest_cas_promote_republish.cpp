@@ -258,3 +258,44 @@ TEST(CasPromoteRepublish, RepublishReDriveOverDifferentContentDstFailsClosed)
         EXPECT_EQ(e.code(), DB::ErrorCodes::ABORTED);
     }
 }
+
+/// BUG 2: `abandon` must emit its precommit removal BEFORE retiring the build_seq, so GC's
+/// `reclaimAbandonedPrecommit` can never observe a live-and-watermark-dead precommit to double-remove.
+/// Assert the removal is present in the shard journal immediately after `abandon` returns.
+/// (This test passes both before AND after the reorder -- the removal is emitted either way. Its value
+/// is as a regression guard that `abandon` still emits the removal after the reorder. The reorder's
+/// *ordering* correctness -- that GC cannot observe the pre-reorder window -- is not deterministically
+/// reproducible as a timing race in a unit test; it is covered structurally by this reorder plus the
+/// TLA+ `WAbandonPrecommit` model.)
+TEST(CasPromoteRepublish, AbandonEmitsRemovalBeforeRetire)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = openStore(b);
+    const RootNamespace ns{"srv/tbl@cas@"};
+    const String ref = "all_0_0_0";
+    auto build = s->startBuild(BuildInfo{.intended_ref = ns.string() + "/" + ref, .intended_namespace = ns});
+    const ManifestId id = build->stageManifest(inlineEntries("f", "AAA"));
+    const UInt128 build_id = build->buildId();
+    build->precommitAdd(ns, ref, id);
+    build->abandon();
+
+    /// Read the target shard directly off the backend and assert the precommit-removal event
+    /// (old = Precommit(ref, build_id, id), new = none) was appended to its journal.
+    const Layout layout("p");
+    const uint64_t shard = DB::Cas::tests::shardOfForTest(ref, /*root_shards*/ 32);
+    const auto got = b->get(layout.rootShardKey(ns, shard));
+    ASSERT_TRUE(got.has_value());
+    const RootShard root = decodeRootShard(got->bytes);
+
+    const bool found = std::any_of(root.journal.begin(), root.journal.end(), [&](const RootOwnerEvent & ev)
+    {
+        return ev.old_binding.has_value()
+            && ev.old_binding->owner_kind == OwnerKind::Precommit
+            && ev.old_binding->ref_name == ref
+            && ev.old_binding->build_id == build_id
+            && ev.old_binding->manifest_ref == id.ref
+            && !ev.new_binding.has_value();
+    });
+    EXPECT_TRUE(found) << "abandon() must append the precommit-removal event (old=Precommit, new=none) "
+                           "to the target shard journal";
+}
