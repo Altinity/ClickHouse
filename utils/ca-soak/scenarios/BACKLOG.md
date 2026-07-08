@@ -1404,3 +1404,27 @@ infra/measurement gaps (not CA defects — all had dangling=0 + agreement):
 - **Proposed action:** confirm on the CI stateless job whether the default config enables the log; if
   the local overlay enables it, either the overlay or the test's expectation needs reconciling. Re-check
   under Task 3c. Low priority.
+
+## GTEST-CAWIRING-3-PREEXISTING: three gtest_ca_wiring.cpp tests red on the branch (NOT part-folder-cache)
+
+- **Logged (UTC):** 2026-07-09
+- **Severity:** finding (pre-existing on the dev branch; DEFINITIVELY not caused by the part-folder-cache
+  Phases 1-3 — reverted all part-folder-cache src to the pre-Phase-1 baseline `e6fa3bf16f6`, rebuilt
+  `unit_tests_dbms`, and all three fail IDENTICALLY at baseline; `gtest_ca_wiring.cpp` itself is untouched
+  by the work and predates the session).
+- **Observed (both at HEAD and at e6fa3bf16f6):**
+  - `CaWiringOps.FreezeViaHardLinksIntoShadow` (`gtest_ca_wiring.cpp:872`): after
+    `removeRecursive("shadow/bk1")`, `existsDirectory("shadow/bk1")` still returns true (expected false).
+    The deeper path (`shadow/bk1/store/...`, L871) correctly reports gone — only the backup-root
+    intermediate marker lingers. Shadow-intermediate `existsDirectory` + `removeRecursive`/`dropNamespace`
+    interaction.
+  - `CaWiringGc.DroppedPartIsReclaimedByRounds`: throws `promote: blob <hash> condemned at commit
+    revalidation — failing closed (INV-1)` — a promote races a GC condemn within the test's round-driving.
+  - `CaWiringGc.DisplacedTreeBlobsReclaimedThroughRealPath` (`:1031`): `after.unreachable == 2`,
+    expected 0 — manifestA's unique blobs not reclaimed after displacement (B199 real-path).
+- **Note:** these are in the `CaWiring*` suite, which NO recent session gated (every gate used
+  `--gtest_filter='Cas*'`, which does not match `CaWiring*`) — so they have been silently red. The two GC
+  ones are GC/blob-lifecycle behaviors; the first is shadow-namespace removal. All three are independent
+  of the read-path/observability refactor.
+- **Proposed action:** triage separately (GC round/condemn timing + shadow-root removal). Add `CaWiring*`
+  to a gate going forward. Deferred (not caused by current work; needs GC-domain investigation).
