@@ -45,5 +45,19 @@ Watchdog cron: job 60470431 (hourly at :23).
   built clickhouse clean; re-ran → **GREEN: 2 passed** (roundtrip + cache-hit metrics cold≫warm).
 - **Task 1 COMPLETE.** Commits: af43bfc5dcb (with_rustfs infra), 40cf056cacb (integration test),
   3ed0e5f5030 (fix). Docs: ROADMAP row → DONE; tmp/test_stand_ca_storage.xml comment updated; memory
-  `project-ca-cache-disk-unwired` → resolved. NEXT: review-subagent gate, then session-Task 2
-  (part-folder-cache phases 1-5, subagent-driven, on cas-gc-rebuild — NOT a new branch per user).
+  `project-ca-cache-disk-unwired` → resolved. Review gate: no Critical.
+
+### 2026-07-09 — Task 2 (part-folder metadata cache) COMPLETE
+- All 5 phases implemented subagent-driven on cas-gc-rebuild (~19 commits a80a32553f5..76d46ad96a1).
+  Cas* gtests 535/535. Per-phase reviews (P1/P2/P4 dedicated, P3 inline) + FINAL whole-branch review (opus)
+  = READY TO MERGE, no surviving Critical/Important.
+- Highlights: index-free PartFolderView over shared decode; readManifestShared (no per-op copy); strict
+  decoder ordering; CachedPartFolderAccess facade owns committed reads+writes; validate-on-hit retention
+  (ON by default, cas_part_folder_cache_bytes=0 disables); single-flight; write-through erase; byte-bounded
+  manifest decode cache. ACCEPTANCE MET: ≤1 manifest GET + 0 HEAD per load window on validated hits
+  (confirmed: on=1GET+1HEAD/5reads, off=1GET+5HEADs).
+- Baseline-confirmed PRE-EXISTING (not this work), backlogged: 3 CaWiring* GC/shadow tests (fail identically
+  at e6fa3bf16f6); 2 CA stateless env failures (04286 EISDIR-on-LOCAL, 05009 log-enabled). 3 Phase-4
+  observability minors backlogged (dead evictions counter etc.). GATING GAP noted: CaWiring* never in gate.
+- NOT pushed (CLAUDE.md: push only when asked). NEXT: Task 3 stabilization (3a backlog sweep + scenario
+  infra, 3b soak+replica-freeze 4h, 3c stateless CA-s3 triage).
