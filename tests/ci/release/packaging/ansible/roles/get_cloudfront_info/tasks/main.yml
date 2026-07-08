@@ -1,5 +1,5 @@
 - name: Get existing CloudFront information
-  community.aws.cloudfront_info:
+  community.aws.cloudfront_distribution_info:
     distribution: yes
     domain_name_alias: "{{ repo_dns_name }}"
   register: cloudfront_info

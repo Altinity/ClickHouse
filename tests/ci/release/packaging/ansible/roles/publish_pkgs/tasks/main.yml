@@ -52,7 +52,7 @@
       .txt: text/plain
 
 - name: Template HTML files to S3
-  amazon.aws.aws_s3:
+  amazon.aws.s3_object:
     bucket: "{{ repo_dns_name }}"
     object: "{{ new_cloudfront_origin_path }}/{{ target_filenames[item.path] }}"
     content: "{{ lookup('template', item.path) }}"
@@ -64,7 +64,7 @@
     label: "{{ item.path }}"
 
 - name: Copy other static files to S3
-  amazon.aws.aws_s3:
+  amazon.aws.s3_object:
     bucket: "{{ repo_dns_name }}"
     object: "{{ new_cloudfront_origin_path }}/{{ target_filenames[item.path] }}"
     src: "{{ item.path }}"
@@ -78,7 +78,7 @@
     label: "{{ item.path }}"
 
 - name: Upload installer.sh with an explicit text/plain Content-Type
-  amazon.aws.aws_s3:
+  amazon.aws.s3_object:
     bucket: "{{ repo_dns_name }}"
     object: "{{ new_cloudfront_origin_path }}/installer.sh"
     src: "{{ static_path }}/installer.sh"
@@ -132,8 +132,7 @@
   when: cf_function_describe.rc != 0
 
 - name: Get current function code (to detect drift on later runs)
-  command: "aws cloudfront get-function --name {{ cf_function_name }} --stage DEVELOPMENT --output text"
-  register: cf_function_current_code
+  command: "aws cloudfront get-function --name {{ cf_function_name }} --stage DEVELOPMENT /tmp/{{ cf_function_name }}-current-code.js"
   when: cf_function_describe.rc == 0
   changed_when: false
 
@@ -146,7 +145,7 @@
     --function-code fileb://{{ cf_function_js_path }}
   when:
     - cf_function_describe.rc == 0
-    - cf_function_current_code.stdout | trim != lookup('file', cf_function_js_path) | trim
+    - lookup('file', '/tmp/' + cf_function_name + '-current-code.js') | trim != lookup('file', cf_function_js_path) | trim
 
 - name: Re-check function state after create/update
   command: "aws cloudfront describe-function --name {{ cf_function_name }} --stage DEVELOPMENT"
