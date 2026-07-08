@@ -1304,6 +1304,16 @@ infra/measurement gaps (not CA defects — all had dangling=0 + agreement):
   spec (`…resurrect-reupload-orphan-fix-design.md` §Observability) intended `{hash, old_token, new_token,
   round}` — add the superseded token to `detail`. Neither is a data-safety issue; both belong in this
   audit-accuracy cycle.
+- **RESOLVED 2026-07-08 (branch `cas-gc-rebuild`).** `Build::stageManifest` now emits `manifest_put` (a
+  manifest's body write) and `Build::abandon` emits `precommit_removed` (the writer-side precommit removal;
+  GC-side already logged `precommit_reclaim`) — so the manifest/precommit lifecycle is fully auditable
+  per-object in `system.content_addressed_log` and "precommit created, never removed" is a visible gap. The
+  dead `ManifestExpand`/`ManifestRetire`/`ManifestStrip` enum entries were deleted. Blob-audit fixes: the
+  resurrect supersede in `closeBlob` now uses a side-effect-free peek (same single S3 HEAD) so it emits ONLY
+  `blob_retire_replaced` (not also `blob_retire`) with a single `CasGcRetireReplaced` increment, and records
+  the superseded `old_token` in `detail["superseded_token"]` (a review caught + fixed a size-unit regression
+  in the peek — now applies `retiredLogicalSize` like `head_blob`). Commits `ab74694aaa8`, `0f539bafc0b`,
+  `99cbe199580`. Unit: `CasObservability.*`.
 
 ## INTROSPECTION-2 (2026-07-07): no easy human-readable introspection of CA bucket objects
 
@@ -1317,6 +1327,13 @@ infra/measurement gaps (not CA defects — all had dangling=0 + agreement):
   `ca-gc-dryrun`) as e.g. `ca-inspect <key>` → human-readable JSON for any CA object; optionally extend fsck
   detail to report the "why" per key (`reachable-via` / `spared-by-precommit` / `eligible`) so leaks like this
   surface directly. Ends hand hex-decoding of the bucket.
+- **RESOLVED 2026-07-08 (branch `cas-gc-rebuild`, commit `82bc0df7df8`).** Added `clickhouse-disks ca-inspect
+  <key>` — read-only, dispatches by key layout to the existing decoders (`decodeRootShard`/
+  `decodePartManifest`/`decodeMountLease`/`decodeGcState`/`decodeFoldSeal`/`decodeRetiredSet` + the
+  `CasEnvelope` header for `blobs/`) and prints human-readable JSON; unknown key → `BAD_ARGUMENTS` listing
+  recognized layouts (fail-closed, no guessed dump). The decode→JSON logic is a CLI-free `caInspectToJson`
+  free function (`Core/CasInspect.{h,cpp}`), unit-tested against each encoder's output. The optional fsck
+  "why per key" extension is NOT included (deferred). Ends the ephemeral-`mc` + `od` hand-decoding.
 
 
 ## PROMOTE-OVER-COMMITTED-LEAK (2026-07-08, write-path audit) — MEDIUM, real reachable leak + fail-close gap
