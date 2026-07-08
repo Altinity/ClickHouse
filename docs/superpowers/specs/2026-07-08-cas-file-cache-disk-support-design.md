@@ -71,9 +71,23 @@ safe because:
   ONE mount and ONE mount lease — no self-conflict.
 - `shutdown()` is idempotent (`gc_scheduler` reset guarded, `cas_store.reset()` safe to call twice).
   `DiskSelector::shutdown` shutting down both disks is harmless.
-- `DiskSelector::unwrapEncryptedAndCacheLayers` already tolerates a cache disk whose metadata storage
-  IS the CA storage directly (its `while (dynamic_cast<MetadataStorageFromCacheObjectStorage*>)` loop
-  simply peels nothing and returns the CA storage) — so the plain-rewritable dedup guard keeps working.
+- The plain-rewritable dedup guard in `DiskSelector::recordDisk` is INAPPLICABLE to CA disks (not
+  merely "tolerant"): it only runs for `disk->isPlain()` disks (`DiskSelector.cpp:52`), and
+  `ContentAddressedMetadataStorage` never overrides `isPlain()` so both the base CA disk and the CA
+  cache disk report `isPlain() == false` — the guard block is simply skipped for both. Nothing relies
+  on it firing for CA, so reusing the CA metadata storage changes nothing here. (The only
+  `dynamic_cast<MetadataStorageFromCacheObjectStorage*>` site is `DiskSelector.cpp:32`, inside
+  `unwrapEncryptedAndCacheLayers`, which peels nothing when the metadata storage IS the CA storage —
+  harmless.)
+
+### GC identity binds to the base disk name {#gc-identity}
+
+The CA metadata storage's `disk_name` (used for the GC-lease/scheduler naming and
+`system.content_addressed_log` attribution) is bound once at construction to the BASE disk's factory
+name. Because the cache disk reuses that same metadata storage, running
+`SYSTEM CONTENT ADDRESSED GC ...` against the cache disk's name operates/attributes under the base
+disk's identity. This is correct (one CA mount = one GC identity) but slightly surprising UX — two disk
+names, one GC identity. Documented, not changed.
 
 ### Write/read data flow under B {#data-flow}
 
