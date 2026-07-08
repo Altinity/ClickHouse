@@ -159,6 +159,9 @@ bool ContentAddressedTransaction::republishRef(
     /// only dropRef(src) was interrupted. Compare CONTENT (path-sorted `entries`, not the whole manifest —
     /// ref/namespace/digest legitimately differ): same content => finish the rename by dropping src; a
     /// different-content dst is a genuine conflict => fail closed (never silently drop src's content).
+    /// `entries` is the idempotency key; `mutable_files` is NOT part of it and can legitimately have
+    /// drifted on src between the crashed promote(dst) and this re-drive (e.g. a `metadata_version.txt`/
+    /// `txn_version.txt` rewrite) — re-sync it onto dst below rather than assuming the caller froze src.
     if (auto dst_resolved = metadata_storage.store()->resolveRef(dst_ns, dst_ref))
     {
         const Cas::PartManifest dst_manifest = metadata_storage.store()->readManifest(dst_resolved->manifest_id);
@@ -166,6 +169,14 @@ bool ContentAddressedTransaction::republishRef(
             throw Exception(ErrorCodes::ABORTED,
                 "republishRef: destination '{}' is already committed with different content — refusing "
                 "(rename/attach conflict)", dst_ns.string() + "/" + dst_ref);
+        if (dst_resolved->mutable_files != resolved->mutable_files)
+        {
+            const std::map<String, String> current_mutable_files = resolved->mutable_files;
+            metadata_storage.store()->updateRefPayload(dst_ns, dst_ref, [&](Cas::RootRef & payload)
+            {
+                payload.mutable_files = current_mutable_files;
+            });
+        }
         metadata_storage.store()->dropRef(src_ns, src_ref);
         return true;
     }
