@@ -170,7 +170,7 @@ TEST(CasThreeCursorMerge, FloorBoundary)
     std::vector<RunRef> runs2;
     RetiredMergeResult rmr;
     foldDeltasIntoGeneration(backend, layout, /*prior_runs*/runs1, 2, 0, 0, {}, runs2,
-        {entry(1, 2), entry(2, 3)}, /*min_ack*/3, /*condemn_round*/4, {}, &rmr);
+        {entry(1, 2), entry(2, 3)}, /*min_ack*/3, /*condemn_round*/4, /*head_blob*/{}, /*peek_head*/{}, &rmr);
 
     /// Two-phase graduation: the floor-passed entry is REPUBLISHED pending (still in the list);
     /// its physical delete belongs to the NEXT pass.
@@ -200,7 +200,7 @@ TEST(CasThreeCursorMerge, PendingRedeletesAndDrops)
     std::vector<RunRef> runs;
     RetiredMergeResult rmr;
     foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{}, 1, 0, 0, {}, runs,
-        {pending}, /*min_ack*/9, /*condemn_round*/9, {}, &rmr);
+        {pending}, /*min_ack*/9, /*condemn_round*/9, /*head_blob*/{}, /*peek_head*/{}, &rmr);
 
     ASSERT_EQ(rmr.redelete.size(), 1u);
     EXPECT_EQ(rmr.redelete[0].hash, b(1));
@@ -219,7 +219,7 @@ TEST(CasThreeCursorMerge, RecoverySpares)
     std::vector<RunRef> runs;
     RetiredMergeResult rmr;
     foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{}, 1, 0, 0, {{b(1), s(1), false}}, runs,
-        {entry(1, 1)}, /*min_ack*/5, /*condemn_round*/6, {}, &rmr);
+        {entry(1, 1)}, /*min_ack*/5, /*condemn_round*/6, /*head_blob*/{}, /*peek_head*/{}, &rmr);
 
     ASSERT_EQ(rmr.spared.size(), 1u);
     EXPECT_EQ(rmr.spared[0].hash, b(1));
@@ -240,7 +240,7 @@ TEST(CasThreeCursorMerge, NewCandidateCondemned)
     std::vector<RunRef> runs2;
     RetiredMergeResult rmr;
     foldDeltasIntoGeneration(backend, layout, /*prior_runs*/runs1, 2, 0, 0, {{b(3), s(1), true}}, runs2,
-        {}, /*min_ack*/0, /*condemn_round*/7, headPresent("t9", 42), &rmr);
+        {}, /*min_ack*/0, /*condemn_round*/7, headPresent("t9", 42), /*peek_head*/{}, &rmr);
 
     ASSERT_EQ(rmr.still_retired.size(), 1u);
     EXPECT_EQ(rmr.still_retired[0].hash, b(3));
@@ -265,7 +265,7 @@ TEST(CasThreeCursorMerge, AbsentBlobNotCondemned)
     RetiredMergeResult rmr;
     foldDeltasIntoGeneration(backend, layout, /*prior_runs*/runs1, 2, 0, 0, {{b(3), s(1), true}}, runs2,
         {}, /*min_ack*/0, /*condemn_round*/7,
-        [](const UInt128 &) -> std::optional<HeadResult> { return std::nullopt; }, &rmr);
+        [](const UInt128 &) -> std::optional<HeadResult> { return std::nullopt; }, /*peek_head*/{}, &rmr);
 
     EXPECT_TRUE(rmr.still_retired.empty());
     EXPECT_TRUE(rmr.graduated.empty());
@@ -288,7 +288,7 @@ TEST(CasThreeCursorMerge, SnapshotBytesUnchanged)
     RetiredMergeResult rmr;
     foldDeltasIntoGeneration(engaged, layout, /*prior_runs*/{}, 1, 0, 0,
         {{b(1), s(1), false}, {b(2), s(1), false}, {b(2), s(2), true}}, r2,
-        {entry(1, 1), entry(5, 2)}, /*min_ack*/9, /*condemn_round*/3, headPresent("t", 1), &rmr);
+        {entry(1, 1), entry(5, 2)}, /*min_ack*/9, /*condemn_round*/3, headPresent("t", 1), /*peek_head*/{}, &rmr);
 
     const auto ga = plain.get(layout.blobTargetRunKey(1, 0, 0, 0));
     const auto gb = engaged.get(layout.blobTargetRunKey(1, 0, 0, 0));

@@ -147,6 +147,7 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
                               const std::vector<RetiredEntry> & prior_retired,
                               uint64_t min_ack, uint64_t condemn_round,
                               const std::function<std::optional<HeadResult>(const UInt128 &)> & head_blob,
+                              const std::function<std::optional<HeadResult>(const UInt128 &)> & peek_head,
                               RetiredMergeResult * out_retired,
                               bool suppress_destructive)
 {
@@ -236,10 +237,15 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
             /// replaced the incarnation at this key — supersede the stale entry with a fresh condemn of the
             /// current token so the replacement enters the pipeline (the stale token's exact-token delete
             /// would only find the new token and no-op). Keyed on (hash, current token), matching GRetire.
+            /// `peek_head` (audit fix, 2026-07-08): a SIDE-EFFECT-FREE peek, deliberately NOT `head_blob` —
+            /// `head_blob` is the fresh-condemn hook (emits `BlobRetire` + increments
+            /// `CasGcRetiredCondemned`); calling it here would double-emit `blob_retire` alongside the
+            /// `blob_retire_replaced` this supersede already produces below, and double-count the
+            /// condemned counter for one physical condemnation.
             bool superseded = false;
-            if (cur_edges == 0 && cur_touched && head_blob)
+            if (cur_edges == 0 && cur_touched && peek_head)
             {
-                if (const auto hr = head_blob(cur_blob);
+                if (const auto hr = peek_head(cur_blob);
                     hr && hr->exists && hr->token != prior_retired[ri].token)
                 {
                     RetiredEntry fresh;
@@ -248,7 +254,10 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
                     fresh.token = hr->token;
                     fresh.size = hr->size;
                     fresh.condemn_round = condemn_round;
-                    rmr.replaced.push_back(fresh);              /// caller emits blob_retire_replaced
+                    ReplacedEntry re;
+                    re.old_token = prior_retired[ri].token;     /// the stale token this supersede replaces
+                    re.fresh = fresh;
+                    rmr.replaced.push_back(std::move(re));      /// caller emits blob_retire_replaced
                     rmr.still_retired.push_back(std::move(fresh));
                     ++ri;                                       /// drop the stale entry (superseded)
                     superseded = true;

@@ -2,13 +2,23 @@
 #include <Disks/tests/cas_test_helpers.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEvent.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
+#include <Common/ProfileEvents.h>
 #include <algorithm>
 #include <memory>
 #include <vector>
 
+namespace ProfileEvents
+{
+extern const Event CasGcRetiredCondemned;
+extern const Event CasGcRetireReplaced;
+}
+
 using namespace DB::Cas;
+using DB::Cas::tests::idOf;
+using DB::Cas::tests::u128Of;
 
 namespace
 {
@@ -17,6 +27,27 @@ StorePtr openStore(std::shared_ptr<InMemoryBackend> & b)
 {
     b = std::make_shared<InMemoryBackend>();
     return Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+}
+
+/// Publish ONE ref naming a single-blob part through the real writer sequence (mirrors
+/// `publishOneBlobPart` in `gtest_cas_gc_leak.cpp`, duplicated here because that helper has internal
+/// linkage in its own translation unit).
+ManifestId publishOneBlobPart(
+    const StorePtr & s, const RootNamespace & ns, const String & ref, const String & payload)
+{
+    BuildInfo info;
+    info.intended_ref = ns.string() + "/" + ref;
+    auto build = s->startBuild(info);
+    build->putBlob(idOf(payload), BlobSource::fromString(payload));
+    DB::Cas::ManifestEntry e;
+    e.path = "data.bin";
+    e.placement = EntryPlacement::Blob;
+    e.blob_hash = u128Of(payload);
+    e.blob_size = payload.size();
+    const ManifestId id = build->stageManifest({e});
+    build->precommitAdd(ns, ref, id);
+    build->promote(ns, ref, build->buildId(), id);
+    return id;
 }
 
 }
@@ -108,4 +139,83 @@ TEST(CasObservability, AbandonWithoutPrecommitEmitsNoPrecommitRemoved)
 
     EXPECT_EQ(std::count_if(seen.begin(), seen.end(),
         [](const CasEvent & x){ return x.type == CasEventType::PrecommitRemoved; }), 0);
+}
+
+/// Task 2 (Part A audit fix, 2026-07-08): the resurrect-supersede branch inside `closeBlob`
+/// (`CasBlobInDegree.cpp`) used to peek the current token via `head_blob` — the FRESH-CONDEMN
+/// observation hook — which double-emitted `blob_retire` alongside `blob_retire_replaced` and
+/// double-counted `CasGcRetiredCondemned` for what is really ONE physical condemnation (the resurrect
+/// replaced a stale retired entry with the current token). Drives the same condemn-A / resurrect-B /
+/// drop-B sequence as `CasGcLeak.ResurrectReplacedIncarnationReclaimed`, then isolates the ONE round
+/// that folds B's create+drop and supersedes A's stale retired entry: that round must emit exactly one
+/// `blob_retire_replaced` (carrying the STALE token A in `detail["superseded_token"]`), ZERO
+/// `blob_retire` for this hash, one `CasGcRetireReplaced` increment, and NO `CasGcRetiredCondemned`
+/// double-count.
+TEST(CasObservability, ResurrectSupersedeEmitsOnlyRetireReplacedWithOldToken)
+{
+    std::shared_ptr<InMemoryBackend> b;
+    auto s = openStore(b);
+    const RootNamespace ns{"test/tbl"};
+    const String P = "resurrect-payload-audit";
+
+    /// 1. Publish ref r1 -> token A referenced; drop it; ONE GC round condemns A (retired, not deleted).
+    publishOneBlobPart(s, ns, "r1", P);
+    const HeadResult hA = b->head(s->layout().blobKey(idOf(P)));
+    ASSERT_TRUE(hA.exists);
+    s->dropRef(ns, "r1");
+    s->renewWatermarkOnce();
+
+    Gc gc(s, hexToU128("000000000000000000000000000000ab"));
+    {
+        const RoundReport rep = gc.runRegularRound();
+        ASSERT_TRUE(rep.acquired_lease);
+    }
+    s->retireView().refresh();
+    ASSERT_TRUE(s->retireView().isCondemnedToken(ObjectKind::Blob, u128Of(P), hA.token))
+        << "precondition: token A must be condemned before the resurrect";
+
+    /// 2. RESURRECT: r2 dedup-hits P while A is condemned -> mints a fresh incarnation B; drop it too.
+    publishOneBlobPart(s, ns, "r2", P);
+    const HeadResult hB = b->head(s->layout().blobKey(idOf(P)));
+    ASSERT_TRUE(hB.exists);
+    ASSERT_NE(hB.token.value, hA.token.value) << "resurrect must mint a new incarnation token B";
+    s->dropRef(ns, "r2");
+    s->renewWatermarkOnce();
+
+    /// 3. The NEXT round folds r2's create+drop in one pass and must SUPERSEDE A's stale retired entry
+    /// with a fresh condemn of B (peek, not the fresh-condemn `head_blob` hook). Capture events + the
+    /// counters for exactly THIS round.
+    using ProfileEvents::global_counters;
+    const auto condemned_before = global_counters[ProfileEvents::CasGcRetiredCondemned].load();
+    const auto replaced_before  = global_counters[ProfileEvents::CasGcRetireReplaced].load();
+
+    std::vector<CasEvent> seen;
+    s->setEventSink([&](const CasEvent & e){ seen.push_back(e); });
+    const RoundReport rep = gc.runRegularRound();
+    s->setEventSink(nullptr);
+    ASSERT_TRUE(rep.acquired_lease);
+
+    const auto condemned_after = global_counters[ProfileEvents::CasGcRetiredCondemned].load();
+    const auto replaced_after  = global_counters[ProfileEvents::CasGcRetireReplaced].load();
+
+    const String hash_hex = u128ToHex(u128Of(P));
+    const auto is_this_blob = [&](const CasEvent & e){ return e.object_hash == hash_hex; };
+
+    EXPECT_EQ(std::count_if(seen.begin(), seen.end(),
+        [&](const CasEvent & e){ return is_this_blob(e) && e.type == CasEventType::BlobRetire; }), 0)
+        << "supersede must not also emit blob_retire (that is the fresh-condemn hook's event)";
+
+    std::vector<CasEvent> replaced_events;
+    std::copy_if(seen.begin(), seen.end(), std::back_inserter(replaced_events),
+        [&](const CasEvent & e){ return is_this_blob(e) && e.type == CasEventType::BlobRetireReplaced; });
+    ASSERT_EQ(replaced_events.size(), 1u) << "exactly one blob_retire_replaced for the supersede";
+    EXPECT_EQ(replaced_events[0].token, hB.token.value) << "the event's own token is the fresh CURRENT token B";
+    ASSERT_TRUE(replaced_events[0].detail.count("superseded_token"));
+    EXPECT_FALSE(replaced_events[0].detail.at("superseded_token").empty());
+    EXPECT_EQ(replaced_events[0].detail.at("superseded_token"), hA.token.value)
+        << "superseded_token must name the STALE token (A) the resurrect replaced";
+
+    EXPECT_EQ(replaced_after - replaced_before, 1u) << "CasGcRetireReplaced increments exactly once";
+    EXPECT_EQ(condemned_after - condemned_before, 0u)
+        << "supersede peek must not fresh-condemn -- CasGcRetiredCondemned must not double-count";
 }

@@ -342,11 +342,15 @@ RoundReport Gc::runRegularRound()
                 e.detail = {{"condemn_round", std::to_string(entry.condemn_round)}};
             });
         }
-        for (const RetiredEntry & entry : merge.replaced)
+        for (const ReplacedEntry & replaced : merge.replaced)
         {
+            const RetiredEntry & entry = replaced.fresh;
             ProfileEvents::increment(ProfileEvents::CasGcRetireReplaced);
             /// RESURRECT-REUPLOAD-ORPHAN: the current object token differed from a stale retired entry;
             /// the fold superseded that entry and re-condemned the current token in the same window.
+            /// `detail["superseded_token"]` (audit fix, 2026-07-08) carries the STALE token the supersede
+            /// dropped — `entry.token` above is only the fresh CURRENT token, and without the old one
+            /// this event cannot tell an operator WHICH incarnation was replaced.
             EventEmitter{*store}.emit([&](CasEvent & e)
             {
                 e.type = CasEventType::BlobRetireReplaced;
@@ -358,6 +362,7 @@ RoundReport Gc::runRegularRound()
                 e.outcome = "replaced";
                 e.reason = "current object token differs from the retired entry — resurrect replaced the "
                            "incarnation; superseded the stale entry and re-condemned the current token";
+                e.detail = {{"superseded_token", replaced.old_token.value}};
             });
         }
     }
@@ -663,6 +668,18 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         HeadResult adjusted = observed;
         adjusted.size = retiredLogicalSize(ObjectKind::Blob, observed.size, store->poolMeta().blob_header_len);
         return adjusted;
+    };
+
+    /// Side-effect-free peek (audit fix, 2026-07-08): the fold's resurrect-supersede branch (inside
+    /// `foldDeltasIntoGeneration`) needs the CURRENT token to detect that a resurrect replaced a stale
+    /// retired entry, but must NOT emit the fresh-condemn trail or bump `CasGcRetiredCondemned` — that
+    /// hook is `head_blob` above, reserved for a genuinely NEW zero-in-degree candidate. A supersede's
+    /// own event is `blob_retire_replaced`, emitted once below from `merge.replaced`. Plain HEAD, no
+    /// events, no counters.
+    const auto peek_head = [&](const UInt128 & hash) -> std::optional<HeadResult>
+    {
+        const HeadResult hr = backend.head(blobKeyOf(layout, hash));
+        return hr.exists ? std::optional<HeadResult>(hr) : std::nullopt;
     };
 
     const uint64_t new_generation = state.snap_generation + 1;
@@ -974,7 +991,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             foldDeltasIntoGeneration(backend, layout, priorRunsFor(0),
                                      new_generation, attempt, /*shard*/0,
                                      std::move(deltas), result.fold_seal.blob_target_runs,
-                                     prior_retired[0], min_ack, condemn_round, head_blob,
+                                     prior_retired[0], min_ack, condemn_round, head_blob, peek_head,
                                      &result.retired_merge[0], suppress_destructive);
         }
     }
@@ -1008,7 +1025,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
                 reducer.reduce(backend, layout, priorRunsFor(shard),
                                new_generation, attempt,
                                std::move(buckets[shard]),
-                               prior_retired[shard], min_ack, condemn_round, head_blob,
+                               prior_retired[shard], min_ack, condemn_round, head_blob, peek_head,
                                &result.retired_merge[shard], suppress_destructive);
             for (RunRef & r : shard_runs)
                 result.fold_seal.blob_target_runs.push_back(std::move(r));

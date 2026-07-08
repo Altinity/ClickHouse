@@ -102,6 +102,7 @@ public:
                                const std::vector<RetiredEntry> & prior_retired = {},
                                uint64_t min_ack = 0, uint64_t condemn_round = 0,
                                const std::function<std::optional<HeadResult>(const UInt128 &)> & head_blob = {},
+                               const std::function<std::optional<HeadResult>(const UInt128 &)> & peek_head = {},
                                RetiredMergeResult * out_retired = nullptr,
                                bool suppress_destructive = false);
 

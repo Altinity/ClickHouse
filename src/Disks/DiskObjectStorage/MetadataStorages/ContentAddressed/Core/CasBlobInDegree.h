@@ -57,6 +57,16 @@ struct BlobCandidate
 /// parent carry a run sealed for the parent generation may physically live under an OLDER generation's key
 /// — the seal ref names the real key, key construction would not. `new_generation`/`attempt`/`shard` name
 /// only the OUTPUT run's key namespace.
+/// One resurrect-supersede (audit fix, 2026-07-08): the fresh entry that re-condemns the CURRENT
+/// token, paired with the STALE entry's token it superseded. Kept as its own struct (rather than a
+/// field bolted onto `RetiredEntry`) because `RetiredEntry` is the durable `RetiredSet` element —
+/// widening it would touch the encode/decode format for every entry, not just replaced ones.
+struct ReplacedEntry
+{
+    RetiredEntry fresh;   /// the freshly condemned CURRENT token (also pushed into still_retired byte-identically)
+    Token old_token;      /// the superseded (stale) entry's token — what the resurrect replaced
+};
+
 /// Outcome of the retired (third) merge cursor (ack-floor redesign, spec 2026-07-02): the same
 /// streaming pass that folds edges settles every prior retired entry and detects new candidates.
 struct RetiredMergeResult
@@ -65,7 +75,7 @@ struct RetiredMergeResult
     std::vector<RetiredEntry> graduated;       /// newly floor-passed this pass — published pending, deleted NEXT pass
     std::vector<RetiredEntry> spared;          /// in-degree recovered — entry dropped
     std::vector<RetiredEntry> redelete;        /// pending in the PRIOR list — execute deleteExact pre-CAS, drop
-    std::vector<RetiredEntry> replaced;   /// re-condemned CURRENT tokens that superseded a stale entry (resurrect-replaced); caller emits blob_retire_replaced
+    std::vector<ReplacedEntry> replaced;  /// re-condemned CURRENT tokens that superseded a stale entry (resurrect-replaced); caller emits blob_retire_replaced
 };
 
 /// Three-cursor extension (ack-floor redesign): `prior_retired` (Blob entries ONLY, sorted by hash
@@ -92,6 +102,16 @@ struct RetiredMergeResult
 /// (no edges, no deltas) settle at in-degree 0 by definition. The retired cursor never changes the
 /// snapshot run bytes. Defaults keep the legacy call sites behavior-identical (empty retired,
 /// min_ack 0 => nothing graduates, no head_blob => nothing condemned).
+///
+/// `peek_head` (audit fix, 2026-07-08): a SIDE-EFFECT-FREE HEAD used ONLY by the resurrect-supersede
+/// branch (a `prior_retired` entry whose blob re-touched this pass at net in-degree 0, current token
+/// differs from the stale entry's token). `head_blob` is the FRESH-CONDEMN observation hook — it emits
+/// the `IndegZero`/`GcRetireObserve`/`BlobRetire` trail and increments `CasGcRetiredCondemned`, which is
+/// wrong for a supersede (the supersede's own event is `blob_retire_replaced`, emitted once by the
+/// caller from `RetiredMergeResult::replaced`). Calling `head_blob` from the supersede branch used to
+/// double-emit `blob_retire` alongside `blob_retire_replaced` and double-count the condemned counter;
+/// `peek_head` is a plain HEAD with no events and no counters. No supersede detection happens if
+/// `peek_head` is unset (default `{}`), independent of whether `head_blob` is set.
 void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
                               const std::vector<RunRef> & prior_runs,
                               uint64_t new_generation, uint64_t attempt,
@@ -100,6 +120,7 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
                               const std::vector<RetiredEntry> & prior_retired = {},
                               uint64_t min_ack = 0, uint64_t condemn_round = 0,
                               const std::function<std::optional<HeadResult>(const UInt128 &)> & head_blob = {},
+                              const std::function<std::optional<HeadResult>(const UInt128 &)> & peek_head = {},
                               RetiredMergeResult * out_retired = nullptr,
                               bool suppress_destructive = false);
 
