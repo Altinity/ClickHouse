@@ -105,6 +105,9 @@ public:
     DirectoryIteratorPtr iterateDirectory(const std::string & path) const override;
     bool isDirectoryEmpty(const std::string & path) const override;
     StoredObjects getStorageObjects(const std::string & path) const override;
+    /// Single-lookup override (spec §Method Routing): the inherited default is existsFile +
+    /// getStorageObjects — a two-read trap for CAS on the readFileIfExists path.
+    std::optional<StoredObjects> getStorageObjectsIfExist(const std::string & path) const override;
 
     /// ==== IContentAddressedExchange (DataPartsExchange facade; relink lands in M-W T11) ====
     const String & getPoolUUID() const override { return pool_uuid; }

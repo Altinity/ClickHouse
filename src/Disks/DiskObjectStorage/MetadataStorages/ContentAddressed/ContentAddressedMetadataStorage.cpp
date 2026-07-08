@@ -623,17 +623,27 @@ bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) 
 
 bool ContentAddressedMetadataStorage::existsFileOrDirectory(const std::string & path) const
 {
+    if (ContentAddressed::isPartFilePath(path))
+    {
+        auto p = ContentAddressed::parsePartFilePath(path);
+        auto r = p ? route(*p) : std::nullopt;
+        if (r && !r->ref.empty() && !r->file.empty() && !ContentAddressed::isMutablePerPartFile(r->file))
+        {
+            auto view = partAccess().getView(r->refKey(), ContentAddressed::Freshness::CachedForLoad);
+            if (!view)
+                return false;
+            return view->hasFile(r->file) || view->hasDirectory(r->file + "/");
+        }
+    }
     return existsFile(path) || existsDirectory(path);
 }
 
 uint64_t ContentAddressedMetadataStorage::getFileSize(const std::string & path) const
 {
-    if (auto bytes = tryGetInManifestBytes(path))
-        return bytes->size();
-
     if (!ContentAddressed::isPartFilePath(path))
     {
-        /// A loose mountpoint object (design §5.2): read and return its byte length.
+        if (auto bytes = tryGetInManifestBytes(path))   /// verbatim table-level file
+            return bytes->size();
         if (auto bytes = store()->getMountpointObject(serverPrefix() + "/" + path))
             return bytes->size();
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no object for {}", path);
@@ -645,6 +655,16 @@ uint64_t ContentAddressedMetadataStorage::getFileSize(const std::string & path) 
     auto r = route(*p);
     if (!r || r->file.empty())
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: not a part file path: {}", path);
+
+    if (ContentAddressed::isMutablePerPartFile(r->file))
+    {
+        /// Force-fresh (Pillar B): read-your-writes for a just-written mutable file.
+        auto resolved = partAccess().resolve(r->refKey(), ContentAddressed::Freshness::ForceFresh);
+        if (resolved && !ContentAddressed::PartFolderView::isReservedMutableName(r->file))
+            if (auto it = resolved->mutable_files.find(r->file); it != resolved->mutable_files.end())
+                return it->second.size();
+        throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no object for {}", path);
+    }
 
     auto view = partAccess().getView(r->refKey(), ContentAddressed::Freshness::CachedForLoad);
     if (!view)
@@ -852,6 +872,48 @@ StoredObjects ContentAddressedMetadataStorage::getStorageObjects(const std::stri
         return {StoredObject(location.key, path, location.length)};
     }
     throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: file {} not in manifest of {}", r->file, path);
+}
+
+std::optional<StoredObjects> ContentAddressedMetadataStorage::getStorageObjectsIfExist(const std::string & path) const
+{
+    /// Non-part shapes (verbatim table files, loose mountpoint objects) are rare paths — the
+    /// generic two-step is fine for them.
+    if (!ContentAddressed::isPartFilePath(path))
+    {
+        if (existsFile(path))
+            return getStorageObjects(path);
+        return std::nullopt;
+    }
+    auto p = ContentAddressed::parsePartFilePath(path);
+    if (!p || p->file.empty())
+        return std::nullopt;
+    auto r = route(*p);
+    if (!r || r->file.empty())
+        return std::nullopt;
+
+    if (ContentAddressed::isMutablePerPartFile(r->file))
+    {
+        /// Force-fresh (Pillar B), same contract as existsFile/tryGetInManifestBytes.
+        auto resolved = partAccess().resolve(r->refKey(), ContentAddressed::Freshness::ForceFresh);
+        if (!resolved || ContentAddressed::PartFolderView::isReservedMutableName(r->file))
+            return std::nullopt;
+        const auto it = resolved->mutable_files.find(r->file);
+        if (it == resolved->mutable_files.end())
+            return std::nullopt;
+        /// Sized empty-key placeholder — same shape getStorageObjects returns for in-manifest bytes.
+        return StoredObjects{StoredObject("", path, it->second.size())};
+    }
+
+    auto view = partAccess().getView(r->refKey(), ContentAddressed::Freshness::CachedForLoad);
+    if (!view)
+        return std::nullopt;
+    const auto * entry = view->findFile(r->file);
+    if (!entry)
+        return std::nullopt;
+    if (entry->placement == Cas::EntryPlacement::Inline)
+        return StoredObjects{StoredObject("", path, entry->inline_bytes.size())};
+    const auto location = store()->locate(*entry);
+    return StoredObjects{StoredObject(location.key, path, location.length)};
 }
 
 std::optional<String> ContentAddressedMetadataStorage::tryGetInManifestBytes(const std::string & path) const
