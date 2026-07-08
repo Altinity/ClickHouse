@@ -19,10 +19,6 @@ on:
         required: true
         default: true
         type: boolean
-      GPG_PASSPHRASE:
-        description: 'GPG passphrase for signing (required for production releases)'
-        required: false
-        type: string
       folder_time:
         description: 'Optional timestamp for the release folder. If not provided, one will be generated.'
         required: false
@@ -56,6 +52,15 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Validate package_version
+        env:
+          PACKAGE_VERSION_INPUT: ${{ inputs.package_version }}
+        run: |
+          if ! [[ "$PACKAGE_VERSION_INPUT" =~ ^[A-Za-z0-9._]+$ ]]; then
+            echo "Error: package_version contains unexpected characters: $PACKAGE_VERSION_INPUT"
+            exit 1
+          fi
 
       - name: Run script
         run: |
@@ -291,6 +296,7 @@ jobs:
       inputs.release_environment == 'staging' && 'arc-runners-clickhouse-signer' ||
       inputs.release_environment == 'production' && 'arc-runners-clickhouse-signer-prod'
      }}
+    environment: ${{ inputs.release_environment }}
     env:
       REPO_DNS_NAME: ${{ inputs.release_environment == 'production' && 'builds.altinity.cloud' || 'builds.staging.altinity.cloud' }}
       REPO_NAME: ${{ inputs.release_environment == 'production' && 'altinity' || 'altinity-staging' }}
@@ -343,16 +349,14 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
 
       - name: Set up GPG passphrase
+        env:
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: |
-          if [ "${RELEASE_ENVIRONMENT}" == "production" ]; then
-            if [ -z "${{ inputs.GPG_PASSPHRASE }}" ]; then
-              echo "Error: GPG_PASSPHRASE is required for production releases"
-              exit 1
-            fi
-            echo "${{ inputs.GPG_PASSPHRASE }}" > /tmp/gpg_passphrase
-          else
-            echo "${{ secrets.GPG_PASSPHRASE }}" > /tmp/gpg_passphrase
+          if [ -z "$GPG_PASSPHRASE" ]; then
+            echo "Error: GPG_PASSPHRASE secret is not set for the $RELEASE_ENVIRONMENT environment"
+            exit 1
           fi
+          echo "$GPG_PASSPHRASE" > /tmp/gpg_passphrase
           chmod 600 /tmp/gpg_passphrase
 
       - name: Sign and publish packages

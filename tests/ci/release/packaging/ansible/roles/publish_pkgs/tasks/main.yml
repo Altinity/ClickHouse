@@ -94,17 +94,8 @@
       enabled: "{{ cloudfront_info.cloudfront[repo_dns_name].Distribution.DistributionConfig.Logging.Enabled }}"
       include_cookies: "{{ cloudfront_info.cloudfront[repo_dns_name].Distribution.DistributionConfig.Logging.IncludeCookies }}"
       prefix: "{{ cloudfront_info.cloudfront[repo_dns_name].Distribution.DistributionConfig.Logging.Prefix }}"
-  when: 'not (push_to_active|default(false))'
+  when: 'not (push_to_active|default(false)|bool)'
   register: distribution
-
-# The community.aws.cloudfront_distribution module above has no support for
-# CloudFront Function associations (only Lambda@Edge, via
-# lambda_function_associations) - confirmed no Ansible module covers this, so
-# it's managed with raw `aws cloudfront` calls instead. This runs *after* the
-# distribution update above, deliberately: that task reconstructs the
-# distribution's desired state from only the parameters it's given, so patching
-# FunctionAssociations first would risk it being silently dropped on the next
-# run. Running after guarantees this association always wins.
 
 - name: Set CloudFront Function name
   set_fact:
@@ -196,7 +187,7 @@
     set -euo pipefail;
     aws cloudfront get-distribution-config --id {{ cloudfront_info.cloudfront[repo_dns_name].Distribution.Id }} > /tmp/{{ cf_function_name }}-dist-config.json &&
     DIST_ETAG=$(jq -r '.ETag' /tmp/{{ cf_function_name }}-dist-config.json) &&
-    jq --arg arn "{{ cf_function_arn_result.stdout }}" '.DistributionConfig.DefaultCacheBehavior.FunctionAssociations = {Quantity: 1, Items: [{FunctionARN: $arn, EventType: "viewer-request"}]} | .DistributionConfig' /tmp/{{ cf_function_name }}-dist-config.json > /tmp/{{ cf_function_name }}-new-dist-config.json &&
+    jq --arg arn "{{ cf_function_arn_result.stdout }}" '(.DistributionConfig.DefaultCacheBehavior.FunctionAssociations.Items // [] | map(select(.EventType != "viewer-request")) | . + [{FunctionARN: $arn, EventType: "viewer-request"}]) as $merged | .DistributionConfig.DefaultCacheBehavior.FunctionAssociations = {Quantity: ($merged | length), Items: $merged} | .DistributionConfig' /tmp/{{ cf_function_name }}-dist-config.json > /tmp/{{ cf_function_name }}-new-dist-config.json &&
     aws cloudfront update-distribution --id {{ cloudfront_info.cloudfront[repo_dns_name].Distribution.Id }} --distribution-config file:///tmp/{{ cf_function_name }}-new-dist-config.json --if-match "$DIST_ETAG"
   args:
     executable: /bin/bash
@@ -209,4 +200,4 @@
   register: invalidation
 
 - name: Wait for CloudFront invalidation to be complete
-  shell: "aws cloudfront wait invalidation-completed --distribution-id {{ distribution.id }} --id {{ invalidation.invalidation.id }}"
+  shell: "aws cloudfront wait invalidation-completed --distribution-id {{ cloudfront_info.cloudfront[repo_dns_name].Distribution.Id }} --id {{ invalidation.invalidation.id }}"

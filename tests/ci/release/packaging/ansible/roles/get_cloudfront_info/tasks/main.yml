@@ -15,7 +15,7 @@
 - name: Decide on the target (blue/green)
   set_fact:
     new_cloudfront_origin_path: "{{ 'Green' if cloudfront_origin_path == 'Blue' else 'Blue' }}"
-  when: 'not (push_to_active|default(false))'
+  when: 'not (push_to_active|default(false)|bool)'
 
 - name: Update the active site, when push_to_active is defined
   set_fact:
