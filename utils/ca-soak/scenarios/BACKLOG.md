@@ -1229,6 +1229,17 @@ infra/measurement gaps (not CA defects — all had dangling=0 + agreement):
 - **Oracle:** the improved class-aware `assert_no_leftovers` + graduation-drain CORRECTLY surfaces this
   (unaccounted/unreachable ⇒ leak ⇒ FAIL) — it was previously MASKED by the "fsck detail unavailable"
   inconclusive. So S30 (and any recurring-hash churn card) now FAILs on this real residual until fixed.
+- **RESOLVED 2026-07-08 (branch `cas-gc-rebuild`).** Fix in `CasBlobInDegree.cpp` `closeBlob`: when a hash is
+  touched this fold window with net in-degree 0, HEAD the current token and ensure a condemn entry for the
+  CURRENT token, superseding any stale-token retired entry — i.e. condemn/retire keyed on `(hash, current
+  token)`, matching `CaIncarnationCore`'s `GRetire`. Adds `blob_retire_replaced` CA-log event +
+  `CasGcRetireReplaced` counter; rides the existing round CAS (no extra write), +1 HEAD per resurrect cycle.
+  TLA+-gated by `CaGcResurrectReuploadOrphan` (`_bug.cfg` violates `NoLeakForever`, `_fix.cfg` holds; see
+  `docs/superpowers/cas/06-tla-models.md` §Area 12). Commits `5156d37454b`(TLA+)..`6da55fce2a0`(tests), fix
+  `308360e595d`. Verified: unit `CasGcLeak.*` (RED→GREEN + idempotency + writer-side retire-view), and S30 —
+  the blob residual moved from stuck `unaccounted` to a draining pipeline (the remaining S30 `_manifests`
+  orphan was a DISTINCT bug, `DANGLING-PRECOMMIT`, since also fixed). Follow-up: touch-gating dimension in
+  the canonical `CaIncarnationCore` model (non-blocker).
 ## S30-20260707T120511-1: forced GC left 1 UNCONDEMNED orphan object(s) (unreachable/dangling blobs/_manif
 
 - **Logged (UTC):** 2026-07-07T12:08:27
@@ -1283,6 +1294,16 @@ infra/measurement gaps (not CA defects — all had dangling=0 + agreement):
   `ManifestExpand/Retire/Strip`. Goal: "precommit created, never removed" becomes visible per-object in
   `system.content_addressed_log`. Debuggability-first, in the spirit of B170 (blob audit that pinned the
   B140 dangle).
+- **Also fold in (from the RESURRECT-REUPLOAD-ORPHAN blob-fix final review, 2026-07-08, both Minor
+  observability-only):** (a) `CasBlobInDegree.cpp` `closeBlob`'s supersede reuses the `head_blob` peek,
+  which is the *fresh-condemn* observation hook — so a resurrect supersede emits BOTH `blob_retire` and
+  `blob_retire_replaced` for the same (hash, token, round) and double-increments
+  `CasGcRetiredCondemned`+`CasGcRetireReplaced`. Give the peek a side-effect-free HEAD (or an observe-only
+  `head_blob` mode) so `blob_retire_replaced` is the SOLE retire event for the supersede — this pollutes
+  the very audit log used to triage such leaks. (b) `blob_retire_replaced` records only the new token; the
+  spec (`…resurrect-reupload-orphan-fix-design.md` §Observability) intended `{hash, old_token, new_token,
+  round}` — add the superseded token to `detail`. Neither is a data-safety issue; both belong in this
+  audit-accuracy cycle.
 
 ## INTROSPECTION-2 (2026-07-07): no easy human-readable introspection of CA bucket objects
 

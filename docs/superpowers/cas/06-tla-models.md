@@ -818,5 +818,12 @@ object — i.e. it makes the code match `CaIncarnationCore`'s already-proven `GR
 
 **Why a focused model (not a flag in `CaIncarnationCore`).** A `SabotageRetireByHash` flag was tried in the canonical model (key the retire decision on hash, not (hash, current token)). It does NOT reproduce the *permanent* orphan: `CaIncarnationCore`'s `GRetire` is **un-touch-gated** — it re-condemns any eligible blob (`present ∧ everEdged ∧ InDeg=0`) every retiring phase — so once the stale entry drops, a later round simply re-condemns the replaced token. At every `MaxRound` both the sabotaged and the unsabotaged run violate `NoLeakForever` identically (the last-round bound artifact the doc already notes), so the property cannot distinguish them. The C++ orphan is permanent ONLY because the fold is **touch-gated** (`closeBlob` visits a blob only when it has edge deltas this window; once the resurrect-replaced token's edges are folded-and-gone the fold never revisits it). The canonical model abstracts that away (idealized always-eventually-condemn GC) — which is the DEEPER reason it misses this class. A faithful port would need to add a touch-gating dimension to `GFold`/`GRetire` plus a state invariant (not round-capped liveness); that is a real structural change, so the focused model is the gate for now.
 
-**Code currency:** CURRENT (reproduces shipped `CasBlobInDegree.cpp` behavior). The C++ fix is pending;
-this model is the design gate for it.
+**Code currency:** CURRENT. The C++ fix **LANDED** (branch `cas-gc-rebuild`): `CasBlobInDegree.cpp`
+`closeBlob` now re-condemns the CURRENT token when settling a prior retired entry whose token differs from
+the present object (keyed on `(hash, current token)`, matching `CaIncarnationCore`'s `GRetire`), with a
+`blob_retire_replaced` CA-log event + `CasGcRetireReplaced` counter. So `_fix.cfg` (holds) is now this
+model's **regression gate**, not a pending-design gate. Verified: unit `CasGcLeak.*` (RED→GREEN +
+idempotency + writer-side retire-view condemnation), and ca-soak S30 — the blob residual moved from stuck
+`unaccounted` to a draining pipeline (the remaining S30 manifest orphan was a DISTINCT bug, the
+`DANGLING-PRECOMMIT` fix in §Area 7). Documented follow-up (non-blocker): add a touch-gating dimension to
+`CaIncarnationCore` `GFold`/`GRetire` so the canonical model can reproduce this class directly.
