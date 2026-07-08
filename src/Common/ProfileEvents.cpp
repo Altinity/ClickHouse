@@ -822,6 +822,14 @@ The server successfully detected this situation and will download merged part fr
     M(CasGcRetiredRedeleted,   "CA gc pending deletes executed this round (exact-token blob deletes)", ValueType::Number) \
     M(CasGcHeartbeatFenceOuts, "CA gc expired-mount fence-outs performed by the heartbeat floor", ValueType::Number) \
     M(CasGcFloorHeldByStaleAck, "CA gc rounds where a live heartbeat ack lagged the published round by more than 2", ValueType::Number) \
+    M(CasPartFolderViewHits, "CA part-folder view cache validated hits (retained view matched a fresh resolve)", ValueType::Number) \
+    M(CasPartFolderViewMutableRefreshes, "CA part-folder view refreshes: manifest unchanged, mutable payload drifted — view cloned, no manifest read", ValueType::Number) \
+    M(CasPartFolderViewValidationMismatches, "CA part-folder view validation mismatches: the manifest changed under a retained view — rebuilt", ValueType::Number) \
+    M(CasPartFolderViewMisses, "CA part-folder view cold builds (no retained entry consulted or found)", ValueType::Number) \
+    M(CasPartFolderViewEvictions, "CA part-folder view LRU evictions", ValueType::Number) \
+    M(CasPartFolderViewOversizedBypasses, "CA part-folder views built but not retained (estimated weight above the per-entry cap)", ValueType::Number) \
+    M(CasPartFolderViewInvalidations, "CA part-folder view write-through erases (promote, mutable update, drop ref, drop namespace)", ValueType::Number) \
+    M(CasPartFolderManifestGets, "CA part-manifest body GET requests issued by readManifestShared (the part-folder cache acceptance metric)", ValueType::Number) \
     M(S3GetObjectTagging, "Number of S3 API GetObjectTagging calls.", ValueType::Number) \
     M(S3CreateMultipartUpload, "Number of S3 API CreateMultipartUpload calls.", ValueType::Number) \
     M(S3UploadPartCopy, "Number of S3 API UploadPartCopy calls.", ValueType::Number) \

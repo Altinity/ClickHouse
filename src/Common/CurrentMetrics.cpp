@@ -230,6 +230,8 @@
     \
     M(CasGcIsLeader, "1 while this server holds the content-addressed GC leadership lease (set at each round end; 0 after a round where the lease was not acquired).") \
     M(CasGcPendingReclaimEntries, "Content-addressed GC two-phase deletion backlog observed by this process: cumulative condemned entries minus executed exact-token deletes. Process-local (resets on restart).") \
+    M(CasPartFolderCacheBytes, "Estimated bytes retained by the CA part-folder view cache") \
+    M(CasPartFolderCacheEntries, "Entries retained by the CA part-folder view cache") \
     \
     M(MergeTreeFetchPartitionThreads, "Number of threads for ALTER TABLE FETCH PARTITION") \
     M(MergeTreeFetchPartitionThreadsActive, "Number of threads for ALTER TABLE FETCH PARTITION fetching part") \
