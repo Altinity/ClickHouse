@@ -91,7 +91,13 @@ already committed:
 If dst is absent → the normal path (`stageManifest`/`precommitAdd`/`promote`/`dropRef`) runs unchanged.
 
 Idempotency is keyed on **content** (`entries`), not `ManifestId`, because the re-drive mints a fresh id
-for the same content. This makes `RENAME TABLE` / `DETACH`-`ATTACH` re-drives idempotent, so the second
+for the same content. Compare **only** `PartManifest::entries` (the `std::vector<ManifestEntry>` with its
+defaulted element-wise `operator==`), NOT the whole `PartManifest`: `encodePartManifest` writes entries in
+canonical **path-sorted** order (`CasManifestCodec.cpp:67-76`, dup-path rejected) and `decodePartManifest`
+reads them back in that order, so `readManifest(...).entries` is deterministically ordered and the vector
+`==` is order-stable; the full-manifest `==` would be a false conflict because `ref`, `root_namespace_id`,
+and `payload_digest` legitimately differ between src and dst (the digest is a content-hash over
+ref+namespace+entries). This makes `RENAME TABLE` / `DETACH`-`ATTACH` re-drives idempotent, so the second
 `promote` never runs → no `T_b` overwrite → no leak; and it never reaches `promote`'s fail-close guard
 (it skips `promote` entirely when dst is already committed).
 
