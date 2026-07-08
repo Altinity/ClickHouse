@@ -532,13 +532,7 @@ bool MergeTask::ExecuteAndFinalizeHorizontalPart::prepare() const
         !patch_parts.empty() ||
         global_ctx->cleanup ||
         global_ctx->deduplicate ||
-        global_ctx->merging_params.mode == MergeTreeData::MergingParams::Collapsing ||
-        global_ctx->merging_params.mode == MergeTreeData::MergingParams::Replacing ||
-        global_ctx->merging_params.mode == MergeTreeData::MergingParams::VersionedCollapsing ||
-        global_ctx->merging_params.mode == MergeTreeData::MergingParams::Summing ||
-        global_ctx->merging_params.mode == MergeTreeData::MergingParams::Aggregating ||
-        global_ctx->merging_params.mode == MergeTreeData::MergingParams::Graphite ||
-        global_ctx->merging_params.mode == MergeTreeData::MergingParams::Coalescing;
+        global_ctx->merging_params.mode != MergeTreeData::MergingParams::Ordinary;
 
     prepareProjectionsToMergeAndRebuild();
 
