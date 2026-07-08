@@ -58,6 +58,10 @@ Store::Store(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
         dedup_cache = std::make_unique<DedupCache>(
             "LRU", CurrentMetrics::end(), CurrentMetrics::end(),
             config.dedup_cache_bytes, DedupCache::NO_MAX_COUNT, DedupCache::DEFAULT_SIZE_RATIO);
+    if (config.manifest_decode_cache_bytes > 0)
+        manifest_cache = std::make_unique<ManifestDecodeCache>(
+            "LRU", CurrentMetrics::end(), CurrentMetrics::end(),
+            config.manifest_decode_cache_bytes, /*max_count=*/16384, ManifestDecodeCache::DEFAULT_SIZE_RATIO);
 }
 
 bool Store::dedupCacheContains(const UInt128 & blob_hash) const
@@ -972,12 +976,9 @@ std::shared_ptr<const PartManifest> Store::readManifestShared(const ManifestId &
             "live ref names manifest at {} but its object is missing — INV-NO-DANGLE", key);
     }
 
-    {
-        std::lock_guard lock(manifest_cache_mutex);
-        auto it = manifest_cache.find(ManifestCacheKey{.manifest_id = id, .token = head.token});
-        if (it != manifest_cache.end())
-            return it->second;
-    }
+    if (manifest_cache)
+        if (auto cached = manifest_cache->get(ManifestCacheKey{.manifest_id = id, .token = head.token}))
+            return cached;
 
     std::optional<GetResult> object = pool_backend->get(key);
     if (!object)
@@ -1025,15 +1026,9 @@ std::shared_ptr<const PartManifest> Store::readManifestShared(const ManifestId &
             "CAS manifest at {} body root_namespace_id does not match the owning namespace — manifestNamespaceMatches", key);
     }
 
-    auto decoded = std::make_shared<const PartManifest>(std::move(body));
-    {
-        std::lock_guard lock(manifest_cache_mutex);
-        /// Bound memory: a wholesale clear on overflow is fine — entries are pure immutable decode
-        /// caches that re-populate on demand.
-        if (manifest_cache.size() >= MANIFEST_CACHE_MAX_ENTRIES)
-            manifest_cache.clear();
-        manifest_cache[ManifestCacheKey{.manifest_id = id, .token = head.token}] = decoded;
-    }
+    auto decoded = std::make_shared<PartManifest>(std::move(body));
+    if (manifest_cache)
+        manifest_cache->set(ManifestCacheKey{.manifest_id = id, .token = head.token}, decoded);
     return decoded;
 }
 

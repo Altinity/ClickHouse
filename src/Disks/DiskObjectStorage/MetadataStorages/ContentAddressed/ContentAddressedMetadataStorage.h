@@ -64,7 +64,8 @@ public:
         uint64_t gc_max_conditional_put_bytes_ = 1ULL << 30,
         uint64_t cas_part_folder_cache_bytes_ = 64ULL << 20,
         uint64_t cas_part_folder_cache_max_entries_ = 10000,
-        uint64_t cas_part_folder_cache_max_entry_bytes_ = 16ULL << 20);
+        uint64_t cas_part_folder_cache_max_entry_bytes_ = 16ULL << 20,
+        uint64_t manifest_decode_cache_bytes_ = 128ULL << 20);
 
     /// Test/diagnostics: one synchronous GC round (creates an ad-hoc scheduler when disabled).
     void runOneGcRoundForTest();
@@ -232,6 +233,9 @@ private:
     const uint64_t cas_part_folder_cache_bytes;
     const uint64_t cas_part_folder_cache_max_entries;
     const uint64_t cas_part_folder_cache_max_entry_bytes;
+    /// Phase 5 (part-folder cache spec): byte bound for the manifest DECODE cache (Cas::Store), threaded
+    /// into PoolConfig in startup(). 0 disables decode caching entirely (diagnostic mode).
+    const uint64_t manifest_decode_cache_bytes;
 
     /// Set by startup (Store::open is fail-closed; empty store == not started).
     Cas::StorePtr cas_store;

@@ -608,6 +608,56 @@ TEST(CasStore, ManifestCacheIsKeyedByIdAndToken)
         << "fresh publish (new ManifestId) should miss the id-keyed manifest cache";
 }
 
+/// Phase 5 (part-folder cache spec): manifest_cache is now a byte-weighted CacheBase LRU instead of a
+/// count-only bound, since decoded manifests carry inline bytes and can each be megabytes.
+TEST(CasStore, ManifestDecodeCacheIsByteBounded)
+{
+    auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
+    const DB::Cas::Layout layout("p");
+    const DB::Cas::RootNamespace ns{"srv/t1"};
+
+    /// 8 manifests x ~1 MiB of inline bytes; a 2 MiB decode-cache bound must hold while every
+    /// read stays correct (evicted decodes just re-GET + re-decode).
+    std::vector<DB::Cas::ManifestId> ids;
+    for (int i = 0; i < 8; ++i)
+    {
+        const DB::Cas::ManifestRef ref{.writer_epoch = 1, .build_sequence = static_cast<uint64_t>(i + 1),
+                                       .manifest_ordinal = 1};
+        DB::Cas::ManifestEntry e;
+        e.path = "big.txt";
+        e.placement = DB::Cas::EntryPlacement::Inline;
+        e.blob_hash = DB::UInt128(i + 1);
+        e.inline_bytes = String(1 << 20, static_cast<char>('a' + i));
+        e.blob_size = e.inline_bytes.size();
+        ids.push_back(DB::Cas::tests::writeManifestRaw(*backend, layout, ns, ref, {e}));
+        DB::Cas::tests::publishCommittedTransition(*backend, layout, ns, "part_" + std::to_string(i),
+                                                   std::nullopt, ref);
+    }
+
+    DB::Cas::PoolConfig config{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1};
+    config.manifest_decode_cache_bytes = 2ULL << 20;
+    auto store = DB::Cas::Store::open(backend, std::move(config));
+
+    uint64_t total_gets = 0;
+    for (int round = 0; round < 2; ++round)
+        for (int i = 0; i < 8; ++i)
+        {
+            auto resolved = store->resolveRef(ns, "part_" + std::to_string(i));
+            ASSERT_TRUE(resolved.has_value());
+            auto m = store->readManifestShared(resolved->manifest_id);
+            ASSERT_EQ(m->entries.size(), 1u);
+            EXPECT_EQ(m->entries[0].inline_bytes[0], static_cast<char>('a' + i));   /// always correct
+        }
+    for (const auto & id : ids)
+        total_gets += backend->getCount(layout.manifestKey(id));
+
+    /// The bound forces re-GETs (16 reads over a 2 MiB window of ~1 MiB decodes cannot all hit),
+    /// proving eviction actually happens...
+    EXPECT_GT(total_gets, 8u);
+    /// ...and the cache reports an in-bound retained size.
+    EXPECT_LE(store->manifestDecodeCacheBytesForTest(), 2ULL << 20);
+}
+
 TEST(CasStore, ResolveDecodeCacheInvalidatesOnWrite)
 {
     /// B113: resolveRef uses a token-validated shard-manifest decode cache. A write to the shard

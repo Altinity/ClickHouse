@@ -125,6 +125,10 @@ struct PoolConfig
     /// P2 (HEAD-before-PUT): on a dedup-cache MISS, a blob whose body is >= this many bytes is written
     /// HEAD-first (a cheap HEAD avoids streaming a body that would 412). 0 disables the size trigger.
     uint64_t dedup_head_first_min_bytes = 1ULL << 20;   /// 1 MiB
+    /// Phase-5 (part-folder cache spec): byte bound for the manifest DECODE cache. The old cache
+    /// was count-bounded only (16384 entries) — decoded manifests carry inline bytes, so the worst
+    /// case was multi-GB. 0 disables decode caching (every read decodes fresh — diagnostic mode).
+    uint64_t manifest_decode_cache_bytes = 128ULL << 20;
     /// B174 (gc/snap retention): how many superseded snap generations to retain. After committing
     /// generation G, generations <= G - this are pruned (bounded per round). 0 = keep ALL
     /// (debug/forensics — replay GC's in-degree view as-of a past round). Default 3 = the safety
@@ -419,6 +423,8 @@ public:
     /// No-ops when disabled (dedup_cache_bytes == 0).
     bool dedupCacheContains(const UInt128 & blob_hash) const;
     void dedupCacheAdd(const UInt128 & blob_hash);
+    /// Test seam: retained bytes of the manifest decode cache (0 when disabled).
+    size_t manifestDecodeCacheBytesForTest() const { return manifest_cache ? manifest_cache->sizeInBytes() : 0; }
     /// The shard a ref name routes to: CityHash64(ref_name) % root_shards. Build uses it to address the
     /// publish/precommit CAS (the build-root ref name is the build_seq, B171); tests reconstruct the
     /// build-root shard with it.
@@ -706,7 +712,8 @@ private:
     /// id. Unlike the old content-hash tree cache there is NO cross-id sharing — each publish has a
     /// unique ManifestId (spec §Read Path Scope: per-instance cache, less sharing, intentional). The
     /// read path resolves `route` per file, so caching makes a repeated same-part read O(1) decodes.
-    /// Bounded (wholesale clear on overflow) to cap memory on a server that reads very many parts.
+    /// Phase 5 (part-folder cache spec): byte-weighted LRU (`ManifestDecodeCache` below) instead of the
+    /// old count-only bound, since decoded manifests carry inline bytes and can each be megabytes.
     struct ManifestCacheKey
     {
         ManifestId manifest_id;
@@ -717,9 +724,22 @@ private:
     {
         size_t operator()(const ManifestCacheKey & k) const;
     };
-    static constexpr size_t MANIFEST_CACHE_MAX_ENTRIES = 16384;
-    std::mutex manifest_cache_mutex;
-    std::unordered_map<ManifestCacheKey, std::shared_ptr<const PartManifest>, ManifestCacheKeyHash> manifest_cache;
+    /// Phase 5 (part-folder cache spec): byte-weighted so a server that reads very many parts (each
+    /// decode carrying megabytes of inline bytes) has an honest memory ceiling instead of the old
+    /// count-only bound (16384 entries, multi-GB worst case). Same key, same fail-closed token
+    /// semantics as before; nullptr <=> decode caching disabled (manifest_decode_cache_bytes == 0).
+    struct PartManifestWeight
+    {
+        size_t operator()(const PartManifest & m) const
+        {
+            size_t bytes = 256;
+            for (const auto & e : m.entries)
+                bytes += e.path.size() + e.inline_bytes.size() + 96;
+            return bytes;
+        }
+    };
+    using ManifestDecodeCache = CacheBase<ManifestCacheKey, PartManifest, ManifestCacheKeyHash, PartManifestWeight>;
+    std::unique_ptr<ManifestDecodeCache> manifest_cache;
 
     /// NOTE (M-C2): the manifest journal is never trimmed here — trimming needs folded_cursor
     /// (INV-JOURNAL-COVERAGE), which is GC state landing in M-C3; the manifest size guard

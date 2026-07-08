@@ -140,7 +140,8 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     uint64_t gc_max_conditional_put_bytes_,
     uint64_t cas_part_folder_cache_bytes_,
     uint64_t cas_part_folder_cache_max_entries_,
-    uint64_t cas_part_folder_cache_max_entry_bytes_)
+    uint64_t cas_part_folder_cache_max_entry_bytes_,
+    uint64_t manifest_decode_cache_bytes_)
     : object_storage(std::move(object_storage_))
     , storage_path_prefix(std::move(storage_path_prefix_))
     , storage_path_full(fs::path(object_storage->getRootPrefix()) / storage_path_prefix)
@@ -165,6 +166,7 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     , cas_part_folder_cache_bytes(cas_part_folder_cache_bytes_)
     , cas_part_folder_cache_max_entries(cas_part_folder_cache_max_entries_)
     , cas_part_folder_cache_max_entry_bytes(cas_part_folder_cache_max_entry_bytes_)
+    , manifest_decode_cache_bytes(manifest_decode_cache_bytes_)
 {
 }
 
@@ -381,6 +383,7 @@ void ContentAddressedMetadataStorage::startup()
     pool_config.root_shards = root_shards;
     pool_config.dedup_cache_bytes = dedup_cache_bytes;
     pool_config.dedup_head_first_min_bytes = dedup_head_first_min_bytes;
+    pool_config.manifest_decode_cache_bytes = manifest_decode_cache_bytes;
     pool_config.gc_snap_generations_to_keep = gc_snap_generations_to_keep;
     pool_config.gc_shards = gc_shards;
     pool_config.manifest_sweep_list_budget_keys = manifest_sweep_list_budget_keys;
