@@ -698,6 +698,16 @@ ManifestId Build::stageManifest(std::vector<ManifestEntry> entries)
         throw Exception(ErrorCodes::LOGICAL_ERROR,
             "stageManifest: manifest ordinal collision at {} (PreconditionFailed) — failing closed", key);
 
+    EventEmitter{*store}.emit([&](CasEvent & e)
+    {
+        e.type = CasEventType::ManifestPut;
+        e.namespace_ = owning_ns.string();
+        e.object_kind = CasEventObjectKind::Manifest;
+        e.object_hash = manifestRefDebugString(id.ref);
+        e.token = res.token.value;
+        e.reason = "stageManifest: part-manifest body written";
+    });
+
     staged_manifests.push_back(id);
     return id;
 }
@@ -962,6 +972,16 @@ void Build::abandon()
                 .new_binding = std::nullopt});
         }, nullptr, RootMutationOrigin::Writer, RootMutationKind::Abandon);
         precommitted = false;
+
+        EventEmitter{*store}.emit([&](CasEvent & e)
+        {
+            e.type = CasEventType::PrecommitRemoved;
+            e.namespace_ = precommit_target_ns.string();
+            e.ref_name = precommit_final_ref;
+            e.object_kind = CasEventObjectKind::Root;
+            e.object_hash = manifestRefDebugString(precommit_manifest);
+            e.reason = "abandon: precommit binding removed";
+        });
     }
 
     /// No longer in-flight: retire the seq so the GC watermark floor can advance (idempotent). This runs

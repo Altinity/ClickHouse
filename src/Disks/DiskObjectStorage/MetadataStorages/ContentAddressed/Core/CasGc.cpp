@@ -547,7 +547,7 @@ bool Gc::foldManifestEdges(const ManifestId & id, int sign, std::vector<BlobDelt
                 .source_id = sourceEdgeId(id, entry.path),
                 .remove = (sign < 0)});
             /// B170: a folded owner edge over this blob (the manifest-model analog of the old
-            /// RootAdd/ManifestExpand). +1 = the manifest's owner activated this blob's reference; -1 =
+            /// `RootAdd`). +1 = the manifest's owner activated this blob's reference; -1 =
             /// the owner was removed, dropping the reference. Reconstructs WHY a blob's in-degree moved.
             EventEmitter{*store}.emit([&](CasEvent & ev)
             {

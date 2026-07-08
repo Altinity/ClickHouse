@@ -25,10 +25,7 @@ String toString(CasEventType type)
         case CasEventType::BlobDelete:            return "blob_delete";
         case CasEventType::BlobForget:            return "blob_forget";
         case CasEventType::ManifestPut:           return "manifest_put";
-        case CasEventType::ManifestExpand:        return "manifest_expand";
-        case CasEventType::ManifestRetire:        return "manifest_retire";
         case CasEventType::ManifestDelete:        return "manifest_delete";
-        case CasEventType::ManifestStrip:         return "manifest_strip";
         case CasEventType::RefPublish:            return "ref_publish";
         case CasEventType::RefDrop:               return "ref_drop";
         case CasEventType::RefRepoint:            return "ref_repoint";

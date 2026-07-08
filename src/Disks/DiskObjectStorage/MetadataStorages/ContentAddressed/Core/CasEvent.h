@@ -17,7 +17,7 @@ namespace DB::Cas
 enum class CasEventType
 {
     BlobPut, BlobReuseAdopt, BlobReuseResurrect, BlobCopyForward, BlobRetire, BlobRetireReplaced, BlobDelete, BlobForget,
-    ManifestPut, ManifestExpand, ManifestRetire, ManifestDelete, ManifestStrip,
+    ManifestPut, ManifestDelete,
     RefPublish, RefDrop, RefRepoint, RootAdd, RootRemove, RootRepoint, IndegZero,
     GcFoldBegin, GcFoldEnd, GcRetireObserve, GcRetireDecision, GcRecheckVerdict,
     GcFence, GcSnapPersist, GcCursorAdvance, GcTrim, GcShardReclaim, GcFenceOut, GcRebuild, GcFoldClamp,
