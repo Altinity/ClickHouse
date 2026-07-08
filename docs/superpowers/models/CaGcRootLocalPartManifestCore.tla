@@ -24,6 +24,7 @@ CONSTANTS
     EnableTokenDiff,            \* TRUE -> discover MAY skip an unchanged shard's body read
     TokenObservable,            \* TRUE -> LIST surfaces a per-shard token (supportsListTokens); FALSE -> always read
     SabotageSkipChangedShard,   \* skip a shard whose listed root token actually advanced past the folded token (must dangle)
+    SabotageSkipParksDeadPrecommit,  \* TRUE = discover still SKIPs a token-stable shard even when it holds a live precommit the watermark has proven dead (the shipped bug); the reclaim never runs and the manifest orphans
     \* ---- Phase 3: lazy trim ----
     EnableLazyTrim,             \* TRUE -> lazy-trim arm enabled (trim work may lag; fence stays all-shard fresh)
     SabotageLazyFenceUnsafe,    \* reuse a stale fence position for a shard that got a publish between discovery and recheck (must dangle)
@@ -878,10 +879,39 @@ WMutableUpdate(m) ==
 \*
 \* The skip governs ONLY the body read / re-fold cursor; it does NOT touch the fence (the all-shard fence
 \* is orthogonal and still fences every shard every round, GFenceShard).
+\* ---- watermark-dead live precommit: the dangling-precommit manifest orphan (SkipParksDeadPrecommit) ----
+\* The DEATH FACT. A precommit is dead by the namespace watermark once GC has advanced the round barrier
+\* over its namespace (some completed fence exists for n) — the model's abstraction of "other builds
+\* retiring advance min_active past this precommit's build_sequence." This is the SAME durable-watermark
+\* fact reclaimAbandonedPrecommit/prefixEligible use in the C++ (control #9); it is INDEPENDENT of the
+\* lingering binding (an abandoned precommit stays owner \in Builds while its build is proven dead). The
+\* model's other watermark fact, sweepEligible, is binding-coupled (GMarkSweepEligible requires every
+\* binding in the prefix already removed), so it cannot express a still-bound dead precommit — hence the
+\* death fact is keyed on the fence barrier, which CAN hold while owner[m] \in Builds.
+BuildDead(n, m) == \E r \in 1..MaxRound : fenceVersion[r][n] > 0
+\* A shard (root-shard = namespace n) holds a LIVE precommit binding (un-removed, un-promoted, body
+\* present) whose build the watermark has already proven dead — the exact orphan reclaimAbandonedPrecommit
+\* must reclaim. This is the fact the fix consults before letting discover Skip a token-stable shard.
+HasDeadLivePrecommit(n) ==
+    \E m \in ManifestIds :
+        /\ m[1] = n
+        /\ owner[m] \in Builds             \* still a precommit owner (never promoted/removed)
+        /\ mBody[m]                         \* body present (classification 1, skip-eligible), not the clamped-4 path
+        /\ BuildDead(n, m)                  \* the same watermark death predicate the sweep-side reclaim uses
+\* A token-stable shard is skip-eligible ONLY when it does not hold a live precommit the watermark has
+\* already proven dead — forcing a re-Read so reclaimAbandonedPrecommit can run. SabotageSkipParksDeadPrecommit
+\* DROPS this conjunct = the shipped bug (the static shard is parked forever and its dead precommit is never
+\* reclaimed). The SabotageSkipChangedShard disjunct isolates the OTHER token-diff sabotage: when that control
+\* is on, CanSkipShard degenerates EXACTLY to the pre-existing guard so that sabotage's counterexample is
+\* preserved byte-for-byte.
+CanSkipShard(n) ==
+    /\ (listedTok[n] = foldedTok[n] \/ SabotageSkipChangedShard)
+    /\ (SabotageSkipParksDeadPrecommit \/ SabotageSkipChangedShard \/ ~HasDeadLivePrecommit(n))
+
 GDiscoverSkip(n) ==
     /\ EnableTokenDiff
     /\ TokenObservable
-    /\ (listedTok[n] = foldedTok[n] \/ SabotageSkipChangedShard)
+    /\ CanSkipShard(n)
     \* Claim coverage to the journal end WITHOUT folding the body. On the honest path (listedTok =
     \* foldedTok) the shard is unchanged since the last fold, so cursor is already at Len(journal) and
     \* this is a harmless no-op (the skip elides only the I/O of re-reading already-folded bytes). Under
@@ -910,6 +940,23 @@ GDiscoverRead(n) ==
                     roundOf, fencePos, cursor, trimBase, fenceVersion, retired, inflight, wView,
                     mfCleanup, mfDeleted, mPrefix, sweepEligible, extraShared, listedTok, foldTok, prevFencePos, shardIndeg, coordFence, reducerOwner, storedTok >>
     /\ UNCHANGED attemptVars
+
+\* The fold-visit reclaim of a dead abandoned precommit (reclaimAbandonedPrecommit). It runs ONLY on a
+\* Read visit — i.e. when discover does NOT Skip the shard (~CanSkipShard): the Read path is what calls
+\* reclaimAbandonedPrecommit before readShard. Its EFFECT is exactly WAbandonPrecommit's (owner: bld ->
+\* None, a removal event, listed-token bump) — reclaim IS an abandon — so it introduces NO new reachable
+\* state (every GReclaimDeadPrecommit step is a WAbandonPrecommit step); the extra guards only restrict WHEN
+\* it fires. Under the fix the shard holding a watermark-dead live precommit is force-Read (~CanSkipShard
+\* holds), so weak fairness drives this reclaim and the manifest drains. Under SabotageSkipParksDeadPrecommit
+\* the token-stable shard stays skip-eligible (CanSkipShard holds), this action is DISABLED, and the dead
+\* precommit is parked forever -> LiveDeadPrecommitReclaimed is violated. Gated on EnableTokenDiff so it is
+\* provably inert (never enabled) in every pre-token-diff stage.
+GReclaimDeadPrecommit(m) ==
+    /\ EnableTokenDiff
+    /\ mBody[m]
+    /\ BuildDead(m[1], m)
+    /\ ~CanSkipShard(m[1])
+    /\ WAbandonPrecommit(m)
 
 \* GScatterDelta(n, s): the MAPPER. Consume the next unfolded journal[n] record at cursor[n] and apply
 \* the paired old/new-binding deltas. It performs the SAME journal fold as GFoldTransition (edges,
@@ -1261,6 +1308,15 @@ NoLeakForever ==
     \A b \in Blobs :
         [](( present[b] /\ b \notin OwnedRefBlobs ) => <>( ~present[b] \/ b \in OwnedRefBlobs ))
 
+\* LIVENESS (SkipParksDeadPrecommit): a present, body-present, still-bound (owner \in Builds), watermark-dead
+\* abandoned precommit manifest is EVENTUALLY reclaimed — its owner leaves Builds (the removal is emitted) or
+\* its body is deleted. Under the fix the forced re-Read runs GReclaimDeadPrecommit; under the bug the static
+\* shard is parked and the dead precommit's binding/body stutters unchanged forever.
+LiveDeadPrecommitReclaimed ==
+    \A m \in ManifestIds :
+        [] ( ( mBody[m] /\ owner[m] \in Builds /\ BuildDead(m[1], m) )
+             => <> (m \in mfDeleted \/ owner[m] \notin Builds) )
+
 StateConstraint ==
     /\ \A n \in Namespaces : Len(journal[n]) <= MaxLog
     /\ Cardinality(inflight) <= 2
@@ -1295,11 +1351,18 @@ Next ==
     \* Phase 2: token-diff discovery (the rev.15 token split):
     \/ \E n \in Namespaces : GDiscoverSkip(n)
     \/ \E n \in Namespaces : GDiscoverRead(n)
+    \* fold-visit reclaim of a watermark-dead abandoned precommit (runs only on a force-Read shard):
+    \/ \E m \in ManifestIds : GReclaimDeadPrecommit(m)
     \* attempt-scoping (self-contained; inert unless AttemptActive):
     \/ \E r \in 0..MaxRound : GMintAttempt(r)
     \/ \E r \in 0..MaxRound, a \in 1..MaxAttempt : GAdopt(r, a) \/ GDeposedFinalWrite(r, a)
 
+\* Weak fairness on the dead-precommit reclaim makes LiveDeadPrecommitReclaimed checkable under
+\* `SPECIFICATION Spec` (mirroring how CaResurrectLiveness.tla carries its liveness fairness in Spec).
+\* The action is gated on EnableTokenDiff, so this WF conjunct is vacuous (the action is never enabled)
+\* in every pre-token-diff cfg and in every safety-only (invariant) run.
 Spec == Init /\ [][Next]_vars
+    /\ WF_vars(\E m \in ManifestIds : GReclaimDeadPrecommit(m))
 
 FairSpec == Spec
     /\ WF_vars(\E l \in Leaders : GStartRound(l))
