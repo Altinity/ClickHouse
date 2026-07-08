@@ -72,6 +72,9 @@ String encodeFoldSeal(const CasFoldSeal & seal)
         e->set_folded_cursor(cov.folded_cursor);
         e->set_incarnation_writer_epoch(cov.incarnation.writer_epoch);
         e->set_incarnation_build_sequence(cov.incarnation.build_sequence);
+        e->set_has_live_precommit(cov.has_live_precommit);
+        e->set_min_live_precommit_writer_epoch(cov.min_live_precommit_writer_epoch);
+        e->set_min_live_precommit_build_sequence(cov.min_live_precommit_build_sequence);
     }
     addRuns(msg.mutable_blob_target_runs(), seal.blob_target_runs);
     addRuns(msg.mutable_part_manifest_cleanup(), seal.part_manifest_cleanup);
@@ -101,7 +104,10 @@ CasFoldSeal decodeFoldSeal(std::string_view data)
             .classification = static_cast<uint8_t>(e.classification()),
             .folded_token = Token{e.folded_token_value(), static_cast<TokenType>(e.folded_token_type())},
             .folded_cursor = e.folded_cursor(),
-            .incarnation = ShardIncarnation{e.incarnation_writer_epoch(), e.incarnation_build_sequence()}};
+            .incarnation = ShardIncarnation{e.incarnation_writer_epoch(), e.incarnation_build_sequence()},
+            .has_live_precommit = e.has_live_precommit(),
+            .min_live_precommit_writer_epoch = e.min_live_precommit_writer_epoch(),
+            .min_live_precommit_build_sequence = e.min_live_precommit_build_sequence()};
     readRuns(msg.blob_target_runs(), seal.blob_target_runs);
     readRuns(msg.part_manifest_cleanup(), seal.part_manifest_cleanup);
     return seal;

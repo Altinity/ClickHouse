@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGenerationSeal.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include <Disks/tests/cas_test_helpers.h>
@@ -63,4 +64,32 @@ TEST(CasDanglingPrecommit, AbandonedPrecommitOrphansManifestUntilFix)
     /// After Task 4 this assertion is INVERTED (see Task 4 Step 4).
     EXPECT_TRUE(backend->head(layout.manifestKey(id)).exists)
         << "PRE-FIX: dangling precommit manifest is orphaned (Skip parks the shard, reclaim never runs)";
+}
+
+/// Scaffold (Task 3): ShardCoverage.has_live_precommit / min_live_precommit_* round-trip through the
+/// fold seal codec. Nothing consumes these fields yet (Task 4 wires them into computeDiscoverDecisions).
+TEST(CasDanglingPrecommit, ShardCoverageRoundTripsMinLivePrecommit)
+{
+    CasFoldSeal seal;
+    seal.generation = 3;
+    seal.parent_generation = 2;
+    ShardCoverage cov;
+    cov.classification = 1;
+    cov.folded_cursor = 7;
+    cov.has_live_precommit = true;
+    cov.min_live_precommit_writer_epoch = 1;
+    cov.min_live_precommit_build_sequence = 5;
+    seal.per_ns_shard["srv/tbl@cas@/0"] = cov;
+
+    const CasFoldSeal back = decodeFoldSeal(encodeFoldSeal(seal));
+    const ShardCoverage & r = back.per_ns_shard.at("srv/tbl@cas@/0");
+    EXPECT_TRUE(r.has_live_precommit);
+    EXPECT_EQ(r.min_live_precommit_writer_epoch, 1u);
+    EXPECT_EQ(r.min_live_precommit_build_sequence, 5u);
+
+    /// Default (no live precommit) round-trips as absent.
+    CasFoldSeal empty_seal;
+    empty_seal.per_ns_shard["srv/tbl@cas@/1"] = ShardCoverage{};
+    const CasFoldSeal e_back = decodeFoldSeal(encodeFoldSeal(empty_seal));
+    EXPECT_FALSE(e_back.per_ns_shard.at("srv/tbl@cas@/1").has_live_precommit);
 }

@@ -224,6 +224,9 @@ message FoldShardCoverageProto {
   uint64 folded_cursor      = 5;
   uint64 incarnation_writer_epoch   = 6;  // ShardIncarnation.writer_epoch; 0 = unstamped
   uint64 incarnation_build_sequence = 7;  // ShardIncarnation.build_sequence; 0 = unstamped
+  bool   has_live_precommit                 = 8;  // shard holds >=1 live (un-promoted, un-removed) precommit
+  uint64 min_live_precommit_writer_epoch    = 9;  // lexicographically-min live precommit writer_epoch
+  uint64 min_live_precommit_build_sequence  = 10; // lexicographically-min live precommit build_sequence
 }
 
 // FOLD seal (write-once gc/gen/<gen>/fold_seal). Magic CAFS, FormatId::FoldSeal.
