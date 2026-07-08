@@ -902,6 +902,17 @@ void Build::promote(const RootNamespace & target_ns, const String & final_ref_na
             .new_binding = OwnerBinding{
                 .owner_kind = OwnerKind::Committed, .ref_name = final_ref_name,
                 .build_id = UInt128(0), .manifest_ref = id.ref}});
+        /// BUG 1a: refuse to overwrite a live committed ref that already names a DIFFERENT manifest — that
+        /// would orphan the old manifest (its owner-removal `-1` is never emitted). This enforces the
+        /// model's `RefFreeFor` guard (WPromote requires it). A re-promote of the SAME manifest_ref is
+        /// idempotent and allowed. Fail-closed with ABORTED (not LOGICAL_ERROR): a conflicting durable
+        /// state the caller handles (republishRef is made idempotent so its legitimate re-drive skips
+        /// promote entirely), never a must-not-happen invariant.
+        if (const auto it = root.refs.find(final_ref_name);
+            it != root.refs.end() && it->second.manifest_ref != id.ref)
+            throw Exception(ErrorCodes::ABORTED,
+                "promote: ref '{}' already names a different committed manifest — refusing to overwrite "
+                "(unique-ref invariant; use republishRef for an intended repoint)", final_ref_name);
         root.refs[final_ref_name] = RootRef{
             .ref_name = final_ref_name, .manifest_ref = id.ref,
             .mutable_files = pending_mutable_files, .published_at_ms = nowMs()};
