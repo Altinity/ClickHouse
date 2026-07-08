@@ -40,12 +40,13 @@ with four amendments settled during design review:
    `updateMutableFiles`, `dropRef`, `dropRefIfPresent`, `dropNamespace`) plus the one real domain
    operation `republishRef`, built on a shared `publishEntries` primitive that also replaces the
    near-duplicate body of `adoptPartFromManifest`. Build staging orchestration stays in the
-   transaction. A `utils/check-style` rule makes the "no raw committed-ref mutation in wiring"
-   review rule mechanical.
+   transaction. A style-check rule (`ci/jobs/scripts/check_style/check_cpp.sh`) makes the "no raw
+   committed-ref mutation in wiring" review rule mechanical.
 4. **Trimmed machinery, reshaped Phase 5.** No thread-local "active slot". `Freshness` has three
    values, not four. The retained map reuses `Common/CacheBase`. Phase 5 does *not* relocate
    `shard_decode_cache` or `dedup_cache`; it byte-bounds `manifest_cache` (today count-bounded with
-   a multi-GB worst case) and unifies byte accounting with the view cache.
+   a multi-GB worst case). The view cache keeps its conservative `manifest_size` over-count — a
+   retained view can outlive the decode-cache entry, so removing it would under-count.
 
 ## Goals And Non-Goals {#goals-and-non-goals}
 
@@ -399,7 +400,7 @@ altered by the facade: `promoteBuild` wraps only the final promote step.
 
 ### Mechanical Enforcement {#mechanical-enforcement}
 
-Add a style-check rule (the grep suite under `utils/check-style/`): in
+Add a style-check rule (the parallel grep suite in `ci/jobs/scripts/check_style/check_cpp.sh`): in
 `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/*.{h,cpp}` **excluding**
 `CachedPartFolderAccess.*`, the tokens `->dropRef(`, `->updateRefPayload(`, `->dropNamespace(`, and
 `->promote(` must not appear. `Core/` is exempt (the protocol implements these). This is a
@@ -470,10 +471,10 @@ guarantee lapses. This is the operational kill switch and the Phase 2/3 default.
 |---|---|
 | `shard_decode_cache` | **stays in `Cas::Store` untouched.** Its TTL + `shard_write_seq` + single-flight machinery is verified and is now a load-bearing dependency of validate-on-hit. Relocating it buys no behavior. |
 | `dedup_cache` | **stays in `Cas::Store` untouched.** Write-path hint, unrelated to part loading. |
-| `manifest_cache` | **Phase 5: byte-bound it.** Today it is count-bounded (16384 entries) with no byte limit — decoded manifests can hold megabytes of inline bytes each, a multi-GB worst case. Convert to a byte-weighted bound (reuse `CacheBase` or add byte accounting to the existing map + wholesale-clear), and share the accounting with the view cache so a decode referenced by both is counted once. |
+| `manifest_cache` | **Phase 5: byte-bound it.** Today it is count-bounded (16384 entries) with no byte limit — decoded manifests can hold megabytes of inline bytes each, a multi-GB worst case. Convert to a byte-weighted `CacheBase` bound. The view cache keeps its conservative `manifest_size` over-count: a retained view can outlive the decode-cache entry, so "counting the shared decode once" would under-count — over-counting is the safe direction. |
 
 The RFC's `CasCacheState` (one object owning all cache maps) is **not built**. Its honest kernel —
-bounded memory with unified accounting — is delivered by Phase 5 without relocating verified
+bounded decode memory — is delivered by Phase 5 without relocating verified
 machinery. If a later need arises (e.g. server-wide cache introspection), extraction can be
 revisited then.
 
@@ -611,8 +612,9 @@ observes it), all counters live.
 
 ### Phase 5: Byte-Bound `manifest_cache` {#phase-5-byte-bound-manifest-cache}
 
-Byte-weighted bound for `manifest_cache`; unified accounting with the view cache (shared decodes
-counted once). No relocation of `shard_decode_cache` or `dedup_cache`.
+Byte-weighted bound for `manifest_cache`; the view cache keeps its conservative `manifest_size`
+over-count (a retained view can outlive the decode-cache entry). No relocation of
+`shard_decode_cache` or `dedup_cache`.
 
 Acceptance: bounded decode memory under a many-parts read storm; no behavior change.
 
