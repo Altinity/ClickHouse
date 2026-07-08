@@ -455,6 +455,17 @@ xargs < "$STYLE_TMPDIR/all_excluded" rg -n '\bassert[[:space:]]*\(' |
     echo "Use chassert instead of assert"
 } > "$O.18" 2>&1 &
 
+# 19: CAS wiring must not mutate committed refs through raw Cas::Store / Cas::Build (spec
+# docs/superpowers/specs/2026-07-08-cas-part-folder-cache-design.md): committed part-ref mutations
+# go through CachedPartFolderAccess (dot-syntax on the partAccess() reference). Best-effort textual
+# guard: Core/ (the protocol implementation) and the facade itself are exempt.
+{
+find $ROOT_PATH/src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed -maxdepth 1 \( -name '*.h' -or -name '*.cpp' \) 2>/dev/null |
+    grep -v 'CachedPartFolderAccess' |
+    xargs -r rg -n -e '->(dropRef|updateRefPayload|dropNamespace|promote)\(' &&
+    echo "Committed part-ref mutations in CAS wiring must go through CachedPartFolderAccess (docs/superpowers/specs/2026-07-08-cas-part-folder-cache-design.md)"
+} > "$O.19" 2>&1 &
+
 # Wait for all parallel checks to complete, then output results in order
 wait
 cat "$O".* 2>/dev/null
