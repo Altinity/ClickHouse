@@ -27,8 +27,10 @@ with four amendments settled during design review:
 1. **Validate-on-hit retention.** A retained view is never trusted by age or by invalidation
    bookkeeping. Every hit re-resolves the ref through the existing `resolveRef` path (already
    TTL-bounded and locally write-coherent) and compares `(manifest_id, mutable_files)` with the
-   view. Staleness is therefore identical to today's semantics *by construction*, and correctness
-   no longer depends on routing every mutation site through the facade.
+   view. Ref staleness is therefore identical to today's semantics *by construction*; manifest-body
+   liveness checking is deferred only on validated `CachedForLoad` hits and never on write-evidence
+   or strict paths (see Safety Analysis). Correctness no longer depends on routing every mutation
+   site through the facade. The cache is on by default and can be disabled with one setting.
 2. **Shared decoded manifests and index-free views.** `Cas::Store` gains `readManifestShared`
    returning `std::shared_ptr<const PartManifest>` (the decode the manifest cache already holds),
    and the manifest codec's decoder is tightened to enforce strict canonical path order. A
@@ -56,7 +58,11 @@ Goals:
   through `CachedPartFolderAccess`; direct `Cas::Store` committed-ref mutations in wiring code
   become mechanical review failures.
 - Behavior preservation: with retention disabled, byte-identical answers and an identical call
-  graph; with retention enabled, staleness semantics identical to today's.
+  graph; with retention enabled, ref-staleness semantics identical to today's, with manifest-body
+  liveness validation deferred only on validated `CachedForLoad` hits — never on write-evidence or
+  strict paths.
+- Retention is enabled by default (from Phase 4 onward) and disabling it is a supported permanent
+  operational configuration, not only a debug aid.
 - Keep `Cas::Store` protocol-only; keep the TLA+ posture unchanged (no new durable state, no new
   transition, cached state never used as write evidence or reachability).
 
@@ -157,8 +163,10 @@ right parse result shape) and gains `refKey` returning the `(ns, ref)` subset; t
 
 ### `Freshness` {#freshness}
 
-Three values (the RFC's `ForceFreshMutable` and `FreshForWrite` were behaviorally identical — both
-mean "resolve fresh"; call-site intent is carried by counters and comments, not by enum values):
+Three values. The RFC's `ForceFreshMutable` / `FreshForWrite` distinction is carried by the
+*method*, not by a fourth enum value: mutable per-part reads call `resolve` and never touch a
+manifest at all, while write-path source reads call `getView`, which under `ForceFresh` always
+re-proves the manifest body (below).
 
 ```text
 enum class Freshness
@@ -174,11 +182,15 @@ Behavior contract:
 | Freshness | Ref resolution | May serve retained view | May retain/update view |
 |---|---|---|---|
 | `CachedForLoad` | `allow_stale=true` | yes, after compare-validation | yes |
-| `ForceFresh` | `allow_stale=false` | yes, only if the *fresh* resolve matches it | yes |
+| `ForceFresh` | `allow_stale=false` | never without body revalidation: `getView` always runs `readManifestShared` (mandatory manifest `HEAD`; token-matched decode reuse) | yes, after body validation |
 | `StrictValidate` | `allow_stale=false` | never | never |
 
 In every mode, answers about mutable per-part files come from the freshly resolved
 `Resolved::mutable_files`, never from a view that was not validated against that same resolve.
+A fresh ref resolve proves only that the *ref* is current — it does not prove the manifest *body*
+still exists; that is why `ForceFresh` and `StrictValidate` must reach `readManifestShared`'s
+mandatory `HEAD` on every `getView` call, preserving today's fail-closed `INV-NO-DANGLE` surfacing
+on write-evidence paths unchanged.
 
 ### `PartFolderView` {#partfolderview}
 
@@ -262,7 +274,7 @@ manifest `HEAD`, the manifest copy, the linear scan) and adds only an in-memory 
 getView(key, freshness):
     1. resolved = Store::resolveRef(key.ns, key.ref, allow_stale per freshness)
        -- absent ref => return nullptr; NEVER retain absence.
-    2. if freshness != StrictValidate and retained view V exists for key:
+    2. if freshness == CachedForLoad and retained view V exists for key:
          a. if V.manifest_id == resolved.manifest_id
             and V.mutable_files == resolved.mutable_files:
               count hit; return V.                       (validated hit — no remote manifest op)
@@ -287,10 +299,13 @@ writes; a foreign write (shadow namespaces are pool-global) is observed within t
 bound as today. A racing stale insert is benign: the next hit's compare rejects it. The RFC's
 `view_write_seq` / generation machinery is therefore not built.
 
-`ForceFresh` runs the same steps with `allow_stale=false`; a retained view that matches a *fresh*
-resolve is exactly current, so reusing it (and its shared decode) is both safe and desirable — this
-is how `getPartManifestBytes` and write-path source reads avoid re-decodes without ever consuming
-stale evidence.
+`ForceFresh` resolves with `allow_stale=false` and always proceeds to step 3: the mandatory
+manifest `HEAD` inside `readManifestShared` re-proves the body exists *now*, while the
+token-matched decode reuse keeps the cost at one `HEAD` — no `GET`, no re-decode, no copy. That is
+exactly today's request pattern for `getPartManifestBytes`, `republishRef` source reads, and
+committed-source `createHardLink`, so fail-closed behavior on write-evidence paths is preserved
+unchanged. (An earlier draft let `ForceFresh` serve a retained view when the fresh resolve matched
+it; that was rejected on review — see Rejected Alternatives.)
 
 `StrictValidate` skips steps 2 and 4 entirely: fresh resolve, `readManifestShared` (whose mandatory
 manifest `HEAD` re-proves remote presence — a token match proves byte identity, and in-place
@@ -324,7 +339,7 @@ shadow-intermediate, table-verbatim, mountpoint, and live-tree-LIST branches are
 | `tryGetInManifestBytes` | mutable: `resolve(ForceFresh)`; inline: `getView(CachedForLoad)` | |
 | `getBlobViewPlan` | `getView(key, CachedForLoad)` | `findFile` + `Store::locate` |
 | `getLastModified` | `resolve(key, CachedForLoad)` | ref-only (`published_at_ms`); no view needed |
-| `getPartManifestBytes` | `getView(key, ForceFresh)` | re-encode the shared decode; fresh evidence for part exchange |
+| `getPartManifestBytes` | `getView(key, ForceFresh)` | body re-proven by the mandatory `HEAD`; re-encode the shared decode |
 | `adoptPartFromManifest` | `publishEntries(dst, decoded.entries, mutable_files, Attach)` | see Write Path |
 | `iterateDirectory`, `isDirectoryEmpty` | inherit via `listDirectory` / short-circuits | unchanged behavior |
 
@@ -345,7 +360,10 @@ The in-flight overlay's first-component-collapse logic (`listInFlightDirectory`,
 Level 1 — terminal committed-ref primitives, each a thin wrapper: perform the `Cas::Store` /
 `Cas::Build` operation, then on success erase the affected key(s) from the retained map (namespace
 prefix scan for `dropNamespace`) and count the invalidation. On exception, cache state is
-untouched. Under validate-on-hit this erase is *hygiene* (prompt memory release, honest counters) —
+untouched — with one deliberate, documented exception: `dropRefBestEffort` erases the key even
+when the underlying drop failed and was swallowed, because in its destructor/rollback context the
+ref's durable state is unknown and dropping the view is the conservative direction. Under
+validate-on-hit the erase is *hygiene* in both variants (prompt memory release, honest counters) —
 correctness never depends on it.
 
 | Facade operation | Wraps | Cache effect on success |
@@ -384,9 +402,12 @@ altered by the facade: `promoteBuild` wraps only the final promote step.
 Add a style-check rule (the grep suite under `utils/check-style/`): in
 `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/*.{h,cpp}` **excluding**
 `CachedPartFolderAccess.*`, the tokens `->dropRef(`, `->updateRefPayload(`, `->dropNamespace(`, and
-`->promote(` must not appear. `Core/` is exempt (the protocol implements these). This turns the
-RFC's review rule — "no committed part-ref mutation in wiring calls raw `Cas::Store`" — into a CI
-failure instead of reviewer vigilance.
+`->promote(` must not appear. `Core/` is exempt (the protocol implements these). This is a
+**best-effort textual guard**, like the rest of the check-style grep suite: it will not catch
+dot-syntax calls through a `Store &` alias or creative wrappers, and a comment quoting a banned
+token trips it (acceptable — reword the comment). The *review rule* — "no committed part-ref
+mutation in wiring calls raw `Cas::Store` / `Cas::Build`" — remains normative; the grep exists so
+the common regression shape fails CI instead of relying on reviewer vigilance.
 
 ## Shared Decodes And Codec Ordering {#shared-decodes-and-codec-ordering}
 
@@ -431,6 +452,10 @@ cas_part_folder_cache_bytes = 64 MiB      /// 0 disables retention entirely
 cas_part_folder_cache_max_entries = 10000
 cas_part_folder_cache_max_entry_bytes = 16 MiB   /// = manifest_soft_limit default
 ```
+
+The cache is **on by default** from Phase 4 onward (the 64 MiB default);
+`cas_part_folder_cache_bytes = 0` is the single disable switch and is a supported permanent
+operational configuration, not only a debugging aid.
 
 ### Disabled Mode {#disabled-mode}
 
@@ -484,8 +509,10 @@ set `cas_part_folder_cache_bytes = 0`; run `fsck` / integrity probes only throug
 
 ### Staleness Equivalence {#staleness-equivalence}
 
-Claim: with retention enabled, every `CachedForLoad` answer is byte-identical to the answer the
-same operation produces today.
+Claim, stated precisely: with retention enabled, `CachedForLoad` reads keep today's
+*ref-staleness* semantics exactly, and their answers are byte-identical to today's whenever the
+manifest body is in its protocol-normal state; *manifest-body liveness* validation is deferred on
+validated hits (and only there — `ForceFresh` and `StrictValidate` re-prove the body per call).
 
 Argument: today's answer is a pure function of `(resolveRef(allow_stale=true) result, the manifest
 body it names)`. A validated hit serves a view whose `(manifest_id, mutable_files)` equal the
@@ -497,10 +524,12 @@ visible to the resolve via `shard_write_seq`; foreign-writer staleness is bounde
 `shard_decode_cache_ttl_ms` exactly as today. Shadow namespaces need no special handling.
 
 The residual (accepted, documented) delta: if a live manifest *object* is externally tampered with
-or physically deleted after the view was built — both protocol violations — a validated hit delays
-detection until eviction, mismatch, or a `StrictValidate` probe, whereas today's per-operation
-`HEAD` would notice sooner. This is the RFC's stated `INV-NO-DANGLE` diagnostic tradeoff; `fsck`
-uses `StrictValidate` precisely so incident diagnosis is never behind the cache.
+or physically deleted after the view was built — both protocol violations — a validated
+`CachedForLoad` hit delays detection until eviction, a compare mismatch, or the next `ForceFresh`
+or `StrictValidate` operation on the folder, whereas today's per-operation `HEAD` would notice
+sooner. Write-evidence and strict paths have no delta at all (they `HEAD` per call). This is the
+RFC's stated `INV-NO-DANGLE` diagnostic tradeoff, now confined to stale-tolerant load reads;
+`fsck` uses `StrictValidate` precisely so incident diagnosis is never behind the cache.
 
 ### Invariant Obligations {#invariant-obligations}
 
@@ -510,9 +539,10 @@ uses `StrictValidate` precisely so incident diagnosis is never behind the cache.
    exception on the byte read.
 3. `mutable_files` are never treated as reachability; views are not owner state, hold no tokens
    with authority, never affect GC in-degree, and never protect objects from GC.
-4. Write evidence is never taken from a `CachedForLoad` view: write-path source reads use
-   `ForceFresh`, whose view reuse is gated on matching a fresh resolve — the resolve itself is the
-   evidence.
+4. Write evidence is never taken from a retained view: write-path source reads use `ForceFresh`,
+   which re-proves the manifest body with `readManifestShared`'s mandatory `HEAD` on every call —
+   the same fail-closed surface as today's `readManifest`. A fresh ref resolve alone is never
+   treated as proof that a manifest body or blob still exists.
 5. The `precommitAdd` -> blob validation -> `promote` ordering is unchanged.
 
 ### Model-Adjacent Freshness Checklist {#model-adjacent-freshness-checklist}
@@ -525,7 +555,8 @@ The RFC's five checks, each now discharged structurally rather than by per-site 
 2. *A stale remote read cannot be reinserted after a local write* — reinsertion is possible but
    harmless: the entry can never validate against any post-write resolve.
 3. *`ForceFresh` mutable reads bypass stale state* — mutable answers always come from the fresh
-   `Resolved`; a view is consulted only if it equals that resolve.
+   `Resolved`; `getView(ForceFresh)` never serves a retained view and re-proves the manifest body
+   per call.
 4. *Write paths never use cached views as existence proof* — obligation 4 above.
 5. *Cached views never count as reachability roots or GC state* — obligation 3 above.
 
@@ -591,7 +622,9 @@ Acceptance: bounded decode memory under a many-parts read storm; no behavior cha
   entry, prefix boundaries, projection collapse, reserved-name filtering, empty manifest,
   mutable-only folders). Codec: out-of-order and non-adjacent-duplicate bodies rejected. Facade:
   validate-on-hit hit/refresh/mismatch/miss paths; `ForceFresh` read-your-writes after each level-1
-  primitive; `StrictValidate` bypass; single-flight coalescing (leader exception propagation);
+  primitive; `getView(ForceFresh)` surfaces `FILE_DOESNT_EXIST` when the manifest body is missing
+  even while a matching retained view exists (write-evidence fail-closed); `StrictValidate`
+  bypass; single-flight coalescing (leader exception propagation);
   absence never retained; oversized bypass; disabled-mode call-graph equivalence; write-through
   erase per primitive; `republishRef` idempotent re-drive and conflict arms; `publishEntries`
   parity with the old `adoptPartFromManifest` body. Request counts via `CasInstrumentedBackend`
@@ -609,13 +642,16 @@ Acceptance: bounded decode memory under a many-parts read storm; no behavior cha
 1. No `MergeTree` files change; no `IMetadataStorage` API change; disk/pool formats unchanged.
 2. Phase gates as listed per phase above, in order; retention is not enabled before Phase 3's
    counters and baselines exist.
-3. With retention disabled, read and write call graphs are identical to the enabled ones minus the
-   retained-map consultation.
-4. Repeated metadata operations on one eligible committed part/projection folder perform at most
-   one `PartManifest` body `GET` and zero manifest `HEAD`s while its view is retained and
-   validating.
+3. The cache is enabled by default; `cas_part_folder_cache_bytes = 0` disables it as a supported
+   operational configuration, and with retention disabled, read and write call graphs are
+   identical to the enabled ones minus the retained-map consultation.
+4. Repeated `CachedForLoad` metadata operations on one eligible committed part/projection folder
+   perform at most one `PartManifest` body `GET` and zero manifest `HEAD`s while its view is
+   retained and validating; `ForceFresh` and `StrictValidate` operations intentionally keep their
+   per-call manifest `HEAD`.
 5. Mutable per-part file reads keep force-fresh semantics; write-path source reads use
-   `ForceFresh`; `fsck`/probes use `StrictValidate` and never consult retained views.
+   `ForceFresh`, which re-proves the manifest body per call; `fsck`/probes use `StrictValidate`
+   and never consult retained views.
 6. Missing or corrupt committed manifests raise exceptions on every build and strict path; a
    failed validation is never cached; ref absence is never cached.
 7. Ordinary caller code contains no manual cache invalidation; the check-style rule rejects raw
@@ -636,7 +672,15 @@ Acceptance: bounded decode memory under a many-parts read storm; no behavior cha
   namespaces. Validate-on-hit is strictly stronger and cheaper to reason about.
 - **Thread-local "active slot".** Rejected as v1 complexity with no measurable benefit over a
   bounded shared map lookup.
-- **Four-value `Freshness`.** `ForceFreshMutable` and `FreshForWrite` were behaviorally identical;
+- **`ForceFresh` serving a retained view on a matching fresh resolve (earlier draft of this
+  spec).** Rejected on external review 2026-07-08: a fresh ref resolve proves ref currency, not
+  manifest-body existence, so write paths would have consumed cached entries as evidence and
+  delayed `INV-NO-DANGLE` where today's `readManifest` surfaces it. `getView(ForceFresh)` now
+  always runs `readManifestShared` (mandatory `HEAD`, token-matched decode reuse) — same request
+  pattern and fail-closed surface as today, still no `GET`/re-decode on the common path.
+- **Four-value `Freshness`.** The reviewer's alternative remedy for the above. Not needed: the
+  `ForceFreshMutable` / `FreshForWrite` distinction is carried by the method (mutable reads call
+  `resolve` and touch no manifest; write-evidence reads call `getView`, which re-proves the body);
   intent lives in counters and call-site comments.
 - **Materialized file/directory indexes in `PartFolderView`.** Unnecessary once the decoder
   enforces canonical order; binary search over the shared decode is simpler and lighter.
