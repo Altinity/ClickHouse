@@ -749,12 +749,13 @@ void ContentAddressedTransaction::createHardLink(const std::string & path_from, 
 
     /// Carry forward from the COMMITTED source part: read the source manifest, find the named entry,
     /// record a TOKENLESS W-EVIDENCE dep for its blob (no HEAD before precommit; promote re-proves it).
-    auto resolved = metadata_storage.store()->resolveRef(src->ns, src->ref);
-    if (!resolved)
+    /// ForceFresh getView == resolveRef(allow_stale=false) + readManifestShared, so this is the same
+    /// request pattern as before, now instrumented via the facade (spec §Method Routing).
+    auto view = metadata_storage.partAccess().getView(src->refKey(), ContentAddressed::Freshness::ForceFresh);
+    if (!view)
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
             "ContentAddressed: createHardLink source part missing: {}", path_from);
-    const auto src_manifest = metadata_storage.store()->readManifestShared(resolved->manifest_id);
-    const auto * src_entry = Cas::findEntry(src_manifest->entries, src->file);
+    const auto * src_entry = view->findFile(src->file);
     if (!src_entry)
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
             "ContentAddressed: createHardLink source file missing in manifest: {}", path_from);

@@ -36,6 +36,7 @@ namespace ProfileEvents
     extern const Event CasManifestBackpressureCount;
     extern const Event CasManifestBackpressureMicroseconds;
     extern const Event CasManifestHardLimitExceeded;
+    extern const Event CasPartFolderManifestGets;
 }
 
 namespace DB::Cas
@@ -982,6 +983,7 @@ std::shared_ptr<const PartManifest> Store::readManifestShared(const ManifestId &
     if (!object)
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
             "manifest at {} vanished between head and get — INV-NO-DANGLE", key);
+    ProfileEvents::increment(ProfileEvents::CasPartFolderManifestGets);
 
     PartManifest body = decodePartManifest(object->bytes);
 

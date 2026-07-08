@@ -5,7 +5,9 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <unordered_map>
 #include <vector>
 
 namespace DB::Cas { class Build; }
@@ -61,8 +63,30 @@ public:
     void dropRefBestEffort(const PartRefKey & key) noexcept;
     void dropNamespace(const Cas::RootNamespace & ns);
 
+    /// ==== diagnostics (spec §Observability) ====
+    enum class LastDecision : uint8_t
+    { Hit, MutableRefresh, Mismatch, Miss, OversizedBypass, StrictBypass, ForceFreshRead, Invalidated };
+    struct ExplainResult
+    {
+        bool retained = false;             /// false throughout Phase 3 (no retained map yet)
+        LastDecision last_decision = LastDecision::Miss;
+        String manifest_ref;               /// manifestRefDebugString of the last-served view
+        size_t estimated_bytes = 0;
+    };
+    /// Test/log-only decision journal; absent key => default ExplainResult.
+    ExplainResult explain(const PartRefKey & key) const;
+    void clearForTest();
+
 private:
     Cas::StorePtr store;
+
+    /// Decision journal for explain (test/log-only; spec §Observability). Bounded by wholesale
+    /// clear — debug state, never consulted by the read/write paths.
+    static constexpr size_t EXPLAIN_MAX_ENTRIES = 10000;
+    mutable std::mutex explain_mutex;
+    mutable std::unordered_map<String, ExplainResult> explain_map;
+    void recordDecision(const PartRefKey & key, LastDecision decision,
+                        const PartFolderView * view) const;
 };
 
 }

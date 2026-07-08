@@ -1,10 +1,17 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/CachedPartFolderAccess.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.h>
+#include <Common/ProfileEvents.h>
 
 namespace DB::ErrorCodes
 {
     extern const int FILE_DOESNT_EXIST;
     extern const int ABORTED;
+}
+
+namespace ProfileEvents
+{
+    extern const Event CasPartFolderViewMisses;
+    extern const Event CasPartFolderViewInvalidations;
 }
 
 namespace DB::ContentAddressed
@@ -18,7 +25,14 @@ CachedPartFolderAccess::getView(const PartRefKey & key, Freshness freshness) con
         return nullptr;   /// absence is never cached
     /// Fail-closed exactly as before: a live ref naming a missing body throws FILE_DOESNT_EXIST
     /// (INV-NO-DANGLE surfaced); corrupt bodies throw CORRUPTED_DATA and are never cached.
-    return PartFolderView::make(key, *resolved, store->readManifestShared(resolved->manifest_id));
+    auto view = PartFolderView::make(key, *resolved, store->readManifestShared(resolved->manifest_id));
+    ProfileEvents::increment(ProfileEvents::CasPartFolderViewMisses);
+    recordDecision(key,
+        freshness == Freshness::CachedForLoad ? LastDecision::Miss
+        : freshness == Freshness::ForceFresh ? LastDecision::ForceFreshRead
+        : LastDecision::StrictBypass,
+        view.get());
+    return view;
 }
 
 std::optional<Cas::Resolved>
@@ -38,6 +52,8 @@ void CachedPartFolderAccess::promoteBuild(Cas::Build & build, const PartRefKey &
     build.setPendingMutableFiles(std::move(mutable_files));
     build.promote(key.ns, key.ref, build_id, manifest_id);
     /// Phase 4: eraseView(key)
+    ProfileEvents::increment(ProfileEvents::CasPartFolderViewInvalidations);
+    recordDecision(key, LastDecision::Invalidated, nullptr);
 }
 
 void CachedPartFolderAccess::publishEntries(const PartRefKey & dst,
@@ -101,12 +117,16 @@ void CachedPartFolderAccess::updateMutableFiles(const PartRefKey & key, std::fun
 {
     store->updateRefPayload(key.ns, key.ref, std::move(mutator));
     /// Phase 4: eraseView(key)
+    ProfileEvents::increment(ProfileEvents::CasPartFolderViewInvalidations);
+    recordDecision(key, LastDecision::Invalidated, nullptr);
 }
 
 void CachedPartFolderAccess::dropRef(const PartRefKey & key)
 {
     store->dropRef(key.ns, key.ref);
     /// Phase 4: eraseView(key)
+    ProfileEvents::increment(ProfileEvents::CasPartFolderViewInvalidations);
+    recordDecision(key, LastDecision::Invalidated, nullptr);
 }
 
 void CachedPartFolderAccess::dropRefIfPresent(const PartRefKey & key)
@@ -126,8 +146,11 @@ void CachedPartFolderAccess::dropRefIfPresent(const PartRefKey & key)
     {
         if (e.code() != ErrorCodes::FILE_DOESNT_EXIST)
             throw;
+        return;   /// raced away between the gate and dropRef — nothing was actually dropped here
     }
     /// Phase 4: eraseView(key)
+    ProfileEvents::increment(ProfileEvents::CasPartFolderViewInvalidations);
+    recordDecision(key, LastDecision::Invalidated, nullptr);
 }
 
 void CachedPartFolderAccess::dropRefBestEffort(const PartRefKey & key) noexcept
@@ -141,12 +164,45 @@ void CachedPartFolderAccess::dropRefBestEffort(const PartRefKey & key) noexcept
         /// Best-effort destructor/rollback cleanup: debris is GC-reclaimed, never a masked throw.
     }
     /// Phase 4: eraseView(key) — deliberately ALSO on the swallowed-failure path (spec §Two-Level API).
+    ProfileEvents::increment(ProfileEvents::CasPartFolderViewInvalidations);
+    recordDecision(key, LastDecision::Invalidated, nullptr);
 }
 
 void CachedPartFolderAccess::dropNamespace(const Cas::RootNamespace & ns)
 {
     store->dropNamespace(ns);
-    /// Phase 4: erase every view whose key is in `ns`
+    /// Phase 4: erase every view whose key is in `ns`. Nothing enumerates the namespace's keys
+    /// cheaply until then, so per-key `recordDecision` is skipped here (spec §Observability).
+    ProfileEvents::increment(ProfileEvents::CasPartFolderViewInvalidations);
+}
+
+void CachedPartFolderAccess::recordDecision(const PartRefKey & key, LastDecision decision,
+                                            const PartFolderView * view) const
+{
+    std::lock_guard lock(explain_mutex);
+    if (explain_map.size() >= EXPLAIN_MAX_ENTRIES)
+        explain_map.clear();
+    auto & e = explain_map[key.cacheKey()];
+    e.last_decision = decision;
+    if (view)
+    {
+        e.manifest_ref = Cas::manifestRefDebugString(view->manifestId().ref);
+        e.estimated_bytes = view->estimatedBytes();
+    }
+    /// `retained` stays false until Phase 4 sets it on insert/erase.
+}
+
+CachedPartFolderAccess::ExplainResult CachedPartFolderAccess::explain(const PartRefKey & key) const
+{
+    std::lock_guard lock(explain_mutex);
+    const auto it = explain_map.find(key.cacheKey());
+    return it == explain_map.end() ? ExplainResult{} : it->second;
+}
+
+void CachedPartFolderAccess::clearForTest()
+{
+    std::lock_guard lock(explain_mutex);
+    explain_map.clear();
 }
 
 }

@@ -159,3 +159,31 @@ TEST(CasPartFolderAccess, RepublishRefIdempotentRedriveAndConflict)
     expectThrowsCode(ErrorCodes::ABORTED, [&] { access.republishRef({ns, "src2"}, {ns, "dst2"}); });
     EXPECT_TRUE(access.existsRef({ns, "src2"}, ContentAddressed::Freshness::ForceFresh));
 }
+
+TEST(CasPartFolderAccess, ExplainRecordsDecisions)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openStoreForTest(backend);
+    const Cas::RootNamespace ns{"srv/t1"};
+    ContentAddressed::CachedPartFolderAccess access(store);
+    publishPart(store, ns, "part_1", {inlineEntry("checksums.txt", "cs")});
+    const ContentAddressed::PartRefKey key{ns, "part_1"};
+
+    access.getView(key, ContentAddressed::Freshness::CachedForLoad);
+    EXPECT_EQ(access.explain(key).last_decision,
+              ContentAddressed::CachedPartFolderAccess::LastDecision::Miss);       /// cold build
+    EXPECT_FALSE(access.explain(key).retained);                                    /// Phase 3: never
+
+    access.getView(key, ContentAddressed::Freshness::ForceFresh);
+    EXPECT_EQ(access.explain(key).last_decision,
+              ContentAddressed::CachedPartFolderAccess::LastDecision::ForceFreshRead);
+
+    access.getView(key, ContentAddressed::Freshness::StrictValidate);
+    EXPECT_EQ(access.explain(key).last_decision,
+              ContentAddressed::CachedPartFolderAccess::LastDecision::StrictBypass);
+
+    access.dropRef(key);
+    EXPECT_EQ(access.explain(key).last_decision,
+              ContentAddressed::CachedPartFolderAccess::LastDecision::Invalidated);
+    EXPECT_GT(access.explain(key).estimated_bytes, 0u);
+}
