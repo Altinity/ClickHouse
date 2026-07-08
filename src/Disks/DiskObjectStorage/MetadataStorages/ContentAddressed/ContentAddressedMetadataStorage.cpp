@@ -384,6 +384,7 @@ void ContentAddressedMetadataStorage::startup()
     pool_config.manifest_max_delay_ms = manifest_max_delay_ms;
     cas_store = Cas::Store::open(std::move(backend), std::move(pool_config));
     pool_uuid = Cas::u128ToHex(cas_store->poolMeta().pool_id);
+    part_access = std::make_unique<ContentAddressed::CachedPartFolderAccess>(cas_store);
 
     /// B170: bridge per-event CAS decisions to system.content_addressed_log (null sink when context
     /// is absent, e.g. unit tests — emitEvent is then a no-op single branch in the Core).
@@ -408,6 +409,7 @@ void ContentAddressedMetadataStorage::shutdown()
         gc_scheduler->stop();
         gc_scheduler.reset();
     }
+    part_access.reset();
     cas_store.reset();
 }
 
@@ -417,6 +419,14 @@ const Cas::StorePtr & ContentAddressedMetadataStorage::store() const
         throw Exception(ErrorCodes::LOGICAL_ERROR,
             "ContentAddressedMetadataStorage: store accessed before startup");
     return cas_store;
+}
+
+ContentAddressed::CachedPartFolderAccess & ContentAddressedMetadataStorage::partAccess() const
+{
+    if (!part_access)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "ContentAddressedMetadataStorage: partAccess accessed before startup");
+    return *part_access;
 }
 
 MetadataTransactionPtr ContentAddressedMetadataStorage::createTransaction()
@@ -505,17 +515,6 @@ ContentAddressedMetadataStorage::route(const ContentAddressed::PartFilePath & p)
     return r;
 }
 
-std::shared_ptr<const ContentAddressed::PartFolderView>
-ContentAddressedMetadataStorage::resolveRouted(const Route & r) const
-{
-    auto resolved = store()->resolveRef(r.ns, r.ref, /*allow_stale=*/true);
-    if (!resolved)
-        return nullptr;
-    /// A live ref to a missing/corrupt manifest throws (INV-NO-DANGLE surfaced, never substituted).
-    return ContentAddressed::PartFolderView::make(
-        r.refKey(), *resolved, store()->readManifestShared(resolved->manifest_id));
-}
-
 std::vector<std::string> ContentAddressedMetadataStorage::detachedRefNames(const Cas::RootNamespace & ns) const
 {
     std::vector<std::string> refs;
@@ -547,12 +546,12 @@ bool ContentAddressedMetadataStorage::existsFile(const std::string & path) const
     if (ContentAddressed::isMutablePerPartFile(r->file))
     {
         /// Force-fresh (Pillar B): read-your-writes for a just-written mutable file — no TTL-stale manifest.
-        auto resolved = store()->resolveRef(r->ns, r->ref);
+        auto resolved = partAccess().resolve(r->refKey(), ContentAddressed::Freshness::ForceFresh);
         return resolved && !ContentAddressed::PartFolderView::isReservedMutableName(r->file)
             && resolved->mutable_files.contains(r->file);
     }
 
-    auto view = resolveRouted(*r);
+    auto view = partAccess().getView(r->refKey(), ContentAddressed::Freshness::CachedForLoad);
     return view && view->findFile(r->file);
 }
 
@@ -563,7 +562,8 @@ bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) 
     if (ContentAddressed::isShadowPath(path))
     {
         if (auto p = ContentAddressed::parsePartFilePath(path); p && !p->backup_name.empty() && p->file.empty())
-            return store()->resolveRef(shadowNamespace(p->shadow_table_dir), p->part_name, /*allow_stale=*/true).has_value();
+            return partAccess().existsRef(Route{shadowNamespace(p->shadow_table_dir), p->part_name, ""}.refKey(),
+                                          ContentAddressed::Freshness::CachedForLoad);
         if (ContentAddressed::endsWithTableUuidPair(path))
             return !store()->listRefs(shadowNamespace(path)).empty();
         /// Intermediate dir (shadow/<bk>, shadow/<bk>/store, ...): exists iff the scoped S3
@@ -593,13 +593,13 @@ bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) 
             return !detachedRefNames(r->ns).empty();
         /// A part dir (live, detached, or shadow): exists iff its ref is present.
         if (r && !r->ref.empty() && r->file.empty())
-            return store()->resolveRef(r->ns, r->ref, /*allow_stale=*/true).has_value();
+            return partAccess().existsRef(r->refKey(), ContentAddressed::Freshness::CachedForLoad);
         /// A projection dir: at least one tree entry (or mutable file) under its prefix.
         if (r && !r->ref.empty())
         {
             if (auto prefix = ContentAddressed::PartFolderView::projectionDirPrefix(r->file))
             {
-                auto view = resolveRouted(*r);
+                auto view = partAccess().getView(r->refKey(), ContentAddressed::Freshness::CachedForLoad);
                 return view && view->hasDirectory(*prefix);
             }
         }
@@ -646,7 +646,7 @@ uint64_t ContentAddressedMetadataStorage::getFileSize(const std::string & path) 
     if (!r || r->file.empty())
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: not a part file path: {}", path);
 
-    auto view = resolveRouted(*r);
+    auto view = partAccess().getView(r->refKey(), ContentAddressed::Freshness::CachedForLoad);
     if (!view)
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no ref for {}", path);
     if (auto size = view->fileSize(r->file))
@@ -663,7 +663,7 @@ Poco::Timestamp ContentAddressedMetadataStorage::getLastModified(const std::stri
     /// stamps only feed cleanup TTLs and system tables).
     auto resolve_stamp = [&](const Route & r) -> Poco::Timestamp
     {
-        auto resolved = store()->resolveRef(r.ns, r.ref, /*allow_stale=*/true);
+        auto resolved = partAccess().resolve(r.refKey(), ContentAddressed::Freshness::CachedForLoad);
         if (!resolved)
             throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no ref for {}", path);
         if (resolved->published_at_ms == 0)
@@ -691,7 +691,8 @@ std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const st
         /// Shadow PART dir: the frozen part's file names (first components).
         if (auto p = ContentAddressed::parsePartFilePath(path); p && !p->backup_name.empty() && p->file.empty())
         {
-            auto view = resolveRouted(Route{shadowNamespace(p->shadow_table_dir), p->part_name, ""});
+            auto view = partAccess().getView(Route{shadowNamespace(p->shadow_table_dir), p->part_name, ""}.refKey(),
+                                             ContentAddressed::Freshness::CachedForLoad);
             return view ? view->listChildren("") : std::vector<std::string>{};
         }
         /// Shadow TABLE dir: the frozen part names.
@@ -750,7 +751,7 @@ std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const st
         /// keys collapsed to their first component (projections surface as ONE <proj>.proj entry).
         if (r && !r->ref.empty() && r->file.empty())
         {
-            auto view = resolveRouted(*r);
+            auto view = partAccess().getView(r->refKey(), ContentAddressed::Freshness::CachedForLoad);
             return view ? view->listChildren("") : std::vector<std::string>{};
         }
         /// A projection dir: inner names with the <proj>.proj/ prefix stripped.
@@ -758,7 +759,7 @@ std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const st
         {
             if (auto prefix = ContentAddressed::PartFolderView::projectionDirPrefix(r->file))
             {
-                auto view = resolveRouted(*r);
+                auto view = partAccess().getView(r->refKey(), ContentAddressed::Freshness::CachedForLoad);
                 return view ? view->listChildren(*prefix) : std::vector<std::string>{};
             }
         }
@@ -839,7 +840,7 @@ StoredObjects ContentAddressedMetadataStorage::getStorageObjects(const std::stri
     if (!r || r->file.empty())
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: not a part file path: {}", path);
 
-    auto view = resolveRouted(*r);
+    auto view = partAccess().getView(r->refKey(), ContentAddressed::Freshness::CachedForLoad);
     if (!view)
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no ref for {}", path);
     if (const auto * entry = view->findFile(r->file))
@@ -875,7 +876,7 @@ std::optional<String> ContentAddressedMetadataStorage::tryGetInManifestBytes(con
     if (ContentAddressed::isMutablePerPartFile(r->file))
     {
         /// Force-fresh (Pillar B): MVCC txn_version / mutable-file read — must not serve a TTL-stale manifest.
-        auto resolved = store()->resolveRef(r->ns, r->ref);
+        auto resolved = partAccess().resolve(r->refKey(), ContentAddressed::Freshness::ForceFresh);
         if (!resolved || ContentAddressed::PartFolderView::isReservedMutableName(r->file))
             return std::nullopt;
         auto it = resolved->mutable_files.find(r->file);
@@ -884,7 +885,7 @@ std::optional<String> ContentAddressedMetadataStorage::tryGetInManifestBytes(con
         return it->second;
     }
 
-    auto view = resolveRouted(*r);
+    auto view = partAccess().getView(r->refKey(), ContentAddressed::Freshness::CachedForLoad);
     if (!view)
         return std::nullopt;
     return view->inlineBytes(r->file);
@@ -920,7 +921,7 @@ std::optional<ContentAddressedMetadataStorage::BlobViewPlan> ContentAddressedMet
     auto r = route(*p);
     if (!r || r->file.empty())
         return std::nullopt;
-    auto view = resolveRouted(*r);
+    auto view = partAccess().getView(r->refKey(), ContentAddressed::Freshness::CachedForLoad);
     if (!view)
         return std::nullopt;
     if (const auto * entry = view->findFile(r->file))
@@ -957,7 +958,7 @@ std::optional<String> ContentAddressedMetadataStorage::getPartManifestBytes(cons
     /// (route), resolve the committed ref to its ManifestId, read the immutable manifest, and re-encode
     /// it canonically. nullopt when the path is not a committed content-addressed part here (no ref =>
     /// no relink offer; the sender streams bytes). A live ref to a missing/corrupt manifest throws
-    /// (INV-NO-DANGLE surfaced, never substituted) — the same fail-loud contract as resolveRouted.
+    /// (INV-NO-DANGLE surfaced, never substituted) — the same fail-loud contract as partAccess().getView.
     auto p = ContentAddressed::parsePartFilePath(part_path);
     if (!p)
         return std::nullopt;
@@ -965,11 +966,10 @@ std::optional<String> ContentAddressedMetadataStorage::getPartManifestBytes(cons
     if (!r || r->ref.empty())
         return std::nullopt;
 
-    auto resolved = store()->resolveRef(r->ns, r->ref);
-    if (!resolved)
+    auto view = partAccess().getView(r->refKey(), ContentAddressed::Freshness::ForceFresh);
+    if (!view)
         return std::nullopt;
-
-    return Cas::encodePartManifest(*store()->readManifestShared(resolved->manifest_id));
+    return Cas::encodePartManifest(*view->manifest());
 }
 
 bool ContentAddressedMetadataStorage::adoptPartFromManifest(

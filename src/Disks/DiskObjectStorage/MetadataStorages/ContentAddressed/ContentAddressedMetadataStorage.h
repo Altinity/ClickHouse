@@ -5,6 +5,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartPathParser.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartRefKey.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartFolderView.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/CachedPartFolderAccess.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/CasGcScheduler.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include <Interpreters/Context_fwd.h>
@@ -116,6 +117,9 @@ public:
 
     /// The opened pool. Throws LOGICAL_ERROR before startup — every caller is post-startup.
     const Cas::StorePtr & store() const;
+    /// The facade, by REFERENCE (dot-syntax call sites — the committed-ref style guard bans raw
+    /// `->` mutation tokens in wiring). Throws LOGICAL_ERROR before startup, like store().
+    ContentAddressed::CachedPartFolderAccess & partAccess() const;
     const std::string & serverId() const { return server_id; }
     const std::string & serverRootId() const { return server_root_id; }
     const std::string & scratchPath() const { return local_scratch_path; }
@@ -220,6 +224,10 @@ private:
 
     /// Set by startup (Store::open is fail-closed; empty store == not started).
     Cas::StorePtr cas_store;
+    /// The part-folder access facade (spec 2026-07-08-cas-part-folder-cache): the ONLY normal path
+    /// for committed part/projection reads and committed part-ref mutations. Constructed in
+    /// startup right after Store::open; reset in shutdown before cas_store.
+    std::unique_ptr<ContentAddressed::CachedPartFolderAccess> part_access;
     String pool_uuid;
     std::unique_ptr<ContentAddressed::CasGcScheduler> gc_scheduler;
     /// Derived from object_storage->isReadOnly() at startup (the disk's <readonly> config). When set:
@@ -238,11 +246,6 @@ private:
             return physical_key_prefix + key;
         return physical_key_prefix + "/" + key;
     }
-
-    /// resolveRef + readManifestShared for a routed path, joined into an immutable view; nullptr
-    /// when the ref is absent. Throws on a present-but-corrupt manifest (fail closed, INV-NO-DANGLE
-    /// surfaced). Phase-1 shape: built per call; the Phase-2 facade replaces this method.
-    std::shared_ptr<const ContentAddressed::PartFolderView> resolveRouted(const Route & r) const;
 
     /// Build the GC round sink: the std::function the scheduler calls per Start/Finish. Captures the
     /// ContextPtr, converts the POD GcRoundLogRecord into a ContentAddressedGarbageCollectionLogElement,
