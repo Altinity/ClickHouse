@@ -48,6 +48,7 @@ namespace DB
 
 namespace ErrorCodes
 {
+    extern const int ABORTED;
     extern const int FILE_DOESNT_EXIST;
     extern const int LOGICAL_ERROR;
     extern const int NOT_IMPLEMENTED;
@@ -153,6 +154,21 @@ bool ContentAddressedTransaction::republishRef(
     if (!resolved)
         return false;
     const Cas::PartManifest src_manifest = metadata_storage.store()->readManifest(resolved->manifest_id);
+
+    /// BUG 1c: idempotent re-drive. If dst is ALREADY committed, the prior attempt's promote landed and
+    /// only dropRef(src) was interrupted. Compare CONTENT (path-sorted `entries`, not the whole manifest —
+    /// ref/namespace/digest legitimately differ): same content => finish the rename by dropping src; a
+    /// different-content dst is a genuine conflict => fail closed (never silently drop src's content).
+    if (auto dst_resolved = metadata_storage.store()->resolveRef(dst_ns, dst_ref))
+    {
+        const Cas::PartManifest dst_manifest = metadata_storage.store()->readManifest(dst_resolved->manifest_id);
+        if (dst_manifest.entries != src_manifest.entries)
+            throw Exception(ErrorCodes::ABORTED,
+                "republishRef: destination '{}' is already committed with different content — refusing "
+                "(rename/attach conflict)", dst_ns.string() + "/" + dst_ref);
+        metadata_storage.store()->dropRef(src_ns, src_ref);
+        return true;
+    }
 
     auto build = metadata_storage.store()->startBuild(
         Cas::BuildInfo{.intended_ref = dst_ns.string() + "/" + dst_ref,
