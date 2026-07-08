@@ -945,7 +945,7 @@ size_t Store::ManifestCacheKeyHash::operator()(const ManifestCacheKey & k) const
     return h;
 }
 
-PartManifest Store::readManifest(const ManifestId & id)
+std::shared_ptr<const PartManifest> Store::readManifestShared(const ManifestId & id)
 {
     /// A live ref naming a missing manifest body is INV-NO-DANGLE (spec §Read Path Scope: "fail-closed
     /// behavior when a committed ref names a missing manifest"). Never substitute an empty manifest.
@@ -975,7 +975,7 @@ PartManifest Store::readManifest(const ManifestId & id)
         std::lock_guard lock(manifest_cache_mutex);
         auto it = manifest_cache.find(ManifestCacheKey{.manifest_id = id, .token = head.token});
         if (it != manifest_cache.end())
-            return *it->second;
+            return it->second;
     }
 
     std::optional<GetResult> object = pool_backend->get(key);
@@ -1032,7 +1032,12 @@ PartManifest Store::readManifest(const ManifestId & id)
             manifest_cache.clear();
         manifest_cache[ManifestCacheKey{.manifest_id = id, .token = head.token}] = decoded;
     }
-    return *decoded;
+    return decoded;
+}
+
+PartManifest Store::readManifest(const ManifestId & id)
+{
+    return *readManifestShared(id);
 }
 
 std::optional<ManifestEntry> Store::lookupPath(const PartManifest & manifest, const String & path) const

@@ -2332,3 +2332,30 @@ TEST(CasRetiredViewSyncer, RunningSyncerAdvancesPublishedRound)
     store->stopRetiredViewSync();
     EXPECT_EQ(store->retireView().round(), 4u) << "the syncer thread must advance the installed round on its own";
 }
+
+TEST(CasStore, ReadManifestSharedReturnsSharedDecodeWithoutCopy)
+{
+    auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
+    const DB::Cas::Layout layout("p");
+    const DB::Cas::RootNamespace ns{"srv/t1"};
+    const DB::Cas::ManifestRef ref{.writer_epoch = 1, .build_sequence = 1, .manifest_ordinal = 1};
+    const auto id = DB::Cas::tests::writeManifestRaw(*backend, layout, ns, ref,
+        {DB::Cas::tests::blobEntryFor("data.bin", DB::UInt128(7))});
+    DB::Cas::tests::publishCommittedTransition(*backend, layout, ns, "part_1", std::nullopt, ref);
+
+    auto store = DB::Cas::Store::open(backend,
+        DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1});
+    const auto resolved = store->resolveRef(ns, "part_1");
+    ASSERT_TRUE(resolved.has_value());
+
+    const String manifest_key = layout.manifestKey(id);
+    backend->resetCounts();
+
+    auto m1 = store->readManifestShared(resolved->manifest_id);
+    auto m2 = store->readManifestShared(resolved->manifest_id);
+    EXPECT_EQ(m1.get(), m2.get());                          /// the SAME shared decode, no copy
+    EXPECT_EQ(backend->getCount(manifest_key), 1u);         /// one body GET
+    EXPECT_EQ(backend->headCount(manifest_key), 2u);        /// mandatory HEAD per call (unchanged)
+    ASSERT_EQ(m1->entries.size(), 1u);
+    EXPECT_EQ(m1->entries[0].path, "data.bin");
+}

@@ -329,6 +329,10 @@ public:
     /// `root_namespace_id` ≠ id.root_namespace (manifestNamespaceMatches) throws CORRUPTED_DATA — the
     /// ref is addressing the wrong object, or a cross-namespace dangle. Token-gated decode cache below.
     PartManifest readManifest(const ManifestId & id);
+    /// Identical to `readManifest` (same mandatory HEAD, same fail-closed validation, same decode
+    /// cache) but returns the SHARED immutable decode the manifest cache holds — no per-call copy.
+    /// The wiring read path uses this variant (spec 2026-07-08-cas-part-folder-cache).
+    std::shared_ptr<const PartManifest> readManifestShared(const ManifestId & id);
     /// Path lookup over a decoded part manifest's canonical-path-ordered entries (Resolved OQ3: no
     /// DirectoryIndex yet). Returns the entry whose `path` equals `path`, or nullopt.
     std::optional<ManifestEntry> lookupPath(const PartManifest & manifest, const String & path) const;
