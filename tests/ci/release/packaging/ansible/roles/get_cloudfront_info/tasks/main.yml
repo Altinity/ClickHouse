@@ -6,11 +6,11 @@
 
 - name: Get current CloudFront origin path
   set_fact:
-    cloudfront_origin_path: "{{ cloudfront_info.cloudfront[repo_dns_name].Distribution.DistributionConfig.Origins.Items[0].OriginPath }}"
+    cloudfront_origin_path: "{{ cloudfront_info.cloudfront[repo_dns_name].Distribution.DistributionConfig.Origins.Items[0].OriginPath | regex_replace('^/', '') }}"
 
 - name: Calculate the source S3 path
   set_fact:
-    s3_repo_source_path: "s3://{{ repo_dns_name }}{{ cloudfront_origin_path }}"
+    s3_repo_source_path: "s3://{{ repo_dns_name }}/{{ cloudfront_origin_path }}"
 
 - name: Decide on the target (blue/green)
   set_fact:
