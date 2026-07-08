@@ -34,6 +34,25 @@ def test_rustfs_never_killed():
                     f"RustFS fault must never be KILL (got {f.action} at t={f.t_offset}, seed={seed})"
                 )
 
+def test_freeze_long_replica_freeze():
+    # The "replica freeze" fault: a single ClickHouse replica is frozen (docker pause = cgroup freezer
+    # = SIGSTOP-equivalent) for LONGER than mount_lease_ttl (30s) + GC fence margin (ttl/2 = 15s), so
+    # the frozen replica is fenced out and must self-remount on unfreeze. Must never freeze BOTH (the
+    # cluster must stay recoverable) or RustFS, and must be held long enough to cross the fence.
+    saw = False
+    for seed in range(20):
+        for f in generate_chaos_schedule(seed=seed, duration_s=7200, mean_interval_s=120):
+            if f.action == FaultAction.FREEZE_LONG:
+                saw = True
+                assert f.target in (FaultTarget.CH1, FaultTarget.CH2), (
+                    f"FREEZE_LONG must hit a single CH replica, got {f.target}"
+                )
+                assert f.duration_s > 45, (
+                    f"FREEZE_LONG must exceed ttl(30s)+margin(15s), got {f.duration_s}s"
+                )
+    assert saw, "expected at least one FREEZE_LONG (replica freeze) fault across the seed sweep"
+
+
 def test_ch_replicas_still_killed():
     # The CA-relevant crash — a ClickHouse SERVER crashing over a durable-enough store — must still be
     # exercised: at least one CH-replica KILL should appear across a reasonable seed sweep.

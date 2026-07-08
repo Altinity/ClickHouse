@@ -12,7 +12,13 @@ class FaultTarget(str, Enum):
 class FaultAction(str, Enum):
     KILL = "kill"        # docker kill -s KILL (hard crash)
     RESTART = "restart"  # docker restart
-    PAUSE = "pause"      # docker pause + unpause after duration
+    PAUSE = "pause"      # docker pause + unpause after duration (short freeze, 5..60s)
+    # A LONG freeze of ONE replica (docker pause = cgroup freezer = SIGSTOP-equivalent for the whole
+    # container; unpause = SIGCONT), held past the mount-lease TTL (30s) + GC fence margin (ttl/2=15s)
+    # so the frozen replica's lease EXPIRES and the peer's GC leader fences it out. On unfreeze the
+    # replica must detect the fence and self-remount (recovery path: project_ca_p31_mount_fence_recovery).
+    # Never applied to BOTH replicas (the cluster must stay recoverable) or to RustFS.
+    FREEZE_LONG = "freeze_long"
 
 @dataclass(frozen=True)
 class Fault:
@@ -26,6 +32,9 @@ _CONTAINER = {FaultTarget.CH1: "ca-soak-ch1-1", FaultTarget.CH2: "ca-soak-ch2-1"
               FaultTarget.RUSTFS: "ca-soak-rustfs1-1"}
 
 _TARGETS = [FaultTarget.CH1, FaultTarget.CH2, FaultTarget.BOTH, FaultTarget.RUSTFS]
+# FREEZE_LONG is NOT in the uniform action pick: it is a rarer (~1/6) deterministic UPGRADE applied
+# after the base pick (below), so the common fault mix stays kill/restart/short-pause and the cluster
+# is not frozen for most of the run.
 _ACTIONS = [FaultAction.KILL, FaultAction.RESTART, FaultAction.PAUSE]
 
 def generate_chaos_schedule(seed: int, duration_s: int, mean_interval_s: int):
@@ -67,6 +76,15 @@ def generate_chaos_schedule(seed: int, duration_s: int, mean_interval_s: int):
             action = FaultAction.RESTART
         if target == FaultTarget.BOTH and action == FaultAction.KILL:
             dur = min(dur, 60)        # safety bound
+        # Rare (~1/6) UPGRADE to a long single-replica freeze, held past the mount-lease TTL so the
+        # frozen replica is GC-fenced and must self-remount on unfreeze. Must hit exactly ONE ClickHouse
+        # replica: never BOTH (the cluster must stay recoverable — a peer keeps the shard live and does
+        # the fencing), never RustFS (freezing the store is a different fault class). Duration 60..90s
+        # reliably exceeds mount_lease_ttl (30s) + GC fence margin (ttl/2 = 15s).
+        if ((r2 >> 9) % 6) == 0:
+            action = FaultAction.FREEZE_LONG
+            target = FaultTarget.CH1 if ((r2 >> 13) & 1) == 0 else FaultTarget.CH2
+            dur = 60 + ((r2 >> 17) % 31)   # 60..90s
         faults.append(Fault(t_offset=t, target=target, action=action, duration_s=dur))
         i += 1
     return faults
@@ -108,7 +126,10 @@ def apply_fault(fault: Fault):
     elif fault.action == FaultAction.RESTART:
         for c in cs:
             subprocess.run(["docker", "restart", c], capture_output=True)
-    elif fault.action == FaultAction.PAUSE:
+    elif fault.action in (FaultAction.PAUSE, FaultAction.FREEZE_LONG):
+        # Both freeze the container via the cgroup freezer (docker pause = SIGSTOP-equivalent for all
+        # tasks; unpause = SIGCONT). FREEZE_LONG differs only in duration (held past the mount-lease TTL
+        # to force a fence-out), so the mechanics are identical.
         for c in cs:
             subprocess.run(["docker", "pause", c], capture_output=True)
         time.sleep(fault.duration_s)
