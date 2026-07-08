@@ -36,66 +36,46 @@
 
 ---
 
-## Task 0: TLA+ gate — `AtMostOneCommittedManifestPerRef` + `SabotagePromoteOverwritesCommitted`
+## Task 0: TLA+ gate — `AtMostOneCommittedManifestPerRef` invariant (light: model already enforces `RefFreeFor`)
 
 **Files:**
-- Modify: `docs/superpowers/models/CaGcRootLocalPartManifestCore.tla`
-- Modify: all `docs/superpowers/models/CaGcRootLocalPartManifestCore*.cfg` (assign the new constant)
-- Create: `docs/superpowers/models/CaGcRootLocalPartManifestCore_sab_promoteoverwritescommitted.cfg`
+- Modify: `docs/superpowers/models/CaGcRootLocalPartManifestCore.tla` (add ONE invariant definition — no new `CONSTANT`, so NO sibling-cfg changes)
+- Modify: `docs/superpowers/models/CaGcRootLocalPartManifestCore_stage2.cfg` (and `_stage3.cfg` if it runs in reasonable time) — add one `INVARIANT` line
 
 **Interfaces:**
-- Produces: invariant `AtMostOneCommittedManifestPerRef`; constant `SabotagePromoteOverwritesCommitted`.
+- Produces: invariant `AtMostOneCommittedManifestPerRef`.
 
-**Context:** `WPromote` (`.tla:283-296`) and `WPublishCommitted` (`.tla:318-332`) already guard with `RefFreeFor(ref, m)` (`.tla:215-219`) — the model already forbids a ref owning two committed manifests (= BUG 1's fix). This task makes that property an explicit checked invariant and adds a negative control proving the guard is load-bearing.
+**Context:** `WPromote` (`.tla:283-296`) and `WPublishCommitted` (`.tla:318-332`) ALREADY guard with `RefFreeFor(ref, m)` (`.tla:215-219`) — the model already forbids a ref owning two committed manifests (= exactly BUG 1's fix; the shipped C++ `promote` simply diverged by not enforcing it). So the TLA+ side does not need to *reproduce* the bug (the C++ RED test in Task 1 does that deterministically); it needs to make the fix-property **explicit and TLC-checked** so the model is a durable regression gate. We therefore add the invariant and confirm the model MAINTAINS it in the promote/publish-exercising stages — no new `CONSTANT` (which would force editing all 47 sibling cfgs), no negative-control sabotage. (A `SabotagePromoteOverwritesCommitted` negative control that drops `RefFreeFor` is a possible future strengthening, deliberately skipped here to avoid the 47-cfg churn for marginal added assurance beyond the C++ RED test.)
 
-- [ ] **Step 1: Add the invariant definition** (near the other `INV_*`/invariant defs). `owner[m] = r` for `r \in Refs` means m is committed-owned by ref r:
+- [ ] **Step 1: Add the invariant definition** to `CaGcRootLocalPartManifestCore.tla`, near the other invariant defs (e.g. next to `SingleManifestOwner`). `owner[m] = r` for `r \in Refs` means m is committed-owned by ref r:
 
 ```tla
-\* BUG 1 (promote-over-committed): a ref owns AT MOST ONE committed manifest. RefFreeFor (the WPromote /
-\* WPublishCommitted guard) maintains this; SabotagePromoteOverwritesCommitted drops that guard = the
-\* shipped C++ promote's silent overwrite, which leaves two committed bindings for one ref (the leaked T_old).
+\* BUG 1 (promote-over-committed): a ref owns AT MOST ONE committed manifest. The WPromote /
+\* WPublishCommitted RefFreeFor guard maintains this; the shipped C++ promote diverged by not enforcing
+\* it (silent overwrite -> two committed bindings for one ref -> the old manifest T_old is leaked). This
+\* invariant makes the property TLC-checked so the model is a regression gate for the C++ fail-close fix.
 AtMostOneCommittedManifestPerRef ==
     \A r \in Refs : Cardinality({m \in ManifestIds : owner[m] = r}) <= 1
 ```
 
-(Use the model's real `Cardinality` import — `FiniteSets` is already extended if `Cardinality` appears elsewhere; if not, add `Cardinality({...})` via the existing set-size idiom the model uses.)
+Confirm `Cardinality`/`FiniteSets` is available (it is if `Cardinality` already appears in the module; otherwise use the set-size idiom the model already uses, or add `FiniteSets` to the `EXTENDS`).
 
-- [ ] **Step 2: Add the sabotage constant** to the `CONSTANTS` block (near `SabotageSplitPromote`):
+- [ ] **Step 2: Check the invariant in the FIX side** — add `INVARIANT AtMostOneCommittedManifestPerRef` to `CaGcRootLocalPartManifestCore_stage2.cfg` (stage 2 = "owner transitions + precommit + promote", the smallest cfg that exercises promote/publish). Optionally also add it to `_stage3.cfg`.
 
-```tla
-    SabotagePromoteOverwritesCommitted,  \* TRUE = WPromote/WPublishCommitted drop the RefFreeFor guard (the shipped C++ promote's silent overwrite of a committed ref) -> two committed manifests for one ref
-```
-
-- [ ] **Step 3: Weaken the guard under the sabotage** in `WPromote` (`.tla:286`) and `WPublishCommitted` (`.tla:321`): replace `/\ RefFreeFor(ref, m)` with `/\ (SabotagePromoteOverwritesCommitted \/ RefFreeFor(ref, m))` in BOTH.
-
-- [ ] **Step 4: Assign the constant in ALL 47 sibling cfgs** (`= FALSE`), plus the new bug cfg. Do it mechanically:
-
-```bash
-cd docs/superpowers/models
-for f in CaGcRootLocalPartManifestCore*.cfg; do
-  grep -q "SabotagePromoteOverwritesCommitted" "$f" || \
-    sed -i 's/^\( *\)SabotageSplitPromote = .*/&\n\1SabotagePromoteOverwritesCommitted = FALSE/' "$f"
-done
-```
-Then create `CaGcRootLocalPartManifestCore_sab_promoteoverwritescommitted.cfg` by copying an existing invariant cfg (e.g. `CaGcRootLocalPartManifestCore_sab_twoowners.cfg`), setting `SabotagePromoteOverwritesCommitted = TRUE`, keeping all other `Sabotage* = FALSE`, and using `INVARIANT AtMostOneCommittedManifestPerRef` (plus `SPECIFICATION Spec`, `CONSTRAINT StateConstraint`, `CHECK_DEADLOCK FALSE`). Add `INVARIANT AtMostOneCommittedManifestPerRef` to `stage2`, `stage3` (or the smallest positive cfg that exercises promote/publish — `stage2` covers "owner transitions + precommit + promote") so the FIX side is checked too.
-
-- [ ] **Step 5: Run TLC — bug cfg MUST violate**
-
-Run: `cd docs/superpowers/models && ./run_gc_partmanifest.sh CaGcRootLocalPartManifestCore_sab_promoteoverwritescommitted`
-Expected: `AtMostOneCommittedManifestPerRef` **violated** (a ref reaches two committed manifests), non-zero exit.
-
-- [ ] **Step 6: Run TLC — fix side MUST hold**
+- [ ] **Step 3: Run TLC — the invariant MUST hold**
 
 Run: `cd docs/superpowers/models && ./run_gc_partmanifest.sh CaGcRootLocalPartManifestCore_stage2`
-Expected: `Model checking completed. No error has been found.` (`AtMostOneCommittedManifestPerRef` holds under the enforced `RefFreeFor`).
+Expected: `Model checking completed. No error has been found.` (the model maintains `AtMostOneCommittedManifestPerRef` via the enforced `RefFreeFor` — proving the fix-property holds in-model). If stage2 is too slow, use the smallest promote/publish-exercising cfg and say which.
 
-- [ ] **Step 7: Re-verify no masking (scoped).** Re-run the cfgs whose behavior the guard-weakening could touch — every cfg is now inert to it (constant `FALSE`), so a spot check suffices: run `CaGcRootLocalPartManifestCore_sab_twoowners` (must still violate `INV_NO_LOSS`) and `CaGcRootLocalPartManifestCore_stage0` (must still pass, no `exit=151`). Confirm no cfg reports "not assigned a value".
+- [ ] **Step 4: Sanity — no cfg broke.** Since NO new constant was added, no sibling cfg needs changes; confirm `stage2` (and any cfg you touched) reports no `exit=151` / "not assigned a value".
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
-git add docs/superpowers/models/CaGcRootLocalPartManifestCore.tla docs/superpowers/models/CaGcRootLocalPartManifestCore*.cfg
-git commit  # "CAS TLA+: AtMostOneCommittedManifestPerRef invariant + SabotagePromoteOverwritesCommitted control (promote-over-committed gate)" + trailers
+git add docs/superpowers/models/CaGcRootLocalPartManifestCore.tla \
+        docs/superpowers/models/CaGcRootLocalPartManifestCore_stage2.cfg
+# (+ _stage3.cfg if you added the INVARIANT there)
+git commit  # "CAS TLA+: AtMostOneCommittedManifestPerRef invariant — model gate for promote fail-close (holds via RefFreeFor)" + trailers
 ```
 
 ---
@@ -470,7 +450,7 @@ cd utils/ca-soak && python3 -m scenarios.run --scenario S15 --scale dev > tmp/s1
 ```
 Expected: `status=PASS`. If no card exercises rename/attach re-drive, note that the unit tests + TLA+ are the primary evidence and record which card was used as the general no-regression check.
 
-- [ ] **Step 3: Update `docs/superpowers/cas/06-tla-models.md`** — add a short subsection recording the `AtMostOneCommittedManifestPerRef` invariant + `SabotagePromoteOverwritesCommitted` control (bug violates, `stage2` holds), and that the C++ fix landed (promote fail-close + republishRef idempotency). Use `{#kebab-anchor}` headers.
+- [ ] **Step 3: Update `docs/superpowers/cas/06-tla-models.md`** — add a short subsection recording the `AtMostOneCommittedManifestPerRef` invariant (holds in `stage2` via the model's `RefFreeFor` guard) and that the C++ fix landed (promote fail-close + republishRef idempotency), noting the bug is reproduced by the C++ RED test rather than a TLA+ negative control. Use `{#kebab-anchor}` headers.
 
 - [ ] **Step 4: Mark BACKLOG resolved** — in `utils/ca-soak/scenarios/BACKLOG.md`, append `RESOLVED 2026-07-08` notes to `PROMOTE-OVER-COMMITTED-LEAK` and `ABANDON-RETIRE-ORDERING` with the commit trail.
 
