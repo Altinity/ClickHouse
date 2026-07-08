@@ -29,6 +29,14 @@ ColumnsDescription StorageSystemReplicatedPartitionExports::getColumnsDescriptio
         },
         Names{"replica", "message", "part", "time", "count"});
 
+    auto backoff_tuple = std::make_shared<DataTypeTuple>(
+        DataTypes{
+            std::make_shared<DataTypeString>(),
+            std::make_shared<DataTypeUInt64>(),
+            std::make_shared<DataTypeDateTime>(),
+        },
+        Names{"part", "attempts", "next_retry_time"});
+
     return ColumnsDescription
     {
         {"source_database", std::make_shared<DataTypeString>(), "Name of the source database."},
@@ -58,6 +66,8 @@ ColumnsDescription StorageSystemReplicatedPartitionExports::getColumnsDescriptio
             "For Iceberg destinations: path of the manifest file referenced by committed_manifest_list. Empty under the same conditions as committed_metadata_file."},
         {"committed_marker_file", std::make_shared<DataTypeString>(),
             "For plain object storage destinations: path of the per-transaction commit marker file written by the destination. Empty for Iceberg destinations and for tasks that have not committed yet."},
+        {"local_backoff_per_part", std::make_shared<DataTypeArray>(backoff_tuple),
+            "Per-part retry back-off local to this replica: parts currently waiting before their next attempt, with attempt count and the next eligible time. Not shared across replicas; empty if no part is backing off."},
     };
 }
 
@@ -182,6 +192,12 @@ void StorageSystemReplicatedPartitionExports::fillData(MutableColumns & res_colu
             res_columns[i++]->insert(info.committed_manifest_file);
 
             res_columns[i++]->insert(info.committed_marker_file);
+
+            Array backoff_array;
+            backoff_array.reserve(info.backoff_per_part.size());
+            for (const auto & b : info.backoff_per_part)
+                backoff_array.push_back(Tuple{b.part, b.attempts, b.next_retry_time});
+            res_columns[i++]->insert(backoff_array);
         }
     }
 }

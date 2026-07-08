@@ -355,6 +355,8 @@ std::vector<ReplicatedPartitionExportInfo> ExportPartitionManifestUpdatingTask::
     if (!model)
         return {};
 
+    const auto backoff = storage.export_merge_tree_partition_task_scheduler->getLocalBackoffSnapshot();
+
     std::vector<ReplicatedPartitionExportInfo> infos;
     infos.reserve(model->size());
 
@@ -393,6 +395,13 @@ std::vector<ReplicatedPartitionExportInfo> ExportPartitionManifestUpdatingTask::
             info.committed_manifest_list = entry.commit_info->iceberg_manifest_list;
             info.committed_manifest_file = entry.commit_info->iceberg_manifest_file;
             info.committed_marker_file = entry.commit_info->commit_marker_file;
+        }
+
+        if (const auto it = backoff.find(entry.getTransactionId()); it != backoff.end())
+        {
+            info.backoff_per_part.reserve(it->second.size());
+            for (const auto & [part_name, state] : it->second)
+                info.backoff_per_part.push_back({part_name, state.attempts, state.next_retry_time});
         }
 
         infos.emplace_back(std::move(info));
@@ -466,7 +475,20 @@ void ExportPartitionManifestUpdatingTask::poll()
                 continue;
             }
 
-            const auto metadata = ExportReplicatedMergeTreePartitionManifest::fromJsonString(metadata_json);
+            ExportReplicatedMergeTreePartitionManifest metadata;
+            try
+            {
+                metadata = ExportReplicatedMergeTreePartitionManifest::fromJsonString(metadata_json);
+            }
+            catch (...)
+            {
+                /// A single unparseable metadata.json (e.g. genuinely corrupt, or written by a
+                /// future incompatible format) must not abort the whole poll and stall discovery,
+                /// cleanup and status convergence for every other task. Skip just this entry.
+                tryLogCurrentException(storage.log, __PRETTY_FUNCTION__);
+                LOG_WARNING(storage.log, "ExportPartition Manifest Updating Task: Skipping {}: could not parse metadata.json", key);
+                continue;
+            }
 
             auto last_exception_per_replica = readLastExceptionPerReplica(
                 zk, fs::path(entry_path), key, storage.log.load());
@@ -610,20 +632,20 @@ void ExportPartitionManifestUpdatingTask::poll()
                 "Caught exception while committing export for {}: {}",
                 work.entry_path, e.message());
 
-            const bool exceeded_commimt_max_retries = ExportPartitionUtils::handleCommitFailure(
+            const bool became_failed = ExportPartitionUtils::handleCommitFailure(
                 zk,
                 work.entry_path,
-                work.metadata.max_retries,
+                e.code(),
                 storage.getReplicaName(),
                 e.message(),
                 log_ptr);
 
-            if (exceeded_commimt_max_retries)
+            if (became_failed)
             {
                 LOG_WARNING(log_ptr,
                     "ExportPartition Manifest Updating Task: "
-                    "Commit for {} transitioned to FAILED after exhausting max_retries={}",
-                    work.entry_path, work.metadata.max_retries);
+                    "Commit for {} transitioned to FAILED due to non-retryable error (code {})",
+                    work.entry_path, e.code());
             }
         }
     }
