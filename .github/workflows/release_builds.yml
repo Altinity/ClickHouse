@@ -181,7 +181,7 @@ jobs:
           fi
 
   build_amd_debug:
-    runs-on: [self-hosted, altinity-on-demand, altinity-builder]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_binary, build_arm_binary]
     name: "Build (amd_debug)"
     outputs:
@@ -228,7 +228,7 @@ jobs:
           fi
 
   build_amd_release:
-    runs-on: [self-hosted, altinity-on-demand, altinity-builder]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm]
     name: "Build (amd_release)"
     outputs:
@@ -275,7 +275,7 @@ jobs:
           fi
 
   build_amd_asan:
-    runs-on: [self-hosted, altinity-on-demand, altinity-builder]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_binary, build_arm_binary]
     name: "Build (amd_asan)"
     outputs:
@@ -322,7 +322,7 @@ jobs:
           fi
 
   build_amd_tsan:
-    runs-on: [self-hosted, altinity-on-demand, altinity-builder]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_binary, build_arm_binary]
     name: "Build (amd_tsan)"
     outputs:
@@ -369,7 +369,7 @@ jobs:
           fi
 
   build_amd_msan:
-    runs-on: [self-hosted, altinity-on-demand, altinity-builder]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_binary, build_arm_binary]
     name: "Build (amd_msan)"
     outputs:
@@ -416,7 +416,7 @@ jobs:
           fi
 
   build_amd_ubsan:
-    runs-on: [self-hosted, altinity-on-demand, altinity-builder]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_binary, build_arm_binary]
     name: "Build (amd_ubsan)"
     outputs:
@@ -463,7 +463,7 @@ jobs:
           fi
 
   build_amd_binary:
-    runs-on: [self-hosted, altinity-on-demand, altinity-builder]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm]
     name: "Build (amd_binary)"
     outputs:
@@ -557,7 +557,7 @@ jobs:
           fi
 
   build_arm_binary:
-    runs-on: [self-hosted, altinity-on-demand, altinity-builder]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm]
     name: "Build (arm_binary)"
     outputs:
@@ -698,7 +698,7 @@ jobs:
           fi
 
   install_packages_amd_release:
-    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
+    runs-on: [self-hosted, altinity-on-demand, altinity-builder]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_release]
     name: "Install packages (amd_release)"
     outputs:
@@ -745,7 +745,7 @@ jobs:
           fi
 
   install_packages_arm_release:
-    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester-aarch64]
+    runs-on: [self-hosted, altinity-on-demand, altinity-builder]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_arm_release]
     name: "Install packages (arm_release)"
     outputs:
