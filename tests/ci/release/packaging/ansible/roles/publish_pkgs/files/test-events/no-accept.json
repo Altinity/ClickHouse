@@ -1,0 +1,18 @@
+{
+  "version": "1.0",
+  "context": {
+    "eventType": "viewer-request"
+  },
+  "viewer": {
+    "ip": "203.0.113.2"
+  },
+  "request": {
+    "method": "GET",
+    "uri": "/",
+    "querystring": {},
+    "headers": {
+      "host": { "value": "builds.staging.altinity.cloud" }
+    },
+    "cookies": {}
+  }
+}

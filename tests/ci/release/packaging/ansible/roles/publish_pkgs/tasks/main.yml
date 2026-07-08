@@ -20,6 +20,7 @@
     paths: "{{ static_path }}"
     file_type: file
     recurse: true
+    follow: true
   register: static_files
 
 - name: Generate target filenames for source filenames
@@ -57,10 +58,20 @@
     src: "{{ item.path }}"
     metadata: "Content-Type={{ lookup('pipe', 'file -b --mime-type ' + item.path) }}"
     mode: put
-  when: 'item.path | basename | splitext | last != ".html"'
+  when:
+    - 'item.path | basename | splitext | last != ".html"'
+    - 'item.path | basename != "installer.sh"'
   loop: "{{ static_files.files }}"
   loop_control:
     label: "{{ item.path }}"
+
+- name: Upload installer.sh with an explicit text/plain Content-Type
+  amazon.aws.aws_s3:
+    bucket: "{{ repo_dns_name }}"
+    object: "{{ new_cloudfront_origin_path }}/installer.sh"
+    src: "{{ static_path }}/installer.sh"
+    metadata: "Content-Type=text/plain"
+    mode: put
 
 - name: Update CloudFront distribution
   community.aws.cloudfront_distribution:
@@ -86,6 +97,110 @@
   when: 'not (push_to_active|default(false))'
   register: distribution
 
+# The community.aws.cloudfront_distribution module above has no support for
+# CloudFront Function associations (only Lambda@Edge, via
+# lambda_function_associations) - confirmed no Ansible module covers this, so
+# it's managed with raw `aws cloudfront` calls instead. This runs *after* the
+# distribution update above, deliberately: that task reconstructs the
+# distribution's desired state from only the parameters it's given, so patching
+# FunctionAssociations first would risk it being silently dropped on the next
+# run. Running after guarantees this association always wins.
+
+- name: Set CloudFront Function name
+  set_fact:
+    cf_function_name: "{{ repo_name }}-root-router"
+
+- name: Get CloudFront Function source path
+  set_fact:
+    cf_function_js_path: "{{ role_path }}/files/installer-router.js"
+
+- name: Check if the root-router function already exists
+  command: "aws cloudfront describe-function --name {{ cf_function_name }} --stage DEVELOPMENT"
+  register: cf_function_describe
+  failed_when: false
+  changed_when: false
+
+- name: Create the root-router function (first run only)
+  command: >
+    aws cloudfront create-function
+    --name {{ cf_function_name }}
+    --function-config Comment="Serve installer.sh to non-browser clients hitting /",Runtime=cloudfront-js-2.0
+    --function-code fileb://{{ cf_function_js_path }}
+  when: cf_function_describe.rc != 0
+
+- name: Get current function code (to detect drift on later runs)
+  command: "aws cloudfront get-function --name {{ cf_function_name }} --stage DEVELOPMENT --output text"
+  register: cf_function_current_code
+  when: cf_function_describe.rc == 0
+  changed_when: false
+
+- name: Update the function if its code has drifted
+  command: >
+    aws cloudfront update-function
+    --name {{ cf_function_name }}
+    --if-match {{ (cf_function_describe.stdout | from_json).ETag }}
+    --function-config Comment="Serve installer.sh to non-browser clients hitting /",Runtime=cloudfront-js-2.0
+    --function-code fileb://{{ cf_function_js_path }}
+  when:
+    - cf_function_describe.rc == 0
+    - cf_function_current_code.stdout | trim != lookup('file', cf_function_js_path) | trim
+
+- name: Re-check function state after create/update
+  command: "aws cloudfront describe-function --name {{ cf_function_name }} --stage DEVELOPMENT"
+  register: cf_function_current
+  changed_when: false
+
+- name: Test the function against synthetic events before publishing
+  command: >
+    aws cloudfront test-function
+    --name {{ cf_function_name }}
+    --if-match {{ (cf_function_current.stdout | from_json).ETag }}
+    --stage DEVELOPMENT
+    --event-object fileb://{{ role_path }}/files/test-events/{{ item }}.json
+  register: cf_function_test
+  changed_when: false
+  loop:
+    - curl
+    - no-accept
+    - browser
+  loop_control:
+    label: "{{ item }}"
+
+- name: Verify the function rewrote the URI correctly for each test event
+  vars:
+    output: "{{ (item.stdout | from_json).TestResult.FunctionOutput | from_json }}"
+    should_rewrite: "{{ item.item in ['curl', 'no-accept'] }}"
+    expected_uri: "{{ '/installer.sh' if should_rewrite else '/' }}"
+  assert:
+    that: output.request.uri == expected_uri
+    fail_msg: "root-router function returned uri={{ output.request.uri }} for the '{{ item.item }}' test event, expected {{ expected_uri }} - refusing to publish a function that doesn't route correctly"
+    success_msg: "{{ item.item }} -> {{ output.request.uri }} (as expected)"
+  loop: "{{ cf_function_test.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Publish the function to LIVE
+  command: >
+    aws cloudfront publish-function --name {{ cf_function_name }}
+    --if-match {{ (cf_function_current.stdout | from_json).ETag }}
+
+- name: Get the LIVE function ARN
+  command: >
+    aws cloudfront describe-function --name {{ cf_function_name }} --stage LIVE
+    --query FunctionSummary.FunctionMetadata.FunctionARN --output text
+  register: cf_function_arn_result
+  changed_when: false
+
+- name: Associate the root-router function with the distribution's default cache behavior
+  shell: >
+    set -euo pipefail;
+    aws cloudfront get-distribution-config --id {{ cloudfront_info.cloudfront[repo_dns_name].Distribution.Id }} > /tmp/{{ cf_function_name }}-dist-config.json &&
+    DIST_ETAG=$(jq -r '.ETag' /tmp/{{ cf_function_name }}-dist-config.json) &&
+    jq --arg arn "{{ cf_function_arn_result.stdout }}" '.DistributionConfig.DefaultCacheBehavior.FunctionAssociations = {Quantity: 1, Items: [{FunctionARN: $arn, EventType: "viewer-request"}]} | .DistributionConfig' /tmp/{{ cf_function_name }}-dist-config.json > /tmp/{{ cf_function_name }}-new-dist-config.json &&
+    aws cloudfront update-distribution --id {{ cloudfront_info.cloudfront[repo_dns_name].Distribution.Id }} --distribution-config file:///tmp/{{ cf_function_name }}-new-dist-config.json --if-match "$DIST_ETAG"
+  args:
+    executable: /bin/bash
+
 - name: Invalidate CloudFront cache
   community.aws.cloudfront_invalidation:
     alias: "{{ repo_dns_name }}"
@@ -95,4 +210,3 @@
 
 - name: Wait for CloudFront invalidation to be complete
   shell: "aws cloudfront wait invalidation-completed --distribution-id {{ distribution.id }} --id {{ invalidation.invalidation.id }}"
-
