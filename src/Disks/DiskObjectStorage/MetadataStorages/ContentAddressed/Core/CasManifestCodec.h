@@ -68,4 +68,16 @@ bool refMatchesBody(const ManifestRef & journal_ref, const PartManifest & body);
 /// The body `root_namespace_id` must equal the owning root namespace.
 bool manifestNamespaceMatches(const RootNamespace & owning, const PartManifest & body);
 
+/// Ordered-entry lookup primitives (spec 2026-07-08-cas-part-folder-cache §Shared Decodes): pure
+/// functions of a DECODED manifest, whose entries the decoder guarantees strictly ascending by
+/// `path`. `PartFolderView` composes these with wiring policy; Core tests use them directly.
+
+/// Binary search. Returns nullptr when absent. The pointer aliases `entries` — do not outlive it.
+const ManifestEntry * findEntry(const std::vector<ManifestEntry> & entries, std::string_view path);
+
+/// The contiguous [first, last) sub-span of entries whose path starts with `dir_prefix` (canonical
+/// order makes matches contiguous). Empty prefix = the whole span.
+std::pair<const ManifestEntry *, const ManifestEntry *>
+entryRange(const std::vector<ManifestEntry> & entries, std::string_view dir_prefix);
+
 }

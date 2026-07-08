@@ -184,4 +184,28 @@ bool manifestNamespaceMatches(const RootNamespace & owning, const PartManifest &
     return owning == body.root_namespace_id;
 }
 
+const ManifestEntry * findEntry(const std::vector<ManifestEntry> & entries, std::string_view path)
+{
+    const auto it = std::lower_bound(entries.begin(), entries.end(), path,
+        [](const ManifestEntry & e, std::string_view p) { return std::string_view(e.path) < p; });
+    if (it == entries.end() || std::string_view(it->path) != path)
+        return nullptr;
+    return &*it;
+}
+
+std::pair<const ManifestEntry *, const ManifestEntry *>
+entryRange(const std::vector<ManifestEntry> & entries, std::string_view dir_prefix)
+{
+    if (dir_prefix.empty())
+        return {entries.data(), entries.data() + entries.size()};
+    /// Every path starting with `dir_prefix` compares >= `dir_prefix`, and prefixed paths form a
+    /// contiguous run from the first such position.
+    const auto first = std::lower_bound(entries.begin(), entries.end(), dir_prefix,
+        [](const ManifestEntry & e, std::string_view p) { return std::string_view(e.path) < p; });
+    auto last = first;
+    while (last != entries.end() && std::string_view(last->path).starts_with(dir_prefix))
+        ++last;
+    return {entries.data() + (first - entries.begin()), entries.data() + (last - entries.begin())};
+}
+
 }

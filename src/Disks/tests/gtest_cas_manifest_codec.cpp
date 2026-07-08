@@ -341,3 +341,45 @@ TEST(CasManifestCodec, DecodeRejectsNonAdjacentDuplicatePath)
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
         [&] { DB::Cas::decodePartManifest(forged); });
 }
+
+TEST(CasManifestCodec, FindEntryBinarySearch)
+{
+    std::vector<DB::Cas::ManifestEntry> entries;
+    for (const char * p : {"a.txt", "b/inner.txt", "b/z.txt", "c.txt"})
+    {
+        DB::Cas::ManifestEntry e;
+        e.path = p;
+        e.placement = DB::Cas::EntryPlacement::Inline;
+        e.inline_bytes = "v";
+        entries.push_back(e);
+    }
+    EXPECT_NE(DB::Cas::findEntry(entries, "a.txt"), nullptr);
+    EXPECT_EQ(DB::Cas::findEntry(entries, "a.txt")->path, "a.txt");
+    EXPECT_NE(DB::Cas::findEntry(entries, "c.txt"), nullptr);          /// last element
+    EXPECT_EQ(DB::Cas::findEntry(entries, "b"), nullptr);              /// prefix of a path, not a path
+    EXPECT_EQ(DB::Cas::findEntry(entries, "zzz"), nullptr);            /// past the end
+    EXPECT_EQ(DB::Cas::findEntry({}, "a"), nullptr);                   /// empty
+}
+
+TEST(CasManifestCodec, EntryRangeContiguousPrefix)
+{
+    std::vector<DB::Cas::ManifestEntry> entries;
+    for (const char * p : {"a.txt", "p.proj/data.bin", "p.proj/x.txt", "q.txt"})
+    {
+        DB::Cas::ManifestEntry e;
+        e.path = p;
+        e.placement = DB::Cas::EntryPlacement::Inline;
+        e.inline_bytes = "v";
+        entries.push_back(e);
+    }
+    auto [first, last] = DB::Cas::entryRange(entries, "p.proj/");
+    ASSERT_EQ(last - first, 2);
+    EXPECT_EQ(first->path, "p.proj/data.bin");
+    EXPECT_EQ((last - 1)->path, "p.proj/x.txt");
+
+    auto [w1, w2] = DB::Cas::entryRange(entries, "");                  /// empty prefix = whole span
+    EXPECT_EQ(w2 - w1, 4);
+
+    auto [n1, n2] = DB::Cas::entryRange(entries, "zzz/");              /// no match
+    EXPECT_EQ(n1, n2);
+}
