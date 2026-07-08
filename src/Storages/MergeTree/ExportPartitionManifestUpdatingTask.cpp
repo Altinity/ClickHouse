@@ -572,10 +572,7 @@ void ExportPartitionManifestUpdatingTask::poll()
                 continue;
             }
 
-            const bool status_changed = local_entry->status != *status;
-
-            /// A silly optimization to avoid reading the commit info if the status is not COMPLETED
-            if (status_changed && *status == ExportReplicatedMergeTreePartitionTaskEntry::Status::COMPLETED)
+            if (local_entry->commit_info->empty() && *status == ExportReplicatedMergeTreePartitionTaskEntry::Status::COMPLETED)
             {
                 local_entry->commit_info = readCommitInfo(zk, fs::path(entry_path), key, log);
             }
@@ -583,10 +580,11 @@ void ExportPartitionManifestUpdatingTask::poll()
             /// If we already have the local entry, we need to update it
             local_entry->last_exception_per_replica = std::move(last_exception_per_replica);
             local_entry->destination_file_paths_per_part = std::move(destination_file_paths_per_part);
-            local_entry->status = *status;
 
+            const bool status_changed = local_entry->status != *status;
             if (status_changed)
             {
+                local_entry->status = *status;
                 if (local_entry->status != ExportReplicatedMergeTreePartitionTaskEntry::Status::PENDING)
                 {
                     /// terminal now - we no longer need to keep the data parts alive
