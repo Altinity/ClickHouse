@@ -1327,6 +1327,18 @@ infra/measurement gaps (not CA defects — all had dangling=0 + agreement):
 - **Reachability (upgraded):** NOT just "unique-part-names externally violated". `republishRef` (primitive behind DETACH/ATTACH rename + RENAME TABLE, `ContentAddressedTransaction.cpp:167-174`) does `stageManifest → precommitAdd → promote(dst) → dropRef(src)` and is advertised idempotent/re-drivable. A crash/throw AFTER `promote(dst)` and BEFORE `dropRef(src)`, then re-driven, mints a FRESH `ManifestId T_b` (`stageManifest` bumps ordinal; new build ⇒ new build_seq), so the second `promote` overwrites `refs[dst]=Com(T_b)` and leaks `Com(dst,T_a)`. The `moveDirectory` idempotency claim holds only when the prior attempt did nothing or completed through `dropRef(src)`; the "dst published, src not dropped" intermediate re-drives into a leak.
 - **Fix (own brainstorm→spec→plan cycle):** in `promote`, before overwriting `refs[final_ref_name]`, inspect it: if it names a DIFFERENT committed `T_old` → emit a proper repoint (`old_binding = Committed(R,T_old)`) so GC folds the `-1`, OR throw `LOGICAL_ERROR` (fail closed). Repoint event shape already defined in `CasRootShardCodec.h`. Equivalently `republishRef` could `dropRef(src)` before/atomically, or make the dst promote idempotent when `refs[dst]` already names a manifest over the same entries.
 - **Interaction with DANGLING-PRECOMMIT fix (cas-gc-rebuild):** independent locus (writer-side promote vs GC-side discover/fold reclaim); does not block that fix.
+- **RESOLVED 2026-07-08 (branch `cas-gc-rebuild`).** Chosen fix was fail-close + idempotent re-drive (NOT a
+  silent repoint, and `ABORTED` not `LOGICAL_ERROR` — the latter is CI-checked and reserved for
+  must-not-happen invariants). `Build::promote` throws `ABORTED` when `refs[final_ref_name]` already names a
+  DIFFERENT committed `manifest_ref` (a same-manifest re-promote / absent ref proceed) — enforcing the
+  model's `RefFreeFor` guard (`CasBuild.cpp`). `ContentAddressedTransaction::republishRef` is idempotent on
+  the destination: if dst is already committed with the same path-sorted `entries`, skip
+  stage/precommit/promote and `dropRef(src)` (finish the interrupted rename); a different-content dst throws
+  `ABORTED`. So a RENAME/DETACH-ATTACH crash re-drive no longer leaks and never reaches promote's guard.
+  TLA+ gate: `AtMostOneCommittedManifestPerRef` holds in `stage2` (`docs/superpowers/cas/06-tla-models.md`
+  §Area 7). Commits: TLA+ `7e604ff1a2a`; RED tests `fa6b7689459`; promote guard `0c8c564f498` (+ test-fix
+  `dee120cdde8`); republishRef idempotency `93e7cda1085`. Unit: `CasPromoteRepublish.*` (promote fail-close,
+  same-manifest idempotent, absent-ref, re-drive idempotent, different-content conflict).
 
 ## ABANDON-RETIRE-ORDERING (2026-07-08, write-path audit) — LOW, latent robustness
 
@@ -1334,3 +1346,8 @@ infra/measurement gaps (not CA defects — all had dangling=0 + agreement):
 - **Severity:** finding (benign today). `Build::abandon` calls `retireBuildSeq(build_seq)` BEFORE appending the precommit-removal `mutateShard`, opening a window where `min_active` advances and GC's `reclaimAbandonedPrecommit` races `abandon`'s removal (double removal of the same precommit binding). Safe today ONLY because in-degree is an idempotent source-edge SET (H1b) and no committed ref is involved — but it contradicts the ordering discipline the function documents. `Build::promote` already does the safe order (retire AFTER its CAS, `CasBuild.cpp:911`).
 - **Relevance to DANGLING-PRECOMMIT fix:** that fix force-Reads Skip-parked shards, INCREASING `reclaimAbandonedPrecommit` firing frequency → the abandon-vs-reclaim double-removal window is exercised more. Still safe (idempotent set), but raises the priority of moving `retireBuildSeq` to AFTER the removal `mutateShard`.
 - **Fix:** move `retireBuildSeq` after the removal CAS in `Build::abandon`, mirroring `promote`.
+- **RESOLVED 2026-07-08 (branch `cas-gc-rebuild`, commit `f5fd7c0ead3`).** `Build::abandon` now retires the
+  build_seq only AFTER the precommit-removal `mutateShard` (unconditionally, past the `if (precommitted)`
+  block; `alive = false` stays early), mirroring `promote`. The precommit becomes watermark-dead only after
+  its removal is durably committed, so `reclaimAbandonedPrecommit` can never observe a live-and-dead
+  precommit to double-remove. Regression test `CasPromoteRepublish.AbandonEmitsRemovalBeforeRetire`.

@@ -482,6 +482,33 @@ writer-side leak reachable via a `republishRef` crash re-drive) and `ABANDON-RET
 
 **Code currency:** CURRENT (the C++ fix matches this gate).
 
+### `AtMostOneCommittedManifestPerRef` — promote-over-committed gate (C++ fix LANDED) {#atmostonecommittedmanifestperref}
+
+**Files:** `CaGcRootLocalPartManifestCore.tla` + `CaGcRootLocalPartManifestCore_stage2.cfg`.
+
+**What it proves.** The `PROMOTE-OVER-COMMITTED-LEAK` write-path bug (2026-07-08): `Build::promote`
+overwrote `refs[ref]` with a Δ=0 owner-move without releasing a pre-existing *different* committed manifest
+`T_old`, leaving two committed bindings for one ref and orphaning `T_old` (owner↔refs divergence);
+reachable via a `republishRef` crash re-drive (RENAME/DETACH-ATTACH). The model's `WPromote`/
+`WPublishCommitted` ALREADY enforce `RefFreeFor(ref, m)` (a ref owns ≤1 committed manifest) — the shipped
+C++ simply diverged. The new invariant `AtMostOneCommittedManifestPerRef ==
+\A r \in Refs : Cardinality({m \in ManifestIds : owner[m] = r}) <= 1` makes that property TLC-checked; it
+**HOLDS** in `stage2` (68.5M distinct states) under the enforced `RefFreeFor`. It is logically equivalent
+to the pre-existing `SingleManifestOwner` (same ref→manifest direction) — a dedicated, named regression
+gate rather than new coverage. The bug itself is reproduced deterministically by the C++ RED test
+(`CasPromoteRepublish.*`), so no `SabotagePromoteOverwritesCommitted` negative control was added (it would
+force editing all 47 sibling cfgs for marginal added assurance).
+
+**C++ fix (LANDED, branch `cas-gc-rebuild`).** `Build::promote` fail-closes with `ABORTED` when
+`refs[final_ref_name]` already names a different committed `manifest_ref` (a same-manifest re-promote and an
+absent ref proceed); `ContentAddressedTransaction::republishRef` is idempotent on the destination (skip the
+publish + `dropRef(src)` when dst is already committed with the same path-sorted `entries`; `ABORTED` on a
+different-content conflict), so RENAME/DETACH-ATTACH re-drives no longer leak; and `Build::abandon` retires
+its build_seq only after the precommit-removal CAS (`ABANDON-RETIRE-ORDERING`, closing the double-removal
+window that the just-landed dangling-precommit fix made more frequent). Unit tests: `CasPromoteRepublish.*`.
+
+**Code currency:** CURRENT (the C++ fix matches this gate).
+
 ---
 
 ## Area 8 — In-degree re-fold undercount (B-indeg fix) {#area-indeg-refold}
