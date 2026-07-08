@@ -395,7 +395,7 @@ TEST(CasStore, ListNamespaceFilesEmpty)
     EXPECT_TRUE(s->listNamespaceFiles(ns).empty());
 }
 
-/// ---------- read side (spec §6): resolveRef / readManifest / lookupPath / listDirectory / listRefs ----------
+/// ---------- read side (spec §6): resolveRef / readManifest / findEntry / entryRange / listRefs ----------
 
 /// Phase 1c read path: a published ref resolves to a ManifestId; readManifest returns the immutable
 /// body; locate yields a ranged blob read; an Inline entry has no location. Replaces the old
@@ -435,8 +435,8 @@ TEST(CasStore, ResolveReturnsManifestId)
     ASSERT_EQ(manifest.entries.size(), 2u);
 
     /// "data.bin" sorts before "small.txt" (canonical path order).
-    auto data = s->lookupPath(manifest, "data.bin");
-    ASSERT_TRUE(data.has_value());
+    const auto * data = findEntry(manifest.entries, "data.bin");
+    ASSERT_TRUE(data != nullptr);
     auto loc = s->locate(*data);
     EXPECT_EQ(loc.offset, s->poolMeta().blob_header_len);
     EXPECT_EQ(loc.length, payload.size());
@@ -445,8 +445,8 @@ TEST(CasStore, ResolveReturnsManifestId)
     ASSERT_TRUE(bytes.has_value());
     EXPECT_EQ(bytes->bytes, payload);               /// ranged read, no header touch
 
-    auto small = s->lookupPath(manifest, "small.txt");
-    ASSERT_TRUE(small.has_value());
+    const auto * small = findEntry(manifest.entries, "small.txt");
+    ASSERT_TRUE(small != nullptr);
     EXPECT_THROW(s->locate(*small), DB::Exception);  /// Inline has no location
 }
 
@@ -515,7 +515,7 @@ TEST(CasStore, ReadManifestValidatesBodyAndFailsClosed)
     }
 }
 
-/// lookupPath and listDirectory over a decoded part manifest's canonical-path-ordered entries.
+/// findEntry and entryRange over a decoded part manifest's canonical-path-ordered entries.
 TEST(CasStore, LookupAndListOverManifestEntries)
 {
     auto b = std::make_shared<InMemoryBackend>();
@@ -536,20 +536,22 @@ TEST(CasStore, LookupAndListOverManifestEntries)
     auto manifest = s->readManifest(r->manifest_id);
     ASSERT_EQ(manifest.entries.size(), 4u);
 
-    /// lookupPath: exact-path hit + miss.
-    auto hit = s->lookupPath(manifest, "data.bin");
-    ASSERT_TRUE(hit.has_value());
+    /// findEntry: exact-path hit + miss.
+    const auto * hit = findEntry(manifest.entries, "data.bin");
+    ASSERT_TRUE(hit != nullptr);
     EXPECT_EQ(hit->blob_hash, u128Of("data"));
-    EXPECT_FALSE(s->lookupPath(manifest, "no_such_file").has_value());
+    EXPECT_TRUE(findEntry(manifest.entries, "no_such_file") == nullptr);
 
-    /// listDirectory under "p.proj/" yields exactly the two projection files, in canonical order.
-    auto proj = s->listDirectory(manifest, "p.proj/");
+    /// entryRange under "p.proj/" yields exactly the two projection files, in canonical order.
+    auto [proj_first, proj_last] = entryRange(manifest.entries, "p.proj/");
+    std::vector<ManifestEntry> proj(proj_first, proj_last);
     ASSERT_EQ(proj.size(), 2u);
     EXPECT_EQ(proj[0].path, "p.proj/columns.txt");
     EXPECT_EQ(proj[1].path, "p.proj/data.bin");
 
     /// The empty prefix lists everything (all four), still in canonical order.
-    auto all = s->listDirectory(manifest, "");
+    auto [all_first, all_last] = entryRange(manifest.entries, "");
+    std::vector<ManifestEntry> all(all_first, all_last);
     ASSERT_EQ(all.size(), 4u);
     EXPECT_EQ(all[0].path, "columns.txt");
     EXPECT_EQ(all[3].path, "p.proj/data.bin");

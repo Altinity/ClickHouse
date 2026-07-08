@@ -333,13 +333,6 @@ public:
     /// cache) but returns the SHARED immutable decode the manifest cache holds — no per-call copy.
     /// The wiring read path uses this variant (spec 2026-07-08-cas-part-folder-cache).
     std::shared_ptr<const PartManifest> readManifestShared(const ManifestId & id);
-    /// Path lookup over a decoded part manifest's canonical-path-ordered entries (Resolved OQ3: no
-    /// DirectoryIndex yet). Returns the entry whose `path` equals `path`, or nullopt.
-    std::optional<ManifestEntry> lookupPath(const PartManifest & manifest, const String & path) const;
-    /// Directory listing: every entry whose `path` lies under `dir_prefix`, in canonical path order.
-    /// `dir_prefix` is matched as a path prefix; the caller collapses to first path segments (the
-    /// wiring's listDirectory does the segment collapse, as it did for tree entries).
-    std::vector<ManifestEntry> listDirectory(const PartManifest & manifest, const String & dir_prefix) const;
     BlobLocation locate(const ManifestEntry & entry) const;       /// Blob placement only
     std::map<String, Resolved> listRefs(const RootNamespace & ns);
     /// Namespaces with the given prefix: a LIST of `cas/refs/` ∪ `roots/`, results are UNORDERED.

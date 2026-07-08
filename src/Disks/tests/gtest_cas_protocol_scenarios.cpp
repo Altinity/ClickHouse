@@ -76,7 +76,7 @@ ManifestId publishBlobPart(
     return id;
 }
 
-/// Read the part's blob back through the full read stack (resolveRef → readManifest → lookupPath →
+/// Read the part's blob back through the full read stack (resolveRef → readManifest → findEntry →
 /// locate → ranged GET) and assert it returns `payload`. This is the INV-NO-DANGLE check: every named
 /// object resolves and reads.
 void assertPartReads(
@@ -87,8 +87,8 @@ void assertPartReads(
     ASSERT_TRUE(r.has_value());
 
     const PartManifest manifest = s->readManifest(r->manifest_id);
-    auto entry = s->lookupPath(manifest, path);
-    ASSERT_TRUE(entry.has_value());
+    const auto * entry = findEntry(manifest.entries, path);
+    ASSERT_TRUE(entry != nullptr);
     auto loc = s->locate(*entry);
     auto got = b->get(loc.key, Range{loc.offset, loc.length});
     ASSERT_TRUE(got.has_value());
@@ -569,15 +569,15 @@ TEST(CasProtocol, AdoptedLeafCarriesRealBlobSize)
     const ManifestId id_a = publishBlobPart(s, ns, "ref_a", "data.bin", "payload-B92");
 
     const PartManifest manifest_a = s->readManifest(id_a);
-    auto entry_a = s->lookupPath(manifest_a, "data.bin");
-    ASSERT_TRUE(entry_a.has_value());
+    const auto * entry_a = findEntry(manifest_a.entries, "data.bin");
+    ASSERT_TRUE(entry_a != nullptr);
     const uint64_t size_a = entry_a->blob_size;
     EXPECT_NE(size_a, 0u) << "ref A blob_size must be non-zero";
     EXPECT_EQ(size_a, String("payload-B92").size());
 
     /// Build B: adopt the same leaf, publish as ref_b (no re-upload).
     auto build_b = startBuildFor(s, ns, "ref_b");
-    ASSERT_TRUE(entry_a.has_value());
+    ASSERT_TRUE(entry_a != nullptr);
     build_b->adoptEvidence(*entry_a);
     const ManifestId id_b = build_b->stageManifest({*entry_a});
     build_b->precommitAdd(ns, "ref_b", id_b);
@@ -585,8 +585,8 @@ TEST(CasProtocol, AdoptedLeafCarriesRealBlobSize)
 
     /// Resolve ref B: the adopted leaf's blob_size must match ref A (round-trip invariant for B92).
     const PartManifest manifest_b = s->readManifest(s->resolveRef(ns, "ref_b")->manifest_id);
-    auto entry_b = s->lookupPath(manifest_b, "data.bin");
-    ASSERT_TRUE(entry_b.has_value());
+    const auto * entry_b = findEntry(manifest_b.entries, "data.bin");
+    ASSERT_TRUE(entry_b != nullptr);
     EXPECT_NE(entry_b->blob_size, 0u) << "adopted leaf blob_size must not be 0 (B92)";
     EXPECT_EQ(entry_b->blob_size, size_a) << "adopted-leaf blob_size mismatch (B92 round-trip)";
 }

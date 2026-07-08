@@ -1052,8 +1052,8 @@ TEST(CasBuild, PublishHappyPathRoundTrip)
     /// Read the manifest back and locate its single blob leaf.
     const PartManifest manifest = s->readManifest(id);
     ASSERT_EQ(manifest.entries.size(), 1u);
-    const auto entry = s->lookupPath(manifest, "data.bin");
-    ASSERT_TRUE(entry.has_value());
+    const auto * entry = findEntry(manifest.entries, "data.bin");
+    ASSERT_TRUE(entry != nullptr);
     const auto loc = s->locate(*entry);
     auto got = b->get(loc.key, Range{loc.offset, loc.length});
     ASSERT_TRUE(got.has_value());
@@ -1461,8 +1461,8 @@ TEST(CasBuild, ConvergesUnderProductiveGc)
 
     const PartManifest manifest = s->readManifest(mid_b);
     ASSERT_EQ(manifest.entries.size(), 1u);
-    const auto entry = s->lookupPath(manifest, "f");
-    ASSERT_TRUE(entry.has_value());
+    const auto * entry = findEntry(manifest.entries, "f");
+    ASSERT_TRUE(entry != nullptr);
     const auto loc = s->locate(*entry);
     const auto got = b->get(loc.key, Range{loc.offset, loc.length});
     ASSERT_TRUE(got.has_value());

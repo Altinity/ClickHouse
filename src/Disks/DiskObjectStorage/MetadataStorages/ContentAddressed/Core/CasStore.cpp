@@ -1040,27 +1040,6 @@ PartManifest Store::readManifest(const ManifestId & id)
     return *readManifestShared(id);
 }
 
-std::optional<ManifestEntry> Store::lookupPath(const PartManifest & manifest, const String & path) const
-{
-    for (const auto & entry : manifest.entries)
-    {
-        if (entry.path == path)
-            return entry;
-    }
-    return std::nullopt;
-}
-
-std::vector<ManifestEntry> Store::listDirectory(const PartManifest & manifest, const String & dir_prefix) const
-{
-    std::vector<ManifestEntry> result;
-    for (const auto & entry : manifest.entries)
-    {
-        if (dir_prefix.empty() || entry.path.starts_with(dir_prefix))
-            result.push_back(entry);
-    }
-    return result;
-}
-
 BlobLocation Store::locate(const ManifestEntry & entry) const
 {
     /// A ranged read into the content object: the payload starts at a constant offset for blobs
