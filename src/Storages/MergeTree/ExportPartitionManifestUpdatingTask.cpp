@@ -419,6 +419,7 @@ void ExportPartitionManifestUpdatingTask::poll()
     std::vector<CommitRecoveryWork> deferred_commits;
 
     auto zk = storage.getZooKeeper();
+    const auto log = storage.log.load();
 
     const std::string exports_path = fs::path(storage.zookeeper_path) / "exports";
     const std::string cleanup_lock_path = fs::path(storage.zookeeper_path) / "exports_cleanup_lock";
@@ -431,7 +432,7 @@ void ExportPartitionManifestUpdatingTask::poll()
     auto cleanup_lock = zkutil::EphemeralNodeHolder::tryCreate(cleanup_lock_path, *zk, storage.replica_name);
     if (cleanup_lock)
     {
-        LOG_DEBUG(storage.log, "ExportPartition Manifest Updating Task: Cleanup lock acquired, will remove stale entries");
+        LOG_DEBUG(log, "ExportPartition Manifest Updating Task: Cleanup lock acquired, will remove stale entries");
     }
 
     {
@@ -448,7 +449,7 @@ void ExportPartitionManifestUpdatingTask::poll()
 
         auto & entries_by_key = working_model->get<ExportPartitionTaskEntryTagByCompositeKey>();
 
-        LOG_DEBUG(storage.log, "ExportPartition Manifest Updating Task: Polling for new entries for table {}. Current number of entries: {}", storage.getStorageID().getNameForLogs(), entries_by_key.size());
+        LOG_DEBUG(log, "ExportPartition Manifest Updating Task: Polling for new entries for table {}. Current number of entries: {}", storage.getStorageID().getNameForLogs(), entries_by_key.size());
 
         ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
         ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGetChildrenWatch);
@@ -471,7 +472,7 @@ void ExportPartitionManifestUpdatingTask::poll()
             std::string metadata_json;
             if (!zk->tryGet(fs::path(entry_path) / "metadata.json", metadata_json))
             {
-                LOG_WARNING(storage.log, "ExportPartition Manifest Updating Task: Skipping {}: missing metadata.json", key);
+                LOG_WARNING(log, "ExportPartition Manifest Updating Task: Skipping {}: missing metadata.json", key);
                 continue;
             }
 
@@ -485,13 +486,13 @@ void ExportPartitionManifestUpdatingTask::poll()
                 /// A single unparseable metadata.json (e.g. genuinely corrupt, or written by a
                 /// future incompatible format) must not abort the whole poll and stall discovery,
                 /// cleanup and status convergence for every other task. Skip just this entry.
-                tryLogCurrentException(storage.log, __PRETTY_FUNCTION__);
-                LOG_WARNING(storage.log, "ExportPartition Manifest Updating Task: Skipping {}: could not parse metadata.json", key);
+                tryLogCurrentException(log, __PRETTY_FUNCTION__);
+                LOG_WARNING(log, "ExportPartition Manifest Updating Task: Skipping {}: could not parse metadata.json", key);
                 continue;
             }
 
             auto last_exception_per_replica = readLastExceptionPerReplica(
-                zk, fs::path(entry_path), key, storage.log.load());
+                zk, fs::path(entry_path), key, log);
 
             /// If the zk entry has been replaced with export_merge_tree_partition_force_export, checking only for the export key is not enough
             /// we need to make sure it is the same transaction id. If it is not, it needs to be replaced.
@@ -534,19 +535,19 @@ void ExportPartitionManifestUpdatingTask::poll()
 
             if (status_string.empty())
             {
-                LOG_WARNING(storage.log, "ExportPartition Manifest Updating Task: Skipping {}: missing status", key);
+                LOG_WARNING(log, "ExportPartition Manifest Updating Task: Skipping {}: missing status", key);
                 continue;
             }
 
             const auto status = magic_enum::enum_cast<ExportReplicatedMergeTreePartitionTaskEntry::Status>(status_string);
             if (!status)
             {
-                LOG_WARNING(storage.log, "ExportPartition Manifest Updating Task: Invalid status {} for task {}, skipping", status_string, key);
+                LOG_WARNING(log, "ExportPartition Manifest Updating Task: Invalid status {} for task {}, skipping", status_string, key);
                 continue;
             }
 
             const auto destination_file_paths_per_part = readDestinationFilePathsPerPart(
-                zk, fs::path(entry_path), key, storage.log.load());
+                zk, fs::path(entry_path), key, log);
 
             /// If we hold the cleanup lock, enforce the task timeout and recover uncommitted exports.
             /// Entries are never removed here, so we always fall through to refresh / addTask below.
@@ -555,7 +556,7 @@ void ExportPartitionManifestUpdatingTask::poll()
                 tryCleanup(
                     zk,
                     entry_path,
-                    storage.log.load(),
+                    log,
                     storage.getContext(),
                     storage,
                     metadata,
@@ -566,8 +567,8 @@ void ExportPartitionManifestUpdatingTask::poll()
 
             if (!has_local_entry)
             {
-                addTask(metadata, *status, std::move(last_exception_per_replica), std::move(destination_file_paths_per_part), readCommitInfo(zk, fs::path(entry_path), key, storage.log.load()), key, entries_by_key);
-                LOG_INFO(storage.log, "ExportPartition Manifest Updating Task: Added new entry for task {}", key);
+                addTask(metadata, *status, std::move(last_exception_per_replica), std::move(destination_file_paths_per_part), readCommitInfo(zk, fs::path(entry_path), key, log), key, entries_by_key);
+                LOG_INFO(log, "ExportPartition Manifest Updating Task: Added new entry for task {}", key);
                 continue;
             }
 
@@ -576,7 +577,7 @@ void ExportPartitionManifestUpdatingTask::poll()
             /// A silly optimization to avoid reading the commit info if the status is not COMPLETED
             if (status_changed && *status == ExportReplicatedMergeTreePartitionTaskEntry::Status::COMPLETED)
             {
-                local_entry->commit_info = readCommitInfo(zk, fs::path(entry_path), key, storage.log.load());
+                local_entry->commit_info = readCommitInfo(zk, fs::path(entry_path), key, log);
             }
 
             /// If we already have the local entry, we need to update it
@@ -599,7 +600,7 @@ void ExportPartitionManifestUpdatingTask::poll()
                 }
             }
 
-            LOG_DEBUG(storage.log, "ExportPartition Manifest Updating Task: Skipping {}: already exists", key);
+            LOG_DEBUG(log, "ExportPartition Manifest Updating Task: Skipping {}: already exists", key);
             
         }
 
@@ -611,10 +612,8 @@ void ExportPartitionManifestUpdatingTask::poll()
         /// `entries_by_key` (a reference into it) must not be used afterwards.
         storage.export_partition_manifests.set(std::move(working_model));
 
-        LOG_DEBUG(storage.log, "ExportPartition Manifest Updating task: finished polling for new entries. Number of entries: {}", entries_count);
+        LOG_DEBUG(log, "ExportPartition Manifest Updating task: finished polling for new entries. Number of entries: {}", entries_count);
     }
-
-    const auto log_ptr = storage.log.load();
 
     /// Execute pending commits
     for (const auto & work : deferred_commits)
@@ -622,11 +621,11 @@ void ExportPartitionManifestUpdatingTask::poll()
         /// A replica exported the last part but the commit never landed. Try to fix it.
         try
         {
-            ExportPartitionUtils::commit(work.metadata, work.destination_storage, zk, log_ptr, work.entry_path, work.context, storage, storage.getReplicaName());
+            ExportPartitionUtils::commit(work.metadata, work.destination_storage, zk, log, work.entry_path, work.context, storage, storage.getReplicaName());
         }
         catch (const Exception & e)
         {
-            LOG_WARNING(log_ptr,
+            LOG_WARNING(log,
                 "ExportPartition Manifest Updating Task: "
                 "Caught exception while committing export for {}: {}",
                 work.entry_path, e.message());
@@ -637,11 +636,11 @@ void ExportPartitionManifestUpdatingTask::poll()
                 e.code(),
                 storage.getReplicaName(),
                 e.message(),
-                log_ptr);
+                log);
 
             if (became_failed)
             {
-                LOG_WARNING(log_ptr,
+                LOG_WARNING(log,
                     "ExportPartition Manifest Updating Task: "
                     "Commit for {} transitioned to FAILED due to non-retryable error (code {})",
                     work.entry_path, e.code());
@@ -741,6 +740,7 @@ void ExportPartitionManifestUpdatingTask::handleStatusChanges()
 
     /// Take a snapshot of all status changes. If an exception is thrown, we will requeue the whole batch.
     const std::queue<std::string> batch = local_status_changes;
+    const auto log = storage.log.load();
 
     try
     {
@@ -753,7 +753,7 @@ void ExportPartitionManifestUpdatingTask::handleStatusChanges()
 
         const bool had_changes = !local_status_changes.empty();
 
-        LOG_DEBUG(storage.log, "ExportPartition Manifest Updating task: handling status changes. Number of status changes: {}", local_status_changes.size());
+        LOG_DEBUG(log, "ExportPartition Manifest Updating task: handling status changes. Number of status changes: {}", local_status_changes.size());
 
         const auto current_model = storage.export_partition_manifests.get();
         auto working_model = current_model
@@ -764,7 +764,7 @@ void ExportPartitionManifestUpdatingTask::handleStatusChanges()
         while (!local_status_changes.empty())
         {
             const auto & key = local_status_changes.front();
-            LOG_INFO(storage.log, "ExportPartition Manifest Updating task: handling status change for task {}", key);
+            LOG_INFO(log, "ExportPartition Manifest Updating task: handling status change for task {}", key);
 
             fiu_do_on(FailPoints::export_partition_status_change_throw,
             {
@@ -785,7 +785,7 @@ void ExportPartitionManifestUpdatingTask::handleStatusChanges()
             std::string new_status_string;
             if (!zk->tryGet(fs::path(storage.zookeeper_path) / "exports" / key / "status", new_status_string))
             {
-                LOG_WARNING(storage.log, "ExportPartition Manifest Updating Task: Failed to get new status for task {}, skipping", key);
+                LOG_WARNING(log, "ExportPartition Manifest Updating Task: Failed to get new status for task {}, skipping", key);
                 local_status_changes.pop();
                 continue;
             }
@@ -793,21 +793,21 @@ void ExportPartitionManifestUpdatingTask::handleStatusChanges()
             const auto new_status = magic_enum::enum_cast<ExportReplicatedMergeTreePartitionTaskEntry::Status>(new_status_string);
             if (!new_status)
             {
-                LOG_WARNING(storage.log, "ExportPartition Manifest Updating Task: Invalid status {} for task {}, skipping", new_status_string, key);
+                LOG_WARNING(log, "ExportPartition Manifest Updating Task: Invalid status {} for task {}, skipping", new_status_string, key);
                 local_status_changes.pop();
                 continue;
             }
 
-            LOG_INFO(storage.log, "ExportPartition Manifest Updating task: status changed for task {}. New status: {}", key, magic_enum::enum_name(*new_status).data());
+            LOG_INFO(log, "ExportPartition Manifest Updating task: status changed for task {}. New status: {}", key, magic_enum::enum_name(*new_status).data());
 
             auto fetched = readLastExceptionPerReplica(
-                zk, fs::path(storage.zookeeper_path) / "exports" / key, key, storage.log.load());
+                zk, fs::path(storage.zookeeper_path) / "exports" / key, key, log);
 
             /// Refresh per-part destination paths and commit_info on the status flip too,
             /// so the system table observes the COMPLETED state and the committed file
             /// paths in the same poll cycle.
             const auto destination_file_paths_per_part = readDestinationFilePathsPerPart(
-                    zk, fs::path(storage.zookeeper_path) / "exports" / key, key, storage.log.load());
+                    zk, fs::path(storage.zookeeper_path) / "exports" / key, key, log);
             if (!destination_file_paths_per_part.empty())
             {
                 it->destination_file_paths_per_part = std::move(destination_file_paths_per_part);
@@ -819,7 +819,7 @@ void ExportPartitionManifestUpdatingTask::handleStatusChanges()
             if (*new_status == ExportReplicatedMergeTreePartitionTaskEntry::Status::COMPLETED)
             {
                 if (auto fetched_commit_info = readCommitInfo(
-                        zk, fs::path(storage.zookeeper_path) / "exports" / key, key, storage.log.load()))
+                        zk, fs::path(storage.zookeeper_path) / "exports" / key, key, log))
                 {
                     it->commit_info = std::move(fetched_commit_info);
                 }
@@ -830,12 +830,12 @@ void ExportPartitionManifestUpdatingTask::handleStatusChanges()
             {
                 try
                 {
-                    LOG_INFO(storage.log, "ExportPartition Manifest Updating task: killing export partition for task {}", key);
+                    LOG_INFO(log, "ExportPartition Manifest Updating task: killing export partition for task {}", key);
                     storage.killExportPart(it->manifest.transaction_id);
                 }
                 catch (...)
                 {
-                    tryLogCurrentException(storage.log, __PRETTY_FUNCTION__);
+                    tryLogCurrentException(log, __PRETTY_FUNCTION__);
                 }
             }
 
@@ -861,9 +861,9 @@ void ExportPartitionManifestUpdatingTask::handleStatusChanges()
     }
     catch (...)
     {
-        tryLogCurrentException(storage.log, __PRETTY_FUNCTION__);
+        tryLogCurrentException(log, __PRETTY_FUNCTION__);
 
-        LOG_WARNING(storage.log, "ExportPartition Manifest Updating task: exception thrown while handling status changes; nothing was published, requeuing the whole batch. Batch size: {}", batch.size());
+        LOG_WARNING(log, "ExportPartition Manifest Updating task: exception thrown while handling status changes; nothing was published, requeuing the whole batch. Batch size: {}", batch.size());
 
         std::lock_guard lock(status_changes_mutex);
 
@@ -880,7 +880,7 @@ void ExportPartitionManifestUpdatingTask::handleStatusChanges()
             std::swap(status_changes, requeued);
         }
 
-        LOG_DEBUG(storage.log, "ExportPartition Manifest Updating task: pending status changes after requeue: {}", status_changes.size());
+        LOG_DEBUG(log, "ExportPartition Manifest Updating task: pending status changes after requeue: {}", status_changes.size());
 
         throw;
     }
