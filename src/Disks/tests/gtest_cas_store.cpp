@@ -557,8 +557,8 @@ TEST(CasStore, LookupAndListOverManifestEntries)
 
 /// The Phase 1c manifest decode cache is keyed by (ManifestId, Token). Resolve+read the same ref twice:
 /// the second readManifest must be served from the cache (no second GET of the body). A fresh publish
-/// of the SAME ref name mints a NEW ManifestId (and a new shard token), so the cache misses and the
-/// body is fetched again. A CountingBackend asserts the body GET count.
+/// under a DIFFERENT ref name mints a NEW ManifestId (and a new shard token), so the cache misses and
+/// the body is fetched again. A CountingBackend asserts the body GET count.
 TEST(CasStore, ManifestCacheIsKeyedByIdAndToken)
 {
     auto b = std::make_shared<DB::Cas::tests::CountingBackend>();
@@ -590,12 +590,14 @@ TEST(CasStore, ManifestCacheIsKeyedByIdAndToken)
     EXPECT_EQ(b->getCount(key1), gets_after_first)
         << "second readManifest re-GET the body for the same (ManifestId, Token) — cache miss";
 
-    /// A fresh publish over the SAME ref name mints a NEW ManifestId: the cache (keyed by id) misses.
-    const ManifestId id2 = publishPart(s, ns.string(), "part_1", "payload-2");
+    /// A fresh publish under a DIFFERENT ref name mints a NEW ManifestId: the cache (keyed by id) misses.
+    /// (Promoting a different manifest over the SAME committed ref is a distinct promote-over-committed
+    /// leak that `Build::promote` now forbids — see the CasPromoteRepublish tests.)
+    const ManifestId id2 = publishPart(s, ns.string(), "part_2", "payload-2");
     EXPECT_FALSE(id2 == id1);                       /// a new publish never reuses a ManifestId
     const String key2 = layout.manifestKey(id2);
 
-    auto r2 = s->resolveRef(ns, "part_1");
+    auto r2 = s->resolveRef(ns, "part_2");
     ASSERT_TRUE(r2.has_value());
     EXPECT_EQ(r2->manifest_id, id2);               /// resolve now sees the new manifest
     auto m2 = s->readManifest(r2->manifest_id);
