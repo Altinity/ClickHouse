@@ -1,6 +1,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/CachedPartFolderAccess.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.h>
 #include <Common/ProfileEvents.h>
+#include <base/scope_guard.h>
 
 namespace DB::ErrorCodes
 {
@@ -10,29 +11,158 @@ namespace DB::ErrorCodes
 
 namespace ProfileEvents
 {
+    extern const Event CasPartFolderViewHits;
+    extern const Event CasPartFolderViewMutableRefreshes;
+    extern const Event CasPartFolderViewValidationMismatches;
     extern const Event CasPartFolderViewMisses;
+    extern const Event CasPartFolderViewOversizedBypasses;
     extern const Event CasPartFolderViewInvalidations;
+}
+
+namespace CurrentMetrics
+{
+    extern const Metric CasPartFolderCacheBytes;
+    extern const Metric CasPartFolderCacheEntries;
 }
 
 namespace DB::ContentAddressed
 {
 
+CachedPartFolderAccess::CachedPartFolderAccess(Cas::StorePtr store_)
+    : CachedPartFolderAccess(std::move(store_), CacheParams{})
+{
+}
+
+CachedPartFolderAccess::CachedPartFolderAccess(Cas::StorePtr store_, CacheParams params_)
+    : store(std::move(store_)), params(params_)
+{
+    if (params.cache_bytes > 0)
+        view_cache = std::make_unique<ViewCache>(
+            "LRU", CurrentMetrics::CasPartFolderCacheBytes, CurrentMetrics::CasPartFolderCacheEntries,
+            params.cache_bytes, params.max_entries, ViewCache::DEFAULT_SIZE_RATIO);
+}
+
 std::shared_ptr<const PartFolderView>
 CachedPartFolderAccess::getView(const PartRefKey & key, Freshness freshness) const
 {
+    /// Step 1 (spec §Validate-On-Hit): the SAME resolve every read already pays today. Absence is
+    /// never retained.
     auto resolved = resolve(key, freshness);
     if (!resolved)
-        return nullptr;   /// absence is never cached
-    /// Fail-closed exactly as before: a live ref naming a missing body throws FILE_DOESNT_EXIST
-    /// (INV-NO-DANGLE surfaced); corrupt bodies throw CORRUPTED_DATA and are never cached.
-    auto view = PartFolderView::make(key, *resolved, store->readManifestShared(resolved->manifest_id));
+        return nullptr;
+
+    /// Step 2: retained views serve ONLY CachedForLoad. ForceFresh must re-prove the manifest BODY
+    /// (a fresh ref resolve proves ref currency, not body existence — review 2026-07-08);
+    /// StrictValidate bypasses retention entirely.
+    if (freshness == Freshness::CachedForLoad && view_cache)
+    {
+        if (auto cached = view_cache->get(key.cacheKey()))
+        {
+            if (cached->manifestId() == resolved->manifest_id)
+            {
+                if (cached->mutableFiles() == resolved->mutable_files)
+                {
+                    ProfileEvents::increment(ProfileEvents::CasPartFolderViewHits);
+                    recordDecision(key, LastDecision::Hit, cached.get(), /*retained=*/true);
+                    return cached;
+                }
+                /// 2b: manifest unchanged, mutable-only drift (txn_version bumps) — clone around
+                /// the SAME shared decode; no manifest operation at all.
+                auto refreshed = std::make_shared<PartFolderView>(
+                    key, resolved->manifest_id, resolved->manifest_size,
+                    resolved->published_at_ms, resolved->mutable_files, cached->manifest());
+                if (refreshed->estimatedBytes() <= params.max_entry_bytes)
+                    view_cache->set(key.cacheKey(), refreshed);
+                ProfileEvents::increment(ProfileEvents::CasPartFolderViewMutableRefreshes);
+                recordDecision(key, LastDecision::MutableRefresh, refreshed.get(), /*retained=*/true);
+                return refreshed;
+            }
+            ProfileEvents::increment(ProfileEvents::CasPartFolderViewValidationMismatches);
+            /// fall through to rebuild — the stale entry is superseded by the insert below
+        }
+    }
+
+    auto view = buildView(key, *resolved, freshness);
+
+    /// Step 4: retain (StrictValidate never populates; oversized views are served, not retained).
+    /// `oversized` is tracked SEPARATELY from `retained`: with retention disabled (view_cache ==
+    /// nullptr), `retained` is also false, but that is not an oversized bypass — it is the ordinary
+    /// disabled-mode miss the Phase 3 baseline pins (deviation from the plan's draft, which
+    /// conflated `!retained` with oversized and mis-recorded every disabled-mode CachedForLoad
+    /// miss as OversizedBypass).
+    bool retained = false;
+    bool oversized = false;
+    if (freshness != Freshness::StrictValidate && view_cache)
+    {
+        if (view->estimatedBytes() <= params.max_entry_bytes)
+        {
+            /// CacheBase stores mutable pointers; views are logically const (never mutated).
+            view_cache->set(key.cacheKey(), std::const_pointer_cast<PartFolderView>(view));
+            retained = true;
+        }
+        else
+        {
+            oversized = true;
+            ProfileEvents::increment(ProfileEvents::CasPartFolderViewOversizedBypasses);
+        }
+    }
     ProfileEvents::increment(ProfileEvents::CasPartFolderViewMisses);
     recordDecision(key,
-        freshness == Freshness::CachedForLoad ? LastDecision::Miss
-        : freshness == Freshness::ForceFresh ? LastDecision::ForceFreshRead
-        : LastDecision::StrictBypass,
-        view.get());
+        freshness == Freshness::CachedForLoad ? (oversized ? LastDecision::OversizedBypass : LastDecision::Miss)
+        : freshness == Freshness::ForceFresh  ? LastDecision::ForceFreshRead
+                                              : LastDecision::StrictBypass,
+        view.get(), retained);
     return view;
+}
+
+std::shared_ptr<const PartFolderView> CachedPartFolderAccess::buildView(
+    const PartRefKey & key, const Cas::Resolved & resolved, Freshness freshness) const
+{
+    /// Fresh modes must not coalesce onto another caller's read (each ForceFresh/StrictValidate
+    /// call owns its mandatory HEAD); only cold CachedForLoad builds single-flight.
+    if (freshness != Freshness::CachedForLoad)
+        return PartFolderView::make(key, resolved, store->readManifestShared(resolved.manifest_id));
+
+    std::promise<std::shared_ptr<const PartFolderView>> promise;
+    std::shared_future<std::shared_ptr<const PartFolderView>> future;
+    bool leader = false;
+    {
+        std::lock_guard lock(inflight_mutex);
+        if (auto it = inflight.find(key.cacheKey()); it != inflight.end())
+            future = it->second;                          /// follower: share the leader's build
+        else
+        {
+            leader = true;
+            future = promise.get_future().share();
+            inflight.emplace(key.cacheKey(), future);
+        }
+    }
+    if (!leader)
+        return future.get();                              /// rethrows the leader's failure, if any
+
+    SCOPE_EXIT({
+        std::lock_guard lock(inflight_mutex);
+        inflight.erase(key.cacheKey());
+    });
+    try
+    {
+        auto view = PartFolderView::make(key, resolved, store->readManifestShared(resolved.manifest_id));
+        promise.set_value(view);
+        return view;
+    }
+    catch (...)
+    {
+        promise.set_exception(std::current_exception());  /// followers see the leader's failure
+        throw;
+    }
+}
+
+void CachedPartFolderAccess::eraseView(const PartRefKey & key)
+{
+    if (view_cache)
+        view_cache->remove(key.cacheKey());
+    ProfileEvents::increment(ProfileEvents::CasPartFolderViewInvalidations);
+    recordDecision(key, LastDecision::Invalidated, nullptr, /*retained=*/false);
 }
 
 std::optional<Cas::Resolved>
@@ -51,9 +181,7 @@ void CachedPartFolderAccess::promoteBuild(Cas::Build & build, const PartRefKey &
 {
     build.setPendingMutableFiles(std::move(mutable_files));
     build.promote(key.ns, key.ref, build_id, manifest_id);
-    /// Phase 4: eraseView(key)
-    ProfileEvents::increment(ProfileEvents::CasPartFolderViewInvalidations);
-    recordDecision(key, LastDecision::Invalidated, nullptr);
+    eraseView(key);
 }
 
 void CachedPartFolderAccess::publishEntries(const PartRefKey & dst,
@@ -116,17 +244,13 @@ bool CachedPartFolderAccess::republishRef(const PartRefKey & src, const PartRefK
 void CachedPartFolderAccess::updateMutableFiles(const PartRefKey & key, std::function<void(Cas::RootRef &)> mutator)
 {
     store->updateRefPayload(key.ns, key.ref, std::move(mutator));
-    /// Phase 4: eraseView(key)
-    ProfileEvents::increment(ProfileEvents::CasPartFolderViewInvalidations);
-    recordDecision(key, LastDecision::Invalidated, nullptr);
+    eraseView(key);
 }
 
 void CachedPartFolderAccess::dropRef(const PartRefKey & key)
 {
     store->dropRef(key.ns, key.ref);
-    /// Phase 4: eraseView(key)
-    ProfileEvents::increment(ProfileEvents::CasPartFolderViewInvalidations);
-    recordDecision(key, LastDecision::Invalidated, nullptr);
+    eraseView(key);
 }
 
 void CachedPartFolderAccess::dropRefIfPresent(const PartRefKey & key)
@@ -135,9 +259,13 @@ void CachedPartFolderAccess::dropRefIfPresent(const PartRefKey & key)
     /// error); dropRef re-reads the shard inside its own CAS loop, so a concurrent drop can land in
     /// the window between our resolve and that re-read — surfacing as FILE_DOESNT_EXIST. Removal is
     /// replay-safe, so an already-gone ref is success; any other error still propagates. (Moved
-    /// verbatim from ContentAddressedTransaction.)
+    /// verbatim from ContentAddressedTransaction.) Cheap and harmless to also erase the view on the
+    /// early-return absent path (Phase 4).
     if (!store->resolveRef(key.ns, key.ref, /*allow_stale=*/true))
+    {
+        eraseView(key);
         return;
+    }
     try
     {
         store->dropRef(key.ns, key.ref);
@@ -146,11 +274,10 @@ void CachedPartFolderAccess::dropRefIfPresent(const PartRefKey & key)
     {
         if (e.code() != ErrorCodes::FILE_DOESNT_EXIST)
             throw;
+        eraseView(key);
         return;   /// raced away between the gate and dropRef — nothing was actually dropped here
     }
-    /// Phase 4: eraseView(key)
-    ProfileEvents::increment(ProfileEvents::CasPartFolderViewInvalidations);
-    recordDecision(key, LastDecision::Invalidated, nullptr);
+    eraseView(key);
 }
 
 void CachedPartFolderAccess::dropRefBestEffort(const PartRefKey & key) noexcept
@@ -163,33 +290,37 @@ void CachedPartFolderAccess::dropRefBestEffort(const PartRefKey & key) noexcept
     {
         /// Best-effort destructor/rollback cleanup: debris is GC-reclaimed, never a masked throw.
     }
-    /// Phase 4: eraseView(key) — deliberately ALSO on the swallowed-failure path (spec §Two-Level API).
-    ProfileEvents::increment(ProfileEvents::CasPartFolderViewInvalidations);
-    recordDecision(key, LastDecision::Invalidated, nullptr);
+    /// eraseView(key) deliberately ALSO on the swallowed-failure path (spec §Two-Level API): in this
+    /// destructor/rollback context the ref's durable state is unknown, so dropping the view is the
+    /// conservative direction.
+    eraseView(key);
 }
 
 void CachedPartFolderAccess::dropNamespace(const Cas::RootNamespace & ns)
 {
     store->dropNamespace(ns);
-    /// Phase 4: erase every view whose key is in `ns`. Nothing enumerates the namespace's keys
-    /// cheaply until then, so per-key `recordDecision` is skipped here (spec §Observability).
+    if (view_cache)
+    {
+        const String prefix = ns.string() + '\0';
+        view_cache->remove([&](const String & k, const auto &) { return k.starts_with(prefix); });
+    }
     ProfileEvents::increment(ProfileEvents::CasPartFolderViewInvalidations);
 }
 
 void CachedPartFolderAccess::recordDecision(const PartRefKey & key, LastDecision decision,
-                                            const PartFolderView * view) const
+                                            const PartFolderView * view, bool retained) const
 {
     std::lock_guard lock(explain_mutex);
     if (explain_map.size() >= EXPLAIN_MAX_ENTRIES)
         explain_map.clear();
     auto & e = explain_map[key.cacheKey()];
     e.last_decision = decision;
+    e.retained = retained;
     if (view)
     {
         e.manifest_ref = Cas::manifestRefDebugString(view->manifestId().ref);
         e.estimated_bytes = view->estimatedBytes();
     }
-    /// `retained` stays false until Phase 4 sets it on insert/erase.
 }
 
 CachedPartFolderAccess::ExplainResult CachedPartFolderAccess::explain(const PartRefKey & key) const
@@ -203,6 +334,8 @@ void CachedPartFolderAccess::clearForTest()
 {
     std::lock_guard lock(explain_mutex);
     explain_map.clear();
+    if (view_cache)
+        view_cache->clear();
 }
 
 }

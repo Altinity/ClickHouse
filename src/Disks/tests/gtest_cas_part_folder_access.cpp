@@ -40,6 +40,35 @@ Cas::ManifestId publishPart(const Cas::StorePtr & store, const Cas::RootNamespac
     return id;
 }
 
+ContentAddressed::CachedPartFolderAccess::CacheParams cacheOn()
+{
+    return {.cache_bytes = 64ULL << 20, .max_entries = 10000, .max_entry_bytes = 16ULL << 20};
+}
+
+}
+
+TEST(CasPartFolderAccess, RetainedHitSkipsManifestHead)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openStoreForTest(backend);
+    const Cas::Layout layout("p");
+    const Cas::RootNamespace ns{"srv/t1"};
+    ContentAddressed::CachedPartFolderAccess access(store, cacheOn());
+    const auto id = publishPart(store, ns, "part_1", {inlineEntry("checksums.txt", "cs")});
+    const ContentAddressed::PartRefKey key{ns, "part_1"};
+    const String manifest_key = layout.manifestKey(id);
+
+    backend->resetCounts();
+    for (int i = 0; i < 5; ++i)
+        ASSERT_NE(access.getView(key, ContentAddressed::Freshness::CachedForLoad), nullptr);
+
+    /// The one-GET goal (spec acceptance 4): ONE body GET, ONE mandatory HEAD (the cold build);
+    /// every subsequent CachedForLoad call is a validated hit — zero manifest ops.
+    EXPECT_EQ(backend->getCount(manifest_key), 1u);
+    EXPECT_EQ(backend->headCount(manifest_key), 1u);
+    EXPECT_TRUE(access.explain(key).retained);
+    EXPECT_EQ(access.explain(key).last_decision,
+              ContentAddressed::CachedPartFolderAccess::LastDecision::Hit);
 }
 
 TEST(CasPartFolderAccess, GetViewServesCommittedFolder)

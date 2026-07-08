@@ -2,7 +2,10 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartFolderView.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartRefKey.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
+#include <Common/CacheBase.h>
+#include <Common/CurrentMetrics.h>
 #include <functional>
+#include <future>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -17,14 +20,31 @@ namespace DB::ContentAddressed
 
 /// The single facade for committed content-addressed part-folder access (spec
 /// 2026-07-08-cas-part-folder-cache). Reads build immutable `PartFolderView`s; committed part-ref
-/// mutations are facade methods so cache effects (Phase 4) are write-through, never a caller
-/// responsibility. Phase-2 shape: NO retained state — `getView` builds a fresh view per call; the
-/// call graph is already final, retention (Phase 4) only adds the retained-map consultation.
+/// mutations are facade methods so cache effects are write-through, never a caller responsibility.
+/// Phase 4: a bounded retained-view map (`Common/CacheBase`) is consulted for `CachedForLoad` and
+/// validated against every fresh resolve (§The Validate-On-Hit Protocol) — `cache_bytes == 0`
+/// (`CacheParams{}`, the unit-test default) keeps the Phase-2/3 call graph byte-identical.
 /// Thread-safe; shared by all readers and transactions of one disk.
 class CachedPartFolderAccess
 {
 public:
-    explicit CachedPartFolderAccess(Cas::StorePtr store_) : store(std::move(store_)) {}
+    /// Retention knobs (spec §Cache State And Memory Bound). `cache_bytes == 0` (the unit-test
+    /// default) disables retention entirely — the disk factory default is 64 MiB.
+    struct CacheParams
+    {
+        uint64_t cache_bytes = 0;            /// 0 = retention disabled (unit-test default;
+                                             /// the DISK default is 64 MiB, set in the factory)
+        uint64_t max_entries = 10000;
+        uint64_t max_entry_bytes = 16ULL << 20;
+    };
+
+    /// NOTE: `CacheParams params_ = {}` cannot be a default ARGUMENT here — Clang's complete-class-
+    /// context rule requires the enclosing class (`CachedPartFolderAccess`) to be complete before a
+    /// nested class's (`CacheParams`) default member initializers can be evaluated, and a default
+    /// argument written inside the class body is evaluated too early. Two overloads sidestep it; the
+    /// single-arg form default-constructs `CacheParams` (retention disabled) out-of-line.
+    explicit CachedPartFolderAccess(Cas::StorePtr store_);
+    CachedPartFolderAccess(Cas::StorePtr store_, CacheParams params_);
 
     /// Resolve + validated manifest read, joined into a view. nullptr = the ref is absent.
     /// EVERY mode re-proves the manifest body via `readManifestShared`'s mandatory HEAD in this
@@ -68,7 +88,7 @@ public:
     { Hit, MutableRefresh, Mismatch, Miss, OversizedBypass, StrictBypass, ForceFreshRead, Invalidated };
     struct ExplainResult
     {
-        bool retained = false;             /// false throughout Phase 3 (no retained map yet)
+        bool retained = false;             /// whether the last-served view is currently retained
         LastDecision last_decision = LastDecision::Miss;
         String manifest_ref;               /// manifestRefDebugString of the last-served view
         size_t estimated_bytes = 0;
@@ -79,6 +99,25 @@ public:
 
 private:
     Cas::StorePtr store;
+    CacheParams params;
+
+    struct ViewWeight
+    {
+        size_t operator()(const PartFolderView & v) const { return v.estimatedBytes(); }
+    };
+    using ViewCache = CacheBase<String, PartFolderView, std::hash<String>, ViewWeight>;
+
+    /// nullptr <=> retention disabled (cache_bytes == 0): same call graph, no retained map.
+    std::unique_ptr<ViewCache> view_cache;
+
+    /// Single-flight per PartRefKey for the build path: concurrent cold builders of the same key
+    /// share ONE readManifestShared. NEVER held across I/O — the map only hands out futures.
+    mutable std::mutex inflight_mutex;
+    mutable std::unordered_map<String, std::shared_future<std::shared_ptr<const PartFolderView>>> inflight;
+
+    std::shared_ptr<const PartFolderView> buildView(
+        const PartRefKey & key, const Cas::Resolved & resolved, Freshness freshness) const;
+    void eraseView(const PartRefKey & key);
 
     /// Decision journal for explain (test/log-only; spec §Observability). Bounded by wholesale
     /// clear — debug state, never consulted by the read/write paths.
@@ -86,7 +125,7 @@ private:
     mutable std::mutex explain_mutex;
     mutable std::unordered_map<String, ExplainResult> explain_map;
     void recordDecision(const PartRefKey & key, LastDecision decision,
-                        const PartFolderView * view) const;
+                        const PartFolderView * view, bool retained) const;
 };
 
 }
