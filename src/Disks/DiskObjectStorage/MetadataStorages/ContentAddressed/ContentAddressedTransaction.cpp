@@ -100,15 +100,7 @@ ContentAddressedTransaction::~ContentAddressedTransaction()
     /// GC-reclaimable debris (and the replicated restart's ZK reconcile detaches an unexpected
     /// part), never a masked exception out of the destructor.
     for (const auto & [ns, ref] : rename_published_refs)
-    {
-        try
-        {
-            metadata_storage.store()->dropRef(ns, ref);
-        }
-        catch (...) // NOLINT(bugprone-empty-catch)
-        {
-        }
-    }
+        metadata_storage.partAccess().dropRefBestEffort({ns, ref});
 
     for (auto & [key, st] : parts)
     {
@@ -202,25 +194,6 @@ bool ContentAddressedTransaction::republishRef(
     return true;
 }
 
-void ContentAddressedTransaction::dropRefIfPresent(const Cas::RootNamespace & ns, const std::string & ref)
-{
-    /// resolveRef gates the common case (a tmp ref that was never committed is a no-op, not an error);
-    /// dropRef re-reads the shard inside its own CAS loop, so a concurrent drop can land in the window
-    /// between our resolve and that re-read — surfacing as FILE_DOESNT_EXIST. Removal is replay-safe,
-    /// so a ref that is already gone is success, not failure; any other error still propagates.
-    if (!metadata_storage.store()->resolveRef(ns, ref, /*allow_stale=*/true))
-        return;
-    try
-    {
-        metadata_storage.store()->dropRef(ns, ref);
-    }
-    catch (const Exception & e)
-    {
-        if (e.code() != ErrorCodes::FILE_DOESNT_EXIST)
-            throw;
-    }
-}
-
 ContentAddressedTransaction::PartStaging * ContentAddressedTransaction::findStaging(
     const ContentAddressedMetadataStorage::Route & r)
 {
@@ -294,7 +267,7 @@ bool ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
         /// fill-in/rewrite) and metadata_version bumps on a COMMITTED part.
         if (!st.mutable_files.empty() || !st.mutable_removed.empty())
         {
-            metadata_storage.store()->updateRefPayload(ns, ref, [&](Cas::RootRef & payload)
+            metadata_storage.partAccess().updateMutableFiles({ns, ref}, [&](Cas::RootRef & payload)
             {
                 for (const auto & [name, bytes] : st.mutable_files)
                     payload.mutable_files[name] = bytes;
@@ -340,9 +313,8 @@ bool ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
         st.build->putBlob(Cas::BlobId(Cas::u128ToHex(pb.hash)), std::move(source));
     }
 
-    const bool ref_existed = metadata_storage.store()->resolveRef(ns, ref).has_value();
-    st.build->setPendingMutableFiles(st.mutable_files);
-    st.build->promote(ns, ref, st.build->buildId(), id);
+    const bool ref_existed = metadata_storage.partAccess().existsRef({ns, ref}, ContentAddressed::Freshness::ForceFresh);
+    metadata_storage.partAccess().promoteBuild(*st.build, {ns, ref}, st.build->buildId(), id, st.mutable_files);
     st.published = true;
     return !ref_existed;
 }
@@ -378,15 +350,7 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
         /// Compensating rollback. Best-effort: a ref we cannot unpublish becomes unreferenced debris
         /// (GC-reclaimed); never mask the original failure with a rollback failure.
         for (const auto & [ns, ref] : created_refs)
-        {
-            try
-            {
-                metadata_storage.store()->dropRef(ns, ref);
-            }
-            catch (...) // NOLINT(bugprone-empty-catch)
-            {
-            }
-        }
+            metadata_storage.partAccess().dropRefBestEffort({ns, ref});
         throw;
     }
     committed = true;
@@ -709,7 +673,7 @@ void ContentAddressedTransaction::removeDirectory(const std::string & path)
     /// storage has no real directories; tables/detached/shadow are removed via removeRecursive).
     if (auto r = routeOf(path); r && !r->ref.empty() && r->file.empty())
     {
-        dropRefIfPresent(r->ns, r->ref);
+        metadata_storage.partAccess().dropRefIfPresent(r->refKey());
         return;
     }
 }
@@ -726,12 +690,12 @@ void ContentAddressedTransaction::removeRecursive(const std::string & path, cons
         if (auto p = ContentAddressed::parsePartFilePath(path); p && !p->backup_name.empty() && p->file.empty())
         {
             const auto ns = ContentAddressedMetadataStorage::shadowNamespace(p->shadow_table_dir);
-            dropRefIfPresent(ns, p->part_name);
+            metadata_storage.partAccess().dropRefIfPresent({ns, p->part_name});
             return;
         }
         if (ContentAddressed::endsWithTableUuidPair(path))
         {
-            metadata_storage.store()->dropNamespace(ContentAddressedMetadataStorage::shadowNamespace(path));
+            metadata_storage.partAccess().dropNamespace(ContentAddressedMetadataStorage::shadowNamespace(path));
             return;
         }
         /// Backup root / intermediate dir (SYSTEM UNFREEZE WITH NAME): drop every shadow
@@ -740,7 +704,7 @@ void ContentAddressedTransaction::removeRecursive(const std::string & path, cons
         while (!prefix.empty() && prefix.back() == '/')
             prefix.pop_back();
         for (const auto & ns : metadata_storage.store()->listNamespaces(prefix + "/"))
-            metadata_storage.store()->dropNamespace(Cas::RootNamespace{ns});
+            metadata_storage.partAccess().dropNamespace(Cas::RootNamespace{ns});
         return;
     }
 
@@ -748,7 +712,7 @@ void ContentAddressedTransaction::removeRecursive(const std::string & path, cons
     /// file go in one dropNamespace.
     if (auto uuid = ContentAddressed::parseTableUuid(path))
     {
-        metadata_storage.store()->dropNamespace(metadata_storage.liveNamespace(*uuid));
+        metadata_storage.partAccess().dropNamespace(metadata_storage.liveNamespace(*uuid));
         return;
     }
 
@@ -759,13 +723,13 @@ void ContentAddressedTransaction::removeRecursive(const std::string & path, cons
         if (r && r->ref.empty() && p->part_name == ContentAddressed::kDetachedDirName)
         {
             for (const auto & ref : metadata_storage.detachedRefNames(r->ns))
-                dropRefIfPresent(r->ns, ref);
+                metadata_storage.partAccess().dropRefIfPresent({r->ns, ref});
             return;
         }
         /// A single part dir (live or detached): drop its ref.
         if (r && !r->ref.empty() && r->file.empty())
         {
-            dropRefIfPresent(r->ns, r->ref);
+            metadata_storage.partAccess().dropRefIfPresent(r->refKey());
             return;
         }
         /// A projection subdir: virtual (nested in the parent tree) - removal is a no-op; the
@@ -807,7 +771,7 @@ void ContentAddressedTransaction::createHardLink(const std::string & path_from, 
                 return;
             }
         /// Force-fresh (Pillar B): projection hardlink source — carry the current payload/tree_id.
-        auto resolved = metadata_storage.store()->resolveRef(src->ns, src->ref);
+        auto resolved = metadata_storage.partAccess().resolve(src->refKey(), ContentAddressed::Freshness::ForceFresh);
         if (!resolved || !resolved->mutable_files.contains(src->file))
             throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
                 "ContentAddressed: createHardLink source mutable file missing: {}", path_from);
@@ -912,7 +876,7 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
                 for (const auto & name : metadata_storage.store()->listNamespaceFiles(from_ns))
                     if (auto bytes = metadata_storage.store()->getNamespaceFile(from_ns, name))
                         metadata_storage.store()->putNamespaceFile(to_ns, name, *bytes);
-                metadata_storage.store()->dropNamespace(from_ns);
+                metadata_storage.partAccess().dropNamespace(from_ns);
             }
             catch (...)
             {
@@ -1055,7 +1019,7 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
             /// over the just-published real manifest CLOBBERS the part (skip-index / statistics files
             /// vanish from the tree, B183). Drop the spurious scratch ref instead — its blobs become
             /// unreachable and GC reclaims them; the real manifest at `dst` stands.
-            dropRefIfPresent(src->ns, src->ref);
+            metadata_storage.partAccess().dropRefIfPresent(src->refKey());
             return;
         }
 
@@ -1184,7 +1148,7 @@ void ContentAddressedTransaction::moveFile(const std::string & path_from, const 
     if (ContentAddressed::isMutablePerPartFile(dst->file))
     {
         /// Force-fresh (Pillar B): RENAME/move source read — stale mutable_files must not carry to dst.
-        auto resolved = metadata_storage.store()->resolveRef(src->ns, src->ref);
+        auto resolved = metadata_storage.partAccess().resolve(src->refKey(), ContentAddressed::Freshness::ForceFresh);
         if (!resolved || !resolved->mutable_files.contains(src->file))
             throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
                 "ContentAddressed: moveFile source mutable file missing: {}", path_from);

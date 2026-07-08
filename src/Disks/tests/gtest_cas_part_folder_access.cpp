@@ -84,3 +84,37 @@ TEST(CasPartFolderAccess, GetViewFailsClosedOnMissingBody)
                            ContentAddressed::Freshness::StrictValidate})
         expectThrowsCode(ErrorCodes::FILE_DOESNT_EXIST, [&] { access.getView(key, freshness); });
 }
+
+TEST(CasPartFolderAccess, WritePrimitivesRoundTrip)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openStoreForTest(backend);
+    const Cas::RootNamespace ns{"srv/t1"};
+    ContentAddressed::CachedPartFolderAccess access(store);
+    const ContentAddressed::PartRefKey key{ns, "part_1"};
+
+    /// promoteBuild: the transaction's terminal publish step, through the facade.
+    auto build = store->startBuild(Cas::BuildInfo{.intended_ref = ns.string() + "/part_1",
+                                                  .intended_namespace = ns, .op = Cas::ProvenanceOp::Insert});
+    const Cas::ManifestId id = build->stageManifest({inlineEntry("checksums.txt", "cs")});
+    build->precommitAdd(ns, "part_1", id);
+    access.promoteBuild(*build, key, build->buildId(), id, {{"txn_version.txt", "v1"}});
+    ASSERT_TRUE(access.existsRef(key, ContentAddressed::Freshness::ForceFresh));
+
+    /// updateMutableFiles is visible to a force-fresh resolve immediately.
+    access.updateMutableFiles(key, [](Cas::RootRef & payload) { payload.mutable_files["txn_version.txt"] = "v2"; });
+    auto resolved = access.resolve(key, ContentAddressed::Freshness::ForceFresh);
+    ASSERT_TRUE(resolved.has_value());
+    EXPECT_EQ(resolved->mutable_files.at("txn_version.txt"), "v2");
+
+    /// dropRefIfPresent: replay-safe (absent ref is success, not failure).
+    access.dropRefIfPresent(key);
+    EXPECT_FALSE(access.existsRef(key, ContentAddressed::Freshness::ForceFresh));
+    access.dropRefIfPresent(key);                              /// second drop: no-op, no throw
+    access.dropRefBestEffort(key);                             /// noexcept even when absent
+
+    /// dropNamespace clears the whole namespace.
+    publishPart(store, ns, "part_2", {inlineEntry("checksums.txt", "cs")});
+    access.dropNamespace(ns);
+    EXPECT_FALSE(access.existsRef({ns, "part_2"}, ContentAddressed::Freshness::ForceFresh));
+}

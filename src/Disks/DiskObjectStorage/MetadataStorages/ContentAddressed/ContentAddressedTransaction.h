@@ -130,10 +130,6 @@ private:
     bool republishRef(const Cas::RootNamespace & src_ns, const std::string & src_ref,
                       const Cas::RootNamespace & dst_ns, const std::string & dst_ref);
 
-    /// Idempotent ref removal: drop `ref` if it resolves, tolerating a concurrent drop that races
-    /// between the resolve and the drop (the removal unit is meant to be replay-safe).
-    void dropRefIfPresent(const Cas::RootNamespace & ns, const std::string & ref);
-
     void cleanupPendingTempFiles() noexcept;   /// B188: remove all parts' pending temp files (commit/abort/dtor)
 
     /// B190 Task 4: unified adopt helper that collapses the 6 inline pending/uploaded dispatch
