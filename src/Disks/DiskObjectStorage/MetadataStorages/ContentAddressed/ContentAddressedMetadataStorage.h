@@ -3,6 +3,7 @@
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedExchange.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartPathParser.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartRefKey.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/CasGcScheduler.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include <Interpreters/Context_fwd.h>
@@ -180,6 +181,9 @@ public:
         /// `detached/<part>` (a ref inside the table namespace, not a separate namespace).
         std::string ref;
         std::string file;   /// empty => the path is the part dir itself
+
+        /// The (ns, ref) identity subset — what the part-folder access layer keys on.
+        ContentAddressed::PartRefKey refKey() const { return {ns, ref}; }
     };
     std::optional<Route> route(const ContentAddressed::PartFilePath & p) const;
 
