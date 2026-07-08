@@ -2,6 +2,8 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <gtest/gtest.h>
+#include <latch>
+#include <thread>
 
 namespace DB::ErrorCodes
 {
@@ -238,4 +240,244 @@ TEST(CasPartFolderAccess, BaselineRequestCountsWithoutRetention)
     /// this test pins the numbers Phase 4 improves.
     EXPECT_EQ(backend->getCount(manifest_key), 1u);
     EXPECT_EQ(backend->headCount(manifest_key), static_cast<uint64_t>(n));
+}
+
+/// ==== Phase 4 (retention) semantics battery: spec §Testing acceptance criteria ====
+
+TEST(CasPartFolderAccess, MutableRefreshWithoutManifestRead)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openStoreForTest(backend);
+    const Cas::Layout layout("p");
+    const Cas::RootNamespace ns{"srv/t1"};
+    ContentAddressed::CachedPartFolderAccess access(store, cacheOn());
+    const auto id = publishPart(store, ns, "part_1", {inlineEntry("f", "x")}, {{"txn_version.txt", "v1"}});
+    const ContentAddressed::PartRefKey key{ns, "part_1"};
+    const String manifest_key = layout.manifestKey(id);
+
+    ASSERT_NE(access.getView(key, ContentAddressed::Freshness::CachedForLoad), nullptr);   /// retained
+    /// RAW-store mutation: the write bypasses the facade (validate-on-hit must cope — this is the
+    /// mutation-site-not-routed / foreign-writer shape the compare exists for). The retained entry
+    /// survives, so the next read exercises the manifest-match + mutable-drift CLONE path.
+    store->updateRefPayload(ns, "part_1", [](Cas::RootRef & p) { p.mutable_files["txn_version.txt"] = "v2"; });
+    backend->resetCounts();
+
+    auto view = access.getView(key, ContentAddressed::Freshness::CachedForLoad);
+    ASSERT_NE(view, nullptr);
+    EXPECT_EQ(view->mutableBytes("txn_version.txt"), std::optional<String>("v2"));   /// read-your-writes
+    EXPECT_EQ(backend->headCount(manifest_key), 0u);                                 /// clone: no HEAD
+    EXPECT_EQ(backend->getCount(manifest_key), 0u);                                  /// and no GET
+    EXPECT_EQ(access.explain(key).last_decision,
+              ContentAddressed::CachedPartFolderAccess::LastDecision::MutableRefresh);
+}
+
+TEST(CasPartFolderAccess, WriteThroughEraseThenRebuild)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openStoreForTest(backend);
+    const Cas::Layout layout("p");
+    const Cas::RootNamespace ns{"srv/t1"};
+    ContentAddressed::CachedPartFolderAccess access(store, cacheOn());
+    const auto id = publishPart(store, ns, "part_1", {inlineEntry("f", "x")}, {{"txn_version.txt", "v1"}});
+    const ContentAddressed::PartRefKey key{ns, "part_1"};
+    const String manifest_key = layout.manifestKey(id);
+
+    ASSERT_NE(access.getView(key, ContentAddressed::Freshness::CachedForLoad), nullptr);
+    access.updateMutableFiles(key, [](Cas::RootRef & p) { p.mutable_files["txn_version.txt"] = "v2"; });
+    backend->resetCounts();
+
+    auto view = access.getView(key, ContentAddressed::Freshness::CachedForLoad);
+    ASSERT_NE(view, nullptr);
+    EXPECT_EQ(view->mutableBytes("txn_version.txt"), std::optional<String>("v2"));
+    EXPECT_EQ(backend->headCount(manifest_key), 1u);   /// erase => cold rebuild re-HEADs...
+    EXPECT_EQ(backend->getCount(manifest_key), 0u);    /// ...but the decode cache absorbs the GET
+    EXPECT_EQ(access.explain(key).last_decision,
+              ContentAddressed::CachedPartFolderAccess::LastDecision::Miss);
+}
+
+TEST(CasPartFolderAccess, MismatchRebuildAfterRepublish)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openStoreForTest(backend);
+    const Cas::Layout layout("p");
+    const Cas::RootNamespace ns{"srv/t1"};
+    ContentAddressed::CachedPartFolderAccess access(store, cacheOn());
+    publishPart(store, ns, "part_1", {inlineEntry("f", "orig")});
+    const ContentAddressed::PartRefKey key{ns, "part_1"};
+
+    ASSERT_NE(access.getView(key, ContentAddressed::Freshness::CachedForLoad), nullptr);   /// retained
+
+    /// Drop + republish the SAME ref name with DIFFERENT content through the raw Core protocol (no
+    /// facade => no write-through erase): the retained entry survives with a manifest_id that no
+    /// longer resolves — the next CachedForLoad hits the manifest-changed compare (step 2c).
+    store->dropRef(ns, "part_1");
+    const auto id2 = publishPart(store, ns, "part_1", {inlineEntry("f", "DIFFERENT")});
+    const String manifest_key2 = layout.manifestKey(id2);
+    backend->resetCounts();
+
+    auto view = access.getView(key, ContentAddressed::Freshness::CachedForLoad);
+    ASSERT_NE(view, nullptr);
+    EXPECT_NE(view->findFile("f"), nullptr);
+    EXPECT_EQ(view->findFile("f")->inline_bytes, "DIFFERENT");    /// never the stale view
+    EXPECT_EQ(backend->getCount(manifest_key2), 1u);              /// one new manifest GET
+    EXPECT_EQ(access.explain(key).last_decision,
+              ContentAddressed::CachedPartFolderAccess::LastDecision::Miss);   /// rebuilt, now retained
+    EXPECT_TRUE(access.explain(key).retained);
+}
+
+TEST(CasPartFolderAccess, ForceFreshFailsClosedWhileRetainedViewExists)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openStoreForTest(backend);
+    const Cas::Layout layout("p");
+    const Cas::RootNamespace ns{"srv/t1"};
+    ContentAddressed::CachedPartFolderAccess access(store, cacheOn());
+    const auto id = publishPart(store, ns, "part_1", {inlineEntry("f", "x")});
+    const ContentAddressed::PartRefKey key{ns, "part_1"};
+
+    ASSERT_NE(access.getView(key, ContentAddressed::Freshness::CachedForLoad), nullptr);   /// retained
+    deleteManifestBody(*backend, layout, id);   /// protocol violation: live body vanishes
+
+    /// Write-evidence and strict paths surface INV-NO-DANGLE immediately (mandatory HEAD)...
+    expectThrowsCode(ErrorCodes::FILE_DOESNT_EXIST,
+        [&] { access.getView(key, ContentAddressed::Freshness::ForceFresh); });
+    expectThrowsCode(ErrorCodes::FILE_DOESNT_EXIST,
+        [&] { access.getView(key, ContentAddressed::Freshness::StrictValidate); });
+
+    /// ...while a validated CachedForLoad hit still serves the immutable decode — the documented
+    /// residual delta (spec §Staleness Equivalence): detection deferred, never for write evidence.
+    EXPECT_NE(access.getView(key, ContentAddressed::Freshness::CachedForLoad), nullptr);
+}
+
+TEST(CasPartFolderAccess, AbsenceIsNeverRetained)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openStoreForTest(backend);
+    const Cas::RootNamespace ns{"srv/t1"};
+    ContentAddressed::CachedPartFolderAccess access(store, cacheOn());
+    publishPart(store, ns, "part_1", {inlineEntry("f", "x")});
+    const ContentAddressed::PartRefKey key{ns, "part_1"};
+
+    ASSERT_NE(access.getView(key, ContentAddressed::Freshness::CachedForLoad), nullptr);   /// retained
+    access.dropRef(key);
+    EXPECT_EQ(access.getView(key, ContentAddressed::Freshness::CachedForLoad), nullptr);   /// absent: nullptr, never retained
+
+    /// Re-publish under the SAME ref name: immediately visible, no stale absence remembered.
+    publishPart(store, ns, "part_1", {inlineEntry("f", "y")});
+    auto view = access.getView(key, ContentAddressed::Freshness::CachedForLoad);
+    ASSERT_NE(view, nullptr);
+    EXPECT_EQ(view->inlineBytes("f"), std::optional<String>("y"));
+}
+
+TEST(CasPartFolderAccess, OversizedViewServedNotRetained)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openStoreForTest(backend);
+    const Cas::Layout layout("p");
+    const Cas::RootNamespace ns{"srv/t1"};
+    /// max_entry_bytes = 1: every real view (>= the 256-byte fixed overhead alone) is oversized.
+    ContentAddressed::CachedPartFolderAccess access(store,
+        ContentAddressed::CachedPartFolderAccess::CacheParams{
+            .cache_bytes = 64ULL << 20, .max_entries = 10000, .max_entry_bytes = 1});
+    const auto id = publishPart(store, ns, "part_1", {inlineEntry("f", "x")});
+    const ContentAddressed::PartRefKey key{ns, "part_1"};
+    const String manifest_key = layout.manifestKey(id);
+
+    auto view1 = access.getView(key, ContentAddressed::Freshness::CachedForLoad);
+    ASSERT_NE(view1, nullptr);
+    EXPECT_FALSE(access.explain(key).retained);
+    EXPECT_EQ(access.explain(key).last_decision,
+              ContentAddressed::CachedPartFolderAccess::LastDecision::OversizedBypass);
+
+    const uint64_t head_before = backend->headCount(manifest_key);
+    auto view2 = access.getView(key, ContentAddressed::Freshness::CachedForLoad);
+    ASSERT_NE(view2, nullptr);
+    EXPECT_GT(backend->headCount(manifest_key), head_before);   /// not retained: re-HEADs every call
+    EXPECT_FALSE(access.explain(key).retained);
+}
+
+TEST(CasPartFolderAccess, DisabledModeKeepsBaseline)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openStoreForTest(backend);
+    const Cas::Layout layout("p");
+    const Cas::RootNamespace ns{"srv/t1"};
+    /// CacheParams{} (cache_bytes == 0): the explicit disable switch, same as the single-arg ctor.
+    ContentAddressed::CachedPartFolderAccess access(store, ContentAddressed::CachedPartFolderAccess::CacheParams{});
+    const auto id = publishPart(store, ns, "part_1", {inlineEntry("checksums.txt", "cs")});
+    const ContentAddressed::PartRefKey key{ns, "part_1"};
+    const String manifest_key = layout.manifestKey(id);
+
+    backend->resetCounts();
+    constexpr int n = 5;
+    for (int i = 0; i < n; ++i)
+        ASSERT_NE(access.getView(key, ContentAddressed::Freshness::CachedForLoad), nullptr);
+
+    /// Exactly the Phase-3 baseline: bytes=0 restores the no-retention call graph byte-for-byte.
+    EXPECT_EQ(backend->getCount(manifest_key), 1u);
+    EXPECT_EQ(backend->headCount(manifest_key), static_cast<uint64_t>(n));
+    EXPECT_FALSE(access.explain(key).retained);
+}
+
+TEST(CasPartFolderAccess, SingleFlightColdBuild)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openStoreForTest(backend);
+    const Cas::Layout layout("p");
+    const Cas::RootNamespace ns{"srv/t1"};
+    ContentAddressed::CachedPartFolderAccess access(store, cacheOn());
+    const auto id = publishPart(store, ns, "part_1", {inlineEntry("f", "x")});
+    const ContentAddressed::PartRefKey key{ns, "part_1"};
+    const String manifest_key = layout.manifestKey(id);
+
+    backend->resetCounts();
+    constexpr int k = 8;
+    std::latch start_gate(k);
+    std::vector<std::thread> threads;
+    std::vector<std::shared_ptr<const ContentAddressed::PartFolderView>> results(k);
+    for (int i = 0; i < k; ++i)
+        threads.emplace_back([&, i]
+        {
+            start_gate.arrive_and_wait();
+            results[i] = access.getView(key, ContentAddressed::Freshness::CachedForLoad);
+        });
+    for (auto & t : threads)
+        t.join();
+
+    for (const auto & r : results)
+        EXPECT_NE(r, nullptr);
+    EXPECT_EQ(backend->getCount(manifest_key), 1u);   /// single-flight: ONE body GET for the burst
+}
+
+TEST(CasPartFolderAccess, DropNamespaceErasesAllViews)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openStoreForTest(backend);
+    const Cas::Layout layout("p");
+    const Cas::RootNamespace ns{"srv/t1"};
+    ContentAddressed::CachedPartFolderAccess access(store, cacheOn());
+    publishPart(store, ns, "part_1", {inlineEntry("f", "x")});
+    publishPart(store, ns, "part_2", {inlineEntry("f", "y")});
+    const ContentAddressed::PartRefKey key1{ns, "part_1"};
+    const ContentAddressed::PartRefKey key2{ns, "part_2"};
+
+    ASSERT_NE(access.getView(key1, ContentAddressed::Freshness::CachedForLoad), nullptr);   /// retained
+    ASSERT_NE(access.getView(key2, ContentAddressed::Freshness::CachedForLoad), nullptr);   /// retained
+    EXPECT_TRUE(access.explain(key1).retained);
+    EXPECT_TRUE(access.explain(key2).retained);
+
+    access.dropNamespace(ns);
+
+    /// Re-publish part_1 under the SAME ref name: the dropped namespace's retained entries must be
+    /// gone (a stale key1 view must never be served, and a residual entry would masquerade as
+    /// "retained" without ever going through validate-on-hit for the NEW manifest).
+    const auto id1b = publishPart(store, ns, "part_1", {inlineEntry("f", "z")});
+    const String manifest_key1b = layout.manifestKey(id1b);
+    backend->resetCounts();
+    auto view = access.getView(key1, ContentAddressed::Freshness::CachedForLoad);
+    ASSERT_NE(view, nullptr);
+    EXPECT_EQ(view->inlineBytes("f"), std::optional<String>("z"));
+    EXPECT_EQ(backend->getCount(manifest_key1b), 1u);   /// cold rebuild, not a stale hit
+
+    EXPECT_FALSE(access.explain(key2).retained);   /// dropped too, even though never re-touched
 }

@@ -325,9 +325,21 @@ void CachedPartFolderAccess::recordDecision(const PartRefKey & key, LastDecision
 
 CachedPartFolderAccess::ExplainResult CachedPartFolderAccess::explain(const PartRefKey & key) const
 {
-    std::lock_guard lock(explain_mutex);
-    const auto it = explain_map.find(key.cacheKey());
-    return it == explain_map.end() ? ExplainResult{} : it->second;
+    ExplainResult result;
+    {
+        std::lock_guard lock(explain_mutex);
+        const auto it = explain_map.find(key.cacheKey());
+        if (it != explain_map.end())
+            result = it->second;
+    }
+    /// `retained` is reported LIVE against the cache, not from the decision snapshot: `dropNamespace`
+    /// erases every key of a namespace via one CacheBase::remove(predicate) sweep without a per-key
+    /// recordDecision call (nothing enumerates the removed keys cheaply — spec §Observability), so a
+    /// snapshot value would go stale for every key it touches except the one last read. A live
+    /// membership check is authoritative for every eraser (write-through or namespace-wide) and
+    /// costs one more CacheBase lookup on this test/log-only path.
+    result.retained = view_cache && view_cache->get(key.cacheKey()) != nullptr;
+    return result;
 }
 
 void CachedPartFolderAccess::clearForTest()
