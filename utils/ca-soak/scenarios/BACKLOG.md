@@ -1428,3 +1428,27 @@ infra/measurement gaps (not CA defects — all had dangling=0 + agreement):
   of the read-path/observability refactor.
 - **Proposed action:** triage separately (GC round/condemn timing + shadow-root removal). Add `CaWiring*`
   to a gate going forward. Deferred (not caused by current work; needs GC-domain investigation).
+
+## PFC-PHASE4-OBSERVABILITY-MINORS: part-folder cache retention — 3 diagnostic/observability minors
+
+- **Logged (UTC):** 2026-07-09
+- **Severity:** finding (observability/diagnostic only; retention correctness reviewed clean — no
+  staleness/fail-closed/deadlock issues). From the Phase-4 retention review.
+- **Items:**
+  1. **(Medium, deferred)** `CasPartFolderViewEvictions` ProfileEvent is DEAD — declared but never
+     incremented. `CacheBase` exposes only `onEntryRemoval(weight_loss, ptr)` which fires for BOTH LRU
+     evictions AND explicit `remove()`/`clear()` (write-through erases, dropNamespace sweeps, clearForTest).
+     A correct eviction-only counter needs a `ViewCache` subclass overriding `onEntryRemoval` PLUS a guard
+     to exclude explicit-removal paths (with a minor cross-thread imprecision if an eviction races an
+     explicit remove). Non-trivial for an observability-only counter → deferred. All OTHER facade counters
+     (hits/misses/refreshes/mismatches/invalidations/oversized/manifest-gets) are live.
+  2. **(Low)** `explain().retained` is a LIVE `view_cache->get()` membership check (deviation from the old
+     decision-journal snapshot, needed because dropNamespace skips per-key recording): (a) not an atomic
+     snapshot with the `explain_map` read; (b) `get()` bumps LRU recency as a side effect of a "read-only"
+     diagnostic. Test/log-only path — acceptable; worth a one-line comment.
+  3. **(Low)** Single-flight followers each re-run the retain/`recordDecision`/`CasPartFolderViewMisses`
+     logic after `future.get()`, so k concurrent cold waiters increment `Misses` k times (not once per cold
+     key). Correct + idempotent; only inflates the miss counter under concurrency. No test asserts the
+     count. Consider having only the leader record.
+- **Proposed action:** address #1 if/when eviction visibility is needed (with the subclass approach above);
+  #2/#3 optional polish. None block the feature.
