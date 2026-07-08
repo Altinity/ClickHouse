@@ -385,14 +385,14 @@ std::vector<ReplicatedPartitionExportInfo> ExportPartitionManifestUpdatingTask::
         }
         info.exception_count = total_exception_count;
 
-        info.destination_file_paths_per_part = std::move(snapshot.destination_file_paths_per_part);
+        info.destination_file_paths_per_part = entry.destination_file_paths_per_part;
 
-        if (snapshot.commit_info)
+        if (entry.commit_info)
         {
-            info.committed_metadata_file = snapshot.commit_info->iceberg_metadata_file;
-            info.committed_manifest_list = snapshot.commit_info->iceberg_manifest_list;
-            info.committed_manifest_file = snapshot.commit_info->iceberg_manifest_file;
-            info.committed_marker_file = snapshot.commit_info->commit_marker_file;
+            info.committed_metadata_file = entry.commit_info->iceberg_metadata_file;
+            info.committed_manifest_list = entry.commit_info->iceberg_manifest_list;
+            info.committed_manifest_file = entry.commit_info->iceberg_manifest_file;
+            info.committed_marker_file = entry.commit_info->commit_marker_file;
         }
 
         infos.emplace_back(std::move(info));
@@ -558,25 +558,13 @@ void ExportPartitionManifestUpdatingTask::poll()
                 continue;
             }
 
-            /// If we already have the local entry, we need to update it if the status has changed or if there are new last exceptions.
-            
-            const bool last_exception_per_replica_changed = local_entry->last_exception_per_replica != last_exception_per_replica;
-            const bool destination_file_paths_per_part_changed = local_entry->destination_file_paths_per_part != destination_file_paths_per_part;
-            const bool needs_update = last_exception_per_replica_changed || destination_file_paths_per_part_changed || status_changed;
-
-            if (last_exception_per_replica_changed)
-            {
-                local_entry->last_exception_per_replica = std::move(last_exception_per_replica);
-            }
-
-            if (destination_file_paths_per_part_changed)
-            {
-                local_entry->destination_file_paths_per_part = std::move(destination_file_paths_per_part);
-            }
+            /// If we already have the local entry, we need to update it
+            local_entry->last_exception_per_replica = std::move(last_exception_per_replica);
+            local_entry->destination_file_paths_per_part = std::move(destination_file_paths_per_part);
+            local_entry->status = *status;
 
             if (status_changed)
             {
-                local_entry->status = *status;
                 if (local_entry->status != ExportReplicatedMergeTreePartitionTaskEntry::Status::PENDING)
                 {
                     /// terminal now - we no longer need to keep the data parts alive
@@ -589,6 +577,7 @@ void ExportPartitionManifestUpdatingTask::poll()
                     }
                 }
             }
+
             LOG_DEBUG(storage.log, "ExportPartition Manifest Updating Task: Skipping {}: already exists", key);
             
         }
@@ -796,11 +785,11 @@ void ExportPartitionManifestUpdatingTask::handleStatusChanges()
             /// Refresh per-part destination paths and commit_info on the status flip too,
             /// so the system table observes the COMPLETED state and the committed file
             /// paths in the same poll cycle.
-            if (auto fetched = readDestinationFilePathsPerPart(
+            const auto destination_file_paths_per_part = readDestinationFilePathsPerPart(
                     zk, fs::path(storage.zookeeper_path) / "exports" / key, key, storage.log.load());
-                !fetched.empty())
+            if (!destination_file_paths_per_part.empty())
             {
-                it->destination_file_paths_per_part = std::move(fetched);
+                it->destination_file_paths_per_part = std::move(destination_file_paths_per_part);
             }
 
             /// commit_info is written atomically with the COMPLETED status, so only read it on that
