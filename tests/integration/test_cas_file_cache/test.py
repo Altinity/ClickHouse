@@ -89,6 +89,10 @@ def test_cache_hits_on_repeated_reads():
         query_id=q1,
         settings={"enable_filesystem_cache": 1},
     )
+    # The cold read must POPULATE the cache (read-through), not just read from source: pin the write
+    # side so a config where the cache never fills cannot pass on the warm-scan check alone.
+    assert int(node.query("SELECT count() FROM system.filesystem_cache")) > 0
+
     q2 = "cas_cache_warm_scan"
     node.query(
         "SELECT sum(cityHash64(id, data)) FROM cas_cache_metrics",
