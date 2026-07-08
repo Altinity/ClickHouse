@@ -25,6 +25,7 @@ namespace ProfileEvents
     extern const Event CasGcRetiredGraduated;
     extern const Event CasGcRetiredRedeleted;
     extern const Event CasGcRetireReplaced;
+    extern const Event CasGcPrecommitRevisitForced;
     extern const Event CasGcHeartbeatFenceOuts;
     extern const Event CasGcFloorHeldByStaleAck;
 }
@@ -45,6 +46,13 @@ namespace DB::Cas
 
 namespace
 {
+
+/// Forward declarations for the watermark/precommit helpers defined lower in this file (another block of
+/// this same TU-unique unnamed namespace). `Gc::fold` and `Gc::computeDiscoverDecisions` above their
+/// definition point need these visible; `reclaimAbandonedPrecommit` sits after the definitions.
+std::optional<MountLease> floorForNamespace(Store & store, const RootNamespace & ns);
+bool isPrecommitDead(uint64_t writer_epoch, uint64_t build_sequence, const MountLease & w);
+std::optional<std::pair<uint64_t, uint64_t>> minLivePrecommit(const RootShard & root);
 
 UInt128 cityHash128(const String & bytes)
 {
@@ -888,6 +896,16 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         /// unfolded events that a manifest-body arrival can make foldable WITHOUT touching the shard
         /// (token unchanged) — Skip would park them forever.
         cov.classification = clamped ? 4 : (shard_changed ? 2 : 1);
+        /// Stamp the CURRENT live-precommit floor for the discover force-Read guard. Recomputed on EVERY
+        /// Read visit (after the journal was read AND after this round's reclaim removal was folded), so
+        /// once a reclaim's PrecommitRemove drops the last live precommit the coverage shows none — the
+        /// guard self-terminates and the token-stable shard is Skipped again.
+        if (const auto mlp = minLivePrecommit(root))
+        {
+            cov.has_live_precommit = true;
+            cov.min_live_precommit_writer_epoch = mlp->first;
+            cov.min_live_precommit_build_sequence = mlp->second;
+        }
         result.fold_seal.per_ns_shard[cursor_key] = cov;
         if (shard_changed)
             folded_any = true;
@@ -1438,7 +1456,24 @@ std::map<String, Gc::DiscoverDecision> Gc::computeDiscoverDecisions(const CasFol
         /// cursor there (a one-round lag, bounded and safe because the cursor undercount is caught
         /// before any delete decision — see the ABA-proof cursor comment in `fold()`).
         if (listed_it->second == sealed_it->second.folded_token)
+        {
+            /// Force-Read guard (sibling of the classification-4 clamped guard): a token-stable shard that
+            /// holds a live precommit the namespace watermark has proven dead must be re-folded so
+            /// reclaimAbandonedPrecommit runs — otherwise Skip parks the static shard forever and the
+            /// abandoned precommit's manifest orphans (INV-2). Self-terminating: the reclaim's removal
+            /// changes the shard token, so next round it is a normal changed->unchanged shard.
+            if (sealed_it->second.has_live_precommit)
+            {
+                if (const auto floor = floorForNamespace(*store, ns);
+                    floor && isPrecommitDead(sealed_it->second.min_live_precommit_writer_epoch,
+                                             sealed_it->second.min_live_precommit_build_sequence, *floor))
+                {
+                    ProfileEvents::increment(ProfileEvents::CasGcPrecommitRevisitForced);
+                    continue;   /// forced Read (already defaulted); do NOT mark Skip
+                }
+            }
             decisions[ck] = DiscoverDecision::Skip;
+        }
     }
 
     return decisions;
@@ -1989,6 +2024,31 @@ bool isPrecommitDead(uint64_t writer_epoch, uint64_t build_sequence, const Mount
     if (w.min_active == std::numeric_limits<uint64_t>::max())
         return true;
     return w.min_active > build_sequence;
+}
+
+/// The lexicographically-minimal {writer_epoch, build_sequence} among the shard's LIVE precommit bindings
+/// (owner-state replay: accumulate new_binding, drop old_binding; keep OwnerKind::Precommit survivors).
+/// nullopt when the shard holds no live precommit. This is the SAME replay reclaimAbandonedPrecommit does.
+std::optional<std::pair<uint64_t, uint64_t>> minLivePrecommit(const RootShard & root)
+{
+    std::vector<OwnerBinding> live;
+    for (const RootOwnerEvent & e : root.journal)
+    {
+        if (e.old_binding)
+            std::erase(live, *e.old_binding);
+        if (e.new_binding)
+            live.push_back(*e.new_binding);
+    }
+    std::optional<std::pair<uint64_t, uint64_t>> best;
+    for (const OwnerBinding & b : live)
+    {
+        if (b.owner_kind != OwnerKind::Precommit)
+            continue;
+        const std::pair<uint64_t, uint64_t> cur{b.manifest_ref.writer_epoch, b.manifest_ref.build_sequence};
+        if (!best || cur < *best)
+            best = cur;
+    }
+    return best;
 }
 
 }

@@ -60,10 +60,10 @@ TEST(CasDanglingPrecommit, AbandonedPrecommitOrphansManifestUntilFix)
     for (int i = 0; i < 5; ++i)
         gc.runRegularRound();
 
-    /// BUG (pre-fix): the manifest body is orphaned -- still present, never reclaimed.
-    /// After Task 4 this assertion is INVERTED (see Task 4 Step 4).
-    EXPECT_TRUE(backend->head(layout.manifestKey(id)).exists)
-        << "PRE-FIX: dangling precommit manifest is orphaned (Skip parks the shard, reclaim never runs)";
+    /// FIXED: the watermark-dead precommit forces a re-fold => reclaimAbandonedPrecommit emits the removal
+    /// => the fold folds the -1 => R6 deletes the owner-removed manifest body.
+    EXPECT_FALSE(backend->head(layout.manifestKey(id)).exists)
+        << "POST-FIX: dangling precommit manifest is reclaimed once the watermark proves it dead";
 }
 
 /// Scaffold (Task 3): ShardCoverage.has_live_precommit / min_live_precommit_* round-trip through the

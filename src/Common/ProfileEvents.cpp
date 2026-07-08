@@ -783,6 +783,7 @@ The server successfully detected this situation and will download merged part fr
     M(CasGcOverwrite,    "CA gc overwrite S3 ops", ValueType::Number) \
     M(CasGcCas,          "CA gc cas S3 ops", ValueType::Number) \
     M(CasGcRetireReplaced, "CA gc re-condemns of a resurrect-replaced incarnation (the current object token differed from a prior retired entry; the stale entry was superseded)", ValueType::Number) \
+    M(CasGcPrecommitRevisitForced, "CA gc forced re-folds of an otherwise-Skip (token-stable) ref-shard because it holds a live precommit the namespace watermark has proven dead — so reclaimAbandonedPrecommit runs and its orphaned manifest is reclaimed", ValueType::Number) \
     M(CasGcCasConflict,  "CA gc cas-conflict S3 ops", ValueType::Number) \
     M(CasGcHead,         "CA gc head S3 ops", ValueType::Number) \
     M(CasGcHeadMiss,     "CA gc head-miss S3 ops", ValueType::Number) \
