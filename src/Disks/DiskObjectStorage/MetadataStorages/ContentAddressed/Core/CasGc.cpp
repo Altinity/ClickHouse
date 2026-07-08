@@ -1974,6 +1974,23 @@ std::optional<MountLease> floorForNamespace(Store & store, const RootNamespace &
     return std::nullopt;
 }
 
+/// A precommit binding is provably DEAD by the durable namespace watermark FACT (control #9) — never a
+/// frozen-seq / judged-dead guess. Dead iff its incarnation's writer_epoch is older than the live mount
+/// epoch, the mount carries the farewell/retired sentinel (min_active == UINT64_MAX = every seq retired),
+/// or its build_sequence is below the live floor. A future epoch or a build at/above the floor is NOT dead.
+/// Shared by reclaimAbandonedPrecommit (which acts on it) and computeDiscoverDecisions (which forces a
+/// re-fold on it) so the two can never disagree.
+bool isPrecommitDead(uint64_t writer_epoch, uint64_t build_sequence, const MountLease & w)
+{
+    if (writer_epoch > w.writer_epoch)
+        return false;
+    if (writer_epoch < w.writer_epoch)
+        return true;
+    if (w.min_active == std::numeric_limits<uint64_t>::max())
+        return true;
+    return w.min_active > build_sequence;
+}
+
 }
 
 void Gc::reclaimAbandonedPrecommit(const RootNamespace & ns, uint64_t shard, uint64_t /*round*/)
@@ -2023,13 +2040,8 @@ void Gc::reclaimAbandonedPrecommit(const RootNamespace & ns, uint64_t shard, uin
         /// it is a liveness heuristic, unsafe as a reclaim trigger (a live but slow-renewing build must
         /// never have its in-flight precommit reclaimed). A wrongful reclaim would still be caught by the
         /// promote guard (fail closed), but conservatism keeps live builds from being needlessly aborted.
-        if (binding.manifest_ref.writer_epoch > w.writer_epoch)
-            continue;
         const bool retired_sentinel = w.min_active == std::numeric_limits<uint64_t>::max();
-        const bool is_dead = binding.manifest_ref.writer_epoch < w.writer_epoch
-            || retired_sentinel
-            || w.min_active > binding.manifest_ref.build_sequence;
-        if (is_dead)
+        if (isPrecommitDead(binding.manifest_ref.writer_epoch, binding.manifest_ref.build_sequence, w))
             dead.push_back(DeadPrecommit{binding, retired_sentinel});
     }
 
