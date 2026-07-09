@@ -2034,9 +2034,12 @@ void seedCondemnBlobToken(DB::Cas::Store & store, const DB::UInt128 & hash, cons
 
 }
 
-/// A blob condemned in the putBlob->promote window is resurrected from the retained source; promote SUCCEEDS
-/// and the committed ref names a fresh, live incarnation.
-TEST(CaWiringResurrect, PromoteResurrectsCondemnedTokenedBlob)
+/// A blob condemned in the putBlob->promote window is EDGE-PROTECTED (spec
+/// 2026-07-09-cas-writer-gc-simplification, Phase A): the precommit closure naming the blob was durable
+/// BEFORE putBlob observed it, so a condemnation in this window cannot graduate to a delete (the next fold
+/// sees the edge, d >= 1, spared). promote therefore does NOT re-check or resurrect a TOKENED leaf — it
+/// commits leaving the blob's token UNCHANGED (no resurrect PUT). The premature condemn is doomed on its own.
+TEST(CaWiringResurrect, PromoteIgnoresCondemnedTokenedBlobEdgeProtected)
 {
     using namespace DB::Cas;
     std::shared_ptr<InMemoryBackend> backend;
@@ -2057,20 +2060,22 @@ TEST(CaWiringResurrect, PromoteResurrectsCondemnedTokenedBlob)
     const String blob_key = store->layout().blobKey(idOf(P));
     const HeadResult h1 = store->backend().head(blob_key);
     ASSERT_TRUE(h1.exists);
-    seedCondemnBlobToken(*store, u128Of(P), h1.token, h1.size);
+    const Token t0 = h1.token;
+    seedCondemnBlobToken(*store, u128Of(P), t0, h1.size);
     store->retireView().refresh();
-    ASSERT_TRUE(store->retireView().isCondemnedToken(ObjectKind::Blob, u128Of(P), h1.token))
+    ASSERT_TRUE(store->retireView().isCondemnedToken(ObjectKind::Blob, u128Of(P), t0))
         << "precondition: the putBlob'd token must be condemned before promote";
 
-    /// promote must NOT abort — the leaf is resurrected from THIS build's retained source bytes.
+    /// promote must NOT abort AND must NOT touch the tokened leaf — it is edge-protected.
     EXPECT_NO_THROW(build->promote(ns, ref, build->buildId(), id));
 
-    /// The ref is committed and the blob is present with a FRESH (non-condemned) incarnation.
-    EXPECT_TRUE(store->resolveRef(ns, ref).has_value()) << "the ref must resolve after a resurrecting promote";
+    /// The ref is committed and the blob's token is UNCHANGED — no resurrect PUT ran (tokened leaves are
+    /// not re-validated: EDGE-BEFORE-OBSERVE guarantees the condemnation is doomed, not the blob).
+    EXPECT_TRUE(store->resolveRef(ns, ref).has_value()) << "the ref must resolve after promote";
     const HeadResult h2 = store->backend().head(blob_key);
     ASSERT_TRUE(h2.exists);
-    EXPECT_FALSE(store->retireView().isCondemnedToken(ObjectKind::Blob, u128Of(P), h2.token))
-        << "resurrect must mint a fresh incarnation whose token is not the condemned one";
+    EXPECT_EQ(h2.token, t0)
+        << "tokened leaf is edge-protected: promote must not re-upload it (token unchanged)";
 }
 
 /// If this build's precommit was removed (abandon / GC reclaim) before promote, promote ABORTS at the

@@ -133,11 +133,6 @@ BlobRef Build::putBlob(const BlobId & id, BlobSource source)
 
     const UInt128 logical_hash = hexToU128(id.string());
 
-    /// Keep the re-readable source in hand for promote's resurrect-on-condemn (INV-1). Copy is cheap: the
-    /// closure captures only the temp-path String, not the payload. Covers both the streamed-upload and the
-    /// dedup-adopt outcomes below — an adopted incarnation may still be condemned before promote.
-    retained_sources.insert_or_assign(logical_hash, source);
-
     const String key = store->layout().blobKey(id);
     const PoolConfig & cfg = store->poolConfig();
 
@@ -211,12 +206,6 @@ BlobRef Build::putBlob(const BlobId & id, BlobSource source)
 
     /// Unreachable: the loop either returns or rethrows on the final attempt.
     throw Exception(ErrorCodes::LOGICAL_ERROR, "putBlob: exhausted retries for {}", key);
-}
-
-const BlobSource * Build::retainedSourceFor(const UInt128 & hash) const
-{
-    auto it = retained_sources.find(hash);
-    return it == retained_sources.end() ? nullptr : &it->second;
 }
 
 bool Build::isCopyForwardableTokenless(const UInt128 & hash) const
@@ -899,57 +888,36 @@ void Build::promote(const RootNamespace & target_ns, const String & final_ref_na
                 "(WPromote owner==bld)",
                 final_ref_name, u128ToHex(promote_build_id));
 
-        /// Fail-closed blob revalidation of EVERY blob leaf (spec §Promote Precommit step 3), now with
-        /// resurrect-on-condemn: a leaf may have been PREMATURELY condemned by GC in the putBlob→promote
-        /// window (its precommit→blob edge is not yet folded, so in-degree reads 0). We are PAST the
-        /// owner-liveness check above, so this build's precommit is confirmed the live owner — the leaf is
-        /// legitimately protected and resurrection is warranted (no orphan on an aborting path). Re-upload
-        /// from THIS build's retained source bytes (INV-1: never read the dying object) and re-check.
-        /// Terminates in ≤2 iterations, NOT merely "rarely 8": the retire view is a FIXED snapshot inside
-        /// this closure (refreshed at most once, above, before the loop), and uploadFromSource returns only
-        /// after recording a token absent from that snapshot (a freshly-minted incarnation, or a live
-        /// adopted token), so the next HEAD sees a non-condemned token and validates. The 8-attempt bound
-        /// (mirroring putBlob) is a backstop, not load-bearing against GC cadence. A leaf that is
-        /// condemned/absent with NO retained source keeps the fail-closed ABORTED (retryable), as before.
+        /// Blob-leaf revalidation (spec 2026-07-09-cas-writer-gc-simplification, Phase A): TOKENED leaves
+        /// are edge-protected — EDGE-BEFORE-OBSERVE: the precommit closure was durable BEFORE putBlob
+        /// observed them, so a condemnation in the putBlob→promote window cannot graduate (the next fold
+        /// sees the edge, d >= 1, spared), and putBlob's gate already validated them against the installed
+        /// view under that edge. They are NOT re-checked here. Every NON-tokened leaf (a tokenless
+        /// W-EVIDENCE adopt — observation-free by design, B188 — or a no-dep staging bug) gets the single
+        /// mandatory presence observation: absent => fail closed; condemned-present + copy-forwardable =>
+        /// verified copy-forward (the INV-1 exception); condemned + no-dep => fail closed.
         for (const ManifestEntry & e : body.entries)
         {
             if (e.placement != EntryPlacement::Blob)
                 continue;
+            if (depIsTokened(e.blob_hash))
+                continue;   /// edge-protected (EDGE-BEFORE-OBSERVE); putBlob validated under the durable edge
             const BlobId blob_id{u128ToHex(e.blob_hash)};
             const String blob_key = store->layout().blobKey(blob_id);
-            const BlobSource * src = retainedSourceFor(e.blob_hash);
-
             constexpr int max_reval_attempts = 8;
             bool validated = false;
             for (int attempt = 0; attempt < max_reval_attempts; ++attempt)
             {
                 const HeadResult hr = store->backend().head(blob_key);
                 if (!hr.exists)
-                {
-                    if (!src)
-                        throw Exception(ErrorCodes::ABORTED,
-                            "promote: blob {} absent at commit revalidation — failing closed", blob_key);
-                    uploadFromSource(ObjectKind::Blob, e.blob_hash, blob_key, *src);
-                    continue;
-                }
+                    throw Exception(ErrorCodes::ABORTED,
+                        "promote: blob {} absent at commit revalidation — failing closed", blob_key);
                 if (store->retireView().isCondemnedToken(ObjectKind::Blob, e.blob_hash, hr.token))
                 {
-                    /// Resurrect-on-condemn against the POST-refresh view (the pre-pass ran against the
-                    /// pre-refresh view and may have missed this condemnation). Tokened ⇒ re-upload from the
-                    /// retained source (INV-1, no GET). Tokenless copy-forwardable (adoptEvidence — in
-                    /// production sourced from a committed manifest; NOT verified here) ⇒ verified
-                    /// copy-forward of the condemned-but-present incarnation (the documented INV-1 exception,
-                    /// same one the pre-pass uses). Safe here ONLY because we are past the owner-liveness check
-                    /// above (this build's precommit is the live owner) and the promote fold barrier guarantees
-                    /// the detached precommit's +edge folds before this promote — so the leaf is legitimately
-                    /// protected. Unknown leaf (no dep) or tokened-source-lost ⇒ fail closed.
-                    if (src)
-                        uploadFromSource(ObjectKind::Blob, e.blob_hash, blob_key, *src);
-                    else if (isCopyForwardableTokenless(e.blob_hash))
-                        copyForwardFromCondemned(e.blob_hash, blob_key, hr);
-                    else
+                    if (!isCopyForwardableTokenless(e.blob_hash))
                         throw Exception(ErrorCodes::ABORTED,
                             "promote: blob {} condemned at commit revalidation — failing closed (INV-1)", blob_key);
+                    copyForwardFromCondemned(e.blob_hash, blob_key, hr);
                     continue;
                 }
                 validated = true;
@@ -957,7 +925,7 @@ void Build::promote(const RootNamespace & target_ns, const String & final_ref_na
             }
             if (!validated)
                 throw Exception(ErrorCodes::ABORTED,
-                    "promote: blob {} still condemned after {} resurrect attempts at commit revalidation — "
+                    "promote: blob {} still condemned after {} copy-forward attempts at commit revalidation — "
                     "failing closed (INV-1)", blob_key, max_reval_attempts);
         }
 
