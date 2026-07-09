@@ -1661,3 +1661,25 @@ infra/measurement gaps (not CA defects — all had dangling=0 + agreement):
   config = no-pin (must reproduce the adopt-window dangle), positive = pin + no blob gate holds
   INV_NO_DANGLE/INV_NO_LOSS.
 - Full design cycle required (spec → consult → TLA+ gate → impl). Complements, then retires, variant A.
+
+## WRITER-GC-SIMPLIFICATION-2026-07-09: Tier 2 spec'd; variants A+B SUPERSEDED; Tier 3 recorded
+
+- **Spec:** docs/superpowers/specs/2026-07-09-cas-writer-gc-simplification-design.md (user-driven, approved).
+  Core: EDGE-BEFORE-OBSERVE — publishStaging's order (body → precommitAdd → putBlob → promote) makes the
+  precommit-closure edge durable BEFORE any observation; fold-activation + d>0→spared + two-phase d-recheck
+  make deletion of closure-named hashes impossible. The promote freshness machinery is redundant
+  defense-in-depth.
+- **SUPERSEDED by that spec:** PROMOTE-REVALIDATION-MINIMIZATION variant A (HEAD-skip-on-unchanged-round)
+  and variant B (per-commit pinned-round ack) above — the pin is strictly weaker than the durable edge (a
+  pin bounds the floor; the edge makes deletion impossible regardless of the floor).
+- **Tier 2 (the spec):** delete promote tokened revalidation + retained_sources + copy-forward pre-pass +
+  view_gate drain + writer fence_round-refresh (TLA+-conditional) + dead observed_view_round; keep putBlob
+  gate, owner-check, 1 HEAD/tokenless leaf + copy-forward backstop, lease/fence/epoch, syncer (no drain).
+  No paranoid mode (clamp-suppression hit COMMITTED manifests — the promote gate never covered that class;
+  fsck/soak/content_addressed_log remain the detection net). TLA+ phase-0: sabotage-flip redundancy proofs
+  + a NEW must-stay-red order sabotage (adopt-before-precommit).
+- **Tier 3 (FUTURE, after Tier 2 + one clean soak):** ack-floor graduation gating (condemn_round < min_ack —
+  likely redundant given two-phase d-recheck + EDGE-BEFORE-OBSERVE), beat round-ack + syncer as its feeder,
+  tokenless condemned-arm → accept (weakens the modeled ~CondemnedAtView publish gate — model change),
+  failure-texture review (stale views ⇒ more loud impossible-spares). Each via its own sabotage-flip
+  demolition.
