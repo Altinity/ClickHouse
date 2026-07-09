@@ -137,3 +137,16 @@ Watchdog cron: job 60470431 (hourly at :23).
   Negative control sab_noevreobserve → INV_NO_LOSS VIOLATED (exit 12) = admitting stale evidence without
   re-observe provably dangles → the re-observe (our copy-forward backstop) is load-bearing. Mapping:
   in-closure copy-forward against the refreshed view ≙ the model's WEvObserve re-observe.
+
+- **03283 cycle COMPLETE + reviewed** (APPROVE-WITH-MINOR, minors applied d0eadef700b). Commits:
+  1932e174ee0 (helper), 2b43cb913d1 (in-closure copy-forward backstop), 3ab997c2bf9 (gtests + 2 flipped
+  safety tests). Review confirmed: the wider envelope = existing pre-pass behavior (not new); backstop is
+  STRICTER (post-owner-check, no orphan); INV-1 = same sanctioned copyForwardFromCondemned exception;
+  fail-closed absent/no-dep/tokened-source-lost preserved; NewbornPrecommit self-floor still load-bearing.
+- **END-TO-END:** rebuilt clickhouse (ninja exit 0). 03283_optimize_on_insert_level passes in ISOLATION on
+  CA-s3 lane (Failed 0/Passed 1). Full CA-s3 lane #2 launched under load (the original reproducer) to
+  confirm 03283 stays green + the 3 tokened tests stay green + ZERO promote-condemned aborts. Monitoring.
+- BOTH condemn-race cycles landed this session: tokened INSERT (01156/01710/02346) + tokenless DETACH/freeze
+  (03283). Together close the full promote condemn-race class (putBlob source-backed + adoptEvidence
+  tokenless), each: fresh-model consult → TLA+ gate → subagent impl → independent review. See
+  [[project_promote_resurrect_condemn]].
