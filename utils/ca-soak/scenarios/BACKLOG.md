@@ -1540,3 +1540,21 @@ infra/measurement gaps (not CA defects — all had dangling=0 + agreement):
 - **DISK:** 3 root-owned cores in /var/lib/apport/coredump (~77GB: 57G@12:41 + 9.7G@01:10 + 9.8G@23:51).
   No passwordless sudo — user must `sudo rm /var/lib/apport/coredump/core.*` and consider disabling core
   dumps (`sudo sysctl -w kernel.core_pattern=core` or stop apport) before re-running crash-prone suites.
+
+## STATELESS-CA-S3-triage-2026-07-09: CA-s3-default full-suite rerun (post crash-fix) — 8424 OK / 45 distinct FAIL
+
+- **Logged (UTC):** 2026-07-09  **Severity:** finding (triage summary).
+- **Run:** `Stateless tests (arm_binary, content_addressed s3 storage, parallel)` on the crash-fix binary
+  (f7539af045c). ZERO crashes / ZERO new cores (the CRASH-CA-S3 fix validated end-to-end; the pre-fix run
+  crashed ~2000 tests in). 45 distinct FAILs, in TWO already-understood classes — NO new real CA regression:
+  - **17 CA-test FAILs** — the CA-over-LOCAL stderr-warning artifact (CA tests define inline LOCAL disks →
+    EmulatedSingleProcess `<Warning>` on stderr → the stateless harness fails any test with stderr; stdout
+    matches reference, logic OK) + 04286 EISDIR (STATELESS-04286) + 05009 log-enabled (STATELESS-05009).
+    → BACKLOG (suppress/downgrade the CA-over-LOCAL warning or allowlist it so it doesn't fail the check).
+  - **28 non-CA FAILs** — CA-s3-as-DEFAULT baseline noise: tests not designed for CA as the global default
+    policy (clickhouse-local / local-page-cache: 01146, 02841, 03456, 03536, 03793, 04039, 04266; fuzz/
+    format-inference/dynamic: 03233, 03274, 03466, 04094, 03927; storage-assumption/misc: 00152, 01271,
+    01516, 01854, 02224, 02479, 02784, 02878/02879, 02885, 02931, 03203, 03370, 03649, 03679). The
+    CA-s3-default job is experimental and has never been green; these are not CA-write-path bugs.
+- **Proposed action:** the CA-warning suppression (class 1) is the one worth fixing for CI signal; class 2
+  is expected job baseline (a per-job skiplist or accept-as-noise). Not blockers.
