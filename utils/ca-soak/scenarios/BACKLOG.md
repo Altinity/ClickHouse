@@ -1498,3 +1498,33 @@ infra/measurement gaps (not CA defects — all had dangling=0 + agreement):
   `orphan_reaper.sh <dir> --once` pass every 120s while the soak driver is alive, tolerating rustfs
   down/restart between passes — survives restarts. For run_24h.sh, wire the reaper this way (host loop
   with --once) rather than a single long-lived docker-exec.
+
+## CRASH-CA-S3-staged-entries-without-Build: server LOGICAL_ERROR crash during a merge on CA-s3
+
+- **Logged (UTC):** 2026-07-09  **Severity: CRITICAL (server crash / core dump).**  **Status: OPEN — needs root-cause.**
+- **Observed:** during the CA-s3 stateless suite (CA-s3 as the DEFAULT MergeTree policy), a background merge
+  crashed the server: `<Fatal> Logical error: 'ContentAddressedTransaction: staged entries for
+  stateless-ca-s3/store/2c2/<uuid>@cas@/tmp_merge_all_1_1_1 without a Build'`. Under
+  abort_on_logical_error this aborts the server → SIGABRT → 57GB core (/var/lib/apport/coredump/, 12:41)
+  → apport. Run result 5119 OK / 38 FAIL (many post-crash Connection-refused + the usual stderr-warning
+  artifacts). ONE distinct crash type.
+- **Throw site:** `ContentAddressedTransaction.cpp:222` in `publishStaging` — invariant "staged entries
+  (`st.entries` non-empty) must have an associated `st.build`". A `tmp_merge_*` staging reached commit
+  with entries but `st.build == nullptr`.
+- **Analysis:** the invariant throw is PRE-EXISTING (part-folder-cache Phase 2 only changed the
+  mutable-only branch to the facade, not the build-check). `createHardLink` DOES call `buildFor` (creates
+  the Build). Suspected gap: the tmp→final move/rename build-transfer (ContentAddressedTransaction.cpp
+  ~913-933) or a merge shape where entries are staged without buildFor. The 4h CA soak (real merges on
+  CA-rustfs) did NOT crash and Cas* gtests (CasBuild/CasProtocolScenarios) pass — so this is a specific
+  merge/staging edge case surfaced only by the CA-s3-as-default full suite (arbitrary tables incl. fuzzers
+  e.g. 00746_sql_fuzzy.sh active nearby). REGRESSION-vs-PRE-EXISTING: UNDETERMINED — the CA-s3-default job
+  has never been green (experimental); needs a baseline check (revert part-folder-cache src → rebuild →
+  reproduce) to confirm whether Phase 1-3 introduced it. Older cores exist (23:51, 01:10) — possibly the
+  same crash pre-dating parts of the work.
+- **Proposed action:** (1) identify the exact reproducing test/merge shape (table <uuid>=2c2ea48b);
+  (2) determine regression via baseline; (3) fix the staging→Build lifecycle so a merge can never reach
+  publishStaging with entries and no Build (either ensure buildFor on every entry-staging path incl. the
+  move/rename transfer, or make the mutable/hardlink-only path not leave dangling entries).
+- **DISK:** 3 root-owned cores in /var/lib/apport/coredump (~77GB: 57G@12:41 + 9.7G@01:10 + 9.8G@23:51).
+  No passwordless sudo — user must `sudo rm /var/lib/apport/coredump/core.*` and consider disabling core
+  dumps (`sudo sysctl -w kernel.core_pattern=core` or stop apport) before re-running crash-prone suites.
