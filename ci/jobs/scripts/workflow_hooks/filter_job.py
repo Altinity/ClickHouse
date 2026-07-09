@@ -6,6 +6,7 @@ from ci.jobs.scripts.workflow_hooks.new_tests_check import (
 )
 from ci.jobs.scripts.workflow_hooks.pr_description import Labels
 from ci.praktika.info import Info
+from ci.praktika.settings import Settings
 
 
 def only_docs(changed_files):
