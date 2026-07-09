@@ -1702,3 +1702,19 @@ infra/measurement gaps (not CA defects — all had dangling=0 + agreement):
   the former Tier-3 arrives via point-read freshness instead of list delivery. Budget: ≈ +2 tiny PUTs per
   blob lifetime (+$10/M blobs AWS, ~0 RustFS); mass-DROP requires a parallel GC meta-op pool. Lazy-marker
   alternative REJECTED (saves 1 birth PUT, costs 2-call adopt + keeps body-token linearization).
+
+## CA-ASAN-SUITE-2026-07-09: negative-LOGICAL_ERROR tests abort under abort-on-logical-error builds
+
+- **Logged (UTC):** 2026-07-10, from the first ASan sweep of the CA gtest suite (build_asan was stale;
+  run as the Phase-A M3 chassert gate — which came back CLEAN: 130/137 suites green, zero chassert trips).
+- **Class:** CA product code uses fail-closed `LOGICAL_ERROR` for protocol violations (mount-lease foreign
+  touch/hold/release, RunFile key ordering, ShardQueue partial-edit validation, moveDirectory collision,
+  B122 injected publish failure, CasFormat undefined magic). The NEGATIVE tests of those paths abort the
+  whole binary under abort-on-logical-error (ASan/debug) builds. 13 tests identified individually +
+  5 whole-suite aborters: CasMountLease, CasMountStartup, CasRunFile, CasShardQueue, CasStoreRemount.
+- **FIX (dedicated pass):** either guard those negative tests with a runtime check for
+  abort-on-logical-error builds (GTEST_SKIP), or change deliberate-injection sites (B122) to a
+  non-LOGICAL_ERROR code, or run them via EXPECT_DEATH. Until then ASan sweeps must exclude them (the
+  exclusion list lives in the Phase-A worklog entry).
+- **Fixed alongside (real bugs):** the event-sink stack-use-after-scope in 10 test sites (sink outlived
+  its captured vector; syncer emits until the Store dtor). Production sink verified immune.
