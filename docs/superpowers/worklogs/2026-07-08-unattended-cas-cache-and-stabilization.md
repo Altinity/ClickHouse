@@ -61,3 +61,25 @@ Watchdog cron: job 60470431 (hourly at :23).
   observability minors backlogged (dead evictions counter etc.). GATING GAP noted: CaWiring* never in gate.
 - NOT pushed (CLAUDE.md: push only when asked). NEXT: Task 3 stabilization (3a backlog sweep + scenario
   infra, 3b soak+replica-freeze 4h, 3c stateless CA-s3 triage).
+
+### 2026-07-09 — Task 3c: CA-s3 stateless → zero, and the GC-race fix cycle
+- Watchdog: disk 72% (497G free), no hung tasks/builds/soak. 61G apport coredumps still need user sudo.
+- **Baseline attribution (no hand-waving, per user):** ran the 38 CA-s3 FAILs on the NORMAL non-CA job.
+  31 fail there too (local env: clickhouse-local persistence, no mysql, s2-geo precision, ref drift, loaded
+  box) → NOT CA-caused. Only 7 fail ONLY under CA-s3. Committed to BACKLOG (ea0dd0619ee).
+- **The 7:** 3× promote-vs-GC-condemn ABORTED (01156/01710/02346), 2× timeout (03582/03800), 1× TTL diff
+  (00933), 1× write-path memory (03829). The 3 ABORTED are the meaningful class = real production
+  robustness gap.
+- **Brainstorming cycle — promote resurrect-on-condemn (tokened blob).** User directive: "at commit we
+  must have the data in hand; recovery invisible to client." Root-caused: promote's fail-closed blob
+  revalidation (CasBuild.cpp:886-899) aborts on a prematurely-condemned blob (precommit→blob edge not yet
+  GC-folded); a copy-forward pre-pass already resurrects the TOKENLESS case but skips TOKENED (putBlob'd)
+  deps. Fix = retain the writer's re-readable BlobSource + bounded resurrect-then-recheck from source
+  (uploadFromSource, INV-1, no GET) inside the closure AFTER the owner-liveness check.
+- **Fresh-model consult (opus, adversarial): SOUND-WITH-CHANGES.** Adopted its 3 corrections: (1) resurrect
+  AFTER owner check, not in pre-pass (else orphan debris on abort path); (2) BOUNDED loop, not single-shot
+  (single re-upload doesn't close the race); (3) retain sources in a PARALLEL map (DepEntry gets reassigned/
+  clobbered), incl dedup-adopts. Confirmed INV-1 clean, temp-file lifetime safe (cleanup at commit-end after
+  promote), memory a non-issue. Fold-barrier = ideal follow-up (larger writer↔GC coupling), out of scope.
+- Spec: docs/superpowers/specs/2026-07-09-cas-promote-resurrect-tokened-blob-design.md. NEXT: writing-plans
+  → subagent-driven impl, TLA+ gate first.
