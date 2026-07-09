@@ -1558,3 +1558,26 @@ infra/measurement gaps (not CA defects — all had dangling=0 + agreement):
     CA-s3-default job is experimental and has never been green; these are not CA-write-path bugs.
 - **Proposed action:** the CA-warning suppression (class 1) is the one worth fixing for CI signal; class 2
   is expected job baseline (a per-job skiplist or accept-as-noise). Not blockers.
+
+## STATELESS-CA-S3-attribution-2026-07-09: baseline-proven — 7/38 fails are CA-caused, 31 are env
+
+- **Logged (UTC):** 2026-07-09  **Method:** ran the 38 CA-s3 FAILs on the NORMAL (non-CA) stateless job.
+  31 fail on NORMAL too → NOT CA-caused (local env: clickhouse-local persistence, no mysql, s2-geo
+  precision, reference drift, loaded-box timeouts; incl. 04278-class already-fixed + 04286/05008/05009
+  which are env/harness, not CA-s3-specific). 7 fail ONLY under CA-s3 = genuinely CA-attributable:
+  - **01156_pcg_deserialization, 01710_projection_detach_part, 02346_exclude_materialize_skip_indexes**:
+    `promote: blob <h> condemned at commit revalidation — failing closed (INV-1)` (Code 236 ABORTED). The
+    resurrect-vs-GC race — a fresh INSERT dedups to a blob GC is concurrently condemning. Correct
+    fail-closed; design expects a RETRY (soak retries + passes), but stateless tests don't retry and
+    gc_interval_sec=5 (test config) makes it frequent. **REAL production robustness gap.**
+    FIX (proper cycle): promote should resurrect-on-condemn (re-upload the condemned adopted blob) or
+    retry the transient internally, so an ordinary INSERT isn't ABORTED by a GC race. Relates to
+    [[project_resurrect_reupload_orphan]], [[feedback_ca_resurrect_invariant]].
+  - **03582_pr_read_in_order_hits, 03800_autopr_reuse_index_analysis**: Timeout — parallel-replica tests,
+    CA-s3 (remote pool) slower. FIX: raise per-test timeout under CA-s3 or investigate the slowness.
+  - **00933_ttl_simple**: TTL result-diff (investigate the diff — real CA-s3 TTL behavior vs benign order).
+  - **03829_insert_deduplication_info_memory**: Code 241 MEMORY_LIMIT — CA write-path memory > the test's
+    bound. FIX: investigate the write-path memory (spill/hash) vs the test assertion.
+- NOTE: literal 0 on the FULL CA-s3-DEFAULT suite ALSO needs handling the 31 env fails (local-env fixes or
+  standard no-* storage-modifier tags for tests that don't test CA, e.g. the clickhouse-local set that
+  shares the CA pool) — those are not CA-write-path bugs.
