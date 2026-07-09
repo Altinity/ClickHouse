@@ -223,7 +223,15 @@ bool ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
 
     /// Write path (rev. 15): stage the part manifest body (mints a ManifestId), precommitAdd a
     /// build-intent owner (closure now protected by reachability), upload the pending blobs, then
-    /// promote — an atomic owner move that revalidates every blob fail-closed.
+    /// promote — an atomic owner move that revalidates every non-tokened blob fail-closed.
+    ///
+    /// ORDERING IS LOAD-BEARING (EDGE-BEFORE-OBSERVE, spec 2026-07-09-cas-writer-gc-simplification):
+    /// precommitAdd's durable closure names EVERY blob hash BEFORE putBlob makes the first backend
+    /// observation. This is what lets promote skip re-validating tokened leaves (a condemnation in the
+    /// putBlob→promote window cannot graduate — the next fold sees the edge). Moving putBlob before
+    /// precommitAdd would adopt an incarnation with no protecting edge (the pre-B188 dangle shape) and
+    /// trips the `chassert(precommitted)` in Build::observeAndAdmit; the TLA+ order sabotage (Gate A) is
+    /// the formal guard.
     const Cas::ManifestId id = st.build->stageManifest(st.entries);
     st.build->precommitAdd(ns, ref, id);
 

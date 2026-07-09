@@ -78,22 +78,22 @@ ManifestId publishOneBlobPartStreaming(
     const StorePtr & s, const RootNamespace & ns, const String & ref, const String & path, const String & payload)
 {
     auto build = startBuildFor(s, ns, ref);
-    build->putBlob(BlobId{streamingHexOf(payload)}, BlobSource::fromString(payload));
     const ManifestId id = build->stageManifest({blobManifestEntryStreaming(path, payload)});
     build->precommitAdd(ns, ref, id);
+    build->putBlob(BlobId{streamingHexOf(payload)}, BlobSource::fromString(payload));
     build->promote(ns, ref, build->buildId(), id);
     return id;
 }
 
-/// The full single-blob write flow: putBlob -> stageManifest(one entry) -> precommitAdd -> promote.
-/// Returns the committed ManifestId.
+/// The full single-blob write flow (EDGE-BEFORE-OBSERVE wiring order):
+/// stageManifest(one entry) -> precommitAdd -> putBlob -> promote. Returns the committed ManifestId.
 ManifestId publishOneBlobPart(
     const StorePtr & s, const RootNamespace & ns, const String & ref, const String & path, const String & payload)
 {
     auto build = startBuildFor(s, ns, ref);
-    build->putBlob(idOf(payload), BlobSource::fromString(payload));
     const ManifestId id = build->stageManifest({blobManifestEntry(path, payload)});
     build->precommitAdd(ns, ref, id);
+    build->putBlob(idOf(payload), BlobSource::fromString(payload));
     build->promote(ns, ref, build->buildId(), id);
     return id;
 }
@@ -198,11 +198,17 @@ TEST(CasBuild, PutBlobDedupSecondWriterAdopts)
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openStore(b);
 
+    /// First writer FRESH-uploads (legal pre-precommit — newborn-debris watermark).
     auto build_a = s->startBuild({});
     auto ref_a = build_a->putBlob(idOf("dup"), BlobSource::fromString("dup"));
     const Token token_a = b->head(s->layout().blobKey(ref_a.id)).token;
 
-    auto build_b = s->startBuild({});
+    /// Second writer ADOPTS — the adopt must happen under a durable precommit edge (EDGE-BEFORE-OBSERVE:
+    /// stageManifest -> precommitAdd -> putBlob), so give build_b the wiring order.
+    const RootNamespace ns_b{"srv/tbl"};
+    auto build_b = startBuildFor(s, ns_b, "ref_b");
+    const ManifestId id_b = build_b->stageManifest({blobManifestEntry("data.bin", "dup")});
+    build_b->precommitAdd(ns_b, "ref_b", id_b);
     auto ref_b = build_b->putBlob(idOf("dup"), BlobSource::fromString("dup"));
 
     EXPECT_EQ(ref_b.id, ref_a.id);
@@ -561,7 +567,12 @@ TEST(CasBuild, PutBlobVanishDuringRevivalReUploadsNotFatal)
     /// (object present at PUT time) independently of the inner store, then reports absent on HEAD.
     auto scripted = std::make_shared<ScriptedVanishBackend>(raw, blob_key);
     auto s = Store::open(scripted, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
-    auto build = s->startBuild({});
+    /// Wiring order (EDGE-BEFORE-OBSERVE): the revive re-observes via observeAndAdmit, which requires a
+    /// durable precommit edge — stageManifest -> precommitAdd before putBlob.
+    const RootNamespace ns_v{"srv/tbl"};
+    auto build = startBuildFor(s, ns_v, "part_v");
+    const ManifestId id_v = build->stageManifest({blobManifestEntry("data.bin", "payload-V")});
+    build->precommitAdd(ns_v, "part_v", id_v);
 
     /// putBlob holds "payload-V" as source bytes. The vanish-during-revival must NOT be fatal:
     ///   BEFORE fix: observeAndAdmit throws FILE_DOESNT_EXIST, escapes putBlob's ABORTED-only catch → fatal.
@@ -1257,11 +1268,12 @@ TEST(CasBuild, PublishIntoSecondNamespaceSameBlob)
     build1->promote(ns1, "part_1", build1->buildId(), id1);
 
     /// Second build publishes part_1 in ns2 referencing the SAME blob: putBlob dedup-hits and ADOPTS the
-    /// present incarnation (no re-upload), so the blob token is unchanged.
+    /// present incarnation (no re-upload), so the blob token is unchanged. Wiring order
+    /// (EDGE-BEFORE-OBSERVE): stageManifest -> precommitAdd -> putBlob -> promote.
     auto build2 = startBuildFor(s, ns2, "part_1");
-    build2->putBlob(idOf("hello world"), BlobSource::fromString("hello world"));
     const ManifestId id2 = build2->stageManifest({blobManifestEntry("data.bin", "hello world")});
     build2->precommitAdd(ns2, "part_1", id2);
+    build2->putBlob(idOf("hello world"), BlobSource::fromString("hello world"));
     build2->promote(ns2, "part_1", build2->buildId(), id2);
 
     auto r1 = s->resolveRef(ns1, "part_1");

@@ -47,8 +47,6 @@ ManifestId publishPart2(
     BuildInfo info;
     info.intended_ref = ns + "/" + ref;
     auto build = s->startBuild(info);
-    build->putBlob(idOf(payload_a), BlobSource::fromString(payload_a));
-    build->putBlob(idOf(payload_b), BlobSource::fromString(payload_b));
 
     ManifestEntry ea;
     ea.path = "data.bin";
@@ -62,8 +60,11 @@ ManifestId publishPart2(
     eb.blob_hash = u128Of(payload_b);
     eb.blob_size = payload_b.size();
 
+    /// Wiring order (EDGE-BEFORE-OBSERVE): stageManifest -> precommitAdd -> putBlob -> promote.
     const ManifestId id = build->stageManifest({ea, eb});
     build->precommitAdd(nsr, ref, id);
+    build->putBlob(idOf(payload_a), BlobSource::fromString(payload_a));
+    build->putBlob(idOf(payload_b), BlobSource::fromString(payload_b));
     build->promote(nsr, ref, build->buildId(), id);
     return id;
 }

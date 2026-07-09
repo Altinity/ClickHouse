@@ -74,9 +74,10 @@ ManifestId publishBlobPart(
     const StorePtr & s, const RootNamespace & ns, const String & ref, const String & path, const String & payload)
 {
     auto build = startBuildFor(s, ns, ref);
-    build->putBlob(idOf(payload), BlobSource::fromString(payload));
+    /// Wiring order (EDGE-BEFORE-OBSERVE): stageManifest -> precommitAdd -> putBlob -> promote.
     const ManifestId id = build->stageManifest({blobEntry(path, payload)});
     build->precommitAdd(ns, ref, id);
+    build->putBlob(idOf(payload), BlobSource::fromString(payload));
     build->promote(ns, ref, build->buildId(), id);
     return id;
 }
@@ -183,9 +184,10 @@ TEST(CasProtocol, RevalidateReObservesStaleTokenAdoptsWhenDisplaced)
     const Token t0 = b->head(blob_key).token;
 
     auto build = startBuildFor(s, ns, "part_1");
-    build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));   /// dedup → adopts t0
+    /// Wiring order (EDGE-BEFORE-OBSERVE): stageManifest -> precommitAdd -> putBlob.
     const ManifestId id = build->stageManifest({blobEntry("data.bin", "payload-X")});
     build->precommitAdd(ns, "part_1", id);
+    build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));   /// dedup → adopts t0
 
     /// Another writer displaces X out-of-band ⇒ a new current token t1 (same payload, fresh tag).
     const Token t1 = displaceBlobToken(*b, s->layout(), idOf("payload-X"));
@@ -459,9 +461,10 @@ TEST(CasProtocol, DisplacedToLiveTokenCommitsAtCurrentIncarnation)
     const Token t0 = b->head(blob_key).token;
 
     auto build = startBuildFor(s, ns, "part_1");
-    build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));   /// dedup → adopts t0
+    /// Wiring order (EDGE-BEFORE-OBSERVE): stageManifest -> precommitAdd -> putBlob.
     const ManifestId id = build->stageManifest({blobEntry("data.bin", "payload-X")});
     build->precommitAdd(ns, "part_1", id);
+    build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));   /// dedup → adopts t0
 
     /// Another writer displaces X to t1 (uncondemned) before our gate runs.
     const Token t1 = displaceBlobToken(*b, s->layout(), idOf("payload-X"));

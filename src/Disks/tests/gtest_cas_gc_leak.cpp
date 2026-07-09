@@ -97,9 +97,10 @@ ManifestEntry blobEntry(const String & path, const String & payload)
 }
 
 /// Publish ONE ref naming a two-blob part through the REAL writer transaction sequence — the exact order
-/// the wiring drives: `startBuild -> putBlob(each body) -> stageManifest(entries) -> precommitAdd ->
-/// promote`. Every byte of the closure is born under this build before the owner move commits. Returns
-/// the published `ManifestId` so a caller can later HEAD its body / assert reclaim.
+/// the wiring drives (EDGE-BEFORE-OBSERVE): `startBuild -> stageManifest(entries) -> precommitAdd ->
+/// putBlob(each body) -> promote`. The durable precommit closure names every blob hash before putBlob
+/// makes the first backend observation. Returns the published `ManifestId` so a caller can later HEAD
+/// its body / assert reclaim.
 ManifestId publishTwoBlobPart(
     const StorePtr & s, const RootNamespace & ns, const String & ref,
     const String & payload_a, const String & payload_b)
@@ -108,12 +109,11 @@ ManifestId publishTwoBlobPart(
     info.intended_ref = ns.string() + "/" + ref;
     auto build = s->startBuild(info);
 
-    build->putBlob(idOf(payload_a), BlobSource::fromString(payload_a));
-    build->putBlob(idOf(payload_b), BlobSource::fromString(payload_b));
-
     const ManifestId id = build->stageManifest({blobEntry("data.bin", payload_a),
                                                 blobEntry("data.cmrk3", payload_b)});
     build->precommitAdd(ns, ref, id);
+    build->putBlob(idOf(payload_a), BlobSource::fromString(payload_a));
+    build->putBlob(idOf(payload_b), BlobSource::fromString(payload_b));
     build->promote(ns, ref, build->buildId(), id);
     return id;
 }
@@ -125,9 +125,9 @@ ManifestId publishOneBlobPart(
     BuildInfo info;
     info.intended_ref = ns.string() + "/" + ref;
     auto build = s->startBuild(info);
-    build->putBlob(idOf(payload), BlobSource::fromString(payload));
     const ManifestId id = build->stageManifest({blobEntry("data.bin", payload)});
     build->precommitAdd(ns, ref, id);
+    build->putBlob(idOf(payload), BlobSource::fromString(payload));
     build->promote(ns, ref, build->buildId(), id);
     return id;
 }

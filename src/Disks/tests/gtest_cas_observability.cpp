@@ -41,14 +41,15 @@ ManifestId publishOneBlobPart(
     BuildInfo info;
     info.intended_ref = ns.string() + "/" + ref;
     auto build = s->startBuild(info);
-    build->putBlob(idOf(payload), BlobSource::fromString(payload));
     DB::Cas::ManifestEntry e;
     e.path = "data.bin";
     e.placement = EntryPlacement::Blob;
     e.blob_hash = u128Of(payload);
     e.blob_size = payload.size();
+    /// Wiring order (EDGE-BEFORE-OBSERVE): stageManifest -> precommitAdd -> putBlob -> promote.
     const ManifestId id = build->stageManifest({e});
     build->precommitAdd(ns, ref, id);
+    build->putBlob(idOf(payload), BlobSource::fromString(payload));
     build->promote(ns, ref, build->buildId(), id);
     return id;
 }

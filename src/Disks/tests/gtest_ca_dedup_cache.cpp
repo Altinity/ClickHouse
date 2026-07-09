@@ -100,7 +100,19 @@ TEST(CaDedupCache, HitTakesHeadFirstNoBodyPut)
     EXPECT_EQ(counting->stream_puts, 1u);
 
     /// Second writer of the same content: the cache now says present ⇒ HEAD-first, no second body PUT.
-    auto b2 = s->startBuild({});
+    /// The head-first hit ADOPTS an existing incarnation, so it must run under a durable precommit edge
+    /// (EDGE-BEFORE-OBSERVE: stageManifest -> precommitAdd before putBlob). Counters are reset AFTER that
+    /// ceremony so only the measured putBlob is counted.
+    BuildInfo info2;
+    info2.intended_ref = "srv/tbl/ref2";
+    auto b2 = s->startBuild(info2);
+    ManifestEntry e2;
+    e2.path = "data.bin";
+    e2.placement = EntryPlacement::Blob;
+    e2.blob_hash = u128Of("dup");
+    e2.blob_size = 3;
+    const ManifestId id2 = b2->stageManifest({e2});
+    b2->precommitAdd(RootNamespace{"srv/tbl"}, "ref2", id2);
     counting->stream_puts = 0;
     b2->putBlob(idOf("dup"), BlobSource::fromString("dup"));
     EXPECT_EQ(counting->stream_puts, 0u);                  /// body PUT avoided

@@ -45,6 +45,11 @@ public:
     /// New content: streaming PUT If-None-Match:*; on PreconditionFailed ⇒ the cold-reuse rule
     /// (observe current token; condemned ⇒ uploadFromSource — re-upload from the writer's source
     /// bytes; else adopt — free).
+    /// ORDERING (EDGE-BEFORE-OBSERVE, spec 2026-07-09-cas-writer-gc-simplification): putBlob is always
+    /// called AFTER precommitAdd (the wiring order stageManifest → precommitAdd → putBlob → promote). Its
+    /// ADOPT paths observe an existing incarnation, so they are safe only under this build's durable
+    /// precommit closure — asserted by `chassert(precommitted)` in observeAndAdmit. A FRESH upload before
+    /// precommit is legal (newborn-debris watermark), but production never does it.
     BlobRef putBlob(const BlobId & id, BlobSource source);
 
     /// B156b discriminator: does this build hold a TOKENED Blob dep for `hash` (putBlob'd here ⇒

@@ -226,6 +226,11 @@ bool Build::depIsTokened(const UInt128 & hash) const
 
 uint64_t Build::observeAndAdmit(ObjectKind kind, const UInt128 & hash, const String & key)
 {
+    /// EDGE-BEFORE-OBSERVE (spec 2026-07-09-cas-writer-gc-simplification): adopting an EXISTING
+    /// incarnation is safe ONLY under this build's durable precommit closure — an adopted blob carries the
+    /// ORIGINAL writer's build_id, so the newborn-debris watermark does not cover it. Fresh uploads
+    /// pre-precommit stay legal (watermark-protected). See the TLA+ order sabotage (Gate A).
+    chassert(precommitted);
     const HeadResult hr = store->backend().head(key);
     if (!hr.exists)
         /// Object absent at observe time. Two contexts call this overload:
@@ -244,6 +249,11 @@ uint64_t Build::observeAndAdmit(ObjectKind kind, const UInt128 & hash, const Str
 
 uint64_t Build::observeAndAdmit(ObjectKind kind, const UInt128 & hash, const String & key, const HeadResult & hr)
 {
+    /// EDGE-BEFORE-OBSERVE (spec 2026-07-09-cas-writer-gc-simplification): adopting an EXISTING
+    /// incarnation is safe ONLY under this build's durable precommit closure — an adopted blob carries the
+    /// ORIGINAL writer's build_id, so the newborn-debris watermark does not cover it. Fresh uploads
+    /// pre-precommit stay legal (watermark-protected). See the TLA+ order sabotage (Gate A).
+    chassert(precommitted);
     /// `hr.exists` is guaranteed by the caller (the 3-arg wrapper checked it; the putBlob HEAD-first
     /// path only calls this on a present HEAD). Avoids a redundant second HEAD on the dedup-hit path.
     /// Logical (payload) size = object size minus the pool's fixed blob header. GUARD against
