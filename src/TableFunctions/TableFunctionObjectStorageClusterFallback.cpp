@@ -155,7 +155,10 @@ StoragePtr TableFunctionObjectStorageClusterFallback<Definition, Base>::executeI
     {
         auto result = BaseCluster::executeImpl(ast_function, context, table_name, cached_columns, is_insert_query);
         if (auto storage = typeid_cast<std::shared_ptr<StorageObjectStorageCluster>>(result))
+        {
             storage->setClusterNameInSettings(true);
+            storage->setClusterNameFromFunctionArgument(false);
+        }
         return result;
     }
     else

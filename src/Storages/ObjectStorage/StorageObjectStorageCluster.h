@@ -64,6 +64,11 @@ public:
     std::optional<UInt64> totalBytes(ContextPtr query_context) const override;
     void setClusterNameInSettings(bool cluster_name_in_settings_) { cluster_name_in_settings = cluster_name_in_settings_; }
 
+    void setClusterNameFromFunctionArgument(bool cluster_name_from_function_argument_)
+    {
+        cluster_name_from_function_argument = cluster_name_from_function_argument_;
+    }
+
     String getClusterName(ContextPtr context) const override;
 
     QueryProcessingStage::Enum getQueryProcessingStage(ContextPtr, QueryProcessingStage::Enum, const StorageSnapshotPtr &, SelectQueryInfo &) const override;
@@ -221,6 +226,7 @@ private:
     StorageObjectStorageConfigurationPtr configuration;
     const ObjectStoragePtr object_storage;
     bool cluster_name_in_settings;
+    bool cluster_name_from_function_argument = false;
 
     /// non-clustered storage to fall back on pure realisation if needed
     std::shared_ptr<StorageObjectStorage> pure_storage;

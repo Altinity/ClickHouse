@@ -727,12 +727,12 @@ String StorageObjectStorageCluster::getClusterName(ContextPtr context) const
     /// StorageObjectStorageCluster is always created for cluster or non-cluster variants.
     /// User can specify cluster name in table definition, in *Cluster table function argument,
     /// or in setting `object_storage_cluster` for s3()/iceberg() alternative syntax.
-    /// Explicit *Cluster argument has priority over query setting; alternative-syntax requests use the setting.
+    /// Explicit *Cluster argument has priority over query setting; table engine and alternative-syntax use the setting path.
 
     if (!isClusterSupported())
         return "";
 
-    if (!cluster_name_in_settings && !getOriginalClusterName().empty())
+    if (cluster_name_from_function_argument)
         return getOriginalClusterName();
 
     auto cluster_name_from_settings = context->getSettingsRef()[Setting::object_storage_cluster].value;
@@ -744,10 +744,11 @@ String StorageObjectStorageCluster::getClusterName(ContextPtr context) const
 
 bool StorageObjectStorageCluster::useObjectStorageClusterFallbackIfEmpty(ContextPtr context) const
 {
-    if (!cluster_name_in_settings && !getOriginalClusterName().empty())
+    if (cluster_name_from_function_argument)
         return false;
 
     return cluster_name_in_settings
+        || !getOriginalClusterName().empty()
         || !context->getSettingsRef()[Setting::object_storage_cluster].value.empty();
 }
 
