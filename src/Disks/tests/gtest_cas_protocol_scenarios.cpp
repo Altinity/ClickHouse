@@ -178,8 +178,10 @@ TEST(CasProtocol, RevalidateReObservesStaleTokenKeepsWhenUnchanged)
 
 TEST(CasProtocol, RevalidateReObservesStaleTokenAdoptsWhenDisplaced)
 {
-    /// A blob displaced out-of-band to a fresh live token t1 before the gate. promote re-HEADs the
-    /// CURRENT token (t1), finds it live ⇒ commits; the part rides t1.
+    /// A blob displaced out-of-band to a fresh live token t1 before promote. Phase-A contract: the leaf is
+    /// TOKENED (putBlob-adopted), so promote SKIPS it entirely (edge-protected — EDGE-BEFORE-OBSERVE); no
+    /// re-HEAD happens. The commit still rides the displaced object correctly because the manifest names
+    /// the HASH, not a token — this is the black-box "displaced object still reads by content key" check.
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openStore(b);
     const RootNamespace ns{"srv1/tbl"};
@@ -425,13 +427,12 @@ TEST(CasProtocol, FreezeIntoShadowNamespace)
 
 TEST(CasProtocol, DisplacedToLiveTokenCommitsAtCurrentIncarnation)
 {
-    /// (Ported from the former ResurrectLosesRace scenario.) The old tree-model gate condemned the dep's
-    /// OWN recorded token and ABORTED even when the object had been displaced to a live t1. The new model
-    /// re-HEADs at promote and checks the CURRENT token: a blob displaced to a LIVE t1 (while its old t0
-    /// is condemned for a now-defunct incarnation) is SAFE to commit — the committed manifest names a
+    /// (Ported from the former ResurrectLosesRace scenario.) A blob displaced to a LIVE t1 (while its old
+    /// t0 is condemned for a now-defunct incarnation) is SAFE to commit: the committed manifest names a
     /// blob HASH, the live t1 incarnation backs it, and GC's exact-token delete of t0 only TokenMismatches.
-    /// So promote COMMITS. This is the correct no-loss / no-dangle outcome under the re-HEAD gate; the
-    /// old conservative ABORTED has no manifest-model analog.
+    /// Phase-A contract: the leaf is TOKENED, so promote does not re-HEAD it at all (edge-protected —
+    /// EDGE-BEFORE-OBSERVE); the commit is correct by content addressing, not by revalidation. The old
+    /// conservative ABORTED has no manifest-model analog.
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openStore(b);
     const RootNamespace ns{"srv1/tbl"};
