@@ -123,6 +123,9 @@ protected:
 
     ResolvedClusterRead resolveClusterRead(ContextPtr context) const;
 
+    /// Apply object_storage_cluster_fallback_if_empty only for storages that take cluster name from the setting.
+    virtual bool useObjectStorageClusterFallbackIfEmpty(ContextPtr /* context */) const { return false; }
+
 private:
     // With 'allow_null=true' returns nullptr when cluster does not exist or empty
     // With 'allow_null=false' throws exception

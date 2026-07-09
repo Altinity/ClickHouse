@@ -378,6 +378,7 @@ IStorageCluster::ResolvedClusterRead IStorageCluster::resolveClusterRead(Context
         result.fallback_to_pure = cluster_name_from_settings.empty();
 
     if (!defer_object_storage_cluster_resolution
+        && useObjectStorageClusterFallbackIfEmpty(context)
         && !result.fallback_to_pure
         && settings[Setting::object_storage_cluster_fallback_if_empty])
     {

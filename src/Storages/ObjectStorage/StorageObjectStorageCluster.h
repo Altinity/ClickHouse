@@ -198,6 +198,8 @@ private:
         ContextPtr context,
         bool async_insert) override;
 
+    bool useObjectStorageClusterFallbackIfEmpty(ContextPtr context) const override;
+
     /*
     In case the table was created with `object_storage_cluster` setting,
     modify the AST query object so that it uses the table function implementation

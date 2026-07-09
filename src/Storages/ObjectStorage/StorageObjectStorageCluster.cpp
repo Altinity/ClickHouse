@@ -725,17 +725,30 @@ SinkToStoragePtr StorageObjectStorageCluster::writeFallBackToPure(
 String StorageObjectStorageCluster::getClusterName(ContextPtr context) const
 {
     /// StorageObjectStorageCluster is always created for cluster or non-cluster variants.
-    /// User can specify cluster name in table definition or in setting `object_storage_cluster`
-    /// only for several queries. When it specified in both places, priority is given to the query setting.
-    /// When it is empty, non-cluster realization is used.
+    /// User can specify cluster name in table definition, in *Cluster table function argument,
+    /// or in setting `object_storage_cluster` for s3()/iceberg() alternative syntax.
+    /// Explicit *Cluster argument has priority over query setting; alternative-syntax requests use the setting.
 
     if (!isClusterSupported())
         return "";
 
+    if (!cluster_name_in_settings && !getOriginalClusterName().empty())
+        return getOriginalClusterName();
+
     auto cluster_name_from_settings = context->getSettingsRef()[Setting::object_storage_cluster].value;
-    if (cluster_name_from_settings.empty())
-        cluster_name_from_settings = getOriginalClusterName();
-    return cluster_name_from_settings;
+    if (!cluster_name_from_settings.empty())
+        return cluster_name_from_settings;
+
+    return getOriginalClusterName();
+}
+
+bool StorageObjectStorageCluster::useObjectStorageClusterFallbackIfEmpty(ContextPtr context) const
+{
+    if (!cluster_name_in_settings && !getOriginalClusterName().empty())
+        return false;
+
+    return cluster_name_in_settings
+        || !context->getSettingsRef()[Setting::object_storage_cluster].value.empty();
 }
 
 QueryProcessingStage::Enum StorageObjectStorageCluster::getQueryProcessingStage(
