@@ -344,7 +344,7 @@ Store::~Store()
     }
 
     /// Stop the retired-view syncer before tearing down: its body touches retire_view / pool_backend /
-    /// view_gate / the event sink, which are destroyed with this Store.
+    /// the event sink, which are destroyed with this Store.
     stopRetiredViewSync();
 
     /// Retire the merged heartbeat on a clean Store teardown: stop() runs the keeper's terminal op,
@@ -681,13 +681,12 @@ uint64_t Store::syncRetiredView()
     if (published <= retire_view.round())
         return retire_view.round();
 
-    /// 2. The DRAIN + install: wait out every in-flight mutateShard (shared holders), then load and
-    /// install the newer retired view. The S3 reads inside refresh() run under the exclusive gate —
-    /// acceptable at beat cadence (a few small GETs); mutations queue behind it briefly.
+    /// 2. Install the newer retired view under RetireView's own internal mutex — no drain (spec
+    /// 2026-07-09-cas-writer-gc-simplification D4: entry persistence + monotone installs make any
+    /// in-closure read see every graduated entry regardless of install timing).
     const uint64_t from_round = retire_view.round();
     try
     {
-        std::unique_lock<std::shared_mutex> drain(view_gate);
         retire_view.refresh();
     }
     catch (...)
@@ -1236,11 +1235,9 @@ void Store::flushShardBatch(const RootNamespace & ns, uint64_t shard,
         return all;
     };
 
-    /// Ack-floor drain (spec 2026-07-02): the SHARED side of the view gate spans the whole flush —
-    /// condemn-gate evaluations inside the closures through the CAS response — so a beat advertising
-    /// a newer `observed_gc_round` can never overtake an in-flight batch that gated on the older
-    /// view. Lock order (never inverted elsewhere): view_gate, then RetireView's internal mutex.
-    std::shared_lock<std::shared_mutex> view_guard(view_gate);
+    /// No view-install drain here (spec 2026-07-09-cas-writer-gc-simplification D4): the closures'
+    /// condemn-gate reads consult the live RetireView (internally locked); a mid-flush install only makes
+    /// them stricter, and every graduated entry is in EVERY view >= its condemn round + 1 regardless.
 
     /// Local write fence (spec §write-fence): a superseded/paused writer must not race the live one.
     /// The fence fails the WHOLE queue — every caller would have gotten the same refusal alone.

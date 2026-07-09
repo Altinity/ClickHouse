@@ -1878,7 +1878,14 @@ TEST(CasStoreMountFence, OpenRecoversFromFenceInAdoptWindowWithFreshEpoch)
     EXPECT_TRUE(fencing->fence_key.empty()) << "the one-shot fence must have fired";
 }
 
-TEST(CasStoreBeat, DrainBlocksAckWhileMutationInFlight)
+/// Phase-A contract (spec 2026-07-09-cas-writer-gc-simplification D4): the install drain is GONE — the
+/// syncer installs a newer retired view WITHOUT waiting out in-flight shard mutations. Safe because a
+/// graduated entry (condemned at round C) is present in EVERY view >= C+1 and this writer's own
+/// advertised round exceeded C before that graduation, so an in-flight closure's condemn-gate reads see
+/// every graduated entry regardless of install timing (a mid-flight install only makes them stricter).
+/// This test is the INVERSION of the former DrainBlocksAckWhileMutationInFlight: the sync must now
+/// complete and install WHILE a mutation is parked in flight.
+TEST(CasStoreBeat, SyncInstallsWithoutWaitingForInFlightMutation)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = DB::Cas::tests::openStoreForTest(backend);
@@ -1888,7 +1895,6 @@ TEST(CasStoreBeat, DrainBlocksAckWhileMutationInFlight)
     backend->putIfAbsent(store->layout().gcStateKey(), encodeGcState(st));
 
     std::promise<void> entered, release;
-    std::atomic<bool> released{false};
 
     std::thread mutator([&]
     {
@@ -1900,26 +1906,16 @@ TEST(CasStoreBeat, DrainBlocksAckWhileMutationInFlight)
     });
     entered.get_future().wait();
 
-    /// The beat must park on the drain while the mutation is in flight (the mutation holds the
-    /// shared side of the view gate for its whole call).
-    auto beat = std::async(std::launch::async, [&]
-    {
-        const uint64_t r = store->syncRetiredView();
-        /// Order proof: by the time the beat returns, the mutation MUST have been released — the
-        /// drain forbids installing a view over an in-flight old-view mutation.
-        EXPECT_TRUE(released.load());
-        return r;
-    });
-
-    /// Bounded negative wait: this asserts the blocking occurred (it is an assertion on an
-    /// intentionally-parked thread, not a sleep papering over a race).
-    ASSERT_EQ(beat.wait_for(std::chrono::milliseconds(100)), std::future_status::timeout);
-
-    released.store(true);
-    release.set_value();
-    mutator.join();
+    /// The sync must NOT park behind the in-flight mutation: it installs the round-1 view and returns
+    /// while the mutator is still holding its closure open.
+    auto beat = std::async(std::launch::async, [&] { return store->syncRetiredView(); });
+    ASSERT_EQ(beat.wait_for(std::chrono::seconds(10)), std::future_status::ready)
+        << "syncRetiredView must not wait for in-flight mutations (the D4 drain is gone)";
     EXPECT_EQ(beat.get(), 1u);
     EXPECT_EQ(store->retireView().round(), 1u);
+
+    release.set_value();
+    mutator.join();
 }
 
 /// Task 12: the write-fence deadline is a CLOCK_BOOTTIME instant (boottime includes VM-suspend time,

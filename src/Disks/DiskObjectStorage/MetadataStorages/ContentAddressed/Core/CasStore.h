@@ -23,7 +23,6 @@
 #include <map>
 #include <memory>
 #include <mutex>
-#include <shared_mutex>
 #include <optional>
 #include <set>
 #include <unordered_map>
@@ -398,14 +397,16 @@ public:
     bool tryRemountOnce();
 
     /// Retired-view sync (spec 2026-07-06-cas-lease-view-sync-decouple; formerly the ack-floor
-    /// "beat"): probe `gc/state`; when the published round advanced past the installed view, load the
-    /// retired view and install it under the exclusive side of `view_gate` — the DRAIN: it waits out
-    /// every in-flight `mutateShard` (each holds the shared side for its whole call, gate evaluation
-    /// through CAS response). Returns the round the view is installed at. Any read failure leaves the
-    /// view and the returned round UNCHANGED (fail-closed for the ack: never claim a view that was not
-    /// actually loaded). Runs on the dedicated retired-view syncer thread (`retiredViewSyncLoop`) and,
-    /// synchronously, at open/remount and in tests. It is NOT on the lease-renewal path — the renewal
-    /// advertises the already-installed round via `observedGcRound()`.
+    /// "beat"): probe `gc/state`; when the published round advanced past the installed view, load and
+    /// install the retired view under `RetireView`'s own internal mutex. There is NO install drain
+    /// (spec 2026-07-09-cas-writer-gc-simplification D4): entry persistence + monotone installs mean a
+    /// graduated entry (condemned at round C) is in EVERY view >= C+1, and this writer's own advertised
+    /// round exceeded C before that graduation, so any later in-closure read sees the entry regardless
+    /// of install timing; displacement is exact-token-safe. Returns the round the view is installed at.
+    /// Any read failure leaves the view and the returned round UNCHANGED (fail-closed for the ack: never
+    /// claim a view that was not actually loaded). Runs on the dedicated retired-view syncer thread
+    /// (`retiredViewSyncLoop`) and, synchronously, at open/remount and in tests. It is NOT on the
+    /// lease-renewal path — the renewal advertises the already-installed round via `observedGcRound()`.
     uint64_t syncRetiredView();
 
     /// Retired-view syncer (spec 2026-07-06-cas-lease-view-sync-decouple): a dedicated background
@@ -619,12 +620,6 @@ private:
     /// pool_layout MUST precede retire_view: the ctor init list builds retire_view from pool_layout.
     Layout pool_layout;
     RetireView retire_view;
-    /// The ack-floor view gate (spec 2026-07-02): `mutateShard` holds the SHARED side for its whole
-    /// call (condemn-gate evaluation through the CAS response); `syncRetiredView` installs a newer
-    /// retired view under the EXCLUSIVE side. This is the writer-side DRAIN: an advertised
-    /// `observed_gc_round` proves no in-flight mutation still gates on an older view.
-    std::shared_mutex view_gate;
-
     /// Per-server build watermark (spec 2026-06-16-ca-build-watermark). process_epoch is a random
     /// nonzero u64 minted once at open: GC checks it for EQUALITY (an object stamped with a different
     /// epoch is from a dead incarnation), never for ordering. next_build_seq is a strictly-increasing
