@@ -936,9 +936,10 @@ void Build::promote(const RootNamespace & target_ns, const String & final_ref_na
                 {
                     /// Resurrect-on-condemn against the POST-refresh view (the pre-pass ran against the
                     /// pre-refresh view and may have missed this condemnation). Tokened ⇒ re-upload from the
-                    /// retained source (INV-1, no GET). Tokenless copy-forwardable (adoptEvidence, independent
-                    /// committed owner) ⇒ verified copy-forward of the condemned-but-present incarnation (the
-                    /// documented INV-1 exception). Safe here ONLY because we are past the owner-liveness check
+                    /// retained source (INV-1, no GET). Tokenless copy-forwardable (adoptEvidence — in
+                    /// production sourced from a committed manifest; NOT verified here) ⇒ verified
+                    /// copy-forward of the condemned-but-present incarnation (the documented INV-1 exception,
+                    /// same one the pre-pass uses). Safe here ONLY because we are past the owner-liveness check
                     /// above (this build's precommit is the live owner) and the promote fold barrier guarantees
                     /// the detached precommit's +edge folds before this promote — so the leaf is legitimately
                     /// protected. Unknown leaf (no dep) or tokened-source-lost ⇒ fail closed.

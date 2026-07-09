@@ -153,9 +153,11 @@ private:
     const BlobSource * retainedSourceFor(const UInt128 & hash) const;
 
     /// A leaf is copy-forwardable iff this build holds a TOKENLESS W-EVIDENCE Blob dep for `hash`
-    /// (adoptEvidence — an independent live committed owner exists, so the INV-1 copy-forward exception
-    /// applies). A tokened dep, or NO dep at all (a staging bug — must fail closed), is NOT
-    /// copy-forwardable. Single source of truth for both the promote pre-pass and the in-closure backstop.
+    /// (adoptEvidence — in production always sourced from a committed manifest, which is the copy-forward
+    /// exception's PROVENANCE; it is NOT a checked runtime guarantee here). The enforced runtime safety
+    /// rests on the caller's owner-liveness check + fold barrier (see the backstop in `promote`), exactly
+    /// as the tokened `uploadFromSource` resurrect does. A tokened dep, or NO dep at all (a staging bug —
+    /// must fail closed), is NOT copy-forwardable. Single source of truth for the pre-pass and the backstop.
     bool isCopyForwardableTokenless(const UInt128 & hash) const;
 
     StorePtr store;
