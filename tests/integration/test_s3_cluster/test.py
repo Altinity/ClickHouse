@@ -328,6 +328,80 @@ def test_wrong_cluster(started_cluster):
     assert "not found" in error
 
 
+def test_object_storage_cluster_fallback_if_empty(started_cluster):
+    node = started_cluster.instances["s0_0_0"]
+
+    pure_s3 = node.query(
+        f"""
+    SELECT count(*) from s3(
+        'http://minio1:9001/root/data/{{clickhouse,database}}/*',
+        'minio', '{minio_secret_key}', 'CSV',
+        'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))')"""
+    )
+
+    fallback_s3 = node.query(
+        f"""
+    SELECT count(*) from s3(
+        'http://minio1:9001/root/data/{{clickhouse,database}}/*',
+        'minio', '{minio_secret_key}', 'CSV',
+        'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))')
+    SETTINGS object_storage_cluster = 'non_existing_cluster', object_storage_cluster_fallback_if_empty = 1
+    """
+    )
+
+    assert TSV(pure_s3) == TSV(fallback_s3)
+
+    pure_sum = node.query(
+        f"""
+    SELECT sum(value) from s3(
+        'http://minio1:9001/root/data/{{clickhouse,database}}/*',
+        'minio', '{minio_secret_key}', 'CSV',
+        'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))')"""
+    )
+
+    fallback_sum = node.query(
+        f"""
+    SELECT sum(value) from s3(
+        'http://minio1:9001/root/data/{{clickhouse,database}}/*',
+        'minio', '{minio_secret_key}', 'CSV',
+        'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))')
+    SETTINGS object_storage_cluster = 'non_existing_cluster', object_storage_cluster_fallback_if_empty = 1
+    """
+    )
+
+    assert TSV(pure_sum) == TSV(fallback_sum)
+
+    query_id = uuid.uuid4().hex
+    result = node.query(
+        f"""
+        SELECT * from s3(
+            'http://minio1:9001/root/data/{{clickhouse,database}}/*', 'minio', '{minio_secret_key}', 'CSV',
+            'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))') ORDER BY (name, value, polygon)
+        SETTINGS
+            object_storage_remote_initiator=1,
+            object_storage_cluster='hidden_cluster_with_username_and_password',
+            object_storage_remote_initiator_cluster='cluster_with_dots',
+            object_storage_cluster_fallback_if_empty=1
+        """,
+        query_id=query_id,
+    )
+
+    assert result is not None
+
+    node.query("SYSTEM FLUSH LOGS ON CLUSTER 'cluster_all'")
+    queries = node.query(
+        f"""
+        SELECT count()
+            FROM clusterAllReplicas('cluster_all', system.query_log)
+            WHERE type='QueryFinish' AND initial_query_id='{query_id}'
+            FORMAT TSV
+        """
+    ).splitlines()
+
+    # initial node + remote initiator + 2 subqueries on replicas
+    assert queries == ["4"]
+
+
 def test_ambiguous_join(started_cluster):
     node = started_cluster.instances["s0_0_0"]
     result = node.query(

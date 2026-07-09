@@ -1,0 +1,13 @@
+pure
+10	45
+unknown cluster without fallback
+unknown cluster with fallback
+10	45
+valid cluster with fallback
+10	45
+remote initiator unresolved with fallback
+10	45
+aggregate with fallback
+285
+pure aggregate
+285
