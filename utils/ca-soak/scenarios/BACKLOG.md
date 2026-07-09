@@ -1635,3 +1635,29 @@ infra/measurement gaps (not CA defects — all had dangling=0 + agreement):
   model (min_ack passing the condemn round requires the writer's own ack, by which time its durable edge
   is folded → spared, so graduation can't fire) — but it rides entirely on (c); fail-closed keeps the
   landed resurrect/copy-forward (cost = one rare PUT).
+
+## PROMOTE-REVALIDATION-MINIMIZATION variant B (user-proposed, 2026-07-09): per-commit pinned-round ack
+
+- **Proposal (user):** the beat advertises `min(installed_round, min over active builds' pinned_round)`,
+  where `pinned_round` is latched at `startBuild` (before the first observation) and released at build end
+  — the exact pattern `min_active` already applies to build_seq on the SAME merged beat
+  (CasStore.h:294-303). Then the ack floor can never pass any live commit's knowledge → the
+  adopt→precommitAdd window (the one theoretical counterexample requiring the promote blob gate for a
+  live writer) closes BY CONSTRUCTION.
+- **Consequences:** promote's per-leaf HEAD revalidation becomes theoretically redundant → drop it
+  (owner-check + pure owner-move only; O(0) backend calls) — supersedes the variant-A HEAD-skip. The
+  landed resurrect/copy-forward machinery stays as the insurance path behind a "paranoid revalidation"
+  setting (still catches clamp-suppression-class accounting bugs — 31 live dangles once — and any
+  out-of-band deletion). Fence stays covered by the existing local write-fence deadline
+  (CasStore.h:305-307) + mount-epoch check (CasBuild.cpp:125-127), independent of the blob gate.
+- **Cost (liveness):** a wedged-but-alive commit (S3 retry storm; beat healthy so no fence) holds the
+  POOL-WIDE graduation floor at its pinned round — condemns accumulate, retired lists grow until the
+  commit finishes. Needs a per-commit pin deadline (natural hook: the same write-fence monotonic
+  deadline; a commit outliving it drops its pin and must take the paranoid revalidation path).
+- **Safety notes:** advertising less than installed is fail-closed (view_gate invariant holds a
+  fortiori); the local view keeps advancing (syncer untouched) so putBlob only gets stricter; audit ALL
+  consumers of observed_gc_round before wiring (floor R1 + srid_acks observability today).
+- **TLA+:** extend the CaBuildWatermark.tla min-over-active-builds pattern to the round ack; sabotage
+  config = no-pin (must reproduce the adopt-window dangle), positive = pin + no blob gate holds
+  INV_NO_DANGLE/INV_NO_LOSS.
+- Full design cycle required (spec → consult → TLA+ gate → impl). Complements, then retires, variant A.
