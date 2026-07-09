@@ -122,6 +122,9 @@ public:
 
     virtual bool operator==(const IDataLakeMetadata & other) const = 0;
 
+    /// Returns the full table location URI (e.g. `s3a://bucket/prefix/table/`)
+    virtual std::string getTableLocation() const { return {}; }
+
     /// Return iterator to `data files`.
     using FileProgressCallback = std::function<void(FileProgress)>;
     virtual ObjectIterator iterate(
@@ -223,10 +226,9 @@ public:
         const String & /* transaction_id */,
         Int64 /* original_schema_id */,
         Int64 /* partition_spec_id */,
-        const std::vector<Field> & /* partition_values */,
+        const Block & /* partition_source_block */,
         SharedHeader /* sample_block */,
         const std::vector<String> & /* data_file_paths */,
-        StorageObjectStorageConfigurationPtr /* configuration */,
         ContextPtr /* context */)
         {
             throwNotImplemented("commitExportPartitionTransaction");

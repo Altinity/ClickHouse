@@ -1,4 +1,5 @@
 #pragma once
+#include <chrono>
 #include <optional>
 #include <Core/Types.h>
 #include <Core/NamesAndTypes.h>
@@ -49,7 +50,6 @@ public:
     bool hasLocation() const;
     bool hasSchema() const;
     bool hasStorageCredentials() const;
-    bool hasDataLakeSpecificProperties() const;
 
     void setLocation(const std::string & location_);
     std::string getLocation() const;
@@ -219,6 +219,8 @@ public:
     {
         return std::nullopt;
     }
+
+    virtual void setVendedCredentialsCacheTTL(std::chrono::seconds /*ttl*/) {}
 
 protected:
     /// Name of the warehouse,

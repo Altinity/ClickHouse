@@ -62,6 +62,7 @@ static struct InitFiu
     ONCE(rmt_lightweight_update_sleep_after_block_allocation) \
     ONCE(rmt_merge_task_sleep_in_prepare) \
     ONCE(s3_read_buffer_throw_expired_token) \
+    ONCE(s3_send_request_throw_expired_token) \
     ONCE(distributed_cache_fail_request_in_the_middle_of_request) \
     ONCE(object_storage_queue_fail_commit_once) \
     ONCE(distributed_cache_fail_continue_request) \
@@ -85,6 +86,7 @@ static struct InitFiu
     REGULAR(smt_outdated_parts_exception_response) \
     REGULAR(object_storage_queue_fail_in_the_middle_of_file) \
     PAUSEABLE_ONCE(replicated_merge_tree_insert_retry_pause) \
+    ONCE(replicated_merge_tree_restore_attach_retry) \
     PAUSEABLE_ONCE(finish_set_quorum_failed_parts) \
     PAUSEABLE_ONCE(finish_clean_quorum_failed_parts) \
     PAUSEABLE_ONCE(smt_wait_next_mutation) \
@@ -133,6 +135,8 @@ static struct InitFiu
     ONCE(iceberg_export_after_commit_before_zk_completed) \
     REGULAR(export_partition_commit_always_throw) \
     ONCE(export_partition_status_change_throw) \
+    REGULAR(export_part_non_retryable_throw) \
+    REGULAR(export_part_retryable_throw) \
     ONCE(backup_add_empty_memory_table) \
     PAUSEABLE_ONCE(backup_pause_on_start) \
     PAUSEABLE_ONCE(restore_pause_on_start) \
@@ -167,7 +171,9 @@ static struct InitFiu
     PAUSEABLE_ONCE(drop_database_before_exclusive_ddl_lock) \
     REGULAR(storage_merge_tree_background_schedule_merge_fail) \
     REGULAR(patch_parts_reverse_column_order) \
-    REGULAR(wide_part_writer_fail_in_add_streams)
+    REGULAR(wide_part_writer_fail_in_add_streams) \
+    REGULAR(compact_part_writer_fail_in_add_streams) \
+    REGULAR(query_metric_log_delay_collect)
 
 namespace FailPoints
 {
