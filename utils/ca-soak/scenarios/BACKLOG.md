@@ -1452,3 +1452,19 @@ infra/measurement gaps (not CA defects — all had dangling=0 + agreement):
      count. Consider having only the leader record.
 - **Proposed action:** address #1 if/when eviction visibility is needed (with the subclass approach above);
   #2/#3 optional polish. None block the feature.
+
+## SOAK-TTL-BAND-abort: FIXED — checkpoint aborted spuriously on ambiguous TTL band under ttl_pressure
+
+- **Logged (UTC):** 2026-07-09  **Status: FIXED (obvious/small harness bug, per Task 3 directive).**
+- **Observed:** the 4h soak aborted at the chaos-stage entry checkpoint (~72min in) with `CHECKPOINT
+  FAILURE: ambiguous TTL band still non-empty after 6 waits`. The preceding gc_checkpoint was CLEAN
+  (dangling=0, unreachable=0, exact count matched) — so NOT a CA bug.
+- **Root cause:** TTL=90min; at a checkpoint ~90min into the run, the warmup-stage rows (inserted over a
+  wide window) all cross their `ts+5400` boundary around `now`, so the ±10s ambiguity band is never empty
+  within the bounded 6×11s wait (as `now` advances past one row's boundary, another enters). The oracle
+  treated this timing artifact as fatal.
+- **Fix (`soak/run.py` checkpoint):** degrade like the existing FsckTimeout path instead of aborting —
+  WARN, skip only the exact SUM equality (genuinely ambiguous), but STILL enforce (a) a band-tolerant
+  COUNT RANGE `[count(now+eps), count(now-eps)]` (catches real data loss/dup) and (b) the GC-to-fixpoint
+  + clean-pool fsck gate (the CA-integrity oracle, unaffected by TTL timing). Exact compare unchanged at
+  non-ambiguous checkpoints. 22 model tests pass.

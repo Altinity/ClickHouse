@@ -440,12 +440,23 @@ def checkpoint(driver, cluster, model, phase):
     AMBIGUOUS_BAND_EPS = 10
     AMBIGUOUS_BAND_MAX_ATTEMPTS = 6
     band_attempt = 0
+    ttl_band_ambiguous = False
     while model.ambiguous_band_nonempty(now, eps=AMBIGUOUS_BAND_EPS):
         if band_attempt >= AMBIGUOUS_BAND_MAX_ATTEMPTS:
-            raise CheckpointFailure(
-                f"ambiguous TTL band still non-empty at now={now} after "
-                f"{AMBIGUOUS_BAND_MAX_ATTEMPTS} waits (a row stays within {AMBIGUOUS_BAND_EPS}s of its "
-                f"TTL boundary; genuinely stuck scheduling — checkpoint cannot be asserted exactly)")
+            # Under sustained TTL pressure MANY rows cross their boundary around `now`, so the ±eps band
+            # may never empty within a bounded wait: as `now` advances past one row's boundary another
+            # enters the band. The original code treated this as fatal, but it is a checkpoint-TIMING
+            # artifact, NOT corruption (B173-class) — exactly like the FsckTimeout path below. Degrade
+            # instead of aborting: WARN, skip only the EXACT sum equality (which the band makes genuinely
+            # ambiguous), but STILL enforce (a) a band-tolerant COUNT RANGE (catches real data loss/dup)
+            # and (b) the GC-to-fixpoint + clean-pool fsck gate — the CA-integrity oracle, which TTL
+            # timing cannot affect. The exact `compare_aggregates` runs unchanged at every non-ambiguous
+            # checkpoint. (Fixes the chronic TTL-band soak abort; see BACKLOG SOAK-TTL-band.)
+            log(f"WARNING [TTL-band] ambiguous TTL band still non-empty at now={now} after "
+                f"{AMBIGUOUS_BAND_MAX_ATTEMPTS} waits; degrading this checkpoint to a band-tolerant "
+                f"count-range + CA-integrity (fsck) gate (TTL-timing artifact, not corruption) — soak continues")
+            ttl_band_ambiguous = True
+            break
         band_attempt += 1
         wait_s = AMBIGUOUS_BAND_EPS + 1
         log(f"checkpoint: ambiguous TTL band non-empty at now={now}; waiting {wait_s}s to clear "
@@ -456,7 +467,21 @@ def checkpoint(driver, cluster, model, phase):
     exp = model.aggregates(now)
     n1 = query_aggregates(cluster.node1, TABLE)
     n2 = query_aggregates(cluster.node2, TABLE)
-    compare_aggregates(exp, n1, n2)
+    if not ttl_band_ambiguous:
+        compare_aggregates(exp, n1, n2)
+    else:
+        # Band-tolerant COUNT range: every row is definitely-live if its boundary is > now+eps and
+        # definitely-gone if < now-eps; band rows (within ±eps) may be either. So the replica's live
+        # count must lie within [count(now+eps), count(now-eps)]. A count outside this range is a REAL
+        # divergence (data loss/dup), not TTL timing → still fatal. Exact sum equality is skipped
+        # because the band rows' sum contribution is genuinely undetermined here.
+        count_low = model.aggregates(now + AMBIGUOUS_BAND_EPS)["count"]
+        count_high = model.aggregates(now - AMBIGUOUS_BAND_EPS)["count"]
+        for node_name, na in (("node1", n1), ("node2", n2)):
+            if not (count_low <= na["count"] <= count_high):
+                raise CheckpointFailure(
+                    f"TTL-band-tolerant checkpoint: {node_name} count {na['count']} outside the "
+                    f"band range [{count_low}, {count_high}] at now={now} — real divergence, not TTL timing")
 
     # Drop rows the table has already TTL-deleted so the oracle dict stays bounded by the live set
     # instead of every rid ever inserted. The workload is drained here and `now` is freshly quiesced,
