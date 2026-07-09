@@ -794,30 +794,11 @@ void Build::promote(const RootNamespace & target_ns, const String & final_ref_na
     if (!manifestNamespaceMatches(target_ns, body))
         throw Exception(ErrorCodes::ABORTED, "promote: ManifestNamespaceMatches failed for {}", manifest_key);
 
-    /// Copy-forward pre-pass (spec 2026-07-02-cas-copy-forward-condemned-evidence.md): a blob leaf
-    /// whose dep is TOKENLESS W-EVIDENCE (adoptEvidence — always from a COMMITTED source manifest;
-    /// republishRef / fetch-receiver / part copy) has NO source bytes to re-upload from. Displace each
-    /// condemned-but-present such incarnation via verified copy-forward BEFORE entering the shard CAS
-    /// loop (a large-blob GET+PUT head-of-line-blocks the shard's flat-combining leader and holds
-    /// view_gate against the retired-view install drain — so keep the heavy work outside the lock in
-    /// the common case). This pre-pass reads the CURRENT (pre-refresh) retire view, so it is only the
-    /// fast path: a condemnation surfacing only in the in-closure fence refresh (spec
-    /// 2026-07-09-cas-promote-tokenless-copyforward-race) is MISSED here and handled by the in-closure
-    /// backstop below (which copies it forward against the post-refresh view instead of aborting).
-    /// Sourced (tokened) deps and unknown leaves keep the fail-closed abort.
-    for (const ManifestEntry & e : body.entries)
-    {
-        if (e.placement != EntryPlacement::Blob)
-            continue;
-        if (!isCopyForwardableTokenless(e.blob_hash))
-            continue;
-        const String blob_key = store->layout().blobKey(BlobId{u128ToHex(e.blob_hash)});
-        const HeadResult hr = store->backend().head(blob_key);
-        if (!hr.exists)
-            continue;   /// absent with no source: the gate below fails closed (ABORTED)
-        if (store->retireView().isCondemnedToken(ObjectKind::Blob, e.blob_hash, hr.token))
-            copyForwardFromCondemned(e.blob_hash, blob_key, hr);
-    }
+    /// D3 (spec 2026-07-09-cas-writer-gc-simplification): the copy-forward pre-pass is removed — the
+    /// in-closure blob revalidation below is now the SINGLE copy-forward site. Trade-off: the rare
+    /// condemned-tokenless copy-forward (a GET+PUT) now runs inside the shard CAS closure, briefly
+    /// blocking the flat-combining queue; it is idempotent under CAS retry (a re-run sees its own fresh
+    /// token). Accepted — Phase B replaces the heavy body-dance with a meta CAS anyway.
 
     /// The OwnerBinding that the create-precommit event installed (precommitAdd). The promote is a pure
     /// owner MOVE off EXACTLY this binding (spec §Promote Precommit step 5; TLA+ `WPromote` old-binding).

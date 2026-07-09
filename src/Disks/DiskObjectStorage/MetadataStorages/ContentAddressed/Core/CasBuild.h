@@ -147,9 +147,9 @@ private:
     /// A leaf is copy-forwardable iff this build holds a TOKENLESS W-EVIDENCE Blob dep for `hash`
     /// (adoptEvidence — in production always sourced from a committed manifest, which is the copy-forward
     /// exception's PROVENANCE; it is NOT a checked runtime guarantee here). The enforced runtime safety
-    /// rests on the caller's owner-liveness check + fold barrier (see the backstop in `promote`), exactly
-    /// as the tokened `uploadFromSource` resurrect does. A tokened dep, or NO dep at all (a staging bug —
-    /// must fail closed), is NOT copy-forwardable. Single source of truth for the pre-pass and the backstop.
+    /// rests on the caller's owner-liveness check + fold barrier (see the in-closure gate in `promote`),
+    /// exactly as the tokened resurrect did. A tokened dep, or NO dep at all (a staging bug — must fail
+    /// closed), is NOT copy-forwardable. The single gate for the promote copy-forward site (D3).
     bool isCopyForwardableTokenless(const UInt128 & hash) const;
 
     StorePtr store;
