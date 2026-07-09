@@ -207,3 +207,13 @@ Watchdog cron: job 60470431 (hourly at :23).
   SOUND (minimal guarantee stated + code-provided); backends key-agnostic (no gap); ca-inspect .meta
   dispatch bug pre-identified; M2/M4/M5 folded; Gate B += sabotages (f) birth-completion-by-adoption and
   (g) fresh-HEAD body delete.
+
+- **Phase A Tasks 7-8 landed (controller-inline after pa78-impl hung 2h/zero artifacts — stood down).**
+  D4 (0d86389b93b): view_gate member + both lock sites removed; syncer installs under RetireView's own
+  mutex; the drain test INVERTED (SyncInstallsWithoutWaitingForInFlightMutation — the new non-blocking
+  contract). D5 (55877eb623c): writer-side fence_round refresh removed; 4 tests migrated — the newborn
+  shard-incarnation test now asserts the Phase-A contract (condemned token bound UNCHANGED; floor holds
+  graduation since our ack < condemn round; durable edge spares at next fold; dangling=0), and the 3
+  K3 tests install the view explicitly (preserving visible-condemnation gate coverage). Full sweep after:
+  only the 2 known CaWiring* flakes. Task 9 validation started (clickhouse rebuild → 4 stateless → lane;
+  ASan units for the chassert gate after).
