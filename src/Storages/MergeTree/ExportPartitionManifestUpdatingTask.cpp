@@ -10,6 +10,7 @@
 #include <Common/escapeForFileName.h>
 #include <Interpreters/DatabaseCatalog.h>
 #include <fmt/format.h>
+#include <optional>
 
 namespace ProfileEvents
 {
@@ -48,7 +49,7 @@ namespace
 
     /// Fetch all per-replica last_exception leaves under <entry_path>/last_exception and build
     /// a fresh map keyed by replica name.
-    std::map<String, LastExceptionEntry> readLastExceptionPerReplica(
+    std::optional<std::map<String, LastExceptionEntry>> readLastExceptionPerReplica(
         const zkutil::ZooKeeperPtr & zk,
         const std::filesystem::path & entry_path,
         const std::string & log_key,
@@ -64,7 +65,7 @@ namespace
         if (Coordination::Error::ZOK != zk->tryGetChildren(container_path, children))
         {
             LOG_WARNING(log, "ExportPartition Manifest Updating Task: failed to list last_exception leaves for {}, leaving in-memory copy untouched", log_key);
-            return out;
+            return std::nullopt;
         }
 
         if (children.empty())
@@ -119,13 +120,11 @@ namespace
     /// fresh map keyed by part_name. Returns the destination file paths recorded for
     /// each finished part.
     ///
-    /// Same lenient semantics as readLastExceptionPerReplica: an empty result means
-    /// "nothing actionable" (transient ZK error, no children yet, or all leaves
-    /// concurrently removed) and callers MUST skip the assignment to preserve the
-    /// in-memory mirror across glitches. Safe because processed/<part> leaves are
-    /// written once on per-part success and never rewritten — the entire entry path
-    /// is wiped recursively at task cleanup, handled separately.
-    std::map<String, std::vector<String>> readDestinationFilePathsPerPart(
+    /// Same lenient semantics as readLastExceptionPerReplica: nullopt means
+    /// "nothing actionable" (transient ZK error) and callers MUST skip the
+    /// assignment to preserve the in-memory mirror across glitches. An engaged
+    /// empty map means the read succeeded and no part has finished yet.
+    std::optional<std::map<String, std::vector<String>>> readDestinationFilePathsPerPart(
         const zkutil::ZooKeeperPtr & zk,
         const std::filesystem::path & entry_path,
         const std::string & log_key,
@@ -141,7 +140,7 @@ namespace
         if (Coordination::Error::ZOK != zk->tryGetChildren(container_path, children))
         {
             LOG_INFO(log, "ExportPartition Manifest Updating Task: failed to list processed leaves for {}, leaving in-memory copy untouched", log_key);
-            return out;
+            return std::nullopt;
         }
 
         if (children.empty())
@@ -546,7 +545,7 @@ void ExportPartitionManifestUpdatingTask::poll()
                 continue;
             }
 
-            const auto destination_file_paths_per_part = readDestinationFilePathsPerPart(
+            auto destination_file_paths_per_part = readDestinationFilePathsPerPart(
                 zk, fs::path(entry_path), key, log);
 
             /// If we hold the cleanup lock, enforce the task timeout and recover uncommitted exports.
@@ -567,7 +566,14 @@ void ExportPartitionManifestUpdatingTask::poll()
 
             if (!has_local_entry)
             {
-                addTask(metadata, *status, std::move(last_exception_per_replica), std::move(destination_file_paths_per_part), readCommitInfo(zk, fs::path(entry_path), key, log), key, entries_by_key);
+                addTask(
+                    metadata,
+                    *status,
+                    last_exception_per_replica ? std::move(*last_exception_per_replica) : std::map<String, LastExceptionEntry>{},
+                    destination_file_paths_per_part ? std::move(*destination_file_paths_per_part) : std::map<String, std::vector<String>>{},
+                    readCommitInfo(zk, fs::path(entry_path), key, log),
+                    key,
+                    entries_by_key);
                 LOG_INFO(log, "ExportPartition Manifest Updating Task: Added new entry for task {}", key);
                 continue;
             }
@@ -578,8 +584,10 @@ void ExportPartitionManifestUpdatingTask::poll()
             }
 
             /// If we already have the local entry, we need to update it
-            local_entry->last_exception_per_replica = std::move(last_exception_per_replica);
-            local_entry->destination_file_paths_per_part = std::move(destination_file_paths_per_part);
+            if (last_exception_per_replica)
+                local_entry->last_exception_per_replica = std::move(*last_exception_per_replica);
+            if (destination_file_paths_per_part)
+                local_entry->destination_file_paths_per_part = std::move(*destination_file_paths_per_part);
 
             const bool status_changed = local_entry->status != *status;
             if (status_changed)
@@ -804,11 +812,11 @@ void ExportPartitionManifestUpdatingTask::handleStatusChanges()
             /// Refresh per-part destination paths and commit_info on the status flip too,
             /// so the system table observes the COMPLETED state and the committed file
             /// paths in the same poll cycle.
-            const auto destination_file_paths_per_part = readDestinationFilePathsPerPart(
+            auto destination_file_paths_per_part = readDestinationFilePathsPerPart(
                     zk, fs::path(storage.zookeeper_path) / "exports" / key, key, log);
-            if (!destination_file_paths_per_part.empty())
+            if (destination_file_paths_per_part)
             {
-                it->destination_file_paths_per_part = std::move(destination_file_paths_per_part);
+                it->destination_file_paths_per_part = std::move(*destination_file_paths_per_part);
             }
 
             /// commit_info is written atomically with the COMPLETED status, so only read it on that
@@ -834,8 +842,8 @@ void ExportPartitionManifestUpdatingTask::handleStatusChanges()
             }
 
             /// Apply the in-memory updates directly (poll() cannot run concurrently under M_task).
-            if (!fetched.empty())
-                it->last_exception_per_replica = std::move(fetched);
+            if (fetched)
+                it->last_exception_per_replica = std::move(*fetched);
 
             it->status = *new_status;
 
