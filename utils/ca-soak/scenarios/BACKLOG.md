@@ -1581,3 +1581,27 @@ infra/measurement gaps (not CA defects — all had dangling=0 + agreement):
 - NOTE: literal 0 on the FULL CA-s3-DEFAULT suite ALSO needs handling the 31 env fails (local-env fixes or
   standard no-* storage-modifier tags for tests that don't test CA, e.g. the clickhouse-local set that
   shares the CA pool) — those are not CA-write-path bugs.
+
+## PROMOTE-CONDEMN-TOKENLESS-2026-07-09: DETACH/freeze adopt path hits the same condemn race (not fixed by the INSERT fix)
+
+- **Logged (UTC):** 2026-07-09. Surfaced in the full CA-s3 lane AFTER the tokened-INSERT resurrect fix
+  (spec/plan 2026-07-09-cas-promote-resurrect-tokened-blob) landed + validated (01156/01710/02346 now OK
+  under load).
+- **Symptom:** `03283_optimize_on_insert_level` FAIL — `ALTER TABLE ... DETACH PARTITION` →
+  `StorageMergeTree::dropPartition` → `makeCloneInDetached` → freeze → CAS commit → promote →
+  `promote: blob <h> condemned at commit revalidation — failing closed (INV-1)` (Code 236 ABORTED,
+  CasBuild.cpp:931, the `!src` tokenless backstop).
+- **Root:** the clone-into-detached path references source blobs via tokenless `adoptEvidence` (no putBlob,
+  no retained source), so the tokened resurrect (uploadFromSource) does NOT apply. The existing
+  copy-forward pre-pass (copyForwardFromCondemned, the committed-source INV-1 exception) is SINGLE-SHOT and
+  runs BEFORE the CAS closure (deliberately — GET+PUT must not run inside a retried mutateShard closure).
+  The race: pre-pass copy-forwards the condemned tokenless blob → GC re-condemns the fresh incarnation →
+  in-closure revalidation sees it condemned → backstop ABORTED. Architecturally flagged "rare,
+  retryable-by-caller"; soak retries and passes, stateless (no retry) surfaces it.
+- **NOT a regression:** old promote aborted on EVERY condemned leaf (no resurrect at all); the INSERT fix
+  only added tokened resurrect — tokenless leaves abort byte-for-byte as before.
+- **FIX (separate careful cycle):** make the copy-forward pre-pass a BOUNDED loop (copy-forward → re-HEAD →
+  repeat until not-condemned or bound), keeping GET+PUT OUTSIDE the CAS closure — the tokenless analogue of
+  the tokened bounded resurrect loop. Needs its own design + fresh-model consult + TLA+ gate (the copyForward
+  reads the condemned-but-present object; verify liveness/no-dangle under bounded retry). Relates to
+  [[project_ca_p31_mount_fence_recovery]] (S13 copy-forward origin), [[project_resurrect_reupload_orphan]].
