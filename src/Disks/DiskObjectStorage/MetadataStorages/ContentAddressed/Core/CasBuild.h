@@ -51,8 +51,6 @@ public:
     /// tokened) versus a TOKENLESS W-EVIDENCE dep (adoptEvidence ⇒ tokenless)? False also when this
     /// build has no dep for the hash at all.
     bool depIsTokened(const UInt128 & hash) const;
-    /// Whether this build holds ANY Blob dep (tokened or tokenless) for `hash`.
-    bool hasDep(const UInt128 & hash) const;
 
     /// B188: record a TOKENLESS W-EVIDENCE blob dep directly from a ManifestEntry — NO HEAD, no backend
     /// call. Lets staging adopt sites record the dep by hash without asserting presence before
@@ -107,7 +105,6 @@ private:
     {
         ObjectKind kind = ObjectKind::Blob;
         std::optional<Token> token;                       /// nullopt = live-root evidence (W-EVIDENCE)
-        uint64_t observed_view_round = 0;                 /// W-REVALIDATE bookkeeping
         uint64_t size = 0;
     };
     using DepKey = std::pair<uint8_t, UInt128>;           /// (kind, hash)

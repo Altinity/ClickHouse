@@ -277,17 +277,14 @@ TEST(CasBuildReuseBlob, DepIsTokenedDiscriminatesPutBlobVsAdopt)
     /// putBlob'd hash ⇒ tokened.
     build->putBlob(idOf("written"), BlobSource::fromString("written"));
     EXPECT_TRUE(build->depIsTokened(u128Of("written")));
-    EXPECT_TRUE(build->hasDep(u128Of("written")));
 
     /// Adopted hash ⇒ tokenless. adoptEvidence records the dep directly from a resolved ManifestEntry
     /// (the source manifest's entry); no body needs to be in hand for the dep to be recorded.
     build->adoptEvidence(blobManifestEntry("f", "adopted"));
     EXPECT_FALSE(build->depIsTokened(u128Of("adopted")));
-    EXPECT_TRUE(build->hasDep(u128Of("adopted")));
 
     /// Unknown hash ⇒ no dep, not tokened.
     EXPECT_FALSE(build->depIsTokened(u128Of("unknown")));
-    EXPECT_FALSE(build->hasDep(u128Of("unknown")));
 }
 
 /// B190: ReuseBlobCondemnedThrowsAbortedRetryable is removed (reuseBlob is gone).
@@ -1092,23 +1089,26 @@ TEST(CasBuild, PromoteRevalidatesBlobPresenceFailClosed)
 TEST(CasBuild, AdoptEvidenceRecordsTokenlessDep)
 {
     /// Port of AdoptFromTreeRecordsEvidence. adoptEvidence records a TOKENLESS W-EVIDENCE dep directly
-    /// from a resolved ManifestEntry — observed indirectly: hasDep is true and depIsTokened is false.
+    /// from a resolved ManifestEntry — a Blob entry is tokenless (depIsTokened false), an Inline entry
+    /// records nothing. The dep's EXISTENCE + copy-forwardability (tokenless-recorded vs no-dep) is
+    /// asserted end-to-end at the promote gate by CondemnedPresentEvidenceDepCopiesForwardAtGate
+    /// (positive: tokenless dep ⇒ copy-forward) and PromoteCondemnedLeafWithoutDepAbortsFailClosed
+    /// (negative control: no dep ⇒ fail closed).
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openStore(b);
     auto build = s->startBuild({});
 
     const ManifestEntry adopted = blobManifestEntry("data.bin", "source-blob");
     build->adoptEvidence(adopted);
-    EXPECT_TRUE(build->hasDep(u128Of("source-blob")));
     EXPECT_FALSE(build->depIsTokened(u128Of("source-blob")));
 
-    /// An Inline entry references no standalone object → records nothing.
+    /// An Inline entry references no standalone object → records nothing (never tokened).
     ManifestEntry inline_entry;
     inline_entry.path = "small";
     inline_entry.placement = EntryPlacement::Inline;
     inline_entry.inline_bytes = "abc";
     build->adoptEvidence(inline_entry);
-    EXPECT_FALSE(build->hasDep(u128Of("abc")));
+    EXPECT_FALSE(build->depIsTokened(u128Of("abc")));
 }
 
 TEST(CasBuild, AbandonRemovesStagedDebrisAndDisables)
@@ -1377,8 +1377,8 @@ TEST(CasBuild, AdoptEvidenceNoBackendOp)
     ///
     /// Two behavioural assertions:
     ///   1. No backend op fires during adoptEvidence (counted via a delegating wrapper).
-    ///   2. The recorded dep is usable: after adoptEvidence(entry), hasDep is true (the W-EVIDENCE dep
-    ///      is what the promote gate later revalidates).
+    ///   2. The recorded dep is tokenless: after adoptEvidence(entry), depIsTokened is false (the
+    ///      W-EVIDENCE dep is what the promote gate later revalidates).
 
     /// A delegating wrapper that counts every backend access path including the streaming write path.
     struct LocalCountingBackend final : public Backend
@@ -1425,8 +1425,8 @@ TEST(CasBuild, AdoptEvidenceNoBackendOp)
     EXPECT_EQ(counting->stream_puts, 0u) << "adoptEvidence must not PUT to the backend";
     EXPECT_EQ(counting->gets, 0u) << "adoptEvidence must not GET from the backend";
 
-    /// The dep is recorded — a tokenless W-EVIDENCE dep that the promote gate later revalidates.
-    EXPECT_TRUE(build->hasDep(u128Of("b188-content")));
+    /// The dep is recorded — a tokenless W-EVIDENCE dep (depIsTokened false) that the promote gate later
+    /// revalidates; the no-backend-op counts above are the B188 contract's primary guard.
     EXPECT_FALSE(build->depIsTokened(u128Of("b188-content")));
 
     /// Inline entry: adoptEvidence records nothing (Inline has no standalone object) and no backend op.
@@ -1438,7 +1438,7 @@ TEST(CasBuild, AdoptEvidenceNoBackendOp)
     EXPECT_EQ(counting->heads, 0u);
     EXPECT_EQ(counting->stream_puts, 0u);
     EXPECT_EQ(counting->gets, 0u);
-    EXPECT_FALSE(build->hasDep(u128Of("xy")));
+    EXPECT_FALSE(build->depIsTokened(u128Of("xy")));
 }
 
 TEST(CasBuild, ConvergesUnderProductiveGc)

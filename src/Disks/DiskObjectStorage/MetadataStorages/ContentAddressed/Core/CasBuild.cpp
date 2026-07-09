@@ -224,11 +224,6 @@ bool Build::depIsTokened(const UInt128 & hash) const
     return it != deps.end() && it->second.token.has_value();
 }
 
-bool Build::hasDep(const UInt128 & hash) const
-{
-    return deps.contains({static_cast<uint8_t>(ObjectKind::Blob), hash});
-}
-
 uint64_t Build::observeAndAdmit(ObjectKind kind, const UInt128 & hash, const String & key)
 {
     const HeadResult hr = store->backend().head(key);
@@ -299,7 +294,7 @@ uint64_t Build::observeAndAdmit(ObjectKind kind, const UInt128 & hash, const Str
         e.reason = "observed token not condemned; adopted the live incarnation (no bytes moved)";
     });
     deps[{static_cast<uint8_t>(kind), hash}] =
-        DepEntry{kind, hr.token, store->retireView().round(), logical_size};
+        DepEntry{kind, hr.token, logical_size};
     return logical_size;
 }
 
@@ -374,7 +369,7 @@ void Build::uploadFromSource(ObjectKind kind, const UInt128 & hash, const String
     auto recordDoneAndEmit = [&](Token tok)
     {
         deps[{static_cast<uint8_t>(kind), hash}] =
-            DepEntry{kind, tok, store->retireView().round(), source.size};
+            DepEntry{kind, tok, source.size};
         EventEmitter{*store}.emit([&](CasEvent & e)
         {
             e.type = CasEventType::BlobPut;
@@ -614,7 +609,7 @@ void Build::adoptEvidence(const ManifestEntry & entry)
     if (entry.placement == EntryPlacement::Blob)
     {
         deps[{static_cast<uint8_t>(ObjectKind::Blob), entry.blob_hash}] =
-            DepEntry{ObjectKind::Blob, std::nullopt, store->retireView().round(), entry.blob_size};
+            DepEntry{ObjectKind::Blob, std::nullopt, entry.blob_size};
     }
 }
 
@@ -622,7 +617,7 @@ void Build::recordPendingBlobDep(const UInt128 & hash, uint64_t size)
 {
     requireAlive();
     deps[{static_cast<uint8_t>(ObjectKind::Blob), hash}] =
-        DepEntry{ObjectKind::Blob, std::nullopt, store->retireView().round(), size};
+        DepEntry{ObjectKind::Blob, std::nullopt, size};
 }
 
 RootNamespace Build::manifestNamespace() const

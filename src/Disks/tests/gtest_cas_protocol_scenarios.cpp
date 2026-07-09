@@ -551,7 +551,7 @@ TEST(CasProtocol, FreshEvidenceDepWithViewHitIsResolvedByGate)
     auto b = std::make_shared<InMemoryBackend>();
 
     /// Pre-inject retire state at round=1 BEFORE opening the store — the store's open-time refresh lands
-    /// at round=1, so any dep recorded thereafter is non-stale (observed_view_round == 1).
+    /// at round=1, so any dep recorded thereafter is observed against the already-refreshed view.
     /// The blob is minted with the POOL streaming-hash convention (copy-forward verifies against it).
     DB::Cas::Layout layout("p");
     const String hex = streamingHexOf("payload-fresh-ev");
@@ -570,7 +570,7 @@ TEST(CasProtocol, FreshEvidenceDepWithViewHitIsResolvedByGate)
 
     const RootNamespace ns{"srv1/tbl"};
     auto build = startBuildFor(s, ns, "part_1");
-    /// adoptEvidence records a TOKENLESS dep at observed_view_round = 1 (the current round) — FRESH.
+    /// adoptEvidence records a TOKENLESS dep against the current (round-1) view.
     ManifestEntry entry = blobEntry("data.bin", "payload-fresh-ev");
     entry.blob_hash = hexToU128(hex);   /// streaming-convention id (matches the minted blob)
     build->adoptEvidence(entry);
