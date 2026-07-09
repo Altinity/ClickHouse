@@ -110,12 +110,12 @@ longer the conditional authority.
 | Operation | Protocol |
 |---|---|
 | **Fresh upload** (`putBlob`, cache-miss) | optimistic PUT body (If-None-Match). Success ⇒ PUT meta (If-None-Match; a 412 here = racing writer won ⇒ re-GET meta ⇒ adopt). Body 412 ⇒ dedup path ↓ |
-| **Dedup-adopt** (`putBlob`, cache-hit or body-412) | **ONE GET meta.** Present + clean ⇒ adopt (reference the body directly — INV-META-BODY guarantees presence, no body HEAD). Condemned ⇒ resurrect ↓. Absent + no body-412 seen ⇒ fresh-upload path. **Absent + body-412 (a crashed pre-meta birth left a debris body) ⇒ COMPLETE THE BIRTH:** PUT meta If-None-Match `{fresh incarnation, clean}` then adopt — the debris content is hash-correct by construction (its uploader wrote it conditionally under this content key); a 412 on this completion ⇒ someone else completed or the sweep claimed it ⇒ re-GET and follow. Prevents the body-412/meta-absent livelock |
+| **Dedup-adopt** (`putBlob`, cache-hit or body-412) | **ONE GET meta.** Present + clean ⇒ adopt (reference the body directly — INV-META-BODY guarantees presence, no body HEAD). Condemned ⇒ resurrect ↓. Absent + no body-412 seen ⇒ fresh-upload path. **Absent + body-412 ⇒ BIRTH-COMPLETION BY RESURRECT (consult C1):** the state `(meta absent ∧ body present)` is NOT proof of a crashed birth — GC's top-down delete produces it transiently (meta deleted, body pending) — so the orphan body must NEVER be adopted. Instead: HEAD body → `putOverwrite(body, fresh incarnation FROM THE WRITER'S OWN SOURCE, If-Match observed token)` (If-None-Match if it vanished meanwhile) → THEN PUT meta If-None-Match `{fresh incarnation, clean}`. Always possible — this state is only reachable from `putBlob`, which holds the re-readable `BlobSource`. The displacement makes GC's pending body delete (condemn-time token) miss. Also resolves the body-412/meta-absent livelock. A 412 on the meta PUT ⇒ someone else completed / the sweep claimed ⇒ re-GET and follow |
 | **Resurrect** (writer, own source bytes) | CAS meta (If-Match condemned-etag) → `{fresh incarnation, clean}`; THEN re-upload the body from the writer's OWN bytes (INV-1 — the dying body is never read). Loser of the CAS re-GETs and follows the new state |
 | **Copy-forward** (tokenless leaf, no source) | CAS meta (If-Match condemned-etag) → `{fresh incarnation, clean}`; THEN GET body (the documented INV-1 exception — committed-source provenance), verify payload hash, re-wrap, PUT body |
 | **Condemn** (GC, at fold `d=0`) | GET meta (etag) + CAS meta `{condemned=true, condemn_round}` |
 | **Spare** (GC, `d>0` recovered) | CAS meta `{condemned=false}` — the reprieve is explicit and cheap |
-| **Delete** (GC, two-phase pacing kept) | `deleteExact(meta, condemned-etag)` FIRST — the linearization: a racing resurrect's CAS and this delete target the same etag, exactly one wins. Only on success ⇒ HEAD body + `deleteExact(body, observed token)`. No tombstone needed |
+| **Delete** (GC, two-phase pacing kept) | `deleteExact(meta, condemned-etag)` FIRST — the linearization: a racing resurrect's CAS and this delete target the same etag, exactly one wins. On success ⇒ `deleteExact(body, CONDEMN-TIME token)` — **never a fresh HEAD** (consult C2: after a birth-completion displacement a fresh HEAD would observe and delete the LIVE fresh body; the condemn-time token — captured by `head_blob` at condemn, `CasGc.cpp:640/658` — is exact because meta-delete-won ⟹ no meta CAS since condemn ⟹ body unchanged; a displaced body survives via TokenMismatch). **Idempotent redelete (consult I3):** on retry after a crash between the two deletes, `deleteExact(meta)` returning NotFound still proceeds to the body delete (condemn-time token) — a strict only-on-success reading would strand a meta-less body as a live C1 trap. No tombstone needed |
 | **Reads** | GET body by content key — meta never consulted |
 
 Race audit:
@@ -151,7 +151,7 @@ Race audit:
 | Writer-side `RetireView` + retired-list downloads | **deleted** — writers never read `gc/state` or retired lists |
 | Retired-view syncer | **deleted** |
 | `observed_gc_round` in the beat + ack-floor graduation gating (`min_ack`) | **deleted** — graduation paces on rounds alone (`condemn_round < current_round`); the beat keeps the lease + `min_active` (precommit-reclaim floor) |
-| Resurrect-supersede machinery (`ReplacedEntry`, peek_head) | **reduced** — incarnation supersession becomes a meta-generation compare at fold; sized during implementation |
+| Resurrect-supersede machinery (`ReplacedEntry`, peek_head) | **re-shaped, NOT mechanically reduced (consult I1 — this mechanism previously leaked live, RESURRECT-REUPLOAD-ORPHAN):** (a) the GC ledger stores the **meta condemn-etag** as the delete precondition (today: only the body token) — condemn = GET meta + capture etag + CAS condemned; (b) the fold re-reads the meta (`peek_meta`, the analog of today's `peek_head`) for net-zero-touched entries, and on a generation mismatch supersedes the stale entry + re-condemns the current generation; (c) the untouched-entry drain path (`settleRetiredBelow`) has no peek — its safety rests on the induction "every resurrect's edges fold in some window where the blob is touched": stated here as an invariant and modeled in Gate B. Delete-SAFETY needs no re-read (the meta etag precondition covers it); the peek is for LEDGER correctness (not orphaning resurrected incarnations) |
 | Retired lists as objects | **kept, GC-private** — the three-cursor merge remains the settlement engine (streaming O(condemned)); only its writer-distribution disappears. Deriving it from meta LISTs instead is rejected (full-prefix LIST per pass is dearer than the merge) |
 | K1/K3 checks | **kept, re-sourced** — same sites, the condemned status now comes from the meta GET instead of the installed view |
 
@@ -248,9 +248,11 @@ use **per-shard seals** (finding E).
 
 **Gate B (before Phase B code):**
 
-1. Model the meta as an atomic register per hash: `{incarnation, condemned}` + present/absent; body
+1. Model the meta as an atomic register per hash: `{incarnation, condemned, condemn_round}` + present/absent
+   (consult M4: `condemn_round` in the register prevents a condemned-etag ABA after spare→re-condemn); body
    presence tied by INV-META-BODY; writer adopt/resurrect and GC condemn/spare/delete as CASes on it; NO
-   retire view, NO floor, NO round-ack.
+   retire view, NO floor, NO round-ack. Include the I1 untouched-entry induction ("every resurrect's edges
+   fold in some window where the blob is touched") as a checked property.
 2. **Must hold:** `INV_NO_DANGLE`, `INV_NO_LOSS`, INV-META-BODY, INV_NO_RETURN reformulated over meta
    generations (a deleted generation never becomes current again).
 3. **Must STAY red:** (a) create order flipped (meta before body) — adopt of a meta whose body never landed
@@ -258,7 +260,11 @@ use **per-shard seals** (finding E).
    body must dangle; (c) adopt without the meta GET (blind adopt) — the K1 interleaving must dangle;
    (d) GC body-delete unconditional on winning the meta delete — must dangle against a racing resurrect;
    (e) debris sweep deleting the body WITHOUT first claiming the meta — must produce meta-without-body
-   against a racing birth-completion.
+   against a racing birth-completion;
+   (f) **birth-completion BY ADOPTION** (the C1 sabotage: If-None-Match meta create + adopt of the orphan
+   body, racing GC's meta→body delete) — must dangle, proving resurrect-from-source is the only sound
+   completion; (g) GC body-delete keyed on a FRESH HEAD instead of the condemn-time token (the C2
+   sabotage) — must delete a live displaced body and dangle.
 4. **Must FLIP green:** the Gate-A floor/view sabotages re-run in the meta model (list machinery absent
    entirely) — proving the floor's job moved into the point-read.
 
@@ -283,13 +289,22 @@ use **per-shard seals** (finding E).
 **Phase B (after Phase A + one clean soak):**
 
 1. TLA+ Gate B.
-2. Meta codec + layout + `ca-inspect`/`ca-fsck` support (INV-META-BODY checks, stale-incarnation pruning).
+2. Meta codec + layout + `ca-inspect`/`ca-fsck` support. `ca-inspect`: the `.meta` suffix must dispatch
+   BEFORE the `blobs/`-prefix envelope branch (`CasInspect.cpp:422` would mis-decode a meta as a
+   `CasEnvelope` and throw — consult #3). `ca-fsck`: INV-META-BODY pairing checks; a body whose envelope
+   `incarnation_tag` lags its meta is a benign crashed-resurrect (content identical) and MUST NOT be
+   repaired/deleted (consult M2). `rebuildBaseline`: capture the meta etag + emit meta condemns (today it
+   stores only the body token, `CasGc.cpp:1858`) and repair INV-META-BODY breaks; its `blobs/` LIST skip of
+   `.meta` keys made explicit (consult I2).
 3. `putBlob` rewrite (optimistic body PUT → meta PUT; dedup = 1 meta GET; resurrect = meta CAS + body
    re-upload; **birth completion** on body-412+meta-absent); K3 re-source (meta GET); copy-forward
    re-shape (meta CAS first).
-4. GC: condemn/spare = meta CAS, delete = meta-first exact-delete then body — **on a parallel pool**
+4. GC: condemn = GET meta + capture etag + CAS condemned; spare = meta CAS; delete = meta-first
+   exact-delete then body by CONDEMN-TIME token, idempotent redelete (C2+I3) — **on a parallel pool**
    (mass-DROP requirement); **claim-first debris sweep** (PUT tombstone meta If-None-Match before any
-   debris body delete); supersede machinery reduction; event-log events for meta transitions.
+   debris body delete); the I1 `peek_meta` supersede re-shape; `graduationDue` re-keyed to
+   `condemn_round < current_round` (consult M5 — defers never delete, verified safe); event-log events
+   for meta transitions.
 5. Delete: writer-side `RetireView`, syncer, `observed_gc_round` (beat + floor R1 min_ack gating —
    graduation paces on rounds), the last view consumers.
 6. Validation: gtests → full CA-s3 lane → soak; plus a mass-DROP scenario (utils/ca-soak) sizing the
@@ -304,9 +319,20 @@ use **per-shard seals** (finding E).
 
 ## Consult findings register (Phase A review, 2026-07-09) {#findings-register}
 
-A (Important) → folded into D1/K3 (non-tokened boundary). B (Important) → D4 justification corrected.
-C (Important) → Gate A 3(d). D (Minor) → D6 four writer sites. E (Minor) → per-shard seal precision
-(theorem + models). F (Minor) → D3 trade-off note. G (Minor) → D7, with `depIsTokened` retained as the
-boundary predicate. Consult verified-negative: floor→view→beat chain airtight; chassert premise safe;
-D5 THM-NO-RETURN redundancy; read path clean. **Phase B requires its own adversarial consult before its
-plan** (the meta protocols and crash matrices above are design-level, not yet independently reviewed).
+**Phase A consult (SOUND-WITH-CHANGES):** A (Important) → folded into D1/K3 (non-tokened boundary).
+B (Important) → D4 justification corrected. C (Important) → Gate A 3(d). D (Minor) → D6 four writer sites.
+E (Minor) → per-shard seal precision (theorem + models). F (Minor) → D3 trade-off note. G (Minor) → D7,
+with `depIsTokened` retained as the boundary predicate. Verified-negative: floor→view→beat chain airtight;
+chassert premise safe; D5 THM-NO-RETURN redundancy; read path clean. TLA+ Gate A subsequently RAN GREEN
+(reduced) with all four sabotages red.
+
+**Phase B consult (SOUND-WITH-CHANGES, 2026-07-09):** C1 (Critical) → birth-completion re-specified as
+resurrect-from-source (the meta-absent∧body-present state is GC's transient delete window, never adoptable);
+C2 (Critical) → GC body delete keys on the condemn-time token, never a fresh HEAD. I1 (Important) → the
+supersede re-shape specified (`peek_meta`, ledger stores the meta condemn-etag, the untouched-entry
+induction stated + Gate B property). I2 (Important) → rebuild captures meta state + INV-META-BODY repair.
+I3 (Important) → idempotent redelete past an already-absent meta. Verified: the no-floor argument SOUND
+with the minimal pipeline guarantee stated and code-provided; backend primitives key-agnostic across all
+four backends (no gap); dedup-cache safe iff the meta GET is preserved on cache-hit (it is — spec'd);
+`ca-inspect` `.meta` dispatch bug pre-identified. M2/M4/M5 folded (fsck tolerance, `condemn_round` in the
+Gate B register, `graduationDue` re-key). Gate B gained sabotages (f) and (g).

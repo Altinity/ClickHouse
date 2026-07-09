@@ -195,3 +195,15 @@ Watchdog cron: job 60470431 (hourly at :23).
   **D5 CONFIRMED** (Task 8 GO): the reduced model has no refresh action at all and is green;
   SabotageNewbornNoFloor targets the KEPT shard-side born-floor stamp (birth_floor_provider), not the
   writer refresh; consult's verified-negative concurs. Phase-B meta-consult still in flight (Phase B only).
+
+- **Phase-B meta-consult verdict: SOUND-WITH-CHANGES, 1 Critical pair — FOLDED INTO SPEC.** C1: my
+  birth-completion contended on meta ABSENCE (If-None-Match), not the condemned etag → not serialized
+  against GC's meta-first delete → adopting the orphan body in GC's transient (meta deleted, body pending)
+  window = dangle + INV-META-BODY break; FIX = birth-completion resurrects from the writer's OWN source
+  (putOverwrite displaces, GC's pending body delete misses). C2: GC body delete keys on the CONDEMN-TIME
+  token (head_blob capture), never a fresh HEAD (would delete a displaced live body). I1: supersede
+  re-shape specified (peek_meta analog of peek_head; ledger stores meta condemn-etag; untouched-entry
+  induction → Gate B property). I2 rebuild meta capture; I3 idempotent redelete. no-floor argument verified
+  SOUND (minimal guarantee stated + code-provided); backends key-agnostic (no gap); ca-inspect .meta
+  dispatch bug pre-identified; M2/M4/M5 folded; Gate B += sabotages (f) birth-completion-by-adoption and
+  (g) fresh-HEAD body delete.
