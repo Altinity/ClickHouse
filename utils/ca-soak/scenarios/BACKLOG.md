@@ -1485,3 +1485,16 @@ infra/measurement gaps (not CA defects — all had dangling=0 + agreement):
   `retry_on_transport`'s reroute predicate + the OPTIMIZE swallow set — so a fenced write REROUTES to the
   peer (40 attempts, capped backoff) exactly like node-down. 45 retry unit tests pass (8 new). The B137
   transient ABORTED still retries same-node.
+
+## SOAK-REAPER-dies-on-rustfs-restart: orphan-reaper (docker exec) killed by a chaos rustfs restart
+
+- **Logged (UTC):** 2026-07-09  **Severity:** finding (soak-operational; harness, not CA).
+- **Observed:** the RustFS overwrite-leak reaper launched as `docker exec -i ... sh -s ... < orphan_reaper.sh`
+  (an in-container infinite loop) is killed the moment chaos applies a `rustfs restart`/`kill` fault —
+  the exec'd process dies with the container. Over a chaos soak that restarts rustfs repeatedly, the
+  reaper stops after the first rustfs fault, and the leak resumes unbounded (disk pressure returns; only
+  the 60G-floor disk_watchdog then protects the host).
+- **Mitigation (applied this run):** run the reaper as a HOST-side loop that re-execs a single
+  `orphan_reaper.sh <dir> --once` pass every 120s while the soak driver is alive, tolerating rustfs
+  down/restart between passes — survives restarts. For run_24h.sh, wire the reaper this way (host loop
+  with --once) rather than a single long-lived docker-exec.
