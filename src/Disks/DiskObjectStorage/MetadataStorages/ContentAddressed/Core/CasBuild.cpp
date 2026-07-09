@@ -219,6 +219,12 @@ const BlobSource * Build::retainedSourceFor(const UInt128 & hash) const
     return it == retained_sources.end() ? nullptr : &it->second;
 }
 
+bool Build::isCopyForwardableTokenless(const UInt128 & hash) const
+{
+    auto it = deps.find({static_cast<uint8_t>(ObjectKind::Blob), hash});
+    return it != deps.end() && !it->second.token.has_value();
+}
+
 bool Build::depIsTokened(const UInt128 & hash) const
 {
     /// Discriminator for B156b: a putBlob'd blob records a TOKENED dep (recreatable by retrying), an
@@ -817,8 +823,7 @@ void Build::promote(const RootNamespace & target_ns, const String & final_ref_na
     {
         if (e.placement != EntryPlacement::Blob)
             continue;
-        const auto dep = deps.find({static_cast<uint8_t>(ObjectKind::Blob), e.blob_hash});
-        if (dep == deps.end() || dep->second.token.has_value())
+        if (!isCopyForwardableTokenless(e.blob_hash))
             continue;
         const String blob_key = store->layout().blobKey(BlobId{u128ToHex(e.blob_hash)});
         const HeadResult hr = store->backend().head(blob_key);

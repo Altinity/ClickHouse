@@ -152,6 +152,12 @@ private:
     /// object).
     const BlobSource * retainedSourceFor(const UInt128 & hash) const;
 
+    /// A leaf is copy-forwardable iff this build holds a TOKENLESS W-EVIDENCE Blob dep for `hash`
+    /// (adoptEvidence — an independent live committed owner exists, so the INV-1 copy-forward exception
+    /// applies). A tokened dep, or NO dep at all (a staging bug — must fail closed), is NOT
+    /// copy-forwardable. Single source of truth for both the promote pre-pass and the in-closure backstop.
+    bool isCopyForwardableTokenless(const UInt128 & hash) const;
+
     StorePtr store;
     UInt128 build_id{};
     uint64_t build_seq{};                                 /// per-process monotone seq (spec 2026-06-16)
