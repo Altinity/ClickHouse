@@ -180,31 +180,33 @@ TEST(CasGcShardIncarnation, NewbornPrecommitProtectsDedupBlobAgainstConcurrentDr
         /// fence_round = 1 (self-floor). An existing shard would keep its old fence_round.
         build_b->precommitAdd(ns_b, "part_b1", id_b);
 
-        /// --- Phase 4: promote — the safety assertion ---
-        /// The NEWBORN shard's self-floor (fence_round = 1) forces retireView.round() = 0 < 1 → refresh,
-        /// which EXPOSES b1 as condemned to the in-closure gate. Because b1 is a tokenless adopted leaf and
-        /// this build's precommit is the live owner (past the owner-liveness check), the gate COPIES b1
-        /// FORWARD to a fresh live incarnation (spec 2026-07-09-cas-promote-tokenless-copyforward-race — the
-        /// revive-for-the-live-about-to-commit-owner window, identical to the tokened resurrect) and promote
-        /// SUCCEEDS. The condemned incarnation is displaced, so GC's exact-token delete of the listed token
-        /// becomes a no-op and the committed ref stands over a live blob — no dangle.
-        ///
-        /// The self-floor refresh remains load-bearing: WITHOUT it (fence_round = 0) the stale view would
-        /// miss the condemnation, the copy-forward would never fire, promote would bind the condemned
-        /// (soon-deleted) token, and dangling=1 would result — which the INV-NO-DANGLE check below catches.
+        /// --- Phase 4: promote — the safety assertion (Phase-A contract) ---
+        /// Spec 2026-07-09-cas-writer-gc-simplification D5: there is NO writer-side view refresh at
+        /// promote anymore. The stale view (round 0) does not see b1's condemnation, so the K3 gate binds
+        /// the condemned-but-present token AS IS — and that is SAFE by the floor + edge pair:
+        ///   • graduation of the round-1 condemnation requires min_ack > 1, but THIS writer's advertised
+        ///     round is 0 (its installed view) — the floor holds, the entry can never graduate to delete
+        ///     while this writer has not installed a newer view;
+        ///   • the precommit closure edge has been journal-durable since precommitAdd, so the NEXT GC fold
+        ///     sees d >= 1 and SPARES the entry (EDGE-BEFORE-OBSERVE) — the condemnation is doomed, not
+        ///     the blob.
+        /// The former behavior (self-floor-forced refresh → in-closure copy-forward → fresh incarnation)
+        /// was TLA+-Gate-A-verified redundant; the shard's fence_round stamp itself (THM-NO-RETURN birth
+        /// floor) remains and is asserted by the sibling shard-incarnation tests.
         EXPECT_NO_THROW(build_b->promote(ns_b, "part_b1", build_b->buildId(), id_b))
-            << "gc_shards=" << gc_shards << ": the self-floor refresh exposes b1 as condemned; the "
-               "in-closure gate must copy it forward to a fresh live incarnation, not abort";
+            << "gc_shards=" << gc_shards << ": promote must commit — the floor + durable edge protect the "
+               "condemned-but-present tokenless leaf without any refresh or copy-forward";
         EXPECT_TRUE(store->resolveRef(ns_b, "part_b1").has_value())
-            << "gc_shards=" << gc_shards << ": the ref must commit over the copied-forward incarnation";
-        /// b1 rides a FRESH incarnation — the condemned token was displaced, never bound.
-        EXPECT_NE(backend->head(b1_key).token, b1_token)
-            << "gc_shards=" << gc_shards << ": copy-forward must mint a fresh incarnation, not bind the "
-               "condemned token";
+            << "gc_shards=" << gc_shards << ": the ref must commit";
+        /// The condemned token is bound UNCHANGED — no displacement happens (and none is needed).
+        EXPECT_EQ(backend->head(b1_key).token, b1_token)
+            << "gc_shards=" << gc_shards << ": no copy-forward under the Phase-A contract — the token "
+               "stays; the floor forbids its deletion and the folded edge will spare it";
 
-        /// INV-NO-DANGLE: no committed ref may name a missing or condemned blob. Preserved here by
-        /// copy-forward (a live fresh incarnation) rather than by abort. A regression that dropped the
-        /// self-floor would produce dangling=1, confirming the test still guards it.
+        /// INV-NO-DANGLE: the body is present and the floor forbids its deletion while this writer's ack
+        /// is below the condemn round; the folded precommit/committed edge spares the entry at the next
+        /// fold. A regression that let the delete pipeline run past a live writer's ack would produce
+        /// dangling=1 here.
         const FsckReport rep = runFsck(*store, /*detail=*/false);
         EXPECT_EQ(rep.dangling, 0u)
             << "gc_shards=" << gc_shards << ": INV-NO-DANGLE violated — a committed ref names a "

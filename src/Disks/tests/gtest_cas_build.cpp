@@ -719,14 +719,14 @@ TEST(CasBuild, CondemnedPresentEvidenceDepCopiesForwardAtGate)
     EXPECT_EQ(stored->bytes.substr(h.header_len), "payload-CF") << "payload must survive byte-identical";
 }
 
-TEST(CasBuild, PromoteCopiesForwardCondemnedEvidenceRevealedAfterRefresh)
+TEST(CasBuild, PromoteCopiesForwardCondemnedEvidenceInInstalledView)
 {
-    /// In-closure copy-forward backstop (spec 2026-07-09-cas-promote-tokenless-copyforward-race): a
-    /// tokenless (adoptEvidence) blob X condemned at a round AHEAD of the writer's current view is MISSED
-    /// by the pre-refresh pre-pass and revealed only by the in-closure fence refresh — the revalidation
-    /// gate then copies X forward IN-CLOSURE (against the post-refresh view) instead of aborting, and
-    /// promote SUCCEEDS. Distinct from CondemnedPresentEvidenceDepCopiesForwardAtGate, where the store
-    /// opens with an already-refreshed view and the PRE-PASS catches the condemnation.
+    /// The K3 in-closure copy-forward gate (Phase A, spec 2026-07-09-cas-writer-gc-simplification): a
+    /// tokenless (adoptEvidence) blob X whose condemnation IS in the writer's INSTALLED view is copied
+    /// forward by the promote gate (the single copy-forward site after D3) instead of aborting, and
+    /// promote SUCCEEDS. Phase A deleted the writer-side auto-refresh (D5), so this test installs the
+    /// view explicitly — a stale-view writer instead binds the condemned token as-is, safely (floor +
+    /// durable edge; see NewbornPrecommitProtectsDedupBlobAgainstConcurrentDrop).
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openStore(b);   /// view opens at round 0 (no gc/state yet)
     const RootNamespace ns{"srv1/tbl"};
@@ -745,16 +745,16 @@ TEST(CasBuild, PromoteCopiesForwardCondemnedEvidenceRevealedAfterRefresh)
     const ManifestId id = build->stageManifest({entry});
     build->precommitAdd(ns, "part_2", id);
 
-    /// GC condemns X at t0 in round 1 and fences the namespace to round 1 — AHEAD of the writer's in-memory
-    /// view (still round 0), so the pre-pass misses it and only the in-closure refresh (fence_round 1 >
-    /// view round 0) reveals it.
+    /// GC condemns X at t0 in round 1; install the view EXPLICITLY (Phase A/D5: no writer-side
+    /// auto-refresh) so the K3 gate sees the condemnation.
     injectRetire(*b, s->layout(), /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
         {RetiredEntry{.kind = ObjectKind::Blob, .hash = hexToU128(streamingHexOf("payload-CFX")),
                       .token = t0, .size = 11}});
     fenceNamespace(*b, s->layout(), ns, s->poolMeta().root_shards, /*round*/ 1);
-    ASSERT_EQ(s->retireView().round(), 0u) << "the pre-pass must run against the pre-refresh (round 0) view";
+    s->retireView().refresh();
+    ASSERT_EQ(s->retireView().round(), 1u) << "the installed view must carry the condemnation";
 
-    /// promote: pre-pass (round-0 view) skips X; in-closure refresh reveals t0 condemned ⇒ copy-forward.
+    /// promote: the K3 gate sees t0 condemned in the installed view ⇒ copy-forward ⇒ commit.
     EXPECT_NO_THROW(build->promote(ns, "part_2", build->buildId(), id));
 
     /// The ref resolves and X rides a FRESH, non-condemned token (t0 never bound).
@@ -820,11 +820,13 @@ TEST(CasBuild, PromoteCondemnedLeafWithoutDepAbortsFailClosed)
     const ManifestId id = build->stageManifest({entry});
     build->precommitAdd(ns, "part_1", id);
 
-    /// Condemn X at t0 (present) at a round ahead + fence, so the in-closure gate sees it after refresh.
+    /// Condemn X at t0 (present) and install the view EXPLICITLY (Phase A/D5: no writer-side
+    /// auto-refresh) so the gate sees the condemnation on the no-dep leaf.
     injectRetire(*b, s->layout(), /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
         {RetiredEntry{.kind = ObjectKind::Blob, .hash = hexToU128(streamingHexOf("payload-NODEP")),
                       .token = t0, .size = 13}});
     fenceNamespace(*b, s->layout(), ns, s->poolMeta().root_shards, /*round*/ 1);
+    s->retireView().refresh();
 
     expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { build->promote(ns, "part_1", build->buildId(), id); });
     EXPECT_FALSE(s->resolveRef(ns, "part_1").has_value());

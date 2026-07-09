@@ -268,13 +268,13 @@ TEST(CasProtocol, RevalidateAdoptsLiveTokenWhenOnlyPhantomCondemnedAtDifferentTo
 
 TEST(CasProtocol, EvidenceHitCondemnedPresentBlobCopiesForwardInClosure)
 {
-    /// W-EVIDENCE (tokenless adopted dep) on a blob X that is condemned-but-PRESENT, revealed only when
-    /// the in-closure fence refresh advances the writer's stale (round 0) view. promote copies X forward
-    /// in-closure to a fresh live incarnation and SUCCEEDS (spec
-    /// 2026-07-09-cas-promote-tokenless-copyforward-race). X here has NO independent committed owner (a
-    /// lone raw blob) — the accepted revive-for-the-live-about-to-commit-owner window. A tokenless leaf is
-    /// the ONLY leaf promote still re-observes (tokened leaves are edge-protected, Phase A). Before the
-    /// copy-forward fix this aborted (INV-1 fail-closed), a liveness brick on the DETACH/freeze adopt path.
+    /// W-EVIDENCE (tokenless adopted dep) on a blob X that is condemned-but-PRESENT in the writer's
+    /// INSTALLED view: promote copies X forward in-closure to a fresh live incarnation and SUCCEEDS. X
+    /// here has NO independent committed owner (a lone raw blob) — the accepted
+    /// revive-for-the-live-about-to-commit-owner window. A non-tokened leaf is the ONLY leaf promote
+    /// still observes (tokened leaves are edge-protected; Phase A also removed the auto-refresh, D5, so
+    /// this test installs the view explicitly). Before the copy-forward fix this aborted (INV-1
+    /// fail-closed), a liveness brick on the DETACH/freeze adopt path.
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openStore(b);   /// view opens at round 0 (no gc/state yet)
     const RootNamespace ns{"srv1/tbl"};
@@ -296,13 +296,13 @@ TEST(CasProtocol, EvidenceHitCondemnedPresentBlobCopiesForwardInClosure)
     const ManifestId id = build->stageManifest({entry});
     build->precommitAdd(ns, "part_1", id);
 
-    /// GC condemns X at t0 in round 1 + fence — AHEAD of the writer's stale (round 0) view, so only the
-    /// in-closure refresh reveals it (the pre-pass misses it).
+    /// GC condemns X at t0 in round 1 + fence; install the view EXPLICITLY (Phase A/D5).
     injectRetire(*b, s->layout(), /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
         {RetiredEntry{.kind = ObjectKind::Blob, .hash = hexToU128(hex), .token = t0, .size = 9}});
     fenceNamespace(*b, s->layout(), ns, s->poolMeta().root_shards, /*round*/ 1);
+    s->retireView().refresh();
 
-    /// promote: pre-pass (stale view) skips X; in-closure refresh reveals t0 condemned ⇒ copy-forward.
+    /// promote: the K3 gate sees t0 condemned in the installed view ⇒ copy-forward ⇒ commit.
     EXPECT_NO_THROW(build->promote(ns, "part_1", build->buildId(), id));
 
     /// The committed ref stands over a FRESH incarnation; the condemned token t0 is never bound.

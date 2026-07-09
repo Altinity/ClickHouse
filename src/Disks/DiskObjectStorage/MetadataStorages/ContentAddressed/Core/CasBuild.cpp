@@ -818,18 +818,11 @@ void Build::promote(const RootNamespace & target_ns, const String & final_ref_na
 
     store->mutateShard(target_ns, store->shardOf(final_ref_name), MutationScope::ref(final_ref_name), [&](RootShard & root)
     {
-        /// Task 5 promote gate (registry-free create-ordering, THM-NO-RETURN): if the retire view
-        /// is behind the shard's fence_round, GC has advanced to at least that round and may have
-        /// condemned objects visible to the shard — refresh before the blob revalidation below.
-        /// For a NEWBORN shard (Task 5 self-floor) fence_round equals the GC round at the time the
-        /// precommit CAS ran, so a writer whose view predates that round is forced to refresh and
-        /// will see any condemnations from round fence_round (the shard's birth). fence_round is
-        /// the BIRTH floor only (the ack-floor redesign removed the per-round fence bump); for
-        /// pre-redesign shards a historical fence-step value gates the same way. The refresh
-        /// here (and not before the owner-check above) is correct: the owner check only reads the
-        /// shard journal, not the retire view; the condemn check below is the blob-safety gate.
-        if (store->retireView().round() < root.fence_round)
-            store->retireView().refresh();
+        /// NO writer-side view refresh here (spec 2026-07-09-cas-writer-gc-simplification D5, TLA+
+        /// Gate A): promote-time view freshness is not load-bearing — tokened leaves are edge-protected
+        /// (EDGE-BEFORE-OBSERVE) and the tokenless K3 gate below reads the live view, which the floor
+        /// guarantees contains every graduated entry (in EVERY view >= condemn round + 1). The shard's
+        /// fence_round itself (the newborn birth floor, THM-NO-RETURN) and all GC-side uses stay.
 
         /// BUG 1 / TLA+ `WPromote` guard (`owner[m] = bld`): a promote is a PURE owner MOVE that emits NO
         /// blob delta (Δ=0) — it restores no blob in-degree. It is therefore only sound when the precommit
