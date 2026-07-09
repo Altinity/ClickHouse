@@ -226,3 +226,15 @@ Watchdog cron: job 60470431 (hourly at :23).
   **Full CA-s3 lane: Passed 10357 / Failed 55 / Skipped 104, ZERO promote-condemned aborts, all 4 targets
   OK, failure list = the known env families only (no new CA class).** Remaining Phase-A exit criterion:
   the soak with the fsck gate.
+
+- **TLA+ GATE B GREEN (soak-parallel work).** New model docs/superpowers/models/CaMetaDescriptor.tla:
+  the meta as the per-hash lifecycle register {gen(etag), inc, condemned}; body {tok}; INV-META-BODY;
+  writer fresh/adopt/2-step-resurrect(crash window)/birth-completion; GC condemn(capture etag+condemn-token)
+  → graduate → meta-first exact-delete → body delete at CONDEMN-TIME token; claim-first sweep; a
+  CrashedBirth debris source (needed to arm the sweep race — first draft's sab_e was unreachable-green,
+  caught and fixed). Matrix: reduced GREEN (both invariants over all interleavings incl. the C1 window and
+  the resurrect crash window); ALL 7 sabotages RED breaking the expected invariant — (f) birth-adopt,
+  (g) fresh-head delete, (a) meta-first create, (b) body-first delete, (c) blind adopt (INV_NO_DANGLE),
+  (e) claimless sweep, (d) post-lost-CAS body delete. CAVEAT recorded: a 1-hash/1-writer atomicity
+  sandbox (~41 distinct states) — fold/pacing timing remains Gate A's domain; multi-writer meta races
+  (two resurrectors, adopt-vs-resurrect) to be added when writing the Phase-B plan.
