@@ -147,6 +147,11 @@ private:
 
     void requireAlive() const;                            /// throws LOGICAL_ERROR after abandon
 
+    /// The re-readable source bytes retained for a putBlob'd hash, or nullptr if none is held. Promote's
+    /// resurrect-on-condemn re-uploads a prematurely-condemned leaf from this (INV-1: never GET the dying
+    /// object).
+    const BlobSource * retainedSourceFor(const UInt128 & hash) const;
+
     StorePtr store;
     UInt128 build_id{};
     uint64_t build_seq{};                                 /// per-process monotone seq (spec 2026-06-16)
@@ -165,6 +170,13 @@ private:
     std::vector<ManifestId> staged_manifests;             /// for best-effort abandon cleanup
 
     std::map<DepKey, DepEntry> deps;                      /// the W-DEP-SET (blob-only now)
+
+    /// The writer's re-readable source bytes for every putBlob'd blob, kept in hand through promote so a
+    /// prematurely-condemned leaf can be resurrected from source at commit revalidation (INV-1). The
+    /// BlobSource retains NO payload — its write_payload closure re-reads the pending-blob temp file, which
+    /// lives until commit end (cleanupPendingTempFiles), after promote. NOT a DepEntry field: putBlob
+    /// reassigns a fresh DepEntry on its record/adopt paths and would clobber it. Build is single-threaded.
+    std::map<UInt128, BlobSource> retained_sources;
 };
 
 }

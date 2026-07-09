@@ -132,6 +132,12 @@ BlobRef Build::putBlob(const BlobId & id, BlobSource source)
     requireAlive();
 
     const UInt128 logical_hash = hexToU128(id.string());
+
+    /// Keep the re-readable source in hand for promote's resurrect-on-condemn (INV-1). Copy is cheap: the
+    /// closure captures only the temp-path String, not the payload. Covers both the streamed-upload and the
+    /// dedup-adopt outcomes below — an adopted incarnation may still be condemned before promote.
+    retained_sources.insert_or_assign(logical_hash, source);
+
     const String key = store->layout().blobKey(id);
     const PoolConfig & cfg = store->poolConfig();
 
@@ -205,6 +211,12 @@ BlobRef Build::putBlob(const BlobId & id, BlobSource source)
 
     /// Unreachable: the loop either returns or rethrows on the final attempt.
     throw Exception(ErrorCodes::LOGICAL_ERROR, "putBlob: exhausted retries for {}", key);
+}
+
+const BlobSource * Build::retainedSourceFor(const UInt128 & hash) const
+{
+    auto it = retained_sources.find(hash);
+    return it == retained_sources.end() ? nullptr : &it->second;
 }
 
 bool Build::depIsTokened(const UInt128 & hash) const
