@@ -22,6 +22,18 @@ SELECT 'valid cluster with fallback';
 SELECT count(), sum(x) FROM s3('http://localhost:11111/test/04303_object_storage_cluster_fallback.tsv', 'TSV', 'x UInt32')
 SETTINGS object_storage_cluster = 'test_shard_localhost', object_storage_cluster_fallback_if_empty = 1;
 
+SELECT 'explicit cluster function with fallback';
+SELECT count() FROM s3Cluster('non_existent_cluster_04303', 'http://localhost:11111/test/04303_object_storage_cluster_fallback.tsv', 'TSV', 'x UInt32')
+SETTINGS object_storage_cluster_fallback_if_empty = 1; -- { serverError CLUSTER_DOESNT_EXIST }
+
+SELECT 'explicit cluster function overrides setting';
+SELECT count() FROM s3Cluster('non_existent_cluster_04303', 'http://localhost:11111/test/04303_object_storage_cluster_fallback.tsv', 'TSV', 'x UInt32')
+SETTINGS object_storage_cluster_fallback_if_empty = 1, object_storage_cluster = 'non_existent_cluster_04303_2'; -- { serverError CLUSTER_DOESNT_EXIST }
+
+SELECT 'explicit cluster function overrides setting with valid cluster';
+SELECT count(), sum(x) FROM s3Cluster('test_shard_localhost', 'http://localhost:11111/test/04303_object_storage_cluster_fallback.tsv', 'TSV', 'x UInt32')
+SETTINGS object_storage_cluster = 'non_existent_cluster_04303', object_storage_cluster_fallback_if_empty = 1;
+
 SELECT 'remote initiator unresolved with fallback';
 SELECT count(), sum(x) FROM s3('http://localhost:11111/test/04303_object_storage_cluster_fallback.tsv', 'TSV', 'x UInt32')
 SETTINGS

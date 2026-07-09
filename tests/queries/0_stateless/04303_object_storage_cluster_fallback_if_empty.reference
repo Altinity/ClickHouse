@@ -5,6 +5,10 @@ unknown cluster with fallback
 10	45
 valid cluster with fallback
 10	45
+explicit cluster function with fallback
+explicit cluster function overrides setting
+explicit cluster function overrides setting with valid cluster
+10	45
 remote initiator unresolved with fallback
 10	45
 remote initiator with non-existent cluster
