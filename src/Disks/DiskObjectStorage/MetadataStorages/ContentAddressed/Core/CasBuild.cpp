@@ -898,9 +898,12 @@ void Build::promote(const RootNamespace & target_ns, const String & final_ref_na
         /// owner-liveness check above, so this build's precommit is confirmed the live owner — the leaf is
         /// legitimately protected and resurrection is warranted (no orphan on an aborting path). Re-upload
         /// from THIS build's retained source bytes (INV-1: never read the dying object) and re-check.
-        /// Bounded (a re-condemnation of the fresh incarnation is not physically reachable more than a
-        /// handful of times within one promote at any real GC cadence). A leaf that is condemned/absent
-        /// with NO retained source keeps the fail-closed ABORTED (retryable-by-caller), exactly as before.
+        /// Terminates in ≤2 iterations, NOT merely "rarely 8": the retire view is a FIXED snapshot inside
+        /// this closure (refreshed at most once, above, before the loop), and uploadFromSource returns only
+        /// after recording a token absent from that snapshot (a freshly-minted incarnation, or a live
+        /// adopted token), so the next HEAD sees a non-condemned token and validates. The 8-attempt bound
+        /// (mirroring putBlob) is a backstop, not load-bearing against GC cadence. A leaf that is
+        /// condemned/absent with NO retained source keeps the fail-closed ABORTED (retryable), as before.
         for (const ManifestEntry & e : body.entries)
         {
             if (e.placement != EntryPlacement::Blob)

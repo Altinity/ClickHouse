@@ -315,9 +315,13 @@ TEST(CasProtocol, EvidenceHitCondemnedBlobAbortsRetryable)
 
 TEST(CasProtocol, WedgedHeartbeatCondemnedTokenedBlobResurrectsFromSource)
 {
-    /// A build whose watermark never renews finds its OWN upload condemned by full GC. Because the build
-    /// retains the source bytes, promote resurrects the condemned leaf from source (INV-1) and SUCCEEDS —
-    /// the degenerate wedged-heartbeat window closes invisibly rather than surfacing a client-visible abort.
+    /// A build whose watermark never renews finds its OWN upload condemned by full GC while its precommit
+    /// is STILL the live owner (this setup injects only the retire set + fence, no owner-removal — the
+    /// false-positive-freeze window BEFORE any GC reclaim). Because the build retains the source bytes,
+    /// promote's owner-liveness check passes and it resurrects the condemned leaf from source (INV-1),
+    /// SUCCEEDING — the window closes invisibly rather than surfacing a client-visible abort. The genuine
+    /// dead-build case (precommit reclaimed ⇒ owner check aborts, NO re-upload) is covered separately by
+    /// CaWiringResurrect.PromoteAbandonedPrecommitAbortsWithoutResurrect.
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openStore(b);
     const RootNamespace ns{"srv1/tbl"};
