@@ -91,3 +91,34 @@ Watchdog cron: job 60470431 (hourly at :23).
   with the `EnableReval` publish gate (children must be ~CondemnedAtView). The fix brings the promote
   IMPLEMENTATION into line with this already-verified path (impl was stricter: aborted where model resurrects).
   No model change. Plan: docs/superpowers/plans/2026-07-09-cas-promote-resurrect-tokened-blob.md.
+
+- **Impl COMPLETE (Tasks 2–4), reviewed APPROVE-WITH-MINOR.** Commits 559a6879368 (retain BlobSource),
+  7176e39e29b (bounded resurrect-then-recheck loop in Build::promote, after the owner-liveness check),
+  3091db32a50 (2 new gtests + 3 pre-existing CasProtocol safety tests rewritten to resurrect). RED proof
+  captured (Test A ABORTED pre-fix), GREEN after. Regression Ca*/Cas* 650/652 (2 = pre-existing flaky
+  CaWiring*, not grown). Whole-branch review (opus, adversarial): no Critical/Important — INV-1 preserved
+  (uploadFromSource never GETs), owner-check-first ⇒ no orphan on abort, loop terminates ≤2 iters (fixed
+  retire-view snapshot), tokenless no-source backstop still aborts (EvidenceHit test). 2 Minor doc fixes
+  applied (3b06153d770). SCOPE note: the 3 rewritten CasProtocol tests encoded the OLD no-source
+  fail-closed contract for a leaf THIS build putBlob'd — now source-backed ⇒ resurrect; verified each is
+  owner-live (promote succeeds only past the owner check), so not a safety weakening; the genuine
+  reclaimed-precommit abort is covered by the new PromoteAbandonedPrecommit... test.
+- Building full `clickhouse` binary to validate the 3 GC-race stateless tests (01156/01710/02346) on the
+  CA-s3/RustFS lane end-to-end. Unpushed commits accumulating on cas-gc-rebuild (push on user's word).
+
+- **END-TO-END VALIDATION.** Rebuilt full `clickhouse` (incremental, ninja exit=0). Ran the 3 GC-race
+  tests on the CA-s3/RustFS lane (`Stateless tests (arm_binary, content_addressed s3 storage, parallel)`
+  → starts RustFS + installs CA-s3-default policy): **01156_pcg_deserialization OK, 01710_projection_detach_part
+  OK, 02346_exclude_materialize_skip_indexes_on_insert OK** (all pass). Combined with the deterministic
+  seeded-condemn unit test (RED→GREEN) + green TLA+ gate, the fix is validated. Full CA-s3 lane launched in
+  background as the under-load regression check (confirm the 3 stay green + no NEW promote-condemned ABORTED
+  anywhere); monitoring. Remaining non-race CA-s3 lane items (unchanged by this fix): 2 timeouts
+  (03582/03800), 00933 TTL timing, 03829 memory, + ~31 local-env failures (not CA).
+
+- **FULL CA-s3 LANE RESULT (under load): Passed 10357 / Failed 55 / Skipped 104.** The 3 tokened-INSERT
+  GC-race tests (01156/01710/02346) are GONE from failures — fix validated under concurrent GC churn. The
+  ONLY promote-condemned ABORTED in the whole lane is 03283_optimize_on_insert_level (blob b09909, one
+  occurrence) = the tokenless DETACH/freeze follow-up (backlogged, separate cycle, NOT a regression). The
+  other 54 failures are the known local-env/pre-existing set (mysql, clickhouse-local, s2-geo, dynamic-json,
+  alias-marker) + known CA non-race items (03829 memory, 05008/05009 CA scenarios). Tokened-INSERT
+  resurrect fix = DONE. Memory: [[project_promote_resurrect_condemn]].
