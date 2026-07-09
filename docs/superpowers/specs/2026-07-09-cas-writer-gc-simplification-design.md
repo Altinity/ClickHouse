@@ -131,7 +131,10 @@ of one of them.
    does NOT flip, D5 is cancelled and the refresh stays (the spec's only conditional deletion).
 3. **Must STAY red (the new load-bearing points):** (a) a NEW order sabotage — observations/adoptions
    before the durable closure append (models the pre-B188 order) — must dangle, proving the ordering is the
-   invariant; (b) the tokenless-absent case with the K3 HEAD removed must dangle, proving K3 load-bearing.
+   invariant; (b) the tokenless-absent case with the K3 HEAD removed must dangle, proving K3 load-bearing;
+   (c) the K1 sabotage — dedup-adoption without the condemned check (`SabotageNoRetireView` exists in
+   `CaIncarnationCore`) — must dangle IN THE REDUCED MODEL via the pre-precommit-graduated interleaving
+   (K1's race), proving the condemned list + floor pair remains load-bearing after Tier 2.
 4. **Positive run:** the reduced model (no tokened revalidation, no drain, no writer fence-refresh) holds
    `INV_NO_DANGLE`, `INV_NO_LOSS`, `INV_NO_RETURN`, `INV_JOURNAL_COVERAGE`, `MonotoneGC`.
 
