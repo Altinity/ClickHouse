@@ -317,12 +317,16 @@ DB::HTTPHeaderEntries RestCatalog::getAuthHeaders(
     const String & /*method*/,
     const Poco::URI & /*url*/,
     const DB::HTTPHeaderEntries & /*extra_headers*/,
-    const String & /*body*/) const
+    const String & /*body*/,
+    bool * used_cached_oauth_token) const
 {
     fiu_do_on(DB::FailPoints::check_database_datalake_negative,
     {
         throw DB::Exception(DB::ErrorCodes::FAULT_INJECTED, "Injecting fault when checking database");
     });
+
+    if (used_cached_oauth_token)
+        *used_cached_oauth_token = false;
 
     /// Option 1: user specified auth header manually.
     /// Header has format: 'Authorization: <scheme> <token>'.
@@ -342,9 +346,9 @@ DB::HTTPHeaderEntries RestCatalog::getAuthHeaders(
             access_token.set(std::make_unique<AccessToken>(retrieveAccessToken()));
             current = access_token.get();
         }
-        else
+        else if (used_cached_oauth_token)
         {
-            ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogAuthTokenCacheHits);
+            *used_cached_oauth_token = true;
         }
 
         DB::HTTPHeaderEntries headers;
@@ -518,10 +522,11 @@ BigLakeCatalog::BigLakeCatalog(
 
 DB::HTTPHeaderEntries BigLakeCatalog::getAuthHeaders(
     bool update_token,
-    const String & /*method*/,
-    const Poco::URI & /*url*/,
-    const DB::HTTPHeaderEntries & /*extra_headers*/,
-    const String & /*body*/) const
+    const String & method,
+    const Poco::URI & url,
+    const DB::HTTPHeaderEntries & extra_headers,
+    const String & body,
+    bool * used_cached_oauth_token) const
 {
     /// Google Cloud OAuth2 for BigLake.
     /// Uses GCP metadata service or Application Default Credentials to get access token.
@@ -529,15 +534,18 @@ DB::HTTPHeaderEntries BigLakeCatalog::getAuthHeaders(
     /// https://developers.google.com/identity/protocols/oauth2
     if (!google_project_id.empty() || !google_adc_client_id.empty())
     {
+        if (used_cached_oauth_token)
+            *used_cached_oauth_token = false;
+
         auto current = access_token.get();
         if (!current || update_token || current->isExpired())
         {
             access_token.set(std::make_unique<AccessToken>(retrieveGoogleCloudAccessToken()));
             current = access_token.get();
         }
-        else
+        else if (used_cached_oauth_token)
         {
-            ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogAuthTokenCacheHits);
+            *used_cached_oauth_token = true;
         }
 
         DB::HTTPHeaderEntries headers;
@@ -557,7 +565,7 @@ DB::HTTPHeaderEntries BigLakeCatalog::getAuthHeaders(
         return headers;
     }
 
-    return RestCatalog::getAuthHeaders(update_token);
+    return RestCatalog::getAuthHeaders(update_token, method, url, extra_headers, body, used_cached_oauth_token);
 }
 
 AccessToken BigLakeCatalog::retrieveGoogleCloudAccessTokenFromRefreshToken() const
@@ -700,9 +708,9 @@ DB::ReadWriteBufferFromHTTPPtr RestCatalog::createReadBuffer(
     if (!params.empty())
         url.setQueryParameters(params);
 
-    auto create_buffer = [&](bool update_token)
+    auto create_buffer = [&](bool update_token, bool & used_cached_oauth_token)
     {
-        auto result_headers = getAuthHeaders(update_token, Poco::Net::HTTPRequest::HTTP_GET, url, headers, {});
+        auto result_headers = getAuthHeaders(update_token, Poco::Net::HTTPRequest::HTTP_GET, url, headers, {}, &used_cached_oauth_token);
         std::move(headers.begin(), headers.end(), std::back_inserter(result_headers));
 
         return DB::BuilderRWBufferFromHTTP(url)
@@ -720,7 +728,11 @@ DB::ReadWriteBufferFromHTTPPtr RestCatalog::createReadBuffer(
 
     try
     {
-        return create_buffer(false);
+        bool used_cached_oauth_token = false;
+        auto buf = create_buffer(false, used_cached_oauth_token);
+        if (used_cached_oauth_token)
+            ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogAuthTokenCacheHits);
+        return buf;
     }
     catch (const DB::HTTPException & e)
     {
@@ -730,7 +742,8 @@ DB::ReadWriteBufferFromHTTPPtr RestCatalog::createReadBuffer(
              || status == Poco::Net::HTTPResponse::HTTPStatus::HTTP_FORBIDDEN))
         {
             ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogAuthTokenRefreshedOnUnauthorized);
-            return create_buffer(true);
+            bool used_cached_oauth_token_on_retry = false;
+            return create_buffer(true, used_cached_oauth_token_on_retry);
         }
         throw;
     }
@@ -1409,9 +1422,9 @@ void RestCatalog::sendRequest(const String & endpoint, Poco::JSON::Object::Ptr r
     DB::HTTPHeaderEntries extra_headers;
     extra_headers.emplace_back("Content-Type", "application/json");
 
-    auto create_buffer = [&](bool update_token)
+    auto create_buffer = [&](bool update_token, bool & used_cached_oauth_token)
     {
-        DB::HTTPHeaderEntries headers = getAuthHeaders(update_token, method, url, extra_headers, body_str);
+        DB::HTTPHeaderEntries headers = getAuthHeaders(update_token, method, url, extra_headers, body_str, &used_cached_oauth_token);
         headers.emplace_back("Content-Type", "application/json");
         return DB::BuilderRWBufferFromHTTP(url)
             .withConnectionGroup(DB::HTTPConnectionGroupType::HTTP)
@@ -1427,13 +1440,17 @@ void RestCatalog::sendRequest(const String & endpoint, Poco::JSON::Object::Ptr r
 
     try
     {
-        auto wb = create_buffer(false);
+        bool used_cached_oauth_token = false;
+        auto wb = create_buffer(false, used_cached_oauth_token);
 
         String response_str;
         if (!ignore_result)
             readJSONObjectPossiblyInvalid(response_str, *wb);
         else
             wb->ignoreAll();
+
+        if (used_cached_oauth_token)
+            ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogAuthTokenCacheHits);
     }
     catch (const DB::HTTPException & e)
     {
@@ -1443,7 +1460,8 @@ void RestCatalog::sendRequest(const String & endpoint, Poco::JSON::Object::Ptr r
              || status == Poco::Net::HTTPResponse::HTTPStatus::HTTP_FORBIDDEN))
         {
             ProfileEvents::increment(ProfileEvents::DataLakeRestCatalogAuthTokenRefreshedOnUnauthorized);
-            auto wb = create_buffer(true);
+            bool used_cached_oauth_token_on_retry = false;
+            auto wb = create_buffer(true, used_cached_oauth_token_on_retry);
 
             String response_str;
             if (!ignore_result)
