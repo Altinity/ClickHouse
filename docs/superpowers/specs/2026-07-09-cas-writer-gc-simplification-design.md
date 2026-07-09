@@ -87,9 +87,9 @@ catch that class. Detection of accounting bugs belongs to `ca-fsck`, the soak as
 
 | # | Mechanism | Why it stays |
 |---|---|---|
-| K1 | `putBlob` gate, whole: `observeAndAdmit` condemned check against the installed view, condemned → `uploadFromSource` (INV-1, W-FRESH-TAG, bounded retry), HEAD-first dedup | The writer's half of the ack contract: never knowingly build on a token condemned in your own view. In-memory check, no extra backend IO. Removing it would route routine dedups through loud impossible-spares and supersede churn |
+| K1 | `putBlob` gate, whole: `observeAndAdmit` condemned check against the installed view, condemned → `uploadFromSource` (INV-1, W-FRESH-TAG, bounded retry), HEAD-first dedup | **Safety-critical — the dedup-adoption race.** A hash condemned+graduated BEFORE our `precommitAdd` (entry `delete_pending` in state N) can be adopted present-but-doomed: pass N+1 seals before our append → its fold misses our edge → `d = 0` → `deleteExact` executes AFTER our HEAD observed the object present → with no promote HEADs (D1), the commit dangles. Neither EDGE-BEFORE-OBSERVE (graduation predates the edge) nor the two-phase re-check (its fold sealed before our append) covers this interleaving — ONLY the condemned check does. It is race-safe by exact-token discipline: our `putOverwrite(If-Match)` displacement either beats the delete (delete misses — token changed) or loses (412 → re-observe → absent → fresh upload). The GC-side ack floor is what GUARANTEES the check sees the entry: graduation requires `min_ack > condemn_round`, so every live writer's installed view covers every graduated entry (entries persist until confirmed outcomes). Post-Tier-2 the retire view IS the dedup-safety list and the floor IS its delivery guarantee — single purpose each |
 | K2 | Promote owner-liveness check + body read + `RefMatchesBody` + namespace match | Owner-move correctness (`WPromote owner==bld`); unrelated to blob freshness |
-| K3 | Promote: ONE HEAD per **tokenless** leaf; absent ⇒ `ABORTED`; condemned-present ⇒ `copyForwardFromCondemned` (the landed in-closure backstop, `CasBuild.cpp:947-949`) | `adoptEvidence` is observation-free by design (B188) — this is the single mandatory presence observation. The condemned arm preserves the modeled publish gate (`~CondemnedAtView`) unweakened; revising it to accept is Tier 3 |
+| K3 | Promote: ONE HEAD per **tokenless** leaf; absent ⇒ `ABORTED`; condemned-present ⇒ `copyForwardFromCondemned` (the landed in-closure backstop, `CasBuild.cpp:947-949`) | `adoptEvidence` is observation-free by design (B188) — this is the single mandatory presence observation, AND the tokenless twin of K1's dedup-adoption race: a pre-precommit-graduated entry can be present-but-doomed here too, and only the condemned check + exact-token displacement close it. Revising the condemned arm to accept is Tier 3 — and per K1's analysis that revision is bounded by the same race, not free |
 | K4 | Mount lease + merged beat (`min_active`, `observed_gc_round`), TTL fence-out, local write fence, epoch/self-remount | Liveness backbone; also what bounds dead processes. The beat still advertises the installed round — the GC-side floor semantics are untouched in Tier 2 |
 | K5 | Retired-view syncer (minus the drain) | The GC-side ack floor still consumes advertised rounds; the view must keep advancing for K1's gate quality and floor currency |
 | K6 | GC side, whole: ack floor R1, fold, two-phase graduation, spare rules, supersede/`ReplacedEntry`, clamp suppression handling | Out of scope (Tier 3 candidates); two-phase `d`-recheck is a pillar of the theorem |
@@ -173,8 +173,11 @@ of one of them.
 
 ## Tier 3 backlog (recorded separately in `BACKLOG.md`) {#tier-3}
 
-Ack-floor graduation gating (`condemn_round < min_ack`) — likely redundant given the two-phase `d`-recheck
-+ EDGE-BEFORE-OBSERVE; beat round-ack and the syncer as its feeder; tokenless condemned-arm → accept
-(requires weakening the modeled publish gate `~CondemnedAtView` — a model change, not just code); failure-
-texture review (stale views ⇒ more loud impossible-spares). Each with its own sabotage-flip demolition.
-Precondition: Tier 2 landed + one clean soak.
+**Corrected after the K1 race analysis:** the ack floor is NOT simply redundant — post-Tier-2 it is the
+delivery guarantee of the dedup-safety list (graduation waits until every live writer's view covers the
+entry), and K1's adoption gate is unsound without it. Tier 3 is therefore a package deal: removing the
+floor (and the beat round-ack + the syncer as its feeder) requires replacing dedup-adoption safety
+wholesale — e.g. adopt-displace (every dedup re-uploads under a fresh tag: kills dedup's bandwidth value)
+or no-adoption modes for small deployments. Tokenless condemned-arm → accept is bounded by the same race.
+Failure-texture review (stale views ⇒ more loud impossible-spares) rides along. Each item needs its own
+sabotage-flip demolition; several may conclude "keep". Precondition: Tier 2 landed + one clean soak.

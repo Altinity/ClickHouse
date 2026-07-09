@@ -1683,3 +1683,13 @@ infra/measurement gaps (not CA defects — all had dangling=0 + agreement):
   tokenless condemned-arm → accept (weakens the modeled ~CondemnedAtView publish gate — model change),
   failure-texture review (stale views ⇒ more loud impossible-spares). Each via its own sabotage-flip
   demolition.
+
+- **CORRECTION to the Tier-3 item above (2026-07-09, K1 race analysis):** the ack-floor graduation gating is
+  NOT "likely redundant". Post-Tier-2 it is the DELIVERY GUARANTEE of the dedup-safety list: graduation
+  requires min_ack > condemn_round ⇒ every live writer's installed view covers every graduated entry ⇒
+  putBlob's condemned check (K1) can always see a present-but-doomed token before adopting it. Without the
+  floor (or without the check) there is a concrete dangle interleaving: entry delete_pending pre-precommit →
+  pass seals before our precommitAdd → fold misses our edge → deleteExact executes after our HEAD adopted
+  the token → no promote HEADs (Tier 2) → committed dangle. Exact-token displacement makes check+floor
+  race-safe in both directions. Tier 3 floor removal = replace dedup-adoption safety wholesale
+  (adopt-displace / no-adoption), not a deletion.
