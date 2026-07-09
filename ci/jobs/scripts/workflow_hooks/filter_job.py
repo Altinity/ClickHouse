@@ -48,6 +48,22 @@ FUNCTIONAL_TEST_FLAKY_CHECK_JOBS = [
 
 _info_cache = None
 
+DOCKER_REQUIRED_ARM_JOBS = {
+    "Build (arm_release)",
+    Settings.DOCKER_BUILD_ARM_LINUX_JOB_NAME,
+    Settings.DOCKER_BUILD_MANIFEST_JOB_NAME,
+}
+
+
+def is_ci_excluded_by_tag(job_name, tag):
+    if tag in ("aarch64", "arm") and job_name in DOCKER_REQUIRED_ARM_JOBS:
+        return False
+
+    return tag in job_name.lower()
+
+
+# Must match ci.workflows.pull_request.KEEPER_STRESS_PR_NAME
+KEEPER_STRESS_PR_NAME = "Keeper Stress Tests (PR)"
 
 def should_skip_job(job_name):
     global _info_cache
