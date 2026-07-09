@@ -163,3 +163,25 @@ Watchdog cron: job 60470431 (hourly at :23).
   ack-floor model licenses skipping per-leaf promote HEADs when the installed round is unchanged since dep
   observation (DepEntry::observed_view_round) — complementary to (not replacing) the resurrect fixes: skip
   covers the round-unchanged happy path, the fixes are the recovery when the round moved mid-commit.
+
+### 2026-07-09/10 — Tier-2 writer↔GC simplification cycle (user-driven brainstorm)
+- User probe chain invalidated successively deeper layers: (1) re-checks needed? → (2) round-change
+  irrelevant? → (3) pinned-round ack enough? → (4) **early precommit already enough** — the decisive one.
+  Verified: publishStaging order (body → precommitAdd → putBlob → promote) makes the closure edge durable
+  BEFORE any observation; fold-activation + d>0→spared + two-phase d-recheck ⇒ closure-named hashes
+  undeletable ⇒ promote freshness machinery is redundant defense-in-depth. Named EDGE-BEFORE-OBSERVE.
+- Scope decision (user): **Tier 2 now** (writer side whole: delete tokened promote revalidation,
+  retained_sources, copy-forward pre-pass, view_gate drain, writer fence_round refresh [TLA+-conditional],
+  dead observed_view_round; NO paranoid mode), **Tier 3 → backlog**.
+- User probe "does the writer still need the condemned list?" found my K1 rationale UNDERSTATED — it is
+  safety-critical: pre-precommit-graduated entry can be adopted present-but-doomed (pass seals before our
+  precommitAdd → fold misses edge → deleteExact after our HEAD) — only condemned-check + exact-token
+  displacement close it; the ack floor is the list's DELIVERY GUARANTEE (min_ack > condemn_round ⇒ every
+  live writer's view covers every graduated entry). Spec strengthened; Tier-3 "floor likely redundant"
+  CORRECTED to a package deal (floor removal = replace dedup-adoption safety wholesale).
+- Spec committed: docs/superpowers/specs/2026-07-09-cas-writer-gc-simplification-design.md
+  (7d90f7b4812 + f427d8b1fd5 + 890a8c15439). Variants A/B superseded in BACKLOG; Tier-3 recorded.
+- Spec at user-review gate. Meanwhile dispatched adversarial fresh-model consult (tier2-consult, opus,
+  background): verify the theorem's seal/fold/settle/delete ordering claims, the K1 race, D1 across all
+  write paths (multi-part/exchange/republish/hardlink/abandon), D4/D5, the ordering chassert. Plan
+  (writing-plans) after consult returns clean + user approves spec.
