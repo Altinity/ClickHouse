@@ -1973,3 +1973,157 @@ TEST(CaWiringOps, OrphanedPendingBlobNotUploadedAfterReplace)
     EXPECT_EQ(storage->getFileSize("uui/uuid-1/all_1_1_0/data.bin"), 17u);   /// "replacement-bytes"
     EXPECT_FALSE(storage->existsFile("uui/uuid-1/all_1_1_0/new.bin"));
 }
+
+/// ==== Promote resurrect-on-condemn (spec 2026-07-09-cas-promote-resurrect-tokened-blob-design) ====
+///
+/// A fast GC can PREMATURELY condemn a blob a writer just putBlob'd, in the tiny putBlob->promote window
+/// (the precommit->blob edge is not yet folded, so GC reads in-degree 0). promote's blob revalidation used
+/// to fail the whole INSERT closed with ABORTED. The fix retains the writer's own re-readable BlobSource
+/// per putBlob'd hash and, AFTER the owner-liveness check confirms this build's precommit is still the live
+/// owner, re-uploads the condemned leaf from those bytes (INV-1: never GET the dying object) and re-checks.
+///
+/// These tests drive the REAL writer sequence (stageManifest -> precommitAdd -> putBlob -> promote) against
+/// a raw in-memory Store (no background GC → deterministic), and condemn the blob's CURRENT token by seeding
+/// gc/state the way GC's retire bridge does (mirrors seedState in gtest_cas_retire_view.cpp).
+
+namespace DB::ErrorCodes
+{
+    extern const int ABORTED;
+}
+
+namespace
+{
+
+DB::Cas::StorePtr openResurrectStore(std::shared_ptr<DB::Cas::InMemoryBackend> & out_backend)
+{
+    out_backend = std::make_shared<DB::Cas::InMemoryBackend>();
+    /// One root shard so the ref's journal lives in a single, predictable shard (matches gtest_cas_gc_leak).
+    return DB::Cas::Store::open(
+        out_backend, DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1});
+}
+
+/// Condemn (kind=Blob, hash, token) by seeding gc/state + a per-shard retired set that gc/state references
+/// — the on-storage interface RetireView::refresh consumes (the shape GC's retire bridge writes). Bumps the
+/// round so the retirement is a fresh one; leaves the object itself in place (condemn, NOT delete).
+void seedCondemnBlobToken(DB::Cas::Store & store, const DB::UInt128 & hash, const DB::Cas::Token & token, uint64_t size)
+{
+    using namespace DB::Cas;
+    Backend & b = store.backend();
+    const Layout & layout = store.layout();
+
+    GcState state;
+    const HeadResult head = b.head(layout.gcStateKey());
+    if (head.exists)
+    {
+        const auto got = b.get(layout.gcStateKey());
+        state = decodeGcState(got->bytes);
+    }
+    state.round += 1;
+
+    RetiredSet rs;
+    rs.entries.push_back({ObjectKind::Blob, hash, token, size});
+    const String retired_key = layout.retiredKey(state.snap_generation, state.snap_attempt, state.round, /*shard*/ 0);
+    b.putIfAbsent(retired_key, encodeRetiredSet(rs));
+    state.retired_refs[0] = retired_key;
+
+    if (head.exists)
+        b.putOverwrite(layout.gcStateKey(), encodeGcState(state), head.token);
+    else
+        b.putIfAbsent(layout.gcStateKey(), encodeGcState(state));
+}
+
+}
+
+/// A blob condemned in the putBlob->promote window is resurrected from the retained source; promote SUCCEEDS
+/// and the committed ref names a fresh, live incarnation.
+TEST(CaWiringResurrect, PromoteResurrectsCondemnedTokenedBlob)
+{
+    using namespace DB::Cas;
+    std::shared_ptr<InMemoryBackend> backend;
+    auto store = openResurrectStore(backend);
+    const RootNamespace ns{"test/tbl"};
+    const String ref = "all_1_1_0";
+    const String P = "resurrect-me";
+
+    BuildInfo info;
+    info.intended_ref = ns.string() + "/" + ref;
+    auto build = store->startBuild(info);
+
+    const ManifestId id = build->stageManifest({wiringBlobEntry("data.bin", P)});
+    build->precommitAdd(ns, ref, id);
+    build->putBlob(idOf(P), BlobSource::fromString(P));
+
+    /// Condemn the freshly-uploaded blob's CURRENT token (GC condemning the not-yet-folded fresh incarnation).
+    const String blob_key = store->layout().blobKey(idOf(P));
+    const HeadResult h1 = store->backend().head(blob_key);
+    ASSERT_TRUE(h1.exists);
+    seedCondemnBlobToken(*store, u128Of(P), h1.token, h1.size);
+    store->retireView().refresh();
+    ASSERT_TRUE(store->retireView().isCondemnedToken(ObjectKind::Blob, u128Of(P), h1.token))
+        << "precondition: the putBlob'd token must be condemned before promote";
+
+    /// promote must NOT abort — the leaf is resurrected from THIS build's retained source bytes.
+    EXPECT_NO_THROW(build->promote(ns, ref, build->buildId(), id));
+
+    /// The ref is committed and the blob is present with a FRESH (non-condemned) incarnation.
+    EXPECT_TRUE(store->resolveRef(ns, ref).has_value()) << "the ref must resolve after a resurrecting promote";
+    const HeadResult h2 = store->backend().head(blob_key);
+    ASSERT_TRUE(h2.exists);
+    EXPECT_FALSE(store->retireView().isCondemnedToken(ObjectKind::Blob, u128Of(P), h2.token))
+        << "resurrect must mint a fresh incarnation whose token is not the condemned one";
+}
+
+/// If this build's precommit was removed (abandon / GC reclaim) before promote, promote ABORTS at the
+/// owner-liveness check and performs NO resurrect — no orphan incarnation is uploaded on the aborting path.
+TEST(CaWiringResurrect, PromoteAbandonedPrecommitAbortsWithoutResurrect)
+{
+    using namespace DB::Cas;
+    std::shared_ptr<InMemoryBackend> backend;
+    auto store = openResurrectStore(backend);
+    const RootNamespace ns{"test/tbl"};
+    const String ref = "all_2_2_0";
+    const String P = "abandoned-me";
+
+    BuildInfo info;
+    info.intended_ref = ns.string() + "/" + ref;
+    auto build = store->startBuild(info);
+
+    const ManifestId id = build->stageManifest({wiringBlobEntry("data.bin", P)});
+    build->precommitAdd(ns, ref, id);
+    build->putBlob(idOf(P), BlobSource::fromString(P));
+
+    const String blob_key = store->layout().blobKey(idOf(P));
+    const HeadResult h1 = store->backend().head(blob_key);
+    ASSERT_TRUE(h1.exists);
+    seedCondemnBlobToken(*store, u128Of(P), h1.token, h1.size);
+    store->retireView().refresh();
+    ASSERT_TRUE(store->retireView().isCondemnedToken(ObjectKind::Blob, u128Of(P), h1.token));
+
+    /// Concurrently remove THIS build's precommit binding (the GC-reclaim / abandon shape) BEFORE promote,
+    /// so the owner-liveness check fires. Mirror the removal encoding of Build::abandon / Store::dropRef:
+    /// old = the precommit binding, new = none. Done via appendOwnerEvent rather than build->abandon(), which
+    /// would mark THIS build not-alive and make promote throw a different (LOGICAL_ERROR) error.
+    DB::Cas::tests::appendOwnerEvent(
+        store->backend(), store->layout(), ns, /*shard*/ 0,
+        OwnerBinding{.owner_kind = OwnerKind::Precommit, .ref_name = ref,
+                     .build_id = build->buildId(), .manifest_ref = id.ref},
+        std::nullopt);
+
+    /// promote aborts at the owner-move guard (ABORTED), NOT the blob gate.
+    try
+    {
+        build->promote(ns, ref, build->buildId(), id);
+        FAIL() << "expected promote to abort on the removed precommit binding";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::ABORTED);
+    }
+
+    /// No resurrection ran before the abort: the blob's current token is STILL the condemned one (promote
+    /// uploaded no fresh incarnation) — proving resurrection is gated behind the owner-liveness check.
+    const HeadResult h2 = store->backend().head(blob_key);
+    ASSERT_TRUE(h2.exists);
+    EXPECT_TRUE(store->retireView().isCondemnedToken(ObjectKind::Blob, u128Of(P), h2.token))
+        << "resurrection must not run before the owner check (no consequential PUT on an aborting path)";
+}

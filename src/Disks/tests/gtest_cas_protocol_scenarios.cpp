@@ -15,9 +15,14 @@
 /// The fail-closed publish gate that those scenarios exercise now lives in TWO places:
 ///   • putBlob: INV-1 condemned-dedup re-upload from the writer's OWN source bytes (never GETs the
 ///     dying object);
-///   • promote: a fail-closed HEAD over EVERY blob leaf of the staged manifest body — a blob that is
-///     ABSENT or condemned-at-its-CURRENT-token ⇒ ABORTED (the committed ref never names a missing or
-///     dying blob). promote refreshes the retire view when the shard/registry fence is ahead of it.
+///   • promote: a fail-closed HEAD over EVERY blob leaf of the staged manifest body, AFTER an owner-
+///     liveness check. A leaf that is ABSENT or condemned-at-its-CURRENT-token is RESURRECTED from the
+///     writer's OWN retained source bytes when this build putBlob'd it (INV-1: never GET the dying
+///     object; spec 2026-07-09-cas-promote-resurrect-tokened-blob) — the committed ref then names a
+///     fresh, live incarnation and the premature condemn is invisible to the client. Only a leaf with NO
+///     retained source (a tokenless W-EVIDENCE adopt) keeps the fail-closed ⇒ ABORTED. Resurrection runs
+///     only when the owner-liveness check confirms this build's precommit is still the live owner (an
+///     aborting promote performs no re-upload). promote refreshes the retire view when the fence is ahead.
 /// These scenarios assert the no-dangle / no-loss / fail-closed protocol properties faithfully on that
 /// flow. The strong safety assertions are preserved.
 
@@ -97,11 +102,13 @@ void assertPartReads(
 
 }
 
-TEST(CasProtocol, FenceConflictCondemnedBlobDepAbortsRetryable)
+TEST(CasProtocol, FenceConflictCondemnedTokenedBlobResurrectsFromSource)
 {
-    /// INV-1: a blob leaf whose CURRENT token is condemned at the promote gate has no source bytes
-    /// available (a precommitted build's promote holds no BlobSource). The gate MUST throw ABORTED
-    /// (retryable), never GET the dying object. The caller retries the whole build from scratch.
+    /// Resurrect-on-condemn (spec 2026-07-09-cas-promote-resurrect-tokened-blob): a blob leaf whose
+    /// CURRENT token is condemned at the promote gate, but which THIS build putBlob'd (so it retains the
+    /// re-readable BlobSource), is re-uploaded from the writer's OWN bytes (INV-1: never GET the dying
+    /// object) and promote SUCCEEDS — the premature condemn is invisible to the client. Resurrection runs
+    /// only after the owner-liveness check (here the precommit is still the live owner).
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openStore(b);
     const RootNamespace ns{"srv1/tbl"};
@@ -120,14 +127,15 @@ TEST(CasProtocol, FenceConflictCondemnedBlobDepAbortsRetryable)
         {RetiredEntry{.kind = ObjectKind::Blob, .hash = u128Of("payload-X"), .token = t0, .size = 9}});
     fenceNamespace(*b, s->layout(), ns, s->poolMeta().root_shards, /*round*/ 1);
 
-    /// promote: mutateShard refreshes the view (fence_round 1 > view round 0), then revalidates X:
-    /// HEAD t0 is condemned ⇒ ABORTED (INV-1; caller must retry from scratch).
-    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { build->promote(ns, "part_1", build->buildId(), id); });
+    /// promote: mutateShard refreshes the view (fence_round 1 > view round 0), then revalidates X: HEAD
+    /// t0 is condemned ⇒ re-upload from the retained source ⇒ a fresh, live incarnation ⇒ commit.
+    build->promote(ns, "part_1", build->buildId(), id);
 
-    /// The condemned object is still at t0 — nothing was written.
-    EXPECT_EQ(b->head(blob_key).token, t0);
-    /// No ref was published.
-    EXPECT_FALSE(s->resolveRef(ns, "part_1").has_value());
+    /// The ref is committed and reads back; the blob rides a FRESH token (not the condemned t0).
+    assertPartReads(b, s, ns, "part_1", "data.bin", "payload-X");
+    const Token t1 = b->head(blob_key).token;
+    EXPECT_NE(t1, t0);
+    EXPECT_FALSE(s->retireView().isCondemnedToken(ObjectKind::Blob, u128Of("payload-X"), t1));
 }
 
 TEST(CasProtocol, RevalidateReObservesStaleTokenKeepsWhenUnchanged)
@@ -242,9 +250,12 @@ TEST(CasProtocol, RevalidateAdoptsLiveTokenWhenOnlyPhantomCondemnedAtDifferentTo
     EXPECT_EQ(b->head(blob_key).token, t0);
 }
 
-TEST(CasProtocol, RevalidateAbsentBlobDepAbortsRetryable)
+TEST(CasProtocol, RevalidateAbsentTokenedBlobResurrectsFromSource)
 {
-    /// A blob deleted (a landed GC delete) before the gate. promote HEADs it ⇒ absent ⇒ ABORTED.
+    /// Resurrect-on-absent (spec 2026-07-09): a blob deleted (a landed GC delete) before the gate, but
+    /// which THIS build putBlob'd (so it retains the BlobSource), is re-uploaded from the writer's OWN
+    /// bytes and promote SUCCEEDS. A leaf absent with NO retained source keeps the fail-closed ABORTED
+    /// (covered by EvidenceHitCondemnedBlobAbortsRetryable for the tokenless case).
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openStore(b);
     const RootNamespace ns{"srv1/tbl"};
@@ -253,7 +264,7 @@ TEST(CasProtocol, RevalidateAbsentBlobDepAbortsRetryable)
     const String blob_key = s->layout().blobKey(idOf("payload-X"));
 
     auto build = startBuildFor(s, ns, "part_1");
-    build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));   /// dedup → adopts current token
+    build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));   /// dedup → adopts current token (source retained)
     const ManifestId id = build->stageManifest({blobEntry("data.bin", "payload-X")});
     build->precommitAdd(ns, "part_1", id);
 
@@ -264,9 +275,10 @@ TEST(CasProtocol, RevalidateAbsentBlobDepAbortsRetryable)
     injectRetire(*b, s->layout(), /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0, {});
     fenceNamespace(*b, s->layout(), ns, s->poolMeta().root_shards, /*round*/ 1);
 
-    /// promote: revalidate X ⇒ HEAD absent ⇒ ABORTED (retryable). No ref published.
-    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { build->promote(ns, "part_1", build->buildId(), id); });
-    EXPECT_FALSE(s->resolveRef(ns, "part_1").has_value());
+    /// promote: revalidate X ⇒ HEAD absent ⇒ re-upload from the retained source ⇒ present + live ⇒ commit.
+    build->promote(ns, "part_1", build->buildId(), id);
+    assertPartReads(b, s, ns, "part_1", "data.bin", "payload-X");
+    EXPECT_TRUE(b->head(blob_key).exists);
 }
 
 TEST(CasProtocol, EvidenceHitCondemnedBlobAbortsRetryable)
@@ -301,11 +313,11 @@ TEST(CasProtocol, EvidenceHitCondemnedBlobAbortsRetryable)
     EXPECT_FALSE(s->resolveRef(ns, "part_1").has_value());
 }
 
-TEST(CasProtocol, WedgedHeartbeatCondemnedBlobDepAbortsRetryable)
+TEST(CasProtocol, WedgedHeartbeatCondemnedTokenedBlobResurrectsFromSource)
 {
-    /// A build whose watermark never renews finds its OWN upload condemned by full GC; its promote
-    /// revalidates, sees the blob condemned, and has no retained source bytes at promote time ⇒ ABORTED.
-    /// The precommit fence normally removes this window; this validates the degenerate case.
+    /// A build whose watermark never renews finds its OWN upload condemned by full GC. Because the build
+    /// retains the source bytes, promote resurrects the condemned leaf from source (INV-1) and SUCCEEDS —
+    /// the degenerate wedged-heartbeat window closes invisibly rather than surfacing a client-visible abort.
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openStore(b);
     const RootNamespace ns{"srv1/tbl"};
@@ -323,11 +335,12 @@ TEST(CasProtocol, WedgedHeartbeatCondemnedBlobDepAbortsRetryable)
         {RetiredEntry{.kind = ObjectKind::Blob, .hash = u128Of("payload-X"), .token = t0, .size = 9}});
     fenceNamespace(*b, s->layout(), ns, s->poolMeta().root_shards, /*round*/ 1);
 
-    /// promote: revalidate X ⇒ HEAD t0 condemned ⇒ ABORTED.
-    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { build->promote(ns, "part_1", build->buildId(), id); });
-
-    EXPECT_EQ(b->head(blob_key).token, t0);
-    EXPECT_FALSE(s->resolveRef(ns, "part_1").has_value());
+    /// promote: revalidate X ⇒ HEAD t0 condemned ⇒ re-upload from source ⇒ fresh live incarnation ⇒ commit.
+    build->promote(ns, "part_1", build->buildId(), id);
+    assertPartReads(b, s, ns, "part_1", "data.bin", "payload-X");
+    const Token t1 = b->head(blob_key).token;
+    EXPECT_NE(t1, t0);
+    EXPECT_FALSE(s->retireView().isCondemnedToken(ObjectKind::Blob, u128Of("payload-X"), t1));
 }
 
 TEST(CasProtocol, AbandonLeavesDebrisAndDisables)
