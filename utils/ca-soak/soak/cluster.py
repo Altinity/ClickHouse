@@ -82,6 +82,20 @@ class QueryError(RuntimeError):
             return False
         return any(("Code: %d." % c) in b for c in NODE_DOWN_CODES)
 
+    @property
+    def is_mount_fenced(self) -> bool:
+        """True if the server-side exception is a CAS mount-fence ABORTED (code 236): this replica's
+        mount lease expired / it was GC-fenced (e.g. frozen/paused past the mount-lease TTL), so it
+        REFUSES to mutate its ref shard until it self-remounts. Unlike the B137 retryable ABORTED (a
+        resurrect-vs-GC race that clears in ms on the SAME node), a fence persists for the WHOLE outage,
+        so hammering the same node within the tiny `retry_on_aborted` budget is futile. The correct
+        recovery is to REROUTE the write to the healthy peer (which shares the pool and holds its own
+        live lease) — the same recovery as node-down. Detected by the fence message in the body."""
+        b = self.body or ""
+        if not self.is_aborted:
+            return False
+        return ("mount lost" in b or "lease expired" in b or "refusing to mutate ref shard" in b)
+
 # Port/container convention for replica i (1-based): ch1=8123, ch2=8124, ..., chN=8122+N;
 # container ca-soak-ch{i}-1. Matches docker-compose.yml (2 nodes) and docker-compose-10replicas.yml
 # (ch1..ch10 -> 8123..8132). Per-node overrides via env CA_SOAK_NODE{i}_{HOST,PORT,CONTAINER}.
@@ -183,6 +197,13 @@ def retry_on_aborted(fn, *, attempts: int = 6, backoff_s: float = 0.05, on_retry
         except QueryError as e:
             if not e.is_aborted:
                 raise
+            # A mount-fence ABORTED (lease expired / GC-fenced replica) will NOT clear on this node
+            # within the tiny same-node budget — the replica stays fenced for the whole outage. Re-raise
+            # it immediately so the outer transport-retry REROUTES the write to the healthy peer instead
+            # of wasting the budget hammering the fenced node (which caused the FREEZE_LONG WORKLOAD
+            # FAILURE). The B137 transient ABORTED (resurrect-vs-GC race) still retries on the same node.
+            if e.is_mount_fenced:
+                raise
             last = e
             if attempt < attempts:
                 if on_retry is not None:
@@ -244,6 +265,16 @@ def is_readonly(exc: BaseException) -> bool:
     return isinstance(exc, QueryError) and exc.is_readonly
 
 
+def is_mount_fenced(exc: BaseException) -> bool:
+    """A CAS mount-fence ABORTED (`QueryError.is_mount_fenced`): the target replica's mount lease
+    expired / it was GC-fenced (frozen past the mount-lease TTL) and refuses to mutate its ref shard
+    until it self-remounts. This persists for the whole outage, so — like node-down — the recovery is
+    to REROUTE to the other replica (shared pool, own live lease) with bounded backoff, NOT to hammer
+    the fenced node. Safe: the rejected INSERT never committed (RMT block-dedup keeps the rerouted
+    retry idempotent), and a fenced OPTIMIZE has no model effect."""
+    return isinstance(exc, QueryError) and exc.is_mount_fenced
+
+
 def retry_on_transport(fn, *, attempts: int, backoff_s: float = 0.5, max_backoff_s: float = 8.0,
                        on_retry=None, sleep_fn=time.sleep):
     """Call `fn` and retry it on a NODE-DOWN failure (`is_node_down`: a connection-level transport
@@ -260,7 +291,7 @@ def retry_on_transport(fn, *, attempts: int, backoff_s: float = 0.5, max_backoff
         try:
             return fn()
         except Exception as e:
-            if not (is_node_down(e) or is_readonly(e)):
+            if not (is_node_down(e) or is_readonly(e) or is_mount_fenced(e)):
                 raise
             last = e
             if attempt < attempts:

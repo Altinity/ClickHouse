@@ -1468,3 +1468,20 @@ infra/measurement gaps (not CA defects — all had dangling=0 + agreement):
   COUNT RANGE `[count(now+eps), count(now-eps)]` (catches real data loss/dup) and (b) the GC-to-fixpoint
   + clean-pool fsck gate (the CA-integrity oracle, unaffected by TTL timing). Exact compare unchanged at
   non-ambiguous checkpoints. 22 model tests pass.
+
+## SOAK-FREEZE_LONG-workload-fence-reroute: FIXED — workload aborted instead of rerouting fenced writes
+
+- **Logged (UTC):** 2026-07-09  **Status: FIXED (found by the new FREEZE_LONG fault; obvious once seen).**
+- **Observed:** run2 aborted at ~94% (converge) with `WORKLOAD FAILURE: Code 236 ... CAS mount lost /
+  lease expired — refusing to mutate ref shard for server_root 'ca_soak_ch1'` on op 101073, during an
+  83s FREEZE_LONG of ch1. The CA server behaved CORRECTLY (fail-closed ABORTED — a fenced replica must
+  not mutate); the WORKLOAD retry logic was at fault.
+- **Root cause:** the fence ABORTED is a retryable ABORTED, so it hit `retry_on_aborted` (6 tries over
+  <1s, SAME node) then re-raised; the outer `retry_on_transport` only reroutes `is_node_down`/`is_readonly`
+  (NOT ABORTED). So an 83s freeze (> the tiny same-node budget) → give up → abort. The workload never
+  rerouted the write to the healthy peer (ch2, shared pool, own live lease).
+- **Fix (`soak/cluster.py` + `run.py`):** classify the fence ABORTED (`QueryError.is_mount_fenced` +
+  `is_mount_fenced()`), skip its same-node `retry_on_aborted` (re-raise immediately), and add it to
+  `retry_on_transport`'s reroute predicate + the OPTIMIZE swallow set — so a fenced write REROUTES to the
+  peer (40 attempts, capped backoff) exactly like node-down. 45 retry unit tests pass (8 new). The B137
+  transient ABORTED still retries same-node.

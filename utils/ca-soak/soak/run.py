@@ -336,7 +336,7 @@ class Driver:
                 # re-establishing its Keeper session after a chaos pause/restart -- esp. `both pause`)
                 # are both expected under chaos. OPTIMIZE has NO model effect, so dropping it is sound;
                 # only a genuine logic error surfaces.
-                if not (e.is_node_down or e.is_readonly):
+                if not (e.is_node_down or e.is_readonly or e.is_mount_fenced):
                     raise
             except Exception as e:
                 if not is_transport_error(e):
