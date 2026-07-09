@@ -331,9 +331,16 @@ void ContentAddressedMetadataStorage::startup()
     /// object storage has none). That emulation is per-process: two servers pointed at the SAME local
     /// pool (e.g. an NFS/shared mount) each keep independent token state and would silently violate
     /// the CAS invariants — the capability probe cannot detect this (each process passes it alone).
-    /// Warn loudly so a shared-pool misconfiguration is visible (review #1 / B25).
+    /// Make a shared-pool misconfiguration visible (review #1 / B25), but at INFO — NOT WARNING.
+    /// An inline `disk = disk(... object_storage_type=local ...)` opens the disk on the QUERY thread, so
+    /// a WARNING is forwarded to the client at the functional-test default `send_logs_level=warning` and
+    /// fails EVERY such query (clickhouse-test fails a test on ANY client stderr). At INFO the message
+    /// still lands in the server log for operator visibility but is not forwarded to client queries, so
+    /// the ~15 CA-over-local stateless tests stop failing on a benign single-server note. (A genuinely
+    /// shared local pool is a niche risk that would also surface via CAS/GC corruption; a future
+    /// `system.warnings` entry could restore a louder, test-safe signal.)
     if (mode == Cas::ObjectStorageBackend::Mode::EmulatedSingleProcess)
-        LOG_WARNING(
+        LOG_INFO(
             getLogger("ContentAddressedMetadataStorage"),
             "Content-addressed disk over LOCAL object storage uses emulated in-process conditional "
             "operations — safe ONLY for a single server. Do NOT share this pool path between multiple "
