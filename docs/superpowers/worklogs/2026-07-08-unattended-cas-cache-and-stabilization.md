@@ -150,3 +150,16 @@ Watchdog cron: job 60470431 (hourly at :23).
   (03283). Together close the full promote condemn-race class (putBlob source-backed + adoptEvidence
   tokenless), each: fresh-model consult → TLA+ gate → subagent impl → independent review. See
   [[project_promote_resurrect_condemn]].
+
+- **FULL CA-s3 LANE #2 (post tokenless fix): Passed 10359 / Failed 53 / Skipped 104. ZERO promote-condemned
+  aborts in the entire run.** All 4 condemn-race targets OK under load: 01156, 01710, 02346_on_insert,
+  **03283** (the tokenless DETACH/freeze reproducer — now green). The 53 fails are the known env set
+  (clickhouse-local family 01146/02956/03456/03536x2/03793/04039 + 04286/05008/05009 CA-env, show_privileges
+  ref drift, remote_ipv6, s2, kafka-shutdown, avro, alias_marker, test_optimize_using_constraints) — no
+  promote/condemn involvement; 03829/00933/03582/03800 did not reproduce this run (flaky timing/memory class).
+  **The promote condemn-race class is CLOSED: tokened INSERT resurrect + tokenless copy-forward backstop,
+  both TLA+-gated, reviewed, and validated under the full concurrent lane.**
+- Protocol review with user recorded in BACKLOG (PROMOTE-REVALIDATION-MINIMIZATION-2026-07-09): the
+  ack-floor model licenses skipping per-leaf promote HEADs when the installed round is unchanged since dep
+  observation (DepEntry::observed_view_round) — complementary to (not replacing) the resurrect fixes: skip
+  covers the round-unchanged happy path, the fixes are the recovery when the round moved mid-commit.
