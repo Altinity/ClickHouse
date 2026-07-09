@@ -63,9 +63,6 @@ def is_ci_excluded_by_tag(job_name, tag):
     return tag in job_name.lower()
 
 
-# Must match ci.workflows.pull_request.KEEPER_STRESS_PR_NAME
-KEEPER_STRESS_PR_NAME = "Keeper Stress Tests (PR)"
-
 def should_skip_job(job_name):
     global _info_cache
     if _info_cache is None:
@@ -195,7 +192,7 @@ def should_skip_job(job_name):
 
     ci_exclude_tags = _info_cache.get_kv_data("ci_exclude_tags") or []
     for tag in ci_exclude_tags:
-        if tag in job_name:
+        if is_ci_excluded_by_tag(job_name, tag):
             return True, f"Skipped, job name includes excluded tag '{tag}'"
 
     return False, ""
