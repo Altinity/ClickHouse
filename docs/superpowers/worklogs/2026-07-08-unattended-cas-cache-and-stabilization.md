@@ -122,3 +122,18 @@ Watchdog cron: job 60470431 (hourly at :23).
   other 54 failures are the known local-env/pre-existing set (mysql, clickhouse-local, s2-geo, dynamic-json,
   alias-marker) + known CA non-race items (03829 memory, 05008/05009 CA scenarios). Tokened-INSERT
   resurrect fix = DONE. Memory: [[project_promote_resurrect_condemn]].
+
+### 2026-07-09 — 03283 tokenless copy-forward condemn-race cycle
+- Root cause: promote's copy-forward pre-pass reads the PRE-refresh retire view; the in-closure
+  revalidation checks the POST-refresh (fence_round) view — a condemnation revealed only by the in-closure
+  refresh is missed for tokenless adoptEvidence leaves → fail-closed ABORTED (03283 DETACH/freeze).
+- Fresh-model consult (opus, adversarial): Option A — in-closure copy-forward backstop after the refresh +
+  owner-liveness check; KEEP the pre-pass as the outside-the-lock fast path (view_gate serialization, not
+  the void PUT-in-closure objection); ONE shared predicate isCopyForwardableTokenless; unknown-leaf(no dep)
+  + absent-tokenless stay fail-closed. INV-1/no-dangle window = the SAME one the tokened fix already accepts
+  (past owner-check + fold barrier). Spec+plan committed.
+- **TLA+ gate GREEN:** CaIncarnationCore_stage6_evstale (EnableEvStale+EnableReval) → "No error has been
+  found" (153M states; INV_NO_DANGLE/LOSS/RETURN hold) = re-observe-stale-evidence-then-publish is verified.
+  Negative control sab_noevreobserve → INV_NO_LOSS VIOLATED (exit 12) = admitting stale evidence without
+  re-observe provably dangles → the re-observe (our copy-forward backstop) is load-bearing. Mapping:
+  in-closure copy-forward against the refreshed view ≙ the model's WEvObserve re-observe.
