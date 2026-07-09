@@ -21,8 +21,12 @@ def wait_for_export_status(
     expected_status="COMPLETED",
     timeout=60,
     poll_interval=0.5,
+    system_table="replicated_partition_exports",
 ):
-    """Poll system.replicated_partition_exports until status matches.
+    """Poll a partition-exports system table until status matches.
+
+    *system_table* selects the source table: ``replicated_partition_exports`` for
+    ReplicatedMergeTree (default) or ``partition_exports`` for plain MergeTree.
 
     *dest_table* may be ``None`` to skip filtering by destination table
     (useful for catalog-based tests where the destination is a database-qualified path).
@@ -34,7 +38,7 @@ def wait_for_export_status(
             f" AND destination_table = '{dest_table}'" if dest_table else ""
         )
         status = node.query(
-            f"SELECT status FROM system.replicated_partition_exports"
+            f"SELECT status FROM system.{system_table}"
             f" WHERE source_table = '{source_table}'"
             f"{dest_filter}"
             f" AND partition_id = '{partition_id}'"
@@ -59,12 +63,13 @@ def wait_for_export_to_start(
     partition_id,
     timeout=10,
     poll_interval=0.2,
+    system_table="replicated_partition_exports",
 ):
-    """Poll until at least one row exists in system.replicated_partition_exports."""
+    """Poll until at least one row exists in the given partition-exports system table."""
     start_time = time.time()
     while time.time() - start_time < timeout:
         count = node.query(
-            f"SELECT count() FROM system.replicated_partition_exports"
+            f"SELECT count() FROM system.{system_table}"
             f" WHERE source_table = '{source_table}'"
             f"   AND destination_table = '{dest_table}'"
             f"   AND partition_id = '{partition_id}'"
@@ -88,6 +93,7 @@ def wait_for_exception_count(
     min_exception_count=1,
     timeout=60,
     poll_interval=0.5,
+    system_table="replicated_partition_exports",
 ):
     """Wait for exception_count to reach at least *min_exception_count*.
 
@@ -104,7 +110,7 @@ def wait_for_exception_count(
     last_exception_count = None
     while time.time() - start_time < timeout:
         exception_count_str = node.query(
-            f"SELECT exception_count FROM system.replicated_partition_exports"
+            f"SELECT exception_count FROM system.{system_table}"
             f" WHERE source_table = '{source_table}'"
             f"   AND destination_table = '{dest_table}'"
             f"   AND partition_id = '{partition_id}'"

@@ -265,19 +265,35 @@ BlockIO InterpreterKillQueryQuery::execute()
                 "Exporting merge tree partition is experimental. Set the server setting `allow_experimental_export_merge_tree_partition` to enable it");
         }
 
-        Block exports_block = getSelectResult(
-            "source_database, source_table, transaction_id, destination_database, destination_table, partition_id",
-            "system.replicated_partition_exports");
-        if (exports_block.empty())
+        const String export_columns = "source_database, source_table, transaction_id, destination_database, destination_table, partition_id";
+
+        /// Partition exports live in two system tables: `replicated_partition_exports` for
+        /// ReplicatedMergeTree and `partition_exports` for plain MergeTree. Query both so a single
+        /// KILL EXPORT PARTITION targets either engine. Each query applies the user WHERE to its own
+        /// table (which exposes all of its columns); a WHERE that references columns specific to the
+        /// other engine simply yields no matches / is tolerated.
+        Block replicated_exports_block = getSelectResult(export_columns, "system.replicated_partition_exports");
+        Block plain_exports_block;
+        try
+        {
+            plain_exports_block = getSelectResult(export_columns, "system.partition_exports");
+        }
+        catch (...)
+        {
+            tryLogCurrentException(getLogger("InterpreterKillQueryQuery"),
+                "KILL EXPORT PARTITION: could not read system.partition_exports (the WHERE may reference "
+                "columns that only exist for ReplicatedMergeTree); ignoring plain MergeTree tables");
+        }
+
+        if (replicated_exports_block.empty() && plain_exports_block.empty())
             return res_io;
 
-        const ColumnString & src_db_col = typeid_cast<const ColumnString &>(*exports_block.getByName("source_database").column);
-        const ColumnString & src_table_col = typeid_cast<const ColumnString &>(*exports_block.getByName("source_table").column);
-        const ColumnString & dst_db_col = typeid_cast<const ColumnString &>(*exports_block.getByName("destination_database").column);
-        const ColumnString & dst_table_col = typeid_cast<const ColumnString &>(*exports_block.getByName("destination_table").column);
-        const ColumnString & tx_col = typeid_cast<const ColumnString &>(*exports_block.getByName("transaction_id").column);
-
-        auto header = exports_block.cloneEmpty();
+        /// Build the result header explicitly from the fixed projection so it does not depend on
+        /// whether either source block ended up with rows.
+        Block header;
+        for (const auto & column_name : {"source_database", "source_table", "transaction_id",
+                                         "destination_database", "destination_table", "partition_id"})
+            header.insert({ColumnString::create(), std::make_shared<DataTypeString>(), column_name});
         header.insert(0, {ColumnString::create(), std::make_shared<DataTypeString>(), "kill_status"});
 
         MutableColumns res_columns = header.cloneEmptyColumns();
@@ -285,45 +301,60 @@ BlockIO InterpreterKillQueryQuery::execute()
         auto access = getContext()->getAccess();
         bool access_denied = false;
 
-        for (size_t i = 0; i < exports_block.rows(); ++i)
+        auto process_block = [&](const Block & exports_block)
         {
-            const auto src_database = src_db_col.getDataAt(i);
-            const auto src_table = src_table_col.getDataAt(i);
-            const auto dst_database = dst_db_col.getDataAt(i);
-            const auto dst_table = dst_table_col.getDataAt(i);
+            if (exports_block.empty())
+                return;
 
-            const auto table_id = StorageID{std::string{src_database}, std::string{src_table}};
-            const auto transaction_id = tx_col.getDataAt(i);
+            const ColumnString & src_db_col = typeid_cast<const ColumnString &>(*exports_block.getByName("source_database").column);
+            const ColumnString & src_table_col = typeid_cast<const ColumnString &>(*exports_block.getByName("source_table").column);
+            const ColumnString & dst_db_col = typeid_cast<const ColumnString &>(*exports_block.getByName("destination_database").column);
+            const ColumnString & dst_table_col = typeid_cast<const ColumnString &>(*exports_block.getByName("destination_table").column);
+            const ColumnString & tx_col = typeid_cast<const ColumnString &>(*exports_block.getByName("transaction_id").column);
 
-            CancellationCode code = CancellationCode::Unknown;
-            if (!query.test)
+            for (size_t i = 0; i < exports_block.rows(); ++i)
             {
-                auto storage = DatabaseCatalog::instance().tryGetTable(table_id, getContext());
-                if (!storage)
-                    code = CancellationCode::NotFound;
-                else
+                const auto src_database = src_db_col.getDataAt(i);
+                const auto src_table = src_table_col.getDataAt(i);
+                const auto dst_database = dst_db_col.getDataAt(i);
+                const auto dst_table = dst_table_col.getDataAt(i);
+
+                const auto table_id = StorageID{std::string{src_database}, std::string{src_table}};
+                const auto transaction_id = tx_col.getDataAt(i);
+
+                CancellationCode code = CancellationCode::Unknown;
+                if (!query.test)
                 {
-                    ASTAlterCommand alter_command{};
-                    alter_command.type = ASTAlterCommand::EXPORT_PARTITION;
-                    alter_command.move_destination_type = DataDestinationType::TABLE;
-                    alter_command.from_database = src_database;
-                    alter_command.from_table = src_table;
-                    alter_command.to_database = dst_database;
-                    alter_command.to_table = dst_table;
-
-                    required_access_rights = InterpreterAlterQuery::getRequiredAccessForCommand(
-                        alter_command, table_id.database_name, table_id.table_name);
-                    if (!access->isGranted(required_access_rights))
+                    auto storage = DatabaseCatalog::instance().tryGetTable(table_id, getContext());
+                    if (!storage)
+                        code = CancellationCode::NotFound;
+                    else
                     {
-                        access_denied = true;
-                        continue;
-                    }
-                    code = storage->killExportPartition(std::string{transaction_id});
-                }
-            }
+                        ASTAlterCommand alter_command{};
+                        alter_command.type = ASTAlterCommand::EXPORT_PARTITION;
+                        alter_command.move_destination_type = DataDestinationType::TABLE;
+                        alter_command.from_database = src_database;
+                        alter_command.from_table = src_table;
+                        alter_command.to_database = dst_database;
+                        alter_command.to_table = dst_table;
 
-            insertResultRow(i, code, exports_block, header, res_columns);
-        }
+                        required_access_rights = InterpreterAlterQuery::getRequiredAccessForCommand(
+                            alter_command, table_id.database_name, table_id.table_name);
+                        if (!access->isGranted(required_access_rights))
+                        {
+                            access_denied = true;
+                            continue;
+                        }
+                        code = storage->killExportPartition(std::string{transaction_id});
+                    }
+                }
+
+                insertResultRow(i, code, exports_block, header, res_columns);
+            }
+        };
+
+        process_block(replicated_exports_block);
+        process_block(plain_exports_block);
 
         if (res_columns[0]->empty() && access_denied)
             throw Exception(ErrorCodes::ACCESS_DENIED, "Not allowed to kill export partition. "

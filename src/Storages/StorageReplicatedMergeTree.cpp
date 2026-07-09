@@ -8386,33 +8386,13 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
     const auto dest_storage_id = StorageID(dest_database, dest_table);
     auto dest_storage = DatabaseCatalog::instance().getTable({dest_database, dest_table}, query_context);
 
-    if (dest_storage->getStorageID() == this->getStorageID())
-    {
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Exporting to the same table is not allowed");
-    }
-
-    if (!dest_storage->supportsImport(query_context))
-        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Destination storage {} does not support MergeTree parts or uses unsupported partitioning", dest_storage->getName());
-
-    auto query_to_string = [] (const ASTPtr & ast)
-    {
-        return ast ? ast->formatWithSecretsOneLine() : "";
-    };
-
     auto src_snapshot = getInMemoryMetadataPtr();
-    auto destination_snapshot = dest_storage->getInMemoryMetadataPtr();
 
-    /// Positional CAST matching, like `INSERT INTO dest SELECT * FROM src`.
-    ExportPartitionUtils::verifyExportSchemaCastable(
-        src_snapshot, destination_snapshot, dest_storage->getStorageID(), query_context);
-
-    /// Iceberg partition compatibility is checked below; here we only need the
-    /// partition-key ASTs to match (partition-column types follow the lossy-cast gate).
-    if (!dest_storage->isDataLake())
-    {
-        if (query_to_string(src_snapshot->getPartitionKeyAST()) != query_to_string(destination_snapshot->getPartitionKeyAST()))
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Tables have different partition key");
-    }
+    /// Validate the destination (not self, import support, positionally castable schema, matching
+    /// partition key / Iceberg partition spec) and, for Iceberg destinations, capture the
+    /// destination metadata.json to persist in the manifest.
+    const auto destination_iceberg_metadata_json = ExportPartitionUtils::extractDestinationIcebergMetadataJson(
+        src_snapshot, getStorageID(), dest_storage, query_context);
 
     zkutil::ZooKeeperPtr zookeeper = getZooKeeperAndAssertNotReadonly();
 
@@ -8534,50 +8514,11 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
 
     if (dest_storage->isDataLake())
     {
-#if USE_AVRO
-        auto * object_storage = dynamic_cast<StorageObjectStorage *>(dest_storage.get());
-        auto * object_storage_cluster = dynamic_cast<StorageObjectStorageCluster *>(dest_storage.get());
-
-        /// in theory this should never happen, but just in case
-        if (!object_storage && !object_storage_cluster)
-        {
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Destination storage {} is not a StorageObjectStorage", dest_storage->getName());
-        }
-
-        IcebergMetadata * iceberg_metadata = nullptr;
-        if (object_storage)
-            iceberg_metadata = dynamic_cast<IcebergMetadata *>(object_storage->getExternalMetadata(query_context));
-        else if (object_storage_cluster)
-            iceberg_metadata = dynamic_cast<IcebergMetadata *>(object_storage_cluster->getExternalMetadata(query_context));
-        if (!iceberg_metadata)
-        {
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Destination storage {} is a data lake but not an iceberg table", dest_storage->getName());
-        }
-
-        if (!query_context->getSettingsRef()[Setting::allow_insert_into_iceberg])
-        {
-            throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
-                "Iceberg writes are experimental. "
-                "To allow its usage, enable the setting `allow_insert_into_iceberg` on the initiator (query, session or profile) - replicas inherit it from the scheduled task.");
-        }
-
-        const auto metadata_object = iceberg_metadata->getMetadataJSON(query_context);
-
-        ExportPartitionUtils::verifyIcebergPartitionCompatibility(
-            metadata_object,
-            src_snapshot->getPartitionKeyAST());
-
-        std::ostringstream oss;     // STYLE_CHECK_ALLOW_STD_STRING_STREAM
-        oss.exceptions(std::ios::failbit);
-        metadata_object->stringify(oss);
-        manifest.iceberg_metadata_json = oss.str();
-
+        /// Destination validation and metadata.json capture already happened up-front in
+        /// extractDestinationIcebergMetadataJson; here we only persist the results in the manifest.
+        manifest.iceberg_metadata_json = destination_iceberg_metadata_json;
         manifest.max_bytes_per_file = query_context->getSettingsRef()[Setting::iceberg_insert_max_bytes_in_data_file];
         manifest.max_rows_per_file = query_context->getSettingsRef()[Setting::iceberg_insert_max_rows_in_data_file];
-
-#else
-        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Data lake export requires Avro support");
-#endif
     }
 
     ops.emplace_back(zkutil::makeCreateRequest(

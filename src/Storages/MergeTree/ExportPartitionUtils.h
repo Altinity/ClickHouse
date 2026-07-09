@@ -27,7 +27,36 @@ namespace ExportPartitionUtils
 
     std::vector<std::string> getExportedPaths(const LoggerPtr & log, const zkutil::ZooKeeperPtr & zk, const std::string & export_path);
 
-    ContextPtr getContextCopyWithTaskSettings(const ContextPtr & context, const ExportReplicatedMergeTreePartitionManifest & manifest);
+    /// Build a query context carrying the export task's persisted settings. Templated on the
+    /// descriptor type so it serves both the replicated manifest (backed by ZooKeeper) and the
+    /// plain `MergeTreePartitionExportTask` (backed by disk); both expose the same setting fields.
+    template <typename ManifestT>
+    ContextPtr getContextCopyWithTaskSettings(const ContextPtr & context, const ManifestT & manifest);
+
+    /// Validates that `dest_storage` is a legal export target for a source table with the given
+    /// metadata: it must support imports, be positionally castable, and (for non-data-lake targets)
+    /// share the same partition key. For Iceberg destinations it additionally verifies partition-spec
+    /// compatibility and returns the serialized destination `metadata.json`; returns an empty string
+    /// for non-data-lake destinations. Throws on any incompatibility.
+    std::string extractDestinationIcebergMetadataJson(
+        const StorageMetadataPtr & source_metadata,
+        const StorageID & source_storage_id,
+        const StoragePtr & dest_storage,
+        const ContextPtr & context);
+
+    /// ZooKeeper-free commit core shared by the replicated and plain partition-export paths:
+    /// assembles the Iceberg commit arguments (deriving the partition source block from the source
+    /// table when the destination is a data lake with a partition key) and invokes
+    /// `commitExportPartitionTransaction` on the destination storage.
+    void commitExportedPaths(
+        const String & transaction_id,
+        const String & partition_id,
+        const String & iceberg_metadata_json,
+        bool write_full_path_in_iceberg_metadata,
+        const std::vector<std::string> & exported_paths,
+        const StoragePtr & destination_storage,
+        MergeTreeData & source_storage,
+        const ContextPtr & context);
 
     /// Returns the representative source partition-key columns (the first active local part's
     /// minmax block) for the given partition_id. The destination recomputes the Iceberg partition
