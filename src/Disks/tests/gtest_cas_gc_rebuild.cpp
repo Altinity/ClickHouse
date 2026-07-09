@@ -371,6 +371,7 @@ TEST(CasGcRebuild, LeaseConflictRefuses)
 TEST(CasGcClampSuppression, LandedEdgeBehindClampNeverDeleted)
 {
     auto backend = std::make_shared<InMemoryBackend>();
+    std::vector<CasEvent> seen;   /// declared BEFORE the Store so it outlives the background syncer's emits (ASan 2026-07-09)
     auto store = openStoreForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
 
@@ -398,7 +399,6 @@ TEST(CasGcClampSuppression, LandedEdgeBehindClampNeverDeleted)
     /// Rounds with acks current: X reaches folded in-degree 0 and is condemned, but every pass is
     /// CLAMPED (the bodiless precommit persists), so nothing may graduate or delete.
     /// Observability (2026-07-03): every clamp emits a gc_fold_clamp event with the reason.
-    std::vector<CasEvent> seen;
     store->setEventSink([&](const CasEvent & e){ if (e.type == CasEventType::GcFoldClamp) seen.push_back(e); });
     const String blob_key = store->layout().blobKey(BlobId(u128ToHex(DB::UInt128(1))));
     for (int i = 0; i < 6; ++i)

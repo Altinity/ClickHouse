@@ -384,6 +384,7 @@ TEST(CasGcAckFloor, ExpiredMountFencedOutAndExcluded)
     auto backend = std::make_shared<InMemoryBackend>();
     // A live store (the GC leader's own mount, on the SYSTEM clock) plus a SECOND server's keeper on a
     // FAKE clock that we freeze — so GC's own fake clock can jump past it deterministically.
+    std::vector<CasEvent> events;   /// declared BEFORE the Store so it outlives the background syncer's emits (ASan 2026-07-09)
     auto store = openStoreForTest(backend);
     const Layout & layout = store->layout();
 
@@ -403,7 +404,6 @@ TEST(CasGcAckFloor, ExpiredMountFencedOutAndExcluded)
     Gc gc(store, kGc, [&] { return gc_now; });
 
     // Capture the emitted events so we can assert the round emits exactly one GcFenceOut row for srid2.
-    std::vector<CasEvent> events;
     store->setEventSink([&](const CasEvent & e) { events.push_back(e); });
 
     const RootNamespace ns{"00/aa@cas@"};

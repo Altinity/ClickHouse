@@ -680,8 +680,8 @@ TEST(CasBuild, CondemnedPresentEvidenceDepCopiesForwardAtGate)
     /// 3. Fresh Store (restart: view refreshed at open sees the condemnation) — republishRef's
     ///    exact body: adoptEvidence over the source manifest entry, stage a FRESH dst manifest,
     ///    precommit, promote.
+    std::vector<CasEvent> seen;   /// declared BEFORE the Store so it outlives the background syncer's emits (ASan 2026-07-09)
     auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
-    std::vector<CasEvent> seen;
     s->setEventSink([&](const CasEvent & e){ seen.push_back(e); });
     auto build = startBuildFor(s, ns, "detached_part_a");
     build->adoptEvidence(blobManifestEntryStreaming("data.bin", "payload-CF"));

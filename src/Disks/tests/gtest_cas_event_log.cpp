@@ -33,8 +33,8 @@ TEST(CasEvent, ConstructAndCopyAndName)
 TEST(CasEvent, StoreEmitsToSink)
 {
     auto b = std::make_shared<InMemoryBackend>();
+    std::vector<CasEvent> seen;   /// declared BEFORE the Store so it outlives the background syncer's emits (ASan 2026-07-09)
     auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
-    std::vector<CasEvent> seen;
     s->setEventSink([&](const CasEvent & e){ seen.push_back(e); });
     CasEvent e;
     e.type = CasEventType::BlobPut;
@@ -120,10 +120,14 @@ bool hasType(const std::vector<CasEvent> & events, CasEventType t)
 TEST(CasEvent, LifecycleReconstructionFromRows)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
-
+    /// Declared BEFORE the Store so they OUTLIVE it: the Store's background retired-view syncer can emit
+    /// (e.g. a view-advance event) right up to the Store's destructor, and a sink capturing locals that
+    /// die first is a use-after-scope (found by ASan 2026-07-09; the production sink captures the Context
+    /// shared_ptr by value and is immune).
     std::vector<CasEvent> events;
     std::mutex events_mutex;
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+
     s->setEventSink([&](const CasEvent & e)
     {
         std::lock_guard lock(events_mutex);

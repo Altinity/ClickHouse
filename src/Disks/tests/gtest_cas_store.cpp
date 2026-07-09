@@ -1750,8 +1750,8 @@ TEST(CasStoreBeat, ViewAdvanceEmitsRetiredViewAdvanceEvent)
     /// one `retired_view_advance` event carrying the installed round, the prior round, and the loaded
     /// retired entry count; a beat that observes nothing new is silent.
     auto backend = std::make_shared<InMemoryBackend>();
+    std::vector<CasEvent> seen;   /// declared BEFORE the Store so it outlives the background syncer's emits (ASan 2026-07-09)
     auto store = DB::Cas::tests::openStoreForTest(backend);
-    std::vector<CasEvent> seen;
     store->setEventSink([&](const CasEvent & e){ seen.push_back(e); });
 
     GcState st;

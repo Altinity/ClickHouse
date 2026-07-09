@@ -62,8 +62,8 @@ ManifestId publishOneBlobPart(
 TEST(CasObservability, StageManifestEmitsManifestPut)
 {
     std::shared_ptr<InMemoryBackend> b;
+    std::vector<CasEvent> seen;   /// declared BEFORE the Store so it outlives the background syncer's emits (ASan 2026-07-09)
     auto s = openStore(b);
-    std::vector<CasEvent> seen;
     s->setEventSink([&](const CasEvent & e){ seen.push_back(e); });
 
     const RootNamespace ns{"srv/tbl@cas@"};
@@ -93,6 +93,7 @@ TEST(CasObservability, StageManifestEmitsManifestPut)
 TEST(CasObservability, AbandonEmitsPrecommitRemoved)
 {
     std::shared_ptr<InMemoryBackend> b;
+    std::vector<CasEvent> seen;   /// declared BEFORE the Store so it outlives the background syncer's emits (ASan 2026-07-09)
     auto s = openStore(b);
 
     const RootNamespace ns{"srv/tbl@cas@"};
@@ -104,7 +105,6 @@ TEST(CasObservability, AbandonEmitsPrecommitRemoved)
     const ManifestId id = build->stageManifest({e});
     build->precommitAdd(ns, "all_0_0_0", id);
 
-    std::vector<CasEvent> seen;
     s->setEventSink([&](const CasEvent & x){ seen.push_back(x); });
     build->abandon();
     s->setEventSink(nullptr);
@@ -126,6 +126,7 @@ TEST(CasObservability, AbandonEmitsPrecommitRemoved)
 TEST(CasObservability, AbandonWithoutPrecommitEmitsNoPrecommitRemoved)
 {
     std::shared_ptr<InMemoryBackend> b;
+    std::vector<CasEvent> seen;   /// declared BEFORE the Store so it outlives the background syncer's emits (ASan 2026-07-09)
     auto s = openStore(b);
 
     const RootNamespace ns{"srv/tbl@cas@"};
@@ -136,7 +137,6 @@ TEST(CasObservability, AbandonWithoutPrecommitEmitsNoPrecommitRemoved)
     e.inline_bytes = "AAA";
     build->stageManifest({e});   /// staged, never precommitted
 
-    std::vector<CasEvent> seen;
     s->setEventSink([&](const CasEvent & x){ seen.push_back(x); });
     build->abandon();
     s->setEventSink(nullptr);
@@ -158,6 +158,7 @@ TEST(CasObservability, AbandonWithoutPrecommitEmitsNoPrecommitRemoved)
 TEST(CasObservability, ResurrectSupersedeEmitsOnlyRetireReplacedWithOldToken)
 {
     std::shared_ptr<InMemoryBackend> b;
+    std::vector<CasEvent> seen;   /// declared BEFORE the Store so it outlives the background syncer's emits (ASan 2026-07-09)
     auto s = openStore(b);
     const RootNamespace ns{"test/tbl"};
     const String P = "resurrect-payload-audit";
@@ -193,7 +194,6 @@ TEST(CasObservability, ResurrectSupersedeEmitsOnlyRetireReplacedWithOldToken)
     const auto condemned_before = global_counters[ProfileEvents::CasGcRetiredCondemned].load();
     const auto replaced_before  = global_counters[ProfileEvents::CasGcRetireReplaced].load();
 
-    std::vector<CasEvent> seen;
     s->setEventSink([&](const CasEvent & e){ seen.push_back(e); });
     const RoundReport rep = gc.runRegularRound();
     s->setEventSink(nullptr);
