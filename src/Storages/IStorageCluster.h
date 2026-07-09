@@ -126,6 +126,9 @@ protected:
     /// Apply object_storage_cluster_fallback_if_empty only for storages that take cluster name from the setting.
     virtual bool useObjectStorageClusterFallbackIfEmpty(ContextPtr /* context */) const { return false; }
 
+    /// True for s3()/iceberg() alternative syntax (cluster name from object_storage_cluster setting, not *Cluster argument).
+    virtual bool usePureFunctionForRemoteInitiator(ContextPtr /* context */) const { return false; }
+
 private:
     // With 'allow_null=true' returns nullptr when cluster does not exist or empty
     // With 'allow_null=false' throws exception

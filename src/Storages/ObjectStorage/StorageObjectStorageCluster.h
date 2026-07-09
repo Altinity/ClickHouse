@@ -200,6 +200,8 @@ private:
 
     bool useObjectStorageClusterFallbackIfEmpty(ContextPtr context) const override;
 
+    bool usePureFunctionForRemoteInitiator(ContextPtr /* context */) const override { return cluster_name_in_settings; }
+
     /*
     In case the table was created with `object_storage_cluster` setting,
     modify the AST query object so that it uses the table function implementation

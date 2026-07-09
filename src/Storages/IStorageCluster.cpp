@@ -373,7 +373,7 @@ IStorageCluster::ResolvedClusterRead IStorageCluster::resolveClusterRead(Context
         && !settings[Setting::object_storage_remote_initiator_cluster].value.empty();
 
     if (defer_object_storage_cluster_resolution)
-        result.fallback_to_pure = false;
+        result.fallback_to_pure = usePureFunctionForRemoteInitiator(context);
     else
         result.fallback_to_pure = cluster_name_from_settings.empty();
 
@@ -391,16 +391,18 @@ IStorageCluster::ResolvedClusterRead IStorageCluster::resolveClusterRead(Context
             result.fallback_to_pure = true;
     }
 
-    if (result.fallback_to_pure && settings[Setting::object_storage_remote_initiator])
+    if (settings[Setting::object_storage_remote_initiator])
     {
         auto remote_initiator_cluster_name = settings[Setting::object_storage_remote_initiator_cluster].value;
         if (!remote_initiator_cluster_name.empty())
         {
+            const bool allow_null = settings[Setting::object_storage_cluster_fallback_if_empty]
+                && (result.fallback_to_pure || usePureFunctionForRemoteInitiator(context));
             result.remote_initiator_cluster = getClusterImpl(
                 context,
                 remote_initiator_cluster_name,
                 /*max_hosts*/ 0,
-                /*allow_null*/ settings[Setting::object_storage_cluster_fallback_if_empty]);
+                allow_null);
         }
     }
 
@@ -431,7 +433,10 @@ void IStorageCluster::read(
     auto resolved = resolveClusterRead(context);
     ClusterPtr cluster = resolved.object_storage_cluster;
 
-    if (resolved.fallback_to_pure)
+    const bool send_pure_function_to_remote_initiator
+        = settings[Setting::object_storage_remote_initiator] && usePureFunctionForRemoteInitiator(context);
+
+    if (resolved.fallback_to_pure || send_pure_function_to_remote_initiator)
     {
         if (settings[Setting::object_storage_remote_initiator])
         {

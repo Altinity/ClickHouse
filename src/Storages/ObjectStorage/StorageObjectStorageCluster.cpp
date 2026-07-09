@@ -760,7 +760,10 @@ QueryProcessingStage::Enum StorageObjectStorageCluster::getQueryProcessingStage(
     auto resolved = resolveClusterRead(context);
     const auto & settings = context->getSettingsRef();
 
-    if (resolved.fallback_to_pure)
+    const bool send_pure_function_to_remote_initiator
+        = settings[Setting::object_storage_remote_initiator] && usePureFunctionForRemoteInitiator(context);
+
+    if (resolved.fallback_to_pure || send_pure_function_to_remote_initiator)
     {
         if (settings[Setting::object_storage_remote_initiator])
         {
