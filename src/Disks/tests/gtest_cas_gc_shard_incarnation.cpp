@@ -16,9 +16,6 @@ extern const int ABORTED;
 using namespace DB::Cas;
 using namespace DB::Cas::tests;
 using DB::Cas::tests::injectRetire;
-using DB::Cas::tests::writeBlobRaw;
-using DB::Cas::tests::idOf;
-using DB::Cas::tests::u128Of;
 
 namespace
 {
@@ -33,12 +30,6 @@ StorePtr makeStoreWithShards(std::shared_ptr<InMemoryBackend> & out_backend, uin
 ManifestRef testRef(uint64_t seq)
 {
     return ManifestRef{.writer_epoch = 1, .build_sequence = seq, .manifest_ordinal = 1};
-}
-
-/// Whether a blob's body object is present in the backend.
-bool blobPresent(InMemoryBackend & b, const Layout & layout, const String & payload)
-{
-    return b.head(layout.blobKey(BlobId(u128ToHex(u128Of(payload))))).exists;
 }
 
 }
@@ -141,12 +132,17 @@ TEST(CasGcShardIncarnation, NewbornPrecommitProtectsDedupBlobAgainstConcurrentDr
         const RootNamespace ns_b{"srv1/tblB"};
 
         /// --- Phase 1: Write b1's body directly (before any GC). retireView = round 0. ---
+        /// Mint b1 under the POOL streaming-hash id (via a throwaway build's putBlob) so the in-closure
+        /// copy-forward verifier accepts its payload — the plain CityHash test id would be refused.
         const String b1_payload = "shared-blob-b1";
-        writeBlobRaw(*backend, store->layout(), b1_payload,
-            store->poolMeta().blob_header_len, store->poolMeta().pool_id);
-        ASSERT_TRUE(blobPresent(*backend, store->layout(), b1_payload))
-            << "b1 body must be present after direct write";
-        const String b1_key = store->layout().blobKey(idOf(b1_payload));
+        const String b1_hex = streamingHexOf(b1_payload);
+        {
+            auto seed = store->startBuild({});
+            seed->putBlob(BlobId{b1_hex}, BlobSource::fromString(b1_payload));
+        }
+        const String b1_key = store->layout().blobKey(BlobId{b1_hex});
+        ASSERT_TRUE(backend->head(b1_key).exists)
+            << "b1 body must be present after the seed putBlob";
         const Token b1_token = backend->head(b1_key).token;
 
         /// --- Phase 2: Inject gc/state at round 1 with b1 CONDEMNED (body still present). ---
@@ -154,7 +150,7 @@ TEST(CasGcShardIncarnation, NewbornPrecommitProtectsDedupBlobAgainstConcurrentDr
         /// in the retired set) but not yet deleted b1's body object. The Store's retireView is
         /// still at round 0 — it has NOT been refreshed since open.
         injectRetire(*backend, store->layout(), /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
-            {RetiredEntry{.kind = ObjectKind::Blob, .hash = u128Of(b1_payload),
+            {RetiredEntry{.kind = ObjectKind::Blob, .hash = hexToU128(b1_hex),
                           .token = b1_token, .size = static_cast<uint64_t>(b1_payload.size())}});
 
         /// Sanity: currentGcRound() reads gc/state fresh and returns 1.
@@ -174,7 +170,7 @@ TEST(CasGcShardIncarnation, NewbornPrecommitProtectsDedupBlobAgainstConcurrentDr
         ManifestEntry dep_b1;
         dep_b1.path = "data.bin";
         dep_b1.placement = EntryPlacement::Blob;
-        dep_b1.blob_hash = u128Of(b1_payload);
+        dep_b1.blob_hash = hexToU128(b1_hex);
         dep_b1.blob_size = b1_payload.size();
         build_b->adoptEvidence(dep_b1);
 
@@ -185,31 +181,30 @@ TEST(CasGcShardIncarnation, NewbornPrecommitProtectsDedupBlobAgainstConcurrentDr
         build_b->precommitAdd(ns_b, "part_b1", id_b);
 
         /// --- Phase 4: promote — the safety assertion ---
-        /// With self-floor (fence_round = 1): retireView.round() = 0 < 1 → refresh → b1
-        /// condemned → ABORTED. No dangle.
-        /// Without self-floor (fence_round = 0): no refresh → stale view says b1 ok → promote
-        /// succeeds → committed ref naming a condemned (soon-deleted) blob → dangle.
-        bool promote_threw_aborted = false;
-        try
-        {
-            build_b->promote(ns_b, "part_b1", build_b->buildId(), id_b);
-        }
-        catch (const DB::Exception & e)
-        {
-            if (e.code() == DB::ErrorCodes::ABORTED)
-                promote_threw_aborted = true;
-            else
-                throw;
-        }
+        /// The NEWBORN shard's self-floor (fence_round = 1) forces retireView.round() = 0 < 1 → refresh,
+        /// which EXPOSES b1 as condemned to the in-closure gate. Because b1 is a tokenless adopted leaf and
+        /// this build's precommit is the live owner (past the owner-liveness check), the gate COPIES b1
+        /// FORWARD to a fresh live incarnation (spec 2026-07-09-cas-promote-tokenless-copyforward-race — the
+        /// revive-for-the-live-about-to-commit-owner window, identical to the tokened resurrect) and promote
+        /// SUCCEEDS. The condemned incarnation is displaced, so GC's exact-token delete of the listed token
+        /// becomes a no-op and the committed ref stands over a live blob — no dangle.
+        ///
+        /// The self-floor refresh remains load-bearing: WITHOUT it (fence_round = 0) the stale view would
+        /// miss the condemnation, the copy-forward would never fire, promote would bind the condemned
+        /// (soon-deleted) token, and dangling=1 would result — which the INV-NO-DANGLE check below catches.
+        EXPECT_NO_THROW(build_b->promote(ns_b, "part_b1", build_b->buildId(), id_b))
+            << "gc_shards=" << gc_shards << ": the self-floor refresh exposes b1 as condemned; the "
+               "in-closure gate must copy it forward to a fresh live incarnation, not abort";
+        EXPECT_TRUE(store->resolveRef(ns_b, "part_b1").has_value())
+            << "gc_shards=" << gc_shards << ": the ref must commit over the copied-forward incarnation";
+        /// b1 rides a FRESH incarnation — the condemned token was displaced, never bound.
+        EXPECT_NE(backend->head(b1_key).token, b1_token)
+            << "gc_shards=" << gc_shards << ": copy-forward must mint a fresh incarnation, not bind the "
+               "condemned token";
 
-        EXPECT_TRUE(promote_threw_aborted)
-            << "gc_shards=" << gc_shards << ": promote must throw ABORTED because the NEWBORN "
-               "shard's self-floor (fence_round=1) forced a retireView refresh that exposed b1 "
-               "as condemned — a silent promote would commit a dangling ref (INV-NO-DANGLE)";
-
-        /// INV-NO-DANGLE: whether promote threw or silently succeeded, no committed ref must name
-        /// a missing or condemned blob. A silent promote (promote_threw_aborted == false) produces
-        /// dangling=1 here, confirming the test would catch the regression.
+        /// INV-NO-DANGLE: no committed ref may name a missing or condemned blob. Preserved here by
+        /// copy-forward (a live fresh incarnation) rather than by abort. A regression that dropped the
+        /// self-floor would produce dangling=1, confirming the test still guards it.
         const FsckReport rep = runFsck(*store, /*detail=*/false);
         EXPECT_EQ(rep.dangling, 0u)
             << "gc_shards=" << gc_shards << ": INV-NO-DANGLE violated — a committed ref names a "

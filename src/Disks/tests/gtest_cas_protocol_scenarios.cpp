@@ -281,36 +281,48 @@ TEST(CasProtocol, RevalidateAbsentTokenedBlobResurrectsFromSource)
     EXPECT_TRUE(b->head(blob_key).exists);
 }
 
-TEST(CasProtocol, EvidenceHitCondemnedBlobAbortsRetryable)
+TEST(CasProtocol, EvidenceHitCondemnedPresentBlobCopiesForwardInClosure)
 {
-    /// W-EVIDENCE (tokenless adopted dep) on a blob X that is condemned at the gate. promote does not
-    /// consult the dep set — it HEADs every blob leaf of the manifest body directly. X condemned at its
-    /// current token t0 ⇒ ABORTED (no source bytes to re-upload; INV-1 forbids GET).
+    /// W-EVIDENCE (tokenless adopted dep) on a blob X that is condemned-but-PRESENT, revealed only by the
+    /// in-closure fence refresh (the writer's view is stale during the pre-refresh pre-pass). promote
+    /// copies X forward in-closure to a fresh live incarnation and SUCCEEDS (spec
+    /// 2026-07-09-cas-promote-tokenless-copyforward-race). X here has NO independent committed owner (a
+    /// lone raw blob) — the accepted revive-for-the-live-about-to-commit-owner window, identical to the
+    /// tokened WedgedHeartbeatCondemnedTokenedBlobResurrectsFromSource resurrect. Before that fix this
+    /// aborted (INV-1 fail-closed), a liveness brick on the DETACH/freeze adopt path.
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = openStore(b);
+    auto s = openStore(b);   /// view opens at round 0 (no gc/state yet)
     const RootNamespace ns{"srv1/tbl"};
 
-    /// X pre-exists with token t0; the manifest names it (a tokenless adopted leaf).
-    writeBlobRaw(*b, s->layout(), "payload-X", s->poolMeta().blob_header_len, s->poolMeta().pool_id);
-    const String blob_key = s->layout().blobKey(idOf("payload-X"));
+    /// X pre-exists with token t0 — minted with the POOL streaming-hash id so the copy-forward verifier
+    /// accepts its payload; the manifest names it as a tokenless adopted leaf.
+    const String hex = streamingHexOf("payload-X");
+    {
+        auto seed = s->startBuild({});
+        seed->putBlob(BlobId{hex}, BlobSource::fromString("payload-X"));
+    }
+    const String blob_key = s->layout().blobKey(BlobId{hex});
     const Token t0 = b->head(blob_key).token;
 
     auto build = startBuildFor(s, ns, "part_1");
-    const ManifestEntry entry = blobEntry("data.bin", "payload-X");
+    ManifestEntry entry = blobEntry("data.bin", "payload-X");
+    entry.blob_hash = hexToU128(hex);   /// streaming-convention id (matches the minted blob)
     build->adoptEvidence(entry);   /// tokenless W-EVIDENCE dep on X (no HEAD, no upload)
     const ManifestId id = build->stageManifest({entry});
     build->precommitAdd(ns, "part_1", id);
 
-    /// GC condemns X at t0 in round 1 + fence.
+    /// GC condemns X at t0 in round 1 + fence — AHEAD of the writer's stale (round 0) view, so only the
+    /// in-closure refresh reveals it (the pre-pass misses it).
     injectRetire(*b, s->layout(), /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
-        {RetiredEntry{.kind = ObjectKind::Blob, .hash = u128Of("payload-X"), .token = t0, .size = 9}});
+        {RetiredEntry{.kind = ObjectKind::Blob, .hash = hexToU128(hex), .token = t0, .size = 9}});
     fenceNamespace(*b, s->layout(), ns, s->poolMeta().root_shards, /*round*/ 1);
 
-    /// promote: revalidate X ⇒ HEAD t0 condemned ⇒ ABORTED (INV-1; no source bytes).
-    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { build->promote(ns, "part_1", build->buildId(), id); });
+    /// promote: pre-pass (stale view) skips X; in-closure refresh reveals t0 condemned ⇒ copy-forward.
+    EXPECT_NO_THROW(build->promote(ns, "part_1", build->buildId(), id));
 
-    EXPECT_EQ(b->head(blob_key).token, t0);
-    EXPECT_FALSE(s->resolveRef(ns, "part_1").has_value());
+    /// The committed ref stands over a FRESH incarnation; the condemned token t0 is never bound.
+    EXPECT_TRUE(s->resolveRef(ns, "part_1").has_value());
+    EXPECT_NE(b->head(blob_key).token, t0);
 }
 
 TEST(CasProtocol, WedgedHeartbeatCondemnedTokenedBlobResurrectsFromSource)

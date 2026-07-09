@@ -710,6 +710,119 @@ TEST(CasBuild, CondemnedPresentEvidenceDepCopiesForwardAtGate)
     EXPECT_EQ(stored->bytes.substr(h.header_len), "payload-CF") << "payload must survive byte-identical";
 }
 
+TEST(CasBuild, PromoteCopiesForwardCondemnedEvidenceRevealedAfterRefresh)
+{
+    /// In-closure copy-forward backstop (spec 2026-07-09-cas-promote-tokenless-copyforward-race): a
+    /// tokenless (adoptEvidence) blob X condemned at a round AHEAD of the writer's current view is MISSED
+    /// by the pre-refresh pre-pass and revealed only by the in-closure fence refresh — the revalidation
+    /// gate then copies X forward IN-CLOSURE (against the post-refresh view) instead of aborting, and
+    /// promote SUCCEEDS. Distinct from CondemnedPresentEvidenceDepCopiesForwardAtGate, where the store
+    /// opens with an already-refreshed view and the PRE-PASS catches the condemnation.
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = openStore(b);   /// view opens at round 0 (no gc/state yet)
+    const RootNamespace ns{"srv1/tbl"};
+
+    /// A committed source part names X (independent live committed owner). putBlob mints X under the
+    /// production streaming-hash id, so the copy-forward verifier's payload re-hash matches the content key.
+    publishOneBlobPartStreaming(s, ns, "src_part", "data.bin", "payload-CFX");
+    const String blob_key = s->layout().blobKey(BlobId{streamingHexOf("payload-CFX")});
+    const Token t0 = b->head(blob_key).token;
+
+    /// A second build ADOPTS X via adoptEvidence (tokenless dep, NO putBlob ⇒ no retained source), stages,
+    /// precommits — but does NOT promote yet.
+    auto build = startBuildFor(s, ns, "part_2");
+    const ManifestEntry entry = blobManifestEntryStreaming("data.bin", "payload-CFX");
+    build->adoptEvidence(entry);
+    const ManifestId id = build->stageManifest({entry});
+    build->precommitAdd(ns, "part_2", id);
+
+    /// GC condemns X at t0 in round 1 and fences the namespace to round 1 — AHEAD of the writer's in-memory
+    /// view (still round 0), so the pre-pass misses it and only the in-closure refresh (fence_round 1 >
+    /// view round 0) reveals it.
+    injectRetire(*b, s->layout(), /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
+        {RetiredEntry{.kind = ObjectKind::Blob, .hash = hexToU128(streamingHexOf("payload-CFX")),
+                      .token = t0, .size = 11}});
+    fenceNamespace(*b, s->layout(), ns, s->poolMeta().root_shards, /*round*/ 1);
+    ASSERT_EQ(s->retireView().round(), 0u) << "the pre-pass must run against the pre-refresh (round 0) view";
+
+    /// promote: pre-pass (round-0 view) skips X; in-closure refresh reveals t0 condemned ⇒ copy-forward.
+    EXPECT_NO_THROW(build->promote(ns, "part_2", build->buildId(), id));
+
+    /// The ref resolves and X rides a FRESH, non-condemned token (t0 never bound).
+    EXPECT_TRUE(s->resolveRef(ns, "part_2").has_value());
+    const HeadResult hr = b->head(blob_key);
+    ASSERT_TRUE(hr.exists);
+    EXPECT_NE(hr.token, t0) << "copy-forward must mint a FRESH incarnation, never bind the condemned token";
+    EXPECT_FALSE(s->retireView().isCondemnedToken(ObjectKind::Blob, hexToU128(streamingHexOf("payload-CFX")), hr.token));
+}
+
+TEST(CasBuild, PromoteAbsentTokenlessBlobAbortsRetryable)
+{
+    /// A tokenless (adoptEvidence) blob that is ABSENT at the gate (deleted, no retained source) cannot be
+    /// copied forward — copyForwardFromCondemned requires a present object to GET — so promote fails closed
+    /// (ABORTED, retryable) and no ref is published.
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = openStore(b);
+    const RootNamespace ns{"srv1/tbl"};
+
+    /// Seed X (streaming-keyed) without a committed owner, then adopt it and delete it.
+    {
+        auto seed = s->startBuild({});
+        seed->putBlob(BlobId{streamingHexOf("payload-ABS")}, BlobSource::fromString("payload-ABS"));
+    }
+    const String blob_key = s->layout().blobKey(BlobId{streamingHexOf("payload-ABS")});
+    const Token t0 = b->head(blob_key).token;
+
+    auto build = startBuildFor(s, ns, "part_1");
+    const ManifestEntry entry = blobManifestEntryStreaming("data.bin", "payload-ABS");
+    build->adoptEvidence(entry);
+    const ManifestId id = build->stageManifest({entry});
+    build->precommitAdd(ns, "part_1", id);
+
+    /// A landed GC delete: X is gone by its current token — absent with no source to re-upload.
+    ASSERT_EQ(b->deleteExact(blob_key, t0).kind, DeleteOutcome::Kind::Deleted);
+
+    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { build->promote(ns, "part_1", build->buildId(), id); });
+    EXPECT_FALSE(s->resolveRef(ns, "part_1").has_value());
+}
+
+TEST(CasBuild, PromoteCondemnedLeafWithoutDepAbortsFailClosed)
+{
+    /// A manifest blob leaf with NO recorded dep (a staging-bug shape: neither putBlob nor adoptEvidence
+    /// recorded it) that is condemned at the gate must fail closed — isCopyForwardableTokenless is false,
+    /// so the gate never silently copies it forward. The no-dep shape is reachable through the public build
+    /// API (stageManifest names the leaf without any dep having been recorded), so no test accessor for the
+    /// private predicate is needed.
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = openStore(b);
+    const RootNamespace ns{"srv1/tbl"};
+
+    /// X exists (streaming-keyed) but THIS build records NO dep for it (no putBlob, no adoptEvidence).
+    {
+        auto seed = s->startBuild({});
+        seed->putBlob(BlobId{streamingHexOf("payload-NODEP")}, BlobSource::fromString("payload-NODEP"));
+    }
+    const String blob_key = s->layout().blobKey(BlobId{streamingHexOf("payload-NODEP")});
+    const Token t0 = b->head(blob_key).token;
+
+    auto build = startBuildFor(s, ns, "part_1");
+    const ManifestEntry entry = blobManifestEntryStreaming("data.bin", "payload-NODEP");
+    /// NB: NO adoptEvidence(entry) — deps stays empty for this hash, so isCopyForwardableTokenless is false.
+    const ManifestId id = build->stageManifest({entry});
+    build->precommitAdd(ns, "part_1", id);
+
+    /// Condemn X at t0 (present) at a round ahead + fence, so the in-closure gate sees it after refresh.
+    injectRetire(*b, s->layout(), /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
+        {RetiredEntry{.kind = ObjectKind::Blob, .hash = hexToU128(streamingHexOf("payload-NODEP")),
+                      .token = t0, .size = 13}});
+    fenceNamespace(*b, s->layout(), ns, s->poolMeta().root_shards, /*round*/ 1);
+
+    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { build->promote(ns, "part_1", build->buildId(), id); });
+    EXPECT_FALSE(s->resolveRef(ns, "part_1").has_value());
+    /// The condemned token was never displaced (no copy-forward happened).
+    EXPECT_EQ(b->head(blob_key).token, t0);
+}
+
 /// A one-shot hook: the FIRST head(target_key) returns the (stale) result and THEN displaces the
 /// incarnation via putOverwrite(target_key, <same bytes>, expected) — a racing writer's recreate /
 /// copy-forward landing in the observe->GET window. The fresh token is captured in `displaced_to`.
