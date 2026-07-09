@@ -185,3 +185,13 @@ Watchdog cron: job 60470431 (hourly at :23).
   background): verify the theorem's seal/fold/settle/delete ordering claims, the K1 race, D1 across all
   write paths (multi-part/exchange/republish/hardlink/abandon), D4/D5, the ordering chassert. Plan
   (writing-plans) after consult returns clean + user approves spec.
+
+- **TLA+ GATE A GREEN (Phase A authorized).** New focused model docs/superpowers/models/CaEdgeBeforeObserve.tla
+  (writer order + GC condemn→graduate(floor)→same-pass-decided-delete with per-pass d-recheck + displacement
+  revoking decided deletes). Matrix exactly as spec'd: `reduced` (NO tokened revalidation, NO drain, NO
+  fence-refresh) → "No error has been found"; all four sabotages violate INV_NO_DANGLE: sab_late_edge
+  (adopt before durable closure), sab_no_adopt_check (K1 blind adopt — the pre-graduated interleaving),
+  sab_no_k3_head (tokenless absent leaf), sab_no_k3_adopt_check (finding C promote-adopt shape).
+  **D5 CONFIRMED** (Task 8 GO): the reduced model has no refresh action at all and is green;
+  SabotageNewbornNoFloor targets the KEPT shard-side born-floor stamp (birth_floor_provider), not the
+  writer refresh; consult's verified-negative concurs. Phase-B meta-consult still in flight (Phase B only).
