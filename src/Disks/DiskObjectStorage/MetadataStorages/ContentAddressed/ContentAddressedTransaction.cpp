@@ -560,6 +560,15 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
             if (bytes.size() <= INLINE_CAP)
             {
                 auto & st = stagingFor(route);
+                /// An inline (no-blob) entry still requires a Build. `publishStaging` stages the
+                /// manifest body, precommits, and promotes the ref even for a part with NO blob uploads;
+                /// it asserts `st.build != nullptr` whenever `st.entries` is non-empty. Without this, a
+                /// part whose files are ALL inline (a tiny/empty merge output, every file <= INLINE_CAP)
+                /// reaches `publishStaging` with entries but no Build -> LOGICAL_ERROR "staged entries
+                /// without a Build" -> server crash under abort_on_logical_error (CRASH-CA-S3, pre-existing
+                /// since the inline-files feature). The blob path already establishes the Build via
+                /// `buildFor`; the inline path must do the same.
+                buildFor(route, st);
                 Cas::ManifestEntry entry;
                 entry.path = route.file;
                 entry.placement = Cas::EntryPlacement::Inline;

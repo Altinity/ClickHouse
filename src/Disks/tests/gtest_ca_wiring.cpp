@@ -520,6 +520,30 @@ TEST(CaWiringWrite, ContentRoundTripThroughTransaction)
     EXPECT_GT(storage->getLastModified("uui/uuid-1/all_1_1_0").epochTime(), 1700000000);
 }
 
+TEST(CaWiringWrite, InlineOnlyPartPublishesWithoutBuildCrash)
+{
+    /// Regression (CRASH-CA-S3 "staged entries without a Build"): a part whose files are ALL inline
+    /// — no `partFileMustStayBlob` file (`.bin`/`.mrk*`/`primary.idx`), e.g. an EMPTY merge output that
+    /// writes only `checksums.txt`/`count.txt` and no `data.bin` — staged manifest entries via the
+    /// inline write path, which did NOT establish a Build (only the blob path did, via `buildFor`). So
+    /// `publishStaging` reached its `st.build != nullptr` invariant with entries but no Build and threw
+    /// LOGICAL_ERROR — a SERVER CRASH under `abort_on_logical_error`. Writing only inline metadata files
+    /// to a fresh part and committing must SUCCEED and publish the part. (Bug pre-existed the inline-files
+    /// feature; fix: the inline path now calls `buildFor` like the blob path.)
+    auto storage = openWiringStorage();
+    auto tx = storage->createTransaction();
+    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/checksums.txt", "sums");   // inline (no blob)
+    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/count.txt", "0");          // inline (no blob)
+    EXPECT_NO_THROW(tx->commit(DB::NoCommitOptions{}));
+
+    EXPECT_TRUE(storage->existsDirectory("uui/uuid-1/all_1_1_0"));
+    EXPECT_EQ(storage->tryGetInManifestBytes("uui/uuid-1/all_1_1_0/checksums.txt"), std::optional<String>("sums"));
+    EXPECT_EQ(storage->tryGetInManifestBytes("uui/uuid-1/all_1_1_0/count.txt"), std::optional<String>("0"));
+    auto names = storage->listDirectory("uui/uuid-1/all_1_1_0");
+    std::sort(names.begin(), names.end());
+    EXPECT_EQ(names, (std::vector<std::string>{"checksums.txt", "count.txt"}));
+}
+
 TEST(CaWiringWrite, IdenticalContentDedupsToOneBlob)
 {
     auto storage = openWiringStorage();

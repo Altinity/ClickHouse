@@ -1501,8 +1501,20 @@ infra/measurement gaps (not CA defects — all had dangling=0 + agreement):
 
 ## CRASH-CA-S3-staged-entries-without-Build: server LOGICAL_ERROR crash during a merge on CA-s3
 
-- **Logged (UTC):** 2026-07-09  **Severity: CRITICAL (server crash / core dump).**  **Status: OPEN — needs root-cause.**
-- **Observed:** during the CA-s3 stateless suite (CA-s3 as the DEFAULT MergeTree policy), a background merge
+- **Logged (UTC):** 2026-07-09  **Severity: CRITICAL (server crash / core dump).**  **Status: FIXED 2026-07-09.**
+- **FIX (root-caused):** the INLINE write path (`ContentAddressedTransaction.cpp` `writeFile` →
+  `CaInlineWriteBuffer` finalize for files <= INLINE_CAP=1MiB) staged a manifest entry via `stagingFor`
+  but never called `buildFor` (the blob path does). So a part whose files are ALL inline (no
+  `.bin`/`.mrk*`/`primary.idx` blob file — e.g. an EMPTY/tiny merge output) reached `publishStaging` with
+  `st.entries` non-empty and `st.build == nullptr` → the invariant throw at line 222 → server abort under
+  abort_on_logical_error. Fix = the inline path now calls `buildFor(route, st)` (idempotent — a no-op when
+  a blob file already created the build; only an all-inline part now gets its build from the first inline
+  file). **PRE-EXISTING, NOT a regression from this session** (git blame: inline-files feature
+  `27c5f790d19` 2026-06-24 + `2be338197d2` 2026-06-27, both ancestors of the part-folder-cache base
+  e6fa3bf16f6). Regression test `CaWiringWrite.InlineOnlyPartPublishesWithoutBuildCrash` — RED without the
+  fix (reproduces the EXACT crash: `staged entries … without a Build`), GREEN with; 575 Cas*/CaWiring*
+  pass (minus the 3 known-pre-existing CaWiring fails). DISK note below still applies (77GB cores → `sudo rm`).
+- **Observed (pre-fix):** during the CA-s3 stateless suite (CA-s3 as the DEFAULT MergeTree policy), a background merge
   crashed the server: `<Fatal> Logical error: 'ContentAddressedTransaction: staged entries for
   stateless-ca-s3/store/2c2/<uuid>@cas@/tmp_merge_all_1_1_1 without a Build'`. Under
   abort_on_logical_error this aborts the server → SIGABRT → 57GB core (/var/lib/apport/coredump/, 12:41)
