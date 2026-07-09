@@ -266,7 +266,8 @@ TEST(CasBuild, PutBlobStreamsSourceOnceNoFullMaterialization)
 }
 
 /// B190: reuseBlob is removed (it had no production callers post-B188). Its behaviors are now covered by:
-///   - absent blob / absent-at-gate: RevalidateAbsentTokenedBlobResurrectsFromSource (CasProtocol).
+///   - absent blob / absent-at-gate: PromoteAbsentTokenlessBlobAbortsRetryable (CasBuild) for the
+///     tokenless leaf; a tokened leaf is edge-protected (Phase A) and never re-observed at the gate.
 ///   - condemned dep at gate:        PromoteBodylessCondemnedDepThrowsAbortedRetryable (CasBuild).
 ///   - evidence tokenless vs tokened: DepIsTokenedDiscriminatesPutBlobVsAdopt (CasBuildReuseBlob).
 ///   - adoptEvidence lazy-observe:   AdoptedBlobVanishedIsRetryableNotFatal Part A (CasBuild).

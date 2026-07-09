@@ -1974,13 +1974,15 @@ TEST(CaWiringOps, OrphanedPendingBlobNotUploadedAfterReplace)
     EXPECT_FALSE(storage->existsFile("uui/uuid-1/all_1_1_0/new.bin"));
 }
 
-/// ==== Promote resurrect-on-condemn (spec 2026-07-09-cas-promote-resurrect-tokened-blob-design) ====
+/// ==== Promote tokened-leaf edge-protection (spec 2026-07-09-cas-writer-gc-simplification, Phase A) ====
 ///
 /// A fast GC can PREMATURELY condemn a blob a writer just putBlob'd, in the tiny putBlob->promote window
-/// (the precommit->blob edge is not yet folded, so GC reads in-degree 0). promote's blob revalidation used
-/// to fail the whole INSERT closed with ABORTED. The fix retains the writer's own re-readable BlobSource
-/// per putBlob'd hash and, AFTER the owner-liveness check confirms this build's precommit is still the live
-/// owner, re-uploads the condemned leaf from those bytes (INV-1: never GET the dying object) and re-checks.
+/// (the precommit->blob edge is not yet folded, so GC reads in-degree 0). Under EDGE-BEFORE-OBSERVE the
+/// precommit closure named the blob BEFORE putBlob observed it, so the condemnation cannot graduate to a
+/// delete (the next fold sees the edge, d >= 1, spared) — it is doomed, not the blob. promote therefore
+/// does NOT re-validate or resurrect a TOKENED leaf; it commits with the blob's token UNCHANGED. The only
+/// blob-side abort promote still performs is the owner-liveness check (a reclaimed precommit) — which runs
+/// BEFORE any blob work and touches nothing.
 ///
 /// These tests drive the REAL writer sequence (stageManifest -> precommitAdd -> putBlob -> promote) against
 /// a raw in-memory Store (no background GC → deterministic), and condemn the blob's CURRENT token by seeding
@@ -2079,7 +2081,8 @@ TEST(CaWiringResurrect, PromoteIgnoresCondemnedTokenedBlobEdgeProtected)
 }
 
 /// If this build's precommit was removed (abandon / GC reclaim) before promote, promote ABORTS at the
-/// owner-liveness check and performs NO resurrect — no orphan incarnation is uploaded on the aborting path.
+/// owner-liveness check — which runs BEFORE any blob work — so no consequential PUT is performed on the
+/// aborting path (the tokened leaf is untouched, exactly as on the success path).
 TEST(CaWiringResurrect, PromoteAbandonedPrecommitAbortsWithoutResurrect)
 {
     using namespace DB::Cas;
@@ -2125,10 +2128,12 @@ TEST(CaWiringResurrect, PromoteAbandonedPrecommitAbortsWithoutResurrect)
         EXPECT_EQ(e.code(), DB::ErrorCodes::ABORTED);
     }
 
-    /// No resurrection ran before the abort: the blob's current token is STILL the condemned one (promote
-    /// uploaded no fresh incarnation) — proving resurrection is gated behind the owner-liveness check.
+    /// No blob work ran before the abort: the blob's token is UNCHANGED (still the condemned one) — the
+    /// owner check aborts before any PUT, so nothing consequential happens on the aborting path.
     const HeadResult h2 = store->backend().head(blob_key);
     ASSERT_TRUE(h2.exists);
+    EXPECT_EQ(h2.token, h1.token)
+        << "the aborting path must perform no PUT — the tokened leaf is untouched";
     EXPECT_TRUE(store->retireView().isCondemnedToken(ObjectKind::Blob, u128Of(P), h2.token))
-        << "resurrection must not run before the owner check (no consequential PUT on an aborting path)";
+        << "the token is still the condemned one (no re-upload before the owner check)";
 }
