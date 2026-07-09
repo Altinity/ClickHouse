@@ -83,3 +83,11 @@ Watchdog cron: job 60470431 (hourly at :23).
   promote), memory a non-issue. Fold-barrier = ideal follow-up (larger writer↔GC coupling), out of scope.
 - Spec: docs/superpowers/specs/2026-07-09-cas-promote-resurrect-tokened-blob-design.md. NEXT: writing-plans
   → subagent-driven impl, TLA+ gate first.
+
+- **TLA+ gate GREEN (Task 1):** `CaIncarnationCore_reval_stage2.cfg` (EnableResurrect=TRUE, EnableReval=TRUE)
+  → "Model checking completed. No error has been found" (2.54M states, exit=0); INV_NO_DANGLE, INV_NO_LOSS,
+  INV_NO_RETURN, INV_JOURNAL_COVERAGE all hold. Mapping: C++ promote resurrect-on-condemn ≙ the model's
+  `WResurrect` (condemned incarnation → overwrite in place, fresh token, old token into deadTok) composed
+  with the `EnableReval` publish gate (children must be ~CondemnedAtView). The fix brings the promote
+  IMPLEMENTATION into line with this already-verified path (impl was stricter: aborted where model resurrects).
+  No model change. Plan: docs/superpowers/plans/2026-07-09-cas-promote-resurrect-tokened-blob.md.
