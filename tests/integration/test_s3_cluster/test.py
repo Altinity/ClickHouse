@@ -401,6 +401,76 @@ def test_object_storage_cluster_fallback_if_empty(started_cluster):
     # initial node + remote initiator + 2 subqueries on replicas
     assert queries == ["4"]
 
+    pure_count = node.query(
+        f"""
+    SELECT count(*) from s3(
+        'http://minio1:9001/root/data/{{clickhouse,database}}/*',
+        'minio', '{minio_secret_key}', 'CSV',
+        'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))')"""
+    )
+
+    query_id = uuid.uuid4().hex
+    remote_initiator_count = node.query(
+        f"""
+    SELECT count(*) from s3(
+        'http://minio1:9001/root/data/{{clickhouse,database}}/*',
+        'minio', '{minio_secret_key}', 'CSV',
+        'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))')
+    SETTINGS
+        object_storage_remote_initiator=1,
+        object_storage_cluster='non_existing_cluster',
+        object_storage_remote_initiator_cluster='cluster_with_dots_and_user',
+        object_storage_cluster_fallback_if_empty=1
+    """,
+        query_id=query_id,
+    )
+
+    assert TSV(pure_count) == TSV(remote_initiator_count)
+
+    node.query("SYSTEM FLUSH LOGS ON CLUSTER 'cluster_all'")
+    queries = node.query(
+        f"""
+        SELECT count()
+            FROM clusterAllReplicas('cluster_all', system.query_log)
+            WHERE type='QueryFinish' AND initial_query_id='{query_id}'
+            FORMAT TSV
+        """
+    ).splitlines()
+
+    # initial node + remote initiator.
+    # object_storage_cluster is not exist on remote initiator, so it will not be able to run subqueries on replicas.
+    assert queries == ["2"]
+
+    query_id = uuid.uuid4().hex
+    result = node.query(
+        f"""
+        SELECT * from s3(
+            'http://minio1:9001/root/data/{{clickhouse,database}}/*', 'minio', '{minio_secret_key}', 'CSV',
+            'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))') ORDER BY (name, value, polygon)
+        SETTINGS
+            object_storage_remote_initiator=1,
+            object_storage_cluster='non_existing_cluster',
+            object_storage_remote_initiator_cluster='cluster_with_dots',
+            object_storage_cluster_fallback_if_empty=1
+        """,
+        query_id=query_id,
+    )
+
+    assert result is not None
+
+    node.query("SYSTEM FLUSH LOGS ON CLUSTER 'cluster_all'")
+    queries = node.query(
+        f"""
+        SELECT count()
+            FROM clusterAllReplicas('cluster_all', system.query_log)
+            WHERE type='QueryFinish' AND initial_query_id='{query_id}'
+            FORMAT TSV
+        """
+    ).splitlines()
+
+    # initial node + remote initiator.
+    assert queries == ["2"]
+
 
 def test_ambiguous_join(started_cluster):
     node = started_cluster.instances["s0_0_0"]
