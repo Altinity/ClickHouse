@@ -1693,3 +1693,12 @@ infra/measurement gaps (not CA defects — all had dangling=0 + agreement):
   the token → no promote HEADs (Tier 2) → committed dangle. Exact-token displacement makes check+floor
   race-safe in both directions. Tier 3 floor removal = replace dedup-adoption safety wholesale
   (adopt-displace / no-adoption), not a deletion.
+
+- **UPDATE 2026-07-09 (combined spec):** the WRITER-GC-SIMPLIFICATION spec was REWRITTEN as the combined
+  two-phase design after further user-driven analysis: Phase A = the consulted Tier-2 deletions (findings
+  A-G folded); Phase B = per-hash META-DESCRIPTOR (`blobs/xx/<hash>.meta` = {incarnation, condemned},
+  INV-META-BODY "meta ⇒ body", create bottom-up / delete top-down, birth-completion + claim-first debris
+  sweep) which deletes the writer-side RetireView + syncer + observed_gc_round/ack-floor gating entirely —
+  the former Tier-3 arrives via point-read freshness instead of list delivery. Budget: ≈ +2 tiny PUTs per
+  blob lifetime (+$10/M blobs AWS, ~0 RustFS); mass-DROP requires a parallel GC meta-op pool. Lazy-marker
+  alternative REJECTED (saves 1 birth PUT, costs 2-call adopt + keeps body-token linearization).
