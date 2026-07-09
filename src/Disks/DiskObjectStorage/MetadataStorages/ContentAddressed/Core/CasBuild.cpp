@@ -892,22 +892,51 @@ void Build::promote(const RootNamespace & target_ns, const String & final_ref_na
                 "(WPromote owner==bld)",
                 final_ref_name, u128ToHex(promote_build_id));
 
-        /// Fail-closed blob revalidation of EVERY blob leaf (spec §Promote Precommit step 3). A condemned
-        /// blob is recreatable only from this build's own source (INV-1); a missing or condemned blob ⇒
-        /// ABORTED.
+        /// Fail-closed blob revalidation of EVERY blob leaf (spec §Promote Precommit step 3), now with
+        /// resurrect-on-condemn: a leaf may have been PREMATURELY condemned by GC in the putBlob→promote
+        /// window (its precommit→blob edge is not yet folded, so in-degree reads 0). We are PAST the
+        /// owner-liveness check above, so this build's precommit is confirmed the live owner — the leaf is
+        /// legitimately protected and resurrection is warranted (no orphan on an aborting path). Re-upload
+        /// from THIS build's retained source bytes (INV-1: never read the dying object) and re-check.
+        /// Bounded (a re-condemnation of the fresh incarnation is not physically reachable more than a
+        /// handful of times within one promote at any real GC cadence). A leaf that is condemned/absent
+        /// with NO retained source keeps the fail-closed ABORTED (retryable-by-caller), exactly as before.
         for (const ManifestEntry & e : body.entries)
         {
             if (e.placement != EntryPlacement::Blob)
                 continue;
             const BlobId blob_id{u128ToHex(e.blob_hash)};
             const String blob_key = store->layout().blobKey(blob_id);
-            const HeadResult hr = store->backend().head(blob_key);
-            if (!hr.exists)
+            const BlobSource * src = retainedSourceFor(e.blob_hash);
+
+            constexpr int max_reval_attempts = 8;
+            bool validated = false;
+            for (int attempt = 0; attempt < max_reval_attempts; ++attempt)
+            {
+                const HeadResult hr = store->backend().head(blob_key);
+                if (!hr.exists)
+                {
+                    if (!src)
+                        throw Exception(ErrorCodes::ABORTED,
+                            "promote: blob {} absent at commit revalidation — failing closed", blob_key);
+                    uploadFromSource(ObjectKind::Blob, e.blob_hash, blob_key, *src);
+                    continue;
+                }
+                if (store->retireView().isCondemnedToken(ObjectKind::Blob, e.blob_hash, hr.token))
+                {
+                    if (!src)
+                        throw Exception(ErrorCodes::ABORTED,
+                            "promote: blob {} condemned at commit revalidation — failing closed (INV-1)", blob_key);
+                    uploadFromSource(ObjectKind::Blob, e.blob_hash, blob_key, *src);
+                    continue;
+                }
+                validated = true;
+                break;
+            }
+            if (!validated)
                 throw Exception(ErrorCodes::ABORTED,
-                    "promote: blob {} absent at commit revalidation — failing closed", blob_key);
-            if (store->retireView().isCondemnedToken(ObjectKind::Blob, e.blob_hash, hr.token))
-                throw Exception(ErrorCodes::ABORTED,
-                    "promote: blob {} condemned at commit revalidation — failing closed (INV-1)", blob_key);
+                    "promote: blob {} still condemned after {} resurrect attempts at commit revalidation — "
+                    "failing closed (INV-1)", blob_key, max_reval_attempts);
         }
 
         /// Promotion is a PURE OWNER MOVE (spec rev. 15 §Promote Precommit): append ONE RootOwnerEvent
