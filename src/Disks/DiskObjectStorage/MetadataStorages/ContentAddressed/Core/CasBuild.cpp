@@ -812,13 +812,15 @@ void Build::promote(const RootNamespace & target_ns, const String & final_ref_na
 
     /// Copy-forward pre-pass (spec 2026-07-02-cas-copy-forward-condemned-evidence.md): a blob leaf
     /// whose dep is TOKENLESS W-EVIDENCE (adoptEvidence — always from a COMMITTED source manifest;
-    /// republishRef / fetch-receiver / part copy) has NO source bytes to re-upload from, so the
-    /// in-closure condemned gate below used to be a liveness brick for it (S13: ATTACH's
-    /// renameToDetached aborted forever, table readonly). Displace each condemned-but-present such
-    /// incarnation via verified copy-forward BEFORE entering the shard CAS loop (GET+PUT do not
-    /// belong inside a retried mutation closure). Sourced (tokened) deps and unknown leaves keep the
-    /// fail-closed abort. The in-closure gate stays as the backstop: a condemnation surfacing only
-    /// in a mid-closure view refresh still aborts (rare, retryable-by-caller, exactly as before).
+    /// republishRef / fetch-receiver / part copy) has NO source bytes to re-upload from. Displace each
+    /// condemned-but-present such incarnation via verified copy-forward BEFORE entering the shard CAS
+    /// loop (a large-blob GET+PUT head-of-line-blocks the shard's flat-combining leader and holds
+    /// view_gate against the retired-view install drain — so keep the heavy work outside the lock in
+    /// the common case). This pre-pass reads the CURRENT (pre-refresh) retire view, so it is only the
+    /// fast path: a condemnation surfacing only in the in-closure fence refresh (spec
+    /// 2026-07-09-cas-promote-tokenless-copyforward-race) is MISSED here and handled by the in-closure
+    /// backstop below (which copies it forward against the post-refresh view instead of aborting).
+    /// Sourced (tokened) deps and unknown leaves keep the fail-closed abort.
     for (const ManifestEntry & e : body.entries)
     {
         if (e.placement != EntryPlacement::Blob)
@@ -932,10 +934,21 @@ void Build::promote(const RootNamespace & target_ns, const String & final_ref_na
                 }
                 if (store->retireView().isCondemnedToken(ObjectKind::Blob, e.blob_hash, hr.token))
                 {
-                    if (!src)
+                    /// Resurrect-on-condemn against the POST-refresh view (the pre-pass ran against the
+                    /// pre-refresh view and may have missed this condemnation). Tokened ⇒ re-upload from the
+                    /// retained source (INV-1, no GET). Tokenless copy-forwardable (adoptEvidence, independent
+                    /// committed owner) ⇒ verified copy-forward of the condemned-but-present incarnation (the
+                    /// documented INV-1 exception). Safe here ONLY because we are past the owner-liveness check
+                    /// above (this build's precommit is the live owner) and the promote fold barrier guarantees
+                    /// the detached precommit's +edge folds before this promote — so the leaf is legitimately
+                    /// protected. Unknown leaf (no dep) or tokened-source-lost ⇒ fail closed.
+                    if (src)
+                        uploadFromSource(ObjectKind::Blob, e.blob_hash, blob_key, *src);
+                    else if (isCopyForwardableTokenless(e.blob_hash))
+                        copyForwardFromCondemned(e.blob_hash, blob_key, hr);
+                    else
                         throw Exception(ErrorCodes::ABORTED,
                             "promote: blob {} condemned at commit revalidation — failing closed (INV-1)", blob_key);
-                    uploadFromSource(ObjectKind::Blob, e.blob_hash, blob_key, *src);
                     continue;
                 }
                 validated = true;
