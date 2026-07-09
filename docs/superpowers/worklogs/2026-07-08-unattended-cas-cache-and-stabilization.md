@@ -217,3 +217,12 @@ Watchdog cron: job 60470431 (hourly at :23).
   K3 tests install the view explicitly (preserving visible-condemnation gate coverage). Full sweep after:
   only the 2 known CaWiring* flakes. Task 9 validation started (clickhouse rebuild → 4 stateless → lane;
   ASan units for the chassert gate after).
+
+- **PHASE-A VALIDATION (Task 9) — all gates passed except the soak (launching):**
+  4 condemn-race stateless tests: Failed 0/Passed 4. ASan gate (M3): CLEAN — 130/137 suites green under
+  ASan+abort-on-logical-error, ZERO chassert(precommitted) trips; found+fixed 2 real pre-existing bugs
+  (event-sink stack-use-after-scope, 10 test sites, c46de859cbb; production sink immune); negative-
+  LOGICAL_ERROR test class backlogged (CA-ASAN-SUITE-2026-07-09). Release sweep clean (2 known flakes).
+  **Full CA-s3 lane: Passed 10357 / Failed 55 / Skipped 104, ZERO promote-condemned aborts, all 4 targets
+  OK, failure list = the known env families only (no new CA class).** Remaining Phase-A exit criterion:
+  the soak with the fsck gate.
