@@ -1,5 +1,6 @@
 #include <Storages/System/StorageSystemKeywords.h>
 #include <Storages/System/StorageSystemReplicatedPartitionExports.h>
+#include <Storages/System/StorageSystemPartitionExports.h>
 #include "config.h"
 
 #include <Common/ZooKeeper/ZooKeeperCommon.h>
@@ -270,6 +271,7 @@ void attachSystemTablesServer(ContextPtr context, IDatabase & system_database, b
     if (context->getServerSettings()[ServerSetting::allow_experimental_export_merge_tree_partition])
     {
         attach<StorageSystemReplicatedPartitionExports>(context, system_database, "replicated_partition_exports", "Contains a list of partition exports of ReplicatedMergeTree tables and their progress. Each export operation is represented by a single row.");
+        attach<StorageSystemPartitionExports>(context, system_database, "partition_exports", "Contains a list of partition exports of plain (non-replicated) MergeTree tables and their progress. Each export operation is represented by a single row.");
     }
     attach<StorageSystemMutations>(context, system_database, "mutations", "Contains a list of mutations and their progress. Each mutation command is represented by a single row.");
     attachNoDescription<StorageSystemReplicas>(context, system_database, "replicas", "Contains information and status of all table replicas on current server. Each replica is represented by a single row.");

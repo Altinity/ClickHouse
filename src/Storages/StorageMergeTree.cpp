@@ -8,12 +8,14 @@
 #include <Core/BackgroundSchedulePool.h>
 #include <Core/Names.h>
 #include <Core/QueryProcessingStage.h>
+#include <Core/ServerSettings.h>
 #include <Core/Settings.h>
 #include <Core/UUID.h>
 #include <Databases/DatabasesCommon.h>
 #include <Databases/IDatabase.h>
 #include <Disks/supportWritingWithAppend.h>
 #include <Disks/DiskObjectStorage/DiskObjectStorage.h>
+#include <Functions/generateSnowflakeID.h>
 #include <IO/SharedThreadPools.h>
 #include <IO/copyData.h>
 #include <Interpreters/ClusterProxy/SelectStreamFactory.h>
@@ -28,6 +30,7 @@
 #include <Parsers/ASTAlterQuery.h>
 #include <Parsers/ASTCheckQuery.h>
 #include <Parsers/ASTFunction.h>
+#include <Parsers/ASTLiteral.h>
 #include <Parsers/ASTPartition.h>
 #include <Planner/Utils.h>
 #include <Processors/QueryPlan/Optimizations/QueryPlanOptimizationSettings.h>
@@ -50,6 +53,9 @@
 #include <Storages/MergeTree/MergeTreeSink.h>
 #include <Storages/MergeTree/MergeTreeSinkPatch.h>
 #include <Storages/MergeTree/PatchParts/PatchPartsUtils.h>
+#include <Storages/MergeTree/ExportPartitionUtils.h>
+#include <Storages/MergeTree/MergeTreePartitionExportScheduler.h>
+#include <Storages/MergeTree/MergeTreePartitionExportTask.h>
 #include <Storages/MergeTree/checkDataPart.h>
 #include <Storages/PartitionCommands.h>
 #include <Storages/buildQueryTreeForShard.h>
@@ -108,6 +114,32 @@ namespace Setting
     extern const SettingsBool throw_on_unsupported_query_inside_transaction;
     extern const SettingsUInt64 max_parts_to_move;
     extern const SettingsUpdateParallelMode update_parallel_mode;
+    extern const SettingsBool export_merge_tree_partition_force_export;
+    extern const SettingsBool output_format_parallel_formatting;
+    extern const SettingsBool output_format_parquet_parallel_encoding;
+    extern const SettingsParquetCompression output_format_parquet_compression_method;
+    extern const SettingsUInt64 output_format_compression_level;
+    extern const SettingsUInt64 output_format_parquet_row_group_size;
+    extern const SettingsUInt64 output_format_parquet_row_group_size_bytes;
+    extern const SettingsMaxThreads max_threads;
+    extern const SettingsMergeTreePartExportFileAlreadyExistsPolicy export_merge_tree_part_file_already_exists_policy;
+    extern const SettingsUInt64 export_merge_tree_part_max_bytes_per_file;
+    extern const SettingsUInt64 export_merge_tree_part_max_rows_per_file;
+    extern const SettingsBool export_merge_tree_part_throw_on_pending_mutations;
+    extern const SettingsBool export_merge_tree_part_throw_on_pending_patch_parts;
+    extern const SettingsBool export_merge_tree_part_allow_lossy_cast;
+    extern const SettingsExportPartitionAllOnError export_merge_tree_partition_all_on_error;
+    extern const SettingsString export_merge_tree_part_filename_pattern;
+    extern const SettingsBool write_full_path_in_iceberg_metadata;
+    extern const SettingsUInt64 iceberg_insert_max_bytes_in_data_file;
+    extern const SettingsUInt64 iceberg_insert_max_rows_in_data_file;
+    extern const SettingsTimezone iceberg_partition_timezone;
+    extern const SettingsMergeTreePartExportSchemaMismatchMode export_merge_tree_part_schema_mismatch_mode;
+}
+
+namespace ServerSetting
+{
+    extern const ServerSettingsBool allow_experimental_export_merge_tree_partition;
 }
 
 namespace MergeTreeSetting
@@ -150,6 +182,9 @@ namespace ErrorCodes
     extern const int PART_IS_TEMPORARILY_LOCKED;
     extern const int FAULT_INJECTED;
     extern const int INCOMPATIBLE_COLUMNS;
+    extern const int EXPORT_PARTITION_ALREADY_EXPORTED;
+    extern const int PARTITION_EXPORT_FAILED;
+    extern const int PENDING_MUTATIONS_NOT_ALLOWED;
 }
 
 namespace ActionLocks
@@ -232,6 +267,19 @@ StorageMergeTree::StorageMergeTree(
     loadMutations();
     loadDeduplicationLog();
     prewarmCaches(getActivePartsLoadingThreadPool().get(), getCachesToPrewarm(0));
+
+    if (getContext()->getServerSettings()[ServerSetting::allow_experimental_export_merge_tree_partition])
+    {
+        partition_export_scheduler = std::make_shared<MergeTreePartitionExportScheduler>(*this);
+
+        partition_export_task = getContext()->getSchedulePool().createTask(
+            getStorageID(),
+            getStorageID().getFullTableName() + " (StorageMergeTree::partition_export_task)",
+            [this] { partitionExportTask(); });
+
+        /// Activated in startup(); deactivated during shutdown.
+        partition_export_task->deactivate();
+    }
 }
 
 
@@ -251,6 +299,14 @@ void StorageMergeTree::startup()
 
     try
     {
+        /// Reload persisted partition-export tasks (and re-pin their parts) before background merges
+        /// can start removing parts, then activate the scheduler task so PENDING tasks resume.
+        if (partition_export_scheduler)
+        {
+            partition_export_scheduler->loadFromDisk();
+            partition_export_task->activateAndSchedule();
+        }
+
         cleanup_thread.start();
         background_operations_assignee.start();
         background_streaming_assignee.start();
@@ -286,6 +342,9 @@ void StorageMergeTree::flushAndPrepareForShutdown()
 
     merger_mutator.merges_blocker.cancelForever();
     parts_mover.moves_blocker.cancelForever();
+
+    if (partition_export_task)
+        partition_export_task->deactivate();
 
     background_operations_assignee.finish();
     background_moves_assignee.finish();
@@ -3653,5 +3712,243 @@ CommittingBlocksSet StorageMergeTree::getCommittingBlocks() const
 {
     std::lock_guard lock(committing_blocks_mutex);
     return committing_blocks;
+}
+
+void StorageMergeTree::exportPartitionToTable(const PartitionCommand & command, ContextPtr query_context)
+{
+    if (!query_context->getServerSettings()[ServerSetting::allow_experimental_export_merge_tree_partition])
+        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
+            "Exporting merge tree partition is experimental. Set the server setting `allow_experimental_export_merge_tree_partition` to enable it.\n"
+            "If you are exporting to an Apache Iceberg table, you also need to enable the setting `allow_insert_into_iceberg`.");
+
+    /// The scheduler is created in the constructor whenever the server setting above is enabled, so
+    /// this should always hold here.
+    if (!partition_export_scheduler)
+        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
+            "Partition export is not initialized for table {}", getStorageID().getNameForLogs());
+
+    /// EXPORT PARTITION ALL: expand into one sub-call per active partition id.
+    /// Failure handling is controlled by `export_merge_tree_partition_all_on_error`.
+    if (const auto * partition_ast = command.partition->as<ASTPartition>(); partition_ast && partition_ast->all)
+    {
+        auto partition_id_set = getAllPartitionIds();
+        if (partition_id_set.empty())
+            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                "Table {} has no active partitions to export", getStorageID().getNameForLogs());
+
+        std::vector<String> partition_ids(partition_id_set.begin(), partition_id_set.end());
+        std::sort(partition_ids.begin(), partition_ids.end());
+
+        const auto & on_error_setting = query_context->getSettingsRef()[Setting::export_merge_tree_partition_all_on_error];
+        const ExportPartitionAllOnError on_error = on_error_setting.value;
+
+        LOG_INFO(log, "EXPORT PARTITION ALL: scheduling export for {} partitions, on_error={}",
+                 partition_ids.size(), on_error_setting.toString());
+
+        std::vector<std::pair<String, String>> failures; /// (partition_id, message)
+        size_t skipped_conflicts = 0;
+
+        for (const auto & partition_id : partition_ids)
+        {
+            PartitionCommand sub = command;
+            auto synthetic = make_intrusive<ASTPartition>();
+            synthetic->setPartitionID(make_intrusive<ASTLiteral>(partition_id));
+            sub.partition = synthetic;
+
+            try
+            {
+                exportPartitionToTable(sub, query_context);
+            }
+            catch (const Exception & e)
+            {
+                switch (on_error)
+                {
+                    case ExportPartitionAllOnError::throw_first:
+                        throw;
+                    case ExportPartitionAllOnError::skip_conflicts:
+                        if (e.code() == ErrorCodes::EXPORT_PARTITION_ALREADY_EXPORTED)
+                        {
+                            ++skipped_conflicts;
+                            LOG_INFO(log, "EXPORT PARTITION ALL: skipping partition {} (already exported): {}",
+                                     partition_id, e.message());
+                            break;
+                        }
+                        throw;
+                    case ExportPartitionAllOnError::collect:
+                        LOG_WARNING(log, "EXPORT PARTITION ALL: partition {} failed: {}", partition_id, e.message());
+                        failures.emplace_back(partition_id, e.message());
+                        break;
+                }
+            }
+        }
+
+        if (!failures.empty())
+        {
+            String aggregated = fmt::format(
+                "EXPORT PARTITION ALL: {}/{} partitions failed to schedule. Per-partition errors:",
+                failures.size(), partition_ids.size());
+            for (const auto & [pid, msg] : failures)
+                aggregated += fmt::format("\n  {}: {}", pid, msg);
+            throw Exception(ErrorCodes::PARTITION_EXPORT_FAILED, "{}", aggregated);
+        }
+
+        if (skipped_conflicts > 0)
+            LOG_INFO(log, "EXPORT PARTITION ALL: skipped {} partitions due to existing exports", skipped_conflicts);
+
+        return;
+    }
+
+    const auto dest_database = query_context->resolveDatabase(command.to_database);
+    const auto dest_table = command.to_table;
+    const auto dest_storage_id = StorageID(dest_database, dest_table);
+    auto dest_storage = DatabaseCatalog::instance().getTable({dest_database, dest_table}, query_context);
+
+    if (dest_storage->getStorageID() == this->getStorageID())
+    {
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Exporting to the same table is not allowed");
+    }
+
+    if (!dest_storage->supportsImport(query_context))
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Destination storage {} does not support MergeTree parts or uses unsupported partitioning", dest_storage->getName());
+
+    auto src_snapshot = getInMemoryMetadataPtr(query_context, false);
+    auto destination_snapshot = dest_storage->getInMemoryMetadataPtr(query_context, false);
+
+    /// Positional CAST matching, like `INSERT INTO dest SELECT * FROM src`.
+    ExportPartitionUtils::verifyExportSchemaCastable(
+        src_snapshot, destination_snapshot, dest_storage->getStorageID(), query_context);
+
+    const String partition_id = getPartitionIDFromQuery(command.partition, query_context);
+    const auto composite_key = MergeTreePartitionExportScheduler::compositeKey(partition_id, dest_database, dest_table);
+
+    const bool force = query_context->getSettingsRef()[Setting::export_merge_tree_partition_force_export];
+
+    /// Fail fast on a duplicate before doing part collection and mutation checks. The authoritative
+    /// atomic check happens again inside addTask.
+    partition_export_scheduler->throwIfAlreadyExported(composite_key, force);
+
+    DataPartsVector parts;
+    {
+        auto data_parts_lock = lockParts();
+        parts = getDataPartsVectorInPartitionForInternalUsage(MergeTreeDataPartState::Active, partition_id, data_parts_lock);
+    }
+
+    if (parts.empty())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Partition {} doesn't exist", partition_id);
+
+    const bool throw_on_pending_mutations = query_context->getSettingsRef()[Setting::export_merge_tree_part_throw_on_pending_mutations];
+    const bool throw_on_pending_patch_parts = query_context->getSettingsRef()[Setting::export_merge_tree_part_throw_on_pending_patch_parts];
+
+    MergeTreeData::IMutationsSnapshot::Params mutations_snapshot_params
+    {
+        .metadata_version = src_snapshot->getMetadataVersion(),
+        .min_part_metadata_version = MergeTreeData::getPartsSnapshotInfo(parts).min_metadata_version,
+        .need_data_mutations = throw_on_pending_mutations,
+        .need_alter_mutations = throw_on_pending_mutations || throw_on_pending_patch_parts,
+        .need_patch_parts = throw_on_pending_patch_parts,
+    };
+
+    const auto mutations_snapshot = getMutationsSnapshot(mutations_snapshot_params);
+
+    for (const auto & part : parts)
+    {
+        const auto alter_conversions = getAlterConversionsForPart(part, mutations_snapshot, query_context);
+
+        /// re-check `throw_on_pending_mutations` because `pending_mutations` might have been filled due to `throw_on_pending_patch_parts`
+        if (alter_conversions->hasMutations() && throw_on_pending_mutations)
+            throw Exception(ErrorCodes::PENDING_MUTATIONS_NOT_ALLOWED,
+                "Partition {} can not be exported because the part {} has pending mutations. Either wait for the mutations to be applied or set `export_merge_tree_part_throw_on_pending_mutations` to false",
+                partition_id, part->name);
+
+        if (alter_conversions->hasPatches())
+            throw Exception(ErrorCodes::PENDING_MUTATIONS_NOT_ALLOWED,
+                "Partition {} can not be exported because the part {} has pending patch parts. Either wait for the patch parts to be applied or set `export_merge_tree_part_throw_on_pending_patch_parts` to false",
+                partition_id, part->name);
+    }
+
+    MergeTreePartitionExportTask descriptor;
+    descriptor.transaction_id = generateSnowflakeIDString();
+    descriptor.query_id = query_context->getCurrentQueryId();
+    descriptor.partition_id = partition_id;
+    descriptor.source_database = getStorageID().database_name;
+    descriptor.source_table = getStorageID().table_name;
+    descriptor.destination_database = dest_database;
+    descriptor.destination_table = dest_table;
+    descriptor.create_time = time(nullptr);
+    descriptor.status = MergeTreePartitionExportTask::Status::PENDING;
+
+    for (const auto & part : parts)
+        descriptor.parts.push_back({part->name, /*done*/ false, /*paths*/ {}});
+
+    descriptor.max_threads = query_context->getSettingsRef()[Setting::max_threads];
+    descriptor.parallel_formatting = query_context->getSettingsRef()[Setting::output_format_parallel_formatting];
+    descriptor.parquet_parallel_encoding = query_context->getSettingsRef()[Setting::output_format_parquet_parallel_encoding];
+    descriptor.parquet_compression_method = query_context->getSettingsRef()[Setting::output_format_parquet_compression_method].toString();
+    descriptor.output_format_compression_level = query_context->getSettingsRef()[Setting::output_format_compression_level];
+    descriptor.parquet_row_group_size = query_context->getSettingsRef()[Setting::output_format_parquet_row_group_size];
+    descriptor.parquet_row_group_size_bytes = query_context->getSettingsRef()[Setting::output_format_parquet_row_group_size_bytes];
+    descriptor.max_bytes_per_file = query_context->getSettingsRef()[Setting::export_merge_tree_part_max_bytes_per_file];
+    descriptor.max_rows_per_file = query_context->getSettingsRef()[Setting::export_merge_tree_part_max_rows_per_file];
+    descriptor.file_already_exists_policy = query_context->getSettingsRef()[Setting::export_merge_tree_part_file_already_exists_policy].value;
+    descriptor.filename_pattern = query_context->getSettingsRef()[Setting::export_merge_tree_part_filename_pattern].value;
+    descriptor.write_full_path_in_iceberg_metadata = query_context->getSettingsRef()[Setting::write_full_path_in_iceberg_metadata];
+    descriptor.allow_lossy_cast = query_context->getSettingsRef()[Setting::export_merge_tree_part_allow_lossy_cast];
+    descriptor.iceberg_partition_timezone = query_context->getSettingsRef()[Setting::iceberg_partition_timezone].toString();
+    descriptor.schema_mismatch_mode = query_context->getSettingsRef()[Setting::export_merge_tree_part_schema_mismatch_mode].value;
+
+    /// Validate the destination against the partition being exported (Iceberg partition-spec
+    /// compatibility, or a matching partition key for plain destinations) and, for Iceberg
+    /// destinations, capture the destination metadata.json to persist in the descriptor.
+    /// Shared with the `Replicated*MergeTree` export path.
+    descriptor.iceberg_metadata_json = ExportPartitionUtils::extractDestinationIcebergMetadataJson(
+        src_snapshot,
+        destination_snapshot,
+        dest_storage,
+        parts,
+        partition_id,
+        query_context);
+
+    if (dest_storage->isDataLake())
+    {
+        descriptor.max_bytes_per_file = query_context->getSettingsRef()[Setting::iceberg_insert_max_bytes_in_data_file];
+        descriptor.max_rows_per_file = query_context->getSettingsRef()[Setting::iceberg_insert_max_rows_in_data_file];
+    }
+
+    std::vector<MergeTreeData::DataPartPtr> part_references(parts.begin(), parts.end());
+    partition_export_scheduler->addTask(std::move(descriptor), std::move(part_references), force);
+}
+
+CancellationCode StorageMergeTree::killExportPartition(const String & transaction_id)
+{
+    if (!partition_export_scheduler)
+        return CancellationCode::NotFound;
+    return partition_export_scheduler->kill(transaction_id);
+}
+
+std::vector<PartitionExportInfo> StorageMergeTree::getPartitionExportsInfo() const
+{
+    if (!partition_export_scheduler)
+        return {};
+    return partition_export_scheduler->getInfo();
+}
+
+void StorageMergeTree::partitionExportTask()
+{
+    try
+    {
+        partition_export_scheduler->run();
+    }
+    catch (...)
+    {
+        tryLogCurrentException(log, __PRETTY_FUNCTION__);
+    }
+
+    partition_export_task->scheduleAfter(5000);
+}
+
+void StorageMergeTree::triggerPartitionExportTask()
+{
+    if (partition_export_task)
+        partition_export_task->schedule();
 }
 }

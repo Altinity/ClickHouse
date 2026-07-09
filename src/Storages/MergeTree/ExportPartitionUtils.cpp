@@ -7,6 +7,10 @@
 #include "Storages/ExportReplicatedMergeTreePartitionManifest.h"
 #include "Storages/ExportReplicatedMergeTreePartitionTaskEntry.h"
 #include <Storages/MergeTree/MergeTreeData.h>
+#include <Storages/MergeTree/MergeTreePartitionExportTask.h>
+#include <Storages/ObjectStorage/StorageObjectStorage.h>
+#include <Storages/ObjectStorage/StorageObjectStorageCluster.h>
+#include <Parsers/IAST.h>
 #include <algorithm>
 #include <filesystem>
 #include <thread>
@@ -37,7 +41,9 @@
 
 #if USE_AVRO
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergMetadata.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/ManifestFilesPruning.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
 #endif
 
 namespace ProfileEvents
@@ -94,6 +100,7 @@ namespace Setting
 {
     extern const SettingsBool export_merge_tree_part_allow_lossy_cast;
 #if USE_AVRO
+    extern const SettingsBool allow_insert_into_iceberg;
     extern const SettingsTimezone iceberg_partition_timezone;
 #endif
     extern const SettingsMergeTreePartExportSchemaMismatchMode export_merge_tree_part_schema_mismatch_mode;
@@ -200,7 +207,8 @@ namespace ExportPartitionUtils
         return block;
     }
 
-    ContextPtr getContextCopyWithTaskSettings(const ContextPtr & context, const ExportReplicatedMergeTreePartitionManifest & manifest)
+    template <typename ManifestT>
+    ContextPtr getContextCopyWithTaskSettings(const ContextPtr & context, const ManifestT & manifest)
     {
         auto context_copy = Context::createCopy(context);
         context_copy->makeQueryContextForExportPart();
@@ -256,6 +264,93 @@ namespace ExportPartitionUtils
         }
 
         return context_copy;
+    }
+
+    template ContextPtr getContextCopyWithTaskSettings<ExportReplicatedMergeTreePartitionManifest>(
+        const ContextPtr &, const ExportReplicatedMergeTreePartitionManifest &);
+    template ContextPtr getContextCopyWithTaskSettings<MergeTreePartitionExportTask>(
+        const ContextPtr &, const MergeTreePartitionExportTask &);
+
+    std::string extractDestinationIcebergMetadataJson(
+        const StorageMetadataPtr & source_metadata,
+        const StorageMetadataPtr & destination_metadata,
+        const StoragePtr & dest_storage,
+        const MergeTreeData::DataPartsVector & parts,
+        const String & partition_id,
+        const ContextPtr & context)
+    {
+        if (!dest_storage->isDataLake())
+        {
+            verifyPlainPartitionCompatibility(source_metadata, destination_metadata, parts, partition_id, context);
+            return {};
+        }
+
+#if USE_AVRO
+        auto * object_storage = dynamic_cast<StorageObjectStorage *>(dest_storage.get());
+        auto * object_storage_cluster = dynamic_cast<StorageObjectStorageCluster *>(dest_storage.get());
+
+        /// in theory this should never happen, but just in case
+        if (!object_storage && !object_storage_cluster)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Destination storage {} is not a StorageObjectStorage", dest_storage->getName());
+
+        IcebergMetadata * iceberg_metadata = nullptr;
+        if (object_storage)
+            iceberg_metadata = dynamic_cast<IcebergMetadata *>(object_storage->getExternalMetadata(context));
+        else if (object_storage_cluster)
+            iceberg_metadata = dynamic_cast<IcebergMetadata *>(object_storage_cluster->getExternalMetadata(context));
+        if (!iceberg_metadata)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Destination storage {} is a data lake but not an iceberg table", dest_storage->getName());
+
+        if (!context->getSettingsRef()[Setting::allow_insert_into_iceberg])
+            throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
+                "Iceberg writes are experimental. "
+                "To allow its usage, enable the setting `allow_insert_into_iceberg` on the initiator (query, session or profile) - replicas inherit it from the scheduled task.");
+
+        const auto metadata_object = iceberg_metadata->getMetadataJSON(context);
+
+        verifyIcebergPartitionCompatibility(
+            metadata_object, source_metadata, destination_metadata, parts, partition_id, context);
+
+        std::ostringstream oss;     // STYLE_CHECK_ALLOW_STD_STRING_STREAM
+        oss.exceptions(std::ios::failbit);
+        metadata_object->stringify(oss);
+        return oss.str();
+#else
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Data lake export requires Avro support");
+#endif
+    }
+
+    IStorage::ExportPartitionCommitInfo commitExportedPaths(
+        const String & transaction_id,
+        const String & partition_id,
+        const String & iceberg_metadata_json,
+        bool write_full_path_in_iceberg_metadata,
+        const std::optional<String> & iceberg_partition_timezone,
+        const std::vector<std::string> & exported_paths,
+        const std::vector<String> & exported_part_names,
+        const StoragePtr & destination_storage,
+        MergeTreeData & source_storage,
+        const ContextPtr & context_in)
+    {
+        auto context = Context::createCopy(context_in);
+        context->setSetting("write_full_path_in_iceberg_metadata", write_full_path_in_iceberg_metadata);
+
+        if (iceberg_partition_timezone)
+            context->setSetting("iceberg_partition_timezone", *iceberg_partition_timezone);
+
+        IStorage::IcebergCommitExportPartitionArguments iceberg_args;
+
+        if (!iceberg_metadata_json.empty())
+        {
+            iceberg_args.metadata_json_string = iceberg_metadata_json;
+            const auto source_metadata = source_storage.getInMemoryMetadataPtr(context, false);
+            if (source_metadata->hasPartitionKey())
+                iceberg_args.partition_source_block =
+                    getPartitionSourceBlockForIcebergCommit(source_storage, partition_id, exported_part_names);
+        }
+
+        return destination_storage->commitExportPartitionTransaction(
+            transaction_id, partition_id, exported_paths, iceberg_args, context);
     }
 
     /// Collect all the exported paths from the processed parts
@@ -324,12 +419,6 @@ namespace ExportPartitionUtils
         MergeTreeData & source_storage,
         const String & replica_name)
     {
-        auto context = Context::createCopy(context_in);
-        context->setSetting("write_full_path_in_iceberg_metadata", manifest.write_full_path_in_iceberg_metadata);
-
-        if (manifest.iceberg_partition_timezone)
-            context->setSetting("iceberg_partition_timezone", *manifest.iceberg_partition_timezone);
-
         /// Failpoint used by integration tests to force persistent commit failure and exercise
         /// the commit-attempts budget / FAILED state transition.
         fiu_do_on(FailPoints::export_partition_commit_always_throw,
@@ -376,19 +465,17 @@ namespace ExportPartitionUtils
             throw Exception(ErrorCodes::CORRUPTED_DATA, "ExportPartition: Reached the commit phase, but exported paths size is less than the number of parts, will not commit export. This might be a bug");
         }
 
-        IStorage::IcebergCommitExportPartitionArguments iceberg_args;
-
-        if (!manifest.iceberg_metadata_json.empty())
-        {
-            iceberg_args.metadata_json_string = manifest.iceberg_metadata_json;
-            const auto source_metadata = source_storage.getInMemoryMetadataPtr(context, false);
-            if (source_metadata->hasPartitionKey())
-                iceberg_args.partition_source_block =
-                    getPartitionSourceBlockForIcebergCommit(source_storage, manifest.partition_id, manifest.parts);
-        }
-
-        const auto destination_commit_info = destination_storage->commitExportPartitionTransaction(
-            manifest.transaction_id, manifest.partition_id, exported_paths, iceberg_args, context);
+        const auto destination_commit_info = commitExportedPaths(
+            manifest.transaction_id,
+            manifest.partition_id,
+            manifest.iceberg_metadata_json,
+            manifest.write_full_path_in_iceberg_metadata,
+            manifest.iceberg_partition_timezone,
+            exported_paths,
+            manifest.parts,
+            destination_storage,
+            source_storage,
+            context_in);
 
         /// Failpoint to simulate a crash after the Iceberg commit succeeds but before
         /// ZooKeeper is updated to COMPLETED. Used by idempotency integration tests.
