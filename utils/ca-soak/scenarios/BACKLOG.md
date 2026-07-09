@@ -1605,3 +1605,33 @@ infra/measurement gaps (not CA defects — all had dangling=0 + agreement):
   the tokened bounded resurrect loop. Needs its own design + fresh-model consult + TLA+ gate (the copyForward
   reads the condemned-but-present object; verify liveness/no-dangle under bounded retry). Relates to
   [[project_ca_p31_mount_fence_recovery]] (S13 copy-forward origin), [[project_resurrect_reupload_orphan]].
+
+## PROMOTE-REVALIDATION-MINIMIZATION-2026-07-09: the ack-floor model licenses skipping per-leaf HEADs (design pass)
+
+- **Logged (UTC):** 2026-07-09, from a protocol review with the user ("writer acts only per its announced
+  view; the floor + two-phase delete + spare protect everything newer — are the writer-side re-checks
+  needed at all?"). Verified against code:
+  - announce = installed-view round (`observedGcRound`, CasStore.h:288); `view_gate` drain makes it honest
+    (no in-flight `mutateShard` gates on an older view, CasStore.h:622-626);
+  - graduation needs `condemn_round < min_ack` (min over live + expired-unfenced, CasGc.cpp:190/341/1534);
+  - two-phase delete re-judges in-degree at the delete pass (`d>0 → spared`, "recovery wins even past the
+    floor", CasBlobInDegree.h:87);
+  - `publishStaging` order (body → precommitAdd → putBlob → promote) makes the protecting inline-closure
+    edge journal-durable BEFORE any blob adoption.
+- **What stays load-bearing:** (a) the LOCAL-view publish gate (putBlob/promote condemned checks) — the
+  writer's half of the ack contract (never reference a token you ACKed as condemned); costs no backend IO;
+  (b) fenced/expired-writer defenses (requireAlive/epoch + promote gate backstop, P3.1) + the birth-floor
+  refresh (THM-NO-RETURN create-ordering); (c) the absent-HEAD as fail-closed insurance — the
+  clamp-suppression incident (CasBlobInDegree.h:91, 31 dangles live 2026-07-03) shows "fold always sees the
+  durable edge" broke once in the real world.
+- **Candidate simplification (needs its own design cycle):** skip the per-leaf promote HEADs when the
+  installed view round is UNCHANGED since the dep was observed (`DepEntry::observed_view_round` exists for
+  exactly this W-REVALIDATE bookkeeping). Soundness sketch: any token a delete pass can kill was
+  delete_pending in the PREVIOUS state == condemned-visible in the writer's current view == caught at
+  putBlob. Unchanged round ⟹ observed-live tokens cannot have been deleted. Would make promote O(0)
+  backend calls for revalidation in the common case. Edges to design: newborn/birth-floor shards,
+  out-of-band deletion, the clamp-suppression class (maybe keep HEADs under a "paranoid" setting).
+- **Also noted:** accept-condemned-when-owner-live (instead of resurrect) is NEARLY provable under the
+  model (min_ack passing the condemn round requires the writer's own ack, by which time its durable edge
+  is folded → spared, so graduation can't fire) — but it rides entirely on (c); fail-closed keeps the
+  landed resurrect/copy-forward (cost = one rare PUT).
