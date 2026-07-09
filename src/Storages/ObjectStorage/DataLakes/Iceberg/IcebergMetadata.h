@@ -215,7 +215,7 @@ private:
     /// An empty `ExportPartitionCommitInfo` means the caller must retry. The
     /// short-circuit branch fills `iceberg_metadata_file` with a sentinel note since
     /// the original committer's paths are not trivially recoverable from inside this call.
-    IStorage::ExportPartitionCommitInfo commitImportPartitionTransactionImpl(
+    std::optional<IStorage::ExportPartitionCommitInfo> commitImportPartitionTransactionImpl(
         FileNamesGenerator & filename_generator,
         Poco::JSON::Object::Ptr & metadata,
         Poco::JSON::Object::Ptr & partition_spec,

@@ -333,17 +333,14 @@ namespace ExportPartitionUtils
         Coordination::Requests ops;
         ops.emplace_back(zkutil::makeSetRequest(status_path, completed_name, -1));
 
-        if (!destination_commit_info.empty())
-        {
-            ExportReplicatedMergeTreePartitionCommitInfoEntry commit_info_entry {
-                destination_commit_info.iceberg_metadata_file,
-                destination_commit_info.iceberg_manifest_list,
-                destination_commit_info.iceberg_manifest_file,
-                destination_commit_info.commit_marker_file};
+        ExportReplicatedMergeTreePartitionCommitInfoEntry commit_info_entry {
+            destination_commit_info.iceberg_metadata_file,
+            destination_commit_info.iceberg_manifest_list,
+            destination_commit_info.iceberg_manifest_file,
+            destination_commit_info.commit_marker_file};
 
-            const std::string commit_info_path = fs::path(entry_path) / "commit_info";
-            ops.emplace_back(zkutil::makeCreateRequest(commit_info_path, commit_info_entry.toJsonString(), zkutil::CreateMode::Persistent));
-        }
+        const std::string commit_info_path = fs::path(entry_path) / "commit_info";
+        ops.emplace_back(zkutil::makeCreateRequest(commit_info_path, commit_info_entry.toJsonString(), zkutil::CreateMode::Persistent));
 
         ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
         ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperMulti);
@@ -353,8 +350,7 @@ namespace ExportPartitionUtils
 
         if (rc == Coordination::Error::ZOK)
         {
-            LOG_INFO(log, "ExportPartition: Marked export as completed{}",
-                destination_commit_info.empty() ? "" : " and persisted commit_info");
+            LOG_INFO(log, "ExportPartition: Marked export as completed and persisted commit_info");
             return;
         }
 

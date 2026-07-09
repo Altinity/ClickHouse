@@ -1580,7 +1580,7 @@ std::vector<Field> recomputeExportPartitionValues(
 
 }
 
-IStorage::ExportPartitionCommitInfo IcebergMetadata::commitImportPartitionTransactionImpl(
+std::optional<IStorage::ExportPartitionCommitInfo> IcebergMetadata::commitImportPartitionTransactionImpl(
     FileNamesGenerator & filename_generator,
     Poco::JSON::Object::Ptr & metadata,
     Poco::JSON::Object::Ptr & partition_spec,
@@ -2020,8 +2020,9 @@ IStorage::ExportPartitionCommitInfo IcebergMetadata::commitExportPartitionTransa
                 catalog,
                 table_id,
                 context);
-        if (!commit_info.empty())
-            return commit_info;
+
+        if (commit_info)
+            return *commit_info;
 
         ++attempt;
     }

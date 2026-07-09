@@ -572,7 +572,7 @@ void ExportPartitionManifestUpdatingTask::poll()
                 continue;
             }
 
-            if (local_entry->commit_info->empty() && *status == ExportReplicatedMergeTreePartitionTaskEntry::Status::COMPLETED)
+            if (!local_entry->commit_info && *status == ExportReplicatedMergeTreePartitionTaskEntry::Status::COMPLETED)
             {
                 local_entry->commit_info = readCommitInfo(zk, fs::path(entry_path), key, log);
             }
@@ -816,11 +816,7 @@ void ExportPartitionManifestUpdatingTask::handleStatusChanges()
             /// commit_info; FAILED / KILLED never produce a commit_info znode.
             if (*new_status == ExportReplicatedMergeTreePartitionTaskEntry::Status::COMPLETED)
             {
-                if (auto fetched_commit_info = readCommitInfo(
-                        zk, fs::path(storage.zookeeper_path) / "exports" / key, key, log))
-                {
-                    it->commit_info = std::move(fetched_commit_info);
-                }
+                it->commit_info = readCommitInfo(zk, fs::path(storage.zookeeper_path) / "exports" / key, key, log);
             }
 
             /// If status changed to KILLED, cancel local export operations

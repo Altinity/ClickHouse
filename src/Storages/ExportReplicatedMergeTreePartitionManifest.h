@@ -179,14 +179,6 @@ struct ExportReplicatedMergeTreePartitionCommitInfoEntry
     /// StorageObjectStorage::commitExportPartitionTransaction. Empty for Iceberg.
     String commit_marker_file;
 
-    bool empty() const
-    {
-        return iceberg_metadata_file.empty()
-            && iceberg_manifest_list.empty()
-            && iceberg_manifest_file.empty()
-            && commit_marker_file.empty();
-    }
-
     std::string toJsonString() const
     {
         Poco::JSON::Object json;

@@ -512,8 +512,7 @@ It is currently only implemented in StorageObjectStorage.
     };
 
     /// Paths produced by the destination storage during commit. Surfaced via
-    /// system.replicated_partition_exports for debugging. Empty for commits
-    /// that short-circuit on idempotency.
+    /// system.replicated_partition_exports for debugging
     struct ExportPartitionCommitInfo
     {
       /// Iceberg destinations only.
@@ -524,14 +523,6 @@ It is currently only implemented in StorageObjectStorage.
       /// Plain object storage destinations only: path of the commit marker file
       /// written/observed by StorageObjectStorage::commitExportPartitionTransaction.
       String commit_marker_file;
-
-      bool empty() const
-      {
-          return iceberg_metadata_file.empty()
-              && iceberg_manifest_list.empty()
-              && iceberg_manifest_file.empty()
-              && commit_marker_file.empty();
-      }
     };
 
     virtual ExportPartitionCommitInfo commitExportPartitionTransaction(
