@@ -256,3 +256,11 @@ Watchdog cron: job 60470431 (hourly at :23).
   (0 promote-aborts), PHASE3 OK soak (1 ABORTED-retry in 4h chaos), dangling=0. Soak cluster left up
   (GC draining the backlog). NEXT: Phase-B plan (Gate B model already green; extend with multi-writer
   races per the recorded caveat).
+
+- **P1 FINDING (watchdog, post-soak): GC-WEDGE-REMOVAL-FOLD-2026-07-10.** The exit-soak stand revealed a
+  pool-wide GC liveness wedge: 63 owner-removal events (one early-DROPped table, ~40 shards) with bodies
+  missing at removal-fold ⇒ fold clamps EVERY pass from t+540s ⇒ zero collection for the entire 4h run
+  (56.8k clamp events; pool 112GB; explains the in-run fsck timeouts). Integrity held (the clamp is
+  correct fail-closed) — but liveness is permanently wedged. NOT Phase-A (fold untouched). Backlogged as
+  P1 (above Phase B) with live-repro stand preserved + forensics file. Root-cause candidates: orphan
+  manifest sweep racing the drop / dropNamespace ordering / chaos-kill half-drop.

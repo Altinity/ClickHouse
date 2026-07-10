@@ -1718,3 +1718,30 @@ infra/measurement gaps (not CA defects — all had dangling=0 + agreement):
   exclusion list lives in the Phase-A worklog entry).
 - **Fixed alongside (real bugs):** the event-sink stack-use-after-scope in 10 test sites (sink outlived
   its captured vector; syncer emits until the Store dtor). Production sink verified immune.
+
+## GC-WEDGE-REMOVAL-FOLD-2026-07-10: a routine early DROP wedged ALL pool collection for the entire 4h soak (P1)
+
+- **Logged (UTC):** 2026-07-10, on the Phase-A exit stand (seed 991, STILL UP — live repro preserved).
+- **Symptom:** `gc_fold_clamp` reason `owner-removal: edge-bearing committed body missing at removal-fold`
+  firing for the SAME 63 manifests (ONE dropped table's namespace,
+  `ca_soak_ch1/store/b37/b3781ce3-...@cas@`, ~40 distinct shards) on EVERY fold pass from t+540s of the
+  run to now — 56.8k clamp events over 4.6h. Effect: fail-closed clamp ⇒ **zero graduations, zero
+  deletes pool-wide, forever** (ch2 leader ran 800+ Success rounds with objects_deleted=0); pool ballooned
+  to 112GB / 764k unreachable; the in-run B146/B154 fsck timeouts are a downstream effect (O(pool) scans
+  never shrink). Integrity held throughout (oracle + final dangling=0) — this is a LIVENESS wedge, not
+  corruption.
+- **Shape:** 63 owner-REMOVAL events whose committed manifest BODIES are already absent at removal-fold.
+  The fold needs the body to compute the -1 edge deltas ⇒ clamps. Bodies should not be deletable before
+  their removal folds — candidate causes to investigate: (a) the Phase-1d/S30 orphan-manifest sweep
+  racing the drop (misjudging committed-pending-removal manifests as orphans); (b) `dropNamespace`
+  wholesale ordering; (c) a chaos KILL mid-drop half-state. NOT Phase-A (fold/removal untouched by it);
+  clamps began during plain steady-stage workload.
+- **Forensics:** utils/ca-soak/scenarios/gc_wedge_forensics_20260710.txt (all 63 refs + shards +
+  resolved_through cursors); the stand holds full state (journals, gc/state, content_addressed_log).
+- **FIX DIRECTION (own cycle, spec-level):** the clamp is correct fail-closed for a TRANSIENT missing
+  body, but a PERMANENTLY missing body needs a recovery rule — e.g. a removal-fold tombstone path:
+  if the body is absent AND the manifest is provably beyond its lifecycle (no live owner binding),
+  resolve the removal with edge deltas from the GC snap's recorded closure (the B199-S2 inline closure
+  exists for precommits; committed manifests' edges are IN the snap already — the fold could subtract
+  the snap-recorded edges instead of re-reading the body). Needs TLA+ (extend the fold-barrier model).
+  **PRIORITY: above Phase B** — every pool that ever hits this shape stops collecting garbage forever.
