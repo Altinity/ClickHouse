@@ -247,3 +247,12 @@ Watchdog cron: job 60470431 (hourly at :23).
   dangling==0 gate was unavailable; pool ballooned to ~112GB under chaos-lagged GC), TTL-band count-range.
   **Authoritative no-timeout fsck launched on the quiescent pool (clickhouse disks -C fsck-only.xml
   --disk ca_ro) — the formal Phase-A dangling==0 gate; result pending.**
+
+- **AUTHORITATIVE FSCK: dangling=0 — PHASE A COMPLETE.** Quiescent-pool scan (no timeout):
+  reachable=15 dangling=0 unreachable=764118 (pending_gc=389543 awaiting_gc=160190 unaccounted=48451)
+  physical=93.7GB. The unreachable mass is the post-cliff GC backlog draining through the ack-floor
+  pipeline + chaos-restart debris (17 restarts) — reclaimable classes, not loss. ALL Phase-A gates
+  passed: TLA+ Gate A, unit+review per task, 4 stateless targets, ASan/chassert gate, full CA-s3 lane
+  (0 promote-aborts), PHASE3 OK soak (1 ABORTED-retry in 4h chaos), dangling=0. Soak cluster left up
+  (GC draining the backlog). NEXT: Phase-B plan (Gate B model already green; extend with multi-writer
+  races per the recorded caveat).
