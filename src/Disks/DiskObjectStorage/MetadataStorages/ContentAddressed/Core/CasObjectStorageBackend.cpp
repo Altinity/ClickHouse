@@ -535,11 +535,16 @@ HeadResult ObjectStorageBackend::head(const String & key)
         return HeadResult{};
 
     auto metadata = object_storage->tryGetObjectMetadata(emuPath(key), /*with_tags=*/false);
+    /// B38: a path that exists on the Local filesystem but yields NO object metadata is a DIRECTORY, not
+    /// an object (`tryGetObjectMetadata` returns nullopt for a directory). HEAD must report it as
+    /// not-an-object (exists=false) — otherwise existsFile/getStorageObjects treat a pool sub-dir (e.g.
+    /// `store`, traversed by system.remote_data_paths) as a file and a later body read throws EISDIR.
+    if (!metadata)
+        return HeadResult{};
     HeadResult hr;
     hr.exists = true;
-    hr.size = metadata ? metadata->size_bytes : 0;
-    if (metadata)
-        hr.attributes = ObjectMeta(metadata->attributes.begin(), metadata->attributes.end());
+    hr.size = metadata->size_bytes;
+    hr.attributes = ObjectMeta(metadata->attributes.begin(), metadata->attributes.end());
     hr.token = emuObserveToken(key);
     return hr;
 }

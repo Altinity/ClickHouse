@@ -365,6 +365,11 @@ public:
     /// their path and removed only by `removeMountpointObject`.
     void putMountpointObject(const String & key, const String & bytes);
     std::optional<String> getMountpointObject(const String & key);
+    /// Existence check for a loose mountpoint object WITHOUT reading its body. Directory-safe: a HEAD
+    /// routes through the backend's metadata path (B38: a directory reports as not-an-object), so probing
+    /// a directory-shaped pool path (e.g. `store`, system.remote_data_paths traversal) returns false
+    /// instead of a body read that would throw "Is a directory" (EISDIR).
+    bool mountpointObjectExists(const String & key);
     void removeMountpointObject(const String & key);
 
     /// Internal surface for Build (same TU family; not for the wiring):

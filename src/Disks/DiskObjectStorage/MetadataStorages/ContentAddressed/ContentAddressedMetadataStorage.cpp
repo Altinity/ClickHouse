@@ -555,7 +555,10 @@ bool ContentAddressedMetadataStorage::existsFile(const std::string & path) const
         if (auto tf = ContentAddressed::parseTableFilePath(path))
             return store()->getNamespaceFile(liveNamespace(tf->table_uuid), tf->tail).has_value();
         /// A loose mountpoint object (design §5.2): a plain object at roots/<server_root_id>/<path>.
-        return store()->getMountpointObject(serverPrefix() + "/" + path).has_value();
+        /// Use a HEAD-based existence check (directory-safe), NOT a body read: the traversal in
+        /// system.remote_data_paths probes existsFile on directory-shaped pool paths (e.g. `store`), and a
+        /// body read (getMountpointObject) throws "Is a directory". A directory is not-a-file (B38).
+        return store()->mountpointObjectExists(serverPrefix() + "/" + path);
     }
 
     auto p = ContentAddressed::parsePartFilePath(path);
@@ -869,8 +872,10 @@ StoredObjects ContentAddressedMetadataStorage::getStorageObjects(const std::stri
                 "ContentAddressed: table-level verbatim file is in-manifest, not a storage object: {}", path);
         /// A loose mountpoint object: a real plain object at roots/<server_root_id>/<path>. The
         /// StoredObject key must be the PHYSICAL path (physicalKey-adjusted for Local backends).
+        /// Probe with a HEAD (directory-safe, B38), NOT a body read: `system.remote_data_paths`
+        /// may reach here on a directory-shaped pool path and a GET would throw "Is a directory".
         const std::string pool_key = store()->layout().mountpointObjectKey(serverPrefix() + "/" + path);
-        if (store()->getMountpointObject(serverPrefix() + "/" + path))
+        if (store()->mountpointObjectExists(serverPrefix() + "/" + path))
             return {StoredObject(physicalKey(pool_key), path, getFileSize(path))};
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no object for {}", path);
     }

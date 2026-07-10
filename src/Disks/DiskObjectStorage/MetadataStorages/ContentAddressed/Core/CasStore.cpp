@@ -1391,6 +1391,14 @@ std::optional<String> Store::getMountpointObject(const String & key)
     return casGetObject(pool_layout.mountpointObjectKey(key));
 }
 
+bool Store::mountpointObjectExists(const String & key)
+{
+    /// HEAD (metadata), not a body GET: the probed path may resolve to a DIRECTORY (e.g. the `store`
+    /// pool sub-dir traversed by system.remote_data_paths). The backend's metadata path treats a
+    /// directory as not-an-object (B38), so this returns false instead of a body read throwing EISDIR.
+    return pool_backend->head(pool_layout.mountpointObjectKey(key)).exists;
+}
+
 void Store::removeMountpointObject(const String & key)
 {
     casRemoveObject(pool_layout.mountpointObjectKey(key));
