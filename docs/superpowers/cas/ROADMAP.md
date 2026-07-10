@@ -60,6 +60,7 @@ See [`03-writer-protocol.md`](03-writer-protocol.md) for full detail.
 | Replication fetch-by-relink (same-pool part relink, zero byte cost) | **DONE** | `test_cas_replicated_relink` integration test passes |
 | `manifest_hash` field on Keeper `/parts` znode (cross-replica header divergence detection) | **TODO** | `commitPart` / `getCommitPartOps` in `ReplicatedMergeTreeSink.cpp` have no CA-specific code yet |
 | Streaming `putOverwrite` path (condemned-displacement case) | **DESIRABLE** | The rare INV-1 revival/displacement path still materializes whole body; not a blocker |
+| CA INSERT peak-memory overhead vs local (~9 MiB) | **CHARACTERIZED (2026-07-10)** | Memory-profiled (`trace_type='Memory'`) on a 10 k × 10 KB FixedString INSERT: peak CA 144.5 MiB vs local 135.5 MiB; the ~95 MiB bulk is the column block (identical to local), the ~9 MiB delta is `ContentAddressedTransaction::writeFile` staging/hash buffering (`putBlob` already streams — see above — so this is a fixed write-buffer cost, not whole-file materialization). Drove test `03829` `max_memory_usage` 150M→170M. Shaving it further (stream-hash the staging buffer) is minor/optional |
 | `clickhouse local` shutdown hang (GC thread not reaped on local exit) | **TODO** | B48: background `BackgroundSchedulePool` / GC thread not joined on `LocalServer` teardown |
 | Relink-into-detached fetch (zero-byte `to_detached` fetch for same-pool parts) | **TODO** | B66b: currently byte-streams; extend `Fetcher::relinkPartToDisk` to honor `to_detached` |
 | Concurrent-fetch torn read of shared `detached` ref on local storage | **TODO** | B66a: `LocalObjectStorage` write is not atomic; safe on S3 (atomic PUT) |
@@ -176,6 +177,7 @@ See [`09-read-protocol.md`](09-read-protocol.md) for full detail.
 | B121 per-blob-GET read cost on large parts (one ranged GET per column file per part open) | **DESIRABLE** | Restored from the pre-consolidation backlog; relates to B202/one-GET-open below |
 | B202 inline placement by SIZE only (+ threshold as a disk setting) | **DESIRABLE (design pass)** | Restored: drop the file-type predicate, inline everything < ~512 KiB; weigh the wide-part-medium-column selectivity regression (hybrid: keep a `.bin` carve-out). Pure perf/request-count tradeoff, no safety dimension |
 | One-GET part open (pack small files; serve from memory) | **DESIRABLE** | Restored (was B10 #7): with B202 small parts open in ~1 GET |
+| Cacheless-read cost (every read — incl. warm/repeat — round-trips to the object store; no local byte cache) | **CHARACTERIZED (2026-07-10)** | Profiled on the CA-s3 lane: raw CA warm read ~3× local (141 ms vs 47 ms; 186 S3 GETs; warm never improves). `trace_log` hot path = `ReadBufferFromS3::nextImpl` → socket receive/poll, NOT the CA metadata layer (prefetch on, marks cached, resolve cheap, ~1.2 MB/GET). Mitigation = the opt-in file-cache disk over CA (see §area-writer "File-cache disk"): warm ≈ local, 0 S3 GETs. **Guidance:** add a cache disk for re-read-heavy workloads; it does NOT help one-shot scans (cold-populate cost makes the first read ~2× slower). |
 | `manifest_size` field in `Resolved` always 0 | **TODO** (minor, B10) | `resolveRef` never sets it; harmless but imprecise |
 | Replication fetch-by-relink (zero byte cost for same-pool parts) | **DONE (base)** | `manifest_hash` on Keeper `/parts` znode still TODO |
 
@@ -186,7 +188,8 @@ See [`09-read-protocol.md`](09-read-protocol.md) for full detail.
 | Item | Status | Notes |
 |------|--------|-------|
 | `system.content_addressed_garbage_collection_log` | **DONE** | Per-round GC audit log |
-| `system.content_addressed_log` | **DONE** | Per-event CA audit log (off by default) |
+| `system.content_addressed_log` | **DONE** | Per-event CA audit log; **on by default** since `cbe0ffb7608` (experimental feature → audit log is the primary forensic instrument; zero cost without a CA disk) |
+| System logs on a CA-S3 disk (frequent small flushes) | **DONE (2026-07-10)** | The June B86 test workaround pinning system logs to the local `default` policy is REMOVED — CA-S3 log flushes are fast now (trace_log 7087 rows in 77 ms; no 180 s timeouts). Do NOT re-add B86. See §area-read-protocol "Cacheless-read cost" for the read-side companion |
 | `clickhouse-disks fsck` | **DONE** | Independent pool reachability verification |
 | `clickhouse-disks ca-gc-dryrun` | **DONE** | GC delete preview (zero writes) |
 | Read-only disk mode (WORM deployment) | **DONE** | |
@@ -310,6 +313,7 @@ See [`08-testing-and-soak.md`](08-testing-and-soak.md) for full detail.
 | D3: full GC round test under `gc_shards > 1` (edge-set fold) | **TODO** | Cover fold → retire → reclaim over the source-edge-set (D1) with multiple GC shards; `gc_shards=1` tests hide sharded fold bugs (see [[feedback_review_blindspots_shards_chassert]]) |
 | B5: reconcile shared-pool integration tests to per-server-tree | **TODO** (separate/larger) | Integration tests still assume the old shared-pool layout; reconcile to the per-`server_root_id` tree (`cas/refs/<srid>`, `cas/manifests/<srid>`, `roots/<srid>`) after Phase 1 relocation |
 | Stateless test suite gated CA un-tagging | **PARTIAL** | Most `no-content-addressed-storage` tags removed; remaining are feature gaps (B31 capability gate, B66a concurrent-fetch, freeze/WORM edge cases) |
+| CA-s3 stateless lane drive-to-green (2026-07-10) | **DONE (point-fixes); full-lane run pending** | Fixed: `04286` (directory-safe HEAD), `05008` (ack-floor `entries_redeleted>=objects_deleted` invariant), `05009` (default-ON log + disk_name filter), `01271` (privilege ref), `03829` (150M→170M for the CA write buffer). Removed strays (untracked / wrong-branch): `03649/03650_alias_marker_distributed`, `test_optimize_using_constraints`. B86 removed (system logs on CA). Remaining reds are conclusively NOT CAS and to be IGNORED: arch x86-local-vs-arm-CI FP (`01854_s2`, `02224_s2`, `03233_dynamic`), local infra no-MySQL/no-IPv6 (`02479`, `01880`, `02784`), web-disk-not-CA (`04033_tpc_ds_q14/q24/q31`). Genuine-but-inherent: `00146` one-shot cacheless read. See [[reference_ca_s3_lane_ignore_tests]] |
 
 ---
 
