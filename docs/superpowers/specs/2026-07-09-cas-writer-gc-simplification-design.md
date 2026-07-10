@@ -87,92 +87,108 @@ meta (point read = intrinsically fresh) and thereby deletes the floor and the li
 
 ## Part II — the meta-descriptor (Phase B end-state) {#meta-descriptor}
 
-### OPEN REFINEMENT (user, 2026-07-10): raw bodies — eliminate the blob envelope entirely {#raw-body-refinement}
+### v3 (user, 2026-07-10): KEEP the in-body incarnation tag; the meta is a freshness point-read {#raw-body-refinement}
 
-The blob envelope/header's ONLY load-bearing job is the `incarnation_tag` — it varies the body's etag per
-incarnation so exact-token (`If-Match`) deletes and the resurrect/displace dance work. Everything else
-(`logical_hash` = the key, `logical_size` = object metadata / a meta field, `build_id`/`provenance`/
-`intended_ref` = diagnostics, `hash_algo`/`domain_id`/`pad_to_header_len` = framing) is non-load-bearing.
-Once the META owns the incarnation and is the sole linearization point, the body no longer needs a varying
-etag, so the header can be dropped ENTIRELY and the body becomes RAW immutable content:
+> **This supersedes the v1 "raw bodies — eliminate the envelope entirely" and v2 "terminal tombstone" cuts
+> (both recorded below as REJECTED). The user identified, from git history, that both recreated an
+> already-rejected design.**
 
-- **Body** = raw payload, write-once (`PUT If-None-Match` on the content key), etag = content hash. No envelope.
-- **Meta** = the sole conditionally-operated object, with a THREE-state lifecycle `{clean, condemned, tombstone}`
-  (`gen` = the etag = the only linearization token; no body token anywhere).
-- **Resurrect (from `condemned` ONLY)**: if the body is still present, resurrect = `CAS meta condemned→clean`
-  — NO body re-upload (same content). Its `condemned→clean` CAS races GC's `condemned→tombstone` on the shared
-  condemned etag → exactly one wins. (Supersedes the Part-II resurrect-re-uploads-body and the C2 exact-token
-  body delete.)
-- **Delete = a TERMINAL tombstone handshake** (replaces C2): (1) `CAS meta condemned→tombstone` (If-Match, wins
-  the race vs a resurrect); (2) delete the raw body; (3) delete the tombstone meta (→ `absent`). Tombstone is
-  **terminal**: nothing un-tombstones it. A writer observing `tombstone` **waits** (bounded) for the meta to
-  reach `absent`, then fresh-uploads a new incarnation — it MUST NOT `CAS tombstone→clean`.
-- **Read path** simplifies too (raw GET, no header framing; reads still never touch the meta). **fsck**
-  self-identifies a body by re-hashing it to its key (copyForward already does this).
+**What went wrong (v1/v2).** The v1 cut dropped the blob envelope ENTIRELY, including the in-body
+`incarnation_tag`, making the body raw immutable content (etag = content hash, fixed). But the `incarnation_tag`
+is the ONE load-bearing envelope field: it varies the body's etag per incarnation so `resurrect` displaces the
+body (fresh etag) and GC's exact-token `DELETE If-Match` MISSES a resurrected body. Dropping it removed that
+shield, so a resurrect could no longer displace the body — which forced the v2 "terminal tombstone + writer
+waits on GC" contortion (a writer↔GC liveness coupling). The alternative I then explored — per-incarnation body
+keys `blobs/xx/<hash>.<inc>` — is **exactly the generation-in-key design already REJECTED** (see
+`docs/superpowers/cas/01-architecture.md` §"Approaches tested and REJECTED": EBR's `blobs/<H>/<g>` and Merkle
+`child_gen`): it forces a `404→LIST` read path, propagates the incarnation UP into the manifest/parent (breaking
+the pure-content manifest and FUSE-readiness), and needs per-hash floors/pins/Keeper. The settled 2026-06-10
+design deliberately put **incarnation in the BODY, one key per hash**, so "resurrecting a blob produces a
+distinct backend token without changing any parent's hash or key."
 
-> **v2 CORRECTION (consult 2026-07-10, CRITICAL — terminal tombstone).** The first cut had a writer
-> "complete" a `tombstone` by re-uploading the body + `CAS tombstone→clean`. Under raw **immutable** bodies
-> this is UNSAFE: the body's etag never changes on re-upload (content-addressed), so GC's already-committed
-> body delete (decided when it won the tombstone) still hits the body → the just-resurrected committed ref
-> **dangles**. In the old envelope design a resurrect minted a fresh `incarnation_tag` → new body etag → GC's
-> exact-token delete *missed* the live body; raw bodies removed exactly that shield. Why S3 cannot make it
-> safe: a body delete cannot be made atomically conditional on a *different* object's (the meta's) state.
-> **Fix:** tombstone is terminal (above). `Gate B v2` (`CaMetaDescriptorRaw.tla`) models the body delete as a
-> NON-ATOMIC two-step gated on a delete-commitment flag (not the current meta state) and adds
-> `SabResurrectFromTombstone`, which re-enables the bug and MUST break `INV_NO_LOSS` — proving
-> terminal-tombstone load-bearing. `INV_NO_LOSS` (`gcDeleteCommitted ⇒ no live ref`) + `INV_NO_RETURN` added.
->
-> **v2 CORRECTION (consult finding #8 — meta carries a fresh `incarnation` nonce).** S3 ETags are
-> content-derived, so a `clean` meta re-encodes to an identical etag across incarnations (a latent ABA on the
-> `clean→condemned` precondition). The meta therefore carries a fresh `incarnation` (u128) nonce on EVERY
-> write, making each meta object globally unique (etag = incarnation, literally true on S3) and matching the
-> model's fresh-`gen`-per-write assumption. This restores the §meta-layout `incarnation` field the first
-> raw-body cut had dropped.
+**v3 corrected design — keep the settled safety core, add ONLY the Phase-B freshness win:**
 
-STATUS: a genuine further simplification (drops the entire blob envelope + the body *conditional* token), a
-PROTOCOL change to the delete path (C2 → terminal tombstone). Gate B v2 RE-RUN GREEN (reduced holds
-`INV_NO_DANGLE`, `INV_META_BODY`, `INV_NO_LOSS`, `INV_NO_RETURN`) with all five sabotages RED
-(`meta_first`, `blind_adopt`, `adopt_tomb`, `del_notomb`, `resurrect_tomb`). Applies to the new meta layout
-only — the current pre-meta code keeps its envelope.
+- **Body** = a MINIMAL in-body `incarnation_tag` (16 B) + raw payload. Drop the rest of the envelope junk
+  (`logical_hash`, `build_id`, `provenance`, `intended_ref`, `hash_algo`, `domain_id`, magic/padding) — the
+  user's "keep the tag, drop the chepukha". One key per hash; reads use a CONSTANT offset (like today's
+  `blob_header_len`), stay content-addressed, and the manifest stays pure content (FUSE-ready preserved).
+- **Delete stays exact-token on the BODY** (the validated `CaIncarnationCore` core): GC captures the body's
+  token at condemn and `DELETE If-Match token`. A `resurrect` overwrites the body with a FRESH `incarnation_tag`
+  → distinct etag → GC's exact-token delete MISSES (TokenMismatch) → survives. **No tombstone. No wait. No
+  per-incarnation keys. No cross-object atomicity.**
+- **Resurrect** = overwrite the body from the writer's OWN source with a fresh `incarnation_tag` (the original
+  behaviour; the writer holds the bytes at `putBlob`; tokenless copy-forward GETs the condemned body once, the
+  documented INV-1 exception). This costs one body re-upload on resurrect — the accepted, month-soaked cost.
+- **The META is a per-hash FRESHNESS POINT-READ, NOT the linearization.** Its ONLY job is to answer the
+  dedup-adoption question — "is this hash's current incarnation condemned?" — as an O(1) point read, replacing
+  the O(condemned-set) writer-side retire-view download (the actual Part-II motivation). It is a **2-state
+  marker `{clean, condemned}`** (+ `condemn_round` for pacing/introspection). GC sets it condemned at condemn,
+  clears it at spare, deletes it at delete. Because delete-safety lives in the BODY's exact-token delete, the
+  meta being momentarily behind is harmless for safety (it only ever makes a writer resurrect conservatively);
+  a strongly-consistent GET (S3 RAW consistency, a pool requirement) makes it fresh enough for the K1 gate.
+- **Read path unchanged in shape** (content key + constant offset; reads never touch the meta). **Manifest
+  unchanged** (pure content hashes). **fsck** gains a meta⟺body pairing check.
+
+STATUS (v3): reverts the raw-body over-reach; keeps one-key-per-hash + in-body tag + exact-token delete — the
+`CaIncarnationCore` safety core (TLA+ + Apalache-inductive + one-month soak) is UNCHANGED. The only new
+mechanism is the freshness meta replacing the retire-view; its modeling obligation is small — "the meta
+point-read is at least as fresh as the retire-view for the K1 dedup-adoption gate" — and delete-safety needs no
+new model (it is the unchanged exact-token core). Task 1's meta codec is reused; the meta needs no fresh-nonce
+linearization etag (it is not the linearizer), so Task 1B is not load-bearing here.
+
+<details><summary>REJECTED cuts (kept for the record)</summary>
+
+- **v1 — raw bodies, no envelope, meta = sole 3-state linearization `{clean,condemned,tombstone}`.** Dropped the
+  load-bearing in-body tag → body etag fixed → resurrect can't displace → needed the tombstone handshake.
+- **v2 — terminal tombstone** (`CaMetaDescriptorRaw.tla`, was GREEN): a writer observing `tombstone` waits for
+  `absent` then re-uploads; never `tombstone→clean`. Correct but couples writer liveness to GC and keeps the
+  meta as sole linearizer. Superseded by v3 (the in-body tag makes the tombstone unnecessary).
+- **Option B — per-incarnation body keys** (`CaMetaIncarnationKey.tla`, was GREEN): the already-rejected
+  generation-in-key design (404→LIST, manifest carries the incarnation, breaks FUSE-readiness).
+
+Both models remain in `docs/superpowers/models/` as explored-and-rejected evidence.
+</details>
 
 ### Layout and invariant {#meta-layout}
 
-Per blob hash, TWO objects:
+(v3.) Per blob hash, TWO objects:
 
-- **Body** (unchanged key): `blobs/xx/<hash>` — the **raw** payload (v2 raw-body: NO envelope), write-once
-  via `PUT If-None-Match`, etag = content. **Reads use it directly at offset 0 and never consult the meta**
-  (the read path drops only the header offset).
-- **Meta**: `blobs/xx/<hash>.meta` (fixed codec, `ca-inspect` support required):
-  `{version, incarnation (u128 fresh nonce, minted on EVERY meta write), state (clean|condemned|tombstone),
-  condemn_round (u64), size (u64)}`. The `incarnation` nonce makes each meta object's bytes — and thus its
-  S3 etag — globally unique (finding #8), so "etag = incarnation" is literally true.
+- **Body** (unchanged key): `blobs/xx/<hash>` — a MINIMAL in-body `incarnation_tag` (16 B) + raw payload
+  (envelope junk dropped). One key per hash; reads use a CONSTANT offset (`blob_header_len`, now 16) and never
+  consult the meta. The `incarnation_tag` varies the body's etag per incarnation — this is the LOAD-BEARING
+  field: `resurrect` overwrites the body with a fresh tag → distinct etag → GC's exact-token delete misses.
+- **Meta**: `blobs/xx/<hash>.meta` (tiny fixed codec, `ca-inspect` support required):
+  `{version, state (clean|condemned), condemn_round (u64), size (u64)}` — a **2-state FRESHNESS MARKER**, not
+  the linearizer, and not on the read path. GC sets it `condemned` at condemn, clears it at spare, deletes it
+  at delete. (No `tombstone` state, no `incarnation` nonce — the meta is advisory; the body's etag is the
+  conditional authority.)
 
-> **INV-META-BODY: a `clean` or `condemned` meta ⇒ body present.** Maintained by ordering: **create bottom-up**
-> (PUT body, then PUT meta If-None-Match), **delete top-down** (`condemned→tombstone` CAS, then delete body,
-> then delete tombstone meta). A `tombstone` meta is the mid-delete state where the body may already be gone;
-> an `absent` meta says nothing. This invariant is what makes the 1-GET adopt safe.
-
-**The meta is the SOLE linearization point for the hash's lifecycle.** All conditional lifecycle operations
-CAS the meta (keyed on its etag = incarnation); the raw body has no conditional token — it is created
-write-once and deleted only by GC under a won tombstone claim (never re-uploaded over a present body, so it
-never needs a varying etag). Tombstone is **terminal**.
+> **Delete-safety is the BODY's exact-token delete (the unchanged `CaIncarnationCore` core), NOT the meta.**
+> GC captures the body token at condemn and `DELETE If-Match token`; a resurrect displaces the body (fresh
+> tag → new etag) so the exact-token delete misses. The meta only answers "is the current incarnation
+> condemned?" for the writer's dedup-adoption gate. A momentarily-stale meta is safe: it can only make a
+> writer resurrect **conservatively** (re-upload when it could have adopted) — never adopt a doomed body,
+> because a strongly-consistent GET (S3 RAW consistency, a pool requirement) reflects GC's latest condemn.
+> Ordering: create body-then-meta, delete body-then-meta, so a `clean` meta never outlives its body in a way
+> that misleads the gate.
 
 ### Protocols {#meta-protocols}
 
-(v2 raw-body / terminal-tombstone. Every meta write mints a fresh `incarnation` nonce; the meta etag is the
-sole conditional token; the raw body has no conditional token.)
+(v3. The BODY's in-body `incarnation_tag` varies its etag; exact-token BODY delete is the safety
+linearization — the unchanged `CaIncarnationCore` core. The META is a 2-state freshness marker for the
+writer's dedup-adoption gate, replacing the retire-view download. No tombstone; GC must write the meta
+`condemned` before it can delete, so an absent meta means "not condemned".)
 
 | Operation | Protocol |
 |---|---|
-| **Fresh upload** (`putBlob`, cache-miss) | optimistic PUT raw body (If-None-Match). Success ⇒ PUT meta (If-None-Match `{fresh incarnation, clean, size}`; a 412 here = racing writer won ⇒ re-GET meta ⇒ adopt/follow). Body 412 ⇒ dedup path ↓ |
-| **Dedup-adopt** (`putBlob`, cache-hit or body-412) | **ONE GET meta.** `clean` ⇒ adopt (reference the body directly — INV-META-BODY guarantees presence, no body HEAD). `condemned` ⇒ resurrect ↓. `tombstone` ⇒ **wait** ↓. `absent` + body present ⇒ **BIRTH-COMPLETION** (crashed pre-meta birth): re-establish the body from the writer's OWN re-readable `BlobSource` (`PUT If-None-Match`; a 412 = already present, fine) THEN PUT meta If-None-Match `{fresh incarnation, clean}`; a 412 on the meta ⇒ re-GET and follow. `absent` + body absent ⇒ fresh-upload path |
-| **Resurrect** (writer, from `condemned` ONLY) | CAS meta (If-Match condemned-etag) → `{fresh incarnation, clean}`. Body is present and immutable ⇒ **NO body re-upload** (raw-body). The `condemned→clean` CAS races GC's `condemned→tombstone` on the same etag → exactly one wins; the loser re-GETs and follows (if GC won the tombstone, the writer now sees `tombstone` and waits ↓) |
-| **Wait-on-tombstone** (writer) | `tombstone` is terminal — the content is being deleted. Bounded re-GET/backoff until the meta reaches `absent` (GC finished), then take the fresh-upload path. NEVER `CAS tombstone→clean` (v2: that dangles — see the terminal-tombstone correction). Bounded exhaustion ⇒ `ABORTED` (the build restarts) |
-| **Copy-forward** (tokenless leaf, no source, committed-source provenance) | GET meta. `clean` ⇒ ok. `condemned` ⇒ CAS meta (If-Match condemned-etag) → `{fresh incarnation, clean}` (body present & immutable — no body touch). `tombstone`/`absent` ⇒ fail closed (`ABORTED`) — the content is dead; the writer restarts. (The old envelope re-wrap is gone; raw bodies are immutable.) |
-| **Condemn** (GC, at fold `d=0`) | GET meta (etag); if `clean` ⇒ CAS meta (If-Match clean-etag) → `{fresh incarnation, condemned, condemn_round}`; the resulting condemned-etag is stored in the retired ledger as the delete precondition |
-| **Spare** (GC, `d>0` recovered) | CAS meta (If-Match condemned-etag) → `{fresh incarnation, clean}` — the reprieve is explicit and cheap |
-| **Delete** (GC, graduated; two-phase pacing kept; on a parallel pool) | **Tombstone handshake:** (1) `CAS meta (If-Match condemned-etag) → {tombstone}` — the linearization: a racing resurrect's `condemned→clean` and this both target the condemned-etag, exactly one wins; a lost CAS ⇒ abort the delete (spared/resurrected). (2) On win ⇒ delete the raw body — HEAD body + `deleteExact(body, head-token)`; safe because tombstone is terminal, so no writer re-established the body after the win (a fresh HEAD here cannot observe a live resurrected body — the v2 fix). (3) `deleteExact(meta, tombstone-etag)` → `absent`. **Idempotent redelete (consult I3):** on retry after a crash mid-handshake, an already-`absent`/already-`tombstone` meta still drives the body delete + tombstone-meta delete to completion, so a meta-less body is never stranded |
-| **Reads** | GET raw body by content key at offset 0 — meta never consulted |
+| **Fresh upload** (`putBlob`, cache-miss) | PUT body `{fresh incarnation_tag + payload}` (If-None-Match). Success ⇒ PUT meta If-None-Match `{clean, size}` (a 412 = racing writer created it ⇒ fine). Body 412 ⇒ dedup path ↓ |
+| **Dedup-adopt** (`putBlob`, cache-hit or body-412) | **point-read the meta** (condemned?). `clean` or **absent** ⇒ adopt (body present, not condemned — record the token; if the meta was absent, best-effort PUT meta If-None-Match `{clean}` to help future readers). `condemned` ⇒ resurrect ↓. (Safe: GC always writes the meta `condemned` before deleting, so a non-condemned meta ⇒ the body is not mid-delete; EDGE-BEFORE-OBSERVE + exact-token delete carry the rest.) |
+| **Resurrect** (writer, condemned) | overwrite the body from the writer's OWN source with a FRESH `incarnation_tag` (INV-1 — never GET the dying body) → distinct etag; then CAS/PUT meta `{clean}`. GC's exact-token delete of the OLD token now misses (TokenMismatch). **No wait.** |
+| **Copy-forward** (tokenless leaf, no source, committed-source provenance) | condemned ⇒ GET the still-present condemned body (the documented INV-1 exception), verify payload hash, re-wrap with a fresh `incarnation_tag`, `putOverwrite`; then CAS/PUT meta `{clean}`. (Unchanged from the current `copyForwardFromCondemned`.) |
+| **Condemn** (GC, at fold `d=0`) | HEAD body → capture the exact token into the retired ledger (unchanged), AND PUT/CAS meta `{condemned, condemn_round}` (the writer's freshness signal) |
+| **Spare** (GC, `d>0` recovered) | CAS meta condemned→`{clean}` |
+| **Delete** (GC, graduated; two-phase pacing kept) | `DELETE body If-Match <condemn-time token>` (unchanged exact-token delete — a resurrect displaced the token ⇒ TokenMismatch ⇒ survives), then delete the meta. **No tombstone, no handshake, no cross-object atomicity, no writer wait.** |
+| **Reads** | GET body by content key at the constant `blob_header_len` offset — meta never consulted (unchanged) |
 
 Race audit:
 
@@ -304,7 +320,17 @@ use **per-shard seals** (finding E).
 4. **Positive:** the reduced model (no tokened revalidation, no drain, no writer fence refresh) holds
    `INV_NO_DANGLE`, `INV_NO_LOSS`, `INV_NO_RETURN`, `INV_JOURNAL_COVERAGE`, `MonotoneGC`.
 
-**Gate B — RE-RUN GREEN v2 (`CaMetaDescriptorRaw.tla`, 2026-07-10):**
+**Gate B — v3 (2026-07-10): the safety core is the UNCHANGED `CaIncarnationCore` (exact-token BODY delete +
+retire-view/W-REVALIDATE), already TLA+ + Apalache-inductive + one-month-soaked.** v3 keeps one-key-per-hash
++ in-body `incarnation_tag` + exact-token delete, so NO new delete-safety model is required. The ONLY new
+mechanism is the freshness meta replacing the retire-view as the K1 dedup-adoption signal; its obligation is
+narrow — *the meta point-read is at least as fresh, for the K1 gate, as the retire-view it replaces* (GC writes
+the meta `condemned` before any delete; a strongly-consistent GET observes it) — to be discharged by a small
+focused model or a written argument, NOT a re-derivation of the delete core. **The v2 model below
+(`CaMetaDescriptorRaw.tla`, terminal tombstone) and `CaMetaIncarnationKey.tla` (per-incarnation keys) are
+SUPERSEDED/REJECTED — retained only as explored-and-rejected evidence.**
+
+**REJECTED v2 model — RE-RUN GREEN (`CaMetaDescriptorRaw.tla`, 2026-07-10), superseded by v3:**
 
 1. The meta is a per-hash register `{incarnation (fresh nonce per write), state ∈ {clean,condemned,tombstone},
    condemn_round}` with a fresh `gen` (= etag) minted on every write; body presence is a boolean tied by

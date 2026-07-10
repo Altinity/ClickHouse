@@ -334,3 +334,31 @@ Watchdog cron: job 60470431 (hourly at :23).
   graduation off-by-one (current_round=state.round+1); #11/#12 schedule retiredLogicalSize/payloadOffset/
   blob_header_len removal, FsckReport::clean() includes meta_without_body. NEXT: rewrite model (re-run gate),
   spec raw-body section, plan Tasks 0b/1-followup/2-7, then resume impl.
+
+### 2026-07-10 — DESIGN PIVOT: raw-body was the wrong simplification (user caught it via git history)
+- User: "we already tried and rejected the variant you're recreating (~a month ago), check git." Correct.
+- Evidence: docs/superpowers/cas/01-architecture.md §"Approaches tested and REJECTED":
+  * EBR core REJECTED — "Generations on blob keys (blobs/<H>/<g>) were the ABA guard" = exactly the
+    per-incarnation-KEY / "prefix" variant (my Option B / CaMetaIncarnationKey.tla).
+  * Merkle-tree REJECTED — generation-in-key forced a "404->LIST degraded read path for generation
+    resolution" + "durable per-hash floors, epochs, per-build pins, quiescence, Keeper required."
+  * What replaced BOTH: one-key-per-hash; "incarnation lives in the object BODY (not the key), so
+    resurrecting a blob produces a distinct backend token without changing any parent's hash or key."
+    (2026-06-10 incarnation-token spec; TLA CaIncarnationCore + Apalache-inductive; month-soaked.)
+- ROOT CAUSE of my terminal-tombstone mess: the raw-body refinement dropped the in-body incarnation_tag —
+  the ONE load-bearing envelope field (user said so: "the header's only real job was the tag so the etag
+  changes; the rest is junk"). Without the varying tag, the body etag = content hash (fixed), so a
+  resurrect can't displace it, so GC's exact-token delete can't miss -> forced tombstone + wait. Both
+  Option A (terminal tombstone) and Option B (per-incarnation keys, REJECTED) were symptoms of that error.
+- CORRECTED Phase B (keep the settled core): KEEP a minimal in-body incarnation_tag (16B; drop the rest of
+  the envelope junk) -> resurrect overwrites body with a fresh tag -> distinct etag -> exact-token delete
+  MISSES on resurrect -> NO tombstone, NO wait, NO per-incarnation keys, reads stay content-addressed
+  (stable key, constant offset), manifest stays pure content (FUSE-ready preserved). Phase B's ACTUAL win
+  (kill the O(condemned-set) writer-side retire-view download) is kept: add a per-hash META as the writer's
+  freshness POINT-READ (condemned? -> resurrect vs adopt), replacing the retire-view. The META is a
+  freshness marker, NOT the sole linearization; delete-exactness stays with the BODY token (validated core).
+- Superseded: CaMetaDescriptorRaw.tla (raw-body/terminal-tombstone) + CaMetaIncarnationKey.tla (rejected
+  variant) — keep as explored-and-rejected record. Corrected safety core = existing CaIncarnationCore
+  (exact-token delete). NEW modeling need is small (meta point-read >= retire-view freshness for K1).
+- NEXT: revise spec (raw-body-refinement -> keep-in-body-tag + meta-as-freshness), revise plan; then impl.
+  Task 1 (meta codec) reusable; Task 1B (meta incarnation nonce) likely unneeded (meta not the linearizer).
