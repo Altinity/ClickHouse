@@ -126,23 +126,16 @@ TEST(CasBlobInDegree, FoldDeltaDivergentBytesThrowsCorrupted)
                  DB::Exception);
 }
 
-/// ==== three-cursor merge (spec 2026-07-02-cas-gc-ack-floor-fence-redesign) ====
+/// ==== two-cursor settlement merge (retired-in-snapshot T3, spec §2.1/§3) ====
+///
+/// The retired input is no longer a separate `prior_retired` vector — the prior generation's `kCondemned`
+/// rows RIDE the source-edge run at the zero-sentinel key. These helpers build such a prior run directly
+/// (option (b) from the T3 brief: `RunFileWriter` + `encodeCondemnedRow`) and decode a run for assertions.
 
 namespace
 {
 
-RetiredEntry entry(uint64_t hash, uint64_t condemn_round, const String & tok = "t")
-{
-    RetiredEntry e;
-    e.kind = DB::Cas::ObjectKind::Blob;
-    e.hash = b(hash);
-    e.token = Token{.value = tok, .type = TokenType::Emulated};
-    e.size = 1;
-    e.condemn_round = condemn_round;
-    return e;
-}
-
-/// head_blob stub: present with a fixed token/size.
+/// head_blob / peek_head stub: present with a fixed token/size.
 std::function<std::optional<HeadResult>(const UInt128 &)> headPresent(const String & tok, uint64_t size)
 {
     return [tok, size](const UInt128 &) -> std::optional<HeadResult>
@@ -155,6 +148,80 @@ std::function<std::optional<HeadResult>(const UInt128 &)> headPresent(const Stri
     };
 }
 
+/// A `CondemnedRow` mirroring the old `entry(hash, condemn_round)` fixture (token "t", size 1).
+CondemnedRow condemnedRowFor(uint64_t condemn_round, const String & tok = "t",
+                             bool delete_pending = false, uint64_t size = 1)
+{
+    return CondemnedRow{.delete_pending = delete_pending,
+                        .token = Token{.value = tok, .type = TokenType::Emulated},
+                        .size = size, .condemn_round = condemn_round};
+}
+
+/// Build a source-edge run (`kSourceEdgeKeySchema`) carrying the given `kCondemned` sentinel rows and
+/// surviving edges, write it under `blobTargetRunKey(gen, attempt, shard, 0)`, and return its `RunRef`.
+/// Rows are emitted in (blob_hash, source_id) order (sentinels at source_id 0 sort first per blob).
+RunRef writeSourceEdgeRun(InMemoryBackend & backend, const Layout & layout,
+                          uint64_t gen, uint64_t attempt, uint64_t shard,
+                          const std::vector<std::pair<UInt128, CondemnedRow>> & condemned,
+                          const std::vector<std::pair<UInt128, UInt128>> & edges = {})
+{
+    std::vector<std::pair<String, String>> rows;
+    for (const auto & [h, row] : condemned)
+        rows.emplace_back(srcEdgeRunKey(h, UInt128{0}), encodeCondemnedRow(row));
+    for (const auto & [h, sid] : edges)
+        rows.emplace_back(srcEdgeRunKey(h, sid), String(1, kEdgeActive));
+    std::stable_sort(rows.begin(), rows.end(),
+        [](const auto & a, const auto & bb) { return a.first < bb.first; });
+
+    DB::WriteBufferFromOwnString out;
+    RunHeader header;
+    header.kind = RunKind::SourceEdge;
+    header.key_schema = kSourceEdgeKeySchema;
+    RunFileWriter writer(out, header);
+    for (const auto & [k, p] : rows)
+        writer.append(k, p);
+    writer.finish();
+
+    const String bytes = out.str();
+    const String key = layout.blobTargetRunKey(gen, attempt, shard, 0);
+    backend.putIfAbsent(key, bytes);
+    const auto h = CityHash_v1_0_2::CityHash128(bytes.data(), bytes.size());
+    return RunRef{.key = key,
+                  .checksum = (static_cast<UInt128>(h.high64) << 64) | static_cast<UInt128>(h.low64),
+                  .shard = shard, .generation = gen};
+}
+
+struct DecodedRun
+{
+    std::vector<std::pair<UInt128, CondemnedRow>> condemned;   /// (blob_hash, row)
+    std::vector<UInt128> zero_markers;                         /// blob hashes with a zero-transition marker
+    std::vector<std::pair<UInt128, UInt128>> edges;            /// (blob_hash, source_id)
+};
+
+DecodedRun decodeRun(InMemoryBackend & backend, const RunRef & run)
+{
+    DecodedRun d;
+    RunFileReader r = openSourceEdgeRun(backend, run.key);
+    String k, p;
+    while (r.next(k, p))
+    {
+        UInt128 bh, sid;
+        EXPECT_TRUE(parseSrcEdgeRunKey(k, bh, sid)) << "malformed run key";
+        EXPECT_FALSE(p.empty());
+        if (p.empty())
+            continue;
+        if (p[0] == kCondemned)
+            d.condemned.emplace_back(bh, decodeCondemnedRow(p));
+        else if (p[0] == kZeroMarker)
+            d.zero_markers.push_back(bh);
+        else if (p[0] == kEdgeActive)
+            d.edges.emplace_back(bh, sid);
+        else
+            ADD_FAILURE() << "unknown run row type";
+    }
+    return d;
+}
+
 }
 
 TEST(CasThreeCursorMerge, FloorBoundary)
@@ -162,16 +229,16 @@ TEST(CasThreeCursorMerge, FloorBoundary)
     InMemoryBackend backend;
     Layout layout{"pool"};
 
-    /// Gen 1 holds one unrelated edge (b9) so the prior run exists; A=b1 and B=b2 have no edges at
-    /// all (in-degree 0 by definition). A was condemned at round 2, B at round 3; current_round = 3:
-    /// strictly-below graduates, at-the-current-round stays.
-    std::vector<RunRef> runs1;
-    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{}, 1, 0, 0, {{b(9), s(1), false}}, runs1);
+    /// Gen 1's run holds one unrelated surviving edge (b9) plus the carried kCondemned rows for A=b1
+    /// (condemned round 2) and B=b2 (round 3); neither A nor B has any edge (in-degree 0 by definition).
+    /// current_round = 3: strictly-below graduates, at-the-current-round stays.
+    const RunRef gen1 = writeSourceEdgeRun(backend, layout, /*gen*/1, 0, 0,
+        {{b(1), condemnedRowFor(2)}, {b(2), condemnedRowFor(3)}}, {{b(9), s(1)}});
 
     std::vector<RunRef> runs2;
     RetiredMergeResult rmr;
-    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/runs1, 2, 0, 0, {}, runs2,
-        {entry(1, 2), entry(2, 3)}, /*current_round*/3, /*condemn_round*/4, /*head_blob*/{}, /*peek_head*/{}, &rmr);
+    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{gen1}, 2, 0, 0, {}, runs2,
+        /*current_round*/3, /*condemn_round*/4, /*head_blob*/{}, /*peek_head*/{}, &rmr);
 
     /// Two-phase graduation: the floor-passed entry is REPUBLISHED pending (still in the list);
     /// its physical delete belongs to the NEXT pass.
@@ -186,6 +253,15 @@ TEST(CasThreeCursorMerge, FloorBoundary)
     EXPECT_EQ(rmr.still_retired[1].condemn_round, 3u);   /// carried unchanged, not re-stamped
     EXPECT_TRUE(rmr.spared.empty());
     EXPECT_TRUE(rmr.redelete.empty());
+
+    /// still_retired mirrors exactly the kCondemned rows written into the output run, in order.
+    const DecodedRun out = decodeRun(backend, runs2[0]);
+    ASSERT_EQ(out.condemned.size(), 2u);
+    EXPECT_EQ(out.condemned[0].first, b(1));
+    EXPECT_TRUE(out.condemned[0].second.delete_pending);
+    EXPECT_EQ(out.condemned[1].first, b(2));
+    EXPECT_FALSE(out.condemned[1].second.delete_pending);
+    EXPECT_TRUE(out.zero_markers.empty());
 }
 
 TEST(CasThreeCursorMerge, PendingRedeletesAndDrops)
@@ -193,21 +269,26 @@ TEST(CasThreeCursorMerge, PendingRedeletesAndDrops)
     InMemoryBackend backend;
     Layout layout{"pool"};
 
-    /// An entry the PRIOR pass published as delete_pending: this pass hands it to `redelete`
-    /// (executed pre-CAS by the caller) and drops it from the list output.
-    RetiredEntry pending = entry(1, 1);
-    pending.delete_pending = true;
+    /// A row the PRIOR pass published as delete_pending (carried on gen 1's run): this pass hands it to
+    /// `redelete` (executed pre-CAS by the caller) and drops it from the output run.
+    const RunRef gen1 = writeSourceEdgeRun(backend, layout, /*gen*/1, 0, 0,
+        {{b(1), condemnedRowFor(1, "t", /*delete_pending*/true)}});
 
-    std::vector<RunRef> runs;
+    std::vector<RunRef> runs2;
     RetiredMergeResult rmr;
-    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{}, 1, 0, 0, {}, runs,
-        {pending}, /*current_round*/9, /*condemn_round*/9, /*head_blob*/{}, /*peek_head*/{}, &rmr);
+    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{gen1}, 2, 0, 0, {}, runs2,
+        /*current_round*/9, /*condemn_round*/9, /*head_blob*/{}, /*peek_head*/{}, &rmr);
 
     ASSERT_EQ(rmr.redelete.size(), 1u);
     EXPECT_EQ(rmr.redelete[0].hash, b(1));
     EXPECT_TRUE(rmr.still_retired.empty());
     EXPECT_TRUE(rmr.graduated.empty());
     EXPECT_TRUE(rmr.spared.empty());
+
+    /// The redeleted blob leaves the run entirely (no sentinel carried, no zero marker — untouched).
+    const DecodedRun out = decodeRun(backend, runs2[0]);
+    EXPECT_TRUE(out.condemned.empty());
+    EXPECT_TRUE(out.zero_markers.empty());
 }
 
 TEST(CasThreeCursorMerge, RecoverySpares)
@@ -215,17 +296,25 @@ TEST(CasThreeCursorMerge, RecoverySpares)
     InMemoryBackend backend;
     Layout layout{"pool"};
 
-    /// A (=b1) is retired at round 1 and would long since have graduated (current_round = 5) — but
-    /// this pass's delta adds an edge to it: recovery WINS over graduation, the entry is dropped as spared.
-    std::vector<RunRef> runs;
+    /// A (=b1) is retired at round 1 and would long since have graduated (current_round = 5) — but this
+    /// pass's delta adds an edge to it: recovery WINS over graduation, the entry is dropped as spared.
+    const RunRef gen1 = writeSourceEdgeRun(backend, layout, /*gen*/1, 0, 0, {{b(1), condemnedRowFor(1)}});
+
+    std::vector<RunRef> runs2;
     RetiredMergeResult rmr;
-    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{}, 1, 0, 0, {{b(1), s(1), false}}, runs,
-        {entry(1, 1)}, /*current_round*/5, /*condemn_round*/6, /*head_blob*/{}, /*peek_head*/{}, &rmr);
+    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{gen1}, 2, 0, 0, {{b(1), s(1), false}}, runs2,
+        /*current_round*/5, /*condemn_round*/6, /*head_blob*/{}, /*peek_head*/{}, &rmr);
 
     ASSERT_EQ(rmr.spared.size(), 1u);
     EXPECT_EQ(rmr.spared[0].hash, b(1));
     EXPECT_TRUE(rmr.graduated.empty());
     EXPECT_TRUE(rmr.still_retired.empty());
+
+    /// b1 recovered its edge: the output run carries the surviving edge and no sentinel for it.
+    const DecodedRun out = decodeRun(backend, runs2[0]);
+    EXPECT_TRUE(out.condemned.empty());
+    ASSERT_EQ(out.edges.size(), 1u);
+    EXPECT_EQ(out.edges[0].first, b(1));
 }
 
 TEST(CasThreeCursorMerge, NewCandidateCondemned)
@@ -241,7 +330,7 @@ TEST(CasThreeCursorMerge, NewCandidateCondemned)
     std::vector<RunRef> runs2;
     RetiredMergeResult rmr;
     foldDeltasIntoGeneration(backend, layout, /*prior_runs*/runs1, 2, 0, 0, {{b(3), s(1), true}}, runs2,
-        {}, /*current_round*/0, /*condemn_round*/7, headPresent("t9", 42), /*peek_head*/{}, &rmr);
+        /*current_round*/0, /*condemn_round*/7, headPresent("t9", 42), /*peek_head*/{}, &rmr);
 
     ASSERT_EQ(rmr.still_retired.size(), 1u);
     EXPECT_EQ(rmr.still_retired[0].hash, b(3));
@@ -250,6 +339,13 @@ TEST(CasThreeCursorMerge, NewCandidateCondemned)
     EXPECT_EQ(rmr.still_retired[0].condemn_round, 7u);
     EXPECT_TRUE(rmr.graduated.empty());
     EXPECT_TRUE(rmr.spared.empty());
+
+    /// The fresh condemn is emitted as a kCondemned row (not a zero marker) into the output run.
+    const DecodedRun out = decodeRun(backend, runs2[0]);
+    ASSERT_EQ(out.condemned.size(), 1u);
+    EXPECT_EQ(out.condemned[0].first, b(3));
+    EXPECT_EQ(out.condemned[0].second.token.value, "t9");
+    EXPECT_TRUE(out.zero_markers.empty());
 }
 
 TEST(CasThreeCursorMerge, AbsentBlobNotCondemned)
@@ -258,25 +354,32 @@ TEST(CasThreeCursorMerge, AbsentBlobNotCondemned)
     Layout layout{"pool"};
 
     /// Same transition-to-zero as above, but the blob object is already gone at condemn time:
-    /// nothing to delete later, so no entry is minted.
+    /// nothing to delete later, so no entry is minted — a plain zero marker is emitted instead.
     std::vector<RunRef> runs1;
     foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{}, 1, 0, 0, {{b(3), s(1), false}}, runs1);
 
     std::vector<RunRef> runs2;
     RetiredMergeResult rmr;
     foldDeltasIntoGeneration(backend, layout, /*prior_runs*/runs1, 2, 0, 0, {{b(3), s(1), true}}, runs2,
-        {}, /*current_round*/0, /*condemn_round*/7,
+        /*current_round*/0, /*condemn_round*/7,
         [](const UInt128 &) -> std::optional<HeadResult> { return std::nullopt; }, /*peek_head*/{}, &rmr);
 
     EXPECT_TRUE(rmr.still_retired.empty());
     EXPECT_TRUE(rmr.graduated.empty());
     EXPECT_TRUE(rmr.spared.empty());
+
+    const DecodedRun out = decodeRun(backend, runs2[0]);
+    EXPECT_TRUE(out.condemned.empty());
+    ASSERT_EQ(out.zero_markers.size(), 1u);
+    EXPECT_EQ(out.zero_markers[0], b(3));
 }
 
-TEST(CasThreeCursorMerge, SnapshotBytesUnchanged)
+TEST(CasThreeCursorMerge, SnapshotEdgesUnperturbedByRetired)
 {
-    /// The retired cursor must not perturb the snapshot run bytes: identical edge inputs produce
-    /// byte-identical runs whether or not the retired machinery is engaged.
+    /// Retired-in-snapshot changes the byte-invariant: the retired machinery now WRITES kCondemned
+    /// sentinel rows into the run, so a retired-engaged run is no longer byte-identical to a plain one.
+    /// The preserved invariant (spec §2.1) is narrower: the retired machinery touches ONLY the sentinel
+    /// namespace — the surviving EDGE rows are byte-identical to a plain fold of the same deltas.
     InMemoryBackend plain;
     InMemoryBackend engaged;
     Layout layout{"pool"};
@@ -285,17 +388,111 @@ TEST(CasThreeCursorMerge, SnapshotBytesUnchanged)
     foldDeltasIntoGeneration(plain, layout, /*prior_runs*/{}, 1, 0, 0,
         {{b(1), s(1), false}, {b(2), s(1), false}, {b(2), s(2), true}}, r1);
 
+    /// Engaged: the SAME deltas, but the prior run carries retired rows for b1 (which the delta re-edges
+    /// => spared) and b5 (no edge => graduates past the floor).
+    const RunRef prior = writeSourceEdgeRun(engaged, layout, /*gen*/1, 0, 0,
+        {{b(1), condemnedRowFor(1)}, {b(5), condemnedRowFor(2)}});
     std::vector<RunRef> r2;
     RetiredMergeResult rmr;
-    foldDeltasIntoGeneration(engaged, layout, /*prior_runs*/{}, 1, 0, 0,
+    foldDeltasIntoGeneration(engaged, layout, /*prior_runs*/{prior}, 2, 0, 0,
         {{b(1), s(1), false}, {b(2), s(1), false}, {b(2), s(2), true}}, r2,
-        {entry(1, 1), entry(5, 2)}, /*current_round*/9, /*condemn_round*/3, headPresent("t", 1), /*peek_head*/{}, &rmr);
+        /*current_round*/9, /*condemn_round*/3, headPresent("t", 1), /*peek_head*/{}, &rmr);
 
-    const auto ga = plain.get(layout.blobTargetRunKey(1, 0, 0, 0));
-    const auto gb = engaged.get(layout.blobTargetRunKey(1, 0, 0, 0));
-    ASSERT_TRUE(ga.has_value());
-    ASSERT_TRUE(gb.has_value());
-    EXPECT_EQ(ga->bytes, gb->bytes);
+    const DecodedRun plain_run = decodeRun(plain, r1[0]);
+    const DecodedRun engaged_run = decodeRun(engaged, r2[0]);
+    EXPECT_EQ(plain_run.edges, engaged_run.edges);   /// edge rows byte-identical
+    EXPECT_TRUE(plain_run.condemned.empty());
+    /// The engaged run carries only the retired sentinel(s) on top: b1 spared (no row), b5 graduated.
+    ASSERT_EQ(engaged_run.condemned.size(), 1u);
+    EXPECT_EQ(engaged_run.condemned[0].first, b(5));
+    EXPECT_TRUE(engaged_run.condemned[0].second.delete_pending);
+}
+
+TEST(CasTwoCursorMerge, CarriedSentinelIsNotATouch)
+{
+    /// Gen 1 condemns b (a real +edge/-edge net-to-zero with head_blob present) -> a kCondemned row. Gen 2
+    /// has NO deltas at all: the carried row must (a) survive byte-identically, (b) emit no zero marker,
+    /// (c) never call peek_head (a carried sentinel is not a touch).
+    InMemoryBackend backend;
+    Layout layout{"pool"};
+
+    /// Gen 1: (b,s1) added then removed => net-to-zero => fresh condemn at round 5 (token "tok", size 7).
+    std::vector<RunRef> runs1;
+    RetiredMergeResult rmr1;
+    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{}, 1, 0, 0,
+        {{b(2), s(1), false}, {b(2), s(1), true}}, runs1,
+        /*current_round*/0, /*condemn_round*/5, headPresent("tok", 7), /*peek_head*/{}, &rmr1);
+    ASSERT_EQ(rmr1.still_retired.size(), 1u);
+    {
+        const DecodedRun g1 = decodeRun(backend, runs1[0]);
+        ASSERT_EQ(g1.condemned.size(), 1u);
+        EXPECT_EQ(g1.condemned[0].first, b(2));
+        EXPECT_TRUE(g1.zero_markers.empty());   /// a condemned blob emits kCondemned, never a zero marker
+    }
+
+    /// Gen 2: empty deltas, current_round 1 (< 5 => b carries, does not graduate). peek_head must NOT fire.
+    size_t peek_calls = 0;
+    auto peek = [&](const UInt128 &) -> std::optional<HeadResult> { ++peek_calls; return {}; };
+    std::vector<RunRef> runs2;
+    RetiredMergeResult rmr2;
+    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/runs1, 2, 0, 0, {}, runs2,
+        /*current_round*/1, /*condemn_round*/6, /*head_blob*/{}, peek, &rmr2);
+
+    EXPECT_EQ(peek_calls, 0u);
+    ASSERT_EQ(rmr2.still_retired.size(), 1u);
+    EXPECT_EQ(rmr2.still_retired[0].hash, b(2));
+    EXPECT_EQ(rmr2.still_retired[0].condemn_round, 5u);   /// carried unchanged
+    EXPECT_TRUE(rmr2.graduated.empty());
+
+    const DecodedRun g2 = decodeRun(backend, runs2[0]);
+    ASSERT_EQ(g2.condemned.size(), 1u);
+    EXPECT_EQ(g2.condemned[0].first, b(2));
+    EXPECT_EQ(g2.condemned[0].second.token.value, "tok");
+    EXPECT_EQ(g2.condemned[0].second.size, 7u);
+    EXPECT_TRUE(g2.zero_markers.empty());
+}
+
+TEST(CasTwoCursorMerge, MalformedRunFailsClosed)
+{
+    Layout layout{"pool"};
+
+    /// (1) An active edge at the reserved sentinel source_id 0 -> the merge cursor fails closed.
+    {
+        InMemoryBackend backend;
+        DB::WriteBufferFromOwnString out;
+        RunHeader header;
+        header.kind = RunKind::SourceEdge;
+        header.key_schema = kSourceEdgeKeySchema;
+        RunFileWriter writer(out, header);
+        writer.append(srcEdgeRunKey(b(1), UInt128{0}), String(1, kEdgeActive));   // edge at sentinel key
+        writer.finish();
+        const RunRef bad{.key = layout.blobTargetRunKey(1, 0, 0, 0), .checksum = {}, .shard = 0, .generation = 1};
+        backend.putIfAbsent(bad.key, out.str());
+
+        std::vector<RunRef> runs2;
+        EXPECT_THROW(foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{bad}, 2, 0, 0, {}, runs2),
+                     DB::Exception);
+    }
+
+    /// (2) Two sentinel rows for one blob -> duplicate sentinel -> the merge cursor fails closed.
+    {
+        InMemoryBackend backend;
+        DB::WriteBufferFromOwnString out;
+        RunHeader header;
+        header.kind = RunKind::SourceEdge;
+        header.key_schema = kSourceEdgeKeySchema;
+        RunFileWriter writer(out, header);
+        /// Same (b,0) key twice (equal keys are allowed by the writer) — two condemned sentinels for b1.
+        writer.append(srcEdgeRunKey(b(1), UInt128{0}), encodeCondemnedRow(condemnedRowFor(1)));
+        writer.append(srcEdgeRunKey(b(1), UInt128{0}), encodeCondemnedRow(condemnedRowFor(2)));
+        writer.finish();
+        const RunRef bad{.key = layout.blobTargetRunKey(1, 0, 0, 0), .checksum = {}, .shard = 0, .generation = 1};
+        backend.putIfAbsent(bad.key, out.str());
+
+        std::vector<RunRef> runs2;
+        EXPECT_THROW(foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{bad}, 2, 0, 0, {}, runs2),
+                     DB::Exception);
+    }
 }
 
 /// A prior run spanning several blocks folds correctly with the streaming prior cursor AND the backend

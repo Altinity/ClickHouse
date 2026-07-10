@@ -3,10 +3,12 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasCodecUtil.h>
 #include <IO/WriteBufferFromString.h>
 #include <Common/Exception.h>
+#include <Common/logger_useful.h>
 #include <city.h>
 #include <algorithm>
 #include <cstring>
 #include <memory>
+#include <optional>
 
 namespace DB
 {
@@ -32,14 +34,18 @@ UInt128 cityHash128(const String & bytes)
     return (static_cast<UInt128>(h.high64) << 64) | static_cast<UInt128>(h.low64);
 }
 
-/// Streams a shard's prior surviving source edges at O(one block) resident memory: chains the run
-/// SEGMENTS the caller resolved from the parent seal (`blob_target_runs` filtered to one shard), skips
-/// zero-marker rows (per-generation, never carried forward), and exposes a one-key lookahead the fold
-/// merge consumes. Resolution is BY REF (2026-07-02 T0): the caller passes the exact object keys, so a
-/// run sealed for generation G that physically lives under an older generation's key is reached without
-/// key construction. An empty `segments` is the fresh-pool / empty baseline. The edge stream is globally
-/// sorted by (blob_hash, source_id): each segment is sorted and segments are ordered by key, so `key()`
-/// values are non-decreasing.
+/// Streams a shard's prior source-edge run at O(one block) resident memory: chains the run SEGMENTS the
+/// caller resolved from the parent seal (`blob_target_runs` filtered to one shard) and exposes a one-row
+/// lookahead the fold merge consumes. Two-cursor / retired-in-snapshot (spec §2.1): the prior run carries
+/// BOTH surviving edges (`kEdgeActive`) AND the retired `kCondemned` sentinel rows at the zero source id,
+/// so the cursor stops at edges AND at condemned rows (exposing the type via `rowType`), while zero-marker
+/// sentinels are dropped on carry (per-generation, never carried forward). Row/key invariants are enforced
+/// while streaming (spec §2.1): `kEdgeActive` never at `source_id = 0`; sentinel rows (`kZeroMarker` /
+/// `kCondemned`) ONLY at `source_id = 0`; at most one sentinel per blob; an unknown value byte or an empty
+/// payload is CORRUPTED_DATA. Resolution is BY REF (2026-07-02 T0): the caller passes the exact object
+/// keys, so a run sealed for generation G that physically lives under an older generation's key is reached
+/// without key construction. An empty `segments` is the fresh-pool / empty baseline. The row stream is
+/// globally sorted by (blob_hash, source_id), so `key()` values are non-decreasing.
 class PriorEdgeCursor
 {
 public:
@@ -51,26 +57,67 @@ public:
 
     bool valid() const { return has_current; }
     const String & key() const { return current_key; }
+    /// The value byte of the current row: `kEdgeActive` (a surviving edge) or `kCondemned` (a retired
+    /// sentinel row). Zero markers are never surfaced (dropped on carry).
+    char rowType() const { return current_type; }
+    /// The decoded retired sentinel for the current row (only valid when `rowType() == kCondemned`).
+    const CondemnedRow & condemnedRow() const { return current_condemned; }
 
-    /// Advance to the next surviving edge, skipping zero markers and crossing segment boundaries.
+    /// Advance to the next surviving edge OR retired sentinel, dropping zero markers, enforcing the
+    /// row/key invariants, and crossing segment boundaries.
     void advance()
     {
         while (true)
         {
-            /// Pull rows from the open segment until a surviving edge or the segment ends.
+            /// Pull rows from the open segment until a surviving edge / retired sentinel or the segment ends.
             if (reader)
             {
                 String k;
                 String p;
                 while (reader->next(k, p))
                 {
-                    if (!p.empty() && p[0] == kEdgeActive)   // carry forward only surviving edges
+                    UInt128 bh, sid;
+                    if (!parseSrcEdgeRunKey(k, bh, sid))
+                        throw Exception(ErrorCodes::CORRUPTED_DATA,
+                            "CAS source-edge run: malformed key ({} bytes)", k.size());
+                    if (p.empty())
+                        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS source-edge run: empty row payload");
+                    const char v = p[0];
+                    const bool sentinel_key = (sid == kZeroSourceId);
+
+                    if (sentinel_key)
                     {
+                        /// A sentinel key carries exactly one row per blob and never an edge.
+                        if (v == kEdgeActive)
+                            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                                "CAS source-edge run: active edge at the reserved sentinel source_id 0");
+                        if (v != kZeroMarker && v != kCondemned)
+                            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                                "CAS source-edge run: unknown sentinel row type 0x{:02x}", static_cast<uint8_t>(v));
+                        if (have_sentinel_blob && sentinel_blob == bh)
+                            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                                "CAS source-edge run: duplicate sentinel row for one blob");
+                        have_sentinel_blob = true;
+                        sentinel_blob = bh;
+                        if (v == kZeroMarker)
+                            continue;   // per-generation zero marker: dropped, not carried forward
+                        /// A retired sentinel: decode and surface it (settled at close-out, not an edge).
+                        current_condemned = decodeCondemnedRow(p);
                         current_key = k;
+                        current_type = kCondemned;
                         has_current = true;
                         return;
                     }
-                    // zero-marker (or empty) row: dropped, not carried forward
+
+                    /// A non-sentinel key must carry a surviving edge and nothing else.
+                    if (v != kEdgeActive)
+                        throw Exception(ErrorCodes::CORRUPTED_DATA,
+                            "CAS source-edge run: sentinel row type 0x{:02x} at a non-sentinel key",
+                            static_cast<uint8_t>(v));
+                    current_key = k;
+                    current_type = kEdgeActive;
+                    has_current = true;
+                    return;
                 }
                 reader.reset();
                 ++seg_idx;
@@ -82,7 +129,8 @@ public:
                 has_current = false;
                 return;
             }
-            reader = std::make_unique<RunFileReader>(backend, segments[seg_idx].key);
+            /// Typed open (spec §2.1): every source-edge run reader goes through openSourceEdgeRun.
+            reader = std::make_unique<RunFileReader>(openSourceEdgeRun(backend, segments[seg_idx].key));
         }
     }
 
@@ -93,7 +141,14 @@ private:
     size_t seg_idx = 0;
     std::unique_ptr<RunFileReader> reader;
     String current_key;
+    char current_type = kEdgeActive;
+    CondemnedRow current_condemned;
     bool has_current = false;
+
+    /// Duplicate-sentinel guard: the last blob for which a sentinel row was seen (across skipped zero
+    /// markers too). Rows are globally sorted, so two sentinels for one blob are adjacent.
+    bool have_sentinel_blob = false;
+    UInt128 sentinel_blob{0};
 };
 
 }
@@ -165,14 +220,29 @@ CondemnedRow decodeCondemnedRow(std::string_view p)
     return row;
 }
 
-RunFileReader openSourceEdgeRun(std::string_view bytes)
+namespace
 {
-    RunFileReader reader(bytes);
+void assertSourceEdgeRunHeader(const RunFileReader & reader)
+{
     if (reader.kind() != RunKind::SourceEdge)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS source-edge run: wrong kind {}", static_cast<int>(reader.kind()));
     if (reader.keySchema() != kSourceEdgeKeySchema)
         throw Exception(ErrorCodes::NOT_IMPLEMENTED,
             "CAS source-edge run: key_schema {} (this build reads only {})", reader.keySchema(), kSourceEdgeKeySchema);
+}
+}
+
+RunFileReader openSourceEdgeRun(std::string_view bytes)
+{
+    RunFileReader reader(bytes);
+    assertSourceEdgeRunHeader(reader);
+    return reader;
+}
+
+RunFileReader openSourceEdgeRun(Backend & backend, const String & key)
+{
+    RunFileReader reader(backend, key);
+    assertSourceEdgeRunHeader(reader);
     return reader;
 }
 
@@ -208,22 +278,12 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
                               uint64_t new_generation, uint64_t attempt,
                               uint64_t shard,
                               std::vector<BlobDelta> scattered, std::vector<RunRef> & out_runs,
-                              const std::vector<RetiredEntry> & prior_retired,
                               uint64_t current_round, uint64_t condemn_round,
                               const std::function<std::optional<HeadResult>(const UInt128 &)> & head_blob,
                               const std::function<std::optional<HeadResult>(const UInt128 &)> & peek_head,
                               RetiredMergeResult * out_retired,
                               bool suppress_destructive)
 {
-    /// The retired cursor consumes Blob entries in ascending hash order, in lockstep with the
-    /// ascending merged edge stream (32-byte BE keys order exactly as numeric UInt128). An unsorted
-    /// input would silently mis-settle entries (missed/duplicated graduations), so this is a REAL
-    /// release gate, not a chassert: the list is small (outstanding candidates), the check is O(n).
-    if (!std::is_sorted(prior_retired.begin(), prior_retired.end(),
-        [](const RetiredEntry & a, const RetiredEntry & bb) { return a.hash < bb.hash; }))
-        throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "CAS gc fold: prior retired list for shard {} is not sorted by hash — refusing the merge",
-            shard);
     RetiredMergeResult sink;
     RetiredMergeResult & rmr = out_retired ? *out_retired : sink;
 
@@ -243,25 +303,53 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
     DB::WriteBufferFromOwnString out;
     RunHeader header;
     header.kind = RunKind::SourceEdge;
-    header.key_schema = 0;   // (blob_hash, source_id) 32-byte fixed
+    header.key_schema = kSourceEdgeKeySchema;   // (blob_hash, source_id) 32-byte fixed + zero-sentinel rows
     RunFileWriter writer(out, header);
 
-    // Streaming two-cursor merge over prior edges (by 32-byte key) and this round's edge deltas
-    // (by (blob_hash, source_id)). All rows for one edge key are adjacent in BOTH inputs. We resolve
+    // Streaming two-cursor merge over the prior run (surviving edges by 32-byte key AND retired kCondemned
+    // sentinel rows at the zero source id) and this round's edge deltas (by (blob_hash, source_id)). All
+    // rows for one blob are adjacent in both inputs; the sentinel key (source_id 0) sorts first. We resolve
     // final presence per edge locally (idempotent: prior present + activate => present; any remove =>
-    // absent), emit surviving edges, and accumulate the current blob's surviving-edge count on the fly
-    // to emit a zero-transition marker. O(block) IO + O(1) per current blob.
-    size_t di = 0, ri = 0;
+    // absent), settle each blob's carried retired row against its post-merge in-degree at close-out, and
+    // re-emit the surviving retired rows / zero-transition markers. O(block) IO + O(1) per current blob.
+    size_t di = 0;
     UInt128 cur_blob{0};
     bool have_blob = false;
-    uint64_t cur_edges = 0;    // surviving edges of cur_blob so far
-    bool cur_touched = false;  // cur_blob had prior edges or deltas this generation
+    uint64_t cur_edges = 0;              // surviving edges of cur_blob so far
+    bool cur_touched = false;            // cur_blob had prior edges or deltas this generation
+    std::optional<CondemnedRow> cur_condemned;   // the retired sentinel carried on the prior run for cur_blob
+
+    auto toRetiredEntry = [](const UInt128 & hash, const CondemnedRow & r) -> RetiredEntry
+    {
+        RetiredEntry e;
+        e.kind = ObjectKind::Blob;
+        e.hash = hash;
+        e.token = r.token;
+        e.size = r.size;
+        e.condemn_round = r.condemn_round;
+        e.delete_pending = r.delete_pending;
+        return e;
+    };
+    auto toCondemnedRow = [](const RetiredEntry & e) -> CondemnedRow
+    {
+        return CondemnedRow{.delete_pending = e.delete_pending, .token = e.token,
+                            .size = e.size, .condemn_round = e.condemn_round};
+    };
 
     auto settleEntry = [&](const RetiredEntry & e, uint64_t indeg)
     {
         chassert(e.kind == ObjectKind::Blob);   /// the in-degree merge settles Blob entries only
         if (indeg > 0)
-            rmr.spared.push_back(e);            /// recovery wins, even past the floor (pending too — fail closed)
+        {
+            /// A delete_pending entry recovering in-degree is structurally impossible (a published pending
+            /// blob should never be re-referenced) but IS reachable under real races (T1 TLA finding).
+            /// Spare it LOUDLY — never a fail-closed abort and never a delete of a re-referenced blob.
+            if (e.delete_pending)
+                LOG_WARNING(getLogger("CasGcFold"),
+                    "CAS gc fold: a delete_pending retired entry recovered in-degree {} — structurally "
+                    "impossible but reachable under races; sparing (never a fail-closed delete)", indeg);
+            rmr.spared.push_back(e);            /// recovery wins, even past the floor
+        }
         else if (e.delete_pending)
         {
             if (suppress_destructive)
@@ -279,25 +367,20 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
         else
             rmr.still_retired.push_back(e);     /// carried unchanged until the floor passes it
     };
-    /// Entries for blobs STRICTLY BELOW `bound` that the merged stream never visits: no surviving
-    /// edges, no deltas this pass => in-degree 0 by definition.
-    auto settleRetiredBelow = [&](const UInt128 & bound)
-    {
-        while (ri < prior_retired.size() && prior_retired[ri].hash < bound)
-            settleEntry(prior_retired[ri++], 0);
-    };
 
     auto closeBlob = [&]()
     {
         if (!have_blob)
             return;
-        if (cur_edges == 0 && cur_touched)
-            writer.append(srcEdgeRunKey(cur_blob, kZeroSourceId), String(1, kZeroMarker));
-        /// Settle the retired entry for the blob being closed, against its post-merge in-degree...
-        if (ri < prior_retired.size() && prior_retired[ri].hash == cur_blob)
+        const size_t retired_before = rmr.still_retired.size();
+
+        /// Settle the retired row carried on the prior run for the blob being closed, against its
+        /// post-merge in-degree...
+        if (cur_condemned)
         {
+            const RetiredEntry stale = toRetiredEntry(cur_blob, *cur_condemned);
             /// RESURRECT-REUPLOAD-ORPHAN: on a re-reference cycle (touched this window, net in-degree 0),
-            /// re-observe the CURRENT token. If it differs from the retired entry's token, a resurrect
+            /// re-observe the CURRENT token. If it differs from the retired row's token, a resurrect
             /// replaced the incarnation at this key — supersede the stale entry with a fresh condemn of the
             /// current token so the replacement enters the pipeline (the stale token's exact-token delete
             /// would only find the new token and no-op). Keyed on (hash, current token), matching GRetire.
@@ -310,7 +393,7 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
             if (cur_edges == 0 && cur_touched && peek_head)
             {
                 if (const auto hr = peek_head(cur_blob);
-                    hr && hr->exists && hr->token != prior_retired[ri].token)
+                    hr && hr->exists && hr->token != stale.token)
                 {
                     RetiredEntry fresh;
                     fresh.kind = ObjectKind::Blob;
@@ -319,18 +402,17 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
                     fresh.size = hr->size;
                     fresh.condemn_round = condemn_round;
                     ReplacedEntry re;
-                    re.old_token = prior_retired[ri].token;     /// the stale token this supersede replaces
+                    re.old_token = stale.token;                 /// the stale token this supersede replaces
                     re.fresh = fresh;
-                    rmr.replaced.push_back(std::move(re));      /// caller emits blob_retire_replaced
+                    rmr.replaced.push_back(std::move(re));       /// caller emits blob_retire_replaced
                     rmr.still_retired.push_back(std::move(fresh));
-                    ++ri;                                       /// drop the stale entry (superseded)
                     superseded = true;
                 }
             }
             if (!superseded)
-                settleEntry(prior_retired[ri++], cur_edges);
+                settleEntry(stale, cur_edges);
         }
-        /// ...or condemn a fresh transition-to-zero (no prior entry). `head_blob` captures the exact
+        /// ...or condemn a fresh transition-to-zero (no carried row). `head_blob` captures the exact
         /// incarnation token for the later exact-token delete; an absent object needs no entry.
         else if (cur_edges == 0 && cur_touched && head_blob)
         {
@@ -345,20 +427,32 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
                 rmr.still_retired.push_back(std::move(fresh));
             }
         }
+
+        /// Emit AT MOST ONE sentinel row per blob (spec §2.1, invariant 4): the `kCondemned` row when the
+        /// blob is condemned/carried/graduated this pass (still_retired grew for it), else a per-generation
+        /// `kZeroMarker` when it transitioned to zero this pass but was not condemned (redelete-dropped or
+        /// absent-at-condemn). A blob with surviving edges (cur_edges > 0) emits neither — its edge rows
+        /// were appended inline, and a condemned/zeroed blob has NO surviving edges, so appending the
+        /// sentinel now (its key sorts first for the blob, and no edge rows precede it) keeps the run
+        /// sorted. `still_retired` therefore mirrors exactly the emitted `kCondemned` rows, in order.
+        if (rmr.still_retired.size() > retired_before)
+            writer.append(srcEdgeRunKey(cur_blob, kZeroSourceId),
+                          encodeCondemnedRow(toCondemnedRow(rmr.still_retired.back())));
+        else if (cur_edges == 0 && cur_touched)
+            writer.append(srcEdgeRunKey(cur_blob, kZeroSourceId), String(1, kZeroMarker));
     };
     auto openBlobIfNeeded = [&](const UInt128 & b)
     {
         if (!have_blob || b != cur_blob)
         {
             closeBlob();
-            settleRetiredBelow(b);   /// no-edge blobs between the closed blob and this one
-            cur_blob = b; have_blob = true; cur_edges = 0; cur_touched = false;
+            cur_blob = b; have_blob = true; cur_edges = 0; cur_touched = false; cur_condemned.reset();
         }
     };
 
     while (cursor.valid() || di < scattered.size())
     {
-        // Pick the smallest edge key across the two cursors.
+        // Pick the smallest row key across the prior-run cursor and this round's deltas.
         String key;
         bool from_prior = false;
         if (cursor.valid()) { key = cursor.key(); from_prior = true; }
@@ -372,6 +466,16 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
         if (!parseSrcEdgeRunKey(key, blob_hash, source_id))
             throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS source-edge run: malformed key");
         openBlobIfNeeded(blob_hash);
+
+        /// A retired sentinel row from the prior run: stash it for close-out settlement. It is NOT an edge
+        /// and NEVER a touch — a carried kCondemned row must not force a zero-marker or a peek_head HEAD
+        /// (spec §2.1, invariant 2). Deltas never key the zero source id, so no delta merges at this key.
+        if (from_prior && cursor.rowType() == kCondemned)
+        {
+            cur_condemned = cursor.condemnedRow();
+            cursor.advance();
+            continue;
+        }
 
         bool present = false;
         if (from_prior && cursor.key() == key) { present = true; cursor.advance(); cur_touched = true; }
@@ -390,9 +494,6 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
         }
     }
     closeBlob();
-    /// Entries above the last visited blob: never visited => in-degree 0 by definition.
-    while (ri < prior_retired.size())
-        settleEntry(prior_retired[ri++], 0);
 
     writer.finish();
     const String run_bytes = out.str();
@@ -409,8 +510,9 @@ std::vector<BlobCandidate> zeroInDegree(Backend & backend, const std::vector<Run
     {
         /// Resolution is by ref (2026-07-02 T0): the caller passed the exact object key, so a run sealed
         /// for a later generation but physically living under an older key is reached directly. The run is
-        /// streamed at O(one block) resident memory, never materialized whole.
-        RunFileReader r{backend, run.key};
+        /// streamed at O(one block) resident memory, never materialized whole. `openSourceEdgeRun` enforces
+        /// the run kind + key schema; `kCondemned` sentinel rows are skipped (only `kZeroMarker` counts).
+        RunFileReader r = openSourceEdgeRun(backend, run.key);
         String k, p;
         while (r.next(k, p))
             if (!p.empty() && p[0] == kZeroMarker)
@@ -430,8 +532,9 @@ int64_t inDegreeInGeneration(Backend & backend, const std::vector<RunRef> & runs
     {
         /// Stream the resolved run at O(block). The `seek` below is the ranged-get path: it lands the
         /// cursor on the target blob's block via the sparse footer index rather than scanning a resident
-        /// whole-run buffer.
-        RunFileReader r{backend, run.key};
+        /// whole-run buffer. `openSourceEdgeRun` enforces the run kind + key schema; only `kEdgeActive`
+        /// rows count (the blob's `kCondemned` / `kZeroMarker` sentinel rows are not in-degree).
+        RunFileReader r = openSourceEdgeRun(backend, run.key);
         r.seek(u128ToBytesBE(blob_hash));   // sparse-index skip to this blob's edges
         String k, p;
         while (r.next(k, p))

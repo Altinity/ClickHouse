@@ -1114,7 +1114,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             foldDeltasIntoGeneration(backend, layout, priorRunsFor(0),
                                      new_generation, attempt, /*shard*/0,
                                      std::move(deltas), result.fold_seal.blob_target_runs,
-                                     prior_retired[0], current_round, condemn_round, head_blob, peek_head,
+                                     current_round, condemn_round, head_blob, peek_head,
                                      &result.retired_merge[0], suppress_destructive);
         }
     }
@@ -1148,7 +1148,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
                 reducer.reduce(backend, layout, priorRunsFor(shard),
                                new_generation, attempt,
                                std::move(buckets[shard]),
-                               prior_retired[shard], current_round, condemn_round, head_blob, peek_head,
+                               current_round, condemn_round, head_blob, peek_head,
                                &result.retired_merge[shard], suppress_destructive);
             for (RunRef & r : shard_runs)
                 result.fold_seal.blob_target_runs.push_back(std::move(r));
@@ -1935,11 +1935,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
     }
 
     for (uint64_t shard = 0; shard < gc_shards; ++shard)
-    {
-        flush_shard(shard);
-        for (const RunRef & r : prior_runs[shard])
-            seal.blob_target_runs.push_back(r);
-    }
+        flush_shard(shard);   /// edge runs only; the retired-in-snapshot seeding below appends to them
 
     /// Pipeline blindness repair (found by the convergence test): the fold discovers candidates by
     /// TRANSITIONS to zero, but a blob whose edges are entirely gone by rebuild time has NO row in
@@ -1984,13 +1980,51 @@ RebuildReport Gc::rebuildBaseline(bool force)
         }
     }
 
-    /// Numbering, part 2: the round above every surviving fence/state/generation number. Also fence out
-    /// any expired mounts as part of the disaster-recovery pass (liveness cleanup; the returned
-    /// classification counts are not needed for the round mint — graduation paces on rounds, not acks).
+    /// Numbering, part 2: the round above every surviving fence/state/generation number (also the
+    /// condemn_round stamped on the full-traversal condemns seeded into the runs just below).
+    const uint64_t round = std::max({max_fence_round, state.round, max_gen}) + 1;
+
+    /// Retired-in-snapshot seeding (T3): write each full-traversal condemn into its shard's baseline RUN
+    /// as a kCondemned sentinel row, so the next regular round settles it FROM THE RUN (the fold no longer
+    /// takes a separate retired-set input). This rides the fold's own fresh-condemn path: a synthetic
+    /// +edge/-edge pair at the reserved source id nets the blob to in-degree 0 (no surviving edge — the
+    /// pair cancels), and a head_blob replaying the already-captured exact token/size mints the kCondemned
+    /// row at `round`. The condemn set is disjoint from edge-bearing blobs, so no real edge is perturbed.
+    for (uint64_t shard = 0; shard < gc_shards; ++shard)
+    {
+        if (zero_condemned[shard].empty())
+            continue;
+        std::unordered_map<UInt128, HeadResult, UInt128Hash> seeded;
+        std::vector<BlobDelta> synth;
+        synth.reserve(zero_condemned[shard].size() * 2);
+        for (const RetiredEntry & e : zero_condemned[shard])
+        {
+            seeded.emplace(e.hash, HeadResult{.exists = true, .size = e.size, .token = e.token, .attributes = {}});
+            synth.push_back(BlobDelta{.blob_hash = e.hash, .source_id = UInt128{1}, .remove = false});
+            synth.push_back(BlobDelta{.blob_hash = e.hash, .source_id = UInt128{1}, .remove = true});
+        }
+        const auto seed_head = [&seeded](const UInt128 & h) -> std::optional<HeadResult>
+        {
+            const auto it = seeded.find(h);
+            return it == seeded.end() ? std::nullopt : std::optional<HeadResult>(it->second);
+        };
+        std::vector<RunRef> out;
+        foldDeltasIntoGeneration(backend, layout, prior_runs[shard], generation, ++attempt_of[shard],
+                                 shard, std::move(synth), out,
+                                 /*current_round*/0, /*condemn_round*/round, seed_head,
+                                 /*peek_head*/{}, /*out_retired*/nullptr, /*suppress_destructive*/false);
+        prior_runs[shard] = std::move(out);
+    }
+
+    for (uint64_t shard = 0; shard < gc_shards; ++shard)
+        for (const RunRef & r : prior_runs[shard])
+            seal.blob_target_runs.push_back(r);
+
+    /// Also fence out any expired mounts as part of the disaster-recovery pass (liveness cleanup; the
+    /// returned classification counts are not needed for the round mint — graduation paces on rounds).
     const uint64_t skew_margin_ms =
         static_cast<uint64_t>(store->poolConfig().mount_lease_ttl_ms.count()) / 2;
     computeHeartbeatFloor(backend, layout, now_ms_fn(), skew_margin_ms);
-    const uint64_t round = std::max({max_fence_round, state.round, max_gen}) + 1;
 
     /// Seal (deterministic artifact) + the single state CAS. attempt = the max per-shard attempt
     /// (>= 1 so the seal key is stable даже for an empty universe).

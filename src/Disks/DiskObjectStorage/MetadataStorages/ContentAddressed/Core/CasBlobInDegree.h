@@ -50,7 +50,11 @@ CondemnedRow decodeCondemnedRow(std::string_view payload);    // throws CORRUPTE
 
 /// Typed open (spec §2.1): validates kind == SourceEdge and key_schema == kSourceEdgeKeySchema,
 /// fails closed otherwise. ALL source-edge run readers go through this.
+///   - borrowed-memory overload: zero-copy over caller-owned bytes.
+///   - streaming overload: opens the write-once run object off `backend` at O(one block) resident
+///     memory (the fold/preview readers use this; the returned reader is move-constructed).
 RunFileReader openSourceEdgeRun(std::string_view bytes);
+RunFileReader openSourceEdgeRun(Backend & backend, const String & key);
 
 /// Write-once for a DETERMINISTIC artifact (same inputs => byte-identical bytes): the blob in-degree
 /// runs AND the fold/completion seals. `putIfAbsent`; on a `PreconditionFailed` the key is already
@@ -112,16 +116,26 @@ struct RetiredMergeResult
     std::vector<ReplacedEntry> replaced;  /// re-condemned CURRENT tokens that superseded a stale entry (resurrect-replaced); caller emits blob_retire_replaced
 };
 
-/// Three-cursor extension: `prior_retired` (Blob entries ONLY, sorted by hash ascending) rides the same
-/// per-blob close-out as the two existing cursors. Settlement rules, in order, per entry for blob `h`
-/// with post-merge in-degree `d`:
+/// Two-cursor merge (retired-in-snapshot, spec §2.1/§3): the prior generation's `kCondemned` rows RIDE
+/// the source-edge run itself at the zero-sentinel key (`source_id = 0`), so there is no separate
+/// `prior_retired` cursor — the prior run IS the retired input. `PriorEdgeCursor` decodes each sentinel
+/// `kCondemned` row and hands it to the per-blob close-out (in ascending hash order, exactly the order
+/// the old sorted vector had). Settlement rules, in order, per condemned row for blob `h` with post-merge
+/// in-degree `d`:
 ///   delete_pending (prior pass)                -> redelete if d = 0 (the caller executes the exact-token
 ///                                                 delete pre-CAS and the entry drops); d > 0 for a pending
-///                                                 entry is structurally impossible — spared + loud log;
+///                                                 entry is structurally impossible but reachable under
+///                                                 races (T1 TLA finding) — spared + a LOUD log, never a
+///                                                 fail-closed abort;
 ///   d > 0                                       -> spared (recovery wins even past the floor);
 ///   d = 0 and condemn_round < current_round     -> graduated: REPUBLISHED as delete_pending (two-phase
 ///                                                 graduation) — deleted the NEXT pass;
 ///   d = 0 otherwise                             -> still_retired, carried byte-unchanged.
+/// A carried `kCondemned` row is SETTLEMENT-ONLY: it never sets the blob's `cur_touched` bit, so a
+/// generation that only carries the row emits no zero-marker and pays no `peek_head` HEAD. The surviving
+/// `still_retired` entries are re-emitted as `kCondemned` sentinel rows into the OUTPUT run (one sentinel
+/// per blob, emitted before the blob's edges since the sentinel key sorts first), so the next generation
+/// reads them back — `still_retired` mirrors exactly those rows, in the same order.
 /// CLAMP SUPPRESSION (2026-07-03, found live: 31 dangling in the night soak): when the pass's fold
 /// CLAMPED any shard, landed-before-cut events may sit UNFOLDED behind the clamp — the lemma "landed
 /// before the cut => folded before graduation" does not hold, so graduating or executing pending
@@ -150,7 +164,6 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
                               uint64_t new_generation, uint64_t attempt,
                               uint64_t shard,
                               std::vector<BlobDelta> scattered, std::vector<RunRef> & out_runs,
-                              const std::vector<RetiredEntry> & prior_retired = {},
                               uint64_t current_round = 0, uint64_t condemn_round = 0,
                               const std::function<std::optional<HeadResult>(const UInt128 &)> & head_blob = {},
                               const std::function<std::optional<HeadResult>(const UInt128 &)> & peek_head = {},

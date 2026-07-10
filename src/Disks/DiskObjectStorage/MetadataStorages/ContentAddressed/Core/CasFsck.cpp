@@ -291,7 +291,10 @@ void runFsckImpl(Store & store, bool detail, const FsckProgress & on_progress, c
                 for (const RunRef & run : decodeFoldSeal(seal_got->bytes).blob_target_runs)
                 {
                     checkDeadline(deadline, "reading gc snapshot runs");
-                    RunFileReader reader(backend, run.key);
+                    /// Typed open (spec §2.1): every source-edge run reader goes through openSourceEdgeRun.
+                    /// Fsck only keys off the row's hash (via parseSrcEdgeRunKey), so a hash carried by a
+                    /// `kCondemned` sentinel row now also correctly marks the blob "known to GC".
+                    RunFileReader reader = openSourceEdgeRun(backend, run.key);
                     String key;
                     String payload;
                     while (reader.next(key, payload))
