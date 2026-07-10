@@ -418,8 +418,9 @@ TEST(CasBuild, PutBlobResurrectVanishedReUploadsHeldBody)
     /// 2. Condemn (Blob, hash(X), t0) in the retire view.
     DB::Cas::Layout layout("p");
     const String blob_key = layout.blobKey(id);
-    injectRetire(*b, layout, /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
-        {RetiredEntry{.kind = ObjectKind::Blob, .hash = u128Of("payload-X"), .token = t0, .size = 9}});
+    /// v3: the writer's condemned decision is a per-hash meta point-read (not the retire-view). Condemn the
+    /// meta; t0 stays as the body token the delete-hook below fires with.
+    condemnMeta(*b, layout, u128Of("payload-X"), /*condemn_round*/ 1);
 
     /// 3. Wrap the backend so the NEXT head(blob_key) returns the (present) result and THEN fires
     ///    deleteExact(blob_key, t0) exactly once — GC's delete in the HEAD->GET window. Open a FRESH
@@ -571,8 +572,8 @@ TEST(CasBuild, PutBlobCondemnedDedupPresentNeverGetsTheDyingObject)
     /// 2. Condemn (Blob, hash(Z), t0) — object still PRESENT (GC condemned but not yet deleted).
     DB::Cas::Layout layout("p");
     const String blob_key = layout.blobKey(id);
-    injectRetire(*b, layout, /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
-        {RetiredEntry{.kind = ObjectKind::Blob, .hash = u128Of("payload-Z"), .token = t0, .size = 9}});
+    /// v3: condemn via the per-hash meta (the writer's freshness point-read), object still PRESENT.
+    condemnMeta(*b, layout, u128Of("payload-Z"), /*condemn_round*/ 1);
     ASSERT_TRUE(b->head(blob_key).exists) << "blob must be PRESENT for the condemned-present path";
 
     /// 3. Open a fresh Store over a GET-counting wrapper.
