@@ -1816,3 +1816,24 @@ infra/measurement gaps (not CA defects — all had dangling=0 + agreement):
 - Relatedly (caused the FIRST wrong root cause): manifest `object_hash`/`manifest_ref_instance` in the event
   log is NOT namespace-qualified — "1:308:1" collides across tables. FIX: qualify with namespace (or add a
   manifest_id column). Both extend the INTROSPECTION-1/2 audit-completeness line.
+
+- **FIX LANDED (c1485f52a29):** activeManifestKeys now protects pending removals of BOTH owner kinds
+  (dropped the Precommit-only condition) + the orphan sweep emits a ManifestDelete audit event per
+  deletion (INTROSPECTION-3). RED-proof: reverting the one condition fails the new regression test
+  `CasOrphanManifestSweep.PendingCommittedRemovalBodyIsSkipped` (body deleted); GREEN with the fix.
+  Full Ca*/Cas* sweep clean (only the 2 known flakes). Fresh-model consult CONFIRMED root cause + fix
+  complete + no second no-event deleter + REBUILD FORCE as the unwedge.
+- **TLA+ GATE — BACKLOGGED (attempted, backed out clean):** the model-faithful fix is adding
+  `~HasUnfoldedRemoval(m)` to GOrphanSweep's honest guard + an invariant. BUT the invariant must scope to
+  COMMITTED-owner removals only — the code clamps solely on committed removals ("a removed precommit whose
+  body is absent emitted no edges — nothing to mirror"), so `HasUnfoldedRemoval => mBody` (consult) AND
+  `(HasUnfoldedRemoval /\ everEdged) => mBody` (my refinement) BOTH over-catch honest missing-body /
+  abandoned-precommit removals (verified: stage4 counterexample = WStageManifest→WPrecommitAdd→
+  WAbandonPrecommit under EnableMissingBody=TRUE). Correct scoping needs the journal event to carry the
+  removed owner_kind (Committed vs Precommit) — the model's event `.old` is a manifest-id set that drops
+  it. Task: add committed-vs-precommit to the journal event (or a `HasUnfoldedCommittedRemoval` predicate),
+  then invariant `HasUnfoldedCommittedRemoval(m) => mBody[m]` + a dedicated `SabotageSweepUnfoldedRemoval`
+  constant (propagate FALSE to all ~47 cfgs, one negative cfg TRUE). A focused model session, not tail-work.
+- **REMAINING VALIDATION:** (a) rebuild clickhouse with the fix + remount + re-run the 4h exit soak — a
+  NEW wedge must NOT form (the real end-to-end gate; the stand that repro'd ran the pre-fix binary at soak
+  launch); (b) unwedge/validate REBUILD FORCE on the live stand (after its dropped-table refs settle).
