@@ -3181,6 +3181,12 @@ MergeTreeData::DataPartsVector MergeTreeData::grabOldParts(bool force)
         {
             res.emplace_back(*it_to_delete);
             modifyPartState(it_to_delete, DataPartState::Deleting);
+
+            /// Clear caches while storage is definitely alive so deferred part destruction
+            /// does not have to access storage through a dangling reference.
+            (*it_to_delete)->clearCaches();
+            for (const auto & [_, proj_part] : (*it_to_delete)->getProjectionParts())
+                proj_part->clearCaches();
         }
     }
 
@@ -3723,6 +3729,9 @@ void MergeTreeData::dropAllData()
             continue;
         }
         modifyPartState(it, DataPartState::Deleting);
+        (*it)->clearCaches();
+        for (const auto & [_, proj_part] : (*it)->getProjectionParts())
+            proj_part->clearCaches();
         all_parts.push_back(*it);
     }
     if (skipped_parts > 0)
@@ -5632,6 +5641,9 @@ void MergeTreeData::swapActivePart(MergeTreeData::DataPartPtr part_copy, DataPar
             }
 
             modifyPartState(original_active_part, DataPartState::DeleteOnDestroy);
+            original_active_part->clearCaches();
+            for (const auto & [_, proj_part] : original_active_part->getProjectionParts())
+                proj_part->clearCaches();
             LOG_TEST(log, "swapActivePart: removing {} from data_parts_indexes", (*active_part_it)->getNameWithState());
             data_parts_indexes.erase(active_part_it);
 
