@@ -74,7 +74,7 @@ Add one row value at the **same sentinel key** `(blob_hash, source_id = 0)`:
   `token_type` persists `Token::type` (`Core/CasToken.h`: `ETag = 1`, `Generation = 2`,
   `Emulated = 3`) — `deleteExact` consumes a full `Token{value, type}`, and the current durable
   `RetiredEntryProto` stores both `token_value` and `token_type`; dropping the type would be lossy
-  (review finding, 2026-07-11). Decode fails closed (`CORRUPTED_DATA`) on an unknown `token_type`
+  (review finding, 2026-07-10). Decode fails closed (`CORRUPTED_DATA`) on an unknown `token_type`
   or a payload length that does not match the declared `token_len`.
 
 Rules:
@@ -85,15 +85,29 @@ Rules:
 - The sentinel key sorts **before** all real edges of its blob (`source_id 0` < any real id), so
   the streaming cursor sees the carried condemned state when it opens a blob and settles at
   blob close-out — the adjacency the 2-cursor merge needs.
+- **The sentinel row is settlement-only — it never counts as a "touch" (review finding,
+  2026-07-10).** The current merge keys zero-marker emission and the resurrect-supersede
+  `peek_head` probe on the blob being *touched* this pass (`cur_touched`,
+  `Core/CasBlobInDegree.cpp:230`) — touched means real edges/deltas visited it. A carried
+  `kCondemned` row opens the blob and supplies retired state but MUST NOT set the touch bit:
+  otherwise every carried condemned blob would emit a spurious zero-marker and pay one
+  `peek_head` HEAD **per carried entry per fold** — an op-count regression and a behavior change
+  (supersede probing frequency). Supersede detection stays exactly today's: only for entries whose
+  blob was touched by real edges/deltas at net in-degree 0.
+- **`source_id = 0` is a reserved key (review finding, 2026-07-10):** `sourceEdgeId`
+  (`Core/CasBlobInDegree.cpp:101`) returns an unchecked `CityHash128`; a real edge hashing to 0
+  (probability 2⁻¹²⁸) would collide with the sentinel. Fail closed: `sourceEdgeId` throws
+  `LOGICAL_ERROR` on a zero result, and delta producers reject `source_id == 0` — the check
+  documents the reservation and never fires in practice.
 - `RetiredEntry.kind` is dropped (`ObjectKind` has only `Blob`; manifests go through the separate
   owner-removal sweep, never the retired pipeline). Ordering is by `hash` (the run's native key
   order).
-- Run header `key_schema` bumps `0 → 1` **for `RunKind::BlobDelta`** (`key_schema` is a per-kind
+- Run header `key_schema` bumps `0 → 1` **for `RunKind::SourceEdge`** (`key_schema` is a per-kind
   namespace — "fixed per kind; meaning owned by the producer"; the value `1` is already used by a
-  different `RunKind`, which is fine). **New requirement (review finding, 2026-07-11): the current
+  different `RunKind`, which is fine). **New requirement (review finding, 2026-07-10): the current
   readers do not validate `key_schema` at all** — `RunFileReader` only exposes `keySchema()`, and
   `zeroInDegree` / `inDegreeInGeneration` / the prior-edge cursor never check it. This spec
-  mandates a typed open path for source-edge runs (validate `kind == BlobDelta`,
+  mandates a typed open path for source-edge runs (validate `kind == SourceEdge`,
   `key_schema == 1`, and per-row payload lengths; anything else → `CORRUPTED_DATA` /
   `NOT_IMPLEMENTED` fail-closed) used by **every** consumer: the merge cursor, `zeroInDegree`,
   `inDegreeInGeneration`, dryrun, `fsck`, `ca-inspect`. No compat shim for `key_schema = 0` runs.
@@ -113,11 +127,19 @@ struct CondemnedSummary
 ```
 
 Derived **from the durable run bytes** while writing (or adopting) each shard's run, so it is a
-pure function of the sealed content — the seal stays a deterministic artifact (§4). Consumers:
+pure function of the sealed content — the seal stays a deterministic artifact (§4).
+
+**The map is TOTAL over `gc_shards` in every newly written seal (review finding, 2026-07-10):**
+pure ref-carry shards (`carryParentRefs`, `CasGc.cpp:1069` — parent `RunRef`s copied verbatim with
+zero run I/O) copy the parent seal's `CondemnedSummary` entry verbatim too (pure carry is only
+legal when there is nothing to settle, so the carried entry is the explicit zero/none summary).
+"Missing summary" is therefore always an integrity signal for the fail-closed rule below — an
+implementation must never treat absence as zero, and idle pools are never forced to fold just to
+mint a summary. Consumers:
 
 - `graduationDue` = `pending_total > 0 || oldest_nonpending_condemn_round < current_round`
   over the summaries — **zero I/O** (the seal is already read for `changedShardCount`).
-  **Fail-closed pre-defer rule preserved (review finding, 2026-07-11):** today a missing retired
+  **Fail-closed pre-defer rule preserved (review finding, 2026-07-10):** today a missing retired
   list makes `graduationDue` return `true` ("force a fold so the round's fail-closed path surfaces
   it, never silently defer", `CasGc.cpp:1649-1652`). The seal-summary version keeps the same
   posture: for `snap_generation > 0`, a missing or undecodable adopted seal — or a seal without a
@@ -202,7 +224,7 @@ attempt with new keys. Consequently:
   events, and outcome tallies — run/meta/event divergence inside one attempt is structurally
   impossible. (Independently, `BlobMeta` carries no token — `{state, condemn_round, size}` — so
   condemned-meta content is observation-independent anyway.)
-  **Scope (review finding, 2026-07-11):** this claim is per-attempt, not per-adopted-round. Meta
+  **Scope (review finding, 2026-07-10):** this claim is per-attempt, not per-adopted-round. Meta
   writes complete BEFORE the round's `gc/state` CAS by design (`CasGc.cpp:508-512` — the writer's
   point-read gate must see condemns no later than the ledger), so a **deposed** leader leaves
   advisory `.meta`/event effects from an unadopted attempt — exactly as it does today; this
@@ -270,7 +292,7 @@ Gate is green (invariants hold; every sabotage flips red) **before** implementat
 ## 7. Testing {#testing}
 
 - **gtests** (`CasBlobInDegree` suites): condemned rows in the merged stream (carry, settle order,
-  zero-marker subsumption, absent-at-condemn), **`Token{value, type}` round-trip through the
+  zero-marker subsumption, absent-at-condemn, **carried-sentinel-is-not-a-touch: a generation that only carries a kCondemned row emits no zero-marker and performs no `peek_head`**), **`Token{value, type}` round-trip through the
   `kCondemned` row for all three `TokenType`s + fail-closed on an unknown `token_type` and on a
   truncated payload**, deterministic-adopt collision (byte-identical resend adopts; divergent
   bytes throw), seal summary derivation, **the typed open path rejecting wrong
