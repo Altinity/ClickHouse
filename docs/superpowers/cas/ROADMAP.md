@@ -73,6 +73,7 @@ See [`04-gc-protocol.md`](04-gc-protocol.md) for full detail.
 
 | Item | Status | Notes |
 |------|--------|-------|
+| **Deposed-leader stray-Clean `clearSparedMeta` → live-blob delete** | **TODO (HARD) — real bug, 2026-07-11** | A deposed leader's pre-CAS `clearSparedMeta` (spare verdict, completed before the `gc/state` CAS, `CasGc.cpp:106-113`/`:415`/`:513`) leaves a durable stray-**Clean** meta over a still-`delete_pending` blob → a writer dedup-reuses the condemned exact token → the pending exact-token redelete deletes the live reuse (INV_NO_LOSS). Pre-existing in v3; low-prob (concurrent leaders + reuse race), high-impact (data loss). TLA witness `CaRetiredInRunFoldAbortWitness` reproduces it (RED); add-only advisory meta is green. Fix candidates + full trace: [`reports/2026-07-11-cas-deposed-leader-stray-clean-meta.md`](../reports/2026-07-11-cas-deposed-leader-stray-clean-meta.md). Needs a brainstorm + its own gate |
 | GC leader election, lease, and advisory heartbeat | **DONE** | Lease prevents concurrent leaders; heartbeat (B160) reduces stale-lease wait |
 | One-pass ack-floor round (heartbeat floor → three-cursor merge → single `gc/state` CAS) | **DONE** | On `cas-gc-ack-floor-fence`; replaces fence+recheck; O(delta)+O(servers) per round; soak validation TODO. See [`04-gc-protocol.md §gc-round`](04-gc-protocol.md) |
 | Merged heartbeat (mount lease ∪ build watermark ∪ GC ack in one beat) | **DONE** | `WatermarkKeeper` + `CAWM` object removed; `MountLease` carries `min_active`, `observed_gc_round`, `gc_fenced`; −1 PUT/beat |
