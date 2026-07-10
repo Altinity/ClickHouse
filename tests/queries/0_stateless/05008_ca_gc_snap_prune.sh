@@ -2,14 +2,18 @@
 # Tags: no-fasttest
 # ^ content_addressed is an object-storage metadata type; keep it off the minimal fasttest image.
 
-# P9 end-to-end: a content-addressed (CA) GC round that physically deletes objects also FORGETS them
-# from the in-degree snapshot in the same round (the cascade prune), surfaced as `forgotten_on_delete`
-# in `system.content_addressed_garbage_collection_log`. We build a named inline CA disk, create
-# garbage (INSERT then TRUNCATE), then run synchronous GC rounds in a retry loop until a round reports
-# a physical delete — deletion only happens once the durable watermark floor (advanced by the
-# background renewer) passes the builds, so we poll rather than assume a fixed round count. Once a
-# delete is observed we assert the same rounds forgot at least as many nodes (every Deleted/Absent
-# node is forgotten), proving the prune fires end-to-end through the real SystemLog path.
+# End-to-end: a content-addressed (CA) GC round physically deletes unreferenced objects ONLY through
+# the ack-floor retired-cursor pipeline — a blob is condemned (stage 1), floor-passed / republished as
+# `delete_pending` (stage 2), then exact-token deleted (stage 3), surfaced as `entries_redeleted` /
+# `objects_deleted` in `system.content_addressed_garbage_collection_log`. We build a named inline CA
+# disk, create garbage (INSERT then TRUNCATE), then run synchronous GC rounds in a retry loop until a
+# round reports a physical delete — deletion only happens once the durable watermark floor (advanced by
+# the background renewer) passes the builds, so we poll rather than assume a fixed round count. Once a
+# delete is observed we assert every physical delete went through stage 3 (`entries_redeleted >=
+# objects_deleted`): the redelete loop is the SOLE content-delete site and counts one redelete per
+# attempt (Deleted/Absent/Replaced), so this inequality is a structural identity of the pipeline and an
+# ad-hoc delete that bypassed the graduate->redelete path would break it. This proves deletion fires
+# end-to-end through the real SystemLog path.
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
@@ -58,12 +62,14 @@ for _ in $(seq 1 40); do
     sleep 0.5
 done
 
-# A physical delete happened, and the deleting rounds forgot at least as many nodes as they deleted
-# (every Deleted/Absent node is pruned from `known`). Expect: "deleted>0 forgotten>=deleted" => 1 1.
+# A physical delete happened, and every physical delete went through stage 3 of the retired-cursor
+# pipeline (`entries_redeleted >= objects_deleted`, a structural identity: the redelete loop is the sole
+# content-delete site and increments `redeleted` once per attempt). Expect: "deleted>0 redeleted>=deleted"
+# => 1 1.
 $CLIENT -q "
 SELECT
     sum(objects_deleted) > 0,
-    sum(forgotten_on_delete) >= sum(objects_deleted)
+    sum(entries_redeleted) >= sum(objects_deleted)
 FROM system.content_addressed_garbage_collection_log
 WHERE disk_name LIKE '%${DISK}%' AND event_type = 'Finish'"
 

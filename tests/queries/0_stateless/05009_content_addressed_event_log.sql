@@ -1,11 +1,12 @@
 -- Tags: no-fasttest
 -- ^ content_addressed is an object-storage metadata type; keep it off the minimal fasttest image.
 
--- Default-off contract for `system.content_addressed_log`: the per-event content-addressed audit log is
--- opt-in (it mirrors `system.content_addressed_garbage_collection_log`). It is only created and populated
--- when a `<content_addressed_log>` config section is present. The stateless test config does not enable it,
--- so even after we exercise a content-addressed disk end-to-end (INSERT, OPTIMIZE, DROP), the table must not
--- exist and querying it must fail with `UNKNOWN_TABLE` — no log is created or written behind our back.
+-- Default-ON contract for `system.content_addressed_log`: the per-event content-addressed audit log is
+-- enabled by default. `programs/server/config.xml` ships a `<content_addressed_log>` section because the
+-- CAS disk feature is experimental and this audit log is its primary forensic instrument (it costs
+-- nothing when no CAS disk is configured — events are emitted only by content-addressed disks). After we
+-- exercise a content-addressed disk end-to-end (INSERT, OPTIMIZE), the table exists and carries this
+-- disk's write-path events.
 
 DROP TABLE IF EXISTS t_cas_event_log;
 
@@ -19,22 +20,25 @@ SETTINGS disk = disk(
     name = '05009_content_addressed_event_log',
     path = '05009_content_addressed_event_log_pool/');
 
--- Exercise the content-addressed write/merge path: this is exactly the work that, when the log is enabled,
--- would emit put/reuse/ref events. With the log unconfigured, none of it may conjure the table into being.
+-- Exercise the content-addressed write/merge path: this is exactly the work that emits put/ref events.
 INSERT INTO t_cas_event_log SELECT number, toString(number % 7) FROM numbers(1000);
 INSERT INTO t_cas_event_log SELECT number, toString(number % 7) FROM numbers(1000, 1000);
 OPTIMIZE TABLE t_cas_event_log FINAL;
 
 SELECT 'rows', count() FROM t_cas_event_log;
 
--- Flushing the (unconfigured) log is a harmless no-op and must not create the table either.
+-- Make the buffered events durable before we read them back.
 SYSTEM FLUSH LOGS content_addressed_log;
 
--- Default-off assertion #1: the table simply does not exist.
+-- Default-on assertion #1: the table exists (the config ships the section).
 EXISTS TABLE system.content_addressed_log;
 
--- Default-off assertion #2: querying it surfaces UNKNOWN_TABLE rather than an empty result set.
-SELECT count() FROM system.content_addressed_log; -- { serverError UNKNOWN_TABLE }
+-- Default-on assertion #2: our disk's write path emitted at least one `blob_put` event. Filter by
+-- disk_name so parallel tests sharing this system table (e.g. the lane's own content_addressed_s3 disk)
+-- cannot perturb the result.
+SELECT 'has_blob_put', count() > 0
+FROM system.content_addressed_log
+WHERE disk_name = '05009_content_addressed_event_log' AND event_type = 'blob_put';
 
 DROP TABLE t_cas_event_log;
 SELECT 'ok';
