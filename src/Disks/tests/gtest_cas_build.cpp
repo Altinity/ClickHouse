@@ -27,13 +27,17 @@ extern const int CORRUPTED_DATA;
 }
 
 using namespace DB::Cas;
+using DB::Cas::tests::condemnMeta;
 using DB::Cas::tests::expectThrowsCode;
 using DB::Cas::tests::fenceNamespace;
 using DB::Cas::tests::idOf;
 using DB::Cas::tests::injectRetire;
+using DB::Cas::tests::loadMetaForTest;
 using DB::Cas::tests::shardOfForTest;
 using DB::Cas::tests::streamingHexOf;
 using DB::Cas::tests::u128Of;
+using DB::Cas::tests::writeMetaClean;
+using DB::Cas::tests::writeRawBlobBody;
 
 namespace
 {
@@ -214,6 +218,104 @@ TEST(CasBuild, PutBlobDedupSecondWriterAdopts)
     EXPECT_EQ(ref_b.id, ref_a.id);
     /// A's incarnation survives — the second writer adopts, nothing was overwritten.
     EXPECT_EQ(b->head(s->layout().blobKey(ref_a.id)).token, token_a);
+}
+
+/// Task 3 (spec §meta-protocols v3): the writer's dedup gate no longer consults the RetireView for the
+/// condemned decision — it point-reads the per-hash freshness meta instead. A fresh (absent -> present)
+/// upload must WRITE that meta as Clean so future point-readers (other writers, GC) can see it.
+TEST(CasBuild, PutBlobFreshUploadWritesCleanMeta)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = openStore(b);
+    auto build = s->startBuild({});
+
+    const String payload = "fresh-meta-payload";
+    auto ref = build->putBlob(idOf(payload), BlobSource::fromString(payload));
+    EXPECT_EQ(ref.size, payload.size());
+
+    const auto lm = loadMetaForTest(*b, s->layout(), u128Of(payload));
+    ASSERT_TRUE(lm.has_value()) << "a fresh upload must write a Clean meta descriptor (writer point-read protocol)";
+    EXPECT_EQ(lm->meta.state, MetaState::Clean);
+    EXPECT_EQ(lm->meta.size, payload.size());
+}
+
+/// The adopt decision is driven PURELY by the meta point-read — no RetireView is ever seeded in this
+/// test. A pre-existing body plus an independent Clean meta must be adopted (no putOverwrite/re-upload:
+/// the pre-seeded incarnation's token survives untouched), and the meta stays Clean.
+TEST(CasBuild, PutBlobAdoptsWhenMetaCleanNoRetireView)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = openStore(b);
+
+    const String payload = "adopt-meta-payload";
+    const UInt128 hash = u128Of(payload);
+    const BlobId id = idOf(payload);
+    const String blob_key = s->layout().blobKey(id);
+
+    /// Pre-seed a body big enough that observeAndAdmit's logical-size guard (hr.size - header_len)
+    /// does not underflow, plus an INDEPENDENT Clean meta — deliberately NOT via a real putBlob (so the
+    /// adopt decision below cannot be riding on THIS task's own fresh-upload meta write).
+    const uint64_t header_len = s->poolMeta().blob_header_len;
+    String raw_body(header_len, '\0');
+    raw_body += payload;
+    writeRawBlobBody(*b, s->layout(), hash, raw_body);
+    writeMetaClean(*b, s->layout(), hash, payload.size());
+    const Token t0 = b->head(blob_key).token;
+
+    /// Adopt must happen under a durable precommit edge (EDGE-BEFORE-OBSERVE), mirroring
+    /// PutBlobDedupSecondWriterAdopts above.
+    const RootNamespace ns{"srv/tbl"};
+    auto build = startBuildFor(s, ns, "ref_adopt");
+    const ManifestId manifest_id = build->stageManifest({blobManifestEntry("data.bin", payload)});
+    build->precommitAdd(ns, "ref_adopt", manifest_id);
+    auto ref = build->putBlob(id, BlobSource::fromString(payload));
+
+    EXPECT_EQ(ref.id, id);
+    /// Adopted: the pre-seeded incarnation survives untouched — no putOverwrite/re-upload happened.
+    EXPECT_EQ(b->head(blob_key).token, t0);
+
+    const auto lm = loadMetaForTest(*b, s->layout(), hash);
+    ASSERT_TRUE(lm.has_value());
+    EXPECT_EQ(lm->meta.state, MetaState::Clean) << "an adopt must leave the meta Clean";
+}
+
+/// The resurrect decision (displace a condemned body) is likewise driven PURELY by the meta point-read
+/// — again, no RetireView is seeded. A condemned meta must cause putBlob to displace the body (a fresh
+/// token, the old one never returns — INV-NO-RETURN, unchanged body mechanics) AND flip the meta back
+/// to Clean.
+TEST(CasBuild, PutBlobResurrectsWhenMetaCondemned)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = openStore(b);
+
+    const String payload = "resurrect-meta-payload";
+    const UInt128 hash = u128Of(payload);
+    const BlobId id = idOf(payload);
+    const String blob_key = s->layout().blobKey(id);
+
+    const uint64_t header_len = s->poolMeta().blob_header_len;
+    String raw_body(header_len, '\0');
+    raw_body += payload;
+    writeRawBlobBody(*b, s->layout(), hash, raw_body);
+    writeMetaClean(*b, s->layout(), hash, payload.size());
+    condemnMeta(*b, s->layout(), hash, /*condemn_round*/ 1);
+    const Token t0 = b->head(blob_key).token;
+
+    /// NO retire-view seeding anywhere: the resurrect must be decided purely from the meta point-read.
+    auto build = s->startBuild({});
+    auto ref = build->putBlob(id, BlobSource::fromString(payload));
+    EXPECT_EQ(ref.id, id);
+
+    /// Resurrected: the condemned incarnation was displaced by a fresh one.
+    const HeadResult hr = b->head(blob_key);
+    ASSERT_TRUE(hr.exists);
+    EXPECT_NE(hr.token, t0) << "a condemned incarnation must be displaced by a fresh one (resurrect)";
+    EXPECT_EQ(b->deleteExact(blob_key, t0).kind, DeleteOutcome::Kind::TokenMismatch)
+        << "the condemned token must never return (INV-NO-RETURN)";
+
+    const auto lm = loadMetaForTest(*b, s->layout(), hash);
+    ASSERT_TRUE(lm.has_value());
+    EXPECT_EQ(lm->meta.state, MetaState::Clean) << "a resurrect must flip the meta back to Clean";
 }
 
 TEST(CasBuild, PutBlobWrongSizeFailsClosed)

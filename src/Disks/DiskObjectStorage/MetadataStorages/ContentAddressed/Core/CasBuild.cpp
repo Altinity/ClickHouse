@@ -1,4 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobMeta.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEnvelope.h>
 #include <IO/HashingReadBuffer.h>
 #include <IO/ReadBufferFromMemory.h>
@@ -267,7 +268,13 @@ uint64_t Build::observeAndAdmit(ObjectKind kind, const UInt128 & hash, const Str
     const uint64_t logical_size = hr.size - header_len;
 
     const CasEventObjectKind ev_kind = toEventKind(kind);
-    if (store->retireView().isCondemnedToken(kind, hash, hr.token))
+
+    /// Task 3 (spec §meta-protocols v3): the condemned decision is now a per-hash META POINT-READ, not
+    /// the writer-side RetireView. `absent` meta means "not condemned" — GC always writes a `Condemned`
+    /// meta BEFORE it ever deletes a body, so an absent meta is exactly as live as a `Clean` one.
+    const auto lm = loadMeta(store->backend(), store->layout(), hash);
+    const bool condemned = lm && lm->meta.state == MetaState::Condemned;
+    if (condemned)
     {
         /// INV-1 (revival-from-source): the observed token is condemned — we must NOT read the dying
         /// object via backend().get. Throw ABORTED so the caller can re-upload from its OWN source bytes.
@@ -280,18 +287,26 @@ uint64_t Build::observeAndAdmit(ObjectKind kind, const UInt128 & hash, const Str
             e.object_kind = ev_kind;
             e.object_hash = u128ToHex(hash);
             e.token = hr.token.value;
-            e.round = store->retireView().round();
+            e.round = 0;   /// the round is no longer a writer concept (meta point-read replaces RetireView)
             e.outcome = "condemned";
-            e.reason = "observed token is condemned; caller must re-upload from source (INV-1)";
+            e.reason = "observed token is condemned (meta point-read); caller must re-upload from source (INV-1)";
         });
         throw Exception(ErrorCodes::ABORTED,
             "Build::observeAndAdmit: condemned token for {} — caller must re-upload from source bytes (INV-1)",
             key);
     }
 
+    /// `!lm`: no meta yet for this hash (a pre-existing blob from before this protocol, or a lost race
+    /// with a concurrent fresh-uploader's own meta write). Best-effort create it as Clean so future
+    /// point-readers (writers and GC) never have to fall back to a HEAD-only guess. A Conflict here just
+    /// means a racing writer already created it — both agree on the same Clean steady state.
+    if (!lm)
+        putMetaIfAbsent(store->backend(), store->layout(), hash,
+            BlobMeta{.state = MetaState::Clean, .condemn_round = 0, .size = logical_size});
+
     /// Adopt the current incarnation — free, no bytes moved.
-    /// B170: reuse ADOPTED an existing incarnation's token as NOT condemned (per this build's
-    /// retire-view). Was the CAREUSE adopt audit line. Token-join this against a later blob_delete
+    /// B170: reuse ADOPTED an existing incarnation's token as NOT condemned (per the meta point-read).
+    /// Was the CAREUSE adopt audit line. Token-join this against a later blob_delete
     /// of the same hash/token to pin a reuse-of-an-object-being-deleted race.
     EventEmitter{*store}.emit([&](CasEvent & e)
     {
@@ -299,9 +314,9 @@ uint64_t Build::observeAndAdmit(ObjectKind kind, const UInt128 & hash, const Str
         e.object_kind = ev_kind;
         e.object_hash = u128ToHex(hash);
         e.token = hr.token.value;
-        e.round = store->retireView().round();
+        e.round = 0;   /// the round is no longer a writer concept (meta point-read replaces RetireView)
         e.outcome = "adopt";
-        e.reason = "observed token not condemned; adopted the live incarnation (no bytes moved)";
+        e.reason = "observed token not condemned (meta point-read); adopted the live incarnation (no bytes moved)";
     });
     deps[{static_cast<uint8_t>(kind), hash}] =
         DepEntry{kind, hr.token, logical_size};
@@ -386,11 +401,44 @@ void Build::uploadFromSource(ObjectKind kind, const UInt128 & hash, const String
             e.object_kind = ev_kind;
             e.object_hash = u128ToHex(hash);
             e.token = tok.value;
-            e.round = store->retireView().round();
+            e.round = 0;   /// the round is no longer a writer concept (meta point-read replaces RetireView)
             e.outcome = "ok";
             e.reason = "uploadFromSource: fresh incarnation streamed from writer's own re-readable source (INV-1)";
             e.detail = {{"size", std::to_string(source.size)}, {"build_id", u128ToHex(build_id)}};
         });
+    };
+
+    /// Task 3 (spec §meta-protocols v3) meta write for the FRESH (absent -> present) upload cases: the
+    /// body just transitioned via If-None-Match, so the freshness meta is created as Clean.
+    /// `putMetaIfAbsent` — a Conflict just means a racing writer already created it (fine; both agree
+    /// on the same Clean steady state).
+    auto writeFreshMetaClean = [&]()
+    {
+        putMetaIfAbsent(store->backend(), store->layout(), hash,
+            BlobMeta{.state = MetaState::Clean, .condemn_round = 0, .size = source.size});
+    };
+
+    /// Meta write for the RESURRECT (condemned-displacement) case: flip the now-stale Condemned meta
+    /// back to Clean now that a live incarnation has displaced the condemned body. `lm_before` is the
+    /// point-read taken just before the condemned decision — its etag is the CAS precondition. Bounded
+    /// retry on a racing meta writer (another resurrect, or GC re-condemning); an absent meta (raced
+    /// away between the point-read and here) falls back to putMetaIfAbsent. Best-effort: the body's
+    /// incarnation_tag + exact-token delete are already the safety core — this meta write is only a
+    /// freshness marker for the NEXT point-reader.
+    auto writeResurrectMetaClean = [&](std::optional<LoadedMeta> lm_before)
+    {
+        const BlobMeta clean{.state = MetaState::Clean, .condemn_round = 0, .size = source.size};
+        constexpr int max_meta_attempts = 8;
+        for (int attempt = 0; attempt < max_meta_attempts; ++attempt)
+        {
+            const CasResult res = lm_before
+                ? casMeta(store->backend(), store->layout(), hash, lm_before->etag, clean)
+                : putMetaIfAbsent(store->backend(), store->layout(), hash, clean);
+            if (res.outcome == CasOutcome::Committed)
+                return;
+            lm_before = loadMeta(store->backend(), store->layout(), hash);
+        }
+        /// Exhausted retries: leave the meta as-is — best-effort (a later writer/GC pass reconciles it).
     };
 
     /// Stream header + payload into a fresh putIfAbsentStream sink WITHOUT materializing the whole blob.
@@ -419,6 +467,7 @@ void Build::uploadFromSource(ObjectKind kind, const UInt128 & hash, const String
         if (res.outcome == PutOutcome::Done)
         {
             recordDoneAndEmit(res.token);
+            writeFreshMetaClean();
             return;
         }
     }
@@ -438,6 +487,7 @@ void Build::uploadFromSource(ObjectKind kind, const UInt128 & hash, const String
         if (res2.outcome == PutOutcome::Done)
         {
             recordDoneAndEmit(res2.token);
+            writeFreshMetaClean();
             return;
         }
         /// Still 412 after the vanish-and-retry: a racing writer re-created it. Adopt their token.
@@ -446,7 +496,12 @@ void Build::uploadFromSource(ObjectKind kind, const UInt128 & hash, const String
         return;
     }
 
-    if (!store->retireView().isCondemnedToken(kind, hash, hr.token))
+    /// Task 3 (spec §meta-protocols v3): the condemned decision is now a per-hash META POINT-READ, not
+    /// the writer-side RetireView. `lm` (and its etag) is reused below to flip a condemned meta back to
+    /// Clean once the resurrect displacement lands.
+    const auto lm = loadMeta(store->backend(), store->layout(), hash);
+    const bool condemned = lm && lm->meta.state == MetaState::Condemned;
+    if (!condemned)
     {
         /// Live (not condemned): adopt the current incarnation — free, no bytes moved.
         observeAndAdmit(kind, hash, key, hr);
@@ -476,6 +531,7 @@ void Build::uploadFromSource(ObjectKind kind, const UInt128 & hash, const String
     if (overwrite_res.outcome == PutOutcome::Done)
     {
         recordDoneAndEmit(overwrite_res.token);
+        writeResurrectMetaClean(lm);
         return;
     }
     /// PreconditionFailed from putOverwrite: either a racing writer displaced the condemned token
@@ -490,6 +546,7 @@ void Build::uploadFromSource(ObjectKind kind, const UInt128 & hash, const String
             if (res3.outcome == PutOutcome::Done)
             {
                 recordDoneAndEmit(res3.token);
+                writeFreshMetaClean();
                 return;
             }
             /// Still 412 — a racing writer re-created it. Observe their token.
@@ -583,7 +640,7 @@ Token Build::copyForwardFromCondemned(const UInt128 & hash, const String & key, 
                 e.object_kind = CasEventObjectKind::Blob;
                 e.object_hash = u128ToHex(hash);
                 e.token = res.token.value;
-                e.round = store->retireView().round();
+                e.round = 0;   /// the round is no longer a writer concept (meta point-read replaces RetireView)
                 e.outcome = "ok";
                 e.reason = "verified copy-forward of a condemned incarnation still referenced by a "
                            "committed source manifest (tokenless evidence dep; INV-1 exception)";
