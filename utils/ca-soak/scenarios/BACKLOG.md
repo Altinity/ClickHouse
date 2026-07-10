@@ -1764,3 +1764,27 @@ infra/measurement gaps (not CA defects — all had dangling=0 + agreement):
   (sourceEdgeId(id,path) is already recorded per blob edge; integrate into the three-cursor merge) —
   unwedges existing pools and removes the clamp class. Cross-pass note: with (W)+(F), a cross-pass
   rollback/re-own can still ABORT the writer cleanly (fail-closed, no wedge) — acceptable.
+
+- **ROOT CAUSE CORRECTED (2026-07-10, namespace-strict re-verification — SUPERSEDES the rollback/mf_cleanup
+  story above, which was built on a cross-namespace `manifest_ref_instance` string collision):** the real
+  mechanism is a missing symmetry in the ORPHAN-MANIFEST SWEEP. Evidence: manifest 1:308:1 (ns b3781ce3)
+  has ONE promote (20:24:45), a NORMAL table-DROP ref_drop (20:33:19), NO ns-scoped manifest_delete, NO
+  build_abort, NO re-publish — yet its body `/1/308/000001.proto` is GONE and the removal-fold clamps from
+  20:34:12. The deleter is `sweepManifestCursorPage` (CasOrphanManifestSweep.cpp — deletes bodies via
+  `deleteExact` and emits NO event). It deletes a body iff `prefixEligible` (build_seq < min_active — TRUE
+  for ANY promoted build: promote calls retireBuildSeq, so a committed manifest's build is watermark-dead)
+  AND the key is not in `activeManifestKeys(ns)`. `activeManifestKeys` protects committed owners via
+  `root.refs` and PENDING-PRECOMMIT removals (removal above the sealed fold cursor) — but has **NO branch
+  for PENDING-COMMITTED removals**. So in the window between `dropRef` (committed-removal appended, key
+  leaves root.refs) and the fold sealing that `-1` (delete-after-sealed-decrements), the sweep sees the
+  body eligible+inactive and deletes it → the removal-fold then finds the committed body missing → clamps
+  forever → pool-wide GC stop. NOT Phase-A (sweep predates it); requires a promoted-then-idle build + a
+  DROP + sweep-timing — hit by the soak's heavy DROP/chaos, missed by gc_shards=1 short unit runs.
+- **FIX (surgical, one symmetry):** in `activeManifestKeys` extend the pending-removal protection to ALL
+  owner kinds — a removal event whose `transition_version > sealedFoldCursor` keeps its `old_binding`'s
+  manifest body active regardless of `owner_kind` (drop the `== OwnerKind::Precommit` condition). The fold
+  reads that body to emit the `-1` next round; the sweep must not delete it until the `-1` is sealed. Then:
+  gtest [publish committed, drop, run sweep BEFORE the fold, assert body survives; fold; assert -1 sealed,
+  then sweep deletes]; TLA+ obligation (delete-after-sealed-decrements over committed removals). Unwedge of
+  the live/existing pools: `SYSTEM CONTENT ADDRESSED GC REBUILD` (rebuildBaseline) OR the fold recovery
+  variant (R) — still worth evaluating so an already-orphaned committed body doesn't wedge forever.
