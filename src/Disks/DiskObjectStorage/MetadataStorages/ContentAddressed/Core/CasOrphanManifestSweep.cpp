@@ -1,4 +1,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasOrphanManifestSweep.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEvent.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootShardCodec.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasServerRoot.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGenerationSeal.h>
@@ -156,31 +158,39 @@ std::set<String> activeManifestKeys(Store & store, const RootNamespace & ns)
         for (const auto & [name, ref] : root.refs)
             active.insert(layout.manifestKey(ManifestId{ns, ref.manifest_ref}));
 
-        /// Live precommit owners: a precommit new_binding whose manifest_ref is not later removed. The
-        /// journal is append-only (trimmed below the GC fold cursor only after sealing), so accumulate
-        /// adds and subtract removals by manifest_ref. A removal whose `-1` is NOT YET SEALED (its
-        /// transition_version is above the sealed fold cursor) is treated as STILL ACTIVE: the GC fold
-        /// must read the body to emit that `-1` next round (delete-after-sealed-decrements), so the sweep
-        /// must NOT delete it. This closes the B8 race where GC's own precommit reclaim appends a removal
-        /// in a round whose end-of-round sweep would otherwise delete the body before the `-1` folds.
+        /// Live precommit owners AND bodies still load-bearing for an UNSEALED removal `-1` (either
+        /// owner kind). The journal is append-only (trimmed below the GC fold cursor only after sealing),
+        /// so accumulate adds and subtract removals by manifest_ref. A removal whose `-1` is NOT YET
+        /// SEALED (its transition_version is above the sealed fold cursor) is treated as STILL ACTIVE:
+        /// the GC fold must read the body to emit that `-1` next round (delete-after-sealed-decrements),
+        /// so the sweep must NOT delete it. This holds for BOTH owner kinds:
+        ///   - PRECOMMIT: closes the B8 race where GC's own precommit reclaim appends a removal in a round
+        ///     whose end-of-round sweep would otherwise delete the body before the `-1` folds.
+        ///   - COMMITTED (2026-07-10 GC-WEDGE fix): a promoted build retires its build_seq, so its
+        ///     committed manifest's prefix is watermark-eligible; when its ref is dropped the key leaves
+        ///     root.refs, and WITHOUT this protection the sweep deletes the committed body in the window
+        ///     between dropRef and the fold sealing the `-1` — the removal-fold then clamps forever on the
+        ///     missing committed body ("edge-bearing committed body missing at removal-fold"), wedging ALL
+        ///     pool collection. A live committed owner is covered by root.refs above; this covers it from
+        ///     dropRef until the `-1` seals.
         const uint64_t cursor = sealedFoldCursor(store, ns, shard);
-        std::set<ManifestRef> precommit_live;
+        std::set<ManifestRef> journal_live;
         for (const RootOwnerEvent & e : root.journal)
         {
             const bool is_removal = e.old_binding
                 && (!e.new_binding || e.old_binding->manifest_ref != e.new_binding->manifest_ref);
             if (is_removal && e.transition_version <= cursor)
-                precommit_live.erase(e.old_binding->manifest_ref);
+                journal_live.erase(e.old_binding->manifest_ref);
             if (e.new_binding && e.new_binding->owner_kind == OwnerKind::Precommit)
-                precommit_live.insert(e.new_binding->manifest_ref);
-            /// A PENDING precommit removal (its `-1` not yet sealed) keeps the body load-bearing even when
-            /// the matching create-precommit was already folded and TRIMMED away — protect the body named
-            /// by the removal's old_binding directly so the GC fold can still read it to emit the `-1`.
-            if (is_removal && e.transition_version > cursor
-                && e.old_binding->owner_kind == OwnerKind::Precommit)
-                precommit_live.insert(e.old_binding->manifest_ref);
+                journal_live.insert(e.new_binding->manifest_ref);
+            /// A PENDING removal (its `-1` not yet sealed), of EITHER owner kind, keeps the body
+            /// load-bearing even when the matching activation was already folded and TRIMMED away —
+            /// protect the body named by the removal's old_binding directly so the GC fold can still read
+            /// it to emit the `-1`.
+            if (is_removal && e.transition_version > cursor)
+                journal_live.insert(e.old_binding->manifest_ref);
         }
-        for (const ManifestRef & ref : precommit_live)
+        for (const ManifestRef & ref : journal_live)
             active.insert(layout.manifestKey(ManifestId{ns, ref}));
     }
     return active;
@@ -316,6 +326,23 @@ ManifestSweepResult sweepManifestCursorPage(
             ++result.deleted;
         else
             ++result.skipped;
+
+        /// INTROSPECTION-3 (2026-07-10): EVERY manifest-body deletion must leave an audit row. The sweep
+        /// silently deleting bodies was the blocker in diagnosing the GC-WEDGE (a live committed body
+        /// vanished with no trace). object_hash is the full raw key (namespace-qualified — no cross-ns
+        /// manifest-ref-string collision, the other diagnosis pitfall).
+        EventEmitter{store}.emit([&](CasEvent & e)
+        {
+            e.type = CasEventType::ManifestDelete;
+            e.namespace_ = parsed->ns.string();
+            e.object_kind = CasEventObjectKind::Manifest;
+            e.object_hash = parsed->key;
+            e.outcome = outcome.kind == DeleteOutcome::Kind::Deleted ? "deleted"
+                      : outcome.kind == DeleteOutcome::Kind::NotFound ? "absent" : "token_mismatch";
+            e.reason = "orphan-manifest sweep: exact-token delete of an eligible+unowned build-prefix body";
+            e.detail = {{"writer_epoch", std::to_string(parsed->prefix.writer_epoch)},
+                        {"build_sequence", std::to_string(parsed->prefix.build_sequence)}};
+        });
     }
 
     result.next_cursor = page.next_cursor;

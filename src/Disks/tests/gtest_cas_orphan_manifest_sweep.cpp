@@ -47,6 +47,30 @@ TEST(CasOrphanManifestSweep, OwnedBodyIsSkipped)
     EXPECT_TRUE(backend->head(store->layout().manifestKey(ManifestId{ns, r})).exists);
 }
 
+/// GC-WEDGE regression (2026-07-10): a COMMITTED ref that has been DROPPED but whose removal `-1` is NOT
+/// yet sealed (transition_version above the sealed fold cursor, which is 0 for this fresh pool) must
+/// SURVIVE the sweep — the GC fold still needs the body to emit the `-1` (delete-after-sealed-decrements).
+/// A promoted build retires its build_seq, so the prefix is watermark-eligible; before the fix the sweep
+/// deleted the body in the dropRef→fold window → the removal-fold then clamped FOREVER on the missing
+/// committed body → pool-wide GC stop. The pending-removal protection now covers COMMITTED (not only
+/// PRECOMMIT) removals.
+TEST(CasOrphanManifestSweep, PendingCommittedRemovalBodyIsSkipped)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r = ref(5, 0xAB);
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);   // committed owner
+    dropRefTransition(*backend, store->layout(), ns, "tbl", r);   // dropped: pending committed removal, -1 unsealed
+    setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, 6);   // 6 > 5 => prefix eligible
+
+    sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5});
+    EXPECT_TRUE(backend->head(store->layout().manifestKey(ManifestId{ns, r})).exists)
+        << "a dropped-but-unsealed committed manifest body must survive the sweep (delete-after-sealed-"
+           "decrements) — else the removal-fold clamps forever on the missing body (GC-WEDGE-2026-07-10)";
+}
+
 /// The sweep emits NO blob deltas: the in-degree generation is unchanged.
 TEST(CasOrphanManifestSweep, EmitsNoBlobDeltas)
 {
