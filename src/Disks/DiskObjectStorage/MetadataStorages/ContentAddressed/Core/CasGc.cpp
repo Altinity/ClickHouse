@@ -513,32 +513,15 @@ RoundReport Gc::runRegularRound()
     meta_pool->wait();
     report.meta_write_anomalies = meta_anomaly_count.load(std::memory_order_relaxed);
 
-    /// R4: PUBLISH ORDER — the new current retired list (per gc-shard, ALWAYS written so the refs in
-    /// gc/state always resolve) is durable BEFORE the CAS that publishes the round. Observation-bearing
-    /// (HEAD tokens) => write-once + byte-adopt, attempt-scoped keys.
-    std::map<uint64_t, String> new_refs;
-    for (uint64_t shard = 0; shard < folded.retired_merge.size(); ++shard)
-    {
-        RetiredSet set;
-        set.entries = std::move(folded.retired_merge[shard].still_retired);
-        const String key = layout.retiredKey(generation, attempt, new_round, shard);
-        const String body = encodeRetiredSet(set);
-        if (backend.putIfAbsent(key, body).outcome == PutOutcome::PreconditionFailed)
-        {
-            const auto existing = backend.get(key);
-            if (!existing)
-                throw Exception(ErrorCodes::ABORTED,
-                    "CAS gc: retired list at {} vanished between putIfAbsent and read", key);
-            /// A byte-divergent occupant under OUR OWN attempt key is a replay that observed different
-            /// HEAD tokens; adopt it (first-durable-write-wins, exactly like the old retire sets).
-        }
-        new_refs[shard] = key;
-    }
+    /// R4: retired-in-snapshot (T4) — there is NO separate retired-list object to publish anymore. The
+    /// round's surviving condemned entries were already sealed as `kCondemned` rows inside the fold's
+    /// `blob_target_runs` (durable before this CAS, via `putDeterministicArtifact`), and the per-shard
+    /// `condemned_summary` the seal carries makes the next round's graduation/carry decisions zero-I/O.
 
-    /// R5: the SINGLE round CAS — round, adopted (generation, attempt), retired refs, retention cursor.
+    /// R5: the SINGLE round CAS — round, adopted (generation, attempt), retention cursor.
     GcState next = state;
     next.round = new_round;
-    next.retired_refs = std::move(new_refs);
+    next.retired_refs = {};   /// T4: no separate retired objects; retired state rides the snapshot run.
     /// T0: the generations the adopted seal's runs physically live in (reference-parent carry can point a
     /// current shard's run back at an older generation's key). Retention must never reclaim these.
     std::set<uint64_t> referenced_generations;
@@ -714,25 +697,12 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     const std::map<String, ShardCoverage> parent_cursors =
         adopted_seal ? adopted_seal->per_ns_shard : std::map<String, ShardCoverage>{};
 
-    /// Ack-floor: load the CURRENT retired list (published by the previous round's CAS). A ref that
-    /// does not resolve is integrity loss of destructive bookkeeping — fail closed (this is GC's own
-    /// metadata, not a data-plane 404; losing entries would silently reset condemnation pipelines and
-    /// leak pending deletes).
+    /// Retired-in-snapshot (T4): the prior generation's condemned entries RIDE the source-edge run as
+    /// `kCondemned` sentinel rows (T3), so the round no longer reads any separate retired-list object —
+    /// the parent seal's `blob_target_runs` ARE the retired input. The per-gc-shard `condemned_summary`
+    /// the seal carries below is distilled from the `still_retired` rows each shard re-emits, making the
+    /// next round's `graduationDue` / pure-carry decisions zero-I/O.
     const uint64_t condemn_round = state.round + 1;
-    std::vector<std::vector<RetiredEntry>> prior_retired(state.gc_shards);
-    for (const auto & [retired_shard, retired_key] : state.retired_refs)
-    {
-        if (retired_shard >= state.gc_shards)
-            throw Exception(ErrorCodes::CORRUPTED_DATA,
-                "CAS gc fold: retired ref for shard {} exceeds gc_shards {}", retired_shard, state.gc_shards);
-        const auto got = backend.get(retired_key);
-        if (!got)
-            throw Exception(ErrorCodes::CORRUPTED_DATA,
-                "CAS gc fold: current retired list at {} (shard {}) is missing — refusing the round",
-                retired_key, retired_shard);
-        RetiredSet set = decodeRetiredSet(got->bytes);
-        prior_retired[retired_shard] = std::move(set.entries);
-    }
     result.retired_merge.resize(state.gc_shards);
 
     /// Condemn-time observation: ONE HEAD per new zero-transition captures the exact incarnation token
@@ -1066,12 +1036,53 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// is deterministic (same refs for the same inputs), so seal determinism / crash-replay adoption hold.
     /// An empty delta with a NON-EMPTY retired list still runs the merge: settlement must happen every
     /// pass (carried/graduated/redeleted entries), and that pass reads the run to recompute in-degrees.
+    /// Distill one shard's `condemned_summary` entry from the `kCondemned` rows it re-emitted this pass
+    /// (`still_retired` mirrors those rows exactly — T3). Folding shards call this; it makes the next
+    /// round's `graduationDue` and pure-carry decisions read only the seal, never a run.
+    auto summarize = [](const std::vector<RetiredEntry> & still) -> CondemnedSummary
+    {
+        CondemnedSummary s;
+        s.condemned_total = still.size();
+        for (const RetiredEntry & e : still)
+        {
+            if (e.delete_pending)
+                ++s.pending_total;
+            else
+                s.oldest_nonpending_condemn_round =
+                    std::min(s.oldest_nonpending_condemn_round, e.condemn_round);
+        }
+        return s;
+    };
+    /// The parent seal's summary for a shard, used ONLY for the pure-carry DECISION (condemned_total==0).
+    /// Missing => zero: a fresh pool has no parent entry (correct baseline), and a snap_generation>0 seal
+    /// that is missing an entry we would pure-carry fails closed inside `carryParentRefs` when it copies.
+    auto summaryOfParent = [&](uint64_t shard) -> CondemnedSummary
+    {
+        const auto it = discover_ref_seal.condemned_summary.find(shard);
+        return it != discover_ref_seal.condemned_summary.end() ? it->second : CondemnedSummary{};
+    };
     auto carryParentRefs = [&](uint64_t shard)
     {
         const auto it = parent_runs_by_shard.find(shard);
         if (it != parent_runs_by_shard.end())
             for (const RunRef & r : it->second)
                 result.fold_seal.blob_target_runs.push_back(r);   /// verbatim: parent key/checksum/gen
+        /// Totality: a pure-carry shard settled nothing, so its `condemned_summary` entry is the parent's
+        /// VERBATIM. On a fresh pool (no adopted parent seal) it is the explicit zero baseline; otherwise
+        /// the parent seal MUST carry the entry (a live seal is total over gc_shards) — a missing entry is
+        /// corrupt bookkeeping, never silently treated as zero.
+        if (state.snap_generation == 0)
+            result.fold_seal.condemned_summary[shard] = CondemnedSummary{};
+        else
+        {
+            const auto sit = discover_ref_seal.condemned_summary.find(shard);
+            if (sit == discover_ref_seal.condemned_summary.end())
+                throw Exception(ErrorCodes::CORRUPTED_DATA,
+                    "CAS gc fold: parent fold seal (generation {}, attempt {}) lacks a condemned_summary "
+                    "entry for gc-shard {} — the seal is not total over gc_shards; GC bookkeeping is corrupt",
+                    state.snap_generation, state.snap_attempt, shard);
+            result.fold_seal.condemned_summary[shard] = sit->second;
+        }
     };
     auto priorRunsFor = [&](uint64_t shard) -> const std::vector<RunRef> &
     {
@@ -1101,21 +1112,22 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     {
         /// SINGLE-SHARD PATH (gc_shards == 1). Every blob routes to shard 0, so the entire delta stream
         /// folds into one `blobTargetRunKey(new_generation, 0, 0)` run.
-        if (!folded_any && prior_retired[0].empty())
+        if (!folded_any && summaryOfParent(0).condemned_total == 0)
         {
-            /// Pure ref-carry: nothing changed and no retired entries to settle => zero run I/O. Carry the
-            /// parent shard-0 refs into the seal so coverage/resume stay durable.
+            /// Pure ref-carry: nothing changed and no condemned entries to settle => zero run I/O. Carry the
+            /// parent shard-0 refs + summary into the seal so coverage/resume/graduation stay durable.
             carryParentRefs(0);
         }
         else
         {
-            /// Either a real delta or a non-empty retired list: run the merge (empty deltas still settle
-            /// the retired cursor). The prior runs are the parent seal's shard-0 refs.
+            /// Either a real delta or a non-empty retired input: run the merge (empty deltas still settle
+            /// the kCondemned rows riding the parent run). The prior runs are the parent seal's shard-0 refs.
             foldDeltasIntoGeneration(backend, layout, priorRunsFor(0),
                                      new_generation, attempt, /*shard*/0,
                                      std::move(deltas), result.fold_seal.blob_target_runs,
                                      current_round, condemn_round, head_blob, peek_head,
                                      &result.retired_merge[0], suppress_destructive);
+            result.fold_seal.condemned_summary[0] = summarize(result.retired_merge[0].still_retired);
         }
     }
     else
@@ -1135,9 +1147,9 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
 
         for (uint64_t shard = 0; shard < state.gc_shards; ++shard)
         {
-            if (buckets[shard].empty() && prior_retired[shard].empty())
+            if (buckets[shard].empty() && summaryOfParent(shard).condemned_total == 0)
             {
-                /// Pure ref-carry for this shard: empty delta + empty retired => zero run I/O.
+                /// Pure ref-carry for this shard: empty delta + no condemned entries => zero run I/O.
                 carryParentRefs(shard);
                 continue;
             }
@@ -1152,6 +1164,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
                                &result.retired_merge[shard], suppress_destructive);
             for (RunRef & r : shard_runs)
                 result.fold_seal.blob_target_runs.push_back(std::move(r));
+            result.fold_seal.condemned_summary[shard] = summarize(result.retired_merge[shard].still_retired);
         }
     }
     writePartManifestCleanupBundle(new_generation, attempt, /*owner_shard*/0, result.mf_cleanup,
@@ -1642,17 +1655,35 @@ std::map<String, Gc::DiscoverDecision> Gc::discoverDecisionsForTest()
 
 bool Gc::graduationDue(const GcState & state, uint64_t current_round)
 {
-    Backend & backend = store->backend();
-    for (const auto & [retired_shard, retired_key] : state.retired_refs)
+    /// Retired-in-snapshot (T4): the graduation signal is read from the adopted fold seal's per-shard
+    /// `condemned_summary` — ZERO backend I/O beyond the single seal read. A summary distilled from this
+    /// generation's `kCondemned` rows says, per shard, how many entries are `delete_pending` (a graduation
+    /// is already published) and the oldest non-pending condemn round (one crosses the floor once
+    /// `condemn_round < current_round`).
+    if (state.snap_generation == 0)
+        return false;   /// fresh pool: nothing condemned yet, nothing to graduate.
+
+    /// FAIL-CLOSED: a missing / undecodable seal, or a summary that is not TOTAL over gc_shards, is
+    /// corrupt GC bookkeeping — force a FOLD so the round's own fail-closed path surfaces it, never a
+    /// silent defer (matching the fold's throw-on-missing-adopted-seal treatment).
+    std::optional<CasFoldSeal> seal;
+    try
     {
-        const auto got = backend.get(retired_key);
-        if (!got)
-            /// Missing retired list = corrupt destructive bookkeeping (same fail-closed rule as fold).
-            /// Force a fold so the round's existing fail-closed path surfaces it, never silently defer.
+        seal = readFoldSeal(state.snap_generation, state.snap_attempt);
+    }
+    catch (...)
+    {
+        return true;   /// undecodable seal => fail-closed force-fold
+    }
+    if (!seal)
+        return true;
+    for (uint64_t shard = 0; shard < state.gc_shards; ++shard)
+    {
+        const auto it = seal->condemned_summary.find(shard);
+        if (it == seal->condemned_summary.end())
+            return true;   /// summary not total over gc_shards => fail-closed force-fold
+        if (it->second.pending_total > 0 || it->second.oldest_nonpending_condemn_round < current_round)
             return true;
-        for (const RetiredEntry & e : decodeRetiredSet(got->bytes).entries)
-            if (e.delete_pending || e.condemn_round < current_round)
-                return true;
     }
     return false;
 }
@@ -2025,6 +2056,19 @@ RebuildReport Gc::rebuildBaseline(bool force)
     const uint64_t skew_margin_ms =
         static_cast<uint64_t>(store->poolConfig().mount_lease_ttl_ms.count()) / 2;
     computeHeartbeatFloor(backend, layout, now_ms_fn(), skew_margin_ms);
+
+    /// Retired-in-snapshot (T4): the rebuilt seal's `condemned_summary` must be TOTAL over gc_shards so a
+    /// subsequent regular round reads graduation/carry decisions zero-I/O off it (and its `carryParentRefs`
+    /// totality check does not fail closed). The full-traversal condemns seeded above are all fresh and
+    /// non-pending, condemned at `round`.
+    for (uint64_t shard = 0; shard < gc_shards; ++shard)
+    {
+        CondemnedSummary cs;
+        cs.condemned_total = zero_condemned[shard].size();
+        if (!zero_condemned[shard].empty())
+            cs.oldest_nonpending_condemn_round = round;
+        seal.condemned_summary[shard] = cs;
+    }
 
     /// Seal (deterministic artifact) + the single state CAS. attempt = the max per-shard attempt
     /// (>= 1 so the seal key is stable даже for an empty universe).

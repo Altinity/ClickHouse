@@ -339,6 +339,45 @@ inline void injectRetire(
         backend.putOverwrite(layout.gcStateKey(), state, head.token);
 }
 
+/// Adopt a fold seal carrying a given per-gc-shard `condemned_summary` (retired-in-snapshot T4) and point
+/// gc/state at it (snap_generation / snap_attempt / gc_shards), bypassing a real GC round. If a seal
+/// already exists at (generation, attempt) it is overwritten with the new summary (its other fields are
+/// preserved); otherwise a fresh minimal seal is created. Read-modify-CAS on gc/state preserves the lease.
+/// Used by graduationDue tests to drive the zero-I/O signal directly off a controlled seal.
+inline void injectCondemnedSummarySeal(
+    DB::Cas::Backend & backend, const DB::Cas::Layout & layout,
+    uint64_t generation, uint64_t attempt, uint64_t gc_shards,
+    const std::map<uint64_t, DB::Cas::CondemnedSummary> & summary)
+{
+    const String seal_key = layout.foldSealKey(generation, attempt);
+    DB::Cas::CasFoldSeal seal;
+    const auto existing = backend.get(seal_key);
+    if (existing)
+        seal = DB::Cas::decodeFoldSeal(existing->bytes);
+    else
+        seal.parent_generation = generation ? generation - 1 : 0;
+    seal.generation = generation;
+    seal.condemned_summary = summary;
+    const String seal_bytes = DB::Cas::encodeFoldSeal(seal);
+    if (existing)
+        backend.putOverwrite(seal_key, seal_bytes, existing->token);
+    else
+        backend.putIfAbsent(seal_key, seal_bytes);
+
+    DB::Cas::GcState gc_state;
+    const DB::Cas::HeadResult head = backend.head(layout.gcStateKey());
+    if (head.exists)
+        gc_state = DB::Cas::decodeGcState(backend.get(layout.gcStateKey())->bytes);
+    gc_state.gc_shards = gc_shards;
+    gc_state.snap_generation = generation;
+    gc_state.snap_attempt = attempt;
+    const String state = DB::Cas::encodeGcState(gc_state);
+    if (!head.exists)
+        backend.putIfAbsent(layout.gcStateKey(), state);
+    else
+        backend.putOverwrite(layout.gcStateKey(), state, head.token);
+}
+
 /// Whether blob `hash` is absent from the backend (its exact-token content object is gone).
 inline bool blobAbsent(DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::UInt128 & hash)
 {
@@ -364,8 +403,12 @@ inline bool runRoundsUntilAbsent(
     return blobAbsent(backend, layout, hash);
 }
 
-/// The decoded CURRENT retired set for `shard` (dereferenced through gc/state.retired_refs). Empty when
-/// gc/state or the ref is absent. Used by ack-floor tests to assert an entry's pending/condemn state.
+/// The CURRENT condemned entries for `shard`, read from the adopted fold seal's `blob_target_runs`
+/// (retired-in-snapshot T4): the round no longer writes a separate retired-list object — condemned
+/// entries RIDE the source-edge run as `kCondemned` sentinel rows at the zero-sentinel key. This reads
+/// the seal at (snap_generation, snap_attempt), opens every run for `shard`, and reconstructs the
+/// `RetiredEntry` shape (hash from the run key, the rest from the decoded `CondemnedRow`). Empty when
+/// gc/state / the seal / the runs are absent. Used by ack-floor tests to assert pending/condemn state.
 inline DB::Cas::RetiredSet currentRetiredSet(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout, uint64_t shard)
 {
@@ -373,13 +416,55 @@ inline DB::Cas::RetiredSet currentRetiredSet(
     if (!st)
         return {};
     const DB::Cas::GcState gc_state = DB::Cas::decodeGcState(st->bytes);
-    const auto it = gc_state.retired_refs.find(shard);
-    if (it == gc_state.retired_refs.end())
+    if (gc_state.snap_generation == 0)
         return {};
-    const auto got = backend.get(it->second);
-    if (!got)
+    const auto seal_bytes = backend.get(layout.foldSealKey(gc_state.snap_generation, gc_state.snap_attempt));
+    if (!seal_bytes)
         return {};
-    return DB::Cas::decodeRetiredSet(got->bytes);
+    const DB::Cas::CasFoldSeal seal = DB::Cas::decodeFoldSeal(seal_bytes->bytes);
+
+    DB::Cas::RetiredSet out;
+    for (const DB::Cas::RunRef & run : seal.blob_target_runs)
+    {
+        if (run.shard != shard)
+            continue;
+        DB::Cas::RunFileReader r = DB::Cas::openSourceEdgeRun(backend, run.key);
+        String k, p;
+        while (r.next(k, p))
+        {
+            if (p.empty() || p[0] != DB::Cas::kCondemned)
+                continue;
+            DB::UInt128 blob_hash{}, source_id{};
+            if (!DB::Cas::parseSrcEdgeRunKey(k, blob_hash, source_id))
+                continue;
+            const DB::Cas::CondemnedRow row = DB::Cas::decodeCondemnedRow(p);
+            out.entries.push_back(DB::Cas::RetiredEntry{
+                .kind = DB::Cas::ObjectKind::Blob,
+                .hash = blob_hash,
+                .token = row.token,
+                .size = row.size,
+                .condemn_round = row.condemn_round,
+                .delete_pending = row.delete_pending});
+        }
+    }
+    return out;
+}
+
+/// True iff ANY gc-shard's adopted-seal run still holds a `kCondemned` row — the ack-floor deletion
+/// pipeline is in flight while this is true (retired-in-snapshot T4 replacement for the old
+/// "iterate gc/state.retired_refs" probe). `gc_shards` is read from gc/state when 0 is passed.
+inline bool anyCondemnedInSeal(
+    DB::Cas::Backend & backend, const DB::Cas::Layout & layout, uint64_t gc_shards = 0)
+{
+    const auto st = backend.get(layout.gcStateKey());
+    if (!st)
+        return false;
+    const DB::Cas::GcState gc_state = DB::Cas::decodeGcState(st->bytes);
+    const uint64_t shards = gc_shards ? gc_shards : gc_state.gc_shards;
+    for (uint64_t shard = 0; shard < shards; ++shard)
+        if (!currentRetiredSet(backend, layout, shard).entries.empty())
+            return true;
+    return false;
 }
 
 /// Raise the `fence_round` of every shard of a namespace to at least `round`, exactly as the REMOVED

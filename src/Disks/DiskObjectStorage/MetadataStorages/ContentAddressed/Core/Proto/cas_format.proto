@@ -229,6 +229,15 @@ message FoldShardCoverageProto {
   uint64 min_live_precommit_build_sequence  = 10; // lexicographically-min live precommit build_sequence
 }
 
+// One per-gc-shard condemned-in-snapshot summary inside a FoldSealProto (retired-in-snapshot T4).
+// Sorted repeated (spec bans new proto map<> for byte-determinism); TOTAL over gc_shards.
+message CondemnedSummaryProto {
+  uint64 shard                          = 1;
+  uint64 condemned_total                = 2;
+  uint64 pending_total                  = 3;
+  uint64 oldest_nonpending_condemn_round = 4;   // UINT64_MAX = none
+}
+
 // FOLD seal (write-once gc/gen/<gen>/fold_seal). Magic CAFS, FormatId::FoldSeal.
 message FoldSealProto {
   CasHeader header                            = 1;
@@ -237,6 +246,7 @@ message FoldSealProto {
   repeated FoldShardCoverageProto per_ns_shard = 4;  // sorted by key
   repeated RunRefProto blob_target_runs       = 5;   // sorted by key
   repeated RunRefProto part_manifest_cleanup  = 6;   // sorted by key
+  repeated CondemnedSummaryProto condemned_summary = 7;  // sorted by shard; TOTAL over gc_shards
 }
 
 // (CompletionSealProto / SealVersionEntryProto "CACS" retired with the one-pass ack-floor round —

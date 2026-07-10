@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcFormats.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGenerationSeal.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcOutcomes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasPoolMeta.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFormat.h>
@@ -160,6 +161,40 @@ TEST(CasGcFormats, GcStateV3Validation)
         std::string bytes; msg.SerializeToString(&bytes);
         expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeGcState(bytes); });
     }
+}
+
+/// ---------- retired-in-snapshot T4: fold-seal condemned_summary ----------
+
+TEST(CasGcFormats, FoldSealCondemnedSummaryRoundTrips)
+{
+    /// A seal carrying a non-empty condemned_summary over 2 shards (one a zero entry) round-trips
+    /// byte-for-byte and compares equal: decodeFoldSeal(encodeFoldSeal(s)) == s.
+    CasFoldSeal s;
+    s.generation = 9;
+    s.parent_generation = 8;
+    s.per_ns_shard["ns/0"] = ShardCoverage{.classification = 2, .folded_token = Token{"tok"}, .folded_cursor = 3, .incarnation = {}};
+    s.blob_target_runs.push_back(RunRef{.key = "gc/gen/9/blob_target/0/0", .checksum = UInt128(0x77),
+                                        .shard = 0, .generation = 9});
+    s.condemned_summary[0] = CondemnedSummary{.condemned_total = 3, .pending_total = 1,
+                                              .oldest_nonpending_condemn_round = 5};
+    s.condemned_summary[1] = CondemnedSummary{};   /// explicit zero entry (totality over gc_shards)
+
+    const CasFoldSeal out = decodeFoldSeal(encodeFoldSeal(s));
+    EXPECT_EQ(out, s);
+    ASSERT_EQ(out.condemned_summary.size(), 2u);
+    EXPECT_EQ(out.condemned_summary.at(0).condemned_total, 3u);
+    EXPECT_EQ(out.condemned_summary.at(0).pending_total, 1u);
+    EXPECT_EQ(out.condemned_summary.at(0).oldest_nonpending_condemn_round, 5u);
+    EXPECT_EQ(out.condemned_summary.at(1).condemned_total, 0u);
+    EXPECT_EQ(out.condemned_summary.at(1).pending_total, 0u);
+    EXPECT_EQ(out.condemned_summary.at(1).oldest_nonpending_condemn_round,
+              std::numeric_limits<uint64_t>::max());   /// UINT64_MAX sentinel survives the round-trip
+
+    /// Byte-deterministic: sorted-by-shard encoding is stable.
+    EXPECT_EQ(encodeFoldSeal(s), encodeFoldSeal(s));
+
+    /// Absent by default (proto3): a seal with no summary decodes to an empty map.
+    EXPECT_TRUE(decodeFoldSeal(encodeFoldSeal(CasFoldSeal{})).condemned_summary.empty());
 }
 
 /// ---------- Task 6: condemn_round + retired_refs ----------

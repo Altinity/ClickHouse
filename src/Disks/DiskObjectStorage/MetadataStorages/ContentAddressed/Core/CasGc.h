@@ -305,12 +305,13 @@ private:
     /// state already reachable before the fold's snapshot merge (O(retired)/O(shards), no snapshot
     /// read), so `runRegularRound` can decide DEFER-vs-FOLD before paying the fold's cost.
     ///
-    /// True iff any entry in the CURRENT retired lists (dereferenced through `state.retired_refs`) is
-    /// due to delete/graduate this round (`delete_pending` OR `condemn_round < current_round`). This is
-    /// the load-bearing SAFETY signal (Task-1 TLA+ gate, GREEN): it forces a fold before any destructive
-    /// decision. FAIL-CLOSED: a missing retired list is corrupt destructive bookkeeping — returns TRUE
-    /// (forces a fold so the round's own fail-closed path surfaces it), matching `fold`'s existing
-    /// throw-on-missing-retired-list treatment; a round must never silently defer on corrupt bookkeeping.
+    /// True iff a graduation is due this round, read ZERO-I/O from the adopted fold seal's per-shard
+    /// `condemned_summary` (retired-in-snapshot T4): `∃ shard: pending_total > 0 ||
+    /// oldest_nonpending_condemn_round < current_round`. `snap_generation == 0` (fresh pool) => false.
+    /// This is the load-bearing SAFETY signal (Task-1 TLA+ gate, GREEN): it forces a fold before any
+    /// destructive decision. FAIL-CLOSED: a missing / undecodable seal, or a summary not TOTAL over
+    /// gc_shards, is corrupt GC bookkeeping — returns TRUE (forces a fold so the round's own fail-closed
+    /// path surfaces it); a round must never silently defer on corrupt bookkeeping.
     bool graduationDue(const GcState & state, uint64_t current_round);
 
     /// The number of present shards whose LIST-discovered token differs from what the adopted fold seal

@@ -57,6 +57,19 @@ struct ShardCoverage
     bool operator==(const ShardCoverage &) const = default;
 };
 
+/// Per-gc-shard condemned-in-snapshot summary (retired-in-snapshot T4, spec §2.2). Distilled from the
+/// `kCondemned` rows this generation sealed for one gc-shard so `graduationDue` and the pure ref-carry
+/// decision are ZERO-I/O (they read only the seal, never a run). It is TOTAL over `0..gc_shards-1` in
+/// every newly written seal (folding shards compute it from their `still_retired`; pure-carry shards copy
+/// the parent's entry verbatim). A "missing" shard entry is never treated as zero — consumers fail closed.
+struct CondemnedSummary
+{
+    uint64_t condemned_total = 0;   /// count of `kCondemned` rows in this shard's sealed run
+    uint64_t pending_total = 0;     /// how many of those are `delete_pending` (a graduation is due)
+    uint64_t oldest_nonpending_condemn_round = UINT64_MAX;   /// min condemn_round over non-pending; UINT64_MAX = none
+    bool operator==(const CondemnedSummary &) const = default;
+};
+
 /// The FOLD seal for one GC generation — write-once at <prefix>/gc/gen/<generation>/attempt/<attempt>/fold_seal.
 /// The one-pass ack-floor round records everything it folded here (coarse: no object per
 /// edge/manifest/candidate). This is the sole per-generation coverage record — the resume rule and the
@@ -68,6 +81,7 @@ struct CasFoldSeal
     std::map<String, ShardCoverage> per_ns_shard;   /// "ns/shard" -> coverage
     std::vector<RunRef> blob_target_runs;           /// the blob in-degree run segments this gen sealed
     std::vector<RunRef> part_manifest_cleanup;      /// the part-manifest cleanup bundles this gen sealed
+    std::map<uint64_t, CondemnedSummary> condemned_summary;   /// gc-shard -> summary; TOTAL over gc_shards
     bool operator==(const CasFoldSeal &) const = default;
 };
 

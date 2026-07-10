@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <limits>
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFsck.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.h>
@@ -29,38 +30,83 @@ TEST(CasGcRoundDefer, PredicateTruthTable)
     EXPECT_FALSE(shouldDeferRound(2, false, 8, 3, 8));   // bound reached => force fold
 }
 
-/// graduationDue: a delete_pending entry, and an entry whose condemn_round < current_round, each force
-/// it true; an entry with condemn_round >= current_round and not delete_pending leaves it false.
+/// graduationDue (retired-in-snapshot T4): read ZERO-I/O from the adopted seal's condemned_summary. An
+/// entry whose oldest non-pending condemn round crosses current_round forces it true; a delete_pending
+/// entry forces it true regardless of the round; otherwise false.
 TEST(CasGcRoundDefer, GraduationDueDetectsDuePendingAndRoundCrossing)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openStoreForTest(backend);
     const Layout & layout = store->layout();
 
-    /// Seed the CURRENT retired list for gc-shard 0 with one condemned-but-not-yet-graduated entry.
-    injectRetire(*backend, layout, /*round*/0, /*fence_seq*/0, /*shard*/0,
-        {RetiredEntry{.kind = ObjectKind::Blob, .hash = {}, .token = {}, .size = 0,
-                      .condemn_round = 2, .delete_pending = false}});
+    /// Adopt a seal whose shard-0 summary holds one condemned-but-not-yet-graduated entry (round 2).
+    injectCondemnedSummarySeal(*backend, layout, /*generation*/1, /*attempt*/1, /*gc_shards*/1,
+        {{0, CondemnedSummary{.condemned_total = 1, .pending_total = 0,
+                              .oldest_nonpending_condemn_round = 2}}});
 
     Gc gc(store, kGc);
     const GcState state = decodeGcState(backend->get(layout.gcStateKey())->bytes);
 
     EXPECT_FALSE(gc.graduationDueForTest(state, /*current_round=*/2))
-        << "condemn_round (2) is not < current_round (2); not yet due to graduate";
+        << "oldest non-pending condemn round (2) is not < current_round (2); not yet due to graduate";
     EXPECT_TRUE(gc.graduationDueForTest(state, /*current_round=*/3))
-        << "condemn_round (2) < current_round (3) => due to graduate";
+        << "oldest non-pending condemn round (2) < current_round (3) => due to graduate";
 
-    /// Re-seed the SAME entry (same retired-list object) as delete_pending: due regardless of the round.
-    const String retired_key = state.retired_refs.at(0);
-    const auto current = backend->get(retired_key);
-    ASSERT_TRUE(current.has_value());
-    backend->putOverwrite(retired_key,
-        encodeRetiredSet(RetiredSet{.entries = {RetiredEntry{.kind = ObjectKind::Blob, .hash = {}, .token = {},
-                                                              .size = 0, .condemn_round = 2, .delete_pending = true}}}),
-        current->token);
+    /// Re-adopt a seal whose summary entry is delete_pending: due regardless of the round.
+    injectCondemnedSummarySeal(*backend, layout, /*generation*/1, /*attempt*/1, /*gc_shards*/1,
+        {{0, CondemnedSummary{.condemned_total = 1, .pending_total = 1,
+                              .oldest_nonpending_condemn_round = std::numeric_limits<uint64_t>::max()}}});
+    const GcState state_pending = decodeGcState(backend->get(layout.gcStateKey())->bytes);
 
-    EXPECT_TRUE(gc.graduationDueForTest(state, /*current_round=*/0))
-        << "delete_pending must force graduationDue true regardless of current_round";
+    EXPECT_TRUE(gc.graduationDueForTest(state_pending, /*current_round=*/0))
+        << "a delete_pending entry must force graduationDue true regardless of current_round";
+}
+
+/// graduationDue fail-closed: when the adopted seal OBJECT is deleted out from under gc/state, the signal
+/// must be TRUE (forces the fold so the round's own fail-closed path surfaces the corrupt bookkeeping),
+/// never a silent defer.
+TEST(CasGcRoundDefer, GraduationDueFailsClosedWhenSealMissing)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend);
+    const Layout & layout = store->layout();
+
+    injectCondemnedSummarySeal(*backend, layout, /*generation*/1, /*attempt*/1, /*gc_shards*/1,
+        {{0, CondemnedSummary{}}});
+    const GcState state = decodeGcState(backend->get(layout.gcStateKey())->bytes);
+
+    /// Delete the adopted seal object (corrupt destructive bookkeeping).
+    const String seal_key = layout.foldSealKey(state.snap_generation, state.snap_attempt);
+    const HeadResult h = backend->head(seal_key);
+    ASSERT_TRUE(h.exists);
+    ASSERT_EQ(backend->deleteExact(seal_key, h.token).kind, DeleteOutcome::Kind::Deleted);
+
+    Gc gc(store, kGc);
+    EXPECT_TRUE(gc.graduationDueForTest(state, /*current_round=*/5))
+        << "a missing adopted seal must fail-closed to a forced fold";
+}
+
+/// graduationDue is FALSE on a TOTAL all-zero summary: nothing condemned in any shard => nothing due.
+TEST(CasGcRoundDefer, GraduationDueFalseOnAllZeroSummary)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend);
+    const Layout & layout = store->layout();
+
+    injectCondemnedSummarySeal(*backend, layout, /*generation*/1, /*attempt*/1, /*gc_shards*/2,
+        {{0, CondemnedSummary{}}, {1, CondemnedSummary{}}});
+    const GcState state = decodeGcState(backend->get(layout.gcStateKey())->bytes);
+
+    Gc gc(store, kGc);
+    EXPECT_FALSE(gc.graduationDueForTest(state, /*current_round=*/9))
+        << "an all-zero total summary means nothing is due to graduate";
+
+    /// Fail-closed if the summary is NOT total over gc_shards (shard 1 missing).
+    injectCondemnedSummarySeal(*backend, layout, /*generation*/1, /*attempt*/1, /*gc_shards*/2,
+        {{0, CondemnedSummary{}}});
+    const GcState partial = decodeGcState(backend->get(layout.gcStateKey())->bytes);
+    EXPECT_TRUE(gc.graduationDueForTest(partial, /*current_round=*/9))
+        << "a summary not total over gc_shards is corrupt => fail-closed force-fold";
 }
 
 /// changedShardCount: with the fold seal covering shard s at its current token, a quiescent pool reports
@@ -252,7 +298,7 @@ TEST(CasGcRoundDefer, DueGraduationIsSoleFoldTriggerAtHighThreshold)
     Gc gc(store, kGc);
     /// Warm-up round on the still-empty pool: `gc/state` does not exist yet, so lease acquisition takes
     /// the create-fresh path and succeeds immediately (`gc_id` becomes the owner in storage). This
-    /// matters because the `injectRetire` seeding below writes `gc/state` directly, and a fresh `Gc`
+    /// matters because the `injectCondemnedSummarySeal` seeding below writes `gc/state` directly, and a fresh `Gc`
     /// object's FIRST-EVER `acquireOrRenewLease` call against a PRE-EXISTING lease it has never observed
     /// refuses to steal it (two-observation safety against stealing from a live incumbent) -- it would
     /// return `acquired_lease=false` and the round would bail out BEFORE the fold-decision code, making
@@ -263,16 +309,16 @@ TEST(CasGcRoundDefer, DueGraduationIsSoleFoldTriggerAtHighThreshold)
 
     writeBlobBody(*backend, layout, blob);
 
-    /// Seed the CURRENT retired list directly with B already `delete_pending`, mirroring
-    /// `CasGcRoundDefer.GraduationDueDetectsDuePendingAndFloorCrossing` (Task 3's helper). At
-    /// `gc_fold_threshold = 1000` a real condemn -> graduate pipeline of `runRegularRound` calls is not
-    /// usable to set this up: every round before graduation would ITSELF defer (nothing due yet, and
-    /// changed_shards never nears 1000), so the pending state is injected directly instead of driven
-    /// through real rounds. `round`/`fence_seq` are passed as 0 to match the warm-up round's untouched
-    /// (deferred, so never advanced) persisted state.
-    injectRetire(*backend, layout, /*round*/0, /*fence_seq*/0, /*shard*/0,
-        {RetiredEntry{.kind = ObjectKind::Blob, .hash = blob, .token = {}, .size = 0,
-                      .condemn_round = 0, .delete_pending = true}});
+    /// Seed the adopted fold seal's condemned_summary with B already `delete_pending` (pending_total = 1),
+    /// mirroring `CasGcRoundDefer.GraduationDueDetectsDuePendingAndRoundCrossing`. Retired-in-snapshot
+    /// (T4): graduationDue reads this summary ZERO-I/O off the adopted seal — a delete_pending entry forces
+    /// it true regardless of the round. At `gc_fold_threshold = 1000` a real condemn -> graduate pipeline of
+    /// `runRegularRound` calls is not usable to set this up: every round before graduation would ITSELF
+    /// defer (nothing due yet, and changed_shards never nears 1000), so the due-pending summary is injected
+    /// directly instead of driven through real rounds.
+    injectCondemnedSummarySeal(*backend, layout, /*generation*/1, /*attempt*/1, /*gc_shards*/1,
+        {{0, CondemnedSummary{.condemned_total = 1, .pending_total = 1,
+                              .oldest_nonpending_condemn_round = std::numeric_limits<uint64_t>::max()}}});
 
     /// The +1: a fresh manifest re-references B while it sits `delete_pending` -- one changed shard,
     /// far below the threshold of 1000.

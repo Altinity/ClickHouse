@@ -50,17 +50,9 @@ StorePtr openTestStore(std::shared_ptr<InMemoryBackend> & out_backend)
 /// (condemn -> graduate -> delete) is in flight while this is true.
 bool anyRetiredPending(const StorePtr & s)
 {
-    const auto st = s->backend().get(s->layout().gcStateKey());
-    if (!st)
-        return false;
-    const GcState gc_state = decodeGcState(st->bytes);
-    for (const auto & [shard, key] : gc_state.retired_refs)
-    {
-        const auto got = s->backend().get(key);
-        if (got && !decodeRetiredSet(got->bytes).entries.empty())
-            return true;
-    }
-    return false;
+    /// Retired-in-snapshot (T4): condemned state rides the adopted fold seal's kCondemned rows, not a
+    /// separate retired list — reconstruct the in-flight set from the seal.
+    return DB::Cas::tests::anyCondemnedInSeal(s->backend(), s->layout());
 }
 
 /// Drive regular GC to a fixpoint. A condemned blob is not deleted in the round that folds its removal:

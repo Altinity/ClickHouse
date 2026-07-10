@@ -78,21 +78,12 @@ GcState readState(InMemoryBackend & b, const Store & s)
     return decodeGcState(got->bytes);
 }
 
-/// Whether the CURRENT retired list (any gc-shard, dereferenced through gc/state.retired_refs) holds any
-/// entry — the ack-floor deletion pipeline is still in flight while this is true.
+/// Whether ANY gc-shard's adopted-seal run still holds a `kCondemned` row (retired-in-snapshot T4: the
+/// retired state rides the snapshot run, not a separate retired-list object) — the ack-floor deletion
+/// pipeline is still in flight while this is true.
 bool anyRetiredPending(InMemoryBackend & b, const Store & s)
 {
-    const auto st = b.get(s.layout().gcStateKey());
-    if (!st)
-        return false;
-    const GcState gc_state = decodeGcState(st->bytes);
-    for (const auto & [shard, key] : gc_state.retired_refs)
-    {
-        const auto got = b.get(key);
-        if (got && !decodeRetiredSet(got->bytes).entries.empty())
-            return true;
-    }
-    return false;
+    return anyCondemnedInSeal(b, s.layout());
 }
 
 /// Drive a Gc to fixpoint over the round-paced retired-cursor pipeline: run rounds, renewing the store's
@@ -385,6 +376,97 @@ TEST(CasGcRound, PublishDropReclaimsBlobAndManifestToFixpoint)
     /// Idempotent: re-running to fixpoint changes nothing and never throws.
     EXPECT_NO_THROW(driveToFixpoint(*backend, store, gc));
     EXPECT_FALSE(blobExists(*backend, store->layout(), DB::UInt128(1)));
+}
+
+/// retired-in-snapshot T4: after a round condemns one blob, the ADOPTED fold seal's per-shard
+/// condemned_summary reflects it (condemned_total == 1, pending_total == 0) — distilled zero-I/O from the
+/// kCondemned rows the fold sealed into the snapshot run.
+TEST(CasGcRound, CondemnRoundSealSummaryCountsCondemned)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r = ref(1, 0xAA);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+
+    Gc gc(store, kGc);
+    gc.runRegularRound();                 /// folds the +1
+    store->renewWatermarkOnce();
+    dropRefTransition(*backend, store->layout(), ns, "tbl", r);   /// the -1 condemns it
+
+    /// Drive rounds until the blob shows up condemned in the adopted-seal run; capture that seal.
+    bool condemned = false;
+    CasFoldSeal seal;
+    for (int i = 0; i < 6 && !condemned; ++i)
+    {
+        gc.runRegularRound();
+        store->renewWatermarkOnce();
+        const GcState st = readState(*backend, *store);
+        seal = decodeFoldSeal(
+            backend->get(store->layout().foldSealKey(st.snap_generation, st.snap_attempt))->bytes);
+        for (const RetiredEntry & e : currentRetiredSet(*backend, store->layout(), /*shard*/0).entries)
+            if (e.hash == DB::UInt128(1))
+                condemned = true;
+    }
+    ASSERT_TRUE(condemned) << "blob never condemned into the snapshot run";
+    ASSERT_TRUE(seal.condemned_summary.contains(0)) << "seal summary must be total over gc_shards";
+    EXPECT_EQ(seal.condemned_summary.at(0).condemned_total, 1u);
+    EXPECT_EQ(seal.condemned_summary.at(0).pending_total, 0u)
+        << "a freshly condemned entry is not yet delete_pending";
+    EXPECT_LT(seal.condemned_summary.at(0).oldest_nonpending_condemn_round,
+              std::numeric_limits<uint64_t>::max())
+        << "a non-pending condemned entry records its condemn round";
+}
+
+/// retired-in-snapshot T4: a pure ref-carry shard copies its parent seal's condemned_summary entry
+/// VERBATIM (totality is preserved across a carry round). With gc_shards == 2 and activity in only one
+/// shard, the OTHER shard is pure-carried every fold — its summary entry in the new seal must be the
+/// parent's, byte-for-byte.
+TEST(CasGcRound, CarryRoundPreservesCondemnedSummaryVerbatim)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = Store::open(backend,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1,
+                   .gc_shards = 2, .gc_trim_min_events = 0});
+    const RootNamespace ns{"00/aa@cas@"};
+
+    Gc gc(store, kGc);
+
+    const ManifestRef r1 = ref(1, 0xAA);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
+    writeManifestRaw(*backend, store->layout(), ns, r1, {blobEntryFor("a", DB::UInt128(1))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r1);
+    gc.runRegularRound();
+    const GcState st1 = readState(*backend, *store);
+    const CasFoldSeal seal1 = decodeFoldSeal(
+        backend->get(store->layout().foldSealKey(st1.snap_generation, st1.snap_attempt))->bytes);
+
+    /// A second ref keeps the pool folding so the inactive shard is pure-carried again in the next fold.
+    const ManifestRef r2 = ref(2, 0xBB);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(2));
+    writeManifestRaw(*backend, store->layout(), ns, r2, {blobEntryFor("b", DB::UInt128(2))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl2", std::nullopt, r2);
+    gc.runRegularRound();
+    const GcState st2 = readState(*backend, *store);
+    const CasFoldSeal seal2 = decodeFoldSeal(
+        backend->get(store->layout().foldSealKey(st2.snap_generation, st2.snap_attempt))->bytes);
+
+    /// TOTALITY: both seals carry a summary entry for every gc-shard.
+    ASSERT_EQ(seal1.condemned_summary.size(), 2u);
+    ASSERT_EQ(seal2.condemned_summary.size(), 2u);
+    EXPECT_TRUE(seal1.condemned_summary.contains(0) && seal1.condemned_summary.contains(1));
+    EXPECT_TRUE(seal2.condemned_summary.contains(0) && seal2.condemned_summary.contains(1));
+
+    /// VERBATIM CARRY: nothing was ever condemned, so every shard's summary is the zero entry, carried
+    /// unchanged from parent to child across the fold.
+    for (uint64_t shard = 0; shard < 2; ++shard)
+    {
+        EXPECT_EQ(seal2.condemned_summary.at(shard), seal1.condemned_summary.at(shard))
+            << "shard " << shard << " summary must be carried verbatim from the parent seal";
+        EXPECT_EQ(seal2.condemned_summary.at(shard).condemned_total, 0u);
+    }
 }
 
 /// Attempt-scoping (B2): a fold seal planted under a NON-adopted attempt at the adopted generation

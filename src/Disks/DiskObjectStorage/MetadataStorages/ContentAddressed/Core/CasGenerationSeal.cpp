@@ -79,6 +79,15 @@ String encodeFoldSeal(const CasFoldSeal & seal)
     addRuns(msg.mutable_blob_target_runs(), seal.blob_target_runs);
     addRuns(msg.mutable_part_manifest_cleanup(), seal.part_manifest_cleanup);
 
+    for (const auto & [shard, summary] : seal.condemned_summary)   /// std::map => sorted by shard
+    {
+        auto * e = msg.add_condemned_summary();
+        e->set_shard(shard);
+        e->set_condemned_total(summary.condemned_total);
+        e->set_pending_total(summary.pending_total);
+        e->set_oldest_nonpending_condemn_round(summary.oldest_nonpending_condemn_round);
+    }
+
     return msg.SerializeAsString();
 }
 
@@ -110,6 +119,11 @@ CasFoldSeal decodeFoldSeal(std::string_view data)
             .min_live_precommit_build_sequence = e.min_live_precommit_build_sequence()};
     readRuns(msg.blob_target_runs(), seal.blob_target_runs);
     readRuns(msg.part_manifest_cleanup(), seal.part_manifest_cleanup);
+    for (const auto & e : msg.condemned_summary())
+        seal.condemned_summary[e.shard()] = CondemnedSummary{
+            .condemned_total = e.condemned_total(),
+            .pending_total = e.pending_total(),
+            .oldest_nonpending_condemn_round = e.oldest_nonpending_condemn_round()};
     return seal;
 }
 

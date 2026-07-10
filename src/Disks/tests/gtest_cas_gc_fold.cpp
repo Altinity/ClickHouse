@@ -230,7 +230,8 @@ void injectStaleFoldSeal(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout,
     const DB::Cas::RootNamespace & ns, uint64_t shard,
     uint64_t generation, uint64_t attempt,
-    uint64_t folded_cursor, DB::Cas::ShardIncarnation stale_incarnation)
+    uint64_t folded_cursor, DB::Cas::ShardIncarnation stale_incarnation,
+    uint64_t gc_shards = 1)
 {
     DB::Cas::CasFoldSeal seal;
     seal.generation = generation;
@@ -239,6 +240,12 @@ void injectStaleFoldSeal(
     cov.incarnation = stale_incarnation;
     cov.classification = 2;
     seal.per_ns_shard[cursorKeyForTest(ns, shard)] = cov;
+    /// Retired-in-snapshot (T4): a real prior round always writes a `condemned_summary` TOTAL over
+    /// gc_shards; the fold's carry path fails closed on a missing entry. This stale seal condemned
+    /// nothing, so seed the explicit all-zero total so the multi-shard carry path does not (correctly)
+    /// reject it as corrupt bookkeeping.
+    for (uint64_t s = 0; s < gc_shards; ++s)
+        seal.condemned_summary[s] = DB::Cas::CondemnedSummary{};
     backend.putIfAbsent(layout.foldSealKey(generation, attempt), DB::Cas::encodeFoldSeal(seal));
 }
 }
@@ -312,7 +319,7 @@ TEST(CasGcFold, IncarnationMismatchRestartsFoldAtZeroMultiShard)
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
     publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
 
-    injectStaleFoldSeal(*backend, store->layout(), ns, 0, 1, 1, 5, I1);
+    injectStaleFoldSeal(*backend, store->layout(), ns, 0, 1, 1, 5, I1, /*gc_shards*/2);
     /// gc_shards=2 must be in the injected state so the fold picks the sharded path.
     injectGcStateForFoldTest(*backend, store->layout(), kGc, 1, 1, 1, 2);
 
