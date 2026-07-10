@@ -547,3 +547,31 @@ Watchdog cron: job 60470431 (hourly at :23).
 - NEXT (recommended): (a) check if tpc_ds also fails on a non-CA lane (if yes → not our regression);
   (b) if 00146/tpc_ds fail the CA lane specifically, bump the scoped speed estimator/timeout for that set
   (as the original B86 spec anticipated); (c) final full CA-s3 lane run for the authoritative red list.
+
+### 2026-07-10 — Full-lane post-mortem via read-only CA + trace_log verdict: B86 EXONERATED
+- Full lane: 10365 OK / 44 FAIL / 104 SKIP. All session fixes green; debris class gone; timeout class
+  grew ~10→38 (incl. 00139_like 371s vs 2s isolated) — initially suspected B86 removal.
+- **Post-mortem technique (reusable):** the lane's system logs live in the CA pool and SURVIVE teardown
+  (ci/tmp/rustfs_data + run_r0 metadata). Bring up standalone rustfs over the surviving data dir +
+  `clickhouse local --config-file <minimal CA disk cfg + <readonly>1> --path ci/tmp/run_r0` — the
+  <readonly> (WORM) mode skips owner-claim/mount-lease/GC, so the dead server's pool opens clean.
+  Move stray test-db .sql metadata aside (Replicated DBs need zk/macros). query_log/trace_log then
+  queryable post-mortem. NOTE: addressToSymbol is useless cross-process (PIE/ASLR) — use ProfileEvents.
+- **Incident (self-inflicted, resolved):** deleted the pool's owner anchor before reading it (to force a
+  local mount) — hit the identity-loss fail-closed guard, then RESTORED the anchor by hand-crafting the
+  OwnerProto (magic CAOW, G_BUILD=1, uuid from the run's uuid file) + curl PUT; verified by the guard
+  again reporting the original owner. Lesson reinforced: read-before-delete, and <readonly>1 was the
+  right door all along.
+- **Verdict on the 38 timeouts (ProfileEvents, conclusive):** every stalled query is WEB-DISK-bound:
+  http tens-to-hundreds MB via ReadWriteBufferFromHTTP at ~250KB/s, S3 read/write wait = 0, cpu 1-6s,
+  1418s thread-real-time on a 372s query = threads parked on HTTP socket reads. Endpoints are PUBLIC
+  internet buckets (clickhouse-datasets-web.s3.us-east-1.amazonaws.com, tpc-ds-sf1.s3.amazonaws.com).
+  The one heavy S3 row was dataset prep itself (1.2GB HTTP + 1638s s3rd + 530s s3wr). B86 removal is
+  EXONERATED for the timeouts: CA/RustFS wait is zero on every stalled test. The 4.5GB/127k-object
+  RustFS growth + 5s-interval GC churn remain real lane-hygiene items (feed rustfs#3231) but did not
+  cause these timeouts. Red set = internet weather (external) + ignore-list + 00163 random-settings flake.
+- **AI spec review adjudicated (2 P1s):** scenarios unreachable (attempt = lease.seq bumps EVERY round →
+  same-key collision = byte-identical resend), but the review exposed the draft's false premise. Fixed
+  the OPPOSITE way and simpler: keep putDeterministicArtifact byte-equal for the merged run; withdrew
+  putFirstWriteWins; attempt-pinning invariant now explicit + a TLA sabotage flip. Spec amended
+  (50faf5a27bb). BlobMeta carries no token → meta content observation-independent (P1-2's mechanism moot).
