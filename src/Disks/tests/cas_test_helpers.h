@@ -3,6 +3,7 @@
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobMeta.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEnvelope.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcFormats.h>
@@ -487,6 +488,42 @@ inline void writeBlobBody(
     header.pad_to_header_len = static_cast<uint32_t>(blob_header_len);
     const String head = DB::Cas::encodeEnvelopeHeader(header);
     backend.putIfAbsent(layout.blobKey(DB::Cas::BlobId(DB::Cas::u128ToHex(hash))), head + String("x"));
+}
+
+/// Write a raw blob body (payload written verbatim, no envelope) — the raw-body-refinement shape
+/// (Phase B): the meta descriptor (via the ops layer below) carries all state, the body carries none.
+inline void writeRawBlobBody(DB::Cas::Backend & backend, const DB::Cas::Layout & layout,
+                             const DB::UInt128 & hash, const String & payload)
+{
+    backend.casPut(layout.blobKey(DB::Cas::BlobId(DB::Cas::u128ToHex(hash))), payload, std::nullopt);
+}
+
+/// Create a Clean meta descriptor for `hash` via the shared meta-ops layer (putMetaIfAbsent).
+inline void writeMetaClean(DB::Cas::Backend & backend, const DB::Cas::Layout & layout,
+                           const DB::UInt128 & hash, uint64_t size)
+{
+    DB::Cas::putMetaIfAbsent(backend, layout, hash,
+        DB::Cas::BlobMeta{.state = DB::Cas::MetaState::Clean, .condemn_round = 0, .size = size});
+}
+
+/// Transition an existing meta descriptor to Condemned at `condemn_round`, via a read-modify-CAS on
+/// its current etag (asserts the meta exists — a test setup helper, not production code).
+inline void condemnMeta(DB::Cas::Backend & backend, const DB::Cas::Layout & layout,
+                        const DB::UInt128 & hash, uint64_t condemn_round)
+{
+    const auto lm = DB::Cas::loadMeta(backend, layout, hash);
+    ASSERT_TRUE(lm.has_value());
+    DB::Cas::BlobMeta c = lm->meta;
+    c.state = DB::Cas::MetaState::Condemned;
+    c.condemn_round = condemn_round;
+    DB::Cas::casMeta(backend, layout, hash, lm->etag, c);
+}
+
+/// Load the meta descriptor for `hash` via the shared ops layer (nullopt = absent).
+inline std::optional<DB::Cas::LoadedMeta> loadMetaForTest(DB::Cas::Backend & backend,
+                                                          const DB::Cas::Layout & layout, const DB::UInt128 & hash)
+{
+    return DB::Cas::loadMeta(backend, layout, hash);
 }
 
 /// The latest GC generation (snap_generation pointer in gc/state), or 0 when absent.

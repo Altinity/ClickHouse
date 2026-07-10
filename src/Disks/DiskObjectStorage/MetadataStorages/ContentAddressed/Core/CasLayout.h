@@ -47,6 +47,12 @@ public:
         return shardedKey("blobs", id.string());
     }
 
+    /// The per-hash meta descriptor sibling of the blob body (spec §raw-body-refinement).
+    String blobMetaKey(const BlobId & id) const
+    {
+        return blobKey(id) + ".meta";
+    }
+
     /// Root manifest for a given namespace + shard number.
     /// Phase 1: relocated out of the shared `roots/` tree to `cas/refs/` (hot/cold split). The
     /// namespace fan-out (`<ns>/<shard>`) is unchanged — identity-preserving. GC discovery LISTs
