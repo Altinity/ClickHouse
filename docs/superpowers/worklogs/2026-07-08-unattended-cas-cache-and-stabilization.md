@@ -264,3 +264,15 @@ Watchdog cron: job 60470431 (hourly at :23).
   correct fail-closed) — but liveness is permanently wedged. NOT Phase-A (fold untouched). Backlogged as
   P1 (above Phase B) with live-repro stand preserved + forensics file. Root-cause candidates: orphan
   manifest sweep racing the drop / dropNamespace ordering / chaos-kill half-drop.
+
+### 2026-07-10 — GC-wedge root cause (live-stand forensics)
+- Nailed end-to-end: condemn-race ABORTED mid-63-part-commit → B122 rollback (dropRef x63) → same-txn
+  retry RE-PUBLISHED the SAME ManifestIds → fold folded [removal, re-precommit(+1), promote] same-pass →
+  mf_cleanup kept the removal-half entries (no erase-on-re-own) → R6 deleted 63 LIVE bodies (transient
+  dangle 20:24:51→20:33) → final table DROP's removals clamp forever on missing bodies → pool-wide GC
+  stop for the entire run. Evidence chain: content_addressed_log per-edge events (root_add/root_remove
+  with manifest_ref_instance), shard-20 journal via ca-inspect (single removal event v1487 above the
+  stuck cursor 1486), R6 reason strings, the soak's "ABORTED-retried INSERT attempts: 1". The B170 event
+  log + ca-inspect (both built this session cycle-family) made this diagnosable from SQL + one object
+  decode — exactly their purpose. Fix design going to consult: (W) writer fresh-ids/idempotent re-drive,
+  (F) mf_cleanup symmetric maintenance, (R) snap-source-edge removal recovery (unwedge).

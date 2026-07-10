@@ -1745,3 +1745,22 @@ infra/measurement gaps (not CA defects — all had dangling=0 + agreement):
   exists for precommits; committed manifests' edges are IN the snap already — the fold could subtract
   the snap-recorded edges instead of re-reading the body). Needs TLA+ (extend the fold-barrier model).
   **PRIORITY: above Phase B** — every pool that ever hits this shape stops collecting garbage forever.
+
+- **ROOT CAUSE (2026-07-10, live-stand forensics) for GC-WEDGE-REMOVAL-FOLD:** the trigger was the
+  session's OWN quarry — a 63-part INSERT commit hit the retryable promote-condemn ABORTED mid-publish
+  (the soak's single "ABORTED-retried INSERT"), the B122 compensating rollback dropRef'd the
+  already-published refs, and the commit retry RE-PUBLISHED THE SAME ManifestIds (re-precommit+promote
+  of the same PartStaging). The GC fold then processed [rollback-removal, re-precommit(+1), promote] per
+  part in one pass: `mf_cleanup` is populated by the removal-half and NOTHING erases a manifest that a
+  later same-pass event re-owns → R6 post-CAS exact-token-deleted the bodies of 63 LIVE committed parts
+  (event-log proof: root_add x20 @20:24:47, root_remove x20 + root_add x20 @20:24:49, manifest_delete
+  @20:24:51, ref_drop @20:33:19, clamps from 20:34). TRANSIENT DANGLE window 20:24:51-20:33 (live refs
+  over deleted bodies). The table's later DROP appended the final removals whose bodies are gone →
+  permanent pool-wide clamp. THREE-PART FIX CANDIDATE: (W) writer — a rolled-back PartStaging must not
+  be re-published under the same ManifestId (fresh ids on retry, NoManifestIdReuse) or publishStaging
+  made re-drive-idempotent without the drop+re-add shape; (F) fold — mf_cleanup symmetric maintenance
+  (erase on +1 re-own; R6 skips still-owned manifests) — closes the same-pass shape; (R) recovery —
+  removal-fold with missing committed body resolves its -1 set from the SNAP's source edges
+  (sourceEdgeId(id,path) is already recorded per blob edge; integrate into the three-cursor merge) —
+  unwedges existing pools and removes the clamp class. Cross-pass note: with (W)+(F), a cross-pass
+  rollback/re-own can still ABORT the writer cleanly (fail-closed, no wedge) — acceptable.
