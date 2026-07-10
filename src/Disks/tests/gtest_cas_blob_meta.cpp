@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobMeta.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInspect.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
 #include "cas_test_helpers.h"
 
 namespace DB::ErrorCodes
@@ -64,4 +66,31 @@ TEST(CasBlobMeta, DeleteMetaExactMatchesEtag)
     ASSERT_TRUE(lm.has_value());
     EXPECT_EQ(deleteMetaExact(*backend, store->layout(), h, lm->etag).kind, DeleteOutcome::Kind::Deleted);
     EXPECT_FALSE(loadMeta(*backend, store->layout(), h).has_value());
+}
+
+/// `ca-inspect` dispatch (CasInspect.cpp): a `.meta` key must decode as a BlobMeta, NOT fall through
+/// to the `blobs/` envelope branch (the `.meta` key shares the `blobsPrefix()` prefix with a body key).
+TEST(CasBlobMeta, InspectRendersCondemnedMeta)
+{
+    const Layout layout("p");
+    const DB::UInt128 h = u128Of("hash-inspect");
+    const String key = layout.blobMetaKey(BlobId(u128ToHex(h)));
+    const BlobMeta m{.version = 1, .state = MetaState::Condemned, .condemn_round = 9, .size = 123};
+
+    const String json = caInspectToJson(layout, key, encodeBlobMeta(m));
+    EXPECT_NE(json.find("\"object\":\"blob_meta\""), String::npos);
+    EXPECT_NE(json.find("\"condemned\""), String::npos);
+    EXPECT_NE(json.find("\"condemn_round\":9"), String::npos);
+    EXPECT_NE(json.find("\"size\":123"), String::npos);
+}
+
+TEST(CasBlobMeta, InspectRendersCleanMeta)
+{
+    const Layout layout("p");
+    const DB::UInt128 h = u128Of("hash-inspect-clean");
+    const String key = layout.blobMetaKey(BlobId(u128ToHex(h)));
+    const BlobMeta m{.version = 1, .state = MetaState::Clean, .condemn_round = 0, .size = 7};
+
+    const String json = caInspectToJson(layout, key, encodeBlobMeta(m));
+    EXPECT_NE(json.find("\"clean\""), String::npos);
 }

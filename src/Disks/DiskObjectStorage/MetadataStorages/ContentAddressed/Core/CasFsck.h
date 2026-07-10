@@ -52,6 +52,12 @@ struct FsckReport
     uint64_t awaiting_gc = 0;    /// blobs whose drop is not folded yet / GC never ran (expected)
     uint64_t unaccounted = 0;    /// blobs outside the GC view (transient or anomaly)
 
+    /// The per-hash `.meta` descriptor sibling of a blob body (spec §raw-body-refinement, v3):
+    /// pairing check between the `blobs/` physical listing's `.meta` keys and its body keys.
+    uint64_t meta_without_body = 0;   /// a `.meta` object with no body — INV-META-BODY violation (ERROR)
+    uint64_t body_without_meta = 0;   /// a body with no `.meta` — a not-yet-adopted or crashed-birth
+                                       /// artifact; benign, NOT a dangle
+
     uint64_t physical_bytes = 0;
     uint64_t referenced_logical_bytes = 0;
     uint64_t total_blob_refs = 0;
@@ -65,7 +71,7 @@ struct FsckReport
     std::vector<FsckObject> objects;
 
     double dedupRatio() const { return distinct_blobs ? double(total_blob_refs) / double(distinct_blobs) : 0.0; }
-    bool clean() const { return dangling == 0; }
+    bool clean() const { return dangling == 0 && meta_without_body == 0; }
 };
 
 /// Independent reachability check: recompute reachability from the authoritative refs (NEVER from

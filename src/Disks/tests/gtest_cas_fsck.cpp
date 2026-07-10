@@ -167,6 +167,42 @@ TEST(CasFsck, ForeignBlobClassifiesUnaccounted)
     EXPECT_EQ(rep.pending_gc, 0u);
 }
 
+/// A `.meta` descriptor whose body is missing is an INV-META-BODY violation (meta_without_body),
+/// NOT a `dangling` (nothing referenced it) and NOT one of the present-but-unreferenced blob
+/// pipeline classes (the `.meta` key must be excluded from body classification entirely).
+TEST(CasFsck, MetaWithoutBodyIsFlagged)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend);
+    const DB::UInt128 h = u128Of("meta-without-body");
+    writeMetaClean(*backend, store->layout(), h, /*size*/ 10);   /// meta only, no body written
+
+    const FsckReport rep = runFsck(*store, /*detail*/true);
+    EXPECT_GE(rep.meta_without_body, 1u);
+    EXPECT_EQ(rep.dangling, 0u);
+    EXPECT_EQ(rep.unreachable, 0u);
+    EXPECT_EQ(rep.pending_gc, 0u);
+    EXPECT_EQ(rep.awaiting_gc, 0u);
+    EXPECT_EQ(rep.unaccounted, 0u);
+    EXPECT_FALSE(rep.clean());   // clean() includes meta_without_body == 0
+}
+
+/// A body with no `.meta` sibling is a BENIGN not-yet-adopted (or crashed-birth) artifact — NOT a
+/// dangle, and it must still classify through the ordinary present-but-unreferenced pipeline.
+TEST(CasFsck, BodyWithoutMetaIsBenign)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend);
+    const DB::UInt128 h = u128Of("body-without-meta");
+    writeBlobBody(*backend, store->layout(), h);   /// body only, no meta written
+
+    const FsckReport rep = runFsck(*store, /*detail*/true);
+    EXPECT_GE(rep.body_without_meta, 1u);
+    EXPECT_EQ(rep.dangling, 0u);
+    EXPECT_EQ(rep.meta_without_body, 0u);
+    EXPECT_TRUE(rep.clean());
+}
+
 /// A scan whose deadline is already in the past: partial_on_deadline=false keeps the old
 /// throw-on-timeout contract; partial_on_deadline=true returns the accumulated lower-bound counts
 /// instead of failing empty-handed (the 2026-07-05 campaign lost 5 verdicts to this).

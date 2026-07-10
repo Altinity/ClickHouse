@@ -1,4 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInspect.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobMeta.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEnvelope.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcFormats.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGenerationSeal.h>
@@ -376,6 +377,30 @@ String renderProvenance(const Provenance & p)
         .str();
 }
 
+String metaStateName(MetaState s)
+{
+    switch (s)
+    {
+        case MetaState::Clean:     return "clean";
+        case MetaState::Condemned: return "condemned";
+    }
+    return "unknown";
+}
+
+/// The per-hash `.meta` descriptor sibling of a blob body (spec §raw-body-refinement, v3): a
+/// FRESHNESS MARKER (Clean/Condemned), not the blob's payload — rendered separately from
+/// `renderEnvelopeHeader`, which still decodes the (unchanged, still-enveloped) body itself.
+String renderBlobMeta(const BlobMeta & m)
+{
+    return JsonObj()
+        .add("object", jsonEscape("blob_meta"))
+        .add("version", jsonUInt(m.version))
+        .add("state", jsonEscape(metaStateName(m.state)))
+        .add("condemn_round", jsonUInt(m.condemn_round))
+        .add("size", jsonUInt(m.size))
+        .str();
+}
+
 String renderEnvelopeHeader(const EnvelopeHeader & h)
 {
     return JsonObj()
@@ -400,7 +425,8 @@ String caInspectToJson(const Layout & layout, const String & key, std::string_vi
 {
     /// Most-specific first: `cas/manifests/.../NNNNNN.proto` before the pool-wide `cas/refs/`
     /// prefix, the `/mount` and `/fold_seal` suffixes before the pool-wide `gc/state` exact match,
-    /// and the `/retired/` segment before the pool-wide `blobs/` prefix.
+    /// the `/retired/` segment before the pool-wide `blobs/` prefix, and (v3) the `.meta` sibling
+    /// suffix before the bare `blobs/` prefix it also matches.
     if (key.starts_with(layout.casManifestsPrefix()) && key.ends_with(".proto"))
         return renderPartManifest(decodePartManifest(bytes));
 
@@ -419,12 +445,18 @@ String caInspectToJson(const Layout & layout, const String & key, std::string_vi
     if (key.find("/retired/") != String::npos)
         return renderRetiredSet(decodeRetiredSet(bytes));
 
+    /// The per-hash meta descriptor (v3): `blobMetaKey(id) == blobKey(id) + ".meta"`, so it ALSO
+    /// matches `blobsPrefix()` below — must be checked first or it would wrongly decode as an
+    /// envelope. The body itself (non-`.meta`) is unchanged: it still carries its envelope.
+    if (key.starts_with(layout.blobsPrefix()) && key.ends_with(".meta"))
+        return renderBlobMeta(decodeBlobMeta(bytes));
+
     if (key.starts_with(layout.blobsPrefix()))
         return renderEnvelopeHeader(decodeEnvelopeHeader(bytes, bytes.size(), ObjectKind::Blob));
 
     throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
         "ca-inspect: unrecognized key layout '{}' (recognized: cas/refs, cas/manifests, "
-        "gc/server-roots/*/mount, gc/state, gc/gen/*/fold_seal, retired, blobs)", key);
+        "gc/server-roots/*/mount, gc/state, gc/gen/*/fold_seal, retired, blobs, blobs/*.meta)", key);
 }
 
 }

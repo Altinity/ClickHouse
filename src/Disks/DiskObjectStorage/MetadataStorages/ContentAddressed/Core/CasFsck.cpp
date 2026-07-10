@@ -183,9 +183,37 @@ void runFsckImpl(Store & store, bool detail, const FsckProgress & on_progress, c
     /// pool-wide LIST for what should be O(scoped refs).
     if (namespace_prefix.empty())
     {
-    /// Physical listing: blobs + manifest bodies.
+    /// Physical listing: blobs + manifest bodies. The per-hash `.meta` descriptor sibling
+    /// (`blobMetaKey(id) == blobKey(id) + ".meta"`, v3 raw-body-refinement) lives under the SAME
+    /// `blobsPrefix()` as the body, so partition the raw LIST into bodies vs `.meta` objects up
+    /// front — a `.meta` key must never be classified as a content body (it would otherwise be
+    /// misread as an unreferenced blob and fall into the dangling/pending/unaccounted pipeline
+    /// below), and a body must never be misread as a `.meta`.
+    std::unordered_map<String, uint64_t> present_all;
+    listAll(backend, layout.blobsPrefix(), present_all, on_progress, deadline, "listing blobs");
     std::unordered_map<String, uint64_t> present_blobs;
-    listAll(backend, layout.blobsPrefix(), present_blobs, on_progress, deadline, "listing blobs");
+    std::unordered_set<UInt128, UInt128Hash> present_meta_hashes;
+    present_blobs.reserve(present_all.size());
+    for (const auto & [key, sz] : present_all)
+    {
+        if (key.ends_with(".meta"))
+        {
+            const String body_key = key.substr(0, key.size() - String(".meta").size());
+            const size_t slash = body_key.rfind('/');
+            if (slash == String::npos)
+                continue;
+            try
+            {
+                present_meta_hashes.insert(hexToU128(body_key.substr(slash + 1)));
+            }
+            catch (...)
+            {
+                continue;   /// foreign key shape under blobs/ — not ours to pair
+            }
+        }
+        else
+            present_blobs.emplace(key, sz);
+    }
     for (const auto & [_, sz] : present_blobs)
         report.physical_bytes += sz;
 
@@ -336,6 +364,34 @@ void runFsckImpl(Store & store, bool detail, const FsckProgress & on_progress, c
             report.objects.push_back(std::move(o));
         }
     }
+
+    /// Meta <-> body pairing (spec 2026-07-09 §raw-body-refinement, v3): a `.meta` object with no
+    /// body is an INV-META-BODY violation (the fixed meta/body lifecycle never leaves a meta
+    /// orphaned of its body) — a real ERROR, distinct from `dangling` (which is reachability-driven).
+    /// A body with no `.meta` is a benign not-yet-adopted (or crashed-birth) artifact, NOT a dangle
+    /// — it still classifies through the ordinary present-but-unreferenced pipeline above.
+    std::unordered_set<UInt128, UInt128Hash> present_body_hashes;
+    present_body_hashes.reserve(present_blobs.size());
+    for (const auto & [bkey, _] : present_blobs)
+    {
+        const size_t slash = bkey.rfind('/');
+        if (slash == String::npos)
+            continue;
+        try
+        {
+            present_body_hashes.insert(hexToU128(bkey.substr(slash + 1)));
+        }
+        catch (...)
+        {
+            continue;   /// foreign key shape under blobs/ — not ours to pair
+        }
+    }
+    for (const UInt128 & hash : present_meta_hashes)
+        if (!present_body_hashes.count(hash))
+            ++report.meta_without_body;
+    for (const UInt128 & hash : present_body_hashes)
+        if (!present_meta_hashes.count(hash))
+            ++report.body_without_meta;
     }
     else
     {
