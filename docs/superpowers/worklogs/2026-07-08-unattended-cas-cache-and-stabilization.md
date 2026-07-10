@@ -295,3 +295,15 @@ Watchdog cron: job 60470431 (hourly at :23).
   pending-committed-removal) → fix c1485f52a29 → RED/GREEN gtest → adversarial consult → 20-min verify-soak
   → clean fsck. Remaining (backlogged): the TLA+ regression gate (committed-removal scoping), folded into
   Phase-B Gate B on the meta model.
+
+### 2026-07-10 — Phase B Task 1: Gate B re-authored on the FINAL design (raw body + three-state meta)
+- New model docs/superpowers/models/CaMetaDescriptorRaw.tla: RAW bodies (no envelope/incarnation; etag =
+  content, immutable) + meta with a THREE-state lifecycle {clean, condemned, tombstone} as the SOLE
+  linearization point; TWO writers (multi-writer races — the recorded caveat). Delete = tombstone
+  handshake (condemned→tombstone CAS, delete body, delete tombstone meta); resurrect never re-uploads a
+  present body. GREEN: reduced holds INV_NO_DANGLE + INV_META_BODY; 4 load-bearing sabotages red —
+  blind-adopt (dangle), adopt-over-tombstone (dangle), delete-body-without-tombstone (INV_META_BODY — the
+  tombstone claim is load-bearing), meta-before-body (dangle). This FORMALLY VALIDATES the raw-body
+  refinement: the blob envelope can be dropped entirely. Follow-up (finer interleaving needed): resurrect-
+  skip-CAS + delete-meta-before-body are liveness/debris at this granularity (GC delete gated on NoRef),
+  not safety — noted in the model. NEXT: writing-plans for Phase B on the final design.
