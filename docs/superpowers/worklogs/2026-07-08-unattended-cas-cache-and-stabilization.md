@@ -524,3 +524,26 @@ Watchdog cron: job 60470431 (hourly at :23).
   (validated independently: flushes are fast on RAW CA, no cache needed for logs).
 - Lesson: never use `&` inside a run_in_background:true Bash command — it double-backgrounds, the task
   reports "done" while the container keeps running, tangling result inspection.
+
+### 2026-07-10 — Option 1 (cache for heavy tests): does NOT help one-shot tests; tpc_ds isn't even CA
+- **tpc_ds correction**: 04033_tpc_ds_q14/q24/q31 tables are on the `web` (StaticWeb/HTTP) disk, NOT
+  content_addressed_s3 (04033_tpc_ds.lib: "TPC-DS tables use S3 web disk"). q31's failure is the TOO_SLOW
+  estimator (code 160: "Estimated 613s > max 600s" after reading 3.19M rows in 353s from the web disk), not
+  a CA path. cache-over-CA is irrelevant to it. Almost certainly borderline-slow on any lane (web-disk HTTP
+  reads ~9k rows/s), not a CA regression.
+- **00146 through the cache (remote double-read probe, 20M rows, raw vs cached policy):**
+  * raw: ~450ms every run, ~190-198 S3 GETs, never improves.
+  * cached: COLD #1 = 553ms (SLOWER than raw — populate cost), WARM #2/#3 = 362-387ms, 0 S3 GETs.
+  * 00146 runs its query ONCE → cold cache → the cache makes it SLOWER, not faster. The two reads inside
+    remote('127.0.0.{1,2}') are concurrent and both miss the empty cache. Cache only wins on REPEATED runs.
+- **Conclusion**: the opt-in cache helps warm/repeated reads + logs (written-then-read), but does NOT
+  rescue one-shot heavy analytical tests (00146) — and tpc_ds isn't on CA at all. So option 1 is a dead end
+  for the heavy tests; keep the cache as the opt-in policy already committed.
+- **Remaining reds, final categorization** (no CA-caused bugs left):
+  * arch/env (green on real ARM CI): 01854_s2, 02224_s2, 03233_dynamic (x86-vs-arm FP last-ULP);
+    02479_mysql, 01880_remote_ipv6, 02784_connection_string (no MySQL/IPv6 locally).
+  * slow (not CA-fixable): 04033_tpc_ds_q14/q24/q31 (web disk + TOO_SLOW 600s estimator — likely borderline
+    on all lanes); 00146 (one-shot cacheless heavy read, 262s < 600s — may pass uncontended).
+- NEXT (recommended): (a) check if tpc_ds also fails on a non-CA lane (if yes → not our regression);
+  (b) if 00146/tpc_ds fail the CA lane specifically, bump the scoped speed estimator/timeout for that set
+  (as the original B86 spec anticipated); (c) final full CA-s3 lane run for the authoritative red list.
