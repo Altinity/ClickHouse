@@ -87,6 +87,35 @@ meta (point read = intrinsically fresh) and thereby deletes the floor and the li
 
 ## Part II — the meta-descriptor (Phase B end-state) {#meta-descriptor}
 
+### OPEN REFINEMENT (user, 2026-07-10): raw bodies — eliminate the blob envelope entirely {#raw-body-refinement}
+
+The blob envelope/header's ONLY load-bearing job is the `incarnation_tag` — it varies the body's etag per
+incarnation so exact-token (`If-Match`) deletes and the resurrect/displace dance work. Everything else
+(`logical_hash` = the key, `logical_size` = object metadata / a meta field, `build_id`/`provenance`/
+`intended_ref` = diagnostics, `hash_algo`/`domain_id`/`pad_to_header_len` = framing) is non-load-bearing.
+Once the META owns the incarnation and is the sole linearization point, the body no longer needs a varying
+etag, so the header can be dropped ENTIRELY and the body becomes RAW immutable content:
+
+- **Body** = raw payload, write-once (`PUT If-None-Match` on the content key), etag = content hash. No envelope.
+- **Meta** = the sole conditionally-operated object, with a THREE-state lifecycle `{clean, condemned, tombstone}`
+  (`gen` = the etag = the only linearization token; no body token anywhere).
+- **Resurrect simplifies**: if the body is still present, resurrect = `CAS meta condemned→clean` — NO body
+  re-upload (same content). (Supersedes the Part-II resurrect-re-uploads-body and the C2 exact-token body
+  delete.)
+- **Delete becomes a tombstone handshake** (replaces C2): (1) `CAS meta condemned→tombstone` (If-Match, wins
+  the race vs a resurrect); (2) delete the raw body; (3) delete the tombstone meta. The (2)→(3) window is
+  closed exactly as C1/birth-completion + claim-first sweep do today, but on the meta (a writer seeing
+  `tombstone` re-uploads the body + `CAS tombstone→clean`; its CAS and GC's tombstone-delete target the same
+  `gen` → one wins).
+- **Read path** simplifies too (raw GET, no header framing; reads still never touch the meta). **fsck**
+  self-identifies a body by re-hashing it to its key (copyForward already does this).
+
+STATUS: a genuine further simplification (drops the entire blob envelope + the body token), but it is a
+PROTOCOL change to the delete path (C2 → tombstone), so it requires re-running Gate B on a raw-body/tombstone
+meta model (`{clean, condemned, tombstone}`; new must-stay-red sabotages: delete-body-without-tombstone-claim;
+adopt-over-tombstone). Fold into the Phase-B plan (or a Phase-B' refinement) after that gate. Applies to the
+new meta layout only — the current pre-meta code keeps its envelope.
+
 ### Layout and invariant {#meta-layout}
 
 Per blob hash, TWO objects:
