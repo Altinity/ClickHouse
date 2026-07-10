@@ -65,7 +65,10 @@ public:
         uint64_t cas_part_folder_cache_bytes_ = 64ULL << 20,
         uint64_t cas_part_folder_cache_max_entries_ = 10000,
         uint64_t cas_part_folder_cache_max_entry_bytes_ = 16ULL << 20,
-        uint64_t manifest_decode_cache_bytes_ = 128ULL << 20);
+        uint64_t manifest_decode_cache_bytes_ = 128ULL << 20,
+        /// Task 5: bounded pool size for GC's per-hash freshness-meta writes (condemn/spare/delete);
+        /// see `PoolConfig::gc_meta_pool_size`.
+        uint64_t gc_meta_pool_size_ = 16);
 
     /// Test/diagnostics: one synchronous GC round (creates an ad-hoc scheduler when disabled).
     void runOneGcRoundForTest();
@@ -236,6 +239,8 @@ private:
     /// Phase 5 (part-folder cache spec): byte bound for the manifest DECODE cache (Cas::Store), threaded
     /// into PoolConfig in startup(). 0 disables decode caching entirely (diagnostic mode).
     const uint64_t manifest_decode_cache_bytes;
+    /// Task 5: bounded pool size for GC's per-hash freshness-meta writes, threaded into PoolConfig.
+    const uint64_t gc_meta_pool_size;
 
     /// Set by startup (Store::open is fail-closed; empty store == not started).
     Cas::StorePtr cas_store;

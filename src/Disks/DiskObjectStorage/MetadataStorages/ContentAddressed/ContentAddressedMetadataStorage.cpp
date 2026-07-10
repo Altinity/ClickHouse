@@ -141,7 +141,8 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     uint64_t cas_part_folder_cache_bytes_,
     uint64_t cas_part_folder_cache_max_entries_,
     uint64_t cas_part_folder_cache_max_entry_bytes_,
-    uint64_t manifest_decode_cache_bytes_)
+    uint64_t manifest_decode_cache_bytes_,
+    uint64_t gc_meta_pool_size_)
     : object_storage(std::move(object_storage_))
     , storage_path_prefix(std::move(storage_path_prefix_))
     , storage_path_full(fs::path(object_storage->getRootPrefix()) / storage_path_prefix)
@@ -167,6 +168,7 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     , cas_part_folder_cache_max_entries(cas_part_folder_cache_max_entries_)
     , cas_part_folder_cache_max_entry_bytes(cas_part_folder_cache_max_entry_bytes_)
     , manifest_decode_cache_bytes(manifest_decode_cache_bytes_)
+    , gc_meta_pool_size(gc_meta_pool_size_)
 {
 }
 
@@ -398,6 +400,7 @@ void ContentAddressedMetadataStorage::startup()
     pool_config.manifest_soft_limit = manifest_soft_limit;
     pool_config.manifest_hard_limit = manifest_hard_limit;
     pool_config.manifest_max_delay_ms = manifest_max_delay_ms;
+    pool_config.gc_meta_pool_size = gc_meta_pool_size;
     cas_store = Cas::Store::open(std::move(backend), std::move(pool_config));
     pool_uuid = Cas::u128ToHex(cas_store->poolMeta().pool_id);
     part_access = std::make_unique<ContentAddressed::CachedPartFolderAccess>(cas_store,

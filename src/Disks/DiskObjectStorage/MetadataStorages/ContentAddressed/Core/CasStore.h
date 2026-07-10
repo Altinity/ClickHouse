@@ -170,6 +170,12 @@ struct PoolConfig
     /// (~32 B each => default ~256 MB); each full batch folds into the next attempt number with the
     /// previous attempt's runs as priors, so memory is O(budget), never O(edges).
     uint64_t rebuild_edge_budget = 8000000;
+    /// Task 5 (spec 2026-07-09 §raw-body-refinement, v3): bounded pool size for the per-hash freshness
+    /// meta writes GC schedules at condemn/spare/delete (mass-DROP: a round condemning ~1M blobs would
+    /// take hours sequential). Every job internally catches its own exceptions (never wedges the round;
+    /// feedback_ca_gc_never_throw_on_404) and `Gc::runRegularRound` waits for the round's whole batch
+    /// before the round's single gc/state CAS, so the meta writes are durable before that CAS commits.
+    uint64_t gc_meta_pool_size = 16;
     uint64_t manifest_soft_limit = 16ULL << 20;
     uint64_t manifest_hard_limit = 64ULL << 20;
     /// B164b: max backpressure delay (ms) applied to writer-originated mutations whose encoded root-shard

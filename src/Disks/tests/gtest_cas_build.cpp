@@ -1605,14 +1605,17 @@ TEST(CasBuild, ConvergesUnderProductiveGc)
         s0->dropRef(ns, "part_1");
     }
 
-    /// 2. Condemn (Blob, H, h_token0) in the retire view. A fresh Store::open below refreshes its
-    ///    retire view at open and sees the condemnation, so the dedup-hit on H takes the
-    ///    uploadFromSource (re-stream-a-fresh-incarnation-from-source) path rather than free adoption.
-    ///    INV-1 (B190): no resurrect-by-GET; putBlob re-uploads from its OWN source bytes.
+    /// 2. Condemn (Blob, H, h_token0): `injectRetire` seeds the LEDGER (a real round's later settle/spare
+    ///    of h_token0 rides this entry — the adversarial loop below still exercises that), and v3's
+    ///    `condemnMeta` seeds the per-hash META (the writer's condemned decision is now a point-read of
+    ///    it, not the retire-view — Task 3). `publishOneBlobPart` already created H's meta as Clean, so
+    ///    condemnMeta's read-modify-CAS finds it. Together these reproduce exactly what a real GC condemn
+    ///    now writes (Task 5), without driving a full round just to observe H at in-degree 0.
     DB::Cas::Layout layout("p");
     injectRetire(*b, layout, /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
         {RetiredEntry{.kind = ObjectKind::Blob, .hash = u128Of(content), .token = h_token0,
                       .size = content.size()}});
+    condemnMeta(*b, layout, u128Of(content), /*condemn_round*/ 1);
 
     /// 3. Open the live Store and start build B. B dedup-hits the condemned H and re-uploads from
     ///    source (uploadFromSource via putBlob): a fresh incarnation, a NEW token. B stays ACTIVE for

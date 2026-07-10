@@ -6,7 +6,11 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestCodec.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestId.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
+#include <Common/ThreadPool.h>
+#include <atomic>
+#include <functional>
 #include <map>
+#include <memory>
 #include <set>
 #include <utility>
 #include <vector>
@@ -78,6 +82,11 @@ struct RoundReport
     size_t redeleted = 0;         /// pending deletes executed this round (exact-token blob deletes)
     size_t fence_outs = 0;        /// expired mounts fenced-out by the round's heartbeat floor
     uint64_t min_ack = 0;         /// the heartbeat ack floor latched at round start (UINT64_MAX = no counted heartbeats)
+    /// Task 5: per-hash freshness META write ops (condemn/spare/delete) that threw on the bounded pool
+    /// this round. Advisory-only failures (never wedge the round) but a persistently non-zero count means
+    /// the writer's meta point-read gate is drifting from the ledger -- an operator signal, not a protocol
+    /// input.
+    uint64_t meta_write_anomalies = 0;
     std::vector<RoundAnomaly> anomalies;   /// fold clamps surfaced this round (never wedge the round)
 
     /// Record a fold/recheck anomaly (a clamped cursor). Surfacing, never throwing.
@@ -349,6 +358,14 @@ private:
     /// Update the remembered observation (steal protocol step 3/4).
     void rememberObservation(const GcLease & lease);
 
+    /// Task 5: submit one per-hash freshness-meta op (condemn/spare/delete) to the bounded `meta_pool`.
+    /// NEVER throws: `job` is wrapped in its own try/catch (an exception increments `meta_anomaly_count`
+    /// + a log line, per feedback_ca_gc_never_throw_on_404); if scheduling itself fails (e.g. resource
+    /// exhaustion) the op runs inline rather than being silently lost. Callers must capture every value
+    /// `job` touches BY VALUE (never by reference to a loop-local like the fold's `cur_blob`, which
+    /// mutates across iterations while this job may still be queued).
+    void scheduleMetaJob(std::function<void()> job);
+
     StorePtr store;
     UInt128 gc_id{};
     uint64_t rebuild_edge_budget_override = 0;   /// tests force tiny batches
@@ -368,6 +385,16 @@ private:
     /// B160: the heartbeat observed alongside the lease (gates the steal).
     UInt128 last_seen_hb_owner{};
     uint64_t last_seen_hb_seq = 0;
+
+    /// Task 5: bounded pool for the round's per-hash freshness-meta writes (condemn/spare/delete);
+    /// sized from `PoolConfig::gc_meta_pool_size` (constructed in the ctor, after the null/id checks --
+    /// never touches a possibly-null `store` at member-init time). A `unique_ptr` (not a plain member)
+    /// so construction can happen in the ctor body, after validating `store`.
+    std::unique_ptr<ThreadPool> meta_pool;
+    /// Count of meta-op jobs that threw this round (reset at the top of every `runRegularRound`,
+    /// folded into `RoundReport::meta_write_anomalies` after the round's `meta_pool->wait()`). Written
+    /// from pool worker threads, so atomic.
+    std::atomic<uint64_t> meta_anomaly_count{0};
 
 public:
     /// TEST SEAM: thin public wrapper so unit tests can call foldManifestEdges without driving a full round.

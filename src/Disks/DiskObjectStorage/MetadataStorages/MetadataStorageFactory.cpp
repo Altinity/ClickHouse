@@ -281,13 +281,16 @@ static void registerContentAddressedMetadataStorage(MetadataStorageFactory & fac
         /// Phase-5 (part-folder cache spec): byte bound for the manifest DECODE cache (Cas::Store).
         /// `manifest_decode_cache_bytes = 0` disables decode caching entirely (diagnostic mode).
         const uint64_t manifest_decode_cache_bytes = config.getUInt64(config_prefix + ".manifest_decode_cache_bytes", 128ULL << 20);
+        /// Task 5: bounded pool size for GC's per-hash freshness-meta writes (condemn/spare/delete) —
+        /// a mass-DROP condemning ~1M blobs sequentially would take hours; see `PoolConfig::gc_meta_pool_size`.
+        const uint64_t gc_meta_pool_size = config.getUInt64(config_prefix + ".gc_meta_pool_size", 16);
         auto metadata_storage = std::make_shared<ContentAddressedMetadataStorage>(
             local_object_storage, key_compatibility_prefix, toString(ServerUUID::get()), server_root_id, local_scratch_path,
             global_context, gc_enabled, gc_interval, root_shards, name, dedup_cache_bytes, dedup_head_first_min_bytes,
             gc_snap_generations_to_keep, gc_shards, manifest_sweep_list_budget_keys, manifest_sweep_delete_budget_keys,
             manifest_soft_limit, manifest_hard_limit, manifest_max_delay_ms, gcs_max_conditional_put_bytes,
             cas_part_folder_cache_bytes, cas_part_folder_cache_max_entries, cas_part_folder_cache_max_entry_bytes,
-            manifest_decode_cache_bytes);
+            manifest_decode_cache_bytes, gc_meta_pool_size);
 
         return metadata_storage;
     });

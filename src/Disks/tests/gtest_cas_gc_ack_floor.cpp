@@ -96,6 +96,91 @@ TEST(CasGcRecheck, UnreferencedBlobDeletedExactToken)
     EXPECT_FALSE(backend->head(store->layout().manifestKey(ManifestId{ns, r})).exists);
 }
 
+/// Task 5 (spec 2026-07-09 §raw-body-refinement, v3): GC writes the writer's freshness meta ALONGSIDE
+/// the unchanged ledger retire (RetiredEntry, body token) — the meta is the writer/promote gate's
+/// point-read signal (Task 3/4), not a replacement for the ledger or the exact-token body delete.
+TEST(CasGcRetire, CondemnWritesMetaCondemned)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r = ref("srv-a:1", 1, 0xAA);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+    Gc gc(store, kGc);
+    gc.runRegularRound();   /// +1 folds; blob referenced (`writeBlobBody` never wrote a meta itself)
+    dropRefTransition(*backend, store->layout(), ns, "tbl", r);
+    gc.runRegularRound();   /// -1 folds => in-degree 0 => condemned THIS round
+
+    const auto lm = loadMetaForTest(*backend, store->layout(), DB::UInt128(1));
+    ASSERT_TRUE(lm.has_value()) << "GC must write the freshness meta at condemn time (Task 5)";
+    EXPECT_EQ(lm->meta.state, MetaState::Condemned);
+    EXPECT_TRUE(blobExists(*backend, store->layout(), DB::UInt128(1))) << "condemned, NOT yet deleted";
+}
+
+/// Task 5: the round's exact-token body delete drops the meta alongside it (advisory, no tombstone —
+/// an absent meta reads exactly like a Clean one for the writer's point-read gate).
+TEST(CasGcRetire, DeleteRemovesBodyAndMeta)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r = ref("srv-a:1", 1, 0xAA);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+    Gc gc(store, kGc);
+    gc.runRegularRound();
+    dropRefTransition(*backend, store->layout(), ns, "tbl", r);
+    // condemn -> graduate -> delete (the ack-floor pipeline; runRoundsUntilAbsent keeps the mount's own
+    // ack current so the floor advances).
+    ASSERT_TRUE(runRoundsUntilAbsent(store, gc, *backend, store->layout(), DB::UInt128(1)));
+
+    EXPECT_FALSE(blobExists(*backend, store->layout(), DB::UInt128(1))) << "body gone via exact-token delete";
+    EXPECT_FALSE(loadMetaForTest(*backend, store->layout(), DB::UInt128(1)).has_value())
+        << "the meta must be dropped alongside the exact-token body delete (Task 5)";
+}
+
+/// Task 5: an entry whose in-degree recovers before graduation is SPARED (unchanged ledger behavior) —
+/// its meta must clear back to Clean so the writer's point-read gate can adopt the hash again.
+TEST(CasGcRetire, SpareClearsMeta)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r1 = ref("srv-a:1", 1, 0xA1);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
+    writeManifestRaw(*backend, store->layout(), ns, r1, {blobEntryFor("a", DB::UInt128(1))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r1);
+    Gc gc(store, kGc);
+    gc.runRegularRound();   /// +1 folds
+    dropRefTransition(*backend, store->layout(), ns, "tbl", r1);
+    gc.runRegularRound();   /// -1 folds => in-degree 0 => condemned; meta written Condemned
+    ASSERT_TRUE(currentEntryFor(*backend, store->layout(), DB::UInt128(1)).has_value());
+    {
+        const auto lm = loadMetaForTest(*backend, store->layout(), DB::UInt128(1));
+        ASSERT_TRUE(lm.has_value());
+        ASSERT_EQ(lm->meta.state, MetaState::Condemned);
+    }
+
+    /// Re-reference the SAME blob (same body/token — never re-uploaded) via a fresh ref before
+    /// graduation. The pass merge nets in-degree back to 1: the prior retired entry is SPARED
+    /// (recovery wins, even past the floor) -- not the resurrect-supersede path (the token never changed).
+    const ManifestRef r2 = ref("srv-a:1", 2, 0xA2);
+    writeManifestRaw(*backend, store->layout(), ns, r2, {blobEntryFor("a", DB::UInt128(1))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl_detached", std::nullopt, r2);
+    gc.runRegularRound();   /// +1 folds => spared; meta must clear back to Clean
+
+    EXPECT_FALSE(currentEntryFor(*backend, store->layout(), DB::UInt128(1)).has_value())
+        << "the spared entry drops from the retired set";
+    const auto lm_after = loadMetaForTest(*backend, store->layout(), DB::UInt128(1));
+    ASSERT_TRUE(lm_after.has_value());
+    EXPECT_EQ(lm_after->meta.state, MetaState::Clean)
+        << "SpareClearsMeta (Task 5): recovered in-degree clears the condemned meta";
+    EXPECT_TRUE(blobExists(*backend, store->layout(), DB::UInt128(1)));
+}
+
 /// Copy-forward aftermath, republished arm (spec 2026-07-02-cas-copy-forward-condemned-evidence.md):
 /// after a condemned incarnation (hash, t0) is displaced by a verified copy-forward (fresh token t1)
 /// and the republished part's +1 lands, the listed (hash, t0) entry settles WITHOUT touching the new
