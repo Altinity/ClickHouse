@@ -342,3 +342,20 @@ I’d simplify these first, in this order:
    Don’t let `fsck`, GC, and sweep each invent their own definition.
 
 The guiding simplification: reduce duplicated policy. Repeated loops and small helper calls are fine. Repeated definitions of “live”, “safe to delete”, “namespace exists”, or “token is valid” are where maintenance will hurt.
+## Post-v3 GC settlement follow-ups (2026-07-10, user-raised)
+
+Both are pure GC-internal (writers no longer read the retired list after v3), safety-critical (settlement
+merge = heart of INV-NO-LOSS/NO-RETURN), so each needs its own TLA gate + soak. Do AFTER v3 (freshness
+meta) lands and soaks.
+
+1. **Fold the retired list INTO the snapshot (3-cursor → 2-cursor merge).** Since the retired list is now
+   GC-private AND the snapshot is fully rewritten every non-noop round, the separate `retired_refs` object
+   is pure overhead (an extra GET+PUT/round for state that could ride the snapshot rewrite for free).
+   Fold `{token, condemn_round, delete_pending}` into snapshot entries (snapshot then retains d=0-condemned
+   entries until deleted). Win: −1 object type, −1 GET −1 PUT/round/shard, simpler merge. Prereqs:
+   (i) confirm snap_shard vs blobShard(gc_shards) axes align; (ii) run-file format gains optional
+   condemned-state. Crash-completeness is NOT a concern — the round commits via the single gc/state CAS +
+   fold seal (see reference_gc_one_pass_round_commit), not via the retired object's presence.
+2. **Incremental / LSM snapshot (separate, bigger).** The snapshot is fully rewritten each non-noop round
+   = O(total live nodes) write per round, independent of retired. If it becomes a bottleneck at scale,
+   move to true O(delta)-write log-structured runs with periodic compaction. Independent of #1; #1 first.
