@@ -6,6 +6,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRunFile.h>
 #include <Disks/tests/cas_test_helpers.h>
+#include <IO/WriteBufferFromString.h>
 #include <Common/Exception.h>
 
 using namespace DB::Cas;
@@ -423,4 +424,68 @@ TEST(CasBlobInDegree, ZeroInDegreeStreamsBlockBounded)
               static_cast<uint64_t>(kRunHardCapBlockSize) + 64u * 1024u);
     /// Streaming open touches the tail probe (and at most one exact-footer get); never re-materialized whole.
     EXPECT_LE(backend.getCount(gen2_run_key), 2u);
+}
+
+/// ==== kCondemned row codec + typed source-edge open (retired-in-snapshot T2, spec §2.1) ====
+
+TEST(CasCondemnedRow, RoundTripAllTokenTypes)
+{
+    for (auto type : {DB::Cas::TokenType::ETag, DB::Cas::TokenType::Generation, DB::Cas::TokenType::Emulated})
+    {
+        DB::Cas::CondemnedRow row;
+        row.delete_pending = (type == DB::Cas::TokenType::Generation);
+        row.token = DB::Cas::Token{.value = "etag-abc-123", .type = type};
+        row.size = 4096;
+        row.condemn_round = 7;
+        const auto bytes = DB::Cas::encodeCondemnedRow(row);
+        ASSERT_EQ(bytes[0], DB::Cas::kCondemned);
+        EXPECT_EQ(DB::Cas::decodeCondemnedRow(bytes), row);
+    }
+}
+
+TEST(CasCondemnedRow, UnknownTokenTypeFailsClosed)
+{
+    DB::Cas::CondemnedRow row;
+    row.token = DB::Cas::Token{.value = "t", .type = DB::Cas::TokenType::ETag};
+    auto bytes = DB::Cas::encodeCondemnedRow(row);
+    bytes[2] = 99;   // token_type byte (offset: [0]=0x02 [1]=flags [2]=token_type)
+    EXPECT_THROW(DB::Cas::decodeCondemnedRow(bytes), DB::Exception);
+}
+
+TEST(CasCondemnedRow, TruncatedPayloadFailsClosed)
+{
+    DB::Cas::CondemnedRow row;
+    row.token = DB::Cas::Token{.value = "0123456789", .type = DB::Cas::TokenType::ETag};
+    auto bytes = DB::Cas::encodeCondemnedRow(row);
+    bytes.resize(bytes.size() - 3);   // token bytes shorter than declared token_len
+    EXPECT_THROW(DB::Cas::decodeCondemnedRow(bytes), DB::Exception);
+}
+
+TEST(CasSourceEdgeRun, TypedOpenRejectsWrongSchemaAndKind)
+{
+    /// A run written with today's writer carries key_schema 0 -> the typed open must fail closed.
+    /// Build a minimal run body via RunFileWriter with a deliberately wrong header.
+    DB::WriteBufferFromOwnString out;
+    DB::Cas::RunHeader header;
+    header.kind = DB::Cas::RunKind::SourceEdge;
+    header.key_schema = 0;                                    // pre-refactor schema
+    DB::Cas::RunFileWriter writer(out, header);
+    writer.finish();
+    EXPECT_THROW(DB::Cas::openSourceEdgeRun(out.str()), DB::Exception);
+
+    DB::WriteBufferFromOwnString out2;
+    DB::Cas::RunHeader h2;
+    h2.kind = DB::Cas::RunKind::ManifestEntries;              // wrong kind, right schema
+    h2.key_schema = DB::Cas::kSourceEdgeKeySchema;
+    DB::Cas::RunFileWriter w2(out2, h2);
+    w2.finish();
+    EXPECT_THROW(DB::Cas::openSourceEdgeRun(out2.str()), DB::Exception);
+}
+
+TEST(CasSourceEdgeRun, SourceEdgeIdZeroIsReserved)
+{
+    /// The zero source_id is the sentinel namespace; producers fail closed on a zero hash
+    /// (probability 2^-128 — the check documents the reservation).
+    EXPECT_THROW(DB::Cas::assertValidSourceEdgeId(UInt128{0}), DB::Exception);
+    EXPECT_NO_THROW(DB::Cas::assertValidSourceEdgeId(UInt128{1}));
 }

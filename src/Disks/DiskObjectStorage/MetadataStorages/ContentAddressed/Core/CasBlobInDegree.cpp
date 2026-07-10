@@ -13,6 +13,8 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int CORRUPTED_DATA;
+    extern const int LOGICAL_ERROR;
+    extern const int NOT_IMPLEMENTED;
 }
 }
 
@@ -22,8 +24,6 @@ namespace DB::Cas
 namespace
 {
 
-constexpr char kEdgeActive    = 0x01;   // sealed-run row: a surviving active edge
-constexpr char kZeroMarker    = 0x00;   // sealed-run row: blob transitioned to zero this generation
 const UInt128 kZeroSourceId{0};
 
 UInt128 cityHash128(const String & bytes)
@@ -109,7 +109,71 @@ UInt128 sourceEdgeId(const ManifestId & id, const String & path)
     canon += '\0';
     canon += path;
     const auto h = CityHash_v1_0_2::CityHash128(canon.data(), canon.size());
-    return (static_cast<UInt128>(h.high64) << 64) | static_cast<UInt128>(h.low64);
+    const UInt128 result = (static_cast<UInt128>(h.high64) << 64) | static_cast<UInt128>(h.low64);
+    if (result == UInt128{0})
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "CAS source edge: hash collided with the reserved sentinel id 0");
+    return result;
+}
+
+void assertValidSourceEdgeId(const UInt128 & source_id)
+{
+    if (source_id == UInt128{0})
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "CAS source edge: source_id 0 is the reserved sentinel key (spec §2.1)");
+}
+
+String encodeCondemnedRow(const CondemnedRow & row)
+{
+    String out;
+    out.push_back(kCondemned);
+    out.push_back(static_cast<char>(row.delete_pending ? 1 : 0));
+    out.push_back(static_cast<char>(row.token.type));
+    auto beU64 = [&](uint64_t v) { for (int i = 7; i >= 0; --i) out += static_cast<char>((v >> (8 * i)) & 0xFF); };
+    beU64(row.condemn_round);
+    beU64(row.size);
+    if (row.token.value.size() > 0xFFFF)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS condemned row: token too long ({})", row.token.value.size());
+    out += static_cast<char>((row.token.value.size() >> 8) & 0xFF);
+    out += static_cast<char>(row.token.value.size() & 0xFF);
+    out += row.token.value;
+    return out;
+}
+
+CondemnedRow decodeCondemnedRow(std::string_view p)
+{
+    /// [0]=0x02 [1]=flags [2]=token_type [3..10]=round [11..18]=size [19..20]=len [21..]=value
+    constexpr size_t kFixed = 21;
+    if (p.size() < kFixed || p[0] != kCondemned)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS condemned row: malformed header");
+    CondemnedRow row;
+    const uint8_t flags = static_cast<uint8_t>(p[1]);
+    if (flags > 1)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS condemned row: unknown flags 0x{:02x}", flags);
+    row.delete_pending = flags & 1;
+    const uint8_t type = static_cast<uint8_t>(p[2]);
+    if (type < 1 || type > 3)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS condemned row: unknown token_type {}", type);
+    row.token.type = static_cast<TokenType>(type);
+    auto beU64 = [&](size_t off) { uint64_t v = 0; for (int i = 0; i < 8; ++i) v = (v << 8) | static_cast<uint8_t>(p[off + i]); return v; };
+    row.condemn_round = beU64(3);
+    row.size = beU64(11);
+    const size_t len = (static_cast<uint8_t>(p[19]) << 8) | static_cast<uint8_t>(p[20]);
+    if (p.size() != kFixed + len)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS condemned row: declared token_len {} vs payload {}", len, p.size() - kFixed);
+    row.token.value = String(p.substr(kFixed, len));
+    return row;
+}
+
+RunFileReader openSourceEdgeRun(std::string_view bytes)
+{
+    RunFileReader reader(bytes);
+    if (reader.kind() != RunKind::SourceEdge)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS source-edge run: wrong kind {}", static_cast<int>(reader.kind()));
+    if (reader.keySchema() != kSourceEdgeKeySchema)
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+            "CAS source-edge run: key_schema {} (this build reads only {})", reader.keySchema(), kSourceEdgeKeySchema);
+    return reader;
 }
 
 String srcEdgeRunKey(const UInt128 & blob_hash, const UInt128 & source_id)

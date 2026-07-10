@@ -4,6 +4,8 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGenerationSeal.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestId.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRunFile.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasToken.h>
 #include <base/types.h>
 #include <base/extended_types.h>
 #include <cstdint>
@@ -12,11 +14,43 @@
 namespace DB::Cas
 {
 
+/// Sealed source-edge run row tags (spec §2.1). `kEdgeActive`/`kZeroMarker` were promoted from a
+/// `.cpp`-local anonymous namespace: `kCondemned` (the retired-in-snapshot row, Task 2) needs to
+/// share the tag byte space, and `decodeCondemnedRow` (a public entry point) must be able to
+/// recognize its own tag.
+constexpr char kEdgeActive = 0x01;   // sealed-run row: a surviving active edge
+constexpr char kZeroMarker = 0x00;   // sealed-run row: blob transitioned to zero this generation
+constexpr char kCondemned  = 0x02;   // sealed-run row: blob retired-in-snapshot (spec §2.1)
+constexpr uint8_t kSourceEdgeKeySchema = 1;
+
 /// Deterministic 16-byte id of a source edge (ManifestId, path). Distinctness only — not reconstructable.
 UInt128 sourceEdgeId(const ManifestId & id, const String & path);
 /// 32-byte run key = blob_hash(16 BE) ++ source_id(16 BE); lexicographic == (blob_hash, source_id) order.
 String srcEdgeRunKey(const UInt128 & blob_hash, const UInt128 & source_id);
 bool parseSrcEdgeRunKey(const String & key, UInt128 & blob_hash, UInt128 & source_id);
+
+/// The zero source_id is the reserved sentinel key (used internally for the zero-marker row) —
+/// producers of real source edges must fail closed on a hash collision with it (spec §2.1).
+void assertValidSourceEdgeId(const UInt128 & source_id);
+
+/// A retired-in-snapshot row (spec §2.1): a blob condemned within the source-edge run itself,
+/// carrying the exact incarnation token to delete and the round it was condemned at.
+/// [0x02][flags][token_type][round BE64][size BE64][token_len BE16][token bytes]
+struct CondemnedRow
+{
+    bool delete_pending = false;
+    Token token;                 // {value, type} — full token, spec §2.1
+    uint64_t size = 0;
+    uint64_t condemn_round = 0;
+    bool operator==(const CondemnedRow &) const = default;
+};
+
+String encodeCondemnedRow(const CondemnedRow & row);          // [0x02][flags][token_type][round][size][len][value]
+CondemnedRow decodeCondemnedRow(std::string_view payload);    // throws CORRUPTED_DATA per spec §2.1
+
+/// Typed open (spec §2.1): validates kind == SourceEdge and key_schema == kSourceEdgeKeySchema,
+/// fails closed otherwise. ALL source-edge run readers go through this.
+RunFileReader openSourceEdgeRun(std::string_view bytes);
 
 /// Write-once for a DETERMINISTIC artifact (same inputs => byte-identical bytes): the blob in-degree
 /// runs AND the fold/completion seals. `putIfAbsent`; on a `PreconditionFailed` the key is already

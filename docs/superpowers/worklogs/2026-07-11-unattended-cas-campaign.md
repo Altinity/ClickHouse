@@ -35,3 +35,13 @@ Consult hard calls with a fresh model; very hard → fable / codex 5.5 xhigh. Mo
   + a direct code check (clearSparedMeta really clears-to-Clean pre-CAS) caught it. Model the code's real
   effects, not the intended ones.
 - Next: T2 (kCondemned codec + typed open + source_id=0 guard).
+
+### T2 BLOCKED by build-infra stray (unblocked) → resumed
+- T2 code (kCondemned codec/typed-open/source_id guard) is COMPLETE and compiles cleanly at object level
+  in both build/ and build_asan/; implementer reported BLOCKED because the full dbms link failed.
+- Root cause: the stray untracked src/Coordination/KeeperRequestsQueue.cpp (residue from the T1 stash-pop
+  incident) — no matching .h on cas-gc-rebuild; ClickHouse CMake globs Coordination/*.cpp into dbms → the
+  whole dbms/unit_tests_dbms build broke, unconditionally, in every build dir.
+- FIX (non-destructive): moved it to tmp/misplaced_stray/KeeperRequestsQueue.cpp. Content is preserved 3x
+  (this copy + stash@{0} + the better_keeper worktree on better_keeper6). It never belonged on this branch.
+- Resuming T2: rebuild + run the new + pre-existing tests, then commit if green.
