@@ -1788,3 +1788,31 @@ infra/measurement gaps (not CA defects — all had dangling=0 + agreement):
   then sweep deletes]; TLA+ obligation (delete-after-sealed-decrements over committed removals). Unwedge of
   the live/existing pools: `SYSTEM CONTENT ADDRESSED GC REBUILD` (rebuildBaseline) OR the fold recovery
   variant (R) — still worth evaluating so an already-orphaned committed body doesn't wedge forever.
+
+- **ROOT CAUSE LOCKED (2026-07-10, decisive disambiguation):** confirmed THEORY 2 (orphan sweep), refuted
+  the fresh-model consult's R6/NoManifestIdReuse reframe. Decisive evidence for 1:308:1 (ns b3781ce3):
+  shard-20 journal has EXACTLY ONE binding event — the removal at transition_version 1487, ZERO new_binding
+  re-owns (R6-reuse mechanism impossible); the fold cursor is stuck at 1486 (one BEFORE v1487) so the fold
+  never reached the removal → R6 never enqueued it → and indeed ZERO ns-scoped manifest_delete for it (the
+  1468 deletes at 20:33:32 are OTHER dropped manifests). The stand runs the CURRENT Phase-A binary (compose
+  mounts ../../build/programs/clickhouse), not an older vintage. Only no-event manifest-body deleter with
+  the demonstrated gap = the orphan sweep (deletePrefixWholesale=gen prefix, reclaimDroppedShards=ref-shard
+  objects — neither touches manifest bodies). FIX = activeManifestKeys pending-committed-removal protection
+  (drop the owner_kind==Precommit condition on the transition_version>cursor branch).
+- **Consult's surviving findings (folded):** (R) recovery-from-snap REJECTED — source_id = one-way
+  CityHash128(ns,ref,path), a missing body's edges can't be enumerated. Existing-pool UNWEDGE = SYSTEM
+  CONTENT ADDRESSED GC REBUILD FORCE (rebuildBaseline reconstructs from root.refs, refuses only on a LIVE
+  ref naming a missing body — dropped table's refs are gone → no refusal; FORCE needed on a healthy pool).
+  R6 owner-recheck (F1) + erase-on-+1 (F2) are a REAL latent hardening (R6 deletes mf_cleanup with no
+  owner re-check, relying on NoManifestIdReuse) — backlog as defense-in-depth, NOT this bug.
+
+## INTROSPECTION-3-2026-07-10: orphan sweep deletes manifest bodies with NO audit event (diagnosis blocker)
+- The orphan manifest sweep (`sweepManifestCursorPage`, CasOrphanManifestSweep.cpp) `deleteExact`s manifest
+  bodies and emits NOTHING to system.content_addressed_log. This directly blocked the GC-wedge diagnosis:
+  the path that deleted a LIVE committed body left zero trace; the deleter had to be inferred by elimination
+  + code reading + pool `find`. INVARIANT: every manifest-body deletion must be audited. FIX: emit a
+  `manifest_sweep_delete` (or reuse ManifestDelete with a distinct reason) per sweep deletion carrying
+  {ns, manifest_id, eligibility, cursor}. With it, this diagnosis is a one-line SQL query.
+- Relatedly (caused the FIRST wrong root cause): manifest `object_hash`/`manifest_ref_instance` in the event
+  log is NOT namespace-qualified — "1:308:1" collides across tables. FIX: qualify with namespace (or add a
+  manifest_id column). Both extend the INTROSPECTION-1/2 audit-completeness line.
