@@ -177,9 +177,9 @@ INV_FOLD_PROGRESS == (ownerState = "removing") => (body \/ sealedRemoval)
 
 - [ ] **Step 4: Write the two configs**
 
-Create `docs/superpowers/models/CaManifestSweepWindow_reduced.cfg`:
+Create `docs/superpowers/models/CaManifestSweepWindow_reduced.cfg` (cfg comments use `\*`, not `*`):
 ```
-* Wedge gate (reduced): the fix (protect pending-committed-removals) holds INV_FOLD_PROGRESS.
+\* Wedge gate (reduced): the fix (protect pending-committed-removals) holds INV_FOLD_PROGRESS.
 SPECIFICATION Spec
 CONSTANTS SabSweepCommitted = FALSE
 INVARIANT TypeOK
@@ -187,7 +187,7 @@ INVARIANT INV_FOLD_PROGRESS
 ```
 Create `docs/superpowers/models/CaManifestSweepWindow_sab_sweep_committed.cfg`:
 ```
-* Wedge sabotage: sweep deletes the committed body pre-seal -> INV_FOLD_PROGRESS violated.
+\* Wedge sabotage: sweep deletes the committed body pre-seal -> INV_FOLD_PROGRESS violated.
 SPECIFICATION Spec
 CONSTANTS SabSweepCommitted = TRUE
 INVARIANT TypeOK
