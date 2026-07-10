@@ -15,12 +15,12 @@ TEST(CasBlobMeta, CodecRoundTripsAllStates)
 {
     for (MetaState s : {MetaState::Clean, MetaState::Condemned, MetaState::Tombstone})
     {
-        BlobMeta m{.version = 1, .state = s, .condemn_round = 42, .size = 1 << 20};
+        BlobMeta m{.state = s, .condemn_round = 42, .size = 1 << 20};   // version defaults to 2 (current codec)
         const BlobMeta back = decodeBlobMeta(encodeBlobMeta(m));
         EXPECT_EQ(static_cast<uint8_t>(back.state), static_cast<uint8_t>(s));
         EXPECT_EQ(back.condemn_round, 42u);
         EXPECT_EQ(back.size, 1u << 20);
-        EXPECT_EQ(back.version, 1u);
+        EXPECT_EQ(back.version, 2u);
     }
 }
 
@@ -65,4 +65,15 @@ TEST(CasBlobMeta, DeleteMetaExactMatchesEtag)
     ASSERT_TRUE(lm.has_value());
     EXPECT_EQ(deleteMetaExact(*backend, store->layout(), h, lm->etag).kind, DeleteOutcome::Kind::Deleted);
     EXPECT_FALSE(loadMeta(*backend, store->layout(), h).has_value());
+}
+
+TEST(CasBlobMeta, FreshIncarnationMakesEachWriteUnique)
+{
+    BlobMeta a{.state = MetaState::Clean, .size = 1};
+    BlobMeta b{.state = MetaState::Clean, .size = 1};
+    a.incarnation = DB::Cas::mintU128();
+    b.incarnation = DB::Cas::mintU128();
+    EXPECT_NE(a.incarnation, b.incarnation);
+    EXPECT_NE(encodeBlobMeta(a), encodeBlobMeta(b));   // distinct bytes -> distinct S3 etag
+    EXPECT_EQ(decodeBlobMeta(encodeBlobMeta(a)).incarnation, a.incarnation);   // round-trips
 }

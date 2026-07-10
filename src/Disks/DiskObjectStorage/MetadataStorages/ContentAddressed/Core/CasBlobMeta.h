@@ -23,12 +23,17 @@ enum class MetaState : uint8_t
 };
 
 /// The durable meta body (fixed codec, ~a few dozen bytes). `version` guards codec evolution; `size` is
-/// the raw body size (introspection/fsck/GC accounting — reads never consult the meta). No incarnation
-/// field: under raw bodies the meta etag is the incarnation.
+/// the raw body size (introspection/fsck/GC accounting — reads never consult the meta). `incarnation` is
+/// a fresh nonce (mintU128()) minted on every WRITE of a meta object (create or CAS-transition): S3
+/// ETags are content-derived, so without a per-write nonce two `Clean` metas for the same hash with the
+/// same state/condemn_round/size would re-encode to identical bytes — and hence an identical etag — a
+/// latent ABA on the clean->condemned CAS precondition. With the nonce, "meta etag = incarnation" is
+/// literally true.
 struct BlobMeta
 {
-    uint8_t version = 1;
+    uint8_t version = 2;
     MetaState state = MetaState::Clean;
+    UInt128 incarnation{};         /// fresh per-write nonce (mintU128()); makes every write's bytes unique
     uint64_t condemn_round = 0;   /// the GC round that condemned this incarnation (M4: guards a
                                   /// condemned-etag ABA after spare->re-condemn)
     uint64_t size = 0;
