@@ -2,6 +2,7 @@
 
 #include <optional>
 
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcFormats.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasServerRoot.h>
@@ -360,6 +361,91 @@ TEST(CasGcRebuild, LeaseConflictRefuses)
     EXPECT_FALSE(rep.performed);
     EXPECT_NE(rep.refusal.find("lease"), String::npos) << rep.refusal;
     EXPECT_NE(rep.refusal.find("leader"), String::npos) << rep.refusal;
+}
+
+/// Retired-in-snapshot (T6): a physically-present blob with ZERO edges (an orphan — the
+/// pipeline-blindness case) is condemned DIRECTLY into the rebuilt run as a `kCondemned` row in
+/// the SAME single flush pass as the edge-bearing blobs — no separate `RetiredSet` object, no
+/// orphan attempt run. A subsequent regular round graduates then redeletes it through the run.
+TEST(CasGcRebuild, OrphanBlobCondemnedInRebuiltRun)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    const RootNamespace ns{"00/aa@cas@"};
+
+    /// An edge-bearing blob (committed ref) and an ORPHAN blob (a body with no owner at all) —
+    /// gc_shards defaults to 1, so BOTH land on shard 0: the merged flush must fold the edge row
+    /// AND the orphan's `kCondemned` row into one run (the both-edges-and-condemns shard).
+    const ManifestRef live_r = ref(1, 0xA1);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
+    writeManifestRaw(*backend, store->layout(), ns, live_r, {blobEntryFor("a", DB::UInt128(1))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl_live", std::nullopt, live_r);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(2));   /// orphan: present, zero edges
+
+    Gc gc(store, kGc);
+    const RebuildReport rep = gc.rebuildBaseline(/*force*/ true);
+    ASSERT_TRUE(rep.performed) << rep.refusal;
+    EXPECT_EQ(rep.committed_refs, 1u);
+
+    const GcState st = decodeGcState(backend->get(store->layout().gcStateKey())->bytes);
+    EXPECT_TRUE(st.retired_refs.empty()) << "the RetiredSet dual-write must be gone";
+    const auto seal =
+        decodeFoldSeal(backend->get(store->layout().foldSealKey(st.snap_generation, st.snap_attempt))->bytes);
+
+    /// The orphan is a `kCondemned` row in the rebuilt run at the minted round; the edge blob is not.
+    bool found_orphan = false;
+    bool found_edge_condemned = false;
+    for (const RunRef & r : seal.blob_target_runs)
+    {
+        RunFileReader reader = openSourceEdgeRun(*backend, r.key);
+        String k, p;
+        while (reader.next(k, p))
+        {
+            UInt128 bh, sid;
+            ASSERT_TRUE(parseSrcEdgeRunKey(k, bh, sid));
+            if (p.empty() || p[0] != kCondemned)
+                continue;
+            const CondemnedRow row = decodeCondemnedRow(p);
+            if (bh == DB::UInt128(2))
+            {
+                found_orphan = true;
+                EXPECT_EQ(row.condemn_round, rep.round);
+                EXPECT_FALSE(row.delete_pending);
+            }
+            if (bh == DB::UInt128(1))
+                found_edge_condemned = true;
+        }
+    }
+    EXPECT_TRUE(found_orphan) << "the orphan blob must be a kCondemned row in the rebuilt run";
+    EXPECT_FALSE(found_edge_condemned) << "an edge-bearing blob must never be condemned";
+
+    /// The seal's TOTAL `condemned_summary` counts the orphan (shard 0, at the minted round).
+    ASSERT_TRUE(seal.condemned_summary.contains(0));
+    EXPECT_EQ(seal.condemned_summary.at(0).condemned_total, 1u);
+    EXPECT_EQ(seal.condemned_summary.at(0).oldest_nonpending_condemn_round, rep.round);
+
+    /// No orphan attempt run: every `blob_target` run object under the rebuilt generation is
+    /// referenced by the seal (the merged single flush leaves no unreferenced attempt-A run).
+    std::set<String> sealed_keys;
+    for (const RunRef & r : seal.blob_target_runs)
+        sealed_keys.insert(r.key);
+    const String gen_prefix = store->layout().gcGenPrefix(st.snap_generation);
+    String cursor;
+    for (;;)
+    {
+        const ListPage page = backend->list(gen_prefix, cursor, 1000);
+        for (const auto & lk : page.keys)
+            if (lk.key.find("/blob_target/") != String::npos)
+                EXPECT_TRUE(sealed_keys.contains(lk.key)) << "orphan attempt run: " << lk.key;
+        if (page.next_cursor.empty())
+            break;
+        cursor = page.next_cursor;
+    }
+
+    /// End-to-end: regular rounds graduate then REDELETE the orphan through the run (the pipeline-
+    /// blindness repair works without a retired set); the edge-bearing blob stays intact.
+    EXPECT_TRUE(runRoundsUntilAbsent(store, gc, *backend, store->layout(), DB::UInt128(2)));
+    EXPECT_TRUE(backend->head(store->layout().blobKey(BlobId(u128ToHex(DB::UInt128(1))))).exists);
 }
 
 /// CLAMP SUPPRESSION regression (2026-07-03 night soak: 31 dangling blobs). A committed +1 for

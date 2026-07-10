@@ -1816,13 +1816,23 @@ RebuildReport Gc::rebuildBaseline(bool force)
     std::vector<std::vector<BlobDelta>> buckets(gc_shards);
     std::vector<std::vector<RunRef>> prior_runs(gc_shards);
     std::vector<uint64_t> attempt_of(gc_shards, 0);
+    /// Retired-in-snapshot (T6): the final flush folds the orphan condemn synth deltas ALONGSIDE the
+    /// edges into one run, so `condemn_seed_head` (the captured tokens/sizes) and `condemn_round_stamp`
+    /// are set after the pipeline-blindness LIST/HEAD below and consumed by the LAST `flush_shard` per
+    /// shard. Empty/0 until then keeps mid-traversal budget flushes behavior-identical to the legacy
+    /// edge-only fold (`foldDeltasIntoGeneration` defaults: no head_blob condemns, current_round 0
+    /// graduates nothing).
+    std::function<std::optional<HeadResult>(const UInt128 &)> condemn_seed_head;
+    uint64_t condemn_round_stamp = 0;
     auto flush_shard = [&](uint64_t shard)
     {
         if (buckets[shard].empty())
             return;
         std::vector<RunRef> out;
         foldDeltasIntoGeneration(backend, layout, prior_runs[shard], generation, ++attempt_of[shard],
-                                 shard, std::move(buckets[shard]), out);
+                                 shard, std::move(buckets[shard]), out,
+                                 /*current_round*/0, /*condemn_round*/condemn_round_stamp, condemn_seed_head,
+                                 /*peek_head*/{}, /*out_retired*/nullptr, /*suppress_destructive*/false);
         buckets[shard].clear();
         prior_runs[shard] = std::move(out);
     };
@@ -1965,17 +1975,16 @@ RebuildReport Gc::rebuildBaseline(bool force)
         }
     }
 
-    for (uint64_t shard = 0; shard < gc_shards; ++shard)
-        flush_shard(shard);   /// edge runs only; the retired-in-snapshot seeding below appends to them
-
     /// Pipeline blindness repair (found by the convergence test): the fold discovers candidates by
     /// TRANSITIONS to zero, but a blob whose edges are entirely gone by rebuild time has NO row in
     /// the rebuilt baseline — it would never transition and never be reclaimed. The rebuild holds
     /// FULL-TRAVERSAL knowledge, so it condemns them itself: every physically-present blob with
-    /// zero rebuilt edges enters the retired list with a head-captured exact token at the minted
-    /// round. Graduation still waits for every mount to ack past that round (the normal floor) —
-    /// in model terms this is exactly the GComplete condemnation the next pass would perform if the
-    /// fold were omniscient.
+    /// zero rebuilt edges is condemned at the minted round. Graduation still waits for every mount to
+    /// ack past that round (the normal floor) — in model terms this is exactly the GComplete
+    /// condemnation the next pass would perform if the fold were omniscient. This LIST/HEAD sweep runs
+    /// BEFORE the run flush (retired-in-snapshot T6): the orphans are folded into the SAME single flush
+    /// pass as the edges (no separate second fold, no orphan attempt run), so it needs the COMPLETE
+    /// `edge_bearing` set from the traversal above.
     std::vector<std::vector<RetiredEntry>> zero_condemned(gc_shards);
     {
         const String bprefix = layout.blobsPrefix();
@@ -2012,40 +2021,35 @@ RebuildReport Gc::rebuildBaseline(bool force)
     }
 
     /// Numbering, part 2: the round above every surviving fence/state/generation number (also the
-    /// condemn_round stamped on the full-traversal condemns seeded into the runs just below).
+    /// condemn_round stamped on the full-traversal condemns folded into the runs below).
     const uint64_t round = std::max({max_fence_round, state.round, max_gen}) + 1;
 
-    /// Retired-in-snapshot seeding (T3): write each full-traversal condemn into its shard's baseline RUN
-    /// as a kCondemned sentinel row, so the next regular round settles it FROM THE RUN (the fold no longer
-    /// takes a separate retired-set input). This rides the fold's own fresh-condemn path: a synthetic
-    /// +edge/-edge pair at the reserved source id nets the blob to in-degree 0 (no surviving edge — the
-    /// pair cancels), and a head_blob replaying the already-captured exact token/size mints the kCondemned
-    /// row at `round`. The condemn set is disjoint from edge-bearing blobs, so no real edge is perturbed.
+    /// Retired-in-snapshot seeding (T3/T6): append each full-traversal condemn's synthetic +edge/-edge
+    /// pair (reserved `source_id = UInt128{1}`, net in-degree 0 — the pair cancels) into its shard's
+    /// bucket, and expose the already-captured exact token/size through `condemn_seed_head`. The SINGLE
+    /// `flush_shard` below then folds these alongside the real edges: the fold's own fresh-condemn path
+    /// mints a `kCondemned` sentinel row at `round` for each. The condemn set is disjoint from
+    /// edge-bearing blobs by construction, so no real edge is perturbed. The next regular round settles
+    /// each row FROM THE RUN (the fold no longer takes a separate retired-set input).
+    std::unordered_map<UInt128, HeadResult, UInt128Hash> condemn_seeded;
     for (uint64_t shard = 0; shard < gc_shards; ++shard)
     {
-        if (zero_condemned[shard].empty())
-            continue;
-        std::unordered_map<UInt128, HeadResult, UInt128Hash> seeded;
-        std::vector<BlobDelta> synth;
-        synth.reserve(zero_condemned[shard].size() * 2);
         for (const RetiredEntry & e : zero_condemned[shard])
         {
-            seeded.emplace(e.hash, HeadResult{.exists = true, .size = e.size, .token = e.token, .attributes = {}});
-            synth.push_back(BlobDelta{.blob_hash = e.hash, .source_id = UInt128{1}, .remove = false});
-            synth.push_back(BlobDelta{.blob_hash = e.hash, .source_id = UInt128{1}, .remove = true});
+            condemn_seeded.emplace(e.hash, HeadResult{.exists = true, .size = e.size, .token = e.token, .attributes = {}});
+            buckets[shard].push_back(BlobDelta{.blob_hash = e.hash, .source_id = UInt128{1}, .remove = false});
+            buckets[shard].push_back(BlobDelta{.blob_hash = e.hash, .source_id = UInt128{1}, .remove = true});
         }
-        const auto seed_head = [&seeded](const UInt128 & h) -> std::optional<HeadResult>
-        {
-            const auto it = seeded.find(h);
-            return it == seeded.end() ? std::nullopt : std::optional<HeadResult>(it->second);
-        };
-        std::vector<RunRef> out;
-        foldDeltasIntoGeneration(backend, layout, prior_runs[shard], generation, ++attempt_of[shard],
-                                 shard, std::move(synth), out,
-                                 /*current_round*/0, /*condemn_round*/round, seed_head,
-                                 /*peek_head*/{}, /*out_retired*/nullptr, /*suppress_destructive*/false);
-        prior_runs[shard] = std::move(out);
     }
+    condemn_seed_head = [&condemn_seeded](const UInt128 & h) -> std::optional<HeadResult>
+    {
+        const auto it = condemn_seeded.find(h);
+        return it == condemn_seeded.end() ? std::nullopt : std::optional<HeadResult>(it->second);
+    };
+    condemn_round_stamp = round;
+
+    for (uint64_t shard = 0; shard < gc_shards; ++shard)
+        flush_shard(shard);   /// single pass: real-edge rows AND the orphan kCondemned rows
 
     for (uint64_t shard = 0; shard < gc_shards; ++shard)
         for (const RunRef & r : prior_runs[shard])
@@ -2081,24 +2085,14 @@ RebuildReport Gc::rebuildBaseline(bool force)
     next.round = round;
     next.snap_generation = generation;
     next.snap_attempt = seal_attempt;
+    /// Retired-in-snapshot (T6): the orphan condemns now live as `kCondemned` rows IN the rebuilt runs
+    /// (folded into the single flush above) — there is no separate `RetiredSet` object family, so the
+    /// rebuild mints none and leaves `retired_refs` empty.
     next.retired_refs = {};
     next.manifest_sweep_cursor = "";
     uint64_t zero_total = 0;
     for (uint64_t shard = 0; shard < gc_shards; ++shard)
-    {
-        if (zero_condemned[shard].empty())
-            continue;
-        for (RetiredEntry & e : zero_condemned[shard])
-            e.condemn_round = round;
-        std::sort(zero_condemned[shard].begin(), zero_condemned[shard].end(),
-                  [](const RetiredEntry & a, const RetiredEntry & b) { return a.hash < b.hash; });
         zero_total += zero_condemned[shard].size();
-        RetiredSet set;
-        set.entries = std::move(zero_condemned[shard]);
-        const String rkey = layout.retiredKey(generation, seal_attempt, round, shard);
-        backend.putIfAbsent(rkey, encodeRetiredSet(set));   /// first-durable-write-wins (as the round)
-        next.retired_refs[shard] = rkey;
-    }
     const CasResult res = backend.casPut(layout.gcStateKey(), encodeGcState(next), state_token);
     if (res.outcome != CasOutcome::Committed)
     {
