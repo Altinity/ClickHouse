@@ -69,8 +69,13 @@ Add one row value at the **same sentinel key** `(blob_hash, source_id = 0)`:
 
 - `0x02` `kCondemned` — the blob's condemned incarnation, **carried across generations until
   settled**. Value encoding after the type byte:
-  `[u8 flags (bit0 = delete_pending)] [u64be condemn_round] [u64be size]
-  [u16be token_len] [token bytes]`.
+  `[u8 flags (bit0 = delete_pending)] [u8 token_type] [u64be condemn_round] [u64be size]
+  [u16be token_len] [token value bytes]`.
+  `token_type` persists `Token::type` (`Core/CasToken.h`: `ETag = 1`, `Generation = 2`,
+  `Emulated = 3`) — `deleteExact` consumes a full `Token{value, type}`, and the current durable
+  `RetiredEntryProto` stores both `token_value` and `token_type`; dropping the type would be lossy
+  (review finding, 2026-07-11). Decode fails closed (`CORRUPTED_DATA`) on an unknown `token_type`
+  or a payload length that does not match the declared `token_len`.
 
 Rules:
 
@@ -83,9 +88,15 @@ Rules:
 - `RetiredEntry.kind` is dropped (`ObjectKind` has only `Blob`; manifests go through the separate
   owner-removal sweep, never the retired pipeline). Ordering is by `hash` (the run's native key
   order).
-- Run header `key_schema` bumps `0 → 1`. A `key_schema = 0` run fails closed on decode
-  (`NOT_IMPLEMENTED` / `CORRUPTED_DATA` per the run reader's existing fail-closed rules) — no
-  compat shim.
+- Run header `key_schema` bumps `0 → 1` **for `RunKind::BlobDelta`** (`key_schema` is a per-kind
+  namespace — "fixed per kind; meaning owned by the producer"; the value `1` is already used by a
+  different `RunKind`, which is fine). **New requirement (review finding, 2026-07-11): the current
+  readers do not validate `key_schema` at all** — `RunFileReader` only exposes `keySchema()`, and
+  `zeroInDegree` / `inDegreeInGeneration` / the prior-edge cursor never check it. This spec
+  mandates a typed open path for source-edge runs (validate `kind == BlobDelta`,
+  `key_schema == 1`, and per-row payload lengths; anything else → `CORRUPTED_DATA` /
+  `NOT_IMPLEMENTED` fail-closed) used by **every** consumer: the merge cursor, `zeroInDegree`,
+  `inDegreeInGeneration`, dryrun, `fsck`, `ca-inspect`. No compat shim for `key_schema = 0` runs.
 
 ### 2.2 Fold-seal summary {#seal-summary}
 
@@ -106,6 +117,12 @@ pure function of the sealed content — the seal stays a deterministic artifact 
 
 - `graduationDue` = `pending_total > 0 || oldest_nonpending_condemn_round < current_round`
   over the summaries — **zero I/O** (the seal is already read for `changedShardCount`).
+  **Fail-closed pre-defer rule preserved (review finding, 2026-07-11):** today a missing retired
+  list makes `graduationDue` return `true` ("force a fold so the round's fail-closed path surfaces
+  it, never silently defer", `CasGc.cpp:1649-1652`). The seal-summary version keeps the same
+  posture: for `snap_generation > 0`, a missing or undecodable adopted seal — or a seal without a
+  `condemned_summary` — makes `graduationDue` return `true` (the forced fold then fails closed on
+  the real integrity loss). An idle pool must never defer forever over lost settlement state.
 - Pure ref-carry condition = "no deltas AND `condemned_total == 0`" — the exact analogue of
   today's `!folded_any && prior_retired[shard].empty()` (`CasGc.cpp:1104`).
 - `hasInFlightRetired`, `ca-inspect` counts — O(1) from the seal.
@@ -180,11 +197,19 @@ attempt with new keys. Consequently:
   an external review raised against the first draft (stale edge bytes silently adopted under a
   newer sealed coverage — under byte-equal adoption this is `CORRUPTED_DATA`, fail-closed, the
   round aborts and the next round re-folds under a fresh attempt);
-- the replay-divergence hazard for side effects does not exist: the merge result whose bytes are
-  durable is the same in-memory result that drives the `.meta` writes, B170 events, and outcome
-  tallies — run/meta/event divergence is structurally impossible. (Independently, `BlobMeta`
-  carries no token — `{state, condemn_round, size}` — so condemned-meta content is
-  observation-independent anyway.)
+- the replay-divergence hazard for side effects does not exist **within an attempt**: the merge
+  result whose bytes are durable is the same in-memory result that drives the `.meta` writes, B170
+  events, and outcome tallies — run/meta/event divergence inside one attempt is structurally
+  impossible. (Independently, `BlobMeta` carries no token — `{state, condemn_round, size}` — so
+  condemned-meta content is observation-independent anyway.)
+  **Scope (review finding, 2026-07-11):** this claim is per-attempt, not per-adopted-round. Meta
+  writes complete BEFORE the round's `gc/state` CAS by design (`CasGc.cpp:508-512` — the writer's
+  point-read gate must see condemns no later than the ledger), so a **deposed** leader leaves
+  advisory `.meta`/event effects from an unadopted attempt — exactly as it does today; this
+  refactor does not change that. Those effects are safe by the existing v3 meta-race argument: a
+  stray `Condemned` only causes an unnecessary resurrect (INV-1-conservative), destructive deletes
+  never key off the meta (exact-token from the durably adopted run only), and meta transitions are
+  etag-CAS-guarded. The TLA+ gate models meta effects as advisory (§6).
 
 The historical "observation-bearing ⇒ first-write-wins" classification of the retired set
 (`Core/CasBlobInDegree.h:27-28`) becomes obsolete for the relocated state: with attempt-pinned
@@ -230,6 +255,10 @@ New small model `docs/superpowers/models/CaRetiredInRun.tla` (+ cfg, runner scri
   committed), coverage-coherence (the sealed coverage always describes the adopted run bytes),
   and the write-only-fresh-observations discipline (a delete's token always equals the durably
   adopted condemn-time token).
+- Meta effects are modeled as **advisory** (a deposed leader's pre-CAS `.meta` writes from an
+  unadopted attempt exist in the state space): no destructive transition may read the meta; a
+  stray `Condemned` may only trigger a resurrect (safe direction). Liveness side: `graduationDue`
+  returns due on missing/undecodable adopted settlement state (never an eternal defer).
 - Sabotage flips (must go red): (a) redelete uses an in-memory token instead of the durable one;
   (b) attempt-pinning broken — a re-execution reuses the prior attempt's keys at an advanced
   journal cut → must surface as a byte-equal `CORRUPTED_DATA` refusal (never a silent adoption of
@@ -241,9 +270,14 @@ Gate is green (invariants hold; every sabotage flips red) **before** implementat
 ## 7. Testing {#testing}
 
 - **gtests** (`CasBlobInDegree` suites): condemned rows in the merged stream (carry, settle order,
-  zero-marker subsumption, absent-at-condemn), deterministic-adopt collision (byte-identical resend adopts; divergent bytes throw), seal
-  summary derivation, `key_schema` fail-closed decode, round tests (graduate/redelete over the
-  in-run state, clamp suppression carries pending), rebuild path, dryrun/fsck/inspect readers.
+  zero-marker subsumption, absent-at-condemn), **`Token{value, type}` round-trip through the
+  `kCondemned` row for all three `TokenType`s + fail-closed on an unknown `token_type` and on a
+  truncated payload**, deterministic-adopt collision (byte-identical resend adopts; divergent
+  bytes throw), seal summary derivation, **the typed open path rejecting wrong
+  `kind`/`key_schema` from every consumer** (merge cursor, `zeroInDegree`,
+  `inDegreeInGeneration`, dryrun, `fsck`, `ca-inspect`), `graduationDue` fail-closed on a
+  missing/corrupt adopted seal, round tests (graduate/redelete over the in-run state, clamp
+  suppression carries pending), rebuild path.
 - **e2e:** `05008_ca_gc_snap_prune` must pass **unmodified** (its invariant is
   settlement-semantics-only). Point-run the CA-s3 stateless CAS tests (`04286`, `05008`, `05009`).
 - **Soak:** phase-1 (`utils/ca-soak`, 2-replica, `run_phase1.sh`) with all checkpoints
