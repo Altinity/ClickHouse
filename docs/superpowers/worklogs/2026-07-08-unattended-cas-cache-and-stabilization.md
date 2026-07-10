@@ -276,3 +276,15 @@ Watchdog cron: job 60470431 (hourly at :23).
   log + ca-inspect (both built this session cycle-family) made this diagnosable from SQL + one object
   decode — exactly their purpose. Fix design going to consult: (W) writer fresh-ids/idempotent re-drive,
   (F) mf_cleanup symmetric maintenance, (R) snap-source-edge removal recovery (unwedge).
+
+### 2026-07-10 — GC-wedge fix VALIDATED (20-min verify-soak)
+- Rebuilt clickhouse with the fix, fresh cluster (down -v/up, fix binary mounted), 20-min phase-3 chaos
+  (seed 991): **PHASE3 OK**, 7 faults, 3 restarts, 3 ABORTED-retries (self-remount chaos, retried),
+  dangling=0 at every checkpoint incl. post-cliff mass-DROP (unreachable 851→0, GC keeping up).
+  **DECISIVE: 0 wedge clamps ("committed body missing at removal-fold") on BOTH replicas** (pre-fix stand:
+  56k+); **GC reclaimed 178,536 blobs + 131,731 manifests** (pre-fix: 0 for 4h — total wedge). The
+  orphan-sweep audit event (INTROSPECTION-3) shows 0 because with the fix the sweep correctly finds nothing
+  to delete (backstop; R6 handled removals). Wedge fix (c1485f52a29) = CODE + TEST + CONSULT + SOAK
+  validated. Authoritative quiescent-pool fsck running. TLA+ gate still backlogged (needs committed-removal
+  scoping / meta-model). NEXT: Phase B, starting with re-authored Gate B (three-state meta + raw body +
+  multi-writer; also closes the wedge TLA+ debt in the meta model).
