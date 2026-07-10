@@ -29,7 +29,6 @@ extern const int CORRUPTED_DATA;
 using namespace DB::Cas;
 using DB::Cas::tests::condemnMeta;
 using DB::Cas::tests::expectThrowsCode;
-using DB::Cas::tests::fenceNamespace;
 using DB::Cas::tests::idOf;
 using DB::Cas::tests::injectRetire;
 using DB::Cas::tests::loadMetaForTest;
@@ -721,14 +720,13 @@ TEST(CasBuild, PromoteBodylessCondemnedDepThrowsAbortedRetryable)
     DB::Cas::Layout layout("p");
     const String blob_key = layout.blobKey(id);
 
-    /// 2. Condemn (Blob, hash(X), t0) in the retire view so the promote gate sees the blob leaf as a
-    ///    condemned hit and must resolve it (HEAD-only, no GET).
-    injectRetire(*b, layout, /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
-        {RetiredEntry{.kind = ObjectKind::Blob, .hash = u128Of("payload-X"), .token = t0, .size = 9}});
+    /// 2. Condemn (Blob, hash(X)) via the meta (v3: the promote gate's condemned decision is a per-hash
+    ///    meta point-read, not the retire-view) so the promote gate sees the blob leaf as a condemned hit
+    ///    and must resolve it.
+    condemnMeta(*b, layout, u128Of("payload-X"), /*condemn_round*/ 1);
 
     /// 3. Wrap the backend so the NEXT head(blob_key) returns the (present) result and THEN fires
     ///    deleteExact(blob_key, t0) exactly once — GC's exact-token delete racing the gate's HEAD.
-    ///    Open a FRESH Store over the hook so its retire view (refreshed at open) sees the condemnation.
     auto hook = std::make_shared<HeadThenDeleteOnceBackend>(b, blob_key, t0);
     auto s = Store::open(hook, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     auto build = startBuildFor(s, ns, "part_1");
@@ -752,9 +750,9 @@ TEST(CasBuild, CondemnedPresentEvidenceDepCopiesForwardAtGate)
     /// S13 soak run 3 / spec 2026-07-02-cas-copy-forward-condemned-evidence.md: `republishRef`
     /// (part move: ATTACH renameToDetached, DETACH, merge-result rename) records its deps via
     /// adoptEvidence — tokenless W-EVIDENCE from a COMMITTED source manifest, NO source bytes in
-    /// hand. When the referenced blob's current token is condemned in the writer's fresh retire
-    /// view, the old gate threw ABORTED "retry the op" — but the attach caller never retries and
-    /// the table stays readonly forever (a liveness brick, not a safety save).
+    /// hand. When the referenced blob's hash is condemned (v3: a per-hash meta point-read), the old
+    /// gate threw ABORTED "retry the op" — but the attach caller never retries and the table stays
+    /// readonly forever (a liveness brick, not a safety save).
     ///
     /// Post-fix contract (verified copy-forward): the gate reads the PRESENT dying object, verifies
     /// payload hash == key hash, re-wraps under a fresh envelope, putOverwrite@observed-token ⇒
@@ -774,15 +772,13 @@ TEST(CasBuild, CondemnedPresentEvidenceDepCopiesForwardAtGate)
     DB::Cas::Layout layout("p");
     const String blob_key = layout.blobKey(BlobId{streamingHexOf("payload-CF")});
 
-    /// 2. Condemn (Blob, hash(CF), t0) — models the fold having condemned CF after stale-view
+    /// 2. Condemn (Blob, hash(CF)) via the meta — models the fold having condemned CF after stale-view
     ///    adoptions landed unfolded (the soak chain). Object stays PRESENT (no delete yet: a
     ///    non-pending entry is >= 2 passes from deletion).
-    injectRetire(*b, layout, /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
-        {RetiredEntry{.kind = ObjectKind::Blob, .hash = hexToU128(streamingHexOf("payload-CF")), .token = t0, .size = 10}});
+    condemnMeta(*b, layout, hexToU128(streamingHexOf("payload-CF")), /*condemn_round*/ 1);
 
-    /// 3. Fresh Store (restart: view refreshed at open sees the condemnation) — republishRef's
-    ///    exact body: adoptEvidence over the source manifest entry, stage a FRESH dst manifest,
-    ///    precommit, promote.
+    /// 3. Fresh Store (restart) — republishRef's exact body: adoptEvidence over the source manifest
+    ///    entry, stage a FRESH dst manifest, precommit, promote.
     std::vector<CasEvent> seen;   /// declared BEFORE the Store so it outlives the background syncer's emits (ASan 2026-07-09)
     auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     s->setEventSink([&](const CasEvent & e){ seen.push_back(e); });
@@ -825,13 +821,13 @@ TEST(CasBuild, CondemnedPresentEvidenceDepCopiesForwardAtGate)
 TEST(CasBuild, PromoteCopiesForwardCondemnedEvidenceInInstalledView)
 {
     /// The K3 in-closure copy-forward gate (Phase A, spec 2026-07-09-cas-writer-gc-simplification): a
-    /// tokenless (adoptEvidence) blob X whose condemnation IS in the writer's INSTALLED view is copied
-    /// forward by the promote gate (the single copy-forward site after D3) instead of aborting, and
-    /// promote SUCCEEDS. Phase A deleted the writer-side auto-refresh (D5), so this test installs the
-    /// view explicitly — a stale-view writer instead binds the condemned token as-is, safely (floor +
-    /// durable edge; see NewbornPrecommitProtectsDedupBlobAgainstConcurrentDrop).
+    /// tokenless (adoptEvidence) blob X whose hash is condemned is copied forward by the promote gate
+    /// (the single copy-forward site after D3) instead of aborting, and promote SUCCEEDS.
+    /// v3 (Task 4, spec §meta-protocols): the condemned decision is now a per-hash META POINT-READ, not
+    /// the writer's RetireView — there is no "installed view" to explicitly refresh any more (the test
+    /// name is legacy); a point-read is always live, so condemning the meta is immediately visible to K3.
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = openStore(b);   /// view opens at round 0 (no gc/state yet)
+    auto s = openStore(b);
     const RootNamespace ns{"srv1/tbl"};
 
     /// A committed source part names X (independent live committed owner). putBlob mints X under the
@@ -848,16 +844,10 @@ TEST(CasBuild, PromoteCopiesForwardCondemnedEvidenceInInstalledView)
     const ManifestId id = build->stageManifest({entry});
     build->precommitAdd(ns, "part_2", id);
 
-    /// GC condemns X at t0 in round 1; install the view EXPLICITLY (Phase A/D5: no writer-side
-    /// auto-refresh) so the K3 gate sees the condemnation.
-    injectRetire(*b, s->layout(), /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
-        {RetiredEntry{.kind = ObjectKind::Blob, .hash = hexToU128(streamingHexOf("payload-CFX")),
-                      .token = t0, .size = 11}});
-    fenceNamespace(*b, s->layout(), ns, s->poolMeta().root_shards, /*round*/ 1);
-    s->retireView().refresh();
-    ASSERT_EQ(s->retireView().round(), 1u) << "the installed view must carry the condemnation";
+    /// GC condemns X's hash in round 1 via the meta.
+    condemnMeta(*b, s->layout(), hexToU128(streamingHexOf("payload-CFX")), /*condemn_round*/ 1);
 
-    /// promote: the K3 gate sees t0 condemned in the installed view ⇒ copy-forward ⇒ commit.
+    /// promote: the K3 gate sees X condemned (meta point-read) ⇒ copy-forward ⇒ commit.
     EXPECT_NO_THROW(build->promote(ns, "part_2", build->buildId(), id));
 
     /// The ref resolves and X rides a FRESH, non-condemned token (t0 never bound).
@@ -865,7 +855,9 @@ TEST(CasBuild, PromoteCopiesForwardCondemnedEvidenceInInstalledView)
     const HeadResult hr = b->head(blob_key);
     ASSERT_TRUE(hr.exists);
     EXPECT_NE(hr.token, t0) << "copy-forward must mint a FRESH incarnation, never bind the condemned token";
-    EXPECT_FALSE(s->retireView().isCondemnedToken(ObjectKind::Blob, hexToU128(streamingHexOf("payload-CFX")), hr.token));
+    const auto lm_after = loadMetaForTest(*b, s->layout(), hexToU128(streamingHexOf("payload-CFX")));
+    ASSERT_TRUE(lm_after.has_value());
+    EXPECT_EQ(lm_after->meta.state, MetaState::Clean) << "copy-forward must flip the meta back to Clean";
 }
 
 TEST(CasBuild, PromoteAbsentTokenlessBlobAbortsRetryable)
@@ -923,13 +915,9 @@ TEST(CasBuild, PromoteCondemnedLeafWithoutDepAbortsFailClosed)
     const ManifestId id = build->stageManifest({entry});
     build->precommitAdd(ns, "part_1", id);
 
-    /// Condemn X at t0 (present) and install the view EXPLICITLY (Phase A/D5: no writer-side
-    /// auto-refresh) so the gate sees the condemnation on the no-dep leaf.
-    injectRetire(*b, s->layout(), /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
-        {RetiredEntry{.kind = ObjectKind::Blob, .hash = hexToU128(streamingHexOf("payload-NODEP")),
-                      .token = t0, .size = 13}});
-    fenceNamespace(*b, s->layout(), ns, s->poolMeta().root_shards, /*round*/ 1);
-    s->retireView().refresh();
+    /// Condemn X (present) via the meta (v3: a per-hash point-read, not the retire-view) so the gate
+    /// sees the condemnation on the no-dep leaf.
+    condemnMeta(*b, s->layout(), hexToU128(streamingHexOf("payload-NODEP")), /*condemn_round*/ 1);
 
     expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { build->promote(ns, "part_1", build->buildId(), id); });
     EXPECT_FALSE(s->resolveRef(ns, "part_1").has_value());
@@ -943,8 +931,15 @@ TEST(CasBuild, PromoteCondemnedLeafWithoutDepAbortsFailClosed)
 class HeadThenDisplaceOnceBackend final : public DB::Cas::Backend
 {
 public:
-    HeadThenDisplaceOnceBackend(BackendPtr inner_, String target_key_, DB::Cas::Token expected_)
-        : inner(std::move(inner_)), target_key(std::move(target_key_)), expected(expected_) {}
+    /// `layout`/`hash` are v3 additions (Task 4): the hook models a COMPLETE racing writer, so after its
+    /// own displacement it also flips the per-hash meta back to Clean — mirroring what a real
+    /// copy-forward/resurrect does (step 4). Without this, the meta (a per-hash marker, not per-token)
+    /// would still read Condemned and the promote gate's OWN copy-forward would legitimately re-displace
+    /// this "racer" incarnation a second time.
+    HeadThenDisplaceOnceBackend(BackendPtr inner_, String target_key_, DB::Cas::Token expected_,
+                                DB::Cas::Layout layout_, DB::UInt128 hash_)
+        : inner(std::move(inner_)), target_key(std::move(target_key_)), expected(expected_),
+          layout(std::move(layout_)), hash(hash_) {}
 
     DB::Cas::HeadResult head(const String & k) override
     {
@@ -956,6 +951,14 @@ public:
             const auto res = inner->putOverwrite(target_key, bytes->bytes, expected);
             EXPECT_EQ(res.outcome, DB::Cas::PutOutcome::Done);
             displaced_to = res.token;
+
+            const auto lm = DB::Cas::loadMeta(*inner, layout, hash);
+            const DB::Cas::BlobMeta clean{.state = DB::Cas::MetaState::Clean, .condemn_round = 0,
+                                          .size = bytes->bytes.size()};
+            if (lm)
+                DB::Cas::casMeta(*inner, layout, hash, lm->etag, clean);
+            else
+                DB::Cas::putMetaIfAbsent(*inner, layout, hash, clean);
         }
         return hr;
     }
@@ -976,6 +979,8 @@ private:
     BackendPtr inner;
     String target_key;
     DB::Cas::Token expected;
+    DB::Cas::Layout layout;
+    DB::UInt128 hash;
     bool fired = false;
 };
 
@@ -1020,8 +1025,8 @@ TEST(CasBuild, CopyForwardMultiBlockPayloadVerifies)
     }
 
     DB::Cas::Layout layout("p");
-    injectRetire(*b, layout, /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
-        {RetiredEntry{.kind = ObjectKind::Blob, .hash = hash, .token = t0, .size = payload.size()}});
+    /// v3: condemn the hash via the meta (the promote gate's condemned decision is a per-hash point-read).
+    condemnMeta(*b, layout, hash, /*condemn_round*/ 1);
 
     auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     auto build = startBuildFor(s, ns, "detached_part_a");
@@ -1056,10 +1061,10 @@ TEST(CasBuild, CopyForwardTokenDriftAdoptsCleanIncarnation)
     }
     DB::Cas::Layout layout("p");
     const String blob_key = layout.blobKey(idOf("payload-DRIFT"));
-    injectRetire(*b, layout, /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
-        {RetiredEntry{.kind = ObjectKind::Blob, .hash = u128Of("payload-DRIFT"), .token = t0, .size = 13}});
+    /// v3: condemn the hash via the meta (the promote gate's condemned decision is a per-hash point-read).
+    condemnMeta(*b, layout, u128Of("payload-DRIFT"), /*condemn_round*/ 1);
 
-    auto hook = std::make_shared<HeadThenDisplaceOnceBackend>(b, blob_key, t0);
+    auto hook = std::make_shared<HeadThenDisplaceOnceBackend>(b, blob_key, t0, layout, u128Of("payload-DRIFT"));
     auto s = Store::open(hook, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     auto build = startBuildFor(s, ns, "detached_part_a");
     build->adoptEvidence(blobManifestEntry("data.bin", "payload-DRIFT"));
@@ -1091,8 +1096,9 @@ TEST(CasBuild, CopyForwardCorruptPayloadFailsClosed)
     DB::Cas::Layout layout("p");
     const String blob_key = layout.blobKey(BlobId{streamingHexOf("payload-ROT")});
 
-    /// Corrupt ONE payload byte in place (valid envelope, damaged content); condemn the CORRUPT
-    /// incarnation's token so the pre-pass targets it.
+    /// Corrupt ONE payload byte in place (valid envelope, damaged content); condemn the hash via the
+    /// meta (v3: a per-hash point-read, not the retire-view — condemnation no longer distinguishes
+    /// which token, so the corrupt incarnation's token doesn't need to be captured separately).
     {
         auto got = b->get(blob_key);
         ASSERT_TRUE(got.has_value());
@@ -1101,8 +1107,7 @@ TEST(CasBuild, CopyForwardCorruptPayloadFailsClosed)
         damaged[h.header_len] = static_cast<char>(damaged[h.header_len] ^ 0xFF);
         const auto res = b->putOverwrite(blob_key, damaged, t0);
         ASSERT_EQ(res.outcome, PutOutcome::Done);
-        injectRetire(*b, layout, /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
-            {RetiredEntry{.kind = ObjectKind::Blob, .hash = hexToU128(streamingHexOf("payload-ROT")), .token = res.token, .size = 11}});
+        condemnMeta(*b, layout, hexToU128(streamingHexOf("payload-ROT")), /*condemn_round*/ 1);
     }
 
     auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});

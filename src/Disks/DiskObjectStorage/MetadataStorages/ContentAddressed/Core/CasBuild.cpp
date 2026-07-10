@@ -580,9 +580,14 @@ Token Build::copyForwardFromCondemned(const UInt128 & hash, const String & key, 
                 "the exact-token delete won; failing closed (retry the operation)", key);
         if (got->token != hr.token)
         {
-            /// The incarnation moved under us. A clean (not condemned) token is someone else's
-            /// recreate/copy-forward — adopt it; a condemned one is the new copy-forward target.
-            if (!store->retireView().isCondemnedToken(ObjectKind::Blob, hash, got->token))
+            /// The incarnation moved under us. Task 4 (spec §meta-protocols v3): condemnation is now a
+            /// per-hash META POINT-READ, not a per-token retire-view fact — a positively-Clean meta means
+            /// someone else's copy-forward/resurrect already reconciled this hash (adopt their token, no
+            /// further work); anything else (Condemned, or absent — never observed as clean) falls through
+            /// to re-verify and re-displace THIS incarnation. Safe either way: a spurious re-displacement
+            /// just costs one more GET+PUT and still lands on a verified fresh incarnation.
+            const auto lm_drift = loadMeta(store->backend(), store->layout(), hash);
+            if (lm_drift && lm_drift->meta.state == MetaState::Clean)
                 return got->token;
             hr.token = got->token;
         }
@@ -648,6 +653,29 @@ Token Build::copyForwardFromCondemned(const UInt128 & hash, const String & key, 
                             {"size", std::to_string(payload.size())},
                             {"build_id", u128ToHex(build_id)}};
             });
+
+            /// Task 4 (spec §meta-protocols v3): the displacement just landed a fresh, verified
+            /// incarnation — flip the (now-stale) Condemned meta back to Clean so the NEXT point-reader
+            /// (writer dedup-hit or another promote revalidation) never has to fall back to a HEAD-only
+            /// guess. Best-effort bounded retry on a racing meta writer (another copy-forward/resurrect,
+            /// or GC re-condemning): a Conflict just means someone else already reconciled it to the same
+            /// steady state; putMetaIfAbsent covers the (rare) case the meta was never created at all.
+            {
+                auto lm_out = loadMeta(store->backend(), store->layout(), hash);
+                const BlobMeta clean{.state = MetaState::Clean, .condemn_round = 0, .size = payload.size()};
+                constexpr int max_meta_attempts = 8;
+                for (int meta_attempt = 0; meta_attempt < max_meta_attempts; ++meta_attempt)
+                {
+                    const CasResult meta_res = lm_out
+                        ? casMeta(store->backend(), store->layout(), hash, lm_out->etag, clean)
+                        : putMetaIfAbsent(store->backend(), store->layout(), hash, clean);
+                    if (meta_res.outcome == CasOutcome::Committed)
+                        break;
+                    lm_out = loadMeta(store->backend(), store->layout(), hash);
+                    /// Exhausted retries: leave the meta as-is — best-effort (a later writer/GC pass
+                    /// reconciles it); the body-side displacement above is already durable and verified.
+                }
+            }
             return res.token;
         }
 
@@ -948,7 +976,12 @@ void Build::promote(const RootNamespace & target_ns, const String & final_ref_na
                 if (!hr.exists)
                     throw Exception(ErrorCodes::ABORTED,
                         "promote: blob {} absent at commit revalidation — failing closed", blob_key);
-                if (store->retireView().isCondemnedToken(ObjectKind::Blob, e.blob_hash, hr.token))
+                /// Task 4 (spec §meta-protocols v3): the condemned decision is now a per-hash META
+                /// POINT-READ, not the writer-side RetireView — mirrors Task 3's putBlob/uploadFromSource
+                /// re-sourcing. An absent meta reads as "not condemned" (same convention as the writer gate).
+                const auto lm = loadMeta(store->backend(), store->layout(), e.blob_hash);
+                const bool condemned = lm && lm->meta.state == MetaState::Condemned;
+                if (condemned)
                 {
                     if (!isCopyForwardableTokenless(e.blob_hash))
                         throw Exception(ErrorCodes::ABORTED,

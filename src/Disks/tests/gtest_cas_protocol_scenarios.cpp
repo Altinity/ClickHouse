@@ -41,11 +41,13 @@ extern const int LOGICAL_ERROR;
 
 using namespace DB::Cas;
 using DB::Cas::tests::blobEntryFor;
+using DB::Cas::tests::condemnMeta;
 using DB::Cas::tests::displaceBlobToken;
 using DB::Cas::tests::expectThrowsCode;
 using DB::Cas::tests::fenceNamespace;
 using DB::Cas::tests::idOf;
 using DB::Cas::tests::injectRetire;
+using DB::Cas::tests::loadMetaForTest;
 using DB::Cas::tests::streamingHexOf;
 using DB::Cas::tests::u128Of;
 using DB::Cas::tests::writeBlobRaw;
@@ -268,15 +270,16 @@ TEST(CasProtocol, RevalidateAdoptsLiveTokenWhenOnlyPhantomCondemnedAtDifferentTo
 
 TEST(CasProtocol, EvidenceHitCondemnedPresentBlobCopiesForwardInClosure)
 {
-    /// W-EVIDENCE (tokenless adopted dep) on a blob X that is condemned-but-PRESENT in the writer's
-    /// INSTALLED view: promote copies X forward in-closure to a fresh live incarnation and SUCCEEDS. X
-    /// here has NO independent committed owner (a lone raw blob) — the accepted
-    /// revive-for-the-live-about-to-commit-owner window. A non-tokened leaf is the ONLY leaf promote
-    /// still observes (tokened leaves are edge-protected; Phase A also removed the auto-refresh, D5, so
-    /// this test installs the view explicitly). Before the copy-forward fix this aborted (INV-1
-    /// fail-closed), a liveness brick on the DETACH/freeze adopt path.
+    /// W-EVIDENCE (tokenless adopted dep) on a blob X whose hash is condemned-but-PRESENT: promote copies
+    /// X forward in-closure to a fresh live incarnation and SUCCEEDS. X here has NO independent committed
+    /// owner (a lone raw blob) — the accepted revive-for-the-live-about-to-commit-owner window. A
+    /// non-tokened leaf is the ONLY leaf promote still observes (tokened leaves are edge-protected).
+    /// v3 (Task 4, spec §meta-protocols): the condemned decision is a per-hash META POINT-READ, not the
+    /// writer's RetireView — condemning the meta is immediately visible to K3, no view install needed.
+    /// Before the copy-forward fix this aborted (INV-1 fail-closed), a liveness brick on the DETACH/freeze
+    /// adopt path.
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = openStore(b);   /// view opens at round 0 (no gc/state yet)
+    auto s = openStore(b);
     const RootNamespace ns{"srv1/tbl"};
 
     /// X pre-exists with token t0 — minted with the POOL streaming-hash id so the copy-forward verifier
@@ -296,18 +299,20 @@ TEST(CasProtocol, EvidenceHitCondemnedPresentBlobCopiesForwardInClosure)
     const ManifestId id = build->stageManifest({entry});
     build->precommitAdd(ns, "part_1", id);
 
-    /// GC condemns X at t0 in round 1 + fence; install the view EXPLICITLY (Phase A/D5).
-    injectRetire(*b, s->layout(), /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
-        {RetiredEntry{.kind = ObjectKind::Blob, .hash = hexToU128(hex), .token = t0, .size = 9}});
-    fenceNamespace(*b, s->layout(), ns, s->poolMeta().root_shards, /*round*/ 1);
-    s->retireView().refresh();
+    /// GC condemns X's hash in round 1 via the meta.
+    condemnMeta(*b, s->layout(), hexToU128(hex), /*condemn_round*/ 1);
 
-    /// promote: the K3 gate sees t0 condemned in the installed view ⇒ copy-forward ⇒ commit.
+    /// promote: the K3 gate sees X condemned (meta point-read) ⇒ copy-forward ⇒ commit.
     EXPECT_NO_THROW(build->promote(ns, "part_1", build->buildId(), id));
 
     /// The committed ref stands over a FRESH incarnation; the condemned token t0 is never bound.
     EXPECT_TRUE(s->resolveRef(ns, "part_1").has_value());
     EXPECT_NE(b->head(blob_key).token, t0);
+
+    /// The copy-forward flips the meta back to Clean (Task 4 step 4).
+    const auto lm_after = loadMetaForTest(*b, s->layout(), hexToU128(hex));
+    ASSERT_TRUE(lm_after.has_value());
+    EXPECT_EQ(lm_after->meta.state, MetaState::Clean);
 }
 
 TEST(CasProtocol, WedgedHeartbeatCondemnedTokenedBlobCommitsWithTokenUnchanged)
@@ -526,17 +531,17 @@ TEST(CasProtocol, NewNamespacePublishGatedByShardFenceFloor)
 
 TEST(CasProtocol, FreshEvidenceDepWithViewHitIsResolvedByGate)
 {
-    /// A TOKENLESS (W-EVIDENCE) leaf recorded at the CURRENT view round (fresh — no stale-refresh) whose
-    /// blob is condemned by hash MUST still be caught by promote's unconditional blob revalidation.
-    /// Since the copy-forward pre-pass (spec 2026-07-02-cas-copy-forward-condemned-evidence.md) "caught"
-    /// no longer means ABORTED: a condemned-but-PRESENT incarnation is displaced by a verified
-    /// copy-forward and promote SUCCEEDS. The underlying invariant is unchanged and asserted here:
-    /// the listed token t0 is never bound — the committed ref stands over a FRESH incarnation.
+    /// A TOKENLESS (W-EVIDENCE) leaf whose blob is condemned by hash MUST still be caught by promote's
+    /// unconditional blob revalidation. Since the copy-forward pre-pass
+    /// (spec 2026-07-02-cas-copy-forward-condemned-evidence.md) "caught" no longer means ABORTED: a
+    /// condemned-but-PRESENT incarnation is displaced by a verified copy-forward and promote SUCCEEDS.
+    /// The underlying invariant is unchanged and asserted here: the listed token t0 is never bound — the
+    /// committed ref stands over a FRESH incarnation.
+    /// v3 (Task 4, spec §meta-protocols): the condemned decision is a per-hash META POINT-READ, not the
+    /// writer's RetireView, so there is no "view round"/"fence advance" to track any more (the test name
+    /// is legacy) — condemning the meta is immediately, unconditionally visible to K3.
     auto b = std::make_shared<InMemoryBackend>();
 
-    /// Pre-inject retire state at round=1 BEFORE opening the store — the store's open-time refresh lands
-    /// at round=1, so any dep recorded thereafter is observed against the already-refreshed view.
-    /// The blob is minted with the POOL streaming-hash convention (copy-forward verifies against it).
     DB::Cas::Layout layout("p");
     const String hex = streamingHexOf("payload-fresh-ev");
     {
@@ -546,23 +551,21 @@ TEST(CasProtocol, FreshEvidenceDepWithViewHitIsResolvedByGate)
     }
     const String blob_key = layout.blobKey(BlobId{hex});
     const Token t0 = b->head(blob_key).token;
-    injectRetire(*b, layout, /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
-        {RetiredEntry{.kind = ObjectKind::Blob, .hash = hexToU128(hex), .token = t0, .size = 16}});
+    condemnMeta(*b, layout, hexToU128(hex), /*condemn_round*/ 1);
 
     auto s = openStore(b);
-    ASSERT_EQ(s->retireView().round(), 1u);
 
     const RootNamespace ns{"srv1/tbl"};
     auto build = startBuildFor(s, ns, "part_1");
-    /// adoptEvidence records a TOKENLESS dep against the current (round-1) view.
+    /// adoptEvidence records a TOKENLESS dep.
     ManifestEntry entry = blobEntry("data.bin", "payload-fresh-ev");
     entry.blob_hash = hexToU128(hex);   /// streaming-convention id (matches the minted blob)
     build->adoptEvidence(entry);
     const ManifestId id = build->stageManifest({entry});
     build->precommitAdd(ns, "part_1", id);
 
-    /// No fence advance (round stays 1): promote does NOT refresh, but its blob revalidation is
-    /// unconditional — HEAD t0 condemned ⇒ verified copy-forward displaces it; promote succeeds.
+    /// promote's blob revalidation is unconditional — HEAD t0 condemned (meta point-read) ⇒ verified
+    /// copy-forward displaces it; promote succeeds.
     EXPECT_NO_THROW(build->promote(ns, "part_1", build->buildId(), id));
 
     EXPECT_NE(b->head(blob_key).token, t0) << "the listed token must never be bound — fresh incarnation only";
