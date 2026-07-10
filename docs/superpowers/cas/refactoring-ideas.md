@@ -362,15 +362,17 @@ meta) lands and soaks.
 
 ## Pre-existing debts surfaced by the 2026-07-10 v3 CA-s3 lane triage (NOT v3-caused)
 
-1. **04286_content_addressed_remote_data_paths — EISDIR latent bug.** `system.remote_data_paths` probe
-   (traverse_shadow_remote_data_paths=1) → `existsFile`→`getMountpointObject`→`casGetObject`→`get`→raw
-   read(2) on a directory fd (`roots/<ns>/store`) → "Is a directory" (errno 21). The old B38 fix
-   (`6c3a678550b`) patched only the stat-based `tryGetObjectMetadata`; commit `a4b8185f0fa` (Phase1
-   root-local, 413 commits before v3) rewrote the branch to a full body read that re-exposes it. Fix:
-   guard the mountpoint-object read against a directory / restore the stat-based existence check.
-2. **01271_show_privileges — stale reference.** Missing the branch-only `SYSTEM CONTENT ADDRESSED GARBAGE
-   COLLECTION` row (grant `8519093651b`). Fix: regenerate the reference.
-3. **05008_ca_gc_snap_prune — test/schema mismatch.** Queries `forgotten_on_delete` in
-   `system.content_addressed_garbage_collection_log`; that column never existed on this branch. Fix: either
-   wire the P9 `GForget`/`GcSnap::forget` counter into the GC-log schema or update the test.
-   (05009 log-enabled is a separate known env config issue.)
+1. **04286_content_addressed_remote_data_paths — EISDIR latent bug. RESOLVED (`99b244a9444`, 2026-07-10).**
+   `system.remote_data_paths` probe → `existsFile`/`getStorageObjects` did a body read on a directory fd
+   (`roots/<ns>/store`) → "Is a directory" (errno 21). Fix: the emulated `ObjectStorageBackend::head` now
+   returns not-an-object when `tryGetObjectMetadata` yields no metadata (a directory, B38), and both
+   `existsFile` and `getStorageObjects` probe presence via the HEAD-based `Store::mountpointObjectExists`
+   (no body read).
+2. **01271_show_privileges — stale reference. RESOLVED (`79db187695a`, 2026-07-10).** Reference regenerated
+   with the `SYSTEM CONTENT ADDRESSED GARBAGE COLLECTION` row.
+3. **05008_ca_gc_snap_prune — test/schema mismatch. RESOLVED (`79db187695a`, 2026-07-10).**
+   `forgotten_on_delete` never existed on this branch, and the P9 `GcSnap::forget` counter was removed with
+   the source-edge-set GC model — so the test now asserts the ack-floor invariant
+   `sum(entries_redeleted) >= sum(objects_deleted)` (a structural identity of the redelete loop). 05009 also
+   fixed: the `content_addressed_log` is default-ON now, so the test asserts on-and-populated (filtered by
+   `disk_name`), not default-off.

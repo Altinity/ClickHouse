@@ -64,7 +64,8 @@ Steps run in strict order; failure at any step aborts the open:
 4. **Mount lease — liveness + merged heartbeat** (`claimMountAwaitingExpiry` wrapping `claimMount`,
    `CasServerRoot.cpp`).
    The pool key `gc/server-roots/<srid>/mount` holds a
-   `MountLease{server_uuid, writer_epoch, hostname, pid, seq, expires_at_ms, min_active, observed_gc_round, gc_fenced}`.
+   `MountLease{server_uuid, writer_epoch, hostname, pid, started_at_ms, seq, expires_at_ms, min_active, gc_fenced}`
+   (the `observed_gc_round` field was removed in v3 — the writer-side retired-view ack floor is gone; see §merged-heartbeat).
    - Foreign UUID → `ForeignOwner`, open aborts.
    - Same UUID + same epoch → adopt (idempotent restart, e.g. `seq+1` refresh).
    - Same UUID + different epoch + lease live → `Store::open` bounds-waits (up to the lease TTL plus a
@@ -78,63 +79,59 @@ Steps run in strict order; failure at any step aborts the open:
    live one without any S3 read. A GC fence-out (`gc_fenced`, `04 §heartbeat-floor`) lands as a
    foreign-touch on the renewal and trips `tripMountLost` permanently for this incarnation.
 
-   The **build watermark and the GC ack are carried in this same body** — there is no separate
-   watermark object. `min_active` is the orphan-sweep floor (`04 §manifest-cleanup`) and
-   `observed_gc_round` is the ack the GC heartbeat floor reads. See §merged-heartbeat below for the
-   beat itself.
+   The **build watermark is carried in this same body** — there is no separate watermark object.
+   `min_active` is the orphan-sweep floor (`04 §manifest-cleanup`). (The old `observed_gc_round` GC-ack
+   floor is gone — the writer no longer advertises an ack; condemned-detection is a per-hash `.meta`
+   point-read. See §merged-heartbeat below.)
 
 ---
 
-### Merged heartbeat: lease + watermark + ack in one beat {#merged-heartbeat}
+### Merged heartbeat: lease + watermark {#merged-heartbeat}
 
 **Status: DONE** (`cas-gc-ack-floor-fence`, `CasStore.cpp`, `CasServerRoot.cpp`).
 
 The standalone per-server watermark object and its `WatermarkKeeper` are **removed**: the build
 watermark folded into the mount lease, so one `SingleWriterSlot` subclass and one PUT per renewal
-carry the lease extension, `min_active`, and the GC ack together (net **−1 PUT** per renewal versus
-two heartbeats).
+carry the lease extension and `min_active` together (net **−1 PUT** per renewal versus two
+heartbeats). `min_active` (the orphan-sweep floor, `04 §manifest-cleanup`) and `gc_fenced` (a
+terminal GC fence-out of an expired lease) are the two fields the lease body carries besides plain
+liveness (`server_uuid`, `writer_epoch`, `hostname`, `pid`, `seq`, `expires_at_ms`) — this liveness
+and watermark role is unrelated to condemned-detection and unaffected by the point-read protocol
+below.
 
-**Lease / view-sync decouple** (2026-07-06, `cas-lease-view-sync-decouple`): the lease renewal and
-the retired-view refresh run on **separate threads**. The renewal reads only cheap, in-memory values,
-so the lease PUT does **no** `gc/state` GET and its cadence is independent of S3 latency (a slow view
-refresh can no longer push a renewal past its TTL — the S13 liveness bug). The `MountLeaseKeeper`'s
-`observed_round_fn` is `Store::observedGcRound` — the **currently-installed** `view_round`. A dedicated
-Store-owned poller thread runs the retired-view refresh on its own cadence, gated by
-`background_watermark` (production only):
+**Condemned detection is a per-hash `.meta` point-read, not a writer-side retired view** (spec
+`2026-07-09` §meta-protocols v3, `Core/CasBlobMeta.h`). The earlier `Store::syncRetiredView` /
+`observed_gc_round` / `view_gate` machinery — a writer-side cached copy of the GC retired list,
+refreshed by a dedicated poller thread on its own cadence and drained against every in-flight
+`mutateShard` before being swapped in — is **removed**. `MountLease` (`CasServerRoot.h`) no longer
+has an `observed_gc_round` field at all.
 
-`Store::syncRetiredView` (every `T_renew`, on the retired-view syncer thread):
+Each blob/tree hash instead has a small durable meta descriptor:
 
-1. `GET gc/state`. On failure, leave the installed view (and therefore the advertised ack) unchanged
-   and retry next tick — the syncer never throws out of its loop.
-2. If `gc/state.round > view_round`, `GET` the current retired-list objects (per gc-shard, from
-   `retired_refs`). Any failure leaves the view unadvanced this tick.
-3. **Drain and swap:** take `view_gate` exclusive — this waits until every in-flight `mutateShard`
-   that started under the old view has fully completed (its CAS response received; `mutateShard`
-   holds `view_gate` shared for its **whole** call) — then install the new retired view and emit one
-   `retired_view_advance` event per actual advance.
+```cpp
+enum class MetaState : uint8_t { Clean = 0, Condemned = 1 };
+struct BlobMeta { uint8_t version; MetaState state; uint64_t condemn_round; uint64_t size; };
+```
 
-The **lease renewal** (the keeper's renewal thread, every `T_renew`) `putOverwrite`s the mount body:
-lease extension + `min_active` + `observed_gc_round = observedGcRound()` (the last-installed
-`view_round`). Token-guarded as before; a `PreconditionFailed` is a foreign touch ⇒ `tripMountLost`.
-The advertised ack lags the syncer by at most one renewal period — conservative: a lower
-`observed_gc_round` only holds the heartbeat floor back, never advances it past an installed view.
+`MetaState::Clean` means referenceable, body present; `MetaState::Condemned` means GC has marked the
+hash in-degree 0 (the body may still be physically present — a writer may resurrect it by CAS). GC
+always writes a `Condemned` meta BEFORE it ever deletes the body, so an absent meta reads exactly as
+live as a `Clean` one.
 
-**Drain (the writer-side safety of the ack):** because the ack is advertised strictly *after* every
-old-view commit's CAS response, a heartbeat carrying `observed_gc_round = A` proves no commit with a
-view older than `A` is still in flight from that server. **Monotone-ack invariant:**
-`observed_gc_round` never decreases and is never advertised above a view that is actually installed
-and drained.
+The writer consults this per-hash meta with a single GET (`loadMeta`) at the two places that decide
+whether an observed incarnation may be adopted or must be displaced — `Build::observeAndAdmit`
+(dedup-hit / adopt path) and `Build::uploadFromSource` (fresh-upload / condemned-displacement path),
+both in `CasBuild.cpp`. A `Clean` (or absent) meta is adopted for free, no bytes moved; a `Condemned`
+meta throws `ABORTED` so the caller re-uploads from its own source (INV-1) rather than ever reading
+the dying object. `putMetaIfAbsent` seeds a `Clean` meta the first time a hash is observed with none
+yet (a Conflict just means a racing writer already created the same steady state); `casMeta`
+token-flips a stale `Condemned` meta back to `Clean` once a resurrect or copy-forward has displaced
+the body with a fresh, verified incarnation.
 
-**Open ordering (writable open):** claim heartbeat (the S13 claim protocol; `gc_fenced` incarnations
-are simply superseded by the epoch bump) → load `gc/state` + retired list (the initial
-`retire_view.refresh()` prime at open) → `doStart` stamps `observed_gc_round` via `observedGcRound()`
-→ **only then** enable mutations, and start the retired-view syncer thread. This closes the
-new-mount-during-pass race: a mount the GC enumeration missed necessarily finished its creation PUT
-after the pass's round was already durable, so its first loaded view is ≥ that round. `doStart`
-anchoring the mount already reads an ack from the post-claim view prime, so the order holds by
-construction. The **remount** path (`tryRemountOnce`, after a fence-out) has no such open-time prime,
-so it runs one synchronous `syncRetiredView()` before the fresh keeper's `doStart` — the fresh
-incarnation's first ack is current, not stale.
+This is a **point-read, not a linearization point**: the body's own `incarnation_tag` plus the
+exact-token delete remain the real safety core (INV-1, INV-NO-RETURN). The `.meta` descriptor is
+only a freshness hint that lets the common dedup-hit path skip straight to "adopt" without ever
+reading the body, instead of the writer having to trust a possibly-stale cached view.
 
 ---
 
@@ -246,9 +243,11 @@ GET-from-existing) was deleted; `uploadFromSource` is the sole sourced revival p
 a **tokenless W-EVIDENCE dep** (`adoptEvidence` — every call site adopts entries of a COMMITTED
 source manifest: `republishRef` part moves, the fetch receiver, part/file copies) has **no source
 bytes**, yet the blob it names is referenced by a live committed owner right now — resolving its
-condemned incarnation is a reference transfer, not a resurrection of garbage. For exactly these deps
-the promote gate runs a **copy-forward pre-pass** (`Build::copyForwardFromCondemned`): read the
-condemned-but-present incarnation IN FULL, verify fail-closed (envelope decodes + recomputed payload
+condemned incarnation is a reference transfer, not a resurrection of garbage. For exactly these deps,
+`Build::promote`'s per-manifest-entry blob revalidation loop calls `Build::copyForwardFromCondemned`
+**inline**, gated to non-tokened leaves only (spec `2026-07-09-cas-writer-gc-simplification` D3: the
+former standalone copy-forward pre-pass is removed — this in-closure call is now the SINGLE
+copy-forward site): read the condemned-but-present incarnation IN FULL, verify fail-closed (envelope decodes + recomputed payload
 hash == content key), re-wrap under a fresh envelope (fresh `incarnation_tag`, this build's
 `build_id` — W-FRESH-TAG), and displace EXACTLY the observed incarnation via token-conditional
 `putOverwrite`. Every failure mode stays fail-closed: absent / deleted mid-flight => `ABORTED`
@@ -264,16 +263,20 @@ Motivation: the S13 soak-run-3 liveness brick — `checkParts -> renameToDetache
 republishRef -> promote ABORTED (condemned)` left the table readonly forever; the attach caller
 never retries.
 
-**Ack-floor commit gate (recreate a retired incarnation, do not adopt it):** under the ack-floor
-protocol a writer checks each blob leaf against its in-memory retired list (refreshed by the merged
-heartbeat, §merged-heartbeat). A listed `(hash, current_token)` is a **condemned incarnation and is
-never referenced**. This recreate is performed by the existing `Build::putBlob` cold-reuse rule —
-the `PreconditionFailed`-then-condemned branch below re-uploads from source with a fresh token
-(`uploadFromSource`, INV-1), on the *retried* build; it is not a new gate code path. The `promote`
-gate fails closed `ABORTED` for SOURCED (tokened) deps and unknown leaves; tokenless-evidence deps
-take the copy-forward pre-pass above. This closes the condemned-adoption gap: a
+**Condemned-detection commit gate (recreate a retired incarnation, do not adopt it):** a writer
+checks each observed blob incarnation against its per-hash `.meta` descriptor — a single `loadMeta`
+GET, §merged-heartbeat — rather than any in-memory retired list. A `Condemned` meta is a **condemned
+incarnation and is never referenced**. This recreate is performed by the existing `Build::putBlob`
+cold-reuse rule — the `PreconditionFailed`-then-condemned branch in `uploadFromSource` re-uploads
+from source with a fresh token (INV-1), on the *retried* build; it is not a new gate code path. At
+`promote`, this same point-read gate re-runs only for the non-tokened (evidence/copy-forward)
+dependency subset (see the blob-leaf revalidation step, §phase-promote below); a **tokened dep is
+edge-protected (EDGE-BEFORE-OBSERVE) and gets zero promote-time re-validation** — the common
+`putBlob` case. Unknown/condemned non-tokened leaves fail closed `ABORTED`; copy-forwardable
+tokenless-evidence deps take the copy-forward path above. This closes the condemned-adoption gap: a
 plain `putIfAbsent` HEAD-hit would otherwise adopt the condemned incarnation that a GC round is about
-to delete. The write path gains **zero** S3 operations in the common (not-condemned) case.
+to delete. The write path gains **zero** extra S3 operations in the common (not-condemned) case
+beyond the one `.meta` GET.
 
 **Shard-mutation queue (flat combining, spec `2026-07-03-cas-shard-mutation-queue.md`):**
 `Store::mutateShard` serializes intra-server writers per `(namespace, shard)` through a
@@ -316,14 +319,17 @@ Once all blobs are uploaded, `Build::promote` performs the **fail-closed commit*
 1. Read and validate the manifest body (one streaming GET; absent or mismatched → `ABORTED`,
    never commits a dangle).
 2. Check `RefMatchesBody` and `ManifestNamespaceMatches`.
-3. **Birth-floor retire-view gate** (`fence_round`): if the store's retire view is behind the
-   shard's `fence_round`, refresh it before the blob revalidation. Under the ack-floor protocol
-   `fence_round` is **only the birth floor** stamped once at shard creation (it is no longer bumped
-   per round — `04 §heartbeat-floor` History), so this gate now fires only on a newborn shard,
-   ensuring condemnations from the GC round in which the shard was born are visible before
-   committing. Pool-global retire-view freshness on the steady path comes from the merged heartbeat
-   beat (§merged-heartbeat), not this gate.
-4. Verify the precommit binding is still the live owner (not removed by abandon or GC reclaim).
+3. Verify the precommit binding is still the live owner (not removed by abandon or GC reclaim).
+4. **Blob-leaf revalidation**, non-tokened deps only: a tokened dep is edge-protected
+   (EDGE-BEFORE-OBSERVE — its precommit closure was durable before `putBlob` ever observed it, so a
+   condemnation in the `putBlob`→`promote` window cannot graduate) and is **not** re-checked here.
+   Every non-tokened leaf (a tokenless W-EVIDENCE adopt) gets one mandatory `.meta` point-read:
+   absent/`Clean` → validated; `Condemned` + copy-forwardable → verified copy-forward (§phase-upload
+   above); `Condemned` + not copy-forwardable, or absent from the pool → fail closed `ABORTED`.
+   **No writer-side view-refresh runs before this step** (spec
+   `2026-07-09-cas-writer-gc-simplification` D5, TLA+ Gate A): promote-time view freshness is not
+   load-bearing given the edge protection above. `fence_round` survives only as a **GC-side** birth
+   floor stamped once at shard creation (`THM-NO-RETURN`); there is no writer-side refresh of it.
 5. Append a `promote` `RootOwnerEvent` to the shard — a pure owner MOVE, no blob delta:
    ```
    {old_binding = {Precommit, final_ref_name, build_id, manifest_ref},
@@ -342,19 +348,25 @@ retries the whole part write from scratch. This is the fail-closed invariant:
 
 ### Publish-gate obligations from the incarnation model {#publish-gate}
 
-The `CaIncarnationCore.tla` model imposes three obligations on the dependency re-validation that runs
-at step 3 above (see `06-tla-models.md §caincarnationcore` for the model detail):
+The `CaIncarnationCore.tla` model imposes three obligations on the dependency re-validation. Since
+EDGE-BEFORE-OBSERVE, these apply **only to the non-tokened (evidence/copy-forward) dependency
+subset** — the blob-leaf revalidation, step 4 above. A **tokened** dep (the common `putBlob` case) is
+edge-protected and gets **zero** promote-time re-validation against any of MR-1/MR-2/MR-3: its
+precommit closure was durable before `putBlob` observed it, which already discharges these
+obligations at observe time (see `06-tla-models.md §caincarnationcore` for the model detail):
 
-- **Consult durable deleted-token history, not only the in-flight retire set (MR-1).** A dependency
-  token is condemned if it appears in the retire view **or** in the durable deleted-token history: a
-  physically-deleted token whose retire entry was already consumed by the delete must still be
-  rejected. The retire view alone is insufficient.
+- **Consult durable deleted-token history, not only a cached retired set (MR-1).** A non-tokened
+  dependency's hash is condemned if its `.meta` reads `Condemned` **or** it appears in the durable
+  deleted-token history: a physically-deleted token whose condemned meta was already consumed by the
+  delete must still be rejected. The `.meta` point-read alone is insufficient by itself for a
+  fully-deleted object; the copy-forward gate's fail-closed absent-object handling covers this case.
 - **Re-validate the dependency's CURRENT physical state (MR-2 / F1).** The gate must confirm the
   dependency is still present and still carries the originally-observed token — not merely that the
-  observed token was not condemned when first seen. Any displacement (a `resurrect`/overwrite that
+  observed token was not condemned when first seen. Any displacement (a resurrect/copy-forward that
   minted a fresh `incarnation_tag`, or a GC delete) makes the old token stale; referencing it would
-  dangle. This is why `putBlob`'s condemned-displacement path re-uploads from source rather than
-  reusing the old token.
+  dangle. This is why the copy-forward path re-reads and re-verifies the object at promote time
+  rather than reusing a previously-observed token, and why `putBlob`'s condemned-displacement path
+  re-uploads from source rather than reusing the old token.
 - **Bottom-up tree publish (MR-3 / F2).** A tree/manifest that references child objects may be
   published only when every direct child is present and non-condemned at publish time. Publishing
   over an absent or condemned child dangles as soon as GC folds the tree's edges. The writer builds

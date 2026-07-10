@@ -84,10 +84,12 @@ public:
     void precommitAdd(const RootNamespace & target_ns, const String & final_ref_name, const ManifestId & id);
 
     /// Atomic commit promotion (spec §Promote Precommit): ONE root-shard CAS in shardOf(final_ref_name).
-    ///  1. (mutateShard refreshes the retire view if the shard fence demands it)
+    ///  1. (no writer-side retire-view refresh — removed in the 2026-07-09 writer-GC simplification;
+    ///     tokened leaves are edge-protected via EDGE-BEFORE-OBSERVE);
     ///  2. stream-read the precommit manifest body; validate RefMatchesBody / ManifestNamespaceMatches;
-    ///  3. revalidate EVERY blob leaf listed in the manifest (fail-closed);
-    ///  4. body absent | a blob absent | a blob condemned-and-not-recreatable ⇒ ABORTED;
+    ///  3. revalidate the NON-tokened blob leaves only (tokened leaves are edge-protected, not re-checked):
+    ///     presence observation + per-hash `.meta` point-read, condemned ⇒ copy-forward-from-source (fail-closed);
+    ///  4. body absent | a non-tokened blob absent | a blob condemned-and-not-recreatable ⇒ ABORTED;
     ///  5. atomically replace precommit(build_id) owner with committed(final_ref_name) owner by appending
     ///     ONE pure-move RootOwnerEvent (old={Precommit,final_ref_name,build_id,T}, new={Committed,final_ref_name,T},
     ///     same manifest_ref T) and setting refs[final_ref_name];

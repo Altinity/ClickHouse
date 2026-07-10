@@ -76,12 +76,14 @@ The CMake target name `clickhouse_cas_proto` is unchanged.
 
 Every object in the pool carries a self-describing header with three invariants:
 
-- **magic** — 4-byte ASCII type tag (`CABL`, `CATR`, `CARS` root-shard, `CAPM` pool-meta,
-  `CAGT` gc-state, `CART` retired-set, `CAHB` heartbeat/mount, `CAGO` gc-outcomes). Sanity
-  check only — no CRC; integrity comes from S3 ETag and content-addressing for hashed objects.
-  (The standalone `CAWM` watermark object was removed when the build watermark merged into the
-  mount-lease heartbeat — see `03 §merged-heartbeat`; its `min_active` / `observed_gc_round` fields
-  now live in the `CAHB` mount body.)
+- **magic** — 4-byte ASCII type tag (`CABL` blob, `CARS` root-shard, `CAPM` pool-meta,
+  `CAGT` gc-state, `CART` retired-set, `CAHB` heartbeat/mount, `CAGO` gc-outcomes, `CAMT` per-hash
+  freshness meta — see [§per-hash freshness meta](#per-hash-meta)). Sanity check only — no CRC;
+  integrity comes from S3 ETag and content-addressing for hashed objects.
+  (`CATR` (tree) was removed 2026-07-03 — see the removed-`Tree` note above. The standalone `CAWM`
+  watermark object was removed when the build watermark merged into the mount-lease heartbeat — see
+  `03 §merged-heartbeat`; its `min_active` field now lives in the `CAHB` mount body — the `observed_gc_round`
+  ack field was later removed in v3, `cas_format.proto` reserved 10.)
 - **`writer_version`** — forensic: which build wrote this object.
 - **`compatibility_version`** (`min_reader_version` in earlier plans) — functional write-down-to-floor:
   a reader must fail-closed (`UNKNOWN_FORMAT_VERSION`) if `compatibility_version > G_BUILD`.
@@ -222,6 +224,27 @@ Code: `Core/CasTreeCodec.{h,cpp}` (not implemented as of 2026-07-03 — no such 
 
 ---
 
+## Per-hash freshness meta (`.meta`, `CAMT`) {#per-hash-meta}
+
+**Status: DONE** (v3 freshness-meta, spec `2026-07-09 §meta-protocols`).
+
+Alongside each blob body the pool may carry a small per-hash **freshness meta** object
+(`Core/CasBlobMeta.{h,cpp}`), tagged with the on-disk magic `"CAMT"` (fixed-length body). It records a
+2-state `MetaState` — `Clean = 0` (referenceable; body present) or `Condemned = 1` (GC marked in-degree
+0; body STILL present, a writer may resurrect by CAS) — plus a `condemn_round` (an ABA guard after
+spare→re-condemn) and `size`. There is **no** `Tombstone` state (the raw-body/terminal-tombstone and
+per-incarnation-key variants were rejected — see the freshness-meta v3 plan).
+
+Role: it is the **writer's freshness point-read**, replacing the old writer-side retire-view. On a
+dedup/reuse hit the writer `loadMeta`s the hash and treats `Condemned` as `ABORTED` → re-upload from
+source (INV-1); otherwise it adopts the existing blob. GC keeps it current (`writeCondemnedMeta` on
+condemn, plus spare/delete transitions) on a bounded pool (`gc_meta_pool_size`). It is a freshness
+marker only, **not** the linearization point: delete-exactness stays with the in-body incarnation tag +
+exact-token BODY delete (see [§incarnation-in-body](#incarnation-in-body); `CaIncarnationCore`). Ops
+surface (`CasBlobMeta.h`): `loadMeta`, `putMetaIfAbsent`, `casMeta`, `deleteMetaExact`.
+
+---
+
 ## Merkle `treeId` identity rule {#merkle-tree-id}
 
 **Status: not implemented as of 2026-07-03** — superseded by the rev. 15 root-local part-manifest
@@ -240,8 +263,10 @@ where:
   independent of storage layout. An inline file and a standalone blob with the same content produce
   the same `treeId`.
 
-The domain tag `"CAMT"` and rule version `u8(1)` live only inside the hash input; they are never
-stored on disk. The rule is **frozen by convention**: changing it only loses cross-boundary dedup
+The domain tag `"CAMT"` and rule version `u8(1)` live only inside this (historical, never-persisted)
+hash input. (Note: the 4-byte tag `CAMT` has since been REUSED as a real on-disk magic for the
+unrelated per-hash freshness-meta object — see [§per-hash freshness meta](#per-hash-meta); that reuse
+is independent of this treeId hash-domain tag.) The rule is **frozen by convention**: changing it only loses cross-boundary dedup
 (logically identical trees get different ids → stored twice — a benign duplicate, never a
 correctness problem). Readers never recompute `treeId`; the writer always computes it directly from
 the collected entries before serializing the catalog (`CasBuild::stageTree` uses `merkleTreeId(entries)`).
@@ -306,7 +331,7 @@ layout exactly.
       outcomes/<round>/<shard>
     checkpoint/<version>
     server-roots/<server_root_id>/
-      owner / epoch / mount        (mount body carries min_active + observed_gc_round)
+      owner / epoch / mount        (mount body carries min_active; observed_gc_round removed in v3)
   _pool_meta                       pool identity + format version
 ```
 

@@ -359,7 +359,7 @@ models, preserving the proof history.
 | Subagent-driven development | **DONE** — enforced throughout | Two-review (spec + quality) pattern per task |
 | TLA+ gate (core models) | **DONE** — `CaIncarnationCore`, `CaBuildRootPrecommit`, `CaGcLeaseCore`, `CaGcRootLocalPartManifestCore`, `CaGcShardIncarnationCore` | See `06-tla-models.md` for full index |
 | TLA+ gate (D1 registry removal) | **DONE** — `CaGcShardIncarnationCore` green (724,944 states, two-coordinate proof) | Implementation landed 2026-07-01/02 (`gc/registry`/`RootsRegistry` deleted, discovery via `LIST(cas/refs/)`, shard incarnation stamped); status note updated 2026-07-03 |
-| Scenario suite | **DONE** (S01–S35 cards) | S33 concurrent-leader scenario is EXPECTED-FAIL until attempt-scoped generation lands |
+| Scenario suite | **DONE** (S01–S35 cards) | S33 concurrent-leader scenario now PASSES as a real regression guard (attempt-scoped generation landed 2026-06-28); see `08-testing-and-soak.md §5.1` |
 | 24h deterministic soak | **DESIRABLE** — blocked on conformant backend | rustfs 412 vs. write-error confound needs harness-side fsck retry; currently 4-hour runs |
 | `fsck`/`ca-gc-dryrun` | **DONE** — shipped, used in every soak checkpoint | |
 | Model currency review | **DONE** — 2026-06-22 audit; dispositions recorded | Three stale models identified; `CaGcCore.tla` HISTORICAL |

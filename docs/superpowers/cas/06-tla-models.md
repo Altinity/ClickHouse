@@ -589,6 +589,20 @@ fence and the fold-through-fence recheck (spec `2026-07-02-cas-gc-ack-floor-fenc
 protocol `04 §gc-round`). They are the formal gate for that redesign; the fold/manifest machinery
 the round reuses stays proved by `CaGcRootLocalPartManifestCore.tla` (Area 7).
 
+> **Note — the writer-heartbeat half is superseded by v3 freshness-meta (2026-07-10), the GC-side round
+> half is not.** Both models foreground writer `observed_gc_round` heartbeats and a `min_ack` floor
+> (`condemn_round < min_ack`) as the graduation gate. The freshness-meta redesign
+> (`docs/superpowers/plans/2026-07-10-cas-freshness-meta-v3.md`) removed exactly that half:
+> `CasRetireView.{h,cpp}` (the writer-side retired-view download this ack floor fed) is deleted;
+> `Core/Proto/cas_format.proto` reserves the wire field (`reserved 10; // was observed_gc_round; the
+> writer-side retired-view ack floor was removed (v3 Task 6)`); and `Gc::graduationDue` (`CasGc.cpp`)
+> now paces graduation on GC rounds alone, per its own comment — "graduation itself paces on GC rounds
+> via `new_round`, not on heartbeat acks". The GC-side round pipeline these models also cover —
+> `GBegin`/`GFold`/`GComplete`, the two-step commit gate, `graduationDue`'s `condemn_round < current_round`
+> check, disaster-recovery `GRebuild`, the clamp-suppression guard (§area-clamp-suppression) — is
+> UNCHANGED and stays CURRENT. Only the writer-heartbeat/`min_ack` half of what these models prove is
+> historical; the models are kept as the record of the mechanism they gated, not deleted.
+
 ### `CaGcAckFloorCore.tla` — ack-floor round core {#ackfloor-core}
 
 **Files:** `CaGcAckFloorCore.tla`, `CaGcAckFloorCore_stage1.cfg`, `CaGcAckFloorCore_sab_*.cfg`,
@@ -640,7 +654,11 @@ clamped pass occurred).
 - Rebuild must discard the old retired list and mint a round above every surviving mount ack (see
   §area-clamp-suppression for the clamp/rebuild/copy-forward extension detail).
 
-**Code currency:** CURRENT (`cas-gc-ack-floor-fence`). Honest stage-1 clean at 83.9M distinct states.
+**Code currency:** CURRENT (minor drift; partially superseded — v3 freshness-meta, see the note above).
+The GC-side round pipeline (`GBegin`/`GFold`/`GComplete`, `graduationDue`, `GRebuild`, clamp suppression)
+matches shipped code (`cas-gc-ack-floor-fence`); honest stage-1 clean at 83.9M distinct states. The
+writer-heartbeat/`min_ack` graduation floor this model also proves is SUPERSEDED: shipped graduation now
+paces on `condemn_round < current_round` alone, with no writer ack input.
 
 ---
 
@@ -670,7 +688,10 @@ writers whose in-flight commits landed after the cut (invisible to this pass's i
 fresh graduation could then go pending over a live reference. Pinned as a comment at the
 `computeHeartbeatFloor` call site and in the spec's TLA+ section.
 
-**Code currency:** CURRENT (`cas-gc-ack-floor-fence`).
+**Code currency:** CURRENT (minor drift; partially superseded — v3 freshness-meta, see the note above).
+The two-phase `delete_pending` graduation and the deposed-leader `gc/state` CAS guard are GC-side
+mechanics and stay CURRENT (`cas-gc-ack-floor-fence`); graduation no longer depends on a writer
+heartbeat ack.
 
 ---
 
@@ -722,9 +743,15 @@ The prose files `README.md` and `RESULTS.md` in this directory are this model's 
 | `CaGcRootLocalPartManifestCore.tla` | Part-manifest GC R0 | **CURRENT** (fold/manifest/attempt-scoping); fence/recheck phases SUPERSEDED by Area 11 | `INV_NO_DANGLE/LOSS/RETURN`, 10 more; liveness | 28 | all-shard fresh fence (superseded), single coordinator fence (superseded), scatter deltas, stale-token-no-over-delete, attempt-scoped visibility |
 | `CaGcIndegRefoldCore.tla` | Indeg re-fold | **CURRENT** | `INV_INDEG_NONNEG` | 1 | seal cursor at `max(foldCursor, fenceVersion)`, not `foldCursor` |
 | `CaGcShardIncarnationCore.tla` | Registry removal D1 | **CURRENT** | `INV_NO_DANGLING`, `INV_NO_ORPHAN_EDGE` | 4 | two-coordinate replacement (incarnation + round self-floor) for registry; per-shard monotonicity |
-| `CaGcAckFloorCore.tla` | Ack-floor round core | **CURRENT** | `INV_NO_DANGLE`, `INV_NO_RETURN`, `INV_ACK_LE_VIEW` | 11 | causal floor gates graduation; ack after drain + view load; expired ⇒ fence-out; recreate not adopt; rebuild discards retired list + mints round above all acks; clamp suppression gates graduation |
-| `CaGcAckFloorZombie.tla` | Ack-floor two-leader | **CURRENT** | `INV_NO_DANGLE`, `INV_NO_RETURN` | 1 | `delete_pending` two-phase graduation load-bearing; floor latched ≤ fold cut (order invariant) |
+| `CaGcAckFloorCore.tla` | Ack-floor round core | **CURRENT** (minor drift; writer-heartbeat half superseded — v3) | `INV_NO_DANGLE`, `INV_NO_RETURN`, `INV_ACK_LE_VIEW` | 11 | causal floor gates graduation; ack after drain + view load; expired ⇒ fence-out; recreate not adopt; rebuild discards retired list + mints round above all acks; clamp suppression gates graduation |
+| `CaGcAckFloorZombie.tla` | Ack-floor two-leader | **CURRENT** (minor drift; writer-heartbeat half superseded — v3) | `INV_NO_DANGLE`, `INV_NO_RETURN` | 1 | `delete_pending` two-phase graduation load-bearing; floor latched ≤ fold cut (order invariant) |
 | `CaGcCore.tla` | EBR GC core | **SUPERSEDED** | `INV_NO_LOSS`, `INV_NO_DANGLE`, `INV_NO_ABA` | 4 CEs during dev | EBR design record; replaced by incarnation-token |
+| `CaGcRoundDeferCore.tla` | GC round DEFER/skip-unchanged | **CURRENT** | `NoOverDelete`, `NoDangle`; `EventuallyFolded` | 2 | a due graduation force-folds first (no destructive decision on a not-fully-folded snapshot); deferral bounded (`deferCount < MaxDefer`) |
+| `CaEdgeBeforeObserve.tla` | Writer/GC simplification Gate A | **CURRENT** | `NoOverDelete`-shaped safety (implicit) | 4 | with EDGE-BEFORE-OBSERVE + same-pass decided-delete, promote-time revalidation of TOKENED leaves is redundant; K1/K3Head/K3AdoptCheck + the order itself stay load-bearing |
+| `CaMetaDescriptor.tla` | Writer/GC simplification Gate B (meta descriptor, v1) | **CURRENT** (predates the v3 2-state trim) | `INV-META-BODY` | 7 | create bottom-up (body, then meta); delete top-down (meta at captured etag, then body at condemn-time token) |
+| `CaMetaDescriptorRaw.tla` | Gate B raw-body / terminal-tombstone | **SUPERSEDED** (rejected by v3) | `INV_NO_LOSS`, `INV_NO_DANGLE`, `INV_META_BODY` | 5 | raw immutable bodies force a terminal tombstone + writer-waits-on-GC coupling; rejected in favor of keeping the in-body incarnation tag |
+| `CaMetaIncarnationKey.tla` | Gate B Option B (per-incarnation body keys) | **SUPERSEDED** (rejected) | `INV_NO_DANGLE` (implicit) | 1 | removes the tombstone/wait but reintroduces the already-rejected generation-in-key design (404→LIST, manifest carries incarnation) |
+| `CaManifestSweepWindow.tla` | Orphan-sweep vs removal-fold wedge | **CURRENT** | `INV_FOLD_PROGRESS` | 1 | the orphan sweep must skip a committed body with a pending (unsealed) removal — the removal-fold still needs the body to emit its decrement |
 
 ---
 
@@ -854,3 +881,148 @@ idempotency + writer-side retire-view condemnation), and ca-soak S30 — the blo
 `unaccounted` to a draining pipeline (the remaining S30 manifest orphan was a DISTINCT bug, the
 `DANGLING-PRECOMMIT` fix in §Area 7). Documented follow-up (non-blocker): add a touch-gating dimension to
 `CaIncarnationCore` `GFold`/`GRetire` so the canonical model can reproduce this class directly.
+
+---
+
+## Area 13 — Writer/GC simplification, freshness-meta, and round-defer (2026-07-06 → 2026-07-10) {#area-writer-gc-simplification}
+
+Four models gate the writer/GC simplification effort (spec
+`2026-07-09-cas-writer-gc-simplification-design.md`) and the adjacent GC round-defer and orphan-sweep
+work. Two further models explored and rejected alternate freshness-meta designs, kept as historical
+record (the doc's convention for rejected models, e.g. `CaB140Dangle.tla` / `CaGcCore.tla`).
+
+### `CaGcRoundDeferCore.tla` — GC round DEFER (skip-unchanged) core {#cagcrounddefercore}
+
+**Files:** `CaGcRoundDeferCore.tla`, `CaGcRoundDeferCore_stage1.cfg`,
+`CaGcRoundDeferCore_witness_deferthenfold.cfg`, `CaGcRoundDeferCore_sab_graduate_on_stale.cfg`,
+`CaGcRoundDeferCore_sab_unbounded_defer.cfg` (spec `2026-07-06-cas-gc-round-skip-unchanged-design.md`,
+Phase 4 Lever A). Mirrors `CaGcAckFloorCore.tla`'s round shape (`GBegin`/`GFold`/`GComplete`, a monotone
+`min_ack` abstraction).
+
+**What it proves.** A round that would make no destructive decision may DEFER (re-adopt the sealed
+in-degree snapshot) instead of rebuilding it, but a due graduation must force-fold first: `GComplete`
+may physically delete a blob only when the unfolded delta carrier holds no pending add/remove touching
+it (`NoOverDelete`) — the mirror of the 2026-06-27 concurrent-leader leak on the unfolded `+1` side.
+Deferral itself is bounded (`deferCount < MaxDefer`, `EventuallyFolded`) so an unfolded delta is never
+permanently skipped. `stage1` is clean (8,445 distinct states); `sab_graduate_on_stale` (drop the
+unfolded-covers-`b` delete guard) violates `NoOverDelete`; `sab_unbounded_defer` (drop the bound)
+violates `EventuallyFolded` (a permanent-skip liveness lasso); `witness_deferthenfold` confirms a real
+DEFER-then-FOLD sequence is reachable (non-vacuity).
+
+**Code currency:** CURRENT (gate for the GC round DEFER/skip-unchanged mechanism).
+
+---
+
+### `CaEdgeBeforeObserve.tla` — writer/GC simplification Gate A {#caedgebeforeobserve}
+
+**Files:** `CaEdgeBeforeObserve.tla`, `CaEdgeBeforeObserve_reduced.cfg`,
+`CaEdgeBeforeObserve_sab_late_edge.cfg`, `CaEdgeBeforeObserve_sab_no_adopt_check.cfg`,
+`CaEdgeBeforeObserve_sab_no_k3_head.cfg`, `CaEdgeBeforeObserve_sab_no_k3_adopt_check.cfg` (Gate A of
+`2026-07-09-cas-writer-gc-simplification-design.md`, Phase A).
+
+**What it proves.** With the writer order `precommit (closure durable) → adopt/observe → promote` and
+GC's `condemn → graduate(floor) → same-pass decided delete` pipeline with per-pass d-recheck, the
+promote-time revalidation of TOKENED leaves is redundant, while the dedup-adoption check (K1), the
+tokenless presence HEAD (K3Head), the tokenless condemned check (K3AdoptCheck), and the ORDER itself
+stay load-bearing. `reduced` (no tokened revalidation) holds; the four sabotages each reproduce a
+dangle: `sab_late_edge` (adoption allowed before the durable closure — the pre-B188 order),
+`sab_no_adopt_check` (K1 removed), `sab_no_k3_head` (absent tokenless leaf published blind),
+`sab_no_k3_adopt_check` (condemned tokenless leaf adopted at promote).
+
+**Code currency:** CURRENT (Gate A for the landed writer/GC simplification Phase A deletions,
+`docs/superpowers/plans/2026-07-09-cas-writer-gc-simplification-phase-a.md`).
+
+---
+
+### `CaMetaDescriptor.tla` — writer/GC simplification Gate B, meta descriptor (v1) {#cametadescriptor}
+
+**Files:** `CaMetaDescriptor.tla`, `CaMetaDescriptor_reduced.cfg`,
+`CaMetaDescriptor_sab_a_meta_first.cfg`, `CaMetaDescriptor_sab_b_body_first.cfg`,
+`CaMetaDescriptor_sab_c_blind_adopt.cfg`, `CaMetaDescriptor_sab_d_uncond_body.cfg`,
+`CaMetaDescriptor_sab_e_no_claim_sweep.cfg`, `CaMetaDescriptor_sab_f_birth_adopt.cfg`,
+`CaMetaDescriptor_sab_g_fresh_head.cfg` (Gate B of `2026-07-09-cas-writer-gc-simplification-design.md`,
+Phase B — the first Gate B attempt, envelope-bodies kept, a per-hash meta `{gen, inc, condemned}`).
+
+**What it proves.** `INV-META-BODY` (meta present ⇒ body present) across create-bottom-up
+(body then meta, If-None-Match) / delete-top-down (meta at the captured etag, then body at the
+condemn-time token) discipline, with a resurrect modeled as two steps (meta CAS, then body re-upload)
+and a no-claim sweep sabotage modeled as two steps (observe, then blind delete) so the crash/race
+windows are explorable. Seven sabotages (a–g: meta-before-body, body-before-meta, blind adopt over
+condemned, unconditional body delete after losing the meta-delete CAS, no-claim debris sweep, birth-
+completion adopting the orphan body instead of resurrect-from-source, GC deleting the body at whatever
+token it currently holds instead of the condemn-time token) all dangle as required.
+
+**Code currency:** CURRENT as the first Gate B model (predates the v3 2-state trim: this model's meta
+carries a 3-field `{gen, inc, condemned}` register, not yet the final 2-state `{clean, condemned}` +
+`condemn_round` codec of `docs/superpowers/plans/2026-07-10-cas-freshness-meta-v3.md` Task 1). Its
+create-bottom-up/delete-top-down and meta⟺body pairing results are the closest existing formal evidence
+to the settled v3 layout (one key per hash, meta as freshness marker); it has not been re-run against
+the v3 Task 1 codec change. The v3 plan's own Task 0 discharges the meta-freshness obligation with a
+written argument (citing `CaIncarnationCore`), not a re-derivation of this model.
+
+---
+
+### `CaMetaDescriptorRaw.tla` — Gate B raw-body / terminal-tombstone (REJECTED by v3) {#cametadescriptorraw}
+
+**Files:** `CaMetaDescriptorRaw.tla`, `CaMetaDescriptorRaw_reduced.cfg`,
+`CaMetaDescriptorRaw_sab_meta_first.cfg`, `CaMetaDescriptorRaw_sab_blind_adopt.cfg`,
+`CaMetaDescriptorRaw_sab_adopt_tomb.cfg`, `CaMetaDescriptorRaw_sab_del_notomb.cfg`,
+`CaMetaDescriptorRaw_sab_resurrect_tomb.cfg`.
+
+**What it proves.** A Gate B variant that drops the envelope to RAW, immutable, write-once bodies and
+makes the per-hash meta the SOLE three-state linearizer (`clean, condemned, tombstone`), with the meta
+etag as the only conditional authority. The v2 correction models GC's body delete as a non-atomic
+two-step (`GcClaimTombstone` then `GcDeleteBody`) and makes `tombstone` terminal — a writer observing
+`tombstone` waits for `absent` and re-creates fresh, never `tombstone → clean`
+(`SabResurrectFromTombstone` re-enables the un-tombstone race and breaks `INV_NO_LOSS`/`INV_NO_DANGLE`).
+`reduced` is clean; the five sabotages (meta-before-body, blind adopt, adopt-over-tombstone,
+delete-without-tombstone-claim, resurrect-from-tombstone) each dangle.
+
+**Code currency:** SUPERSEDED. Raw immutable bodies (fixed etag) cannot let a resurrect displace the
+body by itself, which is exactly what forced the terminal-tombstone handshake — a writer↔GC liveness
+coupling. REJECTED by the v3 design (`docs/superpowers/plans/2026-07-10-cas-freshness-meta-v3.md`,
+superseding `docs/superpowers/plans/2026-07-10-cas-meta-descriptor-raw-body.md`), which keeps the
+settled one-key-per-hash + in-body `incarnation_tag` + exact-token BODY delete instead. Kept as
+explored-and-rejected evidence.
+
+---
+
+### `CaMetaIncarnationKey.tla` — Gate B Option B, per-incarnation body keys (REJECTED) {#cametaincarnationkey}
+
+**Files:** `CaMetaIncarnationKey.tla`, `CaMetaIncarnationKey_reduced.cfg`,
+`CaMetaIncarnationKey_sab_reuse.cfg`.
+
+**What it proves.** An alternative to the terminal-tombstone fix ("Option B"): per-incarnation body keys
+(`blobs/xx/<hash>.<incarnation>`), a tombstone-free two-state meta (`clean`/`condemned`) pointing at the
+current incarnation, and manifest records of `(hash, incarnation)`. GC deletes the condemned
+incarnation's body by its exact key; a resurrect writes a fresh incarnation key, so GC's delete can
+never hit the writer's live body — no cross-object atomicity, no tombstone, no wait. The sabotage
+`SabResurrectReuseIncarnation` (resurrect reuses the condemned incarnation instead of minting a fresh
+one) reintroduces the shared-key race and dangles, proving fresh-incarnation-on-resurrect load-bearing
+within this design.
+
+**Code currency:** SUPERSEDED/REJECTED. This is the generation-in-key design already rejected once
+before (see `docs/superpowers/cas/01-architecture.md` §"Approaches tested and REJECTED": EBR's
+`blobs/<H>/<g>` and Merkle `child_gen`): it forces a `404 → LIST` read path and propagates the
+incarnation up into the manifest/parent, breaking the pure-content manifest and FUSE-readiness. Kept as
+explored-and-rejected evidence.
+
+---
+
+### `CaManifestSweepWindow.tla` — orphan-sweep vs removal-fold wedge {#camanifestsweepwindow}
+
+**Files:** `CaManifestSweepWindow.tla`, `CaManifestSweepWindow_reduced.cfg`,
+`CaManifestSweepWindow_sab_sweep_committed.cfg` (Task 0 of
+`docs/superpowers/plans/2026-07-10-cas-freshness-meta-v3.md`; the wedge gate for the committed-removal-
+scoping debt behind `gtest_cas_orphan_manifest_sweep.cpp::PendingCommittedRemovalBodyIsSkipped`).
+
+**What it proves.** `INV_FOLD_PROGRESS`: when a COMMITTED manifest ref is dropped, its `-1` removal is
+appended to the shard journal but not yet sealed by the GC fold; a promoted build has retired its
+`build_seq`, so the prefix is watermark-eligible for the orphan-manifest sweep. The sweep must NOT
+delete the committed body in the `dropRef → fold-seal` window — the removal-fold still needs the body
+present to emit its decrement. `reduced` is clean; `sab_sweep_committed` (sweep ignores the
+pending-committed-removal protection) deletes the body, so the fold can never decrement and
+`INV_FOLD_PROGRESS` is violated forever.
+
+**Code currency:** CURRENT (`8606ab382aa`; the live gate for the wedge fix — a small, standalone
+prerequisite kept regardless of which Phase-B meta design landed).

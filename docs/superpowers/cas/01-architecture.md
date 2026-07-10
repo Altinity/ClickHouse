@@ -86,7 +86,9 @@ shard manifest containing:
 - `incarnation` — a durable, strictly monotone pair `(writer_epoch, build_sequence)` stamped at
   (re)creation and never changed for that object's life. Closes the ABA hazard: a fold cursor keyed by
   `(ns, shard, incarnation)` can never silently skip a recreated shard's events.
-- `fence_round` — set by GC; the floor below which a writer must refresh its retire view before publishing.
+- `fence_round` — set by GC; a per-shard birth floor (THM-NO-RETURN) used GC-side. (The old writer-side
+  "refresh your retire view to ≥ fence_round before publishing" rule was removed in v3 — the writer now
+  point-reads each blob's `.meta` freshness state instead.)
 
 A publish is **one CAS `PUT`** updating `refs` and appending the journal record atomically. The active set
 for a table is exactly the union of refs across its shards.
@@ -249,14 +251,16 @@ A MergeTree INSERT or merge produces a part locally, then publishes it to the po
    from dead debris.
 2. **Upload by placement** — each content file is hashed (from `checksums.txt`) and placed into the pool:
    - New content: `PUT If-None-Match:*` (idempotent; dedup hit → skip upload).
-   - Cold reuse of an existing blob: observe its current backend token; check the GC retire view —
-     condemned → **resurrect** with a fresh `incarnation_tag`; else reuse as-is.
+   - Cold reuse of an existing blob: point-read the object's per-hash `.meta` freshness state
+     (`Core/CasBlobMeta.h`, `MetaState{Clean,Condemned}`) — condemned → **resurrect** with a fresh
+     `incarnation_tag`; else reuse as-is. (The `.meta` point-read replaced the old writer-side retire view.)
 3. **Precommit stage** — the build writes a precommit binding to a `/_precommits` namespace shard,
    providing GC visibility into in-flight blobs (fold barrier holds the +1 edge until the manifest body
    is present).
 4. **Publish** — one CAS PUT to the ref shard: updates `refs[part_name]` and appends `{+, name, T}` to
-   the journal atomically. On fence conflict: refresh retire view, re-validate the dependency set
-   (`W-REVALIDATE`), resurrect condemned objects, retry.
+   the journal atomically. Tokened deps are edge-protected (EDGE-BEFORE-OBSERVE) and not re-checked at
+   promote; non-tokened deps get a per-hash `.meta` point-read and copy-forward-if-condemned inline in the
+   blob-revalidation loop. (There is no writer-side retire-view refresh anymore — see `03-writer-protocol.md`.)
 5. **Drop** — symmetric: one CAS PUT removing `refs[part_name]` and appending `{-, name, T}`.
 
 A crash anywhere before the publish leaves uploaded objects as **debris** attributed to the build's
@@ -434,8 +438,8 @@ identity becomes a `ManifestId` (monotone composite, not a content hash); blobs 
 incarnation lives in the object body (not the key), so resurrecting a blob produces a distinct backend token
 without changing any parent's hash or key. The `404→LIST` path is gone.
 
-**Note:** The `trees/` key prefix and `ObjectKind::Tree` are vestigial dead code in the current
-implementation — no live writer or reader produces them. Cleanup is a separate item.
+**Note:** The `trees/` key prefix and `ObjectKind::Tree` were removed entirely (2026-07-03) — not merely
+dead code: `ObjectKind` now has only `Blob`, and no `trees/` literal remains. Trees are manifest-internal.
 
 ### REJECTED: EBR (Epoch-Based Reclamation) GC core {#rejected-ebr-gc}
 

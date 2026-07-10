@@ -134,6 +134,23 @@ the exception is caught and `std::nullopt` is returned — a legitimate concurre
 surfaces cleanly as absence (never a raw S3 error code 499). Callers expecting presence propagate
 `FILE_DOESNT_EXIST`. This is documented in `05-formats-and-backend.md §get-nullopt`.
 
+### 4.1 Cacheless characteristic {#cacheless-reads}
+
+**Status: CHARACTERIZED (2026-07-10).** A blob-backed file read is billed and latency-bound on
+**every** access, not just the cold one: the CA disk holds no local byte cache, so a warm/repeat read
+of the same part re-fetches from the object store. The only read-path caches are the two *decode*
+caches (§6, shard/manifest metadata) — not column bytes. Profiled on the CA-S3 lane, a raw-CA warm
+scan is ~3× local (141 ms vs 47 ms; 186 S3 GETs; warm never improves); the `trace_log` hot path is
+`ReadBufferFromS3::nextImpl` → socket receive/poll, NOT the CA metadata layer (prefetch is on, marks
+are mark-cached, resolve is cheap, ~1.2 MB/GET).
+
+**Mitigation:** an opt-in filesystem `cache` disk over the CA disk (like plain-s3's `cached_s3`;
+`test_cas_file_cache`, and the `content_addressed_s3_cache` policy in the stateless-lane config).
+Validated: once warm it serves reads from local disk (0 S3 GETs, ≈ local latency). It helps
+**re-read-heavy** workloads; it does NOT help one-shot scans (the cold populate makes the first read
+~2× slower). This is distinct from the metadata-cache RFC in `cache.md`, which does not cache byte
+content. See `ROADMAP.md §area-read-protocol` and `08-testing-and-soak.md §5.1`.
+
 ---
 
 ## 5. Column pruning {#column-pruning}
@@ -364,6 +381,11 @@ Two kinds of verbatim (non-content-addressed) files exist on a CA disk:
 - **Loose mountpoint objects** — stored at `roots/<server_root_id>/<path>` in the object store
   (e.g. `clickhouse_access_check`). `getStorageObjects` returns a `StoredObject` keyed by
   `mountpointObjectKey(serverPrefix() + "/" + path)` with no manifest indirection.
+  Both `existsFile` and `getStorageObjects` probe presence via `Store::mountpointObjectExists` —
+  a **HEAD-based, directory-safe** check (B38, commit `99b244a9444`), NOT a body read: the emulated
+  backend `head` treats a path with no object metadata as not-an-object, so probing a directory-shaped
+  pool sub-dir (e.g. `store`, as `system.remote_data_paths` traversal does) returns false instead of
+  throwing `CANNOT_READ_FROM_FILE_DESCRIPTOR` ("Is a directory").
 - **`@cas@/_files/` namespace files** — namespace-level verbatim files inside an archive's
   reserved `_files/` segment. Served via `getNamespaceFile` from the root shard's
   `_files`-keyed inline bytes.

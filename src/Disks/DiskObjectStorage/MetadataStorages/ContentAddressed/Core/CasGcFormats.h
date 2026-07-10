@@ -15,8 +15,8 @@ namespace DB::Cas
 /// gc/state and the retired sets to decide whether a reused object is condemned, spec §4).
 ///
 /// OWNERSHIP: these codecs are owned by GC (milestone M-C3). CAGS v3 carries the full GC
-/// controller state: the lease, the snap config, and the fence versions. The fold cursor was
-/// moved into the snap (GcSnap::folded_cursor) in B140-dangle fix (v3).
+/// controller state: the lease, the snap config, and the fence versions. The fold cursor is NOT here —
+/// it lives in the write-once fold seal (`CasFoldSeal::per_ns_shard`), see the `gc/state` note below.
 /// Keep writer-side code forward-compatible by treating a future version as NOT_IMPLEMENTED
 /// (fail closed), never as corruption. The format is unreleased, so v1 (the M-C2 minimal CAGS)
 /// is NOT accepted — no compat shims.

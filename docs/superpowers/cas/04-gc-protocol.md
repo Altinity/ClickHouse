@@ -117,22 +117,19 @@ The GC leader discovers the live namespace universe by `LIST(cas/refs/)` — the
 
 This one LIST sweep is the round's only universe-proportional operation (O(universe/1000) LIST requests); everything else is O(delta) + O(servers). Discovery runs **after** the heartbeat floor (§3.1a), so any fenced-out writer's last commits are durable before the sweep enumerates them.
 
-### 3.1a Heartbeat ack floor {#heartbeat-floor}
+### 3.1a Heartbeat fence pass {#heartbeat-floor}
 
-The **heartbeat ack floor** is what lets GC delete a blob without first writing a per-shard fence. Every server maintains one merged heartbeat (`03 §merged-heartbeat`) carrying `observed_gc_round` — the newest GC round whose retired list it has fully loaded. `computeHeartbeatFloor` (`CasServerRoot.cpp`) is the round's first step and its only use of a wall clock:
+Before discovery, GC runs one **heartbeat fence pass** (`computeHeartbeatFloor`, `CasServerRoot.cpp`) so a superseded (expired) writer's last commits are made durable-or-fenced before the sweep enumerates them. It is the round's first step and its only use of a wall clock:
 
 1. **Enumerate:** LIST `gc/server-roots/` + GET each mount (O(servers), single-digit counts).
-2. **Classify** each heartbeat, using the injected `now_ms_fn` and `skew_margin_ms = mount_lease_ttl_ms / 2` (`classification = live | terminated | expired`):
-   - *terminated* (graceful-shutdown stamp) → **excluded**: its own final write is causal proof no further mutations exist.
-   - *live* (`expires_at_ms + skew_margin > now`) → contributes its `observed_gc_round` to the floor.
-   - *expired* (`now > expires_at_ms + skew_margin`, no terminated stamp) → **fence-out**: one token-guarded `putOverwrite` that preserves the body, sets `gc_fenced`, and bumps `seq`. Success ⇒ the sleeper's next renewal permanently fails (`tripMountLost`; only a full re-open with a fresh view can resume writing) ⇒ excluded. `PreconditionFailed` ⇒ it renewed concurrently ⇒ re-GET and reclassify as live.
-3. **Floor:** `min_ack = min(observed_gc_round)` over all **live** entries (expired-and-then-fenced-out writers no longer contribute; no live heartbeats ⇒ `min_ack = +∞`).
+2. **Classify** each heartbeat, using the injected `now_ms_fn` and `skew_margin_ms = mount_lease_ttl_ms / 2` (`live | terminated | expired`):
+   - *terminated* (graceful-shutdown stamp) → excluded: its own final write is causal proof no further mutations exist.
+   - *live* (`expires_at_ms + skew_margin > now`) → left alone.
+   - *expired* (`now > expires_at_ms + skew_margin`, no terminated stamp) → **fence-out**: one token-guarded `putOverwrite` that preserves the body, sets `gc_fenced`, and bumps `seq`. Success ⇒ the sleeper's next renewal permanently fails (`tripMountLost`; only a full re-open with a fresh view can resume writing). `PreconditionFailed` ⇒ it renewed concurrently ⇒ re-GET and reclassify as live.
 
-Fence-outs must complete before discovery (step 2 of the round), so every excluded writer's last commits are durable before the sweep.
+The result is a `HeartbeatFloor{live, terminated, fenced_now, already_fenced, fenced_srids}` (counts + one `GcFenceOut` audit event per fenced srid). Fence-outs must complete before discovery, so every fenced writer's last commits are durable before the sweep.
 
-**Order invariant (load-bearing):** the floor is latched **no later than the fold cut**. Reading the floor after the cut would see acks advertised by writers whose in-flight commits landed after the cut — invisible to this pass's in-degrees — and a fresh graduation could then go pending over a live reference. `CaGcAckFloorZombie.tla` pins this ordering (`06 §ackfloor-zombie`); the implementation latches `min_ack` at the start of the pass, and a comment at the `computeHeartbeatFloor` call site records why.
-
-The floor gates graduation only (§3.4); rounds never block on acknowledgements. A live-but-stale-acking server holds **all** graduations back (the floor is a `min`) — a liveness property, made observable (§Observability) and bounded for dead servers by lease expiry + fence-out.
+**SUPERSEDED (v3 freshness-meta):** this pass used to ALSO compute a writer-ack floor `min_ack = min(observed_gc_round)` over live heartbeats, and graduation was gated on it. The `observed_gc_round` field was removed (`cas_format.proto` reserved 10 — the writer-side retired-view ack floor is gone). **Graduation now paces on GC rounds** — a retired entry graduates one round after it is condemned (via `new_round`), not on heartbeat acks — and the writer's condemned-detection is a per-hash `.meta` point-read (§3.4, `03 §merged-heartbeat`). `CaGcAckFloorZombie.tla` (`06 §area-11`) models the historical ack-floor ordering; only its GC-round-pipeline half stays current.
 
 ### 3.2 Fold {#fold}
 
@@ -212,17 +209,17 @@ Let `min_ack` be the floor latched in §3.1a and `condemn_round = state.round + 
 | `> 0` | yes | **spare** — drop the entry; emit a B170 recheck-verdict event with the recovered in-degree. |
 | `= 0` | retired, `condemn_round < min_ack` | **graduate** — mark the entry `delete_pending` and re-publish it (two-phase, below). |
 | `= 0` | retired, `condemn_round ≥ min_ack` | keep the entry unchanged (not yet provably seen by every live writer). |
-| `= 0` | not retired | **condemn** — `HEAD` the blob to capture its current token (absent ⇒ nothing to delete, skip; `GcSnap::forget`); append `(hash, token, condemn_round)` to the retired output. |
+| `= 0` | not retired | **condemn** — `HEAD` the blob to capture its current token (absent ⇒ nothing to delete, skip); append `(hash, token, condemn_round)` to the retired output. |
 
 Because `min_ack ≤ round − 1` always (acks cannot exceed the last published round), an entry condemned in this pass structurally cannot graduate in the same pass — the two-round pipeline falls out of the arithmetic, with no explicit rule.
 
 **Clamp suppression (`suppress_destructive`, 2026-07-03):** the table above is overridden pass-wide the instant the fold recorded **any** clamp anomaly (§absent-at-head): a `suppress_destructive` flag is threaded `Gc::runRegularRound` → `foldDeltasIntoGeneration` / `ShardReducer::reduce` → `settleEntry`. While set, no entry graduates to `delete_pending` and no already-`delete_pending` entry is re-delivered for `deleteExact`; every retired entry (pending or not) is carried unchanged to `still_retired`. Condemning and sparing are unaffected. This restores the ack-floor lemma "landed before the cut ⇒ folded before graduation," which a clamped shard's frozen cursor otherwise violates — found live in the night soak as 31 dangling blobs. Deletes resume on the first clamp-free pass.
 
-**Condemn fail-closed (absent-at-condemn):** a blob already absent when its `HEAD` returns 404 records **nothing** — there is no token to condemn (`GcSnap::forget`, §4.1). GC must **never fabricate a token** on a 404: a synthetic token would let a stale exact-token delete match a future unrelated incarnation reusing the same hash, violating `INV_NO_RETURN`.
+**Condemn fail-closed (absent-at-condemn):** a blob already absent when its `HEAD` returns 404 records **nothing** — there is no token to condemn. GC must **never fabricate a token** on a 404: a synthetic token would let a stale exact-token delete match a future unrelated incarnation reusing the same hash, violating `INV_NO_RETURN`.
 
 **Recovery wins over everything, `delete_pending` included** (fail-closed spare): a retired entry whose in-degree recovered to `> 0` is spared even if it was already `delete_pending`. A pending entry observed with recovered in-degree is structurally impossible (floor-passed ⇒ every live writer sees it condemned ⇒ no new reference), so it is spared *and* logged loudly.
 
-The retired run is an **observation-bearing artifact**: the token is the value this pass's `HEAD` observed; two leaders may observe different tokens if a re-incarnation happened between their HEADs. The first durable write wins (read-if-present, not byte-equal-or-`CORRUPTED_DATA`). Once the run is published (§3.6), the writer's `RetireView` reflects it — writers see the condemned `(hash, token)` and recreate rather than reference it (`03 §commit-gate`).
+The retired run is an **observation-bearing artifact**: the token is the value this pass's `HEAD` observed; two leaders may observe different tokens if a re-incarnation happened between their HEADs. The first durable write wins (read-if-present, not byte-equal-or-`CORRUPTED_DATA`). Once an entry is condemned, GC writes a per-hash `Condemned` `.meta` marker (`writeCondemnedMeta`, `CasGc.cpp`) on the bounded `gc_meta_pool_size` job pool — the writer's dedup/reuse gate point-reads it via `loadMeta` (`CasBlobMeta.h`) and treats `Condemned` as `ABORTED` → re-upload-from-source (`INV-1`, `CasBuild.cpp`), rather than referencing the condemned blob. There is no round-indexed `RetireView`; the meta is a 2-state freshness marker (`Clean` / `Condemned`), not a linearization point.
 
 **Missing manifest-body policy (inherited from fold, unchanged):** a missing/invalid committed-or-promoted new-binding body **clamps** the affected shard (fail-closed, surfaced to `fsck`, **not** spare-by-default); a missing precommit body is non-activating; an old-binding removal uses edges already sealed at fold and never reads a deleted body. Clamped coverage is now first-class (`ShardCoverage classification = 4`) and forbids the token-diff Skip: a barrier-clamped shard whose listed token never changes (the missing precommit body arrives via a manifest PUT, not a shard rewrite) must still be re-read, or its edges are lost forever. This was a real regression found while porting the merge.
 
@@ -277,30 +274,14 @@ After the round CAS is durable, `trim` removes journal records from root shards 
 
 ### 3.9 Resident-snap incremental GC and the durable-vs-resident cursor {#resident-snap-checkpoint}
 
-**Status: DONE** (incremental-GC checkpoint; source `specs/2026-06-14-ca-reduce-s3-op-count-design.md`).
-
-To avoid a per-round `loadSnap` + full snap PUT on a large pool, the decoded `GcSnap` is kept
-**resident** in the long-lived per-leader GC object. Each round folds only the new journal records
-(changed root-shard bodies past `folded_cursor`) into the resident snap — no per-round snap I/O. The
-whole snap plus its `folded_cursor` are persisted **only at a checkpoint**, triggered when either:
-
-- `gc_checkpoint_records = 4096` — at least this many journal records have been folded since the
-  last checkpoint (caps the recovery re-fold cost), or
-- `gc_checkpoint_rounds = 64` — at least this many rounds have elapsed (caps staleness even under
-  zero churn).
-
-Between checkpoints there is **zero snap I/O**. A recovering or newly-elected leader loads the last
-checkpoint's snap and `folded_cursor`, then re-folds the journal delta from that cursor to the live
-`shard_version` (bounded by `gc_checkpoint_records`), so handoff recovery is seconds, not minutes.
-
-**Durable-vs-resident cursor trim invariant:** there are two cursors — the **resident** cursor
-(advances every round as records are folded into the in-memory snap) and the **durable**
-`folded_cursor` (advances only at a checkpoint). `trim` (§3.8) may remove journal records **only at
-or below the durable `folded_cursor`**, never the resident cursor. Records between the durable
-cursor and the live `shard_version` are unpersisted; a recovery leader re-folds them from the
-durable cursor, so trimming them would lose folded edges on the next recovery — the exact B140-class
-undercount. The `gc/state.folded_cursor` therefore always equals the last-checkpoint cursor, and the
-incremental path must not advance it except at a checkpoint.
+**Status: SUPERSEDED** (2026-07-02 ack-floor one-pass rewrite). This section originally described a
+resident, incrementally-folded `GcSnap` kept in the long-lived per-leader GC object and persisted only
+at a checkpoint gated by `gc_checkpoint_records` / `gc_checkpoint_rounds`, with two cursors
+(resident vs. durable `folded_cursor`) reconciled at checkpoint time. That machinery does not exist in
+the current implementation: there is no resident `GcSnap`, no checkpoint gate, and no
+resident/durable cursor split. Every round now does a full attempt-scoped fold plus exactly one
+`gc/state` CAS — see §3.2/§3.6 for the current fold + publish model and §5 for the attempt-scoped
+artifact layout that replaced incremental checkpointing.
 
 ---
 
@@ -310,18 +291,15 @@ incremental path must not advance it except at a checkpoint.
 
 ### 4.1 Delete-time and retire-404 node pruning {#node-pruning}
 
-**Status: DONE** (P9, TLA+ `GForget` action added to `CaGcCore.tla`).
-
-**Problem:** after GC deletes an object, its node stays in the `known` set (candidate eligibility) forever. Every subsequent round re-derives it as a zero-in-degree candidate and issues a `HEAD` → genuine 404 → `continue`. Measured: ~46k re-`HEAD`s per round even when no objects were deleted this round — ~98% of GC op-count.
-
-**Fix:** `GcSnap::forget(kind, hash)` removes a node from `known` the instant GC confirms it is gone:
-
-- **Delete-time prune** (primary): after a `deleteExact` outcome of `Deleted` or `Absent-while-held`, call `snap.forget(kind, hash)`. Durable in the next snapshot run the round publishes.
-- **Condemn-404 prune** (defensive): when a candidate `HEAD` returns 404 during the three-cursor merge's condemn branch (§3.4), call `snap.forget(kind, hash)` and continue. Self-heals the split-brain case where a live leader already deleted a node the follower still observes in its snap.
-
-A forgotten node that is later re-referenced is re-added to `known` by the ordinary fold (`GFold` re-inserts into `known`). Forgetting is idempotent and can never cause a delete (it only removes a node from candidacy).
-
-**TLA+ reference:** `CaGcCore.tla` adds a `GForget(l, h)` action gated on `~present[h] ∧ h ∈ everEdged ∧ InDeg(h) = 0`. All invariants (`INV_NO_LOSS`, `INV_NO_DANGLE`, `INV_NO_RETURN`, `INV_OVER_COUNT_ONLY`) hold under `GForget`. See `06-tla-models.md §gc-core`.
+**Status: SUPERSEDED.** This section originally described `GcSnap::forget(kind, hash)` (P9), which
+removed a node from a persisted `known` candidate-node set the instant GC confirmed it was gone
+(delete-time prune + condemn-404 prune), to stop ~46k re-`HEAD`s per idle round against nodes GC had
+already deleted. That machinery — `GcSnap`, its `known` set, and `forget` — does not exist in the
+current implementation (superseded by the source-edge-set model, §3.3). The source-edge-set model has
+**no persisted node registry to forget from**: GC candidates are derived transiently, per generation,
+from the explicit zero-transition marker rows the fold emits (§3.3) — a blob that is not a
+zero-transition candidate this generation is never re-`HEAD`ed, with no separate forgetting step
+needed. The re-`HEAD`-storm problem P9 solved no longer applies under this model.
 
 ### 4.2 Generation retention {#generation-retention}
 
@@ -483,13 +461,13 @@ Two orthogonal coordinates replace all five overlapping counters:
 
 **Coordinate 1 — `incarnation`.** A durable, monotone, never-reused value stamped into a `RootShard` at its (re)creation and immutable for that object's life. Source: `(writer_epoch, build_sequence)` of the build that first creates the shard, both already durable-monotone-never-reused. On delete + recreate, the new create stamps a strictly-greater coordinate. **`INC-MONO`**: for a fixed `(ns, shard)`, every successive materialization carries a strictly greater incarnation.
 
-**Coordinate 2 — GC `round`.** The pool-global clock (unchanged). The writer's retire-view gate floor: no writer may durably reference a blob condemned as of round `R` without refreshing its retire view to `≥ R`. This is pool-global and cannot be per-`server_root`.
+**Coordinate 2 — GC `round`.** The pool-global clock (unchanged). Writer-visible condemnation is a per-hash meta point-read (`BlobMeta.state`, §3.4), not a round-indexed floor a writer refreshes: a writer that observes `Condemned` via `loadMeta` re-uploads from source (`INV-1`) rather than referencing the blob. `BlobMeta.condemn_round` is carried in the meta body but is only an ABA guard against a stale spare-then-recondemn race, never a writer-visible floor. `round` itself stays pool-global and cannot be per-`server_root`.
 
 The fold cursor is keyed by `(ns, shard, incarnation)` instead of `(ns, shard)`. A recreated shard draws a strictly-greater incarnation → the old sealed cursor never matches → fold always processes a new incarnation from zero. ABA is closed by construction.
 
 **Discovery replaces the registry:** `discoverUniverse` becomes `LIST(cas/refs/)`. The registry (`gc/registry`, `RootsRegistry`, `rootsRegistryKey`) is deleted entirely. `listNamespaces` (used for FREEZE shadow-tree enumeration) migrates to a `LIST` over `cas/refs/`.
 
-**Newborn namespace ordering (no separate object):** the registry's irreducible role was ordering a first publish that dedup-references an existing blob against a concurrent last-drop-and-GC. D1 replaces this with the existing **precommit machinery**: a first publish creates the ref-shard object at its canonical path carrying a precommit binding (with the fresh incarnation). The shard is LIST-discoverable immediately. The precommit gate (fold barrier + watermark reclaim) provides create-ordering without a separate pending-newborns object. **THM-NO-RETURN (central):** with the registry removed, for a first publish that dedup-references blob `B`, either (a) the newborn shard is in GC's LIST universe and GC folds its precommit `+1` before condemning `B`, or (b) the writer observed a retire-view floor `≥ R` and re-uploads rather than referencing a condemned blob. No interleaving can dangle a live ref. This is the theorem the TLA+ gate proved.
+**Newborn namespace ordering (no separate object):** the registry's irreducible role was ordering a first publish that dedup-references an existing blob against a concurrent last-drop-and-GC. D1 replaces this with the existing **precommit machinery**: a first publish creates the ref-shard object at its canonical path carrying a precommit binding (with the fresh incarnation). The shard is LIST-discoverable immediately. The precommit gate (fold barrier + watermark reclaim) provides create-ordering without a separate pending-newborns object. **THM-NO-RETURN (central):** with the registry removed, for a first publish that dedup-references blob `B`, either (a) the newborn shard is in GC's LIST universe and GC folds its precommit `+1` before condemning `B`, or (b) the writer's meta point-read (`loadMeta`) observes `B` as `Condemned` and re-uploads from source (`INV-1`) rather than referencing the condemned blob. No interleaving can dangle a live ref. This is the theorem the TLA+ gate proved.
 
 **Shard-object reclaim:** `dropNamespace` appends, as its last journal event, an explicit **tombstone** marker (`RootOwnerEvent` variant meaning "namespace dropped, no owner"). GC, during fold, when a shard is empty (no refs), its last journal event is the tombstone, and its journal has been folded past a completed fence, issues `deleteExact(rootShardKey(ns, shard), token)`. Any writer append (revive) changes the token → `deleteExact` returns `TokenMismatch` → the delete is refused; the object survives with new content. An idle-but-live shard (all parts dropped, table alive) has no tombstone → not reclaimed → still discovered. The tombstone is the drop signal.
 
@@ -625,7 +603,7 @@ GC is the dominant S3 cost center on a pool with steady ingest/drop churn. Detai
 
 The ack-floor round is **O(delta) + O(servers)** requests plus the single LIST sweep — no O(universe) GET or PUT phase exists. This is the whole point of replacing fence+recheck; the per-round cost dropped from ~2.4 M requests to ~2 000–3 000 at the 100k-tables example. See `07-s3-budget.md §gc-budget` for the full breakdown.
 
-**P9 snap-prune impact (DONE):** before snap-prune and the node-forgetting mechanism, GC issued ~46k `HEAD`s per idle round (re-`HEAD`ing every previously deleted candidate). Both are now eliminated: the condemn-404 path prunes the node on first 404; the delete-time path prunes immediately on deletion. The `gc/` prefix went from 82% of pool storage to bounded sawtooth.
+**Node-forgetting impact (SUPERSEDED):** this line originally credited a `GcSnap::forget` node-forgetting mechanism (P9) with eliminating ~46k re-`HEAD`s per idle round against previously-deleted candidates. That mechanism does not exist under the current source-edge-set model (§3.3, §4.1) — there is no persisted node registry to prune, so the re-`HEAD` storm it solved does not arise in the first place (candidates are derived transiently from zero-transition markers each generation, §3.3). The `gc/` prefix's reduction from 82% of pool storage to a bounded sawtooth is generation retention (§4.2, B174), not node-forgetting.
 
 ---
 
@@ -664,7 +642,7 @@ Key test files:
 | Delta-runs + compaction for the snapshot (bytes O(edges)/pass) | **DESIRABLE** | Next dominant cost; deferred O(buffer) streaming work |
 | Attempt-scoped generations (concurrent-leader safety) | **DONE** | 2026-07-01; `_sab_deposedleaderwritesfinalgen` confirmed |
 | Advisory heartbeat (B160, false-steal fix) | **DONE** | `CaGcLeaseCore.tla` proved |
-| Snap prune — node forgetting (P9) | **DONE** | `GcSnap::forget`; `GForget` added to model |
+| Snap prune — node forgetting (P9) | **SUPERSEDED** | `GcSnap::forget`/`known` set removed with the source-edge-set model (§3.3); no persisted node registry to forget from (§4.1) |
 | Snap prune — generation retention (B174) | **DONE** | 3 gen default; sawtooth gc/ storage |
 | Part-manifest cleanup (owner-driven) | **DONE** | |
 | Orphan part-manifest sweep (pre-precommit debris) | **DONE** | Bounded per round |

@@ -48,7 +48,7 @@ This was the state prior to the B168 P0/P1/P2 optimizations and the head-after-p
 | Precommit | `PUT` (`If-Match`) | 1 | One `casPut` on the target root shard (appends create-precommit event, **code-derived**, `CasBuild.cpp:582`). |
 | Part-manifest | `PUT` (`If-None-Match:*`) | 1 | One unconditional content-addressed manifest object (`CasBuild.cpp:562`). |
 | Promote (commit) | `PUT` (`If-Match`) | 1 | One `casPut` on the target root shard (owner precommit → committed ref, **code-derived**, `CasBuild.cpp:657`). |
-| Promote: revalidate deps | `HEAD` | 0–`f+1` | Bounded re-HEAD of deps at the publish gate (`CasBuild.cpp:729`). Typically 0 on a hot shard (dedup-cache present); ≤ `f+1` cold (**code-derived**). |
+| Promote: revalidate deps | `HEAD` | 0–`f+1` | **Superseded (EDGE-BEFORE-OBSERVE, `2026-07-09-cas-writer-gc-simplification`):** the bulk re-HEAD-of-all-deps at promote (the old `revalidateDeps`, no longer in code) is gone. Tokened deps are edge-protected and NOT re-checked at promote; only non-tokened deps get a HEAD + a per-hash `.meta` point-read GET (`Build::promote`, `CasBuild.cpp`). |
 
 **Baseline total** (pre-optimizations, no dedup): 2·`f` + 4 `PUT`s + `f` + `D` `HEAD`s (ignoring
 revalidate). At 64% dedup hit rate that is ≈ 3·`f` + 4 ops for a typical part.
@@ -57,7 +57,7 @@ revalidate). At 64% dedup hit rate that is ≈ 3·`f` + 4 ops for a typical part
 
 | Step | Operation | Count | Notes |
 |---|---|---|---|
-| Blob: cache HIT, HEAD-first present | `HEAD` | `D_cache` | Cache-hit blobs: 1 cheap HEAD replaces a body-PUT + HEAD. `D_cache` ≈ `D` after warmup (**code-derived**, `CasBuild.cpp:131`). |
+| Blob: cache HIT, HEAD-first present | `HEAD` + `GET` | `D_cache` | Cache-hit blobs: 1 cheap HEAD (replaces a body-PUT + HEAD) **plus a per-hash `.meta` point-read GET** (v3 freshness-meta, `observeAndAdmit` — condemned? → resurrect, else adopt). `D_cache` ≈ `D` after warmup (**code-derived**). The same `.meta` GET is added on the 412 dedup-follow-up path below. |
 | Blob: cache HIT, HEAD-first 404 (stale) | `HEAD` + `PUT` | rare | Stale cache hit: HEAD 404, fall through to normal PUT. |
 | Blob: large-body cache MISS (P2 size trigger) | `HEAD` + `PUT` | `F - D` | Blobs ≥ 1 MiB and not in cache: HEAD-first check, then PUT on miss (**code-derived**, `CasBuild.cpp:119`). |
 | Blob: small-body cache MISS | `PUT` | `(f-F) - D_small` | Small blobs bypassing P2 with no cache hit go straight to conditional PUT. |
@@ -80,9 +80,9 @@ reduction from the baseline 30+ ops.
 
 ### 1.4 Heartbeat renewal {#write-budget-watermark}
 
-Each writer renews **one merged heartbeat** per renewal interval: the mount lease, the build
-watermark (`min_active`), and the GC ack (`observed_gc_round`) ride a single `PUT`, plus one
-`gc/state` `GET` to learn the current round (`03 §merged-heartbeat`). This is **−1 PUT** versus the
+Each writer renews **one merged heartbeat** per renewal interval: the mount lease and the build
+watermark (`min_active`) ride a single `PUT` (the GC-ack `observed_gc_round` was removed in v3 — see
+`04 §heartbeat-floor`), plus one `gc/state` `GET` to learn the current round (`03 §merged-heartbeat`). This is **−1 PUT** versus the
 former two separate heartbeats (mount lease + standalone watermark object) and **+1 GET**. The
 per-build `CasBuildPut` heartbeat was already removed earlier (B167c: redundant with the watermark).
 
@@ -184,7 +184,7 @@ sweep — no O(universe) GET or PUT phase.
 
 | Step | Operation | Count | Notes |
 |---|---|---|---|
-| Heartbeat enumeration | `LIST` (`gc/server-roots/`) + `GET` | 1 LIST + `N` GETs | LIST the server roots, GET each mount body to classify live/terminated/expired and read `observed_gc_round` (`computeHeartbeatFloor`). `N` is single-digit. |
+| Heartbeat enumeration | `LIST` (`gc/server-roots/`) + `GET` | 1 LIST + `N` GETs | LIST the server roots, GET each mount body to classify live/terminated/expired for fence-outs (`computeHeartbeatFloor`; the `observed_gc_round` ack read was removed in v3). `N` is single-digit. |
 | Expired-mount fence-out | `PUT` (`If-Match`) | rare (`≤` expired count) | A token-guarded `putOverwrite` setting `gc_fenced` on a lease-expired mount; only when a server actually died. |
 
 **Per-round floor cost:** 1 LIST + `N` GETs (+ rare fence-out PUT). This is the round's only clock
@@ -327,8 +327,8 @@ Each row is one optimization, the problem it solved, and its measured or modeled
 | LIST-token skip savings | **Code-derived** | `computeDiscoverDecisions` logic, `CasGc.cpp:1430`; not yet separately instrumented |
 | Replication HEAD+GET per part (~15+15) | **Measured** | `part_log` attribution, `DownloadPart` 53,796 events / ~95 min (P0 soak) |
 | Mutable-files S3 cost (0 ops) | **Code-derived** | `CasRootShardCodec.cpp:121` inline encoding |
-| P9 savings (~90% of read ops) | **Measured basis** | `CasBlobHeadMiss`+`CasTreeHeadMiss` ≈ 90% of all `S3HeadObject`, P0 soak; fix shipped (`GcSnap::forget`), post-fix idle-round re-measurement not yet separately captured here |
-| revalidateDeps per-promote HEAD count | **Modeled/uncertain** | `CasBuild.cpp:729`; exact count depends on dep count + cache state; not separately instrumented |
+| P9 savings (~90% of read ops) | **Measured basis (historical)** | `CasBlobHeadMiss`+`CasManifestHeadMiss` (`CasTreeHeadMiss` was renamed) ≈ 90% of all `S3HeadObject`, P0 soak. NOTE: the specific `GcSnap::forget` node-pruning mechanism this row credited was later REMOVED — superseded by the source-edge-set GC model (no persisted node registry to forget from); see `04-gc-protocol.md` |
+| revalidateDeps per-promote HEAD count | **Removed** | `revalidateDeps` no longer exists (EDGE-BEFORE-OBSERVE, `2026-07-09-cas-writer-gc-simplification`): tokened deps are edge-protected; only non-tokened deps get a HEAD + `.meta` GET at promote |
 
 ---
 

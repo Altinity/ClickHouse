@@ -173,8 +173,10 @@ ORDER BY event_time;
 
 ### 2.2 `system.content_addressed_log` {#event-log}
 
-Per-event CAS audit log (B170). Off by default; enable for tests, soak, or incident forensics.
-When disabled, the injected `CasEventSink *` is `nullptr` — a single branch, no row construction.
+Per-event CAS audit log (B170). **On by default** since `cbe0ffb7608` — `programs/server/config.xml`
+ships a `<content_addressed_log>` section (the CAS disk feature is experimental, so the audit log is the
+primary forensic instrument; it costs nothing when no CAS disk is configured). Remove the config section
+to disable; when disabled, the injected `CasEventSink *` is `nullptr` — a single branch, no row construction.
 Key schema columns:
 
 | column | description |
@@ -240,9 +242,10 @@ deleted in the round that folds its removal, a test that asserts deletion must *
 AND advance the ack between them**: the pipeline is condemn at round K → `delete_pending` at the
 first pass whose floor `min_ack > K` → physical delete the pass after that (with all acks current:
 condemn K → pending K+1 → deleted K+2). Helpers `runRoundsUntilAbsent` / `blobAbsent` /
-`currentRetiredSet` drive this; each round calls `store->renewWatermarkOnce()` (runs the beat so
-`observed_gc_round` follows the committed round), and fixpoint loops continue while the current
-retired list still holds an in-flight entry. A test failing because a blob is deleted *later* than
+`currentRetiredSet` drive this; each round calls `store->renewWatermarkOnce()` (runs the beat to keep
+the mount watermark fresh — graduation itself paces on GC rounds via `new_round`, not on the removed
+`observed_gc_round` ack), and fixpoint loops continue while the current retired list still holds an
+in-flight entry. A test failing because a blob is deleted *later* than
 the old protocol is expected drift; a test failing because a **referenced** blob is deleted, or an
 in-degree double-count appears, is a real bug.
 
@@ -441,6 +444,18 @@ The authoritative finding log is `utils/ca-soak/scenarios/BACKLOG.md` (newest at
   attempt-scoped generations: every per-round artifact is keyed by `(gen, attempt = lease.seq)`;
   a deposed leader's artifacts land under its own unadopted attempt and are invisible to every
   decision path. TLA+ gate A green; S33 liveness verdict flipped to a real regression guard.
+- **CA-S3 stateless lane — system logs on CA + opt-in cache** (2026-07-10): the June **B86** workaround
+  that pinned every system log to the local `default` policy on the CA-S3 lane is REMOVED — the rewritten
+  CA write path flushes fast (`trace_log` 7087 rows in 77 ms; no 180 s timeouts), so system logs now live
+  on `content_addressed_s3` like user tables. An opt-in `content_addressed_s3_cache` disk (`<type>cache>`
+  over the CA disk; integration test `test_cas_file_cache`) is validated warm ≈ local (0 S3 GETs) but is
+  NOT the lane default — it adds cold-populate cost to single-pass reads/writes, and the stateless suite is
+  mostly single-pass. Read-side companion: CA-S3 reads are cacheless (~3× local warm; see
+  `09-read-protocol.md`). Lane point-fixes: `04286` (directory-safe HEAD), `05008` (ack-floor
+  `entries_redeleted >= objects_deleted`), `05009` (default-ON log + `disk_name` filter), `01271`, `03829`
+  (`max_memory_usage` 150M→170M for the ~9 MiB CA write buffer). Remaining reds are conclusively non-CAS
+  (arch x86-vs-arm FP `01854_s2`/`02224_s2`/`03233_dynamic`; no-MySQL/IPv6 infra `02479`/`01880`/`02784`;
+  `04033_tpc_ds_*` on the `web` disk).
 
 ### 5.2 Open backlog items {#open-backlog}
 
