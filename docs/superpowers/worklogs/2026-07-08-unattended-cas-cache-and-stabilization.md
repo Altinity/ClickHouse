@@ -288,3 +288,10 @@ Watchdog cron: job 60470431 (hourly at :23).
   validated. Authoritative quiescent-pool fsck running. TLA+ gate still backlogged (needs committed-removal
   scoping / meta-model). NEXT: Phase B, starting with re-authored Gate B (three-state meta + raw body +
   multi-writer; also closes the wedge TLA+ debt in the meta model).
+
+- **GC-WEDGE P1 CLOSED.** Authoritative quiescent fsck on the fixed stand: reachable=63 dangling=0
+  **unreachable=0 pending_gc=0 unaccounted=0** — a pristine pool (pre-fix wedged stand: 764k unreachable /
+  93GB stuck forever). GC fully drains with the fix. Full chain: root cause (orphan sweep vs
+  pending-committed-removal) → fix c1485f52a29 → RED/GREEN gtest → adversarial consult → 20-min verify-soak
+  → clean fsck. Remaining (backlogged): the TLA+ regression gate (committed-removal scoping), folded into
+  Phase-B Gate B on the meta model.
