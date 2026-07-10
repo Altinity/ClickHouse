@@ -45,3 +45,16 @@ Consult hard calls with a fresh model; very hard → fable / codex 5.5 xhigh. Mo
 - FIX (non-destructive): moved it to tmp/misplaced_stray/KeeperRequestsQueue.cpp. Content is preserved 3x
   (this copy + stash@{0} + the better_keeper worktree on better_keeper6). It never belonged on this branch.
 - Resuming T2: rebuild + run the new + pre-existing tests, then commit if green.
+
+### Keeper stash-pop artifacts FIXED (user-requested)
+- Audited stash@{0} ("WIP on better_keeper3", touches KeeperDispatcher.cpp/.h + KeeperRequestsQueue.cpp).
+  KeeperDispatcher.cpp/.h exist on cas-gc-rebuild → the pop conflicted, they were restored to HEAD (clean).
+  KeeperRequestsQueue.cpp doesn't exist here → the pop left it as an untracked stray (globbed into dbms → broke builds).
+- Verified the stray is byte-identical to `git show stash@{0}:...KeeperRequestsQueue.cpp` (100% preserved in
+  stash@{0}; base commit 5d80a261ba8 present; better_keeper6 worktree also has the real WIP). Removed the
+  tmp/misplaced_stray/ copy. cas-gc-rebuild tree now clean of all stash residue; stash@{0} untouched.
+  (trash/ keeper flamegraphs etc. are unrelated pre-existing user scratch — left alone.)
+
+### T2 review: SPEC ok, QUALITY Approved (Minors only)
+- Verified byte layout encode/decode agree, fail-closed complete (unknown token_type / len mismatch / OOB
+  guarded), openSourceEdgeRun rejects wrong kind+schema, scope clean, no weakened tests. No Critical/Important.
