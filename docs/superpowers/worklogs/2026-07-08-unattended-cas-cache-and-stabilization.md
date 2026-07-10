@@ -362,3 +362,43 @@ Watchdog cron: job 60470431 (hourly at :23).
   (exact-token delete). NEW modeling need is small (meta point-read >= retire-view freshness for K1).
 - NEXT: revise spec (raw-body-refinement -> keep-in-body-tag + meta-as-freshness), revise plan; then impl.
   Task 1 (meta codec) reusable; Task 1B (meta incarnation nonce) likely unneeded (meta not the linearizer).
+
+### 2026-07-10 — v3 (freshness meta) Tasks 1-6 DONE + gtest-green
+- Executed the v3 plan (docs/superpowers/plans/2026-07-10-cas-freshness-meta-v3.md) subagent-driven:
+  T1 trim BlobMeta to 2-state (99b0e2e349f); T2 ca-inspect .meta + ca-fsck pairing (dadac45da92); T3 writer
+  point-reads meta + writes it (affc0938231 + test migration aad4a958a5a); T4 promote K3 + copy-forward meta
+  (1c4cd70882c); T5 GC writes meta condemn/spare/delete on a bounded pool, exact-token body delete UNCHANGED
+  (4409fab0e80, all 4 prior fails green, 552/552); T6 delete RetireView/syncer/observed_gc_round/ack-floor +
+  graduate-on-rounds (55b76af5998, net -571 lines). Full *Cas*:*Ca* 784/792 — 8 fails all pre-existing/order-
+  pollution (verified in isolation), ZERO v3 regressions. Safety core (one-key-per-hash + in-body tag +
+  exact-token BODY delete = CaIncarnationCore) UNCHANGED throughout. NEXT: Task 7 (ASan + CA-s3 lane + soak).
+
+### 2026-07-10 — v3 Task 7 validation: unit+ASan DONE; integration lane env-blocked (not v3)
+- gtest regular 784/792 (8 pre-existing/order-pollution, isolation-verified, 0 v3 regressions); ASan v3
+  concurrent code 171/171 clean (meta pool/merge/races/codec); clickhouse server binary builds clean +
+  version detected. CA-s3 stateless smoke BLOCKED in harness setup: non-idempotent `mc admin config reset
+  clickminio <webhook>` fails in Start-ClickHouse-Server prep (stale/missing MinIO webhook subsystems),
+  before any query — LOCAL env issue, NOT v3. Only the CA-s3 lane is a configured praktika job (no CA-local
+  job). NEXT (monitored): sort the local MinIO/RustFS harness env, then full CA-s3 lane + soak + mass-DROP.
+
+### 2026-07-10 — CORRECTION: CA-s3 smoke blocker was RUSTFS, not MinIO (user caught it)
+- Misdiagnosed the first smoke failure as a MinIO webhook issue; the real error (log line 347/361) was
+  "rustfs binary not found at ci/tmp/rustfs". I had deleted it in this session's earlier ci/tmp cleanup
+  (28G->15M). The mc/clickminio webhook errors are secondary noise (generic stateless s3 infra).
+- RESTORED ci/tmp/rustfs (298MB x86-64 static-pie) from the cached docker image:
+    docker create --name x rustfs/rustfs:1.0.0-beta.8 && docker cp x:/usr/bin/rustfs ci/tmp/rustfs && docker rm x
+  DO NOT delete ci/tmp/rustfs in ci/tmp cleanup — it is load-bearing for the CA-s3 lane + soak.
+- Re-running the CA-s3 smoke (03230_anyHeavy_merge, 00688_low_cardinality_dictionary_deserialization,
+  01039_mergetree_exec_time) with rustfs restored.
+
+### 2026-07-10 — v3 COMPLETE: Phase-1 soak PHASE1 OK (dangling=0), validated 5 ways
+- Full CA-s3 lane triage: 0 genuine v3 regressions (62 fails all pre-existing/env/known; 0 LOGICAL_ERROR/
+  promote-abort/ASan/CORRUPTED_DATA/dangling in the server log). Restored ci/tmp/rustfs (deleted in my
+  earlier ci/tmp cleanup — user caught the misdiagnosis; the CA-s3 lane uses RustFS, not MinIO).
+- Phase-1 soak PHASE1 OK: 5 checkpoints all fsck dangling=0/unreachable=0/oracle-consistent under 1500-op
+  2-replica churn on the v3 binary (GC reclaims cleanly with freshness-meta writes + round-paced graduation).
+- v3 freshness-meta refactor (Tasks 1-6, 99b0e2e349f..55b76af5998, net -571 lines) is DONE + validated:
+  unit 784/792, ASan 171/171, CA-s3 lane 10350/62 (0 v3 regr), smoke 3/3, soak PHASE1 OK. Safety core
+  (one-key-per-hash + in-body incarnation_tag + exact-token BODY delete = CaIncarnationCore) UNCHANGED.
+  Backlog: retired-fold->2-cursor merge, incremental snapshot, 3 pre-existing test debts (04286 EISDIR,
+  01271 stale ref, 05008 forgotten_on_delete), CA-ASAN-SUITE skip guards. Optional: full 24h soak.
