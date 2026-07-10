@@ -111,6 +111,12 @@ Rules:
   `key_schema == 1`, and per-row payload lengths; anything else → `CORRUPTED_DATA` /
   `NOT_IMPLEMENTED` fail-closed) used by **every** consumer: the merge cursor, `zeroInDegree`,
   `inDegreeInGeneration`, dryrun, `fsck`, `ca-inspect`. No compat shim for `key_schema = 0` runs.
+  The typed open path also enforces the **row/key invariants** (review finding, 2026-07-10):
+  `kEdgeActive` must NOT use `source_id = 0`; `kZeroMarker` / `kCondemned` must ONLY use
+  `source_id = 0`; an unknown row-type byte is rejected; more than one sentinel row per blob per
+  run is rejected — each violation → `CORRUPTED_DATA`. Without these checks a malformed durable
+  run could silently fabricate in-degree (an edge row at the sentinel key) or mis-settle condemned
+  state instead of surfacing fail-closed.
 
 ### 2.2 Fold-seal summary {#seal-summary}
 
@@ -248,11 +254,11 @@ attempt-scoped artifacts that retention prunes (`snap_pruned_through`, B174), ex
 | Fold round | `retired_refs` → GET per shard (`CasGc.cpp:723`) | prior runs (already read) |
 | `graduationDue` (`CasGc.cpp:1643`) | GET + decode every retired list, every round | seal summaries, zero I/O |
 | Pure ref-carry (`CasGc.cpp:1104`) | "no deltas AND retired empty" | "no deltas AND `condemned_total == 0`" |
-| `previewDeletes` (dryrun, `CasGc.cpp:1646`) | retired GETs | stream seal-named runs, filter `kCondemned` |
+| `previewDeletes` (dryrun, `CasGc.cpp:2055`) | streams seal-named runs, `zeroInDegree` zero-markers, HEADs each candidate; carried retired/pending entries are NOT previewed today | typed-open stream; emit **every** `kCondemned` row with its stored `token`/`token_type`/`condemn_round`/`delete_pending`, categorized `delete_pending` (deleted next fold) vs `awaiting graduation`; carried entries need no HEAD (token is durable in-run); fresh zero-markers keep today's HEAD probe. Output is a superset of today's (dryrun/fsck soak oracle stays valid); operator view gains the previously-invisible pipeline entries (review finding, 2026-07-10) |
 | `fsck` (`CasFsck.cpp:277`) | `retired_refs` loop | same runs it already streams for reachability — one pass |
 | `ca-inspect` (`CasInspect.cpp:239`) | `retired_refs` map dump | per-shard summaries from the seal (+ optional row streaming) |
 | `hasInFlightRetired` (`CasGc.h:308`, tests) | GET + decode | seal summary, O(1) |
-| Rebuild runbook (`CasGc.cpp:2006`) | mints `RetiredSet` objects + `retired_refs` | writes `kCondemned` rows into the fresh runs it already writes (+ seal it already writes) |
+| Rebuild runbook (`CasGc.cpp:2006`) | mints `RetiredSet` objects + `retired_refs` | writes `kCondemned` rows into the fresh runs. **REORDERING REQUIRED (review finding, 2026-07-10):** today rebuild flushes run segments (`flush_shard`, `CasGc.cpp:1938`) BEFORE the pipeline-blindness LIST discovers zero-edge orphan blobs (`:1944+`) — with condemned state in-run those orphans could no longer be added. New order: traverse journals (accumulate deltas + `edge_bearing`) → LIST physical blobs → mint orphan `kCondemned` rows → flush per-shard runs → seal. The pipeline-blindness repair (zero-edge orphans entering GC state) is preserved by construction |
 | Retention prune (B174) | prunes runs **and** retired objects | one family; retired prune code deleted |
 
 Observability is unchanged: B170 events (`blob_retire`, `blob_retire_replaced`, `blob_delete`),
