@@ -359,3 +359,18 @@ meta) lands and soaks.
 2. **Incremental / LSM snapshot (separate, bigger).** The snapshot is fully rewritten each non-noop round
    = O(total live nodes) write per round, independent of retired. If it becomes a bottleneck at scale,
    move to true O(delta)-write log-structured runs with periodic compaction. Independent of #1; #1 first.
+
+## Pre-existing debts surfaced by the 2026-07-10 v3 CA-s3 lane triage (NOT v3-caused)
+
+1. **04286_content_addressed_remote_data_paths — EISDIR latent bug.** `system.remote_data_paths` probe
+   (traverse_shadow_remote_data_paths=1) → `existsFile`→`getMountpointObject`→`casGetObject`→`get`→raw
+   read(2) on a directory fd (`roots/<ns>/store`) → "Is a directory" (errno 21). The old B38 fix
+   (`6c3a678550b`) patched only the stat-based `tryGetObjectMetadata`; commit `a4b8185f0fa` (Phase1
+   root-local, 413 commits before v3) rewrote the branch to a full body read that re-exposes it. Fix:
+   guard the mountpoint-object read against a directory / restore the stat-based existence check.
+2. **01271_show_privileges — stale reference.** Missing the branch-only `SYSTEM CONTENT ADDRESSED GARBAGE
+   COLLECTION` row (grant `8519093651b`). Fix: regenerate the reference.
+3. **05008_ca_gc_snap_prune — test/schema mismatch.** Queries `forgotten_on_delete` in
+   `system.content_addressed_garbage_collection_log`; that column never existed on this branch. Fix: either
+   wire the P9 `GForget`/`GcSnap::forget` counter into the GC-log schema or update the test.
+   (05009 log-enabled is a separate known env config issue.)
