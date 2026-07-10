@@ -1,5 +1,13 @@
 # CAS per-hash meta-descriptor (raw-body) Implementation Plan
 
+> **⛔ SUPERSEDED / REJECTED (2026-07-10).** This raw-body / terminal-tombstone plan recreated the
+> already-rejected generation-in-key design (per the user + `docs/superpowers/cas/01-architecture.md`
+> §"Approaches tested and REJECTED"). Use **`2026-07-10-cas-freshness-meta-v3.md`** instead, which keeps the
+> settled one-key-per-hash + in-body `incarnation_tag` + exact-token BODY delete and adds only a freshness
+> meta. Kept here for the record.
+
+
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Replace the writer-distributed condemned-list freshness machinery with a per-hash `.meta` descriptor (a three-state `{clean, condemned, tombstone}` register whose etag is the sole linearization token), drop the blob envelope so bodies are raw immutable content, and delete the writer-side `RetireView`/syncer/`observed_gc_round`/ack-floor — preserving `INV_NO_DANGLE`, `INV_NO_LOSS`, `INV_NO_RETURN` under a re-run TLA+ gate.
