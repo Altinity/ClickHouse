@@ -238,3 +238,12 @@ Watchdog cron: job 60470431 (hourly at :23).
   (e) claimless sweep, (d) post-lost-CAS body delete. CAVEAT recorded: a 1-hash/1-writer atomicity
   sandbox (~41 distinct states) — fold/pacing timing remains Gate A's domain; multi-writer meta races
   (two resurrectors, adopt-vs-resurrect) to be added when writing the Phase-B plan.
+
+- **PHASE-A EXIT SOAK: PHASE3 OK.** 4h chaos (seed 991): 16 green checkpoints (1 GC + chaos-recovery +
+  cliff + final converge), oracle agreement on every one; 25 fault windows fired, 17 restarts, 41
+  transport-retried ops, **1 (one) ABORTED-retried INSERT over the whole run** (pre-fix binaries showed
+  dozens — the condemn-race class is visibly closed); 0 hard failures (no MISMATCH/Traceback). Known
+  degrades recurred as designed: fsck>180s on every busy-pool checkpoint (B146/B154 — the in-run
+  dangling==0 gate was unavailable; pool ballooned to ~112GB under chaos-lagged GC), TTL-band count-range.
+  **Authoritative no-timeout fsck launched on the quiescent pool (clickhouse disks -C fsck-only.xml
+  --disk ca_ro) — the formal Phase-A dangling==0 gate; result pending.**
