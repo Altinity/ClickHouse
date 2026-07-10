@@ -402,3 +402,44 @@ Watchdog cron: job 60470431 (hourly at :23).
   (one-key-per-hash + in-body incarnation_tag + exact-token BODY delete = CaIncarnationCore) UNCHANGED.
   Backlog: retired-fold->2-cursor merge, incremental snapshot, 3 pre-existing test debts (04286 EISDIR,
   01271 stale ref, 05008 forgotten_on_delete), CA-ASAN-SUITE skip guards. Optional: full 24h soak.
+
+### 2026-07-10 — CA-s3 lane drive-to-zero: ROOT CAUSE of the bulk = repo-root debris shadowing clickhouse-local
+- User: no handwaving, need GREEN (own the whole lane, not just "0 v3 regressions"). Switched to point-reruns
+  of only the failed tests (no full-suite re-run) per user direction.
+- 62 fails / 45 distinct. Point-run #1 (isolated): 39 still red. Bulk root cause: ~20 clickhouse-LOCAL tests
+  failed `Code:57 Table default.test already exists` — NOT CA. A bare `clickhouse-local -q "create table test"`
+  from the repo root COLLIDES (works from /tmp): stray untracked DATA files `test`/`test1`/`test2`/
+  `test_resize1`/`test_resize2`/`1.tsv`/`uuid_test_*.parquet`/`queries_02352` in the repo root were exposed by
+  clickhouse-local as `default.test` etc. clickhouse-test runs from the repo root → every clickhouse-local
+  test collided. Removed the debris (left the .md/.sh/.svg notes); `clickhouse-local` from repo root now clean.
+  Re-running the 39 to confirm the clickhouse-local ones clear; remaining = real CA-specific (05008/05009/
+  04286) + branch test-debt (01271 stale ref, alias_marker unmerged setting) + a few to fix one-by-one.
+
+### 2026-07-10 — CA-s3 lane drive-to-green: 4 CA-fixable tests GREEN + committed
+- Method (user directive): point-reruns of failed tests only, fix one-by-one, full-suite rerun only
+  after every point-test is green.
+- **04286_content_addressed_remote_data_paths** GREEN (production fix, commit 99b244a9444): root cause was
+  the emulated `ObjectStorageBackend::head` reporting a DIRECTORY as an existing object (set exists=true
+  whenever the path existed, even though `tryGetObjectMetadata` returns nullopt for a dir — B38). So
+  `existsFile`/`getStorageObjects` body-GET'd the `store` pool sub-dir during system.remote_data_paths
+  traversal → EISDIR. Fix: emulated head returns not-found when no object metadata; added HEAD-based
+  `Store::mountpointObjectExists`; existsFile + getStorageObjects use it (no body read). Redundant
+  `if(metadata)` guard removed. Re-verified [OK] post-cleanup-rebuild.
+- **05009_content_addressed_event_log** GREEN (test rewrite, commit 79db187695a): asserted default-OFF
+  content_addressed_log; it is default-ON since cbe0ffb7608 (experimental CAS → audit log on by default).
+  Diagnostic point-run confirmed disk_name='05009_content_addressed_event_log' + blob_put events, and that
+  the log is genuinely SHARED (the lane's own content_addressed_s3 disk also writes it) → filter by
+  disk_name for parallel-safety. Rewritten to assert table exists + has_blob_put.
+- **05008_ca_gc_snap_prune** GREEN (test rewrite, commit 79db187695a): asserted the P9 `forgotten_on_delete`
+  counter (in-degree-snapshot prune) — a concept the rebuilt one-pass GC no longer has (no persistent
+  snapshot). Consulted opus: Option B = assert `sum(entries_redeleted) >= sum(objects_deleted)`, a
+  STRUCTURAL identity of the ack-floor pipeline (self-verified in CasGc.cpp: redelete loop @349-378 is the
+  sole content-delete site, ++redeleted per attempt @378; report.deleted tallied only from OutcomeKind::
+  Deleted @500; adopt path folds the same deterministic attempt-scoped set). Catches a live regression
+  (delete bypassing graduate->redelete), keeps 1\t1 reference. Verified [OK] 2.05s.
+- **01271_show_privileges** GREEN (ref refresh, commit 79db187695a): new SYSTEM CONTENT ADDRESSED GARBAGE
+  COLLECTION privilege.
+- Cleaned 682 per-run test debris files (*.NNNN.stderr/stdout). Repo-root clickhouse-local debris (test,
+  test1, …) already gone (confirmed absent) — the clickhouse-local shadowing bulk is resolved.
+- NEXT: batched point-run of the ~40 remaining suspects (fail_names_counts2.txt minus the 4 fixed) to see
+  the CURRENT red set after debris-cleanup+fixes, then triage/fix each (CA-caused vs local-env vs branch bug).
