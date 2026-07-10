@@ -154,7 +154,9 @@ public:
         UInt128 hash{};
         String key;
         uint64_t size = 0;
-        String reason;   /// "unreachable" (zero in-degree, present)
+        String reason;          /// "unreachable" | "delete_pending" | "awaiting_graduation"
+        Token token;            /// stored condemn-time token (empty for "unreachable")
+        uint64_t condemn_round = 0;
     };
 
     /// WRITE-FREE preview of the next round's deletes, derived from the DURABLE sealed in-degree

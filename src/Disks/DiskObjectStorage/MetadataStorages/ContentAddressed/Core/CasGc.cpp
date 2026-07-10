@@ -2171,6 +2171,36 @@ std::vector<Gc::PreviewEntry> Gc::previewDeletes()
             e.reason = "unreachable";
             out.push_back(std::move(e));
         }
+
+        /// Retired-in-snapshot (spec §5): stream the SAME adopted seal runs and emit every `kCondemned`
+        /// sentinel row. The stored token IS the authority — NO HEAD here (a HEAD would defeat the point
+        /// and cost I/O). `delete_pending` rows are deleted next fold; the rest await graduation. Preview
+        /// stays WRITE-FREE (`openSourceEdgeRun` is a pure reader). Output is a superset of the above.
+        for (const RunRef & run : shard_runs)
+        {
+            RunFileReader reader = openSourceEdgeRun(backend, run.key);
+            String key;
+            String payload;
+            while (reader.next(key, payload))
+            {
+                if (payload.empty() || payload[0] != kCondemned)
+                    continue;
+                UInt128 hash;
+                UInt128 source_id;
+                if (!parseSrcEdgeRunKey(key, hash, source_id))
+                    continue;
+                const CondemnedRow row = decodeCondemnedRow(payload);
+                PreviewEntry e;
+                e.kind = ObjectKind::Blob;
+                e.hash = hash;
+                e.key = blobKeyOf(layout, hash);
+                e.size = row.size;
+                e.token = row.token;
+                e.condemn_round = row.condemn_round;
+                e.reason = row.delete_pending ? "delete_pending" : "awaiting_graduation";
+                out.push_back(std::move(e));
+            }
+        }
     }
     return out;
 }

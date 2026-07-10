@@ -236,10 +236,6 @@ String renderGcLease(const GcLease & l)
 
 String renderGcState(const GcState & s)
 {
-    JsonObj retired_refs;
-    for (const auto & [shard, key] : s.retired_refs)
-        retired_refs.add(std::to_string(shard), jsonEscape(key));
-
     return JsonObj()
         .add("round", jsonUInt(s.round))
         .add("fence_seq", jsonUInt(s.fence_seq))
@@ -249,7 +245,6 @@ String renderGcState(const GcState & s)
         .add("snap_attempt", jsonUInt(s.snap_attempt))
         .add("manifest_sweep_cursor", jsonEscape(s.manifest_sweep_cursor))
         .add("lease", renderGcLease(s.lease))
-        .add("retired_refs", retired_refs.str())
         .str();
 }
 
@@ -322,12 +317,23 @@ String renderFoldSeal(const CasFoldSeal & seal)
     for (const auto & r : seal.part_manifest_cleanup)
         part_manifest_cleanup.push_back(renderRunRef(r));
 
+    /// Retired-in-snapshot (spec §5): per-gc-shard summary of the `kCondemned` rows the seal's runs
+    /// carry, replacing the removed `GcState::retired_refs` dump.
+    JsonObj condemned_summary;
+    for (const auto & [shard, cs] : seal.condemned_summary)
+        condemned_summary.add(std::to_string(shard), JsonObj()
+            .add("condemned_total", jsonUInt(cs.condemned_total))
+            .add("pending_total", jsonUInt(cs.pending_total))
+            .add("oldest_nonpending_condemn_round", jsonUInt(cs.oldest_nonpending_condemn_round))
+            .str());
+
     return JsonObj()
         .add("generation", jsonUInt(seal.generation))
         .add("parent_generation", jsonUInt(seal.parent_generation))
         .add("per_ns_shard", per_ns_shard.str())
         .add("blob_target_runs", jsonArray(blob_target_runs))
         .add("part_manifest_cleanup", jsonArray(part_manifest_cleanup))
+        .add("condemned_summary", condemned_summary.str())
         .str();
 }
 

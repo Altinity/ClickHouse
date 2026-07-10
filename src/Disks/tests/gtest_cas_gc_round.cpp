@@ -111,6 +111,25 @@ size_t driveToFixpoint(InMemoryBackend & backend, const StorePtr & store, Gc & g
     return working_rounds;
 }
 
+/// A full key -> token snapshot of the backend, for the previewDeletes write-free invariant: any
+/// put/casPut/overwrite mints a fresh token (or adds a key) and any delete removes one, so an unchanged
+/// map across a call proves it performed NO writes.
+std::map<String, String> snapshotKeyTokens(InMemoryBackend & b)
+{
+    std::map<String, String> out;
+    String cursor;
+    while (true)
+    {
+        const ListPage page = b.list("", cursor, 100000);
+        for (const ListedKey & k : page.keys)
+            out[k.key] = k.token ? k.token->value : String{};
+        if (page.next_cursor.empty())
+            break;
+        cursor = page.next_cursor;
+    }
+    return out;
+}
+
 }
 
 /// ---- cursor-key codec (not snap-specific: cursorKey/parseCursorKey survive the redesign) ----
@@ -418,6 +437,53 @@ TEST(CasGcRound, CondemnRoundSealSummaryCountsCondemned)
     EXPECT_LT(seal.condemned_summary.at(0).oldest_nonpending_condemn_round,
               std::numeric_limits<uint64_t>::max())
         << "a non-pending condemned entry records its condemn round";
+}
+
+/// retired-in-snapshot T5: `previewDeletes` streams the adopted seal's `kCondemned` rows and reports each
+/// with the STORED condemn-time token — `awaiting_graduation` while newly condemned, then `delete_pending`
+/// once graduated, and NOTHING once the exact-token redelete has removed the blob. The preview performs no
+/// HEAD on the condemned rows (the token is durable in-run) and is WRITE-FREE throughout (spec §5 req 1).
+TEST(CasGcRound, PreviewReportsCondemnedRowsAndIsWriteFree)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r = ref(1, 0xAA);
+    const UInt128 blob = DB::UInt128(1);
+    writeBlobBody(*backend, store->layout(), blob);
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", blob)});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+
+    Gc gc(store, kGc);
+    gc.runRegularRound();                 /// round 1: folds the +1; blob referenced
+    EXPECT_TRUE(gc.previewDeletes().empty()) << "a live-referenced blob is never previewed for deletion";
+
+    dropRefTransition(*backend, store->layout(), ns, "tbl", r);
+    gc.runRegularRound();                 /// condemning round: -1 => in-degree 0 => kCondemned row (not pending)
+
+    /// Write-free contract: a full key->token snapshot must be identical across the previewDeletes call.
+    const auto before = snapshotKeyTokens(*backend);
+    const std::vector<Gc::PreviewEntry> awaiting = gc.previewDeletes();
+    const auto after = snapshotKeyTokens(*backend);
+    EXPECT_EQ(before, after) << "previewDeletes must perform NO writes (put/casPut/overwrite/delete)";
+
+    ASSERT_EQ(awaiting.size(), 1u) << "exactly the one condemned blob is previewed";
+    EXPECT_EQ(awaiting[0].hash, blob);
+    EXPECT_EQ(awaiting[0].key, store->layout().blobKey(BlobId(u128ToHex(blob))));
+    EXPECT_EQ(awaiting[0].reason, "awaiting_graduation");
+    EXPECT_FALSE(awaiting[0].token.value.empty()) << "must carry the stored condemn-time token";
+    EXPECT_GT(awaiting[0].condemn_round, 0u) << "must carry the stored condemn round";
+
+    gc.runRegularRound();                 /// graduation round: entry becomes delete_pending (blob still present)
+    const std::vector<Gc::PreviewEntry> pending = gc.previewDeletes();
+    ASSERT_EQ(pending.size(), 1u);
+    EXPECT_EQ(pending[0].hash, blob);
+    EXPECT_EQ(pending[0].reason, "delete_pending");
+    EXPECT_FALSE(pending[0].token.value.empty());
+
+    gc.runRegularRound();                 /// redelete round: exact-token delete; entry dropped; blob gone
+    EXPECT_FALSE(blobExists(*backend, store->layout(), blob));
+    EXPECT_TRUE(gc.previewDeletes().empty()) << "nothing to preview once the blob is redeleted";
 }
 
 /// retired-in-snapshot T4: a pure ref-carry shard copies its parent seal's condemned_summary entry

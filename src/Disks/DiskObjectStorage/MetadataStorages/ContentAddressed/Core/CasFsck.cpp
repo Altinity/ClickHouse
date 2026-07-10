@@ -274,17 +274,12 @@ void runFsckImpl(Store & store, bool detail, const FsckProgress & on_progress, c
         {
             have_gc_state = true;
             const GcState gc_state = decodeGcState(state_got->bytes);
-            for (const auto & [shard, ref_key] : gc_state.retired_refs)
-            {
-                checkDeadline(deadline, "reading retired sets");
-                if (const auto got = backend.get(ref_key))
-                    for (const RetiredEntry & e : decodeRetiredSet(got->bytes).entries)
-                        if (e.kind == ObjectKind::Blob && unref_hashes.count(e.hash))
-                            retired_by_hash.emplace(e.hash, e);
-            }
             /// The adopted fold seal names the snapshot runs (T0: resolution is by ref, never by key
             /// construction). Every row whose hash is in our candidate set marks "known to GC" —
-            /// edges still counted (drop unfolded) or an explicit zero-marker mid-pipeline.
+            /// edges still counted (drop unfolded), an explicit zero-marker mid-pipeline, or a
+            /// `kCondemned` sentinel row that carries the condemned state (retired-in-snapshot):
+            /// the `kCondemned` rows feed `retired_by_hash` (the `PendingGc` classification) in the
+            /// SAME pass, replacing the removed `retired_refs`/`decodeRetiredSet` loop.
             if (const auto seal_got = backend.get(layout.foldSealKey(gc_state.snap_generation, gc_state.snap_attempt)))
             {
                 uint64_t rows = 0;
@@ -292,8 +287,9 @@ void runFsckImpl(Store & store, bool detail, const FsckProgress & on_progress, c
                 {
                     checkDeadline(deadline, "reading gc snapshot runs");
                     /// Typed open (spec §2.1): every source-edge run reader goes through openSourceEdgeRun.
-                    /// Fsck only keys off the row's hash (via parseSrcEdgeRunKey), so a hash carried by a
-                    /// `kCondemned` sentinel row now also correctly marks the blob "known to GC".
+                    /// Fsck keys off the row's hash (via parseSrcEdgeRunKey), so a hash carried by a
+                    /// `kCondemned` sentinel row also marks the blob "known to GC"; when it is a
+                    /// candidate we additionally decode the condemned state for the `PendingGc` view.
                     RunFileReader reader = openSourceEdgeRun(backend, run.key);
                     String key;
                     String payload;
@@ -302,7 +298,21 @@ void runFsckImpl(Store & store, bool detail, const FsckProgress & on_progress, c
                         UInt128 hash;
                         UInt128 source_id;
                         if (parseSrcEdgeRunKey(key, hash, source_id) && unref_hashes.count(hash))
+                        {
                             in_run_hashes.insert(hash);
+                            if (!payload.empty() && payload[0] == kCondemned)
+                            {
+                                const CondemnedRow row = decodeCondemnedRow(payload);
+                                RetiredEntry e;
+                                e.kind = ObjectKind::Blob;
+                                e.hash = hash;
+                                e.token = row.token;
+                                e.size = row.size;
+                                e.condemn_round = row.condemn_round;
+                                e.delete_pending = row.delete_pending;
+                                retired_by_hash.emplace(hash, std::move(e));
+                            }
+                        }
                         if (on_progress && ++rows % 65536 == 0)
                             on_progress("reading gc snapshot runs", in_run_hashes.size(), rows);
                     }
