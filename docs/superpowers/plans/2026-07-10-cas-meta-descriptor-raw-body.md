@@ -8,6 +8,25 @@
 
 **Tech Stack:** ClickHouse C++ (`src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/`), gtest (`unit_tests_dbms`), TLC/TLA+ (`docs/superpowers/models/`), CA-s3 stateless + `utils/ca-soak` for integration.
 
+## v2 CORRECTIONS (consult 2026-07-10 — read before implementing Tasks 2–7)
+
+A fresh-model consult found a CRITICAL hole in the first cut and the design + model were corrected (spec
+§raw-body-refinement "v2 CORRECTION"; `CaMetaDescriptorRaw.tla` v2 re-run GREEN + `sab_resurrect_tomb` RED).
+The binding changes, folded into the tasks below:
+
+1. **Tombstone is TERMINAL.** A writer that observes a `tombstone` meta MUST NOT `CAS tombstone→clean` — under
+   raw immutable bodies that dangles a committed ref (GC's already-committed body delete still hits the
+   unchanged-token body). Instead the writer **waits (bounded) for the meta to reach `absent`, then
+   fresh-uploads**; bounded exhaustion ⇒ `ABORTED`. Resurrect is legal **only from `condemned`**.
+2. **Birth-completion is from `absent`-meta only** (a crashed pre-meta birth), never from `tombstone`.
+3. **The meta carries a fresh `incarnation` (u128) nonce on EVERY write** (Task 1B) — S3 etags are
+   content-derived, so a `clean` meta would ABA without it.
+4. **GC delete = terminal tombstone handshake** (Task 5): CAS condemned→tombstone; on win HEAD+delete body
+   (safe: terminal tombstone means no writer re-established the body after the win); delete tombstone meta.
+5. Task-specific fixes: keep the large-body head-first guard (Task 3); ca-inspect raw-body branch + schedule
+   `CasEnvelope` removal (Task 2); three extra removal sites in Task 6; a deterministic GC-delete-vs-writer
+   race test (Task 7). Each is noted in its task.
+
 ## Global Constraints
 
 - **Branch discipline:** work on `cas-gc-rebuild`; add new commits, never rebase/amend/force; never commit to `master`. (CLAUDE.md)
@@ -59,7 +78,7 @@
 
 **Why this task is first:** the design's formal gate (spec §tla-gates Gate B) is a precondition for touching code, and the persisted green log does not currently exist on disk (only a failed mis-invocation `tmp/tlc_CaMetaDescriptorRaw.log`). The wedge gate is the backlogged "committed-removal scoping" debt (`gtest_cas_orphan_manifest_sweep.cpp::PendingCommittedRemovalBodyIsSkipped` has the C++ regression; the TLA+ gate was never written).
 
-- [ ] **Step 1: Re-run the Gate B raw-body positive config and confirm green**
+- [x] **Step 1: Re-run the Gate B raw-body positive config and confirm green** — DONE 2026-07-10: `No error has been found` (`tmp/tlc_CaMetaDescriptorRaw_reduced.log`).
 
 Run (from repo root):
 ```bash
@@ -67,7 +86,7 @@ cd docs/superpowers/models && ./run_metaraw.sh CaMetaDescriptorRaw_reduced; cd -
 ```
 Expected: `tmp/tlc_CaMetaDescriptorRaw_reduced.log` ends with `Model checking completed. No error has been found.` (Hand the log to a subagent to confirm the success signature — do not eyeball a 100k-line log.)
 
-- [ ] **Step 2: Re-run all four sabotage configs and confirm each stays RED**
+- [x] **Step 2: Re-run all four sabotage configs and confirm each stays RED** — DONE 2026-07-10: `sab_meta_first`/`sab_blind_adopt`/`sab_adopt_tomb` → `INV_NO_DANGLE violated`; `sab_del_notomb` → `INV_META_BODY violated`.
 
 Run:
 ```bash
@@ -554,6 +573,72 @@ Claude-Session: https://claude.ai/code/session_01MXfxaevd1iF9R8uaj7MPFk"
 
 ---
 
+## Task 1B: Add the fresh `incarnation` nonce to `BlobMeta` (v2 consult finding #8)
+
+**Files:**
+- Modify: `Core/CasBlobMeta.h`, `Core/CasBlobMeta.cpp`
+- Modify: `src/Disks/tests/cas_test_helpers.h` (helpers set the nonce), `src/Disks/tests/gtest_cas_blob_meta.cpp`
+
+**Interfaces:**
+- Consumes: the Task 1 `BlobMeta`/codec/ops layer (committed `ba883680114`); `Cas::UInt128`, `Cas::mintU128` (the fresh-nonce minter used by `CasBuild.cpp`'s `header.incarnation_tag = mintU128()`).
+- Produces: `BlobMeta` gains `UInt128 incarnation{};` (bump `version` to 2, append the 16 bytes to the codec, widen `BODY_LEN` by 16; decode fails closed on the old length). Every code path that WRITES a meta mints a fresh `incarnation` (`putMetaIfAbsent`/`casMeta` callers pass a `BlobMeta` whose `incarnation = mintU128()`). This makes each meta object's bytes — and its S3 etag — globally unique, matching the model's fresh-`gen`-per-write.
+
+**Why:** S3 ETags are content-derived; without a per-write nonce a `clean` meta re-encodes to an identical etag across incarnations → a latent ABA on the `clean→condemned` precondition. The nonce makes "meta etag = incarnation" literally true.
+
+- [ ] **Step 1: Write the failing test — two clean metas for the same hash differ**
+
+Append to `gtest_cas_blob_meta.cpp`:
+```cpp
+TEST(CasBlobMeta, FreshIncarnationMakesEachWriteUnique)
+{
+    BlobMeta a{.state = MetaState::Clean, .size = 1};
+    BlobMeta b{.state = MetaState::Clean, .size = 1};
+    a.incarnation = DB::Cas::mintU128();
+    b.incarnation = DB::Cas::mintU128();
+    EXPECT_NE(a.incarnation, b.incarnation);
+    EXPECT_NE(encodeBlobMeta(a), encodeBlobMeta(b));   // distinct bytes -> distinct S3 etag
+    EXPECT_EQ(decodeBlobMeta(encodeBlobMeta(a)).incarnation, a.incarnation);   // round-trips
+}
+```
+
+- [ ] **Step 2: Run to verify it fails**
+
+```bash
+ninja -C build unit_tests_dbms > build/cas_meta_incarnation_build.log 2>&1
+build/src/unit_tests_dbms --gtest_filter='CasBlobMeta.FreshIncarnationMakesEachWriteUnique' > build/test_cas_meta_incarnation.log 2>&1
+```
+Expected: FAIL — `BlobMeta` has no `incarnation` member.
+
+- [ ] **Step 3: Add the field + extend the codec**
+
+In `CasBlobMeta.h`, add to `BlobMeta` (after `state`): `UInt128 incarnation{};` and bump the doc/`version` default to 2. Add `#include ".../CasIds.h"` if `mintU128`/`UInt128` need it (mintU128 is declared where `CasBuild.cpp` gets it — reuse that header). In `CasBlobMeta.cpp`: `constexpr size_t BODY_LEN = 4 + 1 + 1 + 8 + 8 + 16;` (append 16 for the u128); write the u128 after `size` via two `putU64LE` of its halves (mirror how `CasEnvelope.cpp`/`CasGcFormats.cpp` serialize a `UInt128` — use the SAME byte order helper the codebase uses for u128, e.g. `writeBinaryLittleEndian`/the envelope's u128 writer); read it back in `decodeBlobMeta`; keep `if (bytes.size() != BODY_LEN ...)` fail-closed (an old 22-byte meta now mismatches and throws CORRUPTED_DATA — correct, pre-release, no compat).
+
+- [ ] **Step 4: Mint the nonce at every write site in the helpers**
+
+In `cas_test_helpers.h`, update `writeMetaClean`/`condemnMeta` to set `.incarnation = DB::Cas::mintU128()` on the `BlobMeta` they write. (Production write sites in Tasks 3-5 will do the same — noted in those tasks.)
+
+- [ ] **Step 5: Build and run the meta tests**
+
+```bash
+ninja -C build unit_tests_dbms > build/cas_meta_incarnation_build.log 2>&1
+build/src/unit_tests_dbms --gtest_filter='CasBlobMeta.*' > build/test_cas_meta_incarnation.log 2>&1
+```
+Expected: all `CasBlobMeta.*` pass (round-trip now includes the incarnation).
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobMeta.h \
+        src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobMeta.cpp \
+        src/Disks/tests/cas_test_helpers.h src/Disks/tests/gtest_cas_blob_meta.cpp
+git commit -m "feat(cas): BlobMeta carries a fresh incarnation nonce (S3 etag uniqueness)
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01MXfxaevd1iF9R8uaj7MPFk"
+```
+
+---
+
 ## Task 2: `ca-inspect` `.meta` dispatch + `ca-fsck` INV-META-BODY pairing
 
 **Files:**
@@ -623,6 +708,13 @@ String renderBlobMeta(const BlobMeta & m)
 ```
 Add `#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobMeta.h>` to `CasInspect.cpp`. (Match the file's existing JSON idiom — if it does not use `Poco::JSON`, mirror whatever `renderRetiredSet` uses.)
 
+**Also fix the raw-body branch (v2 finding #5):** the existing `blobs/`-non-`.meta` branch (`CasInspect.cpp:422-423`) decodes an `EnvelopeHeader`, which under raw bodies (Task 3 drops the envelope) throws `CORRUPTED_DATA` on a valid body. Change that branch to render a raw body — size + a re-hash confirming the key:
+```cpp
+    if (key.starts_with(layout.blobsPrefix()))   // (non-.meta reached here — the .meta branch is above)
+        return renderRawBody(key, bytes);
+```
+with `renderRawBody` reporting `{object: "raw_blob", size, hash_matches_key: poolContentHash(bytes)==keyHash}` (reuse the hash-parse idiom from `CasGc.cpp:1838-1849`). Since the envelope decode is now unused for bodies (the only other caller, `copyForwardFromCondemned`, is re-shaped in Task 4), add a note to Task 3 to delete `CasEnvelope.{h,cpp}` (keeping only the `ObjectKind` enum if still referenced) once no callers remain.
+
 - [ ] **Step 4: Run the inspect test to verify it passes**
 
 ```bash
@@ -676,6 +768,8 @@ In `CasFsck.h`, add to `FsckReport` (after `unaccounted`):
 ```cpp
     uint64_t meta_without_body = 0;   /// INV-META-BODY violation: a .meta with no body (must not arise)
     uint64_t body_without_meta = 0;   /// benign pre-meta-birth debris (swept by GC's claim-first pass)
+    /// (v2 finding #12) fold the invariant violation into clean(): a clean/condemned meta with no body is a
+    /// latent loss the 1-GET adopt would trust. Update `bool clean() const { return dangling == 0 && meta_without_body == 0; }`.
 ```
 In `CasFsck.cpp`, the body LIST at `:188` (`listAll(backend, layout.blobsPrefix(), present_blobs, ...)`) now also returns `.meta` keys (same prefix). Partition them: build two sets from the single LIST — `present_bodies` (keys NOT ending in `.meta`) and `present_metas` (keys ending in `.meta`, mapped to their hash). Then after the existing present/reachable passes, add the pairing check:
 ```cpp
@@ -802,22 +896,43 @@ TEST(CasBuild, PutBlobResurrectsCondemnedByMetaCasNoBodyReupload)
     EXPECT_EQ(backend->ioCountForKeysContaining(/*body key, not .meta*/), 0u); // NO body re-upload
 }
 
-TEST(CasBuild, PutBlobBirthCompletionReuploadsFromSourceOnTombstone)
+TEST(CasBuild, PutBlobBirthCompletionFromAbsentMetaReestablishesFromSource)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openStoreForTest(backend);
     const String payload = "complete-my-birth";
     const DB::UInt128 h = store->poolContentHash(payload);
+    // Crashed pre-meta birth: body present, meta ABSENT -> re-establish from source (never adopt blind).
     writeRawBlobBody(*backend, store->layout(), h, payload);
-    // meta = tombstone (GC mid-delete window): must NOT adopt the orphan body.
-    putMetaIfAbsent(*backend, store->layout(), h, BlobMeta{.state = MetaState::Tombstone, .size = payload.size()});
 
     { auto b = /* build+precommit */; b->putBlob(BlobId(u128ToHex(h)), BlobSource::fromString(payload)); }
 
     const auto lm = loadMeta(*backend, store->layout(), h);
     ASSERT_TRUE(lm.has_value());
-    EXPECT_EQ(lm->meta.state, MetaState::Clean);              // re-established from source
+    EXPECT_EQ(lm->meta.state, MetaState::Clean);              // clean meta created
     EXPECT_TRUE(backend->get(store->layout().blobKey(BlobId(u128ToHex(h)))).has_value());
+}
+
+TEST(CasBuild, PutBlobWaitsThenAbortsOnTerminalTombstone)
+{
+    // v2 terminal tombstone: a writer must NEVER un-tombstone. With the meta stuck at tombstone (no GC to
+    // clear it in this deterministic test), putBlob exhausts its bounded wait and fails closed (ABORTED),
+    // never CASing tombstone->clean. (A live GC would clear it to absent and the retry would fresh-upload.)
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend);
+    const String payload = "being-deleted";
+    const DB::UInt128 h = store->poolContentHash(payload);
+    writeRawBlobBody(*backend, store->layout(), h, payload);
+    putMetaIfAbsent(*backend, store->layout(), h,
+        BlobMeta{.incarnation = mintU128(), .state = MetaState::Tombstone, .size = payload.size()});
+
+    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] {
+        auto b = /* build+precommit */; b->putBlob(BlobId(u128ToHex(h)), BlobSource::fromString(payload));
+    });
+    // The meta was NOT resurrected to clean (terminal).
+    const auto lm = loadMeta(*backend, store->layout(), h);
+    ASSERT_TRUE(lm.has_value());
+    EXPECT_EQ(lm->meta.state, MetaState::Tombstone);
 }
 ```
 
@@ -852,9 +967,9 @@ void Build::uploadFromSource(ObjectKind kind, const UInt128 & hash, const String
         observeAndAdmitByMeta(kind, hash, key, source);
         return;
     }
-    /// Body freshly written; create the clean meta.
+    /// Body freshly written; create the clean meta (fresh incarnation nonce — Task 1B).
     const CasResult meta_put = putMetaIfAbsent(store->backend(), store->layout(), hash,
-        BlobMeta{.state = MetaState::Clean, .condemn_round = 0, .size = source.size});
+        BlobMeta{.incarnation = mintU128(), .state = MetaState::Clean, .condemn_round = 0, .size = source.size});
     if (meta_put.outcome == CasOutcome::Conflict)
     {
         /// A racing writer created the meta first (identical body). Adopt its state.
@@ -869,7 +984,18 @@ void Build::uploadFromSource(ObjectKind kind, const UInt128 & hash, const String
 
 - [ ] **Step 5: Add `observeAndAdmitByMeta` — the dedup/adopt/resurrect/birth-completion state machine**
 
-Add a private method (declare in `CasBuild.h` beside `observeAndAdmit`). It implements the spec §meta-protocols "Dedup-adopt" / "Resurrect" / "Birth-completion" rows and matches `CaMetaDescriptorRaw.tla`'s `Adopt`/`Resurrect`/`BirthCompletion`:
+Add a private method (declare in `CasBuild.h` beside `observeAndAdmit`). **v2 TERMINAL-TOMBSTONE** — it implements the spec §meta-protocols v2 "Dedup-adopt / Resurrect / Wait-on-tombstone / Birth-completion" rows and matches `CaMetaDescriptorRaw.tla` v2's `Adopt`/`Resurrect`(condemned only)/`BirthCompletion`(absent only). A writer NEVER un-tombstones. Every meta write mints a fresh `incarnation` nonce (Task 1B). First add a private helper to keep DRY:
+```cpp
+/// Ensure the raw body is present from OUR re-readable source (idempotent; content-addressed).
+/// A 412 (already present) is success — never a GET/read of a possibly-dying body (INV-1).
+void Build::ensureRawBody(const String & key, const BlobSource & source)
+{
+    auto sink = store->backend().putIfAbsentStream(key);
+    source.write_payload(sink->buffer());
+    sink->finalize();   // PutOutcome::PreconditionFailed tolerated: body already present is fine
+}
+```
+Then the state machine:
 ```cpp
 uint64_t Build::observeAndAdmitByMeta(ObjectKind kind, const UInt128 & hash, const String & key, const BlobSource & source)
 {
@@ -881,24 +1007,15 @@ uint64_t Build::observeAndAdmitByMeta(ObjectKind kind, const UInt128 & hash, con
         const auto lm = loadMeta(store->backend(), store->layout(), hash);
         if (!lm)
         {
-            /// Meta absent. Two sub-cases:
-            ///  - body absent too  -> nothing exists -> fresh upload path (caller re-enters uploadFromSource).
-            ///  - body present     -> BIRTH-COMPLETION: NEVER adopt the orphan body (it may be GC's mid-delete
-            ///    window). Re-upload from OUR source (idempotent, content-addressed) + create clean meta.
-            const HeadResult hr = store->backend().head(key);
-            if (!hr.exists)
-            {
-                /// Re-establish the body from source, then create the clean meta.
-                store->backend().putIfAbsentStream(key); // (see step 4 stream helper; re-stream source)
-            }
-            /// Displace/complete: ensure body then create meta If-None-Match.
-            auto sink = store->backend().putIfAbsentStream(key);
-            source.write_payload(sink->buffer());
-            sink->finalize(); // 412 tolerated: body present is fine (content-addressed)
+            /// Meta absent. Either nothing exists, or a crashed pre-meta birth (body present, no meta), or
+            /// GC finished a delete. In ALL cases: re-establish the body from OUR source (idempotent) then
+            /// create a clean meta If-None-Match. NEVER adopt an orphan body blind. (Birth-completion +
+            /// fresh-upload collapse to the same act here.)
+            ensureRawBody(key, source);
             const CasResult put = putMetaIfAbsent(store->backend(), store->layout(), hash,
-                BlobMeta{.state = MetaState::Clean, .condemn_round = 0, .size = source.size});
+                BlobMeta{.incarnation = mintU128(), .state = MetaState::Clean, .condemn_round = 0, .size = source.size});
             if (put.outcome == CasOutcome::Conflict)
-                continue; // someone completed concurrently -> re-load and follow
+                continue;   /// a racing writer created the meta -> re-load and follow
             deps[{static_cast<uint8_t>(kind), hash}] = DepEntry{.kind = kind, .token = put.token, .size = source.size};
             return source.size;
         }
@@ -913,10 +1030,11 @@ uint64_t Build::observeAndAdmitByMeta(ObjectKind kind, const UInt128 & hash, con
             }
             case MetaState::Condemned:
             {
-                /// Resurrect: CAS condemned->clean (fresh gen). Body still present (condemn never deletes it)
-                /// -> NO body re-upload (raw-body simplification, INV-1). Loser re-loads and follows.
+                /// Resurrect (from condemned ONLY): CAS condemned->clean (fresh incarnation). Body present &
+                /// immutable -> NO body re-upload (raw-body). This CAS races GC's condemned->tombstone on the
+                /// same etag; the loser re-loads and follows (if GC won, we next observe tombstone -> wait).
                 const CasResult cas = casMeta(store->backend(), store->layout(), hash, lm->etag,
-                    BlobMeta{.state = MetaState::Clean, .condemn_round = 0, .size = lm->meta.size});
+                    BlobMeta{.incarnation = mintU128(), .state = MetaState::Clean, .condemn_round = 0, .size = lm->meta.size});
                 if (cas.outcome == CasOutcome::Conflict)
                     continue;
                 deps[{static_cast<uint8_t>(kind), hash}] = DepEntry{.kind = kind, .token = cas.token, .size = lm->meta.size};
@@ -924,23 +1042,20 @@ uint64_t Build::observeAndAdmitByMeta(ObjectKind kind, const UInt128 & hash, con
             }
             case MetaState::Tombstone:
             {
-                /// Mid-delete: re-establish from source (body may vanish under us), then CAS tombstone->clean.
-                auto sink = store->backend().putIfAbsentStream(key);
-                source.write_payload(sink->buffer());
-                sink->finalize();
-                const CasResult cas = casMeta(store->backend(), store->layout(), hash, lm->etag,
-                    BlobMeta{.state = MetaState::Clean, .condemn_round = 0, .size = source.size});
-                if (cas.outcome == CasOutcome::Conflict)
-                    continue;
-                deps[{static_cast<uint8_t>(kind), hash}] = DepEntry{.kind = kind, .token = cas.token, .size = source.size};
-                return source.size;
+                /// TERMINAL: the content is being deleted. NEVER CAS tombstone->clean (v2: that dangles a
+                /// committed ref — GC's committed body delete still hits the immutable body). WAIT (bounded
+                /// re-GET; each iteration is a network round-trip, no sleep/busy-spin fix) for GC to reach
+                /// `absent`, then re-drive the fresh-upload path above. Exhaustion -> ABORTED (build restarts;
+                /// the INSERT-level retry lands after GC clears the tombstone).
+                continue;
             }
         }
     }
-    throw Exception(ErrorCodes::ABORTED, "putBlob: exhausted meta-adopt retries for {}", key);
+    throw Exception(ErrorCodes::ABORTED,
+        "putBlob: meta for {} still tombstone (GC deleting) after {} attempts — fail closed, build restarts", key, max_attempts);
 }
 ```
-Note: consolidate the two "re-establish body from source" spots into a single `ensureRawBody(key, source)` private helper to keep DRY. The `absent-meta ∧ absent-body` sub-case should re-drive the fresh path — simplest is to have `putBlob`'s outer loop (step 6) re-call `uploadFromSource`, so `observeAndAdmitByMeta` returning a sentinel (or throwing `ABORTED`) triggers a retry; pick ONE mechanism and make it consistent with `putBlob`.
+Declare `void ensureRawBody(const String & key, const BlobSource & source);` and `uint64_t observeAndAdmitByMeta(ObjectKind, const UInt128 &, const String &, const BlobSource &);` in `CasBuild.h`. `mintU128` is the same fresh-nonce minter used today at `CasBuild.cpp`'s envelope builder (`header.incarnation_tag = mintU128()`).
 
 - [ ] **Step 6: Simplify `putBlob` to drive the raw+meta path**
 
@@ -951,9 +1066,14 @@ BlobRef Build::putBlob(const BlobId & id, BlobSource source)
     requireAlive();
     const UInt128 logical_hash = hexToU128(id.string());
     const String key = store->layout().blobKey(id);
+    const PoolConfig & cfg = store->poolConfig();
 
-    /// Fast path: a likely dedup hit -> one meta GET (adopt/resurrect/complete without streaming the body).
-    if (store->dedupCacheContains(logical_hash))
+    /// Fast path: a likely dedup hit OR a large body (where a wasted body-PUT that 412s is expensive —
+    /// B168 P2 / B187 broken-pipe storm) -> one meta GET (adopt/resurrect/wait/complete without streaming
+    /// the body). KEEP the large-body guard (v2 finding #6): keying only on the dedup cache would stream a
+    /// large not-yet-cached dedup hit just to 412.
+    if (store->dedupCacheContains(logical_hash)
+        || (cfg.dedup_head_first_min_bytes > 0 && source.size >= cfg.dedup_head_first_min_bytes))
     {
         ProfileEvents::increment(ProfileEvents::CasBlobHeadFirst);
         const uint64_t admitted = observeAndAdmitByMeta(ObjectKind::Blob, logical_hash, key, source);
@@ -1115,33 +1235,25 @@ Replace the K3 loop body (`CasBuild.cpp:878-909`). Tokened leaves still `continu
 
 - [ ] **Step 4: Re-shape `copyForwardFromCondemned` to a meta CAS**
 
-Change its signature to `Token copyForwardFromCondemned(const UInt128 & hash, const LoadedMeta & lm);` (declare in `CasBuild.h`). Body: under raw bodies the body is immutable; copy-forward is a meta CAS. The INV-1 body read is needed ONLY to re-establish under a tombstone (body may be mid-delete):
+Change its signature to `Token copyForwardFromCondemned(const UInt128 & hash, const LoadedMeta & lm);` (declare in `CasBuild.h`). **v2 TERMINAL-TOMBSTONE:** under raw immutable bodies, copy-forward of a `condemned` leaf is a pure meta CAS (body present & immutable — no body touch). A `tombstone` (or `absent`) meta means the content is genuinely dying (or gone) → fail closed; the build restarts (the tokenless leaf has no source to recreate it, and un-tombstoning is forbidden). This is the raw-body replacement for the old envelope re-wrap:
 ```cpp
 Token Build::copyForwardFromCondemned(const UInt128 & hash, const LoadedMeta & lm)
 {
-    const String key = store->layout().blobKey(BlobId(u128ToHex(hash)));
-    if (lm.meta.state == MetaState::Tombstone)
-    {
-        /// Body may be mid-delete. Documented INV-1 exception (committed-source provenance): GET the
-        /// still-present condemned body, verify it hashes to its key, re-establish it, then CAS->clean.
-        const auto got = store->backend().get(key);
-        if (!got)
-            throw Exception(ErrorCodes::ABORTED,
-                "promote: tombstoned blob {} body gone, no source to re-establish — failing closed", key);
-        if (store->poolContentHash(got->bytes) != hash)
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "promote: copy-forward body hash mismatch for {}", key);
-        store->backend().casPut(key, got->bytes, std::nullopt);   // re-establish (idempotent; content-addressed)
-    }
-    /// Both condemned and (re-established) tombstone: CAS the meta to clean on the observed etag.
+    /// Only a `condemned` leaf is copy-forwardable: CAS the meta condemned->clean (fresh incarnation) on the
+    /// observed etag. The body is present (condemn never deletes it) and immutable -> no body GET/PUT.
+    if (lm.meta.state != MetaState::Condemned)
+        throw Exception(ErrorCodes::ABORTED,
+            "promote: copy-forward leaf {} is {} (not condemned) — content dying/gone, failing closed",
+            u128ToHex(hash), lm.meta.state == MetaState::Tombstone ? "tombstone" : "clean/absent");
     const CasResult cas = casMeta(store->backend(), store->layout(), hash, lm.etag,
-        BlobMeta{.state = MetaState::Clean, .condemn_round = 0, .size = lm.meta.size});
-    /// (PreconditionFailed => a racing writer/GC moved it; the K3 loop re-loads and re-decides.)
+        BlobMeta{.incarnation = mintU128(), .state = MetaState::Clean, .condemn_round = 0, .size = lm.meta.size});
+    /// PreconditionFailed => a racing resurrect/GC moved it; the K3 loop re-loads and re-decides.
     EventEmitter{*store}.emit(/* CasEventType::BlobCopyForward, reason "meta CAS condemned->clean" */);
     ProfileEvents::increment(ProfileEvents::CasBlobCopyForward);
     return cas.token;
 }
 ```
-Remove the old envelope-decode/re-wrap/`putOverwrite` body of `copyForwardFromCondemned` (`:535-576`).
+Remove the old envelope-decode/re-wrap/`putOverwrite` body of `copyForwardFromCondemned` (`:535-576`). Note the K3 loop (step 3) already ABORTs on `absent` meta before calling this; a `tombstone` observed inside the loop falls here and ABORTs — both fail closed, correct for terminal tombstone.
 
 - [ ] **Step 5: Build and run the promote tests**
 
@@ -1227,33 +1339,43 @@ Expected: FAIL — condemn still HEADs the body and deletes via body token; no m
 
 - [ ] **Step 3: Re-source condemn to a meta CAS**
 
-Replace the `head_blob` lambda's body-token capture (`CasGc.cpp:640/658`) with a meta condemn. The condemn creates the `RetiredEntry` with the **condemned-meta-etag** as its token. Where `closeBlob` builds `RetiredEntry` (`CasBlobInDegree.cpp:271-283`), the `head_blob` callback now returns the condemned meta etag (adapt the callback's return type or capture). Concretely, condemn = `loadMeta`; if `clean` ⇒ `casMeta(lm->etag → {Condemned, condemn_round, lm->meta.size})`; the resulting `cas.token` is stored as `RetiredEntry.token`. If meta absent (debris) ⇒ return `nullopt` (not condemned; the claim-first debris sweep owns it). Keep the three condemn-trail events (`IndegZero`, `GcRetireObserve`, `BlobRetire`) but change `e.token` to the meta etag and `e.reason` to reflect the meta CAS.
+Replace the `head_blob` lambda's body-token capture (`CasGc.cpp:640/658`) with a meta condemn. The condemn creates the `RetiredEntry` with the **condemned-meta-etag** as its token. Where `closeBlob` builds `RetiredEntry` (`CasBlobInDegree.cpp:271-283`), the `head_blob` callback now returns the condemned meta etag (adapt the callback's return type or capture). Concretely, condemn = `loadMeta`; then:
+- meta `clean` ⇒ `casMeta(lm->etag → {incarnation = mintU128(), Condemned, condemn_round, size = lm->meta.size})`. On `Committed` ⇒ store `RetiredEntry{hash, token = cas.token (condemned-etag), condemn_round, size = lm->meta.size}`. On `Conflict` (a writer resurrected or GC raced) ⇒ return `nullopt` (not condemned this pass; retried next fold when `d` is re-checked).
+- meta already `condemned` ⇒ idempotent: reuse the observed etag as the ledger token (no CAS), store the `RetiredEntry` (a prior pass condemned it; this pass just re-records — keeps the ledger token fresh for the `peek_meta` supersede).
+- meta `tombstone` ⇒ a delete is already in flight; return `nullopt` (the graduated entry from the prior condemn owns the delete).
+- meta `absent` (debris body) ⇒ return `nullopt` (the claim-first debris sweep owns it, not condemn).
+
+Keep the three condemn-trail events (`IndegZero`, `GcRetireObserve`, `BlobRetire`) but change `e.token` to the condemned-meta etag and `e.reason` to reflect the meta CAS. `size` comes from `lm->meta.size` (no body HEAD needed — `retiredLogicalSize`/`blob_header_len` accounting is dropped, since a raw body's size == its object size).
 
 - [ ] **Step 4: Re-shape the delete site to the tombstone handshake on a parallel pool**
 
 Replace the R3 redelete loop (`CasGc.cpp:269-303`). Introduce a bounded `ThreadPool` member on `Gc` (or construct one per round sized to a config, e.g. `gc_delete_pool_size`, default 16). For each `redelete` entry, submit a task:
 ```cpp
 // Per graduated entry (submitted to the delete pool; results collected before advancing the round):
+// v2 TERMINAL-TOMBSTONE handshake. Phase A: CAS condemned->tombstone on the ledger's condemned etag.
 const CasResult claim = casMeta(backend, layout, entry.hash, entry.token /*condemned etag*/,
-    BlobMeta{.state = MetaState::Tombstone, .condemn_round = entry.condemn_round, .size = entry.size});
+    BlobMeta{.incarnation = mintU128(), .state = MetaState::Tombstone,
+             .condemn_round = entry.condemn_round, .size = entry.size});
 if (claim.outcome == CasOutcome::Conflict)
 {
-    // A resurrect (or a prior tombstone) won: do NOT delete the body. Drop the entry (spared/superseded).
-    return; // records OutcomeKind::Replaced
+    // A resurrect (condemned->clean) or a superseding re-condemn won on this etag: do NOT delete the body.
+    // Drop the entry (spared/superseded). records OutcomeKind::Replaced.
+    return;
 }
-// Won the tombstone. Delete the body (top-down). Fresh HEAD is safe here: raw bodies are immutable and
-// no writer can re-upload without the meta, which we now hold as tombstone. Idempotent redelete (I3):
+// Won the tombstone -> TERMINAL. No writer can un-tombstone (v2), so no writer re-established the body
+// after this win; a fresh HEAD therefore cannot observe a live resurrected body (the v2 correctness
+// point). Phase B: delete the body top-down. Idempotent redelete (I3): an already-absent body is fine.
 const HeadResult hr = backend.head(blobKeyOf(layout, entry.hash));
 if (hr.exists)
     backend.deleteExact(blobKeyOf(layout, entry.hash), hr.token);
-// Finally delete the tombstone meta.
+// Phase C: delete the tombstone meta -> absent.
 deleteMetaExact(backend, layout, entry.hash, claim.token /*tombstone etag*/);
 ```
 Wrap submission so a per-task exception is caught, logged, and the entry recorded as an anomaly (never throw out of the pool — `feedback_ca_gc_never_throw_on_404`). Collect all futures before the round advances. Keep `created_delete_marker` fail-closed (throw LOGICAL_ERROR) since versioning-on is a store misconfig.
 
 - [ ] **Step 5: Re-key graduation to `condemn_round < current_round`**
 
-In `settleEntry` (`CasBlobInDegree.cpp:196-217`), replace the `e.condemn_round < min_ack` graduation gate (`:208`) with `e.condemn_round < current_round` (pass `current_round` where `min_ack` is passed today). Remove `min_ack` from `foldDeltasIntoGeneration`'s signature (`CasBlobInDegree.h:122`) and all call sites; thread `current_round` instead. Update `graduationDue` (`CasGc.cpp:1523`) correspondingly (defers never delete — M5, verified safe).
+In `settleEntry` (`CasBlobInDegree.cpp:196-217`), replace the `e.condemn_round < min_ack` graduation gate (`:208`) with `e.condemn_round < current_round`. **Off-by-one (v2 finding #13):** `current_round` MUST be `new_round = state.round + 1` — the SAME basis as `condemn_round` (condemn stamps `condemn_round = state.round + 1`, `CasGc.cpp:609`). Passing `state.round` would make `condemn_round < current_round` never true → nothing ever graduates → leak. Pass `new_round` where `min_ack` is passed today. Remove `min_ack` from `foldDeltasIntoGeneration`'s signature (`CasBlobInDegree.h:122`) and all call sites; thread `current_round` (= `new_round`) instead. Update `graduationDue` (`CasGc.cpp:1523`) correspondingly (defers never delete — M5, verified safe).
 
 - [ ] **Step 6: Rename `peek_head`→`peek_meta` and re-shape the supersede**
 
@@ -1337,7 +1459,12 @@ In `CasServerRoot.h`, remove `observed_gc_round` from `MountLease` (`:87-103`) a
 
 - [ ] **Step 5: Remove `min_ack`/`max_ack` from `computeHeartbeatFloor` and re-source GC round numbering**
 
-In `CasServerRoot.{h,cpp}`, drop `min_ack`/`max_ack` from `HeartbeatFloor` (`:246-264`) and the `m.observed_gc_round` reads (`:516/533/535`). The floor now only classifies live/terminated/fenced mounts and computes `min_active` (the precommit-reclaim floor, which stays — K4). In `CasGc.cpp` round recovery (`:1867-1872`), replace `std::max({floor.max_ack, max_fence_round, state.round, max_gen}) + 1` with `std::max({max_fence_round, state.round, max_gen}) + 1` (the ack term is gone; the GC round advances on its own state + fence/gen maxima). Confirm the regular-round path already increments `state.round` each pass so `condemn_round < current_round` graduation makes progress.
+In `CasServerRoot.{h,cpp}`, drop `min_ack`/`max_ack` from `HeartbeatFloor` (`:246-264`) and the `m.observed_gc_round` reads (`:516/533/535`). The floor now only classifies live/terminated/fenced mounts and computes `min_active` (the precommit-reclaim floor, which stays — K4). In `CasGc.cpp` round recovery (`:1867-1872`), replace `std::max({floor.max_ack, max_fence_round, state.round, max_gen}) + 1` with `std::max({max_fence_round, state.round, max_gen}) + 1` (the ack term is gone; the GC round advances on its own state + fence/gen maxima). Confirm the regular-round path already increments `state.round` each pass (`new_round = state.round + 1` at `CasGc.cpp:132`, committed `:428`) so `condemn_round < current_round` graduation makes progress.
+
+**Three additional residual consumers (v2 finding #4) — remove/re-source these too, or the build breaks:**
+- `RoundReport::min_ack` — the field decl (`CasGc.h:80`), its assignment `report.min_ack = floor.min_ack;` (`CasGc.cpp:143`), and its log line (`CasGc.cpp:191`). Delete the field and both uses (it was a `floor.min_ack` introspection echo).
+- `Gc::graduationDueForTest(state, min_ack)` — the test-only overload (`CasGc.h:389-391`): drop its `min_ack` parameter (it now derives `current_round` internally, matching `graduationDue`).
+- `CasInspect.cpp:224` — the mount-lease renderer's `.add("observed_gc_round", jsonUInt(m.observed_gc_round))`: remove it (the `MountLease` field is gone).
 
 - [ ] **Step 6: Migrate the heartbeat/beat/floor tests**
 
@@ -1375,6 +1502,40 @@ Claude-Session: https://claude.ai/code/session_01MXfxaevd1iF9R8uaj7MPFk"
 **Interfaces:**
 - Consumes: the complete Task 1-6 implementation.
 - Produces: a green full CAS gtest run; a green CA-s3 lane (0 promote aborts, 0 fsck dangles); a clean soak run with the fsck gate; a mass-DROP throughput measurement sizing the parallel pool.
+
+- [ ] **Step 0: Deterministic GC-delete-vs-writer-resurrect race test (v2 finding #7)**
+
+The per-task tests manufacture meta state; none exercises a real writer resurrect racing a real GC delete — the exact interleaving of the consult's CRITICAL finding. Add a deterministic test in `gtest_cas_gc_leak.cpp` (or a new `gtest_cas_meta_race.cpp`) that drives the race by hand on the `InMemoryBackend` (single-threaded, explicit step ordering — no sleeps, no real threads):
+```cpp
+TEST(CasReuseGcRace, TerminalTombstoneNoDangleWhenWriterRacesDelete)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend);
+    const String payload = "raced";
+    const DB::UInt128 h = store->poolContentHash(payload);
+    writeRawBlobBody(*backend, store->layout(), h, payload);
+    writeMetaClean(*backend, store->layout(), h, payload.size());
+    condemnMeta(*backend, store->layout(), h, /*round*/ 5);   // meta = condemned(E1), body present
+
+    // GC wins the tombstone claim FIRST (condemned -> tombstone).
+    const auto before = loadMeta(*backend, store->layout(), h);
+    ASSERT_TRUE(before && before->meta.state == MetaState::Condemned);
+    const CasResult claim = casMeta(*backend, store->layout(), h, before->etag,
+        BlobMeta{.incarnation = mintU128(), .state = MetaState::Tombstone, .condemn_round = 5, .size = payload.size()});
+    ASSERT_EQ(claim.outcome, CasOutcome::Committed);
+
+    // NOW a writer tries putBlob: it must observe tombstone and WAIT/ABORT — NEVER un-tombstone.
+    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] {
+        auto b = /* build+precommit */; b->putBlob(BlobId(u128ToHex(h)), BlobSource::fromString(payload));
+    });
+    // GC completes the delete (body then tombstone meta). No committed ref exists -> no dangle.
+    // Assert: had the writer been allowed tombstone->clean (the bug), the body delete below would strand a
+    // clean meta with no body. Terminal tombstone forbids it, so the meta stayed tombstone.
+    const auto after = loadMeta(*backend, store->layout(), h);
+    ASSERT_TRUE(after && after->meta.state == MetaState::Tombstone);
+}
+```
+This is the C++ analog of `CaMetaDescriptorRaw.tla`'s `sab_resurrect_tomb` red run — it proves the code, not just the model, honors terminal tombstone.
 
 - [ ] **Step 1: Full CAS gtest suite**
 
