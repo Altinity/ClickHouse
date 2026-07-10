@@ -3934,16 +3934,23 @@ std::vector<PartitionExportInfo> StorageMergeTree::getPartitionExportsInfo() con
 
 void StorageMergeTree::partitionExportTask()
 {
+    /// Reschedule only while there is pending export work. When the scheduler reports no pending
+    /// tasks the schedule-pool task goes idle (no periodic wakeups per table); it is re-armed by
+    /// triggerPartitionExportTask() on a new EXPORT PARTITION and by loadFromDisk() at startup.
+    bool has_pending_work = true;
     try
     {
-        partition_export_scheduler->run();
+        has_pending_work = partition_export_scheduler->run();
     }
     catch (...)
     {
         tryLogCurrentException(log, __PRETTY_FUNCTION__);
+        /// On an unexpected error keep polling so we do not get stuck idle with pending work.
+        has_pending_work = true;
     }
 
-    partition_export_task->scheduleAfter(5000);
+    if (has_pending_work)
+        partition_export_task->scheduleAfter(5000);
 }
 
 void StorageMergeTree::triggerPartitionExportTask()

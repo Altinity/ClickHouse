@@ -108,8 +108,23 @@ void MergeTreePartitionExportScheduler::addTask(
         removeTaskFile(previous_transaction_id);
     }
 
-    /// Persist before announcing success so a crash right after this call leaves a resumable task.
-    persist(transaction_id, descriptor_json);
+    /// The task is already in the in-memory registry (published under the lock above so the dedup
+    /// check + insert is atomic). If the durable write fails, roll the entry back so the background
+    /// scheduler does not export/commit a task whose ALTER reported failure and which would not
+    /// survive a restart anyway. The transaction_id guard avoids erasing a newer replacement that a
+    /// concurrent force-export may have installed in the meantime.
+    try
+    {
+        persist(transaction_id, descriptor_json);
+    }
+    catch (...)
+    {
+        std::lock_guard lock(mutex);
+        if (const auto it = tasks.find(composite_key);
+            it != tasks.end() && it->second.descriptor.transaction_id == transaction_id)
+            tasks.erase(it);
+        throw;
+    }
 
     LOG_INFO(storage.log, "ExportPartition: scheduled export task {} (key {})", transaction_id, composite_key);
     storage.triggerPartitionExportTask();
@@ -135,6 +150,17 @@ CancellationCode MergeTreePartitionExportScheduler::kill(const String & transact
 
         if (target->descriptor.status != MergeTreePartitionExportTask::Status::PENDING)
             return CancellationCode::CancelCannotBeSent;
+
+        /// Serialize against the commit phase. `committing` is set under this same mutex before the
+        /// (unlocked) destination commit begins, so once it is true the data is being (or has been)
+        /// committed and the task will transition to COMPLETED; cancelling now would leave a
+        /// misleading KILLED status over already-committed data. This mirrors the replicated path,
+        /// which refuses the kill when it cannot take the per-task commit_lock.
+        if (target->committing)
+        {
+            LOG_INFO(storage.log, "ExportPartition: commit in progress for {}, cannot cancel export partition task", transaction_id);
+            return CancellationCode::CancelCannotBeSent;
+        }
 
         target->descriptor.status = MergeTreePartitionExportTask::Status::KILLED;
         descriptor_json = target->descriptor.toJsonString();
@@ -179,18 +205,38 @@ std::vector<PartitionExportInfo> MergeTreePartitionExportScheduler::getInfo() co
     return result;
 }
 
-void MergeTreePartitionExportScheduler::run()
+bool MergeTreePartitionExportScheduler::run()
 {
+    /// Fast path: if no task is PENDING there is nothing to do, so report "no pending work" and let
+    /// the schedule-pool task go idle instead of waking every tick. New work re-arms the task via
+    /// triggerPartitionExportTask (from addTask) and via loadFromDisk at startup.
+    {
+        std::lock_guard lock(mutex);
+        bool any_pending = false;
+        for (const auto & [key, entry] : tasks)
+        {
+            if (entry.descriptor.status == MergeTreePartitionExportTask::Status::PENDING)
+            {
+                any_pending = true;
+                break;
+            }
+        }
+        if (!any_pending)
+            return false;
+    }
+
+    /// There is pending work. Even if we cannot make progress this tick (no move executors, moves
+    /// stopped, or memory pressure), keep the scheduler awake so it retries on the next tick.
     const auto available_move_executors = storage.background_moves_assignee.getAvailableMoveExecutors();
     if (available_move_executors == 0)
-        return;
+        return true;
 
     if (storage.parts_mover.moves_blocker.isCancelled())
-        return;
+        return true;
 
     /// Respect the background memory soft-limit like the per-part export path does.
     if (!canEnqueueBackgroundTask())
-        return;
+        return true;
 
     std::vector<std::pair<String, String>> parts_to_schedule;  /// (transaction_id, part_name)
     std::vector<String> tasks_to_commit;
@@ -238,6 +284,10 @@ void MergeTreePartitionExportScheduler::run()
 
     for (const auto & transaction_id : tasks_to_commit)
         tryCommit(transaction_id);
+
+    /// A task was PENDING this tick (either scheduled/committed above, or waiting on in-flight parts
+    /// or a retry). Keep polling until every task reaches a terminal state.
+    return true;
 }
 
 void MergeTreePartitionExportScheduler::scheduleOnePart(const String & transaction_id, const String & part_name)

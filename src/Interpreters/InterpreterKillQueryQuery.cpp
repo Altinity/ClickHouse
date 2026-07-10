@@ -271,19 +271,42 @@ BlockIO InterpreterKillQueryQuery::execute()
         /// ReplicatedMergeTree and `partition_exports` for plain MergeTree. Query both so a single
         /// KILL EXPORT PARTITION targets either engine. Each query applies the user WHERE to its own
         /// table (which exposes all of its columns); a WHERE that references columns specific to the
-        /// other engine simply yields no matches / is tolerated.
-        Block replicated_exports_block = getSelectResult(export_columns, "system.replicated_partition_exports");
+        /// other engine will fail against the table that lacks them. We tolerate that per-table so a
+        /// predicate on engine-specific columns still reaches the matching engine — but if BOTH reads
+        /// fail (e.g. a genuinely bad predicate / unknown column), we rethrow so the error surfaces.
+        Block replicated_exports_block;
         Block plain_exports_block;
+        std::exception_ptr replicated_error;
+        std::exception_ptr plain_error;
+
+        try
+        {
+            replicated_exports_block = getSelectResult(export_columns, "system.replicated_partition_exports");
+        }
+        catch (...)
+        {
+            replicated_error = std::current_exception();
+            tryLogCurrentException(getLogger("InterpreterKillQueryQuery"),
+                "KILL EXPORT PARTITION: could not read system.replicated_partition_exports (the WHERE may "
+                "reference columns that only exist for plain MergeTree); ignoring ReplicatedMergeTree tables");
+        }
+
         try
         {
             plain_exports_block = getSelectResult(export_columns, "system.partition_exports");
         }
         catch (...)
         {
+            plain_error = std::current_exception();
             tryLogCurrentException(getLogger("InterpreterKillQueryQuery"),
                 "KILL EXPORT PARTITION: could not read system.partition_exports (the WHERE may reference "
                 "columns that only exist for ReplicatedMergeTree); ignoring plain MergeTree tables");
         }
+
+        /// Neither table could be read: the predicate is invalid for both, so surface the error
+        /// instead of silently matching nothing.
+        if (replicated_error && plain_error)
+            std::rethrow_exception(plain_error);
 
         if (replicated_exports_block.empty() && plain_exports_block.empty())
             return res_io;
