@@ -132,8 +132,9 @@ struct CondemnedSummary
 };
 ```
 
-Derived **from the durable run bytes** while writing (or adopting) each shard's run, so it is a
-pure function of the sealed content — the seal stays a deterministic artifact (§4).
+Derived **from the written run bytes** of each shard's run — a pure function of the sealed content,
+so the seal stays a deterministic artifact (§4; byte-equal adoption makes adopted bytes identical to
+written bytes by construction).
 
 **The map is TOTAL over `gc_shards` in every newly written seal (review finding, 2026-07-10):**
 pure ref-carry shards (`carryParentRefs`, `CasGc.cpp:1069` — parent `RunRef`s copied verbatim with
@@ -318,9 +319,13 @@ Gate is green (invariants hold; every sabotage flips red) **before** implementat
 ## 8. Implementation phases (for the plan) {#phases}
 
 1. **Phase 0:** TLA+ gate (§6) — model green + sabotage red.
-2. **Phase 1:** run format — `kCondemned` row, `key_schema` 1, writer/reader/cursor, unit tests.
-3. **Phase 2:** merge and round — 2-cursor `foldDeltasIntoGeneration`,
-   seal `condemned_summary`, `graduationDue` / ref-carry from summaries, round wiring.
-4. **Phase 3:** consumers — `fsck`, `ca-inspect`, `previewDeletes`, `hasInFlightRetired`,
-   rebuild; delete `RetiredSet` / `CART` / `retiredKey` / `retired_refs` (proto `reserved`).
+2. **Phase 1:** run format — `kCondemned` row (incl. `token_type`), `key_schema` 1 for
+   `RunKind::SourceEdge`, the typed open path with the row/key invariants (§2.1), the
+   `source_id = 0` fail-closed reservation, writer/reader/cursor, unit tests.
+3. **Phase 2:** merge and round — 2-cursor `foldDeltasIntoGeneration` (settlement-only sentinel:
+   no touch bit), seal `condemned_summary` (total map, ref-carry copies the parent entry),
+   `graduationDue` (fail-closed on missing seal/summary) / ref-carry from summaries, round wiring.
+4. **Phase 3:** consumers — `fsck`, `ca-inspect`, `previewDeletes` (new contract, §5),
+   `hasInFlightRetired`, rebuild **with the reordering from §5** (blob LIST before run flush);
+   delete `RetiredSet` / `CART` / `retiredKey` / `retired_refs` (proto `reserved`).
 5. **Phase 4:** validation — full `*Cas*` gtest battery, CA-s3 point-runs, phase-1 soak, docs.
