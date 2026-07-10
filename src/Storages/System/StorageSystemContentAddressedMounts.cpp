@@ -41,7 +41,6 @@ StorageSystemContentAddressedMounts::StorageSystemContentAddressedMounts(const S
         {"started_at_ms", std::make_shared<DataTypeUInt64>(), "Lease start, unix ms."},
         {"expires_at_ms", std::make_shared<DataTypeUInt64>(), "Lease expiry, unix ms."},
         {"min_active", std::make_shared<DataTypeUInt64>(), "Oldest in-flight build sequence (UINT64_MAX = farewell)."},
-        {"observed_gc_round", std::make_shared<DataTypeUInt64>(), "Newest GC round this server has acked."},
         {"gc_fenced", std::make_shared<DataTypeUInt8>(), "1 if GC fenced this slot out (terminal)."},
         {"state", std::make_shared<DataTypeString>(), "live | expired | terminated | fenced | corrupt."},
     }));
@@ -78,7 +77,6 @@ Pipe StorageSystemContentAddressedMounts::read(
     MutableColumnPtr col_started = ColumnUInt64::create();
     MutableColumnPtr col_expires = ColumnUInt64::create();
     MutableColumnPtr col_min_active = ColumnUInt64::create();
-    MutableColumnPtr col_round = ColumnUInt64::create();
     MutableColumnPtr col_fenced = ColumnUInt8::create();
     MutableColumnPtr col_state = ColumnString::create();
 
@@ -144,7 +142,6 @@ Pipe StorageSystemContentAddressedMounts::read(
             col_started->insert(m.lease.started_at_ms);
             col_expires->insert(m.lease.expires_at_ms);
             col_min_active->insert(m.lease.min_active);
-            col_round->insert(m.lease.observed_gc_round);
             col_fenced->insert(static_cast<UInt8>(m.lease.gc_fenced));
             col_state->insert(m.state);
         }
@@ -161,7 +158,6 @@ Pipe StorageSystemContentAddressedMounts::read(
     res_columns.emplace_back(std::move(col_started));
     res_columns.emplace_back(std::move(col_expires));
     res_columns.emplace_back(std::move(col_min_active));
-    res_columns.emplace_back(std::move(col_round));
     res_columns.emplace_back(std::move(col_fenced));
     res_columns.emplace_back(std::move(col_state));
 

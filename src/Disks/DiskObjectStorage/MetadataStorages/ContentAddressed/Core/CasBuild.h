@@ -28,7 +28,8 @@ struct BlobRef
 
 /// The writer protocol (spec §5, CA GC root-local part-manifest redesign rev. 15) — the W-rules live
 /// HERE, not in the wiring. One Build per written ref. Thread-compat: a Build is used by ONE thread (the
-/// wiring's commit path); the Store-shared RetireView it consults is itself thread-safe.
+/// wiring's commit path); the per-hash freshness meta it point-reads (`CasBlobMeta.h`) is itself
+/// thread-safe (a plain backend point-read/CAS, no shared in-memory state).
 ///
 /// Write path: stageManifest (mint a ManifestId, stream-write the body) -> precommitAdd (append a
 /// create-precommit RootOwnerEvent in the target root shard) -> putBlob (blob bodies) -> promote

@@ -23,7 +23,7 @@ enum class CasEventType
     GcFence, GcSnapPersist, GcCursorAdvance, GcTrim, GcShardReclaim, GcFenceOut, GcRebuild, GcFoldClamp,
     GcLeaseAcquire, GcLeaseSteal, GcLeaseHeartbeat,
     BuildStart, BuildPublish, BuildAbort, Precommit, PrecommitRemoved, PrecommitReclaim,
-    GateRevalidate, GateResurrect, WatermarkRenew, RetiredViewAdvance, MountRemount,
+    GateRevalidate, GateResurrect, WatermarkRenew, MountRemount,
     MountClaim, MountRelease, MountConflict,
     RefResolve, ReadMissing, DanglingAccess,
     CorruptDangle, CorruptDecode, SnapJournalIncoherent, Exception,

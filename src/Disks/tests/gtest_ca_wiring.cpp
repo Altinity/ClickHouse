@@ -1986,7 +1986,7 @@ TEST(CaWiringOps, OrphanedPendingBlobNotUploadedAfterReplace)
 ///
 /// These tests drive the REAL writer sequence (stageManifest -> precommitAdd -> putBlob -> promote) against
 /// a raw in-memory Store (no background GC → deterministic), and condemn the blob's CURRENT token by seeding
-/// gc/state the way GC's retire bridge does (mirrors seedState in gtest_cas_retire_view.cpp).
+/// gc/state + the per-hash freshness meta the way a real GC condemn does (see `seedCondemnBlobToken` below).
 
 namespace DB::ErrorCodes
 {
@@ -2004,9 +2004,10 @@ DB::Cas::StorePtr openResurrectStore(std::shared_ptr<DB::Cas::InMemoryBackend> &
         out_backend, DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1});
 }
 
-/// Condemn (kind=Blob, hash, token) by seeding gc/state + a per-shard retired set that gc/state references
-/// — the on-storage interface RetireView::refresh consumes (the shape GC's retire bridge writes). Bumps the
-/// round so the retirement is a fresh one; leaves the object itself in place (condemn, NOT delete).
+/// Condemn (kind=Blob, hash, token) by seeding gc/state + a per-shard retired set (the durable GC ledger
+/// shape — RetiredEntry, exact-token delete, unchanged by this task) AND condemning the per-hash freshness
+/// meta, which is what the writer's condemned decision ACTUALLY point-reads (spec §meta-protocols v3).
+/// Bumps the round so the retirement is a fresh one; leaves the object itself in place (condemn, NOT delete).
 void seedCondemnBlobToken(DB::Cas::Store & store, const DB::UInt128 & hash, const DB::Cas::Token & token, uint64_t size)
 {
     using namespace DB::Cas;
@@ -2032,6 +2033,10 @@ void seedCondemnBlobToken(DB::Cas::Store & store, const DB::UInt128 & hash, cons
         b.putOverwrite(layout.gcStateKey(), encodeGcState(state), head.token);
     else
         b.putIfAbsent(layout.gcStateKey(), encodeGcState(state));
+
+    /// The writer's fresh upload (putBlob) already wrote a Clean meta for `hash` (Task 3), so this is a
+    /// plain Clean -> Condemned CAS — exactly what GC's real condemn path does.
+    DB::Cas::tests::condemnMeta(b, layout, hash, state.round);
 }
 
 }
@@ -2064,9 +2069,11 @@ TEST(CaWiringResurrect, PromoteIgnoresCondemnedTokenedBlobEdgeProtected)
     ASSERT_TRUE(h1.exists);
     const Token t0 = h1.token;
     seedCondemnBlobToken(*store, u128Of(P), t0, h1.size);
-    store->retireView().refresh();
-    ASSERT_TRUE(store->retireView().isCondemnedToken(ObjectKind::Blob, u128Of(P), t0))
-        << "precondition: the putBlob'd token must be condemned before promote";
+    {
+        const auto lm = DB::Cas::tests::loadMetaForTest(store->backend(), store->layout(), u128Of(P));
+        ASSERT_TRUE(lm.has_value() && lm->meta.state == MetaState::Condemned)
+            << "precondition: the putBlob'd token must be condemned before promote";
+    }
 
     /// promote must NOT abort AND must NOT touch the tokened leaf — it is edge-protected.
     EXPECT_NO_THROW(build->promote(ns, ref, build->buildId(), id));
@@ -2104,8 +2111,10 @@ TEST(CaWiringResurrect, PromoteAbandonedPrecommitAbortsWithoutResurrect)
     const HeadResult h1 = store->backend().head(blob_key);
     ASSERT_TRUE(h1.exists);
     seedCondemnBlobToken(*store, u128Of(P), h1.token, h1.size);
-    store->retireView().refresh();
-    ASSERT_TRUE(store->retireView().isCondemnedToken(ObjectKind::Blob, u128Of(P), h1.token));
+    {
+        const auto lm = DB::Cas::tests::loadMetaForTest(store->backend(), store->layout(), u128Of(P));
+        ASSERT_TRUE(lm.has_value() && lm->meta.state == MetaState::Condemned);
+    }
 
     /// Concurrently remove THIS build's precommit binding (the GC-reclaim / abandon shape) BEFORE promote,
     /// so the owner-liveness check fires. Mirror the removal encoding of Build::abandon / Store::dropRef:
@@ -2134,6 +2143,7 @@ TEST(CaWiringResurrect, PromoteAbandonedPrecommitAbortsWithoutResurrect)
     ASSERT_TRUE(h2.exists);
     EXPECT_EQ(h2.token, h1.token)
         << "the aborting path must perform no PUT — the tokened leaf is untouched";
-    EXPECT_TRUE(store->retireView().isCondemnedToken(ObjectKind::Blob, u128Of(P), h2.token))
+    const auto lm_after = DB::Cas::tests::loadMetaForTest(store->backend(), store->layout(), u128Of(P));
+    EXPECT_TRUE(lm_after.has_value() && lm_after->meta.state == MetaState::Condemned)
         << "the token is still the condemned one (no re-upload before the owner check)";
 }

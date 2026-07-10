@@ -145,7 +145,7 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
                               uint64_t shard,
                               std::vector<BlobDelta> scattered, std::vector<RunRef> & out_runs,
                               const std::vector<RetiredEntry> & prior_retired,
-                              uint64_t min_ack, uint64_t condemn_round,
+                              uint64_t current_round, uint64_t condemn_round,
                               const std::function<std::optional<HeadResult>(const UInt128 &)> & head_blob,
                               const std::function<std::optional<HeadResult>(const UInt128 &)> & peek_head,
                               RetiredMergeResult * out_retired,
@@ -205,7 +205,7 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
             else
                 rmr.redelete.push_back(e);      /// published pending by a PRIOR pass — execute + drop
         }
-        else if (!suppress_destructive && e.condemn_round < min_ack)
+        else if (!suppress_destructive && e.condemn_round < current_round)
         {
             RetiredEntry pending = e;           /// newly floor-passed: publish pending; delete NEXT pass
             pending.delete_pending = true;

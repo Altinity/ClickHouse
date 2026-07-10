@@ -48,25 +48,24 @@ struct GcState
     uint64_t snap_attempt = 0;     /// adopted attempt id (folding leader's lease.seq) for snap_generation
     String manifest_sweep_cursor;  /// best-effort orphan part-manifest cleanup cursor; reachability ignores it
     GcLease lease;
-    std::map<uint64_t, String> retired_refs;   /// gc-shard -> object key of the current retired list
-                                               /// (ack-floor redesign). The writer publish gate loads
-                                               /// the current retired list by dereferencing these keys;
-                                               /// RetireView reads them straight out of this same body,
-                                               /// so a retired set can never be older than the round it
-                                               /// is installed for.
+    std::map<uint64_t, String> retired_refs;   /// gc-shard -> object key of the current retired list.
+                                               /// The writer's condemned decision does NOT consult this
+                                               /// list; it point-reads the per-hash freshness meta
+                                               /// instead (`CasBlobMeta.h`), which GC keeps current at
+                                               /// condemn/spare/delete time.
 };
 
-/// One condemned object inside a retired set. `condemn_round` is the ack-floor addition (spec
-/// 2026-07-02): the round that condemned the incarnation, used by GC's graduation gate.
+/// One condemned object inside a retired set. `condemn_round` is the round that condemned the
+/// incarnation, used by GC's round-paced graduation gate.
 struct RetiredEntry
 {
     ObjectKind kind = ObjectKind::Blob;
     UInt128 hash{};
     Token token;          /// the exact incarnation token GC observed (exact-token delete)
     uint64_t size = 0;
-    uint64_t condemn_round = 0;   /// the GC round that condemned this incarnation (ack-floor graduation:
-                                  /// an entry graduates only when condemn_round < min_ack). Consulted by
-                                  /// GC only; the writer publish gate ignores it.
+    uint64_t condemn_round = 0;   /// the GC round that condemned this incarnation (round-paced
+                                  /// graduation: an entry graduates only once condemn_round < the
+                                  /// current round). Consulted by GC only; the writer never reads it.
     bool delete_pending = false;  /// two-phase graduation (spec Task-9 amendment): floor-passed and
                                   /// published for deletion; the NEXT pass executes the exact-token
                                   /// delete (pre-CAS, safe at any leader staleness) and drops the entry.

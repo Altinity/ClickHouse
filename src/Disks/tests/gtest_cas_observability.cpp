@@ -175,9 +175,11 @@ TEST(CasObservability, ResurrectSupersedeEmitsOnlyRetireReplacedWithOldToken)
         const RoundReport rep = gc.runRegularRound();
         ASSERT_TRUE(rep.acquired_lease);
     }
-    s->retireView().refresh();
-    ASSERT_TRUE(s->retireView().isCondemnedToken(ObjectKind::Blob, u128Of(P), hA.token))
-        << "precondition: token A must be condemned before the resurrect";
+    {
+        const auto lm = DB::Cas::tests::loadMetaForTest(*b, s->layout(), u128Of(P));
+        ASSERT_TRUE(lm.has_value() && lm->meta.state == MetaState::Condemned)
+            << "precondition: token A must be condemned before the resurrect";
+    }
 
     /// 2. RESURRECT: r2 dedup-hits P while A is condemned -> mints a fresh incarnation B; drop it too.
     publishOneBlobPart(s, ns, "r2", P);

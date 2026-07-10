@@ -93,7 +93,7 @@ TEST(CasGcBaselineGuard, AbsentAdoptedSealFailsClosed)
 }
 
 /// (а): lose gc/state on a lived-in pool -> guard blocks rounds -> rebuild -> rounds converge:
-/// the dropped blob is reclaimed, the live blob intact, the round minted above every mount ack.
+/// the dropped blob is reclaimed, the live blob intact, the round minted strictly above the last one seen.
 TEST(CasGcRebuild, RecoversLostStateAndConverges)
 {
     auto backend = std::make_shared<InMemoryBackend>();
@@ -114,10 +114,13 @@ TEST(CasGcRebuild, RecoversLostStateAndConverges)
     gc.runRegularRound();
     dropRefTransition(*backend, store->layout(), ns, "tbl_dead", dead_r);
     gc.runRegularRound();   /// -1 folds; eager trim cuts the journal
-    store->renewWatermarkOnce();   /// the mount ack advances to the current round
+    store->renewWatermarkOnce();   /// renews the lease + build-watermark floor
 
-    const HeadResult st = backend->head(store->layout().gcStateKey());
-    ASSERT_EQ(backend->deleteExact(store->layout().gcStateKey(), st.token).kind, DeleteOutcome::Kind::Deleted);
+    /// Capture the round reached before gc/state is destroyed (the rebuild must mint strictly above it).
+    const auto pre_rebuild_got = backend->get(store->layout().gcStateKey());
+    ASSERT_TRUE(pre_rebuild_got.has_value());
+    const uint64_t pre_rebuild_round = decodeGcState(pre_rebuild_got->bytes).round;
+    ASSERT_EQ(backend->deleteExact(store->layout().gcStateKey(), pre_rebuild_got->token).kind, DeleteOutcome::Kind::Deleted);
 
     Gc gc2(store, hexToU128("00000000000000000000000000000003"));
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { gc2.runRegularRound(); });
@@ -127,10 +130,8 @@ TEST(CasGcRebuild, RecoversLostStateAndConverges)
     EXPECT_EQ(rep.committed_refs, 1u);
     EXPECT_EQ(rep.namespaces, 1u);
 
-    /// Round strictly above the mount's surviving ack.
-    const auto mount_got = backend->get(store->layout().mountKey("test"));
-    ASSERT_TRUE(mount_got.has_value());
-    EXPECT_GT(rep.round, decodeMountLease(mount_got->bytes).observed_gc_round);
+    /// Round strictly above the fence/state/generation numbers seen so far.
+    EXPECT_GT(rep.round, pre_rebuild_round);
 
     /// Regular rounds converge: blob 2 (unreferenced) reclaimed, blob 1 intact.
     EXPECT_TRUE(runRoundsUntilAbsent(store, gc2, *backend, store->layout(), DB::UInt128(2)));

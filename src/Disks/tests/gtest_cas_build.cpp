@@ -1537,7 +1537,7 @@ TEST(CasBuild, AdoptEvidenceNoBackendOp)
     /// A Blob ManifestEntry. adoptEvidence is called on a hand-crafted entry — that IS the B188 interface.
     const ManifestEntry entry = blobManifestEntry("b188.bin", "b188-content");
 
-    /// Reset the counters after Store::open (which may HEAD gc/state etc. during retireView refresh).
+    /// Reset the counters after Store::open (which may HEAD/GET gc/server-roots etc. during startup).
     counting->heads = 0;
     counting->stream_puts = 0;
     counting->gets = 0;

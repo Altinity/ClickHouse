@@ -29,11 +29,10 @@ struct ContentAddressedGarbageCollectionLogElement
     UInt64 objects_replaced = 0;
     UInt64 objects_spared = 0;
     UInt64 manifests_deleted = 0;   /// owner-removed manifest bodies deleted (B11 — distinct from blob deletes)
-    UInt64 entries_condemned = 0;   /// ack-floor: entries newly condemned this round
-    UInt64 entries_graduated = 0;   /// ack-floor: entries newly floor-passed (delete_pending) this round
-    UInt64 entries_redeleted = 0;   /// ack-floor: pending exact-token blob deletes executed this round
+    UInt64 entries_condemned = 0;   /// retired-cursor pipeline: entries newly condemned this round
+    UInt64 entries_graduated = 0;   /// retired-cursor pipeline: entries newly round-passed (delete_pending) this round
+    UInt64 entries_redeleted = 0;   /// retired-cursor pipeline: pending exact-token blob deletes executed this round
     UInt64 fence_outs = 0;          /// expired mounts fenced-out by the round's heartbeat floor
-    UInt64 min_ack = 0;             /// heartbeat ack floor latched at round start
     UInt64 anomalies = 0;           /// fold clamps surfaced this round
     UInt64 duration_ms = 0;
     String error;

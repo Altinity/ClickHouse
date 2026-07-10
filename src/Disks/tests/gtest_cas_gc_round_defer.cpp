@@ -29,15 +29,15 @@ TEST(CasGcRoundDefer, PredicateTruthTable)
     EXPECT_FALSE(shouldDeferRound(2, false, 8, 3, 8));   // bound reached => force fold
 }
 
-/// graduationDue: a delete_pending entry, and an entry whose condemn_round < min_ack, each force it true;
-/// an entry with condemn_round >= min_ack and not delete_pending leaves it false.
-TEST(CasGcRoundDefer, GraduationDueDetectsDuePendingAndFloorCrossing)
+/// graduationDue: a delete_pending entry, and an entry whose condemn_round < current_round, each force
+/// it true; an entry with condemn_round >= current_round and not delete_pending leaves it false.
+TEST(CasGcRoundDefer, GraduationDueDetectsDuePendingAndRoundCrossing)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openStoreForTest(backend);
     const Layout & layout = store->layout();
 
-    /// Seed the CURRENT retired list for gc-shard 0 with one condemned-but-not-floor-passed entry.
+    /// Seed the CURRENT retired list for gc-shard 0 with one condemned-but-not-yet-graduated entry.
     injectRetire(*backend, layout, /*round*/0, /*fence_seq*/0, /*shard*/0,
         {RetiredEntry{.kind = ObjectKind::Blob, .hash = {}, .token = {}, .size = 0,
                       .condemn_round = 2, .delete_pending = false}});
@@ -45,12 +45,12 @@ TEST(CasGcRoundDefer, GraduationDueDetectsDuePendingAndFloorCrossing)
     Gc gc(store, kGc);
     const GcState state = decodeGcState(backend->get(layout.gcStateKey())->bytes);
 
-    EXPECT_FALSE(gc.graduationDueForTest(state, /*min_ack=*/2))
-        << "condemn_round (2) is not < min_ack (2); not yet due to graduate";
-    EXPECT_TRUE(gc.graduationDueForTest(state, /*min_ack=*/3))
-        << "condemn_round (2) < min_ack (3) => due to graduate";
+    EXPECT_FALSE(gc.graduationDueForTest(state, /*current_round=*/2))
+        << "condemn_round (2) is not < current_round (2); not yet due to graduate";
+    EXPECT_TRUE(gc.graduationDueForTest(state, /*current_round=*/3))
+        << "condemn_round (2) < current_round (3) => due to graduate";
 
-    /// Re-seed the SAME entry (same retired-list object) as delete_pending: due regardless of the floor.
+    /// Re-seed the SAME entry (same retired-list object) as delete_pending: due regardless of the round.
     const String retired_key = state.retired_refs.at(0);
     const auto current = backend->get(retired_key);
     ASSERT_TRUE(current.has_value());
@@ -59,8 +59,8 @@ TEST(CasGcRoundDefer, GraduationDueDetectsDuePendingAndFloorCrossing)
                                                               .size = 0, .condemn_round = 2, .delete_pending = true}}}),
         current->token);
 
-    EXPECT_TRUE(gc.graduationDueForTest(state, /*min_ack=*/0))
-        << "delete_pending must force graduationDue true regardless of the ack floor";
+    EXPECT_TRUE(gc.graduationDueForTest(state, /*current_round=*/0))
+        << "delete_pending must force graduationDue true regardless of current_round";
 }
 
 /// changedShardCount: with the fold seal covering shard s at its current token, a quiescent pool reports

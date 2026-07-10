@@ -78,30 +78,29 @@ struct RetiredMergeResult
     std::vector<ReplacedEntry> replaced;  /// re-condemned CURRENT tokens that superseded a stale entry (resurrect-replaced); caller emits blob_retire_replaced
 };
 
-/// Three-cursor extension (ack-floor redesign): `prior_retired` (Blob entries ONLY, sorted by hash
-/// ascending) rides the same per-blob close-out as the two existing cursors. Settlement rules, in
-/// order, per entry for blob `h` with post-merge in-degree `d`:
-///   delete_pending (prior pass)          -> redelete if d = 0 (the caller executes the exact-token
-///                                           delete pre-CAS and the entry drops); d > 0 for a pending
-///                                           entry is structurally impossible — spared + loud log;
-///   d > 0                                -> spared (recovery wins even past the floor);
-///   d = 0 and condemn_round < min_ack    -> graduated: REPUBLISHED as delete_pending (two-phase
-///                                           graduation, Task-9 amendment) — deleted the NEXT pass;
-///   d = 0 otherwise                      -> still_retired, carried byte-unchanged.
+/// Three-cursor extension: `prior_retired` (Blob entries ONLY, sorted by hash ascending) rides the same
+/// per-blob close-out as the two existing cursors. Settlement rules, in order, per entry for blob `h`
+/// with post-merge in-degree `d`:
+///   delete_pending (prior pass)                -> redelete if d = 0 (the caller executes the exact-token
+///                                                 delete pre-CAS and the entry drops); d > 0 for a pending
+///                                                 entry is structurally impossible — spared + loud log;
+///   d > 0                                       -> spared (recovery wins even past the floor);
+///   d = 0 and condemn_round < current_round     -> graduated: REPUBLISHED as delete_pending (two-phase
+///                                                 graduation) — deleted the NEXT pass;
+///   d = 0 otherwise                             -> still_retired, carried byte-unchanged.
 /// CLAMP SUPPRESSION (2026-07-03, found live: 31 dangling in the night soak): when the pass's fold
-/// CLAMPED any shard, landed-before-cut events may sit UNFOLDED behind the clamp — the ack-floor
-/// lemma "landed before the cut => folded before graduation" does not hold, so graduating or
-/// executing pending deletes over this pass's in-degrees can delete a blob whose +1 is pending
-/// behind the clamp (the model's SabotageSkipChangedShard counterexample, realized). With
-/// `suppress_destructive` the merge neither graduates nor redeletes: pending entries carry
-/// UNCHANGED (still delete_pending) and floor-passed entries stay condemned-only. Condemnation and
-/// sparing remain (both non-destructive).
+/// CLAMPED any shard, landed-before-cut events may sit UNFOLDED behind the clamp — the lemma "landed
+/// before the cut => folded before graduation" does not hold, so graduating or executing pending
+/// deletes over this pass's in-degrees can delete a blob whose +1 is pending behind the clamp (the
+/// model's SabotageSkipChangedShard counterexample, realized). With `suppress_destructive` the merge
+/// neither graduates nor redeletes: pending entries carry UNCHANGED (still delete_pending) and
+/// floor-passed entries stay condemned-only. Condemnation and sparing remain (both non-destructive).
 /// A blob that transitions to zero THIS pass with no prior entry is condemned: `head_blob` captures
 /// the exact incarnation token/size (absent object or empty head_blob -> nothing to delete, skipped)
 /// and the entry is minted at `condemn_round`. Entries for blobs the merged stream never visits
 /// (no edges, no deltas) settle at in-degree 0 by definition. The retired cursor never changes the
 /// snapshot run bytes. Defaults keep the legacy call sites behavior-identical (empty retired,
-/// min_ack 0 => nothing graduates, no head_blob => nothing condemned).
+/// current_round 0 => nothing graduates, no head_blob => nothing condemned).
 ///
 /// `peek_head` (audit fix, 2026-07-08): a SIDE-EFFECT-FREE HEAD used ONLY by the resurrect-supersede
 /// branch (a `prior_retired` entry whose blob re-touched this pass at net in-degree 0, current token
@@ -118,7 +117,7 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
                               uint64_t shard,
                               std::vector<BlobDelta> scattered, std::vector<RunRef> & out_runs,
                               const std::vector<RetiredEntry> & prior_retired = {},
-                              uint64_t min_ack = 0, uint64_t condemn_round = 0,
+                              uint64_t current_round = 0, uint64_t condemn_round = 0,
                               const std::function<std::optional<HeadResult>(const UInt128 &)> & head_blob = {},
                               const std::function<std::optional<HeadResult>(const UInt128 &)> & peek_head = {},
                               RetiredMergeResult * out_retired = nullptr,

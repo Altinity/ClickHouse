@@ -11,12 +11,11 @@
 using namespace DB::Cas;
 
 
-/// MountLeaseKeeper behavior after the ack-floor merge (spec 2026-07-02-cas-gc-ack-floor-fence):
-/// the per-server mount lease and the merged build-watermark floor + GC-round acknowledgement all
-/// ride the SAME slot, renewed by one beat. The keeper anchors durably before return, adopts a slot
-/// already written by `claimMount` (same uuid+epoch), re-reads BOTH callbacks on each renew and bumps
-/// `seq`, stamps the farewell sentinel (`min_active = UINT64_MAX`, `expires_at_ms <= now`) on `stop`,
-/// and fails closed on any foreign touch (`renewOnce` throws).
+/// MountLeaseKeeper behavior: the per-server mount lease and the merged build-watermark floor ride the
+/// SAME slot, renewed by one beat. The keeper anchors durably before return, adopts a slot already
+/// written by `claimMount` (same uuid+epoch), re-reads the callback on each renew and bumps `seq`,
+/// stamps the farewell sentinel (`min_active = UINT64_MAX`, `expires_at_ms <= now`) on `stop`, and
+/// fails closed on any foreign touch (`renewOnce` throws).
 
 namespace
 {
@@ -29,7 +28,7 @@ void seedOwnClaim(Backend & b, const Layout & l, const String & srid, UInt128 uu
 }
 }
 
-TEST(CasHeartbeat, AnchorCarriesFloorAndAck)
+TEST(CasHeartbeat, AnchorCarriesFloor)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     Layout layout("pool");
@@ -37,11 +36,10 @@ TEST(CasHeartbeat, AnchorCarriesFloorAndAck)
     const UInt128 uuid(0x1234);
     uint64_t now_ms = 1000;
     uint64_t min_active_now = 5;
-    uint64_t observed_round_now = 9;
     seedOwnClaim(*backend, layout, srid, uuid, /*epoch=*/9, now_ms, /*ttl_ms=*/100);
 
     MountLeaseKeeper keeper(backend, layout, srid, uuid, /*writer_epoch=*/9, std::chrono::milliseconds(100),
-                            [&] { return now_ms; }, [&] { return min_active_now; }, [&] { return observed_round_now; });
+                            [&] { return now_ms; }, [&] { return min_active_now; });
     keeper.start();
 
     auto hr = backend->head(layout.mountKey(srid));
@@ -49,12 +47,11 @@ TEST(CasHeartbeat, AnchorCarriesFloorAndAck)
     auto m = decodeMountLease(backend->get(layout.mountKey(srid))->bytes);
     EXPECT_EQ(m.writer_epoch, 9u);
     EXPECT_EQ(m.min_active, 5u);
-    EXPECT_EQ(m.observed_gc_round, 9u);
     EXPECT_EQ(m.seq, 1u);
     EXPECT_FALSE(m.gc_fenced);
 }
 
-TEST(CasHeartbeat, RenewRereadsBothCallbacksAndBumpsSeq)
+TEST(CasHeartbeat, RenewRereadsCallbackAndBumpsSeq)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     Layout layout("pool");
@@ -62,22 +59,19 @@ TEST(CasHeartbeat, RenewRereadsBothCallbacksAndBumpsSeq)
     const UInt128 uuid(0x1234);
     uint64_t now_ms = 1000;
     uint64_t min_active_now = 5;
-    uint64_t observed_round_now = 9;
     seedOwnClaim(*backend, layout, srid, uuid, /*epoch=*/9, now_ms, /*ttl_ms=*/100);
 
     MountLeaseKeeper keeper(backend, layout, srid, uuid, /*writer_epoch=*/9, std::chrono::milliseconds(100),
-                            [&] { return now_ms; }, [&] { return min_active_now; }, [&] { return observed_round_now; });
+                            [&] { return now_ms; }, [&] { return min_active_now; });
     keeper.start();
 
-    /// Both dynamic fields move; the renewal re-reads both off the callbacks and bumps seq.
+    /// The dynamic field moves; the renewal re-reads it off the callback and bumps seq.
     now_ms = 1500;
     min_active_now = 8;
-    observed_round_now = 12;
     keeper.renewOnce();
 
     auto m = decodeMountLease(backend->get(layout.mountKey(srid))->bytes);
     EXPECT_EQ(m.min_active, 8u);
-    EXPECT_EQ(m.observed_gc_round, 12u);
     EXPECT_EQ(m.seq, 2u);
     EXPECT_EQ(m.expires_at_ms, 1500u + 100u);
 }
@@ -92,7 +86,7 @@ TEST(CasHeartbeat, StopStampsExpiredAndFarewellSentinel)
     seedOwnClaim(*backend, layout, srid, uuid, /*epoch=*/9, now_ms, /*ttl_ms=*/100);
 
     MountLeaseKeeper keeper(backend, layout, srid, uuid, /*writer_epoch=*/9, std::chrono::milliseconds(100),
-                            [&] { return now_ms; }, [] { return uint64_t{5}; }, [] { return uint64_t{9}; });
+                            [&] { return now_ms; }, [] { return uint64_t{5}; });
     keeper.start();
 
     now_ms = 2000;
@@ -115,7 +109,7 @@ TEST(CasHeartbeat, ForeignTouchMakesRenewThrow)
     seedOwnClaim(*backend, layout, srid, uuid, /*epoch=*/9, now_ms, /*ttl_ms=*/100);
 
     MountLeaseKeeper keeper(backend, layout, srid, uuid, /*writer_epoch=*/9, std::chrono::milliseconds(100),
-                            [&] { return now_ms; }, [] { return uint64_t{5}; }, [] { return uint64_t{9}; });
+                            [&] { return now_ms; }, [] { return uint64_t{5}; });
     keeper.start();
 
     /// A foreign incarnation overwrites the slot: the single-writer contract fails closed on renew.
@@ -174,7 +168,7 @@ TEST(CasMountAudit, KeeperAdoptEmitsClaimAndTerminateEmitsRelease)
     std::vector<CasEvent> seen;
     CasEventSink sink = [&](const CasEvent & e) { seen.push_back(e); };
     MountLeaseKeeper keeper(backend, layout, srid, uuid, /*writer_epoch=*/9, std::chrono::milliseconds(100),
-                            [&] { return now_ms; }, [] { return uint64_t{5}; }, [] { return uint64_t{9}; }, sink);
+                            [&] { return now_ms; }, [] { return uint64_t{5}; }, sink);
     keeper.start();
 
     ASSERT_EQ(seen.size(), 1u);
@@ -210,7 +204,7 @@ TEST(CasMountAudit, KeeperForeignConflictRefusesAndNamesHolder)
     std::vector<CasEvent> seen;
     CasEventSink sink = [&](const CasEvent & e) { seen.push_back(e); };
     MountLeaseKeeper keeper(backend, layout, srid, uuid_y, /*writer_epoch=*/1, std::chrono::milliseconds(100),
-                            [&] { return now_ms; }, [] { return uint64_t{5}; }, [] { return uint64_t{9}; }, sink);
+                            [&] { return now_ms; }, [] { return uint64_t{5}; }, sink);
 
     bool threw = false;
     try
@@ -241,7 +235,7 @@ TEST(CasHeartbeat, StopBeforeStartIsQuietNoOp)
     Layout layout("pool");
     uint64_t now_ms = 1000;
     MountLeaseKeeper keeper(backend, layout, "a", UInt128{1}, /*writer_epoch=*/1, std::chrono::milliseconds(10'000),
-                            [&] { return now_ms; }, [] { return uint64_t{0}; }, [] { return uint64_t{0}; });
+                            [&] { return now_ms; }, [] { return uint64_t{0}; });
     /// start() never called.
     EXPECT_NO_THROW(keeper.stop());
     EXPECT_NO_THROW(keeper.stop());
@@ -275,7 +269,7 @@ TEST(CasMountAudit, KeeperAdoptRefusesFencedSelfWithTypedError)
     CasEventSink sink = [&](const CasEvent & e) { seen.push_back(e); };
     /// A keeper for the SAME (uuid, epoch) tries to adopt the now-fenced slot.
     MountLeaseKeeper keeper(backend, layout, srid, uuid, /*writer_epoch=*/9, std::chrono::milliseconds(100),
-                            [&] { return now_ms; }, [] { return uint64_t{5}; }, [] { return uint64_t{9}; }, sink);
+                            [&] { return now_ms; }, [] { return uint64_t{5}; }, sink);
 
     bool threw = false;
     try
@@ -311,7 +305,7 @@ TEST(CasHeartbeat, RenewOverFencedOwnSlotIsClassifiedNotForeign)
     std::vector<CasEvent> seen;
     CasEventSink sink = [&](const CasEvent & e) { seen.push_back(e); };
     MountLeaseKeeper keeper(backend, layout, srid, uuid, /*writer_epoch=*/9, std::chrono::milliseconds(100),
-                            [&] { return now_ms; }, [] { return uint64_t{5}; }, [] { return uint64_t{9}; }, sink);
+                            [&] { return now_ms; }, [] { return uint64_t{5}; }, sink);
     keeper.start();
     seen.clear();
 

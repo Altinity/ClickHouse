@@ -148,7 +148,6 @@ Cas::RoundReport CasGcScheduler::runRoundLogged(Cas::Gc & gc, GcRoundLogRecord::
         fin.entries_graduated = rep.graduated;
         fin.entries_redeleted = rep.redeleted;
         fin.fence_outs = rep.fence_outs;
-        fin.min_ack = rep.min_ack;
         fin.anomalies = rep.anomalies.size();
         fin.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count();

@@ -62,15 +62,13 @@ public:
 
 protected:
     /// Per-call payload prepared OFF the state lock and handed to `encodeBody`. Subclasses needing
-    /// dynamic values (the mount lease's `now_ms` + merged `min_active` / `observed_gc_round`) carry
-    /// them through this opaque token. `value2` is a second scalar for slots that renew more than one
-    /// dynamic field per beat (the merged heartbeat: `value` = now_ms, `value2` = min_active,
-    /// `value3` = observed_gc_round).
+    /// dynamic values (the mount lease's `now_ms` + merged `min_active`) carry them through this opaque
+    /// token. `value2` is a second scalar for slots that renew more than one dynamic field per beat (the
+    /// merged heartbeat: `value` = now_ms, `value2` = min_active).
     struct RenewPayload
     {
         uint64_t value = 0;
         uint64_t value2 = 0;
-        uint64_t value3 = 0;
     };
 
     using Token = ::DB::Cas::Token;

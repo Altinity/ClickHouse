@@ -76,12 +76,11 @@ struct RoundReport
     uint64_t replaced = 0;        /// 412-saves — a health metric
     uint64_t spared = 0;
     uint64_t manifests_deleted = 0;  /// owner-removed manifest bodies deleted (B11 — distinct from blob deletes)
-    /// Ack-floor observability (Task 11): the retired-cursor pipeline's per-round transitions.
+    /// Retired-cursor pipeline observability (Task 11): the pipeline's per-round transitions.
     size_t condemned = 0;         /// entries newly condemned into the retired list this round
     size_t graduated = 0;         /// entries newly floor-passed (published delete_pending) this round
     size_t redeleted = 0;         /// pending deletes executed this round (exact-token blob deletes)
     size_t fence_outs = 0;        /// expired mounts fenced-out by the round's heartbeat floor
-    uint64_t min_ack = 0;         /// the heartbeat ack floor latched at round start (UINT64_MAX = no counted heartbeats)
     /// Task 5: per-hash freshness META write ops (condemn/spare/delete) that threw on the bounded pool
     /// this round. Advisory-only failures (never wedge the round) but a persistently non-zero count means
     /// the writer's meta point-read gate is drifting from the ledger -- an operator signal, not a protocol
@@ -246,10 +245,12 @@ private:
     /// guess a delta, never throw/wedge (feedback_ca_gc_never_throw_on_404).
     /// On success `state` carries the committed snap_generation and `state_token` the committed gc/state
     /// token. The committed pair is THREADED into retire, never re-read (zombie-steal protection).
-    /// Ack-floor: `min_ack` is the heartbeat floor computed at round start; the fold's three-cursor
-    /// merge graduates/condemns against it (condemn_round = state.round + 1). The fold no longer CASes
-    /// gc/state — it sets (snap_generation, snap_attempt) in-memory; the SINGLE round CAS commits them.
-    FoldResult fold(GcState & state, Token & state_token, RoundReport & report, uint64_t min_ack);
+    /// Round-paced graduation: `current_round` (= state.round + 1, the SAME basis condemn_round is
+    /// stamped at) is the threshold the fold's three-cursor merge graduates/condemns against — an entry
+    /// graduates once `condemn_round < current_round`, i.e. it survived at least one full round after
+    /// being condemned. The fold no longer CASes gc/state — it sets (snap_generation, snap_attempt)
+    /// in-memory; the SINGLE round CAS commits them.
+    FoldResult fold(GcState & state, Token & state_token, RoundReport & report, uint64_t current_round);
 
     /// Read ONE part manifest named by `id`, validate it, and append sign*(+1) blob deltas for each
     /// blob entry to `deltas`. On sign<0 queue (id -> token) into mf_cleanup. Returns whether a body was
@@ -305,12 +306,12 @@ private:
     /// read), so `runRegularRound` can decide DEFER-vs-FOLD before paying the fold's cost.
     ///
     /// True iff any entry in the CURRENT retired lists (dereferenced through `state.retired_refs`) is
-    /// due to delete/graduate this round (`delete_pending` OR `condemn_round < min_ack`). This is the
-    /// load-bearing SAFETY signal (Task-1 TLA+ gate, GREEN): it forces a fold before any destructive
+    /// due to delete/graduate this round (`delete_pending` OR `condemn_round < current_round`). This is
+    /// the load-bearing SAFETY signal (Task-1 TLA+ gate, GREEN): it forces a fold before any destructive
     /// decision. FAIL-CLOSED: a missing retired list is corrupt destructive bookkeeping — returns TRUE
     /// (forces a fold so the round's own fail-closed path surfaces it), matching `fold`'s existing
     /// throw-on-missing-retired-list treatment; a round must never silently defer on corrupt bookkeeping.
-    bool graduationDue(const GcState & state, uint64_t min_ack);
+    bool graduationDue(const GcState & state, uint64_t current_round);
 
     /// The number of present shards whose LIST-discovered token differs from what the adopted fold seal
     /// recorded (= the count of non-`Skip` `DiscoverDecision`s `computeDiscoverDecisions` would make
@@ -413,9 +414,9 @@ public:
 
     /// TEST SEAM (Task 3): expose the two cheap pre-fold GC round-defer signals so unit tests can
     /// assert them directly without driving a full round.
-    bool graduationDueForTest(const GcState & state, uint64_t min_ack)
+    bool graduationDueForTest(const GcState & state, uint64_t current_round)
     {
-        return graduationDue(state, min_ack);
+        return graduationDue(state, current_round);
     }
 
     size_t changedShardCountForTest(const GcState & state)

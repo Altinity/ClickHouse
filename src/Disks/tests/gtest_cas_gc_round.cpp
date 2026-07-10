@@ -95,12 +95,12 @@ bool anyRetiredPending(InMemoryBackend & b, const Store & s)
     return false;
 }
 
-/// Drive a Gc to fixpoint over the ACK-FLOOR round: run rounds, advancing the store's own mount ack after
-/// each (`renewWatermarkOnce` runs the beat so `observed_gc_round` follows the committed round and the
-/// heartbeat floor advances). A condemned blob traverses the multi-round condemn -> graduate -> delete
-/// pipeline, so "fixpoint" is reached only when a round did NO work AND the current retired list is empty
-/// (nothing still in flight). Returns the number of rounds that held the lease and did work. Bounded so a
-/// non-converging core fails downstream assertions rather than hanging.
+/// Drive a Gc to fixpoint over the round-paced retired-cursor pipeline: run rounds, renewing the store's
+/// own heartbeat after each (`renewWatermarkOnce` — keeps the lease + build-watermark floor current;
+/// graduation itself paces on rounds alone). A condemned blob traverses the multi-round condemn ->
+/// graduate -> delete pipeline, so "fixpoint" is reached only when a round did NO work AND the current
+/// retired list is empty (nothing still in flight). Returns the number of rounds that held the lease and
+/// did work. Bounded so a non-converging core fails downstream assertions rather than hanging.
 size_t driveToFixpoint(InMemoryBackend & backend, const StorePtr & store, Gc & gc)
 {
     size_t working_rounds = 0;
@@ -907,10 +907,10 @@ TEST(CasGcSnapRetention, WholesalePruneReclaimsAllAttemptsIncludingRetiredOutcom
 
     /// The drop was necessary to move the seal's blob_target ref off `old_gen` so it could age out (under
     /// T0 a still-referenced generation is deliberately retained — see the comment above). The blob is
-    /// condemned by the drop but stays present: these rounds never advance the mount ack floor
-    /// (`renewWatermarkOnce`), so it never graduates to a delete — retire drain is not the property under
-    /// test here.
-    EXPECT_TRUE(blobExists(*backend, store->layout(), DB::UInt128(1)));
+    /// condemned by the drop and, being round-paced, graduates and is physically deleted well within the
+    /// 8 quiescent rounds above — retire drain is not the property under test here (generation retention
+    /// is), so this only asserts the reclaim pipeline is not itself broken by the retention plumbing.
+    EXPECT_FALSE(blobExists(*backend, store->layout(), DB::UInt128(1)));
     /// The owner-removed manifest body IS reclaimed by the part-manifest cleanup pass over the aging rounds.
     EXPECT_FALSE(manifestExists(*backend, store->layout(), ManifestId{ns, r}));
 }

@@ -28,7 +28,6 @@ namespace ProfileEvents
     extern const Event CasGcRetireReplaced;
     extern const Event CasGcPrecommitRevisitForced;
     extern const Event CasGcHeartbeatFenceOuts;
-    extern const Event CasGcFloorHeldByStaleAck;
     extern const Event CasGcMetaWriteAnomaly;
 }
 
@@ -222,51 +221,29 @@ RoundReport Gc::runRegularRound()
     /// after `meta_pool->wait()`, below).
     meta_anomaly_count.store(0, std::memory_order_relaxed);
 
-    /// ONE-PASS ack-floor round (spec 2026-07-02 + Task-9 amendment). There is no crash-resume step
-    /// anymore: the round commits everything in the SINGLE gc/state CAS at the end, so a crashed pass
-    /// leaves only attempt-scoped debris that is never adopted (retention prunes it), and every
-    /// destructive PRE-CAS action below is justified by PREVIOUSLY PUBLISHED durable state only
-    /// (delete_pending entries), so replay under a fresh attempt is idempotent.
+    /// ONE-PASS round. There is no crash-resume step anymore: the round commits everything in the
+    /// SINGLE gc/state CAS at the end, so a crashed pass leaves only attempt-scoped debris that is
+    /// never adopted (retention prunes it), and every destructive PRE-CAS action below is justified by
+    /// PREVIOUSLY PUBLISHED durable state only (delete_pending entries), so replay under a fresh
+    /// attempt is idempotent.
 
     const Layout & layout = store->layout();
     Backend & backend = store->backend();
     const uint64_t new_round = state.round + 1;
 
-    /// R1: the heartbeat ack floor + token-guarded fence-out of expired mounts. The ONLY clock in the
-    /// round (the inherited lease-expiry contract); margin = ttl/2 (poll granularity + wall skew).
-    /// ORDER INVARIANT (CaGcAckFloorZombie): the floor MUST be latched BEFORE the fold cut. A floor
-    /// (re-)read after folding would see acks advertised by writers whose in-flight commits landed
-    /// AFTER the cut — invisible to this pass's in-degrees — and a fresh graduation could go pending
-    /// over a live reference. Never move this call below fold, never refresh the floor mid-pass.
+    /// R1: token-guarded fence-out of expired mounts (liveness only — graduation itself paces on GC
+    /// rounds via `new_round`, not on heartbeat acks). The ONLY clock in the round (the inherited
+    /// lease-expiry contract); margin = ttl/2 (poll granularity + wall skew).
     const uint64_t skew_margin_ms =
         static_cast<uint64_t>(store->poolConfig().mount_lease_ttl_ms.count()) / 2;
     const HeartbeatFloor floor = computeHeartbeatFloor(backend, layout, now_ms_fn(), skew_margin_ms);
-    report.min_ack = floor.min_ack;
     report.fence_outs = floor.fenced_now;
     if (floor.fenced_now > 0)
         ProfileEvents::increment(ProfileEvents::CasGcHeartbeatFenceOuts, floor.fenced_now);
 
-    /// Stale-ack watchdog (Task 11): a live heartbeat whose ack lags the last-published round by more
-    /// than 2 is holding the graduation floor down while still alive (a stuck view-refresh, not a dead
-    /// server the fence-out reclaims). Name each such server so the operator can act BEFORE the fence.
-    bool floor_held_by_stale_ack = false;
-    for (const auto & [srid, ack] : floor.lagging)
-    {
-        if (state.round > 2 && ack < state.round - 2)
-        {
-            floor_held_by_stale_ack = true;
-            LOG_WARNING(getLogger("CasGc"),
-                "CAS gc: live heartbeat '{}' acked round {} but the published round is {} (lag > 2); it "
-                "holds the graduation floor down — investigate a stuck view refresh on that server",
-                srid, ack, state.round);
-        }
-    }
-    if (floor_held_by_stale_ack)
-        ProfileEvents::increment(ProfileEvents::CasGcFloorHeldByStaleAck);
-
     /// GcFenceOut audit row per expired mount fenced-out this round: the round latched a fence-out to
-    /// re-arm a sleeper's write fence (its held token is now invalid) AND stop its stale ack from
-    /// pinning the floor forever. One row per srid so the log reconstructs which mount was reclaimed.
+    /// re-arm a sleeper's write fence (its held token is now invalid). One row per srid so the log
+    /// reconstructs which mount was reclaimed.
     for (const String & srid : floor.fenced_srids)
         EventEmitter{*store}.emit([&](CasEvent & e)
         {
@@ -276,11 +253,11 @@ RoundReport Gc::runRegularRound()
             e.gen = state.snap_generation;
             e.outcome = "fenced";
             e.reason = "expired mount lease past skew margin; token-guarded fence-out re-arms the write "
-                       "fence (prevents a resumed sleeper from mutating) and drops its stale ack from the floor";
+                       "fence (prevents a resumed sleeper from mutating)";
             e.detail = {{"srid", srid}};
         });
 
-    /// B170: the round's floor — the fence's successor record (what gates this round's graduations).
+    /// B170: the round's heartbeat classification (what mounts are live/terminated/fenced this round).
     EventEmitter{*store}.emit([&](CasEvent & e)
     {
         e.type = CasEventType::GcFence;
@@ -288,9 +265,8 @@ RoundReport Gc::runRegularRound()
         e.round = new_round;
         e.gen = state.snap_generation;
         e.outcome = "floor";
-        e.reason = "R1: heartbeat ack floor (min over live + expired-unfenced observed_gc_round)";
-        e.detail = {{"min_ack", floor.min_ack == UINT64_MAX ? String("inf") : std::to_string(floor.min_ack)},
-                    {"live", std::to_string(floor.live)},
+        e.reason = "R1: heartbeat classification (live/terminated/fenced mounts)";
+        e.detail = {{"live", std::to_string(floor.live)},
                     {"terminated", std::to_string(floor.terminated)},
                     {"fenced_now", std::to_string(floor.fenced_now)},
                     {"already_fenced", std::to_string(floor.already_fenced)}};
@@ -301,7 +277,7 @@ RoundReport Gc::runRegularRound()
     /// slow idle/small-delta round no longer rebuilds the whole in-degree snapshot. Safety: a due
     /// graduation forces a FOLD (graduationDue), so no destructive decision runs on a stale snapshot.
     {
-        const bool graduation_due = graduationDue(state, floor.min_ack);
+        const bool graduation_due = graduationDue(state, new_round);
         const size_t changed = changedShardCount(state);
         if (shouldDeferRound(changed, graduation_due, rounds_since_last_fold_,
                              store->poolConfig().gc_fold_threshold,
@@ -346,7 +322,7 @@ RoundReport Gc::runRegularRound()
         parent_seal_runs = parent_seal->blob_target_runs;
 
     /// R2: the pass — discovery, windows, and the three-cursor merge (spare / graduate / condemn).
-    FoldResult folded = fold(state, state_token, report, floor.min_ack);
+    FoldResult folded = fold(state, state_token, report, new_round);
 
     EventEmitter{*store}.emit([&](CasEvent & e)
     {
@@ -455,7 +431,7 @@ RoundReport Gc::runRegularRound()
                 e.round = new_round;
                 e.gen = generation;
                 e.outcome = "pending";
-                e.reason = "condemn_round < min_ack; published delete_pending (two-phase graduation)";
+                e.reason = "condemn_round < current_round; published delete_pending (two-phase graduation)";
                 e.detail = {{"condemn_round", std::to_string(entry.condemn_round)}};
             });
         }
@@ -710,7 +686,7 @@ bool Gc::foldManifestEdges(const ManifestId & id, int sign, std::vector<BlobDelt
     return true;
 }
 
-Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & report, uint64_t min_ack)
+Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & report, uint64_t current_round)
 {
     Backend & backend = store->backend();
     const Layout & layout = store->layout();
@@ -1138,7 +1114,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             foldDeltasIntoGeneration(backend, layout, priorRunsFor(0),
                                      new_generation, attempt, /*shard*/0,
                                      std::move(deltas), result.fold_seal.blob_target_runs,
-                                     prior_retired[0], min_ack, condemn_round, head_blob, peek_head,
+                                     prior_retired[0], current_round, condemn_round, head_blob, peek_head,
                                      &result.retired_merge[0], suppress_destructive);
         }
     }
@@ -1172,7 +1148,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
                 reducer.reduce(backend, layout, priorRunsFor(shard),
                                new_generation, attempt,
                                std::move(buckets[shard]),
-                               prior_retired[shard], min_ack, condemn_round, head_blob, peek_head,
+                               prior_retired[shard], current_round, condemn_round, head_blob, peek_head,
                                &result.retired_merge[shard], suppress_destructive);
             for (RunRef & r : shard_runs)
                 result.fold_seal.blob_target_runs.push_back(std::move(r));
@@ -1664,7 +1640,7 @@ std::map<String, Gc::DiscoverDecision> Gc::discoverDecisionsForTest()
     return computeDiscoverDecisions(ref_seal);
 }
 
-bool Gc::graduationDue(const GcState & state, uint64_t min_ack)
+bool Gc::graduationDue(const GcState & state, uint64_t current_round)
 {
     Backend & backend = store->backend();
     for (const auto & [retired_shard, retired_key] : state.retired_refs)
@@ -1675,7 +1651,7 @@ bool Gc::graduationDue(const GcState & state, uint64_t min_ack)
             /// Force a fold so the round's existing fail-closed path surfaces it, never silently defer.
             return true;
         for (const RetiredEntry & e : decodeRetiredSet(got->bytes).entries)
-            if (e.delete_pending || e.condemn_round < min_ack)
+            if (e.delete_pending || e.condemn_round < current_round)
                 return true;
     }
     return false;
@@ -2008,12 +1984,13 @@ RebuildReport Gc::rebuildBaseline(bool force)
         }
     }
 
-    /// Numbering, part 2: the round above EVERY surviving ack — a low round would let stale mount
-    /// acks float fresh condemnations past the floor before any writer re-observed the new list.
+    /// Numbering, part 2: the round above every surviving fence/state/generation number. Also fence out
+    /// any expired mounts as part of the disaster-recovery pass (liveness cleanup; the returned
+    /// classification counts are not needed for the round mint — graduation paces on rounds, not acks).
     const uint64_t skew_margin_ms =
         static_cast<uint64_t>(store->poolConfig().mount_lease_ttl_ms.count()) / 2;
-    const HeartbeatFloor floor = computeHeartbeatFloor(backend, layout, now_ms_fn(), skew_margin_ms);
-    const uint64_t round = std::max({floor.max_ack, max_fence_round, state.round, max_gen}) + 1;
+    computeHeartbeatFloor(backend, layout, now_ms_fn(), skew_margin_ms);
+    const uint64_t round = std::max({max_fence_round, state.round, max_gen}) + 1;
 
     /// Seal (deterministic artifact) + the single state CAS. attempt = the max per-shard attempt
     /// (>= 1 so the seal key is stable даже for an empty universe).

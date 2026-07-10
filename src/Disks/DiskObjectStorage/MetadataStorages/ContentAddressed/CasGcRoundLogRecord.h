@@ -33,7 +33,6 @@ struct GcRoundLogRecord
     UInt64 entries_graduated = 0;   /// entries newly floor-passed (published delete_pending) this round
     UInt64 entries_redeleted = 0;   /// pending exact-token blob deletes executed this round
     UInt64 fence_outs = 0;          /// expired mounts fenced-out by the round's heartbeat floor
-    UInt64 min_ack = 0;             /// heartbeat ack floor latched at round start (UINT64_MAX = empty floor set)
     UInt64 anomalies = 0;           /// fold clamps surfaced (never wedging) this round
     UInt64 duration_ms = 0;
     String error;

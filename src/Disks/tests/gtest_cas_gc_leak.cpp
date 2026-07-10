@@ -63,11 +63,11 @@ bool anyRetiredPending(const StorePtr & s)
     return false;
 }
 
-/// Drive regular GC to a fixpoint over the ACK-FLOOR round. A condemned blob is not deleted in the round
-/// that folds its removal: it condemns, then graduates once the ack floor passes it, then the NEXT pass
-/// deletes it. So the loop advances the store's own mount ack after each round (`renewWatermarkOnce` runs
-/// the beat so `observed_gc_round` follows the committed round) and stays alive while ANY work counter is
-/// nonzero OR the current retired list still holds an in-flight entry.
+/// Drive regular GC to a fixpoint. A condemned blob is not deleted in the round that folds its removal:
+/// it condemns, then graduates the round after (round-paced, unconditional), then the NEXT pass deletes
+/// it. The loop renews the store's own heartbeat after each round (`renewWatermarkOnce`, unrelated to
+/// graduation timing but keeping the build-watermark floor and lease current) and stays alive while ANY
+/// work counter is nonzero OR the current retired list still holds an in-flight entry.
 size_t runGcToFixpoint(const StorePtr & s, Gc & gc, size_t max_rounds = 64)
 {
     size_t rounds = 0;
@@ -303,8 +303,8 @@ TEST(CasGcLeak, DroppedPartFullyReclaimed)
 
 /// NO-LEAK (resurrect-reupload): a blob incarnation A is published, dropped, and condemned by ONE GC
 /// round (retired, NOT yet deleted — it is still mid-pipeline). A fresh build then dedup-hits the SAME
-/// content hash: `putBlob` HEADs A, sees it condemned via `retireView().isCondemnedToken`, and — per
-/// INV-1 (revival-from-source) — re-uploads a DISTINCT incarnation B at the same content-addressed key
+/// content hash: `putBlob` HEADs A, sees it condemned via the per-hash freshness meta point-read, and —
+/// per INV-1 (revival-from-source) — re-uploads a DISTINCT incarnation B at the same content-addressed key
 /// (fresh `incarnation_tag`, never a GET of the dying object A). B is referenced by a second ref, then
 /// that ref is dropped too. GC must fold B's own activation/removal exactly like any other incarnation
 /// and reclaim it to a fixpoint: no blob object may remain for the content hash and the in-degree
@@ -333,9 +333,11 @@ TEST(CasGcLeak, ResurrectReplacedIncarnationReclaimed)
     /// 3. ONE GC round: A transitions to in-degree 0 and is condemned (retired), NOT yet deleted.
     Gc gc(s, hexToU128("00000000000000000000000000000004"));
     gc.runRegularRound();
-    s->retireView().refresh();
-    ASSERT_TRUE(s->retireView().isCondemnedToken(ObjectKind::Blob, u128Of(P), hA.token))
-        << "precondition: token A must be condemned before the resurrect";
+    {
+        const auto lm = DB::Cas::tests::loadMetaForTest(*b, s->layout(), u128Of(P));
+        ASSERT_TRUE(lm.has_value() && lm->meta.state == MetaState::Condemned)
+            << "precondition: token A must be condemned before the resurrect";
+    }
     ASSERT_TRUE(blobPresent(b, s->layout(), P)) << "A not yet deleted (still in the pipeline)";
 
     /// 4. RESURRECT: a fresh build dedup-hits P; putBlob sees A condemned -> re-uploads a DISTINCT
@@ -381,7 +383,6 @@ TEST(CasGcLeak, ResurrectReplacedReclaimIsIdempotent)
     /// 2. ONE GC round: A transitions to in-degree 0 and is condemned (retired), NOT yet deleted.
     Gc gc(s, hexToU128("00000000000000000000000000000005"));
     gc.runRegularRound();
-    s->retireView().refresh();
 
     /// 3. RESURRECT: r2 dedup-hits P while A is condemned -> mints a fresh incarnation B.
     publishOneBlobPart(s, ns, "r2", P);
@@ -412,14 +413,16 @@ TEST(CasGcLeak, ResurrectReplacedReclaimIsIdempotent)
 
 /// WRITER-SIDE half of the RESURRECT-REUPLOAD-ORPHAN fold: after the round that folds the resurrect-
 /// replaced incarnation B's dereference re-condemns B, a fresh writer dedup-hitting the SAME content hash
-/// must see B as condemned via `retireView().isCondemnedToken` — never as an adoptable live token. If GC's
-/// bookkeeping instead kept treating B as adopt-eligible (the pre-fix bug), a concurrent writer's `putBlob`
-/// would adopt the being-reclaimed B rather than resurrect a fresh incarnation, racing the delete pipeline.
+/// must see B as condemned via the per-hash freshness meta point-read — never as an adoptable live token.
+/// If GC's bookkeeping instead kept treating B as adopt-eligible (the pre-fix bug), a concurrent writer's
+/// `putBlob` would adopt the being-reclaimed B rather than resurrect a fresh incarnation, racing the
+/// delete pipeline.
 ///
-/// Depending on round/ack-floor timing, by the time the view refreshes B may be (a) still present and
-/// visibly condemned, or (b) already physically deleted by the delete pipeline — BOTH outcomes prove B is
-/// never adoptable. The assertion only fails on the pre-fix shape: B present and NOT condemned.
-TEST(CasGcLeak, ResurrectReplacedTokenIsCondemnedInRetireView)
+/// Depending on round timing, by the time the meta is checked B may be (a) still present and visibly
+/// condemned, or (b) already physically deleted by the delete pipeline (meta dropped alongside it) — BOTH
+/// outcomes prove B is never adoptable. The assertion only fails on the pre-fix shape: B present and NOT
+/// condemned.
+TEST(CasGcLeak, ResurrectReplacedTokenIsCondemnedInMeta)
 {
     std::shared_ptr<InMemoryBackend> b;
     auto s = openTestStore(b);
@@ -434,7 +437,6 @@ TEST(CasGcLeak, ResurrectReplacedTokenIsCondemnedInRetireView)
     s->dropRef(ns, "r1");
     s->renewWatermarkOnce();   /// advance the floor so A is not spared as in-flight
     gc.runRegularRound();
-    s->retireView().refresh();
 
     /// 2. RESURRECT: r2 dedup-hits P while A is condemned -> mints a fresh incarnation B.
     publishOneBlobPart(s, ns, "r2", P);
@@ -446,10 +448,9 @@ TEST(CasGcLeak, ResurrectReplacedTokenIsCondemnedInRetireView)
 
     /// 3. The round that folds B's dereference re-condemns token B.
     gc.runRegularRound();
-    s->retireView().refresh();
 
-    EXPECT_TRUE(s->retireView().isCondemnedToken(ObjectKind::Blob, u128Of(P), hB.token)
-        || !blobPresent(b, s->layout(), P))
+    const auto lm = DB::Cas::tests::loadMetaForTest(*b, s->layout(), u128Of(P));
+    EXPECT_TRUE((lm.has_value() && lm->meta.state == MetaState::Condemned) || !blobPresent(b, s->layout(), P))
         << "the replaced incarnation B must be visible as condemned (or already reclaimed) so a "
            "dedup-hitting writer resurrects, not adopts";
 }

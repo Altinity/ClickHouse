@@ -4,7 +4,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasPoolMeta.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRetireView.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestCodec.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestId.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootShardCodec.h>
@@ -268,8 +267,8 @@ struct MountFence
 class Store : public std::enable_shared_from_this<Store>
 {
     /// Build drives the manifest publish CAS through the private mutateShard/shardOf: the gate logic
-    /// (W-PUBLISH-GATE) is Build's responsibility (it owns deps/retireView access), but the CAS loop
-    /// itself is the verified Store loop — reused, never duplicated.
+    /// (W-PUBLISH-GATE) is Build's responsibility (it owns the per-hash freshness-meta point-read), but
+    /// the CAS loop itself is the verified Store loop — reused, never duplicated.
     friend class Build;
     /// Gc drives the manifest fence CAS (R3) through the same private mutateShard loop — reused,
     /// never duplicated (the lease itself only needs the public accessors).
@@ -290,21 +289,11 @@ public:
     /// The GC floor: the oldest in-flight build_seq, or next_build_seq when no build is active (so a
     /// quiescent server's watermark floor advances to the next-to-be-allocated seq). Locks builds_mutex.
     uint64_t minActive();
-    /// The GC round the retired view is CURRENTLY INSTALLED at (spec 2026-07-06-decouple). Cheap,
-    /// in-memory — the value the lease renewal advertises as `observed_gc_round`. Race-safe against
-    /// the retired-view syncer via `RetireView`'s own internal shared_mutex; takes no Store lock.
-    uint64_t observedGcRound() const;
     /// Test/assertion accessor for the next-to-allocate build_seq under the lock.
     uint64_t peekNextBuildSeq();
-    /// Renew the merged heartbeat once (bump seq, refresh min_active from the live callback, stamp the
-    /// last-INSTALLED GC round via `observedGcRound()`, stamp a fresh expires_at_ms). The build-watermark
-    /// floor rides this beat after the ack-floor merge — there is no standalone watermark object. In
-    /// production this is driven by the background renewer (background_watermark), which no longer
-    /// depends on S3 (the retired-view syncer, Task 3, advances the installed round independently).
-    /// Redefined (spec 2026-07-06-decouple) as the composed test/manual driver: `syncRetiredView()`
-    /// THEN `mount_keeper->renewOnce()`, so a single call still makes `observed_gc_round` follow the
-    /// freshly-published round — the contract the GC pipeline tests rely on. Use `renewLeaseOnlyForTest`
-    /// to drive the isolated renewal path (renew without syncing).
+    /// Renew the merged heartbeat once (bump seq, refresh min_active from the live callback, stamp a
+    /// fresh expires_at_ms). The build-watermark floor rides this beat. In production this is driven by
+    /// the background renewer (background_watermark).
     void renewWatermarkOnce();
 
     /// ---- local write fence (spec §write-fence, Phase 0 Task 6) ----
@@ -383,7 +372,6 @@ public:
     const PoolMeta & poolMeta() const { return meta; }
     const Layout & layout() const { return pool_layout; }
     Backend & backend() { return *pool_backend; }
-    RetireView & retireView() { return retire_view; }
 
     /// The writer_epoch of the LIVE mount incarnation. Bumped by `tryRemountOnce` (self-remount
     /// after a GC fence-out) — a `Build` minted under an older epoch fails closed on its next step.
@@ -391,39 +379,12 @@ public:
 
     /// Self-remount after a GC fence-out (liveness counterpart of the fence-out safety rule): the
     /// OLD incarnation may never write again (the keeper never re-mints), but a FRESH incarnation —
-    /// durable writer_epoch bump + mount reclaim + fresh retired view + re-armed write fence — is
-    /// exactly what a server restart would create, so a live server may create it in place. Runs the
-    /// same claim machinery as `Store::open` (S13); a synchronous `syncRetiredView()` call primes the
-    /// view for the fresh incarnation before the new keeper's anchor (spec 2026-07-06-decouple — the
-    /// keeper's own renewal reads the installed round via `observedGcRound()`, it does not sync), so
-    /// open-ordering holds for the new incarnation too. Returns
-    /// false (and changes nothing durable beyond the epoch bump) when the mount cannot be claimed
-    /// (foreign owner / a genuinely live twin) — the caller retries. Safe to call concurrently
-    /// (serialized internally); also the synchronous test seam.
+    /// durable writer_epoch bump + mount reclaim + re-armed write fence — is exactly what a server
+    /// restart would create, so a live server may create it in place. Runs the same claim machinery as
+    /// `Store::open` (S13). Returns false (and changes nothing durable beyond the epoch bump) when the
+    /// mount cannot be claimed (foreign owner / a genuinely live twin) — the caller retries. Safe to
+    /// call concurrently (serialized internally); also the synchronous test seam.
     bool tryRemountOnce();
-
-    /// Retired-view sync (spec 2026-07-06-cas-lease-view-sync-decouple; formerly the ack-floor
-    /// "beat"): probe `gc/state`; when the published round advanced past the installed view, load and
-    /// install the retired view under `RetireView`'s own internal mutex. There is NO install drain
-    /// (spec 2026-07-09-cas-writer-gc-simplification D4): entry persistence + monotone installs mean a
-    /// graduated entry (condemned at round C) is in EVERY view >= C+1, and this writer's own advertised
-    /// round exceeded C before that graduation, so any later in-closure read sees the entry regardless
-    /// of install timing; displacement is exact-token-safe. Returns the round the view is installed at.
-    /// Any read failure leaves the view and the returned round UNCHANGED (fail-closed for the ack: never
-    /// claim a view that was not actually loaded). Runs on the dedicated retired-view syncer thread
-    /// (`retiredViewSyncLoop`) and, synchronously, at open/remount and in tests. It is NOT on the
-    /// lease-renewal path — the renewal advertises the already-installed round via `observedGcRound()`.
-    uint64_t syncRetiredView();
-
-    /// Retired-view syncer (spec 2026-07-06-cas-lease-view-sync-decouple): a dedicated background
-    /// thread that runs `syncRetiredView` on `mount_renew_period`, decoupled from the lease-renewal
-    /// thread so slow S3 view work can never delay a lease renewal past its TTL. Gated on
-    /// `background_watermark` like every background thread (production only; unit tests drive
-    /// `syncRetiredView` explicitly via `renewWatermarkOnce`, or start/stop this thread directly).
-    /// Started on writable open after the fence is armed; stopped+joined in the destructor before
-    /// `retire_view`/`pool_backend` die.
-    void startRetiredViewSync(std::chrono::milliseconds period);
-    void stopRetiredViewSync();   /// idempotent
 
     /// P1 known-present blob-hash cache (design 2026-06-20, B168). A HINT only — correctness never
     /// depends on it: a hit just makes putBlob go HEAD-first, and a stale hit is caught by that HEAD.
@@ -455,16 +416,9 @@ public:
     }
 
     /// Task 5: read the current GC round from `gc/state`. Returns 0 when `gc/state` is absent (pool
-    /// never GC'd). Used by `precommitAdd` to self-floor a NEWBORN ref-shard to the current round so
-    /// the `promote` gate forces a retire-view refresh before the shard's blobs can be committed.
+    /// never GC'd). Used by `precommitAdd` to self-floor a NEWBORN ref-shard's `fence_round` to the
+    /// current round (the birth floor, THM-NO-RETURN) — only on the create-if-absent branch.
     uint64_t currentGcRound() const;
-
-    /// Test seam (spec 2026-07-06-decouple): drive the ISOLATED lease renewal — renewOnce WITHOUT a
-    /// preceding view sync — so a test can prove the renewal path advertises only the installed round
-    /// and never loads the view. Production renewal runs this via the keeper's background thread;
-    /// `renewWatermarkOnce` is the composed (sync+renew) driver. Defined in CasStore.cpp beside
-    /// `renewWatermarkOnce` (needs `Exception`/`ErrorCodes::LOGICAL_ERROR`).
-    void renewLeaseOnlyForTest();
 
     /// B164b test seam: mutate root shard with explicit origin/kind for backpressure
     /// verification. Production code uses private `mutateShard` via Build/Gc friend
@@ -623,9 +577,7 @@ private:
     struct DedupWeight { size_t operator()(const DedupPresent &) const { return 64; } };
     using DedupCache = CacheBase<UInt128, DedupPresent, UInt128Hash, DedupWeight>;
     std::unique_ptr<DedupCache> dedup_cache;
-    /// pool_layout MUST precede retire_view: the ctor init list builds retire_view from pool_layout.
     Layout pool_layout;
-    RetireView retire_view;
     /// Per-server build watermark (spec 2026-06-16-ca-build-watermark). process_epoch is a random
     /// nonzero u64 minted once at open: GC checks it for EQUALITY (an object stamped with a different
     /// epoch is from a dead incarnation), never for ordering. next_build_seq is a strictly-increasing
@@ -657,14 +609,6 @@ private:
     std::condition_variable remount_cv;
     std::mutex remount_cv_mutex;
     ThreadFromGlobalPool remount_thread;
-
-    /// Retired-view syncer private state: `startRetiredViewSync`/`stopRetiredViewSync` (public, above,
-    /// next to `syncRetiredView`) start/stop this thread; the loop body itself stays private.
-    void retiredViewSyncLoop(std::chrono::milliseconds period);
-    std::mutex retired_view_sync_mutex;
-    std::condition_variable retired_view_sync_cv;
-    bool retired_view_sync_stop = false;   /// guarded by retired_view_sync_mutex
-    ThreadFromGlobalPool retired_view_sync_thread;
 
     /// Local write fence (spec §write-fence). Permissive by default (deadline = time_point::max,
     /// lost = false), so mayMutate() is true until Task 7 arms it with a real lease deadline and the

@@ -144,7 +144,7 @@ message MountLeaseProto {
   uint64    seq           = 7;
   uint64    expires_at_ms = 8;
   uint64    min_active     = 9;   // oldest in-flight build_seq; UINT64_MAX = retired (farewell)
-  uint64    observed_gc_round = 10;  // newest gc round whose retired list this server has loaded
+  reserved 10;  // was observed_gc_round; the writer-side retired-view ack floor was removed (v3 Task 6)
   bool      gc_fenced      = 11;  // set ONLY by GC fence-out of an expired lease; terminal
 }
 

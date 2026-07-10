@@ -75,10 +75,9 @@ TEST(CasGcRecheck, PublishRacingFenceSparesBlob)
     EXPECT_TRUE(blobExists(*backend, store->layout(), DB::UInt128(1)));
 }
 
-/// A genuinely unreferenced blob is deleted with its exact token (the single content-delete site). Under
-/// the ack-floor round the delete is no longer one-round-after-drop: the entry condemns, then graduates
-/// once the mount's ack passes the condemn round, then the NEXT pass executes the exact-token delete. The
-/// reclaim loop keeps the store's own ack current after each round, so the pipeline converges.
+/// A genuinely unreferenced blob is deleted with its exact token (the single content-delete site). The
+/// delete is not one-round-after-drop: the entry condemns, graduates the round AFTER the condemning
+/// round (round-paced, unconditional), then the NEXT pass executes the exact-token delete.
 TEST(CasGcRecheck, UnreferencedBlobDeletedExactToken)
 {
     auto backend = std::make_shared<InMemoryBackend>();
@@ -91,7 +90,7 @@ TEST(CasGcRecheck, UnreferencedBlobDeletedExactToken)
     Gc gc(store, kGc);
     gc.runRegularRound();
     dropRefTransition(*backend, store->layout(), ns, "tbl", r);
-    // The drop's -1 condemns blob 1; the ack-floor pipeline (condemn -> graduate -> delete) reclaims it.
+    // The drop's -1 condemns blob 1; the retired-cursor pipeline (condemn -> graduate -> delete) reclaims it.
     EXPECT_TRUE(runRoundsUntilAbsent(store, gc, *backend, store->layout(), DB::UInt128(1)));
     EXPECT_FALSE(backend->head(store->layout().manifestKey(ManifestId{ns, r})).exists);
 }
@@ -133,8 +132,7 @@ TEST(CasGcRetire, DeleteRemovesBodyAndMeta)
     Gc gc(store, kGc);
     gc.runRegularRound();
     dropRefTransition(*backend, store->layout(), ns, "tbl", r);
-    // condemn -> graduate -> delete (the ack-floor pipeline; runRoundsUntilAbsent keeps the mount's own
-    // ack current so the floor advances).
+    // condemn -> graduate (round-paced) -> delete (the retired-cursor pipeline).
     ASSERT_TRUE(runRoundsUntilAbsent(store, gc, *backend, store->layout(), DB::UInt128(1)));
 
     EXPECT_FALSE(blobExists(*backend, store->layout(), DB::UInt128(1))) << "body gone via exact-token delete";
@@ -296,7 +294,7 @@ TEST(CasGcRecheck, CompletionInheritsFoldAttempt)
         .foldSealKey(after_round2.snap_generation, after_round2.snap_attempt)).exists);
 }
 
-/// ---- ack-floor round protocol suite (spec 2026-07-02 + Task-9 amendment) ----
+/// ---- round-paced graduation suite (spec 2026-07-02 + Task-9 amendment; re-keyed off acks in v3 Task 6) ----
 
 /// A round performs NO fence writes to ref shards: the fence machinery is gone. A no-op round (no owner
 /// events, nothing to fold) leaves the discovered ref shard's token byte-unchanged (the old fence step
@@ -320,10 +318,13 @@ TEST(CasGcAckFloor, NoOpRoundDoesNotMutateRefShards)
     EXPECT_FALSE(backend->get("p/gc/registry").has_value());
 }
 
-/// The canonical pipeline: a blob condemned at round K stays present after the condemning round; the pass
-/// that graduates it (once every mount's ack passes K) publishes it delete_pending — the blob still
-/// exists; the NEXT pass executes the exact-token delete and the blob becomes absent.
-TEST(CasGcAckFloor, CondemnThenDeleteNextRoundAfterAcks)
+/// The canonical pipeline: a blob condemned at round K stays present after the condemning round; the
+/// VERY NEXT round graduates it (round-paced, unconditional — condemn_round < current_round the first
+/// round current_round exceeds it) and publishes it delete_pending — the blob still exists; the round
+/// AFTER THAT executes the exact-token delete and the blob becomes absent. This pins the critical
+/// off-by-one: current_round MUST equal state.round + 1 (the SAME basis condemn_round is stamped at),
+/// so an entry graduates exactly one round after it was condemned — never the same round, never never.
+TEST(CasGcAckFloor, CondemnThenGraduatesNextRoundThenDeletes)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openStoreForTest(backend);
@@ -336,94 +337,45 @@ TEST(CasGcAckFloor, CondemnThenDeleteNextRoundAfterAcks)
     Gc gc(store, kGc);
 
     gc.runRegularRound();                 // round 1: folds the +1; blob referenced
-    store->renewWatermarkOnce();
     dropRefTransition(*backend, store->layout(), ns, "tbl", r);
 
     // The condemning round: the -1 drops in-degree to 0; the blob is condemned into the current retired
     // list but NOT deleted. The entry is present and NOT yet pending. report.condemned counts it.
     {
         const RoundReport rep = gc.runRegularRound();
-        store->renewWatermarkOnce();
         EXPECT_EQ(rep.condemned, 1u);        // one blob condemned this round
-        EXPECT_EQ(rep.graduated, 0u);        // floor has not passed the condemn round yet
+        EXPECT_EQ(rep.graduated, 0u);        // must NOT graduate the same round it was condemned
         EXPECT_EQ(rep.redeleted, 0u);        // nothing pending to delete yet
         EXPECT_TRUE(blobExists(*backend, store->layout(), blob));
         const auto e = currentEntryFor(*backend, store->layout(), blob);
         ASSERT_TRUE(e.has_value());
-        EXPECT_FALSE(e->delete_pending);   // condemned, floor has not passed it yet
+        EXPECT_FALSE(e->delete_pending);   // condemned, not yet graduated
     }
 
-    // Drive rounds until the entry graduates (published delete_pending). It is still present at that pass,
-    // and the round that graduates it reports graduated == 1.
-    bool saw_pending = false;
-    for (int i = 0; i < 6 && !saw_pending; ++i)
+    // The VERY NEXT round graduates it deterministically (no ack/heartbeat dependency).
     {
         const RoundReport rep = gc.runRegularRound();
-        store->renewWatermarkOnce();
+        EXPECT_EQ(rep.graduated, 1u);
+        EXPECT_EQ(rep.redeleted, 0u);   // the delete lands on the NEXT pass, not this one
         const auto e = currentEntryFor(*backend, store->layout(), blob);
-        if (e && e->delete_pending)
-        {
-            saw_pending = true;
-            EXPECT_EQ(rep.graduated, 1u);   // the graduating round reports the floor-pass
-            EXPECT_EQ(rep.redeleted, 0u);   // the delete lands on the NEXT pass, not this one
-            EXPECT_TRUE(blobExists(*backend, store->layout(), blob));   // pending: still present this pass
-        }
+        ASSERT_TRUE(e.has_value());
+        EXPECT_TRUE(e->delete_pending);
+        EXPECT_TRUE(blobExists(*backend, store->layout(), blob));   // pending: still present this pass
     }
-    ASSERT_TRUE(saw_pending) << "entry never reached delete_pending";
 
     // The pass AFTER the pending publish executes the exact-token delete; the blob becomes absent and the
     // entry is dropped from the current retired list. report.redeleted counts the executed pending delete.
     {
         const RoundReport rep = gc.runRegularRound();
-        store->renewWatermarkOnce();
         EXPECT_EQ(rep.redeleted, 1u);        // the pending delete executed this round
         EXPECT_FALSE(blobExists(*backend, store->layout(), blob));
         EXPECT_FALSE(currentEntryFor(*backend, store->layout(), blob).has_value());
     }
 }
 
-/// A mount whose ack is stuck below the condemn round holds the floor down: the entry never graduates
-/// (stays non-pending, blob survives) — but the round itself still completes and advances gc/state.round.
-TEST(CasGcAckFloor, StaleAckHoldsTheFloorWithoutBlockingTheRound)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    /// gc_fold_max_defer_rounds=0: this test asserts gc/state.round strictly advances on EVERY one of
-    /// 5 consecutive rounds with no further writes -- exactly the genuinely-idle case Phase-4 Lever A
-    /// (spec 2026-07-06-cas-gc-round-skip-unchanged) is designed to defer once quiesced. Force
-    /// fold-every-round so this test keeps proving its own intent (a stale ack does not wedge/error
-    /// the round pipeline), independent of the skip-unchanged batching feature.
-    auto store = openStoreForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
-    const RootNamespace ns{"00/aa@cas@"};
-    const ManifestRef r = ref("srv-a:1", 1, 0xAA);
-    const UInt128 blob = DB::UInt128(1);
-    writeBlobBody(*backend, store->layout(), blob);
-    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", blob)});
-    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
-    Gc gc(store, kGc);
-
-    gc.runRegularRound();
-    dropRefTransition(*backend, store->layout(), ns, "tbl", r);
-
-    // Run rounds WITHOUT renewWatermarkOnce: the mount's observed_gc_round never advances, so min_ack
-    // stays pinned at the round the mount last acked (0 — the store opened before any round committed).
-    uint64_t prev_round = decodeGcState(backend->get(store->layout().gcStateKey())->bytes).round;
-    for (int i = 0; i < 5; ++i)
-    {
-        gc.runRegularRound();
-        const auto st = decodeGcState(backend->get(store->layout().gcStateKey())->bytes);
-        EXPECT_GT(st.round, prev_round);   // the round still advances
-        prev_round = st.round;
-        // The entry is condemned but never graduates: delete_pending stays false, blob survives.
-        const auto e = currentEntryFor(*backend, store->layout(), blob);
-        if (e)
-            EXPECT_FALSE(e->delete_pending);
-        EXPECT_TRUE(blobExists(*backend, store->layout(), blob));
-    }
-}
-
 /// A publish re-referencing the condemned blob before graduation is folded and SPARES the entry: the entry
-/// is dropped (recovery wins even past the floor) and the blob survives.
-TEST(CasGcAckFloor, PreAckPublishSpares)
+/// is dropped (recovery wins even past graduation) and the blob survives.
+TEST(CasGcAckFloor, PublishBeforeGraduationSpares)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openStoreForTest(backend);
@@ -461,9 +413,11 @@ TEST(CasGcAckFloor, PreAckPublishSpares)
     EXPECT_TRUE(blobExists(*backend, store->layout(), blob));
 }
 
-/// An expired mount is fenced out by the round's floor step: gc_fenced is set on its body (a token-guarded
-/// rewrite that bumps seq), so the floor no longer counts its stale ack — deletion proceeds. The fenced
-/// mount's own subsequent renew then fails closed, because the fence invalidated the token it held.
+/// An expired mount is fenced out by the round's heartbeat step: gc_fenced is set on its body (a
+/// token-guarded rewrite that bumps seq). The fence is pure liveness (re-arms the write fence so a
+/// resumed sleeper can never mutate again); reclaim itself no longer depends on any mount's heartbeat —
+/// graduation paces on GC rounds. The fenced mount's own subsequent renew then fails closed, because the
+/// fence invalidated the token it held.
 TEST(CasGcAckFloor, ExpiredMountFencedOutAndExcluded)
 {
     auto backend = std::make_shared<InMemoryBackend>();
@@ -473,18 +427,17 @@ TEST(CasGcAckFloor, ExpiredMountFencedOutAndExcluded)
     auto store = openStoreForTest(backend);
     const Layout & layout = store->layout();
 
-    // srid2's keeper: started at fake now=1000 with ttl=100 => lease expires_at = 1100. Its ack is stuck
-    // at 0 (observed_round callback returns 0), so if it stayed live it would pin the floor at 0.
+    // srid2's keeper: started at fake now=1000 with ttl=100 => lease expires_at = 1100.
     const String srid2 = "stale-server";
     uint64_t srid2_now = 1000;
     MountLeaseKeeper srid2_keeper(backend, layout, srid2, DB::UInt128(0x2222), /*writer_epoch=*/1,
-        std::chrono::milliseconds(100), [&] { return srid2_now; }, [] { return 0u; }, [] { return 0u; });
+        std::chrono::milliseconds(100), [&] { return srid2_now; }, [] { return 0u; });
     srid2_keeper.start();
     ASSERT_FALSE(decodeMountLease(backend->get(layout.mountKey(srid2))->bytes).gc_fenced);
 
     // GC runs on a fake clock jumped well past srid2's deadline + margin (ttl/2 = 15000 for the store's
     // 30s ttl). The store's own mount carries a SYSTEM-clock expires_at (~1.7e12 ms), far above the fake
-    // GC clock, so it stays live and governs the floor once srid2 is fenced.
+    // GC clock, so it stays live regardless of srid2's fate.
     uint64_t gc_now = 1100 + 60000;
     Gc gc(store, kGc, [&] { return gc_now; });
 
@@ -500,7 +453,7 @@ TEST(CasGcAckFloor, ExpiredMountFencedOutAndExcluded)
     const RoundReport rep = gc.runRegularRound();
     store->renewWatermarkOnce();
 
-    // The round's floor step fenced srid2 out (expired on the GC clock).
+    // The round's heartbeat step fenced srid2 out (expired on the GC clock).
     EXPECT_EQ(rep.fence_outs, 1u);   // exactly one expired mount fenced-out this round
     const MountLease fenced = decodeMountLease(backend->get(layout.mountKey(srid2))->bytes);
     EXPECT_TRUE(fenced.gc_fenced);
@@ -525,8 +478,8 @@ TEST(CasGcAckFloor, ExpiredMountFencedOutAndExcluded)
     srid2_now = 1050;
     EXPECT_THROW(srid2_keeper.renewOnce(), DB::Exception);
 
-    // With srid2 fenced (excluded from the floor), the live store mount governs the floor and the blob is
-    // reclaimed through the normal pipeline.
+    // The fence-out is pure liveness cleanup: reclaim proceeds through the normal (round-paced) pipeline
+    // regardless of srid2's fate — fencing one stale mount must never wedge the reclaim pipeline.
     dropRefTransition(*backend, layout, ns, "tbl", r);
     EXPECT_TRUE(runRoundsUntilAbsent(store, gc, *backend, layout, blob));
 }

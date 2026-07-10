@@ -52,7 +52,6 @@ Store::Store(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
     , config(std::move(config_))
     , meta(std::move(meta_))
     , pool_layout(config.pool_prefix)
-    , retire_view(pool_backend, pool_layout)
 {
     if (config.dedup_cache_bytes > 0)
         dedup_cache = std::make_unique<DedupCache>(
@@ -140,9 +139,6 @@ StorePtr Store::open(BackendPtr backend, PoolConfig config)
 
     /// Private ctor: make_shared cannot reach it.
     StorePtr store(new Store(std::move(backend), std::move(config), std::move(meta)));
-
-    /// Prime the writer-side retire view once (rare by construction; see RetireView).
-    store->retire_view.refresh();
 
     /// Per-server watermark (spec 2026-06-16-ca-build-watermark). process_epoch is a random NONZERO
     /// value minted once per Store: GC checks it for equality only (a different epoch == a dead
@@ -264,17 +260,12 @@ StorePtr Store::open(BackendPtr backend, PoolConfig config)
 
             /// The mount object now holds OUR live (uuid, epoch) body. Construct + start the keeper, which
             /// ADOPTS that very (uuid, epoch) slot rather than self-tripping the double-start guard.
-            /// Merged heartbeat (ack-floor redesign): the mount keeper now ALSO carries the per-server
-            /// build-watermark floor (`minActive`) and the acked GC round, read off the keeper's state
-            /// lock via `prepareRenew`; the observed-round callback reads the already-installed round
-            /// (`observedGcRound`, cheap and in-memory — spec 2026-07-06-decouple), it does NOT sync.
-            /// Open-ordering falls out of the wiring: the initial `retire_view.refresh()` above (line
-            /// ~140) primes the view BEFORE this construction, so `doStart`'s first anchored ack already
-            /// reflects that primed round; the dedicated syncer (Task 3) keeps it current thereafter.
+            /// The mount keeper carries the per-server build-watermark floor (`minActive`), read off the
+            /// keeper's state lock via `prepareRenew`.
             store->mount_keeper = std::make_unique<MountLeaseKeeper>(
                 store->pool_backend, store->pool_layout, srid, our_uuid, writer_epoch,
                 store->config.mount_lease_ttl_ms, now_ms,
-                [raw] { return raw->minActive(); }, [raw] { return raw->observedGcRound(); },
+                [raw] { return raw->minActive(); },
                 emit_mount_event);
             /// Keeper ↔ fence coupling (spec §write-fence): on each successful background renew refresh
             /// the monotonic deadline; on a superseded/foreign renew failure latch the fence to lost.
@@ -311,20 +302,12 @@ StorePtr Store::open(BackendPtr backend, PoolConfig config)
             store->bootMsNow() + static_cast<uint64_t>(store->config.mount_lease_ttl_ms.count()));
         /// Gate the background renewer with `background_watermark`: it runs only in production
         /// (`background_watermark` = context != nullptr && !read_only), never in unit tests — which
-        /// drive renewOnce (or the composed renewWatermarkOnce) explicitly and rely on the armed
-        /// sub-TTL deadline, never on the loop. The keeper itself is still started above (it must
-        /// claim/adopt the mount + arm the fence on every writable open); only the renewal thread is
-        /// conditional. The merged heartbeat renews at `mount_renew_period` — the standalone watermark
-        /// object (and its separate renew period) is gone; one beat now renews the lease and the floor,
-        /// and advertises the last-INSTALLED GC round (spec 2026-07-06-decouple: renewal no longer runs
-        /// the S3 view sync; the dedicated retired-view syncer, Task 3, advances the installed round on
-        /// its own thread).
+        /// drive renewOnce (or renewWatermarkOnce) explicitly and rely on the armed sub-TTL deadline,
+        /// never on the loop. The keeper itself is still started above (it must claim/adopt the mount +
+        /// arm the fence on every writable open); only the renewal thread is conditional. The merged
+        /// heartbeat renews at `mount_renew_period` — one beat now renews the lease and the floor.
         if (store->config.background_watermark)
             store->mount_keeper->startBackground(store->config.mount_renew_period);
-        /// The retired-view syncer advances the installed round in the background, off the renewal
-        /// thread (spec 2026-07-06-decouple). Same production-only gate as the renewer.
-        if (store->config.background_watermark)
-            store->startRetiredViewSync(store->config.mount_renew_period);
 
         store->live_writer_epoch.store(writer_epoch, std::memory_order_release);
     }
@@ -342,10 +325,6 @@ Store::~Store()
         if (remount_thread.joinable())
             remount_thread.join();
     }
-
-    /// Stop the retired-view syncer before tearing down: its body touches retire_view / pool_backend /
-    /// the event sink, which are destroyed with this Store.
-    stopRetiredViewSync();
 
     /// Retire the merged heartbeat on a clean Store teardown: stop() runs the keeper's terminal op,
     /// which stamps the lease already-expired (expires_at_ms = now) AND folds in the watermark
@@ -456,11 +435,6 @@ uint64_t Store::minActive()
     return active_build_seqs.empty() ? next_build_seq : *active_build_seqs.begin();
 }
 
-uint64_t Store::observedGcRound() const
-{
-    return retire_view.round();
-}
-
 uint64_t Store::peekNextBuildSeq()
 {
     std::lock_guard lk(builds_mutex);
@@ -482,6 +456,15 @@ bool Store::tryRemountOnce()
     const uint64_t poll_interval_ms = std::max<uint64_t>(
         1, static_cast<uint64_t>(config.mount_renew_period.count()) / 2);
     const uint64_t margin_ms = poll_interval_ms;
+
+    /// Best-effort round for the MountRemount audit event only (diagnostic, never correctness-relevant):
+    /// `currentGcRound` is a live `gc/state` GET, which may itself fail on the very backend trouble that
+    /// is causing this remount attempt to fail — never let that escalate into an uncaught throw out of
+    /// a function whose contract is "returns bool, never throws".
+    const auto round_for_event = [this]() -> uint64_t
+    {
+        try { return currentGcRound(); } catch (...) { return 0; }
+    };
 
     /// The same startup protocol as Store::open steps 2-4, as a FRESH incarnation (the old one is
     /// dead by the fence-out contract and its keeper never re-mints). Open THROWS on any failure
@@ -524,7 +507,7 @@ bool Store::tryRemountOnce()
         mount_keeper = std::make_unique<MountLeaseKeeper>(
             pool_backend, pool_layout, srid, our_uuid, writer_epoch,
             config.mount_lease_ttl_ms, now_ms,
-            [raw] { return raw->minActive(); }, [raw] { return raw->observedGcRound(); },
+            [raw] { return raw->minActive(); },
             emit_mount_event);
         mount_keeper->setFenceCallbacks(
             [raw, ttl_ms] { raw->setMountDeadline(raw->bootMsNow() + ttl_ms); },
@@ -533,11 +516,6 @@ bool Store::tryRemountOnce()
                 raw->tripMountLost();
                 raw->scheduleRemount();
             });
-        /// Prime the retired view for the fresh incarnation (open does this at Store::open via the
-        /// initial retire_view.refresh(); the remount path has no such prime). doStart then reads the
-        /// freshly-installed round via observedGcRound(), so the first anchored ack is current — the
-        /// open-ordering the model's WOpen requires.
-        syncRetiredView();
         mount_keeper->start();
         armMountFence(our_uuid, writer_epoch, bootMsNow() + ttl_ms);
         if (config.background_watermark)
@@ -550,7 +528,7 @@ bool Store::tryRemountOnce()
         EventEmitter{*this}.emit([&](CasEvent & e)
         {
             e.type = CasEventType::MountRemount;
-            e.round = retire_view.round();
+            e.round = round_for_event();
             e.outcome = "ok";
             e.reason = "self-remount recovered a fresh mount incarnation after fence-out / renewal failure";
             e.detail = {{"writer_epoch", std::to_string(writer_epoch)},
@@ -564,7 +542,7 @@ bool Store::tryRemountOnce()
         EventEmitter{*this}.emit([&](CasEvent & e)
         {
             e.type = CasEventType::MountRemount;
-            e.round = retire_view.round();
+            e.round = round_for_event();
             e.outcome = "failed";
             e.reason = "self-remount attempt failed; the recovery loop retries with backoff";
             e.detail = {{"server_root_id", srid},
@@ -602,137 +580,12 @@ void Store::scheduleRemount()
     });
 }
 
-void Store::startRetiredViewSync(std::chrono::milliseconds period)
-{
-    std::lock_guard g(retired_view_sync_mutex);
-    if (retired_view_sync_thread.joinable())
-        throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS retired-view syncer already running");
-    retired_view_sync_stop = false;
-    retired_view_sync_thread = ThreadFromGlobalPool([this, period] { retiredViewSyncLoop(period); });
-}
-
-void Store::stopRetiredViewSync()
-{
-    ThreadFromGlobalPool to_join;
-    {
-        std::lock_guard g(retired_view_sync_mutex);
-        if (!retired_view_sync_thread.joinable())
-            return;
-        retired_view_sync_stop = true;
-        retired_view_sync_cv.notify_all();
-        to_join = std::move(retired_view_sync_thread);
-    }
-    to_join.join();
-}
-
-void Store::retiredViewSyncLoop(std::chrono::milliseconds period)
-{
-    std::unique_lock lock(retired_view_sync_mutex);
-    while (!retired_view_sync_stop)
-    {
-        if (retired_view_sync_cv.wait_for(lock, period, [this] { return retired_view_sync_stop; }))
-            break;
-        lock.unlock();
-        try
-        {
-            syncRetiredView();
-        }
-        catch (...)
-        {
-            tryLogCurrentException(getLogger("CasStore"),
-                "CAS retired-view sync: background sync failed; the installed view stays put and retries");
-        }
-        lock.lock();
-    }
-}
-
-uint64_t Store::syncRetiredView()
-{
-    /// 1. Probe the published round. Absent gc/state = a pool GC never touched (round-0 view is
-    /// current by definition). Any failure leaves the installed view — and therefore the advertised
-    /// ack — untouched.
-    std::optional<GetResult> got;
-    try
-    {
-        got = pool_backend->get(pool_layout.gcStateKey());
-    }
-    catch (...)
-    {
-        tryLogCurrentException(getLogger("CasStore"),
-            "CAS retired-view sync: gc/state probe failed; observed_gc_round stays at the installed view");
-        return retire_view.round();
-    }
-    if (!got)
-        return retire_view.round();
-
-    uint64_t published = 0;
-    try
-    {
-        published = decodeGcState(got->bytes).round;
-    }
-    catch (...)
-    {
-        tryLogCurrentException(getLogger("CasStore"),
-            "CAS retired-view sync: gc/state undecodable; observed_gc_round stays at the installed view");
-        return retire_view.round();
-    }
-
-    /// Monotone: never re-install (or regress to) a round the view already covers.
-    if (published <= retire_view.round())
-        return retire_view.round();
-
-    /// 2. Install the newer retired view under RetireView's own internal mutex — no drain (spec
-    /// 2026-07-09-cas-writer-gc-simplification D4: entry persistence + monotone installs make any
-    /// in-closure read see every graduated entry regardless of install timing).
-    const uint64_t from_round = retire_view.round();
-    try
-    {
-        retire_view.refresh();
-    }
-    catch (...)
-    {
-        tryLogCurrentException(getLogger("CasStore"),
-            "CAS retired-view sync: retired-view refresh failed; observed_gc_round stays at the installed view");
-    }
-
-    /// Introspection: one event per VIEW ADVANCE (not per beat) — an unchanged view is silence, so the
-    /// log answers "when did this writer learn about round N and how big a retired list did it load".
-    /// The advertised ack follows this installed round on the same beat.
-    if (retire_view.round() > from_round)
-    {
-        EventEmitter{*this}.emit([&](CasEvent & e)
-        {
-            e.type = CasEventType::RetiredViewAdvance;
-            e.round = retire_view.round();
-            e.outcome = "ok";
-            e.reason = "retired-view sync installed a newer view; observed_gc_round advances with it";
-            e.detail = {{"from_round", std::to_string(from_round)},
-                        {"retired_entries", std::to_string(retire_view.entryCount())}};
-        });
-    }
-    return retire_view.round();
-}
-
 void Store::renewWatermarkOnce()
 {
-    /// Composed test/manual driver (spec 2026-07-06-decouple): sync the retired view, THEN renew the
-    /// lease. In production these are two independent threads (the syncer + the keeper's renewal loop);
-    /// this one-call composition preserves the pipeline-test contract that a single renewWatermarkOnce
-    /// makes `observed_gc_round` follow the freshly-committed gc/state.round. A read-only open never
-    /// anchored the keeper; there is nothing to renew (fail closed rather than fabricate one).
+    /// Renew the merged heartbeat (lease + build-watermark floor). A read-only open never anchored the
+    /// keeper; there is nothing to renew (fail closed rather than fabricate one).
     if (!mount_keeper)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS heartbeat: renewWatermarkOnce on a read-only Store");
-    syncRetiredView();
-    mount_keeper->renewOnce();
-}
-
-void Store::renewLeaseOnlyForTest()
-{
-    /// Test seam (spec 2026-07-06-decouple): drive the ISOLATED renewal path — renewOnce WITHOUT a
-    /// preceding view sync — proving the renewal itself never loads the view (it only reads the
-    /// already-installed round via `observedGcRound`). Mirrors `renewWatermarkOnce`'s read-only guard.
-    if (!mount_keeper)
-        throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS heartbeat: renewLeaseOnlyForTest on a read-only Store");
     mount_keeper->renewOnce();
 }
 
@@ -1235,9 +1088,9 @@ void Store::flushShardBatch(const RootNamespace & ns, uint64_t shard,
         return all;
     };
 
-    /// No view-install drain here (spec 2026-07-09-cas-writer-gc-simplification D4): the closures'
-    /// condemn-gate reads consult the live RetireView (internally locked); a mid-flush install only makes
-    /// them stricter, and every graduated entry is in EVERY view >= its condemn round + 1 regardless.
+    /// No install drain here: the closures' condemn-gate reads point-read the per-hash freshness meta
+    /// directly (spec 2026-07-09-cas-writer-gc-simplification), which is always current — there is no
+    /// cached view to install or drain.
 
     /// Local write fence (spec §write-fence): a superseded/paused writer must not race the live one.
     /// The fence fails the WHOLE queue — every caller would have gotten the same refusal alone.

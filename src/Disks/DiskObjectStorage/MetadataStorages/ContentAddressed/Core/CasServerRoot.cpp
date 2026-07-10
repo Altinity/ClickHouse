@@ -122,7 +122,6 @@ String encodeMountLease(const MountLease & m)
     msg.set_seq(m.seq);
     msg.set_expires_at_ms(m.expires_at_ms);
     msg.set_min_active(m.min_active);
-    msg.set_observed_gc_round(m.observed_gc_round);
     msg.set_gc_fenced(m.gc_fenced);
 
     std::string out;
@@ -155,7 +154,6 @@ MountLease decodeMountLease(std::string_view data)
     m.seq = msg.seq();
     m.expires_at_ms = msg.expires_at_ms();
     m.min_active = msg.min_active();
-    m.observed_gc_round = msg.observed_gc_round();
     m.gc_fenced = msg.gc_fenced();
     return m;
 }
@@ -497,14 +495,13 @@ HeartbeatFloor computeHeartbeatFloor(Backend & b, const Layout & l, uint64_t now
             const String & key = listed.key;
 
             /// The srid is the path segment between `serverRootsPrefix()` and the `/mount` suffix
-            /// (`<prefix>/gc/server-roots/<srid>/mount`). Used only for observability (lagging / fenced).
+            /// (`<prefix>/gc/server-roots/<srid>/mount`). Used only for observability (fenced).
             const String srid = key.substr(prefix.size(),
                 key.size() - prefix.size() - mount_suffix.size());
 
             /// Fence-out on PreconditionFailed re-GETs and reclassifies from the top; bound the retries
             /// so a pathologically contended holder cannot spin forever. On exhaustion the entry is
-            /// counted as live with its current ack (conservative — never excluded without a landed
-            /// fence-out).
+            /// counted as live (conservative — never excluded without a landed fence-out).
             constexpr int max_reclassify = 4;
             for (int attempt = 0; ; ++attempt)
             {
@@ -513,7 +510,6 @@ HeartbeatFloor computeHeartbeatFloor(Backend & b, const Layout & l, uint64_t now
                     break;   /// Raced away (deleted) — nothing to classify.
 
                 const MountLease m = decodeMountLease(got->bytes);
-                floor.max_ack = std::max(floor.max_ack, m.observed_gc_round);
 
                 if (m.gc_fenced)
                 {
@@ -530,9 +526,7 @@ HeartbeatFloor computeHeartbeatFloor(Backend & b, const Layout & l, uint64_t now
                 const bool exhausted = attempt >= max_reclassify;
                 if (live || exhausted)
                 {
-                    floor.min_ack = std::min(floor.min_ack, m.observed_gc_round);
                     ++floor.live;
-                    floor.lagging.emplace_back(srid, m.observed_gc_round);
                     break;
                 }
 
@@ -612,7 +606,7 @@ std::vector<MountInfo> listMounts(Backend & backend, const Layout & layout, uint
 MountLeaseKeeper::MountLeaseKeeper(
     BackendPtr backend_, const Layout & layout_, const String & srid_, UInt128 server_uuid_,
     uint64_t writer_epoch_, std::chrono::milliseconds ttl_, std::function<uint64_t()> now_ms_fn_,
-    std::function<uint64_t()> min_active_fn_, std::function<uint64_t()> observed_round_fn_,
+    std::function<uint64_t()> min_active_fn_,
     CasEventSink event_sink_)
     : SingleWriterSlot(std::move(backend_), layout_.mountKey(srid_), "mount-lease", "release", "CasMountLeaseKeeper")
     , srid(srid_)
@@ -621,19 +615,16 @@ MountLeaseKeeper::MountLeaseKeeper(
     , ttl(ttl_)
     , now_ms_fn(std::move(now_ms_fn_))
     , min_active_fn(std::move(min_active_fn_))
-    , observed_round_fn(std::move(observed_round_fn_))
     , event_sink(std::move(event_sink_))
 {
 }
 
 SingleWriterSlot::RenewPayload MountLeaseKeeper::prepareRenew() const
 {
-    /// Carry the three dynamic fields (all read OFF the state lock — the merged floor/round callbacks
-    /// reach into the Store's own locks): `value` = wall-clock `now_ms` (so `encodeBody` stamps a
-    /// fresh `expires_at_ms = now_ms + ttl`), `value2` = `min_active` (the build-watermark floor),
-    /// `value3` = `observed_gc_round` (the last-INSTALLED GC round ack; spec 2026-07-06-decouple —
-    /// `observed_round_fn` READS this value in memory, it does not load the retired view).
-    return {.value = now_ms_fn(), .value2 = min_active_fn(), .value3 = observed_round_fn()};
+    /// Carry the two dynamic fields (both read OFF the state lock — the merged floor callback reaches
+    /// into the Store's own lock): `value` = wall-clock `now_ms` (so `encodeBody` stamps a fresh
+    /// `expires_at_ms = now_ms + ttl`), `value2` = `min_active` (the build-watermark floor).
+    return {.value = now_ms_fn(), .value2 = min_active_fn()};
 }
 
 String MountLeaseKeeper::encodeBody(uint64_t seq_, const RenewPayload & payload) const
@@ -649,7 +640,6 @@ String MountLeaseKeeper::encodeBody(uint64_t seq_, const RenewPayload & payload)
         .seq = seq_,
         .expires_at_ms = now_ms + ttl_ms,
         .min_active = payload.value2,
-        .observed_gc_round = payload.value3,
     });
 }
 

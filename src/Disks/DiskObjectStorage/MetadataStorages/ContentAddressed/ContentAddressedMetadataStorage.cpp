@@ -238,7 +238,6 @@ ContentAddressed::GcRoundLogger ContentAddressedMetadataStorage::makeGcRoundLogg
         e.entries_graduated = r.entries_graduated;
         e.entries_redeleted = r.entries_redeleted;
         e.fence_outs = r.fence_outs;
-        e.min_ack = r.min_ack;
         e.anomalies = r.anomalies;
         e.duration_ms = r.duration_ms;
         e.error = r.error;

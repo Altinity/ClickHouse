@@ -222,7 +222,6 @@ String renderMountLease(const MountLease & m)
         .add("seq", jsonUInt(m.seq))
         .add("expires_at_ms", jsonUInt(m.expires_at_ms))
         .add("min_active", jsonUInt(m.min_active))
-        .add("observed_gc_round", jsonUInt(m.observed_gc_round))
         .add("gc_fenced", jsonBool(m.gc_fenced))
         .str();
 }

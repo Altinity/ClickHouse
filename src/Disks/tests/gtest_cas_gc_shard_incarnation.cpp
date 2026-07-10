@@ -98,28 +98,22 @@ TEST(CasGcShardIncarnation, ListNamespacesFromRefsNotRegistry)
 }
 
 /// Task 5: THM-NO-RETURN create-race. A NEWBORN ref-shard is born fenced to the current GC round
-/// (self-floor), so the `promote` gate is forced to refresh its retire view before committing any
-/// blob. Without the self-floor, a writer with a stale retire view could promote a committed ref
-/// to a blob that GC has already condemned in the current round — a dangling committed manifest
-/// (INV-NO-DANGLE violation). With the self-floor, the refresh exposes the condemnation and
-/// promote fails closed (ABORTED), preventing the dangle.
+/// (self-floor: `fence_round` self-floors to `currentGcRound()` on the create-if-absent branch).
 ///
 /// Scenario (registry-free create-race):
-///   1. Open a Store (retireView refreshed at open — gc/state absent, so view is at round 0).
+///   1. Open a Store (gc/state absent).
 ///   2. Write blob b1's body directly to the backend (present, not yet condemned).
 ///   3. Inject gc/state at round 1 with b1 condemned (its current token in the retired set).
 ///      b1's body is still PRESENT — this simulates GC having fenced+retired b1 but not yet
 ///      deleted it (the retired-but-body-present window).
-///   4. The Store's retireView is NOT refreshed — it is still at round 0 (empty condemned set).
-///      `currentGcRound()` reads gc/state and returns 1.
-///   5. A writer for NEWBORN ns B calls `precommitAdd` → reads `currentGcRound() = 1` →
+///   4. A writer for NEWBORN ns B calls `precommitAdd` → reads `currentGcRound() = 1` →
 ///      the NEWBORN shard is born with `fence_round = 1` (self-floor).
-///   6. `promote`:
-///      - With self-floor (fixed): `retireView.round() = 0 < shard.fence_round = 1` → refresh
-///        → b1 condemned → ABORTED. No dangle.
-///      - Without self-floor (broken): `shard.fence_round = 0`, no refresh → stale view says
-///        b1 not condemned → promote succeeds → committed ref names a condemned (soon-deleted)
-///        blob → INV-NO-DANGLE violated (dangling=1 in fsck).
+///   5. `promote` binds the condemned-but-present tokenless leaf AS IS (spec
+///      2026-07-09-cas-writer-gc-simplification D5: there is no writer-side view refresh at promote
+///      any more). This is safe because the precommit closure's edge is journal-durable BEFORE
+///      promote returns (EDGE-BEFORE-OBSERVE): the NEXT GC fold sees net in-degree >= 1 for b1 and
+///      SPARES the entry, regardless of when it would otherwise graduate — the condemnation is
+///      doomed, never the blob. INV-NO-DANGLE holds (dangling=0 in fsck).
 ///
 /// Both gc_shards=1 and gc_shards>1 are exercised. The self-floor and promote gate are independent
 /// of the blob-hash-prefix sharding axis (fence_round lives in the ROOT shard).
@@ -131,7 +125,7 @@ TEST(CasGcShardIncarnation, NewbornPrecommitProtectsDedupBlobAgainstConcurrentDr
         auto store = makeStoreWithShards(backend, gc_shards);
         const RootNamespace ns_b{"srv1/tblB"};
 
-        /// --- Phase 1: Write b1's body directly (before any GC). retireView = round 0. ---
+        /// --- Phase 1: Write b1's body directly (before any GC). ---
         /// Mint b1 under the POOL streaming-hash id (via a throwaway build's putBlob) so the in-closure
         /// copy-forward verifier accepts its payload — the plain CityHash test id would be refused.
         const String b1_payload = "shared-blob-b1";
@@ -147,8 +141,7 @@ TEST(CasGcShardIncarnation, NewbornPrecommitProtectsDedupBlobAgainstConcurrentDr
 
         /// --- Phase 2: Inject gc/state at round 1 with b1 CONDEMNED (body still present). ---
         /// This simulates GC having advanced to round 1 and retired b1 (condemned token recorded
-        /// in the retired set) but not yet deleted b1's body object. The Store's retireView is
-        /// still at round 0 — it has NOT been refreshed since open.
+        /// in the retired set) but not yet deleted b1's body object.
         injectRetire(*backend, store->layout(), /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
             {RetiredEntry{.kind = ObjectKind::Blob, .hash = hexToU128(b1_hex),
                           .token = b1_token, .size = static_cast<uint64_t>(b1_payload.size())}});
@@ -156,11 +149,8 @@ TEST(CasGcShardIncarnation, NewbornPrecommitProtectsDedupBlobAgainstConcurrentDr
         /// Sanity: currentGcRound() reads gc/state fresh and returns 1.
         ASSERT_EQ(store->currentGcRound(), 1u)
             << "currentGcRound() must return the injected round";
-        /// Sanity: retireView is still stale (not refreshed since open).
-        ASSERT_EQ(store->retireView().round(), 0u)
-            << "retireView must still be at round 0 (not refreshed after injection)";
 
-        /// --- Phase 3: Writer for NEWBORN ns B — stale retireView, b1 condemned but body present ---
+        /// --- Phase 3: Writer for NEWBORN ns B — b1 condemned but body present ---
         BuildInfo info_b;
         info_b.intended_ref = ns_b.string() + "/part_b1";
         auto build_b = store->startBuild(info_b);
@@ -182,31 +172,29 @@ TEST(CasGcShardIncarnation, NewbornPrecommitProtectsDedupBlobAgainstConcurrentDr
 
         /// --- Phase 4: promote — the safety assertion (Phase-A contract) ---
         /// Spec 2026-07-09-cas-writer-gc-simplification D5: there is NO writer-side view refresh at
-        /// promote anymore. The stale view (round 0) does not see b1's condemnation, so the K3 gate binds
-        /// the condemned-but-present token AS IS — and that is SAFE by the floor + edge pair:
-        ///   • graduation of the round-1 condemnation requires min_ack > 1, but THIS writer's advertised
-        ///     round is 0 (its installed view) — the floor holds, the entry can never graduate to delete
-        ///     while this writer has not installed a newer view;
-        ///   • the precommit closure edge has been journal-durable since precommitAdd, so the NEXT GC fold
-        ///     sees d >= 1 and SPARES the entry (EDGE-BEFORE-OBSERVE) — the condemnation is doomed, not
-        ///     the blob.
+        /// promote any more — the K3 gate binds the condemned-but-present token AS IS. This is SAFE
+        /// because the precommit closure's edge has been journal-durable since precommitAdd (BEFORE
+        /// promote returns), so the NEXT GC fold sees net in-degree >= 1 for b1 and SPARES the entry
+        /// (EDGE-BEFORE-OBSERVE) regardless of round-paced graduation timing — the condemnation is
+        /// doomed, never the blob. (No GC round runs in this test at all; the argument is what makes
+        /// deferring the round safe, not something this test drives to completion.)
         /// The former behavior (self-floor-forced refresh → in-closure copy-forward → fresh incarnation)
         /// was TLA+-Gate-A-verified redundant; the shard's fence_round stamp itself (THM-NO-RETURN birth
         /// floor) remains and is asserted by the sibling shard-incarnation tests.
         EXPECT_NO_THROW(build_b->promote(ns_b, "part_b1", build_b->buildId(), id_b))
-            << "gc_shards=" << gc_shards << ": promote must commit — the floor + durable edge protect the "
+            << "gc_shards=" << gc_shards << ": promote must commit — the durable edge protects the "
                "condemned-but-present tokenless leaf without any refresh or copy-forward";
         EXPECT_TRUE(store->resolveRef(ns_b, "part_b1").has_value())
             << "gc_shards=" << gc_shards << ": the ref must commit";
         /// The condemned token is bound UNCHANGED — no displacement happens (and none is needed).
         EXPECT_EQ(backend->head(b1_key).token, b1_token)
             << "gc_shards=" << gc_shards << ": no copy-forward under the Phase-A contract — the token "
-               "stays; the floor forbids its deletion and the folded edge will spare it";
+               "stays; the folded edge will spare it at the next fold (no round runs here to delete it)";
 
-        /// INV-NO-DANGLE: the body is present and the floor forbids its deletion while this writer's ack
-        /// is below the condemn round; the folded precommit/committed edge spares the entry at the next
-        /// fold. A regression that let the delete pipeline run past a live writer's ack would produce
-        /// dangling=1 here.
+        /// INV-NO-DANGLE: the body is present and no GC round ever runs in this test to fold the
+        /// precommit/committed edge; a real deployment's next fold would see net in-degree >= 1 and
+        /// spare the entry. A regression that let the delete pipeline race a live durable edge would
+        /// produce dangling=1 here.
         const FsckReport rep = runFsck(*store, /*detail=*/false);
         EXPECT_EQ(rep.dangling, 0u)
             << "gc_shards=" << gc_shards << ": INV-NO-DANGLE violated — a committed ref names a "

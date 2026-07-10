@@ -821,7 +821,6 @@ The server successfully detected this situation and will download merged part fr
     M(CasGcRetiredGraduated,   "CA gc retired entries newly floor-passed and published delete_pending", ValueType::Number) \
     M(CasGcRetiredRedeleted,   "CA gc pending deletes executed this round (exact-token blob deletes)", ValueType::Number) \
     M(CasGcHeartbeatFenceOuts, "CA gc expired-mount fence-outs performed by the heartbeat floor", ValueType::Number) \
-    M(CasGcFloorHeldByStaleAck, "CA gc rounds where a live heartbeat ack lagged the published round by more than 2", ValueType::Number) \
     M(CasGcMetaWriteAnomaly, "CA gc per-hash freshness-meta ops (condemn/spare/delete) that threw on the bounded meta pool this round (advisory-only; never wedges the round)", ValueType::Number) \
     M(CasPartFolderViewHits, "CA part-folder view cache validated hits (retained view matched a fresh resolve)", ValueType::Number) \
     M(CasPartFolderViewMutableRefreshes, "CA part-folder view refreshes: manifest unchanged, mutable payload drifted — view cloned, no manifest read", ValueType::Number) \

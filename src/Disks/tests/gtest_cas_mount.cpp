@@ -117,7 +117,7 @@ TEST(CasMountLease, AbsentClaimThenRenewBumpsSeq)
     auto r = claimMount(*b, l, "r", UInt128(1), /*epoch*/ 7, now, /*ttl*/ 100);
     EXPECT_EQ(r.kind, MountClaimResult::Claimed);
     MountLeaseKeeper k(b, l, "r", UInt128(1), 7, std::chrono::milliseconds(100), [&] { return now; },
-                       [] { return uint64_t{0}; }, [] { return uint64_t{0}; });
+                       [] { return uint64_t{0}; });
     k.start();
     EXPECT_EQ(decodeMountLease(b->get(l.mountKey("r"))->bytes).seq, 1u);
     k.renewOnce();
@@ -272,13 +272,13 @@ TEST(CasMountLease, KeeperStartAdoptsOurOwnClaimNotDoubleStart)
     // The normal flow: claimMount writes the live mount under (uuid=1, epoch=7), THEN keeper.start().
     ASSERT_EQ(claimMount(*b, l, "r", UInt128(1), /*epoch*/ 7, now, /*ttl*/ 100).kind, MountClaimResult::Claimed);
     MountLeaseKeeper k(b, l, "r", UInt128(1), /*epoch*/ 7, std::chrono::milliseconds(100), [&] { return now; },
-                       [] { return uint64_t{0}; }, [] { return uint64_t{0}; });
+                       [] { return uint64_t{0}; });
     EXPECT_NO_THROW(k.start());     // adopts our own live (uuid=1,epoch=7) mount — NOT a double-start
     EXPECT_EQ(decodeMountLease(b->get(l.mountKey("r"))->bytes).writer_epoch, 7u);
 
     // A keeper for the SAME uuid but a DIFFERENT live epoch must fail closed (superseded/double-start):
     MountLeaseKeeper k2(b, l, "r", UInt128(1), /*epoch*/ 8, std::chrono::milliseconds(100), [&] { return now; },
-                        [] { return uint64_t{0}; }, [] { return uint64_t{0}; });
+                        [] { return uint64_t{0}; });
     EXPECT_ANY_THROW(k2.start());
 }
 
@@ -402,7 +402,7 @@ TEST(CasMountStartup, StaleSelfMountReclaimedAfterWait)
     EXPECT_GT(a2->writerEpoch(), e1);
 }
 
-TEST(CasMountLease, BodyCarriesFloorAckAndFence)
+TEST(CasMountLease, BodyCarriesFloorAndFence)
 {
     MountLease m;
     m.server_uuid = UInt128(0xAB);
@@ -413,11 +413,9 @@ TEST(CasMountLease, BodyCarriesFloorAckAndFence)
     m.seq = 3;
     m.expires_at_ms = 2000;
     m.min_active = 5;
-    m.observed_gc_round = 9;
     m.gc_fenced = true;
     const MountLease d = decodeMountLease(encodeMountLease(m));
     EXPECT_EQ(d.min_active, 5u);
-    EXPECT_EQ(d.observed_gc_round, 9u);
     EXPECT_TRUE(d.gc_fenced);
     EXPECT_EQ(d.writer_epoch, 7u);
 }
@@ -430,7 +428,7 @@ TEST(CasMountLease, RetiredSentinelRoundTrips)
               std::numeric_limits<uint64_t>::max());
 }
 
-/// ---- Task 7: GC heartbeat floor (min_ack) with token-guarded fence-out ----
+/// ---- Task 7: GC heartbeat classification with token-guarded fence-out ----
 
 namespace
 {
@@ -441,7 +439,7 @@ constexpr uint64_t kSkewMarginMs = 5'000;
 /// Seed one mount body under mountKey(srid) via the on-storage codec (`encodeMountLease` +
 /// `putIfAbsent`) — the same interface the keeper writes through.
 MountLease seedMount(
-    Backend & b, const Layout & l, const String & srid, uint64_t observed_round,
+    Backend & b, const Layout & l, const String & srid,
     uint64_t expires_at_ms, bool gc_fenced, uint64_t min_active, uint64_t seq = 1)
 {
     MountLease m;
@@ -453,7 +451,6 @@ MountLease seedMount(
     m.seq = seq;
     m.expires_at_ms = expires_at_ms;
     m.min_active = min_active;
-    m.observed_gc_round = observed_round;
     m.gc_fenced = gc_fenced;
     b.putIfAbsent(l.mountKey(srid), encodeMountLease(m));
     return m;
@@ -465,15 +462,15 @@ TEST(CasHeartbeatFloor, ClassifiesAndFencesOut)
     auto b = std::make_shared<InMemoryBackend>();
     Layout l("p");
 
-    /// live acked 3, live acked 7 — both count into the floor; min is 3.
-    seedMount(*b, l, "s1", /*round*/ 3, /*expires*/ kNowMs + 60'000, /*fenced*/ false, /*min_active*/ 0);
-    seedMount(*b, l, "s2", /*round*/ 7, /*expires*/ kNowMs + 60'000, /*fenced*/ false, /*min_active*/ 0);
-    /// expired-unfenced acked 1 — must be fenced-out by the call, NOT counted.
-    seedMount(*b, l, "s3", /*round*/ 1, /*expires*/ kNowMs - 60'000, /*fenced*/ false, /*min_active*/ 0);
-    /// already-fenced acked 0 — excluded, body byte-identical after the call (no PUT).
-    seedMount(*b, l, "s4", /*round*/ 0, /*expires*/ kNowMs - 60'000, /*fenced*/ true, /*min_active*/ 0);
+    /// two live mounts — both count into `live`.
+    seedMount(*b, l, "s1", /*expires*/ kNowMs + 60'000, /*fenced*/ false, /*min_active*/ 0);
+    seedMount(*b, l, "s2", /*expires*/ kNowMs + 60'000, /*fenced*/ false, /*min_active*/ 0);
+    /// expired-unfenced — must be fenced-out by the call.
+    seedMount(*b, l, "s3", /*expires*/ kNowMs - 60'000, /*fenced*/ false, /*min_active*/ 0);
+    /// already-fenced — excluded, body byte-identical after the call (no PUT).
+    seedMount(*b, l, "s4", /*expires*/ kNowMs - 60'000, /*fenced*/ true, /*min_active*/ 0);
     /// terminated (min_active == UINT64_MAX) with expired-looking timestamps — excluded, not fenced.
-    seedMount(*b, l, "s5", /*round*/ 0, /*expires*/ kNowMs - 60'000, /*fenced*/ false,
+    seedMount(*b, l, "s5", /*expires*/ kNowMs - 60'000, /*fenced*/ false,
               /*min_active*/ std::numeric_limits<uint64_t>::max());
 
     const auto s3_before = b->get(l.mountKey("s3"));
@@ -483,7 +480,6 @@ TEST(CasHeartbeatFloor, ClassifiesAndFencesOut)
 
     const HeartbeatFloor floor = computeHeartbeatFloor(*b, l, kNowMs, kSkewMarginMs);
 
-    EXPECT_EQ(floor.min_ack, 3u);
     EXPECT_EQ(floor.live, 2u);
     EXPECT_EQ(floor.terminated, 1u);
     EXPECT_EQ(floor.fenced_now, 1u);
@@ -499,7 +495,6 @@ TEST(CasHeartbeatFloor, ClassifiesAndFencesOut)
     EXPECT_EQ(s3_now.server_uuid, s3_prev.server_uuid);
     EXPECT_EQ(s3_now.writer_epoch, s3_prev.writer_epoch);
     EXPECT_EQ(s3_now.hostname, s3_prev.hostname);
-    EXPECT_EQ(s3_now.observed_gc_round, s3_prev.observed_gc_round);
     EXPECT_EQ(s3_now.expires_at_ms, s3_prev.expires_at_ms);
 
     /// The already-fenced body was not touched (no PUT).
@@ -511,15 +506,15 @@ TEST(CasHeartbeatFloor, ClassifiesAndFencesOut)
 namespace
 {
 /// A delegating backend whose `putOverwrite` of the target mount key first performs an inner renewal
-/// (a real, token-correct overwrite that pushes expiry far into the future and bumps the ack) and THEN
-/// delegates — so the caller's fence-out overwrite lands on a stale token and returns PreconditionFailed.
-/// The inner renewal runs exactly once (`renewed`), modelling a holder that renews concurrently in the
-/// window between the function's GET and its fence-out PUT.
+/// (a real, token-correct overwrite that pushes expiry far into the future) and THEN delegates — so
+/// the caller's fence-out overwrite lands on a stale token and returns PreconditionFailed. The inner
+/// renewal runs exactly once (`renewed`), modelling a holder that renews concurrently in the window
+/// between the function's GET and its fence-out PUT.
 class RenewOnFenceBackend : public InMemoryBackend
 {
 public:
-    RenewOnFenceBackend(String target_key_, uint64_t renewed_expires_ms_, uint64_t renewed_ack_)
-        : target_key(std::move(target_key_)), renewed_expires_ms(renewed_expires_ms_), renewed_ack(renewed_ack_)
+    RenewOnFenceBackend(String target_key_, uint64_t renewed_expires_ms_)
+        : target_key(std::move(target_key_)), renewed_expires_ms(renewed_expires_ms_)
     {
     }
 
@@ -529,12 +524,11 @@ public:
         if (key == target_key && !renewed)
         {
             renewed = true;
-            /// The holder renews under the real current token: fresh far-future expiry, ack bumped.
+            /// The holder renews under the real current token: fresh far-future expiry.
             const auto got = InMemoryBackend::get(key);
             MountLease m = decodeMountLease(got->bytes);
             m.seq += 1;
             m.expires_at_ms = renewed_expires_ms;
-            m.observed_gc_round = renewed_ack;
             const PutResult renew = InMemoryBackend::putOverwrite(key, encodeMountLease(m), got->token);
             EXPECT_EQ(renew.outcome, PutOutcome::Done);
         }
@@ -544,7 +538,6 @@ public:
 private:
     String target_key;
     uint64_t renewed_expires_ms;
-    uint64_t renewed_ack;
     bool renewed = false;
 };
 }
@@ -553,32 +546,30 @@ TEST(CasHeartbeatFloor, FenceOutLosesTokenRaceReclassifiesLive)
 {
     Layout l("p");
     auto b = std::make_shared<RenewOnFenceBackend>(
-        l.mountKey("s1"), /*renewed_expires*/ kNowMs + 120'000, /*renewed_ack*/ 11);
+        l.mountKey("s1"), /*renewed_expires*/ kNowMs + 120'000);
 
-    /// One expired-unfenced mount acked 2. The function GETs it (expired), tries to fence it out, the
+    /// One expired-unfenced mount. The function GETs it (expired), tries to fence it out, the
     /// decorator renews it concurrently under the real token, the PUT hits PreconditionFailed, the
-    /// function re-GETs and reclassifies it as live — counting the RENEWED ack (11), never fenced.
-    seedMount(*b, l, "s1", /*round*/ 2, /*expires*/ kNowMs - 60'000, /*fenced*/ false, /*min_active*/ 0);
+    /// function re-GETs and reclassifies it as live — never fenced.
+    seedMount(*b, l, "s1", /*expires*/ kNowMs - 60'000, /*fenced*/ false, /*min_active*/ 0);
 
     const HeartbeatFloor floor = computeHeartbeatFloor(*b, l, kNowMs, kSkewMarginMs);
 
     EXPECT_EQ(floor.fenced_now, 0u);
     EXPECT_EQ(floor.live, 1u);
-    EXPECT_EQ(floor.min_ack, 11u);
 
     const auto after = b->get(l.mountKey("s1"));
     ASSERT_TRUE(after.has_value());
     EXPECT_FALSE(decodeMountLease(after->bytes).gc_fenced);
 }
 
-TEST(CasHeartbeatFloor, EmptyPrefixYieldsInfiniteFloor)
+TEST(CasHeartbeatFloor, EmptyPrefixYieldsNoLiveMounts)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout l("p");
 
     const HeartbeatFloor floor = computeHeartbeatFloor(*b, l, kNowMs, kSkewMarginMs);
 
-    EXPECT_EQ(floor.min_ack, std::numeric_limits<uint64_t>::max());
     EXPECT_EQ(floor.live, 0u);
     EXPECT_EQ(floor.terminated, 0u);
     EXPECT_EQ(floor.fenced_now, 0u);

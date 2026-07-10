@@ -93,12 +93,9 @@ struct MountLease
     uint64_t started_at_ms = 0;
     uint64_t seq = 0;
     uint64_t expires_at_ms = 0;
-    /// Merged heartbeat fields (ack-floor redesign): the per-server build-watermark floor and the
-    /// GC-round acknowledgement ride the SAME object as the lease, so one renewal PUT stamps all three
-    /// (the GC-round ack is the last-INSTALLED round, spec 2026-07-06-decouple — renewal reads it, it
-    /// does not load the view).
+    /// Merged heartbeat field: the per-server build-watermark floor rides the SAME object as the lease,
+    /// so one renewal PUT stamps both.
     uint64_t min_active = 0;          /// oldest in-flight build_seq; UINT64_MAX = retired (farewell)
-    uint64_t observed_gc_round = 0;   /// newest gc round whose retired list this server has loaded
     bool gc_fenced = false;           /// set ONLY by GC fence-out of an expired lease; terminal
 };
 
@@ -220,42 +217,33 @@ MountClaimResult claimMountAwaitingExpiry(
     const std::function<void(const MountLease &, uint64_t)> & on_wait_start = {},
     const CasEventSink & sink = {});
 
-/// GC heartbeat gate (ack-floor redesign, spec 2026-07-02, GC round protocol step 1). Run by the GC
-/// leader at the top of a round: LIST `gc/server-roots/` (O(servers), single-digit counts), GET each
-/// mount body, and derive the per-round acknowledgement floor `min_ack`. Classification per body:
+/// GC heartbeat gate (GC round protocol step 1). Run by the GC leader at the top of a round: LIST
+/// `gc/server-roots/` (O(servers), single-digit counts), GET each mount body, and classify + fence out
+/// expired mounts (liveness only — graduation itself paces on GC rounds, not on heartbeat acks).
+/// Classification per body:
 ///   - `gc_fenced` already set → excluded (`already_fenced`); a fenced mount is terminal, no PUT;
 ///   - terminated (`min_active == UINT64_MAX`, the farewell sentinel stamped by
 ///     `MountLeaseKeeper::terminate`) → excluded (`terminated`). `expires_at_ms` alone cannot
 ///     distinguish a graceful farewell from a crash, so the sentinel — not the timestamps — is the
 ///     terminated marker;
-///   - live (`now_ms <= expires_at_ms + skew_margin_ms`) → contributes `observed_gc_round` to the
-///     floor (`min_ack = min(min_ack, observed_gc_round)`), counted in `live`;
+///   - live (`now_ms <= expires_at_ms + skew_margin_ms`) → counted in `live`;
 ///   - else expired (past the skew-padded deadline, not terminated, not yet fenced) → FENCE-OUT: one
 ///     token-guarded `putOverwrite` preserving the WHOLE body, setting `gc_fenced = true` and `seq +
 ///     1`. On `Done` → excluded (`fenced_now`); on `PreconditionFailed` (the holder renewed
 ///     concurrently) → re-GET and reclassify from the top (bounded retries; if still contended, count
-///     it as live with its current ack — conservative, never exclude a heartbeat without a landed
-///     fence-out).
-/// No counted heartbeats ⇒ `min_ack` stays `UINT64_MAX` (an infinite floor: nothing graduates).
+///     it as live — conservative, never exclude a heartbeat without a landed fence-out).
 ///
 /// The fence-out is BOTH safety and liveness. Safety: a sleeper's later renewal permanently fails
 /// (its `putOverwrite` now mismatches the fenced token → `tripMountLost`), so it can never re-arm
-/// without a fresh `open` that loads a fresh retired view. Liveness: a dead server's stale ack must
-/// not hold the floor down forever. Preserving the body keeps S13 recovery intact: a same-uuid reopen
-/// reads the current body and reclaims through the normal expired-our-uuid branch.
+/// without a fresh `open`. Liveness: a dead server's stale mount slot must not linger forever.
+/// Preserving the body keeps S13 recovery intact: a same-uuid reopen reads the current body and
+/// reclaims through the normal expired-our-uuid branch.
 struct HeartbeatFloor
 {
-    uint64_t min_ack = std::numeric_limits<uint64_t>::max();   /// UINT64_MAX = no counted heartbeats
-    /// MAX observed_gc_round over EVERY decoded mount body (fenced/terminated included — a stale ack
-    /// from any mount poisons a low rebuild round). Used by `Gc::rebuildBaseline`'s round mint.
-    uint64_t max_ack = 0;
     size_t live = 0;
     size_t terminated = 0;
     size_t fenced_now = 0;
     size_t already_fenced = 0;
-    /// Observability (ack-floor): the (srid, observed_gc_round) of every live heartbeat, so the caller
-    /// can name which server pins the floor when an ack lags the published round.
-    std::vector<std::pair<String, uint64_t>> lagging;
     /// The srids of every mount fenced-out THIS call (one GcFenceOut audit event each).
     std::vector<String> fenced_srids;
 };
@@ -278,14 +266,10 @@ struct MountInfo
 /// of `computeHeartbeatFloor`: ZERO writes (no fence-out), per-row fail-open. One LIST + one GET per slot.
 std::vector<MountInfo> listMounts(Backend & backend, const Layout & layout, uint64_t now_ms, uint64_t skew_margin_ms);
 
-/// Per-server MERGED heartbeat (ack-floor redesign, spec 2026-07-02): one `SingleWriterSlot` over the
-/// per-server-root mount object carries the mount lease (liveness) AND the build-watermark floor
-/// (`min_active`) AND the GC-round acknowledgement (`observed_gc_round`). One renewal PUT stamps the
-/// clock, the build-watermark floor, AND the last-INSTALLED GC-round ack together (spec
-/// 2026-07-06-decouple: `observed_round_fn` READS the installed round — it no longer loads the view;
-/// the dedicated retired-view syncer, Task 3, advances that installed round on its own thread). Anchors
-/// the slot synchronously on `start`,
-/// renews it async off the write path, and fails closed on any foreign touch (`renewOnce` throws on a
+/// Per-server MERGED heartbeat: one `SingleWriterSlot` over the per-server-root mount object carries
+/// the mount lease (liveness) AND the build-watermark floor (`min_active`). One renewal PUT stamps the
+/// clock and the build-watermark floor together. Anchors the slot synchronously on `start`, renews it
+/// async off the write path, and fails closed on any foreign touch (`renewOnce` throws on a
 /// precondition miss). `graceful stop` folds the watermark farewell (`min_active = UINT64_MAX`) into
 /// the terminal already-expired mount body.
 ///
@@ -302,15 +286,13 @@ std::vector<MountInfo> listMounts(Backend & backend, const Layout & layout, uint
 class MountLeaseKeeper final : public SingleWriterSlot
 {
 public:
-    /// `min_active_fn_` / `observed_round_fn_` are read OFF the state lock on each beat (via
-    /// `prepareRenew`) and stamped into the mount body — the merged watermark floor and the acked GC
-    /// round. Both reach into the Store's own locks, so they must never run under `state_mutex`.
-    /// `observed_round_fn_` is the cheap in-memory reader (`Store::observedGcRound`, spec
-    /// 2026-07-06-decouple) — it never loads the retired view itself.
+    /// `min_active_fn_` is read OFF the state lock on each beat (via `prepareRenew`) and stamped into
+    /// the mount body — the merged watermark floor. It reaches into the Store's own lock, so it must
+    /// never run under `state_mutex`.
     MountLeaseKeeper(
         BackendPtr backend_, const Layout & layout_, const String & srid_, UInt128 server_uuid_,
         uint64_t writer_epoch_, std::chrono::milliseconds ttl_, std::function<uint64_t()> now_ms_fn_,
-        std::function<uint64_t()> min_active_fn_, std::function<uint64_t()> observed_round_fn_,
+        std::function<uint64_t()> min_active_fn_,
         CasEventSink event_sink_ = {});
 
     /// Claims (adopts) the mount slot for (server_uuid, writer_epoch) with seq following the observed
@@ -348,9 +330,6 @@ private:
     std::chrono::milliseconds ttl;
     std::function<uint64_t()> now_ms_fn;
     std::function<uint64_t()> min_active_fn;
-    /// Reads the last-INSTALLED GC round (cheap, in-memory); never loads the view (spec
-    /// 2026-07-06-decouple).
-    std::function<uint64_t()> observed_round_fn;
     std::function<void()> on_renew_ok;
     std::function<void()> on_lost;
     CasEventSink event_sink;
