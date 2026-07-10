@@ -384,7 +384,13 @@ void PostgreSQLHandler::sendParameterStatusData(PostgreSQLProtocol::Messaging::S
     else
         message_transport->send(PostgreSQLProtocol::Messaging::ParameterStatus("client_encoding", "UTF8"));
 
-    message_transport->send(PostgreSQLProtocol::Messaging::ParameterStatus("server_version", VERSION_STRING));
+    /// VERSION_STRING may carry a non-numeric flavour suffix (e.g. ".altinityantalya") that .NET's System.Version.Parse rejects; keep only the leading numeric portion.
+    String server_version(VERSION_STRING);
+    if (auto suffix_pos = server_version.find_first_not_of("0123456789."); suffix_pos != String::npos)
+        server_version.erase(suffix_pos);
+    while (!server_version.empty() && server_version.back() == '.')
+        server_version.pop_back();
+    message_transport->send(PostgreSQLProtocol::Messaging::ParameterStatus("server_version", server_version));
     message_transport->send(PostgreSQLProtocol::Messaging::ParameterStatus("server_encoding", "UTF8"));
     message_transport->send(PostgreSQLProtocol::Messaging::ParameterStatus("DateStyle", "ISO"));
     message_transport->flush();
