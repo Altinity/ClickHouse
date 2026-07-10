@@ -1837,3 +1837,27 @@ infra/measurement gaps (not CA defects — all had dangling=0 + agreement):
 - **REMAINING VALIDATION:** (a) rebuild clickhouse with the fix + remount + re-run the 4h exit soak — a
   NEW wedge must NOT form (the real end-to-end gate; the stand that repro'd ran the pre-fix binary at soak
   launch); (b) unwedge/validate REBUILD FORCE on the live stand (after its dropped-table refs settle).
+
+## STATUS ROLLUP 2026-07-10 (session close-out)
+FIXED + validated this session (entries above kept for history):
+- CRASH-CA-S3-staged-entries-without-Build — FIXED (inline-path buildFor).
+- STATELESS-CA-S3 condemn-race (01156/01710/02346, tokened INSERT) — FIXED (promote resurrect-on-condemn),
+  green under the full lane.
+- PROMOTE-CONDEMN-TOKENLESS (03283, DETACH/freeze) — FIXED (in-closure copy-forward backstop), green.
+- GC-WEDGE-REMOVAL-FOLD (P1) — FIXED (orphan sweep pending-committed-removal protection) + INTROSPECTION-3
+  part 1 (sweep emits a ManifestDelete audit event). Validated: RED/GREEN gtest + consult + verify-soak
+  (0 wedge clamps, GC reclaims) + clean fsck (dangling=0, unreachable=0).
+- WRITER-GC-SIMPLIFICATION Phase A — DONE + validated (all gates, dangling=0). Phase B Gate B (raw-body +
+  three-state meta) GREEN; writing-plans + impl remain.
+- SOAK-TTL-BAND / SOAK-FREEZE_LONG / SOAK-REAPER — FIXED earlier this session.
+
+STILL OPEN (debt):
+- TLA+ wedge regression gate — needs committed-removal scoping / meta-model (fold into Phase-B Gate B).
+- CA-ASAN-SUITE — negative-LOGICAL_ERROR tests abort under abort-on-logical-error builds (GTEST_SKIP guard).
+- INTROSPECTION-3 part 2 — namespace-qualify manifest object_hash in the event log (collision footgun).
+- INTROSPECTION-2 — verify done (ca-inspect exists + used); confirm/close.
+- 4 non-correctness CA-s3 stateless fails: 03582/03800 (parallel-replica timeouts), 00933 (TTL timing),
+  03829 (write-path memory). + ~31 local-env fails (not CA).
+- PROMOTE-OVER-COMMITTED-LEAK / ABANDON-RETIRE-ORDERING (2026-07-08, prior-session audit) — status unverified.
+- Gate B follow-ups: resurrect-skip-CAS + delete-meta-before-body need finer interleaving.
+- Phase B implementation (writing-plans → subagent impl).
