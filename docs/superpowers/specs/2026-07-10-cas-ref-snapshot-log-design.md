@@ -45,7 +45,7 @@ persists changes by appending one `_log` object.
 - Preserve a single authoritative commit point for every ref mutation.
 - Preserve the `RootOwnerEvent` owner-transition semantics that `GC`, `fsck`, and manifest cleanup rely
   on today.
-- Make `dropNamespace` and other multi-ref mutations atomic within one namespace via a single log record.
+- Make bounded multi-ref mutations atomic within one namespace via a single log record.
 - Let `GC` compact old log records into snapshots without becoming a second live ref index.
 - Keep cross-namespace operations re-drivable rather than introducing distributed transactions.
 
@@ -96,8 +96,10 @@ body is therefore not a separate state. Corrupt bytes, hash mismatch, or future 
 fail-closed exceptions.
 
 Snapshots are derived recovery bases. A snapshot is never a second live index, and snapshot existence
-alone is never sufficient authority to trim log records. Log trim is authorized only by the adopted
-`GC` fold cursor published through `gc/state`.
+alone is never sufficient authority to trim log records. The adopted `GC` fold cursor published through
+`gc/state` is also not sufficient by itself. A namespace log prefix can be trimmed only after there is
+both an adopted fold cursor and a durable adopted snapshot for the same namespace incarnation and
+cursor.
 
 ## Namespace Layout {#namespace-layout}
 
@@ -177,19 +179,25 @@ magic. It repeats key-derived fields so decode can validate key/body agreement:
 RefLogTxn {
   header
   seq
-  body_hash
   namespace_incarnation
   repeated RefOp ops
 }
 ```
 
+`body_hash` is computed over the deterministic serialized bytes of `RefLogTxn` exactly as stored in the
+object body. The body does not contain a `body_hash` field, so the key hash has no circular dependency.
+
 `RefOp` supports:
 
 ```text
+namespace_birth(namespace_incarnation, birth_gc_round)
 owner_transition(old_binding?, new_binding?)
 set_payload(ref, expected_manifest_ref, mutable_files, published_at_ms)
 namespace_tombstone(drop_id)
 ```
+
+`namespace_birth` is allowed only as the first operation in the first log record for a namespace
+incarnation. It creates the replay context needed by later inline records.
 
 `owner_transition` is the direct replacement for `RootOwnerEvent`. It preserves the existing model:
 
@@ -204,7 +212,8 @@ second per-ref patch log. It must validate that the current committed ref still 
 `expected_manifest_ref`.
 
 `namespace_tombstone` has no reachability delta. It marks the namespace intentionally dropped after all
-explicit owner removals in the same transaction.
+explicit owner removals in the same transaction or in prior removal chunks of the same
+`dropNamespace` protocol.
 
 ## Operation Mapping {#operation-mapping}
 
@@ -212,16 +221,22 @@ The logical operations map to the new log as follows:
 
 | Current operation | New log encoding |
 |---|---|
-| `precommitAdd` | inline `precommit`, or `tx` if key length requires it |
+| `precommitAdd` | inline `precommit` for an existing namespace; `tx` with `namespace_birth` plus `owner_transition` for the first namespace event; `tx` if key length requires it |
 | `promote` | `tx` with `owner_transition` plus `set_payload` |
 | `abandon` | inline `abandon`, or `tx` if key length requires it |
 | `dropRef` | inline `drop`, or `tx` if key length requires it |
 | `updateRefPayload` | `tx` with one `set_payload` full replacement |
-| `dropNamespace` | `tx` with many committed-owner removals plus `namespace_tombstone` |
+| `dropNamespace` | bounded `tx` chunks of committed-owner removals, followed by a final `namespace_tombstone` |
 
 `promote` is intentionally a `tx`, not an inline `commit` event. The current `CAS` atomically performs
 both the owner move and initial `RootRef` payload installation. The new format preserves that atomicity
 by putting both operations in one transaction body.
+
+Every body-bearing transaction has a hard encoded size limit. A mutation that would exceed the limit
+must fail before writing a log record unless it has a specified chunked protocol. Large `dropNamespace`
+uses chunked explicit owner removals and writes `namespace_tombstone` only after all removal chunks are
+durable. During a chunked drop, readers may observe the remaining committed refs until their removal
+records are appended; the operation remains re-drivable after interruption.
 
 ## Writer Startup {#writer-startup}
 
@@ -231,19 +246,28 @@ A writable `Store` reconstructs namespace state before serving writes:
 LIST cas/refs/<server_root>/
 group keys by archive namespace
 for each namespace:
-  choose latest valid snapshot
-  load snapshot
-  replay log records with seq > snapshot.seq
+  choose latest valid adopted snapshot or empty base
+  load snapshot if present
+  replay log records with seq > base.seq
   build committed refs, live precommit bindings, namespace lifecycle state
-  next_seq = max(snapshot.seq, max_seen_log_seq) + 1
+  next_seq = max(base.seq, max_seen_log_seq) + 1
 ```
 
 The writer must read snapshot plus tail logs. Snapshot-only startup would lose events not yet folded by
 `GC`.
 
-The latest snapshot is load-bearing. If the latest snapshot object is present but corrupt, has a future
-format version, or fails key/body validation, startup fails closed. It must not silently fall back to an
-older snapshot because that can hide corruption.
+An adopted snapshot is one whose `(namespace_incarnation, seq, gc_round)` is covered by the current
+`gc/state` fold cursor for that namespace. Unadopted snapshots are ignored for startup and never
+authorize trim. A writer that observes any snapshot candidate must read `gc/state` to select the latest
+adopted snapshot. If `gc/state` cannot be read, writable startup fails closed unless it can prove that
+no snapshot exists for that namespace and replays from the empty base.
+
+The latest adopted snapshot is load-bearing. If that snapshot object is present but corrupt, has a
+future format version, or fails key/body validation, startup fails closed. It must not silently fall
+back to an older adopted snapshot because that can hide corruption.
+
+When startup uses the empty base, the first replayed log record for that namespace must be a
+body-bearing transaction whose first operation is `namespace_birth`.
 
 Gaps in the log sequence are fail-closed for writable startup. Duplicate representations for the same
 `seq` are valid only if they name the same object and the same bytes. Different keys for the same `seq`
@@ -273,6 +297,10 @@ The mount lease and local write fence continue to guard the writer. This design 
 writer per server root. `GC` may read logs and write snapshots, but it does not append writer semantic
 log records.
 
+Immediately before appending any build-scoped record, the writer must re-check the local write fence and
+prove that the build sequence is still active under the namespace lock. A retired build, a lost writer
+lease, or a writer epoch mismatch is an exception before any `_log` object is written.
+
 ## Read Path And Caches {#read-path-and-caches}
 
 Same-`Store` reads resolve refs from the in-memory namespace state. The old `readShardDecoded` cache is
@@ -296,14 +324,15 @@ heartbeat floor
 LIST cas/refs/
 group by namespace
 for each namespace:
-  load latest valid snapshot
+  load latest valid adopted snapshot
   replay observed log tail
   fold owner transitions after prior folded cursor
   clamp before non-foldable record
 write generation artifacts
 CAS gc/state publishing adopted generation and folded cursors
 write or adopt namespace snapshots for adopted cursors
-trim log records <= adopted cursor
+verify durable snapshot cursors
+trim log records <= durable adopted snapshot cursor
 post-CAS cleanup
 ```
 
@@ -336,15 +365,18 @@ The snapshot must contain enough state to:
 - Protect manifest bodies whose removal `-1` has not yet been sealed.
 - Let `GC rebuild` over-protect rather than under-protect if `gc/state` is lost.
 
-Trim is authorized by the adopted fold cursor in `gc/state`, not by snapshot existence:
+Trim is authorized by the pair of an adopted fold cursor in `gc/state` and a durable adopted snapshot:
 
 ```text
-delete _log records with seq <= cursor
-only after gc/state has adopted the generation containing that cursor
+delete _log records with seq <= snapshot.seq
+only after gc/state has adopted the generation containing snapshot.seq
+and the snapshot for that namespace incarnation and seq is durable and valid
 ```
 
-If `GC` dies after writing a snapshot but before the `gc/state` `CAS`, old logs remain. If it dies after
-the `gc/state` `CAS` but before trim, old logs remain and are trimmable in a later round.
+If `GC` dies after writing a snapshot but before the `gc/state` `CAS`, old logs remain and the snapshot
+is ignored. If it dies after the `gc/state` `CAS` but before writing the namespace snapshot, old logs
+also remain; a later round must not trim by the adopted cursor alone. If it dies after both adoption and
+snapshot write but before trim, old logs remain and are trimmable in a later round.
 
 ## Dead Precommit Cleanup {#dead-precommit-cleanup}
 
@@ -359,19 +391,32 @@ represented in the adopted fold and snapshot:
 This preserves the purpose of `Gc::reclaimAbandonedPrecommit` without making `GC` a competing semantic
 log writer.
 
-A stale in-memory writer attempting to promote a snapshot-reclaimed precommit must fail closed. The
-implementation can satisfy this by ensuring the namespace writer lock observes the current namespace
-state before `promote`, and by proving that any precommit eligible for `GC` reclaim is below the durable
-mount watermark. This path needs a TLA gate before implementation.
+A stale in-memory writer attempting to append a build-scoped record for a snapshot-reclaimed precommit
+must fail closed. The eligibility rule is:
+
+- `GC` may reclaim a precommit from an old writer epoch only after the mount state proves that epoch is
+  fenced.
+- `GC` may reclaim a precommit from the current writer epoch only after the writer has durably published
+  that `build_sequence` is below its active-build floor or has durably retired that build.
+- The writer must remove or invalidate retired builds in memory before publishing the active-build floor
+  that makes them reclaimable.
+- Any build-scoped record, including `precommit`, `promote`, and `abandon`, must re-check the write
+  fence, writer epoch, and active-build membership under the namespace lock immediately before appending
+  the record.
+
+With those rules, a running writer does not need to adopt a `GC` snapshot to reject a dead precommit:
+active precommits are not reclaimable, and reclaimable precommits are no longer writable by the local
+writer. The TLA model must cover stale build-scoped writes after snapshot reclaim explicitly.
 
 ## Namespace Incarnation And Birth Floor {#namespace-incarnation-and-birth-floor}
 
 The replacement for `RootShard::incarnation` is a namespace incarnation carried by snapshots and
-body-bearing transactions. Inline events inherit the writer's current namespace incarnation from
-in-memory state and the surrounding replay context.
+body-bearing transactions. Inline events are valid only after replay has established namespace state for
+that incarnation. An inline event is forbidden to create a namespace.
 
 The replacement for `RootShard::fence_round` is a namespace birth floor. The first event that creates
-an archive namespace records the current `GC` round, equivalent to the current newborn self-floor.
+an archive namespace must be a body-bearing transaction whose first operation is `namespace_birth` with
+the current `GC` round, equivalent to the current newborn self-floor.
 
 `GC` coverage and trim cursors must include the namespace incarnation. If an archive namespace is
 dropped, reclaimed, and later recreated at the same path, old fold cursors must not skip the new log.
@@ -380,9 +425,12 @@ dropped, reclaimed, and later recreated at the same path, old fold cursors must 
 
 - Uncertain `putIfAbsent`: retry the same key and bytes. Identical object means success; different bytes
   means exception.
-- Corrupt latest snapshot: fail closed.
+- Corrupt latest adopted snapshot: fail closed.
 - Body hash mismatch: fail closed.
+- Body hash computation includes the deterministic stored transaction body and excludes the object key.
 - Body `seq`, kind, or namespace mismatch: fail closed.
+- Transaction body over the hard size limit: fail before writing unless the operation uses its specified
+  chunked protocol.
 - Unknown future body version: fail closed.
 - Log gap on writable startup: fail closed.
 - Log gap during `GC`: abort or clamp, but never trim past the gap.
@@ -390,6 +438,7 @@ dropped, reclaimed, and later recreated at the same path, old fold cursors must 
 - Missing log body cannot occur separately from the marker because body-bearing records are single
   objects.
 - Inline key over limit: use `tx` before writing; never truncate or silently alter `ref`.
+- Inline first event for a namespace: fail closed.
 
 ## Code Impact {#code-impact}
 
@@ -411,21 +460,22 @@ TLA model:
 
 - Writer `precommit`, `promote`, `abandon`, `drop`, `updateRefPayload`, and `dropNamespace`.
 - `GC` fold, snapshot adoption, trim, and dead-precommit snapshot reclaim.
-- Sabotage cases for trim-before-adopt, snapshot-only recovery, dead-precommit promote after reclaim,
-  duplicate `seq`, and namespace ABA.
+- Sabotage cases for trim-before-adopt, snapshot-only recovery, dead-precommit build-scoped write after
+  reclaim, adopted cursor without durable snapshot, duplicate `seq`, and namespace ABA.
 
 Unit tests:
 
 - Inline key parsing and validation.
-- `tx` body validation, hash mismatch, key/body `seq` mismatch.
+- `tx` body validation, hash mismatch, key/body `seq` mismatch, and first-event `namespace_birth`.
 - Startup replay from snapshot plus tail.
 - Idempotent retry of same `_log` key.
 - Gap and duplicate conflict detection.
 - `shadowNamespace` adds `@cas@`.
+- Large `dropNamespace` uses chunked removals before `namespace_tombstone`.
 
 `GC` tests:
 
-- Trim only after adopted cursor.
+- Trim only after adopted cursor plus durable adopted snapshot.
 - Unadopted snapshot never authorizes trim.
 - Dead precommit reclaim via snapshot/fold.
 - Pending removal manifest body protection.
@@ -446,8 +496,9 @@ Integration and soak:
 - Keep a single authoritative commit point: the `_log` object.
 - Store body-bearing event bodies directly in `_log`, not in separate `_tx` or `_payload` objects.
 - Inline only single owner-transition records: `precommit`, `abandon`, and `drop`.
-- Use generic `tx` for `promote`, `payload`, `dropNamespace`, long-key fallback, and future multi-op
-  namespace transactions.
+- Use generic `tx` for `promote`, `payload`, bounded `dropNamespace` chunks, long-key fallback, first
+  namespace birth, and future multi-op namespace transactions.
+- Require trim to have both an adopted `GC` cursor and a durable adopted namespace snapshot.
 - Require `@cas@/_log` and `@cas@/_snap`.
 - Fix shadow namespaces to include `@cas@`; no migration needed.
 - Keep cross-namespace operations re-drivable rather than atomic.
