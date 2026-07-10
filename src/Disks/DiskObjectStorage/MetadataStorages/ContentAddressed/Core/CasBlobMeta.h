@@ -12,29 +12,22 @@
 namespace DB::Cas
 {
 
-/// The per-hash meta descriptor lifecycle (spec 2026-07-09 §raw-body-refinement). The meta is the SOLE
-/// linearization point for a content hash: its backend etag (the "gen") is the only conditional token.
-/// The body is raw immutable content (etag == content); it carries no state.
+/// The per-hash meta descriptor lifecycle (spec 2026-07-09 §raw-body-refinement, v3). The meta is a
+/// 2-state FRESHNESS MARKER, not a linearization point: the body's in-body incarnation_tag plus
+/// exact-token delete is the safety core, and the meta is only a point-read for the writer's dedup gate.
 enum class MetaState : uint8_t
 {
     Clean = 0,       /// referenceable; body present (INV-META-BODY)
     Condemned = 1,   /// GC marked in-degree 0; body STILL present (a writer may resurrect by CAS)
-    Tombstone = 2,   /// GC won the delete race; body deletion in progress / done — never adoptable
 };
 
-/// The durable meta body (fixed codec, ~a few dozen bytes). `version` guards codec evolution; `size` is
-/// the raw body size (introspection/fsck/GC accounting — reads never consult the meta). `incarnation` is
-/// a fresh nonce (mintU128()) minted on every WRITE of a meta object (create or CAS-transition): S3
-/// ETags are content-derived, so without a per-write nonce two `Clean` metas for the same hash with the
-/// same state/condemn_round/size would re-encode to identical bytes — and hence an identical etag — a
-/// latent ABA on the clean->condemned CAS precondition. With the nonce, "meta etag = incarnation" is
-/// literally true.
+/// The durable meta body (fixed codec, ~a couple dozen bytes). `version` guards codec evolution; `size`
+/// is the raw body size (introspection/fsck/GC accounting — reads never consult the meta).
 struct BlobMeta
 {
-    uint8_t version = 2;
+    uint8_t version = 1;
     MetaState state = MetaState::Clean;
-    UInt128 incarnation{};         /// fresh per-write nonce (mintU128()); makes every write's bytes unique
-    uint64_t condemn_round = 0;   /// the GC round that condemned this incarnation (M4: guards a
+    uint64_t condemn_round = 0;   /// the GC round that condemned this blob (M4: guards a
                                   /// condemned-etag ABA after spare->re-condemn)
     uint64_t size = 0;
 };

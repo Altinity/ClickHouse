@@ -11,16 +11,15 @@ extern const int CORRUPTED_DATA;
 using namespace DB::Cas;
 using namespace DB::Cas::tests;
 
-TEST(CasBlobMeta, CodecRoundTripsAllStates)
+TEST(CasBlobMeta, CodecRoundTripsBothStates)
 {
-    for (MetaState s : {MetaState::Clean, MetaState::Condemned, MetaState::Tombstone})
+    for (MetaState s : {MetaState::Clean, MetaState::Condemned})
     {
-        BlobMeta m{.state = s, .condemn_round = 42, .size = 1 << 20};   // version defaults to 2 (current codec)
+        BlobMeta m{.version = 1, .state = s, .condemn_round = 42, .size = 1 << 20};
         const BlobMeta back = decodeBlobMeta(encodeBlobMeta(m));
         EXPECT_EQ(static_cast<uint8_t>(back.state), static_cast<uint8_t>(s));
         EXPECT_EQ(back.condemn_round, 42u);
         EXPECT_EQ(back.size, 1u << 20);
-        EXPECT_EQ(back.version, 2u);
     }
 }
 
@@ -60,20 +59,9 @@ TEST(CasBlobMeta, DeleteMetaExactMatchesEtag)
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openStoreForTest(backend);
     const DB::UInt128 h = u128Of("hash-b");
-    putMetaIfAbsent(*backend, store->layout(), h, BlobMeta{.state = MetaState::Tombstone});
+    putMetaIfAbsent(*backend, store->layout(), h, BlobMeta{.state = MetaState::Condemned});
     const auto lm = loadMeta(*backend, store->layout(), h);
     ASSERT_TRUE(lm.has_value());
     EXPECT_EQ(deleteMetaExact(*backend, store->layout(), h, lm->etag).kind, DeleteOutcome::Kind::Deleted);
     EXPECT_FALSE(loadMeta(*backend, store->layout(), h).has_value());
-}
-
-TEST(CasBlobMeta, FreshIncarnationMakesEachWriteUnique)
-{
-    BlobMeta a{.state = MetaState::Clean, .size = 1};
-    BlobMeta b{.state = MetaState::Clean, .size = 1};
-    a.incarnation = DB::Cas::mintU128();
-    b.incarnation = DB::Cas::mintU128();
-    EXPECT_NE(a.incarnation, b.incarnation);
-    EXPECT_NE(encodeBlobMeta(a), encodeBlobMeta(b));   // distinct bytes -> distinct S3 etag
-    EXPECT_EQ(decodeBlobMeta(encodeBlobMeta(a)).incarnation, a.incarnation);   // round-trips
 }

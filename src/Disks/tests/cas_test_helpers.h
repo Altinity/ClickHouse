@@ -36,24 +36,6 @@
 #include <unistd.h>
 #include <vector>
 
-namespace DB::Cas
-{
-
-/// TEST-ONLY minter, algorithm-identical to the production `mintU128()` defined in the anonymous
-/// namespace of `CasBuild.cpp` (two `thread_local_rng` draws composed into a UInt128; used there to
-/// mint build ids and, on every write, a fresh `incarnation_tag`/meta `incarnation`). The production
-/// helper has internal linkage private to that translation unit, so it is not reachable from test
-/// code; this duplicate lets test helpers and gtests mint a real fresh nonce the same way production
-/// does (Task 1B, `BlobMeta::incarnation`) without widening CasBuild.cpp's public surface.
-inline UInt128 mintU128()
-{
-    const UInt64 hi = thread_local_rng();
-    const UInt64 lo = thread_local_rng();
-    return (static_cast<UInt128>(hi) << 64) | lo;
-}
-
-}
-
 namespace DB::Cas::tests
 {
 
@@ -517,20 +499,16 @@ inline void writeRawBlobBody(DB::Cas::Backend & backend, const DB::Cas::Layout &
     backend.casPut(layout.blobKey(DB::Cas::BlobId(DB::Cas::u128ToHex(hash))), payload, std::nullopt);
 }
 
-/// Create a Clean meta descriptor for `hash` via the shared meta-ops layer (putMetaIfAbsent). Mints a
-/// fresh `incarnation` nonce (as every production write site does — Task 1B) so the meta's bytes/etag
-/// are unique to this write.
+/// Create a Clean meta descriptor for `hash` via the shared meta-ops layer (putMetaIfAbsent).
 inline void writeMetaClean(DB::Cas::Backend & backend, const DB::Cas::Layout & layout,
                            const DB::UInt128 & hash, uint64_t size)
 {
     DB::Cas::putMetaIfAbsent(backend, layout, hash,
-        DB::Cas::BlobMeta{.state = DB::Cas::MetaState::Clean, .incarnation = DB::Cas::mintU128(),
-                          .condemn_round = 0, .size = size});
+        DB::Cas::BlobMeta{.state = DB::Cas::MetaState::Clean, .condemn_round = 0, .size = size});
 }
 
 /// Transition an existing meta descriptor to Condemned at `condemn_round`, via a read-modify-CAS on
-/// its current etag (asserts the meta exists — a test setup helper, not production code). Mints a
-/// fresh `incarnation` nonce for the transition (every write mints fresh — Task 1B).
+/// its current etag (asserts the meta exists — a test setup helper, not production code).
 inline void condemnMeta(DB::Cas::Backend & backend, const DB::Cas::Layout & layout,
                         const DB::UInt128 & hash, uint64_t condemn_round)
 {
@@ -538,7 +516,6 @@ inline void condemnMeta(DB::Cas::Backend & backend, const DB::Cas::Layout & layo
     ASSERT_TRUE(lm.has_value());
     DB::Cas::BlobMeta c = lm->meta;
     c.state = DB::Cas::MetaState::Condemned;
-    c.incarnation = DB::Cas::mintU128();
     c.condemn_round = condemn_round;
     DB::Cas::casMeta(backend, layout, hash, lm->etag, c);
 }
