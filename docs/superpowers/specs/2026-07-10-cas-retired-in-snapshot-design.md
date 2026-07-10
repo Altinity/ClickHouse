@@ -1,5 +1,5 @@
 ---
-description: 'Design spec: fold the GC retired list into the per-shard in-degree run (3-cursor to 2-cursor settlement merge) — one artifact family, first-durable-write-wins adoption anchored by the fold seal, retired_refs removed from gc/state.'
+description: 'Design spec: fold the GC retired list into the per-shard in-degree run (3-cursor to 2-cursor settlement merge) — one artifact family, deterministic byte-equal adoption preserved via the attempt-pinning invariant, retired_refs removed from gc/state.'
 sidebar_label: 'CAS retired-in-snapshot'
 sidebar_position: 10
 slug: /superpowers/specs/cas-retired-in-snapshot
@@ -151,41 +151,45 @@ stateless invariant (`sum(entries_redeleted) >= sum(objects_deleted)`) must pass
 **only** against `delete_pending` rows read from the *prior durable adopted* run; fresh
 observations (`head_blob` tokens) are write-only in the pass that mints them and become actionable
 only after durable adoption. The acting round always re-reads the token from the durable artifact.
-This is today's retired-list semantics carried over — it is what makes first-write-wins adoption
-safe under divergent replay (§4).
+This is today's retired-list semantics carried over.
 
 ## 4. Adoption and integrity {#adoption}
 
-The determinism boundary moves down one level:
+**The merged run stays a deterministic artifact — the adoption rule does not change at all.**
+(Amended after external review, 2026-07-10: the first draft proposed first-write-wins adoption
+with the integrity anchor moved to the seal; that rested on a false premise and is withdrawn.)
 
-- **Run:** `putIfAbsent`; on `PreconditionFailed` → GET the existing object and use **its** bytes
-  (first-durable-write-wins — the rule `RetiredSet` has today, `CasGc.cpp:2021`). No byte-equal
-  check: a same-attempt replay may legitimately re-observe a different `head_blob` token, so
-  byte-equality is not a meaningful tripwire for observation-bearing content. New helper beside
-  `putDeterministicArtifact` (`Core/CasBlobInDegree.h:29`):
-  `String putFirstWriteWins(Backend &, const String & key, String bytes)` — returns the durable
-  bytes (own or adopted). The `RunRef.checksum` and the seal summary are computed **from the
-  returned durable bytes**.
-- **Seal:** rule unchanged — `putDeterministicArtifact`, byte-equal-or-`CORRUPTED_DATA`. It stays
-  deterministic because it is anchored on durable run bytes: a replay re-reads the same durable
-  runs → same checksums and summaries → byte-identical seal.
+- **Run:** `putDeterministicArtifact` unchanged — `putIfAbsent`; on `PreconditionFailed`
+  byte-equal-or-`CORRUPTED_DATA` (`Core/CasBlobInDegree.h:29`).
+- **Seal:** `putDeterministicArtifact` unchanged; `RunRef.checksum` and the `condemned_summary`
+  are pure functions of the written run bytes.
 - **`gc/state` CAS:** unchanged — the single CAS adopts `{round, snap_generation, snap_attempt}`;
   the condemned state adopts *through the seal* (named by generation + attempt). The one-pass
   round property is preserved; there is no `retired_refs` left to adopt.
-- **Integrity:** read-side, seal-anchored — every reader verifies the run stream against the
-  seal's `RunRef.checksum` (footer checksum machinery unchanged). The write-time divergent-replay
-  tripwire is retired for runs; its remaining job is done by the seal anchor. Keys stay
-  attempt-scoped, so cross-leader collisions are impossible by construction; collisions are
-  same-leader self-retries only.
 
-**Divergent-replay safety argument** (the case the TLA+ gate must close): a leader writes run
-bytes `B1` (token `t1` observed for a fresh condemn), crashes before the seal; the replay
-re-observes token `t2`, computes `B2`, collides at `putIfAbsent`, adopts `B1`. The replay's
-in-memory fresh-condemn view (`t2`) diverges from durable (`t1`) — harmless, because fresh
-condemnations are write-only in their pass (§3): no delete acts on `t2`; the eventual delete
-executes with `t1` re-read from the durable adopted run. Graduation and redelete inputs
-(`prior` run) are durable and identical for both computations. This is exactly the invariant the
-current separate retired list relies on; the relocation does not weaken it.
+**Why byte-equality cannot false-fire on observation content — the attempt-pinning invariant
+(load-bearing, encoded in the TLA+ gate):** the fold mints its artifact keys from
+`attempt = lease.seq`, and the renew/steal paths bump `lease.seq` **every round**
+(`CasGc.cpp:809-814`, `:1372`) — a failed or repeated round always lands under fresh keys. A
+`putIfAbsent` collision at the same key can therefore only be a same-execution resend of the
+**same buffer** (a network-level retry) — byte-identical by construction. There is no reachable
+"same-attempt replay that re-observes a different `head_blob` token": a re-execution is a new
+attempt with new keys. Consequently:
+
+- byte-equality never trips on legitimate operation, and it **hard-catches** the incoherence class
+  an external review raised against the first draft (stale edge bytes silently adopted under a
+  newer sealed coverage — under byte-equal adoption this is `CORRUPTED_DATA`, fail-closed, the
+  round aborts and the next round re-folds under a fresh attempt);
+- the replay-divergence hazard for side effects does not exist: the merge result whose bytes are
+  durable is the same in-memory result that drives the `.meta` writes, B170 events, and outcome
+  tallies — run/meta/event divergence is structurally impossible. (Independently, `BlobMeta`
+  carries no token — `{state, condemn_round, size}` — so condemned-meta content is
+  observation-independent anyway.)
+
+The historical "observation-bearing ⇒ first-write-wins" classification of the retired set
+(`Core/CasBlobInDegree.h:27-28`) becomes obsolete for the relocated state: with attempt-pinned
+keys the condemned rows inherit the deterministic-artifact rule. (The outcome log keeps its
+existing defensive adopt path — out of scope.)
 
 **Crash-completeness:** unchanged — a crash between run PUT and seal/state CAS leaves orphan
 attempt-scoped artifacts that retention prunes (`snap_pruned_through`, B174), exactly as today.
@@ -213,20 +217,23 @@ New small model `docs/superpowers/models/CaRetiredInRun.tla` (+ cfg, runner scri
 `run_*.sh` convention, `tmp/tla2tools.jar`), extending the ack-floor/round family's abstractions:
 
 - State: per-shard adopted artifact = `{edges, condemned rows}` as one atom; `gc/state` names the
-  adopted generation; first-write-wins adoption; seal derived from durable bytes.
-- Actions: fold (2-cursor settle: condemn / spare / graduate / redelete), crash-replay with
-  **divergent observation** (replay writes a different token; first durable wins), competing
-  leader (attempt-scoped keys — no cross-leader key collision), clamp suppression
+  adopted generation; deterministic (byte-equal) adoption; attempt ids minted fresh per round
+  (the attempt-pinning invariant, §4); seal derived from the written bytes.
+- Actions: fold (2-cursor settle: condemn / spare / graduate / redelete), round failure + retry
+  (new attempt, new keys), same-buffer resend (byte-identical collision), competing leader
+  (attempt-scoped keys — no cross-leader key collision), clamp suppression
   (`suppress_destructive`), pure ref-carry (no rewrite when nothing to settle), writer
   resurrect (fresh incarnation between condemn and delete → exact-token delete misses,
   outcome `Replaced`).
 - Invariants: `INV_NO_LOSS` (no referenced blob deleted), `INV_NO_RETURN` (no stale token ever
   deletes a live incarnation), one-pass adoption (settled state visible iff the round's CAS
-  committed), and the write-only-fresh-observations discipline (a delete's token always equals
-  the durably adopted condemn-time token).
-- Sabotage flips (must go red): (a) redelete uses the replay's in-memory token instead of the
-  durable one; (b) byte-equal adoption retained for runs → legitimate divergent replay reaches a
-  false `CORRUPTED_DATA` dead state; (c) graduate without the `condemn_round < current_round`
+  committed), coverage-coherence (the sealed coverage always describes the adopted run bytes),
+  and the write-only-fresh-observations discipline (a delete's token always equals the durably
+  adopted condemn-time token).
+- Sabotage flips (must go red): (a) redelete uses an in-memory token instead of the durable one;
+  (b) attempt-pinning broken — a re-execution reuses the prior attempt's keys at an advanced
+  journal cut → must surface as a byte-equal `CORRUPTED_DATA` refusal (never a silent adoption of
+  stale edges under newer coverage); (c) graduate without the `condemn_round < current_round`
   gate → racing-writer edge loses its spare window.
 
 Gate is green (invariants hold; every sabotage flips red) **before** implementation starts.
@@ -234,7 +241,7 @@ Gate is green (invariants hold; every sabotage flips red) **before** implementat
 ## 7. Testing {#testing}
 
 - **gtests** (`CasBlobInDegree` suites): condemned rows in the merged stream (carry, settle order,
-  zero-marker subsumption, absent-at-condemn), `putFirstWriteWins` collision adoption, seal
+  zero-marker subsumption, absent-at-condemn), deterministic-adopt collision (byte-identical resend adopts; divergent bytes throw), seal
   summary derivation, `key_schema` fail-closed decode, round tests (graduate/redelete over the
   in-run state, clamp suppression carries pending), rebuild path, dryrun/fsck/inspect readers.
 - **e2e:** `05008_ca_gc_snap_prune` must pass **unmodified** (its invariant is
@@ -250,7 +257,7 @@ Gate is green (invariants hold; every sabotage flips red) **before** implementat
 
 1. **Phase 0:** TLA+ gate (§6) — model green + sabotage red.
 2. **Phase 1:** run format — `kCondemned` row, `key_schema` 1, writer/reader/cursor, unit tests.
-3. **Phase 2:** merge and round — 2-cursor `foldDeltasIntoGeneration`, `putFirstWriteWins`,
+3. **Phase 2:** merge and round — 2-cursor `foldDeltasIntoGeneration`,
    seal `condemned_summary`, `graduationDue` / ref-carry from summaries, round wiring.
 4. **Phase 3:** consumers — `fsck`, `ca-inspect`, `previewDeletes`, `hasInFlightRetired`,
    rebuild; delete `RetiredSet` / `CART` / `retiredKey` / `retired_refs` (proto `reserved`).
