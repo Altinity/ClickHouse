@@ -545,8 +545,15 @@ void ExportPartitionManifestUpdatingTask::poll()
                 continue;
             }
 
-            auto destination_file_paths_per_part = readDestinationFilePathsPerPart(
-                zk, fs::path(entry_path), key, log);
+            /// Minor optimization: skip reading file paths per part if the in-memory mirror is complete
+            /// we know it is complete if the status is in terminal state (COMPLETED, FAILED, KILLED) AND we have a local entry
+            const bool processed_cache_complete = has_local_entry
+                && local_entry->status != ExportReplicatedMergeTreePartitionTaskEntry::Status::PENDING;
+
+            std::optional<std::map<String, std::vector<String>>> destination_file_paths_per_part;
+            if (!processed_cache_complete)
+                destination_file_paths_per_part = readDestinationFilePathsPerPart(
+                    zk, fs::path(entry_path), key, log);
 
             /// If we hold the cleanup lock, enforce the task timeout and recover uncommitted exports.
             /// Entries are never removed here, so we always fall through to refresh / addTask below.
