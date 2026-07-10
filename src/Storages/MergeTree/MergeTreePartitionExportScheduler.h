@@ -67,8 +67,10 @@ public:
     std::vector<PartitionExportInfo> getInfo() const;
 
     /// Scheduler tick: schedule pending parts of PENDING tasks and commit tasks whose parts are all
-    /// exported. Invoked periodically from the storage's schedule-pool task.
-    void run();
+    /// exported. Invoked from the storage's schedule-pool task. Returns true if at least one task is
+    /// still PENDING (so the caller should keep polling); false when there is no work left, letting
+    /// the task go idle until the next addTask/startup trigger.
+    bool run();
 
     /// Reloads persisted descriptors from disk and re-pins the parts of PENDING tasks. Called once
     /// during table startup, before background merges can remove parts.
