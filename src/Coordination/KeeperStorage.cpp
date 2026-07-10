@@ -1323,7 +1323,10 @@ Coordination::Error KeeperStorage<Container>::commit(KeeperStorageBase::DeltaRan
                 else if constexpr (std::same_as<DeltaType, AddAuthDelta>)
                 {
                     std::lock_guard auth_lock{auth_mutex};
-                    committed_session_and_auth[operation.session_id].emplace_back(std::move(*operation.auth_id));
+                    /// Copy instead of move because the uncommitted state may still hold
+                    /// a shared_ptr to the same AuthID object, and a concurrent preprocess
+                    /// call can read it without holding auth_mutex.
+                    committed_session_and_auth[operation.session_id].emplace_back(*operation.auth_id);
                     return Coordination::Error::ZOK;
                 }
                 else if constexpr (std::same_as<DeltaType, CloseSessionDelta>)
@@ -1789,8 +1792,7 @@ std::list<KeeperStorageBase::Delta> preprocess(
     ProfileEvents::increment(ProfileEvents::KeeperGetRequest);
 
     if (zk_request.path == Coordination::keeper_api_feature_flags_path
-        || zk_request.path == Coordination::keeper_config_path
-        || zk_request.path == Coordination::keeper_availability_zone_path)
+        || zk_request.path == Coordination::keeper_config_path)
         return {};
 
     if (!storage.uncommitted_state.getNode(zk_request.path))
