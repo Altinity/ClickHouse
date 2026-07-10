@@ -29,6 +29,15 @@ namespace DB::ErrorCodes
 class FiberStack
 {
 private:
+    static constexpr bool guardPagesEnabled()
+    {
+#ifdef DEBUG_OR_SANITIZER_BUILD
+        return true;
+#else
+        return false;
+#endif
+    }
+
     size_t stack_size;
     size_t page_size = 0;
 public:
@@ -39,15 +48,22 @@ public:
     /// way. We will have 80 pages with 4KB page size.
     static constexpr size_t default_stack_size = 320 * 1024; /// 64KB was not enough for tests
 
-    explicit FiberStack(size_t stack_size_ = default_stack_size) : stack_size(stack_size_)
+    explicit FiberStack(size_t stack_size_ = default_stack_size)
+        : stack_size(stack_size_)
     {
         page_size = getPageSize();
     }
 
     boost::context::stack_context allocate() const
     {
-        size_t num_pages = 1 + (stack_size - 1) / page_size;
-        size_t num_bytes = (num_pages + 1) * page_size; /// Add one page at bottom that will be used as guard-page
+        size_t tracked_num_pages = 1 + (stack_size - 1) / page_size;
+        size_t num_pages = tracked_num_pages;
+
+        if constexpr (guardPagesEnabled())
+            /// Add one page at bottom that will be used as guard-page
+            num_pages += 1;
+
+        size_t num_bytes = num_pages * page_size;
 
         void * vp = ::mmap(nullptr, num_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (MAP_FAILED == vp)
@@ -55,15 +71,19 @@ public:
 
         /// TODO: make reports on illegal guard page access more clear.
         /// Currently we will see segfault and almost random stacktrace.
-        if (-1 == ::mprotect(vp, page_size, PROT_NONE))
+        if constexpr (guardPagesEnabled())
         {
-            ::munmap(vp, num_bytes);
-            throw DB::ErrnoException(DB::ErrorCodes::CANNOT_ALLOCATE_MEMORY, "FiberStack: cannot protect guard page");
+            if (-1 == ::mprotect(vp, page_size, PROT_NONE))
+            {
+                ::munmap(vp, num_bytes);
+                throw DB::ErrnoException(DB::ErrorCodes::CANNOT_ALLOCATE_MEMORY, "FiberStack: cannot protect guard page");
+            }
         }
 
         /// Do not count guard page in memory usage.
-        auto trace = CurrentMemoryTracker::alloc(num_pages * page_size);
-        trace.onAlloc(vp, num_pages * page_size);
+        size_t tracked_bytes = tracked_num_pages * page_size;
+        auto trace = CurrentMemoryTracker::alloc(tracked_bytes);
+        trace.onAlloc(vp, tracked_bytes);
 
         boost::context::stack_context sctx;
         sctx.size = num_bytes;
@@ -80,10 +100,19 @@ public:
         VALGRIND_STACK_DEREGISTER(sctx.valgrind_stack_id);
 #endif
         void * vp = static_cast< char * >(sctx.sp) - sctx.size;
+
+        size_t tracked_bytes = sctx.size;
+        if constexpr (guardPagesEnabled())
+        {
+            if (-1 == ::mprotect(vp, page_size, PROT_WRITE | PROT_READ))
+                throw DB::ErrnoException(DB::ErrorCodes::CANNOT_ALLOCATE_MEMORY, "FiberStack: cannot unprotect guard page");
+            tracked_bytes -= page_size;
+        }
+
         ::munmap(vp, sctx.size);
 
         /// Do not count guard page in memory usage.
-        auto trace = CurrentMemoryTracker::free(sctx.size - page_size);
-        trace.onFree(vp, sctx.size - page_size);
+        auto trace = CurrentMemoryTracker::free(tracked_bytes);
+        trace.onFree(vp, tracked_bytes);
     }
 };
