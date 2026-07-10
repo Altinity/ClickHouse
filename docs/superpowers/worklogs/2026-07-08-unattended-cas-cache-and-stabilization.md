@@ -575,3 +575,13 @@ Watchdog cron: job 60470431 (hourly at :23).
   the OPPOSITE way and simpler: keep putDeterministicArtifact byte-equal for the merged run; withdrew
   putFirstWriteWins; attempt-pinning invariant now explicit + a TLA sabotage flip. Spec amended
   (50faf5a27bb). BlobMeta carries no token → meta content observation-independent (P1-2's mechanism moot).
+
+### 2026-07-11 — 00163 classified (cancellation-boundary flake, not CAS) + lane boot re-validated
+- Point-run 00163 in isolation: FAIL 0.54s with the same `TOO_MANY_ROWS max 20M, current 20.02M` on
+  `system.numbers` — an infinite-stream + `LIMIT 10` short-circuit race against the harness's
+  `max_rows_to_read=20M` guard; passes/fails by scheduler luck (passed this morning, failed now, both
+  isolated). No storage involved → added to the ignore-list memory. Optional upstream nicety: the test
+  could pin `max_rows_to_read=0`; out of CAS scope.
+- Same run re-validated the lane boots fine after the post-mortem pool surgery (owner anchor restore).
+- Final full-lane red-set classification is now COMPLETE: 22 tpc_ds + ~16 heavy = web-disk internet
+  weather; 6 = arch/infra ignore-list; 00163 = cancellation flake. ZERO CAS-caused reds.
