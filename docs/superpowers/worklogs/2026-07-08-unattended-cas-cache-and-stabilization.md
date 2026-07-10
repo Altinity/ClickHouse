@@ -307,3 +307,30 @@ Watchdog cron: job 60470431 (hourly at :23).
   refinement: the blob envelope can be dropped entirely. Follow-up (finer interleaving needed): resurrect-
   skip-CAS + delete-meta-before-body are liveness/debris at this granularity (GC delete gated on NoRef),
   not safety — noted in the model. NEXT: writing-plans for Phase B on the final design.
+
+### 2026-07-10 — Phase B plan CONSULT found a CRITICAL bug → terminal-tombstone rework
+- Wrote docs/superpowers/plans/2026-07-10-cas-meta-descriptor-raw-body.md (commit 4215d4a8d8b). Re-ran +
+  persisted Gate B raw-body evidence (tmp/tlc_CaMetaDescriptorRaw_*.log): reduced GREEN, 4 sabotages RED.
+  Task 1 (BlobMeta codec + shared meta-ops layer) DONE+committed ba883680114 (4/4 + 542/542 green).
+- Adversarial fresh-model consult (opus) on the PLAN → **NEEDS-REWORK**. THE bug (CRITICAL #1+#2):
+  raw immutable bodies make resurrect-FROM-TOMBSTONE unsafe. Seq: GC wins condemned→tombstone(E2);
+  writer loadMeta→tombstone, re-streams body (412, body token T UNCHANGED because raw=immutable),
+  casMeta(E2→clean); GC (already decided) HEADs body→T, deleteExact(body,T) SUCCEEDS → committed ref
+  DANGLES. My C2 reasoning was INVERTED: the OLD envelope minted a fresh incarnation_tag on resurrect →
+  new body etag → GC's exact-token delete MISSED the live body; raw bodies removed exactly that shield.
+  And the TLA model couldn't catch it: GcDeletePhaseB atomically conjoined "meta==tombstone" with
+  "delete body" — an atomicity S3 cannot provide.
+- FIX (consult-recommended, adopted): **tombstone is TERMINAL.** Resurrect legal ONLY from condemned
+  (its condemned→clean CAS races GC's condemned→tombstone on the shared etag; one wins). A writer seeing
+  tombstone WAITS for absent (GC finished delete) then fresh-uploads; NEVER tombstone→clean. Plus restore
+  a fresh `incarnation` u128 nonce in BlobMeta (finding #8: S3 etags are content-derived → clean metas
+  would ABA; nonce makes "etag=incarnation" literally true + model-faithful).
+- Other consult findings folded into the rework: #3 add INV_NO_LOSS+INV_NO_RETURN to the model + note
+  Task-5 ledger machinery is outside the gate (targeted tests); #4 Task 6 also removes RoundReport::min_ack
+  (CasGc.h:80/.cpp:143/191), graduationDueForTest(min_ack) (CasGc.h:389), CasInspect.cpp:224 observed_gc_round
+  render; #5 ca-inspect raw-body branch (delete/repoint CasEnvelope decode for bodies) + schedule CasEnvelope
+  removal; #6 keep the large-body head-first guard in putBlob (B168 P2/B187); #7 add a deterministic
+  GC-delete-vs-writer race test; #9 fix the dead putIfAbsentStream no-op; #10/#13 reconcile delete order +
+  graduation off-by-one (current_round=state.round+1); #11/#12 schedule retiredLogicalSize/payloadOffset/
+  blob_header_len removal, FsckReport::clean() includes meta_without_body. NEXT: rewrite model (re-run gate),
+  spec raw-body section, plan Tasks 0b/1-followup/2-7, then resume impl.
