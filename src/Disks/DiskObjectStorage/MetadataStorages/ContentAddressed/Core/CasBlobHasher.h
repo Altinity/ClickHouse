@@ -26,6 +26,12 @@ enum class BlobHashAlgo : uint8_t
 /// `"sha256"`. Throws `BAD_ARGUMENTS` for an out-of-range enum value.
 std::string_view blobHashAlgoName(BlobHashAlgo algo);
 
+/// The digest byte width for `algo`: 16 for the 128-bit hashes (`CityHash128`, `XXH3_128`), 32 for
+/// the 256-bit `Sha256` (CAS pluggable-blob-hash Phase 2, design §12). Derives `PoolMeta::blob_hash_len`
+/// from the pool's recorded `blob_hash_algo` and sizes the `DigestCodec` (`CasBlobDigest.h`). Throws
+/// `BAD_ARGUMENTS` for an out-of-range enum value (same fail-closed contract as `blobHashAlgoName`).
+uint64_t blobHashLenFor(BlobHashAlgo algo);
+
 /// Parses the per-disk `blob_hash` CONFIG value: `"cityhash128"` | `"xxh3-128"` | `"sha256"`. Throws
 /// `BAD_ARGUMENTS` on any other value (fail-closed). Note that `"sha256"` parses successfully here --
 /// rejecting it as `NOT_IMPLEMENTED` in Phase 1 is the CALLER's job (the config layer), the same way

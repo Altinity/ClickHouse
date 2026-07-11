@@ -44,6 +44,19 @@ std::string_view blobHashAlgoName(BlobHashAlgo algo)
     throw Exception(ErrorCodes::BAD_ARGUMENTS, "blobHashAlgoName: unknown BlobHashAlgo {}", static_cast<int>(algo));
 }
 
+uint64_t blobHashLenFor(BlobHashAlgo algo)
+{
+    switch (algo)
+    {
+        case BlobHashAlgo::CityHash128:
+        case BlobHashAlgo::XXH3_128:
+            return 16;
+        case BlobHashAlgo::Sha256:
+            return 32;
+    }
+    throw Exception(ErrorCodes::BAD_ARGUMENTS, "blobHashLenFor: unknown BlobHashAlgo {}", static_cast<int>(algo));
+}
+
 BlobHashAlgo parseBlobHashAlgo(std::string_view config_value)
 {
     if (config_value == "cityhash128")

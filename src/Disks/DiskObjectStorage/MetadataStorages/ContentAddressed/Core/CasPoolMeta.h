@@ -30,6 +30,14 @@ struct PoolMeta
     /// cityHash128 pools). Fixed at pool creation; on reopen the recorded value is authoritative
     /// (`createOrValidate` fails closed on a disagreeing config, spec §8 — never re-hash a pool).
     uint8_t blob_hash_algo = 1;
+    /// CAS pluggable-blob-hash Phase 2 (design §12, Task 1): the pool's digest byte width, derived
+    /// from `blob_hash_algo` via `blobHashLenFor` (16 for `CityHash128`/`XXH3_128`, 32 for `Sha256`).
+    /// NOT an independently persisted field yet (Phase 2 Task 6 adds real persistence + fail-close
+    /// validation) -- `decodePoolMeta` and `createOrValidate` always RE-DERIVE it from the decoded/
+    /// validated `blob_hash_algo`, so it can never drift from the algo it comes from. Feeds
+    /// `DigestCodec` (`CasBlobDigest.h`), the ONE object all digest<->hex/bytes conversion routes
+    /// through.
+    uint64_t blob_hash_len = 16;
 
     /// GET `_pool_meta`; absent => mint `pool_id` (`thread_local_rng`) and `casPut(expected=nullopt)` —
     /// a racing creator loses the CAS, re-reads, and validates like a reopen. Present => strict parse.

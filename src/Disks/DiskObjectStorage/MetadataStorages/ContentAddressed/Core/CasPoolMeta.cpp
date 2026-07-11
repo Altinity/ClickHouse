@@ -113,6 +113,9 @@ PoolMeta decodePoolMeta(std::string_view data)
     /// A persisted object violating the constant invariants is corruption, not a config error.
     validateConstants(pm.root_shards, pm.blob_header_len, pm.blob_hash_algo, ErrorCodes::CORRUPTED_DATA, "pool meta");
 
+    /// blob_hash_algo is now known-valid (validateConstants above) -- derive the digest width from it.
+    pm.blob_hash_len = blobHashLenFor(static_cast<BlobHashAlgo>(pm.blob_hash_algo));
+
     /// Startup gate: if min_reader_generation > G_BUILD, this binary is too old to open the pool.
     if (G_BUILD < pm.min_reader_generation)
         throw Exception(ErrorCodes::UNKNOWN_FORMAT_VERSION,
@@ -165,6 +168,7 @@ PoolMeta PoolMeta::createOrValidate(
     pm.blob_header_len = blob_header_len;
     pm.min_reader_generation = 0;   /// pre-release: no minimum reader generation required
     pm.blob_hash_algo = static_cast<uint8_t>(blob_hash_algo);
+    pm.blob_hash_len = blobHashLenFor(blob_hash_algo);
 
     if (backend.casPut(key, encodePoolMeta(pm), /*expected*/ std::nullopt).outcome == CasOutcome::Committed)
         return pm;
