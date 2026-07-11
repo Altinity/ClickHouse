@@ -1931,3 +1931,14 @@ in isolation — a pre-existing order-dependent-flake / shared-state issue, not 
 - PROCESS NOTE: a subagent's helper monitor autonomously armed a `docker compose down -v` on a disk threshold
   (security-flagged). Controller policy: disk-safety teardown of the EPHEMERAL ca-soak cluster is fine and
   mandated at >85%, but the controller (not a subagent's detached monitor) manages it; never `ci/tmp/rustfs`.
+
+## S07 manifest-cap fail-close — now covered by gtest 2026-07-11 (commit 81b40ae0df2)
+Acting on the finding that S07's manifest-cap fail-close is NOT SQL-scenario-reachable: added
+`CasBuild.ManifestCapEncodedBytesOverThrowsBeforeBodyWrite` + `...JustUnderStagesSuccessfully`
+(`gtest_cas_build.cpp`). The over-cap manifest is built by MEASURING the actual `encodePartManifest`
+output (a Blob `ManifestEntry` with a long path walked to the exact byte boundary of the 256 MiB
+`kMaxManifestEncodedBytes` cap) — not a hand-derived size. Asserts `stageManifest` throws BEFORE any body
+write (fail-closed), and that a just-under manifest stages. The P0 cap is now validated at unit level.
+Remaining sub-gap: the ordinal cap (`kMaxManifestOrdinal`=999,999) has no test-injection point and needs
+~1e6 real calls — documented, not forced into a slow test. S07-as-a-SQL-scenario stays effectively
+inconclusive-by-design; the gtest is the real coverage.
