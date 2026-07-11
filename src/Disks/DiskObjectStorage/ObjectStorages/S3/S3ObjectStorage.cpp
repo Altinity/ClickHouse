@@ -64,6 +64,7 @@ namespace Setting
 
 namespace S3RequestSetting
 {
+    extern const S3RequestSettingsBool allow_native_copy;
     extern const S3RequestSettingsBool check_objects_after_upload;
     extern const S3RequestSettingsUInt64 list_object_keys_size;
     extern const S3RequestSettingsUInt64 objects_chunk_size_to_delete;
@@ -76,6 +77,7 @@ namespace ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
     extern const int LOGICAL_ERROR;
+    extern const int NOT_IMPLEMENTED;
     extern const int S3_ERROR;
 }
 
@@ -730,6 +732,69 @@ void S3ObjectStorage::copyObject( // NOLINT
         scheduler,
         [&, this]{ return readObject(object_from, read_settings_to_use);},
         object_to_attributes);
+}
+
+ConditionalCopyResult S3ObjectStorage::copyObjectConditional( // NOLINT
+    const StoredObject & object_from,
+    const StoredObject & object_to,
+    const ReadSettings & read_settings,
+    const WriteSettings &,
+    std::optional<ObjectAttributes> object_to_attributes)
+{
+    auto current_client = client.get();
+    auto settings_ptr = s3_settings.get();
+
+    /// `copyS3File`'s `If-None-Match` precondition is only honored on the native server-side copy
+    /// path (`CopyObject` / `CompleteMultipartUpload`): if native copy is disabled it silently falls
+    /// back to an unconditional read-write copy (`copyDataToS3File`), which would defeat the
+    /// write-once guarantee the content-addressed staging promote relies on. Fail closed instead of
+    /// racing an unconditional overwrite onto what may already be a live blob.
+    if (!settings_ptr->request_settings[S3RequestSetting::allow_native_copy])
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+            "Conditional (write-once) object copy requires the native S3 copy path, which is disabled "
+            "(allow_native_copy=false) for object storage {}", getName());
+
+    auto size = S3::getObjectSize(*current_client, uri.bucket, object_from.remote_path, {});
+    auto scheduler = threadPoolCallbackRunnerUnsafe<void>(getThreadPoolWriter(), ThreadName::S3_COPY_POOL);
+    const auto read_settings_to_use = patchSettings(read_settings);
+
+    String dest_etag;
+    try
+    {
+        copyS3File(
+            /*src_s3_client=*/current_client,
+            /*src_bucket=*/uri.bucket,
+            /*src_key=*/object_from.remote_path,
+            /*src_offset=*/0,
+            /*src_size=*/size,
+            /*dest_s3_client=*/current_client,
+            /*dest_bucket=*/uri.bucket,
+            /*dest_key=*/object_to.remote_path,
+            settings_ptr->request_settings,
+            read_settings_to_use,
+            BlobStorageLogWriter::create(disk_name),
+            scheduler,
+            [&, this]{ return readObject(object_from, read_settings_to_use);},
+            object_to_attributes,
+            /*if_none_match=*/"*",
+            /*out_dest_etag=*/&dest_etag);
+    }
+    catch (S3Exception & exc)
+    {
+        /// A `412 Precondition Failed` is the expected "lost the race" signal (the destination
+        /// already exists), not an error: detect it the same way `removeObjectIfTokenMatches` detects
+        /// the `If-Match` loss on conditional delete (the AWS SDK does not map this to a dedicated
+        /// `S3Errors` enum value, so the canonical `<Code>` string is the only reliable discriminator).
+        if (exc.getExceptionName() == "PreconditionFailed"
+            || exc.message().find("PreconditionFailed") != std::string::npos)
+            return {.created = false, .dest_etag = {}};
+
+        /// Any other failure (network error, access denied, etc.) is a real error and must propagate:
+        /// never silently treat it as "lost the race".
+        throw;
+    }
+
+    return {.created = true, .dest_etag = dest_etag};
 }
 
 void S3ObjectStorage::shutdown()

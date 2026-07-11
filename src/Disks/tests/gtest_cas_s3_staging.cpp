@@ -72,3 +72,24 @@ TEST(CasS3Staging, DefaultConstructedStorageReportsLocalAndNoConditionalCopy)
     EXPECT_EQ(storage->s3StagingMinBytes(), 64ULL << 20);
     EXPECT_FALSE(storage->conditionalCopySupported());
 }
+
+/// Task 2 of the S3-native staging plan: `IObjectStorage::copyObjectConditional` (write-once
+/// conditional server-side copy) — the interface-level contract. Backends without an enforced,
+/// native conditional copy MUST NOT override the default: it fail-closes with `NOT_IMPLEMENTED`,
+/// exactly like the existing `IObjectStorage::removeObjectIfTokenMatches` default (never silently
+/// falls back to an unconditional overwrite). `LocalObjectStorage` (used by
+/// `makeLocalObjectStorageForTest`) does not override `copyObjectConditional`, so it exercises the
+/// base-class default directly. Live 412-vs-created S3 semantics are covered by the Task 7
+/// integration test (with_rustfs); this is deliberately just the fail-closed contract test.
+TEST(CasS3Staging, DefaultCopyObjectConditionalThrowsNotImplemented)
+{
+    auto storage = DB::Cas::tests::makeLocalObjectStorageForTest();
+
+    const DB::StoredObject from{"cas_s3_staging_conditional_copy_from"};
+    const DB::StoredObject to{"cas_s3_staging_conditional_copy_to"};
+
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NOT_IMPLEMENTED, [&]
+    {
+        storage->copyObjectConditional(from, to, DB::ReadSettings{}, DB::WriteSettings{});
+    });
+}

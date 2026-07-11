@@ -244,10 +244,17 @@ namespace
                     continue; /// will retry
                 }
                 ProfileEvents::increment(ProfileEvents::WriteBufferFromS3RequestsErrors, 1);
+                /// Preserve the S3 exception name (e.g. `PreconditionFailed` for a rejected
+                /// `If-None-Match` on `CompleteMultipartUpload`) on the thrown exception: `GetErrorType()`
+                /// alone maps an unmodeled error like a 412 to `UNKNOWN`, so callers that need to detect
+                /// a specific condition (a write-once conditional copy losing the race) must be able to
+                /// read `S3Exception::getExceptionName()`, mirroring how `S3ObjectStorage::removeObjectIfTokenMatches`
+                /// reads `AWSError::GetExceptionName()` directly off the (not-yet-thrown) outcome.
                 throw S3Exception(
+                    fmt::format("Message: {}, Key: {}, Bucket: {}, Tags: {}",
+                        outcome.GetError().GetMessage(), dest_key, dest_bucket, fmt::join(multipart_tags.begin(), multipart_tags.end(), " ")),
                     outcome.GetError().GetErrorType(),
-                    "Message: {}, Key: {}, Bucket: {}, Tags: {}",
-                    outcome.GetError().GetMessage(), dest_key, dest_bucket, fmt::join(multipart_tags.begin(), multipart_tags.end(), " "));
+                    outcome.GetError().GetExceptionName());
             }
         }
 
@@ -778,13 +785,17 @@ namespace
                     continue; /// will retry
                 }
 
+                /// Preserve the S3 exception name for the same reason as the `CompleteMultipartUpload`
+                /// throw in `completeMultipartUpload()` above (a 412 on a conditional `CopyObject` maps
+                /// to `S3Errors::UNKNOWN`; the exception name is the only reliable discriminator).
                 throw S3Exception(
+                    fmt::format("Message: {}, Key: {}, Bucket: {}, Object size: {}",
+                        outcome.GetError().GetMessage(),
+                        dest_key,
+                        dest_bucket,
+                        size),
                     outcome.GetError().GetErrorType(),
-                    "Message: {}, Key: {}, Bucket: {}, Object size: {}",
-                    outcome.GetError().GetMessage(),
-                    dest_key,
-                    dest_bucket,
-                    size);
+                    outcome.GetError().GetExceptionName());
             }
         }
 
