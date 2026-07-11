@@ -23,6 +23,7 @@
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedWriteBuffers.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobHasher.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasCodecUtil.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEnvelope.h>
@@ -711,4 +712,209 @@ TEST(CasPluggableHash, ReaderGenerationIsRaisedToTwo)
         expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [&]
         { Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"}); });
     }
+}
+
+/// ============================================================================================
+/// CAS mixed-algo pools Phase 3 T6 (design 2026-07-11-cas-mixed-algo-pools-design.md §9.3/§9.5):
+/// cross-cutting cruxes over a pool that genuinely mixes algos end-to-end (reclaim + distinctness).
+/// The no-bare-digest grep gates (design Step 3) are run separately, not as gtest bodies.
+/// ============================================================================================
+
+/// spec §9.3 -- THE reclaim crux. A pool admits BOTH `ch128` and `sha256`; an orphan blob body is
+/// planted directly under EACH algo's segment (mirrors `Sha256BlobSeenByCondemnSweepAndFsckNotSilentlySkipped`'s
+/// fixture, widened to two algos). `rebuildBaseline(force)` must condemn BOTH into the SAME baseline
+/// (`previewDeletes` surfaces both refs), and driving the round-paced pipeline to completion (graduate,
+/// then the exact-token delete) must reclaim BOTH bodies -- the backend ends up holding ZERO blob
+/// bytes of EITHER algo, and fsck reports clean.
+///
+/// MUST GO RED if any settlement/sweep/graduation/delete path silently narrows to one algo -- e.g. a
+/// condemn-sweep LIST that only walks `blobs/ch128/`, a graduation/delete loop that iterates a
+/// digest-only set and coalesces the two algos' entries, or an fsck reachability check that stops
+/// after the first algo it sees.
+TEST(CasPluggableHash, TwoAlgoOrphansBothFullyReclaimed)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = Store::open(backend,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1,
+                   .blob_hash_algo = BlobHashAlgo::CityHash128, .gc_trim_min_events = 0,
+                   .gc_fold_max_defer_rounds = 0});
+    /// Admit sha256 into the SAME pool from a second mount, then pull the union into `store`'s cache
+    /// (mirrors `ForeignAlgoSegmentIsDebrisNotOurs`'s admission fixture).
+    Store::open(backend,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "test2", .root_shards = 1,
+                   .blob_hash_algo = BlobHashAlgo::Sha256, .blob_hash_allow_new = true});
+    store->refreshAdmittedAlgos();
+    ASSERT_TRUE(store->isAlgoAdmitted(BlobHashAlgo::Sha256));
+
+    /// Two orphan blobs -- one per algo -- written directly at their content keys: no manifest ever
+    /// references either, so the LIST/HEAD pipeline-blindness sweep is the ONLY path that can ever
+    /// condemn them.
+    auto writeOwnOrphan = [&](BlobHashAlgo algo, size_t size) -> std::pair<BlobRef, String>
+    {
+        const std::string payload = makeMultiBlockPayload(size);
+        const BlobDigest digest = codecFor(algo).fromHex(blobHashHexOneShot(algo, payload));
+        const BlobRef ref{algo, digest};
+        const String key = store->layout().blobKey(ref);
+        EnvelopeHeader header;
+        header.kind = ObjectKind::Blob;
+        header.hash_algo = static_cast<uint8_t>(algo);
+        header.domain_id = store->poolMeta().pool_id;
+        header.incarnation_tag = UInt128(0x1234);
+        header.build_id = UInt128(0x5678);
+        header.pad_to_header_len = static_cast<uint32_t>(store->poolMeta().blob_header_len);
+        backend->putIfAbsent(key, encodeEnvelopeHeader(header) + payload);
+        return {ref, key};
+    };
+    const auto [ch_ref, ch_key] = writeOwnOrphan(BlobHashAlgo::CityHash128, 5001);
+    const auto [sh_ref, sh_key] = writeOwnOrphan(BlobHashAlgo::Sha256, 5002);
+    ASSERT_TRUE(backend->head(ch_key).exists);
+    ASSERT_TRUE(backend->head(sh_key).exists);
+
+    Gc gc(store, UInt128(1));
+    const RebuildReport rep = gc.rebuildBaseline(/*force*/ true);
+    ASSERT_TRUE(rep.performed) << rep.refusal;
+
+    /// previewDeletes covers BOTH refs from the fresh baseline -- never just one algo.
+    {
+        const std::vector<Gc::PreviewEntry> preview = gc.previewDeletes();
+        ASSERT_EQ(preview.size(), 2u);
+        std::unordered_set<BlobRef, BlobRefHash> refs;
+        for (const auto & p : preview)
+            refs.insert(p.ref);
+        EXPECT_TRUE(refs.count(ch_ref));
+        EXPECT_TRUE(refs.count(sh_ref));
+    }
+
+    /// Drive the round-paced pipeline to actual physical deletion: the rebuild condemned both at the
+    /// minted round; the VERY NEXT round graduates them (unconditionally, round-paced); the round
+    /// after that executes the exact-token delete for both.
+    {
+        const RoundReport rep1 = gc.runRegularRound();
+        EXPECT_EQ(rep1.graduated, 2u) << "both algos' orphans must graduate together in one round";
+        EXPECT_TRUE(backend->head(ch_key).exists);   // pending: still present this pass
+        EXPECT_TRUE(backend->head(sh_key).exists);
+    }
+    {
+        const RoundReport rep2 = gc.runRegularRound();
+        EXPECT_EQ(rep2.redeleted, 2u) << "both algos' pending deletes must execute together in one round";
+    }
+
+    /// THE CRUX: after graduation the backend holds ZERO blob bodies of EITHER algo.
+    EXPECT_FALSE(backend->head(ch_key).exists) << "the ch128 orphan must be physically reclaimed";
+    EXPECT_FALSE(backend->head(sh_key).exists) << "the sha256 orphan must be physically reclaimed";
+
+    const FsckReport frep = runFsck(*store, /*detail=*/true);
+    EXPECT_TRUE(frep.clean());
+    EXPECT_EQ(frep.dangling, 0u);
+}
+
+/// spec §9.5 -- same-digest-different-algo end-to-end. `ch128:X` and `xxh3:X` share the SAME 16-byte
+/// digest VALUE but are DISTINCT blob identities (`BlobRef` is the pair): distinct object keys, distinct
+/// `.meta`, distinct bodies, distinct settlement rows (fold both -> distinct in-degree per ref), and
+/// dropping ONE ref's committed manifest reclaims ONLY that algo's blob -- the other stays fully
+/// readable throughout.
+///
+/// MUST GO RED if anything upstream of `BlobRef` ever collapses identity to the bare digest (e.g. a
+/// settlement/meta/condemn site keyed on `BlobDigest` alone) -- the two blobs would alias into one row
+/// and dropping one ref would (wrongly) reclaim or corrupt the other.
+TEST(CasPluggableHash, SameDigestDifferentAlgoDistinctBodiesAndSettlement)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = Store::open(backend,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1,
+                   .blob_hash_algo = BlobHashAlgo::CityHash128, .gc_trim_min_events = 0,
+                   .gc_fold_max_defer_rounds = 0});
+    Store::open(backend,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "test2", .root_shards = 1,
+                   .blob_hash_algo = BlobHashAlgo::XXH3_128, .blob_hash_allow_new = true});
+    store->refreshAdmittedAlgos();
+    ASSERT_TRUE(store->isAlgoAdmitted(BlobHashAlgo::XXH3_128));
+
+    /// SAME 16-byte digest VALUE under two different algos -- deliberately NOT derived from either
+    /// body's real content hash: the crux under test is identity distinctness (the pair), not hash
+    /// correctness (already covered by the sha256/xxh3 write-path tests above).
+    const BlobDigest shared_digest = BlobDigest::fromU128(UInt128(0xC0FFEE));
+    const BlobRef ref_ch{BlobHashAlgo::CityHash128, shared_digest};
+    const BlobRef ref_xx{BlobHashAlgo::XXH3_128, shared_digest};
+    /// Distinct content, not merely distinct length: `makeMultiBlockPayload` at two different sizes
+    /// would make the shorter body a byte-for-byte PREFIX of the longer one (same repeating pattern
+    /// from the same phase), which would defeat the "must not contain" assertions below.
+    const std::string body_ch = makeMultiBlockPayload(4001);
+    std::string body_xx = makeMultiBlockPayload(4002);
+    std::reverse(body_xx.begin(), body_xx.end());
+    ASSERT_NE(body_ch, body_xx);
+
+    const RootNamespace ns{"srv1/tbl"};
+
+    BuildInfo info_a;
+    info_a.intended_ref = ns.string() + "/part_a";
+    auto build_a = store->startBuild(info_a);
+    build_a->putBlob(ref_ch, BlobSource::fromString(body_ch));
+    ManifestEntry e_a;
+    e_a.path = "a.bin"; e_a.placement = EntryPlacement::Blob; e_a.ref = ref_ch; e_a.blob_size = body_ch.size();
+    const ManifestId mid_a = build_a->stageManifest({e_a});
+    build_a->precommitAdd(ns, "part_a", mid_a);
+    build_a->promote(ns, "part_a", build_a->buildId(), mid_a);
+
+    BuildInfo info_b;
+    info_b.intended_ref = ns.string() + "/part_b";
+    auto build_b = store->startBuild(info_b);
+    build_b->putBlob(ref_xx, BlobSource::fromString(body_xx));
+    ManifestEntry e_b;
+    e_b.path = "b.bin"; e_b.placement = EntryPlacement::Blob; e_b.ref = ref_xx; e_b.blob_size = body_xx.size();
+    const ManifestId mid_b = build_b->stageManifest({e_b});
+    build_b->precommitAdd(ns, "part_b", mid_b);
+    build_b->promote(ns, "part_b", build_b->buildId(), mid_b);
+    store->renewWatermarkOnce();
+
+    /// Distinct object keys and distinct bodies despite the SAME digest value.
+    const String key_ch = store->layout().blobKey(ref_ch);
+    const String key_xx = store->layout().blobKey(ref_xx);
+    EXPECT_NE(key_ch, key_xx);
+    const auto raw_ch = backend->get(key_ch);
+    const auto raw_xx = backend->get(key_xx);
+    ASSERT_TRUE(raw_ch.has_value());
+    ASSERT_TRUE(raw_xx.has_value());
+    EXPECT_NE(raw_ch->bytes.find(body_ch), String::npos);
+    EXPECT_NE(raw_xx->bytes.find(body_xx), String::npos);
+    EXPECT_EQ(raw_ch->bytes.find(body_xx), String::npos) << "the ch128 body must not contain the xxh3 payload";
+    EXPECT_EQ(raw_xx->bytes.find(body_ch), String::npos) << "the xxh3 body must not contain the ch128 payload";
+
+    /// Distinct `.meta` objects.
+    const String meta_ch = store->layout().blobMetaKey(ref_ch);
+    const String meta_xx = store->layout().blobMetaKey(ref_xx);
+    EXPECT_NE(meta_ch, meta_xx);
+    EXPECT_TRUE(backend->head(meta_ch).exists);
+    EXPECT_TRUE(backend->head(meta_xx).exists);
+
+    /// Distinct settlement (in-degree per ref, keyed on the FULL `BlobRef` pair -- never the shared
+    /// bare digest, which would alias the two rows into one).
+    Gc gc(store, UInt128(1));
+    gc.runRegularRound();
+    {
+        const GcState st = decodeGcState(backend->get(store->layout().gcStateKey())->bytes);
+        const CasFoldSeal seal = decodeFoldSeal(
+            backend->get(store->layout().foldSealKey(st.snap_generation, st.snap_attempt))->bytes);
+        EXPECT_EQ(inDegreeInGeneration(*backend, seal.blob_target_runs, ref_ch), 1);
+        EXPECT_EQ(inDegreeInGeneration(*backend, seal.blob_target_runs, ref_xx), 1);
+    }
+
+    /// Dropping ONLY `part_a`'s committed ref condemns+reclaims ONLY `ch128:X`; `xxh3:X` (the SAME
+    /// digest value, a DIFFERENT algo) stays referenced and fully readable throughout.
+    store->dropRef(ns, "part_a");
+    gc.runRegularRound();   // condemns ch128:X (in-degree drops to 0); xxh3:X is untouched (still ref'd)
+    gc.runRegularRound();   // graduates ch128:X
+    gc.runRegularRound();   // executes the exact-token delete for ch128:X
+
+    EXPECT_FALSE(backend->head(key_ch).exists) << "ch128:X must be reclaimed once its ref is dropped";
+    EXPECT_TRUE(backend->head(key_xx).exists)
+        << "THE CRUX: xxh3:X (same digest value, different algo) must remain readable after ch128:X "
+           "is reclaimed -- a digest-only settlement would have condemned/deleted both together";
+    const auto still_readable = backend->get(key_xx);
+    ASSERT_TRUE(still_readable.has_value());
+    EXPECT_NE(still_readable->bytes.find(body_xx), String::npos);
+
+    const FsckReport frep = runFsck(*store, /*detail=*/true);
+    EXPECT_TRUE(frep.clean());
+    EXPECT_EQ(frep.dangling, 0u);
 }
