@@ -1914,3 +1914,20 @@ Tests: `PhantomDanglingFromRepublishedRefIsReresolvedAway`, `...FromDroppedRef..
 race). NOTE (unrelated test hygiene): ~5 tests (`CasInstrumentedBackend`, `CasObservability`,
 `CasStoreBackpressure`, `UniqueKeyIndexCache`) fail only under a broad combined `*Ca*` gtest filter but pass
 in isolation — a pre-existing order-dependent-flake / shared-state issue, not a CA correctness bug.
+
+## S01/S07 ci/full-scale attempt 2026-07-11 — S01 memory behavior CONFIRMED good; S07 cap NOT SQL-reachable (finding)
+- **S01 (memory-materialization):** the dev-scale run already shows the resolved streaming behavior clearly —
+  peak MemoryResident 0.52 GB for a 64 MiB blob, RSS growth only **51 MiB** (RSS does NOT scale with blob
+  size), CasBlobPut=5, multipart used, replicas byte-identical, fsck dangling=0. The "inconclusive" is purely
+  the dev-scale attribution threshold (blob 64 MiB < 128 MiB), NOT a defect — `Build::putBlob` streams (fix
+  `S01-PUTBLOB-MEMORY-FIXED`). A clean ci/full run to formalize the "<blob size" verdict is still nice-to-have
+  but the evidence is already conclusive that RSS is bounded.
+- **S07 (manifest cap) — FINDING:** at `--scale full` the probe uses a 20000-column wide insert, which is
+  prohibitively slow (>20 min on the single insert, did not complete) AND — per the card's own note — the
+  manifest cap is "3+ orders of magnitude above dev SQL reach." Conclusion: **the manifest-cap fail-close is
+  effectively NOT exercisable via a SQL scenario even at full scale.** It should be validated by a DIRECT /
+  unit-level test (a synthetic manifest that exceeds the cap → assert fail-close), not by a scenario insert.
+  Recommend converting S07 from a SQL-scale probe to a gtest of the cap, or accepting it as not-scenario-testable.
+- PROCESS NOTE: a subagent's helper monitor autonomously armed a `docker compose down -v` on a disk threshold
+  (security-flagged). Controller policy: disk-safety teardown of the EPHEMERAL ca-soak cluster is fine and
+  mandated at >85%, but the controller (not a subagent's detached monitor) manages it; never `ci/tmp/rustfs`.
