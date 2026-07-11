@@ -58,9 +58,9 @@ TEST(CaDedupCache, AddThenContains)
 {
     auto s = Store::open(std::make_shared<InMemoryBackend>(), cfg(64ULL << 20, 1ULL << 20));
     const DB::UInt128 h = u128Of("x");
-    EXPECT_FALSE(s->dedupCacheContains(h));
-    s->dedupCacheAdd(h);
-    EXPECT_TRUE(s->dedupCacheContains(h));
+    EXPECT_FALSE(s->dedupCacheContains(DB::Cas::BlobDigest::fromU128(h)));
+    s->dedupCacheAdd(DB::Cas::BlobDigest::fromU128(h));
+    EXPECT_TRUE(s->dedupCacheContains(DB::Cas::BlobDigest::fromU128(h)));
 }
 
 /// Task 2: dedup_cache_bytes == 0 disables the cache — add is a no-op, contains is always false.
@@ -68,8 +68,8 @@ TEST(CaDedupCache, DisabledNeverContains)
 {
     auto s = Store::open(std::make_shared<InMemoryBackend>(), cfg(/*cache_bytes*/ 0, 1ULL << 20));
     const DB::UInt128 h = u128Of("x");
-    s->dedupCacheAdd(h);
-    EXPECT_FALSE(s->dedupCacheContains(h));
+    s->dedupCacheAdd(DB::Cas::BlobDigest::fromU128(h));
+    EXPECT_FALSE(s->dedupCacheContains(DB::Cas::BlobDigest::fromU128(h)));
 }
 
 /// Task 2: the cache is bounded by bytes — at 64 B/entry a 256 B ceiling holds ~4 entries, so the
@@ -78,11 +78,11 @@ TEST(CaDedupCache, BoundedByBytes)
 {
     auto s = Store::open(std::make_shared<InMemoryBackend>(), cfg(/*cache_bytes*/ 256, 1ULL << 20));
     const DB::UInt128 first = u128Of("k0");
-    s->dedupCacheAdd(first);
+    s->dedupCacheAdd(DB::Cas::BlobDigest::fromU128(first));
     for (int i = 1; i < 100; ++i)
-        s->dedupCacheAdd(u128Of("k" + std::to_string(i)));
-    EXPECT_FALSE(s->dedupCacheContains(first));            /// evicted long ago
-    EXPECT_TRUE(s->dedupCacheContains(u128Of("k99")));     /// most recent survives
+        s->dedupCacheAdd(DB::Cas::BlobDigest::fromU128(u128Of("k" + std::to_string(i))));
+    EXPECT_FALSE(s->dedupCacheContains(DB::Cas::BlobDigest::fromU128(first)));            /// evicted long ago
+    EXPECT_TRUE(s->dedupCacheContains(DB::Cas::BlobDigest::fromU128(u128Of("k99"))));     /// most recent survives
 }
 
 /// Task 5 (P1): a cache hit takes the HEAD-first path and skips the body PUT entirely.
@@ -127,7 +127,7 @@ TEST(CaDedupCache, StaleHitFallsThroughToPut)
     auto s = Store::open(counting, cfg(64ULL << 20, 1ULL << 20));
 
     /// Poison the cache: claim "stale" is present though nothing was ever uploaded.
-    s->dedupCacheAdd(u128Of("stale"));
+    s->dedupCacheAdd(DB::Cas::BlobDigest::fromU128(u128Of("stale")));
 
     auto b = s->startBuild({});
     counting->heads = 0;

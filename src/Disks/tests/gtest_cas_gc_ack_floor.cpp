@@ -30,7 +30,7 @@ bool blobExists(InMemoryBackend & b, const Layout & layout, const UInt128 & hash
 std::optional<RetiredEntry> currentEntryFor(Backend & backend, const Layout & layout, const UInt128 & hash)
 {
     for (const RetiredEntry & e : currentRetiredSet(backend, layout, /*shard*/0))
-        if (e.hash == hash)
+        if (e.hash == BlobDigest::fromU128(hash))
             return e;
     return std::nullopt;
 }

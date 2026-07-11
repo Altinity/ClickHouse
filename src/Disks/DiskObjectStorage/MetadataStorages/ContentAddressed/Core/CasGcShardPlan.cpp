@@ -45,8 +45,8 @@ std::vector<RunRef> ShardReducer::reduce(Backend & backend, const Layout & layou
                                          uint64_t new_generation, uint64_t attempt,
                                          std::vector<BlobDelta> shard_deltas,
                                          uint64_t current_round, uint64_t condemn_round,
-                                         const std::function<std::optional<HeadResult>(const UInt128 &)> & head_blob,
-                                         const std::function<std::optional<HeadResult>(const UInt128 &)> & peek_head,
+                                         const std::function<std::optional<HeadResult>(const BlobDigest &)> & head_blob,
+                                         const std::function<std::optional<HeadResult>(const BlobDigest &)> & peek_head,
                                          RetiredMergeResult * out_retired,
                                     bool suppress_destructive,
                                     uint8_t digest_len)

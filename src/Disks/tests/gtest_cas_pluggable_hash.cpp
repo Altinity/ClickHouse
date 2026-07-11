@@ -21,6 +21,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEnvelope.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFsck.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestCodec.h>
@@ -300,4 +301,107 @@ TEST(CasPluggableHash, Xxh3BlobLandsUnderAlgoSegmentAndIsDiscoveredCleanByFsck)
     const bool found = std::any_of(rep.objects.begin(), rep.objects.end(),
         [](const FsckObject & o) { return o.key.find("/blobs/xxh3/") != String::npos; });
     EXPECT_TRUE(found);
+}
+
+/// ============================================================================================
+/// CAS pluggable-blob-hash Phase 2 Task 5 -- THE CRUX (anti-silent-leak regression gate).
+///
+/// Two sites classify a blob by parsing its object-key hex into a hash set: `CasGc.cpp`'s
+/// pipeline-blindness condemn sweep (inside `Gc::rebuildBaseline`) and `CasFsck.cpp`'s
+/// present-but-unreferenced classification. Both used to route through the bare, fixed-width
+/// `hexToU128` (32-hex-only) inside a `catch(...) continue` / no-catch-at-all — so a 64-hex `sha256`
+/// key either (a) fell into the "foreign key shape — not ours" catch and was silently treated as
+/// debris (the condemn sweep: the blob is NEVER condemned — a permanent GC leak), or (b) threw
+/// uncaught out of fsck's present-but-unreferenced loop (a hard fsck failure on a live sha256 pool).
+/// Phase 2 Task 5 ports both to the pool-scoped `DigestCodec::fromHex`, which parses a CORRECT-WIDTH
+/// key (16 OR 32 bytes) — a genuinely foreign key shape (e.g. a `.meta` sibling) still falls into
+/// the catch, but a real sha256 blob no longer does.
+///
+/// This test constructs a `sha256`-algo pool DIRECTLY via `PoolConfig` (this bypasses only the
+/// disk-config *factory* guard in `MetadataStorageFactory.cpp`, which Task 6 removes — `Store::open`
+/// itself has never gated on algo) and writes an unreferenced blob body straight at its 64-hex
+/// content-addressed key (bypassing `Build::putBlob`, whose OWN internal `logical_hash` stays a
+/// fixed 128-bit representation until a later task — see the Task 5 report). It then drives BOTH
+/// crux sites and asserts the blob is CLASSIFIED, not silently skipped as foreign.
+///
+/// MUST GO RED if either port is reverted to `hexToU128`: reverting `CasGc.cpp`'s sweep leaves
+/// `condemned_total == 0` (never condemned) and `previewDeletes()` empty; reverting `CasFsck.cpp`'s
+/// sites either throws out of `runFsck` or leaves the blob unclassified/absent from `unreachable`.
+TEST(CasPluggableHash, Sha256BlobSeenByCondemnSweepAndFsckNotSilentlySkipped)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = Store::open(backend,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1,
+                   .blob_hash_algo = BlobHashAlgo::Sha256, .gc_trim_min_events = 0});
+    ASSERT_EQ(store->poolMeta().blob_hash_len, 32u) << "a sha256 pool must record a 32-byte digest width";
+
+    const DigestCodec codec(store->poolMeta());
+    const std::string payload = makeMultiBlockPayload();
+    const std::string hex = blobHashHexOneShot(BlobHashAlgo::Sha256, payload);
+    ASSERT_EQ(hex.size(), 64u) << "sha256 renders 64 lowercase hex chars";
+    const BlobDigest digest = codec.fromHex(hex);   // round-trip sanity: must not throw at width 32
+
+    /// Write the blob body DIRECTLY at its content key (mirrors `cas_test_helpers.h`'s `writeBlobRaw`,
+    /// widened to a 64-hex id) -- an unreferenced (orphan) blob, exactly the shape the pipeline-blindness
+    /// sweep and fsck's present-but-unreferenced pipeline exist to classify.
+    const BlobId id{hex};
+    const String blob_key = store->layout().blobKey(id);
+    EXPECT_NE(blob_key.find("/blobs/sha256/"), String::npos) << blob_key;
+    {
+        EnvelopeHeader header;
+        header.kind = ObjectKind::Blob;
+        header.hash_algo = static_cast<uint8_t>(BlobHashAlgo::Sha256);
+        header.domain_id = store->poolMeta().pool_id;
+        header.incarnation_tag = UInt128(0x1234);
+        header.build_id = UInt128(0x5678);
+        header.pad_to_header_len = static_cast<uint32_t>(store->poolMeta().blob_header_len);
+        backend->putIfAbsent(blob_key, encodeEnvelopeHeader(header) + payload);
+    }
+    ASSERT_TRUE(backend->head(blob_key).exists) << "the sha256 blob body must be present before the sweep";
+
+    /// ---- Site 1: the condemn sweep (Gc::rebuildBaseline's pipeline-blindness LIST/HEAD repair) ----
+    /// No manifest ever references this blob, so the universe scan's `edge_bearing` set never contains
+    /// its hash: the LIST/HEAD sweep over `blobsPrefix()` is the ONLY path that can ever condemn it.
+    Gc gc(store, UInt128(1));
+    const RebuildReport rep = gc.rebuildBaseline(/*force*/ true);
+    ASSERT_TRUE(rep.performed) << rep.refusal;
+
+    const auto state_bytes = backend->get(store->layout().gcStateKey());
+    ASSERT_TRUE(state_bytes.has_value());
+    const GcState state = decodeGcState(state_bytes->bytes);
+    ASSERT_GT(state.snap_generation, 0u);
+    const auto seal_bytes = backend->get(store->layout().foldSealKey(state.snap_generation, state.snap_attempt));
+    ASSERT_TRUE(seal_bytes.has_value());
+    const CasFoldSeal seal = decodeFoldSeal(seal_bytes->bytes);
+    ASSERT_TRUE(seal.condemned_summary.contains(0)) << "the seal's condemned_summary must be total over gc_shards";
+    EXPECT_EQ(seal.condemned_summary.at(0).condemned_total, 1u)
+        << "THE CRUX: the sha256 orphan blob must be condemned by the pipeline-blindness sweep -- a "
+           "silent-leak regression (a reverted CasGc.cpp codec.fromHex port) leaves this at 0";
+
+    /// previewDeletes streams the SAME adopted seal via the run's own SourceEdgeKeyCodec (never pool
+    /// meta) and must report exactly our blob, at its real 32-byte digest.
+    const std::vector<Gc::PreviewEntry> preview = gc.previewDeletes();
+    ASSERT_EQ(preview.size(), 1u) << "THE CRUX: previewDeletes must surface the condemned sha256 blob";
+    EXPECT_EQ(preview[0].hash, digest);
+    EXPECT_EQ(preview[0].key, blob_key);
+
+    /// ---- Site 2: fsck's present-but-unreferenced classification ----
+    /// Must complete without throwing (a reverted port either throws BAD_ARGUMENTS out of the
+    /// no-try/catch parse sites, or silently drops the blob from every classified set) and must
+    /// physically account for the blob.
+    FsckReport frep;
+    ASSERT_NO_THROW(frep = runFsck(*store, /*detail=*/true));
+    EXPECT_EQ(frep.unreachable, 1u)
+        << "THE CRUX: fsck's physical listing must count the sha256 blob as unreachable-but-present, "
+           "not silently omit it";
+    const auto oit = std::find_if(frep.objects.begin(), frep.objects.end(),
+        [&](const FsckObject & o) { return o.key == blob_key; });
+    ASSERT_NE(oit, frep.objects.end()) << "the sha256 blob must appear in fsck's detailed object list";
+    /// The rebuild above already condemned it into the GC snapshot, so fsck's GC-pipeline-view
+    /// classification (not the generic Unaccounted bucket -- reachable only by width-correctly pairing
+    /// the fsck-side hash against the run's kCondemned row hash) must recognize it as known-to-GC.
+    EXPECT_EQ(oit->cls, FsckClass::PendingGc)
+        << "THE CRUX: fsck must pair the sha256 blob against the GC snapshot's kCondemned row (a "
+           "silent-leak regression in CasFsck.cpp's unref_hashes/in_run_hashes/retired_by_hash port "
+           "leaves this as the generic Unaccounted bucket instead)";
 }

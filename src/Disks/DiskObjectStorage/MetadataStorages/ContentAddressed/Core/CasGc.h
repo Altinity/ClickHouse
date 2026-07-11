@@ -151,7 +151,7 @@ public:
     struct PreviewEntry
     {
         ObjectKind kind = ObjectKind::Blob;
-        UInt128 hash{};
+        BlobDigest hash{};
         String key;
         uint64_t size = 0;
         String reason;          /// "unreachable" | "delete_pending" | "awaiting_graduation"

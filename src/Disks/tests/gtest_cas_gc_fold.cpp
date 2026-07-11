@@ -436,7 +436,7 @@ TEST(CasGcFold, PreviewResolvesCarriedRef)
     // not a delete candidate. Resolution-by-ref is the property under test.
     const auto preview = gc.previewDeletes();
     for (const auto & e : preview)
-        EXPECT_NE(e.hash, blob) << "still-referenced blob must not be surfaced (carried ref resolved to in-degree 1)";
+        EXPECT_NE(e.hash, DB::Cas::BlobDigest::fromU128(blob)) << "still-referenced blob must not be surfaced (carried ref resolved to in-degree 1)";
     EXPECT_EQ(inDegreeOf(*backend, store->layout(), blob), 1)
         << "in-degree through the carried parent ref is 1";
 }

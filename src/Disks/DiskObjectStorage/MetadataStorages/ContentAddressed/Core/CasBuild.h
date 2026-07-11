@@ -164,7 +164,7 @@ private:
     /// observed incarnation via token-conditional putOverwrite. Every failure mode (absent, corrupt,
     /// lost delete race) throws ABORTED — never a blind PUT, never putIfAbsent after a lost race.
     /// Returns the fresh (or adopted-clean) token. O(blob) resident memory — recovery path only.
-    Token copyForwardFromCondemned(const UInt128 & hash, const String & key, HeadResult hr);
+    Token copyForwardFromCondemned(const BlobDigest & hash, const String & key, HeadResult hr);
 
     /// The build's owning root namespace, derived from BuildInfo::intended_ref ("ns/ref" — the ref is the
     /// last `/`-segment; the namespace is everything before it). Sets a manifest body's root_namespace_id.

@@ -1,4 +1,5 @@
 #pragma once
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobDigest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEnvelope.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasToken.h>
 #include <base/types.h>
@@ -60,7 +61,7 @@ struct GcState
 struct RetiredEntry
 {
     ObjectKind kind = ObjectKind::Blob;
-    UInt128 hash{};
+    BlobDigest hash{};
     Token token;          /// the exact incarnation token GC observed (exact-token delete)
     uint64_t size = 0;
     uint64_t condemn_round = 0;   /// the GC round that condemned this incarnation (round-paced

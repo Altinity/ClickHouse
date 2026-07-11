@@ -1,5 +1,6 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobDigest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobHasher.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEvent.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
@@ -400,9 +401,10 @@ public:
 
     /// P1 known-present blob-hash cache (design 2026-06-20, B168). A HINT only — correctness never
     /// depends on it: a hit just makes putBlob go HEAD-first, and a stale hit is caught by that HEAD.
-    /// No-ops when disabled (dedup_cache_bytes == 0).
-    bool dedupCacheContains(const UInt128 & blob_hash) const;
-    void dedupCacheAdd(const UInt128 & blob_hash);
+    /// No-ops when disabled (dedup_cache_bytes == 0). Keyed on the pool-width `BlobDigest` (CAS
+    /// pluggable-blob-hash Phase 2 Task 5) so a 32-byte pool's dedup hint is width-correct.
+    bool dedupCacheContains(const BlobDigest & blob_hash) const;
+    void dedupCacheAdd(const BlobDigest & blob_hash);
     /// Test seam: retained bytes of the manifest decode cache (0 when disabled).
     size_t manifestDecodeCacheBytesForTest() const { return manifest_cache ? manifest_cache->sizeInBytes() : 0; }
     /// The shard a ref name routes to: CityHash64(ref_name) % root_shards. Build uses it to address the
@@ -587,7 +589,7 @@ private:
     /// configured `dedup_cache_bytes` is an honest memory ceiling. nullptr ⇔ disabled.
     struct DedupPresent {};
     struct DedupWeight { size_t operator()(const DedupPresent &) const { return 64; } };
-    using DedupCache = CacheBase<UInt128, DedupPresent, UInt128Hash, DedupWeight>;
+    using DedupCache = CacheBase<BlobDigest, DedupPresent, BlobDigestHash, DedupWeight>;
     std::unique_ptr<DedupCache> dedup_cache;
     Layout pool_layout;
     /// Per-server build watermark (spec 2026-06-16-ca-build-watermark). process_epoch is a random

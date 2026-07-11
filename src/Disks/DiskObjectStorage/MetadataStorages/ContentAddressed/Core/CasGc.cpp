@@ -68,10 +68,12 @@ UInt128 cityHash128(const String & bytes)
     return (static_cast<UInt128>(h.high64) << 64) | static_cast<UInt128>(h.low64);
 }
 
-/// The blob object key for a content hash.
-String blobKeyOf(const Layout & layout, const UInt128 & hash)
+/// The blob object key for a content hash, at the pool's digest width (CAS pluggable-blob-hash Phase 2
+/// Task 5: routed through the pool-scoped `DigestCodec` — never a bare `u128ToHex`, which hard-rejects
+/// any hex length != 32 and would silently misaddress or throw for a 32-byte (sha256) pool's blob).
+String blobKeyOf(const Layout & layout, const DigestCodec & codec, const BlobDigest & hash)
 {
-    return layout.blobKey(BlobId(u128ToHex(hash)));
+    return layout.blobKey(BlobId(codec.toHex(hash)));
 }
 
 /// Defined below; forward-declared so the post-CAS hand-off delete in `runRegularRound` (Task 7) can
@@ -101,27 +103,27 @@ uint64_t deletePrefixWholesale(Backend & backend, const String & prefix, uint64_
 /// fresh zero-in-degree condemn, or a resurrect-supersede re-condemn of the current token). Absent meta
 /// is created fresh; an already-Condemned meta (a racing condemn, or a replay of this same round) is left
 /// alone rather than clobbering a possibly-newer condemn_round.
-void writeCondemnedMeta(Backend & backend, const Layout & layout, const UInt128 & hash,
+void writeCondemnedMeta(Backend & backend, const Layout & layout, const DigestCodec & codec, const BlobDigest & hash,
                        uint64_t condemn_round, uint64_t size)
 {
-    const auto lm = loadMeta(backend, layout, hash);
+    const auto lm = loadMeta(backend, layout, codec, hash);
     const BlobMeta desired{.state = MetaState::Condemned, .condemn_round = condemn_round, .size = size};
     if (!lm)
-        putMetaIfAbsent(backend, layout, hash, desired);
+        putMetaIfAbsent(backend, layout, codec, hash, desired);
     else if (lm->meta.state != MetaState::Condemned)
-        casMeta(backend, layout, hash, lm->etag, desired);
+        casMeta(backend, layout, codec, hash, lm->etag, desired);
 }
 
 /// Drop the meta after its body was physically deleted (or already found absent) by the round's
 /// exact-token delete. NO tombstone -- an absent meta reads exactly like a Clean one (Task 3/4: "absent
 /// means not condemned"). Idempotent: an already-absent meta, or one a racing writer/GC pass already
 /// moved, is a silent no-op.
-void deleteConfirmedMeta(Backend & backend, const Layout & layout, const UInt128 & hash)
+void deleteConfirmedMeta(Backend & backend, const Layout & layout, const DigestCodec & codec, const BlobDigest & hash)
 {
-    const auto lm = loadMeta(backend, layout, hash);
+    const auto lm = loadMeta(backend, layout, codec, hash);
     if (!lm)
         return;
-    deleteMetaExact(backend, layout, hash, lm->etag);
+    deleteMetaExact(backend, layout, codec, hash, lm->etag);
 }
 
 }
@@ -229,6 +231,9 @@ RoundReport Gc::runRegularRound()
 
     const Layout & layout = store->layout();
     Backend & backend = store->backend();
+    /// CAS pluggable-blob-hash Phase 2 Task 5: ONE pool-scoped digest codec for the whole round --
+    /// every blob-content-hash hex render below routes through it (never a bare `u128ToHex`).
+    const DigestCodec codec(store->poolMeta());
     const uint64_t new_round = state.round + 1;
 
     /// R1: token-guarded fence-out of expired mounts (liveness only — graduation itself paces on GC
@@ -348,11 +353,11 @@ RoundReport Gc::runRegularRound()
         RetiredMergeResult & merge = folded.retired_merge[shard];
         for (const RetiredEntry & entry : merge.redelete)
         {
-            const DeleteOutcome del = backend.deleteExact(blobKeyOf(layout, entry.hash), entry.token);
+            const DeleteOutcome del = backend.deleteExact(blobKeyOf(layout, codec, entry.hash), entry.token);
             if (del.created_delete_marker)
                 throw Exception(ErrorCodes::LOGICAL_ERROR,
                     "CAS gc: delete of blob {} created a delete marker — versioning is enabled "
-                    "on the pool (mis-provisioned; the capability probe must reject this)", u128ToHex(entry.hash));
+                    "on the pool (mis-provisioned; the capability probe must reject this)", codec.toHex(entry.hash));
             OutcomeEntry outcome{.kind = entry.kind, .hash = entry.hash, .token = entry.token,
                                  .outcome = del.kind == DeleteOutcome::Kind::Deleted ? OutcomeKind::Deleted
                                           : del.kind == DeleteOutcome::Kind::NotFound ? OutcomeKind::Absent
@@ -365,14 +370,14 @@ RoundReport Gc::runRegularRound()
             {
                 e.type = CasEventType::BlobDelete;
                 e.object_kind = CasEventObjectKind::Blob;
-                e.object_hash = u128ToHex(entry.hash);
+                e.object_hash = codec.toHex(entry.hash);
                 e.token = entry.token.value;
                 e.round = new_round;
                 e.gen = generation;
                 e.outcome = del_outcome;
                 e.reason = "delete_pending published by a prior pass; exact-token delete (pre-CAS)";
                 e.detail = {{"condemn_round", std::to_string(entry.condemn_round)},
-                            {"key", blobKeyOf(layout, entry.hash)}};
+                            {"key", blobKeyOf(layout, codec, entry.hash)}};
             });
             outcomes[shard].entries.push_back(std::move(outcome));
             ++report.redeleted;
@@ -384,8 +389,8 @@ RoundReport Gc::runRegularRound()
             /// reason to touch it on that path at all).
             if (del.kind == DeleteOutcome::Kind::Deleted || del.kind == DeleteOutcome::Kind::NotFound)
             {
-                const UInt128 hash = entry.hash;
-                scheduleMetaJob([this, hash]() { deleteConfirmedMeta(store->backend(), store->layout(), hash); });
+                const BlobDigest hash = entry.hash;
+                scheduleMetaJob([this, hash]() { deleteConfirmedMeta(store->backend(), store->layout(), DigestCodec(store->poolMeta()), hash); });
             }
         }
         for (const RetiredEntry & entry : merge.spared)
@@ -394,13 +399,13 @@ RoundReport Gc::runRegularRound()
                 LOG_WARNING(getLogger("CasGc"),
                     "CAS gc: delete_pending blob {} recovered in-degree — structurally impossible under "
                     "the ack floor (spared anyway, fail-closed); investigate",
-                    u128ToHex(entry.hash));
+                    codec.toHex(entry.hash));
             /// B170: the spare verdict — a publish re-pinned the candidate before graduation.
             EventEmitter{*store}.emit([&](CasEvent & e)
             {
                 e.type = CasEventType::GcRecheckVerdict;
                 e.object_kind = CasEventObjectKind::Blob;
-                e.object_hash = u128ToHex(entry.hash);
+                e.object_hash = codec.toHex(entry.hash);
                 e.token = entry.token.value;
                 e.round = new_round;
                 e.gen = generation;
@@ -429,7 +434,7 @@ RoundReport Gc::runRegularRound()
             {
                 e.type = CasEventType::GcRecheckVerdict;
                 e.object_kind = CasEventObjectKind::Blob;
-                e.object_hash = u128ToHex(entry.hash);
+                e.object_hash = codec.toHex(entry.hash);
                 e.token = entry.token.value;
                 e.round = new_round;
                 e.gen = generation;
@@ -451,7 +456,7 @@ RoundReport Gc::runRegularRound()
             {
                 e.type = CasEventType::BlobRetireReplaced;
                 e.object_kind = CasEventObjectKind::Blob;
-                e.object_hash = u128ToHex(entry.hash);
+                e.object_hash = codec.toHex(entry.hash);
                 e.token = entry.token.value;
                 e.round = new_round;
                 e.gen = generation;
@@ -465,11 +470,11 @@ RoundReport Gc::runRegularRound()
             /// so a NEXT writer's point-read gate sees it. `peek_head` itself stays side-effect-free (it
             /// runs once per closed candidate, not just on a real supersede — see its own comment).
             {
-                const UInt128 hash = entry.hash;
+                const BlobDigest hash = entry.hash;
                 const uint64_t round = entry.condemn_round;
                 const uint64_t size = entry.size;
                 scheduleMetaJob([this, hash, round, size]()
-                { writeCondemnedMeta(store->backend(), store->layout(), hash, round, size); });
+                { writeCondemnedMeta(store->backend(), store->layout(), DigestCodec(store->poolMeta()), hash, round, size); });
             }
         }
     }
@@ -663,14 +668,14 @@ bool Gc::foldManifestEdges(const ManifestId & id, int sign, std::vector<BlobDelt
             /// B170: a folded owner edge over this blob (the manifest-model analog of the old
             /// `RootAdd`). +1 = the manifest's owner activated this blob's reference; -1 =
             /// the owner was removed, dropping the reference. Reconstructs WHY a blob's in-degree moved.
-            /// The event log stays 128-bit-hex (pre-T5 shim boundary): `legacyBlobId128` fails closed
-            /// rather than silently truncating if a 32-byte pool ever reaches this pre-T5 path.
+            /// CAS pluggable-blob-hash Phase 2 Task 5: the event log renders the pool-width hex natively
+            /// (`entry.blob_hash` is already a `BlobDigest` — no narrowing shim).
             EventEmitter{*store}.emit([&](CasEvent & ev)
             {
                 ev.type = sign > 0 ? CasEventType::RootAdd : CasEventType::RootRemove;
                 ev.namespace_ = id.root_namespace.string();
                 ev.object_kind = CasEventObjectKind::Blob;
-                ev.object_hash = u128ToHex(legacyBlobId128(entry.blob_hash, static_cast<uint8_t>(store->poolMeta().blob_hash_len)));
+                ev.object_hash = DigestCodec(store->poolMeta()).toHex(entry.blob_hash);
                 ev.outcome = sign > 0 ? "edge_added" : "edge_removed";
                 ev.reason = sign > 0
                     ? "fold: manifest owner activated; +1 blob edge"
@@ -689,6 +694,8 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
 {
     Backend & backend = store->backend();
     const Layout & layout = store->layout();
+    /// CAS pluggable-blob-hash Phase 2 Task 5: ONE pool-scoped digest codec for this fold pass.
+    const DigestCodec codec(store->poolMeta());
     FoldResult result;
 
     /// 1. Discover the present (namespace, shard) pairs via LIST(cas/refs/) (Task 4 LIST-based discovery).
@@ -724,23 +731,23 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// Condemn-time observation: ONE HEAD per new zero-transition captures the exact incarnation token
     /// the eventual delete carries (absent => a prior landed delete => nothing to condemn). Emits the
     /// B170 candidate trail (IndegZero / GcRetireObserve / BlobRetire) exactly where the decision is made.
-    const auto head_blob = [&](const UInt128 & hash) -> std::optional<HeadResult>
+    const auto head_blob = [&](const BlobDigest & hash) -> std::optional<HeadResult>
     {
         EventEmitter{*store}.emit([&](CasEvent & e)
         {
             e.type = CasEventType::IndegZero;
             e.object_kind = CasEventObjectKind::Blob;
-            e.object_hash = u128ToHex(hash);
+            e.object_hash = codec.toHex(hash);
             e.round = condemn_round;
             e.gen = state.snap_generation + 1;
             e.reason = "last folded owner edge dropped; in-degree reached 0";
         });
-        const HeadResult observed = backend.head(blobKeyOf(layout, hash));
+        const HeadResult observed = backend.head(blobKeyOf(layout, codec, hash));
         EventEmitter{*store}.emit([&](CasEvent & e)
         {
             e.type = CasEventType::GcRetireObserve;
             e.object_kind = CasEventObjectKind::Blob;
-            e.object_hash = u128ToHex(hash);
+            e.object_hash = codec.toHex(hash);
             e.token = observed.exists ? observed.token.value : "";
             e.round = condemn_round;
             e.gen = state.snap_generation + 1;
@@ -756,7 +763,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         {
             e.type = CasEventType::BlobRetire;
             e.object_kind = CasEventObjectKind::Blob;
-            e.object_hash = u128ToHex(hash);
+            e.object_hash = codec.toHex(hash);
             e.token = observed.token.value;
             e.round = condemn_round;
             e.gen = state.snap_generation + 1;
@@ -772,7 +779,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         /// which the fold's tight streaming loop mutates across iterations while this job may still be
         /// queued on the pool).
         scheduleMetaJob([this, hash, condemn_round, size = adjusted.size]()
-        { writeCondemnedMeta(store->backend(), store->layout(), hash, condemn_round, size); });
+        { writeCondemnedMeta(store->backend(), store->layout(), DigestCodec(store->poolMeta()), hash, condemn_round, size); });
         return adjusted;
     };
 
@@ -782,9 +789,9 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// hook is `head_blob` above, reserved for a genuinely NEW zero-in-degree candidate. A supersede's
     /// own event is `blob_retire_replaced`, emitted once below from `merge.replaced`. Plain HEAD, no
     /// events, no counters.
-    const auto peek_head = [&](const UInt128 & hash) -> std::optional<HeadResult>
+    const auto peek_head = [&](const BlobDigest & hash) -> std::optional<HeadResult>
     {
-        HeadResult hr = backend.head(blobKeyOf(layout, hash));
+        HeadResult hr = backend.head(blobKeyOf(layout, codec, hash));
         if (!hr.exists)
             return std::nullopt;
         hr.size = retiredLogicalSize(ObjectKind::Blob, hr.size, store->poolMeta().blob_header_len);
@@ -1837,12 +1844,12 @@ RebuildReport Gc::rebuildBaseline(bool force)
     /// shard. Empty/0 until then keeps mid-traversal budget flushes behavior-identical to the legacy
     /// edge-only fold (`foldDeltasIntoGeneration` defaults: no head_blob condemns, current_round 0
     /// graduates nothing).
-    std::function<std::optional<HeadResult>(const UInt128 &)> condemn_seed_head;
+    std::function<std::optional<HeadResult>(const BlobDigest &)> condemn_seed_head;
     uint64_t condemn_round_stamp = 0;
     /// The OUTPUT width for this rebuild's folds (Task 4 wiring): sourced from the pool, never
-    /// inferred from the deltas. Every pool that exists today is 16, so this is byte-identical to
-    /// pre-Task-4 behavior.
+    /// inferred from the deltas.
     const uint8_t digest_len = static_cast<uint8_t>(store->poolMeta().blob_hash_len);
+    const DigestCodec codec(store->poolMeta());
     auto flush_shard = [&](uint64_t shard)
     {
         if (buckets[shard].empty())
@@ -1856,16 +1863,16 @@ RebuildReport Gc::rebuildBaseline(bool force)
         buckets[shard].clear();
         prior_runs[shard] = std::move(out);
     };
-    std::unordered_set<UInt128, UInt128Hash> edge_bearing;   /// O(distinct blobs) — maintenance op
+    /// CAS pluggable-blob-hash Phase 2 Task 5: `edge_bearing` is `BlobDigest`-keyed natively (the
+    /// pipeline-blindness LIST/HEAD sweep below parses blob object keys via `codec.fromHex`, admitting
+    /// the pool's real digest width — this is the condemn-sweep silent-leak site the task ports).
+    std::unordered_set<BlobDigest, BlobDigestHash> edge_bearing;   /// O(distinct blobs) — maintenance op
     auto route_deltas = [&](std::vector<BlobDelta> & deltas)
     {
         rep.edges += deltas.size();
         for (BlobDelta & d : deltas)
         {
-            /// `edge_bearing` stays UInt128-keyed (the pipeline-blindness LIST/HEAD sweep below parses
-            /// blob object keys via `hexToU128`, a pre-T5 128-bit-only path) — `legacyBlobId128` fails
-            /// closed rather than silently truncating a future 32-byte digest.
-            edge_bearing.insert(legacyBlobId128(d.blob_hash, digest_len));
+            edge_bearing.insert(d.blob_hash);
             const uint64_t shard = blobShard(d.blob_hash, gc_shards);
             buckets[shard].push_back(std::move(d));
             if (buckets[shard].size() >= budget)
@@ -2020,10 +2027,18 @@ RebuildReport Gc::rebuildBaseline(bool force)
                 const size_t slash = k.key.rfind('/');
                 if (slash == String::npos)
                     continue;
-                UInt128 hash{};
+                BlobDigest hash{};
                 try
                 {
-                    hash = hexToU128(k.key.substr(slash + 1));
+                    /// CAS pluggable-blob-hash Phase 2 Task 5 (THE CRUX condemn-sweep silent-leak site):
+                    /// `codec.fromHex` parses at the POOL's real digest width, so a correct-width key
+                    /// (16 OR 32 bytes) is CLASSIFIED here rather than reaching the catch below. The old
+                    /// `hexToU128` hard-rejected any hex length != 32 chars (i.e. every 64-hex sha256
+                    /// key) INSIDE this same catch-and-skip, silently treating every sha256 blob as
+                    /// foreign debris and never condemning it — a full leak. The catch below still exists
+                    /// for a GENUINELY foreign key shape (e.g. a `.meta` sibling object, which fails
+                    /// `fromHex`'s length check) — that is debris, not a width mismatch.
+                    hash = codec.fromHex(k.key.substr(slash + 1));
                 }
                 catch (...)
                 {
@@ -2034,7 +2049,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
                 const HeadResult hr = backend.head(k.key);
                 if (!hr.exists)
                     continue;
-                zero_condemned[blobShard(BlobDigest::fromU128(hash), gc_shards)].push_back(RetiredEntry{
+                zero_condemned[blobShard(hash, gc_shards)].push_back(RetiredEntry{
                     .kind = ObjectKind::Blob, .hash = hash, .token = hr.token, .size = hr.size});
             }
             if (page.next_cursor.empty())
@@ -2054,17 +2069,17 @@ RebuildReport Gc::rebuildBaseline(bool force)
     /// mints a `kCondemned` sentinel row at `round` for each. The condemn set is disjoint from
     /// edge-bearing blobs by construction, so no real edge is perturbed. The next regular round settles
     /// each row FROM THE RUN (the fold no longer takes a separate retired-set input).
-    std::unordered_map<UInt128, HeadResult, UInt128Hash> condemn_seeded;
+    std::unordered_map<BlobDigest, HeadResult, BlobDigestHash> condemn_seeded;
     for (uint64_t shard = 0; shard < gc_shards; ++shard)
     {
         for (const RetiredEntry & e : zero_condemned[shard])
         {
             condemn_seeded.emplace(e.hash, HeadResult{.exists = true, .size = e.size, .token = e.token, .attributes = {}});
-            buckets[shard].push_back(BlobDelta{.blob_hash = BlobDigest::fromU128(e.hash), .source_id = UInt128{1}, .remove = false});
-            buckets[shard].push_back(BlobDelta{.blob_hash = BlobDigest::fromU128(e.hash), .source_id = UInt128{1}, .remove = true});
+            buckets[shard].push_back(BlobDelta{.blob_hash = e.hash, .source_id = UInt128{1}, .remove = false});
+            buckets[shard].push_back(BlobDelta{.blob_hash = e.hash, .source_id = UInt128{1}, .remove = true});
         }
     }
-    condemn_seed_head = [&condemn_seeded](const UInt128 & h) -> std::optional<HeadResult>
+    condemn_seed_head = [&condemn_seeded](const BlobDigest & h) -> std::optional<HeadResult>
     {
         const auto it = condemn_seeded.find(h);
         return it == condemn_seeded.end() ? std::nullopt : std::optional<HeadResult>(it->second);
@@ -2167,9 +2182,9 @@ std::vector<Gc::PreviewEntry> Gc::previewDeletes()
         for (const RunRef & r : adopted->blob_target_runs)
             runs_by_shard[r.shard].push_back(r);
 
-    /// PreviewEntry.hash is a pre-T5 128-bit shim boundary (Task 4): fail closed rather than silently
-    /// truncate if a 32-byte pool ever reaches this pre-T5 path.
-    const uint8_t digest_len = static_cast<uint8_t>(store->poolMeta().blob_hash_len);
+    /// CAS pluggable-blob-hash Phase 2 Task 5: `PreviewEntry.hash` is now a native `BlobDigest` — the
+    /// pool-scoped codec renders its hex key, no `legacyBlobId128` narrowing shim.
+    const DigestCodec digest_codec(store->poolMeta());
 
     /// Scan every blob-target shard (see `retire`): a preview that only looked at shard 0 would miss the
     /// zero-in-degree candidates owned by shards 1..N under `gc_shards > 1`.
@@ -2180,14 +2195,13 @@ std::vector<Gc::PreviewEntry> Gc::previewDeletes()
         const std::vector<RunRef> & shard_runs = it != runs_by_shard.end() ? it->second : kEmptyRuns;
         for (const BlobCandidate & cand : zeroInDegree(backend, shard_runs))
         {
-            const UInt128 hash = legacyBlobId128(cand.hash, digest_len);
-            const HeadResult observed = backend.head(blobKeyOf(layout, hash));
+            const HeadResult observed = backend.head(blobKeyOf(layout, digest_codec, cand.hash));
             if (!observed.exists)
                 continue;
             PreviewEntry e;
             e.kind = ObjectKind::Blob;
-            e.hash = hash;
-            e.key = blobKeyOf(layout, hash);
+            e.hash = cand.hash;
+            e.key = blobKeyOf(layout, digest_codec, cand.hash);
             e.size = observed.size;
             e.reason = "unreachable";
             out.push_back(std::move(e));
@@ -2201,7 +2215,7 @@ std::vector<Gc::PreviewEntry> Gc::previewDeletes()
         {
             RunFileReader reader = openSourceEdgeRun(backend, run.key);
             /// Readers derive width from the run's OWN key_schema — never from pool meta (Task 4).
-            const SourceEdgeKeyCodec codec = SourceEdgeKeyCodec::forSchema(reader.keySchema());
+            const SourceEdgeKeyCodec run_codec = SourceEdgeKeyCodec::forSchema(reader.keySchema());
             String key;
             String payload;
             while (reader.next(key, payload))
@@ -2210,13 +2224,12 @@ std::vector<Gc::PreviewEntry> Gc::previewDeletes()
                     continue;
                 BlobDigest hash_digest;
                 UInt128 source_id;
-                codec.parse(key, hash_digest, source_id);   // throws CORRUPTED_DATA on a malformed key
-                const UInt128 hash = legacyBlobId128(hash_digest, digest_len);
+                run_codec.parse(key, hash_digest, source_id);   // throws CORRUPTED_DATA on a malformed key
                 const CondemnedRow row = decodeCondemnedRow(payload);
                 PreviewEntry e;
                 e.kind = ObjectKind::Blob;
-                e.hash = hash;
-                e.key = blobKeyOf(layout, hash);
+                e.hash = hash_digest;
+                e.key = blobKeyOf(layout, digest_codec, hash_digest);
                 e.size = row.size;
                 e.token = row.token;
                 e.condemn_round = row.condemn_round;

@@ -142,9 +142,9 @@ namespace
 {
 
 /// head_blob / peek_head stub: present with a fixed token/size.
-std::function<std::optional<HeadResult>(const UInt128 &)> headPresent(const String & tok, uint64_t size)
+std::function<std::optional<HeadResult>(const BlobDigest &)> headPresent(const String & tok, uint64_t size)
 {
-    return [tok, size](const UInt128 &) -> std::optional<HeadResult>
+    return [tok, size](const BlobDigest &) -> std::optional<HeadResult>
     {
         HeadResult hr;
         hr.exists = true;
@@ -256,12 +256,12 @@ TEST(CasThreeCursorMerge, FloorBoundary)
     /// Two-phase graduation: the floor-passed entry is REPUBLISHED pending (still in the list);
     /// its physical delete belongs to the NEXT pass.
     ASSERT_EQ(rmr.graduated.size(), 1u);
-    EXPECT_EQ(rmr.graduated[0].hash, b(1));
+    EXPECT_EQ(rmr.graduated[0].hash, bh(1));
     EXPECT_TRUE(rmr.graduated[0].delete_pending);
     ASSERT_EQ(rmr.still_retired.size(), 2u);
-    EXPECT_EQ(rmr.still_retired[0].hash, b(1));
+    EXPECT_EQ(rmr.still_retired[0].hash, bh(1));
     EXPECT_TRUE(rmr.still_retired[0].delete_pending);
-    EXPECT_EQ(rmr.still_retired[1].hash, b(2));
+    EXPECT_EQ(rmr.still_retired[1].hash, bh(2));
     EXPECT_FALSE(rmr.still_retired[1].delete_pending);
     EXPECT_EQ(rmr.still_retired[1].condemn_round, 3u);   /// carried unchanged, not re-stamped
     EXPECT_TRUE(rmr.spared.empty());
@@ -293,7 +293,7 @@ TEST(CasThreeCursorMerge, PendingRedeletesAndDrops)
         /*current_round*/9, /*condemn_round*/9, /*head_blob*/{}, /*peek_head*/{}, &rmr);
 
     ASSERT_EQ(rmr.redelete.size(), 1u);
-    EXPECT_EQ(rmr.redelete[0].hash, b(1));
+    EXPECT_EQ(rmr.redelete[0].hash, bh(1));
     EXPECT_TRUE(rmr.still_retired.empty());
     EXPECT_TRUE(rmr.graduated.empty());
     EXPECT_TRUE(rmr.spared.empty());
@@ -319,7 +319,7 @@ TEST(CasThreeCursorMerge, RecoverySpares)
         /*current_round*/5, /*condemn_round*/6, /*head_blob*/{}, /*peek_head*/{}, &rmr);
 
     ASSERT_EQ(rmr.spared.size(), 1u);
-    EXPECT_EQ(rmr.spared[0].hash, b(1));
+    EXPECT_EQ(rmr.spared[0].hash, bh(1));
     EXPECT_TRUE(rmr.graduated.empty());
     EXPECT_TRUE(rmr.still_retired.empty());
 
@@ -346,7 +346,7 @@ TEST(CasThreeCursorMerge, NewCandidateCondemned)
         /*current_round*/0, /*condemn_round*/7, headPresent("t9", 42), /*peek_head*/{}, &rmr);
 
     ASSERT_EQ(rmr.still_retired.size(), 1u);
-    EXPECT_EQ(rmr.still_retired[0].hash, b(3));
+    EXPECT_EQ(rmr.still_retired[0].hash, bh(3));
     EXPECT_EQ(rmr.still_retired[0].token.value, "t9");
     EXPECT_EQ(rmr.still_retired[0].size, 42u);
     EXPECT_EQ(rmr.still_retired[0].condemn_round, 7u);
@@ -375,7 +375,7 @@ TEST(CasThreeCursorMerge, AbsentBlobNotCondemned)
     RetiredMergeResult rmr;
     foldDeltasIntoGeneration(backend, layout, /*prior_runs*/runs1, 2, 0, 0, {{bh(3), s(1), true}}, runs2,
         /*current_round*/0, /*condemn_round*/7,
-        [](const UInt128 &) -> std::optional<HeadResult> { return std::nullopt; }, /*peek_head*/{}, &rmr);
+        [](const BlobDigest &) -> std::optional<HeadResult> { return std::nullopt; }, /*peek_head*/{}, &rmr);
 
     EXPECT_TRUE(rmr.still_retired.empty());
     EXPECT_TRUE(rmr.graduated.empty());
@@ -445,7 +445,7 @@ TEST(CasTwoCursorMerge, CarriedSentinelIsNotATouch)
 
     /// Gen 2: empty deltas, current_round 1 (< 5 => b carries, does not graduate). peek_head must NOT fire.
     size_t peek_calls = 0;
-    auto peek = [&](const UInt128 &) -> std::optional<HeadResult> { ++peek_calls; return {}; };
+    auto peek = [&](const BlobDigest &) -> std::optional<HeadResult> { ++peek_calls; return {}; };
     std::vector<RunRef> runs2;
     RetiredMergeResult rmr2;
     foldDeltasIntoGeneration(backend, layout, /*prior_runs*/runs1, 2, 0, 0, {}, runs2,
@@ -453,7 +453,7 @@ TEST(CasTwoCursorMerge, CarriedSentinelIsNotATouch)
 
     EXPECT_EQ(peek_calls, 0u);
     ASSERT_EQ(rmr2.still_retired.size(), 1u);
-    EXPECT_EQ(rmr2.still_retired[0].hash, b(2));
+    EXPECT_EQ(rmr2.still_retired[0].hash, bh(2));
     EXPECT_EQ(rmr2.still_retired[0].condemn_round, 5u);   /// carried unchanged
     EXPECT_TRUE(rmr2.graduated.empty());
 

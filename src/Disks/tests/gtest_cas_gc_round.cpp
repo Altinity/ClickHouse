@@ -426,7 +426,7 @@ TEST(CasGcRound, CondemnRoundSealSummaryCountsCondemned)
         seal = decodeFoldSeal(
             backend->get(store->layout().foldSealKey(st.snap_generation, st.snap_attempt))->bytes);
         for (const RetiredEntry & e : currentRetiredSet(*backend, store->layout(), /*shard*/0))
-            if (e.hash == DB::UInt128(1))
+            if (e.hash == DB::Cas::BlobDigest::fromU128(DB::UInt128(1)))
                 condemned = true;
     }
     ASSERT_TRUE(condemned) << "blob never condemned into the snapshot run";
@@ -468,7 +468,7 @@ TEST(CasGcRound, PreviewReportsCondemnedRowsAndIsWriteFree)
     EXPECT_EQ(before, after) << "previewDeletes must perform NO writes (put/casPut/overwrite/delete)";
 
     ASSERT_EQ(awaiting.size(), 1u) << "exactly the one condemned blob is previewed";
-    EXPECT_EQ(awaiting[0].hash, blob);
+    EXPECT_EQ(awaiting[0].hash, DB::Cas::BlobDigest::fromU128(blob));
     EXPECT_EQ(awaiting[0].key, store->layout().blobKey(BlobId(u128ToHex(blob))));
     EXPECT_EQ(awaiting[0].reason, "awaiting_graduation");
     EXPECT_FALSE(awaiting[0].token.value.empty()) << "must carry the stored condemn-time token";
@@ -477,7 +477,7 @@ TEST(CasGcRound, PreviewReportsCondemnedRowsAndIsWriteFree)
     gc.runRegularRound();                 /// graduation round: entry becomes delete_pending (blob still present)
     const std::vector<Gc::PreviewEntry> pending = gc.previewDeletes();
     ASSERT_EQ(pending.size(), 1u);
-    EXPECT_EQ(pending[0].hash, blob);
+    EXPECT_EQ(pending[0].hash, DB::Cas::BlobDigest::fromU128(blob));
     EXPECT_EQ(pending[0].reason, "delete_pending");
     EXPECT_FALSE(pending[0].token.value.empty());
 

@@ -190,7 +190,7 @@ void ContentAddressedTransaction::cleanupPendingTempFiles() noexcept
 }
 
 const ContentAddressedTransaction::PartStaging::PendingBlob *
-ContentAddressedTransaction::findPendingBlob(const PartStaging & st, const UInt128 & hash) const
+ContentAddressedTransaction::findPendingBlob(const PartStaging & st, const Cas::BlobDigest & hash) const
 {
     /// B188: locate a pending blob by hash. Returns nullptr when the blob has already been uploaded
     /// (post-precommit, pending_blobs is cleared) or was never staged as pending.
@@ -212,7 +212,7 @@ void ContentAddressedTransaction::adoptStagedBlob(
         /// If !copy_pending, the record is already in dst_st (moved by caller) — skip the push.
         if (copy_pending)
             dst_st.pending_blobs.push_back(*pb);
-        dst_build.recordPendingBlobDep(entry.blob_hash.toU128(), entry.blob_size);
+        dst_build.recordPendingBlobDep(entry.blob_hash.toU128(), entry.blob_size);   /// Build's dep map stays UInt128 (Task 6+)
     }
     else
     {
@@ -276,11 +276,14 @@ bool ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
     /// entries represent pending content uploads — Inline are not pending blobs. A pending_blob whose
     /// hash is NOT in this set had its entry removed by unlinkFile/replaceFile and must not be uploaded
     /// (it is an orphan). Its temp file is still cleaned by cleanupPendingTempFiles at commit end.
-    std::unordered_set<UInt128, UInt128Hash> referenced_hashes;
+    std::unordered_set<Cas::BlobDigest, Cas::BlobDigestHash> referenced_hashes;
     for (const auto & entry : st.entries)
         if (entry.placement == Cas::EntryPlacement::Blob)
-            referenced_hashes.insert(entry.blob_hash.toU128());
+            referenced_hashes.insert(entry.blob_hash);
 
+    /// CAS pluggable-blob-hash Phase 2 Task 5: `pb.hash` is the pool-width `BlobDigest`; render its
+    /// `BlobId` hex through the pool-scoped codec (never a bare `u128ToHex`).
+    const Cas::DigestCodec digest_codec(metadata_storage.store()->poolMeta());
     for (const auto & pb : st.pending_blobs)         /// pool writes — uploads + 412/HEAD/resurrect
     {
         if (!referenced_hashes.count(pb.hash))
@@ -309,7 +312,7 @@ bool ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
                 copyData(in, out);
             };
         }
-        st.build->putBlob(Cas::BlobId(Cas::u128ToHex(pb.hash)), std::move(source));
+        st.build->putBlob(Cas::BlobId(digest_codec.toHex(pb.hash)), std::move(source));
     }
 
     const bool ref_existed = metadata_storage.partAccess().existsRef({ns, ref}, ContentAddressed::Freshness::ForceFresh);
@@ -405,7 +408,7 @@ std::optional<StoredObjects> ContentAddressedTransaction::tryGetInFlightStorageO
         {
             /// B188: a pending blob has not been uploaded yet — its storage object does not exist in
             /// the pool. Return empty so the caller falls back to tryReadFileInFlight (local temp read).
-            if (findPendingBlob(it->second, entry->blob_hash.toU128()))
+            if (findPendingBlob(it->second, entry->blob_hash))
                 return {};
             const auto location = metadata_storage.store()->locate(*entry);
             return StoredObjects{StoredObject(location.key, path, location.length)};
@@ -438,7 +441,7 @@ std::unique_ptr<ReadBufferFromFileBase> ContentAddressedTransaction::tryReadFile
             /// temp file for `StagingBackend::Local`, or the S3 staging object for `StagingBackend::S3`
             /// (Task 6, S3-native staging plan — `staging_key` is a remote object key there, never a
             /// local path, so `ReadBufferFromFile` would misinterpret it as a filesystem path).
-            if (const auto * pb = findPendingBlob(it->second, entry->blob_hash.toU128()))
+            if (const auto * pb = findPendingBlob(it->second, entry->blob_hash))
             {
                 if (pb->backend == StagingBackend::S3)
                 {
@@ -539,7 +542,7 @@ void ContentAddressedTransaction::createMetadataFile(const std::string &, const 
 
 void ContentAddressedTransaction::stageBlobPartFile(
     const ContentAddressedMetadataStorage::Route & route,
-    const UInt128 & hash, size_t size, const std::string & staging_key, StagingBackend backend)
+    const Cas::BlobDigest & hash, size_t size, const std::string & staging_key, StagingBackend backend)
 {
     /// B188: do NOT upload here. Record the pending blob (uploaded post-precommit in publishStaging)
     /// and a tokenless dep so stageTree's W-TREE-BUILD check passes; putBlob later overwrites it with
@@ -547,12 +550,12 @@ void ContentAddressedTransaction::stageBlobPartFile(
     /// `StagingBackend::Local`, an S3 staging object for `StagingBackend::S3` (Task 4).
     auto & st = stagingFor(route);
     st.pending_blobs.push_back({hash, staging_key, size, backend});
-    buildFor(route, st).recordPendingBlobDep(hash, size);
+    buildFor(route, st).recordPendingBlobDep(hash.toU128(), size);   /// Build's dep map stays UInt128 (Task 6+)
 
     Cas::ManifestEntry entry;
     entry.path = route.file;
     entry.placement = Cas::EntryPlacement::Blob;
-    entry.blob_hash = Cas::BlobDigest::fromU128(hash);
+    entry.blob_hash = hash;
     entry.blob_size = size;
     std::erase_if(st.entries, [&](const Cas::ManifestEntry & e) { return e.path == entry.path; });
     st.entries.push_back(std::move(entry));
@@ -665,6 +668,11 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
         /// cityHash128 -- `PoolMeta` is authoritative (§4/§8 of the design), the same accessor
         /// `blob_header_len` already uses above.
         const auto hash_algo = static_cast<Cas::BlobHashAlgo>(metadata_storage.store()->poolMeta().blob_hash_algo);
+        /// CAS pluggable-blob-hash Phase 2 Task 5: `hash_hex` is rendered by the streaming write buffer
+        /// at the POOL's real digest width (`hash_algo` above) — parse it back at that SAME width via
+        /// the pool-scoped codec. The old bare `Cas::hexToU128` hard-rejected any hex length != 32 chars,
+        /// i.e. every 64-hex `sha256` blob the write path would ever mint.
+        const Cas::DigestCodec digest_codec(metadata_storage.store()->poolMeta());
 
         if (metadata_storage.stagingBackend() == StagingBackend::S3 && metadata_storage.conditionalCopySupported())
         {
@@ -685,9 +693,9 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
                 buf_size,
                 settings.use_adaptive_write_buffer,
                 settings.adaptive_write_buffer_initial_size,
-                [this, route = *r](const std::string & hash_hex, size_t size, const std::string & key)
+                [this, route = *r, digest_codec](const std::string & hash_hex, size_t size, const std::string & key)
                 {
-                    stageBlobPartFile(route, Cas::hexToU128(hash_hex), size, key, StagingBackend::S3);
+                    stageBlobPartFile(route, digest_codec.fromHex(hash_hex), size, key, StagingBackend::S3);
                 });
         }
 
@@ -697,9 +705,9 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
             buf_size,
             settings.use_adaptive_write_buffer,
             settings.adaptive_write_buffer_initial_size,
-            [this, route = *r](const std::string & hash_hex, size_t size, const std::string & temp_path)
+            [this, route = *r, digest_codec](const std::string & hash_hex, size_t size, const std::string & temp_path)
             {
-                stageBlobPartFile(route, Cas::hexToU128(hash_hex), size, temp_path, StagingBackend::Local);
+                stageBlobPartFile(route, digest_codec.fromHex(hash_hex), size, temp_path, StagingBackend::Local);
             });
     }
 
@@ -755,7 +763,7 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
                 /// enough (a safety net, not a hot path) that Task 4's S3-staging mode does not cover it.
                 bool staged = false;
                 SCOPE_EXIT({ if (!staged) { std::error_code ec; std::filesystem::remove(temp_path, ec); } });
-                stageBlobPartFile(route, hash, bytes.size(), temp_path, StagingBackend::Local);
+                stageBlobPartFile(route, Cas::BlobDigest::fromU128(hash), bytes.size(), temp_path, StagingBackend::Local);
                 staged = true;
             }
         });
@@ -901,7 +909,7 @@ void ContentAddressedTransaction::createHardLink(const std::string & path_from, 
                 /// B190 Task 4: unified adopt dispatch. copy_pending=(&dst_st != src_st) so the pending
                 /// blob record is copied into dst_st only when the destination is a different part
                 /// (hardlink = copy semantics; same-part is a self-ref that shouldn't duplicate the record).
-                const auto * pb = findPendingBlob(*src_st, entry.blob_hash.toU128());
+                const auto * pb = findPendingBlob(*src_st, entry.blob_hash);
                 adoptStagedBlob(pb, entry, dst_st, buildFor(*dst, dst_st), /*copy_pending=*/(&dst_st != src_st));
             }
             else if (entry.placement != Cas::EntryPlacement::Inline)
@@ -1095,7 +1103,7 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
                     {
                         /// B190 Task 4: unified adopt dispatch. Pending blob records were already moved
                         /// to dst_st.pending_blobs above (MOVE semantics), so copy_pending=false.
-                        adoptStagedBlob(findPendingBlob(dst_st, entry.blob_hash.toU128()), entry, dst_st, *dst_st.build, /*copy_pending=*/false);
+                        adoptStagedBlob(findPendingBlob(dst_st, entry.blob_hash), entry, dst_st, *dst_st.build, /*copy_pending=*/false);
                     }
                 src_st.build->abandon();
             }
@@ -1236,13 +1244,13 @@ void ContentAddressedTransaction::moveFile(const std::string & path_from, const 
             /// record from src_st to dst_st FIRST (so dst_st owns the upload), then call adoptStagedBlob
             /// with copy_pending=false (the record is already in dst_st; no additional copy needed).
             auto pb_it = std::find_if(src_st.pending_blobs.begin(), src_st.pending_blobs.end(),
-                [&](const PartStaging::PendingBlob & pb) { return pb.hash == entry.blob_hash.toU128(); });
+                [&](const PartStaging::PendingBlob & pb) { return pb.hash == entry.blob_hash; });
             if (pb_it != src_st.pending_blobs.end())
             {
                 dst_st.pending_blobs.push_back(std::move(*pb_it));
                 src_st.pending_blobs.erase(pb_it);
             }
-            adoptStagedBlob(findPendingBlob(dst_st, entry.blob_hash.toU128()), entry, dst_st, buildFor(*dst, dst_st), /*copy_pending=*/false);
+            adoptStagedBlob(findPendingBlob(dst_st, entry.blob_hash), entry, dst_st, buildFor(*dst, dst_st), /*copy_pending=*/false);
         }
         std::erase_if(dst_st.entries, [&](const Cas::ManifestEntry & e) { return e.path == entry.path; });
         dst_st.entries.push_back(std::move(entry));

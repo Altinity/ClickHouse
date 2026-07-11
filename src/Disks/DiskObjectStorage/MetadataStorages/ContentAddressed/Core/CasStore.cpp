@@ -66,12 +66,12 @@ Store::Store(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
             config.manifest_decode_cache_bytes, /*max_count=*/16384, ManifestDecodeCache::DEFAULT_SIZE_RATIO);
 }
 
-bool Store::dedupCacheContains(const UInt128 & blob_hash) const
+bool Store::dedupCacheContains(const BlobDigest & blob_hash) const
 {
     return dedup_cache && dedup_cache->contains(blob_hash);
 }
 
-void Store::dedupCacheAdd(const UInt128 & blob_hash)
+void Store::dedupCacheAdd(const BlobDigest & blob_hash)
 {
     if (dedup_cache)
         dedup_cache->set(blob_hash, std::make_shared<DedupPresent>());
@@ -900,11 +900,17 @@ BlobLocation Store::locate(const ManifestEntry & entry) const
     switch (entry.placement)
     {
         case EntryPlacement::Blob:
+        {
+            /// CAS pluggable-blob-hash Phase 2 Task 5: the blob's object key is the POOL-width hex of
+            /// its content digest, via the pool-scoped codec -- a bare `.toU128()` truncation here would
+            /// silently address the WRONG (or a nonexistent) key for a 32-byte (sha256) pool's blob.
+            const DigestCodec codec(meta);
             return BlobLocation{
-                .key = pool_layout.blobKey(BlobId(u128ToHex(entry.blob_hash.toU128()))),
+                .key = pool_layout.blobKey(BlobId(codec.toHex(entry.blob_hash))),
                 .offset = meta.blob_header_len,
                 .length = entry.blob_size,
             };
+        }
         case EntryPlacement::Inline:
             throw Exception(ErrorCodes::BAD_ARGUMENTS,
                 "entry placement {} has no blob location", static_cast<int>(entry.placement));

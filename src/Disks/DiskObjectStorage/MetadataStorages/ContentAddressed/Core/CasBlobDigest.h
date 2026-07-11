@@ -17,7 +17,6 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
-    extern const int NOT_IMPLEMENTED;
 }
 }
 
@@ -68,21 +67,6 @@ struct BlobDigest
         return v;
     }
 };
-
-/// Narrow a content digest to the legacy 128-bit id ONLY where 32-byte GC is not yet supported
-/// (CAS pluggable-blob-hash Phase 2 Task 4: the GC source-edge settlement key + shard routing were
-/// widened to admit a 32-byte digest, but every 32-byte GC EXECUTION path fails closed until Task 5
-/// ports the meta/dedup/silent-leak sites). Fail closed on any wider pool rather than silently
-/// truncate: `BlobDigest::toU128()` reads only `bytes[0:16]`, which for a 32-byte digest silently
-/// drops `bytes[16:32]` -- never gate this on "the tail happens to be zero", since a genuine 32-byte
-/// identity may legitimately have a zero-valued (but still load-bearing) tail.
-inline UInt128 legacyBlobId128(const BlobDigest & d, uint8_t digest_len)
-{
-    if (digest_len != 16)
-        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
-            "CAS gc: 32-byte blob digest reached a pre-T5 128-bit code path (sha256 GC lands in Task 5)");
-    return d.toU128();
-}
 
 /// Hasher for `BlobDigest` as an `unordered_map`/`unordered_set` key. This is an in-process hash
 /// table key, not a content address, so a cheap FNV-1a mix over the raw bytes is sufficient -- no

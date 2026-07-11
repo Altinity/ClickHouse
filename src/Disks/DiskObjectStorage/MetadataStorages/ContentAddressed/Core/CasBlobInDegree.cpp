@@ -353,8 +353,8 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
                               uint64_t shard,
                               std::vector<BlobDelta> scattered, std::vector<RunRef> & out_runs,
                               uint64_t current_round, uint64_t condemn_round,
-                              const std::function<std::optional<HeadResult>(const UInt128 &)> & head_blob,
-                              const std::function<std::optional<HeadResult>(const UInt128 &)> & peek_head,
+                              const std::function<std::optional<HeadResult>(const BlobDigest &)> & head_blob,
+                              const std::function<std::optional<HeadResult>(const BlobDigest &)> & peek_head,
                               RetiredMergeResult * out_retired,
                               bool suppress_destructive,
                               uint8_t digest_len)
@@ -401,7 +401,7 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
     bool cur_touched = false;            // cur_blob had prior edges or deltas this generation
     std::optional<CondemnedRow> cur_condemned;   // the retired sentinel carried on the prior run for cur_blob
 
-    auto toRetiredEntry = [](const UInt128 & hash, const CondemnedRow & r) -> RetiredEntry
+    auto toRetiredEntry = [](const BlobDigest & hash, const CondemnedRow & r) -> RetiredEntry
     {
         RetiredEntry e;
         e.kind = ObjectKind::Blob;
@@ -460,10 +460,9 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
         /// post-merge in-degree...
         if (cur_condemned)
         {
-            /// `RetiredEntry.hash` stays UInt128 (T4/T5 shim boundary — see `legacyBlobId128`); this
-            /// throws NOT_IMPLEMENTED rather than silently truncating if a future 32-byte pool reaches
-            /// this pre-T5 path.
-            const RetiredEntry stale = toRetiredEntry(legacyBlobId128(cur_blob, digest_len), *cur_condemned);
+            /// `RetiredEntry.hash` is a native `BlobDigest` (Phase 2 Task 5) — `cur_blob` passes straight
+            /// through, no narrowing shim.
+            const RetiredEntry stale = toRetiredEntry(cur_blob, *cur_condemned);
             /// RESURRECT-REUPLOAD-ORPHAN: on a re-reference cycle (touched this window, net in-degree 0),
             /// re-observe the CURRENT token. If it differs from the retired row's token, a resurrect
             /// replaced the incarnation at this key — supersede the stale entry with a fresh condemn of the
@@ -477,12 +476,12 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
             bool superseded = false;
             if (cur_edges == 0 && cur_touched && peek_head)
             {
-                if (const auto hr = peek_head(legacyBlobId128(cur_blob, digest_len));
+                if (const auto hr = peek_head(cur_blob);
                     hr && hr->exists && hr->token != stale.token)
                 {
                     RetiredEntry fresh;
                     fresh.kind = ObjectKind::Blob;
-                    fresh.hash = legacyBlobId128(cur_blob, digest_len);
+                    fresh.hash = cur_blob;
                     fresh.token = hr->token;
                     fresh.size = hr->size;
                     fresh.condemn_round = condemn_round;
@@ -501,11 +500,11 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
         /// incarnation token for the later exact-token delete; an absent object needs no entry.
         else if (cur_edges == 0 && cur_touched && head_blob)
         {
-            if (const auto hr = head_blob(legacyBlobId128(cur_blob, digest_len)); hr && hr->exists)
+            if (const auto hr = head_blob(cur_blob); hr && hr->exists)
             {
                 RetiredEntry fresh;
                 fresh.kind = ObjectKind::Blob;
-                fresh.hash = legacyBlobId128(cur_blob, digest_len);
+                fresh.hash = cur_blob;
                 fresh.token = hr->token;
                 fresh.size = hr->size;
                 fresh.condemn_round = condemn_round;

@@ -101,7 +101,7 @@ private:
         /// Task 4) that `CaContentWriteBuffer::on_finalized` handed back. `backend` selects which:
         /// `cleanupPendingTempFiles` only `fs::remove`s `Local` entries — an `S3` staging object is
         /// reclaimed by the promote path or the mount-lease sweeper (a later task), never here.
-        struct PendingBlob { UInt128 hash; std::string staging_key; uint64_t size = 0; StagingBackend backend = StagingBackend::Local; };
+        struct PendingBlob { Cas::BlobDigest hash; std::string staging_key; uint64_t size = 0; StagingBackend backend = StagingBackend::Local; };
         std::vector<PendingBlob> pending_blobs;    /// B188: spilled+hashed locally; uploaded post-precommit
     };
 
@@ -121,7 +121,7 @@ private:
     /// W-TREE-BUILD passes) and add/replace its Blob TreeEntry. Shared by the streaming-blob path
     /// (Local or S3-staging, `backend` says which) and the always-Local inline-cap fallback.
     void stageBlobPartFile(const ContentAddressedMetadataStorage::Route & route,
-                           const UInt128 & hash, size_t size, const std::string & staging_key,
+                           const Cas::BlobDigest & hash, size_t size, const std::string & staging_key,
                            StagingBackend backend);
 
     /// S3-native staging fix 2026-07-11: build the fixed-length CABL envelope header for a staging blob,
@@ -134,7 +134,7 @@ private:
     const Cas::ManifestEntry * findStagedEntry(const ContentAddressedMetadataStorage::Route & r) const;
     /// B188: return a pointer to the pending (staged-but-not-yet-uploaded) blob for `hash`, or nullptr
     /// if not pending (already uploaded or never staged).
-    const PartStaging::PendingBlob * findPendingBlob(const PartStaging & st, const UInt128 & hash) const;
+    const PartStaging::PendingBlob * findPendingBlob(const PartStaging & st, const Cas::BlobDigest & hash) const;
     Cas::Build & buildFor(const ContentAddressedMetadataStorage::Route & r, PartStaging & st);
     std::optional<ContentAddressedMetadataStorage::Route> routeOf(const std::string & path) const;
 

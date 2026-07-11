@@ -60,30 +60,30 @@ BlobMeta decodeBlobMeta(std::string_view bytes)
     return m;
 }
 
-std::optional<LoadedMeta> loadMeta(Backend & backend, const Layout & layout, const UInt128 & hash)
+std::optional<LoadedMeta> loadMeta(Backend & backend, const Layout & layout, const DigestCodec & codec, const BlobDigest & hash)
 {
-    const String key = layout.blobMetaKey(BlobId(u128ToHex(hash)));
+    const String key = layout.blobMetaKey(BlobId(codec.toHex(hash)));
     auto got = backend.get(key);
     if (!got)
         return std::nullopt;
     return LoadedMeta{.meta = decodeBlobMeta(got->bytes), .etag = got->token};
 }
 
-CasResult putMetaIfAbsent(Backend & backend, const Layout & layout, const UInt128 & hash, const BlobMeta & meta)
+CasResult putMetaIfAbsent(Backend & backend, const Layout & layout, const DigestCodec & codec, const BlobDigest & hash, const BlobMeta & meta)
 {
-    const String key = layout.blobMetaKey(BlobId(u128ToHex(hash)));
+    const String key = layout.blobMetaKey(BlobId(codec.toHex(hash)));
     return backend.casPut(key, encodeBlobMeta(meta), std::nullopt);
 }
 
-CasResult casMeta(Backend & backend, const Layout & layout, const UInt128 & hash, const Token & expected, const BlobMeta & meta)
+CasResult casMeta(Backend & backend, const Layout & layout, const DigestCodec & codec, const BlobDigest & hash, const Token & expected, const BlobMeta & meta)
 {
-    const String key = layout.blobMetaKey(BlobId(u128ToHex(hash)));
+    const String key = layout.blobMetaKey(BlobId(codec.toHex(hash)));
     return backend.casPut(key, encodeBlobMeta(meta), expected);
 }
 
-DeleteOutcome deleteMetaExact(Backend & backend, const Layout & layout, const UInt128 & hash, const Token & expected)
+DeleteOutcome deleteMetaExact(Backend & backend, const Layout & layout, const DigestCodec & codec, const BlobDigest & hash, const Token & expected)
 {
-    const String key = layout.blobMetaKey(BlobId(u128ToHex(hash)));
+    const String key = layout.blobMetaKey(BlobId(codec.toHex(hash)));
     return backend.deleteExact(key, expected);
 }
 

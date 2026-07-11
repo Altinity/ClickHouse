@@ -191,7 +191,7 @@ message GcStateProto {
 // outcome: 1=deleted, 2=absent, 3=replaced, 4=spared (mirrors OutcomeKind enum).
 message GcOutcomeEntryProto {
   uint32 kind        = 1;
-  bytes  hash        = 2;  // raw 16 bytes (UInt128, big-endian)
+  bytes  hash        = 2;  // raw 32 bytes (BlobDigest, big-endian, tail zero beyond the pool's width)
   string token_value = 3;
   uint32 token_type  = 4;
   uint32 outcome     = 5;
