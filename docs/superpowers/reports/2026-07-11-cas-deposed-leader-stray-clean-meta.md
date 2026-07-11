@@ -9,12 +9,41 @@ doc_type: 'reference'
 
 # CAS GC finding — deposed-leader stray-Clean `clearSparedMeta` (INV_NO_LOSS) {#title}
 
-**Status:** REAL BUG, backlogged (needs a protocol-level fix decision). **Severity:** data loss (a
-referenced blob deleted) — **low probability** (requires concurrent GC leaders + a specific
+**Status:** **FIXED 2026-07-11** (commits `730b59cd686` code + `96c571700382` TLA gate). **Severity:**
+data loss (a referenced blob deleted) — **low probability** (requires concurrent GC leaders + a specific
 spare/depose + reuse race), **high impact**. **Pre-existing in v3** — NOT introduced by the
 retired-in-snapshot refactor (which keeps `.meta` writes byte-for-byte). Found 2026-07-11 while
 building the retired-in-snapshot TLA gate (`CaRetiredInRun`, task-1 review finding I1: modeling the
 deposed leader). **Branch:** `cas-gc-rebuild`.
+
+## Fix (2026-07-11): GC freshness metadata is ADD-ONLY {#fix-addendum}
+
+Design: [`specs/2026-07-11-cas-deposed-leader-clearsparedmeta-fix-design.md`](../specs/2026-07-11-cas-deposed-leader-clearsparedmeta-fix-design.md).
+Two independent strong-model consults. The first proposed **Fix 1** (adoption-couple the spare clear —
+move `clearSparedMeta` after the winning `gc/state` CAS) + a `condemn_round` guard. The second proved
+Fix 1 **insufficient**: the destructive exact-token redelete `deleteExact(t1)` is itself issued **pre-CAS**
+by a *stale, paused* leader working from an older adopted `delete_pending(t1)` snapshot, so a fresh
+leader's *legitimately adopted* post-CAS clear flips the meta to Clean, a writer reuses `t1`, and the
+stale leader's `deleteExact(t1)` deletes the live reuse — the final `gc/state` CAS fences **adoption, not
+pre-CAS side effects**.
+
+**Chosen fix (Fix 4):** make GC freshness metadata **add-only** — GC never transitions
+`Condemned → Clean` on a spare (the spare-side `clearSparedMeta` call + helper are removed); only a
+**writer** that has displaced the body with a **fresh incarnation token** publishes `Clean`
+(`uploadFromSource` + `writeResurrectMetaClean` / `copyForwardFromCondemned`). This restores the
+exact-token delete argument in full: any stale `deleteExact(t1)` finds the body absent or `TokenMismatch`
+(the writer re-referenced the condemned hash by resurrecting to `t2`, never reusing `t1`). Accepted cost:
+a spared hash stays `Condemned` until a writer resurrects it (write amplification on recurring-hash churn;
+safe — normal reads never consult the meta). The pre-CAS `writeCondemnedMeta` (add-only) and
+`deleteConfirmedMeta` (token already consumed) are unchanged.
+
+**Gates.** Code (`730b59cd686`): the RED-first two-leader regression demonstrated *actual* live-blob data
+loss (`hr.exists == false`) on the clear-on-spare code; after the fix, `SpareLeavesMetaCondemned` +
+`StaleRedeleteAfterSpareDoesNotDeleteLiveReuse` pass, full `Cas*` 542/542. TLA (`96c571700382`,
+`CaRetiredInRunFoldAbortWitness` made add-only + a split-action two-leader model): honest **GREEN** (all 4
+invariants, 65.4M states); sabotages `inmem_token` / `attempt_reuse` / `no_pacing` / `gc_clear_on_spare`
+**RED**, and — load-bearing — **`post_adoption_clear` RED** (an authentic 16-state two-leader
+counterexample where Fix 1's post-CAS clear still loses the live blob, proving add-only is required).
 
 ## Mechanism {#mechanism}
 
