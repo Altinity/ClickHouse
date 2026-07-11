@@ -1,5 +1,6 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobRef.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestId.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestCodec.h>
 #include <functional>
@@ -28,11 +29,20 @@ struct BlobSource
     static BlobSource fromString(String bytes);         /// convenience for small content/tests
 };
 
-struct BlobRef
+/// putBlob's return value: the BlobId it was addressed by (a hex string at the WRITE algo's width) plus
+/// the admitted logical size. NOT the mixed-algo-pools `BlobRef` pair type (`CasBlobRef.h`) -- that name
+/// was freed up for the blob IDENTITY pair when this task introduced it; this is unrelated, a plain
+/// upload-result tuple.
+struct PutBlobResult
 {
     BlobId id;
     uint64_t size = 0;
 };
+
+/// The ONE write mint (Phase 3 T2): hashes `payload` under `algo` and returns the full `BlobRef` pair
+/// (algo travels WITH the digest — never a bare digest). Replaces the old digest-returning overload
+/// (which took an explicit `digest_len`); the width now always follows `algo` via `blobHashLenFor`.
+BlobRef poolContentHash(BlobHashAlgo algo, std::string_view payload);
 
 /// The writer protocol (spec §5, CA GC root-local part-manifest redesign rev. 15) — the W-rules live
 /// HERE, not in the wiring. One Build per written ref. Thread-compat: a Build is used by ONE thread (the
@@ -59,21 +69,21 @@ public:
     /// ADOPT paths observe an existing incarnation, so they are safe only under this build's durable
     /// precommit closure — asserted by `chassert(precommitted)` in observeAndAdmit. A FRESH upload before
     /// precommit is legal (newborn-debris watermark), but production never does it.
-    BlobRef putBlob(const BlobId & id, BlobSource source);
+    PutBlobResult putBlob(const BlobId & id, BlobSource source);
 
-    /// B156b discriminator: does this build hold a TOKENED Blob dep for `hash` (putBlob'd here ⇒
+    /// B156b discriminator: does this build hold a TOKENED Blob dep for `ref` (putBlob'd here ⇒
     /// tokened) versus a TOKENLESS W-EVIDENCE dep (adoptEvidence ⇒ tokenless)? False also when this
-    /// build has no dep for the hash at all.
-    bool depIsTokened(const BlobDigest & hash) const;
+    /// build has no dep for the ref at all.
+    bool depIsTokened(const BlobRef & ref) const;
 
     /// B188: record a TOKENLESS W-EVIDENCE blob dep directly from a ManifestEntry — NO HEAD, no backend
     /// call. Lets staging adopt sites record the dep by hash without asserting presence before
     /// precommit; the promote gate observes/resurrects it post-precommit. Inline entries record nothing.
     void adoptEvidence(const ManifestEntry & entry);
 
-    /// B188: record a TOKENLESS Blob dep by hash (no HEAD) for a blob whose bytes are staged locally and
+    /// B188: record a TOKENLESS Blob dep by ref (no HEAD) for a blob whose bytes are staged locally and
     /// will be putBlob'd post-precommit. putBlob later overwrites it with the tokened dep on upload.
-    void recordPendingBlobDep(const BlobDigest & hash, uint64_t size);
+    void recordPendingBlobDep(const BlobRef & ref, uint64_t size);
 
     /// Mint a root-local part ManifestId, stream-write its body under
     /// `cas/manifests/<ns>/<writer_epoch>/<build_sequence>/000001.proto` via putIfAbsentStream (NO preliminary HEAD —
@@ -138,46 +148,43 @@ private:
         std::optional<Token> token;                       /// nullopt = live-root evidence (W-EVIDENCE)
         uint64_t size = 0;
     };
-    /// CAS pluggable-blob-hash Phase 2 Task 6: keyed on the pool-width `BlobDigest` (32 bytes wide,
-    /// zero-tailed for a 128-bit pool) so a sha256 hash is held WHOLE, not narrowed to its low 16 bytes.
-    /// Stays an ordered `std::map` (not `unordered_map`): `BlobDigest` already provides `operator<=>`
-    /// (defaulted over its `std::array`), so `std::pair<uint8_t, BlobDigest>` gets a correct `operator<`
-    /// for free -- no `BlobDigestHash` needed for THIS container (that hasher is for the unordered
-    /// dedup-cache/set consumers elsewhere).
-    using DepKey = std::pair<uint8_t, BlobDigest>;        /// (kind, hash)
+    /// Phase 3 T2: keyed on the full `BlobRef` pair (algo + digest) — the blob identity, per spec's
+    /// decree that a bare digest is never an identity. Stays an ordered `std::map` (not
+    /// `unordered_map`): `BlobRef` already provides `operator<=>`, so no hasher is needed for THIS
+    /// container (that's what `BlobRefHash` is for -- the unordered dedup-cache/set consumers
+    /// elsewhere). The old `(kind, hash)` pair key is gone: `ObjectKind` is always `Blob` now (the
+    /// standalone tree kind was excised 2026-07-03), so dropping it loses no information.
+    using DepKey = BlobRef;
 
     /// The §5 step-2 cold-reuse rule: HEAD the key; absent ⇒ FILE_DOESNT_EXIST;
     /// condemned-at-current-token ⇒ throw ABORTED (caller must re-upload from its own source bytes);
     /// else record the current token as the dep. Returns the admitted size.
-    uint64_t observeAndAdmit(ObjectKind kind, const BlobDigest & hash, const String & key);
+    uint64_t observeAndAdmit(ObjectKind kind, const BlobRef & ref, const String & key);
     /// Overload for callers that already hold a fresh, present HeadResult for `key` (the putBlob
     /// HEAD-before-PUT path), avoiding a redundant second HEAD. `hr.exists` MUST be true.
-    uint64_t observeAndAdmit(ObjectKind kind, const BlobDigest & hash, const String & key, const HeadResult & hr);
+    uint64_t observeAndAdmit(ObjectKind kind, const BlobRef & ref, const String & key, const HeadResult & hr);
     /// INV-1 (revival-from-source): revive a condemned or absent object by re-uploading from the writer's
     /// OWN re-readable source without reading the dying object (no backend().get). The source is STREAMED
     /// into the put sink (header + `source.write_payload`), never materialized into a full in-memory copy;
     /// `source.write_payload` may be re-invoked on each conditional-write attempt (it re-reads the staged
     /// temp file / re-emits the captured String), so it is taken by const ref and not consumed.
-    void uploadFromSource(ObjectKind kind, const BlobDigest & hash, const String & key, const BlobSource & source);
+    void uploadFromSource(ObjectKind kind, const BlobRef & ref, const String & key, const BlobSource & source);
 
     /// Verified copy-forward (spec 2026-07-02-cas-copy-forward-condemned-evidence.md): the narrow,
     /// deliberate exception to INV-1's "never read the dying object" — allowed ONLY for tokenless
     /// W-EVIDENCE deps (`adoptEvidence`: every call site adopts from a COMMITTED source manifest, so
     /// the blob is referenced by a live committed owner and this is a reference transfer, not a
     /// resurrection). Reads the condemned-but-present incarnation IN FULL, verifies fail-closed
-    /// (envelope decodes + recomputed payload hash == `hash`), re-wraps under a fresh envelope
+    /// (envelope decodes + recomputed payload hash == `ref`), re-wraps under a fresh envelope
     /// (fresh incarnation_tag, this build's build_id — W-FRESH-TAG), and displaces EXACTLY the
     /// observed incarnation via token-conditional putOverwrite. Every failure mode (absent, corrupt,
     /// lost delete race) throws ABORTED — never a blind PUT, never putIfAbsent after a lost race.
     /// Returns the fresh (or adopted-clean) token. O(blob) resident memory — recovery path only.
-    Token copyForwardFromCondemned(const BlobDigest & hash, const String & key, HeadResult hr);
+    Token copyForwardFromCondemned(const BlobRef & ref, const String & key, HeadResult hr);
 
     /// The build's owning root namespace, derived from BuildInfo::intended_ref ("ns/ref" — the ref is the
     /// last `/`-segment; the namespace is everything before it). Sets a manifest body's root_namespace_id.
     RootNamespace manifestNamespace() const;
-
-    /// Map (kind, hash) to its object key per kind (blob/tree).
-    String keyFor(ObjectKind kind, const BlobDigest & hash) const;
 
     void requireAlive() const;                            /// throws LOGICAL_ERROR after abandon
 
@@ -187,7 +194,7 @@ private:
     /// rests on the caller's owner-liveness check + fold barrier (see the in-closure gate in `promote`),
     /// exactly as the tokened resurrect did. A tokened dep, or NO dep at all (a staging bug — must fail
     /// closed), is NOT copy-forwardable. The single gate for the promote copy-forward site (D3).
-    bool isCopyForwardableTokenless(const BlobDigest & hash) const;
+    bool isCopyForwardableTokenless(const BlobRef & ref) const;
 
     StorePtr store;
     UInt128 build_id{};

@@ -77,7 +77,7 @@ TEST(CasGcDangle, SharedBlobSurvivesDropOfOneOfTwoLiveRefs)
         ManifestEntry e;
         e.path = "data.bin";
         e.placement = EntryPlacement::Blob;
-        e.blob_hash = DB::Cas::BlobDigest::fromU128(u128Of("B"));
+        e.ref = DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(u128Of("B"))};
 
         e.blob_size = std::string("B").size();
         const ManifestId id = build->stageManifest({e});
@@ -95,7 +95,7 @@ TEST(CasGcDangle, SharedBlobSurvivesDropOfOneOfTwoLiveRefs)
         ManifestEntry e;
         e.path = "other.bin";
         e.placement = EntryPlacement::Blob;
-        e.blob_hash = DB::Cas::BlobDigest::fromU128(u128Of("B"));
+        e.ref = DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(u128Of("B"))};
 
         e.blob_size = std::string("B").size();
         build->adoptEvidence(e);   /// tokenless dep (no HEAD) — the cross-node adopt

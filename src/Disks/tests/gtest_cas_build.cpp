@@ -63,7 +63,7 @@ ManifestEntry blobManifestEntry(const String & path, const String & payload)
     ManifestEntry e;
     e.path = path;
     e.placement = EntryPlacement::Blob;
-    e.blob_hash = DB::Cas::BlobDigest::fromU128(u128Of(payload));
+    e.ref = BlobRef{BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(u128Of(payload))};
 
     e.blob_size = payload.size();
     return e;
@@ -74,7 +74,7 @@ ManifestEntry blobManifestEntryStreaming(const String & path, const String & pay
     ManifestEntry e;
     e.path = path;
     e.placement = EntryPlacement::Blob;
-    e.blob_hash = DB::Cas::BlobDigest::fromU128(hexToU128(streamingHexOf(payload)));
+    e.ref = BlobRef{BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(hexToU128(streamingHexOf(payload)))};
 
     e.blob_size = payload.size();
     return e;
@@ -388,15 +388,15 @@ TEST(CasBuildReuseBlob, DepIsTokenedDiscriminatesPutBlobVsAdopt)
 
     /// putBlob'd hash ⇒ tokened.
     build->putBlob(idOf("written"), BlobSource::fromString("written"));
-    EXPECT_TRUE(build->depIsTokened(BlobDigest::fromU128(u128Of("written"))));
+    EXPECT_TRUE(build->depIsTokened(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(u128Of("written"))}));
 
     /// Adopted hash ⇒ tokenless. adoptEvidence records the dep directly from a resolved ManifestEntry
     /// (the source manifest's entry); no body needs to be in hand for the dep to be recorded.
     build->adoptEvidence(blobManifestEntry("f", "adopted"));
-    EXPECT_FALSE(build->depIsTokened(BlobDigest::fromU128(u128Of("adopted"))));
+    EXPECT_FALSE(build->depIsTokened(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(u128Of("adopted"))}));
 
     /// Unknown hash ⇒ no dep, not tokened.
-    EXPECT_FALSE(build->depIsTokened(BlobDigest::fromU128(u128Of("unknown"))));
+    EXPECT_FALSE(build->depIsTokened(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(u128Of("unknown"))}));
 }
 
 /// B190: ReuseBlobCondemnedThrowsAbortedRetryable is removed (reuseBlob is gone).
@@ -684,7 +684,7 @@ TEST(CasBuild, PutBlobVanishDuringRevivalReUploadsNotFatal)
     /// putBlob holds "payload-V" as source bytes. The vanish-during-revival must NOT be fatal:
     ///   BEFORE fix: observeAndAdmit throws FILE_DOESNT_EXIST, escapes putBlob's ABORTED-only catch → fatal.
     ///   AFTER fix:  wrapped to ABORTED → putBlob retries → re-uploads from held bytes → succeeds.
-    BlobRef ref;
+    PutBlobResult ref;
     EXPECT_NO_THROW(ref = build->putBlob(idOf("payload-V"), BlobSource::fromString("payload-V")));
     EXPECT_EQ(ref.id, idOf("payload-V"));
 
@@ -803,7 +803,8 @@ TEST(CasBuild, CondemnedPresentEvidenceDepCopiesForwardAtGate)
         if (e.type == CasEventType::BlobCopyForward)
         {
             ++copy_forwards;
-            EXPECT_EQ(e.object_hash, streamingHexOf("payload-CF"));
+            /// Phase 3 T2: rendered ids are never a bare hex (ambiguous across algos) — "<algoName>:<hex>".
+            EXPECT_EQ(e.object_hash, "ch128:" + streamingHexOf("payload-CF"));
             EXPECT_EQ(e.detail.at("displaced_token"), t0.value);
         }
     EXPECT_EQ(copy_forwards, 1u);
@@ -1022,7 +1023,7 @@ TEST(CasBuild, CopyForwardMultiBlockPayloadVerifies)
         ManifestEntry e;
         e.path = "data.bin";
         e.placement = EntryPlacement::Blob;
-        e.blob_hash = DB::Cas::BlobDigest::fromU128(hash);
+        e.ref = DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(hash)};
 
         e.blob_size = payload.size();
         const ManifestId mid0 = build->stageManifest({e});
@@ -1040,7 +1041,7 @@ TEST(CasBuild, CopyForwardMultiBlockPayloadVerifies)
     ManifestEntry e;
     e.path = "data.bin";
     e.placement = EntryPlacement::Blob;
-    e.blob_hash = DB::Cas::BlobDigest::fromU128(hash);
+    e.ref = DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(hash)};
 
     e.blob_size = payload.size();
     build->adoptEvidence(e);
@@ -1230,7 +1231,7 @@ TEST(CasBuild, AdoptEvidenceRecordsTokenlessDep)
 
     const ManifestEntry adopted = blobManifestEntry("data.bin", "source-blob");
     build->adoptEvidence(adopted);
-    EXPECT_FALSE(build->depIsTokened(BlobDigest::fromU128(u128Of("source-blob"))));
+    EXPECT_FALSE(build->depIsTokened(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(u128Of("source-blob"))}));
 
     /// An Inline entry references no standalone object → records nothing (never tokened).
     ManifestEntry inline_entry;
@@ -1238,7 +1239,7 @@ TEST(CasBuild, AdoptEvidenceRecordsTokenlessDep)
     inline_entry.placement = EntryPlacement::Inline;
     inline_entry.inline_bytes = "abc";
     build->adoptEvidence(inline_entry);
-    EXPECT_FALSE(build->depIsTokened(BlobDigest::fromU128(u128Of("abc"))));
+    EXPECT_FALSE(build->depIsTokened(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(u128Of("abc"))}));
 }
 
 TEST(CasBuild, AbandonRemovesStagedDebrisAndDisables)
@@ -1558,7 +1559,7 @@ TEST(CasBuild, AdoptEvidenceNoBackendOp)
 
     /// The dep is recorded — a tokenless W-EVIDENCE dep (depIsTokened false) that the promote gate later
     /// revalidates; the no-backend-op counts above are the B188 contract's primary guard.
-    EXPECT_FALSE(build->depIsTokened(BlobDigest::fromU128(u128Of("b188-content"))));
+    EXPECT_FALSE(build->depIsTokened(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(u128Of("b188-content"))}));
 
     /// Inline entry: adoptEvidence records nothing (Inline has no standalone object) and no backend op.
     ManifestEntry inline_entry;
@@ -1569,7 +1570,7 @@ TEST(CasBuild, AdoptEvidenceNoBackendOp)
     EXPECT_EQ(counting->heads, 0u);
     EXPECT_EQ(counting->stream_puts, 0u);
     EXPECT_EQ(counting->gets, 0u);
-    EXPECT_FALSE(build->depIsTokened(BlobDigest::fromU128(u128Of("xy"))));
+    EXPECT_FALSE(build->depIsTokened(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(u128Of("xy"))}));
 }
 
 TEST(CasBuild, ConvergesUnderProductiveGc)
@@ -1942,7 +1943,7 @@ size_t manifestEncodedSizeForPathLen(const RootNamespace & ns, size_t path_len)
     ManifestEntry e;
     e.path = String(path_len, 'a');
     e.placement = EntryPlacement::Blob;
-    e.blob_hash = DB::Cas::BlobDigest::fromU128(UInt128{});
+    e.ref = DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(UInt128{})};
 
     e.blob_size = 12345;
     probe.entries = {std::move(e)};
@@ -1981,7 +1982,7 @@ ManifestEntry wideBlobManifestEntry(size_t path_len)
     ManifestEntry e;
     e.path = String(path_len, 'a');
     e.placement = EntryPlacement::Blob;
-    e.blob_hash = DB::Cas::BlobDigest::fromU128(UInt128{0x42});
+    e.ref = DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(UInt128{0x42})};
 
     e.blob_size = 12345;
     return e;
@@ -2043,4 +2044,52 @@ TEST(CasBuild, ManifestCapEncodedBytesOverThrowsBeforeBodyWrite)
     const size_t keys_after = b->list("", "", 100).keys.size();
     EXPECT_EQ(keys_before, keys_after)
         << "stageManifest must fail closed before writing the manifest body, leaving no new objects";
+}
+
+/// spec §9.9 (mixed-algo pools, Phase 3 T2) — the W-DEP-SET cross-satisfaction crux: a manifest with
+/// two entries carrying the SAME digest VALUE under TWO DIFFERENT algos (`ch128:X` / `xxh3:X`). Only
+/// `ch128:X`'s body is ever putBlob'd; `xxh3:X`'s body never lands anywhere. Promote MUST fail closed —
+/// the tokened `ch128:X` dep must NEVER be read as satisfying the non-tokened `xxh3:X` leaf.
+/// This test is RED (wrongly passes / silently promotes) if `Build::deps` (the W-DEP-SET) were keyed on
+/// a bare digest instead of the full `BlobRef` pair: both entries would collapse to the SAME map key
+/// (the digest alone), so `depIsTokened` would report the xxh3 leaf as edge-protected via the ch128
+/// entry's putBlob and promote would skip its revalidation (and hence its absence) entirely.
+TEST(CasBuild, WDepSetCrossAlgoSatisfactionFailsClosed)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = openStore(b);
+    const RootNamespace ns{"srv/tbl"};
+
+    const BlobDigest shared_digest = BlobDigest::fromU128(u128Of("shared-digest-value"));
+
+    ManifestEntry e_ch128;
+    e_ch128.path = "a.bin";
+    e_ch128.placement = EntryPlacement::Blob;
+    e_ch128.ref = BlobRef{BlobHashAlgo::CityHash128, shared_digest};
+    e_ch128.blob_size = 3;
+
+    ManifestEntry e_xxh3;
+    e_xxh3.path = "b.bin";
+    e_xxh3.placement = EntryPlacement::Blob;
+    e_xxh3.ref = BlobRef{BlobHashAlgo::XXH3_128, shared_digest};   /// SAME digest bytes, DIFFERENT algo
+    e_xxh3.blob_size = 3;
+
+    auto build = startBuildFor(s, ns, "part_mixed");
+    const ManifestId id = build->stageManifest({e_ch128, e_xxh3});
+    build->precommitAdd(ns, "part_mixed", id);
+
+    /// Only the ch128 leaf's body is ever uploaded — its BlobId hex is the digest at the ch128 width,
+    /// which addresses EXACTLY `e_ch128`'s object key (`blobs/ch128/...`), a DISTINCT key from
+    /// `e_xxh3`'s (`blobs/xxh3/...`), even though the raw digest bytes are identical.
+    build->putBlob(BlobId{DigestCodec(16).toHex(shared_digest)}, BlobSource::fromString("abc"));
+
+    /// promote must fail closed: the xxh3:X leaf has no tokened dep and no body at its own (distinct)
+    /// key — never silently satisfied by the ch128:X entry's tokened dep.
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::ABORTED, [&]
+    {
+        build->promote(ns, "part_mixed", build->buildId(), id);
+    });
+
+    /// No committed ref appears — the promote aborted before installing one.
+    EXPECT_FALSE(s->resolveRef(ns, "part_mixed").has_value());
 }

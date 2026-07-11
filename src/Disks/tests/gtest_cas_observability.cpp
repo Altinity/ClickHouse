@@ -44,7 +44,7 @@ ManifestId publishOneBlobPart(
     DB::Cas::ManifestEntry e;
     e.path = "data.bin";
     e.placement = EntryPlacement::Blob;
-    e.blob_hash = DB::Cas::BlobDigest::fromU128(u128Of(payload));
+    e.ref = DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(u128Of(payload))};
 
     e.blob_size = payload.size();
     /// Wiring order (EDGE-BEFORE-OBSERVE): stageManifest -> precommitAdd -> putBlob -> promote.

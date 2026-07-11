@@ -31,7 +31,7 @@ std::shared_ptr<const ContentAddressed::PartFolderView> makeView()
         Cas::ManifestEntry e;
         e.path = path;
         e.placement = placement;
-        e.blob_hash = DB::Cas::BlobDigest::fromU128(UInt128(manifest->entries.size() + 1));
+        e.ref = DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(UInt128(manifest->entries.size() + 1))};
 
         e.blob_size = blob_size;
         e.inline_bytes = bytes;

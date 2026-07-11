@@ -283,7 +283,7 @@ TEST(CasPluggableHash, Xxh3BlobLandsUnderAlgoSegmentAndIsDiscoveredCleanByFsck)
     ManifestEntry e;
     e.path = "data.bin";
     e.placement = EntryPlacement::Blob;
-    e.blob_hash = DB::Cas::BlobDigest::fromU128(hexToU128(id.string()));
+    e.ref = DB::Cas::BlobRef{BlobHashAlgo::XXH3_128, DB::Cas::BlobDigest::fromU128(hexToU128(id.string()))};
 
     e.blob_size = payload.size();
     const ManifestId mid = build->stageManifest({e});
@@ -444,7 +444,7 @@ TEST(CasPluggableHash, Sha256BuildWritesFullWidthDigestAndInlineEqualsBlob)
     BuildInfo info;
     info.intended_ref = ns.string() + "/part1";
     auto build = store->startBuild(info);
-    const BlobRef ref = build->putBlob(id, BlobSource::fromString(payload));
+    const PutBlobResult ref = build->putBlob(id, BlobSource::fromString(payload));
     EXPECT_EQ(ref.size, payload.size());
 
     /// THE CRUX (blob side): the blob body lands under the sha256-segmented path, addressed by the
@@ -470,13 +470,13 @@ TEST(CasPluggableHash, Sha256BuildWritesFullWidthDigestAndInlineEqualsBlob)
     ManifestEntry blob_entry;
     blob_entry.path = "data.bin";
     blob_entry.placement = EntryPlacement::Blob;
-    blob_entry.blob_hash = blob_hash;
+    blob_entry.ref = BlobRef{BlobHashAlgo::Sha256, blob_hash};
     blob_entry.blob_size = payload.size();
 
     ManifestEntry inline_entry;
     inline_entry.path = "checksums.txt";
     inline_entry.placement = EntryPlacement::Inline;
-    inline_entry.blob_hash = inline_hash;
+    inline_entry.ref = BlobRef{BlobHashAlgo::Sha256, inline_hash};
     inline_entry.blob_size = payload.size();
     inline_entry.inline_bytes = payload;
 
@@ -494,9 +494,9 @@ TEST(CasPluggableHash, Sha256BuildWritesFullWidthDigestAndInlineEqualsBlob)
     const auto read_blob_it = std::find_if(read_back.entries.begin(), read_back.entries.end(),
         [](const ManifestEntry & e) { return e.placement == EntryPlacement::Blob; });
     ASSERT_NE(read_blob_it, read_back.entries.end());
-    EXPECT_EQ(read_blob_it->blob_hash, blob_hash);
-    const bool read_tail_nonzero = std::any_of(read_blob_it->blob_hash.bytes.begin() + 16,
-        read_blob_it->blob_hash.bytes.end(), [](uint8_t b) { return b != 0; });
+    EXPECT_EQ(read_blob_it->ref.digest, blob_hash);
+    const bool read_tail_nonzero = std::any_of(read_blob_it->ref.digest.bytes.begin() + 16,
+        read_blob_it->ref.digest.bytes.end(), [](uint8_t b) { return b != 0; });
     EXPECT_TRUE(read_tail_nonzero) << "the manifest's on-disk blob_hash must not be truncated either";
 
     /// The write -> GC -> fsck loop must agree end-to-end on the 64-hex key: clean, no dangling.

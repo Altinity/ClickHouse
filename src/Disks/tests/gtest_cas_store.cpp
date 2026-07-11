@@ -78,7 +78,7 @@ ManifestId publishPart(
     ManifestEntry e;
     e.path = entry_path;
     e.placement = EntryPlacement::Blob;
-    e.blob_hash = DB::Cas::BlobDigest::fromU128(u128Of(payload));
+    e.ref = DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(u128Of(payload))};
 
     e.blob_size = payload.size();
 
@@ -120,7 +120,7 @@ ManifestId publishPartWithEntries(
         {
             /// Materialize the blob body so the promote-time HEAD revalidation succeeds, then record the
             /// tokenless W-EVIDENCE dep (the gate re-observes the current token at promote).
-            DB::Cas::tests::writeBlobBody(s->backend(), s->layout(), e.blob_hash.toU128());
+            DB::Cas::tests::writeBlobBody(s->backend(), s->layout(), e.ref.digest.toU128());
             build->adoptEvidence(e);
         }
     const ManifestId id = build->stageManifest(std::move(entries));
@@ -417,7 +417,7 @@ TEST(CasStore, ResolveReturnsManifestId)
     ManifestEntry blob_entry;
     blob_entry.path = "data.bin";
     blob_entry.placement = EntryPlacement::Blob;
-    blob_entry.blob_hash = DB::Cas::BlobDigest::fromU128(u128Of(payload));
+    blob_entry.ref = DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(u128Of(payload))};
 
     blob_entry.blob_size = payload.size();
     ManifestEntry inline_entry;
@@ -541,7 +541,7 @@ TEST(CasStore, LookupAndListOverManifestEntries)
     /// findEntry: exact-path hit + miss.
     const auto * hit = findEntry(manifest.entries, "data.bin");
     ASSERT_TRUE(hit != nullptr);
-    EXPECT_EQ(hit->blob_hash.toU128(), u128Of("data"));
+    EXPECT_EQ(hit->ref.digest.toU128(), u128Of("data"));
     EXPECT_TRUE(findEntry(manifest.entries, "no_such_file") == nullptr);
 
     /// entryRange under "p.proj/" yields exactly the two projection files, in canonical order.
@@ -628,7 +628,7 @@ TEST(CasStore, ManifestDecodeCacheIsByteBounded)
         DB::Cas::ManifestEntry e;
         e.path = "big.txt";
         e.placement = DB::Cas::EntryPlacement::Inline;
-        e.blob_hash = DB::Cas::BlobDigest::fromU128(DB::UInt128(i + 1));
+        e.ref = DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(DB::UInt128(i + 1))};
 
         e.inline_bytes = String(1 << 20, static_cast<char>('a' + i));
         e.blob_size = e.inline_bytes.size();

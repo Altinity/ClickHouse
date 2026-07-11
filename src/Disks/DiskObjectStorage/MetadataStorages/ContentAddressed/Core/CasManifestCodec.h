@@ -2,6 +2,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestId.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobDigest.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobRef.h>
 #include <base/types.h>
 #include <base/extended_types.h>
 #include <cstdint>
@@ -20,13 +21,15 @@ enum class EntryPlacement : uint8_t
     Blob = 2,     /// bytes stored as a content-addressed blob at blobKey(blob_hash)
 };
 
-/// One file entry inside a part manifest. `blob_hash`/`blob_size` are meaningful only for `Blob`;
-/// `inline_bytes` only for `Inline`.
+/// One file entry inside a part manifest. `ref`/`blob_size` are meaningful only for `Blob`;
+/// `inline_bytes` only for `Inline`. `ref` (mixed-algo pools, Phase 3 T2) is the FULL blob identity —
+/// the algo travels WITH the digest, per-entry, so a manifest may carry entries minted under
+/// different hash algos (additive algo switching, no migration): a bare digest is never the identity.
 struct ManifestEntry
 {
     String path;
     EntryPlacement placement = EntryPlacement::Inline;
-    BlobDigest blob_hash{};
+    BlobRef ref{};
     uint64_t blob_size = 0;
     String inline_bytes;
     bool operator==(const ManifestEntry &) const = default;
@@ -36,12 +39,12 @@ struct ManifestEntry
 /// Identity, OQ1). It repeats its own `ref` and `root_namespace_id` for fail-closed validation only -
 /// never as a second identity. `payload_digest` is integrity/debug only: NEVER a key, NEVER dedup,
 /// NEVER in-degree. No mutable per-ref payload here (that stays in the root RefRecord). No directory
-/// index in Phase 1a (OQ3-deferred).
+/// index in Phase 1a (OQ3-deferred). No manifest-wide `blob_hash_len` (Phase 3 T2 deleted it): every
+/// entry's digest width follows its OWN `ref.algo`, so one manifest may mix 16- and 32-byte digests.
 struct PartManifest
 {
     ManifestRef ref;
     RootNamespace root_namespace_id;
-    uint8_t blob_hash_len = 16;
     UInt128 payload_digest{};
     std::vector<ManifestEntry> entries;
     bool operator==(const PartManifest &) const = default;

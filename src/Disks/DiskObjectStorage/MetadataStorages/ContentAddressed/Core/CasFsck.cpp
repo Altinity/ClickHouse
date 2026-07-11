@@ -115,8 +115,8 @@ bool parseBuildPrefix(const String & key, const String & manifests_prefix, Build
 /// Fails CLOSED on any ambiguity (a malformed label, a dropped-then-recreated ref that throws, a
 /// corrupt current manifest): treated as "still referenced", i.e. the original conservative verdict.
 /// The fix can only SHRINK false positives — it must never hide a real one.
-bool blobStillReferenced(Store & store, const Layout & layout, const DigestCodec & codec, const String & bkey,
-                          const std::vector<String> & labels, const Deadline & deadline)
+bool blobStillReferenced(Store & store, const Layout & layout, [[maybe_unused]] const DigestCodec & codec,
+                          const String & bkey, const std::vector<String> & labels, const Deadline & deadline)
 {
     if (labels.empty())
         return true;
@@ -138,7 +138,7 @@ bool blobStillReferenced(Store & store, const Layout & layout, const DigestCodec
             {
                 if (e.placement != EntryPlacement::Blob)
                     continue;
-                if (layout.blobKey(BlobId(codec.toHex(e.blob_hash))) == bkey)
+                if (layout.blobKey(e.ref) == bkey)
                     return true;   /// a CURRENT ref still names this exact blob — a real dangle
             }
         }
@@ -218,7 +218,7 @@ void runFsckImpl(Store & store, bool detail, const FsckProgress & on_progress, c
             {
                 if (e.placement != EntryPlacement::Blob)
                     continue;
-                const String bkey = layout.blobKey(BlobId(codec.toHex(e.blob_hash)));
+                const String bkey = layout.blobKey(e.ref);
                 reachable_blobs.insert(bkey);
                 ++report.total_blob_refs;
                 report.referenced_logical_bytes += e.blob_size;

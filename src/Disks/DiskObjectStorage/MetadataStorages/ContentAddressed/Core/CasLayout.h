@@ -20,6 +20,13 @@ namespace ErrorCodes
 namespace DB::Cas
 {
 
+/// Forward-declared only: `CasBlobDigest.h` (`BlobDigest`, and via it `BlobRef` in `CasBlobRef.h`)
+/// already depends back on this header (`CasBlobDigest.h` -> `CasPoolMeta.h` -> `CasLayout.h`) --
+/// including it here would cycle. The `blobKey(const BlobRef &)` overload below needs it only by
+/// const reference, so the forward declaration is enough for the header; its definition (which needs
+/// the complete type) lives in `CasBuild.cpp`, where both are already visible.
+struct BlobRef;
+
 /// Pure key-construction functions for a content-addressed pool.
 ///
 /// Every key is built from a pool prefix and a stable path sub-tree (POOL = pool prefix, S = 2-char shard, ID = full id):
@@ -64,6 +71,15 @@ public:
     {
         return blobKey(id) + ".meta";
     }
+
+    /// Content objects, PER-ENTRY algo (mixed-algo pools, Phase 3 T2): POOL/blobs/<algo>/S/<hex>, with
+    /// `<algo>`/`<hex>` taken from `ref` itself -- NOT from this Layout's ctor-level `blob_hash_algo`
+    /// (that field only backs the legacy `blobKey(BlobId)` overload above, kept for existing
+    /// single-algo call sites). Defined out-of-line in CasBuild.cpp: `BlobRef`'s complete type comes
+    /// through `CasBlobDigest.h` -> `CasPoolMeta.h` -> `CasLayout.h`, so this header cannot include it
+    /// directly without cycling (mirrors the pre-existing `objectKey` cyclic-include workaround).
+    String blobKey(const BlobRef & ref) const;
+    String blobMetaKey(const BlobRef & ref) const;
 
     /// Root manifest for a given namespace + shard number.
     /// Phase 1: relocated out of the shared `roots/` tree to `cas/refs/` (hot/cold split). The
@@ -357,23 +373,5 @@ private:
         return prefix + "/" + ns + "/" + id.substr(0, 2) + "/" + id;
     }
 };
-
-/// Forward-declared only: `CasBlobDigest.h` (`BlobDigest`/`DigestCodec`) is NOT included here because
-/// it already depends back on this header (`CasBlobDigest.h` -> `CasPoolMeta.h` -> `CasLayout.h`) --
-/// including it here too would cycle. `objectKey` below needs them only by const reference, so the
-/// forward declaration is enough for the header; its definition (which calls `codec.toHex`, requiring
-/// the complete types) lives in `CasBuild.cpp`, its sole caller, where both are already visible.
-struct BlobDigest;
-class DigestCodec;
-
-/// The object key for a (kind, hash) — the single kind→key-shape mapping.
-/// Shared by `Build` (the publish gate's observe/resurrect) and `Gc` (the retire HEAD and the
-/// exact-token delete): both sides MUST address the same object the same way. The standalone tree
-/// object kind (the rejected Merkle layer) was excised 2026-07-03 (rev. 15 `PartManifest` redesign);
-/// `Blob` is the only surviving `ObjectKind`. CAS pluggable-blob-hash Phase 2 Task 6: routed through
-/// the pool-scoped `DigestCodec` (never a bare `u128ToHex`, which hard-rejects any hex length != 32
-/// and would silently misaddress or reject a sha256 pool's blob) -- `codec` MUST be built from the
-/// SAME pool this `layout` addresses (mirrors `CasGc.cpp`'s analogous `blobKeyOf`).
-String objectKey(const Layout & layout, const DigestCodec & codec, ObjectKind kind, const BlobDigest & hash);
 
 }

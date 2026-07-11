@@ -161,7 +161,7 @@ inline DB::Cas::ManifestEntry blobEntryFor(const String & path, const DB::UInt12
     DB::Cas::ManifestEntry e;
     e.path = path;
     e.placement = DB::Cas::EntryPlacement::Blob;
-    e.blob_hash = DB::Cas::BlobDigest::fromU128(hash);
+    e.ref = DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(hash)};
     e.blob_size = size;
     return e;
 }

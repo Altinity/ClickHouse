@@ -66,15 +66,15 @@ Store::Store(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
             config.manifest_decode_cache_bytes, /*max_count=*/16384, ManifestDecodeCache::DEFAULT_SIZE_RATIO);
 }
 
-bool Store::dedupCacheContains(const BlobDigest & blob_hash) const
+bool Store::dedupCacheContains(const BlobRef & ref) const
 {
-    return dedup_cache && dedup_cache->contains(blob_hash);
+    return dedup_cache && dedup_cache->contains(ref);
 }
 
-void Store::dedupCacheAdd(const BlobDigest & blob_hash)
+void Store::dedupCacheAdd(const BlobRef & ref)
 {
     if (dedup_cache)
-        dedup_cache->set(blob_hash, std::make_shared<DedupPresent>());
+        dedup_cache->set(ref, std::make_shared<DedupPresent>());
 }
 
 uint64_t Store::bootMs()
@@ -901,12 +901,11 @@ BlobLocation Store::locate(const ManifestEntry & entry) const
     {
         case EntryPlacement::Blob:
         {
-            /// CAS pluggable-blob-hash Phase 2 Task 5: the blob's object key is the POOL-width hex of
-            /// its content digest, via the pool-scoped codec -- a bare `.toU128()` truncation here would
-            /// silently address the WRONG (or a nonexistent) key for a 32-byte (sha256) pool's blob.
-            const DigestCodec codec(meta);
+            /// Phase 3 T2: the blob's object key is built directly from the entry's own `ref` (algo +
+            /// digest) -- no pool-scoped codec needed, since the key no longer depends on a pool-wide
+            /// width assumption.
             return BlobLocation{
-                .key = pool_layout.blobKey(BlobId(codec.toHex(entry.blob_hash))),
+                .key = pool_layout.blobKey(entry.ref),
                 .offset = meta.blob_header_len,
                 .length = entry.blob_size,
             };

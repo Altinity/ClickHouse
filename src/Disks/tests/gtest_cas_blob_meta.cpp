@@ -126,11 +126,13 @@ TEST(CasBlobMeta, DedupCacheAdmitsWidth32Digest)
     for (size_t i = 0; i < 16; ++i)
         narrow.bytes[i] = wide.bytes[i];
 
-    EXPECT_FALSE(store->dedupCacheContains(wide));
-    EXPECT_FALSE(store->dedupCacheContains(narrow));
-    store->dedupCacheAdd(wide);
-    EXPECT_TRUE(store->dedupCacheContains(wide));
-    EXPECT_FALSE(store->dedupCacheContains(narrow)) << "a 32-byte digest must not collide with its zero-tailed 16-byte prefix";
+    const BlobRef wide_ref{BlobHashAlgo::Sha256, wide};
+    const BlobRef narrow_ref{BlobHashAlgo::CityHash128, narrow};
+    EXPECT_FALSE(store->dedupCacheContains(wide_ref));
+    EXPECT_FALSE(store->dedupCacheContains(narrow_ref));
+    store->dedupCacheAdd(wide_ref);
+    EXPECT_TRUE(store->dedupCacheContains(wide_ref));
+    EXPECT_FALSE(store->dedupCacheContains(narrow_ref)) << "a 32-byte digest must not collide with its zero-tailed 16-byte prefix";
 }
 
 /// `ca-inspect` dispatch (CasInspect.cpp): a `.meta` key must decode as a BlobMeta, NOT fall through

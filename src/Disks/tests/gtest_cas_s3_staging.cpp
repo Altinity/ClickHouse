@@ -456,7 +456,7 @@ TEST(CasS3Staging, PromoteViaServerSideCopyCreatesFreshBlobTokenedDep)
     backend->putIfAbsent(staging_key, payload);
 
     auto build = precommittedBuildFor(store, ns, ref, hash, payload.size());
-    const DB::Cas::BlobRef bref = build->putBlob(blob_id, serverSideCopySource(staging_key, payload.size()));
+    const DB::Cas::PutBlobResult bref = build->putBlob(blob_id, serverSideCopySource(staging_key, payload.size()));
 
     /// EXACTLY one CONDITIONAL server-side copy staging->blobKey; zero unconditional copies.
     ASSERT_EQ(backend->copy_calls.size(), 1u);
@@ -466,7 +466,7 @@ TEST(CasS3Staging, PromoteViaServerSideCopyCreatesFreshBlobTokenedDep)
     EXPECT_EQ(backend->unconditionalCopyCount(), 0u);
 
     /// A TOKENED Blob dep was recorded (created path); the created blob carries the copy's dest token.
-    EXPECT_TRUE(build->depIsTokened(DB::Cas::BlobDigest::fromU128(hash)));
+    EXPECT_TRUE(build->depIsTokened(DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(hash)}));
     const DB::Cas::HeadResult hr = backend->head(blob_key);
     ASSERT_TRUE(hr.exists);
     EXPECT_FALSE(hr.token.empty());
@@ -513,7 +513,7 @@ TEST(CasS3Staging, PromoteOverExistingCleanBlobAdoptsAndNeverOverwrites)
     EXPECT_EQ(after.token, before.token);
 
     /// The adopt recorded a TOKENED dep at the observed (existing) incarnation's token.
-    EXPECT_TRUE(build->depIsTokened(DB::Cas::BlobDigest::fromU128(hash)));
+    EXPECT_TRUE(build->depIsTokened(DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(hash)}));
 }
 
 /// (c) Blob key exists but is CONDEMNED ⇒ the writer RESURRECTS by re-uploading its OWN staging PAYLOAD
@@ -591,7 +591,7 @@ TEST(CasS3Staging, PromoteOverCondemnedBlobResurrectsWithFreshTagNotVerbatim)
     EXPECT_NE(got->bytes.substr(0, header_len), staging_header);    /// header freshly re-tagged
 
     /// The resurrect recorded a tokened dep and flipped the meta back to Clean.
-    EXPECT_TRUE(build->depIsTokened(DB::Cas::BlobDigest::fromU128(hash)));
+    EXPECT_TRUE(build->depIsTokened(DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(hash)}));
     const auto lm = DB::Cas::tests::loadMetaForTest(*backend, store->layout(), hash);
     ASSERT_TRUE(lm.has_value());
     EXPECT_EQ(lm->meta.state, DB::Cas::MetaState::Clean);

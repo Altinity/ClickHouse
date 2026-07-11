@@ -645,37 +645,31 @@ bool Gc::foldManifestEdges(const ManifestId & id, int sign, std::vector<BlobDelt
     if (!manifestNamespaceMatches(id.root_namespace, body))
         throw Exception(ErrorCodes::CORRUPTED_DATA,
             "CAS gc fold: manifest body namespace mismatch at {} (manifestNamespaceMatches fail-closed)", key);
-    /// Task 4 (the consult's injection-route finding): `decodePartManifest` only validates
-    /// `blob_hash_len` ∈ {16, 32} in isolation — it never cross-checks it against THIS pool's
-    /// recorded width. A manifest body written at a foreign width would otherwise decode
-    /// successfully and hand `foldManifestEdges` `BlobDigest` values whose meaningful prefix length
-    /// disagrees with every other digest in the fold (a silent per-entry width injection). Refuse it
-    /// here, at the one place every manifest enters the fold.
-    if (body.blob_hash_len != store->poolMeta().blob_hash_len)
-        throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "CAS gc fold: manifest blob_hash_len {} != pool width {} at {} (foreign-width manifest refused)",
-            body.blob_hash_len, store->poolMeta().blob_hash_len, key);
+    /// Phase 3 T2: the Phase-2 manifest-wide `blob_hash_len` foreign-width gate is GONE (the field
+    /// itself was deleted — entries now carry their own per-entry algo/width). Per-entry admission
+    /// validation (is this entry's algo actually admitted to THIS pool?) is Task 5's job
+    /// (`foldManifestEdges` admission check with refresh-on-miss); until then every entry's algo is
+    /// simply whatever `decodePartManifest` already validated at decode time (an unknown algo byte
+    /// throws CORRUPTED_DATA there).
 
     for (const ManifestEntry & entry : body.entries)
         if (entry.placement == EntryPlacement::Blob)
         {
-            /// `entry.blob_hash` is already a `BlobDigest` (Phase 2 Task 3) — native now, no `.toU128()`
-            /// shim (Task 4 widens `BlobDelta.blob_hash` to `BlobDigest` too).
+            /// TEMPORARY(P3T3): bare digest, settlement retypes to BlobRef in Task 3
             deltas.push_back(BlobDelta{
-                .blob_hash = entry.blob_hash,
+                .blob_hash = entry.ref.digest,
                 .source_id = sourceEdgeId(id, entry.path),
                 .remove = (sign < 0)});
             /// B170: a folded owner edge over this blob (the manifest-model analog of the old
             /// `RootAdd`). +1 = the manifest's owner activated this blob's reference; -1 =
             /// the owner was removed, dropping the reference. Reconstructs WHY a blob's in-degree moved.
-            /// CAS pluggable-blob-hash Phase 2 Task 5: the event log renders the pool-width hex natively
-            /// (`entry.blob_hash` is already a `BlobDigest` — no narrowing shim).
             EventEmitter{*store}.emit([&](CasEvent & ev)
             {
                 ev.type = sign > 0 ? CasEventType::RootAdd : CasEventType::RootRemove;
                 ev.namespace_ = id.root_namespace.string();
                 ev.object_kind = CasEventObjectKind::Blob;
-                ev.object_hash = DigestCodec(store->poolMeta()).toHex(entry.blob_hash);
+                /// TEMPORARY(P3T3): bare digest, settlement retypes to BlobRef in Task 3
+                ev.object_hash = DigestCodec(store->poolMeta()).toHex(entry.ref.digest);
                 ev.outcome = sign > 0 ? "edge_added" : "edge_removed";
                 ev.reason = sign > 0
                     ? "fold: manifest owner activated; +1 blob edge"

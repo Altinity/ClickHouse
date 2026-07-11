@@ -2,6 +2,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobDigest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobHasher.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobRef.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEvent.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
@@ -401,10 +402,11 @@ public:
 
     /// P1 known-present blob-hash cache (design 2026-06-20, B168). A HINT only — correctness never
     /// depends on it: a hit just makes putBlob go HEAD-first, and a stale hit is caught by that HEAD.
-    /// No-ops when disabled (dedup_cache_bytes == 0). Keyed on the pool-width `BlobDigest` (CAS
-    /// pluggable-blob-hash Phase 2 Task 5) so a 32-byte pool's dedup hint is width-correct.
-    bool dedupCacheContains(const BlobDigest & blob_hash) const;
-    void dedupCacheAdd(const BlobDigest & blob_hash);
+    /// No-ops when disabled (dedup_cache_bytes == 0). Keyed on the full `BlobRef` pair (Phase 3 T2):
+    /// a bare digest is never the blob identity, and the same digest value under two algos is two
+    /// different objects.
+    bool dedupCacheContains(const BlobRef & ref) const;
+    void dedupCacheAdd(const BlobRef & ref);
     /// Test seam: retained bytes of the manifest decode cache (0 when disabled).
     size_t manifestDecodeCacheBytesForTest() const { return manifest_cache ? manifest_cache->sizeInBytes() : 0; }
     /// The shard a ref name routes to: CityHash64(ref_name) % root_shards. Build uses it to address the
@@ -589,7 +591,7 @@ private:
     /// configured `dedup_cache_bytes` is an honest memory ceiling. nullptr ⇔ disabled.
     struct DedupPresent {};
     struct DedupWeight { size_t operator()(const DedupPresent &) const { return 64; } };
-    using DedupCache = CacheBase<BlobDigest, DedupPresent, BlobDigestHash, DedupWeight>;
+    using DedupCache = CacheBase<BlobRef, DedupPresent, BlobRefHash, DedupWeight>;
     std::unique_ptr<DedupCache> dedup_cache;
     Layout pool_layout;
     /// Per-server build watermark (spec 2026-06-16-ca-build-watermark). process_epoch is a random

@@ -160,7 +160,7 @@ TEST(CasGcShardIncarnation, NewbornPrecommitProtectsDedupBlobAgainstConcurrentDr
         ManifestEntry dep_b1;
         dep_b1.path = "data.bin";
         dep_b1.placement = EntryPlacement::Blob;
-        dep_b1.blob_hash = DB::Cas::BlobDigest::fromU128(hexToU128(b1_hex));
+        dep_b1.ref = DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(hexToU128(b1_hex))};
 
         dep_b1.blob_size = b1_payload.size();
         build_b->adoptEvidence(dep_b1);
