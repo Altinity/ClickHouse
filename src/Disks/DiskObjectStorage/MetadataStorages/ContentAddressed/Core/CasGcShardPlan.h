@@ -30,11 +30,19 @@ namespace DB::Cas
 ///   - Deterministic/stable: same inputs always yield the same shard.
 ///   - Total: result is in [0, gc_shards).
 ///   - Single-shard equivalence: gc_shards == 1 always returns 0.
-inline uint64_t blobShard(const UInt128 & blob_hash, uint64_t gc_shards)
+///
+/// Takes a `BlobDigest` (CAS pluggable-blob-hash Phase 2 Task 4 — widened from the old bare
+/// `UInt128` overload) so the routing axis is defined uniformly for 16- and 32-byte digests alike.
+inline uint64_t blobShard(const BlobDigest & blob_hash, uint64_t gc_shards)
 {
     /// gc_shards >= 1 is enforced by GcState decode (CORRUPTED_DATA on 0).
-    /// The high 64 bits of the UInt128 are the upper half: (v >> 64) narrowed to uint64_t.
-    const uint64_t high64 = static_cast<uint64_t>(blob_hash >> 64);
+    /// BE-u64 of bytes[0:8] — an EXPLICIT big-endian read, bit-identical to the old
+    /// `static_cast<uint64_t>(blob_hash >> 64)` for every 128-bit digest (`fromU128` writes the
+    /// UInt128 big-endian into bytes[0:16], so bytes[0:8] IS the old high 64 bits). MUST stay an
+    /// explicit big-endian read, never a native-endian memcpy (would silently reshard on an LE host).
+    uint64_t high64 = 0;
+    for (int i = 0; i < 8; ++i)
+        high64 = (high64 << 8) | blob_hash.bytes[static_cast<size_t>(i)];
     return high64 % gc_shards;
 }
 
@@ -81,7 +89,7 @@ public:
     ShardReducer(uint64_t shard_, uint64_t gc_shards_);
 
     /// True iff this reducer owns `blob_hash` — i.e. `blobShard(blob_hash, gc_shards) == shard`.
-    bool owns(const UInt128 & blob_hash) const;
+    bool owns(const BlobDigest & blob_hash) const;
 
     /// Merge `shard_deltas` (the caller's per-shard `BlobDelta` slice produced by `foldManifestEdges`
     /// and bucketed by `blobShard`) into a new in-degree generation for this shard. Writes the sealed
@@ -95,6 +103,8 @@ public:
     /// PRECONDITION: every `BlobDelta` in `shard_deltas` must be owned by this reducer
     /// (`blobShard(d.blob_hash, gc_shards) == shard`). This is a caller contract; there is no
     /// underflow throw backstopping it — pass a misbucketed delta and the fold silently misroutes it.
+    /// `digest_len` (Task 4): threaded straight through to `foldDeltasIntoGeneration`'s OUTPUT width
+    /// parameter — defaults to 16 (every pool that exists today), so pre-Task-4 callers are unchanged.
     std::vector<RunRef> reduce(Backend & backend, const Layout & layout,
                                const std::vector<RunRef> & prior_runs,
                                uint64_t new_generation, uint64_t attempt,
@@ -103,7 +113,8 @@ public:
                                const std::function<std::optional<HeadResult>(const UInt128 &)> & head_blob = {},
                                const std::function<std::optional<HeadResult>(const UInt128 &)> & peek_head = {},
                                RetiredMergeResult * out_retired = nullptr,
-                               bool suppress_destructive = false);
+                               bool suppress_destructive = false,
+                               uint8_t digest_len = 16);
 
 private:
     uint64_t shard;

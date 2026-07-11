@@ -9,12 +9,18 @@
 #include <IO/WriteBufferFromString.h>
 #include <Common/Exception.h>
 
+namespace DB::ErrorCodes { extern const int CORRUPTED_DATA; }
+
 using namespace DB::Cas;
 
 namespace
 {
 UInt128 b(uint64_t n) { return UInt128(n); }
 UInt128 s(uint64_t n) { return UInt128(n); }   // source-edge id
+/// A `BlobDigest` (128-bit-width, zero-tailed) for the same literal `n` — every existing test's
+/// `BlobDelta.blob_hash` / `BlobCandidate.hash` / `inDegreeInGeneration` argument is a `BlobDigest`
+/// as of CAS pluggable-blob-hash Phase 2 Task 4.
+BlobDigest bh(uint64_t n) { return BlobDigest::fromU128(UInt128(n)); }
 }
 
 TEST(CasBlobInDegree, FoldStartsFromEmptyPriorGeneration)
@@ -25,9 +31,9 @@ TEST(CasBlobInDegree, FoldStartsFromEmptyPriorGeneration)
     /// Generation 1 from empty prior: two distinct edges on b1 and one on b2.
     /// Edge (b1,s1), (b1,s2), (b2,s1) => indeg(b1)=2, indeg(b2)=1.
     std::vector<BlobDelta> deltas{
-        {b(1), s(1), false},
-        {b(1), s(2), false},
-        {b(2), s(1), false},
+        {bh(1), s(1), false},
+        {bh(1), s(2), false},
+        {bh(2), s(1), false},
     };
     std::vector<RunRef> runs;
     foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{}, /*new*/1, /*attempt*/0, /*shard*/0, deltas, runs);
@@ -45,16 +51,16 @@ TEST(CasBlobInDegree, PlusMinusCancelToZeroDetectsCandidate)
     /// Gen 1: activate edge (b1,s1) and (b2,s1).
     std::vector<RunRef> runs1;
     foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{}, 1, /*attempt*/0, 0,
-        {{b(1), s(1), false}, {b(2), s(1), false}}, runs1);
+        {{bh(1), s(1), false}, {bh(2), s(1), false}}, runs1);
 
     /// Generation 2 merges prior gen-1 run (resolved via runs1 refs) with removal of (b1,s1): indeg(b1)=0, indeg(b2)=1.
     std::vector<RunRef> runs2;
     foldDeltasIntoGeneration(backend, layout, /*prior_runs*/runs1, /*new*/2, /*attempt*/0, 0,
-        {{b(1), s(1), true}}, runs2);
+        {{bh(1), s(1), true}}, runs2);
 
     const auto zero = zeroInDegree(backend, runs2);
     ASSERT_EQ(zero.size(), 1u);
-    EXPECT_EQ(zero[0].hash, b(1));
+    EXPECT_EQ(zero[0].hash, bh(1));
 }
 
 TEST(CasBlobInDegree, RunsAreByteDeterministic)
@@ -66,9 +72,9 @@ TEST(CasBlobInDegree, RunsAreByteDeterministic)
     std::vector<RunRef> rb;
     /// Same deltas in a DIFFERENT input order must produce the same sealed run bytes (sorted by key).
     foldDeltasIntoGeneration(a,  layout, /*prior_runs*/{}, 1, /*attempt*/0, 0,
-        {{b(3), s(1), false}, {b(1), s(1), false}, {b(2), s(1), false}}, ra);
+        {{bh(3), s(1), false}, {bh(1), s(1), false}, {bh(2), s(1), false}}, ra);
     foldDeltasIntoGeneration(b2, layout, /*prior_runs*/{}, 1, /*attempt*/0, 0,
-        {{b(1), s(1), false}, {b(2), s(1), false}, {b(3), s(1), false}}, rb);
+        {{bh(1), s(1), false}, {bh(2), s(1), false}, {bh(3), s(1), false}}, rb);
     const auto ga = a.get(layout.blobTargetRunKey(1, /*attempt*/0, 0, 0));
     const auto gb = b2.get(layout.blobTargetRunKey(1, /*attempt*/0, 0, 0));
     ASSERT_TRUE(ga.has_value());
@@ -87,14 +93,14 @@ TEST(CasBlobInDegree, SameEdgeActivatedTwiceCountsOnce)
     InMemoryBackend backend;
     Layout layout{"pool"};
     std::vector<BlobDelta> deltas{
-        {b(1), s(1), false},   // activate (b1,s1)
-        {b(1), s(1), false},   // same edge again — must deduplicate
+        {bh(1), s(1), false},   // activate (b1,s1)
+        {bh(1), s(1), false},   // same edge again — must deduplicate
     };
     std::vector<RunRef> runs;
     foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{}, 1, /*attempt*/0, 0, deltas, runs);
     ASSERT_FALSE(runs.empty());
 
-    const int64_t deg = inDegreeInGeneration(backend, runs, b(1));
+    const int64_t deg = inDegreeInGeneration(backend, runs, bh(1));
     EXPECT_EQ(deg, 1);   /// deduplicated, not 2
 
     const auto zero = zeroInDegree(backend, runs);
@@ -105,7 +111,7 @@ TEST(CasBlobInDegree, FoldDeltaByteEqualReplayAdopts)
 {
     InMemoryBackend backend;
     Layout layout{"pool"};
-    std::vector<BlobDelta> deltas{{b(1), s(1), false}};
+    std::vector<BlobDelta> deltas{{bh(1), s(1), false}};
     std::vector<RunRef> runs1;
     std::vector<RunRef> runs2;
     foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{}, 1, /*attempt*/7, /*shard*/0, deltas, runs1);
@@ -120,7 +126,7 @@ TEST(CasBlobInDegree, FoldDeltaDivergentBytesThrowsCorrupted)
     Layout layout{"pool"};
     /// Pre-occupy the run key (attempt 7) with junk, then fold => divergent => CORRUPTED_DATA.
     backend.putIfAbsent(layout.blobTargetRunKey(1, /*attempt*/7, /*shard*/0, /*seq*/0), "not-a-valid-run");
-    std::vector<BlobDelta> deltas{{b(1), s(1), false}};
+    std::vector<BlobDelta> deltas{{bh(1), s(1), false}};
     std::vector<RunRef> runs;
     EXPECT_THROW(foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{}, 1, /*attempt*/7, /*shard*/0, deltas, runs),
                  DB::Exception);
@@ -157,26 +163,28 @@ CondemnedRow condemnedRowFor(uint64_t condemn_round, const String & tok = "t",
                         .size = size, .condemn_round = condemn_round};
 }
 
-/// Build a source-edge run (`kSourceEdgeKeySchema`) carrying the given `kCondemned` sentinel rows and
-/// surviving edges, write it under `blobTargetRunKey(gen, attempt, shard, 0)`, and return its `RunRef`.
-/// Rows are emitted in (blob_hash, source_id) order (sentinels at source_id 0 sort first per blob).
+/// Build a source-edge run (`kSourceEdgeKeySchema128`) carrying the given `kCondemned` sentinel rows
+/// and surviving edges, write it under `blobTargetRunKey(gen, attempt, shard, 0)`, and return its
+/// `RunRef`. Rows are emitted in (blob_hash, source_id) order (sentinels at source_id 0 sort first
+/// per blob).
 RunRef writeSourceEdgeRun(InMemoryBackend & backend, const Layout & layout,
                           uint64_t gen, uint64_t attempt, uint64_t shard,
                           const std::vector<std::pair<UInt128, CondemnedRow>> & condemned,
                           const std::vector<std::pair<UInt128, UInt128>> & edges = {})
 {
+    const SourceEdgeKeyCodec codec(16);
     std::vector<std::pair<String, String>> rows;
     for (const auto & [h, row] : condemned)
-        rows.emplace_back(srcEdgeRunKey(h, UInt128{0}), encodeCondemnedRow(row));
+        rows.emplace_back(codec.key(BlobDigest::fromU128(h), UInt128{0}), encodeCondemnedRow(row));
     for (const auto & [h, sid] : edges)
-        rows.emplace_back(srcEdgeRunKey(h, sid), String(1, kEdgeActive));
+        rows.emplace_back(codec.key(BlobDigest::fromU128(h), sid), String(1, kEdgeActive));
     std::stable_sort(rows.begin(), rows.end(),
         [](const auto & a, const auto & bb) { return a.first < bb.first; });
 
     DB::WriteBufferFromOwnString out;
     RunHeader header;
     header.kind = RunKind::SourceEdge;
-    header.key_schema = kSourceEdgeKeySchema;
+    header.key_schema = kSourceEdgeKeySchema128;
     RunFileWriter writer(out, header);
     for (const auto & [k, p] : rows)
         writer.append(k, p);
@@ -202,11 +210,16 @@ DecodedRun decodeRun(InMemoryBackend & backend, const RunRef & run)
 {
     DecodedRun d;
     RunFileReader r = openSourceEdgeRun(backend, run.key);
+    /// Readers derive width from the run's OWN key_schema — never from pool meta (Task 4). Every run
+    /// this test helper decodes is schema-1 (16-byte), so `.toU128()` is a provably-exact round trip.
+    const SourceEdgeKeyCodec codec = SourceEdgeKeyCodec::forSchema(r.keySchema());
     String k, p;
     while (r.next(k, p))
     {
-        UInt128 bh, sid;
-        EXPECT_TRUE(parseSrcEdgeRunKey(k, bh, sid)) << "malformed run key";
+        BlobDigest bh_digest;
+        UInt128 sid;
+        codec.parse(k, bh_digest, sid);   // throws CORRUPTED_DATA on a malformed key (fail-closed)
+        const UInt128 bh = bh_digest.toU128();
         EXPECT_FALSE(p.empty());
         if (p.empty())
             continue;
@@ -302,7 +315,7 @@ TEST(CasThreeCursorMerge, RecoverySpares)
 
     std::vector<RunRef> runs2;
     RetiredMergeResult rmr;
-    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{gen1}, 2, 0, 0, {{b(1), s(1), false}}, runs2,
+    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{gen1}, 2, 0, 0, {{bh(1), s(1), false}}, runs2,
         /*current_round*/5, /*condemn_round*/6, /*head_blob*/{}, /*peek_head*/{}, &rmr);
 
     ASSERT_EQ(rmr.spared.size(), 1u);
@@ -325,11 +338,11 @@ TEST(CasThreeCursorMerge, NewCandidateCondemned)
     /// Gen 1: C (=b3) has one edge. Gen 2 removes it => transition to zero, not retired =>
     /// condemned with the head-captured token at THIS pass's condemn_round.
     std::vector<RunRef> runs1;
-    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{}, 1, 0, 0, {{b(3), s(1), false}}, runs1);
+    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{}, 1, 0, 0, {{bh(3), s(1), false}}, runs1);
 
     std::vector<RunRef> runs2;
     RetiredMergeResult rmr;
-    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/runs1, 2, 0, 0, {{b(3), s(1), true}}, runs2,
+    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/runs1, 2, 0, 0, {{bh(3), s(1), true}}, runs2,
         /*current_round*/0, /*condemn_round*/7, headPresent("t9", 42), /*peek_head*/{}, &rmr);
 
     ASSERT_EQ(rmr.still_retired.size(), 1u);
@@ -356,11 +369,11 @@ TEST(CasThreeCursorMerge, AbsentBlobNotCondemned)
     /// Same transition-to-zero as above, but the blob object is already gone at condemn time:
     /// nothing to delete later, so no entry is minted — a plain zero marker is emitted instead.
     std::vector<RunRef> runs1;
-    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{}, 1, 0, 0, {{b(3), s(1), false}}, runs1);
+    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{}, 1, 0, 0, {{bh(3), s(1), false}}, runs1);
 
     std::vector<RunRef> runs2;
     RetiredMergeResult rmr;
-    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/runs1, 2, 0, 0, {{b(3), s(1), true}}, runs2,
+    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/runs1, 2, 0, 0, {{bh(3), s(1), true}}, runs2,
         /*current_round*/0, /*condemn_round*/7,
         [](const UInt128 &) -> std::optional<HeadResult> { return std::nullopt; }, /*peek_head*/{}, &rmr);
 
@@ -386,7 +399,7 @@ TEST(CasThreeCursorMerge, SnapshotEdgesUnperturbedByRetired)
 
     std::vector<RunRef> r1;
     foldDeltasIntoGeneration(plain, layout, /*prior_runs*/{}, 1, 0, 0,
-        {{b(1), s(1), false}, {b(2), s(1), false}, {b(2), s(2), true}}, r1);
+        {{bh(1), s(1), false}, {bh(2), s(1), false}, {bh(2), s(2), true}}, r1);
 
     /// Engaged: the SAME deltas, but the prior run carries retired rows for b1 (which the delta re-edges
     /// => spared) and b5 (no edge => graduates past the floor).
@@ -395,7 +408,7 @@ TEST(CasThreeCursorMerge, SnapshotEdgesUnperturbedByRetired)
     std::vector<RunRef> r2;
     RetiredMergeResult rmr;
     foldDeltasIntoGeneration(engaged, layout, /*prior_runs*/{prior}, 2, 0, 0,
-        {{b(1), s(1), false}, {b(2), s(1), false}, {b(2), s(2), true}}, r2,
+        {{bh(1), s(1), false}, {bh(2), s(1), false}, {bh(2), s(2), true}}, r2,
         /*current_round*/9, /*condemn_round*/3, headPresent("t", 1), /*peek_head*/{}, &rmr);
 
     const DecodedRun plain_run = decodeRun(plain, r1[0]);
@@ -420,7 +433,7 @@ TEST(CasTwoCursorMerge, CarriedSentinelIsNotATouch)
     std::vector<RunRef> runs1;
     RetiredMergeResult rmr1;
     foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{}, 1, 0, 0,
-        {{b(2), s(1), false}, {b(2), s(1), true}}, runs1,
+        {{bh(2), s(1), false}, {bh(2), s(1), true}}, runs1,
         /*current_round*/0, /*condemn_round*/5, headPresent("tok", 7), /*peek_head*/{}, &rmr1);
     ASSERT_EQ(rmr1.still_retired.size(), 1u);
     {
@@ -462,9 +475,9 @@ TEST(CasTwoCursorMerge, MalformedRunFailsClosed)
         DB::WriteBufferFromOwnString out;
         RunHeader header;
         header.kind = RunKind::SourceEdge;
-        header.key_schema = kSourceEdgeKeySchema;
+        header.key_schema = kSourceEdgeKeySchema128;
         RunFileWriter writer(out, header);
-        writer.append(srcEdgeRunKey(b(1), UInt128{0}), String(1, kEdgeActive));   // edge at sentinel key
+        writer.append(SourceEdgeKeyCodec(16).key(bh(1), UInt128{0}), String(1, kEdgeActive));   // edge at sentinel key
         writer.finish();
         const RunRef bad{.key = layout.blobTargetRunKey(1, 0, 0, 0), .checksum = {}, .shard = 0, .generation = 1};
         backend.putIfAbsent(bad.key, out.str());
@@ -480,11 +493,11 @@ TEST(CasTwoCursorMerge, MalformedRunFailsClosed)
         DB::WriteBufferFromOwnString out;
         RunHeader header;
         header.kind = RunKind::SourceEdge;
-        header.key_schema = kSourceEdgeKeySchema;
+        header.key_schema = kSourceEdgeKeySchema128;
         RunFileWriter writer(out, header);
         /// Same (b,0) key twice (equal keys are allowed by the writer) — two condemned sentinels for b1.
-        writer.append(srcEdgeRunKey(b(1), UInt128{0}), encodeCondemnedRow(condemnedRowFor(1)));
-        writer.append(srcEdgeRunKey(b(1), UInt128{0}), encodeCondemnedRow(condemnedRowFor(2)));
+        writer.append(SourceEdgeKeyCodec(16).key(bh(1), UInt128{0}), encodeCondemnedRow(condemnedRowFor(1)));
+        writer.append(SourceEdgeKeyCodec(16).key(bh(1), UInt128{0}), encodeCondemnedRow(condemnedRowFor(2)));
         writer.finish();
         const RunRef bad{.key = layout.blobTargetRunKey(1, 0, 0, 0), .checksum = {}, .shard = 0, .generation = 1};
         backend.putIfAbsent(bad.key, out.str());
@@ -514,7 +527,7 @@ TEST(CasBlobInDegree, FoldStreamsPriorRunBlockBounded)
     std::vector<BlobDelta> gen1;
     gen1.reserve(20000);
     for (uint64_t i = 0; i < 20000; ++i)
-        gen1.push_back({b(i), s(1), false});
+        gen1.push_back({bh(i), s(1), false});
 
     std::vector<RunRef> runs1_c;
     std::vector<RunRef> runs1_o;
@@ -533,7 +546,7 @@ TEST(CasBlobInDegree, FoldStreamsPriorRunBlockBounded)
     /// gen-1 run must be consumed via the streaming cursor (head + tail get + body getStream + per-seq
     /// head probe), NEVER a whole-object get.
     backend.resetCounts();
-    std::vector<BlobDelta> gen2{{b(0), s(1), true}, {b(19999), s(2), false}};
+    std::vector<BlobDelta> gen2{{bh(0), s(1), true}, {bh(19999), s(2), false}};
     std::vector<RunRef> runs2_c;
     std::vector<RunRef> runs2_o;
     foldDeltasIntoGeneration(backend, layout, /*prior_runs*/runs1_c, 2, 0, 0, gen2, runs2_c);
@@ -581,7 +594,7 @@ TEST(CasBlobInDegree, ZeroInDegreeStreamsBlockBounded)
     std::vector<BlobDelta> gen1;
     gen1.reserve(20000);
     for (uint64_t i = 0; i < 20000; ++i)
-        gen1.push_back({b(i), s(1), false});
+        gen1.push_back({bh(i), s(1), false});
 
     std::vector<RunRef> runs1_c;
     std::vector<RunRef> runs1_o;
@@ -590,7 +603,7 @@ TEST(CasBlobInDegree, ZeroInDegreeStreamsBlockBounded)
 
     /// Gen 2 removes every edge on two of the blobs => two zero-transition markers in the gen-2 run,
     /// which is itself multi-block (the surviving-edge rows still span blocks).
-    std::vector<BlobDelta> gen2{{b(0), s(1), true}, {b(19999), s(1), true}};
+    std::vector<BlobDelta> gen2{{bh(0), s(1), true}, {bh(19999), s(1), true}};
     std::vector<RunRef> runs2_c;
     std::vector<RunRef> runs2_o;
     foldDeltasIntoGeneration(backend, layout, /*prior_runs*/runs1_c, 2, 0, 0, gen2, runs2_c);
@@ -673,7 +686,7 @@ TEST(CasSourceEdgeRun, TypedOpenRejectsWrongSchemaAndKind)
     DB::WriteBufferFromOwnString out2;
     DB::Cas::RunHeader h2;
     h2.kind = DB::Cas::RunKind::ManifestEntries;              // wrong kind, right schema
-    h2.key_schema = DB::Cas::kSourceEdgeKeySchema;
+    h2.key_schema = DB::Cas::kSourceEdgeKeySchema128;
     DB::Cas::RunFileWriter w2(out2, h2);
     w2.finish();
     EXPECT_THROW(DB::Cas::openSourceEdgeRun(out2.str()), DB::Exception);
@@ -685,4 +698,117 @@ TEST(CasSourceEdgeRun, SourceEdgeIdZeroIsReserved)
     /// (probability 2^-128 — the check documents the reservation).
     EXPECT_THROW(DB::Cas::assertValidSourceEdgeId(UInt128{0}), DB::Exception);
     EXPECT_NO_THROW(DB::Cas::assertValidSourceEdgeId(UInt128{1}));
+}
+
+/// ==== THE TEETH TEST (CAS pluggable-blob-hash Phase 2 Task 4, consult's cheapest high-value test) ====
+///
+/// A fold must NEVER mix a schema-1 (16-byte digest) prior run with a schema-2 (32-byte digest)
+/// output — cross-width raw-byte comparison is unsafe (a schema-1 key puts `source_id` where a
+/// schema-2 key puts digest-suffix bytes). `PriorEdgeCursor` asserts every prior segment's own
+/// `key_schema` against the fold's output schema THE MOMENT the segment is opened — before any row
+/// of it is parsed or compared — and throws `CORRUPTED_DATA` on a mismatch.
+
+TEST(CasGcFoldCrossWidth, RawKeyComparisonWouldReverseOrder)
+{
+    /// Standalone proof (no fold call) that a NAIVE raw-byte comparison between a schema-1 key and a
+    /// schema-2 key is unsafe — the exact hazard the coherence gate exists to prevent. Both keys share
+    /// the SAME leading 16 digest bytes (value 5); the schema-1 key's remaining bytes are a source_id
+    /// with a 0xFF leading byte, while the schema-2 key's remaining bytes are the digest's own
+    /// zero-heavy suffix (value ...,1) followed by an ordinary source_id.
+    BlobDigest d16 = BlobDigest::fromU128(UInt128(5));            // bytes = [0]*15,5, zero tail
+    BlobDigest d32 = d16;
+    d32.bytes[31] = 1;                                            // same 16-byte prefix, tiny nonzero suffix
+    /// As full 256-bit numbers (i.e. treating d16's zero tail as genuine), d16 < d32 (d32 has one extra
+    /// low bit set) — this is the INTENDED digest-magnitude order a correct merge must respect.
+
+    const UInt128 source_id_prior = UInt128(0xFF) << 120;         // top byte 0xFF
+    const UInt128 source_id_delta = UInt128(7);
+
+    const SourceEdgeKeyCodec codec16(16);
+    const SourceEdgeKeyCodec codec32(32);
+    const String prior_key = codec16.key(d16, source_id_prior);   // 32 bytes
+    const String delta_key = codec32.key(d32, source_id_delta);   // 48 bytes
+
+    /// The REVERSAL: a naive raw byte comparison (mixing "source_id" against "digest suffix" past the
+    /// shared 16-byte prefix) puts the delta's key BEFORE the prior's key — the OPPOSITE of the
+    /// intended digest-magnitude order (d16 < d32). This is exactly why a fold must refuse to compare
+    /// keys of two different schemas rather than trust `String operator<` across them.
+    EXPECT_LT(delta_key, prior_key)
+        << "crafted bytes must demonstrate the raw-comparison reversal (delta sorts first, though "
+           "its digest is numerically LARGER) — else this test is vacuous";
+}
+
+TEST(CasGcFoldCrossWidth, NonEmptyCrossWidthFoldRefusedBeforeWrite)
+{
+    /// The brief's literal construction: a real schema-1 prior edge row, folded with digest_len=32
+    /// (schema-2 output) against a schema-2 delta sharing the prior blob's leading 16 bytes. Must
+    /// throw CORRUPTED_DATA via the NAMED coherence gate (not merely "some" exception) and must not
+    /// write any output run artifact.
+    InMemoryBackend backend;
+    Layout layout{"pool"};
+
+    const UInt128 blob16_u128(5);
+    const BlobDigest d16 = BlobDigest::fromU128(blob16_u128);
+    BlobDigest d32 = d16;
+    d32.bytes[31] = 1;
+
+    const RunRef gen1 = writeSourceEdgeRun(backend, layout, /*gen*/1, 0, /*shard*/0,
+        /*condemned*/{}, /*edges*/{{blob16_u128, s(1)}});
+
+    std::vector<BlobDelta> scattered{{d32, UInt128(7), /*remove*/false}};
+    std::vector<RunRef> runs2;
+    bool threw = false;
+    try
+    {
+        foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{gen1}, /*new*/2, /*attempt*/0, /*shard*/0,
+            scattered, runs2, /*current_round*/0, /*condemn_round*/0, /*head_blob*/{}, /*peek_head*/{},
+            /*out_retired*/nullptr, /*suppress_destructive*/false, /*digest_len*/32);
+    }
+    catch (const DB::Exception & e)
+    {
+        threw = true;
+        EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA);
+        EXPECT_NE(e.message().find("cross-width merge refused"), String::npos)
+            << "the NAMED coherence gate must be what fires, not an incidental length-mismatch "
+               "throw elsewhere — actual message: " << e.message();
+    }
+    EXPECT_TRUE(threw) << "cross-width fold must throw, never silently mismerge";
+
+    /// No output run artifact was written: the generation-2 run key must be absent from the backend.
+    EXPECT_FALSE(backend.get(layout.blobTargetRunKey(2, 0, 0, 0)).has_value())
+        << "a refused cross-width fold must not leave a partial/wrong output artifact behind";
+}
+
+TEST(CasGcFoldCrossWidth, EmptyCrossWidthPriorRunRefused)
+{
+    /// The DISCRIMINATING variant: an EMPTY schema-1 prior run (header + footer, zero rows) has no row
+    /// for the per-row `SourceEdgeKeyCodec::parse` length check to ever reject — the only thing that
+    /// can catch a schema-1-vs-schema-2 mismatch here is the explicit, HEADER-based coherence gate in
+    /// `PriorEdgeCursor` (checked at segment-open, before any row is read). If that gate were removed,
+    /// this fold would run to completion and silently adopt the empty (wrong-schema) prior as if it
+    /// were compatible — this test goes RED without the gate.
+    InMemoryBackend backend;
+    Layout layout{"pool"};
+
+    const RunRef empty_gen1 = writeSourceEdgeRun(backend, layout, /*gen*/1, 0, /*shard*/0,
+        /*condemned*/{}, /*edges*/{});
+
+    std::vector<BlobDelta> scattered{{BlobDigest::fromU128(UInt128(9)), UInt128(1), /*remove*/false}};
+    std::vector<RunRef> runs2;
+    bool threw = false;
+    try
+    {
+        foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{empty_gen1}, /*new*/2, /*attempt*/0, /*shard*/0,
+            scattered, runs2, /*current_round*/0, /*condemn_round*/0, /*head_blob*/{}, /*peek_head*/{},
+            /*out_retired*/nullptr, /*suppress_destructive*/false, /*digest_len*/32);
+    }
+    catch (const DB::Exception & e)
+    {
+        threw = true;
+        EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA);
+        EXPECT_NE(e.message().find("cross-width merge refused"), String::npos) << e.message();
+    }
+    EXPECT_TRUE(threw) << "an EMPTY wrong-schema prior run has no row to trip a parse-length check — "
+                          "only the explicit coherence gate catches this (real teeth)";
+    EXPECT_FALSE(backend.get(layout.blobTargetRunKey(2, 0, 0, 0)).has_value());
 }

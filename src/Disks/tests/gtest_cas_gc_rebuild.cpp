@@ -396,11 +396,15 @@ TEST(CasGcRebuild, OrphanBlobCondemnedInRebuiltRun)
     for (const RunRef & r : seal.blob_target_runs)
     {
         RunFileReader reader = openSourceEdgeRun(*backend, r.key);
+        /// Readers derive width from the run's OWN key_schema — never from pool meta (Task 4).
+        const SourceEdgeKeyCodec codec = SourceEdgeKeyCodec::forSchema(reader.keySchema());
         String k, p;
         while (reader.next(k, p))
         {
-            UInt128 bh, sid;
-            ASSERT_TRUE(parseSrcEdgeRunKey(k, bh, sid));
+            BlobDigest bh_digest;
+            UInt128 sid;
+            codec.parse(k, bh_digest, sid);   // throws CORRUPTED_DATA on a malformed key (fail-closed)
+            const UInt128 bh = bh_digest.toU128();
             if (p.empty() || p[0] != kCondemned)
                 continue;
             const CondemnedRow row = decodeCondemnedRow(p);

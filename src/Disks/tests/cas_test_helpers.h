@@ -335,8 +335,8 @@ inline void injectRetire(
             if (e.condemn_round)
                 condemn_round = e.condemn_round;
             seeded.emplace(e.hash, DB::Cas::HeadResult{.exists = true, .size = e.size, .token = e.token, .attributes = {}});
-            synth.push_back(DB::Cas::BlobDelta{.blob_hash = e.hash, .source_id = DB::UInt128{1}, .remove = false});
-            synth.push_back(DB::Cas::BlobDelta{.blob_hash = e.hash, .source_id = DB::UInt128{1}, .remove = true});
+            synth.push_back(DB::Cas::BlobDelta{.blob_hash = DB::Cas::BlobDigest::fromU128(e.hash), .source_id = DB::UInt128{1}, .remove = false});
+            synth.push_back(DB::Cas::BlobDelta{.blob_hash = DB::Cas::BlobDigest::fromU128(e.hash), .source_id = DB::UInt128{1}, .remove = true});
         }
         const auto seed_head = [&seeded](const DB::UInt128 & h) -> std::optional<DB::Cas::HeadResult>
         {
@@ -463,14 +463,18 @@ inline std::vector<DB::Cas::RetiredEntry> currentRetiredSet(
         if (run.shard != shard)
             continue;
         DB::Cas::RunFileReader r = DB::Cas::openSourceEdgeRun(backend, run.key);
+        /// Readers derive width from the run's OWN key_schema — never from pool meta (Task 4).
+        const DB::Cas::SourceEdgeKeyCodec codec = DB::Cas::SourceEdgeKeyCodec::forSchema(r.keySchema());
         String k, p;
         while (r.next(k, p))
         {
             if (p.empty() || p[0] != DB::Cas::kCondemned)
                 continue;
-            DB::UInt128 blob_hash{}, source_id{};
-            if (!DB::Cas::parseSrcEdgeRunKey(k, blob_hash, source_id))
-                continue;
+            DB::Cas::BlobDigest blob_hash_digest;
+            DB::UInt128 source_id{};
+            codec.parse(k, blob_hash_digest, source_id);   // throws CORRUPTED_DATA on malformed (fail-closed)
+            /// `RetiredEntry.hash` is a pre-T5 128-bit shim boundary (Task 4).
+            const DB::UInt128 blob_hash = DB::Cas::legacyBlobId128(blob_hash_digest, 16);
             const DB::Cas::CondemnedRow row = DB::Cas::decodeCondemnedRow(p);
             out.push_back(DB::Cas::RetiredEntry{
                 .kind = DB::Cas::ObjectKind::Blob,
@@ -685,7 +689,8 @@ inline std::vector<DB::Cas::RunRef> runsForShard(
 /// The in-degree of a blob in the current GC generation's sealed run (0 when absent/zeroed).
 inline int64_t inDegreeOf(DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::UInt128 & hash)
 {
-    return DB::Cas::inDegreeInGeneration(backend, runsForShard(backend, layout, /*shard*/0), hash);
+    return DB::Cas::inDegreeInGeneration(backend, runsForShard(backend, layout, /*shard*/0),
+                                         DB::Cas::BlobDigest::fromU128(hash));
 }
 
 /// The cursor key "ns/shard" — matches CasGcCursorKey::cursorKey.

@@ -644,19 +644,23 @@ bool Gc::foldManifestEdges(const ManifestId & id, int sign, std::vector<BlobDelt
     for (const ManifestEntry & entry : body.entries)
         if (entry.placement == EntryPlacement::Blob)
         {
+            /// `entry.blob_hash` is already a `BlobDigest` (Phase 2 Task 3) — native now, no `.toU128()`
+            /// shim (Task 4 widens `BlobDelta.blob_hash` to `BlobDigest` too).
             deltas.push_back(BlobDelta{
-                .blob_hash = entry.blob_hash.toU128(),
+                .blob_hash = entry.blob_hash,
                 .source_id = sourceEdgeId(id, entry.path),
                 .remove = (sign < 0)});
             /// B170: a folded owner edge over this blob (the manifest-model analog of the old
             /// `RootAdd`). +1 = the manifest's owner activated this blob's reference; -1 =
             /// the owner was removed, dropping the reference. Reconstructs WHY a blob's in-degree moved.
+            /// The event log stays 128-bit-hex (pre-T5 shim boundary): `legacyBlobId128` fails closed
+            /// rather than silently truncating if a 32-byte pool ever reaches this pre-T5 path.
             EventEmitter{*store}.emit([&](CasEvent & ev)
             {
                 ev.type = sign > 0 ? CasEventType::RootAdd : CasEventType::RootRemove;
                 ev.namespace_ = id.root_namespace.string();
                 ev.object_kind = CasEventObjectKind::Blob;
-                ev.object_hash = u128ToHex(entry.blob_hash.toU128());
+                ev.object_hash = u128ToHex(legacyBlobId128(entry.blob_hash, static_cast<uint8_t>(store->poolMeta().blob_hash_len)));
                 ev.outcome = sign > 0 ? "edge_added" : "edge_removed";
                 ev.reason = sign > 0
                     ? "fold: manifest owner activated; +1 blob edge"
@@ -1128,7 +1132,8 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
                                      new_generation, attempt, /*shard*/0,
                                      std::move(deltas), result.fold_seal.blob_target_runs,
                                      current_round, condemn_round, head_blob, peek_head,
-                                     &result.retired_merge[0], suppress_destructive);
+                                     &result.retired_merge[0], suppress_destructive,
+                                     static_cast<uint8_t>(store->poolMeta().blob_hash_len));
             result.fold_seal.condemned_summary[0] = summarize(result.retired_merge[0].still_retired);
         }
     }
@@ -1163,7 +1168,8 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
                                new_generation, attempt,
                                std::move(buckets[shard]),
                                current_round, condemn_round, head_blob, peek_head,
-                               &result.retired_merge[shard], suppress_destructive);
+                               &result.retired_merge[shard], suppress_destructive,
+                               static_cast<uint8_t>(store->poolMeta().blob_hash_len));
             for (RunRef & r : shard_runs)
                 result.fold_seal.blob_target_runs.push_back(std::move(r));
             result.fold_seal.condemned_summary[shard] = summarize(result.retired_merge[shard].still_retired);
@@ -1823,6 +1829,10 @@ RebuildReport Gc::rebuildBaseline(bool force)
     /// graduates nothing).
     std::function<std::optional<HeadResult>(const UInt128 &)> condemn_seed_head;
     uint64_t condemn_round_stamp = 0;
+    /// The OUTPUT width for this rebuild's folds (Task 4 wiring): sourced from the pool, never
+    /// inferred from the deltas. Every pool that exists today is 16, so this is byte-identical to
+    /// pre-Task-4 behavior.
+    const uint8_t digest_len = static_cast<uint8_t>(store->poolMeta().blob_hash_len);
     auto flush_shard = [&](uint64_t shard)
     {
         if (buckets[shard].empty())
@@ -1831,7 +1841,8 @@ RebuildReport Gc::rebuildBaseline(bool force)
         foldDeltasIntoGeneration(backend, layout, prior_runs[shard], generation, ++attempt_of[shard],
                                  shard, std::move(buckets[shard]), out,
                                  /*current_round*/0, /*condemn_round*/condemn_round_stamp, condemn_seed_head,
-                                 /*peek_head*/{}, /*out_retired*/nullptr, /*suppress_destructive*/false);
+                                 /*peek_head*/{}, /*out_retired*/nullptr, /*suppress_destructive*/false,
+                                 digest_len);
         buckets[shard].clear();
         prior_runs[shard] = std::move(out);
     };
@@ -1841,7 +1852,10 @@ RebuildReport Gc::rebuildBaseline(bool force)
         rep.edges += deltas.size();
         for (BlobDelta & d : deltas)
         {
-            edge_bearing.insert(d.blob_hash);
+            /// `edge_bearing` stays UInt128-keyed (the pipeline-blindness LIST/HEAD sweep below parses
+            /// blob object keys via `hexToU128`, a pre-T5 128-bit-only path) — `legacyBlobId128` fails
+            /// closed rather than silently truncating a future 32-byte digest.
+            edge_bearing.insert(legacyBlobId128(d.blob_hash, digest_len));
             const uint64_t shard = blobShard(d.blob_hash, gc_shards);
             buckets[shard].push_back(std::move(d));
             if (buckets[shard].size() >= budget)
@@ -2010,7 +2024,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
                 const HeadResult hr = backend.head(k.key);
                 if (!hr.exists)
                     continue;
-                zero_condemned[blobShard(hash, gc_shards)].push_back(RetiredEntry{
+                zero_condemned[blobShard(BlobDigest::fromU128(hash), gc_shards)].push_back(RetiredEntry{
                     .kind = ObjectKind::Blob, .hash = hash, .token = hr.token, .size = hr.size});
             }
             if (page.next_cursor.empty())
@@ -2036,8 +2050,8 @@ RebuildReport Gc::rebuildBaseline(bool force)
         for (const RetiredEntry & e : zero_condemned[shard])
         {
             condemn_seeded.emplace(e.hash, HeadResult{.exists = true, .size = e.size, .token = e.token, .attributes = {}});
-            buckets[shard].push_back(BlobDelta{.blob_hash = e.hash, .source_id = UInt128{1}, .remove = false});
-            buckets[shard].push_back(BlobDelta{.blob_hash = e.hash, .source_id = UInt128{1}, .remove = true});
+            buckets[shard].push_back(BlobDelta{.blob_hash = BlobDigest::fromU128(e.hash), .source_id = UInt128{1}, .remove = false});
+            buckets[shard].push_back(BlobDelta{.blob_hash = BlobDigest::fromU128(e.hash), .source_id = UInt128{1}, .remove = true});
         }
     }
     condemn_seed_head = [&condemn_seeded](const UInt128 & h) -> std::optional<HeadResult>
@@ -2143,6 +2157,10 @@ std::vector<Gc::PreviewEntry> Gc::previewDeletes()
         for (const RunRef & r : adopted->blob_target_runs)
             runs_by_shard[r.shard].push_back(r);
 
+    /// PreviewEntry.hash is a pre-T5 128-bit shim boundary (Task 4): fail closed rather than silently
+    /// truncate if a 32-byte pool ever reaches this pre-T5 path.
+    const uint8_t digest_len = static_cast<uint8_t>(store->poolMeta().blob_hash_len);
+
     /// Scan every blob-target shard (see `retire`): a preview that only looked at shard 0 would miss the
     /// zero-in-degree candidates owned by shards 1..N under `gc_shards > 1`.
     for (uint64_t shard = 0; shard < state.gc_shards; ++shard)
@@ -2152,13 +2170,14 @@ std::vector<Gc::PreviewEntry> Gc::previewDeletes()
         const std::vector<RunRef> & shard_runs = it != runs_by_shard.end() ? it->second : kEmptyRuns;
         for (const BlobCandidate & cand : zeroInDegree(backend, shard_runs))
         {
-            const HeadResult observed = backend.head(blobKeyOf(layout, cand.hash));
+            const UInt128 hash = legacyBlobId128(cand.hash, digest_len);
+            const HeadResult observed = backend.head(blobKeyOf(layout, hash));
             if (!observed.exists)
                 continue;
             PreviewEntry e;
             e.kind = ObjectKind::Blob;
-            e.hash = cand.hash;
-            e.key = blobKeyOf(layout, cand.hash);
+            e.hash = hash;
+            e.key = blobKeyOf(layout, hash);
             e.size = observed.size;
             e.reason = "unreachable";
             out.push_back(std::move(e));
@@ -2171,16 +2190,18 @@ std::vector<Gc::PreviewEntry> Gc::previewDeletes()
         for (const RunRef & run : shard_runs)
         {
             RunFileReader reader = openSourceEdgeRun(backend, run.key);
+            /// Readers derive width from the run's OWN key_schema — never from pool meta (Task 4).
+            const SourceEdgeKeyCodec codec = SourceEdgeKeyCodec::forSchema(reader.keySchema());
             String key;
             String payload;
             while (reader.next(key, payload))
             {
                 if (payload.empty() || payload[0] != kCondemned)
                     continue;
-                UInt128 hash;
+                BlobDigest hash_digest;
                 UInt128 source_id;
-                if (!parseSrcEdgeRunKey(key, hash, source_id))
-                    continue;
+                codec.parse(key, hash_digest, source_id);   // throws CORRUPTED_DATA on a malformed key
+                const UInt128 hash = legacyBlobId128(hash_digest, digest_len);
                 const CondemnedRow row = decodeCondemnedRow(payload);
                 PreviewEntry e;
                 e.kind = ObjectKind::Blob;

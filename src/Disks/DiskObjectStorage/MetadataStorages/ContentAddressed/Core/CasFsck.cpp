@@ -350,17 +350,25 @@ void runFsckImpl(Store & store, bool detail, const FsckProgress & on_progress, c
                 {
                     checkDeadline(deadline, "reading gc snapshot runs");
                     /// Typed open (spec §2.1): every source-edge run reader goes through openSourceEdgeRun.
-                    /// Fsck keys off the row's hash (via parseSrcEdgeRunKey), so a hash carried by a
+                    /// Fsck keys off the row's hash (via the run's own `SourceEdgeKeyCodec`, derived from
+                    /// its `key_schema` — Task 4, never from pool meta), so a hash carried by a
                     /// `kCondemned` sentinel row also marks the blob "known to GC"; when it is a
                     /// candidate we additionally decode the condemned state for the `PendingGc` view.
+                    /// `unref_hashes`/`in_run_hashes`/`retired_by_hash` stay UInt128-keyed (derived from
+                    /// `hexToU128` on the blob object key, a pre-T5 128-bit-only path): `legacyBlobId128`
+                    /// fails closed rather than silently truncating a future 32-byte digest.
                     RunFileReader reader = openSourceEdgeRun(backend, run.key);
+                    const SourceEdgeKeyCodec codec = SourceEdgeKeyCodec::forSchema(reader.keySchema());
+                    const uint8_t digest_len = static_cast<uint8_t>(store.poolMeta().blob_hash_len);
                     String key;
                     String payload;
                     while (reader.next(key, payload))
                     {
-                        UInt128 hash;
+                        BlobDigest hash_digest;
                         UInt128 source_id;
-                        if (parseSrcEdgeRunKey(key, hash, source_id) && unref_hashes.count(hash))
+                        codec.parse(key, hash_digest, source_id);   // throws CORRUPTED_DATA on malformed (fail-closed)
+                        const UInt128 hash = legacyBlobId128(hash_digest, digest_len);
+                        if (unref_hashes.count(hash))
                         {
                             in_run_hashes.insert(hash);
                             if (!payload.empty() && payload[0] == kCondemned)

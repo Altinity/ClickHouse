@@ -86,7 +86,7 @@ TEST(CasBlobDigest, ShardOfViaPoolMetaConstructedCodecMatchesOldBlobShard)
         /// `blobShard` (`CasGcShardPlan.h`) additionally takes `% gc_shards`; at `gc_shards == 1`
         /// every hash routes to shard 0, so this only pins the trivial single-shard case -- the
         /// bit-identical pre-mod value is already pinned by the assertion above.
-        EXPECT_EQ(blobShard(v, /*gc_shards*/ 1), 0u);
+        EXPECT_EQ(blobShard(BlobDigest::fromU128(v), /*gc_shards*/ 1), 0u);
     }
 }
 
