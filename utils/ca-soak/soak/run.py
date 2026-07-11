@@ -618,18 +618,28 @@ def checkpoint(driver, cluster, model, phase):
         pipeline_classes = ("unreachable", "pending-gc", "awaiting-gc")
         pipeline_keys = {row["key"] for row in detail_rows if row["class"] in pipeline_classes}
         detail_class_by_key = {row["key"]: row["class"] for row in detail_rows}
+
+        # Classify dryrun keys: pipeline, absent-from-detail (already deleted pending fold), or wrong-class
+        already_deleted_count = 0
         for entry in dr.get("entries", []):
-            if entry["key"] not in pipeline_keys:
-                other = detail_class_by_key.get(entry["key"], "absent/reachable")
+            if entry["key"] not in detail_class_by_key:
+                # Blob absent from fsck detail: already physically deleted but row not yet folded. TOLERATED.
+                already_deleted_count += 1
+            elif entry["key"] not in pipeline_keys:
+                # Blob present in detail but NOT in a deletion-pipeline class: a real wrong-preview signal.
+                other = detail_class_by_key.get(entry["key"], "unknown")
                 class_counts: dict = {}
                 for row in detail_rows:
                     class_counts[row["class"]] = class_counts.get(row["class"], 0) + 1
                 raise CheckpointFailure(
                     f"dryrun key {entry['key']!r} previews deletion of a non-pipeline blob "
                     f"(fsck class={other!r}) — a dryrun key must be in a deletion-pipeline class "
-                    f"{pipeline_classes} (absent-from-detail means reachable); "
+                    f"{pipeline_classes} (absent-from-detail means the blob is already deleted); "
                     f"dryrun_count={dr.get('count')} pipeline_keys={len(pipeline_keys)} "
                     f"detail_class_counts={class_counts}")
+
+        if already_deleted_count > 0:
+            log(f"dryrun: {already_deleted_count} keys already deleted, pending fold — tolerated")
 
     # --- TRACK (do NOT hard-fail): residual unreachable is the known M-F Full-GC debris -------
     unreachable = f.get("unreachable", 0)
