@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <cmath>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
@@ -24,6 +25,7 @@ extern const int LOGICAL_ERROR;
 extern const int NOT_IMPLEMENTED;
 extern const int ABORTED;
 extern const int CORRUPTED_DATA;
+extern const int LIMIT_EXCEEDED;
 }
 
 using namespace DB::Cas;
@@ -1904,4 +1906,133 @@ TEST(CasBuild, AbandonStillDeletesNeverPrecommittedStagedDebris)
         << "never-precommitted staged debris must still be best-effort deleted by abandon";
     EXPECT_TRUE(b->head(s->layout().manifestKey(precommitted)).exists)
         << "the live precommit body must be spared";
+}
+
+/// ------------------------------------------------------------------------------------------------
+/// OQ7 manifest-cap fail-close (S07): the scenario suite tried to reach `stageManifest`'s encoded-bytes
+/// cap through a wide-column SQL `INSERT`, but the cap sits 3+ orders of magnitude above what dev SQL
+/// can reach in reasonable time (confirmed: even a 20000-column full-scale insert cannot get there). So
+/// this P0 safety path is not scenario-testable and is exercised directly here instead.
+/// ------------------------------------------------------------------------------------------------
+
+namespace
+{
+
+/// Mirrors `CasBuild.cpp`'s private `kMaxManifestEncodedBytes` (256 MiB). There is no way to read a
+/// file-local `constexpr` from a different translation unit, so this is kept in sync by hand — if that
+/// cap ever changes, update this one to match.
+constexpr uint64_t kExpectedManifestEncodedCap = 256ULL << 20;
+
+/// The exact encoded size `Build::stageManifest` would compute for a single Blob-placement entry whose
+/// path is `path_len` bytes long, staged under `ns` — measured through the SAME `encodePartManifest`
+/// codec `stageManifest` calls, so this is an exact reproduction rather than a hand-derived estimate.
+/// `ref` and `payload_digest` are fixed-width fields (20 and 16 bytes respectively): their VALUES don't
+/// affect the encoded size, only their presence does, so the zero-valued placeholders here reproduce
+/// the exact same byte count `stageManifest` would produce with its real (non-zero) values.
+size_t manifestEncodedSizeForPathLen(const RootNamespace & ns, size_t path_len)
+{
+    PartManifest probe;
+    probe.root_namespace_id = ns;
+    ManifestEntry e;
+    e.path = String(path_len, 'a');
+    e.placement = EntryPlacement::Blob;
+    e.blob_hash = UInt128{};
+    e.blob_size = 12345;
+    probe.entries = {std::move(e)};
+    return encodePartManifest(probe).size();
+}
+
+/// Finds the exact boundary: the SMALLEST `path_len` whose single-entry manifest encodes to MORE than
+/// `kExpectedManifestEncodedCap` bytes under `ns`. `path_len - 1` therefore encodes to AT MOST the cap
+/// (the encoding is monotonic in `path_len` — a longer path can only grow the encoded size). Starts
+/// from a linear estimate (the encoding is affine in `path_len`: fixed framing overhead plus a constant
+/// number of bytes per path byte) and walks to the exact crossing, so this stays correct even if the
+/// framing overhead changes, without needing a full binary search over a ~256 MiB range.
+size_t findManifestEncodedCapBoundaryPathLen(const RootNamespace & ns)
+{
+    constexpr size_t probe_lo = 1000;
+    constexpr size_t probe_hi = 2'000'000;
+    const size_t size_lo = manifestEncodedSizeForPathLen(ns, probe_lo);
+    const size_t size_hi = manifestEncodedSizeForPathLen(ns, probe_hi);
+    const double slope = static_cast<double>(size_hi - size_lo) / static_cast<double>(probe_hi - probe_lo);
+    const double intercept = static_cast<double>(size_lo) - slope * static_cast<double>(probe_lo);
+
+    size_t path_len = static_cast<size_t>(std::ceil(
+        (static_cast<double>(kExpectedManifestEncodedCap) - intercept) / slope)) + 1;
+
+    while (manifestEncodedSizeForPathLen(ns, path_len) <= kExpectedManifestEncodedCap)
+        ++path_len;
+    while (path_len > 1 && manifestEncodedSizeForPathLen(ns, path_len - 1) > kExpectedManifestEncodedCap)
+        --path_len;
+    return path_len;
+}
+
+/// A one-entry Blob ManifestEntry with a synthetic `path_len`-byte path (used only to inflate the
+/// encoded manifest size towards the OQ7 cap).
+ManifestEntry wideBlobManifestEntry(size_t path_len)
+{
+    ManifestEntry e;
+    e.path = String(path_len, 'a');
+    e.placement = EntryPlacement::Blob;
+    e.blob_hash = UInt128{0x42};
+    e.blob_size = 12345;
+    return e;
+}
+
+}
+
+/// Boundary case 1/2: a manifest whose encoded size is the LARGEST that still fits under the cap stages
+/// successfully. Proves the cap enforcement isn't overly conservative — a real just-under-the-limit
+/// manifest is not mistakenly rejected.
+TEST(CasBuild, ManifestCapEncodedBytesJustUnderStagesSuccessfully)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = openStore(b);
+    const RootNamespace ns{"srv1/tbl"};
+
+    const size_t path_len_over = findManifestEncodedCapBoundaryPathLen(ns);
+    ASSERT_GT(path_len_over, 1u);
+    const size_t path_len_under = path_len_over - 1;
+    ASSERT_LE(manifestEncodedSizeForPathLen(ns, path_len_under), kExpectedManifestEncodedCap);
+
+    auto build = startBuildFor(s, ns, "wide_part");
+    const ManifestId id = build->stageManifest({wideBlobManifestEntry(path_len_under)});
+    EXPECT_EQ(id.root_namespace, ns);
+    EXPECT_TRUE(b->head(s->layout().manifestKey(id)).exists)
+        << "a just-under-cap manifest must actually be written";
+}
+
+/// Boundary case 2/2: a manifest whose encoded size exceeds the cap by the smallest possible margin
+/// (one more path byte than the passing case above) throws `LIMIT_EXCEEDED` fail-closed, BEFORE the body
+/// write — no manifest object lands in the backend for the rejected attempt.
+TEST(CasBuild, ManifestCapEncodedBytesOverThrowsBeforeBodyWrite)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = openStore(b);
+    const RootNamespace ns{"srv1/tbl"};
+
+    const size_t path_len_over = findManifestEncodedCapBoundaryPathLen(ns);
+    ASSERT_GT(manifestEncodedSizeForPathLen(ns, path_len_over), kExpectedManifestEncodedCap);
+
+    auto build = startBuildFor(s, ns, "wide_part");
+
+    const size_t keys_before = b->list("", "", 100).keys.size();
+    bool threw = false;
+    try
+    {
+        build->stageManifest({wideBlobManifestEntry(path_len_over)});
+    }
+    catch (const DB::Exception & e)
+    {
+        threw = true;
+        EXPECT_EQ(e.code(), DB::ErrorCodes::LIMIT_EXCEEDED);
+        EXPECT_NE(e.message().find("exceeds cap"), String::npos) << e.message();
+    }
+    EXPECT_TRUE(threw) << "an over-cap manifest must throw, not silently truncate or accept";
+
+    /// Fail-closed BEFORE the body write: the over-cap attempt must not have created ANY new object
+    /// (no partial state, no orphaned blob/manifest debris for a manifest that was never accepted).
+    const size_t keys_after = b->list("", "", 100).keys.size();
+    EXPECT_EQ(keys_before, keys_after)
+        << "stageManifest must fail closed before writing the manifest body, leaving no new objects";
 }
