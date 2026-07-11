@@ -204,7 +204,7 @@ See [`09-read-protocol.md`](09-read-protocol.md) for full detail.
 | Pool-format version breadcrumb (B180) | **TODO** | Self-describing pool meta for version identification |
 | Integration tests on RustFS (not MinIO) (B125) | **TODO** (HARD) | Current integration tests use MinIO; production uses S3-compatible backends |
 | Repo hygiene — non-shippable files removed from the diff (B131) | **TODO** (HARD) | Blocks a clean upstream PR |
-| `CaWiringOps.FreezeViaHardLinksIntoShadow` gtest failure (B3 / B186) | **TODO** (HARD) | `removeRecursive("shadow/bk1")` + commit leaves `existsDirectory("shadow/bk1")` true; one red gtest in the CA battery |
+| `CaWiringOps.FreezeViaHardLinksIntoShadow` gtest failure (B3 / B186) | **RESOLVED 2026-07-11** (`ecb6e1a5e58`) | intermediate-dir `existsDirectory` was raw-LIST-based (counted tombstoned-not-yet-GC'd objects); made tombstone-aware (`listNamespaces`+`listRefs`), GC-timing-independent. CA gtest battery fully green 669/669 |
 | Migration path for existing tables (B13) | **TODO** | `ALTER TABLE … MOVE PARTITION` to a `content_addressed` disk re-packs; rollout safety spec needed |
 | Server OOM at hour-4 soak (~49 GiB RSS, B165) | **TODO** (HARD) | Not reproduced since the `putBlob` streaming fix; re-run long soak to confirm |
 | Expedited/compliance delete (GDPR right-to-erasure, B14) | **DESIRABLE** | Under GC lock, confirm no live ref, then delete bypassing the two-phase ack-floor graduation delay (the old grace_sec is gone); no layout change |
@@ -265,7 +265,7 @@ Operability/hygiene gates:
 14. **B48 (+B167a/f) clean shutdown** — `clickhouse local` hang + server graceful-shutdown ordering.
 15. **B196 `s3_max_connections` cap to backend permits** (cheap; kills 503/retry storms).
 16. **GC discovery O(N²) LIST fix** — ✅ DONE (2026-06-29..07-01): discovery LISTs flat `cas/refs/` not `roots/` (`f5f96dce01a`+`644eb7c6ade`) and backend `list` is real streamed pagination (`b15f1ef9d28`). Remaining O(universe)-per-round cost is the separate Phase-4 fold/discover skip-unchanged item.
-17. **B3/B186 red `FreezeViaHardLinksIntoShadow` gtest** — fix or explicitly waive FREEZE support
+17. **B3/B186 red `FreezeViaHardLinksIntoShadow` gtest** — RESOLVED 2026-07-11 (`ecb6e1a5e58`): tombstone-aware intermediate-dir `existsDirectory`. CA gtest battery fully green.
     via B31.
 18. **B131 repo hygiene + the M-W comment sweep** — a clean upstream PR.
 
