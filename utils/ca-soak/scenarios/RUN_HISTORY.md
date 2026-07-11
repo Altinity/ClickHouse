@@ -282,3 +282,4 @@ Every attempted scenario run is appended here (newest at the bottom). `run_dir` 
 | 2026-07-11T10:06:11 | S34 | 20260711 | dev | 480s | pass | eceacc2ad1d6 | 20260711T100530_S34_seed20260711 |  |
 | 2026-07-11T10:08:16 | S15 | 20260711 | dev | 480s | pass | eceacc2ad1d6 | 20260711T100611_S15_seed20260711 |  |
 | 2026-07-11T10:08:45 | S33 | 20260711 | dev | 480s | pass | eceacc2ad1d6 | 20260711T100816_S33_seed20260711 |  |
+| 2026-07-11T10:15:34 | S12 | 20260711 | dev | 480s | pass | ffc993a1d85b | 20260711T101423_S12_seed20260711 |  |

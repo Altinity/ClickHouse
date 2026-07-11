@@ -1883,3 +1883,14 @@ regression set S30x2/S25/S34/S15/S33 all PASS at `eceacc2ad1d`, **0 real regress
 - **PHASE-2 follow-on** (new, from this campaign): pluggable-hash `sha256` via a variable-length digest
   (spec `docs/superpowers/specs/2026-07-11-cas-pluggable-blob-hash-design.md` §7) — the big settlement/GC
   refactor; its own brainstorm→plan→TLA/soak.
+
+## NEEDS-INFRA-S12 — RESOLVED 2026-07-11 (label was stale; S12 runs green on 10 replicas at HEAD)
+The multi-node abstraction was completed between the 2026-07-03 "NOT RUN" note and 2026-07-07 (S12 ran
+07-07). The S12 card carries `compose_variant="tenreplicas"` (no `needs_infra`); `cluster_boot` maps it to
+`docker-compose-10replicas.yml` (`node_count_for=10`) and `run.py` builds `Cluster(node_count=10)` — one
+command runs it: `PYTHONPATH=$(pwd) python3 -m scenarios.run --scenario S12 --seed 20260711 --duration 480s`.
+Re-confirmed GREEN on `cas-gc-rebuild` @ `ffc993a1d85` (post-campaign): 11/11 verdicts, all 10 replicas
+byte-identical (count=10000, matching row-hash), CA dedup fired (`CasBlobBodyPutAvoided=40`), fsck
+dangling=0/unreachable=0, forced-GC residual=0, no Failed GC rounds. (A store-dependent RustFS S3
+read/write error rate ~14% is recorded as info, not a CA defect.) NEEDS-INFRA remaining: S22 (fault
+S3 proxy), S27 (instrumented dup-object store).
