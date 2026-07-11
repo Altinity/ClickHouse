@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEnvelope.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFormat.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/Exception.h>
 
@@ -94,7 +95,9 @@ TEST(CasEnvelope, FutureCompatibilityVersionThrows)
     String bytes = encodeEnvelopeHeader(h);
     /// compatibility_version is at [6,8) LE (same wire position, formerly named min_reader_version).
     /// Patch to G_BUILD+1 to drive the fail-closed path.
-    bytes[6] = 2; bytes[7] = 0;
+    const uint16_t future_version = static_cast<uint16_t>(G_BUILD + 1);
+    bytes[6] = static_cast<char>(future_version & 0xFF);
+    bytes[7] = static_cast<char>((future_version >> 8) & 0xFF);
     expectThrowsCode(
         DB::ErrorCodes::UNKNOWN_FORMAT_VERSION,
         [&] { decodeEnvelopeHeader(bytes, bytes.size(), ObjectKind::Blob); });
@@ -146,7 +149,6 @@ TEST(CasEnvelope, CriticalUnknownExtensionThrows)
 /// ===================================================================================
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootShardCodec.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFormat.h>
 #include <cas_format.pb.h>
 
 namespace Proto = ::clickhouse::cas::format;
@@ -460,10 +462,15 @@ TEST(CasByteOrderGolden, EnvelopeLittleEndian)
 {
     EnvelopeHeader h = makeBlobHeader();
     const String encoded = encodeEnvelopeHeader(h);
+    /// writer_version/compatibility_version bytes (offsets [4,6) and [6,8)) are `G_BUILD` as LE
+    /// uint16 -- CAS mixed-algo pools Phase 3 T5 raised `G_BUILD` 1 -> 2 (schema-3 settlement needs
+    /// reader generation 2), so both fields and the header_hash they feed into moved from this
+    /// golden's ORIGINAL 1-valued bytes. Pre-release (no on-disk compat to preserve): the golden is
+    /// updated to the new byte-for-byte truth, not pinned to the retired generation-1 shape.
     static constexpr std::string_view golden =
-        "4341424c010001000100480000001032547698badcfeefcdab8967452301"
+        "4341424c020002000100480000001032547698badcfeefcdab8967452301"
         "99000000000000000000000000000000070000000000000000000000000000"
-        "00c746cd3c918892300000";
+        "00781cdd876616966100" "00";
     EXPECT_EQ(toHexBytes(encoded), golden);
 }
 

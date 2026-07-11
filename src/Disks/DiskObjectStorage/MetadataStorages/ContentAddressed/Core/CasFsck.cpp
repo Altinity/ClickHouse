@@ -155,13 +155,12 @@ void runFsckImpl(Store & store, bool detail, const FsckProgress & on_progress, c
 {
     const Layout & layout = store.layout();
     Backend & backend = store.backend();
-    /// TEMPORARY(P3T5): path-derived per-object algo parsing (`Layout::parseBlobKey`) lands in Task
-    /// 5; until then this pass classifies LISTED blob object keys at the POOL-CONFIGURED write algo's
-    /// width only (mirrors the GC condemn-sweep's identical bridge in `CasGc.cpp::rebuildBaseline`) —
-    /// a key under a foreign algo segment is skipped as debris here, same limitation the pre-mixed-
-    /// algo fsck had.
-    const BlobHashAlgo fsck_algo = store.poolConfig().blob_hash_algo;
-    const DigestCodec codec = codecFor(fsck_algo);
+    /// Path-derived per-object algo parsing (Phase 3 T5): every listed blob-tree key -- across EVERY
+    /// admitted algo, not just the pool's node-local write algo -- is classified via
+    /// `Layout::parseBlobKey`, which derives the `BlobRef` from the key's OWN `<algo>` path segment
+    /// (and its `.meta` sibling). A foreign/malformed key (unknown algo segment, wrong-width hex, a
+    /// non-`.meta`/non-blob shape) parses to `std::nullopt` and is classified as debris, never an
+    /// exception.
 
     /// OQ8 manifest audit. Reachability is recomputed from the AUTHORITATIVE refs (never from gc state):
     /// for each namespace, each committed ref resolves to a ManifestId; read its body; a committed ref
@@ -256,18 +255,9 @@ void runFsckImpl(Store & store, bool detail, const FsckProgress & on_progress, c
     {
         if (key.ends_with(".meta"))
         {
-            const String body_key = key.substr(0, key.size() - String(".meta").size());
-            const size_t slash = body_key.rfind('/');
-            if (slash == String::npos)
-                continue;
-            try
-            {
-                present_meta_hashes.insert(BlobRef{fsck_algo, codec.fromHex(body_key.substr(slash + 1))});
-            }
-            catch (...)
-            {
-                continue;   /// foreign key shape under blobs/ — not ours to pair
-            }
+            if (const std::optional<BlobRef> ref = layout.parseBlobKey(key))
+                present_meta_hashes.insert(*ref);
+            /// else: foreign key shape under blobs/ — not ours to pair
         }
         else
             present_blobs.emplace(key, sz);
@@ -333,9 +323,8 @@ void runFsckImpl(Store & store, bool detail, const FsckProgress & on_progress, c
     for (const auto & [bkey, sz] : present_blobs)
         if (!reachable_blobs.count(bkey))
         {
-            const size_t slash = bkey.rfind('/');
-            if (slash != String::npos)
-                unref_hashes.insert(BlobRef{fsck_algo, codec.fromHex(bkey.substr(slash + 1))});
+            if (const std::optional<BlobRef> ref = layout.parseBlobKey(bkey))
+                unref_hashes.insert(*ref);
         }
 
     if (!unref_hashes.empty())
@@ -407,8 +396,11 @@ void runFsckImpl(Store & store, bool detail, const FsckProgress & on_progress, c
             continue;
         ++report.unreachable;
 
-        const size_t slash = bkey.rfind('/');
-        const BlobRef hash = slash != String::npos ? BlobRef{fsck_algo, codec.fromHex(bkey.substr(slash + 1))} : BlobRef{};
+        /// A foreign/malformed key (`parseBlobKey` -> `nullopt`) falls back to the default `BlobRef{}`,
+        /// which cannot match a real `retired_by_hash`/`in_run_hashes` entry — it lands in the generic
+        /// `Unaccounted` bucket below, exactly the "debris, not ours" classification `parseBlobKey`
+        /// documents (spec §9.4, `ForeignAlgoSegmentIsDebrisNotOurs`).
+        const BlobRef hash = layout.parseBlobKey(bkey).value_or(BlobRef{});
 
         FsckClass cls = FsckClass::Unaccounted;
         String note;
@@ -466,19 +458,9 @@ void runFsckImpl(Store & store, bool detail, const FsckProgress & on_progress, c
     std::unordered_set<BlobRef, BlobRefHash> present_body_hashes;
     present_body_hashes.reserve(present_blobs.size());
     for (const auto & [bkey, _] : present_blobs)
-    {
-        const size_t slash = bkey.rfind('/');
-        if (slash == String::npos)
-            continue;
-        try
-        {
-            present_body_hashes.insert(BlobRef{fsck_algo, codec.fromHex(bkey.substr(slash + 1))});
-        }
-        catch (...)
-        {
-            continue;   /// foreign key shape under blobs/ — not ours to pair
-        }
-    }
+        if (const std::optional<BlobRef> ref = layout.parseBlobKey(bkey))
+            present_body_hashes.insert(*ref);
+        /// else: foreign key shape under blobs/ — not ours to pair
     for (const BlobRef & hash : present_meta_hashes)
         if (!present_body_hashes.count(hash))
             ++report.meta_without_body;

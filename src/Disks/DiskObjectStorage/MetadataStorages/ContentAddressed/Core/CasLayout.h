@@ -65,6 +65,18 @@ public:
     /// The per-hash meta descriptor sibling of the blob body (spec §raw-body-refinement).
     String blobMetaKey(const BlobRef & ref) const;
 
+    /// Inverse of `blobKey`/`blobMetaKey` (Phase 3 T5): parses a LISTED object key of the shape
+    /// `<prefix>/blobs/<algoName>/<shard2>/<hex>` (the `.meta` sibling is accepted identically -- its
+    /// trailing `.meta` is stripped first, so a body and its meta parse to the SAME `BlobRef`).
+    /// Returns `std::nullopt` for anything that is not one of OUR blob keys: a foreign top-level
+    /// prefix, a missing shard/hex segment, an `<algoName>` this build does not recognize
+    /// (`blobHashAlgoName` never rendered it), a hex payload of the wrong width for a KNOWN algo, or
+    /// non-hex characters -- every case is "debris, not ours", never an exception (callers classify
+    /// it as foreign/unaccounted, mirroring the LIST sweep's existing `catch (...) continue`
+    /// contract). Defined out-of-line in `CasBuild.cpp` for the same cyclic-include reason as
+    /// `blobKey`/`blobMetaKey` above.
+    std::optional<BlobRef> parseBlobKey(std::string_view key) const;
+
     /// Root manifest for a given namespace + shard number.
     /// Phase 1: relocated out of the shared `roots/` tree to `cas/refs/` (hot/cold split). The
     /// namespace fan-out (`<ns>/<shard>`) is unchanged — identity-preserving. GC discovery LISTs

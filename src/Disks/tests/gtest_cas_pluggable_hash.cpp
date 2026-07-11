@@ -42,10 +42,13 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <unordered_set>
+#include <utility>
 
 namespace DB::ErrorCodes
 {
 extern const int BAD_ARGUMENTS;
+extern const int UNKNOWN_FORMAT_VERSION;
 }
 
 using namespace DB::Cas;
@@ -522,4 +525,190 @@ TEST(CasPluggableHash, Sha256BuildWritesFullWidthDigestAndInlineEqualsBlob)
     EXPECT_TRUE(rep.clean());
     EXPECT_EQ(rep.dangling, 0u);
     EXPECT_GE(rep.reachable, 1u);
+}
+
+/// ============================================================================================
+/// CAS mixed-algo pools Phase 3 T5 (design 2026-07-11-cas-mixed-algo-pools-design.md §5/§7):
+/// path-derived `BlobRef` in the sweep/fsck (`Layout::parseBlobKey`) and per-entry admission
+/// validation at `foldManifestEdges` with refresh-on-miss.
+/// ============================================================================================
+
+/// spec §9.8 -- THE race regression this task exists to close. Each `Store`'s `admitted_algos` cache
+/// is a MONOTONE snapshot seeded once at `Store::open` and never re-read on its own; if node A admits
+/// a brand-new algo and publishes a manifest naming it, node B's stale cache must NOT fail the fold
+/// closed forever -- `foldManifestEdges` must refresh `_pool_meta` on the very first miss and accept
+/// once the fresh read proves the algo genuinely admitted. Node B is opened BEFORE node A performs the
+/// admission on purpose: constructing B afterward would seed its cache already-fresh and never
+/// exercise the race the fix targets.
+TEST(CasPluggableHash, StaleAlgoRegistryRefreshOnMiss)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+
+    /// Node B opens FIRST -- its admitted-cache seeds at {ch128} only, before sha256 exists anywhere.
+    auto store_b = Store::open(backend,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "b", .root_shards = 1,
+                   .blob_hash_algo = BlobHashAlgo::CityHash128});
+    ASSERT_TRUE(store_b->isAlgoAdmitted(BlobHashAlgo::CityHash128));
+    ASSERT_FALSE(store_b->isAlgoAdmitted(BlobHashAlgo::Sha256));
+
+    /// Node A opens SECOND, admits sha256 via the opt-in flag, and publishes a manifest naming a
+    /// sha256 blob through the real Build path (putBlob -> stageManifest -> precommitAdd -> promote).
+    auto store_a = Store::open(backend,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "a", .root_shards = 1,
+                   .blob_hash_algo = BlobHashAlgo::Sha256, .blob_hash_allow_new = true});
+    ASSERT_TRUE(store_a->isAlgoAdmitted(BlobHashAlgo::Sha256));
+
+    const RootNamespace ns{"srv1/tbl"};
+    const std::string payload = makeMultiBlockPayload();
+    const BlobRef id{BlobHashAlgo::Sha256, codecFor(BlobHashAlgo::Sha256).fromHex(blobHashHexOneShot(BlobHashAlgo::Sha256, payload))};
+
+    BuildInfo info;
+    info.intended_ref = ns.string() + "/part1";
+    auto build = store_a->startBuild(info);
+    build->putBlob(id, BlobSource::fromString(payload));
+
+    ManifestEntry e;
+    e.path = "data.bin";
+    e.placement = EntryPlacement::Blob;
+    e.ref = id;
+    e.blob_size = payload.size();
+    const ManifestId mid = build->stageManifest({e});
+    build->precommitAdd(ns, "part1", mid);
+    build->promote(ns, "part1", build->buildId(), mid);
+    store_a->renewWatermarkOnce();
+
+    /// B's cache is STILL stale here -- it has never re-read `_pool_meta` since open.
+    ASSERT_FALSE(store_b->isAlgoAdmitted(BlobHashAlgo::Sha256));
+
+    /// B folds the committed ref naming the sha256 entry: without refresh-on-miss this throws
+    /// CORRUPTED_DATA ("manifest entry algo sha256 not admitted"); with it, the miss triggers exactly
+    /// one `refreshAdmittedAlgos()` and the fold proceeds.
+    Gc gc(store_b, UInt128(1));
+    const RebuildReport rep = gc.rebuildBaseline(/*force*/ true);
+    ASSERT_TRUE(rep.performed) << rep.refusal;
+    EXPECT_EQ(rep.committed_refs, 1u);
+    EXPECT_TRUE(store_b->isAlgoAdmitted(BlobHashAlgo::Sha256)) << "the miss must have unioned B's cache";
+}
+
+/// spec §9.4 half: an object whose key names an algo THIS BUILD has never heard of (a genuinely
+/// foreign top-level segment, e.g. planted by a different/future tool) must never be treated as one
+/// of ours -- the condemn sweep must skip it (never condemn or delete it) and fsck must classify it
+/// the generic `Unaccounted` bucket (never throw, never silently drop it from the physical listing).
+/// In the SAME pass, a 2-algo pool's OWN blobs under `blobs/ch128/` and `blobs/sha256/` must both
+/// still be classified normally -- the foreign segment must not make the sweep/fsck narrow to one
+/// algo or blind them to the others.
+TEST(CasPluggableHash, ForeignAlgoSegmentIsDebrisNotOurs)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = Store::open(backend,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1,
+                   .blob_hash_algo = BlobHashAlgo::CityHash128, .gc_trim_min_events = 0});
+    /// Admit sha256 into the SAME pool from a second mount, then pull the union into `store`'s cache.
+    Store::open(backend,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "test2", .root_shards = 1,
+                   .blob_hash_algo = BlobHashAlgo::Sha256, .blob_hash_allow_new = true});
+    store->refreshAdmittedAlgos();
+    ASSERT_TRUE(store->isAlgoAdmitted(BlobHashAlgo::Sha256));
+
+    /// Two OWN orphan blobs (unreferenced by any manifest) -- one per algo -- written directly at
+    /// their content keys (mirrors `Sha256BlobSeenByCondemnSweepAndFsckNotSilentlySkipped`'s fixture).
+    auto writeOwnOrphan = [&](BlobHashAlgo algo, size_t size) -> std::pair<BlobRef, String>
+    {
+        const std::string payload = makeMultiBlockPayload(size);
+        const BlobDigest digest = codecFor(algo).fromHex(blobHashHexOneShot(algo, payload));
+        const BlobRef ref{algo, digest};
+        const String key = store->layout().blobKey(ref);
+        EnvelopeHeader header;
+        header.kind = ObjectKind::Blob;
+        header.hash_algo = static_cast<uint8_t>(algo);
+        header.domain_id = store->poolMeta().pool_id;
+        header.incarnation_tag = UInt128(0x1234);
+        header.build_id = UInt128(0x5678);
+        header.pad_to_header_len = static_cast<uint32_t>(store->poolMeta().blob_header_len);
+        backend->putIfAbsent(key, encodeEnvelopeHeader(header) + payload);
+        return {ref, key};
+    };
+    const auto [ch_ref, ch_key] = writeOwnOrphan(BlobHashAlgo::CityHash128, 5001);
+    const auto [sh_ref, sh_key] = writeOwnOrphan(BlobHashAlgo::Sha256, 5002);
+
+    /// A FOREIGN object under an algo segment `blobHashAlgoName` never renders ("md5") -- not one of
+    /// ours under any circumstance.
+    const String foreign_key = store->layout().blobsPrefix() + "md5/aa/" + std::string(32, 'a');
+    backend->putIfAbsent(foreign_key, std::string("not a real envelope"));
+
+    Gc gc(store, UInt128(1));
+    const RebuildReport rep = gc.rebuildBaseline(/*force*/ true);
+    ASSERT_TRUE(rep.performed) << rep.refusal;
+
+    /// The sweep condemns exactly the two OWN orphans -- never the foreign object.
+    const std::vector<Gc::PreviewEntry> preview = gc.previewDeletes();
+    ASSERT_EQ(preview.size(), 2u);
+    std::unordered_set<BlobRef, BlobRefHash> condemned_refs;
+    for (const auto & p : preview)
+    {
+        condemned_refs.insert(p.ref);
+        EXPECT_NE(p.key, foreign_key);
+    }
+    EXPECT_TRUE(condemned_refs.count(ch_ref));
+    EXPECT_TRUE(condemned_refs.count(sh_ref));
+    EXPECT_TRUE(backend->head(foreign_key).exists) << "the foreign object must never be touched by the sweep";
+
+    const FsckReport frep = runFsck(*store, /*detail=*/true);
+    /// The physical listing counts all THREE unreferenced objects (two ours + one foreign).
+    EXPECT_EQ(frep.unreachable, 3u);
+    const auto foreign_obj = std::find_if(frep.objects.begin(), frep.objects.end(),
+        [&](const FsckObject & o) { return o.key == foreign_key; });
+    ASSERT_NE(foreign_obj, frep.objects.end()) << "the foreign object must still appear in the physical listing";
+    /// ... but classified as generic Unaccounted -- it can never pair against the GC snapshot, which
+    /// only ever knows about OUR two algo-segmented refs.
+    EXPECT_EQ(foreign_obj->cls, FsckClass::Unaccounted);
+
+    /// The two OWN blobs are recognized under their OWN algo segment in the SAME pass.
+    const auto ch_obj = std::find_if(frep.objects.begin(), frep.objects.end(),
+        [&](const FsckObject & o) { return o.key == ch_key; });
+    const auto sh_obj = std::find_if(frep.objects.begin(), frep.objects.end(),
+        [&](const FsckObject & o) { return o.key == sh_key; });
+    ASSERT_NE(ch_obj, frep.objects.end());
+    ASSERT_NE(sh_obj, frep.objects.end());
+    EXPECT_EQ(ch_obj->cls, FsckClass::PendingGc);
+    EXPECT_EQ(sh_obj->cls, FsckClass::PendingGc);
+}
+
+/// ============================================================================================
+/// CAS mixed-algo pools Phase 3 T5 controller-review extension: the reader-generation gate
+/// (`Core/CasFormat.h`'s `G_BUILD`) is raised 1 -> 2 (schema-3 settlement is unreadable to a
+/// generation-1 build), and `PoolMeta::createOrValidate`'s existing open-time CAS-raise (T4) now
+/// targets 2 instead of the old no-op constant 1.
+/// ============================================================================================
+
+TEST(CasPluggableHash, ReaderGenerationIsRaisedToTwo)
+{
+    EXPECT_EQ(G_BUILD, 2u) << "schema-3 settlement requires reader generation 2 -- a generation-1 "
+        "build cannot decode it, so the no-op gate (G_BUILD == 1) must be raised";
+
+    /// A freshly opened/created pool records `min_reader_generation == 2` (the open-time CAS-raise,
+    /// `PoolMeta::createOrValidate`, now targets `G_BUILD == 2`).
+    {
+        auto backend = std::make_shared<InMemoryBackend>();
+        auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+        EXPECT_EQ(store->poolMeta().min_reader_generation, 2u);
+
+        const auto meta_bytes = backend->get(store->layout().poolMetaKey());
+        ASSERT_TRUE(meta_bytes.has_value());
+        EXPECT_EQ(decodePoolMeta(meta_bytes->bytes).min_reader_generation, 2u);
+    }
+
+    /// A pool-meta carrying `min_reader_generation == 3` (one generation past THIS build's floor)
+    /// still fails closed at open -- the startup gate (`decodePoolMeta`) must reject it even though
+    /// generation 2 is now understood.
+    {
+        auto backend = std::make_shared<InMemoryBackend>();
+        const Layout layout("p");
+        PoolMeta pm = PoolMeta::createOrValidate(*backend, layout, /*root_shards*/ 1, /*blob_header_len*/ 256, BlobHashAlgo::CityHash128);
+        pm.min_reader_generation = 3;
+        ASSERT_TRUE(backend->casPut(layout.poolMetaKey(), encodePoolMeta(pm), backend->get(layout.poolMetaKey())->token).outcome == CasOutcome::Committed);
+
+        expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [&]
+        { Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"}); });
+    }
 }

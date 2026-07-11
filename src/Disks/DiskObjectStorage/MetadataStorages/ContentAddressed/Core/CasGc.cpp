@@ -635,11 +635,30 @@ bool Gc::foldManifestEdges(const ManifestId & id, int sign, std::vector<BlobDelt
         throw Exception(ErrorCodes::CORRUPTED_DATA,
             "CAS gc fold: manifest body namespace mismatch at {} (manifestNamespaceMatches fail-closed)", key);
     /// Phase 3 T2: the Phase-2 manifest-wide `blob_hash_len` foreign-width gate is GONE (the field
-    /// itself was deleted — entries now carry their own per-entry algo/width). Per-entry admission
-    /// validation (is this entry's algo actually admitted to THIS pool?) is Task 5's job
-    /// (`foldManifestEdges` admission check with refresh-on-miss); until then every entry's algo is
-    /// simply whatever `decodePartManifest` already validated at decode time (an unknown algo byte
-    /// throws CORRUPTED_DATA there).
+    /// itself was deleted — entries now carry their own per-entry algo/width). `decodePartManifest`
+    /// already fail-closes on an algo byte this BUILD does not know (`blobHashAlgoName` throws
+    /// CORRUPTED_DATA there) -- but a known algo may still not be ADMITTED to THIS pool yet (a stale
+    /// in-memory `admitted_algos` cache reading a manifest another node already admitted a new algo
+    /// for). Per-entry admission validation (Phase 3 T5, spec §5/§9.8): refresh-on-miss BEFORE
+    /// failing closed, so a genuinely fresh admission is never mistaken for corruption.
+    for (const ManifestEntry & entry : body.entries)
+        if (entry.placement == EntryPlacement::Blob && !store->isAlgoAdmitted(entry.ref.algo))
+        {
+            const std::vector<uint8_t> refreshed = store->refreshAdmittedAlgos();
+            if (!store->isAlgoAdmitted(entry.ref.algo))
+            {
+                String names;
+                for (size_t i = 0; i < refreshed.size(); ++i)
+                {
+                    if (i != 0)
+                        names += ", ";
+                    names += blobHashAlgoName(static_cast<BlobHashAlgo>(refreshed[i]));
+                }
+                throw Exception(ErrorCodes::CORRUPTED_DATA,
+                    "CAS gc fold: manifest entry algo {} not admitted to this pool (algos_used {{{}}})",
+                    blobHashAlgoName(entry.ref.algo), names);
+            }
+        }
 
     for (const ManifestEntry & entry : body.entries)
         if (entry.placement == EntryPlacement::Blob)
@@ -1837,11 +1856,10 @@ RebuildReport Gc::rebuildBaseline(bool force)
         buckets[shard].clear();
         prior_runs[shard] = std::move(out);
     };
-    /// Phase 3 T3: `edge_bearing` is `BlobRef`-keyed natively (the pipeline-blindness LIST/HEAD sweep
-    /// below parses blob object keys via the POOL-CONFIGURED write algo's codec -- TEMPORARY(P3T5):
-    /// path-derived per-object algo parsing lands in Task 5; until then this sweep only recognizes
-    /// blobs under the pool's own configured write algo, exactly as the pre-mixed-algo condemn-sweep
-    /// did).
+    /// Phase 3 T3/T5: `edge_bearing` is `BlobRef`-keyed natively; the pipeline-blindness LIST/HEAD
+    /// sweep below derives each listed key's `BlobRef` from its OWN `<algo>` path segment
+    /// (`Layout::parseBlobKey`), so a mixed-algo pool's blobs under EVERY admitted algo are
+    /// recognized in one sweep, not just the pool's node-local write algo.
     std::unordered_set<BlobRef, BlobRefHash> edge_bearing;   /// O(distinct blobs) — maintenance op
     auto route_deltas = [&](std::vector<BlobDelta> & deltas)
     {
@@ -1993,12 +2011,11 @@ RebuildReport Gc::rebuildBaseline(bool force)
     /// `edge_bearing` set from the traversal above.
     std::vector<std::vector<RetiredEntry>> zero_condemned(gc_shards);
     {
-        /// TEMPORARY(P3T5): path-derived BlobRef (parsing the `<algo>` path segment) lands in Task 5;
-        /// until then this sweep classifies every listed key at the POOL-CONFIGURED write algo's width
-        /// only (mirrors the single-algo-pool condemn-sweep this ports). A key that isn't that algo's
-        /// width is skipped as foreign debris here -- same limitation the pre-mixed-algo sweep had.
-        const BlobHashAlgo sweep_algo = store->poolConfig().blob_hash_algo;
-        const DigestCodec sweep_codec = codecFor(sweep_algo);
+        /// Path-derived BlobRef (Phase 3 T5): every listed key under `blobsPrefix()` -- across EVERY
+        /// admitted algo, not just the pool's node-local write algo -- is classified by parsing its
+        /// OWN `<algo>` path segment. `.meta` siblings and any foreign/malformed key shape parse to
+        /// `std::nullopt` and are skipped as debris, mirroring the pre-mixed-algo sweep's identical
+        /// `catch (...) continue` contract.
         const String bprefix = layout.blobsPrefix();
         String cursor;
         for (;;)
@@ -2006,18 +2023,10 @@ RebuildReport Gc::rebuildBaseline(bool force)
             const ListPage page = backend.list(bprefix, cursor, 1000);
             for (const auto & k : page.keys)
             {
-                const size_t slash = k.key.rfind('/');
-                if (slash == String::npos)
-                    continue;
-                BlobRef ref{sweep_algo, {}};
-                try
-                {
-                    ref.digest = sweep_codec.fromHex(k.key.substr(slash + 1));
-                }
-                catch (...)
-                {
-                    continue;   /// foreign key shape (or a foreign algo) under blobs/ — not ours to condemn
-                }
+                const std::optional<BlobRef> parsed = layout.parseBlobKey(k.key);
+                if (!parsed)
+                    continue;   /// foreign key shape (`.meta` sibling, unknown algo, wrong width) — not ours to condemn
+                const BlobRef & ref = *parsed;
                 if (edge_bearing.contains(ref))
                     continue;
                 const HeadResult hr = backend.head(k.key);

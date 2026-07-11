@@ -11,7 +11,15 @@ namespace DB::Cas
 /// generations 1..G_BUILD (new code always reads old); an object is readable iff its
 /// compatibility_version <= G_BUILD. Bump this (and append a change-point in CasFormat.cpp) when a new
 /// format generation is introduced.
-constexpr uint32_t G_BUILD = 1;
+///
+/// Raised 1 -> 2 (CAS mixed-algo pools, Phase 3 T5 controller-review extension): the schema-3
+/// algo-prefixed settlement key (`SourceEdgeKeyCodec`, `Core/CasBlobInDegree.h`) landed in Task 3 with
+/// NO accompanying reader-generation bump, leaving the gate a no-op constant -- a generation-1 build
+/// could still open a pool whose GC state it cannot actually decode. `PoolMeta::createOrValidate`
+/// (`CasPoolMeta.cpp`) already CAS-raises `min_reader_generation` to `G_BUILD` on every successful
+/// open/admission; bumping this constant to 2 makes that raise land at 2 and makes a persisted
+/// `min_reader_generation > 2` (e.g. a future generation-3 pool) correctly fail-closed here.
+constexpr uint32_t G_BUILD = 2;
 
 /// The registry of every self-describing persisted object class. For hashed binary objects the 4-byte
 /// magic doubles as the on-disk identifier; this enum is what the version tables key on.

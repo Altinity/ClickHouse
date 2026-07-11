@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEnvelope.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFormat.h>
 #include <Common/Exception.h>
 #include <string>
 
@@ -42,8 +43,8 @@ TEST(CasEnvelope, BlobRoundTrip)
     const std::string obj = buildObject(ObjectKind::Blob, payload);
     const EnvelopeHeader h = decodeEnvelopeHeader(obj, obj.size(), ObjectKind::Blob);
     EXPECT_EQ(h.kind, ObjectKind::Blob);
-    EXPECT_EQ(h.writer_version, 1u);
-    EXPECT_EQ(h.compatibility_version, 1u);
+    EXPECT_EQ(h.writer_version, G_BUILD);
+    EXPECT_EQ(h.compatibility_version, G_BUILD);
     /// payload starts right after header (derived downstream as object_size - header_len)
     EXPECT_EQ(obj.substr(payloadOffset(h)), payload);
 }
@@ -72,10 +73,13 @@ TEST(CasEnvelope, BadMagicThrows)
 TEST(CasEnvelope, FutureCompatibilityVersionFailsClosed)
 {
     /// Hand-patch compatibility_version at [6,8) (same wire position, formerly named min_reader_version)
-    /// to a future value (2). The gate is checked BEFORE the header_hash, so decode deterministically
-    /// throws UNKNOWN_FORMAT_VERSION (the hash mismatch from the un-recomputed patch is never reached).
+    /// to a future value (G_BUILD+1). The gate is checked BEFORE the header_hash, so decode
+    /// deterministically throws UNKNOWN_FORMAT_VERSION (the hash mismatch from the un-recomputed
+    /// patch is never reached).
     std::string obj = buildObject(ObjectKind::Blob, "p");
-    obj[6] = 2; obj[7] = 0;                                    // compatibility_version = 2 (LE)
+    const uint16_t future_version = static_cast<uint16_t>(G_BUILD + 1);
+    obj[6] = static_cast<char>(future_version & 0xFF);
+    obj[7] = static_cast<char>((future_version >> 8) & 0xFF);   // compatibility_version = G_BUILD+1 (LE)
     try
     {
         decodeEnvelopeHeader(obj, obj.size(), ObjectKind::Blob);
