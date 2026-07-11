@@ -23,9 +23,21 @@ re-hashing changes the key). Phase 2's pool-level fail-close was a conservative 
 Mixed-algo pools preserve the blob-level invariant: a blob's `(algo, digest)` identity is immutable
 from upload to exact-token delete.
 
-The blob identity everywhere becomes the PAIR `(BlobHashAlgo algo, BlobDigest digest)` — digest alone
-is no longer unique: `ch128` and `xxh3` are both 16-byte, and the same 16-byte value under the two
-algos names two DIFFERENT objects (distinct paths `blobs/ch128/…` vs `blobs/xxh3/…`).
+**The blob identity is the PAIR `BlobRef{algo, digest}` — everywhere, period (user decree).** A bare
+digest CEASES TO EXIST as a blob identity: no API parameter, no container key, no on-wire key, no
+rendered id may carry a blob content hash without its algo. There are NO compatibility modes, NO
+legacy overloads, NO dual paths — digest-only blob-identity code is DELETED, not deprecated, so a
+missed site is a compile error. (Digest alone is not even unique: `ch128` and `xxh3` are both
+16-byte; the same 16-byte value under the two algos names two DIFFERENT objects.)
+
+**BlobRef construction is restricted to the two places where algo and digest are born or read
+TOGETHER:** (1) the write mint — the hasher that just produced the digest returns a `BlobRef` (it
+knows its own algo); (2) durable-form parsers — the settlement key codec, the blob-path parser, the
+manifest decoder, the envelope reader. Every other site COPIES BlobRefs. No site may assemble a
+BlobRef from a digest and an algo obtained separately — this structurally kills both the
+wrong-algo-into-BlobRef hazard and the W-DEP-SET cross-satisfaction hazard (§11), instead of
+guarding them. Non-identity 128-bit hashes (`payload_digest`, `sourceEdgeId`, `RunRef.checksum`,
+lease owners, build ids) are `UInt128` and are NOT blob identities — unaffected.
 
 ## 3. What Phase 2 already gives us {#already-there}
 
@@ -46,8 +58,10 @@ Carry-forward is real: a mutation's destination build adopts existing entries
 manifests would force full part rewrites on every mutation touching an old part — the re-insert cost
 the user rejected. Therefore:
 
-- `ManifestEntry` gains `uint8_t algo` (a `BlobHashAlgo` value). Entry payload:
-  `placement u8, algo u8, blob_hash <lenFor(algo)> raw BE bytes, blob_size u64, inline_len u32, inline`.
+- `ManifestEntry` carries ONE identity field: `BlobRef ref` (not separate `algo` + `blob_hash`
+  members — the pair is never split). Entry payload:
+  `placement u8, algo u8, digest <lenFor(algo)> raw BE bytes, blob_size u64, inline_len u32, inline`
+  (the two on-wire scalars decode into the single `BlobRef`).
 - The per-manifest `blob_hash_len` header field (Phase 2 T3) is **removed** — width is per-entry,
   derived from the entry's `algo` via `blobHashLenFor`. Decode fail-closes on an unknown algo id
   (`CORRUPTED_DATA`). CA is pre-release: no back-compat path, no version bump.
@@ -227,6 +241,8 @@ immutable local snapshot. Findings folded into §5/§6/§9/§11 above:
    inDegreeInGeneration/deletes/.meta jobs/outcomes; rebuild `edge_bearing` + `condemn_seeded`; fsck
    sets + path parse -> BlobRef; dedup cache; inspect/event log render `algo:hex`. `sourceEdgeId`
    stays algo-free (it names the source occurrence; the edge key already carries `BlobRef`).
-   **Highest-risk site = the writer W-DEP-SET** (dangle-class, see §11(c)), NOT the dedup cache
-   (leak-class).
+   **Highest-risk site = the writer W-DEP-SET** (dangle-class), NOT the dedup cache (leak-class).
+   NOTE (rev.5, user decree §2): this enumeration is not an opt-in migration checklist — it is the
+   mechanical CONSEQUENCE of deleting digest-only blob identity; the compiler enforces totality once
+   the digest-only overloads/containers are gone.
 6. **TLA**: no full re-gate; re-run with two distinct atoms; race covered by gtest §9.8.
