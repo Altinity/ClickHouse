@@ -575,10 +575,19 @@ def checkpoint(driver, cluster, model, phase):
     if not _detail_fsck_skipped and f.get("exit_code") != 0:
         raise CheckpointFailure(f"fsck exit_code != 0: {f.get('exit_code')} stderr={f.get('stderr')}")
 
-    # GC never plans to delete a reachable object: {dryrun delete set} subset of {fsck unreachable}.
-    # When the summary was clean (unreachable==0) we skipped `--detail`, so `unreachable_keys` is empty
-    # and the subset check correctly requires the dryrun to be EMPTY (nothing reclaimable -> nothing to
-    # preview); a non-empty dryrun against a zero-unreachable pool would be a real violation.
+    # GC never plans to delete a REACHABLE object: {dryrun delete set} subset of {fsck deletion-pipeline}.
+    # The "retired-in-snapshot" refactor made ca-gc-dryrun (previewDeletes) emit a SUPERSET: not only
+    # fresh zero-in-degree `unreachable` blobs but ALSO every condemned-pipeline blob (a kCondemned row
+    # in the GC snapshot run), with reason delete_pending / awaiting_graduation. In lock-step, fsck now
+    # classifies a condemned-but-present blob as `pending-gc` / `awaiting-gc` (NOT `unreachable`), so
+    # operators do not misread the churny condemn pipeline as a leak. So the oracle is: every dryrun key
+    # MUST appear in fsck `--detail` under a DELETION-PIPELINE class {unreachable, pending-gc, awaiting-gc}.
+    # A dryrun key ABSENT from `--detail` (reachable blobs are NEVER listed) — or present under some OTHER
+    # class (e.g. unaccounted) — means GC is previewing deletion of a live/unknown blob: a real violation.
+    # Because previewDeletes only ever emits zeroInDegree + kCondemned rows, a clean (dangling==0,
+    # unreachable==0) SUMMARY no longer implies an empty dryrun — the condemn pipeline can hold kCondemned
+    # rows mid-flight — so we must fetch `--detail` whenever the dryrun is non-empty, not only when the
+    # summary showed unreachable>0.
     # The dryrun is also bounded at 600s; FsckTimeout skips the subset assert (best-effort oracle).
     if _detail_fsck_skipped:
         dr = {"count": 0, "entries": []}
@@ -590,12 +599,36 @@ def checkpoint(driver, cluster, model, phase):
             log(f"WARNING [B146/B154] dryrun timed out ({_e}); SKIPPING dryrun-subset assert")
             dr = {"count": 0, "entries": []}
             _detail_fsck_skipped = True
-    unreachable_keys = {row["key"] for row in f.get("detail", []) if row["class"] == "unreachable"}
-    for entry in dr.get("entries", []):
-        if entry["key"] not in unreachable_keys:
-            raise CheckpointFailure(
-                f"dryrun key {entry['key']!r} not in fsck unreachable set (dryrun must be a subset of "
-                f"unreachable); dryrun_count={dr.get('count')} unreachable={sorted(unreachable_keys)}")
+
+    # If the dryrun is non-empty but we never escalated to `--detail` above (the clean-summary case),
+    # fetch it now so `pipeline_keys` is populated — otherwise every dryrun entry would falsely fail.
+    # Same container / 600s bound / best-effort-on-timeout pattern as the escalation fsck above.
+    if not _detail_fsck_skipped and dr.get("entries") and "detail" not in f:
+        try:
+            f = run_fsck(FSCK_CONTAINER, detail=True, timeout_s=600)
+        except FsckTimeout as _e:
+            log(f"WARNING [B146/B154] dryrun-subset `--detail` fsck timed out ({_e}); "
+                f"SKIPPING dryrun-subset assert for this checkpoint (B146/B154; O(pool) scan under load); "
+                f"dangling==0 summary gate remains authoritative")
+            _detail_fsck_skipped = True
+
+    if not _detail_fsck_skipped:
+        detail_rows = f.get("detail", [])
+        pipeline_classes = ("unreachable", "pending-gc", "awaiting-gc")
+        pipeline_keys = {row["key"] for row in detail_rows if row["class"] in pipeline_classes}
+        detail_class_by_key = {row["key"]: row["class"] for row in detail_rows}
+        for entry in dr.get("entries", []):
+            if entry["key"] not in pipeline_keys:
+                other = detail_class_by_key.get(entry["key"], "absent/reachable")
+                class_counts: dict = {}
+                for row in detail_rows:
+                    class_counts[row["class"]] = class_counts.get(row["class"], 0) + 1
+                raise CheckpointFailure(
+                    f"dryrun key {entry['key']!r} previews deletion of a non-pipeline blob "
+                    f"(fsck class={other!r}) — a dryrun key must be in a deletion-pipeline class "
+                    f"{pipeline_classes} (absent-from-detail means reachable); "
+                    f"dryrun_count={dr.get('count')} pipeline_keys={len(pipeline_keys)} "
+                    f"detail_class_counts={class_counts}")
 
     # --- TRACK (do NOT hard-fail): residual unreachable is the known M-F Full-GC debris -------
     unreachable = f.get("unreachable", 0)
