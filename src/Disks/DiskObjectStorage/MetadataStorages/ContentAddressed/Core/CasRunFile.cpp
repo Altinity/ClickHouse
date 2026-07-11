@@ -470,14 +470,27 @@ void RunFileReader::seek(std::string_view seek_key)
     /// every block reached by later next()s) come via ranged gets (streaming mode). The pure-linear
     /// fold path never seeks, so this never regresses the 3-request open profile.
     seeked = true;
-    /// Find the last block whose min_key <= key (sparse index); start scanning there.
-    size_t target = 0;
+    /// Find the FIRST block whose max_key >= key (sparse index): that block holds the first record
+    /// with stored_key >= key. Choosing the LAST block whose min_key <= key (the previous formula)
+    /// violated the "first key >= target" contract when an exact key is duplicated across a block
+    /// boundary (the writer permits equal keys): min_key of the LATER duplicate-starting block also
+    /// compares <= target, so the earlier duplicates were silently skipped (2026-07-11 Phase 3
+    /// design consult finding; latent until then because every production seek used a strict PREFIX
+    /// of the stored keys, which no full key can equal).
+    size_t target = index.size();
     for (size_t b = 0; b < index.size(); ++b)
     {
-        if (index[b].min_key <= seek_key)
+        if (index[b].max_key >= seek_key)
+        {
             target = b;
-        else
             break;
+        }
+    }
+    if (target == index.size())
+    {
+        /// Every stored key < seek_key: position at the end (next() yields nothing).
+        exhausted = true;
+        return;
     }
     loadBlock(target);
     /// Advance within the block to the first record with stored_key >= key.

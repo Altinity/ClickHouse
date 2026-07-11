@@ -109,6 +109,41 @@ TEST(CasRunFile, SeekToKeyRange)
     EXPECT_EQ(k, "k051");
 }
 
+TEST(CasRunFile, SeekLandsOnFirstOfDuplicateKeySpanningBlocks)
+{
+    /// The writer permits EQUAL keys (non-decreasing append order), so an exact key may legitimately
+    /// span a block boundary. `seek`'s contract is "position at the FIRST record with key >= target";
+    /// picking the LAST block whose min_key <= target lands past the earlier duplicates and silently
+    /// skips them (2026-07-11 Phase 3 design consult finding — latent today, since every production
+    /// seek uses a strict PREFIX of the stored keys, which no full key can equal).
+    /// block_size=1 makes every record exceed the target, sealing one record per block:
+    /// blocks [aa] [kk] [kk] [kk] [zz] — the duplicate "kk" spans two block boundaries.
+    const std::vector<std::pair<String, String>> recs =
+        {{"aa", "0"}, {"kk", "1"}, {"kk", "2"}, {"kk", "3"}, {"zz", "4"}};
+    const String bytes = writeRun(recs, /*block_size=*/1);
+
+    RunFileReader r{std::string_view(bytes)};
+    r.seek("kk");
+    std::vector<std::pair<String, String>> got;
+    String k, p;
+    while (r.next(k, p))
+        got.emplace_back(k, p);
+    const std::vector<std::pair<String, String>> expected =
+        {{"kk", "1"}, {"kk", "2"}, {"kk", "3"}, {"zz", "4"}};
+    EXPECT_EQ(got, expected);
+}
+
+TEST(CasRunFile, SeekPastEveryKeyIsExhausted)
+{
+    /// A target greater than every stored key positions at the end: next() yields nothing.
+    const std::vector<std::pair<String, String>> recs = {{"aa", "0"}, {"bb", "1"}, {"cc", "2"}};
+    const String bytes = writeRun(recs, /*block_size=*/1);
+    RunFileReader r{std::string_view(bytes)};
+    r.seek("zz");
+    String k, p;
+    EXPECT_FALSE(r.next(k, p));
+}
+
 TEST(CasRunFile, CorruptedPayloadFailsClosed)
 {
     std::vector<std::pair<String, String>> recs = {{"aa", "payload-bytes"}, {"bb", "more"}};
