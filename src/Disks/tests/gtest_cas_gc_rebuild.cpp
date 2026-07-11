@@ -234,7 +234,6 @@ TEST(CasGcRebuild, MissingCommittedManifestRefuses)
     ASSERT_TRUE(post.has_value());
     const GcState post_state = decodeGcState(post->bytes);
     EXPECT_EQ(post_state.snap_generation, 0u) << "a refused rebuild must not adopt a baseline";
-    EXPECT_TRUE(post_state.retired_refs.empty());
 }
 
 /// A live precommit with a durable body contributes edges (no clamp); the rebuilt baseline
@@ -388,7 +387,6 @@ TEST(CasGcRebuild, OrphanBlobCondemnedInRebuiltRun)
     EXPECT_EQ(rep.committed_refs, 1u);
 
     const GcState st = decodeGcState(backend->get(store->layout().gcStateKey())->bytes);
-    EXPECT_TRUE(st.retired_refs.empty()) << "the RetiredSet dual-write must be gone";
     const auto seal =
         decodeFoldSeal(backend->get(store->layout().foldSealKey(st.snap_generation, st.snap_attempt))->bytes);
 

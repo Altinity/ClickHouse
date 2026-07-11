@@ -253,7 +253,7 @@ TEST(CasGcRoundDefer, DueGraduationForcesFoldAndSparesReReferencedBlob)
     {
         gc.runRegularRound();
         store->renewWatermarkOnce();
-        for (const RetiredEntry & e : currentRetiredSet(*backend, store->layout(), /*shard*/0).entries)
+        for (const RetiredEntry & e : currentRetiredSet(*backend, store->layout(), /*shard*/0))
             if (e.hash == blob && e.delete_pending)
                 saw_pending = true;
     }

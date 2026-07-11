@@ -77,7 +77,7 @@ The CMake target name `clickhouse_cas_proto` is unchanged.
 Every object in the pool carries a self-describing header with three invariants:
 
 - **magic** — 4-byte ASCII type tag (`CABL` blob, `CARS` root-shard, `CAPM` pool-meta,
-  `CAGT` gc-state, `CART` retired-set, `CAHB` heartbeat/mount, `CAGO` gc-outcomes, `CAMT` per-hash
+  `CAGT` gc-state, `CAHB` heartbeat/mount, `CAGO` gc-outcomes, `CAMT` per-hash
   freshness meta — see [§per-hash freshness meta](#per-hash-meta)). Sanity check only — no CRC;
   integrity comes from S3 ETag and content-addressing for hashed objects.
   (`CATR` (tree) was removed 2026-07-03 — see the removed-`Tree` note above. The standalone `CAWM`
@@ -321,14 +321,13 @@ layout exactly.
   roots/<server_root_id>/          per-server mutable state mirror
       _files/<name>                verbatim namespace files
   gc/
-    state                          GC lease/round state + retired_refs (ack-floor)
+    state                          GC lease/round state (retired-in-snapshot 2026-07-10: no retired_refs)
     hb                             advisory GC-leader heartbeat (B160)
     gen/<gen>/attempt/<attempt>/
-      fold_seal
-      blob_target/<shard>/<seq>
+      fold_seal                    per-gc-shard coverage + condemned_summary (retired-in-snapshot)
+      blob_target/<shard>/<seq>    source-edge run; condemned state rides here as kCondemned rows
       part_manifest_cleanup/<owner_shard>/<seq>
-      retired/<round>/<shard>      current retired-list run (referenced by gc/state.retired_refs)
-      outcomes/<round>/<shard>
+      outcomes/<round>/<shard>     (retired/<round>/<shard> removed 2026-07-10: no separate retired-list run)
     checkpoint/<version>
     server-roots/<server_root_id>/
       owner / epoch / mount        (mount body carries min_active; observed_gc_round removed in v3)

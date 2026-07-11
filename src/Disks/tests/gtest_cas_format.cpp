@@ -14,7 +14,7 @@ TEST(CasFormat, ChangePointsExistForEveryClass)
 {
     /// Every registered class has a non-empty, gen-1 baseline.
     for (auto id : {FormatId::Blob, FormatId::Manifest,
-                    FormatId::GcState, FormatId::RetiredSet,
+                    FormatId::GcState,
                     FormatId::PoolMeta, FormatId::Roster,
                     FormatId::GcOutcomes,
                     FormatId::PartManifest, FormatId::RunFile,
@@ -70,7 +70,6 @@ TEST(CasFormat, MagicForEachMutableObjectClass)
     EXPECT_EQ(le32toStr(magicFor(FormatId::Manifest)),      "CARS");
     EXPECT_EQ(le32toStr(magicFor(FormatId::PoolMeta)),      "CAPM");
     EXPECT_EQ(le32toStr(magicFor(FormatId::GcState)),       "CAGT");
-    EXPECT_EQ(le32toStr(magicFor(FormatId::RetiredSet)),    "CART");
     EXPECT_EQ(le32toStr(magicFor(FormatId::GcOutcomes)),    "CAGO");
     EXPECT_EQ(le32toStr(magicFor(FormatId::PartManifest)),    "CAPT");
     EXPECT_EQ(le32toStr(magicFor(FormatId::RunFile)),         "CARN");
@@ -102,7 +101,6 @@ TEST(CasFormat, MagicsAreDistinct)
         magicFor(FormatId::Manifest),
         magicFor(FormatId::PoolMeta),
         magicFor(FormatId::GcState),
-        magicFor(FormatId::RetiredSet),
         magicFor(FormatId::GcOutcomes),
         magicFor(FormatId::PartManifest),
         magicFor(FormatId::RunFile),

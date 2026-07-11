@@ -2008,7 +2008,8 @@ DB::Cas::StorePtr openResurrectStore(std::shared_ptr<DB::Cas::InMemoryBackend> &
 /// shape — RetiredEntry, exact-token delete, unchanged by this task) AND condemning the per-hash freshness
 /// meta, which is what the writer's condemned decision ACTUALLY point-reads (spec §meta-protocols v3).
 /// Bumps the round so the retirement is a fresh one; leaves the object itself in place (condemn, NOT delete).
-void seedCondemnBlobToken(DB::Cas::Store & store, const DB::UInt128 & hash, const DB::Cas::Token & token, uint64_t size)
+void seedCondemnBlobToken(DB::Cas::Store & store, const DB::UInt128 & hash,
+                          [[maybe_unused]] const DB::Cas::Token & token, [[maybe_unused]] uint64_t size)
 {
     using namespace DB::Cas;
     Backend & b = store.backend();
@@ -2023,12 +2024,10 @@ void seedCondemnBlobToken(DB::Cas::Store & store, const DB::UInt128 & hash, cons
     }
     state.round += 1;
 
-    RetiredSet rs;
-    rs.entries.push_back({ObjectKind::Blob, hash, token, size});
-    const String retired_key = layout.retiredKey(state.snap_generation, state.snap_attempt, state.round, /*shard*/ 0);
-    b.putIfAbsent(retired_key, encodeRetiredSet(rs));
-    state.retired_refs[0] = retired_key;
-
+    /// Retired-in-snapshot: there is no separate retired-list object to seed — condemned state rides the
+    /// GC snapshot runs, which this writer-side edge-protection test does not exercise. The writer's
+    /// condemned decision point-reads the per-hash freshness meta (condemned below), so bumping the round
+    /// and condemning the meta is enough.
     if (head.exists)
         b.putOverwrite(layout.gcStateKey(), encodeGcState(state), head.token);
     else

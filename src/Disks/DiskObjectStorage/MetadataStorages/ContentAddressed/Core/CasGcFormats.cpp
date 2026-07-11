@@ -21,47 +21,6 @@ namespace DB::Cas
 
 namespace Proto = ::clickhouse::cas::format;
 
-namespace
-{
-
-/// ObjectKind <-> uint32 for the RetiredEntryProto.kind field (mirrors the enum values).
-uint32_t objectKindToProto(ObjectKind kind)
-{
-    return static_cast<uint32_t>(kind);
-}
-
-ObjectKind objectKindFromProto(uint32_t v, std::string_view what)
-{
-    switch (v)
-    {
-        case static_cast<uint32_t>(ObjectKind::Blob): return ObjectKind::Blob;
-        default:
-            throw Exception(ErrorCodes::CORRUPTED_DATA,
-                "CAS {}: invalid object kind {} in retired entry", what, v);
-    }
-}
-
-/// TokenType <-> uint32 for the RetiredEntryProto.token_type field (mirrors the enum values).
-uint32_t tokenTypeToProto(TokenType t)
-{
-    return static_cast<uint32_t>(t);
-}
-
-TokenType tokenTypeFromProto(uint32_t v, std::string_view what)
-{
-    switch (v)
-    {
-        case static_cast<uint32_t>(TokenType::ETag):       return TokenType::ETag;
-        case static_cast<uint32_t>(TokenType::Generation): return TokenType::Generation;
-        case static_cast<uint32_t>(TokenType::Emulated):   return TokenType::Emulated;
-        default:
-            throw Exception(ErrorCodes::CORRUPTED_DATA,
-                "CAS {}: invalid token type {} in retired entry", what, v);
-    }
-}
-
-}
-
 String encodeGcState(const GcState & state)
 {
     chassert(state.gc_shards >= 1);   /// catch a zeroed GC constant at the write site
@@ -81,15 +40,6 @@ String encodeGcState(const GcState & state)
     msg.set_snap_pruned_through(state.snap_pruned_through);
     msg.set_snap_attempt(state.snap_attempt);
     msg.set_manifest_sweep_cursor(state.manifest_sweep_cursor);
-
-    /// retired_refs is `repeated` (spec bans new proto map<> for byte-determinism). `state.retired_refs`
-    /// is a std::map<uint64, String>, so iterating it already yields shards ascending — no explicit sort.
-    for (const auto & [shard, key] : state.retired_refs)
-    {
-        auto * ref = msg.add_retired_refs();
-        ref->set_shard(shard);
-        ref->set_key(key);
-    }
 
     auto * lease = msg.mutable_lease();
     lease->set_owner(u128ToBytesBE(state.lease.owner));
@@ -132,96 +82,7 @@ GcState decodeGcState(std::string_view data)
     state.lease.owner = u128FromBytesBE(msg.lease().owner(), "gc/state lease owner");
     state.lease.seq = msg.lease().seq();
 
-    for (const auto & ref : msg.retired_refs())
-        state.retired_refs[ref.shard()] = ref.key();
-
     return state;
-}
-
-String encodeRetiredSet(const RetiredSet & set)
-{
-    Cas::Proto::RetiredSetProto msg;
-
-    /// Set CasHeader as field 1 (pure protobuf — no binary prefix).
-    auto * hdr = msg.mutable_header();
-    hdr->set_magic(magicFor(FormatId::RetiredSet));
-    hdr->set_writer_version(currentWriterVersion());
-    hdr->set_compatibility_version(currentCompatibilityVersion());
-
-    /// Sort entries by (kind, hash-BE) — the retired set's logical key in the current-list model — so
-    /// the encoded bytes are byte-deterministic regardless of input order (ack-floor spec §"Retired
-    /// list"). token_value / token_type / size stay as tiebreakers so the order is total even if two
-    /// incarnations of the same (kind, hash) ever co-reside in one set.
-    std::vector<const RetiredEntry *> sorted;
-    sorted.reserve(set.entries.size());
-    for (const auto & e : set.entries)
-        sorted.push_back(&e);
-
-    std::sort(sorted.begin(), sorted.end(), [](const RetiredEntry * a, const RetiredEntry * b)
-    {
-        if (a->kind != b->kind)
-            return static_cast<uint8_t>(a->kind) < static_cast<uint8_t>(b->kind);
-        const std::string ha = u128ToBytesBE(a->hash);
-        const std::string hb = u128ToBytesBE(b->hash);
-        if (ha != hb)
-            return ha < hb;
-        if (a->token.value != b->token.value)
-            return a->token.value < b->token.value;
-        if (a->token.type != b->token.type)
-            return static_cast<uint8_t>(a->token.type) < static_cast<uint8_t>(b->token.type);
-        return a->size < b->size;
-    });
-
-    for (const auto * ep : sorted)
-    {
-        auto * pe = msg.add_entries();
-        pe->set_kind(objectKindToProto(ep->kind));
-        pe->set_hash(u128ToBytesBE(ep->hash));
-        pe->set_token_value(ep->token.value);
-        pe->set_token_type(tokenTypeToProto(ep->token.type));
-        pe->set_size(ep->size);
-        pe->set_condemn_round(ep->condemn_round);
-        pe->set_delete_pending(ep->delete_pending);
-    }
-
-    std::string out;
-    if (!msg.SerializeToString(&out))
-        throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS retired set: protobuf serialization failed");
-    return out;
-}
-
-RetiredSet decodeRetiredSet(std::string_view data)
-{
-    if (data.empty())
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS retired set: empty object");
-
-    /// Parse the whole message directly (pure protobuf, no binary prefix).
-    Cas::Proto::RetiredSetProto msg;
-    if (!msg.ParseFromArray(data.data(), static_cast<int>(data.size())))
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS retired set: protobuf parse failed");
-
-    /// Check magic then compatibility_version BEFORE reading any other fields.
-    if (msg.header().magic() != magicFor(FormatId::RetiredSet))
-        throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "CAS retired set: bad magic (got 0x{:08x}, expected 0x{:08x})",
-            msg.header().magic(), magicFor(FormatId::RetiredSet));
-    checkCompatibility(msg.header().compatibility_version(), "retired set");
-
-    RetiredSet set;
-    set.entries.reserve(static_cast<size_t>(msg.entries_size()));
-    for (const auto & pe : msg.entries())
-    {
-        RetiredEntry entry;
-        entry.kind = objectKindFromProto(pe.kind(), "retired set");
-        entry.hash = u128FromBytesBE(pe.hash(), "retired set hash");
-        entry.token.value = pe.token_value();
-        entry.token.type = tokenTypeFromProto(pe.token_type(), "retired set");
-        entry.size = pe.size();
-        entry.condemn_round = pe.condemn_round();
-        entry.delete_pending = pe.delete_pending();
-        set.entries.push_back(std::move(entry));
-    }
-    return set;
 }
 
 String encodeGcHeartbeat(const GcHeartbeat & hb)

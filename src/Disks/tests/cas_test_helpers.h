@@ -306,32 +306,68 @@ inline String encodeMinimalGcState(uint64_t round, uint64_t fence_seq)
     return DB::Cas::encodeGcState(state);
 }
 
-/// Inject a durable GC retired set + gc/state directly (bypassing a real GC round) so a test can seed the
-/// GC ledger's condemned bookkeeping at an arbitrary round. Writes one CURRENT retired-set object and
-/// records its key in `gc/state.retired_refs[shard]`.
-///
-/// Entries carry a `condemn_round` (and optionally `delete_pending`) — the caller supplies them
-/// fully-formed in `entries` (default-constructed entries have condemn_round 0, delete_pending false).
-/// The set is written under the reserved round component 0 (no-real-round sentinel), keyed
-/// retiredKey(0, 0, 0, shard); the minimal injected gc/state has snap_generation == snap_attempt == 0.
+/// Inject condemned bookkeeping + gc/state directly (bypassing a real GC round) so a test can seed the
+/// GC ledger's condemned state at an arbitrary round. Retired-in-snapshot: the condemned entries are
+/// seeded the way a real round leaves them — as `kCondemned` sentinel rows inside an adopted fold seal's
+/// shard run (there is no separate retired-list object). A synthetic +edge/-edge pair nets each blob to
+/// in-degree 0 and a `seed_head` replays the captured token/size so the fold mints the `kCondemned` row.
+/// Also sets {round, fence_seq} on gc/state. Entries carry a `condemn_round` (default 0 → uses `round`);
+/// callers pass fresh (non-pending) condemns. An empty `entries` set just advances {round, fence_seq}.
 inline void injectRetire(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout,
     uint64_t round, uint64_t fence_seq, uint64_t shard, std::vector<DB::Cas::RetiredEntry> entries)
 {
-    const String key = layout.retiredKey(/*generation*/0, /*attempt*/0, /*round*/0, shard);
-    backend.putIfAbsent(key,
-        DB::Cas::encodeRetiredSet(DB::Cas::RetiredSet{.entries = std::move(entries)}));
-
-    /// gc/state carries {round, fence_seq} AND retired_refs[shard] = key, so the ref must be recorded for
-    /// the injected set to be part of the ledger a real GC round would fold against. Read-modify-CAS so
-    /// multiple injectRetire calls for different shards accumulate refs rather than clobbering.
     DB::Cas::GcState gc_state;
     const DB::Cas::HeadResult head = backend.head(layout.gcStateKey());
     if (head.exists)
         gc_state = DB::Cas::decodeGcState(backend.get(layout.gcStateKey())->bytes);
     gc_state.round = round;
     gc_state.fence_seq = fence_seq;
-    gc_state.retired_refs[shard] = key;
+
+    if (!entries.empty())
+    {
+        const uint64_t generation = 1;
+        const uint64_t attempt = 1;
+        uint64_t condemn_round = round;
+        std::unordered_map<DB::UInt128, DB::Cas::HeadResult, ::UInt128Hash> seeded;
+        std::vector<DB::Cas::BlobDelta> synth;
+        synth.reserve(entries.size() * 2);
+        for (const DB::Cas::RetiredEntry & e : entries)
+        {
+            if (e.condemn_round)
+                condemn_round = e.condemn_round;
+            seeded.emplace(e.hash, DB::Cas::HeadResult{.exists = true, .size = e.size, .token = e.token, .attributes = {}});
+            synth.push_back(DB::Cas::BlobDelta{.blob_hash = e.hash, .source_id = DB::UInt128{1}, .remove = false});
+            synth.push_back(DB::Cas::BlobDelta{.blob_hash = e.hash, .source_id = DB::UInt128{1}, .remove = true});
+        }
+        const auto seed_head = [&seeded](const DB::UInt128 & h) -> std::optional<DB::Cas::HeadResult>
+        {
+            const auto it = seeded.find(h);
+            return it == seeded.end() ? std::nullopt : std::optional<DB::Cas::HeadResult>(it->second);
+        };
+        std::vector<DB::Cas::RunRef> out;
+        DB::Cas::foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{}, generation, attempt,
+            shard, std::move(synth), out, /*current_round*/0, condemn_round, seed_head,
+            /*peek_head*/{}, /*out_retired*/nullptr, /*suppress_destructive*/false);
+
+        DB::Cas::CasFoldSeal seal;
+        seal.generation = generation;
+        for (DB::Cas::RunRef & r : out)
+            seal.blob_target_runs.push_back(std::move(r));
+        /// Totality over gc_shards so a later real round's graduation/carry reads it zero-I/O.
+        const uint64_t gc_shards = gc_state.gc_shards ? gc_state.gc_shards : 1;
+        for (uint64_t s = 0; s < gc_shards; ++s)
+            seal.condemned_summary[s] = DB::Cas::CondemnedSummary{};
+        DB::Cas::CondemnedSummary cs;
+        cs.condemned_total = entries.size();
+        cs.oldest_nonpending_condemn_round = condemn_round;
+        seal.condemned_summary[shard] = cs;
+        backend.putIfAbsent(layout.foldSealKey(generation, attempt), DB::Cas::encodeFoldSeal(seal));
+
+        gc_state.snap_generation = generation;
+        gc_state.snap_attempt = attempt;
+    }
+
     const String state = DB::Cas::encodeGcState(gc_state);
     if (!head.exists)
         backend.putIfAbsent(layout.gcStateKey(), state);
@@ -409,7 +445,7 @@ inline bool runRoundsUntilAbsent(
 /// the seal at (snap_generation, snap_attempt), opens every run for `shard`, and reconstructs the
 /// `RetiredEntry` shape (hash from the run key, the rest from the decoded `CondemnedRow`). Empty when
 /// gc/state / the seal / the runs are absent. Used by ack-floor tests to assert pending/condemn state.
-inline DB::Cas::RetiredSet currentRetiredSet(
+inline std::vector<DB::Cas::RetiredEntry> currentRetiredSet(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout, uint64_t shard)
 {
     const auto st = backend.get(layout.gcStateKey());
@@ -423,7 +459,7 @@ inline DB::Cas::RetiredSet currentRetiredSet(
         return {};
     const DB::Cas::CasFoldSeal seal = DB::Cas::decodeFoldSeal(seal_bytes->bytes);
 
-    DB::Cas::RetiredSet out;
+    std::vector<DB::Cas::RetiredEntry> out;
     for (const DB::Cas::RunRef & run : seal.blob_target_runs)
     {
         if (run.shard != shard)
@@ -438,7 +474,7 @@ inline DB::Cas::RetiredSet currentRetiredSet(
             if (!DB::Cas::parseSrcEdgeRunKey(k, blob_hash, source_id))
                 continue;
             const DB::Cas::CondemnedRow row = DB::Cas::decodeCondemnedRow(p);
-            out.entries.push_back(DB::Cas::RetiredEntry{
+            out.push_back(DB::Cas::RetiredEntry{
                 .kind = DB::Cas::ObjectKind::Blob,
                 .hash = blob_hash,
                 .token = row.token,
@@ -462,7 +498,7 @@ inline bool anyCondemnedInSeal(
     const DB::Cas::GcState gc_state = DB::Cas::decodeGcState(st->bytes);
     const uint64_t shards = gc_shards ? gc_shards : gc_state.gc_shards;
     for (uint64_t shard = 0; shard < shards; ++shard)
-        if (!currentRetiredSet(backend, layout, shard).entries.empty())
+        if (!currentRetiredSet(backend, layout, shard).empty())
             return true;
     return false;
 }

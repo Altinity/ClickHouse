@@ -232,10 +232,10 @@ TEST(CasObservability, ResurrectSupersedeEmitsOnlyRetireReplacedWithOldToken)
     /// two different unit conventions in the SAME persisted `RetiredSet`. The superseded entry (now naming
     /// the fresh token B) must carry the LOGICAL size -- i.e. the payload length, with the pool's blob
     /// header already stripped -- exactly like a fresh condemn of the same blob would.
-    const RetiredSet retired = currentRetiredSet(*b, s->layout(), /*shard*/0);
-    const auto it = std::find_if(retired.entries.begin(), retired.entries.end(),
+    const std::vector<RetiredEntry> retired = currentRetiredSet(*b, s->layout(), /*shard*/0);
+    const auto it = std::find_if(retired.begin(), retired.end(),
         [&](const RetiredEntry & e){ return e.kind == ObjectKind::Blob && e.hash == u128Of(P); });
-    ASSERT_NE(it, retired.entries.end()) << "the superseded entry must be present in the current retired set";
+    ASSERT_NE(it, retired.end()) << "the superseded entry must be present in the current retired set";
     EXPECT_EQ(it->token.value, hB.token.value) << "the persisted entry names the fresh CURRENT token B";
     EXPECT_EQ(it->size, P.size())
         << "supersede must persist the LOGICAL size (payload length, header stripped), matching what "

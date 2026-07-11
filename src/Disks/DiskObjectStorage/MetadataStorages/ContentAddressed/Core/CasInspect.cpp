@@ -337,27 +337,6 @@ String renderFoldSeal(const CasFoldSeal & seal)
         .str();
 }
 
-String renderRetiredEntry(const RetiredEntry & e)
-{
-    return JsonObj()
-        .add("kind", jsonEscape(objectKindName(e.kind)))
-        .add("hash", jsonHex(e.hash))
-        .add("token", renderToken(e.token))
-        .add("size", jsonUInt(e.size))
-        .add("condemn_round", jsonUInt(e.condemn_round))
-        .add("delete_pending", jsonBool(e.delete_pending))
-        .str();
-}
-
-String renderRetiredSet(const RetiredSet & set)
-{
-    std::vector<String> entries;
-    entries.reserve(set.entries.size());
-    for (const auto & e : set.entries)
-        entries.push_back(renderRetiredEntry(e));
-    return JsonObj().add("entries", jsonArray(entries)).str();
-}
-
 String provenanceOpName(ProvenanceOp op)
 {
     switch (op)
@@ -446,9 +425,6 @@ String caInspectToJson(const Layout & layout, const String & key, std::string_vi
 
     if (key.ends_with("/fold_seal"))
         return renderFoldSeal(decodeFoldSeal(bytes));
-
-    if (key.find("/retired/") != String::npos)
-        return renderRetiredSet(decodeRetiredSet(bytes));
 
     /// The per-hash meta descriptor (v3): `blobMetaKey(id) == blobKey(id) + ".meta"`, so it ALSO
     /// matches `blobsPrefix()` below — must be checked first or it would wrongly decode as an

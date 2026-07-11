@@ -97,8 +97,8 @@ struct BlobCandidate
 /// only the OUTPUT run's key namespace.
 /// One resurrect-supersede (audit fix, 2026-07-08): the fresh entry that re-condemns the CURRENT
 /// token, paired with the STALE entry's token it superseded. Kept as its own struct (rather than a
-/// field bolted onto `RetiredEntry`) because `RetiredEntry` is the durable `RetiredSet` element —
-/// widening it would touch the encode/decode format for every entry, not just replaced ones.
+/// field bolted onto `RetiredEntry`) so the common merge element stays slim — only replaced entries
+/// carry the extra superseded token.
 struct ReplacedEntry
 {
     RetiredEntry fresh;   /// the freshly condemned CURRENT token (also pushed into still_retired byte-identically)

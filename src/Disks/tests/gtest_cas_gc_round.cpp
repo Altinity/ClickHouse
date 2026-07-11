@@ -425,7 +425,7 @@ TEST(CasGcRound, CondemnRoundSealSummaryCountsCondemned)
         const GcState st = readState(*backend, *store);
         seal = decodeFoldSeal(
             backend->get(store->layout().foldSealKey(st.snap_generation, st.snap_attempt))->bytes);
-        for (const RetiredEntry & e : currentRetiredSet(*backend, store->layout(), /*shard*/0).entries)
+        for (const RetiredEntry & e : currentRetiredSet(*backend, store->layout(), /*shard*/0))
             if (e.hash == DB::UInt128(1))
                 condemned = true;
     }
@@ -1020,11 +1020,9 @@ TEST(CasGcSnapRetention, WholesalePruneReclaimsAllAttemptsIncludingRetiredOutcom
     /// seal, and a blob-target run — exactly the families a deposed leader would have written before its
     /// CAS failed. The per-key single-attempt prune (keyed on the FINAL snap_attempt) never touches them.
     const uint64_t decoy_attempt = adopted_attempt_g1 + 777;
-    const String decoy_retired = store->layout().retiredKey(old_gen, decoy_attempt, /*round*/0, /*shard*/0);
     const String decoy_outcomes = store->layout().outcomesKey(old_gen, decoy_attempt, /*round*/0, /*shard*/0);
     const String decoy_seal = store->layout().foldSealKey(old_gen, decoy_attempt);
     const String decoy_run = store->layout().blobTargetRunKey(old_gen, decoy_attempt, /*shard*/0, /*seq*/0);
-    backend->putIfAbsent(decoy_retired, "decoy-retired");
     backend->putIfAbsent(decoy_outcomes, "decoy-outcomes");
     backend->putIfAbsent(decoy_seal, "decoy-seal");
     backend->putIfAbsent(decoy_run, "decoy-run");
@@ -1043,7 +1041,6 @@ TEST(CasGcSnapRetention, WholesalePruneReclaimsAllAttemptsIncludingRetiredOutcom
     ASSERT_GT(st.snap_generation, old_gen + 3) << "generation 1 must be below the retention floor";
 
     /// The ENTIRE gc/gen/<old_gen>/ subtree — across ALL attempts — must be reclaimed.
-    EXPECT_FALSE(backend->head(decoy_retired).exists) << "non-adopted retired set leaked past retention";
     EXPECT_FALSE(backend->head(decoy_outcomes).exists) << "non-adopted outcomes log leaked past retention";
     EXPECT_FALSE(backend->head(decoy_seal).exists) << "non-adopted fold seal leaked past retention";
     EXPECT_FALSE(backend->head(decoy_run).exists) << "non-adopted blob-target run leaked past retention";

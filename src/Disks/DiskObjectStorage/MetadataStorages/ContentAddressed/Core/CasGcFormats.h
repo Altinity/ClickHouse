@@ -48,15 +48,15 @@ struct GcState
     uint64_t snap_attempt = 0;     /// adopted attempt id (folding leader's lease.seq) for snap_generation
     String manifest_sweep_cursor;  /// best-effort orphan part-manifest cleanup cursor; reachability ignores it
     GcLease lease;
-    std::map<uint64_t, String> retired_refs;   /// gc-shard -> object key of the current retired list.
-                                               /// The writer's condemned decision does NOT consult this
-                                               /// list; it point-reads the per-hash freshness meta
-                                               /// instead (`CasBlobMeta.h`), which GC keeps current at
-                                               /// condemn/spare/delete time.
+    /// (retired-in-snapshot 2026-07-10) the former `retired_refs` map is gone: condemned state now rides
+    /// the source-edge runs as `kCondemned` rows and the fold seal's `condemned_summary`. Proto field
+    /// number reserved — never reuse.
 };
 
-/// One condemned object inside a retired set. `condemn_round` is the round that condemned the
-/// incarnation, used by GC's round-paced graduation gate.
+/// One condemned object. `condemn_round` is the round that condemned the incarnation, used by GC's
+/// round-paced graduation gate. IN-MEMORY ONLY (retired-in-snapshot 2026-07-10): the durable `RetiredSet`
+/// object family is gone; this struct now lives solely as the element type of `RetiredMergeResult`
+/// (`CasBlobInDegree.h`), populated from the `kCondemned` rows decoded out of the source-edge runs.
 struct RetiredEntry
 {
     ObjectKind kind = ObjectKind::Blob;
@@ -73,14 +73,6 @@ struct RetiredEntry
                                   /// it condemned and recreate).
 };
 
-/// Retired set (proto `RetiredSetProto`, magic CART, one object per gc-shard referenced from
-/// `GcState::retired_refs`). Each entry carries (kind, hash, token, size, condemn_round). Entries are
-/// sorted by (kind, hash) before serialization for byte-deterministic bytes (ack-floor spec).
-struct RetiredSet
-{
-    std::vector<RetiredEntry> entries;
-};
-
 String encodeGcState(const GcState & state);
 GcState decodeGcState(std::string_view data);
 
@@ -95,8 +87,5 @@ struct GcHeartbeat
 };
 String encodeGcHeartbeat(const GcHeartbeat & hb);
 GcHeartbeat decodeGcHeartbeat(std::string_view data);
-
-String encodeRetiredSet(const RetiredSet & set);
-RetiredSet decodeRetiredSet(std::string_view data);
 
 }

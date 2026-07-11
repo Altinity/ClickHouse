@@ -22,7 +22,9 @@ enum class FormatId : uint16_t
     /// compat to honor (CA pre-release). The survivors keep their numeric values; no two share a value.
     Manifest = 3,
     GcState = 5,
-    RetiredSet = 6,
+    /// 6 (RetiredSet, magic CART) retired 2026-07-10 with the retired-in-snapshot refactor — condemned
+    /// state rides the source-edge runs + fold-seal condemned_summary. Id 6 and magic CART (0x54524143)
+    /// are freed; never reuse.
     /// 7 (Watermark) retired with the ack-floor merge — the build-watermark floor rides the mount-lease
     /// beat (MountLease), there is no standalone watermark object anymore.
     PoolMeta = 8,

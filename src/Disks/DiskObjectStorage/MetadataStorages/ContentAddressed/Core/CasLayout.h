@@ -191,13 +191,9 @@ public:
                + std::to_string(owner_shard) + "/" + std::to_string(seq);
     }
 
-    /// Retired-set key (the CURRENT retired list, referenced from `gc/state.retired_refs` — readers
-    /// resolve refs, nothing LISTs this subtree):
-    ///   <prefix>/gc/gen/<generation>/attempt/<attempt>/retired/<round>/<shard>
-    String retiredKey(uint64_t generation, uint64_t attempt, uint64_t round, uint64_t shard) const
-    {
-        return gcGenAttemptPrefix(generation, attempt) + "retired/" + std::to_string(round) + "/" + std::to_string(shard);
-    }
+    /// (retiredKey removed 2026-07-10 with the retired-in-snapshot refactor — condemned state rides the
+    /// source-edge runs as kCondemned rows + the fold seal's condemned_summary, so there is no separate
+    /// retired-list object key. The `retired/` subtree is never written or read.)
 
     /// Outcomes key: <prefix>/gc/gen/<generation>/attempt/<attempt>/outcomes/<round>/<shard>
     String outcomesKey(uint64_t generation, uint64_t attempt, uint64_t round, uint64_t shard) const

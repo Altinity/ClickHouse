@@ -521,7 +521,6 @@ RoundReport Gc::runRegularRound()
     /// R5: the SINGLE round CAS — round, adopted (generation, attempt), retention cursor.
     GcState next = state;
     next.round = new_round;
-    next.retired_refs = {};   /// T4: no separate retired objects; retired state rides the snapshot run.
     /// T0: the generations the adopted seal's runs physically live in (reference-parent carry can point a
     /// current shard's run back at an older generation's key). Retention must never reclaim these.
     std::set<uint64_t> referenced_generations;
@@ -1752,9 +1751,6 @@ RebuildReport Gc::rebuildBaseline(bool force)
                             if (!backend.head(r.key).exists)
                                 healthy = false;
                 }
-                for (const auto & [shard, retired_key] : st.retired_refs)
-                    if (!backend.head(retired_key).exists)
-                        healthy = false;
             }
             catch (...)
             {
@@ -2087,8 +2083,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
     next.snap_attempt = seal_attempt;
     /// Retired-in-snapshot (T6): the orphan condemns now live as `kCondemned` rows IN the rebuilt runs
     /// (folded into the single flush above) — there is no separate `RetiredSet` object family, so the
-    /// rebuild mints none and leaves `retired_refs` empty.
-    next.retired_refs = {};
+    /// rebuild mints none.
     next.manifest_sweep_cursor = "";
     uint64_t zero_total = 0;
     for (uint64_t shard = 0; shard < gc_shards; ++shard)

@@ -10,7 +10,6 @@ TEST(CasLayout, KeyShapes)
     Layout l{"p"};
     EXPECT_EQ(l.blobKey(BlobId{"00aabb"}), "p/blobs/00/00aabb");
     EXPECT_EQ(l.gcStateKey(), "p/gc/state");
-    EXPECT_EQ(l.retiredKey(4, 42, 7, 1), "p/gc/gen/4/attempt/42/retired/7/1");
     EXPECT_EQ(l.outcomesKey(4, 42, 7, 1), "p/gc/gen/4/attempt/42/outcomes/7/1");
     EXPECT_EQ(l.poolMetaKey(), "p/_pool_meta");
 }
@@ -89,7 +88,6 @@ TEST(CasLayout, AttemptScopedGenKeys)
     EXPECT_EQ(layout.foldSealKey(4, 42), "p/gc/gen/4/attempt/42/fold_seal");
     EXPECT_EQ(layout.blobTargetRunKey(4, 42, 3, 0), "p/gc/gen/4/attempt/42/blob_target/3/0");
     EXPECT_EQ(layout.partManifestCleanupKey(4, 42, 0, 1), "p/gc/gen/4/attempt/42/part_manifest_cleanup/0/1");
-    EXPECT_EQ(layout.retiredKey(4, 42, 7, 3), "p/gc/gen/4/attempt/42/retired/7/3");
     EXPECT_EQ(layout.outcomesKey(5, 42, 7, 3), "p/gc/gen/5/attempt/42/outcomes/7/3");
     EXPECT_EQ(layout.gcGenPrefix(4), "p/gc/gen/4/");
     EXPECT_EQ(layout.gcGenAttemptPrefix(4, 42), "p/gc/gen/4/attempt/42/");

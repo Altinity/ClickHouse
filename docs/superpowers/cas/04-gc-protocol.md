@@ -13,6 +13,18 @@ doc_type: reference
 
 Cross-links: `06-tla-models.md` for formal proofs · `07-s3-budget.md` for per-operation cost.
 
+> **⚠️ Narrative-vs-code drift (retired-in-snapshot, 2026-07-11).** The prose below still describes the
+> pre-refactor **three-cursor** merge and a separate **retired-list run** published via
+> `gc/state.retired_refs`. As of the retired-in-snapshot refactor
+> (`specs/2026-07-10-cas-retired-in-snapshot-design.md`, DONE) this is superseded: condemned state now
+> rides the **source-edge run** as `kCondemned` sentinel rows (at the zero-sentinel key), the merge is
+> **two-cursor** (prior run + deltas), and the fold seal carries a per-gc-shard `condemned_summary`
+> (`condemned_total`, `pending_total`, `oldest_nonpending_condemn_round`, total over `gc_shards`) that
+> `graduationDue` reads zero-I/O. `RetiredSet`/`retiredKey`/`retired_refs`/magic `CART` are deleted.
+> Graduation is round-paced (writer condemned-detection is a per-hash `.meta` point-read), not ack-floor
+> `min_ack`. The section-by-section prose refresh is tracked in `ROADMAP.md` (doc-debt TODO); read the
+> code (`Core/CasGc.cpp`, `Core/CasBlobInDegree.cpp`) and the spec as authoritative until then.
+
 ---
 
 ## 1. Overview {#overview}

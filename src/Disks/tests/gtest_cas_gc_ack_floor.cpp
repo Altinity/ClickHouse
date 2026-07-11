@@ -27,7 +27,7 @@ bool blobExists(InMemoryBackend & b, const Layout & layout, const UInt128 & hash
 /// The current retired entry for `hash` (dereferenced through gc/state.retired_refs, shard 0), or nullopt.
 std::optional<RetiredEntry> currentEntryFor(Backend & backend, const Layout & layout, const UInt128 & hash)
 {
-    for (const RetiredEntry & e : currentRetiredSet(backend, layout, /*shard*/0).entries)
+    for (const RetiredEntry & e : currentRetiredSet(backend, layout, /*shard*/0))
         if (e.hash == hash)
             return e;
     return std::nullopt;

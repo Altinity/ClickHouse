@@ -13,7 +13,9 @@ package clickhouse.cas.format;
 //   protoc --decode clickhouse.cas.format.RootShardManifest cas_format.proto < manifest.bin
 // Per-object magic (4 ASCII bytes as little-endian fixed32):
 //   RootShardManifest "CARS" | PoolMetaProto "CAPM" | GcStateProto "CAGT"
-//   RetiredSetProto "CART" | GcOutcomeLogProto "CAGO"
+//   GcOutcomeLogProto "CAGO"
+// (RetiredSetProto "CART" retired 2026-07-10 with the retired-in-snapshot refactor — magic CART freed,
+//  never reuse; condemned state rides the source-edge runs + fold-seal condemned_summary)
 // (RootsRegistryProto "CARR" deleted in Task 4 — discovery authority moved to LIST(cas/refs/))
 // (gc-snap stays a versioned binary+zstd codec — GC-internal, not an interchange format; B176 defers
 // its protobuf conversion.)
@@ -154,18 +156,17 @@ message GcLeaseProto {
   uint64 seq   = 2;
 }
 
-// One (gc-shard -> retired-list object key) entry of retired_refs (ack-floor redesign). Spec bans new
-// proto map<> for byte-determinism; we use sorted repeated instead (sorted by shard ascending).
-message RetiredRefEntryProto {
-  uint64 shard = 1;
-  string key   = 2;
-}
+// (RetiredRefEntryProto retired with the retired-in-snapshot refactor 2026-07-10 — condemned state now
+// rides the source-edge runs as kCondemned rows + the fold seal's condemned_summary; no separate
+// retired-list object family.)
 
 // GC controller state (gc/state). Magic CAGT, FormatId::GcState.
 // CasHeader is field 1; existing fields renumbered from 2 to free field 1.
 message GcStateProto {
   reserved 8;                         // fence_version (retired with the one-pass ack-floor round)
   reserved "fence_version";
+  reserved 11;                        // retired_refs (retired-in-snapshot 2026-07-10); condemned state
+  reserved "retired_refs";            //   rides the source-edge runs + fold-seal condemned_summary
   CasHeader header              = 1;  // magic=CAGT; set by encoder, checked by decoder
   uint64 round                  = 2;
   uint64 fence_seq              = 3;
@@ -175,10 +176,6 @@ message GcStateProto {
   GcLeaseProto lease            = 7;
   uint64 snap_attempt           = 9;  // adopted attempt id for the round that produced snap_generation
   string manifest_sweep_cursor  = 10; // best-effort cleanup cursor; never consulted by reachability
-  // ack-floor redesign: gc-shard -> object key of the current retired list. Additive (same regime as
-  // snap_attempt): old readers skip it, but a build that understands the ack-floor protocol reads the
-  // retired list from HERE (not a LIST). Sorted by shard ascending for byte-determinism.
-  repeated RetiredRefEntryProto retired_refs = 11;
 }
 
 // One entry inside a GcOutcomeLogProto.
@@ -252,25 +249,6 @@ message FoldSealProto {
 // (CompletionSealProto / SealVersionEntryProto "CACS" retired with the one-pass ack-floor round —
 // fence/recheck/delete/trim phases removed; the fold seal is now the sole per-generation coverage record.)
 
-// One condemned object inside a RetiredSetProto.
-// kind: 1=blob, 2=tree (mirrors ObjectKind enum).
-// token_type: 1=etag, 2=generation, 3=emulated (mirrors TokenType enum).
-message RetiredEntryProto {
-  uint32 kind          = 1;
-  bytes  hash          = 2;  // raw 16 bytes (UInt128, big-endian)
-  string token_value   = 3;
-  uint32 token_type    = 4;
-  uint64 size          = 5;
-  uint64 condemn_round = 6;  // ack-floor: the GC round that condemned this incarnation
-  bool   delete_pending = 7; // ack-floor two-phase graduation: floor-passed, published for deletion;
-                             // the NEXT pass executes deleteExact (pre-CAS) and drops the entry
-}
-
-// Retired-object set (gc/retired/<round>.<fence_seq>/<shard>). Magic CART, FormatId::RetiredSet.
-// CasHeader is field 1; existing field renumbered from 1 to free field 1.
-// Entries are sorted deterministically (kind, hash-BE, token_value, token_type, size) before
-// serialization so the encoded bytes are stable.
-message RetiredSetProto {
-  CasHeader header                      = 1;  // magic=CART; set by encoder, checked by decoder
-  repeated RetiredEntryProto entries    = 2;
-}
+// (RetiredEntryProto / RetiredSetProto "CART" retired with the retired-in-snapshot refactor 2026-07-10.
+// Condemned state now rides the source-edge runs as kCondemned rows + the fold seal's condemned_summary —
+// there is no separate retired-object set family. Magic CART (0x54524143) is freed; never reuse it.)
