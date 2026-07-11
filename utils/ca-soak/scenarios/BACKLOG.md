@@ -1894,3 +1894,11 @@ byte-identical (count=10000, matching row-hash), CA dedup fired (`CasBlobBodyPut
 dangling=0/unreachable=0, forced-GC residual=0, no Failed GC rounds. (A store-dependent RustFS S3
 read/write error rate ~14% is recorded as info, not a CA defect.) NEEDS-INFRA remaining: S22 (fault
 S3 proxy), S27 (instrumented dup-object store).
+
+## B3/B186 FreezeViaHardLinksIntoShadow red gtest — RESOLVED 2026-07-11 (commit ecb6e1a5e58)
+Root cause: CA removal is tombstone + deferred GC; the intermediate-dir `existsDirectory`
+(`shadow/<bk>`) used a raw object LIST (`listMirroredChildren`) that counted tombstoned-but-not-yet-GC'd
+shard/manifest objects, so a just-`UNFREEZE`d backup dir stayed "existing" until a GC round ran. Fixed by
+making the intermediate branch tombstone-aware (enumerate namespaces via `listNamespaces` + consult the
+tombstone-aware `listRefs`, consistent with the part-level and table-uuid-pair branches). The CA gtest
+battery is now fully green (669/669, no reds). Removes the standing CA-battery red / release-gate item.
