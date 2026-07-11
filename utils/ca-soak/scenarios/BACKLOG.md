@@ -1861,3 +1861,25 @@ STILL OPEN (debt):
 - PROMOTE-OVER-COMMITTED-LEAK / ABANDON-RETIRE-ORDERING (2026-07-08, prior-session audit) — status unverified.
 - Gate B follow-ups: resurrect-skip-CAS + delete-meta-before-body need finer interleaving.
 - Phase B implementation (writing-plans → subagent impl).
+
+## TRIAGE SWEEP 2026-07-11 (post-campaign: RIS + deposed-leader add-only + S3-staging + pluggable-hash P1)
+
+Campaign landed on `cas-gc-rebuild` and was validated end-to-end (soak `dangling=0`; scenario
+regression set S30x2/S25/S34/S15/S33 all PASS at `eceacc2ad1d`, **0 real regressions** — see
+`RUN_HISTORY.md` and the task-4 report). Status of the OPEN classes after this campaign:
+
+- **NO new scenario regressions** from: retired-in-snapshot GC refactor (T1-T8), add-only deposed-leader
+  meta fix, opt-in S3-native staging (OFF by default), pluggable-blob-hash Phase 1 (default cityHash128,
+  blob path now `blobs/ch128/<shard>/<hex>` — the fsck/GC observe oracles are segment-tolerant, verified).
+- **STILL OPEN (unchanged by this campaign — each a focused future effort):**
+  - `NEEDS-INFRA-S12` (10-replica shared pool — template exists, see `reference_compose_multinode_template`),
+    `NEEDS-INFRA-S22` (fault-injecting S3 proxy: 503/429/slow/close), `NEEDS-INFRA-S27` (instrumented store
+    returning duplicate objects). Per the no-skip rule these want a per-scenario compose + N-node driver.
+  - Release-gate items (ROADMAP §release-gates-2026-07-03): the three ack-floor cards (SIGSTOP floor hold,
+    kill-mid-burst fence-out, request-budget guard); `B206` settle-gate tuning; `B207` fsck phantom-dangling
+    race; `B3/B186` `FreezeViaHardLinksIntoShadow` red gtest (the one standing CA-battery red).
+  - `S07` manifest-cap + `S01` memory-attribution: need `--scale ci/full` for a hard verdict (dev-scale gaps;
+    the real memory-materialization bug is already RESOLVED via streaming `putBlob`).
+- **PHASE-2 follow-on** (new, from this campaign): pluggable-hash `sha256` via a variable-length digest
+  (spec `docs/superpowers/specs/2026-07-11-cas-pluggable-blob-hash-design.md` §7) — the big settlement/GC
+  refactor; its own brainstorm→plan→TLA/soak.

@@ -204,3 +204,81 @@ Every attempted scenario run is appended here (newest at the bottom). `run_dir` 
 | 2026-07-06T05:15:46 | S13 | 20260703 | full | 1200s | fail | 8e6e68504b3e | 20260706T044329_S13_seed20260703 | quiescence failed: <urlopen error [Errno 111] Connection refused> |
 | 2026-07-06T06:03:45 | S14 | 20260703 | full | 1200s | pass | 8e6e68504b3e | 20260706T052819_S14_seed20260703 |  |
 | 2026-07-06T07:00:41 | S15 | 20260703 | full | 1200s | inconclusive | 8e6e68504b3e | 20260706T065553_S15_seed20260703 |  |
+| 2026-07-06T08:47:29 | S03 | 20260706 | dev | 900s | pass | f7912a5ed0a3 | 20260706T084644_S03_seed20260706 |  |
+| 2026-07-06T21:04:57 | S13 | 20260707 | dev | 900s | inconclusive | 1cab0a2698be | 20260706T210210_S13_seed20260707 |  |
+| 2026-07-06T22:25:12 | S14 | 20260707 | dev | 900s | pass | 4bbf68b478b5 | 20260706T222403_S14_seed20260707 |  |
+| 2026-07-06T23:01:52 | S14 | 20260707 | full | 1200s | pass | 4bbf68b478b5 | 20260706T222641_S14_seed20260707 |  |
+| 2026-07-06T23:04:37 | S15 | 20260707 | dev | 900s | fail | a3fc07430f5d | 20260706T230317_S15_seed20260707 |  |
+| 2026-07-06T23:08:29 | S15 | 20260707 | dev | 900s | inconclusive | a3fc07430f5d | 20260706T230657_S15_seed20260707 |  |
+| 2026-07-06T23:10:39 | S16 | 20260707 | dev | 900s | inconclusive | 6a4dfebbe5d7 | 20260706T230941_S16_seed20260707 |  |
+| 2026-07-06T23:12:18 | S17 | 20260707 | dev | 900s | pass | 0552b7032282 | 20260706T231157_S17_seed20260707 |  |
+| 2026-07-06T23:13:50 | S18 | 20260707 | dev | 900s | fail | e97858e63ebc | 20260706T231321_S18_seed20260707 | GC dry-run proposed deleting 132 key(s) NOT classified unreachable by fsck: ['soak_pool/blobs/01/01072cc50e01979bd48c985b2719ee8c', 'soak_pool/blobs/01/01c16d4da5bf1ada12a2024ca8591c4c', 'soak_pool/blobs/06/06d01b256bb15321515b1c38254ff56e', 'soak_pool/blobs/06/06eebc04b7f90340adf03dbc86868b02', 'soak_pool/blobs/07/0717efb8c793beebddb325cba8d076da', 'soak_pool/blobs/0f/0fca7b1e1f16c9752ba3f714aecb3c2c', 'soak_pool/blobs/12/12d68cf72c2f6217b3ca85ffb2fae4fe', 'soak_pool/blobs/14/14efb9d2dfe01430a62cd064e40fc318', 'soak_pool/blobs/15/151ef3fcaa9bd70cf26a36132b2432a8', 'soak_pool/blobs/1d/1d60ba4b3f5540694e218b5902602f41'] |
+| 2026-07-06T23:17:58 | S19 | 20260707 | dev | 900s | fail | 6518efddb5f5 | 20260706T231738_S19_seed20260707 |  |
+| 2026-07-06T23:20:13 | S20 | 20260707 | dev | 900s | inconclusive | b88125257280 | 20260706T231948_S20_seed20260707 |  |
+| 2026-07-06T23:21:15 | S21 | 20260707 | dev | 900s | inconclusive | 43e06f832d45 | 20260706T232055_S21_seed20260707 |  |
+| 2026-07-06T23:22:51 | S23 | 20260707 | dev | 900s | inconclusive | dbe0556e14e4 | 20260706T232213_S23_seed20260707 |  |
+| 2026-07-06T23:24:15 | S24 | 20260707 | dev | 900s | fail | dbe0556e14e4 | 20260706T232353_S24_seed20260707 |  |
+| 2026-07-06T23:26:27 | S25 | 20260707 | dev | 900s | fail | e5d6aa785cbf | 20260706T232602_S25_seed20260707 | GC dry-run proposed deleting 10 key(s) NOT classified unreachable by fsck: ['soak_pool/blobs/00/00000000000000000000000000000000', 'soak_pool/blobs/07/07596c79b6ee9d57c99a5e7272902c3f', 'soak_pool/blobs/0d/0d6b60b1f3397793f1c5f54f78326e1d', 'soak_pool/blobs/1b/1b243a06671e1270cd076b0a901ad65a', 'soak_pool/blobs/38/38aa643fcf9332594e0166ac106170b9', 'soak_pool/blobs/a3/a3af5524c8b55aa3cb374c923706ae39', 'soak_pool/blobs/c7/c7dedcceb2f845ee7ffe17e48ce96c0f', 'soak_pool/blobs/e1/e19d3c9977e508b0824410174ef10166', 'soak_pool/blobs/fb/fb85b48a48b6dbb3617b8ec2e460483b', 'soak_pool/blobs/fd/fd082a9a2007ea9bb93102b15e1a8f33'] |
+| 2026-07-06T23:28:39 | S26 | 20260707 | dev | 900s | fail | 141030b27936 | 20260706T232811_S26_seed20260707 | GC dry-run proposed deleting 63 key(s) NOT classified unreachable by fsck: ['soak_pool/blobs/0c/0cb03f16cfebaccc7750d4ca40ebc188', 'soak_pool/blobs/0f/0f2b0b701c916b38c32dcbd42bfd1be1', 'soak_pool/blobs/12/121a73e8a6b09205e6fb7fa75e5bf273', 'soak_pool/blobs/14/14174d2098c21591e0d4781382e7ce35', 'soak_pool/blobs/17/17147dcd91c5dcccb77fc50fe576ada1', 'soak_pool/blobs/1f/1fe03c0fb542471b31f32b62a54917c4', 'soak_pool/blobs/20/200d0e4f3db020618ce4eaca85fa3006', 'soak_pool/blobs/20/20225823b00d4d034be7ed1125075e28', 'soak_pool/blobs/21/21d8e7ce195f9b2f875908e0746e800b', 'soak_pool/blobs/25/25892a5e81965b3a3c2e9e17868966c1'] |
+| 2026-07-06T23:30:04 | S28 | 20260707 | dev | 900s | pass | 6d701167c8a7 | 20260706T232943_S28_seed20260707 |  |
+| 2026-07-06T23:31:21 | S29 | 20260707 | dev | 900s | inconclusive | 2fadf5a6bce9 | 20260706T233101_S29_seed20260707 |  |
+| 2026-07-06T23:32:38 | S30 | 20260707 | dev | 900s | fail | b059d6edc181 | 20260706T233201_S30_seed20260707 | S30 REGRESSION vs D1: GC per-round fanout (roots/<ns> dir count and/or CasRootGet) grew across create/drop iterations though no table stayed live — the D1 registry-removal / dropped-shard-reclaim guarantee is violated. |
+| 2026-07-06T23:34:54 | S31 | 20260707 | dev | 900s | inconclusive | 121562406653 | 20260706T233410_S31_seed20260707 |  |
+| 2026-07-06T23:36:01 | S32 | 20260707 | dev | 900s | pass | 44338b6ba967 | 20260706T233542_S32_seed20260707 |  |
+| 2026-07-06T23:37:39 | S33 | 20260707 | dev | 900s | fail | 716462053388 | 20260706T233703_S33_seed20260707 | GC dry-run proposed deleting 34 key(s) NOT classified unreachable by fsck: ['soak_pool/blobs/07/070323332e252eb0620007c0728aa372', 'soak_pool/blobs/10/1000348b3e9635e7adef8c91774d6747', 'soak_pool/blobs/19/19fe4b0496717c2cd3cdbe977451fd62', 'soak_pool/blobs/1a/1a742de0de639e55306b48fba511985d', 'soak_pool/blobs/20/200961efba8a14242a2d97a83c2fdfb2', 'soak_pool/blobs/24/24a908bed8ddfacfc5aaf7cc96a8f01d', 'soak_pool/blobs/2f/2f5e04d458d0eebfeea76204b7228ea2', 'soak_pool/blobs/35/35cb2108cb4974f86801b513f7e33b08', 'soak_pool/blobs/3a/3ac9f384f1f74e0a14be1aa360c192a4', 'soak_pool/blobs/44/440730c92b5561bda171664ea355263a'] |
+| 2026-07-06T23:39:55 | S34 | 20260707 | dev | 900s | fail | 288e39b51431 | 20260706T233911_S34_seed20260707 | S34 D1 regression: per-round GC fanout grew across create/drop iterations (CasRootGet first=32 -> last=248, root_dirs 2 -> 2) — D1 should have eliminated the monotone namespace registry; investigate dropNamespace / tombstone GC reclaim path |
+| 2026-07-06T23:44:31 | S35 | 20260707 | dev | 900s | inconclusive | 043db564345c | 20260706T234353_S35_seed20260707 |  |
+| 2026-07-07T06:14:00 | S34 | 20260707 | dev | 900s | fail | 8682956258e1 | 20260707T061202_S34_seed20260707 | S34 D1 regression: per-round GC fanout grew across create/drop iterations (CasRootGet first=0 -> last=214, root_dirs 2 -> 2) — D1 should have eliminated the monotone namespace registry; investigate dropNamespace / tombstone GC reclaim path |
+| 2026-07-07T06:16:21 | S34 | 20260707 | dev | 900s | inconclusive | 8682956258e1 | 20260707T061536_S34_seed20260707 |  |
+| 2026-07-07T06:19:10 | S34 | 20260707 | dev | 900s | inconclusive | 8682956258e1 | 20260707T061822_S34_seed20260707 |  |
+| 2026-07-07T06:34:05 | S12 | 20260707 | dev | 900s | fail | 6bb7ae5caa04 | 20260707T063228_S12_seed20260707 |  |
+| 2026-07-07T06:39:53 | S12 | 20260707 | dev | 900s | pass | 6bb7ae5caa04 | 20260707T063816_S12_seed20260707 |  |
+| 2026-07-07T06:48:32 | S22 | 20260707 | dev | 900s | fail | 04ac62b12ca7 | 20260707T064805_S22_seed20260707 | Node(localhost:8123) HTTP 500: Code: 246. DB::Exception: Build: blob object soak_pool/blobs/f2/f2123bb7f1630af47810ea1a47068929 size 0 is below the pool blob header length 256. (CORRUPTED_DATA) (version 26.6.1.1) / sql=INSERT INTO s22_t0 SELECT 0 + number AS id, randomString(4096) AS payload FROM numbers(750) |
+| 2026-07-07T06:54:09 | S22 | 20260707 | dev | 900s | pass | 04ac62b12ca7 | 20260707T065316_S22_seed20260707 |  |
+| 2026-07-07T06:58:16 | S27 | 20260707 | dev | 900s | inconclusive | 74c8764fc6c7 | 20260707T065708_S27_seed20260707 |  |
+| 2026-07-07T07:17:19 | S13 | 20260707 | dev | 900s | fail | 07d8c37efe45 | 20260707T071428_S13_seed20260707 | forced GC left 1 unreachable RECLAIMABLE object(s) (blobs/_manifests) — possible leak; full residual by prefix: {'_manifests': 1}. If explicit GC was driven concurrently with background GC (or on both replicas), this is likely the known GC-CONCURRENT-LEADER-LEAK (see BACKLOG): a divergent-fold abort orphans owner-removal events permanently. |
+| 2026-07-07T07:18:34 | S14 | 20260707 | dev | 900s | pass | 07d8c37efe45 | 20260707T071719_S14_seed20260707 |  |
+| 2026-07-07T07:20:13 | S15 | 20260707 | dev | 900s | inconclusive | 07d8c37efe45 | 20260707T071834_S15_seed20260707 |  |
+| 2026-07-07T07:21:16 | S16 | 20260707 | dev | 900s | inconclusive | 07d8c37efe45 | 20260707T072013_S16_seed20260707 |  |
+| 2026-07-07T07:21:44 | S17 | 20260707 | dev | 900s | pass | 07d8c37efe45 | 20260707T072116_S17_seed20260707 |  |
+| 2026-07-07T07:22:17 | S18 | 20260707 | dev | 900s | fail | 07d8c37efe45 | 20260707T072144_S18_seed20260707 | GC dry-run proposed deleting 132 key(s) NOT classified unreachable by fsck: ['soak_pool/blobs/01/01072cc50e01979bd48c985b2719ee8c', 'soak_pool/blobs/01/01c16d4da5bf1ada12a2024ca8591c4c', 'soak_pool/blobs/06/06d01b256bb15321515b1c38254ff56e', 'soak_pool/blobs/06/06eebc04b7f90340adf03dbc86868b02', 'soak_pool/blobs/07/0717efb8c793beebddb325cba8d076da', 'soak_pool/blobs/0f/0fca7b1e1f16c9752ba3f714aecb3c2c', 'soak_pool/blobs/12/12d68cf72c2f6217b3ca85ffb2fae4fe', 'soak_pool/blobs/14/14efb9d2dfe01430a62cd064e40fc318', 'soak_pool/blobs/15/151ef3fcaa9bd70cf26a36132b2432a8', 'soak_pool/blobs/1d/1d60ba4b3f5540694e218b5902602f41'] |
+| 2026-07-07T07:22:43 | S19 | 20260707 | dev | 900s | fail | 07d8c37efe45 | 20260707T072217_S19_seed20260707 |  |
+| 2026-07-07T07:23:13 | S20 | 20260707 | dev | 900s | inconclusive | 07d8c37efe45 | 20260707T072243_S20_seed20260707 |  |
+| 2026-07-07T07:23:39 | S21 | 20260707 | dev | 900s | inconclusive | 07d8c37efe45 | 20260707T072313_S21_seed20260707 |  |
+| 2026-07-07T07:24:21 | S23 | 20260707 | dev | 900s | inconclusive | 07d8c37efe45 | 20260707T072339_S23_seed20260707 |  |
+| 2026-07-07T07:24:48 | S24 | 20260707 | dev | 900s | pass | 07d8c37efe45 | 20260707T072421_S24_seed20260707 |  |
+| 2026-07-07T07:25:18 | S25 | 20260707 | dev | 900s | fail | 07d8c37efe45 | 20260707T072448_S25_seed20260707 | GC dry-run proposed deleting 10 key(s) NOT classified unreachable by fsck: ['soak_pool/blobs/00/00000000000000000000000000000000', 'soak_pool/blobs/0d/0d6b60b1f3397793f1c5f54f78326e1d', 'soak_pool/blobs/1b/1b243a06671e1270cd076b0a901ad65a', 'soak_pool/blobs/2f/2f47273814e4e7c29145a9e1543e52fa', 'soak_pool/blobs/9b/9bb486c1ee93987ad634bc7792f24bb3', 'soak_pool/blobs/c7/c7dedcceb2f845ee7ffe17e48ce96c0f', 'soak_pool/blobs/c8/c89a7d919795d0202f37af4ed5930700', 'soak_pool/blobs/d9/d94fa6eb80490d0867c25e78ee8ef02d', 'soak_pool/blobs/fb/fb85b48a48b6dbb3617b8ec2e460483b', 'soak_pool/blobs/fd/fd082a9a2007ea9bb93102b15e1a8f33'] |
+| 2026-07-07T07:25:50 | S26 | 20260707 | dev | 900s | fail | 07d8c37efe45 | 20260707T072518_S26_seed20260707 | GC dry-run proposed deleting 63 key(s) NOT classified unreachable by fsck: ['soak_pool/blobs/04/040fa185ea949400f8f8f13f41e7a6eb', 'soak_pool/blobs/09/09eceded07bc90a7a9c054998a757811', 'soak_pool/blobs/0a/0a2c77daea60b234a72cd951fecf1fc3', 'soak_pool/blobs/0a/0a8b602963ffd45c68488dbe0db13ee1', 'soak_pool/blobs/0b/0b7d1c9998e7f02fcd3abb72bdf4094a', 'soak_pool/blobs/0f/0f2b0b701c916b38c32dcbd42bfd1be1', 'soak_pool/blobs/11/118b5356bdf4d4b87fc1feab72929d4a', 'soak_pool/blobs/12/121a73e8a6b09205e6fb7fa75e5bf273', 'soak_pool/blobs/16/160493b5223359bae725615333faff0e', 'soak_pool/blobs/18/182467fb900cf2494daae8acee7eab48'] |
+| 2026-07-07T07:26:15 | S28 | 20260707 | dev | 900s | pass | 07d8c37efe45 | 20260707T072550_S28_seed20260707 |  |
+| 2026-07-07T07:26:39 | S29 | 20260707 | dev | 900s | inconclusive | 07d8c37efe45 | 20260707T072615_S29_seed20260707 |  |
+| 2026-07-07T07:27:19 | S30 | 20260707 | dev | 900s | fail | 07d8c37efe45 | 20260707T072639_S30_seed20260707 | S30 REGRESSION vs D1: GC per-round fanout (roots/<ns> dir count and/or CasRootGet) grew across create/drop iterations though no table stayed live — the D1 registry-removal / dropped-shard-reclaim guarantee is violated. |
+| 2026-07-07T07:28:08 | S31 | 20260707 | dev | 900s | inconclusive | 07d8c37efe45 | 20260707T072719_S31_seed20260707 |  |
+| 2026-07-07T07:28:33 | S32 | 20260707 | dev | 900s | pass | 07d8c37efe45 | 20260707T072808_S32_seed20260707 |  |
+| 2026-07-07T07:31:59 | S30 | 20260707 | dev | 900s | inconclusive | 07d8c37efe45 | 20260707T073118_S30_seed20260707 |  |
+| 2026-07-07T07:34:45 | S13 | 20260707 | dev | 900s | pass | 07d8c37efe45 | 20260707T073159_S13_seed20260707 |  |
+| 2026-07-07T07:35:11 | S19 | 20260707 | dev | 900s | fail | 07d8c37efe45 | 20260707T073445_S19_seed20260707 |  |
+| 2026-07-07T07:37:50 | S19 | 20260707 | dev | 900s | pass | 07d8c37efe45 | 20260707T073725_S19_seed20260707 |  |
+| 2026-07-07T07:50:22 | S18 | 20260707 | dev | 900s | inconclusive | 228743fab9f9 | 20260707T074948_S18_seed20260707 |  |
+| 2026-07-07T07:50:53 | S25 | 20260707 | dev | 900s | inconclusive | 228743fab9f9 | 20260707T075022_S25_seed20260707 |  |
+| 2026-07-07T07:51:25 | S26 | 20260707 | dev | 900s | inconclusive | 228743fab9f9 | 20260707T075053_S26_seed20260707 |  |
+| 2026-07-07T07:52:14 | S31 | 20260707 | dev | 900s | inconclusive | 228743fab9f9 | 20260707T075125_S31_seed20260707 |  |
+| 2026-07-07T07:52:56 | S33 | 20260707 | dev | 900s | inconclusive | 228743fab9f9 | 20260707T075214_S33_seed20260707 |  |
+| 2026-07-07T08:56:24 | S25 | 20260707 | dev | 900s | pass | ef6a43a59369 | 20260707T085402_S25_seed20260707 |  |
+| 2026-07-07T09:00:58 | S30 | 20260707 | dev | 900s | fail | bf6b8dc32a63 | 20260707T085740_S30_seed20260707 | forced GC left 3 UNCONDEMNED orphan object(s) (unreachable/dangling blobs/_manifests): {'blobs': 3}. These are NOT in the two-phase pipeline (that would be pending-gc). If explicit GC was driven concurrently with background GC (or on both replicas), this is likely the known GC-CONCURRENT-LEADER-LEAK (see BACKLOG): a divergent-fold abort orphans owner-removal events. |
+| 2026-07-07T09:02:09 | S34 | 20260707 | dev | 900s | pass | bf6b8dc32a63 | 20260707T090058_S34_seed20260707 |  |
+| 2026-07-07T12:08:27 | S30 | 1 | dev | 900s | fail | 6da55fce2a0d | 20260707T120511_S30_seed1 | forced GC left 1 UNCONDEMNED orphan object(s) (unreachable/dangling blobs/_manifests): {'_manifests': 1}. These are NOT in the two-phase pipeline (that would be pending-gc). If explicit GC was driven concurrently with background GC (or on both replicas), this is likely the known GC-CONCURRENT-LEADER-LEAK (see BACKLOG): a divergent-fold abort orphans owner-removal events. |
+| 2026-07-08T13:21:57 | S30 | 1 | dev | 900s | pass | 7c06bcfdde21 | 20260708T132053_S30_seed1 |  |
+| 2026-07-08T13:25:12 | S30 | 2 | dev | 900s | pass | 7c06bcfdde21 | 20260708T132400_S30_seed2 |  |
+| 2026-07-08T13:26:30 | S30 | 3 | dev | 900s | pass | 7c06bcfdde21 | 20260708T132512_S30_seed3 |  |
+| 2026-07-08T13:27:47 | S30 | 4 | dev | 900s | pass | 7c06bcfdde21 | 20260708T132630_S30_seed4 |  |
+| 2026-07-08T16:06:54 | S15 | 1 | dev | 900s | pass | f5fd7c0ead35 | 20260708T160443_S15_seed1 |  |
+| 2026-07-11T03:53:13 | S30 | 20260711 | dev | 600s | pass | aa57013a86a4 | 20260711T035241_S30_seed20260711 |  |
+| 2026-07-11T03:53:42 | S33 | 20260711 | dev | 600s | pass | aa57013a86a4 | 20260711T035313_S33_seed20260711 |  |
+| 2026-07-11T04:36:22 | S33 | 20260711 | dev | 480s | pass | 0868f9d360a6 | 20260711T043558_S33_seed20260711 |  |
+| 2026-07-11T10:03:55 | S30 | 20260711 | dev | 480s | pass | eceacc2ad1d6 | 20260711T100323_S30_seed20260711 |  |
+| 2026-07-11T10:04:32 | S30 | 2 | dev | 480s | pass | eceacc2ad1d6 | 20260711T100355_S30_seed2 |  |
+| 2026-07-11T10:04:59 | S01 | 20260711 | dev | 480s | inconclusive | eceacc2ad1d6 | 20260711T100432_S01_seed20260711 |  |
+| 2026-07-11T10:05:30 | S25 | 20260711 | dev | 480s | pass | eceacc2ad1d6 | 20260711T100459_S25_seed20260711 |  |
+| 2026-07-11T10:06:11 | S34 | 20260711 | dev | 480s | pass | eceacc2ad1d6 | 20260711T100530_S34_seed20260711 |  |
+| 2026-07-11T10:08:16 | S15 | 20260711 | dev | 480s | pass | eceacc2ad1d6 | 20260711T100611_S15_seed20260711 |  |
+| 2026-07-11T10:08:45 | S33 | 20260711 | dev | 480s | pass | eceacc2ad1d6 | 20260711T100816_S33_seed20260711 |  |

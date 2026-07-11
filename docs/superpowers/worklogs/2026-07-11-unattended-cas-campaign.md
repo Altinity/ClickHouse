@@ -58,3 +58,104 @@ Consult hard calls with a fresh model; very hard → fable / codex 5.5 xhigh. Mo
 ### T2 review: SPEC ok, QUALITY Approved (Minors only)
 - Verified byte layout encode/decode agree, fail-closed complete (unknown token_type / len mismatch / OOB
   guarded), openSourceEdgeRun rejects wrong kind+schema, scope clean, no weakened tests. No Critical/Important.
+
+## 2026-07-11 00:35 — RIS plan T4 committed, T5 dispatched
+- T4 (retired-in-snapshot) COMMITTED `6f48cd0db49`. Took over the killed agent's 9-file diff.
+  Takeover fixes: (1) ShardCoverage `.incarnation` designated-init compile; (2) migrated
+  `anyRetiredPending`→`anyCondemnedInSeal` in 6 test files/lambda (qualified `DB::Cas::tests::` in 3);
+  (3) `DueGraduationIsSoleFoldTrigger…` injectRetire→injectCondemnedSummarySeal; (4) `injectStaleFoldSeal`
+  +gc_shards → total all-zero summary. 545/546 Cas* green; the 1 red (`CasFsck.CondemnedBlobClassifiesPendingGc`)
+  is PLAN-anticipated T5 work (plan §4 req4 empties retired_refs; Task 5 = consumers).
+- T4 review dispatched (agent a36e…, opus, background, read-only).
+- T5 (consumers: fsck / previewDeletes / ca-inspect) dispatched (agent afe8…, opus, background).
+  Brief: /home/mfilimonov/.claude/jobs/2dcf2af7/tmp/task-5-brief.md. Report:
+  /home/mfilimonov/.claude/jobs/2dcf2af7/tmp/task-5-report.md. Greens the last red test.
+- LESSON (recorded): transcript-mtime is an UNRELIABLE liveness signal (17min stale on a live agent);
+  use SOURCE-FILE mtime instead. Killed the T4 agent slightly early on transcript-freeze; work was preserved.
+- CONSTRAINT for T6+: T6 edits CasGc.cpp (rebuild) → conflicts with T5's CasGc.cpp edits AND any T4-review
+  fix to CasGc.cpp. Sequence: T5 commits → apply T4-review fixes → then T6. No parallel edits to CasGc.cpp.
+
+## 2026-07-11 (later) — RIS plan T1–T7 DONE, T8 validation in progress
+- Retired-in-snapshot plan (docs/superpowers/plans/2026-07-10-cas-retired-in-snapshot.md) COMPLETE T1–T7:
+  - T4 6f48cd0db49, T5 534de6f0ab2, T6 3cd12e18a16, T7 37813b4ea75 (T1–T3 earlier).
+  - Each reviewed clean (T4/T5/T6 via subagent; T7 inline compiler-checklist + 541/541 battery — subagent
+    review blocked by ORG MONTHLY SPEND LIMIT which started failing subagents mid-T7).
+  - Minor review findings (deferred to SDD final whole-branch review): T4-M1 graduationDue "ZERO-I/O"
+    header wording; T4-M3 CarryRound test weakly discriminating; T5-M1 no-HEAD not asserted; T6 no-orphan
+    LIST assertion assumes single flush.
+- T8 (validation) IN PROGRESS: server build (ninja clickhouse) started in bg (build/build_task8_server.log).
+  Then: CA-s3 lane point-run 04286/05008/05009 (05008 UNMODIFIED = settlement oracle), phase-1 soak
+  (utils/ca-soak/scripts/run_phase1.sh, ~1h), S30/S33 scenarios. This also finishes campaign task 1's
+  "20min soak + stateless".
+- SPEND-LIMIT NOTE: subagent dispatches fail with "org monthly spend limit". Local builds/tests/docker
+  are unaffected (not API). Doing context-heavy subtasks inline; will retry subagents if limit resets.
+- CAMPAIGN REMAINING after task 1: 1a (deposed-leader stray-Clean meta defect — research→brainstorm→plan→
+  TDD→soak; ROADMAP TODO(HARD) + report 2026-07-11-cas-deposed-leader-stray-clean-meta.md + RED witness
+  CaRetiredInRunFoldAbortWitness); 2 (S3 staging area); 3 (pluggable blob hash cityHash128/xxh3-128/sha256);
+  4 (run scenarios); 5 (drain scenario backlog). Each: brainstorm→plan→SDD-TDD→20min soak+stateless.
+- Doc-debt backlogged (ROADMAP): 04/05/07 GC-protocol narrative refresh (3-cursor→2-cursor, retired-list→
+  in-run rows, ack-floor→round-paced).
+
+## 2026-07-11 (later) — CAMPAIGN TASK 1 COMPLETE
+- RIS plan T1-T8 done+validated: lane 3/3 (05008 unmodified), 20-min soak GREEN (fixed stale dryrun
+  oracle aa57013a86a — NOT data loss; previewDeletes superset vs pre-RIS fsck-unreachable assert),
+  S30 8/8 + S33 10/10 PASS. Server binary 26.6.1.1.
+- NEXT: RIS final whole-branch review (bg); then task 1a (deposed-leader meta — fable consult running).
+
+## 2026-07-11 — CAMPAIGN 1a (deposed-leader meta) code+model DONE, validating
+- FIX 4 (add-only GC freshness meta) after TWO strong-model consults (fable→Fix1; codex→Fix1 INSUFFICIENT
+  b/c stale pre-CAS deleteExact after adopted spare; final CAS fences adoption not pre-CAS side effects).
+- Code 730b59cd686: remove spare-side clearSparedMeta + helper; RED-first showed real data loss
+  (hr.exists==false); 542/542 Cas*. TLA 96c571700382: add-only witness GREEN (4 inv, 65.4M states),
+  sabotages inmem_token/attempt_reuse/no_pacing/gc_clear_on_spare RED + post_adoption_clear RED
+  (authentic 16-state 2-leader CE proving Fix1 unsafe). Closeout 0868f9d: report FIXED + ROADMAP DONE.
+- T6 validation IN PROGRESS: server rebuild (build_1a_server.log) → then lane 04286/05008/05009 +
+  20-min soak (tmp/soak_20min.sh) + S33 scenario. Then 1a COMPLETE → campaign task 2 (S3 staging).
+- NOTE: cleaned orphaned ca-soak containers earlier (ci/tmp/rustfs preserved).
+
+## 2026-07-11 — CAMPAIGN 1a COMPLETE
+- Deposed-leader meta fix (add-only, Fix 4) DONE+validated: code 730b59cd686, TLA 96c571700382, closeout
+  0868f9d; lane 3/3 (05008 unmodified), 20-min soak green (dangling=0), S33 PASS 10/10. Real pre-existing
+  v3 data-loss bug closed. → Campaign task 2 (S3 staging) next.
+
+---
+
+## Campaign summary (as of 2026-07-11, mid-task-4)
+
+Branch `cas-gc-rebuild`. Five-task unattended campaign; status:
+
+### Task 1 — retired-in-snapshot GC refactor — DONE + soak-validated
+Fold the GC retired list into the per-shard source-edge run as `kCondemned` rows (3-cursor→2-cursor
+settlement); `CasFoldSeal` gains a condemned-summary so `graduationDue` is zero-I/O; `RetiredSet`/CART/
+`retiredKey`/`retired_refs` deleted. T1–T8 (TLA gate → codec → merge → seal → consumers → rebuild reorder →
+deletions → validation). Soak: 18.8 min phase-3 chaos, `dangling==0` every checkpoint.
+
+### Task 1a — deposed-leader stray-Clean meta fix — DONE + TLA-gated + soak-validated
+Two consults found the exact-token delete fenced *adoption, not pre-CAS side effects*; fix = GC freshness
+meta is **add-only** (never Condemned→Clean on a spare; only a writer with a fresh incarnation token
+publishes Clean). TLA witness green + 5 sabotages red incl. `post_adoption_clear`.
+
+### Task 2 — S3-native staging area — DONE + e2e-validated (opt-in, off by default)
+Stream a large blob to a per-mount S3 staging key while hashing, promote to the content key via a
+**write-once conditional server-side copy**, capability-probed, **fail-close to local**. Two consults +
+an empirical Phase-0 gate (RustFS enforces `If-None-Match:*`). End-to-end validation on RustFS caught a
+data-corrupting bug (S3-staged blobs stored without the 256-byte `CABL` envelope) that 17 in-memory unit
+tests couldn't see; fixed (drop `logical_size`/`logical_hash`, write header into staging bypassing the hash;
+**fresh-tag resurrect** closes an INV-NO-RETURN self-condemn hole) and re-validated. Commits
+`de1e6b9ea41..48e81accca2`. `cas_s3_staging_min_bytes` removed (never enforced).
+
+### Task 3 — pluggable blob hash — Phase 1 DONE + e2e-validated; Phase 2 backlogged
+Phase 1: selectable `cityHash128` (default) + `xxh3-128`; hash id in the path (`blobs/<algo>/<shard>/<hex>`);
+`PoolMeta` records the algo and **fail-close-validates** it (never re-hash an existing pool). cityHash128
+byte-for-byte unchanged. Validated on RustFS (SELECT correct on both, per-disk path segment, live
+fail-close on config mismatch). Commits `f2142d72601..eceacc2ad1d`. Phase 2 (`sha256` via a variable-length
+digest — a large settlement/GC refactor) is specced (spec §7) and backlogged (#46).
+
+### Task 4 — run CA scenarios — IN PROGRESS
+Running a representative regression-catcher set (S30, S01, S25, S34, …) against HEAD to confirm the campaign
+work did not regress the suite; triage fix-vs-backlog.
+
+### Task 5 — drain scenario backlog — pending
+
+Durable state: `.superpowers/sdd/progress.md` (detailed ledger), specs under `docs/superpowers/specs/`,
+plans under `docs/superpowers/plans/`, memory files for each project.
