@@ -34,8 +34,8 @@ algos names two DIFFERENT objects (distinct paths `blobs/ch128/…` vs `blobs/xx
 - **Per-blob self-description**: the envelope header stamps `hash_algo` (`CasEnvelope.h:61`).
 - **Variable-width digests**: `BlobDigest` + `DigestCodec`; source-edge run schemas 1 (16 B) / 2 (32 B)
   with fail-closed width-coherence gates (`SourceEdgeKeyCodec`, `PriorEdgeCursor` schema gate,
-  `foldManifestEdges` width gate). These gates remain — repurposed from "forbid the feature" to
-  "forbid ACCIDENTAL width mixing inside one run partition".
+  `foldManifestEdges` width gate). Schema 3 (§6) supersedes schemas 1/2; the codec/fail-close
+  discipline carries over, and the algo-first key removes the cross-width order hazard entirely.
 
 ## 4. Why manifests must be per-ENTRY algo (the central decision) {#per-entry-algo}
 
@@ -71,28 +71,37 @@ Fail-close remains for: unknown algo id anywhere (`NOT_IMPLEMENTED`), and any ma
 blob under an algo NOT in `algos_used` (foreign-object protection). `checkBlobHashAlgoMatches` is
 deleted; its test flips to assert the additive-switch behavior.
 
-## 6. GC: partition settlement by algo {#gc-partition}
+## 6. GC: algo-prefixed settlement keys (no per-algo partitions) {#gc-keys}
 
-The settlement identity gains the algo dimension by PARTITIONING, not by widening every key:
+**Decision (user, superseding the first draft):** do NOT partition the run namespace per algo.
+Settlement identity gains the algo dimension IN THE ROW KEY, inside the same `gc_shards` runs:
 
-- **Run namespace**: `blobTargetRunKey(generation, attempt, shard, seq)` (`CasLayout.h:192`) gains an
-  algo segment → `…/gc/gen/<generation>/<algo>/<shard>/<seq>` (exact layout at implementation).
-  Each (algo × shard) partition holds ONLY that algo's edges/condemns — every run stays
-  width-homogeneous, so the entire Phase 2 T4 machinery (key schemas 1/2, `SourceEdgeKeyCodec`,
-  coherence gates, 2-cursor merge, retired-in-snapshot `kCondemned` rows, zero-sentinel) is reused
-  UNCHANGED inside a partition. No cross-algo merge ever happens by construction; the coherence gate
-  now guards against a mis-routed segment (corruption), its proper defense-in-depth role.
-- **Fold**: `foldManifestEdges` buckets each `BlobDelta` by `(entry.algo, blobShard(digest))`.
-  `BlobDelta`/`BlobCandidate` gain `algo` (u8). One `ShardReducer` per (algo × shard); rounds and
-  generations stay GLOBAL (one `gc/state`, one fold seal per generation).
-- **Seal totality**: `CasFoldSeal.blob_target_runs` + `condemned_summary` become total over
-  (algos_used × gc_shards) — the coverage/`carryParentRefs` totality checks iterate the recorded algo
-  set. An algo with zero blobs still gets its (empty) partition entries so totality stays checkable.
+- **Source-edge key schema 3** (replaces schemas 1/2 wholesale — pre-release, no back-compat):
+  `algo(u8) ++ digest[blobHashLenFor(algo)] ++ source_id(16 BE)`, i.e. 33 bytes for 16-byte algos,
+  49 for sha256. The algo byte comes FIRST, which makes the variable-width keys totally ordered by
+  construction: keys of different algos diverge at byte 0, so digest bytes of different widths are
+  NEVER compared against each other — the Phase 2 T4 cross-width hazard is eliminated, not guarded.
+  Within one algo all keys share one width. Order == `(algo, digest, source_id)`; the zero-`source_id`
+  sentinel still sorts first within its blob group. Overhead vs today: +1 byte/row (runs are
+  uncompressed, `kRunCodecNone`, payloads ~1 byte — acceptable).
+- **Self-describing parse**: read the algo byte -> `len = blobHashLenFor(algo)` -> the key must be
+  exactly `1+len+16` bytes (`CORRUPTED_DATA` otherwise); an unknown algo byte is `NOT_IMPLEMENTED`.
+  One `SourceEdgeKeyCodec` successor owns build/parse/seekPrefix (same len-drift discipline as T4);
+  `assertSourceEdgeRunHeader` accepts schema 3 only.
+- **No algo loop anywhere in settlement.** The fold/merge processes self-describing rows; it does not
+  know or iterate the pool's algo set. `blobShard` stays digest-only (`bytes[0:8] % gc_shards`) —
+  same-value digests under two algos co-shard harmlessly; existing pools keep their routing.
+  `BlobDelta`/`BlobCandidate` gain `algo` (u8); the merge comparator becomes
+  `(algo, digest, source_id)` — byte-identical to the key order. `foldManifestEdges` emits deltas
+  with `entry.algo`.
+- **Seal unchanged**: `blob_target_runs` + `condemned_summary` stay total over `gc_shards` exactly as
+  today. No algo dimension in the seal, no empty-partition minting, no `algos_used`-driven iteration
+  whose incompleteness could silently leak a subset (the first draft's headline risk is structurally
+  gone).
 - **Delete/condemn identity**: `RetiredEntry`, `OutcomeEntry`, `head_blob`/`peek_head`, `blobKeyOf`,
-  `.meta` API take `(algo, digest)` (a small `BlobRef {uint8_t algo; BlobDigest digest;}` struct).
-  The exact-token delete is untouched (full key + token, algo already in the key).
-- **Ack-floor / graduation**: unchanged — floors are per-mount and rounds are global; graduation
-  paces per condemned row inside its partition exactly as today.
+  the `.meta` API take `(algo, digest)` (`BlobRef {uint8_t algo; BlobDigest digest;}`). The
+  exact-token delete is untouched (full key + token; algo already in the object key).
+- **Ack-floor / graduation / rounds / generations**: unchanged.
 
 ## 7. Sweep, fsck, dedup, inspect {#consumers}
 
@@ -108,9 +117,9 @@ The settlement identity gains the algo dimension by PARTITIONING, not by widenin
 
 Token model (ETag exact-token delete), source_id/`sourceEdgeId` (`UInt128` internal id), root-shard
 journal/refs, manifests' ref/identity model, ack-floor protocol, retired-in-snapshot semantics,
-S3-staging, envelope format (already has `hash_algo`). No TLA+ re-gate expected: partitioning is a
-namespace split running N independent instances of the SAME verified protocol under one global round
-counter; flag for re-check only if seal-totality interacts with graduation in an unforeseen way.
+S3-staging, envelope format (already has `hash_algo`), the fold seal shape and its `gc_shards`
+totality. No TLA+ re-gate expected: the settlement protocol is unchanged — only the row-key alphabet
+widens (algo-prefixed keys), below the model's abstraction level.
 
 ## 9. Testing gates {#testing}
 
@@ -119,8 +128,12 @@ counter; flag for re-check only if seal-totality interacts with graduation in an
    e2e but asserting SUCCESS).
 2. Mixed manifest: mutation carry-forward across the switch → one manifest with entries of both
    algos; round-trip; fold settles both partitions; `dangling==0` after DROP of either or both.
-3. GC totality: forced GC on a 2-algo pool reclaims orphans of BOTH algos to `physical_bytes=0`
-   (the anti-silent-leak crux, now per algo-partition).
+3. GC completeness (crux): forced GC on a 2-algo pool reclaims orphans of BOTH algos to
+   `physical_bytes=0` — proves settlement handles mixed rows end-to-end with no per-algo blind spot.
+3a. Schema-3 key order & parse: `(algo, digest, source_id)` byte order == logical order across mixed
+   widths (incl. adversarial digests whose bytes would mis-compare without the algo prefix — the T4
+   teeth-test construction, now expected to be UNREACHABLE by key design); parse fail-closes on a
+   wrong-length key and on an unknown algo byte; sentinel-first per blob group at both widths.
 4. fsck classifies both subsets; a blob under a never-enabled algo segment → `unaccounted`, sweep
    skips it.
 5. Same-digest/different-algo: craft two blobs whose 16-byte digests collide across `ch128`/`xxh3`
@@ -138,9 +151,12 @@ counter; flag for re-check only if seal-totality interacts with graduation in an
 
 ## 11. Effort & risk {#effort}
 
-Medium. The bulk is §6 (settlement partitioning: run-key namespace, per-(algo×shard) reducers, seal
-totality) and the `BlobRef` plumbing through GC/meta/fsck; §4/§5/§7 are mechanical. Biggest risk:
-seal-totality over the algo set (a missed empty partition would trip the totality fail-close, or —
-worse — a totality check that silently iterates only `write_algo` would leak the other subset).
-Mitigate with test §9.3 as the crux gate, mirroring Phase 2's silent-site discipline. Two-consult
-review of the settlement-partitioning task before implementation (same discipline as Phase 2 T4).
+Medium-small (down from the first draft: no run-namespace change, no seal change, no partition
+lifecycle). The bulk is the schema-3 key codec + `BlobRef` plumbing through fold/GC/meta/fsck and the
+per-entry manifest algo; PoolMeta relax is mechanical. Biggest risk: key build/parse discipline — one
+missed call site building a digest-first (schema 1/2 style) key would corrupt merge order; mitigate
+exactly as T4 did (ONE codec owns build/parse/seekPrefix, no bare helpers; grep-gate that schemas 1/2
+constructors are deleted). Second risk: a consumer narrowing `BlobRef` back to bare digest (identity
+collision across algos) — the strong pair type + deleted single-arg overloads make this
+compiler-visible. Two-consult review of the schema-3 task before implementation (Phase 2 T4
+discipline).
