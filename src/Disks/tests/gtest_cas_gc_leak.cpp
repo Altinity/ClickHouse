@@ -129,7 +129,7 @@ ManifestId publishOneBlobPart(
 /// HEADs the object key, never the Store's manifest decode cache).
 bool blobPresent(const std::shared_ptr<InMemoryBackend> & b, const Layout & layout, const String & payload)
 {
-    return b->head(layout.blobKey(BlobId(u128ToHex(u128Of(payload))))).exists;
+    return b->head(layout.blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(u128Of(payload))})).exists;
 }
 
 /// Whether a manifest body object is present in the backend.

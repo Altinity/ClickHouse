@@ -51,10 +51,9 @@ Store::Store(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
     : pool_backend(std::move(backend_))
     , config(std::move(config_))
     , meta(std::move(meta_))
-    /// `meta` (not the moved-from `meta_` parameter) is authoritative here: `PoolMeta::createOrValidate`
-    /// already fail-closed-validated it against `config.blob_hash_algo`, so this is the pool's REAL
-    /// recorded algo -- every blob key this Store ever builds must carry that exact segment.
-    , pool_layout(config.pool_prefix, static_cast<BlobHashAlgo>(meta.blob_hash_algo))
+    /// Phase 3 T2/T3: `Layout` no longer captures a pool algo -- every blob key is built from a
+    /// `BlobRef` (algo + digest) directly, so the constructor takes only the pool prefix.
+    , pool_layout(config.pool_prefix)
 {
     if (config.dedup_cache_bytes > 0)
         dedup_cache = std::make_unique<DedupCache>(

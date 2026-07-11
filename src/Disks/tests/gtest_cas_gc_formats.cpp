@@ -216,13 +216,13 @@ TEST(CasGcFormats, GcStateRejectsOldVersionFailClosed)
 TEST(CasGcFormats, OutcomeLogRoundTrip)
 {
     OutcomeLog log;
-    log.entries.push_back({ObjectKind::Blob, BlobDigest::fromU128(hexToU128("aa00000000000000000000000000000a")),
+    log.entries.push_back({ObjectKind::Blob, BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hexToU128("aa00000000000000000000000000000a"))},
                            Token{"etag-1", TokenType::ETag}, OutcomeKind::Deleted});
-    log.entries.push_back({ObjectKind::Blob, BlobDigest::fromU128(hexToU128("bb00000000000000000000000000000b")),
+    log.entries.push_back({ObjectKind::Blob, BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hexToU128("bb00000000000000000000000000000b"))},
                            Token{"7", TokenType::Emulated}, OutcomeKind::Spared});
-    log.entries.push_back({ObjectKind::Blob, BlobDigest::fromU128(hexToU128("cc00000000000000000000000000000c")),
+    log.entries.push_back({ObjectKind::Blob, BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hexToU128("cc00000000000000000000000000000c"))},
                            Token{"8", TokenType::Emulated}, OutcomeKind::Replaced});
-    log.entries.push_back({ObjectKind::Blob, BlobDigest::fromU128(hexToU128("dd00000000000000000000000000000d")),
+    log.entries.push_back({ObjectKind::Blob, BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hexToU128("dd00000000000000000000000000000d"))},
                            Token{"9", TokenType::Emulated}, OutcomeKind::Absent});
     auto bytes = encodeOutcomeLog(log);
     ASSERT_FALSE(bytes.empty());
@@ -230,7 +230,7 @@ TEST(CasGcFormats, OutcomeLogRoundTrip)
     auto d = decodeOutcomeLog(bytes);
     ASSERT_EQ(d.entries.size(), 4u);
     EXPECT_EQ(d.entries[0].kind, ObjectKind::Blob);
-    EXPECT_EQ(d.entries[0].hash, BlobDigest::fromU128(hexToU128("aa00000000000000000000000000000a")));
+    EXPECT_EQ(d.entries[0].ref, (BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hexToU128("aa00000000000000000000000000000a"))}));
     EXPECT_EQ(d.entries[0].outcome, OutcomeKind::Deleted);
     EXPECT_EQ(d.entries[1].outcome, OutcomeKind::Spared);
     EXPECT_EQ(d.entries[2].outcome, OutcomeKind::Replaced);
@@ -326,9 +326,9 @@ TEST(CasGcFormats, OutcomeLogValidation)
 TEST(CasHeaderGolden, GcOutcomesCasHeaderRoundTrips)
 {
     OutcomeLog log;
-    log.entries.push_back({ObjectKind::Blob, BlobDigest::fromU128(hexToU128("aa00000000000000000000000000000a")),
+    log.entries.push_back({ObjectKind::Blob, BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hexToU128("aa00000000000000000000000000000a"))},
                            Token{"etag-1", TokenType::ETag}, OutcomeKind::Deleted});
-    log.entries.push_back({ObjectKind::Blob, BlobDigest::fromU128(hexToU128("bb00000000000000000000000000000b")),
+    log.entries.push_back({ObjectKind::Blob, BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hexToU128("bb00000000000000000000000000000b"))},
                            Token{"7", TokenType::Emulated}, OutcomeKind::Spared});
     const String bytes = encodeOutcomeLog(log);
     ASSERT_FALSE(bytes.empty());
@@ -341,7 +341,7 @@ TEST(CasHeaderGolden, GcOutcomesCasHeaderRoundTrips)
     const OutcomeLog d = decodeOutcomeLog(bytes);
     ASSERT_EQ(d.entries.size(), 2u);
     EXPECT_EQ(d.entries[0].kind, ObjectKind::Blob);
-    EXPECT_EQ(d.entries[0].hash, BlobDigest::fromU128(hexToU128("aa00000000000000000000000000000a")));
+    EXPECT_EQ(d.entries[0].ref, (BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hexToU128("aa00000000000000000000000000000a"))}));
     EXPECT_EQ(d.entries[0].outcome, OutcomeKind::Deleted);
     EXPECT_EQ(d.entries[1].outcome, OutcomeKind::Spared);
     EXPECT_EQ(encodeOutcomeLog(d), bytes);   // byte-stable

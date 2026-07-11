@@ -130,11 +130,12 @@ TEST(CasGcShardIncarnation, NewbornPrecommitProtectsDedupBlobAgainstConcurrentDr
         /// copy-forward verifier accepts its payload — the plain CityHash test id would be refused.
         const String b1_payload = "shared-blob-b1";
         const String b1_hex = streamingHexOf(b1_payload);
+        const BlobRef b1_ref{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hexToU128(b1_hex))};
         {
             auto seed = store->startBuild({});
-            seed->putBlob(BlobId{b1_hex}, BlobSource::fromString(b1_payload));
+            seed->putBlob(b1_ref, BlobSource::fromString(b1_payload));
         }
-        const String b1_key = store->layout().blobKey(BlobId{b1_hex});
+        const String b1_key = store->layout().blobKey(b1_ref);
         ASSERT_TRUE(backend->head(b1_key).exists)
             << "b1 body must be present after the seed putBlob";
         const Token b1_token = backend->head(b1_key).token;
@@ -143,7 +144,7 @@ TEST(CasGcShardIncarnation, NewbornPrecommitProtectsDedupBlobAgainstConcurrentDr
         /// This simulates GC having advanced to round 1 and retired b1 (condemned token recorded
         /// in the retired set) but not yet deleted b1's body object.
         injectRetire(*backend, store->layout(), /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
-            {RetiredEntry{.kind = ObjectKind::Blob, .hash = BlobDigest::fromU128(hexToU128(b1_hex)),
+            {RetiredEntry{.kind = ObjectKind::Blob, .ref = b1_ref,
                           .token = b1_token, .size = static_cast<uint64_t>(b1_payload.size())}});
 
         /// Sanity: currentGcRound() reads gc/state fresh and returns 1.

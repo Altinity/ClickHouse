@@ -1,5 +1,6 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobDigest.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobRef.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEnvelope.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasToken.h>
 #include <base/types.h>
@@ -24,7 +25,7 @@ enum class OutcomeKind : uint8_t
 struct OutcomeEntry
 {
     ObjectKind kind = ObjectKind::Blob;
-    BlobDigest hash{};
+    BlobRef ref{};
     Token token;                 /// the retired (condemned) token the recheck acted on
     OutcomeKind outcome = OutcomeKind::Spared;
 };

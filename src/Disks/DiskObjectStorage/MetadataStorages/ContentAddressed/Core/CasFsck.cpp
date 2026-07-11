@@ -115,7 +115,7 @@ bool parseBuildPrefix(const String & key, const String & manifests_prefix, Build
 /// Fails CLOSED on any ambiguity (a malformed label, a dropped-then-recreated ref that throws, a
 /// corrupt current manifest): treated as "still referenced", i.e. the original conservative verdict.
 /// The fix can only SHRINK false positives — it must never hide a real one.
-bool blobStillReferenced(Store & store, const Layout & layout, [[maybe_unused]] const DigestCodec & codec,
+bool blobStillReferenced(Store & store, const Layout & layout,
                           const String & bkey, const std::vector<String> & labels, const Deadline & deadline)
 {
     if (labels.empty())
@@ -155,10 +155,13 @@ void runFsckImpl(Store & store, bool detail, const FsckProgress & on_progress, c
 {
     const Layout & layout = store.layout();
     Backend & backend = store.backend();
-    /// CAS pluggable-blob-hash Phase 2 Task 5: ONE pool-scoped digest codec for the whole fsck pass —
-    /// every blob-content-hash hex render/parse below routes through it (never a bare
-    /// `u128ToHex`/`hexToU128`, which hard-reject any non-16-byte digest).
-    const DigestCodec codec(store.poolMeta());
+    /// TEMPORARY(P3T5): path-derived per-object algo parsing (`Layout::parseBlobKey`) lands in Task
+    /// 5; until then this pass classifies LISTED blob object keys at the POOL-CONFIGURED write algo's
+    /// width only (mirrors the GC condemn-sweep's identical bridge in `CasGc.cpp::rebuildBaseline`) —
+    /// a key under a foreign algo segment is skipped as debris here, same limitation the pre-mixed-
+    /// algo fsck had.
+    const BlobHashAlgo fsck_algo = store.poolConfig().blob_hash_algo;
+    const DigestCodec codec = codecFor(fsck_algo);
 
     /// OQ8 manifest audit. Reachability is recomputed from the AUTHORITATIVE refs (never from gc state):
     /// for each namespace, each committed ref resolves to a ManifestId; read its body; a committed ref
@@ -247,7 +250,7 @@ void runFsckImpl(Store & store, bool detail, const FsckProgress & on_progress, c
     std::unordered_map<String, uint64_t> present_all;
     listAll(backend, layout.blobsPrefix(), present_all, on_progress, deadline, "listing blobs");
     std::unordered_map<String, uint64_t> present_blobs;
-    std::unordered_set<BlobDigest, BlobDigestHash> present_meta_hashes;
+    std::unordered_set<BlobRef, BlobRefHash> present_meta_hashes;
     present_blobs.reserve(present_all.size());
     for (const auto & [key, sz] : present_all)
     {
@@ -259,7 +262,7 @@ void runFsckImpl(Store & store, bool detail, const FsckProgress & on_progress, c
                 continue;
             try
             {
-                present_meta_hashes.insert(codec.fromHex(body_key.substr(slash + 1)));
+                present_meta_hashes.insert(BlobRef{fsck_algo, codec.fromHex(body_key.substr(slash + 1))});
             }
             catch (...)
             {
@@ -295,7 +298,7 @@ void runFsckImpl(Store & store, bool detail, const FsckProgress & on_progress, c
             /// B207: before declaring a loss, re-resolve the referencing ref(s) FRESH — a ref
             /// re-published or dropped between the walk and this HEAD-confirm, combined with a
             /// legitimate GC delete of the OLD blob, must NOT surface as a phantom dangle.
-            const bool still_referenced = blobStillReferenced(store, layout, codec, bkey,
+            const bool still_referenced = blobStillReferenced(store, layout, bkey,
                 lit != blob_labels.end() ? lit->second : std::vector<String>{}, deadline);
             if (!still_referenced)
                 continue;   /// stale-walk artifact: neither reachable nor dangling — skip entirely
@@ -322,9 +325,9 @@ void runFsckImpl(Store & store, bool detail, const FsckProgress & on_progress, c
     /// suspicious "unreachable" lump (2026-07-02; the two-phase graduation keeps a nonzero churning
     /// set here on ANY active pool, and beta testers read "unreachable" as a leak). The GC state is
     /// read for LABELING ONLY — reachability above never consults it.
-    std::unordered_map<BlobDigest, RetiredEntry, BlobDigestHash> retired_by_hash;
-    std::unordered_set<BlobDigest, BlobDigestHash> unref_hashes;
-    std::unordered_set<BlobDigest, BlobDigestHash> in_run_hashes;
+    std::unordered_map<BlobRef, RetiredEntry, BlobRefHash> retired_by_hash;
+    std::unordered_set<BlobRef, BlobRefHash> unref_hashes;
+    std::unordered_set<BlobRef, BlobRefHash> in_run_hashes;
     bool have_gc_state = false;
 
     for (const auto & [bkey, sz] : present_blobs)
@@ -332,7 +335,7 @@ void runFsckImpl(Store & store, bool detail, const FsckProgress & on_progress, c
         {
             const size_t slash = bkey.rfind('/');
             if (slash != String::npos)
-                unref_hashes.insert(codec.fromHex(bkey.substr(slash + 1)));
+                unref_hashes.insert(BlobRef{fsck_algo, codec.fromHex(bkey.substr(slash + 1))});
         }
 
     if (!unref_hashes.empty())
@@ -367,28 +370,27 @@ void runFsckImpl(Store & store, bool detail, const FsckProgress & on_progress, c
                     /// Fsck keys off the row's hash (via the run's own `SourceEdgeKeyCodec`, derived from
                     /// its `key_schema` — Task 4, never from pool meta).
                     RunFileReader reader = openSourceEdgeRun(backend, run.key);
-                    const SourceEdgeKeyCodec run_codec = SourceEdgeKeyCodec::forSchema(reader.keySchema());
                     String key;
                     String payload;
                     while (reader.next(key, payload))
                     {
-                        BlobDigest hash_digest;
+                        BlobRef ref;
                         UInt128 source_id;
-                        run_codec.parse(key, hash_digest, source_id);   // throws CORRUPTED_DATA on malformed (fail-closed)
-                        if (unref_hashes.count(hash_digest))
+                        SourceEdgeKeyCodec::parse(key, ref, source_id);   // throws CORRUPTED_DATA on malformed (fail-closed)
+                        if (unref_hashes.count(ref))
                         {
-                            in_run_hashes.insert(hash_digest);
+                            in_run_hashes.insert(ref);
                             if (!payload.empty() && payload[0] == kCondemned)
                             {
                                 const CondemnedRow row = decodeCondemnedRow(payload);
                                 RetiredEntry e;
                                 e.kind = ObjectKind::Blob;
-                                e.hash = hash_digest;
+                                e.ref = ref;
                                 e.token = row.token;
                                 e.size = row.size;
                                 e.condemn_round = row.condemn_round;
                                 e.delete_pending = row.delete_pending;
-                                retired_by_hash.emplace(hash_digest, std::move(e));
+                                retired_by_hash.emplace(ref, std::move(e));
                             }
                         }
                         if (on_progress && ++rows % 65536 == 0)
@@ -406,7 +408,7 @@ void runFsckImpl(Store & store, bool detail, const FsckProgress & on_progress, c
         ++report.unreachable;
 
         const size_t slash = bkey.rfind('/');
-        const BlobDigest hash = slash != String::npos ? codec.fromHex(bkey.substr(slash + 1)) : BlobDigest{};
+        const BlobRef hash = slash != String::npos ? BlobRef{fsck_algo, codec.fromHex(bkey.substr(slash + 1))} : BlobRef{};
 
         FsckClass cls = FsckClass::Unaccounted;
         String note;
@@ -461,7 +463,7 @@ void runFsckImpl(Store & store, bool detail, const FsckProgress & on_progress, c
     /// orphaned of its body) — a real ERROR, distinct from `dangling` (which is reachability-driven).
     /// A body with no `.meta` is a benign not-yet-adopted (or crashed-birth) artifact, NOT a dangle
     /// — it still classifies through the ordinary present-but-unreferenced pipeline above.
-    std::unordered_set<BlobDigest, BlobDigestHash> present_body_hashes;
+    std::unordered_set<BlobRef, BlobRefHash> present_body_hashes;
     present_body_hashes.reserve(present_blobs.size());
     for (const auto & [bkey, _] : present_blobs)
     {
@@ -470,17 +472,17 @@ void runFsckImpl(Store & store, bool detail, const FsckProgress & on_progress, c
             continue;
         try
         {
-            present_body_hashes.insert(codec.fromHex(bkey.substr(slash + 1)));
+            present_body_hashes.insert(BlobRef{fsck_algo, codec.fromHex(bkey.substr(slash + 1))});
         }
         catch (...)
         {
             continue;   /// foreign key shape under blobs/ — not ours to pair
         }
     }
-    for (const BlobDigest & hash : present_meta_hashes)
+    for (const BlobRef & hash : present_meta_hashes)
         if (!present_body_hashes.count(hash))
             ++report.meta_without_body;
-    for (const BlobDigest & hash : present_body_hashes)
+    for (const BlobRef & hash : present_body_hashes)
         if (!present_meta_hashes.count(hash))
             ++report.body_without_meta;
     }
@@ -498,7 +500,7 @@ void runFsckImpl(Store & store, bool detail, const FsckProgress & on_progress, c
             if (!exists)
             {
                 /// B207: same HEAD-absent re-resolve as the global-mode loop above.
-                const bool still_referenced = blobStillReferenced(store, layout, codec, bkey,
+                const bool still_referenced = blobStillReferenced(store, layout, bkey,
                     lit != blob_labels.end() ? lit->second : std::vector<String>{}, deadline);
                 if (!still_referenced)
                     continue;   /// stale-walk artifact — neither reachable nor dangling

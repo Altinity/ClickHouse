@@ -2,6 +2,7 @@
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobDigest.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobRef.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasToken.h>
 #include <base/types.h>
@@ -47,12 +48,11 @@ struct LoadedMeta
 /// The shared meta-ops layer used by BOTH Build (writer) and Gc. Key-agnostic across all backends.
 /// Requires strong read-after-write consistency for the 1-GET adopt (S3 since 2020, RustFS yes).
 ///
-/// CAS pluggable-blob-hash Phase 2 Task 5: the meta key is built at the POOL's digest width, so every
-/// caller threads the pool-scoped `DigestCodec` (`codec.toHex(hash)` replaces the old bare `u128ToHex`)
-/// — never a bare length, per the design's len-drift mitigation (`CasBlobDigest.h`).
-std::optional<LoadedMeta> loadMeta(Backend & backend, const Layout & layout, const DigestCodec & codec, const BlobDigest & hash);
-CasResult putMetaIfAbsent(Backend & backend, const Layout & layout, const DigestCodec & codec, const BlobDigest & hash, const BlobMeta & meta);
-CasResult casMeta(Backend & backend, const Layout & layout, const DigestCodec & codec, const BlobDigest & hash, const Token & expected, const BlobMeta & meta);
-DeleteOutcome deleteMetaExact(Backend & backend, const Layout & layout, const DigestCodec & codec, const BlobDigest & hash, const Token & expected);
+/// Phase 3 T2/T3 (mixed-algo pools): keyed by the full `BlobRef` pair -- the codec is derived INSIDE
+/// via `codecFor(ref.algo)` (never a pool-wide width), so callers never thread a `DigestCodec`.
+std::optional<LoadedMeta> loadMeta(Backend & backend, const Layout & layout, const BlobRef & ref);
+CasResult putMetaIfAbsent(Backend & backend, const Layout & layout, const BlobRef & ref, const BlobMeta & meta);
+CasResult casMeta(Backend & backend, const Layout & layout, const BlobRef & ref, const Token & expected, const BlobMeta & meta);
+DeleteOutcome deleteMetaExact(Backend & backend, const Layout & layout, const BlobRef & ref, const Token & expected);
 
 }

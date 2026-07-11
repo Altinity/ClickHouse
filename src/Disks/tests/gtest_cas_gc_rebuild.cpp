@@ -49,7 +49,7 @@ TEST(CasGcBaselineGuard, FreshStateOverTrimmedJournalsFailsClosed)
     /// A fresh GC (fresh leader id — the old lease died with the state) must REFUSE, not delete.
     Gc gc2(store, hexToU128("00000000000000000000000000000002"));
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { gc2.runRegularRound(); });
-    EXPECT_TRUE(backend->head(store->layout().blobKey(BlobId(u128ToHex(DB::UInt128(1))))).exists)
+    EXPECT_TRUE(backend->head(store->layout().blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::UInt128(1))})).exists)
         << "the guard must fire BEFORE any destructive step";
 }
 
@@ -136,7 +136,7 @@ TEST(CasGcRebuild, RecoversLostStateAndConverges)
 
     /// Regular rounds converge: blob 2 (unreferenced) reclaimed, blob 1 intact.
     EXPECT_TRUE(runRoundsUntilAbsent(store, gc2, *backend, store->layout(), DB::UInt128(2)));
-    EXPECT_TRUE(backend->head(store->layout().blobKey(BlobId(u128ToHex(DB::UInt128(1))))).exists);
+    EXPECT_TRUE(backend->head(store->layout().blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::UInt128(1))})).exists);
 }
 
 /// (б): a run object named by a healthy state is lost -> the regular round fails closed -> the
@@ -173,7 +173,7 @@ TEST(CasGcRebuild, RecoversLostGenerationArtifact)
     const RebuildReport rep = gc.rebuildBaseline(/*force*/ false);
     ASSERT_TRUE(rep.performed) << rep.refusal;
     EXPECT_NO_THROW(gc.runRegularRound());
-    EXPECT_TRUE(backend->head(store->layout().blobKey(BlobId(u128ToHex(DB::UInt128(1))))).exists);
+    EXPECT_TRUE(backend->head(store->layout().blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::UInt128(1))})).exists);
 }
 
 /// FORCE: a healthy state refuses the plain rebuild; FORCE rebuilds; rounds run clean after.
@@ -263,7 +263,7 @@ TEST(CasGcRebuild, LivePrecommitEdgesIncluded)
         gc2.runRegularRound();
         store->renewWatermarkOnce();
     }
-    EXPECT_TRUE(backend->head(store->layout().blobKey(BlobId(u128ToHex(DB::UInt128(9))))).exists);
+    EXPECT_TRUE(backend->head(store->layout().blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::UInt128(9))})).exists);
 }
 
 /// O(budget) attempt iteration: a tiny edge budget forces multi-batch folding; the rebuilt
@@ -298,7 +298,7 @@ TEST(CasGcRebuild, BatchedRebuildProtectsAllRefs)
         store->renewWatermarkOnce();
     }
     for (uint64_t i = 1; i <= 6; ++i)
-        EXPECT_TRUE(backend->head(store->layout().blobKey(BlobId(u128ToHex(DB::UInt128(i))))).exists)
+        EXPECT_TRUE(backend->head(store->layout().blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::UInt128(i))})).exists)
             << "blob " << i;
 }
 
@@ -336,7 +336,7 @@ TEST(CasGcRebuild, UnownedAliveManifestOverProtected)
         gc.runRegularRound();
         store->renewWatermarkOnce();
     }
-    EXPECT_TRUE(backend->head(store->layout().blobKey(BlobId(u128ToHex(DB::UInt128(9))))).exists);
+    EXPECT_TRUE(backend->head(store->layout().blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::UInt128(9))})).exists);
 }
 
 /// Task 4 (SYSTEM CONTENT ADDRESSED GC REBUILD): a rebuild refuses when ANOTHER Gc instance holds
@@ -396,15 +396,13 @@ TEST(CasGcRebuild, OrphanBlobCondemnedInRebuiltRun)
     for (const RunRef & r : seal.blob_target_runs)
     {
         RunFileReader reader = openSourceEdgeRun(*backend, r.key);
-        /// Readers derive width from the run's OWN key_schema — never from pool meta (Task 4).
-        const SourceEdgeKeyCodec codec = SourceEdgeKeyCodec::forSchema(reader.keySchema());
         String k, p;
         while (reader.next(k, p))
         {
-            BlobDigest bh_digest;
+            BlobRef bh_ref;
             UInt128 sid;
-            codec.parse(k, bh_digest, sid);   // throws CORRUPTED_DATA on a malformed key (fail-closed)
-            const UInt128 bh = bh_digest.toU128();
+            SourceEdgeKeyCodec::parse(k, bh_ref, sid);   // throws CORRUPTED_DATA on a malformed key (fail-closed)
+            const UInt128 bh = bh_ref.digest.toU128();
             if (p.empty() || p[0] != kCondemned)
                 continue;
             const CondemnedRow row = decodeCondemnedRow(p);
@@ -447,7 +445,7 @@ TEST(CasGcRebuild, OrphanBlobCondemnedInRebuiltRun)
     /// End-to-end: regular rounds graduate then REDELETE the orphan through the run (the pipeline-
     /// blindness repair works without a retired set); the edge-bearing blob stays intact.
     EXPECT_TRUE(runRoundsUntilAbsent(store, gc, *backend, store->layout(), DB::UInt128(2)));
-    EXPECT_TRUE(backend->head(store->layout().blobKey(BlobId(u128ToHex(DB::UInt128(1))))).exists);
+    EXPECT_TRUE(backend->head(store->layout().blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::UInt128(1))})).exists);
 }
 
 /// CLAMP SUPPRESSION regression (2026-07-03 night soak: 31 dangling blobs). A committed +1 for
@@ -489,7 +487,7 @@ TEST(CasGcClampSuppression, LandedEdgeBehindClampNeverDeleted)
     /// CLAMPED (the bodiless precommit persists), so nothing may graduate or delete.
     /// Observability (2026-07-03): every clamp emits a gc_fold_clamp event with the reason.
     store->setEventSink([&](const CasEvent & e){ if (e.type == CasEventType::GcFoldClamp) seen.push_back(e); });
-    const String blob_key = store->layout().blobKey(BlobId(u128ToHex(DB::UInt128(1))));
+    const String blob_key = store->layout().blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::UInt128(1))});
     for (int i = 0; i < 6; ++i)
     {
         gc.runRegularRound();

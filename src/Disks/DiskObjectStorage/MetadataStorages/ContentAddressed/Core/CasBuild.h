@@ -29,13 +29,11 @@ struct BlobSource
     static BlobSource fromString(String bytes);         /// convenience for small content/tests
 };
 
-/// putBlob's return value: the BlobId it was addressed by (a hex string at the WRITE algo's width) plus
-/// the admitted logical size. NOT the mixed-algo-pools `BlobRef` pair type (`CasBlobRef.h`) -- that name
-/// was freed up for the blob IDENTITY pair when this task introduced it; this is unrelated, a plain
-/// upload-result tuple.
+/// putBlob's return value: the `BlobRef` it was addressed by (the write mint's algo + digest pair)
+/// plus the admitted logical size.
 struct PutBlobResult
 {
-    BlobId id;
+    BlobRef ref;
     uint64_t size = 0;
 };
 
@@ -69,7 +67,7 @@ public:
     /// ADOPT paths observe an existing incarnation, so they are safe only under this build's durable
     /// precommit closure — asserted by `chassert(precommitted)` in observeAndAdmit. A FRESH upload before
     /// precommit is legal (newborn-debris watermark), but production never does it.
-    PutBlobResult putBlob(const BlobId & id, BlobSource source);
+    PutBlobResult putBlob(const BlobRef & ref, BlobSource source);
 
     /// B156b discriminator: does this build hold a TOKENED Blob dep for `ref` (putBlob'd here ⇒
     /// tokened) versus a TOKENLESS W-EVIDENCE dep (adoptEvidence ⇒ tokenless)? False also when this

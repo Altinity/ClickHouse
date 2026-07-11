@@ -531,3 +531,16 @@ TEST(CasRunFileStreaming, LargeFooterBeyondTailProbeReadsExactWindow)
     EXPECT_EQ(backend->getCount(key), 2u);
     EXPECT_EQ(backend->getStreamCount(key), 1u);
 }
+
+TEST(CasRunFile, MixedWidthKeysAcrossBlockBoundary)      /// spec §9.10 — Phase 3 T3
+{
+    /// tiny blocks: one record per block; a 33->49-byte width transition lands exactly on a block
+    /// boundary; seek by both prefixes; absent prefix positions on the next greater key.
+    const String k1(33, 'a'), k2(33, 'b'), k3(49, 'c'), k4(49, 'd');
+    const String bytes = writeRun({{k1, "1"}, {k2, "2"}, {k3, "3"}, {k4, "4"}}, /*block_size*/ 1);
+    RunFileReader r{std::string_view(bytes)};
+    r.seek(k3.substr(0, 17));                            /// a 17-byte prefix of the 49-byte key
+    String k, p;
+    ASSERT_TRUE(r.next(k, p));
+    EXPECT_EQ(k, k3);
+}

@@ -9,7 +9,7 @@
 #include <IO/WriteBufferFromString.h>
 #include <Common/Exception.h>
 
-namespace DB::ErrorCodes { extern const int CORRUPTED_DATA; }
+namespace DB::ErrorCodes { extern const int CORRUPTED_DATA; extern const int NOT_IMPLEMENTED; }
 
 using namespace DB::Cas;
 
@@ -17,10 +17,9 @@ namespace
 {
 UInt128 b(uint64_t n) { return UInt128(n); }
 UInt128 s(uint64_t n) { return UInt128(n); }   // source-edge id
-/// A `BlobDigest` (128-bit-width, zero-tailed) for the same literal `n` — every existing test's
-/// `BlobDelta.blob_hash` / `BlobCandidate.hash` / `inDegreeInGeneration` argument is a `BlobDigest`
-/// as of CAS pluggable-blob-hash Phase 2 Task 4.
-BlobDigest bh(uint64_t n) { return BlobDigest::fromU128(UInt128(n)); }
+/// A `BlobRef` (CityHash128) for the same literal `n` — every existing test's `BlobDelta.ref` /
+/// `BlobCandidate.ref` / `inDegreeInGeneration` argument is a `BlobRef` as of Phase 3 T3.
+BlobRef bh(uint64_t n) { return BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(UInt128(n))}; }
 }
 
 TEST(CasBlobInDegree, FoldStartsFromEmptyPriorGeneration)
@@ -60,7 +59,7 @@ TEST(CasBlobInDegree, PlusMinusCancelToZeroDetectsCandidate)
 
     const auto zero = zeroInDegree(backend, runs2);
     ASSERT_EQ(zero.size(), 1u);
-    EXPECT_EQ(zero[0].hash, bh(1));
+    EXPECT_EQ(zero[0].ref, bh(1));
 }
 
 TEST(CasBlobInDegree, RunsAreByteDeterministic)
@@ -142,9 +141,9 @@ namespace
 {
 
 /// head_blob / peek_head stub: present with a fixed token/size.
-std::function<std::optional<HeadResult>(const BlobDigest &)> headPresent(const String & tok, uint64_t size)
+std::function<std::optional<HeadResult>(const BlobRef &)> headPresent(const String & tok, uint64_t size)
 {
-    return [tok, size](const BlobDigest &) -> std::optional<HeadResult>
+    return [tok, size](const BlobRef &) -> std::optional<HeadResult>
     {
         HeadResult hr;
         hr.exists = true;
@@ -172,19 +171,18 @@ RunRef writeSourceEdgeRun(InMemoryBackend & backend, const Layout & layout,
                           const std::vector<std::pair<UInt128, CondemnedRow>> & condemned,
                           const std::vector<std::pair<UInt128, UInt128>> & edges = {})
 {
-    const SourceEdgeKeyCodec codec(16);
     std::vector<std::pair<String, String>> rows;
     for (const auto & [h, row] : condemned)
-        rows.emplace_back(codec.key(BlobDigest::fromU128(h), UInt128{0}), encodeCondemnedRow(row));
+        rows.emplace_back(SourceEdgeKeyCodec::key(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(h)}, UInt128{0}), encodeCondemnedRow(row));
     for (const auto & [h, sid] : edges)
-        rows.emplace_back(codec.key(BlobDigest::fromU128(h), sid), String(1, kEdgeActive));
+        rows.emplace_back(SourceEdgeKeyCodec::key(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(h)}, sid), String(1, kEdgeActive));
     std::stable_sort(rows.begin(), rows.end(),
         [](const auto & a, const auto & bb) { return a.first < bb.first; });
 
     DB::WriteBufferFromOwnString out;
     RunHeader header;
     header.kind = RunKind::SourceEdge;
-    header.key_schema = kSourceEdgeKeySchema128;
+    header.key_schema = kSourceEdgeKeySchema;
     RunFileWriter writer(out, header);
     for (const auto & [k, p] : rows)
         writer.append(k, p);
@@ -210,16 +208,15 @@ DecodedRun decodeRun(InMemoryBackend & backend, const RunRef & run)
 {
     DecodedRun d;
     RunFileReader r = openSourceEdgeRun(backend, run.key);
-    /// Readers derive width from the run's OWN key_schema — never from pool meta (Task 4). Every run
-    /// this test helper decodes is schema-1 (16-byte), so `.toU128()` is a provably-exact round trip.
-    const SourceEdgeKeyCodec codec = SourceEdgeKeyCodec::forSchema(r.keySchema());
+    /// Every run this test helper decodes is CityHash128 (16-byte), so `.toU128()` is a
+    /// provably-exact round trip.
     String k, p;
     while (r.next(k, p))
     {
-        BlobDigest bh_digest;
+        BlobRef bh_ref;
         UInt128 sid;
-        codec.parse(k, bh_digest, sid);   // throws CORRUPTED_DATA on a malformed key (fail-closed)
-        const UInt128 bh = bh_digest.toU128();
+        SourceEdgeKeyCodec::parse(k, bh_ref, sid);   // throws CORRUPTED_DATA on a malformed key (fail-closed)
+        const UInt128 bh = bh_ref.digest.toU128();
         EXPECT_FALSE(p.empty());
         if (p.empty())
             continue;
@@ -256,12 +253,12 @@ TEST(CasThreeCursorMerge, FloorBoundary)
     /// Two-phase graduation: the floor-passed entry is REPUBLISHED pending (still in the list);
     /// its physical delete belongs to the NEXT pass.
     ASSERT_EQ(rmr.graduated.size(), 1u);
-    EXPECT_EQ(rmr.graduated[0].hash, bh(1));
+    EXPECT_EQ(rmr.graduated[0].ref, bh(1));
     EXPECT_TRUE(rmr.graduated[0].delete_pending);
     ASSERT_EQ(rmr.still_retired.size(), 2u);
-    EXPECT_EQ(rmr.still_retired[0].hash, bh(1));
+    EXPECT_EQ(rmr.still_retired[0].ref, bh(1));
     EXPECT_TRUE(rmr.still_retired[0].delete_pending);
-    EXPECT_EQ(rmr.still_retired[1].hash, bh(2));
+    EXPECT_EQ(rmr.still_retired[1].ref, bh(2));
     EXPECT_FALSE(rmr.still_retired[1].delete_pending);
     EXPECT_EQ(rmr.still_retired[1].condemn_round, 3u);   /// carried unchanged, not re-stamped
     EXPECT_TRUE(rmr.spared.empty());
@@ -293,7 +290,7 @@ TEST(CasThreeCursorMerge, PendingRedeletesAndDrops)
         /*current_round*/9, /*condemn_round*/9, /*head_blob*/{}, /*peek_head*/{}, &rmr);
 
     ASSERT_EQ(rmr.redelete.size(), 1u);
-    EXPECT_EQ(rmr.redelete[0].hash, bh(1));
+    EXPECT_EQ(rmr.redelete[0].ref, bh(1));
     EXPECT_TRUE(rmr.still_retired.empty());
     EXPECT_TRUE(rmr.graduated.empty());
     EXPECT_TRUE(rmr.spared.empty());
@@ -319,7 +316,7 @@ TEST(CasThreeCursorMerge, RecoverySpares)
         /*current_round*/5, /*condemn_round*/6, /*head_blob*/{}, /*peek_head*/{}, &rmr);
 
     ASSERT_EQ(rmr.spared.size(), 1u);
-    EXPECT_EQ(rmr.spared[0].hash, bh(1));
+    EXPECT_EQ(rmr.spared[0].ref, bh(1));
     EXPECT_TRUE(rmr.graduated.empty());
     EXPECT_TRUE(rmr.still_retired.empty());
 
@@ -346,7 +343,7 @@ TEST(CasThreeCursorMerge, NewCandidateCondemned)
         /*current_round*/0, /*condemn_round*/7, headPresent("t9", 42), /*peek_head*/{}, &rmr);
 
     ASSERT_EQ(rmr.still_retired.size(), 1u);
-    EXPECT_EQ(rmr.still_retired[0].hash, bh(3));
+    EXPECT_EQ(rmr.still_retired[0].ref, bh(3));
     EXPECT_EQ(rmr.still_retired[0].token.value, "t9");
     EXPECT_EQ(rmr.still_retired[0].size, 42u);
     EXPECT_EQ(rmr.still_retired[0].condemn_round, 7u);
@@ -375,7 +372,7 @@ TEST(CasThreeCursorMerge, AbsentBlobNotCondemned)
     RetiredMergeResult rmr;
     foldDeltasIntoGeneration(backend, layout, /*prior_runs*/runs1, 2, 0, 0, {{bh(3), s(1), true}}, runs2,
         /*current_round*/0, /*condemn_round*/7,
-        [](const BlobDigest &) -> std::optional<HeadResult> { return std::nullopt; }, /*peek_head*/{}, &rmr);
+        [](const BlobRef &) -> std::optional<HeadResult> { return std::nullopt; }, /*peek_head*/{}, &rmr);
 
     EXPECT_TRUE(rmr.still_retired.empty());
     EXPECT_TRUE(rmr.graduated.empty());
@@ -445,7 +442,7 @@ TEST(CasTwoCursorMerge, CarriedSentinelIsNotATouch)
 
     /// Gen 2: empty deltas, current_round 1 (< 5 => b carries, does not graduate). peek_head must NOT fire.
     size_t peek_calls = 0;
-    auto peek = [&](const BlobDigest &) -> std::optional<HeadResult> { ++peek_calls; return {}; };
+    auto peek = [&](const BlobRef &) -> std::optional<HeadResult> { ++peek_calls; return {}; };
     std::vector<RunRef> runs2;
     RetiredMergeResult rmr2;
     foldDeltasIntoGeneration(backend, layout, /*prior_runs*/runs1, 2, 0, 0, {}, runs2,
@@ -453,7 +450,7 @@ TEST(CasTwoCursorMerge, CarriedSentinelIsNotATouch)
 
     EXPECT_EQ(peek_calls, 0u);
     ASSERT_EQ(rmr2.still_retired.size(), 1u);
-    EXPECT_EQ(rmr2.still_retired[0].hash, bh(2));
+    EXPECT_EQ(rmr2.still_retired[0].ref, bh(2));
     EXPECT_EQ(rmr2.still_retired[0].condemn_round, 5u);   /// carried unchanged
     EXPECT_TRUE(rmr2.graduated.empty());
 
@@ -475,9 +472,9 @@ TEST(CasTwoCursorMerge, MalformedRunFailsClosed)
         DB::WriteBufferFromOwnString out;
         RunHeader header;
         header.kind = RunKind::SourceEdge;
-        header.key_schema = kSourceEdgeKeySchema128;
+        header.key_schema = kSourceEdgeKeySchema;
         RunFileWriter writer(out, header);
-        writer.append(SourceEdgeKeyCodec(16).key(bh(1), UInt128{0}), String(1, kEdgeActive));   // edge at sentinel key
+        writer.append(SourceEdgeKeyCodec::key(bh(1), UInt128{0}), String(1, kEdgeActive));   // edge at sentinel key
         writer.finish();
         const RunRef bad{.key = layout.blobTargetRunKey(1, 0, 0, 0), .checksum = {}, .shard = 0, .generation = 1};
         backend.putIfAbsent(bad.key, out.str());
@@ -493,11 +490,11 @@ TEST(CasTwoCursorMerge, MalformedRunFailsClosed)
         DB::WriteBufferFromOwnString out;
         RunHeader header;
         header.kind = RunKind::SourceEdge;
-        header.key_schema = kSourceEdgeKeySchema128;
+        header.key_schema = kSourceEdgeKeySchema;
         RunFileWriter writer(out, header);
         /// Same (b,0) key twice (equal keys are allowed by the writer) — two condemned sentinels for b1.
-        writer.append(SourceEdgeKeyCodec(16).key(bh(1), UInt128{0}), encodeCondemnedRow(condemnedRowFor(1)));
-        writer.append(SourceEdgeKeyCodec(16).key(bh(1), UInt128{0}), encodeCondemnedRow(condemnedRowFor(2)));
+        writer.append(SourceEdgeKeyCodec::key(bh(1), UInt128{0}), encodeCondemnedRow(condemnedRowFor(1)));
+        writer.append(SourceEdgeKeyCodec::key(bh(1), UInt128{0}), encodeCondemnedRow(condemnedRowFor(2)));
         writer.finish();
         const RunRef bad{.key = layout.blobTargetRunKey(1, 0, 0, 0), .checksum = {}, .shard = 0, .generation = 1};
         backend.putIfAbsent(bad.key, out.str());
@@ -623,7 +620,7 @@ TEST(CasBlobInDegree, ZeroInDegreeStreamsBlockBounded)
     ASSERT_EQ(zero_c.size(), zero_o.size());
     ASSERT_EQ(zero_c.size(), 2u);
     for (size_t i = 0; i < zero_c.size(); ++i)
-        EXPECT_EQ(zero_c[i].hash, zero_o[i].hash);
+        EXPECT_EQ(zero_c[i].ref, zero_o[i].ref);
 
     /// The core assertion: no whole-object get of the run key — every read carried a Range or a stream.
     EXPECT_EQ(backend.wholeGetCount(gen2_run_key), 0u);
@@ -686,7 +683,7 @@ TEST(CasSourceEdgeRun, TypedOpenRejectsWrongSchemaAndKind)
     DB::WriteBufferFromOwnString out2;
     DB::Cas::RunHeader h2;
     h2.kind = DB::Cas::RunKind::ManifestEntries;              // wrong kind, right schema
-    h2.key_schema = DB::Cas::kSourceEdgeKeySchema128;
+    h2.key_schema = DB::Cas::kSourceEdgeKeySchema;
     DB::Cas::RunFileWriter w2(out2, h2);
     w2.finish();
     EXPECT_THROW(DB::Cas::openSourceEdgeRun(out2.str()), DB::Exception);
@@ -700,115 +697,73 @@ TEST(CasSourceEdgeRun, SourceEdgeIdZeroIsReserved)
     EXPECT_NO_THROW(DB::Cas::assertValidSourceEdgeId(UInt128{1}));
 }
 
-/// ==== THE TEETH TEST (CAS pluggable-blob-hash Phase 2 Task 4, consult's cheapest high-value test) ====
-///
-/// A fold must NEVER mix a schema-1 (16-byte digest) prior run with a schema-2 (32-byte digest)
-/// output — cross-width raw-byte comparison is unsafe (a schema-1 key puts `source_id` where a
-/// schema-2 key puts digest-suffix bytes). `PriorEdgeCursor` asserts every prior segment's own
-/// `key_schema` against the fold's output schema THE MOMENT the segment is opened — before any row
-/// of it is parsed or compared — and throws `CORRUPTED_DATA` on a mismatch.
+/// ==== schema 3 key codec (Phase 3 T3, mixed-algo pools) ====
 
-TEST(CasGcFoldCrossWidth, RawKeyComparisonWouldReverseOrder)
+TEST(CasSourceEdgeKeySchema3, MixedWidthKeysOrderAlgoFirst)
 {
-    /// Standalone proof (no fold call) that a NAIVE raw-byte comparison between a schema-1 key and a
-    /// schema-2 key is unsafe — the exact hazard the coherence gate exists to prevent. Both keys share
-    /// the SAME leading 16 digest bytes (value 5); the schema-1 key's remaining bytes are a source_id
-    /// with a 0xFF leading byte, while the schema-2 key's remaining bytes are the digest's own
-    /// zero-heavy suffix (value ...,1) followed by an ordinary source_id.
-    BlobDigest d16 = BlobDigest::fromU128(UInt128(5));            // bytes = [0]*15,5, zero tail
-    BlobDigest d32 = d16;
-    d32.bytes[31] = 1;                                            // same 16-byte prefix, tiny nonzero suffix
-    /// As full 256-bit numbers (i.e. treating d16's zero tail as genuine), d16 < d32 (d32 has one extra
-    /// low bit set) — this is the INTENDED digest-magnitude order a correct merge must respect.
-
-    const UInt128 source_id_prior = UInt128(0xFF) << 120;         // top byte 0xFF
-    const UInt128 source_id_delta = UInt128(7);
-
-    const SourceEdgeKeyCodec codec16(16);
-    const SourceEdgeKeyCodec codec32(32);
-    const String prior_key = codec16.key(d16, source_id_prior);   // 32 bytes
-    const String delta_key = codec32.key(d32, source_id_delta);   // 48 bytes
-
-    /// The REVERSAL: a naive raw byte comparison (mixing "source_id" against "digest suffix" past the
-    /// shared 16-byte prefix) puts the delta's key BEFORE the prior's key — the OPPOSITE of the
-    /// intended digest-magnitude order (d16 < d32). This is exactly why a fold must refuse to compare
-    /// keys of two different schemas rather than trust `String operator<` across them.
-    EXPECT_LT(delta_key, prior_key)
-        << "crafted bytes must demonstrate the raw-comparison reversal (delta sorts first, though "
-           "its digest is numerically LARGER) — else this test is vacuous";
+    const BlobDigest d16 = BlobDigest::fromU128((UInt128(0xFFFFFFFFFFFFFFFFULL) << 64) | 0xFFULL);
+    BlobDigest d32{};                                    /// sha256 digest starting 0x00,0x01 — small bytes
+    d32.bytes[1] = 0x01;
+    const BlobRef ch{BlobHashAlgo::CityHash128, d16};    /// algo=1, digest all-FF prefix
+    const BlobRef sh{BlobHashAlgo::Sha256, d32};         /// algo=3, tiny digest
+    const String k_ch = SourceEdgeKeyCodec::key(ch, UInt128(7));   /// 33 bytes
+    const String k_sh = SourceEdgeKeyCodec::key(sh, UInt128(7));   /// 49 bytes
+    EXPECT_EQ(k_ch.size(), 33u);
+    EXPECT_EQ(k_sh.size(), 49u);
+    /// algo byte decides BEFORE any digest byte can: ch128(1) < sha256(3) even though the ch128
+    /// digest bytes are all 0xFF and the sha256 digest bytes are almost all zero.
+    EXPECT_LT(k_ch, k_sh);
+    /// sentinel-first inside one blob group:
+    EXPECT_LT(SourceEdgeKeyCodec::key(ch, UInt128(0)), k_ch);
 }
 
-TEST(CasGcFoldCrossWidth, NonEmptyCrossWidthFoldRefusedBeforeWrite)
+TEST(CasSourceEdgeKeySchema3, ParseFailsClosed)
 {
-    /// The brief's literal construction: a real schema-1 prior edge row, folded with digest_len=32
-    /// (schema-2 output) against a schema-2 delta sharing the prior blob's leading 16 bytes. Must
-    /// throw CORRUPTED_DATA via the NAMED coherence gate (not merely "some" exception) and must not
-    /// write any output run artifact.
+    BlobRef r; UInt128 sid;
+    String k = SourceEdgeKeyCodec::key(BlobRef{BlobHashAlgo::XXH3_128, BlobDigest::fromU128(UInt128(5))}, UInt128(9));
+    SourceEdgeKeyCodec::parse(k, r, sid);
+    EXPECT_EQ(r.algo, BlobHashAlgo::XXH3_128);
+    EXPECT_EQ(r.digest.toU128(), UInt128(5));
+    EXPECT_EQ(sid, UInt128(9));
+    k[0] = static_cast<char>(99);                        /// unknown algo byte
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NOT_IMPLEMENTED, [&]{ SourceEdgeKeyCodec::parse(k, r, sid); });
+    k[0] = static_cast<char>(1);                         /// known algo, wrong length (33 expected, this is 33 — truncate)
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]{ SourceEdgeKeyCodec::parse(std::string_view(k).substr(0, 20), r, sid); });
+}
+
+TEST(CasBlobInDegree, TwoAlgoFoldSettlesBothInOneShardRun)
+{
+    /// Step 3 (Phase 3 T3): extend the fold with deltas for ch128:X and sha256:Y in ONE shard run —
+    /// both settle (edges present, condemn on removal works per ref), mixed rows in one run, no
+    /// algo loop.
     InMemoryBackend backend;
     Layout layout{"pool"};
 
-    const UInt128 blob16_u128(5);
-    const BlobDigest d16 = BlobDigest::fromU128(blob16_u128);
-    BlobDigest d32 = d16;
-    d32.bytes[31] = 1;
+    const BlobRef ch_x{BlobHashAlgo::CityHash128, BlobDigest::fromU128(UInt128(11))};
+    BlobDigest sha_y{};
+    sha_y.bytes[0] = 0xAB;
+    const BlobRef sha_y_ref{BlobHashAlgo::Sha256, sha_y};
 
-    const RunRef gen1 = writeSourceEdgeRun(backend, layout, /*gen*/1, 0, /*shard*/0,
-        /*condemned*/{}, /*edges*/{{blob16_u128, s(1)}});
+    std::vector<RunRef> runs1;
+    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{}, 1, /*attempt*/0, 0,
+        {{ch_x, s(1), false}, {sha_y_ref, s(1), false}}, runs1);
+    ASSERT_FALSE(runs1.empty());
 
-    std::vector<BlobDelta> scattered{{d32, UInt128(7), /*remove*/false}};
+    EXPECT_EQ(inDegreeInGeneration(backend, runs1, ch_x), 1);
+    EXPECT_EQ(inDegreeInGeneration(backend, runs1, sha_y_ref), 1);
+    EXPECT_TRUE(zeroInDegree(backend, runs1).empty());
+
+    /// Remove both edges in gen 2: each transitions to zero independently, condemned per its own ref.
     std::vector<RunRef> runs2;
-    bool threw = false;
-    try
-    {
-        foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{gen1}, /*new*/2, /*attempt*/0, /*shard*/0,
-            scattered, runs2, /*current_round*/0, /*condemn_round*/0, /*head_blob*/{}, /*peek_head*/{},
-            /*out_retired*/nullptr, /*suppress_destructive*/false, /*digest_len*/32);
-    }
-    catch (const DB::Exception & e)
-    {
-        threw = true;
-        EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA);
-        EXPECT_NE(e.message().find("cross-width merge refused"), String::npos)
-            << "the NAMED coherence gate must be what fires, not an incidental length-mismatch "
-               "throw elsewhere — actual message: " << e.message();
-    }
-    EXPECT_TRUE(threw) << "cross-width fold must throw, never silently mismerge";
+    RetiredMergeResult rmr;
+    foldDeltasIntoGeneration(backend, layout, /*prior_runs*/runs1, 2, /*attempt*/0, 0,
+        {{ch_x, s(1), true}, {sha_y_ref, s(1), true}}, runs2,
+        /*current_round*/0, /*condemn_round*/1, headPresent("t", 1), /*peek_head*/{}, &rmr);
 
-    /// No output run artifact was written: the generation-2 run key must be absent from the backend.
-    EXPECT_FALSE(backend.get(layout.blobTargetRunKey(2, 0, 0, 0)).has_value())
-        << "a refused cross-width fold must not leave a partial/wrong output artifact behind";
-}
-
-TEST(CasGcFoldCrossWidth, EmptyCrossWidthPriorRunRefused)
-{
-    /// The DISCRIMINATING variant: an EMPTY schema-1 prior run (header + footer, zero rows) has no row
-    /// for the per-row `SourceEdgeKeyCodec::parse` length check to ever reject — the only thing that
-    /// can catch a schema-1-vs-schema-2 mismatch here is the explicit, HEADER-based coherence gate in
-    /// `PriorEdgeCursor` (checked at segment-open, before any row is read). If that gate were removed,
-    /// this fold would run to completion and silently adopt the empty (wrong-schema) prior as if it
-    /// were compatible — this test goes RED without the gate.
-    InMemoryBackend backend;
-    Layout layout{"pool"};
-
-    const RunRef empty_gen1 = writeSourceEdgeRun(backend, layout, /*gen*/1, 0, /*shard*/0,
-        /*condemned*/{}, /*edges*/{});
-
-    std::vector<BlobDelta> scattered{{BlobDigest::fromU128(UInt128(9)), UInt128(1), /*remove*/false}};
-    std::vector<RunRef> runs2;
-    bool threw = false;
-    try
-    {
-        foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{empty_gen1}, /*new*/2, /*attempt*/0, /*shard*/0,
-            scattered, runs2, /*current_round*/0, /*condemn_round*/0, /*head_blob*/{}, /*peek_head*/{},
-            /*out_retired*/nullptr, /*suppress_destructive*/false, /*digest_len*/32);
-    }
-    catch (const DB::Exception & e)
-    {
-        threw = true;
-        EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA);
-        EXPECT_NE(e.message().find("cross-width merge refused"), String::npos) << e.message();
-    }
-    EXPECT_TRUE(threw) << "an EMPTY wrong-schema prior run has no row to trip a parse-length check — "
-                          "only the explicit coherence gate catches this (real teeth)";
-    EXPECT_FALSE(backend.get(layout.blobTargetRunKey(2, 0, 0, 0)).has_value());
+    ASSERT_EQ(rmr.still_retired.size(), 2u);
+    std::vector<BlobRef> condemned_refs{rmr.still_retired[0].ref, rmr.still_retired[1].ref};
+    EXPECT_NE(std::find(condemned_refs.begin(), condemned_refs.end(), ch_x), condemned_refs.end());
+    EXPECT_NE(std::find(condemned_refs.begin(), condemned_refs.end(), sha_y_ref), condemned_refs.end());
+    EXPECT_EQ(inDegreeInGeneration(backend, runs2, ch_x), 0);
+    EXPECT_EQ(inDegreeInGeneration(backend, runs2, sha_y_ref), 0);
 }

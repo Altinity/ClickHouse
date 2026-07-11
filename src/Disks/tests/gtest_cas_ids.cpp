@@ -7,13 +7,16 @@ using namespace DB::Cas;
 
 TEST(CasIds, StrongTypingAndContainers)
 {
-    BlobId b1{"00ff"}, b2{"00ff"}, b3{"0100"};
-    EXPECT_EQ(b1, b2);
-    EXPECT_NE(b1, b3);
-    std::unordered_set<BlobId> s{b1, b3};
+    /// `BlobId` (a bare-hex identity) was deleted in the mixed-algo-pools refactor -- a blob's
+    /// identity is now ONLY the `BlobRef` pair (`CasBlobRef.h`). `TreeId` is unrelated and stays,
+    /// exercising the SAME strong-typed-string macro (`CAS_STRONG_STRING`).
+    TreeId t1{"00ff"}, t2{"00ff"}, t3{"0100"};
+    EXPECT_EQ(t1, t2);
+    EXPECT_NE(t1, t3);
+    std::unordered_set<TreeId> s{t1, t3};
     EXPECT_EQ(s.size(), 2u);
-    // BlobId and TreeId must not be interchangeable: the next line must NOT compile if uncommented.
-    // TreeId t = b1;
+    // TreeId and RootNamespace must not be interchangeable: the next line must NOT compile if uncommented.
+    // RootNamespace ns = t1;
 }
 
 TEST(CasIds, HexU128RoundTrip)

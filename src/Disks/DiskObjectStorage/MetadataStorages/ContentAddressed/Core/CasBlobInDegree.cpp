@@ -50,13 +50,10 @@ UInt128 cityHash128(const String & bytes)
 class PriorEdgeCursor
 {
 public:
-    /// `out_codec` is the FOLD'S OUTPUT codec (Task 4): the load-bearing coherence gate. Every prior
-    /// run segment's own `key_schema` must equal `out_codec.keySchema()`, checked the moment the
-    /// segment is opened — BEFORE any row of that segment is parsed or compared. Cross-width raw-byte
-    /// comparison is unsafe (a schema-1 key puts `source_id` where a schema-2 key puts digest-suffix
-    /// bytes), so a mismatch throws `CORRUPTED_DATA` here rather than silently mis-merging.
-    PriorEdgeCursor(Backend & backend_, const std::vector<RunRef> & segments_, const SourceEdgeKeyCodec & out_codec_)
-        : backend(backend_), segments(segments_), out_codec(out_codec_)
+    /// Phase 3 T3: the codec is stateless (self-describing per-row via the algo byte), so there is no
+    /// per-segment width coherence gate anymore — a run may freely mix algos.
+    PriorEdgeCursor(Backend & backend_, const std::vector<RunRef> & segments_)
+        : backend(backend_), segments(segments_)
     {
         advance();
     }
@@ -82,12 +79,11 @@ public:
                 String p;
                 while (reader->next(k, p))
                 {
-                    BlobDigest bh;
+                    BlobRef bh;
                     UInt128 sid;
-                    /// `out_codec` is the fold's output codec; the segment-open check above already
-                    /// proved this segment's key_schema matches it, so every row is this codec's width.
-                    /// `parse` throws CORRUPTED_DATA on a malformed size (fail-closed).
-                    out_codec.parse(k, bh, sid);
+                    /// `parse` throws CORRUPTED_DATA on a malformed size / NOT_IMPLEMENTED on an
+                    /// unknown algo byte (fail-closed).
+                    SourceEdgeKeyCodec::parse(k, bh, sid);
                     if (p.empty())
                         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS source-edge run: empty row payload");
                     const char v = p[0];
@@ -138,22 +134,16 @@ public:
                 return;
             }
             /// Typed open (spec §2.1): every source-edge run reader goes through openSourceEdgeRun.
+            /// Phase 3 T3: `openSourceEdgeRun` validates only the run kind + the single schema
+            /// constant now — a mixed-algo run's segments never disagree on width (there is no
+            /// per-run width anymore), so there is no cross-width coherence gate to check here.
             reader = std::make_unique<RunFileReader>(openSourceEdgeRun(backend, segments[seg_idx].key));
-            /// THE LOAD-BEARING COHERENCE GATE (Task 4, consult finding 1 & 4): this segment's own
-            /// key_schema must match the fold's output schema, checked BEFORE any row of the segment
-            /// is read/parsed/compared. A schema-1 segment folded into a schema-2 output (or the
-            /// reverse) is refused here, not discovered later via a corrupted merge.
-            if (reader->keySchema() != out_codec.keySchema())
-                throw Exception(ErrorCodes::CORRUPTED_DATA,
-                    "CAS gc fold: prior source-edge run schema {} != output schema {} (cross-width "
-                    "merge refused)", reader->keySchema(), out_codec.keySchema());
         }
     }
 
 private:
     Backend & backend;
     const std::vector<RunRef> & segments;
-    const SourceEdgeKeyCodec & out_codec;
 
     size_t seg_idx = 0;
     std::unique_ptr<RunFileReader> reader;
@@ -165,7 +155,7 @@ private:
     /// Duplicate-sentinel guard: the last blob for which a sentinel row was seen (across skipped zero
     /// markers too). Rows are globally sorted, so two sentinels for one blob are adjacent.
     bool have_sentinel_blob = false;
-    BlobDigest sentinel_blob{};
+    BlobRef sentinel_blob{};
 };
 
 }
@@ -243,9 +233,12 @@ void assertSourceEdgeRunHeader(const RunFileReader & reader)
 {
     if (reader.kind() != RunKind::SourceEdge)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS source-edge run: wrong kind {}", static_cast<int>(reader.kind()));
-    /// Widened set (Task 4): key_schema ∈ {kSourceEdgeKeySchema128, kSourceEdgeKeySchemaSha256}; any
-    /// other value (including the pre-Task-4 unset 0) is NOT_IMPLEMENTED — sourceEdgeDigestLen throws.
-    sourceEdgeDigestLen(reader.keySchema());
+    /// Phase 3 T3: ONE self-describing schema — any other value (including the pre-Task-3 128/Sha256
+    /// schemas or the unset 0) is NOT_IMPLEMENTED, fail-closed.
+    if (reader.keySchema() != kSourceEdgeKeySchema)
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+            "CAS source-edge run: key_schema {} (this build supports only {})",
+            reader.keySchema(), kSourceEdgeKeySchema);
 }
 }
 
@@ -263,75 +256,62 @@ RunFileReader openSourceEdgeRun(Backend & backend, const String & key)
     return reader;
 }
 
-uint8_t sourceEdgeDigestLen(uint8_t key_schema)
-{
-    switch (key_schema)
-    {
-        case kSourceEdgeKeySchema128:
-            return 16;
-        case kSourceEdgeKeySchemaSha256:
-            return 32;
-        default:
-            throw Exception(ErrorCodes::NOT_IMPLEMENTED,
-                "CAS source-edge run: key_schema {} (this build supports {} and {})",
-                key_schema, kSourceEdgeKeySchema128, kSourceEdgeKeySchemaSha256);
-    }
-}
-
-uint8_t sourceEdgeKeySchemaFor(uint8_t digest_len)
-{
-    if (digest_len == 16)
-        return kSourceEdgeKeySchema128;
-    if (digest_len == 32)
-        return kSourceEdgeKeySchemaSha256;
-    throw Exception(ErrorCodes::NOT_IMPLEMENTED,
-        "CAS source-edge key codec: digest length {} bytes is not a supported source-edge key width "
-        "(16 or 32)", digest_len);
-}
-
-SourceEdgeKeyCodec::SourceEdgeKeyCodec(uint8_t digest_len_) : digest_len(digest_len_)
-{
-    /// Validates via sourceEdgeKeySchemaFor (throws NOT_IMPLEMENTED on an unsupported width) rather
-    /// than duplicating the 16/32 check — one authority for "is this a supported digest width".
-    sourceEdgeKeySchemaFor(digest_len);
-}
-
-SourceEdgeKeyCodec SourceEdgeKeyCodec::forSchema(uint8_t key_schema)
-{
-    return SourceEdgeKeyCodec(sourceEdgeDigestLen(key_schema));
-}
-
 namespace
 {
 /// len-drift guard (mirrors DigestCodec::checkZeroTail, CasBlobDigest.h): a caller passing a digest
-/// wider than this codec's width is a programming bug, not corrupted on-disk data — chassert, not throw.
-void checkZeroTailForCodec(const BlobDigest & d, uint8_t digest_len, [[maybe_unused]] const char * what)
+/// wider than the algo's own width is a programming bug, not corrupted on-disk data — chassert, not
+/// throw.
+void checkZeroTailForAlgo(const BlobDigest & d, uint8_t digest_len, [[maybe_unused]] const char * what)
 {
     for (size_t i = digest_len; i < d.bytes.size(); ++i)
         chassert(d.bytes[i] == 0, fmt::format("SourceEdgeKeyCodec::{}: non-zero byte at tail position {} (digest_len={})", what, i, digest_len));
 }
 }
 
-String SourceEdgeKeyCodec::key(const BlobDigest & blob_hash, const UInt128 & source_id) const
+String SourceEdgeKeyCodec::key(const BlobRef & ref, const UInt128 & source_id)
 {
-    checkZeroTailForCodec(blob_hash, digest_len, "key");
-    return String(reinterpret_cast<const char *>(blob_hash.bytes.data()), digest_len) + u128ToBytesBE(source_id);
+    const uint8_t digest_len = static_cast<uint8_t>(blobHashLenFor(ref.algo));
+    checkZeroTailForAlgo(ref.digest, digest_len, "key");
+    String out;
+    out.push_back(static_cast<char>(static_cast<uint8_t>(ref.algo)));
+    out += String(reinterpret_cast<const char *>(ref.digest.bytes.data()), digest_len);
+    out += u128ToBytesBE(source_id);
+    return out;
 }
 
-void SourceEdgeKeyCodec::parse(std::string_view key, BlobDigest & blob_hash, UInt128 & source_id) const
+void SourceEdgeKeyCodec::parse(std::string_view key, BlobRef & ref, UInt128 & source_id)
 {
-    if (key.size() != static_cast<size_t>(digest_len) + 16)
+    if (key.empty())
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS source-edge run: empty key");
+    const uint8_t algo_byte = static_cast<uint8_t>(key[0]);
+    BlobHashAlgo algo;
+    switch (algo_byte)
+    {
+        case static_cast<uint8_t>(BlobHashAlgo::CityHash128): algo = BlobHashAlgo::CityHash128; break;
+        case static_cast<uint8_t>(BlobHashAlgo::XXH3_128):    algo = BlobHashAlgo::XXH3_128; break;
+        case static_cast<uint8_t>(BlobHashAlgo::Sha256):      algo = BlobHashAlgo::Sha256; break;
+        default:
+            throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+                "CAS source-edge run: unknown algo byte {} in key", algo_byte);
+    }
+    const uint8_t digest_len = static_cast<uint8_t>(blobHashLenFor(algo));
+    if (key.size() != 1 + static_cast<size_t>(digest_len) + 16)
         throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "CAS source-edge run: malformed key ({} bytes, expected {})", key.size(), digest_len + 16);
-    blob_hash = BlobDigest{};
-    memcpy(blob_hash.bytes.data(), key.data(), digest_len);
-    source_id = u128FromBytesBE(String(key.substr(digest_len, 16)), "src-edge run key source_id");
+            "CAS source-edge run: malformed key ({} bytes, expected {})", key.size(), 1 + digest_len + 16);
+    ref = BlobRef{};
+    ref.algo = algo;
+    memcpy(ref.digest.bytes.data(), key.data() + 1, digest_len);
+    source_id = u128FromBytesBE(String(key.substr(1 + digest_len, 16)), "src-edge run key source_id");
 }
 
-String SourceEdgeKeyCodec::seekPrefix(const BlobDigest & blob_hash) const
+String SourceEdgeKeyCodec::seekPrefix(const BlobRef & ref)
 {
-    checkZeroTailForCodec(blob_hash, digest_len, "seekPrefix");
-    return String(reinterpret_cast<const char *>(blob_hash.bytes.data()), digest_len);
+    const uint8_t digest_len = static_cast<uint8_t>(blobHashLenFor(ref.algo));
+    checkZeroTailForAlgo(ref.digest, digest_len, "seekPrefix");
+    String out;
+    out.push_back(static_cast<char>(static_cast<uint8_t>(ref.algo)));
+    out += String(reinterpret_cast<const char *>(ref.digest.bytes.data()), digest_len);
+    return out;
 }
 
 void putDeterministicArtifact(Backend & backend, const String & key, const String & bytes)
@@ -353,39 +333,34 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
                               uint64_t shard,
                               std::vector<BlobDelta> scattered, std::vector<RunRef> & out_runs,
                               uint64_t current_round, uint64_t condemn_round,
-                              const std::function<std::optional<HeadResult>(const BlobDigest &)> & head_blob,
-                              const std::function<std::optional<HeadResult>(const BlobDigest &)> & peek_head,
+                              const std::function<std::optional<HeadResult>(const BlobRef &)> & head_blob,
+                              const std::function<std::optional<HeadResult>(const BlobRef &)> & peek_head,
                               RetiredMergeResult * out_retired,
-                              bool suppress_destructive,
-                              uint8_t digest_len)
+                              bool suppress_destructive)
 {
     RetiredMergeResult sink;
     RetiredMergeResult & rmr = out_retired ? *out_retired : sink;
 
-    /// ONE write codec for this fold, built from the OUTPUT width (Task 4). Every key build/parse
-    /// below — including the prior-run coherence gate inside `PriorEdgeCursor` — goes through it.
-    const SourceEdgeKeyCodec out_codec(digest_len);
-
     // Deterministic input ordering => byte-reproducible run (OQ5 resume/adoption).
-    // MUST be stable: for the same (blob_hash, source_id) the journal ordering is
+    // MUST be stable: for the same (ref, source_id) the journal ordering is
     // activation-before-removal; "last wins" then correctly resolves to removal (edge absent).
     // An unstable sort can put removal before activation => last=activation => false positive.
-    // BlobDigest's defaulted operator<=> is lexicographic over the 32-byte array, which for a
-    // WIDTH-HOMOGENEOUS run (every digest zero-tailed beyond digest_len) equals numeric magnitude
-    // order — bit-identical to the old UInt128 `<` for every 128-bit digest (design consult).
+    // The comparator is exactly (ref.algo, ref.digest, source_id) == BlobRef::operator< then
+    // source_id — the SAME order the raw keys sort in (Phase 3 T3: SourceEdgeKeyCodec::key's algo
+    // byte decides before any digest byte can), so the merge below stays a plain key comparison.
     std::stable_sort(scattered.begin(), scattered.end(),
         [](const BlobDelta & a, const BlobDelta & b)
         {
-            if (a.blob_hash != b.blob_hash) return a.blob_hash < b.blob_hash;
+            if (a.ref != b.ref) return a.ref < b.ref;
             return a.source_id < b.source_id;
         });
 
-    PriorEdgeCursor cursor(backend, prior_runs, out_codec);
+    PriorEdgeCursor cursor(backend, prior_runs);
 
     DB::WriteBufferFromOwnString out;
     RunHeader header;
     header.kind = RunKind::SourceEdge;
-    header.key_schema = out_codec.keySchema();   // (blob_hash, source_id) fixed-width + zero-sentinel rows
+    header.key_schema = kSourceEdgeKeySchema;   // self-describing (ref, source_id) rows + zero-sentinel rows
     RunFileWriter writer(out, header);
 
     // Streaming two-cursor merge over the prior run (surviving edges by 32-byte key AND retired kCondemned
@@ -395,17 +370,17 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
     // absent), settle each blob's carried retired row against its post-merge in-degree at close-out, and
     // re-emit the surviving retired rows / zero-transition markers. O(block) IO + O(1) per current blob.
     size_t di = 0;
-    BlobDigest cur_blob{};
+    BlobRef cur_blob{};
     bool have_blob = false;
     uint64_t cur_edges = 0;              // surviving edges of cur_blob so far
     bool cur_touched = false;            // cur_blob had prior edges or deltas this generation
     std::optional<CondemnedRow> cur_condemned;   // the retired sentinel carried on the prior run for cur_blob
 
-    auto toRetiredEntry = [](const BlobDigest & hash, const CondemnedRow & r) -> RetiredEntry
+    auto toRetiredEntry = [](const BlobRef & ref, const CondemnedRow & r) -> RetiredEntry
     {
         RetiredEntry e;
         e.kind = ObjectKind::Blob;
-        e.hash = hash;
+        e.ref = ref;
         e.token = r.token;
         e.size = r.size;
         e.condemn_round = r.condemn_round;
@@ -460,7 +435,7 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
         /// post-merge in-degree...
         if (cur_condemned)
         {
-            /// `RetiredEntry.hash` is a native `BlobDigest` (Phase 2 Task 5) — `cur_blob` passes straight
+            /// `RetiredEntry.ref` is a native `BlobRef` (Phase 3 T3) — `cur_blob` passes straight
             /// through, no narrowing shim.
             const RetiredEntry stale = toRetiredEntry(cur_blob, *cur_condemned);
             /// RESURRECT-REUPLOAD-ORPHAN: on a re-reference cycle (touched this window, net in-degree 0),
@@ -481,7 +456,7 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
                 {
                     RetiredEntry fresh;
                     fresh.kind = ObjectKind::Blob;
-                    fresh.hash = cur_blob;
+                    fresh.ref = cur_blob;
                     fresh.token = hr->token;
                     fresh.size = hr->size;
                     fresh.condemn_round = condemn_round;
@@ -504,7 +479,7 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
             {
                 RetiredEntry fresh;
                 fresh.kind = ObjectKind::Blob;
-                fresh.hash = cur_blob;
+                fresh.ref = cur_blob;
                 fresh.token = hr->token;
                 fresh.size = hr->size;
                 fresh.condemn_round = condemn_round;
@@ -520,12 +495,12 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
         /// sentinel now (its key sorts first for the blob, and no edge rows precede it) keeps the run
         /// sorted. `still_retired` therefore mirrors exactly the emitted `kCondemned` rows, in order.
         if (rmr.still_retired.size() > retired_before)
-            writer.append(out_codec.key(cur_blob, kZeroSourceId),
+            writer.append(SourceEdgeKeyCodec::key(cur_blob, kZeroSourceId),
                           encodeCondemnedRow(toCondemnedRow(rmr.still_retired.back())));
         else if (cur_edges == 0 && cur_touched)
-            writer.append(out_codec.key(cur_blob, kZeroSourceId), String(1, kZeroMarker));
+            writer.append(SourceEdgeKeyCodec::key(cur_blob, kZeroSourceId), String(1, kZeroMarker));
     };
-    auto openBlobIfNeeded = [&](const BlobDigest & b)
+    auto openBlobIfNeeded = [&](const BlobRef & b)
     {
         if (!have_blob || b != cur_blob)
         {
@@ -542,14 +517,14 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
         if (cursor.valid()) { key = cursor.key(); from_prior = true; }
         if (di < scattered.size())
         {
-            const String dk = out_codec.key(scattered[di].blob_hash, scattered[di].source_id);
+            const String dk = SourceEdgeKeyCodec::key(scattered[di].ref, scattered[di].source_id);
             if (!from_prior || dk < key) { key = dk; from_prior = false; }
         }
 
-        BlobDigest blob_hash;
+        BlobRef blob_ref;
         UInt128 source_id;
-        out_codec.parse(key, blob_hash, source_id);   // throws CORRUPTED_DATA on a malformed key (fail-closed)
-        openBlobIfNeeded(blob_hash);
+        SourceEdgeKeyCodec::parse(key, blob_ref, source_id);   // throws CORRUPTED_DATA on a malformed key (fail-closed)
+        openBlobIfNeeded(blob_ref);
 
         /// A retired sentinel row from the prior run: stash it for close-out settlement. It is NOT an edge
         /// and NEVER a touch — a carried kCondemned row must not force a zero-marker or a peek_head HEAD
@@ -564,7 +539,7 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
         bool present = false;
         if (from_prior && cursor.key() == key) { present = true; cursor.advance(); cur_touched = true; }
         while (di < scattered.size()
-               && scattered[di].blob_hash == blob_hash && scattered[di].source_id == source_id)
+               && scattered[di].ref == blob_ref && scattered[di].source_id == source_id)
         {
             present = scattered[di].remove ? false : true;   // apply in order; last wins
             cur_touched = true;
@@ -597,25 +572,22 @@ std::vector<BlobCandidate> zeroInDegree(Backend & backend, const std::vector<Run
         /// streamed at O(one block) resident memory, never materialized whole. `openSourceEdgeRun` enforces
         /// the run kind + key schema; `kCondemned` sentinel rows are skipped (only `kZeroMarker` counts).
         RunFileReader r = openSourceEdgeRun(backend, run.key);
-        /// Readers derive width from the run's OWN key_schema — never from pool meta (Task 4): a run
-        /// is decoded by its own header.
-        const SourceEdgeKeyCodec codec = SourceEdgeKeyCodec::forSchema(r.keySchema());
         String k, p;
         while (r.next(k, p))
             if (!p.empty() && p[0] == kZeroMarker)
             {
-                BlobDigest bh;
+                BlobRef bh;
                 UInt128 sid;
                 /// `parse` throws CORRUPTED_DATA on a malformed key — fail-closed (Task 4 consult
                 /// finding 5): the pre-Task-4 code silently skipped a malformed row here instead.
-                codec.parse(k, bh, sid);
-                result.push_back(BlobCandidate{.hash = bh});
+                SourceEdgeKeyCodec::parse(k, bh, sid);
+                result.push_back(BlobCandidate{.ref = bh});
             }
     }
     return result;
 }
 
-int64_t inDegreeInGeneration(Backend & backend, const std::vector<RunRef> & runs, const BlobDigest & blob_hash)
+int64_t inDegreeInGeneration(Backend & backend, const std::vector<RunRef> & runs, const BlobRef & ref)
 {
     int64_t count = 0;
     for (const RunRef & run : runs)
@@ -625,16 +597,14 @@ int64_t inDegreeInGeneration(Backend & backend, const std::vector<RunRef> & runs
         /// whole-run buffer. `openSourceEdgeRun` enforces the run kind + key schema; only `kEdgeActive`
         /// rows count (the blob's `kCondemned` / `kZeroMarker` sentinel rows are not in-degree).
         RunFileReader r = openSourceEdgeRun(backend, run.key);
-        /// Readers derive width from the run's OWN key_schema — never from pool meta (Task 4).
-        const SourceEdgeKeyCodec codec = SourceEdgeKeyCodec::forSchema(r.keySchema());
-        r.seek(codec.seekPrefix(blob_hash));   // sparse-index skip to this blob's edges
+        r.seek(SourceEdgeKeyCodec::seekPrefix(ref));   // sparse-index skip to this blob's edges
         String k, p;
         while (r.next(k, p))
         {
-            BlobDigest bh;
+            BlobRef bh;
             UInt128 sid;
-            codec.parse(k, bh, sid);   // throws CORRUPTED_DATA on a malformed key (fail-closed)
-            if (bh != blob_hash)
+            SourceEdgeKeyCodec::parse(k, bh, sid);   // throws CORRUPTED_DATA on a malformed key (fail-closed)
+            if (bh != ref)
                 break;   // past this blob
             if (!p.empty() && p[0] == kEdgeActive) ++count;
         }

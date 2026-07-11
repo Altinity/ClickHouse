@@ -449,7 +449,7 @@ TEST(CasS3Staging, PromoteViaServerSideCopyCreatesFreshBlobTokenedDep)
     const std::string ref = "part_a";
 
     const DB::UInt128 hash = DB::Cas::tests::u128Of("payload-A");
-    const DB::Cas::BlobId blob_id{DB::Cas::u128ToHex(hash)};
+    const DB::Cas::BlobRef blob_id{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(hash)};
     const std::string blob_key = store->layout().blobKey(blob_id);
     const std::string staging_key = "p/staging/mount1/aaa.tmp";
     const std::string payload(300, 'a');
@@ -489,7 +489,7 @@ TEST(CasS3Staging, PromoteOverExistingCleanBlobAdoptsAndNeverOverwrites)
     const std::string ref = "part_b";
 
     const DB::UInt128 hash = DB::Cas::tests::u128Of("payload-B");
-    const DB::Cas::BlobId blob_id{DB::Cas::u128ToHex(hash)};
+    const DB::Cas::BlobRef blob_id{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(hash)};
     const std::string blob_key = store->layout().blobKey(blob_id);
     const std::string staging_key = "p/staging/mount1/bbb.tmp";
     backend->putIfAbsent(staging_key, std::string(300, 'b'));
@@ -529,7 +529,7 @@ TEST(CasS3Staging, PromoteOverCondemnedBlobResurrectsWithFreshTagNotVerbatim)
     const std::string ref = "part_c";
 
     const DB::UInt128 hash = DB::Cas::tests::u128Of("payload-C");
-    const DB::Cas::BlobId blob_id{DB::Cas::u128ToHex(hash)};
+    const DB::Cas::BlobRef blob_id{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(hash)};
     const std::string blob_key = store->layout().blobKey(blob_id);
     const std::string staging_key = "p/staging/mount1/ccc.tmp";
     const std::string payload(300, 'c');

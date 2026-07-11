@@ -136,7 +136,7 @@ TEST(CaDedupCache, StaleHitFallsThroughToPut)
     EXPECT_EQ(ref.size, 5u);
     EXPECT_GE(counting->heads, 1u);                        /// the safety HEAD ran
     EXPECT_EQ(counting->stream_puts, 1u);                  /// and the body was actually uploaded
-    EXPECT_TRUE(counting->head(s->layout().blobKey(ref.id)).exists);
+    EXPECT_TRUE(counting->head(s->layout().blobKey(ref.ref)).exists);
 }
 
 /// Task 5 (P2): on a cold cache, a body at/above dedup_head_first_min_bytes still probes HEAD-first

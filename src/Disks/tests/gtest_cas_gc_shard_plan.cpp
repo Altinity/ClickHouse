@@ -38,7 +38,7 @@ TEST(CasGcShardScatter, DeterministicAndStable)
     /// A fixed hash — the same bytes every run. blobShard must return the same value twice,
     /// must be strictly less than gc_shards=4, and must be 0 when gc_shards=1.
     const UInt128 h = hexToU128("0102030405060708090a0b0c0d0e0f10");
-    const BlobDigest hd = BlobDigest::fromU128(h);
+    const BlobRef hd{BlobHashAlgo::CityHash128, BlobDigest::fromU128(h)};
 
     const uint64_t s4a = blobShard(hd, 4);
     const uint64_t s4b = blobShard(hd, 4);
@@ -61,7 +61,7 @@ TEST(CasGcShardScatter, DisjointCoverageOverManyHashes)
         /// Spread: use i in the high and low halves to avoid clustering.
         const UInt128 h = (static_cast<UInt128>(i * 0x9e3779b97f4a7c15ULL) << 64)
                         | static_cast<UInt128>(i * 0x6c62272e07bb0142ULL);
-        const uint64_t s = blobShard(BlobDigest::fromU128(h), kShards);
+        const uint64_t s = blobShard(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(h)}, kShards);
         ASSERT_LT(s, kShards) << "blobShard out of range at i=" << i;
         seen[s] = true;
     }
@@ -74,14 +74,15 @@ TEST(CasGcShardScatter, DisjointCoverageOverManyHashes)
 
 /// Build two blob hashes that route to DIFFERENT shards under gc_shards=2.
 /// Returns {hash_for_shard0, hash_for_shard1}.
-static std::pair<BlobDigest, BlobDigest> makeTwoShardHashes()
+static std::pair<BlobRef, BlobRef> makeTwoShardHashes()
 {
     /// Scan pairs (i, j): find hash_a -> shard 0, hash_b -> shard 1 under gc_shards=2.
     /// We construct candidates by setting the high 64 bits and leaving the low 64 bits zero
     /// so blobShard = high64 % 2.  i=0 => shard 0, i=1 => shard 1.
     const UInt128 h0 = static_cast<UInt128>(0ULL) << 64;   /// high64=0 => shard 0
     const UInt128 h1 = static_cast<UInt128>(1ULL) << 64;   /// high64=1 => shard 1
-    return {BlobDigest::fromU128(h0), BlobDigest::fromU128(h1)};
+    return {BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(h0)},
+            BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(h1)}};
 }
 
 /// `ShardReducer::reduce` merges deltas into the correct per-shard in-degree run.
@@ -102,12 +103,12 @@ TEST(CasGcShardReducer, MergesDeltasToInDegree)
     /// b2 shard=1: source 3 activates => 1 active edge
     std::vector<std::vector<BlobDelta>> buckets(2);
     buckets[0] = {
-        BlobDelta{.blob_hash = b1, .source_id = UInt128(1), .remove = false},
-        BlobDelta{.blob_hash = b1, .source_id = UInt128(2), .remove = false},
-        BlobDelta{.blob_hash = b1, .source_id = UInt128(1), .remove = true},
+        BlobDelta{.ref = b1, .source_id = UInt128(1), .remove = false},
+        BlobDelta{.ref = b1, .source_id = UInt128(2), .remove = false},
+        BlobDelta{.ref = b1, .source_id = UInt128(1), .remove = true},
     };
     buckets[1] = {
-        BlobDelta{.blob_hash = b2, .source_id = UInt128(3), .remove = false},
+        BlobDelta{.ref = b2, .source_id = UInt128(3), .remove = false},
     };
 
     /// Verify bucket net effects (source 2 survives for b1; source 3 survives for b2).
@@ -115,14 +116,14 @@ TEST(CasGcShardReducer, MergesDeltasToInDegree)
     {
         int64_t net_b1 = 0;
         for (const auto & d : buckets[0])
-            if (d.blob_hash == b1)
+            if (d.ref == b1)
                 net_b1 += d.remove ? -1 : +1;
         EXPECT_EQ(net_b1, 1) << "shard-0 bucket net delta for b1 must be +1";
     }
     {
         int64_t net_b2 = 0;
         for (const auto & d : buckets[1])
-            if (d.blob_hash == b2)
+            if (d.ref == b2)
                 net_b2 += d.remove ? -1 : +1;
         EXPECT_EQ(net_b2, 1) << "shard-1 bucket net delta for b2 must be +1";
     }
@@ -177,8 +178,9 @@ TEST(CasGcShardReducer, TwoReducersCoverDisjointShards)
     {
         const UInt128 h = (static_cast<UInt128>(i * 0x9e3779b97f4a7c15ULL) << 64)
                         | static_cast<UInt128>(i * 0x6c62272e07bb0142ULL);
-        const bool o0 = r0.owns(BlobDigest::fromU128(h));
-        const bool o1 = r1.owns(BlobDigest::fromU128(h));
+        const BlobRef href{BlobHashAlgo::CityHash128, BlobDigest::fromU128(h)};
+        const bool o0 = r0.owns(href);
+        const bool o1 = r1.owns(href);
 
         /// Exactly one of the two reducers must own every hash.
         ASSERT_TRUE(o0 || o1)
@@ -308,16 +310,16 @@ TEST(CasGcShardCoordinator, ShardedFoldRoutesDeltasToOwningShards)
 
     /// A flat delta stream as produced by `foldManifestEdges`: b0 net +1 (two +1, one -1), b1 net +1.
     std::vector<BlobDelta> deltas{
-        BlobDelta{.blob_hash = b0, .source_id = UInt128(1), .remove = false},
-        BlobDelta{.blob_hash = b1, .source_id = UInt128(2), .remove = false},
-        BlobDelta{.blob_hash = b0, .source_id = UInt128(3), .remove = false},
-        BlobDelta{.blob_hash = b0, .source_id = UInt128(1), .remove = true},
+        BlobDelta{.ref = b0, .source_id = UInt128(1), .remove = false},
+        BlobDelta{.ref = b1, .source_id = UInt128(2), .remove = false},
+        BlobDelta{.ref = b0, .source_id = UInt128(3), .remove = false},
+        BlobDelta{.ref = b0, .source_id = UInt128(1), .remove = true},
     };
 
     /// Partition by blobShard — the exact step the sharded fold runs before reducing.
     std::vector<std::vector<BlobDelta>> buckets(kGcShards);
     for (BlobDelta & d : deltas)
-        buckets[blobShard(d.blob_hash, kGcShards)].push_back(d);
+        buckets[blobShard(d.ref, kGcShards)].push_back(d);
 
     auto backend = std::make_shared<InMemoryBackend>();
     const Layout layout("p");
@@ -363,12 +365,15 @@ TEST(CasGcShardEquivalence, SingleShardMatchesPhase1dInDegree)
     const UInt128 hB = static_cast<UInt128>(2ULL) << 64;   /// high64=2, routes to shard 0
     const UInt128 hC = static_cast<UInt128>(4ULL) << 64;   /// high64=4, routes to shard 0
 
-    ASSERT_EQ(blobShard(BlobDigest::fromU128(hA), 2), 0u) << "hA must route to shard 0 under gc_shards=2";
-    ASSERT_EQ(blobShard(BlobDigest::fromU128(hB), 2), 0u) << "hB must route to shard 0 under gc_shards=2";
-    ASSERT_EQ(blobShard(BlobDigest::fromU128(hC), 2), 0u) << "hC must route to shard 0 under gc_shards=2";
-    ASSERT_EQ(blobShard(BlobDigest::fromU128(hA), 1), 0u) << "hA must route to shard 0 under gc_shards=1";
-    ASSERT_EQ(blobShard(BlobDigest::fromU128(hB), 1), 0u) << "hB must route to shard 0 under gc_shards=1";
-    ASSERT_EQ(blobShard(BlobDigest::fromU128(hC), 1), 0u) << "hC must route to shard 0 under gc_shards=1";
+    const BlobRef refA{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hA)};
+    const BlobRef refB{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hB)};
+    const BlobRef refC{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hC)};
+    ASSERT_EQ(blobShard(refA, 2), 0u) << "hA must route to shard 0 under gc_shards=2";
+    ASSERT_EQ(blobShard(refB, 2), 0u) << "hB must route to shard 0 under gc_shards=2";
+    ASSERT_EQ(blobShard(refC, 2), 0u) << "hC must route to shard 0 under gc_shards=2";
+    ASSERT_EQ(blobShard(refA, 1), 0u) << "hA must route to shard 0 under gc_shards=1";
+    ASSERT_EQ(blobShard(refB, 1), 0u) << "hB must route to shard 0 under gc_shards=1";
+    ASSERT_EQ(blobShard(refC, 1), 0u) << "hC must route to shard 0 under gc_shards=1";
 
     /// Construct the journal: hA gets net +2 (published twice), hB gets net +1, hC gets net 0 (publish
     /// then drop => transitions to zero). This exercises all three outcomes (>1, =1, =0) for the
@@ -422,9 +427,9 @@ TEST(CasGcShardEquivalence, SingleShardMatchesPhase1dInDegree)
         /// generation is snap_generation - 1 for the first full round. Use inDegreeOf (which reads
         /// currentGenerationOf = completion generation) for the final in-degrees.
         const std::vector<RunRef> shard0 = runsForShard(*backend, layout, /*shard=*/0);
-        const int64_t iA = inDegreeInGeneration(*backend, shard0, BlobDigest::fromU128(hA));
-        const int64_t iB = inDegreeInGeneration(*backend, shard0, BlobDigest::fromU128(hB));
-        const int64_t iC = inDegreeInGeneration(*backend, shard0, BlobDigest::fromU128(hC));
+        const int64_t iA = inDegreeInGeneration(*backend, shard0, refA);
+        const int64_t iB = inDegreeInGeneration(*backend, shard0, refB);
+        const int64_t iC = inDegreeInGeneration(*backend, shard0, refC);
         return {iA, iB, iC};
     };
 
@@ -489,11 +494,11 @@ TEST(CasGcShardTwoReplica, DisjointShardsConcurrentPerShardRuns)
     /// (two distinct manifests both referencing b0 contribute two source edges; one manifest
     /// referencing b1 contributes one source edge).
     std::vector<BlobDelta> bucket0 = {
-        BlobDelta{.blob_hash = b0, .source_id = UInt128(1), .remove = false},
-        BlobDelta{.blob_hash = b0, .source_id = UInt128(2), .remove = false},
+        BlobDelta{.ref = b0, .source_id = UInt128(1), .remove = false},
+        BlobDelta{.ref = b0, .source_id = UInt128(2), .remove = false},
     };
     std::vector<BlobDelta> bucket1 = {
-        BlobDelta{.blob_hash = b1, .source_id = UInt128(3), .remove = false},
+        BlobDelta{.ref = b1, .source_id = UInt128(3), .remove = false},
     };
 
     /// (b) PER-SHARD RUNS — drive both reducers.
@@ -553,8 +558,8 @@ TEST(CasGcShardRetireDrain, ReclaimsDroppableBlobOwnedByNonZeroShard)
     /// high64=0 => shard 0; high64=1 => shard 1.
     const UInt128 blob_shard0 = (static_cast<UInt128>(0ULL) << 64) | static_cast<UInt128>(7ULL); /// high64=0 => shard 0
     const UInt128 blob_shard1 = (static_cast<UInt128>(1ULL) << 64) | static_cast<UInt128>(7ULL); /// high64=1 => shard 1
-    ASSERT_EQ(blobShard(BlobDigest::fromU128(blob_shard0), kGcShards), 0u) << "blob_shard0 must route to shard 0";
-    ASSERT_EQ(blobShard(BlobDigest::fromU128(blob_shard1), kGcShards), 1u) << "blob_shard1 must route to shard 1 (regression teeth)";
+    ASSERT_EQ(blobShard(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(blob_shard0)}, kGcShards), 0u) << "blob_shard0 must route to shard 0";
+    ASSERT_EQ(blobShard(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(blob_shard1)}, kGcShards), 1u) << "blob_shard1 must route to shard 1 (regression teeth)";
 
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1,
@@ -570,7 +575,7 @@ TEST(CasGcShardRetireDrain, ReclaimsDroppableBlobOwnedByNonZeroShard)
     /// Local blobExists (the round-level helper is file-local to gtest_cas_gc_round.cpp).
     auto blobExists = [&](const UInt128 & hash)
     {
-        return backend->head(layout.blobKey(BlobId(u128ToHex(hash)))).exists;
+        return backend->head(layout.blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hash)})).exists;
     };
     auto manifestExists = [&](const ManifestId & id)
     {
@@ -619,9 +624,9 @@ TEST(CasGcShardRetireDrain, ReclaimsDroppableBlobOwnedByNonZeroShard)
     const GcState live = decodeGcState(backend->get(layout.gcStateKey())->bytes);
     ASSERT_GT(live.snap_generation, 0u);
     ASSERT_EQ(live.gc_shards, kGcShards) << "the pool must be running with gc_shards=2";
-    EXPECT_EQ(inDegreeInGeneration(*backend, runsForShard(*backend, layout, /*shard=*/0), BlobDigest::fromU128(blob_shard0)), 1)
+    EXPECT_EQ(inDegreeInGeneration(*backend, runsForShard(*backend, layout, /*shard=*/0), BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(blob_shard0)}), 1)
         << "shard-0 blob in-degree must be 1 while live";
-    EXPECT_EQ(inDegreeInGeneration(*backend, runsForShard(*backend, layout, /*shard=*/1), BlobDigest::fromU128(blob_shard1)), 1)
+    EXPECT_EQ(inDegreeInGeneration(*backend, runsForShard(*backend, layout, /*shard=*/1), BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(blob_shard1)}), 1)
         << "shard-1 blob in-degree must be 1 while live";
     EXPECT_TRUE(blobExists(blob_shard0));
     EXPECT_TRUE(blobExists(blob_shard1));
@@ -634,9 +639,9 @@ TEST(CasGcShardRetireDrain, ReclaimsDroppableBlobOwnedByNonZeroShard)
     /// After drop + fixpoint: BOTH blobs are retired and exact-token deleted, and BOTH owner-removed
     /// manifest bodies are collected. The shard-1 blob is the regression's teeth — pre-`5f5fa5f` it
     /// would still exist here because retire/previewDeletes never scanned shard 1.
-    EXPECT_EQ(inDegreeInGeneration(*backend, runsForShard(*backend, layout, /*shard=*/0), BlobDigest::fromU128(blob_shard0)), 0)
+    EXPECT_EQ(inDegreeInGeneration(*backend, runsForShard(*backend, layout, /*shard=*/0), BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(blob_shard0)}), 0)
         << "shard-0 blob in-degree must be 0 after drop";
-    EXPECT_EQ(inDegreeInGeneration(*backend, runsForShard(*backend, layout, /*shard=*/1), BlobDigest::fromU128(blob_shard1)), 0)
+    EXPECT_EQ(inDegreeInGeneration(*backend, runsForShard(*backend, layout, /*shard=*/1), BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(blob_shard1)}), 0)
         << "shard-1 blob in-degree must be 0 after drop";
     EXPECT_FALSE(blobExists(blob_shard0)) << "shard-0 droppable blob must be reclaimed";
     EXPECT_FALSE(blobExists(blob_shard1))

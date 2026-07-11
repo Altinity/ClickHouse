@@ -106,19 +106,19 @@ inline DB::UInt128 u128Of(const String & bytes)
     return DB::Cas::hexToU128(hexOf(bytes));
 }
 
-/// The content id of `bytes` as a strong BlobId.
-inline DB::Cas::BlobId idOf(const String & bytes)
+/// The content id of `bytes` as a `BlobRef` (CityHash128 — every test pool's default write algo).
+inline DB::Cas::BlobRef idOf(const String & bytes)
 {
-    return DB::Cas::BlobId(hexOf(bytes));
+    return DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(u128Of(bytes))};
 }
 
 /// Write a Blob object: a fixed-length (pad_to_header_len = blob_header_len) envelope followed by the
 /// raw payload, keyed by content. Mirrors what Build::putBlob will emit (Task 11).
-inline DB::Cas::BlobId writeBlobRaw(
+inline DB::Cas::BlobRef writeBlobRaw(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const String & payload,
     uint64_t blob_header_len, const DB::UInt128 & domain_id)
 {
-    const DB::Cas::BlobId id = idOf(payload);
+    const DB::Cas::BlobRef id = idOf(payload);
 
     DB::Cas::EnvelopeHeader header;
     header.kind = DB::Cas::ObjectKind::Blob;
@@ -327,18 +327,18 @@ inline void injectRetire(
         const uint64_t generation = 1;
         const uint64_t attempt = 1;
         uint64_t condemn_round = round;
-        std::unordered_map<DB::Cas::BlobDigest, DB::Cas::HeadResult, DB::Cas::BlobDigestHash> seeded;
+        std::unordered_map<DB::Cas::BlobRef, DB::Cas::HeadResult, DB::Cas::BlobRefHash> seeded;
         std::vector<DB::Cas::BlobDelta> synth;
         synth.reserve(entries.size() * 2);
         for (const DB::Cas::RetiredEntry & e : entries)
         {
             if (e.condemn_round)
                 condemn_round = e.condemn_round;
-            seeded.emplace(e.hash, DB::Cas::HeadResult{.exists = true, .size = e.size, .token = e.token, .attributes = {}});
-            synth.push_back(DB::Cas::BlobDelta{.blob_hash = e.hash, .source_id = DB::UInt128{1}, .remove = false});
-            synth.push_back(DB::Cas::BlobDelta{.blob_hash = e.hash, .source_id = DB::UInt128{1}, .remove = true});
+            seeded.emplace(e.ref, DB::Cas::HeadResult{.exists = true, .size = e.size, .token = e.token, .attributes = {}});
+            synth.push_back(DB::Cas::BlobDelta{.ref = e.ref, .source_id = DB::UInt128{1}, .remove = false});
+            synth.push_back(DB::Cas::BlobDelta{.ref = e.ref, .source_id = DB::UInt128{1}, .remove = true});
         }
-        const auto seed_head = [&seeded](const DB::Cas::BlobDigest & h) -> std::optional<DB::Cas::HeadResult>
+        const auto seed_head = [&seeded](const DB::Cas::BlobRef & h) -> std::optional<DB::Cas::HeadResult>
         {
             const auto it = seeded.find(h);
             return it == seeded.end() ? std::nullopt : std::optional<DB::Cas::HeadResult>(it->second);
@@ -415,7 +415,7 @@ inline void injectCondemnedSummarySeal(
 /// Whether blob `hash` is absent from the backend (its exact-token content object is gone).
 inline bool blobAbsent(DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::UInt128 & hash)
 {
-    return !backend.head(layout.blobKey(DB::Cas::BlobId(DB::Cas::u128ToHex(hash)))).exists;
+    return !backend.head(layout.blobKey(DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(hash)})).exists;
 }
 
 /// Reclaim loop (the canonical retired-cursor pipeline driver): run regular rounds, renewing the store's
@@ -463,21 +463,18 @@ inline std::vector<DB::Cas::RetiredEntry> currentRetiredSet(
         if (run.shard != shard)
             continue;
         DB::Cas::RunFileReader r = DB::Cas::openSourceEdgeRun(backend, run.key);
-        /// Readers derive width from the run's OWN key_schema — never from pool meta (Task 4).
-        const DB::Cas::SourceEdgeKeyCodec codec = DB::Cas::SourceEdgeKeyCodec::forSchema(r.keySchema());
         String k, p;
         while (r.next(k, p))
         {
             if (p.empty() || p[0] != DB::Cas::kCondemned)
                 continue;
-            DB::Cas::BlobDigest blob_hash_digest;
+            DB::Cas::BlobRef ref;
             DB::UInt128 source_id{};
-            codec.parse(k, blob_hash_digest, source_id);   // throws CORRUPTED_DATA on malformed (fail-closed)
-            /// `RetiredEntry.hash` is a native `BlobDigest` (Phase 2 Task 5) — no narrowing shim.
+            DB::Cas::SourceEdgeKeyCodec::parse(k, ref, source_id);   // throws CORRUPTED_DATA on malformed (fail-closed)
             const DB::Cas::CondemnedRow row = DB::Cas::decodeCondemnedRow(p);
             out.push_back(DB::Cas::RetiredEntry{
                 .kind = DB::Cas::ObjectKind::Blob,
-                .hash = blob_hash_digest,
+                .ref = ref,
                 .token = row.token,
                 .size = row.size,
                 .condemn_round = row.condemn_round,
@@ -556,7 +553,7 @@ inline DB::Cas::Token displaceObjectToken(
 }
 
 inline DB::Cas::Token displaceBlobToken(
-    DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::BlobId & id)
+    DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::BlobRef & id)
 {
     return displaceObjectToken(backend, layout.blobKey(id), DB::Cas::ObjectKind::Blob);
 }
@@ -604,7 +601,7 @@ inline void writeBlobBody(
     header.build_id = DB::UInt128(0x5678);
     header.pad_to_header_len = static_cast<uint32_t>(blob_header_len);
     const String head = DB::Cas::encodeEnvelopeHeader(header);
-    backend.putIfAbsent(layout.blobKey(DB::Cas::BlobId(DB::Cas::u128ToHex(hash))), head + String("x"));
+    backend.putIfAbsent(layout.blobKey(DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(hash)}), head + String("x"));
 }
 
 /// Write a raw blob body (payload written verbatim, no envelope) — the raw-body-refinement shape
@@ -612,25 +609,23 @@ inline void writeBlobBody(
 inline void writeRawBlobBody(DB::Cas::Backend & backend, const DB::Cas::Layout & layout,
                              const DB::UInt128 & hash, const String & payload)
 {
-    backend.casPut(layout.blobKey(DB::Cas::BlobId(DB::Cas::u128ToHex(hash))), payload, std::nullopt);
+    backend.casPut(layout.blobKey(DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(hash)}), payload, std::nullopt);
 }
 
-/// These `UInt128`-hash meta-op wrappers are the pre-T5 128-bit-only test convenience surface: every
-/// existing caller operates on a 128-bit (`cityHash128`/`xxh3-128`) test pool, so the codec is fixed
-/// at width 16 here — NOT derived from a real pool (these helpers take only `Backend&, Layout&`, no
-/// `PoolMeta`). A test that needs a sha256/32-byte pool calls the `.meta` API directly with its own
-/// pool-scoped `DigestCodec`, never through these wrappers.
-inline const DB::Cas::DigestCodec & legacyMetaTestCodec()
+/// These `UInt128`-hash meta-op wrappers are the pre-mixed-algo 128-bit-only test convenience surface:
+/// every existing caller operates on a 128-bit (`cityHash128`) test pool, so the ref is built at
+/// `CityHash128` here. The shared `.meta` API (Phase 3 T3) is `BlobRef`-keyed directly and derives its
+/// own codec internally — no codec is threaded from here anymore.
+inline DB::Cas::BlobRef legacyMetaTestRef(const DB::UInt128 & hash)
 {
-    static const DB::Cas::DigestCodec codec(16);
-    return codec;
+    return DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(hash)};
 }
 
 /// Create a Clean meta descriptor for `hash` via the shared meta-ops layer (putMetaIfAbsent).
 inline void writeMetaClean(DB::Cas::Backend & backend, const DB::Cas::Layout & layout,
                            const DB::UInt128 & hash, uint64_t size)
 {
-    DB::Cas::putMetaIfAbsent(backend, layout, legacyMetaTestCodec(), DB::Cas::BlobDigest::fromU128(hash),
+    DB::Cas::putMetaIfAbsent(backend, layout, legacyMetaTestRef(hash),
         DB::Cas::BlobMeta{.state = DB::Cas::MetaState::Clean, .condemn_round = 0, .size = size});
 }
 
@@ -639,19 +634,19 @@ inline void writeMetaClean(DB::Cas::Backend & backend, const DB::Cas::Layout & l
 inline void condemnMeta(DB::Cas::Backend & backend, const DB::Cas::Layout & layout,
                         const DB::UInt128 & hash, uint64_t condemn_round)
 {
-    const auto lm = DB::Cas::loadMeta(backend, layout, legacyMetaTestCodec(), DB::Cas::BlobDigest::fromU128(hash));
+    const auto lm = DB::Cas::loadMeta(backend, layout, legacyMetaTestRef(hash));
     ASSERT_TRUE(lm.has_value());
     DB::Cas::BlobMeta c = lm->meta;
     c.state = DB::Cas::MetaState::Condemned;
     c.condemn_round = condemn_round;
-    DB::Cas::casMeta(backend, layout, legacyMetaTestCodec(), DB::Cas::BlobDigest::fromU128(hash), lm->etag, c);
+    DB::Cas::casMeta(backend, layout, legacyMetaTestRef(hash), lm->etag, c);
 }
 
 /// Load the meta descriptor for `hash` via the shared ops layer (nullopt = absent).
 inline std::optional<DB::Cas::LoadedMeta> loadMetaForTest(DB::Cas::Backend & backend,
                                                           const DB::Cas::Layout & layout, const DB::UInt128 & hash)
 {
-    return DB::Cas::loadMeta(backend, layout, legacyMetaTestCodec(), DB::Cas::BlobDigest::fromU128(hash));
+    return DB::Cas::loadMeta(backend, layout, legacyMetaTestRef(hash));
 }
 
 /// The latest GC generation (snap_generation pointer in gc/state), or 0 when absent.
@@ -700,7 +695,7 @@ inline std::vector<DB::Cas::RunRef> runsForShard(
 inline int64_t inDegreeOf(DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::UInt128 & hash)
 {
     return DB::Cas::inDegreeInGeneration(backend, runsForShard(backend, layout, /*shard*/0),
-                                         DB::Cas::BlobDigest::fromU128(hash));
+                                         legacyMetaTestRef(hash));
 }
 
 /// The cursor key "ns/shard" — matches CasGcCursorKey::cursorKey.

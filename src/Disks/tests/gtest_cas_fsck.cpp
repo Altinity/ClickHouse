@@ -322,7 +322,7 @@ TEST(CasFsck, PhantomDanglingFromRepublishedRefIsReresolvedAway)
         writeManifestRaw(*backend, store->layout(), ns, r2, {blobEntryFor("a", h2)});
         publishCommittedTransition(*backend, store->layout(), ns, "tbl", r1, r2);   /// re-publish
 
-        const String old_key = store->layout().blobKey(BlobId(u128ToHex(h1)));
+        const String old_key = store->layout().blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(h1)});
         const HeadResult head = backend->head(old_key);
         ASSERT_TRUE(head.exists);
         backend->deleteExact(old_key, head.token);   /// legitimate GC delete of the now-unreferenced blob
@@ -351,7 +351,7 @@ TEST(CasFsck, PhantomDanglingFromDroppedRefIsReresolvedAway)
     {
         dropRefTransition(*backend, store->layout(), ns, "tbl", r1);   /// ref dropped since the walk
 
-        const String old_key = store->layout().blobKey(BlobId(u128ToHex(h1)));
+        const String old_key = store->layout().blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(h1)});
         const HeadResult head = backend->head(old_key);
         ASSERT_TRUE(head.exists);
         backend->deleteExact(old_key, head.token);   /// legitimate GC delete after the drop folds
@@ -377,7 +377,7 @@ TEST(CasFsck, RealDanglingStillCaughtAfterReresolve)
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", h)});
     publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
 
-    const String key = store->layout().blobKey(BlobId(u128ToHex(h)));
+    const String key = store->layout().blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(h)});
     const HeadResult head = backend->head(key);
     ASSERT_TRUE(head.exists);
     backend->deleteExact(key, head.token);   /// genuine loss — the ref is UNCHANGED, still names this blob

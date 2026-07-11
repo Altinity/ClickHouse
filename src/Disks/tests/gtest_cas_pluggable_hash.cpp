@@ -224,9 +224,9 @@ TEST(CasPluggableHash, StoreWithXxh3AlgoStampsEnvelopeHashAlgo)
 
     auto build = store->startBuild({});
     const std::string payload = "hello xxh3 world";
-    auto ref = build->putBlob(BlobId{blobHashHexOneShot(BlobHashAlgo::XXH3_128, payload)}, BlobSource::fromString(payload));
+    auto ref = build->putBlob(BlobRef{BlobHashAlgo::XXH3_128, codecFor(BlobHashAlgo::XXH3_128).fromHex(blobHashHexOneShot(BlobHashAlgo::XXH3_128, payload))}, BlobSource::fromString(payload));
 
-    const auto raw = backend->get(store->layout().blobKey(ref.id));
+    const auto raw = backend->get(store->layout().blobKey(ref.ref));
     ASSERT_TRUE(raw.has_value());
     const EnvelopeHeader h = decodeEnvelopeHeader(raw->bytes, raw->bytes.size(), ObjectKind::Blob);
     EXPECT_EQ(h.hash_algo, static_cast<uint8_t>(BlobHashAlgo::XXH3_128));
@@ -244,7 +244,7 @@ TEST(CasPluggableHash, StoreWithDefaultAlgoStampsEnvelopeHashAlgoOne)
     auto build = store->startBuild({});
     auto ref = build->putBlob(idOf("hello world"), BlobSource::fromString("hello world"));
 
-    const auto raw = backend->get(store->layout().blobKey(ref.id));
+    const auto raw = backend->get(store->layout().blobKey(ref.ref));
     ASSERT_TRUE(raw.has_value());
     const EnvelopeHeader h = decodeEnvelopeHeader(raw->bytes, raw->bytes.size(), ObjectKind::Blob);
     EXPECT_EQ(h.hash_algo, 1u);
@@ -266,7 +266,7 @@ TEST(CasPluggableHash, Xxh3BlobLandsUnderAlgoSegmentAndIsDiscoveredCleanByFsck)
 
     const RootNamespace ns{"srv1/tbl"};
     const std::string payload = makeMultiBlockPayload();
-    const BlobId id{blobHashHexOneShot(BlobHashAlgo::XXH3_128, payload)};
+    const BlobRef id{BlobHashAlgo::XXH3_128, codecFor(BlobHashAlgo::XXH3_128).fromHex(blobHashHexOneShot(BlobHashAlgo::XXH3_128, payload))};
 
     BuildInfo info;
     info.intended_ref = ns.string() + "/rb";
@@ -283,7 +283,7 @@ TEST(CasPluggableHash, Xxh3BlobLandsUnderAlgoSegmentAndIsDiscoveredCleanByFsck)
     ManifestEntry e;
     e.path = "data.bin";
     e.placement = EntryPlacement::Blob;
-    e.ref = DB::Cas::BlobRef{BlobHashAlgo::XXH3_128, DB::Cas::BlobDigest::fromU128(hexToU128(id.string()))};
+    e.ref = id;
 
     e.blob_size = payload.size();
     const ManifestId mid = build->stageManifest({e});
@@ -344,7 +344,7 @@ TEST(CasPluggableHash, Sha256BlobSeenByCondemnSweepAndFsckNotSilentlySkipped)
     /// Write the blob body DIRECTLY at its content key (mirrors `cas_test_helpers.h`'s `writeBlobRaw`,
     /// widened to a 64-hex id) -- an unreferenced (orphan) blob, exactly the shape the pipeline-blindness
     /// sweep and fsck's present-but-unreferenced pipeline exist to classify.
-    const BlobId id{hex};
+    const BlobRef id{BlobHashAlgo::Sha256, digest};
     const String blob_key = store->layout().blobKey(id);
     EXPECT_NE(blob_key.find("/blobs/sha256/"), String::npos) << blob_key;
     {
@@ -382,7 +382,7 @@ TEST(CasPluggableHash, Sha256BlobSeenByCondemnSweepAndFsckNotSilentlySkipped)
     /// meta) and must report exactly our blob, at its real 32-byte digest.
     const std::vector<Gc::PreviewEntry> preview = gc.previewDeletes();
     ASSERT_EQ(preview.size(), 1u) << "THE CRUX: previewDeletes must surface the condemned sha256 blob";
-    EXPECT_EQ(preview[0].hash, digest);
+    EXPECT_EQ(preview[0].ref, id);
     EXPECT_EQ(preview[0].key, blob_key);
 
     /// ---- Site 2: fsck's present-but-unreferenced classification ----
@@ -439,7 +439,7 @@ TEST(CasPluggableHash, Sha256BuildWritesFullWidthDigestAndInlineEqualsBlob)
     const std::string payload = makeMultiBlockPayload();
     const std::string hex = blobHashHexOneShot(BlobHashAlgo::Sha256, payload);
     ASSERT_EQ(hex.size(), 64u) << "sha256 renders 64 lowercase hex chars";
-    const BlobId id{hex};
+    const BlobRef id{BlobHashAlgo::Sha256, codec.fromHex(hex)};
 
     BuildInfo info;
     info.intended_ref = ns.string() + "/part1";

@@ -254,7 +254,7 @@ TEST(CasGcRoundDefer, DueGraduationForcesFoldAndSparesReReferencedBlob)
         gc.runRegularRound();
         store->renewWatermarkOnce();
         for (const RetiredEntry & e : currentRetiredSet(*backend, store->layout(), /*shard*/0))
-            if (e.hash == DB::Cas::BlobDigest::fromU128(blob) && e.delete_pending)
+            if (e.ref == DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(blob)} && e.delete_pending)
                 saw_pending = true;
     }
     ASSERT_TRUE(saw_pending) << "entry never reached delete_pending";

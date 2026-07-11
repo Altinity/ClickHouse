@@ -44,7 +44,7 @@ ManifestRef ref(uint64_t seq, uint64_t inst)
 
 bool blobExists(InMemoryBackend & b, const Layout & layout, const UInt128 & hash)
 {
-    return b.head(layout.blobKey(BlobId(u128ToHex(hash)))).exists;
+    return b.head(layout.blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hash)})).exists;
 }
 
 /// Append a RAW owner event to a shard journal WITHOUT going through the semantic helpers, so a test can

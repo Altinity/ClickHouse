@@ -22,7 +22,7 @@ ManifestRef ref(uint64_t seq, uint64_t inst)
 }
 bool blobExists(InMemoryBackend & b, const Layout & layout, const UInt128 & hash)
 {
-    return b.head(layout.blobKey(BlobId(u128ToHex(hash)))).exists;
+    return b.head(layout.blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hash)})).exists;
 }
 
 /// Whether the CURRENT retired list (any gc-shard) still holds an entry.

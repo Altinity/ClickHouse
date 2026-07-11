@@ -1,16 +1,32 @@
 #include <gtest/gtest.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobRef.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestId.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartPathParser.h>
 
 using namespace DB::Cas;
 
+namespace
+{
+/// A `BlobRef` at `algo` whose first bytes are `0x00, 0xaa, 0xbb` (the rest zero) -- for key-shape
+/// tests that need a stable, recognizable hex prefix. `Layout` no longer captures an algo (Phase 3
+/// T2/T3): every blob key is built from a `BlobRef` alone, so key-shape tests construct one directly.
+BlobRef prefixedRef(BlobHashAlgo algo)
+{
+    BlobDigest d{};
+    d.bytes[0] = 0x00; d.bytes[1] = 0xaa; d.bytes[2] = 0xbb;
+    return BlobRef{algo, d};
+}
+}
+
 TEST(CasLayout, KeyShapes)
 {
-    /// Default (no explicit algo) is cityHash128, and per design §10 EVERY algo -- including the
-    /// default -- carries an explicit path segment: `blobs/ch128/...`, not the legacy `blobs/...`.
+    /// Per design §10 EVERY algo carries an explicit path segment: `blobs/ch128/...`, not the legacy
+    /// `blobs/...`.
     Layout l{"p"};
-    EXPECT_EQ(l.blobKey(BlobId{"00aabb"}), "p/blobs/ch128/00/00aabb");
+    const BlobRef ref = prefixedRef(BlobHashAlgo::CityHash128);
+    const String hex = codecFor(BlobHashAlgo::CityHash128).toHex(ref.digest);
+    EXPECT_EQ(l.blobKey(ref), "p/blobs/ch128/" + hex.substr(0, 2) + "/" + hex);
     EXPECT_EQ(l.gcStateKey(), "p/gc/state");
     EXPECT_EQ(l.outcomesKey(4, 42, 7, 1), "p/gc/gen/4/attempt/42/outcomes/7/1");
     EXPECT_EQ(l.poolMetaKey(), "p/_pool_meta");
@@ -19,23 +35,26 @@ TEST(CasLayout, KeyShapes)
 TEST(CasLayout, BlobKeyCarriesAlgoSegment)
 {
     /// Every algo gets its own segment (design §3/§10), so two algos can never collide in the key
-    /// space even after a config change on a fresh pool.
-    const Layout ch128("p", BlobHashAlgo::CityHash128);
-    EXPECT_EQ(ch128.blobKey(BlobId{"00aabb"}), "p/blobs/ch128/00/00aabb");
-    EXPECT_EQ(ch128.blobMetaKey(BlobId{"00aabb"}), "p/blobs/ch128/00/00aabb.meta");
+    /// space even after a config change on a fresh pool. `Layout` itself carries no algo anymore --
+    /// the segment comes from the `BlobRef` passed to `blobKey`/`blobMetaKey`.
+    const Layout l("p");
 
-    const Layout xxh3("p", BlobHashAlgo::XXH3_128);
-    EXPECT_EQ(xxh3.blobKey(BlobId{"00aabb"}), "p/blobs/xxh3/00/00aabb");
-    EXPECT_EQ(xxh3.blobMetaKey(BlobId{"00aabb"}), "p/blobs/xxh3/00/00aabb.meta");
+    const BlobRef ch128_ref = prefixedRef(BlobHashAlgo::CityHash128);
+    const String ch128_hex = codecFor(BlobHashAlgo::CityHash128).toHex(ch128_ref.digest);
+    EXPECT_EQ(l.blobKey(ch128_ref), "p/blobs/ch128/" + ch128_hex.substr(0, 2) + "/" + ch128_hex);
+    EXPECT_EQ(l.blobMetaKey(ch128_ref), l.blobKey(ch128_ref) + ".meta");
 
-    const Layout sha256("p", BlobHashAlgo::Sha256);
-    EXPECT_EQ(sha256.blobKey(BlobId{"00aabb"}), "p/blobs/sha256/00/00aabb");
+    const BlobRef xxh3_ref = prefixedRef(BlobHashAlgo::XXH3_128);
+    const String xxh3_hex = codecFor(BlobHashAlgo::XXH3_128).toHex(xxh3_ref.digest);
+    EXPECT_EQ(l.blobKey(xxh3_ref), "p/blobs/xxh3/" + xxh3_hex.substr(0, 2) + "/" + xxh3_hex);
+    EXPECT_EQ(l.blobMetaKey(xxh3_ref), l.blobKey(xxh3_ref) + ".meta");
+
+    const BlobRef sha256_ref = prefixedRef(BlobHashAlgo::Sha256);
+    const String sha256_hex = codecFor(BlobHashAlgo::Sha256).toHex(sha256_ref.digest);
+    EXPECT_EQ(l.blobKey(sha256_ref), "p/blobs/sha256/" + sha256_hex.substr(0, 2) + "/" + sha256_hex);
 
     /// Trees/manifests/refs are UNCHANGED -- only blob-body keys gain the algo segment.
-    EXPECT_EQ(ch128.gcStateKey(), xxh3.gcStateKey());
-    EXPECT_EQ(ch128.poolMetaKey(), xxh3.poolMetaKey());
-    EXPECT_EQ(ch128.blobsPrefix(), "p/blobs/");
-    EXPECT_EQ(ch128.blobsPrefix(), xxh3.blobsPrefix());
+    EXPECT_EQ(l.blobsPrefix(), "p/blobs/");
 }
 
 TEST(CasLayout, RootNamespaceKeys)
@@ -115,13 +134,6 @@ TEST(CasLayout, AttemptScopedGenKeys)
     EXPECT_EQ(layout.outcomesKey(5, 42, 7, 3), "p/gc/gen/5/attempt/42/outcomes/7/3");
     EXPECT_EQ(layout.gcGenPrefix(4), "p/gc/gen/4/");
     EXPECT_EQ(layout.gcGenAttemptPrefix(4, 42), "p/gc/gen/4/attempt/42/");
-}
-
-TEST(CasLayout, ShortIdThrows)
-{
-    Layout l{"p"};
-    EXPECT_THROW(l.blobKey(BlobId{"x"}), DB::Exception);    // < 2 chars
-    EXPECT_NO_THROW(l.blobKey(BlobId{"ab"}));                // exactly 2 chars is OK
 }
 
 TEST(CasLayout, RegistryDeletedGcDiscoveryViaList)

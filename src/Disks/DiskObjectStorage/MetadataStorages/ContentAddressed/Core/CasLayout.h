@@ -45,40 +45,24 @@ struct BlobRef;
 /// The 2-char shard is always the first two characters of the id string.
 /// This matches the protocol spec §4 layout exactly.
 ///
-/// Blob bodies additionally carry the pool's `BlobHashAlgo` as a path segment (CAS pluggable-blob-hash
-/// design §3/§10): `POOL/blobs/<algo>/S/ID`, where `<algo>` is `blobHashAlgoName(blob_hash_algo)`
-/// (`"ch128"` for the default cityHash128, `"xxh3"`, `"sha256"`). This applies to ALL algos, including
-/// the default, so blob keys are uniformly self-describing. Trees/manifests/refs/gc keys are
-/// unaffected -- only blob-body keys (`blobKey`/`blobMetaKey`/`objectKey`) gain the segment. The
-/// `blob_hash_algo` here MUST be the pool's actual recorded algo (`PoolMeta::blob_hash_algo`) for every
-/// `Layout` that addresses a real pool -- a mismatch would silently put blobs at an unreadable path.
-/// The default parameter exists only so pure-unit-test `Layout("p")` constructions that never mix algos
-/// stay terse; `Store`'s canonical `pool_layout` is always built from the pool's validated `PoolMeta`.
+/// Blob bodies carry their OWN `BlobHashAlgo` as a path segment (mixed-algo pools, Phase 3 T2/T3):
+/// `POOL/blobs/<algo>/S/<hex>`, where `<algo>` is `blobHashAlgoName(ref.algo)` (`"ch128"`, `"xxh3"`,
+/// `"sha256"`) and `<hex>`/`S` are taken from `ref.digest` at the algo's own width. This applies to
+/// ALL algos, including the pool's default, so blob keys are uniformly self-describing and a pool may
+/// hold blobs under several algos at once. Trees/manifests/refs/gc keys are unaffected -- only
+/// blob-body keys (`blobKey`/`blobMetaKey`/`objectKey`) gain the segment. `Layout` itself carries NO
+/// algo -- there is no pool-wide "the" algo anymore; every blob key is built from a `BlobRef` alone.
 class Layout
 {
 public:
-    explicit Layout(String prefix_, BlobHashAlgo blob_hash_algo_ = BlobHashAlgo::CityHash128)
-        : prefix(std::move(prefix_)), blob_hash_algo(blob_hash_algo_) {}
+    explicit Layout(String prefix_) : prefix(std::move(prefix_)) {}
 
-    /// Content objects: POOL/blobs/<algo>/S/ID.
-    String blobKey(const BlobId & id) const
-    {
-        return shardedKey("blobs/" + String(blobHashAlgoName(blob_hash_algo)), id.string());
-    }
-
-    /// The per-hash meta descriptor sibling of the blob body (spec §raw-body-refinement).
-    String blobMetaKey(const BlobId & id) const
-    {
-        return blobKey(id) + ".meta";
-    }
-
-    /// Content objects, PER-ENTRY algo (mixed-algo pools, Phase 3 T2): POOL/blobs/<algo>/S/<hex>, with
-    /// `<algo>`/`<hex>` taken from `ref` itself -- NOT from this Layout's ctor-level `blob_hash_algo`
-    /// (that field only backs the legacy `blobKey(BlobId)` overload above, kept for existing
-    /// single-algo call sites). Defined out-of-line in CasBuild.cpp: `BlobRef`'s complete type comes
-    /// through `CasBlobDigest.h` -> `CasPoolMeta.h` -> `CasLayout.h`, so this header cannot include it
+    /// Content objects: POOL/blobs/<algo>/S/<hex>, with `<algo>`/`<hex>` taken from `ref` itself.
+    /// Defined out-of-line in CasBuild.cpp: `BlobRef`'s complete type comes through
+    /// `CasBlobDigest.h` -> `CasPoolMeta.h` -> `CasLayout.h`, so this header cannot include it
     /// directly without cycling (mirrors the pre-existing `objectKey` cyclic-include workaround).
     String blobKey(const BlobRef & ref) const;
+    /// The per-hash meta descriptor sibling of the blob body (spec §raw-body-refinement).
     String blobMetaKey(const BlobRef & ref) const;
 
     /// Root manifest for a given namespace + shard number.
@@ -327,7 +311,6 @@ public:
 
 private:
     String prefix;
-    BlobHashAlgo blob_hash_algo;
 
     /// A namespace must be non-empty, with no leading/trailing '/', no empty segment ("//"),
     /// and no segment equal to the reserved "_files".

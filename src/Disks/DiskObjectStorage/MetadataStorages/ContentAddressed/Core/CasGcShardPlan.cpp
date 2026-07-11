@@ -35,9 +35,9 @@ ShardReducer::ShardReducer(uint64_t shard_, uint64_t gc_shards_)
             "ShardReducer: shard {} is out of range [0, {})", shard_, gc_shards_);
 }
 
-bool ShardReducer::owns(const BlobDigest & blob_hash) const
+bool ShardReducer::owns(const BlobRef & ref) const
 {
-    return blobShard(blob_hash, gc_shards) == shard;
+    return blobShard(ref, gc_shards) == shard;
 }
 
 std::vector<RunRef> ShardReducer::reduce(Backend & backend, const Layout & layout,
@@ -45,17 +45,16 @@ std::vector<RunRef> ShardReducer::reduce(Backend & backend, const Layout & layou
                                          uint64_t new_generation, uint64_t attempt,
                                          std::vector<BlobDelta> shard_deltas,
                                          uint64_t current_round, uint64_t condemn_round,
-                                         const std::function<std::optional<HeadResult>(const BlobDigest &)> & head_blob,
-                                         const std::function<std::optional<HeadResult>(const BlobDigest &)> & peek_head,
+                                         const std::function<std::optional<HeadResult>(const BlobRef &)> & head_blob,
+                                         const std::function<std::optional<HeadResult>(const BlobRef &)> & peek_head,
                                          RetiredMergeResult * out_retired,
-                                    bool suppress_destructive,
-                                    uint8_t digest_len)
+                                    bool suppress_destructive)
 {
     std::vector<RunRef> out_runs;
     foldDeltasIntoGeneration(backend, layout, prior_runs, new_generation, attempt, shard,
                              std::move(shard_deltas), out_runs,
                              current_round, condemn_round, head_blob, peek_head, out_retired,
-                             suppress_destructive, digest_len);
+                             suppress_destructive);
     return out_runs;
 }
 

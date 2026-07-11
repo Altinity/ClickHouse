@@ -129,21 +129,18 @@ void Build::requireAlive() const
             "the mount was fenced out and self-remounted; restart the build", epoch, live);
 }
 
-PutBlobResult Build::putBlob(const BlobId & id, BlobSource source)
+PutBlobResult Build::putBlob(const BlobRef & ref, BlobSource source)
 {
     requireAlive();
 
     const PoolConfig & cfg = store->poolConfig();
-    /// Phase 3 T2: `putBlob` always writes NEW content, minted under the node's configured WRITE algo
-    /// (`cfg.blob_hash_algo` — mixed-algo admission is a later task; every write today still uses the
-    /// pool's one configured algo). `id.string()` is that algo's hex (32 chars for a 128-bit algo, 64
-    /// for sha256) -- parse it at the WRITE algo's width via `codecFor` (never the pool-wide
-    /// `DigestCodec(poolMeta())`, which this task retires from the write-mint path) into a full
-    /// `BlobRef` pair. `logical_ref` is the blob identity end-to-end from here on: the dedup cache, the
-    /// dep map, and every downstream event render key off THIS value directly.
-    const BlobRef logical_ref{cfg.blob_hash_algo, codecFor(cfg.blob_hash_algo).fromHex(id.string())};
+    /// Phase 3 T2/T3: `putBlob` writes the blob identified by `ref` directly -- the caller (the
+    /// write-mint site) already produced the full `BlobRef` pair (algo + digest), so there is no hex
+    /// round-trip here anymore. `logical_ref` is the blob identity end-to-end from here on: the dedup
+    /// cache, the dep map, and every downstream event render key off THIS value directly.
+    const BlobRef & logical_ref = ref;
 
-    const String key = store->layout().blobKey(id);
+    const String key = store->layout().blobKey(ref);
 
     /// The source is RE-READABLE (the caller's `write_payload` re-reads a staged temp file, or re-emits a
     /// captured String): it can be invoked MULTIPLE times — the primary streaming PUT plus any INV-1
@@ -173,7 +170,7 @@ PutBlobResult Build::putBlob(const BlobId & id, BlobSource source)
             {
                 const uint64_t admitted = observeAndAdmit(ObjectKind::Blob, logical_ref, key, hr);
                 store->dedupCacheAdd(logical_ref);
-                return PutBlobResult{id, admitted};
+                return PutBlobResult{ref, admitted};
             }
             catch (const Exception & e)
             {
@@ -197,7 +194,7 @@ PutBlobResult Build::putBlob(const BlobId & id, BlobSource source)
             uploadFromSource(ObjectKind::Blob, logical_ref, key, source);
             /// P1: this hash is now known-present — future writers can HEAD-first and skip the body.
             store->dedupCacheAdd(logical_ref);
-            return PutBlobResult{id, source.size};
+            return PutBlobResult{ref, source.size};
         }
         catch (const Exception & e)
         {
@@ -280,12 +277,10 @@ uint64_t Build::observeAndAdmit(ObjectKind kind, const BlobRef & ref, const Stri
     /// Task 3 (spec §meta-protocols v3): the condemned decision is now a per-hash META POINT-READ, not
     /// the writer-side RetireView. `absent` meta means "not condemned" — GC always writes a `Condemned`
     /// meta BEFORE it ever deletes a body, so an absent meta is exactly as live as a `Clean` one.
-    /// Phase 3 T2: the meta ops layer stays `(DigestCodec, BlobDigest)`-keyed (retyping it to `BlobRef`
-    /// is Task 3's job, gated by GC's parallel callers) — derive the codec from `ref.algo` at the call
-    /// site instead (`codecFor`, `CasBlobRef.h`). Every event-log render below uses `blobIdOf(ref)`
-    /// ("<algoName>:<hex>"), never a bare hex.
-    const DigestCodec meta_codec = codecFor(ref.algo);
-    const auto lm = loadMeta(store->backend(), store->layout(), meta_codec, ref.digest);
+    /// Phase 3 T3: the meta ops layer is `BlobRef`-keyed directly (derives its codec from `ref.algo`
+    /// internally). Every event-log render below uses `blobIdOf(ref)` ("<algoName>:<hex>"), never a
+    /// bare hex.
+    const auto lm = loadMeta(store->backend(), store->layout(), ref);
     const bool condemned = lm && lm->meta.state == MetaState::Condemned;
     if (condemned)
     {
@@ -314,7 +309,7 @@ uint64_t Build::observeAndAdmit(ObjectKind kind, const BlobRef & ref, const Stri
     /// point-readers (writers and GC) never have to fall back to a HEAD-only guess. A Conflict here just
     /// means a racing writer already created it — both agree on the same Clean steady state.
     if (!lm)
-        putMetaIfAbsent(store->backend(), store->layout(), meta_codec, ref.digest,
+        putMetaIfAbsent(store->backend(), store->layout(), ref,
             BlobMeta{.state = MetaState::Clean, .condemn_round = 0, .size = logical_size});
 
     /// Adopt the current incarnation — free, no bytes moved.
@@ -346,10 +341,8 @@ void Build::uploadFromSource(ObjectKind kind, const BlobRef & ref, const String 
     /// temp file), which is exactly what preserves INV-1 across retries.
     const PoolMeta & meta = store->poolMeta();
     const PoolConfig & cfg = store->poolConfig();
-    /// Phase 3 T2: `ref` is the full blob identity (algo + digest) end-to-end -- the `.meta` API's codec
-    /// is derived from `ref.algo` (never the pool-wide `DigestCodec(meta)`), and the dep map + every
-    /// event render below key off `ref` directly.
-    const DigestCodec meta_codec = codecFor(ref.algo);
+    /// Phase 3 T3: `ref` is the full blob identity (algo + digest) end-to-end -- the `.meta` API is
+    /// `BlobRef`-keyed directly, and the dep map + every event render below key off `ref` too.
 
     auto buildHeader = [&]() -> String
     {
@@ -427,7 +420,7 @@ void Build::uploadFromSource(ObjectKind kind, const BlobRef & ref, const String 
     /// on the same Clean steady state).
     auto writeFreshMetaClean = [&]()
     {
-        putMetaIfAbsent(store->backend(), store->layout(), meta_codec, ref.digest,
+        putMetaIfAbsent(store->backend(), store->layout(), ref,
             BlobMeta{.state = MetaState::Clean, .condemn_round = 0, .size = source.size});
     };
 
@@ -445,11 +438,11 @@ void Build::uploadFromSource(ObjectKind kind, const BlobRef & ref, const String 
         for (int attempt = 0; attempt < max_meta_attempts; ++attempt)
         {
             const CasResult res = lm_before
-                ? casMeta(store->backend(), store->layout(), meta_codec, ref.digest, lm_before->etag, clean)
-                : putMetaIfAbsent(store->backend(), store->layout(), meta_codec, ref.digest, clean);
+                ? casMeta(store->backend(), store->layout(), ref, lm_before->etag, clean)
+                : putMetaIfAbsent(store->backend(), store->layout(), ref, clean);
             if (res.outcome == CasOutcome::Committed)
                 return;
-            lm_before = loadMeta(store->backend(), store->layout(), meta_codec, ref.digest);
+            lm_before = loadMeta(store->backend(), store->layout(), ref);
         }
         /// Exhausted retries: leave the meta as-is — best-effort (a later writer/GC pass reconciles it).
     };
@@ -522,7 +515,7 @@ void Build::uploadFromSource(ObjectKind kind, const BlobRef & ref, const String 
     /// Task 3 (spec §meta-protocols v3): the condemned decision is now a per-hash META POINT-READ, not
     /// the writer-side RetireView. `lm` (and its etag) is reused below to flip a condemned meta back to
     /// Clean once the resurrect displacement lands.
-    const auto lm = loadMeta(store->backend(), store->layout(), meta_codec, ref.digest);
+    const auto lm = loadMeta(store->backend(), store->layout(), ref);
     const bool condemned = lm && lm->meta.state == MetaState::Condemned;
     if (!condemned)
     {
@@ -612,10 +605,9 @@ Token Build::copyForwardFromCondemned(const BlobRef & ref, const String & key, H
     /// Blob-only: adoptEvidence never records tree deps (trees are recreatable from retained payloads).
     const PoolMeta & meta = store->poolMeta();
     const PoolConfig & cfg = store->poolConfig();
-    /// Phase 3 T2: `ref` is the full blob identity (the caller — `promote`'s non-tokened-leaf
-    /// revalidation — passes `entry.ref` directly), so every meta-op and hex render below routes
-    /// through `codecFor(ref.algo)`, never the pool-wide `DigestCodec(meta)`.
-    const DigestCodec codec = codecFor(ref.algo);
+    /// Phase 3 T3: `ref` is the full blob identity (the caller — `promote`'s non-tokened-leaf
+    /// revalidation — passes `entry.ref` directly), so every meta-op below is `BlobRef`-keyed
+    /// directly, and every hex render routes through `blobIdOf(ref)`.
 
     constexpr int max_attempts = 8;
     for (int attempt = 0; attempt < max_attempts; ++attempt)
@@ -636,7 +628,7 @@ Token Build::copyForwardFromCondemned(const BlobRef & ref, const String & key, H
             /// further work); anything else (Condemned, or absent — never observed as clean) falls through
             /// to re-verify and re-displace THIS incarnation. Safe either way: a spurious re-displacement
             /// just costs one more GET+PUT and still lands on a verified fresh incarnation.
-            const auto lm_drift = loadMeta(store->backend(), store->layout(), codec, ref.digest);
+            const auto lm_drift = loadMeta(store->backend(), store->layout(), ref);
             if (lm_drift && lm_drift->meta.state == MetaState::Clean)
                 return got->token;
             hr.token = got->token;
@@ -709,17 +701,17 @@ Token Build::copyForwardFromCondemned(const BlobRef & ref, const String & key, H
             /// or GC re-condemning): a Conflict just means someone else already reconciled it to the same
             /// steady state; putMetaIfAbsent covers the (rare) case the meta was never created at all.
             {
-                auto lm_out = loadMeta(store->backend(), store->layout(), codec, ref.digest);
+                auto lm_out = loadMeta(store->backend(), store->layout(), ref);
                 const BlobMeta clean{.state = MetaState::Clean, .condemn_round = 0, .size = payload.size()};
                 constexpr int max_meta_attempts = 8;
                 for (int meta_attempt = 0; meta_attempt < max_meta_attempts; ++meta_attempt)
                 {
                     const CasResult meta_res = lm_out
-                        ? casMeta(store->backend(), store->layout(), codec, ref.digest, lm_out->etag, clean)
-                        : putMetaIfAbsent(store->backend(), store->layout(), codec, ref.digest, clean);
+                        ? casMeta(store->backend(), store->layout(), ref, lm_out->etag, clean)
+                        : putMetaIfAbsent(store->backend(), store->layout(), ref, clean);
                     if (meta_res.outcome == CasOutcome::Committed)
                         break;
-                    lm_out = loadMeta(store->backend(), store->layout(), codec, ref.digest);
+                    lm_out = loadMeta(store->backend(), store->layout(), ref);
                     /// Exhausted retries: leave the meta as-is — best-effort (a later writer/GC pass
                     /// reconciles it); the body-side displacement above is already durable and verified.
                 }
@@ -1037,7 +1029,7 @@ void Build::promote(const RootNamespace & target_ns, const String & final_ref_na
                 /// Task 4 (spec §meta-protocols v3): the condemned decision is now a per-hash META
                 /// POINT-READ, not the writer-side RetireView — mirrors Task 3's putBlob/uploadFromSource
                 /// re-sourcing. An absent meta reads as "not condemned" (same convention as the writer gate).
-                const auto lm = loadMeta(store->backend(), store->layout(), codecFor(e.ref.algo), e.ref.digest);
+                const auto lm = loadMeta(store->backend(), store->layout(), e.ref);
                 const bool condemned = lm && lm->meta.state == MetaState::Condemned;
                 if (condemned)
                 {

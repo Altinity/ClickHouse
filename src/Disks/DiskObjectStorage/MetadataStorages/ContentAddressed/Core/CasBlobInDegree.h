@@ -1,6 +1,7 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobDigest.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobRef.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcFormats.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGenerationSeal.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
@@ -24,52 +25,32 @@ constexpr char kEdgeActive = 0x01;   // sealed-run row: a surviving active edge
 constexpr char kZeroMarker = 0x00;   // sealed-run row: blob transitioned to zero this generation
 constexpr char kCondemned  = 0x02;   // sealed-run row: blob retired-in-snapshot (spec §2.1)
 
-/// Source-edge run key schemas (CAS pluggable-blob-hash Phase 2 Task 4): the key schema byte
-/// carried in the run header names the DIGEST WIDTH the row keys were built at — 16 bytes
-/// (`cityHash128`/`xxh3-128`, every pool that exists today) or 32 bytes (`sha256`). A schema value
-/// outside this set is a future/unknown format: `sourceEdgeDigestLen` fails closed with
-/// `NOT_IMPLEMENTED`, never silently guessing a width.
-constexpr uint8_t kSourceEdgeKeySchema128    = 1;   // 16-byte digest (cityHash128 / xxh3)
-constexpr uint8_t kSourceEdgeKeySchemaSha256 = 2;   // 32-byte digest (sha256)
+/// Source-edge run key schema (Phase 3 T3, mixed-algo pools): a SINGLE schema, self-describing per
+/// row via the leading algo byte — replaces the pool-wide-width schemas 1/2 (DELETED, along with
+/// `sourceEdgeDigestLen`/`sourceEdgeKeySchemaFor`/the width-stateful `SourceEdgeKeyCodec(uint8_t)`
+/// ctor). A run may now carry rows for MULTIPLE algos at once (mixed-algo pool), each at its own
+/// algo's width; there is no pool-wide "the" digest width anymore.
+constexpr uint8_t kSourceEdgeKeySchema = 3;
 
-/// key_schema -> digest width. Unknown/future schema -> NOT_IMPLEMENTED (fail-closed, per typed-open
-/// policy — see `assertSourceEdgeRunHeader`).
-uint8_t sourceEdgeDigestLen(uint8_t key_schema);
-/// pool digest width -> the key_schema a run of that width MUST be written under. Any width other
-/// than 16/32 -> NOT_IMPLEMENTED.
-uint8_t sourceEdgeKeySchemaFor(uint8_t digest_len);
-
-/// Bundles the digest width with source-edge key build/parse (consult's explicit recommendation,
-/// CAS pluggable-blob-hash Phase 2 Task 4): every source-edge key build or parse goes through an
-/// instance of this codec — never a bare digest_len or a free key-building function — so no per-row
-/// call site can silently use the wrong width. Construct from a pool width (WRITE path) or from a
-/// typed reader's `key_schema` (READ path, via `forSchema`).
+/// Stateless key codec (Phase 3 T3): key = algo(u8) ++ digest[blobHashLenFor(algo)] ++ source_id(16
+/// BE) — 33 bytes for a 16-byte-digest algo, 49 for sha256. All static: no width state, because the
+/// width is self-describing per key (the leading algo byte). Raw lexicographic key order equals
+/// `(algo, digest, source_id)` order (== `BlobRef::operator<` then `source_id`), because the algo
+/// byte always decides before any digest byte can (a smaller algo byte sorts first regardless of the
+/// digest bytes that follow, since it is fewer bytes in and lexicographic comparison is byte-by-byte
+/// left to right).
 class SourceEdgeKeyCodec
 {
 public:
-    /// `digest_len_` must be 16 or 32; anything else is NOT_IMPLEMENTED (fail closed — a caller
-    /// bug or an unported width, never silently coerced).
-    explicit SourceEdgeKeyCodec(uint8_t digest_len_);
-    /// = `SourceEdgeKeyCodec(sourceEdgeDigestLen(key_schema))` — the READ-path constructor: a
-    /// reader derives its codec from the run it opened (`reader.keySchema()`), never from pool meta.
-    static SourceEdgeKeyCodec forSchema(uint8_t key_schema);
+    SourceEdgeKeyCodec() = delete;
 
-    uint8_t digestLen() const { return digest_len; }
-    uint8_t keySchema() const { return sourceEdgeKeySchemaFor(digest_len); }
-
-    /// key = blob_hash.bytes[0:digestLen()] ++ source_id (16 BE). Requires `blob_hash` to carry a
-    /// zero tail beyond `digestLen()` (checked in debug builds — a caller passing a digest wider
-    /// than this codec's width is a programming bug, not corrupted on-disk data).
-    String key(const BlobDigest & blob_hash, const UInt128 & source_id) const;
-    /// Parse a key that MUST be exactly `digestLen() + 16` bytes. A wrong size is CORRUPTED_DATA
-    /// (thrown) — never a silent `false` return (fail-closes the pre-Task-4 fail-open `bool`
-    /// contract). Fills a zeroed `BlobDigest` (tail beyond `digestLen()` stays zero) + `source_id`.
-    void parse(std::string_view key, BlobDigest & blob_hash, UInt128 & source_id) const;
-    /// The sparse-index seek prefix for a blob: blob_hash.bytes[0:digestLen()].
-    String seekPrefix(const BlobDigest & blob_hash) const;
-
-private:
-    uint8_t digest_len;
+    /// key = algo(u8) ++ digest[blobHashLenFor(algo)] ++ source_id(16 BE); 33 or 49 bytes.
+    static String key(const BlobRef & ref, const UInt128 & source_id);
+    /// Parse a key. Throws `NOT_IMPLEMENTED` on an unknown algo byte, `CORRUPTED_DATA` on a wrong
+    /// total length for a known algo. Zero-tails the digest (beyond the algo's own width).
+    static void parse(std::string_view key, BlobRef & ref, UInt128 & source_id);
+    /// The sparse-index seek prefix for a blob: algo(u8) ++ digest[blobHashLenFor(algo)].
+    static String seekPrefix(const BlobRef & ref);
 };
 
 /// Deterministic 16-byte id of a source edge (ManifestId, path). Distinctness only — not reconstructable.
@@ -112,11 +93,11 @@ RunFileReader openSourceEdgeRun(Backend & backend, const String & key);
 /// tokens that two observers may legitimately differ on and keep first-durable-write-wins semantics.
 void putDeterministicArtifact(Backend & backend, const String & key, const String & bytes);
 
-/// One source-edge update pre-merge: the edge (blob_hash, source_id), and whether it is an activation
+/// One source-edge update pre-merge: the edge (ref, source_id), and whether it is an activation
 /// (+edge) or a removal (−edge). Idempotent under re-fold at the merge (set membership, not a counter).
 struct BlobDelta
 {
-    BlobDigest blob_hash{};
+    BlobRef ref{};
     UInt128 source_id{};   /// sourceEdgeId(ManifestId, path) — NOT a content hash; stays UInt128 (design §12)
     bool remove = false;
 };
@@ -124,7 +105,7 @@ struct BlobDelta
 /// A blob whose active source-edge set became empty this generation — a retire candidate.
 struct BlobCandidate
 {
-    BlobDigest hash{};
+    BlobRef ref{};
 };
 
 /// Merge the prior generation's blob source-edge run for `shard` with `scattered` deltas, producing the
@@ -205,25 +186,21 @@ struct RetiredMergeResult
 /// double-emit `blob_retire` alongside `blob_retire_replaced` and double-count the condemned counter;
 /// `peek_head` is a plain HEAD with no events and no counters. No supersede detection happens if
 /// `peek_head` is unset (default `{}`), independent of whether `head_blob` is set.
-/// `digest_len` (CAS pluggable-blob-hash Phase 2 Task 4): the OUTPUT run's digest width, sourced by
-/// the caller from the pool (`PoolMeta::blob_hash_len`) — NEVER inferred from the input deltas.
-/// Defaults to 16 (every pool that exists today) so every pre-Task-4 call site stays byte-for-byte
-/// unchanged. Stamps `header.key_schema` and gates a load-bearing coherence check: every PRIOR run
-/// segment's own key_schema must equal this output schema, checked BEFORE any raw key is compared —
-/// a schema-1 prior run folded into a schema-2 output (or vice versa) throws `CORRUPTED_DATA`
-/// (cross-width raw-byte comparison is unsafe; see `PriorEdgeCursor`). `digest_len` values other
-/// than 16/32 are `NOT_IMPLEMENTED` (via `SourceEdgeKeyCodec`).
+/// Phase 3 T3: the run's key schema is now the single self-describing `kSourceEdgeKeySchema` (no
+/// per-pool digest width parameter anymore — `SourceEdgeKeyCodec` is stateless and every row carries
+/// its own algo byte), so mixed-algo deltas in ONE `scattered` batch settle in ONE fold, no per-algo
+/// loop. The merge comparator is exactly `(ref.algo, ref.digest, source_id)` (== `BlobRef::operator<`
+/// then `source_id`), which is also raw key order (see `SourceEdgeKeyCodec`).
 void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
                               const std::vector<RunRef> & prior_runs,
                               uint64_t new_generation, uint64_t attempt,
                               uint64_t shard,
                               std::vector<BlobDelta> scattered, std::vector<RunRef> & out_runs,
                               uint64_t current_round = 0, uint64_t condemn_round = 0,
-                              const std::function<std::optional<HeadResult>(const BlobDigest &)> & head_blob = {},
-                              const std::function<std::optional<HeadResult>(const BlobDigest &)> & peek_head = {},
+                              const std::function<std::optional<HeadResult>(const BlobRef &)> & head_blob = {},
+                              const std::function<std::optional<HeadResult>(const BlobRef &)> & peek_head = {},
                               RetiredMergeResult * out_retired = nullptr,
-                              bool suppress_destructive = false,
-                              uint8_t digest_len = 16);
+                              bool suppress_destructive = false);
 
 /// Stream the sealed in-degree run named by `runs` (the current seal's `blob_target_runs` filtered to one
 /// shard) and return every blob written at in-degree 0 (the candidates that transitioned to zero). An
@@ -234,6 +211,6 @@ std::vector<BlobCandidate> zeroInDegree(Backend & backend, const std::vector<Run
 /// shard): 0 when the blob is absent from the run (or written as an explicit transitioned-to-0 row), else
 /// its count. Used by `Gc::previewDeletes` and by tests (the round itself settles candidates inside the
 /// three-cursor merge; there is no per-candidate point query anymore).
-int64_t inDegreeInGeneration(Backend & backend, const std::vector<RunRef> & runs, const BlobDigest & blob_hash);
+int64_t inDegreeInGeneration(Backend & backend, const std::vector<RunRef> & runs, const BlobRef & ref);
 
 }

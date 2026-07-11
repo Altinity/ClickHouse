@@ -69,7 +69,10 @@ String publishOneBlobPart(const StorePtr & s, const String & ns, const String & 
     const ManifestId id = build->stageManifest({e});
     build->precommitAdd(nsr, ref, id);
     build->promote(nsr, ref, build->buildId(), id);
-    return u128ToHex(u128Of(payload));
+    /// Phase 3 (mixed-algo pools): every blob-content-hash event render is `blobIdOf(ref)`
+    /// ("<algoName>:<hex>"), never a bare hex -- the prime directive that a digest never appears
+    /// without its algo.
+    return DB::Cas::blobIdOf(e.ref);
 }
 
 /// Whether the CURRENT retired list (any gc-shard) still holds an entry (ack-floor pipeline in flight).
@@ -143,7 +146,7 @@ TEST(CasEvent, LifecycleReconstructionFromRows)
     runGcToFixpoint(s, gc);
 
     /// The blob must actually be gone (the delete fired).
-    ASSERT_FALSE(b->head(s->layout().blobKey(BlobId{blob_hash})).exists)
+    ASSERT_FALSE(b->head(s->layout().blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(u128Of(payload))})).exists)
         << "GC must have deleted the now-unreferenced blob";
 
     /// (a) the expected taxonomy was emitted across the lifecycle (manifest model: no standalone trees).

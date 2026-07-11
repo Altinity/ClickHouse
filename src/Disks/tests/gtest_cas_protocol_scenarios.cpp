@@ -133,7 +133,7 @@ TEST(CasProtocol, FenceConflictCondemnedTokenedBlobCommitsWithTokenUnchanged)
 
     /// GC condemns X at t0 in round 1 and fences the namespace to round 1.
     injectRetire(*b, s->layout(), /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
-        {RetiredEntry{.kind = ObjectKind::Blob, .hash = DB::Cas::BlobDigest::fromU128(u128Of("payload-X")), .token = t0, .size = 9}});
+        {RetiredEntry{.kind = ObjectKind::Blob, .ref = DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(u128Of("payload-X"))}, .token = t0, .size = 9}});
     fenceNamespace(*b, s->layout(), ns, s->poolMeta().root_shards, /*round*/ 1);
 
     /// promote: mutateShard refreshes the view (fence_round 1 > view round 0), but the tokened leaf is
@@ -242,7 +242,7 @@ TEST(CasProtocol, RevalidateAdoptsLiveTokenWhenOnlyPhantomCondemnedAtDifferentTo
     ASSERT_NE(t_other, t0);
 
     injectRetire(*b, layout, /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
-        {RetiredEntry{.kind = ObjectKind::Blob, .hash = DB::Cas::BlobDigest::fromU128(u128Of("payload-X")), .token = t_other, .size = 9}});
+        {RetiredEntry{.kind = ObjectKind::Blob, .ref = DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(u128Of("payload-X"))}, .token = t_other, .size = 9}});
     /// Fence to round 1 BEFORE opening the store, so the store's open-time refresh lands the view at
     /// round 1 already populated.
     fenceNamespace(*b, layout, ns, /*n_shards*/ 8, /*round*/ 1);
@@ -287,9 +287,9 @@ TEST(CasProtocol, EvidenceHitCondemnedPresentBlobCopiesForwardInClosure)
     const String hex = streamingHexOf("payload-X");
     {
         auto seed = s->startBuild({});
-        seed->putBlob(BlobId{hex}, BlobSource::fromString("payload-X"));
+        seed->putBlob(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hexToU128(hex))}, BlobSource::fromString("payload-X"));
     }
-    const String blob_key = s->layout().blobKey(BlobId{hex});
+    const String blob_key = s->layout().blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hexToU128(hex))});
     const Token t0 = b->head(blob_key).token;
 
     auto build = startBuildFor(s, ns, "part_1");
@@ -339,7 +339,7 @@ TEST(CasProtocol, WedgedHeartbeatCondemnedTokenedBlobCommitsWithTokenUnchanged)
 
     /// Full GC condemned the build's OWN upload.
     injectRetire(*b, s->layout(), /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
-        {RetiredEntry{.kind = ObjectKind::Blob, .hash = DB::Cas::BlobDigest::fromU128(u128Of("payload-X")), .token = t0, .size = 9}});
+        {RetiredEntry{.kind = ObjectKind::Blob, .ref = DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(u128Of("payload-X"))}, .token = t0, .size = 9}});
     fenceNamespace(*b, s->layout(), ns, s->poolMeta().root_shards, /*round*/ 1);
 
     /// promote: the tokened leaf is edge-protected — skipped, not re-validated ⇒ commit, token unchanged.
@@ -363,7 +363,7 @@ TEST(CasProtocol, AbandonLeavesDebrisAndDisables)
     build->abandon();
 
     /// The uploaded blob remains as debris; the staged manifest body is best-effort deleted by abandon.
-    EXPECT_TRUE(b->head(s->layout().blobKey(blob.id)).exists);
+    EXPECT_TRUE(b->head(s->layout().blobKey(blob.ref)).exists);
     EXPECT_FALSE(b->head(s->layout().manifestKey(id)).exists);   /// best-effort cleanup ran
     EXPECT_TRUE(s->listRefs(ns).empty());
 
@@ -458,7 +458,7 @@ TEST(CasProtocol, DisplacedToLiveTokenCommitsAtCurrentIncarnation)
 
     /// The view still condemns the OLD t0 at round 1, fenced.
     injectRetire(*b, s->layout(), /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
-        {RetiredEntry{.kind = ObjectKind::Blob, .hash = DB::Cas::BlobDigest::fromU128(u128Of("payload-X")), .token = t0, .size = 9}});
+        {RetiredEntry{.kind = ObjectKind::Blob, .ref = DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(u128Of("payload-X"))}, .token = t0, .size = 9}});
     fenceNamespace(*b, s->layout(), ns, s->poolMeta().root_shards, /*round*/ 1);
 
     /// promote: revalidate X ⇒ HEAD current t1 (NOT condemned; only the defunct t0 is) ⇒ commit.
@@ -547,9 +547,9 @@ TEST(CasProtocol, FreshEvidenceDepWithViewHitIsResolvedByGate)
     {
         auto s0 = openStore(b);
         auto build0 = s0->startBuild({});
-        build0->putBlob(BlobId{hex}, BlobSource::fromString("payload-fresh-ev"));
+        build0->putBlob(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hexToU128(hex))}, BlobSource::fromString("payload-fresh-ev"));
     }
-    const String blob_key = layout.blobKey(BlobId{hex});
+    const String blob_key = layout.blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hexToU128(hex))});
     const Token t0 = b->head(blob_key).token;
     condemnMeta(*b, layout, hexToU128(hex), /*condemn_round*/ 1);
 

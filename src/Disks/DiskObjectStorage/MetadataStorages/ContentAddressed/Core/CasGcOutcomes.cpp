@@ -80,11 +80,12 @@ TokenType tokenTypeFromProto(uint32_t v, std::string_view what)
     }
 }
 
-/// CAS pluggable-blob-hash Phase 2 Task 5: `OutcomeEntry::hash` is a `BlobDigest` (always 32 bytes,
-/// tail zero beyond the pool's width) — serialize the WHOLE fixed-size array unconditionally rather
-/// than a pool-width slice. This keeps the codec self-describing (encode/decode need no `PoolMeta`/
-/// `DigestCodec` in scope) at the cost of a fixed 16 spare zero bytes per entry for a 128-bit pool —
-/// outcome logs are ephemeral per-round bookkeeping, not the storage-cost driver.
+/// Phase 3 T3 (mixed-algo pools): `OutcomeEntry::ref` is a `BlobRef` (algo + a 32-byte-capacity
+/// digest, tail zero beyond the algo's own width) — serialize the WHOLE fixed-size digest array
+/// unconditionally rather than an algo-width slice, plus the algo byte itself (`hash_algo` field).
+/// This keeps the codec self-describing (encode/decode need no `PoolMeta`/`codecFor` lookup beyond
+/// the algo byte already in the entry) at the cost of a fixed spare-zero-byte tail for a 128-bit
+/// algo — outcome logs are ephemeral per-round bookkeeping, not the storage-cost driver.
 String digestToBytesFull(const BlobDigest & d)
 {
     return String(reinterpret_cast<const char *>(d.bytes.data()), d.bytes.size());
@@ -98,6 +99,26 @@ BlobDigest digestFromBytesFull(const std::string & b, std::string_view what)
     BlobDigest d;
     memcpy(d.bytes.data(), b.data(), b.size());
     return d;
+}
+
+/// `BlobHashAlgo` <-> uint32 (mirrors the other enum<->proto helpers above). Unknown value on decode
+/// is corruption (fail closed).
+uint32_t blobHashAlgoToProto(BlobHashAlgo algo)
+{
+    return static_cast<uint32_t>(algo);
+}
+
+BlobHashAlgo blobHashAlgoFromProto(uint32_t v, std::string_view what)
+{
+    switch (v)
+    {
+        case static_cast<uint32_t>(BlobHashAlgo::CityHash128): return BlobHashAlgo::CityHash128;
+        case static_cast<uint32_t>(BlobHashAlgo::XXH3_128):    return BlobHashAlgo::XXH3_128;
+        case static_cast<uint32_t>(BlobHashAlgo::Sha256):      return BlobHashAlgo::Sha256;
+        default:
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS {}: invalid hash_algo {} in outcome entry", what, v);
+    }
 }
 
 }
@@ -116,10 +137,11 @@ String encodeOutcomeLog(const OutcomeLog & log)
     {
         auto * pe = msg.add_entries();
         pe->set_kind(objectKindToProto(entry.kind));
-        pe->set_hash(digestToBytesFull(entry.hash));
+        pe->set_hash(digestToBytesFull(entry.ref.digest));
         pe->set_token_value(entry.token.value);
         pe->set_token_type(tokenTypeToProto(entry.token.type));
         pe->set_outcome(outcomeKindToProto(entry.outcome));
+        pe->set_hash_algo(blobHashAlgoToProto(entry.ref.algo));
     }
 
     std::string out;
@@ -153,7 +175,8 @@ OutcomeLog decodeOutcomeLog(std::string_view data)
         {
             OutcomeEntry entry;
             entry.kind = objectKindFromProto(pe.kind(), "outcome log");
-            entry.hash = digestFromBytesFull(pe.hash(), "outcome log hash");
+            entry.ref.algo = blobHashAlgoFromProto(pe.hash_algo(), "outcome log");
+            entry.ref.digest = digestFromBytesFull(pe.hash(), "outcome log hash");
             entry.token.value = pe.token_value();
             entry.token.type = tokenTypeFromProto(pe.token_type(), "outcome log");
             entry.outcome = outcomeKindFromProto(pe.outcome(), "outcome log");

@@ -69,12 +69,18 @@ ManifestEntry blobManifestEntry(const String & path, const String & payload)
     return e;
 }
 
+/// The streaming (production-convention) `BlobRef` of `payload` — CityHash128 at the write width.
+BlobRef streamRefOf(const String & payload)
+{
+    return BlobRef{BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(hexToU128(streamingHexOf(payload)))};
+}
+
 ManifestEntry blobManifestEntryStreaming(const String & path, const String & payload)
 {
     ManifestEntry e;
     e.path = path;
     e.placement = EntryPlacement::Blob;
-    e.ref = BlobRef{BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(hexToU128(streamingHexOf(payload)))};
+    e.ref = streamRefOf(payload);
 
     e.blob_size = payload.size();
     return e;
@@ -87,7 +93,7 @@ ManifestId publishOneBlobPartStreaming(
     auto build = startBuildFor(s, ns, ref);
     const ManifestId id = build->stageManifest({blobManifestEntryStreaming(path, payload)});
     build->precommitAdd(ns, ref, id);
-    build->putBlob(BlobId{streamingHexOf(payload)}, BlobSource::fromString(payload));
+    build->putBlob(streamRefOf(payload), BlobSource::fromString(payload));
     build->promote(ns, ref, build->buildId(), id);
     return id;
 }
@@ -154,7 +160,7 @@ TEST(CasBuild, PutBlobWritesEnvelopeWithFixedHeader)
     auto ref = build->putBlob(idOf("hello world"), BlobSource::fromString("hello world"));
     EXPECT_EQ(ref.size, 11u);
 
-    auto raw = b->get(s->layout().blobKey(ref.id));
+    auto raw = b->get(s->layout().blobKey(ref.ref));
     ASSERT_TRUE(raw.has_value());
     auto h = decodeEnvelopeHeader(raw->bytes, raw->bytes.size(), ObjectKind::Blob);
     EXPECT_EQ(h.header_len, s->poolMeta().blob_header_len);   /// 256
@@ -208,7 +214,7 @@ TEST(CasBuild, PutBlobDedupSecondWriterAdopts)
     /// First writer FRESH-uploads (legal pre-precommit — newborn-debris watermark).
     auto build_a = s->startBuild({});
     auto ref_a = build_a->putBlob(idOf("dup"), BlobSource::fromString("dup"));
-    const Token token_a = b->head(s->layout().blobKey(ref_a.id)).token;
+    const Token token_a = b->head(s->layout().blobKey(ref_a.ref)).token;
 
     /// Second writer ADOPTS — the adopt must happen under a durable precommit edge (EDGE-BEFORE-OBSERVE:
     /// stageManifest -> precommitAdd -> putBlob), so give build_b the wiring order.
@@ -218,9 +224,9 @@ TEST(CasBuild, PutBlobDedupSecondWriterAdopts)
     build_b->precommitAdd(ns_b, "ref_b", id_b);
     auto ref_b = build_b->putBlob(idOf("dup"), BlobSource::fromString("dup"));
 
-    EXPECT_EQ(ref_b.id, ref_a.id);
+    EXPECT_EQ(ref_b.ref, ref_a.ref);
     /// A's incarnation survives — the second writer adopts, nothing was overwritten.
-    EXPECT_EQ(b->head(s->layout().blobKey(ref_a.id)).token, token_a);
+    EXPECT_EQ(b->head(s->layout().blobKey(ref_a.ref)).token, token_a);
 }
 
 /// Task 3 (spec §meta-protocols v3): the writer's dedup gate no longer consults the RetireView for the
@@ -252,7 +258,7 @@ TEST(CasBuild, PutBlobAdoptsWhenMetaCleanNoRetireView)
 
     const String payload = "adopt-meta-payload";
     const UInt128 hash = u128Of(payload);
-    const BlobId id = idOf(payload);
+    const BlobRef id = idOf(payload);
     const String blob_key = s->layout().blobKey(id);
 
     /// Pre-seed a body big enough that observeAndAdmit's logical-size guard (hr.size - header_len)
@@ -273,7 +279,7 @@ TEST(CasBuild, PutBlobAdoptsWhenMetaCleanNoRetireView)
     build->precommitAdd(ns, "ref_adopt", manifest_id);
     auto ref = build->putBlob(id, BlobSource::fromString(payload));
 
-    EXPECT_EQ(ref.id, id);
+    EXPECT_EQ(ref.ref, id);
     /// Adopted: the pre-seeded incarnation survives untouched — no putOverwrite/re-upload happened.
     EXPECT_EQ(b->head(blob_key).token, t0);
 
@@ -293,7 +299,7 @@ TEST(CasBuild, PutBlobResurrectsWhenMetaCondemned)
 
     const String payload = "resurrect-meta-payload";
     const UInt128 hash = u128Of(payload);
-    const BlobId id = idOf(payload);
+    const BlobRef id = idOf(payload);
     const String blob_key = s->layout().blobKey(id);
 
     const uint64_t header_len = s->poolMeta().blob_header_len;
@@ -307,7 +313,7 @@ TEST(CasBuild, PutBlobResurrectsWhenMetaCondemned)
     /// NO retire-view seeding anywhere: the resurrect must be decided purely from the meta point-read.
     auto build = s->startBuild({});
     auto ref = build->putBlob(id, BlobSource::fromString(payload));
-    EXPECT_EQ(ref.id, id);
+    EXPECT_EQ(ref.ref, id);
 
     /// Resurrected: the condemned incarnation was displaced by a fresh one.
     const HeadResult hr = b->head(blob_key);
@@ -331,7 +337,7 @@ TEST(CasBuild, PutBlobWrongSizeFailsClosed)
     lying.size = 11;   /// declares 11 but writes 5
     lying.write_payload = [](DB::WriteBuffer & out) { DB::writeString(std::string_view("short"), out); };
 
-    const BlobId id = idOf("does-not-matter");
+    const BlobRef id = idOf("does-not-matter");
     expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&] { build->putBlob(id, std::move(lying)); });
     /// The cancelled stream created nothing.
     EXPECT_FALSE(b->head(s->layout().blobKey(id)).exists);
@@ -364,7 +370,7 @@ TEST(CasBuild, PutBlobStreamsSourceOnceNoFullMaterialization)
     EXPECT_EQ(invocations, 1) << "happy-path upload must stream the source exactly once (no pre-materialization pass)";
 
     /// And the object really landed with the streamed payload (at the fixed header offset).
-    auto raw = b->get(s->layout().blobKey(ref.id));
+    auto raw = b->get(s->layout().blobKey(ref.ref));
     ASSERT_TRUE(raw.has_value());
     auto h = decodeEnvelopeHeader(raw->bytes, raw->bytes.size(), ObjectKind::Blob);
     EXPECT_EQ(raw->bytes.substr(h.header_len), payload);
@@ -409,12 +415,12 @@ TEST(CasBuild, PutBlobResurrectVanishedReUploadsHeldBody)
     auto b = std::make_shared<InMemoryBackend>();
 
     /// 1. Write payload-X via a throwaway build to create the blob; capture its token t0.
-    BlobId id;
+    BlobRef id;
     Token t0;
     {
         auto s0 = openStore(b);
         auto build0 = s0->startBuild({});
-        id = build0->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X")).id;
+        id = build0->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X")).ref;
         t0 = b->head(s0->layout().blobKey(id)).token;
     }
 
@@ -438,7 +444,7 @@ TEST(CasBuild, PutBlobResurrectVanishedReUploadsHeldBody)
     ///    AFTER fix:  condemned dedup → uploadFromSource directly from held body; the object is
     ///                recreated under a FRESH token. NO GET of the condemned object (INV-1).
     auto ref = build->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X"));
-    EXPECT_EQ(ref.id, id);
+    EXPECT_EQ(ref.ref, id);
 
     /// 5. The blob is present again under a FRESH token, with the same payload; and the condemned token
     ///    never returns (INV-NO-RETURN).
@@ -490,12 +496,12 @@ TEST(CasBuild, PutBlobCondemnedDedupNeverGetsTheDyingObject)
     auto b = std::make_shared<InMemoryBackend>();
 
     /// 1. Upload blob Y via a throwaway build; capture the token t0.
-    BlobId id;
+    BlobRef id;
     Token t0;
     {
         auto s0 = openStore(b);
         auto build0 = s0->startBuild({});
-        id = build0->putBlob(idOf("payload-Y"), BlobSource::fromString("payload-Y")).id;
+        id = build0->putBlob(idOf("payload-Y"), BlobSource::fromString("payload-Y")).ref;
         t0 = b->head(s0->layout().blobKey(id)).token;
     }
 
@@ -504,7 +510,7 @@ TEST(CasBuild, PutBlobCondemnedDedupNeverGetsTheDyingObject)
     DB::Cas::Layout layout("p");
     const String blob_key = layout.blobKey(id);
     injectRetire(*b, layout, /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
-        {RetiredEntry{.kind = ObjectKind::Blob, .hash = DB::Cas::BlobDigest::fromU128(u128Of("payload-Y")), .token = t0, .size = 9}});
+        {RetiredEntry{.kind = ObjectKind::Blob, .ref = DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(u128Of("payload-Y"))}, .token = t0, .size = 9}});
     b->deleteExact(blob_key, t0);
     ASSERT_FALSE(b->head(blob_key).exists);
 
@@ -518,7 +524,7 @@ TEST(CasBuild, PutBlobCondemnedDedupNeverGetsTheDyingObject)
     ///    However, even if a racing re-creation happens between the check and the upload, the
     ///    condemned branch must NEVER call backend().get(blob_key).
     auto ref = build->putBlob(idOf("payload-Y"), BlobSource::fromString("payload-Y"));
-    EXPECT_EQ(ref.id, id);
+    EXPECT_EQ(ref.ref, id);
     EXPECT_EQ(counting->get_count, 0u) << "INV-1: putBlob must not GET the dying object to revive it";
 
     const HeadResult hr = b->head(blob_key);
@@ -563,12 +569,12 @@ TEST(CasBuild, PutBlobCondemnedDedupPresentNeverGetsTheDyingObject)
     auto b = std::make_shared<InMemoryBackend>();
 
     /// 1. Upload blob Z via a throwaway build; capture the token t0.
-    BlobId id;
+    BlobRef id;
     Token t0;
     {
         auto s0 = openStore(b);
         auto build0 = s0->startBuild({});
-        id = build0->putBlob(idOf("payload-Z"), BlobSource::fromString("payload-Z")).id;
+        id = build0->putBlob(idOf("payload-Z"), BlobSource::fromString("payload-Z")).ref;
         t0 = b->head(s0->layout().blobKey(id)).token;
     }
 
@@ -587,7 +593,7 @@ TEST(CasBuild, PutBlobCondemnedDedupPresentNeverGetsTheDyingObject)
     /// 4. putBlob Z: putIfAbsentStream → PreconditionFailed (object present) → observeAndAdmit →
     ///    sees condemned token → must call uploadFromSource (NOT resurrect/GET).
     auto ref = build->putBlob(idOf("payload-Z"), BlobSource::fromString("payload-Z"));
-    EXPECT_EQ(ref.id, id);
+    EXPECT_EQ(ref.ref, id);
     EXPECT_EQ(counting->get_count, 0u) << "INV-1: putBlob must not GET the condemned object";
 
     const HeadResult hr = b->head(blob_key);
@@ -686,7 +692,7 @@ TEST(CasBuild, PutBlobVanishDuringRevivalReUploadsNotFatal)
     ///   AFTER fix:  wrapped to ABORTED → putBlob retries → re-uploads from held bytes → succeeds.
     PutBlobResult ref;
     EXPECT_NO_THROW(ref = build->putBlob(idOf("payload-V"), BlobSource::fromString("payload-V")));
-    EXPECT_EQ(ref.id, idOf("payload-V"));
+    EXPECT_EQ(ref.ref, idOf("payload-V"));
 
     /// The blob is present with a fresh incarnation and the exact payload — re-uploaded from source.
     const HeadResult hr = raw->head(blob_key);
@@ -712,12 +718,12 @@ TEST(CasBuild, PromoteBodylessCondemnedDepThrowsAbortedRetryable)
     const RootNamespace ns{"srv1/tbl"};
 
     /// 1. Write payload-X via a throwaway build to create the blob object; capture its token t0.
-    BlobId id;
+    BlobRef id;
     Token t0;
     {
         auto s0 = openStore(b);
         auto build0 = s0->startBuild({});
-        id = build0->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X")).id;
+        id = build0->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X")).ref;
         t0 = b->head(s0->layout().blobKey(id)).token;
     }
 
@@ -770,11 +776,11 @@ TEST(CasBuild, CondemnedPresentEvidenceDepCopiesForwardAtGate)
     {
         auto s0 = openStore(b);
         publishOneBlobPartStreaming(s0, ns, "part_a", "data.bin", "payload-CF");
-        t0 = b->head(s0->layout().blobKey(BlobId{streamingHexOf("payload-CF")})).token;
+        t0 = b->head(s0->layout().blobKey(streamRefOf("payload-CF"))).token;
     }
 
     DB::Cas::Layout layout("p");
-    const String blob_key = layout.blobKey(BlobId{streamingHexOf("payload-CF")});
+    const String blob_key = layout.blobKey(streamRefOf("payload-CF"));
 
     /// 2. Condemn (Blob, hash(CF)) via the meta — models the fold having condemned CF after stale-view
     ///    adoptions landed unfolded (the soak chain). Object stays PRESENT (no delete yet: a
@@ -838,7 +844,7 @@ TEST(CasBuild, PromoteCopiesForwardCondemnedEvidenceInInstalledView)
     /// A committed source part names X (independent live committed owner). putBlob mints X under the
     /// production streaming-hash id, so the copy-forward verifier's payload re-hash matches the content key.
     publishOneBlobPartStreaming(s, ns, "src_part", "data.bin", "payload-CFX");
-    const String blob_key = s->layout().blobKey(BlobId{streamingHexOf("payload-CFX")});
+    const String blob_key = s->layout().blobKey(streamRefOf("payload-CFX"));
     const Token t0 = b->head(blob_key).token;
 
     /// A second build ADOPTS X via adoptEvidence (tokenless dep, NO putBlob ⇒ no retained source), stages,
@@ -877,9 +883,9 @@ TEST(CasBuild, PromoteAbsentTokenlessBlobAbortsRetryable)
     /// Seed X (streaming-keyed) without a committed owner, then adopt it and delete it.
     {
         auto seed = s->startBuild({});
-        seed->putBlob(BlobId{streamingHexOf("payload-ABS")}, BlobSource::fromString("payload-ABS"));
+        seed->putBlob(streamRefOf("payload-ABS"), BlobSource::fromString("payload-ABS"));
     }
-    const String blob_key = s->layout().blobKey(BlobId{streamingHexOf("payload-ABS")});
+    const String blob_key = s->layout().blobKey(streamRefOf("payload-ABS"));
     const Token t0 = b->head(blob_key).token;
 
     auto build = startBuildFor(s, ns, "part_1");
@@ -909,9 +915,9 @@ TEST(CasBuild, PromoteCondemnedLeafWithoutDepAbortsFailClosed)
     /// X exists (streaming-keyed) but THIS build records NO dep for it (no putBlob, no adoptEvidence).
     {
         auto seed = s->startBuild({});
-        seed->putBlob(BlobId{streamingHexOf("payload-NODEP")}, BlobSource::fromString("payload-NODEP"));
+        seed->putBlob(streamRefOf("payload-NODEP"), BlobSource::fromString("payload-NODEP"));
     }
-    const String blob_key = s->layout().blobKey(BlobId{streamingHexOf("payload-NODEP")});
+    const String blob_key = s->layout().blobKey(streamRefOf("payload-NODEP"));
     const Token t0 = b->head(blob_key).token;
 
     auto build = startBuildFor(s, ns, "part_1");
@@ -957,15 +963,14 @@ public:
             EXPECT_EQ(res.outcome, DB::Cas::PutOutcome::Done);
             displaced_to = res.token;
 
-            const DB::Cas::DigestCodec codec(16);
-            const DB::Cas::BlobDigest digest = DB::Cas::BlobDigest::fromU128(hash);
-            const auto lm = DB::Cas::loadMeta(*inner, layout, codec, digest);
+            const DB::Cas::BlobRef ref{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(hash)};
+            const auto lm = DB::Cas::loadMeta(*inner, layout, ref);
             const DB::Cas::BlobMeta clean{.state = DB::Cas::MetaState::Clean, .condemn_round = 0,
                                           .size = bytes->bytes.size()};
             if (lm)
-                DB::Cas::casMeta(*inner, layout, codec, digest, lm->etag, clean);
+                DB::Cas::casMeta(*inner, layout, ref, lm->etag, clean);
             else
-                DB::Cas::putMetaIfAbsent(*inner, layout, codec, digest, clean);
+                DB::Cas::putMetaIfAbsent(*inner, layout, ref, clean);
         }
         return hr;
     }
@@ -1012,8 +1017,8 @@ TEST(CasBuild, CopyForwardMultiBlockPayloadVerifies)
     DB::HashingReadBuffer hashing(in);
     hashing.ignoreAll();
     const String hash_hex = getHexUIntLowercase(hashing.getHash());
-    const BlobId id{hash_hex};
     const UInt128 hash = hexToU128(hash_hex);
+    const BlobRef id{BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(hash)};
 
     Token t0;
     {
@@ -1100,10 +1105,10 @@ TEST(CasBuild, CopyForwardCorruptPayloadFailsClosed)
     {
         auto s0 = openStore(b);
         publishOneBlobPartStreaming(s0, ns, "part_a", "data.bin", "payload-ROT");
-        t0 = b->head(s0->layout().blobKey(BlobId{streamingHexOf("payload-ROT")})).token;
+        t0 = b->head(s0->layout().blobKey(streamRefOf("payload-ROT"))).token;
     }
     DB::Cas::Layout layout("p");
-    const String blob_key = layout.blobKey(BlobId{streamingHexOf("payload-ROT")});
+    const String blob_key = layout.blobKey(streamRefOf("payload-ROT"));
 
     /// Corrupt ONE payload byte in place (valid envelope, damaged content); condemn the hash via the
     /// meta (v3: a per-hash point-read, not the retire-view — condemnation no longer distinguishes
@@ -1148,12 +1153,12 @@ TEST(CasBuild, GateBodylessAdoptFullyDeletedObjectThrowsAbortedNotFatal)
     const RootNamespace ns{"srv1/tbl"};
 
     /// 1. Write payload-B190 via a throwaway build; capture its token t0.
-    BlobId id;
+    BlobRef id;
     Token t0;
     {
         auto s0 = openStore(b);
         auto build0 = s0->startBuild({});
-        id = build0->putBlob(idOf("payload-B190"), BlobSource::fromString("payload-B190")).id;
+        id = build0->putBlob(idOf("payload-B190"), BlobSource::fromString("payload-B190")).ref;
         t0 = b->head(s0->layout().blobKey(id)).token;
     }
 
@@ -1162,7 +1167,7 @@ TEST(CasBuild, GateBodylessAdoptFullyDeletedObjectThrowsAbortedNotFatal)
 
     /// 2. Condemn (Blob, hash(B190), t0) in the retire view AND immediately GC-delete the object.
     injectRetire(*b, layout, /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
-        {RetiredEntry{.kind = ObjectKind::Blob, .hash = DB::Cas::BlobDigest::fromU128(u128Of("payload-B190")), .token = t0, .size = 11}});
+        {RetiredEntry{.kind = ObjectKind::Blob, .ref = DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(u128Of("payload-B190"))}, .token = t0, .size = 11}});
     ASSERT_EQ(b->deleteExact(blob_key, t0).kind, DeleteOutcome::Kind::Deleted);
     ASSERT_FALSE(b->head(blob_key).exists) << "object must be absent before the gate HEAD";
 
@@ -1256,13 +1261,13 @@ TEST(CasBuild, AbandonRemovesStagedDebrisAndDisables)
     const ManifestId mid = build->stageManifest({blobManifestEntry("f", "kept")});
 
     /// The staged manifest body and the blob are present before abandon.
-    EXPECT_TRUE(b->head(s->layout().blobKey(blob_ref.id)).exists);
+    EXPECT_TRUE(b->head(s->layout().blobKey(blob_ref.ref)).exists);
     EXPECT_TRUE(b->head(s->layout().manifestKey(mid)).exists);
 
     build->abandon();
 
     /// Blob stays (debris — full GC reclaims it). The staged manifest debris is best-effort cleaned now.
-    EXPECT_TRUE(b->head(s->layout().blobKey(blob_ref.id)).exists);
+    EXPECT_TRUE(b->head(s->layout().blobKey(blob_ref.ref)).exists);
     EXPECT_FALSE(b->head(s->layout().manifestKey(mid)).exists)
         << "abandon must best-effort delete this build's staged manifest debris";
 
@@ -1381,7 +1386,7 @@ TEST(CasBuild, PublishIntoSecondNamespaceSameBlob)
     /// First build publishes part_1 in ns1, uploading the blob.
     auto build1 = startBuildFor(s, ns1, "part_1");
     auto blob = build1->putBlob(idOf("hello world"), BlobSource::fromString("hello world"));
-    const String blob_key = s->layout().blobKey(blob.id);
+    const String blob_key = s->layout().blobKey(blob.ref);
     const Token blob_token = b->head(blob_key).token;
     const ManifestId id1 = build1->stageManifest({blobManifestEntry("data.bin", "hello world")});
     build1->precommitAdd(ns1, "part_1", id1);
@@ -1604,7 +1609,7 @@ TEST(CasBuild, ConvergesUnderProductiveGc)
 
     /// 1. Build A creates H ("shared-content"), publishes a part referencing it, then drops the ref.
     ///    Capture H's first incarnation token so we can condemn exactly it.
-    BlobId h;
+    BlobRef h;
     Token h_token0;
     {
         auto s0 = Store::open(b, cfg);
@@ -1622,7 +1627,7 @@ TEST(CasBuild, ConvergesUnderProductiveGc)
     ///    now writes (Task 5), without driving a full round just to observe H at in-degree 0.
     DB::Cas::Layout layout("p");
     injectRetire(*b, layout, /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
-        {RetiredEntry{.kind = ObjectKind::Blob, .hash = DB::Cas::BlobDigest::fromU128(u128Of(content)), .token = h_token0,
+        {RetiredEntry{.kind = ObjectKind::Blob, .ref = DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(u128Of(content))}, .token = h_token0,
                       .size = content.size()}});
     condemnMeta(*b, layout, u128Of(content), /*condemn_round*/ 1);
 
@@ -1636,7 +1641,7 @@ TEST(CasBuild, ConvergesUnderProductiveGc)
     /// B190: use putBlob (holds source bytes). putBlob detects the condemned dedup hit and calls
     /// uploadFromSource — no GET of dying object.
     const auto ref_b = build_b->putBlob(h, BlobSource::fromString(content));
-    ASSERT_EQ(ref_b.id, h);
+    ASSERT_EQ(ref_b.ref, h);
 
     const HeadResult after_reupload = b->head(blob_key);
     ASSERT_TRUE(after_reupload.exists);
@@ -1733,7 +1738,7 @@ TEST(CasBuild, AdoptedBlobVanishedIsRetryableNotFatal)
     const RootNamespace ns{"srv1/tbl"};
 
     /// 1. Build A: upload the blob and publish a ref that references it. Capture the blob id and token.
-    BlobId id;
+    BlobRef id;
     Token t0;
     {
         auto s0 = openStore(b);
@@ -2081,7 +2086,7 @@ TEST(CasBuild, WDepSetCrossAlgoSatisfactionFailsClosed)
     /// Only the ch128 leaf's body is ever uploaded — its BlobId hex is the digest at the ch128 width,
     /// which addresses EXACTLY `e_ch128`'s object key (`blobs/ch128/...`), a DISTINCT key from
     /// `e_xxh3`'s (`blobs/xxh3/...`), even though the raw digest bytes are identical.
-    build->putBlob(BlobId{DigestCodec(16).toHex(shared_digest)}, BlobSource::fromString("abc"));
+    build->putBlob(BlobRef{BlobHashAlgo::CityHash128, shared_digest}, BlobSource::fromString("abc"));
 
     /// promote must fail closed: the xxh3:X leaf has no tokened dep and no body at its own (distinct)
     /// key — never silently satisfied by the ch128:X entry's tokened dep.

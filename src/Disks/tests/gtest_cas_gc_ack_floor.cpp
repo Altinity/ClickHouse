@@ -23,14 +23,14 @@ ManifestRef ref(const String &, uint64_t seq, uint64_t inst)
 }
 bool blobExists(InMemoryBackend & b, const Layout & layout, const UInt128 & hash)
 {
-    return b.head(layout.blobKey(BlobId(u128ToHex(hash)))).exists;
+    return b.head(layout.blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hash)})).exists;
 }
 
 /// The current retired entry for `hash` (dereferenced through gc/state.retired_refs, shard 0), or nullopt.
 std::optional<RetiredEntry> currentEntryFor(Backend & backend, const Layout & layout, const UInt128 & hash)
 {
     for (const RetiredEntry & e : currentRetiredSet(backend, layout, /*shard*/0))
-        if (e.hash == BlobDigest::fromU128(hash))
+        if (e.ref == BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hash)})
             return e;
     return std::nullopt;
 }
@@ -159,7 +159,7 @@ TEST(CasGcRetire, SpareLeavesMetaCondemned)
     /// resolves to THIS exact hash (GC condemns it; the writer resurrects it).
     const String payload = "spare-add-only-payload";
     const UInt128 hash = u128Of(payload);
-    const BlobId id = idOf(payload);
+    const BlobRef id = idOf(payload);
     {
         auto seed = store->startBuild({});
         seed->putBlob(id, BlobSource::fromString(payload));
@@ -207,7 +207,7 @@ TEST(CasGcRetire, SpareLeavesMetaCondemned)
     /// the meta flips to Clean WITH that token change.
     auto build = store->startBuild({});
     auto ref_w = build->putBlob(id, BlobSource::fromString(payload));
-    EXPECT_EQ(ref_w.id, id);
+    EXPECT_EQ(ref_w.ref, id);
     const Token t_resurrect = backend->head(store->layout().blobKey(id)).token;
     EXPECT_NE(t_resurrect, t_seed) << "resurrect displaces the body with a fresh incarnation token";
     const auto lm_after = loadMetaForTest(*backend, store->layout(), hash);
@@ -235,7 +235,7 @@ TEST(CasGcRetire, StaleRedeleteAfterSpareDoesNotDeleteLiveReuse)
 
     const String payload = "two-leader-stale-redelete-payload";
     const UInt128 hash = u128Of(payload);
-    const BlobId id = idOf(payload);
+    const BlobRef id = idOf(payload);
     const String blob_key = store->layout().blobKey(id);
     {
         auto seed = store->startBuild({});
@@ -315,7 +315,7 @@ TEST(CasGcRetire, CopyForwardedBlobSurvivesWhenRepublished)
     /// The raw equivalent of Build::copyForwardFromCondemned: displace EXACTLY t0 with the same
     /// verified bytes under a fresh token t1, then republish a part referencing the blob (the
     /// promoted dst ref of a republishRef move).
-    const String blob_key = store->layout().blobKey(BlobId{u128ToHex(DB::UInt128(1))});
+    const String blob_key = store->layout().blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::UInt128(1))});
     const Token t0 = backend->head(blob_key).token;
     const auto res = backend->putOverwrite(blob_key, backend->get(blob_key)->bytes, t0);
     ASSERT_EQ(res.outcome, PutOutcome::Done);
@@ -355,7 +355,7 @@ TEST(CasGcRetire, AbandonedCopyForwardDropsEntryWithoutWrongTokenDelete)
     gc.runRegularRound();
     ASSERT_TRUE(currentEntryFor(*backend, store->layout(), DB::UInt128(1)).has_value());
 
-    const String blob_key = store->layout().blobKey(BlobId{u128ToHex(DB::UInt128(1))});
+    const String blob_key = store->layout().blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::UInt128(1))});
     const Token t0 = backend->head(blob_key).token;
     const auto res = backend->putOverwrite(blob_key, backend->get(blob_key)->bytes, t0);
     ASSERT_EQ(res.outcome, PutOutcome::Done);
@@ -608,7 +608,7 @@ TEST(CasGcAckFloor, RecreatedBlobDeleteIsTokenMismatchOk)
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref("srv-a:1", 1, 0xAA);
     const UInt128 blob = DB::UInt128(1);
-    const BlobId blob_id(u128ToHex(blob));
+    const BlobRef blob_id{BlobHashAlgo::CityHash128, BlobDigest::fromU128(blob)};
     writeBlobBody(*backend, store->layout(), blob);
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", blob)});
     publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
@@ -656,7 +656,7 @@ TEST(CasGcAckFloor, ResumeAfterCrashBetweenRetiredPutAndStateCas)
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref("srv-a:1", 1, 0xAA);
     const UInt128 blob = DB::UInt128(1);
-    const BlobId blob_id(u128ToHex(blob));
+    const BlobRef blob_id{BlobHashAlgo::CityHash128, BlobDigest::fromU128(blob)};
     writeBlobBody(*backend, store->layout(), blob);
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", blob)});
     publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);

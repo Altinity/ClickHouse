@@ -308,7 +308,7 @@ bool ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
                 copyData(in, out);
             };
         }
-        st.build->putBlob(Cas::BlobId(Cas::blobHexOf(pb.ref)), std::move(source));
+        st.build->putBlob(pb.ref, std::move(source));
     }
 
     const bool ref_existed = metadata_storage.partAccess().existsRef({ns, ref}, ContentAddressed::Freshness::ForceFresh);
