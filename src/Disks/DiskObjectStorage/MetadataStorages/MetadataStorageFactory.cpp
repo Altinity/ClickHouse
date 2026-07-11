@@ -287,16 +287,14 @@ static void registerContentAddressedMetadataStorage(MetadataStorageFactory & fac
         /// S3-native staging (design 2026-07-11-cas-s3-native-staging-design.md §4, plan Task 0):
         /// `cas_staging_backend` defaults to `local` — BYTE-FOR-BYTE the current write path, zero
         /// behavior change, no probe, no new code path taken (global constraint: OFF BY DEFAULT).
-        /// `cas_s3_staging_min_bytes` only matters once `cas_staging_backend=s3` (a later task).
         const auto staging_backend = ContentAddressedMetadataStorage::parseStagingBackend(config, config_prefix);
-        const uint64_t s3_staging_min_bytes = ContentAddressedMetadataStorage::parseS3StagingMinBytes(config, config_prefix);
         auto metadata_storage = std::make_shared<ContentAddressedMetadataStorage>(
             local_object_storage, key_compatibility_prefix, toString(ServerUUID::get()), server_root_id, local_scratch_path,
             global_context, gc_enabled, gc_interval, root_shards, name, dedup_cache_bytes, dedup_head_first_min_bytes,
             gc_snap_generations_to_keep, gc_shards, manifest_sweep_list_budget_keys, manifest_sweep_delete_budget_keys,
             manifest_soft_limit, manifest_hard_limit, manifest_max_delay_ms, gcs_max_conditional_put_bytes,
             cas_part_folder_cache_bytes, cas_part_folder_cache_max_entries, cas_part_folder_cache_max_entry_bytes,
-            manifest_decode_cache_bytes, gc_meta_pool_size, staging_backend, s3_staging_min_bytes);
+            manifest_decode_cache_bytes, gc_meta_pool_size, staging_backend);
 
         return metadata_storage;
     });

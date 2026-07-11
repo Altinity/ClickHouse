@@ -85,10 +85,9 @@ public:
         /// see `PoolConfig::gc_meta_pool_size`.
         uint64_t gc_meta_pool_size_ = 16,
         /// S3-native staging Task 0 (config plumbing, no behavior change): see `StagingBackend`
-        /// above. Trailing defaults keep every existing positional call site (the disk factory,
+        /// above. Trailing default keeps every existing positional call site (the disk factory,
         /// the gtests that stop at `context_`) compiling unmodified.
-        StagingBackend staging_backend_ = StagingBackend::Local,
-        uint64_t s3_staging_min_bytes_ = 64ULL << 20);
+        StagingBackend staging_backend_ = StagingBackend::Local);
 
     /// Parse `cas_staging_backend` from the CAS disk config (default `local` — the OFF BY DEFAULT
     /// global constraint). Extracted as a static method (rather than inlined into
@@ -96,9 +95,6 @@ public:
     /// logic is unit-testable without constructing the full disk factory. Throws BAD_ARGUMENTS on an
     /// unrecognized value (fail closed rather than silently defaulting to `local`).
     static StagingBackend parseStagingBackend(const Poco::Util::AbstractConfiguration & config, const std::string & config_prefix);
-    /// Parse `cas_s3_staging_min_bytes` from the CAS disk config (default 64 MiB). Only meaningful
-    /// when `stagingBackend() == StagingBackend::S3`.
-    static uint64_t parseS3StagingMinBytes(const Poco::Util::AbstractConfiguration & config, const std::string & config_prefix);
 
     /// Test/diagnostics: one synchronous GC round (creates an ad-hoc scheduler when disabled).
     void runOneGcRoundForTest();
@@ -163,10 +159,9 @@ public:
     const std::string & serverId() const { return server_id; }
     const std::string & serverRootId() const { return server_root_id; }
     const std::string & scratchPath() const { return local_scratch_path; }
-    /// S3-native staging Task 0 accessors — pure config plumbing, no behavior change. `writeFile`
-    /// starts consulting these in a later task (Task 3/4 of the plan); today they are stored-but-unread.
+    /// S3-native staging Task 0 accessor — pure config plumbing, no behavior change. `writeFile`
+    /// starts consulting this in a later task (Task 3/4 of the plan); today it is stored-but-unread.
     StagingBackend stagingBackend() const { return staging_backend; }
-    uint64_t s3StagingMinBytes() const { return s3_staging_min_bytes; }
     /// Set by the mount-time conditional-copy capability probe (a later task). Defaults to `false`:
     /// conditional copy is assumed UNSUPPORTED until proven otherwise (fail-close), so consulting this
     /// accessor before the probe wiring lands can never mistakenly enable the S3 promote path.
@@ -291,7 +286,6 @@ private:
     const uint64_t gc_meta_pool_size;
     /// S3-native staging Task 0 (config plumbing, no behavior change): see `StagingBackend` above.
     const StagingBackend staging_backend;
-    const uint64_t s3_staging_min_bytes;
     /// Set later by the mount-time conditional-copy capability probe (a later task) — NOT const.
     /// Defaults to false (fail-close): assumed unsupported until the probe proves otherwise.
     bool conditional_copy_supported = false;

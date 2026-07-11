@@ -22,14 +22,13 @@
 #include <string>
 
 /// Task 0 of the S3-native staging plan (docs/superpowers/plans/2026-07-11-cas-s3-native-staging.md):
-/// pure config plumbing, ZERO behavior change. `cas_staging_backend` (default `local`) and
-/// `cas_s3_staging_min_bytes` (default 64 MiB) are parsed from the CAS disk config; the parsed
-/// `StagingBackend` is exposed via `ContentAddressedMetadataStorage::stagingBackend()` /
-/// `::s3StagingMinBytes()`. `::conditionalCopySupported()` is a stored bool, defaulting to `false`
-/// until a later task wires the mount-time capability probe.
+/// pure config plumbing, ZERO behavior change. `cas_staging_backend` (default `local`) is parsed
+/// from the CAS disk config; the parsed `StagingBackend` is exposed via
+/// `ContentAddressedMetadataStorage::stagingBackend()`. `::conditionalCopySupported()` is a stored
+/// bool, defaulting to `false` until a later task wires the mount-time capability probe.
 ///
 /// The global constraint (OFF BY DEFAULT) is the DEFAULT arm below: absent config keys must parse to
-/// `StagingBackend::Local` with the default min-bytes threshold and `conditionalCopySupported()==false`.
+/// `StagingBackend::Local` with `conditionalCopySupported()==false`.
 
 namespace
 {
@@ -234,23 +233,19 @@ DB::Cas::BlobSource serverSideCopySource(const std::string & staging_key, uint64
 
 }
 
-TEST(CasS3Staging, ParsesS3BackendAndMinBytesFromConfig)
+TEST(CasS3Staging, ParsesS3BackendFromConfig)
 {
-    auto config = configWithDiskSection(
-        "<cas_staging_backend>s3</cas_staging_backend>"
-        "<cas_s3_staging_min_bytes>67108864</cas_s3_staging_min_bytes>");
+    auto config = configWithDiskSection("<cas_staging_backend>s3</cas_staging_backend>");
 
     EXPECT_EQ(DB::ContentAddressedMetadataStorage::parseStagingBackend(*config, "disk"), DB::StagingBackend::S3);
-    EXPECT_EQ(DB::ContentAddressedMetadataStorage::parseS3StagingMinBytes(*config, "disk"), 67108864ULL);
 }
 
-TEST(CasS3Staging, DefaultConfigParsesToLocalBackendAndDefaultMinBytes)
+TEST(CasS3Staging, DefaultConfigParsesToLocalBackend)
 {
-    /// No `cas_staging_backend` / `cas_s3_staging_min_bytes` keys at all — the OFF BY DEFAULT arm.
+    /// No `cas_staging_backend` key at all — the OFF BY DEFAULT arm.
     auto config = configWithDiskSection("<scratch_path>/tmp/whatever</scratch_path>");
 
     EXPECT_EQ(DB::ContentAddressedMetadataStorage::parseStagingBackend(*config, "disk"), DB::StagingBackend::Local);
-    EXPECT_EQ(DB::ContentAddressedMetadataStorage::parseS3StagingMinBytes(*config, "disk"), 64ULL << 20);
 }
 
 TEST(CasS3Staging, UnknownBackendValueThrows)
@@ -269,7 +264,6 @@ TEST(CasS3Staging, DefaultConstructedStorageReportsLocalAndNoConditionalCopy)
         std::filesystem::temp_directory_path() / "cas_s3_staging_default_scratch", nullptr);
 
     EXPECT_EQ(storage->stagingBackend(), DB::StagingBackend::Local);
-    EXPECT_EQ(storage->s3StagingMinBytes(), 64ULL << 20);
     EXPECT_FALSE(storage->conditionalCopySupported());
 }
 
@@ -619,8 +613,7 @@ std::shared_ptr<DB::ContentAddressedMetadataStorage> makeS3StagingMetadataStorag
         /*cas_part_folder_cache_max_entry_bytes_=*/16ULL << 20,
         /*manifest_decode_cache_bytes_=*/128ULL << 20,
         /*gc_meta_pool_size_=*/16,
-        DB::StagingBackend::S3,
-        /*s3_staging_min_bytes_=*/0);
+        DB::StagingBackend::S3);
 }
 
 /// Mirrors gtest_ca_wiring.cpp's helper of the same shape.
