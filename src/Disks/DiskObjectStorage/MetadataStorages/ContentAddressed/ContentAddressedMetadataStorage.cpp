@@ -18,6 +18,7 @@
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
 #include <Common/thread_local_rng.h>
+#include <Poco/Util/AbstractConfiguration.h>
 #include <chrono>
 #include <filesystem>
 #include <ctime>
@@ -142,7 +143,9 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     uint64_t cas_part_folder_cache_max_entries_,
     uint64_t cas_part_folder_cache_max_entry_bytes_,
     uint64_t manifest_decode_cache_bytes_,
-    uint64_t gc_meta_pool_size_)
+    uint64_t gc_meta_pool_size_,
+    StagingBackend staging_backend_,
+    uint64_t s3_staging_min_bytes_)
     : object_storage(std::move(object_storage_))
     , storage_path_prefix(std::move(storage_path_prefix_))
     , storage_path_full(fs::path(object_storage->getRootPrefix()) / storage_path_prefix)
@@ -169,7 +172,27 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     , cas_part_folder_cache_max_entry_bytes(cas_part_folder_cache_max_entry_bytes_)
     , manifest_decode_cache_bytes(manifest_decode_cache_bytes_)
     , gc_meta_pool_size(gc_meta_pool_size_)
+    , staging_backend(staging_backend_)
+    , s3_staging_min_bytes(s3_staging_min_bytes_)
 {
+}
+
+StagingBackend ContentAddressedMetadataStorage::parseStagingBackend(
+    const Poco::Util::AbstractConfiguration & config, const std::string & config_prefix)
+{
+    const std::string value = config.getString(config_prefix + ".cas_staging_backend", "local");
+    if (value == "local")
+        return StagingBackend::Local;
+    if (value == "s3")
+        return StagingBackend::S3;
+    throw Exception(ErrorCodes::BAD_ARGUMENTS,
+        "Unknown cas_staging_backend value '{}' (expected 'local' or 's3')", value);
+}
+
+uint64_t ContentAddressedMetadataStorage::parseS3StagingMinBytes(
+    const Poco::Util::AbstractConfiguration & config, const std::string & config_prefix)
+{
+    return config.getUInt64(config_prefix + ".cas_s3_staging_min_bytes", 64ULL << 20);
 }
 
 void ContentAddressedMetadataStorage::runOneGcRoundForTest()

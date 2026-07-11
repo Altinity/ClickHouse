@@ -13,8 +13,23 @@
 #include <optional>
 #include <string>
 
+namespace Poco::Util { class AbstractConfiguration; }
+
 namespace DB
 {
+
+/// Per-disk CAS staging backend selection (design `docs/superpowers/specs/2026-07-11-cas-s3-native-staging-design.md`
+/// §4, plan `docs/superpowers/plans/2026-07-11-cas-s3-native-staging.md` Task 0). `Local` (the
+/// default) is BYTE-FOR-BYTE the current write path (the local `scratchPath` write-buffer spill) —
+/// zero behavior change, no capability probe, no new code path taken (global constraint: OFF BY
+/// DEFAULT). `S3` opts in to streaming large blobs directly to an S3-native staging key; it is still
+/// subject to the mount-time conditional-copy capability probe (a later task), which can fail-close
+/// back to `Local` when the object storage does not enforce conditional writes.
+enum class StagingBackend
+{
+    Local,
+    S3,
+};
 
 /// Content-addressed metadata storage — the M-W wiring (design 2026-06-11 section 4): a THIN
 /// translator between the IMetadataStorage read surface and the Cas:: core. ClickHouse path
@@ -68,7 +83,22 @@ public:
         uint64_t manifest_decode_cache_bytes_ = 128ULL << 20,
         /// Task 5: bounded pool size for GC's per-hash freshness-meta writes (condemn/spare/delete);
         /// see `PoolConfig::gc_meta_pool_size`.
-        uint64_t gc_meta_pool_size_ = 16);
+        uint64_t gc_meta_pool_size_ = 16,
+        /// S3-native staging Task 0 (config plumbing, no behavior change): see `StagingBackend`
+        /// above. Trailing defaults keep every existing positional call site (the disk factory,
+        /// the gtests that stop at `context_`) compiling unmodified.
+        StagingBackend staging_backend_ = StagingBackend::Local,
+        uint64_t s3_staging_min_bytes_ = 64ULL << 20);
+
+    /// Parse `cas_staging_backend` from the CAS disk config (default `local` — the OFF BY DEFAULT
+    /// global constraint). Extracted as a static method (rather than inlined into
+    /// `MetadataStorageFactory.cpp` like the neighboring `scratch_path` read) so the config-parsing
+    /// logic is unit-testable without constructing the full disk factory. Throws BAD_ARGUMENTS on an
+    /// unrecognized value (fail closed rather than silently defaulting to `local`).
+    static StagingBackend parseStagingBackend(const Poco::Util::AbstractConfiguration & config, const std::string & config_prefix);
+    /// Parse `cas_s3_staging_min_bytes` from the CAS disk config (default 64 MiB). Only meaningful
+    /// when `stagingBackend() == StagingBackend::S3`.
+    static uint64_t parseS3StagingMinBytes(const Poco::Util::AbstractConfiguration & config, const std::string & config_prefix);
 
     /// Test/diagnostics: one synchronous GC round (creates an ad-hoc scheduler when disabled).
     void runOneGcRoundForTest();
@@ -133,6 +163,14 @@ public:
     const std::string & serverId() const { return server_id; }
     const std::string & serverRootId() const { return server_root_id; }
     const std::string & scratchPath() const { return local_scratch_path; }
+    /// S3-native staging Task 0 accessors — pure config plumbing, no behavior change. `writeFile`
+    /// starts consulting these in a later task (Task 3/4 of the plan); today they are stored-but-unread.
+    StagingBackend stagingBackend() const { return staging_backend; }
+    uint64_t s3StagingMinBytes() const { return s3_staging_min_bytes; }
+    /// Set by the mount-time conditional-copy capability probe (a later task). Defaults to `false`:
+    /// conditional copy is assumed UNSUPPORTED until proven otherwise (fail-close), so consulting this
+    /// accessor before the probe wiring lands can never mistakenly enable the S3 promote path.
+    bool conditionalCopySupported() const { return conditional_copy_supported; }
 
     /// Bytes that live INSIDE pool metadata rather than as their own object: a mutable per-part
     /// file's bytes from RefPayload.mutable_files, an Inline-placement tree entry, or a verbatim
@@ -241,6 +279,12 @@ private:
     const uint64_t manifest_decode_cache_bytes;
     /// Task 5: bounded pool size for GC's per-hash freshness-meta writes, threaded into PoolConfig.
     const uint64_t gc_meta_pool_size;
+    /// S3-native staging Task 0 (config plumbing, no behavior change): see `StagingBackend` above.
+    const StagingBackend staging_backend;
+    const uint64_t s3_staging_min_bytes;
+    /// Set later by the mount-time conditional-copy capability probe (a later task) — NOT const.
+    /// Defaults to false (fail-close): assumed unsupported until the probe proves otherwise.
+    bool conditional_copy_supported = false;
 
     /// Set by startup (Store::open is fail-closed; empty store == not started).
     Cas::StorePtr cas_store;
