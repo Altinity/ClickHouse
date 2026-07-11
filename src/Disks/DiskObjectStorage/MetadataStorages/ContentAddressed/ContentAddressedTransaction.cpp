@@ -145,8 +145,15 @@ void ContentAddressedTransaction::cleanupPendingTempFiles() noexcept
     {
         for (const auto & pb : st.pending_blobs)
         {
-            std::error_code ec;
-            std::filesystem::remove(pb.temp_path, ec);
+            if (pb.backend == StagingBackend::Local)
+            {
+                std::error_code ec;
+                std::filesystem::remove(pb.staging_key, ec);
+            }
+            /// Task 6: an S3-mode pending blob's staging object is NOT removed here. It is deleted by
+            /// the promote path after a successful copy, or reclaimed by the mount-lease sweeper on an
+            /// abandoned/cancelled transaction — never a bare fs::remove (staging_key is a remote
+            /// object key, not a local path).
         }
         st.pending_blobs.clear();
     }
@@ -248,12 +255,16 @@ bool ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
     {
         if (!referenced_hashes.count(pb.hash))
             continue;   /// B189: orphaned pending blob (entry removed by unlinkFile/replaceFile) — skip
+        /// Task 5 (plan docs/superpowers/plans/2026-07-11-cas-s3-native-staging.md) wires the S3-mode
+        /// promote (a conditional server-side copy from `pb.staging_key`, condemn/resurrect gate
+        /// preserved) — this loop, as of Task 4, only handles `StagingBackend::Local` pending blobs
+        /// (the sole kind any test stages end-to-end so far: S3 mode is off by default).
         Cas::BlobSource source;
         source.size = pb.size;
-        const std::string temp_path = pb.temp_path;
-        source.write_payload = [temp_path](WriteBuffer & out)
+        const std::string staging_key = pb.staging_key;
+        source.write_payload = [staging_key](WriteBuffer & out)
         {
-            ReadBufferFromFile in(temp_path);
+            ReadBufferFromFile in(staging_key);
             copyData(in, out);
         };
         st.build->putBlob(Cas::BlobId(Cas::u128ToHex(pb.hash)), std::move(source));
@@ -382,8 +393,10 @@ std::unique_ptr<ReadBufferFromFileBase> ContentAddressedTransaction::tryReadFile
         {
             /// B188: a pending blob has not been uploaded yet — serve reads from the local temp file
             /// (the same file that will be streamed to the pool in publishStaging post-precommit).
+            /// Local-mode only, as of Task 4 (S3-mode pending blobs are staged-but-not-yet-promoted;
+            /// Task 5 wires their read-your-writes path, if needed, alongside the promote).
             if (const auto * pb = findPendingBlob(it->second, entry->blob_hash))
-                return std::make_unique<ReadBufferFromFile>(pb->temp_path);
+                return std::make_unique<ReadBufferFromFile>(pb->staging_key);
             return metadata_storage.readBlobPayload(metadata_storage.store()->locate(*entry), path, settings);
         }
     }
@@ -465,13 +478,14 @@ void ContentAddressedTransaction::createMetadataFile(const std::string &, const 
 
 void ContentAddressedTransaction::stageBlobPartFile(
     const ContentAddressedMetadataStorage::Route & route,
-    const UInt128 & hash, size_t size, const std::string & temp_path)
+    const UInt128 & hash, size_t size, const std::string & staging_key, StagingBackend backend)
 {
     /// B188: do NOT upload here. Record the pending blob (uploaded post-precommit in publishStaging)
     /// and a tokenless dep so stageTree's W-TREE-BUILD check passes; putBlob later overwrites it with
-    /// the tokened dep. The temp file is kept (the transaction owns it).
+    /// the tokened dep. The staging bytes are kept (the transaction owns them) — a local temp file for
+    /// `StagingBackend::Local`, an S3 staging object for `StagingBackend::S3` (Task 4).
     auto & st = stagingFor(route);
-    st.pending_blobs.push_back({hash, temp_path, size});
+    st.pending_blobs.push_back({hash, staging_key, size, backend});
     buildFor(route, st).recordPendingBlobDep(hash, size);
 
     Cas::ManifestEntry entry;
@@ -538,12 +552,35 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
             });
     }
 
-    /// A CONTENT part file that must stay a blob (per-column data/marks, primary.idx): spill + hash
-    /// into a local temp file, then stage the blob as PENDING (B188 precommit-first). The blob is NOT
-    /// uploaded here; publishStaging uploads it post-precommit. recordPendingBlobDep (inside
-    /// stageBlobPartFile) lets stageTree's W-TREE-BUILD check pass without any pool op at staging time.
+    /// A CONTENT part file that must stay a blob (per-column data/marks, primary.idx): spill + hash,
+    /// then stage the blob as PENDING (B188 precommit-first). The blob is NOT uploaded/promoted here;
+    /// publishStaging uploads it (Local) or a later task's promote drives it (S3) post-precommit.
+    /// recordPendingBlobDep (inside stageBlobPartFile) lets stageTree's W-TREE-BUILD check pass
+    /// without any pool op at staging time.
     if (ContentAddressed::partFileMustStayBlob(r->file))
     {
+        /// S3-native staging (Task 4, plan docs/superpowers/plans/2026-07-11-cas-s3-native-staging.md):
+        /// when this disk opted in (`cas_staging_backend=s3`) AND the mount-time capability probe
+        /// (Task 3) proved the object storage enforces write-once conditional copy, stream directly
+        /// to a fresh per-mount S3 staging object while hashing — no local-disk round trip. Otherwise
+        /// (the OFF BY DEFAULT global constraint, or a probe fail-close) fall through to the existing,
+        /// byte-for-byte-unchanged local-temp-file path below.
+        if (metadata_storage.stagingBackend() == StagingBackend::S3 && metadata_storage.conditionalCopySupported())
+        {
+            const std::string staging_key = metadata_storage.stagingKeyPrefix() + "/" + getRandomASCIIString(32) + ".tmp";
+            auto object_sink = metadata_storage.objectStorage()->writeObject(StoredObject(staging_key), WriteMode::Rewrite);
+            return std::make_unique<ContentAddressed::CaContentWriteBuffer>(
+                std::move(object_sink),
+                staging_key,
+                buf_size,
+                settings.use_adaptive_write_buffer,
+                settings.adaptive_write_buffer_initial_size,
+                [this, route = *r](const std::string & hash_hex, size_t size, const std::string & key)
+                {
+                    stageBlobPartFile(route, Cas::hexToU128(hash_hex), size, key, StagingBackend::S3);
+                });
+        }
+
         return std::make_unique<ContentAddressed::CaContentWriteBuffer>(
             metadata_storage.scratchPath(),
             buf_size,
@@ -551,7 +588,7 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
             settings.adaptive_write_buffer_initial_size,
             [this, route = *r](const std::string & hash_hex, size_t size, const std::string & temp_path)
             {
-                stageBlobPartFile(route, Cas::hexToU128(hash_hex), size, temp_path);
+                stageBlobPartFile(route, Cas::hexToU128(hash_hex), size, temp_path, StagingBackend::Local);
             });
     }
 
@@ -602,10 +639,12 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
                 }
                 /// Until stageBlobPartFile takes ownership, WE own the temp file — mirror the blob path,
                 /// where CaContentWriteBuffer's dtor removes it unless the callback succeeded. If
-                /// stageBlobPartFile throws, drop the orphan instead of leaking it into scratch.
+                /// stageBlobPartFile throws, drop the orphan instead of leaking it into scratch. This
+                /// fallback is always `StagingBackend::Local` — an oversized inline candidate is rare
+                /// enough (a safety net, not a hot path) that Task 4's S3-staging mode does not cover it.
                 bool staged = false;
                 SCOPE_EXIT({ if (!staged) { std::error_code ec; std::filesystem::remove(temp_path, ec); } });
-                stageBlobPartFile(route, hash, bytes.size(), temp_path);
+                stageBlobPartFile(route, hash, bytes.size(), temp_path, StagingBackend::Local);
                 staged = true;
             }
         });

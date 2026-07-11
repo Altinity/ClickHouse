@@ -96,7 +96,12 @@ private:
         bool published = false;                    /// the ref is already durably published (at the
                                                    /// lock-free rename); commit() must not re-publish it.
 
-        struct PendingBlob { UInt128 hash; std::string temp_path; uint64_t size = 0; };
+        /// `staging_key`: the local temp path (`StagingBackend::Local`) or the S3 staging object key
+        /// (`StagingBackend::S3`, plan `docs/superpowers/plans/2026-07-11-cas-s3-native-staging.md`
+        /// Task 4) that `CaContentWriteBuffer::on_finalized` handed back. `backend` selects which:
+        /// `cleanupPendingTempFiles` only `fs::remove`s `Local` entries — an `S3` staging object is
+        /// reclaimed by the promote path or the mount-lease sweeper (a later task), never here.
+        struct PendingBlob { UInt128 hash; std::string staging_key; uint64_t size = 0; StagingBackend backend = StagingBackend::Local; };
         std::vector<PendingBlob> pending_blobs;    /// B188: spilled+hashed locally; uploaded post-precommit
     };
 
@@ -113,10 +118,11 @@ private:
     std::vector<std::pair<Cas::RootNamespace, std::string>> rename_published_refs;
 
     /// Stage a CONTENT part file as a blob: record the pending upload + a tokenless dep (so stageTree's
-    /// W-TREE-BUILD passes) and add/replace its Blob TreeEntry. Shared by the streaming-blob path and
-    /// the inline-cap fallback.
+    /// W-TREE-BUILD passes) and add/replace its Blob TreeEntry. Shared by the streaming-blob path
+    /// (Local or S3-staging, `backend` says which) and the always-Local inline-cap fallback.
     void stageBlobPartFile(const ContentAddressedMetadataStorage::Route & route,
-                           const UInt128 & hash, size_t size, const std::string & temp_path);
+                           const UInt128 & hash, size_t size, const std::string & staging_key,
+                           StagingBackend backend);
 
     PartStaging & stagingFor(const ContentAddressedMetadataStorage::Route & r);
     PartStaging * findStaging(const ContentAddressedMetadataStorage::Route & r);

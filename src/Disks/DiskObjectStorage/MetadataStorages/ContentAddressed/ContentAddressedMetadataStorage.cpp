@@ -504,6 +504,15 @@ MetadataTransactionPtr ContentAddressedMetadataStorage::createTransaction()
     return std::make_shared<ContentAddressedTransaction>(*this);
 }
 
+String ContentAddressedMetadataStorage::stagingKeyPrefix() const
+{
+    /// Mirrors the Task 3 probe's own prefix construction (`startup()`'s `probe_prefix` above), minus
+    /// the probe's own `/probe` leaf — this is the writer-owned sibling subtree of the SAME
+    /// `staging/<server_root_id>/` area. `store()` throws LOGICAL_ERROR before startup; every caller
+    /// (writeFile, via a transaction) runs post-startup.
+    return physicalKey(store()->poolConfig().pool_prefix + "/staging/" + server_root_id);
+}
+
 /// ==== D-W1 namespace mapping ====
 
 std::string ContentAddressedMetadataStorage::serverPrefix() const

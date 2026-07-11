@@ -22,7 +22,7 @@ CaContentWriteBuffer::CaContentWriteBuffer(
 
     /// The spill buffer is a SECOND per-stream buffer; thread the adaptive flag into it too so a
     /// wide part keeps its footprint small. Its IO is a local temp file, not the remote stream.
-    temp_file = std::make_unique<WriteBufferFromFile>(
+    sink = std::make_unique<WriteBufferFromFile>(
         temp_path,
         buf_size,
         /*flags=*/-1,
@@ -32,16 +32,37 @@ CaContentWriteBuffer::CaContentWriteBuffer(
         /*alignment=*/0,
         use_adaptive_buffer_size,
         adaptive_buffer_initial_size);
-    hashing = std::make_unique<HashingWriteBuffer>(*temp_file);
+    hashing = std::make_unique<HashingWriteBuffer>(*sink);
+}
+
+CaContentWriteBuffer::CaContentWriteBuffer(
+    std::unique_ptr<WriteBufferFromFileBase> object_store_sink,
+    std::string object_key,
+    size_t buf_size,
+    bool use_adaptive_buffer_size,
+    size_t adaptive_buffer_initial_size,
+    OnFinalized on_finalized_)
+    : WriteBufferFromFileBase(use_adaptive_buffer_size ? adaptive_buffer_initial_size : buf_size, nullptr, 0)
+    , on_finalized(std::move(on_finalized_))
+    , temp_path(std::move(object_key))
+    , is_s3_staging(true)
+    , sink(std::move(object_store_sink))
+{
+    /// The sink is ALREADY opened against the staging object by the caller (writeFile) — this
+    /// constructor only wraps it in the hashing chain, exactly like the local-temp-file mode. The
+    /// adaptive-sizing params only affect THIS outer buffer (mirroring the Local ctor above); the
+    /// sink's own buffering was decided by the caller when it opened the object-store write.
+    hashing = std::make_unique<HashingWriteBuffer>(*sink);
 }
 
 CaContentWriteBuffer::~CaContentWriteBuffer()
 {
     /// Best-effort cleanup if finalize was never reached (exception unwind / cancel).
     cancel();
-    /// B188: if on_finalized ran successfully the transaction owns the temp file and will clean it up
-    /// post-commit (or in its own destructor). Do not remove it here.
-    if (!temp_ownership_transferred)
+    /// B188: if on_finalized ran successfully the transaction (Local mode) or a later task's promote
+    /// path (S3 mode) owns the staged bytes and cleans them up. Do not remove them here. S3-mode
+    /// staging objects are never removed by this class at all (see cancelImpl / removeTempFile).
+    if (!temp_ownership_transferred && !is_s3_staging)
         removeTempFile();
 }
 
@@ -62,10 +83,11 @@ void CaContentWriteBuffer::finalizeImpl()
     const std::string hash_hex = getHexUIntLowercase(hash);
 
     hashing->finalize();
-    temp_file->finalize();
+    sink->finalize();
 
-    /// B188: on successful finalize, ownership of temp_path transfers to the transaction (it uploads
-    /// the blob post-precommit and cleans up). cancel() still removes it.
+    /// B188: on successful finalize, ownership of temp_path (Local: the local temp path; S3: the
+    /// staging object key) transfers to the caller (the transaction uploads/promotes it and cleans
+    /// up). cancel() still removes/cancels it.
     if (on_finalized)
     {
         on_finalized(hash_hex, size, temp_path);
@@ -77,9 +99,14 @@ void CaContentWriteBuffer::cancelImpl() noexcept
 {
     if (hashing)
         hashing->cancel();
-    if (temp_file)
-        temp_file->cancel();
-    removeTempFile();
+    if (sink)
+        sink->cancel();
+    /// S3 mode: `temp_path` is a remote object key, not a path on this filesystem — do NOT attempt
+    /// to delete the (possibly partially-written) staging object here. Cancelling `sink` above is
+    /// enough to make sure no partial finalize happens; reclaiming an orphaned staging object is the
+    /// mount-lease sweeper's job (a later task).
+    if (!is_s3_staging)
+        removeTempFile();
 }
 
 void CaContentWriteBuffer::removeTempFile() noexcept
@@ -92,7 +119,7 @@ void CaContentWriteBuffer::sync()
 {
     next();
     hashing->next();
-    temp_file->sync();
+    sink->sync();
 }
 
 std::string CaContentWriteBuffer::getFileName() const

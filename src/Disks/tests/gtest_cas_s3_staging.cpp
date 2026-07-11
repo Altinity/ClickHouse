@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 #include "cas_test_helpers.h"
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedWriteBuffers.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasProbe.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
 
@@ -99,6 +100,52 @@ std::shared_ptr<FakeConditionalCopyObjectStorage> makeFakeConditionalCopyStorage
     return std::make_shared<FakeConditionalCopyObjectStorage>(std::move(settings), mode);
 }
 
+/// A fake object-store sink for Task 4 of the S3-native staging plan (`DB::ContentAddressed::CaContentWriteBuffer`'s
+/// S3-staging constructor): an in-memory `WriteBufferFromFileBase` that records every byte written to
+/// it, plus whether `cancelImpl`/`finalizeImpl` ran. This is enough to prove the S3-staging mode
+/// streams to the SINK (not to a local temp file) while hashing, without needing a real object storage
+/// — the end-to-end wiring (`writeFile` choosing this mode, the promote path) lands in later tasks.
+class FakeStagingSink : public DB::WriteBufferFromFileBase
+{
+public:
+    explicit FakeStagingSink(std::string key_)
+        : DB::WriteBufferFromFileBase(/*buf_size=*/8192, nullptr, 0), key(std::move(key_))
+    {
+    }
+
+    void sync() override {}
+    std::string getFileName() const override { return key; }
+
+    const std::string & writtenBytes() const { return written; }
+    bool wasCancelled() const { return cancelled; }
+    bool wasFinalizedForTest() const { return did_finalize; }
+
+protected:
+    void nextImpl() override
+    {
+        if (!offset())
+            return;
+        written.append(working_buffer.begin(), offset());
+    }
+
+    void finalizeImpl() override
+    {
+        next();
+        did_finalize = true;
+    }
+
+    void cancelImpl() noexcept override
+    {
+        cancelled = true;
+    }
+
+private:
+    std::string key;
+    std::string written;
+    bool cancelled = false;
+    bool did_finalize = false;
+};
+
 }
 
 TEST(CasS3Staging, ParsesS3BackendAndMinBytesFromConfig)
@@ -192,4 +239,103 @@ TEST(CasS3Staging, ProbeConditionalCopyReturnsFalseWhenCopyObjectConditionalThro
     auto storage = DB::Cas::tests::makeLocalObjectStorageForTest();
 
     EXPECT_FALSE(DB::Cas::probeConditionalCopy(*storage, "probe_prefix"));
+}
+
+/// Task 4 of the S3-native staging plan: `CaContentWriteBuffer`'s S3-staging constructor streams
+/// directly to an already-opened object-store sink while hashing, instead of spilling to a local temp
+/// file (see the constructor's doc comment in ContentAddressedWriteBuffers.h). These two tests
+/// exercise the buffer directly over a `FakeStagingSink` — no real object storage, disk, or
+/// `ContentAddressedTransaction` needed; `writeFile` choosing this mode is exercised together with the
+/// promote path in later tasks (S3 mode is off by default and not enabled by any existing test).
+
+TEST(CasS3Staging, ContentWriteBufferS3ModeStreamsToSinkAndFinalizes)
+{
+    const std::string staging_key = "staging/mount1/abc123.tmp";
+    auto * sink_ptr = new FakeStagingSink(staging_key);
+    std::unique_ptr<DB::WriteBufferFromFileBase> sink(sink_ptr);
+
+    std::string got_hash_hex;
+    size_t got_size = 0;
+    std::string got_key;
+    int on_finalized_calls = 0;
+
+    auto buf = std::make_unique<DB::ContentAddressed::CaContentWriteBuffer>(
+        std::move(sink),
+        staging_key,
+        /*buf_size=*/8192,
+        /*use_adaptive_buffer_size=*/false,
+        /*adaptive_buffer_initial_size=*/0,
+        [&](const std::string & hash_hex, size_t size, const std::string & key)
+        {
+            ++on_finalized_calls;
+            got_hash_hex = hash_hex;
+            got_size = size;
+            got_key = key;
+        });
+
+    /// Write in two chunks (exercises more than one nextImpl flush) and finalize.
+    const std::string payload_part1(4000, 'x');
+    const std::string payload_part2(1234, 'y');
+    buf->write(payload_part1.data(), payload_part1.size());
+    buf->write(payload_part2.data(), payload_part2.size());
+    buf->finalize();
+
+    const std::string payload = payload_part1 + payload_part2;
+
+    /// (a) the sink received EXACTLY the bytes written — no local temp file was ever touched.
+    EXPECT_EQ(sink_ptr->writtenBytes(), payload);
+    EXPECT_TRUE(sink_ptr->wasFinalizedForTest());
+    EXPECT_FALSE(sink_ptr->wasCancelled());
+
+    /// (b) on_finalized fired exactly once with the correct cityHash128 hex, size, and staging key.
+    /// The pool-wide content hash is the STREAMING `HashingWriteBuffer` convention (chunked
+    /// cityHash128, block = 2048 B), which diverges from a one-shot `CityHash_v1_0_2::CityHash128`
+    /// call for a payload spanning more than one block (see `gtest_cas_build.cpp`'s
+    /// `CopyForwardMultiBlockPayloadVerifies`, which documents and exercises the same divergence).
+    /// This payload (5234 bytes) spans multiple 2048-byte blocks, so the expected hash must be
+    /// recomputed with the SAME streaming convention via `HashingReadBuffer`, not a one-shot call.
+    DB::ReadBufferFromMemory expected_in(payload.data(), payload.size());
+    DB::HashingReadBuffer expected_hashing(expected_in);
+    expected_hashing.ignoreAll();
+    const std::string expected_hash_hex = getHexUIntLowercase(expected_hashing.getHash());
+    EXPECT_EQ(on_finalized_calls, 1);
+    EXPECT_EQ(got_hash_hex, expected_hash_hex);
+    EXPECT_EQ(got_size, payload.size());
+    EXPECT_EQ(got_key, staging_key);
+    EXPECT_EQ(buf->getFileName(), staging_key);
+}
+
+TEST(CasS3Staging, ContentWriteBufferS3ModeCancelCancelsSinkAndSkipsFinalize)
+{
+    const std::string staging_key = "staging/mount1/cancelled.tmp";
+    auto * sink_ptr = new FakeStagingSink(staging_key);
+    std::unique_ptr<DB::WriteBufferFromFileBase> sink(sink_ptr);
+
+    bool on_finalized_called = false;
+
+    auto buf = std::make_unique<DB::ContentAddressed::CaContentWriteBuffer>(
+        std::move(sink),
+        staging_key,
+        /*buf_size=*/8192,
+        /*use_adaptive_buffer_size=*/false,
+        /*adaptive_buffer_initial_size=*/0,
+        [&](const std::string &, size_t, const std::string &)
+        {
+            on_finalized_called = true;
+        });
+
+    const std::string payload = "some bytes that must never be promoted";
+    buf->write(payload.data(), payload.size());
+    buf->cancel();
+
+    /// (c) cancel() before finalize cancels the sink and on_finalized is NEVER called — no partial
+    /// finalize (no promote-worthy hash/size is ever handed to the transaction for cancelled bytes).
+    EXPECT_TRUE(sink_ptr->wasCancelled());
+    EXPECT_FALSE(sink_ptr->wasFinalizedForTest());
+    EXPECT_FALSE(on_finalized_called);
+
+    /// The buffer's destructor calls cancel() again (defensive backstop) — already-cancelled, so this
+    /// must stay a no-op: still no on_finalized call, and no attempt to fs::remove a remote key.
+    buf.reset();
+    EXPECT_FALSE(on_finalized_called);
 }

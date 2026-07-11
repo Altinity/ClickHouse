@@ -171,6 +171,16 @@ public:
     /// conditional copy is assumed UNSUPPORTED until proven otherwise (fail-close), so consulting this
     /// accessor before the probe wiring lands can never mistakenly enable the S3 promote path.
     bool conditionalCopySupported() const { return conditional_copy_supported; }
+    /// S3-native staging Task 4: raw access to the object storage, so `writeFile` can open a
+    /// staging-object sink directly with `object_storage->writeObject(...)` — Task 4 predates the
+    /// `Cas::Backend` seams (`Core/CasBackend.h::stageStream`) a later task adds. Only meaningful
+    /// when `stagingBackend()==StagingBackend::S3 && conditionalCopySupported()`.
+    const ObjectStoragePtr & objectStorage() const { return object_storage; }
+    /// S3-native staging Task 4: the physical staging-key PREFIX for this pool's writer-owned staging
+    /// area — `physicalKey(pool_prefix + "/staging/" + server_root_id)`, the SAME prefix construction
+    /// the Task 3 capability probe uses for its own `<prefix>/probe` subtree (see `startup()`).
+    /// Callers append their own unique leaf, e.g. `"/" + getRandomASCIIString(32) + ".tmp"`.
+    String stagingKeyPrefix() const;
 
     /// Bytes that live INSIDE pool metadata rather than as their own object: a mutable per-part
     /// file's bytes from RefPayload.mutable_files, an Inline-placement tree entry, or a verbatim
