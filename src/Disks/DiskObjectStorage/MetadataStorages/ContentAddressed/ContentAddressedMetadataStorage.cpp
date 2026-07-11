@@ -4,6 +4,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasObjectStorageBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasProbe.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/StaticDirectoryIterator.h>
 #include <IO/ReadBufferFromFileView.h>
 #include <IO/ReadBufferFromMemory.h>
@@ -434,6 +435,28 @@ void ContentAddressedMetadataStorage::startup()
     /// B170: bridge per-event CAS decisions to system.content_addressed_log (null sink when context
     /// is absent, e.g. unit tests — emitEvent is then a no-op single branch in the Core).
     cas_store->setEventSink(makeCasEventSink());
+
+    /// S3-native staging Task 3 (design `docs/superpowers/specs/2026-07-11-cas-s3-native-staging-design.md`
+    /// §3): the OPTIONAL mount-time capability probe for a write-once conditional server-side copy.
+    /// Only relevant when this disk opted in to `cas_staging_backend=s3`; `Local` (the default,
+    /// global constraint: OFF BY DEFAULT) takes NO probe here — `conditional_copy_supported` simply
+    /// stays at its `false` default and is never consulted on the local path. Skipped in
+    /// observe-only/readonly mode: a probe write would fail on a read-only backend, exactly like the
+    /// mandatory battery (`runCapabilityProbe`) above skips a read-only mount.
+    ///
+    /// Fail-close, never fail-open: an unsupported or non-enforcing backend just falls back to local
+    /// staging (`conditional_copy_supported` stays `false`) — this is NOT a mount failure, unlike the
+    /// mandatory battery, because `local` staging remains fully functional.
+    if (staging_backend == StagingBackend::S3 && !read_only)
+    {
+        const String probe_prefix = physicalKey(pool_prefix + "/staging/" + server_root_id + "/probe");
+        conditional_copy_supported = Cas::probeConditionalCopy(*object_storage, probe_prefix);
+        if (!conditional_copy_supported)
+            LOG_INFO(
+                getLogger("ContentAddressedMetadataStorage"),
+                "cas_staging_backend=s3 requested but the object storage does not enforce conditional "
+                "copy; falling back to local staging");
+    }
 
     /// The background GC scheduler runs only on the disk-factory path (context non-null) and when
     /// enabled - the lease makes concurrent schedulers across mounters safe (work dedup), so no

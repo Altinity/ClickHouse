@@ -1,10 +1,13 @@
 #include <gtest/gtest.h>
 #include "cas_test_helpers.h"
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasProbe.h>
+#include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
 
 #include <Poco/AutoPtr.h>
 #include <Poco/Util/XMLConfiguration.h>
 
+#include <atomic>
 #include <filesystem>
 #include <sstream>
 #include <string>
@@ -30,6 +33,70 @@ Poco::AutoPtr<Poco::Util::XMLConfiguration> configWithDiskSection(const std::str
     std::istringstream xml_stream( // STYLE_CHECK_ALLOW_STD_STRING_STREAM
         "<clickhouse><disk>" + inner_xml + "</disk></clickhouse>");
     return new Poco::Util::XMLConfiguration(xml_stream);
+}
+
+/// A test-only `LocalObjectStorage` subclass whose `copyObjectConditional` is configurable, so the
+/// Task 3 selection logic (`DB::Cas::probeConditionalCopy`) can be exercised without a live S3/RustFS
+/// backend (live enforcement is Task 7). `LocalObjectStorage` already implements every OTHER pure
+/// virtual (`writeObject`, `removeObjectIfExists`, `exists`, `copyObject`, ...) against real files
+/// under a fresh temp root, so overriding just `copyObjectConditional` is enough to fake either an
+/// ENFORCING or a NON-ENFORCING backend; a THROWING (default `NOT_IMPLEMENTED`) backend needs no
+/// fake at all — a plain `LocalObjectStorage` already exercises that path (see
+/// `DefaultCopyObjectConditionalThrowsNotImplemented` above).
+class FakeConditionalCopyObjectStorage : public DB::LocalObjectStorage
+{
+public:
+    enum class Mode
+    {
+        /// Real write-once semantics: creates the destination iff it was absent; a destination that
+        /// already exists is REJECTED (created=false), no bytes touched.
+        Enforcing,
+        /// A backend that silently ignores `If-None-Match`: every call overwrites the destination
+        /// and reports created=true, even when the destination already existed.
+        NonEnforcing,
+    };
+
+    FakeConditionalCopyObjectStorage(DB::LocalObjectStorageSettings settings_, Mode mode_)
+        : DB::LocalObjectStorage(std::move(settings_)), mode(mode_)
+    {
+    }
+
+    DB::ConditionalCopyResult copyObjectConditional(
+        const DB::StoredObject & object_from,
+        const DB::StoredObject & object_to,
+        const DB::ReadSettings & read_settings,
+        const DB::WriteSettings & write_settings,
+        std::optional<DB::ObjectAttributes> object_to_attributes = {}) override
+    {
+        ++call_count;
+        if (mode == Mode::Enforcing && exists(object_to))
+            return {.created = false, .dest_etag = {}};
+
+        copyObject(object_from, object_to, read_settings, write_settings, object_to_attributes);
+        return {.created = true, .dest_etag = "fake-etag"};
+    }
+
+    int callCount() const { return call_count; }
+
+private:
+    Mode mode;
+    int call_count = 0;
+};
+
+/// Build a `FakeConditionalCopyObjectStorage` rooted at a fresh, unique temp directory (mirrors
+/// `DB::Cas::tests::makeLocalObjectStorageForTest`).
+std::shared_ptr<FakeConditionalCopyObjectStorage> makeFakeConditionalCopyStorage(FakeConditionalCopyObjectStorage::Mode mode)
+{
+    static std::atomic<uint64_t> counter{0};
+    const auto unique = std::to_string(::getpid()) + "_" + std::to_string(counter.fetch_add(1));
+    const auto root = (std::filesystem::temp_directory_path() / ("cas_s3_staging_probe_" + unique)).string();
+
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+    std::filesystem::create_directories(root, ec);
+
+    DB::LocalObjectStorageSettings settings("test", root, /*read_only_=*/false);
+    return std::make_shared<FakeConditionalCopyObjectStorage>(std::move(settings), mode);
 }
 
 }
@@ -92,4 +159,37 @@ TEST(CasS3Staging, DefaultCopyObjectConditionalThrowsNotImplemented)
     {
         storage->copyObjectConditional(from, to, DB::ReadSettings{}, DB::WriteSettings{});
     });
+}
+
+/// Task 3 of the S3-native staging plan: the mount-time capability probe (`DB::Cas::probeConditionalCopy`)
+/// for the OPTIONAL conditional-copy capability (distinct from the mandatory `runCapabilityProbe`
+/// battery). These three tests cover the fail-close SELECTION logic with fakes — live 412-vs-created
+/// enforcement against a real backend is Task 7 (with_rustfs integration test).
+
+TEST(CasS3Staging, ProbeConditionalCopyReturnsTrueForEnforcingBackend)
+{
+    auto storage = makeFakeConditionalCopyStorage(FakeConditionalCopyObjectStorage::Mode::Enforcing);
+
+    EXPECT_TRUE(DB::Cas::probeConditionalCopy(*storage, "probe_prefix"));
+    /// Both the "fresh destination" and the "already-existing destination" conditional copies ran.
+    EXPECT_EQ(storage->callCount(), 2);
+}
+
+TEST(CasS3Staging, ProbeConditionalCopyReturnsFalseForNonEnforcingBackend)
+{
+    auto storage = makeFakeConditionalCopyStorage(FakeConditionalCopyObjectStorage::Mode::NonEnforcing);
+
+    /// The backend silently overwrites the destination on the second call (created=true again) —
+    /// it does not enforce If-None-Match, so the probe must fail closed.
+    EXPECT_FALSE(DB::Cas::probeConditionalCopy(*storage, "probe_prefix"));
+}
+
+TEST(CasS3Staging, ProbeConditionalCopyReturnsFalseWhenCopyObjectConditionalThrows)
+{
+    /// A plain `LocalObjectStorage` does not override `copyObjectConditional` at all — it falls
+    /// through to the base-class default, which throws NOT_IMPLEMENTED (exactly what a real backend
+    /// without conditional-copy support does). The probe must never propagate this: it fails closed.
+    auto storage = DB::Cas::tests::makeLocalObjectStorageForTest();
+
+    EXPECT_FALSE(DB::Cas::probeConditionalCopy(*storage, "probe_prefix"));
 }
