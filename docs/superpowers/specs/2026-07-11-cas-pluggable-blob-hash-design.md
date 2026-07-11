@@ -133,3 +133,52 @@ or move to `blobs/ch128/<shard>/<hex>`? Since CA is pre-release (no persisted da
 `blobs/ch128/...` is cleanest (uniform, self-describing) and is the recommended choice; the legacy no-segment
 layout would only matter if we needed on-disk continuity, which we do not. **Recommendation: algo segment for
 ALL algos including the default.**
+
+## 12. Phase 2 design (consulted 2026-07-11) {#phase2-design}
+
+Resolves §7's open identity-type question. A strong-model consult (grounded in the code) settled it; summary:
+
+**Representation — (A) a strong `BlobDigest` type.** `struct BlobDigest { std::array<uint8_t, 32> bytes; auto
+operator<=>(const BlobDigest&) const = default; }` (big-endian, tail beyond the pool's `blob_hash_len` is
+zero). Rejected (B) variable `String`: a 32-byte sha256 digest exceeds libc++'s 22-byte SSO → one heap
+allocation per `Blob` `ManifestEntry` on the manifest-decode READ path (part-folder validate-on-hit), and it
+costs MORE memory for sha256 (~72 B vs 32 B). (A)'s cost is acceptable (`ManifestEntry` ~80→96 B; `BlobDelta`
+40→56 B). A BE `std::array` with default `<=>` yields the SAME total order as today's `UInt128` numeric
+compare, so the run merge's `stable_sort` + cross-cursor `dk < key` keep their semantics for free. On-wire
+writes exactly `blob_hash_len` bytes (no format bloat).
+
+**Refinement — widen ONLY the content digest.** Internal 128-bit hashes stay `UInt128`: `payload_digest`
+(integrity/debug — keep CityHash128, decoupled from the blob algo), `RunRef.checksum`, `sourceEdgeId`,
+`GcLease.owner`, `GcHeartbeat.owner`, `manifestCleanupShard`. The strong `BlobDigest` type makes the compiler
+enumerate exactly the ~10 content-digest fields and blocks accidental widening of an internal hash.
+
+**`srcEdgeRunKey` + `blobShard` (verified sound).** Run key = `digest[0:blob_hash_len] ++ source_id(16 BE)`;
+order preserved (fixed width within one pool); the zero-sentinel `(digest, source_id=0)` still sorts first.
+`CondemnedRow` carries NO digest (it's key-only) → retired-in-snapshot settlement untouched. `blobShard` =
+BE-u64 of `digest[0:8]` mod `gc_shards` — **bit-identical** to today's `blob_hash >> 64` for every existing
+128-bit digest (no reshard on upgrade; mixed-build replicas route identically). MUST be an explicit BE read
+(a native-endian memcpy would silently resplit shards → the `ShardReducer` misroute hazard). Bump
+`kSourceEdgeKeySchema`: 1 = 16-B digest (32-B key), 2 = 32-B digest (48-B key); `assertSourceEdgeRunHeader`
+already fail-closes unknown schemas. Sparse-index seek passes the digest at pool width (prefix-seek holds).
+
+**TWO SILENT fail-open sites — MUST be ported in the SAME commit as the type** (the crux hazard):
+1. `CasGc.cpp:~2002` condemn sweep: `hexToU128(k.key.substr(slash+1))` inside `catch(...) { continue; }` —
+   `hexToU128` rejects 64-hex, so in a sha256 pool EVERY blob is classified "foreign" and skipped → a **silent
+   permanent pool-wide leak** (the never-throw-on-fold discipline turns the unported parse fail-open).
+2. `CasFsck.cpp:~258/331/394/458` same parse → fsck silently ignores all sha256 bodies → false-clean pool.
+Everything else fails closed + loud (`u128FromBytesBE` throws on ≠16; `CasBuild.cpp:73` `hexToU128` throws
+`BAD_ARGUMENTS`; the run-key/manifest parses throw). Move the manifest per-entry 16-B assumption to a manifest
+HEADER digest-length field (once, not per entry).
+
+**No TLA+ re-gate** — a width-generalization below the models' opaque-atom abstraction; the touched invariants
+(deterministic pure-function routing agreed by all actors; run-key lex order == `(digest, source_id)` with
+sentinel-first; settlement semantics) are all preserved and routing is bit-identical for 128-bit pools. Gate
+with unit tests: (i) shard-assignment equality (old `>>64` vs new first-8-BE over random digests); (ii)
+key-order preservation; (iii) schema-2 run-key round-trip; (iv) old-reader-meets-schema-2 → `NOT_IMPLEMENTED`.
+
+**Biggest risk — len-drift** (the digest value and its meaningful length live apart). An unported site that
+renders/serializes the wrong width mints a valid-looking-but-WRONG blob key → object at the wrong key, dedup
+misses, and (via the GC sweep's `catch(...) continue`) a silent leak. Mitigations: route ALL digest↔hex/bytes
+conversion through ONE codec object constructed from `PoolMeta` (no free functions taking a bare `len`); a
+zero-tail `chassert` at codec boundaries; and port the two silent sites in the same commit that introduces the
+type.
