@@ -1902,3 +1902,15 @@ shard/manifest objects, so a just-`UNFREEZE`d backup dir stayed "existing" until
 making the intermediate branch tombstone-aware (enumerate namespaces via `listNamespaces` + consult the
 tombstone-aware `listRefs`, consistent with the part-level and table-uuid-pair branches). The CA gtest
 battery is now fully green (669/669, no reds). Removes the standing CA-battery red / release-gate item.
+
+## B207 fsck phantom-dangling race — RESOLVED 2026-07-11 (commit 94970514116)
+`runFsck`'s ref-walk and HEAD-confirm were minutes apart with no snapshot, so a re-published/dropped ref
+plus a legitimate GC delete of the old blob manufactured a false `dangling`. Fixed: `blob_labels` is now
+always-populated (was `detail`-only), and at both HEAD-absent branches (global + scoped) the fsck
+RE-RESOLVES every referencing ref FRESH — a HEAD-absent blob is `dangling` ONLY if a CURRENT ref still
+names it; if every label re-resolved away (re-published/dropped), it is a stale-walk artifact, not a loss.
+Tests: `PhantomDanglingFromRepublishedRefIsReresolvedAway`, `...FromDroppedRef...`, and (safety companion)
+`RealDanglingStillCaughtAfterReresolve`. Unblocks honest release-validation soaks (B185/B206/B144 were this
+race). NOTE (unrelated test hygiene): ~5 tests (`CasInstrumentedBackend`, `CasObservability`,
+`CasStoreBackpressure`, `UniqueKeyIndexCache`) fail only under a broad combined `*Ca*` gtest filter but pass
+in isolation — a pre-existing order-dependent-flake / shared-state issue, not a CA correctness bug.
