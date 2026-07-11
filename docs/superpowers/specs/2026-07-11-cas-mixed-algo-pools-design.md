@@ -76,7 +76,14 @@ deleted; its test flips to assert the additive-switch behavior.
 **Decision (user, superseding the first draft):** do NOT partition the run namespace per algo.
 Settlement identity gains the algo dimension IN THE ROW KEY, inside the same `gc_shards` runs:
 
-- **Source-edge key schema 3** (replaces schemas 1/2 wholesale — pre-release, no back-compat):
+- **Source-edge key schema 3 — and schemas 1/2 CEASE TO EXIST** (user decision: "старого не должно
+  существовать вообще; есть только новый"). The same change DELETES the schema-1/2 constants, the
+  digest-first `key`/`parse`/`seekPrefix` code paths, and every `BlobDigest`-only keyed GC container —
+  there is exactly ONE way to build/parse a settlement key and ONE identity type (`BlobRef`) after the
+  change, so a "missed old-style call site" is a compile error, not a convention risk. No transitional
+  shims (unlike Phase 2's staged `.toU128()`/`legacyBlobId128` migration): the replacement is atomic.
+  A pool holding old-format runs is recovered by `SYSTEM CONTENT ADDRESSED GC REBUILD` (runs are
+  derived state, rebuilt from manifests) — pre-release, no read path for old runs. Key layout:
   `algo(u8) ++ digest[blobHashLenFor(algo)] ++ source_id(16 BE)`, i.e. 33 bytes for 16-byte algos,
   49 for sha256. The algo byte comes FIRST, which makes the variable-width keys totally ordered by
   construction: keys of different algos diverge at byte 0, so digest bytes of different widths are
@@ -153,10 +160,11 @@ widens (algo-prefixed keys), below the model's abstraction level.
 
 Medium-small (down from the first draft: no run-namespace change, no seal change, no partition
 lifecycle). The bulk is the schema-3 key codec + `BlobRef` plumbing through fold/GC/meta/fsck and the
-per-entry manifest algo; PoolMeta relax is mechanical. Biggest risk: key build/parse discipline — one
-missed call site building a digest-first (schema 1/2 style) key would corrupt merge order; mitigate
-exactly as T4 did (ONE codec owns build/parse/seekPrefix, no bare helpers; grep-gate that schemas 1/2
-constructors are deleted). Second risk: a consumer narrowing `BlobRef` back to bare digest (identity
-collision across algos) — the strong pair type + deleted single-arg overloads make this
-compiler-visible. Two-consult review of the schema-3 task before implementation (Phase 2 T4
-discipline).
+per-entry manifest algo; PoolMeta relax is mechanical. The old forms (schemas 1/2, digest-first
+helpers, `BlobDigest`-only GC identity) are DELETED in the same change (§6), so "building a key the
+old way" is a compile error by construction — the residual risks are (a) a call site passing the
+WRONG algo into a `BlobRef` (e.g. `write_algo` instead of the row's own algo — compiles, parses,
+names a different blob; mitigated by pair-typed `key(BlobRef, source_id)` with no separate algo
+parameter, plus the mixed-pool crux test §9.3 which goes red on any such hardcode), and (b) stale
+cached `PoolMeta.algos_used` fail-closing the fold on a legitimately new algo (consult question).
+Two-consult review of the schema-3 task before implementation (Phase 2 T4 discipline).
