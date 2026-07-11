@@ -7,11 +7,35 @@ using namespace DB::Cas;
 
 TEST(CasLayout, KeyShapes)
 {
+    /// Default (no explicit algo) is cityHash128, and per design §10 EVERY algo -- including the
+    /// default -- carries an explicit path segment: `blobs/ch128/...`, not the legacy `blobs/...`.
     Layout l{"p"};
-    EXPECT_EQ(l.blobKey(BlobId{"00aabb"}), "p/blobs/00/00aabb");
+    EXPECT_EQ(l.blobKey(BlobId{"00aabb"}), "p/blobs/ch128/00/00aabb");
     EXPECT_EQ(l.gcStateKey(), "p/gc/state");
     EXPECT_EQ(l.outcomesKey(4, 42, 7, 1), "p/gc/gen/4/attempt/42/outcomes/7/1");
     EXPECT_EQ(l.poolMetaKey(), "p/_pool_meta");
+}
+
+TEST(CasLayout, BlobKeyCarriesAlgoSegment)
+{
+    /// Every algo gets its own segment (design §3/§10), so two algos can never collide in the key
+    /// space even after a config change on a fresh pool.
+    const Layout ch128("p", BlobHashAlgo::CityHash128);
+    EXPECT_EQ(ch128.blobKey(BlobId{"00aabb"}), "p/blobs/ch128/00/00aabb");
+    EXPECT_EQ(ch128.blobMetaKey(BlobId{"00aabb"}), "p/blobs/ch128/00/00aabb.meta");
+
+    const Layout xxh3("p", BlobHashAlgo::XXH3_128);
+    EXPECT_EQ(xxh3.blobKey(BlobId{"00aabb"}), "p/blobs/xxh3/00/00aabb");
+    EXPECT_EQ(xxh3.blobMetaKey(BlobId{"00aabb"}), "p/blobs/xxh3/00/00aabb.meta");
+
+    const Layout sha256("p", BlobHashAlgo::Sha256);
+    EXPECT_EQ(sha256.blobKey(BlobId{"00aabb"}), "p/blobs/sha256/00/00aabb");
+
+    /// Trees/manifests/refs are UNCHANGED -- only blob-body keys gain the algo segment.
+    EXPECT_EQ(ch128.gcStateKey(), xxh3.gcStateKey());
+    EXPECT_EQ(ch128.poolMetaKey(), xxh3.poolMetaKey());
+    EXPECT_EQ(ch128.blobsPrefix(), "p/blobs/");
+    EXPECT_EQ(ch128.blobsPrefix(), xxh3.blobsPrefix());
 }
 
 TEST(CasLayout, RootNamespaceKeys)

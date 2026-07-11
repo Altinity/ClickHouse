@@ -20,8 +20,10 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasCodecUtil.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEnvelope.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFsck.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestCodec.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasPoolMeta.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include "cas_test_helpers.h"
@@ -30,6 +32,7 @@
 
 #include <cas_format.pb.h>
 
+#include <algorithm>
 #include <filesystem>
 
 namespace DB::ErrorCodes
@@ -244,4 +247,56 @@ TEST(CasPluggableHash, StoreWithDefaultAlgoStampsEnvelopeHashAlgoOne)
     ASSERT_TRUE(raw.has_value());
     const EnvelopeHeader h = decodeEnvelopeHeader(raw->bytes, raw->bytes.size(), ObjectKind::Blob);
     EXPECT_EQ(h.hash_algo, 1u);
+}
+
+/// ---- P1-T3b: the pool's blob_hash_algo threaded into blob-body PATH keys (spec §3/§10) ----
+
+/// A blob written and promoted through a live ref on an xxh3-128 pool lands under the
+/// `blobs/xxh3/<shard>/<hex>` path segment (not the bare `blobs/<shard>/<hex>` shape), is readable at
+/// that key, and `runFsck`'s LIST-based discovery (`Layout::blobsPrefix`, deliberately algo-agnostic)
+/// finds it reachable and clean -- proving the GC/fsck key-parse (which takes only the LAST path
+/// component as the hex digest, `CasGc.cpp`/`CasFsck.cpp`) still works with the extra segment.
+TEST(CasPluggableHash, Xxh3BlobLandsUnderAlgoSegmentAndIsDiscoveredCleanByFsck)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = Store::open(backend,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1,
+                   .blob_hash_algo = BlobHashAlgo::XXH3_128});
+
+    const RootNamespace ns{"srv1/tbl"};
+    const std::string payload = makeMultiBlockPayload();
+    const BlobId id{blobHashHexOneShot(BlobHashAlgo::XXH3_128, payload)};
+
+    BuildInfo info;
+    info.intended_ref = ns.string() + "/rb";
+    auto build = store->startBuild(info);
+    build->putBlob(id, BlobSource::fromString(payload));
+
+    /// The blob body landed under the algo-segmented path -- readable there, not at the legacy
+    /// no-segment shape.
+    const String blob_key = store->layout().blobKey(id);
+    EXPECT_NE(blob_key.find("/blobs/xxh3/"), String::npos) << blob_key;
+    EXPECT_EQ(blob_key.find("/blobs/ch128/"), String::npos) << blob_key;
+    EXPECT_TRUE(backend->head(blob_key).exists);
+
+    ManifestEntry e;
+    e.path = "data.bin";
+    e.placement = EntryPlacement::Blob;
+    e.blob_hash = hexToU128(id.string());
+    e.blob_size = payload.size();
+    const ManifestId mid = build->stageManifest({e});
+    build->precommitAdd(ns, "rb", mid);
+    build->promote(ns, "rb", build->buildId(), mid);
+    store->renewWatermarkOnce();
+
+    const FsckReport rep = runFsck(*store, /*detail=*/true);
+    EXPECT_TRUE(rep.clean());
+    EXPECT_EQ(rep.dangling, 0u);
+    EXPECT_GE(rep.reachable, 1u);
+
+    /// Not merely "clean by omission" (e.g. a bug that silently LISTed nothing): the physical listing
+    /// actually walked the algo-segmented key.
+    const bool found = std::any_of(rep.objects.begin(), rep.objects.end(),
+        [](const FsckObject & o) { return o.key.find("/blobs/xxh3/") != String::npos; });
+    EXPECT_TRUE(found);
 }

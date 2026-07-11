@@ -1,4 +1,5 @@
 #pragma once
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobHasher.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEnvelope.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestId.h>
@@ -36,15 +37,26 @@ namespace DB::Cas
 ///
 /// The 2-char shard is always the first two characters of the id string.
 /// This matches the protocol spec §4 layout exactly.
+///
+/// Blob bodies additionally carry the pool's `BlobHashAlgo` as a path segment (CAS pluggable-blob-hash
+/// design §3/§10): `POOL/blobs/<algo>/S/ID`, where `<algo>` is `blobHashAlgoName(blob_hash_algo)`
+/// (`"ch128"` for the default cityHash128, `"xxh3"`, `"sha256"`). This applies to ALL algos, including
+/// the default, so blob keys are uniformly self-describing. Trees/manifests/refs/gc keys are
+/// unaffected -- only blob-body keys (`blobKey`/`blobMetaKey`/`objectKey`) gain the segment. The
+/// `blob_hash_algo` here MUST be the pool's actual recorded algo (`PoolMeta::blob_hash_algo`) for every
+/// `Layout` that addresses a real pool -- a mismatch would silently put blobs at an unreadable path.
+/// The default parameter exists only so pure-unit-test `Layout("p")` constructions that never mix algos
+/// stay terse; `Store`'s canonical `pool_layout` is always built from the pool's validated `PoolMeta`.
 class Layout
 {
 public:
-    explicit Layout(String prefix_) : prefix(std::move(prefix_)) {}
+    explicit Layout(String prefix_, BlobHashAlgo blob_hash_algo_ = BlobHashAlgo::CityHash128)
+        : prefix(std::move(prefix_)), blob_hash_algo(blob_hash_algo_) {}
 
-    /// Content objects.
+    /// Content objects: POOL/blobs/<algo>/S/ID.
     String blobKey(const BlobId & id) const
     {
-        return shardedKey("blobs", id.string());
+        return shardedKey("blobs/" + String(blobHashAlgoName(blob_hash_algo)), id.string());
     }
 
     /// The per-hash meta descriptor sibling of the blob body (spec §raw-body-refinement).
@@ -207,7 +219,12 @@ public:
         return prefix + "/roots/";
     }
 
-    /// Prefix that covers every content blob (raw object listing for fsck).
+    /// Prefix that covers every content blob (raw object listing for fsck). Deliberately stays
+    /// `<prefix>/blobs/` (no algo segment) even though `blobKey` nests one level deeper under
+    /// `blobs/<algo>/S/ID`: a recursive LIST of this prefix still returns every blob object across all
+    /// algos in one sweep. Any code that PARSES a listed key back to a hash must take the LAST path
+    /// component (the hex digest), which stays correct regardless of the algo segment (`CasGc.cpp` /
+    /// `CasFsck.cpp` already do this via `rfind('/')`).
     ///
     /// S3-native staging Task 6 (verified, design §6 "GC exclusion"): the S3-staging area lives under
     /// `<prefix>/staging/<mount_id>/` — a distinct top-level sibling of `blobs/`, `cas/refs/`, and
@@ -294,6 +311,7 @@ public:
 
 private:
     String prefix;
+    BlobHashAlgo blob_hash_algo;
 
     /// A namespace must be non-empty, with no leading/trailing '/', no empty segment ("//"),
     /// and no segment equal to the reserved "_files".
