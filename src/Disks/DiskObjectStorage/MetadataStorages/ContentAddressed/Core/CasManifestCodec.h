@@ -1,6 +1,7 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestId.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobDigest.h>
 #include <base/types.h>
 #include <base/extended_types.h>
 #include <cstdint>
@@ -25,7 +26,7 @@ struct ManifestEntry
 {
     String path;
     EntryPlacement placement = EntryPlacement::Inline;
-    UInt128 blob_hash{};
+    BlobDigest blob_hash{};
     uint64_t blob_size = 0;
     String inline_bytes;
     bool operator==(const ManifestEntry &) const = default;
@@ -40,6 +41,7 @@ struct PartManifest
 {
     ManifestRef ref;
     RootNamespace root_namespace_id;
+    uint8_t blob_hash_len = 16;
     UInt128 payload_digest{};
     std::vector<ManifestEntry> entries;
     bool operator==(const PartManifest &) const = default;

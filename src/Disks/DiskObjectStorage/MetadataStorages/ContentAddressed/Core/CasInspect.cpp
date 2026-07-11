@@ -190,7 +190,7 @@ String renderManifestEntry(const ManifestEntry & e)
     return JsonObj()
         .add("path", jsonEscape(e.path))
         .add("placement", jsonEscape(placementName(e.placement)))
-        .add("blob_hash", jsonHex(e.blob_hash))
+        .add("blob_hash", jsonHex(e.blob_hash.toU128()))
         .add("blob_size", jsonUInt(e.blob_size))
         .add("inline_bytes_size", jsonUInt(e.inline_bytes.size()))
         .str();

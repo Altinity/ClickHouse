@@ -83,7 +83,8 @@ ManifestEntry blobEntry(const String & path, const String & payload)
     ManifestEntry e;
     e.path = path;
     e.placement = EntryPlacement::Blob;
-    e.blob_hash = u128Of(payload);
+    e.blob_hash = DB::Cas::BlobDigest::fromU128(u128Of(payload));
+
     e.blob_size = payload.size();
     return e;
 }
@@ -536,7 +537,8 @@ TEST(CasReuseGcRace, ReuseOfBlobDeletedBeforePublish)
     ManifestEntry eb;
     eb.path = "data.bin";
     eb.placement = EntryPlacement::Blob;
-    eb.blob_hash = u128Of(B);
+    eb.blob_hash = DB::Cas::BlobDigest::fromU128(u128Of(B));
+
     eb.blob_size = B.size();
     build2->adoptEvidence(eb);                                   /// tokenless dep (no HEAD)
     build2->putBlob(idOf(U), BlobSource::fromString(U));         /// build2's own unique, protected blob

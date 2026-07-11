@@ -138,7 +138,7 @@ bool blobStillReferenced(Store & store, const Layout & layout, const String & bk
             {
                 if (e.placement != EntryPlacement::Blob)
                     continue;
-                if (layout.blobKey(BlobId(u128ToHex(e.blob_hash))) == bkey)
+                if (layout.blobKey(BlobId(u128ToHex(e.blob_hash.toU128()))) == bkey)
                     return true;   /// a CURRENT ref still names this exact blob — a real dangle
             }
         }
@@ -214,7 +214,7 @@ void runFsckImpl(Store & store, bool detail, const FsckProgress & on_progress, c
             {
                 if (e.placement != EntryPlacement::Blob)
                     continue;
-                const String bkey = layout.blobKey(BlobId(u128ToHex(e.blob_hash)));
+                const String bkey = layout.blobKey(BlobId(u128ToHex(e.blob_hash.toU128())));
                 reachable_blobs.insert(bkey);
                 ++report.total_blob_refs;
                 report.referenced_logical_bytes += e.blob_size;

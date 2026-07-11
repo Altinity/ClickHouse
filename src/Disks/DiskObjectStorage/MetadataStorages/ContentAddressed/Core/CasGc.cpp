@@ -645,7 +645,7 @@ bool Gc::foldManifestEdges(const ManifestId & id, int sign, std::vector<BlobDelt
         if (entry.placement == EntryPlacement::Blob)
         {
             deltas.push_back(BlobDelta{
-                .blob_hash = entry.blob_hash,
+                .blob_hash = entry.blob_hash.toU128(),
                 .source_id = sourceEdgeId(id, entry.path),
                 .remove = (sign < 0)});
             /// B170: a folded owner edge over this blob (the manifest-model analog of the old
@@ -656,7 +656,7 @@ bool Gc::foldManifestEdges(const ManifestId & id, int sign, std::vector<BlobDelt
                 ev.type = sign > 0 ? CasEventType::RootAdd : CasEventType::RootRemove;
                 ev.namespace_ = id.root_namespace.string();
                 ev.object_kind = CasEventObjectKind::Blob;
-                ev.object_hash = u128ToHex(entry.blob_hash);
+                ev.object_hash = u128ToHex(entry.blob_hash.toU128());
                 ev.outcome = sign > 0 ? "edge_added" : "edge_removed";
                 ev.reason = sign > 0
                     ? "fold: manifest owner activated; +1 blob edge"

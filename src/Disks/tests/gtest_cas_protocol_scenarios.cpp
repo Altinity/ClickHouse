@@ -294,7 +294,7 @@ TEST(CasProtocol, EvidenceHitCondemnedPresentBlobCopiesForwardInClosure)
 
     auto build = startBuildFor(s, ns, "part_1");
     ManifestEntry entry = blobEntry("data.bin", "payload-X");
-    entry.blob_hash = hexToU128(hex);   /// streaming-convention id (matches the minted blob)
+    entry.blob_hash = DB::Cas::BlobDigest::fromU128(hexToU128(hex));   /// streaming-convention id (matches the minted blob)
     build->adoptEvidence(entry);   /// tokenless W-EVIDENCE dep on X (no HEAD, no upload)
     const ManifestId id = build->stageManifest({entry});
     build->precommitAdd(ns, "part_1", id);
@@ -559,7 +559,7 @@ TEST(CasProtocol, FreshEvidenceDepWithViewHitIsResolvedByGate)
     auto build = startBuildFor(s, ns, "part_1");
     /// adoptEvidence records a TOKENLESS dep.
     ManifestEntry entry = blobEntry("data.bin", "payload-fresh-ev");
-    entry.blob_hash = hexToU128(hex);   /// streaming-convention id (matches the minted blob)
+    entry.blob_hash = DB::Cas::BlobDigest::fromU128(hexToU128(hex));   /// streaming-convention id (matches the minted blob)
     build->adoptEvidence(entry);
     const ManifestId id = build->stageManifest({entry});
     build->precommitAdd(ns, "part_1", id);

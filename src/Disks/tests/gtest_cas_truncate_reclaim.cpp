@@ -51,13 +51,15 @@ ManifestId publishPart2(
     ManifestEntry ea;
     ea.path = "data.bin";
     ea.placement = EntryPlacement::Blob;
-    ea.blob_hash = u128Of(payload_a);
+    ea.blob_hash = DB::Cas::BlobDigest::fromU128(u128Of(payload_a));
+
     ea.blob_size = payload_a.size();
 
     ManifestEntry eb;
     eb.path = "data.cmrk3";
     eb.placement = EntryPlacement::Blob;
-    eb.blob_hash = u128Of(payload_b);
+    eb.blob_hash = DB::Cas::BlobDigest::fromU128(u128Of(payload_b));
+
     eb.blob_size = payload_b.size();
 
     /// Wiring order (EDGE-BEFORE-OBSERVE): stageManifest -> precommitAdd -> putBlob -> promote.

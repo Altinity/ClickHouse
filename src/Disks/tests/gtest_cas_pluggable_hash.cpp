@@ -282,7 +282,8 @@ TEST(CasPluggableHash, Xxh3BlobLandsUnderAlgoSegmentAndIsDiscoveredCleanByFsck)
     ManifestEntry e;
     e.path = "data.bin";
     e.placement = EntryPlacement::Blob;
-    e.blob_hash = hexToU128(id.string());
+    e.blob_hash = DB::Cas::BlobDigest::fromU128(hexToU128(id.string()));
+
     e.blob_size = payload.size();
     const ManifestId mid = build->stageManifest({e});
     build->precommitAdd(ns, "rb", mid);

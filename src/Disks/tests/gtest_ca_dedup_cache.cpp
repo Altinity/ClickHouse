@@ -109,7 +109,8 @@ TEST(CaDedupCache, HitTakesHeadFirstNoBodyPut)
     ManifestEntry e2;
     e2.path = "data.bin";
     e2.placement = EntryPlacement::Blob;
-    e2.blob_hash = u128Of("dup");
+    e2.blob_hash = DB::Cas::BlobDigest::fromU128(u128Of("dup"));
+
     e2.blob_size = 3;
     const ManifestId id2 = b2->stageManifest({e2});
     b2->precommitAdd(RootNamespace{"srv/tbl"}, "ref2", id2);

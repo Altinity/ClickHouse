@@ -9,6 +9,7 @@
 #include <Common/Exception.h>
 #include <city.h>
 #include <algorithm>
+#include <cstring>
 
 namespace DB
 {
@@ -26,19 +27,21 @@ namespace
 
 constexpr uint16_t kPartManifestFormatVersion = 1;
 
-/// One entry's RunFile payload: placement u8, blob_hash 16B LE, blob_size u64 LE, inline_len u32, inline.
-String encodeEntryPayload(const ManifestEntry & e)
+/// One entry's RunFile payload: placement u8, blob_hash `blob_hash_len` raw BE bytes, blob_size u64 LE,
+/// inline_len u32, inline. `blob_hash_len` is the manifest-wide pool digest width (16 or 32); it is
+/// carried once in the `PartManifest` header, not per-entry.
+String encodeEntryPayload(const ManifestEntry & e, uint8_t blob_hash_len)
 {
     WriteBufferFromOwnString buf;
     writeBinaryLittleEndian(static_cast<uint8_t>(e.placement), buf);
-    writeU128LE(buf, e.blob_hash);
+    buf.write(reinterpret_cast<const char *>(e.blob_hash.bytes.data()), blob_hash_len);
     writeBinaryLittleEndian(e.blob_size, buf);
     writeBinaryLittleEndian(static_cast<uint32_t>(e.inline_bytes.size()), buf);
     buf.write(e.inline_bytes.data(), e.inline_bytes.size());
     return buf.str();
 }
 
-ManifestEntry decodeEntryPayload(const String & path, std::string_view payload)
+ManifestEntry decodeEntryPayload(const String & path, std::string_view payload, uint8_t blob_hash_len)
 {
     ReadBufferFromMemory in(payload.data(), payload.size());
     return decodeGuarded("PartManifest entry", [&]
@@ -51,7 +54,9 @@ ManifestEntry decodeEntryPayload(const String & path, std::string_view payload)
             && placement_raw != static_cast<uint8_t>(EntryPlacement::Blob))
             throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: unknown placement {}", placement_raw);
         e.placement = static_cast<EntryPlacement>(placement_raw);
-        e.blob_hash = readU128LE(in);
+        const String hash_bytes = readFixedBytes(in, blob_hash_len);
+        e.blob_hash = BlobDigest{};
+        memcpy(e.blob_hash.bytes.data(), hash_bytes.data(), blob_hash_len);
         readBinaryLittleEndian(e.blob_size, in);
         uint32_t inline_len = 0;
         readBinaryLittleEndian(inline_len, in);
@@ -81,6 +86,9 @@ String encodePartManifest(const PartManifest & m)
     writeBinaryLittleEndian(magic, out);
     writeBinaryLittleEndian(kPartManifestFormatVersion, out);
     writeBinaryLittleEndian(static_cast<uint16_t>(currentWriterVersion()), out);
+    /// blob_hash_len: the pool digest width (16 or 32) shared by every entry in this manifest.
+    /// Written unconditionally -- no old-format fallback (CA is pre-release, no persisted data).
+    writeBinaryLittleEndian(m.blob_hash_len, out);
     /// ref: durable writer_epoch + build sequence + per-build manifest ordinal.
     writeBinaryLittleEndian(m.ref.writer_epoch, out);
     writeBinaryLittleEndian(m.ref.build_sequence, out);
@@ -98,7 +106,7 @@ String encodePartManifest(const PartManifest & m)
         h.key_schema = 0;
         RunFileWriter w(entries_buf, h);
         for (const auto * e : sorted)
-            w.append(e->path, encodeEntryPayload(*e));
+            w.append(e->path, encodeEntryPayload(*e, m.blob_hash_len));
         w.finish();
     }
     const String entries_bytes = entries_buf.str();
@@ -121,8 +129,13 @@ PartManifest decodePartManifest(std::string_view data)
         checkCompatibility(format_version, "PartManifest");
         uint16_t writer_version = 0;
         readBinaryLittleEndian(writer_version, in);
+        uint8_t blob_hash_len = 0;
+        readBinaryLittleEndian(blob_hash_len, in);
+        if (blob_hash_len != 16 && blob_hash_len != 32)
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: bad blob_hash_len {}", blob_hash_len);
 
         PartManifest m;
+        m.blob_hash_len = blob_hash_len;
         readBinaryLittleEndian(m.ref.writer_epoch, in);
         readBinaryLittleEndian(m.ref.build_sequence, in);
         readBinaryLittleEndian(m.ref.manifest_ordinal, in);
@@ -153,7 +166,7 @@ PartManifest decodePartManifest(std::string_view data)
             if (have_prev && path < prev_path)
                 throw Exception(ErrorCodes::CORRUPTED_DATA,
                     "PartManifest: entries out of canonical order ('{}' after '{}')", path, prev_path);
-            m.entries.push_back(decodeEntryPayload(path, payload));
+            m.entries.push_back(decodeEntryPayload(path, payload, blob_hash_len));
             prev_path = path;
             have_prev = true;
         }

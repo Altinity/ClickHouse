@@ -22,7 +22,8 @@ Cas::ManifestEntry inlineEntry(const String & path, const String & bytes)
     Cas::ManifestEntry e;
     e.path = path;
     e.placement = Cas::EntryPlacement::Inline;
-    e.blob_hash = u128Of(bytes);
+    e.blob_hash = DB::Cas::BlobDigest::fromU128(u128Of(bytes));
+
     e.blob_size = bytes.size();
     e.inline_bytes = bytes;
     return e;

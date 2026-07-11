@@ -20,7 +20,7 @@ PartManifest sample()
     ManifestEntry blob;
     blob.path = "columns/data.bin";
     blob.placement = EntryPlacement::Blob;
-    blob.blob_hash = (UInt128(1) << 64) | UInt128(2);
+    blob.blob_hash = BlobDigest::fromU128((UInt128(1) << 64) | UInt128(2));
     blob.blob_size = 4096;
     ManifestEntry inl;
     inl.path = "checksums.txt";
@@ -54,7 +54,7 @@ TEST(CasManifestCodec, EntriesInCanonicalPathOrder)
     EXPECT_EQ(got.entries[1].path, "columns/data.bin");
     EXPECT_EQ(got.entries[1].placement, EntryPlacement::Blob);
     EXPECT_EQ(got.entries[1].blob_size, 4096u);
-    EXPECT_EQ(got.entries[1].blob_hash, (UInt128(1) << 64) | UInt128(2));
+    EXPECT_EQ(got.entries[1].blob_hash.toU128(), (UInt128(1) << 64) | UInt128(2));
 }
 
 TEST(CasManifestCodec, ByteDeterminism)
@@ -204,12 +204,12 @@ DB::Cas::PartManifest makeTwoEntryManifestForOrderTest()
     DB::Cas::ManifestEntry a;
     a.path = "path_alpha_0001";
     a.placement = DB::Cas::EntryPlacement::Inline;
-    a.blob_hash = DB::UInt128(1);
+    a.blob_hash = DB::Cas::BlobDigest::fromU128(DB::UInt128(1));
     a.blob_size = 1;
     a.inline_bytes = "x";
     DB::Cas::ManifestEntry b = a;
     b.path = "path_bravo_0002";
-    b.blob_hash = DB::UInt128(2);
+    b.blob_hash = DB::Cas::BlobDigest::fromU128(DB::UInt128(2));
     b.inline_bytes = "y";
     m.entries = {a, b};
     m.payload_digest = DB::Cas::computePayloadDigest(m);
@@ -331,7 +331,7 @@ TEST(CasManifestCodec, DecodeRejectsNonAdjacentDuplicatePath)
     auto m = makeTwoEntryManifestForOrderTest();
     DB::Cas::ManifestEntry c = m.entries[0];
     c.path = "path_delta_0003";
-    c.blob_hash = DB::UInt128(3);
+    c.blob_hash = DB::Cas::BlobDigest::fromU128(DB::UInt128(3));
     c.inline_bytes = "z";
     m.entries.push_back(c);
     m.payload_digest = DB::Cas::computePayloadDigest(m);
@@ -340,6 +340,67 @@ TEST(CasManifestCodec, DecodeRejectsNonAdjacentDuplicatePath)
     const String forged = forgeRenamedRecordKey(encoded, "path_delta_0003", "path_alpha_0001");
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
         [&] { DB::Cas::decodePartManifest(forged); });
+}
+
+TEST(CasManifestCodec, BlobHashLen16RoundTripAndBlobKeyStability)
+{
+    /// blob_hash_len=16 (the default, 128-bit pools): the digest round-trips through the raw-byte
+    /// codec AND through fromU128/toU128, proving the derived blobKey (which hashes via toU128 at
+    /// today's 128-bit call sites) is stable across an encode/decode cycle.
+    const UInt128 some_v = (UInt128(0x1122334455667788ULL) << 64) | UInt128(0x99AABBCCDDEEFF00ULL);
+    PartManifest m;
+    m.ref = ManifestRef{11, 22, 1};
+    m.root_namespace_id = RootNamespace("srv-c/uuid@cas@");
+    m.blob_hash_len = 16;
+    ManifestEntry blob;
+    blob.path = "data.bin";
+    blob.placement = EntryPlacement::Blob;
+    blob.blob_hash = BlobDigest::fromU128(some_v);
+    blob.blob_size = 123;
+    m.entries = {blob};
+    m.payload_digest = computePayloadDigest(m);
+
+    const PartManifest got = decodePartManifest(encodePartManifest(m));
+    EXPECT_EQ(got.blob_hash_len, 16);
+    ASSERT_EQ(got.entries.size(), 1u);
+    EXPECT_EQ(got.entries[0], m.entries[0]);
+    EXPECT_EQ(got.entries[0].blob_hash.toU128(), some_v);
+}
+
+TEST(CasManifestCodec, BlobHashLen32RoundTrip)
+{
+    /// blob_hash_len=32 (a sha256 pool): all 32 bytes must survive — no truncation, no tail loss.
+    PartManifest m;
+    m.ref = ManifestRef{33, 44, 1};
+    m.root_namespace_id = RootNamespace("srv-d/uuid@cas@");
+    m.blob_hash_len = 32;
+    ManifestEntry blob;
+    blob.path = "data.bin";
+    blob.placement = EntryPlacement::Blob;
+    for (size_t i = 0; i < blob.blob_hash.bytes.size(); ++i)
+        blob.blob_hash.bytes[i] = static_cast<uint8_t>(0xA0 + i);   /// known non-trivial 32-byte pattern
+    blob.blob_size = 456;
+    m.entries = {blob};
+    m.payload_digest = computePayloadDigest(m);
+
+    const PartManifest got = decodePartManifest(encodePartManifest(m));
+    EXPECT_EQ(got.blob_hash_len, 32);
+    ASSERT_EQ(got.entries.size(), 1u);
+    EXPECT_EQ(got.entries[0], m.entries[0]);
+    EXPECT_EQ(got.entries[0].blob_hash.bytes, blob.blob_hash.bytes);
+}
+
+TEST(CasManifestCodec, BadBlobHashLenFailsClosed)
+{
+    /// Corrupt the blob_hash_len header byte (right after the 2-byte writer_version, which follows
+    /// the 4-byte magic + 2-byte format_version) to an invalid width -> decodePartManifest must fail
+    /// closed with CORRUPTED_DATA, never silently accept an unknown digest width.
+    String encoded = encodePartManifest(sample());
+    constexpr size_t blob_hash_len_offset = 4 /* magic */ + 2 /* format_version */ + 2 /* writer_version */;
+    ASSERT_LT(blob_hash_len_offset, encoded.size());
+    encoded[blob_hash_len_offset] = static_cast<char>(99);
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { decodePartManifest(encoded); });
 }
 
 TEST(CasManifestCodec, FindEntryBinarySearch)

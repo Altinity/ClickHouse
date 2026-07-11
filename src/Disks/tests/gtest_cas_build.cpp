@@ -63,7 +63,8 @@ ManifestEntry blobManifestEntry(const String & path, const String & payload)
     ManifestEntry e;
     e.path = path;
     e.placement = EntryPlacement::Blob;
-    e.blob_hash = u128Of(payload);
+    e.blob_hash = DB::Cas::BlobDigest::fromU128(u128Of(payload));
+
     e.blob_size = payload.size();
     return e;
 }
@@ -73,7 +74,8 @@ ManifestEntry blobManifestEntryStreaming(const String & path, const String & pay
     ManifestEntry e;
     e.path = path;
     e.placement = EntryPlacement::Blob;
-    e.blob_hash = hexToU128(streamingHexOf(payload));
+    e.blob_hash = DB::Cas::BlobDigest::fromU128(hexToU128(streamingHexOf(payload)));
+
     e.blob_size = payload.size();
     return e;
 }
@@ -1018,7 +1020,8 @@ TEST(CasBuild, CopyForwardMultiBlockPayloadVerifies)
         ManifestEntry e;
         e.path = "data.bin";
         e.placement = EntryPlacement::Blob;
-        e.blob_hash = hash;
+        e.blob_hash = DB::Cas::BlobDigest::fromU128(hash);
+
         e.blob_size = payload.size();
         const ManifestId mid0 = build->stageManifest({e});
         build->precommitAdd(ns, "part_a", mid0);
@@ -1035,7 +1038,8 @@ TEST(CasBuild, CopyForwardMultiBlockPayloadVerifies)
     ManifestEntry e;
     e.path = "data.bin";
     e.placement = EntryPlacement::Blob;
-    e.blob_hash = hash;
+    e.blob_hash = DB::Cas::BlobDigest::fromU128(hash);
+
     e.blob_size = payload.size();
     build->adoptEvidence(e);
     const ManifestId mid = build->stageManifest({e});
@@ -1936,7 +1940,8 @@ size_t manifestEncodedSizeForPathLen(const RootNamespace & ns, size_t path_len)
     ManifestEntry e;
     e.path = String(path_len, 'a');
     e.placement = EntryPlacement::Blob;
-    e.blob_hash = UInt128{};
+    e.blob_hash = DB::Cas::BlobDigest::fromU128(UInt128{});
+
     e.blob_size = 12345;
     probe.entries = {std::move(e)};
     return encodePartManifest(probe).size();
@@ -1974,7 +1979,8 @@ ManifestEntry wideBlobManifestEntry(size_t path_len)
     ManifestEntry e;
     e.path = String(path_len, 'a');
     e.placement = EntryPlacement::Blob;
-    e.blob_hash = UInt128{0x42};
+    e.blob_hash = DB::Cas::BlobDigest::fromU128(UInt128{0x42});
+
     e.blob_size = 12345;
     return e;
 }

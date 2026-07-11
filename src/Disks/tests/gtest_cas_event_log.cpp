@@ -63,7 +63,8 @@ String publishOneBlobPart(const StorePtr & s, const String & ns, const String & 
     ManifestEntry e;
     e.path = "data.bin";
     e.placement = EntryPlacement::Blob;
-    e.blob_hash = u128Of(payload);
+    e.blob_hash = DB::Cas::BlobDigest::fromU128(u128Of(payload));
+
     e.blob_size = payload.size();
     const ManifestId id = build->stageManifest({e});
     build->precommitAdd(nsr, ref, id);

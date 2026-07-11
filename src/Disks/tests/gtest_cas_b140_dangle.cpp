@@ -77,7 +77,8 @@ TEST(CasGcDangle, SharedBlobSurvivesDropOfOneOfTwoLiveRefs)
         ManifestEntry e;
         e.path = "data.bin";
         e.placement = EntryPlacement::Blob;
-        e.blob_hash = u128Of("B");
+        e.blob_hash = DB::Cas::BlobDigest::fromU128(u128Of("B"));
+
         e.blob_size = std::string("B").size();
         const ManifestId id = build->stageManifest({e});
         build->precommitAdd(ns, "rb_live", id);
@@ -94,7 +95,8 @@ TEST(CasGcDangle, SharedBlobSurvivesDropOfOneOfTwoLiveRefs)
         ManifestEntry e;
         e.path = "other.bin";
         e.placement = EntryPlacement::Blob;
-        e.blob_hash = u128Of("B");
+        e.blob_hash = DB::Cas::BlobDigest::fromU128(u128Of("B"));
+
         e.blob_size = std::string("B").size();
         build->adoptEvidence(e);   /// tokenless dep (no HEAD) — the cross-node adopt
         const ManifestId id = build->stageManifest({e});

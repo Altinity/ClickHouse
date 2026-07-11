@@ -49,7 +49,8 @@ ManifestEntry blobEntry(const String & name, const String & payload)
     ManifestEntry e;
     e.path = name;
     e.placement = EntryPlacement::Blob;
-    e.blob_hash = u128Of(payload);
+    e.blob_hash = DB::Cas::BlobDigest::fromU128(u128Of(payload));
+
     e.blob_size = payload.size();
     return e;
 }

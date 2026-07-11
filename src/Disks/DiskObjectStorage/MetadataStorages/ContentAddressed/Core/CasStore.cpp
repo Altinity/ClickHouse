@@ -901,7 +901,7 @@ BlobLocation Store::locate(const ManifestEntry & entry) const
     {
         case EntryPlacement::Blob:
             return BlobLocation{
-                .key = pool_layout.blobKey(BlobId(u128ToHex(entry.blob_hash))),
+                .key = pool_layout.blobKey(BlobId(u128ToHex(entry.blob_hash.toU128()))),
                 .offset = meta.blob_header_len,
                 .length = entry.blob_size,
             };

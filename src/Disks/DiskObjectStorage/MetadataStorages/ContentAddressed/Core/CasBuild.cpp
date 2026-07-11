@@ -728,7 +728,7 @@ void Build::adoptEvidence(const ManifestEntry & entry)
     /// Inline / Blob placements (no Subtree): only blobs are content-addressed.
     if (entry.placement == EntryPlacement::Blob)
     {
-        deps[{static_cast<uint8_t>(ObjectKind::Blob), entry.blob_hash}] =
+        deps[{static_cast<uint8_t>(ObjectKind::Blob), entry.blob_hash.toU128()}] =
             DepEntry{ObjectKind::Blob, std::nullopt, entry.blob_size};
     }
 }
@@ -801,6 +801,7 @@ ManifestId Build::stageManifest(std::vector<ManifestEntry> entries)
     PartManifest body;
     body.ref = ref;
     body.root_namespace_id = owning_ns;
+    body.blob_hash_len = static_cast<uint8_t>(store->poolMeta().blob_hash_len);
     body.entries = std::move(entries);
     body.payload_digest = computePayloadDigest(body);
     const String encoded = encodePartManifest(body);
@@ -989,9 +990,9 @@ void Build::promote(const RootNamespace & target_ns, const String & final_ref_na
         {
             if (e.placement != EntryPlacement::Blob)
                 continue;
-            if (depIsTokened(e.blob_hash))
+            if (depIsTokened(e.blob_hash.toU128()))
                 continue;   /// edge-protected (EDGE-BEFORE-OBSERVE); putBlob validated under the durable edge
-            const BlobId blob_id{u128ToHex(e.blob_hash)};
+            const BlobId blob_id{u128ToHex(e.blob_hash.toU128())};
             const String blob_key = store->layout().blobKey(blob_id);
             constexpr int max_reval_attempts = 8;
             bool validated = false;
@@ -1004,14 +1005,14 @@ void Build::promote(const RootNamespace & target_ns, const String & final_ref_na
                 /// Task 4 (spec §meta-protocols v3): the condemned decision is now a per-hash META
                 /// POINT-READ, not the writer-side RetireView — mirrors Task 3's putBlob/uploadFromSource
                 /// re-sourcing. An absent meta reads as "not condemned" (same convention as the writer gate).
-                const auto lm = loadMeta(store->backend(), store->layout(), e.blob_hash);
+                const auto lm = loadMeta(store->backend(), store->layout(), e.blob_hash.toU128());
                 const bool condemned = lm && lm->meta.state == MetaState::Condemned;
                 if (condemned)
                 {
-                    if (!isCopyForwardableTokenless(e.blob_hash))
+                    if (!isCopyForwardableTokenless(e.blob_hash.toU128()))
                         throw Exception(ErrorCodes::ABORTED,
                             "promote: blob {} condemned at commit revalidation — failing closed (INV-1)", blob_key);
-                    copyForwardFromCondemned(e.blob_hash, blob_key, hr);
+                    copyForwardFromCondemned(e.blob_hash.toU128(), blob_key, hr);
                     continue;
                 }
                 validated = true;

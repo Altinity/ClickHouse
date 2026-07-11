@@ -176,7 +176,8 @@ DB::Cas::ManifestEntry wiringBlobEntry(const String & path, const String & paylo
     DB::Cas::ManifestEntry e;
     e.path = path;
     e.placement = DB::Cas::EntryPlacement::Blob;
-    e.blob_hash = u128Of(payload);
+    e.blob_hash = DB::Cas::BlobDigest::fromU128(u128Of(payload));
+
     e.blob_size = payload.size();
     return e;
 }
@@ -1082,9 +1083,9 @@ TEST(CaWiringExchange, GetPartManifestBytesReturnsBodyForCommittedPart)
     const DB::Cas::PartManifest decoded = DB::Cas::decodePartManifest(*bytes);
     ASSERT_EQ(decoded.entries.size(), 2u);
     EXPECT_EQ(decoded.entries[0].path, "data.bin");
-    EXPECT_EQ(decoded.entries[0].blob_hash, u128Of("payload-A"));
+    EXPECT_EQ(decoded.entries[0].blob_hash.toU128(), u128Of("payload-A"));
     EXPECT_EQ(decoded.entries[1].path, "p.proj/data.bin");
-    EXPECT_EQ(decoded.entries[1].blob_hash, u128Of("payload-B"));
+    EXPECT_EQ(decoded.entries[1].blob_hash.toU128(), u128Of("payload-B"));
 
     /// An absent part is not a committed CA part here -> no offer.
     EXPECT_FALSE(exchange->getPartManifestBytes("uui/uuid-1/all_9_9_9").has_value());
@@ -1131,7 +1132,7 @@ TEST(CaWiringExchange, AdoptPartFromManifestPublishesFreshLocalManifest)
     const DB::Cas::PartManifest receiver_manifest =
         storage->store()->readManifest(receiver_resolved->manifest_id);
     ASSERT_EQ(receiver_manifest.entries.size(), 2u);
-    EXPECT_EQ(receiver_manifest.entries[0].blob_hash, u128Of("payload-A"));
+    EXPECT_EQ(receiver_manifest.entries[0].blob_hash.toU128(), u128Of("payload-A"));
 
     /// FRESH receiver-local identity: a DIFFERENT ManifestId from the sender's, in the RECEIVER namespace.
     EXPECT_FALSE(sender_id == receiver_resolved->manifest_id)
