@@ -352,7 +352,8 @@ TEST(CasHeaderGolden, GcOutcomesCasHeaderRoundTrips)
 TEST(CasHeaderGolden, PoolMetaCasHeaderRoundTrips)
 {
     const PoolMeta pm{.pool_id = hexToU128("000102030405060708090a0b0c0d0e0f"),
-                      .root_shards = 16, .blob_header_len = 96, .min_reader_generation = 0};
+                      .root_shards = 16, .blob_header_len = 96, .min_reader_generation = 0,
+                      .algos_used = {static_cast<uint8_t>(BlobHashAlgo::CityHash128)}};
     const String bytes = encodePoolMeta(pm);
     ASSERT_FALSE(bytes.empty());
     EXPECT_NE(bytes.front(), '{');   // not JSON
@@ -461,6 +462,7 @@ TEST(CasPoolMeta, MinReaderGenerationGate)
         pm.pool_id = UInt128(42);
         pm.root_shards = 1;
         pm.blob_header_len = 96;
+        pm.algos_used = {static_cast<uint8_t>(BlobHashAlgo::CityHash128)};
         pm.min_reader_generation = G_BUILD;   /// at-floor: OK
         const String bytes = encodePoolMeta(pm);
         const PoolMeta d = decodePoolMeta(bytes);
@@ -472,6 +474,7 @@ TEST(CasPoolMeta, MinReaderGenerationGate)
         pm.pool_id = UInt128(43);
         pm.root_shards = 1;
         pm.blob_header_len = 96;
+        pm.algos_used = {static_cast<uint8_t>(BlobHashAlgo::CityHash128)};
         pm.min_reader_generation = 0;
         const String bytes = encodePoolMeta(pm);
         const PoolMeta d = decodePoolMeta(bytes);
@@ -483,6 +486,7 @@ TEST(CasPoolMeta, MinReaderGenerationGate)
         pm.pool_id = UInt128(44);
         pm.root_shards = 1;
         pm.blob_header_len = 96;
+        pm.algos_used = {static_cast<uint8_t>(BlobHashAlgo::CityHash128)};
         pm.min_reader_generation = G_BUILD + 1;   /// above the floor: this build is too old
         const String bytes = encodePoolMeta(pm);
         expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [&] { decodePoolMeta(bytes); });

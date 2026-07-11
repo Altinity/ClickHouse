@@ -112,13 +112,14 @@ message PoolMetaProto {
   uint64 root_shards            = 3;  // must be >= 1
   uint64 blob_header_len        = 4;  // 8-aligned, in [96, 16384]
   uint64 min_reader_generation  = 5;  // startup gate: if G_BUILD < min_reader_generation => UNKNOWN_FORMAT_VERSION
-  // CAS pluggable-blob-hash Phase 1 (design 2026-07-11-cas-pluggable-blob-hash-design.md §4).
-  // Safe-additive: `optional` (proto3 explicit presence) so an old-format object with the field
-  // absent decodes with has_blob_hash_algo()==false; the decoder then defaults it to 1 (cityHash128),
-  // which is correct for every pool created before this field existed. 1=cityHash128 2=xxh3-128
-  // 3=sha256 (mirrors DB::Cas::BlobHashAlgo). Fixed at pool creation; on reopen the recorded value is
-  // authoritative and a disagreeing disk config fails closed (never re-hash an existing pool).
-  optional uint32 blob_hash_algo = 6;
+  // CAS mixed-algo pools (Phase 3 T4, design 2026-07-11-cas-mixed-algo-pools-design.md §5): every
+  // hash algo ever ADMITTED to this pool, sorted, append-only. 1=cityHash128 2=xxh3-128 3=sha256
+  // (mirrors DB::Cas::BlobHashAlgo). REPLACES the Phase 1/2 single `blob_hash_algo` field (field
+  // number 6 reused -- CAS is pre-release, no wire compat kept for the old singular value: a
+  // pre-Phase-3 `_pool_meta` object is disposable derived state, per CLAUDE.md). Admitting a new
+  // algo (opt-in via the disk's `blob_hash_allow_new`) CAS-unions it in; the default reopen with an
+  // unlisted algo fails closed (BAD_ARGUMENTS).
+  repeated uint32 algos_used = 6;
 }
 
 // (WatermarkProto "CAWM" retired with the ack-floor merge — the build-watermark floor rides the

@@ -12,6 +12,7 @@
 /// upgrade. This is load-bearing: it is what makes Phase 2 safe to land under running pools.
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobDigest.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobRef.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasCodecUtil.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcShardPlan.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
@@ -67,16 +68,16 @@ TEST(CasBlobDigest, ShardOfBitIdenticalToOldHighBitsOver200RandomValues)
     EXPECT_EQ(codec16.shardOf(BlobDigest::fromU128(all_ones)), static_cast<uint64_t>(all_ones >> 64));
 }
 
-/// The same gate, but via the codec's `PoolMeta`-scoped constructor (a 128-bit pool's PoolMeta
-/// yields blob_hash_len=16, so this is the same behavior reached through the intended production
-/// entry point).
+/// The same gate, but via `Cas::codecFor` (`CasBlobRef.h`), the ONE way production code obtains a
+/// codec (Phase 3 T4 deleted the pool-scoped `DigestCodec(PoolMeta)` constructor -- a mixed-algo
+/// pool has no single width; the codec is selected per-algo, never per-pool).
 TEST(CasBlobDigest, ShardOfViaPoolMetaConstructedCodecMatchesOldBlobShard)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     const Layout layout("p");
     const PoolMeta pm = PoolMeta::createOrValidate(*backend, layout, /*root_shards*/ 4, /*blob_header_len*/ 256);
-    ASSERT_EQ(pm.blob_hash_len, 16u);
-    const DigestCodec codec(pm);
+    ASSERT_EQ(pm.algos_used, (std::vector<uint8_t>{static_cast<uint8_t>(BlobHashAlgo::CityHash128)}));
+    const DigestCodec codec = codecFor(BlobHashAlgo::CityHash128);
 
     std::mt19937_64 rng(12345);
     for (int i = 0; i < 200; ++i)
@@ -220,31 +221,35 @@ TEST(CasBlobDigest, UsableAsUnorderedMapKey)
         EXPECT_EQ(m.at(digests[static_cast<size_t>(i)]), i);
 }
 
-/// ---- PoolMeta::blob_hash_len derivation (feeds DigestCodec's PoolMeta constructor) ----
+/// ---- PoolMeta::algos_used records the creating algo (Phase 3 T4 -- the width itself is no longer
+/// pool state at all: `blobHashLenFor(algo)`/`codecFor(algo)` derive it per-algo, never per-pool) ----
 
-TEST(CasBlobDigest, PoolMetaDerivesBlobHashLenFromAlgo)
+TEST(CasBlobDigest, PoolMetaRecordsCreatingAlgoAndWidthDerivesFromIt)
 {
     {
         auto backend = std::make_shared<InMemoryBackend>();
         const Layout layout("p1");
         const PoolMeta pm = PoolMeta::createOrValidate(*backend, layout, 4, 256, BlobHashAlgo::CityHash128);
-        EXPECT_EQ(pm.blob_hash_len, 16u);
+        EXPECT_EQ(pm.algos_used, (std::vector<uint8_t>{static_cast<uint8_t>(BlobHashAlgo::CityHash128)}));
+        EXPECT_EQ(blobHashLenFor(BlobHashAlgo::CityHash128), 16u);
     }
     {
         auto backend = std::make_shared<InMemoryBackend>();
         const Layout layout("p2");
         const PoolMeta pm = PoolMeta::createOrValidate(*backend, layout, 4, 256, BlobHashAlgo::XXH3_128);
-        EXPECT_EQ(pm.blob_hash_len, 16u);
+        EXPECT_EQ(pm.algos_used, (std::vector<uint8_t>{static_cast<uint8_t>(BlobHashAlgo::XXH3_128)}));
+        EXPECT_EQ(blobHashLenFor(BlobHashAlgo::XXH3_128), 16u);
     }
     {
         auto backend = std::make_shared<InMemoryBackend>();
         const Layout layout("p3");
         const PoolMeta pm = PoolMeta::createOrValidate(*backend, layout, 4, 256, BlobHashAlgo::Sha256);
-        EXPECT_EQ(pm.blob_hash_len, 32u);
+        EXPECT_EQ(pm.algos_used, (std::vector<uint8_t>{static_cast<uint8_t>(BlobHashAlgo::Sha256)}));
+        EXPECT_EQ(blobHashLenFor(BlobHashAlgo::Sha256), 32u);
 
-        /// Reopen (decode path) must re-derive the same width.
+        /// Reopen (decode path) must re-derive the same recorded algo.
         const PoolMeta reopened = PoolMeta::createOrValidate(*backend, layout, 4, 256, BlobHashAlgo::Sha256);
-        EXPECT_EQ(reopened.blob_hash_len, 32u);
+        EXPECT_EQ(reopened.algos_used, (std::vector<uint8_t>{static_cast<uint8_t>(BlobHashAlgo::Sha256)}));
     }
 }
 

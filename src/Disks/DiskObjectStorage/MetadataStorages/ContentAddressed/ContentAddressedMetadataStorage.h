@@ -92,7 +92,12 @@ public:
         /// the pool's blob content-hash function, threaded into `Cas::PoolConfig` in `startup()`.
         /// Trailing default (`CityHash128`, byte-for-byte today's behavior) keeps every existing
         /// positional call site compiling unmodified.
-        Cas::BlobHashAlgo blob_hash_algo_ = Cas::BlobHashAlgo::CityHash128);
+        Cas::BlobHashAlgo blob_hash_algo_ = Cas::BlobHashAlgo::CityHash128,
+        /// CAS mixed-algo pools (Phase 3 T4, design 2026-07-11-cas-mixed-algo-pools-design.md §5):
+        /// opt-in for `blob_hash_algo_` to be ADMITTED into the pool's `algos_used` when it is not
+        /// already a member. Trailing default `false` (fail-closed) keeps every existing positional
+        /// call site compiling unmodified.
+        bool blob_hash_allow_new_ = false);
 
     /// Parse `cas_staging_backend` from the CAS disk config (default `local` — the OFF BY DEFAULT
     /// global constraint). Extracted as a static method (rather than inlined into
@@ -294,6 +299,9 @@ private:
     /// CAS pluggable-blob-hash Phase 1: the pool's blob content-hash function, threaded into
     /// `Cas::PoolConfig` in `startup()`.
     const Cas::BlobHashAlgo blob_hash_algo;
+    /// CAS mixed-algo pools (Phase 3 T4): opt-in for `blob_hash_algo` to be ADMITTED into the pool's
+    /// `algos_used`, threaded into `Cas::PoolConfig` in `startup()`.
+    const bool blob_hash_allow_new;
     /// Set later by the mount-time conditional-copy capability probe (a later task) — NOT const.
     /// Defaults to false (fail-close): assumed unsupported until the probe proves otherwise.
     bool conditional_copy_supported = false;

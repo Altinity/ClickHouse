@@ -6,6 +6,7 @@
 #include <base/extended_types.h>
 #include <cstdint>
 #include <string_view>
+#include <vector>
 
 namespace DB::Cas
 {
@@ -24,29 +25,29 @@ struct PoolMeta
     uint64_t root_shards = 0;
     uint64_t blob_header_len = 0;
     uint64_t min_reader_generation = 0;     /// startup gate: if G_BUILD < min_reader_generation => UNKNOWN_FORMAT_VERSION
-    /// CAS pluggable-blob-hash Phase 1 (spec 2026-07-11, §4): the pool's blob content-hash function,
-    /// as `static_cast<uint8_t>(BlobHashAlgo)`. `1` = `BlobHashAlgo::CityHash128` (the default;
-    /// existing pools created before this field existed decode to `1`, which is correct — they ARE
-    /// cityHash128 pools). Fixed at pool creation; on reopen the recorded value is authoritative
-    /// (`createOrValidate` fails closed on a disagreeing config, spec §8 — never re-hash a pool).
-    uint8_t blob_hash_algo = 1;
-    /// CAS pluggable-blob-hash Phase 2 (design §12, Task 1): the pool's digest byte width, derived
-    /// from `blob_hash_algo` via `blobHashLenFor` (16 for `CityHash128`/`XXH3_128`, 32 for `Sha256`).
-    /// NOT an independently persisted field yet (Phase 2 Task 6 adds real persistence + fail-close
-    /// validation) -- `decodePoolMeta` and `createOrValidate` always RE-DERIVE it from the decoded/
-    /// validated `blob_hash_algo`, so it can never drift from the algo it comes from. Feeds
-    /// `DigestCodec` (`CasBlobDigest.h`), the ONE object all digest<->hex/bytes conversion routes
-    /// through.
-    uint64_t blob_hash_len = 16;
+    /// CAS mixed-algo pools (Phase 3 T4, design 2026-07-11-cas-mixed-algo-pools-design.md §5):
+    /// every hash algo ever ADMITTED to this pool, as `static_cast<uint8_t>(BlobHashAlgo)`,
+    /// canonically SORTED and APPEND-ONLY (never shrinks, never reorders). Replaces the Phase 1/2
+    /// single fail-closed `blob_hash_algo` -- a pool may now hold blobs under SEVERAL algos at once
+    /// (additive switching, no migration). `PoolMeta::createOrValidate` is pool-authoritative: a
+    /// config algo already IN this set is accepted with no write; a config algo NOT in this set is
+    /// admitted via a CAS-union (opt-in, `blob_hash_allow_new`) or refused (`BAD_ARGUMENTS`, the
+    /// default). There is no separately-persisted digest width anymore -- `Cas::codecFor(algo)`
+    /// (`CasBlobRef.h`) derives it per-`BlobRef` from `blobHashLenFor`, never from the pool.
+    std::vector<uint8_t> algos_used;
 
-    /// GET `_pool_meta`; absent => mint `pool_id` (`thread_local_rng`) and `casPut(expected=nullopt)` —
-    /// a racing creator loses the CAS, re-reads, and validates like a reopen. Present => strict parse.
-    /// The POOL is authoritative on reopen: `root_shards` / `blob_header_len` / `blob_hash_algo` come
-    /// FROM the pool; the passed config values apply only at first creation. `blob_hash_algo` additionally
-    /// fails closed on reopen (BAD_ARGUMENTS) when the config disagrees with the recorded value.
+    /// GET `_pool_meta`; absent => mint `pool_id` (`thread_local_rng`), seed `algos_used = {blob_hash_algo}`,
+    /// and `casPut(expected=nullopt)` — a racing creator loses the CAS and re-enters the SAME
+    /// admission path as a reopen (spec §5: "the creation-race loser UNIONS its algo instead of
+    /// today's fail-close"). Present => strict parse, then admission: `blob_hash_algo` already a
+    /// member of `algos_used` => OK, no write; not a member and `allow_new` => CAS-union it in
+    /// (read+token -> insert sorted -> casPut; re-read and retry on conflict); not a member and
+    /// `!allow_new` => `BAD_ARGUMENTS` naming `<blob_hash_allow_new>` (never touches the pool). The
+    /// POOL is authoritative on reopen: `root_shards` / `blob_header_len` come FROM the pool; the
+    /// passed config values apply only at first creation.
     static PoolMeta createOrValidate(
         Backend &, const Layout &, uint64_t root_shards, uint64_t blob_header_len,
-        BlobHashAlgo blob_hash_algo = BlobHashAlgo::CityHash128);
+        BlobHashAlgo blob_hash_algo = BlobHashAlgo::CityHash128, bool allow_new = false);
 };
 
 String encodePoolMeta(const PoolMeta &);     /// exposed for the round-trip test

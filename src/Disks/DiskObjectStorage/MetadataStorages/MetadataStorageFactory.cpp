@@ -258,6 +258,12 @@ static void registerContentAddressedMetadataStorage(MetadataStorageFactory & fac
         /// width). The choice is fixed at pool creation; `PoolMeta::createOrValidate` is pool-authoritative
         /// on reopen and fails closed (BAD_ARGUMENTS) when this disagrees with the recorded algo.
         const Cas::BlobHashAlgo blob_hash_algo = Cas::parseBlobHashAlgo(config.getString(config_prefix + ".blob_hash", "cityhash128"));
+        /// CAS mixed-algo pools (Phase 3 T4, design 2026-07-11-cas-mixed-algo-pools-design.md §5):
+        /// admission of a NEW algo into an existing pool's `algos_used` is explicit opt-in -- a
+        /// reopen whose `blob_hash` disagrees with the pool's recorded set fails closed
+        /// (BAD_ARGUMENTS) unless this is set. Default 0 (fail-closed): a changed config alone must
+        /// never silently turn a pool mixed.
+        const bool blob_hash_allow_new = config.getBool(config_prefix + ".blob_hash_allow_new", false);
         const uint64_t dedup_cache_bytes = config.getUInt64(config_prefix + ".dedup_cache_bytes", 64ULL << 20);
         const uint64_t dedup_head_first_min_bytes = config.getUInt64(config_prefix + ".dedup_head_first_min_bytes", 1ULL << 20);
         const uint64_t gc_snap_generations_to_keep = config.getUInt64(config_prefix + ".gc_snap_generations_to_keep", 3);
@@ -305,7 +311,7 @@ static void registerContentAddressedMetadataStorage(MetadataStorageFactory & fac
             gc_snap_generations_to_keep, gc_shards, manifest_sweep_list_budget_keys, manifest_sweep_delete_budget_keys,
             manifest_soft_limit, manifest_hard_limit, manifest_max_delay_ms, gcs_max_conditional_put_bytes,
             cas_part_folder_cache_bytes, cas_part_folder_cache_max_entries, cas_part_folder_cache_max_entry_bytes,
-            manifest_decode_cache_bytes, gc_meta_pool_size, staging_backend, blob_hash_algo);
+            manifest_decode_cache_bytes, gc_meta_pool_size, staging_backend, blob_hash_algo, blob_hash_allow_new);
 
         return metadata_storage;
     });

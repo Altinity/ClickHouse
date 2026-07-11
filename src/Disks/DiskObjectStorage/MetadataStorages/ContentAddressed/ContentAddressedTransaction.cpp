@@ -570,7 +570,9 @@ std::string ContentAddressedTransaction::buildS3StagingBlobHeader(
 
     Cas::EnvelopeHeader header;
     header.kind = Cas::ObjectKind::Blob;
-    header.hash_algo = meta.blob_hash_algo;
+    /// Phase 3 T4: `PoolMeta` no longer records a single pool-wide algo (mixed-algo pools, `algos_used`)
+    /// -- a write-mint context always uses this Store's NODE-LOCAL write algo.
+    header.hash_algo = static_cast<uint8_t>(store->writeAlgo());
     header.domain_id = meta.pool_id;
     header.incarnation_tag = (static_cast<UInt128>(thread_local_rng()) << 64) | thread_local_rng();
     header.build_id = 0;   /// not known at stream time; diagnostic-only (not read by GC/read paths)
@@ -660,14 +662,13 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
         /// to a fresh per-mount S3 staging object while hashing — no local-disk round trip. Otherwise
         /// (the OFF BY DEFAULT global constraint, or a probe fail-close) fall through to the existing,
         /// byte-for-byte-unchanged local-temp-file path below.
-        /// P1-T3a (CAS pluggable blob hash): hash with the POOL's recorded algo, not a hardcoded
-        /// cityHash128 -- `PoolMeta` is authoritative (§4/§8 of the design), the same accessor
-        /// `blob_header_len` already uses above.
-        const auto hash_algo = static_cast<Cas::BlobHashAlgo>(metadata_storage.store()->poolMeta().blob_hash_algo);
+        /// P1-T3a (CAS pluggable blob hash): hash with this Store's NODE-LOCAL write algo, not a
+        /// hardcoded cityHash128 (Phase 3 T4: `PoolMeta` no longer records a single pool-wide algo --
+        /// mixed-algo pools track `algos_used`; `writeAlgo()` is the write-mint accessor now).
+        const auto hash_algo = metadata_storage.store()->writeAlgo();
         /// Phase 3 T2: `hash_hex` is rendered by the streaming write buffer at `hash_algo`'s own width —
-        /// parse it back at that SAME width via `Cas::codecFor(hash_algo)` (never the pool-wide
-        /// `DigestCodec(poolMeta())`, which this task retires from the write-mint path) into a full
-        /// `BlobRef` pair.
+        /// parse it back at that SAME width via `Cas::codecFor(hash_algo)` (never a pool-wide
+        /// `DigestCodec`, which no longer exists) into a full `BlobRef` pair.
 
         if (metadata_storage.stagingBackend() == StagingBackend::S3 && metadata_storage.conditionalCopySupported())
         {
@@ -718,7 +719,7 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
             /// (`CasBuild.h`) -- the SAME mint the streaming blob path's callers use, so an inline file
             /// and a standalone blob of identical content get the same ref (same content hash identity)
             /// under EVERY algo, including sha256.
-            const auto hash_algo = static_cast<Cas::BlobHashAlgo>(metadata_storage.store()->poolMeta().blob_hash_algo);
+            const auto hash_algo = metadata_storage.store()->writeAlgo();
             const Cas::BlobRef ref = Cas::poolContentHash(hash_algo, bytes);
             if (bytes.size() <= INLINE_CAP)
             {

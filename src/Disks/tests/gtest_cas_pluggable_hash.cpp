@@ -5,6 +5,13 @@
 /// disk config that disagrees with an existing pool's recorded algo -- the pool-wide durability
 /// invariant (never silently re-hash an existing pool).
 ///
+/// Phase 3 T4 (design 2026-07-11-cas-mixed-algo-pools-design.md §5) RELAXES that single fail-closed
+/// value into `PoolMeta::algos_used` (sorted, append-only): a config algo already a MEMBER is
+/// accepted with no write (steady state); a non-member is admitted via a CAS-union ONLY when the
+/// disk opts in (`blob_hash_allow_new`), and refused (`BAD_ARGUMENTS`, same as before) otherwise --
+/// a changed config alone must never silently turn a pool mixed. See `AdmissionIsFlagGated` and
+/// `ConcurrentAdmissionUnions` below.
+///
 /// P1-T3a (this file, extended): the pool's `blob_hash_algo` is threaded into the three hash sites
 /// (spec §5/§6) -- `ContentAddressed::CaContentWriteBuffer` (streaming blob-body hash),
 /// `Build`'s envelope `hash_algo` field, and (transitively, via `Cas::blobHashHexOneShot`) the
@@ -63,16 +70,16 @@ std::string makeMultiBlockPayload(size_t size = 5000)
 
 }
 
-TEST(CasPluggableHash, PoolMetaRoundTripsBlobHashAlgo)
+TEST(CasPluggableHash, PoolMetaRoundTripsAlgosUsed)
 {
     PoolMeta pm;
     pm.pool_id = u128Of("pool-a");
     pm.root_shards = 8;
     pm.blob_header_len = 256;
-    pm.blob_hash_algo = static_cast<uint8_t>(BlobHashAlgo::XXH3_128);
+    pm.algos_used = {static_cast<uint8_t>(BlobHashAlgo::CityHash128), static_cast<uint8_t>(BlobHashAlgo::XXH3_128)};
 
     const PoolMeta back = decodePoolMeta(encodePoolMeta(pm));
-    EXPECT_EQ(back.blob_hash_algo, static_cast<uint8_t>(BlobHashAlgo::XXH3_128));
+    EXPECT_EQ(back.algos_used, pm.algos_used);
     EXPECT_EQ(back.root_shards, 8u);
     EXPECT_EQ(back.blob_header_len, 256u);
 }
@@ -83,11 +90,11 @@ TEST(CasPluggableHash, CreateOrValidateRecordsConfigAlgoOnFreshPool)
     const Layout layout("p");
 
     const PoolMeta pm = PoolMeta::createOrValidate(*backend, layout, /*root_shards*/ 4, /*blob_header_len*/ 256, BlobHashAlgo::XXH3_128);
-    EXPECT_EQ(pm.blob_hash_algo, static_cast<uint8_t>(BlobHashAlgo::XXH3_128));
+    EXPECT_EQ(pm.algos_used, (std::vector<uint8_t>{static_cast<uint8_t>(BlobHashAlgo::XXH3_128)}));
 
     /// Reopening with the SAME algo is a no-op reopen: the recorded value comes back unchanged.
     const PoolMeta reopened = PoolMeta::createOrValidate(*backend, layout, 4, 256, BlobHashAlgo::XXH3_128);
-    EXPECT_EQ(reopened.blob_hash_algo, static_cast<uint8_t>(BlobHashAlgo::XXH3_128));
+    EXPECT_EQ(reopened.algos_used, (std::vector<uint8_t>{static_cast<uint8_t>(BlobHashAlgo::XXH3_128)}));
     EXPECT_EQ(reopened.pool_id, pm.pool_id);
 }
 
@@ -97,12 +104,14 @@ TEST(CasPluggableHash, CreateOrValidateDefaultsToCityHash128)
     const Layout layout("p");
 
     const PoolMeta pm = PoolMeta::createOrValidate(*backend, layout, 4, 256, BlobHashAlgo::CityHash128);
-    EXPECT_EQ(pm.blob_hash_algo, static_cast<uint8_t>(BlobHashAlgo::CityHash128));
+    EXPECT_EQ(pm.algos_used, (std::vector<uint8_t>{static_cast<uint8_t>(BlobHashAlgo::CityHash128)}));
 }
 
-/// Fail-closed (spec §8): a config that disagrees with an existing pool's recorded algo must NEVER
-/// silently re-hash the pool -- it throws BAD_ARGUMENTS instead.
-TEST(CasPluggableHash, CreateOrValidateFailsClosedOnAlgoMismatch)
+/// Phase 3 T4 (spec §5, replaces the Phase 1/2 unconditional-fail-close test of the same shape):
+/// admission of a NEW algo is EXPLICIT OPT-IN -- the default reopen with a non-member algo still
+/// fails closed (BAD_ARGUMENTS), but the message now names `<blob_hash_allow_new>` and the pool
+/// is truly extensible with the flag set. See `AdmissionIsFlagGated` below for the full flow.
+TEST(CasPluggableHash, CreateOrValidateFailsClosedOnAlgoMismatchWithoutFlag)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     const Layout layout("p");
@@ -111,38 +120,45 @@ TEST(CasPluggableHash, CreateOrValidateFailsClosedOnAlgoMismatch)
 
     expectThrowsCode(DB::ErrorCodes::BAD_ARGUMENTS, [&]
     {
-        PoolMeta::createOrValidate(*backend, layout, 4, 256, BlobHashAlgo::XXH3_128);
+        PoolMeta::createOrValidate(*backend, layout, 4, 256, BlobHashAlgo::XXH3_128, /*allow_new*/ false);
     });
 
     /// The pool is untouched by the refused reopen: a subsequent open with the ORIGINAL algo still
     /// succeeds and returns the same pool_id.
     const PoolMeta reopened = PoolMeta::createOrValidate(*backend, layout, 4, 256, BlobHashAlgo::CityHash128);
-    EXPECT_EQ(reopened.blob_hash_algo, static_cast<uint8_t>(BlobHashAlgo::CityHash128));
+    EXPECT_EQ(reopened.algos_used, (std::vector<uint8_t>{static_cast<uint8_t>(BlobHashAlgo::CityHash128)}));
 }
 
-/// An old-format `_pool_meta` object (written before `blob_hash_algo` existed) has the field absent
-/// entirely -- proto3 `optional` explicit presence, so `has_blob_hash_algo() == false`. It must decode
-/// to `1` (cityHash128), since every pool created before this field existed WAS cityHash128.
-TEST(CasPluggableHash, OldFormatPoolMetaWithoutFieldDecodesToCityHash128)
+/// spec §9.1 at the unit level: admission of a new algo requires the flag; once admitted, membership
+/// alone is the steady-state check (the flag is not needed again for the same algo).
+TEST(CasPluggableHash, AdmissionIsFlagGated)
 {
-    Proto::PoolMetaProto msg;
-    auto * hdr = msg.mutable_header();
-    hdr->set_magic(magicFor(FormatId::PoolMeta));
-    hdr->set_writer_version(currentWriterVersion());
-    hdr->set_compatibility_version(currentCompatibilityVersion());
-    msg.set_pool_id(u128ToBytesBE(u128Of("old-pool")));
-    msg.set_root_shards(8);
-    msg.set_blob_header_len(256);
-    msg.set_min_reader_generation(0);
-    /// Deliberately NOT calling set_blob_hash_algo -- simulates an object written before the field
-    /// existed.
-    ASSERT_FALSE(msg.has_blob_hash_algo());
+    auto backend = std::make_shared<InMemoryBackend>();
+    const Layout layout("p");
+    PoolMeta::createOrValidate(*backend, layout, 4, 256, BlobHashAlgo::CityHash128, /*allow_new*/ false);
 
-    std::string bytes;
-    ASSERT_TRUE(msg.SerializeToString(&bytes));
+    /// without the flag: refuse, pool untouched
+    expectThrowsCode(DB::ErrorCodes::BAD_ARGUMENTS, [&]
+    { PoolMeta::createOrValidate(*backend, layout, 4, 256, BlobHashAlgo::Sha256, false); });
 
-    const PoolMeta pm = decodePoolMeta(bytes);
-    EXPECT_EQ(pm.blob_hash_algo, static_cast<uint8_t>(BlobHashAlgo::CityHash128));
+    /// with the flag: admitted
+    const PoolMeta admitted = PoolMeta::createOrValidate(*backend, layout, 4, 256, BlobHashAlgo::Sha256, true);
+    EXPECT_EQ(admitted.algos_used, (std::vector<uint8_t>{1, 3}));
+
+    /// steady state: admitted algo reopens WITHOUT the flag
+    const PoolMeta steady = PoolMeta::createOrValidate(*backend, layout, 4, 256, BlobHashAlgo::Sha256, false);
+    EXPECT_EQ(steady.algos_used, (std::vector<uint8_t>{1, 3}));
+}
+
+TEST(CasPluggableHash, ConcurrentAdmissionUnions)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    const Layout layout("p");
+    PoolMeta::createOrValidate(*backend, layout, 4, 256, BlobHashAlgo::CityHash128, false);
+    PoolMeta::createOrValidate(*backend, layout, 4, 256, BlobHashAlgo::XXH3_128, true);
+    PoolMeta::createOrValidate(*backend, layout, 4, 256, BlobHashAlgo::Sha256, true);
+    const PoolMeta final_pm = PoolMeta::createOrValidate(*backend, layout, 4, 256, BlobHashAlgo::CityHash128, false);
+    EXPECT_EQ(final_pm.algos_used, (std::vector<uint8_t>{1, 2, 3}));   /// union, sorted, nothing lost
 }
 
 /// ---- P1-T3a: the pool's blob_hash_algo threaded into the streaming write-buffer hash site ----
@@ -220,7 +236,8 @@ TEST(CasPluggableHash, StoreWithXxh3AlgoStampsEnvelopeHashAlgo)
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Store::open(backend,
         PoolConfig{.pool_prefix = "p", .server_root_id = "test", .blob_hash_algo = BlobHashAlgo::XXH3_128});
-    EXPECT_EQ(store->poolMeta().blob_hash_algo, static_cast<uint8_t>(BlobHashAlgo::XXH3_128));
+    EXPECT_EQ(store->writeAlgo(), BlobHashAlgo::XXH3_128);
+    EXPECT_EQ(store->poolMeta().algos_used, (std::vector<uint8_t>{static_cast<uint8_t>(BlobHashAlgo::XXH3_128)}));
 
     auto build = store->startBuild({});
     const std::string payload = "hello xxh3 world";
@@ -239,7 +256,8 @@ TEST(CasPluggableHash, StoreWithDefaultAlgoStampsEnvelopeHashAlgoOne)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
-    EXPECT_EQ(store->poolMeta().blob_hash_algo, static_cast<uint8_t>(BlobHashAlgo::CityHash128));
+    EXPECT_EQ(store->writeAlgo(), BlobHashAlgo::CityHash128);
+    EXPECT_EQ(store->poolMeta().algos_used, (std::vector<uint8_t>{static_cast<uint8_t>(BlobHashAlgo::CityHash128)}));
 
     auto build = store->startBuild({});
     auto ref = build->putBlob(idOf("hello world"), BlobSource::fromString("hello world"));
@@ -333,9 +351,9 @@ TEST(CasPluggableHash, Sha256BlobSeenByCondemnSweepAndFsckNotSilentlySkipped)
     auto store = Store::open(backend,
         PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1,
                    .blob_hash_algo = BlobHashAlgo::Sha256, .gc_trim_min_events = 0});
-    ASSERT_EQ(store->poolMeta().blob_hash_len, 32u) << "a sha256 pool must record a 32-byte digest width";
+    ASSERT_EQ(blobHashLenFor(store->writeAlgo()), 32u) << "sha256 must derive a 32-byte digest width";
 
-    const DigestCodec codec(store->poolMeta());
+    const DigestCodec codec = codecFor(store->writeAlgo());
     const std::string payload = makeMultiBlockPayload();
     const std::string hex = blobHashHexOneShot(BlobHashAlgo::Sha256, payload);
     ASSERT_EQ(hex.size(), 64u) << "sha256 renders 64 lowercase hex chars";
@@ -432,8 +450,8 @@ TEST(CasPluggableHash, Sha256BuildWritesFullWidthDigestAndInlineEqualsBlob)
     auto store = Store::open(backend,
         PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1,
                    .blob_hash_algo = BlobHashAlgo::Sha256});
-    ASSERT_EQ(store->poolMeta().blob_hash_len, 32u) << "a sha256 pool must record a 32-byte digest width";
-    const DigestCodec codec(store->poolMeta());
+    ASSERT_EQ(blobHashLenFor(store->writeAlgo()), 32u) << "sha256 must derive a 32-byte digest width";
+    const DigestCodec codec = codecFor(store->writeAlgo());
 
     const RootNamespace ns{"srv1/tbl"};
     const std::string payload = makeMultiBlockPayload();

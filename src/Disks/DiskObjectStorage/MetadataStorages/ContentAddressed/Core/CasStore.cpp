@@ -51,6 +51,11 @@ Store::Store(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
     : pool_backend(std::move(backend_))
     , config(std::move(config_))
     , meta(std::move(meta_))
+    /// Seed the monotone admitted-algo cache from the pool state `createOrValidate` already
+    /// established (fresh create, steady-state member, or a just-completed admission union) --
+    /// register-before-first-write (spec §5) means this Store's own `writeAlgo()` is ALWAYS a
+    /// member by the time the constructor runs.
+    , admitted_algos(meta.algos_used)
     /// Phase 3 T2/T3: `Layout` no longer captures a pool algo -- every blob key is built from a
     /// `BlobRef` (algo + digest) directly, so the constructor takes only the pool prefix.
     , pool_layout(config.pool_prefix)
@@ -63,6 +68,34 @@ Store::Store(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
         manifest_cache = std::make_unique<ManifestDecodeCache>(
             "LRU", CurrentMetrics::end(), CurrentMetrics::end(),
             config.manifest_decode_cache_bytes, /*max_count=*/16384, ManifestDecodeCache::DEFAULT_SIZE_RATIO);
+}
+
+bool Store::isAlgoAdmitted(BlobHashAlgo algo) const
+{
+    const auto v = static_cast<uint8_t>(algo);
+    std::lock_guard lock(admitted_algos_mutex);
+    return std::binary_search(admitted_algos.begin(), admitted_algos.end(), v);
+}
+
+std::vector<uint8_t> Store::refreshAdmittedAlgos()
+{
+    /// A direct GET+decode of `_pool_meta`, not a re-run of `createOrValidate`'s admission logic --
+    /// this Store's OWN algo is already admitted (register-before-first-write, spec §5), so all this
+    /// needs is the CURRENT authoritative `algos_used`, unioned into the monotone cache.
+    const auto existing = pool_backend->get(pool_layout.poolMetaKey());
+
+    std::lock_guard lock(admitted_algos_mutex);
+    if (existing)
+    {
+        const PoolMeta fresh = decodePoolMeta(existing->bytes);
+        for (uint8_t v : fresh.algos_used)
+            if (!std::binary_search(admitted_algos.begin(), admitted_algos.end(), v))
+            {
+                admitted_algos.push_back(v);
+                std::sort(admitted_algos.begin(), admitted_algos.end());
+            }
+    }
+    return admitted_algos;
 }
 
 bool Store::dedupCacheContains(const BlobRef & ref) const
@@ -137,10 +170,18 @@ StorePtr Store::open(BackendPtr backend, PoolConfig config)
         const UInt128 probe_uid = (static_cast<UInt128>(thread_local_rng()) << 64) | thread_local_rng();
         runCapabilityProbe(*backend, config.pool_prefix + "/_probe/" + u128ToHex(probe_uid));
     }
-    PoolMeta meta = PoolMeta::createOrValidate(*backend, layout, config.root_shards, config.blob_header_len, config.blob_hash_algo);
+    PoolMeta meta = PoolMeta::createOrValidate(
+        *backend, layout, config.root_shards, config.blob_header_len, config.blob_hash_algo, config.blob_hash_allow_new);
+    const BlobHashAlgo write_algo = config.blob_hash_algo;   /// `config` is moved-from just below
 
     /// Private ctor: make_shared cannot reach it.
     StorePtr store(new Store(std::move(backend), std::move(config), std::move(meta)));
+
+    /// Register-before-first-write, belt-and-braces (spec §5): `createOrValidate` above already
+    /// admitted/validated the write algo, so the freshly-seeded cache must already contain it -- a
+    /// violation here would mean a build/write could reach this Store naming an algo that was never
+    /// durably admitted (the invariant this whole design rests on).
+    chassert(store->isAlgoAdmitted(write_algo));
 
     /// Per-server watermark (spec 2026-06-16-ca-build-watermark). process_epoch is a random NONZERO
     /// value minted once per Store: GC checks it for equality only (a different epoch == a dead

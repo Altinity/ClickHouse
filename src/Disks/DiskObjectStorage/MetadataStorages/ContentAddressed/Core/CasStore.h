@@ -119,12 +119,21 @@ struct PoolConfig
     /// healthy / ~165 KB under a 10-minute storm with batching ~1.4x and discovery x4.
     uint64_t root_shards = 32;
     uint64_t blob_header_len = 256;           /// creation-time only; ditto
-    /// CAS pluggable-blob-hash Phase 1 (design 2026-07-11-cas-pluggable-blob-hash-design.md): the
-    /// pool's blob content-hash function. Creation-time only, like `root_shards`/`blob_header_len` —
-    /// `PoolMeta::createOrValidate` is pool-authoritative on reopen and fails closed (BAD_ARGUMENTS)
-    /// when this disagrees with the pool's recorded algo (spec §8: never re-hash an existing pool).
-    /// Default `CityHash128` keeps every existing pool's hash byte-for-byte unchanged.
+    /// CAS mixed-algo pools (Phase 3 T4, design 2026-07-11-cas-mixed-algo-pools-design.md §5): the
+    /// NODE-LOCAL algo this Store writes NEW content with (`Store::writeAlgo()`). NOT durable pool
+    /// state -- two live nodes may intentionally write with different (already-admitted) algos, so
+    /// no single truthful pool-wide value exists. `PoolMeta::createOrValidate` accepts it with no
+    /// write when it is already a member of the pool's `algos_used`; otherwise it is admitted via
+    /// the CAS-union below (opt-in, `blob_hash_allow_new`) or refused (BAD_ARGUMENTS, the default --
+    /// a changed config alone must never silently turn a pool mixed). Default `CityHash128` keeps
+    /// every existing pool's hash byte-for-byte unchanged.
     BlobHashAlgo blob_hash_algo = BlobHashAlgo::CityHash128;
+    /// Opt-in for `blob_hash_algo` to be ADMITTED into the pool's `algos_used` when it is not
+    /// already a member (spec §5: "admission of a NEW algo is EXPLICIT OPT-IN"). Consulted only on
+    /// the FIRST open that would otherwise refuse -- once admitted, `algos_used` membership alone is
+    /// the steady-state check and this flag is not needed again for the same algo. Default `false`
+    /// (fail-closed, matching the Phase 1/2 default-refuse behavior).
+    bool blob_hash_allow_new = false;
     /// P1 (dedup cache): byte ceiling for the per-disk known-present blob-hash LRU set. 0 disables the
     /// cache (every create misses → P2-only). A hint cache; correctness never depends on it (a stale
     /// hit is caught by the mandatory HEAD in putBlob — design 2026-06-20, B168).
@@ -387,6 +396,27 @@ public:
     const Layout & layout() const { return pool_layout; }
     Backend & backend() { return *pool_backend; }
 
+    /// CAS mixed-algo pools (Phase 3 T4/T5, design 2026-07-11-cas-mixed-algo-pools-design.md §5):
+    /// the NODE-LOCAL algo this Store mints NEW content with (`PoolConfig::blob_hash_algo` -- never
+    /// durable pool state, see the field comment). Every write-mint site uses this, never a bare
+    /// `poolMeta()` field (the pool no longer records one truthful write algo).
+    BlobHashAlgo writeAlgo() const { return config.blob_hash_algo; }
+
+    /// Whether `algo` is a member of the pool's `algos_used`, per this Store's MONOTONE in-memory
+    /// cache (seeded from `algos_used` at open time, unioned by `refreshAdmittedAlgos` -- never
+    /// shrinks). This is the validation-protocol fast path (spec §5.1): a hit needs no I/O. A miss
+    /// for an algo this build KNOWS about must be followed by `refreshAdmittedAlgos()` before
+    /// concluding the algo is genuinely not admitted (a long-running fold can overlap a later
+    /// registration by another node) -- callers at the manifest-read boundary do this (Task 5).
+    bool isAlgoAdmitted(BlobHashAlgo algo) const;
+
+    /// Re-reads `_pool_meta` and unions its CURRENT `algos_used` into the in-memory admitted-algo
+    /// cache (mutex-guarded; monotone -- a concurrent shrink is impossible since `algos_used` is
+    /// itself append-only). Returns the refreshed cache as a sorted vector, for callers that want to
+    /// render it (error messages, diagnostics). THE stale-cache-race fix (spec §5.1/§9.8): call this
+    /// on every admission-check miss, not just once at open.
+    std::vector<uint8_t> refreshAdmittedAlgos();
+
     /// The writer_epoch of the LIVE mount incarnation. Bumped by `tryRemountOnce` (self-remount
     /// after a GC fence-out) — a `Build` minted under an older epoch fails closed on its next step.
     uint64_t liveWriterEpoch() const { return live_writer_epoch.load(std::memory_order_acquire); }
@@ -585,6 +615,14 @@ private:
     BackendPtr pool_backend;
     PoolConfig config;
     PoolMeta meta;
+
+    /// CAS mixed-algo pools (Phase 3 T4): monotone in-memory cache of `algos_used`, seeded from
+    /// `meta.algos_used` at open. Guards `isAlgoAdmitted`/`refreshAdmittedAlgos` -- ITS OWN mutex,
+    /// not `meta`'s (there is no other mutable access to `meta` post-open; this avoids taking a
+    /// wider lock than the cache needs). Kept sorted (a plain vector; membership is a handful of
+    /// entries, no need for a set).
+    mutable std::mutex admitted_algos_mutex;
+    std::vector<uint8_t> admitted_algos;
 
     /// P1 known-present cache: a bytes-bounded LRU set of blob hashes confirmed present in the pool.
     /// Value is a 1-byte presence marker; DedupWeight charges a fixed per-entry byte estimate so the

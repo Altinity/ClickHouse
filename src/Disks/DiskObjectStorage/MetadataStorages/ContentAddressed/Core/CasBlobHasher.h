@@ -27,8 +27,9 @@ enum class BlobHashAlgo : uint8_t
 std::string_view blobHashAlgoName(BlobHashAlgo algo);
 
 /// The digest byte width for `algo`: 16 for the 128-bit hashes (`CityHash128`, `XXH3_128`), 32 for
-/// the 256-bit `Sha256` (CAS pluggable-blob-hash Phase 2, design §12). Derives `PoolMeta::blob_hash_len`
-/// from the pool's recorded `blob_hash_algo` and sizes the `DigestCodec` (`CasBlobDigest.h`). Throws
+/// the 256-bit `Sha256` (CAS pluggable-blob-hash Phase 2, design §12). Sizes `Cas::codecFor(algo)`'s
+/// `DigestCodec` (`CasBlobDigest.h`/`CasBlobRef.h`) -- Phase 3 T4 deleted the pool-wide
+/// `PoolMeta::blob_hash_len`; the width is always derived per-algo, never per-pool. Throws
 /// `BAD_ARGUMENTS` for an out-of-range enum value (same fail-closed contract as `blobHashAlgoName`).
 uint64_t blobHashLenFor(BlobHashAlgo algo);
 

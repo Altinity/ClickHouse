@@ -218,6 +218,7 @@ TEST(CasPoolMeta, RoundTripAndReadability)
     pm.pool_id = hexToU128("0123456789abcdeffedcba9876543210");
     pm.root_shards = 8;
     pm.blob_header_len = 256;
+    pm.algos_used = {static_cast<uint8_t>(BlobHashAlgo::CityHash128)};
 
     const String encoded = encodePoolMeta(pm);
     /// Pure protobuf (not JSON); the CAPM magic is the CasHeader.magic fixed32 field (little-endian,
@@ -288,6 +289,7 @@ TEST(CasPoolMeta, ConcurrentCreateRace)
     foreign_pm.pool_id = foreign;
     foreign_pm.root_shards = 8;
     foreign_pm.blob_header_len = 256;
+    foreign_pm.algos_used = {static_cast<uint8_t>(BlobHashAlgo::CityHash128)};
     b->putIfAbsent(layout.poolMetaKey(), encodePoolMeta(foreign_pm));
 
     PoolMeta result = PoolMeta::createOrValidate(*b, layout, /*root_shards*/ 4, /*blob_header_len*/ 512);
@@ -330,6 +332,7 @@ TEST(CasPoolMeta, CasConflictReReadsWinner)
     winner_pm.pool_id = winner;
     winner_pm.root_shards = 8;
     winner_pm.blob_header_len = 256;
+    winner_pm.algos_used = {static_cast<uint8_t>(BlobHashAlgo::CityHash128)};
 
     auto b = std::make_shared<RacingBackend>();
     b->winner_bytes = encodePoolMeta(winner_pm);

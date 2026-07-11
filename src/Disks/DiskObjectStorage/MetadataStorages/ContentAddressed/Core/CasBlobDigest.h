@@ -1,5 +1,4 @@
 #pragma once
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasPoolMeta.h>
 #include <base/defines.h>
 #include <base/extended_types.h>
 #include <base/hex.h>
@@ -23,12 +22,13 @@ namespace ErrorCodes
 namespace DB::Cas
 {
 
-/// The blob CONTENT digest (CAS pluggable-blob-hash Phase 2, design §12): a pool-scoped
+/// The blob CONTENT digest (CAS pluggable-blob-hash Phase 2, design §12): an algo-scoped
 /// variable-length digest that generalizes the fixed 128-bit `UInt128` blob identity so a
 /// 256-bit hash (`sha256`) is admissible alongside the existing 128-bit hashes (`cityHash128`,
-/// `xxh3-128`). Always 32 bytes wide, big-endian; only the FIRST `PoolMeta::blob_hash_len` bytes
-/// (the pool's recorded digest width, 16 or 32) are meaningful -- bytes beyond that are always
-/// zero. A fixed-size `std::array` (not a `String`): design §12 rejected a variable `String`
+/// `xxh3-128`). Always 32 bytes wide, big-endian; only the FIRST `blobHashLenFor(algo)` bytes
+/// (the ALGO's digest width, 16 or 32 -- Phase 3 T4 deleted the pool-wide width, a mixed-algo pool
+/// has no single one) are meaningful -- bytes beyond that are always zero. A fixed-size
+/// `std::array` (not a `String`): design §12 rejected a variable `String`
 /// because a 32-byte `sha256` digest exceeds libc++'s 22-byte SSO, forcing one heap allocation
 /// per `ManifestEntry` on the manifest-decode READ path (part-folder validate-on-hit) and costing
 /// MORE memory than the fixed array even for the 32-byte case.
@@ -85,24 +85,22 @@ struct BlobDigestHash
     }
 };
 
-/// The ONE pool-scoped digest<->hex/bytes codec (design §12 "len-drift" mitigation, the biggest
-/// Phase 2 risk): every digest<->hex or digest<->bytes conversion routes through an object
-/// constructed from the pool's recorded `PoolMeta::blob_hash_len` (16 for `cityHash128`/
-/// `xxh3-128`, 32 for `sha256`) -- NEVER a free function taking a bare length. `toHex`/`fromHex`
-/// render/parse exactly `2 * digestLen()` lowercase hex chars; `toBytesBE`/`fromBytesBE`
-/// (de)serialize exactly `digestLen()` raw bytes; `shardOf` reads the first 8 bytes big-endian --
-/// bit-identical to today's `blob_hash >> 64` for every 128-bit digest, the gate this whole
-/// refactor must never break (design §12).
+/// The ONE algo-scoped digest<->hex/bytes codec (design §12 "len-drift" mitigation, the biggest
+/// Phase 2 risk; Phase 3 T4 relocated its width source from the deleted pool-wide `blob_hash_len`
+/// to the per-`BlobRef` algo): every digest<->hex or digest<->bytes conversion routes through an
+/// object constructed from a digest width (16 for `cityHash128`/`xxh3-128`, 32 for `sha256`) --
+/// NEVER a free function taking a bare length. Construct via `Cas::codecFor(algo)`
+/// (`CasBlobRef.h`), the ONE way to obtain one; never wire a pool-wide value in again (a mixed-algo
+/// pool has no single width). `toHex`/`fromHex` render/parse exactly `2 * digestLen()` lowercase
+/// hex chars; `toBytesBE`/`fromBytesBE` (de)serialize exactly `digestLen()` raw bytes; `shardOf`
+/// reads the first 8 bytes big-endian -- bit-identical to today's `blob_hash >> 64` for every
+/// 128-bit digest, the gate this whole refactor must never break (design §12).
 class DigestCodec
 {
 public:
     explicit DigestCodec(uint64_t blob_hash_len_) : len(blob_hash_len_)
     {
         chassert(len == 16 || len == 32, "DigestCodec: digest length must be 16 or 32 bytes");
-    }
-
-    explicit DigestCodec(const PoolMeta & pool_meta) : DigestCodec(pool_meta.blob_hash_len)
-    {
     }
 
     uint64_t digestLen() const { return len; }
