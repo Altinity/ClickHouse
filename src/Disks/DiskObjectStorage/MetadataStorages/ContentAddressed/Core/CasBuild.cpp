@@ -1,8 +1,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobMeta.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEnvelope.h>
-#include <IO/HashingReadBuffer.h>
-#include <IO/ReadBufferFromMemory.h>
 #include <IO/WriteBufferFromString.h>
 #include <IO/WriteHelpers.h>
 #include <Common/Exception.h>
@@ -62,19 +60,17 @@ uint64_t nowMs()
         std::chrono::system_clock::now().time_since_epoch()).count());
 }
 
-/// The POOL-WIDE content-hash convention: the streaming `HashingWriteBuffer` hash (chunked
-/// CityHash128 chained per DBMS_DEFAULT_HASHING_BLOCK_SIZE = 2048 B), formatted/parsed through the
-/// same hex chain the write path uses (`ContentAddressedWriteBuffers`: `getHexUIntLowercase` ->
-/// `BlobId` -> `hexToU128`). The core otherwise NEVER re-hashes payloads; copy-forward is the one
-/// sanctioned re-verification and MUST use this convention — a one-shot `CityHash128` diverges for
-/// any payload larger than one hash block (found live: 2026-07-03 soak, a false `CORRUPTED_DATA`
-/// re-bricked the attach path copy-forward exists to fix).
-UInt128 poolContentHash(std::string_view payload)
+/// The POOL-WIDE content-hash convention, with the pool's selected `algo` (P1-T3a, CAS
+/// pluggable-blob-hash design §5): `Cas::blobHashHexOneShot` uses the SAME streaming/chunked
+/// convention the write path uses for `CityHash128` (`ContentAddressedWriteBuffers`: `getHashHex` ->
+/// `BlobId` -> `hexToU128`) and the one-shot `XXH3_128bits` call for `XXH3_128` (defined to agree
+/// with its own streaming digest). The core otherwise NEVER re-hashes payloads; copy-forward is the
+/// one sanctioned re-verification and MUST use this convention — a one-shot `CityHash128` (as opposed
+/// to the chunked convention) diverges for any payload larger than one hash block (found live:
+/// 2026-07-03 soak, a false `CORRUPTED_DATA` re-bricked the attach path copy-forward exists to fix).
+UInt128 poolContentHash(BlobHashAlgo algo, std::string_view payload)
 {
-    ReadBufferFromMemory in(payload.data(), payload.size());
-    HashingReadBuffer hashing(in);
-    hashing.ignoreAll();
-    return hexToU128(getHexUIntLowercase(hashing.getHash()));
+    return hexToU128(blobHashHexOneShot(algo, payload));
 }
 
 }
@@ -339,7 +335,7 @@ void Build::uploadFromSource(ObjectKind kind, const UInt128 & hash, const String
     {
         EnvelopeHeader header;
         header.kind = kind;
-        header.hash_algo = 1;
+        header.hash_algo = meta.blob_hash_algo;
         header.domain_id = meta.pool_id;
         header.incarnation_tag = mintU128();
         header.build_id = build_id;
@@ -628,7 +624,7 @@ Token Build::copyForwardFromCondemned(const UInt128 & hash, const String & key, 
         const EnvelopeHeader header_in = decodeEnvelopeHeader(got->bytes, got->bytes.size(), ObjectKind::Blob);
         const std::string_view payload{got->bytes.data() + header_in.header_len,
                                        got->bytes.size() - header_in.header_len};
-        const UInt128 payload_hash = poolContentHash(payload);
+        const UInt128 payload_hash = poolContentHash(static_cast<BlobHashAlgo>(meta.blob_hash_algo), payload);
         if (payload_hash != hash)
             throw Exception(ErrorCodes::CORRUPTED_DATA,
                 "copyForwardFromCondemned: object {} payload does not verify against its content key "
@@ -639,7 +635,7 @@ Token Build::copyForwardFromCondemned(const UInt128 & hash, const String & key, 
         ///    (W-FRESH-TAG, B167 — the new incarnation is owned by this live build).
         EnvelopeHeader header;
         header.kind = ObjectKind::Blob;
-        header.hash_algo = 1;
+        header.hash_algo = meta.blob_hash_algo;
         header.domain_id = meta.pool_id;
         header.incarnation_tag = mintU128();
         header.build_id = build_id;

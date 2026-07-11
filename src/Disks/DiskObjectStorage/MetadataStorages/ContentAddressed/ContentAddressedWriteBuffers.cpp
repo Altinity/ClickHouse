@@ -1,6 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedWriteBuffers.h>
 #include <Common/getRandomASCIIString.h>
-#include <base/hex.h>
 #include <filesystem>
 
 namespace fs = std::filesystem;
@@ -10,6 +9,7 @@ namespace DB::ContentAddressed
 
 CaContentWriteBuffer::CaContentWriteBuffer(
     std::string temp_dir,
+    Cas::BlobHashAlgo hash_algo,
     size_t buf_size,
     bool use_adaptive_buffer_size,
     size_t adaptive_buffer_initial_size,
@@ -32,13 +32,14 @@ CaContentWriteBuffer::CaContentWriteBuffer(
         /*alignment=*/0,
         use_adaptive_buffer_size,
         adaptive_buffer_initial_size);
-    hashing = std::make_unique<HashingWriteBuffer>(*sink);
+    hashing = Cas::makeBlobHashingWriteBuffer(hash_algo, *sink);
 }
 
 CaContentWriteBuffer::CaContentWriteBuffer(
     std::unique_ptr<WriteBufferFromFileBase> object_store_sink,
     std::string object_key,
     std::string envelope_header,
+    Cas::BlobHashAlgo hash_algo,
     size_t buf_size,
     bool use_adaptive_buffer_size,
     size_t adaptive_buffer_initial_size,
@@ -63,7 +64,7 @@ CaContentWriteBuffer::CaContentWriteBuffer(
 
     /// The adaptive-sizing params only affect THIS outer buffer (mirroring the Local ctor above); the
     /// sink's own buffering was decided by the caller when it opened the object-store write.
-    hashing = std::make_unique<HashingWriteBuffer>(*sink);
+    hashing = Cas::makeBlobHashingWriteBuffer(hash_algo, *sink);
 }
 
 CaContentWriteBuffer::~CaContentWriteBuffer()
@@ -89,9 +90,9 @@ void CaContentWriteBuffer::finalizeImpl()
     next();
     const size_t size = count();
 
-    /// getHash flushes the chain and returns the streaming cityHash128 of everything written.
-    const auto hash = hashing->getHash();
-    const std::string hash_hex = getHexUIntLowercase(hash);
+    /// getHashHex flushes the chain and returns the streaming digest (the pool's selected algo) of
+    /// everything written, as 32 lowercase hex chars.
+    const std::string hash_hex = hashing->getHashHex();
 
     hashing->finalize();
     sink->finalize();

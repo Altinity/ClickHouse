@@ -571,7 +571,7 @@ std::string ContentAddressedTransaction::buildS3StagingBlobHeader(
 
     Cas::EnvelopeHeader header;
     header.kind = Cas::ObjectKind::Blob;
-    header.hash_algo = 1;
+    header.hash_algo = meta.blob_hash_algo;
     header.domain_id = meta.pool_id;
     header.incarnation_tag = (static_cast<UInt128>(thread_local_rng()) << 64) | thread_local_rng();
     header.build_id = 0;   /// not known at stream time; diagnostic-only (not read by GC/read paths)
@@ -661,6 +661,11 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
         /// to a fresh per-mount S3 staging object while hashing — no local-disk round trip. Otherwise
         /// (the OFF BY DEFAULT global constraint, or a probe fail-close) fall through to the existing,
         /// byte-for-byte-unchanged local-temp-file path below.
+        /// P1-T3a (CAS pluggable blob hash): hash with the POOL's recorded algo, not a hardcoded
+        /// cityHash128 -- `PoolMeta` is authoritative (§4/§8 of the design), the same accessor
+        /// `blob_header_len` already uses above.
+        const auto hash_algo = static_cast<Cas::BlobHashAlgo>(metadata_storage.store()->poolMeta().blob_hash_algo);
+
         if (metadata_storage.stagingBackend() == StagingBackend::S3 && metadata_storage.conditionalCopySupported())
         {
             const std::string staging_key = metadata_storage.stagingKeyPrefix() + "/" + getRandomASCIIString(32) + ".tmp";
@@ -670,12 +675,13 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
             /// stays a verbatim server-side copy. The header carries a FRESH `incarnation_tag`; `build_id`
             /// is left 0 (not known at stream time — diagnostic-only, not read by GC/read paths). The
             /// buffer writes this header first, UNHASHED and excluded from the reported size, so the
-            /// content key stays `cityHash128(payload)` and `blob_size` stays the payload size.
+            /// content key stays the pool's hash of `payload` and `blob_size` stays the payload size.
             std::string envelope_header = buildS3StagingBlobHeader(*r);
             return std::make_unique<ContentAddressed::CaContentWriteBuffer>(
                 std::move(object_sink),
                 staging_key,
                 std::move(envelope_header),
+                hash_algo,
                 buf_size,
                 settings.use_adaptive_write_buffer,
                 settings.adaptive_write_buffer_initial_size,
@@ -687,6 +693,7 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
 
         return std::make_unique<ContentAddressed::CaContentWriteBuffer>(
             metadata_storage.scratchPath(),
+            hash_algo,
             buf_size,
             settings.use_adaptive_write_buffer,
             settings.adaptive_write_buffer_initial_size,

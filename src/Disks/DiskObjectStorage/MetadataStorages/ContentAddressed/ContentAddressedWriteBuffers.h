@@ -1,6 +1,6 @@
 #pragma once
 #include <Core/Defines.h>
-#include <IO/HashingWriteBuffer.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobHasher.h>
 #include <IO/WriteBufferFromFile.h>
 #include <IO/WriteBufferFromFileBase.h>
 #include <functional>
@@ -11,9 +11,11 @@ namespace DB::ContentAddressed
 {
 
 /// Write buffer for a CONTENT part file (M-W T3). The blob key is the content hash, only known
-/// once all bytes are written, so the buffer spills to a unique local temp file while hashing
-/// (the streaming HashingWriteBuffer convention — the pool-wide file-hash function the wiring
-/// defines; the core never re-hashes payloads). On finalize it hands (hash_hex, size, temp_path)
+/// once all bytes are written, so the buffer spills to a unique local temp file while hashing with
+/// `hash_algo` (P1-T3a, `Cas::makeBlobHashingWriteBuffer` — the pool-wide selectable blob-hash
+/// function the wiring defines; the core never re-hashes payloads). `CityHash128` stays the thin
+/// `HashingWriteBuffer` adapter (byte-for-byte unchanged); `XXH3_128` hashes with xxh3 instead. On
+/// finalize it hands (hash_hex, size, temp_path)
 /// to the owning transaction; B188: the transaction owns the temp file post-finalize and uploads it
 /// post-precommit, so finalizeImpl no longer removes it. cancelImpl and the destructor (on error
 /// paths) still remove it.
@@ -34,6 +36,7 @@ public:
     /// per-INSERT footprint small).
     CaContentWriteBuffer(
         std::string temp_dir,
+        Cas::BlobHashAlgo hash_algo,
         size_t buf_size,
         bool use_adaptive_buffer_size,
         size_t adaptive_buffer_initial_size,
@@ -46,8 +49,9 @@ public:
     /// built for this staging blob (S3-native staging fix 2026-07-11). It is written to the sink FIRST —
     /// UNHASHED and NOT counted in the reported size — so the staging object holds `[header][payload]`
     /// and the promote can stay a verbatim server-side copy. Excluding the header from the hash is
-    /// CRITICAL: the content key must be `cityHash128(payload)` (else the random `incarnation_tag` in the
-    /// header would make every blob's key unique ⇒ zero dedup), and the reported blob size must be the
+    /// CRITICAL: the content key must be the pool's selected hash of `payload` alone (else the random
+    /// `incarnation_tag` in the header would make every blob's key unique ⇒ zero dedup), and the reported
+    /// blob size must be the
     /// PAYLOAD size (else the manifest `blob_size` would be payload+`blob_header_len`). Only the PAYLOAD
     /// bytes written through THIS buffer flow through `hashing` and `count()`.
     ///
@@ -60,6 +64,7 @@ public:
         std::unique_ptr<WriteBufferFromFileBase> object_store_sink,
         std::string object_key,
         std::string envelope_header,
+        Cas::BlobHashAlgo hash_algo,
         size_t buf_size,
         bool use_adaptive_buffer_size,
         size_t adaptive_buffer_initial_size,
@@ -87,7 +92,10 @@ private:
     /// The spill sink: a local WriteBufferFromFile (Local mode) or the caller-supplied object-store
     /// sink (S3 mode). Either way it is a SECOND per-stream buffer wrapped by `hashing` below.
     std::unique_ptr<WriteBufferFromFileBase> sink;
-    std::unique_ptr<HashingWriteBuffer> hashing;
+    /// Built via `Cas::makeBlobHashingWriteBuffer(hash_algo, *sink)` (P1-T3a, pluggable blob hash):
+    /// `CityHash128` is a thin adapter over the pre-existing `HashingWriteBuffer` convention (byte-for-byte
+    /// unchanged); `XXH3_128` hashes with the pool's selected algo instead.
+    std::unique_ptr<Cas::IHashingWriteBuffer> hashing;
     bool temp_ownership_transferred = false;   /// B188: set after on_finalized; the dtor skips removeTempFile
 };
 
