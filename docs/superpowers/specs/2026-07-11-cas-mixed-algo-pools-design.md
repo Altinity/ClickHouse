@@ -58,18 +58,29 @@ the user rejected. Therefore:
 
 ## 5. PoolMeta: write-algo + ever-used set {#poolmeta}
 
-Replace the single fail-closed `blob_hash_algo` with:
+Replace the single fail-closed `blob_hash_algo` with (consulted 2026-07-11, §12):
 
-- `write_algo` (u8): the algo NEW blobs are hashed with. Follows the disk config `<blob_hash>` on
-  every (re)open — changing config is now legal and simply switches `write_algo`.
-- `algos_used` (repeated u8, append-only set): every algo that has ever been `write_algo` for this
-  pool. Reopen with a new algo CAS-appends it (idempotent, first-writer-wins merge like other pool
-  meta fields). Never removed — GC/fsck must keep classifying old-algo blobs forever (until the last
-  one is reclaimed; keeping the entry after that is harmless and simpler).
+- **The write algo is NODE-LOCAL config, NOT durable pool state.** Two live nodes may intentionally
+  write with different algos, so no single truthful pool-wide value exists; persisting one would be
+  misleading metadata + CAS churn. `PoolConfig`/`Store` carry it; `PoolMeta` does not.
+- `algos_used` (repeated u8, append-only, canonically sorted): every algo ever ADMITTED to the pool.
+  **Register-before-first-write**: a node MUST durably CAS-union its configured algo into `algos_used`
+  BEFORE writing any blob/manifest/ref that names it. CAS-union loop: read+token -> already present?
+  done -> insert -> CAS -> on conflict re-read and retry (recompute from the fresh value; never encode
+  a stale whole `PoolMeta`). Union-only => no ABA. The `createOrValidate` creation-race loser UNIONS
+  its algo instead of today's fail-close. First registration of a schema-3-bearing algo also raises
+  `min_reader_generation` so pre-Phase-3 builds refuse the pool (they cannot read schema-3 runs).
+- **Validation protocol (the stale-cache fix, §12.3)**: validators keep a MONOTONE local cache of
+  `algos_used`. Check the cache; on a miss for a KNOWN-to-the-build algo, synchronously re-read
+  `_pool_meta`; if the refreshed set contains it — accept and union into the cache; only if the
+  AUTHORITATIVE set still omits it — `CORRUPTED_DATA`. Refresh on every miss (a long fold can overlap
+  a later registration), and apply at the CENTRAL manifest-read boundary, not only in GC (else plain
+  reads accept what GC rejects). Unknown-to-the-build algo id stays `NOT_IMPLEMENTED`.
 
-Fail-close remains for: unknown algo id anywhere (`NOT_IMPLEMENTED`), and any manifest entry / listed
-blob under an algo NOT in `algos_used` (foreign-object protection). `checkBlobHashAlgoMatches` is
-deleted; its test flips to assert the additive-switch behavior.
+`checkBlobHashAlgoMatches` is deleted; its test flips to assert the additive-switch behavior. The
+`algos_used` membership check is kept deliberately: decode answers "does this BUILD understand algo 3?",
+the registry answers "was algo 3 ADMITTED to this POOL?" — namespace/integrity admission against a
+recognized-but-never-enabled or forged segment.
 
 ## 6. GC: algo-prefixed settlement keys (no per-algo partitions) {#gc-keys}
 
@@ -109,6 +120,12 @@ Settlement identity gains the algo dimension IN THE ROW KEY, inside the same `gc
   the `.meta` API take `(algo, digest)` (`BlobRef {uint8_t algo; BlobDigest digest;}`). The
   exact-token delete is untouched (full key + token; algo already in the object key).
 - **Ack-floor / graduation / rounds / generations**: unchanged.
+- **Consult confirmations (§12)**: the run-file format needs NO change (records/blocks/footer are
+  already variable-key-length; the writer already enforces non-decreasing raw keys); blob-prefix
+  `seek(algo ++ digest)` is correct with mixed widths. The duplicate-sentinel guard and the merge
+  group state must key on `BlobRef` (a `BlobDigest`-keyed guard would falsely merge `ch128:X` and
+  `xxh3:X`). `blobShard` takes `BlobRef` and deliberately ignores `algo` internally (callers cannot
+  accidentally discard identity). Codify key comparison as unsigned-octet lexicographic.
 
 ## 7. Sweep, fsck, dedup, inspect {#consumers}
 
@@ -125,8 +142,10 @@ Settlement identity gains the algo dimension IN THE ROW KEY, inside the same `gc
 Token model (ETag exact-token delete), source_id/`sourceEdgeId` (`UInt128` internal id), root-shard
 journal/refs, manifests' ref/identity model, ack-floor protocol, retired-in-snapshot semantics,
 S3-staging, envelope format (already has `hash_algo`), the fold seal shape and its `gc_shards`
-totality. No TLA+ re-gate expected: the settlement protocol is unchanged — only the row-key alphabet
-widens (algo-prefixed keys), below the model's abstraction level.
+totality. No full TLA+ re-gate (consult §12.6): the models treat blobs as opaque atoms — re-run the relevant
+model with `ch128:X`/`xxh3:X` as two distinct atoms to confirm no hidden digest-equality assumption.
+The registry refresh race (§5) is covered by the concurrency gtest §9.8 (or a small dedicated state
+model), not by reopening the settlement proof.
 
 ## 9. Testing gates {#testing}
 
@@ -148,6 +167,17 @@ widens (algo-prefixed keys), below the model's abstraction level.
    (keys, meta, settlement rows, deletes).
 6. Regression: single-algo pools byte-identical in behavior (existing 802-test battery + scenarios).
 7. Soak: phase-3 chaos on a pool switched mid-soak (`ch128` → `sha256` at t≈50%), `dangling==0`.
+8. **Stale-registry race (consult §12.3, the hole's regression test):** GC node B opens with cached
+   `algos_used={ch128}`; node A CAS-registers sha256 AFTER B's open and publishes a manifest with a
+   sha256 entry; B folds it → must refresh `_pool_meta`, accept, and emit a schema-3 row with the
+   correct `BlobRef`. (Constructing B after A's update misses the race — B must be open BEFORE.)
+9. **W-DEP-SET cross-satisfaction (consult §12.5, the dangle-class risk):** one manifest referencing
+   `ch128:X` and `xxh3:X` (same digest value), only ONE physical object present → dependency evidence
+   for one must NOT let `promote` skip validation of the other; publish must fail-close, never commit
+   a manifest whose other-algo twin is absent.
+10. Run-file mixed-width micro-test: tiny block size; a 33→49-byte key transition exactly at a block
+   boundary; sentinel + active rows; present and absent seek prefixes; an exact duplicate key spanning
+   blocks.
 
 ## 10. Non-goals {#non-goals}
 
@@ -168,3 +198,35 @@ names a different blob; mitigated by pair-typed `key(BlobRef, source_id)` with n
 parameter, plus the mixed-pool crux test §9.3 which goes red on any such hardcode), and (b) stale
 cached `PoolMeta.algos_used` fail-closing the fold on a legitimately new algo (consult question).
 Two-consult review of the schema-3 task before implementation (Phase 2 T4 discipline).
+
+## 12. Adversarial consult record (2026-07-11, codex xhigh) {#consult}
+
+Full reply: job scratch `consult_phase3_reply.md`. Verdict: ordering and "no algo loop in settlement"
+claims SOUND; rev.2/3 NOT ready unchanged — `algos_used` is mutable durable state validated through an
+immutable local snapshot. Findings folded into §5/§6/§9/§11 above:
+
+1. **Total order proof confirmed** (algo byte decides before widths can interact; BE digest ==
+   magnitude; sentinel-first; writer already enforces non-decreasing appends). Duplicate-sentinel
+   guard must be `BlobRef`-keyed.
+2. **Run-file format already variable-key-capable** — no format change; blob-prefix seek correct.
+   Found a PRE-EXISTING, schema-independent `RunFileReader::seek` contract bug (an exact full key
+   duplicated across a block boundary can be skipped: seek picks the LAST block with `min_key <=
+   target`; fix = FIRST block with `max_key >= target`). Latent today (all current seeks are
+   blob-prefix). Fix independently of Phase 3; micro-test §9.10. Footer-size budgeting commentary
+   needs updating for larger keys.
+3. **Stale `algos_used` race confirmed** (the biggest hole) → §5 register-before-write +
+   monotone-cache + refresh-on-miss at the central manifest-read boundary; test §9.8.
+4. **PoolMeta concurrency**: CAS-union loop is lost-update-free, no ABA (union-only); creation-race
+   loser unions; `write_algo` must NOT be durable pool state (node-local only);
+   `min_reader_generation` bump on first schema-3 registration.
+5. **Pair-keying enumeration** (all become `BlobRef`): ManifestEntry, PendingBlob/findPendingBlob/
+   referenced_hashes/carry-forward; Build DepKey + recordPendingBlobDep/depIsTokened/
+   isCopyForwardableTokenless/keyFor + promote/revalidation/meta chain; Layout/blobKey/blobMetaKey/
+   objectKey/locate (Layout can no longer capture one pool-wide algo; DigestCodec selected from
+   `ref.algo`); BlobDelta/BlobCandidate/RetiredEntry/ReplacedEntry/preview/head-callbacks/
+   inDegreeInGeneration/deletes/.meta jobs/outcomes; rebuild `edge_bearing` + `condemn_seeded`; fsck
+   sets + path parse -> BlobRef; dedup cache; inspect/event log render `algo:hex`. `sourceEdgeId`
+   stays algo-free (it names the source occurrence; the edge key already carries `BlobRef`).
+   **Highest-risk site = the writer W-DEP-SET** (dangle-class, see §11(c)), NOT the dedup cache
+   (leak-class).
+6. **TLA**: no full re-gate; re-run with two distinct atoms; race covered by gtest §9.8.
