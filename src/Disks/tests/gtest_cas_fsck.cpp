@@ -6,6 +6,9 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include "cas_test_helpers.h"
 
+#include <functional>
+#include <mutex>
+
 using namespace DB::Cas;
 using namespace DB::Cas::tests;
 
@@ -17,6 +20,45 @@ ManifestRef ref(uint64_t seq, uint64_t inst)
 {
     return ManifestRef{.writer_epoch = kWriterEpoch, .build_sequence = seq, .manifest_ordinal = static_cast<uint32_t>(inst)};
 }
+
+/// B207 race-simulation harness: `InMemoryBackend` is documented "not final: tests subclass it to
+/// distort single behaviors". `runFsck`'s ref-walk and its physical blob listing (`listAll` over
+/// `layout.blobsPrefix()`) are two separate calls to `Backend::list` minutes apart in production; here
+/// we fire an injected mutation the FIRST time `list` is called against the armed prefix — i.e.
+/// strictly AFTER the ref-walk has captured its (now stale) `reachable_blobs`/`blob_labels` view, and
+/// strictly BEFORE the HEAD-confirm loop sees the physical listing. That reproduces the race
+/// deterministically, without any real timing.
+class RepublishOnListBackend : public InMemoryBackend
+{
+public:
+    void armOnFirstList(String prefix, std::function<void()> mutation)
+    {
+        std::lock_guard<std::mutex> lock(arm_mutex);
+        armed_prefix = std::move(prefix);
+        pending_mutation = std::move(mutation);
+    }
+
+    ListPage list(const String & prefix, const String & cursor, size_t limit) override
+    {
+        std::function<void()> to_run;
+        {
+            std::lock_guard<std::mutex> lock(arm_mutex);
+            if (pending_mutation && prefix == armed_prefix)
+            {
+                to_run = std::move(pending_mutation);
+                pending_mutation = nullptr;
+            }
+        }
+        if (to_run)
+            to_run();
+        return InMemoryBackend::list(prefix, cursor, limit);
+    }
+
+private:
+    std::mutex arm_mutex;
+    String armed_prefix;
+    std::function<void()> pending_mutation;
+};
 }
 
 /// A committed ref whose manifest body is present and whose blobs exist => clean.
@@ -252,4 +294,95 @@ TEST(CasFsckScoped, NamespacePrefixChecksOnlyMatchingRefsDanglingOnly)
     /// manifest bodies — zero in this clean setup, legitimately nonzero on a churned pool.
     EXPECT_EQ(scoped.unreachable, 0u);
     EXPECT_EQ(scoped.pending_gc + scoped.awaiting_gc + scoped.unaccounted, 0u);
+}
+
+/// B207: the ref-walk and the HEAD-confirm run minutes apart with no snapshot. A ref that gets
+/// RE-PUBLISHED to a different manifest in that window, combined with a legitimate GC delete of the
+/// blob it used to name, must NOT surface as a phantom `dangling` — only a CURRENT ref over an absent
+/// object is a real dangle.
+TEST(CasFsck, PhantomDanglingFromRepublishedRefIsReresolvedAway)
+{
+    auto backend = std::make_shared<RepublishOnListBackend>();
+    auto store = openStoreForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r1 = ref(1, 0xA1);
+    const ManifestRef r2 = ref(2, 0xA2);
+    const DB::UInt128 h1 = u128Of("b207-phantom-old");
+    const DB::UInt128 h2 = u128Of("b207-phantom-new");
+
+    writeBlobBody(*backend, store->layout(), h1);
+    writeManifestRaw(*backend, store->layout(), ns, r1, {blobEntryFor("a", h1)});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r1);
+
+    /// Fires strictly between the ref-walk (which captures ref "tbl" -> r1, blob h1, as reachable) and
+    /// the HEAD-confirm's physical listing — exactly the window B207 is about.
+    backend->armOnFirstList(store->layout().blobsPrefix(), [&]
+    {
+        writeBlobBody(*backend, store->layout(), h2);
+        writeManifestRaw(*backend, store->layout(), ns, r2, {blobEntryFor("a", h2)});
+        publishCommittedTransition(*backend, store->layout(), ns, "tbl", r1, r2);   /// re-publish
+
+        const String old_key = store->layout().blobKey(BlobId(u128ToHex(h1)));
+        const HeadResult head = backend->head(old_key);
+        ASSERT_TRUE(head.exists);
+        backend->deleteExact(old_key, head.token);   /// legitimate GC delete of the now-unreferenced blob
+    });
+
+    const FsckReport rep = runFsck(*store, /*detail*/true);
+    EXPECT_EQ(rep.dangling, 0u);
+    EXPECT_TRUE(rep.clean());
+}
+
+/// Same race, but the ref is DROPPED (not re-published) in the window between the walk and the
+/// HEAD-confirm — also must not surface as a phantom dangle.
+TEST(CasFsck, PhantomDanglingFromDroppedRefIsReresolvedAway)
+{
+    auto backend = std::make_shared<RepublishOnListBackend>();
+    auto store = openStoreForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r1 = ref(1, 0xA1);
+    const DB::UInt128 h1 = u128Of("b207-phantom-dropped");
+
+    writeBlobBody(*backend, store->layout(), h1);
+    writeManifestRaw(*backend, store->layout(), ns, r1, {blobEntryFor("a", h1)});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r1);
+
+    backend->armOnFirstList(store->layout().blobsPrefix(), [&]
+    {
+        dropRefTransition(*backend, store->layout(), ns, "tbl", r1);   /// ref dropped since the walk
+
+        const String old_key = store->layout().blobKey(BlobId(u128ToHex(h1)));
+        const HeadResult head = backend->head(old_key);
+        ASSERT_TRUE(head.exists);
+        backend->deleteExact(old_key, head.token);   /// legitimate GC delete after the drop folds
+    });
+
+    const FsckReport rep = runFsck(*store, /*detail*/true);
+    EXPECT_EQ(rep.dangling, 0u);
+    EXPECT_TRUE(rep.clean());
+}
+
+/// Companion: the fix must never HIDE a real loss. A blob that a CURRENT ref still names, but whose
+/// object is genuinely gone (an operator error, a storage-layer bug — NOT a legitimate GC delete),
+/// stays `dangling` after the re-resolve.
+TEST(CasFsck, RealDanglingStillCaughtAfterReresolve)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r = ref(1, 0xA1);
+    const DB::UInt128 h = u128Of("b207-real-dangle");
+
+    writeBlobBody(*backend, store->layout(), h);
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", h)});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+
+    const String key = store->layout().blobKey(BlobId(u128ToHex(h)));
+    const HeadResult head = backend->head(key);
+    ASSERT_TRUE(head.exists);
+    backend->deleteExact(key, head.token);   /// genuine loss — the ref is UNCHANGED, still names this blob
+
+    const FsckReport rep = runFsck(*store, /*detail*/true);
+    EXPECT_EQ(rep.dangling, 1u);
+    EXPECT_FALSE(rep.clean());
 }

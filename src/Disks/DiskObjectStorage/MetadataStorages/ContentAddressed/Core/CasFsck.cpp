@@ -100,6 +100,56 @@ bool parseBuildPrefix(const String & key, const String & manifests_prefix, Build
     }
 }
 
+/// B207 fix: the ref-walk (which builds `reachable_blobs`/`blob_labels`) and the HEAD-confirm below
+/// run minutes apart with no snapshot between them. A ref that gets RE-PUBLISHED (now names a
+/// different manifest) or DROPPED in that window, combined with a legitimate GC delete of the OLD
+/// blob, makes the stale walk look like a genuine dangle (a "phantom dangling") — this made the fsck
+/// oracle dishonest and false-failed long soaks (B185/B206/B144 were all this race).
+///
+/// Before counting a HEAD-absent blob as `Dangling`, re-resolve every `"ns/ref"` label that named it
+/// FRESH (`resolveRef` with `allow_stale=false`, never the walk's cached/stale view) and check whether
+/// the CURRENT manifest still lists this blob as a `Blob` entry. `label` is split on the LAST '/' —
+/// mirroring exactly how the walk built it (`ns_str + "/" + ref_name`): `ref_name` never contains '/',
+/// but `ns_str` may, so the join separator is always the rightmost one.
+///
+/// Fails CLOSED on any ambiguity (a malformed label, a dropped-then-recreated ref that throws, a
+/// corrupt current manifest): treated as "still referenced", i.e. the original conservative verdict.
+/// The fix can only SHRINK false positives — it must never hide a real one.
+bool blobStillReferenced(Store & store, const Layout & layout, const String & bkey,
+                          const std::vector<String> & labels, const Deadline & deadline)
+{
+    if (labels.empty())
+        return true;
+    for (const String & label : labels)
+    {
+        checkDeadline(deadline, "re-resolving refs at HEAD-absent");
+        const size_t slash = label.rfind('/');
+        if (slash == String::npos)
+            return true;   /// malformed label — cannot re-resolve, fail closed
+        const String ns_part = label.substr(0, slash);
+        const String ref_name = label.substr(slash + 1);
+        try
+        {
+            const auto resolved = store.resolveRef(RootNamespace{ns_part}, ref_name, /*allow_stale=*/false);
+            if (!resolved)
+                continue;   /// the ref was DROPPED since the walk — this label no longer applies
+            const PartManifest body = store.readManifest(resolved->manifest_id);
+            for (const ManifestEntry & e : body.entries)
+            {
+                if (e.placement != EntryPlacement::Blob)
+                    continue;
+                if (layout.blobKey(BlobId(u128ToHex(e.blob_hash))) == bkey)
+                    return true;   /// a CURRENT ref still names this exact blob — a real dangle
+            }
+        }
+        catch (...)
+        {
+            return true;   /// cannot confirm the ref moved away — keep the conservative verdict
+        }
+    }
+    return false;   /// every label re-resolved away (re-published or dropped) — a stale-walk artifact
+}
+
 void runFsckImpl(Store & store, bool detail, const FsckProgress & on_progress, const Deadline & deadline,
                   const String & namespace_prefix, FsckReport & report)
 {
@@ -111,7 +161,9 @@ void runFsckImpl(Store & store, bool detail, const FsckProgress & on_progress, c
     /// naming a MISSING body is an ERROR (Dangling); a present body whose blobs are missing is an ERROR.
     std::set<String> reachable_blobs;        /// blob object keys named by a live owner
     std::set<String> owned_manifest_keys;    /// manifest object keys named by a committed owner
-    std::unordered_map<String, std::vector<String>> blob_labels;   /// blob key -> "ns/ref" (detail)
+    /// blob key -> "ns/ref" labels of the refs that named it. Always populated (not just under
+    /// `detail`) — the B207 HEAD-absent re-resolve below needs it in every mode.
+    std::unordered_map<String, std::vector<String>> blob_labels;
 
     uint64_t refs_walked = 0;
     for (const String & ns_str : store.listNamespaces(namespace_prefix))
@@ -166,8 +218,7 @@ void runFsckImpl(Store & store, bool detail, const FsckProgress & on_progress, c
                 reachable_blobs.insert(bkey);
                 ++report.total_blob_refs;
                 report.referenced_logical_bytes += e.blob_size;
-                if (detail)
-                    blob_labels[bkey].push_back(label);
+                blob_labels[bkey].push_back(label);
             }
 
             ++refs_walked;
@@ -233,6 +284,19 @@ void runFsckImpl(Store & store, bool detail, const FsckProgress & on_progress, c
                 report.physical_bytes += h.size;
             }
         }
+
+        const auto lit = blob_labels.find(bkey);
+        if (!exists)
+        {
+            /// B207: before declaring a loss, re-resolve the referencing ref(s) FRESH — a ref
+            /// re-published or dropped between the walk and this HEAD-confirm, combined with a
+            /// legitimate GC delete of the OLD blob, must NOT surface as a phantom dangle.
+            const bool still_referenced = blobStillReferenced(store, layout, bkey,
+                lit != blob_labels.end() ? lit->second : std::vector<String>{}, deadline);
+            if (!still_referenced)
+                continue;   /// stale-walk artifact: neither reachable nor dangling — skip entirely
+        }
+
         if (exists)
             ++report.reachable;
         else
@@ -244,9 +308,8 @@ void runFsckImpl(Store & store, bool detail, const FsckProgress & on_progress, c
             o.kind = ObjectKind::Blob;
             o.size = size;
             o.cls = exists ? FsckClass::Reachable : FsckClass::Dangling;
-            if (detail)
-                if (const auto lit = blob_labels.find(bkey); lit != blob_labels.end())
-                    o.reachable_from = lit->second;
+            if (detail && lit != blob_labels.end())
+                o.reachable_from = lit->second;
             report.objects.push_back(std::move(o));
         }
     }
@@ -415,23 +478,32 @@ void runFsckImpl(Store & store, bool detail, const FsckProgress & on_progress, c
         {
             checkDeadline(deadline, "head-checking scoped blobs");
             const HeadResult h = backend.head(bkey);
-            if (h.exists)
+            const auto lit = blob_labels.find(bkey);
+            bool exists = h.exists;
+            if (!exists)
+            {
+                /// B207: same HEAD-absent re-resolve as the global-mode loop above.
+                const bool still_referenced = blobStillReferenced(store, layout, bkey,
+                    lit != blob_labels.end() ? lit->second : std::vector<String>{}, deadline);
+                if (!still_referenced)
+                    continue;   /// stale-walk artifact — neither reachable nor dangling
+            }
+            if (exists)
             {
                 ++report.reachable;
                 report.physical_bytes += h.size;
             }
             else
                 ++report.dangling;
-            if (detail || !h.exists)
+            if (detail || !exists)
             {
                 FsckObject o;
                 o.key = bkey;
                 o.kind = ObjectKind::Blob;
-                o.size = h.exists ? h.size : 0;
-                o.cls = h.exists ? FsckClass::Reachable : FsckClass::Dangling;
-                if (detail)
-                    if (const auto lit = blob_labels.find(bkey); lit != blob_labels.end())
-                        o.reachable_from = lit->second;
+                o.size = exists ? h.size : 0;
+                o.cls = exists ? FsckClass::Reachable : FsckClass::Dangling;
+                if (detail && lit != blob_labels.end())
+                    o.reachable_from = lit->second;
                 report.objects.push_back(std::move(o));
             }
         }
