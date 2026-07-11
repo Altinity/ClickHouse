@@ -1909,10 +1909,13 @@ TEST(CaWiringOps, OrphanedPendingBlobNotUploadedAfterUnlink)
 
     const auto & log = recording->ops;
 
-    /// Collect blob keys written by this transaction (only /blobs/ writeObjects).
+    /// Collect blob BODY keys written by this transaction (only /blobs/ writeObjects). Exclude the
+    /// per-hash `.meta` freshness descriptor sibling (`blobMetaKey` = body key + `.meta`, spec
+    /// §meta-protocols v3): it lives under the same /blobs/ prefix but is NOT a blob upload, so it must
+    /// not inflate the body-upload count. `putBlob` writes exactly one such `.meta` per body.
     std::vector<std::string> blob_writes;
     for (const auto & r : log)
-        if (r.op == "writeObject" && r.key.find("/blobs/") != std::string::npos)
+        if (r.op == "writeObject" && r.key.find("/blobs/") != std::string::npos && !r.key.ends_with(".meta"))
             blob_writes.push_back(r.key);
 
     /// Exactly ONE blob must have been uploaded (the kept one). The orphaned blob's pool key must
@@ -1958,10 +1961,11 @@ TEST(CaWiringOps, OrphanedPendingBlobNotUploadedAfterReplace)
 
     const auto & log = recording->ops;
 
-    /// Exactly ONE blob must have been uploaded (the replacement blob Y).
+    /// Exactly ONE blob must have been uploaded (the replacement blob Y). Exclude the per-hash `.meta`
+    /// freshness descriptor sibling (see the AfterUnlink test) — it is not a blob body upload.
     std::vector<std::string> blob_writes;
     for (const auto & r : log)
-        if (r.op == "writeObject" && r.key.find("/blobs/") != std::string::npos)
+        if (r.op == "writeObject" && r.key.find("/blobs/") != std::string::npos && !r.key.ends_with(".meta"))
             blob_writes.push_back(r.key);
 
     EXPECT_EQ(blob_writes.size(), 1u)
