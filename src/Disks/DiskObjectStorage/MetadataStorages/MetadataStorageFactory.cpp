@@ -249,17 +249,15 @@ static void registerContentAddressedMetadataStorage(MetadataStorageFactory & fac
         /// weighed batching-vs-body-size default; see the comment there). Configurable to spread
         /// manifest CAS writes across more keys.
         const uint64_t root_shards = config.getUInt64(config_prefix + ".root_shards", 32);
-        /// CAS pluggable-blob-hash Phase 1 (design 2026-07-11-cas-pluggable-blob-hash-design.md §2):
+        /// CAS pluggable-blob-hash Phase 1/2 (design 2026-07-11-cas-pluggable-blob-hash-design.md §2):
         /// `blob_hash` selects the pool's blob content-hash function; default `cityhash128` keeps
         /// today's behavior byte-for-byte unchanged. `parseBlobHashAlgo` fails closed on an unknown
-        /// spelling. `sha256` PARSES (Phase 2 admits it) but is rejected HERE with NOT_IMPLEMENTED —
-        /// only cityHash128 and xxh3-128 are usable until the variable-length digest refactor lands.
-        /// The choice is fixed at pool creation; `PoolMeta::createOrValidate` is pool-authoritative on
-        /// reopen and fails closed (BAD_ARGUMENTS) when this disagrees with the recorded algo.
+        /// spelling. `sha256` is now fully usable (Phase 2 Task 6 finished the variable-length digest
+        /// write path: `objectKey`/`Build`'s dep map/`putBlob`/`logical_hash`/the event-log hash render/
+        /// the inline-candidate hash all route through the pool-scoped `DigestCodec` at the pool's real
+        /// width). The choice is fixed at pool creation; `PoolMeta::createOrValidate` is pool-authoritative
+        /// on reopen and fails closed (BAD_ARGUMENTS) when this disagrees with the recorded algo.
         const Cas::BlobHashAlgo blob_hash_algo = Cas::parseBlobHashAlgo(config.getString(config_prefix + ".blob_hash", "cityhash128"));
-        if (blob_hash_algo == Cas::BlobHashAlgo::Sha256)
-            throw Exception(ErrorCodes::NOT_IMPLEMENTED,
-                "sha256 blob hashing is not implemented yet (Phase 2 - the variable-length digest refactor)");
         const uint64_t dedup_cache_bytes = config.getUInt64(config_prefix + ".dedup_cache_bytes", 64ULL << 20);
         const uint64_t dedup_head_first_min_bytes = config.getUInt64(config_prefix + ".dedup_head_first_min_bytes", 1ULL << 20);
         const uint64_t gc_snap_generations_to_keep = config.getUInt64(config_prefix + ".gc_snap_generations_to_keep", 3);

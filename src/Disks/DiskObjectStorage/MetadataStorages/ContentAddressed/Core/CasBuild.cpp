@@ -132,11 +132,13 @@ BlobRef Build::putBlob(const BlobId & id, BlobSource source)
 {
     requireAlive();
 
-    const UInt128 logical_hash = hexToU128(id.string());
-    /// CAS pluggable-blob-hash Phase 2 Task 5: the dedup cache is pool-width `BlobDigest`-keyed; `Build`'s
-    /// own dep-tracking (`logical_hash`) stays `UInt128` (write-path widening is Task 6+ — the disk-config
-    /// guard means a sha256 pool never reaches `putBlob` today), so bridge via `BlobDigest::fromU128`.
-    const BlobDigest dedup_hash = BlobDigest::fromU128(logical_hash);
+    /// CAS pluggable-blob-hash Phase 2 Task 6: `id.string()` is the pool's real content-hash hex (32
+    /// chars for a 128-bit pool, 64 for sha256) -- parse it at the pool's ACTUAL recorded width via the
+    /// pool-scoped codec, never the bare, fixed-32-hex `hexToU128` (which would misparse or reject a
+    /// genuine sha256 blob id). `logical_hash` is a native `BlobDigest` end-to-end from here on: the
+    /// dedup cache, the dep map, and every downstream event render key off THIS value directly, with
+    /// no `BlobDigest::fromU128` narrowing bridge (the write-path widening Task 5's comment deferred).
+    const BlobDigest logical_hash = DigestCodec(store->poolMeta()).fromHex(id.string());
 
     const String key = store->layout().blobKey(id);
     const PoolConfig & cfg = store->poolConfig();
@@ -154,7 +156,7 @@ BlobRef Build::putBlob(const BlobId & id, BlobSource source)
     /// always genuinely observe present-at-round before skipping the body, so the cache can never cause
     /// a dangle (a stale hit just HEADs 404 and uploads).
     const bool head_first =
-        store->dedupCacheContains(dedup_hash)
+        store->dedupCacheContains(logical_hash)
         || (cfg.dedup_head_first_min_bytes > 0 && source.size >= cfg.dedup_head_first_min_bytes);
     if (head_first)
     {
@@ -163,12 +165,12 @@ BlobRef Build::putBlob(const BlobId & id, BlobSource source)
         if (hr.exists)
         {
             ProfileEvents::increment(ProfileEvents::CasBlobBodyPutAvoided);
-            if (store->dedupCacheContains(dedup_hash))
+            if (store->dedupCacheContains(logical_hash))
                 ProfileEvents::increment(ProfileEvents::CasBlobDedupCacheHit);
             try
             {
                 const uint64_t admitted = observeAndAdmit(ObjectKind::Blob, logical_hash, key, hr);
-                store->dedupCacheAdd(dedup_hash);
+                store->dedupCacheAdd(logical_hash);
                 return BlobRef{id, admitted};
             }
             catch (const Exception & e)
@@ -192,7 +194,7 @@ BlobRef Build::putBlob(const BlobId & id, BlobSource source)
         {
             uploadFromSource(ObjectKind::Blob, logical_hash, key, source);
             /// P1: this hash is now known-present — future writers can HEAD-first and skip the body.
-            store->dedupCacheAdd(dedup_hash);
+            store->dedupCacheAdd(logical_hash);
             return BlobRef{id, source.size};
         }
         catch (const Exception & e)
@@ -213,13 +215,13 @@ BlobRef Build::putBlob(const BlobId & id, BlobSource source)
     throw Exception(ErrorCodes::LOGICAL_ERROR, "putBlob: exhausted retries for {}", key);
 }
 
-bool Build::isCopyForwardableTokenless(const UInt128 & hash) const
+bool Build::isCopyForwardableTokenless(const BlobDigest & hash) const
 {
     auto it = deps.find({static_cast<uint8_t>(ObjectKind::Blob), hash});
     return it != deps.end() && !it->second.token.has_value();
 }
 
-bool Build::depIsTokened(const UInt128 & hash) const
+bool Build::depIsTokened(const BlobDigest & hash) const
 {
     /// Discriminator for B156b: a putBlob'd blob records a TOKENED dep (recreatable by retrying), an
     /// adoptFromTree carry-forward records a TOKENLESS W-EVIDENCE dep (not recreatable — pinned by a
@@ -229,7 +231,7 @@ bool Build::depIsTokened(const UInt128 & hash) const
     return it != deps.end() && it->second.token.has_value();
 }
 
-uint64_t Build::observeAndAdmit(ObjectKind kind, const UInt128 & hash, const String & key)
+uint64_t Build::observeAndAdmit(ObjectKind kind, const BlobDigest & hash, const String & key)
 {
     /// EDGE-BEFORE-OBSERVE (spec 2026-07-09-cas-writer-gc-simplification): adopting an EXISTING
     /// incarnation is safe ONLY under this build's durable precommit closure — an adopted blob carries the
@@ -252,7 +254,7 @@ uint64_t Build::observeAndAdmit(ObjectKind kind, const UInt128 & hash, const Str
     return observeAndAdmit(kind, hash, key, hr);
 }
 
-uint64_t Build::observeAndAdmit(ObjectKind kind, const UInt128 & hash, const String & key, const HeadResult & hr)
+uint64_t Build::observeAndAdmit(ObjectKind kind, const BlobDigest & hash, const String & key, const HeadResult & hr)
 {
     /// EDGE-BEFORE-OBSERVE (spec 2026-07-09-cas-writer-gc-simplification): adopting an EXISTING
     /// incarnation is safe ONLY under this build's durable precommit closure — an adopted blob carries the
@@ -276,13 +278,11 @@ uint64_t Build::observeAndAdmit(ObjectKind kind, const UInt128 & hash, const Str
     /// Task 3 (spec §meta-protocols v3): the condemned decision is now a per-hash META POINT-READ, not
     /// the writer-side RetireView. `absent` meta means "not condemned" — GC always writes a `Condemned`
     /// meta BEFORE it ever deletes a body, so an absent meta is exactly as live as a `Clean` one.
-    /// CAS pluggable-blob-hash Phase 2 Task 5: the `.meta` API is pool-width `BlobDigest`-keyed; `Build`'s
-    /// own dep-tracking (`deps`, this `hash` parameter) stays `UInt128` (write-path widening is Task 6+ —
-    /// the disk-config guard means a sha256 pool never reaches `Build` today), so bridge via
-    /// `BlobDigest::fromU128` at this meta-ops boundary only.
+    /// CAS pluggable-blob-hash Phase 2 Task 6: `hash` is a native `BlobDigest` end-to-end now (the
+    /// write-path widening Task 5's comment here deferred) -- the `.meta` API, the dep map, and the
+    /// event-log render below all take it directly, no `BlobDigest::fromU128` bridge.
     const DigestCodec meta_codec(store->poolMeta());
-    const BlobDigest meta_hash = BlobDigest::fromU128(hash);
-    const auto lm = loadMeta(store->backend(), store->layout(), meta_codec, meta_hash);
+    const auto lm = loadMeta(store->backend(), store->layout(), meta_codec, hash);
     const bool condemned = lm && lm->meta.state == MetaState::Condemned;
     if (condemned)
     {
@@ -295,7 +295,7 @@ uint64_t Build::observeAndAdmit(ObjectKind kind, const UInt128 & hash, const Str
         {
             e.type = CasEventType::BlobReuseResurrect;
             e.object_kind = ev_kind;
-            e.object_hash = u128ToHex(hash);
+            e.object_hash = meta_codec.toHex(hash);
             e.token = hr.token.value;
             e.round = 0;   /// the round is no longer a writer concept (meta point-read replaces RetireView)
             e.outcome = "condemned";
@@ -311,7 +311,7 @@ uint64_t Build::observeAndAdmit(ObjectKind kind, const UInt128 & hash, const Str
     /// point-readers (writers and GC) never have to fall back to a HEAD-only guess. A Conflict here just
     /// means a racing writer already created it — both agree on the same Clean steady state.
     if (!lm)
-        putMetaIfAbsent(store->backend(), store->layout(), meta_codec, meta_hash,
+        putMetaIfAbsent(store->backend(), store->layout(), meta_codec, hash,
             BlobMeta{.state = MetaState::Clean, .condemn_round = 0, .size = logical_size});
 
     /// Adopt the current incarnation — free, no bytes moved.
@@ -322,7 +322,7 @@ uint64_t Build::observeAndAdmit(ObjectKind kind, const UInt128 & hash, const Str
     {
         e.type = CasEventType::BlobReuseAdopt;
         e.object_kind = ev_kind;
-        e.object_hash = u128ToHex(hash);
+        e.object_hash = meta_codec.toHex(hash);
         e.token = hr.token.value;
         e.round = 0;   /// the round is no longer a writer concept (meta point-read replaces RetireView)
         e.outcome = "adopt";
@@ -333,7 +333,7 @@ uint64_t Build::observeAndAdmit(ObjectKind kind, const UInt128 & hash, const Str
     return logical_size;
 }
 
-void Build::uploadFromSource(ObjectKind kind, const UInt128 & hash, const String & key, const BlobSource & source)
+void Build::uploadFromSource(ObjectKind kind, const BlobDigest & hash, const String & key, const BlobSource & source)
 {
     /// INV-1 (revival-from-source): re-upload a condemned or absent object from the writer's OWN
     /// re-readable source — NEVER calls backend().get to read the dying object. W-FRESH-TAG: fresh
@@ -344,11 +344,9 @@ void Build::uploadFromSource(ObjectKind kind, const UInt128 & hash, const String
     /// temp file), which is exactly what preserves INV-1 across retries.
     const PoolMeta & meta = store->poolMeta();
     const PoolConfig & cfg = store->poolConfig();
-    /// CAS pluggable-blob-hash Phase 2 Task 5: the `.meta` API is pool-width `BlobDigest`-keyed;
-    /// `Build`'s own dep-tracking (`deps`, this `hash` parameter) stays `UInt128` (write-path widening
-    /// is Task 6+), so bridge via `BlobDigest::fromU128` at this meta-ops boundary only.
+    /// CAS pluggable-blob-hash Phase 2 Task 6: `hash` is a native `BlobDigest` end-to-end now -- the
+    /// `.meta` API and the dep map below take it directly, no `BlobDigest::fromU128` bridge.
     const DigestCodec meta_codec(meta);
-    const BlobDigest meta_hash = BlobDigest::fromU128(hash);
 
     auto buildHeader = [&]() -> String
     {
@@ -412,7 +410,7 @@ void Build::uploadFromSource(ObjectKind kind, const UInt128 & hash, const String
         {
             e.type = CasEventType::BlobPut;
             e.object_kind = ev_kind;
-            e.object_hash = u128ToHex(hash);
+            e.object_hash = meta_codec.toHex(hash);
             e.token = tok.value;
             e.round = 0;   /// the round is no longer a writer concept (meta point-read replaces RetireView)
             e.outcome = "ok";
@@ -427,7 +425,7 @@ void Build::uploadFromSource(ObjectKind kind, const UInt128 & hash, const String
     /// on the same Clean steady state).
     auto writeFreshMetaClean = [&]()
     {
-        putMetaIfAbsent(store->backend(), store->layout(), meta_codec, meta_hash,
+        putMetaIfAbsent(store->backend(), store->layout(), meta_codec, hash,
             BlobMeta{.state = MetaState::Clean, .condemn_round = 0, .size = source.size});
     };
 
@@ -445,11 +443,11 @@ void Build::uploadFromSource(ObjectKind kind, const UInt128 & hash, const String
         for (int attempt = 0; attempt < max_meta_attempts; ++attempt)
         {
             const CasResult res = lm_before
-                ? casMeta(store->backend(), store->layout(), meta_codec, meta_hash, lm_before->etag, clean)
-                : putMetaIfAbsent(store->backend(), store->layout(), meta_codec, meta_hash, clean);
+                ? casMeta(store->backend(), store->layout(), meta_codec, hash, lm_before->etag, clean)
+                : putMetaIfAbsent(store->backend(), store->layout(), meta_codec, hash, clean);
             if (res.outcome == CasOutcome::Committed)
                 return;
-            lm_before = loadMeta(store->backend(), store->layout(), meta_codec, meta_hash);
+            lm_before = loadMeta(store->backend(), store->layout(), meta_codec, hash);
         }
         /// Exhausted retries: leave the meta as-is — best-effort (a later writer/GC pass reconciles it).
     };
@@ -522,7 +520,7 @@ void Build::uploadFromSource(ObjectKind kind, const UInt128 & hash, const String
     /// Task 3 (spec §meta-protocols v3): the condemned decision is now a per-hash META POINT-READ, not
     /// the writer-side RetireView. `lm` (and its etag) is reused below to flip a condemned meta back to
     /// Clean once the resurrect displacement lands.
-    const auto lm = loadMeta(store->backend(), store->layout(), meta_codec, meta_hash);
+    const auto lm = loadMeta(store->backend(), store->layout(), meta_codec, hash);
     const bool condemned = lm && lm->meta.state == MetaState::Condemned;
     if (!condemned)
     {
@@ -751,12 +749,14 @@ void Build::adoptEvidence(const ManifestEntry & entry)
     /// Inline / Blob placements (no Subtree): only blobs are content-addressed.
     if (entry.placement == EntryPlacement::Blob)
     {
-        deps[{static_cast<uint8_t>(ObjectKind::Blob), entry.blob_hash.toU128()}] =
+        /// CAS pluggable-blob-hash Phase 2 Task 6: `entry.blob_hash` is already a native `BlobDigest` --
+        /// no `.toU128()` narrowing (the `deps` map is itself `BlobDigest`-keyed now).
+        deps[{static_cast<uint8_t>(ObjectKind::Blob), entry.blob_hash}] =
             DepEntry{ObjectKind::Blob, std::nullopt, entry.blob_size};
     }
 }
 
-void Build::recordPendingBlobDep(const UInt128 & hash, uint64_t size)
+void Build::recordPendingBlobDep(const BlobDigest & hash, uint64_t size)
 {
     requireAlive();
     deps[{static_cast<uint8_t>(ObjectKind::Blob), hash}] =
@@ -858,9 +858,25 @@ ManifestId Build::stageManifest(std::vector<ManifestEntry> entries)
     return id;
 }
 
-String Build::keyFor(ObjectKind kind, const UInt128 & hash) const
+/// CAS pluggable-blob-hash Phase 2 Task 6: `objectKey` (declared in `CasLayout.h`) is defined HERE, not
+/// inline in that header, because `CasBlobDigest.h` (`BlobDigest`/`DigestCodec`) already includes
+/// `CasPoolMeta.h`, which includes `CasLayout.h` back -- including `CasBlobDigest.h` from `CasLayout.h`
+/// would cycle. `Build::keyFor` below is `objectKey`'s sole caller, and this translation unit already
+/// has both complete types via `CasBuild.h` -> `CasStore.h`.
+String objectKey(const Layout & layout, const DigestCodec & codec, ObjectKind kind, const BlobDigest & hash)
 {
-    return objectKey(store->layout(), kind, hash);
+    const String id = codec.toHex(hash);
+    switch (kind)
+    {
+        case ObjectKind::Blob:
+            return layout.blobKey(BlobId(id));
+    }
+    throw Exception(ErrorCodes::LOGICAL_ERROR, "objectKey: unknown ObjectKind {}", static_cast<uint8_t>(kind));
+}
+
+String Build::keyFor(ObjectKind kind, const BlobDigest & hash) const
+{
+    return objectKey(store->layout(), DigestCodec(store->poolMeta()), kind, hash);
 }
 
 void Build::precommitAdd(const RootNamespace & target_ns, const String & final_ref_name, const ManifestId & id)
@@ -1017,7 +1033,7 @@ void Build::promote(const RootNamespace & target_ns, const String & final_ref_na
         {
             if (e.placement != EntryPlacement::Blob)
                 continue;
-            if (depIsTokened(e.blob_hash.toU128()))
+            if (depIsTokened(e.blob_hash))
                 continue;   /// edge-protected (EDGE-BEFORE-OBSERVE); putBlob validated under the durable edge
             const BlobId blob_id{codec.toHex(e.blob_hash)};
             const String blob_key = store->layout().blobKey(blob_id);
@@ -1036,7 +1052,7 @@ void Build::promote(const RootNamespace & target_ns, const String & final_ref_na
                 const bool condemned = lm && lm->meta.state == MetaState::Condemned;
                 if (condemned)
                 {
-                    if (!isCopyForwardableTokenless(e.blob_hash.toU128()))
+                    if (!isCopyForwardableTokenless(e.blob_hash))
                         throw Exception(ErrorCodes::ABORTED,
                             "promote: blob {} condemned at commit revalidation — failing closed (INV-1)", blob_key);
                     copyForwardFromCondemned(e.blob_hash, blob_key, hr);

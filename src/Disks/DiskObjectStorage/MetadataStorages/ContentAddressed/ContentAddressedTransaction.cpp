@@ -18,7 +18,6 @@
 #include <Common/logger_useful.h>
 #include <base/hex.h>
 #include <base/scope_guard.h>
-#include <city.h>
 #include <ctime>
 
 namespace DB::ContentAddressed
@@ -212,7 +211,7 @@ void ContentAddressedTransaction::adoptStagedBlob(
         /// If !copy_pending, the record is already in dst_st (moved by caller) — skip the push.
         if (copy_pending)
             dst_st.pending_blobs.push_back(*pb);
-        dst_build.recordPendingBlobDep(entry.blob_hash.toU128(), entry.blob_size);   /// Build's dep map stays UInt128 (Task 6+)
+        dst_build.recordPendingBlobDep(entry.blob_hash, entry.blob_size);   /// Build's dep map is BlobDigest-keyed (Task 6)
     }
     else
     {
@@ -550,7 +549,7 @@ void ContentAddressedTransaction::stageBlobPartFile(
     /// `StagingBackend::Local`, an S3 staging object for `StagingBackend::S3` (Task 4).
     auto & st = stagingFor(route);
     st.pending_blobs.push_back({hash, staging_key, size, backend});
-    buildFor(route, st).recordPendingBlobDep(hash.toU128(), size);   /// Build's dep map stays UInt128 (Task 6+)
+    buildFor(route, st).recordPendingBlobDep(hash, size);   /// Build's dep map is BlobDigest-keyed (Task 6)
 
     Cas::ManifestEntry entry;
     entry.path = route.file;
@@ -717,10 +716,18 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
     return std::make_unique<ContentAddressed::CaInlineWriteBuffer>(
         [this, route = *r](std::string bytes)
         {
-            /// Hash via the SAME hex round-trip the blob path (CaContentWriteBuffer) uses, so an inline file
-            /// and a standalone blob of identical content get the same file_hash (inline == blob for treeId).
-            const UInt128 hash = Cas::hexToU128(
-                getHexUIntLowercase(CityHash_v1_0_2::CityHash128(bytes.data(), bytes.size())));
+            /// CAS pluggable-blob-hash Phase 2 Task 6: hash with the POOL's recorded algo -- NOT a
+            /// hardcoded `CityHash128` -- via the SAME `blobHashHexOneShot` -> pool-scoped
+            /// `DigestCodec::fromHex` round-trip the blob path (`stageBlobPartFile`'s callers above)
+            /// uses, so an inline file and a standalone blob of identical content get the same
+            /// `file_hash` (inline == blob for treeId) under EVERY algo, including sha256. The old
+            /// hardcoded `CityHash128` broke this invariant for any non-default pool: an inline entry
+            /// would hash with cityHash128 while its sibling blob hashed with the pool's real algo, so
+            /// identical content produced DIFFERENT hashes (and, for sha256, a 128-bit hash silently
+            /// zero-padded into a `BlobDigest` instead of the real 32-byte digest).
+            const auto hash_algo = static_cast<Cas::BlobHashAlgo>(metadata_storage.store()->poolMeta().blob_hash_algo);
+            const Cas::DigestCodec digest_codec(metadata_storage.store()->poolMeta());
+            const Cas::BlobDigest hash = digest_codec.fromHex(Cas::blobHashHexOneShot(hash_algo, bytes));
             if (bytes.size() <= INLINE_CAP)
             {
                 auto & st = stagingFor(route);
@@ -736,7 +743,7 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
                 Cas::ManifestEntry entry;
                 entry.path = route.file;
                 entry.placement = Cas::EntryPlacement::Inline;
-                entry.blob_hash = Cas::BlobDigest::fromU128(hash);   /// content hash — inline == blob for the Merkle id
+                entry.blob_hash = hash;   /// content hash — inline == blob for the Merkle id
                 entry.blob_size = bytes.size();
                 entry.inline_bytes = std::move(bytes);
                 std::erase_if(st.entries, [&](const Cas::ManifestEntry & e) { return e.path == entry.path; });
@@ -763,7 +770,7 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
                 /// enough (a safety net, not a hot path) that Task 4's S3-staging mode does not cover it.
                 bool staged = false;
                 SCOPE_EXIT({ if (!staged) { std::error_code ec; std::filesystem::remove(temp_path, ec); } });
-                stageBlobPartFile(route, Cas::BlobDigest::fromU128(hash), bytes.size(), temp_path, StagingBackend::Local);
+                stageBlobPartFile(route, hash, bytes.size(), temp_path, StagingBackend::Local);
                 staged = true;
             }
         });

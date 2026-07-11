@@ -388,15 +388,15 @@ TEST(CasBuildReuseBlob, DepIsTokenedDiscriminatesPutBlobVsAdopt)
 
     /// putBlob'd hash ⇒ tokened.
     build->putBlob(idOf("written"), BlobSource::fromString("written"));
-    EXPECT_TRUE(build->depIsTokened(u128Of("written")));
+    EXPECT_TRUE(build->depIsTokened(BlobDigest::fromU128(u128Of("written"))));
 
     /// Adopted hash ⇒ tokenless. adoptEvidence records the dep directly from a resolved ManifestEntry
     /// (the source manifest's entry); no body needs to be in hand for the dep to be recorded.
     build->adoptEvidence(blobManifestEntry("f", "adopted"));
-    EXPECT_FALSE(build->depIsTokened(u128Of("adopted")));
+    EXPECT_FALSE(build->depIsTokened(BlobDigest::fromU128(u128Of("adopted"))));
 
     /// Unknown hash ⇒ no dep, not tokened.
-    EXPECT_FALSE(build->depIsTokened(u128Of("unknown")));
+    EXPECT_FALSE(build->depIsTokened(BlobDigest::fromU128(u128Of("unknown"))));
 }
 
 /// B190: ReuseBlobCondemnedThrowsAbortedRetryable is removed (reuseBlob is gone).
@@ -1230,7 +1230,7 @@ TEST(CasBuild, AdoptEvidenceRecordsTokenlessDep)
 
     const ManifestEntry adopted = blobManifestEntry("data.bin", "source-blob");
     build->adoptEvidence(adopted);
-    EXPECT_FALSE(build->depIsTokened(u128Of("source-blob")));
+    EXPECT_FALSE(build->depIsTokened(BlobDigest::fromU128(u128Of("source-blob"))));
 
     /// An Inline entry references no standalone object → records nothing (never tokened).
     ManifestEntry inline_entry;
@@ -1238,7 +1238,7 @@ TEST(CasBuild, AdoptEvidenceRecordsTokenlessDep)
     inline_entry.placement = EntryPlacement::Inline;
     inline_entry.inline_bytes = "abc";
     build->adoptEvidence(inline_entry);
-    EXPECT_FALSE(build->depIsTokened(u128Of("abc")));
+    EXPECT_FALSE(build->depIsTokened(BlobDigest::fromU128(u128Of("abc"))));
 }
 
 TEST(CasBuild, AbandonRemovesStagedDebrisAndDisables)
@@ -1558,7 +1558,7 @@ TEST(CasBuild, AdoptEvidenceNoBackendOp)
 
     /// The dep is recorded — a tokenless W-EVIDENCE dep (depIsTokened false) that the promote gate later
     /// revalidates; the no-backend-op counts above are the B188 contract's primary guard.
-    EXPECT_FALSE(build->depIsTokened(u128Of("b188-content")));
+    EXPECT_FALSE(build->depIsTokened(BlobDigest::fromU128(u128Of("b188-content"))));
 
     /// Inline entry: adoptEvidence records nothing (Inline has no standalone object) and no backend op.
     ManifestEntry inline_entry;
@@ -1569,7 +1569,7 @@ TEST(CasBuild, AdoptEvidenceNoBackendOp)
     EXPECT_EQ(counting->heads, 0u);
     EXPECT_EQ(counting->stream_puts, 0u);
     EXPECT_EQ(counting->gets, 0u);
-    EXPECT_FALSE(build->depIsTokened(u128Of("xy")));
+    EXPECT_FALSE(build->depIsTokened(BlobDigest::fromU128(u128Of("xy"))));
 }
 
 TEST(CasBuild, ConvergesUnderProductiveGc)

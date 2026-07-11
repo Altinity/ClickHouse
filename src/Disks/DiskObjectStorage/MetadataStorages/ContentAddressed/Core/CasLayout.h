@@ -358,20 +358,22 @@ private:
     }
 };
 
+/// Forward-declared only: `CasBlobDigest.h` (`BlobDigest`/`DigestCodec`) is NOT included here because
+/// it already depends back on this header (`CasBlobDigest.h` -> `CasPoolMeta.h` -> `CasLayout.h`) --
+/// including it here too would cycle. `objectKey` below needs them only by const reference, so the
+/// forward declaration is enough for the header; its definition (which calls `codec.toHex`, requiring
+/// the complete types) lives in `CasBuild.cpp`, its sole caller, where both are already visible.
+struct BlobDigest;
+class DigestCodec;
+
 /// The object key for a (kind, hash) — the single kind→key-shape mapping.
 /// Shared by `Build` (the publish gate's observe/resurrect) and `Gc` (the retire HEAD and the
 /// exact-token delete): both sides MUST address the same object the same way. The standalone tree
 /// object kind (the rejected Merkle layer) was excised 2026-07-03 (rev. 15 `PartManifest` redesign);
-/// `Blob` is the only surviving `ObjectKind`.
-inline String objectKey(const Layout & layout, ObjectKind kind, const UInt128 & hash)
-{
-    const String id = u128ToHex(hash);
-    switch (kind)
-    {
-        case ObjectKind::Blob:
-            return layout.blobKey(BlobId(id));
-    }
-    throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "objectKey: unknown ObjectKind {}", static_cast<uint8_t>(kind));
-}
+/// `Blob` is the only surviving `ObjectKind`. CAS pluggable-blob-hash Phase 2 Task 6: routed through
+/// the pool-scoped `DigestCodec` (never a bare `u128ToHex`, which hard-rejects any hex length != 32
+/// and would silently misaddress or reject a sha256 pool's blob) -- `codec` MUST be built from the
+/// SAME pool this `layout` addresses (mirrors `CasGc.cpp`'s analogous `blobKeyOf`).
+String objectKey(const Layout & layout, const DigestCodec & codec, ObjectKind kind, const BlobDigest & hash);
 
 }

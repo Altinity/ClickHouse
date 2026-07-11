@@ -405,3 +405,103 @@ TEST(CasPluggableHash, Sha256BlobSeenByCondemnSweepAndFsckNotSilentlySkipped)
            "silent-leak regression in CasFsck.cpp's unref_hashes/in_run_hashes/retired_by_hash port "
            "leaves this as the generic Unaccounted bucket instead)";
 }
+
+/// ============================================================================================
+/// CAS pluggable-blob-hash Phase 2 Task 6 -- end-to-end sha256 WRITE path (in-memory; the real
+/// wiring-level integration + soak is Task 7).
+///
+/// Before this task, `Build`'s OWN write-path internals stayed a fixed 128-bit representation
+/// downstream of the mint (`poolContentHash`/`Build::putBlob`'s `logical_hash`, the `deps` map key, the
+/// event-log `object_hash` render, and `objectKey`) -- safe only because the disk-config factory guard
+/// (`MetadataStorageFactory.cpp`) blocked any real sha256 pool from reaching `Build` at all (see the
+/// Task 5 report and the "Task 6+" comments this task removes). Task 6 finishes those sites AND lifts
+/// the guard in the SAME commit. This test drives a REAL `Build` (`putBlob` -> `stageManifest` ->
+/// `precommitAdd` -> `promote`) on a `Sha256` pool and asserts:
+///   1. the blob lands under `blobs/sha256/<64-hex>` and the manifest entry's `blob_hash`, read back via
+///      `decodePartManifest`, is the FULL 32-byte digest (bytes beyond 16 are non-zero for a real sha256
+///      digest, i.e. NOT truncated to `.toU128()`'s low 16 bytes);
+///   2. an inline file and a standalone blob of IDENTICAL content get the SAME 32-byte `file_hash` under
+///      sha256 -- mirroring the (fixed) `ContentAddressedTransaction.cpp` inline-candidate formula
+///      (`blobHashHexOneShot(pool_algo, bytes)` -> pool-scoped `DigestCodec::fromHex`) directly at the
+///      Core level, since exercising the wiring itself is Task 7's job;
+///   3. `runFsck` on the pool is clean (no dangling, no foreign) -- the whole write -> GC -> fsck loop
+///      agrees on the 64-hex key.
+TEST(CasPluggableHash, Sha256BuildWritesFullWidthDigestAndInlineEqualsBlob)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = Store::open(backend,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1,
+                   .blob_hash_algo = BlobHashAlgo::Sha256});
+    ASSERT_EQ(store->poolMeta().blob_hash_len, 32u) << "a sha256 pool must record a 32-byte digest width";
+    const DigestCodec codec(store->poolMeta());
+
+    const RootNamespace ns{"srv1/tbl"};
+    const std::string payload = makeMultiBlockPayload();
+    const std::string hex = blobHashHexOneShot(BlobHashAlgo::Sha256, payload);
+    ASSERT_EQ(hex.size(), 64u) << "sha256 renders 64 lowercase hex chars";
+    const BlobId id{hex};
+
+    BuildInfo info;
+    info.intended_ref = ns.string() + "/part1";
+    auto build = store->startBuild(info);
+    const BlobRef ref = build->putBlob(id, BlobSource::fromString(payload));
+    EXPECT_EQ(ref.size, payload.size());
+
+    /// THE CRUX (blob side): the blob body lands under the sha256-segmented path, addressed by the
+    /// FULL 64-hex key -- `Build::putBlob`'s internal `logical_hash` must not have silently narrowed it
+    /// to a 32-hex (128-bit) key before this task.
+    const String blob_key = store->layout().blobKey(id);
+    EXPECT_NE(blob_key.find("/blobs/sha256/"), String::npos) << blob_key;
+    ASSERT_TRUE(backend->head(blob_key).exists);
+
+    /// Mirror the (fixed) inline-candidate hash site directly: same content, same pool algo, via the
+    /// SAME public formula ContentAddressedTransaction.cpp's writeFile now uses -- NOT the old hardcoded
+    /// CityHash128 (which would produce a DIFFERENT, 128-bit-then-zero-padded value here).
+    const BlobDigest inline_hash = codec.fromHex(blobHashHexOneShot(BlobHashAlgo::Sha256, payload));
+    const BlobDigest blob_hash = codec.fromHex(hex);
+    EXPECT_EQ(inline_hash, blob_hash) << "inline == blob: identical content must hash identically under sha256";
+
+    /// THE CRUX (width): a genuine 32-byte sha256 digest must NOT be zero-padded past byte 16 -- the
+    /// shape `BlobDigest::fromU128` (or a reverted hardcoded-CityHash128 inline site) would produce.
+    const bool tail_nonzero = std::any_of(blob_hash.bytes.begin() + 16, blob_hash.bytes.end(),
+        [](uint8_t b) { return b != 0; });
+    EXPECT_TRUE(tail_nonzero) << "a genuine sha256 digest must not be zero-padded past byte 16";
+
+    ManifestEntry blob_entry;
+    blob_entry.path = "data.bin";
+    blob_entry.placement = EntryPlacement::Blob;
+    blob_entry.blob_hash = blob_hash;
+    blob_entry.blob_size = payload.size();
+
+    ManifestEntry inline_entry;
+    inline_entry.path = "checksums.txt";
+    inline_entry.placement = EntryPlacement::Inline;
+    inline_entry.blob_hash = inline_hash;
+    inline_entry.blob_size = payload.size();
+    inline_entry.inline_bytes = payload;
+
+    const ManifestId mid = build->stageManifest({blob_entry, inline_entry});
+    build->precommitAdd(ns, "part1", mid);
+    build->promote(ns, "part1", build->buildId(), mid);
+    store->renewWatermarkOnce();
+
+    /// Read the committed manifest back -- the on-disk `blob_hash` must be the FULL 32-byte digest, not
+    /// truncated by the manifest codec or by anything upstream of `stageManifest`.
+    const auto manifest_bytes = backend->get(store->layout().manifestKey(mid));
+    ASSERT_TRUE(manifest_bytes.has_value());
+    const PartManifest read_back = decodePartManifest(manifest_bytes->bytes);
+    ASSERT_EQ(read_back.entries.size(), 2u);
+    const auto read_blob_it = std::find_if(read_back.entries.begin(), read_back.entries.end(),
+        [](const ManifestEntry & e) { return e.placement == EntryPlacement::Blob; });
+    ASSERT_NE(read_blob_it, read_back.entries.end());
+    EXPECT_EQ(read_blob_it->blob_hash, blob_hash);
+    const bool read_tail_nonzero = std::any_of(read_blob_it->blob_hash.bytes.begin() + 16,
+        read_blob_it->blob_hash.bytes.end(), [](uint8_t b) { return b != 0; });
+    EXPECT_TRUE(read_tail_nonzero) << "the manifest's on-disk blob_hash must not be truncated either";
+
+    /// The write -> GC -> fsck loop must agree end-to-end on the 64-hex key: clean, no dangling.
+    const FsckReport rep = runFsck(*store, /*detail=*/true);
+    EXPECT_TRUE(rep.clean());
+    EXPECT_EQ(rep.dangling, 0u);
+    EXPECT_GE(rep.reachable, 1u);
+}
