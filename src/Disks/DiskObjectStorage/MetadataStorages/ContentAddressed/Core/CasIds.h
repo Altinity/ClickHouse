@@ -23,13 +23,14 @@ namespace DB::Cas
 /// Strong-typed id strings for the content-addressed core.
 ///
 /// Each wraps a String but carries a distinct C++ type, so the compiler refuses to mix e.g. a
-/// TreeId with a RootNamespace (the class of bug that caused live-blob data loss: mixed identifier
+/// RootNamespace (the class of bug that caused live-blob data loss: mixed identifier
 /// types made mismatched comparisons silently compile). Construction from String is explicit, there
 /// is NO implicit conversion to String, and the underlying string is reached only through the
 /// explicit string accessor — at the object-storage boundary.
 ///
 /// (`BlobId` — a bare hex string — was deleted in the mixed-algo-pools refactor: a blob's identity is
-/// now ONLY the `BlobRef` pair, `CasBlobRef.h`. `TreeId` is unrelated and stays.)
+/// now ONLY the `BlobRef` pair, `CasBlobRef.h`. `TreeId` was part of the standalone-tree layer
+/// excised in 2026-07-03 (rev. 15 `PartManifest` redesign) and is no longer defined.)
 ///
 /// All of them expose operator<=> and operator== (so they live in std::set / std::map) and a
 /// std::hash specialization (so they live in std::unordered_* containers).
@@ -46,8 +47,6 @@ namespace DB::Cas
     private: \
         String value; \
     };
-
-CAS_STRONG_STRING(TreeId)
 
 /// Opaque namespace under which root manifests live. The core never interprets its contents:
 /// the wiring composes strings like "srv1/<table_uuid>" or "shadow/<backup>/<table_uuid>".
@@ -94,7 +93,6 @@ inline UInt128 hexToU128(const String & hex)
         } \
     };
 
-CAS_STRONG_STRING_HASH(TreeId)
 CAS_STRONG_STRING_HASH(RootNamespace)
 
 #undef CAS_STRONG_STRING_HASH

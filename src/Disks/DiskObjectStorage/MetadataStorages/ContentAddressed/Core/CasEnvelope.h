@@ -13,7 +13,7 @@ namespace DB::Cas
 /// fixed 70-byte little-endian core header, optionally followed by TLV extensions up to header_len,
 /// then the payload. The header is the "incarnation zone": it may differ between incarnations of the
 /// same logical object. The 4-byte magic encodes the kind: `CABL` for blobs (the standalone tree
-/// object kind was retired in the rev. 15 `PartManifest` redesign; see `ObjectKind` below).
+/// object kind was excised in the rev. 15 `PartManifest` redesign; see `ObjectKind` below).
 ///
 /// The binary core layout (all little-endian):
 ///   magic[4] + writer_version[2] + compatibility_version[2] + hash_algo[1] + flags[1] + header_len[4]

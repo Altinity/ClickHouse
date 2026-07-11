@@ -4,8 +4,8 @@ package clickhouse.cas.format;
 // ===========================================================================================
 // NORMATIVE protobuf schema for EVERY mutable content-addressed (CA) object. This single file is
 // the portable contract: a third party reimplementing CA reads/writes (Python/Java/Go) compiles it
-// to get all message types. (Hashed/immutable objects — the blob/tree envelope + the Merkle treeId
-// rule — are NOT protobuf; they are normative in the design doc
+// to get all message types. (Hashed/immutable objects — the blob envelope and its hash rules —
+// are NOT protobuf; they are normative in the design doc
 // docs/superpowers/specs/2026-06-24-cas-schema-evolution-framework-design.md.)
 //
 // CONVERGED HEADER MODEL (2026-06-25): every mutable object carries a CasHeader as field 1.
@@ -186,7 +186,7 @@ message GcStateProto {
 }
 
 // One entry inside a GcOutcomeLogProto.
-// kind: 1=blob, 2=tree (mirrors ObjectKind enum).
+// kind: 1=blob (mirrors ObjectKind enum; Tree was excised in rev. 15).
 // token_type: 1=etag, 2=generation, 3=emulated (mirrors TokenType enum).
 // outcome: 1=deleted, 2=absent, 3=replaced, 4=spared (mirrors OutcomeKind enum).
 message GcOutcomeEntryProto {

@@ -36,9 +36,9 @@ namespace DB::Cas
 inline void writeU128LE(WriteBuffer & out, const UInt128 & v) { writeBinaryLittleEndian(v, out); }
 inline UInt128 readU128LE(ReadBuffer & in) { UInt128 v; readBinaryLittleEndian(v, in); return v; }
 
-/// BE 16-byte form — used by the root-shard manifest's protobuf `bytes` fields (`tree_id`,
-/// `tree_hash`, `file_hash`). Body copied VERBATIM from the former hand-rolled
-/// `u128ToBytes` / `u128FromBytes` in `CasRootShardCodec.cpp` so the bytes are unchanged.
+/// BE 16-byte form — used by protobuf `bytes` fields to encode UInt128 values in big-endian order.
+/// Body copied VERBATIM from the former hand-rolled `u128ToBytes` / `u128FromBytes` in
+/// `CasRootShardCodec.cpp` so the bytes are unchanged.
 inline std::string u128ToBytesBE(const UInt128 & v)
 {
     std::string out(16, '\0');
@@ -50,7 +50,7 @@ inline std::string u128ToBytesBE(const UInt128 & v)
 inline UInt128 u128FromBytesBE(const std::string & b, std::string_view what)
 {
     if (b.size() != 16)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: tree_id must be 16 bytes, got {}", what, b.size());
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: big-endian UInt128 field must be 16 bytes, got {}", what, b.size());
     UInt128 v = 0;
     for (int i = 0; i < 16; ++i)
         v = (v << 8) | static_cast<UInt8>(b[i]);

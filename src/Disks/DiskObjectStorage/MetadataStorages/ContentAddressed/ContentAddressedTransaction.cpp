@@ -205,10 +205,10 @@ void ContentAddressedTransaction::adoptStagedBlob(
 {
     if (pb)
     {
-        /// Pending blob (not yet uploaded): record a tokenless dep so stageTree's W-TREE-BUILD
-        /// check passes without any pool op. If copy_pending, push a copy of the pb record into
-        /// dst_st so publishStaging uploads it for the dst part too (hardlink = copy semantics).
-        /// If !copy_pending, the record is already in dst_st (moved by caller) — skip the push.
+        /// Pending blob (not yet uploaded): record a tokenless dependency without any pool operation.
+        /// If copy_pending, push a copy of the pb record into dst_st so publishStaging uploads it
+        /// for the dst part too (hardlink = copy semantics). If !copy_pending, the record is already
+        /// in dst_st (moved by caller) — skip the push.
         if (copy_pending)
             dst_st.pending_blobs.push_back(*pb);
         dst_build.recordPendingBlobDep(entry.ref, entry.blob_size);
@@ -541,8 +541,8 @@ void ContentAddressedTransaction::stageBlobPartFile(
     const Cas::BlobRef & ref, size_t size, const std::string & staging_key, StagingBackend backend)
 {
     /// B188: do NOT upload here. Record the pending blob (uploaded post-precommit in publishStaging)
-    /// and a tokenless dep so stageTree's W-TREE-BUILD check passes; putBlob later overwrites it with
-    /// the tokened dep. The staging bytes are kept (the transaction owns them) — a local temp file for
+    /// and a tokenless dependency; putBlob later overwrites it with the tokened dependency.
+    /// The staging bytes are kept (the transaction owns them) — a local temp file for
     /// `StagingBackend::Local`, an S3 staging object for `StagingBackend::S3` (Task 4).
     auto & st = stagingFor(route);
     st.pending_blobs.push_back({ref, staging_key, size, backend});
@@ -650,8 +650,8 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
     /// A CONTENT part file that must stay a blob (per-column data/marks, primary.idx): spill + hash,
     /// then stage the blob as PENDING (B188 precommit-first). The blob is NOT uploaded/promoted here;
     /// publishStaging uploads it (Local) or a later task's promote drives it (S3) post-precommit.
-    /// recordPendingBlobDep (inside stageBlobPartFile) lets stageTree's W-TREE-BUILD check pass
-    /// without any pool op at staging time.
+    /// recordPendingBlobDep (inside stageBlobPartFile) records a tokenless dependency without any
+    /// pool operation at staging time.
     if (ContentAddressed::partFileMustStayBlob(r->file))
     {
         /// S3-native staging (Task 4, plan docs/superpowers/plans/2026-07-11-cas-s3-native-staging.md):
@@ -716,8 +716,8 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
         {
             /// Phase 3 T2: mint via the ONE write mint, `Cas::poolContentHash` (algo, payload) -> BlobRef
             /// (`CasBuild.h`) -- the SAME mint the streaming blob path's callers use, so an inline file
-            /// and a standalone blob of identical content get the same ref (inline == blob for the
-            /// Merkle id) under EVERY algo, including sha256.
+            /// and a standalone blob of identical content get the same ref (same content hash identity)
+            /// under EVERY algo, including sha256.
             const auto hash_algo = static_cast<Cas::BlobHashAlgo>(metadata_storage.store()->poolMeta().blob_hash_algo);
             const Cas::BlobRef ref = Cas::poolContentHash(hash_algo, bytes);
             if (bytes.size() <= INLINE_CAP)
@@ -735,7 +735,7 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
                 Cas::ManifestEntry entry;
                 entry.path = route.file;
                 entry.placement = Cas::EntryPlacement::Inline;
-                entry.ref = ref;   /// content hash — inline == blob for the Merkle id
+                entry.ref = ref;   /// content hash identity (same for inline and blob of same content)
                 entry.blob_size = bytes.size();
                 entry.inline_bytes = std::move(bytes);
                 std::erase_if(st.entries, [&](const Cas::ManifestEntry & e) { return e.path == entry.path; });
@@ -882,7 +882,7 @@ void ContentAddressedTransaction::createHardLink(const std::string & path_from, 
                 dst_st.mutable_files[dst->file] = it->second;
                 return;
             }
-        /// Force-fresh (Pillar B): projection hardlink source — carry the current payload/tree_id.
+        /// Force-fresh (Pillar B): projection hardlink source — carry the current payload.
         auto resolved = metadata_storage.partAccess().resolve(src->refKey(), ContentAddressed::Freshness::ForceFresh);
         if (!resolved || !resolved->mutable_files.contains(src->file))
             throw Exception(ErrorCodes::FILE_DOESNT_EXIST,

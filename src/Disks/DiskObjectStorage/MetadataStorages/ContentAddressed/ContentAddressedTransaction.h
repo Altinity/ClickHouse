@@ -117,8 +117,8 @@ private:
     /// insert's part survives as an orphan ref (resurrection / unexpected-part on restart). B151.
     std::vector<std::pair<Cas::RootNamespace, std::string>> rename_published_refs;
 
-    /// Stage a CONTENT part file as a blob: record the pending upload + a tokenless dep (so stageTree's
-    /// W-TREE-BUILD passes) and add/replace its Blob TreeEntry. Shared by the streaming-blob path
+    /// Stage a CONTENT part file as a blob: record the pending upload + a tokenless dependency
+    /// and add/replace its manifest entry. Shared by the streaming-blob path
     /// (Local or S3-staging, `backend` says which) and the always-Local inline-cap fallback.
     void stageBlobPartFile(const ContentAddressedMetadataStorage::Route & route,
                            const Cas::BlobRef & ref, size_t size, const std::string & staging_key,
