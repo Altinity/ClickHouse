@@ -81,7 +81,9 @@ namespace
             const std::optional<ObjectAttributes> & object_metadata_,
             ThreadPoolCallbackRunnerUnsafe<void> schedule_,
             BlobStorageLogWriterPtr blob_storage_log_,
-            const LoggerPtr log_)
+            const LoggerPtr log_,
+            const std::optional<String> & if_none_match_ = {},
+            String * out_dest_etag_ = nullptr)
             : client_ptr(client_ptr_)
             , dest_bucket(dest_bucket_)
             , dest_key(dest_key_)
@@ -90,6 +92,8 @@ namespace
             , schedule(schedule_)
             , blob_storage_log(blob_storage_log_)
             , log(log_)
+            , if_none_match(if_none_match_)
+            , out_dest_etag(out_dest_etag_)
             , num_parts(0)
             , normal_part_size(0)
         {
@@ -106,6 +110,13 @@ namespace
         ThreadPoolCallbackRunnerUnsafe<void> schedule;
         BlobStorageLogWriterPtr blob_storage_log;
         const LoggerPtr log;
+
+        /// If set, passed as the `If-None-Match` precondition on the destination write of a copy
+        /// (`CopyObject` and, for large objects, `CompleteMultipartUpload`), making the copy write-once
+        /// conditional. Only meaningful for copyS3File() (CopyFileHelper); unused by copyDataToS3File().
+        const std::optional<String> if_none_match;
+        /// If non-null, filled in with the destination object's ETag on a successful copy.
+        String * out_dest_etag;
 
         /// Represents a task uploading a single part.
         /// Keep this struct small because there can be thousands of parts.
@@ -197,6 +208,9 @@ namespace
 
             request.SetMultipartUpload(multipart_upload);
 
+            if (if_none_match.has_value())
+                request.SetIfNoneMatch(*if_none_match);
+
             size_t max_retries = std::max<UInt64>(request_settings[S3RequestSetting::max_unexpected_write_error_retries].value, 1UL);
             for (size_t retries = 1;; ++retries)
             {
@@ -216,6 +230,8 @@ namespace
 
                 if (outcome.IsSuccess())
                 {
+                    if (out_dest_etag)
+                        *out_dest_etag = outcome.GetResult().GetETag();
                     LOG_TRACE(log, "Multipart upload has completed. Bucket: {}, Key: {}, Upload_id: {}, Parts: {}", dest_bucket, dest_key, multipart_upload_id, multipart_tags.size());
                     break;
                 }
@@ -613,7 +629,9 @@ namespace
             const std::optional<ObjectAttributes> & object_metadata_,
             ThreadPoolCallbackRunnerUnsafe<void> schedule_,
             BlobStorageLogWriterPtr blob_storage_log_,
-            std::function<void()> fallback_method_)
+            std::function<void()> fallback_method_,
+            const std::optional<String> & if_none_match_ = {},
+            String * out_dest_etag_ = nullptr)
             : UploadHelper(
                 client_ptr_,
                 dest_bucket_,
@@ -622,7 +640,9 @@ namespace
                 object_metadata_,
                 schedule_,
                 blob_storage_log_,
-                getLogger("copyS3File"))
+                getLogger("copyS3File"),
+                if_none_match_,
+                out_dest_etag_)
             , src_bucket(src_bucket_)
             , src_key(src_key_)
             , offset(src_offset_)
@@ -676,6 +696,9 @@ namespace
                 request.SetMetadataDirective(Aws::S3::Model::MetadataDirective::REPLACE);
             }
 
+            if (if_none_match.has_value())
+                request.SetIfNoneMatch(*if_none_match);
+
             const auto & storage_class_name = request_settings[S3RequestSetting::storage_class_name];
             if (!storage_class_name.value.empty())
                 request.SetStorageClass(Aws::S3::Model::StorageClassMapper::GetStorageClassForName(storage_class_name));
@@ -698,6 +721,8 @@ namespace
                 auto outcome = client_ptr->CopyObject(request);
                 if (outcome.IsSuccess())
                 {
+                    if (out_dest_etag)
+                        *out_dest_etag = outcome.GetResult().GetCopyObjectResultDetails().GetETag();
                     LOG_TRACE(
                         log,
                         "Single operation copy has completed. Bucket: {}, Key: {}, Object size: {}",
@@ -855,7 +880,9 @@ void copyS3File(
     BlobStorageLogWriterPtr blob_storage_log,
     ThreadPoolCallbackRunnerUnsafe<void> schedule,
     const CreateReadBuffer& fallback_file_reader,
-    const std::optional<ObjectAttributes> & object_metadata)
+    const std::optional<ObjectAttributes> & object_metadata,
+    std::optional<String> if_none_match,
+    String * out_dest_etag)
 {
     if (!dest_s3_client)
         dest_s3_client = src_s3_client;
@@ -895,7 +922,9 @@ void copyS3File(
         object_metadata,
         schedule,
         blob_storage_log,
-        std::move(fallback_method)};
+        std::move(fallback_method),
+        if_none_match,
+        out_dest_etag};
     helper.performCopy();
 }
 
