@@ -74,12 +74,22 @@ the user rejected. Therefore:
 
 Replace the single fail-closed `blob_hash_algo` with (consulted 2026-07-11, §12):
 
+- **Admission of a NEW algo is EXPLICIT OPT-IN; the default stays fail-closed (user decision).**
+  A reopen whose configured `<blob_hash>` is NOT in the pool's `algos_used` FAILS with
+  `BAD_ARGUMENTS` exactly like Phase 2 today ("pool has {ch128}; config requests sha256; set
+  `<blob_hash_allow_new>1</blob_hash_allow_new>` to admit a new algo into this pool") — a changed
+  config alone must never silently turn a pool mixed (config drift / copy-paste protection; admission
+  is irreversible: permanent `algos_used` entry, per-subset dedup, reader-generation bump). With the
+  flag set, the algo is admitted via the CAS-union below; once ADMITTED, subsequent opens with that
+  algo need no flag (membership, not the flag, is the steady-state check). The flag gates admission
+  only — it is not a persistent mode.
 - **The write algo is NODE-LOCAL config, NOT durable pool state.** Two live nodes may intentionally
-  write with different algos, so no single truthful pool-wide value exists; persisting one would be
-  misleading metadata + CAS churn. `PoolConfig`/`Store` carry it; `PoolMeta` does not.
+  write with different (already-admitted) algos, so no single truthful pool-wide value exists;
+  persisting one would be misleading metadata + CAS churn. `PoolConfig`/`Store` carry it; `PoolMeta`
+  does not.
 - `algos_used` (repeated u8, append-only, canonically sorted): every algo ever ADMITTED to the pool.
   **Register-before-first-write**: a node MUST durably CAS-union its configured algo into `algos_used`
-  BEFORE writing any blob/manifest/ref that names it. CAS-union loop: read+token -> already present?
+  (permitted by the flag above) BEFORE writing any blob/manifest/ref that names it. CAS-union loop: read+token -> already present?
   done -> insert -> CAS -> on conflict re-read and retry (recompute from the fresh value; never encode
   a stale whole `PoolMeta`). Union-only => no ABA. The `createOrValidate` creation-race loser UNIONS
   its algo instead of today's fail-close. First registration of a schema-3-bearing algo also raises
@@ -91,7 +101,10 @@ Replace the single fail-closed `blob_hash_algo` with (consulted 2026-07-11, §12
   a later registration), and apply at the CENTRAL manifest-read boundary, not only in GC (else plain
   reads accept what GC rejects). Unknown-to-the-build algo id stays `NOT_IMPLEMENTED`.
 
-`checkBlobHashAlgoMatches` is deleted; its test flips to assert the additive-switch behavior. The
+`checkBlobHashAlgoMatches` is not deleted but RELAXED into the admission check: config algo
+member of `algos_used` -> OK; not a member + flag set -> CAS-union (admit); not a member + no flag ->
+`BAD_ARGUMENTS` (today's behavior, message now naming the flag). Its Phase 2 test keeps asserting the
+default fail-close; a new test asserts flag-gated admission. The
 `algos_used` membership check is kept deliberately: decode answers "does this BUILD understand algo 3?",
 the registry answers "was algo 3 ADMITTED to this POOL?" — namespace/integrity admission against a
 recognized-but-never-enabled or forged segment.
@@ -163,9 +176,10 @@ model), not by reopening the settlement proof.
 
 ## 9. Testing gates {#testing}
 
-1. Additive switch: create pool at `ch128`, insert; reopen at `sha256`, insert → both subsets
-   readable; `algos_used = {ch128, sha256}`; old data intact (e2e, mirrors the 2026-07-11 fail-close
-   e2e but asserting SUCCESS).
+1. Additive switch is flag-gated: create pool at `ch128`, insert; reopen at `sha256` WITHOUT the
+   flag → `BAD_ARGUMENTS`, pool untouched (today's e2e stays green); reopen WITH
+   `blob_hash_allow_new=1` → admitted, insert → both subsets readable; `algos_used={ch128, sha256}`;
+   old data intact; third open at `sha256` WITHOUT the flag → OK (already admitted).
 2. Mixed manifest: mutation carry-forward across the switch → one manifest with entries of both
    algos; round-trip; fold settles both partitions; `dangling==0` after DROP of either or both.
 3. GC completeness (crux): forced GC on a 2-algo pool reclaims orphans of BOTH algos to
