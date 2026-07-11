@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <optional>
+#include <set>
 #include <vector>
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.h>
@@ -34,6 +35,32 @@ std::optional<RetiredEntry> currentEntryFor(Backend & backend, const Layout & la
             return e;
     return std::nullopt;
 }
+
+/// Decorator reproducing the rustfs quirk (observed 2026-07-11): a conditional exact-token delete against
+/// an object that is ALREADY absent can answer HTTP 412 (precondition failed), which this backend layer
+/// maps to `TokenMismatch` -- not the 404-shaped `NotFound` an in-memory backend naturally returns. For
+/// keys marked via `quirkOnAbsent`, `deleteExact` forces exactly that answer whenever the underlying
+/// object is gone, letting a test drive the GC redelete site through the disambiguation path
+/// backend-agnostically (without guessing at real rustfs HTTP mappings).
+class TokenMismatchOnAbsentBackend : public InMemoryBackend
+{
+public:
+    DeleteOutcome deleteExact(const String & key, const Token & token) override
+    {
+        if (quirk_keys.count(key) && !InMemoryBackend::head(key).exists)
+        {
+            DeleteOutcome d;
+            d.kind = DeleteOutcome::Kind::TokenMismatch;
+            return d;
+        }
+        return InMemoryBackend::deleteExact(key, token);
+    }
+
+    void quirkOnAbsent(const String & key) { quirk_keys.insert(key); }
+
+private:
+    std::set<String> quirk_keys;
+};
 }
 
 /// The owner-removed manifest body is deleted only after a full round (its decrement is sealed — #11).
@@ -700,4 +727,69 @@ TEST(CasGcAckFloor, ResumeAfterCrashBetweenRetiredPutAndStateCas)
     const uint64_t round_after = decodeGcState(backend->get(store->layout().gcStateKey())->bytes).round;
     EXPECT_GT(round_after, round_before);   // the round completed (no wedge)
     EXPECT_FALSE(currentEntryFor(*backend, store->layout(), blob).has_value());
+}
+
+/// Backend-agnostic regression for the rustfs 412-on-absent quirk: a conditional exact-token delete
+/// against an object that is ALREADY absent answers `TokenMismatch`, not `NotFound`, on this backend
+/// (`TokenMismatchOnAbsentBackend` reproduces it deterministically). The redelete site must disambiguate
+/// via a follow-up HEAD: the object is truly gone, so the outcome must settle as Absent (never Replaced)
+/// and the `.meta` cleanup (gated on Deleted/NotFound) must still run.
+TEST(CasGcAckFloor, TokenMismatchOnAbsentBlobSettlesAsAbsentAndDropsMeta)
+{
+    auto backend = std::make_shared<TokenMismatchOnAbsentBackend>();
+    auto store = openStoreForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r = ref("srv-a:1", 1, 0xAA);
+    const UInt128 blob = DB::UInt128(1);
+    const BlobRef blob_id{BlobHashAlgo::CityHash128, BlobDigest::fromU128(blob)};
+    writeBlobBody(*backend, store->layout(), blob);
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", blob)});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+
+    Gc gc(store, kGc);
+    gc.runRegularRound();
+    store->renewWatermarkOnce();
+    dropRefTransition(*backend, store->layout(), ns, "tbl", r);
+    gc.runRegularRound();   // condemn
+    store->renewWatermarkOnce();
+
+    // Drive rounds until the entry is delete_pending, capturing its exact condemn-time token.
+    RetiredEntry pending_entry;
+    bool pending = false;
+    for (int i = 0; i < 6 && !pending; ++i)
+    {
+        gc.runRegularRound();
+        store->renewWatermarkOnce();
+        const auto e = currentEntryFor(*backend, store->layout(), blob);
+        if (e && e->delete_pending)
+        {
+            pending = true;
+            pending_entry = *e;
+        }
+    }
+    ASSERT_TRUE(pending);
+    {
+        const auto lm = loadMetaForTest(*backend, store->layout(), blob);
+        ASSERT_TRUE(lm.has_value()) << "the blob must still carry its Condemned freshness meta pre-delete";
+        ASSERT_EQ(lm->meta.state, MetaState::Condemned);
+    }
+
+    // The object is genuinely gone already (as if a prior crashed pass landed the delete); confirm that,
+    // then arm the quirk so the NEXT conditional delete against this now-absent key answers TokenMismatch
+    // instead of NotFound (the rustfs 412-on-absent behavior).
+    const String blob_key = store->layout().blobKey(blob_id);
+    ASSERT_EQ(backend->deleteExact(blob_key, pending_entry.token).kind, DeleteOutcome::Kind::Deleted);
+    ASSERT_FALSE(backend->head(blob_key).exists);
+    backend->quirkOnAbsent(blob_key);
+
+    // The deleting pass replays deleteExact(entry.token): the backend answers TokenMismatch (quirk), but
+    // the follow-up HEAD shows the object absent, so the fix disambiguates the outcome to Absent and still
+    // runs the `.meta` cleanup.
+    const RoundReport rep = gc.runRegularRound();
+    store->renewWatermarkOnce();
+    EXPECT_EQ(rep.absent, 1u) << "the 412-on-absent quirk must settle as Absent, not Replaced";
+    EXPECT_EQ(rep.replaced, 0u);
+    EXPECT_FALSE(currentEntryFor(*backend, store->layout(), blob).has_value());
+    EXPECT_FALSE(loadMetaForTest(*backend, store->layout(), blob).has_value())
+        << ".meta cleanup (gated on Deleted/NotFound) must still run on the disambiguated Absent outcome";
 }

@@ -349,11 +349,29 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired)
         RetiredMergeResult & merge = folded.retired_merge[shard];
         for (const RetiredEntry & entry : merge.redelete)
         {
-            const DeleteOutcome del = backend.deleteExact(layout.blobKey(entry.ref), entry.token);
+            DeleteOutcome del = backend.deleteExact(layout.blobKey(entry.ref), entry.token);
             if (del.created_delete_marker)
                 throw Exception(ErrorCodes::LOGICAL_ERROR,
                     "CAS gc: delete of blob {} created a delete marker — versioning is enabled "
                     "on the pool (mis-provisioned; the capability probe must reject this)", blobIdOf(entry.ref));
+
+            /// Quirk (rustfs, observed 2026-07-11): a conditional delete (`If-Match`) against an ABSENT
+            /// object can answer HTTP 412 (precondition failed) instead of 404 — we map that 412 to
+            /// TokenMismatch. Backend-agnostically disambiguate here: a genuine TokenMismatch means the
+            /// object exists under a different (fresh) token; if a follow-up HEAD shows the object is
+            /// gone, the "mismatch" was actually the object being absent — treat it as Absent (NotFound)
+            /// end-to-end so the `.meta` cleanup below still runs.
+            bool absent_on_mismatch_quirk = false;
+            if (del.kind == DeleteOutcome::Kind::TokenMismatch)
+            {
+                const HeadResult head = backend.head(layout.blobKey(entry.ref));
+                if (!head.exists)
+                {
+                    del.kind = DeleteOutcome::Kind::NotFound;
+                    absent_on_mismatch_quirk = true;
+                }
+            }
+
             OutcomeEntry outcome{.kind = entry.kind, .ref = entry.ref, .token = entry.token,
                                  .outcome = del.kind == DeleteOutcome::Kind::Deleted ? OutcomeKind::Deleted
                                           : del.kind == DeleteOutcome::Kind::NotFound ? OutcomeKind::Absent
@@ -371,7 +389,10 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired)
                 e.round = new_round;
                 e.gen = generation;
                 e.outcome = del_outcome;
-                e.reason = "delete_pending published by a prior pass; exact-token delete (pre-CAS)";
+                e.reason = absent_on_mismatch_quirk
+                    ? "delete_pending published by a prior pass; exact-token delete (pre-CAS) "
+                      "(delete returned token-mismatch but the object is absent — backend 412-on-absent quirk)"
+                    : "delete_pending published by a prior pass; exact-token delete (pre-CAS)";
                 e.detail = {{"condemn_round", std::to_string(entry.condemn_round)},
                             {"key", layout.blobKey(entry.ref)}};
             });
