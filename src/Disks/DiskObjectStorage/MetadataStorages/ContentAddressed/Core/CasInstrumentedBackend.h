@@ -134,6 +134,22 @@ public:
 
     bool supportsListTokens() const override { return inner->supportsListTokens(); }
 
+    PutResult promoteStaged(const String & staging_key, const String & blob_key) override
+    {
+        PutResult result = inner->promoteStaged(staging_key, blob_key);
+        /// A write-once server-side copy is a create attempt on the BLOB key: Done ⇒ Put, 412 ⇒ PutDedup.
+        incrementCasEvent(classifyCasNs(blob_key), result.outcome == PutOutcome::Done ? CasOp::Put : CasOp::PutDedup);
+        return result;
+    }
+
+    Token resurrectStaged(const String & staging_key, const String & blob_key) override
+    {
+        Token token = inner->resurrectStaged(staging_key, blob_key);
+        /// An unconditional resurrect copy overwrites the (condemned) BLOB key.
+        incrementCasEvent(classifyCasNs(blob_key), CasOp::Overwrite);
+        return token;
+    }
+
 private:
     BackendPtr inner;
 };

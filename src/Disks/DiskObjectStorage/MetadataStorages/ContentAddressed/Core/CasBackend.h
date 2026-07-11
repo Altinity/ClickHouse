@@ -2,12 +2,18 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasToken.h>
 #include <IO/ReadBuffer.h>
 #include <IO/WriteBuffer.h>
+#include <Common/Exception.h>
 #include <base/types.h>
 #include <map>
 #include <memory>
 #include <optional>
 #include <string>
 #include <vector>
+
+namespace DB::ErrorCodes
+{
+    extern const int NOT_IMPLEMENTED;
+}
 
 namespace DB::Cas
 {
@@ -189,6 +195,36 @@ public:
     /// DELETE would archive a noncurrent generation instead of reclaiming storage, so GC
     /// "reclaim" would silently stop reclaiming.
     virtual void checkStorePreconditions() {}
+
+    /// WRITE-ONCE conditional SERVER-SIDE COPY of `staging_key` to `blob_key` (`If-None-Match:*` on the
+    /// destination) — the S3-native staging promote's create primitive (spec 2026-07-11-cas-s3-native-staging
+    /// §8). `Done` + `token` = the destination ETag (the new incarnation token, exactly the role the
+    /// streaming `putIfAbsentStream` PUT's ETag plays) when this call created `blob_key`;
+    /// `PreconditionFailed` when `blob_key` already existed — NOTHING was changed (same write-once
+    /// contract as `putIfAbsentStream`). No LIVE object is ever overwritten by this call.
+    ///
+    /// DEFAULT: fail closed (`NOT_IMPLEMENTED`) — a backend without a native, enforced conditional
+    /// server-side copy is NEVER selected for S3 staging (the mount-time probe fell back to Local
+    /// staging + `putIfAbsentStream`), so this must throw rather than silently degrade to an
+    /// unconditional overwrite (the fail-open path CLAUDE.md forbids).
+    virtual PutResult promoteStaged(const String & /*staging_key*/, const String & /*blob_key*/)
+    {
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+            "Cas::Backend::promoteStaged (write-once server-side copy) is not implemented for this backend");
+    }
+
+    /// UNCONDITIONAL server-side copy of `staging_key` over `blob_key`, minting a fresh incarnation
+    /// token — the sanctioned condemned-RESURRECT overwrite (spec §5/§9). The resurrect source is
+    /// ALWAYS the writer's OWN staging object, NEVER a read/copy of the condemned `blob_key`
+    /// (`feedback_ca_resurrect_invariant`). The caller MUST have observed the current incarnation as
+    /// `Condemned` (per-hash meta point-read) before calling this, so it overwrites a condemned body,
+    /// never a live blob (INV: never overwrite a live blob). Returns the fresh incarnation token.
+    /// DEFAULT: fail closed (`NOT_IMPLEMENTED`), same rationale as `promoteStaged`.
+    virtual Token resurrectStaged(const String & /*staging_key*/, const String & /*blob_key*/)
+    {
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+            "Cas::Backend::resurrectStaged (server-side resurrect copy) is not implemented for this backend");
+    }
 };
 
 using BackendPtr = std::shared_ptr<Backend>;

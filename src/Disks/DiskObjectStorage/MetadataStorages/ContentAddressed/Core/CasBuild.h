@@ -17,6 +17,14 @@ struct BlobSource
 {
     uint64_t size = 0;
     std::function<void(WriteBuffer &)> write_payload;   /// must write exactly `size` bytes
+    /// S3-native staging promote (spec 2026-07-11-cas-s3-native-staging §5/§8): when set, the blob's
+    /// bytes already live in an S3 staging object with THIS key, and `putBlob` promotes it by a
+    /// WRITE-ONCE conditional SERVER-SIDE COPY (`Backend::promoteStaged`) instead of streaming
+    /// `write_payload` — and resurrects a condemned incarnation by an unconditional server-side copy
+    /// from the SAME staging object (`Backend::resurrectStaged`), never a read of the condemned blob
+    /// (`feedback_ca_resurrect_invariant`). Unset (the default, `StagingBackend::Local`) ⇒ the local
+    /// streaming path is byte-for-byte unchanged and `write_payload` is the source.
+    std::optional<String> server_side_copy_from;
     static BlobSource fromString(String bytes);         /// convenience for small content/tests
 };
 

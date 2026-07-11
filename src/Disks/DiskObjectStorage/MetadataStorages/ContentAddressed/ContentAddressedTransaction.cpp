@@ -255,18 +255,30 @@ bool ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
     {
         if (!referenced_hashes.count(pb.hash))
             continue;   /// B189: orphaned pending blob (entry removed by unlinkFile/replaceFile) — skip
-        /// Task 5 (plan docs/superpowers/plans/2026-07-11-cas-s3-native-staging.md) wires the S3-mode
-        /// promote (a conditional server-side copy from `pb.staging_key`, condemn/resurrect gate
-        /// preserved) — this loop, as of Task 4, only handles `StagingBackend::Local` pending blobs
-        /// (the sole kind any test stages end-to-end so far: S3 mode is off by default).
+        /// Task 5 (plan docs/superpowers/plans/2026-07-11-cas-s3-native-staging.md): each pending blob
+        /// is promoted through the SAME condemn/resurrect gate in `Build::putBlob`. Only the upload
+        /// primitive differs by staging backend:
+        ///   - `StagingBackend::Local`: `write_payload` re-reads the local staged temp file and streams
+        ///     it into a write-once `putIfAbsentStream` create (byte-for-byte the pre-Task-5 path).
+        ///   - `StagingBackend::S3`: the bytes already live in an S3 staging object (`pb.staging_key`);
+        ///     `server_side_copy_from` drives a WRITE-ONCE conditional SERVER-SIDE COPY (and an
+        ///     unconditional resurrect copy FROM the staging object for a condemned incarnation). No
+        ///     local read-back — `write_payload` is left unset.
         Cas::BlobSource source;
         source.size = pb.size;
-        const std::string staging_key = pb.staging_key;
-        source.write_payload = [staging_key](WriteBuffer & out)
+        if (pb.backend == StagingBackend::S3)
         {
-            ReadBufferFromFile in(staging_key);
-            copyData(in, out);
-        };
+            source.server_side_copy_from = pb.staging_key;
+        }
+        else
+        {
+            const std::string staging_key = pb.staging_key;
+            source.write_payload = [staging_key](WriteBuffer & out)
+            {
+                ReadBufferFromFile in(staging_key);
+                copyData(in, out);
+            };
+        }
         st.build->putBlob(Cas::BlobId(Cas::u128ToHex(pb.hash)), std::move(source));
     }
 

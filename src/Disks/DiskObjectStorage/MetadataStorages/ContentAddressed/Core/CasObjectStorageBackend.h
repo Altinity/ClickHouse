@@ -63,6 +63,14 @@ public:
     DeleteOutcome deleteExact(const String & key, const Token & token) override;
     ListPage list(const String & prefix, const String & cursor, size_t limit) override;
 
+    /// S3-native staging promote seams (spec 2026-07-11-cas-s3-native-staging §8). Native mode only —
+    /// EmulatedSingleProcess (LocalObjectStorage) has no server-side conditional copy and is never
+    /// selected for S3 staging, so both throw `NOT_IMPLEMENTED` there (fail closed).
+    /// `promoteStaged`: WRITE-ONCE conditional copy via `IObjectStorage::copyObjectConditional`.
+    /// `resurrectStaged`: UNCONDITIONAL copy via `IObjectStorage::copyObject` + a fresh HEAD for the ETag.
+    PutResult promoteStaged(const String & staging_key, const String & blob_key) override;
+    Token resurrectStaged(const String & staging_key, const String & blob_key) override;
+
     /// Store-level precondition: on a Native, generation-dialect (GCS) backend, fail closed if the
     /// bucket has object versioning enabled — see Backend::checkStorePreconditions.
     void checkStorePreconditions() override;

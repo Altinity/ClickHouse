@@ -1,8 +1,17 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
 #include <IO/ReadBufferFromString.h>
 #include <IO/WriteBufferFromString.h>
+#include <Common/Exception.h>
 #include <base/defines.h>
 #include <algorithm>
+
+namespace DB
+{
+namespace ErrorCodes
+{
+    extern const int FILE_DOESNT_EXIST;
+}
+}
 
 namespace DB::Cas
 {
@@ -261,6 +270,46 @@ DeleteOutcome InMemoryBackend::deleteExact(const String & key, const Token & tok
     }
 
     return applyDelete(key, token);
+}
+
+PutResult InMemoryBackend::promoteStaged(const String & staging_key, const String & blob_key)
+{
+    std::lock_guard lock(mutex_);
+    auto src = store_.find(staging_key);
+    if (src == store_.end())
+        throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
+            "InMemoryBackend::promoteStaged: staging object {} is absent", staging_key);
+
+    /// Write-once: a present destination is the "lost the race" signal, not an overwrite.
+    if (store_.count(blob_key))
+        return {PutOutcome::PreconditionFailed, {}};
+
+    /// Server-side copy: the destination bytes ARE the staging bytes; a fresh monotone token stands in
+    /// for the destination ETag the real backend returns from the conditional copy.
+    const Token t = mintToken();
+    Object obj;
+    obj.bytes = src->second.bytes;
+    obj.token = t;
+    store_[blob_key] = std::move(obj);
+    return {PutOutcome::Done, t};
+}
+
+Token InMemoryBackend::resurrectStaged(const String & staging_key, const String & blob_key)
+{
+    std::lock_guard lock(mutex_);
+    auto src = store_.find(staging_key);
+    if (src == store_.end())
+        throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
+            "InMemoryBackend::resurrectStaged: staging object {} is absent", staging_key);
+
+    /// Unconditional overwrite FROM the staging object — never reads `blob_key`. `src->second.bytes` is
+    /// copied before the map write; std::map insert/assign never invalidates other iterators/references.
+    const Token t = mintToken();
+    Object obj;
+    obj.bytes = src->second.bytes;
+    obj.token = t;
+    store_[blob_key] = std::move(obj);
+    return t;
 }
 
 ListPage InMemoryBackend::list(const String & prefix, const String & cursor, size_t limit)

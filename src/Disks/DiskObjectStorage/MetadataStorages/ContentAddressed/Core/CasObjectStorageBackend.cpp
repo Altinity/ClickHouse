@@ -717,6 +717,44 @@ DeleteOutcome ObjectStorageBackend::deleteExact(const String & key, const Token 
     return d;
 }
 
+PutResult ObjectStorageBackend::promoteStaged(const String & staging_key, const String & blob_key)
+{
+    if (mode != Mode::Native)
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+            "ObjectStorageBackend::promoteStaged is Native-mode only (EmulatedSingleProcess has no "
+            "server-side conditional copy and is never selected for S3 staging)");
+
+    /// WRITE-ONCE conditional server-side copy staging -> blob (`If-None-Match:*` on the destination),
+    /// via `IObjectStorage::copyObjectConditional`. `created` ⇒ the destination ETag is the new
+    /// incarnation token; `!created` ⇒ the destination already existed = the "lost the race" 412 signal.
+    const ConditionalCopyResult res = object_storage->copyObjectConditional(
+        StoredObject(staging_key), StoredObject(blob_key), getReadSettings(), WriteSettings{});
+    if (!res.created)
+        return {PutOutcome::PreconditionFailed, {}};
+    return {PutOutcome::Done, Token{res.dest_etag, native_token_type}};
+}
+
+Token ObjectStorageBackend::resurrectStaged(const String & staging_key, const String & blob_key)
+{
+    if (mode != Mode::Native)
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+            "ObjectStorageBackend::resurrectStaged is Native-mode only (EmulatedSingleProcess has no "
+            "server-side copy and is never selected for S3 staging)");
+
+    /// UNCONDITIONAL server-side copy staging -> blob — the sanctioned condemned-resurrect overwrite
+    /// (spec §5/§9). The source is ALWAYS the writer's own staging object, NEVER a read of the
+    /// condemned `blob_key` (`feedback_ca_resurrect_invariant`). `copyObject` does not surface the
+    /// destination ETag, so HEAD the fresh incarnation to learn its token.
+    object_storage->copyObject(
+        StoredObject(staging_key), StoredObject(blob_key), getReadSettings(), WriteSettings{});
+    const auto hr = nativeHead(blob_key);
+    if (!hr)
+        throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
+            "ObjectStorageBackend::resurrectStaged: blob {} is absent immediately after the resurrect "
+            "copy — failing closed", blob_key);
+    return hr->token;
+}
+
 ListPage ObjectStorageBackend::list(const String & prefix, const String & cursor, size_t limit)
 {
     /// Use the lazy object-storage iterator instead of `listObjects(..., max_keys=0)`: the latter

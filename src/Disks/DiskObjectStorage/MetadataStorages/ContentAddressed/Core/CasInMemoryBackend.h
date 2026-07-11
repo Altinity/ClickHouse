@@ -42,6 +42,15 @@ public:
     DeleteOutcome deleteExact(const String & key, const Token & token) override;
     ListPage list(const String & prefix, const String & cursor, size_t limit) override;
 
+    /// Same-store server-side copy stubs (the emulated backend models conditional create, so it can
+    /// honor the write-once / resurrect contracts a real S3 backend provides — enough for the S3
+    /// staging promote gtests). `promoteStaged` copies `staging_key`'s bytes to `blob_key` ONLY if
+    /// `blob_key` is absent (`PreconditionFailed` otherwise), minting a fresh token = the "dest ETag".
+    /// `resurrectStaged` copies `staging_key`'s bytes over `blob_key` unconditionally, minting a fresh
+    /// token; it NEVER reads `blob_key` (INV `feedback_ca_resurrect_invariant`).
+    PutResult promoteStaged(const String & staging_key, const String & blob_key) override;
+    Token resurrectStaged(const String & staging_key, const String & blob_key) override;
+
     // ---- Fault-injection controls ----
 
     /// When true, deleteExact enqueues deletes rather than applying them immediately.

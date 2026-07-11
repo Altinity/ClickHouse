@@ -2,7 +2,9 @@
 #include "cas_test_helpers.h"
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedWriteBuffers.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasProbe.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
 
 #include <Poco/AutoPtr.h>
@@ -145,6 +147,84 @@ private:
     bool cancelled = false;
     bool did_finalize = false;
 };
+
+/// Task 5 of the S3-native staging plan: the promote path (`Build::putBlob` with
+/// `BlobSource::server_side_copy_from` set) drives a WRITE-ONCE conditional server-side copy through
+/// the SAME condemn/resurrect gate the streaming path uses. This backend is a `DB::Cas::InMemoryBackend`
+/// (which models conditional create, so it honors both the write-once `promoteStaged` and the
+/// unconditional `resurrectStaged` contracts) that RECORDS every server-side-copy call so a test can
+/// assert the copy source/destination and the conditional-vs-unconditional distinction — in particular
+/// that a condemned-blob RESURRECT copies FROM the staging key, NEVER from the condemned blob key
+/// (`feedback_ca_resurrect_invariant`), and that a live blob is NEVER unconditionally overwritten.
+class RecordingStagingBackend : public DB::Cas::InMemoryBackend
+{
+public:
+    struct CopyCall
+    {
+        std::string from;
+        std::string to;
+        bool conditional;   /// true = promoteStaged (write-once); false = resurrectStaged (unconditional)
+    };
+
+    std::vector<CopyCall> copy_calls;
+
+    DB::Cas::PutResult promoteStaged(const String & staging_key, const String & blob_key) override
+    {
+        copy_calls.push_back({staging_key, blob_key, /*conditional=*/true});
+        return DB::Cas::InMemoryBackend::promoteStaged(staging_key, blob_key);
+    }
+
+    DB::Cas::Token resurrectStaged(const String & staging_key, const String & blob_key) override
+    {
+        copy_calls.push_back({staging_key, blob_key, /*conditional=*/false});
+        return DB::Cas::InMemoryBackend::resurrectStaged(staging_key, blob_key);
+    }
+
+    /// Every unconditional (resurrect) copy this backend saw — empty iff no live/condemned body was ever
+    /// overwritten. `assertNeverOverwritesLiveBlob` reads this to enforce invariant (d).
+    size_t unconditionalCopyCount() const
+    {
+        size_t n = 0;
+        for (const CopyCall & c : copy_calls)
+            n += c.conditional ? 0 : 1;
+        return n;
+    }
+};
+
+DB::Cas::StorePtr openStagingStore(const std::shared_ptr<RecordingStagingBackend> & b)
+{
+    return DB::Cas::Store::open(b, DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+}
+
+/// A build whose owning manifest namespace / final ref name are `ns`/`ref` (mirrors gtest_cas_build's
+/// `startBuildFor`: promote/stageManifest derive the namespace by splitting `intended_ref` on the LAST '/').
+DB::Cas::BuildPtr startStagingBuild(const DB::Cas::StorePtr & s, const DB::Cas::RootNamespace & ns, const String & ref)
+{
+    DB::Cas::BuildInfo info;
+    info.intended_ref = ns.string() + "/" + ref;
+    return s->startBuild(info);
+}
+
+/// Stage a one-blob manifest and precommit it (so the EDGE-BEFORE-OBSERVE `chassert(precommitted)` in
+/// `observeAndAdmit` holds), returning the build ready for a `putBlob` promote of `hash`.
+DB::Cas::BuildPtr precommittedBuildFor(
+    const DB::Cas::StorePtr & s, const DB::Cas::RootNamespace & ns, const String & ref,
+    const DB::UInt128 & hash, uint64_t blob_size)
+{
+    DB::Cas::BuildPtr build = startStagingBuild(s, ns, ref);
+    const DB::Cas::ManifestId id = build->stageManifest({DB::Cas::tests::blobEntryFor("col.bin", hash, blob_size)});
+    build->precommitAdd(ns, ref, id);
+    return build;
+}
+
+/// A `BlobSource` that promotes via the S3 server-side-copy path (no local `write_payload`).
+DB::Cas::BlobSource serverSideCopySource(const std::string & staging_key, uint64_t size)
+{
+    DB::Cas::BlobSource source;
+    source.size = size;
+    source.server_side_copy_from = staging_key;
+    return source;
+}
 
 }
 
@@ -338,4 +418,142 @@ TEST(CasS3Staging, ContentWriteBufferS3ModeCancelCancelsSinkAndSkipsFinalize)
     /// must stay a no-op: still no on_finalized call, and no attempt to fs::remove a remote key.
     buf.reset();
     EXPECT_FALSE(on_finalized_called);
+}
+
+/// Task 5 of the S3-native staging plan: the promote path. `Build::putBlob` with
+/// `BlobSource::server_side_copy_from` set drives a WRITE-ONCE conditional SERVER-SIDE COPY through the
+/// SAME condemn/resurrect gate as the streaming path (spec 2026-07-11-cas-s3-native-staging §5/§9). The
+/// four cases below use `RecordingStagingBackend` (an emulated backend that models conditional create
+/// and records every server-side-copy call). Live 412-vs-created enforcement against a real backend is
+/// Task 7 (with_rustfs integration test).
+
+/// (a) Fresh blob key ⇒ the write-once conditional copy CREATES it; the tokened Blob dep is recorded at
+/// the copy's destination token (the new incarnation token). No unconditional copy is ever issued.
+TEST(CasS3Staging, PromoteViaServerSideCopyCreatesFreshBlobTokenedDep)
+{
+    auto backend = std::make_shared<RecordingStagingBackend>();
+    auto store = openStagingStore(backend);
+    const DB::Cas::RootNamespace ns{"srv1/nsA"};
+    const std::string ref = "part_a";
+
+    const DB::UInt128 hash = DB::Cas::tests::u128Of("payload-A");
+    const DB::Cas::BlobId blob_id{DB::Cas::u128ToHex(hash)};
+    const std::string blob_key = store->layout().blobKey(blob_id);
+    const std::string staging_key = "p/staging/mount1/aaa.tmp";
+    const std::string payload(300, 'a');
+    backend->putIfAbsent(staging_key, payload);
+
+    auto build = precommittedBuildFor(store, ns, ref, hash, payload.size());
+    const DB::Cas::BlobRef bref = build->putBlob(blob_id, serverSideCopySource(staging_key, payload.size()));
+
+    /// EXACTLY one CONDITIONAL server-side copy staging->blobKey; zero unconditional copies.
+    ASSERT_EQ(backend->copy_calls.size(), 1u);
+    EXPECT_TRUE(backend->copy_calls[0].conditional);
+    EXPECT_EQ(backend->copy_calls[0].from, staging_key);
+    EXPECT_EQ(backend->copy_calls[0].to, blob_key);
+    EXPECT_EQ(backend->unconditionalCopyCount(), 0u);
+
+    /// A TOKENED Blob dep was recorded (created path); the created blob carries the copy's dest token.
+    EXPECT_TRUE(build->depIsTokened(hash));
+    const DB::Cas::HeadResult hr = backend->head(blob_key);
+    ASSERT_TRUE(hr.exists);
+    EXPECT_FALSE(hr.token.empty());
+    EXPECT_EQ(bref.size, payload.size());
+
+    /// The promoted blob body IS the staging bytes (server-side copy moved them verbatim).
+    const auto got = backend->get(blob_key);
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(got->bytes, payload);
+}
+
+/// (b) Blob key already exists and is CLEAN ⇒ the conditional copy 412s and the writer ADOPTS the
+/// existing incarnation. No copy of any kind lands over the live blob. Also covers invariant (d): NO
+/// unconditional copy is ever issued over a live (non-condemned) blob.
+TEST(CasS3Staging, PromoteOverExistingCleanBlobAdoptsAndNeverOverwrites)
+{
+    auto backend = std::make_shared<RecordingStagingBackend>();
+    auto store = openStagingStore(backend);
+    const DB::Cas::RootNamespace ns{"srv1/nsB"};
+    const std::string ref = "part_b";
+
+    const DB::UInt128 hash = DB::Cas::tests::u128Of("payload-B");
+    const DB::Cas::BlobId blob_id{DB::Cas::u128ToHex(hash)};
+    const std::string blob_key = store->layout().blobKey(blob_id);
+    const std::string staging_key = "p/staging/mount1/bbb.tmp";
+    backend->putIfAbsent(staging_key, std::string(300, 'b'));
+
+    /// A pre-existing, well-formed, CLEAN blob (envelope + payload) already at the content key.
+    DB::Cas::tests::writeBlobBody(*backend, store->layout(), hash);
+    DB::Cas::tests::writeMetaClean(*backend, store->layout(), hash, /*size=*/1);
+    const DB::Cas::HeadResult before = backend->head(blob_key);
+    ASSERT_TRUE(before.exists);
+
+    auto build = precommittedBuildFor(store, ns, ref, hash, 300);
+    build->putBlob(blob_id, serverSideCopySource(staging_key, 300));
+
+    /// Exactly one CONDITIONAL promote (which 412s) — then ADOPT. Invariant (d): zero unconditional copies.
+    ASSERT_EQ(backend->copy_calls.size(), 1u);
+    EXPECT_TRUE(backend->copy_calls[0].conditional);
+    EXPECT_EQ(backend->unconditionalCopyCount(), 0u);
+
+    /// The existing incarnation is untouched: same token, same bytes.
+    const DB::Cas::HeadResult after = backend->head(blob_key);
+    EXPECT_EQ(after.token, before.token);
+
+    /// The adopt recorded a TOKENED dep at the observed (existing) incarnation's token.
+    EXPECT_TRUE(build->depIsTokened(hash));
+}
+
+/// (c) Blob key exists but is CONDEMNED ⇒ the writer RESURRECTS by an UNCONDITIONAL server-side copy
+/// FROM the staging object — NEVER a read/copy of the condemned blob key
+/// (`feedback_ca_resurrect_invariant`) — and the incarnation token is refreshed.
+TEST(CasS3Staging, PromoteOverCondemnedBlobResurrectsFromStagingNotBlobKey)
+{
+    auto backend = std::make_shared<RecordingStagingBackend>();
+    auto store = openStagingStore(backend);
+    const DB::Cas::RootNamespace ns{"srv1/nsC"};
+    const std::string ref = "part_c";
+
+    const DB::UInt128 hash = DB::Cas::tests::u128Of("payload-C");
+    const DB::Cas::BlobId blob_id{DB::Cas::u128ToHex(hash)};
+    const std::string blob_key = store->layout().blobKey(blob_id);
+    const std::string staging_key = "p/staging/mount1/ccc.tmp";
+    const std::string payload(300, 'c');
+    backend->putIfAbsent(staging_key, payload);
+
+    /// A pre-existing blob whose meta is CONDEMNED (pending GC delete).
+    DB::Cas::tests::writeBlobBody(*backend, store->layout(), hash);
+    DB::Cas::tests::writeMetaClean(*backend, store->layout(), hash, /*size=*/1);
+    DB::Cas::tests::condemnMeta(*backend, store->layout(), hash, /*condemn_round=*/5);
+    const DB::Cas::HeadResult before = backend->head(blob_key);
+    ASSERT_TRUE(before.exists);
+
+    auto build = precommittedBuildFor(store, ns, ref, hash, payload.size());
+    build->putBlob(blob_id, serverSideCopySource(staging_key, payload.size()));
+
+    /// A CONDITIONAL promote (412 — blob present) FOLLOWED BY exactly one UNCONDITIONAL resurrect copy
+    /// whose SOURCE is the staging key, NEVER the condemned blob key.
+    ASSERT_EQ(backend->copy_calls.size(), 2u);
+    EXPECT_TRUE(backend->copy_calls[0].conditional);
+    EXPECT_EQ(backend->copy_calls[0].to, blob_key);
+    EXPECT_FALSE(backend->copy_calls[1].conditional);
+    EXPECT_EQ(backend->copy_calls[1].from, staging_key);
+    EXPECT_NE(backend->copy_calls[1].from, blob_key);   /// INV: resurrect source is NEVER the condemned blob key
+    EXPECT_EQ(backend->copy_calls[1].to, blob_key);
+    EXPECT_EQ(backend->unconditionalCopyCount(), 1u);
+
+    /// The incarnation token is REFRESHED (a fresh incarnation displaced the condemned one).
+    const DB::Cas::HeadResult after = backend->head(blob_key);
+    EXPECT_NE(after.token, before.token);
+    ASSERT_TRUE(after.exists);
+
+    /// The resurrect wrote the staging bytes over the condemned body, recorded a tokened dep, and
+    /// flipped the meta back to Clean (a live incarnation now backs the content key).
+    const auto got = backend->get(blob_key);
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(got->bytes, payload);
+    EXPECT_TRUE(build->depIsTokened(hash));
+    const auto lm = DB::Cas::tests::loadMetaForTest(*backend, store->layout(), hash);
+    ASSERT_TRUE(lm.has_value());
+    EXPECT_EQ(lm->meta.state, DB::Cas::MetaState::Clean);
 }

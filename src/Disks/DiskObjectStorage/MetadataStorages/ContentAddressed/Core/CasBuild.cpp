@@ -448,6 +448,16 @@ void Build::uploadFromSource(ObjectKind kind, const UInt128 & hash, const String
     /// size check, with no full in-memory copy. A mismatch is a LOGICAL_ERROR (a buggy/racing source).
     auto streamIfAbsent = [&]() -> PutResult
     {
+        /// S3-native staging promote (spec 2026-07-11-cas-s3-native-staging §5/§8): when the source
+        /// carries a server-side-copy descriptor, the write-once CREATE primitive is a conditional
+        /// server-side copy of the staging object to `key` (`If-None-Match:*`) instead of a client-side
+        /// streaming PUT. Same write-once contract (`Done` + dest-ETag token on created,
+        /// `PreconditionFailed` when `key` already exists), so every gate branch below is UNCHANGED. The
+        /// staging object IS the promote source — no envelope is streamed here. The LOCAL path (no
+        /// descriptor) is byte-for-byte unchanged.
+        if (source.server_side_copy_from)
+            return store->backend().promoteStaged(*source.server_side_copy_from, key);
+
         /// B171: no owner metadata (protection is the precommit edge — reachability, not `cas_owner`).
         WriteSinkPtr sink = store->backend().putIfAbsentStream(key);
         WriteBuffer & out = sink->buffer();
@@ -508,7 +518,21 @@ void Build::uploadFromSource(ObjectKind kind, const UInt128 & hash, const String
         return;
     }
 
-    /// Condemned: displace the condemned incarnation with our fresh source via If-Match.
+    /// Condemned: displace the condemned incarnation with our fresh source.
+    if (source.server_side_copy_from)
+    {
+        /// S3-native staging RESURRECT (spec §5/§9): re-establish a fresh incarnation by an
+        /// UNCONDITIONAL server-side copy from OUR OWN staging object — NEVER a read/copy of the
+        /// condemned `key` (`feedback_ca_resurrect_invariant`). We reach here ONLY after the per-hash
+        /// meta point-read observed `Condemned` just above, so this overwrites a condemned body, never a
+        /// live blob (INV: never overwrite a live blob, spec §9). The copy mints a fresh ETag/token —
+        /// the W-FRESH-TAG role the freshly-minted `incarnation_tag` plays on the streaming path.
+        const Token tok = store->backend().resurrectStaged(*source.server_side_copy_from, key);
+        recordDoneAndEmit(tok);
+        writeResurrectMetaClean(lm);
+        return;
+    }
+
     /// CRITICAL: we re-read the writer's OWN source (NOT backend().get) — no GET of the dying object.
     /// W-FRESH-TAG: a fresh incarnation_tag minted inside buildHeader() ensures INV-NO-RETURN.
     /// putOverwrite is whole-body only (no streaming variant), so this rare condemned-displacement path
