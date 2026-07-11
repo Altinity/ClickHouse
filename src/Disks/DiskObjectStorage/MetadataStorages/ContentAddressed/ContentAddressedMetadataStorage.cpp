@@ -5,6 +5,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasObjectStorageBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasProbe.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStagingSweeper.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/StaticDirectoryIterator.h>
 #include <IO/ReadBufferFromFileView.h>
 #include <IO/ReadBufferFromMemory.h>
@@ -456,6 +457,20 @@ void ContentAddressedMetadataStorage::startup()
                 getLogger("ContentAddressedMetadataStorage"),
                 "cas_staging_backend=s3 requested but the object storage does not enforce conditional "
                 "copy; falling back to local staging");
+
+        /// S3-native staging Task 6 (mount-lease-scoped staging sweeper, design §6): reclaim THIS
+        /// mount's own leaked `staging/<server_root_id>/` debris (a promote whose staging-delete never
+        /// ran, or an aborted transaction's never-promoted staging object — see
+        /// `cleanupPendingTempFiles`) at mount start. Only runs when the S3 path is actually usable
+        /// (`conditional_copy_supported`) — an unsupported/fail-closed-to-local mount never wrote any
+        /// S3 staging objects under this prefix in the first place. LEASE-FENCE: `stagingKeyPrefix()`
+        /// is keyed by THIS mount's own `server_root_id` (the SAME prefix construction the probe above
+        /// and every staging key this mount ever mints use), so this sweep can never reach a different
+        /// mount's in-flight staging (`Cas::sweepOwnMountStaging`'s own doc comment). GC excludes
+        /// `staging/` entirely (a distinct top-level prefix from `blobs/` — see `CasLayout.h`), so this
+        /// sweeper is the ONLY reclaimer of `staging/` debris.
+        if (conditional_copy_supported)
+            Cas::sweepOwnMountStaging(*object_storage, stagingKeyPrefix() + "/");
     }
 
     /// The background GC scheduler runs only on the disk-factory path (context non-null) and when

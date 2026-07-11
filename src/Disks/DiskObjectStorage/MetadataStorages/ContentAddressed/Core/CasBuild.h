@@ -103,6 +103,21 @@ public:
     ///     same manifest_ref T) and setting refs[final_ref_name];
     ///  6. promotion NEVER emits blob deltas (spec rev. 15 §Promote Precommit). A missing-body precommit
     ///     is non-activating and was rejected at step 4 (the writer re-stages with a fresh ManifestId).
+    ///
+    /// CRASH-RECOVERY INVARIANT (S3-native staging plan Task 6, design §6 "crash between
+    /// precommitAdd(edge) and copy"): a `Build` is a plain in-memory C++ object owned by the wiring's
+    /// `ContentAddressedTransaction` — it is NEVER persisted and NEVER resumed across a process
+    /// restart. There is no "replay a precommit" code path anywhere in the core: `promote` is called
+    /// synchronously, in-process, strictly AFTER every referenced blob's `putBlob` (which for S3
+    /// staging drives `promoteStaged`'s conditional copy) has already returned successfully. If the
+    /// process exits between `precommitAdd` and `promote` (e.g. between staging a blob and its
+    /// server-side-copy promote completing), the `Build` object is simply lost with it: nothing ever
+    /// "wakes up" that precommit and finishes promoting it. The precommit's `RootOwnerEvent` is left as
+    /// a dead intent, judged build-dead via the durable per-server watermark and REMOVED (never
+    /// promoted) by `Gc::reclaimAbandonedPrecommit` (`CasGc.cpp`) once that floor passes it. So the
+    /// hazard the design calls out — "promote a precommit whose copy did not complete" — has no code
+    /// path to occur through: promotion is not a recoverable/resumable operation, only a synchronous
+    /// one that either completes within the writing process or never happens at all.
     void promote(const RootNamespace & target_ns, const String & final_ref_name, UInt128 build_id, const ManifestId & id);
 
     /// Carry the mutable per-ref payload (txn_version.txt, ...) that promote writes into RootRef.mutable_files.

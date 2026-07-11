@@ -208,6 +208,13 @@ public:
     }
 
     /// Prefix that covers every content blob (raw object listing for fsck).
+    ///
+    /// S3-native staging Task 6 (verified, design §6 "GC exclusion"): the S3-staging area lives under
+    /// `<prefix>/staging/<mount_id>/` — a distinct top-level sibling of `blobs/`, `cas/refs/`, and
+    /// `cas/manifests/`, never a sub-path of any of them. Every GC blob-discovery LIST (`CasGc.cpp`,
+    /// `CasFsck.cpp`) enumerates ONLY this `blobsPrefix()`, so a `staging/` object can never be listed,
+    /// HEAD'd, or condemned as an orphan blob — `Cas::sweepOwnMountStaging` (`CasStagingSweeper.h`) is
+    /// the sole reclaimer of `staging/` debris.
     String blobsPrefix() const { return prefix + "/blobs/"; }
 
     /// Phase 0 (mount safety): per-server-root control subtree, keyed by the configured `server_root_id`

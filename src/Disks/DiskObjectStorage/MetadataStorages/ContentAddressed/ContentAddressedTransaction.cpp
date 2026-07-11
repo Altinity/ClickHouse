@@ -150,10 +150,37 @@ void ContentAddressedTransaction::cleanupPendingTempFiles() noexcept
                 std::error_code ec;
                 std::filesystem::remove(pb.staging_key, ec);
             }
-            /// Task 6: an S3-mode pending blob's staging object is NOT removed here. It is deleted by
-            /// the promote path after a successful copy, or reclaimed by the mount-lease sweeper on an
-            /// abandoned/cancelled transaction — never a bare fs::remove (staging_key is a remote
-            /// object key, not a local path).
+            else if (committed)
+            {
+                /// Task 6 (S3-native staging plan): a successful commit deletes the S3 staging object
+                /// HERE — `committed` is only ever true when EVERY part's `publishStaging` ran to
+                /// completion (commit() sets it right before this call), which means every referenced
+                /// pending blob was already promoted (`Build::putBlob` → `promoteStaged`/`resurrectStaged`)
+                /// or, for a B189-orphaned pending blob (its entry removed by `unlinkFile`/`replaceFile`
+                /// before commit), was never going to be promoted at all — either way the staging object
+                /// is no longer needed as a resurrect source, so it is safe to reclaim now.
+                ///
+                /// An ABORTED/exception-unwound transaction (`committed == false`, including a partial
+                /// multi-part commit failure where an EARLIER part's blobs were already promoted) leaves
+                /// its S3 staging objects in place — `staging_key` is a remote object-storage key, never a
+                /// bare `fs::remove` target, and is reclaimed by the mount-lease-scoped sweeper
+                /// (`Cas::sweepOwnMountStaging`), never here. This mirrors the local path's own asymmetry:
+                /// `Local` staging is a private per-transaction scratch file removed unconditionally on
+                /// both commit and abort (nobody else can ever read it), whereas an `S3` staging object
+                /// is the sanctioned resurrect source for the promote gate and must outlive an aborted
+                /// transaction so a later attempt (or the sweeper) can still account for it.
+                try
+                {
+                    metadata_storage.objectStorage()->removeObjectIfExists(StoredObject(pb.staging_key));
+                }
+                catch (...) // NOLINT(bugprone-empty-catch)
+                {
+                    /// Best-effort (noexcept context): a stubborn delete just leaves debris for the
+                    /// mount-lease sweeper to reclaim on a later mount.
+                }
+            }
+            /// else: an S3-mode pending blob of an ABORTED transaction — intentionally left in place
+            /// (see above); the mount-lease sweeper (`Cas::sweepOwnMountStaging`) is its reclaimer.
         }
         st.pending_blobs.clear();
     }
@@ -403,12 +430,17 @@ std::unique_ptr<ReadBufferFromFileBase> ContentAddressedTransaction::tryReadFile
             return std::make_unique<ReadBufferFromOwnMemoryFile>(path, entry->inline_bytes);
         if (entry->placement == Cas::EntryPlacement::Blob)
         {
-            /// B188: a pending blob has not been uploaded yet — serve reads from the local temp file
-            /// (the same file that will be streamed to the pool in publishStaging post-precommit).
-            /// Local-mode only, as of Task 4 (S3-mode pending blobs are staged-but-not-yet-promoted;
-            /// Task 5 wires their read-your-writes path, if needed, alongside the promote).
+            /// B188: a pending blob has not been uploaded yet — serve reads from the staging area (the
+            /// same bytes that will be promoted to the pool in publishStaging post-precommit): a local
+            /// temp file for `StagingBackend::Local`, or the S3 staging object for `StagingBackend::S3`
+            /// (Task 6, S3-native staging plan — `staging_key` is a remote object key there, never a
+            /// local path, so `ReadBufferFromFile` would misinterpret it as a filesystem path).
             if (const auto * pb = findPendingBlob(it->second, entry->blob_hash))
+            {
+                if (pb->backend == StagingBackend::S3)
+                    return metadata_storage.objectStorage()->readObject(StoredObject(pb->staging_key), settings);
                 return std::make_unique<ReadBufferFromFile>(pb->staging_key);
+            }
             return metadata_storage.readBlobPayload(metadata_storage.store()->locate(*entry), path, settings);
         }
     }

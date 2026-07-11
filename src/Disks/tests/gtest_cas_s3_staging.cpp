@@ -1,16 +1,22 @@
 #include <gtest/gtest.h>
 #include "cas_test_helpers.h"
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedWriteBuffers.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasProbe.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStagingSweeper.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
+#include <Disks/DiskCommitTransactionOptions.h>
+#include <IO/ReadHelpers.h>
 
 #include <Poco/AutoPtr.h>
 #include <Poco/Util/XMLConfiguration.h>
 
 #include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <sstream>
 #include <string>
@@ -556,4 +562,176 @@ TEST(CasS3Staging, PromoteOverCondemnedBlobResurrectsFromStagingNotBlobKey)
     const auto lm = DB::Cas::tests::loadMetaForTest(*backend, store->layout(), hash);
     ASSERT_TRUE(lm.has_value());
     EXPECT_EQ(lm->meta.state, DB::Cas::MetaState::Clean);
+}
+
+/// ===========================================================================================
+/// Task 6 of the S3-native staging plan: staging cleanup after commit, read-your-writes over an S3
+/// pending blob, and the mount-lease-scoped sweeper (`CasStagingSweeper.h`).
+///
+/// The wiring-level tests below (cleanup-after-commit, read-your-writes) drive the REAL
+/// `ContentAddressedMetadataStorage` + `ContentAddressedTransaction` over `FakeConditionalCopyObjectStorage`
+/// in `Enforcing` mode. The fake's REAL `getType()` stays `Local`, so `Cas::ObjectStorageBackend` selects
+/// `EmulatedSingleProcess` for the CAS core protocol — the same fully-supported combination every other
+/// `gtest_ca_wiring.cpp` test uses — while the mount-time conditional-copy PROBE
+/// (`Cas::probeConditionalCopy`) is decoupled from that (it exercises `copyObjectConditional` directly
+/// against the object storage), so it reports S3 staging as usable independent of the backend mode. This
+/// lets `writeFile` take the S3-staging code path (stream to a staging object while hashing) WITHOUT
+/// needing a live/native conditional-copy backend for the promote: `Build::putBlob`'s
+/// `promoteStaged`/`resurrectStaged` seams (Native-mode only — see `CasObjectStorageBackend.cpp`) are
+/// already covered directly against `Cas::Build`/`RecordingStagingBackend` above (Task 5) and against a
+/// live backend in Task 7's `with_rustfs` integration test; these two tests only ever exercise an S3
+/// pending blob that is either NEVER referenced (the B189 orphan shape — publishStaging skips its
+/// `putBlob`) or read BEFORE commit, so `promoteStaged` is never reached here.
+
+namespace
+{
+
+/// Construct a `ContentAddressedMetadataStorage` with `cas_staging_backend=s3` over `object_storage`,
+/// mirroring `DefaultConstructedStorageReportsLocalAndNoConditionalCopy`'s positional defaults for every
+/// parameter this test suite does not care about — only `server_root_id` (the mount identity that names
+/// the staging prefix) and the trailing `StagingBackend::S3` differ.
+std::shared_ptr<DB::ContentAddressedMetadataStorage> makeS3StagingMetadataStorageForTest(
+    const DB::ObjectStoragePtr & object_storage, const std::string & server_root_id)
+{
+    static std::atomic<uint64_t> counter{0};
+    const auto unique = std::to_string(::getpid()) + "_" + std::to_string(counter.fetch_add(1));
+    const auto scratch = std::filesystem::temp_directory_path()
+        / ("cas_s3_staging_wiring_" + server_root_id + "_" + unique);
+    return std::make_shared<DB::ContentAddressedMetadataStorage>(
+        object_storage, "pool", "srv1", server_root_id, scratch,
+        /*context_=*/nullptr,
+        /*gc_enabled_=*/true,
+        /*gc_interval_=*/std::chrono::seconds(60),
+        /*root_shards_=*/8,
+        /*disk_name_=*/std::string{},
+        /*dedup_cache_bytes_=*/64ULL << 20,
+        /*dedup_head_first_min_bytes_=*/1ULL << 20,
+        /*gc_snap_generations_to_keep_=*/3,
+        /*gc_shards_=*/1,
+        /*manifest_sweep_list_budget_keys_=*/1000,
+        /*manifest_sweep_delete_budget_keys_=*/100,
+        /*manifest_soft_limit_=*/16ULL << 20,
+        /*manifest_hard_limit_=*/64ULL << 20,
+        /*manifest_max_delay_ms_=*/1000,
+        /*gc_max_conditional_put_bytes_=*/1ULL << 30,
+        /*cas_part_folder_cache_bytes_=*/64ULL << 20,
+        /*cas_part_folder_cache_max_entries_=*/10000,
+        /*cas_part_folder_cache_max_entry_bytes_=*/16ULL << 20,
+        /*manifest_decode_cache_bytes_=*/128ULL << 20,
+        /*gc_meta_pool_size_=*/16,
+        DB::StagingBackend::S3,
+        /*s3_staging_min_bytes_=*/0);
+}
+
+/// Mirrors gtest_ca_wiring.cpp's helper of the same shape.
+void writeThroughS3Transaction(DB::ContentAddressedTransaction & tx, const std::string & path, const std::string & bytes)
+{
+    auto buf = tx.writeFile(path, 65536, DB::WriteMode::Rewrite, {});
+    buf->write(bytes.data(), bytes.size());
+    buf->finalize();
+}
+
+}
+
+/// (a) A successful commit removes the S3 staging object of a pending blob it staged. Uses the B189
+/// orphan shape (the pending blob's entry is unlinked before commit) so `publishStaging` never calls
+/// `putBlob` for it — only `cleanupPendingTempFiles`'s Task 6 branch ever touches this staging object,
+/// which is exactly the seam this test targets.
+TEST(CasS3Staging, SuccessfulCommitRemovesOrphanedS3StagingObject)
+{
+    auto object_storage = makeFakeConditionalCopyStorage(FakeConditionalCopyObjectStorage::Mode::Enforcing);
+    auto metadata_storage = makeS3StagingMetadataStorageForTest(object_storage, "mountA");
+    metadata_storage->startup();
+    ASSERT_TRUE(metadata_storage->conditionalCopySupported());
+
+    auto tx = metadata_storage->createTransaction();
+    auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
+
+    /// orphan.bin forces the S3-staging blob path (a ".bin" suffix always stays a blob, per
+    /// `partFileMustStayBlob`); it is unlinked below before commit.
+    writeThroughS3Transaction(ca_tx, "uui/uuid-1/all_1_1_0/orphan.bin", std::string(300, 'x'));
+    /// checksums.txt is small and NOT blob-forcing: an INLINE entry that gives the part's Build a real
+    /// (non-orphaned) manifest entry, so `publishStaging` takes its normal path (not the early-return
+    /// mutable-only/no-Build branch).
+    writeThroughS3Transaction(ca_tx, "uui/uuid-1/all_1_1_0/checksums.txt", "sums");
+
+    DB::RelativePathsWithMetadata staged_before;
+    object_storage->listObjects(metadata_storage->stagingKeyPrefix(), staged_before, /*max_keys=*/0);
+    ASSERT_EQ(staged_before.size(), 1u) << "exactly orphan.bin's S3 staging object should exist pre-commit";
+
+    tx->unlinkFile("uui/uuid-1/all_1_1_0/orphan.bin", false, false);
+
+    tx->commit(DB::NoCommitOptions{});
+
+    DB::RelativePathsWithMetadata staged_after;
+    object_storage->listObjects(metadata_storage->stagingKeyPrefix(), staged_after, /*max_keys=*/0);
+    EXPECT_TRUE(staged_after.empty())
+        << "cleanupPendingTempFiles must remove the orphaned S3 staging object after a successful commit";
+}
+
+/// (b) Read-your-writes over an S3 pending blob (before commit) returns the staged bytes from the S3
+/// staging object, not a local temp file.
+TEST(CasS3Staging, ReadYourWritesReturnsStagedBytesFromS3StagingObject)
+{
+    auto object_storage = makeFakeConditionalCopyStorage(FakeConditionalCopyObjectStorage::Mode::Enforcing);
+    auto metadata_storage = makeS3StagingMetadataStorageForTest(object_storage, "mountB");
+    metadata_storage->startup();
+    ASSERT_TRUE(metadata_storage->conditionalCopySupported());
+
+    auto tx = metadata_storage->createTransaction();
+    auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
+
+    const std::string path = "uui/uuid-1/all_1_1_0/data.bin";
+    const std::string payload(5000, 'z');
+    writeThroughS3Transaction(ca_tx, path, payload);
+
+    auto read_buf = tx->tryReadFileInFlight(path, DB::ReadSettings{}, {});
+    ASSERT_NE(read_buf, nullptr);
+    std::string got;
+    DB::readStringUntilEOF(got, *read_buf);
+    EXPECT_EQ(got, payload);
+}
+
+/// (c) `sweepOwnMountStaging` removes only objects under the given mount prefix and leaves a DIFFERENT
+/// mount's staging objects untouched (the lease-fence — `CasStagingSweeper.h`).
+TEST(CasStagingSweeper, RemovesOnlyObjectsUnderGivenMountPrefix)
+{
+    auto storage = DB::Cas::tests::makeLocalObjectStorageForTest();
+    const std::string root = storage->getCommonKeyPrefix();
+
+    auto put = [&](const std::string & key, const std::string & bytes)
+    {
+        auto buf = storage->writeObject(DB::StoredObject(key), DB::WriteMode::Rewrite);
+        buf->write(bytes.data(), bytes.size());
+        buf->finalize();
+    };
+
+    put(root + "/p/staging/mountA/one.tmp", "a1");
+    put(root + "/p/staging/mountA/two.tmp", "a2");
+    put(root + "/p/staging/mountB/three.tmp", "b1");   /// a DIFFERENT mount's staging — must survive
+
+    DB::Cas::sweepOwnMountStaging(*storage, root + "/p/staging/mountA/");
+
+    EXPECT_FALSE(storage->exists(DB::StoredObject(root + "/p/staging/mountA/one.tmp")));
+    EXPECT_FALSE(storage->exists(DB::StoredObject(root + "/p/staging/mountA/two.tmp")));
+    EXPECT_TRUE(storage->exists(DB::StoredObject(root + "/p/staging/mountB/three.tmp")));
+}
+
+/// (d) GC's blob-discovery LISTs ONLY `Layout::blobsPrefix()` (`<pool>/blobs/`) — a top-level prefix
+/// strictly disjoint from the S3-staging area (`<pool>/staging/<mount_id>/`), so a staging object can
+/// never be listed, HEAD'd, or condemned as an orphan blob by GC's fold (`CasGc.cpp`, `CasFsck.cpp`).
+/// This is a prefix-separation assertion (the GC fold itself is not unit-testable in isolation from a
+/// full round — see `gtest_cas_gc_fold.cpp` for that machinery); it pins the invariant a refactor that
+/// nested `staging/` under `blobs/` (or vice versa) would violate.
+TEST(CasS3Staging, GcBlobDiscoveryPrefixExcludesStagingObjects)
+{
+    const DB::Cas::Layout layout("p");
+    const std::string blobs_prefix = layout.blobsPrefix();
+    const std::string staging_prefix = "p/staging/mountA/";
+    const std::string staging_key = staging_prefix + "aaa.tmp";
+
+    EXPECT_EQ(blobs_prefix, "p/blobs/");
+    EXPECT_FALSE(staging_prefix.starts_with(blobs_prefix));
+    EXPECT_FALSE(blobs_prefix.starts_with(staging_prefix));
+    EXPECT_FALSE(staging_key.starts_with(blobs_prefix));
 }
