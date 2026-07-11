@@ -332,11 +332,12 @@ class Driver:
             try:
                 node.command(f"OPTIMIZE TABLE {TABLE}", timeout=self.OPTIMIZE_TIMEOUT_S)
             except QueryError as e:
-                # node-down (graceful-shutdown cancel) and the transient TABLE_IS_READ_ONLY (a replica
-                # re-establishing its Keeper session after a chaos pause/restart -- esp. `both pause`)
-                # are both expected under chaos. OPTIMIZE has NO model effect, so dropping it is sound;
+                # node-down (graceful-shutdown cancel), the transient TABLE_IS_READ_ONLY (a replica
+                # re-establishing its Keeper session after a chaos pause/restart -- esp. `both pause`),
+                # and a Keeper `Session expired` (a node frozen/paused past its Keeper session TTL, B190)
+                # are all expected under chaos. OPTIMIZE has NO model effect, so dropping it is sound;
                 # only a genuine logic error surfaces.
-                if not (e.is_node_down or e.is_readonly or e.is_mount_fenced):
+                if not (e.is_node_down or e.is_readonly or e.is_mount_fenced or e.is_keeper_session_expired):
                     raise
             except Exception as e:
                 if not is_transport_error(e):

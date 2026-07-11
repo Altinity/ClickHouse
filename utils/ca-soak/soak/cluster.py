@@ -43,6 +43,16 @@ TABLE_IS_READ_ONLY_CODE = 242
 #   735 QUERY_WAS_CANCELLED_BY_CLIENT  -- cancellation surfaced via the client-cancel path
 NODE_DOWN_CODES = (394, 209, 210, 735)
 
+# ClickHouse error code KEEPER_EXCEPTION (Common/ErrorCodes.cpp). Under chaos a node that is frozen or
+# paused PAST its Keeper session timeout (e.g. a `freeze_long`/`pause` fault longer than the ~tens-of-
+# seconds session TTL) has its ZooKeeper/Keeper session EXPIRED. A `ReplicatedMergeTree` admin op such
+# as `OPTIMIZE TABLE` (which enqueues a merge entry in Keeper) issued during that window then fails with
+# `Coordination::Exception: Session expired. (KEEPER_EXCEPTION)`. The replica re-establishes a fresh
+# session automatically within tens of seconds. This is the Keeper-coordination twin of the
+# TABLE_IS_READ_ONLY transient (B155) and, like it, is EXPECTED under chaos; a best-effort admin op with
+# no model effect (OPTIMIZE) must swallow it rather than surface a hard WORKLOAD FAILURE. See B190.
+KEEPER_EXCEPTION_CODE = 999
+
 
 class QueryError(RuntimeError):
     """A ClickHouse HTTP query failed; carries the server-side exception text from the response body
@@ -70,6 +80,17 @@ class QueryError(RuntimeError):
         Detected by parsing the ClickHouse exception body in the HTTP response."""
         b = self.body or ""
         return ("Code: %d" % TABLE_IS_READ_ONLY_CODE) in b or "TABLE_IS_READ_ONLY" in b
+
+    @property
+    def is_keeper_session_expired(self) -> bool:
+        """True if the server-side exception is a Keeper session-expiry transient (code 999
+        KEEPER_EXCEPTION with a `Session expired` coordination error). A node frozen/paused past its
+        Keeper session TTL under chaos loses its session and re-establishes a fresh one within tens of
+        seconds; a best-effort admin op (OPTIMIZE) that raced that window must RETRY/skip rather than
+        surface as a hard WORKLOAD FAILURE. The Keeper-coordination twin of `is_readonly` (B155). See
+        B190. Detected by parsing the ClickHouse exception body in the HTTP response."""
+        b = self.body or ""
+        return ("Code: %d" % KEEPER_EXCEPTION_CODE) in b and "Session expired" in b
 
     @property
     def is_node_down(self) -> bool:
