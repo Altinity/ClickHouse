@@ -154,8 +154,8 @@ TEST(CasBuild, PutBlobWritesEnvelopeWithFixedHeader)
     ASSERT_TRUE(raw.has_value());
     auto h = decodeEnvelopeHeader(raw->bytes, raw->bytes.size(), ObjectKind::Blob);
     EXPECT_EQ(h.header_len, s->poolMeta().blob_header_len);   /// 256
-    EXPECT_EQ(h.logical_size, 11u);
-    EXPECT_EQ(u128ToHex(h.logical_hash), ref.id.string());
+    /// `logical_size`/`logical_hash` were dropped 2026-07-11 — identity is the content key and the
+    /// payload starts at the fixed offset `header_len`.
     EXPECT_EQ(h.domain_id, s->poolMeta().pool_id);
     EXPECT_EQ(h.build_id, build->buildId());
     EXPECT_NE(h.incarnation_tag, UInt128{});
@@ -359,11 +359,11 @@ TEST(CasBuild, PutBlobStreamsSourceOnceNoFullMaterialization)
     EXPECT_EQ(ref.size, payload.size());
     EXPECT_EQ(invocations, 1) << "happy-path upload must stream the source exactly once (no pre-materialization pass)";
 
-    /// And the object really landed with the streamed payload.
+    /// And the object really landed with the streamed payload (at the fixed header offset).
     auto raw = b->get(s->layout().blobKey(ref.id));
     ASSERT_TRUE(raw.has_value());
     auto h = decodeEnvelopeHeader(raw->bytes, raw->bytes.size(), ObjectKind::Blob);
-    EXPECT_EQ(h.logical_size, payload.size());
+    EXPECT_EQ(raw->bytes.substr(h.header_len), payload);
 }
 
 /// B190: reuseBlob is removed (it had no production callers post-B188). Its behaviors are now covered by:

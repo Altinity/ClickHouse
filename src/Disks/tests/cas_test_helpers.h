@@ -123,8 +123,6 @@ inline DB::Cas::BlobId writeBlobRaw(
     DB::Cas::EnvelopeHeader header;
     header.kind = DB::Cas::ObjectKind::Blob;
     header.hash_algo = 1;
-    header.logical_size = payload.size();
-    header.logical_hash = u128Of(payload);
     header.domain_id = domain_id;
     header.incarnation_tag = DB::UInt128(0x1234);
     header.build_id = DB::UInt128(0x5678);
@@ -598,8 +596,6 @@ inline void writeBlobBody(
     DB::Cas::EnvelopeHeader header;
     header.kind = DB::Cas::ObjectKind::Blob;
     header.hash_algo = 1;
-    header.logical_size = 1;
-    header.logical_hash = hash;
     header.domain_id = DB::UInt128(0x42);
     header.incarnation_tag = DB::UInt128(0x1234);
     header.build_id = DB::UInt128(0x5678);

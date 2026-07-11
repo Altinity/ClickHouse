@@ -9,6 +9,7 @@
 #include <IO/ReadHelpers.h>
 #include <IO/ReadSettings.h>
 #include <IO/WriteBufferFromString.h>
+#include <IO/copyData.h>
 #include <IO/WriteSettings.h>
 
 #include <Common/Exception.h>
@@ -734,24 +735,41 @@ PutResult ObjectStorageBackend::promoteStaged(const String & staging_key, const 
     return {PutOutcome::Done, Token{res.dest_etag, native_token_type}};
 }
 
-Token ObjectStorageBackend::resurrectStaged(const String & staging_key, const String & blob_key)
+Token ObjectStorageBackend::resurrectStaged(const String & staging_key, const String & blob_key,
+                                            const String & fresh_header, uint64_t staging_payload_offset)
 {
     if (mode != Mode::Native)
         throw Exception(ErrorCodes::NOT_IMPLEMENTED,
             "ObjectStorageBackend::resurrectStaged is Native-mode only (EmulatedSingleProcess has no "
             "server-side copy and is never selected for S3 staging)");
 
-    /// UNCONDITIONAL server-side copy staging -> blob — the sanctioned condemned-resurrect overwrite
-    /// (spec §5/§9). The source is ALWAYS the writer's own staging object, NEVER a read of the
-    /// condemned `blob_key` (`feedback_ca_resurrect_invariant`). `copyObject` does not surface the
-    /// destination ETag, so HEAD the fresh incarnation to learn its token.
-    object_storage->copyObject(
-        StoredObject(staging_key), StoredObject(blob_key), getReadSettings(), WriteSettings{});
+    /// INV-NO-RETURN (S3-native staging fix 2026-07-11): the sanctioned condemned-resurrect overwrite is
+    /// NOT a verbatim server-side copy — that would reproduce the condemned incarnation's exact bytes ⇒
+    /// identical ETag ⇒ the queued exact-token delete of the condemned incarnation would kill the live
+    /// resurrection. Instead re-upload OUR OWN staging PAYLOAD (skipping the staging object's own
+    /// envelope header) under a FRESH-tagged `fresh_header`, so the resurrected body — and hence its
+    /// ETag/token — DIFFERS from the condemned incarnation regardless of edge-before-observe. The source
+    /// is ALWAYS the writer's own staging object, NEVER a read of the condemned `blob_key`
+    /// (`feedback_ca_resurrect_invariant`). The caller reached here only after a `Condemned` meta
+    /// point-read, so this overwrites a condemned body, never a live blob.
+    auto in = object_storage->readObject(StoredObject(staging_key), getReadSettings(), /*read_hint=*/std::nullopt);
+    if (staging_payload_offset)
+        in->ignore(staging_payload_offset);
+
+    /// Unconditional overwrite of the condemned body (plain WriteSettings — no If-Match/If-None-Match).
+    auto out = object_storage->writeObject(
+        StoredObject(blob_key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, WriteSettings{});
+    out->write(fresh_header.data(), fresh_header.size());
+    copyData(*in, *out);
+    out->finalize();
+
+    /// The plain write does not reliably surface the destination ETag across dialects, so HEAD the
+    /// fresh incarnation to learn its token.
     const auto hr = nativeHead(blob_key);
     if (!hr)
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
             "ObjectStorageBackend::resurrectStaged: blob {} is absent immediately after the resurrect "
-            "copy — failing closed", blob_key);
+            "re-upload — failing closed", blob_key);
     return hr->token;
 }
 

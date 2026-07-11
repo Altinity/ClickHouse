@@ -294,7 +294,8 @@ PutResult InMemoryBackend::promoteStaged(const String & staging_key, const Strin
     return {PutOutcome::Done, t};
 }
 
-Token InMemoryBackend::resurrectStaged(const String & staging_key, const String & blob_key)
+Token InMemoryBackend::resurrectStaged(const String & staging_key, const String & blob_key,
+                                       const String & fresh_header, uint64_t staging_payload_offset)
 {
     std::lock_guard lock(mutex_);
     auto src = store_.find(staging_key);
@@ -302,11 +303,19 @@ Token InMemoryBackend::resurrectStaged(const String & staging_key, const String 
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
             "InMemoryBackend::resurrectStaged: staging object {} is absent", staging_key);
 
-    /// Unconditional overwrite FROM the staging object — never reads `blob_key`. `src->second.bytes` is
-    /// copied before the map write; std::map insert/assign never invalidates other iterators/references.
+    /// INV-NO-RETURN (S3-native staging fix 2026-07-11): re-upload the staging PAYLOAD (skipping its own
+    /// envelope header) under a FRESH-tagged header, NOT a verbatim copy — so the resurrected body
+    /// DIFFERS byte-for-byte from the condemned incarnation for the same payload (on a real
+    /// content-addressed store that means a distinct ETag, defeating the queued exact-token delete).
+    /// Never reads `blob_key`. `src->second.bytes` is read before the map write; std::map insert/assign
+    /// never invalidates other iterators/references.
+    const String & staging_bytes = src->second.bytes;
+    const String payload = staging_payload_offset <= staging_bytes.size()
+        ? staging_bytes.substr(staging_payload_offset)
+        : String{};
     const Token t = mintToken();
     Object obj;
-    obj.bytes = src->second.bytes;
+    obj.bytes = fresh_header + payload;
     obj.token = t;
     store_[blob_key] = std::move(obj);
     return t;

@@ -26,17 +26,18 @@ namespace DB::Cas
 namespace
 {
 
-/// 94 is the EXACT packed size of the v1 core fields (hole-free; the kind byte and the old index_len
-/// pad word are gone — kind is encoded by the magic):
+/// 70 is the EXACT packed size of the core fields (hole-free; the kind byte and the old index_len
+/// pad word are gone — kind is encoded by the magic; `logical_size`/`logical_hash` were dropped
+/// 2026-07-11 so the header is buildable BEFORE the payload is streamed):
 ///   magic[4] + writer_version[2] + compatibility_version[2] + hash_algo[1] + flags[1] + header_len[4]
-///   + logical_size[8] + four u128s[64] + header_hash[8] = 94.
+///   + three u128s[48] + header_hash[8] = 70.
 /// The slot at [6,8) was formerly named `min_reader_version`; now `compatibility_version`. Same wire
 /// position and width; reader check unchanged (> G_BUILD → UNKNOWN_FORMAT_VERSION).
-/// The core is never grown: new fields go into the [94, header_len) TLV extensions. header_len is
+/// The core is never grown: new fields go into the [70, header_len) TLV extensions. header_len is
 /// padded up to an 8-byte multiple; a fixed per-pool header length is set via pad_to_header_len.
-constexpr uint32_t CORE_HEADER_LEN = 94;
+constexpr uint32_t CORE_HEADER_LEN = 70;
 constexpr uint32_t MAX_HEADER_LEN = 16384;
-constexpr size_t HEADER_HASH_OFFSET = 86;
+constexpr size_t HEADER_HASH_OFFSET = 62;
 constexpr size_t HEADER_HASH_LEN = 8;
 
 constexpr std::string_view MAGIC_BLOB = "CABL";
@@ -58,7 +59,7 @@ constexpr uint16_t TLV_INTENDED_REF = 0x0002;
 /// An arbitrary unknown type used (test-only) to exercise the critical fail-closed path.
 constexpr uint16_t TLV_UNKNOWN_CRITICAL = 0x7f01;
 
-/// header_hash = CityHash64 over the 94 core-header bytes with the [86, 94) field itself zeroed —
+/// header_hash = CityHash64 over the 70 core-header bytes with the [62, 70) field itself zeroed —
 /// the hash family the rest of ClickHouse uses for checksums. A diagnostics-quality check, not a
 /// safety dependency: every load-bearing header field is independently re-verified (spec §3.1).
 uint64_t computeHeaderHash(const char * core_header_with_hash_zeroed)
@@ -164,14 +165,12 @@ String encodeEnvelopeHeader(EnvelopeHeader & header)
         writeBinaryLittleEndian(
             static_cast<uint8_t>(critical ? FLAG_HAS_CRITICAL_EXTENSION : 0), out_buf); /// [9] flags
         writeBinaryLittleEndian(header_len, out_buf);                       /// [10,14) header_len
-        writeBinaryLittleEndian(header.logical_size, out_buf);              /// [14,22) logical_size
-        writeU128LE(out_buf, header.logical_hash);                          /// [22,38)
-        writeU128LE(out_buf, header.domain_id);                             /// [38,54)
-        writeU128LE(out_buf, header.incarnation_tag);                       /// [54,70)
-        writeU128LE(out_buf, header.build_id);                              /// [70,86)
-        writeBinaryLittleEndian(static_cast<uint64_t>(0), out_buf);         /// [86,94) header_hash (zeroed)
+        writeU128LE(out_buf, header.domain_id);                             /// [14,30)
+        writeU128LE(out_buf, header.incarnation_tag);                       /// [30,46)
+        writeU128LE(out_buf, header.build_id);                              /// [46,62)
+        writeBinaryLittleEndian(static_cast<uint64_t>(0), out_buf);         /// [62,70) header_hash (zeroed)
 
-        writeString(ext, out_buf);                                          /// [94, header_len) TLV extensions
+        writeString(ext, out_buf);                                          /// [70, header_len) TLV extensions
         out_buf.finalize();
     }
 
@@ -182,7 +181,7 @@ String encodeEnvelopeHeader(EnvelopeHeader & header)
     return out;
 }
 
-EnvelopeHeader decodeEnvelopeHeader(std::string_view head_bytes, uint64_t object_size, ObjectKind expected_kind)
+EnvelopeHeader decodeEnvelopeHeader(std::string_view head_bytes, uint64_t /*object_size*/, ObjectKind expected_kind)
 {
     if (head_bytes.size() < CORE_HEADER_LEN)
         throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
@@ -229,16 +228,12 @@ EnvelopeHeader decodeEnvelopeHeader(std::string_view head_bytes, uint64_t object
                 "CHCA envelope: header_len {} exceeds provided bytes {}", header_len, head_bytes.size());
         h.header_len = header_len;
 
-        /// [14,22) logical_size
-        readBinaryLittleEndian(h.logical_size, in);
-
-        /// [22,38) [38,54) [54,70) [70,86)
-        h.logical_hash = readU128LE(in);
+        /// [14,30) [30,46) [46,62)
         h.domain_id = readU128LE(in);
         h.incarnation_tag = readU128LE(in);
         h.build_id = readU128LE(in);
 
-        /// [86,94) header_hash
+        /// [62,70) header_hash
         uint64_t stored_header_hash = 0;
         readBinaryLittleEndian(stored_header_hash, in);
 
@@ -254,15 +249,12 @@ EnvelopeHeader decodeEnvelopeHeader(std::string_view head_bytes, uint64_t object
                     computed, stored_header_hash);
         }
 
-        /// Size arithmetic (uniform for ALL kinds, spec §3.1): header_len + logical_size == object_size.
-        /// logical_size covers [header_len, EOF).
-        const uint64_t expected_object_size = static_cast<uint64_t>(header_len) + h.logical_size;
-        if (expected_object_size != object_size)
-            throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA,
-                "CHCA envelope: size mismatch (header_len {} + logical_size {} = {}, object_size {})",
-                header_len, h.logical_size, expected_object_size, object_size);
+        /// The former `header_len + logical_size == object_size` size-arithmetic check was dropped with
+        /// the `logical_size` core field (2026-07-11): the payload length is derived downstream as
+        /// `object_size - header_len` and re-verified where it matters (`copyForwardFromCondemned`
+        /// re-hashes the payload against the content key). `object_size` is kept for call-site symmetry.
 
-        /// [94, header_len) TLV extensions. Encode pads the area to 8-alignment with zero bytes; a valid
+        /// [70, header_len) TLV extensions. Encode pads the area to 8-alignment with zero bytes; a valid
         /// TLV type is never 0, so a zero type marks the start of alignment padding (which must be all
         /// zero and shorter than a minimal 4-byte TLV header).
         bool saw_unknown_critical = false;

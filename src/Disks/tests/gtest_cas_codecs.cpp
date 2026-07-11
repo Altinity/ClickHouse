@@ -21,9 +21,7 @@ EnvelopeHeader makeBlobHeader()
     EnvelopeHeader h;
     h.kind = ObjectKind::Blob;
     h.hash_algo = 1;
-    h.logical_size = 1000;
-    h.logical_hash = (UInt128(0x0123456789abcdefULL) << 64) | UInt128(0xfedcba9876543210ULL);
-    h.domain_id = UInt128(0x42);
+    h.domain_id = (UInt128(0x0123456789abcdefULL) << 64) | UInt128(0xfedcba9876543210ULL);
     h.incarnation_tag = UInt128(0x99);
     h.build_id = UInt128(0x7);
     return h;
@@ -45,16 +43,14 @@ TEST(CasEnvelope, RoundTripWithProvenanceAndIntendedRef)
     h.intended_ref = String("srv1/tbl-uuid/all_1_1_0");
 
     String bytes = encodeEnvelopeHeader(h);
-    EXPECT_GE(h.header_len, 94u);
+    EXPECT_GE(h.header_len, 70u);
     EXPECT_EQ(bytes.size(), h.header_len);
 
-    const uint64_t object_size = h.header_len + h.logical_size;
+    const uint64_t object_size = bytes.size();
     EnvelopeHeader d = decodeEnvelopeHeader(bytes, object_size, ObjectKind::Blob);
 
     EXPECT_EQ(d.kind, ObjectKind::Blob);
     EXPECT_EQ(d.hash_algo, 1u);
-    EXPECT_EQ(d.logical_size, 1000u);
-    EXPECT_EQ(d.logical_hash, h.logical_hash);
     EXPECT_EQ(d.domain_id, h.domain_id);
     EXPECT_EQ(d.incarnation_tag, h.incarnation_tag);
     EXPECT_EQ(d.build_id, h.build_id);
@@ -74,10 +70,10 @@ TEST(CasEnvelope, RoundTripNoExtensions)
 {
     EnvelopeHeader h = makeBlobHeader();
     String bytes = encodeEnvelopeHeader(h);
-    /// 94-byte core + 2 zero alignment bytes = 96 on disk.
-    EXPECT_EQ(h.header_len, 96u);
+    /// 70-byte core + 2 zero alignment bytes = 72 on disk.
+    EXPECT_EQ(h.header_len, 72u);
 
-    EnvelopeHeader d = decodeEnvelopeHeader(bytes, h.header_len + h.logical_size, ObjectKind::Blob);
+    EnvelopeHeader d = decodeEnvelopeHeader(bytes, bytes.size(), ObjectKind::Blob);
     EXPECT_FALSE(d.provenance.has_value());
     EXPECT_FALSE(d.intended_ref.has_value());
 }
@@ -86,7 +82,7 @@ TEST(CasEnvelope, PayloadOffsetHelper)
 {
     EnvelopeHeader h = makeBlobHeader();
     String bytes = encodeEnvelopeHeader(h);
-    EnvelopeHeader d = decodeEnvelopeHeader(bytes, h.header_len + h.logical_size, ObjectKind::Blob);
+    EnvelopeHeader d = decodeEnvelopeHeader(bytes, bytes.size(), ObjectKind::Blob);
     EXPECT_EQ(payloadOffset(d), static_cast<uint64_t>(d.header_len));
 }
 
@@ -101,43 +97,37 @@ TEST(CasEnvelope, FutureCompatibilityVersionThrows)
     bytes[6] = 2; bytes[7] = 0;
     expectThrowsCode(
         DB::ErrorCodes::UNKNOWN_FORMAT_VERSION,
-        [&] { decodeEnvelopeHeader(bytes, h.header_len + h.logical_size, ObjectKind::Blob); });
+        [&] { decodeEnvelopeHeader(bytes, bytes.size(), ObjectKind::Blob); });
 }
 
 TEST(CasEnvelope, BadHeaderLenThrows)
 {
     EnvelopeHeader h = makeBlobHeader();
     String bytes = encodeEnvelopeHeader(h);
-    /// header_len = 90 (< 94) at offset 10; the header hash would mismatch too, but range check fires first.
-    bytes[10] = 90;
-    EXPECT_THROW(decodeEnvelopeHeader(bytes, h.header_len + h.logical_size, ObjectKind::Blob), DB::Exception);
-}
-
-TEST(CasEnvelope, SizeMismatchThrows)
-{
-    EnvelopeHeader h = makeBlobHeader();
-    String bytes = encodeEnvelopeHeader(h);
-    EXPECT_THROW(decodeEnvelopeHeader(bytes, h.header_len + h.logical_size + 1, ObjectKind::Blob), DB::Exception);
+    /// header_len = 64 (< 70) at offset 10; the header hash would mismatch too, but the range check
+    /// (header_len < CORE_HEADER_LEN) fires first.
+    bytes[10] = 64;
+    EXPECT_THROW(decodeEnvelopeHeader(bytes, bytes.size(), ObjectKind::Blob), DB::Exception);
 }
 
 TEST(CasEnvelope, CorruptedHeaderFieldFailsHeaderHash)
 {
     EnvelopeHeader h = makeBlobHeader();
     String bytes = encodeEnvelopeHeader(h);
-    bytes[24] ^= 0xff;  /// flip a byte inside logical_hash [22,38) -> header hash mismatch
+    bytes[20] ^= 0xff;  /// flip a byte inside domain_id [14,30) -> header hash mismatch
     expectThrowsCode(
         DB::ErrorCodes::CORRUPTED_DATA,
-        [&] { decodeEnvelopeHeader(bytes, h.header_len + h.logical_size, ObjectKind::Blob); });
+        [&] { decodeEnvelopeHeader(bytes, bytes.size(), ObjectKind::Blob); });
 }
 
 TEST(CasEnvelope, CorruptedStoredHeaderHashThrows)
 {
     EnvelopeHeader h = makeBlobHeader();
     String bytes = encodeEnvelopeHeader(h);
-    bytes[92] ^= 0xff;  /// flip a byte inside the stored header_hash itself ([86,94))
+    bytes[64] ^= 0xff;  /// flip a byte inside the stored header_hash itself ([62,70))
     expectThrowsCode(
         DB::ErrorCodes::CORRUPTED_DATA,
-        [&] { decodeEnvelopeHeader(bytes, h.header_len + h.logical_size, ObjectKind::Blob); });
+        [&] { decodeEnvelopeHeader(bytes, bytes.size(), ObjectKind::Blob); });
 }
 
 TEST(CasEnvelope, CriticalUnknownExtensionThrows)
@@ -148,7 +138,7 @@ TEST(CasEnvelope, CriticalUnknownExtensionThrows)
     String bytes = encodeEnvelopeHeader(h);
     expectThrowsCode(
         DB::ErrorCodes::UNKNOWN_FORMAT_VERSION,
-        [&] { decodeEnvelopeHeader(bytes, h.header_len + h.logical_size, ObjectKind::Blob); });
+        [&] { decodeEnvelopeHeader(bytes, bytes.size(), ObjectKind::Blob); });
 }
 
 /// ===================================================================================
@@ -415,13 +405,11 @@ TEST(CasEnvelope, EnvelopeHeaderPaddingReachesTargetLen)
     EXPECT_EQ(h.header_len, 256u);
     EXPECT_EQ(bytes.size(), 256u);
 
-    /// The padded header round-trips: the decoder skips the zero-type pad TLV and validates the size
-    /// arithmetic header_len + logical_size == object_size.
-    const uint64_t object_size = 256 + h.logical_size;
-    EnvelopeHeader d = decodeEnvelopeHeader(bytes, object_size, ObjectKind::Blob);
+    /// The padded header round-trips: the decoder skips the zero-type pad TLV. (The size-arithmetic
+    /// check was dropped with the `logical_size` field 2026-07-11.)
+    EnvelopeHeader d = decodeEnvelopeHeader(bytes, bytes.size(), ObjectKind::Blob);
     EXPECT_EQ(d.header_len, 256u);
-    EXPECT_EQ(d.logical_hash, h.logical_hash);
-    EXPECT_EQ(d.logical_size, h.logical_size);
+    EXPECT_EQ(d.domain_id, h.domain_id);
 
     /// Not 8-aligned ⇒ BAD_ARGUMENTS.
     expectThrowsCode(DB::ErrorCodes::BAD_ARGUMENTS, []
@@ -431,7 +419,7 @@ TEST(CasEnvelope, EnvelopeHeaderPaddingReachesTargetLen)
         encodeEnvelopeHeader(bad);
     });
 
-    /// Below the natural header length (94+2=96 aligned) ⇒ BAD_ARGUMENTS.
+    /// Below the natural header length (70+2=72 aligned) ⇒ BAD_ARGUMENTS.
     expectThrowsCode(DB::ErrorCodes::BAD_ARGUMENTS, []
     {
         EnvelopeHeader bad = makeBlobHeader();
@@ -462,19 +450,20 @@ String toHexBytes(const String & s)
 }
 }
 
-/// LE binary form: the envelope header. `logical_hash` (offset [22,38)) appears little-endian in the
-/// golden — e.g. 0x0123...3210 serializes as bytes 10 32 54 ... — pinning the LE order.
+/// LE binary form: the envelope header. `domain_id` (offset [14,30)) appears little-endian in the
+/// golden — e.g. 0x0123...3210 serializes as bytes 10 32 54 ... — pinning the LE order. (The former
+/// `logical_size`/`logical_hash` core fields were dropped 2026-07-11.)
 /// Layout: CABL magic[4] writer_version[2] compatibility_version[2] hash_algo[1] flags[1] header_len[4]
-///         logical_size[8] logical_hash[16] domain_id[16] incarnation_tag[16] build_id[16]
-///         header_hash[8] align_pad[2] = 96 bytes total (94-byte core + 2 zero alignment bytes).
+///         domain_id[16] incarnation_tag[16] build_id[16] header_hash[8] align_pad[2] = 72 bytes total
+///         (70-byte core + 2 zero alignment bytes).
 TEST(CasByteOrderGolden, EnvelopeLittleEndian)
 {
     EnvelopeHeader h = makeBlobHeader();
     const String encoded = encodeEnvelopeHeader(h);
     static constexpr std::string_view golden =
-        "4341424c01000100010060000000e8030000000000001032547698badcfeefcd"
-        "ab89674523014200000000000000000000000000000099000000000000000000"
-        "00000000000007000000000000000000000000000000c037e11e6ef26cce0000";
+        "4341424c010001000100480000001032547698badcfeefcdab8967452301"
+        "99000000000000000000000000000000070000000000000000000000000000"
+        "00c746cd3c918892300000";
     EXPECT_EQ(toHexBytes(encoded), golden);
 }
 

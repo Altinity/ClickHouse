@@ -213,14 +213,21 @@ public:
             "Cas::Backend::promoteStaged (write-once server-side copy) is not implemented for this backend");
     }
 
-    /// UNCONDITIONAL server-side copy of `staging_key` over `blob_key`, minting a fresh incarnation
-    /// token — the sanctioned condemned-RESURRECT overwrite (spec §5/§9). The resurrect source is
-    /// ALWAYS the writer's OWN staging object, NEVER a read/copy of the condemned `blob_key`
-    /// (`feedback_ca_resurrect_invariant`). The caller MUST have observed the current incarnation as
-    /// `Condemned` (per-hash meta point-read) before calling this, so it overwrites a condemned body,
-    /// never a live blob (INV: never overwrite a live blob). Returns the fresh incarnation token.
+    /// UNCONDITIONAL re-upload of the writer's OWN staging PAYLOAD over `blob_key` under a FRESH-tagged
+    /// envelope header — the sanctioned condemned-RESURRECT overwrite (spec §5/§9, INV-NO-RETURN fix
+    /// 2026-07-11). The backend reads the payload from `staging_key` skipping the first
+    /// `staging_payload_offset` bytes (the staging object's own envelope header), prepends `fresh_header`
+    /// (built by the caller with a freshly-minted `incarnation_tag`), and writes `[fresh_header][payload]`
+    /// to `blob_key`. The source is ALWAYS the writer's OWN staging object, NEVER a read/copy of the
+    /// condemned `blob_key` (`feedback_ca_resurrect_invariant`). The fresh header guarantees the
+    /// resurrected body — and hence its ETag/token — DIFFERS from the condemned incarnation, so a queued
+    /// exact-token delete of the condemned incarnation can never match the live resurrection
+    /// (INV-NO-RETURN). The caller MUST have observed the current incarnation as `Condemned` (per-hash
+    /// meta point-read) before calling this, so it overwrites a condemned body, never a live blob (INV:
+    /// never overwrite a live blob). Returns the fresh incarnation token.
     /// DEFAULT: fail closed (`NOT_IMPLEMENTED`), same rationale as `promoteStaged`.
-    virtual Token resurrectStaged(const String & /*staging_key*/, const String & /*blob_key*/)
+    virtual Token resurrectStaged(const String & /*staging_key*/, const String & /*blob_key*/,
+                                  const String & /*fresh_header*/, uint64_t /*staging_payload_offset*/)
     {
         throw Exception(ErrorCodes::NOT_IMPLEMENTED,
             "Cas::Backend::resurrectStaged (server-side resurrect copy) is not implemented for this backend");

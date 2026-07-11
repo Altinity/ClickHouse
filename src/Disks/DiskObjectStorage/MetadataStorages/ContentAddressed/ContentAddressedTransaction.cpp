@@ -1,11 +1,14 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedWriteBuffers.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEnvelope.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
 #include <IO/ReadBufferFromFile.h>
+#include <IO/ReadBufferFromFileView.h>
 #include <IO/ReadBufferFromMemory.h>
 #include <IO/WriteBufferFromFile.h>
 #include <IO/copyData.h>
+#include <Common/thread_local_rng.h>
 #include <algorithm>
 #include <filesystem>
 #include <unordered_set>
@@ -438,7 +441,21 @@ std::unique_ptr<ReadBufferFromFileBase> ContentAddressedTransaction::tryReadFile
             if (const auto * pb = findPendingBlob(it->second, entry->blob_hash))
             {
                 if (pb->backend == StagingBackend::S3)
-                    return metadata_storage.objectStorage()->readObject(StoredObject(pb->staging_key), settings);
+                {
+                    /// S3-native staging fix 2026-07-11: the staging object now holds `[header][payload]`
+                    /// (the fixed-length `blob_header_len` CABL envelope, so the promote can stay a
+                    /// verbatim server-side copy). Read-your-writes must serve the PAYLOAD ONLY — wrap the
+                    /// object read in a `ReadBufferFromFileView` windowed to `[header_len, header_len+size)`
+                    /// so position 0 is the payload start, else the reader would see 256 bytes of header
+                    /// prepended to the payload (corruption). The LOCAL staging temp file holds the payload
+                    /// verbatim (no header), so its path is unchanged.
+                    const uint64_t header_len = metadata_storage.store()->poolMeta().blob_header_len;
+                    const uint64_t payload_end = header_len + pb->size;
+                    auto impl = metadata_storage.objectStorage()->readObject(
+                        StoredObject(pb->staging_key, path, payload_end), settings);
+                    return std::make_unique<ReadBufferFromFileView>(
+                        std::move(impl), path, header_len, payload_end);
+                }
                 return std::make_unique<ReadBufferFromFile>(pb->staging_key);
             }
             return metadata_storage.readBlobPayload(metadata_storage.store()->locate(*entry), path, settings);
@@ -541,6 +558,41 @@ void ContentAddressedTransaction::stageBlobPartFile(
     st.entries.push_back(std::move(entry));
 }
 
+std::string ContentAddressedTransaction::buildS3StagingBlobHeader(
+    const ContentAddressedMetadataStorage::Route & route) const
+{
+    /// Mirror `Build::uploadFromSource`'s `buildHeader` (minus the dropped `logical_size`/`logical_hash`
+    /// fields and minus `build_id`, which is not known until commit and is diagnostic-only). A FRESH
+    /// `incarnation_tag` per staging object keeps the incarnation zone unique; the header is padded to
+    /// the pool's fixed `blob_header_len` so the payload starts at a constant offset.
+    const Cas::StorePtr & store = metadata_storage.store();
+    const Cas::PoolMeta & meta = store->poolMeta();
+    const Cas::PoolConfig & cfg = store->poolConfig();
+
+    Cas::EnvelopeHeader header;
+    header.kind = Cas::ObjectKind::Blob;
+    header.hash_algo = 1;
+    header.domain_id = meta.pool_id;
+    header.incarnation_tag = (static_cast<UInt128>(thread_local_rng()) << 64) | thread_local_rng();
+    header.build_id = 0;   /// not known at stream time; diagnostic-only (not read by GC/read paths)
+    header.provenance = Cas::Provenance{
+        /*created_at_ms*/ 0, cfg.server_id, /*ch_version*/ 0, Cas::ProvenanceOp::Other};
+    header.intended_ref = route.ns.string() + "/" + route.ref;
+    header.pad_to_header_len = static_cast<uint32_t>(meta.blob_header_len);
+    try
+    {
+        return Cas::encodeEnvelopeHeader(header);
+    }
+    catch (const Exception & e)
+    {
+        if (e.code() != ErrorCodes::BAD_ARGUMENTS)
+            throw;
+        /// intended_ref is diagnostic-only: when it makes the header exceed blob_header_len, drop it.
+        header.intended_ref.reset();
+        return Cas::encodeEnvelopeHeader(header);
+    }
+}
+
 std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
     const std::string & path, size_t buf_size, WriteMode mode, const WriteSettings & settings)
 {
@@ -613,9 +665,17 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
         {
             const std::string staging_key = metadata_storage.stagingKeyPrefix() + "/" + getRandomASCIIString(32) + ".tmp";
             auto object_sink = metadata_storage.objectStorage()->writeObject(StoredObject(staging_key), WriteMode::Rewrite);
+            /// S3-native staging fix 2026-07-11: build the fixed-length CABL envelope header NOW (before
+            /// the payload is streamed) so the staging object holds `[header][payload]` and the promote
+            /// stays a verbatim server-side copy. The header carries a FRESH `incarnation_tag`; `build_id`
+            /// is left 0 (not known at stream time — diagnostic-only, not read by GC/read paths). The
+            /// buffer writes this header first, UNHASHED and excluded from the reported size, so the
+            /// content key stays `cityHash128(payload)` and `blob_size` stays the payload size.
+            std::string envelope_header = buildS3StagingBlobHeader(*r);
             return std::make_unique<ContentAddressed::CaContentWriteBuffer>(
                 std::move(object_sink),
                 staging_key,
+                std::move(envelope_header),
                 buf_size,
                 settings.use_adaptive_write_buffer,
                 settings.adaptive_write_buffer_initial_size,

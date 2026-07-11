@@ -179,10 +179,11 @@ public:
         return DB::Cas::InMemoryBackend::promoteStaged(staging_key, blob_key);
     }
 
-    DB::Cas::Token resurrectStaged(const String & staging_key, const String & blob_key) override
+    DB::Cas::Token resurrectStaged(const String & staging_key, const String & blob_key,
+                                   const String & fresh_header, uint64_t staging_payload_offset) override
     {
         copy_calls.push_back({staging_key, blob_key, /*conditional=*/false});
-        return DB::Cas::InMemoryBackend::resurrectStaged(staging_key, blob_key);
+        return DB::Cas::InMemoryBackend::resurrectStaged(staging_key, blob_key, fresh_header, staging_payload_offset);
     }
 
     /// Every unconditional (resurrect) copy this backend saw — empty iff no live/condemned body was ever
@@ -339,9 +340,16 @@ TEST(CasS3Staging, ContentWriteBufferS3ModeStreamsToSinkAndFinalizes)
     std::string got_key;
     int on_finalized_calls = 0;
 
+    /// S3-native staging fix 2026-07-11: the S3 constructor takes a fixed-length envelope header that is
+    /// written to the sink FIRST, UNHASHED and excluded from the reported size. A distinctive 256-byte
+    /// filler stands in for the real CABL header here (this test exercises the buffer mechanics, not the
+    /// envelope encoder).
+    const std::string envelope_header(256, 'H');
+
     auto buf = std::make_unique<DB::ContentAddressed::CaContentWriteBuffer>(
         std::move(sink),
         staging_key,
+        envelope_header,
         /*buf_size=*/8192,
         /*use_adaptive_buffer_size=*/false,
         /*adaptive_buffer_initial_size=*/0,
@@ -362,8 +370,9 @@ TEST(CasS3Staging, ContentWriteBufferS3ModeStreamsToSinkAndFinalizes)
 
     const std::string payload = payload_part1 + payload_part2;
 
-    /// (a) the sink received EXACTLY the bytes written — no local temp file was ever touched.
-    EXPECT_EQ(sink_ptr->writtenBytes(), payload);
+    /// (a) the sink received the ENVELOPE HEADER FIRST, then EXACTLY the payload bytes — the staging
+    /// object holds `[header][payload]` so the promote can stay a verbatim server-side copy.
+    EXPECT_EQ(sink_ptr->writtenBytes(), envelope_header + payload);
     EXPECT_TRUE(sink_ptr->wasFinalizedForTest());
     EXPECT_FALSE(sink_ptr->wasCancelled());
 
@@ -396,6 +405,7 @@ TEST(CasS3Staging, ContentWriteBufferS3ModeCancelCancelsSinkAndSkipsFinalize)
     auto buf = std::make_unique<DB::ContentAddressed::CaContentWriteBuffer>(
         std::move(sink),
         staging_key,
+        /*envelope_header=*/std::string(256, 'H'),
         /*buf_size=*/8192,
         /*use_adaptive_buffer_size=*/false,
         /*adaptive_buffer_initial_size=*/0,
@@ -504,10 +514,12 @@ TEST(CasS3Staging, PromoteOverExistingCleanBlobAdoptsAndNeverOverwrites)
     EXPECT_TRUE(build->depIsTokened(hash));
 }
 
-/// (c) Blob key exists but is CONDEMNED ⇒ the writer RESURRECTS by an UNCONDITIONAL server-side copy
-/// FROM the staging object — NEVER a read/copy of the condemned blob key
-/// (`feedback_ca_resurrect_invariant`) — and the incarnation token is refreshed.
-TEST(CasS3Staging, PromoteOverCondemnedBlobResurrectsFromStagingNotBlobKey)
+/// (c) Blob key exists but is CONDEMNED ⇒ the writer RESURRECTS by re-uploading its OWN staging PAYLOAD
+/// under a FRESH-tagged envelope header — NEVER a read/copy of the condemned blob key
+/// (`feedback_ca_resurrect_invariant`) — and the resurrected body DIFFERS from the condemned incarnation
+/// (INV-NO-RETURN: a verbatim copy would reproduce identical bytes ⇒ identical ETag ⇒ the queued
+/// exact-token delete of the condemned incarnation would kill the live resurrection = data loss).
+TEST(CasS3Staging, PromoteOverCondemnedBlobResurrectsWithFreshTagNotVerbatim)
 {
     auto backend = std::make_shared<RecordingStagingBackend>();
     auto store = openStagingStore(backend);
@@ -519,11 +531,25 @@ TEST(CasS3Staging, PromoteOverCondemnedBlobResurrectsFromStagingNotBlobKey)
     const std::string blob_key = store->layout().blobKey(blob_id);
     const std::string staging_key = "p/staging/mount1/ccc.tmp";
     const std::string payload(300, 'c');
-    backend->putIfAbsent(staging_key, payload);
 
-    /// A pre-existing blob whose meta is CONDEMNED (pending GC delete).
-    DB::Cas::tests::writeBlobBody(*backend, store->layout(), hash);
-    DB::Cas::tests::writeMetaClean(*backend, store->layout(), hash, /*size=*/1);
+    /// The staging object holds `[header][payload]` (as `writeFile` now emits it). The staging header is
+    /// a fixed 256-byte CABL envelope with its OWN incarnation_tag.
+    DB::Cas::EnvelopeHeader staging_h;
+    staging_h.kind = DB::Cas::ObjectKind::Blob;
+    staging_h.hash_algo = 1;
+    staging_h.domain_id = store->poolMeta().pool_id;
+    staging_h.incarnation_tag = DB::UInt128(0xC0FFEE);   /// the create-time tag
+    staging_h.pad_to_header_len = static_cast<uint32_t>(store->poolMeta().blob_header_len);
+    const std::string staging_header = DB::Cas::encodeEnvelopeHeader(staging_h);
+    ASSERT_EQ(staging_header.size(), store->poolMeta().blob_header_len);
+    const std::string staging_bytes = staging_header + payload;
+    backend->putIfAbsent(staging_key, staging_bytes);
+
+    /// Seed the condemned blob body = EXACTLY what a verbatim promote of this staging object would have
+    /// produced (the writer's OWN create, later observed condemned). This is the adversarial shape: a
+    /// verbatim resurrect WOULD reproduce these identical bytes ⇒ identical ETag ⇒ collision.
+    backend->putIfAbsent(blob_key, staging_bytes);
+    DB::Cas::tests::writeMetaClean(*backend, store->layout(), hash, /*size=*/payload.size());
     DB::Cas::tests::condemnMeta(*backend, store->layout(), hash, /*condemn_round=*/5);
     const DB::Cas::HeadResult before = backend->head(blob_key);
     ASSERT_TRUE(before.exists);
@@ -531,7 +557,7 @@ TEST(CasS3Staging, PromoteOverCondemnedBlobResurrectsFromStagingNotBlobKey)
     auto build = precommittedBuildFor(store, ns, ref, hash, payload.size());
     build->putBlob(blob_id, serverSideCopySource(staging_key, payload.size()));
 
-    /// A CONDITIONAL promote (412 — blob present) FOLLOWED BY exactly one UNCONDITIONAL resurrect copy
+    /// A CONDITIONAL promote (412 — blob present) FOLLOWED BY exactly one UNCONDITIONAL resurrect
     /// whose SOURCE is the staging key, NEVER the condemned blob key.
     ASSERT_EQ(backend->copy_calls.size(), 2u);
     EXPECT_TRUE(backend->copy_calls[0].conditional);
@@ -547,11 +573,22 @@ TEST(CasS3Staging, PromoteOverCondemnedBlobResurrectsFromStagingNotBlobKey)
     EXPECT_NE(after.token, before.token);
     ASSERT_TRUE(after.exists);
 
-    /// The resurrect wrote the staging bytes over the condemned body, recorded a tokened dep, and
-    /// flipped the meta back to Clean (a live incarnation now backs the content key).
     const auto got = backend->get(blob_key);
     ASSERT_TRUE(got.has_value());
-    EXPECT_EQ(got->bytes, payload);
+    const uint64_t header_len = store->poolMeta().blob_header_len;
+
+    /// INV-NO-RETURN — THE fresh-tag property: the resurrected body is NOT byte-identical to the
+    /// condemned incarnation (a verbatim copy would have been). The PAYLOAD is preserved exactly (the
+    /// resurrect read it from OUR staging object, skipping the staging header), but the envelope HEADER
+    /// differs — the writer minted a FRESH incarnation_tag — so on a real content-addressed store the
+    /// resurrected ETag differs and the queued exact-token delete of the condemned incarnation cannot
+    /// match the live resurrection.
+    EXPECT_NE(got->bytes, staging_bytes);
+    ASSERT_GE(got->bytes.size(), header_len);
+    EXPECT_EQ(got->bytes.substr(header_len), payload);              /// payload preserved
+    EXPECT_NE(got->bytes.substr(0, header_len), staging_header);    /// header freshly re-tagged
+
+    /// The resurrect recorded a tokened dep and flipped the meta back to Clean.
     EXPECT_TRUE(build->depIsTokened(hash));
     const auto lm = DB::Cas::tests::loadMetaForTest(*backend, store->layout(), hash);
     ASSERT_TRUE(lm.has_value());

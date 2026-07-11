@@ -46,10 +46,14 @@ public:
     /// honor the write-once / resurrect contracts a real S3 backend provides — enough for the S3
     /// staging promote gtests). `promoteStaged` copies `staging_key`'s bytes to `blob_key` ONLY if
     /// `blob_key` is absent (`PreconditionFailed` otherwise), minting a fresh token = the "dest ETag".
-    /// `resurrectStaged` copies `staging_key`'s bytes over `blob_key` unconditionally, minting a fresh
-    /// token; it NEVER reads `blob_key` (INV `feedback_ca_resurrect_invariant`).
+    /// `resurrectStaged` re-uploads `staging_key`'s PAYLOAD (skipping its `staging_payload_offset`
+    /// envelope header) under `fresh_header`, writing `[fresh_header][payload]` over `blob_key`
+    /// unconditionally and minting a fresh token; it NEVER reads `blob_key` (INV
+    /// `feedback_ca_resurrect_invariant`). The fresh header makes the resurrected body DIFFER from the
+    /// condemned incarnation for the same payload (INV-NO-RETURN — the fresh-tag property).
     PutResult promoteStaged(const String & staging_key, const String & blob_key) override;
-    Token resurrectStaged(const String & staging_key, const String & blob_key) override;
+    Token resurrectStaged(const String & staging_key, const String & blob_key,
+                          const String & fresh_header, uint64_t staging_payload_offset) override;
 
     // ---- Fault-injection controls ----
 

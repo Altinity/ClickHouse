@@ -41,6 +41,16 @@ public:
 
     /// S3-native staging mode: `object_store_sink` is an ALREADY-OPENED write buffer over the staging
     /// object at `object_key` (e.g. `object_storage->writeObject(StoredObject(object_key), ...)`).
+    ///
+    /// `envelope_header` is the fixed-length (`blob_header_len`) CABL envelope header the transaction
+    /// built for this staging blob (S3-native staging fix 2026-07-11). It is written to the sink FIRST —
+    /// UNHASHED and NOT counted in the reported size — so the staging object holds `[header][payload]`
+    /// and the promote can stay a verbatim server-side copy. Excluding the header from the hash is
+    /// CRITICAL: the content key must be `cityHash128(payload)` (else the random `incarnation_tag` in the
+    /// header would make every blob's key unique ⇒ zero dedup), and the reported blob size must be the
+    /// PAYLOAD size (else the manifest `blob_size` would be payload+`blob_header_len`). Only the PAYLOAD
+    /// bytes written through THIS buffer flow through `hashing` and `count()`.
+    ///
     /// Bytes are hashed while streaming into `object_store_sink`; on finalize `on_finalized` receives
     /// `object_key` as its third argument (in place of a local temp path) and `getFileName()` returns
     /// it too. `cancelImpl` only cancels `object_store_sink` — it never attempts to delete the
@@ -49,6 +59,7 @@ public:
     CaContentWriteBuffer(
         std::unique_ptr<WriteBufferFromFileBase> object_store_sink,
         std::string object_key,
+        std::string envelope_header,
         size_t buf_size,
         bool use_adaptive_buffer_size,
         size_t adaptive_buffer_initial_size,

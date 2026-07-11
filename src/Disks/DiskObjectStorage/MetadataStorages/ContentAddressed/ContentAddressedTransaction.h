@@ -124,6 +124,11 @@ private:
                            const UInt128 & hash, size_t size, const std::string & staging_key,
                            StagingBackend backend);
 
+    /// S3-native staging fix 2026-07-11: build the fixed-length CABL envelope header for a staging blob,
+    /// with a FRESH `incarnation_tag`, so the S3 staging object holds `[header][payload]` and the promote
+    /// stays a verbatim server-side copy. `build_id` is left 0 (not known at stream time; diagnostic-only).
+    std::string buildS3StagingBlobHeader(const ContentAddressedMetadataStorage::Route & route) const;
+
     PartStaging & stagingFor(const ContentAddressedMetadataStorage::Route & r);
     PartStaging * findStaging(const ContentAddressedMetadataStorage::Route & r);
     const Cas::ManifestEntry * findStagedEntry(const ContentAddressedMetadataStorage::Route & r) const;

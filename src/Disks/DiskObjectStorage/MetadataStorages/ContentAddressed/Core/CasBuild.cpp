@@ -340,8 +340,6 @@ void Build::uploadFromSource(ObjectKind kind, const UInt128 & hash, const String
         EnvelopeHeader header;
         header.kind = kind;
         header.hash_algo = 1;
-        header.logical_size = source.size;
-        header.logical_hash = hash;
         header.domain_id = meta.pool_id;
         header.incarnation_tag = mintU128();
         header.build_id = build_id;
@@ -521,13 +519,22 @@ void Build::uploadFromSource(ObjectKind kind, const UInt128 & hash, const String
     /// Condemned: displace the condemned incarnation with our fresh source.
     if (source.server_side_copy_from)
     {
-        /// S3-native staging RESURRECT (spec §5/§9): re-establish a fresh incarnation by an
-        /// UNCONDITIONAL server-side copy from OUR OWN staging object — NEVER a read/copy of the
-        /// condemned `key` (`feedback_ca_resurrect_invariant`). We reach here ONLY after the per-hash
-        /// meta point-read observed `Condemned` just above, so this overwrites a condemned body, never a
-        /// live blob (INV: never overwrite a live blob, spec §9). The copy mints a fresh ETag/token —
-        /// the W-FRESH-TAG role the freshly-minted `incarnation_tag` plays on the streaming path.
-        const Token tok = store->backend().resurrectStaged(*source.server_side_copy_from, key);
+        /// S3-native staging RESURRECT (spec §5/§9, INV-NO-RETURN fix 2026-07-11): re-establish a fresh
+        /// incarnation by re-uploading OUR OWN staging PAYLOAD under a FRESHLY-tagged envelope header —
+        /// NEVER a read/copy of the condemned `key` (`feedback_ca_resurrect_invariant`). We reach here
+        /// ONLY after the per-hash meta point-read observed `Condemned` just above, so this overwrites a
+        /// condemned body, never a live blob (INV: never overwrite a live blob, spec §9).
+        ///
+        /// CRITICAL — a VERBATIM server-side copy of the create-time staging object would reproduce the
+        /// condemned incarnation's exact bytes ⇒ identical ETag ⇒ the queued exact-token delete of the
+        /// condemned incarnation would kill the live resurrection (data loss). `buildHeader` mints a
+        /// FRESH `incarnation_tag` distinct from the staging header's tag, so the resurrected body (and
+        /// hence its ETag) differs from the condemned incarnation regardless of edge-before-observe. The
+        /// backend reads the payload from the staging object skipping its own `blob_header_len` envelope
+        /// header and prepends this fresh header.
+        const String fresh_header = buildHeader();
+        const Token tok = store->backend().resurrectStaged(
+            *source.server_side_copy_from, key, fresh_header, meta.blob_header_len);
         recordDoneAndEmit(tok);
         writeResurrectMetaClean(lm);
         return;
@@ -622,19 +629,17 @@ Token Build::copyForwardFromCondemned(const UInt128 & hash, const String & key, 
         const std::string_view payload{got->bytes.data() + header_in.header_len,
                                        got->bytes.size() - header_in.header_len};
         const UInt128 payload_hash = poolContentHash(payload);
-        if (payload_hash != hash || header_in.logical_hash != hash)
+        if (payload_hash != hash)
             throw Exception(ErrorCodes::CORRUPTED_DATA,
                 "copyForwardFromCondemned: object {} payload does not verify against its content key "
-                "(payload hash {}, header hash {}, expected {}) — refusing to copy forward",
-                key, u128ToHex(payload_hash), u128ToHex(header_in.logical_hash), u128ToHex(hash));
+                "(payload hash {}, expected {}) — refusing to copy forward",
+                key, u128ToHex(payload_hash), u128ToHex(hash));
 
         /// 3. Re-wrap under a fresh envelope: fresh incarnation_tag + THIS build's build_id
         ///    (W-FRESH-TAG, B167 — the new incarnation is owned by this live build).
         EnvelopeHeader header;
         header.kind = ObjectKind::Blob;
         header.hash_algo = 1;
-        header.logical_size = payload.size();
-        header.logical_hash = hash;
         header.domain_id = meta.pool_id;
         header.incarnation_tag = mintU128();
         header.build_id = build_id;

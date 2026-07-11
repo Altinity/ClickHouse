@@ -38,6 +38,7 @@ CaContentWriteBuffer::CaContentWriteBuffer(
 CaContentWriteBuffer::CaContentWriteBuffer(
     std::unique_ptr<WriteBufferFromFileBase> object_store_sink,
     std::string object_key,
+    std::string envelope_header,
     size_t buf_size,
     bool use_adaptive_buffer_size,
     size_t adaptive_buffer_initial_size,
@@ -49,8 +50,18 @@ CaContentWriteBuffer::CaContentWriteBuffer(
     , sink(std::move(object_store_sink))
 {
     /// The sink is ALREADY opened against the staging object by the caller (writeFile) — this
-    /// constructor only wraps it in the hashing chain, exactly like the local-temp-file mode. The
-    /// adaptive-sizing params only affect THIS outer buffer (mirroring the Local ctor above); the
+    /// constructor wraps it in the hashing chain, exactly like the local-temp-file mode.
+    ///
+    /// S3-native staging fix 2026-07-11: write the CABL envelope header to the sink FIRST, DIRECTLY —
+    /// bypassing `hashing` (so it is excluded from the content hash) and this outer buffer's `count()`
+    /// (so the reported size is the payload only). The staging object therefore holds `[header][payload]`
+    /// and the promote stays a verbatim server-side copy. Only the payload the caller subsequently writes
+    /// through THIS buffer flows through `hashing`. The header write precedes any payload write, so the
+    /// on-object byte order is header-then-payload.
+    if (!envelope_header.empty())
+        sink->write(envelope_header.data(), envelope_header.size());
+
+    /// The adaptive-sizing params only affect THIS outer buffer (mirroring the Local ctor above); the
     /// sink's own buffering was decided by the caller when it opened the object-store write.
     hashing = std::make_unique<HashingWriteBuffer>(*sink);
 }
