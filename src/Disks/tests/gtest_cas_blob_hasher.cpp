@@ -134,13 +134,49 @@ TEST(CasBlobHasher, AlgoNameAndParseRoundTrip)
     EXPECT_THROW(parseBlobHashAlgo(""), DB::Exception);
 }
 
-TEST(CasBlobHasher, Sha256NotImplemented)
+TEST(CasBlobHasher, Sha256OneShotGoldenVectors)
 {
+    /// NIST/FIPS 180-2 test vectors, the standard SHA-256 sanity check.
+    EXPECT_EQ(blobHashHexOneShot(BlobHashAlgo::Sha256, "abc"),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    EXPECT_EQ(blobHashHexOneShot(BlobHashAlgo::Sha256, ""),
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+}
+
+TEST(CasBlobHasher, Sha256StreamingMatchesOneShotAndIsPassthrough)
+{
+    /// Bigger than `DBMS_DEFAULT_HASHING_BLOCK_SIZE` (2048 B) so the payload chunks through several
+    /// `nextImpl` flushes, not just a single call.
+    const std::string payload = makePayload(200 * 1024);
+
     std::string sink_data;
-    WriteBufferFromString sink(sink_data);
+    std::string streaming_hex;
+    {
+        WriteBufferFromString sink(sink_data);
+        auto hashing = makeBlobHashingWriteBuffer(BlobHashAlgo::Sha256, sink);
 
-    EXPECT_THROW(makeBlobHashingWriteBuffer(BlobHashAlgo::Sha256, sink), DB::Exception);
-    EXPECT_THROW(blobHashHexOneShot(BlobHashAlgo::Sha256, "abc"), DB::Exception);
+        /// Feed the payload through several `write()` chunks to exercise the streaming EVP digest
+        /// across multiple `nextImpl` flushes.
+        size_t offset = 0;
+        constexpr size_t chunk = 4096;
+        while (offset < payload.size())
+        {
+            const size_t n = std::min(chunk, payload.size() - offset);
+            hashing->write(payload.data() + offset, n);
+            offset += n;
+        }
 
-    sink.finalize();
+        streaming_hex = hashing->getHashHex();
+        hashing->finalize();
+        sink.finalize();
+    }
+
+    /// The passthrough forwarded every byte unchanged.
+    EXPECT_EQ(sink_data, payload);
+    EXPECT_EQ(streaming_hex.size(), 64u);
+
+    /// SHA-256 streaming == SHA-256 one-shot (like xxh3, unlike cityHash128 -- SHA-256 has no
+    /// chunked convention to preserve).
+    const std::string one_shot_hex = blobHashHexOneShot(BlobHashAlgo::Sha256, payload);
+    EXPECT_EQ(streaming_hex, one_shot_hex);
 }

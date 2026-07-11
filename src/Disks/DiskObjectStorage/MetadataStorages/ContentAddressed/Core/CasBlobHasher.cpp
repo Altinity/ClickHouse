@@ -5,7 +5,10 @@
 #include <IO/HashingWriteBuffer.h>
 #include <IO/ReadBufferFromMemory.h>
 #include <Common/Exception.h>
+#include <Common/OpenSSLHelpers.h>
 #include <base/hex.h>
+
+#include <openssl/evp.h>
 
 /// `XXH_INLINE_ALL` renames every public symbol under the `XXH_INLINE_` prefix (`XXH_NAMESPACE`) and
 /// makes the whole library a header-only, static-inline implementation local to THIS translation
@@ -22,7 +25,6 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
-    extern const int NOT_IMPLEMENTED;
     extern const int LOGICAL_ERROR;
 }
 }
@@ -166,6 +168,67 @@ private:
     Xxh3Streamer state;
 };
 
+/// A hash-and-passthrough buffer over OpenSSL's streaming EVP SHA-256 digest. Unlike the 128-bit
+/// hashes above, `Sha256` produces a 32-byte digest (64 lowercase hex chars, see `blobHashLenFor`).
+/// Every byte written is folded into the running EVP digest (`EVP_DigestUpdate`) AND forwarded
+/// unchanged to `sink`, exactly like `Xxh3128BlobHashingWriteBuffer` above -- streaming SHA-256 is
+/// defined to agree with the one-shot digest, so there is no chunked-convention to preserve either.
+class Sha256BlobHashingWriteBuffer : public BufferWithOwnMemory<IHashingWriteBuffer>
+{
+public:
+    explicit Sha256BlobHashingWriteBuffer(WriteBuffer & sink_, size_t buf_size = DBMS_DEFAULT_HASHING_BLOCK_SIZE)
+        : BufferWithOwnMemory<IHashingWriteBuffer>(buf_size)
+        , sink(sink_)
+        , ctx(EVP_MD_CTX_new(), &EVP_MD_CTX_free)
+    {
+        if (!ctx)
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "Sha256BlobHashingWriteBuffer: EVP_MD_CTX_new failed: {}", getOpenSSLErrors());
+
+        if (EVP_DigestInit_ex(ctx.get(), EVP_sha256(), nullptr) != 1)
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "Sha256BlobHashingWriteBuffer: EVP_DigestInit_ex failed: {}", getOpenSSLErrors());
+    }
+
+    void sync() override
+    {
+        sink.sync();
+    }
+
+    String getHashHex() override
+    {
+        next();
+
+        unsigned char digest[EVP_MAX_MD_SIZE];
+        unsigned int digest_len = 0;
+        if (EVP_DigestFinal_ex(ctx.get(), digest, &digest_len) != 1)
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "Sha256BlobHashingWriteBuffer: EVP_DigestFinal_ex failed: {}", getOpenSSLErrors());
+
+        chassert(digest_len == 32);
+        return hexString(digest, digest_len);
+    }
+
+private:
+    using EVP_MD_CTX_ptr = std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)>;
+
+    void nextImpl() override
+    {
+        const size_t len = offset();
+        if (!len)
+            return;
+
+        if (EVP_DigestUpdate(ctx.get(), working_buffer.begin(), len) != 1)
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "Sha256BlobHashingWriteBuffer: EVP_DigestUpdate failed: {}", getOpenSSLErrors());
+
+        sink.write(working_buffer.begin(), len);
+    }
+
+    WriteBuffer & sink;
+    EVP_MD_CTX_ptr ctx;
+};
+
 }
 
 std::unique_ptr<IHashingWriteBuffer> makeBlobHashingWriteBuffer(BlobHashAlgo algo, WriteBuffer & sink)
@@ -177,9 +240,7 @@ std::unique_ptr<IHashingWriteBuffer> makeBlobHashingWriteBuffer(BlobHashAlgo alg
         case BlobHashAlgo::XXH3_128:
             return std::make_unique<Xxh3128BlobHashingWriteBuffer>(sink);
         case BlobHashAlgo::Sha256:
-            throw Exception(ErrorCodes::NOT_IMPLEMENTED,
-                "makeBlobHashingWriteBuffer: sha256 blob hashing is not implemented yet (Phase 2 -- "
-                "the variable-length digest refactor)");
+            return std::make_unique<Sha256BlobHashingWriteBuffer>(sink);
     }
     throw Exception(ErrorCodes::BAD_ARGUMENTS, "makeBlobHashingWriteBuffer: unknown BlobHashAlgo {}", static_cast<int>(algo));
 }
@@ -207,9 +268,14 @@ String blobHashHexOneShot(BlobHashAlgo algo, std::string_view bytes)
             return getHexUIntLowercase(UInt128{low, high});
         }
         case BlobHashAlgo::Sha256:
-            throw Exception(ErrorCodes::NOT_IMPLEMENTED,
-                "blobHashHexOneShot: sha256 blob hashing is not implemented yet (Phase 2 -- the "
-                "variable-length digest refactor)");
+        {
+            /// One-shot SHA-256 is defined to agree with the streaming EVP digest above (there is no
+            /// chunked convention to preserve, unlike `CityHash128`), so this can go straight through
+            /// `encodeSHA256`'s one-shot path instead of round-tripping through a streaming buffer.
+            unsigned char digest[32];
+            encodeSHA256(bytes.data(), bytes.size(), digest);
+            return hexString(digest, sizeof(digest));
+        }
     }
     throw Exception(ErrorCodes::BAD_ARGUMENTS, "blobHashHexOneShot: unknown BlobHashAlgo {}", static_cast<int>(algo));
 }
