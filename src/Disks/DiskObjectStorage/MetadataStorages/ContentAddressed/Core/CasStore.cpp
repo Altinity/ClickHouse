@@ -135,7 +135,7 @@ StorePtr Store::open(BackendPtr backend, PoolConfig config)
         const UInt128 probe_uid = (static_cast<UInt128>(thread_local_rng()) << 64) | thread_local_rng();
         runCapabilityProbe(*backend, config.pool_prefix + "/_probe/" + u128ToHex(probe_uid));
     }
-    PoolMeta meta = PoolMeta::createOrValidate(*backend, layout, config.root_shards, config.blob_header_len);
+    PoolMeta meta = PoolMeta::createOrValidate(*backend, layout, config.root_shards, config.blob_header_len, config.blob_hash_algo);
 
     /// Private ctor: make_shared cannot reach it.
     StorePtr store(new Store(std::move(backend), std::move(config), std::move(meta)));

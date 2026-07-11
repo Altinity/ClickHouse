@@ -87,7 +87,12 @@ public:
         /// S3-native staging Task 0 (config plumbing, no behavior change): see `StagingBackend`
         /// above. Trailing default keeps every existing positional call site (the disk factory,
         /// the gtests that stop at `context_`) compiling unmodified.
-        StagingBackend staging_backend_ = StagingBackend::Local);
+        StagingBackend staging_backend_ = StagingBackend::Local,
+        /// CAS pluggable-blob-hash Phase 1 (design 2026-07-11-cas-pluggable-blob-hash-design.md):
+        /// the pool's blob content-hash function, threaded into `Cas::PoolConfig` in `startup()`.
+        /// Trailing default (`CityHash128`, byte-for-byte today's behavior) keeps every existing
+        /// positional call site compiling unmodified.
+        Cas::BlobHashAlgo blob_hash_algo_ = Cas::BlobHashAlgo::CityHash128);
 
     /// Parse `cas_staging_backend` from the CAS disk config (default `local` — the OFF BY DEFAULT
     /// global constraint). Extracted as a static method (rather than inlined into
@@ -286,6 +291,9 @@ private:
     const uint64_t gc_meta_pool_size;
     /// S3-native staging Task 0 (config plumbing, no behavior change): see `StagingBackend` above.
     const StagingBackend staging_backend;
+    /// CAS pluggable-blob-hash Phase 1: the pool's blob content-hash function, threaded into
+    /// `Cas::PoolConfig` in `startup()`.
+    const Cas::BlobHashAlgo blob_hash_algo;
     /// Set later by the mount-time conditional-copy capability probe (a later task) — NOT const.
     /// Defaults to false (fail-close): assumed unsupported until the probe proves otherwise.
     bool conditional_copy_supported = false;

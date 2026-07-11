@@ -1,5 +1,6 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobHasher.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEvent.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
@@ -116,6 +117,12 @@ struct PoolConfig
     /// healthy / ~165 KB under a 10-minute storm with batching ~1.4x and discovery x4.
     uint64_t root_shards = 32;
     uint64_t blob_header_len = 256;           /// creation-time only; ditto
+    /// CAS pluggable-blob-hash Phase 1 (design 2026-07-11-cas-pluggable-blob-hash-design.md): the
+    /// pool's blob content-hash function. Creation-time only, like `root_shards`/`blob_header_len` —
+    /// `PoolMeta::createOrValidate` is pool-authoritative on reopen and fails closed (BAD_ARGUMENTS)
+    /// when this disagrees with the pool's recorded algo (spec §8: never re-hash an existing pool).
+    /// Default `CityHash128` keeps every existing pool's hash byte-for-byte unchanged.
+    BlobHashAlgo blob_hash_algo = BlobHashAlgo::CityHash128;
     /// P1 (dedup cache): byte ceiling for the per-disk known-present blob-hash LRU set. 0 disables the
     /// cache (every create misses → P2-only). A hint cache; correctness never depends on it (a stale
     /// hit is caught by the mandatory HEAD in putBlob — design 2026-06-20, B168).

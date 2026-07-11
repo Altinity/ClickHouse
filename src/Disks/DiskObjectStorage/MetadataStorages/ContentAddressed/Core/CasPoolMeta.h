@@ -1,5 +1,6 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobHasher.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
 #include <base/types.h>
 #include <base/extended_types.h>
@@ -23,12 +24,21 @@ struct PoolMeta
     uint64_t root_shards = 0;
     uint64_t blob_header_len = 0;
     uint64_t min_reader_generation = 0;     /// startup gate: if G_BUILD < min_reader_generation => UNKNOWN_FORMAT_VERSION
+    /// CAS pluggable-blob-hash Phase 1 (spec 2026-07-11, §4): the pool's blob content-hash function,
+    /// as `static_cast<uint8_t>(BlobHashAlgo)`. `1` = `BlobHashAlgo::CityHash128` (the default;
+    /// existing pools created before this field existed decode to `1`, which is correct — they ARE
+    /// cityHash128 pools). Fixed at pool creation; on reopen the recorded value is authoritative
+    /// (`createOrValidate` fails closed on a disagreeing config, spec §8 — never re-hash a pool).
+    uint8_t blob_hash_algo = 1;
 
     /// GET `_pool_meta`; absent => mint `pool_id` (`thread_local_rng`) and `casPut(expected=nullopt)` —
     /// a racing creator loses the CAS, re-reads, and validates like a reopen. Present => strict parse.
-    /// The POOL is authoritative on reopen: `root_shards` / `blob_header_len` come FROM the pool; the
-    /// passed config values apply only at first creation.
-    static PoolMeta createOrValidate(Backend &, const Layout &, uint64_t root_shards, uint64_t blob_header_len);
+    /// The POOL is authoritative on reopen: `root_shards` / `blob_header_len` / `blob_hash_algo` come
+    /// FROM the pool; the passed config values apply only at first creation. `blob_hash_algo` additionally
+    /// fails closed on reopen (BAD_ARGUMENTS) when the config disagrees with the recorded value.
+    static PoolMeta createOrValidate(
+        Backend &, const Layout &, uint64_t root_shards, uint64_t blob_header_len,
+        BlobHashAlgo blob_hash_algo = BlobHashAlgo::CityHash128);
 };
 
 String encodePoolMeta(const PoolMeta &);     /// exposed for the round-trip test

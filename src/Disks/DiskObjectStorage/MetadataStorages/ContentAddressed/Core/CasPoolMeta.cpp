@@ -28,8 +28,11 @@ namespace
 /// Pool-wide constant invariants, enforced in two contexts with different error codes:
 ///   - at creation, a bad value is the CALLER's config mistake => BAD_ARGUMENTS;
 ///   - on decode, a persisted object violating them is corruption => CORRUPTED_DATA.
-/// `root_shards` must be at least 1; `blob_header_len` must be 8-aligned and within [96, 16 KiB].
-void validateConstants(uint64_t root_shards, uint64_t blob_header_len, int error_code, std::string_view what)
+/// `root_shards` must be at least 1; `blob_header_len` must be 8-aligned and within [96, 16 KiB];
+/// `blob_hash_algo` must be a value `BlobHashAlgo` actually admits (`blobHashAlgoName` throws
+/// `BAD_ARGUMENTS` for anything else -- re-thrown here under the caller-selected `error_code` so a
+/// corrupt persisted value reports CORRUPTED_DATA rather than BAD_ARGUMENTS).
+void validateConstants(uint64_t root_shards, uint64_t blob_header_len, uint8_t blob_hash_algo, int error_code, std::string_view what)
 {
     if (root_shards < 1)
         throw Exception(error_code, "CAS {}: root_shards must be >= 1, got {}", what, root_shards);
@@ -39,6 +42,14 @@ void validateConstants(uint64_t root_shards, uint64_t blob_header_len, int error
         throw Exception(error_code, "CAS {}: blob_header_len must be a multiple of 8, got {}", what, blob_header_len);
     if (blob_header_len > 16 * 1024)
         throw Exception(error_code, "CAS {}: blob_header_len must be <= 16384, got {}", what, blob_header_len);
+    try
+    {
+        blobHashAlgoName(static_cast<BlobHashAlgo>(blob_hash_algo));
+    }
+    catch (const Exception &)
+    {
+        throw Exception(error_code, "CAS {}: blob_hash_algo must be a known algo, got {}", what, blob_hash_algo);
+    }
 }
 
 /// Two `thread_local_rng` u64 draws composed into a 128-bit id.
@@ -65,6 +76,7 @@ String encodePoolMeta(const PoolMeta & pm)
     msg.set_root_shards(pm.root_shards);
     msg.set_blob_header_len(pm.blob_header_len);
     msg.set_min_reader_generation(pm.min_reader_generation);
+    msg.set_blob_hash_algo(pm.blob_hash_algo);
 
     std::string out;
     if (!msg.SerializeToString(&out))
@@ -94,9 +106,12 @@ PoolMeta decodePoolMeta(std::string_view data)
     pm.root_shards = msg.root_shards();
     pm.blob_header_len = msg.blob_header_len();
     pm.min_reader_generation = msg.min_reader_generation();
+    /// Absent (old-format pool, pre-dating this field) => default `1` (cityHash128) -- correct,
+    /// because every pool created before this field existed WAS cityHash128 (spec §8 default-unchanged).
+    pm.blob_hash_algo = msg.has_blob_hash_algo() ? static_cast<uint8_t>(msg.blob_hash_algo()) : 1;
 
     /// A persisted object violating the constant invariants is corruption, not a config error.
-    validateConstants(pm.root_shards, pm.blob_header_len, ErrorCodes::CORRUPTED_DATA, "pool meta");
+    validateConstants(pm.root_shards, pm.blob_header_len, pm.blob_hash_algo, ErrorCodes::CORRUPTED_DATA, "pool meta");
 
     /// Startup gate: if min_reader_generation > G_BUILD, this binary is too old to open the pool.
     if (G_BUILD < pm.min_reader_generation)
@@ -107,16 +122,40 @@ PoolMeta decodePoolMeta(std::string_view data)
     return pm;
 }
 
-PoolMeta PoolMeta::createOrValidate(Backend & backend, const Layout & layout, uint64_t root_shards, uint64_t blob_header_len)
+namespace
+{
+
+/// Fail-closed on a blob-hash mismatch (spec §8: never re-hash an existing pool). Shared by the
+/// existing-pool branch and the lost-the-creation-race branch of `createOrValidate` below.
+void checkBlobHashAlgoMatches(const PoolMeta & pool, BlobHashAlgo config_algo)
+{
+    if (pool.blob_hash_algo == static_cast<uint8_t>(config_algo))
+        return;
+    throw Exception(ErrorCodes::BAD_ARGUMENTS,
+        "CAS pool blob_hash mismatch: pool was created with {} but disk config requests {}; "
+        "never re-hash an existing pool",
+        blobHashAlgoName(static_cast<BlobHashAlgo>(pool.blob_hash_algo)), blobHashAlgoName(config_algo));
+}
+
+}
+
+PoolMeta PoolMeta::createOrValidate(
+    Backend & backend, const Layout & layout, uint64_t root_shards, uint64_t blob_header_len, BlobHashAlgo blob_hash_algo)
 {
     /// The passed config is the caller's responsibility — reject bad values before any I/O.
-    validateConstants(root_shards, blob_header_len, ErrorCodes::BAD_ARGUMENTS, "pool meta");
+    validateConstants(root_shards, blob_header_len, static_cast<uint8_t>(blob_hash_algo), ErrorCodes::BAD_ARGUMENTS, "pool meta");
 
     const String key = layout.poolMetaKey();
 
-    /// Present => the pool is authoritative; ignore the passed config and validate like a reopen.
+    /// Present => the pool is authoritative; ignore the passed config's root_shards/blob_header_len
+    /// and validate like a reopen -- EXCEPT blob_hash_algo, which fails closed on disagreement rather
+    /// than silently being ignored (spec §8: never re-hash an existing pool with a different function).
     if (auto existing = backend.get(key))
-        return decodePoolMeta(existing->bytes);
+    {
+        PoolMeta pm = decodePoolMeta(existing->bytes);
+        checkBlobHashAlgoMatches(pm, blob_hash_algo);
+        return pm;
+    }
 
     /// Absent => mint a pool id and try to create the object. A racing creator that wrote first
     /// turns our create-if-absent CAS into a Conflict; we then re-read and validate like a reopen.
@@ -125,6 +164,7 @@ PoolMeta PoolMeta::createOrValidate(Backend & backend, const Layout & layout, ui
     pm.root_shards = root_shards;
     pm.blob_header_len = blob_header_len;
     pm.min_reader_generation = 0;   /// pre-release: no minimum reader generation required
+    pm.blob_hash_algo = static_cast<uint8_t>(blob_hash_algo);
 
     if (backend.casPut(key, encodePoolMeta(pm), /*expected*/ std::nullopt).outcome == CasOutcome::Committed)
         return pm;
@@ -134,7 +174,9 @@ PoolMeta PoolMeta::createOrValidate(Backend & backend, const Layout & layout, ui
     if (!winner)
         throw Exception(ErrorCodes::LOGICAL_ERROR,
             "CAS pool meta: create-if-absent reported Conflict but '{}' is absent on re-read", key);
-    return decodePoolMeta(winner->bytes);
+    PoolMeta winner_pm = decodePoolMeta(winner->bytes);
+    checkBlobHashAlgoMatches(winner_pm, blob_hash_algo);
+    return winner_pm;
 }
 
 }

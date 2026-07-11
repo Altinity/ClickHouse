@@ -146,7 +146,8 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     uint64_t cas_part_folder_cache_max_entry_bytes_,
     uint64_t manifest_decode_cache_bytes_,
     uint64_t gc_meta_pool_size_,
-    StagingBackend staging_backend_)
+    StagingBackend staging_backend_,
+    Cas::BlobHashAlgo blob_hash_algo_)
     : object_storage(std::move(object_storage_))
     , storage_path_prefix(std::move(storage_path_prefix_))
     , storage_path_full(fs::path(object_storage->getRootPrefix()) / storage_path_prefix)
@@ -174,6 +175,7 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     , manifest_decode_cache_bytes(manifest_decode_cache_bytes_)
     , gc_meta_pool_size(gc_meta_pool_size_)
     , staging_backend(staging_backend_)
+    , blob_hash_algo(blob_hash_algo_)
 {
 }
 
@@ -406,6 +408,9 @@ void ContentAddressedMetadataStorage::startup()
     /// manifest CAS writes across more keys, reducing per-key congestion + per-key overwrite-orphan
     /// pileup (#4). Existing pools keep their shard count.
     pool_config.root_shards = root_shards;
+    /// Creation-time only (the pool is authoritative on reopen): `PoolMeta::createOrValidate`
+    /// fails closed (BAD_ARGUMENTS) when this disagrees with an existing pool's recorded algo.
+    pool_config.blob_hash_algo = blob_hash_algo;
     pool_config.dedup_cache_bytes = dedup_cache_bytes;
     pool_config.dedup_head_first_min_bytes = dedup_head_first_min_bytes;
     pool_config.manifest_decode_cache_bytes = manifest_decode_cache_bytes;
