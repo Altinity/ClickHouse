@@ -185,12 +185,15 @@ String placementName(EntryPlacement p)
 
 /// `inline_bytes` renders as its LENGTH only, not its content — an inline file's bytes are payload
 /// data, not part-manifest identity, and may be arbitrarily large / non-UTF8.
-String renderManifestEntry(const ManifestEntry & e)
+String renderManifestEntry(const ManifestEntry & e, uint8_t blob_hash_len)
 {
+    /// Render the FULL pool-width digest (64 hex chars for sha256, 32 for the 128-bit algos) via the
+    /// pool-scoped codec — NOT `e.blob_hash.toU128()`, which would truncate a 32-byte sha256 digest to
+    /// its first 16 bytes in introspection JSON. `blob_hash_len` comes from the owning `PartManifest`.
     return JsonObj()
         .add("path", jsonEscape(e.path))
         .add("placement", jsonEscape(placementName(e.placement)))
-        .add("blob_hash", jsonHex(e.blob_hash.toU128()))
+        .add("blob_hash", jsonEscape(DigestCodec(blob_hash_len).toHex(e.blob_hash)))
         .add("blob_size", jsonUInt(e.blob_size))
         .add("inline_bytes_size", jsonUInt(e.inline_bytes.size()))
         .str();
@@ -201,7 +204,7 @@ String renderPartManifest(const PartManifest & m)
     std::vector<String> entries;
     entries.reserve(m.entries.size());
     for (const auto & e : m.entries)
-        entries.push_back(renderManifestEntry(e));
+        entries.push_back(renderManifestEntry(e, m.blob_hash_len));
 
     return JsonObj()
         .add("ref", renderManifestRef(m.ref))
