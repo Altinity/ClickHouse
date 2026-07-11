@@ -202,7 +202,7 @@ void Gc::scheduleMetaJob(std::function<void()> job)
     }
 }
 
-RoundReport Gc::runRegularRound()
+RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired)
 {
     RoundReport report;
     GcState state;
@@ -210,6 +210,13 @@ RoundReport Gc::runRegularRound()
     report.acquired_lease = acquireOrRenewLease(state, state_token);
     if (!report.acquired_lease)
         return report;
+
+    /// B160/P3-B1: fire the acquire-time hook BEFORE the long fold below, not after the round
+    /// returns - a new leader's first round could otherwise run for the whole fold with no
+    /// heartbeat cover, letting a follower steal deterministically once it freezes (owner, seq)
+    /// across two of its own ticks.
+    if (on_lease_acquired)
+        on_lease_acquired();
 
     /// Task 5: this round's per-hash meta-write anomaly tally starts fresh (folded into the report
     /// after `meta_pool->wait()`, below).

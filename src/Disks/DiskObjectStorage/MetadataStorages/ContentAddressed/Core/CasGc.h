@@ -125,7 +125,14 @@ public:
     Gc(StorePtr store_, UInt128 gc_id_, std::function<uint64_t()> now_ms_fn_ = {});
 
     /// One full round. Returns acquired_lease=false (nothing else done) if another leader is alive.
-    RoundReport runRegularRound();
+    /// `on_lease_acquired`, if set, is invoked ONCE, synchronously, immediately after the lease is
+    /// acquired/renewed and BEFORE the (potentially long) fold begins - the scheduler uses this to
+    /// mark itself leader and fire the first advisory heartbeat pulse right away (B160/P3-B1: a new
+    /// leader's first round must not run unprotected for the whole fold before the pacing thread's
+    /// post-round bookkeeping would otherwise have set it). Never called when the lease is not held;
+    /// exceptions from the callback propagate like any other round failure (the caller is expected to
+    /// keep it advisory/non-throwing, matching pulseHeartbeat's own contract).
+    RoundReport runRegularRound(std::function<void()> on_lease_acquired = {});
 
     /// B160 advisory heartbeat: bump <prefix>/gc/hb to {gc_id, hb_seq+1}. Best-effort (a lost CAS is
     /// harmless — the next pulse retries). Touches NO Gc instance state. Static by design.

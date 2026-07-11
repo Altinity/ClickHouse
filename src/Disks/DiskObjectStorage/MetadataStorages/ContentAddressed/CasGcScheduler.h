@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <functional>
 #include <mutex>
 
 namespace DB::ContentAddressed
@@ -47,7 +48,7 @@ private:
     /// Run one round through the full logging path (Start record, ProfileEventsScope, Finish
     /// record). Used by BOTH loop() and runOneRoundNow. Logging is best-effort - the logger sink
     /// never throws into the round. Rethrows a round exception (after emitting an Aborted Finish).
-    Cas::RoundReport runRoundLogged(Cas::Gc & gc, GcRoundLogRecord::Trigger trigger);
+    Cas::RoundReport runRoundLogged(Cas::Gc & gc, GcRoundLogRecord::Trigger trigger, std::function<void()> on_lease_acquired = {});
 
     const Cas::StorePtr store;
     const std::chrono::seconds interval;

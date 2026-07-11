@@ -240,6 +240,56 @@ TEST(CasGcLease, HeartbeatBlocksFalseStealOfAliveLeader)
     EXPECT_EQ(readState(*b, *s).lease.owner, kGcA);            /// gc1 still owns the lease
 }
 
+/// P3-B1 (2026-07-11 mid-switch soak wedge): CasGcScheduler used to flip its `i_am_leader` flag (which
+/// gates the heartbeat thread's pulses) only AFTER `runRegularRound` RETURNS, while the lease is
+/// acquired INSIDE the round, before the (potentially long) fold. A brand-new leader's FIRST round
+/// therefore ran the whole fold with no heartbeat cover: a follower observing the frozen (owner, seq)
+/// across two of its own ticks steals deterministically once that first round outlasts ~2 ticks -
+/// mutual-steal livelock under a slow fold. The fix moves the "start heartbeating" action to the
+/// INSTANT the lease is acquired (`Gc::runRegularRound`'s new `on_lease_acquired` hook), fired before
+/// the fold begins. These two tests pin the protocol both ways at the `Gc` level (the scheduler itself
+/// only wires `i_am_leader.store(true, ...)` + one `pulseHeartbeat` call into that hook - a thread-pacing
+/// wire-up not practically unit-testable without sleeps; verified by code review + the full gtest run).
+
+TEST(CasGcLease, WithoutAcquireTimePulseFirstRoundStealsDeterministically)
+{
+    /// RED-before-the-fix scenario: gc1 acquires the lease and (simulating a long first round) never
+    /// pulses `gc/hb` and never renews - exactly what happened before `on_lease_acquired` existed.
+    /// gc2's SECOND observation of the same frozen (owner, seq, hb) steals, per the documented protocol.
+    std::shared_ptr<InMemoryBackend> b;
+    auto s = openTestStore(b);
+    Gc gc1(s, kGcA);
+    Gc gc2(s, kGcB);
+
+    ASSERT_TRUE(gc1.runRegularRound().acquired_lease);    /// gc1 becomes leader; NO pulse follows (the bug)
+    EXPECT_FALSE(gc2.runRegularRound().acquired_lease);   /// obs #1: records (owner=A, seq, hb=absent)
+    EXPECT_TRUE(gc2.runRegularRound().acquired_lease);    /// obs #2: unchanged => steal-eligible => STEALS
+    EXPECT_EQ(readState(*b, *s).lease.owner, kGcB);
+}
+
+TEST(CasGcLease, AcquireTimePulseProtectsNewLeadersFirstRound)
+{
+    /// GREEN-after-the-fix scenario: with the fix, `i_am_leader` flips true and the FIRST pulse fires
+    /// the instant gc1 acquires the lease - before B's first observation even happens - and the
+    /// (separately-threaded, out of scope here) `heartbeatLoop` keeps landing further pulses on its own
+    /// cadence for as long as `i_am_leader` stays true, i.e. for the whole duration of gc1's first round.
+    /// The net effect proven here is the one that matters: SOME pulse lands between B's two
+    /// observations (not just before both, and not only after both), so B's second observation sees hb
+    /// advanced relative to its first and backs off instead of stealing - exactly what never happened
+    /// pre-fix, when `i_am_leader` (and hence every pulse) was gated on the round having already returned.
+    std::shared_ptr<InMemoryBackend> b;
+    auto s = openTestStore(b);
+    Gc gc1(s, kGcA);
+    Gc gc2(s, kGcB);
+
+    ASSERT_TRUE(gc1.runRegularRound().acquired_lease);    /// gc1 becomes leader (still mid-fold, seq frozen)
+    EXPECT_FALSE(gc2.runRegularRound().acquired_lease);   /// obs #1: records (owner=A, seq, hb=absent)
+    Gc::pulseHeartbeat(*s, kGcA);                          /// a heartbeatLoop tick lands mid-round (hb 0->1)
+    EXPECT_FALSE(gc2.runRegularRound().acquired_lease);   /// obs #2: hb advanced since obs #1 => alive => NO steal
+
+    EXPECT_EQ(readState(*b, *s).lease.owner, kGcA);       /// gc1 keeps the lease through its whole first round
+}
+
 TEST(CasGcLease, FailoverStealOnceHeartbeatStops)
 {
     /// B160: once the incumbent stops heartbeating (it died), a follower observing the now-frozen

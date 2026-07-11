@@ -86,7 +86,7 @@ void CasGcScheduler::stop()
         hb_thread.join();
 }
 
-Cas::RoundReport CasGcScheduler::runRoundLogged(Cas::Gc & gc, GcRoundLogRecord::Trigger trigger)
+Cas::RoundReport CasGcScheduler::runRoundLogged(Cas::Gc & gc, GcRoundLogRecord::Trigger trigger, std::function<void()> on_lease_acquired)
 {
     using Rec = GcRoundLogRecord;
     /// Best-effort: the table row must never break GC. A throwing sink is swallowed.
@@ -131,7 +131,7 @@ Cas::RoundReport CasGcScheduler::runRoundLogged(Cas::Gc & gc, GcRoundLogRecord::
     fin.event_type = Rec::EventType::Finish;
     try
     {
-        const Cas::RoundReport rep = gc.runRegularRound();
+        const Cas::RoundReport rep = gc.runRegularRound(std::move(on_lease_acquired));
         CurrentMetrics::set(CurrentMetrics::CasGcIsLeader, rep.acquired_lease ? 1 : 0);
         if (rep.acquired_lease)
             CurrentMetrics::add(CurrentMetrics::CasGcPendingReclaimEntries,
@@ -189,9 +189,28 @@ void CasGcScheduler::loop()
         }
         try
         {
+            /// B160/P3-B1: fired the instant the lease is (re)acquired, before the round's fold runs -
+            /// a new leader's first round is otherwise unprotected (i_am_leader would only flip below,
+            /// AFTER the whole round returns), so a follower observing the frozen (owner, seq) across
+            /// two of its own ticks would steal deterministically once that first round outlasts them.
+            auto on_lease_acquired = [this]
+            {
+                i_am_leader.store(true, std::memory_order_relaxed);
+                try
+                {
+                    Cas::Gc::pulseHeartbeat(*store, gc_id);
+                }
+                catch (...)
+                {
+                    /// Advisory, same as heartbeatLoop's own pulse: a lost pulse is harmless, the next
+                    /// one (from heartbeatLoop, hb_interval later) retries. Must never fail the round.
+                    tryLogCurrentException(log, "CA GC acquire-time heartbeat pulse failed (advisory; will retry)");
+                }
+            };
+
             /// runRoundLogged emits the Start + Finish table rows (incl. the per-round
             /// ProfileEvents delta) and rethrows on a round exception (after an Aborted Finish).
-            const Cas::RoundReport report = runRoundLogged(gc, GcRoundLogRecord::Trigger::Scheduled);
+            const Cas::RoundReport report = runRoundLogged(gc, GcRoundLogRecord::Trigger::Scheduled, on_lease_acquired);
             i_am_leader.store(report.acquired_lease, std::memory_order_relaxed);   /// B160: gate the heartbeat
             if (report.acquired_lease)
             {
