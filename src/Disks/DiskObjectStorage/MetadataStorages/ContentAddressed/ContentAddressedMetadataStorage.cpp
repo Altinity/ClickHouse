@@ -658,13 +658,20 @@ bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) 
                                           ContentAddressed::Freshness::CachedForLoad);
         if (ContentAddressed::endsWithTableUuidPair(path))
             return !store()->listRefs(shadowNamespace(path)).empty();
-        /// Intermediate dir (shadow/<bk>, shadow/<bk>/store, ...): exists iff the scoped S3
-        /// LIST of the mirrored subtree finds any objects (design §5.3). A non-empty LIST means
-        /// at least one shadow archive exists under this path; GC removes S3 objects for fully-
-        /// dropped archives, so a bare LIST is a reliable existence signal without registry access.
+        /// Intermediate dir (shadow/<bk>, shadow/<bk>/store, ...): exists iff SOME shadow namespace
+        /// under this path still has a LIVE ref. A raw object LIST of the mirrored subtree would count
+        /// tombstoned-but-not-yet-GC'd shard/manifest objects — CA removal is tombstone + deferred GC
+        /// (`removeRecursive`/`dropNamespace` only tombstone; `Cas::Gc` physically deletes later) — so a
+        /// just-`UNFREEZE`d backup dir would spuriously "exist" until a GC round runs (B3/B186). Instead
+        /// enumerate the namespaces exactly as `removeRecursive` does (`listNamespaces(scope)`) and
+        /// consult the tombstone-aware `listRefs` (as the `endsWithTableUuidPair` case above does), so
+        /// existence is consistent with the ref-level signal and independent of GC timing.
         const std::string canonical = canonicalDiskPath(path);
         const std::string scope = canonical.empty() ? "shadow/" : canonical + "/";
-        return !store()->listMirroredChildren(scope).empty();
+        for (const auto & ns : store()->listNamespaces(scope))
+            if (!store()->listRefs(Cas::RootNamespace{ns}).empty())
+                return true;
+        return false;
     }
 
     /// The Atomic `store/<u3>` shard dir (see listDirectory): route to the generic existence signal
