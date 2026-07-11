@@ -640,6 +640,16 @@ bool Gc::foldManifestEdges(const ManifestId & id, int sign, std::vector<BlobDelt
     if (!manifestNamespaceMatches(id.root_namespace, body))
         throw Exception(ErrorCodes::CORRUPTED_DATA,
             "CAS gc fold: manifest body namespace mismatch at {} (manifestNamespaceMatches fail-closed)", key);
+    /// Task 4 (the consult's injection-route finding): `decodePartManifest` only validates
+    /// `blob_hash_len` ∈ {16, 32} in isolation — it never cross-checks it against THIS pool's
+    /// recorded width. A manifest body written at a foreign width would otherwise decode
+    /// successfully and hand `foldManifestEdges` `BlobDigest` values whose meaningful prefix length
+    /// disagrees with every other digest in the fold (a silent per-entry width injection). Refuse it
+    /// here, at the one place every manifest enters the fold.
+    if (body.blob_hash_len != store->poolMeta().blob_hash_len)
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "CAS gc fold: manifest blob_hash_len {} != pool width {} at {} (foreign-width manifest refused)",
+            body.blob_hash_len, store->poolMeta().blob_hash_len, key);
 
     for (const ManifestEntry & entry : body.entries)
         if (entry.placement == EntryPlacement::Blob)
