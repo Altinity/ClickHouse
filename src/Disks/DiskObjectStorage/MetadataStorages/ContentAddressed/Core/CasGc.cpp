@@ -78,11 +78,24 @@ String blobKeyOf(const Layout & layout, const UInt128 & hash)
 /// reach the same wholesale LIST-delete helper the retention prune uses.
 uint64_t deletePrefixWholesale(Backend & backend, const String & prefix, uint64_t bounded_remaining);
 
-/// Task 5 (spec 2026-07-09 §raw-body-refinement, v3): the three per-hash freshness-meta ops GC schedules
-/// on the bounded pool. All three are best-effort/idempotent by design -- the meta is only a point-read
-/// freshness marker for the writer/promote gate (Task 3/4); the ledger retired-set + the exact-token body
-/// delete remain the actual safety core (unchanged by this task). A lost CAS here is never a correctness
-/// problem, only a (rare, self-healing) staleness window for the NEXT point-reader.
+/// Task 5 (spec 2026-07-09 §raw-body-refinement, v3) + ADD-ONLY (spec 2026-07-11 deposed-leader
+/// `clearSparedMeta` fix): the per-hash freshness-meta ops GC schedules on the bounded pool. All are
+/// best-effort/idempotent by design -- the meta is only a point-read freshness marker for the writer/
+/// promote gate (Task 3/4); the ledger retired-set + the exact-token body delete remain the actual safety
+/// core (unchanged by this task). A lost CAS here is never a correctness problem, only a (rare,
+/// self-healing) staleness window for the NEXT point-reader.
+///
+/// GC freshness meta is ADD-ONLY: GC may publish `Condemned`, and may REMOVE the meta once the exact body
+/// token is confirmed deleted/absent (`deleteConfirmedMeta`), but it NEVER transitions `Condemned ->
+/// Clean` on a spare. The SOLE `-> Clean` transition is a WRITER that has already displaced the body with
+/// a fresh incarnation token (`Build::uploadFromSource` + `writeResurrectMetaClean`, or the tokenless
+/// committed-source `copyForwardFromCondemned` clean-flip). Rationale: a deposed leader that cleared a
+/// spare's meta then lost its round CAS would leave a durable stray-`Clean` over a still-condemned body;
+/// a writer reading `Clean` would reuse the exact condemned token, which a stale pre-CAS exact-token
+/// redelete then deletes -- live-blob data loss (INV_NO_LOSS). Removing the clear restores the exact-token
+/// delete argument in full: once a hash is `Condemned`, observing `Clean` means EITHER the condemned body
+/// is absent OR a writer already changed its incarnation token, so every stale `deleteExact(t1)` finds the
+/// body absent or `TokenMismatch`. See `reports/2026-07-11-cas-deposed-leader-stray-clean-meta.md`.
 
 /// Write the per-hash meta to Condemned: a blob newly entering the retired set this round (either the
 /// fresh zero-in-degree condemn, or a resurrect-supersede re-condemn of the current token). Absent meta
@@ -97,19 +110,6 @@ void writeCondemnedMeta(Backend & backend, const Layout & layout, const UInt128 
         putMetaIfAbsent(backend, layout, hash, desired);
     else if (lm->meta.state != MetaState::Condemned)
         casMeta(backend, layout, hash, lm->etag, desired);
-}
-
-/// Clear a spared entry's meta back to Clean: its in-degree recovered before graduation, so a Condemned
-/// meta is now stale (a writer must be free to adopt it again). Best-effort: a lost CAS just means a
-/// writer already resurrected it (a fresh Clean meta of its own) -- fine, matching
-/// feedback_ca_gc_never_throw_on_404's spirit for GC's own bookkeeping.
-void clearSparedMeta(Backend & backend, const Layout & layout, const UInt128 & hash)
-{
-    const auto lm = loadMeta(backend, layout, hash);
-    if (!lm || lm->meta.state != MetaState::Condemned)
-        return;   /// absent or already Clean: nothing to clear
-    const BlobMeta clean{.state = MetaState::Clean, .condemn_round = 0, .size = lm->meta.size};
-    casMeta(backend, layout, hash, lm->etag, clean);
 }
 
 /// Drop the meta after its body was physically deleted (or already found absent) by the round's
@@ -410,12 +410,15 @@ RoundReport Gc::runRegularRound()
             outcomes[shard].entries.push_back(OutcomeEntry{.kind = entry.kind, .hash = entry.hash,
                                                            .token = entry.token, .outcome = OutcomeKind::Spared});
             ProfileEvents::increment(ProfileEvents::CasGcRetiredSpared);
-            /// Task 5: the in-degree recovered before graduation — clear a stale Condemned meta so the
-            /// writer's point-read gate can adopt this hash again.
-            {
-                const UInt128 hash = entry.hash;
-                scheduleMetaJob([this, hash]() { clearSparedMeta(store->backend(), store->layout(), hash); });
-            }
+            /// ADD-ONLY (spec 2026-07-11 deposed-leader `clearSparedMeta` fix): a spare does NOT touch the
+            /// meta. GC freshness meta is add-only — GC never publishes `Clean`. The in-degree recovered,
+            /// but the meta stays `Condemned` (conservative marker) until a WRITER displaces the body with
+            /// a fresh incarnation token (`uploadFromSource` + `writeResurrectMetaClean` /
+            /// `copyForwardFromCondemned`) — the SOLE `Condemned -> Clean` transition. Clearing here on a
+            /// deposed leader that then lost its round CAS would strand a stray-`Clean` over a still-live
+            /// condemned token and lose the reuse to a stale exact-token redelete (INV_NO_LOSS); see
+            /// `reports/2026-07-11-cas-deposed-leader-stray-clean-meta.md`. The next `putBlob` self-heals
+            /// the marker: `observeAndAdmit` refuses same-token adoption on `Condemned` and resurrects.
         }
         for (const RetiredEntry & entry : merge.graduated)
         {

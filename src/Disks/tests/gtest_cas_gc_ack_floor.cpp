@@ -3,7 +3,9 @@
 #include <optional>
 #include <vector>
 
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEvent.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFsck.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasServerRoot.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
@@ -140,24 +142,40 @@ TEST(CasGcRetire, DeleteRemovesBodyAndMeta)
         << "the meta must be dropped alongside the exact-token body delete (Task 5)";
 }
 
-/// Task 5: an entry whose in-degree recovers before graduation is SPARED (unchanged ledger behavior) —
-/// its meta must clear back to Clean so the writer's point-read gate can adopt the hash again.
-TEST(CasGcRetire, SpareClearsMeta)
+/// GC freshness meta is ADD-ONLY (spec 2026-07-11 deposed-leader `clearSparedMeta` fix): an entry whose
+/// in-degree recovers before graduation is SPARED (unchanged ledger behavior) but GC must NEVER flip its
+/// meta `Condemned -> Clean` on the spare. A deposed leader that cleared-then-lost the round would leave a
+/// stray-`Clean` over a still-condemned body; a writer reading `Clean` would reuse the exact condemned
+/// token, which a stale exact-token redelete then deletes (INV_NO_LOSS live-blob loss —
+/// `reports/2026-07-11-cas-deposed-leader-stray-clean-meta.md`). The spare leaves the meta `Condemned`;
+/// ONLY a writer that displaces the body with a fresh incarnation token publishes `Clean`.
+TEST(CasGcRetire, SpareLeavesMetaCondemned)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openStoreForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
+
+    /// A content-addressed body + Clean meta via a real fresh upload, so a later writer dedup-attempt
+    /// resolves to THIS exact hash (GC condemns it; the writer resurrects it).
+    const String payload = "spare-add-only-payload";
+    const UInt128 hash = u128Of(payload);
+    const BlobId id = idOf(payload);
+    {
+        auto seed = store->startBuild({});
+        seed->putBlob(id, BlobSource::fromString(payload));
+    }
+    const Token t_seed = backend->head(store->layout().blobKey(id)).token;
+
     const ManifestRef r1 = ref("srv-a:1", 1, 0xA1);
-    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
-    writeManifestRaw(*backend, store->layout(), ns, r1, {blobEntryFor("a", DB::UInt128(1))});
+    writeManifestRaw(*backend, store->layout(), ns, r1, {blobEntryFor("a", hash)});
     publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r1);
     Gc gc(store, kGc);
     gc.runRegularRound();   /// +1 folds
     dropRefTransition(*backend, store->layout(), ns, "tbl", r1);
-    gc.runRegularRound();   /// -1 folds => in-degree 0 => condemned; meta written Condemned
-    ASSERT_TRUE(currentEntryFor(*backend, store->layout(), DB::UInt128(1)).has_value());
+    gc.runRegularRound();   /// -1 folds => in-degree 0 => condemned; meta flipped Condemned
+    ASSERT_TRUE(currentEntryFor(*backend, store->layout(), hash).has_value());
     {
-        const auto lm = loadMetaForTest(*backend, store->layout(), DB::UInt128(1));
+        const auto lm = loadMetaForTest(*backend, store->layout(), hash);
         ASSERT_TRUE(lm.has_value());
         ASSERT_EQ(lm->meta.state, MetaState::Condemned);
     }
@@ -166,17 +184,113 @@ TEST(CasGcRetire, SpareClearsMeta)
     /// graduation. The pass merge nets in-degree back to 1: the prior retired entry is SPARED
     /// (recovery wins, even past the floor) -- not the resurrect-supersede path (the token never changed).
     const ManifestRef r2 = ref("srv-a:1", 2, 0xA2);
-    writeManifestRaw(*backend, store->layout(), ns, r2, {blobEntryFor("a", DB::UInt128(1))});
+    writeManifestRaw(*backend, store->layout(), ns, r2, {blobEntryFor("a", hash)});
     publishCommittedTransition(*backend, store->layout(), ns, "tbl_detached", std::nullopt, r2);
-    gc.runRegularRound();   /// +1 folds => spared; meta must clear back to Clean
+    gc.runRegularRound();   /// +1 folds => spared
 
-    EXPECT_FALSE(currentEntryFor(*backend, store->layout(), DB::UInt128(1)).has_value())
+    EXPECT_FALSE(currentEntryFor(*backend, store->layout(), hash).has_value())
         << "the spared entry drops from the retired set";
-    const auto lm_after = loadMetaForTest(*backend, store->layout(), DB::UInt128(1));
+    EXPECT_TRUE(blobExists(*backend, store->layout(), hash));
+    EXPECT_EQ(backend->head(store->layout().blobKey(id)).token, t_seed)
+        << "spare does not touch the body — the incarnation token is unchanged";
+
+    /// ADD-ONLY: the spare must NOT clear the meta back to Clean (that is the deposed-leader hole).
+    {
+        const auto lm = loadMetaForTest(*backend, store->layout(), hash);
+        ASSERT_TRUE(lm.has_value());
+        EXPECT_EQ(lm->meta.state, MetaState::Condemned)
+            << "GC freshness meta is add-only: a spare leaves the meta Condemned (never -> Clean)";
+    }
+
+    /// Only a WRITER re-publishes Clean, and only by displacing the body with a fresh incarnation token:
+    /// a dedup-attempt on the condemned hash resurrects (uploadFromSource) — the body token CHANGES and
+    /// the meta flips to Clean WITH that token change.
+    auto build = store->startBuild({});
+    auto ref_w = build->putBlob(id, BlobSource::fromString(payload));
+    EXPECT_EQ(ref_w.id, id);
+    const Token t_resurrect = backend->head(store->layout().blobKey(id)).token;
+    EXPECT_NE(t_resurrect, t_seed) << "resurrect displaces the body with a fresh incarnation token";
+    const auto lm_after = loadMetaForTest(*backend, store->layout(), hash);
     ASSERT_TRUE(lm_after.has_value());
     EXPECT_EQ(lm_after->meta.state, MetaState::Clean)
-        << "SpareClearsMeta (Task 5): recovered in-degree clears the condemned meta";
-    EXPECT_TRUE(blobExists(*backend, store->layout(), DB::UInt128(1)));
+        << "the writer's resurrect path is the SOLE Condemned -> Clean transition";
+}
+
+/// Two-leader stale-redelete regression — the executable form of the deposed-leader spec §2. A stale
+/// leader's pre-CAS exact-token redelete `deleteExact(h, t1)` must never delete a live reuse. With the
+/// buggy clear-on-spare, a spare publishes `Clean`; a writer reads `Clean` and REUSES `t1`; the stale
+/// `deleteExact(t1)` then deletes the LIVE body (INV_NO_LOSS). Add-only meta closes it: the spare leaves
+/// `Condemned`, the writer resurrects to `t2`, and the stale `deleteExact(t1)` is a `TokenMismatch` no-op.
+///
+/// Interleaving fidelity (APPROXIMATED): the deposed leader's destructive side effect is its pre-CAS
+/// exact-token `deleteExact(h, t1)`. We reproduce it deterministically by CAPTURING `t1` at condemn time
+/// (exactly the token a paused leader's `delete_pending` snapshot holds) and firing that exact
+/// `deleteExact` AFTER the surviving leader's spare and the writer's resurrect — the faithful destructive
+/// op, without a mid-round CAS-interrupt seam on the delete path (which the backend does not expose).
+TEST(CasGcRetire, StaleRedeleteAfterSpareDoesNotDeleteLiveReuse)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+
+    const String payload = "two-leader-stale-redelete-payload";
+    const UInt128 hash = u128Of(payload);
+    const BlobId id = idOf(payload);
+    const String blob_key = store->layout().blobKey(id);
+    {
+        auto seed = store->startBuild({});
+        seed->putBlob(id, BlobSource::fromString(payload));
+    }
+
+    const ManifestRef r1 = ref("srv-a:1", 1, 0xA1);
+    writeManifestRaw(*backend, store->layout(), ns, r1, {blobEntryFor("a", hash)});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r1);
+    Gc gc(store, kGc);
+    gc.runRegularRound();   /// +1 folds
+    dropRefTransition(*backend, store->layout(), ns, "tbl", r1);
+    gc.runRegularRound();   /// -1 => in-degree 0 => condemned at t1
+
+    /// The OLD leader L1's planned pre-CAS delete uses the EXACT token it observed at condemn: capture t1.
+    const auto condemned_entry = currentEntryFor(*backend, store->layout(), hash);
+    ASSERT_TRUE(condemned_entry.has_value());
+    const Token t1 = condemned_entry->token;
+    ASSERT_EQ(backend->head(blob_key).token, t1);
+
+    /// A NEW leader L2 folds a +1 that recovered h's in-degree and adopts a SPARE for h.
+    const ManifestRef r2 = ref("srv-a:1", 2, 0xA2);
+    writeManifestRaw(*backend, store->layout(), ns, r2, {blobEntryFor("a", hash)});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl_live", std::nullopt, r2);
+    gc.runRegularRound();   /// +1 => spared
+
+    /// Add-only: the spare left the meta Condemned (the stale-redelete guard depends on it).
+    {
+        const auto lm = loadMetaForTest(*backend, store->layout(), hash);
+        ASSERT_TRUE(lm.has_value());
+        EXPECT_EQ(lm->meta.state, MetaState::Condemned)
+            << "add-only: a spare must not clear the meta (the writer must still see the hash condemned)";
+    }
+
+    /// A writer dedup-hits h. It point-reads Condemned and RESURRECTS to a fresh token t2
+    /// (uploadFromSource) — it never reuses t1.
+    {
+        auto build = store->startBuild({});
+        build->putBlob(id, BlobSource::fromString(payload));
+    }
+    const Token t2 = backend->head(blob_key).token;
+    EXPECT_NE(t2, t1) << "the writer resurrected to a fresh incarnation, not a reuse of t1";
+
+    /// L1 resumes and executes its stale pre-CAS exact-token redelete `deleteExact(h, t1)`: it must be a
+    /// TokenMismatch no-op (the live body is now t2), NEVER a Deleted of the live reuse.
+    const DeleteOutcome stale = backend->deleteExact(blob_key, t1);
+    EXPECT_EQ(stale.kind, DeleteOutcome::Kind::TokenMismatch)
+        << "the stale exact-token redelete must miss the live reuse (add-only closes INV_NO_LOSS)";
+
+    /// The live body under t2 survives, stays reachable via the committed r2, and fsck sees no dangle.
+    const HeadResult hr = backend->head(blob_key);
+    ASSERT_TRUE(hr.exists);
+    EXPECT_EQ(hr.token, t2);
+    EXPECT_EQ(runFsck(*store, /*detail=*/false).dangling, 0u)
+        << "no live reference dangles: the stale redelete did not delete the reused body";
 }
 
 /// Copy-forward aftermath, republished arm (spec 2026-07-02-cas-copy-forward-condemned-evidence.md):
