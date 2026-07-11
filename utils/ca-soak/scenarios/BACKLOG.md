@@ -1942,3 +1942,13 @@ write (fail-closed), and that a just-under manifest stages. The P0 cap is now va
 Remaining sub-gap: the ordinal cap (`kMaxManifestOrdinal`=999,999) has no test-injection point and needs
 ~1e6 real calls — documented, not forced into a slow test. S07-as-a-SQL-scenario stays effectively
 inconclusive-by-design; the gtest is the real coverage.
+
+## Broad-*Ca* gtest "flake" — NOT a CAS defect (diagnosed 2026-07-11)
+Re-diagnosed: the CAS observability/instrumented/backpressure tests PASS as a group
+(`CasObservability.*:CasInstrumentedBackend.*:CasStoreBackpressure.*` → 16/16). They ARE properly isolated
+— counters are read as before/after DELTAS and events via a per-test captured vector. The 5 failures appear
+ONLY under a broader `*Ca*` gtest filter that interleaves them with a NON-CAS test (e.g. `UniqueKeyIndexCache`)
+which leaves shared global state dirty. So this is a pre-existing GENERAL `unit_tests_dbms` cross-test-ordering
+hygiene issue (a non-CAS test not resetting global state), NOT a CAS correctness bug and NOT caused by this
+campaign. The CAS gtest battery is green. No CAS action; if pursued, it belongs in general test-harness hygiene
+(the offending non-CAS test's SetUp/TearDown), out of the CAS scope.
