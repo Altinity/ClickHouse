@@ -135,6 +135,28 @@ TEST(CaPartPathParser, DetachedPathsReportTheSharedDetachedComponent)
     EXPECT_EQ(d->file, "attaching_all_0_0_0/metadata_version.txt");
 }
 
+TEST(CaPartPathParser, DetachedPathsNonAtomicFoldIntoTheTableNamespace)
+{
+    // U#6: the Ordinary/non-Atomic detached form data/<db>/<table>/detached/<part>/<file> must fold
+    // into the table's OWN namespace with part_name == "detached" (mirroring the Atomic form), so
+    // route() keys the detached/<part> ref off it. The right-to-left part-dir scan would otherwise
+    // anchor on the INNER part dir and fold `detached` into a spurious table_uuid
+    // ("data/<db>/<table>/detached") that DROP TABLE never cleans — a permanently orphaned live ref.
+    auto d = parsePartFilePath("data/db/tbl/detached/attaching_all_0_0_0/metadata_version.txt");
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(d->table_uuid, "data/db/tbl");
+    EXPECT_EQ(d->part_name, std::string(kDetachedDirName));
+    EXPECT_EQ(d->file, "attaching_all_0_0_0/metadata_version.txt");
+
+    // The bare non-Atomic detached CONTAINER dir folds to part_name == "detached" with an empty file,
+    // exactly like the Atomic container, so route()'s empty-ref branch is reached for both layouts.
+    auto c = parsePartFilePath("data/db/tbl/detached");
+    ASSERT_TRUE(c.has_value());
+    EXPECT_EQ(c->table_uuid, "data/db/tbl");
+    EXPECT_EQ(c->part_name, std::string(kDetachedDirName));
+    EXPECT_TRUE(c->file.empty());
+}
+
 TEST(CaPartPathParser, MutablePerPartFiles)
 {
     EXPECT_TRUE(isMutablePerPartFile("uuid.txt"));

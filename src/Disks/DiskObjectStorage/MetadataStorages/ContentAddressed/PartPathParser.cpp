@@ -115,9 +115,19 @@ static std::optional<PartDirAnchor> findPartDirComponent(const std::vector<std::
         return std::nullopt; // table dir, no part component after the uuid
     }
 
-    // No uuid anchor: a non-Atomic table path. The table identifier must be at least one component
-    // (a real table dir, never the bare disk root), so the part dir is at index >= 1. Scan right to
-    // left so a part-dir-shaped table/partition name earlier in the path cannot steal the anchor.
+    // No uuid anchor: a non-Atomic table path. The MergeTree `detached` dir is a reserved table-level
+    // subdir (data/<db>/<table>/detached/<part>/...), exactly like the Atomic layout where the uuid
+    // anchor makes `detached` the part_name. Anchor on it FIRST (leftmost, index >= 1): the right-to-
+    // left part-dir scan below would otherwise anchor on the INNER <part>-shaped component and fold
+    // `detached` into a spurious table id (data/<db>/<table>/detached) that DROP TABLE never cleans,
+    // orphaning a permanently-live ref (U#6). Mirrors route()'s part_name == kDetachedDirName folding.
+    for (size_t i = 1; i < p.size(); ++i)
+        if (p[i] == kDetachedDirName)
+            return PartDirAnchor{0, i}; // table id = the whole path before `detached`
+
+    // The table identifier must be at least one component (a real table dir, never the bare disk
+    // root), so the part dir is at index >= 1. Scan right to left so a part-dir-shaped
+    // table/partition name earlier in the path cannot steal the anchor.
     for (size_t i = p.size(); i-- > 1;)
         if (looksLikePartDir(p[i]))
             return PartDirAnchor{0, i}; // table id = the whole path before the part dir
