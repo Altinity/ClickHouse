@@ -244,11 +244,14 @@ private:
 
 
     /// Ref-object cleanup (spec §Step 6 / §Concurrent Startup And Cleanup): delete each table's ref logs
-    /// covered by BOTH the durable fold cursor AND an observed snapshot, and snapshots older than the
-    /// newest observed one, in batches of <=1000 exact keys. A remove_namespace log is retained until its
-    /// namespace-cleanup item is durably Completed. Runs post-CAS (durable cursor) and only on a clamp-free
-    /// round (`suppress_destructive == false`). Acts only on keys THIS round's scan returned (reused via
-    /// `folded.ref_tables`), so a covering snapshot is always durable before any deletion it authorizes.
+    /// covered by BOTH the durable fold cursor AND a durable snapshot, and snapshots older than the newest
+    /// observed one, in batches of <=1000 exact keys. A remove_namespace log is retained until its
+    /// namespace-cleanup item is durably Completed; ONCE Completed, that item's `remove_txn_id` is the
+    /// covering snapshot of the whole tail and its logs are cleaned in the SAME round (spec §Namespace
+    /// Removal republication path). Runs post-CAS (durable cursor), AFTER `runNamespaceCleanupPasses` has
+    /// made the `Removed` snapshot durable, and only on a clamp-free round (`suppress_destructive == false`).
+    /// Acts only on keys THIS round's scan returned (reused via `folded.ref_tables`), so a covering snapshot
+    /// -- observed or just-republished -- is always durable before any deletion it authorizes.
     void cleanupRefObjects(const FoldResult & folded, bool suppress_destructive);
 
     /// Namespace-cleanup item passes (spec §Step 6): for each item in the committed seal, a Pending item

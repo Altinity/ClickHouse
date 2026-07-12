@@ -101,6 +101,14 @@ std::map<String, RefTableListing> groupRefKeys(const Layout & layout, const std:
 ///      not durably reached `Completed`).
 /// Snapshots with id `< X` are deletable. With no observed snapshot, `X` is undefined and no log is
 /// coverage-deletable (an empty plan). The newest snapshot `X` itself is retained.
+///
+/// `completed_removal_snapshot` (optional) is the identifier of a `Removed` snapshot that the caller has
+/// already made durable THIS round via `putIfAbsent` for a namespace-cleanup item that reached
+/// `Completed` (spec §Namespace Removal republication path). It participates in `X` as a covering
+/// snapshot exactly as if the round's scan had returned it -- the caller guarantees it is durable before
+/// any delete this plan authorizes, preserving the "covering snapshot durable before deletion" invariant.
+/// It is never itself scheduled for deletion (it is not in `listing.snapshots` on the round it is first
+/// published; on a later round it appears in `listing.snapshots` as the newest and is retained there).
 struct RefCleanupPlan
 {
     std::vector<RefTxnId> deletable_logs;
@@ -109,7 +117,8 @@ struct RefCleanupPlan
     bool operator==(const RefCleanupPlan &) const = default;
 };
 RefCleanupPlan planRefCleanup(const RefTableListing & listing, const RefTxnId & durable_cursor,
-                              const std::set<RefTxnId> & removal_logs_blocked);
+                              const std::set<RefTxnId> & removal_logs_blocked,
+                              std::optional<RefTxnId> completed_removal_snapshot = std::nullopt);
 
 /// Recover one table's state via the shared recovery equation (spec §Startup And Recovery / §Table State):
 /// one `LIST` of the table prefix, the newest valid snapshot, and replay of the later log tail through the

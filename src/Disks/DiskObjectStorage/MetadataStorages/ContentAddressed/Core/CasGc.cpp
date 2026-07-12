@@ -622,10 +622,20 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired)
     /// Ref-object cleanup + namespace-cleanup item passes (spec §Step 6), post-CAS so the durable fold
     /// cursor is committed. `suppress_destructive` (any clamp or ref-folding abort this round) gates the
     /// deletes; the idempotent marker / `Removed`-snapshot republication for a Completed item still runs.
+    ///
+    /// ORDER IS LOAD-BEARING: `runNamespaceCleanupPasses` runs FIRST because it republishes the `Removed`
+    /// snapshot for a Completed item (via idempotent putIfAbsent) -- and only after that snapshot is
+    /// durable may `cleanupRefObjects` delete the logs it covers (spec §Step 6: "a covering snapshot is
+    /// always durable before any deletion it authorizes"). A concurrent recovering reader that misses this
+    /// republication and later GETs a now-deleted log restarts with a fresh LIST and observes the durable
+    /// `Removed` snapshot -- a complete constant-size state with no tail to replay. Running cleanup first
+    /// (the previous order) left the completing round unable to see its own just-published snapshot, so a
+    /// removed namespace's covered logs persisted as debris until some later fold -- which never comes on
+    /// a quiesced pool.
     const bool suppress_destructive = !report.anomalies.empty();
+    runNamespaceCleanupPasses(folded.fold_seal, suppress_destructive);
     if (trim_enabled)
         cleanupRefObjects(folded, suppress_destructive);
-    runNamespaceCleanupPasses(folded.fold_seal, suppress_destructive);
 
     /// Bounded orphan-manifest backstop: cleanup-only cursor progress; never fails the round.
     try
@@ -1276,10 +1286,23 @@ void Gc::cleanupRefObjects(const FoldResult & folded, bool suppress_destructive)
 
     /// A remove_namespace log is retained until its namespace-cleanup item is durably Completed (spec
     /// §Step 6 condition 3): its owner-removal edges must stay foldable until the physical reclaim is done.
+    /// Once Completed, the item's `remove_txn_id` also names the constant-size `Removed` snapshot -- the
+    /// covering snapshot of the WHOLE tail (every log id <= remove_txn_id). `runNamespaceCleanupPasses`
+    /// ran first this round and made that snapshot durable (idempotent putIfAbsent), so we hand its id to
+    /// `planRefCleanup` as a covering snapshot even when the writer never published it and this round's
+    /// scan therefore did not return it -- closing the liveness gap where a removed namespace's covered
+    /// logs would otherwise persist forever (the completing round is the only fold on a quiesced pool).
     std::set<std::pair<String, RefTxnId>> blocked_removals;
+    std::map<String, RefTxnId> completed_removals;   /// ns -> greatest Completed remove_txn_id (the tail cover)
     for (const auto & [key, item] : folded.fold_seal.ns_cleanup_items)
         if (item.state != RefNsCleanupState::Completed)
             blocked_removals.insert({item.ns.string(), item.remove_txn_id});
+        else
+        {
+            RefTxnId & slot = completed_removals[item.ns.string()];
+            if (slot < item.remove_txn_id)
+                slot = item.remove_txn_id;
+        }
 
     /// Backend exposes only token-conditional `deleteExact` (no batch-delete primitive), so cleanup is a
     /// per-key HEAD + exact-token delete (like the orphan sweep). Ref objects are immutable and their keys
@@ -1308,7 +1331,12 @@ void Gc::cleanupRefObjects(const FoldResult & folded, bool suppress_destructive)
             if (blocked_removals.count({ns_str, log_id}))
                 removal_logs_blocked.insert(log_id);
 
-        const RefCleanupPlan plan = planRefCleanup(listing, durable_cursor, removal_logs_blocked);
+        std::optional<RefTxnId> completed_removal_snapshot;
+        if (const auto cit = completed_removals.find(ns_str); cit != completed_removals.end())
+            completed_removal_snapshot = cit->second;
+
+        const RefCleanupPlan plan =
+            planRefCleanup(listing, durable_cursor, removal_logs_blocked, completed_removal_snapshot);
         for (const RefTxnId & log_id : plan.deletable_logs)
             deleteRefObject(layout.refLogKey(ns, log_id));
         for (const RefTxnId & snap_id : plan.deletable_snapshots)

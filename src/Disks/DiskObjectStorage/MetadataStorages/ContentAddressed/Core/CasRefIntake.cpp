@@ -97,20 +97,27 @@ std::map<String, RefTableListing> groupRefKeys(const Layout & layout, const std:
 }
 
 RefCleanupPlan planRefCleanup(const RefTableListing & listing, const RefTxnId & durable_cursor,
-                              const std::set<RefTxnId> & removal_logs_blocked)
+                              const std::set<RefTxnId> & removal_logs_blocked,
+                              std::optional<RefTxnId> completed_removal_snapshot)
 {
     RefCleanupPlan plan;
 
-    /// With no observed snapshot there is no coverage boundary, so no log is coverage-deletable and no
-    /// older snapshot exists to delete (spec §Step 6, condition 2).
-    if (listing.snapshots.empty())
+    /// The coverage boundary `X` is the newest snapshot known to be durable: the newest observed in this
+    /// round's scan, and -- for a namespace-cleanup item that reached `Completed` this round -- the
+    /// `Removed` snapshot the caller just made durable (spec §Namespace Removal republication path). With
+    /// neither there is no boundary, so no log is coverage-deletable and no older snapshot exists to delete
+    /// (spec §Step 6, condition 2).
+    std::optional<RefTxnId> newest_snapshot;
+    if (!listing.snapshots.empty())
+        newest_snapshot = listing.snapshots.back();
+    if (completed_removal_snapshot && (!newest_snapshot || *newest_snapshot < *completed_removal_snapshot))
+        newest_snapshot = completed_removal_snapshot;
+    if (!newest_snapshot)
         return plan;
-
-    const RefTxnId newest_snapshot = listing.snapshots.back();
 
     for (const RefTxnId & log_id : listing.logs)
     {
-        if (newest_snapshot < log_id)      /// L > X: not covered by any observed snapshot
+        if (*newest_snapshot < log_id)     /// L > X: not covered by any durable snapshot
             continue;
         if (durable_cursor < log_id)       /// L > cursor: its edge delta is not yet durable
             continue;
@@ -119,8 +126,11 @@ RefCleanupPlan planRefCleanup(const RefTableListing & listing, const RefTxnId & 
         plan.deletable_logs.push_back(log_id);
     }
 
+    /// Only snapshots the scan actually returned are deletion candidates; a `completed_removal_snapshot`
+    /// first published this round is not in `listing.snapshots`, so it is never scheduled for deletion,
+    /// and once it later appears in the scan it is the newest and is retained here.
     for (const RefTxnId & snapshot_id : listing.snapshots)
-        if (snapshot_id < newest_snapshot)
+        if (snapshot_id < *newest_snapshot)
             plan.deletable_snapshots.push_back(snapshot_id);
 
     return plan;

@@ -492,6 +492,89 @@ TEST(CasRefGc, RemoveNamespaceCompletesAndPublishesMarkerDeterministically)
     EXPECT_FALSE(store->resolveRef(ns, "part_1").has_value()) << "the removed ref must not resurrect";
 }
 
+/// (7b) LIVENESS (spec §Step 6 bounded tails): the round that COMPLETES a `remove_namespace` removal --
+/// i.e. the round in which GC republishes the `Removed` snapshot because the writer stopped before doing
+/// so (spec §Namespace Removal: "if it stops first, the namespace-cleanup item republishes it") -- must
+/// also clean the namespace's now-covered `_log` debris. The defect: `cleanupRefObjects` ran BEFORE
+/// `runNamespaceCleanupPasses` republished the `Removed` snapshot, so the completing round never saw its
+/// own covering snapshot; on a quiesced pool no later fold reruns cleanup with the snapshot visible, so
+/// the covered logs persist as `cas/refs/` debris indefinitely. Drive GC only until the removal completes
+/// (the `_cleanup` marker appears) -- the natural quiescence point for a removed namespace, mirroring
+/// what a real GC scheduler reaches -- then assert the covered logs are gone, leaving only the
+/// constant-size `Removed` snapshot + `_cleanup` marker tombstone (spec §Object Layout: "Phase 1 never
+/// deletes markers").
+TEST(CasRefGc, RemovedNamespaceCoveredLogsCleanedByCompletingRound)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    /// Default fold cadence (gc_fold_max_defer_rounds = 8): the quiesced-pool regime where the gap bites.
+    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test",
+                                                 .root_shards = 1});
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"test/tbl"};
+
+    /// Real writer: publish several committed parts (each is a `_log`), then DROP the whole namespace.
+    for (int i = 1; i <= 4; ++i)
+    {
+        BuildInfo info;
+        const String part = "part_" + std::to_string(i);
+        info.intended_ref = ns.string() + "/" + part;
+        auto build = store->startBuild(info);
+        const ManifestId id = build->stageManifest({});
+        build->precommitAdd(ns, part, id);
+        build->promote(ns, part, build->buildId(), id);
+    }
+    store->dropNamespace(ns);
+    store->renewWatermarkOnce();
+
+    const auto countKind = [&](RefObjectKind want) -> size_t
+    {
+        size_t n = 0;
+        const ListPage page = backend->list(layout.refsNamespacePrefix(ns), "", 10000);
+        for (const ListedKey & lk : page.keys)
+            if (const auto p = layout.parseRefObjectKey(lk.key); p && p->kind == want)
+                ++n;
+        return n;
+    };
+
+    /// Model "the writer stopped before publishing the Removed snapshot": remove every `_snap` object the
+    /// writer published at drop time, so GC's namespace-cleanup item is the sole publisher of the Removed
+    /// snapshot (spec §Namespace Removal republication path). This is exactly the interleaving that
+    /// surfaces the ordering gap -- when the writer DOES publish, `cleanupRefObjects` already sees the
+    /// covering snapshot from round one and the gap never bites.
+    {
+        const ListPage snaps = backend->list(layout.refsNamespacePrefix(ns) + "_snap/", "", 10000);
+        for (const ListedKey & lk : snaps.keys)
+        {
+            const auto h = backend->head(lk.key);
+            if (h.exists)
+                backend->deleteExact(lk.key, h.token);
+        }
+    }
+    ASSERT_EQ(countKind(RefObjectKind::Snap), 0u) << "the writer's Removed snapshot is gone (writer stopped)";
+    /// Sanity: there ARE `_log` objects to clean (a vacuous fold must not let this "pass").
+    ASSERT_GT(countKind(RefObjectKind::Log), 0u) << "the dropped namespace must have _log objects to clean";
+
+    /// Drive rounds ONLY until the removal completes (the `_cleanup` marker is published). Do NOT
+    /// over-drive: a later forced fold would mask the defect by cleaning on a subsequent round.
+    Gc gc(store, kGc);
+    bool completed = false;
+    for (int i = 0; i < 32 && !completed; ++i)
+    {
+        gc.runRegularRound();
+        store->renewWatermarkOnce();
+        completed = countKind(RefObjectKind::Cleanup) > 0;
+    }
+    ASSERT_TRUE(completed) << "GC must complete the namespace removal (publish the `_cleanup` marker)";
+
+    /// The completing round must have cleaned the covered logs; only the tombstone remains.
+    EXPECT_EQ(countKind(RefObjectKind::Log), 0u)
+        << "the round that completes the removal must clean the namespace's covered `_log` debris "
+           "(spec §Step 6 bounded tails); leaving them behind is the liveness gap";
+    EXPECT_EQ(countKind(RefObjectKind::Snap), 1u)
+        << "only the constant-size Removed snapshot tombstone remains";
+    EXPECT_EQ(countKind(RefObjectKind::Cleanup), 1u) << "the `_cleanup` marker tombstone remains";
+}
+
 /// (8) A malformed/adversarial ref key aborts ref folding for the round: no partial delta, no cursor
 /// advance. The malformed key is a real object under `cas/refs/` whose `RefTxnId` render is invalid.
 TEST(CasRefGc, MalformedRefKeyAbortsRefFoldingNoPartialDelta)
