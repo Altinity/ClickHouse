@@ -240,11 +240,13 @@ bool Build::depIsTokened(const BlobRef & ref) const
 
 uint64_t Build::observeAndAdmit(ObjectKind kind, const BlobRef & ref, const String & key)
 {
-    /// EDGE-BEFORE-OBSERVE (spec 2026-07-09-cas-writer-gc-simplification): adopting an EXISTING
-    /// incarnation is safe ONLY under this build's durable precommit closure — an adopted blob carries the
-    /// ORIGINAL writer's build_id, so the newborn-debris watermark does not cover it. Fresh uploads
-    /// pre-precommit stay legal (watermark-protected). See the TLA+ order sabotage (Gate A).
-    chassert(precommitted);
+    /// EDGE-BEFORE-OBSERVE (spec 2026-07-09-cas-writer-gc-simplification): the durable-precommit guard
+    /// lives in the 4-arg overload below, scoped to its ADOPT branch only — NOT here. A HEAD result
+    /// reached through this wrapper (e.g. `reviveObserve`'s post-race re-observe) can resolve to EITHER
+    /// the condemned/ABORTED branch or the adopt branch once the 4-arg overload point-reads the meta;
+    /// gating here (before that point-read) would wrongly block the condemned branch too, which
+    /// re-uploads under THIS build's own build_id via `uploadFromSource` and stays watermark-protected
+    /// pre-precommit.
     const HeadResult hr = store->backend().head(key);
     if (!hr.exists)
         /// Object absent at observe time. Two contexts call this overload:
@@ -263,11 +265,6 @@ uint64_t Build::observeAndAdmit(ObjectKind kind, const BlobRef & ref, const Stri
 
 uint64_t Build::observeAndAdmit(ObjectKind kind, const BlobRef & ref, const String & key, const HeadResult & hr)
 {
-    /// EDGE-BEFORE-OBSERVE (spec 2026-07-09-cas-writer-gc-simplification): adopting an EXISTING
-    /// incarnation is safe ONLY under this build's durable precommit closure — an adopted blob carries the
-    /// ORIGINAL writer's build_id, so the newborn-debris watermark does not cover it. Fresh uploads
-    /// pre-precommit stay legal (watermark-protected). See the TLA+ order sabotage (Gate A).
-    chassert(precommitted);
     /// `hr.exists` is guaranteed by the caller (the 3-arg wrapper checked it; the putBlob HEAD-first
     /// path only calls this on a present HEAD). Avoids a redundant second HEAD on the dedup-hit path.
     /// Logical (payload) size = object size minus the pool's fixed blob header. GUARD against
@@ -311,6 +308,22 @@ uint64_t Build::observeAndAdmit(ObjectKind kind, const BlobRef & ref, const Stri
             "Build::observeAndAdmit: condemned token for {} — caller must re-upload from source bytes (INV-1)",
             key);
     }
+
+    /// EDGE-BEFORE-OBSERVE (spec 2026-07-09-cas-writer-gc-simplification): from here on we are about to
+    /// ADOPT the live (non-condemned) incarnation as our own dependency — safe ONLY under this build's
+    /// durable precommit closure, because an adopted blob carries the ORIGINAL writer's build_id, so the
+    /// newborn-debris watermark does not cover it. (The condemned branch above is unaffected — it
+    /// re-uploads under THIS build's own build_id via `uploadFromSource`, which stays watermark-protected
+    /// pre-precommit.) See the TLA+ order sabotage (Gate A). A4: a real throw, not chassert — chassert is
+    /// compiled out in release, and a wiring/retry bug that reached adopt without a durable precommit
+    /// would silently drop watermark protection (later dangling ref / data loss with no production
+    /// signal).
+    if (!precommitted)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "Build::observeAndAdmit: EDGE-BEFORE-OBSERVE invariant violated — adopting an existing "
+            "incarnation before this build's precommit is durable would admit {} ({}) under the original "
+            "writer's build_id with no newborn-debris watermark protection",
+            key, kind == ObjectKind::Blob ? "blob" : "manifest");
 
     /// `!lm`: no meta yet for this hash (a pre-existing blob from before this protocol, or a lost race
     /// with a concurrent fresh-uploader's own meta write). Best-effort create it as Clean so future

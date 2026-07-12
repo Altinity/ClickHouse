@@ -286,6 +286,37 @@ TEST(CasBuild, PutBlobAdoptsWhenMetaCleanNoRetireView)
     EXPECT_EQ(lm->meta.state, MetaState::Clean) << "an adopt must leave the meta Clean";
 }
 
+/// A4 (negative): observeAndAdmit's EDGE-BEFORE-OBSERVE invariant — adopting an EXISTING incarnation is
+/// safe ONLY under this build's durable precommit closure — was guarded only by chassert(precommitted),
+/// which is compiled out in release. A putBlob that reaches the adopt path with NO precommit (the wiring
+/// order stageManifest -> precommitAdd -> putBlob violated) must fail closed with a real LOGICAL_ERROR,
+/// not silently adopt a blob the newborn-debris watermark does not cover.
+TEST(CasBuild, AdoptBeforePrecommitFailsClosed)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = openStore(b);
+
+    const String payload = "adopt-before-precommit-payload";
+    const UInt128 hash = u128Of(payload);
+    const BlobRef id = idOf(payload);
+
+    /// Pre-seed a present body (padded past the pool header so the logical-size guard does not
+    /// underflow) + an independent Clean meta, so putBlob's upload conflicts on the present object and
+    /// takes the ADOPT branch of observeAndAdmit — mirroring PutBlobAdoptsWhenMetaCleanNoRetireView.
+    const uint64_t header_len = s->poolMeta().blob_header_len;
+    String raw_body(header_len, '\0');
+    raw_body += payload;
+    writeRawBlobBody(*b, s->layout(), hash, raw_body);
+    writeMetaClean(*b, s->layout(), hash, payload.size());
+
+    /// Start a build but DO NOT call precommitAdd: the adopt runs with `precommitted == false`.
+    const RootNamespace ns{"srv/tbl"};
+    auto build = startBuildFor(s, ns, "ref_adopt");
+
+    expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR,
+        [&] { build->putBlob(id, BlobSource::fromString(payload)); });
+}
+
 /// The resurrect decision (displace a condemned body) is likewise driven PURELY by the meta point-read
 /// — again, no RetireView is seeded. A condemned meta must cause putBlob to displace the body (a fresh
 /// token, the old one never returns — INV-NO-RETURN, unchanged body mechanics) AND flip the meta back
