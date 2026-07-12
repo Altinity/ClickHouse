@@ -362,8 +362,8 @@ The build identity of a precommit is
 
 Phase 1 has exactly one log encoding: every transaction, however small, is one deterministic body
 object at `_log/<txn-id>`. Ref names therefore never appear in object keys; they are validated as
-canonical clean relative paths inside transaction bodies — empty, `.`, `..`, repeated separators, and
-non-canonical escaping are rejected. One transaction creates exactly one key, a premise the
+canonical clean relative paths inside transaction bodies — empty, `.`, `..`, repeated separators,
+embedded NUL bytes, and non-canonical escaping are rejected. One transaction creates exactly one key, a premise the
 pagination proof relies on.
 
 Zero-byte inline keys that encode a common one-operation transaction entirely in the key are a
