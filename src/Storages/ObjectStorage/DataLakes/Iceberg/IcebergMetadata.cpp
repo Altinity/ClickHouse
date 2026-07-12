@@ -30,6 +30,7 @@
 #include <Common/Exception.h>
 
 #include <Interpreters/PreparedSets.h>
+#include <Interpreters/castColumn.h>
 #include <Storages/ObjectStorage/Utils.h>
 
 #include <Databases/DataLake/Common.h>
@@ -112,6 +113,8 @@ extern const int S3_ERROR;
 extern const int TABLE_ALREADY_EXISTS;
 extern const int SUPPORT_IS_DISABLED;
 extern const int INCORRECT_DATA;
+extern const int METADATA_MISMATCH;
+extern const int UNFINISHED;
 }
 
 namespace Setting
@@ -1503,7 +1506,7 @@ namespace
 {
 
 /// Find the partition spec object with the given spec-id inside a metadata JSON document.
-/// Throws BAD_ARGUMENTS if the spec is not found (indicates metadata/spec-id mismatch).
+/// Throws METADATA_MISMATCH if the spec is not found (indicates metadata/spec-id mismatch).
 Poco::JSON::Object::Ptr lookupPartitionSpec(const Poco::JSON::Object::Ptr & meta, Int64 spec_id)
 {
     auto specs = meta->getArray(Iceberg::f_partition_specs);
@@ -1513,7 +1516,7 @@ Poco::JSON::Object::Ptr lookupPartitionSpec(const Poco::JSON::Object::Ptr & meta
         if (spec->getValue<Int64>(Iceberg::f_spec_id) == spec_id)
             return spec;
     }
-    throw Exception(ErrorCodes::BAD_ARGUMENTS,
+    throw Exception(ErrorCodes::METADATA_MISMATCH,
         "Partition spec with id {} not found in table metadata", spec_id);
 }
 
@@ -1527,8 +1530,59 @@ Poco::JSON::Object::Ptr lookupSchema(const Poco::JSON::Object::Ptr & meta, Int64
             return schema;
     }
 
-    throw Exception(ErrorCodes::BAD_ARGUMENTS,
+    throw Exception(ErrorCodes::METADATA_MISMATCH,
         "Schema with id {} not found in table metadata", schema_id);
+}
+
+/// Derive the Iceberg partition tuple for an exported part from a representative source row.
+/// The MergeTree `partition.value` is the source partition-key expression result; it is neither
+/// cast to the destination column types nor expressed through the Iceberg transform, so it must
+/// not be written to metadata directly. Within a MergeTree partition the transform result is
+/// constant, so a single representative value per partition-source column (taken from the part's
+/// minmax block) suffices: cast it to the destination column type and run the same transform the
+/// data uses. The result is transform-correct and consistent with the exported data files.
+std::vector<Field> recomputeExportPartitionValues(
+    ChunkPartitioner & partitioner,
+    const SharedHeader & sample_block,
+    const Block & partition_source_block)
+{
+    const auto & partition_columns = partitioner.getColumns();
+    if (partition_columns.empty())
+        return {};
+
+    for (const auto & column_name : partition_columns)
+        if (!partition_source_block.has(column_name))
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "Partition source column '{}' required by the Iceberg partition transform is missing "
+                "from the representative source block while committing an export.", column_name);
+
+    Columns columns;
+    columns.reserve(sample_block->columns());
+    for (size_t i = 0; i < sample_block->columns(); ++i)
+    {
+        const auto & dest_column = sample_block->getByPosition(i);
+        if (partition_source_block.has(dest_column.name))
+        {
+            const auto & source = partition_source_block.getByName(dest_column.name);
+            ColumnWithTypeAndName representative{source.column->cut(0, 1), source.type, source.name};
+            columns.push_back(castColumn(representative, dest_column.type));
+        }
+        else
+        {
+            auto column = dest_column.type->createColumn();
+            column->insertDefault();
+            columns.push_back(std::move(column));
+        }
+    }
+
+    auto partitioned = partitioner.partitionChunk(Chunk(std::move(columns), 1));
+    if (partitioned.size() != 1)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "Recomputing Iceberg partition values produced {} partitions for a single representative row; "
+            "a MergeTree partition must map to exactly one Iceberg partition.", partitioned.size());
+
+    const auto & key = partitioned.front().first;
+    return std::vector<Field>(key.begin(), key.end());
 }
 
 }
@@ -1663,13 +1717,13 @@ bool IcebergMetadata::commitImportPartitionTransactionImpl(
             /// the caller has to restart the export from scratch.
             const auto new_schema_id = metadata->getValue<Int64>(Iceberg::f_current_schema_id);
             if (new_schema_id != original_schema_id)
-                throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+                throw Exception(ErrorCodes::METADATA_MISMATCH,
                     "Table schema changed during export (expected schema {}, got {}). Restart the export operation.",
                     original_schema_id, new_schema_id);
 
             const Int64 new_partition_spec_id = metadata->getValue<Int64>(Iceberg::f_default_spec_id);
             if (new_partition_spec_id != partition_spec_id)
-                throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+                throw Exception(ErrorCodes::METADATA_MISMATCH,
                     "Partition spec changed during export (expected spec {}, got {}). Restart the export operation.",
                     partition_spec_id, new_partition_spec_id);
 
@@ -1833,7 +1887,7 @@ void IcebergMetadata::commitExportPartitionTransaction(
     const String & transaction_id,
     Int64 original_schema_id,
     Int64 partition_spec_id,
-    const std::vector<Field> & partition_values,
+    const Block & partition_source_block,
     SharedHeader sample_block,
     const std::vector<String> & data_file_paths,
     ContextPtr context)
@@ -1877,14 +1931,14 @@ void IcebergMetadata::commitExportPartitionTransaction(
     /// The exported data files and partition values were produced against the original spec;
     const auto latest_schema_id = metadata->getValue<Int64>(Iceberg::f_current_schema_id);
     if (latest_schema_id != original_schema_id)
-        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+        throw Exception(ErrorCodes::METADATA_MISMATCH,
             "Table schema changed before export could commit (expected schema {}, got {}). "
             "Restart the export operation.",
             original_schema_id, latest_schema_id);
 
     const auto latest_spec_id = metadata->getValue<Int64>(Iceberg::f_default_spec_id);
     if (latest_spec_id != partition_spec_id)
-        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+        throw Exception(ErrorCodes::METADATA_MISMATCH,
             "Partition spec changed before export could commit (expected spec {}, got {}). "
             "Restart the export operation.",
             partition_spec_id, latest_spec_id);
@@ -1901,6 +1955,10 @@ void IcebergMetadata::commitExportPartitionTransaction(
 
     const auto partition_columns = partitioner.getColumns();
     const auto partition_types = partitioner.getResultTypes();
+
+    /// Recompute the partition tuple via the destination transform so the metadata partition
+    /// value matches the exported data (rather than the raw source MergeTree partition value).
+    const auto partition_values = recomputeExportPartitionValues(partitioner, sample_block, partition_source_block);
 
     const auto metadata_compression_method = persistent_components.metadata_compression_method;
 
@@ -1955,7 +2013,7 @@ void IcebergMetadata::commitExportPartitionTransaction(
         ++attempt;
     }
 
-    throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+    throw Exception(ErrorCodes::UNFINISHED,
         "Failed to commit export partition transaction after {} attempts due to repeated metadata conflicts.",
         attempt);
 }

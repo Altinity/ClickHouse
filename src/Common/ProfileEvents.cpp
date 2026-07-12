@@ -1429,6 +1429,8 @@ The server successfully detected this situation and will download merged part fr
     M(DataLakeRestCatalogGetTableMetadataMicroseconds, "Total time of 'get table metadata' requests to Iceberg REST catalog.", ValueType::Microseconds) \
     M(DataLakeRestCatalogGetCredentials, "Number of 'get credentials' requests to Iceberg REST catalog.", ValueType::Number) \
     M(DataLakeRestCatalogGetCredentialsMicroseconds, "Total time of 'get credentials' requests to Iceberg REST catalog.", ValueType::Microseconds) \
+    M(DataLakeRestCatalogCredentialsVended, "Number of table metadata requests to Iceberg REST catalog that asked the catalog to vend storage credentials (i.e. cache miss).", ValueType::Number) \
+    M(DataLakeRestCatalogCredentialsCacheHits, "Number of table metadata requests to Iceberg REST catalog that reused cached storage credentials and did not ask the catalog to vend new ones.", ValueType::Number) \
     M(DataLakeRestCatalogCreateNamespace, "Number of 'create namespace' requests to Iceberg REST catalog.", ValueType::Number) \
     M(DataLakeRestCatalogCreateNamespaceMicroseconds, "Total time of 'create namespace' requests to Iceberg REST catalog.", ValueType::Microseconds) \
     M(DataLakeRestCatalogCreateTable, "Number of 'create table' requests to Iceberg REST catalog.", ValueType::Number) \
