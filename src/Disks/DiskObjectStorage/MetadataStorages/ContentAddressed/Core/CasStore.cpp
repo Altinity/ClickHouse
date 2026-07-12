@@ -2247,6 +2247,18 @@ void Store::removeMountpointObject(const String & key)
     casRemoveObject(pool_layout.mountpointObjectKey(key));
 }
 
+bool Store::namespaceIsRemoved(const RootNamespace & ns)
+{
+    const auto rt = getRefTableRuntime(ns);
+    ensureRefTableRecovered(ns, *rt);
+    std::lock_guard<std::mutex> lock(rt->state_mutex);
+    /// A genuinely-removed namespace is `Removed` WITH a `remove_txn_id` (RemoveNamespace sets both). The
+    /// never-born default is also `Removed` but carries no `remove_txn_id`, and a recreated one is `Live`
+    /// (NamespaceBirth resets the marker) — so `remove_txn_id.has_value()` is the exact born-then-removed
+    /// discriminator, matching promote's own `state.remove_txn_id` recreation guard.
+    return rt->state.lifecycle != RefLifecycle::Live && rt->state.remove_txn_id.has_value();
+}
+
 void Store::dropNamespace(const RootNamespace & ns)
 {
     /// Task 11 (spec §Namespace Removal): one body transaction naming an exact `owner_transition`

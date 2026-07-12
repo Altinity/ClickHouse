@@ -416,6 +416,14 @@ public:
     /// GC's namespace-cleanup item, Task 12.
     void dropNamespace(const RootNamespace & ns);
 
+    /// True iff this namespace's ref-table lifecycle is durably `Removed` — a table that `dropNamespace`
+    /// removed and that has NOT been recreated (distinguished from a never-born namespace, whose default
+    /// `Removed` lifecycle carries no `remove_txn_id`). Recovers a cold runtime; the warm path is a
+    /// cached-state read. Readers consult this to treat a dropped table's namespace files as absent while
+    /// GC has not yet physically reclaimed them (deferred-GC removal, Task 12); a never-born namespace is
+    /// NOT reported removed (fail-closed — only a KNOWN-removed table hides its files).
+    bool namespaceIsRemoved(const RootNamespace & ns);
+
     /// ==== writer ref-log append lane (Task 10, spec §Writer Algorithms) ====
     ///
     /// The ONE entry point every ref mutation funnels through -- Store's own dropRef/updateRefPayload

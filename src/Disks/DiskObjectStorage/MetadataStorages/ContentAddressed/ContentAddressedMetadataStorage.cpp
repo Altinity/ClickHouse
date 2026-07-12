@@ -558,6 +558,11 @@ Cas::RootNamespace ContentAddressedMetadataStorage::liveNamespace(const std::str
     return Cas::RootNamespace{serverPrefix() + "/" + ContentAddressed::mirroredArchiveNamespace(table_uuid)};
 }
 
+bool ContentAddressedMetadataStorage::namespaceFilesReadable(const Cas::RootNamespace & ns) const
+{
+    return !store()->namespaceIsRemoved(ns);
+}
+
 Cas::RootNamespace ContentAddressedMetadataStorage::shadowNamespace(const std::string & shadow_table_dir)
 {
     /// The LITERAL shadow table dir (shadow/<backup>/store/<u3>/<uuid> or .../data/<db>/<tbl>):
@@ -615,7 +620,10 @@ bool ContentAddressedMetadataStorage::existsFile(const std::string & path) const
     if (!ContentAddressed::isPartFilePath(path))
     {
         if (auto tf = ContentAddressed::parseTableFilePath(path))
-            return store()->getNamespaceFile(liveNamespace(tf->table_uuid), tf->tail).has_value();
+        {
+            const auto ns = liveNamespace(tf->table_uuid);
+            return namespaceFilesReadable(ns) && store()->getNamespaceFile(ns, tf->tail).has_value();
+        }
         /// A loose mountpoint object (design §5.2): a plain object at roots/<server_root_id>/<path>.
         /// Use a HEAD-based existence check (directory-safe), NOT a body read: the traversal in
         /// system.remote_data_paths probes existsFile on directory-shaped pool paths (e.g. `store`), and a
@@ -702,8 +710,11 @@ bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) 
     /// A table-level SUBDIRECTORY (deduplication_logs/...): at least one verbatim file under it.
     if (auto tf = ContentAddressed::parseTableFilePath(path))
     {
+        const auto ns = liveNamespace(tf->table_uuid);
+        if (!namespaceFilesReadable(ns))
+            return false;
         const std::string prefix = tf->tail + "/";
-        for (const auto & name : store()->listNamespaceFiles(liveNamespace(tf->table_uuid)))
+        for (const auto & name : store()->listNamespaceFiles(ns))
             if (name.starts_with(prefix))
                 return true;
         return false;
@@ -842,11 +853,15 @@ std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const st
     /// the single `detached` subdir, exactly like a nested verbatim file).
     if (auto uuid = ContentAddressed::parseTableUuid(path))
     {
+        const auto ns = liveNamespace(*uuid);
         std::unordered_set<std::string> result;
-        for (const auto & [ref, _] : store()->listRefs(liveNamespace(*uuid)))
+        for (const auto & [ref, _] : store()->listRefs(ns))
             addFirstComponent(result, ref);
-        for (const auto & name : store()->listNamespaceFiles(liveNamespace(*uuid)))
-            addFirstComponent(result, name);
+        /// A dropped table lists empty for its namespace files too (its refs are already gone via the
+        /// ref state); only surface verbatim file names while the table is not removed.
+        if (namespaceFilesReadable(ns))
+            for (const auto & name : store()->listNamespaceFiles(ns))
+                addFirstComponent(result, name);
         return toVector(std::move(result));
     }
 
@@ -882,11 +897,12 @@ std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const st
     /// A table-level SUBDIRECTORY: verbatim files under <subdir>/, first-component collapsed.
     if (auto tf = ContentAddressed::parseTableFilePath(path))
     {
-        const std::string prefix = tf->tail + "/";
+        const auto ns = liveNamespace(tf->table_uuid);
         std::unordered_set<std::string> result;
-        for (const auto & name : store()->listNamespaceFiles(liveNamespace(tf->table_uuid)))
-            if (name.starts_with(prefix))
-                addFirstComponent(result, name.substr(prefix.size()));
+        if (namespaceFilesReadable(ns))
+            for (const auto & name : store()->listNamespaceFiles(ns))
+                if (name.starts_with(tf->tail + "/"))
+                    addFirstComponent(result, name.substr(tf->tail.size() + 1));
         return toVector(std::move(result));
     }
 
@@ -1020,7 +1036,10 @@ std::optional<String> ContentAddressedMetadataStorage::tryGetInManifestBytes(con
     if (!ContentAddressed::isPartFilePath(path))
     {
         if (auto tf = ContentAddressed::parseTableFilePath(path))
-            return store()->getNamespaceFile(liveNamespace(tf->table_uuid), tf->tail);
+        {
+            const auto ns = liveNamespace(tf->table_uuid);
+            return namespaceFilesReadable(ns) ? store()->getNamespaceFile(ns, tf->tail) : std::nullopt;
+        }
         return std::nullopt;   /// loose files are plain objects, not in-manifest bytes (design §5.2)
     }
 

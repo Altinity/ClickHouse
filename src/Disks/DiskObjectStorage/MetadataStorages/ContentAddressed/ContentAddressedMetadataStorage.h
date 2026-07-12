@@ -221,6 +221,13 @@ public:
     Cas::RootNamespace liveNamespace(const std::string & table_uuid) const;
     static Cas::RootNamespace shadowNamespace(const std::string & shadow_table_dir);
 
+    /// A dropped-and-not-recreated table (ref-table lifecycle durably `Removed`) is GONE for readers: its
+    /// table-level namespace files — `format_version.txt` and other verbatim files — must read as absent
+    /// even while GC has not yet physically reclaimed them (deferred-GC removal, commit 318291fe5e5),
+    /// mirroring how its parts already vanish via the ref state. Gate every namespace-file read on this.
+    /// A never-born namespace is NOT hidden (fail-closed — only a KNOWN-removed table hides its files).
+    bool namespaceFilesReadable(const Cas::RootNamespace & ns) const;
+
     /// The configured live-tree root prefix. Phase 1 makes layout identity explicit:
     /// live/detached namespaces and verbatim live-tree files are rooted by `server_root_id`, while
     /// `ServerUUID` remains only the mount owner token.
