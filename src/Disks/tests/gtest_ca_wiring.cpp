@@ -157,6 +157,24 @@ TEST(CaPartPathParser, DetachedPathsNonAtomicFoldIntoTheTableNamespace)
     EXPECT_TRUE(c->file.empty());
 }
 
+TEST(CaPartPathParser, DetachedNamedTableIsKnownAmbiguityFoldedAsReservedDir)
+{
+    // ACCEPTED LIMITATION (see the anchor-site comment in findPartDirComponent): a non-Atomic
+    // database or TABLE literally named "detached" is structurally indistinguishable, from the path
+    // string alone, from the reserved detached subdir of a table one level up — so it gets folded
+    // as the reserved dir, not as a table name. This test PINS that known, deliberately-accepted
+    // behavior (backlogged by the stabilization campaign) so any future change to it is a conscious
+    // one, not an accidental regression.
+    auto d = parsePartFilePath("data/db/detached/all_1_1_0/data.bin");
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(d->table_uuid, "data/db");
+    EXPECT_EQ(d->part_name, std::string(kDetachedDirName));
+    EXPECT_EQ(d->file, "all_1_1_0/data.bin");
+
+    // Consequently the table dir itself is unrecognized: it looks like a detached container instead.
+    EXPECT_FALSE(parseTableUuid("data/db/detached").has_value());
+}
+
 TEST(CaPartPathParser, MutablePerPartFiles)
 {
     EXPECT_TRUE(isMutablePerPartFile("uuid.txt"));

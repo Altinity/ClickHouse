@@ -125,6 +125,18 @@ static std::optional<PartDirAnchor> findPartDirComponent(const std::vector<std::
         if (p[i] == kDetachedDirName)
             return PartDirAnchor{0, i}; // table id = the whole path before `detached`
 
+    // ACCEPTED LIMITATION: a non-Atomic database or table literally named `detached` is misparsed
+    // by this anchor — e.g. data/db/detached/all_1_1_0/... folds to table id "data/db" with
+    // part_name "detached" instead of table id "data/db/detached". The two shapes are structurally
+    // indistinguishable from the path string alone (there is nothing here that says whether the
+    // component is the reserved subdir or a table name that happens to collide with it); a full fix
+    // needs a structural anchor supplied by the caller (e.g. knowledge of which databases/tables
+    // exist), which is out of scope for this string-only parser. Deliberately kept: the common case
+    // (real detached dirs on Ordinary-engine tables) must parse correctly, and a table named
+    // `detached` is legal-but-exotic on a pre-release storage engine. Backlogged by the stabilization
+    // campaign. See CaPartPathParser.DetachedNamedTableIsKnownAmbiguityFoldedAsReservedDir, which
+    // pins this exact behavior so any future change here is a conscious one.
+
     // The table identifier must be at least one component (a real table dir, never the bare disk
     // root), so the part dir is at index >= 1. Scan right to left so a part-dir-shaped
     // table/partition name earlier in the path cannot steal the anchor.
