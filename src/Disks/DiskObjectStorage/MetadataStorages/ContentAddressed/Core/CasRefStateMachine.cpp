@@ -1,0 +1,333 @@
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRefStateMachine.h>
+#include <Common/Exception.h>
+#include <algorithm>
+
+namespace DB
+{
+namespace ErrorCodes
+{
+    extern const int CORRUPTED_DATA;
+}
+}
+
+namespace DB::Cas
+{
+
+namespace
+{
+
+/// True iff `manifest_ref` already names an existing committed row or precommit binding under ANY
+/// ref_name (spec §Add Precommit: "no conflicting owner may name the same manifest"). Linear scan:
+/// the state machine is not the hot path (see `admits`'s header doc), and table sizes are bounded by
+/// the same admission budget this invariant protects.
+bool manifestAlreadyOwned(const RefTableState & state, const ManifestRef & manifest_ref)
+{
+    for (const auto & [name, row] : state.committed)
+        if (row.manifest_ref == manifest_ref)
+            return true;
+    for (const auto & [name, ref] : state.precommits)
+        if (ref == manifest_ref)
+            return true;
+    return false;
+}
+
+/// The `owner_transition` op kind (spec §State Transitions): dispatches on the `(old_binding,
+/// new_binding)` shape to one of the four legal transitions (add precommit / remove precommit /
+/// remove committed / promote). Any other shape is not a recognized transition.
+void applyOwnerTransition(RefTableState & state, const RefOp & op)
+{
+    if (state.lifecycle != RefLifecycle::Live)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableState: owner_transition while namespace is not Live");
+
+    const bool has_old = op.old_binding.has_value();
+    const bool has_new = op.new_binding.has_value();
+
+    /// Add precommit (spec §Add Precommit): no old_binding, a fresh Precommit new_binding.
+    if (!has_old && has_new && op.new_binding->kind == RefOwnerKind::Precommit)
+    {
+        const RefOwnerBinding & b = *op.new_binding;
+        if (state.precommits.contains({b.ref_name, b.manifest_ref}))
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "RefTableState: add precommit '{}' already exists for this exact manifest", b.ref_name);
+        if (manifestAlreadyOwned(state, b.manifest_ref))
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "RefTableState: manifest already has a conflicting owner under another ref_name");
+        state.precommits.emplace(b.ref_name, b.manifest_ref);
+        return;
+    }
+
+    /// Remove precommit (spec §Remove Precommit): an exact Precommit old_binding, no new_binding.
+    if (has_old && !has_new && op.old_binding->kind == RefOwnerKind::Precommit)
+    {
+        const RefOwnerBinding & b = *op.old_binding;
+        if (state.precommits.erase({b.ref_name, b.manifest_ref}) == 0)
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "RefTableState: exact precommit binding '{}' to remove is absent", b.ref_name);
+        return;
+    }
+
+    /// Remove committed ref (spec §Remove Committed Ref): an exact Committed old_binding, no new_binding.
+    if (has_old && !has_new && op.old_binding->kind == RefOwnerKind::Committed)
+    {
+        const RefOwnerBinding & b = *op.old_binding;
+        const auto it = state.committed.find(b.ref_name);
+        if (it == state.committed.end() || !(it->second.manifest_ref == b.manifest_ref))
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "RefTableState: exact committed binding '{}' to remove is absent", b.ref_name);
+        state.committed.erase(it);
+        return;
+    }
+
+    /// Promote (spec §Promote): the SAME ref_name and manifest_ref move from Precommit to Committed
+    /// in one atomic step; the resulting row's payload starts empty (installed by a later set_payload).
+    if (has_old && has_new && op.old_binding->kind == RefOwnerKind::Precommit
+        && op.new_binding->kind == RefOwnerKind::Committed
+        && op.old_binding->ref_name == op.new_binding->ref_name
+        && op.old_binding->manifest_ref == op.new_binding->manifest_ref)
+    {
+        const RefOwnerBinding & b = *op.old_binding;
+        if (state.precommits.erase({b.ref_name, b.manifest_ref}) == 0)
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "RefTableState: exact precommit binding '{}' to promote is absent", b.ref_name);
+        /// A DIFFERENT manifest already committed under this exact ref_name must be evicted by its
+        /// own explicit owner_transition(old=Committed, new=None) first (an earlier op of this same
+        /// transaction, or an earlier transaction) -- never silently here. `GC`'s manifest-edge delta
+        /// (spec §Produce Manifest-Edge Delta) is read off the transaction's explicit ops, not a
+        /// before/after state diff; a promote that silently evicted a stale committed row would never
+        /// emit that manifest's "-1" edge, leaking it as phantom-alive forever.
+        if (state.committed.contains(b.ref_name))
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "RefTableState: promote '{}' would silently displace a different already-committed "
+                "manifest -- remove it with an explicit owner_transition first", b.ref_name);
+        RefCommittedRow row;
+        row.ref_name = b.ref_name;
+        row.manifest_ref = b.manifest_ref;
+        state.committed.emplace(b.ref_name, std::move(row));
+        return;
+    }
+
+    throw Exception(ErrorCodes::CORRUPTED_DATA,
+        "RefTableState: owner_transition does not match any legal transition shape");
+}
+
+/// The `set_payload` op kind (spec §Update Payload): the committed ref must still name
+/// `expected_manifest_ref`; replaces the complete mutable payload without touching the manifest edge.
+void applySetPayload(RefTableState & state, const RefOp & op)
+{
+    if (state.lifecycle != RefLifecycle::Live)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableState: set_payload while namespace is not Live");
+
+    const auto it = state.committed.find(op.ref_name);
+    if (it == state.committed.end() || !(it->second.manifest_ref == op.expected_manifest_ref))
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "RefTableState: set_payload '{}' no longer names its expected_manifest_ref", op.ref_name);
+
+    it->second.payload = op.payload;
+    it->second.published_at_ms = op.published_at_ms;
+}
+
+/// One operation's local preconditions and effect (spec §State Transitions), shared by
+/// `applyRefLogTxn`'s per-op loop and by `admits`'s single-op preview. `txn_id` is only read by
+/// `RemoveNamespace` (it becomes the resulting `remove_txn_id`).
+void applyOpInPlace(RefTableState & state, const RefOp & op, const RefTxnId & txn_id)
+{
+    switch (op.kind)
+    {
+        case RefOpKind::NamespaceBirth:
+        {
+            /// spec §Namespace Birth: legal from never-born or Removed, never from Live. Gating
+            /// recreation on the `_cleanup` marker is the writer's recovery-time responsibility
+            /// (Task 10/11) -- the marker is not part of `RefTableState`.
+            if (state.lifecycle == RefLifecycle::Live)
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableState: namespace_birth while already Live");
+            state.lifecycle = RefLifecycle::Live;
+            state.remove_txn_id.reset();
+            return;
+        }
+        case RefOpKind::OwnerTransition:
+            applyOwnerTransition(state, op);
+            return;
+        case RefOpKind::SetPayload:
+            applySetPayload(state, op);
+            return;
+        case RefOpKind::RemoveNamespace:
+        {
+            /// spec §Remove Namespace: requires Live and both owner sets already empty -- true only
+            /// if this transaction's earlier ops (checked by `checkRemoveNamespaceOrdering`) actually
+            /// named every owner that existed when the transaction started.
+            if (state.lifecycle != RefLifecycle::Live)
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableState: remove_namespace while not Live");
+            if (!state.committed.empty() || !state.precommits.empty())
+                throw Exception(ErrorCodes::CORRUPTED_DATA,
+                    "RefTableState: remove_namespace with nonempty owner sets");
+            state.lifecycle = RefLifecycle::Removed;
+            state.remove_txn_id = txn_id;
+            return;
+        }
+    }
+    /// Reachable only through a hand-corrupted RefOpKind (mirrors CasRefLogCodec.cpp's
+    /// exhaustive-switch-then-throw shape); every named enumerator returns above.
+    throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableState: unknown op kind {}", static_cast<uint8_t>(op.kind));
+}
+
+/// Txn-wide structural check (spec §Remove Namespace), NOT a per-op precondition: if `ops` contains a
+/// `RemoveNamespace`, it must be the last element, and every earlier op must be an exact
+/// owner-removal `owner_transition` (`old_binding` set, `new_binding` empty). `CasRefLogCodec`
+/// deliberately does not check this shape -- this is the one place that does.
+void checkRemoveNamespaceOrdering(const std::vector<RefOp> & ops)
+{
+    const bool has_remove = std::any_of(ops.begin(), ops.end(),
+        [](const RefOp & op) { return op.kind == RefOpKind::RemoveNamespace; });
+    if (!has_remove)
+        return;
+
+    if (ops.empty() || ops.back().kind != RefOpKind::RemoveNamespace)
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "RefTableState: remove_namespace must be the final operation of its transaction");
+
+    for (size_t i = 0; i + 1 < ops.size(); ++i)
+    {
+        const RefOp & op = ops[i];
+        const bool pure_removal = op.kind == RefOpKind::OwnerTransition
+            && op.old_binding.has_value() && !op.new_binding.has_value();
+        if (!pure_removal)
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "RefTableState: every operation before remove_namespace must be an exact owner removal");
+    }
+}
+
+/// The inverse of `snapshotOf`: state from a snapshot's rows, after checking the same
+/// lifecycle/remove_txn_id/row-emptiness coupling `CasRefSnapshotCodec` enforces on encode (re-checked
+/// here since `replay` may receive a hand-built `RefTableSnapshot` that never passed through
+/// `decodeRefTableSnapshot`).
+RefTableState stateFromSnapshot(const RefTableSnapshot & snapshot)
+{
+    if (snapshot.lifecycle == RefLifecycle::Removed)
+    {
+        if (!snapshot.remove_txn_id || !snapshot.committed.empty() || !snapshot.precommits.empty())
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "RefTableSnapshot: Removed snapshot must carry remove_txn_id and no committed/precommit rows");
+    }
+    else if (snapshot.remove_txn_id)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableSnapshot: Live snapshot must not carry remove_txn_id");
+
+    RefTableState state;
+    state.lifecycle = snapshot.lifecycle;
+    state.remove_txn_id = snapshot.remove_txn_id;
+    state.greatest_applied = snapshot.snapshot_id;
+    for (const RefCommittedRow & row : snapshot.committed)
+        state.committed.emplace(row.ref_name, row);
+    for (const RefOwnerBinding & b : snapshot.precommits)
+        state.precommits.emplace(b.ref_name, b.manifest_ref);
+    return state;
+}
+
+/// The hypothetical complete-removal transaction for `state` (spec §Remove Namespace: an exact
+/// owner-removal op for every committed ref and precommit, then `remove_namespace`), used only to
+/// measure `admits`'s removal-budget bound -- never persisted, never applied.
+RefLogTxn buildHypotheticalRemovalTxn(const RefTableState & state, const RefTxnId & placeholder_txn_id)
+{
+    RefLogTxn txn;
+    txn.txn_id = placeholder_txn_id;
+
+    for (const auto & [name, row] : state.committed)
+    {
+        RefOp op;
+        op.kind = RefOpKind::OwnerTransition;
+        op.old_binding = RefOwnerBinding{RefOwnerKind::Committed, name, row.manifest_ref};
+        txn.ops.push_back(std::move(op));
+    }
+    for (const auto & [name, manifest_ref] : state.precommits)
+    {
+        RefOp op;
+        op.kind = RefOpKind::OwnerTransition;
+        op.old_binding = RefOwnerBinding{RefOwnerKind::Precommit, name, manifest_ref};
+        txn.ops.push_back(std::move(op));
+    }
+
+    RefOp remove_op;
+    remove_op.kind = RefOpKind::RemoveNamespace;
+    txn.ops.push_back(remove_op);
+    return txn;
+}
+
+}
+
+void applyRefLogTxn(RefTableState & state, const RefLogTxn & txn)
+{
+    if (!(state.greatest_applied < txn.txn_id))
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "RefTableState: txn_id {}-{} is not strictly greater than the greatest applied {}-{}",
+            txn.txn_id.writer_epoch, txn.txn_id.ref_sequence,
+            state.greatest_applied.writer_epoch, state.greatest_applied.ref_sequence);
+
+    checkRemoveNamespaceOrdering(txn.ops);
+
+    /// Two-phase: validate and apply every op, in order, against a scratch copy; `state` is replaced
+    /// only once the whole transaction succeeds, so a throw anywhere above leaves it untouched and no
+    /// intra-transaction intermediate state is ever observable.
+    RefTableState scratch = state;
+    for (const RefOp & op : txn.ops)
+        applyOpInPlace(scratch, op, txn.txn_id);
+
+    scratch.greatest_applied = txn.txn_id;
+    state = std::move(scratch);
+}
+
+RefTableSnapshot snapshotOf(const RefTableState & state, const String & ns)
+{
+    RefTableSnapshot snapshot;
+    snapshot.ns = ns;
+    snapshot.snapshot_id = state.greatest_applied;
+    snapshot.lifecycle = state.lifecycle;
+    snapshot.remove_txn_id = state.remove_txn_id;
+
+    snapshot.committed.reserve(state.committed.size());
+    for (const auto & [name, row] : state.committed)
+        snapshot.committed.push_back(row);   /// std::map<String, ...> iterates sorted by ref_name
+
+    snapshot.precommits.reserve(state.precommits.size());
+    for (const auto & [name, manifest_ref] : state.precommits)
+        snapshot.precommits.push_back(RefOwnerBinding{RefOwnerKind::Precommit, name, manifest_ref});
+        /// std::set<std::pair<String, ManifestRef>> iterates sorted by (ref_name, manifest_ref),
+        /// matching CasRefSnapshotCodec's required precommit sort order exactly.
+
+    return snapshot;
+}
+
+RefTableState replay(const std::optional<RefTableSnapshot> & snapshot, std::span<const RefLogTxn> tail)
+{
+    RefTableState state = snapshot ? stateFromSnapshot(*snapshot) : RefTableState{};
+
+    const String * expected_ns = snapshot ? &snapshot->ns : nullptr;
+    for (const RefLogTxn & txn : tail)
+    {
+        if (expected_ns && txn.ns != *expected_ns)
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "RefTableState::replay: transaction ns '{}' does not match the table's ns '{}'",
+                txn.ns, *expected_ns);
+        expected_ns = &txn.ns;
+        applyRefLogTxn(state, txn);
+    }
+    return state;
+}
+
+bool admits(const RefTableState & state, const RefOp & op, uint64_t snapshot_budget, uint64_t removal_budget)
+{
+    /// A fixed nonzero placeholder id: this previews `op` in isolation, never as part of a real
+    /// transaction, and the resulting scratch state plus its two hypothetical encodings are discarded
+    /// immediately after measuring their size.
+    static constexpr RefTxnId kPreviewTxnId{1, 1};
+
+    RefTableState scratch = state;
+    applyOpInPlace(scratch, op, kPreviewTxnId);
+
+    const String snapshot_bytes = encodeRefTableSnapshot(snapshotOf(scratch, ""));
+    if (snapshot_bytes.size() > snapshot_budget)
+        return false;
+
+    const String removal_bytes = encodeRefLogTxn(buildHypotheticalRemovalTxn(scratch, kPreviewTxnId));
+    return removal_bytes.size() <= removal_budget;
+}
+
+}
