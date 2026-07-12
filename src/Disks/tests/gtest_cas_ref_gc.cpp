@@ -391,7 +391,13 @@ TEST(CasRefGc, RefSnaplogLifecycleE2E)
     EXPECT_TRUE(blobPresent(*backend, layout, DB::UInt128(2))) << "live blob survives";
     EXPECT_TRUE(blobPresent(*backend, layout, DB::UInt128(3))) << "other table's blob survives";
 
-    /// Read-only consumers agree: fsck clean (no dangle, no oracle divergence) and ca-gc-dryrun empty.
+    /// Read-only consumers agree: fsck clean (no dangle) and ca-gc-dryrun empty. The snapshot oracle takes
+    /// its SKIP path here -- va1, a log covered by the retained va2 snapshot, was cleaned in this same run,
+    /// so the oracle cannot reconstruct the state AT va2 and returns without comparing (spec: a cleaned
+    /// covered log makes the oracle unavailable, not an error; `snapshot_oracle_checked` stays 0). The
+    /// `snapshot_oracle_mismatches == 0` below therefore holds trivially, NOT via an active byte-compare;
+    /// the positive byte-compare path (covered logs still surviving) is exercised by
+    /// `CasFsckSnapshotOracle.PublishedSnapshotMatchingReplayIsClean`.
     const FsckReport rep = runFsck(*store, /*detail*/true);
     EXPECT_TRUE(rep.clean());
     EXPECT_EQ(rep.dangling, 0u);
