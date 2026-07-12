@@ -20,10 +20,10 @@ namespace DB::Cas
 /// spread across shards. `CityHash128` output has high entropy in BOTH halves, so both choices
 /// are equivalent for organic workloads; high bits are the documented canonical choice.
 ///
-/// NOTE: this is a SEPARATE sharding axis from the root-shard axis used by `Store::shardOf` and
-/// the test helper `shardOfForTest` (which applies `CityHash64(ref_name) % root_shards` to
-/// string ref names). The two axes are intentionally different: root shards partition the owner
-/// journal by ref name; blob-target shards partition the in-degree reducer work by blob hash.
+/// NOTE: this is a SEPARATE sharding axis from the root-shard axis used by `Store::shardOf` (which
+/// applies `CityHash64(ref_name) % root_shards` to string ref names). The two axes are intentionally
+/// different: root shards partition the ref-log by ref name; blob-target shards partition the
+/// in-degree reducer work by blob hash.
 ///
 /// Properties:
 ///   - Deterministic/stable: same inputs always yield the same shard.

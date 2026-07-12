@@ -32,7 +32,6 @@ using namespace DB::Cas;
 using DB::Cas::tests::blobEntryFor;
 using DB::Cas::tests::expectThrowsCode;
 using DB::Cas::tests::idOf;
-using DB::Cas::tests::shardOfForTest;
 using DB::Cas::tests::u128Of;
 
 namespace

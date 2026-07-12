@@ -73,9 +73,6 @@ public:
         uint64_t gc_shards_ = 1,
         uint64_t manifest_sweep_list_budget_keys_ = 1000,
         uint64_t manifest_sweep_delete_budget_keys_ = 100,
-        uint64_t manifest_soft_limit_ = 16ULL << 20,
-        uint64_t manifest_hard_limit_ = 64ULL << 20,
-        uint64_t manifest_max_delay_ms_ = 1000,
         uint64_t gc_max_conditional_put_bytes_ = 1ULL << 30,
         uint64_t cas_part_folder_cache_bytes_ = 64ULL << 20,
         uint64_t cas_part_folder_cache_max_entries_ = 10000,
@@ -277,10 +274,6 @@ private:
     const uint64_t gc_shards;                    /// Phase 4: blob-hash-prefix reducer shard count (creation-time only)
     const uint64_t manifest_sweep_list_budget_keys;
     const uint64_t manifest_sweep_delete_budget_keys;
-    /// B164b: root-shard manifest size limits and backpressure delay, passed through to PoolConfig.
-    const uint64_t manifest_soft_limit;
-    const uint64_t manifest_hard_limit;
-    const uint64_t manifest_max_delay_ms;
     /// GCS single-PUT budget for conditional writes (generation-token stores only): threaded into
     /// the ObjectStorageBackend construction site in startup(). Irrelevant on ETag stores (AWS et al).
     const uint64_t gc_max_conditional_put_bytes;

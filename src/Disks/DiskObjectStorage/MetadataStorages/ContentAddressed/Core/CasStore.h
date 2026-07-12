@@ -34,8 +34,7 @@ namespace DB::Cas
 {
 
 /// Whether a root-shard mutation originates from the writer path (user-visible publish/drop/precommit)
-/// or from GC/maintenance (trim/fence/reclaim). Writer mutations may be delayed for backpressure; GC
-/// mutations bypass backpressure entirely so cleanup cannot delay itself.
+/// or from GC/maintenance. Diagnostic-only (`toString`, event logging): recorded on the mutation item.
 enum class RootMutationOrigin : uint8_t
 {
     Writer,
@@ -66,8 +65,6 @@ enum class RootMutationKind : uint8_t
     Abandon,
     UpdateRefPayload,
     DropNamespace,
-    Fence,
-    Trim,
     ReclaimPrecommit,
 };
 
@@ -94,8 +91,6 @@ inline std::string_view toString(RootMutationKind kind)
         case RootMutationKind::Abandon:           return "Abandon";
         case RootMutationKind::UpdateRefPayload:  return "UpdateRefPayload";
         case RootMutationKind::DropNamespace:     return "DropNamespace";
-        case RootMutationKind::Fence:             return "Fence";
-        case RootMutationKind::Trim:              return "Trim";
         case RootMutationKind::ReclaimPrecommit:  return "ReclaimPrecommit";
     }
     return "Unknown";
@@ -193,13 +188,6 @@ struct PoolConfig
     /// feedback_ca_gc_never_throw_on_404) and `Gc::runRegularRound` waits for the round's whole batch
     /// before the round's single gc/state CAS, so the meta writes are durable before that CAS commits.
     uint64_t gc_meta_pool_size = 16;
-    uint64_t manifest_soft_limit = 16ULL << 20;
-    uint64_t manifest_hard_limit = 64ULL << 20;
-    /// B164b: max backpressure delay (ms) applied to writer-originated mutations whose encoded root-shard
-    /// body is between `manifest_soft_limit` and `manifest_hard_limit`. 0 disables delay (soft limit acts
-    /// as a warning-only log). At most one delay per mutation call. Delay is linear: 0 at soft_limit →
-    /// `manifest_max_delay_ms` near the hard limit.
-    uint64_t manifest_max_delay_ms = 1000;
     bool background_watermark = false;       /// tests drive renewOnce explicitly; gates the merged heartbeat's background thread
 
     /// Mount-lease TTL (spec §mount-safety): how long a freshly-renewed mount lease is valid. The local
@@ -552,13 +540,6 @@ public:
     /// entirely when the log is disabled (sink null) — a true no-op on the production hot path.
     bool hasEventSink() const noexcept { return static_cast<bool>(event_sink_); }
 
-    /// B164b: injectable backpressure delay hook for tests. In production the default
-    /// (std::this_thread::sleep_for) is used. Tests replace this with a no-op counter hook.
-    void setBackpressureDelayHook(std::function<void(std::chrono::milliseconds)> hook)
-    {
-        backpressure_delay_hook = std::move(hook);
-    }
-
     /// Task 5: read the current GC round from `gc/state`. Returns 0 when `gc/state` is absent (pool
     /// never GC'd). Used by `precommitAdd` to self-floor a NEWBORN ref-shard's `fence_round` to the
     /// current round (the birth floor, THM-NO-RETURN) — only on the create-if-absent branch.
@@ -833,7 +814,7 @@ public:
     /// tail a snapshot candidate would replay from).
     size_t tailSinceSnapshotCountForTest(const RootNamespace & ns);
 
-    /// Test-only hook (mirrors `setBackpressureDelayHook`'s existing pattern): called by `flushRefBatch`
+    /// Test-only hook: called by `flushRefBatch`
     /// right before it carves a batch, i.e. AFTER the table is already recovered -- the one otherwise
     /// untestable timing window `BlockingGetBackend`-style backend tricks cannot reach, since a warm
     /// flush performs no I/O between becoming leader and carving. A test blocks here to let a second
@@ -969,10 +950,6 @@ private:
     /// NOTE (M-C2): the manifest journal is never trimmed here — trimming needs folded_cursor
     /// (INV-JOURNAL-COVERAGE), which is GC state landing in M-C3; the manifest size guard
     /// (soft warn / hard throw, in the publish/drop CAS loop) bounds growth meanwhile.
-
-    /// B164b: injectable delay hook for backpressure tests. In production, stores use the default
-    /// (std::this_thread::sleep_for). Tests replace this with a no-op counter hook.
-    std::function<void(std::chrono::milliseconds)> backpressure_delay_hook;
 };
 
 }

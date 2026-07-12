@@ -555,14 +555,6 @@ inline DB::Cas::Token displaceBlobToken(
     return displaceObjectToken(backend, layout.blobKey(id), DB::Cas::ObjectKind::Blob);
 }
 
-/// Duplicate of `Store::shardOf` (CityHash64(ref) % root_shards) for placing manifests in tests, since
-/// shardOf is private and the Store API must not be widened for tests.
-/// MUST match Store::shardOf exactly.
-inline uint64_t shardOfForTest(const String & ref_name, uint64_t root_shards)
-{
-    return CityHash_v1_0_2::CityHash64(ref_name.data(), ref_name.size()) % root_shards;
-}
-
 /// ---- GC-core (Phase 1d) test helpers over the part-manifest model ----
 
 /// Open a Store over `backend` with a single root shard (so cursor keys are "ns/0").

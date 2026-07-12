@@ -137,9 +137,6 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     uint64_t gc_shards_,
     uint64_t manifest_sweep_list_budget_keys_,
     uint64_t manifest_sweep_delete_budget_keys_,
-    uint64_t manifest_soft_limit_,
-    uint64_t manifest_hard_limit_,
-    uint64_t manifest_max_delay_ms_,
     uint64_t gc_max_conditional_put_bytes_,
     uint64_t cas_part_folder_cache_bytes_,
     uint64_t cas_part_folder_cache_max_entries_,
@@ -166,9 +163,6 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     , gc_shards(gc_shards_)
     , manifest_sweep_list_budget_keys(manifest_sweep_list_budget_keys_)
     , manifest_sweep_delete_budget_keys(manifest_sweep_delete_budget_keys_)
-    , manifest_soft_limit(manifest_soft_limit_)
-    , manifest_hard_limit(manifest_hard_limit_)
-    , manifest_max_delay_ms(manifest_max_delay_ms_)
     , gc_max_conditional_put_bytes(gc_max_conditional_put_bytes_)
     , cas_part_folder_cache_bytes(cas_part_folder_cache_bytes_)
     , cas_part_folder_cache_max_entries(cas_part_folder_cache_max_entries_)
@@ -422,9 +416,6 @@ void ContentAddressedMetadataStorage::startup()
     pool_config.gc_shards = gc_shards;
     pool_config.manifest_sweep_list_budget_keys = manifest_sweep_list_budget_keys;
     pool_config.manifest_sweep_delete_budget_keys = manifest_sweep_delete_budget_keys;
-    pool_config.manifest_soft_limit = manifest_soft_limit;
-    pool_config.manifest_hard_limit = manifest_hard_limit;
-    pool_config.manifest_max_delay_ms = manifest_max_delay_ms;
     pool_config.gc_meta_pool_size = gc_meta_pool_size;
     cas_store = Cas::Store::open(std::move(backend), std::move(pool_config));
     pool_uuid = Cas::u128ToHex(cas_store->poolMeta().pool_id);

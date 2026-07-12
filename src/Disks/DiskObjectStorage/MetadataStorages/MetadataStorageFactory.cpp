@@ -282,9 +282,6 @@ static void registerContentAddressedMetadataStorage(MetadataStorageFactory & fac
         const std::string server_root_id = global_context->getMacros()->expand(
             config.getString(config_prefix + ".server_root_id"));
         Cas::validateServerRootId(server_root_id);
-        const uint64_t manifest_soft_limit = config.getUInt64(config_prefix + ".manifest_soft_limit", 16ULL << 20);
-        const uint64_t manifest_hard_limit = config.getUInt64(config_prefix + ".manifest_hard_limit", 64ULL << 20);
-        const uint64_t manifest_max_delay_ms = config.getUInt64(config_prefix + ".manifest_max_delay_ms", 1000);
         /// GCS single-PUT budget for conditional writes (generation-token stores only): the body
         /// is RAM-buffered up to this size; a bigger conditional write throws NOT_IMPLEMENTED
         /// (the compose-based path is a follow-up). Irrelevant on ETag stores (AWS et al).
@@ -309,7 +306,7 @@ static void registerContentAddressedMetadataStorage(MetadataStorageFactory & fac
             local_object_storage, key_compatibility_prefix, toString(ServerUUID::get()), server_root_id, local_scratch_path,
             global_context, gc_enabled, gc_interval, root_shards, name, dedup_cache_bytes, dedup_head_first_min_bytes,
             gc_snap_generations_to_keep, gc_shards, manifest_sweep_list_budget_keys, manifest_sweep_delete_budget_keys,
-            manifest_soft_limit, manifest_hard_limit, manifest_max_delay_ms, gcs_max_conditional_put_bytes,
+            gcs_max_conditional_put_bytes,
             cas_part_folder_cache_bytes, cas_part_folder_cache_max_entries, cas_part_folder_cache_max_entry_bytes,
             manifest_decode_cache_bytes, gc_meta_pool_size, staging_backend, blob_hash_algo, blob_hash_allow_new);
 
