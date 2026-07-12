@@ -11,7 +11,7 @@ namespace DB
 {
 namespace ErrorCodes
 {
-    extern const int BAD_ARGUMENTS;
+    extern const int LOGICAL_ERROR;
 }
 }
 
@@ -35,12 +35,12 @@ struct RefTxnId
 /// Renders the canonical form: two fixed-width, lower-case, 16-digit hexadecimal numbers joined by
 /// '-' (e.g. "0000000000000007-000000000000008e"). Lexical order of the render equals tuple order of
 /// `id`, because '-' (0x2d) sorts below every hex digit character and both fields are fixed-width.
-/// Throws BAD_ARGUMENTS if either field is zero: this render becomes an object key, and an invalid id
+/// Throws LOGICAL_ERROR if either field is zero: this render becomes an object key, and an invalid id
 /// must never silently produce a well-formed-looking one.
 inline String renderRefTxnId(const RefTxnId & id)
 {
     if (id.writer_epoch == 0 || id.ref_sequence == 0)
-        throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
+        throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR,
             "RefTxnId: writer_epoch and ref_sequence must both be nonzero, got {}-{}",
             id.writer_epoch, id.ref_sequence);
     return getHexUIntLowercase(id.writer_epoch) + "-" + getHexUIntLowercase(id.ref_sequence);

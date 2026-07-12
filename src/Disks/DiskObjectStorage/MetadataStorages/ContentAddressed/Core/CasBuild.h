@@ -49,9 +49,9 @@ BlobRef poolContentHash(BlobHashAlgo algo, std::string_view payload);
 /// thread-safe (a plain backend point-read/CAS, no shared in-memory state).
 ///
 /// Write path: stageManifest (mint a ManifestId, stream-write the body) -> precommitAdd (append a
-/// create-precommit RootOwnerEvent in the target root shard) -> putBlob (blob bodies) -> promote
-/// (atomic single-shard owner move precommit->committed, fail-closed revalidation). Only blobs stay
-/// content-addressed; a part is one immutable single-owner ManifestId.
+/// create-precommit owner-transition ref-log op to the target ref's shard) -> putBlob (blob bodies) ->
+/// promote (atomic single-shard owner move precommit->committed, fail-closed revalidation). Only blobs
+/// stay content-addressed; a part is one immutable single-owner ManifestId.
 class Build
 {
 public:
@@ -93,8 +93,8 @@ public:
     ManifestId stageManifest(std::vector<ManifestEntry> entries);
 
     /// Build-intent owner add, written to the SAME root shard as the future committed ref (spec §Precommit
-    /// Add) — there is no `_precommits` namespace. ONE root-shard CAS appending a RootOwnerEvent
-    /// {old=none, new={Precommit, final_ref_name, build_id, id.ref}} to the single ordered journal; shard =
+    /// Add) — there is no `_precommits` namespace. ONE `appendRefOps` call appending an OwnerTransition
+    /// `RefOp` (new_binding = {Precommit, final_ref_name, id.ref}) to the ref-log; shard =
     /// store->shardOf(final_ref_name), so the later promote is an atomic owner move in this same shard.
     /// Needs NO body-exists HEAD as a safety authority: GC and promotion handle a missing precommit
     /// manifest body by failing closed (a missing-body precommit is a non-activating, non-promotable intent).
@@ -108,7 +108,7 @@ public:
     ///     presence observation + per-hash `.meta` point-read, condemned ⇒ copy-forward-from-source (fail-closed);
     ///  4. body absent | a non-tokened blob absent | a blob condemned-and-not-recreatable ⇒ ABORTED;
     ///  5. atomically replace precommit(build_id) owner with committed(final_ref_name) owner by appending
-    ///     ONE pure-move RootOwnerEvent (old={Precommit,final_ref_name,build_id,T}, new={Committed,final_ref_name,T},
+    ///     ONE pure-move `RefOp` (old_binding={Precommit,final_ref_name,T}, new_binding={Committed,final_ref_name,T},
     ///     same manifest_ref T) and setting refs[final_ref_name];
     ///  6. promotion NEVER emits blob deltas (spec rev. 15 §Promote Precommit). A missing-body precommit
     ///     is non-activating and was rejected at step 4 (the writer re-stages with a fresh ManifestId).

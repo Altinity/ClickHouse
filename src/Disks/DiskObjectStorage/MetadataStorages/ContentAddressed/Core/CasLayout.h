@@ -470,8 +470,8 @@ public:
         return ns.string().ends_with("/_precommits");
     }
 
-    /// Public validator for a namespace reconstructed from an untrusted listed key (GC ref intake,
-    /// VERIFY-AT-T12): `parseRefObjectKey` returns the namespace without checking its shape, so a
+    /// Public validator for a namespace reconstructed from an untrusted listed key (GC ref intake):
+    /// `parseRefObjectKey` returns the namespace without checking its shape, so a
     /// consumer that will act on it must re-validate. Throws BAD_ARGUMENTS on a malformed namespace,
     /// exactly as every key-building method does.
     void validateNamespace(const RootNamespace & ns) const { checkNamespace(ns); }

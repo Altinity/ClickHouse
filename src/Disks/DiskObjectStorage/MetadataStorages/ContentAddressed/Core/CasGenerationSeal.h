@@ -34,7 +34,7 @@ struct RunRef
 /// What a round did to ONE (namespace, shard). classification is a small enum byte:
 ///   0 = Absent (shard not present / fresh-pool), 1 = Unchanged (token matched persisted; skipped),
 ///   2 = Folded (records in (folded_cursor, shard_version] were folded), 3 = Minted (fence-only,
-///   retired concept), 4 = Clamped (the fold was barrier/anomaly-clamped below the journal end:
+///   retired concept), 4 = Clamped (the fold was barrier/anomaly-clamped below the ref-log's current cursor:
 ///   unfolded events exist or may become foldable, so the token-diff Skip is FORBIDDEN — the next
 ///   round must re-read this shard regardless of an unchanged token).
 /// folded_token is the shard's observed manifest token at fold time; folded_cursor is the position

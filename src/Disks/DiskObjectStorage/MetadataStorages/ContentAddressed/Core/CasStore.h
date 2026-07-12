@@ -413,7 +413,7 @@ public:
     /// Task 11 (spec §Namespace Removal): one ref-log transaction naming every owner's exact removal
     /// followed by `remove_namespace`, then a best-effort publish of the constant-size `Removed`
     /// snapshot. Performs NO physical deletion (no verbatim-file deletes, no tombstones) -- that is
-    /// GC's namespace-cleanup item, Task 12 (see the TODO at this function's definition).
+    /// GC's namespace-cleanup item, Task 12.
     void dropNamespace(const RootNamespace & ns);
 
     /// ==== writer ref-log append lane (Task 10, spec §Writer Algorithms) ====
@@ -541,8 +541,8 @@ public:
     bool hasEventSink() const noexcept { return static_cast<bool>(event_sink_); }
 
     /// Task 5: read the current GC round from `gc/state`. Returns 0 when `gc/state` is absent (pool
-    /// never GC'd). Used by `precommitAdd` to self-floor a NEWBORN ref-shard's `fence_round` to the
-    /// current round (the birth floor, THM-NO-RETURN) — only on the create-if-absent branch.
+    /// never GC'd). Best-effort: its one remaining caller is `tryRemountOnce`'s MountRemount audit
+    /// event, which reports round 0 on any read failure rather than let the error escalate.
     uint64_t currentGcRound() const;
 
 private:
@@ -671,7 +671,7 @@ private:
         /// the fresh incarnation re-recovers each table under the new epoch on next touch, so any leader
         /// still holding THIS (now-orphaned) runtime must fail closed instead of allocating an id / applying
         /// against its stale cache once the re-armed fence re-opens the gate. Stored with release BEFORE the
-        /// remount re-arms the fence, so a lane that observes `mayMutate()` true also observes this flag
+        /// remount re-arms the fence, so a lane that observes `mayMutate` true also observes this flag
         /// (release/acquire through the fence) -- there is no interleaving where a stale runtime both passes
         /// the fence and reads this flag false.
         std::atomic<bool> superseded_by_remount{false};
@@ -679,7 +679,7 @@ private:
     static constexpr size_t kMaxRefBatch = 128;
     static constexpr size_t kRefRecoveryMaxRestarts = 3;          /// spec: "bounded (3) and counted"
     /// Fixed Phase-1 safety margin subtracted (alongside the per-table `4 + ns.size()` overhead) from
-    /// the raw `ref_snapshot_max_bytes`/`ref_removal_max_bytes` hard limits before calling `admits()`.
+    /// the raw `ref_snapshot_max_bytes`/`ref_removal_max_bytes` hard limits before calling `admits`.
     static constexpr uint64_t kRefAdmissionSafetyMargin = 4096;
 
     std::mutex ref_queue_mutex;
@@ -703,10 +703,10 @@ private:
     /// conditional log/snapshot `PUT` and uncertain-result resolution.
     std::unique_ptr<CasRequestController> ref_request_controller;
 
-    /// RFC pre-attempt fence check (T5 review obligation): extends `mayMutate()` with the REMAINING
-    /// budget check -- an attempt is not even started unless there is enough of the mount lease left
-    /// for one more attempt_timeout plus the lease safety margin. Passed as `fence_ok` to every
-    /// `CasRequestController` call the ref-log writer path makes.
+    /// RFC pre-attempt fence check: extends `mayMutate` with the REMAINING budget check -- an attempt
+    /// is not even started unless there is enough of the mount lease left for one more attempt_timeout
+    /// plus the lease safety margin. Passed as `fence_ok` to every `CasRequestController` call the
+    /// ref-log writer path makes.
     bool refAppendFenceOk() const;
 
     /// Get-or-create the namespace's runtime (map access only; does not recover). `ensureRefTableRecovered`
@@ -774,7 +774,7 @@ private:
     /// state, gathers up to `ref_txn_max_ops` stale precommits (`manifest_ref.writer_epoch <
     /// liveWriterEpoch()`), and appends one bounded exact-removal transaction per chunk, until none remain.
     void sweepStalePrecommitsNow(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt);
-    /// Review follow-up (T11): the READ-side wrapper `resolveRef`/`listRefs` call instead of
+    /// The READ-side wrapper `resolveRef`/`listRefs` call instead of
     /// `maybeSweepStalePrecommits` directly -- catches any failure (an uncertain PUT propagated as
     /// ABORTED), counts it (`CasRefSweepDeferred`), logs once, and lets the read proceed. A mutation
     /// path (`appendRefOps`'s own hoisted call) must not use this: it calls `maybeSweepStalePrecommits`
@@ -908,7 +908,7 @@ private:
     ThreadFromGlobalPool remount_thread;
 
     /// Local write fence (spec §write-fence). Permissive by default (deadline = time_point::max,
-    /// lost = false), so mayMutate() is true until Task 7 arms it with a real lease deadline and the
+    /// lost = false), so mayMutate is true until Task 7 arms it with a real lease deadline and the
     /// renewer trips it. Gates the ref-append mutate chokepoint.
     MountFence mount_fence;
 
@@ -947,9 +947,8 @@ private:
     using ManifestDecodeCache = CacheBase<ManifestCacheKey, PartManifest, ManifestCacheKeyHash, PartManifestWeight>;
     std::unique_ptr<ManifestDecodeCache> manifest_cache;
 
-    /// NOTE (M-C2): the manifest journal is never trimmed here — trimming needs folded_cursor
-    /// (INV-JOURNAL-COVERAGE), which is GC state landing in M-C3; the manifest size guard
-    /// (soft warn / hard throw, in the publish/drop CAS loop) bounds growth meanwhile.
+    /// NOTE (M-C2): the ref-log is never trimmed here — trimming needs GC's fold state
+    /// (`last_folded_ref_id`, INV-JOURNAL-COVERAGE), which is GC state landing in M-C3.
 };
 
 }

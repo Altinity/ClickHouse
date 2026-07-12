@@ -32,7 +32,6 @@ namespace ErrorCodes
 {
     extern const int FILE_DOESNT_EXIST;
     extern const int NOT_IMPLEMENTED;
-    extern const int LOGICAL_ERROR;
 }
 }
 
@@ -81,7 +80,7 @@ ObjectStorageBackend::ObjectStorageBackend(ObjectStoragePtr object_storage_, Mod
     /// Both retry knobs must be overridden: `retry_strategy.max_retries` (the POD struct) only bounds
     /// this Client's OWN network-exception wrapper loop (Client::doRequestWithRetryNetworkErrors); the
     /// AWS SDK's internal per-request retry (5xx, throttling, ...) is driven entirely through the
-    /// polymorphic `retryStrategy` object, which `getClientConfiguration()` copies BY POINTER — so
+    /// polymorphic `retryStrategy` object, which `getClientConfiguration` copies BY POINTER — so
     /// leaving it in place would still consult the DISK'S retry strategy (max_retries=500, fixed at
     /// its OWN construction time, unaffected by mutating the POD copy here) for that path.
     if (mode == Mode::Native)
@@ -153,7 +152,7 @@ void ObjectStorageBackend::checkConditionalWriteSingleAttemptSupport()
     const bool has_single_attempt_client = false;
 #endif
     if (!has_single_attempt_client)
-        throw Exception(ErrorCodes::LOGICAL_ERROR,
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED,
             "CAS Native-mode conditional writes require a single-attempt S3 client (RFC "
             "cas-s3-timeout-retry-control) but none could be built for this object storage "
             "(IObjectStorage::tryGetS3StorageClient returned null, or this build has no AWS S3 "

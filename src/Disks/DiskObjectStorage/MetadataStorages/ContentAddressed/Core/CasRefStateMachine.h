@@ -18,7 +18,8 @@ namespace DB::Cas
 /// `TableState = Replay(S_X.state, tail(X))`. This struct, `applyRefLogTxn`, `snapshotOf`, and
 /// `replay` are the ONE shared implementation of that equation -- used verbatim by the writer, its
 /// own recovery path, `fsck`, and snapshot construction, so every consumer agrees on what a
-/// transaction sequence means.
+/// transaction sequence means. "Namespace" and "table" name the same entity throughout this file
+/// (and its callers): one `RefTableState` per `RootNamespace`.
 ///
 /// Representation note (never-born vs removed): there is no separate "first birth" flag. Both
 /// "never born" and "Removed" default `lifecycle` to `RefLifecycle::Removed`; they are told apart by

@@ -185,10 +185,10 @@ void Store::tripMountLost()
 
 bool Store::refAppendFenceOk() const
 {
-    /// RFC pre-attempt check (T5 review obligation): mount fence not lost AND now < lease_deadline AND
-    /// now + attempt_timeout + lease_safety_margin < lease_deadline -- `mayMutate()` only checks the
-    /// first two; this adds the REMAINING-budget check so a controlled attempt is never even started
-    /// unless it could plausibly finish (with its own safety margin) before the lease expires.
+    /// RFC pre-attempt check: mount fence not lost AND now < lease_deadline AND now + attempt_timeout +
+    /// lease_safety_margin < lease_deadline -- `mayMutate` only checks the first two; this adds the
+    /// REMAINING-budget check so a controlled attempt is never even started unless it could plausibly
+    /// finish (with its own safety margin) before the lease expires.
     if (mount_fence.lost.load(std::memory_order_acquire))
         return false;
     const uint64_t now = bootMsNow();
@@ -418,7 +418,7 @@ StorePtr Store::open(BackendPtr backend, PoolConfig config)
         }
 
         /// Arm the local write fence: cache (uuid, epoch) and set the boottime deadline now + ttl. From
-        /// here ordinary ref mutations (appendRefOps) are fence-gated via mayMutate().
+        /// here ordinary ref mutations (appendRefOps) are fence-gated via mayMutate.
         store->armMountFence(our_uuid, writer_epoch,
             store->bootMsNow() + static_cast<uint64_t>(store->config.mount_lease_ttl_ms.count()));
         /// Gate the background renewer with `background_watermark`: it runs only in production
@@ -1006,7 +1006,7 @@ void Store::ensureRefTableRecovered(const RootNamespace & ns, RefTableRuntime & 
                 const auto parsed = pool_layout.parseRefObjectKey(lk.key);
                 if (!parsed)
                     continue;   /// not one of Task 10's ref-object keys (e.g. a legacy shard-number key)
-                /// T8 review obligation: trust the parsed `ns` only when it names EXACTLY this
+                /// Trust the parsed `ns` only when it names EXACTLY this
                 /// namespace -- the same checkNamespace-level guarantee the key builders enforce, not
                 /// position math (the scoped LIST prefix already implies this in practice, but a listed
                 /// key is untrusted input and is treated as such).
@@ -1534,7 +1534,7 @@ void Store::flushRefBatch(const RootNamespace & ns, const std::shared_ptr<RefTab
     RefTxnId trial_id = working.greatest_applied;
     /// A never-born table's `greatest_applied` is `{0, 0}`; `applyRefLogTxn`'s strict-increase check
     /// only needs a strictly greater EPOCH to accept the first trial id (RefTxnId compares epoch
-    /// first), and `admits()`'s preview snapshot encoding rejects a zero epoch field regardless of
+    /// first), and `admits`'s preview snapshot encoding rejects a zero epoch field regardless of
     /// sequence. `liveWriterEpoch()` is this incarnation's nonzero epoch -- the SAME source
     /// `allocateRefTxnId` stamps the real id with, so the trial preview and the persisted id never
     /// disagree on epoch; these trial ids are never persisted or compared outside this loop.
@@ -1547,7 +1547,7 @@ void Store::flushRefBatch(const RootNamespace & ns, const std::shared_ptr<RefTab
         {
             std::vector<RefOp> item_ops = it->build_ops(working);
 
-            /// Whole-item shape validation (review fix, prerequisite to Task 11's dropNamespace): the
+            /// Whole-item shape validation (prerequisite to Task 11's dropNamespace): the
             /// per-op loop below previews each op as its OWN single-op trial transaction, so a
             /// whole-transaction-shape rule like "remove_namespace must be the FINAL op" trivially
             /// passes on every singleton slice regardless of this item's REAL combined shape -- a
@@ -1582,7 +1582,7 @@ void Store::flushRefBatch(const RootNamespace & ns, const std::shared_ptr<RefTab
                         ns.string(), rt->snapshot_budget, rt->removal_budget);
                 /// Apply THIS op to item_scratch now (a single-op trial transaction) so a LATER op of
                 /// the SAME item (e.g. namespace_birth immediately followed by its first
-                /// owner_transition) is validated -- both here and by admits()'s own preview -- against
+                /// owner_transition) is validated -- both here and by admits's own preview -- against
                 /// a state that already reflects it, exactly as the real combined transaction will.
                 trial_id.ref_sequence += 1;
                 applyRefLogTxn(item_scratch, RefLogTxn{ns.string(), trial_id, {op}});
@@ -1616,14 +1616,6 @@ void Store::flushRefBatch(const RootNamespace & ns, const std::shared_ptr<RefTab
         return;
     }
 
-    /// Self-remount re-check BEFORE allocating an id (spec §Startup And Recovery): the top-of-flush gate
-    /// is passed once, but a leader can stall between it and here -- in `build_ops`' caller I/O -- across
-    /// the whole fence-loss + remount window, then resume after `armMountFence`. Allocating {new_epoch,
-    /// seq} now and PUTting it (its live `fence_ok` would pass) would persist a transaction validated
-    /// against this orphaned runtime's STALE cache -- the C1 data-loss class. `superseded_by_remount` is
-    /// published before the fence re-arm, so failing closed here (no id, no PUT, no wedge -- a safe gap,
-    /// cache unchanged) keeps the durable log free of any stale-view transaction. The append `fence_ok`
-    /// (which also checks the flag) is the airtight backstop for the narrow window past this point.
     /// Self-remount re-check BEFORE allocating an id (spec §Startup And Recovery): the top-of-flush gate
     /// is passed once, but a leader can stall between it and here -- in `build_ops`' caller I/O -- across
     /// the whole fence-loss + remount window, then resume after `armMountFence`. Allocating {new_epoch,
@@ -1828,7 +1820,7 @@ void Store::maybeScheduleSnapshotPublish(const RootNamespace & ns, const std::sh
     }
     catch (...)
     {
-        /// Review follow-up (T11): the `ThreadFromGlobalPool` ctor can throw (pool exhaustion) AFTER the
+        /// The `ThreadFromGlobalPool` ctor can throw (pool exhaustion) AFTER the
         /// count was incremented. Undo the count (else `waitForSnapshotPublishSettleForTest` hangs and the
         /// leaked pending count wedges every later settle) and SWALLOW the failure: read-path callers
         /// (`resolveRef`/`listRefs`) invoke this OUTSIDE any insulation, and dispatching a background
@@ -1960,7 +1952,7 @@ bool Store::trySnapshotPublishOnce(const RootNamespace & ns)
         /// A durable publish clears any backoff: progress was made this attempt (even if the T11
         /// monotonic guard below skips the in-memory adoption because a newer snapshot already won).
         resetPublishBackoff(*rt);
-        /// Monotonic adoption guard (review, T11 -- CRITICAL): publishes are NOT serialized, so two
+        /// Monotonic adoption guard (CRITICAL): publishes are NOT serialized, so two
         /// overlapping attempts can finish out of order (this OLDER-candidate attempt landing its PUT
         /// after a NEWER one already adopted). Adopting the older `candidate_x` here would REGRESS
         /// `newest_snapshot_id`/`snapshot_base_state` below the tail's already-pruned prefix, silently
@@ -1999,7 +1991,7 @@ bool Store::trySnapshotPublishOnce(const RootNamespace & ns)
 
 void Store::sweepStalePrecommitsForRead(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt)
 {
-    /// Review follow-up (T11): a read-only caller (resolveRef/listRefs) must not fail its OWN
+    /// A read-only caller (resolveRef/listRefs) must not fail its OWN
     /// otherwise-successful read because a piggybacked maintenance action (the stale-precommit sweep)
     /// hit an uncertain PUT -- the read asked for none of that; a mutation path (appendRefOps's own
     /// top-level hoisted call, which calls `maybeSweepStalePrecommits` directly, uncaught) keeps

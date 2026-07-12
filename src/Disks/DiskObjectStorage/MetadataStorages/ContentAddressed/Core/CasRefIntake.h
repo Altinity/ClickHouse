@@ -85,7 +85,7 @@ struct RefTableListing
 /// Parse and group a global `LIST` of keys under `layout.casRefsPrefix()` by table (spec §Step 1). Every
 /// key is expected to be one of the three ref-object kinds; a key under the ref prefix that
 /// `Layout::parseRefObjectKey` does not recognize, or whose reconstructed namespace is malformed
-/// (VERIFY-AT-T12: `parseRefObjectKey` does not re-validate the namespace, so this does), is a malformed
+/// (`parseRefObjectKey` does not re-validate the namespace, so this does), is a malformed
 /// ref key and throws `CORRUPTED_DATA` -- the round catches it and aborts ref folding for the round
 /// (spec §Step 2: a malformed key cannot produce a partial ref delta or authorize destructive work).
 /// A key OUTSIDE `casRefsPrefix()` is ignored: the caller lists only the ref prefix, and a foreign key

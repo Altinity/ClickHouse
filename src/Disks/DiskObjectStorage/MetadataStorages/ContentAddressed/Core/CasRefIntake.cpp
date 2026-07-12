@@ -66,7 +66,7 @@ std::map<String, RefTableListing> groupRefKeys(const Layout & layout, const std:
             throw Exception(ErrorCodes::CORRUPTED_DATA,
                 "groupRefKeys: key '{}' under the ref prefix is not a valid ref object -- aborting ref folding", key);
 
-        /// VERIFY-AT-T12: `parseRefObjectKey` reconstructs the namespace from the key WITHOUT checking
+        /// `parseRefObjectKey` reconstructs the namespace from the key WITHOUT checking
         /// its shape. This is the first production consumer of that namespace, so re-validate it; a
         /// malformed namespace throws (BAD_ARGUMENTS), which the round treats as a malformed key.
         layout.validateNamespace(parsed->ns);
