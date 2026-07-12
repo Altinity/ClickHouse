@@ -2386,24 +2386,24 @@ bool Gc::acquireOrRenewLease(GcState & state, Token & state_token, bool allow_st
         const bool incumbent_renewed = !has_observation
             || current.lease.owner != last_seen_owner
             || current.lease.seq != last_seen_seq;
-        if (incumbent_renewed || hb_alive)
+        if (incumbent_renewed || hb_alive || !allow_steal)
         {
-            rememberObservation(current.lease);
-            last_seen_hb_owner = hb.owner;
-            last_seen_hb_seq = hb.hb_seq;
-            return false;
-        }
-
-        if (!allow_steal)
-        {
-            /// Steal-eligible by the tuple comparison alone, but this caller has no real-wall-time
-            /// guarantee between its observations (see runRegularRound's doc comment) — "frozen twice"
-            /// here could mean "alive but not yet re-observed" as easily as "dead". Record the
-            /// (unchanged) observation and back off; only the loop's own interval-paced ticks execute
-            /// the steal CAS below.
-            rememberObservation(current.lease);
-            last_seen_hb_owner = hb.owner;
-            last_seen_hb_seq = hb.hb_seq;
+            /// Only ARM the steal-decision state (last_seen_owner/seq/hb_*) when this call is itself
+            /// allowed to act on a frozen tuple - i.e. the loop path. A caller with allow_steal=false
+            /// (manual `SYSTEM ... GC`) reads current state for its own acquire/renew/back-off decision
+            /// above, but must NOT record this foreign-incumbent observation: doing so would let the
+            /// loop's own very next tick treat THIS snapshot as one half of ITS two-observation window,
+            /// without the real wall-time gap (>= H) the window's safety argument requires between the
+            /// loop's own ticks (a manual command can land microseconds before a scheduled tick). Leaving
+            /// last_seen_* untouched here restores the pre-A7 invariant exactly: the frozen-tuple
+            /// comparison that can actually trigger a steal is only ever between two LOOP observations,
+            /// always >= interval apart.
+            if (allow_steal)
+            {
+                rememberObservation(current.lease);
+                last_seen_hb_owner = hb.owner;
+                last_seen_hb_seq = hb.hb_seq;
+            }
             return false;
         }
 

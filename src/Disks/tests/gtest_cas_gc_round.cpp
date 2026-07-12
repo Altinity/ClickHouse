@@ -240,6 +240,40 @@ TEST(CasGcLease, HeartbeatBlocksFalseStealOfAliveLeader)
     EXPECT_EQ(readState(*b, *s).lease.owner, kGcA);            /// gc1 still owns the lease
 }
 
+/// A7-HIGH-fix follow-up (residual timing window): an allow_steal=false observation of a foreign
+/// incumbent (the manual `SYSTEM ... GC` path) must NOT arm the frozen-tuple comparison that the loop's
+/// very next (allow_steal=true) call uses to decide whether to steal. Without this, a manual round's
+/// observation at time t, immediately followed by an unluckily-timed scheduled tick at t+epsilon (no
+/// real chance for a live incumbent to heartbeat in between), would see the SAME (owner, seq, hb) twice
+/// and steal a LIVE leader — exactly the hazard the allow_steal gate alone does not close, since it only
+/// stops the MANUAL call itself from executing the steal CAS, not from contaminating the shared `Gc`
+/// instance's observation state that the next allow_steal=true call reads.
+TEST(CasGcLease, ManualObservationNeverArmsTheLoopsStealDecision)
+{
+    std::shared_ptr<InMemoryBackend> b;
+    auto s = openTestStore(b);
+    Gc gc1(s, kGcA);
+    Gc gc2(s, kGcB);   /// plays the scheduler's ONE shared Gc, observed by both manual and loop calls
+
+    ASSERT_TRUE(gc1.runRegularRound().acquired_lease);           /// gc1 leads; never renews, never heartbeats
+
+    /// Manual observation "at t": allow_steal=false. Would normally be obs #1, but must NOT record it.
+    EXPECT_FALSE(gc2.runRegularRound({}, /*allow_steal=*/false).acquired_lease);
+
+    /// Loop-path call "immediately after" (allow_steal=true, the default): with the fix, gc2's
+    /// last_seen_* is UNTOUCHED by the manual call above, so this is still effectively obs #1 (first
+    /// sight) => must NOT steal. Pre-fix (manual observations armed the state), this would see the same
+    /// frozen tuple as "twice observed" and steal gc1's still-live lease.
+    EXPECT_FALSE(gc2.runRegularRound().acquired_lease);
+    EXPECT_EQ(readState(*b, *s).lease.owner, kGcA);               /// gc1 keeps the lease
+
+    /// The loop still recovers a genuinely dead incumbent across its OWN two spaced observations: the
+    /// call above was the loop's real obs #1 (now armed, since allow_steal=true); this one is obs #2 of
+    /// the same still-frozen tuple => steal-eligible => steals. Recovery is delayed, not disabled.
+    EXPECT_TRUE(gc2.runRegularRound().acquired_lease);
+    EXPECT_EQ(readState(*b, *s).lease.owner, kGcB);
+}
+
 /// P3-B1 (2026-07-11 mid-switch soak wedge): CasGcScheduler used to flip its `i_am_leader` flag (which
 /// gates the heartbeat thread's pulses) only AFTER `runRegularRound` RETURNS, while the lease is
 /// acquired INSIDE the round, before the (potentially long) fold. A brand-new leader's FIRST round
