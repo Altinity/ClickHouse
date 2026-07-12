@@ -1261,19 +1261,18 @@ public:
     }
 };
 
-/// True for a root-shard ref key (<...>/cas/refs/<namespace...>/<shard_number>) — the object a
-/// single publish CASes. Phase 1 relocated ref shards out of roots/ to cas/refs/. Tree blobs
-/// (blobs/ prefix), GC state (`gc/`), part-manifests (`cas/manifests/...`) and verbatim
-/// files (roots/<ns>/_files/...) are excluded, so counting these isolates publishes one-for-one.
-bool isShardManifestPath(const std::string & path)
+/// True for a per-part manifest BODY object (<...>/cas/manifests/<namespace...>/<epoch-seq>/<NNNNNN>.proto)
+/// — the FIRST durable object `publishStaging` writes for a part (via `Build::stageManifest`), a direct
+/// write-once `putIfAbsentStream` create (NOT the CAS retry controller), so an injected fault here throws
+/// cleanly out of `publishStaging`. Exactly one body per part, so counting these isolates part publishes
+/// one-for-one. Ref-log txns (`cas/refs/.../_log/...`), tree blobs (`blobs/`), GC state (`gc/`) and verbatim
+/// files are excluded. Replaces the mutable root-shard-manifest object the test used to count, which the
+/// removed `RootShardManifest` format wrote at `cas/refs/<ns>/<shard_number>` (commit 318291fe5e5 deleted
+/// that format — its all-digits key no longer exists, so the old predicate never matched and the fault
+/// never fired, silently turning this into a no-op that passed a partial commit).
+bool isPartManifestBodyPath(const std::string & path)
 {
-    if (path.find("/cas/refs/") == std::string::npos)
-        return false;
-    const auto slash = path.rfind('/');
-    if (slash == std::string::npos || slash + 1 >= path.size())
-        return false;
-    const std::string last = path.substr(slash + 1);
-    return std::all_of(last.begin(), last.end(), [](unsigned char c) { return c >= '0' && c <= '9'; });
+    return path.find("/cas/manifests/") != std::string::npos && path.ends_with(".proto");
 }
 
 std::shared_ptr<FaultyLocalObjectStorage> makeFaultyStorageForTest()
@@ -1296,25 +1295,29 @@ TEST(CaWiringWrite, PartialCommitRollsBackPublishedParts)
         faulty, "pool", "srv1", "test", std::filesystem::temp_directory_path() / "ca_b122_scratch", nullptr);
     storage->startup();
 
-    /// Two parts in ONE transaction. The staging map is keyed by (ns, ref), so all_1_1_0 publishes
-    /// before all_2_2_0 — the blob uploads happen now (before the fault is armed).
+    /// Two parts in ONE transaction, published sequentially at commit (the staging map orders all_1_1_0
+    /// before all_2_2_0). writeThroughTransaction only STAGES to local temp files here — the pool writes
+    /// (manifest bodies, blob uploads, ref-log promotes) all happen later, inside commit's publishStaging.
     auto tx = storage->createTransaction();
     writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/data.bin", "content-A");
     writeThroughTransaction(*tx, "uui/uuid-1/all_2_2_0/data.bin", "content-B");
 
-    /// Fail the SECOND shard-manifest publish (part all_2_2_0) — all_1_1_0 has already published by
-    /// then. A pre-fix commit() leaves all_1_1_0 durably visible: a partial commit.
+    /// Fail the SECOND part's manifest-body write (all_2_2_0's stageManifest) — by then all_1_1_0 has
+    /// fully published (its manifest body + blob + promoted ref). A pre-B122 commit() would leave
+    /// all_1_1_0 durably visible: a partial commit. The manifest body is a direct putIfAbsentStream
+    /// create (not the CAS retry controller), so the injected fault surfaces as a clean throw.
     int manifest_writes = 0;
     faulty->on_write = [&](const std::string & path)
     {
-        if (isShardManifestPath(path) && ++manifest_writes == 2)
+        if (isPartManifestBodyPath(path) && ++manifest_writes == 2)
             throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "injected publish failure (B122)");
     };
 
     EXPECT_THROW(tx->commit(DB::NoCommitOptions{}), DB::Exception);
 
-    /// All-or-nothing: the part that DID publish must have been rolled back. Disarm first so the
-    /// rollback's own (3rd) manifest write and these read-back assertions run clean.
+    /// All-or-nothing: the part that DID publish must have been rolled back (commit's compensating
+    /// dropRefBestEffort). Disarm first so the read-back assertions run clean — the rollback itself only
+    /// writes ref-log ops, never a manifest body, so it does not re-trip the count-2 fault.
     faulty->on_write = nullptr;
     EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/all_1_1_0"));
     EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/all_2_2_0"));
