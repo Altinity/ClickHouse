@@ -10,8 +10,8 @@ doc_type: 'reference'
 # CAS Ref Table Snapshot and Log Design {#cas-ref-table-snapshot-log-design}
 
 **Date:** 2026-07-11
-**Revised:** 2026-07-12 (rev.3 — two adversarial review rounds folded in; see
-[Review Record](#review-record-2026-07-12))
+**Revised:** 2026-07-12 (rev.4 — two adversarial review rounds and a simplification round folded in;
+see [Review Record](#review-record-2026-07-12))
 **Branch:** `cas-gc-rebuild`
 **Status:** proposed Phase 1 design
 
@@ -30,16 +30,18 @@ covers all table logs through `X`, and recovery reads log ids greater than `X`.
 The writer and `GC` have deliberately separate responsibilities:
 
 - The writer owns table semantics. It creates and recreates namespaces, adds and removes precommits,
-  promotes refs, updates ref payloads, and removes namespaces. It writes only transaction logs.
+  promotes refs, updates ref payloads, and removes namespaces. It writes transaction logs and
+  publishes its own tables' snapshots from its cached state.
 - The writer does not read `gc/state` or publish snapshots. Ordinary mutations do not wait for a `GC`
   round; recreation after `remove_namespace` is the explicit exception and requires durable completion
   of that removal's physical cleanup.
 - On startup, the writer performs one `LIST` for its table namespace, reads the newest snapshot, reads
-  the bodies of later non-inline transactions, replays the tail, and caches the resulting table state.
-- `GC` performs one global ref `LIST` per round. It reads newly folded non-inline transactions and turns
+  the bodies of later transactions, replays the tail, and caches the resulting table state.
+- `GC` performs one global ref `LIST` per round. It reads newly folded transactions and turns
   their owner changes into the ordinary manifest-edge delta consumed by the existing `GC` protocol.
-- While it already has the necessary log view, `GC` may create a new snapshot for a table whose tail is
-  large enough. Snapshot creation is compaction of table metadata, not part of the `GC` authority.
+- Snapshot creation is compaction of table metadata and belongs to the writer, which publishes from
+  its cached state on its own thresholds. `GC` never reconstructs table state; the only snapshot it
+  may publish is the constant-size `Removed` snapshot of a removed namespace.
 - After both snapshot coverage and ordinary `GC` fold coverage are durable, `GC` may remove covered ref
   logs and older snapshots. Ordered `_log`-before-`_snap` enumeration makes this safe for a concurrent
   one-pass writer startup.
@@ -47,9 +49,9 @@ The writer and `GC` have deliberately separate responsibilities:
   manifest edges to the existing multi-round `GC` protocol. Scheduling and performing deletion remain
   later `GC` steps with their existing safety delay and recheck.
 
-If `GC` stops indefinitely, the writer remains correct. Snapshot creation and log cleanup stop, so a
-later writer startup may need to replay a longer tail. In the limiting case it reconstructs the table
-from sequence zero and all surviving logs.
+If `GC` stops indefinitely, the writer remains correct and keeps compacting its own tables; only
+physical cleanup stops, so covered logs and superseded snapshots accumulate as debris. A table that
+never received a snapshot recovers from sequence zero and all surviving logs.
 
 ## Design Goals {#design-goals}
 
@@ -59,7 +61,8 @@ from sequence zero and all surviving logs.
 - Require no `gc/state`, snapshot, `HEAD`, or `LIST` request for a warm writer mutation.
 - Make writer recovery understandable as a database checkpoint plus a write-ahead-log tail.
 - Keep `GC` independent of table state during ordinary delta extraction.
-- Let one global ref `LIST` serve log intake, snapshot planning, and ref-object cleanup planning.
+- Let one global ref `LIST` serve log intake and ref-object cleanup planning.
+- Keep `GC` memory independent of table size: `GC` never reconstructs table state.
 - Make a snapshot an exact, self-validating state of one table, not a reference into a `GC` generation.
 - Make namespace removal one explicit writer transaction containing every removed owner.
 - Keep failed-precommit cleanup in writer transactions; `GC` never invents a ref transition.
@@ -199,7 +202,7 @@ The prefix contains immutable transaction logs and snapshots:
 
 ```text
 cas/refs/<namespace>/_cleanup/<remove-txn-id>
-cas/refs/<namespace>/_log/<txn-id>/<operation-specific-suffix>
+cas/refs/<namespace>/_log/<txn-id>
 cas/refs/<namespace>/_snap/<snapshot-id>.proto
 ```
 
@@ -207,8 +210,7 @@ For example:
 
 ```text
 cas/refs/srv1/data/db/table@cas@/_log/
-  0000000000000007-0000000000000124/
-  tx.proto
+  0000000000000007-0000000000000124
 
 cas/refs/srv1/data/db/table@cas@/_snap/
   0000000000000007-0000000000000120.proto
@@ -241,14 +243,14 @@ One namespace `LIST` returns every surviving snapshot and log key. The writer:
 2. Ignores log keys at or below that identifier.
 3. Replays all later log keys in `RefTxnId` order.
 
-Inline operations are decoded entirely from their keys. Only the selected snapshot and body-bearing
-tail transactions require `GET` requests. If concurrent `GC` cleanup deletes a selected object between
+The selected snapshot and every tail transaction require one `GET` each; there is no key-decoded
+operation in Phase 1. If concurrent `GC` cleanup deletes a selected object between
 the `LIST` and its `GET`, recovery restarts with a fresh `LIST`
 (see [Startup And Recovery](#startup-and-recovery)).
 
-The snapshot key is its coverage, so `GC` can measure tails and plan cleanup from the same `LIST`
-without reading every snapshot body. Only the winner of the ordinary `GC` generation commit may publish
-the prepared snapshot. Deterministic replay gives one exact object for snapshot `X`.
+The snapshot key is its coverage, so `GC` can plan cleanup from the same `LIST` without reading any
+snapshot body. The mounted writer publishes snapshot `X` from its cached state; deterministic
+encoding gives one exact object for snapshot `X`.
 
 ## Snapshot Format {#snapshot-format}
 
@@ -356,26 +358,18 @@ remove_namespace
 The build identity of a precommit is
 `{manifest_ref.writer_epoch, manifest_ref.build_sequence}`; there is no second build token.
 
-### Inline Log Objects {#inline-log-objects}
+### One Log Encoding {#one-log-encoding}
 
-Common one-operation transactions whose complete meaning fits in an object key use a zero-byte object:
+Phase 1 has exactly one log encoding: every transaction, however small, is one deterministic body
+object at `_log/<txn-id>`. Ref names therefore never appear in object keys; they are validated as
+canonical clean relative paths inside transaction bodies — empty, `.`, `..`, repeated separators, and
+non-canonical escaping are rejected. One transaction creates exactly one key, a premise the
+pagination proof relies on.
 
-```text
-_log/<txn-id>/precommit/<manifest-ref>/<ref-name>
-_log/<txn-id>/abandon/<manifest-ref>/<ref-name>
-_log/<txn-id>/drop/<manifest-ref>/<ref-name>
-```
-
-Long names, batches, promotions, payload changes, and any operation not completely described by an
-inline key use:
-
-```text
-_log/<txn-id>/tx.proto
-```
-
-The writer decides from deterministic encoded length whether an operation is inline. It does not probe
-the object store. The complete clean relative ref path is used; empty, `.`, `..`, repeated separators,
-and non-canonical escaping are rejected.
+Zero-byte inline keys that encode a common one-operation transaction entirely in the key are a
+Phase 2 optimization, justified only by measured `GET` cost during fold and recovery. They would
+reintroduce a second parser, a key grammar for ref names, and key-length limits, and must preserve
+the one-key-per-transaction rule.
 
 ## State Transitions {#state-transitions}
 
@@ -463,7 +457,7 @@ parse and validate every returned snapshot and log key
 select the greatest snapshot id X, or use an empty base
 GET and validate that snapshot body, if present
 for every log with id greater than X, in RefTxnId order:
-  decode an inline operation from the key, or GET and validate the transaction body
+  GET and validate the transaction body
   apply the complete transaction
 cache the resulting complete table state and greatest observed RefTxnId
 enable ordinary table mutations
@@ -609,7 +603,7 @@ lock the cached table state
 verify Live state, mount fence, and operation preconditions
 enqueue and form a bounded local batch
 allocate the next RefTxnId
-construct one inline key or deterministic transaction body
+construct one deterministic transaction body
 putIfAbsent(log-key, bytes)
 if the result is uncertain:
   GET the exact key
@@ -637,6 +631,31 @@ neither detects, enumerates, nor removes dead precommits by itself.
 A delayed cleanup only over-protects manifests. It cannot publish an old build and does not block
 current-epoch transactions.
 
+### Snapshot Publication {#writer-snapshot-publication}
+
+The mounted writer publishes Live snapshots of its own tables. It already holds the complete cached
+state, so publication is one background `putIfAbsent` of deterministically encoded bytes and requires
+no read request. A table becomes a candidate when logs after its newest snapshot exceed
+`snapshot_log_count_threshold`, when their encoded bytes exceed `snapshot_log_bytes_threshold`, or at
+mount time right after recovery replayed a tail above either threshold. The chosen identifier `X` is
+an applied transaction id that respects the grace age: `X` never covers a log younger than
+`snapshot_min_log_age_ms` (see [Late Predecessor PUT](#late-predecessor-put)). The writer knows its
+own append times exactly and uses `LIST` metadata for predecessor logs replayed at mount.
+
+Publication is off the mutation hot path and never blocks appends: later transactions do not
+invalidate snapshot `X`, they extend the tail above it. An uncertain publication result is resolved
+exactly like an uncertain append: `GET` the exact `_snap` key and compare deterministic bytes. A
+fenced predecessor publishing an older snapshot id is harmless: its bytes are the deterministic
+replay through that identifier, and readers pick the greatest snapshot.
+
+Because the cached state is by definition `Replay(S_X.state, tail(X))`, the published object doubles
+as an integrity oracle: `fsck` recomputes the replay and compares bytes. A divergence is corruption
+of the cache or the codec and fails closed.
+
+`GC` publishes no Live snapshot and never reconstructs table state. A table whose writer never mounts
+again keeps its final bounded tail as debris; a `GC`-side fallback compaction is a Phase 2 option
+justified only by measurements.
+
 ### Namespace Removal {#writer-namespace-removal}
 
 The writer takes the namespace and build-state locks, enumerates every cached committed and precommit
@@ -644,7 +663,9 @@ binding, and builds one body transaction containing their exact removals followe
 `remove_namespace`. After the transaction is durable, it applies the same operations to memory, cancels
 local builds, and rejects further ordinary mutations. If the append fails, the namespace remains
 `Live` and the exception propagates. The writer does not delete namespace files; durable
-`remove_namespace` hands that work to `GC`.
+`remove_namespace` hands that work to `GC`. After the removal transaction is durable, the writer also
+publishes the constant-size `Removed` snapshot (identifier `remove_txn_id`); if it stops first, the
+namespace-cleanup item republishes it.
 
 The successful ref-protocol cost is one S3 create and `O(number_of_owners)` uploaded bytes. Recreation
 requires durable `Completed(namespace, remove_txn_id)` from the namespace-cleanup item, then appends
@@ -669,9 +690,7 @@ The ref part of one `GC` round consumes:
 
 - the durable `last_folded_ref_id` cursor for each table;
 - one global `LIST cas/refs/` result;
-- bodies of new non-inline transactions;
-- for a table selected for compaction, any older body transactions after its previous snapshot that
-  are no longer part of the current fold batch.
+- bodies of new transactions.
 
 Its only semantic output to `GC` is a set of idempotently identified manifest-edge changes:
 
@@ -694,9 +713,8 @@ No table snapshot is named by that commit. Both identities are namespace-qualifi
 `RefTxnId`. The same enumeration is used for:
 
 - finding, for each table, ref transactions greater than `last_folded_ref_id[table]`;
-- measuring each table's tail after its newest snapshot;
-- finding old logs and snapshots that may later be cleaned;
-- locating snapshots and log tails considered for optional compaction.
+- observing each table's newest snapshot for cleanup planning;
+- finding old logs and snapshots that may later be cleaned.
 
 No per-table `LIST`, snapshot `HEAD`, or mutable-head read is required.
 
@@ -753,9 +771,8 @@ guarantee lexical order.
 
 ### Step 2: Decode New Transactions {#gc-step-decode-new-transactions}
 
-Inline operations are known from `LIST` keys. `GC` performs one `GET` for each new body-bearing
-transaction and validates its repeated key fields and deterministic encoding. Bodies are kept only for
-the current bounded fold batch and are reused if the same table is compacted in this round.
+`GC` performs one `GET` for each new transaction and validates its repeated key fields and
+deterministic encoding. Bodies are kept only for the current bounded fold batch.
 
 A malformed key, missing or invalid body, structurally invalid operation, or input-visibility ambiguity
 aborts ref folding for the round. It cannot produce a partial ref delta or authorize destructive work.
@@ -787,38 +804,18 @@ If a required manifest body is needed by the existing reachability fold and is m
 ordinary `GC` attempt fails closed. Ref replay never treats durable build death or a missing object as an
 implicit owner removal.
 
-### Step 4: Optionally Create Table Snapshots {#gc-step-create-snapshots}
+### Step 4: Snapshot Coverage Comes From The Writer {#gc-step-create-snapshots}
 
-Snapshot creation is optional metadata compaction. A table becomes a candidate when one of these simple
-Phase 1 conditions holds:
+`GC` creates no Live snapshot and never reconstructs table state. Compaction belongs to the mounted
+writer (see [Snapshot Publication](#writer-snapshot-publication)), which publishes from its cached
+state on its own thresholds, independent of `GC` rounds. `GC` merely observes snapshots in its global
+scan and uses them for cleanup planning in
+[Clean Old Ref Objects](#gc-step-clean-ref-objects).
 
-- logs after its newest snapshot exceed `snapshot_log_count_threshold`;
-- their encoded key and body bytes exceed `snapshot_log_bytes_threshold`;
-- `remove_namespace` is present;
-- the table was selected for another reason and writing a snapshot avoids repeating replay work.
-
-A candidate id must additionally be old enough: `X` never covers a log younger than
-`snapshot_min_log_age_ms` (see [Late Predecessor PUT](#late-predecessor-put)).
-
-Phase 1 selects at most one table per round. While reading its logs, `GC` prepares the next deterministic
-snapshot in memory but does not publish it yet:
-
-```text
-GET and validate the newest snapshot, unless it is already cached for this round
-choose X as the greatest table RefTxnId included in its candidate cursor
-for every transaction after the old snapshot through X:
-  decode it from its inline key, or reuse its body already fetched by this fold
-  if an older already-folded body is not cached, GET and validate it
-  replay the complete transaction
-encode the complete state deterministically
-retain the encoded candidate until the ordinary GC generation commit finishes
-```
-
-The candidate is snapshot `X`; there is no second snapshot number or coverage field. A losing attempt
-discards its candidate. If snapshot creation was skipped for several successful folds, this replay
-explicitly reads body transactions between the old snapshot and the previous durable fold cursor; the
-current fold's body set alone is not sufficient. Covered logs remain available because cleanup requires
-snapshot coverage. Tables not selected retain their logs and remain fully recoverable.
+The one snapshot `GC` may publish is the constant-size `Removed` snapshot of a removed namespace,
+derived from `{namespace, remove_txn_id}` alone, republished by the namespace-cleanup item when the
+writer stopped before publishing it. Tables whose writer never mounts again keep their final bounded
+tail; a `GC`-side fallback compaction is a Phase 2 option justified only by measurements.
 
 ### Step 5: Continue The Ordinary GC Protocol {#gc-step-continue-protocol}
 
@@ -826,20 +823,11 @@ After all selected ref transactions have been decoded and their edge changes res
 delta into its normal fold artifacts and attempts the existing generation commit. If the commit loses
 or fails, the previous per-table cursors remain authoritative and no newly covered log may be cleaned.
 
-Only after that commit succeeds, the winner publishes its prepared snapshot with:
-
-```text
-putIfAbsent _snap/<X>.proto
-on an uncertain result, GET and validate that exact key
-```
-
-Within one `GC` process, the next ref-intake round does not begin until publication succeeds or fails
-explicitly. This pacing rule binds only that process: it cannot be enforced across a leader change,
-and safety never depends on it — deterministic byte-identical construction and `putIfAbsent` make a
-late or duplicate publication by a deposed attempt harmless debris that a later round removes. A
-publication failure does not roll back the already adopted edge delta; it leaves every log in place
-and the next round may prepare the snapshot again. The snapshot is not named by or adopted through `gc/state`.
-Its identifier `X` is never greater than that table's cursor adopted by the winning commit.
+The commit publishes no snapshot. Live snapshots are the writer's work
+(see [Snapshot Publication](#writer-snapshot-publication)); the fold adopts cursors and edge deltas
+regardless of when the writer compacts. A snapshot is never named by or adopted through `gc/state`,
+and its identifier may exceed the adopted cursor: cleanup requires snapshot coverage and fold
+coverage independently, so logs in `(cursor, X]` survive until folded.
 
 Adopting a `-1` edge does not delete its manifest or content. It only changes input to the existing
 reachability accounting. The existing later-round rules remain responsible for:
@@ -856,13 +844,13 @@ Thus ref intake adds no new direct deletion path.
 
 ### Step 6: Clean Old Ref Objects {#gc-step-clean-ref-objects}
 
-Ref-object cleanup begins only after any prepared snapshot has been published successfully or skipped.
-It is storage housekeeping and is separate from content deletion. A ref log can be
-removed only when:
+Ref-object cleanup is storage housekeeping and is separate from content deletion. It acts only on
+snapshots returned by this round's own scan, so a covering snapshot is always durable before any
+deletion it authorizes. A ref log can be removed only when:
 
 1. The currently durable `last_folded_ref_id[table]` covers its `RefTxnId`, so its edge delta cannot be
    lost.
-2. A durable table snapshot `X` exists and the log identifier is no greater than `X`.
+2. A table snapshot `X` observed by this round's scan covers the log identifier.
 3. If the transaction contains `remove_namespace`, its `GC` namespace-cleanup work item is
    already durable.
 
@@ -888,9 +876,10 @@ enumerated in the removed incarnation cannot name a recreated object. A later `n
 rejected until the exact completion is observed; merely observing an empty prefix is insufficient.
 
 After `Completed` is durable in the fold, the winner publishes the `_cleanup/<remove-txn-id>` marker
-with `putIfAbsent`. A crash between the two steps is repaired by any later round that observes
-`Completed` without its marker and republishes it; publication is idempotent. The marker is the only
-completion signal the writer consumes.
+with `putIfAbsent`, and republishes the constant-size `Removed` snapshot if the writer's own
+publication is missing; both derive from `{namespace, remove_txn_id}` alone. A crash between these
+steps is repaired by any later round that observes `Completed` without them; publication is
+idempotent. The marker is the only completion signal the writer consumes.
 
 ## Concurrent Startup And Cleanup {#concurrent-startup-and-cleanup}
 
@@ -898,11 +887,11 @@ All `_log/` keys sort before all `_snap/` keys inside a table prefix because `l 
 order, together with publish-before-delete, makes cleanup safe for a writer performing one paginated
 ordered `LIST`.
 
-For snapshot `X`, `GC` always performs physical changes in this order:
+For snapshot `X`, cleanup acts only on a snapshot returned by this round's own scan, so its
+publication strictly preceded every deletion it authorizes:
 
 ```text
-PUT _snap/X.proto
-wait for successful durable completion
+observe _snap/X.proto in this round's LIST
 DELETE _log records with id <= X and already covered by the durable GC fold
 DELETE snapshots with id < X
 ```
@@ -921,7 +910,7 @@ The same reasoning allows deleting older snapshots: a writer that already enumer
 base plus the logs it saw earlier; a writer that did not reach it sees the newer snapshot later.
 
 This proof depends on canonical ordered pagination and strong post-`PUT` `LIST` visibility. The backend
-format probe must verify both. Cleanup must never delete logs before publishing the covering snapshot,
+format probe must verify both. Cleanup must never delete a log unless it observed the covering snapshot durable in its own scan,
 and `_snap/` must remain lexically after `_log/`. No second snapshot, mutable head, writer `gc/state`
 read, or wall-clock grace period is needed for this enumeration argument.
 
@@ -960,16 +949,16 @@ sweep to skip deletion and surface the error. It never substitutes an empty owne
 
 | Writer operation | Ref-persistence requests |
 |---|---:|
-| Warm isolated inline mutation | One zero-byte `PUT` with create-if-absent |
-| Warm isolated body transaction | One body `PUT` with create-if-absent |
+| Warm isolated mutation | One body `PUT` with create-if-absent |
 | `B` compatible queued mutations | One body `PUT`, or `1/B` creates per mutation |
 | `remove_namespace` | One body `PUT`; uploaded bytes are proportional to owner count |
-| Current-build precommit cleanup | One inline removal `PUT` |
-| Successor old-precommit cleanup | One body `PUT` per bounded batch of exact removals; a single short removal may be inline |
+| Current-build precommit cleanup | One body `PUT` |
+| Successor old-precommit cleanup | One body `PUT` per bounded batch of exact removals |
+| Threshold or mount-time snapshot publication | One snapshot `PUT` from cached state; zero reads |
 | Uncertain create result | Exact-key `GET`s bounded by the retry-control budgets |
 | Recovery restart forced by concurrent ref cleanup | One additional `LIST` plus the re-selected snapshot and tail `GET`s |
-| Startup with a snapshot | One namespace `LIST`, one snapshot `GET`, and one `GET` per later body transaction |
-| Startup without a snapshot | One namespace `LIST` and one `GET` per body transaction |
+| Startup with a snapshot | One namespace `LIST`, one snapshot `GET`, and one `GET` per tail transaction |
+| Startup without a snapshot | One namespace `LIST` and one `GET` per transaction |
 | Warm cached read | Zero ref-persistence requests |
 
 An ordinary warm mutation performs no read request. Keeping the local batching queue is required: at
@@ -981,12 +970,7 @@ For one round define:
 
 ```text
 K = new ref-log objects included in the candidate fold
-A = fraction of those objects with bodies
-T = tables selected for snapshot creation
-G = snapshot GET misses while constructing the selected table snapshot
-R = older body-log GETs needed between the selected table's previous snapshot and previous fold cursor
 H = manifest-body GET cache misses required by the ordinary reachability fold
-P = successfully published snapshots, P <= T and P <= 1 in Phase 1
 D = exact old ref objects selected for cleanup
 Q = all surviving ref-object keys returned by the global LIST
 L = encoded bytes of those Q listed keys and their returned metadata
@@ -997,22 +981,21 @@ The ref-specific requests are:
 | GC work | PUT | GET | LIST | batch DELETE |
 |---|---:|---:|---:|---:|
 | Enumerate refs | 0 | 0 | 1 global paginated scan | 0 |
-| Decode new transactions | 0 | `A·K` | 0 | 0 |
+| Decode new transactions | 0 | `K` | 0 | 0 |
 | Resolve manifest edges | 0 | `H` | 0 | 0 |
-| Optional snapshot compaction | `P` | `G + R` | 0 | 0 |
+| Removal completion (per removal) | 2 | 0 | 0 | 0 |
 | Clean old ref objects | 0 | 0 | 0 | `ceil(D/1000)` |
 
-Current-fold transaction bodies are reused for snapshot construction. `R` accounts for body
-transactions that are newer than the previous snapshot but old enough to have been folded in an
-earlier round; they must still be read when compaction finally occurs. Namespace removal needs no
-snapshot `GET` for edge-delta extraction; a snapshot is read only if the table is selected for
-compaction.
+Namespace removal needs no snapshot `GET` for edge-delta extraction: every removed owner is named in
+the transaction body. The two removal-completion `PUT`s are the constant-size `Removed` snapshot
+republication and the `_cleanup` marker; both are per removal, not per round. Live-snapshot
+publication costs nothing to `GC`: it is the writer's one `PUT` from cached state.
 
 Using S3 Standard request-price ratios where one `PUT` or `LIST` costs one unit and one `GET` costs
 approximately `0.08` units, the ref-specific successful-round price is approximately:
 
 ```text
-LIST_pages(Q) + 0.08 * (A*K + G + R + H) + P
+LIST_pages(Q) + 0.08 * (K + H)
 ```
 
 AWS does not charge for `DELETE`, but batching is still required to bound HTTP and backend metadata
@@ -1048,13 +1031,13 @@ O(one LIST page + bounded decoded transaction batch + emitted edge delta buffer
   + retained exact cleanup keys)
 ```
 
-Snapshot construction additionally uses `O(size of one selected table state)`, because Phase 1
-reconstructs and serializes at most one table at a time. The global `LIST` necessarily transfers and
+`GC` never reconstructs table state, so its memory is independent of table size. Snapshot
+serialization happens in the writer, over state it already caches. The global `LIST` necessarily transfers and
 parses every surviving ref-object key in every round, including keys unrelated to new deltas. Network
 metadata transfer is `O(L)` and CPU is:
 
 ```text
-O(L + new log bytes + emitted edge count + bytes of tables actually snapshotted)
+O(L + new log bytes + emitted edge count)
 ```
 
 Phase 1 avoids reconstructing all live table rows, but it does not avoid `O(Q)` global key enumeration.
@@ -1094,13 +1077,15 @@ both startup replay time and backend metadata pressure; dollar request cost alon
 | Writer stops after durable `remove_namespace` | `GC` folds its exact removals and executes the namespace-cleanup item |
 | `GC` stops after `Completed` but before marker publication | A later round republishes the marker idempotently; recreation waits |
 | Snapshot create fails | Keep all logs; writer recovery remains unchanged |
+| Writer stops before a threshold snapshot | The tail stays longer; the next mount compacts after recovery |
+| Writer publishes snapshot `X` beyond the folded cursor | Cleanup still requires fold coverage; logs in `(cursor, X]` survive until folded |
 | Snapshot create result is uncertain | `GET` the exact snapshot `X` key and validate its deterministic bytes |
 | A selected snapshot or tail body vanishes between `LIST` and `GET` | Not corruption: restart recovery with a fresh `LIST`; bounded and counted |
 | Greatest snapshot `X` contains an invalid body | Corruption; do not fall back or clean covered objects |
 | `GC` cannot read a new transaction body | Adopt no ref delta or updated table cursor for the attempted batch |
 | `GC` generation commit loses | Its candidate delta is unadopted; delete no newly covered log |
 | `GC` generation commit result is uncertain | Re-read `gc/state`; matching generation and attempt mean success, otherwise retry without deleting inputs |
-| `GC` stops after fold commit but before snapshot publication | Edge delta is durable; logs remain and a later round retries compaction |
+| `GC` stops after fold commit | Edge delta is durable; cleanup of newly covered logs resumes in a later round |
 | `GC` stops after fold commit but before ref cleanup | Delta is durable; redundant logs are retried later |
 | Ref cleanup deletes only some keys | Retained snapshot and remaining logs are still sufficient; retry exact failed keys later |
 | Snapshot or tail is corrupt | Writer refuses writable recovery; destructive maintenance skips the table |
@@ -1132,15 +1117,14 @@ performs no namespace cleanup. Ambiguity may over-protect storage but may not au
 
 Phase 1 implements:
 
-- one complete snapshot object per selected table;
-- one immutable log object per isolated mutation or local batch;
+- one complete snapshot object per table, published by the writer from its cached state;
+- one immutable body-only log object per isolated mutation or local batch;
 - full table state cached by the writer;
 - whole-table eviction only;
 - one global ref `LIST` per `GC` round;
-- direct delta extraction from ordinary owner transitions;
-- temporary table reconstruction only for snapshot creation;
-- publish-before-delete cleanup using ordered `_log`-before-`_snap` enumeration;
-- simple count and byte thresholds plus a per-round snapshot budget;
+- direct delta extraction from ordinary owner transitions, with no `GC` table reconstruction;
+- observed-snapshot-before-delete cleanup using ordered `_log`-before-`_snap` enumeration;
+- simple writer-side count and byte thresholds plus the grace age;
 - exact-key batch deletion of old ref objects;
 - no direct content deletion from ref intake.
 
@@ -1151,6 +1135,8 @@ structures.
 
 Only measurements may justify Phase 2. Possible independent optimizations are:
 
+- zero-byte inline log keys for common one-operation transactions;
+- `GC`-side fallback compaction for tables that are never mounted again;
 - indexed multi-object snapshots for tables that exceed the single-object limit;
 - lazy snapshot blocks and a byte-bounded row cache for very large open tables;
 - a compact per-round index if the global ref `LIST` becomes expensive;
@@ -1189,17 +1175,17 @@ It must not make writer correctness depend on `GC` availability or `gc/state`.
   the writer performs no physical namespace deletion.
 - Publish the `_cleanup/<remove-txn-id>` completion marker after `Completed` and gate
   `namespace_birth` recreation on observing it in the recovery `LIST`.
-- Implement resume-after-returned-key pagination for the global ref scan, add it to the backend
-  capability probe, and enforce the `snapshot_min_log_age_ms` snapshot lag.
+- Implement resume-after-returned-key pagination for the global ref scan and add it to the backend
+  capability probe.
 - Extend ordinary `GC` fold input with deterministic ref edge events and one `last_folded_ref_id` per
   table; do not add complete table state to `GC` state.
-- Add optional one-table snapshot construction during ref-log intake.
+- Publish snapshots from the writer's cached state on count and byte thresholds, at mount time, and
+  after `remove_namespace`, honoring `snapshot_min_log_age_ms`; `GC` gains no snapshot construction.
 - Add ordered publish-before-delete cleanup gated by both snapshot `X` and adopted fold coverage.
 - Update orphan-manifest sweep, `CasInspect`, `fsck`, and offline repair to understand snapshot plus
   tail.
-- Add counters for global `LIST` pages, inline logs, body `GET`s, logs per table after snapshot,
-  snapshot GET/PUT bytes, manifest-body cache misses `H`, reconstructed-table peak memory, emitted edge
-  events, and cleanup backlog.
+- Add counters for global `LIST` pages, body `GET`s, logs per table after snapshot, snapshot `PUT`
+  bytes, manifest-body cache misses `H`, emitted edge events, and cleanup backlog.
 - Add explicit offline rebuild from current snapshot-plus-tail owner views when per-table cursor state is
   unavailable.
 - Protect the format with one feature gate so partially converted readers and writers cannot share a
@@ -1240,7 +1226,7 @@ Replay(newest visible valid snapshot, surviving later logs)
 - paginated enumeration concurrent with strictly ordered writer appends;
 - deterministic `+1` and `-1` edge events;
 - losing and interrupted `GC` attempts;
-- snapshot publication only by the winning fold, without adding the snapshot to `gc/state`;
+- writer snapshot publication independent of fold adoption, with no snapshot in `gc/state`;
 - cleanup requiring both snapshot and adopted fold coverage;
 - no content deletion action in ref intake;
 - explicit namespace-removal owner transitions followed by the lifecycle change;
@@ -1298,10 +1284,13 @@ must retain the late-predecessor trace rather than silently strengthening the mo
 - Manifest, log, and snapshot key round trips.
 - Deterministic transaction and snapshot bytes.
 - Snapshot `X` uses the same identifier as its last included log and has one exact key.
-- Losing attempts publish no snapshot; repeated construction of snapshot `X` is byte-identical.
+- Repeated construction of snapshot `X` is byte-identical; a fenced predecessor republishing an older
+  snapshot id is harmless.
+- Writer cache-replay equivalence: the cached state encodes byte-identically to replay of the newest
+  snapshot plus tail.
 - Snapshot rows are canonical, sorted, and duplicate-free.
 - Empty base plus birth log recovery.
-- Latest snapshot plus mixed inline and body tail recovery.
+- Latest snapshot plus tail recovery.
 - Numbers unused by one table do not appear as false log gaps.
 - Whole-table cache eviction and reload returns identical state.
 - Partial row eviction is not exposed in Phase 1.
@@ -1347,7 +1336,7 @@ must retain the late-predecessor trace rather than silently strengthening the mo
 - Fault injection forbids a later table log from becoming durable while an earlier append is unresolved.
 - Cross-epoch fault injection reproduces the documented late-predecessor counterexample and increments
   its diagnostic counter; the test must not pretend that ordinary `GC` repairs it.
-- Inline logs require no body `GET`; each body transaction is fetched once and reused by snapshotting.
+- Each new transaction body is fetched once per fold.
 - Ordinary owner transitions produce exact deterministic edge events.
 - Promotion to the same manifest produces no net delta.
 - Add and remove inside one candidate fold cancel.
@@ -1369,8 +1358,10 @@ must retain the late-predecessor trace rather than silently strengthening the mo
 - Recreation is rejected while the `_cleanup` marker is absent even if the physical prefix is empty;
   marker republication after a crash between fold commit and marker `PUT` is idempotent.
 - A snapshot candidate never covers a log younger than the configured grace age.
-- A losing `GC` attempt publishes no snapshot; a winning attempt publishes without adding a snapshot
-  reference to `gc/state`.
+- Cleanup acts only on snapshots observed durable in its own scan; no snapshot reference enters
+  `gc/state`.
+- Writer snapshot publication proceeds while `GC` is stopped and while folds are in flight; appends
+  are never blocked by it.
 - A failed fold commit leaves every newly covered log intact.
 - An uncertain fold commit is resolved by rereading `gc/state`; only the matching generation and
   attempt may continue with snapshot publication or cleanup.
@@ -1378,20 +1369,20 @@ must retain the late-predecessor trace rather than silently strengthening the mo
 - Snapshot `X` is durable before any log with id no greater than `X` is deleted.
 - Ordered `_log`-before-`_snap` pagination preserves recovery during concurrent publication and cleanup.
 - A single snapshot `X` is sufficient to clean covered logs; no preceding snapshot is required.
-- Disabling `GC` leaves writes functional; restart recovers from all logs without a snapshot.
+- Disabling `GC` leaves writes and writer compaction functional; only cleanup lags. Recovery from
+  logs alone, before any snapshot exists, also works.
 - Ref intake never increments a content-delete or manifest-delete counter.
 - A later ordinary `GC` round cancels planned deletion after a new ref edge appears.
 - Global sparse activity does not rewrite unrelated table snapshots.
-- Snapshot scheduling respects per-round byte, count, and peak-memory limits.
+- Writer snapshot pacing respects its thresholds and the grace age.
 - Manifest-body cache misses are counted as `H` and match actual `GET` requests.
-- Snapshot construction after several folds fetches every older unsnapshotted body log, counts those
-  `GET`s as `R`, and does not rely only on current-fold bodies.
+- A writer snapshot with id beyond the folded cursor never enables deletion of unfolded logs.
 - Global-list counters report all returned keys `Q`, metadata bytes `L`, pages, transfer, and parsing
   CPU even when no new ref log exists.
 - Offline rebuild from newest snapshots plus tails establishes a new owner baseline before enabling any
   destructive action.
-- RustFS soak demonstrates bounded tail length when `GC` runs and correct log-only degradation when it
-  does not.
+- RustFS soak demonstrates bounded tail length regardless of `GC` availability and debris-only
+  degradation while `GC` is stopped.
 
 ## Decisions {#decisions}
 
@@ -1399,10 +1390,14 @@ must retain the late-predecessor trace rather than silently strengthening the mo
 - Snapshot id and coverage are the same `RefTxnId`; there is no second identifier.
 - Writer recovery is exactly newest snapshot plus later logs.
 - The writer performs one table-prefix `LIST` at startup and never reads `gc/state`.
-- Only the writer appends ref transactions; only `GC` creates snapshots and cleans old ref objects.
+- Only the writer appends ref transactions and publishes Live snapshots; `GC` folds deltas,
+  republishes removal artifacts, and cleans old ref objects. `GC` never reconstructs table state, so
+  its memory is independent of table size.
 - `GC` stores manifest-edge delta and one last-folded identifier per table, not complete table state.
-- Snapshot publication is performed only by the winning `GC` attempt, but the snapshot is not named by
-  or adopted through the generation commit.
+- Snapshot publication needs no `gc/state` naming; cleanup trusts only snapshots its own scan
+  observed durable.
+- Phase 1 log encoding is body-only (`_log/<txn-id>`); inline key encodings are a Phase 2
+  optimization.
 - Log cleanup requires both snapshot coverage and adopted `GC` fold coverage.
 - `_log` sorts before `_snap`; snapshot publication always precedes covered-log and old-snapshot
   deletion.
@@ -1496,3 +1491,25 @@ independently before folding in:
    attempt it answers.
 7. P2, accepted: failure-path request classes (bounded resolution `GET`s, restart `LIST`s, cleanup
    item passes, marker publication) documented alongside the steady-state budget.
+
+### Third Round (Simplification, rev.4) {#review-record-third-round}
+
+A YAGNI pass over the mechanisms (Claude Fable 5, user-approved) folded in two simplifications:
+
+1. Live-snapshot publication moved from `GC` to the writer, which already caches the complete state:
+   `GC` loses the replay machinery, the `G`/`R` request classes, the per-round snapshot memory
+   budget, and the publish-by-winner protocol, and never reconstructs table state at all. Cleanup now
+   acts only on snapshots observed durable in its own scan, which subsumes publish-before-delete by
+   observation. Side benefits: tails stay bounded even while `GC` is stopped, and the published
+   snapshot doubles as a cache-replay integrity oracle for `fsck`. `GC` retains only the constant-size
+   `Removed` snapshot republication, derived from `{namespace, remove_txn_id}` alone.
+2. Phase 1 logs are body-only: the inline zero-byte key encoding, its second parser, and the ref-name
+   key grammar moved to Phase 2 behind measured `GET` cost. One transaction = one key became
+   structural, which the pagination proof uses as a premise.
+
+Evaluated and rejected in the same pass: a single global `ref_sequence` watermark instead of
+per-table cursors (unsound — lexical scan order differs from sequence order across tables, so a
+watermark claims unseen concurrent appends as folded); a constant-size `remove_namespace` without the
+owner list (would reintroduce table-state reconstruction into `GC`, conflicting with simplification
+1); per-table sequences instead of the store-wide counter (gap contiguity cannot detect a late
+predecessor across epochs, so the churn buys nothing).
