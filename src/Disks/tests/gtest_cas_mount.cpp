@@ -8,6 +8,11 @@
 #include <map>
 #include <string>
 
+namespace DB::ErrorCodes
+{
+    extern const int BAD_ARGUMENTS;
+}
+
 using namespace DB::Cas;
 
 TEST(CasServerRootId, ValidationAcceptsCleanPathsRejectsBad)
@@ -374,6 +379,27 @@ TEST(CasMountReadOnly, ForeignOwnedPoolOpensWithoutMutation)
     EXPECT_EQ(owner_after->bytes, owner_before->bytes);
     EXPECT_EQ(mount_after->bytes, mount_before->bytes);
     EXPECT_EQ(epoch_after->bytes, epoch_before->bytes);
+}
+
+/// Store::open must call validateCasRequestBudget itself (not just the free function in isolation —
+/// see gtest_cas_request_control.cpp for that): an inconsistent cas_request_budget must refuse a
+/// writable mount end-to-end (RFC cas-s3-timeout-retry-control §required-timeout-model), never mount
+/// silently with a budget that could let a controlled attempt outlive the lease it is fenced under.
+TEST(CasMountStartup, RefusesWritableOpenWithInconsistentCasRequestBudget)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+
+    /// attempt_timeout_ms + lease_safety_margin_ms == mount_lease_ttl_ms below (30000): not STRICTLY
+    /// less, so this must be rejected.
+    const CasRequestBudget bad_budget{
+        .attempt_timeout_ms = 25000, .operation_deadline_ms = 25000, .max_attempts = 3, .lease_safety_margin_ms = 5000};
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::BAD_ARGUMENTS, [&]
+    {
+        Store::open(b, PoolConfig{
+            .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r", .root_shards = 1,
+            .mount_lease_ttl_ms = std::chrono::milliseconds(30000),
+            .cas_request_budget = bad_budget});
+    });
 }
 
 TEST(CasMountStartup, StaleSelfMountReclaimedAfterWait)

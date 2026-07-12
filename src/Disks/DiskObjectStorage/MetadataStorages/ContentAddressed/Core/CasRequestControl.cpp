@@ -129,7 +129,18 @@ uint64_t steadyClockNowMs()
 
 void validateCasRequestBudget(const CasRequestBudget & budget, uint64_t mount_lease_ttl_ms, uint64_t mount_renew_period_ms)
 {
-    if (!(budget.attempt_timeout_ms + budget.lease_safety_margin_ms < mount_lease_ttl_ms))
+    if (budget.max_attempts < 1)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "CAS request budget rejected: max_attempts must be at least 1 (got {}) — zero would let "
+            "putIfAbsentControlled return Unresolved without ever sending an attempt.",
+            budget.max_attempts);
+
+    /// Overflow-safe: `attempt_timeout_ms + lease_safety_margin_ms` could wrap uint64 for absurd config
+    /// values, which would make the sum spuriously small and the inequality below pass when it should
+    /// fail closed. Compare via subtraction against the (unsigned, so already non-negative) TTL instead
+    /// of computing the sum directly.
+    if (!(budget.attempt_timeout_ms < mount_lease_ttl_ms
+          && budget.lease_safety_margin_ms < mount_lease_ttl_ms - budget.attempt_timeout_ms))
         throw Exception(ErrorCodes::BAD_ARGUMENTS,
             "CAS request budget rejected: attempt_timeout_ms ({}) + lease_safety_margin_ms ({}) must be "
             "strictly less than the mount lease TTL ({} ms) — RFC cas-s3-timeout-retry-control "
