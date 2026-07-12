@@ -910,6 +910,12 @@ private:
     std::mutex builds_mutex;
     uint64_t next_build_seq = 1;
     std::set<uint64_t> active_build_seqs;
+    /// In-flight builds keyed by build_seq (mirrors `active_build_seqs`' lifecycle: populated in
+    /// `startBuild`, removed in `retireBuildSeq`). `dropNamespace` upgrades these weak_ptrs AFTER its
+    /// removal transaction is durable and cancels those targeting the removed namespace (spec §Namespace
+    /// Removal: "cancels local builds"). weak_ptr because the wiring owns the shared_ptr; an expired entry
+    /// (a build already destroyed) is simply skipped. Guarded by builds_mutex.
+    std::map<uint64_t, std::weak_ptr<Build>> inflight_builds;
 
     /// Mount-lease heartbeat (spec §mount-safety, Phase 0 Task 7). Constructed + started on a writable
     /// open AFTER the owner/epoch/mount startup protocol; renews the mount lease async off the write

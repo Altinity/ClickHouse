@@ -1113,6 +1113,97 @@ TEST(RefWriterNamespaceRemoval, MalformedShapeWithRemoveNamespaceNotFinalRejecte
     ASSERT_TRUE(store->resolveRef(ns, "a").has_value()) << "the malformed attempt left no trace on the table";
 }
 
+/// spec §Namespace Removal (writer, line 666): "After the transaction is durable, it applies the same
+/// operations to memory, cancels local builds, and rejects further ordinary mutations." An in-flight
+/// build for the removed namespace must be cancelled once (and only once) the removal is durable: its
+/// next operation throws (ABORTED, from requireAlive) rather than promoting a fresh committed ref into
+/// the just-removed namespace.
+TEST(RefWriterNamespaceRemoval, DropNamespaceCancelsInFlightBuildAndNextOpThrows)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openStore(backend);
+    const RootNamespace ns{"srv1/remove_cancels_build"};
+
+    publishEmptyPart(store, ns, "committed");   /// births the table + one committed ref
+
+    /// An in-flight build for ns: staged + precommit-added, never promoted.
+    auto build = startBuildFor(store, ns, "inflight");
+    const ManifestId id = build->stageManifest({});
+    build->precommitAdd(ns, "inflight", id);
+
+    store->dropNamespace(ns);
+
+    /// The build is cancelled: EVERY subsequent operation fails fast at `requireAlive` with ABORTED.
+    /// `stageManifest` is the discriminator -- it has NO namespace-lifecycle gate, so an UN-cancelled
+    /// build would happily execute it (staging more debris into a dead namespace); only cancellation
+    /// stops it.
+    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { build->stageManifest({}); });
+    /// And it certainly cannot promote a fresh committed ref into the removed namespace (the important
+    /// invariant -- though the old WPromote "precommit removed" guard also blocked this, less directly).
+    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { build->promote(ns, "inflight", build->buildId(), id); });
+
+    /// The cancelled build did not resurrect anything into the removed namespace.
+    EXPECT_FALSE(store->resolveRef(ns, "inflight").has_value());
+    EXPECT_FALSE(store->resolveRef(ns, "committed").has_value()) << "the whole namespace was removed";
+}
+
+/// spec §Namespace Removal (line 667-668): "If the append fails, the namespace remains Live and the
+/// exception propagates." Cancellation must NOT fire on a failed removal append -- the build stays alive
+/// and usable. (Fault the removal transaction's own `_log` PUT so the append wedges and throws.)
+TEST(RefWriterNamespaceRemoval, RemovalAppendFailureLeavesBuildAliveAndNamespaceLive)
+{
+    CasRequestBudget budget;
+    budget.max_attempts = 1;
+    budget.attempt_timeout_ms = 100;
+    budget.operation_deadline_ms = 100;
+    budget.lease_safety_margin_ms = 100;
+
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openStore(backend, budget);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/remove_fault_keeps_build"};
+
+    publishEmptyPart(store, ns, "committed");
+
+    auto build = startBuildFor(store, ns, "inflight");
+    const ManifestId id = build->stageManifest({});
+    build->precommitAdd(ns, "inflight", id);
+
+    backend->fault_key_substr = layout.refsNamespacePrefix(ns) + "_log/";
+    backend->fault_count = 1;
+
+    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { store->dropNamespace(ns); });
+
+    /// The removal did not apply: the namespace stays Live and its committed ref still resolves.
+    ASSERT_TRUE(store->resolveRef(ns, "committed").has_value()) << "a failed removal leaves the namespace Live";
+    /// The build was NOT cancelled: a non-append operation (`stageManifest` -- it never touches the now
+    /// wedged ref-append lane) still succeeds; it would throw ABORTED had the build been cancelled.
+    EXPECT_NO_THROW(build->stageManifest({}));
+}
+
+/// Cancellation is namespace-scoped: dropping namespace N must not cancel an in-flight build targeting a
+/// DIFFERENT namespace M -- that build promotes normally.
+TEST(RefWriterNamespaceRemoval, DropNamespaceDoesNotCancelBuildsInOtherNamespaces)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openStore(backend);
+    const RootNamespace ns_dropped{"srv1/remove_me"};
+    const RootNamespace ns_other{"srv1/keep_me"};
+
+    publishEmptyPart(store, ns_dropped, "x");
+
+    /// An in-flight build in a DIFFERENT namespace.
+    auto other_build = startBuildFor(store, ns_other, "y");
+    const ManifestId id = other_build->stageManifest({});
+    other_build->precommitAdd(ns_other, "y", id);
+
+    store->dropNamespace(ns_dropped);
+
+    /// The other namespace's build is untouched: it promotes successfully and its ref resolves.
+    EXPECT_NO_THROW(other_build->promote(ns_other, "y", other_build->buildId(), id));
+    EXPECT_TRUE(store->resolveRef(ns_other, "y").has_value());
+}
+
 /// ===================================================================================
 /// Task 11: namespace birth / the recreation gate (spec §Namespace Birth)
 /// ===================================================================================

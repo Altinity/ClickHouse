@@ -120,6 +120,14 @@ void Build::requireAlive() const
 {
     if (!alive)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Build has been abandoned; no further operations allowed");
+    /// spec §Namespace Removal: `dropNamespace` cancels in-flight builds once its removal transaction is
+    /// durable. A cancelled build must not promote/precommit a fresh owner into the just-removed namespace
+    /// (nor stage more debris there), so every further op fails closed here -- fast, before any backend
+    /// work, with a clear diagnostic (the append lane would reject a promote/precommit anyway).
+    if (cancelled.load(std::memory_order_acquire))
+        throw Exception(ErrorCodes::ABORTED,
+            "Build cancelled: its owning namespace was removed (dropNamespace) while this build was "
+            "in flight; restart the build only after the namespace is recreated");
     /// Self-remount (fence-out recovery) supersedes the mount incarnation this build was minted
     /// under; its write fence already interrupted the build mid-flight, so every further step fails
     /// closed and the caller restarts the build under the live epoch.
@@ -1153,6 +1161,31 @@ void Build::promote(const RootNamespace & target_ns, const String & final_ref_na
 
 void Build::abandon()
 {
+    if (cancelled.load(std::memory_order_acquire))
+    {
+        /// `dropNamespace` cancelled this build once its removal transaction became durable: that same
+        /// transaction already removed EVERY precommit binding for the (now Removed) namespace, so
+        /// re-appending a precommit removal here is redundant AND impossible (`owner_transition` on a
+        /// non-Live namespace is rejected by the state machine -- and `requireAlive` would throw first
+        /// anyway). Do ONLY the best-effort staged-debris cleanup + seq retire (both idempotent, both on
+        /// this build's OWN thread); leave the precommit body, if any, for GC's
+        /// delete-after-sealed-decrements exactly as the normal path does.
+        alive = false;
+        precommitted = false;
+        store->retireBuildSeq(build_seq);
+        cleanupStagedManifestDebrisBestEffort();
+        EventEmitter{*store}.emit([&](CasEvent & e)
+        {
+            e.type = CasEventType::BuildAbort;
+            e.token = u128ToHex(build_id);
+            e.outcome = "cancelled";
+            e.reason = "cancelForNamespaceRemoval: owning namespace removed (dropNamespace); best-effort "
+                       "deleted staged _manifests debris; precommit body (if any) left for GC";
+            e.detail = {{"build_seq", std::to_string(build_seq)}, {"staged", std::to_string(staged_manifests.size())}};
+        });
+        return;
+    }
+
     requireAlive();
     alive = false;
 
@@ -1198,11 +1231,27 @@ void Build::abandon()
     /// for a double removal race between this call and GC's reclaim.
     store->retireBuildSeq(build_seq);
 
+    cleanupStagedManifestDebrisBestEffort();
+
+    /// B170: the build was abandoned; its uploads become GC-reclaimable debris.
+    EventEmitter{*store}.emit([&](CasEvent & e)
+    {
+        e.type = CasEventType::BuildAbort;
+        e.token = u128ToHex(build_id);
+        e.outcome = "abandoned";
+        e.reason = "abandon: appended a precommit-removal event for the live precommit (body left for GC); "
+                   "best-effort deleted the never-precommitted _manifests debris; remainder reaped by the orphan sweep";
+        e.detail = {{"build_seq", std::to_string(build_seq)}, {"staged", std::to_string(staged_manifests.size())}};
+    });
+}
+
+void Build::cleanupStagedManifestDebrisBestEffort()
+{
     /// Best-effort writer cleanup of THIS build's pre-precommit/staged `_manifests` debris (spec
     /// §Pre-Precommit Part-Manifest Debris). The common case is writer cleanup; a missed object is
     /// benign — the Phase-1d namespace-scoped orphan sweep reclaims it. Exact-token delete only; never
-    /// throw from abandon. SKIP the manifest that became a live precommit owner above: its body is a live
-    /// precommit input whose deletion is GC's job after the sealed decrement (never writer-delete it).
+    /// throws. SKIP the manifest that became a live precommit owner: its body is a live precommit input
+    /// whose deletion is GC's job after the sealed decrement (never writer-delete it).
     for (const ManifestId & id : staged_manifests)
     {
         if (id.ref == precommit_manifest && id.root_namespace == precommit_target_ns)
@@ -1216,17 +1265,27 @@ void Build::abandon()
         }
         catch (...) {}   /// best-effort: GC backstop sweep is the durable guarantee
     }
+}
 
-    /// B170: the build was abandoned; its uploads become GC-reclaimable debris.
-    EventEmitter{*store}.emit([&](CasEvent & e)
+void Build::cancelForNamespaceRemoval(const RootNamespace & removed_ns)
+{
+    /// Only cancel a build that actually targets the removed namespace. `manifestNamespace` reads only
+    /// the immutable `info` set at construction, so this is safe to call from `dropNamespace`'s thread
+    /// while the build's own thread runs. A build whose owning namespace cannot be determined (a
+    /// malformed diagnostic-only BuildInfo) is left alone — the append lane still fails closed on any op
+    /// it later attempts against the now-Removed namespace.
+    std::optional<RootNamespace> mine;
+    try
     {
-        e.type = CasEventType::BuildAbort;
-        e.token = u128ToHex(build_id);
-        e.outcome = "abandoned";
-        e.reason = "abandon: appended a precommit-removal event for the live precommit (body left for GC); "
-                   "best-effort deleted the never-precommitted _manifests debris; remainder reaped by the orphan sweep";
-        e.detail = {{"build_seq", std::to_string(build_seq)}, {"staged", std::to_string(staged_manifests.size())}};
-    });
+        mine = manifestNamespace();
+    }
+    catch (...)
+    {
+        return;
+    }
+    if (mine != removed_ns)
+        return;
+    cancelled.store(true, std::memory_order_release);
 }
 
 }

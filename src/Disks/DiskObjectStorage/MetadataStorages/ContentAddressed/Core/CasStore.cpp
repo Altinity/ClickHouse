@@ -723,6 +723,7 @@ void Store::retireBuildSeq(uint64_t seq)
 {
     std::lock_guard lk(builds_mutex);
     active_build_seqs.erase(seq);
+    inflight_builds.erase(seq);
 }
 
 BuildPtr Store::startBuild(BuildInfo info)
@@ -737,7 +738,14 @@ BuildPtr Store::startBuild(BuildInfo info)
     /// the Store-owned watermark renews — tracks in-flight builds.
     const uint64_t seq = allocateBuildSeq();
 
-    return std::make_shared<Build>(shared_from_this(), build_id, seq, liveWriterEpoch(), std::move(info));
+    auto build = std::make_shared<Build>(shared_from_this(), build_id, seq, liveWriterEpoch(), std::move(info));
+    /// Register for `dropNamespace`'s post-durable build cancellation (spec §Namespace Removal). weak_ptr:
+    /// the wiring owns the returned shared_ptr; `retireBuildSeq` (publish/abandon/dtor) removes the entry.
+    {
+        std::lock_guard lk(builds_mutex);
+        inflight_builds[seq] = build;
+    }
+    return build;
 }
 
 std::shared_ptr<const RootShard> Store::readShardDecoded(const RootNamespace & ns, uint64_t shard, bool allow_stale)
@@ -1626,8 +1634,14 @@ void Store::runRefQueueLeader(const RootNamespace & ns, const std::shared_ptr<Re
 
 void Store::flushRefBatch(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt)
 {
-    /// One flush = one carved batch through one attempted append. NEVER throws: every outcome lands in
-    /// the affected items so waiters always wake (mirrors `flushShardBatch`'s contract exactly).
+    /// One flush = one carved batch through one attempted append. Contract: every ORDINARY outcome
+    /// (validation reject, DefiniteFailure, Unresolved/wedge, Committed) lands in the affected items so
+    /// waiters always wake, and this does NOT throw for any of them (mirrors `flushShardBatch`). The ONE
+    /// exception is the provably-unreachable case where a DURABLY-committed transaction then fails to
+    /// apply to the in-memory state (which the whole-item shape validation is supposed to preclude): that
+    /// path completes every waiting survivor with the error, restores the leader bookkeeping, and RETHROWS
+    /// a LOGICAL_ERROR (the object is already durable and every future recovery would re-hit it -- see the
+    /// Committed-case catch below), so the caller learns this table's lane is bricked instead of hanging.
     auto complete_error = [&](const std::vector<std::shared_ptr<RefMutationItem>> & items, std::exception_ptr e)
     {
         std::lock_guard<std::mutex> g(ref_queue_mutex);
@@ -2381,6 +2395,27 @@ void Store::dropNamespace(const RootNamespace & ns)
             return ops;
         },
         RootMutationOrigin::Writer, RootMutationKind::DropNamespace);
+
+    /// spec §Namespace Removal (line 666): "After the transaction is durable, it applies the same
+    /// operations to memory, cancels local builds, and rejects further ordinary mutations." Reaching here
+    /// means the removal is durable (this call's, or a concurrent caller's whose durable result the append
+    /// lane observed) -- a FAILED append would have thrown above, so cancellation is only ever reached
+    /// after durability (spec 667-668: a failed append leaves the namespace Live and propagates). Cancel
+    /// every in-flight build TARGETING this namespace so its next op fails closed (`requireAlive`),
+    /// preventing it from promoting/precommitting a fresh owner into (or staging more debris in) the
+    /// just-removed namespace. The append lane is the real linearization authority (an `owner_transition`
+    /// on a non-Live namespace is rejected by the state machine regardless); this stops wasted work early
+    /// and surfaces a clear error. Builds in OTHER namespaces self-filter (no-op). Collect the live
+    /// shared_ptrs under the lock, cancel OUTSIDE it (`cancelForNamespaceRemoval` only stores an atomic).
+    std::vector<BuildPtr> builds_to_check;
+    {
+        std::lock_guard lk(builds_mutex);
+        for (const auto & entry : inflight_builds)
+            if (auto build = entry.second.lock())
+                builds_to_check.push_back(std::move(build));
+    }
+    for (const auto & build : builds_to_check)
+        build->cancelForNamespaceRemoval(ns);
 
     /// spec §Namespace Removal: "After the removal transaction is durable, the writer also publishes
     /// the constant-size Removed snapshot"; best-effort here (the removal itself already succeeded) --

@@ -3,6 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobRef.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestId.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestCodec.h>
+#include <atomic>
 #include <functional>
 #include <map>
 #include <optional>
@@ -135,6 +136,15 @@ public:
     /// (the Phase-1d orphan sweep is the durable backstop).
     void abandon();
 
+    /// spec §Namespace Removal ("After the transaction is durable, it ... cancels local builds"): called
+    /// by `Store::dropNamespace` for every in-flight build ONCE its removal transaction is durable. If
+    /// this build's owning namespace equals `removed_ns`, mark it cancelled so every further operation
+    /// fails closed at `requireAlive` (ABORTED); a build in any other namespace is left untouched.
+    /// Cross-thread safe: reads only the immutable `info` (the owning namespace) and stores ONE atomic --
+    /// it touches no other member, so the build's own thread may keep running concurrently. Staged debris
+    /// is cleaned best-effort when the build's own thread later runs `abandon` (or via the GC backstop).
+    void cancelForNamespaceRemoval(const RootNamespace & removed_ns);
+
     UInt128 buildId() const { return build_id; }
     /// The strictly-increasing per-process build_seq (spec 2026-06-16).
     uint64_t buildSeq() const { return build_seq; }
@@ -185,6 +195,11 @@ private:
     RootNamespace manifestNamespace() const;
 
     void requireAlive() const;                            /// throws LOGICAL_ERROR after abandon
+    /// Best-effort exact-token delete of THIS build's staged `_manifests` debris; the precommit body (if
+    /// any) is SKIPPED -- left for GC's delete-after-sealed-decrements. Never throws (the Phase-1d orphan
+    /// sweep is the durable backstop). Shared by the normal and the namespace-removal-cancelled `abandon`
+    /// paths; only ever called on the build's OWN thread.
+    void cleanupStagedManifestDebrisBestEffort();
 
     /// A leaf is copy-forwardable iff this build holds a TOKENLESS W-EVIDENCE Blob dep for `hash`
     /// (adoptEvidence — in production always sourced from a committed manifest, which is the copy-forward
@@ -201,6 +216,10 @@ private:
     uint32_t next_manifest_ordinal = 1;                   /// per-build monotone manifest ordinal
     BuildInfo info;
     bool alive = true;
+    /// spec §Namespace Removal: set by `cancelForNamespaceRemoval` (from `Store::dropNamespace`'s thread)
+    /// once this build's owning namespace is durably removed. Atomic because it is WRITTEN cross-thread
+    /// and READ by `requireAlive` on the build's own thread. Once cancelled, every further op fails closed.
+    std::atomic<bool> cancelled{false};
     bool precommitted = false;                            /// a create-precommit RootOwnerEvent was appended
 
     /// Set by precommitAdd so promote knows which shard to move ownership in.
