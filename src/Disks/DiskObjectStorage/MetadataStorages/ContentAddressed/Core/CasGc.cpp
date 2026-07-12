@@ -634,7 +634,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired)
     /// removed namespace's covered logs persisted as debris until some later fold -- which never comes on
     /// a quiesced pool.
     const bool suppress_destructive = !report.anomalies.empty();
-    runNamespaceCleanupPasses(folded.fold_seal, suppress_destructive);
+    runNamespaceCleanupPasses(folded.fold_seal, new_round, suppress_destructive);
     if (trim_enabled)
         cleanupRefObjects(folded, suppress_destructive);
 
@@ -1387,10 +1387,24 @@ void Gc::cleanupRefObjects(const FoldResult & folded, bool suppress_destructive)
     }
 }
 
-void Gc::runNamespaceCleanupPasses(const CasFoldSeal & seal, bool suppress_destructive)
+void Gc::runNamespaceCleanupPasses(const CasFoldSeal & seal, uint64_t new_round, bool suppress_destructive)
 {
     Backend & backend = store->backend();
     const Layout & layout = store->layout();
+
+    /// Re-read gc/state and confirm this round is still the durable round under our lease. Compare the
+    /// ROUND (strictly incremented on every commit, spec §GC State), never `lease.seq` -- a
+    /// deposed-then-re-elected owner can present the same seq. A false here means a successor advanced past
+    /// us; the destructive Pending pass below must not run against a namespace that successor may have
+    /// Completed and the writer recreated (spec §Step 6 straggler safety).
+    const auto round_still_ours = [&]() -> bool
+    {
+        const auto got = backend.get(layout.gcStateKey());
+        if (!got)
+            return false;
+        const GcState durable = decodeGcState(got->bytes);
+        return durable.round == new_round && durable.lease.owner == gc_id;
+    };
 
     for (const auto & [key, item] : seal.ns_cleanup_items)
     {
@@ -1399,17 +1413,53 @@ void Gc::runNamespaceCleanupPasses(const CasFoldSeal & seal, bool suppress_destr
             /// A clamp/abort round defers the physical reclaim (align with the round's destructive gate).
             if (suppress_destructive)
                 continue;
+            /// Freshness fence at pass start: a deposed leader stops here rather than deleting recreated data.
+            if (!round_still_ours())
+                return;
+
+            /// The completion marker's PRESENCE is the exact precondition a successor uses before recreating
+            /// this namespace ("observing an empty physical prefix is not sufficient", spec §Namespace
+            /// Birth). If a successor already Completed this item, the marker exists and the writer may have
+            /// recreated live objects under these prefixes -- abort the pass on marker-present.
+            const String marker_key = layout.refCleanupMarkerKey(item.ns, item.remove_txn_id);
+
             /// Bounded exact-key enumerate-and-delete over the removed namespace's physical `@cas@` prefixes
-            /// (manifest bodies + verbatim files). A key enumerated here cannot name a recreated object: a
-            /// later namespace_birth uses a greater writer_epoch (spec §Step 6). NotFound/TokenMismatch tolerated.
-            for (const String & prefix : {layout.manifestNamespacePrefix(item.ns), layout.namespaceFilesPrefix(item.ns)})
+            /// (manifest bodies + verbatim files). NotFound/TokenMismatch tolerated.
+            struct { String prefix; bool is_manifest; } passes[] = {
+                {layout.manifestNamespacePrefix(item.ns), true},
+                {layout.namespaceFilesPrefix(item.ns), false},
+            };
+            for (const auto & pass : passes)
             {
                 String cursor;
                 for (;;)
                 {
-                    const ListPage page = backend.list(prefix, cursor, 1000);
+                    /// Per-page freshness + recreation re-check bounds the delete window to one page.
+                    if (!round_still_ours() || backend.head(marker_key).exists)
+                        return;
+                    const ListPage page = backend.list(pass.prefix, cursor, 1000);
                     for (const ListedKey & lk : page.keys)
                     {
+                        if (pass.is_manifest)
+                        {
+                            /// Manifest deletes are epoch-timing-independent: a recreated namespace's manifest
+                            /// carries a strictly greater `writer_epoch`, so a body at/below the removed
+                            /// incarnation's epoch can never be recreated data and is always safe to delete; a
+                            /// greater-epoch body is recreated data and is never deleted. An unparseable key
+                            /// under the manifest prefix is skipped fail-closed (the orphan sweep is the backstop).
+                            const auto parsed = layout.parseManifestKey(lk.key);
+                            if (!parsed || parsed->ref.writer_epoch > item.remove_txn_id.writer_epoch)
+                                continue;
+                        }
+                        else
+                        {
+                            /// Verbatim files carry no epoch and a recreated namespace re-uploads them at the
+                            /// SAME key, so the per-key marker HEAD is the only recreation guard here (files are
+                            /// few, so the cost is negligible) -- abort the whole pass on marker-present.
+                            if (backend.head(marker_key).exists)
+                                return;
+                        }
+
                         if (lk.token)
                             backend.deleteExact(lk.key, *lk.token);
                         else if (const HeadResult h = backend.head(lk.key); h.exists)

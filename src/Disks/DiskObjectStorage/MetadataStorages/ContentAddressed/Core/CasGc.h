@@ -257,9 +257,13 @@ private:
     /// Namespace-cleanup item passes (spec §Step 6): for each item in the committed seal, a Pending item
     /// runs a bounded exact-key enumerate-and-delete pass over the removed namespace's physical `@cas@`
     /// prefixes (manifest bodies + verbatim files); a Completed item publishes the `_cleanup` marker and
-    /// republishes the constant-size `Removed` snapshot (both idempotent `putIfAbsent`). Runs post-CAS, so
-    /// winning the round's gc/state CAS is the leadership fence that gates publication.
-    void runNamespaceCleanupPasses(const CasFoldSeal & seal, bool suppress_destructive);
+    /// republishes the constant-size `Removed` snapshot (both idempotent `putIfAbsent`). Runs post-CAS.
+    /// A stale leader (deposed after its round CAS but still executing) must never delete a namespace a
+    /// successor round Completed and the writer recreated: the Pending pass re-reads gc/state (aborting
+    /// unless `durable.round == new_round` under our lease), aborts on the `_cleanup` marker's presence
+    /// (the exact recreation precondition, spec §Namespace Birth), and epoch-filters manifest deletes to
+    /// the removed incarnation's `writer_epoch` (a recreated manifest carries a strictly greater epoch).
+    void runNamespaceCleanupPasses(const CasFoldSeal & seal, uint64_t new_round, bool suppress_destructive);
 
     /// Whether a namespace's physical `@cas@` metadata prefixes (manifest bodies + verbatim files) hold no
     /// object -- the Pending->Completed condition for its namespace-cleanup item. LIST-only, no delete.
@@ -392,6 +396,14 @@ public:
     size_t changedShardCountForTest(const GcState & state)
     {
         return changedShardCount(state);
+    }
+
+    /// TEST SEAM (spec §Step 6 straggler safety): drive one namespace-cleanup pass directly so a test can
+    /// stage the exact stale-leader interleaving (a Pending item whose namespace a successor Completed +
+    /// recreated) without racing a live round. Production drives this only through `runRegularRound`.
+    void runNamespaceCleanupPassesForTest(const CasFoldSeal & seal, uint64_t new_round, bool suppress_destructive)
+    {
+        runNamespaceCleanupPasses(seal, new_round, suppress_destructive);
     }
 
 };

@@ -675,3 +675,118 @@ TEST(CasRefGc, BaselineGuardRefusesWhenSnapshotSurvivesWithoutLogsOrCursor)
     EXPECT_TRUE(blobPresent(*backend, layout, DB::UInt128(2)))
         << "table B's blob must NOT be condemned -- the guard fires before any delete";
 }
+
+/// (C3) A stale GC leader's `Pending` namespace-cleanup pass must NOT delete a recreated namespace's live
+/// data. A leader deposed after its round CAS resumes its pass after a successor Completed the item,
+/// published the `_cleanup` marker, and the writer recreated the namespace (successor-epoch manifests +
+/// verbatim files). The marker's presence is the exact recreation precondition (spec §Namespace Birth):
+/// the pass must abort on it. On the unfixed code the fresh LIST + exact-token delete reclaims the
+/// recreated objects (verbatim files carry no epoch at all).
+TEST(CasRefGc, StaleLeaderPendingPassAbortsOnCompletionMarker)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/aa@cas@"};
+
+    /// Establish gc/state under leader kGc (a real round commits round + lease.owner = kGc).
+    Gc gc(store, kGc);
+    gc.runRegularRound();
+    const GcState st = decodeGcState(backend->get(layout.gcStateKey())->bytes);
+    ASSERT_EQ(st.lease.owner, kGc);
+
+    /// The removed incarnation removed at epoch 1; the stale leader still holds a Pending item for it.
+    const RefTxnId remove_txn{1, 5};
+    CasFoldSeal seal;
+    seal.ns_cleanup_items[ns.string() + "\n" + renderRefTxnId(remove_txn)] =
+        RefNsCleanupItem{.ns = ns, .remove_txn_id = remove_txn, .state = RefNsCleanupState::Pending};
+
+    /// A successor Completed the item + the writer recreated the namespace: the `_cleanup` marker is
+    /// durable, and recreation wrote a successor-epoch (2 > 1) manifest and a verbatim file at a fixed key.
+    backend->putIfAbsent(layout.refCleanupMarkerKey(ns, remove_txn), String{});
+    const ManifestRef recreated = ManifestRef{.writer_epoch = 2, .build_sequence = 1, .manifest_ordinal = 1};
+    writeManifestRaw(*backend, layout, ns, recreated, {blobEntryFor("a", DB::UInt128(1))});
+    const String file_key = layout.namespaceFilesPrefix(ns) + "format_version.txt";
+    backend->putIfAbsent(file_key, "1");
+
+    /// The stale leader runs its Pending pass at its (still-durable) round: the marker HEAD must abort it.
+    gc.runNamespaceCleanupPassesForTest(seal, st.round, /*suppress_destructive*/false);
+
+    EXPECT_TRUE(backend->head(layout.manifestKey(ManifestId{ns, recreated})).exists)
+        << "the recreated successor-epoch manifest must survive the stale pass";
+    EXPECT_TRUE(backend->head(file_key).exists)
+        << "the recreated verbatim file must survive: the marker HEAD aborts the pass before deleting it";
+}
+
+/// (C3/N3) The `Pending` pass re-reads gc/state and aborts when a successor advanced the ROUND (strictly
+/// incremented on every commit), never trusting the lease `seq` (a deposed-then-re-elected owner can
+/// present the same seq). A deposed leader executing round R while durable gc/state is already R+1 must
+/// delete nothing.
+TEST(CasRefGc, StaleLeaderPendingPassAbortsWhenRoundAdvanced)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/aa@cas@"};
+
+    Gc gc(store, kGc);
+    gc.runRegularRound();
+    const GcState st = decodeGcState(backend->get(layout.gcStateKey())->bytes);
+    ASSERT_EQ(st.lease.owner, kGc);
+
+    const RefTxnId remove_txn{2, 5};
+    CasFoldSeal seal;
+    seal.ns_cleanup_items[ns.string() + "\n" + renderRefTxnId(remove_txn)] =
+        RefNsCleanupItem{.ns = ns, .remove_txn_id = remove_txn, .state = RefNsCleanupState::Pending};
+
+    /// A removed-incarnation manifest (epoch 2 <= remove epoch 2) the epoch filter would otherwise delete;
+    /// no marker present, so ONLY the round-freshness guard can spare it.
+    const ManifestRef removed_incarnation = ManifestRef{.writer_epoch = 2, .build_sequence = 1, .manifest_ordinal = 1};
+    writeManifestRaw(*backend, layout, ns, removed_incarnation, {blobEntryFor("a", DB::UInt128(1))});
+
+    /// Durable gc/state advances to a newer round (a successor committed) while this leader still holds R.
+    {
+        GcState advanced = st;
+        advanced.round = st.round + 1;
+        const HeadResult h = backend->head(layout.gcStateKey());
+        backend->putOverwrite(layout.gcStateKey(), encodeGcState(advanced), h.token);
+    }
+
+    gc.runNamespaceCleanupPassesForTest(seal, /*new_round=*/st.round, /*suppress_destructive*/false);
+
+    EXPECT_TRUE(backend->head(layout.manifestKey(ManifestId{ns, removed_incarnation})).exists)
+        << "a deposed leader (durable round advanced past its own) must delete nothing";
+}
+
+/// (C3) Manifest deletes are epoch-timing-independent: even when the pass runs (round fresh, no marker), a
+/// manifest whose `writer_epoch` exceeds the removed incarnation's is recreated data and is never deleted,
+/// while a manifest at/below the removed epoch is removed-incarnation debris and is reclaimed.
+TEST(CasRefGc, PendingPassEpochFiltersManifestDeletes)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/aa@cas@"};
+
+    Gc gc(store, kGc);
+    gc.runRegularRound();
+    const GcState st = decodeGcState(backend->get(layout.gcStateKey())->bytes);
+
+    const RefTxnId remove_txn{2, 5};
+    CasFoldSeal seal;
+    seal.ns_cleanup_items[ns.string() + "\n" + renderRefTxnId(remove_txn)] =
+        RefNsCleanupItem{.ns = ns, .remove_txn_id = remove_txn, .state = RefNsCleanupState::Pending};
+
+    const ManifestRef old_incarnation = ManifestRef{.writer_epoch = 2, .build_sequence = 1, .manifest_ordinal = 1};
+    const ManifestRef recreated = ManifestRef{.writer_epoch = 3, .build_sequence = 1, .manifest_ordinal = 1};
+    writeManifestRaw(*backend, layout, ns, old_incarnation, {blobEntryFor("a", DB::UInt128(1))});
+    writeManifestRaw(*backend, layout, ns, recreated, {blobEntryFor("b", DB::UInt128(2))});
+
+    /// No marker (marker guard inert), round fresh (round guard passes): the epoch filter is the guard.
+    gc.runNamespaceCleanupPassesForTest(seal, st.round, /*suppress_destructive*/false);
+
+    EXPECT_FALSE(backend->head(layout.manifestKey(ManifestId{ns, old_incarnation})).exists)
+        << "a manifest at/below the removed incarnation's epoch is removed-incarnation debris and is reclaimed";
+    EXPECT_TRUE(backend->head(layout.manifestKey(ManifestId{ns, recreated})).exists)
+        << "a greater-epoch manifest is recreated data and must never be deleted, regardless of pass timing";
+}
