@@ -263,7 +263,10 @@ private:
     /// unless `durable.round == new_round` under our lease), aborts on the `_cleanup` marker's presence
     /// (the exact recreation precondition, spec §Namespace Birth), and epoch-filters manifest deletes to
     /// the removed incarnation's `writer_epoch` (a recreated manifest carries a strictly greater epoch).
-    void runNamespaceCleanupPasses(const CasFoldSeal & seal, uint64_t new_round, bool suppress_destructive);
+    /// `ref_tables` is this round's own global LIST: the `Removed`-snapshot republication is gated on it
+    /// so a snapshot a recreated namespace already superseded is never re-created (the per-round churn).
+    void runNamespaceCleanupPasses(const CasFoldSeal & seal, const std::map<String, RefTableListing> & ref_tables,
+                                   uint64_t new_round, bool suppress_destructive);
 
     /// Whether a namespace's physical `@cas@` metadata prefixes (manifest bodies + verbatim files) hold no
     /// object -- the Pending->Completed condition for its namespace-cleanup item. LIST-only, no delete.
@@ -401,9 +404,11 @@ public:
     /// TEST SEAM (spec §Step 6 straggler safety): drive one namespace-cleanup pass directly so a test can
     /// stage the exact stale-leader interleaving (a Pending item whose namespace a successor Completed +
     /// recreated) without racing a live round. Production drives this only through `runRegularRound`.
-    void runNamespaceCleanupPassesForTest(const CasFoldSeal & seal, uint64_t new_round, bool suppress_destructive)
+    void runNamespaceCleanupPassesForTest(const CasFoldSeal & seal,
+                                          const std::map<String, RefTableListing> & ref_tables,
+                                          uint64_t new_round, bool suppress_destructive)
     {
-        runNamespaceCleanupPasses(seal, new_round, suppress_destructive);
+        runNamespaceCleanupPasses(seal, ref_tables, new_round, suppress_destructive);
     }
 
 };

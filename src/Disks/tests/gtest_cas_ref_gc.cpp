@@ -710,7 +710,7 @@ TEST(CasRefGc, StaleLeaderPendingPassAbortsOnCompletionMarker)
     backend->putIfAbsent(file_key, "1");
 
     /// The stale leader runs its Pending pass at its (still-durable) round: the marker HEAD must abort it.
-    gc.runNamespaceCleanupPassesForTest(seal, st.round, /*suppress_destructive*/false);
+    gc.runNamespaceCleanupPassesForTest(seal, /*ref_tables*/{}, st.round, /*suppress_destructive*/false);
 
     EXPECT_TRUE(backend->head(layout.manifestKey(ManifestId{ns, recreated})).exists)
         << "the recreated successor-epoch manifest must survive the stale pass";
@@ -752,7 +752,7 @@ TEST(CasRefGc, StaleLeaderPendingPassAbortsWhenRoundAdvanced)
         backend->putOverwrite(layout.gcStateKey(), encodeGcState(advanced), h.token);
     }
 
-    gc.runNamespaceCleanupPassesForTest(seal, /*new_round=*/st.round, /*suppress_destructive*/false);
+    gc.runNamespaceCleanupPassesForTest(seal, /*ref_tables*/{}, /*new_round=*/st.round, /*suppress_destructive*/false);
 
     EXPECT_TRUE(backend->head(layout.manifestKey(ManifestId{ns, removed_incarnation})).exists)
         << "a deposed leader (durable round advanced past its own) must delete nothing";
@@ -783,10 +783,147 @@ TEST(CasRefGc, PendingPassEpochFiltersManifestDeletes)
     writeManifestRaw(*backend, layout, ns, recreated, {blobEntryFor("b", DB::UInt128(2))});
 
     /// No marker (marker guard inert), round fresh (round guard passes): the epoch filter is the guard.
-    gc.runNamespaceCleanupPassesForTest(seal, st.round, /*suppress_destructive*/false);
+    gc.runNamespaceCleanupPassesForTest(seal, /*ref_tables*/{}, st.round, /*suppress_destructive*/false);
 
     EXPECT_FALSE(backend->head(layout.manifestKey(ManifestId{ns, old_incarnation})).exists)
         << "a manifest at/below the removed incarnation's epoch is removed-incarnation debris and is reclaimed";
     EXPECT_TRUE(backend->head(layout.manifestKey(ManifestId{ns, recreated})).exists)
         << "a greater-epoch manifest is recreated data and must never be deleted, regardless of pass timing";
+}
+
+/// (I2) A recreated namespace must not drive a per-round republish/delete churn, and Completed cleanup
+/// items must not accumulate in the seal forever. After a removed namespace is recreated with a Live
+/// snapshot that supersedes the `Removed` one, `cleanupRefObjects` deletes the superseded `Removed`
+/// snapshot; on the unfixed code the next round's Completed republication re-creates it and the round
+/// after deletes it again -- one PUT + one DELETE every round, per recreated namespace, forever. The fix
+/// retires the item once its artifacts are durably observed (marker present AND superseded), so neither
+/// the churn nor unbounded seal growth occurs.
+TEST(CasRefGc, RecreatedNamespaceRetiresCleanupItemAndStopsChurn)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test",
+                                                 .root_shards = 1, .gc_fold_max_defer_rounds = 0});
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"test/tbl"};
+
+    /// Real writer: publish a committed part, then DROP the whole namespace.
+    {
+        BuildInfo info;
+        info.intended_ref = ns.string() + "/part_1";
+        auto build = store->startBuild(info);
+        const ManifestId id = build->stageManifest({});
+        build->precommitAdd(ns, "part_1", id);
+        build->promote(ns, "part_1", build->buildId(), id);
+    }
+    store->dropNamespace(ns);
+    store->renewWatermarkOnce();
+
+    /// Drive GC until the removal Completes (the `_cleanup` marker is published).
+    Gc gc(store, kGc);
+    RefTxnId remove_txn{};
+    for (int i = 0; i < 32 && remove_txn == RefTxnId{}; ++i)
+    {
+        gc.runRegularRound();
+        store->renewWatermarkOnce();
+        const ListPage m = backend->list(layout.refsNamespacePrefix(ns) + "_cleanup/", "", 10);
+        if (!m.keys.empty())
+        {
+            const auto p = layout.parseRefObjectKey(m.keys.front().key);
+            ASSERT_TRUE(p.has_value());
+            remove_txn = p->txn_id;
+        }
+    }
+    ASSERT_FALSE(remove_txn == RefTxnId{}) << "GC must complete the removal (publish the marker)";
+    const String removed_snap_key = layout.refSnapshotKey(ns, remove_txn);
+    ASSERT_TRUE(backend->head(removed_snap_key).exists) << "completion published the Removed snapshot";
+
+    /// RECREATE: a fresh committed log with an id above the removal, plus a Live snapshot that supersedes
+    /// the Removed snapshot (the writer's post-recreation compaction).
+    const ManifestRef rec = mref(remove_txn.ref_sequence + 10);
+    writeManifestRaw(*backend, layout, ns, rec, {blobEntryFor("z", DB::UInt128(99))});
+    const uint64_t rec_log = appendRefLogSeed(*backend, layout, ns, publishCommittedOps("part_2", rec));
+    const RefTxnId live_snapshot_id{1, rec_log};
+    writeRefSnapshotRaw(*backend, layout,
+        minimalLiveSnapshot(ns.string(), live_snapshot_id, {committedRow("part_2", rec)}));
+    ASSERT_GT(live_snapshot_id, remove_txn) << "the recreation's Live snapshot must supersede the Removed one";
+
+    /// Run several folding rounds; measure how often the Removed snapshot is re-created.
+    backend->resetCounts();
+    for (int i = 0; i < 6; ++i)
+    {
+        gc.runRegularRound();
+        store->renewWatermarkOnce();
+    }
+
+    EXPECT_EQ(backend->putCount(removed_snap_key), 0u)
+        << "the superseded Removed snapshot must not be re-created every round (the churn)";
+    EXPECT_FALSE(backend->head(removed_snap_key).exists)
+        << "the Removed snapshot stays deleted once a recreated namespace supersedes it";
+
+    const uint64_t gen = currentGenerationOf(*backend, layout);
+    const uint64_t attempt = currentAttemptOf(*backend, layout);
+    const CasFoldSeal seal = decodeFoldSeal(backend->get(layout.foldSealKey(gen, attempt))->bytes);
+    EXPECT_EQ(seal.ns_cleanup_items.count(ns.string() + "\n" + renderRefTxnId(remove_txn)), 0u)
+        << "the Completed cleanup item retires once its artifacts are durably observed (no unbounded seal growth)";
+}
+
+/// (I2) The Completed branch still repairs a crash-lost `Removed` snapshot (marker durable, snapshot lost
+/// between the two publishes, NO recreation): it republishes the snapshot exactly once (idempotent, not
+/// churned), and once the snapshot is durably observed the item retires. This is the corner the
+/// artifact-absence gate must preserve -- gating republication on marker-only would drop this repair.
+TEST(CasRefGc, CompletedItemRepublishesCrashLostRemovedSnapshotThenRetires)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test",
+                                                 .root_shards = 1, .gc_fold_max_defer_rounds = 0});
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"test/tbl"};
+
+    {
+        BuildInfo info;
+        info.intended_ref = ns.string() + "/part_1";
+        auto build = store->startBuild(info);
+        const ManifestId id = build->stageManifest({});
+        build->precommitAdd(ns, "part_1", id);
+        build->promote(ns, "part_1", build->buildId(), id);
+    }
+    store->dropNamespace(ns);
+    store->renewWatermarkOnce();
+
+    Gc gc(store, kGc);
+    RefTxnId remove_txn{};
+    for (int i = 0; i < 32 && remove_txn == RefTxnId{}; ++i)
+    {
+        gc.runRegularRound();
+        store->renewWatermarkOnce();
+        const ListPage m = backend->list(layout.refsNamespacePrefix(ns) + "_cleanup/", "", 10);
+        if (!m.keys.empty())
+        {
+            const auto p = layout.parseRefObjectKey(m.keys.front().key);
+            ASSERT_TRUE(p.has_value());
+            remove_txn = p->txn_id;
+        }
+    }
+    ASSERT_FALSE(remove_txn == RefTxnId{});
+    const String removed_snap_key = layout.refSnapshotKey(ns, remove_txn);
+    ASSERT_TRUE(backend->head(removed_snap_key).exists);
+
+    /// Model a crash between the marker PUT and the snapshot PUT: delete the Removed snapshot, keep the
+    /// marker, and do NOT recreate the namespace (no newer snapshot supersedes it).
+    { const HeadResult h = backend->head(removed_snap_key); backend->deleteExact(removed_snap_key, h.token); }
+    ASSERT_FALSE(backend->head(removed_snap_key).exists);
+
+    backend->resetCounts();
+    gc.runRegularRound();   /// the Completed branch republishes the lost snapshot (absent AND not superseded)
+    store->renewWatermarkOnce();
+    EXPECT_TRUE(backend->head(removed_snap_key).exists) << "a crash-lost Removed snapshot is repaired";
+    EXPECT_EQ(backend->putCount(removed_snap_key), 1u) << "republished exactly once (idempotent, not churned)";
+
+    gc.runRegularRound();   /// now the artifacts are durably observed -> the item retires
+    store->renewWatermarkOnce();
+    const uint64_t gen = currentGenerationOf(*backend, layout);
+    const uint64_t attempt = currentAttemptOf(*backend, layout);
+    const CasFoldSeal seal = decodeFoldSeal(backend->get(layout.foldSealKey(gen, attempt))->bytes);
+    EXPECT_EQ(seal.ns_cleanup_items.count(ns.string() + "\n" + renderRefTxnId(remove_txn)), 0u)
+        << "once the marker + Removed snapshot are durably observed the item retires";
 }

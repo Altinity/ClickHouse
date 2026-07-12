@@ -634,7 +634,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired)
     /// removed namespace's covered logs persisted as debris until some later fold -- which never comes on
     /// a quiesced pool.
     const bool suppress_destructive = !report.anomalies.empty();
-    runNamespaceCleanupPasses(folded.fold_seal, new_round, suppress_destructive);
+    runNamespaceCleanupPasses(folded.fold_seal, folded.ref_tables, new_round, suppress_destructive);
     if (trim_enabled)
         cleanupRefObjects(folded, suppress_destructive);
 
@@ -1112,6 +1112,39 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         if (item.state != RefNsCleanupState::Completed && namespacePhysicallyEmpty(item.ns))
             item.state = RefNsCleanupState::Completed;
 
+    /// Retire a Completed item once its completion artifacts are DURABLY OBSERVED in this round's own
+    /// global LIST -- the `_cleanup` marker present AND (the `Removed` snapshot present OR superseded by a
+    /// newer Live snapshot). Carrying Completed items forever grows the seal unboundedly and, once a
+    /// removed namespace is recreated (whose Live snapshot supersedes the `Removed` one, which cleanup
+    /// then deletes), drives a per-round republish/delete churn. Gate retirement on ARTIFACT presence,
+    /// not marker-only: a `Removed` snapshot lost to a crash between the two publishes (no recreation)
+    /// must still be repaired by the Completed branch before the item retires. Skipped on a ref-folding
+    /// abort (the LIST may be incomplete); a later clean round retires it.
+    if (!ref_folding_aborted)
+        for (auto it = result.fold_seal.ns_cleanup_items.begin(); it != result.fold_seal.ns_cleanup_items.end();)
+        {
+            const RefNsCleanupItem & item = it->second;
+            bool retire = false;
+            if (item.state == RefNsCleanupState::Completed)
+                if (const auto tit = ref_tables.find(item.ns.string()); tit != ref_tables.end())
+                {
+                    const RefTableListing & listing = tit->second;
+                    const bool marker_present =
+                        std::find(listing.cleanup_markers.begin(), listing.cleanup_markers.end(),
+                                  item.remove_txn_id) != listing.cleanup_markers.end();
+                    const bool removed_snapshot_present =
+                        std::find(listing.snapshots.begin(), listing.snapshots.end(),
+                                  item.remove_txn_id) != listing.snapshots.end();
+                    const bool superseded_by_newer =
+                        !listing.snapshots.empty() && item.remove_txn_id < listing.snapshots.back();
+                    retire = marker_present && (removed_snapshot_present || superseded_by_newer);
+                }
+            if (retire)
+                it = result.fold_seal.ns_cleanup_items.erase(it);
+            else
+                ++it;
+        }
+
     /// T0 (2026-07-02 snapshot-streaming): the parent generation's per-shard run segments, resolved from
     /// the parent fold seal's `blob_target_runs` and grouped by the ref's explicit `shard`. The same seal
     /// `discover_ref_seal` the token-diff already read is the run source — consumers resolve runs THROUGH
@@ -1387,7 +1420,8 @@ void Gc::cleanupRefObjects(const FoldResult & folded, bool suppress_destructive)
     }
 }
 
-void Gc::runNamespaceCleanupPasses(const CasFoldSeal & seal, uint64_t new_round, bool suppress_destructive)
+void Gc::runNamespaceCleanupPasses(const CasFoldSeal & seal, const std::map<String, RefTableListing> & ref_tables,
+                                   uint64_t new_round, bool suppress_destructive)
 {
     Backend & backend = store->backend();
     const Layout & layout = store->layout();
@@ -1473,17 +1507,34 @@ void Gc::runNamespaceCleanupPasses(const CasFoldSeal & seal, uint64_t new_round,
         }
         else
         {
-            /// Completed: publish the completion marker and republish the constant-size Removed snapshot,
-            /// both idempotent `putIfAbsent` derived from {namespace, remove_txn_id} alone. Winning this
-            /// round's gc/state CAS (moments earlier) is the GC leadership fence gating publication -- a
-            /// deposed leader's round CAS ABORTs before reaching here, so no stale publication occurs.
+            /// Completed: publish the completion marker and (conditionally) republish the constant-size
+            /// Removed snapshot, both derived from {namespace, remove_txn_id} alone. Winning this round's
+            /// gc/state CAS (moments earlier) is the GC leadership fence gating publication -- a deposed
+            /// leader's round CAS ABORTs before reaching here, so no stale publication occurs. The marker
+            /// putIfAbsent is a no-op when present ("republish only if absent"). The `Removed` snapshot is
+            /// republished ONLY when it is absent AND not superseded by a newer Live snapshot: a lost
+            /// snapshot (crash between the two publishes, no recreation) is repaired, but a snapshot a
+            /// recreated namespace already superseded (and cleanup deleted) is NOT re-created -- otherwise
+            /// each round re-creates it and the next deletes it, a permanent one-PUT-one-DELETE churn.
             backend.putIfAbsent(layout.refCleanupMarkerKey(item.ns, item.remove_txn_id), String{});
-            RefTableSnapshot removed;
-            removed.ns = item.ns.string();
-            removed.snapshot_id = item.remove_txn_id;
-            removed.lifecycle = RefLifecycle::Removed;
-            removed.remove_txn_id = item.remove_txn_id;
-            backend.putIfAbsent(layout.refSnapshotKey(item.ns, item.remove_txn_id), encodeRefTableSnapshot(removed));
+            bool removed_snapshot_present = false;
+            bool superseded_by_newer = false;
+            if (const auto tit = ref_tables.find(item.ns.string()); tit != ref_tables.end())
+            {
+                const RefTableListing & listing = tit->second;
+                removed_snapshot_present = std::find(listing.snapshots.begin(), listing.snapshots.end(),
+                                                     item.remove_txn_id) != listing.snapshots.end();
+                superseded_by_newer = !listing.snapshots.empty() && item.remove_txn_id < listing.snapshots.back();
+            }
+            if (!removed_snapshot_present && !superseded_by_newer)
+            {
+                RefTableSnapshot removed;
+                removed.ns = item.ns.string();
+                removed.snapshot_id = item.remove_txn_id;
+                removed.lifecycle = RefLifecycle::Removed;
+                removed.remove_txn_id = item.remove_txn_id;
+                backend.putIfAbsent(layout.refSnapshotKey(item.ns, item.remove_txn_id), encodeRefTableSnapshot(removed));
+            }
         }
     }
 }
