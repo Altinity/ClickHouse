@@ -438,6 +438,13 @@ StorePtr Store::open(BackendPtr backend, PoolConfig config)
 
 Store::~Store()
 {
+    /// Refuse any further self-remount arming for the rest of teardown. Latched under the thread mutex
+    /// (paired with scheduleRemount's checks) BEFORE the join below, so a keeper on_lost firing during
+    /// teardown can never re-arm remount_thread after we join it.
+    {
+        std::lock_guard g(remount_thread_mutex);
+        remount_shutting_down.store(true);
+    }
     /// Stop the self-remount recovery loop FIRST: it may otherwise re-create the keeper below us.
     remount_stop.store(true);
     remount_cv.notify_all();
@@ -462,6 +469,15 @@ Store::~Store()
         {
             tryLogCurrentException(getLogger("CasStore"), "CAS mount-lease: release during Store teardown failed");
         }
+    }
+
+    /// Belt-and-suspenders re-join. The shutting-down flag makes scheduleRemount a no-op above, so this
+    /// is normally not joinable; it closes the residual window where a keeper on_lost between the first
+    /// join and stop() observed the flag late.
+    {
+        std::lock_guard g(remount_thread_mutex);
+        if (remount_thread.joinable())
+            remount_thread.join();
     }
 }
 
@@ -684,10 +700,10 @@ void Store::scheduleRemount()
 {
     if (!config.background_watermark)
         return;   /// tests drive tryRemountOnce explicitly (the same gate as every background thread)
-    if (remount_running.load())
+    if (remount_shutting_down.load() || remount_running.load())
         return;
     std::lock_guard g(remount_thread_mutex);
-    if (remount_running.load())
+    if (remount_shutting_down.load() || remount_running.load())
         return;
     if (remount_thread.joinable())
         remount_thread.join();   /// a PREVIOUS recovery finished; reap it before starting a new one
@@ -706,6 +722,19 @@ void Store::scheduleRemount()
         }
         remount_running.store(false);
     });
+}
+
+bool Store::scheduleRemountForTest()
+{
+    scheduleRemount();
+    std::lock_guard g(remount_thread_mutex);
+    return remount_thread.joinable();
+}
+
+void Store::beginShutdownForTest()
+{
+    std::lock_guard g(remount_thread_mutex);
+    remount_shutting_down.store(true);
 }
 
 void Store::renewWatermarkOnce()

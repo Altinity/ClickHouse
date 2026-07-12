@@ -520,6 +520,14 @@ public:
     /// call concurrently (serialized internally); also the synchronous test seam.
     bool tryRemountOnce();
 
+    /// Test seam: drive the (private) self-remount arm/refuse path directly — in production the
+    /// keeper's on_lost callback calls `scheduleRemount`, otherwise reachable only via the background
+    /// renewer's cadence. Returns true iff a recovery thread is armed after the call.
+    bool scheduleRemountForTest();
+    /// Test seam: latch `remount_shutting_down` exactly as `~Store()` does at its top, WITHOUT tearing
+    /// the Store down, so a test can assert `scheduleRemount` refuses to spawn once teardown has begun.
+    void beginShutdownForTest();
+
     /// P1 known-present blob-hash cache (design 2026-06-20, B168). A HINT only — correctness never
     /// depends on it: a hit just makes putBlob go HEAD-first, and a stale hit is caught by that HEAD.
     /// No-ops when disabled (dedup_cache_bytes == 0). Keyed on the full `BlobRef` pair (Phase 3 T2):
@@ -903,6 +911,7 @@ private:
     std::mutex remount_thread_mutex;       /// guards the thread handle below
     std::atomic<bool> remount_running{false};
     std::atomic<bool> remount_stop{false};
+    std::atomic<bool> remount_shutting_down{false};   /// latched at ~Store() top; scheduleRemount refuses to re-arm during teardown
     std::condition_variable remount_cv;
     std::mutex remount_cv_mutex;
     ThreadFromGlobalPool remount_thread;

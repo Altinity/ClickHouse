@@ -302,6 +302,12 @@ public:
     /// Releases the mount: the terminal op. Stops the background thread first.
     void stop() { doTerminate(); }
 
+    /// Join the renewal thread BEFORE this object's own `std::function` members (`on_renew_ok` /
+    /// `on_lost`, which reach back into the Store) are destroyed. The base `~SingleWriterSlot` also
+    /// calls `stopBackground`, but it runs AFTER the derived members are gone — a renewal firing
+    /// `on_lost` in that window would call a destroyed `std::function`. Stopping here closes that window.
+    ~MountLeaseKeeper() override { stopBackground(); }
+
     /// Local write-fence coupling (set once by `Store::open` before `startBackground`): the keeper is
     /// the ONLY thing that touches S3 for the lease, so the fence must reflect the live lease without a
     /// per-write S3 read. On each SUCCESSFUL background renew the keeper calls `on_renew_ok` (the Store

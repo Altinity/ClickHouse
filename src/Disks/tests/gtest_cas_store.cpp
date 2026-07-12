@@ -1158,6 +1158,26 @@ TEST(CasStoreRemount, ForeignOwnerIsNeverTakenOver)
     EXPECT_EQ(decodeMountLease(backend->get(mount_key)->bytes).server_uuid, foreign.server_uuid);
 }
 
+TEST(CasStoreRemount, ShutdownGuardRefusesToArmRemount)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    /// background_watermark = true so scheduleRemount actually arms a recovery thread in production mode
+    /// (the same gate every background thread checks).
+    auto store = DB::Cas::Store::open(backend,
+        DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test", .background_watermark = true});
+
+    /// Teardown has begun: ~Store() latches this at its very top, BEFORE its only remount-thread join.
+    store->beginShutdownForTest();
+
+    /// A lease-renewal failure firing DURING teardown re-enters scheduleRemount (the keeper's on_lost
+    /// callback). With the guard it must refuse to spawn; without it, it arms remount_thread AFTER
+    /// ~Store()'s join — the leftover joinable ThreadFromGlobalPool handle then abort()s the process at
+    /// member destruction (std::terminate). Reading joinable() immediately after the synchronous call is
+    /// race-free: the armed thread never touches the handle.
+    EXPECT_FALSE(store->scheduleRemountForTest())
+        << "scheduleRemount must not arm a recovery thread once teardown has begun";
+}
+
 TEST(CasStore, ReadManifestSharedReturnsSharedDecodeWithoutCopy)
 {
     auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
