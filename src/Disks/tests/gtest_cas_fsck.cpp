@@ -3,6 +3,9 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFsck.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRefIntake.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRefSnapshotCodec.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRefStateMachine.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include "cas_test_helpers.h"
 
@@ -242,6 +245,86 @@ TEST(CasFsck, BodyWithoutMetaIsBenign)
     EXPECT_GE(rep.body_without_meta, 1u);
     EXPECT_EQ(rep.dangling, 0u);
     EXPECT_EQ(rep.meta_without_body, 0u);
+    EXPECT_TRUE(rep.clean());
+}
+
+/// Snapshot integrity oracle (spec §Snapshot Publication): a published snapshot whose bytes equal an
+/// independent replay of its own surviving logs is clean, and the oracle actually RAN (logs present).
+TEST(CasFsckSnapshotOracle, PublishedSnapshotMatchingReplayIsClean)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r = ref(1, 0xAA);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+
+    /// Publish the CORRECT snapshot: exactly the deterministic replay of the logs, at the greatest log id.
+    const RefTableState st = recoverRefTable(*backend, store->layout(), ns);
+    writeRefSnapshotRaw(*backend, store->layout(), snapshotOf(st, ns.string()));
+
+    const FsckReport rep = runFsck(*store, /*detail*/true);
+    EXPECT_TRUE(rep.clean());
+    EXPECT_EQ(rep.snapshot_oracle_mismatches, 0u);
+    EXPECT_GE(rep.snapshot_oracle_checked, 1u) << "the oracle must actually run when the logs survive";
+}
+
+/// A published snapshot whose bytes are a VALID snapshot object but DIVERGE from the replay of its logs
+/// (here: it carries an extra precommit the logs never added) is a hard ERROR -- caught even though
+/// reachability is unaffected (precommits are not walked), so it surfaces ONLY through the oracle.
+TEST(CasFsckSnapshotOracle, ForgedSnapshotDivergingFromReplayIsError)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r = ref(1, 0xAA);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+
+    /// Forge a snapshot at the greatest log id: the correct replay plus one phantom precommit binding.
+    /// It is internally valid (decodes fine), so only the byte-compare against the log replay catches it.
+    const RefTableState st = recoverRefTable(*backend, store->layout(), ns);
+    RefTableSnapshot forged = snapshotOf(st, ns.string());
+    forged.precommits.push_back(RefOwnerBinding{RefOwnerKind::Precommit, "ghost", ref(2, 0xBB)});
+    writeRefSnapshotRaw(*backend, store->layout(), forged);
+
+    const FsckReport rep = runFsck(*store, /*detail*/true);
+    EXPECT_EQ(rep.snapshot_oracle_mismatches, 1u);
+    EXPECT_EQ(rep.dangling, 0u) << "the divergence is a snapshot-oracle error, not a reachability dangle";
+    EXPECT_FALSE(rep.clean());
+    bool saw = false;
+    for (const FsckObject & o : rep.objects)
+        if (o.cls == FsckClass::SnapshotOracleMismatch)
+            saw = true;
+    EXPECT_TRUE(saw);
+}
+
+/// Once a table's covered logs are cleaned (the steady state on a GC-caught-up pool), the oracle has no
+/// independent history to replay from and SKIPS the table -- it must never false-positive on a snapshot
+/// whose logs are legitimately gone.
+TEST(CasFsckSnapshotOracle, CleanedLogsSkipOracleWithoutFalsePositive)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r = ref(1, 0xAA);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
+    const uint64_t seq = publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+
+    /// Publish the correct snapshot, then delete the log it covers (as GC cleanup would once covered).
+    const RefTableState st = recoverRefTable(*backend, store->layout(), ns);
+    writeRefSnapshotRaw(*backend, store->layout(), snapshotOf(st, ns.string()));
+    const String log_key = store->layout().refLogKey(ns, RefTxnId{1, seq});
+    const HeadResult h = backend->head(log_key);
+    ASSERT_TRUE(h.exists);
+    backend->deleteExact(log_key, h.token);
+
+    const FsckReport rep = runFsck(*store, /*detail*/true);
+    EXPECT_EQ(rep.snapshot_oracle_mismatches, 0u);
+    EXPECT_EQ(rep.snapshot_oracle_checked, 0u) << "no surviving logs -> the oracle skips, not fails";
     EXPECT_TRUE(rep.clean());
 }
 

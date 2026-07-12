@@ -7,6 +7,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/Exception.h>
+#include <Common/ProfileEvents.h>
 
 #include <Poco/Exception.h>
 
@@ -33,6 +34,8 @@ extern const int CORRUPTED_DATA;
 namespace ProfileEvents
 {
 extern const Event CasRefSweepDeferred;
+extern const Event CasRefSnapshotPutBytes;
+extern const Event CasRefSnapshotTailLogs;
 }
 
 using namespace DB::Cas;
@@ -619,6 +622,87 @@ TEST(RefWriterAppendLane, WedgedAppendObservedDurableAppliesBeforeNextId)
 }
 
 /// ===================================================================================
+/// Task 13: whole-table ref-cache eviction (spec §Byte, Memory, And CPU Budget)
+/// ===================================================================================
+
+/// A tiny cache budget forces WHOLE-TABLE eviction: publishing to several tables in turn keeps only the
+/// most-recently-touched one resident, and an evicted table re-recovers its exact committed state on the
+/// next touch (spec §Startup And Recovery: "Evicting the table drops the entire object; the next access
+/// repeats recovery").
+TEST(RefTableCacheEviction, WholeTableEvictionUnderBudgetReRecovers)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openStoreWithConfig(backend,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "test", .ref_table_cache_bytes = 1});
+    const RootNamespace ns_a{"srv1/evict_a"};
+    const RootNamespace ns_b{"srv1/evict_b"};
+    const RootNamespace ns_c{"srv1/evict_c"};
+
+    publishEmptyPart(store, ns_a, "x");
+    publishEmptyPart(store, ns_b, "y");
+    publishEmptyPart(store, ns_c, "z");
+
+    /// A 1-byte budget is below one table's weight, so each new table evicts the prior idle ones: only
+    /// the last-touched table stays resident (the just-recovered table is never evicted).
+    EXPECT_EQ(store->refTablesCachedCountForTest(), 1u);
+    EXPECT_TRUE(store->refTableCachedForTest(ns_c));
+    EXPECT_FALSE(store->refTableCachedForTest(ns_a));
+    EXPECT_FALSE(store->refTableCachedForTest(ns_b));
+
+    /// The evicted table re-recovers its exact committed state on next touch.
+    const auto resolved = store->resolveRef(ns_a, "x");
+    ASSERT_TRUE(resolved.has_value()) << "an evicted table must re-recover its committed ref";
+    /// That touch, in turn, evicted the previously-resident table under the same budget.
+    EXPECT_TRUE(store->refTableCachedForTest(ns_a));
+    EXPECT_FALSE(store->refTableCachedForTest(ns_c));
+}
+
+/// A zero budget disables eviction entirely: every touched table stays resident.
+TEST(RefTableCacheEviction, ZeroBudgetDisablesEviction)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openStoreWithConfig(backend,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "test", .ref_table_cache_bytes = 0});
+    for (const String & n : {String("srv1/keep_a"), String("srv1/keep_b"), String("srv1/keep_c")})
+        publishEmptyPart(store, RootNamespace{n}, "x");
+    EXPECT_EQ(store->refTablesCachedCountForTest(), 3u);
+}
+
+/// A table with a WEDGED append lane is never evicted, even when idle and over budget: its uncertain
+/// in-flight PUT is not reconstructable from the durable objects (spec §Writer-Side Linearization), so
+/// re-recovery must not be allowed to drop and re-materialize it (which could re-allocate an id).
+TEST(RefTableCacheEviction, WedgedTableIsNeverEvicted)
+{
+    CasRequestBudget budget;
+    budget.max_attempts = 1;
+    budget.attempt_timeout_ms = 100;
+    budget.operation_deadline_ms = 100;
+    budget.lease_safety_margin_ms = 100;
+
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openStoreWithConfig(backend,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "test",
+                   .cas_request_budget = budget, .ref_table_cache_bytes = 1});
+    const Layout & layout = store->layout();
+    const RootNamespace ns_w{"srv1/wedged"};
+    publishEmptyPart(store, ns_w, "x");
+
+    /// Wedge ns_w's append lane with one ambiguous (Unresolved) PUT that exhausts the single-attempt budget.
+    backend->fault_key_substr = layout.refsNamespacePrefix(ns_w) + "_log/";
+    backend->fault_count = 1;
+    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { store->dropRef(ns_w, "x"); });
+    ASSERT_TRUE(store->refLaneWedgedForTest(ns_w));
+
+    /// Pressure the cache with other tables. ns_w is idle and over the 1-byte budget, but its wedged lane
+    /// makes it non-evictable, so its wedge state survives (a fresh runtime would report no wedge).
+    publishEmptyPart(store, RootNamespace{"srv1/other_a"}, "y");
+    publishEmptyPart(store, RootNamespace{"srv1/other_b"}, "z");
+
+    EXPECT_TRUE(store->refTableCachedForTest(ns_w)) << "a wedged table must never be evicted";
+    EXPECT_TRUE(store->refLaneWedgedForTest(ns_w)) << "and its wedge state survives";
+}
+
+/// ===================================================================================
 /// Task 11: snapshot publication (spec §writer-snapshot-publication)
 /// ===================================================================================
 
@@ -654,6 +738,34 @@ TEST(RefWriterSnapshotPublish, ThresholdTriggerPublishesCacheReplayEquivalentByt
     const RefTableState oracle = independentFullReplayForTest(*backend, layout, ns, *snap_id);
     const String expected_bytes = encodeRefTableSnapshot(snapshotOf(oracle, ns.string()));
     EXPECT_EQ(got->bytes, expected_bytes) << "published snapshot bytes must equal replay(logs through X)";
+}
+
+/// Task 13 (spec §implementation-impact): a threshold snapshot publish increments the writer-side
+/// observability counters -- snapshot PUT bytes and the tail-logs-compacted count
+/// (logs-per-table-after-snapshot). Before/after deltas prove both sites fire.
+TEST(RefWriterSnapshotPublish, PublishIncrementsSnapshotCounters)
+{
+    using ProfileEvents::global_counters;
+    const auto bytes_before = global_counters[ProfileEvents::CasRefSnapshotPutBytes].load();
+    const auto logs_before  = global_counters[ProfileEvents::CasRefSnapshotTailLogs].load();
+
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const Layout layout("p");
+    PoolConfig config;
+    config.snapshot_log_count_threshold = 3;
+    config.snapshot_log_bytes_threshold = 1ULL << 40;
+    config.snapshot_min_log_age_ms = 0;
+    auto store = openStoreWithConfig(backend, config);
+    const RootNamespace ns{"srv1/counter_publish"};
+
+    publishEmptyPart(store, ns, "a");
+    publishEmptyPart(store, ns, "b");
+    store->waitForSnapshotPublishSettleForTest(ns);
+
+    ASSERT_TRUE(listGreatestSnapshotIdForTest(*backend, layout, ns).has_value())
+        << "the threshold trigger must have published a snapshot";
+    EXPECT_GT(global_counters[ProfileEvents::CasRefSnapshotPutBytes].load(), bytes_before);
+    EXPECT_GT(global_counters[ProfileEvents::CasRefSnapshotTailLogs].load(), logs_before);
 }
 
 /// A fresh mount that recovers a large PRE-EXISTING tail (left by a predecessor whose own thresholds

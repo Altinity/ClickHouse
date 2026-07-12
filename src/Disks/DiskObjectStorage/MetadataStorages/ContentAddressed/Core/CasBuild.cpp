@@ -1191,7 +1191,7 @@ void Build::abandon()
     /// BUG 2 / TLA+ `WAbandonPrecommit`: if this build made a manifest a LIVE precommit owner input
     /// (`precommitAdd` ran), abandoning it must NOT writer-delete that body. Instead append an exact
     /// precommit-removal ref-log transaction (spec §Remove Precommit), mirroring EXACTLY the removal
-    /// shape `Store::dropRef` and `Gc::reclaimAbandonedPrecommit` (Task 12) use (an old_binding naming
+    /// shape `Store::dropRef` and the fenced-successor stale-precommit sweep use (an old_binding naming
     /// the exact precommit, no new_binding). GC then folds the `-1` blob decrements and deletes the
     /// body only after they are sealed (delete-after-sealed-decrements). Deleting a live precommit body
     /// here would strand GC's fold barrier (live precommit, missing body → clamp forever) or lose the
@@ -1223,11 +1223,12 @@ void Build::abandon()
         });
     }
 
-    /// No longer in-flight: retire the seq so the GC watermark floor can advance (idempotent). This runs
-    /// AFTER the precommit removal above (mirrors `Build::promote`, which retires after its CAS) so
-    /// `min_active` can never advance — and let GC's `reclaimAbandonedPrecommit` observe a live precommit
-    /// past the watermark — before the removal is durably committed; retiring first would open a window
-    /// for a double removal race between this call and GC's reclaim.
+    /// No longer in-flight: retire the seq so the per-server active-build floor (`min_active`) can advance
+    /// (idempotent). This runs AFTER the precommit removal above (mirrors `Build::promote`, which retires
+    /// after its commit) so the build stays active until its precommit binding's removal is durable:
+    /// retiring first would advance `min_active` past a build whose precommit binding is still live in the
+    /// ref log, letting a freshness-window consumer judge the manifest build-dead while an un-removed
+    /// precommit still names it. Ordering removal-before-retire keeps that happens-before clean.
     store->retireBuildSeq(build_seq);
 
     cleanupStagedManifestDebrisBestEffort();

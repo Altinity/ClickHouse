@@ -121,9 +121,11 @@ public:
     /// staging drives `promoteStaged`'s conditional copy) has already returned successfully. If the
     /// process exits between `precommitAdd` and `promote` (e.g. between staging a blob and its
     /// server-side-copy promote completing), the `Build` object is simply lost with it: nothing ever
-    /// "wakes up" that precommit and finishes promoting it. The precommit's `RootOwnerEvent` is left as
-    /// a dead intent, judged build-dead via the durable per-server watermark and REMOVED (never
-    /// promoted) by `Gc::reclaimAbandonedPrecommit` (`CasGc.cpp`) once that floor passes it. So the
+    /// "wakes up" that precommit and finishes promoting it. The precommit's owner binding is left as a
+    /// dead intent in the ref log and is REMOVED (never promoted) by an exact precommit-removal ref-log
+    /// transaction -- the current writer's own `Build::abandon` if it is still mounted, otherwise a
+    /// fenced successor's stale-precommit sweep (spec §Clean Up Old Precommits). `GC` folds the resulting
+    /// `-1` manifest edge but never detects or removes a dead precommit itself. So the
     /// hazard the design calls out — "promote a precommit whose copy did not complete" — has no code
     /// path to occur through: promotion is not a recoverable/resumable operation, only a synchronous
     /// one that either completes within the writing process or never happens at all.

@@ -30,6 +30,8 @@ enum class FsckClass : uint8_t
     AwaitingGc,    /// edges still in the GC snapshot (drop/reclaim not folded yet) or GC never ran — EXPECTED
     Unaccounted,   /// absent from the whole GC view — transient for a fast create+drop between rounds;
                    /// PERSISTENT occurrences should be impossible (INV-2 reachability-before-content)
+    SnapshotOracleMismatch,  /// a published table snapshot's bytes diverge from an independent replay of
+                             /// its logs (spec §Snapshot Publication oracle) — cache/codec corruption, ERROR
 };
 
 struct FsckObject
@@ -58,6 +60,14 @@ struct FsckReport
     uint64_t body_without_meta = 0;   /// a body with no `.meta` — a not-yet-adopted or crashed-birth
                                        /// artifact; benign, NOT a dangle
 
+    /// Snapshot integrity oracle (spec §Snapshot Publication): for each table with a published snapshot
+    /// whose covered logs still survive, fsck independently replays those logs and re-encodes the
+    /// snapshot; a byte divergence from the published object means the writer cache or a codec is
+    /// corrupt and is a hard ERROR. `snapshot_oracle_checked` counts tables the oracle could actually
+    /// verify (logs present); tables whose covered logs were already cleaned are skipped, not counted.
+    uint64_t snapshot_oracle_mismatches = 0;
+    uint64_t snapshot_oracle_checked = 0;
+
     uint64_t physical_bytes = 0;
     uint64_t referenced_logical_bytes = 0;
     uint64_t total_blob_refs = 0;
@@ -71,7 +81,7 @@ struct FsckReport
     std::vector<FsckObject> objects;
 
     double dedupRatio() const { return distinct_blobs ? double(total_blob_refs) / double(distinct_blobs) : 0.0; }
-    bool clean() const { return dangling == 0 && meta_without_body == 0; }
+    bool clean() const { return dangling == 0 && meta_without_body == 0 && snapshot_oracle_mismatches == 0; }
 };
 
 /// Independent reachability check: recompute reachability from the authoritative refs (NEVER from

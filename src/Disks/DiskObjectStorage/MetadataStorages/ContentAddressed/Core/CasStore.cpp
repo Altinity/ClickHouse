@@ -44,6 +44,9 @@ namespace ProfileEvents
     extern const Event CasRefAppendUnwedged;
     extern const Event CasRefAppendDefiniteFailure;
     extern const Event CasRefSweepDeferred;
+    extern const Event CasRefTableEvictions;
+    extern const Event CasRefSnapshotPutBytes;
+    extern const Event CasRefSnapshotTailLogs;
 }
 
 namespace DB::Cas
@@ -949,7 +952,11 @@ void Store::ensureRefTableRecovered(const RootNamespace & ns, RefTableRuntime & 
     /// correct, not a missed-concurrency opportunity -- and this only affects each table's FIRST touch
     /// per mounted Store (spec §Startup And Recovery: "one LIST ... cache the resulting complete table
     /// state").
+    {
     std::lock_guard lock(rt.state_mutex);
+    /// Whole-table LRU stamp (spec §Byte, Memory, And CPU Budget): every touch -- warm or cold --
+    /// marks this table most-recently-used so `enforceRefTableCacheBudget` evicts idle tables first.
+    rt.last_touch_tick = ref_table_access_tick.fetch_add(1, std::memory_order_relaxed) + 1;
     if (rt.recovered)
         return;
 
@@ -1010,13 +1017,17 @@ void Store::ensureRefTableRecovered(const RootNamespace & ns, RefTableRuntime & 
 
         bool vanished = false;
         std::optional<RefTableSnapshot> snapshot;
+        uint64_t snapshot_body_bytes = 0;   /// weight of the recovered base (spec §Byte Budget); 0 = never-born base
         if (greatest_snapshot)
         {
             const auto got = pool_backend->get(pool_layout.refSnapshotKey(ns, *greatest_snapshot));
             if (!got)
                 vanished = true;   /// covered by a newer snapshot published-before-delete; restart
             else
+            {
                 snapshot = decodeRefTableSnapshot(got->bytes, ns.string(), *greatest_snapshot);
+                snapshot_body_bytes = got->bytes.size();
+            }
         }
 
         std::vector<RefLogTxn> tail;
@@ -1069,8 +1080,88 @@ void Store::ensureRefTableRecovered(const RootNamespace & ns, RefTableRuntime & 
         const uint64_t overhead = 4 + ns.string().size() + kRefAdmissionSafetyMargin;
         rt.snapshot_budget = overhead < ref_snapshot_max_bytes ? ref_snapshot_max_bytes - overhead : 0;
         rt.removal_budget = overhead < ref_removal_max_bytes ? ref_removal_max_bytes - overhead : 0;
-        return;
+
+        /// Cache-weight base (spec §Byte, Memory, And CPU Budget): the encoded body size of the recovered
+        /// base snapshot, captured for free from the GET above. The tail bytes are tracked separately in
+        /// `tail_bytes_since_snapshot`; the two sum to this table's estimated resident weight.
+        rt.base_snapshot_bytes = snapshot_body_bytes;
+        break;
     }
+    }
+
+    /// A NEW table was just materialized; enforce the whole-table cache budget, protecting this one
+    /// (spec §Byte, Memory, And CPU Budget). Runs OUTSIDE `rt.state_mutex` (that scope closed above) so
+    /// the pass -- which acquires `ref_queue_mutex` and try-locks other tables' `state_mutex` -- never
+    /// nests this table's `state_mutex` under `ref_queue_mutex`.
+    enforceRefTableCacheBudget(ns);
+}
+
+void Store::enforceRefTableCacheBudget(const RootNamespace & keep_ns)
+{
+    if (config.ref_table_cache_bytes == 0)
+        return;   /// 0 = unbounded: eviction disabled
+
+    /// Evicted runtimes are held alive here until AFTER every lock is released, so a runtime whose sole
+    /// owner is its map slot is never destroyed while we still hold its `state_mutex` (that would destroy
+    /// a locked mutex).
+    std::vector<std::shared_ptr<RefTableRuntime>> evicted;
+    {
+        std::lock_guard<std::mutex> qlock(ref_queue_mutex);
+
+        const auto weightOf = [](const RefTableRuntime & rt)
+        { return rt.base_snapshot_bytes + rt.tail_bytes_since_snapshot; };
+
+        uint64_t total = 0;
+        for (const auto & [name, rt] : ref_tables)
+            total += weightOf(*rt);
+        if (total <= config.ref_table_cache_bytes)
+            return;
+
+        /// Idle candidates, least-recently-touched first. Idle == the map holds the SOLE `shared_ptr`
+        /// (`use_count() == 1`: no in-flight caller, queued append, leader, or background publish holds a
+        /// copy), no active queue leader, an empty pending queue, and not the just-recovered `keep_ns`.
+        /// The `use_count() == 1` gate is what makes append-lane split-brain impossible: any thread that
+        /// fetched this runtime keeps it non-evictable for as long as it holds the copy.
+        struct Cand { String name; uint64_t tick; uint64_t weight; };
+        std::vector<Cand> cands;
+        for (const auto & [name, rt] : ref_tables)
+        {
+            if (name == keep_ns.string())
+                continue;
+            if (rt.use_count() != 1 || rt->leader_active || !rt->pending.empty())
+                continue;
+            cands.push_back(Cand{name, rt->last_touch_tick, weightOf(*rt)});
+        }
+        std::sort(cands.begin(), cands.end(),
+                  [](const Cand & a, const Cand & b) { return a.tick < b.tick; });
+
+        for (const Cand & c : cands)
+        {
+            if (total <= config.ref_table_cache_bytes)
+                break;
+            auto it = ref_tables.find(c.name);
+            if (it == ref_tables.end())
+                continue;
+            std::shared_ptr<RefTableRuntime> & rt = it->second;
+            {
+                /// `use_count() == 1` guarantees no other thread holds the runtime, so this try_lock
+                /// cannot fail; the RAII scope releases `state_mutex` before `rt` is moved out. A wedged
+                /// append lane is never evicted -- its uncertain in-flight PUT is not reconstructable from
+                /// the durable objects, and re-recovery could re-allocate an id (spec §Writer-Side
+                /// Linearization forbids this).
+                std::unique_lock<std::mutex> slock(rt->state_mutex, std::try_to_lock);
+                if (!slock.owns_lock() || rt->wedge.has_value())
+                    continue;
+            }
+            if (rt.use_count() != 1 || rt->leader_active || !rt->pending.empty())
+                continue;   /// re-check under the still-held ref_queue_mutex
+            total -= c.weight;
+            evicted.push_back(std::move(rt));   /// keep alive past the erase and lock release
+            ref_tables.erase(it);
+            ProfileEvents::increment(ProfileEvents::CasRefTableEvictions);
+        }
+    }
+    /// `evicted` destructs the dropped runtimes here, with no lock held.
 }
 
 uint64_t Store::refRecoveryRestartsForTest(const RootNamespace & ns)
@@ -1624,6 +1715,7 @@ bool Store::trySnapshotPublishOnce(const RootNamespace & ns)
     const CasWriteOutcome outcome = ref_request_controller->putIfAbsentControlled(key, bytes, fence_ok);
     if (outcome != CasWriteOutcome::Committed)
         return false;   /// DefiniteFailure/Unresolved: leave everything as-is; a later trigger retries
+    ProfileEvents::increment(ProfileEvents::CasRefSnapshotPutBytes, bytes.size());   /// spec §writer-snapshot-publication
 
     {
         std::lock_guard lock(rt->state_mutex);
@@ -1653,8 +1745,13 @@ bool Store::trySnapshotPublishOnce(const RootNamespace & ns)
         rt->tail_since_snapshot.erase(rt->tail_since_snapshot.begin(),
             rt->tail_since_snapshot.begin() + static_cast<ptrdiff_t>(prune_upto));
         rt->tail_bytes_since_snapshot -= pruned_bytes;
+        /// logs-per-table-after-snapshot (spec §implementation-impact): the tail this publish compacted.
+        ProfileEvents::increment(ProfileEvents::CasRefSnapshotTailLogs, prune_upto);
         rt->snapshot_base_state = std::move(candidate_state);
         rt->newest_snapshot_id = candidate_x;
+        /// Cache-weight base (spec §Byte, Memory, And CPU Budget): the new base is exactly the snapshot
+        /// we just encoded and PUT, so its body size is the fresh base weight -- no re-encode needed.
+        rt->base_snapshot_bytes = bytes.size();
     }
     return true;
 }

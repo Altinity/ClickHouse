@@ -760,6 +760,14 @@ The server successfully detected this situation and will download merged part fr
     M(CasRefAppendUnwedged, "CA ref-log append lane unwedges: a previously uncertain PUT was later observed durable", ValueType::Number) \
     M(CasRefAppendDefiniteFailure, "CA ref-log append attempts conclusively rejected (safe id gap, cache unchanged)", ValueType::Number) \
     M(CasRefSweepDeferred, "CA stale-precommit sweep failures deferred by a read-only caller (resolveRef/listRefs): the read still succeeded; a later mutation or mount retries the sweep", ValueType::Number) \
+    M(CasRefTableEvictions, "CA whole-table ref-cache evictions forced by the ref_table_cache_bytes budget (the table re-recovers from its snapshot+log objects on next touch)", ValueType::Number) \
+    M(CasRefGlobalListPages, "CA ref intake: global cas/refs/ LIST pages fetched by the GC round's single enumeration (spec §Step 1 / §GC Budget Q)", ValueType::Number) \
+    M(CasRefLogBodyGets, "CA ref intake: ref-log transaction-body GETs decoded during the GC fold (spec §Step 2 / §GC Budget K)", ValueType::Number) \
+    M(CasRefManifestBodyFoldGets, "CA ref intake: manifest-body GETs the reachability fold performed for ref edges (spec §GC Budget H, manifest-body cache misses)", ValueType::Number) \
+    M(CasRefEmittedEdges, "CA ref intake: manifest-edge events emitted from ref-log owner transitions during the fold (spec §Step 3)", ValueType::Number) \
+    M(CasRefCleanupObjectsDeleted, "CA ref intake: old ref log/snapshot objects deleted by ref-object cleanup once snapshot+cursor coverage is durable (spec §Step 6 / §GC Budget D)", ValueType::Number) \
+    M(CasRefSnapshotPutBytes, "CA writer: bytes of table snapshots PUT by threshold/mount-time publication (spec §writer-snapshot-publication)", ValueType::Bytes) \
+    M(CasRefSnapshotTailLogs, "CA writer: tail logs compacted into a published table snapshot (logs-per-table-after-snapshot; spec §implementation-impact)", ValueType::Number) \
     M(CasGcClampSuppressedPasses, "CA GC passes whose fold clamped a shard: graduations and pending deletes were suppressed (carried) to preserve the ack-floor lemma", ValueType::Number) \
     M(CasBlobGet,        "CA blob get S3 ops", ValueType::Number) \
     M(CasBlobGetStream,  "CA blob get-stream S3 ops", ValueType::Number) \
@@ -792,7 +800,6 @@ The server successfully detected this situation and will download merged part fr
     M(CasGcOverwrite,    "CA gc overwrite S3 ops", ValueType::Number) \
     M(CasGcCas,          "CA gc cas S3 ops", ValueType::Number) \
     M(CasGcRetireReplaced, "CA gc re-condemns of a resurrect-replaced incarnation (the current object token differed from a prior retired entry; the stale entry was superseded)", ValueType::Number) \
-    M(CasGcPrecommitRevisitForced, "CA gc forced re-folds of an otherwise-Skip (token-stable) ref-shard because it holds a live precommit the namespace watermark has proven dead — so reclaimAbandonedPrecommit runs and its orphaned manifest is reclaimed", ValueType::Number) \
     M(CasGcCasConflict,  "CA gc cas-conflict S3 ops", ValueType::Number) \
     M(CasGcHead,         "CA gc head S3 ops", ValueType::Number) \
     M(CasGcHeadMiss,     "CA gc head-miss S3 ops", ValueType::Number) \

@@ -69,6 +69,8 @@ public:
         std::cout << "reachable=" << report.reachable << " dangling=" << report.dangling << " unreachable=" << report.unreachable
                   << " pending_gc=" << report.pending_gc << " awaiting_gc=" << report.awaiting_gc
                   << " unaccounted=" << report.unaccounted
+                  << " snapshot_oracle_mismatches=" << report.snapshot_oracle_mismatches
+                  << " snapshot_oracle_checked=" << report.snapshot_oracle_checked
                   << " physical_bytes=" << report.physical_bytes << " referenced_logical_bytes=" << report.referenced_logical_bytes
                   << " distinct_blobs=" << report.distinct_blobs << " total_blob_refs=" << report.total_blob_refs
                   << " dedup_ratio=" << report.dedupRatio();
@@ -101,6 +103,7 @@ public:
                     case Cas::FsckClass::PendingGc:   c = "pending-gc"; break;
                     case Cas::FsckClass::AwaitingGc:  c = "awaiting-gc"; break;
                     case Cas::FsckClass::Unaccounted: c = "unaccounted"; break;
+                    case Cas::FsckClass::SnapshotOracleMismatch: c = "snapshot-oracle-mismatch"; break;
                 }
                 std::cout << c << "\t" << o.key << "\t" << o.size;
                 for (const auto & r : o.reachable_from)
@@ -112,6 +115,11 @@ public:
         if (report.dangling > 0)
             throw Exception(
                 ErrorCodes::BAD_ARGUMENTS, "fsck: {} reachable object(s) MISSING (INV-NO-LOSS violation)", report.dangling);
+        if (report.snapshot_oracle_mismatches > 0)
+            throw Exception(
+                ErrorCodes::BAD_ARGUMENTS,
+                "fsck: {} table snapshot(s) diverge from an independent replay of their logs "
+                "(cache/codec corruption, spec §Snapshot Publication oracle)", report.snapshot_oracle_mismatches);
     }
 };
 

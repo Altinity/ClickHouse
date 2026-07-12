@@ -12,6 +12,7 @@
 #include <Common/Exception.h>
 #include <Common/HashTable/Hash.h>
 
+#include <algorithm>
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
@@ -127,6 +128,115 @@ bool blobStillReferenced(Store & store, const Layout & layout,
     return false;   /// every label re-resolved away (re-published or dropped) — a stale-walk artifact
 }
 
+/// Snapshot integrity oracle (spec §Snapshot Publication: "the published object doubles as an integrity
+/// oracle: fsck recomputes the replay and compares bytes. A divergence is corruption of the cache or the
+/// codec and fails closed."). For the newest published snapshot `X` of `ns`, independently reconstruct
+/// the table state AT `X` from an EARLIER base (the greatest snapshot below `X`, or the empty state) plus
+/// the surviving logs in `(base, X]`, re-encode it deterministically, and byte-compare to the published
+/// `X` object. Byte-determinism of the codec (canonical sort, verified in the codec's own gtests) makes
+/// the comparison exact.
+///
+/// The check runs ONLY when every log needed for the independent reconstruction still survives. `X` reuses
+/// its last covered log's id, so `X` itself is a log id; once `GC` folds and covers those logs it deletes
+/// them, after which there is nothing independent left to replay from -- such a table is SKIPPED, never
+/// failed. A selected object that vanishes mid-check (a concurrent `GC` cleanup published a covering newer
+/// snapshot) is likewise a skip, exactly like recovery's restart-on-vanish -- never corruption. This
+/// oracle therefore validates freshly-published snapshots and any table whose `GC` cleanup is still
+/// behind; it uses only the shared `replay`/`snapshotOf` state machine, never a second copy.
+void checkSnapshotOracle(Backend & backend, const Layout & layout, const RootNamespace & ns,
+                         bool detail, const Deadline & deadline, FsckReport & report)
+{
+    checkDeadline(deadline, "snapshot oracle");
+
+    /// One LIST of the table prefix; gather snapshot and log ids.
+    std::vector<RefTxnId> snap_ids;
+    std::vector<RefTxnId> log_ids;
+    String cursor;
+    for (;;)
+    {
+        const ListPage page = backend.list(layout.refsNamespacePrefix(ns), cursor, 1000);
+        for (const ListedKey & lk : page.keys)
+        {
+            const auto parsed = layout.parseRefObjectKey(lk.key);
+            if (!parsed || parsed->ns != ns)
+                continue;
+            if (parsed->kind == RefObjectKind::Snap)
+                snap_ids.push_back(parsed->txn_id);
+            else if (parsed->kind == RefObjectKind::Log)
+                log_ids.push_back(parsed->txn_id);
+        }
+        if (page.next_cursor.empty())
+            break;
+        cursor = page.next_cursor;
+    }
+    if (snap_ids.empty())
+        return;   /// no published snapshot: recovering from logs alone is valid, nothing to oracle
+    std::sort(snap_ids.begin(), snap_ids.end());
+    std::sort(log_ids.begin(), log_ids.end());
+
+    const RefTxnId snapshot_x = snap_ids.back();
+    const auto got_x = backend.get(layout.refSnapshotKey(ns, snapshot_x));
+    if (!got_x)
+        return;   /// vanished (a covering newer snapshot superseded it): restart-on-vanish -> skip
+
+    /// X reuses its last covered log's id, so X is itself a log id. Once GC covers and cleans that log
+    /// (the steady state on a caught-up pool), the state AT X cannot be independently reconstructed from
+    /// logs -- skip, never fail. This also guards against replaying an empty tail into a {0,0} state.
+    if (!std::binary_search(log_ids.begin(), log_ids.end(), snapshot_x))
+        return;
+
+    /// Independent base: the greatest snapshot strictly below X we can still fetch, else the empty state.
+    std::optional<RefTableSnapshot> base;
+    RefTxnId base_id{};   /// {0,0} = empty base
+    for (auto it = snap_ids.rbegin(); it != snap_ids.rend(); ++it)
+    {
+        if (!(*it < snapshot_x))
+            continue;   /// X itself or anything not strictly below it
+        const auto got_base = backend.get(layout.refSnapshotKey(ns, *it));
+        if (!got_base)
+            continue;   /// vanished; try the next older snapshot
+        base = decodeRefTableSnapshot(got_base->bytes, ns.string(), *it);
+        base_id = *it;
+        break;
+    }
+
+    /// Logs in (base_id, X]. X reuses its last log's id, so X itself is a log id here: if its log -- or any
+    /// covered log above the base -- was already cleaned, the independent reconstruction is unavailable.
+    std::vector<RefLogTxn> tail;
+    for (const RefTxnId & id : log_ids)
+    {
+        if (!(base_id < id))
+            continue;   /// <= base: already folded into the base snapshot
+        if (snapshot_x < id)
+            continue;   /// > X: not part of the state AT X
+        checkDeadline(deadline, "snapshot oracle");
+        const auto got_log = backend.get(layout.refLogKey(ns, id));
+        if (!got_log)
+            return;   /// a covered log was cleaned/vanished: oracle unavailable for X -> skip, not error
+        tail.push_back(decodeRefLogTxn(got_log->bytes, ns.string(), id));
+    }
+
+    /// Reconstruct the state AT X and re-encode. `replay` revalidates the base snapshot in full and applies
+    /// the tail through the SAME state machine the writer used; the last applied id is X, so `snapshotOf`
+    /// yields a snapshot with id X whose bytes must equal the published object.
+    const RefTableState reconstructed = replay(base, tail);
+    const String recomputed = encodeRefTableSnapshot(snapshotOf(reconstructed, ns.string()));
+    ++report.snapshot_oracle_checked;
+    if (recomputed != got_x->bytes)
+    {
+        ++report.snapshot_oracle_mismatches;
+        FsckObject o;
+        o.key = layout.refSnapshotKey(ns, snapshot_x);
+        o.kind = ObjectKind::Blob;   /// snapshots have no ObjectKind; reuse Blob as the generic kind
+        o.size = got_x->bytes.size();
+        o.cls = FsckClass::SnapshotOracleMismatch;
+        if (detail)
+            o.reachable_from = {"published snapshot bytes diverge from an independent replay of its logs "
+                                "(writer cache or codec corruption)"};
+        report.objects.push_back(std::move(o));
+    }
+}
+
 void runFsckImpl(Store & store, bool detail, const FsckProgress & on_progress, const Deadline & deadline,
                   const String & namespace_prefix, FsckReport & report)
 {
@@ -155,6 +265,11 @@ void runFsckImpl(Store & store, bool detail, const FsckProgress & on_progress, c
         /// FRESH recovery (LIST + replay), NOT the mounted Store's cached `listRefs`: fsck is a read-only
         /// audit that must see the authoritative durable ref state, including any external write.
         const RefTableState table = recoverRefTable(backend, layout, ns);
+        /// Snapshot integrity oracle (spec §Snapshot Publication): verify this table's newest published
+        /// snapshot is byte-identical to an independent replay of its own logs. Fails closed (records a
+        /// mismatch, making the report not `clean()`) on a genuine divergence; skips silently when the
+        /// covered logs were already cleaned or an object vanished mid-check.
+        checkSnapshotOracle(backend, layout, ns, detail, deadline, report);
         for (const auto & [ref_name, row] : table.committed)
         {
             const ManifestId id{ns, row.manifest_ref};

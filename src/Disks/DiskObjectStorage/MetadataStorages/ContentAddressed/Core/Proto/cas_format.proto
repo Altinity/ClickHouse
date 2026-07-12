@@ -173,9 +173,11 @@ message FoldShardCoverageProto {
   uint64 folded_cursor      = 5;
   uint64 incarnation_writer_epoch   = 6;  // ShardIncarnation.writer_epoch; 0 = unstamped
   uint64 incarnation_build_sequence = 7;  // ShardIncarnation.build_sequence; 0 = unstamped
-  bool   has_live_precommit                 = 8;  // shard holds >=1 live (un-promoted, un-removed) precommit
-  uint64 min_live_precommit_writer_epoch    = 9;  // lexicographically-min live precommit writer_epoch
-  uint64 min_live_precommit_build_sequence  = 10; // lexicographically-min live precommit build_sequence
+  // 8/9/10 were the live-precommit watermark fields (has_live_precommit,
+  // min_live_precommit_{writer_epoch,build_sequence}) that fed the removed GC-side abandoned-precommit
+  // reclaim; the snapshot+log writer removes stale precommits itself, so they are gone (T13). Field
+  // numbers reserved so they are never reused for an incompatible meaning.
+  reserved 8, 9, 10;
   // Snapshot+log ref model (spec §GC State): last_folded_ref_id = greatest RefTxnId whose owner changes
   // this table already folded. Replaces folded_cursor for ref intake; per table (shard fixed at 0).
   uint64 last_folded_ref_epoch    = 11;  // RefTxnId.writer_epoch; 0 = nothing folded

@@ -161,7 +161,7 @@ struct PoolConfig
     uint64_t manifest_sweep_delete_budget_keys = 100;
     /// B12 lazy-trim: compact a root shard's journal ONLY when at least this many events lie at/below
     /// the sealed fold cursor (batch gate), OR the encoded shard body is at/above
-    /// `gc_trim_body_soft_limit` (soft-cap gate), OR `Gc::setMaintenanceTrimForTest(true)` is set.
+    /// `gc_trim_body_soft_limit` (soft-cap gate).
     /// The two hard gates guarantee bounded journal growth: a shard that accumulates enough events or
     /// grows large enough is ALWAYS compacted regardless of batch size. 0 disables the batch gate
     /// (compact on >= 1 event — the previous eager behaviour, useful for tests).
@@ -235,6 +235,18 @@ struct PoolConfig
     /// per-key last-modified timestamp (`ListedKey` has none) -- conservative: it can only DELAY a
     /// replayed log's eligibility, never advance it prematurely.
     uint64_t snapshot_min_log_age_ms = 5000;
+
+    /// Task 13 (spec §Byte, Memory, And CPU Budget): resident-memory ceiling for the writer's
+    /// whole-table ref cache (`Store::ref_tables`). Phase 1 has no row overlay, so eviction is
+    /// WHOLE-TABLE: when the summed estimated weight of cached tables exceeds this, whole tables are
+    /// dropped (never rows) and the next touch re-recovers them from the durable snapshot+log objects
+    /// (spec §Startup And Recovery: "Evicting the table drops the entire object; the next access repeats
+    /// recovery"). A table with a wedged append lane, a nonempty pending queue, or any in-flight
+    /// caller/publish (its un-persisted lane/queue state is not reconstructable) is never evicted, and
+    /// neither is the table whose recovery just triggered the pass -- so the effective floor is one
+    /// table. 0 = unbounded (eviction disabled). The estimate is the base snapshot body size plus the
+    /// retained log-tail bytes; both are already tracked, so a mutation costs no extra encode.
+    uint64_t ref_table_cache_bytes = 256ULL << 20;   /// 256 MiB
 };
 
 struct Resolved
@@ -625,6 +637,15 @@ private:
         /// a snapshot published) -- the base every `tail_since_snapshot` entry replays forward from.
         RefTableState snapshot_base_state;
         std::optional<RefTxnId> newest_snapshot_id;
+        /// Task 13 (spec §Byte, Memory, And CPU Budget): whole-table cache-weight bookkeeping for
+        /// `enforceRefTableCacheBudget`. `base_snapshot_bytes` is the encoded body size of
+        /// `snapshot_base_state`'s snapshot (0 for a never-born base), captured for free from the
+        /// recovered/published snapshot body -- refreshed only when the base changes (recovery + each
+        /// publish), never per mutation. The estimated resident weight is
+        /// `base_snapshot_bytes + tail_bytes_since_snapshot`. `last_touch_tick` is the monotonic access
+        /// stamp (`Store::ref_table_access_tick`) used to evict least-recently-touched tables first.
+        uint64_t base_snapshot_bytes = 0;
+        uint64_t last_touch_tick = 0;
         /// Cleared to false once a stale-precommit sweep has been dispatched for this table this mount
         /// (spec §Clean Up Old Precommits); set true by recovery. `appendRefOps`'s top level checks it
         /// before every call, cheaply, so it fires exactly once per table per mount.
@@ -647,6 +668,9 @@ private:
 
     std::mutex ref_queue_mutex;
     std::map<String, std::shared_ptr<RefTableRuntime>> ref_tables;
+    /// Task 13 (spec §Byte, Memory, And CPU Budget): monotonic access stamp for whole-table cache LRU
+    /// eviction; bumped on every table touch, recorded in `RefTableRuntime::last_touch_tick`.
+    std::atomic<uint64_t> ref_table_access_tick{0};
 
     /// Store-wide strictly-increasing counter (spec §Ordered Ref Transaction Identifier): shared by
     /// every table of this mounted writer; a fresh writer_epoch (a new Store) restarts it at one.
@@ -667,6 +691,18 @@ private:
     /// performs the actual one-`LIST`-plus-tail-`GET`s recovery, idempotently, under `rt->state_mutex`.
     std::shared_ptr<RefTableRuntime> getRefTableRuntime(const RootNamespace & ns);
     void ensureRefTableRecovered(const RootNamespace & ns, RefTableRuntime & rt);
+
+    /// Task 13 (spec §Byte, Memory, And CPU Budget): whole-table cache-budget enforcement, called right
+    /// after a NEW table is materialized in `ensureRefTableRecovered`. When the summed estimated weight
+    /// of cached tables exceeds `config.ref_table_cache_bytes` (0 = disabled), it drops whole tables,
+    /// least-recently-touched first, until back under budget. A table is evictable only when it is
+    /// IDLE -- its map slot holds the sole `shared_ptr` (`use_count() == 1`, so no in-flight caller,
+    /// queued append, or background publish holds it), it has no active queue leader or pending item,
+    /// and (checked under its own `state_mutex`) no wedged append lane. `keep_ns` (the table whose
+    /// recovery triggered this pass) is never evicted. The `use_count() == 1` gate is the load-bearing
+    /// one: it makes eviction of a runtime any caller currently holds impossible, so the ref-append
+    /// lane can never split-brain across an old (evicted) and a fresh runtime for one table.
+    void enforceRefTableCacheBudget(const RootNamespace & keep_ns);
 
     /// Leader loop / one flush for the ref-log append lane (recovery, wedge resolution, per-item
     /// validation, admission budget, the controlled `PUT`, and applying the committed transaction to
@@ -746,6 +782,21 @@ public:
         std::lock_guard<std::mutex> g(ref_queue_mutex);
         const auto it = ref_tables.find(ns.string());
         return it == ref_tables.end() ? 0 : it->second->pending.size();
+    }
+
+    /// Task 13 cache-eviction test seams: how many whole ref tables are cached right now, and whether a
+    /// specific table's runtime is currently materialized (recovered) in the cache -- a table that was
+    /// evicted reports false until its next touch re-recovers it.
+    size_t refTablesCachedCountForTest()
+    {
+        std::lock_guard<std::mutex> g(ref_queue_mutex);
+        return ref_tables.size();
+    }
+    bool refTableCachedForTest(const RootNamespace & ns)
+    {
+        std::lock_guard<std::mutex> g(ref_queue_mutex);
+        const auto it = ref_tables.find(ns.string());
+        return it != ref_tables.end() && it->second->recovered;
     }
 
 private:

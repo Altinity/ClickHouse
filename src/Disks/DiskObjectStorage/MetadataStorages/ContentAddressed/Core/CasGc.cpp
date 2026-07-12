@@ -29,9 +29,13 @@ namespace ProfileEvents
     extern const Event CasGcRetiredGraduated;
     extern const Event CasGcRetiredRedeleted;
     extern const Event CasGcRetireReplaced;
-    extern const Event CasGcPrecommitRevisitForced;
     extern const Event CasGcHeartbeatFenceOuts;
     extern const Event CasGcMetaWriteAnomaly;
+    extern const Event CasRefGlobalListPages;
+    extern const Event CasRefLogBodyGets;
+    extern const Event CasRefManifestBodyFoldGets;
+    extern const Event CasRefEmittedEdges;
+    extern const Event CasRefCleanupObjectsDeleted;
 }
 
 namespace CurrentMetrics
@@ -650,6 +654,7 @@ bool Gc::foldManifestEdges(const ManifestId & id, int sign, std::vector<BlobDelt
     const auto got = backend.get(key);
     if (!got)
         return false;   /// raced delete between HEAD and GET — record-and-continue (never throw on a 404)
+    ProfileEvents::increment(ProfileEvents::CasRefManifestBodyFoldGets);   /// spec §GC Budget H
 
     const PartManifest body = decodePartManifest(got->bytes);
     if (!refMatchesBody(id.ref, body))
@@ -732,6 +737,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         for (;;)
         {
             const ListPage page = backend.list(refs_prefix, list_cursor, 1000);
+            ProfileEvents::increment(ProfileEvents::CasRefGlobalListPages);
             for (const ListedKey & lk : page.keys)
                 ref_object_keys.push_back(lk.key);
             if (page.next_cursor.empty())
@@ -944,6 +950,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
                                      "ref log body vanished mid-fold: ref folding aborted this round");
                 break;
             }
+            ProfileEvents::increment(ProfileEvents::CasRefLogBodyGets);   /// spec §GC Budget K: one body GET per new log
             RefLogTxn txn;
             try
             {
@@ -964,6 +971,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             /// next round. A removed precommit whose body never existed emitted no edge -- skip, no clamp.
             for (const RefManifestEdge & edge : manifestEdgesOfTxn(txn))
             {
+                ProfileEvents::increment(ProfileEvents::CasRefEmittedEdges);   /// spec §Step 3: one manifest-edge event
                 if (foldManifestEdges(edge.manifest_id, edge.change, deltas, result.mf_cleanup))
                     continue;
 
@@ -1281,7 +1289,10 @@ void Gc::cleanupRefObjects(const FoldResult & folded, bool suppress_destructive)
     {
         const HeadResult h = backend.head(key);
         if (h.exists)
+        {
             backend.deleteExact(key, h.token);
+            ProfileEvents::increment(ProfileEvents::CasRefCleanupObjectsDeleted);   /// spec §GC Budget D
+        }
     };
 
     for (const auto & [ns_str, listing] : folded.ref_tables)

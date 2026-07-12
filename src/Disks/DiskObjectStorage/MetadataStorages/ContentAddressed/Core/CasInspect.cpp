@@ -348,9 +348,7 @@ String renderShardCoverage(const ShardCoverage & c)
         .add("folded_token", renderToken(c.folded_token))
         .add("folded_cursor", jsonUInt(c.folded_cursor))
         .add("incarnation", renderShardIncarnation(c.incarnation))
-        .add("has_live_precommit", jsonBool(c.has_live_precommit))
-        .add("min_live_precommit_writer_epoch", jsonUInt(c.min_live_precommit_writer_epoch))
-        .add("min_live_precommit_build_sequence", jsonUInt(c.min_live_precommit_build_sequence))
+        .add("last_folded_ref_id", renderRefTxnIdObj(c.last_folded_ref_id))
         .str();
 }
 

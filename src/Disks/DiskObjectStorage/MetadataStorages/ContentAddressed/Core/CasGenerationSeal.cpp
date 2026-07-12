@@ -72,9 +72,6 @@ String encodeFoldSeal(const CasFoldSeal & seal)
         e->set_folded_cursor(cov.folded_cursor);
         e->set_incarnation_writer_epoch(cov.incarnation.writer_epoch);
         e->set_incarnation_build_sequence(cov.incarnation.build_sequence);
-        e->set_has_live_precommit(cov.has_live_precommit);
-        e->set_min_live_precommit_writer_epoch(cov.min_live_precommit_writer_epoch);
-        e->set_min_live_precommit_build_sequence(cov.min_live_precommit_build_sequence);
         e->set_last_folded_ref_epoch(cov.last_folded_ref_id.writer_epoch);
         e->set_last_folded_ref_sequence(cov.last_folded_ref_id.ref_sequence);
     }
@@ -125,10 +122,7 @@ CasFoldSeal decodeFoldSeal(std::string_view data)
             .folded_token = Token{e.folded_token_value(), static_cast<TokenType>(e.folded_token_type())},
             .folded_cursor = e.folded_cursor(),
             .incarnation = ShardIncarnation{e.incarnation_writer_epoch(), e.incarnation_build_sequence()},
-            .last_folded_ref_id = RefTxnId{e.last_folded_ref_epoch(), e.last_folded_ref_sequence()},
-            .has_live_precommit = e.has_live_precommit(),
-            .min_live_precommit_writer_epoch = e.min_live_precommit_writer_epoch(),
-            .min_live_precommit_build_sequence = e.min_live_precommit_build_sequence()};
+            .last_folded_ref_id = RefTxnId{e.last_folded_ref_epoch(), e.last_folded_ref_sequence()}};
     readRuns(msg.blob_target_runs(), seal.blob_target_runs);
     readRuns(msg.part_manifest_cleanup(), seal.part_manifest_cleanup);
     for (const auto & e : msg.condemned_summary())

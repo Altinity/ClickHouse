@@ -173,13 +173,6 @@ public:
     /// blob in-degree). Production never calls this; trim is always enabled.
     void setTrimEnabledForTest(bool enabled) { trim_enabled = enabled; }
 
-    /// B12 lazy-trim TEST SEAM: enable maintenance (full-compaction) mode for the next round.
-    /// When true, trim ignores the event-count and body-size thresholds and compacts every shard that
-    /// has any trimmable events (the pre-B12 eager behaviour). Cleared to false after each round so
-    /// each test call arms exactly one round. Production never calls this; maintenance mode is driven
-    /// externally (e.g. by a scheduled maintenance task, not yet wired).
-    void setMaintenanceTrimForTest(bool enabled) { maintenance_trim = enabled; }
-
     /// (GC-side abandoned-precommit reclaim was removed with the snapshot+log ref model: dead-precommit
     /// cleanup is now the writer's job -- it appends exact `owner_transition` removals in ref logs, spec
     /// §Failed Precommit Cleanup / §Clean Up Old Precommits. `GC` never invents a ref transition.)
@@ -347,7 +340,6 @@ private:
     uint64_t rebuild_edge_budget_override = 0;   /// tests force tiny batches
     std::function<uint64_t()> now_ms_fn;   /// wall-clock ms; injected (tests), defaults to system_clock              /// this leader's identity (random u128, never 0)
     bool trim_enabled = true;     /// TEST SEAM ONLY (M1): production always trims; see setTrimEnabledForTest
-    bool maintenance_trim = false; /// B12 TEST SEAM: bypass lazy-trim thresholds for one round (full compaction); see setMaintenanceTrimForTest
     /// Phase-4 skip-unchanged (spec 2026-07-06): leader-local, in-memory count of consecutive DEFERRED
     /// rounds since the last FOLD. NOT persisted (a fresh/stolen leader starts at 0 -- conservative:
     /// it may fold one round sooner than a long-lived leader would, never later). Reset to 0 whenever

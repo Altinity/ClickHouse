@@ -54,14 +54,6 @@ struct ShardCoverage
     /// stays a vestigial 0 under the new model.
     RefTxnId last_folded_ref_id{};
 
-    /// The lexicographically-minimal {writer_epoch, build_sequence} among this shard's LIVE precommit
-    /// owner bindings (un-promoted, un-removed) at fold time; has_live_precommit == false when there are
-    /// none. Consumed by computeDiscoverDecisions to force a re-fold once the watermark proves this
-    /// precommit dead, so reclaimAbandonedPrecommit runs even on an otherwise token-stable (Skip) shard.
-    bool has_live_precommit = false;
-    uint64_t min_live_precommit_writer_epoch = 0;
-    uint64_t min_live_precommit_build_sequence = 0;
-
     bool operator==(const ShardCoverage &) const = default;
 };
 

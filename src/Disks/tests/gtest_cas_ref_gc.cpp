@@ -7,6 +7,8 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include "cas_test_helpers.h"
 
+#include <Common/ProfileEvents.h>
+
 #include <set>
 
 /// Task 12 required GC tests over the snapshot+log ref model (spec 2026-07-11-cas-ref-table-snapshot-log-design).
@@ -20,6 +22,15 @@ using namespace DB::Cas::tests;
 namespace DB::ErrorCodes
 {
 extern const int CORRUPTED_DATA;
+}
+
+namespace ProfileEvents
+{
+extern const Event CasRefGlobalListPages;
+extern const Event CasRefLogBodyGets;
+extern const Event CasRefManifestBodyFoldGets;
+extern const Event CasRefEmittedEdges;
+extern const Event CasRefCleanupObjectsDeleted;
 }
 
 namespace
@@ -294,6 +305,44 @@ TEST(CasRefGc, RefObjectCleanupHonorsAllThreeConditions)
     /// the older snapshot (< newest) is deleted; the newest is retained.
     EXPECT_FALSE(backend->head(old_snap_key).exists) << "an older snapshot must be deleted";
     EXPECT_TRUE(backend->head(new_snap_key).exists) << "the newest snapshot must be retained";
+}
+
+/// Task 13 (spec §implementation-impact / §GC Budget): one fold+clean round increments every ref-intake
+/// observability counter -- global LIST pages (Q), log-body GETs (K), manifest-body fold GETs (H), emitted
+/// manifest edges, and cleaned old ref objects (D). Before/after deltas prove each site actually fires.
+TEST(CasRefGc, RefIntakeIncrementsObservabilityCounters)
+{
+    using ProfileEvents::global_counters;
+    const auto list_pages_before = global_counters[ProfileEvents::CasRefGlobalListPages].load();
+    const auto log_gets_before   = global_counters[ProfileEvents::CasRefLogBodyGets].load();
+    const auto mf_gets_before    = global_counters[ProfileEvents::CasRefManifestBodyFoldGets].load();
+    const auto edges_before      = global_counters[ProfileEvents::CasRefEmittedEdges].load();
+    const auto cleaned_before    = global_counters[ProfileEvents::CasRefCleanupObjectsDeleted].load();
+
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/aa@cas@"};
+
+    const ManifestRef r1 = mref(1);
+    const ManifestRef r2 = mref(2);
+    writeManifestRaw(*backend, layout, ns, r1, {blobEntryFor("a", DB::UInt128(1))});
+    writeManifestRaw(*backend, layout, ns, r2, {blobEntryFor("b", DB::UInt128(2))});
+    const uint64_t v1 = publishCommittedTransition(*backend, layout, ns, "t1", std::nullopt, r1);
+    const uint64_t v2 = publishCommittedTransition(*backend, layout, ns, "t2", std::nullopt, r2);
+    /// A newest snapshot covering v2 so cleanup can delete the covered logs once folded.
+    writeRefSnapshotRaw(*backend, layout,
+        minimalLiveSnapshot(ns.string(), RefTxnId{1, v2}, {committedRow("t1", r1), committedRow("t2", r2)}));
+    (void)v1;
+
+    Gc gc(store, kGc);
+    runToFixpoint(store, gc);
+
+    EXPECT_GT(global_counters[ProfileEvents::CasRefGlobalListPages].load(), list_pages_before);
+    EXPECT_GT(global_counters[ProfileEvents::CasRefLogBodyGets].load(), log_gets_before);
+    EXPECT_GT(global_counters[ProfileEvents::CasRefManifestBodyFoldGets].load(), mf_gets_before);
+    EXPECT_GT(global_counters[ProfileEvents::CasRefEmittedEdges].load(), edges_before);
+    EXPECT_GT(global_counters[ProfileEvents::CasRefCleanupObjectsDeleted].load(), cleaned_before);
 }
 
 /// (7) Namespace-cleanup item: `remove_namespace` -> Pending item -> physical prefixes reclaimed ->

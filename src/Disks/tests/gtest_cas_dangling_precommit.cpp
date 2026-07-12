@@ -12,10 +12,12 @@ using namespace DB::Cas;
 /// the token-diff Skip machinery (`computeDiscoverDecisions`/`discoverDecisionsForTest`) no longer exists
 /// -- the "did it change" signal is simply logs above the durable cursor. There is no GC-side reclaim to
 /// assert, so these tests are obsolete rather than adaptable.
-
-/// The one still-meaningful assertion: `ShardCoverage.has_live_precommit` / `min_live_precommit_*`
-/// survive as fold-seal fields, so their codec round-trip is pinned here.
-TEST(CasDanglingPrecommit, ShardCoverageRoundTripsMinLivePrecommit)
+///
+/// The live-precommit watermark fields (`has_live_precommit`/`min_live_precommit_*`) that fed that
+/// removed reclaim were deleted from `ShardCoverage` with it (T13). The still-meaningful fold-seal
+/// assertion is the round-trip of `last_folded_ref_id` -- the per-table durable ref cursor that replaced
+/// them in the same struct under the snapshot+log ref model.
+TEST(CasDanglingPrecommit, ShardCoverageRoundTripsLastFoldedRefId)
 {
     CasFoldSeal seal;
     seal.generation = 3;
@@ -23,20 +25,16 @@ TEST(CasDanglingPrecommit, ShardCoverageRoundTripsMinLivePrecommit)
     ShardCoverage cov;
     cov.classification = 1;
     cov.folded_cursor = 7;
-    cov.has_live_precommit = true;
-    cov.min_live_precommit_writer_epoch = 1;
-    cov.min_live_precommit_build_sequence = 5;
+    cov.last_folded_ref_id = RefTxnId{4, 11};
     seal.per_ns_shard["srv/tbl@cas@/0"] = cov;
 
     const CasFoldSeal back = decodeFoldSeal(encodeFoldSeal(seal));
     const ShardCoverage & r = back.per_ns_shard.at("srv/tbl@cas@/0");
-    EXPECT_TRUE(r.has_live_precommit);
-    EXPECT_EQ(r.min_live_precommit_writer_epoch, 1u);
-    EXPECT_EQ(r.min_live_precommit_build_sequence, 5u);
+    EXPECT_EQ(r.last_folded_ref_id, (RefTxnId{4, 11}));
 
-    /// Default (no live precommit) round-trips as absent.
+    /// Default (nothing folded) round-trips as {0,0}.
     CasFoldSeal empty_seal;
     empty_seal.per_ns_shard["srv/tbl@cas@/1"] = ShardCoverage{};
     const CasFoldSeal e_back = decodeFoldSeal(encodeFoldSeal(empty_seal));
-    EXPECT_FALSE(e_back.per_ns_shard.at("srv/tbl@cas@/1").has_live_precommit);
+    EXPECT_EQ(e_back.per_ns_shard.at("srv/tbl@cas@/1").last_folded_ref_id, (RefTxnId{}));
 }
