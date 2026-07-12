@@ -109,9 +109,9 @@ TEST(CasFsck, ReclaimablePrePrecommitBodyIsInfo)
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openStoreForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
-    /// Task 4: discovery is LIST-based; write an actual shard so the namespace is discoverable.
-    /// We use a fence-only shard (no refs) by writing an empty manifest directly.
-    fenceNamespace(*backend, store->layout(), ns, /*n_shards=*/1, /*round=*/0);
+    /// Discovery is LIST-based (`listNamespaces` scans `cas/refs/`); seed a birth-only ref log so the
+    /// namespace is discoverable but holds NO committed owner -- the manifest body below is orphan debris.
+    appendRefLogSeed(*backend, store->layout(), ns, {});
     const ManifestRef r = ref(5, 0xAB);
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});   // body, no owner
     setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, 6);   // eligible

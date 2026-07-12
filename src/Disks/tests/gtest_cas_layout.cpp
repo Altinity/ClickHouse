@@ -62,8 +62,8 @@ TEST(CasLayout, RootNamespaceKeys)
 {
     Layout l("p");
     RootNamespace ns{"srv1/3f2e-uuid"};
-    /// Phase 1: ref shards relocated out of roots/ to cas/refs/; the namespace fan-out is unchanged.
-    EXPECT_EQ(l.rootShardKey(ns, 3), "p/cas/refs/srv1/3f2e-uuid/3");
+    /// Phase 1: ref objects live under cas/refs/<ns>/; the namespace fan-out is unchanged.
+    EXPECT_EQ(l.refsNamespacePrefix(ns), "p/cas/refs/srv1/3f2e-uuid/");
     /// Browse helpers (verbatim `_files` tree) stay under roots/.
     EXPECT_EQ(l.namespaceFileKey(ns, "format_version.txt"), "p/roots/srv1/3f2e-uuid/_files/format_version.txt");
     EXPECT_EQ(l.namespaceFilesPrefix(ns), "p/roots/srv1/3f2e-uuid/_files/");
@@ -73,8 +73,8 @@ TEST(CasLayout, RelocatedRefAndManifestKeys)
 {
     Layout l("p");
     const RootNamespace ns{"srid/store/ab/uuid@cas@"};
-    /// Ref shards: roots/ -> cas/refs/ (identity-preserving; only the base prefix moves).
-    EXPECT_EQ(l.rootShardKey(ns, 3), "p/cas/refs/srid/store/ab/uuid@cas@/3");
+    /// Ref objects: cas/refs/<ns>/ (identity-preserving namespace fan-out).
+    EXPECT_EQ(l.refsNamespacePrefix(ns), "p/cas/refs/srid/store/ab/uuid@cas@/");
     /// Pool-wide ref prefix (discovery LIST + strip base).
     EXPECT_EQ(l.casRefsPrefix(), "p/cas/refs/");
     /// All manifests of a namespace: cas/manifests/<ns>/ (replaces roots/<ns>/_manifests/).
@@ -95,9 +95,9 @@ TEST(CasLayout, RelocatedRefAndManifestKeys)
 TEST(CasLayout, RootNamespaceValidation)
 {
     Layout l("p");
-    EXPECT_THROW(l.rootShardKey(RootNamespace{""}, 0), DB::Exception);
-    EXPECT_THROW(l.rootShardKey(RootNamespace{"/lead"}, 0), DB::Exception);
-    EXPECT_THROW(l.rootShardKey(RootNamespace{"trail/"}, 0), DB::Exception);
+    EXPECT_THROW(l.refsNamespacePrefix(RootNamespace{""}), DB::Exception);
+    EXPECT_THROW(l.refsNamespacePrefix(RootNamespace{"/lead"}), DB::Exception);
+    EXPECT_THROW(l.refsNamespacePrefix(RootNamespace{"trail/"}), DB::Exception);
     /// File names may be NESTED relative paths (M-W T2: deduplication_logs/...); only unclean
     /// shapes are rejected (empty, leading/trailing '/', empty segments, '..' escapes).
     EXPECT_NO_THROW(l.namespaceFileKey(RootNamespace{"ok"}, "a/b"));
@@ -109,11 +109,11 @@ TEST(CasLayout, RootNamespaceValidation)
     EXPECT_THROW(l.namespaceFileKey(RootNamespace{"ok"}, "a/../b"), DB::Exception);
 
     /// A middle empty segment ("a//b") is rejected (doubled '/').
-    EXPECT_THROW(l.rootShardKey(RootNamespace{"a//b"}, 0), DB::Exception);
+    EXPECT_THROW(l.refsNamespacePrefix(RootNamespace{"a//b"}), DB::Exception);
     /// A segment exactly equal to the reserved "_files" is rejected.
-    EXPECT_THROW(l.rootShardKey(RootNamespace{"srv1/_files/x"}, 0), DB::Exception);
+    EXPECT_THROW(l.refsNamespacePrefix(RootNamespace{"srv1/_files/x"}), DB::Exception);
     /// But a segment that merely CONTAINS "_files" as a substring is legal (no false positive).
-    EXPECT_NO_THROW(l.rootShardKey(RootNamespace{"my_files/tbl"}, 0));
+    EXPECT_NO_THROW(l.refsNamespacePrefix(RootNamespace{"my_files/tbl"}));
 }
 
 TEST(CasLayout, GenerationAndRootsKeys)
@@ -144,9 +144,9 @@ TEST(CasLayout, RegistryDeletedGcDiscoveryViaList)
     /// The `_registry` namespace segment is not reserved (it was only reserved while the registry lived
     /// under `roots/_registry`, which was already relocated to `gc/registry` before being deleted).
     Layout l("p");
-    EXPECT_NO_THROW(l.rootShardKey(RootNamespace{"a/_registry@cas@"}, 0));
+    EXPECT_NO_THROW(l.refsNamespacePrefix(RootNamespace{"a/_registry@cas@"}));
     /// `_files` and `_pool_meta`-style reservations are unaffected.
-    EXPECT_THROW(l.rootShardKey(RootNamespace{"a/_files"}, 0), DB::Exception);
+    EXPECT_THROW(l.refsNamespacePrefix(RootNamespace{"a/_files"}), DB::Exception);
 }
 
 TEST(CasLayout, CasArchiveSuffixConstant)
@@ -185,10 +185,10 @@ TEST(CasLayout, ManifestsSegmentReserved)
     ManifestId bad;
     bad.root_namespace = RootNamespace("srv-a/_manifests/x");
     EXPECT_THROW(l.manifestKey(bad), DB::Exception);
-    /// Also rejected as a generic namespace segment via rootShardKey.
-    EXPECT_THROW(l.rootShardKey(RootNamespace{"srv-a/_manifests/tbl"}, 0), DB::Exception);
+    /// Also rejected as a generic namespace segment via refsNamespacePrefix (the shared checkNamespace).
+    EXPECT_THROW(l.refsNamespacePrefix(RootNamespace{"srv-a/_manifests/tbl"}), DB::Exception);
     /// A segment that merely CONTAINS "_manifests" as a substring is still legal (no false positive).
-    EXPECT_NO_THROW(l.rootShardKey(RootNamespace{"my_manifests/tbl"}, 0));
+    EXPECT_NO_THROW(l.refsNamespacePrefix(RootNamespace{"my_manifests/tbl"}));
 }
 
 TEST(CasLayout, ManifestKeyHexRoundTrip)
@@ -277,9 +277,9 @@ TEST(CasLayout, ParseRefObjectKeyRejections)
 
     /// Foreign top-level prefix.
     EXPECT_FALSE(l.parseRefObjectKey("p/cas/manifests/srv1/tbl@cas@/_log/" + renderRefTxnId(id)).has_value());
-    /// Unknown kind directory (also covers the coexisting old rootShardKey shape, which has none).
+    /// Unknown kind directory (also covers the removed numeric-shard ref-key shape, which has no kind dir).
     EXPECT_FALSE(l.parseRefObjectKey("p/cas/refs/srv1/tbl@cas@/_bogus/" + renderRefTxnId(id)).has_value());
-    EXPECT_FALSE(l.parseRefObjectKey(l.rootShardKey(ns, 3)).has_value());
+    EXPECT_FALSE(l.parseRefObjectKey(l.refsNamespacePrefix(ns) + "3").has_value());
     /// Uppercase hex and a short id are non-canonical RefTxnId renders.
     EXPECT_FALSE(l.parseRefObjectKey("p/cas/refs/srv1/tbl@cas@/_log/"
         "0000000000000007-000000000000008E").has_value());

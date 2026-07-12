@@ -75,6 +75,8 @@ String encodeFoldSeal(const CasFoldSeal & seal)
         e->set_has_live_precommit(cov.has_live_precommit);
         e->set_min_live_precommit_writer_epoch(cov.min_live_precommit_writer_epoch);
         e->set_min_live_precommit_build_sequence(cov.min_live_precommit_build_sequence);
+        e->set_last_folded_ref_epoch(cov.last_folded_ref_id.writer_epoch);
+        e->set_last_folded_ref_sequence(cov.last_folded_ref_id.ref_sequence);
     }
     addRuns(msg.mutable_blob_target_runs(), seal.blob_target_runs);
     addRuns(msg.mutable_part_manifest_cleanup(), seal.part_manifest_cleanup);
@@ -86,6 +88,15 @@ String encodeFoldSeal(const CasFoldSeal & seal)
         e->set_condemned_total(summary.condemned_total);
         e->set_pending_total(summary.pending_total);
         e->set_oldest_nonpending_condemn_round(summary.oldest_nonpending_condemn_round);
+    }
+
+    for (const auto & [key, item] : seal.ns_cleanup_items)   /// std::map => sorted by key => deterministic
+    {
+        auto * e = msg.add_ns_cleanup_items();
+        e->set_ns(item.ns.string());
+        e->set_remove_txn_epoch(item.remove_txn_id.writer_epoch);
+        e->set_remove_txn_sequence(item.remove_txn_id.ref_sequence);
+        e->set_state(static_cast<uint32_t>(item.state));
     }
 
     return msg.SerializeAsString();
@@ -114,6 +125,7 @@ CasFoldSeal decodeFoldSeal(std::string_view data)
             .folded_token = Token{e.folded_token_value(), static_cast<TokenType>(e.folded_token_type())},
             .folded_cursor = e.folded_cursor(),
             .incarnation = ShardIncarnation{e.incarnation_writer_epoch(), e.incarnation_build_sequence()},
+            .last_folded_ref_id = RefTxnId{e.last_folded_ref_epoch(), e.last_folded_ref_sequence()},
             .has_live_precommit = e.has_live_precommit(),
             .min_live_precommit_writer_epoch = e.min_live_precommit_writer_epoch(),
             .min_live_precommit_build_sequence = e.min_live_precommit_build_sequence()};
@@ -124,6 +136,15 @@ CasFoldSeal decodeFoldSeal(std::string_view data)
             .condemned_total = e.condemned_total(),
             .pending_total = e.pending_total(),
             .oldest_nonpending_condemn_round = e.oldest_nonpending_condemn_round()};
+    for (const auto & e : msg.ns_cleanup_items())
+    {
+        const RefTxnId remove_txn_id{e.remove_txn_epoch(), e.remove_txn_sequence()};
+        const String key = e.ns() + "\n" + renderRefTxnId(remove_txn_id);
+        seal.ns_cleanup_items[key] = RefNsCleanupItem{
+            .ns = RootNamespace{e.ns()},
+            .remove_txn_id = remove_txn_id,
+            .state = static_cast<RefNsCleanupState>(e.state())};
+    }
     return seal;
 }
 

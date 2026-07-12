@@ -267,7 +267,7 @@ TEST(CasPromoteRepublish, RepublishReDriveResyncsDriftedMutableFiles)
     /// 3. DRIFT: src's mutable_files change AFTER the crashed promote(dst) but BEFORE the re-drive
     ///    (e.g. a metadata_version.txt bump that landed on the still-committed src). Mutable-fields-only
     ///    write -- the same primitive the autocommit one-shot path uses, no reachability change.
-    storage->store()->updateRefPayload(ns, src_ref, [](RootRef & payload)
+    storage->store()->updateRefPayload(ns, src_ref, [](RefMutableFilesUpdate & payload)
     {
         payload.mutable_files["metadata_version.txt"] = "7";
     });

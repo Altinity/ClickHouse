@@ -99,27 +99,17 @@ public:
     /// `blobKey`/`blobMetaKey` above.
     std::optional<BlobRef> parseBlobKey(std::string_view key) const;
 
-    /// Root manifest for a given namespace + shard number.
-    /// Phase 1: relocated out of the shared `roots/` tree to `cas/refs/` (hot/cold split). The
-    /// namespace fan-out (`<ns>/<shard>`) is unchanged — identity-preserving. GC discovery LISTs
-    /// `casRefsPrefix()` (only ref shards, no manifest backlog or verbatim files interleaved).
-    String rootShardKey(const RootNamespace & ns, uint64_t shard) const
-    {
-        checkNamespace(ns);
-        return prefix + "/cas/refs/" + ns.string() + "/" + std::to_string(shard);
-    }
-
-    /// Namespace-scoped ref-shard prefix: `<prefix>/cas/refs/<ns>/` — the parent of every
-    /// `rootShardKey(ns, shard)`. One LIST of it enumerates the namespace's PRESENT shard
-    /// objects (listRefs uses it to avoid a HEAD per shard; the 2026-07-03 CREATE storm).
+    /// Namespace-scoped ref-object prefix: `<prefix>/cas/refs/<ns>/` — the parent of a table's
+    /// `_log`/`_snap`/`_cleanup` objects. One LIST of it enumerates the table's present ref objects
+    /// (recovery, orphan-sweep tail read).
     String refsNamespacePrefix(const RootNamespace & ns) const
     {
         checkNamespace(ns);
         return prefix + "/cas/refs/" + ns.string() + "/";
     }
 
-    /// Pool-wide ref-shard prefix (Phase 1): `<prefix>/cas/refs/`. The base of every `rootShardKey`,
-    /// used by GC discovery for the LIST sweep and the strip-to-cursor-key step.
+    /// Pool-wide ref-object prefix (Phase 1): `<prefix>/cas/refs/`. The base of every ref object, used
+    /// by GC's one global discovery LIST and the strip-to-namespace step.
     String casRefsPrefix() const
     {
         return prefix + "/cas/refs/";
@@ -149,7 +139,7 @@ public:
     /// `casRefsPrefix()` by its kind directory (`_cleanup`, `_log`, `_snap`) and parses the trailing
     /// `RefTxnId`. Strict: returns `std::nullopt` -- never throws -- for anything that is not one of
     /// OUR ref-object keys: a foreign top-level prefix, a missing namespace/kind/id segment, an
-    /// unrecognized kind directory (this also excludes the coexisting old `rootShardKey` layout,
+    /// unrecognized kind directory (this also excludes a bare numeric-shard ref-key shape,
     /// `cas/refs/<ns>/<shard>`, which has no kind directory at all), a `_snap` id missing its `.proto`
     /// suffix, a `_log`/`_cleanup` id carrying any extension, trailing garbage after the id, or a
     /// non-canonical `RefTxnId` render (delegates to `parseRefTxnId`).
@@ -472,13 +462,19 @@ public:
     /// The precommit namespace (B171): `<server-hex>/_precommits`, one shard per in-flight build keyed by
     /// `build_seq`. A precommit publishes the build's manifest tree as a ref in that shard, so GC's
     /// fold lifts the in-degree of every reachable object — replacing the revocable `cas_owner` hint.
-    /// It is an ordinary namespace key-wise (`rootShardKey` works unchanged); only behavioral branches
+    /// It is an ordinary namespace key-wise (its ref-object keys build unchanged); only behavioral branches
     /// (fold pending-tolerance, precommit reclaim) key off `isPrecommitNamespace`. Recognized by its
     /// LAST segment being `_precommits` (Phase 6: relocated under the server's `roots/<server-hex>/`).
     static bool isPrecommitNamespace(const RootNamespace & ns)
     {
         return ns.string().ends_with("/_precommits");
     }
+
+    /// Public validator for a namespace reconstructed from an untrusted listed key (GC ref intake,
+    /// VERIFY-AT-T12): `parseRefObjectKey` returns the namespace without checking its shape, so a
+    /// consumer that will act on it must re-validate. Throws BAD_ARGUMENTS on a malformed namespace,
+    /// exactly as every key-building method does.
+    void validateNamespace(const RootNamespace & ns) const { checkNamespace(ns); }
 
 private:
     String prefix;

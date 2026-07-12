@@ -19,7 +19,20 @@ namespace DB::Cas
 /// (`CasPoolMeta.cpp`) already CAS-raises `min_reader_generation` to `G_BUILD` on every successful
 /// open/admission; bumping this constant to 2 makes that raise land at 2 and makes a persisted
 /// `min_reader_generation > 2` (e.g. a future generation-3 pool) correctly fail-closed here.
-constexpr uint32_t G_BUILD = 2;
+///
+/// Raised 2 -> 3 (Task 12, ref snapshot+log format): the table ref state moved from the mutable
+/// pre-generation-3 ref-shard objects to immutable `_log`/`_snap` objects -- a BREAKING ref-format
+/// change. The forward gate above is not sufficient (a generation-2 pool's `compatibility_version` still
+/// passes `<= G_BUILD`), so `decodePoolMeta` adds an explicit BACKWARD floor: a pool whose pool-meta
+/// `compatibility_version < 3` holds unreadable pre-generation-3 ref-shard-format refs and fails closed
+/// at open. CAS is pre-release, so no migration exists -- such a pool must be recreated.
+constexpr uint32_t G_BUILD = 3;
+
+/// The pool-format generation at which the ref state became immutable snapshot+log objects (Task 12).
+/// A pool-meta `compatibility_version` below this cannot be opened by this build (its refs are the
+/// removed pre-generation-3 mutable ref-shard format). See the backward floor in
+/// `CasPoolMeta.cpp::decodePoolMeta`.
+constexpr uint32_t kRefSnapshotLogGeneration = 3;
 
 /// The registry of every self-describing persisted object class. For hashed binary objects the 4-byte
 /// magic doubles as the on-disk identifier; this enum is what the version tables key on.

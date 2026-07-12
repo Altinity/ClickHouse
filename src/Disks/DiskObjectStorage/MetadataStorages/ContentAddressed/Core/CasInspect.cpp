@@ -5,7 +5,8 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGenerationSeal.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestCodec.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootShardCodec.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRefLogCodec.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRefSnapshotCodec.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasServerRoot.h>
 #include <Common/Exception.h>
 #include <fmt/format.h>
@@ -109,67 +110,116 @@ String renderShardIncarnation(const ShardIncarnation & i)
         .str();
 }
 
-String ownerKindName(OwnerKind k)
+/// The snapshot+log ref objects (spec §Object Layout). `renderRefTxnIdObj` renders the raw
+/// `{writer_epoch, ref_sequence}` fields rather than the canonical hex render (which throws on a zero
+/// field) so inspect can dump any object, even a malformed one, without failing.
+String renderRefTxnIdObj(const RefTxnId & id)
+{
+    return JsonObj()
+        .add("writer_epoch", jsonUInt(id.writer_epoch))
+        .add("ref_sequence", jsonUInt(id.ref_sequence))
+        .str();
+}
+
+String refOwnerKindName(RefOwnerKind k)
 {
     switch (k)
     {
-        case OwnerKind::Committed: return "Committed";
-        case OwnerKind::Precommit: return "Precommit";
+        case RefOwnerKind::Committed: return "Committed";
+        case RefOwnerKind::Precommit: return "Precommit";
     }
     return "Unknown";
 }
 
-String renderOwnerBinding(const OwnerBinding & b)
+String renderRefOwnerBinding(const RefOwnerBinding & b)
 {
     return JsonObj()
-        .add("owner_kind", jsonEscape(ownerKindName(b.owner_kind)))
+        .add("kind", jsonEscape(refOwnerKindName(b.kind)))
         .add("ref_name", jsonEscape(b.ref_name))
-        .add("build_id", jsonHex(b.build_id))
         .add("manifest_ref", renderManifestRef(b.manifest_ref))
         .str();
 }
 
-String renderRootOwnerEvent(const RootOwnerEvent & e)
+String renderRefCommittedRow(const RefCommittedRow & r)
 {
-    return JsonObj()
-        .add("transition_version", jsonUInt(e.transition_version))
-        .add("old_binding", e.old_binding ? renderOwnerBinding(*e.old_binding) : "null")
-        .add("new_binding", e.new_binding ? renderOwnerBinding(*e.new_binding) : "null")
-        .add("is_tombstone", jsonBool(e.is_tombstone))
-        .str();
-}
-
-String renderRootRef(const RootRef & r)
-{
-    JsonObj files;
-    for (const auto & [k, v] : r.mutable_files)
-        files.add(k, jsonEscape(v));
-
     return JsonObj()
         .add("ref_name", jsonEscape(r.ref_name))
         .add("manifest_ref", renderManifestRef(r.manifest_ref))
-        .add("mutable_files", files.str())
+        .add("payload_size", jsonUInt(r.payload.size()))
         .add("published_at_ms", jsonUInt(r.published_at_ms))
         .str();
 }
 
-String renderRootShard(const RootShard & root)
+String refLifecycleName(RefLifecycle l)
 {
-    JsonObj refs;
-    for (const auto & [name, ref] : root.refs)
-        refs.add(name, renderRootRef(ref));
+    switch (l)
+    {
+        case RefLifecycle::Live: return "Live";
+        case RefLifecycle::Removed: return "Removed";
+    }
+    return "Unknown";
+}
 
-    std::vector<String> journal;
-    journal.reserve(root.journal.size());
-    for (const auto & e : root.journal)
-        journal.push_back(renderRootOwnerEvent(e));
+String renderRefTableSnapshot(const RefTableSnapshot & s)
+{
+    std::vector<String> committed;
+    committed.reserve(s.committed.size());
+    for (const auto & row : s.committed)
+        committed.push_back(renderRefCommittedRow(row));
+
+    std::vector<String> precommits;
+    precommits.reserve(s.precommits.size());
+    for (const auto & b : s.precommits)
+        precommits.push_back(renderRefOwnerBinding(b));
 
     return JsonObj()
-        .add("shard_version", jsonUInt(root.shard_version))
-        .add("fence_round", jsonUInt(root.fence_round))
-        .add("incarnation", renderShardIncarnation(root.incarnation))
-        .add("refs", refs.str())
-        .add("journal", jsonArray(journal))
+        .add("object", jsonEscape("ref_snapshot"))
+        .add("ns", jsonEscape(s.ns))
+        .add("snapshot_id", renderRefTxnIdObj(s.snapshot_id))
+        .add("lifecycle", jsonEscape(refLifecycleName(s.lifecycle)))
+        .add("remove_txn_id", s.remove_txn_id ? renderRefTxnIdObj(*s.remove_txn_id) : "null")
+        .add("committed", jsonArray(committed))
+        .add("precommits", jsonArray(precommits))
+        .str();
+}
+
+String refOpKindName(RefOpKind k)
+{
+    switch (k)
+    {
+        case RefOpKind::NamespaceBirth: return "NamespaceBirth";
+        case RefOpKind::OwnerTransition: return "OwnerTransition";
+        case RefOpKind::SetPayload: return "SetPayload";
+        case RefOpKind::RemoveNamespace: return "RemoveNamespace";
+    }
+    return "Unknown";
+}
+
+String renderRefOp(const RefOp & op)
+{
+    return JsonObj()
+        .add("kind", jsonEscape(refOpKindName(op.kind)))
+        .add("old_binding", op.old_binding ? renderRefOwnerBinding(*op.old_binding) : "null")
+        .add("new_binding", op.new_binding ? renderRefOwnerBinding(*op.new_binding) : "null")
+        .add("ref_name", jsonEscape(op.ref_name))
+        .add("expected_manifest_ref", renderManifestRef(op.expected_manifest_ref))
+        .add("payload_size", jsonUInt(op.payload.size()))
+        .add("published_at_ms", jsonUInt(op.published_at_ms))
+        .str();
+}
+
+String renderRefLogTxn(const RefLogTxn & t)
+{
+    std::vector<String> ops;
+    ops.reserve(t.ops.size());
+    for (const auto & op : t.ops)
+        ops.push_back(renderRefOp(op));
+
+    return JsonObj()
+        .add("object", jsonEscape("ref_log"))
+        .add("ns", jsonEscape(t.ns))
+        .add("txn_id", renderRefTxnIdObj(t.txn_id))
+        .add("ops", jsonArray(ops))
         .str();
 }
 
@@ -416,7 +466,22 @@ String caInspectToJson(const Layout & layout, const String & key, std::string_vi
         return renderPartManifest(decodePartManifest(bytes));
 
     if (key.starts_with(layout.casRefsPrefix()))
-        return renderRootShard(decodeRootShard(bytes));
+    {
+        const auto parsed = layout.parseRefObjectKey(key);
+        if (!parsed)
+            throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
+                "ca-inspect: key under cas/refs is not a recognized ref-object key '{}'", key);
+        if (parsed->kind == RefObjectKind::Snap)
+            return renderRefTableSnapshot(decodeRefTableSnapshot(bytes, parsed->ns.string(), parsed->txn_id));
+        if (parsed->kind == RefObjectKind::Log)
+            return renderRefLogTxn(decodeRefLogTxn(bytes, parsed->ns.string(), parsed->txn_id));
+        /// A `_cleanup` marker is a zero-byte object — nothing to decode, so render its key-derived facts.
+        return JsonObj()
+            .add("object", jsonEscape("ref_cleanup_marker"))
+            .add("ns", jsonEscape(parsed->ns.string()))
+            .add("txn_id", renderRefTxnIdObj(parsed->txn_id))
+            .str();
+    }
 
     if (key == layout.gcStateKey())
         return renderGcState(decodeGcState(bytes));

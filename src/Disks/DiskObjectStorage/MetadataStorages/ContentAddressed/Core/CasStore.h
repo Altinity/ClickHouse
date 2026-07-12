@@ -11,7 +11,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestId.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRefStateMachine.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRequestControl.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootShardCodec.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasServerRoot.h>
 #include <Common/CacheBase.h>
 #include <Common/CurrentMetrics.h>
@@ -43,11 +42,10 @@ enum class RootMutationOrigin : uint8_t
     Gc,
 };
 
-/// The write-scope of one `mutateShard` closure (shard-mutation-queue spec 2026-07-03): which part
-/// of the shard the closure touches. The flat-combining batch builder admits at most ONE mutation
-/// per ref name into a single flush (per-ref durable histories stay bit-identical to the unbatched
-/// protocol) and flushes `WholeShard` closures SOLO (trim, GC fence, dropNamespace, reclaim —
-/// anything touching multiple refs or the journal wholesale).
+/// The write-scope of one `appendRefOps` call (ref-append-lane batching): which part of the table the
+/// call touches. The flat-combining batch builder admits at most ONE mutation per ref name into a
+/// single flush (per-ref durable histories stay bit-identical to the unbatched protocol) and flushes
+/// `WholeShard` calls SOLO (dropNamespace and anything touching multiple refs wholesale).
 struct MutationScope
 {
     enum class Kind : uint8_t { Ref, WholeShard };
@@ -219,11 +217,6 @@ struct PoolConfig
     /// keep these defaults, but a caller that LOWERS it must revisit this budget too.
     CasRequestBudget cas_request_budget{};
 
-    /// Pillar B bounded-TTL decode cache: a staleness-tolerant caller (allow_stale=true) may reuse a
-    /// decode validated < this many ms ago WITHOUT a HEAD. 0 disables the TTL (all callers force-fresh).
-    /// Strict-freshness callers always pass allow_stale=false and always HEAD, regardless of this value.
-    std::chrono::milliseconds shard_decode_cache_ttl_ms{200};
-
     /// The write-fence deadline clock (CLOCK_BOOTTIME milliseconds; see `MountFence`). Empty = the real
     /// boot clock (`Store::bootMs`); injected by tests to drive the fence deadline deterministically.
     std::function<uint64_t()> boot_ms_fn = {};
@@ -247,7 +240,7 @@ struct PoolConfig
 struct Resolved
 {
     /// The namespace-qualified identity of the part manifest this ref names. The owning RootNamespace
-    /// + the RootRef.manifest_ref form the ManifestId (the ref carries no namespace itself — that comes
+    /// + the ref's manifest_ref form the ManifestId (the ref carries no namespace itself — that comes
     /// from the owning root context, spec §Object Identity And Ownership).
     ManifestId manifest_id;
     uint64_t manifest_size = 0;
@@ -255,9 +248,19 @@ struct Resolved
     uint64_t published_at_ms = 0;   /// publish wall-clock (epoch ms); 0 = unset
 };
 
-/// Task 10: the deterministic encoding of a committed ref's mutable payload (`RootRef::mutable_files` /
-/// `Resolved::mutable_files`) inside one `RefCommittedRow.payload` -- an OPAQUE blob from the
-/// ref-log/snapshot codecs' point of view (spec §Snapshot Format: "mutable_files: deterministic RootRef
+/// The `{mutable_files, published_at_ms}` carrier `updateRefPayload`'s mutator edits in place: the one
+/// set_payload transaction replaces the complete mutable payload without touching the manifest edge, so
+/// the mutator has no way to express (and no need to reject) a `manifest_ref` change -- a reachability
+/// change goes through publish/drop instead.
+struct RefMutableFilesUpdate
+{
+    std::map<String, String> mutable_files;
+    uint64_t published_at_ms = 0;   /// publish wall-clock (epoch ms); 0 = unset
+};
+
+/// Task 10: the deterministic encoding of a committed ref's mutable payload (`Resolved::mutable_files` /
+/// `RefMutableFilesUpdate::mutable_files`) inside one `RefCommittedRow.payload` -- an OPAQUE blob from the
+/// ref-log/snapshot codecs' point of view (spec §Snapshot Format: "mutable_files: deterministic ref
 /// payload"). Shared by `Store`'s own dropRef/updateRefPayload/resolveRef/listRefs and by `Build::promote`
 /// (the `set_payload` op that installs a precommit's initial payload). Defined in CasStore.cpp.
 String encodeMutableFilesPayload(const std::map<String, String> & files);
@@ -316,12 +319,12 @@ struct MountFence
 /// failure refuses the pool (design §6). The read side has no GC awareness and no tokens (spec §6).
 class Store : public std::enable_shared_from_this<Store>
 {
-    /// Build drives the manifest publish CAS through the private mutateShard/shardOf: the gate logic
+    /// Build drives ref mutations through the private appendRefOps lane: the gate logic
     /// (W-PUBLISH-GATE) is Build's responsibility (it owns the per-hash freshness-meta point-read), but
-    /// the CAS loop itself is the verified Store loop — reused, never duplicated.
+    /// the append/commit loop itself is the verified Store loop — reused, never duplicated.
     friend class Build;
-    /// Gc drives the manifest fence CAS (R3) through the same private mutateShard loop — reused,
-    /// never duplicated (the lease itself only needs the public accessors).
+    /// Gc reaches the ref-log lane and Store internals through the public accessors and this friendship —
+    /// reused, never duplicated.
     friend class Gc;
 
 public:
@@ -396,7 +399,7 @@ public:
     /// ---- ref lifecycle (Task 10: persisted on the snapshot+log protocol, spec §Writer Algorithms) ----
     void dropRef(const RootNamespace & ns, const String & ref_name);            /// one owner_transition removal txn
     void updateRefPayload(const RootNamespace & ns, const String & ref_name,
-                          std::function<void(RootRef &)> mutator);              /// one set_payload txn
+                          std::function<void(RefMutableFilesUpdate &)> mutator);   /// one set_payload txn
     /// Task 11 (spec §Namespace Removal): one ref-log transaction naming every owner's exact removal
     /// followed by `remove_namespace`, then a best-effort publish of the constant-size `Removed`
     /// snapshot. Performs NO physical deletion (no verbatim-file deletes, no tombstones) -- that is
@@ -406,10 +409,9 @@ public:
     /// ==== writer ref-log append lane (Task 10, spec §Writer Algorithms) ====
     ///
     /// The ONE entry point every ref mutation funnels through -- Store's own dropRef/updateRefPayload
-    /// above, and (as a friend) Build's precommitAdd/promote/abandon. Replaces the old per-(ns,shard)
-    /// `mutateShard`/`RootShard` persistence for refs; GC's own fold/trim/reclaim (Task 12) keep using
-    /// `mutateShard`/`readShard`/`RootShard` unchanged below, which is exactly why the GC-side gtest
-    /// suites go red until Task 12 rewires GC intake onto this same protocol.
+    /// above, and (as a friend) Build's precommitAdd/promote/abandon. This is the SOLE ref-persistence
+    /// lane now: the legacy per-(ns,shard) mutable manifest format was removed once GC/sweep/fsck/inspect
+    /// were rewired onto the snapshot+log ref protocol (Task 12).
     ///
     /// `build_ops(state)` is invoked from the per-namespace flush leader with the table's CURRENT cached
     /// state (reflecting every earlier item of the SAME batch already applied) -- exactly the atomicity
@@ -517,10 +519,6 @@ public:
     void dedupCacheAdd(const BlobRef & ref);
     /// Test seam: retained bytes of the manifest decode cache (0 when disabled).
     size_t manifestDecodeCacheBytesForTest() const { return manifest_cache ? manifest_cache->sizeInBytes() : 0; }
-    /// The shard a ref name routes to: CityHash64(ref_name) % root_shards. Build uses it to address the
-    /// publish/precommit CAS (the build-root ref name is the build_seq, B171); tests reconstruct the
-    /// build-root shard with it.
-    uint64_t shardOf(const String & ref_name) const;
 
     /// ---- B170 event audit (system.content_addressed_log) ----
     /// The wiring injects a sink (CasEvent -> SystemLog row) when the log is configured; null sink
@@ -544,48 +542,6 @@ public:
     /// current round (the birth floor, THM-NO-RETURN) — only on the create-if-absent branch.
     uint64_t currentGcRound() const;
 
-    /// B164b test seam: mutate root shard with explicit origin/kind for backpressure
-    /// verification. Production code uses private `mutateShard` via Build/Gc friend
-    /// classes. Exists only so the GC-bypass test can verify that `RootMutationOrigin::Gc`
-    /// skips backpressure delay without exposing the full mutation API.
-    /// Task 2: `birth_incarnation` (default `{}`) is forwarded to the private `mutateShard`
-    /// so incarnation-stamp tests can drive the create-if-absent path directly.
-    /// Task 5: `birth_floor` (default 0) is forwarded to the private `mutateShard` as a
-    /// lazy provider so self-floor tests can drive the create-if-absent path with an
-    /// explicit fence_round. Wraps the eager value in a lambda — the provider is only
-    /// invoked inside the create-if-absent branch (no S3 call on the existing-shard path).
-    void mutateShardForTest(const RootNamespace & ns, uint64_t shard,
-                            std::function<void(RootShard &)> mutate,
-                            RootMutationOrigin origin, RootMutationKind kind,
-                            ShardIncarnation birth_incarnation = {},
-                            uint64_t birth_floor = 0)
-    {
-        std::function<uint64_t()> provider = birth_floor ? std::function<uint64_t()>([birth_floor] { return birth_floor; }) : nullptr;
-        mutateShard(ns, shard, MutationScope::wholeShard(), std::move(mutate), nullptr, origin, kind, birth_incarnation, std::move(provider));
-    }
-
-    /// Queue depth for the shard-mutation-queue tests: how many mutations are enqueued (the
-    /// leader's own item stays counted until its batch is carved, which happens after the flush's
-    /// first read — so a blocked-in-read leader plus one waiter reads as depth 2).
-    size_t shardQueuePendingForTest(const RootNamespace & ns, uint64_t shard)
-    {
-        std::lock_guard<std::mutex> g(shard_queue_mutex);
-        const auto it = shard_queues.find(std::make_pair(ns.string(), shard));
-        return it == shard_queues.end() ? 0 : it->second->pending.size();
-    }
-
-    /// Scoped variant for the shard-mutation-queue tests (spec 2026-07-03): exposes the scope so
-    /// batching/cut semantics are testable; returns the committed version.
-    uint64_t mutateShardScopedForTest(const RootNamespace & ns, uint64_t shard, MutationScope scope,
-                                      std::function<void(RootShard &)> mutate,
-                                      RootMutationOrigin origin = RootMutationOrigin::Writer,
-                                      RootMutationKind kind = RootMutationKind::Publish)
-    {
-        uint64_t v = 0;
-        mutateShard(ns, shard, std::move(scope), std::move(mutate), &v, origin, kind, {}, nullptr);
-        return v;
-    }
-
 private:
 
     Store(BackendPtr backend_, PoolConfig config_, PoolMeta meta_);
@@ -597,10 +553,6 @@ private:
     /// Remove a build_seq from the active set; idempotent (safe from publish/abandon/dtor).
     void retireBuildSeq(uint64_t seq);
 
-    /// Read shard manifest (absent ⇒ empty RootShard with no token); used by mutateShard (writes,
-    /// which need the token for the CAS) and as the uncached primitive under readShardDecoded.
-    std::pair<RootShard, std::optional<Token>> readShard(const RootNamespace & ns, uint64_t shard);
-
     /// ---- plain-object CAS helpers (shared by namespace-file and mountpoint-object paths) ----
     /// head + putIfAbsent/putOverwrite loop (bounded by MAX_CAS_ATTEMPTS); throws ABORTED on live-lock.
     void casPutObject(const String & full_key, const String & bytes);
@@ -608,87 +560,6 @@ private:
     std::optional<String> casGetObject(const String & full_key);
     /// head + deleteExact loop; no-op when absent. Throws ABORTED on live-lock.
     void casRemoveObject(const String & full_key);
-
-    /// Read-path shard read with a token-validated DECODE CACHE (B113): a `head` fetches the current
-    /// token cheaply; on a token match the already-decoded, IMMUTABLE manifest is returned without a
-    /// `get` or a re-decode (the dominant read-heavy cost — the whole shard manifest holds many refs).
-    /// The cached object is `const` and shared, so it is never mutated; writers use `readShard`
-    /// (always fresh) so a publish/drop never reads stale state. Correctness rests on the token
-    /// uniquely identifying the incarnation's bytes (every write mints a new token), so a matching
-    /// token guarantees identical content. Used by resolveRef/listRefs only.
-    /// Single-flight coalescing (Pillar B, Task 2): concurrent callers for the same shard key share
-    /// ONE head (+ at most one get); followers wait on the leader's shared_future.
-    /// Pillar B TTL fast-path (Task 3): allow_stale=true callers skip the HEAD entirely when the
-    /// cache entry was validated within shard_decode_cache_ttl_ms.
-    std::shared_ptr<const RootShard> readShardDecoded(const RootNamespace & ns, uint64_t shard, bool allow_stale = false);
-    /// The actual head+get+decode for one shard key (no coalescing). Called by coalescedReadShardDecoded.
-    std::shared_ptr<const RootShard> loadShardDecoded(const String & key);
-    /// Single-flight coalescing wrapper around loadShardDecoded.
-    std::shared_ptr<const RootShard> coalescedReadShardDecoded(const String & key);
-
-    /// Read-modify-CAS one shard manifest under the manifest size guard. `mutate` edits the in-memory
-    /// RootShard (which carries the freshly-read shard_version); the helper bumps shard_version, encodes,
-    /// applies the manifest size guard (soft ⇒ LOG_WARNING + backpressure delay for Writer, hard ⇒
-    /// LIMIT_EXCEEDED), and casPut against the observed token (nullopt when the shard was absent —
-    /// create-if-absent). On Conflict it re-reads and retries the WHOLE mutate, bounded (100) then ABORTED
-    /// ("manifest CAS contention on {}"). Single-writer shards make a real storm impossible; the bound is
-    /// a runaway brake. `mutate` runs on the FRESHLY READ root each attempt, so a journal append is never
-    /// double-applied across retries.
-    /// `out_committed_version` (optional) receives the shard_version the successful casPut committed —
-    /// the GC fence (R3) records it as the durable per-shard fence position (the model's fencePos[s]).
-    /// `origin` distinguishes Writer mutations (subject to backpressure) from Gc mutations (bypass).
-    /// `kind` is diagnostic-only (logged/metrics) and does not affect behaviour.
-    /// When the shard does not yet exist (token == nullopt on the first readShard call), the shard is
-    /// created fresh: `root.incarnation` is set to `birth_incarnation` AND `root.fence_round` is set
-    /// to the value returned by `birth_floor_provider` (Task 5 self-floor) BEFORE `mutate` runs. On
-    /// subsequent mutations (token present), both are left untouched (immutable for the shard's life).
-    /// Callers that never create a first object (drop, updateRefPayload, dropNamespace, GC fence) pass
-    /// the defaults (`{}`, nullptr) — the stamps are no-ops since the shard already exists.
-    /// Only `precommitAdd` passes a non-null `birth_floor_provider` (a lazy S3 GET of `gc/state`);
-    /// the provider is invoked ONLY on the create-if-absent branch so the common existing-shard path
-    /// incurs ZERO extra S3 round-trips. `fence_round = 0` (fresh pool, no GC) is a valid value and
-    /// is assigned unconditionally (the `if (birth_floor > 0)` guard is a footgun — removed).
-    void mutateShard(const RootNamespace & ns, uint64_t shard, MutationScope scope,
-                     std::function<void(RootShard &)> mutate,
-                     uint64_t * out_committed_version,
-                     RootMutationOrigin origin, RootMutationKind kind,
-                     ShardIncarnation birth_incarnation = {},
-                     std::function<uint64_t()> birth_floor_provider = nullptr);
-
-    /// ==== flat-combining shard-mutation queue (spec 2026-07-03-cas-shard-mutation-queue) ====
-    /// One queued item = one BLOCKED mutateShard caller (bounded by writer-thread count by
-    /// construction). Map entries exist only while work is in flight; ONE mutex guards the map and
-    /// every item's completion fields; per-queue cv wakes that queue's waiters only.
-    struct ShardMutationItem
-    {
-        MutationScope scope;
-        std::function<void(RootShard &)> mutate;
-        RootMutationOrigin origin = RootMutationOrigin::Writer;
-        RootMutationKind kind = RootMutationKind::Publish;
-        ShardIncarnation birth_incarnation;
-        std::function<uint64_t()> birth_floor_provider;
-        bool done = false;                       /// guarded by shard_queue_mutex
-        std::exception_ptr error;                /// guarded by shard_queue_mutex
-        uint64_t committed_version = 0;          /// written by the leader before done = true
-    };
-    struct ShardMutationQueue
-    {
-        std::deque<std::shared_ptr<ShardMutationItem>> pending;
-        bool leader_active = false;
-        uint64_t force_solo = 0;                 /// hard-limit degrade: next N carves are solo
-        std::condition_variable cv;
-    };
-    static constexpr size_t kMaxShardBatch = 128;
-    std::mutex shard_queue_mutex;
-    std::map<std::pair<String, uint64_t>, std::shared_ptr<ShardMutationQueue>> shard_queues;
-
-    /// Leader loop: flush batches until the leader's OWN item completes (fairness baton pass).
-    void runShardQueueLeader(const RootNamespace & ns, uint64_t shard,
-                             const std::shared_ptr<ShardMutationQueue> & q,
-                             const std::shared_ptr<ShardMutationItem> & own);
-    /// One carved batch through one CAS loop; NEVER throws (outcomes land in the items).
-    void flushShardBatch(const RootNamespace & ns, uint64_t shard,
-                         const std::shared_ptr<ShardMutationQueue> & q);
 
     /// ==== writer ref-log append lane (Task 10, spec §Writer Algorithms / §Local Batching Queue) ====
 
@@ -701,9 +572,8 @@ private:
         String bytes;
     };
 
-    /// One queued `appendRefOps` caller. Mirrors `ShardMutationItem`; `build_ops` replaces the old
-    /// `mutate(RootShard&)` closure -- it is invoked at most once, from inside the flush, and returns
-    /// the ops it contributes rather than mutating storage directly.
+    /// One queued `appendRefOps` caller. `build_ops` is invoked at most once, from inside the flush,
+    /// and returns the ops it contributes rather than mutating storage directly.
     struct RefMutationItem
     {
         MutationScope scope;
@@ -798,9 +668,9 @@ private:
     std::shared_ptr<RefTableRuntime> getRefTableRuntime(const RootNamespace & ns);
     void ensureRefTableRecovered(const RootNamespace & ns, RefTableRuntime & rt);
 
-    /// Leader loop / one flush, mirroring `runShardQueueLeader`/`flushShardBatch` exactly, retargeted
-    /// at the ref-log append lane (recovery, wedge resolution, per-item validation, admission budget,
-    /// the controlled `PUT`, and applying the committed transaction to `rt.state`).
+    /// Leader loop / one flush for the ref-log append lane (recovery, wedge resolution, per-item
+    /// validation, admission budget, the controlled `PUT`, and applying the committed transaction to
+    /// `rt.state`).
     void runRefQueueLeader(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt,
                            const std::shared_ptr<RefMutationItem> & own);
     void flushRefBatch(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt);
@@ -939,44 +809,8 @@ private:
 
     /// Local write fence (spec §write-fence). Permissive by default (deadline = time_point::max,
     /// lost = false), so mayMutate() is true until Task 7 arms it with a real lease deadline and the
-    /// renewer trips it. Gates the mutate chokepoint (mutateShard).
+    /// renewer trips it. Gates the ref-append mutate chokepoint.
     MountFence mount_fence;
-
-    /// B113 read-path decode cache: rootShardKey -> ShardDecodeCacheEntry. Guarded by its own mutex.
-    /// A token mismatch (any write to the shard) forces a fresh get + decode; cache entries are
-    /// otherwise reused across reads within and across queries. Bounded (wholesale clear on overflow,
-    /// like the tree cache) so a long-lived server that touches many tables/backups/detached dirs
-    /// cannot grow it without limit; `dropNamespace` also evicts a dropped namespace's shard entries
-    /// explicitly (they would otherwise never be re-read — leak).
-    /// validated_at supports the Pillar B TTL fast-path (Task 3): staleness-tolerant callers skip the
-    /// HEAD when the entry was validated within shard_decode_cache_ttl_ms. Absence is NEVER TTL-cached
-    /// — only present entries carry a validated_at stamp.
-    struct ShardDecodeCacheEntry
-    {
-        Token token;
-        std::shared_ptr<const RootShard> shard;
-        std::chrono::steady_clock::time_point validated_at;
-    };
-    static constexpr size_t SHARD_DECODE_CACHE_MAX_ENTRIES = 16384;
-    std::mutex shard_decode_cache_mutex;
-    std::unordered_map<String, ShardDecodeCacheEntry> shard_decode_cache;
-
-    /// Per-shard-key monotonic write counter, guarded by shard_decode_cache_mutex. Bumped on every
-    /// committed manifest write (the mutateShard invalidation, alongside the cache erase). A reader
-    /// captures it BEFORE its get() and re-checks before populating shard_decode_cache: if a write
-    /// landed during the get(), the just-decoded bytes may already be superseded AND that write's
-    /// invalidation erase has already run, so caching the decode would resurrect a stale entry that
-    /// the TTL fast-path then serves — making a just-published ref look absent (read-your-writes
-    /// coherence race, B157). On seq mismatch the reader returns its own point-in-time decode but
-    /// does NOT cache it. Kept monotonic across the wholesale cache clear (never reset) so a captured
-    /// value can never spuriously match a reset counter. Bounded by distinct (namespace, shard) pairs.
-    std::unordered_map<String, uint64_t> shard_write_seq;
-
-    /// Single-flight coalescing for readShardDecoded: concurrent resolves of the SAME shard key
-    /// share ONE head (+ at most one get). The leader publishes its decode to the followers'
-    /// shared_future. Zero added staleness — all coalesced callers get the leader's fresh result.
-    std::mutex shard_inflight_mutex;
-    std::unordered_map<String, std::shared_future<std::shared_ptr<const RootShard>>> shard_inflight;
 
     /// Phase 1c manifest decode cache: (ManifestId, Token) -> decoded immutable PartManifest. Part
     /// manifests are immutable single-owner objects, so a token match guarantees identical bytes; the

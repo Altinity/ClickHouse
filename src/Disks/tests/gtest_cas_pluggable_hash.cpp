@@ -676,39 +676,66 @@ TEST(CasPluggableHash, ForeignAlgoSegmentIsDebrisNotOurs)
 }
 
 /// ============================================================================================
-/// CAS mixed-algo pools Phase 3 T5 controller-review extension: the reader-generation gate
-/// (`Core/CasFormat.h`'s `G_BUILD`) is raised 1 -> 2 (schema-3 settlement is unreadable to a
-/// generation-1 build), and `PoolMeta::createOrValidate`'s existing open-time CAS-raise (T4) now
-/// targets 2 instead of the old no-op constant 1.
+/// CAS reader-generation gate (`Core/CasFormat.h`'s `G_BUILD`) is raised to 3 for the Task-12 ref
+/// snapshot+log format: a build older than generation 3 holds the removed generation-2 mutable ref
+/// manifest and cannot decode the immutable `_log`/`_snap` ref objects. `PoolMeta::createOrValidate`'s
+/// open-time CAS-raise now targets 3, and `decodePoolMeta` fail-closes BOTH on a FUTURE
+/// `min_reader_generation` AND on a BACKWARD pool whose header `compatibility_version` is below
+/// generation 3 (the pre-snapshot+log ref format this build can no longer read).
 /// ============================================================================================
 
-TEST(CasPluggableHash, ReaderGenerationIsRaisedToTwo)
+TEST(CasPluggableHash, ReaderGenerationIsRaisedToThree)
 {
-    EXPECT_EQ(G_BUILD, 2u) << "schema-3 settlement requires reader generation 2 -- a generation-1 "
-        "build cannot decode it, so the no-op gate (G_BUILD == 1) must be raised";
+    EXPECT_EQ(G_BUILD, 3u) << "generation 3 is the Task-12 ref snapshot+log format -- an older build "
+        "cannot decode the immutable _log/_snap ref objects, so the gate (G_BUILD) must be raised to 3";
 
-    /// A freshly opened/created pool records `min_reader_generation == 2` (the open-time CAS-raise,
-    /// `PoolMeta::createOrValidate`, now targets `G_BUILD == 2`).
+    /// A freshly opened/created pool records `min_reader_generation == 3` (the open-time CAS-raise,
+    /// `PoolMeta::createOrValidate`, now targets `G_BUILD == 3`).
     {
         auto backend = std::make_shared<InMemoryBackend>();
         auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
-        EXPECT_EQ(store->poolMeta().min_reader_generation, 2u);
+        EXPECT_EQ(store->poolMeta().min_reader_generation, 3u);
 
         const auto meta_bytes = backend->get(store->layout().poolMetaKey());
         ASSERT_TRUE(meta_bytes.has_value());
-        EXPECT_EQ(decodePoolMeta(meta_bytes->bytes).min_reader_generation, 2u);
+        EXPECT_EQ(decodePoolMeta(meta_bytes->bytes).min_reader_generation, 3u);
     }
 
-    /// A pool-meta carrying `min_reader_generation == 3` (one generation past THIS build's floor)
-    /// still fails closed at open -- the startup gate (`decodePoolMeta`) must reject it even though
-    /// generation 2 is now understood.
+    /// FORWARD gate: a pool-meta carrying `min_reader_generation == G_BUILD + 1` (one generation past
+    /// THIS build's floor) still fails closed at open -- the startup gate (`decodePoolMeta`) rejects it
+    /// even though generation 3 is now understood.
     {
         auto backend = std::make_shared<InMemoryBackend>();
         const Layout layout("p");
         PoolMeta pm = PoolMeta::createOrValidate(*backend, layout, /*root_shards*/ 1, /*blob_header_len*/ 256, BlobHashAlgo::CityHash128);
-        pm.min_reader_generation = 3;
+        pm.min_reader_generation = G_BUILD + 1;
         ASSERT_TRUE(backend->casPut(layout.poolMetaKey(), encodePoolMeta(pm), backend->get(layout.poolMetaKey())->token).outcome == CasOutcome::Committed);
 
+        expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [&]
+        { Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"}); });
+    }
+
+    /// BACKWARD floor (Task 12): a pool whose header `compatibility_version` is BELOW generation 3 was
+    /// written by an older build holding the removed pre-snapshot+log ref format; it must fail closed at
+    /// open rather than mis-recover every table from a fresh-looking empty ref prefix. Craft it at the
+    /// proto layer: take a fresh (generation-3) pool-meta and stamp its header down to `G_BUILD - 1`.
+    {
+        auto backend = std::make_shared<InMemoryBackend>();
+        const Layout layout("p");
+        PoolMeta pm = PoolMeta::createOrValidate(*backend, layout, /*root_shards*/ 1, /*blob_header_len*/ 256, BlobHashAlgo::CityHash128);
+        const String fresh_bytes = encodePoolMeta(pm);
+
+        Proto::PoolMetaProto msg;
+        ASSERT_TRUE(msg.ParseFromString(fresh_bytes));
+        ASSERT_EQ(msg.header().compatibility_version(), G_BUILD);   // sanity: a fresh pool is at the floor
+        msg.mutable_header()->set_compatibility_version(G_BUILD - 1);
+        std::string downgraded;
+        ASSERT_TRUE(msg.SerializeToString(&downgraded));
+        ASSERT_TRUE(backend->casPut(layout.poolMetaKey(), downgraded, backend->get(layout.poolMetaKey())->token).outcome == CasOutcome::Committed);
+
+        /// `decodePoolMeta`'s backward floor rejects the downgraded bytes directly...
+        expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [&] { decodePoolMeta(downgraded); });
+        /// ...and so does a full `Store::open` (decoding the pool-meta is its first fail-closed step).
         expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [&]
         { Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"}); });
     }

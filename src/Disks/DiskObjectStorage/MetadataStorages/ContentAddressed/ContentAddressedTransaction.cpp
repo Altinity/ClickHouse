@@ -241,7 +241,7 @@ bool ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
         /// fill-in/rewrite) and metadata_version bumps on a COMMITTED part.
         if (!st.mutable_files.empty() || !st.mutable_removed.empty())
         {
-            metadata_storage.partAccess().updateMutableFiles({ns, ref}, [&](Cas::RootRef & payload)
+            metadata_storage.partAccess().updateMutableFiles({ns, ref}, [&](Cas::RefMutableFilesUpdate & payload)
             {
                 for (const auto & [name, bytes] : st.mutable_files)
                     payload.mutable_files[name] = bytes;

@@ -168,44 +168,23 @@ TEST(CasBuildRootDangle, PrematureReclaimCommitFailsClosed)
     const ManifestId t2 = b->stageManifest({pe2});
     b->precommitAdd(ns, "refB", t2);
 
-    /// SIMULATE premature reclaim: remove the precommit owner binding exactly as a GC reclaim /
-    /// PrecommitRemove would — append a removal RootOwnerEvent {old = precommit(build_id, "refB", T),
-    /// new = none} on the TABLE namespace shard (the converged model places the precommit binding in the
-    /// future committed ref's own shard, keyed by final_ref_name, NOT a separate `_precommits` namespace).
-    /// We drive the shard manifest CAS directly through the backend codec.
+    /// SIMULATE a premature reclaim having already collected P: had the precommit binding been wrongly
+    /// reclaimed with no other owner, GC would condemn+delete P's closure. Reproduce that END STATE
+    /// directly by deleting P's blob object. (The durable ref-log stream is owned by the live writer, so a
+    /// RAW removal append would collide with the writer's own `RefTxnId` sequence allocation on the next
+    /// flush; the property under test is the COMMIT gate's fail-closed behavior against a missing
+    /// dependency, not the reclaim mechanics -- so we go straight to the reclaimed state.)
     {
-        const String key = s->layout().rootShardKey(ns, s->shardOf("refB"));
-        const auto got = backend->get(key);
-        ASSERT_TRUE(got.has_value()) << "table shard manifest must exist before reclaim";
-        DB::Cas::RootShard root = DB::Cas::decodeRootShard(got->bytes);
-        ++root.shard_version;
-        root.journal.push_back(DB::Cas::RootOwnerEvent{
-            .transition_version = root.shard_version,
-            .old_binding = DB::Cas::OwnerBinding{
-                .owner_kind = DB::Cas::OwnerKind::Precommit,
-                .ref_name = "refB",
-                .build_id = b->buildId(),
-                .manifest_ref = t2.ref},
-            .new_binding = std::nullopt});
-        backend->casPut(key, DB::Cas::encodeRootShard(root), got->token);
+        const String pkey = s->layout().blobKey(idOf(P));
+        const HeadResult h = backend->head(pkey);
+        ASSERT_TRUE(h.exists) << "P must be present before the simulated reclaim";
+        ASSERT_EQ(backend->deleteExact(pkey, h.token).kind, DeleteOutcome::Kind::Deleted);
     }
-
-    /// Drop the source ref too, renew the watermark, and run GC: P is now unprotected (no precommit, no
-    /// table ref, retired owner) and gets collected. The reclaim is a CASCADE — t2 (the manifest tree,
-    /// now an orphan), then t1, then the leaf blob P are condemned over successive rounds, with empty
-    /// rounds in between. The shared runGcToFixpoint helper stops at the first empty round, so it can
-    /// halt mid-cascade; here we drive a fixed, generous number of rounds and let it settle so P is
-    /// reliably collected before the commit attempt.
+    /// Drop the source ref too (the state a real premature reclaim leaves: P unprotected and gone).
     s->dropRef(ns, "refA");
     s->renewWatermarkOnce();
-    Gc gc(s, u128Of("gc-b171-reclaim"));
-    for (int round = 0; round < 32; ++round)
-    {
-        try { gc.runRegularRound(); s->renewWatermarkOnce(); }
-        catch (const DB::Exception &) { break; }
-    }
 
-    /// The shared blob must be GONE (the premature reclaim let GC collect it).
+    /// The shared blob must be GONE (the premature reclaim collected it).
     ASSERT_FALSE(backend->head(s->layout().blobKey(idOf(P))).exists)
         << "premature-reclaim setup invalid: P should have been collected after losing its precommit";
 
@@ -222,96 +201,18 @@ TEST(CasBuildRootDangle, PrematureReclaimCommitFailsClosed)
         << "B171: refB must NOT be committed when its closure is missing (fail-closed)";
 }
 
-namespace
-{
+/// (The GC-reclaim test `CasBuildRoot.AbandonedPrecommitReclaimed` -- which asserted GC AUTOMATICALLY
+/// reclaims an abandoned precommit of a judged-dead build and then collects its closure -- was removed
+/// with the snapshot+log ref model. Per spec §Responsibility Boundary, reclaiming an abandoned precommit
+/// is now the WRITER's job (it appends the exact `owner_transition` removal on recovery); GC never scans
+/// for or removes precommit bindings, and there is no mutable shard journal to append a `PrecommitRemove`
+/// into. The `precommitRemovalAppended` shard-journal probe it shared with `LivePrecommitNotReclaimed`
+/// went with it.)
 
-/// Whether a `PrecommitRemove` event (old = a `OwnerKind::Precommit` binding, new = none) for `ref_name`
-/// appears in the shard's journal. This is the durable, trim-proof signal that a precommit was RECLAIMED
-/// (the encoding GC / abandon / dropRef append). Unlike a "live set" replay, it survives the GC journal
-/// trim: GC trims FOLDED events below the cursor, so a still-live precommit's create event may be gone
-/// from the journal even though it is logically live — but a REMOVAL is what we actually want to detect.
-bool precommitRemovalAppended(InMemoryBackend & backend, const Layout & layout,
-                              const RootNamespace & ns, uint64_t shard, const String & ref_name)
-{
-    const auto got = backend.get(layout.rootShardKey(ns, shard));
-    if (!got)
-        return false;
-    const RootShard root = decodeRootShard(got->bytes);
-    for (const RootOwnerEvent & e : root.journal)
-        if (!e.new_binding && e.old_binding && e.old_binding->owner_kind == OwnerKind::Precommit
-            && e.old_binding->ref_name == ref_name)
-            return true;
-    return false;
-}
-
-}
-
-/// B171 INV-BUILDROOT-RECLAIM (§C.3) / B8: GC AUTOMATICALLY reclaims an ABANDONED precommit of a
-/// judged-dead build in the CONVERGED-SHARD model, then collects its exclusively-owned closure.
-///
-/// `precommitAdd` writes the precommit owner binding into the FUTURE COMMITTED REF's OWN table-namespace
-/// shard (keyed by `final_ref_name`), keyed by `OwnerKind::Precommit`. There is no `_precommits`
-/// namespace. The reclaim must therefore scan EVERY table shard the fold visits for live precommit
-/// bindings, derive `(server, build_seq)` from the binding's `manifest_ref`
-/// (`writer_epoch`, `build_sequence`), judge build-death via the per-server
-/// watermark exactly as the orphan sweep does, and append a `PrecommitRemove` `RootOwnerEvent` for dead
-/// builds. The next fold then folds the `-1` and the closure's blobs become zero-in-degree candidates.
-///
-/// Crash simulation: Build B uploads blob Q (exclusively its own), assembles a manifest, and
-/// `precommitAdd`s it — then VANISHES without calling abandon/promote (we retire its build_seq directly,
-/// as the dtor does on a crash). The watermark is renewed so `min_active` advances PAST B's build_seq.
-/// GC must reclaim B's precommit and collect Q.
-TEST(CasBuildRoot, AbandonedPrecommitReclaimed)
-{
-    std::shared_ptr<InMemoryBackend> backend;
-    auto s = openTestStore(backend);
-    const RootNamespace ns{"test/tbl"};
-    const String Q = "exclusive-blob-payload-Q";
-
-    /// Build B: upload Q (exclusively owned by this build), assemble a manifest, precommitAdd it. The
-    /// precommit owner binding for refB now protects Q with a +1 fold edge.
-    BuildInfo binfo;
-    binfo.intended_ref = ns.string() + "/refB";
-    auto b = s->startBuild(binfo);
-    const uint64_t dead_seq = b->buildSeq();
-    b->putBlob(idOf(Q), BlobSource::fromString(Q));
-    const ManifestId t = b->stageManifest({blobEntry("data.bin", Q)});
-    b->precommitAdd(ns, "refB", t);
-
-    /// Sanity: Q is present before reclaim.
-    ASSERT_TRUE(backend->head(s->layout().blobKey(idOf(Q))).exists);
-
-    /// CRASH: the build vanishes — neither abandon (which would remove the binding) nor promote ran. Only
-    /// the dtor's idempotent retireBuildSeq fires; `b.reset()` is that crash path — the precommit binding
-    /// and the staged body survive, but the seq leaves the active set. Then renew the watermark so the
-    /// durable `min_active` advances PAST `dead_seq` (B is now provably dead: build_seq < min_active).
-    b.reset();
-    s->renewWatermarkOnce();
-    ASSERT_LT(dead_seq, s->minActive()) << "crash sim invalid: B's seq must be below the live floor";
-
-    /// GC over a fixed, generous number of rounds. The reclaim fires while folding refB's shard in the
-    /// first round: it judges B dead via the watermark and appends a PrecommitRemove. But that round still
-    /// sees the precommit's +1 pinning Q (the removal is not folded until the NEXT round), so it reports no
-    /// candidates — a fixpoint helper that stops on the first empty round would halt before the cascade.
-    /// We therefore drive a fixed count and let the cascade settle: round 2 folds the -1 (Q -> in-degree 0),
-    /// then Q is condemned and deleted (precommit edge removed -> orphaned manifest body -> leaf blob Q).
-    Gc gc(s, u128Of("gc-b8-reclaim"));
-    for (int round = 0; round < 32; ++round)
-    {
-        try { gc.runRegularRound(); s->renewWatermarkOnce(); }
-        catch (const DB::Exception &) { break; }
-    }
-
-    /// Q's only protection was the precommit edge; with it reclaimed Q reaches in-degree 0 and is deleted.
-    ASSERT_FALSE(backend->head(s->layout().blobKey(idOf(Q))).exists)
-        << "B8: the dead build's exclusively-owned blob Q must be collected after the precommit reclaim";
-}
-
-/// B8 CONSERVATISM (liveness-correctness guard): a build with a LIVE precommit — its build_seq is at/above
-/// `min_active` and the server's watermark is NOT frozen — must NEVER be reclaimed by GC. The precommit
-/// binding (and its pinned blobs) must survive a full GC round. Safety against a WRONGFUL reclaim is
-/// already covered by the promote-fail-closed guard (PrematureReclaimCommitFailsClosed); this guards the
-/// dual liveness property: GC must not abort a still-live build by reclaiming its in-flight precommit.
+/// B8 CONSERVATISM (liveness-correctness guard): a live in-flight build's precommit binding (and its
+/// pinned blobs) must survive a full GC run, and the build must still be able to promote it. In the
+/// snapshot+log model GC never reclaims a precommit at all, so this is purely a liveness pin: the live
+/// precommit's `+1` fold edge keeps its exclusively-owned blob alive across GC.
 TEST(CasBuildRoot, LivePrecommitNotReclaimed)
 {
     std::shared_ptr<InMemoryBackend> backend;
@@ -334,13 +235,7 @@ TEST(CasBuildRoot, LivePrecommitNotReclaimed)
     Gc gc(s, u128Of("gc-b8-live"));
     runGcToFixpoint(gc);
 
-    /// No PrecommitRemove for refLive may have been appended — GC must not reclaim an in-flight build's
-    /// precommit. (Checked directly: a reclaim's removal event is the unambiguous signal; in a live, all-
-    /// folded round nothing trims it away before this check since no removal exists to fold.)
-    ASSERT_FALSE(precommitRemovalAppended(*backend, s->layout(), ns, s->shardOf("refLive"), "refLive"))
-        << "B8 conservatism: a live build's precommit must not be reclaimed (no PrecommitRemove appended)";
-
-    /// And Q must still be present (the live precommit pins it across GC).
+    /// Q must still be present (the live precommit's +1 edge pins it across GC).
     ASSERT_TRUE(backend->head(s->layout().blobKey(idOf(Q))).exists)
         << "B8 conservatism: the live precommit must keep its blob alive across GC";
 

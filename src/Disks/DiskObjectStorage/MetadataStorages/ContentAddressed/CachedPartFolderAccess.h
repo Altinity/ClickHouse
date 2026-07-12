@@ -74,7 +74,7 @@ public:
     /// Move a COMMITTED ref by republish + drop-source. false = absent source (nothing written).
     bool republishRef(const PartRefKey & src, const PartRefKey & dst);
     /// Mutable-only committed update (autocommit one-shots on a COMMITTED part). NO journal event.
-    void updateMutableFiles(const PartRefKey & key, std::function<void(Cas::RootRef &)> mutator);
+    void updateMutableFiles(const PartRefKey & key, std::function<void(Cas::RefMutableFilesUpdate &)> mutator);
     void dropRef(const PartRefKey & key);
     /// Idempotent removal: absent ref is success; a drop racing between resolve and the shard
     /// re-read (FILE_DOESNT_EXIST) is success too — the removal unit is replay-safe.

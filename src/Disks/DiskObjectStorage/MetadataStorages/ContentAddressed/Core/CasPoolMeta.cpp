@@ -129,11 +129,24 @@ PoolMeta decodePoolMeta(std::string_view data)
     validatePoolConstants(pm.root_shards, pm.blob_header_len, ErrorCodes::CORRUPTED_DATA, "pool meta");
     validateAlgosUsed(pm.algos_used, ErrorCodes::CORRUPTED_DATA, "pool meta");
 
-    /// Startup gate: if min_reader_generation > G_BUILD, this binary is too old to open the pool.
+    /// Startup gate (forward): if min_reader_generation > G_BUILD, this binary is too old to open the pool.
     if (G_BUILD < pm.min_reader_generation)
         throw Exception(ErrorCodes::UNKNOWN_FORMAT_VERSION,
             "CAS pool meta: pool requires reader generation {} but this build supports at most {}",
             pm.min_reader_generation, G_BUILD);
+
+    /// Startup gate (backward, Task 12): the ref state changed INCOMPATIBLY from the mutable
+    /// pre-generation-3 ref-shard objects to immutable `_log`/`_snap` objects at generation
+    /// `kRefSnapshotLogGeneration`. A pool written by an older build stamps its pool-meta
+    /// `compatibility_version` below that generation and holds pre-generation-3 ref-shard-format refs
+    /// this build cannot read; fail closed rather than silently mis-recovering every table from a
+    /// fresh-looking empty ref prefix. CAS is pre-release (no data to migrate) -- the pool must be recreated.
+    if (msg.header().compatibility_version() < kRefSnapshotLogGeneration)
+        throw Exception(ErrorCodes::UNKNOWN_FORMAT_VERSION,
+            "CAS pool meta: pool was written with the removed pre-generation-3 mutable ref-shard format "
+            "(compatibility generation {}); this build reads only the snapshot+log ref format "
+            "(generation {}+). The pool is not openable; CAS is pre-release -- recreate it.",
+            msg.header().compatibility_version(), kRefSnapshotLogGeneration);
 
     return pm;
 }

@@ -4,6 +4,9 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcCursorKey.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcShardPlan.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasOrphanManifestSweep.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRefIntake.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRefLogCodec.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRefSnapshotCodec.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRunFile.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasCodecUtil.h>
 #include <IO/ReadBufferFromMemory.h>
@@ -54,13 +57,6 @@ namespace DB::Cas
 
 namespace
 {
-
-/// Forward declarations for the watermark/precommit helpers defined lower in this file (another block of
-/// this same TU-unique unnamed namespace). `Gc::fold` and `Gc::computeDiscoverDecisions` above their
-/// definition point need these visible; `reclaimAbandonedPrecommit` sits after the definitions.
-std::optional<MountLease> floorForNamespace(Store & store, const RootNamespace & ns);
-bool isPrecommitDead(uint64_t writer_epoch, uint64_t build_sequence, const MountLease & w);
-std::optional<std::pair<uint64_t, uint64_t>> minLivePrecommit(const RootShard & root);
 
 UInt128 cityHash128(const String & bytes)
 {
@@ -619,13 +615,13 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired)
         });
     }
 
-    /// Task 6: reclaim empty+tombstoned+fully-folded ref-shard objects. Must run BEFORE trim so the
-    /// tombstone event is still present in the journal.
-    reclaimDroppedShards(folded);
-
-    /// Trim journals below the sealed fold cursor.
+    /// Ref-object cleanup + namespace-cleanup item passes (spec §Step 6), post-CAS so the durable fold
+    /// cursor is committed. `suppress_destructive` (any clamp or ref-folding abort this round) gates the
+    /// deletes; the idempotent marker / `Removed`-snapshot republication for a Completed item still runs.
+    const bool suppress_destructive = !report.anomalies.empty();
     if (trim_enabled)
-        trim(folded, state.round);
+        cleanupRefObjects(folded, suppress_destructive);
+    runNamespaceCleanupPasses(folded.fold_seal, suppress_destructive);
 
     /// Bounded orphan-manifest backstop: cleanup-only cursor progress; never fails the round.
     try
@@ -726,8 +722,43 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     const Layout & layout = store->layout();
     FoldResult result;
 
-    /// 1. Discover the present (namespace, shard) pairs via LIST(cas/refs/) (Task 4 LIST-based discovery).
-    result.root_shards = discoverUniverse();
+    /// 1. One global paginated LIST of cas/refs/, grouped into per-table (log / snapshot / cleanup-marker)
+    /// listings (spec §Step 1: Enumerate Once). This single enumeration serves BOTH ref-log intake and
+    /// ref-object cleanup planning. Resume is by explicit last-returned-key (`ListPage::next_cursor`).
+    std::vector<String> ref_object_keys;
+    {
+        const String refs_prefix = layout.casRefsPrefix();
+        String list_cursor;
+        for (;;)
+        {
+            const ListPage page = backend.list(refs_prefix, list_cursor, 1000);
+            for (const ListedKey & lk : page.keys)
+                ref_object_keys.push_back(lk.key);
+            if (page.next_cursor.empty())
+                break;
+            list_cursor = page.next_cursor;
+        }
+    }
+
+    /// A malformed ref-object key or namespace aborts ref folding for the whole round (spec §Step 2): the
+    /// round produces no ref delta, advances no cursor, and authorizes no destructive work -- recorded as
+    /// an anomaly (which drives `suppress_destructive`), never a throw that wedges the round.
+    std::map<String, RefTableListing> ref_tables;
+    bool ref_folding_aborted = false;
+    try
+    {
+        ref_tables = groupRefKeys(layout, ref_object_keys);
+    }
+    catch (const Exception & e)
+    {
+        ref_folding_aborted = true;
+        report.recordAnomaly(RootNamespace{}, 0, ManifestId{},
+                             "malformed ref-object key: ref folding aborted this round");
+        LOG_WARNING(getLogger("CasGc"),
+                    "CAS GC ref intake: {} -- aborting ref folding for the round", e.message());
+    }
+    for (const auto & [ns_str, listing] : ref_tables)
+        result.root_shards.emplace_back(RootNamespace{ns_str}, 0);
 
     /// Parent cursors — the per-(ns,shard) cursors a prior round sealed. One-pass round: read them from
     /// the fold seal at the adopted (snap_generation, snap_attempt) (the fold seal IS the coverage record).
@@ -839,238 +870,186 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     std::vector<BlobDelta> deltas;
     bool folded_any = false;
 
-    /// Phase-2 token-diff: compute the per-shard discover decisions ONCE before the shard loop. A Skip
-    /// means the LIST-observed shard token equals the sealed post-fence `folded_token`, so the shard body
-    /// is unchanged since the prior fold and the durable state already covers it — we carry the parent
-    /// coverage forward unchanged and elide the `readShard` body GET. A Read uses the existing fold path
-    /// unchanged. The fence still runs globally on EVERY shard regardless — this skip elides ONLY the body
-    /// read / re-fold, never the fence.
-    ///
-    /// The reference (post-fence tokens + fence positions) comes from the PARENT generation's completion
-    /// seal (recorded by `recheck`). If no completion seal exists (mid-round: fold sealed, completion not
-    /// yet advanced) we read the fold seal at the SAME adopted pair; if neither exists (fresh pool) the
-    /// empty seal yields all Read.
-    ///
-    /// VERIFIED-SAFE (B2): the reference seal always resolves at the ADOPTED `(snap_generation,
-    /// snap_attempt)` — a completed round leaves the completion seal there; a mid-round state has
-    /// `snap_generation == G_f` with its fold seal under `snap_attempt`; a fresh pool has neither. The old
-    /// `for g = snap_generation downto 1` back-scan was UNSOUND with a single stored `snap_attempt`: for
-    /// `g < snap_generation` the adopted attempt was a DIFFERENT `lease.seq`, recorded nowhere, so
-    /// `readFoldSeal(g, snap_attempt)` is the wrong key (nullopt only by accident). A direct read at the
-    /// adopted pair (else empty) is conservative — fail-closed to all-Read, never an older generation.
+    /// The adopted parent seal, read once at the ADOPTED (snap_generation, snap_attempt): it carries the
+    /// parent generation's `blob_target_runs` (resolved below into per-gc-shard prior runs) and the parent
+    /// `condemned_summary` (the pure-carry decision). A completed round leaves its fold seal there; a fresh
+    /// pool has none (empty seal). Under the snapshot+log ref model there is no per-shard token-diff Skip:
+    /// the "did this table change" signal is simply whether the global LIST returned any log id above the
+    /// table's durable cursor, which the per-table loop below tests directly.
     CasFoldSeal discover_ref_seal;
     if (const auto fold_seal = readFoldSeal(state.snap_generation, state.snap_attempt))
         discover_ref_seal = *fold_seal;
-    /// else: leave discover_ref_seal empty (fresh pool / no adopted seal) => all Read. (The one-pass
-    /// round writes only fold seals; completion seals are a retired concept. `folded_token` is now the
-    /// FOLD-time shard token — conservative: any later write changes it => Read next round.)
-    const std::map<String, DiscoverDecision> discover_decisions =
-        computeDiscoverDecisions(discover_ref_seal);
 
-    for (const auto & [ns, root_shard] : result.root_shards)
+    /// Each fully-folded remove_namespace transaction seeds a namespace-cleanup item (spec §Remove Namespace).
+    std::vector<std::pair<RootNamespace, RefTxnId>> new_removals;
+
+    /// 2-3. Ref-log intake (spec §Step 2 Decode / §Step 3 Produce Manifest-Edge Delta): for each table,
+    /// GET every log with id > its durable cursor in ascending id order, decode+validate the body, and
+    /// fold each explicit owner-change into `foldManifestEdges` (which reads the manifest body and appends
+    /// per-blob `BlobDelta`s to `deltas`). The durable cursor advances per FULLY folded log; a missing
+    /// manifest body clamps this table below the log (barrier, re-read next round) while other tables keep
+    /// folding. One transaction = one key, so logs of one table fold in strict id order.
+    for (auto & [ns_str, listing] : ref_tables)
     {
-        const String cursor_key = cursorKey(ns, root_shard);
+        if (ref_folding_aborted)
+            break;
+        const RootNamespace ns{ns_str};
+        const String cursor_key = cursorKey(ns, /*shard*/0);
 
-        /// Phase-2 token-diff skip: carry the parent coverage forward (classification 1 = Unchanged,
-        /// same folded_token + folded_cursor) and skip the body GET. The default below is Read, so a
-        /// missing decision or missing parent coverage falls through to the existing read path (fail
-        /// closed — the spec, not a hidden fallback).
-        {
-            const auto dec_it = discover_decisions.find(cursor_key);
-            if (dec_it != discover_decisions.end() && dec_it->second == DiscoverDecision::Skip)
-            {
-                const auto parent_it = parent_cursors.find(cursor_key);
-                if (parent_it != parent_cursors.end())
-                {
-                    ShardCoverage carried = parent_it->second;
-                    carried.classification = 1;   /// Unchanged: token matched persisted; body read skipped
-                    result.fold_seal.per_ns_shard[cursor_key] = carried;
-                    continue;
-                }
-                /// Skip decided but parent coverage absent (should not happen — `computeDiscoverDecisions`
-                /// requires prior coverage for Skip). Fail closed: fall through to the Read path below.
-            }
-        }
-
-        /// B8: reclaim ABANDONED precommits BEFORE reading the shard for the fold, so the reclaim's
-        /// PrecommitRemove event is folded IN THIS SAME ROUND — its `-1` lands in this round's deltas and the
-        /// fold cursor advances to cover it. (Appending it AFTER sealing the cursor would leave an event above
-        /// the sealed cursor, which the next round's fold would apply — a double-counted `-1`.) The reclaim
-        /// PIGGYBACKS on this per-shard visit: it reads the shard
-        /// already being visited, no extra LIST / no separate enumeration stage. It judges build-death from
-        /// each live `OwnerKind::Precommit` binding's `manifest_ref` (server + build_seq) via the watermark.
-        reclaimAbandonedPrecommit(ns, root_shard, state.round + 1);
-
-        const auto [root, manifest_token] = store->readShard(ns, root_shard);
+        /// Parent cursor = the durable last_folded_ref_id this table folded to (absent => {0,0}). RefTxnId
+        /// is strictly increasing (writer_epoch primary), so a removed+recreated namespace's new logs carry
+        /// a greater id and fold normally -- no ABA / incarnation check is needed (id ordering subsumes it).
         const auto cursor_it = parent_cursors.find(cursor_key);
+        const RefTxnId cursor = cursor_it != parent_cursors.end()
+            ? cursor_it->second.last_folded_ref_id : RefTxnId{};
 
-        /// ABA-proof cursor: if the sealed incarnation differs from the live shard's incarnation
-        /// (the shard was deleted and recreated at the same path), the prior cursor is stale — it
-        /// was sealed against a different object. Reset to 0 so we re-fold the new shard's full
-        /// journal from scratch.
-        ///
-        /// Within a single fold() call, no deltas for this shard have been accumulated in `deltas`
-        /// at the point we detect the mismatch (the mismatch is detected before the journal loop
-        /// for this shard begins). Stale source-edges already baked into the parent generation's
-        /// in-degree run from prior rounds cannot be removed here — the old shard's data is gone;
-        /// they will be abandoned-orphaned (unreachable source-ids with no live manifest body)
-        /// and are harmless: they prevent a blob from being GC-deleted at most one extra round.
-        /// The cursor reset is the ABA-correctness fix: without it, new events on the recreated
-        /// shard would be skipped by the stale cursor, creating a durable in-degree under-count.
-        const bool incarnation_mismatch = cursor_it != parent_cursors.end()
-            && cursor_it->second.incarnation != root.incarnation;
-        if (incarnation_mismatch)
-            LOG_DEBUG(getLogger("CasGc"),
-                "CAS GC fold: incarnation mismatch for {}/{} "
-                "(sealed={{{},{}}}, live={{{},{}}}); resetting fold cursor to 0",
-                ns.string(), root_shard,
-                cursor_it->second.incarnation.writer_epoch,
-                cursor_it->second.incarnation.build_sequence,
-                root.incarnation.writer_epoch,
-                root.incarnation.build_sequence);
-
-        const uint64_t cursor = (incarnation_mismatch || cursor_it == parent_cursors.end())
-            ? 0
-            : cursor_it->second.folded_cursor;
-
-        /// Baseline guard (spec 2026-07-03-cas-gc-rebuild-design.md Part 1): a shard with NO sealed
-        /// cursor whose journal PROVES trimmed history means the baseline that folded (and licensed
-        /// trimming) those events is gone — folding it from scratch would mass-condemn every blob
-        /// whose edges lived only in the lost snapshot. Fail closed; the recovery is the explicit
-        /// rebuild. A shard born after the baseline passes (journal starts at transition_version 1);
-        /// an incarnation-mismatch reset passes too (the recreated shard's journal restarts at 1).
-        if (cursor_it == parent_cursors.end() && !incarnation_mismatch)
+        /// Baseline guard (spec §Offline Recovery): a table with NO sealed cursor whose logs at/below its
+        /// newest snapshot have all been cleaned means a prior fold advanced+cleaned them and then gc/state
+        /// was lost -- folding from {0,0} would miss those edges and mass-condemn their blobs. Fail closed;
+        /// recover with the explicit rebuild. A fresh table (writer already snapshotted, logs still present)
+        /// passes because its logs at or below the snapshot survive.
+        if (cursor_it == parent_cursors.end() && !listing.snapshots.empty())
         {
-            const bool proves_trim = root.journal.empty()
-                ? root.shard_version > 0
-                : root.journal.front().transition_version > 1;
-            if (proves_trim)
+            const RefTxnId newest_snapshot = listing.snapshots.back();
+            const bool logs_below_snapshot_gone = listing.logs.empty() || newest_snapshot < listing.logs.front();
+            if (logs_below_snapshot_gone)
                 throw Exception(ErrorCodes::CORRUPTED_DATA,
-                    "CAS GC baseline guard: ref shard {}/{} journal starts at transition_version {} "
-                    "(shard_version {}) but no sealed baseline covers it — gc/state was lost or "
-                    "regressed. GC refuses to run; recover with SYSTEM CONTENT ADDRESSED GC REBUILD.",
-                    ns.string(), root_shard,
-                    root.journal.empty() ? 0 : root.journal.front().transition_version,
-                    root.shard_version);
+                    "CAS GC baseline guard: table {} has snapshot {} but no surviving log at or below it and "
+                    "no sealed fold cursor -- gc/state was lost after cleaning covered logs. GC refuses to "
+                    "run; recover with SYSTEM CONTENT ADDRESSED GC REBUILD.",
+                    ns_str, renderRefTxnId(newest_snapshot));
         }
 
         ShardCoverage cov;
-        cov.folded_token = manifest_token.value_or(Token{});
         cov.classification = 0;
-
-        bool shard_changed = false;
-        /// resolved_through is the cursor we commit. Two conditions CLAMP it just below an event (never
-        /// advancing past it), record an anomaly, and stop folding THIS shard — while OTHER shards still
-        /// fold (GC never wedges the round on a 404; feedback_ca_gc_never_throw_on_404):
-        ///   (a) a true-removal whose edge-bearing old body is missing at removal-fold (control #11);
-        ///   (b) the FOLD BARRIER (control #23): a live create-precommit whose body is not yet present.
-        uint64_t resolved_through = root.shard_version;
+        bool table_changed = false;
         bool clamped = false;
-        auto clampBefore = [&](uint64_t at_version, const ManifestId & id, const char * what)
-        {
-            report.recordAnomaly(ns, root_shard, id, what);
-            resolved_through = at_version > 0 ? at_version - 1 : 0;
-            clamped = true;
-            /// 2026-07-03 forensics gap: clamp details previously lived only in the in-memory
-            /// RoundReport (the gc log stores just the COUNT) — attributing the night's 30-minute
-            /// clamp era took an hour of indirect cursor archaeology. One row makes it instant.
-            EventEmitter{*store}.emit([&](CasEvent & ev)
-            {
-                ev.type = CasEventType::GcFoldClamp;
-                ev.namespace_ = ns.string();
-                ev.object_kind = CasEventObjectKind::Root;
-                ev.object_hash = manifestRefDebugString(id.ref);
-                ev.at_version = at_version;
-                ev.outcome = "clamped";
-                ev.reason = what;
-                ev.detail = {{"shard", std::to_string(root_shard)},
-                             {"resolved_through", std::to_string(resolved_through)}};
-            });
-        };
+        RefTxnId resolved_through = cursor;   /// advances per fully-folded log; a clamp keeps it below the log
 
-        /// ONE ordered RootOwnerEvent stream, transition_version order. Dispatch each event by comparing
-        /// old_binding.manifest_ref vs new_binding.manifest_ref.
-        for (const RootOwnerEvent & e : root.journal)
+        for (const RefTxnId & log_id : listing.logs)
         {
+            if (!(cursor < log_id))
+                continue;   /// id <= cursor: already folded in a prior round
             if (clamped)
                 break;
-            if (e.transition_version <= cursor || e.transition_version > root.shard_version)
-                continue;
 
-            const bool has_old = e.old_binding.has_value();
-            const bool has_new = e.new_binding.has_value();
-            if (has_old && has_new && e.old_binding->manifest_ref == e.new_binding->manifest_ref)
+            /// GET + decode the new log body. A missing or invalid log body aborts ref folding for the whole
+            /// round (spec §Step 2): the listed key was durable, so absence is input-visibility ambiguity,
+            /// never a partial ref delta.
+            const auto got = backend.get(layout.refLogKey(ns, log_id));
+            if (!got)
             {
-                /// OWNER MOVE (promote precommit -> committed): same manifest_ref, no delta, no cleanup.
-                /// The activating +1 was folded earlier — the barrier guarantees the create-precommit was
-                /// activated (body present) before this move could be reached.
-                shard_changed = true;
-                continue;
+                ref_folding_aborted = true;
+                report.recordAnomaly(ns, 0, ManifestId{ns, {}},
+                                     "ref log body vanished mid-fold: ref folding aborted this round");
+                break;
+            }
+            RefLogTxn txn;
+            try
+            {
+                txn = decodeRefLogTxn(got->bytes, ns_str, log_id);
+            }
+            catch (const Exception & e)
+            {
+                ref_folding_aborted = true;
+                report.recordAnomaly(ns, 0, ManifestId{ns, {}},
+                                     "ref log body invalid: ref folding aborted this round");
+                LOG_WARNING(getLogger("CasGc"), "CAS GC ref intake: log {} invalid: {}",
+                            layout.refLogKey(ns, log_id), e.message());
+                break;
             }
 
-            if (has_old)
+            /// Fold every explicit manifest edge of the log (spec §Step 3). A missing manifest body is a
+            /// per-table CLAMP (barrier), never a round abort: keep the cursor below THIS log and re-read it
+            /// next round. A removed precommit whose body never existed emitted no edge -- skip, no clamp.
+            for (const RefManifestEdge & edge : manifestEdgesOfTxn(txn))
             {
-                /// True removal: mirror ONLY edges actually emitted at activation. A precommit never
-                /// activated (missing body) emitted none, so a missing old body simply contributes no -1.
-                const ManifestId old_id{ns, e.old_binding->manifest_ref};
-                const bool was_precommit = e.old_binding->owner_kind == OwnerKind::Precommit;
-                if (!foldManifestEdges(old_id, -1, deltas, result.mf_cleanup))
+                if (foldManifestEdges(edge.manifest_id, edge.change, deltas, result.mf_cleanup))
+                    continue;
+
+                if (edge.change < 0 && edge.owner_kind == RefOwnerKind::Precommit)
+                    continue;   /// removed precommit that never activated: no edge to mirror, no clamp
+
+                const char * reason = edge.change > 0
+                    ? (edge.owner_kind == RefOwnerKind::Precommit
+                           ? "fold barrier: live precommit body not yet present (non-activating)"
+                           : "committed/promoted ref names a missing manifest body")
+                    : "owner-removal: edge-bearing committed body missing at removal-fold";
+                report.recordAnomaly(ns, 0, edge.manifest_id, reason);
+                EventEmitter{*store}.emit([&](CasEvent & ev)
                 {
-                    if (!was_precommit)
-                    {
-                        /// A committed owner-removal whose edge-bearing body is gone at removal-fold: the
-                        /// matching -1 is unresolvable. Do NOT skip silently, do NOT emit a partial -1.
-                        clampBefore(e.transition_version, old_id,
-                            "owner-removal: edge-bearing committed body missing at removal-fold");
-                        break;
-                    }
-                    /// A removed precommit whose body is absent emitted no edges — nothing to mirror.
-                }
+                    ev.type = CasEventType::GcFoldClamp;
+                    ev.namespace_ = ns_str;
+                    ev.object_kind = CasEventObjectKind::Root;
+                    ev.object_hash = manifestRefDebugString(edge.manifest_id.ref);
+                    ev.outcome = "clamped";
+                    ev.reason = reason;
+                    ev.detail = {{"log", renderRefTxnId(log_id)},
+                                 {"resolved_through",
+                                  resolved_through == RefTxnId{} ? "none" : renderRefTxnId(resolved_through)}};
+                });
+                clamped = true;
+                break;   /// stop folding this log's edges; the cursor stays at resolved_through (< log_id)
             }
 
-            if (has_new)
-            {
-                const ManifestId id{ns, e.new_binding->manifest_ref};
-                const bool is_precommit = e.new_binding->owner_kind == OwnerKind::Precommit;
-                if (!foldManifestEdges(id, +1, deltas, result.mf_cleanup))
-                {
-                    if (is_precommit)
-                        /// FOLD BARRIER (control #23): a live create-precommit whose body is not yet
-                        /// present is NON-ACTIVATING. Clamp below it; it activates (+1) when the body
-                        /// appears, or a later removal event drops it. Never throw/wedge.
-                        clampBefore(e.transition_version, id,
-                            "fold barrier: live precommit body not yet present (non-activating)");
-                    else
-                        /// A committed/promoted new-binding naming a missing body is fail-closed FOR THIS
-                        /// DECISION: a committed owner is never treated as zero-edge (INV_NO_DANGLE).
-                        clampBefore(e.transition_version, id,
-                            "committed/promoted ref names a missing manifest body");
-                    break;
-                }
-            }
-            shard_changed = true;
+            if (clamped)
+                break;                     /// stop folding this table
+            /// A fully-folded remove_namespace transaction hands its {ns, remove_txn_id} to the
+            /// namespace-cleanup item (spec §Remove Namespace); its owner-removal edges were folded above.
+            if (const auto removal = removalTxnId(txn))
+                new_removals.emplace_back(ns, *removal);
+            resolved_through = log_id;     /// this log fully folded
+            table_changed = true;
         }
 
-        cov.folded_cursor = resolved_through;
-        cov.incarnation = root.incarnation;   /// stamp live incarnation; next round detects mismatch on ABA
-        /// Clamped coverage (4) is load-bearing for the token-diff: a barrier/anomaly clamp leaves
-        /// unfolded events that a manifest-body arrival can make foldable WITHOUT touching the shard
-        /// (token unchanged) — Skip would park them forever.
-        cov.classification = clamped ? 4 : (shard_changed ? 2 : 1);
-        /// Stamp the CURRENT live-precommit floor for the discover force-Read guard. Recomputed on EVERY
-        /// Read visit (after the journal was read AND after this round's reclaim removal was folded), so
-        /// once a reclaim's PrecommitRemove drops the last live precommit the coverage shows none — the
-        /// guard self-terminates and the token-stable shard is Skipped again.
-        if (const auto mlp = minLivePrecommit(root))
-        {
-            cov.has_live_precommit = true;
-            cov.min_live_precommit_writer_epoch = mlp->first;
-            cov.min_live_precommit_build_sequence = mlp->second;
-        }
+        cov.last_folded_ref_id = resolved_through;
+        cov.classification = clamped ? 4 : (table_changed ? 2 : 1);
         result.fold_seal.per_ns_shard[cursor_key] = cov;
-        if (shard_changed)
+        if (table_changed)
             folded_any = true;
     }
+
+    /// All-or-nothing (spec §Step 2): a malformed key/body anywhere aborts the round's ref folding. Discard
+    /// every ref delta and cursor advance already accumulated, carry each table's parent cursor verbatim,
+    /// and let the recorded anomaly suppress destructive work.
+    if (ref_folding_aborted)
+    {
+        deltas.clear();
+        result.mf_cleanup.clear();
+        folded_any = false;
+        result.fold_seal.per_ns_shard.clear();
+        for (const auto & [ns_str, listing] : ref_tables)
+        {
+            const String cursor_key = cursorKey(RootNamespace{ns_str}, /*shard*/0);
+            ShardCoverage cov;
+            cov.classification = 1;
+            if (const auto pit = parent_cursors.find(cursor_key); pit != parent_cursors.end())
+                cov.last_folded_ref_id = pit->second.last_folded_ref_id;
+            result.fold_seal.per_ns_shard[cursor_key] = cov;
+        }
+    }
+
+    /// Reuse the round's single ref LIST for post-CAS ref-object cleanup (spec §Step 1: one LIST serves
+    /// intake AND cleanup planning).
+    result.ref_tables = ref_tables;
+
+    /// Namespace-cleanup items (spec §Step 6): carry the parent generation's items forward, add a Pending
+    /// item for each remove_namespace transaction folded this round (skipped on a ref-folding abort), and
+    /// promote a Pending item to Completed once its physical `@cas@` prefixes (manifest bodies + verbatim
+    /// files) are empty. The Pending->Completed transition depends only on physical emptiness, so a carried
+    /// item still advances even on an abort.
+    result.fold_seal.ns_cleanup_items =
+        adopted_seal ? adopted_seal->ns_cleanup_items : std::map<String, RefNsCleanupItem>{};
+    if (!ref_folding_aborted)
+        for (const auto & [rns, remove_txn_id] : new_removals)
+        {
+            const String key = rns.string() + "\n" + renderRefTxnId(remove_txn_id);
+            result.fold_seal.ns_cleanup_items[key] = RefNsCleanupItem{
+                .ns = rns, .remove_txn_id = remove_txn_id, .state = RefNsCleanupState::Pending};
+        }
+    for (auto & [key, item] : result.fold_seal.ns_cleanup_items)
+        if (item.state != RefNsCleanupState::Completed && namespacePhysicallyEmpty(item.ns))
+            item.state = RefNsCleanupState::Completed;
 
     /// T0 (2026-07-02 snapshot-streaming): the parent generation's per-shard run segments, resolved from
     /// the parent fold seal's `blob_target_runs` and grouped by the ref's explicit `shard`. The same seal
@@ -1267,75 +1246,113 @@ void Gc::runManifestSweepCursorPass(GcState & state, Token & state_token)
         result.listed, result.deleted, result.skipped);
 }
 
-void Gc::trim(FoldResult & folded, uint64_t /*round*/)
+bool Gc::namespacePhysicallyEmpty(const RootNamespace & ns)
 {
-    const uint64_t trim_min_events = store->poolConfig().gc_trim_min_events;
-    const uint64_t trim_body_soft_limit = store->poolConfig().gc_trim_body_soft_limit;
+    Backend & backend = store->backend();
+    const Layout & layout = store->layout();
+    for (const String & prefix : {layout.manifestNamespacePrefix(ns), layout.namespaceFilesPrefix(ns)})
+        if (!backend.list(prefix, /*cursor*/String{}, /*limit*/1).keys.empty())
+            return false;
+    return true;
+}
 
-    /// B12: consume (and reset) the maintenance-trim flag exactly once per round.
-    const bool is_maintenance = maintenance_trim;
-    maintenance_trim = false;
+void Gc::cleanupRefObjects(const FoldResult & folded, bool suppress_destructive)
+{
+    /// A clamp / ref-folding abort this round may leave landed-before-cut edges unfolded behind the clamp,
+    /// so a covered-log cleanup could delete a log whose delta is not yet durable -- defer to a clean pass.
+    if (suppress_destructive)
+        return;
 
-    for (const auto & [ns, shard] : folded.root_shards)
+    Backend & backend = store->backend();
+    const Layout & layout = store->layout();
+
+    /// A remove_namespace log is retained until its namespace-cleanup item is durably Completed (spec
+    /// §Step 6 condition 3): its owner-removal edges must stay foldable until the physical reclaim is done.
+    std::set<std::pair<String, RefTxnId>> blocked_removals;
+    for (const auto & [key, item] : folded.fold_seal.ns_cleanup_items)
+        if (item.state != RefNsCleanupState::Completed)
+            blocked_removals.insert({item.ns.string(), item.remove_txn_id});
+
+    /// Backend exposes only token-conditional `deleteExact` (no batch-delete primitive), so cleanup is a
+    /// per-key HEAD + exact-token delete (like the orphan sweep). Ref objects are immutable and their keys
+    /// are never reused (a recreated namespace uses a greater writer_epoch), so a NotFound / TokenMismatch
+    /// is benign debris, never a lost race -- tolerated, never a throw.
+    const auto deleteRefObject = [&](const String & key)
     {
-        const String cursor_key = cursorKey(ns, shard);
-        /// INV-JOURNAL-COVERAGE: source the trim cursor exclusively from the sealed CasFoldSeal
-        /// per-shard coverage. A shard absent from the sealed coverage has no provably-folded
-        /// records yet — trim nothing for it (no fallback to a looser cursor, per the invariant).
-        const auto cov_it = folded.fold_seal.per_ns_shard.find(cursor_key);
-        if (cov_it == folded.fold_seal.per_ns_shard.end())
-            continue;
-        const uint64_t cursor = cov_it->second.folded_cursor;
-        if (cursor == 0)
-            continue;
+        const HeadResult h = backend.head(key);
+        if (h.exists)
+            backend.deleteExact(key, h.token);
+    };
 
-        /// Peek: read the shard once to inspect the journal and encoded body size.
-        const auto [peek, tok] = store->readShard(ns, shard);
+    for (const auto & [ns_str, listing] : folded.ref_tables)
+    {
+        const RootNamespace ns{ns_str};
+        RefTxnId durable_cursor{};
+        if (const auto it = folded.fold_seal.per_ns_shard.find(cursorKey(ns, /*shard*/0));
+            it != folded.fold_seal.per_ns_shard.end())
+            durable_cursor = it->second.last_folded_ref_id;
 
-        /// Count events at/below the sealed cursor (these are the trimmable ones).
-        uint64_t trimmable_count = 0;
-        for (const RootOwnerEvent & e : peek.journal)
-            if (e.transition_version <= cursor)
-                ++trimmable_count;
+        std::set<RefTxnId> removal_logs_blocked;
+        for (const RefTxnId & log_id : listing.logs)
+            if (blocked_removals.count({ns_str, log_id}))
+                removal_logs_blocked.insert(log_id);
 
-        if (trimmable_count == 0)
-            continue;   /// nothing to trim — no pointless version bump (same as before)
+        const RefCleanupPlan plan = planRefCleanup(listing, durable_cursor, removal_logs_blocked);
+        for (const RefTxnId & log_id : plan.deletable_logs)
+            deleteRefObject(layout.refLogKey(ns, log_id));
+        for (const RefTxnId & snap_id : plan.deletable_snapshots)
+            deleteRefObject(layout.refSnapshotKey(ns, snap_id));
+    }
+}
 
-        /// B12 lazy-trim gate: compact only when a threshold is met.
-        ///   (a) event-count batch gate: trimmable_count >= gc_trim_min_events (0 = eager, always compact).
-        ///   (b) body soft-limit gate: the encoded shard body is at/above gc_trim_body_soft_limit.
-        ///   (c) maintenance mode: explicit one-round full-compaction bypass.
-        /// Gate (b) guarantees bounded journal growth even when (a) never fires (unbounded build-up
-        /// is impossible once the encoded body exceeds the soft limit — a hard cap on inert events).
-        const bool count_gate = (trim_min_events == 0) || (trimmable_count >= trim_min_events);
-        const String encoded_peek = encodeRootShard(peek);
-        const bool size_gate = (trim_body_soft_limit > 0) && (encoded_peek.size() >= trim_body_soft_limit);
-        if (!count_gate && !size_gate && !is_maintenance)
-            continue;   /// B12: skip this shard — inert events; token stays stable for the next discover Skip
+void Gc::runNamespaceCleanupPasses(const CasFoldSeal & seal, bool suppress_destructive)
+{
+    Backend & backend = store->backend();
+    const Layout & layout = store->layout();
 
-        /// Determine the trigger reason for the B170 audit log.
-        const char * trim_reason = is_maintenance ? "maintenance"
-                                 : size_gate       ? "soft-limit"
-                                                   : "threshold";
-
-        store->mutateShard(ns, shard, MutationScope::wholeShard(), [&](RootShard & fresh)
+    for (const auto & [key, item] : seal.ns_cleanup_items)
+    {
+        if (item.state == RefNsCleanupState::Pending)
         {
-            std::erase_if(fresh.journal,
-                [&](const RootOwnerEvent & e) { return e.transition_version <= cursor; });
-        }, nullptr, RootMutationOrigin::Gc, RootMutationKind::Trim);
-        /// B170: the journal trim for this shard (events provably folded into the durable generation).
-        EventEmitter{*store}.emit([&](CasEvent & e)
+            /// A clamp/abort round defers the physical reclaim (align with the round's destructive gate).
+            if (suppress_destructive)
+                continue;
+            /// Bounded exact-key enumerate-and-delete over the removed namespace's physical `@cas@` prefixes
+            /// (manifest bodies + verbatim files). A key enumerated here cannot name a recreated object: a
+            /// later namespace_birth uses a greater writer_epoch (spec §Step 6). NotFound/TokenMismatch tolerated.
+            for (const String & prefix : {layout.manifestNamespacePrefix(item.ns), layout.namespaceFilesPrefix(item.ns)})
+            {
+                String cursor;
+                for (;;)
+                {
+                    const ListPage page = backend.list(prefix, cursor, 1000);
+                    for (const ListedKey & lk : page.keys)
+                    {
+                        if (lk.token)
+                            backend.deleteExact(lk.key, *lk.token);
+                        else if (const HeadResult h = backend.head(lk.key); h.exists)
+                            backend.deleteExact(lk.key, h.token);
+                    }
+                    if (page.next_cursor.empty())
+                        break;
+                    cursor = page.next_cursor;
+                }
+            }
+        }
+        else
         {
-            e.type = CasEventType::GcTrim;
-            e.namespace_ = ns.string();
-            e.object_kind = CasEventObjectKind::Root;
-            e.outcome = "trimmed";
-            e.reason = "INV-JOURNAL-COVERAGE: trimmed owner events at or below the sealed fold cursor";
-            e.detail = {{"shard", std::to_string(shard)},
-                        {"sealed_fold_cursor", std::to_string(cursor)},
-                        {"trimmed_count", std::to_string(trimmable_count)},
-                        {"trim_trigger", trim_reason}};
-        });
+            /// Completed: publish the completion marker and republish the constant-size Removed snapshot,
+            /// both idempotent `putIfAbsent` derived from {namespace, remove_txn_id} alone. Winning this
+            /// round's gc/state CAS (moments earlier) is the GC leadership fence gating publication -- a
+            /// deposed leader's round CAS ABORTs before reaching here, so no stale publication occurs.
+            backend.putIfAbsent(layout.refCleanupMarkerKey(item.ns, item.remove_txn_id), String{});
+            RefTableSnapshot removed;
+            removed.ns = item.ns.string();
+            removed.snapshot_id = item.remove_txn_id;
+            removed.lifecycle = RefLifecycle::Removed;
+            removed.remove_txn_id = item.remove_txn_id;
+            backend.putIfAbsent(layout.refSnapshotKey(item.ns, item.remove_txn_id), encodeRefTableSnapshot(removed));
+        }
     }
 }
 
@@ -1509,199 +1526,30 @@ std::map<String, ShardCoverage> Gc::readSealedCursors(uint64_t generation, uint6
 
 std::vector<std::pair<RootNamespace, uint64_t>> Gc::discoverUniverse()
 {
-    /// LIST-based namespace discovery (Task 4): the discovery authority rests on LIST(cas/refs/).
-    /// Consistency requirement: the backend must give read-your-writes LIST enumeration.
-    /// InMemoryBackend: guaranteed (in-memory map). S3: strongly consistent since 2021.
-    /// RustFS: to confirm in soak.
+    /// LIST-based table discovery (spec §Step 1): the discovery authority rests on LIST(cas/refs/).
+    /// Under the snapshot+log ref model there is one immutable-object stream per table (no numeric shards),
+    /// so each present table is reported once as `(ns, 0)`. Consistency requirement: the backend must give
+    /// read-your-writes LIST enumeration (S3 strongly consistent; InMemoryBackend by construction).
+    const Layout & layout = store->layout();
+    Backend & backend = store->backend();
+    const String prefix = layout.casRefsPrefix();
+    std::set<String> namespaces;
+    String cursor;
+    for (;;)
+    {
+        const ListPage page = backend.list(prefix, cursor, /*limit=*/1000);
+        for (const ListedKey & lk : page.keys)
+            if (const auto parsed = layout.parseRefObjectKey(lk.key))
+                namespaces.insert(parsed->ns.string());
+        if (page.next_cursor.empty())
+            break;
+        cursor = page.next_cursor;
+    }
     std::vector<std::pair<RootNamespace, uint64_t>> universe;
-    const Layout & layout = store->layout();
-    Backend & backend = store->backend();
-    const String prefix = layout.casRefsPrefix();
-    String cursor;
-    for (;;)
-    {
-        const ListPage page = backend.list(prefix, cursor, /*limit=*/1000);
-        for (const ListedKey & lk : page.keys)
-        {
-            if (!lk.key.starts_with(prefix))
-                continue;
-            const std::string_view rest(lk.key.data() + prefix.size(), lk.key.size() - prefix.size());
-            const size_t slash = rest.rfind('/');
-            if (slash == std::string_view::npos || slash + 1 == rest.size())
-                continue;
-            const std::string_view shard_sv = rest.substr(slash + 1);
-            uint64_t shard = 0;
-            /// Length guard: >9 digits cannot be a real shard index (root_shards is tiny) and could
-            /// wrap uint64 into a small in-range value, sneaking a foreign/corrupt key past the
-            /// bounds check below — reject by length before parsing (review follow-up, task A).
-            bool valid = !shard_sv.empty() && shard_sv.size() <= 9;
-            for (const char c : shard_sv)
-            {
-                if (c < '0' || c > '9')
-                {
-                    valid = false;
-                    break;
-                }
-                shard = shard * 10 + static_cast<uint64_t>(c - '0');
-            }
-            if (!valid)
-                continue;
-            universe.emplace_back(RootNamespace{String(rest.substr(0, slash))}, shard);
-        }
-        if (page.next_cursor.empty())
-            break;
-        cursor = page.next_cursor;
-    }
+    universe.reserve(namespaces.size());
+    for (const String & ns : namespaces)
+        universe.emplace_back(RootNamespace{ns}, 0);
     return universe;
-}
-
-std::map<String, Token> Gc::listRootShardTokens(std::set<String> & ambiguous_keys)
-{
-    std::map<String, Token> result;
-    Backend & backend = store->backend();
-    const Layout & layout = store->layout();
-
-    const String prefix = layout.casRefsPrefix();
-    String cursor;
-    for (;;)
-    {
-        const ListPage page = backend.list(prefix, cursor, /*limit=*/1000);
-        for (const ListedKey & lk : page.keys)
-        {
-            if (!lk.token.has_value())
-                continue;
-            /// AMBIGUITY DETECTION: a key observed more than once across pages is ambiguous (a backend
-            /// anomaly or a racing write that landed between pages). Ambiguous keys are forced Read in
-            /// `computeDiscoverDecisions` — a shard we cannot unambiguously identify must never be
-            /// skipped (fail closed; the spec, not a hidden fallback).
-            if (result.contains(lk.key))
-                ambiguous_keys.insert(lk.key);
-            else
-                result[lk.key] = *lk.token;
-        }
-        if (page.next_cursor.empty())
-            break;
-        cursor = page.next_cursor;
-    }
-    return result;
-}
-
-std::map<String, Gc::DiscoverDecision> Gc::computeDiscoverDecisions(const CasFoldSeal & sealed)
-{
-    const Layout & layout = store->layout();
-    Backend & backend = store->backend();
-
-    /// Universe is the LIST-discovered present-shard set (Task 4: `discoverUniverse` LISTs `cas/refs/`).
-    /// The token sweep below is only an accelerator on top of it — it decides Read-vs-Skip per shard, never
-    /// removes a shard from the set. Default decision is Read (fail closed; the spec, not a fallback).
-    std::map<String, DiscoverDecision> decisions;
-    const std::vector<std::pair<RootNamespace, uint64_t>> universe = discoverUniverse();
-    for (const auto & [ns, shard] : universe)
-        decisions[cursorKey(ns, shard)] = DiscoverDecision::Read;
-
-    if (!backend.supportsListTokens())
-        /// No token information available from LIST — every shard must be read (already defaulted to Read).
-        return decisions;
-
-    /// ONE LIST sweep — the accelerator. Map the full backend keys to cursor-key form ("ns/shard") by
-    /// stripping the refs prefix (`rootShardKey` == casRefsPrefix() + "ns/shard"), so they line up with
-    /// `per_ns_shard`. After the Phase 1 relocation, `cas/refs/` holds ONLY ref shards (the manifest
-    /// backlog and verbatim files stay under `roots/`), so no non-shard key is even listed here.
-    ///
-    /// AMBIGUITY: `listRootShardTokens` also reports keys it observed MORE THAN ONCE across all pages.
-    /// An ambiguous full key is mapped to cursor-key form and added to `ambiguous_cursor_keys` so the
-    /// Skip guard below can force those shards to Read (fail closed; an unambiguous listed token is
-    /// required for Skip — the spec, not a hidden fallback).
-    std::set<String> ambiguous_full_keys;
-    const std::map<String, Token> listed = listRootShardTokens(ambiguous_full_keys);
-    const String refs_prefix = layout.casRefsPrefix();
-    std::map<String, Token> listed_by_cursor_key;
-    std::set<String> ambiguous_cursor_keys;
-    for (const auto & [full_key, token] : listed)
-    {
-        if (full_key.starts_with(refs_prefix))
-            listed_by_cursor_key[full_key.substr(refs_prefix.size())] = token;
-    }
-    for (const auto & full_key : ambiguous_full_keys)
-    {
-        if (full_key.starts_with(refs_prefix))
-            ambiguous_cursor_keys.insert(full_key.substr(refs_prefix.size()));
-    }
-
-    for (const auto & [ns, shard] : universe)
-    {
-        const String ck = cursorKey(ns, shard);
-
-        const auto sealed_it = sealed.per_ns_shard.find(ck);
-        if (sealed_it == sealed.per_ns_shard.end())
-            continue;   /// no prior coverage (new shard since last round) => Read (already defaulted)
-
-        /// CLAMP guard: a barrier/anomaly-clamped fold (classification 4) left unfolded events that can
-        /// become foldable with NO shard write (e.g. the missing precommit body arrives) — the token
-        /// comparison is blind to that, so a clamped shard is forced Read.
-        if (sealed_it->second.classification == 4)
-            continue;   /// clamped => Read (already defaulted)
-
-        const auto listed_it = listed_by_cursor_key.find(ck);
-        if (listed_it == listed_by_cursor_key.end())
-            continue;   /// shard not visible in LIST (absent / key format differs) => Read (defaulted)
-
-        /// AMBIGUITY guard: a shard key seen more than once in the LIST sweep is ambiguous — we cannot
-        /// unambiguously identify its current token. Forced Read (fail closed; the spec, not a fallback).
-        if (ambiguous_cursor_keys.contains(ck))
-            continue;   /// ambiguous listed key => Read (already defaulted)
-
-        /// Skip IFF the listed token equals the sealed post-fence `folded_token` exactly.
-        /// INCARNATION EQUALITY: `RootShard::incarnation` is serialised into the shard body, so
-        /// token equality implies incarnation equality — a recreated shard produces different bytes
-        /// and therefore a different token. The spec's incarnation-equality conjunct is therefore
-        /// subsumed by the token check here. For the rare backend that issues non-content-based
-        /// tokens, `fold()`'s Read path detects the mismatch after `readShard` and resets the
-        /// cursor there (a one-round lag, bounded and safe because the cursor undercount is caught
-        /// before any delete decision — see the ABA-proof cursor comment in `fold()`).
-        if (listed_it->second == sealed_it->second.folded_token)
-        {
-            /// Force-Read guard (sibling of the classification-4 clamped guard): a token-stable shard that
-            /// holds a live precommit the namespace watermark has proven dead must be re-folded so
-            /// reclaimAbandonedPrecommit runs — otherwise Skip parks the static shard forever and the
-            /// abandoned precommit's manifest orphans (INV-2). Self-terminating: the reclaim's removal
-            /// changes the shard token, so next round it is a normal changed->unchanged shard.
-            if (sealed_it->second.has_live_precommit)
-            {
-                if (const auto floor = floorForNamespace(*store, ns);
-                    floor && isPrecommitDead(sealed_it->second.min_live_precommit_writer_epoch,
-                                             sealed_it->second.min_live_precommit_build_sequence, *floor))
-                {
-                    ProfileEvents::increment(ProfileEvents::CasGcPrecommitRevisitForced);
-                    continue;   /// forced Read (already defaulted); do NOT mark Skip
-                }
-            }
-            decisions[ck] = DiscoverDecision::Skip;
-        }
-    }
-
-    return decisions;
-}
-
-std::map<String, Gc::DiscoverDecision> Gc::discoverDecisionsForTest()
-{
-    /// WRITE-FREE: load the reference tokens from durable state and return the decisions the next round's
-    /// discover would make. No CAS, no delete, no fold.
-    const auto state_bytes = store->backend().get(store->layout().gcStateKey());
-    if (!state_bytes)
-        /// Fresh pool: no sealed state. `computeDiscoverDecisions` over an empty seal yields all Read.
-        return computeDiscoverDecisions(CasFoldSeal{});
-
-    const GcState state = decodeGcState(state_bytes->bytes);
-
-    /// One-pass round: the adopted fold seal IS the reference (fold-time tokens; conservative — any
-    /// later shard write changes the token => Read). Mirrors `fold`'s reference-seal resolution.
-    CasFoldSeal ref_seal;
-    if (const auto fold = readFoldSeal(state.snap_generation, state.snap_attempt))
-        ref_seal = *fold;
-    /// else: empty ref_seal (fresh pool / no adopted seal) => all Read.
-
-    return computeDiscoverDecisions(ref_seal);
 }
 
 bool Gc::graduationDue(const GcState & state, uint64_t current_round)
@@ -1741,14 +1589,46 @@ bool Gc::graduationDue(const GcState & state, uint64_t current_round)
 
 size_t Gc::changedShardCount(const GcState & state)
 {
-    CasFoldSeal ref_seal;
+    /// The number of tables with at least one ref log above their sealed cursor -- the pre-fold DEFER
+    /// signal (spec §Step 1). Lenient parse: a malformed key is simply not counted here; the fold's own
+    /// `groupRefKeys` does the strict validation and round-abort. `parseRefObjectKey` never throws.
+    const Layout & layout = store->layout();
+    Backend & backend = store->backend();
+
+    std::map<String, ShardCoverage> cursors;
     if (const auto seal = readFoldSeal(state.snap_generation, state.snap_attempt))
-        ref_seal = *seal;
-    const std::map<String, DiscoverDecision> decisions = computeDiscoverDecisions(ref_seal);
+        cursors = seal->per_ns_shard;
+
+    std::map<String, RefTxnId> greatest_log;
+    const String prefix = layout.casRefsPrefix();
+    String cursor;
+    for (;;)
+    {
+        const ListPage page = backend.list(prefix, cursor, /*limit=*/1000);
+        for (const ListedKey & lk : page.keys)
+        {
+            const auto parsed = layout.parseRefObjectKey(lk.key);
+            if (parsed && parsed->kind == RefObjectKind::Log)
+            {
+                RefTxnId & g = greatest_log[parsed->ns.string()];
+                if (g < parsed->txn_id)
+                    g = parsed->txn_id;
+            }
+        }
+        if (page.next_cursor.empty())
+            break;
+        cursor = page.next_cursor;
+    }
+
     size_t changed = 0;
-    for (const auto & [ck, dec] : decisions)
-        if (dec != DiscoverDecision::Skip)
+    for (const auto & [ns_str, greatest] : greatest_log)
+    {
+        RefTxnId folded{};
+        if (const auto it = cursors.find(cursorKey(RootNamespace{ns_str}, /*shard*/0)); it != cursors.end())
+            folded = it->second.last_folded_ref_id;
+        if (folded < greatest)
             ++changed;
+    }
     return changed;
 }
 
@@ -1777,16 +1657,27 @@ RebuildReport Gc::rebuildBaseline(bool force)
                 healthy = true;
                 if (st.snap_generation == 0)
                 {
-                    /// A gen-0 state (fresh-pool shape — possibly a bootstrap body minted by a
-                    /// lease acquire AFTER the real state was lost) is healthy ONLY when no shard
-                    /// journal proves trimmed history — the guard's own probe.
+                    /// A gen-0 state (possibly a bootstrap body minted by a lease acquire AFTER the real
+                    /// state was lost) is healthy ONLY when no table proves cleaned logs -- the ref baseline
+                    /// guard: a snapshot with no surviving log at or below it (its covered logs were cleaned
+                    /// by a now-lost cursor).
                     for (const auto & [ns, root_shard] : discoverUniverse())
                     {
-                        const auto [root, tok] = store->readShard(ns, root_shard);
-                        const bool proves_trim = root.journal.empty()
-                            ? root.shard_version > 0
-                            : root.journal.front().transition_version > 1;
-                        if (proves_trim)
+                        std::vector<String> table_keys;
+                        String table_cursor;
+                        for (;;)
+                        {
+                            const ListPage tpage = backend.list(layout.refsNamespacePrefix(ns), table_cursor, 1000);
+                            for (const ListedKey & lk : tpage.keys)
+                                table_keys.push_back(lk.key);
+                            if (tpage.next_cursor.empty())
+                                break;
+                            table_cursor = tpage.next_cursor;
+                        }
+                        const auto grouped = groupRefKeys(layout, table_keys);
+                        const auto git = grouped.find(ns.string());
+                        if (git != grouped.end() && !git->second.snapshots.empty()
+                            && (git->second.logs.empty() || git->second.snapshots.back() < git->second.logs.front()))
                         {
                             healthy = false;
                             break;
@@ -1916,21 +1807,24 @@ RebuildReport Gc::rebuildBaseline(bool force)
     for (const auto & [ns, root_shard] : universe)
     {
         seen_ns.insert(ns.string());
-        const auto [root, token] = store->readShard(ns, root_shard);
         ++rep.shards;
-        max_fence_round = std::max(max_fence_round, root.fence_round);
+
+        /// Recover the table via the shared snapshot+tail equation (spec §Offline Recovery): the current
+        /// owner set is exactly the committed rows plus live precommits it yields. The rebuilt cursor is
+        /// the greatest RefTxnId that verified view included.
+        const RefTableState st = recoverRefTable(backend, layout, ns);
 
         ShardCoverage cov;
-        cov.classification = 2;   /// Folded (full coverage) unless a bodiless precommit clamps below
-        cov.folded_token = token.value_or(Token{});
-        cov.folded_cursor = root.shard_version;
-        cov.incarnation = root.incarnation;
+        cov.classification = 2;   /// Folded (full coverage) unless a bodiless precommit clamps
+        cov.last_folded_ref_id = st.greatest_applied;
 
-        /// Committed owners: the refs map IS the authoritative committed state.
         std::vector<BlobDelta> deltas;
-        for (const auto & [ref_name, rref] : root.refs)
+
+        /// Committed owners: a missing/invalid body under a committed ref is DATA LOSS the rebuild must
+        /// not bless (INV_NO_DANGLE) -- refuse.
+        for (const auto & [ref_name, row] : st.committed)
         {
-            const ManifestId id{ns, rref.manifest_ref};
+            const ManifestId id{ns, row.manifest_ref};
             owned_manifest_keys.insert(layout.manifestKey(id));
             if (!foldManifestEdges(id, +1, deltas, mf_cleanup_unused))
             {
@@ -1942,37 +1836,22 @@ RebuildReport Gc::rebuildBaseline(bool force)
             ++rep.committed_refs;
         }
 
-        /// Live precommits: replay the journal (old_binding erases, new_binding inserts); what
-        /// remains with owner_kind Precommit is live. A live precommit whose body is present
-        /// contributes edges; a bodiless one CLAMPS this shard's cursor below its transition (the
-        /// fold-barrier semantics — the first regular round folds it once the body lands).
-        std::vector<std::pair<uint64_t, OwnerBinding>> live;   /// (transition_version, binding)
-        for (const RootOwnerEvent & e : root.journal)
+        /// Live precommits: a present body contributes edges; a bodiless one is non-activating and clamps
+        /// (the fold barrier -- the first regular round folds it once the body lands).
+        for (const auto & [ref_name, manifest_ref] : st.precommits)
         {
-            if (e.old_binding)
-                std::erase_if(live, [&](const auto & p) { return p.second == *e.old_binding; });
-            if (e.new_binding)
-                live.emplace_back(e.transition_version, *e.new_binding);
-        }
-        for (const auto & [transition, binding] : live)
-        {
-            if (binding.owner_kind != OwnerKind::Precommit)
-                continue;
-            const ManifestId id{ns, binding.manifest_ref};
+            const ManifestId id{ns, manifest_ref};
             owned_manifest_keys.insert(layout.manifestKey(id));
             if (foldManifestEdges(id, +1, deltas, mf_cleanup_unused))
-            {
                 ++rep.live_precommits;
-            }
             else
             {
                 cov.classification = 4;   /// Clamped
-                cov.folded_cursor = std::min(cov.folded_cursor, transition - 1);
                 ++rep.clamped_shards;
             }
         }
         route_deltas(deltas);
-        seal.per_ns_shard[ns.string() + "/" + std::to_string(root_shard)] = cov;
+        seal.per_ns_shard[cursorKey(ns, /*shard*/0)] = cov;
     }
     rep.namespaces = seen_ns.size();
 
@@ -2258,173 +2137,6 @@ void Gc::pulseHeartbeat(Store & store, UInt128 gc_id)
     store.backend().casPut(key, encodeGcHeartbeat(hb), expected);
 }
 
-namespace
-{
-
-/// The build-watermark floor now rides the per-server mount lease (ack-floor merge, spec 2026-07-02).
-/// A namespace is rooted by `server_root_id`, but that id is a clean relative path and can contain
-/// slashes. Try namespace prefixes from longest to shortest and accept the first durable mount body.
-/// `{writer_epoch, min_active}` are the same durable facts the old watermark's `{epoch, min_active}`
-/// carried on the writable path (CasStore.cpp "THE BRIDGE").
-std::optional<MountLease> floorForNamespace(Store & store, const RootNamespace & ns)
-{
-    const String & value = ns.string();
-    size_t pos = value.size();
-    while (true)
-    {
-        pos = value.rfind('/', pos == 0 ? 0 : pos - 1);
-        if (pos == String::npos)
-            break;
-
-        const String server_root_id = value.substr(0, pos);
-        if (!server_root_id.empty())
-        {
-            if (const auto got = store.backend().get(store.layout().mountKey(server_root_id)))
-                return decodeMountLease(got->bytes);
-        }
-        if (pos == 0)
-            break;
-    }
-    return std::nullopt;
-}
-
-/// A precommit binding is provably DEAD by the durable namespace watermark FACT (control #9) — never a
-/// frozen-seq / judged-dead guess. Dead iff its incarnation's writer_epoch is older than the live mount
-/// epoch, the mount carries the farewell/retired sentinel (min_active == UINT64_MAX = every seq retired),
-/// or its build_sequence is below the live floor. A future epoch or a build at/above the floor is NOT dead.
-/// Shared by reclaimAbandonedPrecommit (which acts on it) and computeDiscoverDecisions (which forces a
-/// re-fold on it) so the two can never disagree.
-bool isPrecommitDead(uint64_t writer_epoch, uint64_t build_sequence, const MountLease & w)
-{
-    if (writer_epoch > w.writer_epoch)
-        return false;
-    if (writer_epoch < w.writer_epoch)
-        return true;
-    if (w.min_active == std::numeric_limits<uint64_t>::max())
-        return true;
-    return w.min_active > build_sequence;
-}
-
-/// The lexicographically-minimal {writer_epoch, build_sequence} among the shard's LIVE precommit bindings
-/// (owner-state replay: accumulate new_binding, drop old_binding; keep OwnerKind::Precommit survivors).
-/// nullopt when the shard holds no live precommit. This is the SAME replay reclaimAbandonedPrecommit does.
-std::optional<std::pair<uint64_t, uint64_t>> minLivePrecommit(const RootShard & root)
-{
-    std::vector<OwnerBinding> live;
-    for (const RootOwnerEvent & e : root.journal)
-    {
-        if (e.old_binding)
-            std::erase(live, *e.old_binding);
-        if (e.new_binding)
-            live.push_back(*e.new_binding);
-    }
-    std::optional<std::pair<uint64_t, uint64_t>> best;
-    for (const OwnerBinding & b : live)
-    {
-        if (b.owner_kind != OwnerKind::Precommit)
-            continue;
-        const std::pair<uint64_t, uint64_t> cur{b.manifest_ref.writer_epoch, b.manifest_ref.build_sequence};
-        if (!best || cur < *best)
-            best = cur;
-    }
-    return best;
-}
-
-}
-
-void Gc::reclaimAbandonedPrecommit(const RootNamespace & ns, uint64_t shard, uint64_t /*round*/)
-{
-    /// B8: reclaim ABANDONED precommits in the CONVERGED-SHARD model. `precommitAdd` writes a precommit
-    /// owner binding into the FUTURE COMMITTED REF's OWN table shard (keyed by `final_ref_name`, kind
-    /// `OwnerKind::Precommit`) — there is no `_precommits` namespace. So while the fold visits a shard, this
-    /// enumerates the LIVE precommit bindings from the journal owner-state replay (the same
-    /// accumulate-adds/subtract-removals the fold and `Build::promote` do), then judges build-death via
-    /// the namespace's per-server-root watermark (identical to the orphan sweep). It runs BEFORE the fold reads this shard so its
-    /// PrecommitRemove is folded in the SAME round (no double-counted `-1`).
-
-    /// Read the shard being visited (the fold re-reads it right after, picking up any removal we append).
-    const RootShard root = store->readShard(ns, shard).first;
-
-    /// Owner-state replay: a precommit `new_binding` not later removed (or moved off its manifest_ref) is
-    /// LIVE. Keep the FULL binding so the removal event names EXACTLY it (the encoding `Build::promote`
-    /// re-proves against; a partial binding would not match and the fold/promote guards would mis-judge).
-    std::vector<OwnerBinding> live;
-    for (const RootOwnerEvent & e : root.journal)
-    {
-        if (e.old_binding)
-            std::erase(live, *e.old_binding);
-        if (e.new_binding)
-            live.push_back(*e.new_binding);
-    }
-
-    const auto floor = floorForNamespace(*store, ns);
-    if (!floor)
-        return;   /// no durable fact => not dead (conservative)
-    const MountLease & w = *floor;
-
-    struct DeadPrecommit { OwnerBinding binding; bool retired_sentinel; };
-    std::vector<DeadPrecommit> dead;
-    for (const OwnerBinding & binding : live)
-    {
-        if (binding.owner_kind != OwnerKind::Precommit)
-            continue;
-
-        /// CONSERVATIVE death judgment, identical to the orphan sweep's `prefixEligible` — a DURABLE
-        /// watermark FACT only, never a frozen-seq / judged-dead guess (control #9). A build is provably
-        /// DEAD iff the server has a watermark AND either the farewell/retired sentinel
-        /// (`min_active == UINT64_MAX`, every seq retired), its `writer_epoch` is older than the live
-        /// watermark epoch, or its `build_sequence` is below the live floor (`min_active > build_sequence`).
-        /// A missing watermark, a future epoch, or a build at/above the floor is NOT dead — the precommit
-        /// is spared. The K=2 frozen-seq crash detector is deliberately NOT consulted here:
-        /// it is a liveness heuristic, unsafe as a reclaim trigger (a live but slow-renewing build must
-        /// never have its in-flight precommit reclaimed). A wrongful reclaim would still be caught by the
-        /// promote guard (fail closed), but conservatism keeps live builds from being needlessly aborted.
-        const bool retired_sentinel = w.min_active == std::numeric_limits<uint64_t>::max();
-        if (isPrecommitDead(binding.manifest_ref.writer_epoch, binding.manifest_ref.build_sequence, w))
-            dead.push_back(DeadPrecommit{binding, retired_sentinel});
-    }
-
-    if (dead.empty())
-        return;
-
-    /// Reclaim: append a removal RootOwnerEvent per dead precommit on the SAME shard (old = the precommit
-    /// binding, new = none — the encoding shared by `Build::abandon` / `Store::dropRef`). The fold (which
-    /// re-reads this shard immediately after) then folds the removal IN THIS ROUND, releasing the edges so
-    /// the closure's blobs become zero-in-degree candidates. ONE mutateShard CAS removes all dead bindings;
-    /// each gets a distinct, contiguous transition_version above the shard's current version (mutateShard
-    /// bumps shard_version by one, so the LAST appended event aligns with the committed shard_version).
-    /// `mutateShard` does a single `++shard_version` AFTER this callback, so the LAST event we append must
-    /// carry `shard_version + dead.size()` and we pre-advance shard_version to one below that; the trailing
-    /// `++` lands it exactly on the last event's transition_version (no gap, contiguous versions).
-    store->mutateShard(ns, shard, MutationScope::wholeShard(), [&](RootShard & fresh)
-    {
-        const uint64_t base = fresh.shard_version;
-        for (size_t i = 0; i < dead.size(); ++i)
-            fresh.journal.push_back(RootOwnerEvent{
-                .transition_version = base + i + 1,
-                .old_binding = dead[i].binding,
-                .new_binding = std::nullopt});
-        fresh.shard_version = base + dead.size() - 1;
-    }, nullptr, RootMutationOrigin::Gc, RootMutationKind::ReclaimPrecommit);
-
-    /// B170: each abandoned precommit reclaimed (its owner edge removed; the next fold releases its blob
-    /// edges). Records WHY the build was judged dead — the soak's leak/dangle attribution.
-    for (const DeadPrecommit & dp : dead)
-        EventEmitter{*store}.emit([&](CasEvent & e)
-        {
-            e.type = CasEventType::PrecommitReclaim;
-            e.namespace_ = ns.string();
-            e.ref_name = dp.binding.ref_name;
-            e.object_kind = CasEventObjectKind::Root;
-            e.outcome = "reclaimed";
-            e.reason = dp.retired_sentinel
-                ? "precommit reclaim: owning server posted the farewell/retired sentinel (build gone)"
-                : "precommit reclaim: build_seq below the server's min_active floor (retired build)";
-            e.detail = {{"writer_epoch", std::to_string(dp.binding.manifest_ref.writer_epoch)},
-                        {"build_seq", std::to_string(dp.binding.manifest_ref.build_sequence)}};
-        });
-}
-
 bool Gc::acquireOrRenewLease(GcState & state, Token & state_token)
 {
     const String key = store->layout().gcStateKey();
@@ -2511,138 +2223,6 @@ bool Gc::acquireOrRenewLease(GcState & state, Token & state_token)
     }
 
     return false;
-}
-
-void Gc::reclaimDroppedShards(const FoldResult & folded)
-{
-    /// Task 6: reclaim ref-shard objects that are empty + tombstoned + fully folded (soak S30).
-    ///
-    /// CORRECTNESS CONSTRAINT — FULLY-FOLDED-BEFORE-RECLAIM (not optional):
-    /// The fold cursor MUST cover the tombstone and every prior -1 removal event before we delete
-    /// the shard object. Deleting before the removal events are folded leaves phantom in-degree on
-    /// the blobs those refs named — a silent blob-retention leak. We enforce this by requiring
-    /// `cov.folded_cursor >= tombstone_version` (the tombstone's `transition_version`).
-    ///
-    /// TOKEN: We use the token from the eligibility GET (`readShard`) for `deleteExact`. The LIST
-    /// token from the discovery sweep may lag any writer mutation that landed since the sweep, so it
-    /// must never carry a destructive op; the GET is already required for eligibility (tombstone
-    /// present, refs empty), so the fresh token costs no extra round-trip.
-    ///
-    /// CONCURRENT REVIVE: a writer appending to the shard after the tombstone changes its body =>
-    /// different token from GET => `deleteExact` returns `TokenMismatch` => shard survives (fail-closed).
-    /// The writer's new publication has a strictly greater incarnation (Task 2), and the next round folds
-    /// from cursor 0 (Task 3 ABA reset).
-    Backend & backend = store->backend();
-    const Layout & layout = store->layout();
-
-    for (const auto & [ns, shard] : folded.root_shards)
-    {
-        try
-        {
-            const String ck = cursorKey(ns, shard);
-
-            /// Need fold coverage to verify fully-folded-at-current-incarnation.
-            const auto cov_it = folded.fold_seal.per_ns_shard.find(ck);
-            if (cov_it == folded.fold_seal.per_ns_shard.end())
-                continue;   /// shard not covered in this fold (Skipped — cannot verify fully folded)
-            const ShardCoverage & cov = cov_it->second;
-
-            /// Read the shard to check: refs empty, last event is tombstone. This GET also gives us the
-            /// current token for the deleteExact — avoids a separate HEAD/GET for the token.
-            /// IMPORTANT: This must run BEFORE trim() (see runRegularRound): trim removes events at/below
-            /// the fold cursor, which includes the tombstone. After trim the journal is empty and this guard
-            /// would fail. The ordering is trim runs AFTER reclaimDroppedShards.
-            const auto [root, shard_tok] = store->readShard(ns, shard);
-
-            /// Guard 1: refs must be empty (all dropped — the tombstone comes after all -1 events).
-            if (!root.refs.empty())
-                continue;
-
-            /// Guard 2: last journal event must be the tombstone.
-            if (root.journal.empty() || !root.journal.back().is_tombstone)
-                continue;
-            const uint64_t tombstone_version = root.journal.back().transition_version;
-
-            /// Guard 3: FULLY-FOLDED-BEFORE-RECLAIM (the binding correctness constraint, not optional).
-            /// `cov.folded_cursor` is the journal position the fold reached this round.
-            /// `tombstone_version` is the transition_version of the tombstone event. We compare against
-            /// the tombstone's version (not root.shard_version) because fence() may have bumped shard_version
-            /// beyond the tombstone's version without adding a journal entry.
-            /// Fully folded <=> cursor >= tombstone_version AND incarnations match (no ABA).
-            if (cov.incarnation != root.incarnation)
-                continue;   /// ABA: shard was recreated between fold and here — not safe to reclaim
-            if (cov.folded_cursor < tombstone_version)
-                continue;   /// tombstone (or prior events) not yet folded — wait for a later round
-
-            /// Guard 4: NO LIVE OWNER BINDINGS (guards against the activated-precommit blob-leak).
-            ///
-            /// `refs.empty()` (Guard 1) only covers COMMITTED bindings (the promoted refs). A
-            /// PRECOMMIT binding lives solely in the journal, never in `refs` — it is only moved to
-            /// `refs` at `promote`. So a shard that was dropped while a same-namespace build had an
-            /// ACTIVATED (body-present) but unpromoted precommit passes Guards 1-3: `refs` is empty,
-            /// a tombstone was appended, and the fold advanced past the tombstone (the body being
-            /// present meant the fold barrier did NOT clamp the cursor below the precommit event).
-            /// If we reclaim such a shard, the precommit's +1 edge is already folded into the sealed
-            /// generation's in-degree, but the matching -1 (from a future abandon / PrecommitRemove)
-            /// can never land — the shard object is gone. The referenced blob's in-degree never drains
-            /// → permanent blob leak.
-            ///
-            /// Guard: replay the journal's owner-state exactly as `reclaimAbandonedPrecommit` does
-            /// (accumulate `new_binding`, erase on `old_binding`) and refuse reclaim if ANY live owner
-            /// binding remains (Committed OR Precommit). In the normal fully-dropped case all bindings
-            /// have been removed before the tombstone, so the set is empty and reclaim proceeds.
-            ///
-            /// NOTE: the body-ABSENT precommit sub-case is already safe (the fold barrier clamps
-            /// `folded_cursor` below the live precommit, so Guard 3 blocks it). This guard
-            /// additionally covers the body-PRESENT (activated) sub-case.
-            {
-                std::vector<OwnerBinding> live_bindings;
-                for (const RootOwnerEvent & ev : root.journal)
-                {
-                    if (ev.old_binding)
-                        std::erase(live_bindings, *ev.old_binding);
-                    if (ev.new_binding)
-                        live_bindings.push_back(*ev.new_binding);
-                }
-                if (!live_bindings.empty())
-                    continue;   /// live owner binding present — skip reclaim this round
-            }
-
-            /// All guards pass. Delete using the token from the GET above (not an extra round-trip;
-            /// the GET was already needed for tombstone + empty-refs eligibility). The fence step
-            /// runs between the fold's LIST sweep and here, so the LIST token would be stale.
-            if (!shard_tok)
-                continue;   /// shard vanished between the GET and the delete — concurrent reclaim; skip
-            const String key = layout.rootShardKey(ns, shard);
-            const DeleteOutcome del = backend.deleteExact(key, *shard_tok);
-            /// Tolerate NotFound (raced delete by another leader) and TokenMismatch (concurrent revive:
-            /// a writer appended after the tombstone — the object survives, which is correct).
-            /// Never throw on 404 (feedback_ca_gc_never_throw_on_404).
-            EventEmitter{*store}.emit([&](CasEvent & e)
-            {
-                e.type = CasEventType::GcShardReclaim;
-                e.namespace_ = ns.string();
-                e.object_kind = CasEventObjectKind::Root;
-                e.outcome = del.kind == DeleteOutcome::Kind::Deleted   ? "deleted"
-                          : del.kind == DeleteOutcome::Kind::NotFound  ? "absent"
-                                                                       : "replaced";
-                e.reason = "Task 6: reclaim empty+tombstoned+fully-folded ref-shard object (S30)";
-                e.detail = {{"shard", std::to_string(shard)},
-                            {"key", key},
-                            {"fold_cursor", std::to_string(cov.folded_cursor)},
-                            {"shard_version", std::to_string(root.shard_version)}};
-            });
-        }
-        catch (const Exception & e)
-        {
-            /// Per-shard error isolation: a bad shard must not abort the rest or let trim erase
-            /// the tombstone before this shard is reclaimed. Log and continue (record-and-continue
-            /// per feedback_ca_gc_never_throw_on_404). The shard is retried next round.
-            LOG_WARNING(getLogger("CasGc"),
-                "CAS gc shard reclaim: error for {}/{}, skipping this shard this round: {}",
-                ns.string(), shard, e.message());
-        }
-    }
 }
 
 }

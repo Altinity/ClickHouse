@@ -251,20 +251,43 @@ TEST(CasObservability, ResurrectSupersedeEmitsOnlyRetireReplacedWithOldToken)
 /// These tests drive it directly against real encoder output (one per recognized key shape) plus the
 /// unknown-key fail-closed path — the same function the CLI command (`CommandCaInspect.cpp`) calls.
 
-TEST(CasObservability, CaInspectDecodesRootShardToJson)
+/// The legacy mutable ref-shard object is gone (snapshot+log ref model); inspect now decodes the two
+/// immutable ref objects. A `_snap/<id>.proto` renders as a ref-table snapshot...
+TEST(CasObservability, CaInspectDecodesRefSnapshotToJson)
+{
+    using DB::Cas::tests::committedRow;
+    using DB::Cas::tests::minimalLiveSnapshot;
+    Layout layout("p");
+    const RootNamespace ns{"srv/tbl@cas@"};
+    const RefTxnId snap_id{1, 7};
+    const RefTableSnapshot snap = minimalLiveSnapshot(ns.string(), snap_id,
+        {committedRow("all_0_0_0", ManifestRef{.writer_epoch = 1, .build_sequence = 2, .manifest_ordinal = 1})});
+    const String key = layout.refSnapshotKey(ns, snap_id);
+    const String json = caInspectToJson(layout, key, encodeRefTableSnapshot(snap));
+    EXPECT_NE(json.find("ref_snapshot"), String::npos);
+    EXPECT_NE(json.find("\"lifecycle\""), String::npos);
+    EXPECT_NE(json.find("Live"), String::npos);
+    EXPECT_NE(json.find("all_0_0_0"), String::npos);
+}
+
+/// ...and a `_log/<txn-id>` renders as a ref-transaction log.
+TEST(CasObservability, CaInspectDecodesRefLogToJson)
 {
     Layout layout("p");
-    RootShard root;
-    root.shard_version = 7;
-    root.refs["all_0_0_0"] = RootRef{
-        .ref_name = "all_0_0_0",
-        .manifest_ref = ManifestRef{.writer_epoch = 1, .build_sequence = 2, .manifest_ordinal = 1},
-        .mutable_files = {},
-        .published_at_ms = 0};
-    const String key = layout.rootShardKey(RootNamespace{"srv/tbl@cas@"}, 0);
-    const String json = caInspectToJson(layout, key, encodeRootShard(root));
-    EXPECT_NE(json.find("\"shard_version\""), String::npos);
-    EXPECT_NE(json.find("7"), String::npos);
+    const RootNamespace ns{"srv/tbl@cas@"};
+    const RefTxnId txn_id{1, 8};
+    RefLogTxn txn;
+    txn.ns = ns.string();
+    txn.txn_id = txn_id;
+    RefOp add;
+    add.kind = RefOpKind::OwnerTransition;
+    add.new_binding = RefOwnerBinding{RefOwnerKind::Precommit, "all_0_0_0",
+        ManifestRef{.writer_epoch = 1, .build_sequence = 2, .manifest_ordinal = 1}};
+    txn.ops = {add};
+    const String key = layout.refLogKey(ns, txn_id);
+    const String json = caInspectToJson(layout, key, encodeRefLogTxn(txn));
+    EXPECT_NE(json.find("ref_log"), String::npos);
+    EXPECT_NE(json.find("OwnerTransition"), String::npos);
     EXPECT_NE(json.find("all_0_0_0"), String::npos);
 }
 

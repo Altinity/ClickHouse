@@ -226,7 +226,7 @@ bool CachedPartFolderAccess::republishRef(const PartRefKey & src, const PartRefK
         if (dst_resolved->mutable_files != resolved->mutable_files)
         {
             const std::map<String, String> current_mutable_files = resolved->mutable_files;
-            updateMutableFiles(dst, [&](Cas::RootRef & payload)
+            updateMutableFiles(dst, [&](Cas::RefMutableFilesUpdate & payload)
             {
                 payload.mutable_files = current_mutable_files;
             });
@@ -241,7 +241,7 @@ bool CachedPartFolderAccess::republishRef(const PartRefKey & src, const PartRefK
     return true;
 }
 
-void CachedPartFolderAccess::updateMutableFiles(const PartRefKey & key, std::function<void(Cas::RootRef &)> mutator)
+void CachedPartFolderAccess::updateMutableFiles(const PartRefKey & key, std::function<void(Cas::RefMutableFilesUpdate &)> mutator)
 {
     store->updateRefPayload(key.ns, key.ref, std::move(mutator));
     eraseView(key);

@@ -448,64 +448,11 @@ TEST(CasGcLeak, ResurrectReplacedTokenIsCondemnedInMeta)
            "dedup-hitting writer resurrects, not adopts";
 }
 
-/// NO-LEAK (abandon): a build stages a manifest, precommitAdds it (activating +1 for its OWN unique
-/// blob, body present), uploads that blob, then VANISHES (crash: never promoted, never abandoned). GC's
-/// automatic precommit-reclaim (B8) judges the build dead via the watermark and appends a PrecommitRemove
-/// RootOwnerEvent old={Precommit,ref,build,id}/new=none on the table shard. GC then folds that removal as
-/// a true removal: -1 for the blob, retire + delete — no debris for the abandoned closure, no stranded
-/// positive in-degree.
-///
-/// B8: the reclaim now runs for EVERY table shard the fold visits (not just legacy `_precommits`
-/// namespaces). `precommitAdd` writes the create-precommit into the TARGET TABLE shard, and the reclaim
-/// derives `(server, build_seq)` from the precommit binding's `manifest_ref` and judges death by the
-/// per-server watermark — so an abandoned table-shard precommit IS auto-released by the core. This test no
-/// longer drives the removal itself; it asserts the automatic reclaim.
-///
-/// (This replaces the obsolete staged-parent/adopted-subtree own-blob no-leak case — there is no subtree
-/// in the manifest model, so the property is exercised through a flat staged-then-abandoned part.)
-TEST(CasGcLeak, AbandonedPrecommitReclaimsOwnBlobs)
-{
-    std::shared_ptr<InMemoryBackend> b;
-    auto s = openTestStore(b);
-    const RootNamespace ns{"test/tbl"};
-    const String ref = "all_2_2_0";
-    const String payload = "abandon-unique-blob";
-
-    BuildInfo info;
-    info.intended_ref = ns.string() + "/" + ref;
-    auto build = s->startBuild(info);
-    build->putBlob(idOf(payload), BlobSource::fromString(payload));   /// the build's OWN unique blob
-    const ManifestId id = build->stageManifest({blobEntry("data.bin", payload)});
-    build->precommitAdd(ns, ref, id);                                 /// activating +1 for the blob (body present)
-
-    /// CRASH: the build vanishes without abandon (which would remove the binding) or promote. The dtor's
-    /// idempotent retireBuildSeq is the only effect — the precommit binding and its body survive. GC's
-    /// automatic reclaim (B8) must judge the build dead and append the PrecommitRemove itself.
-    build.reset();   /// dtor retires the build_seq (crash semantics); does NOT delete the staged body
-
-    /// Build finished → advance the floor past its seq so GC reclaims the orphaned precommit's blob.
-    s->renewWatermarkOnce();
-
-    /// The automatic reclaim (B8) appends the PrecommitRemove DURING the first round's fold, but that round
-    /// still sees the precommit's +1 pinning the blob (the removal is folded only in the NEXT round), so it
-    /// reports no candidates — `runGcToFixpoint` would stop on that first empty round before the cascade.
-    /// Drive a fixed, generous number of rounds so the -1 folds, the blob condemns, and the ack-floor
-    /// pipeline (advancing the mount ack after each round) graduates and deletes it.
-    Gc gc(s, hexToU128("00000000000000000000000000000003"));
-    for (int round = 0; round < 32; ++round)
-    {
-        try { gc.runRegularRound(); s->renewWatermarkOnce(); }
-        catch (const DB::Exception &) { break; }
-    }
-
-    const FsckReport after = runFsck(*s, /*detail=*/false);
-    EXPECT_EQ(after.dangling, 0u) << "abandon INV-NO-LOSS: nothing reachable was lost";
-    EXPECT_EQ(after.unreachable, 0u)
-        << "abandon INV-NO-LEAK: the abandoned precommit's own unique blob must be reclaimed "
-           "(unreachable=" << after.unreachable << ")";
-    EXPECT_FALSE(blobPresent(b, s->layout(), payload)) << "abandoned build's own blob must be deleted";
-    EXPECT_EQ(inDegreeOf(*b, s->layout(), u128Of(payload)), 0) << "no stranded positive in-degree";
-}
+/// (The NO-LEAK-on-abandon test `CasGcLeak.AbandonedPrecommitReclaimsOwnBlobs` was removed with the
+/// snapshot+log ref model: it asserted GC AUTOMATICALLY reclaims a crashed build's abandoned precommit and
+/// collects its own unique blob. Per spec §Responsibility Boundary that reclaim is now the WRITER's job
+/// (it appends the exact `owner_transition` removal on recovery); GC never scans for or removes precommit
+/// bindings. The writer-side abandon/recovery cleanup is exercised by the writer tests.)
 
 /// REUSE-vs-GC race (no-LOSS half of the no-leak family): a build ADOPTS a committed blob B by tokenless
 /// evidence (B present, not yet condemned), the committed ref pinning B is DROPPED, GC retires+deletes B

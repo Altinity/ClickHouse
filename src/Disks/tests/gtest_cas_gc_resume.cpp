@@ -86,25 +86,11 @@ private:
 };
 }
 
-/// Trim removes owner events at/below the sealed cursor; later events survive (#15 / INV_JOURNAL_COVERAGE).
-TEST(CasGcRound, TrimDropsFoldedOwnerEvents)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
-    const RootNamespace ns{"00/aa@cas@"};
-    const ManifestRef r = ref(1, 0xAA);
-    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
-    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
-    Gc gc(store, kGc);
-    gc.runRegularRound();   // folds + seals the transition; trim may now drop it
-
-    const uint64_t cursor = foldCursorOf(*backend, store->layout(), ns, 0);
-    const auto shard = backend->get(store->layout().rootShardKey(ns, 0));
-    ASSERT_TRUE(shard.has_value());
-    const RootShard root = decodeRootShard(shard->bytes);
-    for (const RootOwnerEvent & e : root.journal)
-        EXPECT_GT(e.transition_version, cursor);
-}
+/// (`CasGcRound.TrimDropsFoldedOwnerEvents` was removed with the snapshot+log ref model: it asserted GC
+/// trims folded owner events out of a MUTABLE shard journal in place. Immutable `_log` objects are never
+/// trimmed in place; the new-model equivalent -- ref-object cleanup deletes a covered `_log`/`_snap` key
+/// once BOTH the durable cursor AND an observed snapshot cover it -- is exercised in `gtest_cas_ref_gc.cpp`
+/// (RefObjectCleanupHonorsAllThreeConditions).)
 
 /// A crashed round leaves only never-adopted attempt-scoped debris (there is no resume machinery in the
 /// one-pass round). A fresh Gc simply re-runs the round under a fresh attempt and the deletion pipeline

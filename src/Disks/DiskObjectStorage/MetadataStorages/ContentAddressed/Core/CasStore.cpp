@@ -12,7 +12,6 @@
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
 #include <Common/thread_local_rng.h>
-#include <city.h>
 #include <algorithm>
 #include <chrono>
 #include <ctime>
@@ -35,13 +34,6 @@ namespace ErrorCodes
 
 namespace ProfileEvents
 {
-    extern const Event CasShardBatchFlushes;
-    extern const Event CasShardBatchedMutations;
-    extern const Event CasShardBatchScopeCuts;
-    extern const Event CasShardQueueWaitMicroseconds;
-    extern const Event CasManifestBackpressureCount;
-    extern const Event CasManifestBackpressureMicroseconds;
-    extern const Event CasManifestHardLimitExceeded;
     extern const Event CasPartFolderManifestGets;
     extern const Event CasRefBatchFlushes;
     extern const Event CasRefBatchedMutations;
@@ -419,7 +411,7 @@ StorePtr Store::open(BackendPtr backend, PoolConfig config)
         }
 
         /// Arm the local write fence: cache (uuid, epoch) and set the boottime deadline now + ttl. From
-        /// here ordinary mutations (mutateShard) are fence-gated via mayMutate().
+        /// here ordinary ref mutations (appendRefOps) are fence-gated via mayMutate().
         store->armMountFence(our_uuid, writer_epoch,
             store->bootMsNow() + static_cast<uint64_t>(store->config.mount_lease_ttl_ms.count()));
         /// Gate the background renewer with `background_watermark`: it runs only in production
@@ -464,12 +456,6 @@ Store::~Store()
             tryLogCurrentException(getLogger("CasStore"), "CAS mount-lease: release during Store teardown failed");
         }
     }
-}
-
-uint64_t Store::shardOf(const String & ref_name) const
-{
-    /// root_shards >= 1 is a PoolMeta invariant, so the modulus is always well-defined.
-    return CityHash_v1_0_2::CityHash64(ref_name.data(), ref_name.size()) % meta.root_shards;
 }
 
 void Store::casPutObject(const String & full_key, const String & bytes)
@@ -748,144 +734,6 @@ BuildPtr Store::startBuild(BuildInfo info)
     return build;
 }
 
-std::shared_ptr<const RootShard> Store::readShardDecoded(const RootNamespace & ns, uint64_t shard, bool allow_stale)
-{
-    const String key = pool_layout.rootShardKey(ns, shard);
-
-    /// Pillar B TTL fast-path: a staleness-tolerant caller may reuse a recently-validated decode
-    /// WITHOUT a HEAD. Only for PRESENT entries (absence is never TTL-cached — a just-created ref
-    /// must be observable by force-fresh callers; staleness-tolerant callers re-validate on miss).
-    if (allow_stale && config.shard_decode_cache_ttl_ms.count() > 0)
-    {
-        std::lock_guard lock(shard_decode_cache_mutex);
-        auto it = shard_decode_cache.find(key);
-        if (it != shard_decode_cache.end())
-        {
-            const auto age = std::chrono::steady_clock::now() - it->second.validated_at;
-            if (age < config.shard_decode_cache_ttl_ms)
-                return it->second.shard;
-        }
-    }
-
-    return coalescedReadShardDecoded(key);
-}
-
-std::shared_ptr<const RootShard> Store::coalescedReadShardDecoded(const String & key)
-{
-    std::shared_ptr<std::promise<std::shared_ptr<const RootShard>>> promise;
-    std::shared_future<std::shared_ptr<const RootShard>> future;
-    {
-        std::lock_guard lock(shard_inflight_mutex);
-        auto it = shard_inflight.find(key);
-        if (it != shard_inflight.end())
-        {
-            future = it->second;   /// follower: wait on the in-flight leader
-        }
-        else
-        {
-            promise = std::make_shared<std::promise<std::shared_ptr<const RootShard>>>();
-            future = promise->get_future().share();
-            shard_inflight.emplace(key, future);
-        }
-    }
-
-    if (!promise)
-        return future.get();   /// follower: returns the leader's result (or rethrows the leader's exception)
-
-    /// Leader: do the real work, publish to followers whether it succeeds or throws.
-    try
-    {
-        auto result = loadShardDecoded(key);
-        {
-            std::lock_guard lock(shard_inflight_mutex);
-            shard_inflight.erase(key);
-        }
-        promise->set_value(result);
-        return result;
-    }
-    catch (...)
-    {
-        {
-            std::lock_guard lock(shard_inflight_mutex);
-            shard_inflight.erase(key);
-        }
-        promise->set_exception(std::current_exception());
-        throw;
-    }
-}
-
-std::shared_ptr<const RootShard> Store::loadShardDecoded(const String & key)
-{
-    /// Empty-manifest sentinel for the absent case — shared so callers can treat absent and present
-    /// uniformly (no refs). Never mutated.
-    static const std::shared_ptr<const RootShard> empty_shard = std::make_shared<const RootShard>();
-
-    /// A `head` gets the current token without transferring/decoding the manifest body.
-    const HeadResult h = pool_backend->head(key);
-    if (!h.exists)
-    {
-        std::lock_guard lock(shard_decode_cache_mutex);
-        shard_decode_cache.erase(key);
-        return empty_shard;
-    }
-
-    {
-        std::lock_guard lock(shard_decode_cache_mutex);
-        auto it = shard_decode_cache.find(key);
-        if (it != shard_decode_cache.end() && it->second.token == h.token)
-        {
-            /// Token match: the cached decode is still valid. Stamp validated_at so TTL-tolerant
-            /// callers can skip the next HEAD within the configured window.
-            it->second.validated_at = std::chrono::steady_clock::now();
-            return it->second.shard;
-        }
-    }
-
-    /// Miss (or the shard was written since we last decoded it): fetch + decode once, then cache by
-    /// the token the bytes actually came from (NOT the head token — a write could have landed in
-    /// between; we cache what we decoded, which is self-consistent).
-    ///
-    /// Capture the per-key write counter BEFORE the get(): a committed write that bumps it while our
-    /// get() is in flight means the bytes we are about to fetch may predate that write — and the
-    /// write's invalidation erase has already run — so caching the decode now would poison the TTL
-    /// fast-path with a stale entry the erase can no longer remove (read-your-writes coherence, B157).
-    uint64_t seq_before_get;
-    {
-        std::lock_guard lock(shard_decode_cache_mutex);
-        seq_before_get = shard_write_seq[key];
-    }
-
-    std::optional<GetResult> object = pool_backend->get(key);
-    if (!object)
-    {
-        /// Raced a deletion between head and get — treat as absent.
-        std::lock_guard lock(shard_decode_cache_mutex);
-        shard_decode_cache.erase(key);
-        return empty_shard;
-    }
-    auto decoded = std::make_shared<const RootShard>(decodeRootShard(object->bytes));
-    {
-        std::lock_guard lock(shard_decode_cache_mutex);
-        /// Skip caching if a write committed during our get() (B157): the decode may be superseded
-        /// and its invalidation erase has already run, so populating now would resurrect a stale
-        /// entry. We still RETURN the decode to our own caller — a point-in-time view, acceptable
-        /// for allow_stale; a force-fresh caller's own writes happen-before its head() so this only
-        /// ever under-caches, never serves a caller its own stale write.
-        if (shard_write_seq[key] == seq_before_get)
-        {
-            /// Bound memory on a long-lived server: a wholesale clear is fine — entries re-populate
-            /// on demand (a stale entry would be re-validated by the head token check anyway).
-            if (shard_decode_cache.size() >= SHARD_DECODE_CACHE_MAX_ENTRIES)
-                shard_decode_cache.clear();
-            shard_decode_cache[key] = ShardDecodeCacheEntry{
-                .token = object->token,
-                .shard = decoded,
-                .validated_at = std::chrono::steady_clock::now()};
-        }
-    }
-    return decoded;
-}
-
 std::optional<Resolved> Store::resolveRef(const RootNamespace & ns, const String & ref_name, bool /*allow_stale*/)
 {
     /// Task 10: read side of the snapshot+log protocol (spec §Table State / §Read-Only Consumers). The
@@ -1085,324 +933,6 @@ std::map<String, Resolved> Store::listRefs(const RootNamespace & ns)
     return result;
 }
 
-void Store::mutateShard(const RootNamespace & ns, uint64_t shard, MutationScope scope,
-                        std::function<void(RootShard &)> mutate,
-                        uint64_t * out_committed_version, RootMutationOrigin origin, RootMutationKind kind,
-                        ShardIncarnation birth_incarnation, std::function<uint64_t()> birth_floor_provider)
-{
-    /// Flat-combining shard-mutation queue (spec 2026-07-03-cas-shard-mutation-queue): callers
-    /// enqueue (scope, closure, promise-like item) per (ns, shard); the caller that finds the queue
-    /// leaderless becomes the LEADER and flushes batches (one read -> apply-all -> one casPut) until
-    /// its OWN item completes, then hands the baton to a woken waiter. Bounded by construction:
-    /// every queued item is a BLOCKED caller thread, so total queued items across all shards never
-    /// exceeds the writer-thread count; the map entry lives only while work is in flight.
-    auto item = std::make_shared<ShardMutationItem>();
-    item->scope = std::move(scope);
-    item->mutate = std::move(mutate);
-    item->origin = origin;
-    item->kind = kind;
-    item->birth_incarnation = birth_incarnation;
-    item->birth_floor_provider = std::move(birth_floor_provider);
-
-    const auto qkey = std::make_pair(ns.string(), shard);
-    std::shared_ptr<ShardMutationQueue> q;
-    const auto enqueued_at = std::chrono::steady_clock::now();
-
-    std::unique_lock<std::mutex> lk(shard_queue_mutex);
-    auto & slot = shard_queues[qkey];
-    if (!slot)
-        slot = std::make_shared<ShardMutationQueue>();
-    q = slot;
-    q->pending.push_back(item);
-
-    while (!item->done)
-    {
-        if (!q->leader_active)
-        {
-            q->leader_active = true;
-            lk.unlock();
-            runShardQueueLeader(ns, shard, q, item);
-            lk.lock();
-            q->leader_active = false;
-            /// Baton pass: our item is done; a woken waiter with pending work self-promotes.
-            q->cv.notify_all();
-        }
-        else
-        {
-            q->cv.wait(lk);
-        }
-    }
-
-    /// Last one out removes the (empty, leaderless) queue — an idle pool holds an EMPTY map.
-    /// Erase ONLY when the map still holds OUR queue: a slow-exiting waiter must not evict a
-    /// successor queue (same key, fresh entry) whose leader is mid-flush — that would allow a
-    /// second leader on the shard (two-leader CAS conflicts, found by the stress test).
-    if (q->pending.empty() && !q->leader_active)
-    {
-        const auto it = shard_queues.find(qkey);
-        if (it != shard_queues.end() && it->second == q)
-            shard_queues.erase(it);
-    }
-    lk.unlock();
-
-    ProfileEvents::increment(ProfileEvents::CasShardQueueWaitMicroseconds,
-        std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now() - enqueued_at).count());
-    if (item->error)
-        std::rethrow_exception(item->error);
-    if (out_committed_version)
-        *out_committed_version = item->committed_version;
-}
-
-void Store::runShardQueueLeader(const RootNamespace & ns, uint64_t shard,
-                                const std::shared_ptr<ShardMutationQueue> & q,
-                                const std::shared_ptr<ShardMutationItem> & own)
-{
-    /// The leader serves flushes only until ITS caller's work is done (fairness: no caller thread is
-    /// held hostage flushing strangers' work after its own completed) — the baton then passes.
-    while (true)
-    {
-        {
-            std::lock_guard<std::mutex> g(shard_queue_mutex);
-            if (own->done)
-                return;
-        }
-        flushShardBatch(ns, shard, q);
-    }
-}
-
-void Store::flushShardBatch(const RootNamespace & ns, uint64_t shard,
-                            const std::shared_ptr<ShardMutationQueue> & q)
-{
-    /// One flush = one carved batch through one CAS loop. NEVER throws: every outcome lands in the
-    /// affected items (done + error/version) so waiters always wake.
-    const String key = pool_layout.rootShardKey(ns, shard);
-
-    auto complete_error = [&](const std::vector<std::shared_ptr<ShardMutationItem>> & items, std::exception_ptr e)
-    {
-        std::lock_guard<std::mutex> g(shard_queue_mutex);
-        for (const auto & it : items)
-        {
-            it->error = e;
-            it->done = true;
-        }
-        q->cv.notify_all();
-    };
-    auto carve_all_pending = [&]() -> std::vector<std::shared_ptr<ShardMutationItem>>
-    {
-        std::lock_guard<std::mutex> g(shard_queue_mutex);
-        std::vector<std::shared_ptr<ShardMutationItem>> all(q->pending.begin(), q->pending.end());
-        q->pending.clear();
-        return all;
-    };
-
-    /// No install drain here: the closures' condemn-gate reads point-read the per-hash freshness meta
-    /// directly (spec 2026-07-09-cas-writer-gc-simplification), which is always current — there is no
-    /// cached view to install or drain.
-
-    /// Local write fence (spec §write-fence): a superseded/paused writer must not race the live one.
-    /// The fence fails the WHOLE queue — every caller would have gotten the same refusal alone.
-    if (!mayMutate())
-    {
-        complete_error(carve_all_pending(), std::make_exception_ptr(Exception(ErrorCodes::ABORTED,
-            "CAS mount lost / lease expired — refusing to mutate ref shard for server_root '{}'",
-            config.server_root_id)));
-        return;
-    }
-
-    /// B164b: at most one backpressure delay per FLUSH (was: per mutation call).
-    bool delayed_once = false;
-
-    const uint64_t soft_limit = config.manifest_soft_limit;
-    const uint64_t hard_limit = config.manifest_hard_limit;
-    const uint64_t max_delay_ms = config.manifest_max_delay_ms;
-    const bool backpressure_active = (hard_limit > soft_limit) && (max_delay_ms > 0);
-
-    /// Rate-limiter for soft-limit warnings — at most one per 30s to avoid log spam under pressure.
-    static std::atomic<std::chrono::steady_clock::time_point> last_soft_warn{
-        std::chrono::steady_clock::time_point::min()};
-
-    std::vector<std::shared_ptr<ShardMutationItem>> batch;   /// carved once, after the first read
-
-    try
-    {
-        for (size_t attempt = 0; attempt < MAX_CAS_ATTEMPTS; ++attempt)
-        {
-            /// Re-read inside the loop so closures always edit the FRESH shard state: on a Conflict
-            /// retry the previous attempt's edits are discarded and re-applied to the winner's state,
-            /// so a journal append is never double-appended.
-            auto [root, token] = readShard(ns, shard);
-
-            /// Carve AFTER the first read: everything enqueued while the read was in flight joins
-            /// this batch (the read IS the batching window). Scope rule: at most one mutation per
-            /// ref name per flush; WholeShard flushes SOLO; create-if-absent flushes SOLO so the
-            /// creator's birth stamps apply exactly as in the unbatched protocol.
-            if (batch.empty())
-            {
-                std::lock_guard<std::mutex> g(shard_queue_mutex);
-                size_t cap = kMaxShardBatch;
-                if (!token || q->force_solo > 0)
-                    cap = 1;
-                std::set<String> seen_refs;
-                while (!q->pending.empty() && batch.size() < cap)
-                {
-                    const auto & front = q->pending.front();
-                    if (front->scope.kind == MutationScope::Kind::WholeShard)
-                    {
-                        if (!batch.empty())
-                            break;
-                        batch.push_back(front);
-                        q->pending.pop_front();
-                        break;
-                    }
-                    if (!seen_refs.insert(front->scope.ref_name).second)
-                    {
-                        ProfileEvents::increment(ProfileEvents::CasShardBatchScopeCuts);
-                        break;
-                    }
-                    batch.push_back(front);
-                    q->pending.pop_front();
-                }
-                if (q->force_solo > 0)
-                    --q->force_solo;
-            }
-            if (batch.empty())
-                return;   /// raced: everything was carved by a previous flush of this leader
-
-            if (!token)
-            {
-                /// Create-if-absent (solo by the carve rule): the creator's birth stamps.
-                root.incarnation = batch.front()->birth_incarnation;
-                if (batch.front()->birth_floor_provider)
-                    root.fence_round = batch.front()->birth_floor_provider();
-            }
-
-            /// Apply closures in queue order with per-closure SNAPSHOT isolation: a throwing closure
-            /// (validation, promote owner-check) rolls back ONLY its own edits, completes with its
-            /// exception, and drops out of the batch — exactly today's no-retry-on-throw semantics.
-            std::vector<std::shared_ptr<ShardMutationItem>> survivors;
-            survivors.reserve(batch.size());
-            for (const auto & it : batch)
-            {
-                RootShard snapshot = root;
-                try
-                {
-                    it->mutate(root);
-                    ++root.shard_version;
-                    it->committed_version = root.shard_version;
-                    survivors.push_back(it);
-                }
-                catch (...)
-                {
-                    root = std::move(snapshot);
-                    complete_error({it}, std::current_exception());
-                }
-            }
-            batch = std::move(survivors);
-            if (batch.empty())
-                return;
-
-            String body = encodeRootShard(root);
-
-            /// Hard limit — fail-closed before any consequential write. With a batch, degrade to
-            /// SOLO re-flushes so exactly the offending mutation gets LIMIT_EXCEEDED and innocent
-            /// co-batched neighbors proceed.
-            if (body.size() >= hard_limit)
-            {
-                if (batch.size() == 1)
-                {
-                    ProfileEvents::increment(ProfileEvents::CasManifestHardLimitExceeded);
-                    complete_error({batch.front()}, std::make_exception_ptr(Exception(ErrorCodes::LIMIT_EXCEEDED,
-                        "manifest {} size {} reached hard limit {} (kind={})",
-                        key, body.size(), hard_limit, toString(batch.front()->kind))));
-                    return;
-                }
-                std::lock_guard<std::mutex> g(shard_queue_mutex);
-                for (auto rit = batch.rbegin(); rit != batch.rend(); ++rit)
-                    q->pending.push_front(*rit);
-                q->force_solo = batch.size();
-                return;
-            }
-
-            /// Soft limit — warning + optional backpressure delay when ANY batched item is Writer.
-            if (body.size() >= soft_limit)
-            {
-                const auto now = std::chrono::steady_clock::now();
-                auto last = last_soft_warn.load(std::memory_order_relaxed);
-                if (now - last > std::chrono::seconds(30))
-                {
-                    if (last_soft_warn.compare_exchange_strong(last, now))
-                    {
-                        LOG_WARNING(getLogger("CasStore"),
-                            "manifest {} size {} crossed soft limit {} (hard={}, kind={}, origin={})",
-                            key, body.size(), soft_limit, hard_limit,
-                            toString(batch.front()->kind), toString(batch.front()->origin));
-                    }
-                }
-
-                const bool any_writer = std::any_of(batch.begin(), batch.end(),
-                    [](const auto & it) { return it->origin == RootMutationOrigin::Writer; });
-                if (any_writer && backpressure_active && !delayed_once)
-                {
-                    const double fraction = static_cast<double>(body.size() - soft_limit)
-                                          / static_cast<double>(hard_limit - soft_limit);
-                    uint64_t delay_ms = static_cast<uint64_t>(fraction * static_cast<double>(max_delay_ms));
-                    if (delay_ms > 0)
-                    {
-                        delayed_once = true;
-                        const auto delay = std::chrono::milliseconds(delay_ms);
-                        ProfileEvents::increment(ProfileEvents::CasManifestBackpressureCount);
-                        ProfileEvents::increment(
-                            ProfileEvents::CasManifestBackpressureMicroseconds,
-                            std::chrono::duration_cast<std::chrono::microseconds>(delay).count());
-                        LOG_DEBUG(getLogger("CasStore"),
-                            "manifest backpressure: ns/shard={}/{} size={} soft={} hard={} delay={}ms batch={}",
-                            ns.string(), shard, body.size(), soft_limit, hard_limit,
-                            delay_ms, batch.size());
-                        if (backpressure_delay_hook)
-                            backpressure_delay_hook(delay);
-                        else
-                            std::this_thread::sleep_for(delay);
-                        continue;   /// fresh read, batch stays carved
-                    }
-                }
-            }
-
-            if (pool_backend->casPut(key, body, token).outcome == CasOutcome::Committed)
-            {
-                /// Read-your-writes (Pillar B): invalidate this shard's decode cache so a same-Store
-                /// allow_stale read cannot serve the pre-write decode; bumping shard_write_seq under
-                /// the SAME lock fences any in-flight reader (B157).
-                {
-                    std::lock_guard cache_lock(shard_decode_cache_mutex);
-                    ++shard_write_seq[key];
-                    shard_decode_cache.erase(key);
-                }
-                ProfileEvents::increment(ProfileEvents::CasShardBatchFlushes);
-                ProfileEvents::increment(ProfileEvents::CasShardBatchedMutations, batch.size());
-                {
-                    std::lock_guard<std::mutex> g(shard_queue_mutex);
-                    for (const auto & it : batch)
-                        it->done = true;
-                    q->cv.notify_all();
-                }
-                return;
-            }
-            /// Conflict (cross-writer only: e.g. the GC leader on another replica) => re-read and
-            /// REPLAY the carved batch — identical to today's single-mutation retry semantics.
-        }
-        complete_error(batch, std::make_exception_ptr(Exception(ErrorCodes::ABORTED,
-            "manifest CAS contention on {}", key)));
-    }
-    catch (...)
-    {
-        /// A flush-level failure (readShard/backend error) fails the carved batch — or, when the
-        /// first read itself threw, everything currently pending (each caller would have hit the
-        /// same storage error alone).
-        complete_error(batch.empty() ? carve_all_pending() : batch, std::current_exception());
-    }
-}
-
 std::shared_ptr<Store::RefTableRuntime> Store::getRefTableRuntime(const RootNamespace & ns)
 {
     std::lock_guard lock(ref_queue_mutex);
@@ -1563,7 +1093,23 @@ bool Store::observedNamespaceCleanupMarker(const RootNamespace & ns, const RefTx
     const auto rt = getRefTableRuntime(ns);
     ensureRefTableRecovered(ns, *rt);
     std::lock_guard lock(rt->state_mutex);
-    return rt->cleanup_markers.contains(remove_txn_id);
+    if (rt->cleanup_markers.contains(remove_txn_id))
+        return true;
+
+    /// Warm-mount re-observation (Task 12): the recovery `LIST` that populated `cleanup_markers` may have
+    /// run BEFORE GC's namespace-cleanup item published the `_cleanup/<remove_txn_id>` marker, so a
+    /// warm-mounted writer that dropped a namespace and recreates it within the same mount lifetime would
+    /// otherwise be rejected until it remounts. Do ONE exact-key backend check of the marker before
+    /// answering; if it is durably present now, adopt it into the cached set. This preserves fail-close
+    /// (a still-absent marker keeps recreation rejected -- evidence is refreshed, never assumed) and
+    /// matches the recovery restart-on-vanish philosophy of consulting the durable object on a cache miss.
+    const HeadResult head = backend().head(layout().refCleanupMarkerKey(ns, remove_txn_id));
+    if (head.exists)
+    {
+        rt->cleanup_markers.insert(remove_txn_id);
+        return true;
+    }
+    return false;
 }
 
 RefTxnId Store::appendRefOps(const RootNamespace & ns, MutationScope scope,
@@ -1619,8 +1165,8 @@ RefTxnId Store::appendRefOps(const RootNamespace & ns, MutationScope scope,
 void Store::runRefQueueLeader(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt,
                               const std::shared_ptr<RefMutationItem> & own)
 {
-    /// Fairness baton pass, exactly like `runShardQueueLeader`: serve flushes only until the caller's
-    /// OWN item is done, then hand off to a woken waiter.
+    /// Fairness baton pass: serve flushes only until the caller's OWN item is done, then hand off to a
+    /// woken waiter.
     while (true)
     {
         {
@@ -1636,7 +1182,7 @@ void Store::flushRefBatch(const RootNamespace & ns, const std::shared_ptr<RefTab
 {
     /// One flush = one carved batch through one attempted append. Contract: every ORDINARY outcome
     /// (validation reject, DefiniteFailure, Unresolved/wedge, Committed) lands in the affected items so
-    /// waiters always wake, and this does NOT throw for any of them (mirrors `flushShardBatch`). The ONE
+    /// waiters always wake, and this does NOT throw for any of them. The ONE
     /// exception is the provably-unreachable case where a DURABLY-committed transaction then fails to
     /// apply to the in-memory state (which the whole-item shape validation is supposed to preclude): that
     /// path completes every waiting survivor with the error, restores the leader bookkeeping, and RETHROWS
@@ -2278,12 +1824,12 @@ void Store::dropRef(const RootNamespace & ns, const String & ref_name)
 }
 
 void Store::updateRefPayload(const RootNamespace & ns, const String & ref_name,
-                             std::function<void(RootRef &)> mutator)
+                             std::function<void(RefMutableFilesUpdate &)> mutator)
 {
-    /// Task 10 (spec §Update Payload): one `set_payload` ref-log transaction. Unlike the old
-    /// journal-free RootShard field mutation, EVERY change (even payload-only) is now an explicit
-    /// logged operation -- the immutable append-only log has no other way to record it (spec: "The
-    /// operation replaces the complete mutable payload and does not change the manifest edge").
+    /// Task 10 (spec §Update Payload): one `set_payload` ref-log transaction. EVERY change (even
+    /// payload-only) is an explicit logged operation -- the immutable append-only log has no other way
+    /// to record it (spec: "The operation replaces the complete mutable payload and does not change the
+    /// manifest edge").
     appendRefOps(ns, MutationScope::ref(ref_name),
         [&](const RefTableState & state) -> std::vector<RefOp>
         {
@@ -2292,29 +1838,21 @@ void Store::updateRefPayload(const RootNamespace & ns, const String & ref_name,
                 throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
                     "updateRefPayload: no such ref {} in namespace {}", ref_name, ns.string());
 
-            /// Round-trip through the legacy RootRef shape so every existing `mutator` (written
-            /// against `RootRef::mutable_files`) is unchanged; only the persisted encoding (one opaque
-            /// `payload` blob) is new.
-            RootRef legacy;
-            legacy.ref_name = ref_name;
-            legacy.manifest_ref = it->second.manifest_ref;
-            legacy.mutable_files = decodeMutableFilesPayload(it->second.payload);
-            legacy.published_at_ms = it->second.published_at_ms;
+            /// The mutator edits only the mutable payload; the carrier deliberately carries no
+            /// `manifest_ref`, so a reachability change is structurally impossible here (it goes through
+            /// publish/drop instead). The persisted encoding is one opaque `payload` blob.
+            RefMutableFilesUpdate update;
+            update.mutable_files = decodeMutableFilesPayload(it->second.payload);
+            update.published_at_ms = it->second.published_at_ms;
 
-            mutator(legacy);
-
-            /// A reachability change is not allowed on this path (use publish/drop instead); throwing
-            /// here rejects only this item, before any object is created.
-            if (!(legacy.manifest_ref == it->second.manifest_ref))
-                throw Exception(ErrorCodes::LOGICAL_ERROR,
-                    "updateRefPayload must not change manifest_ref; use publish/drop");
+            mutator(update);
 
             RefOp op;
             op.kind = RefOpKind::SetPayload;
             op.ref_name = ref_name;
             op.expected_manifest_ref = it->second.manifest_ref;
-            op.payload = encodeMutableFilesPayload(legacy.mutable_files);
-            op.published_at_ms = legacy.published_at_ms;
+            op.payload = encodeMutableFilesPayload(update.mutable_files);
+            op.published_at_ms = update.published_at_ms;
             return {op};
         },
         RootMutationOrigin::Writer, RootMutationKind::UpdateRefPayload);
@@ -2429,23 +1967,10 @@ void Store::dropNamespace(const RootNamespace & ns)
         tryLogCurrentException(getLogger("CasStore"), "CAS dropNamespace: publishing the Removed snapshot failed (best-effort)");
     }
 
-    /// TODO(Task 12): the writer performs NO physical deletion of ref-log/snapshot objects or verbatim
-    /// namespace files anymore -- GC's namespace-cleanup item ({namespace, remove_txn_id},
-    /// Pending->Completed) owns that reclaim, keyed off the durable `remove_namespace` this call just
-    /// appended (spec §Clean Old Ref Objects). Until Task 12 lands, a dropped namespace's ref-log
-    /// objects and verbatim files remain as debris; the OLD per-shard tombstoning + verbatim-file
-    /// deletion this function used to do is gone (it operated on the legacy RootShard format, which no
-    /// longer holds any real ref state to protect once refs live on the snapshot+log protocol).
-}
-
-std::pair<RootShard, std::optional<Token>> Store::readShard(const RootNamespace & ns, uint64_t shard)
-{
-    /// An absent shard manifest means the shard holds no refs yet — a fresh, empty manifest with no
-    /// token (nothing to CAS against). This is normal state, NOT a fallback masking an error.
-    std::optional<GetResult> object = pool_backend->get(pool_layout.rootShardKey(ns, shard));
-    if (!object)
-        return {RootShard{}, std::nullopt};
-    return {decodeRootShard(object->bytes), object->token};
+    /// The writer performs NO physical deletion of ref-log/snapshot objects or verbatim namespace files
+    /// -- GC's namespace-cleanup item ({namespace, remove_txn_id}, Pending->Completed) owns that reclaim,
+    /// keyed off the durable `remove_namespace` this call just appended (spec §Clean Old Ref Objects).
+    /// Until GC reclaims it, a dropped namespace's ref-log objects and verbatim files remain as debris.
 }
 
 std::vector<String> Store::listNamespaces(const String & prefix)
@@ -2458,11 +1983,9 @@ std::vector<String> Store::listNamespaces(const String & prefix)
     /// RustFS: to confirm in soak.
     std::unordered_set<String> found;
 
-    /// `cas/refs/`: Task 10 keys are `<pool_prefix>/cas/refs/<ns>/_log|_snap|_cleanup/<txn-id>`; the
-    /// pre-Task-10 (still GC/dropNamespace-written until Task 12) legacy shape is
-    /// `<pool_prefix>/cas/refs/<ns>/<shard>` (shard a decimal integer). Try the new parser first; a key
-    /// it does not recognize falls back to the legacy "namespace = everything before the last '/'"
-    /// extraction so a namespace touched only via the old writer path stays discoverable.
+    /// `cas/refs/`: ref-object keys are `<pool_prefix>/cas/refs/<ns>/_log|_snap|_cleanup/<txn-id>`.
+    /// `parseRefObjectKey` recognizes them and yields the owning namespace; any key it does not
+    /// recognize is skipped (it is not one of this pool's ref objects).
     {
         const String base = pool_layout.casRefsPrefix() + prefix;
         String cursor;
@@ -2478,16 +2001,7 @@ std::vector<String> Store::listNamespaces(const String & prefix)
                 {
                     if (parsed->ns.string().starts_with(prefix))
                         found.insert(parsed->ns.string());
-                    continue;
                 }
-                const std::string_view rest(key.data() + pool_layout.casRefsPrefix().size(),
-                    key.size() - pool_layout.casRefsPrefix().size());
-                const size_t last_slash = rest.rfind('/');
-                if (last_slash == std::string_view::npos)
-                    continue;
-                const String ns_str(rest.substr(0, last_slash));
-                if (!ns_str.empty() && ns_str.starts_with(prefix))
-                    found.insert(ns_str);
             }
             if (page.next_cursor.empty())
                 break;
@@ -2532,11 +2046,11 @@ std::vector<String> Store::listMirroredChildren(const String & prefix)
     /// names. NOT authoritative — callers must re-check `listRefs` per candidate before surfacing
     /// it. GC uses LIST-based discovery (`cas/refs/` prefix) rather than a registry.
     ///
-    /// Phase 1: a namespace's presence is split across two physical subtrees — its ref shards live
-    /// under `cas/refs/<ns>/<shard>` (the relocation target) while its verbatim files and PLAIN
+    /// Phase 1: a namespace's presence is split across two physical subtrees — its ref-log/snapshot
+    /// objects live under `cas/refs/<ns>/_log|_snap|_cleanup/…` while its verbatim files and PLAIN
     /// mountpoint objects stay under `roots/<ns>/_files/…` / `roots/<key>`. The browse therefore
     /// UNIONs the next-segment names from BOTH subtrees so a namespace discoverable only by its ref
-    /// shards (the common case — mutable per-part files ride inside the RootRef payload, not as
+    /// objects (the common case — mutable per-part files ride inside the ref payload, not as
     /// verbatim `_files`) is still surfaced.
     std::unordered_set<String> children;
     const String roots_full = pool_layout.rootsPrefix() + prefix;       /// e.g. <pool>/roots/shadow/

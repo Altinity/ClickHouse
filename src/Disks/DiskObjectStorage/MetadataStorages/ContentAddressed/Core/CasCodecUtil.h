@@ -40,8 +40,6 @@ inline void writeU128LE(WriteBuffer & out, const UInt128 & v) { writeBinaryLittl
 inline UInt128 readU128LE(ReadBuffer & in) { UInt128 v; readBinaryLittleEndian(v, in); return v; }
 
 /// BE 16-byte form — used by protobuf `bytes` fields to encode UInt128 values in big-endian order.
-/// Body copied VERBATIM from the former hand-rolled `u128ToBytes` / `u128FromBytes` in
-/// `CasRootShardCodec.cpp` so the bytes are unchanged.
 inline std::string u128ToBytesBE(const UInt128 & v)
 {
     std::string out(16, '\0');

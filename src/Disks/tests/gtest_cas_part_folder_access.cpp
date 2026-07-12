@@ -134,7 +134,7 @@ TEST(CasPartFolderAccess, WritePrimitivesRoundTrip)
     ASSERT_TRUE(access.existsRef(key, ContentAddressed::Freshness::ForceFresh));
 
     /// updateMutableFiles is visible to a force-fresh resolve immediately.
-    access.updateMutableFiles(key, [](Cas::RootRef & payload) { payload.mutable_files["txn_version.txt"] = "v2"; });
+    access.updateMutableFiles(key, [](Cas::RefMutableFilesUpdate & payload) { payload.mutable_files["txn_version.txt"] = "v2"; });
     auto resolved = access.resolve(key, ContentAddressed::Freshness::ForceFresh);
     ASSERT_TRUE(resolved.has_value());
     EXPECT_EQ(resolved->mutable_files.at("txn_version.txt"), "v2");
@@ -260,7 +260,7 @@ TEST(CasPartFolderAccess, MutableRefreshWithoutManifestRead)
     /// RAW-store mutation: the write bypasses the facade (validate-on-hit must cope — this is the
     /// mutation-site-not-routed / foreign-writer shape the compare exists for). The retained entry
     /// survives, so the next read exercises the manifest-match + mutable-drift CLONE path.
-    store->updateRefPayload(ns, "part_1", [](Cas::RootRef & p) { p.mutable_files["txn_version.txt"] = "v2"; });
+    store->updateRefPayload(ns, "part_1", [](Cas::RefMutableFilesUpdate & p) { p.mutable_files["txn_version.txt"] = "v2"; });
     backend->resetCounts();
 
     auto view = access.getView(key, ContentAddressed::Freshness::CachedForLoad);
@@ -284,7 +284,7 @@ TEST(CasPartFolderAccess, WriteThroughEraseThenRebuild)
     const String manifest_key = layout.manifestKey(id);
 
     ASSERT_NE(access.getView(key, ContentAddressed::Freshness::CachedForLoad), nullptr);
-    access.updateMutableFiles(key, [](Cas::RootRef & p) { p.mutable_files["txn_version.txt"] = "v2"; });
+    access.updateMutableFiles(key, [](Cas::RefMutableFilesUpdate & p) { p.mutable_files["txn_version.txt"] = "v2"; });
     backend->resetCounts();
 
     auto view = access.getView(key, ContentAddressed::Freshness::CachedForLoad);
@@ -454,7 +454,6 @@ TEST(CasPartFolderAccess, DropNamespaceErasesAllViews)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = openStoreForTest(backend);
-    const Cas::Layout layout("p");
     const Cas::RootNamespace ns{"srv/t1"};
     ContentAddressed::CachedPartFolderAccess access(store, cacheOn());
     publishPart(store, ns, "part_1", {inlineEntry("f", "x")});
@@ -469,16 +468,34 @@ TEST(CasPartFolderAccess, DropNamespaceErasesAllViews)
 
     access.dropNamespace(ns);
 
-    /// Re-publish part_1 under the SAME ref name: the dropped namespace's retained entries must be
-    /// gone (a stale key1 view must never be served, and a residual entry would masquerade as
-    /// "retained" without ever going through validate-on-hit for the NEW manifest).
-    const auto id1b = publishPart(store, ns, "part_1", {inlineEntry("f", "z")});
-    const String manifest_key1b = layout.manifestKey(id1b);
-    backend->resetCounts();
-    auto view = access.getView(key1, ContentAddressed::Freshness::CachedForLoad);
-    ASSERT_NE(view, nullptr);
-    EXPECT_EQ(view->inlineBytes("f"), std::optional<String>("z"));
-    EXPECT_EQ(backend->getCount(manifest_key1b), 1u);   /// cold rebuild, not a stale hit
-
+    /// dropNamespace removes the namespace via the ref-log `remove_namespace` transaction AND erases every
+    /// cached view: the dropped entries must not masquerade as "retained", and no stale key1/key2 view may
+    /// be served.
+    EXPECT_FALSE(access.explain(key1).retained);
     EXPECT_FALSE(access.explain(key2).retained);   /// dropped too, even though never re-touched
+
+    /// A fresh getView on the removed namespace is a COLD MISS (nullptr) -- never a stale hit on the
+    /// dropped manifest. A residual retained entry would instead be served here without ever going through
+    /// validate-on-hit, exactly the masquerade this guards against.
+    EXPECT_EQ(access.getView(key1, ContentAddressed::Freshness::CachedForLoad), nullptr);
+    EXPECT_EQ(access.getView(key2, ContentAddressed::Freshness::CachedForLoad), nullptr);
+
+    /// Recreation end-to-end (Task 12, snapshot+log §Namespace Birth): recreating the namespace requires
+    /// GC's `_cleanup/<remove_txn_id>` completion marker; a warm writer re-observes it via one exact-key
+    /// re-check (`Store::observedNamespaceCleanupMarker`). This file has no GC harness, so we publish the
+    /// marker directly -- the removal already published a `Removed` snapshot at `remove_txn_id`, so read
+    /// that id and write the marker, exactly as GC's namespace-cleanup item would. Republishing part_1
+    /// under the SAME name must then be admitted and serve a fresh RECREATED view via validate-on-hit,
+    /// never a stale hit on the dropped manifest.
+    const Cas::Layout & layout = store->layout();
+    const Cas::ListPage removed_snaps = backend->list(layout.refsNamespacePrefix(ns) + "_snap/", "", 100);
+    ASSERT_FALSE(removed_snaps.keys.empty()) << "dropNamespace must publish a Removed snapshot at remove_txn_id";
+    const auto parsed = layout.parseRefObjectKey(removed_snaps.keys.front().key);
+    ASSERT_TRUE(parsed.has_value());
+    backend->putIfAbsent(layout.refCleanupMarkerKey(ns, parsed->txn_id), "");
+
+    publishPart(store, ns, "part_1", {inlineEntry("f", "recreated")});
+    const auto recreated_view = access.getView(key1, ContentAddressed::Freshness::CachedForLoad);
+    ASSERT_NE(recreated_view, nullptr) << "the recreated namespace must serve a fresh view after the marker is durable";
+    EXPECT_TRUE(access.explain(key1).retained);
 }

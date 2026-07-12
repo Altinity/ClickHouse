@@ -129,7 +129,7 @@ public:
     /// one that either completes within the writing process or never happens at all.
     void promote(const RootNamespace & target_ns, const String & final_ref_name, UInt128 build_id, const ManifestId & id);
 
-    /// Carry the mutable per-ref payload (txn_version.txt, ...) that promote writes into RootRef.mutable_files.
+    /// Carry the mutable per-ref payload (txn_version.txt, ...) that promote writes into the ref's mutable files.
     void setPendingMutableFiles(std::map<String, String> files) { pending_mutable_files = std::move(files); }
 
     /// Retire seq so the GC watermark floor can advance; staged manifest debris is best-effort cleaned
@@ -220,14 +220,14 @@ private:
     /// once this build's owning namespace is durably removed. Atomic because it is WRITTEN cross-thread
     /// and READ by `requireAlive` on the build's own thread. Once cancelled, every further op fails closed.
     std::atomic<bool> cancelled{false};
-    bool precommitted = false;                            /// a create-precommit RootOwnerEvent was appended
+    bool precommitted = false;                            /// a create-precommit owner_transition was appended
 
     /// Set by precommitAdd so promote knows which shard to move ownership in.
     RootNamespace precommit_target_ns;
     String precommit_final_ref;
     ManifestRef precommit_manifest;
 
-    std::map<String, String> pending_mutable_files;       /// promote writes these into RootRef.mutable_files
+    std::map<String, String> pending_mutable_files;       /// promote writes these into the ref's mutable files
     std::vector<ManifestId> staged_manifests;             /// for best-effort abandon cleanup
 
     std::map<DepKey, DepEntry> deps;                      /// the W-DEP-SET (blob-only now)

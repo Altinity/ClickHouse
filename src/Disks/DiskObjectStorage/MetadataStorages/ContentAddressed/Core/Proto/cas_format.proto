@@ -10,10 +10,11 @@ package clickhouse.cas.format;
 //
 // CONVERGED HEADER MODEL (2026-06-25): every mutable object carries a CasHeader as field 1.
 // The object is PURE PROTOBUF — no binary prefix, decodable directly with protoc:
-//   protoc --decode clickhouse.cas.format.RootShardManifest cas_format.proto < manifest.bin
+//   protoc --decode clickhouse.cas.format.PoolMetaProto cas_format.proto < pool_meta.bin
 // Per-object magic (4 ASCII bytes as little-endian fixed32):
-//   RootShardManifest "CARS" | PoolMetaProto "CAPM" | GcStateProto "CAGT"
-//   GcOutcomeLogProto "CAGO"
+//   PoolMetaProto "CAPM" | GcStateProto "CAGT" | GcOutcomeLogProto "CAGO"
+// (The generation-2 mutable ref manifest family "CARS" was removed in Task 12 with the snapshot+log ref
+//  format — magic CARS freed, never reuse; refs now live as immutable _log/_snap objects.)
 // (RetiredSetProto "CART" retired 2026-07-10 with the retired-in-snapshot refactor — magic CART freed,
 //  never reuse; condemned state rides the source-edge runs + fold-seal condemned_summary)
 // (RootsRegistryProto "CARR" deleted in Task 4 — discovery authority moved to LIST(cas/refs/))
@@ -43,65 +44,6 @@ message CasHeader {
   fixed32 magic               = 1;  // per-type 4-ASCII-byte constant (see table above)
   uint32  writer_version      = 2;  // forensic: the build/generation that wrote this
   uint32  compatibility_version = 3; // functional: the floor targeted; reader dispatches + fail-closes
-}
-
-// CA GC root-local part-manifest redesign (rev. 15). The compact reference a root journal stores for a
-// part manifest. NOT a string key: CasLayout::manifestKey derives the object key from this ref plus the
-// owning root namespace. root_namespace_id is NOT a field here (it comes from the owning context).
-message ManifestRefProto {
-  uint64 writer_epoch          = 1;  // durable monotone writer epoch under the mounted server root
-  uint64 build_sequence        = 2;  // monotone build sequence inside one writer epoch
-  uint32 manifest_ordinal      = 3;  // monotone ordinal inside one build, rendered as 000001.proto
-}
-
-enum OwnerKindProto {
-  OWNER_KIND_UNSPECIFIED = 0;        // decode fails closed on 0
-  OWNER_KIND_COMMITTED   = 1;
-  OWNER_KIND_PRECOMMIT   = 2;
-}
-
-// One owner binding: which kind of owner names which manifest.
-// Committed: ref_name set, build_id = 0. Precommit: ref_name = final_ref_name, build_id set.
-message OwnerBindingProto {
-  OwnerKindProto   owner_kind  = 1;
-  string           ref_name    = 2;
-  bytes            build_id    = 3;  // raw 16 bytes (UInt128, big-endian); 0 for Committed
-  ManifestRefProto manifest_ref = 4;
-}
-
-// One ordered owner-change event in the single root journal stream. old_binding/new_binding are
-// proto3 explicit-presence (optional) so absence is distinguishable from a zero binding.
-// is_tombstone: set by dropNamespace as the LAST journal event; both bindings are absent. The fold
-// treats it as a no-op (no blob delta), and GC reclaims the shard object once it is fully folded.
-message RootOwnerEventProto {
-  uint64                     transition_version = 1;
-  optional OwnerBindingProto old_binding        = 2;
-  optional OwnerBindingProto new_binding        = 3;
-  bool                       is_tombstone       = 4;  // Task 6: drop-namespace tombstone marker
-}
-
-// The current committed ref payload in the root journal: the committed ManifestRef plus the mutable
-// per-ref files. root_namespace_id is NOT stored here — it comes from the owning root context.
-message RootRefProto {
-  string              ref_name        = 1;
-  ManifestRefProto    manifest_ref    = 2;
-  map<string, string> mutable_files   = 3;
-  uint64              published_at_ms = 4;  // publish wall-clock (epoch ms); 0 = unset
-}
-
-// Root shard manifest (the per-namespace versioned ref store). Magic CARS, FormatId::Manifest.
-// rev. 15: refs carry a ManifestRef; the journal is ONE ordered RootOwnerEvent stream
-// (transition_version order). The old RefPayload/JournalRecord/ClosureNode model is removed.
-// (Pre-release: field renumbering is safe — no on-disk data exists under the old numbering.)
-message RootShardManifest {
-  CasHeader header      = 1;          // magic=CARS; set by encoder, checked by decoder
-  reserved "codec_version";           // old name; reserved so it is never reused
-  uint64 shard_version  = 2;
-  uint64 fence_round    = 3;
-  map<string, RootRefProto> refs = 4;
-  repeated RootOwnerEventProto journal = 5; // insertion order == transition_version order
-  uint64 incarnation_writer_epoch    = 6;   // ShardIncarnation.writer_epoch; 0 = unstamped
-  uint64 incarnation_build_sequence  = 7;   // ShardIncarnation.build_sequence; 0 = unstamped
 }
 
 // Pool-wide identity and constants (_pool_meta). Magic CAPM, FormatId::PoolMeta.
@@ -234,6 +176,10 @@ message FoldShardCoverageProto {
   bool   has_live_precommit                 = 8;  // shard holds >=1 live (un-promoted, un-removed) precommit
   uint64 min_live_precommit_writer_epoch    = 9;  // lexicographically-min live precommit writer_epoch
   uint64 min_live_precommit_build_sequence  = 10; // lexicographically-min live precommit build_sequence
+  // Snapshot+log ref model (spec §GC State): last_folded_ref_id = greatest RefTxnId whose owner changes
+  // this table already folded. Replaces folded_cursor for ref intake; per table (shard fixed at 0).
+  uint64 last_folded_ref_epoch    = 11;  // RefTxnId.writer_epoch; 0 = nothing folded
+  uint64 last_folded_ref_sequence = 12;  // RefTxnId.ref_sequence; 0 = nothing folded
 }
 
 // One per-gc-shard condemned-in-snapshot summary inside a FoldSealProto (retired-in-snapshot T4).
@@ -245,6 +191,16 @@ message CondemnedSummaryProto {
   uint64 oldest_nonpending_condemn_round = 4;   // UINT64_MAX = none
 }
 
+// One namespace-cleanup item {ns, remove_txn_id} inside a FoldSealProto (spec §Clean Old Ref Objects).
+// New Phase-1 protocol state: the durable Pending->Completed record for the physical reclamation of a
+// removed namespace. Carried forward each fold generation until Completed.
+message RefNsCleanupItemProto {
+  string ns                  = 1;
+  uint64 remove_txn_epoch    = 2;  // RefTxnId.writer_epoch of remove_txn_id
+  uint64 remove_txn_sequence = 3;  // RefTxnId.ref_sequence of remove_txn_id
+  uint32 state               = 4;  // 1=Pending 2=Completed
+}
+
 // FOLD seal (write-once gc/gen/<gen>/fold_seal). Magic CAFS, FormatId::FoldSeal.
 message FoldSealProto {
   CasHeader header                            = 1;
@@ -254,6 +210,7 @@ message FoldSealProto {
   repeated RunRefProto blob_target_runs       = 5;   // sorted by key
   repeated RunRefProto part_manifest_cleanup  = 6;   // sorted by key
   repeated CondemnedSummaryProto condemned_summary = 7;  // sorted by shard; TOTAL over gc_shards
+  repeated RefNsCleanupItemProto ns_cleanup_items  = 8;  // sorted by (ns, remove_txn_id); §Step 6
 }
 
 // (CompletionSealProto / SealVersionEntryProto "CACS" retired with the one-pass ack-floor round —

@@ -7,7 +7,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestCodec.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestId.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasOrphanManifestSweep.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootShardCodec.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRefIntake.h>
 
 #include <Common/Exception.h>
 #include <Common/HashTable/Hash.h>
@@ -102,10 +102,15 @@ bool blobStillReferenced(Store & store, const Layout & layout,
         const String ref_name = label.substr(slash + 1);
         try
         {
-            const auto resolved = store.resolveRef(RootNamespace{ns_part}, ref_name, /*allow_stale=*/false);
-            if (!resolved)
+            /// FRESH read via `recoverRefTable` (a full LIST + replay), NOT `store.resolveRef` -- the
+            /// mounted Store caches its `RefTableState` and never re-recovers it, so a concurrent EXTERNAL
+            /// ref write (the B207 race) is invisible to the cache. The recovery equation sees every log.
+            const RootNamespace rns{ns_part};
+            const RefTableState table = recoverRefTable(store.backend(), layout, rns);
+            const auto rit = table.committed.find(ref_name);
+            if (rit == table.committed.end())
                 continue;   /// the ref was DROPPED since the walk — this label no longer applies
-            const PartManifest body = store.readManifest(resolved->manifest_id);
+            const PartManifest body = store.readManifest(ManifestId{rns, rit->second.manifest_ref});
             for (const ManifestEntry & e : body.entries)
             {
                 if (e.placement != EntryPlacement::Blob)
@@ -147,9 +152,12 @@ void runFsckImpl(Store & store, bool detail, const FsckProgress & on_progress, c
     for (const String & ns_str : store.listNamespaces(namespace_prefix))
     {
         const RootNamespace ns{ns_str};
-        for (const auto & [ref_name, resolved] : store.listRefs(ns))
+        /// FRESH recovery (LIST + replay), NOT the mounted Store's cached `listRefs`: fsck is a read-only
+        /// audit that must see the authoritative durable ref state, including any external write.
+        const RefTableState table = recoverRefTable(backend, layout, ns);
+        for (const auto & [ref_name, row] : table.committed)
         {
-            const ManifestId id = resolved.manifest_id;
+            const ManifestId id{ns, row.manifest_ref};
             const String mkey = layout.manifestKey(id);
             owned_manifest_keys.insert(mkey);
             const String label = ns_str + "/" + ref_name;

@@ -153,9 +153,9 @@ TEST(CasGcRoundDefer, ChangedShardCountIsZeroWhenQuiescent)
 /// real fold round (no `blob_target` run object touched at all -- the fold never runs). Snap
 /// generation/attempt are untouched (the snapshot is not rebuilt).
 ///
-/// SETTLING NOTE: with eager trim (gc_trim_min_events=0, the openStoreForTest default) a shard's token
-/// is rewritten by trim AFTER the fold seal captures it, so reaching true quiescence takes 2 rounds
-/// (fold-then-trim lag) -- mirrors CasGcRoundDefer.ChangedShardCountIsZeroWhenQuiescent above.
+/// SETTLING NOTE: immutable `_log` objects are never trimmed in place (unlike the legacy mutable shard
+/// journal, whose fold-then-trim token rewrite forced a second settling round), so the pool quiesces the
+/// round AFTER the folding round -- the very next round defers.
 TEST(CasGcRoundDefer, IdleRoundDefersAndReadsNoGeneration)
 {
     auto backend = std::make_shared<CountingBackend>();
@@ -167,20 +167,15 @@ TEST(CasGcRoundDefer, IdleRoundDefersAndReadsNoGeneration)
     publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
 
     Gc gc(store, kGc);
-    ASSERT_FALSE(gc.runRegularRound().deferred);   /// round 1: folds the +1 (trim-lag not yet settled)
-
     backend->resetCounts();
-    const RoundReport settle = gc.runRegularRound();   /// round 2: still folds (sees round 1's own
-                                                        /// trim-rewrite as "changed"); this fold's seal
-                                                        /// finally captures the shard's true current token.
-    ASSERT_FALSE(settle.deferred);
+    ASSERT_FALSE(gc.runRegularRound().deferred);   /// round 1: folds the +1 (no trim-lag, quiesces at once)
     const uint64_t fold_round_gets = backend->getTotal();
     EXPECT_GT(fold_round_gets, 0u) << "sanity: a real fold round performs some GETs";
 
     const auto st_before = decodeGcState(backend->get(store->layout().gcStateKey())->bytes);
 
     backend->resetCounts();
-    const RoundReport rep = gc.runRegularRound();   /// round 3: genuinely quiesced now => must defer
+    const RoundReport rep = gc.runRegularRound();   /// round 2: genuinely quiesced now => must defer
     const uint64_t defer_round_gets = backend->getTotal();
 
     EXPECT_TRUE(rep.deferred) << "a settled idle round must re-adopt the sealed generation, not fold";
@@ -216,10 +211,11 @@ TEST(CasGcRoundDefer, IdleRoundDefersUnderShardedGc)
     publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
 
     Gc gc(store, kGc);
-    ASSERT_FALSE(gc.runRegularRound().deferred);   /// round 1: folds
-    ASSERT_FALSE(gc.runRegularRound().deferred);   /// round 2: settles the trim-lag mismatch
+    ASSERT_FALSE(gc.runRegularRound().deferred);   /// round 1: folds the publish
 
-    const RoundReport rep = gc.runRegularRound();   /// round 3: quiesced
+    /// Immutable `_log` objects are never trimmed in place, so there is no fold-then-trim token-rewrite
+    /// lag: the pool quiesces after the folding round, and the very next round defers.
+    const RoundReport rep = gc.runRegularRound();   /// round 2: quiesced
     EXPECT_TRUE(rep.deferred) << "idle pool under gc_shards=2 must defer once settled";
 }
 

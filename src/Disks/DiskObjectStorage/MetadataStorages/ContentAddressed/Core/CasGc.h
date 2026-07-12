@@ -5,6 +5,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcOutcomes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestCodec.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestId.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRefIntake.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include <Common/ThreadPool.h>
 #include <atomic>
@@ -138,21 +139,6 @@ public:
     /// harmless — the next pulse retries). Touches NO Gc instance state. Static by design.
     static void pulseHeartbeat(Store & store, UInt128 gc_id);
 
-    /// Phase-2 token-diff: whether the next round's discover step should skip the body read for a
-    /// root shard (the listed token equals the persisted folded token, so durable state covers it)
-    /// or must read and re-fold the body (token advanced, missing, or no prior coverage).
-    enum class DiscoverDecision : uint8_t
-    {
-        Skip = 0,   /// listed token == sealed folded_token => body already covered; skip the GET
-        Read = 1,   /// token advanced / missing / no prior coverage / !supportsListTokens => must read
-    };
-
-    /// WRITE-FREE TEST SEAM: the per-shard discover decisions the NEXT round would make, derived from
-    /// the durable sealed `folded_token` (recorded by `recheck` from the POST-FENCE shard token) plus a
-    /// single LIST sweep over the roots prefix. Returns a map keyed by "ns/shard" (the same format as
-    /// `CasFoldSeal::per_ns_shard`). The universe is LIST-discovered (`cas/refs/` prefix).
-    /// No CAS, no delete, no fold. Mirrors the write-free contract of `previewDeletes`.
-    std::map<String, DiscoverDecision> discoverDecisionsForTest();
 
     /// One previewed deletion the next regular round would make, with the reason it is eligible.
     struct PreviewEntry
@@ -194,19 +180,9 @@ public:
     /// externally (e.g. by a scheduled maintenance task, not yet wired).
     void setMaintenanceTrimForTest(bool enabled) { maintenance_trim = enabled; }
 
-    /// B8 precommit reclaim (converged-shard model): while folding ANY table shard, drop the precommit
-    /// bindings of ABANDONED builds (the owning build is no longer live). `precommitAdd` writes a precommit
-    /// owner binding into the FUTURE COMMITTED REF's OWN table shard (keyed by `final_ref_name`, kind
-    /// `OwnerKind::Precommit`) — there is no `_precommits` namespace. The reclaim therefore enumerates the
-    /// LIVE precommit bindings from the shard's folded owner state (the journal owner-state replay), and for
-    /// each derives `(server, build_seq)` from the binding's `manifest_ref`
-    /// (`writer_epoch`, `build_sequence`). A build is DEAD iff the server has
-    /// no watermark, is judged not-live this round (K=2 frozen-seq crash detector), or
-    /// `build_sequence < min_active`. Each dead binding is removed by appending a `PrecommitRemove`
-    /// RootOwnerEvent (old = the precommit binding, new = none — the SAME encoding `Build::abandon` /
-    /// `Store::dropRef` / the legacy reclaim use) in ONE CAS on the shard already in hand. CONSERVATIVE: a
-    /// live build is never reclaimed; a wrongful reclaim is caught by the promote guard (fail closed).
-    void reclaimAbandonedPrecommit(const RootNamespace & ns, uint64_t shard, uint64_t round);
+    /// (GC-side abandoned-precommit reclaim was removed with the snapshot+log ref model: dead-precommit
+    /// cleanup is now the writer's job -- it appends exact `owner_transition` removals in ref logs, spec
+    /// §Failed Precommit Cleanup / §Clean Up Old Precommits. `GC` never invents a ref transition.)
 
     /// DELETE-SITE AUDIT (closeout invariant; grep `deleteExact` under Core/): the round's pre-CAS
     /// redelete phase (R3 in runRegularRound) holds the ONLY content (blob reachability) delete in
@@ -234,6 +210,9 @@ private:
         /// Ack-floor one-pass round: the retired-cursor outcome per gc-shard (settled entries, new
         /// condemnations, floor-passed pendings, and the prior pendings to delete pre-CAS).
         std::vector<RetiredMergeResult> retired_merge;
+        /// The round's one global ref LIST, grouped per table (spec §Step 1). Reused post-CAS for
+        /// ref-object cleanup (covered logs / superseded snapshots) so a second LIST is never issued.
+        std::map<String, RefTableListing> ref_tables;
     };
 
     /// R1 (spec rev. 15 §Fold Owner Transitions): per changed root shard, stream the ONE ordered
@@ -271,12 +250,24 @@ private:
 
 
 
-    /// Trim (INV-JOURNAL-COVERAGE): drop owner events with transition_version <= the sealed fold cursor,
-    /// sourced from `CasFoldSeal::per_ns_shard[cursorKey].folded_cursor` (the generation carrying those
-    /// deltas is durable: fold/recheck sealed it before trim runs). A shard absent from the sealed
-    /// coverage is not trimmed (no fallback to a looser cursor). The cursor used per shard is recorded
-    /// into `folded.completion_seal.trim_cursors` for the in-round audit log.
-    void trim(FoldResult & folded, uint64_t round);
+    /// Ref-object cleanup (spec §Step 6 / §Concurrent Startup And Cleanup): delete each table's ref logs
+    /// covered by BOTH the durable fold cursor AND an observed snapshot, and snapshots older than the
+    /// newest observed one, in batches of <=1000 exact keys. A remove_namespace log is retained until its
+    /// namespace-cleanup item is durably Completed. Runs post-CAS (durable cursor) and only on a clamp-free
+    /// round (`suppress_destructive == false`). Acts only on keys THIS round's scan returned (reused via
+    /// `folded.ref_tables`), so a covering snapshot is always durable before any deletion it authorizes.
+    void cleanupRefObjects(const FoldResult & folded, bool suppress_destructive);
+
+    /// Namespace-cleanup item passes (spec §Step 6): for each item in the committed seal, a Pending item
+    /// runs a bounded exact-key enumerate-and-delete pass over the removed namespace's physical `@cas@`
+    /// prefixes (manifest bodies + verbatim files); a Completed item publishes the `_cleanup` marker and
+    /// republishes the constant-size `Removed` snapshot (both idempotent `putIfAbsent`). Runs post-CAS, so
+    /// winning the round's gc/state CAS is the leadership fence that gates publication.
+    void runNamespaceCleanupPasses(const CasFoldSeal & seal, bool suppress_destructive);
+
+    /// Whether a namespace's physical `@cas@` metadata prefixes (manifest bodies + verbatim files) hold no
+    /// object -- the Pending->Completed condition for its namespace-cleanup item. LIST-only, no delete.
+    bool namespacePhysicallyEmpty(const RootNamespace & ns);
 
     /// Best-effort cursor-paced orphan part-manifest sweep. This is cleanup-only state: a lost CAS only
     /// discards cursor progress and must not fail the already-completed GC round.
@@ -286,29 +277,6 @@ private:
     /// resume re-fence. Returns only shards that have a backend object (absent shards not included).
     /// Fresh pool (no shards yet) => empty result.
     std::vector<std::pair<RootNamespace, uint64_t>> discoverUniverse();
-
-    /// Phase-2 token-diff: do ONE LIST sweep over `<prefix>/roots/` and return, for each listed key
-    /// whose backend surfaced an incarnation token, that token. Only meaningful when
-    /// `supportsListTokens()` is TRUE; the result is an accelerator — a missing key here means Read
-    /// (fail closed). Key format: the full backend key (e.g. `p/roots/ns/0`); callers strip the roots
-    /// prefix to get the "ns/shard" cursor-key form when looking up in `per_ns_shard`.
-    ///
-    /// AMBIGUITY DETECTION: a key seen more than once across all pages is ambiguous (a backend anomaly
-    /// or a racing write that landed between two pages). Ambiguous keys are reported into
-    /// `ambiguous_keys` so that `computeDiscoverDecisions` can force those shards to Read (fail closed).
-    std::map<String, Token> listRootShardTokens(std::set<String> & ambiguous_keys);
-
-    /// Phase-2 token-diff: compute the per-shard `DiscoverDecision` for the upcoming round. The universe
-    /// is the LIST-discovered present-shard set (LIST is the authority; shards absent from LIST are absent). The
-    /// default decision is Read (fail closed; the spec, not a hidden fallback). A shard is Skip IFF:
-    ///   `supportsListTokens()` is TRUE, AND
-    ///   `sealed.per_ns_shard` has prior coverage for the key, AND
-    ///   the LIST sweep surfaced a token for the key, AND
-    ///   that listed token == the sealed `folded_token` (the post-fence token recheck recorded), AND
-    ///   the shard is NOT clamped: if `fence_positions` has the key with `fence_pos > 0` and
-    ///   `folded_cursor + 1 < fence_pos`, the previous fold was barrier-clamped (unfolded events may
-    ///   exist) => forced Read.
-    std::map<String, DiscoverDecision> computeDiscoverDecisions(const CasFoldSeal & sealed);
 
     /// Task 3 (Phase 4 Lever A): the two cheap pre-fold GC round-defer signals — both computed from
     /// state already reachable before the fold's snapshot merge (O(retired)/O(shards), no snapshot
@@ -323,16 +291,13 @@ private:
     /// path surfaces it); a round must never silently defer on corrupt bookkeeping.
     bool graduationDue(const GcState & state, uint64_t current_round);
 
-    /// The number of present shards whose LIST-discovered token differs from what the adopted fold seal
-    /// recorded (= the count of non-`Skip` `DiscoverDecision`s `computeDiscoverDecisions` would make
-    /// against the seal at `state.snap_generation`/`snap_attempt`).
+    /// The number of tables (namespaces) with at least one ref log above their sealed durable cursor --
+    /// the pre-fold DEFER signal (spec §Step 1). Computed from one `LIST cas/refs/` compared against the
+    /// per-table cursors in the adopted fold seal at `state.snap_generation`/`snap_attempt`.
     size_t changedShardCount(const GcState & state);
 
-    /// Task 6: for each discovered shard that is empty + tombstoned (last journal event `is_tombstone`)
-    /// + fully folded at current incarnation, issue `deleteExact(rootShardKey, read_token)` using the
-    /// token from the eligibility GET. Tolerates `NotFound` and `TokenMismatch` (never throws on 404
-    /// or a concurrent revive — feedback_ca_gc_never_throw_on_404).
-    void reclaimDroppedShards(const FoldResult & folded);
+    /// (reclaimDroppedShards was removed with the snapshot+log ref model: there is no mutable per-namespace
+    /// shard object to tombstone+reclaim; physical namespace reclamation is the namespace-cleanup item.)
 
 
     /// Write the part-manifest cleanup bundle(s) for one fold generation: a write-once record listing

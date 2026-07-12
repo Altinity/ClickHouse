@@ -1,12 +1,14 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasOrphanManifestSweep.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEvent.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootShardCodec.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRefIntake.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasServerRoot.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGenerationSeal.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcFormats.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcCursorKey.h>
 #include <Common/Exception.h>
+#include <Common/logger_useful.h>
+#include <algorithm>
 #include <map>
 #include <set>
 #include <limits>
@@ -68,92 +70,80 @@ std::optional<ListedManifestObject> parseListedManifestObject(const Layout & lay
         .key = key};
 }
 
-/// The shard's sealed fold cursor (the latest seal's `folded_cursor` for ns/shard), or 0 when no seal
-/// covers it yet. A precommit-removal event AT OR ABOVE this cursor has NOT had its `-1` blob decrement
-/// folded+sealed, so the precommit's manifest body is still load-bearing (delete-after-sealed-decrements).
-///
-/// B2 — resolve the seal DIRECTLY at the adopted `(snap_generation, snap_attempt)` (mirrors
-/// `Gc::readSealedCursors`): the one-pass round's fold seal at that pair carries the cursors, else cursor 0
-/// (fresh pool). The old `for g downto 1` back-scan was UNSOUND with a single stored `snap_attempt`: a
-/// prior generation's adopted attempt was a different `lease.seq`, recorded nowhere, so its key is
-/// unreachable here — the scan never legitimately reached a prior round.
-uint64_t sealedFoldCursor(Store & store, const RootNamespace & ns, uint64_t shard)
+/// The table's durable `last_folded_ref_id` (spec §Orphan Manifest Protection), read from the adopted
+/// fold seal at `(snap_generation, snap_attempt)`; {0,0} when no seal covers it yet (fresh pool). A
+/// manifest removed by a log ABOVE this cursor has NOT had its `-1` decrement folded, so its body is still
+/// load-bearing (delete-after-sealed-decrements).
+RefTxnId sealedRefCursor(Store & store, const RootNamespace & ns)
 {
     const Layout & layout = store.layout();
     const auto state_got = store.backend().get(layout.gcStateKey());
     if (!state_got)
-        return 0;
+        return RefTxnId{};
     const GcState state = decodeGcState(state_got->bytes);
-    const uint64_t gen = state.snap_generation;
-    const uint64_t attempt = state.snap_attempt;
-    const String key = cursorKey(ns, shard);
-
-    if (const auto got = store.backend().get(layout.foldSealKey(gen, attempt)))
+    if (const auto got = store.backend().get(layout.foldSealKey(state.snap_generation, state.snap_attempt)))
     {
         const CasFoldSeal seal = decodeFoldSeal(got->bytes);
-        const auto it = seal.per_ns_shard.find(key);
-        return it != seal.per_ns_shard.end() ? it->second.folded_cursor : 0;
+        const auto it = seal.per_ns_shard.find(cursorKey(ns, /*shard*/0));
+        if (it != seal.per_ns_shard.end())
+            return it->second.last_folded_ref_id;
     }
-    return 0;
+    return RefTxnId{};
 }
 
-/// The active manifest-object-KEY set for one namespace: every committed RootRef's manifest_ref plus
-/// every live precommit binding (a precommit new_binding not later removed) AND every precommit body
-/// whose REMOVAL is still PENDING (above the sealed fold cursor — its `-1` not yet sealed). Keys (not
-/// ManifestIds) so a listed object key can be tested directly without parsing the key back.
+/// The active manifest-object-KEY set for one namespace (spec §Orphan Manifest Protection), built as the
+/// same complete view writer recovery uses:
+///   owners in the newest snapshot + owner changes in every later log (== `recoverRefTable`'s committed
+///   rows and live precommits) + manifests removed anywhere in the tail above the durable
+///   `last_folded_ref_id` (their `-1` is not yet folded, so the GC fold still needs the body).
+/// Keys (not ManifestIds) so a listed object key can be tested directly. Throws on a corrupt snapshot /
+/// invalid transaction (via `recoverRefTable` / `decodeRefLogTxn`); the caller SKIPS the namespace's
+/// deletions on such a throw rather than substituting an empty owner set.
 std::set<String> activeManifestKeys(Store & store, const RootNamespace & ns)
 {
     std::set<String> active;
     const Layout & layout = store.layout();
-    const uint64_t shards = store.poolMeta().root_shards;
-    for (uint64_t shard = 0; shard < shards; ++shard)
+    Backend & backend = store.backend();
+
+    /// Current owners = snapshot + replayed tail (committed rows + live precommits).
+    const RefTableState state = recoverRefTable(backend, layout, ns);
+    for (const auto & [ref_name, row] : state.committed)
+        active.insert(layout.manifestKey(ManifestId{ns, row.manifest_ref}));
+    for (const auto & [ref_name, manifest_ref] : state.precommits)
+        active.insert(layout.manifestKey(ManifestId{ns, manifest_ref}));
+
+    /// Tail-removal protection: every manifest removed by a log ABOVE the durable fold cursor stays active
+    /// until its `-1` folds. LIST the table's logs, decode those above the cursor, and protect each
+    /// removed manifest (a `-1` edge). A namespace-removal transaction names every removed owner explicitly,
+    /// so this also protects a whole removed namespace's bodies until the fold catches up.
+    const RefTxnId cursor = sealedRefCursor(store, ns);
+    std::vector<RefTxnId> logs;
     {
-        const auto got = store.backend().get(layout.rootShardKey(ns, shard));
-        if (!got)
-            continue;
-        const RootShard root = decodeRootShard(got->bytes);
-
-        /// Committed owners: the current ref payloads. `root.refs` IS the sealed committed view — a
-        /// promote/publish sets refs[final_ref_name] AND appends the committed RootOwnerEvent in ONE
-        /// mutateShard CAS (Build::promote / publishCommitted), so a committed manifest is ALWAYS in
-        /// root.refs the instant it exists; there is no committed-in-journal-only window to miss.
-        for (const auto & [name, ref] : root.refs)
-            active.insert(layout.manifestKey(ManifestId{ns, ref.manifest_ref}));
-
-        /// Live precommit owners AND bodies still load-bearing for an UNSEALED removal `-1` (either
-        /// owner kind). The journal is append-only (trimmed below the GC fold cursor only after sealing),
-        /// so accumulate adds and subtract removals by manifest_ref. A removal whose `-1` is NOT YET
-        /// SEALED (its transition_version is above the sealed fold cursor) is treated as STILL ACTIVE:
-        /// the GC fold must read the body to emit that `-1` next round (delete-after-sealed-decrements),
-        /// so the sweep must NOT delete it. This holds for BOTH owner kinds:
-        ///   - PRECOMMIT: closes the B8 race where GC's own precommit reclaim appends a removal in a round
-        ///     whose end-of-round sweep would otherwise delete the body before the `-1` folds.
-        ///   - COMMITTED (2026-07-10 GC-WEDGE fix): a promoted build retires its build_seq, so its
-        ///     committed manifest's prefix is watermark-eligible; when its ref is dropped the key leaves
-        ///     root.refs, and WITHOUT this protection the sweep deletes the committed body in the window
-        ///     between dropRef and the fold sealing the `-1` — the removal-fold then clamps forever on the
-        ///     missing committed body ("edge-bearing committed body missing at removal-fold"), wedging ALL
-        ///     pool collection. A live committed owner is covered by root.refs above; this covers it from
-        ///     dropRef until the `-1` seals.
-        const uint64_t cursor = sealedFoldCursor(store, ns, shard);
-        std::set<ManifestRef> journal_live;
-        for (const RootOwnerEvent & e : root.journal)
+        String list_cursor;
+        for (;;)
         {
-            const bool is_removal = e.old_binding
-                && (!e.new_binding || e.old_binding->manifest_ref != e.new_binding->manifest_ref);
-            if (is_removal && e.transition_version <= cursor)
-                journal_live.erase(e.old_binding->manifest_ref);
-            if (e.new_binding && e.new_binding->owner_kind == OwnerKind::Precommit)
-                journal_live.insert(e.new_binding->manifest_ref);
-            /// A PENDING removal (its `-1` not yet sealed), of EITHER owner kind, keeps the body
-            /// load-bearing even when the matching activation was already folded and TRIMMED away —
-            /// protect the body named by the removal's old_binding directly so the GC fold can still read
-            /// it to emit the `-1`.
-            if (is_removal && e.transition_version > cursor)
-                journal_live.insert(e.old_binding->manifest_ref);
+            const ListPage page = backend.list(layout.refsNamespacePrefix(ns), list_cursor, 1000);
+            for (const ListedKey & lk : page.keys)
+                if (const auto parsed = layout.parseRefObjectKey(lk.key);
+                    parsed && parsed->ns == ns && parsed->kind == RefObjectKind::Log)
+                    logs.push_back(parsed->txn_id);
+            if (page.next_cursor.empty())
+                break;
+            list_cursor = page.next_cursor;
         }
-        for (const ManifestRef & ref : journal_live)
-            active.insert(layout.manifestKey(ManifestId{ns, ref}));
+    }
+    std::sort(logs.begin(), logs.end());
+    for (const RefTxnId & id : logs)
+    {
+        if (!(cursor < id))
+            continue;   /// id <= cursor: its edges are already folded
+        const auto got = backend.get(layout.refLogKey(ns, id));
+        if (!got)
+            continue;   /// vanished (a concurrent cleanup published a covering snapshot) -- its -1 was folded
+        const RefLogTxn txn = decodeRefLogTxn(got->bytes, ns.string(), id);
+        for (const RefManifestEdge & edge : manifestEdgesOfTxn(txn))
+            if (edge.change < 0)
+                active.insert(layout.manifestKey(edge.manifest_id));
     }
     return active;
 }
@@ -187,7 +177,22 @@ void sweepNamespace(Store & store, const RootNamespace & ns, const BuildPrefix &
     const Layout & layout = store.layout();
     Backend & backend = store.backend();
 
-    const std::set<String> active = activeManifestKeys(store, ns);
+    /// Build the protection view. A corrupt snapshot / invalid transaction throws (spec §Orphan Manifest
+    /// Protection: "a missing snapshot body, invalid transaction, or incomplete ordered view causes the
+    /// sweep to skip deletion and surface the error. It never substitutes an empty owner set."). Skip this
+    /// namespace's deletions on such a throw rather than deleting against a wrong (empty) view.
+    std::set<String> active;
+    try
+    {
+        active = activeManifestKeys(store, ns);
+    }
+    catch (const Exception & e)
+    {
+        LOG_WARNING(getLogger("CasOrphanManifestSweep"),
+                    "CAS orphan sweep: namespace {} protection view unavailable ({}); skipping its deletions",
+                    ns.string(), e.message());
+        return;
+    }
 
     /// Enumerate the ONE build prefix: cas/manifests/<ns>/<epoch-hex>-<seq-hex>/ (spec §Manifest
     /// Identifier canonical hex form -- same rendering `Layout::manifestKey` uses).
@@ -233,6 +238,7 @@ ManifestSweepResult sweepManifestCursorPage(
 
     std::map<String, bool> eligible_by_prefix;
     std::map<String, std::set<String>> active_by_ns;
+    std::set<String> errored_namespaces;   /// protection view unavailable => skip, never delete
     for (const ListedKey & listed : page.keys)
     {
         ++result.listed;
@@ -263,7 +269,26 @@ ManifestSweepResult sweepManifestCursorPage(
 
         auto [active_it, inserted] = active_by_ns.emplace(parsed->ns.string(), std::set<String>{});
         if (inserted)
-            active_it->second = activeManifestKeys(store, parsed->ns);
+        {
+            /// A corrupt snapshot / invalid transaction throws (spec §Orphan Manifest Protection): skip the
+            /// namespace's deletions and surface the error, never substitute an empty owner set.
+            try
+            {
+                active_it->second = activeManifestKeys(store, parsed->ns);
+            }
+            catch (const Exception & e)
+            {
+                LOG_WARNING(getLogger("CasOrphanManifestSweep"),
+                            "CAS orphan sweep: namespace {} protection view unavailable ({}); skipping",
+                            parsed->ns.string(), e.message());
+                errored_namespaces.insert(parsed->ns.string());
+            }
+        }
+        if (errored_namespaces.count(parsed->ns.string()))
+        {
+            ++result.skipped;
+            continue;
+        }
         if (active_it->second.count(parsed->key))
         {
             ++result.skipped;

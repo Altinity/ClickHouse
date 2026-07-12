@@ -16,7 +16,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestId.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRefLogCodec.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRefSnapshotCodec.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootShardCodec.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include <Common/Exception.h>
 #include <Common/thread_local_rng.h>
@@ -168,103 +167,139 @@ inline DB::Cas::ManifestEntry blobEntryFor(const String & path, const DB::UInt12
     return e;
 }
 
-/// Append ONE RootOwnerEvent to a shard's journal via read-modify-CAS (mirroring the production Build
-/// path): bump shard_version, append the event at the new version, maintain `refs` for committed
-/// bindings, and CAS. Returns the event's transition_version. Registers the namespace first.
-inline uint64_t appendOwnerEvent(
-    DB::Cas::Backend & backend, const DB::Cas::Layout & layout,
-    const DB::Cas::RootNamespace & ns, uint64_t shard,
-    std::optional<DB::Cas::OwnerBinding> old_binding,
-    std::optional<DB::Cas::OwnerBinding> new_binding,
-    const String & committed_ref_name = {})
+/// Forward declarations of the ref snapshot+log raw fixtures defined further down (they emit the
+/// snapshot+log objects GC and recovery actually read); the seeding wrappers below emit through them.
+inline void writeRefLogTxnRaw(
+    DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::RefLogTxn & txn);
+inline DB::Cas::RefOp namespaceBirthOp();
+inline std::vector<DB::Cas::RefOp> publishCommittedOps(
+    const String & ref_name, const DB::Cas::ManifestRef & manifest_ref);
+
+/// One `owner_transition` op built from an optional old/new `RefOwnerBinding` (removal = old set / new
+/// unset; add-precommit = new set / old unset; promote = both set naming the SAME manifest).
+inline DB::Cas::RefOp ownerTransitionOp(
+    std::optional<DB::Cas::RefOwnerBinding> old_binding, std::optional<DB::Cas::RefOwnerBinding> new_binding)
 {
-    registerNamespaceRaw(backend, layout, ns);
-    const String key = layout.rootShardKey(ns, shard);
-    while (true)
-    {
-        const auto got = backend.get(key);
-        DB::Cas::RootShard root;
-        std::optional<DB::Cas::Token> expected;
-        if (got)
-        {
-            root = DB::Cas::decodeRootShard(got->bytes);
-            expected = got->token;
-        }
-        const uint64_t version = root.shard_version + 1;
-        root.shard_version = version;
-        root.journal.push_back(DB::Cas::RootOwnerEvent{
-            .transition_version = version, .old_binding = old_binding, .new_binding = new_binding});
-
-        /// Maintain committed refs so the read path + fsck see the current owner.
-        if (new_binding && new_binding->owner_kind == DB::Cas::OwnerKind::Committed && !committed_ref_name.empty())
-        {
-            DB::Cas::RootRef r;
-            r.ref_name = committed_ref_name;
-            r.manifest_ref = new_binding->manifest_ref;
-            root.refs[committed_ref_name] = r;
-        }
-        if ((!new_binding || new_binding->owner_kind != DB::Cas::OwnerKind::Committed)
-            && old_binding && old_binding->owner_kind == DB::Cas::OwnerKind::Committed && !committed_ref_name.empty())
-            root.refs.erase(committed_ref_name);
-
-        const auto outcome = backend.casPut(key, DB::Cas::encodeRootShard(root), expected).outcome;
-        if (outcome == DB::Cas::CasOutcome::Committed)
-            return version;
-    }
+    DB::Cas::RefOp op;
+    op.kind = DB::Cas::RefOpKind::OwnerTransition;
+    op.old_binding = std::move(old_binding);
+    op.new_binding = std::move(new_binding);
+    return op;
 }
 
-/// Publish a committed ref over `ref` (old none unless `old_ref` set). Returns the event version.
+/// Seed ONE ref-log transaction directly into a table's `_log/` stream -- the snapshot+log replacement
+/// for the removed mutable-shard `appendOwnerEvent`. LIST the table's ref prefix, find the greatest
+/// existing log/snapshot `ref_sequence` (and whether ANY log or snapshot exists at all), prepend a
+/// `namespace_birth` op iff the table has none yet, allocate `txn_id = {writer_epoch=1, greatest+1}`,
+/// and write `RefLogTxn{ns, txn_id, ops}` via `writeRefLogTxnRaw`. Returns the allocated `ref_sequence`.
+/// `ops` must form a REPLAY-VALID transaction: `fsck`/recovery replay them through the same state
+/// machine the writer uses, and the GC edge extractor reads their manifest edges. The bytes are real
+/// wire-format (the same codec `Store`'s recovery reads) -- never hand-rolled.
+inline uint64_t appendRefLogSeed(
+    DB::Cas::Backend & backend, const DB::Cas::Layout & layout,
+    const DB::Cas::RootNamespace & ns, std::vector<DB::Cas::RefOp> ops)
+{
+    const String prefix = layout.refsNamespacePrefix(ns);
+    uint64_t greatest_seq = 0;
+    bool any_log_or_snap = false;
+    String cursor;
+    while (true)
+    {
+        const DB::Cas::ListPage page = backend.list(prefix, cursor, /*limit=*/1000);
+        for (const DB::Cas::ListedKey & lk : page.keys)
+        {
+            const auto parsed = layout.parseRefObjectKey(lk.key);
+            if (!parsed)
+                continue;
+            if (parsed->kind == DB::Cas::RefObjectKind::Log || parsed->kind == DB::Cas::RefObjectKind::Snap)
+            {
+                any_log_or_snap = true;
+                greatest_seq = std::max(greatest_seq, parsed->txn_id.ref_sequence);
+            }
+        }
+        if (page.next_cursor.empty())
+            break;
+        cursor = page.next_cursor;
+    }
+
+    if (!any_log_or_snap)
+        ops.insert(ops.begin(), namespaceBirthOp());
+
+    DB::Cas::RefLogTxn txn;
+    txn.ns = ns.string();
+    txn.txn_id = DB::Cas::RefTxnId{/*writer_epoch=*/1, /*ref_sequence=*/greatest_seq + 1};
+    txn.ops = std::move(ops);
+    writeRefLogTxnRaw(backend, layout, txn);
+    return txn.txn_id.ref_sequence;
+}
+
+/// Append ONE `owner_transition` op as a standalone ref-log transaction. `shard` is ignored (the
+/// immutable ref model has no per-shard journal); it stays in the signature so existing shard-passing
+/// callers compile unchanged. Returns the allocated `ref_sequence`.
+inline uint64_t appendOwnerEvent(
+    DB::Cas::Backend & backend, const DB::Cas::Layout & layout,
+    const DB::Cas::RootNamespace & ns, uint64_t /*shard*/,
+    std::optional<DB::Cas::RefOwnerBinding> old_binding,
+    std::optional<DB::Cas::RefOwnerBinding> new_binding)
+{
+    return appendRefLogSeed(backend, layout, ns, {ownerTransitionOp(std::move(old_binding), std::move(new_binding))});
+}
+
+/// Publish a committed ref over `ref_name` (no old unless `old_ref` set). Emits a REPLAY-VALID
+/// transaction: an optional owner-removal of the old committed binding, then add-precommit + promote of
+/// the new manifest (spec §State Transitions has no direct "add committed" shape). Edges: -1(old)+1(new)
+/// or +1(new). Returns the allocated `ref_sequence`.
 inline uint64_t publishCommittedTransition(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::RootNamespace & ns,
     const String & ref_name, std::optional<DB::Cas::ManifestRef> old_ref, const DB::Cas::ManifestRef & new_ref,
-    uint64_t shard = 0)
+    uint64_t /*shard*/ = 0)
 {
-    std::optional<DB::Cas::OwnerBinding> old_b;
+    std::vector<DB::Cas::RefOp> ops;
     if (old_ref)
-        old_b = DB::Cas::OwnerBinding{.owner_kind = DB::Cas::OwnerKind::Committed,
-            .ref_name = ref_name, .build_id = {}, .manifest_ref = *old_ref};
-    DB::Cas::OwnerBinding new_b{.owner_kind = DB::Cas::OwnerKind::Committed,
-        .ref_name = ref_name, .build_id = {}, .manifest_ref = new_ref};
-    return appendOwnerEvent(backend, layout, ns, shard, old_b, new_b, ref_name);
+        ops.push_back(ownerTransitionOp(
+            DB::Cas::RefOwnerBinding{DB::Cas::RefOwnerKind::Committed, ref_name, *old_ref}, std::nullopt));
+    const std::vector<DB::Cas::RefOp> commit_ops = publishCommittedOps(ref_name, new_ref);
+    ops.insert(ops.end(), commit_ops.begin(), commit_ops.end());
+    return appendRefLogSeed(backend, layout, ns, std::move(ops));
 }
 
-/// Drop a committed ref (old committed / new none). Returns the event version.
+/// Drop a committed ref (old committed / new none). Edge -1. Returns the allocated `ref_sequence`.
 inline uint64_t dropRefTransition(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::RootNamespace & ns,
-    const String & ref_name, const DB::Cas::ManifestRef & old_ref, uint64_t shard = 0)
+    const String & ref_name, const DB::Cas::ManifestRef & old_ref, uint64_t /*shard*/ = 0)
 {
-    DB::Cas::OwnerBinding old_b{.owner_kind = DB::Cas::OwnerKind::Committed,
-        .ref_name = ref_name, .build_id = {}, .manifest_ref = old_ref};
-    return appendOwnerEvent(backend, layout, ns, shard, old_b, std::nullopt, ref_name);
+    return appendRefLogSeed(backend, layout, ns,
+        {ownerTransitionOp(DB::Cas::RefOwnerBinding{DB::Cas::RefOwnerKind::Committed, ref_name, old_ref}, std::nullopt)});
 }
 
-/// Add a precommit binding (old none / new precommit). Returns the event version.
+/// Add a precommit binding (optional owner-removal of a stale committed manifest, then add-precommit of
+/// the new manifest). Edge -1(old)+1(new) or +1(new). `build_id` is dropped (RefLog bindings carry no
+/// build_id; build identity lives in `manifest_ref`). Returns the allocated `ref_sequence`.
 inline uint64_t addPrecommitTransition(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::RootNamespace & ns,
-    const DB::UInt128 & build_id, const String & final_ref_name, std::optional<DB::Cas::ManifestRef> old_ref,
-    const DB::Cas::ManifestRef & new_ref, uint64_t shard = 0)
+    const DB::UInt128 & /*build_id*/, const String & final_ref_name, std::optional<DB::Cas::ManifestRef> old_ref,
+    const DB::Cas::ManifestRef & new_ref, uint64_t /*shard*/ = 0)
 {
-    std::optional<DB::Cas::OwnerBinding> old_b;
+    std::vector<DB::Cas::RefOp> ops;
     if (old_ref)
-        old_b = DB::Cas::OwnerBinding{.owner_kind = DB::Cas::OwnerKind::Committed,
-            .ref_name = final_ref_name, .build_id = {}, .manifest_ref = *old_ref};
-    DB::Cas::OwnerBinding new_b{.owner_kind = DB::Cas::OwnerKind::Precommit,
-        .ref_name = final_ref_name, .build_id = build_id, .manifest_ref = new_ref};
-    return appendOwnerEvent(backend, layout, ns, shard, old_b, new_b);
+        ops.push_back(ownerTransitionOp(
+            DB::Cas::RefOwnerBinding{DB::Cas::RefOwnerKind::Committed, final_ref_name, *old_ref}, std::nullopt));
+    ops.push_back(ownerTransitionOp(
+        std::nullopt, DB::Cas::RefOwnerBinding{DB::Cas::RefOwnerKind::Precommit, final_ref_name, new_ref}));
+    return appendRefLogSeed(backend, layout, ns, std::move(ops));
 }
 
-/// Promote a precommit to committed at the SAME manifest_ref (an owner move: equal old/new). Returns
-/// the event version.
+/// Promote a precommit to committed at the SAME manifest_ref (old=Precommit, new=Committed). No edge
+/// (net-zero owner move). `build_id` is dropped. Returns the allocated `ref_sequence`.
 inline uint64_t promoteTransition(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::RootNamespace & ns,
-    const DB::UInt128 & build_id, const String & final_ref_name, const DB::Cas::ManifestRef & ref,
-    uint64_t shard = 0)
+    const DB::UInt128 & /*build_id*/, const String & final_ref_name, const DB::Cas::ManifestRef & ref,
+    uint64_t /*shard*/ = 0)
 {
-    DB::Cas::OwnerBinding old_b{.owner_kind = DB::Cas::OwnerKind::Precommit,
-        .ref_name = final_ref_name, .build_id = build_id, .manifest_ref = ref};
-    DB::Cas::OwnerBinding new_b{.owner_kind = DB::Cas::OwnerKind::Committed,
-        .ref_name = final_ref_name, .build_id = {}, .manifest_ref = ref};
-    return appendOwnerEvent(backend, layout, ns, shard, old_b, new_b, final_ref_name);
+    return appendRefLogSeed(backend, layout, ns,
+        {ownerTransitionOp(
+            DB::Cas::RefOwnerBinding{DB::Cas::RefOwnerKind::Precommit, final_ref_name, ref},
+            DB::Cas::RefOwnerBinding{DB::Cas::RefOwnerKind::Committed, final_ref_name, ref})});
 }
 
 /// Exact-token delete of a manifest body (HEAD then deleteExact). No-op when absent.
@@ -283,17 +318,6 @@ inline void registerNamespaceRaw(
     DB::Cas::Backend & /*backend*/, const DB::Cas::Layout & /*layout*/, const DB::Cas::RootNamespace & /*ns*/)
 {
     /// No-op: Task 4 deleted the registry; LIST(cas/refs/) is now the discovery authority.
-}
-
-/// Publish a root-shard manifest fresh (create-if-absent CAS). One fresh publish per shard suffices for
-/// the read-side tests; lifecycle tests that layer go through the Store CAS loop instead.
-/// Registers the namespace first (W-REGISTER) so GC discovery sees it.
-inline void publishRaw(
-    DB::Cas::Backend & backend, const DB::Cas::Layout & layout,
-    const DB::Cas::RootNamespace & ns, uint64_t shard, const DB::Cas::RootShard & root)
-{
-    registerNamespaceRaw(backend, layout, ns);
-    backend.casPut(layout.rootShardKey(ns, shard), DB::Cas::encodeRootShard(root), /*expected*/ std::nullopt);
 }
 
 /// Encode a CAGS document carrying only {round, fence_seq} — everything else defaulted. Callers that
@@ -503,35 +527,6 @@ inline bool anyCondemnedInSeal(
     return false;
 }
 
-/// Raise the `fence_round` of every shard of a namespace to at least `round`, exactly as the REMOVED
-/// pre-redesign fence step (R3) did — kept to synthesize historical/birth-floor shard state. For each shard 0..n_shards-1: read the manifest raw (decodeRootShard) if
-/// present, `fence_round = max(fence_round, round)`, re-encode, and `casPut` it back against the
-/// observed token. An ABSENT shard is created fresh holding only `fence_round = round` (mirrors GC
-/// fencing a never-published shard) via `casPut(expected = nullopt)`.
-inline void fenceNamespace(
-    DB::Cas::Backend & backend, const DB::Cas::Layout & layout,
-    const DB::Cas::RootNamespace & ns, uint64_t n_shards, uint64_t round)
-{
-    registerNamespaceRaw(backend, layout, ns);
-    for (uint64_t shard = 0; shard < n_shards; ++shard)
-    {
-        const String key = layout.rootShardKey(ns, shard);
-        const auto got = backend.get(key);
-        if (got)
-        {
-            DB::Cas::RootShard root = DB::Cas::decodeRootShard(got->bytes);
-            root.fence_round = std::max(root.fence_round, round);
-            backend.casPut(key, DB::Cas::encodeRootShard(root), got->token);
-        }
-        else
-        {
-            DB::Cas::RootShard root;
-            root.fence_round = round;
-            backend.casPut(key, DB::Cas::encodeRootShard(root), /*expected*/ std::nullopt);
-        }
-    }
-}
-
 /// Displace a blob's incarnation out-of-band (as a racing writer would): GET it, mint a fresh
 /// incarnation_tag in its envelope header (preserving header_len + payload), putOverwrite against the
 /// current token, and return the NEW token. Used to drive the W-REVALIDATE adopt branch (current token
@@ -721,7 +716,10 @@ inline uint64_t foldCursorOf(
         {
             const DB::Cas::CasFoldSeal seal = DB::Cas::decodeFoldSeal(got->bytes);
             const auto it = seal.per_ns_shard.find(cursorKeyForTest(ns, shard));
-            return it != seal.per_ns_shard.end() ? it->second.folded_cursor : 0;
+            /// Snapshot+log ref model: the per-table durable cursor is `last_folded_ref_id` (a RefTxnId);
+            /// the legacy `folded_cursor` stays a vestigial 0. Seeds allocate `writer_epoch = 1`, so the
+            /// `ref_sequence` is the monotone cursor the seeding wrappers return and tests compare against.
+            return it != seal.per_ns_shard.end() ? it->second.last_folded_ref_id.ref_sequence : 0;
         }
         if (g == 0)
             return 0;

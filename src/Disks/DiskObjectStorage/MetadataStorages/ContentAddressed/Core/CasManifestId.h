@@ -58,6 +58,21 @@ struct ManifestId
     }
 };
 
+/// A `{writer_epoch, build_sequence}` pair identifying the incarnation of a ref-shard (legacy
+/// mutable-shard model). `{0, 0}` is the unstamped sentinel -- a valid value, not an error. Relocated
+/// here from the removed legacy ref-shard codec (dropped with the snapshot+log ref model): it survives as
+/// the type of `ShardCoverage::incarnation` in the fold seal, which the snapshot+log model leaves unstamped.
+struct ShardIncarnation
+{
+    uint64_t writer_epoch = 0;
+    uint64_t build_sequence = 0;
+    bool operator==(const ShardIncarnation &) const = default;
+    bool operator<(const ShardIncarnation & o) const
+    {
+        return std::tie(writer_epoch, build_sequence) < std::tie(o.writer_epoch, o.build_sequence);
+    }
+};
+
 inline constexpr uint32_t kMaxManifestOrdinal = 999999;
 
 /// Six-digit filename for a per-build part-manifest ordinal: `000001.proto` through `999999.proto`.

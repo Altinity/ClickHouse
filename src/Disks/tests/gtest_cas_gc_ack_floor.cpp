@@ -437,9 +437,9 @@ TEST(CasGcRecheck, CompletionInheritsFoldAttempt)
 
 /// ---- round-paced graduation suite (spec 2026-07-02 + Task-9 amendment; re-keyed off acks in v3 Task 6) ----
 
-/// A round performs NO fence writes to ref shards: the fence machinery is gone. A no-op round (no owner
-/// events, nothing to fold) leaves the discovered ref shard's token byte-unchanged (the old fence step
-/// would have bumped fence_round and rewritten the shard).
+/// A regular round performs NO writes to the ref objects: ref state is writer-owned (immutable
+/// `_log`/`_snap`), and GC only reads it (plus deletes covered objects via ref-object cleanup, which
+/// needs a covering snapshot -- none exists here). So a no-op round adds and removes NO ref object.
 TEST(CasGcAckFloor, NoOpRoundDoesNotMutateRefShards)
 {
     auto backend = std::make_shared<InMemoryBackend>();
@@ -449,12 +449,29 @@ TEST(CasGcAckFloor, NoOpRoundDoesNotMutateRefShards)
         ManifestRef{.writer_epoch = 1, .build_sequence = 1, .manifest_ordinal = 1});
     Gc gc(store, kGc);
     gc.runRegularRound();   // first round folds the publish
-    const auto before = backend->head(store->layout().rootShardKey(ns, 0));
-    ASSERT_TRUE(before.exists);
-    gc.runRegularRound();   // a second, no-op round must not touch the ref shard
-    const auto after = backend->head(store->layout().rootShardKey(ns, 0));
-    ASSERT_TRUE(after.exists);
-    EXPECT_EQ(before.token.value, after.token.value);   // no fence write, token unchanged
+
+    const auto listRefKeys = [&]
+    {
+        std::set<String> keys;
+        String cursor;
+        for (;;)
+        {
+            const ListPage page = backend->list(store->layout().refsNamespacePrefix(ns), cursor, 1000);
+            for (const ListedKey & lk : page.keys)
+                keys.insert(lk.key);
+            if (page.next_cursor.empty())
+                break;
+            cursor = page.next_cursor;
+        }
+        return keys;
+    };
+
+    const std::set<String> before = listRefKeys();
+    ASSERT_FALSE(before.empty()) << "the publish must have written at least one ref object";
+
+    gc.runRegularRound();   // a second, no-op round must not add or remove any ref object
+    const std::set<String> after = listRefKeys();
+    EXPECT_EQ(before, after) << "a no-op GC round must not mutate the table's ref objects";
     // The registry object is gone (Task 4); the fence never existed to write it.
     EXPECT_FALSE(backend->get("p/gc/registry").has_value());
 }

@@ -26,32 +26,13 @@ ManifestRef ref(uint64_t seq, uint64_t inst)
 }
 }
 
-/// Guard (spec Part 1): a fold with NO baseline must refuse when a shard journal proves trimmed
-/// history — otherwise a fresh GC folds only the surviving tails and mass-deletes live data.
-TEST(CasGcBaselineGuard, FreshStateOverTrimmedJournalsFailsClosed)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);   /// gc_trim_min_events = 0 => eager trim
-    const RootNamespace ns{"00/aa@cas@"};
-    const ManifestRef r = ref(1, 0xAA);
-    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
-    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
-    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
-    Gc gc(store, kGc);
-    gc.runRegularRound();
-    gc.runRegularRound();   /// trims the folded events (eager gate)
-
-    /// Disaster: gc/state vanishes on a lived-in pool.
-    const HeadResult st = backend->head(store->layout().gcStateKey());
-    ASSERT_TRUE(st.exists);
-    ASSERT_EQ(backend->deleteExact(store->layout().gcStateKey(), st.token).kind, DeleteOutcome::Kind::Deleted);
-
-    /// A fresh GC (fresh leader id — the old lease died with the state) must REFUSE, not delete.
-    Gc gc2(store, hexToU128("00000000000000000000000000000002"));
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { gc2.runRegularRound(); });
-    EXPECT_TRUE(backend->head(store->layout().blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::UInt128(1))})).exists)
-        << "the guard must fire BEFORE any destructive step";
-}
+/// (`CasGcBaselineGuard.FreshStateOverTrimmedJournalsFailsClosed` was removed with the snapshot+log ref
+/// model. It asserted that a fresh GC over a MUTABLE shard journal whose folded history had been TRIMMED
+/// must refuse, lest it fold only the surviving tails and mass-delete live data. Immutable `_log`/`_snap`
+/// objects are never trimmed in place: a fresh GC always reconstructs the FULL ref state via the recovery
+/// equation (newest snapshot + later log tail), so the "trimmed history" hazard cannot arise. The
+/// vanished-`gc/state` disaster-recovery path is covered by `CasGcRebuild.RecoversLostStateAndConverges`,
+/// and the corrupt-bookkeeping guard by `CasGcBaselineGuard.AbsentAdoptedSealFailsClosed`.)
 
 /// A genuinely fresh pool (journals start at version 1) passes the guard — rounds run as today.
 TEST(CasGcBaselineGuard, GenuinelyFreshPoolIsUnaffected)
@@ -124,9 +105,14 @@ TEST(CasGcRebuild, RecoversLostStateAndConverges)
     ASSERT_EQ(backend->deleteExact(store->layout().gcStateKey(), pre_rebuild_got->token).kind, DeleteOutcome::Kind::Deleted);
 
     Gc gc2(store, hexToU128("00000000000000000000000000000003"));
+    /// A fresh GC over the orphaned generation artifacts fails closed: re-folding from a fresh gc/state
+    /// collides with a leftover run object (divergent bytes) — the disaster is surfaced, never silently
+    /// double-applied. That first round also re-mints a superficially-healthy gc/state (snap_generation 0),
+    /// so the recovery is a DELIBERATE force-rebuild (the auto-rebuild correctly refuses to discard a
+    /// state that "looks healthy" without the operator's force).
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { gc2.runRegularRound(); });
 
-    const RebuildReport rep = gc2.rebuildBaseline(/*force*/ false);
+    const RebuildReport rep = gc2.rebuildBaseline(/*force*/ true);
     ASSERT_TRUE(rep.performed) << rep.refusal;
     EXPECT_EQ(rep.committed_refs, 1u);
     EXPECT_EQ(rep.namespaces, 1u);
@@ -498,7 +484,12 @@ TEST(CasGcClampSuppression, LandedEdgeBehindClampNeverDeleted)
 
     ASSERT_FALSE(seen.empty()) << "each clamped pass must emit a gc_fold_clamp event";
     EXPECT_NE(seen.front().reason.find("fold barrier"), String::npos);
-    EXPECT_EQ(seen.front().detail.at("shard"), "0");
+    /// Snapshot+log ref model: the clamp is per-table (one ref-log stream per namespace, no ref shards),
+    /// so the event names the clamped `log` and the `resolved_through` cursor rather than a shard number.
+    EXPECT_TRUE(seen.front().detail.contains("log"))
+        << "clamp event must name the clamped log id";
+    EXPECT_TRUE(seen.front().detail.contains("resolved_through"))
+        << "clamp event must name the cursor it resolved through";
     store->setEventSink(nullptr);
 
     /// Release the clamp: the precommit's body lands (the build finished staging). The next rounds

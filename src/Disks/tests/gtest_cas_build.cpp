@@ -9,7 +9,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcFormats.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestCodec.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestId.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootShardCodec.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <IO/HashingReadBuffer.h>
 #include <IO/ReadBufferFromMemory.h>
@@ -34,7 +33,6 @@ using DB::Cas::tests::expectThrowsCode;
 using DB::Cas::tests::idOf;
 using DB::Cas::tests::injectRetire;
 using DB::Cas::tests::loadMetaForTest;
-using DB::Cas::tests::shardOfForTest;
 using DB::Cas::tests::streamingHexOf;
 using DB::Cas::tests::u128Of;
 using DB::Cas::tests::writeMetaClean;
@@ -1332,28 +1330,11 @@ TEST(CasBuild, PromoteCrossNamespaceManifestFailsClosed)
         [&] { build->promote(other_ns, "part_1", build->buildId(), id); });
 }
 
-TEST(CasBuild, PublishOwnThreadConflictRetries)
-{
-    auto b = std::make_shared<InMemoryBackend>();
-    auto s = openStore(b);
-    const RootNamespace ns{"srv1/tbl"};
-    auto build = startBuildFor(s, ns, "part_1");
-
-    build->putBlob(idOf("hello world"), BlobSource::fromString("hello world"));
-    const ManifestId id = build->stageManifest({blobManifestEntry("data.bin", "hello world")});
-    build->precommitAdd(ns, "part_1", id);
-
-    /// One artificial Conflict on the shard's NEXT casPut (the promote owner move). mutateShard re-reads
-    /// + re-runs the lambda and lands on the retry.
-    const uint64_t shard = shardOfForTest("part_1", s->poolMeta().root_shards);
-    b->failNextCasPut(s->layout().rootShardKey(ns, shard));
-
-    build->promote(ns, "part_1", build->buildId(), id);
-
-    auto r = s->resolveRef(ns, "part_1");
-    ASSERT_TRUE(r.has_value());
-    EXPECT_EQ(r->manifest_id, id);
-}
+/// (CasBuild.PublishOwnThreadConflictRetries was removed with the legacy mutable ref-shard lane: it
+/// injected a Conflict on the promote's shard `casPut` and asserted the shard re-read/retry. The ref model
+/// has no shard CAS -- promote appends a write-once ref-log object via `putIfAbsentControlled`, and an
+/// uncertain create is resolved by exact-key observation, covered by the ref-writer uncertain-result tests
+/// (`gtest_cas_ref_writer.cpp`), not a CAS retry.)
 
 TEST(CasBuild, PublishIntoSecondNamespaceSameBlob)
 {

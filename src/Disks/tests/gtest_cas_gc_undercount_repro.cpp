@@ -47,39 +47,14 @@ bool blobExists(InMemoryBackend & b, const Layout & layout, const UInt128 & hash
     return b.head(layout.blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hash)})).exists;
 }
 
-/// Append a RAW owner event to a shard journal WITHOUT going through the semantic helpers, so a test can
-/// stage an event whose old_binding does not correspond to the shard's current owner (the "drop THEN
-/// repoint-from-r1" hazard the fold has no way to reject at fold time — it dispatches purely on the
-/// event's own old/new manifest_ref pair). Mirrors appendOwnerEvent's CAS loop but takes the bindings
-/// verbatim and does not maintain `refs` (the fold reads the journal, not refs).
-uint64_t appendRawOwnerEvent(
-    InMemoryBackend & backend, const Layout & layout, const RootNamespace & ns, uint64_t shard,
-    std::optional<OwnerBinding> old_binding, std::optional<OwnerBinding> new_binding)
+/// A committed `RefOwnerBinding` for a raw `owner_transition` op. The raw appender is now
+/// `tests::appendOwnerEvent`, which writes ONE `owner_transition` ref-log transaction via
+/// `writeRefLogTxnRaw` at the next `RefTxnId` -- the GC fold EXTRACTS edges from each log
+/// (`manifestEdgesOfTxn`) and never replays them, so an `old_binding` that does not correspond to the
+/// table's current committed owner is folded verbatim (exactly the "drop THEN repoint-from-r1" hazard).
+RefOwnerBinding committed(const String & ref_name, const ManifestRef & r)
 {
-    registerNamespaceRaw(backend, layout, ns);
-    const String key = layout.rootShardKey(ns, shard);
-    while (true)
-    {
-        const auto got = backend.get(key);
-        RootShard root;
-        std::optional<Token> expected;
-        if (got)
-        {
-            root = decodeRootShard(got->bytes);
-            expected = got->token;
-        }
-        const uint64_t version = root.shard_version + 1;
-        root.shard_version = version;
-        root.journal.push_back(RootOwnerEvent{
-            .transition_version = version, .old_binding = old_binding, .new_binding = new_binding});
-        if (backend.casPut(key, encodeRootShard(root), expected).outcome == CasOutcome::Committed)
-            return version;
-    }
-}
-
-OwnerBinding committed(const String & ref_name, const ManifestRef & r)
-{
-    return OwnerBinding{.owner_kind = OwnerKind::Committed, .ref_name = ref_name, .build_id = {}, .manifest_ref = r};
+    return RefOwnerBinding{RefOwnerKind::Committed, ref_name, r};
 }
 
 }
@@ -126,8 +101,8 @@ TEST(CasGcUndercount, H2_DropThenRepointFromSameOldIsIdempotentNoUnderflow)
     ///   v2: DROP r1        {old=committed(r1), new=none}
     ///   v3: REPOINT r1->r2 {old=committed(r1), new=committed(r2)}
     /// The second removal of r1's edge to blob 2 is a no-op under the idempotent set model.
-    appendRawOwnerEvent(*backend, store->layout(), ns, 0, committed("tbl", r1), std::nullopt);
-    appendRawOwnerEvent(*backend, store->layout(), ns, 0, committed("tbl", r1), committed("tbl", r2));
+    appendOwnerEvent(*backend, store->layout(), ns, 0, committed("tbl", r1), std::nullopt);
+    appendOwnerEvent(*backend, store->layout(), ns, 0, committed("tbl", r1), committed("tbl", r2));
 
     /// Drive GC to fixpoint (advancing the mount ack each round so the ack floor graduates the condemned
     /// blob 2): must complete without throwing, collect blob 2, spare blob 1.
@@ -293,7 +268,11 @@ public:
 TEST(CasGcUndercount, H1b_FenceWindowRemovalReFoldedNextRoundUnderflows)
 {
     auto backend = std::make_shared<DropAtCommitBackend>();
-    auto store = openStoreForTest(backend);
+    /// gc_fold_max_defer_rounds=0 forces fold-every-round: the injected drop fires from `on_commit`,
+    /// which only runs on the round-commit CAS that ADVANCES snap_generation. With immutable logs an idle
+    /// round DEFERS (never advancing the generation), so a default store would never fire the injection --
+    /// forcing a fold each round keeps the fence-window injection point (and its re-fold) reachable.
+    auto store = openStoreForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
     ASSERT_EQ(store->layout().gcStateKey(), "p/gc/state");
 
     const RootNamespace ns{"00/aa@cas@"};

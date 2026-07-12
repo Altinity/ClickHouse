@@ -938,8 +938,8 @@ void Build::precommitAdd(const RootNamespace & target_ns, const String & final_r
 
     /// Task 10 (spec §Add Precommit / §Namespace Birth): one `owner_transition` create-precommit op.
     /// No body HEAD — a missing body is a legal fail-closed, non-activating intent, unchanged from the
-    /// old protocol. Unlike the old RootShard model, precommit ownership carries NO separate build
-    /// token: `id.ref` (writer_epoch, build_sequence, manifest_ordinal) IS the build identity (spec
+    /// old protocol. Precommit ownership carries NO separate build token: `id.ref` (writer_epoch,
+    /// build_sequence, manifest_ordinal) IS the build identity (spec
     /// §Transaction Log Format: "there is no second build token"). `build_ops` is invoked from inside
     /// the per-namespace flush, so it sees the table's CURRENT state including any earlier item of the
     /// same batch; when that state is not `Live` (never born, or `Removed`), it prepends
@@ -1050,9 +1050,8 @@ void Build::promote(const RootNamespace & target_ns, const String & final_ref_na
             /// precommit is STILL the live owner of the ref: if an abandon or GC reclaim already appended
             /// a removal of the precommit binding, the blobs' in-degree was already decremented and a Δ=0
             /// move would re-publish a committed ref over to-be-deleted blobs ⇒ a dangling committed
-            /// manifest (INV_NO_DANGLE). Unlike the old RootShard journal (which had to be REPLAYED to
-            /// infer live ownership because it kept no materialized owner set), `RefTableState.precommits`
-            /// materializes exactly this: `id.ref` alone identifies the build (spec: "there is no second
+            /// manifest (INV_NO_DANGLE). `RefTableState.precommits` materializes live ownership directly:
+            /// `id.ref` alone identifies the build (spec: "there is no second
             /// build token"), so an exact-binding lookup answers the same question directly.
             if (!state.precommits.contains({final_ref_name, id.ref}))
                 throw Exception(ErrorCodes::ABORTED,

@@ -1,5 +1,6 @@
 #pragma once
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootShardCodec.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestId.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRefIds.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasToken.h>
 #include <base/types.h>
 #include <base/extended_types.h>
@@ -46,6 +47,13 @@ struct ShardCoverage
     uint64_t folded_cursor = 0;
     ShardIncarnation incarnation;  /// incarnation the cursor was sealed against; {0,0} = unstamped
 
+    /// Snapshot+log ref model (spec §GC State): the durable `last_folded_ref_id` for this table -- the
+    /// greatest `RefTxnId` whose owner changes have already contributed their manifest-edge delta. Keyed
+    /// per table (one ref-log stream per namespace, shard fixed at 0). {0,0} = nothing folded yet. This
+    /// replaces `folded_cursor` (the legacy per-shard `transition_version`) for ref intake; `folded_cursor`
+    /// stays a vestigial 0 under the new model.
+    RefTxnId last_folded_ref_id{};
+
     /// The lexicographically-minimal {writer_epoch, build_sequence} among this shard's LIVE precommit
     /// owner bindings (un-promoted, un-removed) at fold time; has_live_precommit == false when there are
     /// none. Consumed by computeDiscoverDecisions to force a re-fold once the watermark proves this
@@ -70,6 +78,27 @@ struct CondemnedSummary
     bool operator==(const CondemnedSummary &) const = default;
 };
 
+/// Durable state of one namespace-cleanup item (spec §Clean Old Ref Objects). Phase 1 protocol state
+/// added by the snapshot+log ref design: the two-state record of physically reclaiming a removed
+/// namespace's `@cas@` metadata. `Pending` while enumerate-and-delete passes run; terminal `Completed`
+/// once a pass observed nothing left, after which the `_cleanup` marker and `Removed` snapshot are
+/// (idempotently) published and a later `namespace_birth` may recreate the namespace.
+enum class RefNsCleanupState : uint8_t
+{
+    Pending = 1,
+    Completed = 2,
+};
+
+/// One namespace-cleanup item keyed by `{ns, remove_txn_id}` (spec §Remove Namespace / §Step 6). Carried
+/// forward in the fold seal each generation until `Completed`.
+struct RefNsCleanupItem
+{
+    RootNamespace ns;
+    RefTxnId remove_txn_id;
+    RefNsCleanupState state = RefNsCleanupState::Pending;
+    bool operator==(const RefNsCleanupItem &) const = default;
+};
+
 /// The FOLD seal for one GC generation — write-once at <prefix>/gc/gen/<generation>/attempt/<attempt>/fold_seal.
 /// The one-pass ack-floor round records everything it folded here (coarse: no object per
 /// edge/manifest/candidate). This is the sole per-generation coverage record — the resume rule and the
@@ -82,6 +111,9 @@ struct CasFoldSeal
     std::vector<RunRef> blob_target_runs;           /// the blob in-degree run segments this gen sealed
     std::vector<RunRef> part_manifest_cleanup;      /// the part-manifest cleanup bundles this gen sealed
     std::map<uint64_t, CondemnedSummary> condemned_summary;   /// gc-shard -> summary; TOTAL over gc_shards
+    /// Namespace-cleanup items (spec §Step 6), keyed by "<ns>\n<remove-txn-render>". Carried forward each
+    /// generation until Completed. Empty on a pool that has never removed a namespace.
+    std::map<String, RefNsCleanupItem> ns_cleanup_items;
     bool operator==(const CasFoldSeal &) const = default;
 };
 

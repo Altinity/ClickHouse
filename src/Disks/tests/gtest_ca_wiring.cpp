@@ -218,7 +218,7 @@ void publishWiredPart(
     /// promote stamps published_at_ms with nowMs(); the read assertions want a FIXED stamp, so pin it
     /// through the mutable-only updateRefPayload path (no journal record — same as a payload-only edit).
     storage.store()->updateRefPayload(ns, ref,
-        [](DB::Cas::RootRef & r) { r.published_at_ms = 1700000000ULL * 1000; });   /// epoch ms; getLastModified /1000
+        [](DB::Cas::RefMutableFilesUpdate & r) { r.published_at_ms = 1700000000ULL * 1000; });   /// epoch ms; getLastModified /1000
 }
 
 }
@@ -1329,14 +1329,14 @@ TEST(CaWiringRead, UnsetPublishedAtMsReturnsEpoch)
 
     /// Ensure published_at_ms is unset (the default is 0).
     storage->store()->updateRefPayload(storage->liveNamespace("uuid-1"), "all_1_1_0",
-        [](DB::Cas::RootRef & r) { r.published_at_ms = 0; });
+        [](DB::Cas::RefMutableFilesUpdate & r) { r.published_at_ms = 0; });
 
     EXPECT_EQ(storage->getLastModified("uui/uuid-1/all_1_1_0").epochTime(), 0);
 }
 
 // #4: root_shards is plumbed through the ctor to pool creation (creation-time
 // fanout); default stays 8.
-TEST(CaWiring, RootShardsConfigurable)
+TEST(CaWiring, RefShardCountConfigurable)
 {
     auto widened = std::make_shared<DB::ContentAddressedMetadataStorage>(
         DB::Cas::tests::makeLocalObjectStorageForTest(), "pool", "srv1", "test",
@@ -1457,35 +1457,35 @@ std::shared_ptr<RecordingLocalObjectStorage> makeRecordingStorageForTest(const s
         DB::LocalObjectStorageSettings("test", root, /*read_only_=*/false));
 }
 
-/// True for a root-shard ref key (`<...>/cas/refs/<namespace...>/<shard_number>`) — the object a
-/// precommit (and later a promote) CASes. Phase 1 relocated ref shards out of roots/ to cas/refs/.
-/// The converged model (rev. 15) appends the create-precommit RootOwnerEvent into the TARGET TABLE
-/// SHARD's journal (owner_kind == Precommit) keyed by the final ref name — there is NO `_precommits`
-/// namespace on the precommit path. The namespace itself contains '/', so the discriminator is
-/// "under /cas/refs/ AND the last path segment is all digits", which excludes blobs (`/blobs/`),
-/// part-manifests (`/cas/manifests/...`), GC state (`/gc/`), the watermark
-/// (`/_watermark`), and verbatim files (`/_files/...`).
-bool isRootShardKey(const std::string & key)
+/// True for a durable ref-object write key under `/cas/refs/`. In the snapshot+log ref model the
+/// writer's first durable ref write on the precommit path is an immutable transaction-log object
+/// (`<...>/cas/refs/<namespace...>/_log/<txn-id>`); a published table snapshot is
+/// `<...>/_snap/<id>.proto`. The held Phase-E legacy shard lane may still write the mutable ref-shard
+/// key (`<...>/cas/refs/<namespace...>/<shard_number>`), so that shape is accepted too — the predicate
+/// anchors on whichever durable ref write comes first. It excludes blobs (`/blobs/`), part-manifests
+/// (`/cas/manifests/...`), GC state (`/gc/`), and verbatim files (`/_files/...`).
+bool isRefWriteKey(const std::string & key)
 {
     if (key.find("/cas/refs/") == std::string::npos)
         return false;
+    if (key.find("/_log/") != std::string::npos || key.find("/_snap/") != std::string::npos)
+        return true;
     const auto slash = key.rfind('/');
     if (slash == std::string::npos || slash + 1 >= key.size())
         return false;
     const std::string last = key.substr(slash + 1);
-    return std::all_of(last.begin(), last.end(), [](unsigned char c) { return c >= '0' && c <= '9'; });
+    return !last.empty() && std::all_of(last.begin(), last.end(), [](unsigned char c) { return c >= '0' && c <= '9'; });
 }
 
-/// Index of the first writeObject that appends the create-precommit owner event — i.e. the first
-/// durable CAS (casPut → writeObject) to the TARGET shard's root-shard key. In the happy path the
-/// precommit write strictly precedes the promote write (the second write to the SAME shard key), so
-/// the FIRST root-shard write IS the precommit. Anchors on the WRITE, not on any op: mutateShard
-/// READS the shard key (exists/readObject) before its casPut, so an any-op scan would anchor on that
-/// READ rather than the durable write. Returns -1 if no root-shard write was recorded.
+/// Index of the first writeObject that durably appends the create-precommit ref transaction — i.e. the
+/// first durable write (writeObject) of a ref-object key (a `_log/<txn-id>` object in the snapshot+log
+/// model). Anchors on the WRITE, not on any op: recovery READS the ref prefix before the durable write,
+/// so an any-op scan would anchor on that READ rather than the durable write. Returns -1 if no ref write
+/// was recorded.
 int firstPrecommitWriteIdx(const std::vector<RecordingLocalObjectStorage::Record> & log)
 {
     for (int i = 0; i < static_cast<int>(log.size()); ++i)
-        if (log[i].op == "writeObject" && isRootShardKey(log[i].key))
+        if (log[i].op == "writeObject" && isRefWriteKey(log[i].key))
             return i;
     return -1;
 }
@@ -2126,8 +2126,7 @@ TEST(CaWiringResurrect, PromoteAbandonedPrecommitAbortsWithoutResurrect)
     /// would mark THIS build not-alive and make promote throw a different (LOGICAL_ERROR) error.
     DB::Cas::tests::appendOwnerEvent(
         store->backend(), store->layout(), ns, /*shard*/ 0,
-        OwnerBinding{.owner_kind = OwnerKind::Precommit, .ref_name = ref,
-                     .build_id = build->buildId(), .manifest_ref = id.ref},
+        RefOwnerBinding{RefOwnerKind::Precommit, ref, id.ref},
         std::nullopt);
 
     /// promote aborts at the owner-move guard (ABORTED), NOT the blob gate.
