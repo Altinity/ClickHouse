@@ -393,7 +393,10 @@ locally active build, and no conflicting owner may name the same manifest.
 
 The exact precommit must exist. One transaction removes it, creates the committed binding to the same
 manifest, and installs the complete initial mutable payload. There is no moment at which the manifest
-has no owner.
+has no owner. The target ref name must not already hold a committed binding: replacing an existing
+committed ref requires its own explicit `owner_transition` removal, ordered before the promote inside
+the same transaction or in an earlier one. A silent displacement would evict an owner without ever
+emitting its `-1` edge, because `GC` reads edges from explicit operations, not from state diffs.
 
 ### Remove Precommit {#remove-precommit}
 
