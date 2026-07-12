@@ -1,6 +1,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/CachedPartFolderAccess.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.h>
 #include <Disks/tests/cas_test_helpers.h>
+#include <Common/ProfileEvents.h>
 #include <gtest/gtest.h>
 #include <latch>
 #include <thread>
@@ -9,6 +10,11 @@ namespace DB::ErrorCodes
 {
     extern const int FILE_DOESNT_EXIST;
     extern const int ABORTED;
+}
+
+namespace ProfileEvents
+{
+extern const Event CasRefRollbackBestEffortDropFailed;
 }
 
 using namespace DB;
@@ -47,6 +53,51 @@ ContentAddressed::CachedPartFolderAccess::CacheParams cacheOn()
 {
     return {.cache_bytes = 64ULL << 20, .max_entries = 10000, .max_entry_bytes = 16ULL << 20};
 }
+
+/// Every mutating backend op throws once armed — models a correlated backend outage during the
+/// transaction's compensating rollback (dropRef must append a removal, which mutates the backend).
+class RollbackFaultBackend final : public Cas::InMemoryBackend
+{
+public:
+    std::atomic<bool> armed{false};
+
+    Cas::PutResult putIfAbsent(const String & k, const String & b, const Cas::ObjectMeta & m = {}) override
+    {
+        failIfArmed();
+        return InMemoryBackend::putIfAbsent(k, b, m);
+    }
+
+    Cas::WriteSinkPtr putIfAbsentStream(const String & k, const Cas::ObjectMeta & m = {}) override
+    {
+        failIfArmed();
+        return InMemoryBackend::putIfAbsentStream(k, m);
+    }
+
+    Cas::PutResult putOverwrite(const String & k, const String & b, const Cas::Token & e, const Cas::ObjectMeta & m = {}) override
+    {
+        failIfArmed();
+        return InMemoryBackend::putOverwrite(k, b, e, m);
+    }
+
+    Cas::CasResult casPut(const String & k, const String & b, const std::optional<Cas::Token> & e, const Cas::ObjectMeta & m = {}) override
+    {
+        failIfArmed();
+        return InMemoryBackend::casPut(k, b, e, m);
+    }
+
+    Cas::DeleteOutcome deleteExact(const String & k, const Cas::Token & t) override
+    {
+        failIfArmed();
+        return InMemoryBackend::deleteExact(k, t);
+    }
+
+private:
+    void failIfArmed()
+    {
+        if (armed.load())
+            throw Exception(ErrorCodes::ABORTED, "injected backend outage");
+    }
+};
 
 }
 
@@ -498,4 +549,29 @@ TEST(CasPartFolderAccess, DropNamespaceErasesAllViews)
     const auto recreated_view = access.getView(key1, ContentAddressed::Freshness::CachedForLoad);
     ASSERT_NE(recreated_view, nullptr) << "the recreated namespace must serve a fresh view after the marker is durable";
     EXPECT_TRUE(access.explain(key1).retained);
+}
+
+TEST(CasPartFolderAccess, BestEffortRollbackDropCountsAndSurvivesABackendOutage)
+{
+    auto backend = std::make_shared<RollbackFaultBackend>();
+    auto store = openStoreForTest(backend);
+    ContentAddressed::CachedPartFolderAccess access(store, cacheOn());
+
+    const Cas::RootNamespace ns_a{"srv/ta"};
+    const Cas::RootNamespace ns_b{"srv/tb"};
+    publishPart(store, ns_a, "part_a", {inlineEntry("checksums.txt", "cs")});
+    publishPart(store, ns_b, "part_b", {inlineEntry("checksums.txt", "cs")});
+
+    backend->armed = true;
+    /// Sanity: with the backend armed, a real dropRef propagates (so the fault reaches the catch).
+    EXPECT_ANY_THROW(store->dropRef(ns_a, "part_a"));
+
+    using ProfileEvents::global_counters;
+    const auto before = global_counters[ProfileEvents::CasRefRollbackBestEffortDropFailed].load();
+    /// The compensating-rollback path must NOT throw (noexcept) and MUST record the swallowed failure.
+    access.dropRefBestEffort(ContentAddressed::PartRefKey{ns_b, "part_b"});
+    const auto after = global_counters[ProfileEvents::CasRefRollbackBestEffortDropFailed].load();
+    EXPECT_EQ(after, before + 1);
+
+    backend->armed = false;   /// let store teardown release its lease cleanly
 }

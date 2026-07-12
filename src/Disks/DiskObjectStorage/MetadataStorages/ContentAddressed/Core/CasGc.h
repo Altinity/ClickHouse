@@ -206,6 +206,10 @@ private:
         /// The round's one global ref LIST, grouped per table (spec §Step 1). Reused post-CAS for
         /// ref-object cleanup (covered logs / superseded snapshots) so a second LIST is never issued.
         std::map<String, RefTableListing> ref_tables;
+        /// The single suppress-deletes decision for this round (any clamp / ref-folding abort). Computed
+        /// once in fold() and threaded here so the merge-side reducers and the post-CAS ref/namespace
+        /// cleanup share ONE value — they can never desync (A10).
+        bool suppress_destructive = false;
     };
 
     /// R1 (spec rev. 15 §Fold Owner Transitions): per changed root shard, stream the ONE ordered

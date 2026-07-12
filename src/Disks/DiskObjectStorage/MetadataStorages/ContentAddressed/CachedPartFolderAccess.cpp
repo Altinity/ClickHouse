@@ -1,6 +1,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/CachedPartFolderAccess.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.h>
 #include <Common/ProfileEvents.h>
+#include <Common/logger_useful.h>
 #include <base/scope_guard.h>
 
 namespace DB::ErrorCodes
@@ -17,6 +18,7 @@ namespace ProfileEvents
     extern const Event CasPartFolderViewMisses;
     extern const Event CasPartFolderViewOversizedBypasses;
     extern const Event CasPartFolderViewInvalidations;
+    extern const Event CasRefRollbackBestEffortDropFailed;
 }
 
 namespace CurrentMetrics
@@ -286,9 +288,16 @@ void CachedPartFolderAccess::dropRefBestEffort(const PartRefKey & key) noexcept
     {
         store->dropRef(key.ns, key.ref);
     }
-    catch (...) // NOLINT(bugprone-empty-catch)
+    catch (...)
     {
-        /// Best-effort destructor/rollback cleanup: debris is GC-reclaimed, never a masked throw.
+        /// Best-effort destructor/rollback cleanup: debris is GC-reclaimed, never a masked throw. But
+        /// NEVER silent — unlike every other swallow in the feature this had no log trail, so a
+        /// correlated backend outage during rollback could leave a permanently-live phantom ref with
+        /// no diagnostic (A9). Log + count it as a countable anomaly.
+        ProfileEvents::increment(ProfileEvents::CasRefRollbackBestEffortDropFailed);
+        tryLogCurrentException(getLogger("CachedPartFolderAccess"),
+            fmt::format("CA best-effort rollback dropRef failed (ns={} ref={}); the ref may remain live",
+                        key.ns.string(), key.ref));
     }
     /// eraseView(key) deliberately ALSO on the swallowed-failure path (spec §Two-Level API): in this
     /// destructor/rollback context the ref's durable state is unknown, so dropping the view is the

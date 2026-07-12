@@ -633,7 +633,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired)
     /// (the previous order) left the completing round unable to see its own just-published snapshot, so a
     /// removed namespace's covered logs persisted as debris until some later fold -- which never comes on
     /// a quiesced pool.
-    const bool suppress_destructive = !report.anomalies.empty();
+    const bool suppress_destructive = folded.suppress_destructive;
     runNamespaceCleanupPasses(folded.fold_seal, folded.ref_tables, new_round, suppress_destructive);
     if (trim_enabled)
         cleanupRefObjects(folded, suppress_destructive);
@@ -1222,7 +1222,8 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// must not graduate NOR execute pending deletes (the merge carries everything; condemnation
     /// and sparing continue). Deletes resume on the first clamp-free pass. This is the honest-mode
     /// counterpart of the model's SabotageSkipChangedShard counterexample.
-    const bool suppress_destructive = !report.anomalies.empty();
+    result.suppress_destructive = !report.anomalies.empty();
+    const bool suppress_destructive = result.suppress_destructive;
     if (suppress_destructive)
     {
         ProfileEvents::increment(ProfileEvents::CasGcClampSuppressedPasses);

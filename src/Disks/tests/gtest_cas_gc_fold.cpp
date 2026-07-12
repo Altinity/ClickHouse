@@ -401,3 +401,40 @@ TEST(CasGcFold, DeadPrecommitWithMissingBodyIsSkippedNotClampedForever)
     const RoundReport report2 = gc.runRegularRound();
     EXPECT_FALSE(report2.hasAnomaly(ns, /*shard*/0)) << "the resolution is terminal: no recurring clamp";
 }
+
+/// A10: a single clamp anomaly must suppress ALL destructive actions in the round — the merge-side
+/// deletes AND the post-CAS ref/namespace cleanup — from ONE decision, not two independent recomputes
+/// of !report.anomalies.empty() that a future edit could desync (over-delete class). This pins that a
+/// clamped round reclaims nothing.
+TEST(CasGcFold, SingleAnomalySuppressesEveryDestructiveActionInTheRound)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef a = ref("srv-a:1", 1, 0xAA);
+    const ManifestRef b = ref("srv-a:2", 2, 0xBB);
+
+    /// Round 0: commit A (references blob 1); its body folds a +1.
+    writeManifestRaw(*backend, store->layout(), ns, a, {blobEntryFor("a", DB::UInt128(1))});
+    publishCommittedTransition(*backend, store->layout(), ns, "r1", std::nullopt, a);
+    Gc gc(store, kGc);
+    gc.runRegularRound();
+    ASSERT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 1);
+
+    /// One log: drop committed A (`-1`, body present) then add precommit B whose body is absent -> the
+    /// missing B body clamps the log AFTER A's `-1` folded.
+    writeManifestRaw(*backend, store->layout(), ns, b, {blobEntryFor("b", DB::UInt128(2))});
+    deleteManifestBody(*backend, store->layout(), ManifestId{ns, b});
+    appendRefLogSeed(*backend, store->layout(), ns,
+        {ownerTransitionOp(RefOwnerBinding{RefOwnerKind::Committed, "r1", a}, std::nullopt),
+         ownerTransitionOp(std::nullopt, RefOwnerBinding{RefOwnerKind::Precommit, "r2", b})});
+
+    const RoundReport rep = gc.runRegularRound();
+    ASSERT_TRUE(rep.hasAnomaly(ns, /*shard*/0)) << "the missing B body must clamp this round";
+    /// The clamp suppresses the WHOLE destructive pipeline this round: no deletes, no redeletes, and
+    /// A's `-1` stays unadopted (its body must survive, else the re-fold clamps on it forever).
+    EXPECT_EQ(rep.deleted, 0u);
+    EXPECT_EQ(rep.redeleted, 0u);
+    EXPECT_TRUE(backend->head(store->layout().manifestKey(ManifestId{ns, a})).exists);
+    EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 1);
+}
