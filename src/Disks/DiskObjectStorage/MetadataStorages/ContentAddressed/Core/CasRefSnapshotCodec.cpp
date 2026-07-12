@@ -78,22 +78,8 @@ ManifestRef readManifestRef(ReadBuffer & in)
     return ref;
 }
 
-void writeLenPrefixed(WriteBuffer & out, const String & s)
-{
-    /// Explicit guard rather than relying on the byte budget alone to keep every string short: this is
-    /// the point where a length silently truncated by the u32 cast would corrupt the wire.
-    if (s.size() > std::numeric_limits<uint32_t>::max())
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableSnapshot: string field of {} bytes exceeds UInt32 length prefix", s.size());
-    writeBinaryLittleEndian(static_cast<uint32_t>(s.size()), out);
-    out.write(s.data(), s.size());
-}
-
-String readLenPrefixed(ReadBuffer & in)
-{
-    uint32_t len = 0;
-    readBinaryLittleEndian(len, in);
-    return readFixedBytes(in, len);
-}
+/// `writeLenPrefixed`/`readLenPrefixed` (u32-length-prefixed byte strings, with the >UInt32 guard):
+/// shared with `CasRefLogCodec` via `CasCodecUtil.h` rather than duplicated per codec.
 
 void writeCommittedRow(WriteBuffer & out, const RefCommittedRow & row)
 {

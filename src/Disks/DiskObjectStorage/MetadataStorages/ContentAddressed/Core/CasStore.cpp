@@ -63,17 +63,17 @@ static constexpr size_t MAX_CAS_ATTEMPTS = 100;
 
 /// Task 10: declared in CasStore.h (shared with CasBuild.cpp's promote). Wire: `u32 count | (u32
 /// klen+bytes, u32 vlen+bytes)...`. `std::map` already iterates sorted by key, so this is a pure
-/// function of the map's contents with no separate sort step.
+/// function of the map's contents with no separate sort step. Reuses the shared `writeLenPrefixed`/
+/// `readLenPrefixed` (`CasCodecUtil.h`, with their >UInt32 guard) rather than open-coding the same
+/// length-prefixed-string shape a fourth time (already shared by `CasRefLogCodec`/`CasRefSnapshotCodec`).
 String encodeMutableFilesPayload(const std::map<String, String> & files)
 {
     WriteBufferFromOwnString out;
     writeBinaryLittleEndian(static_cast<uint32_t>(files.size()), out);
     for (const auto & [k, v] : files)
     {
-        writeBinaryLittleEndian(static_cast<uint32_t>(k.size()), out);
-        out.write(k.data(), k.size());
-        writeBinaryLittleEndian(static_cast<uint32_t>(v.size()), out);
-        out.write(v.data(), v.size());
+        writeLenPrefixed(out, k);
+        writeLenPrefixed(out, v);
     }
     return out.str();
 }
@@ -88,12 +88,8 @@ std::map<String, String> decodeMutableFilesPayload(const String & payload)
     readBinaryLittleEndian(count, in);
     for (uint32_t i = 0; i < count; ++i)
     {
-        uint32_t klen = 0;
-        readBinaryLittleEndian(klen, in);
-        const String k = DB::Cas::readFixedBytes(in, klen);
-        uint32_t vlen = 0;
-        readBinaryLittleEndian(vlen, in);
-        const String v = DB::Cas::readFixedBytes(in, vlen);
+        const String k = readLenPrefixed(in);
+        const String v = readLenPrefixed(in);
         files[k] = v;
     }
     return files;
@@ -1770,6 +1766,26 @@ void Store::flushRefBatch(const RootNamespace & ns, const std::shared_ptr<RefTab
         try
         {
             std::vector<RefOp> item_ops = it->build_ops(working);
+
+            /// Whole-item shape validation (review fix, prerequisite to Task 11's dropNamespace): the
+            /// per-op loop below previews each op as its OWN single-op trial transaction, so a
+            /// whole-transaction-shape rule like "remove_namespace must be the FINAL op" trivially
+            /// passes on every singleton slice regardless of this item's REAL combined shape -- a
+            /// malformed item (e.g. remove_namespace not last) would otherwise only be caught by the
+            /// post-persist apply further below, AFTER its object is already durable (see that apply's
+            /// own catch for why that would ALSO wedge this table's lane). Validate the item's COMPLETE
+            /// ops array as ONE combined transaction, against a throwaway copy of the pre-item state,
+            /// before doing any other per-op work -- exactly what the real persisted transaction will
+            /// contain, using only the public two-phase `applyRefLogTxn` entry point (no need to reach
+            /// into the state machine's private per-op helpers).
+            if (!item_ops.empty())
+            {
+                RefTableState shape_check = working;
+                RefTxnId shape_probe_id = trial_id;
+                shape_probe_id.ref_sequence += 1;
+                applyRefLogTxn(shape_check, RefLogTxn{ns.string(), shape_probe_id, item_ops});
+            }
+
             for (const RefOp & op : item_ops)
             {
                 /// Admission budget (spec §Snapshot Format): only STATE-GROWING ops need the check --
@@ -1839,6 +1855,7 @@ void Store::flushRefBatch(const RootNamespace & ns, const std::shared_ptr<RefTab
     {
         case CasWriteOutcome::Committed:
         {
+            try
             {
                 std::lock_guard lock(rt->state_mutex);
                 applyRefLogTxn(rt->state, final_txn);
@@ -1846,6 +1863,33 @@ void Store::flushRefBatch(const RootNamespace & ns, const std::shared_ptr<RefTab
                 /// writer's exact append time, per PoolConfig::snapshot_min_log_age_ms's contract).
                 rt->tail_since_snapshot.push_back(RefTableRuntime::TailLogEntry{final_txn, bootMsNow(), bytes.size()});
                 rt->tail_bytes_since_snapshot += bytes.size();
+            }
+            catch (...)
+            {
+                /// Provably unreachable given the whole-item shape validation above (every item's
+                /// COMPLETE ops array is already validated as one combined transaction before this
+                /// point) -- but `final_txn` is now durably PUT regardless, so if this line throws
+                /// anyway (a bug the pre-check did not anticipate), every future recovery would replay
+                /// and re-throw on it, bricking this table forever. Restore the queue's own leader
+                /// bookkeeping here (this catch bypasses appendRefOps's normal post-runRefQueueLeader
+                /// reset, since we rethrow past it) so this table's lane is not ALSO wedged for every
+                /// OTHER mount, then fail every waiting survivor's own caller with a clear diagnostic
+                /// instead of leaving them hung on an `item->done` that would otherwise never be set.
+                const String detail = getCurrentExceptionMessage(false);
+                Exception rethrown(ErrorCodes::LOGICAL_ERROR,
+                    "CAS ref-log append for namespace '{}': the durably-committed transaction {}-{} "
+                    "failed to apply to the in-memory table state -- this should be provably "
+                    "unreachable (every item's ops are validated as one combined transaction before any "
+                    "object is created); the object is already durable and every future recovery will "
+                    "hit the same failure: {}",
+                    ns.string(), id.writer_epoch, id.ref_sequence, detail);
+                complete_error(survivors, std::make_exception_ptr(rethrown));
+                {
+                    std::lock_guard<std::mutex> g(ref_queue_mutex);
+                    rt->leader_active = false;
+                    rt->cv.notify_all();
+                }
+                throw rethrown;
             }
             ProfileEvents::increment(ProfileEvents::CasRefBatchFlushes);
             ProfileEvents::increment(ProfileEvents::CasRefBatchedMutations, survivors.size());

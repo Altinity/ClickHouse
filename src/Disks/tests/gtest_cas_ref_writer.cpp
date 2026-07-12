@@ -923,6 +923,41 @@ TEST(RefWriterNamespaceRemoval, RemovedSnapshotPublished)
     EXPECT_TRUE(snap.precommits.empty());
 }
 
+/// Review fix (prerequisite to this task's dropNamespace rewiring): `flushRefBatch`'s per-item
+/// validation previously previewed each op as its OWN single-op trial transaction, so a
+/// whole-transaction-shape rule ("remove_namespace must be the FINAL op") trivially passed on every
+/// singleton slice regardless of an item's REAL combined shape -- a malformed item would only have
+/// been caught by the post-persist apply, AFTER its transaction object was already durable (bricking
+/// the table on every future recovery and permanently wedging this table's lane). Drives
+/// `appendRefOps` directly with a deliberately malformed multi-op item (remove_namespace not last) to
+/// prove the whole-item shape check now rejects it BEFORE any backend object is created.
+TEST(RefWriterNamespaceRemoval, MalformedShapeWithRemoveNamespaceNotFinalRejectedBeforeAnyCreate)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openStore(backend);
+    const RootNamespace ns{"srv1/malformed_shape"};
+    publishEmptyPart(store, ns, "a");   /// births the table so the malformed item isn't ALSO rejected
+                                        /// for the unrelated reason "namespace_birth was needed first"
+
+    const uint64_t put_before = backend->putTotal();
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
+    {
+        store->appendRefOps(ns, MutationScope::wholeShard(),
+            [](const RefTableState &) -> std::vector<RefOp>
+            {
+                RefOp remove_ns_1;
+                remove_ns_1.kind = RefOpKind::RemoveNamespace;
+                RefOp remove_ns_2;
+                remove_ns_2.kind = RefOpKind::RemoveNamespace;
+                return {remove_ns_1, remove_ns_2};   /// remove_namespace NOT the final op -- malformed
+            },
+            RootMutationOrigin::Writer, RootMutationKind::DropNamespace);
+    });
+
+    EXPECT_EQ(backend->putTotal(), put_before) << "the malformed shape must be rejected before any object is created";
+    ASSERT_TRUE(store->resolveRef(ns, "a").has_value()) << "the malformed attempt left no trace on the table";
+}
+
 /// ===================================================================================
 /// Task 11: namespace birth / the recreation gate (spec §Namespace Birth)
 /// ===================================================================================

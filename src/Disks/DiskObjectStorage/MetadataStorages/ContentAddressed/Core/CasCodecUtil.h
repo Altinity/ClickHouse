@@ -3,8 +3,10 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestId.h>
 #include <IO/ReadBuffer.h>
 #include <IO/ReadHelpers.h>
+#include <IO/WriteBuffer.h>
 #include <IO/WriteHelpers.h>
 #include <Common/Exception.h>
+#include <limits>
 #include <string_view>
 
 namespace DB
@@ -73,6 +75,25 @@ inline String readFixedBytes(ReadBuffer & in, size_t n)
     String s(n, '\0');
     in.readStrict(s.data(), n);
     return s;
+}
+
+/// Length-prefixed byte string, shared by every codec that embeds one (`CasRefLogCodec`,
+/// `CasRefSnapshotCodec`, and `CasStore`'s `encodeMutableFilesPayload`): `u32 length (LE) | bytes`.
+/// The explicit guard (rather than relying on an op/byte budget elsewhere to keep every string short)
+/// is the point where a length silently truncated by the `u32` cast would otherwise corrupt the wire.
+inline void writeLenPrefixed(WriteBuffer & out, const String & s)
+{
+    if (s.size() > std::numeric_limits<uint32_t>::max())
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS codec: string field of {} bytes exceeds UInt32 length prefix", s.size());
+    writeBinaryLittleEndian(static_cast<uint32_t>(s.size()), out);
+    out.write(s.data(), s.size());
+}
+
+inline String readLenPrefixed(ReadBuffer & in)
+{
+    uint32_t len = 0;
+    readBinaryLittleEndian(len, in);
+    return readFixedBytes(in, len);
 }
 
 /// Decode-boundary guard. The codecs parse fully materialized objects, so running out of bytes is
