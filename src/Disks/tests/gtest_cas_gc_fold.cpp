@@ -324,3 +324,80 @@ TEST(CasGcFold, PreviewResolvesCarriedRef)
     EXPECT_EQ(inDegreeOf(*backend, store->layout(), blob), 1)
         << "in-degree through the carried parent ref is 1";
 }
+
+/// A mid-log clamp must be RECOVERABLE (spec §Step 3 transaction atomicity). A single log carrying two
+/// ops -- [drop committed A (a `-1` whose body is present at removal-fold), add precommit B (whose body is
+/// transiently absent)] -- clamps on B. The `-1` on A must NOT be merged into the round's owner-removed
+/// cleanup, because the post-CAS body delete would then reclaim A's body while A's edge stays unfolded
+/// behind the clamp; the next re-fold of that same log would then find A's body missing and clamp forever
+/// (a permanent pool-wide destructive freeze). With per-log staging, A's body survives the clamp round and
+/// the log folds cleanly once B's body reappears.
+TEST(CasGcFold, MidLogClampPreservesEarlierRemovalBodyAndRecovers)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef a = ref("srv-a:1", 1, 0xAA);
+    const ManifestRef b = ref("srv-a:2", 2, 0xBB);
+
+    /// Round 0: commit A (references blob 1). A's body is present and folds a +1.
+    writeManifestRaw(*backend, store->layout(), ns, a, {blobEntryFor("a", DB::UInt128(1))});
+    publishCommittedTransition(*backend, store->layout(), ns, "r1", std::nullopt, a);
+    Gc gc(store, kGc);
+    gc.runRegularRound();
+    EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 1);
+
+    /// ONE log with two ops: drop committed A (`-1`, body present), then add precommit B (`+1`, body
+    /// staged then removed => a transient 404 clamps the log after A's `-1` already folded).
+    writeManifestRaw(*backend, store->layout(), ns, b, {blobEntryFor("b", DB::UInt128(2))});
+    deleteManifestBody(*backend, store->layout(), ManifestId{ns, b});   // B's body absent => clamp
+    const uint64_t log_seq = appendRefLogSeed(*backend, store->layout(), ns,
+        {ownerTransitionOp(RefOwnerBinding{RefOwnerKind::Committed, "r1", a}, std::nullopt),
+         ownerTransitionOp(std::nullopt, RefOwnerBinding{RefOwnerKind::Precommit, "r2", b})});
+
+    const RoundReport clamp_report = gc.runRegularRound();
+    EXPECT_TRUE(clamp_report.hasAnomaly(ns, /*shard*/0)) << "the missing B body must clamp this log";
+    EXPECT_LT(foldCursorOf(*backend, store->layout(), ns, 0), log_seq) << "the clamp halts the cursor below the log";
+    EXPECT_TRUE(backend->head(store->layout().manifestKey(ManifestId{ns, a})).exists)
+        << "A's body must survive the clamp round: its `-1` was staged, not merged, so no post-CAS delete "
+           "reclaimed it -- otherwise the re-fold would clamp on A's missing body forever";
+    EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 1) << "A's `-1` was not adopted (clamp)";
+
+    /// The transient 404 heals: B's body reappears. The next round re-folds the SAME log cleanly.
+    writeManifestRaw(*backend, store->layout(), ns, b, {blobEntryFor("b", DB::UInt128(2))});
+    const RoundReport clean_report = gc.runRegularRound();
+    EXPECT_FALSE(clean_report.hasAnomaly(ns, /*shard*/0)) << "with both bodies present the log folds; no clamp";
+    EXPECT_GE(foldCursorOf(*backend, store->layout(), ns, 0), log_seq) << "the cursor advanced past the recovered log";
+    EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 0) << "A's `-1` applied";
+    EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(2)), 1) << "B's `+1` applied";
+}
+
+/// A `+1` precommit whose body is PERMANENTLY absent and whose build is below the durable watermark floor
+/// (provably dead -- the exact fact the orphan sweep uses to reclaim the body) must be SKIPPED, not held on
+/// the fold barrier forever. Without a terminal rule this table clamps every round with no resolution (a
+/// late-predecessor precommit whose body was already reclaimed). The watermark is seeded so the precommit's
+/// build is dead; the fold must advance the cursor past the log and record no clamp anomaly.
+TEST(CasGcFold, DeadPrecommitWithMissingBodyIsSkippedNotClampedForever)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    /// The namespace's server-root prefix is "srv"; seed its watermark floor so build_sequence 5 is retired.
+    const RootNamespace ns{"srv/tbl"};
+    setWatermarkMinActive(*backend, store->layout(), "srv", /*writer_epoch*/1, /*min_active*/10);
+
+    /// A precommit naming a build (writer_epoch 1, build_sequence 5) whose body is never written.
+    const ManifestRef dead = ManifestRef{.writer_epoch = 1, .build_sequence = 5, .manifest_ordinal = 1};
+    const uint64_t log_seq =
+        addPrecommitTransition(*backend, store->layout(), ns, DB::UInt128(7), "r1", std::nullopt, dead);
+
+    Gc gc(store, kGc);
+    const RoundReport report = gc.runRegularRound();
+    EXPECT_FALSE(report.hasAnomaly(ns, /*shard*/0))
+        << "a provably-dead precommit's missing body is skipped, not clamped";
+    EXPECT_GE(foldCursorOf(*backend, store->layout(), ns, 0), log_seq)
+        << "the fold advanced past the log instead of holding the barrier forever";
+
+    /// A second identical round stays clean (terminal resolution, not a recurring clamp).
+    const RoundReport report2 = gc.runRegularRound();
+    EXPECT_FALSE(report2.hasAnomaly(ns, /*shard*/0)) << "the resolution is terminal: no recurring clamp";
+}

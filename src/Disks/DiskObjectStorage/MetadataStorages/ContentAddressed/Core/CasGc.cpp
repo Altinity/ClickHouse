@@ -24,6 +24,7 @@
 namespace ProfileEvents
 {
     extern const Event CasGcClampSuppressedPasses;
+    extern const Event CasGcDeadPrecommitSkipped;
     extern const Event CasGcRetiredCondemned;
     extern const Event CasGcRetiredSpared;
     extern const Event CasGcRetiredGraduated;
@@ -976,17 +977,52 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
                 break;
             }
 
-            /// Fold every explicit manifest edge of the log (spec §Step 3). A missing manifest body is a
-            /// per-table CLAMP (barrier), never a round abort: keep the cursor below THIS log and re-read it
-            /// next round. A removed precommit whose body never existed emitted no edge -- skip, no clamp.
+            /// Fold every explicit manifest edge of the log (spec §Step 3). A transaction applies
+            /// ATOMICALLY ("either the complete transaction applies or none of it applies"): stage this
+            /// log's blob deltas and owner-removed manifest cleanup in PER-LOG buffers and merge them into
+            /// the round buffers only once the WHOLE log folds. A mid-log clamp DISCARDS the staged buffers
+            /// so the cursor stays coherent -- merging a partially folded log's `-1` cleanup would let the
+            /// post-CAS body delete remove a body whose edge is still unfolded behind the clamp, and the
+            /// re-fold would then clamp on that missing body forever. A missing manifest body is a per-table
+            /// CLAMP (barrier), never a round abort: keep the cursor below THIS log and re-read it next
+            /// round. A removed precommit whose body never existed emitted no edge -- skip, no clamp.
+            std::vector<BlobDelta> log_deltas;
+            std::map<ManifestId, Token> log_mf_cleanup;
             for (const RefManifestEdge & edge : manifestEdgesOfTxn(txn))
             {
                 ProfileEvents::increment(ProfileEvents::CasRefEmittedEdges);   /// spec §Step 3: one manifest-edge event
-                if (foldManifestEdges(edge.manifest_id, edge.change, deltas, result.mf_cleanup))
+                if (foldManifestEdges(edge.manifest_id, edge.change, log_deltas, log_mf_cleanup))
                     continue;
 
                 if (edge.change < 0 && edge.owner_kind == RefOwnerKind::Precommit)
                     continue;   /// removed precommit that never activated: no edge to mirror, no clamp
+
+                /// A `+1` precommit whose body is absent normally holds the fold barrier (the writer may
+                /// still be uploading it). But a precommit naming a build PROVABLY DEAD by the durable
+                /// watermark floor -- the SAME fact the orphan sweep uses to reclaim the body -- can never
+                /// activate, and its body will never return. Skip it (non-activating, advance the log) so
+                /// the barrier is not held forever on a body no writer will complete; otherwise this table
+                /// clamps every round with no terminal resolution. Fail-closed: no durable watermark (the
+                /// build cannot be proven dead) keeps the barrier.
+                if (edge.change > 0 && edge.owner_kind == RefOwnerKind::Precommit
+                    && prefixEligible(*store, ns,
+                           BuildPrefix{.writer_epoch = edge.manifest_id.ref.writer_epoch,
+                                       .build_sequence = edge.manifest_id.ref.build_sequence}))
+                {
+                    ProfileEvents::increment(ProfileEvents::CasGcDeadPrecommitSkipped);
+                    EventEmitter{*store}.emit([&](CasEvent & ev)
+                    {
+                        ev.type = CasEventType::GcFoldClamp;   /// reuse the fold-decision channel; outcome distinguishes
+                        ev.namespace_ = ns_str;
+                        ev.object_kind = CasEventObjectKind::Root;
+                        ev.object_hash = manifestRefDebugString(edge.manifest_id.ref);
+                        ev.outcome = "dead_precommit_skipped";
+                        ev.reason = "live precommit body absent AND its build is below the watermark floor "
+                                    "(provably dead); skip the non-activating edge instead of clamping forever";
+                        ev.detail = {{"log", renderRefTxnId(log_id)}};
+                    });
+                    continue;
+                }
 
                 const char * reason = edge.change > 0
                     ? (edge.owner_kind == RefOwnerKind::Precommit
@@ -1011,7 +1047,14 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             }
 
             if (clamped)
-                break;                     /// stop folding this table
+                break;   /// discard the staged log_deltas / log_mf_cleanup (never merged) and stop this table
+
+            /// The whole log folded: merge its staged transaction into the round buffers.
+            for (BlobDelta & d : log_deltas)
+                deltas.push_back(std::move(d));
+            for (const auto & [mid, tok] : log_mf_cleanup)
+                result.mf_cleanup.emplace(mid, tok);
+
             /// A fully-folded remove_namespace transaction hands its {ns, remove_txn_id} to the
             /// namespace-cleanup item (spec §Remove Namespace); its owner-removal edges were folded above.
             if (const auto removal = removalTxnId(txn))

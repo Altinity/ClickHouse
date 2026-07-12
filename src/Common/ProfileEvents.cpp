@@ -768,7 +768,10 @@ The server successfully detected this situation and will download merged part fr
     M(CasRefCleanupObjectsDeleted, "CA ref intake: old ref log/snapshot objects deleted by ref-object cleanup once snapshot+cursor coverage is durable (spec §Step 6 / §GC Budget D)", ValueType::Number) \
     M(CasRefSnapshotPutBytes, "CA writer: bytes of table snapshots PUT by threshold/mount-time publication (spec §writer-snapshot-publication)", ValueType::Bytes) \
     M(CasRefSnapshotTailLogs, "CA writer: tail logs compacted into a published table snapshot (logs-per-table-after-snapshot; spec §implementation-impact)", ValueType::Number) \
+    M(CasRefSnapshotPublishDispatched, "CA writer: background snapshot-publish attempts dispatched past the in-flight/candidate-advance/backoff gate (bounds the read-triggered publish storm)", ValueType::Number) \
+    M(CasRefSnapshotPublishBackoff, "CA writer: per-table snapshot-publish backoffs armed after a non-Committed publish outcome (the read-triggered PUT-storm latch breaker)", ValueType::Number) \
     M(CasGcClampSuppressedPasses, "CA GC passes whose fold clamped a shard: graduations and pending deletes were suppressed (carried) to preserve the ack-floor lemma", ValueType::Number) \
+    M(CasGcDeadPrecommitSkipped, "CA GC fold edges skipped for a +1 precommit whose manifest body is absent and whose build is below the durable watermark floor (provably dead; barrier lifted instead of clamping forever)", ValueType::Number) \
     M(CasBlobGet,        "CA blob get S3 ops", ValueType::Number) \
     M(CasBlobGetStream,  "CA blob get-stream S3 ops", ValueType::Number) \
     M(CasBlobDelete,     "CA blob delete S3 ops", ValueType::Number) \
