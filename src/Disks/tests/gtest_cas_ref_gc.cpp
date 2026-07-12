@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFsck.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRefIntake.h>
@@ -343,6 +344,59 @@ TEST(CasRefGc, RefIntakeIncrementsObservabilityCounters)
     EXPECT_GT(global_counters[ProfileEvents::CasRefManifestBodyFoldGets].load(), mf_gets_before);
     EXPECT_GT(global_counters[ProfileEvents::CasRefEmittedEdges].load(), edges_before);
     EXPECT_GT(global_counters[ProfileEvents::CasRefCleanupObjectsDeleted].load(), cleaned_before);
+}
+
+/// Task 13 e2e (in-process regression twin of the rustfs integration test): the whole snapshot+log
+/// lifecycle over real wire-format objects and real GC rounds -- publish committed refs across two
+/// tables, replace one (dropping a blob), publish a covering snapshot, drive GC to a fixpoint, and
+/// assert the fold + ref-object cleanup + snapshot lifecycle plus the two read-only consumers:
+/// `runFsck(*store).clean()` (the fsck CLI's verdict, oracle included) and `gc.previewDeletes().empty()`
+/// (what `ca-gc-dryrun` reports). This is the deterministic permanent twin the unit sweep keeps running.
+TEST(CasRefGc, RefSnaplogLifecycleE2E)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    const Layout & layout = store->layout();
+    const RootNamespace ns_a{"00/aa@cas@"};
+    const RootNamespace ns_b{"00/bb@cas@"};
+
+    /// Two tables with committed refs naming present manifests + blobs (insert-like). ns_a's ref is then
+    /// re-published to a second manifest, dropping the first manifest's blob (a replace: -1 old, +1 new).
+    const ManifestRef a1 = mref(1);
+    const ManifestRef a2 = mref(2);
+    const ManifestRef b1 = mref(3);
+    writeBlobBody(*backend, layout, DB::UInt128(1));
+    writeBlobBody(*backend, layout, DB::UInt128(2));
+    writeBlobBody(*backend, layout, DB::UInt128(3));
+    writeManifestRaw(*backend, layout, ns_a, a1, {blobEntryFor("a", DB::UInt128(1))});
+    writeManifestRaw(*backend, layout, ns_a, a2, {blobEntryFor("a", DB::UInt128(2))});
+    writeManifestRaw(*backend, layout, ns_b, b1, {blobEntryFor("b", DB::UInt128(3))});
+    const uint64_t va1 = publishCommittedTransition(*backend, layout, ns_a, "t", std::nullopt, a1);
+    const uint64_t va2 = publishCommittedTransition(*backend, layout, ns_a, "t", a1, a2);   /// replace a1 -> a2
+    publishCommittedTransition(*backend, layout, ns_b, "t", std::nullopt, b1);
+
+    /// The writer's compaction: a snapshot of ns_a covering its greatest log (va2), the same
+    /// deterministic bytes the oracle recomputes.
+    const RefTableState sa = recoverRefTable(*backend, layout, ns_a);
+    writeRefSnapshotRaw(*backend, layout, snapshotOf(sa, ns_a.string()));
+
+    Gc gc(store, kGc);
+    runToFixpoint(store, gc);
+
+    /// Snapshot lifecycle: the covering snapshot is retained; the covered logs (folded + snapshot-covered)
+    /// are cleaned; the replaced manifest's blob is reclaimed while the live blobs survive.
+    EXPECT_TRUE(backend->head(layout.refSnapshotKey(ns_a, RefTxnId{1, va2})).exists) << "covering snapshot retained";
+    EXPECT_FALSE(backend->head(layout.refLogKey(ns_a, RefTxnId{1, va1})).exists) << "covered log cleaned";
+    EXPECT_FALSE(blobPresent(*backend, layout, DB::UInt128(1))) << "replaced blob reclaimed";
+    EXPECT_TRUE(blobPresent(*backend, layout, DB::UInt128(2))) << "live blob survives";
+    EXPECT_TRUE(blobPresent(*backend, layout, DB::UInt128(3))) << "other table's blob survives";
+
+    /// Read-only consumers agree: fsck clean (no dangle, no oracle divergence) and ca-gc-dryrun empty.
+    const FsckReport rep = runFsck(*store, /*detail*/true);
+    EXPECT_TRUE(rep.clean());
+    EXPECT_EQ(rep.dangling, 0u);
+    EXPECT_EQ(rep.snapshot_oracle_mismatches, 0u);
+    EXPECT_TRUE(gc.previewDeletes().empty()) << "ca-gc-dryrun equivalent: no pending content deletes";
 }
 
 /// (7) Namespace-cleanup item: `remove_namespace` -> Pending item -> physical prefixes reclaimed ->
