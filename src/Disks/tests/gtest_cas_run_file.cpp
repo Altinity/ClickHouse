@@ -274,6 +274,25 @@ TEST(CasRunFile, CorruptedBlockCountInFooterFailsClosed)
     expectCorruptedData("huge block_count", [&] { constructAndDrain(b); });
 }
 
+TEST(CasRunFile, CorruptedBlockRecordCountFailsClosed)
+{
+    /// The per-block record_count lives in the block HEAD, which the block CRC did NOT cover (only the
+    /// record payload was checksummed). Inflating record_count slipped past installBlockFrame, and
+    /// next() then raw-indexed the block past its end via an unchecked le32at + substr -> heap OOB read
+    /// / std::out_of_range (a hard crash under libc++ hardening), violating CasRunFile.h's fail-closed
+    /// contract. With the head in the CRC (and next() bounds-checked) the mutation is CORRUPTED_DATA.
+    const String valid = writeRun({{"aa", "payload-bytes"}, {"bb", "more"}, {"cc", "third"}});
+
+    /// File layout: 13-byte header, then the first block frame: block_len u32 @13, record_count u32 @17.
+    constexpr size_t header_len = 13;
+    constexpr size_t record_count_off = header_len + 4;   /// past the block_len prefix
+    String b = valid;
+    /// Inflate the block's record_count so the reader would loop past the real records.
+    b[record_count_off + 0] = static_cast<char>(0xFF);
+    b[record_count_off + 1] = static_cast<char>(0x7F);
+    expectCorruptedData("inflated block record_count", [&] { constructAndDrain(b); });
+}
+
 TEST(CasRunFile, TruncationSweepFailsClosed)
 {
     /// A multi-block run; truncate at many lengths past the header and require every prefix to

@@ -41,6 +41,14 @@ uint32_t crc32cOf(std::string_view bytes)
     return crc32c::Crc32c(reinterpret_cast<const uint8_t *>(bytes.data()), bytes.size());
 }
 
+/// CRC over the block HEAD (record_count, min_key, max_key) followed by the payload - so the
+/// record_count that next() trusts is itself checksummed, not just the record payload.
+uint32_t crc32cOf(std::string_view head, std::string_view payload)
+{
+    return crc32c::Extend(crc32cOf(head),
+        reinterpret_cast<const uint8_t *>(payload.data()), payload.size());
+}
+
 }
 
 RunFileWriter::RunFileWriter(WriteBuffer & out_, RunHeader header_) : out(out_), header(header_)
@@ -106,7 +114,9 @@ void RunFileWriter::flushBlock()
     putLE32(block_head, block_records);
     putLenPrefixed(block_head, block_min_key);
     putLenPrefixed(block_head, block_max_key);
-    putLE32(block_head, crc32cOf(block_payload));
+    /// CRC covers the whole block head (incl. record_count) AND the payload, so a corrupted
+    /// record_count / key length is caught by installBlockFrame before next() ever trusts it.
+    putLE32(block_head, crc32cOf(block_head, block_payload));
     const uint32_t block_len = static_cast<uint32_t>(block_head.size() + block_payload.size());
 
     writeBinaryLittleEndian(block_len, out);
@@ -366,6 +376,7 @@ void RunFileReader::installBlockFrame(std::string_view frame, size_t block_no)
     if (block_len > frame.size() - off)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "RunFile: block field out of bounds");
     const size_t block_end = off + block_len;
+    const size_t head_start = off;   /// record_count..max_key are CRC-covered together with the payload
     const uint32_t rec_count = le32of(frame, off); off += 4;
     uint32_t mn = le32of(frame, off); off += 4;
     if (mn > frame.size() - off) throw Exception(ErrorCodes::CORRUPTED_DATA, "RunFile: block field out of bounds");
@@ -373,11 +384,13 @@ void RunFileReader::installBlockFrame(std::string_view frame, size_t block_no)
     uint32_t mx = le32of(frame, off); off += 4;
     if (mx > frame.size() - off) throw Exception(ErrorCodes::CORRUPTED_DATA, "RunFile: block field out of bounds");
     off += mx;   /// skip max_key
+    const size_t crc_field_off = off;
     const uint32_t stored_crc = le32of(frame, off); off += 4;
     if (off > block_end)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "RunFile: block header exceeds block");
+    const std::string_view head(frame.data() + head_start, crc_field_off - head_start);
     const std::string_view payload(frame.data() + off, block_end - off);
-    if (crc32cOf(payload) != stored_crc)
+    if (crc32cOf(head, payload) != stored_crc)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "RunFile: block crc mismatch");
 
     cur_block.assign(payload.data(), payload.size());
@@ -443,18 +456,24 @@ bool RunFileReader::next(String & key, String & payload)
         if (!loadBlock(cur_block_idx + 1))
             return false;
     }
-    auto le32at = [&](const String & s, size_t off) -> uint32_t
-    {
-        uint32_t v = 0;
-        for (int i = 0; i < 4; ++i)
-            v |= static_cast<uint32_t>(static_cast<uint8_t>(s[off + i])) << (8 * i);
-        return v;
-    };
-    uint32_t klen = le32at(cur_block, cur_block_pos); cur_block_pos += 4;
+    /// Bounds-checked reads over the (now CRC-covered, incl. record_count) block payload - a
+    /// self-inconsistent length fails closed with CORRUPTED_DATA, never an unchecked operator[] or a
+    /// substr-past-end (std::out_of_range).
+    const std::string_view block(cur_block);
+    const uint32_t klen = le32of(block, cur_block_pos); cur_block_pos += 4;
+    if (klen > cur_block.size() - cur_block_pos)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "RunFile: record key out of bounds");
     key = cur_block.substr(cur_block_pos, klen); cur_block_pos += klen;
-    uint32_t plen = le32at(cur_block, cur_block_pos); cur_block_pos += 4;
+    const uint32_t plen = le32of(block, cur_block_pos); cur_block_pos += 4;
+    if (plen > cur_block.size() - cur_block_pos)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "RunFile: record payload out of bounds");
     payload = cur_block.substr(cur_block_pos, plen); cur_block_pos += plen;
     ++cur_record_no;
+    /// After the block's last record the cursor must land EXACTLY on the block end - a record_count
+    /// that under- or over-counts the payload is corruption. record_count is now CRC-covered, so this
+    /// fires only on a CRC collision or a writer bug, but it is the reader's fail-closed backstop.
+    if (cur_record_no == cur_block_records && cur_block_pos != cur_block.size())
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "RunFile: block record_count does not match payload");
     return true;
 }
 
