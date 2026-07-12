@@ -246,6 +246,9 @@ StorePtr Store::open(BackendPtr backend, PoolConfig config)
             /// single-attempt conditional-write gate — see `PoolConfig::skip_access_check`. Run it
             /// directly so a Native-mode backend with no working single-attempt client still fails
             /// closed at open instead of silently corrupting CAS state under blind retries later.
+            /// The skipped store-precondition check also covers GCS bucket-versioning/delete-marker
+            /// detection — that risk is purely environmental (slower GC reclaim, not data loss) and
+            /// gets re-checked the next time this pool is opened without skip_access_check.
             backend->checkConditionalWriteSingleAttemptSupport();
         }
     }

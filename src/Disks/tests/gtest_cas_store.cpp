@@ -202,7 +202,61 @@ TEST(CasStore, SkipAccessCheckOpenSkipsProbeButStaysWritable)
         auto s = DB::Cas::Store::open(watch, sac);
         ASSERT_NE(s, nullptr);
         EXPECT_FALSE(watch->probe_touched) << "skip_access_check must perform no probe I/O";
+
+        /// Prove the mount is genuinely WRITABLE, not merely non-null — a read_only open would also
+        /// satisfy the two assertions above. Publish a part through the real Build write path
+        /// (startBuild/putBlob/stageManifest/precommitAdd/promote) and read it back.
+        publishPart(s, "srv-2/tbl", "part_1", "payload-x");
+        const auto r = s->resolveRef(DB::Cas::RootNamespace{"srv-2/tbl"}, "part_1");
+        ASSERT_TRUE(r.has_value()) << "skip_access_check open must accept real writes, not just open";
     }
+}
+
+namespace
+{
+/// A backend whose checkConditionalWriteSingleAttemptSupport ALWAYS throws — a stand-in for a
+/// Native-mode backend with no working single-attempt client (see
+/// ObjectStorageBackend::checkConditionalWriteSingleAttemptSupport). Pins that skip_access_check does
+/// NOT bypass this gate: the regression this guards is reverting Store::open's skip_access_check
+/// branch back to the naive "wrap the whole probe" shape, which would silently skip this check too.
+class ThrowingSingleAttemptBackend final : public DB::Cas::Backend
+{
+public:
+    explicit ThrowingSingleAttemptBackend(std::shared_ptr<DB::Cas::Backend> inner_) : inner(std::move(inner_)) {}
+
+    std::optional<DB::Cas::GetResult> get(const String & k, DB::Cas::Range r = {}) override { return inner->get(k, r); }
+    std::optional<DB::Cas::GetStreamResult> getStream(const String & k, DB::Cas::Range r = {}) override { return inner->getStream(k, r); }
+    DB::Cas::HeadResult head(const String & k) override { return inner->head(k); }
+    DB::Cas::ListPage list(const String & p, const String & c, size_t l) override { return inner->list(p, c, l); }
+    DB::Cas::PutResult putIfAbsent(const String & k, const String & b, const DB::Cas::ObjectMeta & m = {}) override { return inner->putIfAbsent(k, b, m); }
+    DB::Cas::WriteSinkPtr putIfAbsentStream(const String & k, const DB::Cas::ObjectMeta & m = {}) override { return inner->putIfAbsentStream(k, m); }
+    DB::Cas::PutResult putOverwrite(const String & k, const String & b, const DB::Cas::Token & e, const DB::Cas::ObjectMeta & m = {}) override { return inner->putOverwrite(k, b, e, m); }
+    DB::Cas::CasResult casPut(const String & k, const String & b, const std::optional<DB::Cas::Token> & e, const DB::Cas::ObjectMeta & m = {}) override { return inner->casPut(k, b, e, m); }
+    DB::Cas::DeleteOutcome deleteExact(const String & k, const DB::Cas::Token & t) override { return inner->deleteExact(k, t); }
+    bool supportsListTokens() const override { return inner->supportsListTokens(); }
+    void checkConditionalWriteSingleAttemptSupport() override
+    {
+        throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED, "test: no single-attempt client");
+    }
+private:
+    std::shared_ptr<DB::Cas::Backend> inner;
+};
+}
+
+TEST(CasStore, SkipAccessCheckStillEnforcesSingleAttemptGate)
+{
+    auto backend = std::make_shared<ThrowingSingleAttemptBackend>(std::make_shared<DB::Cas::InMemoryBackend>());
+
+    DB::Cas::PoolConfig cfg;
+    cfg.pool_prefix = "pool";
+    cfg.server_id = DB::UInt128(1);
+    cfg.server_root_id = "test";
+    cfg.skip_access_check = true;
+
+    /// skip_access_check must NOT bypass checkConditionalWriteSingleAttemptSupport (RFC
+    /// cas-s3-timeout-retry-control): a writable open still refuses to mount on a backend that cannot
+    /// prove single-attempt conditional-write support, exactly as it does without skip_access_check.
+    EXPECT_THROW(DB::Cas::Store::open(backend, cfg), DB::Exception);
 }
 
 TEST(CasStore, MinActiveTracksInFlightBuilds)
