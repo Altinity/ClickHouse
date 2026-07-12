@@ -20,6 +20,7 @@ namespace ProfileEvents
     extern const Event CasConditionalWriteDefiniteFailure;
     extern const Event CasConditionalWriteUnresolved;
     extern const Event CasConditionalWriteSdkRetries;
+    extern const Event CasConditionalWriteFenceLostPostWrite;
 }
 
 namespace DB::ErrorCodes
@@ -242,8 +243,14 @@ CasWriteOutcome CasRequestController::putIfAbsentControlled(
         /// attempt_outcome == Committed here (either the attempt's own 2xx, or resolution found
         /// identical bytes). Final fence check before reporting success (RFC §ack-and-cache-rules step
         /// 4): a fence lost here means the write may have landed but this call must never claim it did.
+        /// Count this "response observed after the local fence" leg (spec §Late Predecessor PUT's
+        /// best-effort diagnostic) separately from the generic Unresolved classifier so a cross-epoch
+        /// fence loss is visible rather than folded into ordinary retry-budget exhaustion.
         if (!fence_ok())
+        {
+            ProfileEvents::increment(ProfileEvents::CasConditionalWriteFenceLostPostWrite);
             return CasWriteOutcome::Unresolved;
+        }
         return CasWriteOutcome::Committed;
     }
 

@@ -13,6 +13,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <future>
 #include <mutex>
 #include <thread>
 
@@ -38,6 +39,7 @@ extern const Event CasRefSnapshotPutBytes;
 extern const Event CasRefSnapshotTailLogs;
 extern const Event CasRefSnapshotPublishDispatched;
 extern const Event CasRefSnapshotPublishBackoff;
+extern const Event CasConditionalWriteFenceLostPostWrite;
 }
 
 using namespace DB::Cas;
@@ -167,6 +169,12 @@ public:
     int fault_count = 0;
     std::optional<std::pair<String, String>> pending_delayed_write;
 
+    /// (I1) On a matching `putIfAbsent`, a FOREIGN writer lands a DIFFERENT object at the exact key and
+    /// then this attempt's response is lost -- so the controller's resolve-before-reissue GET observes
+    /// different bytes and must raise CORRUPTED_DATA (a proven conflict, never a retry signal).
+    String corrupt_key_substr;
+    int corrupt_count = 0;
+
     std::optional<GetResult> get(const String & key, Range range = {}) override
     {
         const auto it = vanish_once_keys.find(key);
@@ -186,6 +194,13 @@ public:
 
     PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta = {}) override
     {
+        if (corrupt_count > 0 && !corrupt_key_substr.empty() && key.find(corrupt_key_substr) != String::npos)
+        {
+            --corrupt_count;
+            /// A foreign writer lands a DIFFERENT object at this exact key; then our own response is lost.
+            CountingBackend::putIfAbsent(key, bytes + String("\x01_FOREIGN_DIFFERENT"));
+            throw Poco::TimeoutException("RefWriterTestBackend: a foreign different object landed; response lost");
+        }
         if (fault_count > 0 && !fault_key_substr.empty() && key.find(fault_key_substr) != String::npos)
         {
             --fault_count;
@@ -621,6 +636,120 @@ TEST(RefWriterAppendLane, WedgedAppendObservedDurableAppliesBeforeNextId)
     EXPECT_FALSE(store->refLaneWedgedForTest(ns));
     EXPECT_FALSE(store->resolveRef(ns, "x").has_value()) << "the wedged drop was applied on resolution";
     EXPECT_FALSE(store->resolveRef(ns, "y").has_value()) << "the next mutation committed normally afterward";
+}
+
+/// ===================================================================================
+/// I1: a CORRUPTED_DATA from the retry controller (resolve-before-reissue observed a DIFFERENT object at
+/// the exact key) must be surfaced LOUDLY to the caller and never hang the table's append queue. The
+/// unfixed code let the throw propagate through the leader loop with `leader_active` still true, so every
+/// queued and future caller for that table blocked forever in `cv.wait`.
+/// ===================================================================================
+
+/// Append-site CORRUPTED_DATA: the offending caller gets the error, the lane is NOT wedged (a proven
+/// different-object conflict is conclusive, not uncertain), and both a later SAME-table append and an
+/// independent-table append complete promptly -- proven by a bounded wait, so a hang fails the test
+/// instead of stalling it.
+TEST(RefWriterAppendLane, I1AppendCorruptionSurfacesAndLaneStaysUsable)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openStore(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/i1_append"};
+    const RootNamespace other{"srv1/i1_other"};
+    publishEmptyPart(store, ns, "x");
+    publishEmptyPart(store, other, "z");
+
+    /// The next `_log` PUT for `ns` has a foreign different object land at its key; resolve-before-reissue
+    /// then observes the mismatch and raises CORRUPTED_DATA.
+    backend->corrupt_key_substr = layout.refsNamespacePrefix(ns) + "_log/";
+    backend->corrupt_count = 1;
+
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { store->dropRef(ns, "x"); });
+    EXPECT_FALSE(store->refLaneWedgedForTest(ns)) << "a proven different-object conflict must not wedge the lane";
+
+    /// The lane is usable, not hung: a later same-table append and an independent-table append both
+    /// complete within a bounded wait (a real cv hang would time out here rather than pass).
+    auto same = std::async(std::launch::async, [&] { store->dropRef(ns, "x"); });
+    ASSERT_EQ(same.wait_for(std::chrono::seconds(10)), std::future_status::ready)
+        << "the same-table append hung -- the queue's leader bookkeeping was not restored";
+    same.get();
+    EXPECT_FALSE(store->resolveRef(ns, "x").has_value());
+
+    auto indep = std::async(std::launch::async, [&] { store->dropRef(other, "z"); });
+    ASSERT_EQ(indep.wait_for(std::chrono::seconds(10)), std::future_status::ready);
+    indep.get();
+    EXPECT_FALSE(store->resolveRef(other, "z").has_value());
+}
+
+/// Wedge-resolve-site CORRUPTED_DATA: a wedged lane whose key a foreign writer overwrote must surface the
+/// corruption to the triggering caller AND KEEP the wedge (fail closed on corruption), without hanging.
+TEST(RefWriterAppendLane, I1WedgeResolveCorruptionSurfacesAndKeepsWedge)
+{
+    CasRequestBudget budget;
+    budget.max_attempts = 1;
+    budget.attempt_timeout_ms = 100;
+    budget.operation_deadline_ms = 100;
+    budget.lease_safety_margin_ms = 100;
+
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openStore(backend, budget);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/i1_wedge"};
+    publishEmptyPart(store, ns, "x");
+    publishEmptyPart(store, ns, "y");
+
+    /// Wedge the lane with an ambiguous PUT that never landed.
+    backend->fault_key_substr = layout.refsNamespacePrefix(ns) + "_log/";
+    backend->fault_count = 1;
+    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { store->dropRef(ns, "x"); });
+    ASSERT_TRUE(store->refLaneWedgedForTest(ns));
+
+    /// A foreign writer lands a DIFFERENT object at the exact wedged key; the next append's wedge resolve
+    /// observes the mismatch and must raise CORRUPTED_DATA to that caller while keeping the wedge.
+    const String wedged_key = store->wedgedKeyForTest(ns);
+    ASSERT_FALSE(wedged_key.empty());
+    ASSERT_EQ(backend->putIfAbsent(wedged_key, "a-different-object").outcome, PutOutcome::Done);
+
+    auto fut = std::async(std::launch::async, [&]
+    {
+        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { store->dropRef(ns, "y"); });
+    });
+    ASSERT_EQ(fut.wait_for(std::chrono::seconds(10)), std::future_status::ready)
+        << "the wedge-resolve corruption hung the queue instead of surfacing to the caller";
+    fut.get();
+    EXPECT_TRUE(store->refLaneWedgedForTest(ns)) << "corruption at the wedged key must keep the lane wedged (fail closed)";
+
+    /// The queue's leader bookkeeping was restored, so a SUBSEQUENT same-table caller does not hang: it
+    /// re-hits the kept wedge and again surfaces the corruption, but promptly (a real cv hang would time
+    /// out this bounded wait). This is the leg the unfixed code left blocked forever.
+    auto fut2 = std::async(std::launch::async, [&]
+    {
+        try { store->dropRef(ns, "y"); } catch (...) {}   /// corruption expected; we assert only "no hang"
+    });
+    ASSERT_EQ(fut2.wait_for(std::chrono::seconds(10)), std::future_status::ready)
+        << "a later same-table append hung -- the leader bookkeeping was not restored after the corruption";
+    fut2.get();
+}
+
+/// I3: a conditional write whose attempt classified Committed but whose FINAL post-write fence check
+/// failed (the mount fence was lost after the write may have landed) is counted separately, not folded
+/// into the generic Unresolved classifier (spec §Late Predecessor PUT best-effort diagnostic).
+TEST(CasRequestControllerFenceLoss, I3PostWriteFenceLossIsCounted)
+{
+    using ProfileEvents::global_counters;
+    auto backend = std::make_shared<CountingBackend>();
+    CasRequestBudget budget;
+    budget.max_attempts = 3;
+    CasRequestController ctrl(backend, budget, [] { return static_cast<uint64_t>(0); });   // fixed clock
+
+    /// `fence_ok` holds for the pre-attempt check, then is lost by the post-write check.
+    int calls = 0;
+    auto fence_ok = [&calls] { return ++calls <= 1; };
+
+    const auto before = global_counters[ProfileEvents::CasConditionalWriteFenceLostPostWrite].load();
+    const CasWriteOutcome outcome = ctrl.putIfAbsentControlled("k", "v", fence_ok);
+    EXPECT_EQ(outcome, CasWriteOutcome::Unresolved) << "a post-write fence loss must never be reported as Committed";
+    EXPECT_EQ(global_counters[ProfileEvents::CasConditionalWriteFenceLostPostWrite].load(), before + 1);
 }
 
 /// ===================================================================================

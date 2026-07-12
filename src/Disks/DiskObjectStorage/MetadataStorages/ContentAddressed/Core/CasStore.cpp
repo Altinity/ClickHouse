@@ -1248,6 +1248,13 @@ bool Store::refLaneWedgedForTest(const RootNamespace & ns)
     return rt->wedge.has_value();
 }
 
+String Store::wedgedKeyForTest(const RootNamespace & ns)
+{
+    const auto rt = getRefTableRuntime(ns);
+    std::lock_guard lock(rt->state_mutex);
+    return rt->wedge ? rt->wedge->key : String{};
+}
+
 bool Store::observedNamespaceCleanupMarker(const RootNamespace & ns, const RefTxnId & remove_txn_id)
 {
     const auto rt = getRefTableRuntime(ns);
@@ -1302,7 +1309,22 @@ RefTxnId Store::appendRefOps(const RootNamespace & ns, MutationScope scope,
         {
             rt->leader_active = true;
             lk.unlock();
-            runRefQueueLeader(ns, rt, item);
+            try
+            {
+                runRefQueueLeader(ns, rt, item);
+            }
+            catch (...)
+            {
+                /// Any exceptional exit from the leader loop (e.g. an unhandled CORRUPTED_DATA the flush's
+                /// controller sites now surface loudly) must restore `leader_active`, or every queued and
+                /// future `appendRefOps` caller for this table blocks forever in `cv.wait` -- a silent hang
+                /// instead of a fail-closed error. Idempotent with the flush's own resets; rethrow so the
+                /// corruption surfaces to this caller rather than being swallowed.
+                lk.lock();
+                rt->leader_active = false;
+                rt->cv.notify_all();
+                throw;
+            }
             lk.lock();
             rt->leader_active = false;
             rt->cv.notify_all();
@@ -1413,7 +1435,20 @@ void Store::flushRefBatch(const RootNamespace & ns, const std::shared_ptr<RefTab
         }
         if (wedge_copy)
         {
-            const CasWriteOutcome resolved = ref_request_controller->resolveByExactGet(wedge_copy->key, wedge_copy->bytes);
+            CasWriteOutcome resolved;
+            try
+            {
+                resolved = ref_request_controller->resolveByExactGet(wedge_copy->key, wedge_copy->bytes);
+            }
+            catch (...)
+            {
+                /// `resolveByExactGet` throws CORRUPTED_DATA when the wedged key holds a DIFFERENT object
+                /// than this attempt intended -- a real conflict, never a retry signal. Surface it to every
+                /// queued caller loudly (corruption is exactly when to fail closed) and KEEP the wedge, so
+                /// the lane is left explicitly wedged for inspection rather than hanging every future caller.
+                complete_error(carve_all_pending(), std::current_exception());
+                return;
+            }
             if (resolved == CasWriteOutcome::Committed)
             {
                 std::lock_guard lock(rt->state_mutex);
@@ -1590,7 +1625,20 @@ void Store::flushRefBatch(const RootNamespace & ns, const std::shared_ptr<RefTab
     }
     const String key = pool_layout.refLogKey(ns, id);
 
-    const CasWriteOutcome outcome = ref_request_controller->putIfAbsentControlled(key, bytes, fence_ok);
+    CasWriteOutcome outcome;
+    try
+    {
+        outcome = ref_request_controller->putIfAbsentControlled(key, bytes, fence_ok);
+    }
+    catch (...)
+    {
+        /// `putIfAbsentControlled` throws CORRUPTED_DATA when resolve-before-reissue observes a DIFFERENT
+        /// object already at this txn's key -- a proven different-object conflict, not an unresolved PUT.
+        /// Fail every survivor loudly and do NOT wedge (this is a conclusive rejection, not an uncertain
+        /// outcome): the id is a safe gap, the cache is unchanged, and the lane stays usable.
+        complete_error(survivors, std::current_exception());
+        return;
+    }
     switch (outcome)
     {
         case CasWriteOutcome::Committed:

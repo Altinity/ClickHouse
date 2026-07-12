@@ -854,6 +854,7 @@ The server successfully detected this situation and will download merged part fr
     M(CasConditionalWriteDefiniteFailure, "CA conditional writes whose single HTTP attempt classified DefiniteFailure (a whitelisted malformed-request/entity-too-large/access-denied rejection, proving the request was never applied)", ValueType::Number) \
     M(CasConditionalWriteUnresolved, "CA conditional writes whose single HTTP attempt classified Unresolved (PreconditionFailed/NoSuchKey, timeout, connection loss, 5xx, or an unrecognized error) — the caller resolves the exact key before any reissue", ValueType::Number) \
     M(CasConditionalWriteSdkRetries, "CA conditional-write SDK-level retries observed; MUST stay zero under the single-attempt policy (RFC cas-s3-timeout-retry-control) — the single-attempt client's retry strategy always refuses, but every consultation about a retry beyond attempt 1 is counted here as a live tripwire", ValueType::Number) \
+    M(CasConditionalWriteFenceLostPostWrite, "CA conditional writes whose attempt classified Committed but the FINAL post-write fence check failed, so the controller reported Unresolved — the spec §Late Predecessor PUT best-effort count of responses observed after the local mount fence was lost", ValueType::Number) \
     M(S3GetObjectTagging, "Number of S3 API GetObjectTagging calls.", ValueType::Number) \
     M(S3CreateMultipartUpload, "Number of S3 API CreateMultipartUpload calls.", ValueType::Number) \
     M(S3UploadPartCopy, "Number of S3 API UploadPartCopy calls.", ValueType::Number) \

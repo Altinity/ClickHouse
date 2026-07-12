@@ -811,6 +811,9 @@ public:
     /// friend hack. Recovers the table (like any real read) if not already cached.
     uint64_t refRecoveryRestartsForTest(const RootNamespace & ns);
     bool refLaneWedgedForTest(const RootNamespace & ns);
+    /// (I1) The object key of the current wedge for `ns`, or empty when the lane is not wedged -- lets a
+    /// test land a DIFFERENT object at the exact wedged key to exercise resolve-time CORRUPTED_DATA.
+    String wedgedKeyForTest(const RootNamespace & ns);
 
     /// Task 11 test seam: blocks until every background snapshot-publish attempt dispatched so far for
     /// `ns` has settled. Needed only by tests that exercise the REAL background dispatch (production
