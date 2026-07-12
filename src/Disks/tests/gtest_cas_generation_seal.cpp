@@ -2,6 +2,7 @@
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGenerationSeal.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFormat.h>
+#include <cas_format.pb.h>
 #include <Common/Exception.h>
 
 namespace DB::ErrorCodes
@@ -10,6 +11,7 @@ extern const int CORRUPTED_DATA;
 }
 
 using namespace DB::Cas;
+namespace Proto = ::clickhouse::cas::format;
 
 namespace
 {
@@ -85,13 +87,18 @@ TEST(CasGenerationSeal, ShardCoverageIncarnationRoundTrips)
 
 TEST(CasFoldSeal, RejectsOutOfRangeFoldedTokenType)
 {
-    CasFoldSeal in = sampleFoldSeal();
-    /// Wire an out-of-range folded token type (valid enumerators are 1..3). encodeFoldSeal only
-    /// static_casts the enum to a uint32, so the bad value reaches the wire; decode must reject it.
-    in.per_ns_shard["ns1/0"].folded_token = Token{"tok-a", static_cast<TokenType>(99)};
+    /// Built directly against the proto (not through encodeFoldSeal, which does not itself validate
+    /// the enum): decode alone must be the enforcement point, so this stays a real regression test even
+    /// if the encoder later grows symmetric validation.
+    Proto::FoldSealProto msg;
+    auto * hdr = msg.mutable_header();
+    hdr->set_magic(magicFor(FormatId::FoldSeal));
+    hdr->set_compatibility_version(currentCompatibilityVersion());
+    /// Valid folded token types are 1..3.
+    msg.add_per_ns_shard()->set_folded_token_type(99);
     try
     {
-        decodeFoldSeal(encodeFoldSeal(in));
+        decodeFoldSeal(msg.SerializeAsString());
         FAIL() << "expected CORRUPTED_DATA for an out-of-range folded token type";
     }
     catch (const DB::Exception & e)
@@ -102,15 +109,15 @@ TEST(CasFoldSeal, RejectsOutOfRangeFoldedTokenType)
 
 TEST(CasFoldSeal, RejectsOutOfRangeNsCleanupState)
 {
-    CasFoldSeal in = sampleFoldSeal();
-    RefNsCleanupItem item;
-    item.ns = RootNamespace{"ns9"};
-    item.remove_txn_id = RefTxnId{4, 5};
-    item.state = static_cast<RefNsCleanupState>(7);   /// valid: 1 (Pending), 2 (Completed)
-    in.ns_cleanup_items["k"] = item;
+    Proto::FoldSealProto msg;
+    auto * hdr = msg.mutable_header();
+    hdr->set_magic(magicFor(FormatId::FoldSeal));
+    hdr->set_compatibility_version(currentCompatibilityVersion());
+    /// Valid states are 1 (Pending), 2 (Completed).
+    msg.add_ns_cleanup_items()->set_state(7);
     try
     {
-        decodeFoldSeal(encodeFoldSeal(in));
+        decodeFoldSeal(msg.SerializeAsString());
         FAIL() << "expected CORRUPTED_DATA for an out-of-range ns-cleanup state";
     }
     catch (const DB::Exception & e)
