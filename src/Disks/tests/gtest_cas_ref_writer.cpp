@@ -191,7 +191,13 @@ public:
                 block_cv.wait(lk, [&] { return !block_armed; });
             }
         }
-        return CountingBackend::putIfAbsent(key, bytes, meta);
+        const PutResult r = CountingBackend::putIfAbsent(key, bytes, meta);
+        {
+            std::lock_guard g(block_mutex);
+            block_call_completed = true;
+        }
+        block_cv.notify_all();
+        return r;
     }
 
     /// "Deliver" the earlier ambiguous write: the request DID eventually land server-side, the caller
@@ -214,6 +220,7 @@ public:
         block_substr = substr;
         block_armed = true;
         block_entered = false;
+        block_call_completed = false;
     }
     void awaitBlockEntered()
     {
@@ -228,6 +235,15 @@ public:
         }
         block_cv.notify_all();
     }
+    /// Blocks until the PREVIOUSLY-blocked `putIfAbsent` call has actually RETURNED (not merely been
+    /// unblocked) -- i.e. its underlying `CountingBackend::putIfAbsent` has completed. Deterministic,
+    /// sleep-free way to observe a detached background caller's own work finishing when the TEST no
+    /// longer holds anything (e.g. a Store handle) that call would otherwise let it wait on.
+    void awaitBlockedCallCompleted()
+    {
+        std::unique_lock lk(block_mutex);
+        block_cv.wait(lk, [&] { return block_call_completed; });
+    }
 
 private:
     std::mutex block_mutex;
@@ -235,6 +251,7 @@ private:
     String block_substr;
     bool block_armed = false;
     bool block_entered = false;
+    bool block_call_completed = false;
 };
 
 }
@@ -698,6 +715,42 @@ TEST(RefWriterSnapshotPublish, PublicationNeverBlocksConcurrentAppend)
     backend->releaseBlock();
     store->waitForSnapshotPublishSettleForTest(ns);
     EXPECT_TRUE(listGreatestSnapshotIdForTest(*backend, layout, ns).has_value());
+}
+
+/// Review caution (T10 review): a dispatched background publish must never outlive the Store object
+/// it operates on -- `maybeScheduleSnapshotPublish` captures `shared_from_this()` BY VALUE into the
+/// dispatch lambda specifically to guarantee this (the classic "background thread references a
+/// dangling owner" shutdown segfault, avoided here since a shared_ptr copy keeps the object alive for
+/// as long as the thread holds it, regardless of what every OTHER holder does). Proves it directly:
+/// blocks a dispatched publish mid-PUT, drops the TEST's own (only) Store handle while still blocked,
+/// and confirms via a `weak_ptr` that the Store demonstrably survives on the blocked thread's own
+/// reference alone. Then unblocks it with no live Store handle anywhere in this test any more -- a
+/// dangling-pointer crash here would abort the whole test binary, the strongest possible signal for
+/// this specific hazard.
+TEST(RefWriterSnapshotPublish, PublishThreadOutlivesDroppedStoreHandleWithoutCrashing)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const RootNamespace ns{"srv1/publish_outlives_store"};
+    PoolConfig config;
+    config.snapshot_log_count_threshold = 3;
+    config.snapshot_log_bytes_threshold = 1ULL << 40;
+    config.snapshot_min_log_age_ms = 0;
+    auto store = openStoreWithConfig(backend, config);
+
+    backend->armPutBlock("_snap/");
+    publishEmptyPart(store, ns, "a");
+    publishEmptyPart(store, ns, "b");   /// tail reaches 4 (> 3) -> dispatches a background publish
+    backend->awaitBlockEntered();       /// stuck mid-PUT, holding its OWN shared_ptr<Store> copy
+
+    std::weak_ptr<Store> weak_store = store;
+    store.reset();   /// drop the ONLY Store handle this test holds
+    EXPECT_FALSE(weak_store.expired())
+        << "the blocked background thread's own shared_ptr copy must keep the Store alive";
+
+    backend->releaseBlock();
+    /// Deterministic, sleep-free: waits for the blocked call to actually RETURN (not merely unblock),
+    /// entirely through the backend -- this test holds no Store handle to wait on any more.
+    backend->awaitBlockedCallCompleted();
 }
 
 /// ===================================================================================
