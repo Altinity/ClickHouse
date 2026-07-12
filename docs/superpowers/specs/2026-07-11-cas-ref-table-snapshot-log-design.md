@@ -10,6 +10,8 @@ doc_type: 'reference'
 # CAS Ref Table Snapshot and Log Design {#cas-ref-table-snapshot-log-design}
 
 **Date:** 2026-07-11
+**Revised:** 2026-07-12 (rev.2 — independent adversarial review folded in; see
+[Review Record](#review-record-2026-07-12))
 **Branch:** `cas-gc-rebuild`
 **Status:** proposed Phase 1 design
 
@@ -293,10 +295,17 @@ nondeterministic value.
 A `Removed` snapshot contains no committed refs or precommits. A later `namespace_birth` log with an id
 greater than that snapshot recreates the namespace on the same continuous timeline.
 
-The snapshot has a configurable hard encoded-size limit. Phase 1 does not publish an oversized
-snapshot, records the reason, and retains all required logs; this does not fail ref-delta intake.
-Splitting a snapshot into indexed immutable chunks is a Phase 2 optimization and must preserve the same
-logical format and recovery equation.
+The snapshot has a configurable hard encoded-size limit, and the same complete-table limit class
+bounds the `remove_namespace` transaction. Phase 1 therefore refuses to create a table state that
+could exceed it: an `owner_transition` that would grow the deterministic complete-table encoding
+beyond a configured admission budget (a safety margin below the hard limit) fails closed with a clear
+error before any object is created. This keeps every reachable table permanently snapshottable and
+removable. If an oversized state nevertheless exists (the limit was lowered, or the budget was
+misconfigured), Phase 1 does not publish the oversized snapshot, records the reason, retains all
+required logs, and keeps ref-delta intake working; such a table also cannot be removed until the limit
+is raised, because the removal body shares the limit class. Splitting a snapshot into indexed
+immutable chunks is a Phase 2 optimization and must preserve the same logical format and recovery
+equation.
 
 ## Transaction Log Format {#transaction-log-format}
 
@@ -360,8 +369,8 @@ and non-canonical escaping are rejected.
 ### Namespace Birth {#namespace-birth}
 
 The first `namespace_birth` changes the empty state to `Live`. After `remove_namespace`, another
-`namespace_birth` may change `Removed` back to `Live` only after the existing `GC` cleanup item for the
-exact `remove_txn_id` has durably reached `Completed`. Completion means no worker or retry can issue
+`namespace_birth` may change `Removed` back to `Live` only after the `GC` namespace-cleanup item for
+the exact `remove_txn_id` has durably reached `Completed`. Completion means no worker or retry can issue
 another delete for that removal. Observing an empty physical prefix is not sufficient.
 The birth transaction normally also adds the first precommit. Its strictly greater `RefTxnId`, rather
 than a separate lifetime identifier or a `GC` round read by the writer, provides the ordering fence.
@@ -410,15 +419,17 @@ precommit. Applying those transitions removes their payloads; `remove_namespace`
 owner sets to be empty and changes `Live` to `Removed`. Until a later `namespace_birth`, it is the last
 valid transaction. The resulting state records this transaction's `RefTxnId` as `remove_txn_id`.
 
-The final operation is also a durable request keyed by `{namespace, remove_txn_id}` to the existing
-`GC` namespace-cleanup machinery. It
+The final operation is also a durable request keyed by `{namespace, remove_txn_id}` to the `GC`
+namespace-cleanup item specified in [Clean Old Ref Objects](#gc-step-clean-ref-objects). It
 does not emit another manifest-edge delta: the preceding exact transitions already describe all edge
 removals. After those removals pass through the normal `GC` protocol, the marker lets `GC` reclaim the
-physical `@cas@` namespace using its existing rules.
+physical `@cas@` namespace through that item.
 
 The transaction is `O(number_of_owners)` bytes but remains one object-store create. Its hard size limit
 is the same class of limit as a complete table snapshot. If the deterministic body does not fit, Phase
-1 fails before object creation; chunked namespace removal is Phase 2 work.
+1 fails before object creation; the owner-admission budget in [Snapshot Format](#snapshot-format)
+exists precisely so a correctly configured pool never reaches this state. Chunked namespace removal is
+Phase 2 work.
 
 Repeated API removal observes the cached `Removed` state and returns success without appending a second
 transaction. Any operation other than a valid later `namespace_birth` while state is `Removed` is
@@ -466,14 +477,31 @@ requirement for paginated `LIST`, not merely a batching optimization.
 
 - At most one ref-log `PUT` for a table may have an unresolved result.
 - The writer selects the next queue batch and allocates its `RefTxnId` under the table lock.
-- It does not start a later ref-log `PUT` for that table until the earlier result is successful,
-  definitely failed, or resolved by an exact-key `GET`.
+- It does not start a later ref-log `PUT` for that table until the earlier result is resolved. Exactly
+  three resolutions exist. Success is a successful `putIfAbsent` response or an exact-key `GET`
+  observing the identical deterministic bytes. Definite failure is a synchronous conclusive rejection
+  by the store that proves the attempt was never applied (a `4xx`-class protocol rejection); only this
+  outcome may leave the allocated id as a safe gap. Everything else — a timeout, a connection loss, a
+  `5xx` response, or an exact-key `GET` that finds the key absent — leaves the result unresolved,
+  because the store may still apply the original request later. An unresolved result wedges the
+  table's append lane.
 - A definitely failed transaction does not change cached state. Its unused id may remain a gap.
 - For an operation that returns success, the linearization point is a successful `putIfAbsent`, or an
   exact-key `GET` confirming identical deterministic bytes, followed by a successful post-write local
   mount-fence check.
 - Every operation in one batch shares that transaction and linearization point.
 - Different tables are independent and may have unresolved `PUT`s concurrently.
+
+A wedged lane exits only through the bounded budgets of the
+[CAS S3 Timeout and Retry Control RFC](2026-07-12-cas-s3-timeout-retry-control-rfc.md): re-observation
+of the exact key yielding identical bytes resolves the append as success, and the writer applies the
+transaction to cached state before allocating the next table id; a conclusive rejection resolves it as
+definite failure. If the budgets are exhausted first, the caller receives an uncertainty exception —
+uncertainty, not proof of non-commit — and the lane stays wedged. Unmounting with a wedged lane ends
+the epoch and converts the in-flight request into the documented
+[Late Predecessor PUT](#late-predecessor-put) case. Declaring an absent key failed and moving on is
+forbidden: the old request could then materialize below already-published table logs, which is exactly
+the missed-transaction hazard the append rule exists to prevent.
 
 Consequently, in one mounted writer process, durable ref logs of one table are published in strictly
 increasing `RefTxnId` order. The object store is not expected to impose this cross-key order; the writer
@@ -496,6 +524,15 @@ linearization does not close this window because it orders requests only inside 
 consistency also does not make an unfinished `PUT` visible to an earlier `LIST`. As specified in Phase
 1, neither the successor nor `GC` is guaranteed to revisit that old key after advancing past it, so the
 transaction can be missed.
+
+The impact class is asymmetric. A missed removal only over-protects: the affected manifest stays alive
+until a later view repairs the account. A missed addition under-protects: the fold account never
+learns the `+1`, so the manifest can be scheduled for deletion while a durable log names it — a
+data-loss class, not a leak class. The surviving defense is that destructive decisions never trust the
+fold account alone: the orphan-manifest sweep and the final pre-delete recheck read table tails
+directly, so a late log that has materialized by recheck time still protects its manifest. Loss
+therefore requires the same object to stay invisible across both the fold enumeration and the final
+recheck, which realistic S3 completion times make improbable but which Phase 1 cannot exclude.
 
 This is an open correctness limitation, not an S3 consistency guarantee or a case handled by `GC`.
 The implementation must expose fault injection and a best-effort counter for responses observed after
@@ -544,6 +581,7 @@ if the result is uncertain:
   GET the exact key
   identical bytes mean success
   different bytes mean corruption
+  absence leaves the result unresolved: retry the same key within budgets; never reuse or skip the id
 apply the transaction to memory
 invalidate affected reader facades
 unlock
@@ -575,9 +613,18 @@ local builds, and rejects further ordinary mutations. If the append fails, the n
 `remove_namespace` hands that work to `GC`.
 
 The successful ref-protocol cost is one S3 create and `O(number_of_owners)` uploaded bytes. Recreation
-requires durable `Completed(namespace, remove_txn_id)` from the existing cleanup protocol, then appends
+requires durable `Completed(namespace, remove_txn_id)` from the namespace-cleanup item, then appends
 a `namespace_birth` whose `RefTxnId` is greater than the preceding removal. Prefix emptiness may be
 checked as a diagnostic but is not the authority.
+
+## Read-Only Consumers {#read-only-consumers}
+
+`fsck`, `CasInspect`, offline repair, external checkers, and a read-only mount consume table state with
+the same recovery equation as the writer: one namespace `LIST`, the newest valid snapshot, and replay
+of the later tail. They apply the same validation, fail closed on the same corruption conditions,
+never append, and carry no destructive authority. There is no cheaper freshness probe: with no mutable
+head object, observing a table's current state from outside the mounted writer always costs at least
+the `LIST`. Tooling that previously read one mutable shard object per table must budget for that.
 
 ## GC Round Algorithm {#gc-round-algorithm}
 
@@ -627,7 +674,9 @@ Safety comes from the writer append rule, not from guessing the end of the list:
 
 - One fenced writer owns a table at a time.
 - Under the table lock it makes log ids durable in strictly increasing order.
-- It does not make a later table log durable while the result of an earlier log is unresolved.
+- It does not make a later table log durable while the result of an earlier log is unresolved, and
+  key absence on `GET` does not count as resolution
+  (see [Writer-Side Linearization](#writer-side-linearization)).
 - Within one mounted writer, logs are immutable and a new log is never inserted at or below an already
   durable table log id.
 
@@ -680,7 +729,7 @@ namespace-removal transitions therefore require no special handling in `GC`: eve
 `ManifestRef` is present in the transaction body, is qualified by the transaction namespace, and
 directly emits its own `ManifestId` `-1`. The final
 `remove_namespace` operation changes lifecycle, emits no additional edge delta, and records the input
-for the existing physical namespace-cleanup path. The candidate `GC` fold persists that cleanup work
+for the namespace-cleanup item. The candidate `GC` fold persists that cleanup work
 before the source log can be removed.
 
 If a required manifest body is needed by the existing reachability fold and is missing or invalid, the
@@ -730,9 +779,12 @@ putIfAbsent _snap/<X>.proto
 on an uncertain result, GET and validate that exact key
 ```
 
-The next ref-intake round does not begin until publication succeeds or fails explicitly. A publication
-failure does not roll back the already adopted edge delta; it leaves every log in place and the next
-round may prepare the snapshot again. The snapshot is not named by or adopted through `gc/state`.
+Within one `GC` process, the next ref-intake round does not begin until publication succeeds or fails
+explicitly. This pacing rule binds only that process: it cannot be enforced across a leader change,
+and safety never depends on it — deterministic byte-identical construction and `putIfAbsent` make a
+late or duplicate publication by a deposed attempt harmless debris that a later round removes. A
+publication failure does not roll back the already adopted edge delta; it leaves every log in place
+and the next round may prepare the snapshot again. The snapshot is not named by or adopted through `gc/state`.
 Its identifier `X` is never greater than that table's cursor adopted by the winning commit.
 
 Adopting a `-1` edge does not delete its manifest or content. It only changes input to the existing
@@ -743,8 +795,8 @@ reachability accounting. The existing later-round rules remain responsible for:
 - waiting the required generation or grace interval;
 - cancelling a planned deletion if a new `+1` appears;
 - deleting content and manifests only after the ordinary final recheck;
-- processing an adopted `remove_namespace` marker through the existing `@cas@` namespace cleanup after
-  its explicit owner removals are safe.
+- processing an adopted `remove_namespace` marker through the namespace-cleanup item after its
+  explicit owner removals are safe.
 
 Thus ref intake adds no new direct deletion path.
 
@@ -757,18 +809,29 @@ removed only when:
 1. The currently durable `last_folded_ref_id[table]` covers its `RefTxnId`, so its edge delta cannot be
    lost.
 2. A durable table snapshot `X` exists and the log identifier is no greater than `X`.
-3. If the transaction contains `remove_namespace`, its existing `GC` namespace-cleanup work item is
+3. If the transaction contains `remove_namespace`, its `GC` namespace-cleanup work item is
    already durable.
 
 Cleanup uses exact keys gathered by the round's one global `LIST` and groups up to 1000 keys in one
 backend batch-delete request. Per-key results are checked. Failed deletion is harmless debris and is
 retried by a later round. Once snapshot `X` is durable, snapshots older than `X` may be deleted as well.
 
-The physical namespace-cleanup item is identified by `{namespace, remove_txn_id}` and has a durable
-terminal `Completed` state. Reaching `Completed` means all deletion requests for that item have
-finished and no retry may issue another delete. A later `namespace_birth` is rejected until that exact
-completion is observed; merely observing an empty prefix is insufficient. Therefore a retry belonging
-to an old removal cannot delete objects from a recreated namespace.
+The physical namespace-cleanup item is identified by `{namespace, remove_txn_id}` and is new protocol
+state added by this design, not a property the current tombstoned-shard reclaim already provides:
+today `dropNamespace` tombstones shards and `reclaimDroppedShards` reclaims an empty tombstoned shard,
+with no durable per-removal item. Phase 1 adds the item with two durable states, `Pending` and
+terminal `Completed`, carried in the ordinary `GC` fold artifacts. While `Pending`, the `GC` leader
+executes bounded enumerate-and-delete passes over the removed namespace's physical prefixes; a leader
+change simply re-executes the item, which is safe because recreation is still blocked. `Completed` is
+written only after a pass observes nothing left to delete; after it is durable, no worker may start
+another pass for that item.
+
+Two properties make a straggling delete from a deposed cleanup pass harmless. First, deletion always
+uses exact keys captured by that pass's own enumeration; a prefix wildcard is never a delete
+primitive. Second, every object key created after recreation contains the successor `writer_epoch`
+(ref logs and snapshots through `RefTxnId`, manifests through `ManifestRef`), so an exact key
+enumerated in the removed incarnation cannot name a recreated object. A later `namespace_birth` is
+rejected until the exact completion is observed; merely observing an empty prefix is insufficient.
 
 ## Concurrent Startup And Cleanup {#concurrent-startup-and-cleanup}
 
@@ -816,6 +879,11 @@ owners in newest snapshot
 
 The last term protects a manifest whose owner disappeared in a transaction not yet present in the
 durable `GC` fold. A namespace-removal transaction names every such owner explicitly.
+
+The tail view races a concurrent append: the sweep's `LIST` may complete before the newest transaction
+of a table is durable. A manifest created for a build whose first owner the sweep has not yet seen is
+therefore protected by the existing young-manifest sweep window, not by the tail view; the tail view
+extends protection backward in time, it does not replace the freshness fence.
 
 The sweep uses the table's durable `last_folded_ref_id` as an additional condition before deleting a
 retired manifest. A missing snapshot body, invalid transaction, or incomplete ordered view causes the
@@ -938,8 +1006,11 @@ both startup replay time and backend metadata pressure; dollar request cost alon
 
 | Failure | Required behavior |
 |---|---|
-| Writer log create fails | Do not change cached state; propagate the exception |
-| Writer log result is uncertain | `GET` the exact attempted key; identical bytes succeed, different bytes are corruption |
+| Writer log create is conclusively rejected before apply | Definite failure: do not change cached state; propagate the exception; the unused id is a safe gap |
+| Writer log result is uncertain | `GET` the exact attempted key; identical bytes succeed, different bytes are corruption, absence leaves the result unresolved |
+| Retry budgets exhaust while a result is unresolved | Propagate an uncertainty exception; the table's append lane stays wedged; no later table id is allocated |
+| A wedged append is later observed durable | Apply the transaction to cached state before unwedging; the earlier caller-visible outcome was uncertainty, not failure |
+| Writer unmounts while a lane is wedged | The epoch ends; the in-flight request becomes the documented late-predecessor case |
 | Writer log key already contains different bytes | Corruption; never skip forward and reuse the logical operation under another id |
 | Another same-table append arrives while a result is unresolved | Keep it queued; do not allocate or publish a later table transaction |
 | A predecessor ref-log `PUT` completes after successor recovery | Known unresolved Phase 1 limitation; do not claim that ordinary `GC` detects or repairs it |
@@ -947,7 +1018,7 @@ both startup replay time and backend metadata pressure; dollar request cost alon
 | Namespace-removal body exceeds its hard limit | Fail before object creation; leave the namespace `Live` |
 | Writer stops before exact precommit removal | Successor fences the epoch, recovers the table, and appends the remaining exact removals |
 | Writer stops after durable log create | Recovery replays the log |
-| Writer stops after durable `remove_namespace` | `GC` folds its exact removals and resumes existing namespace cleanup |
+| Writer stops after durable `remove_namespace` | `GC` folds its exact removals and executes the namespace-cleanup item |
 | Snapshot create fails | Keep all logs; writer recovery remains unchanged |
 | Snapshot create result is uncertain | `GET` the exact snapshot `X` key and validate its deterministic bytes |
 | Greatest snapshot `X` contains an invalid body | Corruption; do not fall back or clean covered objects |
@@ -1017,8 +1088,13 @@ It must not make writer correctness depend on `GC` availability or `gc/state`.
 
 ## Implementation Impact {#implementation-impact}
 
+- Land the [CAS S3 Timeout and Retry Control RFC](2026-07-12-cas-s3-timeout-retry-control-rfc.md)
+  controller first: single-attempt conditional writes, exact-key resolution, and lease-budget gating
+  are prerequisites of the writer linearization rule, not optimizations of it.
 - Add shared strong types and canonical hexadecimal renderers for `BuildId`, `RefTxnId`, and
   `ManifestRef`.
+- Enforce the complete-table admission budget at `owner_transition` time so every reachable table
+  stays below the snapshot and removal hard limits.
 - Change the unreleased manifest layout to the canonical hexadecimal form.
 - Add `RefTableSnapshot`, `RefLogTxn`, deterministic codecs, and one shared transition
   validator used by writer recovery, `GC`, inspection, and repair.
@@ -1033,8 +1109,9 @@ It must not make writer correctness depend on `GC` availability or `gc/state`.
   epoch cleanup.
 - Encode `dropNamespace` as one body transaction containing exact owner removals followed by
   `remove_namespace`.
-- Route adopted `remove_namespace` into the existing `GC` `@cas@` namespace-cleanup machinery; the
-  writer performs no physical namespace deletion.
+- Add the durable `{namespace, remove_txn_id}` namespace-cleanup item (`Pending`/`Completed`,
+  exact-key deletion only) to the `GC` fold artifacts and route adopted `remove_namespace` into it;
+  the writer performs no physical namespace deletion.
 - Extend ordinary `GC` fold input with deterministic ref edge events and one `last_folded_ref_id` per
   table; do not add complete table state to `GC` state.
 - Add optional one-table snapshot construction during ref-log intake.
@@ -1088,7 +1165,7 @@ Replay(newest visible valid snapshot, surviving later logs)
 - cleanup requiring both snapshot and adopted fold coverage;
 - no content deletion action in ref intake;
 - explicit namespace-removal owner transitions followed by the lifecycle change;
-- durable handoff of the final marker to existing namespace cleanup before ref-log deletion.
+- durable handoff of the final marker to the namespace-cleanup item before ref-log deletion.
 
 Its adversarial configuration also permits `LatePredecessorPut` after enumeration has advanced. The
 resulting missed-delta trace remains an expected counterexample until a cross-epoch fencing protocol is
@@ -1123,7 +1200,8 @@ Keep these old models as historical regressions rather than adapting their retir
 
 Required sabotage cases include deleting logs before snapshot `X` is durable, selecting a snapshot by
 `LIST` without validating its body, folding a partial transaction, advancing a table cursor before its
-delta is adopted, starting a later same-table `PUT` while an earlier result is unresolved, publishing
+delta is adopted, starting a later same-table `PUT` while an earlier result is unresolved, resolving an uncertain
+append as definitely failed on key absence, publishing
 two logs of one table out of id order, advancing one table from a global maximum observed in another
 table, cleaning a log before cursor coverage, treating build death as owner removal, emitting content
 deletion directly from ref intake, and allowing an operation other than `namespace_birth` while
@@ -1157,6 +1235,13 @@ must retain the late-predecessor trace rather than silently strengthening the mo
 - Warm isolated mutation performs one create and zero ref reads.
 - `B` compatible mutations perform one create.
 - Exact uncertain-write resolution.
+- An uncertain create with an absent exact key stays unresolved: the lane wedges, the id is not
+  reused, and no later same-table id is allocated.
+- A synchronous conditional-create rejection resolves as definite failure and leaves a safe id gap.
+- A wedged append later observed durable is applied to cached state before the next same-table
+  transaction is allocated.
+- An `owner_transition` that would exceed the complete-table admission budget fails closed before any
+  object is created.
 - Unknown future log and snapshot versions fail closed.
 - The backend capability probe rejects unordered pages, broken continuation, and missing
   read-after-write `LIST` visibility.
@@ -1189,10 +1274,12 @@ must retain the late-predecessor trace rather than silently strengthening the mo
 - Exact stale-precommit cleanup emits direct decrements without table reconstruction.
 - Namespace removal emits all required decrements directly from its transaction body without loading a
   table snapshot for delta extraction.
-- Its final marker creates durable existing `GC` namespace-cleanup work before the source log is
+- Its final marker creates a durable `GC` namespace-cleanup item before the source log is
   eligible for deletion.
 - A namespace cannot be recreated while its exact cleanup item is pending; after durable completion,
   injected retries from that item issue no deletion against the recreated namespace.
+- A straggling exact-key delete captured before removal cannot name any post-recreation object:
+  recreated keys carry the successor `writer_epoch`.
 - A losing `GC` attempt publishes no snapshot; a winning attempt publishes without adding a snapshot
   reference to `gc/state`.
 - A failed fold commit leaves every newly covered log intact.
@@ -1233,11 +1320,53 @@ must retain the late-predecessor trace rather than silently strengthening the mo
 - Ref folding never directly deletes content or manifests.
 - Local writer batching remains because it is the primary normal-operation S3 optimization.
 - Writer-side per-table linearization and at most one unresolved append are required for paging safety.
+- An uncertain ref-log create is never resolved as failed by key absence; the append lane wedges until
+  exact-key observation of the identical bytes, conclusive rejection, or unmount.
+- The complete-table admission budget keeps every reachable table snapshottable and removable in
+  Phase 1.
+- The namespace-cleanup item (`Pending`/`Completed`, exact-key deletion) is new protocol state added
+  by this design.
 - A predecessor S3 `PUT` completing after successor recovery is a known unresolved Phase 1 correctness
   limitation; the design adds neither `_seal` nor `_head` as a provisional workaround.
 - Namespace removal is one body transaction containing every exact owner removal; old-precommit cleanup
   is one or more bounded transactions containing exact removals.
 - The final `remove_namespace` operation delegates physical `@cas@` namespace reclamation to the
-  existing `GC` cleanup path; the writer only makes the logical transition durable.
+  `GC` namespace-cleanup item; the writer only makes the logical transition durable.
 - Phase 1 uses one complete snapshot object and one coherent in-memory table state.
 - Complex indexing, sharding, and compaction are deferred until measurements justify Phase 2.
+
+## Review Record (2026-07-12) {#review-record-2026-07-12}
+
+Rev.2 folds in an independent adversarial review (Claude Fable 5) performed against rev.1 and the
+current `cas-gc-rebuild` sources. The rev.1 draft was authored with Codex, so the review was
+deliberately run by a different model. Verified as sound: the `_log`-before-`_snap`
+publish-before-delete cleanup proof (checked by induction over the snapshot chain, through multi-page
+`LIST` interleavings and repeated snapshot generations); benign snapshot-publication races
+(byte-identical determinism plus `putIfAbsent`); per-table cursor safety under paginated enumeration
+given the writer append rule; the durable-monotone `writer_epoch` allocator already present in
+`CasStore`.
+
+Findings folded in as rev.2 amendments:
+
+1. Blocker (text): "definitely failed" was undefined and the failure table omitted the absent-key
+   case, permitting an implementation that converts a timeout into a same-epoch missed-transaction
+   hazard (cache/durable divergence, missed `GC` delta, false-negative ACK resurrected by recovery).
+   Resolved by the three-outcome resolution rule and lane wedging in
+   [Writer-Side Linearization](#writer-side-linearization).
+2. Major: the namespace-cleanup item was described as existing machinery; the current
+   tombstoned-shard reclaim provides no durable `{namespace, remove_txn_id}` `Completed` state.
+   Resolved by specifying the item as new protocol state with exact-key deletion and epoch-disjoint
+   recreated keys in [Clean Old Ref Objects](#gc-step-clean-ref-objects).
+3. Major: the shared complete-table size limit left an oversized table neither snapshottable nor
+   removable. Resolved by the fail-closed admission budget in [Snapshot Format](#snapshot-format).
+4. Minor: the snapshot-publication pacing rule is per-process and advisory; stated explicitly in
+   [Step 5](#gc-step-continue-protocol).
+5. Minor: fresh-manifest protection remains the young-manifest sweep window; the tail view does not
+   replace it. Stated in [Orphan Manifest Protection](#orphan-manifest-protection), together with the
+   asymmetric impact class of the late-predecessor limitation (a missed `+1` is data-loss class,
+   mitigated by direct tail reads at the final recheck) in
+   [Late Predecessor PUT](#late-predecessor-put).
+6. Minor: read-only consumers and their request-cost implication documented in
+   [Read-Only Consumers](#read-only-consumers).
+7. Sequencing: the timeout-and-retry RFC is a prerequisite of the linearization rule; ordered first in
+   [Implementation Impact](#implementation-impact).
