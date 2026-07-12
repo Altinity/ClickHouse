@@ -1,324 +1,234 @@
 ---
-description: 'Design for replacing CAS ref-shard overwrites with incarnation-scoped logs and atomically adopted snapshots'
-sidebar_label: 'CAS Ref Snapshot Log'
+description: 'Design for append-only CAS refs transferred directly into the adopted GC fold'
+sidebar_label: 'CAS Ref Log Handoff'
 sidebar_position: 20260710
 slug: /superpowers/specs/cas-ref-snapshot-log-design
-title: 'CAS Ref Snapshot Log Design'
+title: 'CAS Ref Log Handoff Design'
 doc_type: 'reference'
 ---
 
-# CAS Ref Snapshot Log Design {#cas-ref-snapshot-log-design}
+# CAS Ref Log Handoff Design {#cas-ref-log-handoff-design}
 
 **Date:** 2026-07-10
 **Revised:** 2026-07-11
 **Branch:** `cas-gc-rebuild`
-**Status:** revised design after brainstorming and protocol review
-**Scope:** replace the mutable `RootShardManifest` ref store with namespace-incarnation-local
-append-only logs and exact snapshots adopted through the existing `GC` generation commit.
+**Status:** obsolete
+
+This design is obsolete. It is superseded by
+[CAS Ref Table Snapshot and Log Design](2026-07-11-cas-ref-table-snapshot-log-design.md).
 
 ## Summary {#summary}
 
-The current ref path rewrites a growing `RootShardManifest` for every mutation. This design replaces
-that object with:
+`cas/refs` is only an append-only inbox from the mounted writer to `GC`. It contains no snapshots,
+mutable heads, cleanup state, or long-lived compacted state.
+
+The authoritative namespace state is:
 
 ```text
-writer_state(namespace, incarnation)
-    = exact_adopted_snapshot(namespace, incarnation)
-    + contiguous_writer_log_tail_after_snapshot
+adopted GC ref fold + contiguous writer-log tail
 ```
 
-The protocol derives two views from those objects. The recovery view ends at the adopted fold cursor
-and is the only state that can authorize trim. The protection view replays the complete validated log
-tail and is the only state that destructive maintenance, including the orphan manifest sweep, may use.
+The writer commits an isolated normal mutation with one `_log` object and no ref-state read. Concurrent
+mutations are flat-combined into one bounded transaction, preserving the current request compression.
+During an ordinary `GC` round, `GC` reads a contiguous log prefix, incorporates its exact namespace
+state and reachability effects into the generation's own fold, adopts that generation through the
+existing single `gc/state` `CAS`, and removes the consumed `_log` objects in bounded delete batches.
 
-Normal writer mutations commit by creating exactly one object under `_log`. `GC` never allocates writer
-log sequence numbers. A `GC`-only semantic change, currently dead-precommit reclaim, commits only when
-`gc/state` adopts a write-once fold seal that names the exact already-durable snapshot containing that
-change.
-
-The physical log and snapshot paths include the namespace incarnation. Sequence numbers therefore start
-at one for every incarnation without colliding with an older incarnation at the same archive path.
-
-Large namespace drops use a durable lifecycle:
+This is one logical handoff:
 
 ```text
-Live -> Dropping(drop_id) -> Tombstoned
+writer _log prefix  --existing GC generation CAS-->  adopted GC ref fold
 ```
 
-The first drop record blocks new namespace mutations. Every removal chunk carries the same `drop_id`.
-Interruption leaves an unambiguous state that startup can resume.
+There is no second ref snapshot protocol. Before the `CAS`, the `_log` prefix remains authoritative.
+After the `CAS`, the GC fold is authoritative and the prefix is immediately removable. A stopped
+post-`CAS` delete is only physical debris cleanup; it is not another protocol phase.
 
-## Motivation {#motivation}
+Failed precommits are also writer-log state. The current writer records an exact removal before retiring
+the build. A newly mounted writer first fences the predecessor epoch, then appends one constant-size
+epoch clear in each affected namespace. `GC` never invents owner transitions.
 
-The current object at `cas/refs/<namespace>/<shard>` has three roles:
-
-- The current committed `RootRef` table.
-- The ordered `RootOwnerEvent` stream folded by `GC`.
-- The `CAS PUT` commit point for every ref mutation.
-
-The model is correct, but each mutation rewrites the complete object. The cost grows with the ref table
-and the untrimmed journal tail. On RustFS, repeatedly replacing objects above the inline threshold also
-leaves old backend incarnations and makes `cas/refs` dominate pool storage.
-
-The replacement must keep one durable commit object per writer mutation without keeping a hot mutable
-head object.
+`dropNamespace` appends one constant-size `remove_namespace` transaction. Replaying it atomically clears
+every committed and precommit binding and changes the incarnation to `Removed`. It does not serialize
+the owner list and does not require removal chunks, `drop_id`, `Dropping`, or `finish_drop`.
 
 ## Goals {#goals}
 
-- Remove large-object overwrites from the normal ref write path.
-- Keep one authoritative `_log` object per writer mutation.
-- Keep steady-state ref-state persistence at one object-store create and zero ref-state reads.
-- Preserve the owner-transition, fold-barrier, manifest-cleanup, and orphan-sweep semantics used today.
-- Make bounded multi-ref changes atomic in one namespace transaction.
-- Make large namespace drops bounded, durable, and re-drivable.
-- Let `GC` compact logs without becoming a competing writer-log sequencer.
-- Make snapshot adoption exact: an adopted generation names a specific snapshot key and hash.
-- Make namespace drop and recreation safe at the same archive path.
-- Fail closed on gaps, conflicting records, invalid state transitions, and corrupt adopted artifacts.
+- Replace growing `RootShardManifest` overwrites with small write-once append objects.
+- Keep the successful isolated existing-namespace path at one S3 create and zero ref-state reads.
+- Preserve flat-combining so a concurrent batch shares one S3 create.
+- Keep all logical owner transitions on the mounted writer.
+- Transfer consumed refs directly into the already-existing GC fold and then remove them from
+  `cas/refs`.
+- Make `dropNamespace` one logical ref mutation regardless of namespace cardinality.
+- Use the same fenced identity and canonical hexadecimal rendering for builds, manifests, and namespace
+  incarnations.
+- Preserve exact reachability accounting, orphan-manifest protection, namespace recreation, and
+  fail-closed recovery.
+- Bound resident ref-state memory and keep GC fold memory at fixed streaming buffers.
+- Keep Phase 1 mechanically simple even when that means rewriting the complete folded ref base.
+- Make GC ref-fold `PUT` count depend on target-sized base bytes, not changed-namespace count.
 
 ## Non-Goals {#non-goals}
 
-- No compatibility with the old `RootShardManifest` layout is required. The format has not shipped.
-- No compatibility with the unreleased decimal `writer_epoch/build_sequence` part-manifest key is
-  required; this design switches it to canonical `WriterId`.
-- No cross-namespace atomic rename. `republishRef` remains an idempotent sequence.
-- No adaptive namespace sharding or radix redesign.
+- No compatibility with the unreleased `RootShardManifest` or decimal manifest-key layouts.
 - No mutable `_head` object.
-- No writable recovery after loss of `gc/state`. That requires an explicit offline rebuild procedure.
-- No compatibility writer for shadow namespaces without `@cas@`.
+- No `_snap` service area under `cas/refs`.
+- No second adoption `CAS` for ref state.
+- No `GC`-generated writer records or implicit owner removal.
+- No cross-namespace atomic rename. `republishRef` remains idempotent and re-drivable.
+- No writable recovery after loss of an adopted `gc/state` baseline without an explicit rebuild.
 
-## Current Constraints {#current-constraints}
+## Delivery Phases {#delivery-phases}
 
-The implementation must preserve these properties:
+### Phase 1: KISS Protocol {#phase-1-kiss-protocol}
 
-- `RootShard::incarnation` prevents an old `GC` cursor from covering a newly created owner stream.
-- `RootShard::fence_round` is a newborn birth floor used by `GC` ordering.
-- `RootRef` contains `manifest_ref`, `mutable_files`, and `published_at_ms`.
-- `updateRefPayload` changes no reachability edge.
-- A precommit add is subject to the fold barrier until its manifest body can be expanded.
-- `Gc::reclaimAbandonedPrecommit` currently appends a durable precommit-removal event before folding it.
-- The orphan manifest sweep protects bodies named by unsealed removals as well as current owners.
-- `CachedPartFolderAccess` owns committed-view invalidation.
-- The mount lease and local write fence permit only one writer incarnation per server root.
-- `min_active` is a durable scalar floor over locally active build sequences.
+Phase 1 implements only the correctness boundary and the cheap writer path:
 
-The current shadow namespace implementation omits `@cas@`, although the documented archive layout
-includes it. The implementation must fix that before enabling this format.
+- Existing writer-local flat-combining appends one immutable log object per isolated operation or
+  compatible batch.
+- `GC` streams the complete adopted ref base, applies a bounded contiguous log prefix, writes one
+  complete replacement base, adopts it with the existing generation `CAS`, and deletes covered logs.
+- Idle and deferred rounds carry the exact parent base without reading or rewriting it.
+- The existing fixed GC defer bound batches sparse tails; Phase 1 adds no adaptive compaction or cache
+  policy.
+- Ref reads use the existing sparse `RunFile` index and a byte-bounded cache.
+- `clear_precommits_before` and `remove_namespace` are constant-size writer transitions applied while
+  streaming the full base.
+- A missing required manifest body aborts the complete tentative GC attempt; Phase 1 has no preflight or
+  partial-clamp subprotocol.
 
-## Safety Invariants {#safety-invariants}
+Phase 1 deliberately accepts `O(live_ref_bytes)` read, CPU, and write bytes for each productive ref
+handoff. This is the cost of removing a second index, delta-level protocol, and compaction policy. It
+does not change the ordinary warm writer budget: one create per isolated mutation, or `1/B` creates per
+flat-combined mutation, and zero ref-state reads.
 
-The protocol is governed by the following invariants.
+### Phase 2: Measured Optimizations {#phase-2-measured-optimizations}
 
-**I1. Writer mutation authority.** A writer mutation exists if and only if its `_log` object exists.
-There is no separate transaction body, payload body, or mutable head that can commit independently.
+Phase 2 is a separate follow-up design, enabled only after Phase 1 measurements show that full-base
+rewrite is the dominant cost. Candidate optimizations are delta `RunFile` levels, leveled compaction,
+sealed object sizes that remove `HEAD`, precommit-epoch summaries, Bloom or fence-pointer metadata,
+shared decoded-block reuse beyond the basic LRU, adaptive handoff thresholds, and preflight or
+per-namespace restart only if missing-body abort waste is observed in practice.
 
-**I2. One sequencer.** Only the mounted writer allocates `_log` sequence numbers. `GC` never appends to
-the writer log.
+No Phase 1 reader, writer, recovery rule, TLA+ invariant, or on-disk authority may depend on those
+optimizations. Phase 2 must preserve the same `adopted base + contiguous tail` abstraction and the same
+single generation `CAS`; it is a representation refinement, not a protocol prerequisite.
 
-**I3. Exact `GC` adoption.** A `GC`-only semantic change exists if and only if `gc/state` points to a
-fold seal that names the exact snapshot key and body hash containing the change.
+## Core Invariants {#core-invariants}
 
-**I4. Snapshot-before-adoption.** Every snapshot named by a fold seal is durable and verified before
-the `gc/state` `CAS` can adopt that seal.
+**I1. One writer commit object.** A writer mutation exists if and only if a durable operation in its
+`_log` object exists. One object may atomically contain a bounded flat-combined batch. Its key plus body
+are the complete operation encoding; there is no separate body commit or mutable head.
 
-**I5. Trim requires an exact recovery base.** A log record can be deleted only when the currently
-adopted fold seal names a valid snapshot for the same namespace incarnation with
-`snapshot.seq >= record.seq`.
+**I2. One sequencer.** Only the mounted writer allocates namespace log sequence numbers. `GC` never
+appends to the writer log.
 
-**I6. Incarnation isolation.** Every log and snapshot key contains its namespace incarnation. Records
-from an older incarnation can never be replayed in the state machine of a newer incarnation.
+**I3. Writer-only owner semantics.** Every owner add, move, payload update, removal, and namespace
+removal is a writer-log operation. `GC` only replays those operations.
 
-**I7. Contiguous replay.** From an empty base, replay starts at sequence one. From a snapshot at `N`,
-replay starts at `N + 1`. A missing record before the maximum observed sequence is an exception.
+**I4. One GC handoff.** The existing GC generation `CAS` co-adopts reachability runs, the fold seal, and
+the exact `RefBaseSet`. There is no independent ref adoption state.
 
-**I8. Validated transitions.** Startup, `GC`, `fsck`, and the writer use the same state-machine
-validator for durable records. A record whose state precondition is false is corruption. API-level
-idempotency is resolved before constructing a new record; it never makes a duplicate record valid.
+**I5. Fold before delete.** A writer-log object can be removed only when the currently adopted fold
+seal names a valid `RefBaseSet` whose namespace metadata row has the same incarnation and
+`folded_seq >= log_record.seq`.
 
-**I9. Durable drop exclusion.** Once `begin_drop` is committed, no normal ref or namespace-file
-mutation is permitted in that incarnation.
+**I6. Exact recovery base.** The fold seal names every authoritative base `RunRef`, its checksum, and
+non-overlapping row-key bounds. Consumers never select a run merely because it was found by `LIST`.
 
-**I10. No stale writer removal of a `GC`-reclaimed precommit.** A writer may remove a precommit only
-while the corresponding build is locally active. Retired precommits are reclaimed only through exact
-adopted `GC` snapshots.
+**I7. Contiguous replay.** Replay starts at `folded_seq + 1`, or at sequence one for an empty base. A
+gap before the maximum observed sequence is an exception and disables every destructive action for that
+namespace.
 
-**I11. Complete destructive protection.** A destructive scan uses the exact adopted snapshot plus the
-entire contiguous validated writer tail. It protects every current owner and every removed binding whose
-cleanup is not represented by an adopted snapshot. A gap, corrupt record, or unavailable adopted base
-disables deletion; it never falls back to snapshot-only protection.
+**I8. Incarnation isolation.** Every writer-log key and GC ref-fold entry contains the namespace incarnation.
+An older incarnation can neither cover nor consume a newer incarnation's sequence numbers.
 
-**I12. Resolved-prefix folding.** `GC` may advance the fold cursor past a writer record only when the
-record's complete reachability effect is known. A missing-body precommit add is resolved either by later
-activation, by an exact removal in the observed prefix, or by durable proof that the build is dead. A
-live unresolved binding remains a fold barrier.
+**I9. Failed-precommit ordering.** A writer does not retire a build while that build owns a precommit.
+If the process stops first, only a successor that has fenced the entire predecessor epoch may append its
+namespace-scoped epoch clear.
 
-**I13. Writer request budget.** After startup, ref-state persistence for a mutation in an existing
-namespace adds exactly one `_log` `putIfAbsent` and no ref-state `GET`, `HEAD`, or `LIST` on its successful
-common path. Lifecycle checks, sequence allocation, owner validation, and active-build checks use
-recovered process-local state. Manifest or blob validation required by the surrounding operation is
-accounted separately and must not be duplicated by the ref protocol. Reads used to resolve an uncertain
-write are failure-path I/O, not common-path I/O.
+**I10. Atomic namespace removal.** `remove_namespace` changes `Live` to `Removed` and clears every owner
+binding in one replay transition. No later mutation is valid in that incarnation.
 
-**I14. Common writer identity and fence.** Build ownership, `ManifestRef`, and namespace incarnation use
-the same `WriterId` allocated under the mounted writer epoch. A record or manifest whose identity
-components disagree is corruption. The mount fence invalidates every writer-authorized use of the old
-epoch at once.
+**I11. Complete destructive protection.** Orphan cleanup uses the exact adopted `RefBaseSet` plus the
+complete validated writer tail. It protects current owners and every manifest removed
+in the unadopted tail.
 
-**I15. Fence- and floor-ordered visibility.** A writable startup `LIST` after mount fencing must expose
-every log create completed by the fenced predecessor. After a writer completes a log create and then
-publishes a `min_active` floor that retires that build, a later destructive `LIST` must expose that log
-object. These are part of the backend consistency contract. A backend without read-after-write `LIST`
-visibility cannot safely enable this format for writable recovery or orphan deletion.
+**I12. Minimal writer I/O.** A warm-cache isolated mutation adds one `_log` `putIfAbsent`; a batch of
+`B` compatible mutations shares one `putIfAbsent`. Neither path performs a ref-state `GET`, `HEAD`, or
+`LIST`. Uncertain-write resolution is a failure-path exact-key `GET`.
 
-## Terminology {#terminology}
+**I13. Bounded memory.** Only touched ref-row blocks and tail overlays enter a byte-bounded cache.
+Eviction is always safe because the adopted base set and durable log tail are authoritative. GC fold
+merge and `RunFile` construction use fixed streaming buffers.
 
-`WriterId` is the pair:
+**I14. Common identity and fence.** Build ownership, `ManifestRef`, and namespace incarnation use the
+same `WriterId`. The mount fence invalidates every writer-authorized use of the predecessor epoch.
+
+**I15. Fence-ordered visibility.** A namespace-recovery `LIST` performed after mount fencing exposes
+every log create completed by the predecessor. After a removal log becomes durable and the writer
+advances `min_active`, a later destructive `LIST` exposes that removal. A backend without the required
+read-after-write `LIST` visibility cannot enable this format.
+
+**I16. Ordered enumeration.** Ref-log `LIST` pages and continuation cursors preserve canonical key
+order, and memcomparable tuple encoding preserves the exact physical
+`<namespace>/_log/` grouping-prefix order in ref-base row keys. This lets `GC` stream namespace groups
+directly into sorted runs. A backend without this ordering must fail the format probe; it may not
+substitute an unbounded in-memory sort.
+
+**I17. Resolution before adoption.** Every reachability effect in a candidate ref base is resolved before
+the fold seal, any destructive GC action, and the generation `CAS`. Any required manifest-body failure
+aborts the whole attempt; no partial base, reachability result, content deletion, or covered-log trim
+becomes authoritative.
+
+## Identity And Canonical Paths {#identity-and-canonical-paths}
+
+### Writer Identity {#writer-identity}
+
+`WriterId` is:
 
 ```text
 { writer_epoch, writer_sequence }
 ```
 
-It is allocated from the mounted `Store`'s single monotone sequence allocator and rendered as two
-fixed-width 16-digit lower-case hexadecimal components using the same integer hex primitives as
-`getHexUIntLowercase` and `unhexUInt`:
+Both components are nonzero `UInt64` values. The common mounted-writer allocator never reuses a pair and
+fails before overflow. Every successful mount strictly increases `writer_epoch`; `writer_sequence`
+starts from one within that epoch.
+
+The canonical rendering uses two fixed-width 16-digit lower-case hexadecimal components:
 
 ```text
 0000000000000007-000000000000008e
 ```
 
-Lexical and numeric order are identical. The pair is globally unique for one server root because
-`writer_epoch` is durable and monotone, while `writer_sequence` is never reused within an epoch. Every
-build consumes one `WriterId`. A namespace incarnation uses the first build's `WriterId`, or consumes a
-control `WriterId` when `dropNamespace` acts on a namespace that has verbatim files but has never had a
-ref. Build and control allocations therefore cannot collide.
-
-Both components are nonzero. Sequence exhaustion fails before allocation and never wraps.
-Each `WriterId` is consumed exactly once and bound to one build namespace or one control birth; it cannot
-create incarnations or manifests in multiple namespaces.
+Lexical and numeric order are identical. Upper-case, shortened, zero, or overflowing forms are
+rejected.
 
 The same `WriterId` is:
 
-- The build identity used by precommit ownership and `min_active`.
-- The prefix identity of every `ManifestRef` created by that build.
-- The `NamespaceIncarnation` when that build creates the namespace.
+- The build identity checked by `min_active`.
+- The prefix identity of each `ManifestRef` created by that build.
+- The `NamespaceIncarnation` when that build creates a namespace.
 
-There is no second random protocol `build_id`. A process-local diagnostic correlation ID may exist, but
-it is not serialized into owner bindings or object keys. `drop_id` remains a separate random nonzero
-128-bit transaction token because a drop can span many builds and writer records. It is encoded as
-exactly 16 bytes in transaction and snapshot bodies and never appears in an object key.
+If a control operation creates an incarnation without a build, it consumes one `WriterId` from the same
+allocator. There is no serialized random `build_id` or `drop_id`.
 
-The mount lease and local write fence are the common writer fence. They authorize allocation and append
-for every `WriterId` in the current `writer_epoch`. `birth_gc_round` is deliberately separate: it is a
-newborn ordering floor relative to `GC`, not writer identity or fencing authority.
+`birth_gc_round` remains separate. It orders a new namespace incarnation relative to `GC`; it is not a
+writer fence.
 
-`ManifestRef` is `{writer_id, manifest_ordinal}`. The ordinal remains in the range one through 999999
-within one build.
+### Manifest Paths {#manifest-paths}
 
-`seq` is a fixed-width 16-digit lower-case hexadecimal per-incarnation log sequence starting at one:
+`ManifestRef` is `{writer_id, manifest_ordinal}`. The ordinal range is one through 999999.
 
-```text
-000000000000002a
-```
-
-Fixed width makes lexical order equal numeric order without the path length of 20-digit decimal.
-Upper-case hex and shortened forms are non-canonical and rejected in object keys.
-This log `seq` is distinct from `WriterId.writer_sequence`: the former orders records inside one
-namespace incarnation, while the latter allocates globally unique writer-owned identities within an
-epoch.
-
-`generation` and `attempt` identify the write-once `GC` fold seal already selected by `gc/state`.
-
-## Namespace Layout {#namespace-layout}
-
-All ref namespaces are archive namespaces. The archive table segment ends in `@cas@`, and the service
-areas are directly below it:
-
-```text
-cas/refs/<archive-ns@cas@>/_log/<incarnation>/...
-cas/refs/<archive-ns@cas@>/_snap/<incarnation>/...
-```
-
-Examples:
-
-```text
-cas/refs/srv1/store/3f2/3f2a...@cas@/_log/0000000000000007-000000000000008e/...
-cas/refs/srv1/data/db/table@cas@/_snap/0000000000000007-000000000000008e/...
-cas/refs/shadow/backup1/store/3f2/3f2a...@cas@/_log/0000000000000008-0000000000000003/...
-```
-
-`shadowNamespace` must return:
-
-```text
-shadow/<backup>/store/<u3>/<uuid>@cas@
-shadow/<backup>/data/<db>/<table>@cas@
-```
-
-The parser rejects:
-
-- `_log` or `_snap` outside an `@cas@` archive namespace.
-- A malformed or zero `NamespaceIncarnation`.
-- A malformed fixed-width `seq`.
-- Sequence zero.
-- Unknown service areas below the archive segment.
-- A key whose decoded namespace disagrees with its body.
-
-## Log Key Format {#log-key-format}
-
-Inline records are zero-byte objects. `manifest_ref_suffix` occupies the same two path components as
-the existing part-manifest path suffix:
-
-```text
-_log/<incarnation>/<seq>/precommit/<manifest_ref_suffix>/<ref...>
-_log/<incarnation>/<seq>/abandon/<manifest_ref_suffix>/<ref...>
-_log/<incarnation>/<seq>/drop/<manifest_ref_suffix>/<ref...>
-```
-
-`manifest_ref_suffix` is:
-
-```text
-<writer_id>/<000001>.proto
-```
-
-`writer_id` uses the canonical fixed-width rendering from Terminology. `manifest_ordinal` uses the
-six-digit decimal range `000001.proto` through `999999.proto`. The refs-log implementation must reuse
-the shared part-manifest suffix renderer and parser described below rather than introduce a second
-string representation of `ManifestRef`.
-
-For `precommit` and `abandon`, `ManifestRef.writer_id` is also the build identity. The key therefore does
-not repeat a random `build_id`; replay validates the same identity against the owner binding and durable
-mount floor.
-
-`ref...` is the complete clean relative ref path and consumes the remainder of the key. Empty segments,
-`.` segments, `..` segments, repeated separators, and non-canonical encodings are rejected.
-
-Body-bearing records use:
-
-```text
-_log/<incarnation>/<seq>/tx/<body_hash>.proto
-```
-
-`body_hash` is the lower-case 32-digit hexadecimal `CityHash128` of the deterministic bytes stored in
-the object. The body has a normal `CasHeader` and does not contain its own hash.
-
-Before attempting a write, the writer checks the backend key-length limit. An inline record that would
-exceed it is encoded as an equivalent one-operation transaction. A key is never truncated.
-
-## Part Manifest Path Reuse {#part-manifest-path-reuse}
-
-The new canonical part-manifest layout is:
+The canonical path is:
 
 ```text
 cas/manifests/<namespace>/<writer_id>/<000001>.proto
 cas/manifests/srv1/data/db/table@cas@/0000000000000007-000000000000008e/000001.proto
 ```
 
-The unreleased existing implementation renders `writer_epoch` and `build_sequence` as two variable-width
-decimal components. This design intentionally replaces those components with the same canonical
-fixed-width `WriterId` used by namespace incarnations. The format has not shipped, so no compatibility
-reader or migration path is required. Using one representation removes parser drift and shortens maximum
-manifest and inline-log keys.
-
-The implementation should extract two shared helpers from the existing code:
+The implementation uses shared helpers:
 
 ```text
 renderWriterId(WriterId) -> <writer_epoch>-<writer_sequence>
@@ -327,14 +237,55 @@ manifestRefKeySuffix(ManifestRef) -> <writer_id>/<000001>.proto
 parseManifestRefKeySuffix(string) -> ManifestRef
 ```
 
-`CasLayout::manifestKey`, inline log rendering, inline log parsing, and orphan manifest parsing must use
-these helpers. The parser accepts only the canonical fixed-width lower-case `WriterId`, the six-digit
-ordinal, and the `.proto` suffix. This removes the current duplication between
-`CasLayout::manifestKey` and `parseListedManifestObject`.
+`CasLayout::manifestKey`, ref-log rendering, ref-log parsing, `fsck`, and orphan-manifest enumeration use
+these helpers. The old variable-width decimal manifest identity is removed without a compatibility
+reader because it has not shipped.
 
-## Transaction Format {#transaction-format}
+### Ref Log Paths {#ref-log-paths}
 
-The body is:
+All archive namespaces end in `@cas@`. `shadowNamespace` must return paths with the same suffix.
+
+```text
+cas/refs/<archive-ns@cas@>/_log/<incarnation>/<seq>/...
+```
+
+There is intentionally no `cas/refs/.../_snap` path.
+
+`seq` is a fixed-width 16-digit lower-case hexadecimal per-incarnation record sequence starting at one.
+One isolated operation or one flat-combined transaction consumes one sequence:
+
+```text
+000000000000002a
+```
+
+Inline zero-byte records use:
+
+```text
+_log/<incarnation>/<seq>/precommit/<manifest_ref_suffix>/<ref...>
+_log/<incarnation>/<seq>/abandon/<manifest_ref_suffix>/<ref...>
+_log/<incarnation>/<seq>/drop/<manifest_ref_suffix>/<ref...>
+_log/<incarnation>/<seq>/clear-precommits-before/<writer_epoch>
+_log/<incarnation>/<seq>/remove-namespace
+```
+
+`ref...` is the complete clean relative path. Empty, `.`, `..`, repeated-separator, and non-canonical
+segments are rejected.
+
+Body-bearing records use:
+
+```text
+_log/<incarnation>/<seq>/tx/<body_hash>.proto
+```
+
+`writer_epoch` uses the same fixed-width 16-digit lower-case hexadecimal rendering as its `WriterId`
+component. `body_hash` is the lower-case 32-digit hexadecimal `CityHash128` of the deterministic stored bytes.
+Key-derived fields are repeated in the body and must agree. If an inline key would exceed the configured
+backend limit, the writer uses an equivalent one-operation transaction without making an object-store
+request to discover the limit.
+
+## Writer Log Format {#writer-log-format}
+
+The transaction body is:
 
 ```text
 RefLogTxn {
@@ -342,15 +293,9 @@ RefLogTxn {
   namespace
   namespace_incarnation
   seq
-  optional transaction_drop_id
   repeated RefOp ops
 }
 ```
-
-Key-derived fields are repeated so the decoder can validate key/body agreement. `ops` is ordered and
-the transaction is applied atomically. `transaction_drop_id` is absent for normal mutations and is
-mandatory on every transaction belonging to a durable namespace drop. When `begin_drop` or
-`finish_drop` is present, its `drop_id` must equal `transaction_drop_id`.
 
 Supported operations are:
 
@@ -358,820 +303,891 @@ Supported operations are:
 namespace_birth(birth_gc_round)
 owner_transition(old_binding?, new_binding?)
 set_payload(ref, expected_manifest_ref, mutable_files, published_at_ms)
-begin_drop(drop_id)
-finish_drop(drop_id)
+clear_precommits_before(writer_epoch)
+remove_namespace
 ```
 
-An `OwnerBinding` contains `{owner_kind, ref, manifest_ref}`. A `Precommit` binding derives its build
-identity from `manifest_ref.writer_id`; a `Committed` binding has no build identity. No binding carries a
-second build token.
+Operations are ordered and the transaction is applied atomically. A transaction has hard operation-count
+and encoded-size limits. `remove_namespace` is constant-size because it operates on the replayed
+namespace state rather than serializing its owner set.
 
-`namespace_birth` is allowed only as operation zero of sequence one. It creates `Live` lifecycle state.
-The same transaction normally contains the first precommit owner transition. For a namespace with no
-prior ref state, it may instead contain `begin_drop` so file cleanup has a durable gate.
+### Flat-Combined Append {#flat-combined-append}
 
-`begin_drop` changes `Live` to `Dropping(drop_id)`. It may share a transaction with a bounded set of
-owner removals.
+The writer reuses the existing local flat-combining machinery: `ShardMutationItem`, leader-caller
+election under the queue mutex, `MutationScope` carving, condition-variable wakeup, and baton passing.
+Batching is a writer-local property and does not depend on mutable root-shard CAS. The queue is re-keyed
+to namespace incarnation because `_log` has one sequence stream per incarnation; no distributed lock or
+object-store read is added. Only the flush payload changes:
 
-`finish_drop` changes `Dropping(drop_id)` to `Tombstoned`. It must be the last operation in its
+```text
+enqueue mutation under namespace
+leader loads the required namespace rows only on cache miss
+carve a bounded compatible batch
+validate requests in queue order against a small undo log
+drop invalid requests from the batch and complete them with their exceptions
+encode all surviving operations in one RefLogTxn at next_seq
+putIfAbsent once
+apply the same operations to cached state
+complete every surviving request
+```
+
+The current queue's useful properties remain unchanged:
+
+- At most one local leader flushes one namespace incarnation.
+- Enqueued callers provide the batching window while the leader prepares the flush.
+- Queue memory remains bounded by blocked writer callers and the explicit batch limit.
+- A caller does not flush unrelated work after its own item completes; the baton passes to a waiter.
+- Intra-writer sequence conflicts are structurally impossible.
+
+Removed work is the expensive part of the old flush: full-shard `GET`, complete `RootShard` decode,
+per-request full-state snapshot copy, complete re-encode, CAS conflict retry, and manifest-size
+backpressure. The replacement flush validates against cached rows and appends one small immutable
 transaction.
 
-## Snapshot Key And Format {#snapshot-key-and-format}
+Compatibility rules are deliberately simple:
 
-A snapshot candidate is stored at:
+- Every operation belongs to the same namespace incarnation.
+- At most one operation per ref name enters a batch.
+- A transaction containing `namespace_birth` and its optional first owner transition runs alone;
+  `clear_precommits_before` and `remove_namespace` also run alone.
+- A batch never crosses its encoded-size or operation-count limit.
+- The writer records only per-operation undo information; it never copies a complete owner map for
+  request isolation.
 
-```text
-_snap/<incarnation>/<seq>/<generation>.<attempt>.<body_hash>.proto
-```
+An isolated inline-capable operation remains a zero-byte inline object. A batch, `promote`, payload
+update, or long-key operation uses one body-bearing transaction. Consequently one body `GET` during a
+later `GC` handoff replaces the writer's old full-shard `GET`; it does not add one `GET` per operation.
 
-The key includes `generation` and `attempt` because `GC`-only state and pending cleanup can change while
-the writer `seq` remains constant. The hash is `CityHash128` over the deterministic stored bytes.
-
-The body is:
-
-```text
-RefSnapshot {
-  header
-  namespace
-  namespace_incarnation
-  seq
-  generation
-  attempt
-  birth_gc_round
-  lifecycle
-  drop_id
-  repeated committed_refs
-  repeated live_precommit_bindings
-  repeated pending_manifest_cleanup
-}
-```
-
-`pending_manifest_cleanup` contains removed bindings whose manifest bodies must remain protected until
-the adopted cleanup artifact has completed. A later adopted snapshot may omit an entry only after a
-durable cleanup outcome or an absence proof.
-
-Snapshot encoding is canonical. `committed_refs` is sorted by ref name, `live_precommit_bindings` is
-sorted by `(ref, writer_id, manifest_ref)`, and `pending_manifest_cleanup` is sorted by `ManifestRef`.
-Duplicate keys or bindings are rejected. The encoder must not depend on unordered-container iteration;
-the same logical snapshot must always produce the same bytes and `body_hash`.
-
-Every live owner in an adopted snapshot is activated: its matching `+1` is present in the adopted
-generation. An unactivated precommit is represented only in the writer log tail and can never enter an
-adopted snapshot as a live binding.
-
-The write-once fold seal contains a carried map for every unreclaimed namespace incarnation with an
-adopted recovery base:
-
-```text
-NamespaceSnapshotRef {
-  namespace
-  namespace_incarnation
-  folded_seq
-  gc_round
-  snapshot_key
-  snapshot_body_hash
-}
-```
-
-The current `gc/state` identifies `(snap_generation, snap_attempt)`, which identifies one exact fold
-seal. Only `NamespaceSnapshotRef` values in that seal are adopted. A snapshot discovered by `LIST` is
-never adopted merely because its tuple is less than or equal to a cursor.
-
-When a namespace is unchanged, the next fold seal carries its prior `NamespaceSnapshotRef` verbatim.
-The snapshot object may therefore physically belong to an older generation.
-
-A newly observed incarnation whose sequence-one birth is still unresolved has no
-`NamespaceSnapshotRef`; absence means an empty recovery base at folded sequence zero and authorizes no
-trim. The first adopted snapshot for that incarnation must cover sequence one. Once a reference exists,
-every later fold seal carries it until the incarnation is physically reclaimed.
-
-## Replay State Machine {#replay-state-machine}
-
-All consumers use one replay implementation. It maintains:
-
-- Lifecycle: `Live`, `Dropping(drop_id)`, or `Tombstoned`.
-- Committed ref payloads keyed by ref name.
-- Live precommit bindings.
-- Namespace birth floor.
-- Pending manifest cleanup protections.
-
-Replaying a reachability-changing removal adds its old `ManifestRef` to pending cleanup. The entry stays
-protected until an adopted snapshot covers the removal and a later durable cleanup outcome or absence
-proof permits omission. Replaying a tail therefore produces both current owner state and protection for
-unadopted removals without reading a manifest body.
-
-The following preconditions are mandatory.
+An `OwnerBinding` is `{owner_kind, ref, manifest_ref}`. A precommit binding derives build identity from
+`manifest_ref.writer_id`; it carries no second token.
 
 ### Namespace Birth {#namespace-birth}
 
-- The record has sequence one.
-- `namespace_birth` is operation zero.
-- No earlier record or empty-base state exists for this incarnation.
-- The birth incarnation equals the incarnation in the physical key.
-- `birth_gc_round` is no greater than the current decoded `gc/state` round. An absent `gc/state` is
-  treated as round zero, and zero is also valid for explicit generation-zero state.
-- The resulting lifecycle is `Live`.
+- `namespace_birth` is operation zero of sequence one.
+- It creates `Live` state for the incarnation in the physical key.
+- The same transaction normally contains the first precommit add.
+- `birth_gc_round` is no greater than the current decoded `gc/state.round` used for the birth.
 
 ### Precommit Add {#precommit-add}
 
-- Lifecycle is `Live`.
-- The new binding is a canonical `Precommit` binding.
-- The binding is not already live.
-- No other live precommit with the same `(ref, writer_id)` names a different manifest.
-- No other live owner binding names the same `ManifestRef`; part manifests remain single-owner.
-- The binding's `writer_id` equals its `ManifestRef.writer_id` and the locally active build identity.
+- State is `Live`.
+- The binding is absent and its `writer_id` is the locally active build identity.
+- No other owner names the same `ManifestRef`.
+- No conflicting precommit exists for the same `(ref, writer_id)`.
 
 ### Promote {#promote}
 
-- Lifecycle is `Live`.
-- The exact old precommit binding is live.
-- The new committed binding names the same `ManifestRef`.
-- The target ref is absent or already names the same `ManifestRef`.
-- The same transaction installs the complete initial `RootRef` payload.
+- State is `Live`.
+- The exact old precommit exists.
+- The committed binding names the same `ManifestRef`.
+- The transaction installs the complete initial `RootRef` payload.
 
-### Abandon {#abandon}
+### Precommit Removal {#precommit-removal}
 
-- Lifecycle is `Live`.
-- The exact old precommit binding is live.
-- The writer proves the build is still locally active immediately before append.
+- State is `Live`.
+- The exact old precommit exists.
+- A current-build removal requires the build to remain locally active until the record is durable.
+- An exact removal serializes the same owner transition in every replay; it has no liveness-dependent
+  branch.
 
-### Drop Ref {#drop-ref}
+A fenced successor does not enumerate and serialize the predecessor's individual bindings. It appends
+one inline `clear_precommits_before(current_writer_epoch)` operation for the namespace. The operation
+removes all precommit bindings whose `ManifestRef.writer_id.writer_epoch` is less than the boundary and
+leaves committed bindings and current-epoch precommits untouched. It is valid only when the durable
+mount record proves the boundary. Thus one record also clears precommits from namespaces skipped across
+several mounts. Repeated API cleanup observes no precommit below the boundary and returns success
+without a second record.
 
-- An ordinary `dropRef` requires `Live` lifecycle.
-- A `Dropping` lifecycle accepts committed-owner removal inside a transaction whose
-  `transaction_drop_id` matches the durable lifecycle `drop_id`.
-- The old committed binding exactly matches the current committed ref.
-- Applying the transition removes the `RootRef` payload.
+### Committed Ref Removal {#committed-ref-removal}
 
-### Set Payload {#set-payload}
+- State is `Live`.
+- The exact committed binding exists.
+- Removing it also removes its `RootRef` payload.
 
-- Lifecycle is `Live`.
-- The committed ref exists.
-- Its current `ManifestRef` equals `expected_manifest_ref`.
-- The operation replaces the complete mutable payload.
-- The operation cannot change reachability.
+### Payload Update {#payload-update}
 
-### Begin Drop {#begin-drop}
+- State is `Live`.
+- The committed ref exists and still names `expected_manifest_ref`.
+- The operation replaces the complete mutable payload and changes no reachability edge.
 
-- Lifecycle is `Live`.
-- A durable second `begin_drop`, including one with the same `drop_id`, is corruption. Retry of an
-  uncertain first append resolves the same key and bytes; it does not allocate another sequence.
-- Once applied, normal precommit, promote, ref drop, payload, and namespace-file mutations are blocked.
+### Namespace Removal {#namespace-removal}
 
-The `dropNamespace` API is idempotent above the record state machine. If lifecycle is already
-`Dropping`, it resumes with the stored `drop_id` without appending `begin_drop`. If lifecycle is
-`Tombstoned`, it returns success without appending a record.
+- State is `Live`.
+- `remove_namespace` is the final operation in its transaction.
+- Applying it clears committed refs, precommits, and payloads, then changes state to `Removed`. `GC` and
+  orphan-sweep replay derive the removed-manifest protection set while streaming; the writer does not
+  retain a second copy of all removed owners.
+- A second durable `remove_namespace` record is corruption. API idempotency returns success after
+  observing `Removed` without appending another record.
+- No later record is valid for that incarnation.
 
-### Drop-Owned Precommit Removal {#drop-owned-precommit-removal}
+Startup, writer recovery, `GC`, and `fsck` use the same transition validator. A durable record whose
+precondition is false is `CORRUPTED_DATA`. Request-level idempotency is resolved before creating a new
+record and never makes a duplicate durable transition valid.
 
-- Lifecycle is `Dropping`, and the transaction's `transaction_drop_id` matches the durable `drop_id`.
-- The exact old precommit binding is live in the writer's current state.
-- The corresponding build is still locally active under the namespace and active-build locks
-  immediately before append.
-- A retired binding is skipped by the writer and left for exact adopted `GC` reclamation.
-- Each transaction is independently bounded; no transaction must contain the complete active set.
+## Writer Operation {#writer-operation}
 
-### Finish Drop {#finish-drop}
+### Startup {#startup}
 
-- Lifecycle is `Dropping` with the same `drop_id`.
-- No committed refs remain.
-- No locally active build can append a namespace-scoped operation.
-- The namespace-file prefix has been re-listed under the drop gate and is empty.
-- The operation is last in its transaction.
-
-A replay precondition failure is `CORRUPTED_DATA` for startup, `GC`, and `fsck`. Checks that depend on
-live external state, specifically active-build membership and the namespace-file listing, are append
-eligibility checks performed by the fenced writer; they are not reconstructed from transaction bytes.
-`fsck` separately audits that a tombstoned namespace has no files. On the live writer path, an invalid
-requested operation fails before object creation with the existing user-facing exception.
-
-## Writer Startup {#writer-startup}
-
-A writable `Store` completes mount fencing before recovery and completes recovery before serving
-namespace writes:
+A writable `Store` fences the predecessor before reading refs:
 
 ```text
-claim mount and fence the prior writer
-repeat:
+claim mount and durably establish a new writer_epoch
+read gc/state and verify the exact adopted fold seal
+install its exact RefBaseSet metadata
+start with empty ref-state and run-index caches
+
+on first access to a namespace:
   read gc/state as state_before
-  if state_before.snap_generation != 0:
-    read and verify its exact adopted fold seal
-  else:
-    use an empty adopted snapshot-reference map
-  LIST cas/refs/<server_root>/
-  group log and snapshot keys by namespace and incarnation
-  for each incarnation:
-    use only the NamespaceSnapshotRef carried by the adopted fold seal
-    load and verify that exact snapshot, or use an empty base
-    replay the complete contiguous log tail after snapshot.seq
-    retain current owners and tail pending-cleanup protection in memory
-  read gc/state as state_after
-until adopted (snap_generation, snap_attempt) is unchanged
-for each namespace:
-  choose the greatest valid incarnation
-  require every other non-reclaimed incarnation to be Tombstoned
-  install recovered lifecycle and in-memory state
-  next_seq = max(snapshot.seq, max_log_seq) + 1
-resume or expose any durable Dropping state before accepting normal writes
+  seek its metadata and required owner rows in the adopted RefBaseSet
+  LIST and replay that namespace's tail, GETting only body-bearing records
+  validate incarnation selection, canonical keys, and complete tail contiguity
+  re-read gc/state and retry if adoption changed
+  resume file cleanup if replay produces Removed
 ```
 
-An empty base is valid only when sequence one is a body-bearing transaction beginning with
-`namespace_birth`.
+For generation zero, the adopted `RefBaseSet` is empty and replay must begin at sequence one. If
+`gc/state` is absent after any ref history has been trimmed, writable startup fails closed.
 
-An absent `gc/state` and `snap_generation == 0` both mean that no fold seal has been adopted. They are
-valid while every discovered incarnation still has a complete sequence-one-based log. Generation-zero
-state does not require a fold-seal object.
+Startup performs no pool-wide ref `LIST` and materializes no namespace owner state. Every lazy namespace
+load uses a before/after adoption check around ref-run and tail reads. If the tuple
+changes, only that provisional load is discarded and retried. A bounded background maintenance scan may
+identify namespaces containing precommits below the current fenced epoch and append one
+`clear_precommits_before` record to each. This over-protected cleanup is not on the mount or
+ordinary-operation critical path. Namespace-file cleanup for `Removed` state is likewise resumable.
 
-The final `gc/state` validation closes concurrent adoption and trim. If the adopted tuple changes while
-startup is loading an older base, all provisional namespace state is discarded and recovery restarts
-from the new exact seal. Once a stable scan is installed, later `GC` adoption may make the writer's
-in-memory pending-cleanup or retired-precommit view conservative, but active-build checks keep subsequent
-writer records valid.
+Each bounded cleanup-scan window reads `gc/state` and its exact fold-seal tuple before reading base rows
+and tails, then re-reads `gc/state` before acting on any discovery. A missing referenced run, a changed
+generation or attempt, or a tail gap discards the window and retries from the new adopted base. Only a
+stable window may enqueue `clear_precommits_before`; a later adoption cannot invalidate the discovery
+because adoption moves the same logical state from tail to base. The ordinary namespace queue then
+revalidates the incarnation, `Live` state, and fence boundary before append; concurrent
+`remove_namespace` turns cleanup into a no-op rather than a post-removal record.
 
-Records at or below an adopted snapshot cursor may still exist because trim is asynchronous. They are
-not replayed. If inspected by `fsck`, they must decode consistently.
+Unadopted GC attempt artifacts are never recovery authority.
 
-If `gc/state` is absent while `GC` generation artifacts or trimmed log prefixes exist, writable startup
-fails closed. It must not guess which snapshot was adopted. An explicit offline rebuild may recover
-conservative reachability, but it does not silently authorize writable startup.
+### Byte-Bounded Ref-State Cache {#byte-bounded-ref-state-cache}
 
-Unadopted snapshot candidates are ignored regardless of generation, sequence, or lexical order.
+Phase 1 uses two ordinary byte-bounded LRU caches:
 
-## Writer Write Path {#writer-write-path}
+- A logical-state cache stores one coherent namespace view: `lifecycle`, `next_seq`, base rows touched
+  since load, and the complete overlay derived from its unadopted tail. The whole namespace view is one
+  eviction unit; a tail-derived row is never evicted independently from its tail cursor and lifecycle.
+- A run cache stores footer indexes and decoded blocks by `(RunRef, block)`.
 
-Every writer record uses:
+Both count complete owned memory against `ref_state_cache_bytes`; 256 MiB is the initial default to
+validate in soak. A point miss inside a resident view seeks the base row and then reapplies every
+tail operation relevant to that row plus namespace-wide operations before returning it. Because the
+overlay is complete, a row-specific tail mutation or removal itself prevents a base-only miss; the
+replay rule primarily covers an implementation that reconstructs rather than retains that entry.
+Alternatively, the implementation may discard and reload the whole view through the same before/after
+`gc/state` validation as cold recovery; a base-only reload is forbidden. Namespace enumeration and
+predecessor cleanup stream the base range instead of populating the whole namespace. `remove_namespace` changes
+lifecycle and clears the touched-row set. There is never a materialized full owner set.
+
+A successful append leaves no dirty memory because the log is authoritative. Once unpinned, a complete
+namespace view may be evicted immediately, and eviction never writes storage. Phase 1 reuses the
+existing `RunFileReader` profile: a cold run reads `HEAD`, footer, and the required indexed block. A full
+run is never downloaded merely to open one namespace. Shared immutable block graphs and adaptive cache
+policy are Phase 2 work.
+
+The writer tracks encoded tail bytes, operation count, and estimated decoded overlay weight since
+`folded_seq`. A candidate append that would cross `max_ref_tail_bytes_per_namespace` or its decoded-row
+limit fails before creating an object and may be retried after `GC` advances the adopted cursor. These
+limits are no larger than the corresponding `gc_ref_fold_namespace_bytes` work budget, so one
+namespace's observed tail and cache overlay are structurally bounded without spill.
+
+### Common Write Path {#common-write-path}
 
 ```text
 lock namespace state
-check lifecycle
-check mount fence and writer epoch
-for a build-scoped operation, prove its WriterId is locally active
-validate the operation against in-memory state
-construct the inline key or deterministic transaction body
-putIfAbsent(log_key, bytes)
+check Live state
+check mount fence and operation-specific eligibility
+pin or lazily load the required ref-row cache entries
+enqueue and validate through the flat-combining rules
+construct one inline key or deterministic batch transaction
+putIfAbsent(log_key, bytes) once for the batch
 if PreconditionFailed:
   GET the exact key
-  identical key and bytes => idempotent success
+  identical bytes => idempotent success
   different bytes => corruption
-apply the validated record to memory
+apply the transition to memory
 increment next_seq
 invalidate affected committed views
 unlock
 ```
 
-An uncertain request result is resolved under the same namespace lock with the same key and bytes.
-Another logical operation cannot consume that sequence while resolution is pending.
+An uncertain result is resolved under the same namespace lock with the same key and bytes. A later
+logical operation cannot consume that sequence first.
 
-All namespace-file mutation entry points must consult the same lifecycle gate. Otherwise an interrupted
-`dropNamespace` could delete files created by a later namespace incarnation.
+Warm-cache same-`Store` ref reads use recovered in-memory state and issue zero ref requests. A cold read
+pays bounded indexed seeks in the adopted base set plus namespace-tail replay, then populates the
+byte-bounded cache.
+`CachedPartFolderAccess` remains the committed-ref facade and is invalidated only after the corresponding
+log object is known durable.
 
-The common ref-state path performs one object create and no ref-state read from object storage.
+Every namespace-file mutation entry point uses the same selected-incarnation state and namespace lock.
+It may create or change files only in `Live`; no object-store read is added to that check.
 
-## S3 Request Budget {#s3-request-budget}
+### Failed Precommit Cleanup {#failed-precommit-cleanup}
 
-The request budget is part of the protocol, not an implementation optimization.
+For a failure observed by the current writer:
 
-| Path | Successful ref-protocol object-store budget |
-|---|---|
-| Existing-namespace `precommitAdd` | One zero-byte inline `_log` `putIfAbsent` |
-| Existing-namespace `promote` | One body-bearing `_log` `putIfAbsent` |
-| Existing-namespace `abandon` or `dropRef` | One inline `_log` `putIfAbsent`, unless key length requires a body |
-| Existing-namespace `updateRefPayload` | One body-bearing `_log` `putIfAbsent` |
-| Uncertain or conflicting writer result | One exact-key `GET` to resolve the attempted bytes |
-| First mutation of an unseen incarnation | At most one `gc/state` `GET`, then one `_log` `putIfAbsent` |
-| Same-`Store` ref read after startup | Zero object-store requests for ref state |
-| Startup, `GC`, `fsck`, orphan sweep, and namespace drop | Maintenance paths; bounded separately |
+1. Keep the build locally active.
+2. Append the exact precommit removal.
+3. Only after it is durable, remove the build from the active set and allow `min_active` to advance past
+   its `WriterId.writer_sequence`.
 
-The budget counts requests introduced by ref persistence. Existing operation-specific content checks,
-such as the manifest and blob validation required by `promote`, remain separate, but the new protocol
-must neither repeat nor amplify them. In particular, the writer must not add a mutable head,
-per-mutation `gc/state` read, ref existence `HEAD`, snapshot check, or defensive ref `LIST` to the
-existing-namespace path. `namespace_birth` needs the current `GC` round only once for a new incarnation.
-The result is cached in the recovered namespace state; later mutations do not re-read it. Backend
-key-length validation uses configured backend capabilities and performs no request.
+If the append fails, the build stays active and the error propagates. There is no fallback retirement.
 
-## Operation Mapping {#operation-mapping}
+If the process stops first, its successor:
 
-| Current operation | New encoding |
-|---|---|
-| `precommitAdd` | Inline `precommit`; sequence one uses `tx(namespace_birth, owner_transition)` |
-| `promote` | `tx(owner_transition, set_payload)` |
-| `abandon` | Inline `abandon`, or one-operation `tx` for a long key |
-| `dropRef` | Inline `drop`, or one-operation `tx` for a long key |
-| `updateRefPayload` | `tx(set_payload)` |
-| `dropNamespace` | If needed, sequence-one `tx(namespace_birth, begin_drop)`; otherwise `tx(begin_drop)` with optional bounded removals, bounded drop-owned removal chunks, file cleanup, `tx(final removals, finish_drop)` |
+1. Establishes the new mount fence.
+2. Starts a bounded background scan of the exact adopted base plus complete log tails.
+3. Validates every scan window with before/after `gc/state` reads and retries changed windows.
+4. Appends one `clear_precommits_before(current_writer_epoch)` transition per affected namespace found
+   in a stable window.
 
-Every transaction has a hard encoded size limit. An oversized non-chunkable operation fails before
-object creation.
+The cleanup requires no owner enumeration in the log body and no manifest reads. If the add and clear
+are both in the unadopted tail, `GC` folds their lifetime to zero. If the add is already in the GC fold,
+the later clear produces the
+ordinary matching decrement. Until cleanup lands, the stale precommit only over-protects content; it
+does not authorize a publish and does not block ordinary current-epoch mutations.
 
-## Durable Namespace Drop {#durable-namespace-drop}
+### Removing A Namespace {#removing-a-namespace}
 
-When `dropNamespace` observes `Live`, it allocates a random nonzero `drop_id`. When it observes
-`Dropping`, it reuses the durable ID already in lifecycle state. It never generates a replacement ID for
-an existing drop.
+`dropNamespace` takes the namespace and build-state locks, thereby preventing a concurrent build
+append, and writes one inline `remove_namespace` record. If the write fails, the namespace remains `Live`
+and the error propagates. After the record is durable, the writer applies `Removed` and cancels the
+local builds before releasing the locks. Its successful ref-protocol cost is one S3 create regardless
+of the number of refs.
 
-1. If the namespace has files but no ref incarnation, allocate an incarnation and append sequence one
-   containing `namespace_birth` followed by `begin_drop(drop_id)`. This makes the file-deletion gate
-   durable before the first delete.
-2. Otherwise append `begin_drop(drop_id)`. The transaction may also remove any bounded subset of exact
-   committed owners or locally active precommit bindings, but progress does not depend on fitting the
-   whole namespace or active-build set into this transaction.
-3. After `begin_drop` is durable, mark every local build for this namespace as drop-cancelled. Normal
-   build-scoped appends already fail at the lifecycle gate.
-4. In bounded transactions, remove exact precommit bindings whose builds are still locally active.
-   Re-check active membership immediately before each append, then retire the removed builds before a
-   higher `min_active` becomes durable. If a build retires first, leave its binding for `GC`.
-5. Append bounded committed-owner removal chunks. Every transaction carries
-   `transaction_drop_id = drop_id`, and every old binding must still match current state.
-6. Delete namespace files while lifecycle is `Dropping`. Normal file writers are blocked.
-7. Re-list the file prefix under the lifecycle gate until it is empty.
-8. After no locally active build remains, append a final bounded transaction containing any remaining
-   committed removals followed by `finish_drop(drop_id)`.
+Once the record is durable:
 
-Precommits that were already retired before `begin_drop` and are visible only in a running writer's
-stale in-memory state are not removed by the writer. They are no longer writable because active-build
-membership is false. `GC` reclaims them
-through an exact adopted snapshot. Namespace physical reclamation waits until the adopted snapshot
-contains no live precommit binding.
+- All committed and precommit bindings are absent in the writer view.
+- Every build-scoped and namespace-file mutation for that incarnation is rejected.
+- Cancelled local builds can retire without separate abandon records because their bindings were
+  removed by the namespace transition.
+- Readers observe no refs from the removed incarnation.
+- Namespace-file deletion runs idempotently and is resumed by startup.
 
-If the process stops at any step, startup reconstructs `Dropping(drop_id)`. Startup may schedule the
-generic prefix cleanup immediately; a later `dropNamespace` call also resumes with the durable ID. Both
-paths keep the namespace closed and never append a second `begin_drop`.
+Recreation at the same archive path is allowed only after the old namespace-file prefix is empty. It
+uses a strictly greater `NamespaceIncarnation` and starts again at sequence one. No finish record is
+needed: file-prefix emptiness is a physical recreation precondition, not ref state.
 
-Readers may observe the remaining committed refs during chunking. They never observe newly added refs
-after `begin_drop`.
+## GC Ref Fold Handoff {#gc-ref-fold-handoff}
 
-## GC Fold And Snapshot Adoption {#gc-fold-and-snapshot-adoption}
+### GC-Owned Fold Format {#gc-owned-fold-format}
 
-### Recovery And Protection Views {#recovery-and-protection-views}
-
-For each incarnation, `GC` derives two explicit views from the same validated replay:
-
-- The **protection view** is the exact parent snapshot plus the complete contiguous observed log tail.
-  It contains current live owners and pending cleanup for every tail removal. Destructive maintenance
-  uses this view even when folding clamps earlier.
-- The **fold candidate** starts from the exact parent snapshot and advances only through the largest
-  prefix whose reachability effects are resolved. Its sequence becomes the candidate snapshot's
-  `folded_seq` and is the only prefix that adoption can later authorize for trim.
-
-The protection view is not adoption authority. The fold candidate is not sufficient protection for
-objects named later in the tail. Neither may be substituted for the other.
-
-### Fold Barrier Resolution {#fold-barrier-resolution}
-
-The fold classifies complete owner lifetimes, not isolated records. An owner lifetime begins with a
-binding add and ends with an exact removal or a move. The parent snapshot establishes which lifetimes
-were already activated; every live binding in it already has an adopted `+1`.
-
-For lifetimes that begin after the parent cursor:
-
-- If an exact removal closes the lifetime within the observed contiguous prefix, the lifetime has net
-  zero reachability relative to the parent. `GC` may consume the complete interval without reading the
-  body and emits neither `+1` nor `-1`. The removed manifest enters pending cleanup.
-- If a precommit remains live but the durable mount fact proves its build dead, `GC` closes that
-  not-yet-adopted lifetime in the candidate snapshot without reading the manifest, emits no delta,
-  advances past the add, and records pending cleanup. This is the dead missing-body escape from the fold
-  barrier and avoids unnecessary manifest `GET` requests for dead tail owners.
-- Otherwise, if the binding remains live, `GC` reads and validates the manifest body before emitting
-  `+1` and advancing past the add.
-- If a live committed binding or a non-dead live precommit has no valid body, the add remains unresolved
-  and clamps the fold cursor before its sequence.
-
-For a live binding inherited from the parent snapshot, a true removal or dead-precommit reclaim emits
-`-1` because the matching `+1` is already adopted. The manifest body must be readable and valid to
-produce that decrement; otherwise folding clamps and keeps the binding protected.
-
-An owner move with the same `ManifestRef`, including precommit promotion, preserves activation and emits
-no delta. A transaction is resolved atomically: either every operation and owner-lifetime effect is
-resolved, or the cursor stays before the transaction.
-
-One `GC` attempt uses this order:
+Phase 1 stores one complete canonical ref base as deterministic, non-overlapping `RunFile` artifacts
+under the GC attempt:
 
 ```text
-read gc/state and exact parent fold seal, or generation-zero empty base
-heartbeat floor
+gc/gen/<generation>/attempt/<attempt>/ref-base/<run_ordinal>.run
+```
+
+Each `RunFile` row uses one of these canonical binary tuple keys:
+
+```text
+LogPrefix(ns) = canonical_namespace_bytes(ns) || "/_log/"
+
+NamespaceMeta = M(LogPrefix(namespace)) || BE64(incarnation.epoch) || BE64(incarnation.sequence) || 0x00
+Committed     = M(LogPrefix(namespace)) || BE64(incarnation.epoch) || BE64(incarnation.sequence) || 0x01
+                || M(ref_name)
+Precommit     = M(LogPrefix(namespace)) || BE64(incarnation.epoch) || BE64(incarnation.sequence) || 0x02
+                || BE64(writer_epoch) || M(ref_name) || BE64(writer_sequence)
+                || BE32(manifest_ordinal)
+```
+
+`M` is memcomparable byte-string encoding, not a conventional length prefix: nonzero bytes are copied,
+`0x00` is escaped as `0x00 0xff`, and the component ends with `0x00 0x00`. Fixed-width integers are
+unsigned big-endian. Consequently bytewise comparison of encoded keys has exactly the same namespace
+group order as canonical object-key `LIST`. Encoding the appended `/_log/` is load-bearing: standalone
+namespace order differs for prefix-related namespaces such as `a@cas@` and `a@cas@/!x@cas@`.
+`RunFileWriter::append` may therefore enforce its existing nondecreasing bytewise-key check without an
+across-namespace sort. `LogPrefix` consumes the exact canonical bytes used after the fixed `cas/refs/`
+prefix; no Unicode normalization or alternate escaping occurs between the two encodings.
+
+`row_kind` is `NamespaceMeta`, `Committed`, or `Precommit`. The namespace row stores `folded_seq`,
+`birth_gc_round`, and `Live` or `Removed`. A committed row stores the `ManifestRef`, mutable files, and
+publication time; a precommit row stores its `ManifestRef`. The base contains only current rows, never
+`Delete` rows or range tombstones. During the full merge, `clear_precommits_before` omits the matching
+precommit prefix and `remove_namespace` omits every owner row while retaining `Removed` namespace
+metadata. No component uses delimiter-sensitive path text.
+
+One canonical row, including a committed ref's complete mutable payload, has a hard encoded-size limit
+below the `RunFile` hard block size. The same limit is checked before the writer creates a log record.
+Oversized mutable metadata fails explicitly; it is not silently moved to another storage path.
+
+Encoding is canonical and streamed. There are no timestamps beyond the writer-provided publication
+time, attempt-dependent fields, pending-cleanup lists, or other nondeterministic metadata. A large
+namespace is a row range spanning blocks and runs; it is never one protobuf string or one oversized run
+record.
+
+Runs use a fixed target size `Q` and split only at row boundaries. For `S_next` bytes in the complete
+next base:
+
+```text
+ref_base_puts <= ceil(S_next / Q) + 1
+```
+
+`Q` is an implementation constant chosen from measurement; 8 MiB is the initial target. The fold seal
+carries one `RefBaseSet`: the exact `RunRef`, checksum, minimum key, and maximum key for every base run.
+Key ranges never overlap. A point read selects at most one run by those bounds. Phase 1 uses the existing
+`RunFileReader` open sequence: `HEAD`, footer range `GET`, then indexed-block range `GET`.
+
+Every productive handoff streams the complete parent base and writes a complete replacement base. An
+idle or deferred round carries the parent's exact `RefBaseSet` verbatim and reads or writes no ref-base
+run. After a successful replacement, ordinary generation retention reclaims the old unreferenced base.
+There are no delta levels, compaction scheduler, overlapping runs, slice graph, or live-pack accounting
+in Phase 1.
+
+An incarnation with no namespace metadata row has an empty base at folded sequence zero. Its complete
+sequence-one-based log remains in `cas/refs`. Once a metadata row exists, every later seal either
+carries the whole base or replaces it with another whole base.
+
+### Fold Algorithm {#fold-algorithm}
+
+`GC` streams the complete parent base once and merges it with the observed contiguous writer tails. It
+materializes only one namespace's bounded touched-row set plus input and output blocks. Unchanged rows
+are copied through the merge; changed rows replace or disappear. Namespace removal and epoch cleanup
+are ordinary merge filters rather than separate storage protocols.
+
+The tuple key begins with namespace and incarnation, matching canonical ref-log `LIST` order. `GC`
+therefore processes namespaces in that order and selects at most one complete transaction prefix per
+namespace per generation. It collapses the selected prefix within `gc_ref_fold_namespace_bytes`, sorts
+that namespace's touched rows in memory, merges them with the parent namespace range, and never returns
+to that namespace after emitting its output. Any suffix stays in `_log` for a later generation. The
+writer tail limits guarantee that the observed touched set is bounded, and one record always fits the
+work budget. No ref-specific external sorter or temporary spill format is needed.
+`clear_precommits_before` and `remove_namespace` filter key ranges during the merge and do not emit one
+deletion row per prior owner.
+
+It then resolves the reachability effect of the selected prefixes:
+
+- An owner added and removed entirely after the parent cursor has net zero effect and requires no
+  manifest read.
+- A live owner newly entering the fold requires a valid manifest body before emitting `+1`.
+- Removal of an owner inherited from the parent fold requires the body before emitting `-1`.
+- Promotion or another move preserving the same `ManifestRef` emits no delta.
+- `remove_namespace` removes every owner atomically. New tail-only lifetimes fold to zero; inherited
+  owners emit their ordinary decrements.
+- A missing, corrupt, or otherwise unreadable required manifest body aborts the entire GC attempt.
+  Durable build death is not an implicit removal.
+- A transaction folds completely or not at all.
+
+Phase 1 has no per-namespace clamp, preflight pass, or restart within the same attempt. Resolution and
+base emission are tentative until the generation `CAS`. If a late body failure occurs after output runs
+or reachability artifacts were finalized, those artifacts remain attempt-local and unadopted; the fold
+seal is not written, `gc/state` is not changed, and no destructive GC or writer-log deletion is allowed.
+The implementation orders all physical delete sites after successful ref-prefix resolution. A later
+attempt restarts from the still-adopted parent base. Independent orphan sweep continues to use the
+complete validated base-plus-tail view and performs no deletion on a missing body.
+
+Ref handoff participates in the existing GC defer decision. A small tail is left in `cas/refs` and the
+parent `RefBaseSet` is carried when no destructive decision is due. Handoff is forced by any of:
+
+- The existing fold-delta threshold.
+- A ref-tail byte or record pressure threshold.
+- The existing maximum defer-round bound.
+- A destructive decision that requires the new owner state.
+- `remove_namespace`, so terminal cleanup does not wait behind batching.
+
+This amortizes ref-run `PUT`s under sparse namespace churn without allowing an unbounded tail.
+Even on a deferred round, destructive protection replays the complete tail; defer never means ignoring
+new owners.
+
+One GC attempt performs:
+
+```text
+read gc/state and its exact parent fold seal
 LIST cas/refs/
-for each namespace incarnation:
-  load the exact parent snapshot or empty base
-  replay the complete contiguous observed log tail into the protection view
-  classify owner lifetimes and eligible dead precommits
-  derive the largest resolved fold prefix
-  build the fold candidate, clamping before its first unresolved transaction
-  build a candidate snapshot at the folded cursor
-write generation runs and cleanup artifacts
-putIfAbsent every candidate snapshot and verify its body hash
-write the fold seal containing exact NamespaceSnapshotRef values
-verify every snapshot referenced by the fold seal
-CAS gc/state to adopt generation and attempt
-re-read gc/state after an uncertain CAS result
-perform adopted cleanup
-trim logs covered by exact adopted snapshots
+validate complete contiguous tails and choose productive or deferred handoff
+if productive:
+  stream the complete parent ref base into tentative replacement artifacts
+  select at most one prefix per namespace and resolve required manifest bodies while merging
+  on any resolution failure, abandon the entire attempt before every physical delete site
+  otherwise finish reachability runs and one complete deterministic ref base
+if deferred:
+  carry the parent ref-base RunRefs verbatim
+write one fold seal naming exact reachability and RefBaseSet RunRefs
+verify every referenced artifact
+perform the existing single gc/state CAS
+if CAS succeeds:
+  remove every _log object at or below its adopted folded_seq
+  group up to 1000 exact keys per backend batch-delete request
+if CAS loses:
+  remove no ref-log object
 ```
 
-The fold seal is not writable until all objects it references are durable. Therefore the state
+The exact `RefBaseSet` and reachability runs are adopted by the same `gc/state` `CAS`. This
+preserves journal coverage without a separate ref snapshot adoption protocol.
 
-```text
-adopted generation + missing adopted snapshot
-```
+### One-Phase Ref-Side Deletion {#one-phase-ref-side-deletion}
 
-is unrepresentable.
+From the ref protocol's perspective, the generation `CAS` is the only phase boundary:
 
-Transaction records fold atomically. If any operation in a transaction is not foldable, the cursor
-stays before the transaction and none of its operations enter the candidate snapshot. Records later in
-the tail still enter the protection view and remain unavailable for trim.
+- Before it, recovery uses the parent GC ref fold plus the full `_log` prefix.
+- After it, recovery uses the new GC ref fold and ignores any physical `_log` objects at or below
+  `folded_seq`.
 
-A multi-page `LIST` is not assumed to be snapshot-isolated. `GC` folds only the contiguous prefix it
-observed and validated. A later record remains for the next attempt.
+`GC` deletes the covered objects immediately after a successful `CAS`, using the backend's exact-key
+batch-delete operation with at most 1000 keys per request. Per-key results are checked; failed keys are
+retried by later maintenance rather than hidden by a single-object fallback. Interruption may leave
+redundant objects, but never pending logical state. Startup and the next `GC` attempt may repeat the
+same delete batches. There is no `_snap`, tombstone adoption, completion seal, or ref-side retention
+rule.
 
-## Dead Precommit Reclamation {#dead-precommit-reclamation}
+A multi-page `LIST` need not be snapshot-isolated. `GC` adopts only the contiguous prefix it observed.
+A concurrently appended record stays above `folded_seq` for the next handoff.
 
-`GC` does not append a writer log record. It may remove a precommit in a candidate snapshot only when a
-durable mount fact proves the build cannot write:
+### Removed Fold Reclamation {#removed-fold-reclamation}
 
-- The precommit epoch is lower than the current mounted writer epoch.
-- The matching epoch has published the retired sentinel.
-- The matching epoch has durably published `min_active > writer_id.writer_sequence`.
+The first full-base rewrite that folds `remove_namespace` emits `Removed` metadata and no owner rows for
+the incarnation. A later full-base rewrite may omit that metadata only after it verifies:
 
-Eligible precommits have two cases:
+- No writer-log object remains for the incarnation, including redundant covered debris.
+- The namespace-file prefix is empty, so writer recovery no longer needs to resume physical cleanup.
 
-1. If the binding is inherited from the exact parent snapshot, it is activated. Read and validate the
-   manifest, emit the matching `-1`, remove the binding from the candidate snapshot, and add its manifest
-   to `pending_manifest_cleanup`.
-2. If the binding was added after the parent cursor, no generation containing its `+1` is authoritative
-   yet. Treat durable build death as resolution of the not-yet-adopted owner lifetime. Advance through
-   the add, emit neither `+1` nor `-1`, omit the binding from the candidate snapshot, and add its manifest
-   to `pending_manifest_cleanup` without reading the body.
-
-Every case records the reclaimed binding and whether it was inherited-activated or tail-unactivated in
-the generation's diagnostic artifact.
-
-The generation deltas, diagnostic record, and exact snapshot are adopted by the same `gc/state` `CAS`.
-If the attempt loses the `CAS` or stops before it, none of those candidate semantics are authoritative.
-
-The next `GC` attempt loads the exact adopted snapshot, where the binding is already absent, so it
-cannot emit a second `-1`.
-
-A running writer may still retain the reclaimed binding in memory. This is safe because:
-
-- Build-scoped operations re-check local active-build membership immediately before append.
-- A build below the published floor is removed from the active set before the floor becomes durable.
-- Namespace-wide writer operations never remove retired precommits from stale memory.
-
-The TLA model must include a running writer whose in-memory state predates adopted reclamation.
+Ordinary GC generation retention reclaims the superseded base. A future writer may create the namespace
+with a greater incarnation and sequence one. This keeps both `cas/refs` and folded state bounded without
+a tombstone-compaction protocol or ref-side registry.
 
 ## Orphan Manifest Sweep {#orphan-manifest-sweep}
 
-The orphan manifest sweep is destructive and therefore uses the protection view, never only the fold
-candidate or adopted snapshot. For the namespace being swept it constructs:
+The destructive protection set for a namespace is:
 
 ```text
-protected_manifest_keys =
-    manifests named by current committed refs
-  + manifests named by current live precommits
-  + adopted pending_manifest_cleanup
-  + manifests named by every tail removal not covered by the adopted snapshot
+manifests named by owners in the adopted RefBaseSet
++ manifests named by current owners after complete tail replay
++ manifests removed anywhere in the unadopted tail
 ```
 
-Current owners include bindings created anywhere in the complete contiguous tail, even after the first
-fold barrier. This closes the case where precommit and promotion both occur after the adopted cursor and
-the build watermark later makes their manifest prefix sweep-eligible.
+For `remove_namespace`, the final term includes every owner present immediately before the transition.
+After the removal is adopted, the generation already contains all required reachability deltas, so the
+old manifests no longer need a separate pending-cleanup list.
 
-The sweep may delete from a build prefix only after this order:
+Before deleting from a retired build prefix, the sweep:
 
-1. Read the durable mount floor and prove the build prefix retired. Active-build membership is removed
-   before that floor becomes durable, and build-scoped appends re-check membership, so no later record
-   from this build prefix can commit after the proof.
-2. Read `gc/state` as `state_before`, then load and verify the exact snapshot selected by its adopted fold
-   seal, or establish a valid empty base.
-3. Replay every log sequence through the maximum observed sequence with no gap, duplicate, corrupt
-   record, or invalid transition. A multi-page scan may include unrelated later records; it may not omit
-   a record from the already-retired target build.
-4. Re-read `gc/state`. If the adopted `(snap_generation, snap_attempt)` changed, discard the protection
-   view and repeat from step 2 so concurrent trim cannot turn an older base plus a missing tail into a
-   plausible state.
-5. The candidate manifest key is absent from `protected_manifest_keys`.
+1. Proves the build retired from the durable mount floor.
+2. Reads `gc/state` and the required rows from the exact adopted `RefBaseSet`.
+3. Replays the complete contiguous tail through the maximum observed sequence.
+4. Re-reads `gc/state`; if the adopted tuple changed, discards the view and retries.
+5. Deletes only a candidate absent from the complete protection set.
 
-Failure of any step skips deletion for the namespace and surfaces the error. The sweep never treats an
-unavailable snapshot, partial tail, or fold clamp as an empty owner set. Exact-token deletion and its
-`NotFound` or token-mismatch handling remain unchanged.
+A missing fold, gap, decode failure, invalid transition, or changed adoption skips deletion and surfaces
+the error. The sweep never substitutes an empty or prefix-only view.
 
-## Snapshot Trim And Retention {#snapshot-trim-and-retention}
+## S3 Request Budget {#s3-request-budget}
 
-After adoption, `GC` reads the currently adopted fold seal again. For each
-`NamespaceSnapshotRef`, it verifies:
+The successful ref-protocol budget is:
 
-- Exact key equality.
-- Key/body namespace, incarnation, sequence, generation, and attempt agreement.
-- Body hash.
-- Supported format version.
-- Replay state invariants.
+| Operation | Requests introduced by ref persistence |
+|---|---|
+| Isolated existing-namespace `precommitAdd` | One zero-byte `_log` `putIfAbsent` |
+| Isolated existing-namespace `promote` | One body-bearing `_log` `putIfAbsent` |
+| Isolated existing-namespace `abandon` or `dropRef` | One inline `_log` `putIfAbsent`, unless the key requires a body |
+| Isolated existing-namespace `updateRefPayload` | One body-bearing `_log` `putIfAbsent` |
+| `B` compatible concurrent mutations | One body-bearing `_log` `putIfAbsent` shared by the batch |
+| `dropNamespace` | One zero-byte inline `_log` `putIfAbsent` |
+| Failed local build with a durable precommit | One removal `_log` `putIfAbsent` |
+| Fenced-predecessor cleanup | One zero-byte inline `clear_precommits_before` `_log` `putIfAbsent` per affected namespace |
+| Fenced-predecessor discovery | One bounded sequential base scan plus tail `LIST`/body reads per mounted epoch; background, never per mutation |
+| Uncertain writer result | One exact-key `GET` to resolve the attempted bytes |
+| First mutation of a new incarnation | At most one `gc/state` `GET`, then one `_log` `putIfAbsent` |
+| Warm-cache same-`Store` ref read | Zero ref-state requests |
+| Cold namespace read | One non-overlapping base-run candidate per sought row, normally metadata plus the touched owner row; `HEAD` plus two range `GET`s for a cold run and one range `GET` with cached metadata; then one namespace-tail `LIST` |
 
-Only then may it delete `_log/<incarnation>/<seq>/...` objects with
-`seq <= NamespaceSnapshotRef.folded_seq`.
+Existing content validation required by operations such as `promote` is accounted separately and must
+not be repeated by the ref protocol.
 
-Trim is incarnation-local. Coverage for one incarnation never authorizes deletion in another.
+For `J` stable-view windows, the successor discovery scan costs `2J` `gc/state` reads, the same `3R`
+opening profile as a full-base GC scan, plus existing-tail intake. It is a once-per-mounted-epoch
+recovery cost, not part of `K`. Phase 1 accounts it explicitly and does not require sharing it with GC;
+scan sharing is a possible Phase 2 optimization.
 
-Partial trim is harmless. A later attempt repeats exact-key deletes. A log record above the adopted
-cursor is never deleted, even if a newer unadopted candidate covers it.
+The normal warm-cache writer path must not add a mutable head, per-operation `gc/state` read, ref
+`HEAD`, fold check, or defensive `LIST`. Failed-build recovery, cache misses, and namespace-file cleanup
+are accounted separately.
 
-The snapshot referenced by the current fold seal and every run or cleanup artifact referenced by that
-seal are retention roots. Older snapshots can be deleted only after a newer adopted seal no longer
-references them and no rebuild-retention rule requires them.
+### Request Cost Model {#request-cost-model}
 
-A tombstoned incarnation can be physically reclaimed only when:
+For one handoff interval let:
 
-- Its exact adopted snapshot is `Tombstoned`.
-- It has no committed refs or live precommits.
-- All pending manifest cleanup is complete.
-- All logs through the tombstone are covered.
-- No current fold seal references an older recovery base for it.
+```text
+W = logical writer mutations
+K = _log objects after flat-combining
+B = W / K, the achieved batch factor
+A = body-bearing fraction of log objects
+S = encoded bytes in the complete next ref base
+P = complete next-base runs, P <= ceil(S / Q) + 1
+R = complete parent-base runs streamed by GC
+H = manifest-body GET cache misses needed to resolve the selected prefix
+P_fail, R_fail, H_fail = ref-base writes and reads completed before a failed attempt aborts
+E_fail = other tentative GC artifact PUTs invalidated by that abort
+```
 
-## Namespace Incarnation And ABA {#namespace-incarnation-and-aba}
+The incremental request counts are:
 
-The first namespace event is a sequence-one `namespace_birth` transaction. The incarnation comes from
-the mounted writer's common `WriterId` allocator and the birth floor is the current `GC` round. A first
-precommit uses its already allocated build `WriterId`; a control-only birth reserves a distinct
-`WriterId` from the same allocator.
+| Phase | PUT | GET/HEAD | LIST | DELETE requests |
+|---|---:|---:|---:|---:|
+| Writer | `K` | `0` | `0` | `0` |
+| GC log intake | `0` | `A·K` | `ceil(K/1000)` | `0` |
+| Productive GC ref fold | `P` | `3R + H` base and manifest-body reads | `0` | `0` |
+| Deferred GC ref fold | `0` | `0` | `0` | `0` |
+| Post-adoption trim | `0` | `0` | `0` | `ceil(K/1000)` |
 
-A `Tombstoned` archive path can be recreated with a strictly greater incarnation. Its log starts again
-at sequence one because the incarnation is part of every physical key.
+The existing fold-seal write and single `gc/state` `CAS` are shared with the rest of the GC round; no
+extra adoption request is introduced. AWS prices `DELETE` as free, but batching remains required to
+bound HTTP, SDK, and backend metadata CPU.
 
-Startup selects the greatest valid incarnation. If two incarnations are not ordered, or a lower
-unreclaimed incarnation is not `Tombstoned`, startup fails closed.
+Using the common S3 Standard ratio `PUT/LIST = 1` and `GET/HEAD = 0.08` request-cost units, the log
+handoff costs approximately:
 
-An older mounted writer cannot create a winning incarnation:
+```text
+K * (1 + 0.08 * A) + ceil(K / 1000) + P + 0.24 * R + 0.08 * H
+```
 
-- Its `writer_epoch` is lower.
-- The mount deadline and local fence stop its writes before a newer mount becomes active.
-- Even if old objects remain, their physical prefix and fold coverage carry the old incarnation.
+That formula is for a successful handoff. A late missing-body failure may already have paid `P_fail`
+writes approaching a full output pass, `R_fail <= R` parent-run opens, and `H_fail` manifest reads and
+therefore adds:
 
-`GC` keeps independent coverage and snapshot references per incarnation. An old cursor can neither skip
-nor trim the sequence-one birth record of the new incarnation.
+```text
+P_fail + E_fail + 0.24 * R_fail + 0.08 * H_fail
+```
 
-Once the newer incarnation has an adopted snapshot, retention may remove the predecessor's terminal
-snapshot when all predecessor cleanup is complete.
+plus the log-intake work shared with the attempted pass. It performs no post-adoption trim. Finalized
+base or reachability objects from the failed attempt are unadopted debris and are removed by ordinary
+attempt pruning. Phase 1 chooses this failure-only waste instead of adding a preflight pass to every
+successful handoff.
 
-## Read Path And Caches {#read-path-and-caches}
+Let `F_fail = P_fail + E_fail` be all finalized objects in the abandoned attempt, including base runs
+and tentative reachability artifacts. Later pruning adds the attempt-prefix `LIST` pages and at most
+`ceil(F_fail / 1000)` batch-delete calls. S3 prices those deletes as free, but the implementation records
+their HTTP and backend metadata cost and keeps abandoned-attempt count under the existing retention
+bound.
 
-Same-`Store` reads use recovered in-memory namespace state. The old `readShardDecoded` cache is removed
-or replaced by the namespace-state owner.
+For an illustrative stable base with `Q = 8 MiB`, `S_parent ~= S_next`, and `H = 0`, the base-only
+productive-fold part is:
 
-`CachedPartFolderAccess` remains the committed-ref facade. Every committed mutation invalidates the
-affected view only after its log object is known durable.
+| Base bytes | Base `PUT`s, upper bound | Parent `GET`/`HEAD` requests | Request-cost units |
+|---:|---:|---:|---:|
+| 25 MiB | 5 | 15 | 6.20 |
+| 165 MiB | 22 | 66 | 27.28 |
+| 588 MiB | 75 | 225 | 93.00 |
 
-`CachedForLoad` may retain a `PartFolderView` after validating the current committed ref through the
-facade. `ForceFresh` uses current in-memory state and continues to prove manifest bodies where required.
+These costs occur per productive ref handoff, not per writer mutation. They are the primary metric for
+deciding whether Phase 2 delta runs are justified. They exclude manifest misses: an empty-cache
+`remove_namespace` or `clear_precommits_before` may add one `GET` per inherited owner whose decrement
+requires a body. An add-plus-remove lifetime contained entirely in the tail still folds to zero with
+`H = 0`.
 
-A `Dropping` namespace can serve refs that have not yet been removed, but it cannot accept normal
-mutations. A `Tombstoned` incarnation serves no refs.
+The old read-modify-write queue cost approximately `1.08 * K_old` units before conflicts. Therefore:
+
+- Flat-combining must achieve `K <= K_old`; removing it is a budget regression.
+- An isolated inline record saves the old full-shard `GET`.
+- A body-bearing batch moves one `GET` from the writer critical path to `GC`; it does not multiply it by
+  `B`.
+- Phase 1 `P` is governed by complete live-base bytes through target-sized runs, not changed-namespace
+  count. This is intentionally more byte-expensive than Phase 2 delta runs.
+- Sparse deltas are deferred and batched by the existing fold thresholds unless destructive work or
+  tail pressure forces handoff.
+
+At the observed `B = 1.4`, preserving batching halves writer critical-path requests from about `1.43`
+to `0.71` per logical mutation. Writer request price drops accordingly, while a productive Phase 1 GC
+fold additionally pays the explicit full-base `P + 0.24R + 0.08H` cost. This cost is measured before
+Phase 2 is designed; it is not hidden in the writer-path comparison.
+
+### Byte And CPU Model {#byte-and-cpu-model}
+
+Let `M` be the encoded mutable shard body and `q` the encoded logical operation. The old writer moved
+approximately `2M/B` bytes per mutation and performed a full decode, full encode, and one full
+`RootShard` copy per request in the batch. Its approximate memory traffic was:
+
+```text
+M * (1 + 2 / B) per logical mutation
+```
+
+The new writer transfers and encodes `O(q)`, validates against only touched cache entries, and stores
+per-operation undo. With `B = 1.4` and an illustrative `q = 512 B`:
+
+| Old shard body `M` | Old writer transfer/mutation | New writer transfer/mutation | Reduction |
+|---:|---:|---:|---:|
+| 25 KiB healthy | 35.7 KiB | 0.5 KiB | about 71x |
+| 165 KiB delayed fold | 235.7 KiB | 0.5 KiB | about 471x |
+
+The later GC body read makes end-to-end log transfer at most `2q` for a body-bearing operation. It does
+not restore dependence on `M`.
+
+Let `S_parent` and `S_next` be the complete encoded parent and next bases, `D` the folded log bytes, and
+`U` the total bytes of the `H` cache-missed manifest bodies. A productive Phase 1 handoff transfers
+`O(S_parent + S_next + D + U)` bytes and performs `O(S_parent + D + U)` merge, decode, and encode CPU.
+An idle or deferred handoff performs zero ref-base I/O. Full-base encoding uses fixed memory:
+
+```text
+O(RunFile block + mutation batch + gc_ref_fold_namespace_bytes)
+```
+
+With a 1 MiB run block and a 16 MiB namespace-fold budget, ref-fold construction needs about 17 MiB plus
+small bounded codec and mutation buffers, independent of total live-ref cardinality. The streaming
+writer rotates output objects near `Q = 8 MiB`; it does not retain `Q` bytes in memory.
+
+### Transient Storage And Object Count {#transient-storage-and-object-count}
+
+For mutation rate `lambda` and handoff interval `T`:
+
+```text
+log objects  ~= lambda * T / B
+log bytes    ~= lambda * T * q
+LIST pages   ~= ceil(lambda * T / (1000 * B))
+```
+
+At 1000 mutations/s, `T = 60 s`, and `B = 1.4`, this is about 42,900 temporary objects and 43 `LIST`
+pages. Dollar cost is small, but bounded handoff cadence and batch delete are necessary for RustFS
+metadata and inode pressure. Unlike mutable shard overwrites, these objects are write-once and disappear
+after the next adopted fold.
+
+A failed productive attempt may additionally leave `P_fail` finalized ref-base runs plus tentative
+reachability artifacts under its attempt directory. They are never named by an adopted fold seal and
+are handled by the existing unadopted-attempt pruning and retention bound. Repeated missing-body
+failures must not create an unbounded set of attempt directories.
 
 ## Failure Handling {#failure-handling}
 
 | Failure | Required result |
 |---|---|
-| Uncertain writer `putIfAbsent` | Re-read the same key under lock; identical bytes succeed, different bytes are corruption |
-| Writer log key conflict | Exception; never allocate a later sequence to hide the conflict |
-| Log gap | Writable startup fails; `GC` clamps or aborts and never trims past it |
-| `gc/state` adoption changes during startup | Discard provisional recovery state and restart from the new exact seal |
-| Protection-view gap or decode failure | Orphan sweep and every destructive namespace action skip deletion and surface the error |
-| Invalid owner transition | Fail closed before applying or folding it |
-| Oversized transaction | Fail before object creation unless the operation has a specified chunk protocol |
-| Candidate snapshot write fails | Do not write or adopt the fold seal |
-| `GC` stops after snapshot writes but before state `CAS` | Candidates remain unadopted debris; logs remain |
-| `GC` state `CAS` loses | Losing snapshots and artifacts remain unadopted and cannot authorize trim |
-| Uncertain `GC` state `CAS` | Re-read `gc/state`; matching generation and attempt mean success |
-| `GC` stops after state `CAS` | Exact adopted snapshots already exist; cleanup and trim resume |
-| Corrupt adopted fold seal or snapshot | Writable startup and destructive `GC` actions fail closed |
-| Interrupted namespace drop | Recover `Dropping(drop_id)` and resume; normal writes remain blocked |
-| Repeated `dropNamespace` | Reuse durable `drop_id`, or return success for `Tombstoned`; append no duplicate lifecycle record |
-| Stale build after `GC` reclaim | Active-build check fails before append |
-| Missing `gc/state` over nonempty adopted history | Writable startup fails; explicit offline rebuild required |
+| Uncertain writer `putIfAbsent` | Read the same key; identical bytes succeed, different bytes are corruption |
+| Writer log key conflict | Exception; never skip to a later sequence |
+| Candidate append exceeds namespace tail or decoded-row bound | Exception before object creation; retain the current sequence |
+| Log gap | Writable recovery fails; `GC` and orphan cleanup delete nothing for the namespace |
+| Current-build removal fails | Keep the build active and propagate the error |
+| Writer stops before precommit removal | The fenced successor appends one epoch clear for the namespace |
+| Writer stops after `remove_namespace` | Recovery sees `Removed` and resumes namespace-file cleanup |
+| GC ref-base run write fails | Do not write the fold seal and do not delete logs |
+| Required manifest body is missing or unreadable, including after tentative runs were finalized | Abort the entire attempt before every physical delete site; publish no fold seal, perform no generation `CAS` or log trim, and prune attempt-local artifacts later |
+| Namespace fold exceeds its hard per-transaction bound or full-base stream fails | Abort the GC attempt; retain the parent base and every writer log |
+| GC generation `CAS` loses | The attempt is unadopted; delete no logs |
+| Uncertain GC generation `CAS` | Re-read `gc/state`; matching generation and attempt mean success |
+| GC stops after successful `CAS` | The new fold is authoritative; repeat covered-log deletion later |
+| Corrupt adopted fold seal or ref run | Writable startup and destructive maintenance fail closed |
+| Missing `gc/state` over trimmed history | Refuse writable startup; require explicit offline rebuild |
 | Sequence overflow | Fail before constructing a record; never wrap |
 
-Unknown future format versions produce the repository's future-format exception, not a fallback to an
-older snapshot.
+Unknown future format versions produce the repository's future-format exception. No path falls back to
+an older plausible fold.
 
-## Offline GC Rebuild {#offline-gc-rebuild}
+## Offline Rebuild {#offline-rebuild}
 
-If `gc/state` is lost, snapshot candidates no longer carry adoption authority by themselves. Offline
-`GC rebuild` may scan every valid snapshot and remaining log to conservatively reconstruct object
-reachability:
+If `gc/state` is lost, attempt-local ref-base runs are not independently authoritative. Offline `GC`
+rebuild may conservatively scan surviving runs and logs, union their owner protection, and publish a
+new verified baseline.
 
-- Union owner and pending-cleanup protection across ambiguous candidates.
-- Never infer that a missing binding was authoritatively reclaimed.
-- Never trim logs or delete content while adoption is ambiguous.
-
-This can over-protect storage. It cannot under-protect content or silently choose a writable namespace
-head. Re-establishing writable authority requires an explicit recovery action that publishes a new
-verified baseline.
-
-## Alternatives Considered {#alternatives-considered}
-
-### Separate Random Build ID {#separate-random-build-id}
-
-Rejected because `{writer_epoch, writer_sequence}` is already globally unique under the mount fence and
-is the identity used by `ManifestRef` and `min_active`. Repeating a random ID lengthens inline keys and
-creates another equality invariant without adding authority.
-
-### Keep Decimal Manifest Identity Paths {#keep-decimal-manifest-identity-paths}
-
-Rejected because the format has not shipped and keeping a second renderer would preserve parser drift
-between manifest enumeration, inline logs, `fsck`, and operational tools. Canonical fixed-width
-`WriterId` also bounds maximum key length more tightly.
-
-### Use GC Round As The Writer Fence {#use-gc-round-as-the-writer-fence}
-
-Rejected because the two values prove different facts. `writer_epoch` fences processes and authorizes
-identity allocation; `birth_gc_round` orders a newborn namespace relative to already adopted `GC`
-state. Combining them would either require a writer-side `gc/state` read on ordinary mutations or fail
-to fence an old process promptly.
-
-### Snapshot-Only Orphan Protection {#snapshot-only-orphan-protection}
-
-Rejected because a committed owner can be created entirely after the adopted cursor. A destructive
-sweep must replay the complete validated tail after first proving the target build retired.
-
-### Remove Every Active Precommit In Begin Drop {#remove-every-active-precommit-in-begin-drop}
-
-Rejected because locally active build cardinality has no protocol bound. `begin_drop` commits the gate
-independently; later exact removals are chunked while active membership remains true.
-
-### Mutable Head Object {#mutable-head-object}
-
-Rejected because it restores a hot overwrite, introduces a second commit marker, and adds uncertain
-ordering between head and log objects.
-
-### Snapshot Written After Adoption {#snapshot-written-after-adoption}
-
-Rejected because an adopted dead-precommit `-1` could exist without the snapshot that remembers the
-binding is gone. A later fold could emit the decrement again or resurrect the binding.
-
-### Cursor-Only Snapshot Adoption {#cursor-only-snapshot-adoption}
-
-Rejected because different `GC` attempts can produce different semantic snapshots at the same writer
-cursor. Adoption must name an exact key and body hash.
-
-### GC Appends Writer Log Records {#gc-appends-writer-log-records}
-
-Rejected because it creates a second sequence allocator and reintroduces coordination with the mounted
-writer.
-
-### Incarnation Only In Transaction Bodies {#incarnation-only-in-transaction-bodies}
-
-Rejected because inline records would inherit replay context and could be misclassified after archive
-path reuse. Physical keys are incarnation-scoped instead.
-
-### Process-Local Drop Lock {#process-local-drop-lock}
-
-Rejected because interruption loses the lock and permits new writes before a drop retry. `begin_drop`
-must be durable.
-
-### Reset Sequence Without Incarnation In Key {#reset-sequence-without-incarnation-in-key}
-
-Rejected because recreated namespaces collide with old append-only objects. Continuing a global
-sequence also makes empty-base recovery depend on retained predecessor objects.
+While adoption is ambiguous, rebuild never infers a missing owner, trims refs, or deletes content. It
+may over-protect storage. Writable authority returns only after an explicit recovery action adopts a new
+baseline.
 
 ## Code Impact {#code-impact}
 
-Implementation work includes:
+- Add common `WriterId` and `ManifestRef` path renderers and parsers.
+- Change the unreleased part-manifest path to canonical fixed-width hexadecimal `WriterId`.
+- Add `RefLogTxn`, canonical GC ref-fold rows, `RefBaseSet`, and shared transition
+  validation.
+- Add incarnation-scoped `_log` construction and parsing to `CasLayout`; do not add `_snap` paths.
+- Reuse the local queue, `MutationScope` carving, leader-caller, and baton logic from
+  `Store::mutateShard`; replace only its read-modify-write flush with the append flush. Replace
+  `Store::readShardDecoded` with a lazy namespace loader, touched-row map, and ordinary byte-bounded
+  run-block cache.
+- Add `ref_state_cache_bytes`, bounded append-batch limits, `max_ref_tail_bytes_per_namespace`, decoded
+  tail-row limits, `gc_ref_fold_namespace_bytes`, and ref-base target bytes.
+- Update `Build::precommitAdd`, `Build::promote`, and `Build::abandon` to obey removal-before-retirement.
+- Add fenced-successor `clear_precommits_before` cleanup.
+- Encode `dropNamespace` as one `remove_namespace` transaction and make startup resume physical file
+  cleanup for `Removed` namespaces.
+- Extend the existing GC fold seal with the exact `RefBaseSet`. Stream one complete deterministic
+  replacement base inside the attempt directory before the existing generation `CAS`.
+- Add one ref-resolution-success gate before every physical GC delete site; a failed tentative ref fold
+  may write attempt artifacts but may delete no content, manifest, or writer log.
+- Add exact-key batch delete and remove adopted writer-log prefixes directly after that `CAS`.
+- Omit terminal `Removed` metadata during a later full-base rewrite only after log debris and namespace
+  files are gone.
+- Expose ref-fold counters for log-body reads, base-run opens, base-run writes, and manifest-body cache
+  misses, split by successful and aborted attempts, so the Phase 2 decision can measure `A`, `R`, `P`,
+  `H`, `R_fail`, `P_fail`, `E_fail`, and `H_fail` directly.
+- Include ref-base and reachability artifacts in the existing bounded unadopted-attempt pruning.
+- Update orphan-manifest sweep, `CasInspect`, `fsck`, and raw rebuild to use the adopted base set and
+  tails.
+- Fix `shadowNamespace` to include `@cas@` before enabling the format.
+- Do not implement delta ref runs, leveled compaction, Bloom filters, or adaptive cache policy in Phase
+  1. They require a separate measured Phase 2 spec.
 
-- Add the common `WriterId` type and use it for build identity, `ManifestRef`, and
-  `NamespaceIncarnation`; remove the serialized random protocol `build_id`.
-- Add `RefLogTxn`, `RefSnapshot`, `NamespaceSnapshotRef`, lifecycle, and codec types.
-- Extend the fold seal with the carried exact snapshot-reference map; absence is allowed only for an
-  incarnation whose adopted cursor is still zero.
-- Add incarnation-scoped key construction and parsing to `CasLayout`.
-- Replace the unreleased decimal part-manifest identity path with canonical `WriterId`, then use the
-  shared render/parse helpers from part-manifest and inline-log paths.
-- Replace `Store::mutateShard` with a namespace mutation queue and replay state owner.
-- Replace `Store::readShardDecoded`, `resolveRef`, and `listRefs` with recovered namespace state.
-- Update `Build::precommitAdd`, `Build::promote`, and `Build::abandon`.
-- Update `dropRef`, `updateRefPayload`, namespace-file mutation gates, and `dropNamespace`.
-- Update `GC` fold, dead-precommit reclaim, snapshot adoption, trim, cleanup, and tombstoned-incarnation
-  reclamation.
-- Update orphan manifest sweep to consume the exact snapshot plus the complete validated tail protection
-  view; a partial view disables deletion.
-- Update `CasInspect` and `fsck` to render candidates separately from adopted snapshots.
-- Fix `shadowNamespace` before enabling the new layout.
-
-The implementation should land behind a format gate so partially converted readers and writers cannot
-share a pool.
+The implementation must be protected by one format gate so partially converted readers and writers
+cannot share a pool.
 
 ## Verification Plan {#verification-plan}
 
-### TLA Model {#tla-model}
+### Model Checks {#model-checks}
 
-Model:
+Do not extend `CaGcRootLocalPartManifestCore.tla`. Its mutable shards, completion seal, GC-side
+precommit reclaim, fence/recheck loop, and roughly forty configurations are the protocol being removed.
+Keep it as a historical regression model and replace its current-design role with two small models:
 
-- Incarnation-scoped writer sequences.
-- Writer `precommit`, `promote`, `abandon`, `drop`, payload update, and durable namespace drop.
-- Distinct fold-candidate and complete-tail protection views.
-- `GC` fold barrier, unactivated and activated dead-precommit reclaim, candidate snapshot writes,
-  fold-seal write, state adoption, cleanup, and trim.
-- A running writer with state older than an adopted dead-precommit snapshot.
-- Namespace recreation while predecessor objects still exist.
+1. Add `CaRefLogHandoffCore.tla`. It models one atomic batch record, per-incarnation sequence,
+   adopted ref state, candidate fold artifacts, the existing generation `CAS`, immediate covered-log
+   trim, whole-attempt abort after a late resolution failure, concurrent GC attempts,
+   `remove_namespace`, and incarnation recreation. Its logical state is simply
+   `Replay(adopted_base, contiguous_tail)`; physical base-run splitting is abstracted as one durable
+   artifact because it is not a safety protocol.
+2. Add `CaRefWriterCleanupCore.tla`. It models active builds, precommit ownership, mount epoch fencing,
+   `clear_precommits_before`, local removal-before-retirement, the cleanup scan's before/after adoption
+   fence, concurrent fold-and-trim, successor cleanup, and namespace removal.
+   Weak fairness on successor maintenance proves eventual cleanup; safety permits the stale precommit to
+   over-protect until then. Keeping this separate avoids multiplying the handoff model's state space by
+   build-liveness states.
 
-Required sabotage cases:
+Modify only these focused current models:
 
-- State adoption before snapshot durability.
-- Cursor-only adoption choosing a losing candidate.
-- Repeated dead-precommit decrement after leader interruption.
-- Dead missing-body precommit that must advance rather than permanently clamp the fold cursor.
-- Writer removal of a snapshot-reclaimed retired precommit.
-- Interleaved publish during chunked drop.
-- Restart during each drop phase.
-- Snapshot-only startup that ignores a log tail.
-- Orphan sweep using a fold-clamped prefix instead of the complete protection tail.
-- Orphan sweep scanning the tail before the target build's retirement floor becomes durable.
-- Trim from an unadopted candidate.
-- Gap, duplicate sequence, conflicting representation, and sequence overflow.
-- Old-incarnation inline record replayed into a new incarnation.
+- Extend `CaManifestSweepWindow.tla` from one pending removal to adopted fold plus complete tail. Add
+  `clear_precommits_before`, `remove_namespace`, whole-attempt abort on unresolved bodies, and protection
+  of every manifest removed anywhere in the unadopted tail.
+- Extend `CaGcRoundDeferCore.tla` with tail pressure, maximum defer age, destructive demand, and
+  `remove_namespace` as force-fold causes. Its existing rule that stale folded state cannot authorize a
+  destructive decision remains unchanged.
+- Update only the explanatory header of `CaGcAckFloorCore.tla`: its immediate `landed`/`folded`
+  abstraction and ack-floor proof remain valid, while fold lag is proved by `CaGcRoundDeferCore` and the
+  new handoff model. Its historical honest-clamp branch is a behavioral superset; Phase 1's whole-attempt
+  abort is stricter and introduces no new delete behavior.
+
+Do not change the behavior of these regression models:
+
+- `CaB140DangleMerge.tla` remains the minimal trim-before-adoption counterexample.
+- `CaGcShardIncarnationCore.tla` remains the old mutable-shard ABA regression; port its
+  path-keyed-cursor sabotage into `CaRefLogHandoffCore.tla` instead of rewriting the model.
+- `CaIncarnationCore.tla` and `CaIncarnationProofCore.tla` remain historical models of the retired
+  registry, mutable journal, fence, and recheck protocol; do not retrofit the new ref handoff into them.
+- `CaBuildRootPrecommit.tla` remains the historical proof of inline closure and fail-closed commit. Its
+  `GcReclaimPrecommit` action is not the new cleanup protocol; cleanup safety moves to
+  `CaRefWriterCleanupCore.tla`.
+- `CaCasMountCore.tla`, `CaEdgeBeforeObserve.tla`, `CaGcAckFloorZombie.tla`, `CaRetiredInRun.tla`, and
+  `CaRetiredInRunFoldAbortWitness.tla` are orthogonal and remain unchanged.
+- `CaBuildWatermark.tla` and `CaBuildWatermarkNum.tla` are already marked superseded and remain
+  historical.
+
+The new models require sabotages for trim before adoption, adoption before every named artifact is
+durable, split batch visibility, sequence gaps, losing-attempt trim, retirement before durable cleanup,
+successor cleanup without a mount fence, cleanup scan without an after-adoption check, implicit GC
+cleanup on build death, cleanup of only the immediate predecessor instead of every epoch below the
+fence, path-keyed incarnation cursors, mutation after `remove_namespace`, and prefix-only orphan
+protection. Another sabotage must allow a late manifest-resolution failure to publish its partially
+constructed base or trim its input logs.
+
+Do not model queue mutexes, cache eviction, base-run splitting, bounded row sorting, or batch-delete
+request size in TLA+. They do not change logical authority. Cover them with deterministic unit tests,
+fault injection, and resource-bound tests below. Any future Phase 2 LSM remains the same abstract
+durable base in these models.
 
 ### Unit Tests {#unit-tests}
 
-- Canonical fixed-width `WriterId`, incarnation, and log-sequence parsing, including rejection of
-  upper-case and shortened forms.
-- One `WriterId` round-trip through build identity, `ManifestRef`, namespace incarnation,
-  part-manifest path, and inline log path.
-- Rejection of a precommit whose binding, manifest, and active-build `WriterId` values disagree.
-- Inline-to-transaction fallback at the key-length boundary.
-- Transaction and snapshot deterministic encoding and hash validation.
-- Canonical snapshot ordering and duplicate rejection.
-- Key/body namespace, incarnation, sequence, generation, and attempt mismatch.
-- Shared transition-validator rejection for duplicate drop, duplicate abandon, missing promote owner,
-  conflicting committed ref, and payload manifest mismatch.
-- Empty-base sequence-one birth and snapshot-plus-tail recovery.
-- Generation-zero `gc/state` without a fold seal.
-- Startup adoption-and-trim race retries instead of installing an older snapshot with a missing tail.
-- Exact fold-seal snapshot selection with newer unadopted candidates present.
-- Idempotent uncertain writer retry.
+- Canonical `WriterId`, manifest suffix, incarnation, and sequence parsing.
+- Shared identity round-trip through build, `ManifestRef`, manifest key, incarnation, and log key.
+- Deterministic transaction, tuple-key, complete-base run encoding, and hash validation.
+- Memcomparable `LogPrefix(namespace)` encoding preserves canonical object-key byte order for different
+  lengths, embedded zero bytes at codec level, and non-ASCII bytes. The regression pair `a@cas@` and
+  `a@cas@/!x@cas@` sorts in physical `LIST` order, and feeding that order into `RunFileWriter` never
+  produces a decreasing key.
+- Flat-combined batches preserve queue order, exclude invalid requests, and use one sequence.
+- A batch performs one `putIfAbsent` and one later GC body `GET`, independent of operation count.
+- Queue stress preserves leader/baton fairness, leaves no idle queue entries, and achieves a batch
+  factor no worse than the current shard-mutation queue under the same writer workload.
+- Key/body namespace, incarnation, sequence, and hash mismatch.
+- Backend probe rejects unordered or non-monotone paginated ref-log `LIST` results.
+- Empty-base sequence-one birth and adopted-fold-plus-tail replay.
+- Log gap, duplicate transition, conflicting owner, payload mismatch, and post-removal mutation.
+- `remove_namespace` clears zero, one, and many committed and precommit owners with one record.
+- Repeated `dropNamespace` returns success without another log append.
+- Startup adoption-and-delete race retries the affected lazy namespace load.
+- Startup loads no owner rows and performs no pool-wide ref `LIST`.
+- Each point lookup selects at most one non-overlapping base run and reuses cached size/footer metadata
+  across metadata and owner-row seeks.
+- Cache eviction followed by lazy reload returns the same owner state and performs no eviction write.
+- Mutate a row in the unadopted tail, evict its complete namespace view, reload it, and prove the tail
+  wins over the older adopted-base row. A test-only partial-row eviction must be rejected or take the
+  explicit base-plus-tail replay path.
+- Cache weight includes strings, touched-row entries, mutable files, precommits, footer indexes, and
+  decoded run blocks.
+- Current-build cleanup failure keeps the build active.
+- Successor cleanup emits one constant-size epoch clear per affected namespace and resumes after every
+  interruption point.
+- A successor scan racing fold adoption and covered-log trim either finds the precommit in its stable
+  base-plus-tail view or detects the changed adoption and retries; it cannot observe neither copy and
+  declare the namespace clean.
+- Successor cleanup runs outside mount and ordinary mutation critical paths; delayed cleanup only
+  preserves extra owners.
+- An isolated warm-cache mutation issues one create and no ref-state reads.
+- `B` compatible warm-cache mutations share one create.
+- `dropNamespace` issues one ref-log create independent of owner count.
 - `shadowNamespace` includes `@cas@`.
-- Existing-namespace mutations issue one `_log` create and no ref-state object-store reads.
-- Sequence-one birth performs at most one `gc/state` read before its `_log` create.
 
-### GC Tests {#gc-tests}
+### GC And Integration Tests {#gc-and-integration-tests}
 
-- Candidate snapshots are durable before the adopting `gc/state` `CAS`.
-- A losing attempt cannot authorize trim.
-- State-`CAS` success always resolves every exact snapshot reference.
-- Dead-precommit reclaim emits one decrement across every interruption point.
-- An unactivated dead precommit advances past its add with no `+1` or `-1`.
-- An add followed by exact removal in the same unadopted tail folds to zero without requiring the body.
-- Pending manifest cleanup survives snapshot compaction.
-- Clamp keeps the non-foldable transaction and all later records in the tail.
-- Trim is incarnation-local and bounded by the exact adopted cursor.
-- `GC rebuild` unions ambiguous protection and performs no destructive action.
-- Orphan sweep protects owners and removals after a fold clamp and performs no deletion on a tail gap.
-- Orphan sweep reads the retiring floor before its tail scan; the reversed-order sabotage deletes a
-  newly committed manifest or is rejected by the model.
-- Orphan sweep retries when concurrent snapshot adoption and trim changes `gc/state` during protection
-  replay.
+- The complete replacement ref base and reachability runs are durable before the generation `CAS`.
+- Sparse ref tails defer without base writes, then hand off on threshold, age, pressure, removal, or
+  destructive demand.
+- Productive ref-base `PUT` count follows complete next-base bytes, not changed-namespace count.
+- With an empty manifest cache, inherited-owner removal reports `H` manifest-body `GET` misses in both
+  request accounting and metrics; a warm cache reduces `H` without changing correctness.
+- Make the last inherited owner body unreadable after at least one tentative base run is finalized. The
+  entire attempt aborts, every physical delete counter remains unchanged, `gc/state` and all writer logs
+  remain unchanged, and attempt pruning later removes the tentative artifacts.
+- Point lookup reads one candidate indexed block; namespace enumeration and productive fold stream runs
+  without whole-run materialization.
+- Idle and deferred rounds carry byte-identical parent `RunRef` values and perform zero ref-base I/O.
+- Large-full-base tests keep measured peak working memory within fixed buffer bounds.
+- A candidate append exceeding the namespace tail bound fails before object creation. If a writer
+  appends another transaction for the same namespace after the fold cut, the current generation never
+  returns to that namespace; the later generation handles the suffix and both bases remain byte-sorted
+  and deterministic without a temporary spill format.
+- A losing GC attempt deletes no writer logs.
+- A winning attempt deletes only records at or below its exact adopted cursor.
+- Stopping after the `CAS` but before deletion recovers from the fold and later removes debris.
+- Add plus remove in one unadopted tail folds to zero without a manifest read.
+- Removal inherited from the parent fold emits exactly one decrement.
+- `remove_namespace` emits decrements only for owners already present in the parent fold.
+- `Removed` metadata is omitted only by a later full-base rewrite after its log debris and
+  namespace-file prefix are empty.
+- A missing required manifest aborts the complete attempt, keeps the parent base and every writer log,
+  and authorizes no destructive action.
+- Orphan sweep retries across concurrent adoption and refuses a tail gap.
+- `INSERT`, promote, drop, restart, namespace removal, and recreation with many refs.
+- RustFS soak shows bounded `cas/refs` size and no large-object overwrite growth.
 
-### Drop Tests {#drop-tests}
+## Decisions {#decisions}
 
-- `begin_drop` blocks ref and namespace-file mutations.
-- Every removal chunk validates `drop_id`.
-- Active precommit removals span multiple bounded chunks without limiting active-build cardinality.
-- A repeated API call reuses the durable `drop_id` and appends no second `begin_drop`.
-- Restart after every chunk resumes the same drop.
-- Final tombstone requires no committed refs, no locally writable build, and an empty file prefix.
-- A retired precommit is not removed by stale writer state.
-- Physical reclamation waits for an adopted snapshot with no live precommit.
-- Recreation uses sequence one under a greater incarnation while predecessor objects remain.
-
-### Integration And Soak {#integration-and-soak}
-
-- `INSERT`, drop, restart, and recreation with many refs.
-- Mutable-only `updateRefPayload` transactions.
-- `DETACH`, `ATTACH`, and `republishRef`.
-- `FREEZE` and `UNFREEZE` under `shadow/...@cas@`.
-- Concurrent writer and `GC` attempts with injected failures at every adoption boundary.
-- Interrupted large `dropNamespace` with concurrent rejected writers.
-- Request-count assertions for precommit, promote, abandon, ref drop, and payload update common paths.
-- RustFS soak confirming that refs remain append-only and no large-overwrite growth returns.
-
-## Approved Decisions {#approved-decisions}
-
-- Use incarnation-scoped snapshot plus append-only log.
-- Keep `_log` as the only writer mutation commit object.
-- Put transaction bytes directly in the `_log` object.
-- Use one mount-fenced `WriterId` for builds, `ManifestRef`, and namespace incarnation; keep `drop_id`
-  and `GC` generation identity separate by purpose.
-- Put incarnation in every log and snapshot key.
-- Start writer sequence at one for every namespace incarnation.
-- Adopt exact snapshots indirectly through the write-once fold seal selected by `gc/state`.
-- Write and verify snapshots before the adoption `CAS`.
-- Keep `GC` out of writer sequence allocation.
-- Reclaim dead precommits through generation-plus-snapshot atomic adoption.
-- Resolve a dead unactivated precommit at its add without manufacturing writer-log records or deltas.
-- Never let a writer remove a retired precommit from stale memory.
-- Use durable `Live -> Dropping(drop_id) -> Tombstoned` lifecycle.
-- Commit the drop gate independently of active-build cardinality and chunk later removals.
-- Reuse the durable `drop_id` on every resume.
-- Gate namespace-file writers with the same drop lifecycle.
-- Require exact adopted snapshots before trim.
-- Use the complete validated tail protection view for every destructive manifest sweep.
-- Keep successful existing-namespace ref persistence at one create and zero ref-state reads.
-- Keep cross-namespace operations re-drivable rather than atomic.
-- Require `@cas@/_log` and `@cas@/_snap`.
-- Fail closed rather than fall back to an older or merely plausible snapshot.
+- `cas/refs` contains only incarnation-scoped append-only writer logs.
+- Folded ref state belongs to the existing GC fold, not a ref snapshot subsystem.
+- Isolated inline operations remain one object; compatible concurrent operations share one bounded
+  body-bearing transaction.
+- Flat-combining reuses the existing writer-local queue/leader/baton mechanism; it is not a new S3
+  coordination protocol.
+- Phase 1 folded ref state is one complete, non-overlapping deterministic `RefBaseSet`. Productive
+  handoff rewrites it completely; deferred handoff carries it verbatim.
+- Phase 1 has no delta levels, compaction policy, coverage index, owner-shard slice graph, or
+  pack-utilization repack protocol. Those are Phase 2 candidates only after measurement.
+- Point lookup selects at most one base run by exact key bounds.
+- Base row ordering encodes the exact physical `<namespace>/_log/` prefix with a memcomparable codec;
+  standalone namespace ordering is not used.
+- The existing single generation `CAS` is the only handoff boundary.
+- Any unresolved required manifest body aborts the entire Phase 1 attempt. Tentative artifacts are
+  pruned; partial base adoption and input-log trim are forbidden.
+- Covered ref logs are deleted immediately after adoption and may remain only as harmless physical
+  debris after interruption; physical deletion uses bounded exact-key batches.
+- Only the mounted writer creates owner transitions.
+- Failed precommits are removed before build retirement or by one fenced-successor epoch clear per
+  affected namespace.
+- `dropNamespace` is one constant-size `remove_namespace` transition clearing all owners atomically.
+- There is no `_snap`, `drop_id`, `Dropping`, `finish_drop`, or persistent pending-cleanup list.
+- Warm isolated persistence remains one S3 create and zero reads; `B` compatible mutations amortize to
+  `1/B` creates.
+- Owner state is lazy and byte-bounded; no startup step materializes every live ref.
+- Builds, manifests, and incarnations share canonical fixed-width hexadecimal `WriterId`.
+- Destructive maintenance always uses the adopted GC fold plus the complete validated tail.
+- Missing or ambiguous authority fails closed.
