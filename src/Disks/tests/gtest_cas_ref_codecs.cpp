@@ -335,6 +335,29 @@ TEST(CasRefCodec, DecodeRejectsUnknownOpKind)
         [&] { decodeRefLogTxn(bytes, txn.ns, txn.txn_id); });
 }
 
+/// Coverage gap (Task 13a): the decode-time reject of an unknown OWNER kind byte (`readBinding`,
+/// CasRefLogCodec.cpp) had no test -- only the sibling unknown-OP-kind reject above did. A corrupt
+/// owner_kind inside an owner binding must fail closed like every other decode validation.
+TEST(CasRefCodec, DecodeRejectsUnknownOwnerKind)
+{
+    RefLogTxn txn;
+    txn.ns = "ns";
+    txn.txn_id = RefTxnId{1, 1};
+    RefOp op;
+    op.kind = RefOpKind::OwnerTransition;
+    op.new_binding = RefOwnerBinding{RefOwnerKind::Committed, "a/b/c", manifestRef(1, 1, 1)};
+    txn.ops.push_back(op);
+    String bytes = encodeRefLogTxn(txn);
+
+    /// Layout up to the binding's owner_kind byte: u32 ver | u32 ns_len | ns | u64 epoch | u64 seq |
+    /// u32 op_count | u8 kind | u8 has_old(0) | u8 has_new(1) | u8 owner_kind ...
+    const size_t owner_kind_offset = 4 + 4 + txn.ns.size() + 8 + 8 + 4 + 1 + 1 + 1;
+    ASSERT_EQ(static_cast<uint8_t>(bytes[owner_kind_offset]), static_cast<uint8_t>(RefOwnerKind::Committed));
+    bytes[owner_kind_offset] = 99;
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { decodeRefLogTxn(bytes, txn.ns, txn.txn_id); });
+}
+
 TEST(CasRefCodec, DecodeRejectsBodyNamespaceMismatch)
 {
     RefLogTxn txn;

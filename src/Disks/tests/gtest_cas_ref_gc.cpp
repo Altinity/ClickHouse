@@ -609,3 +609,69 @@ TEST(CasRefGc, MalformedRefKeyAbortsRefFoldingNoPartialDelta)
     EXPECT_EQ(foldCursorOf(*backend, layout, ns, 0), 0u)
         << "the durable cursor must not advance on an aborted round";
 }
+
+/// Coverage gap (Task 13a): a ref log at a CANONICAL key but with an undecodable BODY aborts ref folding
+/// for the round (spec §Step 2) -- distinct from a malformed *key* (which aborts earlier at the group
+/// step, above). Only the malformed-key path had a test; this exercises the GET-then-decode-throw abort.
+TEST(CasRefGc, InvalidRefLogBodyAbortsFoldNoPartialDelta)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/aa@cas@"};
+
+    const ManifestRef r = mref(1);
+    writeManifestRaw(*backend, layout, ns, r, {blobEntryFor("a", DB::UInt128(1))});
+    publishCommittedTransition(*backend, layout, ns, "tbl", std::nullopt, r);
+
+    /// A canonical `_log` key (groupRefKeys accepts it) whose body cannot be decoded: the fold GETs it,
+    /// decodeRefLogTxn throws, and ref folding aborts -- no partial delta, no cursor advance.
+    backend->putIfAbsent(layout.refLogKey(ns, RefTxnId{1, 999}), "garbage-not-a-valid-reflog-body");
+
+    Gc gc(store, kGc);
+    ASSERT_NO_THROW(gc.runRegularRound());   /// the round catches the abort internally and survives
+
+    EXPECT_EQ(inDegreeOf(*backend, layout, DB::UInt128(1)), 0)
+        << "an invalid ref log body must abort ref folding before any partial delta lands";
+    EXPECT_EQ(foldCursorOf(*backend, layout, ns, 0), 0u)
+        << "the durable cursor must not advance on an aborted round";
+}
+
+/// Coverage gap (Task 13a): the per-table baseline guard (spec §Offline Recovery) has no positive-trip
+/// test at HEAD -- the adapted successor of the retired CasGcBaselineGuard.FreshStateOverTrimmedJournals
+/// contract. A table whose logs at/below its newest snapshot are gone and that has no sealed fold cursor
+/// is the "a prior fold advanced+cleaned covered logs, then gc/state was lost" signature: folding it from
+/// {0,0} would emit no edges and mass-condemn its still-referenced blob. GC must refuse the round before
+/// any delete. The existing CasGcBaselineGuard tests cover only the genuinely-fresh pass case and the
+/// adopted-seal-missing guard, not this branch.
+TEST(CasRefGc, BaselineGuardRefusesWhenSnapshotSurvivesWithoutLogsOrCursor)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    const Layout & layout = store->layout();
+
+    /// Table A is healthy (a committed ref with its manifest+blob, no snapshot), giving GC a normal table
+    /// to fold in the same round.
+    const RootNamespace ns_a{"00/aa@cas@"};
+    const ManifestRef ra = mref(1);
+    writeBlobBody(*backend, layout, DB::UInt128(1));
+    writeManifestRaw(*backend, layout, ns_a, ra, {blobEntryFor("a", DB::UInt128(1))});
+    publishCommittedTransition(*backend, layout, ns_a, "ta", std::nullopt, ra);
+
+    /// Table B is poisoned: a durable snapshot survives, but its logs at/below it are GONE and B has no
+    /// sealed cursor (first round -> no adopted parent cursors). This is the exact baseline-guard input.
+    const RootNamespace ns_b{"00/bb@cas@"};
+    const ManifestRef rb = mref(2);
+    writeBlobBody(*backend, layout, DB::UInt128(2));
+    writeManifestRaw(*backend, layout, ns_b, rb, {blobEntryFor("b", DB::UInt128(2))});
+    writeRefSnapshotRaw(*backend, layout, minimalLiveSnapshot(ns_b.string(), RefTxnId{1, 5},
+        {committedRow("tb", rb)}));
+
+    /// The baseline guard must fail closed BEFORE any destructive step (first round: no prior fold seal,
+    /// so the failure can only come from the baseline guard, not the seal-divergence guard).
+    Gc gc(store, kGc);
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { gc.runRegularRound(); });
+    EXPECT_TRUE(blobPresent(*backend, layout, DB::UInt128(1))) << "table A's blob survives the refusal";
+    EXPECT_TRUE(blobPresent(*backend, layout, DB::UInt128(2)))
+        << "table B's blob must NOT be condemned -- the guard fires before any delete";
+}

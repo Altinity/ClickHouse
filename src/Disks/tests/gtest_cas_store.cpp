@@ -1187,3 +1187,24 @@ TEST(CasStore, ReadManifestSharedReturnsSharedDecodeWithoutCopy)
     ASSERT_EQ(m1->entries.size(), 1u);
     EXPECT_EQ(m1->entries[0].path, "data.bin");
 }
+
+/// Coverage gap (Task 13a): restores the get/exists/remove roundtrip for the mount access-check probe
+/// object. The old `CasStore.MountpointObjectRoundTrip` was dropped in the refactor; the wiring test only
+/// exercises `putMountpointObject` + `existsFile`, leaving `getMountpointObject`'s value round-trip and
+/// `removeMountpointObject` unasserted even though both `Store` methods remain live.
+TEST(CasStore, MountpointObjectRoundTrip)
+{
+    auto b = std::make_shared<DB::Cas::InMemoryBackend>();
+    auto store = DB::Cas::Store::open(b, DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    const String key = "srv1/clickhouse_access_check_abc";
+    EXPECT_FALSE(store->getMountpointObject(key).has_value());
+    EXPECT_FALSE(store->mountpointObjectExists(key));
+    store->putMountpointObject(key, "probe-bytes");
+    EXPECT_TRUE(store->mountpointObjectExists(key));
+    auto got = store->getMountpointObject(key);
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(*got, "probe-bytes");
+    store->removeMountpointObject(key);
+    EXPECT_FALSE(store->getMountpointObject(key).has_value());
+    EXPECT_FALSE(store->mountpointObjectExists(key));
+}

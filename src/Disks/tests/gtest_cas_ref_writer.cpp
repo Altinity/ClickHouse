@@ -1383,3 +1383,53 @@ TEST(RefWriterNamespaceBirth, BirthFromNeverBornNeedsNoMarker)
     EXPECT_NO_THROW(publishEmptyPart(store, ns, "first"));
     EXPECT_TRUE(store->resolveRef(ns, "first").has_value());
 }
+
+/// Coverage gap (Task 13a): the "one op per ref name per batch" cut in `flushRefBatch` (the `seen_refs`
+/// guard, `CasRefBatchScopeCuts`) had no test after the shard-lane `CasShardQueue.SameRefMutations
+/// SplitAcrossFlushes` was retired. Two payload mutations of the SAME committed ref, made co-pending by
+/// the pre-carve hook (mirrors `CompatibleMutationsShareOneCreate`), must NOT co-batch: per-request undo
+/// validates each op against the pre-batch state, so the batch carries at most one op per ref name and
+/// the two flush as two separate `_log` objects.
+TEST(RefWriterAppendLane, SameRefMutationsSplitAcrossFlushes)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openStore(backend);
+    const RootNamespace ns{"srv1/samerefsplit"};
+    publishEmptyPart(store, ns, "a");
+    ASSERT_TRUE(store->resolveRef(ns, "a").has_value());
+
+    std::mutex m;
+    std::condition_variable cv;
+    bool entered = false;
+    store->setRefPreCarveHookForTest([&]
+    {
+        std::unique_lock lk(m);
+        if (entered)
+            return;   /// only the leader's own first carve blocks; the second flush proceeds
+        entered = true;
+        cv.notify_all();
+        cv.wait(lk, [&] { return store->refQueuePendingForTest(ns) >= 2; });
+    });
+
+    const uint64_t put_before = backend->putTotal();
+    std::thread t_a([&] { store->updateRefPayload(ns, "a", [](RefMutableFilesUpdate & r) { r.mutable_files["k"] = "1"; }); });
+    {
+        std::unique_lock lk(m);
+        cv.wait(lk, [&] { return entered; });
+    }
+    std::thread t_b([&] { store->updateRefPayload(ns, "a", [](RefMutableFilesUpdate & r) { r.mutable_files["k"] = "2"; }); });
+    while (store->refQueuePendingForTest(ns) < 2)
+        std::this_thread::yield();
+    cv.notify_all();
+    t_a.join();
+    t_b.join();
+    store->setRefPreCarveHookForTest(nullptr);
+
+    EXPECT_EQ(backend->putTotal(), put_before + 2) << "same-ref mutations must flush as two separate logs";
+    /// Neither mutation was lost or corrupted -- the ref still resolves with one of the two writes.
+    const auto resolved = store->resolveRef(ns, "a");
+    ASSERT_TRUE(resolved.has_value());
+    const auto it = resolved->mutable_files.find("k");
+    ASSERT_NE(it, resolved->mutable_files.end());
+    EXPECT_TRUE(it->second == "1" || it->second == "2");
+}
