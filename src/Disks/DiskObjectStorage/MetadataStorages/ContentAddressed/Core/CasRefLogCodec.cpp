@@ -6,6 +6,7 @@
 #include <IO/ReadHelpers.h>
 #include <Common/Exception.h>
 #include <algorithm>
+#include <limits>
 
 namespace DB
 {
@@ -24,32 +25,11 @@ namespace
 
 constexpr uint32_t kRefLogTxnFormatVersion = 1;
 
-/// Canonical clean relative path (spec §One Log Encoding): non-empty, no backslash, and no segment
-/// that is empty (rejects a leading/trailing/doubled '/'), ".", or "..".
-bool isCanonicalRefName(std::string_view name)
-{
-    if (name.empty() || name.find('\\') != std::string_view::npos)
-        return false;
-    size_t start = 0;
-    while (true)
-    {
-        const size_t end = name.find('/', start);
-        const std::string_view segment
-            = name.substr(start, end == std::string_view::npos ? std::string_view::npos : end - start);
-        if (segment.empty() || segment == "." || segment == "..")
-            return false;
-        if (end == std::string_view::npos)
-            break;
-        start = end + 1;
-    }
-    return true;
-}
-
+/// Canonical-clean-relative-path check (spec §One Log Encoding): shared with `CasRefSnapshotCodec` via
+/// `CasCodecUtil.h`'s `isCanonicalRefName`/`checkCanonicalRefName` rather than duplicated per codec.
 void checkRefName(std::string_view name, std::string_view what)
 {
-    if (!isCanonicalRefName(name))
-        throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "RefLogTxn: {} is not a canonical clean relative path: '{}'", what, name);
+    checkCanonicalRefName(name, "RefLogTxn", what);
 }
 
 void writeManifestRef(WriteBuffer & out, const ManifestRef & ref)
@@ -70,6 +50,10 @@ ManifestRef readManifestRef(ReadBuffer & in)
 
 void writeLenPrefixed(WriteBuffer & out, const String & s)
 {
+    /// Explicit guard rather than relying on the op/byte budgets alone to keep every string short:
+    /// this is the point where a length silently truncated by the u32 cast would corrupt the wire.
+    if (s.size() > std::numeric_limits<uint32_t>::max())
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "RefLogTxn: string field of {} bytes exceeds UInt32 length prefix", s.size());
     writeBinaryLittleEndian(static_cast<uint32_t>(s.size()), out);
     out.write(s.data(), s.size());
 }

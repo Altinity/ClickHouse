@@ -94,4 +94,37 @@ auto decodeGuarded(std::string_view what, F && f)
     }
 }
 
+/// Canonical clean relative path, shared by every codec that embeds a ref/file name in its body
+/// (`CasRefLogCodec`, `CasRefSnapshotCodec`): non-empty, no NUL byte, no backslash, and no segment
+/// that is empty (rejects a leading/trailing/doubled '/'), ".", or "..". Names in this family
+/// originate from part names -- a NUL byte is never legitimate there, so it fails closed rather than
+/// being silently truncated or passed through.
+inline bool isCanonicalRefName(std::string_view name)
+{
+    if (name.empty() || name.find('\0') != std::string_view::npos || name.find('\\') != std::string_view::npos)
+        return false;
+    size_t start = 0;
+    while (true)
+    {
+        const size_t end = name.find('/', start);
+        const std::string_view segment
+            = name.substr(start, end == std::string_view::npos ? std::string_view::npos : end - start);
+        if (segment.empty() || segment == "." || segment == "..")
+            return false;
+        if (end == std::string_view::npos)
+            break;
+        start = end + 1;
+    }
+    return true;
+}
+
+/// Throws CORRUPTED_DATA naming both `caller` (the codec, e.g. "RefLogTxn") and `what` (the field,
+/// e.g. "set_payload ref_name") when `name` fails `isCanonicalRefName`.
+inline void checkCanonicalRefName(std::string_view name, std::string_view caller, std::string_view what)
+{
+    if (!isCanonicalRefName(name))
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "{}: {} is not a canonical clean relative path: '{}'", caller, what, name);
+}
+
 }
