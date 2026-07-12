@@ -386,6 +386,41 @@ lifecycle → `fsck` clean → `ca-gc-dryrun` empty.
 
 - [ ] Tests green; commit: `cas: read-only consumers, counters, e2e for ref snapshot+log`
 
+### Task 13a: Test-coverage audit of the refactored surface + gap-filling tests
+
+**Motivation:** Tasks 10-13 rewrote or deleted a large share of the CAS unit suites (writer
+persistence, GC fixtures, journal-trim/token-guard contracts, fsck/inspect). This step verifies that
+nothing important stopped being tested after the refactor, and closes every gap with new tests before
+the soak.
+
+**Method (all four parts required):**
+1. **Contract inventory.** Diff every `src/Disks/tests/gtest_cas_*` / `cas_test_helpers.h` between
+   the pre-rework baseline `a39032d51fa` (last commit before the Task 10 writer switch) and HEAD.
+   For each `TEST()` deleted or rewritten since, classify into exactly one of:
+   *preserved-equivalent* (name the new test that carries the same behavioral contract),
+   *obsolete* (the contract's concept was removed by the spec — cite the spec section), or **GAP**.
+   No unclassified deletions allowed.
+2. **Structural coverage.** Dedicated coverage build (clang source-based
+   `-fprofile-instr-generate -fcoverage-mapping`, separate `build_cov` dir) of `unit_tests_dbms`;
+   run the full CAS sweep; report per-file line+region coverage for every new/rewritten Core file
+   (`CasRefIds`, `CasRefLogCodec`, `CasRefSnapshotCodec`, `CasRefStateMachine`, `CasRequestControl`,
+   the ref-intake module, `CasGc`, `CasStore`, `CasFsck`, `CasInspect`, `CasOrphanManifestSweep`,
+   `CasLayout`). Enumerate uncovered branches specifically in fail-closed / clamp / cleanup /
+   fence / wedge / restart-on-vanish paths — each must be either covered by a test or explicitly
+   justified in the report (fail-closed paths are where regressions hide).
+3. **Spec cross-check.** Re-verify that every unit-test bullet in Tasks 4-13 of this plan still has
+   a live, asserting test at HEAD (the bullets were written pre-refactor; rewrites may have
+   silently weakened them).
+4. **Gap-filling tests.** Write tests for every GAP from (1) and every unjustified uncovered branch
+   from (2). Each new test must be shown to discriminate: it fails under a targeted revert or
+   mutation of the code it guards (record the mutation used).
+
+- [ ] Contract map complete — zero unclassified deletions; GAP list closed or explicitly accepted
+- [ ] Coverage report generated; all fail-closed-class branches covered or justified
+- [ ] Gap tests written, discrimination evidence recorded, full sweep green
+- [ ] Report committed to `docs/superpowers/reports/2026-07-XX-cas-refsnaplog-coverage-audit.md`
+- [ ] Commit: `cas: coverage audit and gap-filling tests for the ref snapshot-log refactor`
+
 ### Task 14: 1-hour soak
 
 Rebuild release binary; 2-node ca-soak cluster on rustfs (`utils/ca-soak`, compose from
