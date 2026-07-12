@@ -566,9 +566,12 @@ injection, the diagnostic counter, and a future cross-epoch fence (for example K
 predecessor draining) remain the real containment.
 
 This is an open correctness limitation, not an S3 consistency guarantee or a case handled by `GC`.
-The implementation must expose fault injection and a best-effort counter for responses observed after
-the local fence, and the TLA+ model must retain a `LatePredecessorPut` action that demonstrates the
-counterexample. The counter is diagnostic and cannot prove that no unobserved late completion exists.
+The implementation must expose a best-effort counter for responses observed after the local fence
+(`CasConditionalWriteFenceLostPostWrite`), and the TLA+ model must retain a `LatePredecessorPut`
+action that demonstrates the counterexample. The cross-epoch fault-injection integration test that
+reproduces the counterexample end-to-end is Phase 2 scope (the Phase 1 containment is the counter,
+the grace age, and the model). The counter is diagnostic and cannot prove that no unobserved late
+completion exists.
 CAS-specific attempt timeouts, retry suppression, exact-result resolution, and pre-ACK fence checks are
 specified separately in [CAS S3 Timeout and Retry Control RFC](2026-07-12-cas-s3-timeout-retry-control-rfc.md).
 Phase 1 does not add a per-table `_seal`, mutable `_head`, or extra request to every ordinary mutation.
@@ -873,9 +876,16 @@ another pass for that item.
 
 Two properties make a straggling delete from a deposed cleanup pass harmless. First, deletion always
 uses exact keys captured by that pass's own enumeration; a prefix wildcard is never a delete
-primitive. Second, every object key created after recreation contains the successor `writer_epoch`
-(ref logs and snapshots through `RefTxnId`, manifests through `ManifestRef`), so an exact key
-enumerated in the removed incarnation cannot name a recreated object. A later `namespace_birth` is
+primitive. Second, every object key created after recreation is strictly greater in id order than
+every key of the removed incarnation (ref logs and snapshots through `RefTxnId`, manifests through
+`ManifestRef`), so an exact key enumerated in the removed incarnation cannot name a recreated
+object. Successor-ness is id order, not the `writer_epoch` component alone: a warm recreation by the
+same mount continues under the same `writer_epoch` with a strictly greater sequence, while a
+recreation after remount carries a greater `writer_epoch`. Guards that compare only the epoch
+component therefore under-protect warm recreation; the load-bearing straggler guard is observing the
+`_cleanup` marker (whose presence is the recreation precondition) before any delete, with id-order
+exactness as defense in depth. Verbatim namespace files carry no id at all and rely entirely on the
+marker guard. A later `namespace_birth` is
 rejected until the exact completion is observed; merely observing an empty prefix is insufficient.
 
 After `Completed` is durable in the fold, the winner publishes the `_cleanup/<remove-txn-id>` marker
