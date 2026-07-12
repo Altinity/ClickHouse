@@ -791,7 +791,7 @@ private:
     void maybeSweepStalePrecommits(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt);
     /// The actual chunked removal loop (spec §Clean Up Old Precommits): repeatedly re-reads the live
     /// state, gathers up to `ref_txn_max_ops` stale precommits (`manifest_ref.writer_epoch <
-    /// process_epoch`), and appends one bounded exact-removal transaction per chunk, until none remain.
+    /// liveWriterEpoch()`), and appends one bounded exact-removal transaction per chunk, until none remain.
     void sweepStalePrecommitsNow(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt);
     /// Review follow-up (T11): the READ-side wrapper `resolveRef`/`listRefs` call instead of
     /// `maybeSweepStalePrecommits` directly -- catches any failure (an uncertain PUT propagated as

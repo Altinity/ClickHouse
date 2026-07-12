@@ -1423,7 +1423,12 @@ void Store::flushRefBatch(const RootNamespace & ns, const std::shared_ptr<RefTab
         return;
     }
 
-    const auto fence_ok = [this] { return refAppendFenceOk(); };
+    /// The pre-attempt / post-write fence gate for THIS flush's controller calls. It also folds in
+    /// `superseded_by_remount` so the append PUT is airtight against a self-remount that lands between a
+    /// leader's pre-allocate re-check and its PUT: `superseded` is published before `armMountFence`, so a
+    /// leader whose PUT observes a LIVE fence (`refAppendFenceOk` true) necessarily observes the flag too
+    /// (release/acquire through the fence) and reports Unresolved instead of committing against a stale cache.
+    const auto fence_ok = [this, &rt] { return refAppendFenceOk() && !rt->superseded_by_remount.load(std::memory_order_acquire); };
 
     /// Resolve an outstanding wedge FIRST (spec §Writer-Side Linearization): "It does not start a later
     /// ref-log PUT for that table until the earlier result is resolved."
@@ -1611,6 +1616,31 @@ void Store::flushRefBatch(const RootNamespace & ns, const std::shared_ptr<RefTab
         return;
     }
 
+    /// Self-remount re-check BEFORE allocating an id (spec §Startup And Recovery): the top-of-flush gate
+    /// is passed once, but a leader can stall between it and here -- in `build_ops`' caller I/O -- across
+    /// the whole fence-loss + remount window, then resume after `armMountFence`. Allocating {new_epoch,
+    /// seq} now and PUTting it (its live `fence_ok` would pass) would persist a transaction validated
+    /// against this orphaned runtime's STALE cache -- the C1 data-loss class. `superseded_by_remount` is
+    /// published before the fence re-arm, so failing closed here (no id, no PUT, no wedge -- a safe gap,
+    /// cache unchanged) keeps the durable log free of any stale-view transaction. The append `fence_ok`
+    /// (which also checks the flag) is the airtight backstop for the narrow window past this point.
+    /// Self-remount re-check BEFORE allocating an id (spec §Startup And Recovery): the top-of-flush gate
+    /// is passed once, but a leader can stall between it and here -- in `build_ops`' caller I/O -- across
+    /// the whole fence-loss + remount window, then resume after `armMountFence`. Allocating {new_epoch,
+    /// seq} now and PUTting it (its live `fence_ok` would pass) would persist a transaction validated
+    /// against this orphaned runtime's STALE cache -- the C1 data-loss class. `superseded_by_remount` is
+    /// published before the fence re-arm, so failing closed here (no id, no PUT, no wedge -- a safe gap,
+    /// cache unchanged) keeps the durable log free of any stale-view transaction. The append `fence_ok`
+    /// (which also checks the flag) is the airtight backstop for the narrow window past this point.
+    if (rt->superseded_by_remount.load(std::memory_order_acquire))
+    {
+        complete_error(survivors, std::make_exception_ptr(Exception(ErrorCodes::ABORTED,
+            "CAS ref-log append for server_root '{}': this cached table was superseded by a self-remount "
+            "before id allocation — retry against the fresh mount incarnation",
+            config.server_root_id)));
+        return;
+    }
+
     const RefTxnId id = allocateRefTxnId();
     const RefLogTxn final_txn{ns.string(), id, final_ops};
     String bytes;
@@ -1658,11 +1688,12 @@ void Store::flushRefBatch(const RootNamespace & ns, const std::shared_ptr<RefTab
                 /// COMPLETE ops array is already validated as one combined transaction before this
                 /// point) -- but `final_txn` is now durably PUT regardless, so if this line throws
                 /// anyway (a bug the pre-check did not anticipate), every future recovery would replay
-                /// and re-throw on it, bricking this table forever. Restore the queue's own leader
-                /// bookkeeping here (this catch bypasses appendRefOps's normal post-runRefQueueLeader
-                /// reset, since we rethrow past it) so this table's lane is not ALSO wedged for every
-                /// OTHER mount, then fail every waiting survivor's own caller with a clear diagnostic
-                /// instead of leaving them hung on an `item->done` that would otherwise never be set.
+                /// and re-throw on it, bricking this table forever. Fail every waiting survivor's own
+                /// caller with a clear diagnostic instead of leaving them hung on an `item->done` that
+                /// would otherwise never be set, then rethrow: `appendRefOps`'s own catch is the SOLE
+                /// authority that resets `leader_active` on an exceptional exit from the leader loop, so
+                /// this path must NOT reset it too (a double reset would open a two-leader window -- a
+                /// waiter woken by the first reset could become leader before this frame unwinds).
                 const String detail = getCurrentExceptionMessage(false);
                 Exception rethrown(ErrorCodes::LOGICAL_ERROR,
                     "CAS ref-log append for namespace '{}': the durably-committed transaction {}-{} "
@@ -1672,11 +1703,6 @@ void Store::flushRefBatch(const RootNamespace & ns, const std::shared_ptr<RefTab
                     "hit the same failure: {}",
                     ns.string(), id.writer_epoch, id.ref_sequence, detail);
                 complete_error(survivors, std::make_exception_ptr(rethrown));
-                {
-                    std::lock_guard<std::mutex> g(ref_queue_mutex);
-                    rt->leader_active = false;
-                    rt->cv.notify_all();
-                }
                 throw rethrown;
             }
             ProfileEvents::increment(ProfileEvents::CasRefBatchFlushes);

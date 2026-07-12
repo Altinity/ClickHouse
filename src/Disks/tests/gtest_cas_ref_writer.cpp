@@ -1558,6 +1558,66 @@ TEST(RefWriterRemount, DiscardsWedgeAndLaneRemainsUsable)
     EXPECT_EQ(greatest->writer_epoch, store->liveWriterEpoch());
 }
 
+/// C1 residual: a flush leader that passed the top-of-flush gate BEFORE a self-remount and stalled
+/// mid-flush (here parked at the pre-carve hook, post-top-gate / pre-allocate) across the whole
+/// fence-loss + remount window must NOT, on resume, allocate an id and PUT a transaction validated
+/// against its now-stale detached cache. The pre-allocate `superseded_by_remount` re-check fails it
+/// closed: the caller gets the failure and no backend `_log` object is created.
+TEST(RefWriterRemount, SupersededLeaderMidFlushFailsClosedCreatesNoObject)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openStore(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/remount_midflush"};
+    publishEmptyPart(store, ns, "x");
+    const auto greatest_before = listGreatestLogIdForTest(*backend, layout, ns);
+    ASSERT_TRUE(greatest_before.has_value());
+
+    /// Park the next flush leader at the pre-carve hook (post-top-gate, pre-allocate). Fires once.
+    std::mutex m;
+    std::condition_variable cv;
+    bool entered = false;
+    bool release = false;
+    std::atomic<bool> hook_fired{false};
+    store->setRefPreCarveHookForTest([&]
+    {
+        if (hook_fired.exchange(true))
+            return;
+        std::unique_lock<std::mutex> lk(m);
+        entered = true;
+        cv.notify_all();
+        cv.wait(lk, [&] { return release; });
+    });
+
+    auto fut = std::async(std::launch::async, [&]() -> std::string
+    {
+        try { store->dropRef(ns, "x"); return "committed"; }
+        catch (const DB::Exception & e) { return e.message(); }
+    });
+    { std::unique_lock<std::mutex> lk(m); cv.wait(lk, [&] { return entered; }); }   /// leader parked mid-flush
+
+    /// The remount completes while the leader is parked (the quiesce does not wait for leaders); it marks
+    /// the table superseded and re-arms the fence.
+    fenceOutRefMount(*backend, layout.mountKey("test"));
+    ASSERT_TRUE(store->tryRemountOnce());
+
+    /// Unpark: the leader resumes, re-checks the flag before allocating, and fails closed.
+    { std::lock_guard<std::mutex> lk(m); release = true; }
+    cv.notify_all();
+
+    ASSERT_EQ(fut.wait_for(std::chrono::seconds(10)), std::future_status::ready)
+        << "the superseded leader hung instead of failing closed";
+    const std::string result = fut.get();
+    EXPECT_NE(result.find("superseded by a self-remount"), std::string::npos)
+        << "expected a superseded fail-closed, got: " << result;
+
+    /// No new ref-log object was created: the greatest durable log id is unchanged.
+    const auto greatest_after = listGreatestLogIdForTest(*backend, layout, ns);
+    ASSERT_TRUE(greatest_after.has_value());
+    EXPECT_EQ(*greatest_after, *greatest_before)
+        << "a superseded leader must allocate no id and PUT no object";
+}
+
 /// ===================================================================================
 /// Task 11: namespace removal (spec §Namespace Removal)
 /// ===================================================================================
