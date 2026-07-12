@@ -927,3 +927,59 @@ TEST(CasRefGc, CompletedItemRepublishesCrashLostRemovedSnapshotThenRetires)
     EXPECT_EQ(seal.ns_cleanup_items.count(ns.string() + "\n" + renderRefTxnId(remove_txn)), 0u)
         << "once the marker + Removed snapshot are durably observed the item retires";
 }
+
+namespace
+{
+/// Makes the `_cleanup` marker read as ABSENT on its first HEAD and PRESENT thereafter -- a successor
+/// publishing it mid-pass, exactly the window the per-KEY marker guard must close (the per-PAGE HEAD saw
+/// it absent, then the per-key HEAD sees it present before the delete).
+class MarkerAppearsAfterFirstHeadBackend : public InMemoryBackend
+{
+public:
+    String marker_key;
+    int marker_heads = 0;
+    HeadResult head(const String & key) override
+    {
+        if (key == marker_key && ++marker_heads >= 2)
+            return HeadResult{.exists = true, .size = 0, .token = Token{}, .attributes = {}};
+        return InMemoryBackend::head(key);
+    }
+};
+}
+
+/// (C3 hardening) The per-KEY marker HEAD on the manifest branch closes the mid-pass recreation window the
+/// epoch filter alone cannot: a WARM recreation reuses the same `live_writer_epoch` (bumped only at
+/// open/remount), so its manifest carries `writer_epoch` EQUAL to the removed incarnation's and the
+/// `> remove epoch` skip would NOT spare it. Here the marker is absent at the per-page HEAD (the pass
+/// proceeds) but present before the same-epoch manifest's per-key HEAD -- which must abort and spare it.
+TEST(CasRefGc, PendingPassPerKeyMarkerGuardSparesWarmSameEpochRecreation)
+{
+    auto backend = std::make_shared<MarkerAppearsAfterFirstHeadBackend>();
+    auto store = openStoreForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"00/aa@cas@"};
+
+    Gc gc(store, kGc);
+    gc.runRegularRound();
+    const GcState st = decodeGcState(backend->get(layout.gcStateKey())->bytes);
+    ASSERT_EQ(st.lease.owner, kGc);
+
+    /// Removed at epoch 2; a WARM recreation writes a manifest at the SAME epoch 2 (greater build_sequence),
+    /// which the `> remove epoch` skip does NOT spare -- only the per-key marker HEAD can.
+    const RefTxnId remove_txn{2, 5};
+    CasFoldSeal seal;
+    seal.ns_cleanup_items[ns.string() + "\n" + renderRefTxnId(remove_txn)] =
+        RefNsCleanupItem{.ns = ns, .remove_txn_id = remove_txn, .state = RefNsCleanupState::Pending};
+
+    const ManifestRef warm_recreated = ManifestRef{.writer_epoch = 2, .build_sequence = 9, .manifest_ordinal = 1};
+    writeManifestRaw(*backend, layout, ns, warm_recreated, {blobEntryFor("a", DB::UInt128(1))});
+
+    /// Absent at the per-page HEAD (marker_heads == 1), present at the per-key HEAD (>= 2).
+    backend->marker_key = layout.refCleanupMarkerKey(ns, remove_txn);
+
+    gc.runNamespaceCleanupPassesForTest(seal, /*ref_tables*/{}, st.round, /*suppress_destructive*/false);
+
+    EXPECT_TRUE(backend->head(layout.manifestKey(ManifestId{ns, warm_recreated})).exists)
+        << "a same-epoch warm recreation's manifest must survive: the per-key marker HEAD aborts the pass "
+           "even though the epoch filter would not spare it and the per-page HEAD saw the marker absent";
+}

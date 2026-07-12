@@ -260,9 +260,10 @@ private:
     /// republishes the constant-size `Removed` snapshot (both idempotent `putIfAbsent`). Runs post-CAS.
     /// A stale leader (deposed after its round CAS but still executing) must never delete a namespace a
     /// successor round Completed and the writer recreated: the Pending pass re-reads gc/state (aborting
-    /// unless `durable.round == new_round` under our lease), aborts on the `_cleanup` marker's presence
-    /// (the exact recreation precondition, spec §Namespace Birth), and epoch-filters manifest deletes to
-    /// the removed incarnation's `writer_epoch` (a recreated manifest carries a strictly greater epoch).
+    /// unless `durable.round == new_round` under our lease) and aborts on the `_cleanup` marker's presence
+    /// HEAD'd PER KEY -- the exact recreation precondition for both a cold (successor-epoch) and a warm
+    /// (same-epoch) recreation, spec §Namespace Birth. A cheap greater-epoch skip on manifest keys is kept
+    /// as defense-in-depth.
     /// `ref_tables` is this round's own global LIST: the `Removed`-snapshot republication is gated on it
     /// so a snapshot a recreated namespace already superseded is never re-created (the per-round churn).
     void runNamespaceCleanupPasses(const CasFoldSeal & seal, const std::map<String, RefTableListing> & ref_tables,

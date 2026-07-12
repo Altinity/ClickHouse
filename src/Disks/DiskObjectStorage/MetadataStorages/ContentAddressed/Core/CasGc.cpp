@@ -1474,24 +1474,26 @@ void Gc::runNamespaceCleanupPasses(const CasFoldSeal & seal, const std::map<Stri
                     const ListPage page = backend.list(pass.prefix, cursor, 1000);
                     for (const ListedKey & lk : page.keys)
                     {
+                        /// PER-KEY recreation guard (airtight, applied to every key of both prefixes). The
+                        /// `_cleanup` marker's presence is the exact precondition for ANY recreation (spec
+                        /// §Namespace Birth). Checking it per key -- not just per page -- closes the window
+                        /// where a recreation lands mid-page: a manifest body is deleted only if the marker
+                        /// was still absent immediately before its delete. This covers a WARM recreation too
+                        /// (`observedNamespaceCleanupMarker` reuses the same `live_writer_epoch` -- bumped only
+                        /// at open/remount, never on warm recreation -- so its manifest carries `writer_epoch`
+                        /// EQUAL to the removed incarnation's and would slip past the epoch skip below).
+                        if (backend.head(marker_key).exists)
+                            return;
+
+                        /// Cheap defense-in-depth skip for manifests: a strictly-greater-epoch body is a
+                        /// cold recreation's and is never removed-incarnation debris (an unparseable key is
+                        /// skipped fail-closed; the orphan sweep is the backstop). The per-key marker HEAD
+                        /// above is the load-bearing guard; verbatim files carry no epoch and rely on it alone.
                         if (pass.is_manifest)
                         {
-                            /// Manifest deletes are epoch-timing-independent: a recreated namespace's manifest
-                            /// carries a strictly greater `writer_epoch`, so a body at/below the removed
-                            /// incarnation's epoch can never be recreated data and is always safe to delete; a
-                            /// greater-epoch body is recreated data and is never deleted. An unparseable key
-                            /// under the manifest prefix is skipped fail-closed (the orphan sweep is the backstop).
                             const auto parsed = layout.parseManifestKey(lk.key);
                             if (!parsed || parsed->ref.writer_epoch > item.remove_txn_id.writer_epoch)
                                 continue;
-                        }
-                        else
-                        {
-                            /// Verbatim files carry no epoch and a recreated namespace re-uploads them at the
-                            /// SAME key, so the per-key marker HEAD is the only recreation guard here (files are
-                            /// few, so the cost is negligible) -- abort the whole pass on marker-present.
-                            if (backend.head(marker_key).exists)
-                                return;
                         }
 
                         if (lk.token)
