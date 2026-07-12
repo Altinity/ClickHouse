@@ -254,9 +254,11 @@ StorePtr Store::open(BackendPtr backend, PoolConfig config)
     /// safety and to avoid the 0/UINT64_MAX sentinels, mask to 52 bits (collision-safe for an
     /// equality-only token) and re-draw on 0 (UINT64_MAX is the retired sentinel).
     constexpr uint64_t EPOCH_MASK = (1ULL << 52) - 1;
-    store->process_epoch = (thread_local_rng() ^ (static_cast<uint64_t>(thread_local_rng()) << 32)) & EPOCH_MASK;
-    if (store->process_epoch == 0)
-        store->process_epoch = 1;
+    store->process_epoch.store(
+        (thread_local_rng() ^ (static_cast<uint64_t>(thread_local_rng()) << 32)) & EPOCH_MASK,
+        std::memory_order_relaxed);
+    if (store->process_epoch.load(std::memory_order_relaxed) == 0)
+        store->process_epoch.store(1, std::memory_order_relaxed);
 
     /// W-ANCHOR: the per-server watermark must be durable BEFORE any object PUT. A read-only open
     /// must never mutate the pool (the probe is skipped above for the same reason), so the watermark
@@ -287,7 +289,7 @@ StorePtr Store::open(BackendPtr backend, PoolConfig config)
         /// recoverable — a fence costs an epoch, so the fence-recovery loop below re-allocates a fresh
         /// writer_epoch and re-claims (P3.1 vector C; TLA+ `NoPermanentWedge`).
         uint64_t writer_epoch = allocateWriterEpoch(*store->pool_backend, store->pool_layout, srid);
-        store->process_epoch = writer_epoch;
+        store->process_epoch.store(writer_epoch, std::memory_order_relaxed);
 
         /// 4. Mount lease — LIVENESS. Decide over the current mount object using a wall-clock `now_ms`.
         const auto now_ms = []() -> uint64_t
@@ -365,7 +367,7 @@ StorePtr Store::open(BackendPtr backend, PoolConfig config)
                         "could adopt it. This should not persist; investigate GC fence-out timing.",
                         srid, max_fence_recoveries);
                 writer_epoch = allocateWriterEpoch(*store->pool_backend, store->pool_layout, srid);
-                store->process_epoch = writer_epoch;
+                store->process_epoch.store(writer_epoch, std::memory_order_relaxed);
                 continue;
             }
             if (claim.kind != MountClaimResult::Claimed)
@@ -407,7 +409,7 @@ StorePtr Store::open(BackendPtr backend, PoolConfig config)
                     throw;
                 store->mount_keeper.reset();
                 writer_epoch = allocateWriterEpoch(*store->pool_backend, store->pool_layout, srid);
-                store->process_epoch = writer_epoch;
+                store->process_epoch.store(writer_epoch, std::memory_order_relaxed);
                 continue;
             }
             break;
@@ -628,11 +630,24 @@ bool Store::tryRemountOnce()
                 raw->scheduleRemount();
             });
         mount_keeper->start();
+
+        /// Re-establish the ref-protocol incarnation BEFORE re-arming the fence (spec §Startup And
+        /// Recovery / §write-fence). Order is load-bearing: `start()` refreshes the lease deadline but
+        /// does NOT clear `lost`, so the fence stays closed here and no append/publish can race the swap.
+        /// 1. Bump the live epoch so every subsequent `allocateRefTxnId` sorts strictly above any older
+        ///    (dead-incarnation or twin) durable log. Do this BEFORE `armMountFence` so there is no window
+        ///    where the gate is open while the epoch is still stale. Keep `process_epoch` (the identity
+        ///    accessors) equal to it.
+        live_writer_epoch.store(writer_epoch, std::memory_order_release);
+        process_epoch.store(writer_epoch, std::memory_order_release);
+        /// 2. Drain publishers and drop the cached tables so each re-recovers under the new epoch on next
+        ///    touch (and any leader still holding an orphaned runtime fails closed). While the fence is lost.
+        quiesceRefTablesForRemount();
+        /// 3. Re-open the gate. From here appends allocate ids under the new epoch and touch fresh runtimes.
         armMountFence(our_uuid, writer_epoch, bootMsNow() + ttl_ms);
         if (config.background_watermark)
             mount_keeper->startBackground(config.mount_renew_period);
 
-        live_writer_epoch.store(writer_epoch, std::memory_order_release);
         LOG_INFO(getLogger("CasStore"),
             "CAS self-remount '{}': recovered as writer_epoch {} (fresh incarnation; older builds fail closed)",
             srid, writer_epoch);
@@ -1170,6 +1185,52 @@ void Store::enforceRefTableCacheBudget(const RootNamespace & keep_ns)
     /// `evicted` destructs the dropped runtimes here, with no lock held.
 }
 
+void Store::quiesceRefTablesForRemount()
+{
+    /// Snapshot the current runtimes (copies keep them alive across the drain). New dispatches are
+    /// already suppressed while the fence is lost (`maybeScheduleSnapshotPublish`'s fence guard), so the
+    /// only publishers to drain are those dispatched before the fence dropped.
+    std::vector<std::shared_ptr<RefTableRuntime>> tables;
+    {
+        std::lock_guard<std::mutex> qlock(ref_queue_mutex);
+        tables.reserve(ref_tables.size());
+        for (auto & [name, rt] : ref_tables)
+            tables.push_back(rt);
+    }
+
+    /// Wait for every in-flight background publisher to finish so none is mid-PUT when its runtime is
+    /// detached. A publisher observes the lost fence (`fence_ok` false) and returns without committing,
+    /// then decrements `pending_snapshot_publishes` under `state_mutex` and signals `publish_settle_cv`.
+    for (auto & rt : tables)
+    {
+        std::unique_lock<std::mutex> slock(rt->state_mutex);
+        rt->publish_settle_cv.wait(slock,
+            [&] { return rt->pending_snapshot_publishes.load(std::memory_order_relaxed) == 0; });
+    }
+
+    /// Detach every cached table. Mark it superseded FIRST (release, and before the caller re-arms the
+    /// fence): a leader that raced in and holds one of these orphaned runtimes then fails closed at the
+    /// `flushRefBatch` gate rather than allocating an id against a stale cache under the re-armed fence.
+    /// Queued callers self-drain -- each `flushRefBatch` for a superseded runtime completes its whole
+    /// carved batch with a retry error, so no caller hangs; the next touch creates a fresh runtime that
+    /// re-recovers from the durable snapshot+log objects under `live_writer_epoch`. Dropping the map slot
+    /// discards each runtime's in-memory wedge (converted to the accepted Late Predecessor case).
+    std::vector<std::shared_ptr<RefTableRuntime>> detached;
+    {
+        std::lock_guard<std::mutex> qlock(ref_queue_mutex);
+        detached.reserve(ref_tables.size());
+        for (auto & [name, rt] : ref_tables)
+        {
+            rt->superseded_by_remount.store(true, std::memory_order_release);
+            rt->cv.notify_all();   /// wake any waiter so it re-leads and fails closed against the flag
+            detached.push_back(rt);
+        }
+        ref_tables.clear();
+    }
+    /// `detached` releases the map's references here (with no lock held); each runtime lives on only as
+    /// long as an in-flight leader/caller still holds it.
+}
+
 uint64_t Store::refRecoveryRestartsForTest(const RootNamespace & ns)
 {
     const auto rt = getRefTableRuntime(ns);
@@ -1323,6 +1384,21 @@ void Store::flushRefBatch(const RootNamespace & ns, const std::shared_ptr<RefTab
         return;
     }
 
+    /// Self-remount re-incarnation (spec §Startup And Recovery): this runtime was detached by a
+    /// `quiesceRefTablesForRemount` swap, so its cache is a stale (pre-remount) view. Fail the whole
+    /// carved batch closed -- allocating an id / applying against this orphaned runtime under the
+    /// re-armed fence would split-brain against the fresh runtime the next touch re-recovers. The
+    /// superseded flag is ordered before the fence re-arm (release/acquire through `mayMutate`), so
+    /// reaching this AFTER passing `mayMutate` above proves the swap happened.
+    if (rt->superseded_by_remount.load(std::memory_order_acquire))
+    {
+        complete_error(carve_all_pending(), std::make_exception_ptr(Exception(ErrorCodes::ABORTED,
+            "CAS ref-log append for server_root '{}': this cached table was superseded by a self-remount — "
+            "retry against the fresh mount incarnation",
+            config.server_root_id)));
+        return;
+    }
+
     const auto fence_ok = [this] { return refAppendFenceOk(); };
 
     /// Resolve an outstanding wedge FIRST (spec §Writer-Side Linearization): "It does not start a later
@@ -1417,10 +1493,11 @@ void Store::flushRefBatch(const RootNamespace & ns, const std::shared_ptr<RefTab
     /// A never-born table's `greatest_applied` is `{0, 0}`; `applyRefLogTxn`'s strict-increase check
     /// only needs a strictly greater EPOCH to accept the first trial id (RefTxnId compares epoch
     /// first), and `admits()`'s preview snapshot encoding rejects a zero epoch field regardless of
-    /// sequence. `process_epoch` is this Store's own nonzero epoch -- reused here purely as a valid
-    /// placeholder; these trial ids are never persisted or compared outside this loop.
+    /// sequence. `liveWriterEpoch()` is this incarnation's nonzero epoch -- the SAME source
+    /// `allocateRefTxnId` stamps the real id with, so the trial preview and the persisted id never
+    /// disagree on epoch; these trial ids are never persisted or compared outside this loop.
     if (trial_id.writer_epoch == 0)
-        trial_id.writer_epoch = process_epoch;
+        trial_id.writer_epoch = liveWriterEpoch();
     for (const auto & it : batch)
     {
         RefTableState item_scratch = working;
@@ -1597,6 +1674,14 @@ void Store::flushRefBatch(const RootNamespace & ns, const std::shared_ptr<RefTab
 
 void Store::maybeScheduleSnapshotPublish(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt)
 {
+    /// Never dispatch a publisher while the fence is lost (spec §write-fence): a publish is a
+    /// conditional PUT that would fail `fence_ok` and return non-Committed anyway, and dispatching one
+    /// during the self-remount window is exactly the stale-cache-publish race the remount quiesce closes
+    /// -- with no dispatch here, `quiesceRefTablesForRemount` only has to drain publishers already in
+    /// flight before the fence dropped, never a moving target.
+    if (!mayMutate())
+        return;
+
     bool trigger = false;
     {
         std::lock_guard lock(rt->state_mutex);
@@ -1802,12 +1887,14 @@ void Store::sweepStalePrecommitsNow(const RootNamespace & ns, const std::shared_
 {
     /// Task 11 (spec §Clean Up Old Precommits): after a fresh mount fence and recovery, this writer
     /// knows the exact stale precommit bindings -- their `manifest_ref.writer_epoch` predates this
-    /// writer's own `process_epoch`, i.e. they belong to a build from a superseded incarnation that can
-    /// never be promoted. Removed with ordinary exact `owner_transition(old_binding, none)` operations,
-    /// chunked to `ref_txn_max_ops` per transaction. Interruption is harmless: each chunk re-reads the
-    /// LIVE state, so a partial sweep just leaves fewer stale bindings for the next chunk (or the next
-    /// mount's recovery) to find; nothing here can loop forever since only OLDER-epoch bindings ever
-    /// qualify, and this writer's own new work always uses `process_epoch`.
+    /// incarnation's live writer_epoch, i.e. they belong to a build from a superseded incarnation that
+    /// can never be promoted. Removed with ordinary exact `owner_transition(old_binding, none)`
+    /// operations, chunked to `ref_txn_max_ops` per transaction. Interruption is harmless: each chunk
+    /// re-reads the LIVE state, so a partial sweep just leaves fewer stale bindings for the next chunk
+    /// (or the next mount's recovery) to find; nothing here can loop forever since only OLDER-epoch
+    /// bindings ever qualify, and this writer's own new work always uses `liveWriterEpoch()` -- which a
+    /// self-remount bumps in lockstep with the threshold below, so a remount's fresh precommits survive.
+    const uint64_t live_epoch = liveWriterEpoch();
     while (true)
     {
         std::vector<std::pair<String, ManifestRef>> chunk;
@@ -1815,7 +1902,7 @@ void Store::sweepStalePrecommitsNow(const RootNamespace & ns, const std::shared_
             std::lock_guard lock(rt->state_mutex);
             for (const auto & [ref_name, mref] : rt->state.precommits)
             {
-                if (mref.writer_epoch >= process_epoch)
+                if (mref.writer_epoch >= live_epoch)
                     continue;
                 chunk.emplace_back(ref_name, mref);
                 if (chunk.size() >= ref_txn_max_ops)

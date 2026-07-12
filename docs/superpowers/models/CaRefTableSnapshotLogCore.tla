@@ -46,6 +46,7 @@ CONSTANTS
     SabotageDeleteBeforeSnapshot,    \* cleanup deletes a log with no present covering snapshot
     SabotageVanishIsCorruption,      \* reader treats a vanished selected object as corruption, not restart
     SabotageRecreateBeforeCompleted, \* namespace_birth over Removed without the durable Completed marker
+    SabotageRemountKeepsOldEpoch,    \* a self-remount keeps stamping fresh appends at the old (below-durable) epoch
     LatePred                         \* enable LatePredecessorPut (adversarial; expected-fail)
 
 Seqs == 1..MaxSeq
@@ -238,6 +239,35 @@ LatePredecessorPut ==
     /\ UNCHANGED << snaps, publishedEver, snapCov, nextId, completed, badRecreate,
                     rPhase, rScanPos, rSeenLogs, rSeenSnaps, rPickedSnap, rRestarts >>
 
+(* ---- adversarial: self-remount keeps the old epoch and a stale cache (spec §write-fence; C1) ---- *)
+
+(* A self-remount that fails to re-establish the ref-protocol incarnation keeps stamping FRESH appends
+   with the OLD, now-below-durable epoch, from a cache that never saw a same-uuid twin's intermediate
+   work. Modeled as a durable `mut` at an id L that sorts BELOW an already-durable (twin) log AND below a
+   present snapshot that was frozen before L existed: recovery through that snapshot reconstructs a state
+   missing L -- the missed-`+1` loss the pagination premise ("a new log is never inserted at or below an
+   already durable table log id") leans on.
+
+   The FIX routes `allocateRefTxnId` through the fresh `live_writer_epoch` (so a remount append always
+   sorts strictly ABOVE every durable log -- it is just an ordinary `WriterMut` above the frontier) and
+   re-recovers the dropped cache; so the honest protocol has NO such action and the safe config is GREEN.
+   This is DISTINCT from `LatePredecessorPut`: that is an in-flight EXTERNAL straggler PUT the epoch bump
+   cannot cancel (an accepted Phase-1 limitation), whereas this is the live writer's OWN fresh appends,
+   which the epoch route provably eliminates. Enabled only under `SabotageRemountKeepsOldEpoch`; it must
+   break INV_RECOVERY. *)
+RemountStaleAppend ==
+    /\ SabotageRemountKeepsOldEpoch
+    /\ \E L \in Seqs :
+        /\ op[L] = "none"
+        /\ L \notin writtenEver
+        /\ \E X \in snaps : X > L                             \* a present snapshot already covers past L (the twin's)
+        /\ LifeBelow(L) = "live"                              \* a mid-history mut at L is well-formed
+        /\ op' = [op EXCEPT ![L] = "mut"]
+        /\ writtenEver' = writtenEver \cup {L}
+        /\ logs' = logs \cup {L}
+    /\ UNCHANGED << snaps, publishedEver, snapCov, nextId, completed, badRecreate,
+                    rPhase, rScanPos, rSeenLogs, rSeenSnaps, rPickedSnap, rRestarts >>
+
 (* ---- reader: one ordered scan + body fetch with restart-on-vanish ---- *)
 
 ReaderStart ==
@@ -307,6 +337,7 @@ Next ==
     \/ WriterPublishSnapshot
     \/ GcCleanupLog \/ GcCleanupSnap
     \/ LatePredecessorPut
+    \/ RemountStaleAppend
     \/ ReaderStart \/ ReaderScanStep \/ ReaderFetch
     \/ NoOp
 

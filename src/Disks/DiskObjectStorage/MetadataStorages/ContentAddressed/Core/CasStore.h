@@ -345,12 +345,13 @@ public:
 
     /// ---- per-server watermark surface (spec 2026-06-16-ca-build-watermark) ----
     /// process_epoch: random nonzero per Store (process). GC checks epoch EQUALITY, never ordering.
-    uint64_t epoch() const { return process_epoch; }
+    uint64_t epoch() const { return process_epoch.load(std::memory_order_acquire); }
     /// The durable-monotone writer_epoch allocated at writable open (spec §writer-epoch-alloc). On a
     /// writable Store this is the value bridged into `process_epoch` (so the watermark + the manifest
     /// manifest ref carries it); on a read-only open the random `process_epoch` is unchanged and
-    /// no durable epoch is allocated. Phase 2's epoch-aware sweep reads this value.
-    uint64_t writerEpoch() const { return process_epoch; }
+    /// no durable epoch is allocated. A self-remount re-establishes this to the fresh incarnation's
+    /// writer_epoch (kept equal to `liveWriterEpoch`). Phase 2's epoch-aware sweep reads this value.
+    uint64_t writerEpoch() const { return process_epoch.load(std::memory_order_acquire); }
     /// The GC floor: the oldest in-flight build_seq, or next_build_seq when no build is active (so a
     /// quiescent server's watermark floor advances to the next-to-be-allocated seq). Locks builds_mutex.
     uint64_t minActive();
@@ -668,6 +669,15 @@ private:
         std::deque<std::shared_ptr<RefMutationItem>> pending;    /// guarded by ref_queue_mutex
         bool leader_active = false;                               /// guarded by ref_queue_mutex
         std::condition_variable cv;
+
+        /// Set true when a self-remount detaches this runtime from the cache (`quiesceRefTablesForRemount`):
+        /// the fresh incarnation re-recovers each table under the new epoch on next touch, so any leader
+        /// still holding THIS (now-orphaned) runtime must fail closed instead of allocating an id / applying
+        /// against its stale cache once the re-armed fence re-opens the gate. Stored with release BEFORE the
+        /// remount re-arms the fence, so a lane that observes `mayMutate()` true also observes this flag
+        /// (release/acquire through the fence) -- there is no interleaving where a stale runtime both passes
+        /// the fence and reads this flag false.
+        std::atomic<bool> superseded_by_remount{false};
     };
     static constexpr size_t kMaxRefBatch = 128;
     static constexpr size_t kRefRecoveryMaxRestarts = 3;          /// spec: "bounded (3) and counted"
@@ -684,7 +694,13 @@ private:
     /// Store-wide strictly-increasing counter (spec §Ordered Ref Transaction Identifier): shared by
     /// every table of this mounted writer; a fresh writer_epoch (a new Store) restarts it at one.
     std::atomic<uint64_t> next_ref_sequence{1};
-    RefTxnId allocateRefTxnId() { return RefTxnId{process_epoch, next_ref_sequence.fetch_add(1)}; }
+    /// The epoch component is the LIVE mount incarnation's writer_epoch, not the open-time
+    /// `process_epoch`: a self-remount allocates a strictly-greater durable writer_epoch, so every ref
+    /// transaction stamped after the remount sorts strictly ABOVE any (dead-incarnation or twin) log
+    /// still durable under an older epoch. `RefTxnId` compares epoch first, so the epoch bump alone
+    /// guarantees the pagination premise "a new log is never inserted at or below an already durable
+    /// table log id" (spec §Ordered Ref Transaction Identifier / §Step 1).
+    RefTxnId allocateRefTxnId() { return RefTxnId{liveWriterEpoch(), next_ref_sequence.fetch_add(1)}; }
 
     /// The CAS-owned retry controller (Task 5) this Store's ref-log writer path uses for every
     /// conditional log/snapshot `PUT` and uncertain-result resolution.
@@ -712,6 +728,17 @@ private:
     /// one: it makes eviction of a runtime any caller currently holds impossible, so the ref-append
     /// lane can never split-brain across an old (evicted) and a fresh runtime for one table.
     void enforceRefTableCacheBudget(const RootNamespace & keep_ns);
+
+    /// Self-remount re-incarnation (spec §Startup And Recovery / §write-fence): drain in-flight
+    /// background publishers, mark every cached table `superseded_by_remount`, and drop the runtimes so
+    /// the fresh incarnation re-recovers each table under the new `live_writer_epoch` on next touch. Runs
+    /// on the remount path while the fence is still lost and AFTER `live_writer_epoch` is bumped but
+    /// BEFORE the fence is re-armed, so no append allocates an id and no publisher commits from a stale
+    /// cache across the swap. The in-memory wedge is discarded with its runtime -- a remount ends the
+    /// epoch and converts an in-flight wedged PUT into the accepted Late Predecessor case (spec §Late
+    /// Predecessor PUT). Respects the same idle invariants the eviction pass uses: it never mutates a
+    /// runtime a leader still holds (the superseded flag makes that leader fail closed instead).
+    void quiesceRefTablesForRemount();
 
     /// Leader loop / one flush for the ref-log append lane (recovery, wedge resolution, per-item
     /// validation, admission budget, the controlled `PUT`, and applying the committed transaction to
@@ -835,8 +862,11 @@ private:
     /// per-process counter (monotonicity is load-bearing — a seq is never reused or lowered);
     /// active_build_seqs holds the seqs of in-flight builds, so minActive yields the GC floor. After
     /// the ack-floor merge (spec 2026-07-02) the floor is published by the merged `mount_keeper`
-    /// beat (there is no standalone watermark object anymore).
-    uint64_t process_epoch = 0;
+    /// beat (there is no standalone watermark object anymore). ATOMIC because a self-remount re-stamps it
+    /// (kept equal to `live_writer_epoch`) off the background remount thread while `epoch`/`writerEpoch`
+    /// may observe it; the ref-lane hot readers were moved to `liveWriterEpoch`, so this now backs only
+    /// the identity accessors.
+    std::atomic<uint64_t> process_epoch{0};
     std::mutex builds_mutex;
     uint64_t next_build_seq = 1;
     std::set<uint64_t> active_build_seqs;

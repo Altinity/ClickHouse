@@ -1105,6 +1105,167 @@ TEST(RefWriterStalePrecommitSweep, BoundedBatchesAndInterruptionResumeAcrossMoun
 }
 
 /// ===================================================================================
+/// C1: self-remount establishes a fresh ref-protocol incarnation (spec §Startup And Recovery /
+/// §write-fence). A self-remount bumps the durable writer_epoch, so every ref transaction it stamps
+/// afterward sorts strictly above any log a dead-incarnation or same-uuid twin left durable under an
+/// older epoch, and it drops its stale in-memory cache so the next touch re-recovers under the new
+/// epoch. The unfixed code kept the open-time `process_epoch` and the cached tables across the fence-out.
+/// ===================================================================================
+
+namespace
+{
+
+/// Fence out the mount lease so `tryRemountOnce` reclaims a fresh incarnation (mirrors
+/// gtest_cas_store.cpp's fenceOutMount, without its ASSERT_ macros so it can run outside a fixture).
+void fenceOutRefMount(Backend & backend, const String & mount_key)
+{
+    const auto got = backend.get(mount_key);
+    MountLease m = decodeMountLease(got->bytes);
+    m.gc_fenced = true;
+    m.seq += 1;
+    backend.putOverwrite(mount_key, encodeMountLease(m), got->token);
+}
+
+/// The greatest `_log/<id>` transaction id currently present for `ns` (independent of any Store cache).
+std::optional<RefTxnId> listGreatestLogIdForTest(Backend & backend, const Layout & layout, const RootNamespace & ns)
+{
+    std::optional<RefTxnId> greatest;
+    String cursor;
+    for (;;)
+    {
+        const ListPage page = backend.list(layout.refsNamespacePrefix(ns), cursor, 1000);
+        for (const ListedKey & lk : page.keys)
+        {
+            const auto parsed = layout.parseRefObjectKey(lk.key);
+            if (parsed && parsed->ns == ns && parsed->kind == RefObjectKind::Log
+                && (!greatest || *greatest < parsed->txn_id))
+                greatest = parsed->txn_id;
+        }
+        if (page.next_cursor.empty())
+            break;
+        cursor = page.next_cursor;
+    }
+    return greatest;
+}
+
+/// Seed a same-uuid TWIN incarnation that bumped the durable writer_epoch and durably DROPPED `ref_name`
+/// (its committed binding `old_ref`) at `{twin_epoch, 1}` -- an id that sorts strictly above every log a
+/// Store wrote under its own (lower) open-time epoch. Returns the twin's epoch.
+uint64_t seedTwinDrop(Backend & backend, const Layout & layout, const RootNamespace & ns,
+                      const String & ref_name, const ManifestRef & old_ref)
+{
+    const uint64_t twin_epoch = allocateWriterEpoch(backend, layout, "test");
+    RefLogTxn twin;
+    twin.ns = ns.string();
+    twin.txn_id = RefTxnId{twin_epoch, 1};
+    RefOp drop;
+    drop.kind = RefOpKind::OwnerTransition;
+    drop.old_binding = RefOwnerBinding{RefOwnerKind::Committed, ref_name, old_ref};
+    twin.ops = {drop};
+    writeRefLogTxnRaw(backend, layout, twin);
+    return twin_epoch;
+}
+
+}
+
+/// C1/N1 (stale cache): a warm table whose committed ref a twin durably dropped must re-recover to the
+/// twin's view after a self-remount. The unfixed code kept the stale cache and still resolved the ref.
+TEST(RefWriterRemount, ReRecoversStaleCacheToTwinDrop)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openStore(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/remount_twin_view"};
+
+    const ManifestId a_id = publishEmptyPart(store, ns, "a");
+    ASSERT_TRUE(store->resolveRef(ns, "a").has_value());
+    const uint64_t e1 = store->liveWriterEpoch();
+
+    /// A same-uuid twin bumped the durable epoch and durably dropped "a"; this Store's warm cache never
+    /// observed it.
+    const uint64_t twin_epoch = seedTwinDrop(*backend, layout, ns, "a", a_id.ref);
+    ASSERT_GT(twin_epoch, e1);
+    ASSERT_TRUE(store->resolveRef(ns, "a").has_value()) << "precondition: the warm cache is stale";
+
+    fenceOutRefMount(*backend, layout.mountKey("test"));
+    ASSERT_TRUE(store->tryRemountOnce());
+    EXPECT_GT(store->liveWriterEpoch(), twin_epoch);
+
+    /// The remount dropped the stale runtime: the next read re-recovers from the durable objects and
+    /// adopts the twin's drop -- "a" is gone.
+    EXPECT_FALSE(store->resolveRef(ns, "a").has_value())
+        << "a self-remount must re-recover the table under the new epoch, adopting the twin's drop";
+}
+
+/// C1/N2 (epoch routing + ordering): a post-remount append must stamp its log with the fresh
+/// incarnation's live epoch, landing strictly above a twin's durable log (the pagination premise
+/// "a new log is never inserted at or below an already durable table log id"). The unfixed code stamped
+/// the stale open-time epoch, which sorts BELOW a higher-epoch twin log.
+TEST(RefWriterRemount, PostRemountAppendCarriesLiveEpochSortingAboveTwinLogs)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openStore(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/remount_epoch_order"};
+
+    const ManifestId a_id = publishEmptyPart(store, ns, "a");
+    const uint64_t e1 = store->liveWriterEpoch();
+    const uint64_t twin_epoch = seedTwinDrop(*backend, layout, ns, "a", a_id.ref);
+    ASSERT_GT(twin_epoch, e1);
+
+    fenceOutRefMount(*backend, layout.mountKey("test"));
+    ASSERT_TRUE(store->tryRemountOnce());
+    const uint64_t e2 = store->liveWriterEpoch();
+    ASSERT_GT(e2, twin_epoch);
+
+    publishEmptyPart(store, ns, "b");
+    const auto greatest = listGreatestLogIdForTest(*backend, layout, ns);
+    ASSERT_TRUE(greatest.has_value());
+    EXPECT_EQ(greatest->writer_epoch, e2)
+        << "the newest ref log must carry the fresh incarnation's epoch and be the greatest id";
+    EXPECT_GT(*greatest, (RefTxnId{twin_epoch, 1}))
+        << "the post-remount append must sort strictly above the twin's log";
+}
+
+/// C1 (wedge disposition): a wedged append lane converts to the accepted Late Predecessor case on a
+/// self-remount -- the runtime (and its wedge) is dropped, the next touch re-recovers a clean lane, and
+/// appends resume without hanging. The unfixed code kept the wedged runtime cached across the remount.
+TEST(RefWriterRemount, DiscardsWedgeAndLaneRemainsUsable)
+{
+    CasRequestBudget budget;
+    budget.max_attempts = 1;
+    budget.attempt_timeout_ms = 100;
+    budget.operation_deadline_ms = 100;
+    budget.lease_safety_margin_ms = 100;
+
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openStore(backend, budget);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/remount_wedge"};
+    publishEmptyPart(store, ns, "x");
+    publishEmptyPart(store, ns, "y");
+
+    /// Wedge the lane with an ambiguous PUT that never landed server-side.
+    backend->fault_key_substr = layout.refsNamespacePrefix(ns) + "_log/";
+    backend->fault_count = 1;
+    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { store->dropRef(ns, "x"); });
+    ASSERT_TRUE(store->refLaneWedgedForTest(ns));
+
+    fenceOutRefMount(*backend, layout.mountKey("test"));
+    ASSERT_TRUE(store->tryRemountOnce());
+
+    EXPECT_FALSE(store->refLaneWedgedForTest(ns))
+        << "a self-remount discards the in-memory wedge with the detached runtime";
+
+    /// The lane is usable, not hung: a fresh append completes and carries the live epoch.
+    EXPECT_NO_THROW(store->dropRef(ns, "y"));
+    EXPECT_FALSE(store->resolveRef(ns, "y").has_value());
+    const auto greatest = listGreatestLogIdForTest(*backend, layout, ns);
+    ASSERT_TRUE(greatest.has_value());
+    EXPECT_EQ(greatest->writer_epoch, store->liveWriterEpoch());
+}
+
+/// ===================================================================================
 /// Task 11: namespace removal (spec §Namespace Removal)
 /// ===================================================================================
 

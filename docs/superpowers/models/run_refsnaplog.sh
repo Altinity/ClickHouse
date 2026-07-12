@@ -4,6 +4,8 @@
 #   sab_deletebeforesnapshot     -> expect VIOLATION (INV_RECOVERY)
 #   sab_vanishiscorruption       -> expect VIOLATION (INV_NOFAIL)
 #   sab_recreatebeforecompleted  -> expect VIOLATION (INV_RECREATE)
+#   sab_remountkeepsoldepoch     -> expect VIOLATION (INV_RECOVERY; C1 self-remount stamping fresh appends
+#                                   at the old below-durable epoch — the epoch-route fix makes it GREEN)
 #   latepred                     -> expect VIOLATION (INV_RECOVERY; documented Phase-1 late-predecessor
 #                                   limitation, spec §late-predecessor-put — "violation found" is PASS)
 # Exits nonzero if any expectation is unmet.
@@ -19,6 +21,7 @@ CONFIGS=(
   "sab_deletebeforesnapshot    violation  INV_RECOVERY"
   "sab_vanishiscorruption      violation  INV_NOFAIL"
   "sab_recreatebeforecompleted violation  INV_RECREATE"
+  "sab_remountkeepsoldepoch    violation  INV_RECOVERY"
   "latepred                    violation  INV_RECOVERY"
 )
 
