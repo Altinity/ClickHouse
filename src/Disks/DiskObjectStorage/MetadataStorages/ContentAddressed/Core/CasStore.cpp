@@ -890,6 +890,13 @@ std::optional<Resolved> Store::resolveRef(const RootNamespace & ns, const String
     /// authoritative view. Kept as a parameter so existing callers compile unchanged.
     const auto rt = getRefTableRuntime(ns);
     ensureRefTableRecovered(ns, *rt);
+    /// Task 11 mount-time triggers: a table this mount only ever READS (never mutates) would otherwise
+    /// never have its just-replayed tail/precommits checked -- `appendRefOps`'s own hoisted checks only
+    /// fire for a table this mount WRITES to. Both are cheap (lock + comparison) on the warm path (the
+    /// flag/threshold is already false after the table's first touch this mount); the sweep, if it DOES
+    /// fire, runs synchronously here (safe: this call is not nested inside any queue leader's stack).
+    maybeSweepStalePrecommits(ns, rt);
+    maybeScheduleSnapshotPublish(ns, rt);
 
     std::lock_guard lock(rt->state_mutex);
     const auto it = rt->state.committed.find(ref_name);
@@ -1054,6 +1061,9 @@ std::map<String, Resolved> Store::listRefs(const RootNamespace & ns)
     /// dance, since there is no longer a shard fan-out to rediscover on every call).
     const auto rt = getRefTableRuntime(ns);
     ensureRefTableRecovered(ns, *rt);
+    /// Task 11 mount-time triggers: see the identical comment in `resolveRef`.
+    maybeSweepStalePrecommits(ns, rt);
+    maybeScheduleSnapshotPublish(ns, rt);
 
     std::map<String, Resolved> result;
     std::lock_guard lock(rt->state_mutex);
@@ -1472,6 +1482,7 @@ void Store::ensureRefTableRecovered(const RootNamespace & ns, RefTableRuntime & 
         }
 
         std::vector<RefLogTxn> tail;
+        std::vector<uint64_t> tail_bytes;
         if (!vanished)
         {
             for (const RefTxnId & id : log_ids)
@@ -1485,6 +1496,7 @@ void Store::ensureRefTableRecovered(const RootNamespace & ns, RefTableRuntime & 
                     break;
                 }
                 tail.push_back(decodeRefLogTxn(got->bytes, ns.string(), id));
+                tail_bytes.push_back(got->bytes.size());
             }
         }
 
@@ -1494,6 +1506,24 @@ void Store::ensureRefTableRecovered(const RootNamespace & ns, RefTableRuntime & 
         rt.state = replay(snapshot, tail);
         rt.cleanup_markers = std::move(cleanup_markers);
         rt.recovered = true;
+
+        /// Task 11 (spec §writer-snapshot-publication): seed the tail-since-snapshot bookkeeping from
+        /// this SAME recovery pass -- `snapshot_base_state` is the state as of the recovered snapshot
+        /// alone (an empty tail replay), and every log strictly above it is retained with THIS writer's
+        /// own recovery-completion time as its (deliberately conservative) "observed at" stamp.
+        rt.snapshot_base_state = replay(snapshot, {});
+        rt.newest_snapshot_id = snapshot ? std::optional<RefTxnId>(snapshot->snapshot_id) : std::nullopt;
+        rt.tail_since_snapshot.clear();
+        rt.tail_bytes_since_snapshot = 0;
+        const uint64_t mount_now = bootMsNow();
+        for (size_t i = 0; i < tail.size(); ++i)
+        {
+            rt.tail_since_snapshot.push_back(RefTableRuntime::TailLogEntry{tail[i], mount_now, tail_bytes[i]});
+            rt.tail_bytes_since_snapshot += tail_bytes[i];
+        }
+        /// Task 11 (spec §Clean Up Old Precommits): dispatched once, from `appendRefOps`'s top level
+        /// (never from here -- this call may itself be nested inside a queue leader's flush stack).
+        rt.needs_stale_precommit_sweep = true;
 
         /// Per-table admission budgets (spec §Snapshot Format): pre-subtract this table's own wire
         /// overhead (`4 + ns.size()`, repeated once in a snapshot body and once in a removal txn body)
@@ -1520,11 +1550,27 @@ bool Store::refLaneWedgedForTest(const RootNamespace & ns)
     return rt->wedge.has_value();
 }
 
+bool Store::observedNamespaceCleanupMarker(const RootNamespace & ns, const RefTxnId & remove_txn_id)
+{
+    const auto rt = getRefTableRuntime(ns);
+    ensureRefTableRecovered(ns, *rt);
+    std::lock_guard lock(rt->state_mutex);
+    return rt->cleanup_markers.contains(remove_txn_id);
+}
+
 RefTxnId Store::appendRefOps(const RootNamespace & ns, MutationScope scope,
                              std::function<std::vector<RefOp>(const RefTableState &)> build_ops,
                              RootMutationOrigin origin, RootMutationKind kind)
 {
     const auto rt = getRefTableRuntime(ns);
+    /// Hoisted here (rather than left to `flushRefBatch`'s own idempotent call) so both Task 11
+    /// triggers below run on the CALLING thread, strictly BEFORE this call enqueues its own item or
+    /// becomes a queue leader -- `maybeSweepStalePrecommits`'s own nested `appendRefOps` calls are
+    /// therefore always a fresh top-level invocation, never nested inside a leader's flush stack
+    /// (which would deadlock the leader against itself).
+    ensureRefTableRecovered(ns, *rt);
+    maybeSweepStalePrecommits(ns, rt);
+    maybeScheduleSnapshotPublish(ns, rt);
 
     auto item = std::make_shared<RefMutationItem>();
     item->scope = std::move(scope);
@@ -1796,16 +1842,26 @@ void Store::flushRefBatch(const RootNamespace & ns, const std::shared_ptr<RefTab
             {
                 std::lock_guard lock(rt->state_mutex);
                 applyRefLogTxn(rt->state, final_txn);
+                /// Task 11: this commit's own txn joins the retained tail-since-snapshot (this
+                /// writer's exact append time, per PoolConfig::snapshot_min_log_age_ms's contract).
+                rt->tail_since_snapshot.push_back(RefTableRuntime::TailLogEntry{final_txn, bootMsNow(), bytes.size()});
+                rt->tail_bytes_since_snapshot += bytes.size();
             }
             ProfileEvents::increment(ProfileEvents::CasRefBatchFlushes);
             ProfileEvents::increment(ProfileEvents::CasRefBatchedMutations, survivors.size());
-            std::lock_guard<std::mutex> g(ref_queue_mutex);
-            for (const auto & it : survivors)
             {
-                it->committed_id = id;
-                it->done = true;
+                std::lock_guard<std::mutex> g(ref_queue_mutex);
+                for (const auto & it : survivors)
+                {
+                    it->committed_id = id;
+                    it->done = true;
+                }
+                rt->cv.notify_all();
             }
-            rt->cv.notify_all();
+            /// Task 11 (spec §writer-snapshot-publication): the threshold trigger -- off the lane,
+            /// dispatched AFTER waking every waiter above so this commit's own callers are never
+            /// delayed by it.
+            maybeScheduleSnapshotPublish(ns, rt);
             return;
         }
         case CasWriteOutcome::DefiniteFailure:
@@ -1832,6 +1888,225 @@ void Store::flushRefBatch(const RootNamespace & ns, const std::shared_ptr<RefTab
             return;
         }
     }
+}
+
+void Store::maybeScheduleSnapshotPublish(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt)
+{
+    bool trigger = false;
+    {
+        std::lock_guard lock(rt->state_mutex);
+        if (rt->state.lifecycle == RefLifecycle::Live
+            && (rt->tail_since_snapshot.size() > config.snapshot_log_count_threshold
+                || rt->tail_bytes_since_snapshot > config.snapshot_log_bytes_threshold))
+            trigger = true;
+    }
+    if (!trigger)
+        return;
+
+    /// Off the mutation hot path (spec §writer-snapshot-publication): `trySnapshotPublishOnce` never
+    /// touches the append queue, so dispatching it onto an unrelated global-pool thread can never
+    /// deadlock a flush leader. `shared_from_this()` keeps the Store alive for the thread's lifetime.
+    rt->pending_snapshot_publishes.fetch_add(1, std::memory_order_relaxed);
+    auto self = shared_from_this();
+    ThreadFromGlobalPool([self, ns, rt]
+    {
+        try
+        {
+            self->trySnapshotPublishOnce(ns);
+        }
+        catch (...)
+        {
+            tryLogCurrentException(getLogger("CasStore"), "CAS background snapshot publish attempt failed");
+        }
+        {
+            std::lock_guard lock(rt->state_mutex);
+            rt->pending_snapshot_publishes.fetch_sub(1, std::memory_order_relaxed);
+        }
+        rt->publish_settle_cv.notify_all();
+    }).detach();
+}
+
+void Store::waitForSnapshotPublishSettleForTest(const RootNamespace & ns)
+{
+    const auto rt = getRefTableRuntime(ns);
+    std::unique_lock lock(rt->state_mutex);
+    rt->publish_settle_cv.wait(lock, [&] { return rt->pending_snapshot_publishes.load(std::memory_order_relaxed) == 0; });
+}
+
+std::optional<RefTxnId> Store::newestPublishedSnapshotIdForTest(const RootNamespace & ns)
+{
+    const auto rt = getRefTableRuntime(ns);
+    ensureRefTableRecovered(ns, *rt);
+    std::lock_guard lock(rt->state_mutex);
+    return rt->newest_snapshot_id;
+}
+
+size_t Store::tailSinceSnapshotCountForTest(const RootNamespace & ns)
+{
+    const auto rt = getRefTableRuntime(ns);
+    ensureRefTableRecovered(ns, *rt);
+    std::lock_guard lock(rt->state_mutex);
+    return rt->tail_since_snapshot.size();
+}
+
+bool Store::trySnapshotPublishOnce(const RootNamespace & ns)
+{
+    const auto rt = getRefTableRuntime(ns);
+    ensureRefTableRecovered(ns, *rt);
+
+    RefTableState candidate_state;
+    RefTxnId candidate_x;
+    bool have_candidate = false;
+    {
+        std::lock_guard lock(rt->state_mutex);
+        if (rt->state.lifecycle != RefLifecycle::Live)
+            return false;   /// nothing to (re)publish here; dropNamespace publishes its own Removed snapshot
+
+        const uint64_t now = bootMsNow();
+        RefTableState replay_state = rt->snapshot_base_state;
+        for (const auto & entry : rt->tail_since_snapshot)
+        {
+            applyRefLogTxn(replay_state, entry.txn);
+            const uint64_t age = now >= entry.observed_at_ms ? now - entry.observed_at_ms : 0;
+            if (age < config.snapshot_min_log_age_ms)
+                break;   /// spec §Late Predecessor PUT: "a candidate snapshot id never covers a log
+                         /// younger than that age" -- observed_at_ms is non-decreasing across entries
+                         /// (own appends: real commit order; mount-replayed: all equal), so once one
+                         /// entry is too young every LATER entry is at least as young. Stop here.
+            candidate_state = replay_state;
+            candidate_x = entry.txn.txn_id;
+            have_candidate = true;
+        }
+        if (!have_candidate)
+            return false;   /// even the oldest tail entry is still within the grace window
+    }
+
+    const RefTableSnapshot snap = snapshotOf(candidate_state, ns.string());
+    String bytes;
+    try
+    {
+        bytes = encodeRefTableSnapshot(snap);
+    }
+    catch (...)
+    {
+        /// Failure Handling: "Snapshot create fails: keep all logs; writer recovery remains unchanged."
+        return false;
+    }
+    const String key = pool_layout.refSnapshotKey(ns, candidate_x);
+    const auto fence_ok = [this] { return refAppendFenceOk(); };
+    const CasWriteOutcome outcome = ref_request_controller->putIfAbsentControlled(key, bytes, fence_ok);
+    if (outcome != CasWriteOutcome::Committed)
+        return false;   /// DefiniteFailure/Unresolved: leave everything as-is; a later trigger retries
+
+    {
+        std::lock_guard lock(rt->state_mutex);
+        /// Prune by id, not by the (possibly now-stale) index computed above: more appends -- or even
+        /// another publish -- may have landed on `tail_since_snapshot` while the PUT was in flight.
+        uint64_t pruned_bytes = 0;
+        size_t prune_upto = 0;
+        while (prune_upto < rt->tail_since_snapshot.size()
+               && !(candidate_x < rt->tail_since_snapshot[prune_upto].txn.txn_id))
+        {
+            pruned_bytes += rt->tail_since_snapshot[prune_upto].encoded_bytes;
+            ++prune_upto;
+        }
+        rt->tail_since_snapshot.erase(rt->tail_since_snapshot.begin(),
+            rt->tail_since_snapshot.begin() + static_cast<ptrdiff_t>(prune_upto));
+        rt->tail_bytes_since_snapshot -= pruned_bytes;
+        rt->snapshot_base_state = std::move(candidate_state);
+        rt->newest_snapshot_id = candidate_x;
+    }
+    return true;
+}
+
+void Store::maybeSweepStalePrecommits(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt)
+{
+    {
+        std::lock_guard lock(rt->state_mutex);
+        if (!rt->needs_stale_precommit_sweep)
+            return;
+        /// Cleared FIRST: `sweepStalePrecommitsNow`'s own `appendRefOps` calls re-enter this same
+        /// top-level check (via `appendRefOps`'s hoisted call), and must see it already cleared.
+        rt->needs_stale_precommit_sweep = false;
+    }
+    sweepStalePrecommitsNow(ns, rt);
+}
+
+void Store::sweepStalePrecommitsNow(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt)
+{
+    /// Task 11 (spec §Clean Up Old Precommits): after a fresh mount fence and recovery, this writer
+    /// knows the exact stale precommit bindings -- their `manifest_ref.writer_epoch` predates this
+    /// writer's own `process_epoch`, i.e. they belong to a build from a superseded incarnation that can
+    /// never be promoted. Removed with ordinary exact `owner_transition(old_binding, none)` operations,
+    /// chunked to `ref_txn_max_ops` per transaction. Interruption is harmless: each chunk re-reads the
+    /// LIVE state, so a partial sweep just leaves fewer stale bindings for the next chunk (or the next
+    /// mount's recovery) to find; nothing here can loop forever since only OLDER-epoch bindings ever
+    /// qualify, and this writer's own new work always uses `process_epoch`.
+    while (true)
+    {
+        std::vector<std::pair<String, ManifestRef>> chunk;
+        {
+            std::lock_guard lock(rt->state_mutex);
+            for (const auto & [ref_name, mref] : rt->state.precommits)
+            {
+                if (mref.writer_epoch >= process_epoch)
+                    continue;
+                chunk.emplace_back(ref_name, mref);
+                if (chunk.size() >= ref_txn_max_ops)
+                    break;
+            }
+        }
+        if (chunk.empty())
+            return;
+
+        appendRefOps(ns, MutationScope::wholeShard(),
+            [chunk](const RefTableState & state) -> std::vector<RefOp>
+            {
+                std::vector<RefOp> ops;
+                for (const auto & [ref_name, mref] : chunk)
+                    if (state.precommits.contains({ref_name, mref}))
+                    {
+                        RefOp op;
+                        op.kind = RefOpKind::OwnerTransition;
+                        op.old_binding = RefOwnerBinding{RefOwnerKind::Precommit, ref_name, mref};
+                        ops.push_back(op);
+                    }
+                return ops;
+            },
+            RootMutationOrigin::Writer, RootMutationKind::ReclaimPrecommit);
+    }
+}
+
+void Store::publishRemovedSnapshotNow(const RootNamespace & ns)
+{
+    const auto rt = getRefTableRuntime(ns);
+    RefTxnId remove_id;
+    {
+        std::lock_guard lock(rt->state_mutex);
+        if (rt->state.lifecycle != RefLifecycle::Removed || !rt->state.remove_txn_id)
+            return;
+        remove_id = *rt->state.remove_txn_id;
+        if (rt->newest_snapshot_id && *rt->newest_snapshot_id == remove_id)
+            return;   /// already published this exact Removed snapshot
+    }
+
+    RefTableSnapshot removed_snap;
+    removed_snap.ns = ns.string();
+    removed_snap.snapshot_id = remove_id;
+    removed_snap.lifecycle = RefLifecycle::Removed;
+    removed_snap.remove_txn_id = remove_id;
+    const String bytes = encodeRefTableSnapshot(removed_snap);
+    const String key = pool_layout.refSnapshotKey(ns, remove_id);
+    const auto fence_ok = [this] { return refAppendFenceOk(); };
+    const CasWriteOutcome outcome = ref_request_controller->putIfAbsentControlled(key, bytes, fence_ok);
+    if (outcome != CasWriteOutcome::Committed)
+        return;   /// best-effort; Task 12's namespace-cleanup item republishes idempotently later
+
+    std::lock_guard lock(rt->state_mutex);
+    rt->newest_snapshot_id = remove_id;
+    rt->snapshot_base_state = rt->state;   /// == the Removed state (empty committed/precommits)
+    rt->tail_since_snapshot.clear();
+    rt->tail_bytes_since_snapshot = 0;
 }
 
 uint64_t Store::currentGcRound() const
@@ -1958,64 +2233,71 @@ void Store::removeMountpointObject(const String & key)
 
 void Store::dropNamespace(const RootNamespace & ns)
 {
-    /// Tombstone every PRESENT shard, then delete the verbatim files. GC removes the manifest OBJECTS
-    /// themselves later once the shard is empty + tombstoned + fully folded (Task 6). Spec §4: untouched
-    /// (absent) shards stay absent — we never mint a manifest just to hold a tombstone.
-    ///
-    /// Task 6: for every present shard (with or without refs) we append ref-removal events (one per
-    /// former ref) FOLLOWED by the drop-namespace tombstone as the LAST journal event. The tombstone
-    /// event (`is_tombstone = true`, both bindings absent) is the in-band signal GC reads to decide
-    /// whether the shard object is eligible for reclaim: empty + tombstone + fully folded ⇒ deleteExact.
-    for (uint64_t shard = 0; shard < meta.root_shards; ++shard)
+    /// Task 11 (spec §Namespace Removal): one body transaction naming an exact `owner_transition`
+    /// removal for every committed ref and precommit, followed by `remove_namespace` -- the removal
+    /// class shares the bigger complete-table byte budget (encodeRefLogTxn's own `checkBudget`, keyed
+    /// off the presence of a `RemoveNamespace` op) and is exempt from the ordinary per-op admission
+    /// check (it only ever shrinks state; see `flushRefBatch`'s `state_growing` filter).
+    const auto rt = getRefTableRuntime(ns);
+    ensureRefTableRecovered(ns, *rt);
     {
-        const auto [root, token] = readShard(ns, shard);
-        if (!token)
-            continue;   /// absent shard: stays absent, no manifest minted
+        /// spec: "Repeated API removal observes the cached Removed state and returns success without
+        /// appending a second transaction." `RefTableState::lifecycle` cannot distinguish "genuinely
+        /// removed" from "never born" (both default to `Removed` -- see the representation note on
+        /// `RefTableState`), so a never-touched namespace's drop is ALSO a harmless no-op here, which
+        /// is the correct behavior either way (nothing to remove).
+        std::lock_guard lock(rt->state_mutex);
+        if (rt->state.lifecycle != RefLifecycle::Live)
+            return;
+    }
 
-        mutateShard(ns, shard, MutationScope::wholeShard(), [](RootShard & shard_root)
+    appendRefOps(ns, MutationScope::wholeShard(),
+        [&](const RefTableState & state) -> std::vector<RefOp>
         {
-            /// Append one removal RootOwnerEvent per former ref (iterate before clearing), then clear
-            /// all refs. Each event: old_binding = the committed binding being removed / new_binding none.
-            for (const auto & [ref_name, payload] : shard_root.refs)
-                shard_root.journal.push_back(RootOwnerEvent{
-                    .transition_version = shard_root.shard_version + 1,
-                    .old_binding = OwnerBinding{
-                        .owner_kind = OwnerKind::Committed, .ref_name = ref_name,
-                        .build_id = UInt128(0), .manifest_ref = payload.manifest_ref},
-                    .new_binding = std::nullopt});
-            shard_root.refs.clear();
-            /// Task 6: append the tombstone as the LAST journal event (after all removal events so the
-            /// fold must cover every -1 removal before reaching the tombstone, preventing phantom in-degree).
-            shard_root.journal.push_back(RootOwnerEvent{
-                .transition_version = shard_root.shard_version + 1,
-                .old_binding = std::nullopt,
-                .new_binding = std::nullopt,
-                .is_tombstone = true});
-        }, nullptr, RootMutationOrigin::Writer, RootMutationKind::DropNamespace);
+            if (state.lifecycle != RefLifecycle::Live)
+                return {};   /// raced: another caller already removed it since our check above
+
+            std::vector<RefOp> ops;
+            for (const auto & [ref_name, row] : state.committed)
+            {
+                RefOp op;
+                op.kind = RefOpKind::OwnerTransition;
+                op.old_binding = RefOwnerBinding{RefOwnerKind::Committed, ref_name, row.manifest_ref};
+                ops.push_back(op);
+            }
+            for (const auto & [ref_name, mref] : state.precommits)
+            {
+                RefOp op;
+                op.kind = RefOpKind::OwnerTransition;
+                op.old_binding = RefOwnerBinding{RefOwnerKind::Precommit, ref_name, mref};
+                ops.push_back(op);
+            }
+            RefOp remove;
+            remove.kind = RefOpKind::RemoveNamespace;
+            ops.push_back(remove);
+            return ops;
+        },
+        RootMutationOrigin::Writer, RootMutationKind::DropNamespace);
+
+    /// spec §Namespace Removal: "After the removal transaction is durable, the writer also publishes
+    /// the constant-size Removed snapshot"; best-effort here (the removal itself already succeeded) --
+    /// Task 12's namespace-cleanup item republishes it idempotently if this writer stops first.
+    try
+    {
+        publishRemovedSnapshotNow(ns);
+    }
+    catch (...)
+    {
+        tryLogCurrentException(getLogger("CasStore"), "CAS dropNamespace: publishing the Removed snapshot failed (best-effort)");
     }
 
-    /// Delete the verbatim files: list → head for the token → deleteExact (single-owner, bounded retry).
-    const String prefix = pool_layout.namespaceFilesPrefix(ns);
-    String cursor;
-    while (true)
-    {
-        ListPage page = pool_backend->list(prefix, cursor, /*limit*/ 1000);
-        for (const ListedKey & listed : page.keys)
-            /// Single-owner head → deleteExact with the bounded TokenMismatch-retry: exactly the
-            /// casRemoveObject contract (no-op on absent, idempotent on NotFound, ABORTED on live-lock).
-            casRemoveObject(listed.key);
-        if (page.next_cursor.empty())
-            break;
-        cursor = page.next_cursor;
-    }
-
-    /// Evict this namespace's shard entries from the read-path decode cache: the namespace is gone,
-    /// so they would never be re-read (and thus never revalidated/replaced) — a slow leak otherwise.
-    {
-        std::lock_guard lock(shard_decode_cache_mutex);
-        for (uint64_t shard = 0; shard < meta.root_shards; ++shard)
-            shard_decode_cache.erase(pool_layout.rootShardKey(ns, shard));
-    }
+    /// TODO(Task 12): the writer performs NO physical deletion of ref-log/snapshot objects or verbatim
+    /// namespace files anymore -- GC's namespace-cleanup item ({namespace, remove_txn_id},
+    /// Pending->Completed) owns that reclaim, keyed off the durable `remove_namespace` this call just
+    /// appended (spec §Clean Old Ref Objects). Until Task 12 lands, a dropped namespace's ref-log
+    /// objects and verbatim files remain as debris; the OLD per-shard tombstoning + verbatim-file
+    /// deletion this function used to do is gone (it operated on the legacy RootShard format, which no
+    /// longer holds any real ref state to protect once refs live on the snapshot+log protocol).
 }
 
 std::pair<RootShard, std::optional<Token>> Store::readShard(const RootNamespace & ns, uint64_t shard)

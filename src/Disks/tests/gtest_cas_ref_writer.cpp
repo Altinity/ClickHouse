@@ -48,6 +48,16 @@ StorePtr openStore(const BackendPtr & backend, CasRequestBudget budget = {})
     return Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .cas_request_budget = budget});
 }
 
+/// Task 11: like `openStore`, but the caller supplies (and owns) the rest of the config -- snapshot
+/// thresholds, grace age, a fake `boot_ms_fn`, etc. `pool_prefix`/`server_root_id` are pinned so every
+/// test in this file addresses the same pool shape.
+StorePtr openStoreWithConfig(const BackendPtr & backend, PoolConfig config)
+{
+    config.pool_prefix = "p";
+    config.server_root_id = "test";
+    return Store::open(backend, std::move(config));
+}
+
 /// Mirrors gtest_cas_build.cpp's startBuildFor/publishOneBlobPart, minus the blob (an empty-entry
 /// manifest is a legal, blob-free part -- the ref-writer tests only care about ref/manifest identity).
 BuildPtr startBuildFor(const StorePtr & s, const RootNamespace & ns, const String & ref)
@@ -70,6 +80,64 @@ ManifestId publishEmptyPart(const StorePtr & s, const RootNamespace & ns, const 
 ManifestRef manifestRef(uint64_t epoch, uint64_t seq, uint32_t ordinal)
 {
     return ManifestRef{epoch, seq, ordinal};
+}
+
+/// Task 11: an INDEPENDENT ground truth for "cache-replay equivalence" tests -- lists every `_log/`
+/// key under `ns` directly off the backend (ignoring any snapshot), decodes and replays them in id
+/// order via the SAME shared state machine the writer uses, and returns the resulting state. A
+/// published snapshot's bytes must equal `encodeRefTableSnapshot(snapshotOf(replay-through-X, ns))`
+/// for this oracle's replay truncated at `X`.
+RefTableState independentFullReplayForTest(Backend & backend, const Layout & layout, const RootNamespace & ns,
+                                            std::optional<RefTxnId> up_to = std::nullopt)
+{
+    std::vector<RefTxnId> ids;
+    String cursor;
+    for (;;)
+    {
+        const ListPage page = backend.list(layout.refsNamespacePrefix(ns), cursor, 1000);
+        for (const ListedKey & lk : page.keys)
+        {
+            const auto parsed = layout.parseRefObjectKey(lk.key);
+            if (parsed && parsed->ns == ns && parsed->kind == RefObjectKind::Log
+                && (!up_to || !(*up_to < parsed->txn_id)))
+                ids.push_back(parsed->txn_id);
+        }
+        if (page.next_cursor.empty())
+            break;
+        cursor = page.next_cursor;
+    }
+    std::sort(ids.begin(), ids.end());
+
+    RefTableState state;
+    for (const RefTxnId & id : ids)
+    {
+        const auto got = backend.get(layout.refLogKey(ns, id));
+        applyRefLogTxn(state, decodeRefLogTxn(got->bytes, ns.string(), id));
+    }
+    return state;
+}
+
+/// The greatest `_snap/<id>.proto` key currently present for `ns`, found via a fresh LIST (independent
+/// of the Store's own cached bookkeeping).
+std::optional<RefTxnId> listGreatestSnapshotIdForTest(Backend & backend, const Layout & layout, const RootNamespace & ns)
+{
+    std::optional<RefTxnId> greatest;
+    String cursor;
+    for (;;)
+    {
+        const ListPage page = backend.list(layout.refsNamespacePrefix(ns), cursor, 1000);
+        for (const ListedKey & lk : page.keys)
+        {
+            const auto parsed = layout.parseRefObjectKey(lk.key);
+            if (parsed && parsed->ns == ns && parsed->kind == RefObjectKind::Snap
+                && (!greatest || *greatest < parsed->txn_id))
+                greatest = parsed->txn_id;
+        }
+        if (page.next_cursor.empty())
+            break;
+        cursor = page.next_cursor;
+    }
+    return greatest;
 }
 
 /// A backend that can (a) force one `get()` on a chosen exact key to return absent exactly once
@@ -114,6 +182,15 @@ public:
             pending_delayed_write = {key, bytes};
             throw Poco::TimeoutException("RefWriterTestBackend: simulated ambiguous result (response lost)");
         }
+        {
+            std::unique_lock lk(block_mutex);
+            if (block_armed && key.find(block_substr) != String::npos)
+            {
+                block_entered = true;
+                block_cv.notify_all();
+                block_cv.wait(lk, [&] { return !block_armed; });
+            }
+        }
         return CountingBackend::putIfAbsent(key, bytes, meta);
     }
 
@@ -128,6 +205,36 @@ public:
         }
     }
 
+    /// Task 11: blocks EVERY `putIfAbsent()` whose key contains `armed_block_substr` until
+    /// `releaseBlock()` is called, notifying `awaitBlockEntered()` the first time one is reached. Used
+    /// to prove snapshot publication never holds up an unrelated concurrent append.
+    void armPutBlock(const String & substr)
+    {
+        std::lock_guard g(block_mutex);
+        block_substr = substr;
+        block_armed = true;
+        block_entered = false;
+    }
+    void awaitBlockEntered()
+    {
+        std::unique_lock lk(block_mutex);
+        block_cv.wait(lk, [&] { return block_entered; });
+    }
+    void releaseBlock()
+    {
+        {
+            std::lock_guard g(block_mutex);
+            block_armed = false;
+        }
+        block_cv.notify_all();
+    }
+
+private:
+    std::mutex block_mutex;
+    std::condition_variable block_cv;
+    String block_substr;
+    bool block_armed = false;
+    bool block_entered = false;
 };
 
 }
@@ -454,4 +561,432 @@ TEST(RefWriterAppendLane, WedgedAppendObservedDurableAppliesBeforeNextId)
     EXPECT_FALSE(store->refLaneWedgedForTest(ns));
     EXPECT_FALSE(store->resolveRef(ns, "x").has_value()) << "the wedged drop was applied on resolution";
     EXPECT_FALSE(store->resolveRef(ns, "y").has_value()) << "the next mutation committed normally afterward";
+}
+
+/// ===================================================================================
+/// Task 11: snapshot publication (spec §writer-snapshot-publication)
+/// ===================================================================================
+
+/// The count threshold fires a background publish covering the whole retained tail; its bytes must
+/// equal an INDEPENDENT oracle's replay of the same logs through the published id (cache-replay
+/// equivalence), and the retained tail must be fully pruned afterward (spec: "Publication is
+/// background and never blocks an append").
+TEST(RefWriterSnapshotPublish, ThresholdTriggerPublishesCacheReplayEquivalentBytes)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const Layout layout("p");
+    PoolConfig config;
+    config.snapshot_log_count_threshold = 3;
+    config.snapshot_log_bytes_threshold = 1ULL << 40;
+    config.snapshot_min_log_age_ms = 0;
+    auto store = openStoreWithConfig(backend, config);
+    const RootNamespace ns{"srv1/threshold_publish"};
+
+    publishEmptyPart(store, ns, "a");   /// tail: 2 (birth+add, promote)
+    publishEmptyPart(store, ns, "b");   /// tail: 3, then 4 (4 > 3 -> dispatches ONE background publish)
+
+    store->waitForSnapshotPublishSettleForTest(ns);
+
+    const auto snap_id = listGreatestSnapshotIdForTest(*backend, layout, ns);
+    ASSERT_TRUE(snap_id.has_value()) << "the threshold trigger must have published a snapshot";
+    EXPECT_EQ(store->newestPublishedSnapshotIdForTest(ns), snap_id);
+    EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), 0u) << "a snapshot covering everything prunes the whole tail";
+
+    const auto got = backend->get(layout.refSnapshotKey(ns, *snap_id));
+    ASSERT_TRUE(got.has_value());
+
+    /// The independent oracle: replay every `_log/` object directly, ignoring the snapshot entirely.
+    const RefTableState oracle = independentFullReplayForTest(*backend, layout, ns, *snap_id);
+    const String expected_bytes = encodeRefTableSnapshot(snapshotOf(oracle, ns.string()));
+    EXPECT_EQ(got->bytes, expected_bytes) << "published snapshot bytes must equal replay(logs through X)";
+}
+
+/// A fresh mount that recovers a large PRE-EXISTING tail (left by a predecessor whose own thresholds
+/// never fired) must trigger its own publish from a plain READ (resolveRef/listRefs), not only from a
+/// write -- the mount-time trigger (spec: "or right after recovery replays a tail already above one").
+TEST(RefWriterSnapshotPublish, MountTimeTriggerPublishesAfterRecoveryReplaysLargeTail)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/mount_time_publish"};
+
+    {
+        /// Predecessor: default (high) thresholds, so nothing publishes yet. 3 parts -> 6 tail entries.
+        auto predecessor = openStore(backend);
+        publishEmptyPart(predecessor, ns, "a");
+        publishEmptyPart(predecessor, ns, "b");
+        publishEmptyPart(predecessor, ns, "c");
+    }   /// mount released; the tail is durable but nothing has published it
+
+    PoolConfig config;
+    config.snapshot_log_count_threshold = 3;
+    config.snapshot_log_bytes_threshold = 1ULL << 40;
+    config.snapshot_min_log_age_ms = 0;
+    auto successor = openStoreWithConfig(backend, config);
+
+    /// A mere READ triggers recovery; recovery alone must dispatch the mount-time publish (the table is
+    /// never otherwise mutated by this mount).
+    EXPECT_EQ(successor->listRefs(ns).size(), 3u);
+    successor->waitForSnapshotPublishSettleForTest(ns);
+
+    const auto snap_id = listGreatestSnapshotIdForTest(*backend, layout, ns);
+    ASSERT_TRUE(snap_id.has_value()) << "the mount-time trigger must have published a snapshot";
+    EXPECT_EQ(successor->tailSinceSnapshotCountForTest(ns), 0u);
+
+    const auto got = backend->get(layout.refSnapshotKey(ns, *snap_id));
+    ASSERT_TRUE(got.has_value());
+    const RefTableState oracle = independentFullReplayForTest(*backend, layout, ns, *snap_id);
+    EXPECT_EQ(got->bytes, encodeRefTableSnapshot(snapshotOf(oracle, ns.string())));
+}
+
+/// Grace age (spec §Late Predecessor PUT): a candidate id never covers a log younger than
+/// `snapshot_min_log_age_ms`. Drives `trySnapshotPublishOnce` directly (bypassing thresholds/background
+/// dispatch entirely) against an injected fake clock for a fully deterministic age check.
+TEST(RefWriterSnapshotPublish, GraceAgeRespectedYoungLogNotCovered)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/grace_age"};
+    uint64_t fake_now = 1000;
+
+    PoolConfig config;
+    config.snapshot_min_log_age_ms = 60000;
+    config.boot_ms_fn = [&fake_now] { return fake_now; };
+    /// The local write fence's deadline is ALSO measured off this same fake clock (armed at open as
+    /// `bootMsNow() + mount_lease_ttl_ms`); widen it well past the clock jump below so advancing the
+    /// fake clock to exercise the grace age does not ALSO trip the (unrelated) mount-lease fence.
+    config.mount_lease_ttl_ms = std::chrono::milliseconds(10'000'000);
+    auto store = openStoreWithConfig(backend, config);
+
+    publishEmptyPart(store, ns, "a");   /// both commits stamped observed_at_ms = 1000
+
+    EXPECT_FALSE(store->trySnapshotPublishOnce(ns)) << "every tail entry is still within the grace window";
+    EXPECT_FALSE(listGreatestSnapshotIdForTest(*backend, layout, ns).has_value());
+
+    fake_now += 61000;   /// past the 60s grace window
+    EXPECT_TRUE(store->trySnapshotPublishOnce(ns));
+    const auto snap_id = listGreatestSnapshotIdForTest(*backend, layout, ns);
+    ASSERT_TRUE(snap_id.has_value());
+    EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), 0u);
+}
+
+/// Publication must never block a concurrent append on the SAME table (spec: "Publication is
+/// background and never blocks an append"): while a dispatched background publish is stuck mid-PUT, an
+/// ordinary mutation on the table must still complete promptly (a real deadlock would hang this test).
+TEST(RefWriterSnapshotPublish, PublicationNeverBlocksConcurrentAppend)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/publish_no_block"};
+    PoolConfig config;
+    config.snapshot_log_count_threshold = 3;
+    config.snapshot_log_bytes_threshold = 1ULL << 40;
+    config.snapshot_min_log_age_ms = 0;
+    auto store = openStoreWithConfig(backend, config);
+
+    backend->armPutBlock("_snap/");
+
+    publishEmptyPart(store, ns, "a");
+    publishEmptyPart(store, ns, "b");   /// tail reaches 4 (> 3) -> dispatches a background publish
+
+    backend->awaitBlockEntered();   /// the dispatched attempt is now stuck mid-PUT on the snapshot key
+
+    /// An unrelated mutation on the SAME table must complete without waiting for the stuck publish.
+    EXPECT_NO_THROW(store->dropRef(ns, "a"));
+    EXPECT_FALSE(store->resolveRef(ns, "a").has_value());
+
+    backend->releaseBlock();
+    store->waitForSnapshotPublishSettleForTest(ns);
+    EXPECT_TRUE(listGreatestSnapshotIdForTest(*backend, layout, ns).has_value());
+}
+
+/// ===================================================================================
+/// Task 11: successor stale-precommit cleanup (spec §Clean Up Old Precommits)
+/// ===================================================================================
+
+/// A predecessor's dangling (never-promoted) precommits are swept by the successor mount's first touch
+/// of the table; a precommit the SUCCESSOR itself adds under its OWN (current) epoch must survive.
+TEST(RefWriterStalePrecommitSweep, SweepsOnlyStaleEpochPrecommitsKeepsCurrentEpoch)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const RootNamespace ns{"srv1/precommit_sweep_basic"};
+
+    {
+        /// A predecessor writer leaves THREE precommits dangling (a crash before promote).
+        auto predecessor = openStore(backend);
+        for (const String & name : {"stale_a", "stale_b", "stale_c"})
+        {
+            auto build = startBuildFor(predecessor, ns, name);
+            const ManifestId id = build->stageManifest({});
+            build->precommitAdd(ns, name, id);
+            /// no promote -- left dangling, as a crashed build would leave it
+        }
+    }   /// predecessor destroyed: its mount lease is released
+
+    /// The successor allocates a strictly higher durable writer_epoch; its own FRESH precommit must
+    /// survive the sweep its very first touch of the table triggers.
+    auto successor = openStore(backend);
+    auto build = startBuildFor(successor, ns, "fresh_x");
+    const ManifestId fresh_id = build->stageManifest({});
+    build->precommitAdd(ns, "fresh_x", fresh_id);   /// this call's own appendRefOps hoists the sweep first
+
+    const RefTableState replayed = independentFullReplayForTest(*backend, successor->layout(), ns);
+    EXPECT_EQ(replayed.lifecycle, RefLifecycle::Live);
+    EXPECT_TRUE(replayed.committed.empty());
+    ASSERT_EQ(replayed.precommits.size(), 1u);
+    EXPECT_EQ(replayed.precommits.begin()->first, "fresh_x");
+    EXPECT_EQ(replayed.precommits.begin()->second, fresh_id.ref);
+}
+
+/// The sweep chunks its removal to `ref_txn_max_ops` (1000) stale precommits per transaction (spec
+/// §Clean Up Old Precommits), and an interruption (an uncertain PUT, wedging the lane) leaves the
+/// remainder harmlessly for a LATER mount's own fresh recovery to finish -- "each chunk re-reads the
+/// LIVE state, so a partial sweep just leaves fewer stale bindings for the next chunk (or the next
+/// mount's recovery) to find."
+TEST(RefWriterStalePrecommitSweep, BoundedBatchesAndInterruptionResumeAcrossMounts)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/precommit_sweep_bounded"};
+    constexpr int kTotalStale = 1200;   /// > ref_txn_max_ops (1000): forces at least two removal chunks
+
+    uint64_t e1;
+    {
+        auto predecessor = openStore(backend);
+        e1 = predecessor->writerEpoch();
+    }   /// predecessor released; only its epoch is needed -- the stale precommits are seeded raw below
+
+    /// Seed kTotalStale precommits directly (bypassing any Store) under the predecessor's epoch,
+    /// spread over two raw log objects (each within the per-transaction 1000-op ENCODE cap) so recovery
+    /// costs only two GETs, not kTotalStale of them.
+    {
+        std::vector<RefOp> ops1;
+        ops1.push_back(namespaceBirthOp());
+        for (int i = 0; i < 700; ++i)
+        {
+            RefOp op;
+            op.kind = RefOpKind::OwnerTransition;
+            op.new_binding = RefOwnerBinding{RefOwnerKind::Precommit, "stale_" + std::to_string(i), manifestRef(e1, static_cast<uint64_t>(i + 1), 1)};
+            ops1.push_back(op);
+        }
+        writeRefLogTxnRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{e1, 1}, ops1});
+
+        std::vector<RefOp> ops2;
+        for (int i = 700; i < kTotalStale; ++i)
+        {
+            RefOp op;
+            op.kind = RefOpKind::OwnerTransition;
+            op.new_binding = RefOwnerBinding{RefOwnerKind::Precommit, "stale_" + std::to_string(i), manifestRef(e1, static_cast<uint64_t>(i + 1), 1)};
+            ops2.push_back(op);
+        }
+        writeRefLogTxnRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{e1, 2}, ops2});
+    }
+
+    /// The successor: a tight retry budget so ONE simulated ambiguous response wedges rather than
+    /// transparently retries away (mirrors the existing wedge-semantics tests in this file exactly).
+    CasRequestBudget budget;
+    budget.max_attempts = 1;
+    budget.attempt_timeout_ms = 100;
+    budget.operation_deadline_ms = 100;
+    budget.lease_safety_margin_ms = 100;
+    PoolConfig config;
+    config.cas_request_budget = budget;
+    auto successor = openStoreWithConfig(backend, config);
+
+    backend->fault_key_substr = layout.refsNamespacePrefix(ns) + "_log/";
+    backend->fault_count = 1;   /// hits exactly the sweep's FIRST removal chunk's PUT
+
+    /// The sweep is piggybacked on this mount's very first touch; its (uncertain) failure propagates to
+    /// the caller's own read, per `resolveRef`/`listRefs`'s undecorated call to `maybeSweepStalePrecommits`.
+    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { successor->listRefs(ns); });
+    EXPECT_TRUE(successor->refLaneWedgedForTest(ns));
+
+    /// The first chunk's request actually landed server-side; the caller just never saw the ack.
+    backend->materializePendingDelayedWrite();
+    successor.reset();   /// abandoned mid-sweep WITHOUT ever resolving its own wedge in-memory
+
+    /// A THIRD mount (successor-of-the-successor): fresh recovery replays the two raw seed logs PLUS the
+    /// first chunk's now-durable removal, sees `needs_stale_precommit_sweep` armed again, and finishes
+    /// the remaining stale precommits in exactly one further chunk (<= 1000 remain).
+    auto resumer = openStore(backend);
+    EXPECT_NO_THROW(resumer->listRefs(ns));
+
+    const RefTableState final_state = independentFullReplayForTest(*backend, layout, ns);
+    EXPECT_EQ(final_state.lifecycle, RefLifecycle::Live);
+    EXPECT_TRUE(final_state.precommits.empty()) << "every stale precommit must eventually be swept";
+
+    /// Bounded batches: exactly two NEW removal transactions (epoch > e1) were needed for kTotalStale
+    /// items -- never one (would violate the 1000-op cap) and never kTotalStale individual ones.
+    size_t new_log_objects = 0;
+    {
+        String cursor;
+        for (;;)
+        {
+            const ListPage page = backend->list(layout.refsNamespacePrefix(ns), cursor, 1000);
+            for (const ListedKey & lk : page.keys)
+            {
+                const auto parsed = layout.parseRefObjectKey(lk.key);
+                if (parsed && parsed->ns == ns && parsed->kind == RefObjectKind::Log && parsed->txn_id.writer_epoch != e1)
+                    ++new_log_objects;
+            }
+            if (page.next_cursor.empty())
+                break;
+            cursor = page.next_cursor;
+        }
+    }
+    EXPECT_EQ(new_log_objects, 2u);
+}
+
+/// ===================================================================================
+/// Task 11: namespace removal (spec §Namespace Removal)
+/// ===================================================================================
+
+/// dropNamespace's ONE body transaction names an exact removal for every committed ref AND every
+/// dangling precommit, with `remove_namespace` as the FINAL op -- never any other shape.
+TEST(RefWriterNamespaceRemoval, TxnNamesEveryOwnerThenRemoveNamespace)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openStore(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/remove_shape"};
+
+    publishEmptyPart(store, ns, "committed_1");
+    publishEmptyPart(store, ns, "committed_2");
+    /// One precommit left dangling (never promoted) so the removal txn must ALSO name it.
+    auto build = startBuildFor(store, ns, "dangling");
+    const ManifestId dangling_id = build->stageManifest({});
+    build->precommitAdd(ns, "dangling", dangling_id);
+
+    store->dropNamespace(ns);
+
+    /// The newest `_log/` object for `ns` is the removal transaction.
+    std::optional<RefTxnId> newest_log;
+    {
+        String cursor;
+        for (;;)
+        {
+            const ListPage page = backend->list(layout.refsNamespacePrefix(ns), cursor, 1000);
+            for (const ListedKey & lk : page.keys)
+            {
+                const auto parsed = layout.parseRefObjectKey(lk.key);
+                if (parsed && parsed->ns == ns && parsed->kind == RefObjectKind::Log
+                    && (!newest_log || *newest_log < parsed->txn_id))
+                    newest_log = parsed->txn_id;
+            }
+            if (page.next_cursor.empty())
+                break;
+            cursor = page.next_cursor;
+        }
+    }
+    ASSERT_TRUE(newest_log.has_value());
+    const auto got = backend->get(layout.refLogKey(ns, *newest_log));
+    ASSERT_TRUE(got.has_value());
+    const RefLogTxn removal_txn = decodeRefLogTxn(got->bytes, ns.string(), *newest_log);
+
+    ASSERT_FALSE(removal_txn.ops.empty());
+    EXPECT_EQ(removal_txn.ops.back().kind, RefOpKind::RemoveNamespace);
+    size_t owner_removals = 0;
+    for (size_t i = 0; i + 1 < removal_txn.ops.size(); ++i)
+    {
+        const RefOp & op = removal_txn.ops[i];
+        EXPECT_EQ(op.kind, RefOpKind::OwnerTransition);
+        EXPECT_TRUE(op.old_binding.has_value());
+        EXPECT_FALSE(op.new_binding.has_value());
+        ++owner_removals;
+    }
+    EXPECT_EQ(owner_removals, 3u) << "2 committed + 1 dangling precommit";
+}
+
+/// After the removal transaction is durable, dropNamespace publishes the constant-size `Removed`
+/// snapshot; the retained tail is fully pruned by it (constant-size going forward).
+TEST(RefWriterNamespaceRemoval, RemovedSnapshotPublished)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openStore(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/remove_snapshot"};
+
+    publishEmptyPart(store, ns, "a");
+    store->dropNamespace(ns);
+
+    const auto remove_id = store->newestPublishedSnapshotIdForTest(ns);
+    ASSERT_TRUE(remove_id.has_value());
+    EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), 0u);
+
+    const auto got = backend->get(layout.refSnapshotKey(ns, *remove_id));
+    ASSERT_TRUE(got.has_value());
+    const RefTableSnapshot snap = decodeRefTableSnapshot(got->bytes, ns.string(), *remove_id);
+    EXPECT_EQ(snap.lifecycle, RefLifecycle::Removed);
+    ASSERT_TRUE(snap.remove_txn_id.has_value());
+    EXPECT_EQ(*snap.remove_txn_id, *remove_id);
+    EXPECT_TRUE(snap.committed.empty());
+    EXPECT_TRUE(snap.precommits.empty());
+}
+
+/// ===================================================================================
+/// Task 11: namespace birth / the recreation gate (spec §Namespace Birth)
+/// ===================================================================================
+
+/// Recreating a `Removed` namespace is rejected absent the exact `_cleanup/<remove_txn_id>` marker --
+/// even though a FRESH mount's own recovery sees the table as functionally "empty" (the pre-removal
+/// logs are all at/below the small Removed snapshot and are ignored by the recovery rule), an
+/// empty-looking prefix is never sufficient on its own. Once the marker is observed, birth succeeds and
+/// the table's id timeline continues strictly above the old remove_txn_id.
+TEST(RefWriterNamespaceBirth, BirthFromRemovedRejectedWithoutMarkerAcceptedWithMarker)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/recreate"};
+
+    RefTxnId remove_id;
+    {
+        auto store = openStore(backend);
+        publishEmptyPart(store, ns, "a");
+        store->dropNamespace(ns);
+        const auto id = store->newestPublishedSnapshotIdForTest(ns);
+        ASSERT_TRUE(id.has_value());
+        remove_id = *id;
+    }   /// mount released
+
+    /// A fresh mount, no marker observed: rejected.
+    {
+        auto store2 = openStore(backend);
+        auto build = startBuildFor(store2, ns, "reborn");
+        const ManifestId id = build->stageManifest({});
+        expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { build->precommitAdd(ns, "reborn", id); });
+    }
+
+    /// GC's namespace-cleanup item (Task 12) publishes the exact completion marker -- simulated here
+    /// directly via the raw fixture convention, since Task 12 has not landed yet.
+    backend->putIfAbsent(layout.refCleanupMarkerKey(ns, remove_id), "");
+
+    /// A further fresh mount, marker now observed: birth succeeds.
+    {
+        auto store3 = openStore(backend);
+        auto build = startBuildFor(store3, ns, "reborn");
+        const ManifestId id = build->stageManifest({});
+        EXPECT_NO_THROW(build->precommitAdd(ns, "reborn", id));
+        build->promote(ns, "reborn", build->buildId(), id);
+
+        const auto resolved = store3->resolveRef(ns, "reborn");
+        ASSERT_TRUE(resolved.has_value());
+        EXPECT_EQ(resolved->manifest_id.ref, id.ref);
+
+        const RefTableState replayed = independentFullReplayForTest(*backend, layout, ns);
+        EXPECT_EQ(replayed.lifecycle, RefLifecycle::Live);
+        EXPECT_GT(replayed.greatest_applied, remove_id) << "the reborn timeline continues strictly above the old removal";
+    }
+}
+
+/// A never-born namespace needs no marker at all (spec: "A never-born table (remove_txn_id absent)
+/// needs no marker.").
+TEST(RefWriterNamespaceBirth, BirthFromNeverBornNeedsNoMarker)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openStore(backend);
+    const RootNamespace ns{"srv1/virgin"};
+
+    EXPECT_FALSE(store->observedNamespaceCleanupMarker(ns, RefTxnId{1, 1}));
+    EXPECT_NO_THROW(publishEmptyPart(store, ns, "first"));
+    EXPECT_TRUE(store->resolveRef(ns, "first").has_value());
 }

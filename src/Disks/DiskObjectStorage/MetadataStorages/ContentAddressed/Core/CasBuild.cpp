@@ -952,6 +952,17 @@ void Build::precommitAdd(const RootNamespace & target_ns, const String & final_r
             std::vector<RefOp> ops;
             if (state.lifecycle != RefLifecycle::Live)
             {
+                /// Task 11 (spec §Namespace Birth): recreating a `Removed` namespace requires the
+                /// EXACT `_cleanup/<remove_txn_id>` completion marker from this table's own recovery --
+                /// an empty physical prefix is never sufficient. A never-born table (`remove_txn_id`
+                /// absent) needs no marker at all.
+                if (state.remove_txn_id.has_value()
+                    && !store->observedNamespaceCleanupMarker(target_ns, *state.remove_txn_id))
+                    throw Exception(ErrorCodes::ABORTED,
+                        "precommitAdd: namespace '{}' was removed (remove_txn_id {}-{}) and recreation "
+                        "requires the exact _cleanup completion marker from GC's namespace-cleanup item, "
+                        "which has not yet been observed (spec §Namespace Birth)",
+                        target_ns.string(), state.remove_txn_id->writer_epoch, state.remove_txn_id->ref_sequence);
                 RefOp birth;
                 birth.kind = RefOpKind::NamespaceBirth;
                 ops.push_back(birth);

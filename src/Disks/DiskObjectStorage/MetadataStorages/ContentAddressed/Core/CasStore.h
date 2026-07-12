@@ -227,6 +227,21 @@ struct PoolConfig
     /// The write-fence deadline clock (CLOCK_BOOTTIME milliseconds; see `MountFence`). Empty = the real
     /// boot clock (`Store::bootMs`); injected by tests to drive the fence deadline deterministically.
     std::function<uint64_t()> boot_ms_fn = {};
+
+    /// Task 11 (spec §writer-snapshot-publication): a table's tail (logs after its newest snapshot)
+    /// becomes a publish candidate once it exceeds either threshold, or right after recovery replays a
+    /// tail already above one (the mount-time trigger). Publication is background and never blocks an
+    /// append (see `Store::maybeScheduleSnapshotPublish`).
+    uint64_t snapshot_log_count_threshold = 64;
+    uint64_t snapshot_log_bytes_threshold = 1ULL << 20;   /// 1 MiB
+    /// Grace age (spec §Late Predecessor PUT): a candidate snapshot id `X` never covers a log younger
+    /// than this many milliseconds -- documented wall-clock risk reduction for the cross-epoch race,
+    /// not a proof. This writer times its OWN appends exactly (`Store::bootMsNow()` at commit); a
+    /// mount-replayed (pre-existing) log's age is measured from this writer's OWN recovery-completion
+    /// time instead of its true creation time, since this backend generation's `list()` carries no
+    /// per-key last-modified timestamp (`ListedKey` has none) -- conservative: it can only DELAY a
+    /// replayed log's eligibility, never advance it prematurely.
+    uint64_t snapshot_min_log_age_ms = 5000;
 };
 
 struct Resolved
@@ -382,10 +397,11 @@ public:
     void dropRef(const RootNamespace & ns, const String & ref_name);            /// one owner_transition removal txn
     void updateRefPayload(const RootNamespace & ns, const String & ref_name,
                           std::function<void(RootRef &)> mutator);              /// one set_payload txn
-    /// TODO(Task 11): still tombstones the legacy RootShard objects only -- it does not yet emit the
-    /// ref-log `remove_namespace` transaction the new format's read path (resolveRef/listRefs, both
-    /// backed by `RefTableRuntime` below) understands. Kept compiling per Task 10's scope boundary.
-    void dropNamespace(const RootNamespace & ns);                 /// tombstone every shard + delete verbatim files
+    /// Task 11 (spec §Namespace Removal): one ref-log transaction naming every owner's exact removal
+    /// followed by `remove_namespace`, then a best-effort publish of the constant-size `Removed`
+    /// snapshot. Performs NO physical deletion (no verbatim-file deletes, no tombstones) -- that is
+    /// GC's namespace-cleanup item, Task 12 (see the TODO at this function's definition).
+    void dropNamespace(const RootNamespace & ns);
 
     /// ==== writer ref-log append lane (Task 10, spec §Writer Algorithms) ====
     ///
@@ -412,6 +428,22 @@ public:
     RefTxnId appendRefOps(const RootNamespace & ns, MutationScope scope,
                          std::function<std::vector<RefOp>(const RefTableState &)> build_ops,
                          RootMutationOrigin origin, RootMutationKind kind);
+
+    /// Task 11 (spec §Namespace Birth): whether namespace `ns`'s recovery observed the exact
+    /// `_cleanup/<remove_txn_id>` completion marker for `remove_txn_id` -- the SOLE gate on recreating
+    /// a `Removed` namespace (an empty physical prefix is never sufficient). Recovers the table
+    /// (idempotent) if not already cached. Used by `Build::precommitAdd`'s auto-birth guard.
+    bool observedNamespaceCleanupMarker(const RootNamespace & ns, const RefTxnId & remove_txn_id);
+
+    /// Task 11 (spec §writer-snapshot-publication): the synchronous core of one publish attempt --
+    /// picks the newest grace-age-eligible candidate id `X` from the retained tail, encodes
+    /// `Replay(snapshot_base_state, tail through X)`, and `putIfAbsentControlled`s it. Returns true iff
+    /// a NEW snapshot was confirmed durable this call (false covers "nothing eligible yet", "nothing
+    /// new to cover", and every non-Committed outcome -- all harmless per the Failure Handling table:
+    /// "Snapshot create fails: keep all logs; writer recovery remains unchanged"). Public so tests can
+    /// drive one attempt deterministically without depending on the background dispatch's timing;
+    /// production reaches it only through `maybeScheduleSnapshotPublish`.
+    bool trySnapshotPublishOnce(const RootNamespace & ns);
 
     /// ---- verbatim namespace files (format_version.txt, ...) — plain keys, never content-addressed ----
     void putNamespaceFile(const RootNamespace & ns, const String & name, const String & bytes);
@@ -696,7 +728,7 @@ private:
         bool recovered = false;
         RefTableState state;
         /// Retained `_cleanup/<remove-txn-id>` markers observed at recovery (Task 11's recreation
-        /// gate consumes these; Task 10 only collects and retains them).
+        /// gate consumes these via `observedNamespaceCleanupMarker`).
         std::set<RefTxnId> cleanup_markers;
         std::optional<RefAppendWedge> wedge;
         uint64_t recovery_restarts = 0;           /// diagnostic: LIST/GET restarts forced by a vanished object
@@ -704,6 +736,34 @@ private:
         /// own `4 + ns.size()` wire overhead and a fixed safety margin, computed once at recovery.
         uint64_t snapshot_budget = 0;
         uint64_t removal_budget = 0;
+
+        /// Task 11 (spec §writer-snapshot-publication): one applied txn strictly above
+        /// `newest_snapshot_id`, retained so a grace-age-eligible candidate `X <= greatest_applied` can
+        /// be replayed from `snapshot_base_state` without re-fetching anything. `observed_at_ms` is
+        /// this writer's own commit time (own appends) or the table's recovery-completion time
+        /// (mount-replayed logs -- see `PoolConfig::snapshot_min_log_age_ms`); `encoded_bytes` avoids
+        /// re-encoding on prune. Pruned up through `X` once a snapshot covering `X` is confirmed durable.
+        struct TailLogEntry
+        {
+            RefLogTxn txn;
+            uint64_t observed_at_ms = 0;
+            uint64_t encoded_bytes = 0;
+        };
+        std::vector<TailLogEntry> tail_since_snapshot;
+        uint64_t tail_bytes_since_snapshot = 0;
+        /// The state as of `newest_snapshot_id` (the never-born/empty state if this table has never had
+        /// a snapshot published) -- the base every `tail_since_snapshot` entry replays forward from.
+        RefTableState snapshot_base_state;
+        std::optional<RefTxnId> newest_snapshot_id;
+        /// Cleared to false once a stale-precommit sweep has been dispatched for this table this mount
+        /// (spec §Clean Up Old Precommits); set true by recovery. `appendRefOps`'s top level checks it
+        /// before every call, cheaply, so it fires exactly once per table per mount.
+        bool needs_stale_precommit_sweep = false;
+        /// Test-observability + graceful settling for the background snapshot-publish dispatch (see
+        /// `maybeScheduleSnapshotPublish`): the count of in-flight publish attempts for this table, and
+        /// the condvar (guarded by `state_mutex`) a test waits on via `waitForSnapshotPublishSettleForTest`.
+        std::atomic<int> pending_snapshot_publishes{0};
+        std::condition_variable publish_settle_cv;
 
         std::deque<std::shared_ptr<RefMutationItem>> pending;    /// guarded by ref_queue_mutex
         bool leader_active = false;                               /// guarded by ref_queue_mutex
@@ -748,11 +808,53 @@ private:
     /// See `setRefPreCarveHookForTest`. Null in production (a no-op call site).
     std::function<void()> ref_pre_carve_hook_for_test;
 
+    /// ==== Task 11: snapshot publication + stale-precommit successor cleanup ====
+
+    /// Cheap threshold/lifecycle check (lock + comparison, no I/O); if triggered, dispatches
+    /// `trySnapshotPublishOnce` onto a detached background thread (spec: "off the mutation hot path
+    /// and never blocks appends" -- `trySnapshotPublishOnce` never touches the append queue, so this
+    /// can never deadlock against a flush leader). Called after every commit in `flushRefBatch` (the
+    /// threshold trigger) and once per table from `appendRefOps`'s top level right after recovery (the
+    /// mount-time trigger).
+    void maybeScheduleSnapshotPublish(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt);
+
+    /// Cheap flag check (lock + bool, no I/O) at the top of `appendRefOps`; if this table's stale
+    /// (older-epoch) precommits haven't been swept yet this mount, clears the flag and runs
+    /// `sweepStalePrecommitsNow` SYNCHRONOUSLY on the CALLING thread. Safe only because it runs BEFORE
+    /// that caller enqueues its own item or becomes a queue leader -- the sweep's own `appendRefOps`
+    /// calls are therefore a separate top-level invocation, never nested inside a leader's flush stack
+    /// (which would deadlock the leader against itself).
+    void maybeSweepStalePrecommits(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt);
+    /// The actual chunked removal loop (spec §Clean Up Old Precommits): repeatedly re-reads the live
+    /// state, gathers up to `ref_txn_max_ops` stale precommits (`manifest_ref.writer_epoch <
+    /// process_epoch`), and appends one bounded exact-removal transaction per chunk, until none remain.
+    void sweepStalePrecommitsNow(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt);
+
+    /// Publishes the constant-size `Removed` snapshot for a namespace whose `remove_namespace` is
+    /// already durable (spec §Namespace Removal). Best-effort / idempotent: a non-Committed outcome, or
+    /// this namespace not (yet) being `Removed`, is silently a no-op -- Task 12's namespace-cleanup item
+    /// republishes it if this writer stops first.
+    void publishRemovedSnapshotNow(const RootNamespace & ns);
+
 public:
     /// Test seams (Task 10): observe recovery-restart counting and wedge state without a private-member
     /// friend hack. Recovers the table (like any real read) if not already cached.
     uint64_t refRecoveryRestartsForTest(const RootNamespace & ns);
     bool refLaneWedgedForTest(const RootNamespace & ns);
+
+    /// Task 11 test seam: blocks until every background snapshot-publish attempt dispatched so far for
+    /// `ns` has settled. Needed only by tests that exercise the REAL background dispatch (production
+    /// concurrency); tests that just want deterministic publish-logic coverage call
+    /// `trySnapshotPublishOnce` directly instead.
+    void waitForSnapshotPublishSettleForTest(const RootNamespace & ns);
+
+    /// Task 11 test seam: the id of the newest snapshot this runtime has confirmed durable (recovered
+    /// or published), or `nullopt` if none. Recovers the table (idempotent) if not already cached.
+    std::optional<RefTxnId> newestPublishedSnapshotIdForTest(const RootNamespace & ns);
+
+    /// Task 11 test seam: count of applied txns retained above `newestPublishedSnapshotIdForTest` (the
+    /// tail a snapshot candidate would replay from).
+    size_t tailSinceSnapshotCountForTest(const RootNamespace & ns);
 
     /// Test-only hook (mirrors `setBackpressureDelayHook`'s existing pattern): called by `flushRefBatch`
     /// right before it carves a batch, i.e. AFTER the table is already recovered -- the one otherwise

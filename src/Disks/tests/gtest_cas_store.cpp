@@ -900,39 +900,39 @@ TEST(CasStore, UpdateRefPayloadUpdatesMutableFiles)
 /// unaffected by dropNamespace today. This test now exercises the two parts of dropNamespace that
 /// remain load-bearing regardless of ref format: verbatim-file removal, and legacy-shard tombstoning
 /// (still relied on by GC, Task 12) — it does not claim listRefs becomes empty afterward.
-TEST(CasStore, DropNamespaceRemovesVerbatimFilesAndTombstonesLegacyShards)
+/// Task 11: dropNamespace now removes every owner through the ref-log protocol and performs NO
+/// physical deletion at all (no verbatim-file deletes -- that is GC's namespace-cleanup item, Task 12).
+TEST(CasStore, DropNamespaceRemovesEveryOwnerButLeavesFilesForGc)
 {
     auto b = std::make_shared<InMemoryBackend>();
     auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
-    Layout layout("p");
     RootNamespace ns{"srv1/tbl"};
-    const uint64_t shards = s->poolMeta().root_shards;
 
-    /// A legacy RootShard object, as GC's fold/reclaim still write today (Task 12 migrates this).
-    const uint64_t shard = shardOfForTest("legacy_part", shards);
-    DB::Cas::tests::publishCommittedTransition(*b, layout, ns, "legacy_part", std::nullopt,
-        manifestRefFor("legacy"), shard);
+    const std::vector<String> ref_names{"alpha", "bravo", "charlie"};
+    for (const String & name : ref_names)
+        publishPart(s, ns.string(), name, "payload-" + name);
+    for (const String & name : ref_names)
+        ASSERT_TRUE(s->resolveRef(ns, name).has_value());
 
-    /// Two verbatim files.
     s->putNamespaceFile(ns, "format_version.txt", "1\n");
     s->putNamespaceFile(ns, "uuid.txt", "abc");
 
     s->dropNamespace(ns);
 
-    /// The touched legacy shard manifest still EXISTS, with empty refs and a removal journal record.
-    auto obj = b->get(layout.rootShardKey(ns, shard));
-    ASSERT_TRUE(obj.has_value());
-    auto after = decodeRootShard(obj->bytes);
-    EXPECT_TRUE(after.refs.empty());
-    bool has_remove = false;
-    for (const RootOwnerEvent & rec : after.journal)
-        if (rec.old_binding && !rec.new_binding && rec.old_binding->owner_kind == OwnerKind::Committed)
-            has_remove = true;
-    EXPECT_TRUE(has_remove);
+    for (const String & name : ref_names)
+        EXPECT_FALSE(s->resolveRef(ns, name).has_value());
+    EXPECT_TRUE(s->listRefs(ns).empty());
 
-    /// Verbatim files gone.
-    EXPECT_FALSE(s->getNamespaceFile(ns, "format_version.txt").has_value());
-    EXPECT_FALSE(s->getNamespaceFile(ns, "uuid.txt").has_value());
+    /// Task 11: the writer performs NO physical deletion; verbatim files survive until Task 12's
+    /// namespace-cleanup item reclaims the whole @cas@ namespace.
+    EXPECT_TRUE(s->getNamespaceFile(ns, "format_version.txt").has_value());
+    EXPECT_TRUE(s->getNamespaceFile(ns, "uuid.txt").has_value());
+
+    /// Repeated drop is idempotent: no throw, no second transaction (nothing left to observe changing).
+    EXPECT_NO_THROW(s->dropNamespace(ns));
+
+    /// Ordinary mutations on a Removed namespace are rejected.
+    expectThrowsCode(DB::ErrorCodes::FILE_DOESNT_EXIST, [&] { s->dropRef(ns, "alpha"); });
 }
 
 TEST(CasStore, ListNamespacesFromRefsTree)
