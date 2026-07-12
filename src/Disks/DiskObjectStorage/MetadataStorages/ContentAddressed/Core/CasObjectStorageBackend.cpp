@@ -1,5 +1,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasObjectStorageBackend.h>
 
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRequestControl.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/ObjectStorageIterator.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/StoredObject.h>
 #include <Disks/WriteMode.h>
@@ -37,6 +38,26 @@ namespace ErrorCodes
 namespace DB::Cas
 {
 
+#if USE_AWS_S3
+/// See the declaration in CasObjectStorageBackend.h: `ShouldRetry` always refuses, so the AWS SDK's
+/// OWN internal retry loop (which consults THIS object, not the POD `retry_strategy.max_retries`
+/// field — that only bounds Client's ClickHouse-side network-exception wrapper) can never issue a
+/// second attempt either. Every consultation is counted: it proves the SDK believed the first attempt
+/// was inconclusive or failed, which is exactly the signal CasConditionalWriteSdkRetries exists to
+/// catch (RFC §observability) — without this the counter would be permanently and vacuously zero,
+/// since nothing would ever call it.
+bool detail::SingleAttemptRetryStrategy::ShouldRetry(const Aws::Client::AWSError<Aws::Client::CoreErrors> &, long) const
+{
+    recordConditionalWriteSdkRetryConsidered();
+    return false;
+}
+
+long detail::SingleAttemptRetryStrategy::CalculateDelayBeforeNextRetry(const Aws::Client::AWSError<Aws::Client::CoreErrors> &, long) const
+{
+    return 0;   /// unreachable: ShouldRetry above always refuses before this would be consulted.
+}
+#endif
+
 ObjectStorageBackend::ObjectStorageBackend(ObjectStoragePtr object_storage_, Mode mode_, uint64_t conditional_single_put_cap_)
     : object_storage(std::move(object_storage_))
     , mode(mode_)
@@ -45,6 +66,31 @@ ObjectStorageBackend::ObjectStorageBackend(ObjectStoragePtr object_storage_, Mod
 {
     if (mode == Mode::Native && object_storage->conditionalOpsUseGenerationTokens())
         native_token_type = TokenType::Generation;
+
+#if USE_AWS_S3
+    /// Build the single-attempt conditional-write client ONCE (RFC cas-s3-timeout-retry-control
+    /// §disable-transparent-conditional-write-retries). `tryGetS3StorageClient` returns null for a
+    /// non-S3 object storage (EmulatedSingleProcess/local tests) — conditionalWriteSettings then
+    /// leaves the client override unset and Native conditional writes keep the disk's own retry
+    /// policy, same as before this change.
+    ///
+    /// Both retry knobs must be overridden: `retry_strategy.max_retries` (the POD struct) only bounds
+    /// this Client's OWN network-exception wrapper loop (Client::doRequestWithRetryNetworkErrors); the
+    /// AWS SDK's internal per-request retry (5xx, throttling, ...) is driven entirely through the
+    /// polymorphic `retryStrategy` object, which `getClientConfiguration()` copies BY POINTER — so
+    /// leaving it in place would still consult the DISK'S retry strategy (max_retries=500, fixed at
+    /// its OWN construction time, unaffected by mutating the POD copy here) for that path.
+    if (mode == Mode::Native)
+    {
+        if (auto base_client = object_storage->tryGetS3StorageClient())
+        {
+            auto cfg = base_client->getClientConfiguration();
+            cfg.retry_strategy.max_retries = 0;
+            cfg.retryStrategy = std::make_shared<detail::SingleAttemptRetryStrategy>();
+            single_attempt_s3_client = base_client->cloneWithConfigurationOverride(cfg);
+        }
+    }
+#endif
 }
 
 /// See Backend::checkStorePreconditions. Only the Native, generation-dialect (GCS) combination has
@@ -146,6 +192,30 @@ static PutOutcome finalizeConditionalWrite(WriteBuffer & buf)
 #endif
 }
 
+/// Instrumented wrapper shared by nativeConditionalPut and NativeStreamingSink::finalize: adds the RFC
+/// cas-s3-timeout-retry-control attempt/outcome counters around the SAME single finalize() call
+/// finalizeConditionalWrite already makes, WITHOUT changing the legacy Done/PreconditionFailed-or-
+/// rethrow contract every caller still depends on. finalizeConditionalWrite resolves a lost
+/// precondition WITHOUT throwing, so that case is counted directly as Unresolved (never Committed,
+/// never a false DefiniteFailure) rather than through the exception-classifying overload. Task 5's
+/// CasRequestController replaces this call site, consuming the full CasWriteOutcome range directly.
+static PutOutcome finalizeConditionalWriteInstrumented(WriteBuffer & buf)
+{
+    recordConditionalWriteAttemptStarted();
+    try
+    {
+        const PutOutcome legacy = finalizeConditionalWrite(buf);
+        recordConditionalWriteOutcome(
+            legacy == PutOutcome::Done ? classifyConditionalWriteResult() : CasWriteOutcome::Unresolved);
+        return legacy;
+    }
+    catch (const std::exception & e)
+    {
+        recordConditionalWriteOutcome(classifyConditionalWriteResult(e));
+        throw;
+    }
+}
+
 /// Issue a conditional PUT (the condition rides on `ws`) and map a precondition loss — see
 /// finalizeConditionalWrite. The condition is checked by the backend when the object is completed,
 /// so the precondition loss always surfaces from the buffer's finalize, never from write.
@@ -157,7 +227,7 @@ PutResult ObjectStorageBackend::nativeConditionalPut(const String & key, const S
     auto buf = object_storage->writeObject(
         StoredObject(key), WriteMode::Rewrite, attrs, DBMS_DEFAULT_BUFFER_SIZE, ws);
     buf->write(bytes.data(), bytes.size());
-    if (finalizeConditionalWrite(*buf) == PutOutcome::PreconditionFailed)
+    if (finalizeConditionalWriteInstrumented(*buf) == PutOutcome::PreconditionFailed)
         return {PutOutcome::PreconditionFailed, {}};
 
     /// Record the token of the incarnation WE just wrote (model WCreate). The S3 write returns
@@ -200,7 +270,7 @@ public:
     {
         chassert(!done);   /// finalize after finalize/cancel is a misuse — see the WriteSink contract
         done = true;
-        if (finalizeConditionalWrite(*write_buf) == PutOutcome::PreconditionFailed)
+        if (finalizeConditionalWriteInstrumented(*write_buf) == PutOutcome::PreconditionFailed)
             return {PutOutcome::PreconditionFailed, {}};
 
         /// Record the token of the incarnation we just wrote (model WCreate). The S3 write
@@ -573,6 +643,12 @@ WriteSettings ObjectStorageBackend::conditionalWriteSettings() const
         ws.s3_force_single_part_upload = true;
         ws.s3_single_part_upload_max_bytes_override = conditional_single_put_cap;
     }
+#if USE_AWS_S3
+    /// Exactly one HTTP attempt for every conditional write (RFC cas-s3-timeout-retry-control) — see
+    /// single_attempt_s3_client. Null (non-S3 object storage) leaves the disk's own client in place.
+    if (single_attempt_s3_client)
+        ws.s3_client_override = single_attempt_s3_client;
+#endif
     return ws;
 }
 

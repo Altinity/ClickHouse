@@ -830,6 +830,11 @@ The server successfully detected this situation and will download merged part fr
     M(CasPartFolderViewOversizedBypasses, "CA part-folder views built but not retained (estimated weight above the per-entry cap)", ValueType::Number) \
     M(CasPartFolderViewInvalidations, "CA part-folder view write-through erases (promote, mutable update, drop ref, drop namespace)", ValueType::Number) \
     M(CasPartFolderManifestGets, "CA part-manifest body GET requests issued by readManifestShared (the part-folder cache acceptance metric)", ValueType::Number) \
+    M(CasConditionalWriteAttempts, "CA conditional-write (If-None-Match/If-Match) HTTP attempts issued with the generic S3 client's transparent retries disabled (RFC cas-s3-timeout-retry-control)", ValueType::Number) \
+    M(CasConditionalWriteCommitted, "CA conditional writes whose single HTTP attempt classified Committed (2xx)", ValueType::Number) \
+    M(CasConditionalWriteDefiniteFailure, "CA conditional writes whose single HTTP attempt classified DefiniteFailure (a whitelisted malformed-request/entity-too-large/access-denied rejection, proving the request was never applied)", ValueType::Number) \
+    M(CasConditionalWriteUnresolved, "CA conditional writes whose single HTTP attempt classified Unresolved (PreconditionFailed/NoSuchKey, timeout, connection loss, 5xx, or an unrecognized error) — the caller resolves the exact key before any reissue", ValueType::Number) \
+    M(CasConditionalWriteSdkRetries, "CA conditional-write SDK-level retries observed; MUST stay zero under the single-attempt policy (RFC cas-s3-timeout-retry-control) — the single-attempt client's retry strategy always refuses, but every consultation about a retry beyond attempt 1 is counted here as a live tripwire", ValueType::Number) \
     M(S3GetObjectTagging, "Number of S3 API GetObjectTagging calls.", ValueType::Number) \
     M(S3CreateMultipartUpload, "Number of S3 API CreateMultipartUpload calls.", ValueType::Number) \
     M(S3UploadPartCopy, "Number of S3 API UploadPartCopy calls.", ValueType::Number) \

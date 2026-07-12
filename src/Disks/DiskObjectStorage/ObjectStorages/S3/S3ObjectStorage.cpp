@@ -326,8 +326,11 @@ std::unique_ptr<WriteBufferFromFileBase> S3ObjectStorage::writeObject( /// NOLIN
     if (blob_storage_log)
         blob_storage_log->local_path = object.local_path;
 
+    /// A per-request client override (e.g. CAS conditional writes forcing a single HTTP attempt) rides
+    /// on WriteSettings instead of changing this disk's shared client — every other write keeps using
+    /// `client.get()` and its normal retry policy unchanged.
     return std::make_unique<WriteBufferFromS3>(
-        client.get(),
+        write_settings.s3_client_override ? write_settings.s3_client_override : client.get(),
         uri.bucket,
         object.remote_path,
         write_settings.use_adaptive_write_buffer ? write_settings.adaptive_write_buffer_initial_size : buf_size,

@@ -3,9 +3,19 @@
 #include <Common/IThrottler.h>
 #include <Common/Scheduler/ResourceLink.h>
 #include <IO/DistributedCacheSettings.h>
+#include <memory>
+
+#include "config.h"
 
 namespace DB
 {
+
+#if USE_AWS_S3
+namespace S3
+{
+class Client;
+}
+#endif
 
 /// Settings to be passed to IDisk::writeFile()
 struct WriteSettings
@@ -49,6 +59,15 @@ struct WriteSettings
     /// Companion cap: raises max_single_part_upload_size / min_upload_part_size in the request
     /// settings so bodies up to this size stay in ONE part (RAM-buffered). 0 = no override.
     size_t s3_single_part_upload_max_bytes_override = 0;
+
+#if USE_AWS_S3
+    /// Per-request S3 client override: when set, S3ObjectStorage::writeObject issues THIS write with
+    /// the given client instead of the disk's shared one. Lets ONE write path (e.g. a CAS conditional
+    /// write, RFC cas-s3-timeout-retry-control) run with a different retry policy (a cheap
+    /// Client::cloneWithConfigurationOverride, same connection pool/credentials) without touching the
+    /// disk-wide client used by every other operation.
+    std::shared_ptr<const S3::Client> s3_client_override;
+#endif
 
     bool operator==(const WriteSettings & other) const = default;
 };

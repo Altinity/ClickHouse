@@ -6,6 +6,10 @@
 
 #include "config.h"
 
+#if USE_AWS_S3
+#include <IO/S3/Client.h>
+#endif
+
 namespace DB::Cas
 {
 
@@ -17,6 +21,19 @@ namespace detail
 /// typed `S3Exception` signal; exposed here for unit tests only — production callers go through
 /// `ObjectStorageBackend`. See the definition for the exact matching rules.
 PutOutcome finalizeConditionalWrite(WriteBuffer & buf);
+
+/// Retry strategy for the single-attempt conditional-write client (RFC cas-s3-timeout-retry-control
+/// §disable-transparent-conditional-write-retries): `ShouldRetry` always refuses, and every
+/// consultation is counted (CasConditionalWriteSdkRetries — see CasRequestControl.h) since it proves
+/// the SDK believed the first attempt was inconclusive or failed. Exposed here for unit tests only —
+/// production callers get it wired into `ObjectStorageBackend`'s ctor automatically.
+class SingleAttemptRetryStrategy final : public Aws::Client::RetryStrategy
+{
+public:
+    bool ShouldRetry(const Aws::Client::AWSError<Aws::Client::CoreErrors> &, long) const override;
+    long CalculateDelayBeforeNextRetry(const Aws::Client::AWSError<Aws::Client::CoreErrors> &, long) const override;
+    long GetMaxAttempts() const override { return 1; }
+};
 }
 #endif
 
@@ -95,6 +112,19 @@ private:
     TokenType native_token_type = TokenType::ETag;
     /// GCS single-PUT budget for conditional writes (generation-token stores only); see ctor.
     const uint64_t conditional_single_put_cap;
+
+#if USE_AWS_S3
+    /// Single-attempt S3 client for conditional writes (RFC cas-s3-timeout-retry-control
+    /// §disable-transparent-conditional-write-retries): a cheap clone of the underlying object
+    /// storage's shared client (same connection pool/credentials, see Client::cloneWithConfigurationOverride)
+    /// with SDK retries disabled, so a lost response surfaces to CAS immediately instead of the
+    /// generic ~500-attempt retry policy silently continuing past the mount lease. Built once in the
+    /// ctor for Native mode; null when the object storage is not S3-backed (EmulatedSingleProcess /
+    /// local tests) — conditionalWriteSettings then leaves the disk's own client in place, so Native
+    /// mode over a non-S3 backend keeps compiling but is NOT single-attempt (not expected in practice:
+    /// Native mode is only ever mounted over an S3-like conditional dialect).
+    std::shared_ptr<const S3::Client> single_attempt_s3_client;
+#endif
 
     /// EmulatedSingleProcess state: per-key current token (monotone counter as string).
     std::mutex emu_mutex;
