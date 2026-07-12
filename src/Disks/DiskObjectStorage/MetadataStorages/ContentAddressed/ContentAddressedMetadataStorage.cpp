@@ -145,7 +145,8 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     uint64_t gc_meta_pool_size_,
     StagingBackend staging_backend_,
     Cas::BlobHashAlgo blob_hash_algo_,
-    bool blob_hash_allow_new_)
+    bool blob_hash_allow_new_,
+    bool skip_access_check_)
     : object_storage(std::move(object_storage_))
     , storage_path_prefix(std::move(storage_path_prefix_))
     , storage_path_full(fs::path(object_storage->getRootPrefix()) / storage_path_prefix)
@@ -172,6 +173,7 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     , staging_backend(staging_backend_)
     , blob_hash_algo(blob_hash_algo_)
     , blob_hash_allow_new(blob_hash_allow_new_)
+    , skip_access_check(skip_access_check_)
 {
 }
 
@@ -400,6 +402,7 @@ void ContentAddressedMetadataStorage::startup()
     pool_config.server_root_id = server_root_id;
     pool_config.background_watermark = (context != nullptr) && !read_only;
     pool_config.read_only = read_only;
+    pool_config.skip_access_check = skip_access_check;
     /// Creation-time only (the pool is authoritative on reopen): widening the shard fanout spreads
     /// manifest CAS writes across more keys, reducing per-key congestion + per-key overwrite-orphan
     /// pileup (#4). Existing pools keep their shard count.

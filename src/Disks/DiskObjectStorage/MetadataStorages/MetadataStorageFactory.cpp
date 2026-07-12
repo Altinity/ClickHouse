@@ -264,6 +264,10 @@ static void registerContentAddressedMetadataStorage(MetadataStorageFactory & fac
         /// (BAD_ARGUMENTS) unless this is set. Default 0 (fail-closed): a changed config alone must
         /// never silently turn a pool mixed.
         const bool blob_hash_allow_new = config.getBool(config_prefix + ".blob_hash_allow_new", false);
+        /// Boot-time "start now, fix later" (see `Cas::PoolConfig::skip_access_check`): unlike the
+        /// generic `IDisk::startup(bool)` global flag, this per-disk directive is read directly here
+        /// because `IDisk::startupImpl()` drops the flag before `metadata_storage->startup()` runs.
+        const bool skip_access_check = config.getBool(config_prefix + ".skip_access_check", false);
         const uint64_t dedup_cache_bytes = config.getUInt64(config_prefix + ".dedup_cache_bytes", 64ULL << 20);
         const uint64_t dedup_head_first_min_bytes = config.getUInt64(config_prefix + ".dedup_head_first_min_bytes", 1ULL << 20);
         const uint64_t gc_snap_generations_to_keep = config.getUInt64(config_prefix + ".gc_snap_generations_to_keep", 3);
@@ -308,7 +312,8 @@ static void registerContentAddressedMetadataStorage(MetadataStorageFactory & fac
             gc_snap_generations_to_keep, gc_shards, manifest_sweep_list_budget_keys, manifest_sweep_delete_budget_keys,
             gcs_max_conditional_put_bytes,
             cas_part_folder_cache_bytes, cas_part_folder_cache_max_entries, cas_part_folder_cache_max_entry_bytes,
-            manifest_decode_cache_bytes, gc_meta_pool_size, staging_backend, blob_hash_algo, blob_hash_allow_new);
+            manifest_decode_cache_bytes, gc_meta_pool_size, staging_backend, blob_hash_algo, blob_hash_allow_new,
+            skip_access_check);
 
         return metadata_storage;
     });

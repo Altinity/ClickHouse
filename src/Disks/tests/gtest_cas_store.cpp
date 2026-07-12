@@ -147,6 +147,64 @@ TEST(CasStore, ReadOnlyOpenSkipsProbe)
     ASSERT_NE(store, nullptr);
 }
 
+namespace
+{
+/// Records whether any MUTATING op touched a `_probe/` key, so a test can assert an open ran (or
+/// skipped) the capability probe. Mirrors WriteCountingBackend above but keys on the probe subtree.
+class ProbeWatchingBackend final : public DB::Cas::Backend
+{
+public:
+    explicit ProbeWatchingBackend(std::shared_ptr<DB::Cas::Backend> inner_) : inner(std::move(inner_)) {}
+    bool probe_touched = false;
+
+    std::optional<DB::Cas::GetResult> get(const String & k, DB::Cas::Range r = {}) override { return inner->get(k, r); }
+    std::optional<DB::Cas::GetStreamResult> getStream(const String & k, DB::Cas::Range r = {}) override { return inner->getStream(k, r); }
+    DB::Cas::HeadResult head(const String & k) override { return inner->head(k); }
+    DB::Cas::ListPage list(const String & p, const String & c, size_t l) override { return inner->list(p, c, l); }
+    DB::Cas::PutResult putIfAbsent(const String & k, const String & b, const DB::Cas::ObjectMeta & m = {}) override { note(k); return inner->putIfAbsent(k, b, m); }
+    DB::Cas::WriteSinkPtr putIfAbsentStream(const String & k, const DB::Cas::ObjectMeta & m = {}) override { note(k); return inner->putIfAbsentStream(k, m); }
+    DB::Cas::PutResult putOverwrite(const String & k, const String & b, const DB::Cas::Token & e, const DB::Cas::ObjectMeta & m = {}) override { note(k); return inner->putOverwrite(k, b, e, m); }
+    DB::Cas::CasResult casPut(const String & k, const String & b, const std::optional<DB::Cas::Token> & e, const DB::Cas::ObjectMeta & m = {}) override { note(k); return inner->casPut(k, b, e, m); }
+    DB::Cas::DeleteOutcome deleteExact(const String & k, const DB::Cas::Token & t) override { note(k); return inner->deleteExact(k, t); }
+    bool supportsListTokens() const override { return inner->supportsListTokens(); }
+private:
+    void note(const String & k) { if (k.find("/_probe/") != String::npos) probe_touched = true; }
+    std::shared_ptr<DB::Cas::Backend> inner;
+};
+}
+
+TEST(CasStore, SkipAccessCheckOpenSkipsProbeButStaysWritable)
+{
+    auto shared = std::make_shared<DB::Cas::InMemoryBackend>();
+
+    DB::Cas::PoolConfig cfg;
+    cfg.pool_prefix = "pool";
+    cfg.server_id = DB::UInt128(1);
+    cfg.server_root_id = "srv-1";
+
+    /// Baseline: a normal writable open runs the capability probe (PUT+delete of `_probe/` keys).
+    {
+        auto watch = std::make_shared<ProbeWatchingBackend>(shared);
+        auto s = DB::Cas::Store::open(watch, cfg);
+        ASSERT_NE(s, nullptr);
+        EXPECT_TRUE(watch->probe_touched) << "the probe must run by default";
+    }
+
+    /// skip_access_check open ("start now, fix later"): NO probe I/O, yet still a WRITABLE mount
+    /// (owner/epoch/mount/watermark bootstrap writes still happen — unlike a read_only open, which is
+    /// a total no-op). Distinct root over the same (now-created) pool.
+    {
+        auto watch = std::make_shared<ProbeWatchingBackend>(shared);
+        DB::Cas::PoolConfig sac = cfg;
+        sac.server_id = DB::UInt128(2);
+        sac.server_root_id = "srv-2";
+        sac.skip_access_check = true;
+        auto s = DB::Cas::Store::open(watch, sac);
+        ASSERT_NE(s, nullptr);
+        EXPECT_FALSE(watch->probe_touched) << "skip_access_check must perform no probe I/O";
+    }
+}
+
 TEST(CasStore, MinActiveTracksInFlightBuilds)
 {
     auto backend = std::make_shared<DB::Cas::InMemoryBackend>();

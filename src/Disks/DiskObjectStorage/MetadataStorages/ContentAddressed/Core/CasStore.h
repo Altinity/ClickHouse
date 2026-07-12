@@ -198,6 +198,17 @@ struct PoolConfig
     std::chrono::milliseconds mount_renew_period{10000};   /// = ttl/3 by default
     bool read_only = false;                   /// observe-only open: skip the mutating capability probe; reads only
 
+    /// Boot-time "start now, fix later": skip the access-check-class part of the capability probe
+    /// (the `_probe/` read/write/delete/list round trip and the store-precondition check) while
+    /// STILL opening writable — a mistyped bucket / transient DNS blip at mount should not hard-fail
+    /// the disk when the operator asked to defer the access check (U#5), mirroring `checkAccess`'s
+    /// `skip_access_check` gate for other disk types. Does NOT skip the single-attempt conditional-
+    /// write gate (`checkConditionalWriteSingleAttemptSupport`, RFC cas-s3-timeout-retry-control):
+    /// that guards every conditional write this writable mount will ever issue against running under
+    /// the disk's ~500-attempt transparent retry policy, a correctness hazard rather than a preflight
+    /// convenience, so `Store::open` still runs it unconditionally whenever the mount is writable.
+    bool skip_access_check = false;
+
     /// The CAS retry controller's budget (RFC cas-s3-timeout-retry-control), validated against
     /// `mount_lease_ttl_ms` at writable open (`Store::open` calls `validateCasRequestBudget`) — an
     /// inconsistent budget refuses the mount rather than silently retrying unsafely. Defaults are

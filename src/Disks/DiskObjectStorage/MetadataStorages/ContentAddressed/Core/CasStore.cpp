@@ -227,15 +227,27 @@ StorePtr Store::open(BackendPtr backend, PoolConfig config)
     /// read-only when the pool already exists; a missing pool meta on a read-only backend fails closed.)
     if (!config.read_only)
     {
-        /// B135: give each mount a PER-MOUNT UNIQUE probe key prefix so two servers mounting the SAME
-        /// shared pool concurrently never collide on the (formerly fixed) `<pool>/_probe/token` /
-        /// `<pool>/_probe/cas` keys. Without this, the loser of the `putIfAbsent` race aborts startup
-        /// with PreconditionFailed (and the winner's cleanup delete can cascade into the loser). With a
-        /// fresh random 128-bit id per `Store::open`, each mounter validates conditional-op support
-        /// independently. A crashed mount leaves harmless `_probe/<rand>/...` debris under the `_probe/`
-        /// namespace only (never the content planes) — acceptable.
-        const UInt128 probe_uid = (static_cast<UInt128>(thread_local_rng()) << 64) | thread_local_rng();
-        runCapabilityProbe(*backend, config.pool_prefix + "/_probe/" + u128ToHex(probe_uid));
+        if (!config.skip_access_check)
+        {
+            /// B135: give each mount a PER-MOUNT UNIQUE probe key prefix so two servers mounting the SAME
+            /// shared pool concurrently never collide on the (formerly fixed) `<pool>/_probe/token` /
+            /// `<pool>/_probe/cas` keys. Without this, the loser of the `putIfAbsent` race aborts startup
+            /// with PreconditionFailed (and the winner's cleanup delete can cascade into the loser). With a
+            /// fresh random 128-bit id per `Store::open`, each mounter validates conditional-op support
+            /// independently. A crashed mount leaves harmless `_probe/<rand>/...` debris under the `_probe/`
+            /// namespace only (never the content planes) — acceptable.
+            const UInt128 probe_uid = (static_cast<UInt128>(thread_local_rng()) << 64) | thread_local_rng();
+            runCapabilityProbe(*backend, config.pool_prefix + "/_probe/" + u128ToHex(probe_uid));
+        }
+        else
+        {
+            /// skip_access_check: skip the access-check-class probe I/O (store preconditions + the
+            /// `_probe/` round trip, both folded into runCapabilityProbe above) but NOT the
+            /// single-attempt conditional-write gate — see `PoolConfig::skip_access_check`. Run it
+            /// directly so a Native-mode backend with no working single-attempt client still fails
+            /// closed at open instead of silently corrupting CAS state under blind retries later.
+            backend->checkConditionalWriteSingleAttemptSupport();
+        }
     }
     PoolMeta meta = PoolMeta::createOrValidate(
         *backend, layout, config.root_shards, config.blob_header_len, config.blob_hash_algo, config.blob_hash_allow_new);
