@@ -2,6 +2,12 @@
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGenerationSeal.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFormat.h>
+#include <Common/Exception.h>
+
+namespace DB::ErrorCodes
+{
+extern const int CORRUPTED_DATA;
+}
 
 using namespace DB::Cas;
 
@@ -75,4 +81,40 @@ TEST(CasGenerationSeal, ShardCoverageIncarnationRoundTrips)
     EXPECT_EQ(cov.incarnation.writer_epoch, 9u);
     EXPECT_EQ(cov.incarnation.build_sequence, 77u);
     EXPECT_EQ(out, in);
+}
+
+TEST(CasFoldSeal, RejectsOutOfRangeFoldedTokenType)
+{
+    CasFoldSeal in = sampleFoldSeal();
+    /// Wire an out-of-range folded token type (valid enumerators are 1..3). encodeFoldSeal only
+    /// static_casts the enum to a uint32, so the bad value reaches the wire; decode must reject it.
+    in.per_ns_shard["ns1/0"].folded_token = Token{"tok-a", static_cast<TokenType>(99)};
+    try
+    {
+        decodeFoldSeal(encodeFoldSeal(in));
+        FAIL() << "expected CORRUPTED_DATA for an out-of-range folded token type";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA);
+    }
+}
+
+TEST(CasFoldSeal, RejectsOutOfRangeNsCleanupState)
+{
+    CasFoldSeal in = sampleFoldSeal();
+    RefNsCleanupItem item;
+    item.ns = RootNamespace{"ns9"};
+    item.remove_txn_id = RefTxnId{4, 5};
+    item.state = static_cast<RefNsCleanupState>(7);   /// valid: 1 (Pending), 2 (Completed)
+    in.ns_cleanup_items["k"] = item;
+    try
+    {
+        decodeFoldSeal(encodeFoldSeal(in));
+        FAIL() << "expected CORRUPTED_DATA for an out-of-range ns-cleanup state";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA);
+    }
 }

@@ -117,12 +117,20 @@ CasFoldSeal decodeFoldSeal(std::string_view data)
     seal.generation = msg.generation();
     seal.parent_generation = msg.parent_generation();
     for (const auto & e : msg.per_ns_shard())
+    {
+        const uint32_t token_type_raw = e.folded_token_type();
+        if (token_type_raw != static_cast<uint32_t>(TokenType::ETag)
+            && token_type_raw != static_cast<uint32_t>(TokenType::Generation)
+            && token_type_raw != static_cast<uint32_t>(TokenType::Emulated))
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS fold seal: unknown folded token type {}", token_type_raw);
         seal.per_ns_shard[e.key()] = ShardCoverage{
             .classification = static_cast<uint8_t>(e.classification()),
-            .folded_token = Token{e.folded_token_value(), static_cast<TokenType>(e.folded_token_type())},
+            .folded_token = Token{e.folded_token_value(), static_cast<TokenType>(token_type_raw)},
             .folded_cursor = e.folded_cursor(),
             .incarnation = ShardIncarnation{e.incarnation_writer_epoch(), e.incarnation_build_sequence()},
             .last_folded_ref_id = RefTxnId{e.last_folded_ref_epoch(), e.last_folded_ref_sequence()}};
+    }
     readRuns(msg.blob_target_runs(), seal.blob_target_runs);
     readRuns(msg.part_manifest_cleanup(), seal.part_manifest_cleanup);
     for (const auto & e : msg.condemned_summary())
@@ -132,12 +140,17 @@ CasFoldSeal decodeFoldSeal(std::string_view data)
             .oldest_nonpending_condemn_round = e.oldest_nonpending_condemn_round()};
     for (const auto & e : msg.ns_cleanup_items())
     {
+        const uint32_t state_raw = e.state();
+        if (state_raw != static_cast<uint32_t>(RefNsCleanupState::Pending)
+            && state_raw != static_cast<uint32_t>(RefNsCleanupState::Completed))
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS fold seal: unknown ref-namespace cleanup state {}", state_raw);
         const RefTxnId remove_txn_id{e.remove_txn_epoch(), e.remove_txn_sequence()};
         const String key = e.ns() + "\n" + renderRefTxnId(remove_txn_id);
         seal.ns_cleanup_items[key] = RefNsCleanupItem{
             .ns = RootNamespace{e.ns()},
             .remove_txn_id = remove_txn_id,
-            .state = static_cast<RefNsCleanupState>(e.state())};
+            .state = static_cast<RefNsCleanupState>(state_raw)};
     }
     return seal;
 }
