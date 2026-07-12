@@ -1063,12 +1063,12 @@ void Store::ensureRefTableRecovered(const RootNamespace & ns, RefTableRuntime & 
         rt.snapshot_base_state = replay(snapshot, {});
         rt.newest_snapshot_id = snapshot ? std::optional<RefTxnId>(snapshot->snapshot_id) : std::nullopt;
         rt.tail_since_snapshot.clear();
-        rt.tail_bytes_since_snapshot = 0;
+        rt.tail_bytes_since_snapshot.store(0, std::memory_order_relaxed);
         const uint64_t mount_now = bootMsNow();
         for (size_t i = 0; i < tail.size(); ++i)
         {
             rt.tail_since_snapshot.push_back(RefTableRuntime::TailLogEntry{tail[i], mount_now, tail_bytes[i]});
-            rt.tail_bytes_since_snapshot += tail_bytes[i];
+            rt.tail_bytes_since_snapshot.fetch_add(tail_bytes[i], std::memory_order_relaxed);
         }
         /// Task 11 (spec §Clean Up Old Precommits): dispatched once, from `appendRefOps`'s top level
         /// (never from here -- this call may itself be nested inside a queue leader's flush stack).
@@ -1084,7 +1084,7 @@ void Store::ensureRefTableRecovered(const RootNamespace & ns, RefTableRuntime & 
         /// Cache-weight base (spec §Byte, Memory, And CPU Budget): the encoded body size of the recovered
         /// base snapshot, captured for free from the GET above. The tail bytes are tracked separately in
         /// `tail_bytes_since_snapshot`; the two sum to this table's estimated resident weight.
-        rt.base_snapshot_bytes = snapshot_body_bytes;
+        rt.base_snapshot_bytes.store(snapshot_body_bytes, std::memory_order_relaxed);
         break;
     }
     }
@@ -1108,8 +1108,14 @@ void Store::enforceRefTableCacheBudget(const RootNamespace & keep_ns)
     {
         std::lock_guard<std::mutex> qlock(ref_queue_mutex);
 
+        /// Relaxed atomic reads: the `total` loop below reads this for EVERY table, including hot ones a
+        /// concurrent append lane is mutating under `state_mutex` only (a cross-lock read). The gated
+        /// candidate loop reads it too, but only for `use_count()==1` tables (no concurrent writer).
         const auto weightOf = [](const RefTableRuntime & rt)
-        { return rt.base_snapshot_bytes + rt.tail_bytes_since_snapshot; };
+        {
+            return rt.base_snapshot_bytes.load(std::memory_order_relaxed)
+                 + rt.tail_bytes_since_snapshot.load(std::memory_order_relaxed);
+        };
 
         uint64_t total = 0;
         for (const auto & [name, rt] : ref_tables)
@@ -1517,7 +1523,7 @@ void Store::flushRefBatch(const RootNamespace & ns, const std::shared_ptr<RefTab
                 /// Task 11: this commit's own txn joins the retained tail-since-snapshot (this
                 /// writer's exact append time, per PoolConfig::snapshot_min_log_age_ms's contract).
                 rt->tail_since_snapshot.push_back(RefTableRuntime::TailLogEntry{final_txn, bootMsNow(), bytes.size()});
-                rt->tail_bytes_since_snapshot += bytes.size();
+                rt->tail_bytes_since_snapshot.fetch_add(bytes.size(), std::memory_order_relaxed);
             }
             catch (...)
             {
@@ -1596,7 +1602,7 @@ void Store::maybeScheduleSnapshotPublish(const RootNamespace & ns, const std::sh
         std::lock_guard lock(rt->state_mutex);
         if (rt->state.lifecycle == RefLifecycle::Live
             && (rt->tail_since_snapshot.size() > config.snapshot_log_count_threshold
-                || rt->tail_bytes_since_snapshot > config.snapshot_log_bytes_threshold))
+                || rt->tail_bytes_since_snapshot.load(std::memory_order_relaxed) > config.snapshot_log_bytes_threshold))
             trigger = true;
     }
     if (!trigger)
@@ -1744,14 +1750,14 @@ bool Store::trySnapshotPublishOnce(const RootNamespace & ns)
         }
         rt->tail_since_snapshot.erase(rt->tail_since_snapshot.begin(),
             rt->tail_since_snapshot.begin() + static_cast<ptrdiff_t>(prune_upto));
-        rt->tail_bytes_since_snapshot -= pruned_bytes;
+        rt->tail_bytes_since_snapshot.fetch_sub(pruned_bytes, std::memory_order_relaxed);
         /// logs-per-table-after-snapshot (spec §implementation-impact): the tail this publish compacted.
         ProfileEvents::increment(ProfileEvents::CasRefSnapshotTailLogs, prune_upto);
         rt->snapshot_base_state = std::move(candidate_state);
         rt->newest_snapshot_id = candidate_x;
         /// Cache-weight base (spec §Byte, Memory, And CPU Budget): the new base is exactly the snapshot
         /// we just encoded and PUT, so its body size is the fresh base weight -- no re-encode needed.
-        rt->base_snapshot_bytes = bytes.size();
+        rt->base_snapshot_bytes.store(bytes.size(), std::memory_order_relaxed);
     }
     return true;
 }
@@ -1866,7 +1872,7 @@ void Store::publishRemovedSnapshotNow(const RootNamespace & ns)
     rt->newest_snapshot_id = remove_id;
     rt->snapshot_base_state = rt->state;   /// == the Removed state (empty committed/precommits)
     rt->tail_since_snapshot.clear();
-    rt->tail_bytes_since_snapshot = 0;
+    rt->tail_bytes_since_snapshot.store(0, std::memory_order_relaxed);
 }
 
 uint64_t Store::currentGcRound() const

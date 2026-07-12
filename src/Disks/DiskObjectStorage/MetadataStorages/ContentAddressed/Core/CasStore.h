@@ -632,7 +632,13 @@ private:
             uint64_t encoded_bytes = 0;
         };
         std::vector<TailLogEntry> tail_since_snapshot;
-        uint64_t tail_bytes_since_snapshot = 0;
+        /// ATOMIC (relaxed): `enforceRefTableCacheBudget`'s pre-candidacy `total` loop sums the weight of
+        /// EVERY cached table under `ref_queue_mutex` alone -- including hot tables whose append lane
+        /// (holding only `state_mutex`) is concurrently mutating this field. That cross-lock read is a
+        /// data race on a plain `uint64_t` (formal UB, TSan-detectable); an atomic makes it well-defined.
+        /// The gated candidate loop and every other reader/writer already hold `state_mutex`, so relaxed
+        /// ordering is sufficient (this counter carries no happens-before for other state).
+        std::atomic<uint64_t> tail_bytes_since_snapshot{0};
         /// The state as of `newest_snapshot_id` (the never-born/empty state if this table has never had
         /// a snapshot published) -- the base every `tail_since_snapshot` entry replays forward from.
         RefTableState snapshot_base_state;
@@ -642,9 +648,12 @@ private:
         /// `snapshot_base_state`'s snapshot (0 for a never-born base), captured for free from the
         /// recovered/published snapshot body -- refreshed only when the base changes (recovery + each
         /// publish), never per mutation. The estimated resident weight is
-        /// `base_snapshot_bytes + tail_bytes_since_snapshot`. `last_touch_tick` is the monotonic access
-        /// stamp (`Store::ref_table_access_tick`) used to evict least-recently-touched tables first.
-        uint64_t base_snapshot_bytes = 0;
+        /// `base_snapshot_bytes + tail_bytes_since_snapshot`. `base_snapshot_bytes` is ATOMIC (relaxed)
+        /// for the same cross-lock `total`-loop read as `tail_bytes_since_snapshot` above. `last_touch_tick`
+        /// is the monotonic access stamp (`Store::ref_table_access_tick`) used to evict least-recently-
+        /// touched tables first; it is read only in the `use_count()==1`-gated candidate loop (no
+        /// concurrent writer there), so it stays a plain `uint64_t`.
+        std::atomic<uint64_t> base_snapshot_bytes{0};
         uint64_t last_touch_tick = 0;
         /// Cleared to false once a stale-precommit sweep has been dispatched for this table this mount
         /// (spec §Clean Up Old Precommits); set true by recovery. `appendRefOps`'s top level checks it

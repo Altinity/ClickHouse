@@ -339,8 +339,10 @@ TEST(CasPromoteRepublish, RepublishReDriveOverDifferentContentDstFailsClosed)
     }
 }
 
-/// BUG 2: `abandon` must emit its precommit removal BEFORE retiring the build_seq, so GC's
-/// `reclaimAbandonedPrecommit` can never observe a live-and-watermark-dead precommit to double-remove.
+/// BUG 2: `abandon` must emit its precommit removal (an exact `owner_transition`) BEFORE retiring the
+/// build_seq, so the build stays active until that removal is durable and no freshness-window consumer
+/// judges the manifest build-dead while an un-removed precommit still names it (GC no longer reclaims
+/// abandoned precommits — the writer removes them itself).
 /// Assert the removal is present in the shard journal immediately after `abandon` returns.
 /// (This test passes both before AND after the reorder -- the removal is emitted either way. Its value
 /// is as a regression guard that `abandon` still emits the removal after the reorder. The reorder's

@@ -911,8 +911,9 @@ TEST(CasGcRound, SplitBrainLeadersOnlyDuplicateWork)
 ///   - CasGcRound.PreviewDeletesIsWriteFreeAndSubsetOfUnreachable — previewDeletes survives, but it is
 ///     covered by the fsck/preview suite; not duplicated here.
 ///   - CasGcWatermark.LiveBuildPrecommitHonoredAcrossGcRounds /
-///     CasGcRetire.ReclaimsAbandonedPrecommitWhenFloorPasses — precommit reclaim is exercised by the
-///     orphan-manifest-sweep / build-root suites against the new reclaimAbandonedPrecommit path.
+///     CasGcRetire.ReclaimsAbandonedPrecommitWhenFloorPasses — precommit removal is now the WRITER's job
+///     (an exact `owner_transition` on abandon, or a fenced successor's stale-precommit sweep); GC no
+///     longer reclaims abandoned precommits. Exercised by the orphan-manifest-sweep / build-root suites.
 
 /// B9 snap-generation retention, reimplemented over the run/generation model: after a generation is
 /// adopted the GC prunes the per-generation seal/run/cleanup objects of generations at or below the
