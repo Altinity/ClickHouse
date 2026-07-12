@@ -1956,22 +1956,41 @@ void Store::maybeScheduleSnapshotPublish(const RootNamespace & ns, const std::sh
     /// deadlock a flush leader. `shared_from_this()` keeps the Store alive for the thread's lifetime.
     rt->pending_snapshot_publishes.fetch_add(1, std::memory_order_relaxed);
     auto self = shared_from_this();
-    ThreadFromGlobalPool([self, ns, rt]
+    try
     {
-        try
+        ThreadFromGlobalPool([self, ns, rt]
         {
-            self->trySnapshotPublishOnce(ns);
-        }
-        catch (...)
-        {
-            tryLogCurrentException(getLogger("CasStore"), "CAS background snapshot publish attempt failed");
-        }
+            try
+            {
+                self->trySnapshotPublishOnce(ns);
+            }
+            catch (...)
+            {
+                tryLogCurrentException(getLogger("CasStore"), "CAS background snapshot publish attempt failed");
+            }
+            {
+                std::lock_guard lock(rt->state_mutex);
+                rt->pending_snapshot_publishes.fetch_sub(1, std::memory_order_relaxed);
+            }
+            rt->publish_settle_cv.notify_all();
+        }).detach();
+    }
+    catch (...)
+    {
+        /// Review follow-up (T11): the `ThreadFromGlobalPool` ctor can throw (pool exhaustion) AFTER the
+        /// count was incremented. Undo the count (else `waitForSnapshotPublishSettleForTest` hangs and the
+        /// leaked pending count wedges every later settle) and SWALLOW the failure: read-path callers
+        /// (`resolveRef`/`listRefs`) invoke this OUTSIDE any insulation, and dispatching a background
+        /// publish is a best-effort maintenance trigger -- it must never fail an otherwise-successful read
+        /// (consistent with the `CasRefSweepDeferred` read-insulation adjudication). The next trigger
+        /// reschedules; a mutation caller has already committed regardless.
         {
             std::lock_guard lock(rt->state_mutex);
             rt->pending_snapshot_publishes.fetch_sub(1, std::memory_order_relaxed);
         }
         rt->publish_settle_cv.notify_all();
-    }).detach();
+        tryLogCurrentException(getLogger("CasStore"), "CAS background snapshot-publish dispatch failed to launch");
+    }
 }
 
 void Store::waitForSnapshotPublishSettleForTest(const RootNamespace & ns)
@@ -2048,6 +2067,19 @@ bool Store::trySnapshotPublishOnce(const RootNamespace & ns)
 
     {
         std::lock_guard lock(rt->state_mutex);
+        /// Monotonic adoption guard (review, T11 -- CRITICAL): publishes are NOT serialized, so two
+        /// overlapping attempts can finish out of order (this OLDER-candidate attempt landing its PUT
+        /// after a NEWER one already adopted). Adopting the older `candidate_x` here would REGRESS
+        /// `newest_snapshot_id`/`snapshot_base_state` below the tail's already-pruned prefix, silently
+        /// dropping the txns committed in between from base+tail -- the next published snapshot would then
+        /// omit committed transactions and recovery would lose refs. Skip the in-memory adoption whenever a
+        /// newer-or-equal snapshot is already adopted; the already-durable `_snap/<candidate_x>` object is
+        /// harmless (readers pick the greatest snapshot, GC reclaims covered ones). This also keeps the
+        /// Removed path monotonic: a stale Live attempt can never drag `newest_snapshot_id` back below a
+        /// `remove_txn_id` that `publishRemovedSnapshotNow` already adopted (`remove_txn_id` is allocated
+        /// after every Live txn, so it is always the greatest and this guard trips).
+        if (rt->newest_snapshot_id && !(*rt->newest_snapshot_id < candidate_x))
+            return true;
         /// Prune by id, not by the (possibly now-stale) index computed above: more appends -- or even
         /// another publish -- may have landed on `tail_since_snapshot` while the PUT was in flight.
         uint64_t pruned_bytes = 0;

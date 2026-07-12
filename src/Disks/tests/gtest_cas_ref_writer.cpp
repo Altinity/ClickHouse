@@ -189,7 +189,21 @@ public:
         }
         {
             std::unique_lock lk(block_mutex);
+            bool block_this = false;
             if (block_armed && key.find(block_substr) != String::npos)
+            {
+                if (!block_first_match_only)
+                    block_this = true;                 /// block EVERY matching put (the original mode)
+                else if (blocked_key.empty())
+                {
+                    blocked_key = key;                 /// first match: capture and block exactly this key
+                    block_this = true;
+                }
+                else if (key == blocked_key)
+                    block_this = true;                 /// the SAME captured key retried: keep blocking it
+                /// a DIFFERENT matching key under first-match-only mode falls through unblocked
+            }
+            if (block_this)
             {
                 block_entered = true;
                 block_cv.notify_all();
@@ -226,6 +240,23 @@ public:
         block_armed = true;
         block_entered = false;
         block_call_completed = false;
+        block_first_match_only = false;
+        blocked_key.clear();
+    }
+
+    /// Task 11 (monotonic-adoption harness): block ONLY the FIRST `putIfAbsent` whose key contains
+    /// `substr`, capturing that exact key; every LATER put -- including a DIFFERENT `_snap/<id>` key --
+    /// proceeds unblocked. Lets a test pin one in-flight publish's PUT mid-flight while a second,
+    /// higher-id publish runs to completion, deterministically forcing the out-of-order overlap.
+    void armPutBlockFirstMatchOnly(const String & substr)
+    {
+        std::lock_guard g(block_mutex);
+        block_substr = substr;
+        block_armed = true;
+        block_entered = false;
+        block_call_completed = false;
+        block_first_match_only = true;
+        blocked_key.clear();
     }
     void awaitBlockEntered()
     {
@@ -257,6 +288,8 @@ private:
     bool block_armed = false;
     bool block_entered = false;
     bool block_call_completed = false;
+    bool block_first_match_only = false;
+    String blocked_key;
 };
 
 }
@@ -756,6 +789,65 @@ TEST(RefWriterSnapshotPublish, PublishThreadOutlivesDroppedStoreHandleWithoutCra
     /// Deterministic, sleep-free: waits for the blocked call to actually RETURN (not merely unblock),
     /// entirely through the backend -- this test holds no Store handle to wait on any more.
     backend->awaitBlockedCallCompleted();
+}
+
+/// Review (T11) — CRITICAL: publishes are NOT serialized, so two overlapping attempts can finish out of
+/// order. An OLDER-candidate publish that lands its `_snap` PUT AFTER a newer one already adopted must
+/// NOT regress the in-memory snapshot base/newest back to its older id: doing so drops the txns
+/// committed in between from base+tail, so the NEXT published snapshot silently omits committed
+/// transactions and recovery loses refs. Deterministic, sleep-free: the fake backend blocks publish #1's
+/// PUT (capturing exactly its key) while a higher-id publish #2 runs to completion, then unblocks #1.
+TEST(RefWriterSnapshotPublish, ConcurrentOutOfOrderPublishDoesNotRegressBaseNorDropCommittedTxns)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/concurrent_publish_monotonic"};
+    PoolConfig config;
+    /// High thresholds: NO automatic background dispatch -- we drive `trySnapshotPublishOnce` directly
+    /// (mirrors GraceAge) for full determinism. Grace age 0 so every tail entry is immediately eligible.
+    config.snapshot_log_count_threshold = 1ULL << 40;
+    config.snapshot_log_bytes_threshold = 1ULL << 40;
+    config.snapshot_min_log_age_ms = 0;
+    auto store = openStoreWithConfig(backend, config);
+
+    publishEmptyPart(store, ns, "a");   /// tail: 2 (birth+add, promote)
+    publishEmptyPart(store, ns, "b");   /// tail: 4 -- greatest_applied is publish #1's candidate
+
+    /// Block ONLY publish #1's own `_snap` PUT (its exact key is captured on first match); a later,
+    /// different `_snap/<id>` key proceeds unblocked.
+    backend->armPutBlockFirstMatchOnly("_snap/");
+
+    std::thread publisher1([&] { store->trySnapshotPublishOnce(ns); });
+    backend->awaitBlockEntered();   /// #1 is parked mid-PUT on `_snap/<older>`, holding no lock
+
+    /// While #1 is parked, commit more txns and run publish #2 to COMPLETION: it PUTs a strictly higher
+    /// `_snap/<newer>` (unblocked) and adopts it as the base.
+    publishEmptyPart(store, ns, "c");
+    ASSERT_TRUE(store->trySnapshotPublishOnce(ns));
+    const auto newest_after_2 = store->newestPublishedSnapshotIdForTest(ns);
+    ASSERT_TRUE(newest_after_2.has_value());
+
+    /// Release #1: on the BUGGY code it now adopts its OLDER candidate, regressing newest below #2 and
+    /// dropping "c"'s txns from base+tail. The monotonic guard must skip that adoption.
+    backend->releaseBlock();
+    publisher1.join();
+
+    const auto newest_after_1 = store->newestPublishedSnapshotIdForTest(ns);
+    ASSERT_TRUE(newest_after_1.has_value());
+    EXPECT_FALSE(*newest_after_1 < *newest_after_2)
+        << "a late-finishing OLDER publish must not regress newest_snapshot_id below the adopted newer one";
+
+    /// Independent proof no committed txn was lost: the NEXT publish's bytes must equal a full log replay.
+    /// A regressed base would omit the txns committed while publish #1 was parked.
+    publishEmptyPart(store, ns, "d");
+    ASSERT_TRUE(store->trySnapshotPublishOnce(ns));
+    const auto snap_id = listGreatestSnapshotIdForTest(*backend, layout, ns);
+    ASSERT_TRUE(snap_id.has_value());
+    const auto got = backend->get(layout.refSnapshotKey(ns, *snap_id));
+    ASSERT_TRUE(got.has_value());
+    const RefTableState oracle = independentFullReplayForTest(*backend, layout, ns, *snap_id);
+    EXPECT_EQ(got->bytes, encodeRefTableSnapshot(snapshotOf(oracle, ns.string())))
+        << "published snapshot bytes must equal replay(all logs through X) -- a regressed base drops txns";
 }
 
 /// ===================================================================================
