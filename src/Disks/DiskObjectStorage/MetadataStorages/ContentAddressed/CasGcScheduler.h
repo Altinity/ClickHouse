@@ -48,7 +48,7 @@ private:
     /// Run one round through the full logging path (Start record, ProfileEventsScope, Finish
     /// record). Used by BOTH loop() and runOneRoundNow. Logging is best-effort - the logger sink
     /// never throws into the round. Rethrows a round exception (after emitting an Aborted Finish).
-    Cas::RoundReport runRoundLogged(Cas::Gc & gc, GcRoundLogRecord::Trigger trigger, std::function<void()> on_lease_acquired = {});
+    Cas::RoundReport runRoundLogged(Cas::Gc & round_gc, GcRoundLogRecord::Trigger trigger, std::function<void()> on_lease_acquired = {});
 
     const Cas::StorePtr store;
     const std::chrono::seconds interval;
@@ -57,6 +57,15 @@ private:
     const UInt128 gc_id;
     const String disk_name;
     const GcRoundLogger logger;
+
+    /// One persistent Gc for BOTH loop() and runOneRoundNow: the lease's observation-window steal
+    /// protocol REQUIRES a stable observer (it compares the lease across consecutive runRegularRound
+    /// calls of the same instance). A throwaway per call could never recover a dead-incumbent lease.
+    Cas::Gc gc;
+    /// Serializes the manual round against the background round so the two never touch the single
+    /// (not-thread-safe) `gc` concurrently. Distinct from `mutex`: the loop releases `mutex` before
+    /// the round so stop()/heartbeatLoop are not blocked, so the round cannot hold `mutex`.
+    std::mutex gc_round_mutex;
 
     std::mutex mutex;
     std::condition_variable wake;

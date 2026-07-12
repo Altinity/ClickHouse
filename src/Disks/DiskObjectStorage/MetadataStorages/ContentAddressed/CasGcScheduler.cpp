@@ -55,6 +55,7 @@ CasGcScheduler::CasGcScheduler(
     , gc_id((static_cast<UInt128>(thread_local_rng()) << 64) | thread_local_rng())
     , disk_name(std::move(disk_name_))
     , logger(std::move(logger_))
+    , gc(store, gc_id)
 {
 }
 
@@ -86,7 +87,7 @@ void CasGcScheduler::stop()
         hb_thread.join();
 }
 
-Cas::RoundReport CasGcScheduler::runRoundLogged(Cas::Gc & gc, GcRoundLogRecord::Trigger trigger, std::function<void()> on_lease_acquired)
+Cas::RoundReport CasGcScheduler::runRoundLogged(Cas::Gc & round_gc, GcRoundLogRecord::Trigger trigger, std::function<void()> on_lease_acquired)
 {
     using Rec = GcRoundLogRecord;
     /// Best-effort: the table row must never break GC. A throwing sink is swallowed.
@@ -131,7 +132,7 @@ Cas::RoundReport CasGcScheduler::runRoundLogged(Cas::Gc & gc, GcRoundLogRecord::
     fin.event_type = Rec::EventType::Finish;
     try
     {
-        const Cas::RoundReport rep = gc.runRegularRound(std::move(on_lease_acquired));
+        const Cas::RoundReport rep = round_gc.runRegularRound(std::move(on_lease_acquired));
         CurrentMetrics::set(CurrentMetrics::CasGcIsLeader, rep.acquired_lease ? 1 : 0);
         if (rep.acquired_lease)
             CurrentMetrics::add(CurrentMetrics::CasGcPendingReclaimEntries,
@@ -169,16 +170,12 @@ Cas::RoundReport CasGcScheduler::runRoundLogged(Cas::Gc & gc, GcRoundLogRecord::
 
 Cas::RoundReport CasGcScheduler::runOneRoundNow(GcRoundLogRecord::Trigger trigger)
 {
-    Cas::Gc gc(store, gc_id);
+    std::lock_guard round_lock(gc_round_mutex);
     return runRoundLogged(gc, trigger);
 }
 
 void CasGcScheduler::loop()
 {
-    /// One Gc instance for the thread's lifetime: the lease's observation-window steal protocol
-    /// REQUIRES a stable observer (it compares the lease across consecutive runRegularRound calls
-    /// of the same instance).
-    Cas::Gc gc(store, gc_id);
     size_t consecutive_backoffs = 0;
     while (true)
     {
@@ -189,6 +186,7 @@ void CasGcScheduler::loop()
         }
         try
         {
+            std::lock_guard round_lock(gc_round_mutex);
             /// B160/P3-B1: fired the instant the lease is (re)acquired, before the round's fold runs -
             /// a new leader's first round is otherwise unprotected (i_am_leader would only flip below,
             /// AFTER the whole round returns), so a follower observing the frozen (owner, seq) across

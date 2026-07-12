@@ -10,6 +10,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include <Interpreters/Context_fwd.h>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 
@@ -322,6 +323,10 @@ private:
     std::unique_ptr<ContentAddressed::CachedPartFolderAccess> part_access;
     String pool_uuid;
     std::unique_ptr<ContentAddressed::CasGcScheduler> gc_scheduler;
+    /// Guards the lazy `gc_scheduler` creation in `runOneGcRoundForTest`/`runGarbageCollectionRoundNow`
+    /// against a racing manual `SYSTEM ... GC` on another query thread; the round itself runs OUTSIDE
+    /// this lock (CasGcScheduler::runOneRoundNow has its own gc_round_mutex for that).
+    std::mutex gc_scheduler_mutex;
     /// Derived from object_storage->isReadOnly() at startup (the disk's <readonly> config). When set:
     /// the probe is skipped, no watermark, no GC scheduler, and the mutating surface fails closed.
     bool read_only = false;

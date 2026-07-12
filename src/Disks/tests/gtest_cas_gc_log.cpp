@@ -181,6 +181,30 @@ public:
 
 }
 
+/// A7/U#7: the manual `SYSTEM ... GC` path (runOneRoundNow) must reuse ONE stable Gc instance across
+/// calls — the lease's observation-window steal protocol compares consecutive observations of the
+/// SAME observer. A throwaway Gc per call resets the observation every time, so a dead incumbent's
+/// lease could never be recovered. Deterministic: "time" is the order of runRegularRound calls; no
+/// sleep, no clock, no threads.
+TEST(CasGcSchedulerSteal, ManualRoundReusesAStableObserverAndStealsDeadIncumbent)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+
+    /// A foreign incumbent takes the lease and then DIES (never renews, never heartbeats).
+    const UInt128 kIncumbent = hexToU128("00000000000000000000000000000abc");
+    Gc incumbent(store, kIncumbent);
+    ASSERT_TRUE(incumbent.runRegularRound().acquired_lease);
+
+    DB::ContentAddressed::CasGcScheduler sched(store, std::chrono::seconds(1), "test::gc", "ca");
+
+    /// obs #1: records the incumbent's (owner, seq, hb=absent); not yet steal-eligible.
+    EXPECT_FALSE(sched.runOneRoundNow(Rec::Trigger::Manual).acquired_lease);
+    /// obs #2: the same frozen (owner, seq, hb) observed twice => steal-eligible => the manual round
+    /// recovers the lease. With a throwaway Gc per call this stays false forever.
+    EXPECT_TRUE(sched.runOneRoundNow(Rec::Trigger::Manual).acquired_lease);
+}
+
 /// A round whose backend throws must produce a Finish with `outcome == Aborted` and a non-empty
 /// `error`, and `runOneRoundNow` must rethrow the exception (the round failure is observable, not
 /// swallowed — the logging sink itself is best-effort, but the round error propagates).

@@ -196,11 +196,16 @@ void ContentAddressedMetadataStorage::runOneGcRoundForTest()
     /// scheduler per call would acquire the lease on the first call and then back off forever
     /// ("incumbent alive" - its own previous incarnation). Found by the M-W retro: the original
     /// per-call one-shot made every round after the first a silent no-op.
-    if (!gc_scheduler)
-        gc_scheduler = std::make_unique<ContentAddressed::CasGcScheduler>(
-            store(), gc_interval, fmt::format("{}::ContentAddressedGC", storage_path_full),
-            disk_name, makeGcRoundLogger());
-    gc_scheduler->runOneRoundNow();
+    ContentAddressed::CasGcScheduler * sched;
+    {
+        std::lock_guard lock(gc_scheduler_mutex);
+        if (!gc_scheduler)
+            gc_scheduler = std::make_unique<ContentAddressed::CasGcScheduler>(
+                store(), gc_interval, fmt::format("{}::ContentAddressedGC", storage_path_full),
+                disk_name, makeGcRoundLogger());
+        sched = gc_scheduler.get();
+    }
+    sched->runOneRoundNow();
 }
 
 ContentAddressed::GcRoundLogger ContentAddressedMetadataStorage::makeGcRoundLogger() const
@@ -309,11 +314,16 @@ Cas::RoundReport ContentAddressedMetadataStorage::runGarbageCollectionRoundNow()
             "Garbage collection is not enabled on this content-addressed disk");
     /// Mirror runOneGcRoundForTest: a STABLE scheduler instance across calls (the lease's
     /// observation-window steal protocol compares consecutive observations of the same gc_id).
-    if (!gc_scheduler)
-        gc_scheduler = std::make_unique<ContentAddressed::CasGcScheduler>(
-            store(), gc_interval, fmt::format("{}::ContentAddressedGC", storage_path_full),
-            disk_name, makeGcRoundLogger());
-    return gc_scheduler->runOneRoundNow(ContentAddressed::GcRoundLogRecord::Trigger::Manual);
+    ContentAddressed::CasGcScheduler * sched;
+    {
+        std::lock_guard lock(gc_scheduler_mutex);
+        if (!gc_scheduler)
+            gc_scheduler = std::make_unique<ContentAddressed::CasGcScheduler>(
+                store(), gc_interval, fmt::format("{}::ContentAddressedGC", storage_path_full),
+                disk_name, makeGcRoundLogger());
+        sched = gc_scheduler.get();
+    }
+    return sched->runOneRoundNow(ContentAddressed::GcRoundLogRecord::Trigger::Manual);
 }
 
 Cas::RebuildReport ContentAddressedMetadataStorage::runGcRebuildNow(bool force)
