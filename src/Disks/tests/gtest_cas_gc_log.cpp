@@ -181,12 +181,18 @@ public:
 
 }
 
-/// A7/U#7: the manual `SYSTEM ... GC` path (runOneRoundNow) must reuse ONE stable Gc instance across
-/// calls — the lease's observation-window steal protocol compares consecutive observations of the
-/// SAME observer. A throwaway Gc per call resets the observation every time, so a dead incumbent's
-/// lease could never be recovered. Deterministic: "time" is the order of runRegularRound calls; no
-/// sleep, no clock, no threads.
-TEST(CasGcSchedulerSteal, ManualRoundReusesAStableObserverAndStealsDeadIncumbent)
+/// A7-HIGH-fix: the manual `SYSTEM ... GC` path (runOneRoundNow) reuses ONE stable Gc instance across
+/// calls (A7 — the lease's observation-window steal protocol compares consecutive observations of the
+/// SAME observer), but it must be OBSERVE-ONLY with respect to STEALING: the protocol's safety argument
+/// requires the two observations that flag an incumbent "frozen" to be spaced by real wall time (>= the
+/// heartbeat cadence H) so a live incumbent gets a chance to pulse in between — a guarantee only the
+/// background loop's own interval-paced ticks provide. Two manual calls have no such guarantee (they
+/// can land microseconds apart in a real query), so a manual round must NEVER execute the steal CAS,
+/// no matter how many times it re-observes the same frozen tuple. Dead-incumbent recovery stays the
+/// loop's job (bounded ~2*interval; covered by the CasGcLease loop-driven steal tests in
+/// gtest_cas_gc_round.cpp, e.g. StealAfterObservedNonRenewalBumpsEpoch / FailoverStealOnceHeartbeatStops).
+/// Deterministic: "time" is the order of runRegularRound calls; no sleep, no clock, no threads.
+TEST(CasGcSchedulerSteal, ManualRoundNeverStealsEvenADeadIncumbent)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
@@ -198,11 +204,38 @@ TEST(CasGcSchedulerSteal, ManualRoundReusesAStableObserverAndStealsDeadIncumbent
 
     DB::ContentAddressed::CasGcScheduler sched(store, std::chrono::seconds(1), "test::gc", "ca");
 
-    /// obs #1: records the incumbent's (owner, seq, hb=absent); not yet steal-eligible.
+    /// obs #1: records the incumbent's (owner, seq, hb=absent).
     EXPECT_FALSE(sched.runOneRoundNow(Rec::Trigger::Manual).acquired_lease);
-    /// obs #2: the same frozen (owner, seq, hb) observed twice => steal-eligible => the manual round
-    /// recovers the lease. With a throwaway Gc per call this stays false forever.
-    EXPECT_TRUE(sched.runOneRoundNow(Rec::Trigger::Manual).acquired_lease);
+    /// obs #2 and #3: the same frozen (owner, seq, hb) observed repeatedly would be steal-eligible on
+    /// the loop path (see the Core-level test this mirrors), but the manual path keeps backing off.
+    EXPECT_FALSE(sched.runOneRoundNow(Rec::Trigger::Manual).acquired_lease);
+    EXPECT_FALSE(sched.runOneRoundNow(Rec::Trigger::Manual).acquired_lease);
+}
+
+/// Negative-control companion to the test above (reviewer-requested): with the incumbent visibly alive
+/// (its heartbeat advancing between the manual round's observations, exactly like
+/// CasGcLease.HeartbeatBlocksFalseStealOfAliveLeader at the Core level), the manual round must still
+/// correctly back off — confirming the new observe-only branch didn't regress the PRE-EXISTING
+/// incumbent_renewed/hb_alive liveness detection (this test would already pass on the protocol's own
+/// terms even without the A7-HIGH-fix; it pins that the fix didn't break it).
+TEST(CasGcSchedulerSteal, ManualRoundNeverStealsALiveHeartbeatingIncumbent)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+
+    const UInt128 kIncumbent = hexToU128("00000000000000000000000000000abc");
+    Gc incumbent(store, kIncumbent);
+    ASSERT_TRUE(incumbent.runRegularRound().acquired_lease);
+
+    DB::ContentAddressed::CasGcScheduler sched(store, std::chrono::seconds(1), "test::gc", "ca");
+
+    /// obs #1: records (owner=incumbent, seq, hb=absent).
+    EXPECT_FALSE(sched.runOneRoundNow(Rec::Trigger::Manual).acquired_lease);
+    Gc::pulseHeartbeat(*store, kIncumbent);   /// the incumbent is alive and pulsing (hb 0->1)
+    /// obs #2: hb advanced since obs #1 => alive => no steal (never reaches the observe-only branch).
+    EXPECT_FALSE(sched.runOneRoundNow(Rec::Trigger::Manual).acquired_lease);
+    Gc::pulseHeartbeat(*store, kIncumbent);   /// hb 1->2
+    EXPECT_FALSE(sched.runOneRoundNow(Rec::Trigger::Manual).acquired_lease);
 }
 
 /// A round whose backend throws must produce a Finish with `outcome == Aborted` and a non-empty

@@ -133,7 +133,16 @@ public:
     /// post-round bookkeeping would otherwise have set it). Never called when the lease is not held;
     /// exceptions from the callback propagate like any other round failure (the caller is expected to
     /// keep it advisory/non-throwing, matching pulseHeartbeat's own contract).
-    RoundReport runRegularRound(std::function<void()> on_lease_acquired = {});
+    ///
+    /// `allow_steal` (default true — the paced background loop's semantics, unchanged): gates the
+    /// observation-window protocol's steal branch (see acquireOrRenewLease). The window's safety
+    /// argument requires the two observations that flag an incumbent "frozen" to be spaced by real
+    /// wall time (>= the heartbeat cadence H) so a live incumbent gets a chance to pulse in between —
+    /// a guarantee only the loop's own interval-paced ticks provide. A caller with no such guarantee
+    /// (e.g. a manual `SYSTEM ... GC` command, where two calls can land microseconds apart) must pass
+    /// `false`: it may still acquire a FREE lease or renew ITS OWN, but never executes the steal CAS —
+    /// dead-incumbent recovery stays the loop's job.
+    RoundReport runRegularRound(std::function<void()> on_lease_acquired = {}, bool allow_steal = true);
 
     /// B160 advisory heartbeat: bump <prefix>/gc/hb to {gc_id, hb_seq+1}. Best-effort (a lost CAS is
     /// harmless — the next pulse retries). Touches NO Gc instance state. Static by design.
@@ -187,8 +196,10 @@ public:
 
 private:
     /// Lease acquire/renew/steal per the documented observation protocol. On success `state` holds the
-    /// committed gc/state (with our lease) and `state_token` its backend token.
-    bool acquireOrRenewLease(GcState & state, Token & state_token);
+    /// committed gc/state (with our lease) and `state_token` its backend token. `allow_steal=false`
+    /// suppresses only the steal CAS (see runRegularRound's doc comment) — acquiring a free lease and
+    /// renewing our own are unaffected.
+    bool acquireOrRenewLease(GcState & state, Token & state_token, bool allow_steal);
 
     /// What one R1 fold produced (spec rev. 15 §Fold Owner Transitions). The blob deltas are sealed
     /// into a write-once generation; `fold_seal` is the durable index of WHAT WAS FOLDED (a CasFoldSeal),

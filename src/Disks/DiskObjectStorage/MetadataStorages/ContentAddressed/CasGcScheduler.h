@@ -45,10 +45,20 @@ private:
     void loop();
     void heartbeatLoop();   /// B160: bump gc/hb while we hold the lease, on a fast cadence (H <= W)
 
+    /// B160/P3-B1 acquire-time hook: fired synchronously the instant the lease is acquired/renewed,
+    /// BEFORE the round's (potentially long) fold begins — marks us leader and fires the first
+    /// advisory heartbeat pulse immediately, so neither a new automatic leader's nor a manually-
+    /// acquired lease's first (possibly long) round runs unprotected. Shared by BOTH loop() and
+    /// runOneRoundNow() so a manual `SYSTEM ... GC` acquisition is heartbeat-protected exactly like an
+    /// automatic one.
+    void onLeaseAcquired();
+
     /// Run one round through the full logging path (Start record, ProfileEventsScope, Finish
     /// record). Used by BOTH loop() and runOneRoundNow. Logging is best-effort - the logger sink
     /// never throws into the round. Rethrows a round exception (after emitting an Aborted Finish).
-    Cas::RoundReport runRoundLogged(Cas::Gc & round_gc, GcRoundLogRecord::Trigger trigger, std::function<void()> on_lease_acquired = {});
+    /// `allow_steal` is forwarded to `Cas::Gc::runRegularRound` verbatim (see its doc comment).
+    Cas::RoundReport runRoundLogged(Cas::Gc & round_gc, GcRoundLogRecord::Trigger trigger,
+                                     std::function<void()> on_lease_acquired = {}, bool allow_steal = true);
 
     const Cas::StorePtr store;
     const std::chrono::seconds interval;

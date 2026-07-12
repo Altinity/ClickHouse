@@ -203,12 +203,12 @@ void Gc::scheduleMetaJob(std::function<void()> job)
     }
 }
 
-RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired)
+RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool allow_steal)
 {
     RoundReport report;
     GcState state;
     Token state_token;
-    report.acquired_lease = acquireOrRenewLease(state, state_token);
+    report.acquired_lease = acquireOrRenewLease(state, state_token, allow_steal);
     if (!report.acquired_lease)
         return report;
 
@@ -1895,10 +1895,14 @@ RebuildReport Gc::rebuildBaseline(bool force)
     }
 
     /// Lease: single leader vs regular rounds and other rebuilds. On an absent state this CREATES
-    /// a lease-bearing bootstrap body whose token anchors our final CAS.
+    /// a lease-bearing bootstrap body whose token anchors our final CAS. allow_steal=false: this is a
+    /// manual disaster-recovery command, same reasoning as the manual GC round (runRegularRound's doc
+    /// comment) — though it is structurally moot here too (a fresh one-shot `this` with
+    /// has_observation==false always takes the non-steal branch on its one and only call), pass it
+    /// explicitly rather than rely on that invariant.
     GcState state;
     Token state_token;
-    if (!acquireOrRenewLease(state, state_token))
+    if (!acquireOrRenewLease(state, state_token, /*allow_steal=*/false))
     {
         rep.refusal = "another GC leader holds the lease";
         return rep;
@@ -2323,7 +2327,7 @@ void Gc::pulseHeartbeat(Store & store, UInt128 gc_id)
     store.backend().casPut(key, encodeGcHeartbeat(hb), expected);
 }
 
-bool Gc::acquireOrRenewLease(GcState & state, Token & state_token)
+bool Gc::acquireOrRenewLease(GcState & state, Token & state_token, bool allow_steal)
 {
     const String key = store->layout().gcStateKey();
 
@@ -2384,6 +2388,19 @@ bool Gc::acquireOrRenewLease(GcState & state, Token & state_token)
             || current.lease.seq != last_seen_seq;
         if (incumbent_renewed || hb_alive)
         {
+            rememberObservation(current.lease);
+            last_seen_hb_owner = hb.owner;
+            last_seen_hb_seq = hb.hb_seq;
+            return false;
+        }
+
+        if (!allow_steal)
+        {
+            /// Steal-eligible by the tuple comparison alone, but this caller has no real-wall-time
+            /// guarantee between its observations (see runRegularRound's doc comment) — "frozen twice"
+            /// here could mean "alive but not yet re-observed" as easily as "dead". Record the
+            /// (unchanged) observation and back off; only the loop's own interval-paced ticks execute
+            /// the steal CAS below.
             rememberObservation(current.lease);
             last_seen_hb_owner = hb.owner;
             last_seen_hb_seq = hb.hb_seq;

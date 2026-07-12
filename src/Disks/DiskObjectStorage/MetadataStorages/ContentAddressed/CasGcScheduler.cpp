@@ -87,7 +87,23 @@ void CasGcScheduler::stop()
         hb_thread.join();
 }
 
-Cas::RoundReport CasGcScheduler::runRoundLogged(Cas::Gc & round_gc, GcRoundLogRecord::Trigger trigger, std::function<void()> on_lease_acquired)
+void CasGcScheduler::onLeaseAcquired()
+{
+    i_am_leader.store(true, std::memory_order_relaxed);
+    try
+    {
+        Cas::Gc::pulseHeartbeat(*store, gc_id);
+    }
+    catch (...)
+    {
+        /// Advisory, same as heartbeatLoop's own pulse: a lost pulse is harmless, the next
+        /// one (from heartbeatLoop, hb_interval later) retries. Must never fail the round.
+        tryLogCurrentException(log, "CA GC acquire-time heartbeat pulse failed (advisory; will retry)");
+    }
+}
+
+Cas::RoundReport CasGcScheduler::runRoundLogged(Cas::Gc & round_gc, GcRoundLogRecord::Trigger trigger,
+                                                 std::function<void()> on_lease_acquired, bool allow_steal)
 {
     using Rec = GcRoundLogRecord;
     /// Best-effort: the table row must never break GC. A throwing sink is swallowed.
@@ -132,7 +148,7 @@ Cas::RoundReport CasGcScheduler::runRoundLogged(Cas::Gc & round_gc, GcRoundLogRe
     fin.event_type = Rec::EventType::Finish;
     try
     {
-        const Cas::RoundReport rep = round_gc.runRegularRound(std::move(on_lease_acquired));
+        const Cas::RoundReport rep = round_gc.runRegularRound(std::move(on_lease_acquired), allow_steal);
         CurrentMetrics::set(CurrentMetrics::CasGcIsLeader, rep.acquired_lease ? 1 : 0);
         if (rep.acquired_lease)
             CurrentMetrics::add(CurrentMetrics::CasGcPendingReclaimEntries,
@@ -171,7 +187,12 @@ Cas::RoundReport CasGcScheduler::runRoundLogged(Cas::Gc & round_gc, GcRoundLogRe
 Cas::RoundReport CasGcScheduler::runOneRoundNow(GcRoundLogRecord::Trigger trigger)
 {
     std::lock_guard round_lock(gc_round_mutex);
-    return runRoundLogged(gc, trigger);
+    /// allow_steal=false: a manual round may acquire a FREE lease or renew ITS OWN, but must never
+    /// steal a live incumbent — see Cas::Gc::runRegularRound's doc comment. Dead-incumbent recovery
+    /// stays the loop's job (bounded ~2*interval; loop() below passes the default allow_steal=true).
+    const Cas::RoundReport report = runRoundLogged(gc, trigger, [this] { onLeaseAcquired(); }, /*allow_steal=*/false);
+    i_am_leader.store(report.acquired_lease, std::memory_order_relaxed);   /// B160: gate the heartbeat, same as loop()
+    return report;
 }
 
 void CasGcScheduler::loop()
@@ -186,29 +207,21 @@ void CasGcScheduler::loop()
         }
         try
         {
+            /// LOW/benign: if stop() flips `stopping` while we're blocked here (a concurrent manual
+            /// round holds gc_round_mutex), we still run one more Scheduled round once it unblocks,
+            /// before the next wait_for() observes `stopping` - an accepted extra round, not a
+            /// correctness issue.
             std::lock_guard round_lock(gc_round_mutex);
-            /// B160/P3-B1: fired the instant the lease is (re)acquired, before the round's fold runs -
-            /// a new leader's first round is otherwise unprotected (i_am_leader would only flip below,
-            /// AFTER the whole round returns), so a follower observing the frozen (owner, seq) across
-            /// two of its own ticks would steal deterministically once that first round outlasts them.
-            auto on_lease_acquired = [this]
-            {
-                i_am_leader.store(true, std::memory_order_relaxed);
-                try
-                {
-                    Cas::Gc::pulseHeartbeat(*store, gc_id);
-                }
-                catch (...)
-                {
-                    /// Advisory, same as heartbeatLoop's own pulse: a lost pulse is harmless, the next
-                    /// one (from heartbeatLoop, hb_interval later) retries. Must never fail the round.
-                    tryLogCurrentException(log, "CA GC acquire-time heartbeat pulse failed (advisory; will retry)");
-                }
-            };
 
             /// runRoundLogged emits the Start + Finish table rows (incl. the per-round
             /// ProfileEvents delta) and rethrows on a round exception (after an Aborted Finish).
-            const Cas::RoundReport report = runRoundLogged(gc, GcRoundLogRecord::Trigger::Scheduled, on_lease_acquired);
+            /// on_lease_acquired (onLeaseAcquired, shared with runOneRoundNow) fires the instant the
+            /// lease is (re)acquired, before the fold runs - a new leader's first round is otherwise
+            /// unprotected (i_am_leader would only flip below, AFTER the whole round returns), so a
+            /// follower observing the frozen (owner, seq) across two of its own ticks would steal
+            /// deterministically once that first round outlasts them. allow_steal defaults to true here
+            /// (the loop is the ONLY caller allowed to execute the steal CAS).
+            const Cas::RoundReport report = runRoundLogged(gc, GcRoundLogRecord::Trigger::Scheduled, [this] { onLeaseAcquired(); });
             i_am_leader.store(report.acquired_lease, std::memory_order_relaxed);   /// B160: gate the heartbeat
             if (report.acquired_lease)
             {
