@@ -7,6 +7,7 @@
 
 #if USE_AWS_S3
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasObjectStorageBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <IO/S3Common.h>
 #include <Poco/Net/NetException.h>
@@ -27,6 +28,8 @@ namespace ProfileEvents
 namespace DB::ErrorCodes
 {
     extern const int LOGICAL_ERROR;
+    extern const int CORRUPTED_DATA;
+    extern const int BAD_ARGUMENTS;
 }
 #endif
 
@@ -196,6 +199,190 @@ TEST(CasRequestControl, SingleAttemptRetryStrategyRefusesAndCountsEveryConsultat
 #else
     (void)before;
 #endif
+}
+
+/// ================================================================================================
+/// Task 5: CasRequestController — retry controller (deadlines, fence gating, exact-key resolution)
+/// ================================================================================================
+
+namespace
+{
+
+/// A per-call scripted Backend for CasRequestController tests: `putIfAbsent` optionally throws a
+/// caller-supplied exception (models one classified HTTP-attempt outcome) or returns a forced
+/// `PutOutcome` directly (models a `PreconditionFailed` observed WITHOUT an exception); with neither
+/// set it delegates to the real in-memory conditional-write semantics. `get` optionally returns a
+/// forced result, independent of what `putIfAbsent` actually did, so a test can drive exact-key
+/// resolution (identical / different / absent) without the scripted put and the resolve GET needing to
+/// agree on a shared, real backing store.
+class ScriptedControllerBackend : public InMemoryBackend
+{
+public:
+    std::function<void()> put_thrower;
+    std::optional<PutOutcome> put_forced_outcome;
+    std::atomic<uint64_t> put_attempts{0};
+
+    bool get_overridden = false;
+    std::optional<GetResult> get_override_value;   /// meaningful only when get_overridden
+
+    void setGetOverride(std::optional<GetResult> value)
+    {
+        get_overridden = true;
+        get_override_value = std::move(value);
+    }
+
+    PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta = {}) override
+    {
+        ++put_attempts;
+        if (put_thrower)
+            put_thrower();
+        if (put_forced_outcome)
+            return {*put_forced_outcome, {}};
+        return InMemoryBackend::putIfAbsent(key, bytes, meta);
+    }
+
+    std::optional<GetResult> get(const String & key, Range range = {}) override
+    {
+        if (get_overridden)
+            return get_override_value;
+        return InMemoryBackend::get(key, range);
+    }
+};
+
+GetResult resultWithBytes(const String & bytes)
+{
+    return GetResult{.bytes = bytes, .token = Token{"t", TokenType::Emulated}, .attributes = {}};
+}
+
+}
+
+TEST(CasRequestController, UncertainResolvesIdenticalAsCommitted)
+{
+    auto backend = std::make_shared<ScriptedControllerBackend>();
+    backend->put_thrower = [] { throw Poco::TimeoutException("scripted: ambiguous"); };
+    backend->setGetOverride(resultWithBytes("payload"));
+
+    CasRequestController controller(backend, CasRequestBudget{});
+    const auto outcome = controller.putIfAbsentControlled("k", "payload", [] { return true; });
+    EXPECT_EQ(outcome, CasWriteOutcome::Committed);
+    EXPECT_EQ(backend->put_attempts.load(), 1u);
+}
+
+TEST(CasRequestController, UncertainResolvesDifferentThrowsCorruption)
+{
+    auto backend = std::make_shared<ScriptedControllerBackend>();
+    backend->put_thrower = [] { throw Poco::TimeoutException("scripted: ambiguous"); };
+    backend->setGetOverride(resultWithBytes("someone-elses-bytes"));
+
+    CasRequestController controller(backend, CasRequestBudget{});
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
+    {
+        controller.putIfAbsentControlled("k", "payload", [] { return true; });
+    });
+}
+
+/// GET-absent NEVER yields DefiniteFailure (spec §writer-side-linearization): the SAME (key, bytes) is
+/// retried up to `max_attempts`, and only THEN does the call give up with Unresolved.
+TEST(CasRequestController, UncertainResolvesAbsentRetriesSameKeyWithinBudget)
+{
+    auto backend = std::make_shared<ScriptedControllerBackend>();
+    backend->put_thrower = [] { throw Poco::TimeoutException("scripted: ambiguous"); };
+    backend->setGetOverride(std::nullopt);   /// absent on every resolve
+
+    CasRequestBudget budget;
+    budget.max_attempts = 3;
+    CasRequestController controller(backend, budget);
+    const auto outcome = controller.putIfAbsentControlled("k", "payload", [] { return true; });
+    EXPECT_EQ(outcome, CasWriteOutcome::Unresolved);
+    EXPECT_EQ(backend->put_attempts.load(), 3u);   /// every attempt targeted the SAME key/bytes
+}
+
+/// The operation deadline — not just the attempt-count budget — cuts a retry loop short: a fake clock
+/// advances by a fixed step per now_ms() call (no sleeps), and max_attempts is generous enough that only
+/// the deadline check can be what stops the loop.
+TEST(CasRequestController, OperationDeadlineExhaustionReturnsUnresolvedBeforeMaxAttempts)
+{
+    auto backend = std::make_shared<ScriptedControllerBackend>();
+    backend->put_thrower = [] { throw Poco::TimeoutException("scripted: ambiguous"); };
+    backend->setGetOverride(std::nullopt);   /// absent on every resolve
+
+    uint64_t clock = 0;
+    auto now_ms = [&clock]() -> uint64_t { const uint64_t t = clock; clock += 200; return t; };
+
+    CasRequestBudget budget;
+    budget.max_attempts = 10;
+    budget.attempt_timeout_ms = 50;
+    budget.operation_deadline_ms = 450;
+    CasRequestController controller(backend, budget, now_ms);
+    const auto outcome = controller.putIfAbsentControlled("k", "payload", [] { return true; });
+    EXPECT_EQ(outcome, CasWriteOutcome::Unresolved);
+    EXPECT_EQ(backend->put_attempts.load(), 2u);   /// cut off well before the 10-attempt budget
+}
+
+TEST(CasRequestController, FenceLostBeforeAttemptSendsNoAttempt)
+{
+    auto backend = std::make_shared<ScriptedControllerBackend>();
+    CasRequestController controller(backend, CasRequestBudget{});
+    const auto outcome = controller.putIfAbsentControlled("k", "payload", [] { return false; });
+    EXPECT_EQ(outcome, CasWriteOutcome::Unresolved);
+    EXPECT_EQ(backend->put_attempts.load(), 0u);
+}
+
+/// The write itself may have landed, but a fence lost between the write and this call's own final
+/// check must never surface as Committed (RFC §ack-and-cache-rules: no ACK, no cache update on that
+/// path) — the caller sees Unresolved and must not treat the operation as acknowledged.
+TEST(CasRequestController, FenceLostAfterWriteNeverReturnsCommitted)
+{
+    auto backend = std::make_shared<ScriptedControllerBackend>();   /// real in-memory commit path
+    int fence_calls = 0;
+    auto fence_ok = [&fence_calls] { return fence_calls++ == 0; };   /// true once, then false
+
+    CasRequestController controller(backend, CasRequestBudget{});
+    const auto outcome = controller.putIfAbsentControlled("k", "payload", fence_ok);
+    EXPECT_EQ(outcome, CasWriteOutcome::Unresolved);
+    EXPECT_EQ(backend->put_attempts.load(), 1u);   /// the write itself DID happen
+    EXPECT_TRUE(backend->head("k").exists);        /// ...it is durable; never claimed as Committed here
+}
+
+TEST(CasRequestController, DefiniteFailurePropagatesImmediatelyWithoutResolve)
+{
+    auto backend = std::make_shared<ScriptedControllerBackend>();
+    backend->put_thrower = [] { throw DB::S3Exception("scripted: malformed", Aws::S3::S3Errors::UNKNOWN, "MalformedXML"); };
+
+    CasRequestController controller(backend, CasRequestBudget{});
+    const auto outcome = controller.putIfAbsentControlled("k", "payload", [] { return true; });
+    EXPECT_EQ(outcome, CasWriteOutcome::DefiniteFailure);
+    EXPECT_EQ(backend->put_attempts.load(), 1u);   /// no retry, no resolve GET issued
+}
+
+/// Startup validation (RFC §required-timeout-model): a consistent default budget is accepted silently;
+/// either inequality violated on its own is rejected with BAD_ARGUMENTS.
+TEST(CasRequestController, ValidateBudgetAcceptsConsistentDefaults)
+{
+    EXPECT_NO_THROW(validateCasRequestBudget(CasRequestBudget{}, /*mount_lease_ttl_ms=*/30000, /*mount_renew_period_ms=*/10000));
+}
+
+TEST(CasRequestController, ValidateBudgetRejectsAttemptTimeoutPlusMarginAtOrAboveLeaseTtl)
+{
+    CasRequestBudget budget;
+    budget.attempt_timeout_ms = 25000;
+    budget.lease_safety_margin_ms = 5000;   /// sums to EXACTLY the lease TTL below — not strictly less
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::BAD_ARGUMENTS, [&]
+    {
+        validateCasRequestBudget(budget, /*mount_lease_ttl_ms=*/30000, /*mount_renew_period_ms=*/10000);
+    });
+}
+
+TEST(CasRequestController, ValidateBudgetRejectsAttemptTimeoutAboveOperationDeadline)
+{
+    CasRequestBudget budget;
+    budget.attempt_timeout_ms = 6000;
+    budget.operation_deadline_ms = 5000;
+    budget.lease_safety_margin_ms = 1000;
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::BAD_ARGUMENTS, [&]
+    {
+        validateCasRequestBudget(budget, /*mount_lease_ttl_ms=*/30000, /*mount_renew_period_ms=*/10000);
+    });
 }
 
 #endif

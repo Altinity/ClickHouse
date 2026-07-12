@@ -231,6 +231,15 @@ StorePtr Store::open(BackendPtr backend, PoolConfig config)
                 std::chrono::system_clock::now().time_since_epoch()).count());
         };
         const uint64_t ttl_ms = static_cast<uint64_t>(store->config.mount_lease_ttl_ms.count());
+
+        /// CAS request budget (RFC cas-s3-timeout-retry-control §required-timeout-model, Task 5): a
+        /// writable mount refuses to open with a budget that could let a controlled attempt outlive the
+        /// mount lease it is fenced under. Throws BAD_ARGUMENTS and aborts open on an inconsistent
+        /// budget; logs the effective values once on success. The controller itself (Store's ref
+        /// mutation paths) is wired in a later task — this validates the config invariant up front.
+        validateCasRequestBudget(store->config.cas_request_budget, ttl_ms,
+            static_cast<uint64_t>(store->config.mount_renew_period.count()));
+
         /// Poll twice per renew period so a live holder's renewal is always observed within the wait;
         /// margin = one poll interval (covers poll granularity + minor wall-clock skew). Derived from
         /// existing config — no new knob (spec §Config).

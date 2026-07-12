@@ -383,10 +383,17 @@ TEST(CasMountStartup, StaleSelfMountReclaimedAfterWait)
     /// Server A opens writable with a SHORT lease TTL and KEEPS its Store alive with NO background
     /// renewer (background_watermark defaults false) — i.e. it simulates a crashed process: the mount
     /// lease survives with a future expires_at_ms but is never renewed.
+    /// This test's short lease TTL is far below the CasRequestBudget defaults (RFC
+    /// cas-s3-timeout-retry-control §required-timeout-model requires attempt_timeout + safety_margin <
+    /// lease TTL), so it also scales down cas_request_budget to fit — the budget itself is not
+    /// exercised here, only Store::open's validateCasRequestBudget startup gate.
+    const CasRequestBudget tiny_budget{
+        .attempt_timeout_ms = 50, .operation_deadline_ms = 50, .max_attempts = 1, .lease_safety_margin_ms = 50};
     auto a = Store::open(b, PoolConfig{
         .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r", .root_shards = 1,
         .mount_lease_ttl_ms = std::chrono::milliseconds(300),
-        .mount_renew_period = std::chrono::milliseconds(100)});
+        .mount_renew_period = std::chrono::milliseconds(100),
+        .cas_request_budget = tiny_budget});
     ASSERT_NE(a, nullptr);
     const uint64_t e1 = a->writerEpoch();
 
@@ -397,7 +404,8 @@ TEST(CasMountStartup, StaleSelfMountReclaimedAfterWait)
         a2 = Store::open(b, PoolConfig{
             .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r", .root_shards = 1,
             .mount_lease_ttl_ms = std::chrono::milliseconds(300),
-            .mount_renew_period = std::chrono::milliseconds(100)}));
+            .mount_renew_period = std::chrono::milliseconds(100),
+            .cas_request_budget = tiny_budget}));
     ASSERT_NE(a2, nullptr);
     EXPECT_GT(a2->writerEpoch(), e1);
 }

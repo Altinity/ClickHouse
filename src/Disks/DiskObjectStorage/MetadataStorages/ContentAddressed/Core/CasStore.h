@@ -9,6 +9,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasPoolMeta.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestCodec.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestId.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRequestControl.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootShardCodec.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasServerRoot.h>
 #include <Common/CacheBase.h>
@@ -209,6 +210,13 @@ struct PoolConfig
     std::chrono::milliseconds mount_lease_ttl_ms{30000};
     std::chrono::milliseconds mount_renew_period{10000};   /// = ttl/3 by default
     bool read_only = false;                   /// observe-only open: skip the mutating capability probe; reads only
+
+    /// The CAS retry controller's budget (RFC cas-s3-timeout-retry-control), validated against
+    /// `mount_lease_ttl_ms` at writable open (`Store::open` calls `validateCasRequestBudget`) — an
+    /// inconsistent budget refuses the mount rather than silently retrying unsafely. Defaults are
+    /// consistent with the default `mount_lease_ttl_ms` above; a caller that raises the lease TTL may
+    /// keep these defaults, but a caller that LOWERS it must revisit this budget too.
+    CasRequestBudget cas_request_budget{};
 
     /// Pillar B bounded-TTL decode cache: a staleness-tolerant caller (allow_stale=true) may reuse a
     /// decode validated < this many ms ago WITHOUT a HEAD. 0 disables the TTL (all callers force-fresh).
