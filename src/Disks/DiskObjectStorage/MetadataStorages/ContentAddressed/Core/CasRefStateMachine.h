@@ -108,15 +108,16 @@ void applyRefLogTxn(RefTableState & state, const RefLogTxn & txn);
 RefTableSnapshot snapshotOf(const RefTableState & state, const String & ns);
 
 /// `TableState = Replay(S_X.state, tail(X))` (spec §Table State) in one call: starts from `snapshot`
-/// (or the empty/never-born state when absent) and applies every transaction in `tail`, in order,
-/// via `applyRefLogTxn`. Validates ns/lifecycle coupling: a given `snapshot`'s `lifecycle` must be
-/// consistent with its `remove_txn_id`/row emptiness (the same coupling `CasRefSnapshotCodec` already
-/// checks -- re-checked here because `replay` may be handed a hand-built `RefTableSnapshot` that never
-/// passed through `decodeRefTableSnapshot`), and every entry of `tail` must share one `ns` -- with
-/// `snapshot`'s `ns` when a snapshot is given, otherwise with each other. A mismatch throws
-/// `CORRUPTED_DATA`: replaying transactions from the wrong table onto this table's snapshot would
-/// silently produce a wrong-but-plausible-looking state, exactly the class of bug this equation exists
-/// to make impossible.
+/// (or the empty/never-born state when absent) and applies every transaction in `tail`, in order, via
+/// `applyRefLogTxn`. A given `snapshot` is revalidated in full -- sortedness, no duplicates, canonical
+/// names, nonzero ids, `manifest_ref` field validity, and lifecycle/remove_txn_id/row-emptiness
+/// coupling, i.e. everything `CasRefSnapshotCodec` already enforces -- because `replay` may be handed
+/// a hand-built `RefTableSnapshot` that never passed through `decodeRefTableSnapshot` (`fsck`, most
+/// notably). Every entry of `tail` must also share one `ns` -- with `snapshot`'s `ns` when a snapshot
+/// is given, otherwise with each other. A mismatch (of either kind) throws `CORRUPTED_DATA`: silently
+/// accepting a malformed snapshot or replaying transactions from the wrong table would produce a
+/// wrong-but-plausible-looking state, exactly the class of bug this equation exists to make
+/// impossible.
 RefTableState replay(const std::optional<RefTableSnapshot> & snapshot, std::span<const RefLogTxn> tail);
 
 /// Admission budget (spec §Snapshot Format): true iff applying `op` to a COPY of `state` (via the same
@@ -127,10 +128,12 @@ RefTableState replay(const std::optional<RefTableSnapshot> & snapshot, std::span
 ///
 /// `RefTableState` carries no `ns` (it is per-table but not one of this struct's fields), so both
 /// hypothetical encodings are measured with an empty `ns`. `ns` is constant for one table for its
-/// entire lifetime, so a caller computes its own table's `4 + ns.size()` overhead once (it is repeated
-/// exactly once in a snapshot body and once in a removal-transaction body -- see `CasRefSnapshotCodec`
-/// / `CasRefLogCodec`'s wire layout) and pre-subtracts it, together with its own safety margin, from
-/// the raw `ref_snapshot_max_bytes` / `ref_removal_max_bytes` hard limits before calling `admits`.
+/// entire lifetime, so a caller computes its own table's `ns.size()` overhead once (the wire layout's
+/// `u32` length prefix itself is present in BOTH the empty-`ns` measurement here and the real encoding,
+/// so it cancels -- only the `ns` bytes themselves are the delta; repeated exactly once in a snapshot
+/// body and once in a removal-transaction body, see `CasRefSnapshotCodec` / `CasRefLogCodec`'s wire
+/// layout) and pre-subtracts it, together with its own safety margin, from the raw
+/// `ref_snapshot_max_bytes` / `ref_removal_max_bytes` hard limits before calling `admits`.
 ///
 /// Implementation choice: sizes are computed non-incrementally, by literally building the hypothetical
 /// post-state's snapshot and removal transaction and calling `encodeRefTableSnapshot` /

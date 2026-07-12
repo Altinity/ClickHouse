@@ -196,28 +196,27 @@ void checkRemoveNamespaceOrdering(const std::vector<RefOp> & ops)
     }
 }
 
-/// The inverse of `snapshotOf`: state from a snapshot's rows, after checking the same
-/// lifecycle/remove_txn_id/row-emptiness coupling `CasRefSnapshotCodec` enforces on encode (re-checked
-/// here since `replay` may receive a hand-built `RefTableSnapshot` that never passed through
-/// `decodeRefTableSnapshot`).
+/// The inverse of `snapshotOf`: state from a snapshot's rows. `replay` may receive a hand-built
+/// `RefTableSnapshot` that never passed through `decodeRefTableSnapshot`, so this round-trips it
+/// through the codec's own `encodeRefTableSnapshot`/`decodeRefTableSnapshot` rather than
+/// re-implementing a second, independently-maintained copy of its validation (sortedness, no
+/// duplicates, canonical names, nonzero ids, `manifest_ref` field validity, lifecycle/remove_txn_id
+/// coupling) that could silently miss a case. Concretely: a hand-built snapshot with two committed
+/// rows sharing one `ref_name` would otherwise DROP the second row via `std::map::emplace` below --
+/// the same phantom-alive class of bug as a promote's silent displacement (see `applyOwnerTransition`
+/// above), just reached through snapshot loading instead of a transaction.
 RefTableState stateFromSnapshot(const RefTableSnapshot & snapshot)
 {
-    if (snapshot.lifecycle == RefLifecycle::Removed)
-    {
-        if (!snapshot.remove_txn_id || !snapshot.committed.empty() || !snapshot.precommits.empty())
-            throw Exception(ErrorCodes::CORRUPTED_DATA,
-                "RefTableSnapshot: Removed snapshot must carry remove_txn_id and no committed/precommit rows");
-    }
-    else if (snapshot.remove_txn_id)
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableSnapshot: Live snapshot must not carry remove_txn_id");
+    const String bytes = encodeRefTableSnapshot(snapshot);
+    const RefTableSnapshot validated = decodeRefTableSnapshot(bytes, snapshot.ns, snapshot.snapshot_id);
 
     RefTableState state;
-    state.lifecycle = snapshot.lifecycle;
-    state.remove_txn_id = snapshot.remove_txn_id;
-    state.greatest_applied = snapshot.snapshot_id;
-    for (const RefCommittedRow & row : snapshot.committed)
+    state.lifecycle = validated.lifecycle;
+    state.remove_txn_id = validated.remove_txn_id;
+    state.greatest_applied = validated.snapshot_id;
+    for (const RefCommittedRow & row : validated.committed)
         state.committed.emplace(row.ref_name, row);
-    for (const RefOwnerBinding & b : snapshot.precommits)
+    for (const RefOwnerBinding & b : validated.precommits)
         state.precommits.emplace(b.ref_name, b.manifest_ref);
     return state;
 }

@@ -705,6 +705,40 @@ TEST(CasRefStateMachine, ReplayRejectsTailNsMismatchAcrossEntries)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { replay(std::nullopt, tail); });
 }
 
+TEST(CasRefStateMachine, ReplayRejectsHandBuiltSnapshotWithDuplicateCommittedName)
+{
+    /// A hand-built RefTableSnapshot (never passed through decodeRefTableSnapshot -- exactly what
+    /// fsck hands to replay) with two committed rows sharing one ref_name must be rejected, not
+    /// silently collapsed to one row via std::map::emplace (the phantom-alive class of bug fixed in
+    /// stateFromSnapshot).
+    RefTableSnapshot snap;
+    snap.ns = kNs;
+    snap.snapshot_id = RefTxnId{1, 1};
+    snap.lifecycle = RefLifecycle::Live;
+    RefCommittedRow row1;
+    row1.ref_name = "a";
+    row1.manifest_ref = manifestRef(1, 1, 1);
+    RefCommittedRow row2;
+    row2.ref_name = "a";
+    row2.manifest_ref = manifestRef(1, 2, 1);
+    snap.committed.push_back(row1);
+    snap.committed.push_back(row2);
+
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { replay(snap, {}); });
+}
+
+TEST(CasRefStateMachine, ReplayRejectsHandBuiltSnapshotWithUnsortedPrecommits)
+{
+    RefTableSnapshot snap;
+    snap.ns = kNs;
+    snap.snapshot_id = RefTxnId{1, 1};
+    snap.lifecycle = RefLifecycle::Live;
+    snap.precommits.push_back(RefOwnerBinding{RefOwnerKind::Precommit, "b", manifestRef(1, 1, 1)});
+    snap.precommits.push_back(RefOwnerBinding{RefOwnerKind::Precommit, "a", manifestRef(1, 2, 1)});
+
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { replay(snap, {}); });
+}
+
 /// Randomized replay equation: replay(snapshotOf(mid-state), tail) == full replay (spec §Table State).
 TEST(CasRefStateMachine, ReplayEquationPropertyTest)
 {
@@ -925,8 +959,10 @@ TEST(CasRefStateMachine, AdmitsExactnessPropertyTest)
         }
         else
         {
-            const auto & [name, mref] = open_committed[rng() % open_committed.size()];
-            candidate = setPayloadOp(name, mref, String(1 + rng() % 64, 'r'), rng());
+            /// A genuinely distinct third shape: a racing precommit under an ALREADY-committed name
+            /// (legal -- spec §Add Precommit only restricts manifest identity, never ref_name).
+            const String & name = open_committed[rng() % open_committed.size()].first;
+            candidate = addPrecommitOp(name, manifestRef(1, next_build_seq++, 1));
         }
 
         RefTableState scratch = state;
