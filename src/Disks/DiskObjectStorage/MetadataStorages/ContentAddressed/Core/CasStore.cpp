@@ -51,6 +51,7 @@ namespace ProfileEvents
     extern const Event CasRefAppendWedged;
     extern const Event CasRefAppendUnwedged;
     extern const Event CasRefAppendDefiniteFailure;
+    extern const Event CasRefSweepDeferred;
 }
 
 namespace DB::Cas
@@ -891,7 +892,9 @@ std::optional<Resolved> Store::resolveRef(const RootNamespace & ns, const String
     /// fire for a table this mount WRITES to. Both are cheap (lock + comparison) on the warm path (the
     /// flag/threshold is already false after the table's first touch this mount); the sweep, if it DOES
     /// fire, runs synchronously here (safe: this call is not nested inside any queue leader's stack).
-    maybeSweepStalePrecommits(ns, rt);
+    /// Insulated (unlike appendRefOps's own hoisted call): a READ must not fail because a piggybacked
+    /// maintenance action hit an uncertain PUT -- see `sweepStalePrecommitsForRead`.
+    sweepStalePrecommitsForRead(ns, rt);
     maybeScheduleSnapshotPublish(ns, rt);
 
     std::lock_guard lock(rt->state_mutex);
@@ -1057,8 +1060,9 @@ std::map<String, Resolved> Store::listRefs(const RootNamespace & ns)
     /// dance, since there is no longer a shard fan-out to rediscover on every call).
     const auto rt = getRefTableRuntime(ns);
     ensureRefTableRecovered(ns, *rt);
-    /// Task 11 mount-time triggers: see the identical comment in `resolveRef`.
-    maybeSweepStalePrecommits(ns, rt);
+    /// Task 11 mount-time triggers: see the identical comment in `resolveRef`. Insulated for the same
+    /// reason -- see `sweepStalePrecommitsForRead`.
+    sweepStalePrecommitsForRead(ns, rt);
     maybeScheduleSnapshotPublish(ns, rt);
 
     std::map<String, Resolved> result;
@@ -2061,6 +2065,29 @@ bool Store::trySnapshotPublishOnce(const RootNamespace & ns)
         rt->newest_snapshot_id = candidate_x;
     }
     return true;
+}
+
+void Store::sweepStalePrecommitsForRead(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt)
+{
+    /// Review follow-up (T11): a read-only caller (resolveRef/listRefs) must not fail its OWN
+    /// otherwise-successful read because a piggybacked maintenance action (the stale-precommit sweep)
+    /// hit an uncertain PUT -- the read asked for none of that; a mutation path (appendRefOps's own
+    /// top-level hoisted call, which calls `maybeSweepStalePrecommits` directly, uncaught) keeps
+    /// propagating instead, since it must not proceed past a wedged lane anyway. Naturally fires at
+    /// most once per table per mount: `maybeSweepStalePrecommits` clears its flag BEFORE attempting
+    /// the sweep, so a failed attempt is never retried by a LATER read on the SAME mount -- only a
+    /// later mutation (via the wedge) or the next mount's fresh recovery makes further progress.
+    try
+    {
+        maybeSweepStalePrecommits(ns, rt);
+    }
+    catch (...)
+    {
+        ProfileEvents::increment(ProfileEvents::CasRefSweepDeferred);
+        tryLogCurrentException(getLogger("CasStore"),
+            "CAS stale-precommit sweep deferred for namespace '" + ns.string()
+                + "' (a read-only caller observed the failure and is proceeding with its own read)");
+    }
 }
 
 void Store::maybeSweepStalePrecommits(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt)

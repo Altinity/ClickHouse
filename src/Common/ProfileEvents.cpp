@@ -759,6 +759,7 @@ The server successfully detected this situation and will download merged part fr
     M(CasRefAppendWedged, "CA ref-log append lane wedges: an uncertain PUT exhausted its retry budget", ValueType::Number) \
     M(CasRefAppendUnwedged, "CA ref-log append lane unwedges: a previously uncertain PUT was later observed durable", ValueType::Number) \
     M(CasRefAppendDefiniteFailure, "CA ref-log append attempts conclusively rejected (safe id gap, cache unchanged)", ValueType::Number) \
+    M(CasRefSweepDeferred, "CA stale-precommit sweep failures deferred by a read-only caller (resolveRef/listRefs): the read still succeeded; a later mutation or mount retries the sweep", ValueType::Number) \
     M(CasGcClampSuppressedPasses, "CA GC passes whose fold clamped a shard: graduations and pending deletes were suppressed (carried) to preserve the ack-floor lemma", ValueType::Number) \
     M(CasBlobGet,        "CA blob get S3 ops", ValueType::Number) \
     M(CasBlobGetStream,  "CA blob get-stream S3 ops", ValueType::Number) \

@@ -30,6 +30,11 @@ extern const int FILE_DOESNT_EXIST;
 extern const int CORRUPTED_DATA;
 }
 
+namespace ProfileEvents
+{
+extern const Event CasRefSweepDeferred;
+}
+
 using namespace DB::Cas;
 using DB::Cas::tests::CountingBackend;
 using DB::Cas::tests::committedRow;
@@ -849,9 +854,14 @@ TEST(RefWriterStalePrecommitSweep, BoundedBatchesAndInterruptionResumeAcrossMoun
     backend->fault_key_substr = layout.refsNamespacePrefix(ns) + "_log/";
     backend->fault_count = 1;   /// hits exactly the sweep's FIRST removal chunk's PUT
 
-    /// The sweep is piggybacked on this mount's very first touch; its (uncertain) failure propagates to
-    /// the caller's own read, per `resolveRef`/`listRefs`'s undecorated call to `maybeSweepStalePrecommits`.
-    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { successor->listRefs(ns); });
+    /// The sweep is piggybacked on this mount's very first touch; its (uncertain) failure is INSULATED
+    /// from the read (resolveRef/listRefs call `sweepStalePrecommitsForRead`, not
+    /// `maybeSweepStalePrecommits` directly): the read itself still succeeds, the failure is counted.
+    const uint64_t deferred_before = ProfileEvents::global_counters[ProfileEvents::CasRefSweepDeferred].load();
+    EXPECT_NO_THROW(successor->listRefs(ns));
+    const uint64_t deferred_after = ProfileEvents::global_counters[ProfileEvents::CasRefSweepDeferred].load();
+    EXPECT_EQ(deferred_after, deferred_before + 1)
+        << "the read-only caller must observe (and count) the deferred sweep failure, not throw";
     EXPECT_TRUE(successor->refLaneWedgedForTest(ns));
 
     /// The first chunk's request actually landed server-side; the caller just never saw the ack.
