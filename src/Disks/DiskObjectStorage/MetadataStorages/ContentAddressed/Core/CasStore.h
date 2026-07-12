@@ -235,6 +235,15 @@ struct PoolConfig
     /// per-key last-modified timestamp (`ListedKey` has none) -- conservative: it can only DELAY a
     /// replayed log's eligibility, never advance it prematurely.
     uint64_t snapshot_min_log_age_ms = 5000;
+    /// C4 (spec §writer-snapshot-publication): bounded per-table backoff arming a dispatch cooldown after
+    /// a NON-Committed publish outcome (an S3 timeout / uncertain PUT). Without it, a saturated backend
+    /// turns every ref read into a re-dispatched full-snapshot encode+PUT (the read-triggered PUT storm),
+    /// since a non-Committed publish deliberately does not prune the tail (that would be data loss) and so
+    /// leaves the threshold trigger latched. The interval doubles from `initial` up to `max` per
+    /// consecutive failure and resets on the next durable publish; combined with the single-in-flight gate
+    /// and the candidate-advance skip, it bounds publish dispatch to O(failures), not O(reads).
+    uint64_t snapshot_publish_backoff_initial_ms = 200;
+    uint64_t snapshot_publish_backoff_max_ms = 30000;
 
     /// Task 13 (spec §Byte, Memory, And CPU Budget): resident-memory ceiling for the writer's
     /// whole-table ref cache (`Store::ref_tables`). Phase 1 has no row overlay, so eviction is
@@ -665,6 +674,13 @@ private:
         /// the condvar (guarded by `state_mutex`) a test waits on via `waitForSnapshotPublishSettleForTest`.
         std::atomic<int> pending_snapshot_publishes{0};
         std::condition_variable publish_settle_cv;
+        /// C4 (spec §writer-snapshot-publication): per-table publish-dispatch backoff (guarded by
+        /// `state_mutex`). `publish_backoff_until_ms` is the boottime instant before which
+        /// `maybeScheduleSnapshotPublish` refuses to dispatch; `publish_backoff_ms` is the current
+        /// exponential interval (0 = not backing off), doubled on each consecutive non-Committed publish
+        /// outcome and reset to 0 on the next durable publish.
+        uint64_t publish_backoff_until_ms = 0;
+        uint64_t publish_backoff_ms = 0;
 
         std::deque<std::shared_ptr<RefMutationItem>> pending;    /// guarded by ref_queue_mutex
         bool leader_active = false;                               /// guarded by ref_queue_mutex
@@ -760,6 +776,12 @@ private:
     /// mount-time trigger).
     void maybeScheduleSnapshotPublish(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt);
 
+    /// C4 per-table publish-dispatch backoff (caller holds `rt.state_mutex`). `advance` arms/doubles the
+    /// backoff after a non-Committed publish outcome (bounded by `snapshot_publish_backoff_max_ms`);
+    /// `reset` clears it after a durable publish. See `RefTableRuntime::publish_backoff_*`.
+    void advancePublishBackoff(RefTableRuntime & rt);
+    void resetPublishBackoff(RefTableRuntime & rt);
+
     /// Cheap flag check (lock + bool, no I/O) at the top of `appendRefOps`; if this table's stale
     /// (older-epoch) precommits haven't been swept yet this mount, clears the flag and runs
     /// `sweepStalePrecommitsNow` SYNCHRONOUSLY on the CALLING thread. Safe only because it runs BEFORE
@@ -795,6 +817,10 @@ public:
     /// concurrency); tests that just want deterministic publish-logic coverage call
     /// `trySnapshotPublishOnce` directly instead.
     void waitForSnapshotPublishSettleForTest(const RootNamespace & ns);
+
+    /// C4 test seam: the count of in-flight background snapshot-publish attempts for `ns` (the
+    /// single-in-flight gate holds this at <= 1). Recovers the table (idempotent) if not already cached.
+    int pendingSnapshotPublishesForTest(const RootNamespace & ns);
 
     /// Task 11 test seam: the id of the newest snapshot this runtime has confirmed durable (recovered
     /// or published), or `nullopt` if none. Recovers the table (idempotent) if not already cached.

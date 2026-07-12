@@ -47,6 +47,8 @@ namespace ProfileEvents
     extern const Event CasRefTableEvictions;
     extern const Event CasRefSnapshotPutBytes;
     extern const Event CasRefSnapshotTailLogs;
+    extern const Event CasRefSnapshotPublishDispatched;
+    extern const Event CasRefSnapshotPublishBackoff;
 }
 
 namespace DB::Cas
@@ -1682,21 +1684,54 @@ void Store::maybeScheduleSnapshotPublish(const RootNamespace & ns, const std::sh
     if (!mayMutate())
         return;
 
-    bool trigger = false;
+    /// Bound the read-triggered dispatch (spec §writer-snapshot-publication, C4). The whole decision --
+    /// the threshold trigger, the single-in-flight gate, the candidate-advance skip, the backoff
+    /// deadline -- and the `pending_snapshot_publishes` increment all happen under ONE `state_mutex`
+    /// hold, so two racing dispatchers can never both admit a publish for this table.
+    bool dispatch = false;
     {
         std::lock_guard lock(rt->state_mutex);
+        const bool over_threshold = rt->tail_since_snapshot.size() > config.snapshot_log_count_threshold
+            || rt->tail_bytes_since_snapshot.load(std::memory_order_relaxed) > config.snapshot_log_bytes_threshold;
         if (rt->state.lifecycle == RefLifecycle::Live
-            && (rt->tail_since_snapshot.size() > config.snapshot_log_count_threshold
-                || rt->tail_bytes_since_snapshot.load(std::memory_order_relaxed) > config.snapshot_log_bytes_threshold))
-            trigger = true;
+            && over_threshold
+            /// Single-in-flight gate: at most one background publish per table. A dropped trigger is
+            /// re-evaluated on the next trigger (post-flush / mount-time / the next read), so no snapshot
+            /// is permanently skipped -- the spec promises best-effort compaction, not a staleness bound.
+            && rt->pending_snapshot_publishes.load(std::memory_order_relaxed) == 0
+            /// Backoff deadline: after a non-Committed publish, a saturated backend is not re-dispatched
+            /// on the next read until the bounded backoff elapses (the read-triggered PUT-storm latch).
+            && bootMsNow() >= rt->publish_backoff_until_ms)
+        {
+            /// Candidate-advance skip: dispatch only if a grace-eligible tail entry sits strictly above
+            /// the newest published snapshot. Otherwise the publisher would find nothing new to cover
+            /// (all tail entries still within the grace window, or the newest already published) and
+            /// return without pruning -- re-latching the threshold trigger on every subsequent read.
+            /// `observed_at_ms` is non-decreasing, so the eligible entries are a prefix; the last of them
+            /// is the candidate the publish would pick (mirrors `trySnapshotPublishOnce`'s selection).
+            const uint64_t now = bootMsNow();
+            std::optional<RefTxnId> candidate_x;
+            for (const auto & entry : rt->tail_since_snapshot)
+            {
+                const uint64_t age = now >= entry.observed_at_ms ? now - entry.observed_at_ms : 0;
+                if (age < config.snapshot_min_log_age_ms)
+                    break;
+                candidate_x = entry.txn.txn_id;
+            }
+            if (candidate_x && (!rt->newest_snapshot_id || *rt->newest_snapshot_id < *candidate_x))
+            {
+                rt->pending_snapshot_publishes.fetch_add(1, std::memory_order_relaxed);
+                dispatch = true;
+            }
+        }
     }
-    if (!trigger)
+    if (!dispatch)
         return;
+    ProfileEvents::increment(ProfileEvents::CasRefSnapshotPublishDispatched);
 
     /// Off the mutation hot path (spec §writer-snapshot-publication): `trySnapshotPublishOnce` never
     /// touches the append queue, so dispatching it onto an unrelated global-pool thread can never
     /// deadlock a flush leader. `shared_from_this()` keeps the Store alive for the thread's lifetime.
-    rt->pending_snapshot_publishes.fetch_add(1, std::memory_order_relaxed);
     auto self = shared_from_this();
     try
     {
@@ -1735,11 +1770,37 @@ void Store::maybeScheduleSnapshotPublish(const RootNamespace & ns, const std::sh
     }
 }
 
+void Store::advancePublishBackoff(RefTableRuntime & rt)
+{
+    /// Caller holds `rt.state_mutex`. Double the interval from `initial` up to `max` per consecutive
+    /// non-Committed publish outcome; arm the deadline off the boottime clock (`bootMsNow`), so an
+    /// injected test clock drives it deterministically and a VM-suspend cannot shorten it.
+    rt.publish_backoff_ms = rt.publish_backoff_ms == 0
+        ? config.snapshot_publish_backoff_initial_ms
+        : std::min<uint64_t>(rt.publish_backoff_ms * 2, config.snapshot_publish_backoff_max_ms);
+    rt.publish_backoff_until_ms = bootMsNow() + rt.publish_backoff_ms;
+    ProfileEvents::increment(ProfileEvents::CasRefSnapshotPublishBackoff);
+}
+
+void Store::resetPublishBackoff(RefTableRuntime & rt)
+{
+    /// Caller holds `rt.state_mutex`. A durable publish clears the cooldown.
+    rt.publish_backoff_ms = 0;
+    rt.publish_backoff_until_ms = 0;
+}
+
 void Store::waitForSnapshotPublishSettleForTest(const RootNamespace & ns)
 {
     const auto rt = getRefTableRuntime(ns);
     std::unique_lock lock(rt->state_mutex);
     rt->publish_settle_cv.wait(lock, [&] { return rt->pending_snapshot_publishes.load(std::memory_order_relaxed) == 0; });
+}
+
+int Store::pendingSnapshotPublishesForTest(const RootNamespace & ns)
+{
+    const auto rt = getRefTableRuntime(ns);
+    std::lock_guard lock(rt->state_mutex);
+    return rt->pending_snapshot_publishes.load(std::memory_order_relaxed);
 }
 
 std::optional<RefTxnId> Store::newestPublishedSnapshotIdForTest(const RootNamespace & ns)
@@ -1799,17 +1860,32 @@ bool Store::trySnapshotPublishOnce(const RootNamespace & ns)
     catch (...)
     {
         /// Failure Handling: "Snapshot create fails: keep all logs; writer recovery remains unchanged."
+        /// Treat like any other non-Committed outcome: arm the backoff so a persistent encode failure
+        /// does not re-dispatch on every read (spec §writer-snapshot-publication).
+        std::lock_guard lock(rt->state_mutex);
+        advancePublishBackoff(*rt);
         return false;
     }
     const String key = pool_layout.refSnapshotKey(ns, candidate_x);
     const auto fence_ok = [this] { return refAppendFenceOk(); };
     const CasWriteOutcome outcome = ref_request_controller->putIfAbsentControlled(key, bytes, fence_ok);
     if (outcome != CasWriteOutcome::Committed)
-        return false;   /// DefiniteFailure/Unresolved: leave everything as-is; a later trigger retries
+    {
+        /// DefiniteFailure/Unresolved: DO NOT prune (no durable covering snapshot -- pruning the tail
+        /// without one is data loss). Arm the bounded per-table backoff so the read path does not
+        /// re-dispatch this full-snapshot encode+PUT until it elapses -- the read-triggered PUT-storm
+        /// latch breaker (spec §writer-snapshot-publication). A later trigger past the deadline retries.
+        std::lock_guard lock(rt->state_mutex);
+        advancePublishBackoff(*rt);
+        return false;
+    }
     ProfileEvents::increment(ProfileEvents::CasRefSnapshotPutBytes, bytes.size());   /// spec §writer-snapshot-publication
 
     {
         std::lock_guard lock(rt->state_mutex);
+        /// A durable publish clears any backoff: progress was made this attempt (even if the T11
+        /// monotonic guard below skips the in-memory adoption because a newer snapshot already won).
+        resetPublishBackoff(*rt);
         /// Monotonic adoption guard (review, T11 -- CRITICAL): publishes are NOT serialized, so two
         /// overlapping attempts can finish out of order (this OLDER-candidate attempt landing its PUT
         /// after a NEWER one already adopted). Adopting the older `candidate_x` here would REGRESS

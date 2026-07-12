@@ -36,6 +36,8 @@ namespace ProfileEvents
 extern const Event CasRefSweepDeferred;
 extern const Event CasRefSnapshotPutBytes;
 extern const Event CasRefSnapshotTailLogs;
+extern const Event CasRefSnapshotPublishDispatched;
+extern const Event CasRefSnapshotPublishBackoff;
 }
 
 using namespace DB::Cas;
@@ -960,6 +962,168 @@ TEST(RefWriterSnapshotPublish, ConcurrentOutOfOrderPublishDoesNotRegressBaseNorD
     const RefTableState oracle = independentFullReplayForTest(*backend, layout, ns, *snap_id);
     EXPECT_EQ(got->bytes, encodeRefTableSnapshot(snapshotOf(oracle, ns.string())))
         << "published snapshot bytes must equal replay(all logs through X) -- a regressed base drops txns";
+}
+
+/// ===================================================================================
+/// C4: bound the read-triggered snapshot-publish dispatch (spec §writer-snapshot-publication). A
+/// fold-heavy reader must not turn every ref read into a re-dispatched full-snapshot encode+PUT: an
+/// in-flight gate admits at most one publish per table, a candidate that has not advanced is skipped,
+/// and a non-Committed outcome arms a bounded per-table backoff instead of re-triggering on the next
+/// read. The unfixed code dispatched a new publish on every trigger and never backed off, producing
+/// the soak's 46 GB/hr `_snap` PUT storm.
+/// ===================================================================================
+
+/// Under a saturated backend (every `_snap` PUT is Unresolved), the read path must NOT re-dispatch a
+/// publish on each read: the failure arms the backoff, and while it holds no read re-dispatches.
+TEST(RefWriterSnapshotPublish, C4LatchBoundedUnderSustainedNonCommittedPublish)
+{
+    using ProfileEvents::global_counters;
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const RootNamespace ns{"srv1/c4_latch"};
+
+    CasRequestBudget budget;   /// one attempt per publish so a failure is a single PUT
+    budget.max_attempts = 1;
+    budget.attempt_timeout_ms = 100;
+    budget.operation_deadline_ms = 100;
+    budget.lease_safety_margin_ms = 100;
+
+    uint64_t fake_now = 1'000'000;
+    PoolConfig config;
+    config.snapshot_log_count_threshold = 1;
+    config.snapshot_log_bytes_threshold = 1ULL << 40;
+    config.snapshot_min_log_age_ms = 0;
+    config.snapshot_publish_backoff_initial_ms = 5000;   /// the frozen clock keeps the backoff armed
+    config.mount_lease_ttl_ms = std::chrono::milliseconds(10'000'000);
+    config.boot_ms_fn = [&fake_now] { return fake_now; };
+    config.cas_request_budget = budget;
+    auto store = openStoreWithConfig(backend, config);
+
+    /// Every `_snap` PUT throws Unresolved (backend saturated), from the very first publish attempt.
+    backend->fault_key_substr = "_snap/";
+    backend->fault_count = 100000;
+
+    publishEmptyPart(store, ns, "a");   /// crosses the threshold -> one dispatch -> fails -> backoff armed
+    store->waitForSnapshotPublishSettleForTest(ns);
+
+    const auto dispatched_before = global_counters[ProfileEvents::CasRefSnapshotPublishDispatched].load();
+    for (int i = 0; i < 30; ++i)
+    {
+        store->resolveRef(ns, "a");
+        store->waitForSnapshotPublishSettleForTest(ns);
+    }
+    EXPECT_EQ(global_counters[ProfileEvents::CasRefSnapshotPublishDispatched].load(), dispatched_before)
+        << "reads within the backoff window must not re-dispatch a publish (the storm latch is broken)";
+}
+
+/// While one background publish is in flight (blocked mid-PUT), further reads must NOT dispatch a
+/// second: the single-in-flight gate holds `pending_snapshot_publishes` at one per table.
+TEST(RefWriterSnapshotPublish, C4InFlightGateAdmitsAtMostOne)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const RootNamespace ns{"srv1/c4_gate"};
+    PoolConfig config;
+    config.snapshot_log_count_threshold = 0;   /// any nonempty tail triggers
+    config.snapshot_log_bytes_threshold = 1ULL << 40;
+    config.snapshot_min_log_age_ms = 0;
+    auto store = openStoreWithConfig(backend, config);
+
+    publishEmptyPart(store, ns, "a");
+    store->waitForSnapshotPublishSettleForTest(ns);   /// drain the setup publishes; tail is compacted
+
+    /// Block the first `_snap` PUT so one publisher parks in flight.
+    backend->armPutBlockFirstMatchOnly("_snap/");
+    std::thread mutator([&] { store->dropRef(ns, "a"); });   /// its detached publisher blocks mid-PUT
+    backend->awaitBlockEntered();
+
+    /// Many more reads while it is blocked must not admit a second publisher.
+    for (int i = 0; i < 20; ++i)
+        store->resolveRef(ns, "a");
+    EXPECT_EQ(store->pendingSnapshotPublishesForTest(ns), 1)
+        << "the in-flight gate must hold background publishes to at most one per table";
+
+    backend->releaseBlock();
+    mutator.join();
+    store->waitForSnapshotPublishSettleForTest(ns);
+}
+
+/// When no grace-eligible tail entry has advanced past the newest snapshot (here: the whole tail is
+/// still within the grace window), the trigger must be SKIPPED at dispatch -- not dispatched to a
+/// publisher that would find nothing to cover and re-latch the trigger.
+TEST(RefWriterSnapshotPublish, C4NoAdvanceCandidateSkipsDispatch)
+{
+    using ProfileEvents::global_counters;
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/c4_noadvance"};
+    uint64_t fake_now = 1'000'000;
+    PoolConfig config;
+    config.snapshot_log_count_threshold = 1;
+    config.snapshot_log_bytes_threshold = 1ULL << 40;
+    config.snapshot_min_log_age_ms = 60000;   /// grace large: no tail entry is eligible yet
+    config.mount_lease_ttl_ms = std::chrono::milliseconds(10'000'000);
+    config.boot_ms_fn = [&fake_now] { return fake_now; };
+    auto store = openStoreWithConfig(backend, config);
+
+    publishEmptyPart(store, ns, "a");   /// 2 tail entries > threshold, but all within the grace window
+    const auto before = global_counters[ProfileEvents::CasRefSnapshotPublishDispatched].load();
+    for (int i = 0; i < 10; ++i)
+        store->resolveRef(ns, "a");
+    store->waitForSnapshotPublishSettleForTest(ns);
+    EXPECT_EQ(global_counters[ProfileEvents::CasRefSnapshotPublishDispatched].load(), before)
+        << "no publish is dispatched while no grace-eligible candidate advances past the newest snapshot";
+    EXPECT_FALSE(listGreatestSnapshotIdForTest(*backend, layout, ns).has_value());
+}
+
+/// A non-Committed publish defers the next dispatch by the backoff, then a read past the backoff
+/// deadline dispatches exactly one retry that publishes a durable snapshot (freshness preserved).
+TEST(RefWriterSnapshotPublish, C4BackoffDefersThenRetriesAndPublishes)
+{
+    using ProfileEvents::global_counters;
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/c4_backoff"};
+
+    CasRequestBudget budget;
+    budget.max_attempts = 1;
+    budget.attempt_timeout_ms = 100;
+    budget.operation_deadline_ms = 100;
+    budget.lease_safety_margin_ms = 100;
+
+    uint64_t fake_now = 1'000'000;
+    PoolConfig config;
+    config.snapshot_log_count_threshold = 1;
+    config.snapshot_log_bytes_threshold = 1ULL << 40;
+    config.snapshot_min_log_age_ms = 0;
+    config.snapshot_publish_backoff_initial_ms = 1000;
+    config.mount_lease_ttl_ms = std::chrono::milliseconds(10'000'000);
+    config.boot_ms_fn = [&fake_now] { return fake_now; };
+    config.cas_request_budget = budget;
+    auto store = openStoreWithConfig(backend, config);
+
+    /// Fail ONLY the first `_snap` PUT (arms the backoff); later PUTs succeed.
+    backend->fault_key_substr = "_snap/";
+    backend->fault_count = 1;
+
+    publishEmptyPart(store, ns, "a");   /// dispatch -> publish fails -> backoff armed
+    store->waitForSnapshotPublishSettleForTest(ns);
+    EXPECT_FALSE(listGreatestSnapshotIdForTest(*backend, layout, ns).has_value());
+
+    /// A read within the backoff window (frozen clock) must not re-dispatch.
+    const auto d1 = global_counters[ProfileEvents::CasRefSnapshotPublishDispatched].load();
+    store->resolveRef(ns, "a");
+    store->waitForSnapshotPublishSettleForTest(ns);
+    EXPECT_EQ(global_counters[ProfileEvents::CasRefSnapshotPublishDispatched].load(), d1)
+        << "a read within the backoff window must not re-dispatch";
+    EXPECT_FALSE(listGreatestSnapshotIdForTest(*backend, layout, ns).has_value());
+
+    /// Advance past the backoff: exactly one retry is dispatched and it publishes.
+    fake_now += 2000;
+    store->resolveRef(ns, "a");
+    store->waitForSnapshotPublishSettleForTest(ns);
+    EXPECT_EQ(global_counters[ProfileEvents::CasRefSnapshotPublishDispatched].load(), d1 + 1)
+        << "after the backoff elapses exactly one retry is dispatched";
+    EXPECT_TRUE(listGreatestSnapshotIdForTest(*backend, layout, ns).has_value())
+        << "the retry publishes a durable snapshot (freshness preserved)";
 }
 
 /// ===================================================================================
