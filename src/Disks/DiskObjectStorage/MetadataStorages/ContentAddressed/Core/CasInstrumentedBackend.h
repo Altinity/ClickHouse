@@ -71,6 +71,7 @@ public:
     explicit InstrumentedBackend(BackendPtr inner_) : inner(std::move(inner_)) {}
 
     void checkStorePreconditions() override { inner->checkStorePreconditions(); }
+    void checkConditionalWriteSingleAttemptSupport() override { inner->checkConditionalWriteSingleAttemptSupport(); }
 
     std::optional<GetResult> get(const String & key, Range range = {}) override
     {

@@ -46,6 +46,10 @@ void runCapabilityProbe(Backend & backend, const String & probe_prefix)
         // ---- Step 0: store-level preconditions (backend-specific; throws = mount refused). ----
         backend.checkStorePreconditions();
 
+        // ---- Step 0b: single-attempt conditional-write support (RFC cas-s3-timeout-retry-control;
+        // throws = mount refused). Separate from Step 0 so each is independently unit-testable. ----
+        backend.checkConditionalWriteSingleAttemptSupport();
+
         // ---- Step 1: putIfAbsent fresh → Done; read-after-write returns the bytes. ----
         Token t1;
         {

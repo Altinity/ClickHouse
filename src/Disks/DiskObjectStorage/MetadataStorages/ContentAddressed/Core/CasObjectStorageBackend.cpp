@@ -32,6 +32,7 @@ namespace ErrorCodes
 {
     extern const int FILE_DOESNT_EXIST;
     extern const int NOT_IMPLEMENTED;
+    extern const int LOGICAL_ERROR;
 }
 }
 
@@ -54,7 +55,10 @@ bool detail::SingleAttemptRetryStrategy::ShouldRetry(const Aws::Client::AWSError
 
 long detail::SingleAttemptRetryStrategy::CalculateDelayBeforeNextRetry(const Aws::Client::AWSError<Aws::Client::CoreErrors> &, long) const
 {
-    return 0;   /// unreachable: ShouldRetry above always refuses before this would be consulted.
+    /// IS reached: AWSClient's retry loop calls this BEFORE ShouldRetry on every failed attempt (to
+    /// have a backoff ready in case ShouldRetry says yes), not after. Harmless here regardless: 0 is
+    /// never acted on as an actual sleep, since ShouldRetry (called right after) always refuses.
+    return 0;
 }
 #endif
 
@@ -125,6 +129,36 @@ void ObjectStorageBackend::checkStorePreconditions()
             "versioned bucket archives a noncurrent generation instead of reclaiming storage — GC "
             "would silently stop reclaiming space. Disable versioning on the bucket (and prefer "
             "soft-delete duration 0 for CAS pools) and retry the mount.");
+}
+
+/// See Backend::checkConditionalWriteSingleAttemptSupport. This is a MOUNT-TIME gate, deliberately
+/// separate from the ctor: the ctor stays silent (single_attempt_s3_client best-effort null) so
+/// narrow, targeted unit tests can keep constructing a raw Native-mode backend over a non-S3
+/// IObjectStorage (LocalObjectStorage) to exercise OTHER behaviors in isolation — the established
+/// convention throughout this test suite (see e.g. gtest_cas_backend_generation.cpp). A REAL writable
+/// mount, by contrast, always reaches this check: runCapabilityProbe (CasProbe.cpp) calls it for
+/// every non-read-only Store::open, so production never silently runs Native-mode conditional writes
+/// under the disk's default (~500-attempt) transparent retry policy.
+void ObjectStorageBackend::checkConditionalWriteSingleAttemptSupport()
+{
+    if (mode != Mode::Native)
+        return;
+
+    /// Without AWS S3 support at all, Native mode inherently has no single-attempt machinery — always
+    /// fail closed. With it, the ctor's best-effort client build (see single_attempt_s3_client) is
+    /// what must have actually succeeded.
+#if USE_AWS_S3
+    const bool has_single_attempt_client = static_cast<bool>(single_attempt_s3_client);
+#else
+    const bool has_single_attempt_client = false;
+#endif
+    if (!has_single_attempt_client)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "CAS Native-mode conditional writes require a single-attempt S3 client (RFC "
+            "cas-s3-timeout-retry-control) but none could be built for this object storage "
+            "(IObjectStorage::tryGetS3StorageClient returned null, or this build has no AWS S3 "
+            "support) — refusing to mount writable. Native mode is designed for an S3-like "
+            "conditional dialect only; a non-S3 object storage should use EmulatedSingleProcess.");
 }
 
 /// =========================================================================================
@@ -643,6 +677,11 @@ WriteSettings ObjectStorageBackend::conditionalWriteSettings() const
         ws.s3_force_single_part_upload = true;
         ws.s3_single_part_upload_max_bytes_override = conditional_single_put_cap;
     }
+    /// Exactly one attempt at the WriteBufferFromS3 layer too: makeSinglepartUpload/
+    /// completeMultipartUpload run their OWN retry loop above the S3 client, reissuing the identical
+    /// (conditional!) request on NO_SUCH_KEY — a client-level override alone does not bound it. Plain
+    /// size_t field, harmless (ignored) for a non-S3 write path.
+    ws.s3_max_unexpected_write_error_retries_override = 1;
 #if USE_AWS_S3
     /// Exactly one HTTP attempt for every conditional write (RFC cas-s3-timeout-retry-control) — see
     /// single_attempt_s3_client. Null (non-S3 object storage) leaves the disk's own client in place.

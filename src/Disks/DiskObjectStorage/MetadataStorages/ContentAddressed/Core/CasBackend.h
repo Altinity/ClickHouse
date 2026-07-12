@@ -196,6 +196,14 @@ public:
     /// "reclaim" would silently stop reclaiming.
     virtual void checkStorePreconditions() {}
 
+    /// Fail-closed precondition (RFC cas-s3-timeout-retry-control): a Native-mode backend MUST have a
+    /// working single-attempt conditional-write path before it coordinates a WRITABLE pool — silently
+    /// running CAS conditional writes under the disk's default (~500-attempt) transparent retry policy
+    /// is exactly the hazard the RFC forbids. Checked by the capability probe alongside
+    /// checkStorePreconditions. Default: nothing to check (EmulatedSingleProcess and non-S3 backends
+    /// are not gated here — see ObjectStorageBackend's override for the one backend that is).
+    virtual void checkConditionalWriteSingleAttemptSupport() {}
+
     /// WRITE-ONCE conditional SERVER-SIDE COPY of `staging_key` to `blob_key` (`If-None-Match:*` on the
     /// destination) — the S3-native staging promote's create primitive (spec 2026-07-11-cas-s3-native-staging
     /// §8). `Done` + `token` = the destination ETag (the new incarnation token, exactly the role the

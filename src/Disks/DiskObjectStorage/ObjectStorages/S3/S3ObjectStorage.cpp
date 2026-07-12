@@ -70,6 +70,7 @@ namespace S3RequestSetting
     extern const S3RequestSettingsUInt64 objects_chunk_size_to_delete;
     extern const S3RequestSettingsUInt64 max_single_part_upload_size;
     extern const S3RequestSettingsUInt64 min_upload_part_size;
+    extern const S3RequestSettingsUInt64 max_unexpected_write_error_retries;
 }
 
 
@@ -316,6 +317,16 @@ std::unique_ptr<WriteBufferFromFileBase> S3ObjectStorage::writeObject( /// NOLIN
             = write_settings.s3_single_part_upload_max_bytes_override;
         request_settings[S3RequestSetting::min_upload_part_size]
             = write_settings.s3_single_part_upload_max_bytes_override;
+    }
+
+    if (write_settings.s3_max_unexpected_write_error_retries_override)
+    {
+        /// WriteBufferFromS3's OWN retry loop (makeSinglepartUpload/completeMultipartUpload) reissues
+        /// the identical request — WITH its If-None-Match/If-Match condition — on a NO_SUCH_KEY
+        /// response; this sits ABOVE the S3 client, so a client-level retry override
+        /// (s3_client_override) does not bound it. See WriteSettings.
+        request_settings[S3RequestSetting::max_unexpected_write_error_retries]
+            = write_settings.s3_max_unexpected_write_error_retries_override;
     }
 
     ThreadPoolCallbackRunnerUnsafe<void> scheduler;

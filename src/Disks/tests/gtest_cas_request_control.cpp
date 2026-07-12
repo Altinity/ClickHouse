@@ -5,6 +5,8 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRequestControl.h>
 #include <Common/ProfileEvents.h>
 
+#include <limits>
+
 #if USE_AWS_S3
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasObjectStorageBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
@@ -201,6 +203,23 @@ TEST(CasRequestControl, SingleAttemptRetryStrategyRefusesAndCountsEveryConsultat
 #endif
 }
 
+/// The SECOND retry-affecting layer above the S3 client (review finding): WriteBufferFromS3's OWN
+/// makeSinglepartUpload/completeMultipartUpload retry loop reissues the identical conditional request
+/// on a NO_SUCH_KEY response, driven by S3RequestSetting::max_unexpected_write_error_retries (default
+/// 4) — a client-level override alone does not bound it (see WriteSettings::
+/// s3_max_unexpected_write_error_retries_override). Asserted at the reachable seam: no live/fake S3
+/// endpoint exists in this binary to drive the retry loop itself, so this proves the settings
+/// plumbing conditionalWriteSettings() -> WriteSettings produces the override value that
+/// S3ObjectStorage::writeObject then applies to request_settings — NOT a real single-attempt
+/// assertion against a live wire attempt.
+TEST(CasRequestControl, ConditionalWriteSettingsForceSingleUnexpectedWriteErrorRetry)
+{
+    auto b = std::make_shared<ObjectStorageBackend>(
+        DB::Cas::tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::Native);
+    const auto ws = b->conditionalWriteSettingsForTest();
+    EXPECT_EQ(ws.s3_max_unexpected_write_error_retries_override, 1u);
+}
+
 /// ================================================================================================
 /// Task 5: CasRequestController — retry controller (deadlines, fence gating, exact-key resolution)
 /// ================================================================================================
@@ -379,6 +398,33 @@ TEST(CasRequestController, ValidateBudgetRejectsAttemptTimeoutAboveOperationDead
     budget.attempt_timeout_ms = 6000;
     budget.operation_deadline_ms = 5000;
     budget.lease_safety_margin_ms = 1000;
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::BAD_ARGUMENTS, [&]
+    {
+        validateCasRequestBudget(budget, /*mount_lease_ttl_ms=*/30000, /*mount_renew_period_ms=*/10000);
+    });
+}
+
+/// max_attempts == 0 would let putIfAbsentControlled return Unresolved without ever sending an
+/// attempt — reject at startup rather than silently accepting a no-op budget.
+TEST(CasRequestController, ValidateBudgetRejectsZeroMaxAttempts)
+{
+    CasRequestBudget budget;
+    budget.max_attempts = 0;
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::BAD_ARGUMENTS, [&]
+    {
+        validateCasRequestBudget(budget, /*mount_lease_ttl_ms=*/30000, /*mount_renew_period_ms=*/10000);
+    });
+}
+
+/// attempt_timeout_ms + lease_safety_margin_ms must not be computed by a wrapping uint64 sum: absurd
+/// config values near UINT64_MAX must fail validation (correctly, as inconsistent), never wrap around
+/// to a spuriously small sum that would pass the "< lease TTL" check.
+TEST(CasRequestController, ValidateBudgetRejectsOverflowingSumRatherThanWrapping)
+{
+    CasRequestBudget budget;
+    budget.attempt_timeout_ms = std::numeric_limits<uint64_t>::max() - 10;
+    budget.lease_safety_margin_ms = 20;   /// sum would wrap past UINT64_MAX to a tiny value
+    budget.operation_deadline_ms = std::numeric_limits<uint64_t>::max();
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::BAD_ARGUMENTS, [&]
     {
         validateCasRequestBudget(budget, /*mount_lease_ttl_ms=*/30000, /*mount_renew_period_ms=*/10000);

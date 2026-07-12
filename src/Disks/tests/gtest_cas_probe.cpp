@@ -127,3 +127,41 @@ TEST(CasProbe, StorePreconditionsFireThroughInstrumentedWrapper)
     /// The hook fires FIRST: no probe keys may have been written to the inner backend.
     EXPECT_TRUE(inner->list("p/.cas_probe", "", 10).keys.empty());
 }
+
+/// RFC cas-s3-timeout-retry-control: a Native-mode mount without a working single-attempt S3 client
+/// (ObjectStorageBackend::single_attempt_s3_client) must never silently proceed under the disk's
+/// default (~500-attempt) transparent retry policy — see Backend::checkConditionalWriteSingleAttemptSupport.
+/// LocalObjectStorage never exposes an S3 client (IObjectStorage::tryGetS3StorageClient returns null),
+/// so Native mode over it is exactly the case this must refuse. EmulatedSingleProcess is exempt: it
+/// never claims single-attempt S3 semantics in the first place (PassesOnEmulatedLocal above).
+TEST(CasProbe, FailsClosedOnMissingSingleAttemptClient)
+{
+    auto native = std::make_shared<ObjectStorageBackend>(
+        DB::Cas::tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::Native);
+    EXPECT_THROW(native->checkConditionalWriteSingleAttemptSupport(), DB::Exception);
+
+    auto emulated = std::make_shared<ObjectStorageBackend>(
+        DB::Cas::tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::EmulatedSingleProcess);
+    EXPECT_NO_THROW(emulated->checkConditionalWriteSingleAttemptSupport());
+}
+
+/// The same fail-closed refusal through the actual capability probe (Step 0b) — the real gate a
+/// writable Store::open goes through, not just the hook in isolation above.
+TEST(CasProbe, MissingSingleAttemptClientFailsCapabilityProbe)
+{
+    auto b = std::make_shared<ObjectStorageBackend>(
+        DB::Cas::tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::Native);
+    EXPECT_THROW(runCapabilityProbe(*b, "p/.cas_probe"), DB::Exception);
+    /// The hook fires before the op battery: no probe keys may have been written.
+    EXPECT_TRUE(b->list("p/.cas_probe", "", 10).keys.empty());
+}
+
+/// Mirrors StorePreconditionsFireThroughInstrumentedWrapper: the real mount path wraps the backend in
+/// InstrumentedBackend BEFORE calling runCapabilityProbe, so this check must fire through it too.
+TEST(CasProbe, MissingSingleAttemptClientFiresThroughInstrumentedWrapper)
+{
+    auto inner = std::make_shared<ObjectStorageBackend>(
+        DB::Cas::tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::Native);
+    InstrumentedBackend wrapped(inner);
+    EXPECT_THROW(runCapabilityProbe(wrapped, "p/.cas_probe"), DB::Exception);
+}

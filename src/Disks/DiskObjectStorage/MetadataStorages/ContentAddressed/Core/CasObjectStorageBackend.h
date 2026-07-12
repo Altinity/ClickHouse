@@ -95,6 +95,11 @@ public:
     /// bucket has object versioning enabled — see Backend::checkStorePreconditions.
     void checkStorePreconditions() override;
 
+    /// Fail-closed precondition (RFC cas-s3-timeout-retry-control): throws LOGICAL_ERROR when Native
+    /// mode has no single-attempt client (single_attempt_s3_client, built in the ctor) — see
+    /// Backend::checkConditionalWriteSingleAttemptSupport. No-op for EmulatedSingleProcess.
+    void checkConditionalWriteSingleAttemptSupport() override;
+
     /// The token kind this backend's object storage mints: TokenType::ETag for AWS-compatible
     /// stores, TokenType::Generation when the storage runs the GCS conditional dialect (the
     /// generation rides the ETag plumbing; the VALUE stays opaque either way).

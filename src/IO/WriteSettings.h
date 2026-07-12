@@ -60,6 +60,14 @@ struct WriteSettings
     /// settings so bodies up to this size stay in ONE part (RAM-buffered). 0 = no override.
     size_t s3_single_part_upload_max_bytes_override = 0;
 
+    /// Overrides S3RequestSetting::max_unexpected_write_error_retries (default 4) for this write.
+    /// WriteBufferFromS3::makeSinglepartUpload/completeMultipartUpload run their OWN retry loop above
+    /// the S3 client that reissues the identical request (WITH its If-None-Match/If-Match condition)
+    /// on a NO_SUCH_KEY response — a second retry-affecting layer a client-level override
+    /// (s3_client_override below) does not reach. A CAS conditional write sets this to 1 for exactly
+    /// one attempt at this layer too (RFC cas-s3-timeout-retry-control). 0 = no override.
+    size_t s3_max_unexpected_write_error_retries_override = 0;
+
 #if USE_AWS_S3
     /// Per-request S3 client override: when set, S3ObjectStorage::writeObject issues THIS write with
     /// the given client instead of the disk's shared one. Lets ONE write path (e.g. a CAS conditional
