@@ -188,10 +188,10 @@ TEST(CasBuild, StageManifestUsesPerBuildOrdinals)
     EXPECT_EQ(second.ref.writer_epoch, first.ref.writer_epoch);
     EXPECT_EQ(second.ref.build_sequence, first.ref.build_sequence);
     EXPECT_EQ(second.ref.manifest_ordinal, 2u);
-    EXPECT_EQ(s->layout().manifestKey(first), "p/cas/manifests/test/tbl@cas@/"
-        + std::to_string(s->writerEpoch()) + "/" + std::to_string(build->buildSeq()) + "/000001.proto");
-    EXPECT_EQ(s->layout().manifestKey(second), "p/cas/manifests/test/tbl@cas@/"
-        + std::to_string(s->writerEpoch()) + "/" + std::to_string(build->buildSeq()) + "/000002.proto");
+    /// Canonical hex build directory (spec §Manifest Identifier): `<epoch-hex>-<build-seq-hex>/`.
+    const String build_segment = renderRefTxnId(RefTxnId{s->writerEpoch(), build->buildSeq()});
+    EXPECT_EQ(s->layout().manifestKey(first), "p/cas/manifests/test/tbl@cas@/" + build_segment + "/000001.proto");
+    EXPECT_EQ(s->layout().manifestKey(second), "p/cas/manifests/test/tbl@cas@/" + build_segment + "/000002.proto");
 
     auto next_build = startBuildFor(s, ns, "all_2_2_0");
     const ManifestId next = next_build->stageManifest({blobManifestEntry("c.bin", "c")});

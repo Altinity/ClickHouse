@@ -7,7 +7,8 @@
 namespace DB::Cas
 {
 
-/// One writer build prefix under `cas/manifests/<ns>/`: `<writer_epoch>/<build_sequence>/`.
+/// One writer build prefix under `cas/manifests/<ns>/`: the canonical hex `<epoch-hex>-<seq-hex>/`
+/// directory (spec §Manifest Identifier).
 struct BuildPrefix
 {
     uint64_t writer_epoch = 0;

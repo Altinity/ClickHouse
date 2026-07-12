@@ -2,6 +2,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobRef.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestId.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRefIds.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartPathParser.h>
 
 using namespace DB::Cas;
@@ -79,14 +80,15 @@ TEST(CasLayout, RelocatedRefAndManifestKeys)
     /// All manifests of a namespace: cas/manifests/<ns>/ (replaces roots/<ns>/_manifests/).
     EXPECT_EQ(l.manifestNamespacePrefix(ns), "p/cas/manifests/srid/store/ab/uuid@cas@/");
 
-    /// manifestKey: same writer/build/aa/inst fan-out, now under cas/manifests/<ns>/ (no /_manifests/ infix).
+    /// manifestKey: canonical hex build directory, under cas/manifests/<ns>/ (no /_manifests/ infix).
     ManifestId id;
     id.root_namespace = ns;
     id.ref.writer_epoch = 1;
     id.ref.build_sequence = 1042;
     id.ref.manifest_ordinal = 1;
     const String key = l.manifestKey(id);
-    EXPECT_EQ(key, "p/cas/manifests/srid/store/ab/uuid@cas@/1/1042/000001.proto");
+    EXPECT_EQ(key, "p/cas/manifests/srid/store/ab/uuid@cas@/"
+        "0000000000000001-0000000000000412/000001.proto");
     EXPECT_EQ(key.find("/_manifests/"), String::npos) << key;
 }
 
@@ -174,7 +176,7 @@ TEST(CasLayout, ManifestKeyShape)
     const String key = l.manifestKey(id);
     EXPECT_EQ(key,
         "p/cas/manifests/srv-a/3f2e-uuid@cas@/"
-        "7/1042/000001.proto");
+        "0000000000000007-0000000000000412/000001.proto");
 }
 
 TEST(CasLayout, ManifestsSegmentReserved)
@@ -187,4 +189,109 @@ TEST(CasLayout, ManifestsSegmentReserved)
     EXPECT_THROW(l.rootShardKey(RootNamespace{"srv-a/_manifests/tbl"}, 0), DB::Exception);
     /// A segment that merely CONTAINS "_manifests" as a substring is still legal (no false positive).
     EXPECT_NO_THROW(l.rootShardKey(RootNamespace{"my_manifests/tbl"}, 0));
+}
+
+TEST(CasLayout, ManifestKeyHexRoundTrip)
+{
+    Layout l("p");
+    ManifestId id;
+    id.root_namespace = RootNamespace("srv-a/3f2e-uuid@cas@");
+    id.ref.writer_epoch = 7;
+    id.ref.build_sequence = 0x8e;
+    id.ref.manifest_ordinal = 42;
+    const String key = l.manifestKey(id);
+    EXPECT_EQ(key,
+        "p/cas/manifests/srv-a/3f2e-uuid@cas@/"
+        "0000000000000007-000000000000008e/000042.proto");
+
+    const auto parsed = l.parseManifestKey(key);
+    ASSERT_TRUE(parsed.has_value());
+    EXPECT_EQ(parsed->root_namespace, id.root_namespace);
+    EXPECT_EQ(parsed->ref, id.ref);
+
+    /// The old two-directory decimal shape (`<writer_epoch>/<build_sequence>/<ordinal>.proto`) is no
+    /// longer canonical: the segment right before the file is a plain decimal number, not two
+    /// fixed-width hex fields joined by '-', so `parseRefTxnId` rejects it.
+    EXPECT_FALSE(l.parseManifestKey("p/cas/manifests/srv-a/3f2e-uuid@cas@/7/142/000042.proto").has_value());
+    /// Foreign prefix, missing build segment, non-.proto file, and out-of-range ordinal are all rejected.
+    EXPECT_FALSE(l.parseManifestKey("p/cas/refs/srv-a/3f2e-uuid@cas@/"
+        "0000000000000007-000000000000008e/000042.proto").has_value());
+    EXPECT_FALSE(l.parseManifestKey("p/cas/manifests/0000000000000007-000000000000008e/000042.proto").has_value());
+    EXPECT_FALSE(l.parseManifestKey("p/cas/manifests/srv-a/3f2e-uuid@cas@/"
+        "0000000000000007-000000000000008e/000042.bin").has_value());
+    EXPECT_FALSE(l.parseManifestKey("p/cas/manifests/srv-a/3f2e-uuid@cas@/"
+        "0000000000000007-000000000000008e/000000.proto").has_value());
+    EXPECT_FALSE(l.parseManifestKey("p/cas/manifests/srv-a/3f2e-uuid@cas@/"
+        "0000000000000007-000000000000008E/000042.proto").has_value());   /// uppercase hex
+}
+
+TEST(CasLayout, RefObjectKeyRoundTrips)
+{
+    Layout l("p");
+    const RootNamespace ns{"srv1/tbl@cas@"};
+    const RefTxnId id{7, 0x8e};
+
+    const String log_key = l.refLogKey(ns, id);
+    EXPECT_EQ(log_key, "p/cas/refs/srv1/tbl@cas@/_log/0000000000000007-000000000000008e");
+    const auto parsed_log = l.parseRefObjectKey(log_key);
+    ASSERT_TRUE(parsed_log.has_value());
+    EXPECT_EQ(parsed_log->ns, ns);
+    EXPECT_EQ(parsed_log->kind, RefObjectKind::Log);
+    EXPECT_EQ(parsed_log->txn_id, id);
+
+    const String snap_key = l.refSnapshotKey(ns, id);
+    EXPECT_EQ(snap_key, "p/cas/refs/srv1/tbl@cas@/_snap/0000000000000007-000000000000008e.proto");
+    const auto parsed_snap = l.parseRefObjectKey(snap_key);
+    ASSERT_TRUE(parsed_snap.has_value());
+    EXPECT_EQ(parsed_snap->ns, ns);
+    EXPECT_EQ(parsed_snap->kind, RefObjectKind::Snap);
+    EXPECT_EQ(parsed_snap->txn_id, id);
+
+    const String cleanup_key = l.refCleanupMarkerKey(ns, id);
+    EXPECT_EQ(cleanup_key, "p/cas/refs/srv1/tbl@cas@/_cleanup/0000000000000007-000000000000008e");
+    const auto parsed_cleanup = l.parseRefObjectKey(cleanup_key);
+    ASSERT_TRUE(parsed_cleanup.has_value());
+    EXPECT_EQ(parsed_cleanup->ns, ns);
+    EXPECT_EQ(parsed_cleanup->kind, RefObjectKind::Cleanup);
+    EXPECT_EQ(parsed_cleanup->txn_id, id);
+}
+
+TEST(CasLayout, RefObjectKeyLexicalOrder)
+{
+    Layout l("p");
+    const RootNamespace ns{"srv1/tbl@cas@"};
+    const RefTxnId id{7, 0x8e};
+    /// spec §Object Layout: "`_cleanup` sorts before `_log` ... and takes no part in the `_log`-before-
+    /// `_snap` recovery ordering". Asserted here on the actual generated keys, same namespace + id.
+    EXPECT_LT(l.refCleanupMarkerKey(ns, id), l.refLogKey(ns, id));
+    EXPECT_LT(l.refLogKey(ns, id), l.refSnapshotKey(ns, id));
+}
+
+TEST(CasLayout, ParseRefObjectKeyRejections)
+{
+    Layout l("p");
+    const RootNamespace ns{"srv1/tbl@cas@"};
+    const RefTxnId id{7, 0x8e};
+    const String log_key = l.refLogKey(ns, id);
+    const String snap_key = l.refSnapshotKey(ns, id);
+
+    /// Foreign top-level prefix.
+    EXPECT_FALSE(l.parseRefObjectKey("p/cas/manifests/srv1/tbl@cas@/_log/" + renderRefTxnId(id)).has_value());
+    /// Unknown kind directory (also covers the coexisting old rootShardKey shape, which has none).
+    EXPECT_FALSE(l.parseRefObjectKey("p/cas/refs/srv1/tbl@cas@/_bogus/" + renderRefTxnId(id)).has_value());
+    EXPECT_FALSE(l.parseRefObjectKey(l.rootShardKey(ns, 3)).has_value());
+    /// Uppercase hex and a short id are non-canonical RefTxnId renders.
+    EXPECT_FALSE(l.parseRefObjectKey("p/cas/refs/srv1/tbl@cas@/_log/"
+        "0000000000000007-000000000000008E").has_value());
+    EXPECT_FALSE(l.parseRefObjectKey("p/cas/refs/srv1/tbl@cas@/_log/7-8e").has_value());
+    /// `_snap` without its `.proto` suffix, and WITH a stray suffix, are both rejected.
+    EXPECT_FALSE(l.parseRefObjectKey(snap_key.substr(0, snap_key.size() - String(".proto").size())).has_value());
+    EXPECT_FALSE(l.parseRefObjectKey(log_key + ".proto").has_value());
+    /// `_cleanup`/`_log` ids never carry an extension.
+    EXPECT_FALSE(l.parseRefObjectKey(l.refCleanupMarkerKey(ns, id) + ".bin").has_value());
+    /// Trailing garbage after the id.
+    EXPECT_FALSE(l.parseRefObjectKey(log_key + "/extra").has_value());
+    EXPECT_FALSE(l.parseRefObjectKey(snap_key + "/extra").has_value());
+    /// Missing namespace segment entirely.
+    EXPECT_FALSE(l.parseRefObjectKey("p/cas/refs/_log/" + renderRefTxnId(id)).has_value());
 }

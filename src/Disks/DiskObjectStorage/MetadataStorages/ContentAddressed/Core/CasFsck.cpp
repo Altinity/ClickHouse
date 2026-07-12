@@ -59,45 +59,17 @@ void listAll(Backend & backend, const String & prefix, std::unordered_map<String
         on_progress(phase, out.size(), pages);
 }
 
-/// Parse (writer_epoch, build_sequence) from a manifest object key of the shape
-/// `<manifest-prefix><writer_epoch>/<build_seq>/<ordinal>.proto`. Returns false on a malformed key.
-bool parseBuildPrefix(const String & key, const String & manifests_prefix, BuildPrefix & out)
+/// Parse (writer_epoch, build_sequence) from a manifest object key. Delegates to the one shared
+/// `Layout::parseManifestKey` (spec §Manifest Identifier canonical hex form) instead of hand-rolling a
+/// second parser; returns false on a malformed/foreign key.
+bool parseBuildPrefix(const Layout & layout, const String & key, BuildPrefix & out)
 {
-    if (!key.starts_with(manifests_prefix))
+    const auto parsed = layout.parseManifestKey(key);
+    if (!parsed)
         return false;
-    const String rest = key.substr(manifests_prefix.size());
-    const size_t file_sep = rest.rfind('/');
-    if (file_sep == String::npos)
-        return false;
-    const size_t build_sep = rest.rfind('/', file_sep == 0 ? 0 : file_sep - 1);
-    if (build_sep == String::npos)
-        return false;
-    const size_t writer_sep = rest.rfind('/', build_sep == 0 ? 0 : build_sep - 1);
-    if (writer_sep != String::npos)
-        return false;
-    const String writer_epoch_str = rest.substr(0, build_sep);
-    const String seq_str = rest.substr(build_sep + 1, file_sep - build_sep - 1);
-    const String file = rest.substr(file_sep + 1);
-    if (writer_epoch_str.empty() || seq_str.empty() || file.size() != 12 || !file.ends_with(".proto"))
-        return false;
-    try
-    {
-        size_t consumed = 0;
-        out.writer_epoch = std::stoull(writer_epoch_str, &consumed);
-        if (consumed != writer_epoch_str.size())
-            return false;
-        consumed = 0;
-        out.build_sequence = std::stoull(seq_str, &consumed);
-        if (consumed != seq_str.size())
-            return false;
-        consumed = 0;
-        const uint64_t ordinal = std::stoull(file.substr(0, 6), &consumed);
-        return consumed == 6 && ordinal > 0 && ordinal <= kMaxManifestOrdinal;
-    }
-    catch (...)
-    {
-        return false;
-    }
+    out.writer_epoch = parsed->ref.writer_epoch;
+    out.build_sequence = parsed->ref.build_sequence;
+    return true;
 }
 
 /// B207 fix: the ref-walk (which builds `reachable_blobs`/`blob_labels`) and the HEAD-confirm below
@@ -525,7 +497,7 @@ void runFsckImpl(Store & store, bool detail, const FsckProgress & on_progress, c
             if (detail)
             {
                 BuildPrefix prefix;
-                const bool parsed = parseBuildPrefix(mkey, manifests_prefix, prefix);
+                const bool parsed = parseBuildPrefix(layout, mkey, prefix);
                 FsckObject o;
                 o.key = mkey;
                 o.kind = ObjectKind::Blob;

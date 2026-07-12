@@ -53,56 +53,18 @@ struct ListedManifestObject
     String key;
 };
 
+/// Delegates to the one shared `Layout::parseManifestKey` (spec §Manifest Identifier canonical hex
+/// form) instead of hand-rolling a second parser -- see also `CasFsck.cpp`'s `parseBuildPrefix`, which
+/// now routes through the same function.
 std::optional<ListedManifestObject> parseListedManifestObject(const Layout & layout, const String & key)
 {
-    const String base = layout.casManifestsPrefix();
-    if (!key.starts_with(base))
+    const auto parsed = layout.parseManifestKey(key);
+    if (!parsed)
         return std::nullopt;
-
-    const String rest = key.substr(base.size());
-    const size_t file_sep = rest.rfind('/');
-    if (file_sep == String::npos)
-        return std::nullopt;
-    const size_t build_sep = rest.rfind('/', file_sep == 0 ? 0 : file_sep - 1);
-    if (build_sep == String::npos)
-        return std::nullopt;
-    const size_t writer_sep = rest.rfind('/', build_sep == 0 ? 0 : build_sep - 1);
-    if (writer_sep == String::npos)
-        return std::nullopt;
-
-    const String ns_str = rest.substr(0, writer_sep);
-    const String writer_epoch_str = rest.substr(writer_sep + 1, build_sep - writer_sep - 1);
-    const String seq_str = rest.substr(build_sep + 1, file_sep - build_sep - 1);
-    const String file = rest.substr(file_sep + 1);
-    if (ns_str.empty() || writer_epoch_str.empty() || seq_str.empty() || file.size() != 12 || !file.ends_with(".proto"))
-        return std::nullopt;
-
-    uint64_t writer_epoch = 0;
-    uint64_t build_seq = 0;
-    uint64_t ordinal = 0;
-    try
-    {
-        size_t consumed = 0;
-        writer_epoch = std::stoull(writer_epoch_str, &consumed);
-        if (consumed != writer_epoch_str.size())
-            return std::nullopt;
-        consumed = 0;
-        build_seq = std::stoull(seq_str, &consumed);
-        if (consumed != seq_str.size())
-            return std::nullopt;
-        consumed = 0;
-        ordinal = std::stoull(file.substr(0, 6), &consumed);
-        if (consumed != 6 || ordinal == 0 || ordinal > kMaxManifestOrdinal)
-            return std::nullopt;
-    }
-    catch (...)
-    {
-        return std::nullopt;
-    }
 
     return ListedManifestObject{
-        .ns = RootNamespace{ns_str},
-        .prefix = BuildPrefix{.writer_epoch = writer_epoch, .build_sequence = build_seq},
+        .ns = parsed->root_namespace,
+        .prefix = BuildPrefix{.writer_epoch = parsed->ref.writer_epoch, .build_sequence = parsed->ref.build_sequence},
         .key = key};
 }
 
@@ -227,9 +189,10 @@ void sweepNamespace(Store & store, const RootNamespace & ns, const BuildPrefix &
 
     const std::set<String> active = activeManifestKeys(store, ns);
 
-    /// Enumerate the ONE build prefix: cas/manifests/<ns>/<writer_epoch>/<build_sequence>/.
+    /// Enumerate the ONE build prefix: cas/manifests/<ns>/<epoch-hex>-<seq-hex>/ (spec §Manifest
+    /// Identifier canonical hex form -- same rendering `Layout::manifestKey` uses).
     const String prefix_key = layout.manifestNamespacePrefix(ns)
-        + std::to_string(prefix.writer_epoch) + "/" + std::to_string(prefix.build_sequence) + "/";
+        + renderRefTxnId(RefTxnId{prefix.writer_epoch, prefix.build_sequence}) + "/";
 
     String cursor;
     while (true)

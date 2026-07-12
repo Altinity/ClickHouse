@@ -1994,23 +1994,12 @@ RebuildReport Gc::rebuildBaseline(bool force)
             {
                 if (owned_manifest_keys.contains(k.key))
                     continue;
-                /// Parse <writer_epoch>/<build_seq>/<ordinal>.proto (mirrors fsck's parseBuildPrefix).
-                const String rest = k.key.substr(mprefix.size());
-                const size_t s1 = rest.find('/');
-                const size_t s2 = s1 == String::npos ? String::npos : rest.find('/', s1 + 1);
-                if (s2 == String::npos || !rest.ends_with(".proto"))
+                /// The one shared manifest-path parser (spec §Manifest Identifier canonical hex form),
+                /// also used by fsck's parseBuildPrefix and the orphan sweep's parseListedManifestObject.
+                const auto parsed = layout.parseManifestKey(k.key);
+                if (!parsed)
                     continue;   /// foreign key shape — debris
-                ManifestRef mref;
-                try
-                {
-                    mref.writer_epoch = std::stoull(rest.substr(0, s1));
-                    mref.build_sequence = std::stoull(rest.substr(s1 + 1, s2 - s1 - 1));
-                    mref.manifest_ordinal = static_cast<uint32_t>(std::stoull(rest.substr(s2 + 1)));
-                }
-                catch (...)
-                {
-                    continue;
-                }
+                const ManifestRef & mref = parsed->ref;
                 if (prefixEligible(*store, ns, BuildPrefix{mref.writer_epoch, mref.build_sequence}))
                     continue;   /// provably dead — the orphan sweep's territory, never an edge
                 const ManifestId id{ns, mref};

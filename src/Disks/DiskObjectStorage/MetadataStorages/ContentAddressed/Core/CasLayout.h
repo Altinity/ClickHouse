@@ -3,6 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEnvelope.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestId.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRefIds.h>
 #include <Common/Exception.h>
 #include <base/types.h>
 #include <optional>
@@ -26,6 +27,27 @@ namespace DB::Cas
 /// const reference, so the forward declaration is enough for the header; its definition (which needs
 /// the complete type) lives in `CasBuild.cpp`, where both are already visible.
 struct BlobRef;
+
+/// Which of the three immutable ref-object kinds a `_cleanup`/`_log`/`_snap` key names (spec §Object
+/// Layout). Lexical order of the directory segments matches enum declaration order: `_cleanup` <
+/// `_log` < `_snap`.
+enum class RefObjectKind : uint8_t
+{
+    Cleanup,
+    Log,
+    Snap,
+};
+
+/// The result of `Layout::parseRefObjectKey`: which table (`ns`), which of the three ref-object kinds,
+/// and its `RefTxnId`.
+struct ParsedRefObjectKey
+{
+    RootNamespace ns;
+    RefObjectKind kind;
+    RefTxnId txn_id;
+
+    bool operator==(const ParsedRefObjectKey &) const = default;
+};
 
 /// Pure key-construction functions for a content-addressed pool.
 ///
@@ -103,6 +125,86 @@ public:
         return prefix + "/cas/refs/";
     }
 
+    /// Immutable transaction log object (spec §Object Layout): `<prefix>/cas/refs/<ns>/_log/<render>`.
+    String refLogKey(const RootNamespace & ns, const RefTxnId & id) const
+    {
+        return refsNamespacePrefix(ns) + "_log/" + renderRefTxnId(id);
+    }
+
+    /// Writer-published table snapshot (spec §Object Layout): `.../_snap/<render>.proto`. Snapshot `X`
+    /// reuses the `RefTxnId` of the last log it covers -- it does not allocate its own identifier.
+    String refSnapshotKey(const RootNamespace & ns, const RefTxnId & id) const
+    {
+        return refsNamespacePrefix(ns) + "_snap/" + renderRefTxnId(id) + ".proto";
+    }
+
+    /// Namespace-removal completion marker (spec §Object Layout): a zero-byte object at
+    /// `.../_cleanup/<render>` that GC publishes once the exact removal durably reaches `Completed`.
+    String refCleanupMarkerKey(const RootNamespace & ns, const RefTxnId & id) const
+    {
+        return refsNamespacePrefix(ns) + "_cleanup/" + renderRefTxnId(id);
+    }
+
+    /// Inverse of `refLogKey`/`refSnapshotKey`/`refCleanupMarkerKey`: classifies a LISTED key under
+    /// `casRefsPrefix()` by its kind directory (`_cleanup`, `_log`, `_snap`) and parses the trailing
+    /// `RefTxnId`. Strict: returns `std::nullopt` -- never throws -- for anything that is not one of
+    /// OUR ref-object keys: a foreign top-level prefix, a missing namespace/kind/id segment, an
+    /// unrecognized kind directory (this also excludes the coexisting old `rootShardKey` layout,
+    /// `cas/refs/<ns>/<shard>`, which has no kind directory at all), a `_snap` id missing its `.proto`
+    /// suffix, a `_log`/`_cleanup` id carrying any extension, trailing garbage after the id, or a
+    /// non-canonical `RefTxnId` render (delegates to `parseRefTxnId`).
+    std::optional<ParsedRefObjectKey> parseRefObjectKey(std::string_view key) const
+    {
+        const String base = casRefsPrefix();
+        if (!key.starts_with(base))
+            return std::nullopt;
+        std::string_view rest = key;
+        rest.remove_prefix(base.size());
+
+        const size_t id_sep = rest.rfind('/');
+        if (id_sep == std::string_view::npos)
+            return std::nullopt;
+        std::string_view id_part = rest.substr(id_sep + 1);
+        std::string_view before_id = rest.substr(0, id_sep);
+
+        const size_t kind_sep = before_id.rfind('/');
+        if (kind_sep == std::string_view::npos)
+            return std::nullopt;
+        const std::string_view kind_seg = before_id.substr(kind_sep + 1);
+        const std::string_view ns_part = before_id.substr(0, kind_sep);
+        if (ns_part.empty())
+            return std::nullopt;
+
+        RefObjectKind kind;
+        if (kind_seg == "_cleanup")
+            kind = RefObjectKind::Cleanup;
+        else if (kind_seg == "_log")
+            kind = RefObjectKind::Log;
+        else if (kind_seg == "_snap")
+            kind = RefObjectKind::Snap;
+        else
+            return std::nullopt;
+
+        std::string_view render = id_part;
+        if (kind == RefObjectKind::Snap)
+        {
+            constexpr std::string_view kProtoSuffix = ".proto";
+            if (!render.ends_with(kProtoSuffix))
+                return std::nullopt;
+            render.remove_suffix(kProtoSuffix.size());
+        }
+        else if (render.find('.') != std::string_view::npos)
+        {
+            return std::nullopt;   /// `_log`/`_cleanup` ids never carry an extension
+        }
+
+        const auto txn_id = parseRefTxnId(render);
+        if (!txn_id)
+            return std::nullopt;
+
+        return ParsedRefObjectKey{RootNamespace{String(ns_part)}, kind, *txn_id};
+    }
+
     /// Prefix that covers all part-manifests of a namespace (Phase 1): `<prefix>/cas/manifests/<ns>/`.
     /// Replaces the old `rootNamespacePrefix(ns) + "_manifests/"` enumeration (sweep + fsck).
     String manifestNamespacePrefix(const RootNamespace & ns) const
@@ -140,17 +242,74 @@ public:
         return prefix + "/roots/" + ns.string() + "/_files/";
     }
 
-    /// Part manifest body key (spec §S3 Layout; Phase 3 identity reshape):
-    ///   <prefix>/cas/manifests/<ns>/<writer_epoch>/<build_sequence>/<000001>.proto
-    /// `writer_epoch` is the durable monotone mount epoch; `manifest_ordinal` is a per-build ordinal
-    /// rendered as a six-digit filename. `root_namespace_id` comes from the owning context
-    /// (the `ManifestId`), never from the journal ref.
+    /// Part manifest body key (spec §Manifest Identifier, canonical hex form):
+    ///   <prefix>/cas/manifests/<ns>/<epoch-hex>-<build-seq-hex>/<000001>.proto
+    /// The build-scoped directory reuses `RefTxnId`'s hex rendering for `{writer_epoch,
+    /// build_sequence}` (same durable-epoch fence and hex width as a ref transaction id, per spec --
+    /// a different counter with different semantics, not the same identifier). `manifest_ordinal` is a
+    /// per-build ordinal rendered as a six-digit filename. `root_namespace_id` comes from the owning
+    /// context (the `ManifestId`), never from the journal ref.
     String manifestKey(const ManifestId & id) const
     {
         checkNamespace(id.root_namespace);
         return prefix + "/cas/manifests/" + id.root_namespace.string() + "/"
-             + std::to_string(id.ref.writer_epoch) + "/" + std::to_string(id.ref.build_sequence) + "/"
+             + renderRefTxnId(RefTxnId{id.ref.writer_epoch, id.ref.build_sequence}) + "/"
              + manifestOrdinalFileName(id.ref.manifest_ordinal);
+    }
+
+    /// Inverse of `manifestKey`: parses `<prefix>/cas/manifests/<ns>/<epoch-hex>-<seq-hex>/<NNNNNN>.proto`.
+    /// Strict: rejects the old decimal directory shape (it is not two fixed-width hex fields joined by
+    /// '-'), a missing namespace/build/ordinal segment, trailing garbage, a non-`.proto` or wrong-width
+    /// ordinal file, and an out-of-range or non-canonical ordinal. Foreign/malformed keys return
+    /// `std::nullopt`, never throw -- LIST sweep / fsck classify by key shape, not by validity. All
+    /// manifest-path parsing (sweep, fsck) routes through this one function.
+    std::optional<ManifestId> parseManifestKey(std::string_view key) const
+    {
+        const String base = casManifestsPrefix();
+        if (!key.starts_with(base))
+            return std::nullopt;
+        std::string_view rest = key;
+        rest.remove_prefix(base.size());
+
+        const size_t file_sep = rest.rfind('/');
+        if (file_sep == std::string_view::npos)
+            return std::nullopt;
+        const std::string_view file = rest.substr(file_sep + 1);
+        const std::string_view before_file = rest.substr(0, file_sep);
+
+        const size_t build_sep = before_file.rfind('/');
+        if (build_sep == std::string_view::npos)
+            return std::nullopt;
+        const std::string_view build_seg = before_file.substr(build_sep + 1);
+        const std::string_view ns_part = before_file.substr(0, build_sep);
+        if (ns_part.empty())
+            return std::nullopt;
+
+        const auto build = parseRefTxnId(build_seg);
+        if (!build)
+            return std::nullopt;
+
+        constexpr std::string_view kProtoSuffix = ".proto";
+        constexpr size_t kOrdinalDigits = 6;
+        if (file.size() != kOrdinalDigits + kProtoSuffix.size() || !file.ends_with(kProtoSuffix))
+            return std::nullopt;
+        const std::string_view ordinal_str = file.substr(0, kOrdinalDigits);
+        uint32_t ordinal = 0;
+        for (char c : ordinal_str)
+        {
+            if (c < '0' || c > '9')
+                return std::nullopt;
+            ordinal = ordinal * 10 + static_cast<uint32_t>(c - '0');
+        }
+        if (ordinal == 0 || ordinal > kMaxManifestOrdinal)
+            return std::nullopt;
+
+        ManifestId parsed;
+        parsed.root_namespace = RootNamespace{String(ns_part)};
+        parsed.ref.writer_epoch = build->writer_epoch;
+        parsed.ref.build_sequence = build->ref_sequence;
+        parsed.ref.manifest_ordinal = ordinal;
+        return parsed;
     }
 
     /// A PLAIN mountpoint object (design §5.2): a loose, non-content-addressed file mirrored at its
