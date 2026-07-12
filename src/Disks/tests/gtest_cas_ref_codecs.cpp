@@ -1060,3 +1060,108 @@ TEST(CasRefSnapshotCodec, EncodeAllowsExactlySnapshotMaxBytes)
     const RefTableSnapshot decoded = decodeRefTableSnapshot(bytes, s.ns, s.snapshot_id);
     EXPECT_EQ(decoded, s);
 }
+
+/// ===================================================================================
+/// Review follow-up (T7 review): ManifestRef field validation, retrofitted into the LOG codec
+/// (previously only enforced by the SNAPSHOT codec -- ManifestRef{0,0,0} round-tripped cleanly
+/// through RefLogTxn even though the spec's "invalid identifiers are rejected" binds both).
+/// ===================================================================================
+
+TEST(CasRefCodec, EncodeRejectsZeroManifestRefWriterEpochInOwnerBinding)
+{
+    RefLogTxn txn;
+    txn.ns = "ns";
+    txn.txn_id = RefTxnId{1, 1};
+    RefOp op;
+    op.kind = RefOpKind::OwnerTransition;
+    op.new_binding = RefOwnerBinding{RefOwnerKind::Precommit, "r", manifestRef(0, 1, 1)};
+    txn.ops.push_back(op);
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(txn); });
+}
+
+TEST(CasRefCodec, EncodeRejectsZeroManifestRefBuildSequenceInOwnerBinding)
+{
+    RefLogTxn txn;
+    txn.ns = "ns";
+    txn.txn_id = RefTxnId{1, 1};
+    RefOp op;
+    op.kind = RefOpKind::OwnerTransition;
+    op.new_binding = RefOwnerBinding{RefOwnerKind::Precommit, "r", manifestRef(1, 0, 1)};
+    txn.ops.push_back(op);
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(txn); });
+}
+
+TEST(CasRefCodec, EncodeRejectsOutOfRangeManifestOrdinalInOwnerBinding)
+{
+    RefLogTxn txn;
+    txn.ns = "ns";
+    txn.txn_id = RefTxnId{1, 1};
+    RefOp op;
+    op.kind = RefOpKind::OwnerTransition;
+    op.new_binding = RefOwnerBinding{RefOwnerKind::Precommit, "r", manifestRef(1, 1, 0)};
+    txn.ops.push_back(op);
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(txn); });
+}
+
+TEST(CasRefCodec, EncodeRejectsZeroManifestRefInSetPayload)
+{
+    RefLogTxn txn;
+    txn.ns = "ns";
+    txn.txn_id = RefTxnId{1, 1};
+    RefOp op;
+    op.kind = RefOpKind::SetPayload;
+    op.ref_name = "r";
+    op.expected_manifest_ref = manifestRef(1, 1, 0);
+    txn.ops.push_back(op);
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(txn); });
+}
+
+TEST(CasRefCodec, DecodeRejectsZeroManifestRefInOwnerBinding)
+{
+    RefLogTxn txn;
+    txn.ns = "ns";
+    txn.txn_id = RefTxnId{1, 1};
+    RefOp op;
+    op.kind = RefOpKind::OwnerTransition;
+    op.new_binding = RefOwnerBinding{RefOwnerKind::Precommit, "r", manifestRef(1, 1, 1)};
+    txn.ops.push_back(op);
+    String bytes = encodeRefLogTxn(txn);
+
+    /// Layout up to the binding's manifest_ref: u32 ver | u32 ns_len | ns bytes | u64 epoch | u64 seq |
+    /// u32 op_count | u8 kind | u8 has_old(0) | u8 has_new(1) | u8 owner_kind | u32 name_len | name
+    /// bytes | u64 m_epoch. Zero the single nonzero byte of m_epoch (LE, value 1) in place.
+    const size_t m_epoch_offset = 4 + 4 + txn.ns.size() + 8 + 8 + 4 + 1 + 1 + 1 + 1 + 4 + 1;
+    ASSERT_EQ(static_cast<uint8_t>(bytes[m_epoch_offset]), 1);
+    bytes[m_epoch_offset] = 0;
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefLogTxn(bytes, txn.ns, txn.txn_id); });
+}
+
+TEST(CasRefCodec, DecodeRejectsZeroManifestRefInSetPayload)
+{
+    RefLogTxn txn;
+    txn.ns = "ns";
+    txn.txn_id = RefTxnId{1, 1};
+    RefOp op;
+    op.kind = RefOpKind::SetPayload;
+    op.ref_name = "r";
+    op.expected_manifest_ref = manifestRef(1, 1, 1);
+    txn.ops.push_back(op);
+    String bytes = encodeRefLogTxn(txn);
+
+    /// Layout up to the manifest_ref: u32 ver | u32 ns_len | ns bytes | u64 epoch | u64 seq |
+    /// u32 op_count | u8 kind | u32 name_len | name bytes | u64 m_epoch.
+    const size_t m_epoch_offset = 4 + 4 + txn.ns.size() + 8 + 8 + 4 + 1 + 4 + 1;
+    ASSERT_EQ(static_cast<uint8_t>(bytes[m_epoch_offset]), 1);
+    bytes[m_epoch_offset] = 0;
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeRefLogTxn(bytes, txn.ns, txn.txn_id); });
+}
+
+TEST(CasRefSnapshotCodec, DecodeRejectsOversizedBufferDirectly)
+{
+    /// Drives the early `data.size() > ref_snapshot_max_bytes` guard directly, before any parsing --
+    /// previously only the encoder-side oversize path (a real, structurally valid over-budget object)
+    /// was exercised.
+    const String oversized(ref_snapshot_max_bytes + 1, 'x');
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { decodeRefTableSnapshot(oversized, "ns", RefTxnId{1, 1}); });
+}

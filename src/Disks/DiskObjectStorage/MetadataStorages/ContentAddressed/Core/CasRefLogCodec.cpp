@@ -32,6 +32,15 @@ void checkRefName(std::string_view name, std::string_view what)
     checkCanonicalRefName(name, "RefLogTxn", what);
 }
 
+/// `ManifestRef` field validity: shared with `CasRefSnapshotCodec` via `CasCodecUtil.h`'s
+/// `checkManifestRef` rather than duplicated per codec. Covers both `RefOwnerBinding.manifest_ref`
+/// (via `writeBinding`/`readBinding`) and `RefOp.expected_manifest_ref` (via the `SetPayload` branch
+/// of `writeOp`/`readOp`) -- every `ManifestRef` this codec touches.
+void checkManifestRef(const ManifestRef & ref, std::string_view what)
+{
+    DB::Cas::checkManifestRef(ref, "RefLogTxn", what);
+}
+
 void writeManifestRef(WriteBuffer & out, const ManifestRef & ref)
 {
     writeBinaryLittleEndian(ref.writer_epoch, out);
@@ -68,6 +77,7 @@ String readLenPrefixed(ReadBuffer & in)
 void writeBinding(WriteBuffer & out, const RefOwnerBinding & b)
 {
     checkRefName(b.ref_name, "owner binding ref_name");
+    checkManifestRef(b.manifest_ref, "owner binding manifest_ref");
     writeBinaryLittleEndian(static_cast<uint8_t>(b.kind), out);
     writeLenPrefixed(out, b.ref_name);
     writeManifestRef(out, b.manifest_ref);
@@ -85,6 +95,7 @@ RefOwnerBinding readBinding(ReadBuffer & in)
     b.ref_name = readLenPrefixed(in);
     checkRefName(b.ref_name, "owner binding ref_name");
     b.manifest_ref = readManifestRef(in);
+    checkManifestRef(b.manifest_ref, "owner binding manifest_ref");
     return b;
 }
 
@@ -106,6 +117,7 @@ void writeOp(WriteBuffer & out, const RefOp & op)
             return;
         case RefOpKind::SetPayload:
             checkRefName(op.ref_name, "set_payload ref_name");
+            checkManifestRef(op.expected_manifest_ref, "set_payload manifest_ref");
             writeLenPrefixed(out, op.ref_name);
             writeManifestRef(out, op.expected_manifest_ref);
             writeLenPrefixed(out, op.payload);
@@ -148,6 +160,7 @@ RefOp readOp(ReadBuffer & in)
             op.ref_name = readLenPrefixed(in);
             checkRefName(op.ref_name, "set_payload ref_name");
             op.expected_manifest_ref = readManifestRef(in);
+            checkManifestRef(op.expected_manifest_ref, "set_payload manifest_ref");
             op.payload = readLenPrefixed(in);
             readBinaryLittleEndian(op.published_at_ms, in);
             break;

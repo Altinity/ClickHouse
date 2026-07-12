@@ -34,17 +34,11 @@ void checkRefName(std::string_view name, std::string_view what)
     checkCanonicalRefName(name, "RefTableSnapshot", what);
 }
 
-/// `writer_epoch`/`build_sequence` nonzero, `manifest_ordinal` in `[1, kMaxManifestOrdinal]` -- the
-/// same range `manifestOrdinalFileName` (`CasManifestId.h`) enforces at key-construction time.
+/// `ManifestRef` field validity: shared with `CasRefLogCodec` via `CasCodecUtil.h`'s
+/// `checkManifestRef` rather than duplicated per codec.
 void checkManifestRef(const ManifestRef & ref, std::string_view what)
 {
-    if (ref.writer_epoch == 0 || ref.build_sequence == 0)
-        throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "RefTableSnapshot: {} manifest_ref writer_epoch/build_sequence must both be nonzero, got {}-{}",
-            what, ref.writer_epoch, ref.build_sequence);
-    if (ref.manifest_ordinal == 0 || ref.manifest_ordinal > kMaxManifestOrdinal)
-        throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "RefTableSnapshot: {} manifest_ref manifest_ordinal {} out of range", what, ref.manifest_ordinal);
+    DB::Cas::checkManifestRef(ref, "RefTableSnapshot", what);
 }
 
 void checkTxnIdNonzero(const RefTxnId & id, std::string_view what)

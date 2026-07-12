@@ -1,5 +1,6 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestId.h>
 #include <IO/ReadBuffer.h>
 #include <IO/ReadHelpers.h>
 #include <IO/WriteHelpers.h>
@@ -125,6 +126,22 @@ inline void checkCanonicalRefName(std::string_view name, std::string_view caller
     if (!isCanonicalRefName(name))
         throw Exception(ErrorCodes::CORRUPTED_DATA,
             "{}: {} is not a canonical clean relative path: '{}'", caller, what, name);
+}
+
+/// `ManifestRef` field validity, shared by every codec that embeds one (`CasRefLogCodec`,
+/// `CasRefSnapshotCodec`): `writer_epoch`/`build_sequence` nonzero, `manifest_ordinal` in
+/// `[1, kMaxManifestOrdinal]` -- the same range `manifestOrdinalFileName` (`CasManifestId.h`) enforces
+/// at key-construction time. Throws CORRUPTED_DATA naming both `caller` (the codec) and `what` (the
+/// field, e.g. "set_payload manifest_ref").
+inline void checkManifestRef(const ManifestRef & ref, std::string_view caller, std::string_view what)
+{
+    if (ref.writer_epoch == 0 || ref.build_sequence == 0)
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "{}: {} manifest_ref writer_epoch/build_sequence must both be nonzero, got {}-{}",
+            caller, what, ref.writer_epoch, ref.build_sequence);
+    if (ref.manifest_ordinal == 0 || ref.manifest_ordinal > kMaxManifestOrdinal)
+        throw Exception(ErrorCodes::CORRUPTED_DATA,
+            "{}: {} manifest_ref manifest_ordinal {} out of range", caller, what, ref.manifest_ordinal);
 }
 
 }
