@@ -928,30 +928,41 @@ void Build::precommitAdd(const RootNamespace & target_ns, const String & final_r
             "precommitAdd: manifest namespace '{}' != target namespace '{}'",
             id.root_namespace.string(), target_ns.string());
 
-    /// ONE CAS on the TARGET shard (shardOf(final_ref_name)): append a create-precommit RootOwnerEvent
-    /// {old=none, new={Precommit, final_ref_name, build_id, id.ref}} to the single ordered journal. No body
-    /// HEAD — a missing body is a legal fail-closed, non-activating intent (spec §Precommit Add).
-    /// Task 2: pass the build's own (writer_epoch, build_seq) as the birth incarnation. On the
-    /// create-if-absent path (shard doesn't exist yet) mutateShard stamps root.incarnation before
-    /// the journal append; on subsequent calls the stamp is skipped (shard already present).
-    /// Task 5: lazily read the current GC round — only on the NEWBORN create-if-absent branch.
-    /// On the common existing-shard path `mutateShard` never invokes the provider, so ZERO extra
-    /// S3 round-trips are incurred. `currentGcRound` does a `gc/state` GET; hoisting it here (eager)
-    /// would waste one GET per publish on every existing shard, which matters for S3 budget.
-    /// `birth_incarnation` stays eager (reads only Build members, no S3 — do not change).
-    store->mutateShard(target_ns, store->shardOf(final_ref_name), MutationScope::ref(final_ref_name), [&](RootShard & root)
-    {
-        root.journal.push_back(RootOwnerEvent{
-            .transition_version = root.shard_version + 1,
-            .old_binding = std::nullopt,
-            .new_binding = OwnerBinding{
-                .owner_kind = OwnerKind::Precommit,
-                .ref_name = final_ref_name,
-                .build_id = build_id,
-                .manifest_ref = id.ref}});
-    }, nullptr, RootMutationOrigin::Writer, RootMutationKind::Precommit,
-    ShardIncarnation{.writer_epoch = epoch, .build_sequence = build_seq},
-    [this] { return store->currentGcRound(); });
+    /// Task 10 (spec §Add Precommit / §Namespace Birth): one `owner_transition` create-precommit op.
+    /// No body HEAD — a missing body is a legal fail-closed, non-activating intent, unchanged from the
+    /// old protocol. Unlike the old RootShard model, precommit ownership carries NO separate build
+    /// token: `id.ref` (writer_epoch, build_sequence, manifest_ordinal) IS the build identity (spec
+    /// §Transaction Log Format: "there is no second build token"). `build_ops` is invoked from inside
+    /// the per-namespace flush, so it sees the table's CURRENT state including any earlier item of the
+    /// same batch; when that state is not `Live` (never born, or `Removed`), it prepends
+    /// `namespace_birth` in the SAME transaction (spec §Namespace Birth: "The birth transaction
+    /// normally also adds the first precommit").
+    store->appendRefOps(target_ns, MutationScope::ref(final_ref_name),
+        [&](const RefTableState & state) -> std::vector<RefOp>
+        {
+            /// Idempotent re-add: the target ref is ALREADY committed to this EXACT manifest_ref (a
+            /// legitimate re-drive calling precommitAdd+promote again for content that is already
+            /// live -- see `promote`'s matching no-op guard). Nothing to append: re-adding a precommit
+            /// for an already-owned manifest would violate "no conflicting owner may name the same
+            /// manifest" (spec §Add Precommit), which the state machine enforces for every OTHER case.
+            if (const auto it = state.committed.find(final_ref_name);
+                it != state.committed.end() && it->second.manifest_ref == id.ref)
+                return {};
+
+            std::vector<RefOp> ops;
+            if (state.lifecycle != RefLifecycle::Live)
+            {
+                RefOp birth;
+                birth.kind = RefOpKind::NamespaceBirth;
+                ops.push_back(birth);
+            }
+            RefOp add;
+            add.kind = RefOpKind::OwnerTransition;
+            add.new_binding = RefOwnerBinding{RefOwnerKind::Precommit, final_ref_name, id.ref};
+            ops.push_back(add);
+            return ops;
+        },
+        RootMutationOrigin::Writer, RootMutationKind::Precommit);
 
     precommit_target_ns = target_ns;
     precommit_final_ref = final_ref_name;
@@ -994,141 +1005,125 @@ void Build::promote(const RootNamespace & target_ns, const String & final_ref_na
 
     /// D3 (spec 2026-07-09-cas-writer-gc-simplification): the copy-forward pre-pass is removed — the
     /// in-closure blob revalidation below is now the SINGLE copy-forward site. Trade-off: the rare
-    /// condemned-tokenless copy-forward (a GET+PUT) now runs inside the shard CAS closure, briefly
-    /// blocking the flat-combining queue; it is idempotent under CAS retry (a re-run sees its own fresh
-    /// token). Accepted — Phase B replaces the heavy body-dance with a meta CAS anyway.
+    /// condemned-tokenless copy-forward (a GET+PUT) now runs inside the append lane's flush, briefly
+    /// blocking the per-namespace batching queue; it is idempotent under a re-run (a retry sees its own
+    /// fresh token). Accepted — Phase B replaces the heavy body-dance with a meta CAS anyway.
 
-    /// The OwnerBinding that the create-precommit event installed (precommitAdd). The promote is a pure
-    /// owner MOVE off EXACTLY this binding (spec §Promote Precommit step 5; TLA+ `WPromote` old-binding).
-    const OwnerBinding expected_precommit{
-        .owner_kind = OwnerKind::Precommit, .ref_name = final_ref_name,
-        .build_id = promote_build_id, .manifest_ref = id.ref};
-
-    store->mutateShard(target_ns, store->shardOf(final_ref_name), MutationScope::ref(final_ref_name), [&](RootShard & root)
-    {
-        /// NO writer-side view refresh here (spec 2026-07-09-cas-writer-gc-simplification D5, TLA+
-        /// Gate A): promote-time view freshness is not load-bearing — tokened leaves are edge-protected
-        /// (EDGE-BEFORE-OBSERVE) and the tokenless K3 gate below reads the live view, which the floor
-        /// guarantees contains every graduated entry (in EVERY view >= condemn round + 1). The shard's
-        /// fence_round itself (the newborn birth floor, THM-NO-RETURN) and all GC-side uses stay.
-
-        /// BUG 1 / TLA+ `WPromote` guard (`owner[m] = bld`): a promote is a PURE owner MOVE that emits NO
-        /// blob delta (Δ=0) — it restores no blob in-degree. It is therefore only sound when the precommit
-        /// is STILL the live owner of the ref: if an abandon or GC reclaim already appended a REMOVAL of
-        /// the precommit binding, the blobs' in-degree was already decremented and a Δ=0 move would
-        /// re-publish a committed ref over to-be-deleted blobs ⇒ a dangling committed manifest
-        /// (INV_NO_DANGLE).
-        ///
-        /// The ref's owner state is the model's `owner[m]`; the converged model keeps a precommit owner
-        /// ONLY in the root journal (precommitAdd appends the create-precommit event; it never touches
-        /// `root.refs`). A removal of a precommit is a `new_binding = none` event whose `old_binding`
-        /// names EXACTLY that precommit binding (the encoding shared by `Build::abandon`,
-        /// `Store::dropRef`, and `Gc::reclaimAbandonedPrecommit`). We replay the shard journal exactly as
-        /// the GC fold dispatches it — `old_binding` removes a live binding, `new_binding` installs one —
-        /// to see whether the precommit binding is removed. The create-precommit `new_binding` may already
-        /// be TRIMMED below the sealed fold cursor once GC has activated it (a trimmed-but-still-live
-        /// precommit); a removal event, by contrast, is what makes the precommit no longer the owner. So
-        /// the precommit is the live owner iff replaying the journal does NOT leave the binding removed:
-        /// either it is present in the (untrimmed) live set, or it was trimmed away and no later removal
-        /// for it appears. Any removal of EXACTLY this precommit binding ⇒ fail closed (ABORTED): the
-        /// build must restart.
-        std::vector<OwnerBinding> live;
-        for (const RootOwnerEvent & e : root.journal)
+    store->appendRefOps(target_ns, MutationScope::ref(final_ref_name),
+        [&](const RefTableState & state) -> std::vector<RefOp>
         {
-            if (e.old_binding)
-                std::erase(live, *e.old_binding);
-            if (e.new_binding)
-                live.push_back(*e.new_binding);
-        }
-        const bool present_in_live = std::find(live.begin(), live.end(), expected_precommit) != live.end();
-        /// A removal of EXACTLY this precommit binding (old = precommit, new = none) anywhere in the
-        /// (untrimmed) journal means it stopped being the owner; only a later re-add (present_in_live)
-        /// restores it.
-        bool seen_removal = false;
-        for (const RootOwnerEvent & e : root.journal)
-            if (!e.new_binding && e.old_binding && *e.old_binding == expected_precommit)
-                seen_removal = true;
-        if (seen_removal && !present_in_live)
-            throw Exception(ErrorCodes::ABORTED,
-                "promote: precommit owner binding for ref '{}' (build {}) was removed (abandon or GC "
-                "reclaim) and is no longer the live owner — failing closed; the build must restart "
-                "(WPromote owner==bld)",
-                final_ref_name, u128ToHex(promote_build_id));
+            /// Idempotent re-promote: the target ref is ALREADY committed to this EXACT manifest_ref --
+            /// a legitimate re-drive (a crash/retry between a prior promote and its caller's own
+            /// follow-up, or a direct repeat call) that must complete as a no-op, not require a live
+            /// precommit that a first successful call already consumed. Mirrors precommitAdd's matching
+            /// guard; the DIFFERENT-manifest case below remains the BUG-1a fail-closed leak guard.
+            if (const auto it = state.committed.find(final_ref_name);
+                it != state.committed.end() && it->second.manifest_ref == id.ref)
+                return {};
 
-        /// Blob-leaf revalidation (spec 2026-07-09-cas-writer-gc-simplification, Phase A): TOKENED leaves
-        /// are edge-protected — EDGE-BEFORE-OBSERVE: the precommit closure was durable BEFORE putBlob
-        /// observed them, so a condemnation in the putBlob→promote window cannot graduate (the next fold
-        /// sees the edge, d >= 1, spared), and putBlob's gate already validated them against the installed
-        /// view under that edge. They are NOT re-checked here. Every NON-tokened leaf (a tokenless
-        /// W-EVIDENCE adopt — observation-free by design, B188 — or a no-dep staging bug) gets the single
-        /// mandatory presence observation: absent => fail closed; condemned-present + copy-forwardable =>
-        /// verified copy-forward (the INV-1 exception); condemned + no-dep => fail closed.
-        for (const ManifestEntry & e : body.entries)
-        {
-            if (e.placement != EntryPlacement::Blob)
-                continue;
-            if (depIsTokened(e.ref))
-                continue;   /// edge-protected (EDGE-BEFORE-OBSERVE); putBlob validated under the durable edge
-            const String blob_key = store->layout().blobKey(e.ref);
-            constexpr int max_reval_attempts = 8;
-            bool validated = false;
-            for (int attempt = 0; attempt < max_reval_attempts; ++attempt)
-            {
-                const HeadResult hr = store->backend().head(blob_key);
-                if (!hr.exists)
-                    throw Exception(ErrorCodes::ABORTED,
-                        "promote: blob {} absent at commit revalidation — failing closed", blob_key);
-                /// Task 4 (spec §meta-protocols v3): the condemned decision is now a per-hash META
-                /// POINT-READ, not the writer-side RetireView — mirrors Task 3's putBlob/uploadFromSource
-                /// re-sourcing. An absent meta reads as "not condemned" (same convention as the writer gate).
-                const auto lm = loadMeta(store->backend(), store->layout(), e.ref);
-                const bool condemned = lm && lm->meta.state == MetaState::Condemned;
-                if (condemned)
-                {
-                    if (!isCopyForwardableTokenless(e.ref))
-                        throw Exception(ErrorCodes::ABORTED,
-                            "promote: blob {} condemned at commit revalidation — failing closed (INV-1)", blob_key);
-                    copyForwardFromCondemned(e.ref, blob_key, hr);
-                    continue;
-                }
-                validated = true;
-                break;
-            }
-            if (!validated)
+            /// NO writer-side view refresh here (spec 2026-07-09-cas-writer-gc-simplification D5, TLA+
+            /// Gate A): promote-time view freshness is not load-bearing — tokened leaves are edge-protected
+            /// (EDGE-BEFORE-OBSERVE) and the tokenless K3 gate below reads the live view, which the floor
+            /// guarantees contains every graduated entry (in EVERY view >= condemn round + 1).
+
+            /// BUG 1 / TLA+ `WPromote` guard (`owner[m] = bld`): a promote is a PURE owner MOVE that emits
+            /// NO blob delta (Δ=0) — it restores no blob in-degree. It is therefore only sound when the
+            /// precommit is STILL the live owner of the ref: if an abandon or GC reclaim already appended
+            /// a removal of the precommit binding, the blobs' in-degree was already decremented and a Δ=0
+            /// move would re-publish a committed ref over to-be-deleted blobs ⇒ a dangling committed
+            /// manifest (INV_NO_DANGLE). Unlike the old RootShard journal (which had to be REPLAYED to
+            /// infer live ownership because it kept no materialized owner set), `RefTableState.precommits`
+            /// materializes exactly this: `id.ref` alone identifies the build (spec: "there is no second
+            /// build token"), so an exact-binding lookup answers the same question directly.
+            if (!state.precommits.contains({final_ref_name, id.ref}))
                 throw Exception(ErrorCodes::ABORTED,
-                    "promote: blob {} still condemned after {} copy-forward attempts at commit revalidation — "
-                    "failing closed (INV-1)", blob_key, max_reval_attempts);
-        }
+                    "promote: precommit owner binding for ref '{}' (build {}) was removed (abandon or GC "
+                    "reclaim) and is no longer the live owner — failing closed; the build must restart "
+                    "(WPromote owner==bld)",
+                    final_ref_name, u128ToHex(promote_build_id));
 
-        /// Promotion is a PURE OWNER MOVE (spec rev. 15 §Promote Precommit): append ONE RootOwnerEvent
-        /// whose old_binding and new_binding name the SAME manifest_ref T, moving ownership from
-        /// precommit(build_id) to committed(final_ref_name). It emits NO blob deltas. The activating +
-        /// edges came from GC's barrier-activation of the create-precommit event (the fold barrier
-        /// guarantees that event is folded — body present ⇒ activated — before this promote is folded).
-        const uint64_t v = root.shard_version + 1;
-        root.journal.push_back(RootOwnerEvent{
-            .transition_version = v,
-            .old_binding = OwnerBinding{
-                .owner_kind = OwnerKind::Precommit, .ref_name = final_ref_name,
-                .build_id = promote_build_id, .manifest_ref = id.ref},
-            .new_binding = OwnerBinding{
-                .owner_kind = OwnerKind::Committed, .ref_name = final_ref_name,
-                .build_id = UInt128(0), .manifest_ref = id.ref}});
-        /// BUG 1a: refuse to overwrite a live committed ref that already names a DIFFERENT manifest — that
-        /// would orphan the old manifest (its owner-removal `-1` is never emitted). This enforces the
-        /// model's `RefFreeFor` guard (WPromote requires it). A re-promote of the SAME manifest_ref is
-        /// idempotent and allowed. Fail-closed with ABORTED (not LOGICAL_ERROR): a conflicting durable
-        /// state the caller handles (republishRef is made idempotent so its legitimate re-drive skips
-        /// promote entirely), never a must-not-happen invariant.
-        if (const auto it = root.refs.find(final_ref_name);
-            it != root.refs.end() && it->second.manifest_ref != id.ref)
-            throw Exception(ErrorCodes::ABORTED,
-                "promote: ref '{}' already names a different committed manifest — refusing to overwrite "
-                "(unique-ref invariant; use republishRef for an intended repoint)", final_ref_name);
-        root.refs[final_ref_name] = RootRef{
-            .ref_name = final_ref_name, .manifest_ref = id.ref,
-            .mutable_files = pending_mutable_files, .published_at_ms = nowMs()};
-    }, nullptr, RootMutationOrigin::Writer, RootMutationKind::Promote);
+            /// Blob-leaf revalidation (spec 2026-07-09-cas-writer-gc-simplification, Phase A): TOKENED
+            /// leaves are edge-protected — EDGE-BEFORE-OBSERVE: the precommit closure was durable BEFORE
+            /// putBlob observed them, so a condemnation in the putBlob→promote window cannot graduate (the
+            /// next fold sees the edge, d >= 1, spared), and putBlob's gate already validated them against
+            /// the installed view under that edge. They are NOT re-checked here. Every NON-tokened leaf (a
+            /// tokenless W-EVIDENCE adopt — observation-free by design, B188 — or a no-dep staging bug)
+            /// gets the single mandatory presence observation: absent => fail closed; condemned-present +
+            /// copy-forwardable => verified copy-forward (the INV-1 exception); condemned + no-dep => fail
+            /// closed.
+            for (const ManifestEntry & e : body.entries)
+            {
+                if (e.placement != EntryPlacement::Blob)
+                    continue;
+                if (depIsTokened(e.ref))
+                    continue;   /// edge-protected (EDGE-BEFORE-OBSERVE); putBlob validated under the durable edge
+                const String blob_key = store->layout().blobKey(e.ref);
+                constexpr int max_reval_attempts = 8;
+                bool validated = false;
+                for (int attempt = 0; attempt < max_reval_attempts; ++attempt)
+                {
+                    const HeadResult hr = store->backend().head(blob_key);
+                    if (!hr.exists)
+                        throw Exception(ErrorCodes::ABORTED,
+                            "promote: blob {} absent at commit revalidation — failing closed", blob_key);
+                    /// Task 4 (spec §meta-protocols v3): the condemned decision is now a per-hash META
+                    /// POINT-READ, not the writer-side RetireView — mirrors Task 3's putBlob/uploadFromSource
+                    /// re-sourcing. An absent meta reads as "not condemned" (same convention as the writer gate).
+                    const auto lm = loadMeta(store->backend(), store->layout(), e.ref);
+                    const bool condemned = lm && lm->meta.state == MetaState::Condemned;
+                    if (condemned)
+                    {
+                        if (!isCopyForwardableTokenless(e.ref))
+                            throw Exception(ErrorCodes::ABORTED,
+                                "promote: blob {} condemned at commit revalidation — failing closed (INV-1)", blob_key);
+                        copyForwardFromCondemned(e.ref, blob_key, hr);
+                        continue;
+                    }
+                    validated = true;
+                    break;
+                }
+                if (!validated)
+                    throw Exception(ErrorCodes::ABORTED,
+                        "promote: blob {} still condemned after {} copy-forward attempts at commit revalidation — "
+                        "failing closed (INV-1)", blob_key, max_reval_attempts);
+            }
+
+            /// BUG 1a: refuse to overwrite a live committed ref that already names a DIFFERENT manifest —
+            /// that would orphan the old manifest (its owner-removal `-1` is never emitted). This enforces
+            /// the model's `RefFreeFor` guard (WPromote requires it). A re-promote of the SAME manifest_ref
+            /// is idempotent and allowed (the state machine's own promote precondition below would reject
+            /// it as "precommit absent" anyway once idempotent republish skips this call — see
+            /// `republishRef`). Fail-closed with ABORTED (not LOGICAL_ERROR): a conflicting durable state
+            /// the caller handles, never a must-not-happen invariant.
+            if (const auto it = state.committed.find(final_ref_name);
+                it != state.committed.end() && !(it->second.manifest_ref == id.ref))
+                throw Exception(ErrorCodes::ABORTED,
+                    "promote: ref '{}' already names a different committed manifest — refusing to overwrite "
+                    "(unique-ref invariant; use republishRef for an intended repoint)", final_ref_name);
+
+            /// Promotion is a PURE OWNER MOVE (spec §Promote): the SAME manifest_ref T moves from
+            /// precommit to committed in one atomic transaction, together with the SetPayload op that
+            /// installs the initial mutable payload (spec: "the initial payload arrives via a separate
+            /// set_payload op, in the same transaction or a later one" -- here, the same one). It emits NO
+            /// blob deltas; the activating `+1` came from GC's barrier-activation of the create-precommit
+            /// op (Task 12).
+            std::vector<RefOp> ops;
+            RefOp transition;
+            transition.kind = RefOpKind::OwnerTransition;
+            transition.old_binding = RefOwnerBinding{RefOwnerKind::Precommit, final_ref_name, id.ref};
+            transition.new_binding = RefOwnerBinding{RefOwnerKind::Committed, final_ref_name, id.ref};
+            ops.push_back(transition);
+
+            RefOp payload_op;
+            payload_op.kind = RefOpKind::SetPayload;
+            payload_op.ref_name = final_ref_name;
+            payload_op.expected_manifest_ref = id.ref;
+            payload_op.payload = encodeMutableFilesPayload(pending_mutable_files);
+            payload_op.published_at_ms = nowMs();
+            ops.push_back(payload_op);
+            return ops;
+        },
+        RootMutationOrigin::Writer, RootMutationKind::Promote);
 
     precommitted = false;
     store->retireBuildSeq(build_seq);
@@ -1151,28 +1146,27 @@ void Build::abandon()
     alive = false;
 
     /// BUG 2 / TLA+ `WAbandonPrecommit`: if this build made a manifest a LIVE precommit owner input
-    /// (`precommitAdd` ran), abandoning it must NOT writer-delete that body. Instead append a precommit
-    /// REMOVAL event into the target shard, mirroring EXACTLY the removal encoding used by `Store::dropRef`
-    /// and `Gc::reclaimAbandonedPrecommit` (old = the precommit binding, new = none). GC then folds the
-    /// `-1` blob decrements and deletes the body only after they are sealed
-    /// (delete-after-sealed-decrements). Deleting a live precommit body here would strand GC's fold
-    /// barrier (live precommit, missing body → clamp forever) or lose the activating `+1`. This is the
-    /// correctness-bearing step of abandon, so it runs through `mutateShard` (reliable CAS), not
-    /// best-effort. It precedes the best-effort debris deletion below so a partial cleanup can never
-    /// leave the precommit binding live without its body's GC release queued.
+    /// (`precommitAdd` ran), abandoning it must NOT writer-delete that body. Instead append an exact
+    /// precommit-removal ref-log transaction (spec §Remove Precommit), mirroring EXACTLY the removal
+    /// shape `Store::dropRef` and `Gc::reclaimAbandonedPrecommit` (Task 12) use (an old_binding naming
+    /// the exact precommit, no new_binding). GC then folds the `-1` blob decrements and deletes the
+    /// body only after they are sealed (delete-after-sealed-decrements). Deleting a live precommit body
+    /// here would strand GC's fold barrier (live precommit, missing body → clamp forever) or lose the
+    /// activating `+1`. This is the correctness-bearing step of abandon, so it runs through
+    /// `appendRefOps` (the reliable append lane), not best-effort. It precedes the best-effort debris
+    /// deletion below so a partial cleanup can never leave the precommit binding live without its
+    /// body's GC release queued.
     if (precommitted)
     {
-        store->mutateShard(precommit_target_ns, store->shardOf(precommit_final_ref), MutationScope::ref(precommit_final_ref), [&](RootShard & root)
-        {
-            root.journal.push_back(RootOwnerEvent{
-                .transition_version = root.shard_version + 1,
-                .old_binding = OwnerBinding{
-                    .owner_kind = OwnerKind::Precommit,
-                    .ref_name = precommit_final_ref,
-                    .build_id = build_id,
-                    .manifest_ref = precommit_manifest},
-                .new_binding = std::nullopt});
-        }, nullptr, RootMutationOrigin::Writer, RootMutationKind::Abandon);
+        store->appendRefOps(precommit_target_ns, MutationScope::ref(precommit_final_ref),
+            [&](const RefTableState &) -> std::vector<RefOp>
+            {
+                RefOp op;
+                op.kind = RefOpKind::OwnerTransition;
+                op.old_binding = RefOwnerBinding{RefOwnerKind::Precommit, precommit_final_ref, precommit_manifest};
+                return {op};
+            },
+            RootMutationOrigin::Writer, RootMutationKind::Abandon);
         precommitted = false;
 
         EventEmitter{*store}.emit([&](CasEvent & e)

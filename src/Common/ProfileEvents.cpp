@@ -751,6 +751,14 @@ The server successfully detected this situation and will download merged part fr
     M(CasShardBatchedMutations, "CA shard mutations committed through the flat-combining queue", ValueType::Number) \
     M(CasShardBatchScopeCuts, "CA shard-queue carves cut early by the scope rule (same-ref repeat or WholeShard behind)", ValueType::Number) \
     M(CasShardQueueWaitMicroseconds, "CA total time mutateShard callers spent enqueued (sum over items)", ValueType::Microseconds) \
+    M(CasRefBatchFlushes, "CA ref-log-append-lane flushes committed (one putIfAbsentControlled each); avg batch = CasRefBatchedMutations / this", ValueType::Number) \
+    M(CasRefBatchedMutations, "CA ref mutations committed through the per-namespace ref-log batching queue", ValueType::Number) \
+    M(CasRefBatchScopeCuts, "CA ref-queue carves cut early by the scope rule (same-ref repeat, non-Live-forced-solo, or WholeShard behind)", ValueType::Number) \
+    M(CasRefQueueWaitMicroseconds, "CA total time appendRefOps callers spent enqueued (sum over items)", ValueType::Microseconds) \
+    M(CasRefRecoveryRestarts, "CA ref-table recovery restarts forced by a selected snapshot/log object vanishing between LIST and GET", ValueType::Number) \
+    M(CasRefAppendWedged, "CA ref-log append lane wedges: an uncertain PUT exhausted its retry budget", ValueType::Number) \
+    M(CasRefAppendUnwedged, "CA ref-log append lane unwedges: a previously uncertain PUT was later observed durable", ValueType::Number) \
+    M(CasRefAppendDefiniteFailure, "CA ref-log append attempts conclusively rejected (safe id gap, cache unchanged)", ValueType::Number) \
     M(CasGcClampSuppressedPasses, "CA GC passes whose fold clamped a shard: graduations and pending deletes were suppressed (carried) to preserve the ack-floor lemma", ValueType::Number) \
     M(CasBlobGet,        "CA blob get S3 ops", ValueType::Number) \
     M(CasBlobGetStream,  "CA blob get-stream S3 ops", ValueType::Number) \

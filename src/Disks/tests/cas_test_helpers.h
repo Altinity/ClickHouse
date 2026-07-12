@@ -14,6 +14,8 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGenerationSeal.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestCodec.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestId.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRefLogCodec.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRefSnapshotCodec.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootShardCodec.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include <Common/Exception.h>
@@ -744,6 +746,79 @@ inline void setWatermarkMinActive(
         backend.putOverwrite(key, DB::Cas::encodeMountLease(m), h.token);
     else
         backend.putIfAbsent(key, DB::Cas::encodeMountLease(m));
+}
+
+/// ---- Task 10 ref snapshot+log raw fixtures ----
+/// Mirror the pre-Task-10 `appendOwnerEvent`/`publishRaw` helpers above, but for the new snapshot+log
+/// object layout: write a ref-object body directly via the SAME codecs `Store`'s recovery reads,
+/// bypassing the writer's own append lane entirely. Used to seed pre-existing table state before a
+/// fresh `Store` ever touches the namespace (recovery tests), and to control exact keys/bytes
+/// (restart-on-vanish tests).
+
+/// Writes `snapshot` at `_snap/<snapshot_id>.proto` (create-if-absent).
+inline void writeRefSnapshotRaw(
+    DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::RefTableSnapshot & snapshot)
+{
+    const String key = layout.refSnapshotKey(DB::Cas::RootNamespace{snapshot.ns}, snapshot.snapshot_id);
+    backend.putIfAbsent(key, DB::Cas::encodeRefTableSnapshot(snapshot));
+}
+
+/// Writes `txn` at `_log/<txn_id>` (create-if-absent).
+inline void writeRefLogTxnRaw(
+    DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::RefLogTxn & txn)
+{
+    const String key = layout.refLogKey(DB::Cas::RootNamespace{txn.ns}, txn.txn_id);
+    backend.putIfAbsent(key, DB::Cas::encodeRefLogTxn(txn));
+}
+
+/// A `Live` snapshot naming exactly `committed` (already-sorted-by-ref_name input expected) with no
+/// precommits — the common recovery-fixture shape.
+inline DB::Cas::RefTableSnapshot minimalLiveSnapshot(
+    const String & ns, DB::Cas::RefTxnId snapshot_id, std::vector<DB::Cas::RefCommittedRow> committed = {})
+{
+    DB::Cas::RefTableSnapshot s;
+    s.ns = ns;
+    s.snapshot_id = snapshot_id;
+    s.lifecycle = DB::Cas::RefLifecycle::Live;
+    s.committed = std::move(committed);
+    return s;
+}
+
+/// One committed row naming `ref_name` -> `manifest_ref` with an empty payload (tests that don't care
+/// about the mutable-files payload use this; `Store::encodeMutableFilesPayload` builds a real one).
+inline DB::Cas::RefCommittedRow committedRow(const String & ref_name, const DB::Cas::ManifestRef & manifest_ref)
+{
+    DB::Cas::RefCommittedRow row;
+    row.ref_name = ref_name;
+    row.manifest_ref = manifest_ref;
+    return row;
+}
+
+/// A `namespace_birth` op — the first op any never-born table's first transaction needs.
+inline DB::Cas::RefOp namespaceBirthOp()
+{
+    DB::Cas::RefOp op;
+    op.kind = DB::Cas::RefOpKind::NamespaceBirth;
+    return op;
+}
+
+/// The two ops a fixture transaction needs to go straight from nothing to a committed ref (spec
+/// §State Transitions has no direct "add committed" shape — only precommit -> promote): an
+/// `owner_transition` add-precommit followed by an `owner_transition` promote of the SAME
+/// (ref_name, manifest_ref). Legal as the tail of one transaction whose earlier ops (if any) left the
+/// table `Live` (prepend `namespaceBirthOp()` for a never-born table).
+inline std::vector<DB::Cas::RefOp> publishCommittedOps(const String & ref_name, const DB::Cas::ManifestRef & manifest_ref)
+{
+    DB::Cas::RefOp add;
+    add.kind = DB::Cas::RefOpKind::OwnerTransition;
+    add.new_binding = DB::Cas::RefOwnerBinding{DB::Cas::RefOwnerKind::Precommit, ref_name, manifest_ref};
+
+    DB::Cas::RefOp promote;
+    promote.kind = DB::Cas::RefOpKind::OwnerTransition;
+    promote.old_binding = DB::Cas::RefOwnerBinding{DB::Cas::RefOwnerKind::Precommit, ref_name, manifest_ref};
+    promote.new_binding = DB::Cas::RefOwnerBinding{DB::Cas::RefOwnerKind::Committed, ref_name, manifest_ref};
+
+    return {add, promote};
 }
 
 /// Counts head/get/putIfAbsent per key for op-count assertions (Pillar B / A1 tests).

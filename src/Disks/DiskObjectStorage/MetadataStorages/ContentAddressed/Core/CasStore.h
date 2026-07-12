@@ -9,6 +9,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasPoolMeta.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestCodec.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestId.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRefStateMachine.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRequestControl.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRootShardCodec.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasServerRoot.h>
@@ -239,6 +240,14 @@ struct Resolved
     uint64_t published_at_ms = 0;   /// publish wall-clock (epoch ms); 0 = unset
 };
 
+/// Task 10: the deterministic encoding of a committed ref's mutable payload (`RootRef::mutable_files` /
+/// `Resolved::mutable_files`) inside one `RefCommittedRow.payload` -- an OPAQUE blob from the
+/// ref-log/snapshot codecs' point of view (spec §Snapshot Format: "mutable_files: deterministic RootRef
+/// payload"). Shared by `Store`'s own dropRef/updateRefPayload/resolveRef/listRefs and by `Build::promote`
+/// (the `set_payload` op that installs a precommit's initial payload). Defined in CasStore.cpp.
+String encodeMutableFilesPayload(const std::map<String, String> & files);
+std::map<String, String> decodeMutableFilesPayload(const String & payload);
+
 struct BlobLocation
 {
     String key;
@@ -369,11 +378,40 @@ public:
     /// is a server-relative or shadow-relative path ending in '/'.
     std::vector<String> listMirroredChildren(const String & prefix);
 
-    /// ---- ref lifecycle (CAS loops on the owning shard) ----
-    void dropRef(const RootNamespace & ns, const String & ref_name);            /// refs−− + '-' journal, atomic
+    /// ---- ref lifecycle (Task 10: persisted on the snapshot+log protocol, spec §Writer Algorithms) ----
+    void dropRef(const RootNamespace & ns, const String & ref_name);            /// one owner_transition removal txn
     void updateRefPayload(const RootNamespace & ns, const String & ref_name,
-                          std::function<void(RootRef &)> mutator);              /// mutable fields only; NO journal
+                          std::function<void(RootRef &)> mutator);              /// one set_payload txn
+    /// TODO(Task 11): still tombstones the legacy RootShard objects only -- it does not yet emit the
+    /// ref-log `remove_namespace` transaction the new format's read path (resolveRef/listRefs, both
+    /// backed by `RefTableRuntime` below) understands. Kept compiling per Task 10's scope boundary.
     void dropNamespace(const RootNamespace & ns);                 /// tombstone every shard + delete verbatim files
+
+    /// ==== writer ref-log append lane (Task 10, spec §Writer Algorithms) ====
+    ///
+    /// The ONE entry point every ref mutation funnels through -- Store's own dropRef/updateRefPayload
+    /// above, and (as a friend) Build's precommitAdd/promote/abandon. Replaces the old per-(ns,shard)
+    /// `mutateShard`/`RootShard` persistence for refs; GC's own fold/trim/reclaim (Task 12) keep using
+    /// `mutateShard`/`readShard`/`RootShard` unchanged below, which is exactly why the GC-side gtest
+    /// suites go red until Task 12 rewires GC intake onto this same protocol.
+    ///
+    /// `build_ops(state)` is invoked from the per-namespace flush leader with the table's CURRENT cached
+    /// state (reflecting every earlier item of the SAME batch already applied) -- exactly the atomicity
+    /// the old per-shard closure got from running inside the shard's own CAS loop. It may perform
+    /// arbitrary caller-side I/O (Build's blob revalidation) and throw to reject ONLY this item; a
+    /// LOGICAL_ERROR/ABORTED/etc it throws propagates to the item's own caller without touching any
+    /// other queued item. It returns the ops this call contributes to the batch's one transaction.
+    /// `scope` reuses `MutationScope` (Ref(name) may co-batch; WholeShard runs solo -- used here for
+    /// `namespace_birth`, which the flush forces automatically whenever the cached state is not `Live`).
+    ///
+    /// Wedge semantics (spec §Writer-Side Linearization): at most one unresolved `PUT` per table. An
+    /// `Unresolved` outcome wedges this namespace's lane -- no later id is allocated until the SAME
+    /// (key, bytes) resolves durable (applied to cache before the next id), or the process unmounts.
+    /// Every item in the failing batch receives the SAME uncertainty exception (ABORTED); items already
+    /// wedged from an EARLIER flush are retried by the NEXT call into this namespace's queue.
+    RefTxnId appendRefOps(const RootNamespace & ns, MutationScope scope,
+                         std::function<std::vector<RefOp>(const RefTableState &)> build_ops,
+                         RootMutationOrigin origin, RootMutationKind kind);
 
     /// ---- verbatim namespace files (format_version.txt, ...) — plain keys, never content-addressed ----
     void putNamespaceFile(const RootNamespace & ns, const String & name, const String & bytes);
@@ -620,6 +658,119 @@ private:
     void flushShardBatch(const RootNamespace & ns, uint64_t shard,
                          const std::shared_ptr<ShardMutationQueue> & q);
 
+    /// ==== writer ref-log append lane (Task 10, spec §Writer Algorithms / §Local Batching Queue) ====
+
+    /// At most one outstanding uncertain `PUT` per table (spec §Writer-Side Linearization). Retained
+    /// on the table's runtime until resolved durable (applied to cache first) or definitely rejected.
+    struct RefAppendWedge
+    {
+        RefTxnId txn_id;
+        String key;
+        String bytes;
+    };
+
+    /// One queued `appendRefOps` caller. Mirrors `ShardMutationItem`; `build_ops` replaces the old
+    /// `mutate(RootShard&)` closure -- it is invoked at most once, from inside the flush, and returns
+    /// the ops it contributes rather than mutating storage directly.
+    struct RefMutationItem
+    {
+        MutationScope scope;
+        std::function<std::vector<RefOp>(const RefTableState &)> build_ops;
+        RootMutationOrigin origin = RootMutationOrigin::Writer;
+        RootMutationKind kind = RootMutationKind::Publish;
+        bool done = false;                       /// guarded by ref_queue_mutex
+        std::exception_ptr error;                /// guarded by ref_queue_mutex
+        RefTxnId committed_id{};                  /// written by the leader before done = true
+    };
+
+    /// The whole-table runtime (spec §Startup And Recovery / §Table State): one coherent decoded
+    /// `RefTableState` per namespace, evicted only as a whole (never populated here -- Phase 1 has no
+    /// eviction trigger yet, only lazy recovery on first touch). `state_mutex` is SEPARATE from
+    /// `ref_queue_mutex` (which only ever guards `pending`/`leader_active`) so a reader (resolveRef/
+    /// listRefs) can observe `state` without contending with the flush leader's network round trip --
+    /// the leader only holds `state_mutex` for the brief copy-out-before-validate and the
+    /// apply-after-commit steps, never for the `putIfAbsentControlled` call itself.
+    struct RefTableRuntime
+    {
+        std::mutex state_mutex;
+        bool recovered = false;
+        RefTableState state;
+        /// Retained `_cleanup/<remove-txn-id>` markers observed at recovery (Task 11's recreation
+        /// gate consumes these; Task 10 only collects and retains them).
+        std::set<RefTxnId> cleanup_markers;
+        std::optional<RefAppendWedge> wedge;
+        uint64_t recovery_restarts = 0;           /// diagnostic: LIST/GET restarts forced by a vanished object
+        /// Per-table admission budgets (spec §Snapshot Format): the raw hard limits minus this table's
+        /// own `4 + ns.size()` wire overhead and a fixed safety margin, computed once at recovery.
+        uint64_t snapshot_budget = 0;
+        uint64_t removal_budget = 0;
+
+        std::deque<std::shared_ptr<RefMutationItem>> pending;    /// guarded by ref_queue_mutex
+        bool leader_active = false;                               /// guarded by ref_queue_mutex
+        std::condition_variable cv;
+    };
+    static constexpr size_t kMaxRefBatch = 128;
+    static constexpr size_t kRefRecoveryMaxRestarts = 3;          /// spec: "bounded (3) and counted"
+    /// Fixed Phase-1 safety margin subtracted (alongside the per-table `4 + ns.size()` overhead) from
+    /// the raw `ref_snapshot_max_bytes`/`ref_removal_max_bytes` hard limits before calling `admits()`.
+    static constexpr uint64_t kRefAdmissionSafetyMargin = 4096;
+
+    std::mutex ref_queue_mutex;
+    std::map<String, std::shared_ptr<RefTableRuntime>> ref_tables;
+
+    /// Store-wide strictly-increasing counter (spec §Ordered Ref Transaction Identifier): shared by
+    /// every table of this mounted writer; a fresh writer_epoch (a new Store) restarts it at one.
+    std::atomic<uint64_t> next_ref_sequence{1};
+    RefTxnId allocateRefTxnId() { return RefTxnId{process_epoch, next_ref_sequence.fetch_add(1)}; }
+
+    /// The CAS-owned retry controller (Task 5) this Store's ref-log writer path uses for every
+    /// conditional log/snapshot `PUT` and uncertain-result resolution.
+    std::unique_ptr<CasRequestController> ref_request_controller;
+
+    /// RFC pre-attempt fence check (T5 review obligation): extends `mayMutate()` with the REMAINING
+    /// budget check -- an attempt is not even started unless there is enough of the mount lease left
+    /// for one more attempt_timeout plus the lease safety margin. Passed as `fence_ok` to every
+    /// `CasRequestController` call the ref-log writer path makes.
+    bool refAppendFenceOk() const;
+
+    /// Get-or-create the namespace's runtime (map access only; does not recover). `ensureRefTableRecovered`
+    /// performs the actual one-`LIST`-plus-tail-`GET`s recovery, idempotently, under `rt->state_mutex`.
+    std::shared_ptr<RefTableRuntime> getRefTableRuntime(const RootNamespace & ns);
+    void ensureRefTableRecovered(const RootNamespace & ns, RefTableRuntime & rt);
+
+    /// Leader loop / one flush, mirroring `runShardQueueLeader`/`flushShardBatch` exactly, retargeted
+    /// at the ref-log append lane (recovery, wedge resolution, per-item validation, admission budget,
+    /// the controlled `PUT`, and applying the committed transaction to `rt.state`).
+    void runRefQueueLeader(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt,
+                           const std::shared_ptr<RefMutationItem> & own);
+    void flushRefBatch(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt);
+
+    /// See `setRefPreCarveHookForTest`. Null in production (a no-op call site).
+    std::function<void()> ref_pre_carve_hook_for_test;
+
+public:
+    /// Test seams (Task 10): observe recovery-restart counting and wedge state without a private-member
+    /// friend hack. Recovers the table (like any real read) if not already cached.
+    uint64_t refRecoveryRestartsForTest(const RootNamespace & ns);
+    bool refLaneWedgedForTest(const RootNamespace & ns);
+
+    /// Test-only hook (mirrors `setBackpressureDelayHook`'s existing pattern): called by `flushRefBatch`
+    /// right before it carves a batch, i.e. AFTER the table is already recovered -- the one otherwise
+    /// untestable timing window `BlockingGetBackend`-style backend tricks cannot reach, since a warm
+    /// flush performs no I/O between becoming leader and carving. A test blocks here to let a second
+    /// caller's item join `rt->pending` before the carve, forcing deterministic co-batching.
+    void setRefPreCarveHookForTest(std::function<void()> hook) { ref_pre_carve_hook_for_test = std::move(hook); }
+
+    /// Queue depth for the ref-append-lane tests (mirrors `shardQueuePendingForTest`): how many
+    /// `appendRefOps` callers are enqueued for `ns` right now.
+    size_t refQueuePendingForTest(const RootNamespace & ns)
+    {
+        std::lock_guard<std::mutex> g(ref_queue_mutex);
+        const auto it = ref_tables.find(ns.string());
+        return it == ref_tables.end() ? 0 : it->second->pending.size();
+    }
+
+private:
     BackendPtr pool_backend;
     PoolConfig config;
     PoolMeta meta;

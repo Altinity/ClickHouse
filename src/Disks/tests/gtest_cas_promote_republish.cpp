@@ -355,27 +355,14 @@ TEST(CasPromoteRepublish, AbandonEmitsRemovalBeforeRetire)
     const String ref = "all_0_0_0";
     auto build = s->startBuild(BuildInfo{.intended_ref = ns.string() + "/" + ref, .intended_namespace = ns});
     const ManifestId id = build->stageManifest(inlineEntries("f", "AAA"));
-    const UInt128 build_id = build->buildId();
     build->precommitAdd(ns, ref, id);
     build->abandon();
 
-    /// Read the target shard directly off the backend and assert the precommit-removal event
-    /// (old = Precommit(ref, build_id, id), new = none) was appended to its journal.
-    const Layout layout("p");
-    const uint64_t shard = DB::Cas::tests::shardOfForTest(ref, /*root_shards*/ 32);
-    const auto got = b->get(layout.rootShardKey(ns, shard));
-    ASSERT_TRUE(got.has_value());
-    const RootShard root = decodeRootShard(got->bytes);
-
-    const bool found = std::any_of(root.journal.begin(), root.journal.end(), [&](const RootOwnerEvent & ev)
-    {
-        return ev.old_binding.has_value()
-            && ev.old_binding->owner_kind == OwnerKind::Precommit
-            && ev.old_binding->ref_name == ref
-            && ev.old_binding->build_id == build_id
-            && ev.old_binding->manifest_ref == id.ref
-            && !ev.new_binding.has_value();
-    });
-    EXPECT_TRUE(found) << "abandon() must append the precommit-removal event (old=Precommit, new=none) "
-                           "to the target shard journal";
+    /// Task 10: the exact precommit-removal transaction is proven black-box (spec §Remove Precommit):
+    /// a FRESH precommitAdd for the SAME (ref_name, manifest_ref) must succeed -- if abandon had left
+    /// the exact binding live, this would instead throw CORRUPTED_DATA ("add precommit ... already
+    /// exists").
+    auto rebuild = s->startBuild(BuildInfo{.intended_ref = ns.string() + "/" + ref, .intended_namespace = ns});
+    EXPECT_NO_THROW(rebuild->precommitAdd(ns, ref, id))
+        << "abandon() must append the exact precommit-removal transaction before returning";
 }

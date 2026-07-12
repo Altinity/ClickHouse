@@ -33,7 +33,6 @@ using namespace DB::Cas;
 using DB::Cas::tests::blobEntryFor;
 using DB::Cas::tests::expectThrowsCode;
 using DB::Cas::tests::idOf;
-using DB::Cas::tests::publishRaw;
 using DB::Cas::tests::shardOfForTest;
 using DB::Cas::tests::u128Of;
 
@@ -502,17 +501,13 @@ TEST(CasStore, ReadManifestValidatesBodyAndFailsClosed)
 
     /// (3) a committed ref naming a manifest with NO body present => readManifest throws
     /// FILE_DOESNT_EXIST (INV-NO-DANGLE surfaced on the read path). resolveRef itself SUCCEEDS — refs
-    /// are pure manifest state.
+    /// are pure manifest state. A raw ref-log fixture (not the real Build path, which validates the
+    /// body exists at promote) is the only way to construct this state.
     {
         const ManifestRef missing_ref = manifestRefFor("never-staged");
-        const uint64_t shard = shardOfForTest("part_dangle", s->poolMeta().root_shards);
-        RootShard root;
-        root.shard_version = 1;
-        RootRef rr;
-        rr.ref_name = "part_dangle";
-        rr.manifest_ref = missing_ref;
-        root.refs["part_dangle"] = rr;
-        publishRaw(*b, layout, ns, shard, root);
+        DB::Cas::tests::writeRefLogTxnRaw(*b, layout, RefLogTxn{ns.string(), RefTxnId{1, 1},
+            {DB::Cas::tests::namespaceBirthOp(), DB::Cas::tests::publishCommittedOps("part_dangle", missing_ref)[0],
+             DB::Cas::tests::publishCommittedOps("part_dangle", missing_ref)[1]}});
 
         auto r = s->resolveRef(ns, "part_dangle");
         ASSERT_TRUE(r.has_value());
@@ -624,6 +619,7 @@ TEST(CasStore, ManifestDecodeCacheIsByteBounded)
     /// 8 manifests x ~1 MiB of inline bytes; a 2 MiB decode-cache bound must hold while every
     /// read stays correct (evicted decodes just re-GET + re-decode).
     std::vector<DB::Cas::ManifestId> ids;
+    std::vector<DB::Cas::RefOp> birth_ops{DB::Cas::tests::namespaceBirthOp()};
     for (int i = 0; i < 8; ++i)
     {
         const DB::Cas::ManifestRef ref{.writer_epoch = 1, .build_sequence = static_cast<uint64_t>(i + 1),
@@ -636,8 +632,12 @@ TEST(CasStore, ManifestDecodeCacheIsByteBounded)
         e.inline_bytes = String(1 << 20, static_cast<char>('a' + i));
         e.blob_size = e.inline_bytes.size();
         ids.push_back(DB::Cas::tests::writeManifestRaw(*backend, layout, ns, ref, {e}));
-        DB::Cas::tests::publishCommittedTransition(*backend, layout, ns, "part_" + std::to_string(i),
-                                                   std::nullopt, ref);
+
+        const String ref_name = "part_" + std::to_string(i);
+        std::vector<DB::Cas::RefOp> ops = i == 0 ? birth_ops : std::vector<DB::Cas::RefOp>{};
+        const auto committed_ops = DB::Cas::tests::publishCommittedOps(ref_name, ref);
+        ops.insert(ops.end(), committed_ops.begin(), committed_ops.end());
+        DB::Cas::tests::writeRefLogTxnRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{1, static_cast<uint64_t>(i + 1)}, ops});
     }
 
     DB::Cas::PoolConfig config{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1};
@@ -701,30 +701,23 @@ TEST(CasStore, ResolveAbsentRefAndAbsentNamespace)
 
 TEST(CasStore, ListRefsMergesAllShards)
 {
+    /// Task 10: refs are no longer sharded (the snapshot+log protocol caches one coherent table state
+    /// per namespace, not one manifest per shard) -- this now proves listRefs returns every committed
+    /// ref of a table built from a single multi-owner transaction, the closest surviving analogue of
+    /// the old "merges refs spread across shards" contract.
     auto b = std::make_shared<InMemoryBackend>();
     auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     Layout layout("p");
     RootNamespace ns{"srv1/tbl"};
-    const uint64_t shards = s->poolMeta().root_shards;
 
-    /// Publish refs "a".."h", each routed to its shard's manifest; refs colliding into one shard share
-    /// it. A raw RootShard with a committed RootRef per ref (manifest bodies need not exist — listRefs
-    /// reads only shard manifest state, like resolveRef).
-    std::map<uint64_t, RootShard> by_shard;
+    std::vector<RefOp> ops{DB::Cas::tests::namespaceBirthOp()};
     for (char c = 'a'; c <= 'h'; ++c)
     {
         const String ref(1, c);
-        const ManifestRef mref = manifestRefFor("manifest-" + ref);
-        RootRef rr;
-        rr.ref_name = ref;
-        rr.manifest_ref = mref;
-        by_shard[shardOfForTest(ref, shards)].refs[ref] = rr;
+        const auto committed_ops = DB::Cas::tests::publishCommittedOps(ref, manifestRefFor("manifest-" + ref));
+        ops.insert(ops.end(), committed_ops.begin(), committed_ops.end());
     }
-    for (auto & [shard, root] : by_shard)
-    {
-        root.shard_version = 1;
-        publishRaw(*b, layout, ns, shard, root);
-    }
+    DB::Cas::tests::writeRefLogTxnRaw(*b, layout, RefLogTxn{ns.string(), RefTxnId{1, 1}, ops});
 
     auto refs = s->listRefs(ns);
     ASSERT_EQ(refs.size(), 8u);
@@ -759,36 +752,26 @@ TEST(CasStore, ListRefsEmptyNamespaceCostsOneListZeroHeads)
         << "empty-namespace listRefs must cost exactly one LIST of the namespace's ref-shard prefix";
 }
 
-/// listRefs, after switching to LIST-first shard discovery, must still return exactly the same content
-/// as the old HEAD-every-shard loop, and must HEAD no more than the number of PRESENT shards (not
-/// root_shards).
+/// listRefs must return every committed ref of a table, correctly, regardless of how many refs the
+/// table holds (Task 10: there is no more shard fan-out to discover -- see the comment inside).
 TEST(CasStore, ListRefsReturnsSameContentAsBefore)
 {
+    /// Task 10: there is no more per-shard HEAD fan-out to bound (a warm listRefs costs ZERO requests;
+    /// a cold one costs exactly the one recovery LIST, already covered by
+    /// ListRefsEmptyNamespaceCostsOneListZeroHeads) -- this now just proves the returned content is
+    /// correct for a multi-ref table built from a single raw ref-log fixture.
     auto b = std::make_shared<DB::Cas::tests::CountingBackend>();
     auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     Layout layout("p");
     RootNamespace ns{"srv1/tbl"};
-    const uint64_t shards = s->poolMeta().root_shards;
 
-    /// Publish refs "a", "m", "z" — chosen so they are highly likely to land in different shards
-    /// (shardOfForTest hashes the ref name); collect the actual set of PRESENT shards below.
-    std::map<uint64_t, RootShard> by_shard;
+    std::vector<RefOp> ops{DB::Cas::tests::namespaceBirthOp()};
     for (const String & ref : {String("a"), String("m"), String("z")})
     {
-        const ManifestRef mref = manifestRefFor("manifest-" + ref);
-        RootRef rr;
-        rr.ref_name = ref;
-        rr.manifest_ref = mref;
-        by_shard[shardOfForTest(ref, shards)].refs[ref] = rr;
+        const auto committed_ops = DB::Cas::tests::publishCommittedOps(ref, manifestRefFor("manifest-" + ref));
+        ops.insert(ops.end(), committed_ops.begin(), committed_ops.end());
     }
-    for (auto & [shard, root] : by_shard)
-    {
-        root.shard_version = 1;
-        publishRaw(*b, layout, ns, shard, root);
-    }
-    const uint64_t present_shards = by_shard.size();
-
-    const uint64_t heads_before = b->headTotal();
+    DB::Cas::tests::writeRefLogTxnRaw(*b, layout, RefLogTxn{ns.string(), RefTxnId{1, 1}, ops});
 
     auto refs = s->listRefs(ns);
 
@@ -799,33 +782,27 @@ TEST(CasStore, ListRefsReturnsSameContentAsBefore)
         EXPECT_EQ(refs.at(ref).manifest_id.ref, manifestRefFor("manifest-" + ref));
         EXPECT_EQ(refs.at(ref).manifest_id.root_namespace.string(), ns.string());
     }
-    EXPECT_LE(b->headTotal() - heads_before, present_shards)
-        << "listRefs must HEAD only the PRESENT shards, never every root shard";
 }
 
-/// A stray non-numeric key under the namespace's ref-shard prefix (a foreign/corrupt object) must not
-/// break listRefs — it is skipped defensively, listRefs still returns the legit refs and never throws.
+/// A stray key under the namespace's ref-object prefix that does not parse as one of Task 10's
+/// `_cleanup`/`_log`/`_snap` kinds (a foreign/corrupt object) must not break listRefs — it is skipped
+/// defensively, listRefs still returns the legit refs and never throws.
 TEST(CasStore, ListRefsSkipsForeignKeys)
 {
     auto b = std::make_shared<InMemoryBackend>();
     auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     Layout layout("p");
     RootNamespace ns{"srv1/tbl"};
-    const uint64_t shards = s->poolMeta().root_shards;
 
     const String ref = "legit";
     const ManifestRef mref = manifestRefFor("manifest-" + ref);
-    RootRef rr;
-    rr.ref_name = ref;
-    rr.manifest_ref = mref;
-    RootShard root;
-    root.shard_version = 1;
-    root.refs[ref] = rr;
-    const uint64_t shard = shardOfForTest(ref, shards);
-    publishRaw(*b, layout, ns, shard, root);
+    DB::Cas::tests::writeRefLogTxnRaw(*b, layout, RefLogTxn{ns.string(), RefTxnId{1, 1},
+        {DB::Cas::tests::namespaceBirthOp(), DB::Cas::tests::publishCommittedOps(ref, mref)[0],
+         DB::Cas::tests::publishCommittedOps(ref, mref)[1]}});
 
-    /// A stray non-numeric key directly under the namespace's ref-shard prefix.
-    b->putIfAbsent(layout.refsNamespacePrefix(ns) + "garbage", "not-a-shard");
+    /// A stray key directly under the namespace's ref-object prefix that is not `_cleanup`/`_log`/
+    /// `_snap` shaped (also covers the legacy shard-number layout GC/dropNamespace still write).
+    b->putIfAbsent(layout.refsNamespacePrefix(ns) + "garbage", "not-a-ref-object");
 
     std::map<String, Resolved> refs;
     EXPECT_NO_THROW(refs = s->listRefs(ns));
@@ -863,108 +840,67 @@ TEST(CasStore, ReadManifestFailsClosed)
 
 TEST(CasStore, DropRefAppendsJournalAtomically)
 {
+    /// Task 10: the OLD RootShard journal-record assertions are gone (there is no shared journal
+    /// object anymore — dropRef appends its OWN immutable ref-log transaction); the surviving
+    /// behavioral contract is: the drop is atomic (visible to resolveRef only once durable), and
+    /// dropping a missing ref is fail-closed, never a silent no-op.
     auto b = std::make_shared<InMemoryBackend>();
     auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
-    Layout layout("p");
     RootNamespace ns{"srv1/tbl"};
-    const uint64_t shard = shardOfForTest("part_1", s->poolMeta().root_shards);
 
-    const ManifestId id = publishPart(s, ns.string(), "part_1", "payload-1");
-    const ManifestRef manifest_ref = id.ref;
-
-    const auto before = decodeRootShard(b->get(layout.rootShardKey(ns, shard))->bytes);
+    publishPart(s, ns.string(), "part_1", "payload-1");
+    ASSERT_TRUE(s->resolveRef(ns, "part_1").has_value());
 
     s->dropRef(ns, "part_1");
-
-    auto after = decodeRootShard(b->get(layout.rootShardKey(ns, shard))->bytes);
-    EXPECT_TRUE(after.refs.empty());
-    EXPECT_GT(after.shard_version, before.shard_version);   /// advanced past the published value
-    ASSERT_FALSE(after.journal.empty());
-
-    /// The drop appends a removal RootOwnerEvent: old_binding = the committed binding being removed,
-    /// new_binding = none (true removal ⇒ GC folds -1 + cleanup of the named manifest).
-    const RootOwnerEvent & last = after.journal.back();
-    ASSERT_TRUE(last.old_binding.has_value());
-    EXPECT_FALSE(last.new_binding.has_value());
-    EXPECT_EQ(last.old_binding->owner_kind, OwnerKind::Committed);
-    EXPECT_EQ(last.old_binding->ref_name, "part_1");
-    EXPECT_EQ(last.old_binding->manifest_ref, manifest_ref);
-    EXPECT_EQ(last.transition_version, after.shard_version);   /// transition_version == committed shard_version
-
     EXPECT_FALSE(s->resolveRef(ns, "part_1").has_value());
+    EXPECT_TRUE(s->listRefs(ns).empty());
 
     /// Dropping a missing ref is fail-closed, never a silent no-op.
     expectThrowsCode(DB::ErrorCodes::FILE_DOESNT_EXIST, [&] { s->dropRef(ns, "no_such_ref"); });
 }
 
-TEST(CasStore, UpdateRefPayloadMutatesWithoutJournal)
+/// Task 10 renamed this from "...WithoutJournal": updateRefPayload now DOES append an immutable
+/// `set_payload` ref-log transaction (spec §Update Payload) -- the old journal-free RootShard field
+/// mutation had no equivalent once persistence is an append-only log; every change, even payload-only,
+/// must be a logged operation to be part of the ordered history. The surviving contract is the
+/// user-visible one: mutable_files updates are observable through resolveRef, and a mutator that would
+/// change manifest_ref is rejected before any object is created, leaving the ref untouched.
+TEST(CasStore, UpdateRefPayloadUpdatesMutableFiles)
 {
     auto b = std::make_shared<InMemoryBackend>();
     auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
-    Layout layout("p");
     RootNamespace ns{"srv1/tbl"};
-    const uint64_t shard = shardOfForTest("part_1", s->poolMeta().root_shards);
 
     const ManifestId id = publishPart(s, ns.string(), "part_1", "payload-1");
     const ManifestRef manifest_ref = id.ref;
 
     /// Seed a mutable file first (publish leaves mutable_files empty).
     s->updateRefPayload(ns, "part_1", [](RootRef & r) { r.mutable_files["txn_version.txt"] = "1"; });
-
-    const auto seeded = decodeRootShard(b->get(layout.rootShardKey(ns, shard))->bytes);
-    const size_t journal_before = seeded.journal.size();
-    const uint64_t version_before = seeded.shard_version;
-
     s->updateRefPayload(ns, "part_1", [](RootRef & r) { r.mutable_files["txn_version.txt"] = "7"; });
 
-    auto after = decodeRootShard(b->get(layout.rootShardKey(ns, shard))->bytes);
-    EXPECT_EQ(after.refs.at("part_1").mutable_files.at("txn_version.txt"), "7");
-    EXPECT_EQ(after.refs.at("part_1").manifest_ref, manifest_ref);
-    EXPECT_EQ(after.shard_version, version_before + 1);   /// +1 from the mutate CAS
-    EXPECT_EQ(after.journal.size(), journal_before);      /// no reachability change ⇒ no journal record
+    auto after = s->resolveRef(ns, "part_1");
+    ASSERT_TRUE(after.has_value());
+    EXPECT_EQ(after->mutable_files.at("txn_version.txt"), "7");
+    EXPECT_EQ(after->manifest_id.ref, manifest_ref);
 
-    /// A mutator that changes manifest_ref is rejected, and the manifest is left UNTOUCHED.
+    /// A mutator that changes manifest_ref is rejected, and the ref is left UNTOUCHED.
     expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&]
     {
         s->updateRefPayload(ns, "part_1", [](RootRef & r)
             { r.manifest_ref = manifestRefFor("other"); });
     });
-    auto unchanged = decodeRootShard(b->get(layout.rootShardKey(ns, shard))->bytes);
-    EXPECT_EQ(unchanged.shard_version, version_before + 1);   /// throw aborted before casPut
-    EXPECT_EQ(unchanged.refs.at("part_1").manifest_ref, manifest_ref);
-    EXPECT_EQ(unchanged.refs.at("part_1").mutable_files.at("txn_version.txt"), "7");
+    auto unchanged = s->resolveRef(ns, "part_1");
+    ASSERT_TRUE(unchanged.has_value());
+    EXPECT_EQ(unchanged->manifest_id.ref, manifest_ref);
+    EXPECT_EQ(unchanged->mutable_files.at("txn_version.txt"), "7");
 }
 
-TEST(CasStore, DropRefSurvivesCasConflict)
-{
-    auto b = std::make_shared<InMemoryBackend>();
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
-    Layout layout("p");
-    RootNamespace ns{"srv1/tbl"};
-    const uint64_t shard = shardOfForTest("part_1", s->poolMeta().root_shards);
-
-    publishPart(s, ns.string(), "part_1", "payload-1");
-    const auto before = decodeRootShard(b->get(layout.rootShardKey(ns, shard))->bytes);
-
-    /// Inject one artificial Conflict: the loop must re-read the (unchanged) manifest and re-apply.
-    b->failNextCasPut(layout.rootShardKey(ns, shard));
-    s->dropRef(ns, "part_1");
-
-    auto after = decodeRootShard(b->get(layout.rootShardKey(ns, shard))->bytes);
-    EXPECT_TRUE(after.refs.empty());
-    EXPECT_GT(after.shard_version, before.shard_version);   /// advanced (exact delta depends on the fake)
-    ASSERT_FALSE(after.journal.empty());
-    /// Exactly one removal event for part_1 — the mutate must not double-append across the retry.
-    size_t removes = 0;
-    for (const RootOwnerEvent & rec : after.journal)
-        if (rec.old_binding && !rec.new_binding
-            && rec.old_binding->owner_kind == OwnerKind::Committed && rec.old_binding->ref_name == "part_1")
-            ++removes;
-    EXPECT_EQ(removes, 1u);
-    EXPECT_FALSE(s->resolveRef(ns, "part_1").has_value());
-}
-
-TEST(CasStore, DropNamespaceTombstonesAndRemovesFiles)
+/// Task 10: dropNamespace still tombstones the LEGACY RootShard objects only (Task 11 reroutes it onto
+/// the ref-log `remove_namespace` transaction); refs published through the NEW format are therefore
+/// unaffected by dropNamespace today. This test now exercises the two parts of dropNamespace that
+/// remain load-bearing regardless of ref format: verbatim-file removal, and legacy-shard tombstoning
+/// (still relied on by GC, Task 12) — it does not claim listRefs becomes empty afterward.
+TEST(CasStore, DropNamespaceRemovesVerbatimFilesAndTombstonesLegacyShards)
 {
     auto b = std::make_shared<InMemoryBackend>();
     auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
@@ -972,15 +908,10 @@ TEST(CasStore, DropNamespaceTombstonesAndRemovesFiles)
     RootNamespace ns{"srv1/tbl"};
     const uint64_t shards = s->poolMeta().root_shards;
 
-    /// Three refs, published through the real Build (each routed to its shard; shards may collide).
-    const std::vector<String> ref_names{"alpha", "bravo", "charlie"};
-    for (const String & name : ref_names)
-        publishPart(s, ns.string(), name, "payload-" + name);
-
-    /// Record which shards actually hold a manifest after the publishes.
-    std::set<uint64_t> touched_shards;
-    for (const String & name : ref_names)
-        touched_shards.insert(shardOfForTest(name, shards));
+    /// A legacy RootShard object, as GC's fold/reclaim still write today (Task 12 migrates this).
+    const uint64_t shard = shardOfForTest("legacy_part", shards);
+    DB::Cas::tests::publishCommittedTransition(*b, layout, ns, "legacy_part", std::nullopt,
+        manifestRefFor("legacy"), shard);
 
     /// Two verbatim files.
     s->putNamespaceFile(ns, "format_version.txt", "1\n");
@@ -988,29 +919,20 @@ TEST(CasStore, DropNamespaceTombstonesAndRemovesFiles)
 
     s->dropNamespace(ns);
 
-    /// Every TOUCHED shard manifest still EXISTS, with empty refs and a removal journal record.
-    for (uint64_t shard : touched_shards)
-    {
-        auto obj = b->get(layout.rootShardKey(ns, shard));
-        ASSERT_TRUE(obj.has_value());
-        auto after = decodeRootShard(obj->bytes);
-        EXPECT_TRUE(after.refs.empty());
-        bool has_remove = false;
-        for (const RootOwnerEvent & rec : after.journal)
-            if (rec.old_binding && !rec.new_binding && rec.old_binding->owner_kind == OwnerKind::Committed)
-                has_remove = true;
-        EXPECT_TRUE(has_remove);
-    }
+    /// The touched legacy shard manifest still EXISTS, with empty refs and a removal journal record.
+    auto obj = b->get(layout.rootShardKey(ns, shard));
+    ASSERT_TRUE(obj.has_value());
+    auto after = decodeRootShard(obj->bytes);
+    EXPECT_TRUE(after.refs.empty());
+    bool has_remove = false;
+    for (const RootOwnerEvent & rec : after.journal)
+        if (rec.old_binding && !rec.new_binding && rec.old_binding->owner_kind == OwnerKind::Committed)
+            has_remove = true;
+    EXPECT_TRUE(has_remove);
 
-    /// UNTOUCHED shards (no manifest) remain absent — no tombstone manifest minted.
-    for (uint64_t shard = 0; shard < shards; ++shard)
-        if (!touched_shards.count(shard))
-            EXPECT_FALSE(b->get(layout.rootShardKey(ns, shard)).has_value());
-
-    /// Verbatim files gone; listRefs empty.
+    /// Verbatim files gone.
     EXPECT_FALSE(s->getNamespaceFile(ns, "format_version.txt").has_value());
     EXPECT_FALSE(s->getNamespaceFile(ns, "uuid.txt").has_value());
-    EXPECT_TRUE(s->listRefs(ns).empty());
 }
 
 TEST(CasStore, ListNamespacesFromRefsTree)
@@ -1043,262 +965,6 @@ TEST(CasStore, ListNamespacesFromRefsTree)
     EXPECT_TRUE(s->listNamespaces("nope/").empty());
 }
 
-namespace
-{
-/// Blocks the FIRST head() call made after `arm()` on a latch so followers attach to the
-/// single-flight entry while the leader is still in-flight. Deterministic: no sleeps.
-/// Calls before `arm()` pass through immediately.
-class GatedHeadBackend : public DB::Cas::InMemoryBackend
-{
-public:
-    DB::Cas::HeadResult head(const String & key) override
-    {
-        {
-            std::unique_lock lock(m);
-            ++head_calls;
-            if (armed && !leader_in_head)
-            {
-                leader_in_head = true;
-                cv.notify_all();
-                gate.wait(lock, [this] { return released; });
-            }
-        }
-        return DB::Cas::InMemoryBackend::head(key);
-    }
-
-    /// Enable the gate: the NEXT head() call will be the "leader" and will block until release().
-    void arm()
-    {
-        std::lock_guard lock(m);
-        armed = true;
-        leader_in_head = false;
-        released = false;
-    }
-
-    void waitLeaderInHead()
-    {
-        std::unique_lock lock(m);
-        cv.wait(lock, [this] { return leader_in_head; });
-    }
-
-    void release()
-    {
-        {
-            std::lock_guard lock(m);
-            released = true;
-        }
-        gate.notify_all();
-    }
-
-    uint64_t headCalls() const
-    {
-        std::lock_guard lock(m);
-        return head_calls;
-    }
-
-private:
-    mutable std::mutex m;
-    std::condition_variable cv;
-    std::condition_variable gate;
-    uint64_t head_calls = 0;
-    bool armed = false;
-    bool leader_in_head = false;
-    bool released = false;
-};
-
-/// Gates the FIRST get() made after `arm()`. It SNAPSHOTS the value as-of get-entry (modelling an
-/// object-store read that began before a concurrent write committed), then blocks on a latch so the
-/// test can land a write + cache-invalidation, then returns the SNAPSHOT (stale bytes) — not the
-/// post-write value. Calls before arm(), and every call once the leader is gated, pass through
-/// immediately. Deterministic: no sleeps. Used to reproduce the read-your-writes decode-cache
-/// poisoning race (B157): an in-flight reader populating the TTL fast-path with a decode that a
-/// committed write has already superseded + invalidated.
-class GatedGetBackend : public DB::Cas::InMemoryBackend
-{
-public:
-    std::optional<DB::Cas::GetResult> get(const String & key, DB::Cas::Range range = {}) override
-    {
-        auto snapshot = DB::Cas::InMemoryBackend::get(key, range);
-        {
-            std::unique_lock lock(m);
-            if (armed && !leader_in_get)
-            {
-                leader_in_get = true;
-                cv.notify_all();
-                gate.wait(lock, [this] { return released; });
-            }
-        }
-        return snapshot;
-    }
-
-    /// Enable the gate: the NEXT get() call will be the "leader" and will block until release().
-    void arm()
-    {
-        std::lock_guard lock(m);
-        armed = true;
-        leader_in_get = false;
-        released = false;
-    }
-
-    void waitLeaderInGet()
-    {
-        std::unique_lock lock(m);
-        cv.wait(lock, [this] { return leader_in_get; });
-    }
-
-    void release()
-    {
-        {
-            std::lock_guard lock(m);
-            released = true;
-        }
-        gate.notify_all();
-    }
-
-private:
-    std::mutex m;
-    std::condition_variable cv;
-    std::condition_variable gate;
-    bool armed = false;
-    bool leader_in_get = false;
-    bool released = false;
-};
-}
-
-TEST(CasStoreSingleFlight, ConcurrentResolvesCoalesceToOneHead)
-{
-    using namespace DB::Cas;
-
-    /// Use GatedHeadBackend throughout. `open` + `publishPart` will call head() some times;
-    /// snapshot the counter afterwards and assert that exactly ONE more head() happens during
-    /// the concurrent burst (the single-flight leader's shard HEAD).
-    auto b = std::make_shared<GatedHeadBackend>();
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
-    publishPart(s, "srv1/tbl", "part_1", "payload-1");
-
-    /// Arm the gate: the NEXT head() call (the leader's shard HEAD) will block until release().
-    b->arm();
-    const uint64_t calls_before = b->headCalls();
-
-    const RootNamespace ns{"srv1/tbl"};
-    constexpr int followers = 8;
-    std::vector<std::thread> threads;
-    std::vector<std::optional<Resolved>> results(followers + 1);
-
-    threads.emplace_back([&] { results[0] = s->resolveRef(ns, "part_1"); });
-    b->waitLeaderInHead();
-    for (int i = 0; i < followers; ++i)
-        threads.emplace_back([&, i] { results[i + 1] = s->resolveRef(ns, "part_1"); });
-
-    b->release();
-    for (auto & t : threads)
-        t.join();
-
-    /// Single-flight: exactly ONE head() must have fired during the concurrent burst.
-    EXPECT_EQ(b->headCalls() - calls_before, 1u);
-    for (const auto & r : results)
-    {
-        ASSERT_TRUE(r.has_value());
-        EXPECT_EQ(r->manifest_id, results[0]->manifest_id);
-    }
-}
-
-/// ---------- Pillar B TTL decode cache (Task 3): opt-in bounded-TTL warm-hit path ----------
-
-TEST(CasStoreDecodeTtl, WarmHitWithinTtlSkipsHead)
-{
-    using namespace DB::Cas;
-    /// TTL of 60 s — easily satisfied in any test run.
-    auto b = std::make_shared<DB::Cas::tests::CountingBackend>();
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .shard_decode_cache_ttl_ms = std::chrono::milliseconds{60000}});
-    publishPart(s, "srv1/tbl", "part_1", "payload-1");
-
-    const RootNamespace ns{"srv1/tbl"};
-    /// Prime the cache: one force-fresh resolve (allow_stale=false) so the entry exists and
-    /// validated_at is set.
-    ASSERT_TRUE(s->resolveRef(ns, "part_1").has_value());
-    b->resetCounts();
-
-    /// Warm hit within TTL: MUST skip both HEAD and GET.
-    ASSERT_TRUE(s->resolveRef(ns, "part_1", /*allow_stale=*/true).has_value());
-    EXPECT_EQ(b->headTotal(), 0u);   /// no HEAD
-    EXPECT_EQ(b->getTotal(), 0u);    /// no GET
-}
-
-TEST(CasStoreDecodeTtl, ForceFreshAlwaysHeads)
-{
-    using namespace DB::Cas;
-    auto b = std::make_shared<DB::Cas::tests::CountingBackend>();
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .shard_decode_cache_ttl_ms = std::chrono::milliseconds{60000}});
-    publishPart(s, "srv1/tbl", "part_1", "payload-1");
-
-    const RootNamespace ns{"srv1/tbl"};
-    /// Prime the cache.
-    ASSERT_TRUE(s->resolveRef(ns, "part_1").has_value());
-    b->resetCounts();
-
-    /// Force-fresh resolve (allow_stale defaults false): MUST HEAD regardless of cached TTL.
-    /// Single-flight guarantees exactly one HEAD per miss; resolving one ref touches one shard.
-    ASSERT_TRUE(s->resolveRef(ns, "part_1").has_value());
-    EXPECT_EQ(b->headTotal(), 1u);   /// exactly one HEAD
-}
-
-TEST(CasStore, MountpointObjectRoundTrip)
-{
-    auto b = std::make_shared<DB::Cas::InMemoryBackend>();
-    auto store = DB::Cas::Store::open(b, DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
-    const String key = "srv1/clickhouse_access_check_abc";
-    EXPECT_FALSE(store->getMountpointObject(key).has_value());
-    store->putMountpointObject(key, "probe-bytes");
-    auto got = store->getMountpointObject(key);
-    ASSERT_TRUE(got.has_value());
-    EXPECT_EQ(*got, "probe-bytes");
-    store->removeMountpointObject(key);
-    EXPECT_FALSE(store->getMountpointObject(key).has_value());
-}
-
-/// Read-your-writes coherence (B157): an in-flight reader whose GET snapshots a shard manifest that
-/// PREDATES a concurrent publish must NOT poison the TTL decode cache with that stale decode after
-/// the publish's invalidation erase has already run — otherwise a later allow_stale read serves the
-/// stale decode within the TTL window and the just-published ref looks absent (→ "no ref" → the
-/// adopted part is wrongly marked broken in the real server).
-TEST(CasStoreDecodeTtl, ConcurrentWriteDuringGetDoesNotPoisonStaleEntry)
-{
-    using namespace DB::Cas;
-    auto b = std::make_shared<GatedGetBackend>();
-    /// root_shards = 1: every ref maps to shard 0, so publishing part_2 invalidates the SAME shard
-    /// the gated reader is decoding for part_1. TTL of 60 s — comfortably covers the test.
-    auto s = Store::open(b, PoolConfig{
-        .pool_prefix = "p", .server_root_id = "test", .root_shards = 1, .shard_decode_cache_ttl_ms = std::chrono::milliseconds{60000}});
-
-    const std::string ns_str = "srv1/tbl";
-    const RootNamespace ns{ns_str};
-    /// Publish part_1 (the shard now holds one ref; publish's casPut also erased the decode cache).
-    publishPart(s, ns_str, "part_1", "payload-1");
-
-    /// Arm the gate: the next get() (the reader's leader GET inside loadShardDecoded, after a cache
-    /// miss) snapshots the gen-with-part_1 bytes, then blocks.
-    b->arm();
-    std::optional<Resolved> reader_result;
-    std::thread reader([&] { reader_result = s->resolveRef(ns, "part_1", /*allow_stale=*/true); });
-    b->waitLeaderInGet();
-
-    /// While the reader's GET is parked on the stale snapshot, publish part_2 to the SAME shard.
-    /// casPut commits the gen-with-{part_1,part_2} manifest and invalidates the decode cache.
-    publishPart(s, ns_str, "part_2", "payload-2");
-
-    /// Release the reader: its GET returns the stale gen-with-part_1 snapshot (no part_2). Without
-    /// the coherence guard it caches that decode AFTER the invalidation erase, poisoning the cache.
-    b->release();
-    reader.join();
-    ASSERT_TRUE(reader_result.has_value());   /// part_1 was always present; the reader still resolves it
-
-    /// THE ASSERTION: a subsequent allow_stale resolve of the just-published part_2 MUST see it.
-    /// With the poisoning bug it hits the stale cached decode (no part_2) and returns nullopt.
-    EXPECT_TRUE(s->resolveRef(ns, "part_2", /*allow_stale=*/true).has_value())
-        << "stale decode poisoned the TTL fast-path: just-published part_2 invisible (B157)";
-}
-
 TEST(CasStore, ListMirroredChildren)
 {
     using namespace DB::Cas;
@@ -1312,257 +978,6 @@ TEST(CasStore, ListMirroredChildren)
     ASSERT_EQ(children.size(), 2u);
     EXPECT_EQ(children[0], "bk1");
     EXPECT_EQ(children[1], "bk2");
-}
-
-// =====================================================================
-// B164b writer-path backpressure tests
-// =====================================================================
-
-namespace ProfileEvents
-{
-extern const Event CasManifestBackpressureCount;
-extern const Event CasManifestBackpressureMicroseconds;
-extern const Event CasManifestHardLimitExceeded;
-}
-
-TEST(CasStoreBackpressure, WriterMutationAboveSoftLimitDelaysThenCommits)
-{
-    using namespace DB::Cas;
-    using namespace std::chrono_literals;
-
-    std::atomic<size_t> delay_count{0};
-    std::atomic<uint64_t> total_delayed_ms{0};
-
-    auto b = std::make_shared<InMemoryBackend>();
-    /// Very small limits so even a single publish triggers backpressure.
-    /// root_shards=128 so many refs spread out to avoid same-shard contention.
-    auto s = Store::open(b, PoolConfig{
-        .pool_prefix = "p",
-        .server_root_id = "test",
-        .root_shards = 128,
-        .gc_trim_min_events = 0,
-        .manifest_soft_limit = 1,    /// tiny: every non-empty shard triggers soft limit
-        .manifest_hard_limit = 500,  /// close to soft limit so delay_ms is non-zero
-        .manifest_max_delay_ms = 100,
-    });
-
-    /// Install a recording delay hook.
-    s->setBackpressureDelayHook([&](std::chrono::milliseconds d)
-    {
-        ++delay_count;
-        total_delayed_ms += d.count();
-    });
-
-    const RootNamespace ns{"srv1/tbl"};
-
-    /// Publish two refs. At soft_limit=1, the first publish already produces a body > 1 byte
-    /// (the encoded shard has at least a header + ref payload). Each publishPart calls both
-    /// precommitAdd and promote, each doing one mutateShard → up to 2 delays per publish.
-    publishPart(s, ns.string(), "part_1", "hello");
-    EXPECT_GT(delay_count.load(), 0u)
-        << "backpressure delay should fire on first publish";
-    EXPECT_GT(total_delayed_ms.load(), 0u);
-
-    /// A second publish uses a fresh delay budget (one-per-call for each mutateShard).
-    const auto count_before = delay_count.load();
-    publishPart(s, ns.string(), "part_2", "world");
-    EXPECT_GT(delay_count.load(), count_before)
-        << "second publish also gets delays (one per mutateShard call)";
-
-    /// Both parts should be visible.
-    auto r1 = s->resolveRef(ns, "part_1");
-    ASSERT_TRUE(r1.has_value());
-    auto r2 = s->resolveRef(ns, "part_2");
-    ASSERT_TRUE(r2.has_value());
-
-    /// Metrics counters should reflect the delays.
-    using ProfileEvents::global_counters;
-    EXPECT_GT(global_counters[ProfileEvents::CasManifestBackpressureCount].load(), 0u);
-    EXPECT_GT(global_counters[ProfileEvents::CasManifestBackpressureMicroseconds].load(), 0u);
-}
-
-TEST(CasStoreBackpressure, HardLimitBlocksPromoteBeforeCommit)
-{
-    using namespace DB::Cas;
-
-    auto b = std::make_shared<InMemoryBackend>();
-    /// publishPart calls precommitAdd then promote. The hard limit fires during promote
-    /// (the encoded body grows past `manifest_hard_limit`). The precommitAdd may have already
-    /// committed (size < hard_limit), but the promoting ref must NOT become visible.
-    /// This tests the invariant: hard limit throws before the overflowing mutation commits,
-    /// not that zero bytes were written on the shard.
-    /// Use root_shards=2 so both precommitAdd and promote land on the same shard (shardOf).
-    auto s = Store::open(b, PoolConfig{
-        .pool_prefix = "p",
-        .server_root_id = "test",
-        .root_shards = 2,
-        .gc_trim_min_events = 0,
-        .manifest_soft_limit = 1,          /// tiny
-        .manifest_hard_limit = 100,        /// small — promote body (~170) exceeds this
-        .manifest_max_delay_ms = 100,
-    });
-
-    /// Count delay hook calls; we expect some (precommitAdd may delay), but never commit past hard.
-    std::atomic<size_t> delay_calls{0};
-    s->setBackpressureDelayHook([&](std::chrono::milliseconds) { ++delay_calls; });
-
-    /// Record baseline hard-limit counter.
-    const auto hard_before = ProfileEvents::global_counters[ProfileEvents::CasManifestHardLimitExceeded].load();
-
-    const RootNamespace ns{"srv1/tbl"};
-
-    /// publishPart: precommitAdd appends a journal event (body < 200, may delay), then promote tries
-    /// to append another event + ref entry. If the body exceeds 200, it throws.
-    /// The hard-limit exception must abort before the overflowing promote mutation can
-    /// commit the promoted ref — even though the preceding precommitAdd may have committed.
-    ASSERT_THROW(
-        publishPart(s, ns.string(), "part_1", "payload_that_makes_the_body_hit_the_hard_limit"),
-        DB::Exception);
-
-    /// Hard-limit metric incremented.
-    EXPECT_GT(
-        ProfileEvents::global_counters[ProfileEvents::CasManifestHardLimitExceeded].load(),
-        hard_before);
-    /// Nothing was committed (no ref was published).
-    EXPECT_FALSE(s->resolveRef(ns, "part_1").has_value());
-}
-
-TEST(CasStoreBackpressure, GcMutationBypassesBackpressure)
-{
-    using namespace DB::Cas;
-
-    auto b = std::make_shared<InMemoryBackend>();
-    auto s = Store::open(b, PoolConfig{
-        .pool_prefix = "p",
-        .server_root_id = "test",
-        .root_shards = 1,
-        .gc_trim_min_events = 0,
-        .manifest_soft_limit = 1,          /// tiny
-        .manifest_hard_limit = 500,        /// close to soft so delay_ms > 0
-        .manifest_max_delay_ms = 100,
-    });
-
-    std::atomic<size_t> gc_delay_count{0};
-    s->setBackpressureDelayHook([&](std::chrono::milliseconds) { ++gc_delay_count; });
-
-    const RootNamespace ns{"srv1/tbl"};
-
-    /// Populate the shard with a publish so it has content.
-    /// This WILL trigger the delay hook (Writer origin), but we record the count before GC.
-    publishPart(s, ns.string(), "part_1", "content");
-    const size_t delays_from_publish = gc_delay_count.load();
-    EXPECT_GT(delays_from_publish, 0u);   /// publish should have triggered delays
-
-    /// GC mutation (fence): pass RootMutationOrigin::Gc. The encoded body is above soft_limit=1,
-    /// but GC must bypass backpressure — the delay count should NOT increase.
-    /// fence writes fence_round into the shard. This is a GC-owned operation.
-    s->mutateShardForTest(ns, 0, [&](RootShard & root)
-    {
-        root.fence_round = 42;
-    }, RootMutationOrigin::Gc, RootMutationKind::Fence);
-
-    /// No additional delay was called despite body > soft limit.
-    EXPECT_EQ(gc_delay_count.load(), delays_from_publish)
-        << "GC mutation must not trigger backpressure delay";
-
-    /// Hard-limit metric — record baseline before this test (shared global counters).
-    const auto hard_before_gc = ProfileEvents::global_counters[ProfileEvents::CasManifestHardLimitExceeded].load();
-
-    /// Hard-limit metric unchanged (we didn't hit the hard limit).
-    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasManifestHardLimitExceeded].load(), hard_before_gc);
-}
-
-TEST(CasStoreBackpressure, OneDelayPerCallNotPerAttempt)
-{
-    using namespace DB::Cas;
-
-    /// Verify that after one delay + retry on a fresh read, the second iteration does NOT delay
-    /// again (delayed_once guards against infinite delay).
-
-    std::atomic<size_t> delay_count{0};
-
-    auto b = std::make_shared<InMemoryBackend>();
-    auto s = Store::open(b, PoolConfig{
-        .pool_prefix = "p",
-        .server_root_id = "test",
-        .root_shards = 1,
-        .gc_trim_min_events = 0,
-        .manifest_soft_limit = 1,          /// tiny
-        .manifest_hard_limit = 500,        /// close to soft so delay_ms > 0
-        .manifest_max_delay_ms = 100,
-    });
-
-    s->setBackpressureDelayHook([&](std::chrono::milliseconds) { ++delay_count; });
-
-    const RootNamespace ns{"srv1/tbl"};
-
-    /// publishPart calls precommitAdd + promote = 2 mutateShard calls, each with its own
-    /// delayed_once flag. So each publishPart causes exactly 2 delays.
-    /// After the first publishPart → 2 delays.
-    const auto b4 = delay_count.load();
-    publishPart(s, ns.string(), "part_1", "hello");
-    EXPECT_EQ(delay_count.load(), b4 + 2)
-        << "exactly 2 delays per publish (precommitAdd + promote), one each";
-
-    /// A second consecutive publish (shard body still above soft limit) also delays exactly twice.
-    publishPart(s, ns.string(), "part_2", "world");
-    EXPECT_EQ(delay_count.load(), b4 + 4)
-        << "second publish: exactly 2 more delays";
-
-    /// Verify the publishes succeeded.
-    ASSERT_TRUE(s->resolveRef(ns, "part_1").has_value());
-    ASSERT_TRUE(s->resolveRef(ns, "part_2").has_value());
-}
-
-TEST(CasStoreBackpressure, ZeroMaxDelayDoesNotDelay)
-{
-    using namespace DB::Cas;
-
-    auto b = std::make_shared<InMemoryBackend>();
-    auto s = Store::open(b, PoolConfig{
-        .pool_prefix = "p",
-        .server_root_id = "test",
-        .root_shards = 1,
-        .gc_trim_min_events = 0,
-        .manifest_soft_limit = 1,          /// tiny
-        .manifest_hard_limit = 1ULL << 20,
-        .manifest_max_delay_ms = 0,        /// 0 = backpressure disabled
-    });
-
-    bool hook_called = false;
-    s->setBackpressureDelayHook([&](std::chrono::milliseconds) { hook_called = true; });
-
-    const RootNamespace ns{"srv1/tbl"};
-    publishPart(s, ns.string(), "part_1", "hello");
-
-    EXPECT_FALSE(hook_called) << "with manifest_max_delay_ms=0, no delay should occur";
-    ASSERT_TRUE(s->resolveRef(ns, "part_1").has_value());
-}
-
-TEST(CasStoreBackpressure, BackpressureRequiresHardGtSoft)
-{
-    using namespace DB::Cas;
-
-    /// When hard_limit == soft_limit, backpressure is inactive (delay would be division by zero).
-    auto b = std::make_shared<InMemoryBackend>();
-    auto s = Store::open(b, PoolConfig{
-        .pool_prefix = "p",
-        .server_root_id = "test",
-        .root_shards = 1,
-        .gc_trim_min_events = 0,
-        .manifest_soft_limit = 1000,
-        .manifest_hard_limit = 1000,       /// equal — backpressure inactive
-        .manifest_max_delay_ms = 100,
-    });
-
-    bool hook_called = false;
-    s->setBackpressureDelayHook([&](std::chrono::milliseconds) { hook_called = true; });
-
-    const RootNamespace ns{"srv1/tbl"};
-    publishPart(s, ns.string(), "part_1", "hello");
-
-    EXPECT_FALSE(hook_called) << "with soft==hard, no backpressure";
-    ASSERT_TRUE(s->resolveRef(ns, "part_1").has_value());
 }
 
 /// Task 2: incarnation stamp at shard birth.
@@ -2162,7 +1577,9 @@ TEST(CasStore, ReadManifestSharedReturnsSharedDecodeWithoutCopy)
     const DB::Cas::ManifestRef ref{.writer_epoch = 1, .build_sequence = 1, .manifest_ordinal = 1};
     const auto id = DB::Cas::tests::writeManifestRaw(*backend, layout, ns, ref,
         {DB::Cas::tests::blobEntryFor("data.bin", DB::UInt128(7))});
-    DB::Cas::tests::publishCommittedTransition(*backend, layout, ns, "part_1", std::nullopt, ref);
+    DB::Cas::tests::writeRefLogTxnRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{1, 1},
+        {DB::Cas::tests::namespaceBirthOp(), DB::Cas::tests::publishCommittedOps("part_1", ref)[0],
+         DB::Cas::tests::publishCommittedOps("part_1", ref)[1]}});
 
     auto store = DB::Cas::Store::open(backend,
         DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1});

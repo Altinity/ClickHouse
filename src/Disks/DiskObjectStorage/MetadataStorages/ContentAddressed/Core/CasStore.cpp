@@ -1,14 +1,20 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasCodecUtil.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcFormats.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInstrumentedBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEnvelope.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasProbe.h>
+#include <IO/ReadBufferFromMemory.h>
+#include <IO/ReadHelpers.h>
+#include <IO/WriteBufferFromString.h>
+#include <IO/WriteHelpers.h>
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
 #include <Common/thread_local_rng.h>
 #include <city.h>
 #include <algorithm>
+#include <chrono>
 #include <ctime>
 #include <thread>
 #include <unordered_set>
@@ -37,6 +43,14 @@ namespace ProfileEvents
     extern const Event CasManifestBackpressureMicroseconds;
     extern const Event CasManifestHardLimitExceeded;
     extern const Event CasPartFolderManifestGets;
+    extern const Event CasRefBatchFlushes;
+    extern const Event CasRefBatchedMutations;
+    extern const Event CasRefBatchScopeCuts;
+    extern const Event CasRefQueueWaitMicroseconds;
+    extern const Event CasRefRecoveryRestarts;
+    extern const Event CasRefAppendWedged;
+    extern const Event CasRefAppendUnwedged;
+    extern const Event CasRefAppendDefiniteFailure;
 }
 
 namespace DB::Cas
@@ -46,6 +60,44 @@ namespace DB::Cas
 /// namespace by construction), so a contention storm is impossible — the bound only catches a
 /// pathological live-lock and never a legitimate steady state.
 static constexpr size_t MAX_CAS_ATTEMPTS = 100;
+
+/// Task 10: declared in CasStore.h (shared with CasBuild.cpp's promote). Wire: `u32 count | (u32
+/// klen+bytes, u32 vlen+bytes)...`. `std::map` already iterates sorted by key, so this is a pure
+/// function of the map's contents with no separate sort step.
+String encodeMutableFilesPayload(const std::map<String, String> & files)
+{
+    WriteBufferFromOwnString out;
+    writeBinaryLittleEndian(static_cast<uint32_t>(files.size()), out);
+    for (const auto & [k, v] : files)
+    {
+        writeBinaryLittleEndian(static_cast<uint32_t>(k.size()), out);
+        out.write(k.data(), k.size());
+        writeBinaryLittleEndian(static_cast<uint32_t>(v.size()), out);
+        out.write(v.data(), v.size());
+    }
+    return out.str();
+}
+
+std::map<String, String> decodeMutableFilesPayload(const String & payload)
+{
+    std::map<String, String> files;
+    if (payload.empty())
+        return files;
+    ReadBufferFromMemory in(payload.data(), payload.size());
+    uint32_t count = 0;
+    readBinaryLittleEndian(count, in);
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        uint32_t klen = 0;
+        readBinaryLittleEndian(klen, in);
+        const String k = DB::Cas::readFixedBytes(in, klen);
+        uint32_t vlen = 0;
+        readBinaryLittleEndian(vlen, in);
+        const String v = DB::Cas::readFixedBytes(in, vlen);
+        files[k] = v;
+    }
+    return files;
+}
 
 Store::Store(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
     : pool_backend(std::move(backend_))
@@ -68,6 +120,11 @@ Store::Store(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
         manifest_cache = std::make_unique<ManifestDecodeCache>(
             "LRU", CurrentMetrics::end(), CurrentMetrics::end(),
             config.manifest_decode_cache_bytes, /*max_count=*/16384, ManifestDecodeCache::DEFAULT_SIZE_RATIO);
+
+    /// Task 10: the ref-log writer path's retry controller. `config.boot_ms_fn` -- the SAME fake-clock
+    /// seam the local write fence uses -- is reused here rather than adding a second clock knob; both
+    /// are monotonic-ms clocks and tests that need deterministic deadline behavior already inject it.
+    ref_request_controller = std::make_unique<CasRequestController>(pool_backend, config.cas_request_budget, config.boot_ms_fn);
 }
 
 bool Store::isAlgoAdmitted(BlobHashAlgo algo) const
@@ -130,6 +187,22 @@ bool Store::mayMutate() const
 void Store::tripMountLost()
 {
     mount_fence.lost.store(true, std::memory_order_release);
+}
+
+bool Store::refAppendFenceOk() const
+{
+    /// RFC pre-attempt check (T5 review obligation): mount fence not lost AND now < lease_deadline AND
+    /// now + attempt_timeout + lease_safety_margin < lease_deadline -- `mayMutate()` only checks the
+    /// first two; this adds the REMAINING-budget check so a controlled attempt is never even started
+    /// unless it could plausibly finish (with its own safety margin) before the lease expires.
+    if (mount_fence.lost.load(std::memory_order_acquire))
+        return false;
+    const uint64_t now = bootMsNow();
+    const uint64_t deadline = mount_fence.deadline_boot_ms.load(std::memory_order_acquire);
+    if (now >= deadline)
+        return false;
+    const uint64_t margin = config.cas_request_budget.attempt_timeout_ms + config.cas_request_budget.lease_safety_margin_ms;
+    return margin < deadline - now;
 }
 
 void Store::setMountDeadline(uint64_t deadline_boot_ms)
@@ -808,17 +881,22 @@ std::shared_ptr<const RootShard> Store::loadShardDecoded(const String & key)
     return decoded;
 }
 
-std::optional<Resolved> Store::resolveRef(const RootNamespace & ns, const String & ref_name, bool allow_stale)
+std::optional<Resolved> Store::resolveRef(const RootNamespace & ns, const String & ref_name, bool /*allow_stale*/)
 {
-    /// Read side (spec §6): no GC awareness, no tokens. The ref is pure manifest state — resolving it
-    /// only reads the owning shard manifest; whether the named tree object is still present is checked
-    /// later by readManifest (INV-NO-DANGLE surfaces there).
-    const auto root = readShardDecoded(ns, shardOf(ref_name), allow_stale);
-    auto it = root->refs.find(ref_name);
-    if (it == root->refs.end())
+    /// Task 10: read side of the snapshot+log protocol (spec §Table State / §Read-Only Consumers). The
+    /// `allow_stale` staleness-tolerance knob no longer selects anything: this mounted writer is the
+    /// ONLY writer of `ns`'s ref state (no external CAS token to go stale against, unlike the old
+    /// per-shard decode cache), so the recovered-and-cached `RefTableState` is always this process's
+    /// authoritative view. Kept as a parameter so existing callers compile unchanged.
+    const auto rt = getRefTableRuntime(ns);
+    ensureRefTableRecovered(ns, *rt);
+
+    std::lock_guard lock(rt->state_mutex);
+    const auto it = rt->state.committed.find(ref_name);
+    if (it == rt->state.committed.end())
         return std::nullopt;
 
-    const RootRef & payload = it->second;
+    const RefCommittedRow & row = it->second;
     /// B170: a ref resolved to its manifest (the read-path entry point). object_hash is the manifest
     /// instance id the ref names; pairs with a later readManifest ReadMissing if that body is gone.
     if (hasEventSink())
@@ -828,16 +906,16 @@ std::optional<Resolved> Store::resolveRef(const RootNamespace & ns, const String
         _ev0.namespace_ = ns.string();
         _ev0.ref_name = ref_name;
         _ev0.object_kind = CasEventObjectKind::Manifest;
-        _ev0.object_hash = manifestRefDebugString(payload.manifest_ref);
+        _ev0.object_hash = manifestRefDebugString(row.manifest_ref);
         _ev0.outcome = "resolved";
         _ev0.reason = "read-side resolve of a ref to its part manifest";
         emitEvent(_ev0);
     }
     return Resolved{
-        .manifest_id = ManifestId{.root_namespace = ns, .ref = payload.manifest_ref},
+        .manifest_id = ManifestId{.root_namespace = ns, .ref = row.manifest_ref},
         .manifest_size = 0,
-        .mutable_files = payload.mutable_files,
-        .published_at_ms = payload.published_at_ms,
+        .mutable_files = decodeMutableFilesPayload(row.payload),
+        .published_at_ms = row.published_at_ms,
     };
 }
 
@@ -969,68 +1047,23 @@ BlobLocation Store::locate(const ManifestEntry & entry) const
 
 std::map<String, Resolved> Store::listRefs(const RootNamespace & ns)
 {
-    /// Refs are sharded by name across all root shards; the full ref set is the union over every PRESENT
-    /// shard. LIST-first (2026-07-03 CREATE/load HEAD storm): looping HEAD over every one of
-    /// `meta.root_shards` (32 by default) to find which shards exist made an empty/new namespace cost a
-    /// HEAD per shard on every CREATE/table-load — ~100 HEAD-misses across the three existsDirectory/
-    /// listDirectory/table-load sweeps. Instead, ONE LIST of the namespace's ref-shard prefix
-    /// (`refsNamespacePrefix`) learns which shard objects EXIST; only those are decoded. An empty
-    /// namespace now costs exactly 1 LIST and zero HEAD/GET. Listing tolerates a point-in-time snapshot:
-    /// pass allow_stale=true to benefit from the per-shard TTL fast-path (unchanged, still PRESENT-shard
-    /// only by design).
-    std::map<String, Resolved> result;
-    const String prefix = pool_layout.refsNamespacePrefix(ns);
-    std::vector<uint64_t> present_shards;
-    String cursor;
-    for (;;)
-    {
-        const ListPage page = pool_backend->list(prefix, cursor, /*limit=*/1024);
-        for (const ListedKey & lk : page.keys)
-        {
-            if (!lk.key.starts_with(prefix))
-                continue;
-            const std::string_view rest(lk.key.data() + prefix.size(), lk.key.size() - prefix.size());
-            const size_t slash = rest.rfind('/');
-            const std::string_view shard_sv = slash == std::string_view::npos ? rest : rest.substr(slash + 1);
-            uint64_t shard = 0;
-            /// Length guard: >9 digits cannot be a real shard index (root_shards is tiny) and could
-            /// wrap uint64 into a small in-range value, sneaking a foreign/corrupt key past the
-            /// bounds check below — reject by length before parsing (review follow-up, task A).
-            bool valid = !shard_sv.empty() && shard_sv.size() <= 9;
-            for (const char c : shard_sv)
-            {
-                if (c < '0' || c > '9')
-                {
-                    valid = false;
-                    break;
-                }
-                shard = shard * 10 + static_cast<uint64_t>(c - '0');
-            }
-            /// A stray non-numeric key or an out-of-range shard index is a foreign/corrupt object under
-            /// the namespace prefix — skip it defensively rather than throw (listing is a read path; one
-            /// bad object must never break listRefs for every caller).
-            if (!valid || shard >= meta.root_shards)
-                continue;
-            present_shards.push_back(shard);
-        }
-        if (page.next_cursor.empty())
-            break;
-        cursor = page.next_cursor;
-    }
+    /// Task 10: the whole ref set is a map iteration over this namespace's recovered-and-cached
+    /// `RefTableState` (spec §Why One LIST Is Sufficient / §Startup And Recovery) -- an empty or
+    /// never-touched namespace still costs exactly one `LIST` (recovery) and zero further requests;
+    /// a warm namespace costs nothing at all (replacing the old per-shard LIST-then-HEAD-present-shards
+    /// dance, since there is no longer a shard fan-out to rediscover on every call).
+    const auto rt = getRefTableRuntime(ns);
+    ensureRefTableRecovered(ns, *rt);
 
-    for (const uint64_t shard : present_shards)
-    {
-        const auto root = readShardDecoded(ns, shard, /*allow_stale=*/true);
-        for (const auto & [ref_name, payload] : root->refs)
-        {
-            result.emplace(ref_name, Resolved{
-                .manifest_id = ManifestId{.root_namespace = ns, .ref = payload.manifest_ref},
-                .manifest_size = 0,
-                .mutable_files = payload.mutable_files,
-                .published_at_ms = payload.published_at_ms,
-            });
-        }
-    }
+    std::map<String, Resolved> result;
+    std::lock_guard lock(rt->state_mutex);
+    for (const auto & [ref_name, row] : rt->state.committed)
+        result.emplace(ref_name, Resolved{
+            .manifest_id = ManifestId{.root_namespace = ns, .ref = row.manifest_ref},
+            .manifest_size = 0,
+            .mutable_files = decodeMutableFilesPayload(row.payload),
+            .published_at_ms = row.published_at_ms,
+        });
     return result;
 }
 
@@ -1352,6 +1385,455 @@ void Store::flushShardBatch(const RootNamespace & ns, uint64_t shard,
     }
 }
 
+std::shared_ptr<Store::RefTableRuntime> Store::getRefTableRuntime(const RootNamespace & ns)
+{
+    std::lock_guard lock(ref_queue_mutex);
+    auto & slot = ref_tables[ns.string()];
+    if (!slot)
+        slot = std::make_shared<RefTableRuntime>();
+    return slot;
+}
+
+void Store::ensureRefTableRecovered(const RootNamespace & ns, RefTableRuntime & rt)
+{
+    /// Held for the WHOLE recovery (including its I/O): there is nothing safe to do with an unrecovered
+    /// table's `state` anyway, so a concurrent second caller for the SAME namespace blocking here is
+    /// correct, not a missed-concurrency opportunity -- and this only affects each table's FIRST touch
+    /// per mounted Store (spec §Startup And Recovery: "one LIST ... cache the resulting complete table
+    /// state").
+    std::lock_guard lock(rt.state_mutex);
+    if (rt.recovered)
+        return;
+
+    for (uint64_t attempt = 0; ; ++attempt)
+    {
+        if (attempt > 0)
+        {
+            if (attempt > kRefRecoveryMaxRestarts)
+                throw Exception(ErrorCodes::ABORTED,
+                    "CAS ref-table recovery for namespace '{}' restarted {} times (a selected snapshot or "
+                    "log object kept vanishing between its LIST and GET) — giving up; this bound is a "
+                    "runaway brake against a pathological cleanup race, not an expected steady state",
+                    ns.string(), attempt - 1);
+            ++rt.recovery_restarts;
+            ProfileEvents::increment(ProfileEvents::CasRefRecoveryRestarts);
+        }
+
+        /// spec §Why One LIST Is Sufficient: one namespace LIST returns every surviving snapshot, log,
+        /// and `_cleanup` marker key.
+        std::optional<RefTxnId> greatest_snapshot;
+        std::vector<RefTxnId> log_ids;
+        std::set<RefTxnId> cleanup_markers;
+        const String prefix = pool_layout.refsNamespacePrefix(ns);
+        String cursor;
+        for (;;)
+        {
+            const ListPage page = pool_backend->list(prefix, cursor, /*limit=*/1000);
+            for (const ListedKey & lk : page.keys)
+            {
+                const auto parsed = pool_layout.parseRefObjectKey(lk.key);
+                if (!parsed)
+                    continue;   /// not one of Task 10's ref-object keys (e.g. a legacy shard-number key)
+                /// T8 review obligation: trust the parsed `ns` only when it names EXACTLY this
+                /// namespace -- the same checkNamespace-level guarantee the key builders enforce, not
+                /// position math (the scoped LIST prefix already implies this in practice, but a listed
+                /// key is untrusted input and is treated as such).
+                if (parsed->ns != ns)
+                    continue;
+                switch (parsed->kind)
+                {
+                    case RefObjectKind::Cleanup:
+                        cleanup_markers.insert(parsed->txn_id);
+                        break;
+                    case RefObjectKind::Log:
+                        log_ids.push_back(parsed->txn_id);
+                        break;
+                    case RefObjectKind::Snap:
+                        if (!greatest_snapshot || *greatest_snapshot < parsed->txn_id)
+                            greatest_snapshot = parsed->txn_id;
+                        break;
+                }
+            }
+            if (page.next_cursor.empty())
+                break;
+            cursor = page.next_cursor;
+        }
+        std::sort(log_ids.begin(), log_ids.end());
+
+        bool vanished = false;
+        std::optional<RefTableSnapshot> snapshot;
+        if (greatest_snapshot)
+        {
+            const auto got = pool_backend->get(pool_layout.refSnapshotKey(ns, *greatest_snapshot));
+            if (!got)
+                vanished = true;   /// covered by a newer snapshot published-before-delete; restart
+            else
+                snapshot = decodeRefTableSnapshot(got->bytes, ns.string(), *greatest_snapshot);
+        }
+
+        std::vector<RefLogTxn> tail;
+        if (!vanished)
+        {
+            for (const RefTxnId & id : log_ids)
+            {
+                if (greatest_snapshot && !(*greatest_snapshot < id))
+                    continue;   /// at or below the selected snapshot: already covered
+                const auto got = pool_backend->get(pool_layout.refLogKey(ns, id));
+                if (!got)
+                {
+                    vanished = true;
+                    break;
+                }
+                tail.push_back(decodeRefLogTxn(got->bytes, ns.string(), id));
+            }
+        }
+
+        if (vanished)
+            continue;   /// restart-on-vanish (spec §Startup And Recovery): not corruption, retry fresh
+
+        rt.state = replay(snapshot, tail);
+        rt.cleanup_markers = std::move(cleanup_markers);
+        rt.recovered = true;
+
+        /// Per-table admission budgets (spec §Snapshot Format): pre-subtract this table's own wire
+        /// overhead (`4 + ns.size()`, repeated once in a snapshot body and once in a removal txn body)
+        /// plus a fixed Phase-1 safety margin from the raw hard limits, once, here.
+        const uint64_t overhead = 4 + ns.string().size() + kRefAdmissionSafetyMargin;
+        rt.snapshot_budget = overhead < ref_snapshot_max_bytes ? ref_snapshot_max_bytes - overhead : 0;
+        rt.removal_budget = overhead < ref_removal_max_bytes ? ref_removal_max_bytes - overhead : 0;
+        return;
+    }
+}
+
+uint64_t Store::refRecoveryRestartsForTest(const RootNamespace & ns)
+{
+    const auto rt = getRefTableRuntime(ns);
+    ensureRefTableRecovered(ns, *rt);
+    std::lock_guard lock(rt->state_mutex);
+    return rt->recovery_restarts;
+}
+
+bool Store::refLaneWedgedForTest(const RootNamespace & ns)
+{
+    const auto rt = getRefTableRuntime(ns);
+    std::lock_guard lock(rt->state_mutex);
+    return rt->wedge.has_value();
+}
+
+RefTxnId Store::appendRefOps(const RootNamespace & ns, MutationScope scope,
+                             std::function<std::vector<RefOp>(const RefTableState &)> build_ops,
+                             RootMutationOrigin origin, RootMutationKind kind)
+{
+    const auto rt = getRefTableRuntime(ns);
+
+    auto item = std::make_shared<RefMutationItem>();
+    item->scope = std::move(scope);
+    item->build_ops = std::move(build_ops);
+    item->origin = origin;
+    item->kind = kind;
+
+    const auto enqueued_at = std::chrono::steady_clock::now();
+    std::unique_lock<std::mutex> lk(ref_queue_mutex);
+    rt->pending.push_back(item);
+
+    while (!item->done)
+    {
+        if (!rt->leader_active)
+        {
+            rt->leader_active = true;
+            lk.unlock();
+            runRefQueueLeader(ns, rt, item);
+            lk.lock();
+            rt->leader_active = false;
+            rt->cv.notify_all();
+        }
+        else
+        {
+            rt->cv.wait(lk);
+        }
+    }
+    lk.unlock();
+
+    ProfileEvents::increment(ProfileEvents::CasRefQueueWaitMicroseconds,
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - enqueued_at).count());
+    if (item->error)
+        std::rethrow_exception(item->error);
+    return item->committed_id;
+}
+
+void Store::runRefQueueLeader(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt,
+                              const std::shared_ptr<RefMutationItem> & own)
+{
+    /// Fairness baton pass, exactly like `runShardQueueLeader`: serve flushes only until the caller's
+    /// OWN item is done, then hand off to a woken waiter.
+    while (true)
+    {
+        {
+            std::lock_guard<std::mutex> g(ref_queue_mutex);
+            if (own->done)
+                return;
+        }
+        flushRefBatch(ns, rt);
+    }
+}
+
+void Store::flushRefBatch(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt)
+{
+    /// One flush = one carved batch through one attempted append. NEVER throws: every outcome lands in
+    /// the affected items so waiters always wake (mirrors `flushShardBatch`'s contract exactly).
+    auto complete_error = [&](const std::vector<std::shared_ptr<RefMutationItem>> & items, std::exception_ptr e)
+    {
+        std::lock_guard<std::mutex> g(ref_queue_mutex);
+        for (const auto & it : items)
+        {
+            it->error = e;
+            it->done = true;
+        }
+        rt->cv.notify_all();
+    };
+    auto carve_all_pending = [&]() -> std::vector<std::shared_ptr<RefMutationItem>>
+    {
+        std::lock_guard<std::mutex> g(ref_queue_mutex);
+        std::vector<std::shared_ptr<RefMutationItem>> all(rt->pending.begin(), rt->pending.end());
+        rt->pending.clear();
+        return all;
+    };
+
+    try
+    {
+        ensureRefTableRecovered(ns, *rt);
+    }
+    catch (...)
+    {
+        complete_error(carve_all_pending(), std::current_exception());
+        return;
+    }
+
+    /// Local write fence (spec §write-fence): a superseded/paused writer must not race the live one.
+    /// Fails the WHOLE queue -- every caller would have gotten the same refusal alone.
+    if (!mayMutate())
+    {
+        complete_error(carve_all_pending(), std::make_exception_ptr(Exception(ErrorCodes::ABORTED,
+            "CAS mount lost / lease expired — refusing to append ref-log transactions for server_root '{}'",
+            config.server_root_id)));
+        return;
+    }
+
+    const auto fence_ok = [this] { return refAppendFenceOk(); };
+
+    /// Resolve an outstanding wedge FIRST (spec §Writer-Side Linearization): "It does not start a later
+    /// ref-log PUT for that table until the earlier result is resolved."
+    {
+        std::optional<RefAppendWedge> wedge_copy;
+        {
+            std::lock_guard lock(rt->state_mutex);
+            wedge_copy = rt->wedge;
+        }
+        if (wedge_copy)
+        {
+            const CasWriteOutcome resolved = ref_request_controller->resolveByExactGet(wedge_copy->key, wedge_copy->bytes);
+            if (resolved == CasWriteOutcome::Committed)
+            {
+                std::lock_guard lock(rt->state_mutex);
+                /// Apply BEFORE unwedging (spec: "a wedged append later observed durable is applied to
+                /// cache before unwedging"). Guard against a re-entrant double-apply: only if this is
+                /// still the SAME wedge (single leader per table makes a mismatch impossible, but the
+                /// check costs nothing and documents the invariant).
+                if (rt->wedge && rt->wedge->txn_id == wedge_copy->txn_id)
+                {
+                    const RefLogTxn wedged_txn = decodeRefLogTxn(wedge_copy->bytes, ns.string(), wedge_copy->txn_id);
+                    applyRefLogTxn(rt->state, wedged_txn);
+                    rt->wedge.reset();
+                }
+                ProfileEvents::increment(ProfileEvents::CasRefAppendUnwedged);
+            }
+            else
+            {
+                /// Still Unresolved: fail every CURRENTLY queued item with the SAME uncertainty
+                /// exception and do not allocate a new id. A later call into this namespace's queue
+                /// retries the resolve.
+                complete_error(carve_all_pending(), std::make_exception_ptr(Exception(ErrorCodes::ABORTED,
+                    "CAS ref-log append for namespace '{}' txn {}-{} is still UNCERTAIN — the append lane "
+                    "stays wedged until the SAME key resolves durable or a conclusive rejection is observed",
+                    ns.string(), wedge_copy->txn_id.writer_epoch, wedge_copy->txn_id.ref_sequence)));
+                return;
+            }
+        }
+    }
+
+    /// Test-only (see `setRefPreCarveHookForTest`): a no-op in production.
+    if (ref_pre_carve_hook_for_test)
+        ref_pre_carve_hook_for_test();
+
+    /// Carve a compatible batch (spec §Local Batching Queue). `lifecycle != Live` forces a solo carve:
+    /// `namespace_birth` must run alone, and the flush already KNOWS the table's current lifecycle
+    /// before carving (unlike a per-item property, which would need speculative undo).
+    RefTableState working;
+    bool table_live;
+    {
+        std::lock_guard lock(rt->state_mutex);
+        working = rt->state;
+        table_live = rt->state.lifecycle == RefLifecycle::Live;
+    }
+
+    std::vector<std::shared_ptr<RefMutationItem>> batch;
+    {
+        std::lock_guard<std::mutex> g(ref_queue_mutex);
+        const size_t cap = table_live ? kMaxRefBatch : 1;
+        std::set<String> seen_refs;
+        while (!rt->pending.empty() && batch.size() < cap)
+        {
+            const auto & front = rt->pending.front();
+            if (front->scope.kind == MutationScope::Kind::WholeShard)
+            {
+                if (!batch.empty())
+                    break;
+                batch.push_back(front);
+                rt->pending.pop_front();
+                break;
+            }
+            if (!seen_refs.insert(front->scope.ref_name).second)
+            {
+                ProfileEvents::increment(ProfileEvents::CasRefBatchScopeCuts);
+                break;
+            }
+            batch.push_back(front);
+            rt->pending.pop_front();
+        }
+    }
+    if (batch.empty())
+        return;   /// raced: everything was carved by a previous flush of this leader
+
+    /// Per-item validation, in order, against `working` (per-request undo via `item_scratch`):
+    /// business preconditions (thrown by `build_ops` itself) and the pre-encode admission budget both
+    /// fail ONLY the offending item; survivors' ops accumulate into `final_ops` for one transaction.
+    std::vector<RefOp> final_ops;
+    std::vector<std::shared_ptr<RefMutationItem>> survivors;
+    RefTxnId trial_id = working.greatest_applied;
+    /// A never-born table's `greatest_applied` is `{0, 0}`; `applyRefLogTxn`'s strict-increase check
+    /// only needs a strictly greater EPOCH to accept the first trial id (RefTxnId compares epoch
+    /// first), and `admits()`'s preview snapshot encoding rejects a zero epoch field regardless of
+    /// sequence. `process_epoch` is this Store's own nonzero epoch -- reused here purely as a valid
+    /// placeholder; these trial ids are never persisted or compared outside this loop.
+    if (trial_id.writer_epoch == 0)
+        trial_id.writer_epoch = process_epoch;
+    for (const auto & it : batch)
+    {
+        RefTableState item_scratch = working;
+        try
+        {
+            std::vector<RefOp> item_ops = it->build_ops(working);
+            for (const RefOp & op : item_ops)
+            {
+                /// Admission budget (spec §Snapshot Format): only STATE-GROWING ops need the check --
+                /// an `owner_transition` installing a binding (add or promote) and `set_payload`.
+                /// `namespace_birth` is exempt (it grows nothing, and a never-born state's preview has
+                /// no meaningful "current snapshot" to encode); `remove_namespace` and a pure
+                /// owner_transition removal shrink state and can never violate the budget.
+                const bool state_growing = (op.kind == RefOpKind::OwnerTransition && op.new_binding.has_value())
+                    || op.kind == RefOpKind::SetPayload;
+                if (state_growing && !admits(item_scratch, op, rt->snapshot_budget, rt->removal_budget))
+                    throw Exception(ErrorCodes::LIMIT_EXCEEDED,
+                        "ref mutation on namespace '{}' would exceed the table's admission budget "
+                        "(snapshot_budget={} removal_budget={}) — refusing before any object is created",
+                        ns.string(), rt->snapshot_budget, rt->removal_budget);
+                /// Apply THIS op to item_scratch now (a single-op trial transaction) so a LATER op of
+                /// the SAME item (e.g. namespace_birth immediately followed by its first
+                /// owner_transition) is validated -- both here and by admits()'s own preview -- against
+                /// a state that already reflects it, exactly as the real combined transaction will.
+                trial_id.ref_sequence += 1;
+                applyRefLogTxn(item_scratch, RefLogTxn{ns.string(), trial_id, {op}});
+            }
+            working = std::move(item_scratch);
+            final_ops.insert(final_ops.end(), item_ops.begin(), item_ops.end());
+            survivors.push_back(it);
+        }
+        catch (...)
+        {
+            complete_error({it}, std::current_exception());
+        }
+    }
+    if (final_ops.empty())
+    {
+        /// Either every item failed validation (already completed via complete_error above, nothing
+        /// left to do), or every survivor's own `build_ops` legitimately contributed ZERO ops (an
+        /// idempotent no-op, e.g. precommitAdd/promote re-targeting a manifest already exactly
+        /// committed). Survivors of the latter kind still need marking done -- with no new object
+        /// created, `committed_id` is simply the table's current (unchanged) high-water mark.
+        if (!survivors.empty())
+        {
+            std::lock_guard<std::mutex> g(ref_queue_mutex);
+            for (const auto & it : survivors)
+            {
+                it->committed_id = working.greatest_applied;
+                it->done = true;
+            }
+            rt->cv.notify_all();
+        }
+        return;
+    }
+
+    const RefTxnId id = allocateRefTxnId();
+    const RefLogTxn final_txn{ns.string(), id, final_ops};
+    String bytes;
+    try
+    {
+        bytes = encodeRefLogTxn(final_txn);
+    }
+    catch (...)
+    {
+        complete_error(survivors, std::current_exception());
+        return;
+    }
+    const String key = pool_layout.refLogKey(ns, id);
+
+    const CasWriteOutcome outcome = ref_request_controller->putIfAbsentControlled(key, bytes, fence_ok);
+    switch (outcome)
+    {
+        case CasWriteOutcome::Committed:
+        {
+            {
+                std::lock_guard lock(rt->state_mutex);
+                applyRefLogTxn(rt->state, final_txn);
+            }
+            ProfileEvents::increment(ProfileEvents::CasRefBatchFlushes);
+            ProfileEvents::increment(ProfileEvents::CasRefBatchedMutations, survivors.size());
+            std::lock_guard<std::mutex> g(ref_queue_mutex);
+            for (const auto & it : survivors)
+            {
+                it->committed_id = id;
+                it->done = true;
+            }
+            rt->cv.notify_all();
+            return;
+        }
+        case CasWriteOutcome::DefiniteFailure:
+        {
+            ProfileEvents::increment(ProfileEvents::CasRefAppendDefiniteFailure);
+            complete_error(survivors, std::make_exception_ptr(Exception(ErrorCodes::ABORTED,
+                "CAS ref-log append for namespace '{}' definitively failed (non-retryable rejection); "
+                "cached state is unchanged and txn id {}-{} is a safe gap",
+                ns.string(), id.writer_epoch, id.ref_sequence)));
+            return;
+        }
+        case CasWriteOutcome::Unresolved:
+        {
+            {
+                std::lock_guard lock(rt->state_mutex);
+                rt->wedge = RefAppendWedge{id, key, bytes};
+            }
+            ProfileEvents::increment(ProfileEvents::CasRefAppendWedged);
+            complete_error(survivors, std::make_exception_ptr(Exception(ErrorCodes::ABORTED,
+                "CAS ref-log append for namespace '{}' txn {}-{} is UNCERTAIN (retry budget exhausted) — "
+                "the append lane is wedged until the SAME key resolves durable or a conclusive rejection "
+                "is observed; this outcome is unproven, not failure",
+                ns.string(), id.writer_epoch, id.ref_sequence)));
+            return;
+        }
+    }
+}
+
 uint64_t Store::currentGcRound() const
 {
     /// Task 5: read `gc/state` once (no CAS loop — a point-in-time read is sufficient; a concurrent
@@ -1365,33 +1847,29 @@ uint64_t Store::currentGcRound() const
 
 void Store::dropRef(const RootNamespace & ns, const String & ref_name)
 {
-    /// Drop = the same CAS shape as publish (spec rev. 15 §Root Journal Format): remove refs[name],
-    /// append a RootOwnerEvent whose old_binding is the committed binding being removed and whose
-    /// new_binding is none (true removal ⇒ GC folds -1 + cleanup of the named manifest).
+    /// Task 10 (spec §Remove Committed Ref): one `owner_transition` removal ref-log transaction. The
+    /// exact committed binding must exist; `build_ops` reads it off the CURRENT batch-validation state,
+    /// so a concurrently-co-batched publish/drop of a DIFFERENT ref sees a consistent view.
     ManifestRef dropped_ref;
-    uint64_t at_version = 0;
-    mutateShard(ns, shardOf(ref_name), MutationScope::ref(ref_name), [&](RootShard & root)
-    {
-        auto it = root.refs.find(ref_name);
-        if (it == root.refs.end())
-            /// Fail-closed (no silent no-op): the throw propagates out of mutateShard and aborts the drop.
-            throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
-                "dropRef: no such ref {} in namespace {}", ref_name, ns.string());
+    const RefTxnId txn_id = appendRefOps(ns, MutationScope::ref(ref_name),
+        [&](const RefTableState & state) -> std::vector<RefOp>
+        {
+            const auto it = state.committed.find(ref_name);
+            if (it == state.committed.end())
+                /// Fail-closed (no silent no-op): this item's own exception, the batch survives.
+                throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
+                    "dropRef: no such ref {} in namespace {}", ref_name, ns.string());
 
-        dropped_ref = it->second.manifest_ref;
-        at_version = root.shard_version + 1;
-        root.refs.erase(it);
-        /// transition_version is the NEW shard_version this attempt commits — the helper bumps AFTER
-        /// mutate, so here the post-commit version is root.shard_version + 1.
-        root.journal.push_back(RootOwnerEvent{
-            .transition_version = root.shard_version + 1,
-            .old_binding = OwnerBinding{
-                .owner_kind = OwnerKind::Committed, .ref_name = ref_name,
-                .build_id = UInt128(0), .manifest_ref = dropped_ref},
-            .new_binding = std::nullopt});
-    }, nullptr, RootMutationOrigin::Writer, RootMutationKind::Drop);
-    /// B170: the ref was dropped (a removal RootOwnerEvent GC folds as a true removal). object_hash is
-    /// the manifest the ref named, so a part's "publish -> drop" life is reconstructable from the rows.
+            dropped_ref = it->second.manifest_ref;
+            RefOp op;
+            op.kind = RefOpKind::OwnerTransition;
+            op.old_binding = RefOwnerBinding{RefOwnerKind::Committed, ref_name, dropped_ref};
+            return {op};
+        },
+        RootMutationOrigin::Writer, RootMutationKind::Drop);
+
+    /// B170: the ref was dropped (a removal op GC folds as a true removal, Task 12). object_hash is the
+    /// manifest the ref named, so a part's "publish -> drop" life is reconstructable from the rows.
     if (hasEventSink())
     {
         CasEvent _ev3;
@@ -1400,9 +1878,9 @@ void Store::dropRef(const RootNamespace & ns, const String & ref_name)
         _ev3.ref_name = ref_name;
         _ev3.object_kind = CasEventObjectKind::Manifest;
         _ev3.object_hash = manifestRefDebugString(dropped_ref);
-        _ev3.at_version = at_version;
+        _ev3.at_version = txn_id.ref_sequence;
         _ev3.outcome = "ok";
-        _ev3.reason = "dropRef: removed the ref and appended a removal RootOwnerEvent";
+        _ev3.reason = "dropRef: appended an owner_transition removal ref-log transaction";
         emitEvent(_ev3);
     }
 }
@@ -1410,27 +1888,44 @@ void Store::dropRef(const RootNamespace & ns, const String & ref_name)
 void Store::updateRefPayload(const RootNamespace & ns, const String & ref_name,
                              std::function<void(RootRef &)> mutator)
 {
-    /// Mutable-fields-only update (design §3): no reachability change ⇒ NO journal event.
-    mutateShard(ns, shardOf(ref_name), MutationScope::ref(ref_name), [&](RootShard & root)
-    {
-        auto it = root.refs.find(ref_name);
-        if (it == root.refs.end())
-            throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
-                "updateRefPayload: no such ref {} in namespace {}", ref_name, ns.string());
+    /// Task 10 (spec §Update Payload): one `set_payload` ref-log transaction. Unlike the old
+    /// journal-free RootShard field mutation, EVERY change (even payload-only) is now an explicit
+    /// logged operation -- the immutable append-only log has no other way to record it (spec: "The
+    /// operation replaces the complete mutable payload and does not change the manifest edge").
+    appendRefOps(ns, MutationScope::ref(ref_name),
+        [&](const RefTableState & state) -> std::vector<RefOp>
+        {
+            const auto it = state.committed.find(ref_name);
+            if (it == state.committed.end())
+                throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
+                    "updateRefPayload: no such ref {} in namespace {}", ref_name, ns.string());
 
-        const ManifestRef old_manifest_ref = it->second.manifest_ref;
+            /// Round-trip through the legacy RootRef shape so every existing `mutator` (written
+            /// against `RootRef::mutable_files`) is unchanged; only the persisted encoding (one opaque
+            /// `payload` blob) is new.
+            RootRef legacy;
+            legacy.ref_name = ref_name;
+            legacy.manifest_ref = it->second.manifest_ref;
+            legacy.mutable_files = decodeMutableFilesPayload(it->second.payload);
+            legacy.published_at_ms = it->second.published_at_ms;
 
-        RootRef payload = it->second;
-        mutator(payload);
+            mutator(legacy);
 
-        /// A reachability change is not allowed on this path: it would need a journal event (use
-        /// publish/drop instead). Throwing here aborts before casPut — the manifest stays untouched.
-        if (!(payload.manifest_ref == old_manifest_ref))
-            throw Exception(ErrorCodes::LOGICAL_ERROR,
-                "updateRefPayload must not change manifest_ref; use publish/drop");
+            /// A reachability change is not allowed on this path (use publish/drop instead); throwing
+            /// here rejects only this item, before any object is created.
+            if (!(legacy.manifest_ref == it->second.manifest_ref))
+                throw Exception(ErrorCodes::LOGICAL_ERROR,
+                    "updateRefPayload must not change manifest_ref; use publish/drop");
 
-        it->second = std::move(payload);
-    }, nullptr, RootMutationOrigin::Writer, RootMutationKind::UpdateRefPayload);
+            RefOp op;
+            op.kind = RefOpKind::SetPayload;
+            op.ref_name = ref_name;
+            op.expected_manifest_ref = it->second.manifest_ref;
+            op.payload = encodeMutableFilesPayload(legacy.mutable_files);
+            op.published_at_ms = legacy.published_at_ms;
+            return {op};
+        },
+        RootMutationOrigin::Writer, RootMutationKind::UpdateRefPayload);
 }
 
 void Store::removeNamespaceFile(const RootNamespace & ns, const String & name)
@@ -1543,8 +2038,11 @@ std::vector<String> Store::listNamespaces(const String & prefix)
     /// RustFS: to confirm in soak.
     std::unordered_set<String> found;
 
-    /// `cas/refs/`: keys are `<pool_prefix>/cas/refs/<ns>/<shard>` (shard is a decimal integer).
-    /// Strip the pool prefix, then extract ns = everything before the last '/'.
+    /// `cas/refs/`: Task 10 keys are `<pool_prefix>/cas/refs/<ns>/_log|_snap|_cleanup/<txn-id>`; the
+    /// pre-Task-10 (still GC/dropNamespace-written until Task 12) legacy shape is
+    /// `<pool_prefix>/cas/refs/<ns>/<shard>` (shard a decimal integer). Try the new parser first; a key
+    /// it does not recognize falls back to the legacy "namespace = everything before the last '/'"
+    /// extraction so a namespace touched only via the old writer path stays discoverable.
     {
         const String base = pool_layout.casRefsPrefix() + prefix;
         String cursor;
@@ -1556,6 +2054,12 @@ std::vector<String> Store::listNamespaces(const String & prefix)
                 const String & key = listed.key;
                 if (!key.starts_with(base))
                     continue;
+                if (const auto parsed = pool_layout.parseRefObjectKey(key))
+                {
+                    if (parsed->ns.string().starts_with(prefix))
+                        found.insert(parsed->ns.string());
+                    continue;
+                }
                 const std::string_view rest(key.data() + pool_layout.casRefsPrefix().size(),
                     key.size() - pool_layout.casRefsPrefix().size());
                 const size_t last_slash = rest.rfind('/');

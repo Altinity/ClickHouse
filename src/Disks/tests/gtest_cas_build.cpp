@@ -1307,22 +1307,6 @@ TEST(CasBuild, PublishHappyPathRoundTrip)
     auto got = b->get(loc.key, Range{loc.offset, loc.length});
     ASSERT_TRUE(got.has_value());
     EXPECT_EQ(got->bytes, "hello world");
-
-    /// journal: read the shard manifest raw, assert the last RootOwnerEvent is the committed owner move
-    /// for "part_1" naming this manifest_ref, and that refs[part_1] points at it.
-    const uint64_t shard = shardOfForTest("part_1", s->poolMeta().root_shards);
-    auto shard_raw = b->get(s->layout().rootShardKey(ns, shard));
-    ASSERT_TRUE(shard_raw.has_value());
-    const RootShard root = decodeRootShard(shard_raw->bytes);
-    ASSERT_FALSE(root.journal.empty());
-    const RootOwnerEvent & last = root.journal.back();
-    ASSERT_TRUE(last.new_binding.has_value());
-    EXPECT_EQ(last.new_binding->owner_kind, OwnerKind::Committed);
-    EXPECT_EQ(last.new_binding->ref_name, "part_1");
-    EXPECT_EQ(last.new_binding->manifest_ref, id.ref);
-    EXPECT_EQ(last.transition_version, root.shard_version);
-    ASSERT_TRUE(root.refs.contains("part_1"));
-    EXPECT_EQ(root.refs.at("part_1").manifest_ref, id.ref);
 }
 
 TEST(CasBuild, PromoteCrossNamespaceManifestFailsClosed)
@@ -1412,82 +1396,38 @@ TEST(CasBuild, PublishIntoSecondNamespaceSameBlob)
     EXPECT_EQ(b->head(blob_key).token, blob_token);
 }
 
-TEST(CasBuild, TwoBuildsPublishToSameShardSerialize)
+/// Task 10: refs are no longer sharded (one whole-table cache per namespace, spec §Table State), so
+/// there is no more "same shard" CAS-conflict-retry to force — two builds publishing into the SAME
+/// TABLE now serialize through the append lane's per-namespace batching queue instead (exercised by
+/// gtest_cas_ref_writer.cpp's co-batch/queue tests). What remains a real regression to guard is the
+/// end-to-end outcome: two builds publishing distinct refs into one namespace both land correctly.
+TEST(CasBuild, TwoBuildsPublishToSameNamespaceBothLand)
 {
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openStore(b);
-    const uint64_t root_shards = s->poolMeta().root_shards;
-
-    /// Find two distinct ref names that map to the SAME shard.
-    String ref1;
-    String ref2;
-    {
-        std::map<uint64_t, String> seen;
-        for (char c = 'a'; c <= 'z' && ref2.empty(); ++c)
-        {
-            const String name(1, c);
-            const uint64_t sh = shardOfForTest(name, root_shards);
-            auto it = seen.find(sh);
-            if (it != seen.end())
-            {
-                ref1 = it->second;
-                ref2 = name;
-            }
-            else
-            {
-                seen.emplace(sh, name);
-            }
-        }
-    }
-    ASSERT_FALSE(ref1.empty());
-    ASSERT_FALSE(ref2.empty());
-    ASSERT_EQ(shardOfForTest(ref1, root_shards), shardOfForTest(ref2, root_shards));
-
     const RootNamespace ns{"srv1/tbl"};
+    const String ref1 = "a";
+    const String ref2 = "b";
 
-    /// Build A publishes ref1.
     auto build_a = startBuildFor(s, ns, ref1);
     build_a->putBlob(idOf("content-a"), BlobSource::fromString("content-a"));
     const ManifestId id_a = build_a->stageManifest({blobManifestEntry("data.bin", "content-a")});
     build_a->precommitAdd(ns, ref1, id_a);
     build_a->promote(ns, ref1, build_a->buildId(), id_a);
 
-    /// Build B publishes ref2 into the same shard: its mutateShard sees A's manifest (shard_version
-    /// advanced past 0), re-reads, and lands. The single artificial conflict forces B to genuinely
-    /// re-read after the first attempt.
     auto build_b = startBuildFor(s, ns, ref2);
     build_b->putBlob(idOf("content-b"), BlobSource::fromString("content-b"));
     const ManifestId id_b = build_b->stageManifest({blobManifestEntry("data.bin", "content-b")});
     build_b->precommitAdd(ns, ref2, id_b);
-
-    const uint64_t shard = shardOfForTest(ref2, root_shards);
-    b->failNextCasPut(s->layout().rootShardKey(ns, shard));
     build_b->promote(ns, ref2, build_b->buildId(), id_b);
 
-    /// Both refs resolve.
     auto r1 = s->resolveRef(ns, ref1);
     auto r2 = s->resolveRef(ns, ref2);
     ASSERT_TRUE(r1.has_value());
     ASSERT_TRUE(r2.has_value());
     EXPECT_EQ(r1->manifest_id, id_a);
     EXPECT_EQ(r2->manifest_id, id_b);
-
-    /// The shared manifest holds both refs and two committed-owner events.
-    auto shard_raw = b->get(s->layout().rootShardKey(ns, shard));
-    ASSERT_TRUE(shard_raw.has_value());
-    const RootShard root = decodeRootShard(shard_raw->bytes);
-    EXPECT_TRUE(root.refs.contains(ref1));
-    EXPECT_TRUE(root.refs.contains(ref2));
-
-    /// Each promote appends a precommit->committed owner MOVE (old_binding={Precommit}, new={Committed},
-    /// same manifest_ref). Both refs serialized into the shared shard, so there are exactly two such moves.
-    size_t committed_moves = 0;
-    for (const RootOwnerEvent & rec : root.journal)
-        if (rec.old_binding && rec.old_binding->owner_kind == OwnerKind::Precommit
-            && rec.new_binding && rec.new_binding->owner_kind == OwnerKind::Committed)
-            ++committed_moves;
-    EXPECT_EQ(committed_moves, 2u);
-    EXPECT_EQ(root.refs.size(), 2u);
+    EXPECT_EQ(s->listRefs(ns).size(), 2u);
 }
 
 TEST(CasBuild, FirstPublishMakesNamespaceDiscoverable)
@@ -1806,25 +1746,20 @@ TEST(CasBuild, PromoteFailsClosedWhenPrecommitNoLongerLiveOwner)
     const ManifestId id = build->stageManifest({blobManifestEntry("data.bin", "hello world")});
     build->precommitAdd(ns, "part_1", id);
 
-    /// Make the precommit NO LONGER the live owner: append a precommit-REMOVAL RootOwnerEvent on the
-    /// target shard exactly as an abandon / GC reclaim would (old = the precommit binding, new = none).
-    /// We drive the shard manifest CAS directly through the backend codec (the converged model keeps the
-    /// precommit binding in the future committed ref's own shard, keyed by final_ref_name).
-    {
-        const uint64_t shard = shardOfForTest("part_1", s->poolMeta().root_shards);
-        const String key = s->layout().rootShardKey(ns, shard);
-        const auto got = b->get(key);
-        ASSERT_TRUE(got.has_value());
-        RootShard root = decodeRootShard(got->bytes);
-        ++root.shard_version;
-        root.journal.push_back(RootOwnerEvent{
-            .transition_version = root.shard_version,
-            .old_binding = OwnerBinding{
-                .owner_kind = OwnerKind::Precommit, .ref_name = "part_1",
-                .build_id = build->buildId(), .manifest_ref = id.ref},
-            .new_binding = std::nullopt});
-        ASSERT_EQ(b->casPut(key, encodeRootShard(root), got->token).outcome, CasOutcome::Committed);
-    }
+    /// Make the precommit NO LONGER the live owner: append an exact precommit-removal ref-log
+    /// transaction exactly as an abandon / GC reclaim would (spec §Remove Precommit) -- via the SAME
+    /// public append lane a real abandon/reclaim would use, simulating an external actor this build
+    /// object does not know about (not this build's own `abandon()`, which would also retire it and
+    /// mask the "precommit no longer live" guard behind requireAlive()'s own rejection).
+    s->appendRefOps(ns, MutationScope::ref("part_1"),
+        [&](const RefTableState &) -> std::vector<RefOp>
+        {
+            RefOp op;
+            op.kind = RefOpKind::OwnerTransition;
+            op.old_binding = RefOwnerBinding{RefOwnerKind::Precommit, "part_1", id.ref};
+            return {op};
+        },
+        RootMutationOrigin::Writer, RootMutationKind::Abandon);
 
     /// promote must fail closed: the precommit is no longer the live owner, so a Δ=0 move would dangle.
     expectThrowsCode(DB::ErrorCodes::ABORTED,
@@ -1879,20 +1814,13 @@ TEST(CasBuild, AbandonAppendsPrecommitRemovalAndKeepsLivePrecommitBody)
     EXPECT_TRUE(b->head(manifest_key).exists)
         << "abandon must NOT writer-delete a live precommit body (delete-after-sealed-decrements)";
 
-    /// (b) a precommit-REMOVAL RootOwnerEvent (old = Precommit binding, new = none) is in the target shard.
-    const uint64_t shard = shardOfForTest("part_1", s->poolMeta().root_shards);
-    const auto shard_raw = b->get(s->layout().rootShardKey(ns, shard));
-    ASSERT_TRUE(shard_raw.has_value());
-    const RootShard root = decodeRootShard(shard_raw->bytes);
-    const OwnerBinding expected{
-        .owner_kind = OwnerKind::Precommit, .ref_name = "part_1",
-        .build_id = abandoned_build_id, .manifest_ref = mid.ref};
-    bool found_removal = false;
-    for (const RootOwnerEvent & e : root.journal)
-        if (!e.new_binding && e.old_binding && *e.old_binding == expected)
-            found_removal = true;
-    EXPECT_TRUE(found_removal)
-        << "abandon must append a precommit-removal RootOwnerEvent (old=Precommit, new=none)";
+    /// (b) the exact precommit binding is gone (spec §Remove Precommit: an exact owner_transition
+    /// removal, old=Precommit new=none). Proven black-box: a FRESH precommitAdd for the SAME
+    /// (ref_name, manifest_ref) must succeed -- if abandon had failed to remove the exact binding, this
+    /// would instead throw CORRUPTED_DATA ("add precommit ... already exists").
+    (void)abandoned_build_id;
+    auto rebuild = startBuildFor(s, ns, "part_1");
+    EXPECT_NO_THROW(rebuild->precommitAdd(ns, "part_1", mid));
 }
 
 /// BUG 2 regression for the never-precommitted path: a manifest that was STAGED but never precommitted is
