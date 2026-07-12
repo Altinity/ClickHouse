@@ -2134,10 +2134,24 @@ TEST(CaWiringResurrect, PromoteIgnoresCondemnedTokenedBlobEdgeProtected)
         << "tokened leaf is edge-protected: promote must not re-upload it (token unchanged)";
 }
 
-/// If this build's precommit was removed (abandon / GC reclaim) before promote, promote ABORTS at the
-/// owner-liveness check — which runs BEFORE any blob work — so no consequential PUT is performed on the
-/// aborting path (the tokened leaf is untouched, exactly as on the success path).
-TEST(CaWiringResurrect, PromoteAbandonedPrecommitAbortsWithoutResurrect)
+/// promote is a PURE owner MOVE (Δ=0 blob delta) — sound ONLY while this build's precommit is STILL the
+/// live owner of the ref (`WPromote owner==bld` / INV_NO_DANGLE): a Δ=0 move over a ref with no live
+/// precommit edge would republish a committed manifest onto to-be-deleted blobs. So when the precommit
+/// binding is absent from the ref-table state, promote MUST fail closed with ABORTED — at the owner-liveness
+/// check in the append closure, which runs BEFORE any blob revalidation, so NO consequential PUT / resurrect
+/// happens (a condemned leaf is left untouched, exactly as on the success path).
+///
+/// This drives that guard the DETERMINISTIC way: a promote whose precommit was NEVER added (so the binding
+/// is simply absent). The original "precommit added, then REMOVED out from under a still-live build" shape is
+/// NOT reachable by any deterministic single-threaded in-runtime actor: `Build::abandon` marks the build
+/// not-alive (`requireAlive` → LOGICAL_ERROR) and `Store::dropNamespace` cancels the build (`requireAlive` →
+/// ABORTED) — BOTH trip `requireAlive` at promote's first line, before this closure ever runs. Only a narrow
+/// promote-vs-dropNamespace RACE (dropNamespace clears the binding in the window between promote's
+/// `requireAlive` and its append closure) reaches the closure guard, which is therefore a defensive backstop
+/// (a candidate for a later dead-code review — out of scope here). The previous version of this test faked
+/// the removal with an out-of-band `appendOwnerEvent` the single-leader runtime never observes — an
+/// unreachable state that surfaced as a CORRUPTED_DATA ref-log collision, not the intended ABORTED.
+TEST(CaWiringResurrect, PromoteWithoutLivePrecommitAbortsWithoutResurrect)
 {
     using namespace DB::Cas;
     std::shared_ptr<InMemoryBackend> backend;
@@ -2150,46 +2164,41 @@ TEST(CaWiringResurrect, PromoteAbandonedPrecommitAbortsWithoutResurrect)
     info.intended_ref = ns.string() + "/" + ref;
     auto build = store->startBuild(info);
 
+    /// Stage the manifest and upload the (fresh) blob, but DO NOT precommitAdd — so the precommit owner
+    /// binding is absent from the ref-table state when promote runs. A fresh putBlob needs no precommit
+    /// (only the ADOPT path requires the durable edge); it records the tokened leaf t0.
     const ManifestId id = build->stageManifest({wiringBlobEntry("data.bin", P)});
-    build->precommitAdd(ns, ref, id);
     build->putBlob(idOf(P), BlobSource::fromString(P));
 
     const String blob_key = store->layout().blobKey(idOf(P));
     const HeadResult h1 = store->backend().head(blob_key);
     ASSERT_TRUE(h1.exists);
+    /// Condemn the leaf so that, WERE the blob gate reached, promote would resurrect it — proving the abort
+    /// happens strictly BEFORE any blob work.
     seedCondemnBlobToken(*store, u128Of(P), h1.token, h1.size);
     {
         const auto lm = DB::Cas::tests::loadMetaForTest(store->backend(), store->layout(), u128Of(P));
         ASSERT_TRUE(lm.has_value() && lm->meta.state == MetaState::Condemned);
     }
 
-    /// Concurrently remove THIS build's precommit binding (the GC-reclaim / abandon shape) BEFORE promote,
-    /// so the owner-liveness check fires. Mirror the removal encoding of Build::abandon / Store::dropRef:
-    /// old = the precommit binding, new = none. Done via appendOwnerEvent rather than build->abandon(), which
-    /// would mark THIS build not-alive and make promote throw a different (LOGICAL_ERROR) error.
-    DB::Cas::tests::appendOwnerEvent(
-        store->backend(), store->layout(), ns, /*shard*/ 0,
-        RefOwnerBinding{RefOwnerKind::Precommit, ref, id.ref},
-        std::nullopt);
-
-    /// promote aborts at the owner-move guard (ABORTED), NOT the blob gate.
+    /// promote aborts at the owner-liveness check (ABORTED), before the blob gate.
     try
     {
         build->promote(ns, ref, build->buildId(), id);
-        FAIL() << "expected promote to abort on the removed precommit binding";
+        FAIL() << "expected promote to abort: the precommit is not the live owner of the ref";
     }
     catch (const DB::Exception & e)
     {
         EXPECT_EQ(e.code(), DB::ErrorCodes::ABORTED);
     }
 
-    /// No blob work ran before the abort: the blob's token is UNCHANGED (still the condemned one) — the
-    /// owner check aborts before any PUT, so nothing consequential happens on the aborting path.
+    /// No blob work ran before the abort: the leaf's token is UNCHANGED (still the condemned one) and its
+    /// meta is still Condemned — the owner check aborts before any PUT / resurrect.
     const HeadResult h2 = store->backend().head(blob_key);
     ASSERT_TRUE(h2.exists);
     EXPECT_EQ(h2.token, h1.token)
         << "the aborting path must perform no PUT — the tokened leaf is untouched";
     const auto lm_after = DB::Cas::tests::loadMetaForTest(store->backend(), store->layout(), u128Of(P));
     EXPECT_TRUE(lm_after.has_value() && lm_after->meta.state == MetaState::Condemned)
-        << "the token is still the condemned one (no re-upload before the owner check)";
+        << "no re-upload/resurrect before the owner check — the token is still the condemned one";
 }
