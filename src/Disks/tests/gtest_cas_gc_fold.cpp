@@ -435,6 +435,87 @@ TEST(CasGcFold, SingleAnomalySuppressesEveryDestructiveActionInTheRound)
     /// A's `-1` stays unadopted (its body must survive, else the re-fold clamps on it forever).
     EXPECT_EQ(rep.deleted, 0u);
     EXPECT_EQ(rep.redeleted, 0u);
+    EXPECT_EQ(rep.graduated, 0u);
     EXPECT_TRUE(backend->head(store->layout().manifestKey(ManifestId{ns, a})).exists);
     EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 1);
+}
+
+/// A10 follow-up: the round-side destructive gates -- `runNamespaceCleanupPasses`' physical Pending-item
+/// reclaim AND `cleanupRefObjects`' covered ref-object deletion -- must ALSO honor the round's ONE
+/// `suppress_destructive` decision, not just fold()'s merge-side reducers pinned above. A clamp anomaly in
+/// one namespace must suppress destructive cleanup POOL-WIDE: a namespace mid-removal (a `Pending`
+/// namespace-cleanup item with un-reclaimed physical debris) must not be swept, and an unrelated live
+/// table's snapshot-covered ref-log must not be deleted, in the SAME clamped round. A clean round
+/// afterward proves the setup really was cleanup-eligible, not vacuously untouched.
+TEST(CasGcFold, RoundSideAnomalySuppressesNamespaceAndRefLogCleanupToo)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    const Layout & layout = store->layout();
+    Gc gc(store, kGc);
+
+    /// Namespace 1: the clamp trigger (same construction as
+    /// SingleAnomalySuppressesEveryDestructiveActionInTheRound above).
+    const RootNamespace ns_clamp{"00/aa@cas@"};
+    const ManifestRef a = ref("srv-a:1", 1, 0xAA);
+    const ManifestRef b = ref("srv-a:2", 2, 0xBB);
+    writeManifestRaw(*backend, layout, ns_clamp, a, {blobEntryFor("a", DB::UInt128(1))});
+    publishCommittedTransition(*backend, layout, ns_clamp, "r1", std::nullopt, a);
+    gc.runRegularRound();   /// folds A cleanly; establishes the baseline before the clamp
+
+    /// Namespace 2: a namespace mid-removal -- a `Pending` cleanup item (a bare `remove_namespace` op, no
+    /// committed refs at all, so there is no owner-removal edge and hence no `mf_cleanup` entry that would
+    /// confound this test with a DIFFERENT, unconditional delete path) with a physical `@cas@` verbatim
+    /// file still present -- exactly what a clamp-free round's enumerate-and-delete pass would reclaim.
+    const RootNamespace ns_removed{"00/cc@cas@"};
+    {
+        RefOp remove_op;
+        remove_op.kind = RefOpKind::RemoveNamespace;
+        appendRefLogSeed(*backend, layout, ns_removed, {remove_op});
+    }
+    const String debris_key = layout.namespaceFilesPrefix(ns_removed) + "leftover_verbatim_file";
+    backend->putIfAbsent(debris_key, "debris");
+
+    /// Namespace 3: a live table with a log covered by a durable snapshot -- exactly what a clamp-free
+    /// round's `cleanupRefObjects` would delete (mirrors `CasRefGc.RefObjectCleanupHonorsAllThreeConditions`).
+    const RootNamespace ns_covered{"00/dd@cas@"};
+    const ManifestRef c1 = ref("srv-c:1", 1, 0xCC);
+    const ManifestRef c2 = ref("srv-c:2", 2, 0xDD);
+    writeManifestRaw(*backend, layout, ns_covered, c1, {blobEntryFor("c", DB::UInt128(3))});
+    writeManifestRaw(*backend, layout, ns_covered, c2, {blobEntryFor("d", DB::UInt128(4))});
+    const uint64_t cv1 = publishCommittedTransition(*backend, layout, ns_covered, "t1", std::nullopt, c1);
+    const uint64_t cv2 = publishCommittedTransition(*backend, layout, ns_covered, "t2", std::nullopt, c2);
+    writeRefSnapshotRaw(*backend, layout, minimalLiveSnapshot(ns_covered.string(), RefTxnId{1, cv2},
+        {committedRow("t1", c1), committedRow("t2", c2)}));
+    const String covered_log_key = layout.refLogKey(ns_covered, RefTxnId{1, cv1});
+    ASSERT_TRUE(backend->head(covered_log_key).exists);
+
+    /// Trigger the clamp in ns_clamp: drop committed A, add precommit B whose body is absent.
+    writeManifestRaw(*backend, layout, ns_clamp, b, {blobEntryFor("b", DB::UInt128(2))});
+    deleteManifestBody(*backend, layout, ManifestId{ns_clamp, b});
+    appendRefLogSeed(*backend, layout, ns_clamp,
+        {ownerTransitionOp(RefOwnerBinding{RefOwnerKind::Committed, "r1", a}, std::nullopt),
+         ownerTransitionOp(std::nullopt, RefOwnerBinding{RefOwnerKind::Precommit, "r2", b})});
+
+    const RoundReport rep = gc.runRegularRound();
+    ASSERT_TRUE(rep.hasAnomaly(ns_clamp, /*shard*/0)) << "the missing B body must clamp this round";
+    EXPECT_EQ(rep.deleted, 0u);
+    EXPECT_EQ(rep.redeleted, 0u);
+    EXPECT_EQ(rep.graduated, 0u);
+
+    /// `runNamespaceCleanupPasses` must have skipped ns_removed's Pending item entirely this round.
+    EXPECT_TRUE(backend->head(debris_key).exists)
+        << "a clamp anywhere in the round must suppress the namespace-cleanup physical reclaim pass too";
+
+    /// `cleanupRefObjects` must not have deleted anything anywhere this round.
+    EXPECT_TRUE(backend->head(covered_log_key).exists)
+        << "a clamp anywhere in the round must suppress ref-log cleanup pool-wide, even for an unrelated live table";
+
+    /// Heal the clamp and run a clean round: NOW both passes reclaim their targets, proving the setup was
+    /// genuinely cleanup-eligible and not vacuously untouched.
+    writeManifestRaw(*backend, layout, ns_clamp, b, {blobEntryFor("b", DB::UInt128(2))});
+    const RoundReport clean_rep = gc.runRegularRound();
+    EXPECT_FALSE(clean_rep.hasAnomaly(ns_clamp, /*shard*/0));
+    EXPECT_FALSE(backend->head(debris_key).exists) << "a clamp-free round reclaims the removed namespace's debris";
+    EXPECT_FALSE(backend->head(covered_log_key).exists) << "a clamp-free round cleans the covered ref-log";
 }

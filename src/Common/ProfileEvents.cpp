@@ -743,7 +743,7 @@ The server successfully detected this situation and will download merged part fr
     M(CasBlobCasConflict,"CA blob cas-conflict S3 ops", ValueType::Number) \
     M(CasBlobHead,       "CA blob head S3 ops", ValueType::Number) \
     M(CasBlobHeadMiss,   "CA blob head-miss S3 ops", ValueType::Number) \
-    M(CasBlobDedupCacheHit, "CA blob known-present dedup-cache hit (P1)", ValueType::Number) \
+    M(CasBlobDedupCacheHit, "CA blob known-present dedup-cache hit", ValueType::Number) \
     M(CasBlobHeadFirst,  "CA blob HEAD-first attempts (P1 cache hit or P2 size threshold)", ValueType::Number) \
     M(CasBlobBodyPutAvoided, "CA blob body PUTs avoided by a HEAD-first present hit (P1/P2)", ValueType::Number) \
     M(CasBlobCopyForward, "CA condemned blob incarnations displaced by verified copy-forward at the promote gate (tokenless committed-manifest evidence; INV-1 exception)", ValueType::Number) \
@@ -760,7 +760,7 @@ The server successfully detected this situation and will download merged part fr
     M(CasRefAppendUnwedged, "CA ref-log append lane unwedges: a previously uncertain PUT was later observed durable", ValueType::Number) \
     M(CasRefAppendDefiniteFailure, "CA ref-log append attempts conclusively rejected (safe id gap, cache unchanged)", ValueType::Number) \
     M(CasRefSweepDeferred, "CA stale-precommit sweep failures deferred by a read-only caller (resolveRef/listRefs): the read still succeeded; a later mutation or mount retries the sweep", ValueType::Number) \
-    M(CasRefRollbackBestEffortDropFailed, "CA transaction-rollback best-effort dropRef swallowed a backend failure: the ref may stay durably live (GC reclaims only unreferenced objects). Previously silent (A9)", ValueType::Number) \
+    M(CasRefRollbackBestEffortDropFailed, "CA transaction-rollback best-effort dropRef swallowed a backend failure: the ref may stay durably live (GC reclaims only unreferenced objects). Previously silent", ValueType::Number) \
     M(CasRefTableEvictions, "CA whole-table ref-cache evictions forced by the ref_table_cache_bytes budget (the table re-recovers from its snapshot+log objects on next touch)", ValueType::Number) \
     M(CasRefGlobalListPages, "CA ref intake: global cas/refs/ LIST pages fetched by the GC round's single enumeration (spec §Step 1 / §GC Budget Q)", ValueType::Number) \
     M(CasRefLogBodyGets, "CA ref intake: ref-log transaction-body GETs decoded during the GC fold (spec §Step 2 / §GC Budget K)", ValueType::Number) \
