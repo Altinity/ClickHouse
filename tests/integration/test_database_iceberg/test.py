@@ -1402,6 +1402,119 @@ def test_alter_orphan_cleanup_failure_reported(started_cluster):
         node.query("SYSTEM DISABLE FAILPOINT iceberg_alter_catalog_update_metadata_fail")
 
 
+def test_alter_sequential_add_drop_shared_location(started_cluster):
+    """
+    Two Iceberg tables share the same storage location, so their metadata files
+    land in the same `<location>/metadata/` folder. Running a sequence of ALTER
+    ADD/DROP COLUMN statements on one table must keep selecting that table's own
+    metadata (by `table-uuid`) instead of the globally highest-version metadata
+    file in the shared folder. Without the fix the ALTER write path picks another
+    table's metadata and the sequence eventually fails with an exception.
+    """
+    node = started_cluster.instances["node1"]
+
+    test_ref = f"test_alter_sequential_{uuid.uuid4()}"
+    table_a = f"{test_ref}_table_a"
+    table_b = f"{test_ref}_table_b"
+    root_namespace = f"{test_ref}_namespace"
+
+    schema = Schema(
+        NestedField(field_id=1, name="x", field_type=StringType(), required=False),
+    )
+
+    shared_location = f"s3://warehouse-rest/data/{root_namespace}/shared"
+
+    catalog = load_catalog_impl(started_cluster)
+    catalog.create_namespace(root_namespace)
+    create_table(
+        catalog,
+        root_namespace,
+        table_a,
+        schema,
+        PartitionSpec(),
+        UNSORTED_SORT_ORDER,
+        location=shared_location,
+    )
+    create_table(
+        catalog,
+        root_namespace,
+        table_b,
+        schema,
+        PartitionSpec(),
+        UNSORTED_SORT_ORDER,
+        location=shared_location,
+    )
+
+    create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
+
+    node.query(
+        f"INSERT INTO {CATALOG_NAME}.`{root_namespace}.{table_a}` VALUES ('a');",
+        settings={"allow_insert_into_iceberg": 1, "write_full_path_in_iceberg_metadata": 1},
+    )
+    node.query(
+        f"INSERT INTO {CATALOG_NAME}.`{root_namespace}.{table_b}` VALUES ('b');",
+        settings={"allow_insert_into_iceberg": 1, "write_full_path_in_iceberg_metadata": 1},
+    )
+
+    # Bump table_b's metadata version well above table_a's, so that pre-fix the
+    # ALTER on table_a would select table_b's (higher-version) metadata file from
+    # the shared folder.
+    table_b_columns = ["b_col1", "b_col2", "b_col3", "b_col4", "b_col5", "b_col6"]
+    for column in table_b_columns:
+        node.query(
+            f"ALTER TABLE {CATALOG_NAME}.`{root_namespace}.{table_b}` ADD COLUMN IF NOT EXISTS {column} Nullable(String);",
+            settings={"allow_insert_into_iceberg": 1},
+        )
+
+    # The exact sequence reported by the user, with a pause between statements to
+    # mirror the manual reproduction.
+    alter_statements = [
+        f"ALTER TABLE {CATALOG_NAME}.`{root_namespace}.{table_a}` ADD COLUMN IF NOT EXISTS name Nullable(String);",
+        f"ALTER TABLE {CATALOG_NAME}.`{root_namespace}.{table_a}` ADD COLUMN IF NOT EXISTS age Nullable(UInt64);",
+        f"ALTER TABLE {CATALOG_NAME}.`{root_namespace}.{table_a}` ADD COLUMN IF NOT EXISTS email Nullable(String);",
+        f"ALTER TABLE {CATALOG_NAME}.`{root_namespace}.{table_a}` ADD COLUMN IF NOT EXISTS `double` Nullable(Float64);",
+        f"ALTER TABLE {CATALOG_NAME}.`{root_namespace}.{table_a}` ADD COLUMN IF NOT EXISTS `integer` Nullable(UInt64);",
+        f"ALTER TABLE {CATALOG_NAME}.`{root_namespace}.{table_a}` DROP COLUMN IF EXISTS name;",
+        f"ALTER TABLE {CATALOG_NAME}.`{root_namespace}.{table_a}` DROP COLUMN IF EXISTS age;",
+        f"ALTER TABLE {CATALOG_NAME}.`{root_namespace}.{table_a}` DROP COLUMN IF EXISTS email;",
+        f"ALTER TABLE {CATALOG_NAME}.`{root_namespace}.{table_a}` DROP COLUMN IF EXISTS `double`;",
+        f"ALTER TABLE {CATALOG_NAME}.`{root_namespace}.{table_a}` DROP COLUMN IF EXISTS `integer`;",
+    ]
+    for i, statement in enumerate(alter_statements):
+        if i > 0:
+            time.sleep(2)
+        node.query(statement, settings={"allow_insert_into_iceberg": 1})
+
+    # table_a is back to its original single-column schema.
+    show_create_a = node.query(
+        f"SHOW CREATE TABLE {CATALOG_NAME}.`{root_namespace}.{table_a}`"
+    )
+    assert "`x`" in show_create_a
+    for column in ["name", "age", "email", "double", "integer"]:
+        assert f"`{column}`" not in show_create_a
+
+    assert (
+        node.query(f"SELECT * FROM {CATALOG_NAME}.`{root_namespace}.{table_a}`") == "a\n"
+    )
+
+    schema_a = catalog.load_table(f"{root_namespace}.{table_a}").schema()
+    assert [field.name for field in schema_a.fields] == ["x"]
+
+    # table_b must be untouched by table_a's alters.
+    show_create_b = node.query(
+        f"SHOW CREATE TABLE {CATALOG_NAME}.`{root_namespace}.{table_b}`"
+    )
+    for column in table_b_columns:
+        assert f"`{column}`" in show_create_b
+
+    assert (
+        node.query(f"SELECT x FROM {CATALOG_NAME}.`{root_namespace}.{table_b}`") == "b\n"
+    )
+
+    schema_b = catalog.load_table(f"{root_namespace}.{table_b}").schema()
+    assert [field.name for field in schema_b.fields] == ["x"] + table_b_columns
+
+
 def test_partitioning_by_time(started_cluster):
     node = started_cluster.instances["node1"]
 

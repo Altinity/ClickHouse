@@ -52,6 +52,7 @@
 #include <Poco/StringTokenizer.h>
 #include <Poco/Timestamp.h>
 
+#include <optional>
 #include <sstream>
 #include <unordered_set>
 
@@ -166,6 +167,71 @@ Poco::JSON::Object::Ptr cloneJsonObject(const Poco::JSON::Object::Ptr & obj)
 
     Poco::JSON::Parser parser;
     return parser.parse(oss.str()).extract<Poco::JSON::Object::Ptr>();
+}
+
+bool icebergJsonValueEquals(const Poco::Dynamic::Var & lhs, const Poco::Dynamic::Var & rhs);
+
+bool icebergJsonObjectEquals(const Poco::JSON::Object::Ptr & lhs, const Poco::JSON::Object::Ptr & rhs)
+{
+    if (lhs.isNull() || rhs.isNull())
+        return lhs.isNull() && rhs.isNull();
+    if (lhs->size() != rhs->size())
+        return false;
+    for (auto it = lhs->begin(); it != lhs->end(); ++it)
+    {
+        if (!rhs->has(it->first))
+            return false;
+        if (!icebergJsonValueEquals(it->second, rhs->get(it->first)))
+            return false;
+    }
+    return true;
+}
+
+bool icebergJsonArrayEquals(const Poco::JSON::Array::Ptr & lhs, const Poco::JSON::Array::Ptr & rhs)
+{
+    if (lhs.isNull() || rhs.isNull())
+        return lhs.isNull() && rhs.isNull();
+    if (lhs->size() != rhs->size())
+        return false;
+    for (UInt32 i = 0; i < lhs->size(); ++i)
+        if (!icebergJsonValueEquals(lhs->get(i), rhs->get(i)))
+            return false;
+    return true;
+}
+
+/// Structural, key-order-independent comparison of two parsed JSON values.
+bool icebergJsonValueEquals(const Poco::Dynamic::Var & lhs, const Poco::Dynamic::Var & rhs)
+{
+    const bool lhs_is_object = lhs.type() == typeid(Poco::JSON::Object::Ptr);
+    const bool rhs_is_object = rhs.type() == typeid(Poco::JSON::Object::Ptr);
+    if (lhs_is_object || rhs_is_object)
+    {
+        if (!(lhs_is_object && rhs_is_object))
+            return false;
+        return icebergJsonObjectEquals(lhs.extract<Poco::JSON::Object::Ptr>(), rhs.extract<Poco::JSON::Object::Ptr>());
+    }
+
+    const bool lhs_is_array = lhs.type() == typeid(Poco::JSON::Array::Ptr);
+    const bool rhs_is_array = rhs.type() == typeid(Poco::JSON::Array::Ptr);
+    if (lhs_is_array || rhs_is_array)
+    {
+        if (!(lhs_is_array && rhs_is_array))
+            return false;
+        return icebergJsonArrayEquals(lhs.extract<Poco::JSON::Array::Ptr>(), rhs.extract<Poco::JSON::Array::Ptr>());
+    }
+
+    return lhs.toString() == rhs.toString();
+}
+
+/// Two Iceberg schemas are equivalent (as the catalog considers them when deduplicating
+/// schemas) when they differ only by their `schema-id`.
+bool schemasEquivalentIgnoringId(const Poco::JSON::Object::Ptr & lhs, const Poco::JSON::Object::Ptr & rhs)
+{
+    Poco::JSON::Object::Ptr lhs_copy = cloneJsonObject(lhs);
+    Poco::JSON::Object::Ptr rhs_copy = cloneJsonObject(rhs);
+    lhs_copy->remove(DB::Iceberg::f_schema_id);
+    rhs_copy->remove(DB::Iceberg::f_schema_id);
+    return icebergJsonObjectEquals(lhs_copy, rhs_copy);
 }
 
 void collectSchemaFieldIdsFromFields(const Poco::JSON::Array::Ptr & fields, std::unordered_set<Int32> & ids)
@@ -293,23 +359,53 @@ Poco::JSON::Object::Ptr buildUpdateMetadataRequestBody(
             request_body->set("requirements", requirements);
         }
 
-        Poco::JSON::Array::Ptr updates = new Poco::JSON::Array;
+        // The target schema may be identical to a schema already present in the table's
+        // schema history (for example an ADD COLUMN followed later by a DROP COLUMN that
+        // restores the original schema). The Iceberg catalog deduplicates identical
+        // schemas, so an `add-schema` update becomes a no-op and a subsequent
+        // `set-current-schema: -1` ("the last added schema") is rejected with
+        // "Cannot set last added schema: no schema has been added". In that case we point
+        // `set-current-schema` at the existing schema's id and skip `add-schema`.
+        std::optional<Int32> existing_equivalent_schema_id;
+        for (UInt32 i = 0; i < schemas->size(); ++i)
         {
-            Poco::JSON::Object::Ptr add_schema = new Poco::JSON::Object;
-            add_schema->set("action", "add-schema");
-            add_schema->set("schema", schema_for_rest);
-            if (new_snapshot->has(DB::Iceberg::f_last_column_id))
-                add_schema->set("last-column-id", new_snapshot->getValue<Int32>(DB::Iceberg::f_last_column_id));
-            updates->add(add_schema);
+            auto existing_schema = schemas->getObject(i);
+            if (existing_schema->getValue<Int32>(DB::Iceberg::f_schema_id) == new_schema_id)
+                continue;
+            if (schemasEquivalentIgnoringId(existing_schema, new_schema_obj))
+            {
+                existing_equivalent_schema_id = existing_schema->getValue<Int32>(DB::Iceberg::f_schema_id);
+                break;
+            }
         }
+
+        Poco::JSON::Array::Ptr updates = new Poco::JSON::Array;
+        if (existing_equivalent_schema_id.has_value())
         {
             Poco::JSON::Object::Ptr set_current_schema = new Poco::JSON::Object;
             set_current_schema->set("action", "set-current-schema");
-            // Iceberg REST spec: schema-id == -1 means "the last added schema".
-            // The catalog assigns schema ids itself and may reuse an existing id when
-            // the new schema is identical, so we must not assume our locally computed id.
-            set_current_schema->set("schema-id", -1);
+            set_current_schema->set("schema-id", *existing_equivalent_schema_id);
             updates->add(set_current_schema);
+        }
+        else
+        {
+            {
+                Poco::JSON::Object::Ptr add_schema = new Poco::JSON::Object;
+                add_schema->set("action", "add-schema");
+                add_schema->set("schema", schema_for_rest);
+                if (new_snapshot->has(DB::Iceberg::f_last_column_id))
+                    add_schema->set("last-column-id", new_snapshot->getValue<Int32>(DB::Iceberg::f_last_column_id));
+                updates->add(add_schema);
+            }
+            {
+                Poco::JSON::Object::Ptr set_current_schema = new Poco::JSON::Object;
+                set_current_schema->set("action", "set-current-schema");
+                // Iceberg REST spec: schema-id == -1 means "the last added schema".
+                // The catalog assigns schema ids itself and may reuse an existing id when
+                // the new schema is identical, so we must not assume our locally computed id.
+                set_current_schema->set("schema-id", -1);
+                updates->add(set_current_schema);
+            }
         }
         if (sortOrderIncompatibleWithSchema(new_snapshot, new_schema_obj))
         {
