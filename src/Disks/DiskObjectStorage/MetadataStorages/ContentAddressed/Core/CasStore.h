@@ -840,6 +840,13 @@ public:
     /// caller's item join `rt->pending` before the carve, forcing deterministic co-batching.
     void setRefPreCarveHookForTest(std::function<void()> hook) { ref_pre_carve_hook_for_test = std::move(hook); }
 
+    /// Test-only: replace the request controller's inter-attempt backoff sleep (e.g. with a no-op) —
+    /// for tests that drive a persistent conditional-write fault to budget exhaustion through a fully
+    /// wired Store/disk and must not serve the production capped-exponential sleeps for real (see
+    /// `CasRequestController::setSleepFnForTest`). Call before driving traffic; empty restores the
+    /// real sleep.
+    void setCasRetrySleepForTest(std::function<void(uint64_t)> sleep_fn);
+
     /// Queue depth for the ref-append-lane tests (mirrors `shardQueuePendingForTest`): how many
     /// `appendRefOps` callers are enqueued for `ns` right now.
     size_t refQueuePendingForTest(const RootNamespace & ns)

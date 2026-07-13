@@ -1399,6 +1399,11 @@ TEST(CaWiringWrite, PartialCommitRollsBackPublishedParts)
     auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
         faulty, "pool", "srv1", "test", std::filesystem::temp_directory_path() / "ca_b122_scratch", nullptr);
     storage->startup();
+    /// The manifest-body PUT rides the CAS request controller, whose inter-attempt backoff would
+    /// otherwise serve the REAL capped-exponential sleeps (~56s at the default budget) while the
+    /// persistent injected fault exhausts the whole attempt budget. Neutralize only the sleeps — the
+    /// retry/exhaustion/rollback semantics under test are unchanged.
+    storage->store()->setCasRetrySleepForTest([](uint64_t) {});
 
     /// Two parts in ONE transaction, published sequentially at commit (the staging map orders all_1_1_0
     /// before all_2_2_0). writeThroughTransaction only STAGES to local temp files here — the pool writes

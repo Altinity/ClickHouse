@@ -310,6 +310,7 @@ TEST(CasRequestController, UncertainResolvesAbsentRetriesSameKeyWithinBudget)
 
     CasRequestBudget budget;
     budget.max_attempts = 3;
+    budget.retry_initial_backoff_ms = 0;   /// backoff behavior is pinned by its own tests below
     CasRequestController controller(backend, budget);
     const auto outcome = controller.putIfAbsentControlled("k", "payload", [] { return true; });
     EXPECT_EQ(outcome, CasWriteOutcome::Unresolved);
@@ -332,6 +333,7 @@ TEST(CasRequestController, OperationDeadlineExhaustionReturnsUnresolvedBeforeMax
     budget.max_attempts = 10;
     budget.attempt_timeout_ms = 50;
     budget.operation_deadline_ms = 450;
+    budget.retry_initial_backoff_ms = 0;   /// isolate the deadline check from the backoff's own deadline guard
     CasRequestController controller(backend, budget, now_ms);
     const auto outcome = controller.putIfAbsentControlled("k", "payload", [] { return true; });
     EXPECT_EQ(outcome, CasWriteOutcome::Unresolved);
@@ -374,6 +376,137 @@ TEST(CasRequestController, DefiniteFailurePropagatesImmediatelyWithoutResolve)
     EXPECT_EQ(backend->put_attempts.load(), 1u);   /// no retry, no resolve GET issued
 }
 
+/// ================================================================================================
+/// Inter-attempt backoff (chaos-tolerance-report §Task B follow-up / stagefix-review M3): the
+/// controller paces reissues with a capped-exponential, fence-gated, deadline-aware sleep instead of
+/// hammering a recovering store with immediate retries.
+/// ================================================================================================
+
+/// The full event-ordered schedule: fence checked before EVERY attempt AND before EVERY sleep, sleeps
+/// strictly between attempts, capped exponential (initial 100ms, cap 200ms), no sleep after the final
+/// attempt. The exact interleaving is the contract — a sleep served before its fence check would keep
+/// a fenced writer dozing past its lease.
+TEST(CasRequestControllerBackoff, CappedExponentialSleepsAreFenceCheckedAndOrdered)
+{
+    auto backend = std::make_shared<ScriptedControllerBackend>();
+    std::vector<String> events;
+    backend->put_thrower = [&] { events.emplace_back("put"); throw Poco::TimeoutException("scripted: ambiguous"); };
+    backend->setGetOverride(std::nullopt);   /// absent on every resolve
+
+    CasRequestBudget budget;
+    budget.max_attempts = 5;
+    budget.attempt_timeout_ms = 1;
+    budget.operation_deadline_ms = 1000000;   /// never the binding constraint here
+    budget.retry_initial_backoff_ms = 100;
+    budget.retry_max_backoff_ms = 200;
+    CasRequestController controller(
+        backend, budget,
+        /*now_ms=*/[] { return static_cast<uint64_t>(0); },
+        /*sleep_ms=*/[&](uint64_t ms) { events.push_back("sleep:" + std::to_string(ms)); });
+
+    const auto fence_ok = [&] { events.emplace_back("fence"); return true; };
+    const auto outcome = controller.putIfAbsentControlled("k", "payload", fence_ok);
+    EXPECT_EQ(outcome, CasWriteOutcome::Unresolved);
+    EXPECT_EQ(backend->put_attempts.load(), 5u);
+
+    const std::vector<String> expected{
+        "fence", "put", "fence", "sleep:100",
+        "fence", "put", "fence", "sleep:200",
+        "fence", "put", "fence", "sleep:200",
+        "fence", "put", "fence", "sleep:200",
+        "fence", "put"};   /// budget spent: no fence-for-sleep, no sleep after the last attempt
+    EXPECT_EQ(events, expected);
+}
+
+/// A fence lost between an ambiguous attempt's resolve and its backoff sleep aborts INSTANTLY: no
+/// sleep is served, no further attempt is sent, and the outcome is Unresolved (never a false
+/// Committed, never a retry under a lost lease).
+TEST(CasRequestControllerBackoff, FenceLostBeforeSleepAbortsWithoutSleeping)
+{
+    auto backend = std::make_shared<ScriptedControllerBackend>();
+    backend->put_thrower = [] { throw Poco::TimeoutException("scripted: ambiguous"); };
+    backend->setGetOverride(std::nullopt);
+
+    CasRequestBudget budget;
+    budget.max_attempts = 5;
+    budget.retry_initial_backoff_ms = 100;
+    budget.retry_max_backoff_ms = 200;
+    uint64_t sleeps = 0;
+    int fence_calls = 0;
+    CasRequestController controller(
+        backend, budget, /*now_ms=*/[] { return static_cast<uint64_t>(0); },
+        /*sleep_ms=*/[&](uint64_t) { ++sleeps; });
+
+    /// True for the pre-attempt check (call 1), lost by the pre-sleep check (call 2).
+    const auto fence_ok = [&fence_calls] { return ++fence_calls <= 1; };
+    const auto outcome = controller.putIfAbsentControlled("k", "payload", fence_ok);
+    EXPECT_EQ(outcome, CasWriteOutcome::Unresolved);
+    EXPECT_EQ(backend->put_attempts.load(), 1u) << "no attempt may be sent after the fence is lost";
+    EXPECT_EQ(sleeps, 0u) << "a fence lost mid-backoff must abort BEFORE the sleep, not after it";
+    EXPECT_EQ(fence_calls, 2);
+}
+
+/// A backoff sleep the operation deadline cannot afford is never served: when sleep + one more
+/// attempt would cross the deadline, the loop gives up immediately (Unresolved) instead of sleeping
+/// into a guaranteed exhaustion.
+TEST(CasRequestControllerBackoff, SleepThatWouldCrossOperationDeadlineIsSkipped)
+{
+    auto backend = std::make_shared<ScriptedControllerBackend>();
+    backend->put_thrower = [] { throw Poco::TimeoutException("scripted: ambiguous"); };
+    backend->setGetOverride(std::nullopt);
+
+    uint64_t clock = 0;
+    CasRequestBudget budget;
+    budget.max_attempts = 10;
+    budget.attempt_timeout_ms = 10;
+    budget.operation_deadline_ms = 100;
+    budget.retry_initial_backoff_ms = 1000;   /// any sleep would blow the 100ms deadline
+    budget.retry_max_backoff_ms = 1000;
+    uint64_t sleeps = 0;
+    CasRequestController controller(
+        backend, budget, /*now_ms=*/[&clock] { return clock; },
+        /*sleep_ms=*/[&](uint64_t) { ++sleeps; });
+
+    const auto outcome = controller.putIfAbsentControlled("k", "payload", [] { return true; });
+    EXPECT_EQ(outcome, CasWriteOutcome::Unresolved);
+    EXPECT_EQ(backend->put_attempts.load(), 1u);
+    EXPECT_EQ(sleeps, 0u) << "the deadline guard must refuse the sleep, not serve it and then fail";
+}
+
+/// THE ENVELOPE CONTRACT (chaos-tolerance-report §Task B follow-up): the DEFAULT budget rides a
+/// simulated 60-second S3 outage — every conditional-write attempt fails (≈3s adaptive first-attempt
+/// timeout each, the observed incident shape) until the store recovers at t=60s, then the next
+/// attempt commits, all inside the default 90s operation deadline and 16-attempt budget. The fake
+/// clock advances 3s per failed attempt and by each backoff sleep, so this test pins the arithmetic
+/// documented on CasRequestBudget without any wall-clock waiting.
+TEST(CasRequestControllerBackoff, DefaultBudgetRidesSixtySecondOutage)
+{
+    auto backend = std::make_shared<ScriptedControllerBackend>();
+    uint64_t clock = 0;
+    backend->put_thrower = [&clock]
+    {
+        if (clock < 60000)
+        {
+            clock += 3000;   /// the failed attempt's own ~3s adaptive receive timeout
+            throw Poco::TimeoutException("scripted: store paused");
+        }
+        /// store recovered: fall through to the real in-memory conditional write (Done)
+    };
+    backend->setGetOverride(std::nullopt);   /// nothing ever landed while the store was paused
+
+    CasRequestController controller(
+        backend, CasRequestBudget{}, /*now_ms=*/[&clock] { return clock; },
+        /*sleep_ms=*/[&clock](uint64_t ms) { clock += ms; });
+
+    const auto outcome = controller.putIfAbsentControlled("k", "payload", [] { return true; });
+    EXPECT_EQ(outcome, CasWriteOutcome::Committed) << "the default budget must absorb a 60s outage";
+    /// Schedule: attempts fail at 3s each with sleeps 0.2,0.4,0.8,1.6,3.2 then 5s (cap); the first
+    /// attempt scheduled at clock >= 60000 (attempt 11, t=61.2s) commits — well inside 16 attempts
+    /// and the 90s deadline.
+    EXPECT_EQ(backend->put_attempts.load(), 11u);
+    EXPECT_LT(clock, CasRequestBudget{}.operation_deadline_ms);
+}
+
 /// Startup validation (RFC §required-timeout-model): a consistent default budget is accepted silently;
 /// either inequality violated on its own is rejected with BAD_ARGUMENTS.
 TEST(CasRequestController, ValidateBudgetAcceptsConsistentDefaults)
@@ -410,6 +543,20 @@ TEST(CasRequestController, ValidateBudgetRejectsZeroMaxAttempts)
 {
     CasRequestBudget budget;
     budget.max_attempts = 0;
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::BAD_ARGUMENTS, [&]
+    {
+        validateCasRequestBudget(budget, /*mount_lease_ttl_ms=*/30000, /*mount_renew_period_ms=*/10000);
+    });
+}
+
+/// A capped-exponential backoff whose cap sits below its own starting value is inconsistent — reject
+/// at startup (0/0 disables backoff and stays accepted, covered by the defaults test above since the
+/// defaults are nonzero and consistent).
+TEST(CasRequestController, ValidateBudgetRejectsInitialBackoffAboveMaxBackoff)
+{
+    CasRequestBudget budget;
+    budget.retry_initial_backoff_ms = 500;
+    budget.retry_max_backoff_ms = 100;
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::BAD_ARGUMENTS, [&]
     {
         validateCasRequestBudget(budget, /*mount_lease_ttl_ms=*/30000, /*mount_renew_period_ms=*/10000);

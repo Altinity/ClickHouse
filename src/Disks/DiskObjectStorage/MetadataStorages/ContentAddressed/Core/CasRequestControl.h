@@ -70,23 +70,48 @@ struct CasRequestBudget
     /// operation deadline) — the actual socket-level wait is configured on the object storage's client
     /// (Task 4, ObjectStorageBackend's single-attempt client), not by this struct.
     uint64_t attempt_timeout_ms = 5000;
-    /// Maximum wall-clock time for the COMPLETE logical operation — every attempt and every exact-key
-    /// resolution — counted from the first call to `putIfAbsentControlled`. A DURATION, not an
-    /// absolute deadline: each call establishes its own `now + operation_deadline_ms` bound.
-    uint64_t operation_deadline_ms = 20000;
+    /// Maximum wall-clock time for the COMPLETE logical operation — every attempt, every exact-key
+    /// resolution, and every inter-attempt backoff sleep — counted from the first call to
+    /// `putIfAbsentControlled`. A DURATION, not an absolute deadline: each call establishes its own
+    /// `now + operation_deadline_ms` bound.
+    ///
+    /// ENVELOPE SIZING (chaos-tolerance-report §Task B follow-up): this deadline is the authoritative
+    /// bound on how long a CAS conditional write keeps riding an S3 disruption server-side before the
+    /// caller sees an abort. 90s absorbs a ~60s object-store outage with margin (see the arithmetic on
+    /// `max_attempts` below) — PROVIDED the mount fence stays alive. The fence, not this deadline, is
+    /// what binds under a TOTAL outage: lease renewals are conditional writes against the same store,
+    /// so when everything is unreachable the fence deadline freezes at `last_renew + mount_lease_ttl`
+    /// and `fence_ok` stops the loop ≈ TTL−attempt_timeout−margin (~23s) after the last successful
+    /// renewal — the RFC's required fail-closed behavior (never an attempt past the lease), not a
+    /// budget limitation. While renewals DO land (blips, throttling, partial outages — the renewer runs
+    /// on its own background thread and keeps extending the fence deadline), the op is NOT bounded by
+    /// the lease TTL and rides the full deadline here.
+    uint64_t operation_deadline_ms = 90000;
     /// Maximum number of controlled attempts for one logical operation (the first attempt counts as 1).
-    uint32_t max_attempts = 5;
+    /// Sized so the operation deadline above — never this count — is what binds under the observed
+    /// failure shape (~3s adaptive first-attempt PUT timeout per failed attempt + capped-exponential
+    /// backoff): 16 attempts × ~3s + Σ backoff (0.2+0.4+0.8+1.6+3.2 + 10×5 = 56.2s) ≈ 104s > 90s.
+    uint32_t max_attempts = 16;
     /// Startup-only margin folded into `validateCasRequestBudget`'s inequality against the mount lease
     /// TTL. Not consulted at runtime by the controller itself — the caller's `fence_ok` callback (backed
     /// by the local write fence's own deadline) is what actually gates lease-relative timing per attempt.
     uint64_t lease_safety_margin_ms = 2000;
+    /// Inter-attempt backoff (RFC cas-s3-timeout-retry-control §Configuration:
+    /// `cas_s3_retry_initial_backoff_ms` / `cas_s3_retry_max_backoff_ms`): the sleep before reissuing
+    /// after an ambiguous attempt whose resolve observed the key absent, capped exponential —
+    /// `initial · 2^(reissues-1)`, never above `retry_max_backoff_ms`. 0 disables backoff (immediate
+    /// reissue — the pre-backoff behavior, and what most exhaustion-path unit tests configure). The
+    /// controller checks the fence BEFORE every sleep and never sleeps past the operation deadline.
+    uint64_t retry_initial_backoff_ms = 200;
+    uint64_t retry_max_backoff_ms = 5000;
 };
 
 /// Startup validation (RFC §required-timeout-model): a writable mount refuses to open with an
 /// inconsistent budget rather than silently falling back to an unbounded/unsafe retry policy. Throws
-/// `BAD_ARGUMENTS` unless BOTH hold:
+/// `BAD_ARGUMENTS` unless ALL hold:
 ///   attempt_timeout_ms + lease_safety_margin_ms < mount_lease_ttl_ms
 ///   attempt_timeout_ms <= operation_deadline_ms
+///   retry_initial_backoff_ms <= retry_max_backoff_ms
 /// `mount_renew_period_ms` takes no part in the inequality (the renewer keeps the fence deadline
 /// refreshed well ahead of the TTL by construction) — it is accepted only so the effective-values log
 /// line records the full picture in one place.
@@ -102,14 +127,25 @@ class CasRequestController
 public:
     /// `now_ms_`: monotonic-ish clock, defaulting to `std::chrono::steady_clock`; tests inject a fake
     /// one to drive deadline behavior deterministically (no sleeps).
-    CasRequestController(BackendPtr backend_, CasRequestBudget budget_, std::function<uint64_t()> now_ms_ = {});
+    /// `sleep_ms_`: the inter-attempt backoff sleep, defaulting to a real `std::this_thread::sleep_for`;
+    /// tests inject a recorder/no-op to assert the backoff schedule without wall-clock waits. The
+    /// controller only ever sleeps BETWEEN attempts of one logical operation, on the calling thread,
+    /// with no Store mutex held (every call site — the ref append lane's leader, `stageManifest`, blob
+    /// uploads, snapshot publishes — invokes the controller outside its locks; the append lane's
+    /// LEADERSHIP is deliberately held across the sleep: same-table appends must queue behind an
+    /// unresolved predecessor PUT anyway, per spec §Writer-Side Linearization).
+    CasRequestController(BackendPtr backend_, CasRequestBudget budget_, std::function<uint64_t()> now_ms_ = {},
+                         std::function<void(uint64_t)> sleep_ms_ = {});
 
     /// Controlled `putIfAbsent` with resolve-before-reissue (RFC §resolve-before-reissuing). Performs at
     /// most `budget.max_attempts` attempts of the exact SAME (key, bytes) — never a different key, never
-    /// a different body — bounded by `budget.operation_deadline_ms` measured from this call's own start.
-    /// `fence_ok` is consulted before EVERY attempt (a false answer sends no further attempt) and once
-    /// more before a `Committed` return (a false answer there means the write may have landed but this
-    /// call reports `Unresolved`, never a false `Committed` — RFC §ack-and-cache-rules). An uncertain
+    /// a different body — bounded by `budget.operation_deadline_ms` measured from this call's own start,
+    /// with capped-exponential inter-attempt backoff (`retry_initial_backoff_ms`/`retry_max_backoff_ms`).
+    /// `fence_ok` is consulted before EVERY attempt (a false answer sends no further attempt), before
+    /// EVERY backoff sleep (a fence lost mid-loop aborts instantly, never after a pointless sleep), and
+    /// once more before a `Committed` return (a false answer there means the write may have landed but
+    /// this call reports `Unresolved`, never a false `Committed` — RFC §ack-and-cache-rules). A sleep is
+    /// never entered when it (plus one more attempt) could not fit the operation deadline. An uncertain
     /// attempt is resolved via `resolveByExactGet` before deciding whether to reissue.
     /// Throws `CORRUPTED_DATA` if resolution ever observes DIFFERENT valid bytes at `key` — a real
     /// conflict, never collapsed into `Unresolved`/`DefiniteFailure`. Returns `Unresolved` (never
@@ -132,10 +168,27 @@ public:
     CasWriteOutcome resolveByExactGet(std::string_view key, std::string_view expected_bytes,
                                       Token * out_token = nullptr);
 
+    /// Test-only: replace the inter-attempt backoff sleep (e.g. with a no-op) on an already-constructed
+    /// controller — for tests that reach the controller only through a fully-wired Store/disk and cannot
+    /// pass the ctor parameter (see `Store::setCasRetrySleepForTest`). Passing an empty function restores
+    /// the real sleep. Not thread-safe: call before driving any traffic through the controller.
+    void setSleepFnForTest(std::function<void(uint64_t)> sleep_ms_);
+
 private:
+    /// The gate between a completed ambiguous attempt and its reissue: fence check FIRST (a fence lost
+    /// mid-loop must abort before any sleep), then the capped-exponential backoff sleep — skipped
+    /// entirely (returning false, no sleep served) when the sleep plus one more attempt could not fit
+    /// the operation deadline. Returns true when the loop may proceed to the next attempt; the loop
+    /// top's own pre-attempt fence/deadline checks re-run AFTER the sleep.
+    bool pauseBeforeReissue(uint32_t completed_attempt, uint64_t deadline_ms, const std::function<bool()> & fence_ok);
+    /// The backoff scheduled before attempt `next_attempt` (attempt 2 sleeps `retry_initial_backoff_ms`,
+    /// doubling per reissue), saturating at `retry_max_backoff_ms`. 0 when backoff is disabled.
+    uint64_t backoffBeforeAttempt(uint32_t next_attempt) const;
+
     BackendPtr backend;
     CasRequestBudget budget;
     std::function<uint64_t()> now_ms;
+    std::function<void(uint64_t)> sleep_ms;
 };
 
 }

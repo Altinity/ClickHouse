@@ -10,7 +10,9 @@
 #include <IO/S3Common.h>
 #endif
 
+#include <algorithm>
 #include <chrono>
+#include <thread>
 #include <utility>
 
 namespace ProfileEvents
@@ -126,6 +128,14 @@ uint64_t steadyClockNowMs()
         std::chrono::steady_clock::now().time_since_epoch()).count());
 }
 
+/// The default inter-attempt backoff sleep. NOT a race-fix sleep: it is deliberate, bounded,
+/// fence-gated pacing of reissues toward a recovering object store (RFC cas-s3-timeout-retry-control
+/// §Configuration), and it is injectable so tests never wait on it.
+void threadSleepMs(uint64_t ms)
+{
+    std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+}
+
 }
 
 void validateCasRequestBudget(const CasRequestBudget & budget, uint64_t mount_lease_ttl_ms, uint64_t mount_renew_period_ms)
@@ -152,19 +162,66 @@ void validateCasRequestBudget(const CasRequestBudget & budget, uint64_t mount_le
             "CAS request budget rejected: attempt_timeout_ms ({}) must not exceed operation_deadline_ms "
             "({}) — a single attempt cannot outlast the logical operation it belongs to.",
             budget.attempt_timeout_ms, budget.operation_deadline_ms);
+    if (!(budget.retry_initial_backoff_ms <= budget.retry_max_backoff_ms))
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "CAS request budget rejected: retry_initial_backoff_ms ({}) must not exceed "
+            "retry_max_backoff_ms ({}) — the capped-exponential backoff cap cannot sit below its own "
+            "starting value. Set both to 0 to disable inter-attempt backoff.",
+            budget.retry_initial_backoff_ms, budget.retry_max_backoff_ms);
 
     LOG_INFO(getLogger("CasRequestControl"),
         "CAS request budget in effect: attempt_timeout_ms={} operation_deadline_ms={} max_attempts={} "
-        "lease_safety_margin_ms={} (mount_lease_ttl_ms={} mount_renew_period_ms={})",
+        "lease_safety_margin_ms={} retry_initial_backoff_ms={} retry_max_backoff_ms={} "
+        "(mount_lease_ttl_ms={} mount_renew_period_ms={})",
         budget.attempt_timeout_ms, budget.operation_deadline_ms, budget.max_attempts,
-        budget.lease_safety_margin_ms, mount_lease_ttl_ms, mount_renew_period_ms);
+        budget.lease_safety_margin_ms, budget.retry_initial_backoff_ms, budget.retry_max_backoff_ms,
+        mount_lease_ttl_ms, mount_renew_period_ms);
 }
 
-CasRequestController::CasRequestController(BackendPtr backend_, CasRequestBudget budget_, std::function<uint64_t()> now_ms_)
+CasRequestController::CasRequestController(BackendPtr backend_, CasRequestBudget budget_, std::function<uint64_t()> now_ms_,
+                                           std::function<void(uint64_t)> sleep_ms_)
     : backend(std::move(backend_))
     , budget(budget_)
     , now_ms(now_ms_ ? std::move(now_ms_) : std::function<uint64_t()>(steadyClockNowMs))
+    , sleep_ms(sleep_ms_ ? std::move(sleep_ms_) : std::function<void(uint64_t)>(threadSleepMs))
 {
+}
+
+void CasRequestController::setSleepFnForTest(std::function<void(uint64_t)> sleep_ms_)
+{
+    sleep_ms = sleep_ms_ ? std::move(sleep_ms_) : std::function<void(uint64_t)>(threadSleepMs);
+}
+
+uint64_t CasRequestController::backoffBeforeAttempt(uint32_t next_attempt) const
+{
+    const uint64_t initial = budget.retry_initial_backoff_ms;
+    const uint64_t cap = budget.retry_max_backoff_ms;
+    if (initial == 0 || next_attempt < 2)
+        return 0;
+    /// Saturating `initial << doublings`: `initial > cap >> doublings` implies the unshifted product
+    /// already exceeds the cap, so return the cap without ever computing an overflowing shift.
+    const uint32_t doublings = next_attempt - 2;
+    if (doublings >= 63 || initial > (cap >> doublings))
+        return cap;
+    return std::min(initial << doublings, cap);
+}
+
+bool CasRequestController::pauseBeforeReissue(uint32_t completed_attempt, uint64_t deadline_ms, const std::function<bool()> & fence_ok)
+{
+    /// Fence BEFORE the sleep (RFC §ack-and-cache-rules step 1 applied to the whole loop, not just the
+    /// attempt): a fence lost mid-backoff aborts the operation instantly — sleeping first would keep a
+    /// fenced writer alive for up to a full backoff cap after it lost its right to write.
+    if (!fence_ok())
+        return false;
+    const uint64_t backoff = backoffBeforeAttempt(completed_attempt + 1);
+    if (backoff == 0)
+        return true;
+    /// Never serve a sleep the operation cannot afford: if the backoff plus one more attempt would
+    /// cross the operation deadline, give up NOW instead of sleeping into a guaranteed Unresolved.
+    if (now_ms() + backoff + budget.attempt_timeout_ms > deadline_ms)
+        return false;
+    sleep_ms(backoff);
+    return true;
 }
 
 CasWriteOutcome CasRequestController::resolveByExactGet(std::string_view key, std::string_view expected_bytes,
@@ -246,7 +303,14 @@ CasWriteOutcome CasRequestController::putIfAbsentControlled(
             /// conflict) straight out of this call — that is never a retry signal.
             attempt_outcome = resolveByExactGet(key_s, bytes_s, &committed_token);
             if (attempt_outcome == CasWriteOutcome::Unresolved)
-                continue;   /// absent/unreadable: another attempt of the SAME (key, bytes) may be legal
+            {
+                /// Absent/unreadable: another attempt of the SAME (key, bytes) may be legal — after the
+                /// fence-gated capped-exponential backoff (pauseBeforeReissue). No pause after the LAST
+                /// attempt: the budget is spent, sleeping would only delay the Unresolved verdict.
+                if (attempt == budget.max_attempts || !pauseBeforeReissue(attempt, deadline_ms, fence_ok))
+                    return CasWriteOutcome::Unresolved;
+                continue;
+            }
         }
 
         /// attempt_outcome == Committed here (either the attempt's own 2xx, or resolution found

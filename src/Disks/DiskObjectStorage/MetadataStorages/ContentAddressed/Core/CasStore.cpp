@@ -122,6 +122,11 @@ Store::Store(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
     ref_request_controller = std::make_unique<CasRequestController>(pool_backend, config.cas_request_budget, config.boot_ms_fn);
 }
 
+void Store::setCasRetrySleepForTest(std::function<void(uint64_t)> sleep_fn)
+{
+    ref_request_controller->setSleepFnForTest(std::move(sleep_fn));
+}
+
 bool Store::isAlgoAdmitted(BlobHashAlgo algo) const
 {
     const auto v = static_cast<uint8_t>(algo);
