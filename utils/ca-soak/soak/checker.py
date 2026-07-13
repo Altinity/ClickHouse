@@ -141,45 +141,178 @@ def scaled_admin_timeout_s(pool_objects: int, *, floor_s: float = 600.0, per_mil
     return min(cap_s, floor_s + per_million_s * (pool_objects / 1_000_000.0))
 
 
+def wait_for_pool_drain(pool_bytes_fn, *, interval_s: float, band_ratio: float = 0.01, stable: int = 3,
+                        safety_factor: float = 3.0, floor_s: float = 300.0, cap_s: float = 1800.0,
+                        sleep_fn=time.sleep, monotonic_fn=time.monotonic, log_fn=print) -> list:
+    """Poll the PHYSICAL CA-pool byte probe (`pool_bytes_fn`, e.g. `soak.pool.pool_size()[1]`, the
+    B204 `du -sb`-based probe — see `soak/pool.py`) until the pool has effectively stopped SHRINKING,
+    and return the sampled trajectory (a list of `int | None`, oldest first).
+
+    Why this runs as a PRECONDITION before `poll_unreachable_to_stable`: per
+    `.superpowers/sdd/task3-soak-diag-report.md` (Q1/Q2), a large pre-checkpoint garbage backlog
+    leaves the server's leader GC ACTIVELY grinding down the physical pool for minutes after
+    quiesce — `fsck.unreachable` oscillates every ~15-18s (candidates(N) ~= deleted(N+2), the
+    report's "lag-2 alternation") for as long as real bytes are still being reclaimed, so 3
+    consecutive samples of `unreachable` are structurally near-impossible to match while the drain
+    is in flight, REGARDLESS of budget length (the report's diagnosed root cause: the criterion, not
+    the product, failed — data was exactly consistent throughout). The physical byte count is a
+    monotone, much lower-noise signal of drain progress than the fold-derived `unreachable` count, so
+    waiting for IT to flatten first establishes the precondition under which
+    `poll_unreachable_to_stable`'s band criterion is measuring genuine residual fold noise, not an
+    active drain.
+
+    Stability: the relative drop between EACH consecutive pair of the last `stable` samples is below
+    `band_ratio` (default 1%) — i.e. the pool has stopped shrinking meaningfully, not necessarily
+    that it is bit-for-bit flat.
+
+    Budget: DERIVED from the OBSERVED drain rate (bytes_drained / elapsed, from the first and latest
+    real samples) rather than a fixed constant — `remaining_bytes / rate * safety_factor`, floored at
+    `floor_s` (a small/no backlog still gets a reasonable wait) and capped at `cap_s` (a pathological
+    rate reading can't produce an unbounded wait). The budget is RECOMPUTED each poll as more samples
+    refine the rate estimate, so an unlucky single early sample can't wedge the whole wait the way a
+    single early `unreachable_fn()` read can shrink `fixpoint_timeout_s` (report Q6) — this avoids the
+    same trap by design.
+
+    Best-effort: `soak.pool.pool_size` returns `(None, None)` on ANY failure by its own contract (it
+    must never block the soak). A `None` reading here carries no signal, so we log and return
+    immediately rather than wait on an unrelated probe outage — the caller falls through to
+    `poll_unreachable_to_stable`, which remains the real, always-authoritative gate.
+
+    If the (rate-scaled) budget expires without the band closing, we log a loud warning and return
+    the trajectory so far rather than raise: this precondition is a best-effort accelerant for the
+    real gate, not a second hard-failure point — `poll_unreachable_to_stable` still has its own
+    band+timeout as the backstop.
+
+    `sleep_fn`/`monotonic_fn` are injectable so the loop is pure-testable."""
+    history: list = []
+    times: list = []
+    start = monotonic_fn()
+    timeout_s = floor_s
+    while True:
+        try:
+            b = pool_bytes_fn()
+        except Exception:
+            b = None
+        now = monotonic_fn()
+        history.append(b)
+        times.append(now)
+        log_fn(f"pool drain probe: pool_bytes={b} sample={len(history)} trajectory={history}")
+
+        if b is None:
+            log_fn("pool drain probe unavailable (best-effort per soak.pool contract); "
+                   "skipping drain-completion wait")
+            return history
+
+        # Refine the rate-scaled budget from the first and most-recent REAL samples.
+        real = [(t, v) for t, v in zip(times, history) if v is not None]
+        if len(real) >= 2:
+            (t_first, b_first), (t_last, b_last) = real[0], real[-1]
+            dt = t_last - t_first
+            drained = b_first - b_last
+            if dt > 0 and drained > 0:
+                rate = drained / dt  # bytes/sec, observed
+                timeout_s = min(cap_s, max(floor_s, (max(0, b_last) / rate) * safety_factor))
+
+        if len(history) >= stable:
+            tail = history[-stable:]
+            stopped = all(
+                prev <= 0 or (prev - cur) / prev < band_ratio
+                for prev, cur in zip(tail, tail[1:])
+            )
+            if stopped:
+                log_fn(f"pool drain complete: last {stable} samples {tail} within "
+                       f"{band_ratio:.0%} relative-drop band (budget was {timeout_s:.0f}s)")
+                return history
+
+        if now - start > timeout_s:
+            log_fn(f"WARNING pool drain wait exceeded its rate-scaled budget ({timeout_s:.0f}s); "
+                   f"proceeding to the unreachable-fixpoint poll anyway. trajectory={history}")
+            return history
+
+        sleep_fn(interval_s)
+
+
+def unreachable_stable_band(history: list, *, stable: int = 3, band_ratio: float = 0.01,
+                            band_floor: float = 50.0) -> bool:
+    """True once the LAST `stable` `fsck.unreachable` samples all lie within a BAND of each other,
+    rather than requiring bit-for-bit equality.
+
+    Why a band and not equality: per `.superpowers/sdd/task3-soak-diag-report.md` (Q1), the server's
+    leader GC keeps running condemn/delete rounds every ~15-18s even once the physical pool has
+    finished draining — candidates(N) is consistently ~= deleted(N+2) (a lag-2 alternation), and each
+    round's magnitude can swing by thousands. The checker's own summary `fsck` fold costs ~20-25s per
+    sample and can itself observe benign in-flight ref-cleanup churn. 3 bit-for-bit-IDENTICAL
+    consecutive samples are therefore structurally near-unreachable even once the pool is fully
+    quiescent — the report's diagnosed failure was exactly this: a perfectly-consistent, converging
+    pool that the equality criterion could never certify. `poll_unreachable_to_stable` only reaches
+    this check AFTER `wait_for_pool_drain` has confirmed the PHYSICAL pool has stopped shrinking, so
+    the band here tolerates residual fold-level noise, not an active drain.
+
+    band = max(band_floor, band_ratio * max(tail)) — an absolute floor (default 50) so a small
+    residual count is not held to an unrealistically tight relative band, plus a relative 1%-of-max
+    term so a large residual gets a proportionally wide one.
+
+    Examples (stable=3, band_floor=50, band_ratio=0.01): [2837, 3177, 6203] band=max(50,62)=62,
+    spread=3366 -> False (still oscillating — matches the report's real, unconverged history).
+    [1622, 1600, 1610] band=max(50,16)=50, spread=22 -> True (settled within noise). [80] -> False
+    (not enough history)."""
+    if len(history) < stable:
+        return False
+    tail = history[-stable:]
+    band = max(band_floor, band_ratio * max(tail))
+    return (max(tail) - min(tail)) <= band
+
+
 def poll_unreachable_to_stable(unreachable_fn, *, timeout_s: float, interval_s: float, stable: int = 3,
+                               band_ratio: float = 0.01, band_floor: float = 50.0,
+                               drain_history: list | None = None,
                                sleep_fn=time.sleep, monotonic_fn=time.monotonic) -> int:
     """Poll `unreachable_fn()` (current fsck.unreachable, an int) until the INCREMENTAL GC reaches ITS
-    fixpoint — i.e. the count STOPS DECREASING (stabilizes) for `stable` consecutive polls — then
-    RETURN the residual unreachable count.
+    fixpoint — i.e. the count STOPS CHANGING MEANINGFULLY (settles into a BAND, see
+    `unreachable_stable_band`) for `stable` consecutive polls — then RETURN the residual unreachable
+    count.
 
     The incremental, journal-driven GC's fixpoint is NOT unreachable==0: per the CA spec §8 it cannot
     reclaim "debris"/"drift" — e.g. blobs orphaned by a tree that is added-and-displaced within one
     fold window, so its child-blob edges are never recorded (the gtest `CasGcLeak.
     DisplacedUnexpandedTreeBlobsLeak` documents this). The Full-GC mark-sweep (milestone M-F, NOT yet
     implemented, tracked as B140) is the documented backstop that drains this residual to 0. So the
-    correct fixpoint of the CURRENTLY-IMPLEMENTED GC is the stable non-zero residual. This residual is
-    NOT data loss: every ref-reachable object still exists (`dangling==0`, INV-NO-LOSS holds).
+    correct fixpoint of the CURRENTLY-IMPLEMENTED GC is the stable residual. This residual is NOT
+    data loss: every ref-reachable object still exists (`dangling==0`, INV-NO-LOSS holds).
 
-    We accept stabilization here (and the checkpoint logs the residual as M-F-debris) rather than
-    target 0, which would assert an unimplemented feature. Stabilization is "no further DECREASE for
-    `stable` consecutive polls" — a transient bump (a new orphan appearing mid-quiesce) resets the
-    run, so we only return once the count has truly settled.
+    Stability criterion (per `.superpowers/sdd/task3-soak-diag-report.md`, which diagnosed a false
+    checkpoint failure here): the ORIGINAL criterion required `stable` bit-for-bit IDENTICAL
+    consecutive samples, but the server's leader GC legitimately keeps running condemn/delete rounds
+    every ~15-18s (candidates(N) ~= deleted(N+2), swinging by up to several thousand per round) for as
+    long as a real backlog remains — so 3-in-a-row exact equality was structurally near-unreachable
+    until the backlog was FULLY drained, independent of how generous the timeout was. Callers should
+    therefore invoke this only AFTER the physical pool has stopped shrinking (`wait_for_pool_drain`),
+    and pass its `drain_history` through here purely so a genuine timeout's failure message carries
+    the full drain trajectory alongside the `unreachable` history. Stabilization is now "the last
+    `stable` samples lie within a band of each other" (`unreachable_stable_band`) — a transient bump
+    (a new orphan appearing mid-quiesce) that lands OUTSIDE the band still keeps the window unstable,
+    so we only return once the count has truly settled within tolerance.
 
     `sleep_fn`/`monotonic_fn` are injectable so the loop is pure-testable. Raises `CheckpointFailure`
-    ONLY on a true timeout — never reaching ANY stable point within `timeout_s` (the GC is still
-    monotonically grinding a huge backlog and the bound was too small), which is a harness/bound
+    ONLY on a true timeout — never reaching ANY stable band within `timeout_s` (the GC is still
+    grinding a huge backlog, or genuinely oscillating without settling), which is a harness/bound
     problem, not a correctness one.
 
-    Examples: a fake returning [1751,1200,600,61,61,61] (stable=3) -> returns 61; a perpetually
-    decreasing [1000,900,800,700,...] -> raises after the bound (never settles)."""
+    Examples: a fake returning [1751,1200,600,61,61,61] (stable=3) -> returns 61 (exact match is
+    still within any band); a fake alternating [4748,0,4748,0,...] forever -> raises after the bound
+    (never settles into a band, matching the report's real per-round swing magnitude)."""
     deadline = monotonic_fn() + timeout_s
     history = []
     while True:
         n = unreachable_fn()
         history.append(n)
-        # Stable == the last `stable` samples are all equal (no further decrease). Requires enough
-        # history so a single early reading cannot be mistaken for a fixpoint.
-        if len(history) >= stable and len(set(history[-stable:])) == 1:
+        if unreachable_stable_band(history, stable=stable, band_ratio=band_ratio, band_floor=band_floor):
             return n
         if monotonic_fn() > deadline:
+            drain_note = f" drain_history={drain_history}" if drain_history is not None else ""
             raise CheckpointFailure(
                 f"GC unreachable count never stabilized within {timeout_s:.0f}s (backlog-scaled "
-                f"bound); it never reached a fixpoint (still grinding?). history={history}")
+                f"bound); it never reached a fixpoint (still grinding?). history={history}{drain_note}")
         sleep_fn(interval_s)
 
 
@@ -375,9 +508,11 @@ def query_aggregates(node, table: str) -> dict:
 
 
 def drive_gc_to_fixpoint(cluster, unreachable_fn, timeout_s: int | None = None,
-                         sleep_fn=time.sleep, monotonic_fn=time.monotonic) -> int:
-    """Wait until the INCREMENTAL GC reaches ITS fixpoint — `fsck.unreachable` STOPS DECREASING
-    (stabilizes) for K consecutive polls — and RETURN the residual unreachable count.
+                         pool_bytes_fn=None, drain_interval_s: float = 60.0,
+                         sleep_fn=time.sleep, monotonic_fn=time.monotonic, log_fn=print) -> int:
+    """Wait until the INCREMENTAL GC reaches ITS fixpoint — `fsck.unreachable` STOPS CHANGING
+    MEANINGFULLY (settles into a band) for K consecutive polls — and RETURN the residual unreachable
+    count.
 
     The incremental, journal-driven GC's fixpoint legitimately has residual M-F-debris (B140): per
     CA spec §8 it cannot reclaim blobs orphaned by a displaced-before-expansion tree; the Full-GC
@@ -390,8 +525,24 @@ def drive_gc_to_fixpoint(cluster, unreachable_fn, timeout_s: int | None = None,
     lease holder progresses), so a large post-TRUNCATE backlog of a few thousand orphans takes many
     rounds to grind DOWN to its residual. The bound is SCALED to the initial backlog (see
     `fixpoint_timeout_s`) with a generous floor; we raise via `CheckpointFailure` ONLY on a true
-    timeout — never reaching ANY stable point (the GC is still monotonically grinding), which is a
-    bound/harness issue, not a correctness one.
+    timeout — never reaching ANY stable band (the GC is still grinding, or genuinely oscillating
+    without settling), which is a bound/harness issue, not a correctness one.
+
+    Two-part fix for the false checkpoint failure diagnosed in
+    `.superpowers/sdd/task3-soak-diag-report.md` (a real backlog whose per-round condemn/delete
+    oscillation made 3-in-a-row EXACT equality of `unreachable` structurally near-unreachable while
+    the pool was still actively, correctly draining):
+
+    1. If `pool_bytes_fn` is given (e.g. `lambda: soak.pool.pool_size()[1]`), we first WAIT for the
+       PHYSICAL pool to stop shrinking (`wait_for_pool_drain`) before even starting to sample
+       `unreachable` for stability — sampling a fold-derived count while the pool is still draining
+       is chasing a moving target, independent of how generous the `unreachable`-poll budget is. This
+       step is a best-effort accelerant with its own rate-scaled budget; it never raises, and a
+       `None` pool-bytes reading (probe outage) or an omitted `pool_bytes_fn` (default `None`, the
+       original behavior) both fall straight through to step 2.
+    2. `poll_unreachable_to_stable` now accepts a BAND (see `unreachable_stable_band`) instead of
+       requiring bit-for-bit equality, tolerating the residual fold-level noise that persists even
+       after the physical drain is complete.
 
     Returns the residual unreachable count (0 once M-F lands). `sleep_fn`/`monotonic_fn` are
     injectable so the loop is pure-testable."""
@@ -404,7 +555,15 @@ def drive_gc_to_fixpoint(cluster, unreachable_fn, timeout_s: int | None = None,
         initial = 0
     if initial == 0:
         return 0
+
+    drain_history = None
+    if pool_bytes_fn is not None:
+        drain_history = wait_for_pool_drain(
+            pool_bytes_fn, interval_s=drain_interval_s, sleep_fn=sleep_fn, monotonic_fn=monotonic_fn,
+            log_fn=log_fn)
+
     if timeout_s is None:
         timeout_s = fixpoint_timeout_s(initial, gc_interval_s=interval)
     return poll_unreachable_to_stable(unreachable_fn, timeout_s=timeout_s, interval_s=interval + 1,
-                                      sleep_fn=sleep_fn, monotonic_fn=monotonic_fn)
+                                      drain_history=drain_history, sleep_fn=sleep_fn,
+                                      monotonic_fn=monotonic_fn)

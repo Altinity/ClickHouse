@@ -503,11 +503,19 @@ def checkpoint(driver, cluster, model, phase):
     # dryrun-subset check consumes) pays that cost exactly once.
     # Each per-poll summary fsck is bounded at 180s; FsckTimeout in any poll surfaces as a logged
     # best-effort skip of the fixpoint loop — the soak must not wedge here (B146/B154).
+    # Per .superpowers/sdd/task3-soak-diag-report.md: wait for the PHYSICAL pool (`pool_size`'s B204
+    # `du -sb` probe) to stop shrinking BEFORE sampling `unreachable` for stability — the server's
+    # leader GC keeps oscillating candidates/deletes every ~15-18s for as long as a real backlog
+    # remains, so the checker was chasing a moving target. `drain_interval_s` matches the existing
+    # metrics-tick cadence (`METRICS_INTERVAL_S`).
     _detail_fsck_skipped = False  # set True if `--detail` fsck times out; skips dryrun-subset assert
     try:
         residual = drive_gc_to_fixpoint(
             cluster,
             lambda: run_fsck(FSCK_CONTAINER, detail=False, timeout_s=180)["unreachable"],
+            pool_bytes_fn=lambda: pool_size()[1],
+            drain_interval_s=METRICS_INTERVAL_S,
+            log_fn=log,
         )
     except FsckTimeout as _e:
         log(f"WARNING [B146/B154] drive_gc_to_fixpoint: summary fsck timed out ({_e}); "

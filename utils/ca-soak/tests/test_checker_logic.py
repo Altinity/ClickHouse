@@ -8,6 +8,8 @@ from soak.checker import (
     is_genuine_hang,
     poll_unreachable_to_stable,
     scaled_admin_timeout_s,
+    unreachable_stable_band,
+    wait_for_pool_drain,
     CheckpointFailure,
 )
 
@@ -108,25 +110,119 @@ def test_poll_unreachable_zero_residual_returns_zero():
 
 
 def test_poll_unreachable_transient_bump_resets_stability():
-    # A transient bump (a new orphan appearing mid-quiesce) must reset the stable run; the fixpoint is
-    # only declared after the count has truly settled. Here [60,60,61,55,55,55] -> 55 (the 61 bump
-    # breaks the early [60,60] run; only the final [55,55,55] settles).
-    seq = iter([60, 60, 61, 55, 55, 55])
+    # A transient bump (a new orphan appearing mid-quiesce) must keep the window UNSTABLE until the
+    # count truly settles within the band. Report-scale magnitudes (thousands, per
+    # .superpowers/sdd/task3-soak-diag-report.md Q1's real history): [6000,6000,6200,...] -- the 6200
+    # bump lands outside the band of the [6000,6000,6200] window (band=max(50,62)=62, spread=200) --
+    # only the final [1600,1620,1610] settles (band=max(50,16.2)=50, spread=20) -> 1610.
+    seq = iter([6000, 6000, 6200, 1600, 1620, 1610])
     mono, sleep = _fake_clock()
     assert poll_unreachable_to_stable(
-        lambda: next(seq), timeout_s=10000, interval_s=3, stable=3, sleep_fn=sleep, monotonic_fn=mono) == 55
+        lambda: next(seq), timeout_s=10000, interval_s=3, stable=3, sleep_fn=sleep, monotonic_fn=mono) == 1610
+
+
+def test_poll_unreachable_band_tolerates_small_residual_noise():
+    # The band criterion's whole point (report Q1/Q6): the server's leader GC keeps oscillating by
+    # thousands per round even while genuinely converging, so 3 bit-for-bit-IDENTICAL samples are
+    # structurally near-unreachable. A residual that settles WITHIN the band (not bit-for-bit equal)
+    # must still be accepted as stable, unlike the old equality criterion.
+    seq = iter([5000, 3000, 1622, 1600, 1610])
+    mono, sleep = _fake_clock()
+    assert poll_unreachable_to_stable(
+        lambda: next(seq), timeout_s=10000, interval_s=3, stable=3, sleep_fn=sleep, monotonic_fn=mono) == 1610
 
 
 def test_poll_unreachable_never_settles_raises_after_bound():
-    # A perpetually decreasing count never settles within the bound -> raise (a true timeout: the GC
-    # is still monotonically grinding and the bound was too small). This is a bound/harness problem,
-    # NOT the non-zero-residual case.
-    seq = iter(range(1000, 0, -1))
+    # An unbounded round-to-round swing of the report's own observed magnitude (0 <-> 4748, "CA GC
+    # round" Q1) never lands within any band -> raise (a true timeout: the GC is still oscillating a
+    # real backlog and the bound was too small). This is a bound/harness problem, NOT the
+    # non-zero-residual case.
+    import itertools
+    seq = itertools.cycle([4748, 0])
     mono, sleep = _fake_clock()
     with pytest.raises(CheckpointFailure) as ei:
         poll_unreachable_to_stable(
             lambda: next(seq), timeout_s=30, interval_s=3, stable=3, sleep_fn=sleep, monotonic_fn=mono)
     assert "never stabilized" in str(ei.value)
+
+
+def test_poll_unreachable_failure_message_includes_drain_history():
+    # The failure message must still carry the `unreachable` history AND (per the task's format
+    # requirement) the drain trajectory when the caller supplied one.
+    import itertools
+    seq = itertools.cycle([4748, 0])
+    mono, sleep = _fake_clock()
+    with pytest.raises(CheckpointFailure) as ei:
+        poll_unreachable_to_stable(
+            lambda: next(seq), timeout_s=10, interval_s=3, stable=3, sleep_fn=sleep, monotonic_fn=mono,
+            drain_history=[818754664, 35823959])
+    msg = str(ei.value)
+    assert "history=" in msg
+    assert "drain_history=[818754664, 35823959]" in msg
+
+
+def test_unreachable_stable_band_examples():
+    # Still-oscillating report-scale history -> not stable.
+    assert unreachable_stable_band([2837, 3177, 6203], stable=3) is False
+    # Settled within the absolute floor band (50) -> stable.
+    assert unreachable_stable_band([1622, 1600, 1610], stable=3) is True
+    # Not enough history yet.
+    assert unreachable_stable_band([80], stable=3) is False
+    # A large residual gets a proportionally wide (1%-of-max) band, not just the floor.
+    assert unreachable_stable_band([10000, 9950, 9920], stable=3, band_ratio=0.01, band_floor=50) is True
+    assert unreachable_stable_band([10000, 9800, 9920], stable=3, band_ratio=0.01, band_floor=50) is False
+
+
+def _fake_pool_probe(sizes):
+    seq = iter(sizes)
+    return lambda: next(seq)
+
+
+def test_wait_for_pool_drain_stops_when_shrink_slows_below_band():
+    # Monotonically draining pool that flattens out -- must stop polling once the relative
+    # drop between consecutive samples falls below the 1% band, not run to a timeout.
+    mono, sleep = _fake_clock()
+    sizes = [1_000_000_000, 500_000_000, 100_000_000, 10_000_000, 9_995_000, 9_990_500]
+    history = wait_for_pool_drain(
+        _fake_pool_probe(sizes), interval_s=60, sleep_fn=sleep, monotonic_fn=mono, log_fn=lambda *_: None)
+    # Stops as soon as 3 consecutive samples are each within 1% of the prior one.
+    assert history == [1_000_000_000, 500_000_000, 100_000_000, 10_000_000, 9_995_000, 9_990_500]
+
+
+def test_wait_for_pool_drain_returns_immediately_on_probe_failure():
+    # A None reading (soak.pool.pool_size's best-effort failure contract) carries no signal -- must
+    # not block the checkpoint waiting on an unrelated probe outage.
+    mono, sleep = _fake_clock()
+    calls = {"n": 0}
+
+    def probe():
+        calls["n"] += 1
+        return None
+
+    history = wait_for_pool_drain(
+        probe, interval_s=60, sleep_fn=sleep, monotonic_fn=mono, log_fn=lambda *_: None)
+    assert history == [None]
+    assert calls["n"] == 1  # returns after the first failed read, does not retry
+
+
+def test_wait_for_pool_drain_budget_scales_with_observed_rate_and_gives_up_gracefully():
+    # A pool that keeps shrinking by a CONSTANT ~2% per sample forever never closes the 1% relative-
+    # drop band (it is always draining "meaningfully"), so the wait can only end via its rate-scaled
+    # budget expiring -- and even then it must log and return the trajectory rather than raise: this
+    # precondition is a best-effort accelerant, not a second hard-failure point.
+    mono, sleep = _fake_clock()
+    sizes = []
+    v = 1_000_000_000.0
+    for _ in range(60):
+        sizes.append(int(v))
+        v *= 0.98
+    logged = []
+    history = wait_for_pool_drain(
+        _fake_pool_probe(sizes), interval_s=60, cap_s=1800, sleep_fn=sleep, monotonic_fn=mono,
+        log_fn=logged.append)
+    assert len(history) < len(sizes)  # gave up before exhausting the fake sample source (60 samples)
+    assert None not in history  # every read succeeded; this was a genuine slow-drain give-up
+    assert any("exceeded its rate-scaled budget" in line for line in logged)
 
 
 def test_fixpoint_timeout_small_backlog_hits_floor():
@@ -181,3 +277,43 @@ def test_drive_gc_to_fixpoint_grinds_large_backlog_to_residual():
     seq = iter([1751, 1751, 1200, 600, 100, 61, 61, 61])
     assert drive_gc_to_fixpoint(
         _FakeCluster(gc_interval_s=2), lambda: next(seq), sleep_fn=sleep, monotonic_fn=mono) == 61
+
+
+def test_drive_gc_to_fixpoint_no_pool_bytes_fn_skips_drain_wait():
+    # Omitting `pool_bytes_fn` (the default, and every pre-existing call site until this fix) must
+    # reproduce the ORIGINAL behavior exactly -- no drain-wait phase -- preserving the public contract.
+    mono, sleep = _fake_clock()
+    seq = iter([1751, 1751, 1200, 600, 100, 61, 61, 61])
+    assert drive_gc_to_fixpoint(
+        _FakeCluster(gc_interval_s=2), lambda: next(seq), sleep_fn=sleep, monotonic_fn=mono) == 61
+
+
+def test_drive_gc_to_fixpoint_waits_for_pool_drain_before_polling_unreachable():
+    # When `pool_bytes_fn` IS supplied (the new production wiring in soak/run.py), drive_gc_to_fixpoint
+    # must run the drain-completion wait FIRST. Here the pool oscillates FOREVER (never within the 1%
+    # band) so the drain-wait can only end by its own rate-scaled budget expiring, logging a give-up --
+    # then the (band-tolerant) unreachable poll still runs to completion afterward.
+    import itertools
+    mono, sleep = _fake_clock()
+    unreachable_seq = iter([1751, 1751, 1200, 600, 100, 61, 61, 61])
+    pool_seq = itertools.cycle([1_000_000, 1])  # wildly oscillating -> drain-wait never settles
+    logged = []
+    result = drive_gc_to_fixpoint(
+        _FakeCluster(gc_interval_s=2), lambda: next(unreachable_seq),
+        pool_bytes_fn=lambda: next(pool_seq), drain_interval_s=1, sleep_fn=sleep, monotonic_fn=mono,
+        log_fn=logged.append)
+    assert result == 61
+    assert any("exceeded its rate-scaled budget" in line for line in logged)  # drain-wait gave up
+    assert any("pool drain" in line for line in logged)  # the drain-wait phase actually ran and logged
+
+
+def test_drive_gc_to_fixpoint_pool_drain_probe_failure_falls_through():
+    # A `pool_bytes_fn` that raises/returns None (probe outage) must not block the checkpoint --
+    # falls straight through to the unreachable poll, same result as if it had been omitted.
+    mono, sleep = _fake_clock()
+    unreachable_seq = iter([1751, 1751, 1200, 600, 100, 61, 61, 61])
+    result = drive_gc_to_fixpoint(
+        _FakeCluster(gc_interval_s=2), lambda: next(unreachable_seq),
+        pool_bytes_fn=lambda: None, drain_interval_s=1, sleep_fn=sleep, monotonic_fn=mono,
+        log_fn=lambda *_: None)
+    assert result == 61
