@@ -195,11 +195,15 @@ INSERT_MODE_SETTINGS = {
 }
 
 
-# Phase-2 transport-retry bound. A node killed/paused by chaos comes back within its fault
-# duration_s (<= 60s) plus restart time; with capped-exponential backoff (0.5s..8s) this many
-# attempts spans several minutes -- generously longer than any single fault window. Exhausting it
-# means a node NEVER recovered, which the task spec says IS a failure (the feature must survive
-# crash+restart), so the exhausted transport error is re-raised loudly.
+# Phase-2 transport-retry bound. A node killed/paused/restarted by chaos comes back within its
+# fault duration_s (<= 60s; freeze_long <= 90s; rustfs pause/restart <= 60s -- see
+# `generate_chaos_schedule`, chaos.py) plus recovery time (worst observed: ~120s kill-to-serving
+# boot, ~90s Keeper-session re-establishment). With capped-exponential backoff (0.5s..8s) these 40
+# attempts sleep ~287s total, plus each failed attempt's own call time -- generously longer than
+# the worst fault window + recovery stack (~270s); the full arithmetic lives on
+# `retry_on_transport` (cluster.py). Exhausting it means a node/store NEVER recovered, which the
+# task spec says IS a failure (the feature must survive crash+restart), so the exhausted transport
+# error is re-raised loudly.
 TRANSPORT_ATTEMPTS = 40
 
 
@@ -269,7 +273,17 @@ class Driver:
         """Execute one INSERT. Inner: retry the retryable ABORTED transient (B137). Outer (Phase 2):
         on a TRANSPORT failure (node killed/paused mid-op), retry with bounded backoff and REROUTE to
         the other replica -- the INSERT replicates back and RMT block-dedup keeps the retry idempotent,
-        and the model already applied the op exactly once."""
+        and the model already applied the op exactly once.
+
+        Idempotency of the retry, including after an AMBIGUOUS failure (a timed-out CAS conditional
+        PUT / a dropped connection where the first attempt MAY have committed server-side): the retry
+        re-sends the byte-identical `sql` (built once from (seed, op_id) and captured here), the soak
+        runs SYNC inserts with `deduplicate_blocks=true` (B138), and RMT block-dedup keys on the block
+        content hash -- so a first attempt that DID commit makes the retry a dedup no-op, and one that
+        did NOT commit left no dedup token (sync insert, B138) so the retry truly re-inserts. The
+        dedup window (`replicated_deduplication_window` = 10000 blocks, ~15 min at the observed op
+        rate) comfortably outlasts the ~287s retry budget. Either way the table converges to exactly
+        the model's one application of the op."""
         def aborted_on_retry(attempt, err):
             with self._aborted_lock:
                 self.aborted_retries += 1
@@ -334,11 +348,14 @@ class Driver:
             except QueryError as e:
                 # node-down (graceful-shutdown cancel), the transient TABLE_IS_READ_ONLY (a replica
                 # re-establishing its Keeper session after a chaos pause/restart -- esp. `both pause`),
-                # and a Keeper coordination transient (`Session expired` or `Operation timeout`, a node
+                # a Keeper coordination transient (`Session expired` or `Operation timeout`, a node
                 # frozen/paused past its Keeper session TTL, B190; broadened per
-                # .superpowers/sdd/task3v2-chaos-diag-report.md) are all expected under chaos. OPTIMIZE
-                # has NO model effect, so dropping it is sound; only a genuine logic error surfaces.
-                if not (e.is_node_down or e.is_readonly or e.is_mount_fenced or e.is_keeper_transient):
+                # .superpowers/sdd/task3v2-chaos-diag-report.md), and a transport-flavored S3_ERROR
+                # (the rustfs store paused/restarting mid-OPTIMIZE -- the task3 v3 tolerance gap,
+                # tmp/task3_soak_2h_v3.log:518) are all expected under chaos. OPTIMIZE has NO model
+                # effect, so dropping it is sound; only a genuine logic error surfaces.
+                if not (e.is_node_down or e.is_readonly or e.is_mount_fenced or e.is_keeper_transient
+                        or e.is_s3_transient):
                     raise
             except Exception as e:
                 if not is_transport_error(e):
@@ -393,9 +410,19 @@ class Driver:
         coordination error (`is_keeper_transient`: `Session expired` or `Operation timeout`, code 999
         KEEPER_EXCEPTION) racing the mutation's Keeper-side bookkeeping (e.g. creating the entry under
         .../mutations), per .superpowers/sdd/task3v2-chaos-diag-report.md -- previously this class went
-        unretried here and could abort the whole run on a self-healing ~70s outage. It is applied to
-        the model ONLY AFTER the cluster command succeeds, so a never-landed mutation surfaces as a
-        transport failure instead of silently diverging the model."""
+        unretried here and could abort the whole run on a self-healing ~70s outage -- and a
+        transport-flavored S3_ERROR (`is_s3_transient`, the rustfs store paused/restarting; the task3
+        v3 tolerance gap). It is applied to the model ONLY AFTER the cluster command succeeds, so a
+        never-landed mutation surfaces as a transport failure instead of silently diverging the model.
+
+        KNOWN residual (pre-existing, documented not fixed): a retried UPDATE is NOT idempotent at
+        the table level (`v = v + 1`), so an AMBIGUOUS first attempt -- one that actually created its
+        mutation entry server-side before the error surfaced (possible for node-down mid-op and the
+        Keeper `Operation timeout` shape; NOT for readonly/mount-fenced, which reject before doing
+        anything) -- followed by a successful retry double-applies the increment and the NEXT
+        checkpoint's model comparison catches it loudly. This window (entry-created-but-error-
+        surfaced) is a few ms wide and has not been observed across the 2h soaks; DELETE/TRUNCATE
+        retries are table-level idempotent."""
         self.drain()
         if op.type == OpType.UPDATE:
             sql = update_sql(TABLE, self.model._pred_bucket(op.param))

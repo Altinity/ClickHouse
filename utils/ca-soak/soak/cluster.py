@@ -65,6 +65,48 @@ NODE_DOWN_CODES = (394, 209, 210, 735)
 # docstring claiming transport-resilience -- aborting the whole run instead of self-healing in ~70s.
 KEEPER_EXCEPTION_CODE = 999
 
+# ClickHouse error code S3_ERROR (Common/ErrorCodes.cpp). Under chaos the RustFS object-store
+# container is PAUSED (docker pause, 5..60s) or RESTARTED — while it is unreachable, any server-side
+# S3 request that a client op depends on can fail and surface to the client as an HTTP 500 carrying
+# `Code: 499 ... (S3_ERROR)`. The CAS conditional-write path makes this especially sharp: every CAS
+# conditional PUT (part manifests, ref-log appends, ...) deliberately runs on a SINGLE-ATTEMPT S3
+# client (RFC cas-s3-timeout-retry-control; `ObjectStorageBackend::conditionalWriteSettings`,
+# src/.../ContentAddressed/Core/CasObjectStorageBackend.cpp) whose one attempt gets the ADAPTIVE
+# first-attempt timeout (~3s receive for a small PUT, src/IO/ConnectionTimeouts.cpp) — so any S3
+# blip longer than ~3s fails a CAS write with zero server-side retries, where upstream non-CAS S3
+# traffic would have retried through it (~500 attempts). Diagnosed on the task3 v3 2h soak
+# (tmp/task3_soak_2h_v3.log:518): a 19s `rustfs pause` fault made an INSERT's part-manifest PUT
+# (`Build::stageManifest`) time out after ONE 3s attempt and the un-retried S3_ERROR aborted the run.
+S3_ERROR_CODE = 499
+
+# TRANSPORT flavors of an S3_ERROR body — the store was unreachable / the connection died, saying
+# NOTHING about data. These self-heal when the fault window ends (rustfs pause <= 60s, restart takes
+# seconds), so they are retryable exactly like node-down:
+#   Timeout            -- docker pause: the store freezes mid-request (the observed v3 shape)
+#   Connection refused -- rustfs restarting: TCP port not yet listening
+#   Connection reset   -- rustfs going down mid-request
+#   Broken pipe        -- rustfs closed the socket mid-body (the B187-documented shape)
+#   DNS error          -- container-name resolution blips while docker recreates the container
+_S3_TRANSIENT_FLAVORS = ("Timeout", "Connection refused", "Connection reset", "Broken pipe", "DNS error")
+
+# CORRECTNESS-signal markers: if any of these appears in the body the error is NEVER retried, even
+# when a transport flavor word is also present. Each one is a real bug/damage signal, not weather:
+#   NoSuchKey / NO_SUCH_KEY   -- S3 "object absent" SEMANTICS: on the CAS read path a live ref naming
+#                                a missing object is INV-NO-DANGLE (durability loss); retrying would
+#                                mask data loss (and revival-by-retry violates the CA resurrect
+#                                invariant — condemned objects are never read back to life).
+#   AccessDenied / ACCESS_DENIED -- auth/config failure: deterministic, a retry can only mask it.
+#   PreconditionFailed        -- a conditional-write 412 leaking RAW to a client is a CAS protocol
+#                                bug (the CAS layer must resolve conflicts internally), not weather.
+#   LOGICAL_ERROR             -- a product invariant broke; must surface immediately.
+#   CORRUPTED_DATA            -- decode/integrity failure; retrying re-reads the same bad bytes.
+# (Wrong-result classes never reach this classifier at all: they surface as CheckpointFailure from
+# the model comparison, not as a QueryError.)
+_S3_CORRECTNESS_MARKERS = (
+    "NoSuchKey", "NO_SUCH_KEY", "AccessDenied", "ACCESS_DENIED",
+    "PreconditionFailed", "LOGICAL_ERROR", "CORRUPTED_DATA",
+)
+
 
 class QueryError(RuntimeError):
     """A ClickHouse HTTP query failed; carries the server-side exception text from the response body
@@ -116,6 +158,26 @@ class QueryError(RuntimeError):
     # `Session expired` shape. Kept pointing at the same (now-broadened) property so any call site
     # still spelled the old way keeps working unchanged.
     is_keeper_session_expired = is_keeper_transient
+
+    @property
+    def is_s3_transient(self) -> bool:
+        """True if the server-side exception is a TRANSPORT-flavored S3_ERROR (code 499): the S3
+        backend (RustFS) was unreachable — paused/restarting under chaos — while the server needed it
+        for this op. Matched ONLY when a transport flavor (`Timeout`/`Connection refused`/`Connection
+        reset`/`Broken pipe`/`DNS error`) is present AND no correctness marker is (`NoSuchKey`,
+        `AccessDenied`, raw `PreconditionFailed`, `LOGICAL_ERROR`, `CORRUPTED_DATA` — see
+        `_S3_CORRECTNESS_MARKERS` for why each must stay fail-fast). Self-heals when the fault window
+        ends (rustfs pause <= 60s), so it gets the same bounded retry + reroute as node-down.
+        Diagnosed on the task3 v3 2h soak (tmp/task3_soak_2h_v3.log:518): a 19s `rustfs pause` made an
+        INSERT's CAS part-manifest conditional PUT fail after its deliberately-single 3s attempt
+        (RFC cas-s3-timeout-retry-control) and the un-retried S3_ERROR aborted the whole run.
+        Detected by parsing the ClickHouse exception body in the HTTP response."""
+        b = self.body or ""
+        if ("Code: %d" % S3_ERROR_CODE) not in b and "S3_ERROR" not in b:
+            return False
+        if any(marker in b for marker in _S3_CORRECTNESS_MARKERS):
+            return False
+        return any(flavor in b for flavor in _S3_TRANSIENT_FLAVORS)
 
     @property
     def is_node_down(self) -> bool:
@@ -335,22 +397,52 @@ def is_keeper_transient(exc: BaseException) -> bool:
     return isinstance(exc, QueryError) and exc.is_keeper_transient
 
 
+def is_s3_transient(exc: BaseException) -> bool:
+    """A transport-flavored S3_ERROR transient (`QueryError.is_s3_transient`, code 499): the S3
+    backend was unreachable (rustfs pause/restart chaos fault) while the server needed it — most
+    sharply on the CAS conditional-write path, whose single-attempt client (RFC
+    cas-s3-timeout-retry-control) turns any >~3s S3 blip into an immediate client-visible S3_ERROR
+    with zero server-side retries. The store comes back within the fault window (pause <= 60s), so
+    this gets the same bounded retry + reroute recovery as node-down/readonly/mount-fenced/
+    keeper-transient. S3 SEMANTIC errors (NoSuchKey, AccessDenied), raw conditional-write conflicts
+    (PreconditionFailed) and integrity failures (LOGICAL_ERROR, CORRUPTED_DATA) are explicitly NOT
+    matched — those are correctness signals and stay fail-fast (see `_S3_CORRECTNESS_MARKERS`).
+
+    Retry safety on the INSERT path: the outcome of a timed-out conditional PUT is AMBIGUOUS (the
+    write may have landed). The retried INSERT re-sends the byte-identical statement (the sql string
+    is built once per op from (seed, op_id) and captured by `_insert_with_retry`), and the soak runs
+    SYNC inserts with `deduplicate_blocks=true` (B138): if the first attempt actually committed
+    server-side, the retry dedups against its block hash (window `replicated_deduplication_window` =
+    10000 blocks, >= ~15 min of headroom at the observed ~11 ops/s — far beyond the retry budget);
+    if it never committed (the observed v3 case: the failed INSERT's transaction was undone,
+    tmp/soak_v3_evidence/ch2/clickhouse-server.log:2021560 `Undoing transaction`), the retry truly
+    re-inserts. Either way the model applied the op exactly once. Added per the task3 v3 soak failure
+    (tmp/task3_soak_2h_v3.log:518, 19s `rustfs pause` -> un-retried S3_ERROR Timeout on an INSERT)."""
+    return isinstance(exc, QueryError) and exc.is_s3_transient
+
+
 def retry_on_transport(fn, *, attempts: int, backoff_s: float = 0.5, max_backoff_s: float = 8.0,
                        on_retry=None, sleep_fn=time.sleep):
     """Call `fn` and retry it on a NODE-DOWN failure (`is_node_down`: a connection-level transport
     error OR a graceful-shutdown cancellation/network `QueryError`), a transient `is_readonly`/
-    `is_mount_fenced`/`is_keeper_transient` `QueryError`, with bounded, capped-exponential backoff, up
-    to `attempts` total tries. A persistent failure after the budget is exhausted is re-raised -- per
-    the task spec, a node that never comes back within a generous bound IS a failure (the feature must
-    survive crash+restart). Other exceptions (a logic `QueryError`, the B137 ABORTED transient that has
-    its own retry, ...) propagate IMMEDIATELY so the caller's own handling sees them unmasked.
+    `is_mount_fenced`/`is_keeper_transient`/`is_s3_transient` `QueryError`, with bounded,
+    capped-exponential backoff, up to `attempts` total tries. A persistent failure after the budget is
+    exhausted is re-raised -- per the task spec, a node that never comes back within a generous bound
+    IS a failure (the feature must survive crash+restart). Other exceptions (a logic `QueryError`, the
+    B137 ABORTED transient that has its own retry, ...) propagate IMMEDIATELY so the caller's own
+    handling sees them unmasked.
 
     Budget note: with the caller's default `attempts=TRANSPORT_ATTEMPTS` (40, `run.py`) and this
     function's default `backoff_s=0.5`/`max_backoff_s=8.0`, the capped-exponential backoff sums to
-    ~287s (~4.8 minutes) of sleep across the retry loop -- comfortably above the >=2-minute floor
-    `.superpowers/sdd/task3v2-chaos-diag-report.md` calls for (the diagnosed Keeper outage there
-    self-healed in ~66-90s), so `is_keeper_transient` reuses the SAME bounded budget as the other
-    transport-retryable classes rather than needing its own extended one.
+    0.5+1+2+4 + 35*8 = ~287s (~4.8 minutes) of PURE SLEEP across the retry loop -- and each failed
+    attempt's own call time (connect/receive timeouts while a node or the store is unreachable) adds
+    on top, so the real wall-clock envelope is strictly larger. That covers the worst self-healing
+    window the chaos module can create (`generate_chaos_schedule`, chaos.py): kill/restart/pause
+    faults last 5..60s and freeze_long 60..90s, plus the worst OBSERVED recoveries — ~120s
+    kill-to-serving boot (task3 v2 fault #8) and ~66-90s Keeper-session re-establishment (v2 diag) —
+    stacking to ~270s < 287s even before per-attempt call time. The rustfs-fault classes are milder
+    still: a rustfs pause (<= 60s) + mount-lease expiry + self-remount completes well inside the
+    budget. Every retryable class therefore shares this ONE bounded budget.
 
     `sleep_fn` is injectable so the loop is pure-testable without real sleeps."""
     last = None
@@ -358,7 +450,8 @@ def retry_on_transport(fn, *, attempts: int, backoff_s: float = 0.5, max_backoff
         try:
             return fn()
         except Exception as e:
-            if not (is_node_down(e) or is_readonly(e) or is_mount_fenced(e) or is_keeper_transient(e)):
+            if not (is_node_down(e) or is_readonly(e) or is_mount_fenced(e) or is_keeper_transient(e)
+                    or is_s3_transient(e)):
                 raise
             last = e
             if attempt < attempts:
