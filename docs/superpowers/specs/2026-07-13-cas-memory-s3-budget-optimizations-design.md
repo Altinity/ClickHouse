@@ -70,6 +70,13 @@ The workload recycles content hashes, yet dedup probes ran ~7M HEADs. Run the so
 `dedup_cache_bytes` (current default, x4, x16) and judge by `CasBlobHead` delta + hit rate. Outcome
 is a default-tuning decision recorded here after measurement; no semantic change.
 
+Mechanics correction (2026-07-14, found during §0 implementation and verified twice against
+`putBlob`'s control flow): a dedup-cache hit does NOT skip the occupancy `HEAD` — it is what selects
+the `head_first` branch, so the `HEAD` runs precisely ON hits; what a `HEAD`-confirmed hit avoids is
+the body PUT (`CasBlobBodyPutAvoided`). A larger cache therefore trades body PUTs for HEADs rather
+than removing HEADs. Judge the matrix by BOTH deltas — `CasBlobHead` AND `CasBlobBodyPutAvoided` /
+PUT-class totals — with `CasDedupCacheHits`/`CasDedupCacheMisses` as the hit-rate denominators.
+
 ## §3 Configurable cache validation (user decision) {#s3-validate-setting}
 
 Facts established during brainstorm: every local ref mutation already pushes invalidation THROUGH
