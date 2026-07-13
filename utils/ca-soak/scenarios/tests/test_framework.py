@@ -70,3 +70,62 @@ def test_select_by_priority_and_name():
     assert all(c.priority == "P0" for c in p0)
     assert base.select("S01") and base.select("S01")[0].name == "S01"
     assert base.select("all")  # non-empty
+
+
+class _FakeNode:
+    """Node stub whose query() returns the next value from a list (last value repeats)."""
+
+    def __init__(self, container, values):
+        self.container = container
+        self._values = list(values)
+
+    def query(self, _query):
+        return self._values.pop(0) if len(self._values) > 1 else self._values[0]
+
+
+class _FakeCluster:
+    def __init__(self, *nodes):
+        self._nodes = list(nodes)
+
+    def nodes(self):
+        return self._nodes
+
+
+def test_assert_replicas_agree_waits_for_replication_lag():
+    # ch2 lags one poll behind (the S06/S07 2026-07-13 false-FAIL class), then converges: PASS.
+    from scenarios.cards import _common
+    r = ScenarioResult(scenario="S99", title="t", priority="P0", seed=1)
+    cl = _FakeCluster(_FakeNode("ch1", ["50\thash"]),
+                      _FakeNode("ch2", ["0\t0", "50\thash"]))
+    sleeps = []
+    agree = _common.assert_replicas_agree(r, cl, "q", sleep_fn=sleeps.append)
+    assert agree is True
+    assert r.verdicts[-1].status == PASS
+    assert sleeps == [2.0]  # exactly one bounded poll, no real sleep in tests
+
+
+def test_assert_replicas_agree_genuine_divergence_still_fails():
+    # A divergence that never converges must exhaust the budget and FAIL (oracle not weakened).
+    from scenarios.cards import _common
+    r = ScenarioResult(scenario="S99", title="t", priority="P0", seed=1)
+    cl = _FakeCluster(_FakeNode("ch1", ["50\thash"]),
+                      _FakeNode("ch2", ["49\tother"]))
+    sleeps = []
+    agree = _common.assert_replicas_agree(r, cl, "q", attempts=3, sleep_fn=sleeps.append)
+    assert agree is False
+    assert r.verdicts[-1].status == FAIL
+    assert len(sleeps) == 2  # attempts-1 polls, then the fail verdict
+
+
+def test_assert_replicas_agree_error_value_counts_as_disagreement():
+    # A transient per-node ERROR (readonly/keeper blip) is retried; persistent ERROR fails.
+    from scenarios.cards import _common
+    r = ScenarioResult(scenario="S99", title="t", priority="P0", seed=1)
+    cl = _FakeCluster(_FakeNode("ch1", ["50\thash"]),
+                      _FakeNode("ch2", ["ERROR: readonly", "50\thash"]))
+    agree = _common.assert_replicas_agree(r, cl, "q", sleep_fn=lambda s: None)
+    assert agree is True
+    r2 = ScenarioResult(scenario="S99", title="t", priority="P0", seed=1)
+    cl2 = _FakeCluster(_FakeNode("ch1", ["ERROR: down"]), _FakeNode("ch2", ["ERROR: down"]))
+    agree2 = _common.assert_replicas_agree(r2, cl2, "q", attempts=2, sleep_fn=lambda s: None)
+    assert agree2 is False  # identical ERROR values are NOT agreement

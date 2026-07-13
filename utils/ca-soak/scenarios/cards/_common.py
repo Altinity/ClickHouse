@@ -1,5 +1,7 @@
 """Shared helpers for scenario cards: standard end checkpoint, memory-peak recording, oracle checks."""
 
+import time
+
 from ..framework import checkpoint, observe
 from ..framework.report import Verdict
 
@@ -29,13 +31,31 @@ def record_peak_memory(result, sampler, *, budget_bytes=None, label="peak Memory
     return peak
 
 
-def assert_replicas_agree(result, cluster, query, name="replica agreement"):
-    """Add a verdict that all replicas return the same value for `query`."""
+def assert_replicas_agree(result, cluster, query, name="replica agreement",
+                          attempts=5, poll_s=2.0, sleep_fn=time.sleep):
+    """Add a verdict that all replicas return the same value for `query`.
+
+    Replication is asynchronous: sampled immediately after an INSERT/OPTIMIZE the peer replica may
+    not have fetched the newest part yet, so a single-shot sample is a guaranteed false FAIL at
+    small scales (2026-07-13 S06/S07 reruns: ch2 was sampled ~0.9 s before its fetch of the only
+    data part landed). Re-poll a bounded number of times until the replicas converge. The oracle is
+    NOT weakened into a tautology: a genuine divergence still FAILS once the `attempts` budget is
+    exhausted — convergence to a COMMON value is the only way to pass. A transient per-node query
+    error (readonly / keeper blip surfaces as an `ERROR:` value from `replicas_agree`) counts as
+    disagreement and is retried the same way.
+    """
     from ..framework.sql import replicas_agree
     agree, vals = replicas_agree(cluster, query)
+    for _ in range(max(0, attempts - 1)):
+        if agree:
+            break
+        sleep_fn(poll_s)
+        agree, vals = replicas_agree(cluster, query)
     result.observations.setdefault("replica_values", {})[name] = vals
-    result.add(Verdict.check(name, "all replicas equal", vals, agree,
-                             "" if agree else f"divergence: {vals}"))
+    result.add(Verdict.check(
+        name, "all replicas equal", vals, agree,
+        "" if agree else f"divergence persisted through {attempts} samples over "
+                         f"~{poll_s * max(0, attempts - 1):.0f}s: {vals}"))
     return agree
 
 
