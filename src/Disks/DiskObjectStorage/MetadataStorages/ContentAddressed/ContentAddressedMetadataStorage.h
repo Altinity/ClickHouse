@@ -289,7 +289,10 @@ public:
 
     struct DirRoute
     {
-        DirShape shape;
+        /// Defaulted so a future classifyDirectory return path that forgets to set it fails safe
+        /// (a defined shape) instead of switching on an indeterminate enum (UB). Matches the
+        /// existing unreachable-fallthrough choice at the bottom of existsDirectory/listDirectory.
+        DirShape shape = DirShape::GenericIntermediate;
         std::optional<ContentAddressed::PartFilePath> p;
         std::optional<Route> r;
         std::optional<std::string> uuid;
