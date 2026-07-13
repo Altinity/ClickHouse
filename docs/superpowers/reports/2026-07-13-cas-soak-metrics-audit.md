@@ -157,3 +157,30 @@ During this audit `CasRootGet` was observed live (backend counter of GETs on the
 `ProfileEvents.cpp:795`) — the s03_s05 card fix dispatch brief had falsely declared it removed. The
 oracle's counter swap to `CasRefLogBodyGets` stands on consumer-isolation grounds; the misleading
 comment was corrected in `8d34bb504ed`.
+
+## Files written vs S3 ops per part type (INSERTs) {#files-vs-s3}
+
+`part_log` `NewPart` by `part_type` × `disk_name` revealed the storage policy is TIERED: small
+insert blocks become **Compact parts on the local `default` disk** (zero S3, 4-8 ms), large blocks
+go straight to **Wide parts on the `ca` disk**; merges/moves later produce Wide@ca parts.
+
+| | Compact@default (39%) | Wide@ca (61%) |
+|---|---|---|
+| parts | ~18 700 | ~29 600 |
+| `FileOpen` per part | 17.6 | 26.8 |
+| S3 conditional writes per part | **0** | 13.6 (5.8 blob bodies + ~1 manifest + ~6.8 tags/ref) |
+| S3 GET / HEAD per part | 0 / 0 | 22 / 43.6 |
+| avg create time | 4–8 ms | ~370 ms |
+| avg rows | 1 059–1 860 | 176–779 |
+
+Insights:
+
+1. **~78% of a Wide part's files never become S3 objects**: 26.8 files opened → only 5.8 blob
+   bodies + 1 manifest; marks, `primary.idx`, checksums, serialization metadata and other
+   sub-`INLINE_CAP` files ride INSIDE the manifest. The inline design saves ~20 PUTs per part.
+2. **The local hot tier absorbs 39% of insert parts entirely** — without it every micro-insert
+   would pay the full CAS publish; this is a large contributor to the modest 13.6 PUT/insert.
+3. The Compact/Wide split is byte-driven (`min_bytes_for_wide_part`), not row-driven: parts with
+   fat `payload` strings go Wide at ~200 rows while 1 800-row thin parts stay Compact.
+4. HEAD ≈ 1.6 × files for Wide parts (per-file dedup probe + adopt/freshness verification) —
+   consistent with the dedup-by-hash design.
