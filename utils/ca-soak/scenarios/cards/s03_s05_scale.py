@@ -504,10 +504,12 @@ class S05(Scenario):
         durs = _finish_durations(gc_all)
         rounds = max(1, len([d for d in durs if d is not None]))
         # CasRefLogBodyGets (src/Common/ProfileEvents.cpp:762): ref-log transaction-body GETs decoded
-        # during the GC fold. This is the live, non-vacuous counter for this check. The old
-        # `CasRootGet` this oracle used to read was emitted by the RootShard protocol, which is GONE —
-        # the counter is always 0 today, so reading it here would make this check pass regardless of
-        # what GC actually did.
+        # during the GC fold. CORRECTION (2026-07-13, live-run verification): the old `CasRootGet`
+        # this oracle used to read is NOT dead — it survives as a backend-level counter of GETs on
+        # the roots/ prefix (ProfileEvents.cpp:795), which today counts ref-log/snapshot object
+        # reads by EVERY consumer (writer recovery, sweeps, folds). It was replaced here not because
+        # it is vacuous but because it CONFLATES consumers: this check asserts a property of the GC
+        # FOLD specifically, and CasRefLogBodyGets isolates exactly the fold's body reads.
         log_body_gets = int(delta.get("CasRefLogBodyGets", 0))
         get_per_round = log_body_gets / rounds
         result.observations["log_body_gets_per_round_avg"] = round(get_per_round, 1)
