@@ -276,7 +276,6 @@ def test_parallel_read_missing_part_on_worker_errors(started_cluster):
         settings = (
             DISTRIBUTED_SETTINGS
             + ", distributed_plan_force_exchange_kind = 'Persisted'"
-            + ", distributed_plan_prefer_replicas_over_workers = 1"
         )
         with pytest.raises(QueryRuntimeException) as exc:
             INITIATOR.query(f"SELECT count(), sum(id) FROM {table} SETTINGS {settings}")
