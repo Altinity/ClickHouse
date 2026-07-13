@@ -25,7 +25,8 @@ namespace DB::Cas
 /// already depends back on this header (`CasBlobDigest.h` -> `CasPoolMeta.h` -> `CasLayout.h`) --
 /// including it here would cycle. The `blobKey(const BlobRef &)` overload below needs it only by
 /// const reference, so the forward declaration is enough for the header; its definition (which needs
-/// the complete type) lives in `CasBuild.cpp`, where both are already visible.
+/// the complete type) lives in `CasLayout.cpp`, which includes `CasBlobRef.h` directly -- a `.cpp`
+/// has no such cycle.
 struct BlobRef;
 
 /// Which of the three immutable ref-object kinds a `_cleanup`/`_log`/`_snap` key names (spec §Object
@@ -80,7 +81,7 @@ public:
     explicit Layout(String prefix_) : prefix(std::move(prefix_)) {}
 
     /// Content objects: POOL/blobs/<algo>/S/<hex>, with `<algo>`/`<hex>` taken from `ref` itself.
-    /// Defined out-of-line in CasBuild.cpp: `BlobRef`'s complete type comes through
+    /// Defined out-of-line in CasLayout.cpp: `BlobRef`'s complete type comes through
     /// `CasBlobDigest.h` -> `CasPoolMeta.h` -> `CasLayout.h`, so this header cannot include it
     /// directly without cycling (mirrors the pre-existing `objectKey` cyclic-include workaround).
     String blobKey(const BlobRef & ref) const;
@@ -95,7 +96,7 @@ public:
     /// (`blobHashAlgoName` never rendered it), a hex payload of the wrong width for a KNOWN algo, or
     /// non-hex characters -- every case is "debris, not ours", never an exception (callers classify
     /// it as foreign/unaccounted, mirroring the LIST sweep's existing `catch (...) continue`
-    /// contract). Defined out-of-line in `CasBuild.cpp` for the same cyclic-include reason as
+    /// contract). Defined out-of-line in `CasLayout.cpp` for the same cyclic-include reason as
     /// `blobKey`/`blobMetaKey` above.
     std::optional<BlobRef> parseBlobKey(std::string_view key) const;
 
