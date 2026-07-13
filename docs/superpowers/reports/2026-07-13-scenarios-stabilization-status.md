@@ -30,9 +30,9 @@ its purpose early — all 5 formerly-dev-inconclusive priority verdicts got defi
 | S02 | full, 4 GiB | **PASS** (второй инсерт — только метаданные) | — | — |
 | S03 | full | FAIL-INFRA ×2 (попытка-2 прервана паузой) | RUSTFS-PUT-DEGRADATION при ~6.4 GB устойчивой записи; `stageManifest` UNCERTAIN после 90 s конверта (availfix работал как задуман) | re-run на реальном S3 или пониженный прифилл |
 | S07 | full, 20 000 колонок | INCONCL 8/9; cap-trip разрешён-как-недостижимый (1 048 576 vs ~40k) | вердикту нужен cap-lowering hook | конфиг-хук (харнесс) |
-| S08 | ci, 20 000 частей | INCONCL 13/14; **ref_objects=4 на 20k вставок** | contention-вердикт мерил не те счётчики | обновить счётчики карты после §0 |
-| S21 | ci, ~14.7 GB | INCONCL; root-decode-амортизация PASS (122 GET « 1800) | cache-absorption — prod-недостижимо на этой машине | записано; нужен больший хост |
-| S29 | full, 20M строк | RSS ограничен (630 MB / 2.8 GB part) | — | — |
+| S08 | ci, 20 000 частей | INCONCL 13/14; **ref_objects=4 на 20k вставок** | HARNESS-STALE-COUNTER: `CasRootCas` мёртв на insert-пути | обновить счётчики карты после §0 |
+| S21 | ci, ~14.7 GB | INCONCL; root-decode-амортизация PASS (122 GET « 1800) | HARNESS-NEEDS-COLD-READ: вердикту нужен холодный читатель, не объём | карта: добавить cold-read фазу |
+| S29 | full, 20M строк | RSS ограничен (630 MB / 2.8 GB part) | HARNESS-PREMISE-GAP: spill-to-blob делает пол атрибуции недостижимым | карта: пересмотреть floor |
 
 **Product findings across both campaigns: ONE (S13, fixed same day).** Every other failure was
 harness, infra, or scale-of-verdict.
@@ -86,6 +86,14 @@ part, fsck clean).
 
 Both scenarios need compose/config additions (a policy with local+CA disks in the scenario
 framework's storage config) — harness work, to be planned with the card implementations.
+
+## Product-adjacent finding (backlog) {#merge-retry-cost}
+
+**Unbounded replicated-merge retry under persistent S3 timeouts** (S01@8GiB): each merge retry
+re-streams gigabytes and progress resets indefinitely (27%→0.8% loops) while the store is degraded —
+a runaway-COST class, not safety (the merge itself is correct). Candidate: bounded backoff /
+circuit-breaker on repeated `S3_ERROR` merge failures, or riding the availfix controller budget at
+the merge-write layer. Recorded here + scenario backlog; not scheduled.
 
 ## Where this leaves the suite {#next}
 
