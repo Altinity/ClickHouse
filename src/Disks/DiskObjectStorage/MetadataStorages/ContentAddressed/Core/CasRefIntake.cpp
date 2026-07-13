@@ -137,7 +137,7 @@ RefCleanupPlan planRefCleanup(const RefTableListing & listing, const RefTxnId & 
 }
 
 RefTableState recoverRefTable(Backend & backend, const Layout & layout, const RootNamespace & ns,
-                              unsigned max_restarts)
+                              const std::function<void()> & on_page_fetched, unsigned max_restarts)
 {
     for (unsigned attempt = 0;; ++attempt)
     {
@@ -148,6 +148,8 @@ RefTableState recoverRefTable(Backend & backend, const Layout & layout, const Ro
         for (;;)
         {
             const ListPage page = backend.list(layout.refsNamespacePrefix(ns), cursor, 1000);
+            if (on_page_fetched)
+                on_page_fetched();
             for (const ListedKey & lk : page.keys)
             {
                 const auto parsed = layout.parseRefObjectKey(lk.key);

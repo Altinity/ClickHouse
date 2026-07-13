@@ -7,6 +7,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRefStateMachine.h>
 #include <base/types.h>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <optional>
 #include <set>
@@ -129,7 +130,12 @@ RefCleanupPlan planRefCleanup(const RefTableListing & listing, const RefTxnId & 
 /// fresh `LIST`, bounded by `max_restarts`, after which the vanish becomes a `CORRUPTED_DATA` throw. A
 /// never-touched namespace yields the empty (never-born) state. Different bytes under a deterministic key,
 /// or an invalid body, are corruption and throw immediately.
+///
+/// `on_page_fetched`, if set, fires once per physical `backend.list` page across every restart attempt --
+/// a GC-owned caller's hook for a page-level ProfileEvents counter; fsck/offline-repair callers leave it
+/// unset.
 RefTableState recoverRefTable(Backend & backend, const Layout & layout, const RootNamespace & ns,
+                              const std::function<void()> & on_page_fetched = {},
                               unsigned max_restarts = 3);
 
 }

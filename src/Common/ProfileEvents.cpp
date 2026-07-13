@@ -845,7 +845,7 @@ The server successfully detected this situation and will download merged part fr
     M(CasMetaAdoptBackfill, "CA blob meta: Clean meta backfilled for a hash that had none at adopt time (pre-protocol blob or lost race)", ValueType::Number) \
     M(CasMetaResurrectClean, "CA blob meta: meta driven back to Clean on the resurrect path (writeResurrectMetaClean)", ValueType::Number) \
     M(CasGcMetaOps, "CA gc: per-hash freshness-meta ops executed on the round's bounded meta pool (pool-scoped: GLOBAL counter only — closes metrics-audit attribution artifact #6)", ValueType::Number) \
-    M(CasGcEnumerationPages, "CA gc: physical-universe LIST pages fetched by the round's own enumeration loops (round-scoped: lands in the GC log ProfileEvents map — closes artifact #3)", ValueType::Number) \
+    M(CasGcEnumerationPages, "CA gc: physical-universe LIST pages fetched by every GC-owned enumeration loop -- fold's/changedShardCount's global cas/refs/ scan (the per-round O(pool) candidate scan), discoverUniverse, rebuildBaseline's traversal, and the orphan-manifest sweep (round-scoped: lands in the GC log ProfileEvents map — closes artifact #3)", ValueType::Number) \
     M(CasPartFolderViewHits, "CA part-folder view cache validated hits (retained view matched a fresh resolve)", ValueType::Number) \
     M(CasPartFolderViewMutableRefreshes, "CA part-folder view refreshes: manifest unchanged, mutable payload drifted — view cloned, no manifest read", ValueType::Number) \
     M(CasPartFolderViewValidationMismatches, "CA part-folder view validation mismatches: the manifest changed under a retained view — rebuilt", ValueType::Number) \

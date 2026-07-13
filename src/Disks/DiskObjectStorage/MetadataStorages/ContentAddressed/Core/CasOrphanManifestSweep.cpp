@@ -26,6 +26,13 @@ namespace DB::Cas
 namespace
 {
 
+/// §0 introspection: the `on_page_fetched` hook this file's own GC-owned enumeration passes to
+/// `forEachListedKey`/`recoverRefTable` -- one increment per physical LIST page, never per listed key.
+void onGcEnumerationPage()
+{
+    ProfileEvents::increment(ProfileEvents::CasGcEnumerationPages);
+}
+
 /// The build-watermark floor now rides the per-server mount lease (ack-floor merge, spec 2026-07-02).
 /// A namespace is rooted by `server_root_id`, but that id is a clean relative path and can contain
 /// slashes. Try namespace prefixes from longest to shortest and accept the first durable mount body.
@@ -113,7 +120,7 @@ std::set<String> activeManifestKeys(Store & store, const RootNamespace & ns)
     Backend & backend = store.backend();
 
     /// Current owners = snapshot + replayed tail (committed rows + live precommits).
-    const RefTableState state = recoverRefTable(backend, layout, ns);
+    const RefTableState state = recoverRefTable(backend, layout, ns, onGcEnumerationPage);
     for (const auto & [ref_name, row] : state.committed)
         active.insert(layout.manifestKey(ManifestId{ns, row.manifest_ref}));
     for (const auto & [ref_name, manifest_ref] : state.precommits)
@@ -130,7 +137,7 @@ std::set<String> activeManifestKeys(Store & store, const RootNamespace & ns)
         if (const auto parsed = layout.parseRefObjectKey(lk.key);
             parsed && parsed->ns == ns && parsed->kind == RefObjectKind::Log)
             logs.push_back(parsed->txn_id);
-    });
+    }, 1000, onGcEnumerationPage);
     std::sort(logs.begin(), logs.end());
     for (const RefTxnId & id : logs)
     {
@@ -209,7 +216,7 @@ void sweepNamespace(Store & store, const RootNamespace & ns, const BuildPrefix &
         if (!head.exists)
             return;
         backend.deleteExact(listed.key, head.token);   /// NotFound/TokenMismatch spared
-    });
+    }, 1000, onGcEnumerationPage);
 }
 
 ManifestSweepResult sweepManifestCursorPage(

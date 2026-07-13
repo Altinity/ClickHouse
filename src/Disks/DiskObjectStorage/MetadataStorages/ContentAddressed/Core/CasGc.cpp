@@ -72,6 +72,14 @@ UInt128 cityHash128(const String & bytes)
     return (static_cast<UInt128>(h.high64) << 64) | static_cast<UInt128>(h.low64);
 }
 
+/// §0 introspection: the `on_page_fetched` hook GC passes to every `forEachListedKey`/`recoverRefTable`
+/// call it owns (never passed by fsck/offline-repair callers of those shared helpers) -- one increment
+/// per physical LIST page, never per listed key.
+void onGcEnumerationPage()
+{
+    ProfileEvents::increment(ProfileEvents::CasGcEnumerationPages);
+}
+
 /// Defined below; forward-declared so the post-CAS hand-off delete in `runRegularRound` (Task 7) can
 /// reach the same wholesale LIST-delete helper the retention prune uses.
 uint64_t deletePrefixWholesale(Backend & backend, const String & prefix, uint64_t bounded_remaining);
@@ -760,7 +768,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
                 count_in_page = 0;
                 ProfileEvents::increment(ProfileEvents::CasRefGlobalListPages);
             }
-        }, kListPageLimit);
+        }, kListPageLimit, onGcEnumerationPage);
         /// The walk's `backend.list` lands at least once even for an empty/undersized final page --
         /// count it, mirroring the original per-page loop (one increment per physical LIST call).
         if (count_in_page > 0 || ref_object_keys.empty())
@@ -1741,7 +1749,7 @@ std::vector<std::pair<RootNamespace, uint64_t>> Gc::discoverUniverse()
     {
         if (const auto parsed = layout.parseRefObjectKey(lk.key))
             namespaces.insert(parsed->ns.string());
-    });
+    }, 1000, onGcEnumerationPage);
     std::vector<std::pair<RootNamespace, uint64_t>> universe;
     universe.reserve(namespaces.size());
     for (const String & ns : namespaces)
@@ -1806,7 +1814,7 @@ size_t Gc::changedShardCount(const GcState & state)
             if (g < parsed->txn_id)
                 g = parsed->txn_id;
         }
-    });
+    }, 1000, onGcEnumerationPage);
 
     size_t changed = 0;
     for (const auto & [ns_str, greatest] : greatest_log)
@@ -1853,7 +1861,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
                     {
                         std::vector<String> table_keys;
                         forEachListedKey(backend, layout.refsNamespacePrefix(ns),
-                            [&](const ListedKey & lk) { table_keys.push_back(lk.key); });
+                            [&](const ListedKey & lk) { table_keys.push_back(lk.key); }, 1000, onGcEnumerationPage);
                         const auto grouped = groupRefKeys(layout, table_keys);
                         const auto git = grouped.find(ns.string());
                         if (git != grouped.end() && !git->second.snapshots.empty()
@@ -1919,7 +1927,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
                 max_gen = std::max(max_gen, static_cast<uint64_t>(std::stoull(k.key.substr(from, slash - from))));
             }
             catch (...) {}   /// foreign key shape under gc/gen — debris, not a numbering input
-        });
+        }, 1000, onGcEnumerationPage);
     }
     const uint64_t generation = max_gen + 1;
     const uint64_t budget = rebuild_edge_budget_override ? rebuild_edge_budget_override
@@ -1988,7 +1996,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
         /// Recover the table via the shared snapshot+tail equation (spec §Offline Recovery): the current
         /// owner set is exactly the committed rows plus live precommits it yields. The rebuilt cursor is
         /// the greatest RefTxnId that verified view included.
-        const RefTableState st = recoverRefTable(backend, layout, ns);
+        const RefTableState st = recoverRefTable(backend, layout, ns, onGcEnumerationPage);
 
         ShardCoverage cov;
         cov.classification = 2;   /// Folded (full coverage) unless a bodiless precommit clamps
@@ -2059,7 +2067,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
                 route_deltas(deltas);
             }
             /// A missing/invalid UNOWNED body is debris (no owner claims it) — skip, never refuse.
-        });
+        }, 1000, onGcEnumerationPage);
     }
 
     /// Pipeline blindness repair (found by the convergence test): the fold discovers candidates by
@@ -2092,7 +2100,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
                 return;
             zero_condemned[blobShard(ref, gc_shards)].push_back(RetiredEntry{
                 .kind = ObjectKind::Blob, .ref = ref, .token = hr.token, .size = hr.size});
-        });
+        }, 1000, onGcEnumerationPage);
     }
 
     /// Numbering, part 2: the round above every surviving fence/state/generation number (also the

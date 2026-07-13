@@ -723,6 +723,28 @@ TEST(CasGcRound, RoundSummaryCountsManifestBodyDeletes)
     EXPECT_GE(ProfileEvents::global_counters[ProfileEvents::CasGcEnumerationPages].load() - pages_before, 1);
 }
 
+/// §0 introspection follow-up: `CasGcEnumerationPages` must not depend on the orphan-manifest sweep alone
+/// (`manifest_sweep_list_budget_keys` zeroed below disables that pass entirely). The mandatory per-round
+/// `cas/refs/` scans -- `changedShardCount`'s pre-fold DEFER signal and `Gc::fold`'s Step-1 global
+/// enumeration, both unconditional every round -- must still land at least one page each round.
+TEST(CasGcRound, EnumerationPagesCountedEvenWithSweepBudgetZeroed)
+{
+    std::shared_ptr<InMemoryBackend> backend;
+    PoolConfig config;
+    config.pool_prefix = "p";
+    config.server_root_id = "test";
+    config.manifest_sweep_list_budget_keys = 0;   /// disables the orphan sweep's own LIST entirely
+    config.gc_fold_max_defer_rounds = 0;          /// force fold-every-round (Phase-4 Lever A would defer)
+    auto store = openTestStoreWithConfig(backend, config);
+
+    Gc gc(store, kGc);
+    const auto pages_before = ProfileEvents::global_counters[ProfileEvents::CasGcEnumerationPages].load();
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+    EXPECT_GE(ProfileEvents::global_counters[ProfileEvents::CasGcEnumerationPages].load() - pages_before, 1)
+        << "the round's own cas/refs/ scans (changedShardCount + fold) must count pages independent of "
+           "the orphan sweep";
+}
+
 /// M1 REGRESSION (cross-round fold cursor must survive independent of trim): a folded-but-untrimmed owner
 /// event must NOT be re-folded by the next round. With eager trim the folded event is removed so the bug
 /// (sealedCursorOf resetting to 0 after a completed round, because snap_generation points at the COMPLETION
