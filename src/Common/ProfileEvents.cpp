@@ -838,12 +838,12 @@ The server successfully detected this situation and will download merged part fr
     M(CasGcRetiredRedeleted,   "CA gc pending deletes executed this round (exact-token blob deletes)", ValueType::Number) \
     M(CasGcHeartbeatFenceOuts, "CA gc expired-mount fence-outs performed by the heartbeat floor", ValueType::Number) \
     M(CasGcMetaWriteAnomaly, "CA gc per-hash freshness-meta ops (condemn/spare/delete) that threw on the bounded meta pool this round (advisory-only; never wedges the round)", ValueType::Number) \
-    M(CasMetaPut,          "CA blob meta: .meta object creations via putMetaIfAbsent (choke-point total; reasons split by CasMetaCreateClean/CasMetaAdoptBackfill)", ValueType::Number) \
-    M(CasMetaCas,          "CA blob meta: .meta conditional rewrites via casMeta (choke-point total)", ValueType::Number) \
-    M(CasMetaDelete,       "CA blob meta: .meta exact-token deletions via deleteMetaExact (choke-point total)", ValueType::Number) \
+    M(CasMetaPut,          "CA blob meta: conditional .meta create attempts via putMetaIfAbsent (choke-point total; counts every attempt incl. lost races — each costs one S3 conditional write; writer-path reasons partially split by CasMetaCreateClean/CasMetaAdoptBackfill/CasMetaResurrectClean, while GC condemn marks and copy-forward clean-flips count only here)", ValueType::Number) \
+    M(CasMetaCas,          "CA blob meta: conditional .meta rewrite attempts via casMeta (choke-point total; counts every attempt incl. lost races — each costs one S3 conditional write)", ValueType::Number) \
+    M(CasMetaDelete,       "CA blob meta: exact-token .meta delete attempts via deleteMetaExact (choke-point total; counts every attempt)", ValueType::Number) \
     M(CasMetaCreateClean,  "CA blob meta: Clean meta created right after a fresh body commit (CasBuild create path; Round-B §5 baseline)", ValueType::Number) \
-    M(CasMetaAdoptBackfill,"CA blob meta: Clean meta backfilled for a hash that had none at adopt time (pre-protocol blob or lost race)", ValueType::Number) \
-    M(CasMetaResurrectClean,"CA blob meta: meta driven back to Clean on the resurrect path (writeResurrectMetaClean)", ValueType::Number) \
+    M(CasMetaAdoptBackfill, "CA blob meta: Clean meta backfilled for a hash that had none at adopt time (pre-protocol blob or lost race)", ValueType::Number) \
+    M(CasMetaResurrectClean, "CA blob meta: meta driven back to Clean on the resurrect path (writeResurrectMetaClean)", ValueType::Number) \
     M(CasPartFolderViewHits, "CA part-folder view cache validated hits (retained view matched a fresh resolve)", ValueType::Number) \
     M(CasPartFolderViewMutableRefreshes, "CA part-folder view refreshes: manifest unchanged, mutable payload drifted — view cloned, no manifest read", ValueType::Number) \
     M(CasPartFolderViewValidationMismatches, "CA part-folder view validation mismatches: the manifest changed under a retained view — rebuilt", ValueType::Number) \
