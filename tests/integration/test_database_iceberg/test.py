@@ -109,11 +109,12 @@ def create_table(
     schema=DEFAULT_SCHEMA,
     partition_spec=DEFAULT_PARTITION_SPEC,
     sort_order=DEFAULT_SORT_ORDER,
+    location="s3://warehouse-rest/data",
 ):
     return catalog.create_table(
         identifier=f"{namespace}.{table}",
         schema=schema,
-        location=f"s3://warehouse-rest/data",
+        location=location,
         partition_spec=partition_spec,
         sort_order=sort_order,
     )
@@ -1136,7 +1137,15 @@ def test_alter_drop_column_without_reload(started_cluster):
 
     catalog = load_catalog_impl(started_cluster)
     catalog.create_namespace(root_namespace)
-    create_table(catalog, root_namespace, table_name, schema, PartitionSpec(), DEFAULT_SORT_ORDER)
+    create_table(
+        catalog,
+        root_namespace,
+        table_name,
+        schema,
+        PartitionSpec(),
+        DEFAULT_SORT_ORDER,
+        location=f"s3://warehouse-rest/data/{root_namespace}/{table_name}",
+    )
 
     create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
     node.query(
@@ -1175,7 +1184,15 @@ def test_alter_modify_column_rest_catalog(started_cluster):
 
     catalog = load_catalog_impl(started_cluster)
     catalog.create_namespace(root_namespace)
-    create_table(catalog, root_namespace, table_name, schema, PartitionSpec(), DEFAULT_SORT_ORDER)
+    create_table(
+        catalog,
+        root_namespace,
+        table_name,
+        schema,
+        PartitionSpec(),
+        DEFAULT_SORT_ORDER,
+        location=f"s3://warehouse-rest/data/{root_namespace}/{table_name}",
+    )
 
     create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
     node.query(
@@ -1240,7 +1257,15 @@ def test_alter_orphan_metadata_cleanup_on_catalog_failure(started_cluster):
 
     catalog = load_catalog_impl(started_cluster)
     catalog.create_namespace(root_namespace)
-    create_table(catalog, root_namespace, table_name, schema, PartitionSpec(), DEFAULT_SORT_ORDER)
+    create_table(
+        catalog,
+        root_namespace,
+        table_name,
+        schema,
+        PartitionSpec(),
+        DEFAULT_SORT_ORDER,
+        location=f"s3://warehouse-rest/data/{root_namespace}/{table_name}",
+    )
 
     create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
     node.query(
@@ -1303,7 +1328,15 @@ def test_alter_fails_when_metadata_not_initialized(started_cluster):
 
     catalog = load_catalog_impl(started_cluster)
     catalog.create_namespace(root_namespace)
-    create_table(catalog, root_namespace, table_name, schema, PartitionSpec(), DEFAULT_SORT_ORDER)
+    create_table(
+        catalog,
+        root_namespace,
+        table_name,
+        schema,
+        PartitionSpec(),
+        DEFAULT_SORT_ORDER,
+        location=f"s3://warehouse-rest/data/{root_namespace}/{table_name}",
+    )
 
     create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
 
@@ -1337,7 +1370,15 @@ def test_alter_orphan_cleanup_failure_reported(started_cluster):
 
     catalog = load_catalog_impl(started_cluster)
     catalog.create_namespace(root_namespace)
-    create_table(catalog, root_namespace, table_name, schema, PartitionSpec(), DEFAULT_SORT_ORDER)
+    create_table(
+        catalog,
+        root_namespace,
+        table_name,
+        schema,
+        PartitionSpec(),
+        DEFAULT_SORT_ORDER,
+        location=f"s3://warehouse-rest/data/{root_namespace}/{table_name}",
+    )
 
     create_clickhouse_iceberg_database(started_cluster, node, CATALOG_NAME)
     node.query(
