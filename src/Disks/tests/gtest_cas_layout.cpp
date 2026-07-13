@@ -295,3 +295,23 @@ TEST(CasLayout, ParseRefObjectKeyRejections)
     /// Missing namespace segment entirely.
     EXPECT_FALSE(l.parseRefObjectKey("p/cas/refs/_log/" + renderRefTxnId(id)).has_value());
 }
+
+/// C3: blobKey/parseBlobKey are inverses; pins the grammar before relocating the definitions
+/// from CasBuild.cpp to CasLayout.cpp (relocation must not change a single byte of output).
+TEST(CasLayout, BlobKeyRoundTripsThroughParse)
+{
+    DB::Cas::Layout layout("pool0");
+    const DB::Cas::BlobRef ref{DB::Cas::BlobHashAlgo::XXH3_128,
+                               DB::Cas::codecFor(DB::Cas::BlobHashAlgo::XXH3_128).fromHex(std::string(32, 'a'))};
+    const String body = layout.blobKey(ref);
+    const String meta = layout.blobMetaKey(ref);
+    EXPECT_EQ(meta, body + ".meta");
+
+    auto parsed_body = layout.parseBlobKey(body);
+    auto parsed_meta = layout.parseBlobKey(meta);   /// body and .meta parse to the SAME BlobRef
+    ASSERT_TRUE(parsed_body.has_value());
+    ASSERT_TRUE(parsed_meta.has_value());
+    EXPECT_EQ(*parsed_body, ref);
+    EXPECT_EQ(*parsed_meta, ref);
+    EXPECT_FALSE(layout.parseBlobKey("pool0/blobs/unknown-algo/aa/aa00").has_value());  /// foreign => nullopt
+}
