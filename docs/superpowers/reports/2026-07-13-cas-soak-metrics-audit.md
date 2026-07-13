@@ -140,7 +140,12 @@ replicas, chaos active). Storage cost excluded (pool ≤ ~5 GB, negligible for t
    NB: plain dedup adoption itself is FREE (`CasBuild.cpp:337`) — an earlier revision mislabeled
    this class as "tags on adoption".
 3. **Dedup-probe HEADs** (~7M): larger/longer dedup cache.
-4. **GC LIST discovery** (~300 pages/round): known quadratic-LIST backlog item.
+4. **GC per-round enumeration** (~300 pages/round): NOT the old "quadratic-LIST" item (that was
+   RESOLVED 2026-07-01 — lazy `start_after` iterator, linear walk; the backlog entry itself warns it
+   keeps misleading re-reads). Today's cost is the BY-DESIGN O(pool-objects) enumeration per round
+   (spec §GC Budget) times an aggressive cadence (272 rounds/72 min ≈ one per 16 s). Levers:
+   adaptive round cadence under low churn, and the Phase-4 skip-unchanged/incremental-discovery
+   idea.
 5. **GC fold buffer churn** (1.96 GB/round): reuse read buffers or size them to body scale.
 6. `appendRefOps` queue wait (1.6% worker time): lane parallelism — lowest priority.
 
