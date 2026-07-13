@@ -41,6 +41,7 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
         /// Note: please check if the key already exists to prevent duplicate entries.
         addSettingsChanges(settings_changes_history, "26.3.1.20001.altinityantalya",
         {
+            {"allow_experimental_geo_types_in_iceberg", false, false, "New setting to allow parsing Iceberg geometry/geography fields as Geometry type."},
             {"object_storage_cluster_join_mode", "allow", "allow", "New setting"},
             {"export_merge_tree_partition_task_timeout_seconds", "3600", "86400", "Increase default value to make it more realistic"},
             {"export_merge_tree_part_allow_lossy_cast", false, false, "New setting to gate lossy casts in EXPORT PART/PARTITION behind explicit acknowledgment"},

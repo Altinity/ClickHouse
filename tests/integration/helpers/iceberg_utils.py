@@ -448,6 +448,7 @@ def create_iceberg_table(
     format="Parquet",
     order_by="",
     object_storage_cluster=False,
+    settings=None,
     **kwargs,
 ):
     if 'output_format_parquet_use_custom_encoder' in kwargs:
@@ -466,7 +467,7 @@ def create_iceberg_table(
                 run_on_cluster=run_on_cluster,
                 object_storage_cluster=object_storage_cluster,
                 **kwargs),
-            settings={"output_format_parquet_use_custom_encoder" : 0, "output_format_parquet_parallel_encoding" : 0}
+            settings={"output_format_parquet_use_custom_encoder" : 0, "output_format_parquet_parallel_encoding" : 0, **(settings or {})}
         )
     else:
         node.query(
@@ -484,6 +485,7 @@ def create_iceberg_table(
                 run_on_cluster=run_on_cluster,
                 object_storage_cluster=object_storage_cluster,
                 **kwargs),
+            settings=settings,
         )
 
 

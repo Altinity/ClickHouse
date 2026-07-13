@@ -10,6 +10,8 @@
 #include <Columns/ColumnTuple.h>
 #include <Columns/ColumnLowCardinality.h>
 #include <Columns/ColumnMap.h>
+#include <Columns/ColumnVariant.h>
+#include <Columns/ColumnsNumber.h>
 #include <Core/Block.h>
 #include <Common/Exception.h>
 #include <Common/WKB.h>
@@ -23,6 +25,7 @@
 #include <DataTypes/DataTypeFixedString.h>
 #include <DataTypes/DataTypeTime64.h>
 #include <DataTypes/DataTypeCustom.h>
+#include <DataTypes/DataTypeVariant.h>
 
 /// This file deals with schema conversion and with repetition and definition levels.
 
@@ -750,6 +753,58 @@ void prepareGeoColumn(ColumnPtr & column, DataTypePtr & type)
 {
     if (!type->getCustomName())
         return;
+
+    if (type->getCustomName()->getName() == "Geometry")
+    {
+        const auto & col_variant = assert_cast<const ColumnVariant &>(*column);
+        const auto & variant_type = assert_cast<const DataTypeVariant &>(*type);
+        const auto & variants = variant_type.getVariants();
+
+        std::vector<std::shared_ptr<IWKBTransform>> transforms(variants.size());
+        for (size_t i = 0; i < variants.size(); ++i)
+        {
+            const auto & variant_name = variants[i]->getCustomName() ? variants[i]->getCustomName()->getName() : variants[i]->getName();
+            if (variant_name == WKBPointTransform::name)
+                transforms[i] = std::make_shared<WKBPointTransform>();
+            else if (variant_name == WKBLineStringTransform::name || variant_name == "Ring")
+                transforms[i] = std::make_shared<WKBLineStringTransform>();
+            else if (variant_name == WKBPolygonTransform::name)
+                transforms[i] = std::make_shared<WKBPolygonTransform>();
+            else if (variant_name == WKBMultiLineStringTransform::name)
+                transforms[i] = std::make_shared<WKBMultiLineStringTransform>();
+            else if (variant_name == WKBMultiPolygonTransform::name)
+                transforms[i] = std::make_shared<WKBMultiPolygonTransform>();
+        }
+
+        auto result = ColumnString::create();
+        auto null_map = ColumnUInt8::create();
+        result->reserve(col_variant.size());
+        null_map->reserve(col_variant.size());
+        for (size_t i = 0; i < col_variant.size(); ++i)
+        {
+            const auto local_discriminator = col_variant.localDiscriminatorAt(i);
+            if (local_discriminator == ColumnVariant::NULL_DISCRIMINATOR)
+            {
+                result->insertDefault();
+                null_map->insertValue(1);
+                continue;
+            }
+            const auto global_discriminator = col_variant.globalDiscriminatorAt(i);
+            if (!transforms[global_discriminator])
+                throw Exception(
+                    ErrorCodes::BAD_ARGUMENTS,
+                    "Cannot encode Geometry sub-type '{}' as WKB",
+                    variants[global_discriminator]->getName());
+            const auto & sub_column = col_variant.getVariantByLocalDiscriminator(local_discriminator);
+            Field field;
+            sub_column.get(col_variant.offsetAt(i), field);
+            result->insert(transforms[global_discriminator]->dumpObject(field));
+            null_map->insertValue(0);
+        }
+        column = ColumnNullable::create(std::move(result), std::move(null_map));
+        type = std::make_shared<DataTypeNullable>(std::make_shared<DataTypeString>());
+        return;
+    }
 
     std::shared_ptr<IWKBTransform> transform;
     if (type->getCustomName()->getName() == WKBPointTransform::name)
