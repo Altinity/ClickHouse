@@ -215,6 +215,35 @@ TEST(CaPartPathParser, RawPathSplitMemoizedAcrossClassifiers)
     EXPECT_EQ(parsed->file, "columns.txt");
 }
 
+TEST(CaPartPathParser, SplitCacheEvictionStaysCorrect)
+{
+    // The split cache is a small fixed-capacity FIFO ring, NOT an LRU/MRU: a hit never promotes its
+    // slot, so a path seen recently can still be evicted by unrelated churn through the same thread.
+    // That is only ever a cache-EFFECTIVENESS tradeoff, never a correctness one: pin that once enough
+    // distinct paths evict the first path's cached split, re-parsing it still yields the exact right
+    // result (a forced re-split / cache miss on the re-parse is expected and fine here — the
+    // assertion is correctness under eviction, not hit rate).
+    resetSplitCacheForTest();
+    const std::string first = "store/uui/uuid-1/all_1_1_0/columns.txt";
+    ASSERT_TRUE(parsePartFilePath(first).has_value());
+
+    // 8 more distinct paths churn through the ring (capacity 8), evicting `first`'s slot.
+    for (int i = 2; i <= 9; ++i)
+    {
+        const std::string path = "store/uui/uuid-" + std::to_string(i) + "/all_1_1_0/columns.txt";
+        ASSERT_TRUE(parsePartFilePath(path).has_value());
+    }
+
+    const size_t misses_before_reparse = splitCacheMissesForTest();
+    const auto reparsed = parsePartFilePath(first);
+    ASSERT_TRUE(reparsed.has_value());
+    EXPECT_EQ(reparsed->table_uuid, "uuid-1");
+    EXPECT_EQ(reparsed->part_name, "all_1_1_0");
+    EXPECT_EQ(reparsed->file, "columns.txt");
+    // Confirms the re-parse really was a forced re-split (the slot was evicted), not a lucky hit.
+    EXPECT_EQ(splitCacheMissesForTest(), misses_before_reparse + 1);
+}
+
 /// ==== M-W Task 2: the read side over Cas::Store ====
 /// Fixture: publish parts through the CORE API, then read through the IMetadataStorage surface of
 /// the rewritten ContentAddressedMetadataStorage (real ctor over a Local object storage; the

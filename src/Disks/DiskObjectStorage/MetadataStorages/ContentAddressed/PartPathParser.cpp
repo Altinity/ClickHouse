@@ -33,10 +33,13 @@ namespace
 /// path classifier, and the CA metadata read path runs SEVERAL of them on the SAME raw path per
 /// logical file-open (each of `existsFile` / `getFileSize` / `getStorageObjects` first calls
 /// `isPartFilePath`, then `parsePartFilePath`). The split is a PURE function of the path, so a small
-/// thread-local most-recently-used cache keyed on the raw path is always correct, disk-agnostic and
-/// lock-free. The returned reference stays valid until the next `splitCached` call on the SAME
-/// thread; every classifier consumes its split before splitting again (none splits while holding
-/// another's split).
+/// thread-local FIFO ring cache keyed on the raw path is always correct, disk-agnostic and
+/// lock-free. It is a fixed-capacity round-robin ring, NOT an LRU/MRU: a hit does not move or
+/// promote its slot, so under sustained eviction pressure a path can be re-split on a later call
+/// even if it was seen recently — always still CORRECT (re-splitting just re-derives the same
+/// result), only less effective as a cache. The returned reference stays valid until the next
+/// `splitCached` call on the SAME thread; every classifier consumes its split before splitting
+/// again (none splits while holding another's split).
 struct SplitCache
 {
     static constexpr size_t kCapacity = 8;
