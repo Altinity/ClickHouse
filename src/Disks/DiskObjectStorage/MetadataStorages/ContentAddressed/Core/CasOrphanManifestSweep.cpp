@@ -1,4 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasOrphanManifestSweep.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBackendListing.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEvent.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRefIntake.h>
@@ -118,20 +119,12 @@ std::set<String> activeManifestKeys(Store & store, const RootNamespace & ns)
     /// so this also protects a whole removed namespace's bodies until the fold catches up.
     const RefTxnId cursor = sealedRefCursor(store, ns);
     std::vector<RefTxnId> logs;
+    forEachListedKey(backend, layout.refsNamespacePrefix(ns), [&](const ListedKey & lk)
     {
-        String list_cursor;
-        for (;;)
-        {
-            const ListPage page = backend.list(layout.refsNamespacePrefix(ns), list_cursor, 1000);
-            for (const ListedKey & lk : page.keys)
-                if (const auto parsed = layout.parseRefObjectKey(lk.key);
-                    parsed && parsed->ns == ns && parsed->kind == RefObjectKind::Log)
-                    logs.push_back(parsed->txn_id);
-            if (page.next_cursor.empty())
-                break;
-            list_cursor = page.next_cursor;
-        }
-    }
+        if (const auto parsed = layout.parseRefObjectKey(lk.key);
+            parsed && parsed->ns == ns && parsed->kind == RefObjectKind::Log)
+            logs.push_back(parsed->txn_id);
+    });
     std::sort(logs.begin(), logs.end());
     for (const RefTxnId & id : logs)
     {
@@ -199,26 +192,18 @@ void sweepNamespace(Store & store, const RootNamespace & ns, const BuildPrefix &
     const String prefix_key = layout.manifestNamespacePrefix(ns)
         + renderRefTxnId(RefTxnId{prefix.writer_epoch, prefix.build_sequence}) + "/";
 
-    String cursor;
-    while (true)
+    forEachListedKey(backend, prefix_key, [&](const ListedKey & listed)
     {
-        const ListPage page = backend.list(prefix_key, cursor, /*limit*/1000);
-        for (const ListedKey & listed : page.keys)
-        {
-            if (active.count(listed.key))
-                continue;   /// owned by a committed/precommit owner — never sweep (control #8)
+        if (active.count(listed.key))
+            return;   /// owned by a committed/precommit owner — never sweep (control #8)
 
-            /// Exact-token delete: HEAD for the current token, then deleteExact. A 404 between HEAD and
-            /// delete (or a TokenMismatch — a fresh owner reclaimed it) is tolerated (record-and-continue).
-            const HeadResult head = backend.head(listed.key);
-            if (!head.exists)
-                continue;
-            backend.deleteExact(listed.key, head.token);   /// NotFound/TokenMismatch spared
-        }
-        if (page.next_cursor.empty())
-            break;
-        cursor = page.next_cursor;
-    }
+        /// Exact-token delete: HEAD for the current token, then deleteExact. A 404 between HEAD and
+        /// delete (or a TokenMismatch — a fresh owner reclaimed it) is tolerated (record-and-continue).
+        const HeadResult head = backend.head(listed.key);
+        if (!head.exists)
+            return;
+        backend.deleteExact(listed.key, head.token);   /// NotFound/TokenMismatch spared
+    });
 }
 
 ManifestSweepResult sweepManifestCursorPage(
@@ -310,7 +295,8 @@ ManifestSweepResult sweepManifestCursorPage(
         }
 
         const DeleteOutcome outcome = backend.deleteExact(parsed->key, token);
-        if (outcome.kind == DeleteOutcome::Kind::Deleted)
+        const DeleteClass outcome_class = classifyDeleteOutcome(outcome);
+        if (outcome_class == DeleteClass::Deleted)
             ++result.deleted;
         else
             ++result.skipped;
@@ -325,8 +311,7 @@ ManifestSweepResult sweepManifestCursorPage(
             e.namespace_ = parsed->ns.string();
             e.object_kind = CasEventObjectKind::Manifest;
             e.object_hash = parsed->key;
-            e.outcome = outcome.kind == DeleteOutcome::Kind::Deleted ? "deleted"
-                      : outcome.kind == DeleteOutcome::Kind::NotFound ? "absent" : "token_mismatch";
+            e.outcome = String{deleteClassName(outcome_class)};
             e.reason = "orphan-manifest sweep: exact-token delete of an eligible+unowned build-prefix body";
             e.detail = {{"writer_epoch", std::to_string(parsed->prefix.writer_epoch)},
                         {"build_sequence", std::to_string(parsed->prefix.build_sequence)}};

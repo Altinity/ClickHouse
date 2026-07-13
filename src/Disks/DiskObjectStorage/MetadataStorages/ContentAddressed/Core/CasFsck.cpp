@@ -1,3 +1,4 @@
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBackendListing.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFsck.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcFormats.h>
@@ -41,20 +42,27 @@ void checkDeadline(const Deadline & deadline, std::string_view phase)
 void listAll(Backend & backend, const String & prefix, std::unordered_map<String, uint64_t> & out,
              const FsckProgress & on_progress, const Deadline & deadline, std::string_view phase)
 {
-    String cursor;
+    static constexpr size_t kPageLimit = 1000;
     uint64_t pages = 0;
-    while (true)
+    size_t count_in_page = 0;
+    forEachListedKey(backend, prefix, [&](const ListedKey & k)
     {
-        ListPage page = backend.list(prefix, cursor, 1000);
-        for (const auto & k : page.keys)
-            out[k.key] = k.size;
+        out[k.key] = k.size;
+        if (++count_in_page == kPageLimit)
+        {
+            count_in_page = 0;
+            ++pages;
+            checkDeadline(deadline, phase);
+            if (on_progress && pages % PROGRESS_PAGES == 0)
+                on_progress(phase, out.size(), pages);
+        }
+    }, kPageLimit);
+    /// The walk's `backend.list` lands at least once even for an empty/undersized final page --
+    /// check it here, mirroring the original per-page loop (deadline checked after every physical page).
+    if (count_in_page > 0 || pages == 0)
+    {
         ++pages;
         checkDeadline(deadline, phase);
-        if (on_progress && pages % PROGRESS_PAGES == 0)
-            on_progress(phase, out.size(), pages);
-        if (page.next_cursor.empty())
-            break;
-        cursor = page.next_cursor;
     }
     if (on_progress)
         on_progress(phase, out.size(), pages);
@@ -151,24 +159,16 @@ void checkSnapshotOracle(Backend & backend, const Layout & layout, const RootNam
     /// One LIST of the table prefix; gather snapshot and log ids.
     std::vector<RefTxnId> snap_ids;
     std::vector<RefTxnId> log_ids;
-    String cursor;
-    for (;;)
+    forEachListedKey(backend, layout.refsNamespacePrefix(ns), [&](const ListedKey & lk)
     {
-        const ListPage page = backend.list(layout.refsNamespacePrefix(ns), cursor, 1000);
-        for (const ListedKey & lk : page.keys)
-        {
-            const auto parsed = layout.parseRefObjectKey(lk.key);
-            if (!parsed || parsed->ns != ns)
-                continue;
-            if (parsed->kind == RefObjectKind::Snap)
-                snap_ids.push_back(parsed->txn_id);
-            else if (parsed->kind == RefObjectKind::Log)
-                log_ids.push_back(parsed->txn_id);
-        }
-        if (page.next_cursor.empty())
-            break;
-        cursor = page.next_cursor;
-    }
+        const auto parsed = layout.parseRefObjectKey(lk.key);
+        if (!parsed || parsed->ns != ns)
+            return;
+        if (parsed->kind == RefObjectKind::Snap)
+            snap_ids.push_back(parsed->txn_id);
+        else if (parsed->kind == RefObjectKind::Log)
+            log_ids.push_back(parsed->txn_id);
+    });
     if (snap_ids.empty())
         return;   /// no published snapshot: recovering from logs alone is valid, nothing to oracle
     std::sort(snap_ids.begin(), snap_ids.end());

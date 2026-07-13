@@ -1,4 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBackendListing.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobMeta.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEvent.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcCursorKey.h>
@@ -373,12 +374,12 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
                 }
             }
 
-            OutcomeEntry outcome{.kind = entry.kind, .ref = entry.ref, .token = entry.token,
-                                 .outcome = del.kind == DeleteOutcome::Kind::Deleted ? OutcomeKind::Deleted
-                                          : del.kind == DeleteOutcome::Kind::NotFound ? OutcomeKind::Absent
-                                          : OutcomeKind::Replaced};
-            const String del_outcome = outcome.outcome == OutcomeKind::Deleted ? "deleted"
-                                     : outcome.outcome == OutcomeKind::Absent ? "absent" : "replaced";
+            const DeleteClass del_class = classifyDeleteOutcome(del);
+            const OutcomeKind outcome_kind = del_class == DeleteClass::Deleted ? OutcomeKind::Deleted
+                                            : del_class == DeleteClass::Absent ? OutcomeKind::Absent
+                                                                                : OutcomeKind::Replaced;
+            OutcomeEntry outcome{.kind = entry.kind, .ref = entry.ref, .token = entry.token, .outcome = outcome_kind};
+            const String del_outcome{deleteClassName(del_class)};
             /// B170: the single content-delete site — attributable per row. TokenMismatch (a writer
             /// recreated the incarnation) is terminal-OK: the fresh incarnation is a live object.
             EventEmitter{*store}.emit([&](CasEvent & e)
@@ -405,7 +406,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
             /// writer's own resurrect path already flipped the meta back to Clean; blindly deleting here
             /// would race that legitimate Clean write for no reason (the meta is advisory, but there is no
             /// reason to touch it on that path at all).
-            if (del.kind == DeleteOutcome::Kind::Deleted || del.kind == DeleteOutcome::Kind::NotFound)
+            if (del_class == DeleteClass::Deleted || del_class == DeleteClass::Absent)
             {
                 const BlobRef ref = entry.ref;
                 scheduleMetaJob([this, ref]() { deleteConfirmedMeta(store->backend(), store->layout(), ref); });
@@ -602,7 +603,8 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     for (const auto & [id, token] : folded.mf_cleanup)
     {
         const DeleteOutcome mdel = backend.deleteExact(layout.manifestKey(id), token);   /// NotFound/TokenMismatch tolerated
-        if (mdel.kind == DeleteOutcome::Kind::Deleted)
+        const DeleteClass mdel_class = classifyDeleteOutcome(mdel);
+        if (mdel_class == DeleteClass::Deleted)
             ++report.manifests_deleted;
         EventEmitter{*store}.emit([&](CasEvent & e)
         {
@@ -613,8 +615,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
             e.token = token.value;
             e.round = new_round;
             e.gen = generation;
-            e.outcome = mdel.kind == DeleteOutcome::Kind::Deleted ? "deleted"
-                      : mdel.kind == DeleteOutcome::Kind::NotFound ? "absent" : "replaced";
+            e.outcome = String{deleteClassName(mdel_class)};
             e.reason = "owner-removed manifest body; exact-token delete after decrements adopted";
         });
     }
@@ -742,18 +743,21 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// ref-object cleanup planning. Resume is by explicit last-returned-key (`ListPage::next_cursor`).
     std::vector<String> ref_object_keys;
     {
-        const String refs_prefix = layout.casRefsPrefix();
-        String list_cursor;
-        for (;;)
+        static constexpr size_t kListPageLimit = 1000;
+        size_t count_in_page = 0;
+        forEachListedKey(backend, layout.casRefsPrefix(), [&](const ListedKey & lk)
         {
-            const ListPage page = backend.list(refs_prefix, list_cursor, 1000);
+            ref_object_keys.push_back(lk.key);
+            if (++count_in_page == kListPageLimit)
+            {
+                count_in_page = 0;
+                ProfileEvents::increment(ProfileEvents::CasRefGlobalListPages);
+            }
+        }, kListPageLimit);
+        /// The walk's `backend.list` lands at least once even for an empty/undersized final page --
+        /// count it, mirroring the original per-page loop (one increment per physical LIST call).
+        if (count_in_page > 0 || ref_object_keys.empty())
             ProfileEvents::increment(ProfileEvents::CasRefGlobalListPages);
-            for (const ListedKey & lk : page.keys)
-                ref_object_keys.push_back(lk.key);
-            if (page.next_cursor.empty())
-                break;
-            list_cursor = page.next_cursor;
-        }
     }
 
     /// A malformed ref-object key or namespace aborts ref folding for the whole round (spec §Step 2): the
@@ -1717,19 +1721,12 @@ std::vector<std::pair<RootNamespace, uint64_t>> Gc::discoverUniverse()
     /// read-your-writes LIST enumeration (S3 strongly consistent; InMemoryBackend by construction).
     const Layout & layout = store->layout();
     Backend & backend = store->backend();
-    const String prefix = layout.casRefsPrefix();
     std::set<String> namespaces;
-    String cursor;
-    for (;;)
+    forEachListedKey(backend, layout.casRefsPrefix(), [&](const ListedKey & lk)
     {
-        const ListPage page = backend.list(prefix, cursor, /*limit=*/1000);
-        for (const ListedKey & lk : page.keys)
-            if (const auto parsed = layout.parseRefObjectKey(lk.key))
-                namespaces.insert(parsed->ns.string());
-        if (page.next_cursor.empty())
-            break;
-        cursor = page.next_cursor;
-    }
+        if (const auto parsed = layout.parseRefObjectKey(lk.key))
+            namespaces.insert(parsed->ns.string());
+    });
     std::vector<std::pair<RootNamespace, uint64_t>> universe;
     universe.reserve(namespaces.size());
     for (const String & ns : namespaces)
@@ -1785,25 +1782,16 @@ size_t Gc::changedShardCount(const GcState & state)
         cursors = seal->per_ns_shard;
 
     std::map<String, RefTxnId> greatest_log;
-    const String prefix = layout.casRefsPrefix();
-    String cursor;
-    for (;;)
+    forEachListedKey(backend, layout.casRefsPrefix(), [&](const ListedKey & lk)
     {
-        const ListPage page = backend.list(prefix, cursor, /*limit=*/1000);
-        for (const ListedKey & lk : page.keys)
+        const auto parsed = layout.parseRefObjectKey(lk.key);
+        if (parsed && parsed->kind == RefObjectKind::Log)
         {
-            const auto parsed = layout.parseRefObjectKey(lk.key);
-            if (parsed && parsed->kind == RefObjectKind::Log)
-            {
-                RefTxnId & g = greatest_log[parsed->ns.string()];
-                if (g < parsed->txn_id)
-                    g = parsed->txn_id;
-            }
+            RefTxnId & g = greatest_log[parsed->ns.string()];
+            if (g < parsed->txn_id)
+                g = parsed->txn_id;
         }
-        if (page.next_cursor.empty())
-            break;
-        cursor = page.next_cursor;
-    }
+    });
 
     size_t changed = 0;
     for (const auto & [ns_str, greatest] : greatest_log)
@@ -1849,16 +1837,8 @@ RebuildReport Gc::rebuildBaseline(bool force)
                     for (const auto & [ns, root_shard] : discoverUniverse())
                     {
                         std::vector<String> table_keys;
-                        String table_cursor;
-                        for (;;)
-                        {
-                            const ListPage tpage = backend.list(layout.refsNamespacePrefix(ns), table_cursor, 1000);
-                            for (const ListedKey & lk : tpage.keys)
-                                table_keys.push_back(lk.key);
-                            if (tpage.next_cursor.empty())
-                                break;
-                            table_cursor = tpage.next_cursor;
-                        }
+                        forEachListedKey(backend, layout.refsNamespacePrefix(ns),
+                            [&](const ListedKey & lk) { table_keys.push_back(lk.key); });
                         const auto grouped = groupRefKeys(layout, table_keys);
                         const auto git = grouped.find(ns.string());
                         if (git != grouped.end() && !git->second.snapshots.empty()
@@ -1913,26 +1893,18 @@ RebuildReport Gc::rebuildBaseline(bool force)
     {
         const String gen_prefix = layout.gcGenPrefix(0);
         const String top = gen_prefix.substr(0, gen_prefix.size() - 2);   /// ".../gc/gen/"
-        String cursor;
-        for (;;)
+        forEachListedKey(backend, top, [&](const ListedKey & k)
         {
-            const ListPage page = backend.list(top, cursor, 1000);
-            for (const auto & k : page.keys)
+            const size_t from = top.size();
+            const size_t slash = k.key.find('/', from);
+            if (slash == String::npos)
+                return;
+            try
             {
-                const size_t from = top.size();
-                const size_t slash = k.key.find('/', from);
-                if (slash == String::npos)
-                    continue;
-                try
-                {
-                    max_gen = std::max(max_gen, static_cast<uint64_t>(std::stoull(k.key.substr(from, slash - from))));
-                }
-                catch (...) {}   /// foreign key shape under gc/gen — debris, not a numbering input
+                max_gen = std::max(max_gen, static_cast<uint64_t>(std::stoull(k.key.substr(from, slash - from))));
             }
-            if (page.next_cursor.empty())
-                break;
-            cursor = page.next_cursor;
-        }
+            catch (...) {}   /// foreign key shape under gc/gen — debris, not a numbering input
+        });
     }
     const uint64_t generation = max_gen + 1;
     const uint64_t budget = rebuild_edge_budget_override ? rebuild_edge_budget_override
@@ -2052,36 +2024,27 @@ RebuildReport Gc::rebuildBaseline(bool force)
     for (const String & ns_str : seen_ns)
     {
         const RootNamespace ns{ns_str};
-        const String mprefix = layout.manifestNamespacePrefix(ns);
-        String cursor;
         std::vector<BlobDelta> deltas;
-        for (;;)
+        forEachListedKey(backend, layout.manifestNamespacePrefix(ns), [&](const ListedKey & k)
         {
-            const ListPage page = backend.list(mprefix, cursor, 1000);
-            for (const auto & k : page.keys)
+            if (owned_manifest_keys.contains(k.key))
+                return;
+            /// The one shared manifest-path parser (spec §Manifest Identifier canonical hex form),
+            /// also used by fsck's parseBuildPrefix and the orphan sweep's parseListedManifestObject.
+            const auto parsed = layout.parseManifestKey(k.key);
+            if (!parsed)
+                return;   /// foreign key shape — debris
+            const ManifestRef & mref = parsed->ref;
+            if (prefixEligible(*store, ns, BuildPrefix{mref.writer_epoch, mref.build_sequence}))
+                return;   /// provably dead — the orphan sweep's territory, never an edge
+            const ManifestId id{ns, mref};
+            if (foldManifestEdges(id, +1, deltas, mf_cleanup_unused))
             {
-                if (owned_manifest_keys.contains(k.key))
-                    continue;
-                /// The one shared manifest-path parser (spec §Manifest Identifier canonical hex form),
-                /// also used by fsck's parseBuildPrefix and the orphan sweep's parseListedManifestObject.
-                const auto parsed = layout.parseManifestKey(k.key);
-                if (!parsed)
-                    continue;   /// foreign key shape — debris
-                const ManifestRef & mref = parsed->ref;
-                if (prefixEligible(*store, ns, BuildPrefix{mref.writer_epoch, mref.build_sequence}))
-                    continue;   /// provably dead — the orphan sweep's territory, never an edge
-                const ManifestId id{ns, mref};
-                if (foldManifestEdges(id, +1, deltas, mf_cleanup_unused))
-                {
-                    ++rep.unowned_alive_manifests;
-                    route_deltas(deltas);
-                }
-                /// A missing/invalid UNOWNED body is debris (no owner claims it) — skip, never refuse.
+                ++rep.unowned_alive_manifests;
+                route_deltas(deltas);
             }
-            if (page.next_cursor.empty())
-                break;
-            cursor = page.next_cursor;
-        }
+            /// A missing/invalid UNOWNED body is debris (no owner claims it) — skip, never refuse.
+        });
     }
 
     /// Pipeline blindness repair (found by the convergence test): the fold discovers candidates by
@@ -2101,29 +2064,20 @@ RebuildReport Gc::rebuildBaseline(bool force)
         /// OWN `<algo>` path segment. `.meta` siblings and any foreign/malformed key shape parse to
         /// `std::nullopt` and are skipped as debris, mirroring the pre-mixed-algo sweep's identical
         /// `catch (...) continue` contract.
-        const String bprefix = layout.blobsPrefix();
-        String cursor;
-        for (;;)
+        forEachListedKey(backend, layout.blobsPrefix(), [&](const ListedKey & k)
         {
-            const ListPage page = backend.list(bprefix, cursor, 1000);
-            for (const auto & k : page.keys)
-            {
-                const std::optional<BlobRef> parsed = layout.parseBlobKey(k.key);
-                if (!parsed)
-                    continue;   /// foreign key shape (`.meta` sibling, unknown algo, wrong width) — not ours to condemn
-                const BlobRef & ref = *parsed;
-                if (edge_bearing.contains(ref))
-                    continue;
-                const HeadResult hr = backend.head(k.key);
-                if (!hr.exists)
-                    continue;
-                zero_condemned[blobShard(ref, gc_shards)].push_back(RetiredEntry{
-                    .kind = ObjectKind::Blob, .ref = ref, .token = hr.token, .size = hr.size});
-            }
-            if (page.next_cursor.empty())
-                break;
-            cursor = page.next_cursor;
-        }
+            const std::optional<BlobRef> parsed = layout.parseBlobKey(k.key);
+            if (!parsed)
+                return;   /// foreign key shape (`.meta` sibling, unknown algo, wrong width) — not ours to condemn
+            const BlobRef & ref = *parsed;
+            if (edge_bearing.contains(ref))
+                return;
+            const HeadResult hr = backend.head(k.key);
+            if (!hr.exists)
+                return;
+            zero_condemned[blobShard(ref, gc_shards)].push_back(RetiredEntry{
+                .kind = ObjectKind::Blob, .ref = ref, .token = hr.token, .size = hr.size});
+        });
     }
 
     /// Numbering, part 2: the round above every surviving fence/state/generation number (also the
