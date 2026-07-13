@@ -145,22 +145,6 @@ struct PoolConfig
     /// per completed GC round; the delete budget separately bounds exact-token destructive work.
     uint64_t manifest_sweep_list_budget_keys = 1000;
     uint64_t manifest_sweep_delete_budget_keys = 100;
-    /// B12 lazy-trim: compact a root shard's journal ONLY when at least this many events lie at/below
-    /// the sealed fold cursor (batch gate), OR the encoded shard body is at/above
-    /// `gc_trim_body_soft_limit` (soft-cap gate).
-    /// The two hard gates guarantee bounded journal growth: a shard that accumulates enough events or
-    /// grows large enough is ALWAYS compacted regardless of batch size. 0 disables the batch gate
-    /// (compact on >= 1 event — the previous eager behaviour, useful for tests).
-    uint64_t gc_trim_min_events = 256;
-    /// B12: encoded root-shard body size at/above which trim is forced regardless of event count. This
-    /// is the BACKSTOP against unbounded journal growth, not the working trimmer: the count gate
-    /// (gc_trim_min_events = 256 events ≈ 21 KB) fires long before any reasonable size cap, and NO
-    /// cap can cut events above the sealed fold cursor — the body is CURSOR-AGE-bound, not
-    /// trim-bound (2026-07-03 night: a 96 KiB cap experiment could not hold a hot table's body; fold
-    /// cadence is the real lever). Keeping shard bodies under an object store's inline threshold
-    /// (e.g. RustFS 128 KiB, relevant while rustfs#3231 leaks data dirs on big-object overwrite) is
-    /// not something this cap can guarantee on its own — it is a hard backstop, not a target.
-    uint64_t gc_trim_body_soft_limit = 8ULL << 20;   /// 8 MiB (backstop)
     /// Phase-4 skip-unchanged (spec 2026-07-06-cas-gc-round-skip-unchanged): a GC round may DEFER
     /// (re-adopt the sealed in-degree generation instead of rebuilding it) when fewer than this many
     /// shards changed since the last fold AND no destructive decision is due. Default 1 = fold as soon

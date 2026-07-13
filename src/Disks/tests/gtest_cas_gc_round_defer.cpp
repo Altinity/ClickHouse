@@ -203,7 +203,7 @@ TEST(CasGcRoundDefer, IdleRoundDefersUnderShardedGc)
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Store::open(backend,
         PoolConfig{.pool_prefix = "p", .server_root_id = "test",
-                   .gc_shards = 2, .gc_trim_min_events = 0});
+                   .gc_shards = 2});
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r{.writer_epoch = 1, .build_sequence = 1, .manifest_ordinal = 0xAA};
     writeBlobBody(*backend, store->layout(), UInt128(1));
@@ -286,7 +286,7 @@ TEST(CasGcRoundDefer, DueGraduationIsSoleFoldTriggerAtHighThreshold)
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Store::open(backend,
         PoolConfig{.pool_prefix = "p", .server_root_id = "test",
-                   .gc_trim_min_events = 0, .gc_fold_threshold = 1000, .gc_fold_max_defer_rounds = 1000});
+                   .gc_fold_threshold = 1000, .gc_fold_max_defer_rounds = 1000});
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/aa@cas@"};
     const UInt128 blob(1);
@@ -343,7 +343,7 @@ TEST(CasGcRoundDefer, BoundedDeferralForcesFoldWithinWindow)
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Store::open(backend,
         PoolConfig{.pool_prefix = "p", .server_root_id = "test",
-                   .gc_trim_min_events = 0, .gc_fold_threshold = 100, .gc_fold_max_defer_rounds = 3});
+                   .gc_fold_threshold = 100, .gc_fold_max_defer_rounds = 3});
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r{.writer_epoch = 1, .build_sequence = 1, .manifest_ordinal = 0xAA};
     writeBlobBody(*backend, store->layout(), UInt128(1));

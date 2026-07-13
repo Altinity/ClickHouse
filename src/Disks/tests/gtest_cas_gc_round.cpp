@@ -577,7 +577,7 @@ TEST(CasGcRound, CarryRoundPreservesCondemnedSummaryVerbatim)
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Store::open(backend,
         PoolConfig{.pool_prefix = "p", .server_root_id = "test",
-                   .gc_shards = 2, .gc_trim_min_events = 0});
+                   .gc_shards = 2});
     const RootNamespace ns{"00/aa@cas@"};
 
     Gc gc(store, kGc);

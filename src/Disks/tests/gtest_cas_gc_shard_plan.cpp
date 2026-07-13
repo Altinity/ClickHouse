@@ -563,7 +563,7 @@ TEST(CasGcShardRetireDrain, ReclaimsDroppableBlobOwnedByNonZeroShard)
 
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test",
-                                                 .gc_shards = kGcShards, .gc_trim_min_events = 0});
+                                                 .gc_shards = kGcShards});
     const Layout & layout = store->layout();
 
     const RootNamespace ns{"00/aa@cas@"};

@@ -352,7 +352,7 @@ TEST(CasPluggableHash, Sha256BlobSeenByCondemnSweepAndFsckNotSilentlySkipped)
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Store::open(backend,
         PoolConfig{.pool_prefix = "p", .server_root_id = "test",
-                   .blob_hash_algo = BlobHashAlgo::Sha256, .gc_trim_min_events = 0});
+                   .blob_hash_algo = BlobHashAlgo::Sha256});
     ASSERT_EQ(blobHashLenFor(store->writeAlgo()), 32u) << "sha256 must derive a 32-byte digest width";
 
     const DigestCodec codec = codecFor(store->writeAlgo());
@@ -601,7 +601,7 @@ TEST(CasPluggableHash, ForeignAlgoSegmentIsDebrisNotOurs)
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Store::open(backend,
         PoolConfig{.pool_prefix = "p", .server_root_id = "test",
-                   .blob_hash_algo = BlobHashAlgo::CityHash128, .gc_trim_min_events = 0});
+                   .blob_hash_algo = BlobHashAlgo::CityHash128});
     /// Admit sha256 into the SAME pool from a second mount, then pull the union into `store`'s cache.
     Store::open(backend,
         PoolConfig{.pool_prefix = "p", .server_root_id = "test2",
@@ -761,8 +761,7 @@ TEST(CasPluggableHash, TwoAlgoOrphansBothFullyReclaimed)
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Store::open(backend,
         PoolConfig{.pool_prefix = "p", .server_root_id = "test",
-                   .blob_hash_algo = BlobHashAlgo::CityHash128, .gc_trim_min_events = 0,
-                   .gc_fold_max_defer_rounds = 0});
+                   .blob_hash_algo = BlobHashAlgo::CityHash128, .gc_fold_max_defer_rounds = 0});
     /// Admit sha256 into the SAME pool from a second mount, then pull the union into `store`'s cache
     /// (mirrors `ForeignAlgoSegmentIsDebrisNotOurs`'s admission fixture).
     Store::open(backend,
@@ -847,8 +846,7 @@ TEST(CasPluggableHash, SameDigestDifferentAlgoDistinctBodiesAndSettlement)
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Store::open(backend,
         PoolConfig{.pool_prefix = "p", .server_root_id = "test",
-                   .blob_hash_algo = BlobHashAlgo::CityHash128, .gc_trim_min_events = 0,
-                   .gc_fold_max_defer_rounds = 0});
+                   .blob_hash_algo = BlobHashAlgo::CityHash128, .gc_fold_max_defer_rounds = 0});
     Store::open(backend,
         PoolConfig{.pool_prefix = "p", .server_root_id = "test2",
                    .blob_hash_algo = BlobHashAlgo::XXH3_128, .blob_hash_allow_new = true});

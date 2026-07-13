@@ -1129,7 +1129,7 @@ TEST(CasStoreMountFence, OpenRecoversFromFenceInAdoptWindowWithFreshEpoch)
     DB::Cas::StorePtr store;
     ASSERT_NO_THROW(
         store = DB::Cas::Store::open(fencing,
-            DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_trim_min_events = 0}))
+            DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test"}))
         << "open must recover from a fence in the adopt window, not wedge (exit-49 S13 bug)";
     ASSERT_TRUE(store);
 
@@ -1155,7 +1155,6 @@ TEST(CasStore, WriteFenceUsesInjectedBootClock)
     auto store = DB::Cas::Store::open(backend, DB::Cas::PoolConfig{
         .pool_prefix = "p",
         .server_root_id = "test",
-        .gc_trim_min_events = 0,
         .mount_lease_ttl_ms = std::chrono::milliseconds(30000),
         .boot_ms_fn = [&] { return fake_boot; },
     });

@@ -556,9 +556,6 @@ inline DB::Cas::Token displaceBlobToken(
 /// ---- GC-core (Phase 1d) test helpers over the part-manifest model ----
 
 /// Open a Store over `backend`.
-/// gc_trim_min_events=0 (eager, pre-B12 behaviour) is the test default so existing tests that
-/// assert "the event was trimmed after one round" do not need to be updated.
-/// New tests that want to exercise the lazy-trim threshold pass their own PoolConfig to Store::open.
 ///
 /// `gc_fold_max_defer_rounds` defaults to the PoolConfig default (8) -- unchanged behaviour for every
 /// existing caller. A test that drives MANY consecutive genuinely-idle `runRegularRound` calls and
@@ -571,7 +568,7 @@ inline DB::Cas::StorePtr openStoreForTest(
 {
     return DB::Cas::Store::open(std::move(backend),
         DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test",
-                            .gc_trim_min_events = 0, .gc_fold_max_defer_rounds = gc_fold_max_defer_rounds});
+                            .gc_fold_max_defer_rounds = gc_fold_max_defer_rounds});
 }
 
 /// Write a blob object (envelope + payload) addressed by `hash`, so a HEAD returns a token. The bytes
