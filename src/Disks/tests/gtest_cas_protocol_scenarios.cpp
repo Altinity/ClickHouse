@@ -131,7 +131,7 @@ TEST(CasProtocol, FenceConflictCondemnedTokenedBlobCommitsWithTokenUnchanged)
     const Token t0 = b->head(blob_key).token;
 
     /// GC condemns X at t0 in round 1 and fences the namespace to round 1.
-    injectRetire(*b, s->layout(), /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
+    injectRetire(*b, s->layout(), /*round*/ 1, /*shard*/ 0,
         {RetiredEntry{.kind = ObjectKind::Blob, .ref = DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(u128Of("payload-X"))}, .token = t0, .size = 9}});
 
     /// promote: mutateShard refreshes the view (fence_round 1 > view round 0), but the tokened leaf is
@@ -165,7 +165,7 @@ TEST(CasProtocol, RevalidateReObservesStaleTokenKeepsWhenUnchanged)
 
     /// GC advanced the round to 1 with an EMPTY retired set; fence to 1. X is NOT condemned and its
     /// token is unchanged.
-    injectRetire(*b, s->layout(), /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0, {});
+    injectRetire(*b, s->layout(), /*round*/ 1, /*shard*/ 0, {});
 
     /// promote: the tokened leaf is edge-protected (not re-observed) ⇒ commit in place (KEEP).
     build->promote(ns, "part_1", build->buildId(), id);
@@ -200,7 +200,7 @@ TEST(CasProtocol, RevalidateReObservesStaleTokenAdoptsWhenDisplaced)
     EXPECT_NE(t1, t0);
 
     /// GC advanced to round 1 with an EMPTY retired set; fence to 1.
-    injectRetire(*b, s->layout(), /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0, {});
+    injectRetire(*b, s->layout(), /*round*/ 1, /*shard*/ 0, {});
 
     /// promote refreshes ⇒ revalidate X ⇒ HEAD current t1 not condemned ⇒ commit. The dep rides t1.
     build->promote(ns, "part_1", build->buildId(), id);
@@ -237,7 +237,7 @@ TEST(CasProtocol, RevalidateAdoptsLiveTokenWhenOnlyPhantomCondemnedAtDifferentTo
     const Token t_other{"emulated-phantom", DB::Cas::TokenType::Emulated};
     ASSERT_NE(t_other, t0);
 
-    injectRetire(*b, layout, /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
+    injectRetire(*b, layout, /*round*/ 1, /*shard*/ 0,
         {RetiredEntry{.kind = ObjectKind::Blob, .ref = DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(u128Of("payload-X"))}, .token = t_other, .size = 9}});
     /// Fence to round 1 BEFORE opening the store, so the store's open-time refresh lands the view at
     /// round 1 already populated.
@@ -333,7 +333,7 @@ TEST(CasProtocol, WedgedHeartbeatCondemnedTokenedBlobCommitsWithTokenUnchanged)
     const Token t0 = b->head(blob_key).token;
 
     /// Full GC condemned the build's OWN upload.
-    injectRetire(*b, s->layout(), /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
+    injectRetire(*b, s->layout(), /*round*/ 1, /*shard*/ 0,
         {RetiredEntry{.kind = ObjectKind::Blob, .ref = DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(u128Of("payload-X"))}, .token = t0, .size = 9}});
 
     /// promote: the tokened leaf is edge-protected — skipped, not re-validated ⇒ commit, token unchanged.
@@ -451,7 +451,7 @@ TEST(CasProtocol, DisplacedToLiveTokenCommitsAtCurrentIncarnation)
     ASSERT_NE(t1, t0);
 
     /// The view still condemns the OLD t0 at round 1, fenced.
-    injectRetire(*b, s->layout(), /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
+    injectRetire(*b, s->layout(), /*round*/ 1, /*shard*/ 0,
         {RetiredEntry{.kind = ObjectKind::Blob, .ref = DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(u128Of("payload-X"))}, .token = t0, .size = 9}});
 
     /// promote: revalidate X ⇒ HEAD current t1 (NOT condemned; only the defunct t0 is) ⇒ commit.

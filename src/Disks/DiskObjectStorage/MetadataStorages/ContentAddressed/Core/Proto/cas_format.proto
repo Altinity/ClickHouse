@@ -118,9 +118,10 @@ message GcStateProto {
   reserved "fence_version";
   reserved 11;                        // retired_refs (retired-in-snapshot 2026-07-10); condemned state
   reserved "retired_refs";            //   rides the source-edge runs + fold-seal condemned_summary
+  reserved 3;                         // fence_seq (write-only vestige; outcome/retire keys moved to
+  reserved "fence_seq";               //   (snap_generation, snap_attempt))
   CasHeader header              = 1;  // magic=CAGT; set by encoder, checked by decoder
   uint64 round                  = 2;
-  uint64 fence_seq              = 3;
   uint64 snap_shards            = 4;  // must be >= 1
   uint64 snap_generation        = 5;
   uint64 snap_pruned_through    = 6;

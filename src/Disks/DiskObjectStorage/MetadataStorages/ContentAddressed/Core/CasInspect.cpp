@@ -291,7 +291,6 @@ String renderGcState(const GcState & s)
 {
     return JsonObj()
         .add("round", jsonUInt(s.round))
-        .add("fence_seq", jsonUInt(s.fence_seq))
         .add("gc_shards", jsonUInt(s.gc_shards))
         .add("snap_generation", jsonUInt(s.snap_generation))
         .add("snap_pruned_through", jsonUInt(s.snap_pruned_through))

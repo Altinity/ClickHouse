@@ -538,7 +538,7 @@ TEST(CasBuild, PutBlobCondemnedDedupNeverGetsTheDyingObject)
     ///    (simulates GC completing the delete before the writer's dedup hit).
     DB::Cas::Layout layout("p");
     const String blob_key = layout.blobKey(id);
-    injectRetire(*b, layout, /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
+    injectRetire(*b, layout, /*round*/ 1, /*shard*/ 0,
         {RetiredEntry{.kind = ObjectKind::Blob, .ref = DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(u128Of("payload-Y"))}, .token = t0, .size = 9}});
     b->deleteExact(blob_key, t0);
     ASSERT_FALSE(b->head(blob_key).exists);
@@ -1195,7 +1195,7 @@ TEST(CasBuild, GateBodylessAdoptFullyDeletedObjectThrowsAbortedNotFatal)
     const String blob_key = layout.blobKey(id);
 
     /// 2. Condemn (Blob, hash(B190), t0) in the retire view AND immediately GC-delete the object.
-    injectRetire(*b, layout, /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
+    injectRetire(*b, layout, /*round*/ 1, /*shard*/ 0,
         {RetiredEntry{.kind = ObjectKind::Blob, .ref = DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(u128Of("payload-B190"))}, .token = t0, .size = 11}});
     ASSERT_EQ(b->deleteExact(blob_key, t0).kind, DeleteOutcome::Kind::Deleted);
     ASSERT_FALSE(b->head(blob_key).exists) << "object must be absent before the gate HEAD";
@@ -1576,7 +1576,7 @@ TEST(CasBuild, ConvergesUnderProductiveGc)
     ///    condemnMeta's read-modify-CAS finds it. Together these reproduce exactly what a real GC condemn
     ///    now writes (Task 5), without driving a full round just to observe H at in-degree 0.
     DB::Cas::Layout layout("p");
-    injectRetire(*b, layout, /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
+    injectRetire(*b, layout, /*round*/ 1, /*shard*/ 0,
         {RetiredEntry{.kind = ObjectKind::Blob, .ref = DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(u128Of(content))}, .token = h_token0,
                       .size = content.size()}});
     condemnMeta(*b, layout, u128Of(content), /*condemn_round*/ 1);

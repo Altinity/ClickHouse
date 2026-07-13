@@ -34,7 +34,6 @@ String encodeGcState(const GcState & state)
     hdr->set_compatibility_version(currentCompatibilityVersion());
 
     msg.set_round(state.round);
-    msg.set_fence_seq(state.fence_seq);
     msg.set_snap_shards(state.gc_shards);
     msg.set_snap_generation(state.snap_generation);
     msg.set_snap_pruned_through(state.snap_pruned_through);
@@ -70,7 +69,6 @@ GcState decodeGcState(std::string_view data)
 
     GcState state;
     state.round = msg.round();
-    state.fence_seq = msg.fence_seq();
     state.gc_shards = msg.snap_shards();
     if (state.gc_shards == 0)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS gc/state: gc_shards must be >= 1");

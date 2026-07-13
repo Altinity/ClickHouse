@@ -2410,7 +2410,6 @@ bool Gc::acquireOrRenewLease(GcState & state, Token & state_token, bool allow_st
         GcState next = current;
         next.lease.owner = gc_id;
         ++next.lease.seq;
-        ++next.fence_seq;
         const CasResult steal_res = store->backend().casPut(key, encodeGcState(next), got->token);
         if (steal_res.outcome == CasOutcome::Committed)
         {

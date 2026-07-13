@@ -143,7 +143,7 @@ TEST(CasGcShardIncarnation, NewbornPrecommitProtectsDedupBlobAgainstConcurrentDr
         /// --- Phase 2: Inject gc/state at round 1 with b1 CONDEMNED (body still present). ---
         /// This simulates GC having advanced to round 1 and retired b1 (condemned token recorded
         /// in the retired set) but not yet deleted b1's body object.
-        injectRetire(*backend, store->layout(), /*round*/ 1, /*fence_seq*/ 0, /*shard*/ 0,
+        injectRetire(*backend, store->layout(), /*round*/ 1, /*shard*/ 0,
             {RetiredEntry{.kind = ObjectKind::Blob, .ref = b1_ref,
                           .token = b1_token, .size = static_cast<uint64_t>(b1_payload.size())}});
 

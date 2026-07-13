@@ -26,14 +26,12 @@ TEST(CasGcFormats, GcStateV3RoundTrip)
 {
     GcState s;
     s.round = 7;
-    s.fence_seq = 3;
     s.gc_shards = 1;
     s.snap_generation = 12;
     s.lease.owner = hexToU128("00000000000000000000000000000005");
     s.lease.seq = 5;
     auto d = decodeGcState(encodeGcState(s));
     EXPECT_EQ(d.round, 7u);
-    EXPECT_EQ(d.fence_seq, 3u);
     EXPECT_EQ(d.gc_shards, 1u);
     EXPECT_EQ(d.snap_generation, 12u);
     EXPECT_EQ(d.lease.owner, hexToU128("00000000000000000000000000000005"));
@@ -373,7 +371,6 @@ TEST(CasHeaderGolden, GcStateCasHeaderRoundTrips)
 {
     GcState s;
     s.round = 7;
-    s.fence_seq = 3;
     s.gc_shards = 2;
     s.snap_generation = 12;
     const String bytes = encodeGcState(s);

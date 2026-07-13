@@ -320,13 +320,12 @@ inline void registerNamespaceRaw(
     /// No-op: Task 4 deleted the registry; LIST(cas/refs/) is now the discovery authority.
 }
 
-/// Encode a CAGS document carrying only {round, fence_seq} — everything else defaulted. Callers that
-/// only care about these two fields (e.g. `injectRetire`) use this shorthand.
-inline String encodeMinimalGcState(uint64_t round, uint64_t fence_seq)
+/// Encode a CAGS document carrying only {round} — everything else defaulted. Callers that only care
+/// about this field (e.g. `injectRetire`) use this shorthand.
+inline String encodeMinimalGcState(uint64_t round)
 {
     DB::Cas::GcState state;
     state.round = round;
-    state.fence_seq = fence_seq;
     return DB::Cas::encodeGcState(state);
 }
 
@@ -335,18 +334,17 @@ inline String encodeMinimalGcState(uint64_t round, uint64_t fence_seq)
 /// seeded the way a real round leaves them — as `kCondemned` sentinel rows inside an adopted fold seal's
 /// shard run (there is no separate retired-list object). A synthetic +edge/-edge pair nets each blob to
 /// in-degree 0 and a `seed_head` replays the captured token/size so the fold mints the `kCondemned` row.
-/// Also sets {round, fence_seq} on gc/state. Entries carry a `condemn_round` (default 0 → uses `round`);
-/// callers pass fresh (non-pending) condemns. An empty `entries` set just advances {round, fence_seq}.
+/// Also sets {round} on gc/state. Entries carry a `condemn_round` (default 0 → uses `round`); callers
+/// pass fresh (non-pending) condemns. An empty `entries` set just advances {round}.
 inline void injectRetire(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout,
-    uint64_t round, uint64_t fence_seq, uint64_t shard, std::vector<DB::Cas::RetiredEntry> entries)
+    uint64_t round, uint64_t shard, std::vector<DB::Cas::RetiredEntry> entries)
 {
     DB::Cas::GcState gc_state;
     const DB::Cas::HeadResult head = backend.head(layout.gcStateKey());
     if (head.exists)
         gc_state = DB::Cas::decodeGcState(backend.get(layout.gcStateKey())->bytes);
     gc_state.round = round;
-    gc_state.fence_seq = fence_seq;
 
     if (!entries.empty())
     {

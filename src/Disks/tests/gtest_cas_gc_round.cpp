@@ -166,7 +166,7 @@ TEST(CasGcCursorKey, RoundTripsAndMatchesLegacyFormat)
 ///
 /// The lease steal window is observation-based and deterministic (see CasGc.h): a contender becomes
 /// steal-eligible when it observes the SAME (owner, seq) across two of its own consecutive round
-/// attempts. The new model keeps gc/state {round, fence_seq, snap_generation, lease}, so these tests
+/// attempts. The new model keeps gc/state {round, snap_generation, lease}, so these tests
 /// are model-agnostic and were ported verbatim from the pre-redesign suite.
 
 TEST(CasGcLease, FreshPoolAcquiresAndRenews)
@@ -185,7 +185,6 @@ TEST(CasGcLease, FreshPoolAcquiresAndRenews)
     const GcState st2 = readState(*b, *s);
     EXPECT_EQ(st2.lease.owner, kGc);
     EXPECT_GT(st2.lease.seq, seq1);                              /// seq strictly advanced
-    EXPECT_EQ(st2.fence_seq, st1.fence_seq);                     /// renewal is NOT a new epoch
 }
 
 TEST(CasGcLease, ContenderBacksOffWhileIncumbentRenews)
@@ -204,7 +203,7 @@ TEST(CasGcLease, ContenderBacksOffWhileIncumbentRenews)
     EXPECT_EQ(readState(*b, *s).lease.owner, kGcA);
 }
 
-TEST(CasGcLease, StealAfterObservedNonRenewalBumpsEpoch)
+TEST(CasGcLease, StealAfterObservedNonRenewalAdvancesLease)
 {
     std::shared_ptr<InMemoryBackend> b;
     auto s = openTestStore(b);
@@ -218,7 +217,6 @@ TEST(CasGcLease, StealAfterObservedNonRenewalBumpsEpoch)
     const GcState st = readState(*b, *s);
     EXPECT_EQ(st.lease.owner, kGcB);
     EXPECT_GT(st.lease.seq, st0.lease.seq);
-    EXPECT_EQ(st.fence_seq, st0.fence_seq + 1);                  /// steal bumps the leadership epoch
 }
 
 TEST(CasGcLease, HeartbeatBlocksFalseStealOfAliveLeader)
@@ -426,7 +424,7 @@ TEST(CasGcLease, IncumbentRenewConflictRetriesOnceAndAcquires)
 TEST(CasGcLease, VanishedStateAfterObservationFailsClosed)
 {
     /// gc/state is never legally deleted - absent AFTER a recorded observation proves an out-of-model
-    /// deletion. Recreating a default state would reset round/fence_seq/cursors; the lease protocol
+    /// deletion. Recreating a default state would reset round/cursors; the lease protocol
     /// must fail closed (CORRUPTED_DATA) instead.
     std::shared_ptr<InMemoryBackend> b;
     auto s = openTestStore(b);
@@ -891,7 +889,6 @@ TEST(CasGcRound, SplitBrainLeadersOnlyDuplicateWork)
     dropRefTransition(*backend, store->layout(), ns, "tbl", r);
     EXPECT_FALSE(gc2.runRegularRound().acquired_lease);   /// obs #1
     ASSERT_TRUE(gc2.runRegularRound().acquired_lease);    /// obs #2 => steal
-    EXPECT_GT(readState(*backend, *store).fence_seq, 0u);
 
     /// Both leaders now drive rounds. The blob is collected exactly once; duplicate attempts are
     /// harmless. No round throws.
