@@ -18,7 +18,6 @@
                 <!-- #4: widen shard fanout (default 8) so manifest CAS writes spread across more
                      keys — drops per-key 64-permit congestion (503) and per-key overwrite-orphan
                      pileup. Creation-time; the fresh per-run pool picks it up. -->
-                <root_shards>64</root_shards> <!-- rustfs#3231 margin: 64 keeps shard bodies inline (<128 KiB) even under 10-min fold-cursor lag; the code default is 32 -->
                 <!-- B187: rustfs honors Expect: 100-continue, so negotiate it for ALL conditional
                      blob PUTs >= 64 KiB (not just the default >= 1 MiB). A dedup-hit conditional PUT
                      (If-None-Match:* on an existing blob) then gets a clean early 412 instead of

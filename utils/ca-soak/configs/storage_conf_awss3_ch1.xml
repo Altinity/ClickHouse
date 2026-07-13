@@ -7,9 +7,7 @@
                  (use_environment_credentials reads AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY,
                  injected via the git-ignored configs/aws.env by docker-compose-awss3.yml) —
                  no secrets in this committed file.
-                 root_shards is left at the CODE DEFAULT (32) on purpose: real S3 has no
-                 rustfs#3231 overwrite-leak, and the validation should exercise what we ship.
-                 expect_continue_min_bytes override (B187) is rustfs-specific and dropped too. -->
+                 expect_continue_min_bytes override (B187) is rustfs-specific and is not set here. -->
             <ca>
                 <type>object_storage</type>
                 <object_storage_type>s3</object_storage_type>

@@ -1,21 +1,24 @@
 """S06 wide part + S07 manifest cap fail-closed + S08 thousands of parts (P0).
 
-These three cards exercise the part-manifest write path and the root-shard metadata that names every
-part. The relevant fail-closed caps live in `Core/CasBuild.cpp::stageManifest`:
+These three cards exercise the part-manifest write path and the per-table ref/manifest objects that
+name every part. The relevant fail-closed caps live in `Core/CasBuild.cpp::stageManifest`
+(`CasBuild.cpp:43-46`):
 
     kMaxManifestEntries        = 1048576       (1M manifest entries)
     kMaxManifestEncodedBytes   = 256 MiB
     kMaxManifestInlineBytesTotal = 16 MiB
     kMaxLargestInlineEntryBytes  = 1 MiB
 
-and the root-shard soft limit (`CasStore::mutateShard`, `manifest_soft_limit = 16 MiB`) which only
-emits a `LOG_WARNING` ("manifest ... size ... crossed soft limit ...").
+(The old `root_shards`-era `manifest_soft_limit` soft cap and its `CasStore::mutateShard`
+`LOG_WARNING` were removed along with the `root_shards` knob; the four `kMaxManifest*` constants above
+are the only live fail-closed caps on manifest size today.)
 
 S06 proves a very wide part stays under the manifest hard cap (or fails early with `LIMIT_EXCEEDED`)
 and that a column-subset read does not fetch every blob. S07 is a negative card that makes a
 best-effort attempt to trip a cap and, when the cap is not reachable at feasible dev SQL scale, still
 verifies the fail-closed PROPERTY (no live ref on a rejected manifest, clean pool). S08 creates many
-small parts fast and checks root-shard CAS contention stays bounded by `root_shards`.
+small parts fast and checks per-table ref-object CAS contention stays bounded (refs now live as
+per-table `_log`/`_snap` objects under `cas/refs/<ns>/`, not a fixed-fanout `root_shards` shard set).
 """
 
 import time
@@ -33,7 +36,14 @@ K_MAX_MANIFEST_ENTRIES = 1048576
 K_MAX_MANIFEST_ENCODED_BYTES = 256 * MIB
 K_MAX_MANIFEST_INLINE_TOTAL = 16 * MIB
 K_MAX_LARGEST_INLINE_ENTRY = 1 * MIB
-ROOT_SHARDS = 8  # compose default; root-shard CAS contention is bounded by this.
+
+# `root_shards` (a small, config-bounded root-manifest shard fan-out) was removed: refs for a table
+# now live as one `_log` object per ref-publish CAS plus occasional `_snap`/`_cleanup` objects
+# (`CasLayout.h::refLogKey`/`refSnapshotKey`, under `cas/refs/<ns>/`), so the live ref-object count
+# scales with the number of ref-publish operations rather than a fixed shard count. There is no tight
+# a-priori bound any more, so S08 checks only a generous per-insert sanity ceiling below (catches a
+# runaway/leak, not a small architectural fan-out limit).
+REF_OBJECTS_SANITY_MULTIPLIER = 4
 
 
 # ---------------------------------------------------------------------------
@@ -59,13 +69,16 @@ def _wide_select(n_cols, *, rows, base=0):
 
 
 def _manifests_shape():
-    """Best-effort {_manifests:{objects,bytes}, roots:{objects,bytes}, _ok} from the pool shape."""
+    """Best-effort {_manifests:{objects,bytes}, refs:{objects,bytes}, _ok} from the pool shape.
+    `refs` is the live per-table ref-object subtree (`cas/refs/<ns>/_log|_snap|_cleanup/`); the old
+    `roots` bucket (bare top-level `roots/<srid>/`) is a mount-safety precondition subtree only,
+    not where ref data lives, since the `root_shards` shard-fanout placement was removed."""
     shape = observe.pool_shape(timeout_s=120)
     if not shape.get("_ok"):
         return {"_ok": False}
     return {"_ok": True,
             "_manifests": shape.get("_manifests"),
-            "roots": shape.get("roots"),
+            "refs": shape.get("refs"),
             "_total": shape.get("_total")}
 
 
@@ -455,44 +468,56 @@ class S08(Scenario):
             "many active parts created", f"~{n_parts} active before merge",
             ps.get("active"), ps.get("active", 0) > 0))
 
-        # Root-shard / manifest pool shape at peak — must not exceed the manifest hard caps.
+        # Ref-object pool shape at peak — must not exceed the manifest hard caps. `root_shards`
+        # placement (a small, config-bounded root-manifest shard fan-out) is gone; a table's ref
+        # objects now live under `cas/refs/<ns>/` (pool_shape "refs" bucket), growing with the number
+        # of ref-publish operations rather than a fixed shard count — see the module-level comment on
+        # `REF_OBJECTS_SANITY_MULTIPLIER`.
         peak_shape = _manifests_shape()
         result.observations["s08_pool_at_peak"] = peak_shape
-        if peak_shape.get("_ok") and peak_shape.get("roots"):
-            root_objs = peak_shape["roots"]["objects"]
-            root_bytes = peak_shape["roots"]["bytes"]
-            # Root shards are bounded in count by root_shards per namespace; the per-object body must
-            # stay below the manifest hard cap. Use mean per-object as a proxy (exact largest needs
-            # an fsck detail row).
-            mean_root_bytes = (root_bytes // root_objs) if root_objs else 0
-            result.observations["s08_root_mean_bytes"] = mean_root_bytes
-            result.observations["s08_root_objects"] = root_objs
+        if peak_shape.get("_ok") and peak_shape.get("refs"):
+            ref_objs = peak_shape["refs"]["objects"]
+            ref_bytes = peak_shape["refs"]["bytes"]
+            # No tight a-priori bound exists any more (see module-level comment), so this is a
+            # generous per-insert sanity ceiling that still catches a runaway/leak. Mean per-object
+            # body is a proxy for one ref-log/snapshot object size (exact largest needs an fsck detail
+            # row); comparing it against the manifest hard cap is a deliberately loose sanity bound —
+            # ref-log/snapshot objects are not manifests, but should be nowhere near that cap.
+            mean_ref_bytes = (ref_bytes // ref_objs) if ref_objs else 0
+            result.observations["s08_ref_mean_bytes"] = mean_ref_bytes
+            result.observations["s08_ref_objects"] = ref_objs
+            sanity_bound = n_parts * REF_OBJECTS_SANITY_MULTIPLIER + 16
             result.add(Verdict.check(
-                "root-shard objects bounded by root_shards",
-                f"<= {ROOT_SHARDS} root objects for one namespace", root_objs,
-                root_objs <= ROOT_SHARDS,
-                "" if root_objs <= ROOT_SHARDS else f"more than {ROOT_SHARDS} root objects — "
-                                                    "unexpected root-shard fanout for one table"))
+                "ref objects proportional to insert volume (sanity bound; no root_shards fan-out any more)",
+                f"<= {sanity_bound} ref objects (~{REF_OBJECTS_SANITY_MULTIPLIER}x n_parts={n_parts}, generous headroom)",
+                ref_objs, ref_objs <= sanity_bound,
+                "" if ref_objs <= sanity_bound else f"far more ref objects ({ref_objs}) than the sanity "
+                                                    f"bound ({sanity_bound}) for {n_parts} inserts — "
+                                                    "possible ref-object leak under cas/refs/<ns>/"))
             result.add(Verdict.check(
-                "root-shard body under manifest hard cap",
-                f"mean root body < {K_MAX_MANIFEST_ENCODED_BYTES/MIB:.0f} MiB",
-                f"{mean_root_bytes/MIB:.3f} MiB",
-                mean_root_bytes < K_MAX_MANIFEST_ENCODED_BYTES))
+                "ref-object body under manifest hard cap (generous sanity bound)",
+                f"mean ref-object body < {K_MAX_MANIFEST_ENCODED_BYTES/MIB:.0f} MiB",
+                f"{mean_ref_bytes/MIB:.3f} MiB",
+                mean_ref_bytes < K_MAX_MANIFEST_ENCODED_BYTES))
         else:
             result.add(Verdict.inconclusive(
-                "root-shard objects bounded by root_shards", f"<= {ROOT_SHARDS}",
+                "ref objects proportional to insert volume",
+                f"<= ~{REF_OBJECTS_SANITY_MULTIPLIER}x n_parts",
                 "pool shape unavailable at peak (probe failed/timed out)"))
 
-        # CAS contention bounded by root_shards: conflicts should be a small fraction of total CAS ops
-        # (with only ROOT_SHARDS shards, concurrent writers serialize per shard but do not livelock).
+        # CAS contention on the per-table ref log: conflicts should be a small fraction of total CAS
+        # ops. There is no root_shards fan-out any more (refs are per-table, not shard-distributed);
+        # the ref-log-append batching/flat-combining lane (CasRefBatchFlushes/CasRefBatchedMutations)
+        # is what keeps the actual underlying CAS attempt rate — and so the conflict rate — bounded
+        # even under many concurrent writers to the same table.
         if cas_total > 0:
             ratio = cas_conflict / cas_total
             result.observations["s08_cas_conflict_ratio"] = round(ratio, 4)
             result.add(Verdict.check(
                 "CAS contention bounded", "conflict ratio bounded (< 0.5)",
                 f"{cas_conflict}/{cas_total} = {ratio:.3f}", ratio < 0.5,
-                "" if ratio < 0.5 else "root-shard CAS conflict ratio high — contention not bounded "
-                                       "by root_shards as expected"))
+                "" if ratio < 0.5 else "ref-log CAS conflict ratio high — contention not bounded by "
+                                       "the batching lane as expected"))
         else:
             result.add(Verdict.inconclusive(
                 "CAS contention bounded", "conflict ratio bounded",

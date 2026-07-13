@@ -9,9 +9,7 @@
                  GCS's native preconditions are x-goog-if-generation-match, and how much of the
                  AWS-style If-Match/If-None-Match surface the S3-compat layer enforces is exactly
                  what this stand measures (TokenType::Generation binding is fail-closed until then).
-                 root_shards is left at the CODE DEFAULT (32) on purpose: real S3 has no
-                 rustfs#3231 overwrite-leak, and the validation should exercise what we ship.
-                 expect_continue_min_bytes override (B187) is rustfs-specific and dropped too. -->
+                 expect_continue_min_bytes override (B187) is rustfs-specific and is not set here. -->
             <ca>
                 <type>object_storage</type>
                 <object_storage_type>s3</object_storage_type>
