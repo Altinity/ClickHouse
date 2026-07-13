@@ -488,8 +488,11 @@ void Build::uploadFromSource(ObjectKind kind, const BlobRef & ref, const String 
     /// PreconditionFailed so every existing gate branch below is UNCHANGED.
     ///
     /// The size-check LOGICAL_ERROR below stays instant and loud: `conditionalCreateControlled`
-    /// propagates a LOGICAL_ERROR from the attempt unchanged (a broken source is a caller bug reissue
-    /// would only replay — pinned by `CasBuild.PutBlobWrongSizeFailsClosed`).
+    /// propagates every deterministic local failure — LOGICAL_ERROR, NOT_IMPLEMENTED (the promoteStaged
+    /// mode guard), BAD_ARGUMENTS (escaping buildHeader's second encode), CORRUPTED_DATA — from the
+    /// attempt unchanged (a caller/config bug reissue would only replay — pinned by
+    /// `CasBuild.PutBlobWrongSizeFailsClosed` and the controller-level
+    /// `DeterministicLocalFailuresPropagateInstantly`).
     auto streamIfAbsent = [&]() -> PutResult
     {
         const auto one_attempt = [&]() -> PutResult

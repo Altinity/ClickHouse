@@ -30,6 +30,7 @@ namespace DB::ErrorCodes
     extern const int BAD_ARGUMENTS;
     extern const int CORRUPTED_DATA;
     extern const int LOGICAL_ERROR;
+    extern const int NOT_IMPLEMENTED;
 }
 
 namespace DB::Cas
@@ -135,6 +136,24 @@ uint64_t steadyClockNowMs()
 void threadSleepMs(uint64_t ms)
 {
     std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+}
+
+/// Deterministic CALLER/local bugs the create retry loop must surface INSTANTLY (availfix review M1):
+/// reissuing only replays the same failure — up to ~12 minutes of budget × putBlob's outer loop at
+/// the defaults — and buries the root cause behind a retryable ABORTED. The set:
+///   LOGICAL_ERROR   — a local invariant violation (e.g. uploadFromSource's source-size check; pinned
+///                     by `CasBuild.PutBlobWrongSizeFailsClosed`, which caught exactly this class)
+///   NOT_IMPLEMENTED — a mode/capability guard (e.g. `promoteStaged` on a backend without a native
+///                     conditional server-side copy) — a deterministic configuration bug
+///   BAD_ARGUMENTS   — a deterministic encode/argument rejection (e.g. BAD_ARGUMENTS escaping
+///                     buildHeader's second, intended_ref-less encode)
+///   CORRUPTED_DATA  — integrity failure; retrying re-reads/re-streams the same bad bytes (the same
+///                     fail-fast rule the driver-side correctness markers enforce)
+/// Fail-safe either way: a propagated exception is never a false Committed.
+bool isDeterministicLocalFailure(int code)
+{
+    return code == ErrorCodes::LOGICAL_ERROR || code == ErrorCodes::NOT_IMPLEMENTED
+        || code == ErrorCodes::BAD_ARGUMENTS || code == ErrorCodes::CORRUPTED_DATA;
 }
 
 }
@@ -354,15 +373,15 @@ CasCreateResult CasRequestController::conditionalCreateControlled(
         }
         catch (const std::exception & e)
         {
-            /// A LOGICAL_ERROR is a LOCAL invariant violation surfaced by the attempt itself (e.g.
-            /// uploadFromSource's source-size check: the replayable source streamed a different byte
-            /// count than it declared) — a caller bug, never a wire ambiguity, and reissuing would only
-            /// re-stream the same bug. Propagate unchanged: instant, loud, exactly the pre-controller
-            /// behavior (pinned by `CasBuild.PutBlobWrongSizeFailsClosed`). This deliberately DIFFERS
-            /// from `putIfAbsentControlled`'s LOGICAL_ERROR-as-Unresolved: that lane's byte-exact
-            /// resolve makes retrying any unproven error harmless, while retrying a broken SOURCE here
-            /// is pure noise. Fail-safe either way — a propagated exception is never a false Committed.
-            if (const auto * db_e = dynamic_cast<const Exception *>(&e); db_e && db_e->code() == ErrorCodes::LOGICAL_ERROR)
+            /// A deterministic LOCAL bug surfaced by the attempt itself — a caller/config error, never
+            /// a wire ambiguity; reissuing would only replay it. Propagate unchanged: instant, loud,
+            /// exactly the pre-controller behavior (see isDeterministicLocalFailure for the set and the
+            /// per-code rationale; `CasBuild.PutBlobWrongSizeFailsClosed` pinned the LOGICAL_ERROR
+            /// member). This deliberately DIFFERS from `putIfAbsentControlled`'s everything-Unresolved:
+            /// that lane's byte-exact resolve makes retrying any unproven error harmless, while
+            /// retrying a broken source/mode/encode here is pure noise. Fail-safe either way — a
+            /// propagated exception is never a false Committed.
+            if (const auto * db_e = dynamic_cast<const Exception *>(&e); db_e && isDeterministicLocalFailure(db_e->code()))
                 throw;
             /// A whitelisted synchronous rejection PROVES the request was never applied: surface the
             /// original exception — the blob lane's callers always saw the raw storage error's root

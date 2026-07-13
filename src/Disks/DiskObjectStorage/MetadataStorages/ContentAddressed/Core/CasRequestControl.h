@@ -211,9 +211,11 @@ public:
     /// PutResult (Done/PreconditionFailed) or throws. A whitelisted DefiniteFailure classification
     /// RETHROWS the original exception (the blob lane always surfaced the raw storage error's root
     /// cause — unlike the ref lane's outcome mapping, nothing here needs the code collapsed), and a
-    /// `LOGICAL_ERROR` from the attempt propagates unchanged too: a local invariant violation (e.g. a
-    /// source streaming a different byte count than it declared) is a caller bug reissue would only
-    /// replay, never a wire ambiguity.
+    /// deterministic LOCAL failure from the attempt — `LOGICAL_ERROR` (e.g. a source streaming a
+    /// different byte count than it declared), `NOT_IMPLEMENTED` (a mode/capability guard),
+    /// `BAD_ARGUMENTS` (a deterministic encode rejection), `CORRUPTED_DATA` (integrity) — propagates
+    /// unchanged too, on the FIRST attempt with no resolve and no backoff: a caller/config bug reissue
+    /// would only replay, never a wire ambiguity (availfix review M1).
     /// A Done attempt gets the final fence check before being reported Committed
     /// (RFC §ack-and-cache-rules); Occupied needs none — it acks nothing of OUR write, and the
     /// caller's occupant path gates its own adoption.
