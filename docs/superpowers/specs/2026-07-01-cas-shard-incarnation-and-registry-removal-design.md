@@ -1,6 +1,13 @@
 # CA GC shard incarnation + registry removal (D1: dropNamespace never deregisters) — design
 
-**Status:** DESIGN (2026-07-01). Phase-0 TLA+ gate **GREEN** (see below); implementation phases 1–5 not yet started.
+> **⚠️ PARTLY SUPERSEDED (2026-07-13).** The **registry removal** half (delete `gc/registry`, discover
+> from `LIST(cas/refs/)`) LANDED as D1 and is the current model. The **RootShard incarnation** half
+> (Tasks 1/3/5 — `incarnation` field on `RootShard`, incarnation-keyed cursor, newborn-precommit-shard)
+> is now **MOOT**: the mutable `RootShardManifest` / per-`(ns,shard)` root-shard model was replaced by the
+> per-table snapshot+log (`Store::shardOf` and `PoolMeta.root_shards` are gone). Do not implement the
+> incarnation tasks against the removed root-shard model. Kept for history.
+
+**Status:** PARTLY SUPERSEDED (registry removal DONE via D1; RootShard incarnation moot under snapshot+log). Was DESIGN 2026-07-01, Phase-0 TLA+ gate GREEN; incarnation phases 1–5 never implemented.
 **Branch:** `cas-layout-hot-cold-split`.
 **Phase-0 gate result (2026-07-01):** `docs/superpowers/models/CaGcShardIncarnationCore.tla` + `CaGcShardIncarnationCore_RESULTS.md`. The `_design` config holds `INV_NO_DANGLING` and `INV_NO_ORPHAN_EDGE` across 724,944 distinct states — **THM-NO-RETURN holds without the registry**, so the registry is deleted (the §risks `pending-newborns` fallback is not needed). Three negative controls each break the invariant they target: `SabotageNewbornNoFloor` (round self-floor irreducible), `SabotagePathKeyedCursor` (incarnation irreducible — ABA), `SabotageDeleteBeforeFold` (fold-before-reclaim ordering). The **one-vs-two question is answered: two** — neither coordinate alone suffices.
 **Origin:** D1 in the CA GC debt inventory — `dropNamespace` tombstones a namespace's shards but never removes it from `gc/registry`, so the registry grows monotonically (soak scenario S30) and GC's per-round fence/fold fanout is proportional to *every table ever created*, not the live ones. The empty tombstoned ref-shard objects and the registry entries accumulate as the unreachable "other" residual.

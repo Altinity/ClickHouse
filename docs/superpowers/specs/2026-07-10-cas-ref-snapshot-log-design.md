@@ -9,6 +9,13 @@ doc_type: 'reference'
 
 # CAS Ref Log Handoff Design {#cas-ref-log-handoff-design}
 
+> **⚠️ SUPERSEDED (2026-07-13).** This GC-owned-base handoff model (`cas/refs` = append-only inbox, GC
+> owns the folded ref base + full-base rewrite) was replaced by the **writer-owned snapshot+log** design
+> in [`2026-07-11-cas-ref-table-snapshot-log-design.md`](2026-07-11-cas-ref-table-snapshot-log-design.md)
+> (rev.5), which landed as Phase 1. That rev.5 is itself being amended by the
+> [rev.6 lease-boundary exclusivity proposal](2026-07-13-cas-ref-lease-exclusivity-rev6-proposal.md).
+> Kept for history; its Phase-2 optimization list carried into the successor (see `BACKLOG.md` §1).
+
 **Date:** 2026-07-10
 **Revised:** 2026-07-11
 **Branch:** `cas-gc-rebuild`

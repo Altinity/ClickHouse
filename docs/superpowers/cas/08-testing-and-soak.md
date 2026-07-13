@@ -474,12 +474,10 @@ The authoritative finding log is `utils/ca-soak/scenarios/BACKLOG.md` (newest at
 - **S27 / list pagination ambiguity**: requires an instrumented object-store proxy.
 - **S23 idle RSS +82 MiB**: above the 64 MiB budget; confirm it does not grow unbounded in the 4h
   soak.
-- **GC run-file O(buffer) streaming** (scalability, deferred):
-  `RunFileReader` materializes the full run in memory (`full` `std::string`); the two-cursor merge
-  algorithm is streaming but its inputs are not. At large pools with high fan-in blobs, the
-  whole-run materialization is N× larger than the old integer-count snapshot. Full fix requires
-  real ranged reads in `CasObjectStorageBackend::get` + a streaming `RunFileReader` interface.
-  Deferred until scale demands it (see `deferred_backlog/2026-07-01-cas-gc-runfile-obuffer-streaming.md`).
+- **GC run-file streaming** (scalability): the O(buffer) reader debt is **DONE** (T2/T0, 2026-07-02) —
+  `RunFileReader` streams over true ranged reads in `CasObjectStorageBackend::get` + the `getStream`
+  seam; the whole-run `full` member is gone. The remaining byte-volume work (delta-runs + compaction,
+  **T1**) stays DESIRABLE — see [`BACKLOG.md`](BACKLOG.md) §2.
 - **S10, S19, S20, S21 harness bugs**: replica-agreement race (missing `SYNC REPLICA`), `FINAL` on
   wrong engine type, per-node counter scoping — to be fixed in the harness (not product bugs).
 - **Ack-floor round soak validation** (TODO): the one-pass ack-floor round (`04 §gc-round`) is

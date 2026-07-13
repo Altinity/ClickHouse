@@ -1,6 +1,11 @@
 # CAS: flat-combining shard mutation queue — spec + plan
 
-**Status:** APPROVED 2026-07-03 (brainstorm in-session; user chose the queue over a plain mutex).
+> **⚠️ OBSOLETE (2026-07-13).** The `Store::mutateShard` root-shard mutation path this queue optimized
+> was **removed** by the per-table snapshot+log ref protocol — intra-server serialization is now the
+> `CasSingleWriterSlot` per-table ref-append lane, and the queue's `CasShard*` ProfileEvents were deleted
+> in the 2026-07-12 stabilization iteration. No longer applicable. Kept for history.
+
+**Status:** OBSOLETE (was APPROVED 2026-07-03; brainstorm in-session, user chose the queue over a plain mutex).
 **Branch:** `cas-shard-mutation-queue` off `cas-copy-forward`.
 
 ## Problem

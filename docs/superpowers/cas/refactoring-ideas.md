@@ -20,6 +20,17 @@ night (see `worklogs/2026-07-06-scenario-validation-night.md`): idea 1 ↔ the r
 an empty pool); idea 2 ↔ `ObjectStorageBackend::list` returns a different token kind than `head` in
 `EmulatedSingleProcess` mode (a Liskov gap vs the `supportsListTokens` contract).
 
+## Status (2026-07-13 grooming) {#status-2026-07-13}
+
+Some of these landed via the 2026-07-12 stabilization iteration; the rest stay WEIGHED. Landed:
+**#2 token policy** (`tokenForHead`/`tokenForList`/`tokenMatches` — C1), **#7 list-pagination** and
+**#8 delete-outcome classifier** (`forEachListedKey` + `classifyDeleteOutcome` in `CasBackendListing.h`
+— C2). Also DONE: the "Post-v3 GC settlement follow-up #1" below (fold the retired list into the
+snapshot) landed as **retired-in-snapshot**. Still open and tracked in [`BACKLOG.md`](BACKLOG.md) §9:
+**#1** `Store::open` modes (the read-only-writes-`_pool_meta` bug), **#3** split `CasGc.cpp`. The
+emulated `list` token-kind gap (#2's Liskov note) is to be re-verified against the landed C1 helpers.
+The rest (#4–#6, #9, #10, naming) remain candidate-only.
+
 ## Ideas {#ideas}
 
 1. **Split `Store::open` into explicit open modes.** `CasStore.cpp` `open` mixes capability probing,
