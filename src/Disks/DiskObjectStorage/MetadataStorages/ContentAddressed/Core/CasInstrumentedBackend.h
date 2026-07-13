@@ -15,10 +15,11 @@ namespace DB::Cas
 /// Motivation: `part_log` shows `put=0` because PUTs ride a background threadpool, so we need a
 /// backend-level chokepoint to attribute the S3 op-count (PUTs/HEADs/404s/412s/LISTs) by CA op type.
 
-/// Namespace of a CA key, classified by substring of the key path (6 classes).
+/// Namespace of a CA key, classified by substring of the key path (6 classes; `Server` is currently
+/// unreachable through this classifier — the per-server control subtree lives under
+/// `/gc/server-roots/<server_root_id>/...` and classifies as Gc).
 ///   <prefix>/blobs/..        → Blob
 ///   <prefix>/cas/manifests/.. → Manifest
-///   <prefix>/roots/<server-hex>/_watermark     → Server  (checked before the generic /roots/)
 ///   <prefix>/roots/..        → Root  (incl. /roots/<ns>/_files/ and mountpoint objects)
 ///   <prefix>/gc/..           → Gc
 ///   else (e.g. _pool_meta, _probe) → Other

@@ -293,8 +293,7 @@ solo so birth stamps apply exactly as before. Failure semantics: a throwing clos
 its own edits and fails alone; the hard limit degrades a batch to solo re-flushes so exactly the
 offender gets `LIMIT_EXCEEDED`; a CAS conflict (cross-writer only now — e.g. the GC leader's trim
 from another replica) replays the carved batch. Bounded by construction: every queued item is a
-blocked caller thread. Counters: `CasShardBatchFlushes` / `CasShardBatchedMutations` (avg batch),
-`CasShardBatchScopeCuts`, `CasShardQueueWaitMicroseconds`.
+blocked caller thread.
 
 **Dedup** (HEAD-before-PUT, `CasBlobHeadFirst`): if the dedup cache signals the blob is present, or
 the blob is large (≥ `dedup_head_first_min_bytes`), a HEAD is issued first. A present HEAD →

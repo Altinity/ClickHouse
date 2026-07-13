@@ -1656,11 +1656,6 @@ protected:
         bool attach = false,
         ContextPtr local_context = nullptr);
 
-    /// Reject, at CREATE/ATTACH, table features a content-addressed disk cannot represent in M1
-    /// (B31). Called from the ctor once the storage policy and metadata are known. No-op when no
-    /// disk in the storage policy is content-addressed.
-    void checkContentAddressedDiskRestrictions(const StorageInMemoryMetadata & metadata) const;
-
     void checkPartitionKeyAndInitMinMax(const KeyDescription & new_partition_key);
 
     void checkTTLExpressions(const StorageInMemoryMetadata & new_metadata, const StorageInMemoryMetadata & old_metadata) const;

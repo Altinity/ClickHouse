@@ -67,9 +67,7 @@ namespace
         "The operation '{}' is not implemented for a content-addressed disk: it belongs to the "
         "generic disk-transaction surface that the content-addressed write path does not use. "
         "Hitting it usually means the disk is wrapped by a layer that bypasses the "
-        "content-addressed write path — e.g. a <type>cache</type> disk over a content-addressed "
-        "disk, which is not supported yet (use the content-addressed disk directly in the storage "
-        "policy).", op);
+        "content-addressed write path.", op);
 }
 
 /// Inline candidates above this size spill to a blob instead of riding the tree object — a tuning
@@ -266,8 +264,8 @@ bool ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
     /// observation. This is what lets promote skip re-validating tokened leaves (a condemnation in the
     /// putBlob→promote window cannot graduate — the next fold sees the edge). Moving putBlob before
     /// precommitAdd would adopt an incarnation with no protecting edge (the pre-B188 dangle shape) and
-    /// trips the `chassert(precommitted)` in Build::observeAndAdmit; the TLA+ order sabotage (Gate A) is
-    /// the formal guard.
+    /// trips the EDGE-BEFORE-OBSERVE fail-closed throw in Build::observeAndAdmit; the TLA+ order
+    /// sabotage (Gate A) is the formal guard.
     const Cas::ManifestId id = st.build->stageManifest(st.entries);
     st.build->precommitAdd(ns, ref, id);
 
@@ -1085,14 +1083,11 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
             for (auto & pb : src_st.pending_blobs)
                 dst_st.pending_blobs.push_back(std::move(pb));
             src_st.pending_blobs.clear();
-            if (!src_st.build)
-            {
-            }
-            else if (!dst_st.build)
+            if (!dst_st.build)
             {
                 dst_st.build = std::move(src_st.build);
             }
-            else
+            else if (src_st.build)
             {
                 /// Two Builds for one destination part: keep the destination's; the source build's
                 /// deps ride the staged entries (re-observed by the destination build at adopt

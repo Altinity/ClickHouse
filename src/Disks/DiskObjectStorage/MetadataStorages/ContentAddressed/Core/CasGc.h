@@ -237,8 +237,8 @@ private:
     /// CORRUPTED_DATA (hard). A MISSING body (404) is handled by where it appears: a precommit
     /// activation new missing body => no edges + barrier holds the cursor; a committed/promote new
     /// missing body or a true-removal old body missing at removal-fold => fail-closed FOR THAT DECISION
-    /// (clamp the shard's folded_cursor below it, record the anomaly, stop folding THIS shard) — never
-    /// guess a delta, never throw/wedge (feedback_ca_gc_never_throw_on_404).
+    /// (clamp the shard's last_folded_ref_id below it, record the anomaly, stop folding THIS shard) —
+    /// never guess a delta, never throw/wedge (feedback_ca_gc_never_throw_on_404).
     /// On success `state` carries the committed snap_generation and `state_token` the committed gc/state
     /// token. The committed pair is THREADED into retire, never re-read (zombie-steal protection).
     /// Round-paced graduation: `current_round` (= state.round + 1, the SAME basis condemn_round is

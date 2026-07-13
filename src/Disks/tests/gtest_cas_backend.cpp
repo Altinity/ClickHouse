@@ -300,9 +300,11 @@ TEST(CasInstrumentedBackend, ClassifierAndPerNamespaceOpEvents)
     EXPECT_EQ(classifyCasNs("pool/gc/registry"), CasNs::Gc);   /// gc/ prefix covers GC state (state, retired sets, etc.)
     EXPECT_EQ(classifyCasNs("pool/roots/default/_files/x"), CasNs::Root);
     EXPECT_EQ(classifyCasNs("pool/gc/state"), CasNs::Gc);
-    /// Phase 6: server control state lives under roots/<server-hex>/; classified by suffix/segment.
-    EXPECT_EQ(classifyCasNs("pool/roots/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/_watermark"), CasNs::Server);
-    EXPECT_EQ(classifyCasNs("pool/roots/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/_precommits/3"), CasNs::Server);
+    /// D3: the old per-server-control key shapes (`_watermark`, `_precommits/<n>`) have no producer
+    /// anymore -- control state now lives under `/gc/server-roots/...` (classifies as Gc). A key of
+    /// this legacy shape, if it ever showed up, would fall through to the generic /roots/ rule.
+    EXPECT_EQ(classifyCasNs("pool/roots/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/_watermark"), CasNs::Root);
+    EXPECT_EQ(classifyCasNs("pool/roots/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/_precommits/3"), CasNs::Root);
     EXPECT_EQ(classifyCasNs("pool/_pool_meta"), CasNs::Other);
     /// Post-relocation layout: ref shards and part manifests must NOT fall into Other (the
     /// 2026-07-03 operator-stand CREATE storm misread as CasOtherHeadMiss=102 because of this).

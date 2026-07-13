@@ -144,7 +144,8 @@ message GcOutcomeEntryProto {
                            // never a blob identity anymore, so every entry names its algo explicitly.
 }
 
-// Retire outcome log (gc/outcomes/<round>.<fence_seq>/<snap_shard>). Magic CAGO, FormatId::GcOutcomes.
+// Retire outcome log (gc/gen/<generation>/attempt/<attempt>/outcomes/<round>/<shard>). Magic CAGO,
+// FormatId::GcOutcomes.
 // CasHeader is field 1; existing field renumbered from 1 to free field 1.
 // Entries are in insertion order (the original JSON encoder kept insertion order).
 message GcOutcomeLogProto {

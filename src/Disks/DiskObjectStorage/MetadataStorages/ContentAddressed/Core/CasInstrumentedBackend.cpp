@@ -122,14 +122,6 @@ CasNs classifyCasNs(const String & key)
         return CasNs::Root;
     if (key.find("/cas/manifests/") != String::npos)
         return CasNs::Manifest;
-    /// Phase 6: a server's mutable control state lives under its own `roots/<server-hex>/` subtree —
-    /// the watermark at `.../_watermark` and the precommit shards under `.../_precommits/`. Both are
-    /// key-wise under `/roots/`, so classify them by their distinguishing suffix/segment BEFORE the
-    /// generic `/roots/` fall-through, preserving the Server (watermark) and Build (precommit) labels.
-    if (key.ends_with("/_watermark"))
-        return CasNs::Server;
-    if (key.find("/_precommits/") != String::npos)
-        return CasNs::Server;
     if (key.find("/roots/") != String::npos)
         return CasNs::Root;
     if (key.find("/gc/") != String::npos)

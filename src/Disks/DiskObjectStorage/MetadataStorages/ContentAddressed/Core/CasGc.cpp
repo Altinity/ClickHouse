@@ -560,7 +560,6 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     state = std::move(next);
     state_token = res.token;
     report.round = state.round;
-    report.candidates += 0;   /// candidates are counted at condemn time (head_blob, inside the fold)
 
     /// R5b post-CAS: T0 reference-parent HAND-OFF DELETE (Task 7). `pruneSupersededGenerations` SKIPS a
     /// generation the live seal still references AND advances `snap_pruned_through` PAST it
@@ -2345,8 +2344,8 @@ bool Gc::acquireOrRenewLease(GcState & state, Token & state_token, bool allow_st
             GcState fresh;
             fresh.lease = GcLease{gc_id, 1};
             /// Creation-time only: gc_shards is set ONCE on first-ever acquire; subsequent rounds read
-            /// the authoritative value from the persisted GcState (pool is authoritative on reopen,
-            /// like root_shards). PoolConfig carries the configured value from the disk XML.
+            /// the authoritative value from the persisted GcState (pool is authoritative on reopen).
+            /// PoolConfig carries the configured value from the disk XML.
             fresh.gc_shards = store->poolConfig().gc_shards;
             const CasResult acquire_res = store->backend().casPut(key, encodeGcState(fresh), std::nullopt);
             if (acquire_res.outcome == CasOutcome::Committed)

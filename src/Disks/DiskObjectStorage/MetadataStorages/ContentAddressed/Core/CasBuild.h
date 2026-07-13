@@ -66,8 +66,9 @@ public:
     /// ORDERING (EDGE-BEFORE-OBSERVE, spec 2026-07-09-cas-writer-gc-simplification): putBlob is always
     /// called AFTER precommitAdd (the wiring order stageManifest → precommitAdd → putBlob → promote). Its
     /// ADOPT paths observe an existing incarnation, so they are safe only under this build's durable
-    /// precommit closure — asserted by `chassert(precommitted)` in observeAndAdmit. A FRESH upload before
-    /// precommit is legal (newborn-debris watermark), but production never does it.
+    /// precommit closure — enforced by a fail-closed throw (LOGICAL_ERROR, not a `chassert`, which is
+    /// compiled out in release) in observeAndAdmit. A FRESH upload before precommit is legal
+    /// (newborn-debris watermark), but production never does it.
     PutBlobResult putBlob(const BlobRef & ref, BlobSource source);
 
     /// B156b discriminator: does this build hold a TOKENED Blob dep for `ref` (putBlob'd here ⇒
@@ -92,15 +93,15 @@ public:
     /// manifest_ordinal per call. The id is recorded for best-effort `abandon` cleanup.
     ManifestId stageManifest(std::vector<ManifestEntry> entries);
 
-    /// Build-intent owner add, written to the SAME root shard as the future committed ref (spec §Precommit
-    /// Add) — there is no `_precommits` namespace. ONE `appendRefOps` call appending an OwnerTransition
-    /// `RefOp` (new_binding = {Precommit, final_ref_name, id.ref}) to the ref-log; shard =
-    /// store->shardOf(final_ref_name), so the later promote is an atomic owner move in this same shard.
-    /// Needs NO body-exists HEAD as a safety authority: GC and promotion handle a missing precommit
-    /// manifest body by failing closed (a missing-body precommit is a non-activating, non-promotable intent).
+    /// Build-intent owner add (spec §Precommit Add) — there is no `_precommits` namespace. ONE
+    /// `appendRefOps` call appending an OwnerTransition `RefOp` (new_binding = {Precommit,
+    /// final_ref_name, id.ref}) to final_ref_name's ref-log entry, so the later promote is an atomic
+    /// owner move over that same entry. Needs NO body-exists HEAD as a safety authority: GC and
+    /// promotion handle a missing precommit manifest body by failing closed (a missing-body precommit
+    /// is a non-activating, non-promotable intent).
     void precommitAdd(const RootNamespace & target_ns, const String & final_ref_name, const ManifestId & id);
 
-    /// Atomic commit promotion (spec §Promote Precommit): ONE root-shard CAS in shardOf(final_ref_name).
+    /// Atomic commit promotion (spec §Promote Precommit): ONE `appendRefOps` call on final_ref_name's ref-log entry.
     ///  1. (no writer-side retire-view refresh — removed in the 2026-07-09 writer-GC simplification;
     ///     tokened leaves are edge-protected via EDGE-BEFORE-OBSERVE);
     ///  2. stream-read the precommit manifest body; validate RefMatchesBody / ManifestNamespaceMatches;

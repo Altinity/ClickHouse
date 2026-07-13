@@ -138,8 +138,8 @@ struct PoolConfig
     /// has lost its lease; its round-commit CAS fails).
     uint64_t gc_snap_generations_to_keep = 3;
     /// Blob target shards for GC (spec §Sharding Model). Default 1 (single-shard equivalence to
-    /// Phase 1d). Creation-time only; the pool is authoritative on reopen, like `root_shards`. This
-    /// is the BLOB-HASH-prefix reducer axis, distinct from the root-shard fence axis.
+    /// Phase 1d). Creation-time only; the pool is authoritative on reopen. This is the
+    /// BLOB-HASH-prefix reducer axis.
     uint64_t gc_shards = 1;
     /// Phase 2 cursor-paced orphan part-manifest sweep. The LIST budget bounds cold-prefix enumeration
     /// per completed GC round; the delete budget separately bounds exact-token destructive work.
@@ -156,10 +156,10 @@ struct PoolConfig
     /// is the BACKSTOP against unbounded journal growth, not the working trimmer: the count gate
     /// (gc_trim_min_events = 256 events ≈ 21 KB) fires long before any reasonable size cap, and NO
     /// cap can cut events above the sealed fold cursor — the body is CURSOR-AGE-bound, not
-    /// trim-bound (2026-07-03 night: a 96 KiB cap experiment could not hold a hot table's body;
-    /// the real levers are root_shards and fold cadence). Keeping shard bodies under an object
-    /// store's inline threshold (e.g. RustFS 128 KiB, relevant while rustfs#3231 leaks data dirs
-    /// on big-object overwrite) is achieved by root_shards sizing, not by this cap.
+    /// trim-bound (2026-07-03 night: a 96 KiB cap experiment could not hold a hot table's body; fold
+    /// cadence is the real lever). Keeping shard bodies under an object store's inline threshold
+    /// (e.g. RustFS 128 KiB, relevant while rustfs#3231 leaks data dirs on big-object overwrite) is
+    /// not something this cap can guarantee on its own — it is a hard backstop, not a target.
     uint64_t gc_trim_body_soft_limit = 8ULL << 20;   /// 8 MiB (backstop)
     /// Phase-4 skip-unchanged (spec 2026-07-06-cas-gc-round-skip-unchanged): a GC round may DEFER
     /// (re-adopt the sealed in-degree generation instead of rebuilding it) when fewer than this many
@@ -423,7 +423,10 @@ public:
     /// `Removed` lifecycle carries no `remove_txn_id`). Recovers a cold runtime; the warm path is a
     /// cached-state read. Readers consult this to treat a dropped table's namespace files as absent while
     /// GC has not yet physically reclaimed them (deferred-GC removal, Task 12); a never-born namespace is
-    /// NOT reported removed (fail-closed — only a KNOWN-removed table hides its files).
+    /// NOT reported removed (fail-closed — only a KNOWN-removed table hides its files). A SAME-namespace
+    /// recreation flips this back to `false` only once its first ref op forces a fresh `namespace_birth`
+    /// — unreachable under normal `Atomic` DDL (a recreated table always mints a fresh UUID, hence a
+    /// fresh namespace), and itself gated on this namespace's `_cleanup` marker (spec §Namespace Birth).
     bool namespaceIsRemoved(const RootNamespace & ns);
 
     /// ==== writer ref-log append lane (Task 10, spec §Writer Algorithms) ====

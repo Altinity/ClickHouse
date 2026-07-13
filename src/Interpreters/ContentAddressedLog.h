@@ -21,7 +21,7 @@ struct ContentAddressedLogElement
     String disk_name;
     String namespace_;
     String ref_name;
-    String object_kind;           /// none/blob/manifest/pack/root/snap
+    String object_kind;           /// none/blob/manifest/root/snap
     String object_hash;
     String token;
     UInt64 round = 0;

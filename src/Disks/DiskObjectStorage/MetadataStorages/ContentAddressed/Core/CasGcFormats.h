@@ -29,9 +29,9 @@ namespace DB::Cas
 /// malformed document => CORRUPTED_DATA; future version => NOT_IMPLEMENTED).
 
 /// gc/state (proto `GcStateProto`, magic CAGT): the GC lease, snap config, and the ack-floor
-/// `retired_refs` (gc-shard -> current retired-list object key). NOTE: the fold cursor (folded_cursor)
-/// lives in the write-once fold seal (`CasFoldSeal::per_ns_shard`), not gc/state, so (edges, cursor)
-/// are one write-once unit.
+/// `retired_refs` (gc-shard -> current retired-list object key). NOTE: the fold cursor
+/// (`ShardCoverage::last_folded_ref_id`) lives in the write-once fold seal
+/// (`CasFoldSeal::per_ns_shard`), not gc/state, so (edges, cursor) are one write-once unit.
 struct GcLease
 {
     UInt128 owner{};          /// gc leader id (random u128); 0 = never held

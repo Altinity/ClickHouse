@@ -11,9 +11,9 @@
 namespace DB::Cas
 {
 
-/// Retire outcomes (spec §7 R4) — what the recheck decided per retired entry. One JSON object per
-/// gc/outcomes/<round>.<fence_seq>/<snap_shard>; written once (`putIfAbsent` — idempotent replay reads
-/// and verifies). Non-hashed metadata => strict JSON. 412-saves (replaced) are a health metric.
+/// Retire outcomes (spec §7 R4) — what the recheck decided per retired entry. One object per
+/// gc/gen/<generation>/attempt/<attempt>/outcomes/<round>/<shard>; written once (`putIfAbsent` —
+/// idempotent replay reads and verifies). 412-saves (replaced) are a health metric.
 enum class OutcomeKind : uint8_t
 {
     Deleted = 1,    /// exact-token delete landed
@@ -30,11 +30,10 @@ struct OutcomeEntry
     OutcomeKind outcome = OutcomeKind::Spared;
 };
 
-/// Outcome log ("cas_gc_outcomes" v1), one object per gc/outcomes/<round>.<fence_seq>/<snap_shard>:
-///   {"format":"cas_gc_outcomes","version":1,
-///    "entries":[{"kind":"blob","hash":"<32 lowercase hex>","token":"etag-1",
-///                "token_type":"etag","outcome":"deleted"}]}
-/// outcome: "deleted" | "absent" | "replaced" | "spared"; kind/token_type as in the retired set.
+/// Outcome log (`GcOutcomeLogProto`, magic CAGO), one object per
+/// gc/gen/<generation>/attempt/<attempt>/outcomes/<round>/<shard>: a `CasHeader` followed by a
+/// repeated `GcOutcomeEntryProto` list (kind/hash/token/token_type/outcome/hash_algo per entry, in
+/// insertion order).
 struct OutcomeLog
 {
     std::vector<OutcomeEntry> entries;

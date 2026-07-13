@@ -25,8 +25,6 @@
                 <gc_enabled>1</gc_enabled>
                 <content_addressed_gc_grace_sec>3</content_addressed_gc_grace_sec>
                 <gc_interval_sec>1</gc_interval_sec>
-                <!-- root_shards=4 is sufficient and non-default (tests the value passes through). -->
-                <root_shards>4</root_shards>
             </disk_cas_gc_sharded>
         </disks>
         <policies>

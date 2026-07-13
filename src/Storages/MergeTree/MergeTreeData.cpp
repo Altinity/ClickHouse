@@ -765,11 +765,6 @@ MergeTreeData::MergeTreeData(
     checkColumnFilenamesForCollision(metadata_.getColumns(), *settings, sanity_checks);
     checkTTLExpressions(metadata_, metadata_);
 
-    /// Fail closed at CREATE/ATTACH on table features a content-addressed disk cannot support in M1
-    /// (currently projections). Runs for both CREATE and ATTACH so a table with an unsupported
-    /// feature can never be brought up on such a disk.
-    checkContentAddressedDiskRestrictions(metadata_);
-
     String reason;
     if (!canUsePolymorphicParts(*settings, reason) && !reason.empty())
         LOG_WARNING(log, "{} Settings 'min_rows_for_wide_part'and 'min_bytes_for_wide_part' will be ignored.", reason);
@@ -1246,16 +1241,6 @@ void MergeTreeData::setProperties(
 
     std::lock_guard lock(patch_parts_metadata_mutex);
     patch_parts_metadata_cache.clear();
-}
-
-void MergeTreeData::checkContentAddressedDiskRestrictions(const StorageInMemoryMetadata & metadata) const
-{
-    /// Projections are now supported on a content_addressed disk (stored as nested keys
-    /// <proj>.proj/<file> in the parent part's manifest — see the projections design spec). The
-    /// non-replicated deduplication window is also supported. Nothing else is decidable from table
-    /// metadata at CREATE/ATTACH time, so this is intentionally a no-op kept as the plug-in point for
-    /// any future create-time content-addressed restriction.
-    (void)metadata;
 }
 
 namespace

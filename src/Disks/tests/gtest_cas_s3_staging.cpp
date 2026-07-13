@@ -211,7 +211,7 @@ DB::Cas::BuildPtr startStagingBuild(const DB::Cas::StorePtr & s, const DB::Cas::
     return s->startBuild(info);
 }
 
-/// Stage a one-blob manifest and precommit it (so the EDGE-BEFORE-OBSERVE `chassert(precommitted)` in
+/// Stage a one-blob manifest and precommit it (so the EDGE-BEFORE-OBSERVE fail-closed check in
 /// `observeAndAdmit` holds), returning the build ready for a `putBlob` promote of `hash`.
 DB::Cas::BuildPtr precommittedBuildFor(
     const DB::Cas::StorePtr & s, const DB::Cas::RootNamespace & ns, const String & ref,
