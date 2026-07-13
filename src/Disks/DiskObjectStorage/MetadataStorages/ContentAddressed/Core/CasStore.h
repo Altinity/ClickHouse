@@ -195,11 +195,17 @@ struct PoolConfig
     /// boot clock (`Store::bootMs`); injected by tests to drive the fence deadline deterministically.
     std::function<uint64_t()> boot_ms_fn = {};
 
-    /// Task 11 (spec §writer-snapshot-publication): a table's tail (logs after its newest snapshot)
-    /// becomes a publish candidate once it exceeds either threshold, or right after recovery replays a
-    /// tail already above one (the mount-time trigger). Publication is background and never blocks an
-    /// append (see `Store::maybeScheduleSnapshotPublish`).
-    uint64_t snapshot_log_count_threshold = 64;
+    /// Task 11 (spec §writer-snapshot-publication): a table becomes a publish candidate once its
+    /// PUBLISHABLE tail -- entries aged past `snapshot_min_log_age_ms` AND strictly above the newest
+    /// published snapshot -- exceeds either threshold (their count / the sum of their encoded bytes),
+    /// or right after recovery replays a tail already above one (the mount-time trigger). Publication
+    /// is background and never blocks an append (see `Store::maybeScheduleSnapshotPublish`).
+    /// The count default trades write-side PUT volume against read-side cold-fold cost: every publish
+    /// re-encodes and PUTs the FULL snapshot, so a low threshold under sustained load degenerates into
+    /// a near-continuous full-snapshot PUT stream, while on the read side a cold fold pays one GET per
+    /// log the newest snapshot does not cover -- 256 bounds that at 256 extra GETs, each far cheaper
+    /// than the snapshot churn it avoids.
+    uint64_t snapshot_log_count_threshold = 256;
     uint64_t snapshot_log_bytes_threshold = 1ULL << 20;   /// 1 MiB
     /// Grace age (spec §Late Predecessor PUT): a candidate snapshot id `X` never covers a log younger
     /// than this many milliseconds -- documented wall-clock risk reduction for the cross-epoch race,

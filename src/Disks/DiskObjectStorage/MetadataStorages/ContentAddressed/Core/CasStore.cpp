@@ -1822,25 +1822,32 @@ void Store::maybeScheduleSnapshotPublish(const RootNamespace & ns, const std::sh
     bool dispatch = false;
     {
         std::lock_guard lock(rt->state_mutex);
-        const bool over_threshold = rt->tail_since_snapshot.size() > config.snapshot_log_count_threshold
-            || rt->tail_bytes_since_snapshot.load(std::memory_order_relaxed) > config.snapshot_log_bytes_threshold;
+        const uint64_t now = bootMsNow();
         if (rt->state.lifecycle == RefLifecycle::Live
-            && over_threshold
             /// Single-in-flight gate: at most one background publish per table. A dropped trigger is
             /// re-evaluated on the next trigger (post-flush / mount-time / the next read), so no snapshot
             /// is permanently skipped -- the spec promises best-effort compaction, not a staleness bound.
             && rt->pending_snapshot_publishes.load(std::memory_order_relaxed) == 0
             /// Backoff deadline: after a non-Committed publish, a saturated backend is not re-dispatched
             /// on the next read until the bounded backoff elapses (the read-triggered PUT-storm latch).
-            && bootMsNow() >= rt->publish_backoff_until_ms)
+            && now >= rt->publish_backoff_until_ms)
         {
-            /// Candidate-advance skip: dispatch only if a grace-eligible tail entry sits strictly above
-            /// the newest published snapshot. Otherwise the publisher would find nothing new to cover
-            /// (all tail entries still within the grace window, or the newest already published) and
-            /// return without pruning -- re-latching the threshold trigger on every subsequent read.
-            /// `observed_at_ms` is non-decreasing, so the eligible entries are a prefix; the last of them
-            /// is the candidate the publish would pick (mirrors `trySnapshotPublishOnce`'s selection).
-            const uint64_t now = bootMsNow();
+            /// Threshold trigger + candidate selection, fused into one walk of the tail's aged prefix.
+            /// The trigger counts ONLY entries a publish dispatched right now could actually cover:
+            /// (a) aged past the grace window AND (b) strictly above the newest published snapshot.
+            /// Counting the RAW tail size instead degenerates under sustained load: the grace window
+            /// keeps a permanent floor of young entries in the tail (append rate x grace age of them),
+            /// so once that floor alone exceeds the count threshold the raw trigger is CONTINUOUSLY
+            /// true, and a FULL snapshot re-encode+PUT is dispatched once per publish latency -- each
+            /// covering only the handful of entries that aged since the previous one (a measured
+            /// 20-26 GB/h of `_snap` PUT traffic per node at ~23 txn/s). Counting aged+uncovered
+            /// entries restores the intended batching: a publish is dispatched only once a full
+            /// threshold's worth of coverable work has accumulated.
+            /// `observed_at_ms` is non-decreasing, so the aged entries are a prefix (one loop, stopping
+            /// at the first young entry); the last of them is the candidate the publish would pick
+            /// (mirrors `trySnapshotPublishOnce`'s selection).
+            uint64_t publishable_count = 0;
+            uint64_t publishable_bytes = 0;
             std::optional<RefTxnId> candidate_x;
             for (const auto & entry : rt->tail_since_snapshot)
             {
@@ -1848,8 +1855,20 @@ void Store::maybeScheduleSnapshotPublish(const RootNamespace & ns, const std::sh
                 if (age < config.snapshot_min_log_age_ms)
                     break;
                 candidate_x = entry.txn.txn_id;
+                if (!rt->newest_snapshot_id || *rt->newest_snapshot_id < entry.txn.txn_id)
+                {
+                    ++publishable_count;
+                    publishable_bytes += entry.encoded_bytes;
+                }
             }
-            if (candidate_x && (!rt->newest_snapshot_id || *rt->newest_snapshot_id < *candidate_x))
+            const bool over_threshold = publishable_count > config.snapshot_log_count_threshold
+                || publishable_bytes > config.snapshot_log_bytes_threshold;
+            /// Candidate-advance skip: dispatch only if a grace-eligible tail entry sits strictly above
+            /// the newest published snapshot. Otherwise the publisher would find nothing new to cover
+            /// (all tail entries still within the grace window, or the newest already published) and
+            /// return without pruning -- re-latching the threshold trigger on every subsequent read.
+            if (over_threshold
+                && candidate_x && (!rt->newest_snapshot_id || *rt->newest_snapshot_id < *candidate_x))
             {
                 rt->pending_snapshot_publishes.fetch_add(1, std::memory_order_relaxed);
                 dispatch = true;
@@ -1967,7 +1986,10 @@ bool Store::trySnapshotPublishOnce(const RootNamespace & ns)
         RefTableState replay_state = rt->snapshot_base_state;
         for (const auto & entry : rt->tail_since_snapshot)
         {
-            applyRefLogTxn(replay_state, entry.txn);
+            /// Age-check BEFORE apply: a young entry must never reach the candidate state anyway, so
+            /// checking first keeps `replay_state` equal to the candidate at every step -- ONE move
+            /// after the loop instead of a full `RefTableState` copy per aged entry (the copy-per-entry
+            /// replay dominated the publish path's CPU cost on large tables).
             const uint64_t age = now >= entry.observed_at_ms ? now - entry.observed_at_ms : 0;
             if (age < config.snapshot_min_log_age_ms)
             {
@@ -1982,12 +2004,13 @@ bool Store::trySnapshotPublishOnce(const RootNamespace & ns)
                 ProfileEvents::increment(ProfileEvents::CasRefLatePredecessorObserved);
                 break;
             }
-            candidate_state = replay_state;
+            applyRefLogTxn(replay_state, entry.txn);
             candidate_x = entry.txn.txn_id;
             have_candidate = true;
         }
         if (!have_candidate)
             return false;   /// even the oldest tail entry is still within the grace window
+        candidate_state = std::move(replay_state);
     }
 
     const RefTableSnapshot snap = snapshotOf(candidate_state, ns.string());

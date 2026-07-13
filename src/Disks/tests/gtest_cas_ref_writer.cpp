@@ -1328,6 +1328,148 @@ TEST(RefWriterSnapshotPublish, C4BackoffDefersThenRetriesAndPublishes)
 }
 
 /// ===================================================================================
+/// Publish-trigger arithmetic: only aged + uncovered entries count (spec
+/// §writer-snapshot-publication). A raw-tail-size trigger degenerates under sustained
+/// load: the grace window keeps a permanent floor of young entries in the tail, so the
+/// raw trigger is continuously true and a FULL snapshot encode+PUT is dispatched per
+/// publish latency (a measured 20-26 GB/h of `_snap` PUTs per node at ~23 txn/s).
+/// ===================================================================================
+
+/// A tail above the count threshold in which EVERY entry is still younger than the grace age must not
+/// dispatch: nothing is publishable yet, so a dispatch could only burn a full-snapshot encode for
+/// nothing. The trigger arithmetic itself (not merely the candidate-advance skip) must see zero.
+TEST(RefWriterSnapshotPublish, TriggerIgnoresYoungTailAboveCountThreshold)
+{
+    using ProfileEvents::global_counters;
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/trigger_young_tail"};
+    uint64_t fake_now = 1'000'000;
+    PoolConfig config;
+    config.snapshot_log_count_threshold = 3;
+    config.snapshot_log_bytes_threshold = 1ULL << 40;
+    config.snapshot_min_log_age_ms = 60000;
+    config.mount_lease_ttl_ms = std::chrono::milliseconds(10'000'000);
+    config.boot_ms_fn = [&fake_now] { return fake_now; };
+    auto store = openStoreWithConfig(backend, config);
+
+    const auto before = global_counters[ProfileEvents::CasRefSnapshotPublishDispatched].load();
+    publishEmptyPart(store, ns, "a");   /// tail: 2 (birth+add, promote), all stamped "now"
+    publishEmptyPart(store, ns, "b");   /// tail: 4 > 3, but every entry is younger than the grace age
+    for (int i = 0; i < 5; ++i)
+        store->resolveRef(ns, "a");     /// read-triggered evaluations must all decline too
+    store->waitForSnapshotPublishSettleForTest(ns);
+
+    EXPECT_EQ(global_counters[ProfileEvents::CasRefSnapshotPublishDispatched].load(), before)
+        << "an all-young tail above the count threshold must not dispatch a publish";
+    EXPECT_EQ(store->pendingSnapshotPublishesForTest(ns), 0);
+    EXPECT_FALSE(listGreatestSnapshotIdForTest(*backend, layout, ns).has_value())
+        << "no snapshot PUT may reach the backend while nothing is publishable";
+    EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), 4u);
+}
+
+/// The sustained-load degeneracy itself: a below-threshold AGED prefix under an above-threshold raw
+/// tail (the permanent young floor) must NOT dispatch -- the raw-size trigger would, covering only the
+/// two aged entries with a full snapshot PUT. Once a full threshold's worth of entries has aged, one
+/// dispatch publishes and covers the whole aged tail (the batching the threshold exists for).
+TEST(RefWriterSnapshotPublish, TriggerNotLatchedBySustainedLoadYoungFloor)
+{
+    using ProfileEvents::global_counters;
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/trigger_young_floor"};
+    uint64_t fake_now = 1'000'000;
+    PoolConfig config;
+    config.snapshot_log_count_threshold = 4;
+    config.snapshot_log_bytes_threshold = 1ULL << 40;
+    config.snapshot_min_log_age_ms = 60000;
+    config.mount_lease_ttl_ms = std::chrono::milliseconds(10'000'000);
+    config.boot_ms_fn = [&fake_now] { return fake_now; };
+    auto store = openStoreWithConfig(backend, config);
+
+    const auto before = global_counters[ProfileEvents::CasRefSnapshotPublishDispatched].load();
+    publishEmptyPart(store, ns, "a");   /// 2 entries stamped t0
+    fake_now += 120'000;                /// t1: the 2 old entries age past the grace window
+    publishEmptyPart(store, ns, "b");   /// +2 young entries (stamped t1)
+    publishEmptyPart(store, ns, "c");   /// +2 young: raw tail = 6 > 4, yet aged+uncovered = 2 <= 4
+    for (int i = 0; i < 5; ++i)
+        store->resolveRef(ns, "a");
+    store->waitForSnapshotPublishSettleForTest(ns);
+
+    EXPECT_EQ(global_counters[ProfileEvents::CasRefSnapshotPublishDispatched].load(), before)
+        << "a young floor above the raw-size threshold must not dispatch while the aged prefix is below it";
+    EXPECT_FALSE(listGreatestSnapshotIdForTest(*backend, layout, ns).has_value());
+    EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), 6u);
+
+    fake_now += 120'000;                /// t2: all 6 entries aged; all sit above the (absent) newest snapshot
+    store->resolveRef(ns, "a");
+    store->waitForSnapshotPublishSettleForTest(ns);
+    EXPECT_EQ(global_counters[ProfileEvents::CasRefSnapshotPublishDispatched].load(), before + 1)
+        << "once a threshold's worth of entries aged, exactly one dispatch publishes";
+    EXPECT_TRUE(listGreatestSnapshotIdForTest(*backend, layout, ns).has_value());
+    EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), 0u)
+        << "the one publish covers the whole aged tail (batched, not one PUT per few aged entries)";
+}
+
+/// Entries at/below `newest_snapshot_id` contribute NOTHING to the trigger: after a successful publish
+/// the arithmetic restarts from zero above the newest snapshot instead of counting the table's covered
+/// history. (The append lane and recovery both keep the retained tail strictly above the newest
+/// snapshot -- recovery drops covered logs, adoption prunes through the candidate -- so the per-entry
+/// uncovered check in the trigger is the defensive mirror of that invariant; this test pins the
+/// observable arithmetic: 4 covered + 2 fresh aged entries is NOT 6 > 3, it is 2 <= 3.)
+TEST(RefWriterSnapshotPublish, TriggerIgnoresEntriesCoveredByNewestSnapshot)
+{
+    using ProfileEvents::global_counters;
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/trigger_covered"};
+    uint64_t fake_now = 1'000'000;
+    PoolConfig config;
+    config.snapshot_log_count_threshold = 3;
+    config.snapshot_log_bytes_threshold = 1ULL << 40;
+    config.snapshot_min_log_age_ms = 60000;
+    config.mount_lease_ttl_ms = std::chrono::milliseconds(10'000'000);
+    config.boot_ms_fn = [&fake_now] { return fake_now; };
+    auto store = openStoreWithConfig(backend, config);
+
+    /// Drive ONE successful publish: 4 entries, all aged and uncovered (4 > 3).
+    publishEmptyPart(store, ns, "a");
+    publishEmptyPart(store, ns, "b");
+    fake_now += 120'000;
+    const auto d0 = global_counters[ProfileEvents::CasRefSnapshotPublishDispatched].load();
+    store->resolveRef(ns, "a");
+    store->waitForSnapshotPublishSettleForTest(ns);
+    ASSERT_EQ(global_counters[ProfileEvents::CasRefSnapshotPublishDispatched].load(), d0 + 1);
+    const auto first_snap = listGreatestSnapshotIdForTest(*backend, layout, ns);
+    ASSERT_TRUE(first_snap.has_value());
+    EXPECT_EQ(store->newestPublishedSnapshotIdForTest(ns), first_snap);
+
+    /// 2 fresh aged entries: uncovered count = 2 <= 3, while the covered history (4 entries at/below
+    /// the snapshot) would push a covered-counting trigger to 6 > 3. Reads must not dispatch.
+    publishEmptyPart(store, ns, "c");
+    fake_now += 120'000;
+    for (int i = 0; i < 5; ++i)
+        store->resolveRef(ns, "c");
+    store->waitForSnapshotPublishSettleForTest(ns);
+    EXPECT_EQ(global_counters[ProfileEvents::CasRefSnapshotPublishDispatched].load(), d0 + 1)
+        << "entries covered by the newest snapshot must not count toward the trigger";
+    EXPECT_EQ(listGreatestSnapshotIdForTest(*backend, layout, ns), first_snap);
+    EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), 2u);
+
+    /// Crossing the threshold with UNCOVERED aged entries alone (4 > 3) dispatches exactly one more
+    /// publish, and it covers the whole uncovered tail.
+    publishEmptyPart(store, ns, "d");
+    fake_now += 120'000;
+    store->resolveRef(ns, "c");
+    store->waitForSnapshotPublishSettleForTest(ns);
+    EXPECT_EQ(global_counters[ProfileEvents::CasRefSnapshotPublishDispatched].load(), d0 + 2);
+    const auto second_snap = listGreatestSnapshotIdForTest(*backend, layout, ns);
+    ASSERT_TRUE(second_snap.has_value());
+    EXPECT_TRUE(*first_snap < *second_snap);
+    EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), 0u);
+}
+
+/// ===================================================================================
 /// Task 11: successor stale-precommit cleanup (spec §Clean Up Old Precommits)
 /// ===================================================================================
 
