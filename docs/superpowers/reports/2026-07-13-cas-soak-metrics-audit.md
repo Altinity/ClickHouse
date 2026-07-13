@@ -47,7 +47,7 @@ attribution: `system.query_log` / `system.part_log` `ProfileEvents` maps; profil
 
 | Class | Count | Share |
 |---|---|---|
-| **Freshness tags on dedup adoption** | ~598k | **53%** |
+| **`.meta` freshness-object writes** (create-Clean per new body ~263k; resurrect CAS-to-Clean on condemned-hash re-upload — this workload recycles hashes; GC per-hash condemn/spare/delete marks on the bounded meta pool) + chaos attempt inflation | ~612k | **54%** (residual class; exact split needs a `CasMetaPut`-style counter — none exists today) |
 | Blob bodies (`blob_put`) | 263k | 23% |
 | Part manifests | ~175k | 16% |
 | Ref-log appends (`CasRefBatchFlushes` 82 234) | 82k | 7% — **batches 3.5M logical ref ops 43:1** |
@@ -135,7 +135,10 @@ replicas, chaos active). Storage cost excluded (pool ≤ ~5 GB, negligible for t
 
 1. **Relink-fetch per-file probes** (~30% of read class): adopt via manifest hash identity without
    per-file HEAD+GET.
-2. **Freshness-tag PUT per adoption** (53% of PUT class): batch or skip within a TTL window.
+2. **`.meta` write volume** (54% of PUT class): the create/resurrect/GC-mark traffic on per-hash
+   freshness objects; needs a dedicated counter (`CasMetaPut`) first, then batching/skip windows.
+   NB: plain dedup adoption itself is FREE (`CasBuild.cpp:337`) — an earlier revision mislabeled
+   this class as "tags on adoption".
 3. **Dedup-probe HEADs** (~7M): larger/longer dedup cache.
 4. **GC LIST discovery** (~300 pages/round): known quadratic-LIST backlog item.
 5. **GC fold buffer churn** (1.96 GB/round): reuse read buffers or size them to body scale.
@@ -150,6 +153,9 @@ replicas, chaos active). Storage cost excluded (pool ≤ ~5 GB, negligible for t
 3. GC rounds' map contains NO `S3ListObjects` key at all: enumeration pages are fetched by the
    shared async-lister pool outside the round scope.
 4. S3 DELETEs are counted under `S3WriteRequestsCount` (write-class requests).
+5. Unfiltered `part_log` mixes system-log-table parts into workload stats — always filter by table.
+6. GC's per-hash `.meta` writes run on a bounded side pool and escape the GC round's ProfileEvents
+   scope (see `CasGcMetaWriteAnomaly`) — round-level `cas_cond` undercounts GC writes.
 
 ## Erratum {#erratum}
 
