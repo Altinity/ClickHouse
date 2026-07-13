@@ -40,7 +40,6 @@ String toString(CasEventType type)
         case CasEventType::GcRecheckVerdict:      return "gc_recheck_verdict";
         case CasEventType::GcFence:               return "gc_fence";
         case CasEventType::GcCursorAdvance:       return "gc_cursor_advance";
-        case CasEventType::GcTrim:                return "gc_trim";
         case CasEventType::GcShardReclaim:        return "gc_shard_reclaim";
         case CasEventType::GcFenceOut:            return "gc_fence_out";
         case CasEventType::GcRebuild:             return "gc_rebuild";
