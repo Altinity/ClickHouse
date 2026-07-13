@@ -413,7 +413,7 @@ TEST(CasRefGc, RemoveNamespaceCompletesAndPublishesMarkerDeterministically)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test",
-                                                 .root_shards = 1, .gc_fold_max_defer_rounds = 0});
+                                                 .gc_fold_max_defer_rounds = 0});
     const Layout & layout = store->layout();
     const RootNamespace ns{"test/tbl"};
 
@@ -513,8 +513,7 @@ TEST(CasRefGc, RemovedNamespaceCoveredLogsCleanedByCompletingRound)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     /// Default fold cadence (gc_fold_max_defer_rounds = 8): the quiesced-pool regime where the gap bites.
-    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test",
-                                                 .root_shards = 1});
+    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     const Layout & layout = store->layout();
     const RootNamespace ns{"test/tbl"};
 
@@ -802,7 +801,7 @@ TEST(CasRefGc, RecreatedNamespaceRetiresCleanupItemAndStopsChurn)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test",
-                                                 .root_shards = 1, .gc_fold_max_defer_rounds = 0});
+                                                 .gc_fold_max_defer_rounds = 0});
     const Layout & layout = store->layout();
     const RootNamespace ns{"test/tbl"};
 
@@ -875,7 +874,7 @@ TEST(CasRefGc, CompletedItemRepublishesCrashLostRemovedSnapshotThenRetires)
 {
     auto backend = std::make_shared<CountingBackend>();
     auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test",
-                                                 .root_shards = 1, .gc_fold_max_defer_rounds = 0});
+                                                 .gc_fold_max_defer_rounds = 0});
     const Layout & layout = store->layout();
     const RootNamespace ns{"test/tbl"};
 

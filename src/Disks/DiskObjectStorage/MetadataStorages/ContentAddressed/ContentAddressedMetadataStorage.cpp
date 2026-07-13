@@ -129,7 +129,6 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     ContextPtr context_,
     bool gc_enabled_,
     std::chrono::seconds gc_interval_,
-    uint64_t root_shards_,
     String disk_name_,
     uint64_t dedup_cache_bytes_,
     uint64_t dedup_head_first_min_bytes_,
@@ -157,7 +156,6 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     , context(context_)
     , gc_enabled(gc_enabled_)
     , gc_interval(gc_interval_)
-    , root_shards(root_shards_)
     , dedup_cache_bytes(dedup_cache_bytes_)
     , dedup_head_first_min_bytes(dedup_head_first_min_bytes_)
     , gc_snap_generations_to_keep(gc_snap_generations_to_keep_)
@@ -413,10 +411,6 @@ void ContentAddressedMetadataStorage::startup()
     pool_config.background_watermark = (context != nullptr) && !read_only;
     pool_config.read_only = read_only;
     pool_config.skip_access_check = skip_access_check;
-    /// Creation-time only (the pool is authoritative on reopen): widening the shard fanout spreads
-    /// manifest CAS writes across more keys, reducing per-key congestion + per-key overwrite-orphan
-    /// pileup (#4). Existing pools keep their shard count.
-    pool_config.root_shards = root_shards;
     /// Node-local write algo (spec §5): `PoolMeta::createOrValidate` accepts it with no write once
     /// it is a member of the pool's `algos_used`; a not-yet-admitted algo is admitted via
     /// `blob_hash_allow_new` or refused (BAD_ARGUMENTS, the default).

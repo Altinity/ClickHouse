@@ -557,7 +557,7 @@ inline DB::Cas::Token displaceBlobToken(
 
 /// ---- GC-core (Phase 1d) test helpers over the part-manifest model ----
 
-/// Open a Store over `backend` with a single root shard (so cursor keys are "ns/0").
+/// Open a Store over `backend`.
 /// gc_trim_min_events=0 (eager, pre-B12 behaviour) is the test default so existing tests that
 /// assert "the event was trimmed after one round" do not need to be updated.
 /// New tests that want to exercise the lazy-trim threshold pass their own PoolConfig to Store::open.
@@ -572,7 +572,7 @@ inline DB::Cas::StorePtr openStoreForTest(
     std::shared_ptr<DB::Cas::InMemoryBackend> backend, uint64_t gc_fold_max_defer_rounds = 8)
 {
     return DB::Cas::Store::open(std::move(backend),
-        DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1,
+        DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test",
                             .gc_trim_min_events = 0, .gc_fold_max_defer_rounds = gc_fold_max_defer_rounds});
 }
 

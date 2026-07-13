@@ -104,16 +104,7 @@ struct PoolConfig
     /// Phase 0). Required + validated (clean relative path); `ServerUUID`/`server_id` is demoted to an
     /// owner token. Validated via `Cas::validateServerRootId`.
     String server_root_id;
-    /// Creation-time only; the pool is authoritative on reopen. Default WEIGHED 2026-07-03 (night
-    /// forensics): per-shard journal tail = mutation_rate/N x fold-cursor age; with the
-    /// flat-combining queue the contention argument for large N is gone, so N trades BODY SIZE
-    /// (flush latency, read-modify-write bytes, object-store inline thresholds) against DISCOVERY
-    /// keys (∝N per namespace per round) and queue batching (dies as N grows). 8 concentrated a
-    /// hot table's writes badly (100 KB+ tails, 600 KB under cursor-lag storms); 128 over-shards
-    /// (batching ~1x, discovery x16, tail already tiny at 64). 32 keeps a hot table's tail ~25 KB
-    /// healthy / ~165 KB under a 10-minute storm with batching ~1.4x and discovery x4.
-    uint64_t root_shards = 32;
-    uint64_t blob_header_len = 256;           /// creation-time only; ditto
+    uint64_t blob_header_len = 256;           /// creation-time only; the pool is authoritative on reopen
     /// CAS mixed-algo pools (Phase 3 T4, design 2026-07-11-cas-mixed-algo-pools-design.md §5): the
     /// NODE-LOCAL algo this Store writes NEW content with (`Store::writeAlgo()`). NOT durable pool
     /// state -- two live nodes may intentionally write with different (already-admitted) algos, so

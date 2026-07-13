@@ -578,7 +578,7 @@ TEST(CasGcRound, CarryRoundPreservesCondemnedSummaryVerbatim)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Store::open(backend,
-        PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "test",
                    .gc_shards = 2, .gc_trim_min_events = 0});
     const RootNamespace ns{"00/aa@cas@"};
 
@@ -958,7 +958,7 @@ TEST(CasGcSnapRetention, PrunesOldGenerationsKeepingLastThree)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     /// keep the default 3 generations; one root shard so cursor keys are "ns/0".
-    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1, .gc_snap_generations_to_keep = 3, .gc_fold_max_defer_rounds = 0});
+    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_snap_generations_to_keep = 3, .gc_fold_max_defer_rounds = 0});
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(1, 0xAA);
 
@@ -1009,7 +1009,7 @@ TEST(CasGcSnapRetention, PrunesOldGenerationsKeepingLastThree)
 TEST(CasGcSnapRetention, WholesalePruneReclaimsAllAttemptsIncludingRetiredOutcomes)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1, .gc_snap_generations_to_keep = 3, .gc_fold_max_defer_rounds = 0});
+    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_snap_generations_to_keep = 3, .gc_fold_max_defer_rounds = 0});
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(1, 0xAA);
 
@@ -1082,7 +1082,7 @@ TEST(CasGcSnapRetention, ReclaimsNonAdoptedCurrentGenAttemptViaRetention)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     /// keep=3 retention floor (matches WholesalePruneReclaimsAllAttemptsIncludingRetiredOutcomes).
-    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1, .gc_snap_generations_to_keep = 3, .gc_fold_max_defer_rounds = 0});
+    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_snap_generations_to_keep = 3, .gc_fold_max_defer_rounds = 0});
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(1, 0xAA);
     writeBlobBody(*backend, store->layout(), DB::UInt128(1));
@@ -1141,7 +1141,7 @@ TEST(CasGcRetention, PruneRetainsLiveReferencedRun)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     /// keep=1: the retention floor is aggressive so the cursor reaches gen-1's neighbourhood fast.
-    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1, .gc_snap_generations_to_keep = 1, .gc_fold_max_defer_rounds = 0});
+    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_snap_generations_to_keep = 1, .gc_fold_max_defer_rounds = 0});
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(1, 0xAA);
 
@@ -1200,7 +1200,7 @@ TEST(CasGcRetention, PruneRetainsLiveReferencedRun)
 TEST(CasGcRetention, HandOffDeletesSupersededRef)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1, .gc_snap_generations_to_keep = 1, .gc_fold_max_defer_rounds = 0});
+    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_snap_generations_to_keep = 1, .gc_fold_max_defer_rounds = 0});
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r1 = ref(1, 0xAA);
 
@@ -1258,7 +1258,7 @@ TEST(CasGcRetention, HandOffDeletesSupersededRef)
 TEST(CasGcSnapRetention, KeepZeroPrunesNothing)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1, .gc_snap_generations_to_keep = 0});
+    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_snap_generations_to_keep = 0});
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(1, 0xAA);
 

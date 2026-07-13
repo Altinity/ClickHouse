@@ -352,7 +352,7 @@ TEST(CasHeaderGolden, GcOutcomesCasHeaderRoundTrips)
 TEST(CasHeaderGolden, PoolMetaCasHeaderRoundTrips)
 {
     const PoolMeta pm{.pool_id = hexToU128("000102030405060708090a0b0c0d0e0f"),
-                      .root_shards = 16, .blob_header_len = 96, .min_reader_generation = 0,
+                      .blob_header_len = 96, .min_reader_generation = 0,
                       .algos_used = {static_cast<uint8_t>(BlobHashAlgo::CityHash128)}};
     const String bytes = encodePoolMeta(pm);
     ASSERT_FALSE(bytes.empty());
@@ -365,7 +365,6 @@ TEST(CasHeaderGolden, PoolMetaCasHeaderRoundTrips)
     /// Round-trips correctly.
     const PoolMeta d = decodePoolMeta(bytes);
     EXPECT_EQ(d.pool_id, pm.pool_id);
-    EXPECT_EQ(d.root_shards, 16u);
     EXPECT_EQ(d.blob_header_len, 96u);
     EXPECT_EQ(d.min_reader_generation, 0u);
 }
@@ -399,7 +398,6 @@ TEST(CasHeaderGolden, PoolMetaFailClosedOnGarbage)
         auto * hdr = msg.mutable_header();
         hdr->set_magic(magicFor(FormatId::PoolMeta));
         hdr->set_compatibility_version(G_BUILD + 1);
-        msg.set_root_shards(1);
         msg.set_blob_header_len(96);
         std::string bytes; msg.SerializeToString(&bytes);
         expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [&] { decodePoolMeta(bytes); });
@@ -412,20 +410,10 @@ TEST(CasPoolMeta, ConstantInvariantsPostParse)
     /// `encodePoolMeta` serializes whatever is in the struct without validation, so we can build
     /// structs with invalid constants and verify that `decodePoolMeta` rejects them as CORRUPTED_DATA.
 
-    /// root_shards == 0 => CORRUPTED_DATA.
-    {
-        PoolMeta bad;
-        bad.pool_id = UInt128(1);
-        bad.root_shards = 0;
-        bad.blob_header_len = 96;
-        const String bytes = encodePoolMeta(bad);
-        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodePoolMeta(bytes); });
-    }
     /// blob_header_len not 8-aligned => CORRUPTED_DATA.
     {
         PoolMeta bad;
         bad.pool_id = UInt128(1);
-        bad.root_shards = 1;
         bad.blob_header_len = 97;   /// not 8-aligned
         const String bytes = encodePoolMeta(bad);
         expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodePoolMeta(bytes); });
@@ -434,7 +422,6 @@ TEST(CasPoolMeta, ConstantInvariantsPostParse)
     {
         PoolMeta bad;
         bad.pool_id = UInt128(1);
-        bad.root_shards = 1;
         bad.blob_header_len = 88;   /// < 96
         const String bytes = encodePoolMeta(bad);
         expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodePoolMeta(bytes); });
@@ -443,7 +430,6 @@ TEST(CasPoolMeta, ConstantInvariantsPostParse)
     {
         PoolMeta bad;
         bad.pool_id = UInt128(1);
-        bad.root_shards = 1;
         bad.blob_header_len = 32768;   /// > 16384
         const String bytes = encodePoolMeta(bad);
         expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodePoolMeta(bytes); });
@@ -460,7 +446,6 @@ TEST(CasPoolMeta, MinReaderGenerationGate)
     {
         PoolMeta pm;
         pm.pool_id = UInt128(42);
-        pm.root_shards = 1;
         pm.blob_header_len = 96;
         pm.algos_used = {static_cast<uint8_t>(BlobHashAlgo::CityHash128)};
         pm.min_reader_generation = G_BUILD;   /// at-floor: OK
@@ -472,7 +457,6 @@ TEST(CasPoolMeta, MinReaderGenerationGate)
     {
         PoolMeta pm;
         pm.pool_id = UInt128(43);
-        pm.root_shards = 1;
         pm.blob_header_len = 96;
         pm.algos_used = {static_cast<uint8_t>(BlobHashAlgo::CityHash128)};
         pm.min_reader_generation = 0;
@@ -484,7 +468,6 @@ TEST(CasPoolMeta, MinReaderGenerationGate)
     {
         PoolMeta pm;
         pm.pool_id = UInt128(44);
-        pm.root_shards = 1;
         pm.blob_header_len = 96;
         pm.algos_used = {static_cast<uint8_t>(BlobHashAlgo::CityHash128)};
         pm.min_reader_generation = G_BUILD + 1;   /// above the floor: this build is too old

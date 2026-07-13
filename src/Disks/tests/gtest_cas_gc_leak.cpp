@@ -42,8 +42,7 @@ namespace
 StorePtr openTestStore(std::shared_ptr<InMemoryBackend> & out_backend)
 {
     out_backend = std::make_shared<InMemoryBackend>();
-    /// One root shard so the journal of a ref lives in a single, predictable shard (cursor keys "ns/0").
-    return Store::open(out_backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1});
+    return Store::open(out_backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
 }
 
 /// Whether the CURRENT retired list (any gc-shard) still holds an entry — the ack-floor deletion pipeline
@@ -178,7 +177,6 @@ FsckReport displaceAndGc(
         << "partA manifest body must still be present so GC can read its -1 edges at removal-fold";
 
     /// REPOINT: old={Committed,ref,partA} / new={Committed,ref,partB} in the single ordered journal.
-    /// (root_shards=1, so the ref's shard is 0 — matches publishCommittedTransition's default.)
     publishCommittedTransition(*b, s->layout(), ns, ref, part_a.ref, part_b.ref);
 
     /// The repoint dropped partA's owner; advance the watermark floor so partA's now-orphaned blobs are

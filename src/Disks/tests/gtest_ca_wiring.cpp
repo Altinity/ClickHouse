@@ -1377,24 +1377,6 @@ TEST(CaWiringRead, UnsetPublishedAtMsReturnsEpoch)
     EXPECT_EQ(storage->getLastModified("uui/uuid-1/all_1_1_0").epochTime(), 0);
 }
 
-// #4: root_shards is plumbed through the ctor to pool creation (creation-time
-// fanout); default stays 8.
-TEST(CaWiring, RefShardCountConfigurable)
-{
-    auto widened = std::make_shared<DB::ContentAddressedMetadataStorage>(
-        DB::Cas::tests::makeLocalObjectStorageForTest(), "pool", "srv1", "test",
-        std::filesystem::temp_directory_path() / "ca_wiring_rootshards", nullptr,
-        /*gc_enabled=*/false, std::chrono::seconds(60), /*root_shards=*/4);
-    widened->startup();
-    EXPECT_EQ(widened->store()->poolMeta().root_shards, 4u);
-
-    auto defaulted = std::make_shared<DB::ContentAddressedMetadataStorage>(
-        DB::Cas::tests::makeLocalObjectStorageForTest(), "pool", "srv1", "test",
-        std::filesystem::temp_directory_path() / "ca_wiring_rootshards_def", nullptr);
-    defaulted->startup();
-    EXPECT_EQ(defaulted->store()->poolMeta().root_shards, 8u);
-}
-
 /// ==== B188 precommit-first order invariant (Task 6) ====
 ///
 /// A RecordingLocalObjectStorage records the four IObjectStorage methods the CA emulated-mode backend
@@ -2047,9 +2029,8 @@ namespace
 DB::Cas::StorePtr openResurrectStore(std::shared_ptr<DB::Cas::InMemoryBackend> & out_backend)
 {
     out_backend = std::make_shared<DB::Cas::InMemoryBackend>();
-    /// One root shard so the ref's journal lives in a single, predictable shard (matches gtest_cas_gc_leak).
     return DB::Cas::Store::open(
-        out_backend, DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1});
+        out_backend, DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
 }
 
 /// Condemn (kind=Blob, hash, token) by seeding gc/state + a per-shard retired set (the durable GC ledger

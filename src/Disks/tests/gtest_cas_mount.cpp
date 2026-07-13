@@ -290,7 +290,7 @@ TEST(CasMountLease, KeeperStartAdoptsOurOwnClaimNotDoubleStart)
 TEST(CasMountFence, SupersededWriterRefusedNoS3Read)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto store = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "r", .root_shards = 1});
+    auto store = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "r"});
 
     /// Permissive default: a Store that has NOT armed the fence allows mutations.
     EXPECT_TRUE(store->mayMutate());
@@ -309,12 +309,12 @@ TEST(CasMountStartup, SecondServerSameRootFailsClosed)
 {
     auto b = std::make_shared<InMemoryBackend>();
     auto s1 = Store::open(b, PoolConfig{
-        .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r", .root_shards = 1});
+        .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r"});
     /// A second server (different uuid) on the SAME server_root_id + same backend → fail closed
     /// (the owner gate rejects the foreign uuid before any mount/epoch mutation).
     EXPECT_THROW(
         Store::open(b, PoolConfig{
-            .pool_prefix = "p", .server_id = UInt128(2), .server_root_id = "r", .root_shards = 1}),
+            .pool_prefix = "p", .server_id = UInt128(2), .server_root_id = "r"}),
         DB::Exception);
 }
 
@@ -322,7 +322,7 @@ TEST(CasMountStartup, WriterEpochStrictlyIncreasesAcrossReopen)
 {
     auto b = std::make_shared<InMemoryBackend>();
     auto s1 = Store::open(b, PoolConfig{
-        .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r", .root_shards = 1});
+        .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r"});
     const uint64_t e1 = s1->writerEpoch();
 
     /// Simulate shutdown: the Store dtor stops the keeper, whose terminate() retires the lease
@@ -332,7 +332,7 @@ TEST(CasMountStartup, WriterEpochStrictlyIncreasesAcrossReopen)
     /// Same server reopen → reclaims the (now-expired, different-epoch) mount and allocates a strictly
     /// higher durable writer_epoch.
     auto s2 = Store::open(b, PoolConfig{
-        .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r", .root_shards = 1});
+        .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r"});
     const uint64_t e2 = s2->writerEpoch();
     EXPECT_GT(e2, e1);
 }
@@ -344,7 +344,7 @@ TEST(CasMountReadOnly, ForeignOwnedPoolOpensWithoutMutation)
 
     /// Server A claims the pool (writable): owner = uuid(1), a durable epoch + a live mount lease.
     auto a = Store::open(b, PoolConfig{
-        .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r", .root_shards = 1});
+        .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r"});
 
     /// Capture the control objects BEFORE the read-only open so we can prove it mutated nothing.
     const auto owner_before = b->get(l.ownerKey("r"));
@@ -361,7 +361,7 @@ TEST(CasMountReadOnly, ForeignOwnedPoolOpensWithoutMutation)
     EXPECT_NO_THROW(
         ro = Store::open(b, PoolConfig{
             .pool_prefix = "p", .server_id = UInt128(2), .server_root_id = "r",
-            .root_shards = 1, .read_only = true}));
+            .read_only = true}));
     EXPECT_NE(ro, nullptr);
 
     /// And it mutated nothing: owner still decodes to A's uuid, the mount body is still A's, and the
@@ -396,7 +396,7 @@ TEST(CasMountStartup, RefusesWritableOpenWithInconsistentCasRequestBudget)
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::BAD_ARGUMENTS, [&]
     {
         Store::open(b, PoolConfig{
-            .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r", .root_shards = 1,
+            .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r",
             .mount_lease_ttl_ms = std::chrono::milliseconds(30000),
             .cas_request_budget = bad_budget});
     });
@@ -416,7 +416,7 @@ TEST(CasMountStartup, StaleSelfMountReclaimedAfterWait)
     const CasRequestBudget tiny_budget{
         .attempt_timeout_ms = 50, .operation_deadline_ms = 50, .max_attempts = 1, .lease_safety_margin_ms = 50};
     auto a = Store::open(b, PoolConfig{
-        .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r", .root_shards = 1,
+        .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r",
         .mount_lease_ttl_ms = std::chrono::milliseconds(300),
         .mount_renew_period = std::chrono::milliseconds(100),
         .cas_request_budget = tiny_budget});
@@ -428,7 +428,7 @@ TEST(CasMountStartup, StaleSelfMountReclaimedAfterWait)
     StorePtr a2;
     EXPECT_NO_THROW(
         a2 = Store::open(b, PoolConfig{
-            .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r", .root_shards = 1,
+            .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r",
             .mount_lease_ttl_ms = std::chrono::milliseconds(300),
             .mount_renew_period = std::chrono::milliseconds(100),
             .cas_request_budget = tiny_budget}));

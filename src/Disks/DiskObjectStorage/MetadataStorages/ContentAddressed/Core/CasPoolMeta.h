@@ -14,7 +14,7 @@ namespace DB::Cas
 /// `_pool_meta` — the pool-identity object (spec §4). It carries the pool id minted once at
 /// creation plus the pool-wide constants every build/read must agree on. Non-hashed metadata =>
 /// STRICT JSON (encoding split, decision 2026-06-11):
-///   {"format":"cas_pool_meta","version":1,"pool_id":"<32 lowercase hex>","root_shards":8,"blob_header_len":256}
+///   {"format":"cas_pool_meta","version":1,"pool_id":"<32 lowercase hex>","blob_header_len":256}
 ///
 /// The POOL is authoritative: on reopen the constants come FROM `_pool_meta`, and the config values
 /// passed to `createOrValidate` apply only at first creation. The `pool_id` doubles as the envelope
@@ -22,7 +22,6 @@ namespace DB::Cas
 struct PoolMeta
 {
     UInt128 pool_id{};                      /// minted at creation; doubles as the envelope domain_id
-    uint64_t root_shards = 0;
     uint64_t blob_header_len = 0;
     uint64_t min_reader_generation = 0;     /// startup gate: if G_BUILD < min_reader_generation => UNKNOWN_FORMAT_VERSION
     /// CAS mixed-algo pools (Phase 3 T4, design 2026-07-11-cas-mixed-algo-pools-design.md §5):
@@ -43,10 +42,10 @@ struct PoolMeta
     /// member of `algos_used` => OK, no write; not a member and `allow_new` => CAS-union it in
     /// (read+token -> insert sorted -> casPut; re-read and retry on conflict); not a member and
     /// `!allow_new` => `BAD_ARGUMENTS` naming `<blob_hash_allow_new>` (never touches the pool). The
-    /// POOL is authoritative on reopen: `root_shards` / `blob_header_len` come FROM the pool; the
-    /// passed config values apply only at first creation.
+    /// POOL is authoritative on reopen: `blob_header_len` comes FROM the pool; the passed config
+    /// value applies only at first creation.
     static PoolMeta createOrValidate(
-        Backend &, const Layout &, uint64_t root_shards, uint64_t blob_header_len,
+        Backend &, const Layout &, uint64_t blob_header_len,
         BlobHashAlgo blob_hash_algo = BlobHashAlgo::CityHash128, bool allow_new = false);
 };
 

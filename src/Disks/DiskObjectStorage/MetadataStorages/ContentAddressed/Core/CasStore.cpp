@@ -253,7 +253,7 @@ StorePtr Store::open(BackendPtr backend, PoolConfig config)
         }
     }
     PoolMeta meta = PoolMeta::createOrValidate(
-        *backend, layout, config.root_shards, config.blob_header_len, config.blob_hash_algo, config.blob_hash_allow_new);
+        *backend, layout, config.blob_header_len, config.blob_hash_algo, config.blob_hash_allow_new);
     const BlobHashAlgo write_algo = config.blob_hash_algo;   /// `config` is moved-from just below
 
     /// Private ctor: make_shared cannot reach it.

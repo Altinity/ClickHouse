@@ -635,7 +635,6 @@ std::shared_ptr<DB::ContentAddressedMetadataStorage> makeS3StagingMetadataStorag
         /*context_=*/nullptr,
         /*gc_enabled_=*/true,
         /*gc_interval_=*/std::chrono::seconds(60),
-        /*root_shards_=*/8,
         /*disk_name_=*/std::string{},
         /*dedup_cache_bytes_=*/64ULL << 20,
         /*dedup_head_first_min_bytes_=*/1ULL << 20,

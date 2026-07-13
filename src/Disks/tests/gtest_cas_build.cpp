@@ -1550,13 +1550,11 @@ TEST(CasBuild, ConvergesUnderProductiveGc)
     auto b = std::make_shared<InMemoryBackend>();
     const RootNamespace ns{"srv1/tbl"};
 
-    /// root_shards=1 keeps the build-root precommit and the table ref in one shard (single-shard fold).
     PoolConfig cfg;
     cfg.pool_prefix = "p";
     cfg.server_root_id = "test";
     cfg.server_id = UInt128(0xAB);
     cfg.background_watermark = false;
-    cfg.root_shards = 1;
     const String content = "shared-content";
 
     /// 1. Build A creates H ("shared-content"), publishes a part referencing it, then drops the ref.

@@ -66,7 +66,6 @@ public:
         ContextPtr context_ = nullptr,
         bool gc_enabled_ = true,
         std::chrono::seconds gc_interval_ = std::chrono::seconds(60),
-        uint64_t root_shards_ = 8,
         String disk_name_ = {},
         uint64_t dedup_cache_bytes_ = 64ULL << 20,
         uint64_t dedup_head_first_min_bytes_ = 1ULL << 20,
@@ -280,7 +279,6 @@ private:
 
     const bool gc_enabled;
     const std::chrono::seconds gc_interval;
-    const uint64_t root_shards;   /// creation-time shard fanout (#4); applied in startup()'s Store::open
     const uint64_t dedup_cache_bytes;            /// P1 known-present cache byte cap (0=off)
     const uint64_t dedup_head_first_min_bytes;   /// P2 HEAD-before-PUT size threshold (0=off)
     const uint64_t gc_snap_generations_to_keep;  /// B174 gc/snap retention (0=keep all)

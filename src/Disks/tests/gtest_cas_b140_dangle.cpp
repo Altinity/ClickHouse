@@ -15,12 +15,11 @@ using DB::Cas::tests::u128Of;
 namespace
 {
 
-/// root_shards=1 so both refs live in the single root shard 0 — the dangle is about the SINGLE
-/// snap shard's in-degree, and one cursor_key covers both refs.
+/// The dangle is about the SINGLE snap shard's in-degree, and one cursor_key covers both refs.
 StorePtr openTestStore(std::shared_ptr<InMemoryBackend> & out_backend)
 {
     out_backend = std::make_shared<InMemoryBackend>();
-    return Store::open(out_backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1});
+    return Store::open(out_backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
 }
 
 size_t runGcToFixpoint(Gc & gc, size_t max_rounds = 64)

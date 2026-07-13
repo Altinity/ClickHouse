@@ -78,13 +78,11 @@ TEST(CasPluggableHash, PoolMetaRoundTripsAlgosUsed)
 {
     PoolMeta pm;
     pm.pool_id = u128Of("pool-a");
-    pm.root_shards = 8;
     pm.blob_header_len = 256;
     pm.algos_used = {static_cast<uint8_t>(BlobHashAlgo::CityHash128), static_cast<uint8_t>(BlobHashAlgo::XXH3_128)};
 
     const PoolMeta back = decodePoolMeta(encodePoolMeta(pm));
     EXPECT_EQ(back.algos_used, pm.algos_used);
-    EXPECT_EQ(back.root_shards, 8u);
     EXPECT_EQ(back.blob_header_len, 256u);
 }
 
@@ -93,11 +91,11 @@ TEST(CasPluggableHash, CreateOrValidateRecordsConfigAlgoOnFreshPool)
     auto backend = std::make_shared<InMemoryBackend>();
     const Layout layout("p");
 
-    const PoolMeta pm = PoolMeta::createOrValidate(*backend, layout, /*root_shards*/ 4, /*blob_header_len*/ 256, BlobHashAlgo::XXH3_128);
+    const PoolMeta pm = PoolMeta::createOrValidate(*backend, layout, /*blob_header_len*/ 256, BlobHashAlgo::XXH3_128);
     EXPECT_EQ(pm.algos_used, (std::vector<uint8_t>{static_cast<uint8_t>(BlobHashAlgo::XXH3_128)}));
 
     /// Reopening with the SAME algo is a no-op reopen: the recorded value comes back unchanged.
-    const PoolMeta reopened = PoolMeta::createOrValidate(*backend, layout, 4, 256, BlobHashAlgo::XXH3_128);
+    const PoolMeta reopened = PoolMeta::createOrValidate(*backend, layout, 256, BlobHashAlgo::XXH3_128);
     EXPECT_EQ(reopened.algos_used, (std::vector<uint8_t>{static_cast<uint8_t>(BlobHashAlgo::XXH3_128)}));
     EXPECT_EQ(reopened.pool_id, pm.pool_id);
 }
@@ -107,7 +105,7 @@ TEST(CasPluggableHash, CreateOrValidateDefaultsToCityHash128)
     auto backend = std::make_shared<InMemoryBackend>();
     const Layout layout("p");
 
-    const PoolMeta pm = PoolMeta::createOrValidate(*backend, layout, 4, 256, BlobHashAlgo::CityHash128);
+    const PoolMeta pm = PoolMeta::createOrValidate(*backend, layout, 256, BlobHashAlgo::CityHash128);
     EXPECT_EQ(pm.algos_used, (std::vector<uint8_t>{static_cast<uint8_t>(BlobHashAlgo::CityHash128)}));
 }
 
@@ -120,16 +118,16 @@ TEST(CasPluggableHash, CreateOrValidateFailsClosedOnAlgoMismatchWithoutFlag)
     auto backend = std::make_shared<InMemoryBackend>();
     const Layout layout("p");
 
-    PoolMeta::createOrValidate(*backend, layout, 4, 256, BlobHashAlgo::CityHash128);
+    PoolMeta::createOrValidate(*backend, layout, 256, BlobHashAlgo::CityHash128);
 
     expectThrowsCode(DB::ErrorCodes::BAD_ARGUMENTS, [&]
     {
-        PoolMeta::createOrValidate(*backend, layout, 4, 256, BlobHashAlgo::XXH3_128, /*allow_new*/ false);
+        PoolMeta::createOrValidate(*backend, layout, 256, BlobHashAlgo::XXH3_128, /*allow_new*/ false);
     });
 
     /// The pool is untouched by the refused reopen: a subsequent open with the ORIGINAL algo still
     /// succeeds and returns the same pool_id.
-    const PoolMeta reopened = PoolMeta::createOrValidate(*backend, layout, 4, 256, BlobHashAlgo::CityHash128);
+    const PoolMeta reopened = PoolMeta::createOrValidate(*backend, layout, 256, BlobHashAlgo::CityHash128);
     EXPECT_EQ(reopened.algos_used, (std::vector<uint8_t>{static_cast<uint8_t>(BlobHashAlgo::CityHash128)}));
 }
 
@@ -139,18 +137,18 @@ TEST(CasPluggableHash, AdmissionIsFlagGated)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     const Layout layout("p");
-    PoolMeta::createOrValidate(*backend, layout, 4, 256, BlobHashAlgo::CityHash128, /*allow_new*/ false);
+    PoolMeta::createOrValidate(*backend, layout, 256, BlobHashAlgo::CityHash128, /*allow_new*/ false);
 
     /// without the flag: refuse, pool untouched
     expectThrowsCode(DB::ErrorCodes::BAD_ARGUMENTS, [&]
-    { PoolMeta::createOrValidate(*backend, layout, 4, 256, BlobHashAlgo::Sha256, false); });
+    { PoolMeta::createOrValidate(*backend, layout, 256, BlobHashAlgo::Sha256, false); });
 
     /// with the flag: admitted
-    const PoolMeta admitted = PoolMeta::createOrValidate(*backend, layout, 4, 256, BlobHashAlgo::Sha256, true);
+    const PoolMeta admitted = PoolMeta::createOrValidate(*backend, layout, 256, BlobHashAlgo::Sha256, true);
     EXPECT_EQ(admitted.algos_used, (std::vector<uint8_t>{1, 3}));
 
     /// steady state: admitted algo reopens WITHOUT the flag
-    const PoolMeta steady = PoolMeta::createOrValidate(*backend, layout, 4, 256, BlobHashAlgo::Sha256, false);
+    const PoolMeta steady = PoolMeta::createOrValidate(*backend, layout, 256, BlobHashAlgo::Sha256, false);
     EXPECT_EQ(steady.algos_used, (std::vector<uint8_t>{1, 3}));
 }
 
@@ -158,10 +156,10 @@ TEST(CasPluggableHash, ConcurrentAdmissionUnions)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     const Layout layout("p");
-    PoolMeta::createOrValidate(*backend, layout, 4, 256, BlobHashAlgo::CityHash128, false);
-    PoolMeta::createOrValidate(*backend, layout, 4, 256, BlobHashAlgo::XXH3_128, true);
-    PoolMeta::createOrValidate(*backend, layout, 4, 256, BlobHashAlgo::Sha256, true);
-    const PoolMeta final_pm = PoolMeta::createOrValidate(*backend, layout, 4, 256, BlobHashAlgo::CityHash128, false);
+    PoolMeta::createOrValidate(*backend, layout, 256, BlobHashAlgo::CityHash128, false);
+    PoolMeta::createOrValidate(*backend, layout, 256, BlobHashAlgo::XXH3_128, true);
+    PoolMeta::createOrValidate(*backend, layout, 256, BlobHashAlgo::Sha256, true);
+    const PoolMeta final_pm = PoolMeta::createOrValidate(*backend, layout, 256, BlobHashAlgo::CityHash128, false);
     EXPECT_EQ(final_pm.algos_used, (std::vector<uint8_t>{1, 2, 3}));   /// union, sorted, nothing lost
 }
 
@@ -283,7 +281,7 @@ TEST(CasPluggableHash, Xxh3BlobLandsUnderAlgoSegmentAndIsDiscoveredCleanByFsck)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Store::open(backend,
-        PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "test",
                    .blob_hash_algo = BlobHashAlgo::XXH3_128});
 
     const RootNamespace ns{"srv1/tbl"};
@@ -353,7 +351,7 @@ TEST(CasPluggableHash, Sha256BlobSeenByCondemnSweepAndFsckNotSilentlySkipped)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Store::open(backend,
-        PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "test",
                    .blob_hash_algo = BlobHashAlgo::Sha256, .gc_trim_min_events = 0});
     ASSERT_EQ(blobHashLenFor(store->writeAlgo()), 32u) << "sha256 must derive a 32-byte digest width";
 
@@ -452,7 +450,7 @@ TEST(CasPluggableHash, Sha256BuildWritesFullWidthDigestAndInlineEqualsBlob)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Store::open(backend,
-        PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "test",
                    .blob_hash_algo = BlobHashAlgo::Sha256});
     ASSERT_EQ(blobHashLenFor(store->writeAlgo()), 32u) << "sha256 must derive a 32-byte digest width";
     const DigestCodec codec = codecFor(store->writeAlgo());
@@ -547,7 +545,7 @@ TEST(CasPluggableHash, StaleAlgoRegistryRefreshOnMiss)
 
     /// Node B opens FIRST -- its admitted-cache seeds at {ch128} only, before sha256 exists anywhere.
     auto store_b = Store::open(backend,
-        PoolConfig{.pool_prefix = "p", .server_root_id = "b", .root_shards = 1,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "b",
                    .blob_hash_algo = BlobHashAlgo::CityHash128});
     ASSERT_TRUE(store_b->isAlgoAdmitted(BlobHashAlgo::CityHash128));
     ASSERT_FALSE(store_b->isAlgoAdmitted(BlobHashAlgo::Sha256));
@@ -555,7 +553,7 @@ TEST(CasPluggableHash, StaleAlgoRegistryRefreshOnMiss)
     /// Node A opens SECOND, admits sha256 via the opt-in flag, and publishes a manifest naming a
     /// sha256 blob through the real Build path (putBlob -> stageManifest -> precommitAdd -> promote).
     auto store_a = Store::open(backend,
-        PoolConfig{.pool_prefix = "p", .server_root_id = "a", .root_shards = 1,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "a",
                    .blob_hash_algo = BlobHashAlgo::Sha256, .blob_hash_allow_new = true});
     ASSERT_TRUE(store_a->isAlgoAdmitted(BlobHashAlgo::Sha256));
 
@@ -602,11 +600,11 @@ TEST(CasPluggableHash, ForeignAlgoSegmentIsDebrisNotOurs)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Store::open(backend,
-        PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "test",
                    .blob_hash_algo = BlobHashAlgo::CityHash128, .gc_trim_min_events = 0});
     /// Admit sha256 into the SAME pool from a second mount, then pull the union into `store`'s cache.
     Store::open(backend,
-        PoolConfig{.pool_prefix = "p", .server_root_id = "test2", .root_shards = 1,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "test2",
                    .blob_hash_algo = BlobHashAlgo::Sha256, .blob_hash_allow_new = true});
     store->refreshAdmittedAlgos();
     ASSERT_TRUE(store->isAlgoAdmitted(BlobHashAlgo::Sha256));
@@ -707,7 +705,7 @@ TEST(CasPluggableHash, ReaderGenerationIsRaisedToThree)
     {
         auto backend = std::make_shared<InMemoryBackend>();
         const Layout layout("p");
-        PoolMeta pm = PoolMeta::createOrValidate(*backend, layout, /*root_shards*/ 1, /*blob_header_len*/ 256, BlobHashAlgo::CityHash128);
+        PoolMeta pm = PoolMeta::createOrValidate(*backend, layout, /*blob_header_len*/ 256, BlobHashAlgo::CityHash128);
         pm.min_reader_generation = G_BUILD + 1;
         ASSERT_TRUE(backend->casPut(layout.poolMetaKey(), encodePoolMeta(pm), backend->get(layout.poolMetaKey())->token).outcome == CasOutcome::Committed);
 
@@ -722,7 +720,7 @@ TEST(CasPluggableHash, ReaderGenerationIsRaisedToThree)
     {
         auto backend = std::make_shared<InMemoryBackend>();
         const Layout layout("p");
-        PoolMeta pm = PoolMeta::createOrValidate(*backend, layout, /*root_shards*/ 1, /*blob_header_len*/ 256, BlobHashAlgo::CityHash128);
+        PoolMeta pm = PoolMeta::createOrValidate(*backend, layout, /*blob_header_len*/ 256, BlobHashAlgo::CityHash128);
         const String fresh_bytes = encodePoolMeta(pm);
 
         Proto::PoolMetaProto msg;
@@ -762,13 +760,13 @@ TEST(CasPluggableHash, TwoAlgoOrphansBothFullyReclaimed)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Store::open(backend,
-        PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "test",
                    .blob_hash_algo = BlobHashAlgo::CityHash128, .gc_trim_min_events = 0,
                    .gc_fold_max_defer_rounds = 0});
     /// Admit sha256 into the SAME pool from a second mount, then pull the union into `store`'s cache
     /// (mirrors `ForeignAlgoSegmentIsDebrisNotOurs`'s admission fixture).
     Store::open(backend,
-        PoolConfig{.pool_prefix = "p", .server_root_id = "test2", .root_shards = 1,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "test2",
                    .blob_hash_algo = BlobHashAlgo::Sha256, .blob_hash_allow_new = true});
     store->refreshAdmittedAlgos();
     ASSERT_TRUE(store->isAlgoAdmitted(BlobHashAlgo::Sha256));
@@ -848,11 +846,11 @@ TEST(CasPluggableHash, SameDigestDifferentAlgoDistinctBodiesAndSettlement)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = Store::open(backend,
-        PoolConfig{.pool_prefix = "p", .server_root_id = "test", .root_shards = 1,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "test",
                    .blob_hash_algo = BlobHashAlgo::CityHash128, .gc_trim_min_events = 0,
                    .gc_fold_max_defer_rounds = 0});
     Store::open(backend,
-        PoolConfig{.pool_prefix = "p", .server_root_id = "test2", .root_shards = 1,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "test2",
                    .blob_hash_algo = BlobHashAlgo::XXH3_128, .blob_hash_allow_new = true});
     store->refreshAdmittedAlgos();
     ASSERT_TRUE(store->isAlgoAdmitted(BlobHashAlgo::XXH3_128));

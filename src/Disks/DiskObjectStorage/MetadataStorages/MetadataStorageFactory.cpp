@@ -245,10 +245,6 @@ static void registerContentAddressedMetadataStorage(MetadataStorageFactory & fac
         const bool gc_enabled = config.getBool(config_prefix + ".gc_enabled", true);
         const auto gc_interval = std::chrono::seconds(
             config.getUInt64(config_prefix + ".gc_interval_sec", 60));
-        /// Creation-time shard fanout (#4): default 32 (matches `PoolConfig::root_shards` — the
-        /// weighed batching-vs-body-size default; see the comment there). Configurable to spread
-        /// manifest CAS writes across more keys.
-        const uint64_t root_shards = config.getUInt64(config_prefix + ".root_shards", 32);
         /// CAS pluggable-blob-hash Phase 1/2 (design 2026-07-11-cas-pluggable-blob-hash-design.md §2):
         /// `blob_hash` selects the pool's blob content-hash function; default `cityhash128` keeps
         /// today's behavior byte-for-byte unchanged. `parseBlobHashAlgo` fails closed on an unknown
@@ -308,7 +304,7 @@ static void registerContentAddressedMetadataStorage(MetadataStorageFactory & fac
         const auto staging_backend = ContentAddressedMetadataStorage::parseStagingBackend(config, config_prefix);
         auto metadata_storage = std::make_shared<ContentAddressedMetadataStorage>(
             local_object_storage, key_compatibility_prefix, toString(ServerUUID::get()), server_root_id, local_scratch_path,
-            global_context, gc_enabled, gc_interval, root_shards, name, dedup_cache_bytes, dedup_head_first_min_bytes,
+            global_context, gc_enabled, gc_interval, name, dedup_cache_bytes, dedup_head_first_min_bytes,
             gc_snap_generations_to_keep, gc_shards, manifest_sweep_list_budget_keys, manifest_sweep_delete_budget_keys,
             gcs_max_conditional_put_bytes,
             cas_part_folder_cache_bytes, cas_part_folder_cache_max_entries, cas_part_folder_cache_max_entry_bytes,

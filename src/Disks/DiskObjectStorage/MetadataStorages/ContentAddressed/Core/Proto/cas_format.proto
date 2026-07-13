@@ -51,7 +51,8 @@ message CasHeader {
 message PoolMetaProto {
   CasHeader header              = 1;  // magic=CAPM; set by encoder, checked by decoder
   bytes  pool_id                = 2;  // raw 16 bytes (UInt128, big-endian); minted once at creation
-  uint64 root_shards            = 3;  // must be >= 1
+  reserved 3;                         // was root_shards; dead since Store::shardOf removal (D3), pre-release, no data to migrate
+  reserved "root_shards";
   uint64 blob_header_len        = 4;  // 8-aligned, in [96, 16384]
   uint64 min_reader_generation  = 5;  // startup gate: if G_BUILD < min_reader_generation => UNKNOWN_FORMAT_VERSION
   // CAS mixed-algo pools (Phase 3 T4, design 2026-07-11-cas-mixed-algo-pools-design.md §5): every

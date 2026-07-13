@@ -26,15 +26,13 @@ namespace Proto = ::clickhouse::cas::format;
 namespace
 {
 
-/// Pool-wide constant invariants over `root_shards`/`blob_header_len`, enforced in two contexts with
-/// different error codes:
+/// Pool-wide constant invariant over `blob_header_len`, enforced in two contexts with different
+/// error codes:
 ///   - at creation, a bad value is the CALLER's config mistake => BAD_ARGUMENTS;
-///   - on decode, a persisted object violating them is corruption => CORRUPTED_DATA.
-/// `root_shards` must be at least 1; `blob_header_len` must be 8-aligned and within [96, 16 KiB].
-void validatePoolConstants(uint64_t root_shards, uint64_t blob_header_len, int error_code, std::string_view what)
+///   - on decode, a persisted object violating it is corruption => CORRUPTED_DATA.
+/// `blob_header_len` must be 8-aligned and within [96, 16 KiB].
+void validateBlobHeaderLen(uint64_t blob_header_len, int error_code, std::string_view what)
 {
-    if (root_shards < 1)
-        throw Exception(error_code, "CAS {}: root_shards must be >= 1, got {}", what, root_shards);
     if (blob_header_len < 96)
         throw Exception(error_code, "CAS {}: blob_header_len must be >= 96, got {}", what, blob_header_len);
     if (blob_header_len % 8 != 0)
@@ -89,7 +87,6 @@ String encodePoolMeta(const PoolMeta & pm)
     hdr->set_compatibility_version(currentCompatibilityVersion());
 
     msg.set_pool_id(u128ToBytesBE(pm.pool_id));
-    msg.set_root_shards(pm.root_shards);
     msg.set_blob_header_len(pm.blob_header_len);
     msg.set_min_reader_generation(pm.min_reader_generation);
     for (uint8_t algo : pm.algos_used)
@@ -120,13 +117,12 @@ PoolMeta decodePoolMeta(std::string_view data)
 
     PoolMeta pm;
     pm.pool_id = u128FromBytesBE(msg.pool_id(), "pool meta pool_id");
-    pm.root_shards = msg.root_shards();
     pm.blob_header_len = msg.blob_header_len();
     pm.min_reader_generation = msg.min_reader_generation();
     pm.algos_used.assign(msg.algos_used().begin(), msg.algos_used().end());
 
-    /// A persisted object violating the constant invariants is corruption, not a config error.
-    validatePoolConstants(pm.root_shards, pm.blob_header_len, ErrorCodes::CORRUPTED_DATA, "pool meta");
+    /// A persisted object violating the constant invariant is corruption, not a config error.
+    validateBlobHeaderLen(pm.blob_header_len, ErrorCodes::CORRUPTED_DATA, "pool meta");
     validateAlgosUsed(pm.algos_used, ErrorCodes::CORRUPTED_DATA, "pool meta");
 
     /// Startup gate (forward): if min_reader_generation > G_BUILD, this binary is too old to open the pool.
@@ -230,19 +226,19 @@ PoolMeta admitOrValidate(Backend & backend, const String & key, PoolMeta pm, Tok
 }
 
 PoolMeta PoolMeta::createOrValidate(
-    Backend & backend, const Layout & layout, uint64_t root_shards, uint64_t blob_header_len,
+    Backend & backend, const Layout & layout, uint64_t blob_header_len,
     BlobHashAlgo blob_hash_algo, bool allow_new)
 {
     /// The passed config is the caller's responsibility — reject bad values before any I/O.
-    validatePoolConstants(root_shards, blob_header_len, ErrorCodes::BAD_ARGUMENTS, "pool meta");
+    validateBlobHeaderLen(blob_header_len, ErrorCodes::BAD_ARGUMENTS, "pool meta");
     /// Defense against a garbage `static_cast` past the caller's own boundary: `blobHashAlgoName`
     /// throws BAD_ARGUMENTS for anything `BlobHashAlgo` does not actually admit.
     blobHashAlgoName(blob_hash_algo);
 
     const String key = layout.poolMetaKey();
 
-    /// Present => the pool is authoritative; ignore the passed config's root_shards/blob_header_len
-    /// and run the flag-gated admission check (spec §5) rather than the old single-value fail-close.
+    /// Present => the pool is authoritative; ignore the passed config's blob_header_len and run the
+    /// flag-gated admission check (spec §5) rather than the old single-value fail-close.
     if (auto existing = backend.get(key))
     {
         PoolMeta pm = decodePoolMeta(existing->bytes);
@@ -255,7 +251,6 @@ PoolMeta PoolMeta::createOrValidate(
     /// creation, not left at 0.
     PoolMeta pm;
     pm.pool_id = mintPoolId();
-    pm.root_shards = root_shards;
     pm.blob_header_len = blob_header_len;
     pm.min_reader_generation = G_BUILD;
     pm.algos_used = {static_cast<uint8_t>(blob_hash_algo)};
