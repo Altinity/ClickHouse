@@ -1485,21 +1485,14 @@ std::shared_ptr<RecordingLocalObjectStorage> makeRecordingStorageForTest(const s
 /// True for a durable ref-object write key under `/cas/refs/`. In the snapshot+log ref model the
 /// writer's first durable ref write on the precommit path is an immutable transaction-log object
 /// (`<...>/cas/refs/<namespace...>/_log/<txn-id>`); a published table snapshot is
-/// `<...>/_snap/<id>.proto`. The held Phase-E legacy shard lane may still write the mutable ref-shard
-/// key (`<...>/cas/refs/<namespace...>/<shard_number>`), so that shape is accepted too — the predicate
-/// anchors on whichever durable ref write comes first. It excludes blobs (`/blobs/`), part-manifests
-/// (`/cas/manifests/...`), GC state (`/gc/`), and verbatim files (`/_files/...`).
+/// `<...>/_snap/<id>.proto`. The predicate anchors on whichever durable ref write comes first. It
+/// excludes blobs (`/blobs/`), part-manifests (`/cas/manifests/...`), GC state (`/gc/`), and verbatim
+/// files (`/_files/...`).
 bool isRefWriteKey(const std::string & key)
 {
     if (key.find("/cas/refs/") == std::string::npos)
         return false;
-    if (key.find("/_log/") != std::string::npos || key.find("/_snap/") != std::string::npos)
-        return true;
-    const auto slash = key.rfind('/');
-    if (slash == std::string::npos || slash + 1 >= key.size())
-        return false;
-    const std::string last = key.substr(slash + 1);
-    return !last.empty() && std::all_of(last.begin(), last.end(), [](unsigned char c) { return c >= '0' && c <= '9'; });
+    return key.find("/_log/") != std::string::npos || key.find("/_snap/") != std::string::npos;
 }
 
 /// Index of the first writeObject that durably appends the create-precommit ref transaction — i.e. the

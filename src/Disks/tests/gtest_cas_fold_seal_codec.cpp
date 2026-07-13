@@ -17,7 +17,7 @@ using namespace DB::Cas;
 /// removed reclaim were deleted from `ShardCoverage` with it (T13). The still-meaningful fold-seal
 /// assertion is the round-trip of `last_folded_ref_id` -- the per-table durable ref cursor that replaced
 /// them in the same struct under the snapshot+log ref model.
-TEST(CasDanglingPrecommit, ShardCoverageRoundTripsLastFoldedRefId)
+TEST(CasFoldSealCodec, ShardCoverageRoundTripsLastFoldedRefId)
 {
     CasFoldSeal seal;
     seal.generation = 3;
