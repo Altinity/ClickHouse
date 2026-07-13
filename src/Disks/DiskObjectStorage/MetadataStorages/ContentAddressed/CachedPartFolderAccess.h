@@ -36,6 +36,10 @@ public:
                                              /// the DISK default is 64 MiB, set in the factory)
         uint64_t max_entries = 10000;
         uint64_t max_entry_bytes = 16ULL << 20;
+        /// The explain decision journal (spec §Observability) is test/log-only and its recordDecision
+        /// path takes a per-disk global mutex and allocates on EVERY read. Off by default so the read
+        /// hit path never pays for it; the disk factory / tests turn it on when they consult explain().
+        bool explain_enabled = false;
     };
 
     /// NOTE: `CacheParams params_ = {}` cannot be a default ARGUMENT here — Clang's complete-class-
@@ -96,6 +100,8 @@ public:
     /// Test/log-only decision journal; absent key => default ExplainResult.
     ExplainResult explain(const PartRefKey & key) const;
     void clearForTest();
+    /// Test-only: number of entries in the decision journal (0 whenever explain is disabled).
+    size_t explainJournalSizeForTest() const;
 
 private:
     Cas::StorePtr store;
@@ -124,7 +130,7 @@ private:
     static constexpr size_t EXPLAIN_MAX_ENTRIES = 10000;
     mutable std::mutex explain_mutex;
     mutable std::unordered_map<String, ExplainResult> explain_map;
-    void recordDecision(const PartRefKey & key, LastDecision decision,
+    void recordDecision(const String & cache_key, LastDecision decision,
                         const PartFolderView * view, bool retained) const;
 };
 

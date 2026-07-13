@@ -53,19 +53,22 @@ CachedPartFolderAccess::getView(const PartRefKey & key, Freshness freshness) con
     if (!resolved)
         return nullptr;
 
+    /// One cache-key materialization per getView (B2): reused by the retained get/set and the journal.
+    const String cache_key = key.cacheKey();
+
     /// Step 2: retained views serve ONLY CachedForLoad. ForceFresh must re-prove the manifest BODY
     /// (a fresh ref resolve proves ref currency, not body existence — review 2026-07-08);
     /// StrictValidate bypasses retention entirely.
     if (freshness == Freshness::CachedForLoad && view_cache)
     {
-        if (auto cached = view_cache->get(key.cacheKey()))
+        if (auto cached = view_cache->get(cache_key))
         {
             if (cached->manifestId() == resolved->manifest_id)
             {
                 if (cached->mutableFiles() == resolved->mutable_files)
                 {
                     ProfileEvents::increment(ProfileEvents::CasPartFolderViewHits);
-                    recordDecision(key, LastDecision::Hit, cached.get(), /*retained=*/true);
+                    recordDecision(cache_key, LastDecision::Hit, cached.get(), /*retained=*/true);
                     return cached;
                 }
                 /// 2b: manifest unchanged, mutable-only drift (txn_version bumps) — clone around
@@ -74,9 +77,9 @@ CachedPartFolderAccess::getView(const PartRefKey & key, Freshness freshness) con
                     key, resolved->manifest_id, resolved->manifest_size,
                     resolved->published_at_ms, resolved->mutable_files, cached->manifest());
                 if (refreshed->estimatedBytes() <= params.max_entry_bytes)
-                    view_cache->set(key.cacheKey(), refreshed);
+                    view_cache->set(cache_key, refreshed);
                 ProfileEvents::increment(ProfileEvents::CasPartFolderViewMutableRefreshes);
-                recordDecision(key, LastDecision::MutableRefresh, refreshed.get(), /*retained=*/true);
+                recordDecision(cache_key, LastDecision::MutableRefresh, refreshed.get(), /*retained=*/true);
                 return refreshed;
             }
             ProfileEvents::increment(ProfileEvents::CasPartFolderViewValidationMismatches);
@@ -99,7 +102,7 @@ CachedPartFolderAccess::getView(const PartRefKey & key, Freshness freshness) con
         if (view->estimatedBytes() <= params.max_entry_bytes)
         {
             /// CacheBase stores mutable pointers; views are logically const (never mutated).
-            view_cache->set(key.cacheKey(), std::const_pointer_cast<PartFolderView>(view));
+            view_cache->set(cache_key, std::const_pointer_cast<PartFolderView>(view));
             retained = true;
         }
         else
@@ -109,7 +112,7 @@ CachedPartFolderAccess::getView(const PartRefKey & key, Freshness freshness) con
         }
     }
     ProfileEvents::increment(ProfileEvents::CasPartFolderViewMisses);
-    recordDecision(key,
+    recordDecision(cache_key,
         freshness == Freshness::CachedForLoad ? (oversized ? LastDecision::OversizedBypass : LastDecision::Miss)
         : freshness == Freshness::ForceFresh  ? LastDecision::ForceFreshRead
                                               : LastDecision::StrictBypass,
@@ -161,10 +164,11 @@ std::shared_ptr<const PartFolderView> CachedPartFolderAccess::buildView(
 
 void CachedPartFolderAccess::eraseView(const PartRefKey & key)
 {
+    const String cache_key = key.cacheKey();
     if (view_cache)
-        view_cache->remove(key.cacheKey());
+        view_cache->remove(cache_key);
     ProfileEvents::increment(ProfileEvents::CasPartFolderViewInvalidations);
-    recordDecision(key, LastDecision::Invalidated, nullptr, /*retained=*/false);
+    recordDecision(cache_key, LastDecision::Invalidated, nullptr, /*retained=*/false);
 }
 
 std::optional<Cas::Resolved>
@@ -316,13 +320,15 @@ void CachedPartFolderAccess::dropNamespace(const Cas::RootNamespace & ns)
     ProfileEvents::increment(ProfileEvents::CasPartFolderViewInvalidations);
 }
 
-void CachedPartFolderAccess::recordDecision(const PartRefKey & key, LastDecision decision,
+void CachedPartFolderAccess::recordDecision(const String & cache_key, LastDecision decision,
                                             const PartFolderView * view, bool retained) const
 {
+    if (!params.explain_enabled)
+        return;   /// B2: the hit path pays neither the per-disk mutex nor a journal allocation.
     std::lock_guard lock(explain_mutex);
     if (explain_map.size() >= EXPLAIN_MAX_ENTRIES)
         explain_map.clear();
-    auto & e = explain_map[key.cacheKey()];
+    auto & e = explain_map[cache_key];
     e.last_decision = decision;
     e.retained = retained;
     if (view)
@@ -330,6 +336,12 @@ void CachedPartFolderAccess::recordDecision(const PartRefKey & key, LastDecision
         e.manifest_ref = Cas::manifestRefDebugString(view->manifestId().ref);
         e.estimated_bytes = view->estimatedBytes();
     }
+}
+
+size_t CachedPartFolderAccess::explainJournalSizeForTest() const
+{
+    std::lock_guard lock(explain_mutex);
+    return explain_map.size();
 }
 
 CachedPartFolderAccess::ExplainResult CachedPartFolderAccess::explain(const PartRefKey & key) const

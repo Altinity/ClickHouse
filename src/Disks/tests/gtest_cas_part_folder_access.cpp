@@ -51,7 +51,8 @@ Cas::ManifestId publishPart(const Cas::StorePtr & store, const Cas::RootNamespac
 
 ContentAddressed::CachedPartFolderAccess::CacheParams cacheOn()
 {
-    return {.cache_bytes = 64ULL << 20, .max_entries = 10000, .max_entry_bytes = 16ULL << 20};
+    return {.cache_bytes = 64ULL << 20, .max_entries = 10000, .max_entry_bytes = 16ULL << 20,
+            .explain_enabled = true};
 }
 
 /// Every mutating backend op throws once armed — models a correlated backend outage during the
@@ -123,6 +124,36 @@ TEST(CasPartFolderAccess, RetainedHitSkipsManifestHead)
     EXPECT_TRUE(access.explain(key).retained);
     EXPECT_EQ(access.explain(key).last_decision,
               ContentAddressed::CachedPartFolderAccess::LastDecision::Hit);
+}
+
+TEST(CasPartFolderAccess, HitPathJournalEmptyAndCheapWhenExplainDisabled)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openStoreForTest(backend);
+    const Cas::Layout layout("p");
+    const Cas::RootNamespace ns{"srv/t1"};
+    /// Retention ON, explain journal OFF (the production default): the hit path must take neither the
+    /// per-disk explain mutex nor write a journal entry (B2).
+    ContentAddressed::CachedPartFolderAccess access(store,
+        {.cache_bytes = 64ULL << 20, .max_entries = 10000, .max_entry_bytes = 16ULL << 20,
+         .explain_enabled = false});
+    const auto id = publishPart(store, ns, "part_1", {inlineEntry("checksums.txt", "cs")});
+    const ContentAddressed::PartRefKey key{ns, "part_1"};
+    const String manifest_key = layout.manifestKey(id);
+
+    backend->resetCounts();
+    for (int i = 0; i < 5; ++i)
+        ASSERT_NE(access.getView(key, ContentAddressed::Freshness::CachedForLoad), nullptr);
+
+    /// Same request oracle as RetainedHitSkipsManifestHead — one cold build, then validated hits.
+    EXPECT_EQ(backend->getCount(manifest_key), 1u);
+    EXPECT_EQ(backend->headCount(manifest_key), 1u);
+    /// The journal is never written when disabled.
+    EXPECT_EQ(access.explainJournalSizeForTest(), 0u);
+    /// explain() still reports live retention truthfully, but the decision defaults to Miss (unwritten).
+    EXPECT_TRUE(access.explain(key).retained);
+    EXPECT_EQ(access.explain(key).last_decision,
+              ContentAddressed::CachedPartFolderAccess::LastDecision::Miss);
 }
 
 TEST(CasPartFolderAccess, GetViewServesCommittedFolder)
@@ -248,7 +279,7 @@ TEST(CasPartFolderAccess, ExplainRecordsDecisions)
     auto backend = std::make_shared<CountingBackend>();
     auto store = openStoreForTest(backend);
     const Cas::RootNamespace ns{"srv/t1"};
-    ContentAddressed::CachedPartFolderAccess access(store);
+    ContentAddressed::CachedPartFolderAccess access(store, {.explain_enabled = true});
     publishPart(store, ns, "part_1", {inlineEntry("checksums.txt", "cs")});
     const ContentAddressed::PartRefKey key{ns, "part_1"};
 
@@ -430,7 +461,8 @@ TEST(CasPartFolderAccess, OversizedViewServedNotRetained)
     /// max_entry_bytes = 1: every real view (>= the 256-byte fixed overhead alone) is oversized.
     ContentAddressed::CachedPartFolderAccess access(store,
         ContentAddressed::CachedPartFolderAccess::CacheParams{
-            .cache_bytes = 64ULL << 20, .max_entries = 10000, .max_entry_bytes = 1});
+            .cache_bytes = 64ULL << 20, .max_entries = 10000, .max_entry_bytes = 1,
+            .explain_enabled = true});
     const auto id = publishPart(store, ns, "part_1", {inlineEntry("f", "x")});
     const ContentAddressed::PartRefKey key{ns, "part_1"};
     const String manifest_key = layout.manifestKey(id);
