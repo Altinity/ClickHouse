@@ -459,17 +459,6 @@ public:
         return prefix + "/_pool_meta";
     }
 
-    /// The precommit namespace (B171): `<server-hex>/_precommits`, one shard per in-flight build keyed by
-    /// `build_seq`. A precommit publishes the build's manifest tree as a ref in that shard, so GC's
-    /// fold lifts the in-degree of every reachable object — replacing the revocable `cas_owner` hint.
-    /// It is an ordinary namespace key-wise (its ref-object keys build unchanged); only behavioral branches
-    /// (fold pending-tolerance, precommit reclaim) key off `isPrecommitNamespace`. Recognized by its
-    /// LAST segment being `_precommits` (Phase 6: relocated under the server's `roots/<server-hex>/`).
-    static bool isPrecommitNamespace(const RootNamespace & ns)
-    {
-        return ns.string().ends_with("/_precommits");
-    }
-
     /// Public validator for a namespace reconstructed from an untrusted listed key (GC ref intake):
     /// `parseRefObjectKey` returns the namespace without checking its shape, so a
     /// consumer that will act on it must re-validate. Throws BAD_ARGUMENTS on a malformed namespace,
@@ -501,12 +490,6 @@ private:
             if (segment == "_manifests")
                 throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
                     "CasLayout: namespace '{}' uses the reserved segment '_manifests'", s);
-            /// Reserved for the precommit namespace (B171: `<server-hex>/_precommits`). A user namespace
-            /// must not use the `_precommits` segment, but the precommit namespace itself is legal — it is
-            /// exactly `<server-hex>/_precommits`, recognized by `isPrecommitNamespace`.
-            if (segment == "_precommits" && !isPrecommitNamespace(ns))
-                throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
-                    "CasLayout: namespace '{}' uses the reserved segment '_precommits'", s);
             if (end == String::npos)
                 break;
             start = end + 1;

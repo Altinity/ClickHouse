@@ -19,7 +19,6 @@ namespace DB::Cas
 ///   <prefix>/blobs/..        → Blob
 ///   <prefix>/cas/manifests/.. → Manifest
 ///   <prefix>/roots/<server-hex>/_watermark     → Server  (checked before the generic /roots/)
-///   <prefix>/roots/<server-hex>/_precommits/.. → Server  (checked before the generic /roots/)
 ///   <prefix>/roots/..        → Root  (incl. /roots/<ns>/_files/ and mountpoint objects)
 ///   <prefix>/gc/..           → Gc
 ///   else (e.g. _pool_meta, _probe) → Other
