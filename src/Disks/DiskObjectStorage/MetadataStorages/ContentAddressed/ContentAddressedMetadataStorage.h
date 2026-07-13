@@ -125,7 +125,9 @@ public:
     Cas::RebuildReport runGcRebuildNow(bool force);
 
     /// Per-disk GC health for system.content_addressed_mounts (B3). nullopt when no GC scheduler runs
-    /// on this disk (GC disabled, read-only, or not started). Reads gc_scheduler under A7's mutex.
+    /// on this disk (GC disabled, read-only, or not started). Holds gc_scheduler_mutex for the whole
+    /// call, which serializes it against shutdown()'s gc_scheduler.reset() under the same mutex -- an
+    /// unprivileged SELECT on the system table can otherwise race a dangling scheduler mid-teardown.
     std::optional<ContentAddressed::CasGcScheduler::GcHealth> gcHealth() const;
 
     MetadataStorageType getType() const override { return MetadataStorageType::ContentAddressed; }
@@ -364,8 +366,12 @@ private:
     std::unique_ptr<ContentAddressed::CasGcScheduler> gc_scheduler;
     /// Guards the lazy `gc_scheduler` creation in `runOneGcRoundForTest`/`runGarbageCollectionRoundNow`
     /// against a racing manual `SYSTEM ... GC` on another query thread; the round itself runs OUTSIDE
-    /// this lock (CasGcScheduler::runOneRoundNow has its own gc_round_mutex for that). `mutable`: also
-    /// taken by the const `gcHealth()` accessor (B3), which only reads `gc_scheduler`.
+    /// this lock (CasGcScheduler::runOneRoundNow has its own gc_round_mutex for that). Also taken around
+    /// `shutdown()`'s `gc_scheduler.reset()` (NOT its `stop()`) and, `mutable`, for the FULL duration of
+    /// the const `gcHealth()` accessor (B3) -- together these two make an unprivileged SELECT on
+    /// system.content_addressed_mounts race-free against a concurrent disk shutdown. The lazy-creation
+    /// call sites do NOT re-check for a post-shutdown state, so they can still resurrect a scheduler
+    /// after `shutdown()` has run (pre-existing, out of scope here).
     mutable std::mutex gc_scheduler_mutex;
     /// Derived from object_storage->isReadOnly() at startup (the disk's <readonly> config). When set:
     /// the probe is skipped, no watermark, no GC scheduler, and the mutating surface fails closed.

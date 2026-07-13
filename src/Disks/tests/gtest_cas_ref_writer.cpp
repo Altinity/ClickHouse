@@ -639,6 +639,47 @@ TEST(RefWriterAppendLane, WedgedAppendObservedDurableAppliesBeforeNextId)
     EXPECT_FALSE(store->resolveRef(ns, "y").has_value()) << "the next mutation committed normally afterward";
 }
 
+/// B3: `Store::wedgedRefLaneCount()` (the accessor `CasGcScheduler::gcHealth()` reads for
+/// `system.content_addressed_mounts.wedged_namespace_count`) must count EXACTLY the tables with a live
+/// wedge -- neither a cached-but-healthy table nor an unrelated table's own successful mutation may move
+/// it, and it must track the wedge's full lifecycle (0 -> 1 -> 0), not just a one-shot snapshot.
+TEST(RefWriterAppendLane, WedgedRefLaneCountTracksExactlyTheWedgedTableThroughItsLifecycle)
+{
+    CasRequestBudget budget;
+    budget.max_attempts = 1;
+    budget.attempt_timeout_ms = 100;
+    budget.operation_deadline_ms = 100;
+    budget.lease_safety_margin_ms = 100;
+
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openStore(backend, budget);
+    const Layout & layout = store->layout();
+    const RootNamespace ns_a{"srv1/wedge_count_a"};
+    const RootNamespace ns_b{"srv1/wedge_count_b"};
+    publishEmptyPart(store, ns_a, "x");
+    publishEmptyPart(store, ns_a, "y");
+    publishEmptyPart(store, ns_b, "p");
+    ASSERT_EQ(store->wedgedRefLaneCount(), 0u) << "both tables cached and healthy before the fault";
+
+    backend->fault_key_substr = layout.refsNamespacePrefix(ns_a) + "_log/";
+    backend->fault_count = 1;
+
+    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { store->dropRef(ns_a, "x"); });
+    ASSERT_TRUE(store->refLaneWedgedForTest(ns_a));
+    EXPECT_EQ(store->wedgedRefLaneCount(), 1u);
+
+    /// ns_b's own mutation succeeds and must not be swept into the count.
+    EXPECT_NO_THROW(store->dropRef(ns_b, "p"));
+    EXPECT_EQ(store->wedgedRefLaneCount(), 1u) << "an unrelated table's successful mutation must not move the count";
+
+    /// The earlier request eventually lands server-side; resolving ns_a's wedge on its next mutation
+    /// drops the count back to zero.
+    backend->materializePendingDelayedWrite();
+    EXPECT_NO_THROW(store->dropRef(ns_a, "y"));
+    EXPECT_FALSE(store->refLaneWedgedForTest(ns_a));
+    EXPECT_EQ(store->wedgedRefLaneCount(), 0u);
+}
+
 /// ===================================================================================
 /// I1: a CORRUPTED_DATA from the retry controller (resolve-before-reissue observed a DIFFERENT object at
 /// the exact key) must be surfaced LOUDLY to the caller and never hang the table's append queue. The

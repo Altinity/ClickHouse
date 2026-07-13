@@ -208,7 +208,12 @@ void ContentAddressedMetadataStorage::runOneGcRoundForTest()
 
 std::optional<ContentAddressed::CasGcScheduler::GcHealth> ContentAddressedMetadataStorage::gcHealth() const
 {
-    std::lock_guard lock(gc_scheduler_mutex);   /// A7
+    /// Holds gc_scheduler_mutex for the WHOLE call (unlike runOneGcRoundForTest/runGarbageCollectionRoundNow,
+    /// which only borrow the lock to snapshot the raw pointer before releasing it): this is what lets it
+    /// serialize against shutdown()'s gc_scheduler.reset() under the same mutex, so a concurrent SELECT on
+    /// system.content_addressed_mounts either completes against a live scheduler or observes null -> zeros,
+    /// never a dangling scheduler mid-teardown.
+    std::lock_guard lock(gc_scheduler_mutex);
     if (!gc_scheduler)
         return std::nullopt;
     return gc_scheduler->gcHealth();
@@ -496,7 +501,14 @@ void ContentAddressedMetadataStorage::shutdown()
 {
     if (gc_scheduler)
     {
+        /// stop() joins the background threads and takes no lock of its own (loop()/heartbeatLoop()
+        /// never touch gc_scheduler_mutex) -- safe to run unlocked. The destructive step is
+        /// gc_scheduler.reset(): B3's gcHealth() (reachable from an unprivileged SELECT on
+        /// system.content_addressed_mounts, unlike the admin-only GC commands) dereferences the raw
+        /// scheduler pointer under gc_scheduler_mutex, so the reset must serialize against it under the
+        /// SAME mutex or a concurrent gcHealth() call races a use-after-free on the scheduler object.
         gc_scheduler->stop();
+        std::lock_guard lock(gc_scheduler_mutex);
         gc_scheduler.reset();
     }
     part_access.reset();
