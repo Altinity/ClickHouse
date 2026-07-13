@@ -189,6 +189,32 @@ TEST(CaPartPathParser, MutablePerPartFiles)
     EXPECT_FALSE(isMutablePerPartFile("uuid.txt2"));
 }
 
+TEST(CaPartPathParser, RawPathSplitMemoizedAcrossClassifiers)
+{
+    // The CA read path runs isPartFilePath then parsePartFilePath on the SAME raw path several times
+    // per logical file-open (existsFile -> getFileSize -> getStorageObjects). The split is a pure
+    // function of the path, so all of those must split the path exactly ONCE (B1).
+    resetSplitCacheForTest();
+    const std::string path = "store/uui/uuid-1/all_1_1_0/columns.txt";
+    EXPECT_TRUE(isPartFilePath(path));
+    ASSERT_TRUE(parsePartFilePath(path).has_value());
+    ASSERT_TRUE(parsePartFilePath(path).has_value());
+    EXPECT_EQ(splitCacheMissesForTest(), 1u) << "the same raw path must be split only once";
+
+    // A distinct raw path is a fresh split (miss #2); repeats of it reuse the memo.
+    const std::string other = "store/uui/uuid-2/all_1_1_0/data.bin";
+    EXPECT_TRUE(isPartFilePath(other));
+    EXPECT_TRUE(isPartFilePath(other));
+    EXPECT_EQ(splitCacheMissesForTest(), 2u);
+
+    // Correctness is unchanged: the memoized parse yields the same fields the direct parse would.
+    const auto parsed = parsePartFilePath(path);
+    ASSERT_TRUE(parsed.has_value());
+    EXPECT_EQ(parsed->table_uuid, "uuid-1");
+    EXPECT_EQ(parsed->part_name, "all_1_1_0");
+    EXPECT_EQ(parsed->file, "columns.txt");
+}
+
 /// ==== M-W Task 2: the read side over Cas::Store ====
 /// Fixture: publish parts through the CORE API, then read through the IMetadataStorage surface of
 /// the rewritten ContentAddressedMetadataStorage (real ctor over a Local object storage; the

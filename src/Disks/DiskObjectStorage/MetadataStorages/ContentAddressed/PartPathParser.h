@@ -129,4 +129,8 @@ std::optional<TableFilePath> parseTableFilePath(const std::string & path);
 /// live-table branches (a shadow table dir also satisfies parseTableUuid).
 bool isShadowPath(const std::string & path);
 
+/// Test/observability (B1): underlying `splitNonEmpty` invocations on THIS thread.
+size_t splitCacheMissesForTest();
+void resetSplitCacheForTest();
+
 }

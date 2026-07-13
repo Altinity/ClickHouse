@@ -1,4 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartPathParser.h>
+#include <utility>
 
 namespace DB::ContentAddressed
 {
@@ -12,7 +13,7 @@ static std::vector<std::string> splitNonEmpty(const std::string & path)
         if (c == '/')
         {
             if (!cur.empty())
-                parts.push_back(cur);
+                parts.push_back(std::move(cur));
             cur.clear();
         }
         else
@@ -21,8 +22,52 @@ static std::vector<std::string> splitNonEmpty(const std::string & path)
         }
     }
     if (!cur.empty())
-        parts.push_back(cur);
+        parts.push_back(std::move(cur));
     return parts;
+}
+
+namespace
+{
+
+/// The split of a disk-relative path into non-empty components is the dominant allocation of every
+/// path classifier, and the CA metadata read path runs SEVERAL of them on the SAME raw path per
+/// logical file-open (each of `existsFile` / `getFileSize` / `getStorageObjects` first calls
+/// `isPartFilePath`, then `parsePartFilePath`). The split is a PURE function of the path, so a small
+/// thread-local most-recently-used cache keyed on the raw path is always correct, disk-agnostic and
+/// lock-free. The returned reference stays valid until the next `splitCached` call on the SAME
+/// thread; every classifier consumes its split before splitting again (none splits while holding
+/// another's split).
+struct SplitCache
+{
+    static constexpr size_t kCapacity = 8;
+    std::array<std::pair<std::string, std::vector<std::string>>, kCapacity> slots;
+    size_t count = 0;  /// populated slots (<= kCapacity)
+    size_t next = 0;   /// round-robin insertion cursor
+    size_t misses = 0; /// underlying `splitNonEmpty` invocations (observability / test oracle)
+
+    const std::vector<std::string> & get(const std::string & path)
+    {
+        for (size_t i = 0; i < count; ++i)
+            if (slots[i].first == path)
+                return slots[i].second;
+        ++misses;
+        auto & slot = slots[next];
+        slot.first = path;
+        slot.second = splitNonEmpty(path);
+        next = (next + 1) % kCapacity;
+        if (count < kCapacity)
+            ++count;
+        return slot.second;
+    }
+};
+
+thread_local SplitCache tls_split_cache;
+
+const std::vector<std::string> & splitCached(const std::string & path)
+{
+    return tls_split_cache.get(path);
+}
+
 }
 
 // Locate the <uuid[:3]>/<uuid> anchor inside a split path. ClickHouse table data paths on an Atomic
@@ -160,9 +205,20 @@ static std::string joinTableId(const std::vector<std::string> & p, size_t start,
     return id;
 }
 
+/// Test/observability (B1): underlying `splitNonEmpty` invocations on THIS thread.
+size_t splitCacheMissesForTest()
+{
+    return tls_split_cache.misses;
+}
+
+void resetSplitCacheForTest()
+{
+    tls_split_cache = SplitCache{};
+}
+
 std::optional<PartFilePath> parsePartFilePath(const std::string & path)
 {
-    auto p = splitNonEmpty(path);
+    const auto & p = splitCached(path);
     auto anchor = findPartDirComponent(p);
     if (!anchor)
         return std::nullopt;
@@ -191,7 +247,7 @@ std::optional<PartFilePath> parsePartFilePath(const std::string & path)
 
 std::optional<std::string> parseTableUuid(const std::string & path)
 {
-    auto p = splitNonEmpty(path);
+    const auto & p = splitCached(path);
 
     // Atomic layout: exactly the table dir <prefix...>/<uuid[:3]>/<uuid>[/] — nothing after the uuid.
     if (auto uuid_idx = findTableUuidComponent(p); uuid_idx && *uuid_idx + 1 == p.size())
@@ -214,13 +270,13 @@ bool isAtomicShardDir(const std::string & path)
     // uuid-prefix component, with nothing after it. This is ambiguous with the non-Atomic
     // data/<db> fallback (both are two non-part components with no uuid anchor), so the router uses
     // this strict predicate to disambiguate before parseTableUuid.
-    auto p = splitNonEmpty(path);
+    const auto & p = splitCached(path);
     return p.size() == 2 && p[0] == "store" && p[1].size() == 3;
 }
 
 bool endsWithTableUuidPair(const std::string & path)
 {
-    auto p = splitNonEmpty(path);
+    const auto & p = splitCached(path);
     auto uuid_idx = findTableUuidComponent(p);
     return uuid_idx && *uuid_idx + 1 == p.size();
 }
@@ -229,14 +285,14 @@ bool isPartFilePath(const std::string & path)
 {
     // A file inside a part dir: <table_path...>/<part>/<file> => at least one component after the
     // part dir, for both the Atomic and non-Atomic layouts.
-    auto p = splitNonEmpty(path);
+    const auto & p = splitCached(path);
     auto anchor = findPartDirComponent(p);
     return anchor && anchor->part_idx + 1 < p.size();
 }
 
 std::optional<TableFilePath> parseTableFilePath(const std::string & path)
 {
-    auto p = splitNonEmpty(path);
+    const auto & p = splitCached(path);
 
     // Atomic layout: a table-level file lives under the table dir, i.e. at least one component
     // after the uuid. The tail is EVERYTHING after the uuid joined by '/', so a table-level file in
