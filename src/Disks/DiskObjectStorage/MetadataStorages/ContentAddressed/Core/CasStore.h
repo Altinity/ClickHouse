@@ -713,8 +713,11 @@ private:
     /// The CAS-owned retry controller (Task 5) this Store's ref-log writer path uses for every
     /// conditional log/snapshot `PUT` and uncertain-result resolution. Also shared (via the Build
     /// friendship) by `Build::stageManifest`'s part-manifest body `PUT` (chaos-tolerance-report
-    /// §Task B) — the controller is stateless per call (immutable budget/clock), so concurrent lanes
-    /// and builds use the one instance safely.
+    /// §Task B) and by `Build::uploadFromSource`'s blob-body create — both the streaming
+    /// `putIfAbsentStream` PUT and `promoteStaged`'s conditional server-side copy — via
+    /// `conditionalCreateControlled` (availfix). The controller is stateless per call (immutable
+    /// budget/clock/sleep — the sleep fn mutates only through the test-only seam, before traffic), so
+    /// concurrent lanes and builds use the one instance safely.
     std::unique_ptr<CasRequestController> ref_request_controller;
 
     /// RFC pre-attempt fence check: extends `mayMutate` with the REMAINING budget check -- an attempt

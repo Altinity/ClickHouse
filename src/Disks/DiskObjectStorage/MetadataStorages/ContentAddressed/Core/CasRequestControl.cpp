@@ -29,6 +29,7 @@ namespace DB::ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
     extern const int CORRUPTED_DATA;
+    extern const int LOGICAL_ERROR;
 }
 
 namespace DB::Cas
@@ -330,6 +331,87 @@ CasWriteOutcome CasRequestController::putIfAbsentControlled(
     }
 
     return CasWriteOutcome::Unresolved;   /// attempt budget exhausted without a definite outcome
+}
+
+CasCreateResult CasRequestController::conditionalCreateControlled(
+    std::string_view key, const std::function<PutResult()> & attempt, const std::function<bool()> & fence_ok)
+{
+    const String key_s{key};
+    const uint64_t deadline_ms = now_ms() + budget.operation_deadline_ms;
+
+    for (uint32_t attempt_no = 1; attempt_no <= budget.max_attempts; ++attempt_no)
+    {
+        /// Same pre-attempt gates as putIfAbsentControlled (RFC §required-timeout-model).
+        if (!fence_ok())
+            return {CasCreateOutcome::Unresolved, {}};
+        if (now_ms() + budget.attempt_timeout_ms > deadline_ms)
+            return {CasCreateOutcome::Unresolved, {}};
+
+        std::optional<PutResult> put;
+        try
+        {
+            put = attempt();
+        }
+        catch (const std::exception & e)
+        {
+            /// A LOGICAL_ERROR is a LOCAL invariant violation surfaced by the attempt itself (e.g.
+            /// uploadFromSource's source-size check: the replayable source streamed a different byte
+            /// count than it declared) — a caller bug, never a wire ambiguity, and reissuing would only
+            /// re-stream the same bug. Propagate unchanged: instant, loud, exactly the pre-controller
+            /// behavior (pinned by `CasBuild.PutBlobWrongSizeFailsClosed`). This deliberately DIFFERS
+            /// from `putIfAbsentControlled`'s LOGICAL_ERROR-as-Unresolved: that lane's byte-exact
+            /// resolve makes retrying any unproven error harmless, while retrying a broken SOURCE here
+            /// is pure noise. Fail-safe either way — a propagated exception is never a false Committed.
+            if (const auto * db_e = dynamic_cast<const Exception *>(&e); db_e && db_e->code() == ErrorCodes::LOGICAL_ERROR)
+                throw;
+            /// A whitelisted synchronous rejection PROVES the request was never applied: surface the
+            /// original exception — the blob lane's callers always saw the raw storage error's root
+            /// cause, and losing it behind an outcome enum here would only degrade diagnostics
+            /// (cf. stagefix-review M2). Anything else is ambiguous: fall through to the occupancy
+            /// resolve below.
+            if (classifyConditionalWriteResult(e) == CasWriteOutcome::DefiniteFailure)
+                throw;
+        }
+
+        if (put)
+        {
+            if (put->outcome == PutOutcome::PreconditionFailed)
+                return {CasCreateOutcome::Occupied, {}};
+
+            /// Done. Final fence check before reporting success (RFC §ack-and-cache-rules): a fence
+            /// lost here means the write may have landed but this call must never claim it did.
+            if (!fence_ok())
+            {
+                ProfileEvents::increment(ProfileEvents::CasConditionalWriteFenceLostPostWrite);
+                return {CasCreateOutcome::Unresolved, {}};
+            }
+            return {CasCreateOutcome::Committed, put->token};
+        }
+
+        /// Ambiguous attempt: resolve by exact-key OCCUPANCY — one HEAD, never a body GET (the body
+        /// may be multi-GB, and reading a possibly-condemned occupant would flirt with the resurrect
+        /// invariant; the key's content-address IS the identity proof, see the header contract).
+        bool occupied = false;
+        bool head_answered = true;
+        try
+        {
+            occupied = backend->head(key_s).exists;
+        }
+        catch (const std::exception &)
+        {
+            /// The HEAD itself failed: occupancy unproven either way. Reissuing is still safe — an
+            /// occupant answers the reissued If-None-Match with PreconditionFailed (-> Occupied on
+            /// the next round) — so treat exactly like "absent" and let the budget bound the loop.
+            head_answered = false;
+        }
+        if (head_answered && occupied)
+            return {CasCreateOutcome::Occupied, {}};
+
+        if (attempt_no == budget.max_attempts || !pauseBeforeReissue(attempt_no, deadline_ms, fence_ok))
+            return {CasCreateOutcome::Unresolved, {}};
+    }
+
+    return {CasCreateOutcome::Unresolved, {}};   /// attempt budget exhausted without a definite outcome
 }
 
 }

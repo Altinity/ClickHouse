@@ -474,29 +474,71 @@ void Build::uploadFromSource(ObjectKind kind, const BlobRef & ref, const String 
     /// dying object). The payload byte count is verified against `source.size` via the sink buffer's
     /// `count()` (total bytes written so far) — the streaming equivalent of the old pre-materialized
     /// size check, with no full in-memory copy. A mismatch is a LOGICAL_ERROR (a buggy/racing source).
+    ///
+    /// The whole conditional create rides the Store's shared request controller
+    /// (`conditionalCreateControlled` — availfix, chaos-tolerance-report §Task B verdict's "any other
+    /// controller-bypassing conditional-write call site"): budgeted attempts + fence-gated backoff +
+    /// exact-key OCCUPANCY resolve, replacing the old bare single attempt whose whole S3-blip tolerance
+    /// was ONE ~3s adaptive-timeout attempt. Reissue is sound for BOTH primitives: the streaming PUT
+    /// re-invokes `source.write_payload` (the REPLAYABLE source contract — a fresh re-upload, never a
+    /// GET-revive), and the server-side copy re-reads the intact staging object. Each re-stream mints a
+    /// fresh incarnation_tag (W-FRESH-TAG), so byte-exact resolve is impossible by design and the
+    /// controller resolves by occupancy instead: an occupant at this content-addressed key IS the
+    /// intended content (whether our own landed ambiguous attempt or a twin), surfaced as
+    /// PreconditionFailed so every existing gate branch below is UNCHANGED.
+    ///
+    /// The size-check LOGICAL_ERROR below stays instant and loud: `conditionalCreateControlled`
+    /// propagates a LOGICAL_ERROR from the attempt unchanged (a broken source is a caller bug reissue
+    /// would only replay — pinned by `CasBuild.PutBlobWrongSizeFailsClosed`).
     auto streamIfAbsent = [&]() -> PutResult
     {
-        /// S3-native staging promote (spec 2026-07-11-cas-s3-native-staging §5/§8): when the source
-        /// carries a server-side-copy descriptor, the write-once CREATE primitive is a conditional
-        /// server-side copy of the staging object to `key` (`If-None-Match:*`) instead of a client-side
-        /// streaming PUT. Same write-once contract (`Done` + dest-ETag token on created,
-        /// `PreconditionFailed` when `key` already exists), so every gate branch below is UNCHANGED. The
-        /// staging object IS the promote source — no envelope is streamed here. The LOCAL path (no
-        /// descriptor) is byte-for-byte unchanged.
-        if (source.server_side_copy_from)
-            return store->backend().promoteStaged(*source.server_side_copy_from, key);
+        const auto one_attempt = [&]() -> PutResult
+        {
+            /// S3-native staging promote (spec 2026-07-11-cas-s3-native-staging §5/§8): when the source
+            /// carries a server-side-copy descriptor, the write-once CREATE primitive is a conditional
+            /// server-side copy of the staging object to `key` (`If-None-Match:*`) instead of a
+            /// client-side streaming PUT. Same write-once contract (`Done` + dest-ETag token on created,
+            /// `PreconditionFailed` when `key` already exists). The staging object IS the promote source
+            /// — no envelope is streamed here.
+            if (source.server_side_copy_from)
+                return store->backend().promoteStaged(*source.server_side_copy_from, key);
 
-        /// B171: no owner metadata (protection is the precommit edge — reachability, not `cas_owner`).
-        WriteSinkPtr sink = store->backend().putIfAbsentStream(key);
-        WriteBuffer & out = sink->buffer();
-        writeString(buildHeader(), out);
-        const size_t before = out.count();
-        source.write_payload(out);
-        const size_t written = out.count() - before;
-        if (written != source.size)
-            throw Exception(ErrorCodes::LOGICAL_ERROR,
-                "uploadFromSource: source streamed {} bytes, declared {}", written, source.size);
-        return sink->finalize();
+            /// B171: no owner metadata (protection is the precommit edge — reachability, not `cas_owner`).
+            /// A throw mid-stream abandons the sink (its dtor cancels): nothing is ever published by a
+            /// failed attempt except via the storage's own late-landing ambiguity, which the controller
+            /// resolves.
+            WriteSinkPtr sink = store->backend().putIfAbsentStream(key);
+            WriteBuffer & out = sink->buffer();
+            writeString(buildHeader(), out);
+            const size_t before = out.count();
+            source.write_payload(out);
+            const size_t written = out.count() - before;
+            if (written != source.size)
+                throw Exception(ErrorCodes::LOGICAL_ERROR,
+                    "uploadFromSource: source streamed {} bytes, declared {}", written, source.size);
+            return sink->finalize();
+        };
+
+        const CasCreateResult res = store->ref_request_controller->conditionalCreateControlled(
+            key, one_attempt, [this] { return store->refAppendFenceOk(); });
+        switch (res.outcome)
+        {
+            case CasCreateOutcome::Committed:
+                return PutResult{PutOutcome::Done, res.token};
+            case CasCreateOutcome::Occupied:
+                return PutResult{PutOutcome::PreconditionFailed, {}};
+            case CasCreateOutcome::Unresolved:
+                break;
+        }
+        /// Unresolved = budget exhausted or fence lost without a definite outcome. Nothing referenced
+        /// this incarnation (deps/meta are recorded only on a definite outcome); a late-landing body is
+        /// inert debris behind the content-addressed key — a future writer of the same content adopts
+        /// or displaces it through the normal occupancy machinery. ABORTED = the same retryable abort
+        /// class stageManifest and the ref lane map their exhausted budgets to.
+        throw Exception(ErrorCodes::ABORTED,
+            "uploadFromSource: conditional create at '{}' is UNCERTAIN (retry budget exhausted or mount "
+            "fence lost) — nothing was acknowledged; retry re-uploads from the writer's own source (INV-1)",
+            key);
     };
 
     /// Phase 1: try If-None-Match upload (object absent or race with another writer).

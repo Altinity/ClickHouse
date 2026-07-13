@@ -855,8 +855,25 @@ PutResult ObjectStorageBackend::promoteStaged(const String & staging_key, const 
     /// WRITE-ONCE conditional server-side copy staging -> blob (`If-None-Match:*` on the destination),
     /// via `IObjectStorage::copyObjectConditional`. `created` ⇒ the destination ETag is the new
     /// incarnation token; `!created` ⇒ the destination already existed = the "lost the race" 412 signal.
-    const ConditionalCopyResult res = object_storage->copyObjectConditional(
-        StoredObject(staging_key), StoredObject(blob_key), getReadSettings(), WriteSettings{});
+    /// Counted with the same RFC cas-s3-timeout-retry-control attempt/outcome counters as every other
+    /// conditional write (finalizeConditionalWriteInstrumented's contract): the copy is a conditional
+    /// create attempt too, and it rides `CasRequestController::conditionalCreateControlled` from
+    /// `Build::uploadFromSource` — an uncounted attempt would hide SDK-vs-controller retry accounting.
+    /// A resolved `!created` is counted Unresolved (the 412 does not prove WHO created the occupant),
+    /// mirroring the PUT paths.
+    recordConditionalWriteAttemptStarted();
+    ConditionalCopyResult res;
+    try
+    {
+        res = object_storage->copyObjectConditional(
+            StoredObject(staging_key), StoredObject(blob_key), getReadSettings(), WriteSettings{});
+    }
+    catch (const std::exception & e)
+    {
+        recordConditionalWriteOutcome(classifyConditionalWriteResult(e));
+        throw;
+    }
+    recordConditionalWriteOutcome(res.created ? classifyConditionalWriteResult() : CasWriteOutcome::Unresolved);
     if (!res.created)
         return {PutOutcome::PreconditionFailed, {}};
     return {PutOutcome::Done, Token{res.dest_etag, native_token_type}};

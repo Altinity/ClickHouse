@@ -2125,8 +2125,12 @@ private:
 /// controller path must ride its attempt budget and succeed.
 TEST(CasBuildStageManifestRetry, AmbiguousTimeoutsThenCommitSucceedsWithinBudget)
 {
+    /// Zero backoff: the retry semantics are under test here, not the (controller-level-tested)
+    /// inter-attempt sleep schedule — keep the suite free of real sleeps.
+    CasRequestBudget budget;
+    budget.retry_initial_backoff_ms = 0;
     auto b = std::make_shared<ManifestPutFaultBackend>();
-    auto s = openStore(b);
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .cas_request_budget = budget});
     const RootNamespace ns{"srv/tbl"};
 
     auto build = startBuildFor(s, ns, "part_retry");
@@ -2195,6 +2199,7 @@ TEST(CasBuildStageManifestRetry, BudgetExhaustionMapsToAborted)
 {
     CasRequestBudget budget;
     budget.max_attempts = 3;
+    budget.retry_initial_backoff_ms = 0;   /// no real sleeps; the backoff schedule has its own tests
     auto b = std::make_shared<ManifestPutFaultBackend>();
     auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .cas_request_budget = budget});
     const RootNamespace ns{"srv/tbl"};
@@ -2206,4 +2211,282 @@ TEST(CasBuildStageManifestRetry, BudgetExhaustionMapsToAborted)
         build->stageManifest({blobManifestEntry("a.bin", "a")});
     });
     EXPECT_EQ(b->put_attempts, 3) << "attempts must be bounded by the configured budget";
+}
+
+/// =====================================================================================
+/// Task B follow-up (availfix): the two conditional-create paths that still bypassed the request
+/// controller — the BLOB body `putIfAbsentStream` create and `promoteStaged`'s conditional
+/// server-side copy (both issued inside `Build::uploadFromSource`'s streamIfAbsent) — now ride the
+/// same budgeted-attempts machinery. Reissue re-streams from the writer's REPLAYABLE source
+/// (`BlobSource::write_payload` re-reads the staged temp file / re-issues the copy from the intact
+/// staging object — INV-1, never a GET-revive); ambiguity resolves by exact-key OCCUPANCY (the key
+/// embeds the content hash, so any occupant IS the intended content — the same trust model as the
+/// plain 412-adopt path).
+/// =====================================================================================
+
+namespace
+{
+
+/// Faults blob-body conditional creates — BOTH primitives `uploadFromSource` can issue: the streaming
+/// `putIfAbsentStream` (local staging) and `promoteStaged`'s conditional server-side copy (S3-native
+/// staging) — with an ambiguous (Unresolved-classified) timeout a bounded number of times, mirroring
+/// ManifestPutFaultBackend above. Blob META writes (`.meta` keys, plain putIfAbsent) are never faulted.
+class BlobPutFaultBackend final : public InMemoryBackend
+{
+public:
+    int fault_count = 0;                 /// remaining ambiguous faults on matching create attempts
+    bool land_despite_fault = false;     /// the faulted attempt's own write actually lands (response lost)
+    int stream_attempts = 0;             /// blob-body streaming-PUT finalize attempts observed
+    int copy_attempts = 0;               /// promoteStaged conditional-copy attempts observed
+
+    WriteSinkPtr putIfAbsentStream(const String & key, const ObjectMeta & meta = {}) override
+    {
+        if (!isBlobBodyKey(key))
+            return InMemoryBackend::putIfAbsentStream(key, meta);
+
+        /// Counts/faults at finalize — the moment the old single-attempt path observed its timeout.
+        struct CountingOrFaultingSink final : WriteSink
+        {
+            BlobPutFaultBackend & parent;
+            String key;
+            ObjectMeta meta;
+            DB::WriteBufferFromOwnString buf;
+
+            CountingOrFaultingSink(BlobPutFaultBackend & parent_, String key_, ObjectMeta meta_)
+                : parent(parent_), key(std::move(key_)), meta(std::move(meta_)) {}
+
+            DB::WriteBuffer & buffer() override { return buf; }
+            PutResult finalize() override
+            {
+                ++parent.stream_attempts;
+                const String & bytes = buf.str();
+                parent.maybeFault(key, bytes);
+                return parent.InMemoryBackend::putIfAbsent(key, bytes, meta);
+            }
+            void cancel() noexcept override {}
+        };
+        return std::make_unique<CountingOrFaultingSink>(*this, key, meta);
+    }
+
+    PutResult promoteStaged(const String & staging_key, const String & blob_key) override
+    {
+        ++copy_attempts;
+        if (fault_count > 0)
+        {
+            --fault_count;
+            if (land_despite_fault)
+                InMemoryBackend::promoteStaged(staging_key, blob_key);
+            throw Poco::TimeoutException("BlobPutFaultBackend: simulated ambiguous copy (response lost)");
+        }
+        return InMemoryBackend::promoteStaged(staging_key, blob_key);
+    }
+
+private:
+    static bool isBlobBodyKey(const String & key)
+    {
+        return key.find("/blobs/") != String::npos && !key.ends_with(".meta");
+    }
+
+    /// One fault: apply the configured server-side effect, then lose the response.
+    void maybeFault(const String & key, const String & bytes)
+    {
+        if (fault_count <= 0)
+            return;
+        --fault_count;
+        if (land_despite_fault)
+            InMemoryBackend::putIfAbsent(key, bytes);
+        throw Poco::TimeoutException("BlobPutFaultBackend: simulated ambiguous result (response lost)");
+    }
+};
+
+/// Zero-backoff store over a BlobPutFaultBackend: the sleep schedule has its own controller-level
+/// tests; these Store-level tests pin the retry/resolve/abort semantics without real sleeps.
+StorePtr openBlobFaultStore(const std::shared_ptr<BlobPutFaultBackend> & b, uint32_t max_attempts = CasRequestBudget{}.max_attempts)
+{
+    CasRequestBudget budget;
+    budget.max_attempts = max_attempts;
+    budget.retry_initial_backoff_ms = 0;
+    return Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .cas_request_budget = budget});
+}
+
+/// A replayable BlobSource that COUNTS its own re-streams — pins INV-1's "retry = fresh re-stream
+/// from the writer's own source" (never a GET of the dying/failed object).
+BlobSource countingSource(const String & payload, int & payload_streams)
+{
+    BlobSource source;
+    source.size = payload.size();
+    source.write_payload = [payload, &payload_streams](DB::WriteBuffer & out)
+    {
+        ++payload_streams;
+        DB::writeString(payload, out);
+    };
+    return source;
+}
+
+}
+
+/// The core ride: two consecutive ambiguous timeouts on the blob-body streaming PUT (each resolved
+/// "absent" by the controller's occupancy HEAD), then a clean third attempt. The old single-attempt
+/// path failed the whole INSERT on the FIRST timeout (the raw Poco::TimeoutException escaped
+/// putBlob); the controller path rides its budget, RE-STREAMING the payload from the writer's own
+/// replayable source on every attempt.
+TEST(CasBuildBlobPutRetry, AmbiguousTimeoutsThenCommitRestreamsFromSource)
+{
+    auto b = std::make_shared<BlobPutFaultBackend>();
+    auto s = openBlobFaultStore(b);
+    const RootNamespace ns{"srv/tbl"};
+    const String payload = "blob-payload-A";
+
+    auto build = startBuildFor(s, ns, "part_blob_retry");
+    const ManifestId id = build->stageManifest({blobManifestEntry("a.bin", payload)});
+    build->precommitAdd(ns, "part_blob_retry", id);
+
+    int payload_streams = 0;
+    b->fault_count = 2;
+    const PutBlobResult res = build->putBlob(idOf(payload), countingSource(payload, payload_streams));
+    EXPECT_EQ(res.size, payload.size());
+
+    EXPECT_EQ(b->stream_attempts, 3) << "two faulted attempts + the committing third";
+    EXPECT_EQ(payload_streams, 3) << "every reissue must RE-STREAM from the writer's own source (INV-1)";
+    EXPECT_TRUE(b->head(s->layout().blobKey(idOf(payload))).exists) << "the blob body must be durable";
+}
+
+/// Ambiguous-but-landed: the FIRST attempt's response is lost AFTER the write actually landed
+/// server-side. The occupancy resolve observes the key present and the existing 412 machinery takes
+/// over — the occupant is ADOPTED (content-addressed identity: any occupant of this key IS the
+/// content), with NO reissue and NO second body upload.
+TEST(CasBuildBlobPutRetry, AmbiguousLandedWriteAdoptsOccupantWithoutReupload)
+{
+    auto b = std::make_shared<BlobPutFaultBackend>();
+    auto s = openBlobFaultStore(b);
+    const RootNamespace ns{"srv/tbl"};
+    const String payload = "blob-payload-B";
+
+    std::vector<CasEvent> events;
+    s->setEventSink([&](const CasEvent & e) { events.push_back(e); });
+
+    auto build = startBuildFor(s, ns, "part_blob_landed");
+    const ManifestId id = build->stageManifest({blobManifestEntry("a.bin", payload)});
+    build->precommitAdd(ns, "part_blob_landed", id);
+
+    int payload_streams = 0;
+    b->fault_count = 1;
+    b->land_despite_fault = true;
+    const PutBlobResult res = build->putBlob(idOf(payload), countingSource(payload, payload_streams));
+    EXPECT_EQ(res.size, payload.size());
+
+    EXPECT_EQ(b->stream_attempts, 1) << "a landed ambiguous attempt must be resolved, never reissued";
+    EXPECT_EQ(payload_streams, 1);
+
+    const String key = s->layout().blobKey(idOf(payload));
+    const auto adopt = std::find_if(events.begin(), events.end(),
+                                    [](const CasEvent & e) { return e.type == CasEventType::BlobReuseAdopt; });
+    ASSERT_NE(adopt, events.end()) << "the landed occupant must be ADOPTED (the standard dedup leg)";
+    EXPECT_EQ(adopt->token, b->head(key).token.value) << "the adopted token must be the landed incarnation's";
+    EXPECT_EQ(std::count_if(events.begin(), events.end(),
+                            [](const CasEvent & e) { return e.type == CasEventType::BlobPut; }), 0)
+        << "no fresh-upload event: the body was never re-uploaded";
+}
+
+/// Budget exhaustion: EVERY attempt is ambiguous and nothing ever lands. The controller reports the
+/// uncertainty and uploadFromSource maps it to ABORTED — the same retryable abort class stageManifest
+/// and the ref-log lane map their exhausted budgets to. putBlob's own bounded condemned-churn loop
+/// (8 rounds) re-drives the upload before the ABORTED escapes, so the total attempt count is
+/// controller budget × that outer bound.
+TEST(CasBuildBlobPutRetry, BudgetExhaustionMapsToAborted)
+{
+    auto b = std::make_shared<BlobPutFaultBackend>();
+    auto s = openBlobFaultStore(b, /*max_attempts=*/3);
+    const RootNamespace ns{"srv/tbl"};
+    const String payload = "blob-payload-C";
+
+    auto build = startBuildFor(s, ns, "part_blob_exhausted");
+    const ManifestId id = build->stageManifest({blobManifestEntry("a.bin", payload)});
+    build->precommitAdd(ns, "part_blob_exhausted", id);
+
+    int payload_streams = 0;
+    b->fault_count = 1000000;
+    bool threw = false;
+    try
+    {
+        build->putBlob(idOf(payload), countingSource(payload, payload_streams));
+    }
+    catch (const DB::Exception & e)
+    {
+        threw = true;
+        EXPECT_EQ(e.code(), DB::ErrorCodes::ABORTED);
+        EXPECT_NE(e.message().find("UNCERTAIN"), String::npos) << e.message();
+    }
+    EXPECT_TRUE(threw);
+    EXPECT_EQ(b->stream_attempts, 3 * 8) << "3-attempt controller budget × putBlob's 8-round outer loop";
+}
+
+/// promoteStaged conditional copy, ambiguous-but-landed: the copy's response is lost AFTER the
+/// destination was created. The occupancy resolve observes the destination present and the occupant
+/// is adopted — Committed-in-effect WITHOUT a re-copy.
+TEST(CasBuildPromoteStagedRetry, AmbiguousCopyLandedAdoptsDestinationWithoutRecopy)
+{
+    auto b = std::make_shared<BlobPutFaultBackend>();
+    auto s = openBlobFaultStore(b);
+    const RootNamespace ns{"srv/tbl"};
+    const String payload = "staged-payload-A";
+    /// The staging object: [pool-fixed-length envelope header][payload], promoted VERBATIM by the copy.
+    const String staging_key = "p/staging/test/blob-a";
+    const String staging_bytes = String(s->poolMeta().blob_header_len, 'h') + payload;
+    ASSERT_EQ(b->putIfAbsent(staging_key, staging_bytes).outcome, PutOutcome::Done);
+
+    std::vector<CasEvent> events;
+    s->setEventSink([&](const CasEvent & e) { events.push_back(e); });
+
+    auto build = startBuildFor(s, ns, "part_copy_landed");
+    const ManifestId id = build->stageManifest({blobManifestEntry("a.bin", payload)});
+    build->precommitAdd(ns, "part_copy_landed", id);
+
+    BlobSource source;
+    source.size = payload.size();
+    source.server_side_copy_from = staging_key;
+    b->fault_count = 1;
+    b->land_despite_fault = true;
+    const PutBlobResult res = build->putBlob(idOf(payload), std::move(source));
+    EXPECT_EQ(res.size, payload.size());
+
+    EXPECT_EQ(b->copy_attempts, 1) << "a landed ambiguous copy must be resolved, never re-copied";
+    const String key = s->layout().blobKey(idOf(payload));
+    const auto got = b->get(key);
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(got->bytes, staging_bytes) << "the destination is the staging object's verbatim copy";
+    EXPECT_NE(std::find_if(events.begin(), events.end(),
+                           [](const CasEvent & e) { return e.type == CasEventType::BlobReuseAdopt; }),
+              events.end()) << "the landed destination must be ADOPTED";
+}
+
+/// promoteStaged conditional copy, ambiguous-and-absent: the first copy attempt times out with
+/// nothing landing; the resolve observes the destination absent and the copy is REISSUED from the
+/// (intact, still-staged) source object — the second attempt commits.
+TEST(CasBuildPromoteStagedRetry, AmbiguousCopyAbsentReattemptsAndCommits)
+{
+    auto b = std::make_shared<BlobPutFaultBackend>();
+    auto s = openBlobFaultStore(b);
+    const RootNamespace ns{"srv/tbl"};
+    const String payload = "staged-payload-B";
+    const String staging_key = "p/staging/test/blob-b";
+    const String staging_bytes = String(s->poolMeta().blob_header_len, 'h') + payload;
+    ASSERT_EQ(b->putIfAbsent(staging_key, staging_bytes).outcome, PutOutcome::Done);
+
+    auto build = startBuildFor(s, ns, "part_copy_retry");
+    const ManifestId id = build->stageManifest({blobManifestEntry("a.bin", payload)});
+    build->precommitAdd(ns, "part_copy_retry", id);
+
+    BlobSource source;
+    source.size = payload.size();
+    source.server_side_copy_from = staging_key;
+    b->fault_count = 1;
+    const PutBlobResult res = build->putBlob(idOf(payload), std::move(source));
+    EXPECT_EQ(res.size, payload.size());
+
+    EXPECT_EQ(b->copy_attempts, 2) << "the faulted attempt + the committing reissue";
+    const String key = s->layout().blobKey(idOf(payload));
+    const auto got = b->get(key);
+    ASSERT_TRUE(got.has_value());
+    EXPECT_EQ(got->bytes, staging_bytes);
 }

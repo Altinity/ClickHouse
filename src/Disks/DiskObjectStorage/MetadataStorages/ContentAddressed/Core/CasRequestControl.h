@@ -117,6 +117,30 @@ struct CasRequestBudget
 /// line records the full picture in one place.
 void validateCasRequestBudget(const CasRequestBudget & budget, uint64_t mount_lease_ttl_ms, uint64_t mount_renew_period_ms);
 
+/// Outcome of a controlled CONTENT-ADDRESSED conditional create (`conditionalCreateControlled`):
+///   - Committed:  an attempt's own request completed (2xx) and the final fence check held — `token`
+///     names the created incarnation.
+///   - Occupied:   the key holds an object — either a genuine `PreconditionFailed` (a racing twin) or
+///     an earlier ambiguous attempt of THIS operation that actually landed. For a content-addressed
+///     key these are THE SAME situation: the key embeds the content hash, so any occupant is the
+///     intended content (the exact trust model the plain 412-adopt path already relies on) — the
+///     caller runs its ordinary occupant machinery (adopt live / displace condemned).
+///   - Unresolved: budget exhausted or fence lost without a definite outcome — the write may or may
+///     not have landed; the caller must not ACK (a late-landing body is inert unreferenced debris for
+///     the orphan sweep, exactly like a stageManifest Unresolved).
+enum class CasCreateOutcome : uint8_t
+{
+    Committed,
+    Occupied,
+    Unresolved,
+};
+
+struct CasCreateResult
+{
+    CasCreateOutcome outcome = CasCreateOutcome::Unresolved;
+    Token token;   /// set ONLY on Committed
+};
+
 /// CAS-owned retry controller (RFC cas-s3-timeout-retry-control): the ONLY place that decides whether a
 /// conditional-write attempt may be reissued, and the seam Tasks 8-11 build the ref writer's append lane
 /// on. It does not itself touch a writer cache or return ACK — RFC §ack-and-cache-rules' "update the
@@ -167,6 +191,35 @@ public:
     /// that verdict. `out_token` (optional): set ONLY on `Committed`, to the observed incarnation's token.
     CasWriteOutcome resolveByExactGet(std::string_view key, std::string_view expected_bytes,
                                       Token * out_token = nullptr);
+
+    /// Controlled conditional create for CONTENT-ADDRESSED write-once keys whose body CANNOT be
+    /// byte-compared across attempts — the blob-body `putIfAbsentStream` create and `promoteStaged`'s
+    /// conditional server-side copy (`Build::uploadFromSource`). Byte-exact resolve
+    /// (`resolveByExactGet`) is impossible there BY DESIGN: W-FRESH-TAG mints a fresh
+    /// `incarnation_tag` into the envelope header on every re-stream, so two attempts of the same
+    /// logical create legitimately differ in bytes. The identity authority is the KEY itself (it
+    /// embeds algo + content digest), so an uncertain attempt resolves by exact-key OCCUPANCY (one
+    /// HEAD — never a GET of a possibly-multi-GB body, and never a GET-revive):
+    ///   - occupant present  -> Occupied (definite; whether it is our own landed attempt or a twin is
+    ///     immaterial for a content-addressed key — the caller's ordinary 412 machinery takes over)
+    ///   - absent            -> another attempt may be legal (fence/deadline/backoff-gated, same
+    ///     schedule as putIfAbsentControlled); `attempt` re-streams from the caller's REPLAYABLE
+    ///     source — a fresh re-upload, honoring the resurrect invariant
+    ///   - the HEAD fails    -> still ambiguous; reissue is safe (an occupant just answers the reissue
+    ///     with PreconditionFailed -> Occupied on the next round)
+    /// `attempt` performs ONE conditional-create attempt of the same logical content and returns its
+    /// PutResult (Done/PreconditionFailed) or throws. A whitelisted DefiniteFailure classification
+    /// RETHROWS the original exception (the blob lane always surfaced the raw storage error's root
+    /// cause — unlike the ref lane's outcome mapping, nothing here needs the code collapsed), and a
+    /// `LOGICAL_ERROR` from the attempt propagates unchanged too: a local invariant violation (e.g. a
+    /// source streaming a different byte count than it declared) is a caller bug reissue would only
+    /// replay, never a wire ambiguity.
+    /// A Done attempt gets the final fence check before being reported Committed
+    /// (RFC §ack-and-cache-rules); Occupied needs none — it acks nothing of OUR write, and the
+    /// caller's occupant path gates its own adoption.
+    CasCreateResult conditionalCreateControlled(std::string_view key,
+                                                const std::function<PutResult()> & attempt,
+                                                const std::function<bool()> & fence_ok);
 
     /// Test-only: replace the inter-attempt backoff sleep (e.g. with a no-op) on an already-constructed
     /// controller — for tests that reach the controller only through a fully-wired Store/disk and cannot
