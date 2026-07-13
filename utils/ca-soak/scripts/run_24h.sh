@@ -27,7 +27,15 @@ COMPOSE_LOG="$LOGDIR/phase3_${RUN_TS}_server.log"
 # survive `docker compose down -v` (the soak #7 OOM left no in-container logs to diagnose). The
 # server runs as uid 101 inside the container, so the host dirs must be writable by it. Start each
 # run from a clean dir so a post-mortem reads only THIS run's logs.
-rm -rf "$LOGDIR/ch1" "$LOGDIR/ch2"
+# Archive-before-restart (2026-07-13): never delete the previous run's logs — a restart used to
+# destroy the evidence of a failed run before its investigation finished. Move them aside instead.
+if [ -d "$LOGDIR/ch1" ] || [ -d "$LOGDIR/ch2" ]; then
+  PREV_DIR="$LOGDIR/prev_${RUN_TS}"
+  mkdir -p "$PREV_DIR"
+  mv "$LOGDIR/ch1" "$PREV_DIR/" 2>/dev/null || true
+  mv "$LOGDIR/ch2" "$PREV_DIR/" 2>/dev/null || true
+  echo "previous run's log dirs archived -> $PREV_DIR"
+fi
 mkdir -p "$LOGDIR/ch1" "$LOGDIR/ch2"
 chmod 777 "$LOGDIR/ch1" "$LOGDIR/ch2"
 
@@ -42,7 +50,14 @@ trap '
   docker compose logs --no-color > "$COMPOSE_LOG" 2>&1 || true
   docker compose ps -a >> "$COMPOSE_LOG" 2>&1 || true
   for c in $(docker compose ps -aq 2>/dev/null); do docker inspect --format "{{.Name}} State={{.State.Status}} OOMKilled={{.State.OOMKilled}} ExitCode={{.State.ExitCode}}" "$c" >> "$COMPOSE_LOG" 2>&1 || true; done
-  echo "preserved docker logs+state -> $COMPOSE_LOG"
+  # The B165 host bind-mount stopped capturing server logs (dirs come out empty), and chaos
+  # restarts recreate containers so `docker compose logs` loses earlier instances. Copy the
+  # server log FILES out of the live containers while they still exist — this is the only
+  # reliable evidence path (2026-07-13, v2/v3 postmortems).
+  for node in ch1 ch2; do
+    docker cp "$(docker compose ps -q $node 2>/dev/null | head -1)":/var/log/clickhouse-server/. "$LOGDIR/$node/" 2>/dev/null || true
+  done
+  echo "preserved docker logs+state -> $COMPOSE_LOG (+ server log files -> $LOGDIR/ch1,ch2)"
   kill $WATCHDOG_PID 2>/dev/null || true
   if [ "$SOAK_OK" = 1 ]; then
     echo "PHASE3 OK — tearing down (down -v)"; docker compose down -v
