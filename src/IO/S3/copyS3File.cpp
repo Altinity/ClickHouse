@@ -251,7 +251,7 @@ namespace
                 /// read `S3Exception::getExceptionName()`, mirroring how `S3ObjectStorage::removeObjectIfTokenMatches`
                 /// reads `AWSError::GetExceptionName()` directly off the (not-yet-thrown) outcome.
                 throw S3Exception(
-                    fmt::format("Message: {}, Key: {}, Bucket: {}, Tags: {}",
+                    PreformattedMessage::create("Message: {}, Key: {}, Bucket: {}, Tags: {}",
                         outcome.GetError().GetMessage(), dest_key, dest_bucket, fmt::join(multipart_tags.begin(), multipart_tags.end(), " ")),
                     outcome.GetError().GetErrorType(),
                     outcome.GetError().GetExceptionName());
@@ -789,7 +789,7 @@ namespace
                 /// throw in `completeMultipartUpload()` above (a 412 on a conditional `CopyObject` maps
                 /// to `S3Errors::UNKNOWN`; the exception name is the only reliable discriminator).
                 throw S3Exception(
-                    fmt::format("Message: {}, Key: {}, Bucket: {}, Object size: {}",
+                    PreformattedMessage::create("Message: {}, Key: {}, Bucket: {}, Object size: {}",
                         outcome.GetError().GetMessage(),
                         dest_key,
                         dest_bucket,
