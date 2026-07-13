@@ -224,6 +224,15 @@ struct PoolConfig
     /// and the candidate-advance skip, it bounds publish dispatch to O(failures), not O(reads).
     uint64_t snapshot_publish_backoff_initial_ms = 200;
     uint64_t snapshot_publish_backoff_max_ms = 30000;
+    /// S13 fix (DANGLING-PRECOMMIT re-opened; triage `.superpowers/sdd/s13-triage-report.md`): bounded
+    /// per-table cooldown between FAILED stale-precommit sweep attempts. A failed/partial sweep re-arms
+    /// `needs_stale_precommit_sweep` instead of consuming the once-per-mount shot (one attempt burned in
+    /// the post-restart error window used to leave a dead incarnation's precommit bindings -- and the
+    /// manifests they protect from the GC orphan sweep -- live forever on a long-lived mount); this
+    /// cooldown keeps the retry from storming a saturated backend, exactly like the C4 publish backoff.
+    /// Doubles from `initial` up to `max` per consecutive failure; reset by a verified-clean sweep.
+    uint64_t precommit_sweep_backoff_initial_ms = 200;
+    uint64_t precommit_sweep_backoff_max_ms = 30000;
 
     /// Task 13 (spec §Byte, Memory, And CPU Budget): resident-memory ceiling for the writer's
     /// whole-table ref cache (`Store::ref_tables`). Phase 1 has no row overlay, so eviction is
@@ -657,10 +666,20 @@ private:
         /// concurrent writer there), so it stays a plain `uint64_t`.
         std::atomic<uint64_t> base_snapshot_bytes{0};
         uint64_t last_touch_tick = 0;
-        /// Cleared to false once a stale-precommit sweep has been dispatched for this table this mount
-        /// (spec §Clean Up Old Precommits); set true by recovery. `appendRefOps`'s top level checks it
-        /// before every call, cheaply, so it fires exactly once per table per mount.
+        /// Set true by recovery (spec §Clean Up Old Precommits); cleared when a sweep attempt is
+        /// dispatched (so the sweep's own nested `appendRefOps` calls do not recurse) and PERMANENTLY
+        /// only once an attempt completes VERIFIED CLEAN (a full pass over the live state found zero
+        /// stale bindings). S13 fix: any failed/partial attempt re-arms it (with the
+        /// `precommit_sweep_backoff_*` cooldown), so a later read/mutation trigger retries until clean --
+        /// a single attempt burned in the post-restart error window must not leave a dead incarnation's
+        /// precommit bindings protected from GC forever on a long-lived mount.
         bool needs_stale_precommit_sweep = false;
+        /// S13 fix: per-table retry cooldown for the stale-precommit sweep (guarded by `state_mutex`),
+        /// mirroring `publish_backoff_*` below: `until` is the boottime instant before which
+        /// `maybeSweepStalePrecommits` refuses to re-attempt; `ms` is the current exponential interval
+        /// (0 = no failure yet, or reset by the last verified-clean sweep).
+        uint64_t precommit_sweep_backoff_until_ms = 0;
+        uint64_t precommit_sweep_backoff_ms = 0;
         /// Test-observability + graceful settling for the background snapshot-publish dispatch (see
         /// `maybeScheduleSnapshotPublish`): the count of in-flight publish attempts for this table, and
         /// the condvar (guarded by `state_mutex`) a test waits on via `waitForSnapshotPublishSettleForTest`.
@@ -780,12 +799,22 @@ private:
     void advancePublishBackoff(RefTableRuntime & rt);
     void resetPublishBackoff(RefTableRuntime & rt);
 
+    /// S13 fix: per-table retry cooldown for the stale-precommit sweep (caller holds `rt.state_mutex`).
+    /// `advance` arms/doubles the cooldown after a FAILED sweep attempt (bounded by
+    /// `precommit_sweep_backoff_max_ms`); `reset` clears it after a verified-clean sweep. See
+    /// `RefTableRuntime::precommit_sweep_backoff_*`.
+    void advancePrecommitSweepBackoff(RefTableRuntime & rt);
+    void resetPrecommitSweepBackoff(RefTableRuntime & rt);
+
     /// Cheap flag check (lock + bool, no I/O) at the top of `appendRefOps`; if this table's stale
-    /// (older-epoch) precommits haven't been swept yet this mount, clears the flag and runs
-    /// `sweepStalePrecommitsNow` SYNCHRONOUSLY on the CALLING thread. Safe only because it runs BEFORE
-    /// that caller enqueues its own item or becomes a queue leader -- the sweep's own `appendRefOps`
-    /// calls are therefore a separate top-level invocation, never nested inside a leader's flush stack
-    /// (which would deadlock the leader against itself).
+    /// (older-epoch) precommits haven't been verified clean yet this mount -- and no failure cooldown is
+    /// pending -- clears the flag and runs `sweepStalePrecommitsNow` SYNCHRONOUSLY on the CALLING thread.
+    /// Safe only because it runs BEFORE that caller enqueues its own item or becomes a queue leader --
+    /// the sweep's own `appendRefOps` calls are therefore a separate top-level invocation, never nested
+    /// inside a leader's flush stack (which would deadlock the leader against itself). S13 fix: the
+    /// clear-before-attempt is for RE-ENTRANCY only, never consumption -- ANY failure (exception,
+    /// uncertain PUT, partial progress) re-arms the flag with a bounded backoff and rethrows, so a later
+    /// read/mutation trigger retries until a sweep completes verified clean.
     void maybeSweepStalePrecommits(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt);
     /// The actual chunked removal loop (spec §Clean Up Old Precommits): repeatedly re-reads the live
     /// state, gathers up to `ref_txn_max_ops` stale precommits (`manifest_ref.writer_epoch <
@@ -793,9 +822,12 @@ private:
     void sweepStalePrecommitsNow(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt);
     /// The READ-side wrapper `resolveRef`/`listRefs` call instead of
     /// `maybeSweepStalePrecommits` directly -- catches any failure (an uncertain PUT propagated as
-    /// ABORTED), counts it (`CasRefSweepDeferred`), logs once, and lets the read proceed. A mutation
-    /// path (`appendRefOps`'s own hoisted call) must not use this: it calls `maybeSweepStalePrecommits`
-    /// directly and keeps propagating, since a mutation must not proceed past a wedged lane.
+    /// ABORTED), counts it (`CasRefSweepDeferred`), logs once, and lets the read proceed. Swallowing
+    /// here does NOT drop the sweep (S13 fix): the failed attempt already re-armed
+    /// `needs_stale_precommit_sweep` inside `maybeSweepStalePrecommits`, so a later trigger retries. A
+    /// mutation path (`appendRefOps`'s own hoisted call) must not use this: it calls
+    /// `maybeSweepStalePrecommits` directly and keeps propagating, since a mutation must not proceed
+    /// past a wedged lane.
     void sweepStalePrecommitsForRead(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt);
 
     /// Publishes the constant-size `Removed` snapshot for a namespace whose `remove_namespace` is
@@ -812,6 +844,10 @@ public:
     /// (I1) The object key of the current wedge for `ns`, or empty when the lane is not wedged -- lets a
     /// test land a DIFFERENT object at the exact wedged key to exercise resolve-time CORRUPTED_DATA.
     String wedgedKeyForTest(const RootNamespace & ns);
+    /// S13 fix: whether this table still owes a stale-precommit sweep (armed by recovery; re-armed by a
+    /// failed attempt; cleared permanently only by a verified-clean sweep). Recovers the table (like any
+    /// real read) if not already cached.
+    bool needsStalePrecommitSweepForTest(const RootNamespace & ns);
 
     /// Number of ref-append lanes currently wedged (an uncertain PUT exhausted its retry budget and
     /// the lane blocks until the same key resolves durable or is conclusively rejected). Per-disk GC

@@ -44,6 +44,8 @@ namespace ProfileEvents
     extern const Event CasRefAppendUnwedged;
     extern const Event CasRefAppendDefiniteFailure;
     extern const Event CasRefSweepDeferred;
+    extern const Event CasRefSweepRearmed;
+    extern const Event CasRefStalePrecommitsReclaimed;
     extern const Event CasRefTableEvictions;
     extern const Event CasRefSnapshotPutBytes;
     extern const Event CasRefSnapshotTailLogs;
@@ -1306,6 +1308,14 @@ String Store::wedgedKeyForTest(const RootNamespace & ns)
     return rt->wedge ? rt->wedge->key : String{};
 }
 
+bool Store::needsStalePrecommitSweepForTest(const RootNamespace & ns)
+{
+    const auto rt = getRefTableRuntime(ns);
+    ensureRefTableRecovered(ns, *rt);
+    std::lock_guard lock(rt->state_mutex);
+    return rt->needs_stale_precommit_sweep;
+}
+
 size_t Store::wedgedRefLaneCount()
 {
     std::vector<std::shared_ptr<RefTableRuntime>> runtimes;
@@ -2096,10 +2106,13 @@ void Store::sweepStalePrecommitsForRead(const RootNamespace & ns, const std::sha
     /// otherwise-successful read because a piggybacked maintenance action (the stale-precommit sweep)
     /// hit an uncertain PUT -- the read asked for none of that; a mutation path (appendRefOps's own
     /// top-level hoisted call, which calls `maybeSweepStalePrecommits` directly, uncaught) keeps
-    /// propagating instead, since it must not proceed past a wedged lane anyway. Naturally fires at
-    /// most once per table per mount: `maybeSweepStalePrecommits` clears its flag BEFORE attempting
-    /// the sweep, so a failed attempt is never retried by a LATER read on the SAME mount -- only a
-    /// later mutation (via the wedge) or the next mount's fresh recovery makes further progress.
+    /// propagating instead, since it must not proceed past a wedged lane anyway. Swallowing here does
+    /// NOT drop the sweep (S13 fix, triage `.superpowers/sdd/s13-triage-report.md`): the failed
+    /// attempt already re-armed `needs_stale_precommit_sweep` (with a bounded cooldown) inside
+    /// `maybeSweepStalePrecommits`, so a later read/mutation trigger on THIS mount retries until a
+    /// sweep completes verified clean -- the old drop-the-shot behavior left a dead incarnation's
+    /// precommit bindings (and the manifests they protect from the GC orphan sweep) live forever on a
+    /// long-lived mount whenever the single attempt burned in the post-restart error window.
     try
     {
         maybeSweepStalePrecommits(ns, rt);
@@ -2119,11 +2132,62 @@ void Store::maybeSweepStalePrecommits(const RootNamespace & ns, const std::share
         std::lock_guard lock(rt->state_mutex);
         if (!rt->needs_stale_precommit_sweep)
             return;
+        /// S13 fix: a failed attempt armed a cooldown; do not re-attempt (and do not touch the flag)
+        /// until it elapses -- the bounded-backoff storm latch, same shape as `publish_backoff_until_ms`.
+        /// The boottime clock is injectable (`boot_ms_fn`), so tests drive this deterministically.
+        if (bootMsNow() < rt->precommit_sweep_backoff_until_ms)
+            return;
         /// Cleared FIRST: `sweepStalePrecommitsNow`'s own `appendRefOps` calls re-enter this same
-        /// top-level check (via `appendRefOps`'s hoisted call), and must see it already cleared.
+        /// top-level check (via `appendRefOps`'s hoisted call), and must see it already cleared. This
+        /// clear is for RE-ENTRANCY only, never consumption: any non-clean outcome re-arms below.
         rt->needs_stale_precommit_sweep = false;
     }
-    sweepStalePrecommitsNow(ns, rt);
+    try
+    {
+        sweepStalePrecommitsNow(ns, rt);
+    }
+    catch (...)
+    {
+        /// S13 fix (triage `.superpowers/sdd/s13-triage-report.md`, run 20260713T172032_S13_seed42): a
+        /// failed or partial sweep must NOT consume the shot. Under kill-chaos the single attempt lands
+        /// exactly inside the post-restart error window (an uncertain PUT, a fence blip), and with no
+        /// retry the dead incarnation's durable precommit bindings -- and the manifests
+        /// `activeManifestKeys` protects for them -- leaked forever on a long-lived mount (GC has no
+        /// backstop by spec §Responsibility Boundary). Re-arm with a bounded backoff and rethrow: the
+        /// read path insulates the caller (`sweepStalePrecommitsForRead`), the mutation path propagates
+        /// as before.
+        {
+            std::lock_guard lock(rt->state_mutex);
+            rt->needs_stale_precommit_sweep = true;
+            advancePrecommitSweepBackoff(*rt);
+        }
+        throw;
+    }
+    /// Verified clean: `sweepStalePrecommitsNow` returns only after a full pass over the live state
+    /// found zero stale bindings, so the flag stays cleared for the rest of this mount; reset the
+    /// failure cooldown too.
+    std::lock_guard lock(rt->state_mutex);
+    resetPrecommitSweepBackoff(*rt);
+}
+
+void Store::advancePrecommitSweepBackoff(RefTableRuntime & rt)
+{
+    /// Caller holds `rt.state_mutex`. S13 fix, mirroring `advancePublishBackoff`: double the interval
+    /// from `initial` up to `max` per consecutive failed sweep attempt; arm the deadline off the
+    /// boottime clock (`bootMsNow`), so an injected test clock drives it deterministically and a
+    /// VM-suspend cannot shorten it.
+    rt.precommit_sweep_backoff_ms = rt.precommit_sweep_backoff_ms == 0
+        ? config.precommit_sweep_backoff_initial_ms
+        : std::min<uint64_t>(rt.precommit_sweep_backoff_ms * 2, config.precommit_sweep_backoff_max_ms);
+    rt.precommit_sweep_backoff_until_ms = bootMsNow() + rt.precommit_sweep_backoff_ms;
+    ProfileEvents::increment(ProfileEvents::CasRefSweepRearmed);
+}
+
+void Store::resetPrecommitSweepBackoff(RefTableRuntime & rt)
+{
+    /// Caller holds `rt.state_mutex`. A verified-clean sweep clears the cooldown.
+    rt.precommit_sweep_backoff_ms = 0;
+    rt.precommit_sweep_backoff_until_ms = 0;
 }
 
 void Store::sweepStalePrecommitsNow(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt)
@@ -2134,9 +2198,19 @@ void Store::sweepStalePrecommitsNow(const RootNamespace & ns, const std::shared_
     /// can never be promoted. Removed with ordinary exact `owner_transition(old_binding, none)`
     /// operations, chunked to `ref_txn_max_ops` per transaction. Interruption is harmless: each chunk
     /// re-reads the LIVE state, so a partial sweep just leaves fewer stale bindings for the next chunk
-    /// (or the next mount's recovery) to find; nothing here can loop forever since only OLDER-epoch
-    /// bindings ever qualify, and this writer's own new work always uses `liveWriterEpoch()` -- which a
-    /// self-remount bumps in lockstep with the threshold below, so a remount's fresh precommits survive.
+    /// (a later retry on this mount, or the next mount's recovery) to find; nothing here can loop
+    /// forever since only OLDER-epoch bindings ever qualify, and this writer's own new work always uses
+    /// `liveWriterEpoch()` -- which a self-remount bumps in lockstep with the threshold below, so a
+    /// remount's fresh precommits survive.
+    ///
+    /// A GC-side backstop stays deliberately OUT of this fix (S13, triage
+    /// `.superpowers/sdd/s13-triage-report.md`): the spec's §Responsibility Boundary assigns
+    /// precommit-binding cleanup to the WRITER -- GC never mutates another writer's ref-table state, so
+    /// a leader-side reclaim would be a new protocol capability (a spec question about GC-authored
+    /// ref-log transactions and their fencing), not a bugfix. The retry-until-clean loop above is the
+    /// writer-side answer; the follow-up (a GC visibility counter for "live precommit binding below the
+    /// mount-lease epoch", possibly a real backstop behind a spec revision) is tracked in
+    /// `utils/ca-soak/scenarios/BACKLOG.md` entry S13-20260713T172032-3.
     const uint64_t live_epoch = liveWriterEpoch();
     while (true)
     {
@@ -2170,6 +2244,38 @@ void Store::sweepStalePrecommitsNow(const RootNamespace & ns, const std::shared_
                 return ops;
             },
             RootMutationOrigin::Writer, RootMutationKind::ReclaimPrecommit);
+
+        /// S13 fix / INTROSPECTION-1: audit each binding this sweep reclaimed, so
+        /// system.content_addressed_log records the reclaim and the S13 card's "abandoned precommits
+        /// reclaimed" counter is falsifiable (it had ZERO emit sites before). A binding gathered above
+        /// that is GONE from the live state after the committed append was reclaimed by this sweep's
+        /// work -- either this chunk's own ops or this lane's just-resolved wedged predecessor txn (a
+        /// PRIOR attempt of this same sweep whose ack was lost); one still present was skipped by the
+        /// builder (raced by another owner transition) and will be gathered again next iteration.
+        /// Collected under the lock, emitted outside it (the sink forwards to the SystemLog).
+        std::vector<std::pair<String, ManifestRef>> reclaimed;
+        {
+            std::lock_guard lock(rt->state_mutex);
+            for (const auto & [ref_name, mref] : chunk)
+                if (!rt->state.precommits.contains({ref_name, mref}))
+                    reclaimed.emplace_back(ref_name, mref);
+        }
+        ProfileEvents::increment(ProfileEvents::CasRefStalePrecommitsReclaimed, reclaimed.size());
+        for (const auto & [ref_name, mref] : reclaimed)
+        {
+            EventEmitter{*this}.emit([&](CasEvent & e)
+            {
+                e.type = CasEventType::PrecommitReclaim;
+                e.namespace_ = ns.string();
+                e.ref_name = ref_name;
+                e.object_kind = CasEventObjectKind::Root;
+                e.object_hash = manifestRefDebugString(mref);
+                e.reason = "stale-precommit sweep: dangling precommit of a superseded writer incarnation "
+                           "reclaimed by the successor's fenced sweep (spec §Clean Up Old Precommits)";
+                e.detail = {{"stale_writer_epoch", std::to_string(mref.writer_epoch)},
+                            {"live_writer_epoch", std::to_string(live_epoch)}};
+            });
+        }
     }
 }
 

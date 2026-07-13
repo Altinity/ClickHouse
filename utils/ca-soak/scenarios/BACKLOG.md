@@ -1952,3 +1952,23 @@ which leaves shared global state dirty. So this is a pre-existing GENERAL `unit_
 hygiene issue (a non-CAS test not resetting global state), NOT a CAS correctness bug and NOT caused by this
 campaign. The CAS gtest battery is green. No CAS action; if pursued, it belongs in general test-harness hygiene
 (the offending non-CAS test's SetUp/TearDown), out of the CAS scope.
+
+## S13-20260713T172032-3: GC-side backstop for stale live precommit bindings — open spec question
+
+- **Logged (UTC):** 2026-07-13T18:30:00
+- **Severity:** design-question
+- **Run:** 20260713T172032_S13_seed42 (triage: `.superpowers/sdd/s13-triage-report.md`)
+- **Observed:** The S13 DANGLING-PRECOMMIT regression was fixed writer-side (the stale-precommit sweep
+  now retries until verified clean and emits `precommit_reclaim` audit events), per the spec's
+  §Responsibility Boundary, which assigns precommit-binding cleanup to the WRITER — GC never mutates
+  another writer's ref-table state, so a GC-side reclaim would be a new protocol capability
+  (leader-side writes into a writer's table), not a bugfix, and is deliberately OUT of the S13 fix
+  commit. The residual exposure is a writer that dies again (or stays wedged) before ever completing a
+  verified-clean sweep on any later mount: its stale precommit bindings keep protecting their manifests
+  from the orphan-manifest sweep (`activeManifestKeys`, control #8) with no second line of defense.
+  Two follow-up options to spec out: (a) a GC-side VISIBILITY counter — "live precommit binding with
+  `writer_epoch` < mount-lease epoch" — surfaced per round in the GC log / `system.content_addressed_mounts`
+  so a stuck reclaim is observable from the leader even when the writer never retries (cheap, no
+  protocol change; the triage's Q4 recommendation 3); and (b) an actual GC-side reclaim of such
+  bindings (requires a spec amendment to the responsibility boundary + fencing story for GC-authored
+  ref-log transactions). Do (a) first; (b) only with a spec revision.

@@ -11,6 +11,7 @@
 
 #include <Poco/Exception.h>
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <future>
@@ -35,6 +36,8 @@ extern const int CORRUPTED_DATA;
 namespace ProfileEvents
 {
 extern const Event CasRefSweepDeferred;
+extern const Event CasRefSweepRearmed;
+extern const Event CasRefStalePrecommitsReclaimed;
 extern const Event CasRefSnapshotPutBytes;
 extern const Event CasRefSnapshotTailLogs;
 extern const Event CasRefSnapshotPublishDispatched;
@@ -1533,8 +1536,9 @@ TEST(RefWriterStalePrecommitSweep, SweepsOnlyStaleEpochPrecommitsKeepsCurrentEpo
 /// The sweep chunks its removal to `ref_txn_max_ops` (1000) stale precommits per transaction (spec
 /// §Clean Up Old Precommits), and an interruption (an uncertain PUT, wedging the lane) leaves the
 /// remainder harmlessly for a LATER mount's own fresh recovery to finish -- "each chunk re-reads the
-/// LIVE state, so a partial sweep just leaves fewer stale bindings for the next chunk (or the next
-/// mount's recovery) to find."
+/// LIVE state, so a partial sweep just leaves fewer stale bindings for the next chunk (a later retry
+/// on this mount, or the next mount's recovery) to find." (Same-mount retry is pinned separately by
+/// `FailedSweepRearmsAndRetriesUntilClean`.)
 TEST(RefWriterStalePrecommitSweep, BoundedBatchesAndInterruptionResumeAcrossMounts)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
@@ -1632,6 +1636,135 @@ TEST(RefWriterStalePrecommitSweep, BoundedBatchesAndInterruptionResumeAcrossMoun
         }
     }
     EXPECT_EQ(new_log_objects, 2u);
+}
+
+/// S13 regression fix (triage `.superpowers/sdd/s13-triage-report.md`, run 20260713T172032_S13_seed42):
+/// a FAILED sweep attempt must NOT consume the once-per-mount shot. The failure re-arms
+/// `needs_stale_precommit_sweep` (with a bounded backoff, so a saturated backend is not stormed), the
+/// read that piggybacked the sweep still succeeds (existing `CasRefSweepDeferred` contract), and a later
+/// trigger -- here a mutation -- retries until a pass completes verified clean, clearing the flag
+/// permanently. Each reclaimed binding is audited: one `precommit_reclaim` CA-log event + one
+/// `CasRefStalePrecommitsReclaimed` increment, exactly per binding.
+TEST(RefWriterStalePrecommitSweep, FailedSweepRearmsAndRetriesUntilClean)
+{
+    using ProfileEvents::global_counters;
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/precommit_sweep_retry"};
+
+    /// One shared injected clock for BOTH incarnations, so the successor's backoff deadline is driven
+    /// deterministically (never a raw sleep).
+    uint64_t fake_now = 1'000'000;
+    const auto fake_clock = [&fake_now] { return fake_now; };
+
+    {
+        /// A predecessor writer leaves THREE precommits dangling (a crash before promote).
+        PoolConfig pred_config;
+        pred_config.mount_lease_ttl_ms = std::chrono::milliseconds(10'000'000);
+        pred_config.boot_ms_fn = fake_clock;
+        auto predecessor = openStoreWithConfig(backend, pred_config);
+        for (const String & name : {"stale_a", "stale_b", "stale_c"})
+        {
+            auto build = startBuildFor(predecessor, ns, name);
+            const ManifestId id = build->stageManifest({});
+            build->precommitAdd(ns, name, id);
+            /// no promote -- left dangling, as a crashed build would leave it
+        }
+    }   /// predecessor destroyed: its mount lease is released
+
+    /// The successor: a tight retry budget so ONE simulated ambiguous response wedges rather than
+    /// transparently retries away (mirrors the wedge-semantics tests in this file exactly).
+    CasRequestBudget budget;
+    budget.max_attempts = 1;
+    budget.attempt_timeout_ms = 100;
+    budget.operation_deadline_ms = 100;
+    budget.lease_safety_margin_ms = 100;
+    PoolConfig config;
+    config.cas_request_budget = budget;
+    config.mount_lease_ttl_ms = std::chrono::milliseconds(10'000'000);
+    config.boot_ms_fn = fake_clock;
+    auto successor = openStoreWithConfig(backend, config);
+
+    std::vector<CasEvent> seen;
+    successor->setEventSink([&](const CasEvent & e) { seen.push_back(e); });
+
+    backend->fault_key_substr = layout.refsNamespacePrefix(ns) + "_log/";
+    backend->fault_count = 1;   /// hits exactly the sweep's FIRST removal chunk's PUT
+
+    /// FIRST trigger (read path): the sweep's removal PUT is uncertain -> the lane wedges; the read
+    /// itself still succeeds and counts the deferral (existing contract) -- but the shot must NOT be
+    /// consumed: the flag is re-armed for a later trigger.
+    const uint64_t deferred_before = global_counters[ProfileEvents::CasRefSweepDeferred].load();
+    const uint64_t rearmed_before = global_counters[ProfileEvents::CasRefSweepRearmed].load();
+    const uint64_t reclaimed_before = global_counters[ProfileEvents::CasRefStalePrecommitsReclaimed].load();
+    EXPECT_NO_THROW(successor->listRefs(ns));
+    EXPECT_EQ(global_counters[ProfileEvents::CasRefSweepDeferred].load(), deferred_before + 1);
+    EXPECT_TRUE(successor->refLaneWedgedForTest(ns));
+    EXPECT_TRUE(successor->needsStalePrecommitSweepForTest(ns))
+        << "a failed sweep must re-arm needs_stale_precommit_sweep, not consume the once-per-mount shot";
+    EXPECT_EQ(global_counters[ProfileEvents::CasRefSweepRearmed].load(), rearmed_before + 1);
+
+    /// Within the backoff window (the injected clock has not advanced) a read must NOT re-attempt --
+    /// the bounded-backoff storm latch: no new deferral, flag still armed.
+    EXPECT_NO_THROW(successor->listRefs(ns));
+    EXPECT_EQ(global_counters[ProfileEvents::CasRefSweepDeferred].load(), deferred_before + 1)
+        << "within the backoff window the sweep must not re-attempt (PUT-storm latch)";
+    EXPECT_TRUE(successor->needsStalePrecommitSweepForTest(ns));
+
+    /// The lost response later lands server-side; past the backoff deadline the NEXT trigger (a
+    /// mutation this time) retries: the lane resolves its wedge (the first chunk's removals become
+    /// durable and applied), the re-pass verifies clean, and the flag clears permanently.
+    backend->materializePendingDelayedWrite();
+    fake_now += 60'000;   /// beyond any armed backoff (initial 200 ms, max 30 s)
+    EXPECT_NO_THROW(publishEmptyPart(successor, ns, "fresh"));
+    EXPECT_FALSE(successor->refLaneWedgedForTest(ns));
+    EXPECT_FALSE(successor->needsStalePrecommitSweepForTest(ns))
+        << "a verified-clean sweep clears the flag permanently";
+
+    /// Ground truth: every stale binding reclaimed; the successor's own committed work intact.
+    const RefTableState final_state = independentFullReplayForTest(*backend, layout, ns);
+    EXPECT_EQ(final_state.lifecycle, RefLifecycle::Live);
+    EXPECT_TRUE(final_state.precommits.empty());
+    EXPECT_TRUE(final_state.committed.contains("fresh"));
+
+    /// Audit (INTROSPECTION-1): exactly ONE `precommit_reclaim` event per reclaimed stale binding --
+    /// this is what makes the S13 card's "abandoned precommits reclaimed" counter falsifiable.
+    std::vector<String> reclaimed_refs;
+    for (const CasEvent & e : seen)
+        if (e.type == CasEventType::PrecommitReclaim)
+            reclaimed_refs.push_back(e.ref_name);
+    std::sort(reclaimed_refs.begin(), reclaimed_refs.end());
+    EXPECT_EQ(reclaimed_refs, (std::vector<String>{"stale_a", "stale_b", "stale_c"}));
+    EXPECT_EQ(global_counters[ProfileEvents::CasRefStalePrecommitsReclaimed].load(), reclaimed_before + 3);
+}
+
+/// Verified-clean semantics: a sweep that finds NOTHING stale clears the flag on its very first pass
+/// and emits no reclaim event (so "no abandons" and "reclaim broken" stay distinguishable in the
+/// audit log).
+TEST(RefWriterStalePrecommitSweep, VerifiedCleanSweepClearsFlagWithoutEvents)
+{
+    using ProfileEvents::global_counters;
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const RootNamespace ns{"srv1/precommit_sweep_clean"};
+
+    {
+        auto predecessor = openStore(backend);
+        publishEmptyPart(predecessor, ns, "committed_x");   /// committed work only; nothing dangles
+    }
+
+    auto successor = openStore(backend);
+    std::vector<CasEvent> seen;
+    successor->setEventSink([&](const CasEvent & e) { seen.push_back(e); });
+
+    const uint64_t deferred_before = ProfileEvents::global_counters[ProfileEvents::CasRefSweepDeferred].load();
+    const uint64_t reclaimed_before = global_counters[ProfileEvents::CasRefStalePrecommitsReclaimed].load();
+    EXPECT_NO_THROW(successor->listRefs(ns));
+    EXPECT_FALSE(successor->needsStalePrecommitSweepForTest(ns))
+        << "a clean first pass IS the verified-clean sweep: the flag clears without any removal";
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasRefSweepDeferred].load(), deferred_before);
+    EXPECT_EQ(global_counters[ProfileEvents::CasRefStalePrecommitsReclaimed].load(), reclaimed_before);
+    EXPECT_EQ(std::count_if(seen.begin(), seen.end(),
+        [](const CasEvent & e) { return e.type == CasEventType::PrecommitReclaim; }), 0);
 }
 
 /// ===================================================================================
