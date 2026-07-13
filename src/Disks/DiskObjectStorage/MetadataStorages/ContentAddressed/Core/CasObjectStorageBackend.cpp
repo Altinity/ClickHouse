@@ -90,6 +90,18 @@ ObjectStorageBackend::ObjectStorageBackend(ObjectStoragePtr object_storage_, Mod
             auto cfg = base_client->getClientConfiguration();
             cfg.retry_strategy.max_retries = 0;
             cfg.retryStrategy = std::make_shared<detail::SingleAttemptRetryStrategy>();
+
+            /// Enable `Expect: 100-continue` for CAS conditional writes on THIS client (B118). The
+            /// shared default is 0 = disabled (so non-CAS S3 traffic keeps upstream behaviour), so we
+            /// raise it here — the single-attempt client is the choke point every CAS conditional write
+            /// routes through (conditionalWriteSettings → s3_client_override). We respect an operator's
+            /// per-disk `expect_continue_min_bytes` (e.g. RustFS pools set 65536, inherited via `cfg`);
+            /// when the disk did not configure one, fall back to the historical 1 MiB gate so an
+            /// unconfigured CAS pool keeps exactly its prior behaviour.
+            static constexpr uint64_t kCasFallbackExpectContinueMinBytes = 1024 * 1024;
+            if (cfg.expect_continue_min_bytes == 0)
+                cfg.expect_continue_min_bytes = kCasFallbackExpectContinueMinBytes;
+
             single_attempt_s3_client = base_client->cloneWithConfigurationOverride(cfg);
         }
     }

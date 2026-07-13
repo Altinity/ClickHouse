@@ -33,11 +33,13 @@ inline static constexpr uint64_t DEFAULT_LIST_OBJECT_KEYS_SIZE = 1000;
 inline static constexpr uint64_t DEFAULT_MAX_SINGLE_READ_TRIES = 4;
 inline static constexpr uint64_t DEFAULT_MAX_UNEXPECTED_WRITE_ERROR_RETRIES = 4;
 inline static constexpr uint64_t DEFAULT_MAX_REDIRECTS = 10;
-/// A conditional write (If-None-Match / If-Match) whose body is at least this large negotiates
-/// `Expect: 100-continue` so the server can reject (e.g. 412) BEFORE the body is streamed (B118).
-/// Default keeps the historical 1 MiB gate (safe on stores that ignore Expect — see B120); lower it
-/// per-disk for a store that honors Expect to also cover sub-1MiB conditional PUTs (B187).
-inline static constexpr uint64_t DEFAULT_EXPECT_CONTINUE_MIN_BYTES = 1024 * 1024;
+/// Gate for the `Expect: 100-continue` negotiation on a conditional write (If-None-Match / If-Match):
+/// `0` = disabled (never negotiate Expect); a positive `N` negotiates Expect for a conditional `PUT`
+/// whose body is at least `N` bytes, so the server can reject (e.g. 412) BEFORE the body is streamed
+/// (B118). The default is DISABLED: only a CAS conditional-write client raises this (see the
+/// single-attempt client built in `ObjectStorageBackend`), so non-CAS S3 traffic keeps upstream
+/// behaviour instead of negotiating Expect on large conditional PUTs it never negotiated before.
+inline static constexpr uint64_t DEFAULT_EXPECT_CONTINUE_MIN_BYTES = 0;
 inline static constexpr uint64_t DEFAULT_RETRY_ATTEMPTS = 500;
 inline static constexpr uint64_t DEFAULT_RETRY_INITIAL_DELAY_MS = 25;
 inline static constexpr uint64_t DEFAULT_RETRY_MAX_DELAY_MS = 5000;

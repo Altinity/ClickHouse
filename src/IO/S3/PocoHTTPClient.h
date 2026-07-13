@@ -95,7 +95,9 @@ struct PocoHTTPClientConfiguration : public Aws::Client::ClientConfiguration
 
     /// See PoolBase::BehaviourOnLimit
     bool s3_use_adaptive_timeouts = true;
-    /// Conditional PUT (If-None-Match / If-Match) bodies >= this negotiate Expect: 100-continue (B118/B187).
+    /// Conditional PUT (If-None-Match / If-Match) bodies >= this negotiate Expect: 100-continue (B118).
+    /// `0` (the default) disables it, so non-CAS S3 clients keep upstream behaviour; only a CAS
+    /// conditional-write client raises it (see the single-attempt client in `ObjectStorageBackend`).
     size_t expect_continue_min_bytes = DEFAULT_EXPECT_CONTINUE_MIN_BYTES;
     size_t http_keep_alive_timeout = DEFAULT_HTTP_KEEP_ALIVE_TIMEOUT;
     size_t http_keep_alive_max_requests = DEFAULT_HTTP_KEEP_ALIVE_MAX_REQUEST;
