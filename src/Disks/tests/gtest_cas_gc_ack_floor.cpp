@@ -10,7 +10,13 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasServerRoot.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
+#include <Common/ProfileEvents.h>
 #include "cas_test_helpers.h"
+
+namespace ProfileEvents
+{
+extern const Event CasMetaDelete;
+}
 
 using namespace DB::Cas;
 using namespace DB::Cas::tests;
@@ -161,12 +167,15 @@ TEST(CasGcRetire, DeleteRemovesBodyAndMeta)
     Gc gc(store, kGc);
     gc.runRegularRound();
     dropRefTransition(*backend, store->layout(), ns, "tbl", r);
+    /// §0 introspection: the meta drop below rides `deleteMetaExact` (`CasMetaDelete` choke point).
+    const auto delete_before = ProfileEvents::global_counters[ProfileEvents::CasMetaDelete].load();
     // condemn -> graduate (round-paced) -> delete (the retired-cursor pipeline).
     ASSERT_TRUE(runRoundsUntilAbsent(store, gc, *backend, store->layout(), DB::UInt128(1)));
 
     EXPECT_FALSE(blobExists(*backend, store->layout(), DB::UInt128(1))) << "body gone via exact-token delete";
     EXPECT_FALSE(loadMetaForTest(*backend, store->layout(), DB::UInt128(1)).has_value())
         << "the meta must be dropped alongside the exact-token body delete (Task 5)";
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasMetaDelete].load() - delete_before, 1);
 }
 
 /// GC freshness meta is ADD-ONLY (spec 2026-07-11 deposed-leader `clearSparedMeta` fix): an entry whose

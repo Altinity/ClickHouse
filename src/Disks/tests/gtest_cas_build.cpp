@@ -16,7 +16,17 @@
 #include <IO/WriteBufferFromString.h>
 #include <IO/WriteHelpers.h>
 #include <Common/Exception.h>
+#include <Common/ProfileEvents.h>
 #include <Poco/Exception.h>
+
+namespace ProfileEvents
+{
+extern const Event CasMetaPut;
+extern const Event CasMetaCas;
+extern const Event CasMetaCreateClean;
+extern const Event CasMetaAdoptBackfill;
+extern const Event CasMetaResurrectClean;
+}
 
 namespace DB::ErrorCodes
 {
@@ -248,6 +258,68 @@ TEST(CasBuild, PutBlobFreshUploadWritesCleanMeta)
     EXPECT_EQ(lm->meta.size, payload.size());
 }
 
+/// §0 introspection: a fresh body upload writes the Clean meta exactly once through the
+/// `putMetaIfAbsent` choke point (`CasMetaPut`), tagged with its reason (`CasMetaCreateClean`).
+TEST(CasBuildMetaCounters, CreateCleanAndChokePointCountOnFreshBody)
+{
+    /// Fresh body upload writes the Clean meta exactly once: CasMetaPut +1 (choke point)
+    /// and CasMetaCreateClean +1 (reason). Reuse the fixture of the nearest putBlob test.
+    const auto put_before = ProfileEvents::global_counters[ProfileEvents::CasMetaPut].load();
+    const auto reason_before = ProfileEvents::global_counters[ProfileEvents::CasMetaCreateClean].load();
+
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = openStore(b);
+    auto build = s->startBuild({});
+
+    const String payload = "fresh-meta-payload-counters";
+    auto ref = build->putBlob(idOf(payload), BlobSource::fromString(payload));
+    EXPECT_EQ(ref.size, payload.size());
+
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasMetaPut].load() - put_before, 1);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasMetaCreateClean].load() - reason_before, 1);
+}
+
+/// §0 introspection: an adopt of a pre-existing body that has NO meta at all (a pre-protocol blob, or a
+/// lost race with a concurrent fresh-uploader's own meta write) backfills a Clean meta through the
+/// `putMetaIfAbsent` choke point (`CasMetaPut`), tagged with its reason (`CasMetaAdoptBackfill`). No
+/// existing test elsewhere in the suite drives this branch: every other pre-seeded raw body in this file
+/// pairs `writeRawBlobBody` with `writeMetaClean`, which skips the `!lm` backfill branch entirely.
+TEST(CasBuildMetaCounters, AdoptBackfillCountsChokePointAndReason)
+{
+    const auto put_before = ProfileEvents::global_counters[ProfileEvents::CasMetaPut].load();
+    const auto reason_before = ProfileEvents::global_counters[ProfileEvents::CasMetaAdoptBackfill].load();
+
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = openStore(b);
+
+    const String payload = "adopt-backfill-payload-counters";
+    const UInt128 hash = u128Of(payload);
+    const BlobRef id = idOf(payload);
+
+    /// Pre-seed a present body big enough that observeAndAdmit's logical-size guard does not underflow —
+    /// deliberately WITHOUT any meta (unlike PutBlobAdoptsWhenMetaCleanNoRetireView), so the adopt reaches
+    /// the `!lm` backfill branch.
+    const uint64_t header_len = s->poolMeta().blob_header_len;
+    String raw_body(header_len, '\0');
+    raw_body += payload;
+    writeRawBlobBody(*b, s->layout(), hash, raw_body);
+
+    /// Adopt must happen under a durable precommit edge (EDGE-BEFORE-OBSERVE).
+    const RootNamespace ns{"srv/tbl"};
+    auto build = startBuildFor(s, ns, "ref_adopt_backfill");
+    const ManifestId manifest_id = build->stageManifest({blobManifestEntry("data.bin", payload)});
+    build->precommitAdd(ns, "ref_adopt_backfill", manifest_id);
+    auto ref = build->putBlob(id, BlobSource::fromString(payload));
+    EXPECT_EQ(ref.ref, id);
+
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasMetaPut].load() - put_before, 1);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasMetaAdoptBackfill].load() - reason_before, 1);
+
+    const auto lm = loadMetaForTest(*b, s->layout(), hash);
+    ASSERT_TRUE(lm.has_value()) << "the adopt-backfill must leave a Clean meta for future point-readers";
+    EXPECT_EQ(lm->meta.state, MetaState::Clean);
+}
+
 /// The adopt decision is driven PURELY by the meta point-read — no RetireView is ever seeded in this
 /// test. A pre-existing body plus an independent Clean meta must be adopted (no putOverwrite/re-upload:
 /// the pre-seeded incarnation's token survives untouched), and the meta stays Clean.
@@ -356,6 +428,35 @@ TEST(CasBuild, PutBlobResurrectsWhenMetaCondemned)
     const auto lm = loadMetaForTest(*b, s->layout(), hash);
     ASSERT_TRUE(lm.has_value());
     EXPECT_EQ(lm->meta.state, MetaState::Clean) << "a resurrect must flip the meta back to Clean";
+}
+
+/// §0 introspection: the resurrect (condemned-displacement) meta flip goes through the `casMeta`
+/// choke point (`CasMetaCas`), tagged with its reason (`CasMetaResurrectClean`).
+TEST(CasBuildMetaCounters, ResurrectCountsCasAndReason)
+{
+    const auto cas_before = ProfileEvents::global_counters[ProfileEvents::CasMetaCas].load();
+    const auto reason_before = ProfileEvents::global_counters[ProfileEvents::CasMetaResurrectClean].load();
+
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = openStore(b);
+
+    const String payload = "resurrect-meta-payload-counters";
+    const UInt128 hash = u128Of(payload);
+    const BlobRef id = idOf(payload);
+
+    const uint64_t header_len = s->poolMeta().blob_header_len;
+    String raw_body(header_len, '\0');
+    raw_body += payload;
+    writeRawBlobBody(*b, s->layout(), hash, raw_body);
+    writeMetaClean(*b, s->layout(), hash, payload.size());
+    condemnMeta(*b, s->layout(), hash, /*condemn_round*/ 1);
+
+    auto build = s->startBuild({});
+    auto ref = build->putBlob(id, BlobSource::fromString(payload));
+    EXPECT_EQ(ref.ref, id);
+
+    EXPECT_GE(ProfileEvents::global_counters[ProfileEvents::CasMetaCas].load() - cas_before, 1);
+    EXPECT_GE(ProfileEvents::global_counters[ProfileEvents::CasMetaResurrectClean].load() - reason_before, 1);
 }
 
 TEST(CasBuild, PutBlobWrongSizeFailsClosed)

@@ -18,6 +18,9 @@ namespace ProfileEvents
     extern const Event CasBlobHeadFirst;
     extern const Event CasBlobBodyPutAvoided;
     extern const Event CasBlobCopyForward;
+    extern const Event CasMetaCreateClean;
+    extern const Event CasMetaAdoptBackfill;
+    extern const Event CasMetaResurrectClean;
 }
 
 namespace DB
@@ -331,8 +334,11 @@ uint64_t Build::observeAndAdmit(ObjectKind kind, const BlobRef & ref, const Stri
     /// point-readers (writers and GC) never have to fall back to a HEAD-only guess. A Conflict here just
     /// means a racing writer already created it — both agree on the same Clean steady state.
     if (!lm)
+    {
+        ProfileEvents::increment(ProfileEvents::CasMetaAdoptBackfill);
         putMetaIfAbsent(store->backend(), store->layout(), ref,
             BlobMeta{.state = MetaState::Clean, .condemn_round = 0, .size = logical_size});
+    }
 
     /// Adopt the current incarnation — free, no bytes moved.
     /// B170: reuse ADOPTED an existing incarnation's token as NOT condemned (per the meta point-read).
@@ -442,6 +448,7 @@ void Build::uploadFromSource(ObjectKind kind, const BlobRef & ref, const String 
     /// on the same Clean steady state).
     auto writeFreshMetaClean = [&]()
     {
+        ProfileEvents::increment(ProfileEvents::CasMetaCreateClean);
         putMetaIfAbsent(store->backend(), store->layout(), ref,
             BlobMeta{.state = MetaState::Clean, .condemn_round = 0, .size = source.size});
     };
@@ -455,6 +462,7 @@ void Build::uploadFromSource(ObjectKind kind, const BlobRef & ref, const String 
     /// freshness marker for the NEXT point-reader.
     auto writeResurrectMetaClean = [&](std::optional<LoadedMeta> lm_before)
     {
+        ProfileEvents::increment(ProfileEvents::CasMetaResurrectClean);
         const BlobMeta clean{.state = MetaState::Clean, .condemn_round = 0, .size = source.size};
         constexpr int max_meta_attempts = 8;
         for (int attempt = 0; attempt < max_meta_attempts; ++attempt)
