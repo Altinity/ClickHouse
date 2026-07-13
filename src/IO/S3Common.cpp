@@ -43,6 +43,15 @@ bool S3Exception::isAccessTokenExpiredError() const
     return code == Aws::S3::S3Errors::INVALID_ACCESS_KEY_ID || code == Aws::S3::S3Errors::ACCESS_DENIED || code == Aws::S3::S3Errors::INVALID_SIGNATURE || code == Aws::S3::S3Errors::UNKNOWN;
 }
 
+bool S3Exception::isPreconditionFailed() const
+{
+    /// See `S3::isPreconditionFailedError`. The thrown exception no longer carries the HTTP status, so
+    /// only the name and raw message are available here — fail-safe: matching too broadly maps a hard
+    /// error to a retryable re-validate, never a false success.
+    return exception_name == "PreconditionFailed"
+        || message().find("PreconditionFailed") != std::string::npos;
+}
+
 }
 
 #endif

@@ -69,6 +69,11 @@ public:
     bool isRetryableError() const;
     bool isAccessTokenExpiredError() const;
 
+    /// True for a conditional-request 412 (a lost `If-Match`/`If-None-Match`). The thrown exception
+    /// discards the HTTP status, so it matches on the canonical `<Code>` name and the raw message —
+    /// see `S3::isPreconditionFailedError` for the full (response-code-aware) policy.
+    bool isPreconditionFailed() const;
+
     S3Exception * clone() const override { return new S3Exception(*this); }
     void rethrow() const override { throw *this; } /// NOLINT(cert-err60-cpp)
 
@@ -76,6 +81,25 @@ private:
     Aws::S3::S3Errors code;
     String exception_name;
 };
+
+namespace S3
+{
+
+/// One policy for "is this error a conditional-request 412 (`PreconditionFailed`)?", shared by the
+/// retry strategy and the CA conditional delete/copy paths. The HTTP status is authoritative — a
+/// non-AWS body (e.g. RustFS) leaves the SDK-parsed `ExceptionName` empty — with the canonical `<Code>`
+/// name and the raw message as fallbacks. Fail-safe by direction: over-matching only forces a caller
+/// re-validate, never a false success.
+template <typename ErrorType>
+inline bool isPreconditionFailedError(const Aws::Client::AWSError<ErrorType> & error)
+{
+    return error.GetResponseCode() == Aws::Http::HttpResponseCode::PRECONDITION_FAILED
+        || error.GetExceptionName() == "PreconditionFailed"
+        || error.GetMessage().find("PreconditionFailed") != std::string::npos;
+}
+
+}
+
 }
 
 #endif

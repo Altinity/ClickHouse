@@ -209,11 +209,22 @@ TEST(IOTestAwsS3Client, DoesNotRetryPreconditionFailed)
     Aws::Client::AWSError<Aws::Client::CoreErrors> precondition(Aws::Client::CoreErrors::UNKNOWN, /*isRetryable=*/true);
     precondition.SetResponseCode(Aws::Http::HttpResponseCode::PRECONDITION_FAILED);
     EXPECT_FALSE(strategy.ShouldRetry(precondition, /*attemptedRetries=*/0));
+    EXPECT_TRUE(DB::S3::isPreconditionFailedError(precondition));       // one policy: agrees via response code
 
     /// A genuinely transient error is still retried (the guard is specific to 412).
     Aws::Client::AWSError<Aws::Client::CoreErrors> unavailable(Aws::Client::CoreErrors::SLOW_DOWN, /*isRetryable=*/true);
     unavailable.SetResponseCode(Aws::Http::HttpResponseCode::SERVICE_UNAVAILABLE);
     EXPECT_TRUE(strategy.ShouldRetry(unavailable, /*attemptedRetries=*/0));
+    EXPECT_FALSE(DB::S3::isPreconditionFailedError(unavailable));
+
+    /// The one 412 policy also matches on the canonical <Code> name / raw body (the two CA conditional
+    /// ops see an error whose ExceptionName the SDK DID parse, or whose body carries the token).
+    Aws::Client::AWSError<Aws::S3::S3Errors> named(Aws::S3::S3Errors::UNKNOWN, "PreconditionFailed", "precondition failed", false);
+    EXPECT_TRUE(DB::S3::isPreconditionFailedError(named));
+
+    /// Typed-exception surface (the conditional copy / finalize catch an S3Exception): name and message.
+    EXPECT_TRUE(DB::S3Exception("boom", Aws::S3::S3Errors::UNKNOWN, "PreconditionFailed").isPreconditionFailed());
+    EXPECT_FALSE(DB::S3Exception("boom", Aws::S3::S3Errors::NO_SUCH_KEY, "NoSuchKey").isPreconditionFailed());
 }
 
 TEST(IOTestAwsS3Client, AppendExtraSSECHeadersRead)

@@ -183,12 +183,13 @@ std::optional<HeadResult> ObjectStorageBackend::nativeHead(const String & key)
 ///
 /// A backend reports a lost condition as an `S3Exception` carrying the canonical S3 error code string
 /// from the response XML `<Code>` (`S3Exception::getExceptionName`); a conditional-write 412 is
-/// UNMODELED for the AWS SDK (its enum value is UNKNOWN), so the name — matched EXACTLY, never as a
-/// substring of free text — is the typed signal. A `404 NoSuchKey` on an `If-Match` PUT (the key was
-/// deleted out from under us) is treated identically: protocol callers handle 'mismatch' and 'gone'
-/// the same way (re-validate), so both collapse onto `PreconditionFailed`. `NoSuchKey` IS modeled by
-/// the SDK, and `WriteBufferFromS3` retries it internally surfacing the exhaustion with the typed enum
-/// code (and no name), so the enum is matched as well as the name. The mapping is fail-safe in
+/// UNMODELED for the AWS SDK (its enum value is UNKNOWN), so `S3Exception::isPreconditionFailed` is the
+/// typed signal — the `PreconditionFailed` name, or that token in the raw body for S3-compatible stores
+/// (RustFS) whose non-AWS body the SDK cannot parse into a name. A `404 NoSuchKey` on an `If-Match` PUT
+/// (the key was deleted out from under us) is treated identically: protocol callers handle 'mismatch'
+/// and 'gone' the same way (re-validate), so both collapse onto `PreconditionFailed`. `NoSuchKey` IS
+/// modeled by the SDK, and `WriteBufferFromS3` retries it internally surfacing the exhaustion with the
+/// typed enum code (and no name), so the enum is matched as well as the name. The mapping is fail-safe in
 /// direction: a misread error becomes a retryable PreconditionFailed/Conflict, never a false success.
 ///
 /// HONEST NOTE: the Native conditional-write paths are exercised end-to-end only at M-W against
@@ -203,7 +204,7 @@ PutOutcome detail::finalizeConditionalWrite(WriteBuffer & buf)
     }
     catch (const S3Exception & e)
     {
-        if (e.getExceptionName() == "PreconditionFailed"
+        if (e.isPreconditionFailed()
             || e.getExceptionName() == "NoSuchKey"
             || e.getS3ErrorCode() == Aws::S3::S3Errors::NO_SUCH_KEY)
             return PutOutcome::PreconditionFailed;

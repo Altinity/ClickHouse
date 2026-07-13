@@ -490,12 +490,10 @@ ConditionalRemoveResult S3ObjectStorage::removeObjectIfTokenMatches(const Stored
 
     const auto & err = outcome.GetError();
 
-    /// The token did not match the current incarnation: the conditional delete is rejected with
-    /// HTTP 412 PreconditionFailed. The AWS SDK does not map this to a dedicated S3Errors enum value,
-    /// so detect it the same way the PoC's `condCreateViaIfNoneMatch` detects an `If-None-Match` loss:
-    /// by the `PreconditionFailed` token in the error name/message.
-    if (err.GetExceptionName() == "PreconditionFailed"
-        || err.GetMessage().find("PreconditionFailed") != std::string::npos)
+    /// The token did not match the current incarnation: the conditional delete is rejected with a 412
+    /// (see `S3::isPreconditionFailedError` for the one policy). Callers treat 'mismatch' and 'gone'
+    /// alike (re-validate); a genuine absence is disambiguated downstream by a HEAD re-check.
+    if (S3::isPreconditionFailedError(err))
         return {ConditionalRemoveOutcome::TokenMismatch, false};
 
     /// The object no longer exists (404). Protocol callers treat 'mismatch' and 'gone' alike (re-validate).
@@ -795,12 +793,9 @@ ConditionalCopyResult S3ObjectStorage::copyObjectConditional( // NOLINT
     }
     catch (S3Exception & exc)
     {
-        /// A `412 Precondition Failed` is the expected "lost the race" signal (the destination
-        /// already exists), not an error: detect it the same way `removeObjectIfTokenMatches` detects
-        /// the `If-Match` loss on conditional delete (the AWS SDK does not map this to a dedicated
-        /// `S3Errors` enum value, so the canonical `<Code>` string is the only reliable discriminator).
-        if (exc.getExceptionName() == "PreconditionFailed"
-            || exc.message().find("PreconditionFailed") != std::string::npos)
+        /// A `412 Precondition Failed` is the expected "lost the race" signal (the destination already
+        /// exists), not an error — see `S3Exception::isPreconditionFailed` for the one policy.
+        if (exc.isPreconditionFailed())
             return {.created = false, .dest_etag = {}};
 
         /// Any other failure (network error, access denied, etc.) is a real error and must propagate:

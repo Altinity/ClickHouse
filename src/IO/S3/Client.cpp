@@ -27,6 +27,7 @@
 #include <Poco/String.h>
 
 #include <IO/Expect404ResponseScope.h>
+#include <IO/S3Common.h>
 #include <IO/S3/Requests.h>
 #include <IO/S3/PocoHTTPClientFactory.h>
 #include <IO/S3/AWSLogger.h>
@@ -102,14 +103,11 @@ bool Client::RetryStrategy::ShouldRetry(const Aws::Client::AWSError<Aws::Client:
     if (error.GetResponseCode() == Aws::Http::HttpResponseCode::MOVED_PERMANENTLY)
         return false;
 
-    /// A 412 Precondition Failed is the DETERMINISTIC result of a conditional request (If-Match /
-    /// If-None-Match — used by the content-addressed MergeTree backend for CAS and dedup writes).
-    /// Retrying never changes it: the precondition is re-evaluated server-side and the caller is the
-    /// one that must inspect the 412 and decide (re-validate / treat as a dedup hit). Some
-    /// S3-compatible servers (e.g. RustFS) return a non-AWS error body, so the SDK cannot parse the
-    /// ExceptionName and classifies the 412 as a retryable UNKNOWN error — producing a retry storm
-    /// that stalls the write path and, downstream, SYSTEM SYNC REPLICA (B166). Return it immediately.
-    if (error.GetResponseCode() == Aws::Http::HttpResponseCode::PRECONDITION_FAILED)
+    /// A 412 Precondition Failed is the DETERMINISTIC result of a conditional request (the
+    /// content-addressed backend's CAS/dedup writes). Retrying never changes it, and on a store that
+    /// returns a non-AWS body (RustFS) the SDK marks the 412 retryable and storms the write path — and
+    /// downstream SYSTEM SYNC REPLICA (B166). One 412 policy across the retry and CA conditional ops.
+    if (S3::isPreconditionFailedError(error))
         return false;
 
     if (attemptedRetries >= config.max_retries)
