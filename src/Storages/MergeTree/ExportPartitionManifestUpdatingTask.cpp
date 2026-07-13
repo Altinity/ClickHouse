@@ -695,9 +695,22 @@ void ExportPartitionManifestUpdatingTask::addTask(
 
     auto it = entries_by_key.find(key);
     if (it != entries_by_key.end())
-        entries_by_key.replace(it, entry);
-    else
-        entries_by_key.insert(entry);
+    {
+        if (!entries_by_key.replace(it, entry))
+            LOG_ERROR(storage.log,
+                "ExportPartition Manifest Updating Task: failed to replace in-memory entry for {} (transaction_id {}). "
+                "This most likely means another export already holds the same transaction_id (id collision); "
+                "this export will be missing from system.replicated_partition_exports.",
+                key, entry.getTransactionId());
+    }
+    else if (!entries_by_key.insert(entry).second)
+    {
+        LOG_ERROR(storage.log,
+            "ExportPartition Manifest Updating Task: failed to insert in-memory entry for {} (transaction_id {}). "
+            "Another entry already holds this transaction_id (id collision); "
+            "this export will be invisible in system.replicated_partition_exports.",
+            key, entry.getTransactionId());
+    }
 }
 
 void ExportPartitionManifestUpdatingTask::removeStaleEntries(
