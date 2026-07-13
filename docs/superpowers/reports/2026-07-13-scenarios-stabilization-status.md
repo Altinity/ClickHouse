@@ -89,11 +89,14 @@ framework's storage config) — harness work, to be planned with the card implem
 
 ## Product-adjacent finding (backlog) {#merge-retry-cost}
 
-**Unbounded replicated-merge retry under persistent S3 timeouts** (S01@8GiB): each merge retry
-re-streams gigabytes and progress resets indefinitely (27%→0.8% loops) while the store is degraded —
-a runaway-COST class, not safety (the merge itself is correct). Candidate: bounded backoff /
-circuit-breaker on repeated `S3_ERROR` merge failures, or riding the availfix controller budget at
-the merge-write layer. Recorded here + scenario backlog; not scheduled.
+**Merge upload-failure handling** (S01@8GiB; investigation OPEN and quality-flagged — see the
+`merge-upload-retry-investigation` memory note; three early analyses were wrong, systematic
+debugging required before any fix). Log-verified: repeated MPU aborts (26/8min) while the merge
+progress reset in loops; the INSERT path survived the same store stall by re-streaming from its
+live scratch file within the query. **Required behavior (user): a merge whose upload fails must
+retry the UPLOAD from the staged part — never rerun the whole merge.** To verify first: which layer
+discards the staged result today, which S3 client uploads blob-body parts, whether the controller
+budget truly starves gigabyte streams. Circuit-breaker remains the outer safety net only.
 
 ## Where this leaves the suite {#next}
 
