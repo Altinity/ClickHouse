@@ -421,6 +421,19 @@ def is_s3_transient(exc: BaseException) -> bool:
     return isinstance(exc, QueryError) and exc.is_s3_transient
 
 
+def is_aborted(exc: BaseException) -> bool:
+    """A retryable ABORTED (code 236) that PERSISTED past `retry_on_aborted`'s tiny same-node budget
+    (6 tries x 0.05s -- sized for the sub-second B137 resurrect-vs-GC race). Post-stagefix
+    (c3d9aa9d8d6) an exhausted manifest-PUT controller budget also surfaces as ABORTED, and under a
+    COMPOUND chaos window (20m-i3: ch1 freeze 76s -> rustfs pause -> rustfs restart -> ch2 freeze,
+    back-to-back) it persists for the whole outage -- far beyond the inner budget, well inside the
+    transport envelope. Two-tier design: the inner loop absorbs the fast race; when it exhausts and
+    re-raises, THIS predicate lets `retry_on_transport` absorb the long tail with reroute + the
+    shared ~287s capped-exponential budget. A genuinely wedged ABORTED still fails after that bound.
+    Retry safety: identical to `is_s3_transient` above (byte-identical INSERT, RMT block-dedup)."""
+    return isinstance(exc, QueryError) and exc.is_aborted
+
+
 def retry_on_transport(fn, *, attempts: int, backoff_s: float = 0.5, max_backoff_s: float = 8.0,
                        on_retry=None, sleep_fn=time.sleep):
     """Call `fn` and retry it on a NODE-DOWN failure (`is_node_down`: a connection-level transport
@@ -428,9 +441,11 @@ def retry_on_transport(fn, *, attempts: int, backoff_s: float = 0.5, max_backoff
     `is_mount_fenced`/`is_keeper_transient`/`is_s3_transient` `QueryError`, with bounded,
     capped-exponential backoff, up to `attempts` total tries. A persistent failure after the budget is
     exhausted is re-raised -- per the task spec, a node that never comes back within a generous bound
-    IS a failure (the feature must survive crash+restart). Other exceptions (a logic `QueryError`, the
-    B137 ABORTED transient that has its own retry, ...) propagate IMMEDIATELY so the caller's own
-    handling sees them unmasked.
+    IS a failure (the feature must survive crash+restart). Other exceptions (a logic `QueryError`,
+    ...) propagate IMMEDIATELY so the caller's own handling sees them unmasked. ABORTED (236) is
+    two-tier: `retry_on_aborted` absorbs the sub-second B137 race on the same node; only when that
+    inner budget exhausts does the re-raised ABORTED land here for the long-tail treatment
+    (see `is_aborted`).
 
     Budget note: with the caller's default `attempts=TRANSPORT_ATTEMPTS` (40, `run.py`) and this
     function's default `backoff_s=0.5`/`max_backoff_s=8.0`, the capped-exponential backoff sums to
@@ -451,7 +466,7 @@ def retry_on_transport(fn, *, attempts: int, backoff_s: float = 0.5, max_backoff
             return fn()
         except Exception as e:
             if not (is_node_down(e) or is_readonly(e) or is_mount_fenced(e) or is_keeper_transient(e)
-                    or is_s3_transient(e)):
+                    or is_s3_transient(e) or is_aborted(e)):
                 raise
             last = e
             if attempt < attempts:
@@ -506,3 +521,22 @@ class Cluster:
             ["docker", "exec", container, *args],
             capture_output=True, text=True)
         return p.returncode, p.stdout, p.stderr
+
+
+def classify_retry_error(exc: BaseException) -> str:
+    """Availability-accounting label for a driver-retried error (see run.py AVAILABILITY report).
+    Order matters: most-specific first; `node_down` covers plain transport-level failures."""
+    if isinstance(exc, QueryError):
+        if is_mount_fenced(exc):
+            return "mount_fenced"
+        if is_keeper_transient(exc):
+            return "keeper_transient"
+        if is_s3_transient(exc):
+            return "s3_transient"
+        if is_aborted(exc):
+            return "aborted_persistent"
+        if is_readonly(exc):
+            return "readonly"
+    if is_node_down(exc):
+        return "node_down"
+    return "other"

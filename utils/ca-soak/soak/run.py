@@ -44,6 +44,7 @@ from soak.cluster import (
     retry_on_aborted,
     retry_on_transport,
     is_transport_error,
+    classify_retry_error,
 )
 from soak.ledger import generate_ledger, Op, OpType
 from soak.model import Model
@@ -227,6 +228,7 @@ class Driver:
         # that must surface immediately).
         self.transport_resilient = transport_resilient
         self.transport_retries = 0  # count of transport-retried op attempts (chaos evidence)
+        self.retry_class_counts = {}  # error-class -> count (availability accounting; see _note_transport_retry)
         self._transport_lock = threading.Lock()
         # Phase-3 resource bounding: an insert THROTTLE the metrics ticker raises when the physical
         # pool approaches --max-pool-gb. `throttle_sleep_s` (0 == unthrottled) is the per-insert delay
@@ -244,8 +246,16 @@ class Driver:
         self._optimize_gate = threading.BoundedSemaphore(1)
 
     def _note_transport_retry(self, op_kind, op_id, attempt, node, err):
+        # Availability accounting (2026-07-13, user finding): every driver-level retry is a
+        # PRODUCT-VISIBLE failure the server did not absorb internally. A week-old build absorbed
+        # S3 blips server-side (multi-attempt conditional writes pre-bc40f5fd945), so a healthy
+        # build should keep these counts near zero outside node-kill windows. The per-class
+        # breakdown below is printed at run end so harness tolerance can never silently mask a
+        # product availability regression again.
+        klass = classify_retry_error(err)
         with self._transport_lock:
             self.transport_retries += 1
+            self.retry_class_counts[klass] = self.retry_class_counts.get(klass, 0) + 1
         log(f"{op_kind} op_id={op_id} transport failure on {node} (attempt {attempt}); "
             f"rerouting/retrying. {type(err).__name__}: {err}")
 
@@ -1305,6 +1315,14 @@ def run_phase3(args):
         f"transport-retried op attempts: {driver.transport_retries}; "
         f"faults fired: {chaos.faults_fired}; restarts: {restarts['n']}; "
         f"metrics rows recorded: {ticker.recorded} (ticks={ticker.ticks})")
+    # AVAILABILITY REPORT (2026-07-13): each driver-level retry is a product-visible failure the
+    # server did not absorb. Per-class counts make harness tolerance measurable instead of masking:
+    # compare across runs — a healthy build keeps non-node-down classes near zero.
+    if driver.retry_class_counts:
+        breakdown = ", ".join(f"{k}={v}" for k, v in sorted(driver.retry_class_counts.items()))
+        log(f"AVAILABILITY: driver-retried product-visible failures by class: {breakdown}")
+    else:
+        log("AVAILABILITY: zero driver-retried product-visible failures (server absorbed everything)")
     print("PHASE3 OK")
     return 0
 

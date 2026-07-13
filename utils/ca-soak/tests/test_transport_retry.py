@@ -207,15 +207,17 @@ def test_retry_exhaustion_raises_transport():
 
 
 def test_non_transport_error_propagates_immediately():
+    # CONTRACT CHANGE (20m-i3, two-tier ABORTED): an ABORTED reaching this loop means the inner
+    # `retry_on_aborted` budget already exhausted, and the outer envelope now absorbs it (see
+    # `is_aborted`). The representative non-retryable error is a LOGIC QueryError.
     calls = {"n": 0}
 
     def attempt():
         calls["n"] += 1
-        raise aborted_query_error()   # a QueryError is NOT transport -> must not be retried here
+        raise unknown_table_error()   # a logic QueryError -> must not be retried here
 
-    with pytest.raises(QueryError) as ei:
+    with pytest.raises(QueryError):
         retry_on_transport(attempt, attempts=5, sleep_fn=lambda s: None)
-    assert ei.value.is_aborted
     assert calls["n"] == 1            # raised on the first attempt, no transport retry
 
 
@@ -357,3 +359,58 @@ def test_non_keeper_http_500_not_retried():
         retry_on_transport(attempt, attempts=5, sleep_fn=lambda s: None)
     assert not ei.value.is_keeper_transient
     assert calls["n"] == 1   # raised on the first attempt, no retry
+
+
+def stage_uncertain_aborted_error():
+    # The 20m-i3 reproducer (tmp/soak_20m_i3.log:183): the stagefix (c3d9aa9d8d6) controller
+    # exhausts its manifest-PUT budget during a compound chaos window and surfaces ABORTED —
+    # persisting far past `retry_on_aborted`'s sub-second inner budget.
+    body = ("Code: 236. DB::Exception: stageManifest: part-manifest PUT at 'soak_pool/cas/.../000001.proto' "
+            "is UNCERTAIN (retry budget exhausted) — nothing conclusive was named; the caller re-stages "
+            "with a fresh ManifestId. (ABORTED) (version 26.6.1.1)")
+    return QueryError("Node(localhost:8123)", 500, body, "INSERT INTO ca_stress VALUES")
+
+
+def test_persistent_aborted_is_absorbed_by_transport_envelope():
+    # Two-tier design: after retry_on_aborted exhausts and re-raises, the OUTER transport loop must
+    # absorb the still-transient ABORTED (compound fault window) and succeed once the store heals.
+    from soak.cluster import is_aborted
+
+    err = stage_uncertain_aborted_error()
+    assert is_aborted(err)
+
+    calls = {"n": 0}
+
+    def fn():
+        calls["n"] += 1
+        if calls["n"] < 4:
+            raise err
+        return "ok"
+
+    slept = []
+    assert retry_on_transport(fn, attempts=10, sleep_fn=slept.append) == "ok"
+    assert calls["n"] == 4
+    assert len(slept) == 3
+
+
+def test_persistent_aborted_still_fails_after_transport_budget():
+    err = stage_uncertain_aborted_error()
+
+    def fn():
+        raise err
+
+    with pytest.raises(QueryError):
+        retry_on_transport(fn, attempts=5, sleep_fn=lambda _s: None)
+
+
+def test_non_aborted_logic_error_still_fails_fast():
+    err = unknown_table_error()
+    calls = {"n": 0}
+
+    def fn():
+        calls["n"] += 1
+        raise err
+
+    with pytest.raises(QueryError):
+        retry_on_transport(fn, attempts=10, sleep_fn=lambda _s: None)
+    assert calls["n"] == 1
