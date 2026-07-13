@@ -184,3 +184,11 @@ Insights:
    fat `payload` strings go Wide at ~200 rows while 1 800-row thin parts stay Compact.
 4. HEAD ≈ 1.6 × files for Wide parts (per-file dedup probe + adopt/freshness verification) —
    consistent with the dedup-by-hash design.
+
+## Final run outcome {#final-outcome}
+
+**PHASE3 OK** — the full 2h run completed green: 38 chaos faults survived, clean teardown.
+Final `AVAILABILITY`: `node_down=723` (irreducible — kill/restart faults), `aborted_persistent=20`
+(compound fault windows occasionally exceeding the 90 s controller envelope — the known M3 backlog
+residual), `mount_fenced=3`, `s3_transient=1`. 24 non-node-down driver retries over 2 hours of
+sustained chaos.
