@@ -1,10 +1,13 @@
 """S03 million-live-object idle GC + S04 million-object orphan drain + S05 10000 sparse tables (P0).
 
-These three cards target the scale risks called out in the README §"Code-review surprise checklist":
-regular GC carries a `namespaces * root_shards` discovery baseline, token-diff lists the whole
-`roots/` prefix, and `discoverUniverse` expands every namespace to every root shard. The cards prove
-that GC cost (duration, memory, S3 GET/LIST counts) tracks *changed* owner transitions rather than the
-total number of live blob objects or idle namespaces.
+These three cards target the scale risks called out in the README §"Code-review surprise checklist"
+for the ref snapshot-log protocol. Ref state for a table lives as one `_log` object per ref-publish
+CAS plus an occasional full-state `_snap`; regular `GC` discovers the whole ref population with a
+single global `LIST` per round (`CasRefGlobalListPages`) and each table's fold reads only the logs
+newer than its own persisted cursor (`CasRefLogBodyGets`). The cards prove that GC cost (duration,
+memory, S3 GET/LIST counts) tracks *new logs since the per-table fold cursor* rather than the total
+number of live blob objects, idle namespaces, or the removed `namespaces * root_shards` RootShard
+discovery baseline.
 
 Dev scale is deliberately a few thousand objects / a few hundred tables so a developer run finishes in
 seconds to ~2 min; ci is larger and full is the spec target (1M-10M objects, 10000 tables). Every card
@@ -170,8 +173,8 @@ class S03(Scenario):
             "CasBlobList == 0 for journal-driven GC",
             "0 (no full blob enumeration in regular GC rounds)",
             blob_list, blob_list == 0,
-            "" if blob_list == 0 else "regular idle GC listed blob objects — it should be journal "
-                                      "(token-diff) driven, not an orphan sweep; investigate"))
+            "" if blob_list == 0 else "regular idle GC listed blob objects — it should be ref-log "
+                                      "driven, not an orphan sweep; investigate"))
 
         # --- memory bounded, not by live-object count ---------------------------------------
         peak = _common.record_peak_memory(result, smp, label="peak MemoryResident during idle GC")
@@ -182,15 +185,18 @@ class S03(Scenario):
                 f"{peak/1e9:.2f} GB at ~{target_live} live rows / "
                 f"{live_blobs if live_blobs is not None else '?'} blob objects", "pass"))
 
-        # --- root/gc LIST and GET counters (record; bounded by changed shards) --------------
+        # --- ref LIST and GET counters (record; bounded by changed/new logs) ----------------
         list_counters = {k: int(delta.get(k, 0)) for k in (
-            "CasRootList", "CasRootGet", "CasGcGet", "CasGcPut", "CasBlobHead", "CasBlobDelete")}
+            "CasRefGlobalListPages", "CasRefLogBodyGets", "CasGcGet", "CasGcPut", "CasBlobHead",
+            "CasBlobDelete")}
         result.observations["idle_list_get_counters"] = list_counters
         result.add(Verdict(
-            "root LIST/GET driven by changed shards",
-            "per-round body reads driven by changed shards when token-diff applies",
+            "ref LIST/GET driven by changed logs",
+            "per-round CasRefLogBodyGets driven by NEW logs since the per-table fold cursor; "
+            "CasRefGlobalListPages scales with total ref-object population, not per-round work",
             list_counters, "pass",
-            "recorded; a hard O(shards) bound oracle needs root_shards from config (not wired here)"))
+            "recorded; the S05 card below asserts the non-vacuous per-round bound on "
+            "CasRefLogBodyGets"))
 
         # --- ops-budget: an IDLE round (no touch) does near-zero generation-run I/O -----------
         # Phase 4 Lever A (GC round skip-unchanged; docs/superpowers/cas/ROADMAP.md): a round that
@@ -203,7 +209,8 @@ class S03(Scenario):
         idle_round_delta = idle_round_counters().get("_total", {})
         idle_round_cas_gc_get = int(idle_round_delta.get("CasGcGet", 0))
         result.observations["idle_round_ops_budget"] = {
-            k: int(idle_round_delta.get(k, 0)) for k in ("CasGcGet", "CasRootGet", "CasRootList")}
+            k: int(idle_round_delta.get(k, 0))
+            for k in ("CasGcGet", "CasRefLogBodyGets", "CasRefGlobalListPages")}
 
         _common.assert_replicas_agree(result, cl, sql.table_checksum_query(table),
                                       name="S03 replica agreement")
@@ -328,7 +335,7 @@ class S04(Scenario):
         delta = counters().get("_total", {})
         result.observations["drain_counters"] = {k: int(delta.get(k, 0)) for k in (
             "CasBlobHead", "CasBlobDelete", "CasGcPut", "CasGcDelete", "CasGcGet",
-            "CasBlobList", "CasRootList", "CasRootGet")}
+            "CasBlobList", "CasRefGlobalListPages", "CasRefLogBodyGets")}
 
         # --- deleted/round, durations, replaced/spared from the GC log --------------------
         gc_all = _gc_log_since(ctx)
@@ -489,33 +496,40 @@ class S05(Scenario):
 
         delta = counters().get("_total", {})
         result.observations["sparse_phase_counters"] = {k: int(delta.get(k, 0)) for k in (
-            "CasRootList", "CasRootGet", "CasGcGet", "CasGcPut", "CasBlobList", "CasBlobHead",
-            "CasBlobDelete")}
+            "CasRefGlobalListPages", "CasRefLogBodyGets", "CasGcGet", "CasGcPut", "CasBlobList",
+            "CasBlobHead", "CasBlobDelete")}
 
         # --- idle tables don't dominate GC CPU / GET counts ---------------------------------
         gc_all = _gc_log_since(ctx)
         durs = _finish_durations(gc_all)
         rounds = max(1, len([d for d in durs if d is not None]))
-        root_get = int(delta.get("CasRootGet", 0))
-        get_per_round = root_get / rounds
-        result.observations["root_get_per_round_avg"] = round(get_per_round, 1)
-        # The fanout floor is tables * root_shards; we cannot read root_shards from config here, so we
-        # assert the weaker (still meaningful) property: per-round body GETs should be much smaller
-        # than one-GET-per-table-per-round (idle tables skipped via token diff).
+        # CasRefLogBodyGets (src/Common/ProfileEvents.cpp:762): ref-log transaction-body GETs decoded
+        # during the GC fold. This is the live, non-vacuous counter for this check. The old
+        # `CasRootGet` this oracle used to read was emitted by the RootShard protocol, which is GONE —
+        # the counter is always 0 today, so reading it here would make this check pass regardless of
+        # what GC actually did.
+        log_body_gets = int(delta.get("CasRefLogBodyGets", 0))
+        get_per_round = log_body_gets / rounds
+        result.observations["log_body_gets_per_round_avg"] = round(get_per_round, 1)
+        # Each table's fold reads only the logs newer than its own persisted cursor, so an idle table
+        # (no new logs since its last fold) contributes ~0 body GETs to a round; the O(tables) fanout
+        # floor this guards against is what a per-table cursor REGRESSION would cause (every table's
+        # already-folded logs re-read every round), not a token-diff/shard-skip mechanism (removed).
         if durs:
-            ok_get = get_per_round < ntables  # not O(tables) GETs per round
+            ok_get = get_per_round < ntables  # not O(tables) body GETs per round
             result.add(Verdict.check(
                 "idle tables don't dominate GC GETs",
-                f"CasRootGet/round << {ntables} (token-diff skips unchanged shards)",
-                f"{get_per_round:.0f} CasRootGet/round over {rounds} rounds",
+                f"CasRefLogBodyGets/round << {ntables} (per-table fold cursors skip already-folded logs)",
+                f"{get_per_round:.0f} CasRefLogBodyGets/round over {rounds} rounds",
                 ok_get,
-                "" if ok_get else f"GC did ~O(tables) root GETs/round ({get_per_round:.0f} >= "
-                                  f"{ntables}) — token-diff is NOT skipping idle table shards; "
-                                  f"flag per README S05 'O(tables * root_shards)' warning"))
+                "" if ok_get else f"GC did ~O(tables) ref-log body GETs/round ({get_per_round:.0f} >= "
+                                  f"{ntables}) — the per-table fold cursor is NOT skipping idle "
+                                  f"tables' already-folded logs (cursor regression); flag per README "
+                                  f"S05 'GC re-reads bodies it has already folded' warning"))
         else:
             result.add(Verdict.inconclusive(
                 "idle tables don't dominate GC GETs",
-                "CasRootGet/round bounded by changed shards",
+                "CasRefLogBodyGets/round bounded by new logs since the per-table fold cursor",
                 "no GC finish rows captured to compute per-round GET cost"))
 
         blob_list = int(delta.get("CasBlobList", 0))
