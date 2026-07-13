@@ -52,9 +52,9 @@ This section is the first commit of the round; its counters are also useful to t
    (`CasGcMetaOps`) and the async-lister enumeration pages (`CasGcEnumerationPages`), incremented so
    they land in the GC round's `ProfileEvents` map (or, failing that, as clearly-named globals).
 3. Dedup-cache hit/miss counters if absent (`CasDedupCacheHits`/`Misses`).
-4. For every request class a later lever ELIMINATES, a counter of avoided operations
-   (`CasBlobAdoptTrusted`, `CasPartFolderValidateSkipped`, ...) — savings become directly visible,
-   not subtraction-derived.
+4. Avoided-op counters (`CasBlobAdoptTrusted`, `CasPartFolderValidateSkipped`, ...) land WITH
+   their levers (§3/§4), NOT here: declaring counters with zero emit sites is the S13
+   INTROSPECTION-1 anti-pattern (unfalsifiable instrumentation).
 5. No new system tables; ProfileEvents + `system.content_addressed_log` only.
 
 ## §1 GC fold read-buffer right-sizing (memory) {#s1-fold-buffers}
