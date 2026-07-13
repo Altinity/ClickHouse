@@ -3,6 +3,13 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
 #include <Disks/tests/cas_test_helpers.h>
+#include <Common/ProfileEvents.h>
+
+namespace ProfileEvents
+{
+extern const Event CasDedupCacheHits;
+extern const Event CasDedupCacheMisses;
+}
 
 using namespace DB::Cas;
 using DB::Cas::tests::idOf;
@@ -117,6 +124,46 @@ TEST(CaDedupCache, HitTakesHeadFirstNoBodyPut)
     counting->stream_puts = 0;
     b2->putBlob(idOf("dup"), BlobSource::fromString("dup"));
     EXPECT_EQ(counting->stream_puts, 0u);                  /// body PUT avoided
+}
+
+/// Task 3 (Round-B §0.3 introspection): the raw dedup_cache presence-lookup counters increment
+/// independently of what putBlob does with the answer. First lookup of a fresh hash misses (nothing
+/// cached yet); the identical second writer's lookup hits (the first writer's dedupCacheAdd populated
+/// the entry). putBlob's HEAD-first branch re-checks dedupCacheContains a second time purely to
+/// attribute CasBlobBodyPutAvoided to the cache (CasBuild.cpp), so a genuine hit can bump
+/// CasDedupCacheHits twice for one putBlob call -- hence GE, not EQ, on the hit delta below.
+TEST(CaDedupCache, HitMissCountersIncrement)
+{
+    using ProfileEvents::global_counters;
+    auto counting = std::make_shared<CountingBackend>(std::make_shared<InMemoryBackend>());
+    auto s = Store::open(counting, cfg(64ULL << 20, 1ULL << 20));
+
+    const auto miss_before = global_counters[ProfileEvents::CasDedupCacheMisses].load();
+    const auto hits_before = global_counters[ProfileEvents::CasDedupCacheHits].load();
+
+    /// First writer: cold cache, small body below the P2 size threshold -> the lookup misses.
+    auto b1 = s->startBuild({});
+    b1->putBlob(idOf("dup"), BlobSource::fromString("dup"));
+    EXPECT_EQ(global_counters[ProfileEvents::CasDedupCacheMisses].load() - miss_before, 1);
+
+    /// Second writer, identical content: the cache now holds the hash -> the lookup hits. The
+    /// head-first hit ADOPTS an existing incarnation, so it must run under a durable precommit edge
+    /// (EDGE-BEFORE-OBSERVE: stageManifest -> precommitAdd before putBlob), mirroring
+    /// HitTakesHeadFirstNoBodyPut above.
+    BuildInfo info2;
+    info2.intended_ref = "srv/tbl/ref2";
+    auto b2 = s->startBuild(info2);
+    ManifestEntry e2;
+    e2.path = "data.bin";
+    e2.placement = EntryPlacement::Blob;
+    e2.ref = DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(u128Of("dup"))};
+    e2.blob_size = 3;
+    const ManifestId id2 = b2->stageManifest({e2});
+    b2->precommitAdd(RootNamespace{"srv/tbl"}, "ref2", id2);
+    b2->putBlob(idOf("dup"), BlobSource::fromString("dup"));
+
+    EXPECT_EQ(global_counters[ProfileEvents::CasDedupCacheMisses].load() - miss_before, 1);
+    EXPECT_GE(global_counters[ProfileEvents::CasDedupCacheHits].load() - hits_before, 1);
 }
 
 /// Task 5 (P1 safety): a STALE cache hit (hash marked present but absent in the store) must not cause a

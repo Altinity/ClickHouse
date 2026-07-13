@@ -52,6 +52,8 @@ namespace ProfileEvents
     extern const Event CasRefSnapshotPublishDispatched;
     extern const Event CasRefSnapshotPublishBackoff;
     extern const Event CasRefLatePredecessorObserved;
+    extern const Event CasDedupCacheHits;
+    extern const Event CasDedupCacheMisses;
 }
 
 namespace DB::Cas
@@ -159,7 +161,23 @@ std::vector<uint8_t> Store::refreshAdmittedAlgos()
 
 bool Store::dedupCacheContains(const BlobRef & ref) const
 {
-    return dedup_cache && dedup_cache->contains(ref);
+    /// Task 3 (Round-B §0.3 introspection): raw lookup counters on the presence cache itself, disabled
+    /// (nullptr `dedup_cache`) means neither counter moves -- the short-circuit below never reaches the
+    /// probe. `Build::putBlob` calls this seam up to twice on a genuine hit (once to pick the
+    /// HEAD-first branch, once more just to attribute `CasBlobBodyPutAvoided` to the cache -- see
+    /// CasBuild.cpp), so `CasDedupCacheHits` counts LOOKUPS, not distinct blobs or putBlob calls. A hit
+    /// does not itself skip the HEAD that follows in putBlob's HEAD-first branch -- it steers the call
+    /// onto that cheap branch instead of an unconditional body stream; the body PUT is what a hit
+    /// actually avoids.
+    if (!dedup_cache)
+        return false;
+    if (dedup_cache->contains(ref))
+    {
+        ProfileEvents::increment(ProfileEvents::CasDedupCacheHits);
+        return true;
+    }
+    ProfileEvents::increment(ProfileEvents::CasDedupCacheMisses);
+    return false;
 }
 
 void Store::dedupCacheAdd(const BlobRef & ref)
