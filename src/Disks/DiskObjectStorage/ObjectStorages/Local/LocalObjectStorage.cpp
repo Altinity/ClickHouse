@@ -424,6 +424,17 @@ std::optional<ObjectMetadata> LocalObjectStorage::tryGetObjectMetadata(const std
 
 void LocalObjectStorage::listObjects(const std::string & path, RelativePathsWithMetadata & children, size_t/* max_keys */) const
 {
+    /// A path containing an embedded NUL byte is never valid on a POSIX filesystem: `std::string`/`fs::path`
+    /// preserve it, but every native syscall below (`opendir`, `stat`, ...) truncates at the first NUL via
+    /// `.c_str()`, so "descend into a subdirectory" silently re-opens the truncated prefix instead of the
+    /// real child (STID 1615-3a7b: the AST fuzzer injects a `\0` into an `icebergLocal(...)` path literal).
+    /// Because `is_directory()` on that truncated prefix keeps reporting the prefix itself (which does
+    /// exist and is a directory) for every entry, the walk below never makes progress and spins forever
+    /// pushing more iterators onto `stack` — reject fail-closed up front instead of looping.
+    if (path.find('\0') != std::string::npos)
+        throw fs::filesystem_error(
+            "Path contains an embedded NUL byte", path, std::make_error_code(std::errc::invalid_argument));
+
     if (!fs::exists(path) || !fs::is_directory(path))
         return;
 
@@ -475,8 +486,19 @@ void LocalObjectStorage::listObjects(const std::string & path, RelativePathsWith
             throw fs::filesystem_error("Got unexpected error while listing directory", path, ec);
         }
 
+        /// Never follow a symlink to descend into it: `directory_entry::is_directory()` resolves through
+        /// symlinks (like `stat`), so a symlink cycle (e.g. `root/loop -> .`) would otherwise make this
+        /// walk repeatedly re-open the same directories forever. `is_symlink()` uses `symlink_status`
+        /// (like `lstat`) and never follows the final component, so it correctly identifies the entry
+        /// itself regardless of its target. This matches the previous `recursive_directory_iterator`
+        /// default (`directory_options::none` does not follow directory symlinks either); a symlink is
+        /// then handled below like any other non-directory entry (and, if it resolves to a directory,
+        /// `tryGetObjectMetadata`'s own `is_directory` guard excludes it from the listing).
+        std::error_code symlink_ec;
+        const bool is_symlink = entry.is_symlink(symlink_ec);
+
         std::error_code dir_ec;
-        if (entry.is_directory(dir_ec))
+        if (!is_symlink && entry.is_directory(dir_ec))
         {
             /// Descend. If the directory was removed between enumeration and now, opening its stream fails
             /// with no_such_file_or_directory — skip it (it is absent from the snapshot) instead of throwing.
