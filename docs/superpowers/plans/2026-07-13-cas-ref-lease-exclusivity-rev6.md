@@ -1103,8 +1103,17 @@ git commit -m "cas: anomaly policy — LOGICAL_ERROR + fail-closed remount on im
       std::optional<RefTxnId> newest_snapshot_id;
       std::optional<RefTxnId> sealed_from; };
   RecoveredRefTable recoverRefTableDetailed(Backend &, const Layout &, const RootNamespace &,
+      std::function<void()> on_page_fetched = {},
       unsigned max_restarts = 3);   /// recoverRefTable stays as a thin wrapper returning .state
   ```
+  CARRY-FORWARD (added 2026-07-14 after the §0 introspection plan landed; final-review finding I1):
+  `recoverRefTable` NOW has an `on_page_fetched` parameter (4th, before `max_restarts`) and the GC
+  callers at `CasGc.cpp` / `CasOrphanManifestSweep.cpp` pass a callback that is the sole emit path
+  for `CasGcEnumerationPages` on the recovery-LIST scans. The wrapper refactor MUST preserve that
+  parameter and keep the two GC call sites passing it (fsck callers stay without it). Likewise the
+  `CasOrphanManifestSweep.cpp` log loop this task modifies already invokes `onGcEnumerationPage`
+  per fetched page — preserve that wiring while adding the late-log detector. Line anchors in this
+  task drifted vs the §0 commits (5edd9b39cec..de42a89ab87); re-locate by name.
   Detector rule: a listed `_log` id `L` with `sealed_from < L <= newest_snapshot_id` (when
   `sealed_from` is present) provably materialized after the recovery LIST → `LOG_WARNING` + one
   `RefLateLogDetected` event. Never GET the log body to "revive" it (resurrect invariant); GC's

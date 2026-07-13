@@ -75,7 +75,9 @@ Mechanics correction (2026-07-14, found during §0 implementation and verified t
 the `head_first` branch, so the `HEAD` runs precisely ON hits; what a `HEAD`-confirmed hit avoids is
 the body PUT (`CasBlobBodyPutAvoided`). A larger cache therefore trades body PUTs for HEADs rather
 than removing HEADs. Judge the matrix by BOTH deltas — `CasBlobHead` AND `CasBlobBodyPutAvoided` /
-PUT-class totals — with `CasDedupCacheHits`/`CasDedupCacheMisses` as the hit-rate denominators.
+PUT-class totals — with `CasDedupCacheHits`/`CasDedupCacheMisses` as the hit-rate denominators
+(per-LOOKUP rates: `putBlob` probes the cache at more than one point, so this is not a per-blob
+dedup rate).
 
 ## §3 Configurable cache validation (user decision) {#s3-validate-setting}
 
