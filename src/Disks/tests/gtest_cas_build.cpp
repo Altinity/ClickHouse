@@ -13,8 +13,10 @@
 #include <IO/HashingReadBuffer.h>
 #include <IO/ReadBufferFromMemory.h>
 #include <IO/WriteBuffer.h>
+#include <IO/WriteBufferFromString.h>
 #include <IO/WriteHelpers.h>
 #include <Common/Exception.h>
+#include <Poco/Exception.h>
 
 namespace DB::ErrorCodes
 {
@@ -2035,4 +2037,173 @@ TEST(CasBuild, WDepSetCrossAlgoSatisfactionFailsClosed)
 
     /// No committed ref appears — the promote aborted before installing one.
     EXPECT_FALSE(s->resolveRef(ns, "part_mixed").has_value());
+}
+
+/// =====================================================================================
+/// Task B (chaos-tolerance-report §Task B): stageManifest's part-manifest conditional PUT rides the
+/// shared CasRequestController — budgeted attempts + resolve-before-reissue — instead of the old
+/// single bare attempt (which a 19s object-store pause killed while every read path survived).
+/// =====================================================================================
+
+namespace
+{
+
+/// Faults the part-manifest body PUT (`/cas/manifests/` keys) with an ambiguous
+/// (Unresolved-classified) timeout a bounded number of times, mirroring RefWriterTestBackend's fault
+/// seam (gtest_cas_ref_writer.cpp). Covers BOTH write primitives — `putIfAbsent` (the controller
+/// path) and `putIfAbsentStream` (the pre-controller path) — with ONE shared `fault_count` and the
+/// same land/plant side effects, so the assertions are flip-proof against either implementation of
+/// the stage write.
+class ManifestPutFaultBackend final : public InMemoryBackend
+{
+public:
+    int fault_count = 0;                 /// remaining ambiguous faults on matching body PUTs
+    bool land_despite_fault = false;     /// the faulted attempt's own write actually lands (response lost)
+    String plant_different_on_fault;     /// a FOREIGN different body lands at the key before the fault
+    int put_attempts = 0;                /// matching body-PUT attempts observed (both primitives)
+
+    PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta = {}) override
+    {
+        if (!isManifestBodyKey(key))
+            return InMemoryBackend::putIfAbsent(key, bytes, meta);
+        ++put_attempts;
+        maybeFault(key, bytes);
+        return InMemoryBackend::putIfAbsent(key, bytes, meta);
+    }
+
+    WriteSinkPtr putIfAbsentStream(const String & key, const ObjectMeta & meta = {}) override
+    {
+        if (!isManifestBodyKey(key))
+            return InMemoryBackend::putIfAbsentStream(key, meta);
+
+        /// Counts/faults at finalize — the moment the old single-attempt path observed its timeout.
+        struct CountingOrFaultingSink final : WriteSink
+        {
+            ManifestPutFaultBackend & parent;
+            String key;
+            ObjectMeta meta;
+            DB::WriteBufferFromOwnString buf;
+
+            CountingOrFaultingSink(ManifestPutFaultBackend & parent_, String key_, ObjectMeta meta_)
+                : parent(parent_), key(std::move(key_)), meta(std::move(meta_)) {}
+
+            DB::WriteBuffer & buffer() override { return buf; }
+            PutResult finalize() override
+            {
+                ++parent.put_attempts;
+                const String & bytes = buf.str();
+                parent.maybeFault(key, bytes);
+                return parent.InMemoryBackend::putIfAbsent(key, bytes, meta);
+            }
+            void cancel() noexcept override {}
+        };
+        return std::make_unique<CountingOrFaultingSink>(*this, key, meta);
+    }
+
+private:
+    static bool isManifestBodyKey(const String & key) { return key.find("/cas/manifests/") != String::npos; }
+
+    /// One fault: apply the configured server-side effect, then lose the response.
+    void maybeFault(const String & key, const String & bytes)
+    {
+        if (fault_count <= 0)
+            return;
+        --fault_count;
+        if (!plant_different_on_fault.empty())
+            InMemoryBackend::putIfAbsent(key, plant_different_on_fault);
+        else if (land_despite_fault)
+            InMemoryBackend::putIfAbsent(key, bytes);
+        throw Poco::TimeoutException("ManifestPutFaultBackend: simulated ambiguous result (response lost)");
+    }
+};
+
+}
+
+/// The Task B core: two consecutive ambiguous timeouts on the part-manifest body PUT (each resolved
+/// to "absent" by the controller's exact-GET), then a clean third attempt. The old single-attempt
+/// path fails the whole stage on the FIRST timeout (the observed 19s-pause INSERT kill); the
+/// controller path must ride its attempt budget and succeed.
+TEST(CasBuildStageManifestRetry, AmbiguousTimeoutsThenCommitSucceedsWithinBudget)
+{
+    auto b = std::make_shared<ManifestPutFaultBackend>();
+    auto s = openStore(b);
+    const RootNamespace ns{"srv/tbl"};
+
+    auto build = startBuildFor(s, ns, "part_retry");
+    b->fault_count = 2;
+    const ManifestId id = build->stageManifest({blobManifestEntry("a.bin", "a")});
+
+    EXPECT_EQ(b->put_attempts, 3) << "two faulted attempts + the committing third";
+    const auto got = b->get(s->layout().manifestKey(id));
+    ASSERT_TRUE(got.has_value()) << "the staged manifest body must be durable";
+    EXPECT_EQ(decodePartManifest(got->bytes).ref, id.ref);
+}
+
+/// Ambiguous-but-landed: the FIRST attempt's response is lost AFTER the write actually landed
+/// server-side. Resolve-before-reissue's exact-GET observes the identical bytes and reports
+/// Committed — the stage succeeds WITHOUT a reissue (no duplicate PUT of the object), and the
+/// `ManifestPut` audit event carries the landed incarnation's token (from the resolve GET).
+TEST(CasBuildStageManifestRetry, AmbiguousLandedWriteResolvesToCommittedWithoutReissue)
+{
+    auto b = std::make_shared<ManifestPutFaultBackend>();
+    auto s = openStore(b);
+    const RootNamespace ns{"srv/tbl"};
+
+    std::vector<CasEvent> events;
+    s->setEventSink([&](const CasEvent & e) { events.push_back(e); });
+
+    auto build = startBuildFor(s, ns, "part_landed");
+    b->fault_count = 1;
+    b->land_despite_fault = true;
+    const ManifestId id = build->stageManifest({blobManifestEntry("a.bin", "a")});
+
+    EXPECT_EQ(b->put_attempts, 1) << "a landed ambiguous attempt must be resolved, never reissued";
+    const String key = s->layout().manifestKey(id);
+    ASSERT_TRUE(b->get(key).has_value());
+
+    const auto ev = std::find_if(events.begin(), events.end(),
+                                 [](const CasEvent & e) { return e.type == CasEventType::ManifestPut; });
+    ASSERT_NE(ev, events.end()) << "the stage must still emit its ManifestPut audit event";
+    EXPECT_EQ(ev->token, b->head(key).token.value)
+        << "the audit token must be the landed incarnation's token";
+}
+
+/// A DIFFERENT object at the exact staged key (a foreign body ahead of our ambiguous attempt) is a
+/// proven conflict — the NoManifestIdReuse invariant broke — and must stay the loud CORRUPTED_DATA
+/// class: never a retry signal, never silently adopted.
+TEST(CasBuildStageManifestRetry, DifferentObjectAtKeyStaysLoudConflict)
+{
+    auto b = std::make_shared<ManifestPutFaultBackend>();
+    auto s = openStore(b);
+    const RootNamespace ns{"srv/tbl"};
+
+    auto build = startBuildFor(s, ns, "part_conflict");
+    b->fault_count = 1;
+    b->plant_different_on_fault = "a-foreign-different-manifest-body";
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&]
+    {
+        build->stageManifest({blobManifestEntry("a.bin", "a")});
+    });
+    EXPECT_EQ(b->put_attempts, 1) << "a proven conflict is never retried";
+}
+
+/// Budget exhaustion: EVERY attempt is ambiguous and nothing ever lands. The controller reports
+/// Unresolved after `max_attempts` and stageManifest maps it to ABORTED — the same retryable abort
+/// class the ref-log lane's exhausted budget maps to. Nothing was durably named: the caller
+/// re-stages with a fresh ManifestId.
+TEST(CasBuildStageManifestRetry, BudgetExhaustionMapsToAborted)
+{
+    CasRequestBudget budget;
+    budget.max_attempts = 3;
+    auto b = std::make_shared<ManifestPutFaultBackend>();
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .cas_request_budget = budget});
+    const RootNamespace ns{"srv/tbl"};
+
+    auto build = startBuildFor(s, ns, "part_exhausted");
+    b->fault_count = 1000;
+    expectThrowsCode(DB::ErrorCodes::ABORTED, [&]
+    {
+        build->stageManifest({blobManifestEntry("a.bin", "a")});
+    });
+    EXPECT_EQ(b->put_attempts, 3) << "attempts must be bounded by the configured budget";
 }

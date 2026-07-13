@@ -85,12 +85,14 @@ public:
     /// will be putBlob'd post-precommit. putBlob later overwrites it with the tokened dep on upload.
     void recordPendingBlobDep(const BlobRef & ref, uint64_t size);
 
-    /// Mint a root-local part ManifestId, stream-write its body under
-    /// `cas/manifests/<ns>/<writer_epoch>/<build_sequence>/000001.proto` via putIfAbsentStream (NO preliminary HEAD —
-    /// the manifest_ordinal is per-build monotone). Enforces the OQ7 caps fail-closed BEFORE the body write
-    /// returns (and therefore before any owner transition is published). The body is not retained after a
-    /// successful write; on retry the caller re-stages from source. NoManifestIdReuse: a fresh random
-    /// manifest_ordinal per call. The id is recorded for best-effort `abandon` cleanup.
+    /// Mint a root-local part ManifestId, write its body under
+    /// `cas/manifests/<ns>/<writer_epoch>/<build_sequence>/000001.proto` via the Store's shared
+    /// `CasRequestController` (`putIfAbsentControlled`: budgeted attempts + resolve-before-reissue,
+    /// chaos-tolerance-report §Task B; NO preliminary HEAD — the manifest_ordinal is per-build
+    /// monotone). Enforces the OQ7 caps fail-closed BEFORE the body write returns (and therefore before
+    /// any owner transition is published). The body is not retained after a successful write; on retry
+    /// the caller re-stages from source. NoManifestIdReuse: a fresh random manifest_ordinal per call.
+    /// The id is recorded for best-effort `abandon` cleanup.
     ManifestId stageManifest(std::vector<ManifestEntry> entries);
 
     /// Build-intent owner add (spec §Precommit Add) — there is no `_precommits` namespace. ONE

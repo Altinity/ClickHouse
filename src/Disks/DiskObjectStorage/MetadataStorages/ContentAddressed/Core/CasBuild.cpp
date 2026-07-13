@@ -1,6 +1,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobMeta.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEnvelope.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRequestControl.h>
 #include <IO/WriteBufferFromString.h>
 #include <IO/WriteHelpers.h>
 #include <Common/Exception.h>
@@ -847,14 +848,38 @@ ManifestId Build::stageManifest(std::vector<ManifestEntry> entries)
     const ManifestId id{owning_ns, ref};
     const String key = store->layout().manifestKey(id);
 
-    /// Stream-write the body — NO preliminary HEAD (the instance id is random). A PreconditionFailed
-    /// would mean a 128-bit collision: fail closed before any root transition becomes visible.
-    WriteSinkPtr sink = store->backend().putIfAbsentStream(key);
-    writeString(encoded, sink->buffer());
-    const PutResult res = sink->finalize();
-    if (res.outcome != PutOutcome::Done)
-        throw Exception(ErrorCodes::LOGICAL_ERROR,
-            "stageManifest: manifest ordinal collision at {} (PreconditionFailed) — failing closed", key);
+    /// Body PUT through the Store's shared request controller (chaos-tolerance-report §Task B):
+    /// budgeted attempts + resolve-before-reissue, replacing the old bare single-attempt write whose
+    /// whole S3-blip tolerance was ONE ~3s adaptive-timeout attempt (a 19s object-store pause killed an
+    /// INSERT through it while every plain read/write path survived — v3 soak evidence). Reissuing this
+    /// conditional PUT is sound: the body bytes are fixed for the whole operation (`encoded` is built
+    /// once; `encodePartManifest` is canonical/deterministic), so `resolveByExactGet` can prove whether
+    /// an ambiguous attempt landed. Still NO preliminary HEAD. A DIFFERENT object at this key is a
+    /// ManifestId collision — the controller's resolve raises CORRUPTED_DATA (a proven conflict,
+    /// fail-closed before any owner transition can name this id), subsuming the old
+    /// PreconditionFailed->LOGICAL_ERROR mapping.
+    ///
+    /// fence_ok is the ref lane's own mount predicate (`refAppendFenceOk`: fence not lost + enough
+    /// lease left for one more attempt): staging runs on this writable Store under that same mount
+    /// lease, and a fenced writer must not keep PUTting bodies ahead of a precommitAdd that would fail
+    /// the same fence anyway. There is no ref-table runtime here, so the lane's extra
+    /// `superseded_by_remount` term does not apply.
+    Token manifest_token;
+    const CasWriteOutcome put_outcome = store->ref_request_controller->putIfAbsentControlled(
+        key, encoded, [this] { return store->refAppendFenceOk(); }, &manifest_token);
+    if (put_outcome == CasWriteOutcome::DefiniteFailure)
+        throw Exception(ErrorCodes::ABORTED,
+            "stageManifest: part-manifest PUT at '{}' definitively failed (non-retryable rejection); "
+            "nothing was named — the caller re-stages with a fresh ManifestId", key);
+    /// Unresolved = budget exhausted (or fence lost) without a definite outcome. Unlike the ref-log
+    /// lane there is nothing to wedge: this id was never named by any owner transition
+    /// (`next_manifest_ordinal` is already past it, so no re-stage ever reuses the key), and a
+    /// late-landing body is inert unreferenced debris for the orphan-manifest sweep. ABORTED = the
+    /// same retryable abort class the ref lane's exhausted budget maps to.
+    if (put_outcome == CasWriteOutcome::Unresolved)
+        throw Exception(ErrorCodes::ABORTED,
+            "stageManifest: part-manifest PUT at '{}' is UNCERTAIN (retry budget exhausted) — "
+            "nothing conclusive was named; the caller re-stages with a fresh ManifestId", key);
 
     EventEmitter{*store}.emit([&](CasEvent & e)
     {
@@ -862,7 +887,7 @@ ManifestId Build::stageManifest(std::vector<ManifestEntry> entries)
         e.namespace_ = owning_ns.string();
         e.object_kind = CasEventObjectKind::Manifest;
         e.object_hash = manifestRefDebugString(id.ref);
-        e.token = res.token.value;
+        e.token = manifest_token.value;
         e.reason = "stageManifest: part-manifest body written";
     });
 

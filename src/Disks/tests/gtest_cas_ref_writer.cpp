@@ -794,6 +794,29 @@ TEST(CasRequestControllerFenceLoss, I3PostWriteFenceLossIsCounted)
     EXPECT_EQ(global_counters[ProfileEvents::CasConditionalWriteFenceLostPostWrite].load(), before + 1);
 }
 
+/// Task B (stageManifest rides the controller): a Committed return surfaces the committed
+/// incarnation's token — from the attempt's own PutResult, and equally from a resolve that proves an
+/// earlier ambiguous attempt landed — so audit emitters (`Build::stageManifest`'s `ManifestPut`
+/// event) keep their token without a follow-up HEAD.
+TEST(CasRequestController, CommittedSurfacesTokenFromPutAndFromResolve)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    CasRequestController ctrl(backend, CasRequestBudget{}, [] { return static_cast<uint64_t>(0); });
+    const auto fence_ok = [] { return true; };
+
+    Token direct_token;
+    ASSERT_EQ(ctrl.putIfAbsentControlled("k1", "v1", fence_ok, &direct_token), CasWriteOutcome::Committed);
+    EXPECT_EQ(direct_token, backend->head("k1").token) << "the direct-commit token is the PutResult's";
+
+    /// k2 already holds the IDENTICAL bytes (an earlier ambiguous attempt that landed): the attempt's
+    /// PreconditionFailed collapses to Unresolved and the resolve GET proves Committed — the token must
+    /// be the observed incarnation's, and no second incarnation is ever created.
+    const Token pre_existing = backend->putIfAbsent("k2", "v2").token;
+    Token resolved_token;
+    ASSERT_EQ(ctrl.putIfAbsentControlled("k2", "v2", fence_ok, &resolved_token), CasWriteOutcome::Committed);
+    EXPECT_EQ(resolved_token, pre_existing) << "the resolve-commit token is the observed incarnation's";
+}
+
 /// ===================================================================================
 /// Task 13: whole-table ref-cache eviction (spec §Byte, Memory, And CPU Budget)
 /// ===================================================================================

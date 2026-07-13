@@ -167,7 +167,8 @@ CasRequestController::CasRequestController(BackendPtr backend_, CasRequestBudget
 {
 }
 
-CasWriteOutcome CasRequestController::resolveByExactGet(std::string_view key, std::string_view expected_bytes)
+CasWriteOutcome CasRequestController::resolveByExactGet(std::string_view key, std::string_view expected_bytes,
+                                                        Token * out_token)
 {
     const String key_s{key};
     std::optional<GetResult> got;
@@ -186,7 +187,11 @@ CasWriteOutcome CasRequestController::resolveByExactGet(std::string_view key, st
         return CasWriteOutcome::Unresolved;   /// absent -> another attempt may still be legal
 
     if (got->bytes == expected_bytes)
+    {
+        if (out_token)
+            *out_token = got->token;
         return CasWriteOutcome::Committed;    /// identical deterministic bytes -> the earlier attempt DID commit
+    }
 
     /// A DIFFERENT valid object at the exact key this create intended: a real conflict, not a retryable
     /// ambiguity. Fail closed rather than silently treating it as Unresolved/DefiniteFailure.
@@ -197,7 +202,7 @@ CasWriteOutcome CasRequestController::resolveByExactGet(std::string_view key, st
 }
 
 CasWriteOutcome CasRequestController::putIfAbsentControlled(
-    std::string_view key, std::string_view bytes, const std::function<bool()> & fence_ok)
+    std::string_view key, std::string_view bytes, const std::function<bool()> & fence_ok, Token * out_token)
 {
     const String key_s{key};
     const String bytes_s{bytes};
@@ -213,6 +218,8 @@ CasWriteOutcome CasRequestController::putIfAbsentControlled(
         if (now_ms() + budget.attempt_timeout_ms > deadline_ms)
             return CasWriteOutcome::Unresolved;
 
+        /// The committed incarnation's token, filled by whichever leg proves Committed below.
+        Token committed_token;
         CasWriteOutcome attempt_outcome;
         try
         {
@@ -222,6 +229,8 @@ CasWriteOutcome CasRequestController::putIfAbsentControlled(
             /// goes through the SAME resolve-before-reissue path as an ambiguous exception, never a
             /// false DefiniteFailure/Committed.
             attempt_outcome = put.outcome == PutOutcome::Done ? CasWriteOutcome::Committed : CasWriteOutcome::Unresolved;
+            if (put.outcome == PutOutcome::Done)
+                committed_token = put.token;
         }
         catch (const std::exception & e)
         {
@@ -235,7 +244,7 @@ CasWriteOutcome CasRequestController::putIfAbsentControlled(
         {
             /// Resolve-before-reissue (RFC §resolve-before-reissuing). May throw CORRUPTED_DATA (a real
             /// conflict) straight out of this call — that is never a retry signal.
-            attempt_outcome = resolveByExactGet(key_s, bytes_s);
+            attempt_outcome = resolveByExactGet(key_s, bytes_s, &committed_token);
             if (attempt_outcome == CasWriteOutcome::Unresolved)
                 continue;   /// absent/unreadable: another attempt of the SAME (key, bytes) may be legal
         }
@@ -251,6 +260,8 @@ CasWriteOutcome CasRequestController::putIfAbsentControlled(
             ProfileEvents::increment(ProfileEvents::CasConditionalWriteFenceLostPostWrite);
             return CasWriteOutcome::Unresolved;
         }
+        if (out_token)
+            *out_token = committed_token;
         return CasWriteOutcome::Committed;
     }
 

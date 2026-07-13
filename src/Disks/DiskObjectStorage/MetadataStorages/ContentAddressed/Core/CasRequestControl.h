@@ -114,8 +114,12 @@ public:
     /// Throws `CORRUPTED_DATA` if resolution ever observes DIFFERENT valid bytes at `key` — a real
     /// conflict, never collapsed into `Unresolved`/`DefiniteFailure`. Returns `Unresolved` (never
     /// throws) when the fence is lost or the budget is exhausted before a definite outcome is reached.
+    /// `out_token` (optional): set ONLY on a `Committed` return, to the committed incarnation's token —
+    /// the attempt's own `PutResult` token, or the token the resolve GET observed when it proved an
+    /// earlier ambiguous attempt landed. Lets audit emitters (e.g. `Build::stageManifest`'s
+    /// `ManifestPut` event) keep the token without a follow-up HEAD. Untouched on any other return.
     CasWriteOutcome putIfAbsentControlled(std::string_view key, std::string_view bytes,
-                                          const std::function<bool()> & fence_ok);
+                                          const std::function<bool()> & fence_ok, Token * out_token = nullptr);
 
     /// One-shot exact-key resolution of an uncertain immutable-create (RFC §resolve-before-reissuing):
     ///   - identical bytes observed at `key`  -> Committed (the earlier attempt DID commit)
@@ -124,8 +128,9 @@ public:
     ///   - absent, or the GET itself fails    -> Unresolved (another attempt may still be legal)
     /// NEVER returns DefiniteFailure: an absent or unreadable key proves nothing about whether the
     /// original request will eventually be provably non-applied, so resolution alone can never produce
-    /// that verdict.
-    CasWriteOutcome resolveByExactGet(std::string_view key, std::string_view expected_bytes);
+    /// that verdict. `out_token` (optional): set ONLY on `Committed`, to the observed incarnation's token.
+    CasWriteOutcome resolveByExactGet(std::string_view key, std::string_view expected_bytes,
+                                      Token * out_token = nullptr);
 
 private:
     BackendPtr backend;

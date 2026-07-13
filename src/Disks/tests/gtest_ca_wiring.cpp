@@ -1365,14 +1365,16 @@ public:
 };
 
 /// True for a per-part manifest BODY object (<...>/cas/manifests/<namespace...>/<epoch-seq>/<NNNNNN>.proto)
-/// — the FIRST durable object `publishStaging` writes for a part (via `Build::stageManifest`), a direct
-/// write-once `putIfAbsentStream` create (NOT the CAS retry controller), so an injected fault here throws
-/// cleanly out of `publishStaging`. Exactly one body per part, so counting these isolates part publishes
-/// one-for-one. Ref-log txns (`cas/refs/.../_log/...`), tree blobs (`blobs/`), GC state (`gc/`) and verbatim
-/// files are excluded. Replaces the mutable root-shard-manifest object the test used to count, which the
-/// removed `RootShardManifest` format wrote at `cas/refs/<ns>/<shard_number>` (commit 318291fe5e5 deleted
-/// that format — its all-digits key no longer exists, so the old predicate never matched and the fault
-/// never fired, silently turning this into a no-op that passed a partial commit).
+/// — the FIRST durable object `publishStaging` writes for a part (via `Build::stageManifest`). Since Task B
+/// (chaos-tolerance-report) that write rides the CAS request controller: a transient fault is retried
+/// (budgeted attempts + resolve-before-reissue), so an injected fault must be PERSISTENT to fail the
+/// publish — the controller exhausts its budget and `stageManifest` throws ABORTED out of `publishStaging`.
+/// Exactly one body per part (retries re-PUT the same per-part key), so counting FIRST attempts isolates
+/// part publishes one-for-one. Ref-log txns (`cas/refs/.../_log/...`), tree blobs (`blobs/`), GC state
+/// (`gc/`) and verbatim files are excluded. Replaces the mutable root-shard-manifest object the test used
+/// to count, which the removed `RootShardManifest` format wrote at `cas/refs/<ns>/<shard_number>` (commit
+/// 318291fe5e5 deleted that format — its all-digits key no longer exists, so the old predicate never
+/// matched and the fault never fired, silently turning this into a no-op that passed a partial commit).
 bool isPartManifestBodyPath(const std::string & path)
 {
     return path.find("/cas/manifests/") != std::string::npos && path.ends_with(".proto");
@@ -1407,12 +1409,13 @@ TEST(CaWiringWrite, PartialCommitRollsBackPublishedParts)
 
     /// Fail the SECOND part's manifest-body write (all_2_2_0's stageManifest) — by then all_1_1_0 has
     /// fully published (its manifest body + blob + promoted ref). A pre-B122 commit() would leave
-    /// all_1_1_0 durably visible: a partial commit. The manifest body is a direct putIfAbsentStream
-    /// create (not the CAS retry controller), so the injected fault surfaces as a clean throw.
+    /// all_1_1_0 durably visible: a partial commit. PERSISTENT (`>= 2`, not one-shot): the manifest
+    /// body PUT rides the CAS request controller (Task B), which absorbs a transient fault by design —
+    /// only a fault that outlasts the whole attempt budget fails the publish (as ABORTED).
     int manifest_writes = 0;
     faulty->on_write = [&](const std::string & path)
     {
-        if (isPartManifestBodyPath(path) && ++manifest_writes == 2)
+        if (isPartManifestBodyPath(path) && ++manifest_writes >= 2)
             throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "injected publish failure (B122)");
     };
 
