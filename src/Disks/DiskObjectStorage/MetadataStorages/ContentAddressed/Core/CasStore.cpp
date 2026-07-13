@@ -49,6 +49,7 @@ namespace ProfileEvents
     extern const Event CasRefSnapshotTailLogs;
     extern const Event CasRefSnapshotPublishDispatched;
     extern const Event CasRefSnapshotPublishBackoff;
+    extern const Event CasRefLatePredecessorObserved;
 }
 
 namespace DB::Cas
@@ -1969,10 +1970,18 @@ bool Store::trySnapshotPublishOnce(const RootNamespace & ns)
             applyRefLogTxn(replay_state, entry.txn);
             const uint64_t age = now >= entry.observed_at_ms ? now - entry.observed_at_ms : 0;
             if (age < config.snapshot_min_log_age_ms)
-                break;   /// spec §Late Predecessor PUT: "a candidate snapshot id never covers a log
-                         /// younger than that age" -- observed_at_ms is non-decreasing across entries
-                         /// (own appends: real commit order; mount-replayed: all equal), so once one
-                         /// entry is too young every LATER entry is at least as young. Stop here.
+            {
+                /// spec §Late Predecessor PUT: the grace window is holding this (and every younger)
+                /// tail entry out of the candidate snapshot so a late-arriving predecessor append from
+                /// a fenced epoch can still land before a snapshot covers its region. This is a distinct
+                /// observation point from `CasConditionalWriteFenceLostPostWrite` (a post-write fence
+                /// check on the writer's own conditional-write attempt): here we count each engaged
+                /// grace window on the snapshot-publish path, so the residual race is measurable, not
+                /// only mitigated. observed_at_ms is non-decreasing, so exactly one break — hence one
+                /// increment — per attempt.
+                ProfileEvents::increment(ProfileEvents::CasRefLatePredecessorObserved);
+                break;
+            }
             candidate_state = replay_state;
             candidate_x = entry.txn.txn_id;
             have_candidate = true;

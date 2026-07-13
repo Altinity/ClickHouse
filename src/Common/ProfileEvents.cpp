@@ -767,6 +767,7 @@ The server successfully detected this situation and will download merged part fr
     M(CasRefSnapshotTailLogs, "CA writer: tail logs compacted into a published table snapshot (logs-per-table-after-snapshot; spec §implementation-impact)", ValueType::Number) \
     M(CasRefSnapshotPublishDispatched, "CA writer: background snapshot-publish attempts dispatched past the in-flight/candidate-advance/backoff gate (bounds the read-triggered publish storm)", ValueType::Number) \
     M(CasRefSnapshotPublishBackoff, "CA writer: per-table snapshot-publish backoffs armed after a non-Committed publish outcome (the read-triggered PUT-storm latch breaker)", ValueType::Number) \
+    M(CasRefLatePredecessorObserved, "CA writer: snapshot-publish attempts where the min-log-age grace window held back a young tail region — the residual Late-Predecessor-PUT ref-loss race window is engaged (spec §Late Predecessor PUT)", ValueType::Number) \
     M(CasGcClampSuppressedPasses, "CA GC passes whose fold clamped a shard: graduations and pending deletes were suppressed (carried) to preserve the ack-floor lemma", ValueType::Number) \
     M(CasGcDeadPrecommitSkipped, "CA GC fold edges skipped for a +1 precommit whose manifest body is absent and whose build is below the durable watermark floor (provably dead; barrier lifted instead of clamping forever)", ValueType::Number) \
     M(CasBlobGet,        "CA blob get S3 ops", ValueType::Number) \

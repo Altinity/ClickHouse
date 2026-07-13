@@ -39,6 +39,7 @@ extern const Event CasRefSnapshotPutBytes;
 extern const Event CasRefSnapshotTailLogs;
 extern const Event CasRefSnapshotPublishDispatched;
 extern const Event CasRefSnapshotPublishBackoff;
+extern const Event CasRefLatePredecessorObserved;
 extern const Event CasConditionalWriteFenceLostPostWrite;
 }
 
@@ -966,6 +967,36 @@ TEST(RefWriterSnapshotPublish, GraceAgeRespectedYoungLogNotCovered)
     const auto snap_id = listGreatestSnapshotIdForTest(*backend, layout, ns);
     ASSERT_TRUE(snap_id.has_value());
     EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), 0u);
+}
+
+/// B4: the Late-Predecessor-PUT observability counter. The min-log-age grace window holds a young
+/// tail region out of a candidate snapshot so a late predecessor append from a fenced epoch can
+/// still land before a snapshot covers it; each engaged window must be counted exactly once. Uses
+/// the fake-clock fixture (same as GraceAgeRespectedYoungLogNotCovered) for a deterministic age.
+TEST(RefWriterSnapshotPublish, LatePredecessorCounterCountsGraceWindowHoldback)
+{
+    using ProfileEvents::global_counters;
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const RootNamespace ns{"srv1/late_pred_counter"};
+    uint64_t fake_now = 1000;
+
+    PoolConfig config;
+    config.snapshot_min_log_age_ms = 60000;
+    config.boot_ms_fn = [&fake_now] { return fake_now; };
+    config.mount_lease_ttl_ms = std::chrono::milliseconds(10'000'000);   /// keep the write fence open
+    auto store = openStoreWithConfig(backend, config);
+
+    publishEmptyPart(store, ns, "a");   /// tail stamped observed_at_ms = 1000 (younger than 60s)
+
+    const auto before = global_counters[ProfileEvents::CasRefLatePredecessorObserved].load();
+    EXPECT_FALSE(store->trySnapshotPublishOnce(ns));   /// young tail => grace window engages
+    EXPECT_EQ(global_counters[ProfileEvents::CasRefLatePredecessorObserved].load(), before + 1)
+        << "an engaged grace window must be counted exactly once per attempt";
+
+    fake_now += 61000;   /// past the grace window: nothing is held back
+    EXPECT_TRUE(store->trySnapshotPublishOnce(ns));
+    EXPECT_EQ(global_counters[ProfileEvents::CasRefLatePredecessorObserved].load(), before + 1)
+        << "no young entry => no holdback => counter unchanged";
 }
 
 /// Publication must never block a concurrent append on the SAME table (spec: "Publication is
