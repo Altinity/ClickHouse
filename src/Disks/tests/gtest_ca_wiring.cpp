@@ -520,6 +520,26 @@ TEST(CaWiringRead, VerbatimNamespaceFiles)
     EXPECT_FALSE(storage->existsFile("clickhouse_access_check_other"));
 }
 
+/// C4: the fixed dispatch order is the invariant. Pins the two ambiguous early guards that make the
+/// order load-bearing: store/<u3> (AtomicShard, ambiguous with the non-Atomic table fallback) and a
+/// shadow table dir (which also satisfies parseTableUuid). existsDirectory/listDirectory must agree.
+TEST(CaWiringRoute, DirShapeDispatchOrderIsStable)
+{
+    auto storage = openWiringStorage();
+    publishWiredPart(*storage, storage->liveNamespace("uuid-1"), "all_1_1_0");
+    publishWiredPart(*storage, DB::ContentAddressedMetadataStorage::shadowNamespace("shadow/bk1/store/uui/uuid-1"), "all_1_1_0");
+
+    using DS = DB::ContentAddressedMetadataStorage::DirShape;
+    EXPECT_EQ(storage->classifyDirectoryForTest("store/uui").shape,             DS::AtomicShard);
+    EXPECT_EQ(storage->classifyDirectoryForTest("uui/uuid-1").shape,            DS::TableDir);
+    EXPECT_EQ(storage->classifyDirectoryForTest("uui/uuid-1/all_1_1_0").shape,  DS::PartDir);
+    EXPECT_EQ(storage->classifyDirectoryForTest("uui/uuid-1/detached").shape,   DS::DetachedContainer);
+    EXPECT_EQ(storage->classifyDirectoryForTest("shadow/bk1/store/uui/uuid-1").shape, DS::ShadowTable);
+    EXPECT_EQ(storage->classifyDirectoryForTest("shadow/bk1").shape,            DS::ShadowIntermediate);
+    EXPECT_EQ(storage->classifyDirectoryForTest("uui/uuid-1/deduplication_logs").shape, DS::TableSubdir);
+    EXPECT_EQ(storage->classifyDirectoryForTest("store").shape,                 DS::GenericIntermediate);
+}
+
 /// ==== M-W Task 3: the write path through IMetadataTransaction ====
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>

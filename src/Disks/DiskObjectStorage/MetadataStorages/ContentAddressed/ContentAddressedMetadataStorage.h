@@ -267,6 +267,40 @@ public:
     /// Full `detached/<part>` ref names in a namespace (B181: detached parts fold into the table ns).
     std::vector<std::string> detachedRefNames(const Cas::RootNamespace & ns) const;
 
+    /// C4: the ONE fixed dispatch order `existsDirectory`/`listDirectory` route a path through
+    /// (shadow -> atomic-shard -> table-uuid -> part -> subdir -> generic), previously implemented
+    /// twice and kept in sync by hand. `classifyDirectory` (private, below) computes it once; both
+    /// callers then switch on the resulting shape. `DirShape`/`DirRoute` are nested-public only so
+    /// `classifyDirectoryForTest` can name them from the test binary (mirroring the `Route` struct
+    /// above); the classification logic itself stays private.
+    enum class DirShape
+    {
+        ShadowPart,
+        ShadowTable,
+        ShadowIntermediate,
+        AtomicShard,
+        TableDir,
+        DetachedContainer,
+        PartDir,
+        ProjectionDir,
+        TableSubdir,
+        GenericIntermediate,
+    };
+
+    struct DirRoute
+    {
+        DirShape shape;
+        std::optional<ContentAddressed::PartFilePath> p;
+        std::optional<Route> r;
+        std::optional<std::string> uuid;
+        std::optional<ContentAddressed::TableFilePath> tf;
+        std::optional<std::string> projection_prefix;
+    };
+
+    /// Test-only accessor (mirrors `conditionalWriteSettingsForTest`): exposes the private
+    /// `classifyDirectory` so `gtest_ca_wiring` can pin the fixed dispatch order directly.
+    DirRoute classifyDirectoryForTest(const std::string & path) const { return classifyDirectory(path); }
+
 private:
     const ObjectStoragePtr object_storage;
     const std::string storage_path_prefix;
@@ -341,6 +375,13 @@ private:
             return physical_key_prefix + key;
         return physical_key_prefix + "/" + key;
     }
+
+    /// C4: classify `path`'s directory shape by running the fixed dispatch order ONCE (shadow ->
+    /// atomic-shard -> table-uuid -> part -> subdir -> generic), including the part-branch
+    /// fall-through when no sub-shape matches. Pure path classification — consults no lifecycle
+    /// state (e.g. `namespaceFilesReadable`); `existsDirectory`/`listDirectory` apply that gate
+    /// themselves in their per-shape arms, exactly as before this refactor.
+    DirRoute classifyDirectory(const std::string & path) const;
 
     /// Build the GC round sink: the std::function the scheduler calls per Start/Finish. Captures the
     /// ContextPtr, converts the POD GcRoundLogRecord into a ContentAddressedGarbageCollectionLogElement,

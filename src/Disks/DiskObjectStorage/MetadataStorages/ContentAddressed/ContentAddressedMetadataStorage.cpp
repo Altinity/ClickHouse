@@ -657,80 +657,153 @@ bool ContentAddressedMetadataStorage::existsFile(const std::string & path) const
     return view && view->findFile(r->file);
 }
 
-bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) const
+ContentAddressedMetadataStorage::DirRoute ContentAddressedMetadataStorage::classifyDirectory(const std::string & path) const
 {
+    DirRoute dr;
+
     /// FREEZE shadow namespace — routed BEFORE the live branches (a shadow table dir also
     /// satisfies parseTableUuid).
     if (ContentAddressed::isShadowPath(path))
     {
         if (auto p = ContentAddressed::parsePartFilePath(path); p && !p->backup_name.empty() && p->file.empty())
-            return partAccess().existsRef(Route{shadowNamespace(p->shadow_table_dir), p->part_name, ""}.refKey(),
-                                          ContentAddressed::Freshness::CachedForLoad);
+        {
+            dr.shape = DirShape::ShadowPart;
+            dr.p = std::move(p);
+            return dr;
+        }
         if (ContentAddressed::endsWithTableUuidPair(path))
-            return !store()->listRefs(shadowNamespace(path)).empty();
-        /// Intermediate dir (shadow/<bk>, shadow/<bk>/store, ...): exists iff SOME shadow namespace
-        /// under this path still has a LIVE ref. A raw object LIST of the mirrored subtree would count
-        /// tombstoned-but-not-yet-GC'd shard/manifest objects — CA removal is tombstone + deferred GC
-        /// (`removeRecursive`/`dropNamespace` only tombstone; `Cas::Gc` physically deletes later) — so a
-        /// just-`UNFREEZE`d backup dir would spuriously "exist" until a GC round runs (B3/B186). Instead
-        /// enumerate the namespaces exactly as `removeRecursive` does (`listNamespaces(scope)`) and
-        /// consult the tombstone-aware `listRefs` (as the `endsWithTableUuidPair` case above does), so
-        /// existence is consistent with the ref-level signal and independent of GC timing.
-        const std::string canonical = canonicalDiskPath(path);
-        const std::string scope = canonical.empty() ? "shadow/" : canonical + "/";
-        for (const auto & ns : store()->listNamespaces(scope))
-            if (!store()->listRefs(Cas::RootNamespace{ns}).empty())
-                return true;
-        return false;
+        {
+            dr.shape = DirShape::ShadowTable;
+            return dr;
+        }
+        dr.shape = DirShape::ShadowIntermediate;
+        return dr;
     }
 
     /// The Atomic `store/<u3>` shard dir (see listDirectory): route to the generic existence signal
     /// before parseTableUuid/parseTableFilePath misclaim it as a non-Atomic table.
     if (ContentAddressed::isAtomicShardDir(path))
-        return liveTreeDirHasChildren(path);
+    {
+        dr.shape = DirShape::AtomicShard;
+        return dr;
+    }
 
     if (auto uuid = ContentAddressed::parseTableUuid(path))
-        /// Table dir exists iff it has at least one committed part (the PoC's refs-only rule).
-        return !store()->listRefs(liveNamespace(*uuid)).empty();
+    {
+        dr.shape = DirShape::TableDir;
+        dr.uuid = std::move(uuid);
+        return dr;
+    }
 
-    auto p = ContentAddressed::parsePartFilePath(path);
-    if (p)
+    if (auto p = ContentAddressed::parsePartFilePath(path))
     {
         auto r = route(*p);
-        /// The detached CONTAINER dir <table>/detached: exists iff it has at least one ref (B181).
+        /// The detached CONTAINER dir <table>/detached.
         if (r && r->ref.empty() && p->part_name == ContentAddressed::kDetachedDirName)
-            return !detachedRefNames(r->ns).empty();
-        /// A part dir (live, detached, or shadow): exists iff its ref is present.
+        {
+            dr.shape = DirShape::DetachedContainer;
+            dr.p = std::move(p);
+            dr.r = std::move(r);
+            return dr;
+        }
+        /// A part dir (live, detached, or shadow).
         if (r && !r->ref.empty() && r->file.empty())
-            return partAccess().existsRef(r->refKey(), ContentAddressed::Freshness::CachedForLoad);
-        /// A projection dir: at least one tree entry (or mutable file) under its prefix.
+        {
+            dr.shape = DirShape::PartDir;
+            dr.p = std::move(p);
+            dr.r = std::move(r);
+            return dr;
+        }
+        /// A projection dir.
         if (r && !r->ref.empty())
         {
             if (auto prefix = ContentAddressed::PartFolderView::projectionDirPrefix(r->file))
             {
-                auto view = partAccess().getView(r->refKey(), ContentAddressed::Freshness::CachedForLoad);
-                return view && view->hasDirectory(*prefix);
+                dr.shape = DirShape::ProjectionDir;
+                dr.p = std::move(p);
+                dr.r = std::move(r);
+                dr.projection_prefix = std::move(prefix);
+                return dr;
             }
         }
+        /// No sub-shape matched: fall through, identical to today's post-`if (p)` continuation.
     }
 
-    /// A table-level SUBDIRECTORY (deduplication_logs/...): at least one verbatim file under it.
+    /// A table-level SUBDIRECTORY (deduplication_logs/...).
     if (auto tf = ContentAddressed::parseTableFilePath(path))
     {
-        const auto ns = liveNamespace(tf->table_uuid);
-        if (!namespaceFilesReadable(ns))
-            return false;
-        const std::string prefix = tf->tail + "/";
-        for (const auto & name : store()->listNamespaceFiles(ns))
-            if (name.starts_with(prefix))
-                return true;
-        return false;
+        dr.shape = DirShape::TableSubdir;
+        dr.tf = std::move(tf);
+        return dr;
     }
 
-    /// A generic INTERMEDIATE live-tree directory (disk root, `store`, ...): exists iff a
-    /// server-root-scoped mirrored LIST finds any object. Keeps `cd`/existence consistent with
-    /// listDirectory so `clickhouse-disks` traversal behaves like a normal disk.
-    return liveTreeDirHasChildren(path);
+    /// A generic INTERMEDIATE live-tree directory (disk root, `store`, ...).
+    dr.shape = DirShape::GenericIntermediate;
+    return dr;
+}
+
+bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) const
+{
+    const DirRoute dr = classifyDirectory(path);
+    switch (dr.shape)
+    {
+        case DirShape::ShadowPart:
+            return partAccess().existsRef(Route{shadowNamespace(dr.p->shadow_table_dir), dr.p->part_name, ""}.refKey(),
+                                          ContentAddressed::Freshness::CachedForLoad);
+        case DirShape::ShadowTable:
+            return !store()->listRefs(shadowNamespace(path)).empty();
+        case DirShape::ShadowIntermediate:
+        {
+            /// Intermediate dir (shadow/<bk>, shadow/<bk>/store, ...): exists iff SOME shadow namespace
+            /// under this path still has a LIVE ref. A raw object LIST of the mirrored subtree would count
+            /// tombstoned-but-not-yet-GC'd shard/manifest objects — CA removal is tombstone + deferred GC
+            /// (`removeRecursive`/`dropNamespace` only tombstone; `Cas::Gc` physically deletes later) — so a
+            /// just-`UNFREEZE`d backup dir would spuriously "exist" until a GC round runs (B3/B186). Instead
+            /// enumerate the namespaces exactly as `removeRecursive` does (`listNamespaces(scope)`) and
+            /// consult the tombstone-aware `listRefs` (as the `endsWithTableUuidPair` case above does), so
+            /// existence is consistent with the ref-level signal and independent of GC timing.
+            const std::string canonical = canonicalDiskPath(path);
+            const std::string scope = canonical.empty() ? "shadow/" : canonical + "/";
+            for (const auto & ns : store()->listNamespaces(scope))
+                if (!store()->listRefs(Cas::RootNamespace{ns}).empty())
+                    return true;
+            return false;
+        }
+        case DirShape::AtomicShard:
+            return liveTreeDirHasChildren(path);
+        case DirShape::TableDir:
+            /// Table dir exists iff it has at least one committed part (the PoC's refs-only rule).
+            return !store()->listRefs(liveNamespace(*dr.uuid)).empty();
+        case DirShape::DetachedContainer:
+            /// Exists iff it has at least one ref (B181).
+            return !detachedRefNames(dr.r->ns).empty();
+        case DirShape::PartDir:
+            /// Exists iff its ref is present.
+            return partAccess().existsRef(dr.r->refKey(), ContentAddressed::Freshness::CachedForLoad);
+        case DirShape::ProjectionDir:
+        {
+            /// At least one tree entry (or mutable file) under its prefix.
+            auto view = partAccess().getView(dr.r->refKey(), ContentAddressed::Freshness::CachedForLoad);
+            return view && view->hasDirectory(*dr.projection_prefix);
+        }
+        case DirShape::TableSubdir:
+        {
+            /// At least one verbatim file under it.
+            const auto ns = liveNamespace(dr.tf->table_uuid);
+            if (!namespaceFilesReadable(ns))
+                return false;
+            const std::string prefix = dr.tf->tail + "/";
+            for (const auto & name : store()->listNamespaceFiles(ns))
+                if (name.starts_with(prefix))
+                    return true;
+            return false;
+        }
+        case DirShape::GenericIntermediate:
+            /// Exists iff a server-root-scoped mirrored LIST finds any object. Keeps `cd`/existence
+            /// consistent with listDirectory so `clickhouse-disks` traversal behaves like a normal disk.
+            return liveTreeDirHasChildren(path);
+    }
+    return liveTreeDirHasChildren(path);   /// unreachable
 }
 
 bool ContentAddressedMetadataStorage::existsFileOrDirectory(const std::string & path) const
@@ -818,106 +891,101 @@ Poco::Timestamp ContentAddressedMetadataStorage::getLastModified(const std::stri
 
 std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const std::string & path) const
 {
-    if (ContentAddressed::isShadowPath(path))
+    const DirRoute dr = classifyDirectory(path);
+    switch (dr.shape)
     {
-        /// Shadow PART dir: the frozen part's file names (first components).
-        if (auto p = ContentAddressed::parsePartFilePath(path); p && !p->backup_name.empty() && p->file.empty())
+        case DirShape::ShadowPart:
         {
-            auto view = partAccess().getView(Route{shadowNamespace(p->shadow_table_dir), p->part_name, ""}.refKey(),
+            /// Shadow PART dir: the frozen part's file names (first components).
+            auto view = partAccess().getView(Route{shadowNamespace(dr.p->shadow_table_dir), dr.p->part_name, ""}.refKey(),
                                              ContentAddressed::Freshness::CachedForLoad);
             return view ? view->listChildren("") : std::vector<std::string>{};
         }
-        /// Shadow TABLE dir: the frozen part names.
-        if (ContentAddressed::endsWithTableUuidPair(path))
+        case DirShape::ShadowTable:
         {
+            /// Shadow TABLE dir: the frozen part names.
             std::vector<std::string> result;
             for (const auto & [ref, _] : store()->listRefs(shadowNamespace(path)))
                 result.push_back(ref);
             return result;
         }
-        /// Shadow INTERMEDIATE dir: enumerate children via a scoped S3 LIST of the mirrored
-        /// subtree (design §5.3). A mirrored LIST naturally surfaces intermediate path segments
-        /// AND `@cas@`-suffixed table dirs; strip the trailing `@cas@` for the logical view.
-        /// Loose LIST is fine: the existing listRefs re-check filters out dropped-but-registered
-        /// archives so they don't appear as false children.
-        const std::string canonical = canonicalDiskPath(path);
-        const std::string scope = canonical.empty() ? "shadow/" : canonical + "/";
-        std::unordered_set<std::string> result;
-        for (const auto & child : store()->listMirroredChildren(scope))
-            result.emplace(stripCasArchiveSuffix(child));
-        return toVector(std::move(result));
-    }
-
-    /// The Atomic `store/<u3>` shard dir: a pure intermediate dir whose only child is the
-    /// uuid-anchored table dir. Its path shape collides with the non-Atomic `data/<db>` fallback of
-    /// both parseTableUuid and parseTableFilePath, so it MUST be routed to the generic mirrored LIST
-    /// BEFORE those branches claim it.
-    if (ContentAddressed::isAtomicShardDir(path))
-        return listLiveTreeChildren(path);
-
-    /// Table dir: part names (live + B181 detached `detached/<part>` refs) + table-level verbatim
-    /// file names; addFirstComponent collapses both to their first path segment (live part names and
-    /// the single `detached` subdir, exactly like a nested verbatim file).
-    if (auto uuid = ContentAddressed::parseTableUuid(path))
-    {
-        const auto ns = liveNamespace(*uuid);
-        std::unordered_set<std::string> result;
-        for (const auto & [ref, _] : store()->listRefs(ns))
-            addFirstComponent(result, ref);
-        /// A dropped table lists empty for its namespace files too (its refs are already gone via the
-        /// ref state); only surface verbatim file names while the table is not removed.
-        if (namespaceFilesReadable(ns))
-            for (const auto & name : store()->listNamespaceFiles(ns))
-                addFirstComponent(result, name);
-        return toVector(std::move(result));
-    }
-
-    if (auto p = ContentAddressed::parsePartFilePath(path))
-    {
-        auto r = route(*p);
-        /// The detached CONTAINER dir: detached part names (prefix stripped; never files, B36/B181).
-        if (r && r->ref.empty() && p->part_name == ContentAddressed::kDetachedDirName)
+        case DirShape::ShadowIntermediate:
         {
+            /// Enumerate children via a scoped S3 LIST of the mirrored subtree (design §5.3). A
+            /// mirrored LIST naturally surfaces intermediate path segments AND `@cas@`-suffixed
+            /// table dirs; strip the trailing `@cas@` for the logical view. Loose LIST is fine: the
+            /// existing listRefs re-check filters out dropped-but-registered archives so they don't
+            /// appear as false children.
+            const std::string canonical = canonicalDiskPath(path);
+            const std::string scope = canonical.empty() ? "shadow/" : canonical + "/";
+            std::unordered_set<std::string> result;
+            for (const auto & child : store()->listMirroredChildren(scope))
+                result.emplace(stripCasArchiveSuffix(child));
+            return toVector(std::move(result));
+        }
+        case DirShape::AtomicShard:
+            /// A pure intermediate dir whose only child is the uuid-anchored table dir. Its path
+            /// shape collides with the non-Atomic `data/<db>` fallback of both parseTableUuid and
+            /// parseTableFilePath, so it MUST be routed to the generic mirrored LIST BEFORE those
+            /// branches claim it (see classifyDirectory).
+            return listLiveTreeChildren(path);
+        case DirShape::TableDir:
+        {
+            /// Part names (live + B181 detached `detached/<part>` refs) + table-level verbatim
+            /// file names; addFirstComponent collapses both to their first path segment (live part
+            /// names and the single `detached` subdir, exactly like a nested verbatim file).
+            const auto ns = liveNamespace(*dr.uuid);
+            std::unordered_set<std::string> result;
+            for (const auto & [ref, _] : store()->listRefs(ns))
+                addFirstComponent(result, ref);
+            /// A dropped table lists empty for its namespace files too (its refs are already gone
+            /// via the ref state); only surface verbatim file names while the table is not removed.
+            if (namespaceFilesReadable(ns))
+                for (const auto & name : store()->listNamespaceFiles(ns))
+                    addFirstComponent(result, name);
+            return toVector(std::move(result));
+        }
+        case DirShape::DetachedContainer:
+        {
+            /// Detached part names (prefix stripped; never files, B36/B181).
             std::vector<std::string> result;
-            for (const auto & ref : detachedRefNames(r->ns))
+            for (const auto & ref : detachedRefNames(dr.r->ns))
                 result.push_back(ref.substr(ContentAddressed::kDetachedRefPrefix.size()));
             return result;
         }
-        /// A part dir (live, detached part, shadow handled above): logical file names, nested
-        /// keys collapsed to their first component (projections surface as ONE <proj>.proj entry).
-        if (r && !r->ref.empty() && r->file.empty())
+        case DirShape::PartDir:
         {
-            auto view = partAccess().getView(r->refKey(), ContentAddressed::Freshness::CachedForLoad);
+            /// A part dir (live, detached part, shadow handled separately): logical file names,
+            /// nested keys collapsed to their first component (projections surface as ONE
+            /// <proj>.proj entry).
+            auto view = partAccess().getView(dr.r->refKey(), ContentAddressed::Freshness::CachedForLoad);
             return view ? view->listChildren("") : std::vector<std::string>{};
         }
-        /// A projection dir: inner names with the <proj>.proj/ prefix stripped.
-        if (r && !r->ref.empty())
+        case DirShape::ProjectionDir:
         {
-            if (auto prefix = ContentAddressed::PartFolderView::projectionDirPrefix(r->file))
-            {
-                auto view = partAccess().getView(r->refKey(), ContentAddressed::Freshness::CachedForLoad);
-                return view ? view->listChildren(*prefix) : std::vector<std::string>{};
-            }
+            /// Inner names with the <proj>.proj/ prefix stripped.
+            auto view = partAccess().getView(dr.r->refKey(), ContentAddressed::Freshness::CachedForLoad);
+            return view ? view->listChildren(*dr.projection_prefix) : std::vector<std::string>{};
         }
+        case DirShape::TableSubdir:
+        {
+            /// Verbatim files under <subdir>/, first-component collapsed.
+            const auto ns = liveNamespace(dr.tf->table_uuid);
+            std::unordered_set<std::string> result;
+            if (namespaceFilesReadable(ns))
+                for (const auto & name : store()->listNamespaceFiles(ns))
+                    if (name.starts_with(dr.tf->tail + "/"))
+                        addFirstComponent(result, name.substr(dr.tf->tail.size() + 1));
+            return toVector(std::move(result));
+        }
+        case DirShape::GenericIntermediate:
+            /// The disk root "", `store`, or any loose-file container above a table dir: a
+            /// server-root-scoped mirrored LIST. (`store/<u3>` is handled by AtomicShard above,
+            /// since its non-Atomic-table ambiguity would otherwise misroute it here too late,
+            /// after parseTableUuid/parseTableFilePath have already claimed it.)
+            return listLiveTreeChildren(path);
     }
-
-    /// A table-level SUBDIRECTORY: verbatim files under <subdir>/, first-component collapsed.
-    if (auto tf = ContentAddressed::parseTableFilePath(path))
-    {
-        const auto ns = liveNamespace(tf->table_uuid);
-        std::unordered_set<std::string> result;
-        if (namespaceFilesReadable(ns))
-            for (const auto & name : store()->listNamespaceFiles(ns))
-                if (name.starts_with(tf->tail + "/"))
-                    addFirstComponent(result, name.substr(tf->tail.size() + 1));
-        return toVector(std::move(result));
-    }
-
-    /// A generic INTERMEDIATE live-tree directory (the disk root "", `store`, or any loose-file
-    /// container above a table dir): a server-root-scoped mirrored LIST. (`store/<u3>` is handled by the
-    /// early guard above, since its non-Atomic-table ambiguity would otherwise misroute it here too
-    /// late, after parseTableUuid/parseTableFilePath have already claimed it.)
-    return listLiveTreeChildren(path);
+    return listLiveTreeChildren(path);   /// unreachable
 }
 
 DirectoryIteratorPtr ContentAddressedMetadataStorage::iterateDirectory(const std::string & path) const
