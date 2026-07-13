@@ -1156,6 +1156,12 @@ std::optional<String> ContentAddressedMetadataStorage::getPartManifestBytes(cons
     return Cas::encodePartManifest(*view->manifest());
 }
 
+/// TRUST MODEL: adopting a part from a peer-supplied manifest is exactly as trusted as an ordinary
+/// ReplicatedMergeTree interserver part fetch. The interserver HTTP channel — not a per-blob ACL — is
+/// the trust boundary: a malicious or MITM peer on that channel can already serve arbitrary part bytes
+/// that the receiver adopts, in both the byte-streaming and the relink path. Table-level RBAC never
+/// defended against a hostile peer, so relink-by-manifest adds no new trust surface. (See the retracted
+/// umbrella "RBAC bypass" finding.)
 bool ContentAddressedMetadataStorage::adoptPartFromManifest(
     const String & table_uuid, const String & part_name,
     const String & manifest_bytes, const std::map<String, String> & mutable_files)

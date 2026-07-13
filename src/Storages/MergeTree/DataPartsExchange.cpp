@@ -1103,6 +1103,7 @@ MergeTreeData::MutableDataPartPtr Fetcher::relinkPartToDisk(
     /// fail-closed blob revalidation (the GC-race safety the old 4-step pin protocol carried). Returns
     /// false if a referenced blob is missing/condemned in this pool — relink not possible, the caller
     /// falls back to a byte fetch; nothing was published (no dangling ref).
+    /// Trust boundary is the interserver channel, as for a normal part fetch — see adoptPartFromManifest.
     const bool published = ca_meta->adoptPartFromManifest(*table_uuid, part_dir, sender_manifest_bytes, sidecar_values);
     if (!published)
         return nullptr;
