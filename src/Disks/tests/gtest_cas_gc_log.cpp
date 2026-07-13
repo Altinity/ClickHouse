@@ -263,3 +263,36 @@ TEST(CasGcLog, AbortedFinishOnThrowingRound)
     EXPECT_EQ(rows[1].disk_name, "ca");
     EXPECT_FALSE(rows[1].gc_id.empty());
 }
+
+/// B3: the scheduler exposes per-disk GC health for system.content_addressed_mounts (the process-
+/// global CurrentMetrics gauges were clobbered with >= 2 CAS disks). Drive one leader round and
+/// assert the health snapshot reflects leadership, the pending-reclaim backlog and a fresh success.
+TEST(CasGcHealth, ReflectsLeadershipAndPendingReclaim)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = Store::open(backend,
+        PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_fold_max_defer_rounds = 0});
+    const RootNamespace ns{"srv1/tbl"};
+    publishPart(store, ns.string(), "all_0_0_0", "hello-cas-gc-health");
+    store->dropRef(ns, "all_0_0_0");
+    store->renewWatermarkOnce();
+
+    DB::ContentAddressed::CasGcScheduler sched(store, std::chrono::seconds(1), "test::gc", "ca", {});
+
+    const auto h0 = sched.gcHealth();
+    EXPECT_FALSE(h0.is_leader);
+    EXPECT_FALSE(h0.ever_succeeded);
+    EXPECT_EQ(h0.pending_reclaim, 0);
+    EXPECT_EQ(h0.wedged_namespace_count, 0u);
+
+    const RoundReport rep = sched.runOneRoundNow(Rec::Trigger::Manual);
+    ASSERT_TRUE(rep.acquired_lease);
+
+    const auto h1 = sched.gcHealth();
+    EXPECT_TRUE(h1.is_leader);
+    EXPECT_TRUE(h1.ever_succeeded);
+    EXPECT_EQ(h1.pending_reclaim,
+              static_cast<Int64>(rep.condemned) - static_cast<Int64>(rep.redeleted));
+    EXPECT_EQ(h1.wedged_namespace_count, 0u);
+    EXPECT_LT(h1.last_success_age_seconds, 60u);
+}

@@ -801,6 +801,11 @@ public:
     /// test land a DIFFERENT object at the exact wedged key to exercise resolve-time CORRUPTED_DATA.
     String wedgedKeyForTest(const RootNamespace & ns);
 
+    /// Number of ref-append lanes currently wedged (an uncertain PUT exhausted its retry budget and
+    /// the lane blocks until the same key resolves durable or is conclusively rejected). Per-disk GC
+    /// health for system.content_addressed_mounts (B3). O(live tables); takes each runtime state lock.
+    size_t wedgedRefLaneCount();
+
     /// Task 11 test seam: blocks until every background snapshot-publish attempt dispatched so far for
     /// `ns` has settled. Needed only by tests that exercise the REAL background dispatch (production
     /// concurrency); tests that just want deterministic publish-logic coverage call

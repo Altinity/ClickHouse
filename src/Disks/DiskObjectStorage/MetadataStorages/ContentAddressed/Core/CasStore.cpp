@@ -1300,6 +1300,25 @@ String Store::wedgedKeyForTest(const RootNamespace & ns)
     return rt->wedge ? rt->wedge->key : String{};
 }
 
+size_t Store::wedgedRefLaneCount()
+{
+    std::vector<std::shared_ptr<RefTableRuntime>> runtimes;
+    {
+        std::lock_guard<std::mutex> g(ref_queue_mutex);
+        runtimes.reserve(ref_tables.size());
+        for (const auto & [_, rt] : ref_tables)
+            runtimes.push_back(rt);
+    }
+    size_t wedged = 0;
+    for (const auto & rt : runtimes)
+    {
+        std::lock_guard lock(rt->state_mutex);
+        if (rt->wedge.has_value())
+            ++wedged;
+    }
+    return wedged;
+}
+
 bool Store::observedNamespaceCleanupMarker(const RootNamespace & ns, const RefTxnId & remove_txn_id)
 {
     const auto rt = getRefTableRuntime(ns);

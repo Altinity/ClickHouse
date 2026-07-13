@@ -1,7 +1,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/CasGcScheduler.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
-#include <Common/CurrentMetrics.h>
 #include <Common/CurrentThread.h>
 #include <Common/Exception.h>
 #include <Common/ProfileEvents.h>
@@ -10,12 +9,6 @@
 #include <Common/thread_local_rng.h>
 #include <algorithm>
 #include <optional>
-
-namespace CurrentMetrics
-{
-    extern const Metric CasGcIsLeader;
-    extern const Metric CasGcPendingReclaimEntries;
-}
 
 namespace DB::ContentAddressed
 {
@@ -149,10 +142,18 @@ Cas::RoundReport CasGcScheduler::runRoundLogged(Cas::Gc & round_gc, GcRoundLogRe
     try
     {
         const Cas::RoundReport rep = round_gc.runRegularRound(std::move(on_lease_acquired), allow_steal);
-        CurrentMetrics::set(CurrentMetrics::CasGcIsLeader, rep.acquired_lease ? 1 : 0);
         if (rep.acquired_lease)
-            CurrentMetrics::add(CurrentMetrics::CasGcPendingReclaimEntries,
-                                static_cast<Int64>(rep.condemned) - static_cast<Int64>(rep.redeleted));
+        {
+            /// B3: feeds gcHealth() -- per-scheduler, unlike the retired process-global CurrentMetrics
+            /// gauges these replace (clobbered with >= 2 CAS disks in one process).
+            pending_reclaim.fetch_add(
+                static_cast<Int64>(rep.condemned) - static_cast<Int64>(rep.redeleted),
+                std::memory_order_relaxed);
+            last_success_ms.store(
+                static_cast<UInt64>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count()),
+                std::memory_order_relaxed);
+        }
         fin.outcome = rep.acquired_lease ? Rec::Outcome::Success : Rec::Outcome::NotALeader;
         fin.round = rep.round;
         fin.candidates_marked = rep.candidates;
@@ -277,6 +278,23 @@ void CasGcScheduler::heartbeatLoop()
             tryLogCurrentException(log, "CA GC heartbeat pulse failed (advisory; will retry)");
         }
     }
+}
+
+CasGcScheduler::GcHealth CasGcScheduler::gcHealth() const
+{
+    GcHealth h;
+    h.is_leader = i_am_leader.load(std::memory_order_relaxed);
+    h.pending_reclaim = pending_reclaim.load(std::memory_order_relaxed);
+    const UInt64 last_ms = last_success_ms.load(std::memory_order_relaxed);
+    h.ever_succeeded = last_ms != 0;
+    if (last_ms != 0)
+    {
+        const UInt64 now_ms = static_cast<UInt64>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+        h.last_success_age_seconds = now_ms > last_ms ? (now_ms - last_ms) / 1000 : 0;
+    }
+    h.wedged_namespace_count = store->wedgedRefLaneCount();
+    return h;
 }
 
 }

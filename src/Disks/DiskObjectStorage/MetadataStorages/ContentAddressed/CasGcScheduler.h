@@ -41,6 +41,19 @@ public:
     /// report so the SYSTEM command / tests can inspect it. Emits a Start + Finish record.
     Cas::RoundReport runOneRoundNow(GcRoundLogRecord::Trigger trigger = GcRoundLogRecord::Trigger::Manual);
 
+    /// Per-disk GC health for system.content_addressed_mounts (B3): the process-global CurrentMetrics
+    /// gauges were clobbered with >= 2 CAS disks. All fields snapshot THIS scheduler's own state;
+    /// wedged_namespace_count is read live from the store's ref lanes.
+    struct GcHealth
+    {
+        bool is_leader = false;
+        bool ever_succeeded = false;
+        Int64 pending_reclaim = 0;             /// cumulative condemned - executed deletes (this process)
+        UInt64 last_success_age_seconds = 0;   /// seconds since the last led round (0 if never)
+        UInt64 wedged_namespace_count = 0;
+    };
+    GcHealth gcHealth() const;
+
 private:
     void loop();
     void heartbeatLoop();   /// B160: bump gc/hb while we hold the lease, on a fast cadence (H <= W)
@@ -83,6 +96,9 @@ private:
     ThreadFromGlobalPool thread;
     std::atomic<bool> i_am_leader{false};   /// B160: set by the round thread, read by the heartbeat thread
     ThreadFromGlobalPool hb_thread;
+
+    std::atomic<Int64> pending_reclaim{0};     /// B3: cumulative condemned - redeleted while leading
+    std::atomic<UInt64> last_success_ms{0};    /// B3: steady-clock ms of the last led round; 0 = never
 };
 
 }

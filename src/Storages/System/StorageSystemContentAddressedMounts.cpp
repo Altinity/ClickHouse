@@ -43,6 +43,10 @@ StorageSystemContentAddressedMounts::StorageSystemContentAddressedMounts(const S
         {"min_active", std::make_shared<DataTypeUInt64>(), "Oldest in-flight build sequence (UINT64_MAX = farewell)."},
         {"gc_fenced", std::make_shared<DataTypeUInt8>(), "1 if GC fenced this slot out (terminal)."},
         {"state", std::make_shared<DataTypeString>(), "live | expired | terminated | fenced | corrupt."},
+        {"is_leader", std::make_shared<DataTypeUInt8>(), "1 if THIS server's GC scheduler currently holds this disk's leadership lease (per-disk; supersedes the retired process-global CasGcIsLeader metric)."},
+        {"pending_reclaim", std::make_shared<DataTypeInt64>(), "Cumulative two-phase deletion backlog observed by this process's GC on this disk (condemned entries minus executed exact-token deletes)."},
+        {"last_success_age_seconds", std::make_shared<DataTypeUInt64>(), "Seconds since this disk's GC last led a round (0 if it has never led or GC is not running here)."},
+        {"wedged_namespace_count", std::make_shared<DataTypeUInt64>(), "Ref-append lanes currently wedged on this disk (an uncertain PUT exhausted its retry budget)."},
     }));
     storage_metadata.setVirtuals(createVirtuals());
     setInMemoryMetadata(storage_metadata);
@@ -79,6 +83,10 @@ Pipe StorageSystemContentAddressedMounts::read(
     MutableColumnPtr col_min_active = ColumnUInt64::create();
     MutableColumnPtr col_fenced = ColumnUInt8::create();
     MutableColumnPtr col_state = ColumnString::create();
+    MutableColumnPtr col_is_leader = ColumnUInt8::create();
+    MutableColumnPtr col_pending = ColumnInt64::create();
+    MutableColumnPtr col_last_success = ColumnUInt64::create();
+    MutableColumnPtr col_wedged = ColumnUInt64::create();
 
     const uint64_t now_ms = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -130,6 +138,7 @@ Pipe StorageSystemContentAddressedMounts::read(
                                    "listing mounts for disk '" + disk_name + "'");
             continue;
         }
+        const auto health = ca->gcHealth();
         for (const auto & m : mounts)
         {
             col_disk->insert(disk_name);
@@ -144,6 +153,10 @@ Pipe StorageSystemContentAddressedMounts::read(
             col_min_active->insert(m.lease.min_active);
             col_fenced->insert(static_cast<UInt8>(m.lease.gc_fenced));
             col_state->insert(m.state);
+            col_is_leader->insert(health ? static_cast<UInt8>(health->is_leader) : UInt8(0));
+            col_pending->insert(health ? health->pending_reclaim : Int64(0));
+            col_last_success->insert(health ? health->last_success_age_seconds : UInt64(0));
+            col_wedged->insert(health ? health->wedged_namespace_count : UInt64(0));
         }
     }
 
@@ -160,6 +173,10 @@ Pipe StorageSystemContentAddressedMounts::read(
     res_columns.emplace_back(std::move(col_min_active));
     res_columns.emplace_back(std::move(col_fenced));
     res_columns.emplace_back(std::move(col_state));
+    res_columns.emplace_back(std::move(col_is_leader));
+    res_columns.emplace_back(std::move(col_pending));
+    res_columns.emplace_back(std::move(col_last_success));
+    res_columns.emplace_back(std::move(col_wedged));
 
     UInt64 num_rows = res_columns.at(0)->size();
     Chunk chunk(std::move(res_columns), num_rows);

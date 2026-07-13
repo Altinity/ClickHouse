@@ -206,6 +206,14 @@ void ContentAddressedMetadataStorage::runOneGcRoundForTest()
     sched->runOneRoundNow();
 }
 
+std::optional<ContentAddressed::CasGcScheduler::GcHealth> ContentAddressedMetadataStorage::gcHealth() const
+{
+    std::lock_guard lock(gc_scheduler_mutex);   /// A7
+    if (!gc_scheduler)
+        return std::nullopt;
+    return gc_scheduler->gcHealth();
+}
+
 ContentAddressed::GcRoundLogger ContentAddressedMetadataStorage::makeGcRoundLogger() const
 {
     /// Unit tests pass a null context (no system logs); the scheduler then runs without a sink.

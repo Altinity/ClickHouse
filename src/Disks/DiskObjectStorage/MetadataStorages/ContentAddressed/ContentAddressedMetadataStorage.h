@@ -124,6 +124,10 @@ public:
     /// BAD_ARGUMENTS when GC is disabled (read-only disk or gc_enabled=false) — same gate as above.
     Cas::RebuildReport runGcRebuildNow(bool force);
 
+    /// Per-disk GC health for system.content_addressed_mounts (B3). nullopt when no GC scheduler runs
+    /// on this disk (GC disabled, read-only, or not started). Reads gc_scheduler under A7's mutex.
+    std::optional<ContentAddressed::CasGcScheduler::GcHealth> gcHealth() const;
+
     MetadataStorageType getType() const override { return MetadataStorageType::ContentAddressed; }
     const std::string & getPath() const override { return storage_path_full; }
     bool supportsChmod() const override { return false; }
@@ -360,8 +364,9 @@ private:
     std::unique_ptr<ContentAddressed::CasGcScheduler> gc_scheduler;
     /// Guards the lazy `gc_scheduler` creation in `runOneGcRoundForTest`/`runGarbageCollectionRoundNow`
     /// against a racing manual `SYSTEM ... GC` on another query thread; the round itself runs OUTSIDE
-    /// this lock (CasGcScheduler::runOneRoundNow has its own gc_round_mutex for that).
-    std::mutex gc_scheduler_mutex;
+    /// this lock (CasGcScheduler::runOneRoundNow has its own gc_round_mutex for that). `mutable`: also
+    /// taken by the const `gcHealth()` accessor (B3), which only reads `gc_scheduler`.
+    mutable std::mutex gc_scheduler_mutex;
     /// Derived from object_storage->isReadOnly() at startup (the disk's <readonly> config). When set:
     /// the probe is skipped, no watermark, no GC scheduler, and the mutating surface fails closed.
     bool read_only = false;

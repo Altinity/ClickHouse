@@ -228,8 +228,6 @@
     M(DiskPlainRewritableS3DirectoryMapSize, "Number of local-to-remote path entries in the 'plain_rewritable' in-memory map for S3ObjectStorage.") \
     M(DiskPlainRewritableS3FileCount, "Number of file entries in the 'plain_rewritable' in-memory map for S3ObjectStorage.") \
     \
-    M(CasGcIsLeader, "1 while this server holds the content-addressed GC leadership lease (set at each round end; 0 after a round where the lease was not acquired).") \
-    M(CasGcPendingReclaimEntries, "Content-addressed GC two-phase deletion backlog observed by this process: cumulative condemned entries minus executed exact-token deletes. Process-local (resets on restart).") \
     M(CasPartFolderCacheBytes, "Estimated bytes retained by the CA part-folder view cache") \
     M(CasPartFolderCacheEntries, "Entries retained by the CA part-folder view cache") \
     \
