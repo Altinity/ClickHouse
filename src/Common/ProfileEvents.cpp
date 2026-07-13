@@ -747,10 +747,6 @@ The server successfully detected this situation and will download merged part fr
     M(CasBlobHeadFirst,  "CA blob HEAD-first attempts (P1 cache hit or P2 size threshold)", ValueType::Number) \
     M(CasBlobBodyPutAvoided, "CA blob body PUTs avoided by a HEAD-first present hit (P1/P2)", ValueType::Number) \
     M(CasBlobCopyForward, "CA condemned blob incarnations displaced by verified copy-forward at the promote gate (tokenless committed-manifest evidence; INV-1 exception)", ValueType::Number) \
-    M(CasShardBatchFlushes, "CA shard-mutation-queue flushes committed (one casPut each); avg batch = CasShardBatchedMutations / this", ValueType::Number) \
-    M(CasShardBatchedMutations, "CA shard mutations committed through the flat-combining queue", ValueType::Number) \
-    M(CasShardBatchScopeCuts, "CA shard-queue carves cut early by the scope rule (same-ref repeat or WholeShard behind)", ValueType::Number) \
-    M(CasShardQueueWaitMicroseconds, "CA total time mutateShard callers spent enqueued (sum over items)", ValueType::Microseconds) \
     M(CasRefBatchFlushes, "CA ref-log-append-lane flushes committed (one putIfAbsentControlled each); avg batch = CasRefBatchedMutations / this", ValueType::Number) \
     M(CasRefBatchedMutations, "CA ref mutations committed through the per-namespace ref-log batching queue", ValueType::Number) \
     M(CasRefBatchScopeCuts, "CA ref-queue carves cut early by the scope rule (same-ref repeat, non-Live-forced-solo, or WholeShard behind)", ValueType::Number) \
@@ -833,9 +829,6 @@ The server successfully detected this situation and will download merged part fr
     M(CasOtherGetStream, "CA other get-stream S3 ops", ValueType::Number) \
     M(CasOtherDelete,    "CA other delete S3 ops", ValueType::Number) \
     M(CasOtherList,      "CA other list S3 ops", ValueType::Number) \
-    M(CasManifestBackpressureCount,      "CA root-shard manifest backpressure delay events", ValueType::Number) \
-    M(CasManifestBackpressureMicroseconds, "CA root-shard manifest backpressure total microseconds delayed", ValueType::Number) \
-    M(CasManifestHardLimitExceeded,      "CA root-shard manifest hard-limit exceptions", ValueType::Number) \
     M(CasGcRetiredCondemned,   "CA gc entries newly condemned into the retired list this round", ValueType::Number) \
     M(CasGcRetiredSpared,      "CA gc retired entries spared (in-degree recovered before graduation)", ValueType::Number) \
     M(CasGcRetiredGraduated,   "CA gc retired entries newly floor-passed and published delete_pending", ValueType::Number) \
@@ -846,7 +839,6 @@ The server successfully detected this situation and will download merged part fr
     M(CasPartFolderViewMutableRefreshes, "CA part-folder view refreshes: manifest unchanged, mutable payload drifted — view cloned, no manifest read", ValueType::Number) \
     M(CasPartFolderViewValidationMismatches, "CA part-folder view validation mismatches: the manifest changed under a retained view — rebuilt", ValueType::Number) \
     M(CasPartFolderViewMisses, "CA part-folder view cold builds (no retained entry consulted or found)", ValueType::Number) \
-    M(CasPartFolderViewEvictions, "CA part-folder view LRU evictions", ValueType::Number) \
     M(CasPartFolderViewOversizedBypasses, "CA part-folder views built but not retained (estimated weight above the per-entry cap)", ValueType::Number) \
     M(CasPartFolderViewInvalidations, "CA part-folder view write-through erases (promote, mutable update, drop ref, drop namespace)", ValueType::Number) \
     M(CasPartFolderManifestGets, "CA part-manifest body GET requests issued by readManifestShared (the part-folder cache acceptance metric)", ValueType::Number) \
@@ -877,13 +869,6 @@ The server successfully detected this situation and will download merged part fr
     M(DiskS3CompleteMultipartUpload, "Number of DiskS3 API CompleteMultipartUpload calls.", ValueType::Number) \
     M(DiskS3PutObject, "Number of DiskS3 API PutObject calls.", ValueType::Number) \
     M(DiskS3GetObject, "Number of DiskS3 API GetObject calls.", ValueType::Number) \
-    \
-    M(ContentAddressedGenerationResurrectionsTotal, "Number of times a content-addressed write resurrected a blob/manifest to a higher generation because the resolved generation was sealed by GC (CA GC S3). A high rate signals hot content cycling zero-refs to resurrection.", ValueType::Number) \
-    M(ContentAddressedDuplicateGenerationBytes, "Bytes uploaded as a RESURRECTED (g>0) content-addressed blob/manifest generation — a byte-identical copy of a still-condemned predecessor (CA GC S3). Grows with resurrection churn; the predecessor is reclaimed once it drains.", ValueType::Bytes) \
-    M(ContentAddressedTombstonesTotal, "Number of GC-owned generation tombstones SEALED (created) by the content-addressed garbage collector (CA GC S3). A swept generation keeps its tombstone as a permanent gravestone, so this counts durable condemnations.", ValueType::Number) \
-    M(ContentAddressedGenerationsObserved, "Number of present content-addressed generation OBJECTS observed across the GC's per-identity generation listings (CA GC S3). Paired with ContentAddressedHashesObserved it is the generations-per-hash proxy (a p99 guardrail for hot-content cycling).", ValueType::Number) \
-    M(ContentAddressedHashesObserved, "Number of distinct content-addressed identities (hashes / part ids) whose generation set the GC listed (CA GC S3). The denominator of the generations-per-hash proxy.", ValueType::Number) \
-    M(ContentAddressedOrphanBytesEstimate, "Estimated bytes of content-addressed generation objects swept by the GC as unreachable orphans (CA GC S3). A guardrail for orphan drift / leaked uploads.", ValueType::Bytes) \
     \
     M(DiskPlainRewritableAzureDirectoryCreated, "Number of directories created by the 'plain_rewritable' metadata storage for AzureObjectStorage.", ValueType::Number) \
     M(DiskPlainRewritableAzureDirectoryRemoved, "Number of directories removed by the 'plain_rewritable' metadata storage for AzureObjectStorage.", ValueType::Number) \

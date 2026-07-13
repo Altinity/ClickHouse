@@ -39,7 +39,6 @@ String toString(CasEventType type)
         case CasEventType::GcRetireDecision:      return "gc_retire_decision";
         case CasEventType::GcRecheckVerdict:      return "gc_recheck_verdict";
         case CasEventType::GcFence:               return "gc_fence";
-        case CasEventType::GcSnapPersist:         return "gc_snap_persist";
         case CasEventType::GcCursorAdvance:       return "gc_cursor_advance";
         case CasEventType::GcTrim:                return "gc_trim";
         case CasEventType::GcShardReclaim:        return "gc_shard_reclaim";

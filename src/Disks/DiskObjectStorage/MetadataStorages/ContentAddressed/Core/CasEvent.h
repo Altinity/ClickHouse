@@ -20,7 +20,7 @@ enum class CasEventType
     ManifestPut, ManifestDelete,
     RefPublish, RefDrop, RefRepoint, RootAdd, RootRemove, RootRepoint, IndegZero,
     GcFoldBegin, GcFoldEnd, GcRetireObserve, GcRetireDecision, GcRecheckVerdict,
-    GcFence, GcSnapPersist, GcCursorAdvance, GcTrim, GcShardReclaim, GcFenceOut, GcRebuild, GcFoldClamp,
+    GcFence, GcCursorAdvance, GcTrim, GcShardReclaim, GcFenceOut, GcRebuild, GcFoldClamp,
     GcLeaseAcquire, GcLeaseSteal, GcLeaseHeartbeat,
     BuildStart, BuildPublish, BuildAbort, Precommit, PrecommitRemoved, PrecommitReclaim,
     GateRevalidate, GateResurrect, WatermarkRenew, MountRemount,
