@@ -22,7 +22,7 @@
 #include <string>
 
 /// Task 0 of the S3-native staging plan (docs/superpowers/plans/2026-07-11-cas-s3-native-staging.md):
-/// pure config plumbing, ZERO behavior change. `cas_staging_backend` (default `local`) is parsed
+/// pure config plumbing, ZERO behavior change. `staging_backend` (default `local`) is parsed
 /// from the CAS disk config; the parsed `StagingBackend` is exposed via
 /// `ContentAddressedMetadataStorage::stagingBackend()`. `::conditionalCopySupported()` is a stored
 /// bool, defaulting to `false` until a later task wires the mount-time capability probe.
@@ -236,14 +236,14 @@ DB::Cas::BlobSource serverSideCopySource(const std::string & staging_key, uint64
 
 TEST(CasS3Staging, ParsesS3BackendFromConfig)
 {
-    auto config = configWithDiskSection("<cas_staging_backend>s3</cas_staging_backend>");
+    auto config = configWithDiskSection("<staging_backend>s3</staging_backend>");
 
     EXPECT_EQ(DB::ContentAddressedMetadataStorage::parseStagingBackend(*config, "disk"), DB::StagingBackend::S3);
 }
 
 TEST(CasS3Staging, DefaultConfigParsesToLocalBackend)
 {
-    /// No `cas_staging_backend` key at all — the OFF BY DEFAULT arm.
+    /// No `staging_backend` key at all — the OFF BY DEFAULT arm.
     auto config = configWithDiskSection("<scratch_path>/tmp/whatever</scratch_path>");
 
     EXPECT_EQ(DB::ContentAddressedMetadataStorage::parseStagingBackend(*config, "disk"), DB::StagingBackend::Local);
@@ -251,7 +251,7 @@ TEST(CasS3Staging, DefaultConfigParsesToLocalBackend)
 
 TEST(CasS3Staging, UnknownBackendValueThrows)
 {
-    auto config = configWithDiskSection("<cas_staging_backend>nfs</cas_staging_backend>");
+    auto config = configWithDiskSection("<staging_backend>nfs</staging_backend>");
     EXPECT_THROW(DB::ContentAddressedMetadataStorage::parseStagingBackend(*config, "disk"), DB::Exception);
 }
 
@@ -619,7 +619,7 @@ TEST(CasS3Staging, PromoteOverCondemnedBlobResurrectsWithFreshTagNotVerbatim)
 namespace
 {
 
-/// Construct a `ContentAddressedMetadataStorage` with `cas_staging_backend=s3` over `object_storage`,
+/// Construct a `ContentAddressedMetadataStorage` with `staging_backend=s3` over `object_storage`,
 /// mirroring `DefaultConstructedStorageReportsLocalAndNoConditionalCopy`'s positional defaults for every
 /// parameter this test suite does not care about — only `server_root_id` (the mount identity that names
 /// the staging prefix) and the trailing `StagingBackend::S3` differ.
@@ -642,7 +642,7 @@ std::shared_ptr<DB::ContentAddressedMetadataStorage> makeS3StagingMetadataStorag
         /*gc_shards_=*/1,
         /*manifest_sweep_list_budget_keys_=*/1000,
         /*manifest_sweep_delete_budget_keys_=*/100,
-        /*gc_max_conditional_put_bytes_=*/1ULL << 30,
+        /*gcs_max_conditional_put_bytes_=*/1ULL << 30,
         /*cas_part_folder_cache_bytes_=*/64ULL << 20,
         /*cas_part_folder_cache_max_entries_=*/10000,
         /*cas_part_folder_cache_max_entry_bytes_=*/16ULL << 20,

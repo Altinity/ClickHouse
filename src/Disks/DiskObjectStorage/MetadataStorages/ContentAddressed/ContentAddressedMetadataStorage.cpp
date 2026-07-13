@@ -136,7 +136,7 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     uint64_t gc_shards_,
     uint64_t manifest_sweep_list_budget_keys_,
     uint64_t manifest_sweep_delete_budget_keys_,
-    uint64_t gc_max_conditional_put_bytes_,
+    uint64_t gcs_max_conditional_put_bytes_,
     uint64_t cas_part_folder_cache_bytes_,
     uint64_t cas_part_folder_cache_max_entries_,
     uint64_t cas_part_folder_cache_max_entry_bytes_,
@@ -162,7 +162,7 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     , gc_shards(gc_shards_)
     , manifest_sweep_list_budget_keys(manifest_sweep_list_budget_keys_)
     , manifest_sweep_delete_budget_keys(manifest_sweep_delete_budget_keys_)
-    , gc_max_conditional_put_bytes(gc_max_conditional_put_bytes_)
+    , gcs_max_conditional_put_bytes(gcs_max_conditional_put_bytes_)
     , cas_part_folder_cache_bytes(cas_part_folder_cache_bytes_)
     , cas_part_folder_cache_max_entries(cas_part_folder_cache_max_entries_)
     , cas_part_folder_cache_max_entry_bytes(cas_part_folder_cache_max_entry_bytes_)
@@ -178,13 +178,13 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
 StagingBackend ContentAddressedMetadataStorage::parseStagingBackend(
     const Poco::Util::AbstractConfiguration & config, const std::string & config_prefix)
 {
-    const std::string value = config.getString(config_prefix + ".cas_staging_backend", "local");
+    const std::string value = config.getString(config_prefix + ".staging_backend", "local");
     if (value == "local")
         return StagingBackend::Local;
     if (value == "s3")
         return StagingBackend::S3;
     throw Exception(ErrorCodes::BAD_ARGUMENTS,
-        "Unknown cas_staging_backend value '{}' (expected 'local' or 's3')", value);
+        "Unknown staging_backend value '{}' (expected 'local' or 's3')", value);
 }
 
 void ContentAddressedMetadataStorage::runOneGcRoundForTest()
@@ -364,7 +364,7 @@ void ContentAddressedMetadataStorage::startup()
     const auto mode = object_storage->getType() == ObjectStorageType::Local
         ? Cas::ObjectStorageBackend::Mode::EmulatedSingleProcess
         : Cas::ObjectStorageBackend::Mode::Native;
-    auto backend = std::make_shared<Cas::ObjectStorageBackend>(object_storage, mode, gc_max_conditional_put_bytes);
+    auto backend = std::make_shared<Cas::ObjectStorageBackend>(object_storage, mode, gcs_max_conditional_put_bytes);
 
     /// EmulatedSingleProcess emulates the conditional-op / exact-token semantics in-process (local
     /// object storage has none). That emulation is per-process: two servers pointed at the SAME local
@@ -451,7 +451,7 @@ void ContentAddressedMetadataStorage::startup()
 
     /// S3-native staging Task 3 (design `docs/superpowers/specs/2026-07-11-cas-s3-native-staging-design.md`
     /// §3): the OPTIONAL mount-time capability probe for a write-once conditional server-side copy.
-    /// Only relevant when this disk opted in to `cas_staging_backend=s3`; `Local` (the default,
+    /// Only relevant when this disk opted in to `staging_backend=s3`; `Local` (the default,
     /// global constraint: OFF BY DEFAULT) takes NO probe here — `conditional_copy_supported` simply
     /// stays at its `false` default and is never consulted on the local path. Skipped in
     /// observe-only/readonly mode: a probe write would fail on a read-only backend, exactly like the
@@ -467,7 +467,7 @@ void ContentAddressedMetadataStorage::startup()
         if (!conditional_copy_supported)
             LOG_INFO(
                 getLogger("ContentAddressedMetadataStorage"),
-                "cas_staging_backend=s3 requested but the object storage does not enforce conditional "
+                "staging_backend=s3 requested but the object storage does not enforce conditional "
                 "copy; falling back to local staging");
 
         /// S3-native staging Task 6 (mount-lease-scoped staging sweeper, design §6): reclaim THIS

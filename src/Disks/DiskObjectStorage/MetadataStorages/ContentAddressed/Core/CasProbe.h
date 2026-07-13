@@ -29,7 +29,7 @@ void runCapabilityProbe(Backend & backend, const String & probe_prefix);
 /// Probe whether `object_storage` ENFORCES a write-once conditional server-side copy
 /// (`IObjectStorage::copyObjectConditional`, `If-None-Match: *`) — an OPTIONAL capability, unlike
 /// the mandatory battery above (`runCapabilityProbe`). Only meaningful for a disk configured with
-/// `cas_staging_backend=s3` (design `docs/superpowers/specs/2026-07-11-cas-s3-native-staging-design.md`
+/// `staging_backend=s3` (design `docs/superpowers/specs/2026-07-11-cas-s3-native-staging-design.md`
 /// §3): when the backend does not enforce the precondition, the S3-native staging promote path is
 /// UNSAFE (it could silently overwrite a live blob), so the metadata layer must fall back to local
 /// staging rather than refuse to mount.

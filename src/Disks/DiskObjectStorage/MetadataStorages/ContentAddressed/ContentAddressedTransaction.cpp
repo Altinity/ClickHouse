@@ -655,7 +655,7 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
     if (ContentAddressed::partFileMustStayBlob(r->file))
     {
         /// S3-native staging (Task 4, plan docs/superpowers/plans/2026-07-11-cas-s3-native-staging.md):
-        /// when this disk opted in (`cas_staging_backend=s3`) AND the mount-time capability probe
+        /// when this disk opted in (`staging_backend=s3`) AND the mount-time capability probe
         /// (Task 3) proved the object storage enforces write-once conditional copy, stream directly
         /// to a fresh per-mount S3 staging object while hashing — no local-disk round trip. Otherwise
         /// (the OFF BY DEFAULT global constraint, or a probe fail-close) fall through to the existing,

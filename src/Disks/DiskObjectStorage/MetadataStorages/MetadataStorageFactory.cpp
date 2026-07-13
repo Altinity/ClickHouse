@@ -273,12 +273,15 @@ static void registerContentAddressedMetadataStorage(MetadataStorageFactory & fac
         const uint64_t manifest_sweep_list_budget_keys = config.getUInt64(config_prefix + ".manifest_sweep_list_budget_keys", 1000);
         const uint64_t manifest_sweep_delete_budget_keys = config.getUInt64(config_prefix + ".manifest_sweep_delete_budget_keys", 100);
         /// Phase 0 (mount safety): the layout subtree identity is explicit and REQUIRED — no default,
-        /// so a missing key throws `Poco::NotFoundException`. `ServerUUID` is demoted to an owner token;
-        /// the subtree a server owns is named by `server_root_id`. Validated immediately (fail closed).
-        /// Macros expand here exactly as in the s3 `endpoint` (ObjectStorageFactory): on a
-        /// multi-replica stand every replica mounts ONE shared pool (same endpoint) and must own a
-        /// DISTINCT subtree, so the natural single-template config is
-        /// `<server_root_id>{replica}</server_root_id>`. An unknown macro throws (fail closed).
+        /// so a missing key throws a typed NO_ELEMENTS_IN_CONFIG exception (mirroring the `metadata_type`
+        /// check above). `ServerUUID` is demoted to an owner token; the subtree a server owns is named
+        /// by `server_root_id`. Validated immediately (fail closed). Macros expand here exactly as in
+        /// the s3 `endpoint` (ObjectStorageFactory): on a multi-replica stand every replica mounts ONE
+        /// shared pool (same endpoint) and must own a DISTINCT subtree, so the natural single-template
+        /// config is `<server_root_id>{replica}</server_root_id>`. An unknown macro throws (fail closed).
+        if (!config.has(config_prefix + ".server_root_id"))
+            throw Exception(ErrorCodes::NO_ELEMENTS_IN_CONFIG,
+                "Expected `server_root_id` in config for a content-addressed disk");
         const std::string server_root_id = global_context->getMacros()->expand(
             config.getString(config_prefix + ".server_root_id"));
         Cas::validateServerRootId(server_root_id);
@@ -287,11 +290,13 @@ static void registerContentAddressedMetadataStorage(MetadataStorageFactory & fac
         /// (the compose-based path is a follow-up). Irrelevant on ETag stores (AWS et al).
         const uint64_t gcs_max_conditional_put_bytes = config.getUInt64(config_prefix + ".gcs_max_conditional_put_bytes", 1ULL << 30);
         /// Part-folder view cache (spec 2026-07-08-cas-part-folder-cache): ON by default;
-        /// `cas_part_folder_cache_bytes = 0` disables retention — a supported permanent
+        /// `part_folder_cache_bytes = 0` disables retention — a supported permanent
         /// operational configuration (the runbook disable switch), not only a debug aid.
-        const uint64_t cas_part_folder_cache_bytes = config.getUInt64(config_prefix + ".cas_part_folder_cache_bytes", 64ULL << 20);
-        const uint64_t cas_part_folder_cache_max_entries = config.getUInt64(config_prefix + ".cas_part_folder_cache_max_entries", 10000);
-        const uint64_t cas_part_folder_cache_max_entry_bytes = config.getUInt64(config_prefix + ".cas_part_folder_cache_max_entry_bytes", 16ULL << 20);
+        /// Config-key convention: the `content_addressed` block already scopes every key to this disk,
+        /// so no key carries a redundant `cas_`/`ca_` prefix.
+        const uint64_t part_folder_cache_bytes = config.getUInt64(config_prefix + ".part_folder_cache_bytes", 64ULL << 20);
+        const uint64_t part_folder_cache_max_entries = config.getUInt64(config_prefix + ".part_folder_cache_max_entries", 10000);
+        const uint64_t part_folder_cache_max_entry_bytes = config.getUInt64(config_prefix + ".part_folder_cache_max_entry_bytes", 16ULL << 20);
         /// Phase-5 (part-folder cache spec): byte bound for the manifest DECODE cache (Cas::Store).
         /// `manifest_decode_cache_bytes = 0` disables decode caching entirely (diagnostic mode).
         const uint64_t manifest_decode_cache_bytes = config.getUInt64(config_prefix + ".manifest_decode_cache_bytes", 128ULL << 20);
@@ -299,7 +304,7 @@ static void registerContentAddressedMetadataStorage(MetadataStorageFactory & fac
         /// a mass-DROP condemning ~1M blobs sequentially would take hours; see `PoolConfig::gc_meta_pool_size`.
         const uint64_t gc_meta_pool_size = config.getUInt64(config_prefix + ".gc_meta_pool_size", 16);
         /// S3-native staging (design 2026-07-11-cas-s3-native-staging-design.md §4, plan Task 0):
-        /// `cas_staging_backend` defaults to `local` — BYTE-FOR-BYTE the current write path, zero
+        /// `staging_backend` defaults to `local` — BYTE-FOR-BYTE the current write path, zero
         /// behavior change, no probe, no new code path taken (global constraint: OFF BY DEFAULT).
         const auto staging_backend = ContentAddressedMetadataStorage::parseStagingBackend(config, config_prefix);
         auto metadata_storage = std::make_shared<ContentAddressedMetadataStorage>(
@@ -307,7 +312,7 @@ static void registerContentAddressedMetadataStorage(MetadataStorageFactory & fac
             global_context, gc_enabled, gc_interval, name, dedup_cache_bytes, dedup_head_first_min_bytes,
             gc_snap_generations_to_keep, gc_shards, manifest_sweep_list_budget_keys, manifest_sweep_delete_budget_keys,
             gcs_max_conditional_put_bytes,
-            cas_part_folder_cache_bytes, cas_part_folder_cache_max_entries, cas_part_folder_cache_max_entry_bytes,
+            part_folder_cache_bytes, part_folder_cache_max_entries, part_folder_cache_max_entry_bytes,
             manifest_decode_cache_bytes, gc_meta_pool_size, staging_backend, blob_hash_algo, blob_hash_allow_new,
             skip_access_check);
 

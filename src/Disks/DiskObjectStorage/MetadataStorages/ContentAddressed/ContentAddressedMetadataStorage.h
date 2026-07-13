@@ -73,7 +73,7 @@ public:
         uint64_t gc_shards_ = 1,
         uint64_t manifest_sweep_list_budget_keys_ = 1000,
         uint64_t manifest_sweep_delete_budget_keys_ = 100,
-        uint64_t gc_max_conditional_put_bytes_ = 1ULL << 30,
+        uint64_t gcs_max_conditional_put_bytes_ = 1ULL << 30,
         uint64_t cas_part_folder_cache_bytes_ = 64ULL << 20,
         uint64_t cas_part_folder_cache_max_entries_ = 10000,
         uint64_t cas_part_folder_cache_max_entry_bytes_ = 16ULL << 20,
@@ -101,7 +101,7 @@ public:
         /// call site compiling unmodified.
         bool skip_access_check_ = false);
 
-    /// Parse `cas_staging_backend` from the CAS disk config (default `local` — the OFF BY DEFAULT
+    /// Parse `staging_backend` from the CAS disk config (default `local` — the OFF BY DEFAULT
     /// global constraint). Extracted as a static method (rather than inlined into
     /// `MetadataStorageFactory.cpp` like the neighboring `scratch_path` read) so the config-parsing
     /// logic is unit-testable without constructing the full disk factory. Throws BAD_ARGUMENTS on an
@@ -330,7 +330,7 @@ private:
     const uint64_t manifest_sweep_delete_budget_keys;
     /// GCS single-PUT budget for conditional writes (generation-token stores only): threaded into
     /// the ObjectStorageBackend construction site in startup(). Irrelevant on ETag stores (AWS et al).
-    const uint64_t gc_max_conditional_put_bytes;
+    const uint64_t gcs_max_conditional_put_bytes;
     /// Part-folder view cache settings (spec 2026-07-08-cas-part-folder-cache), threaded into the
     /// facade construction in startup(). `cas_part_folder_cache_bytes == 0` disables retention.
     const uint64_t cas_part_folder_cache_bytes;
