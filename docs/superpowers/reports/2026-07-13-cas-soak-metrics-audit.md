@@ -158,32 +158,39 @@ During this audit `CasRootGet` was observed live (backend counter of GETs on the
 oracle's counter swap to `CasRefLogBodyGets` stands on consumer-isolation grounds; the misleading
 comment was corrected in `8d34bb504ed`.
 
-## Files written vs S3 ops per part type (INSERTs) {#files-vs-s3}
+## Files written vs S3 ops per part (workload table) {#files-vs-s3}
 
-`part_log` `NewPart` by `part_type` × `disk_name` revealed the storage policy is TIERED: small
-insert blocks become **Compact parts on the local `default` disk** (zero S3, 4-8 ms), large blocks
-go straight to **Wide parts on the `ca` disk**; merges/moves later produce Wide@ca parts.
+**CORRECTION (user challenge, verified against config+DDL):** an earlier revision of this section
+claimed a tiered storage policy (Compact parts on a local hot disk). WRONG — the `ca` policy has a
+single volume/disk and `ca_stress` sets `min_bytes_for_wide_part=0` (soak/run.py:96), so **every
+workload part is Wide on `ca`**. The "Compact @ `default`" population in unfiltered `part_log`
+(9.4k parts, 0 S3, 4-8 ms, 1-2k rows) is the SYSTEM LOG TABLES (`metric_log`, `trace_log`,
+`query_log`, `part_log`, `content_addressed_log`) flushing small Compact parts to the local disk;
+the 66 "Wide @ `default`" are system tables crossing wide thresholds (`metric_log` has thousands of
+columns). Consequently the "parts created" workload figure above (44 655) overcounts: true
+`ca_stress` parts ≈ 29.6k (the Wide@ca population). Audit lesson recorded: ALWAYS filter `part_log`
+by table.
 
-| | Compact@default (39%) | Wide@ca (61%) |
-|---|---|---|
-| parts | ~18 700 | ~29 600 |
-| `FileOpen` per part | 17.6 | 26.8 |
-| S3 conditional writes per part | **0** | 13.6 (5.8 blob bodies + ~1 manifest + ~6.8 tags/ref) |
-| S3 GET / HEAD per part | 0 / 0 | 22 / 43.6 |
-| avg create time | 4–8 ms | ~370 ms |
-| avg rows | 1 059–1 860 | 176–779 |
+Per `ca_stress` part (Wide@ca, both nodes; metric = `ProfileEvents['FileOpen']` in the part-op
+scope, which matches the part anatomy: 9 columns x 2 files + primary.idx + checksums + metadata
+files ~= 25-27):
 
-Insights:
+| Metric | per part |
+|---|---|
+| `FileOpen` (files written) | 26.8 |
+| S3 conditional writes | 13.6 (5.8 blob bodies + ~1 manifest + ~6.8 freshness tags/ref) |
+| S3 GET / HEAD | 22 / 43.6 |
+| avg create time | ~370 ms |
 
-1. **~78% of a Wide part's files never become S3 objects**: 26.8 files opened → only 5.8 blob
-   bodies + 1 manifest; marks, `primary.idx`, checksums, serialization metadata and other
-   sub-`INLINE_CAP` files ride INSIDE the manifest. The inline design saves ~20 PUTs per part.
-2. **The local hot tier absorbs 39% of insert parts entirely** — without it every micro-insert
-   would pay the full CAS publish; this is a large contributor to the modest 13.6 PUT/insert.
-3. The Compact/Wide split is byte-driven (`min_bytes_for_wide_part`), not row-driven: parts with
-   fat `payload` strings go Wide at ~200 rows while 1 800-row thin parts stay Compact.
-4. HEAD ≈ 1.6 × files for Wide parts (per-file dedup probe + adopt/freshness verification) —
-   consistent with the dedup-by-hash design.
+Insights (corrected):
+
+1. **~78% of a part\'s files never become S3 objects**: 26.8 files written -> 5.8 blob bodies +
+   1 manifest; marks, `primary.idx`, checksums, serialization metadata and other sub-`INLINE_CAP`
+   files ride INSIDE the manifest. The inline design saves ~20 PUTs per part.
+2. HEAD ~= 1.6 x files (per-file dedup probe + adopt/freshness verification) — the price of the
+   dedup that absorbed 69% of bodies this run.
+3. System log tables cost zero S3 by residing on the local `default` disk — deliberate soak config,
+   and the reason unfiltered `part_log` aggregates mislead.
 
 ## Final run outcome {#final-outcome}
 
