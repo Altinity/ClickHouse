@@ -140,6 +140,12 @@ point-readers never fall back to a HEAD-only guess" while a fallback for absent 
   (tombstone without body) heals via rule 5 at the hash's next birth.
   The TLA+ gate models exactly these five transitions plus the crash points between step pairs,
   with the invariant "meta absence implies no queued exact-token delete on a live token".
+  Read-side contract (user, 2026-07-13): **data reads never consult `.meta`** — a reader holding a
+  live ref goes straight to the body (live ref => in-degree >= 1 => no delete can be queued;
+  tombstone presence is irrelevant to it, including inside the healing windows of rule 5). The ONLY
+  `.meta` readers are the reuse path (occupied-key point-read on dedup/adopt: alive vs condemned =>
+  adopt vs displace/resurrect) and GC itself. The "absent-meta fallback becomes primary" analysis
+  therefore concerns exactly one function: the adopt-path point-read.
 - SEMANTIC change touching condemn/resurrect invariants: **TLA+ gate required** (the blob
   condemn/resurrect model), lands as the LAST commit of the round, one-command revertible, after a
   baseline soak with §0 counters proves the class decomposition.
