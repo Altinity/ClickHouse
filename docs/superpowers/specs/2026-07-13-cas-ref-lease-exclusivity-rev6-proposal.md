@@ -10,7 +10,9 @@ doc_type: 'reference'
 # CAS Ref Protocol rev.6 Proposal: Lease-Boundary Exclusivity {#cas-ref-lease-exclusivity-rev6}
 
 **Date:** 2026-07-13
-**Status:** PROPOSAL — awaiting user review; amends
+**Status:** SUPERSEDED by the approved
+[rev.6 design](2026-07-13-cas-ref-lease-exclusivity-rev6-design.md) (2026-07-13 brainstorm; note the
+seal-id correction there — sealing at the greatest listed id was insufficient). Amends
 [CAS Ref Table Snapshot and Log Design](2026-07-11-cas-ref-table-snapshot-log-design.md) (rev.5)
 **Origin:** user design discussion during the task-3 soak, 2026-07-13. The user's directive:
 exclusivity is solved once at the lease boundary; the ref protocol assumes a single writer by
