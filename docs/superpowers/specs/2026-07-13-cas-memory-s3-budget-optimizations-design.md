@@ -120,13 +120,26 @@ create-as-Clean after every new body (~263k per audit window, 23% of all PUTs) �
 point-readers never fall back to a HEAD-only guess" while a fallback for absent meta ALREADY exists
 (pre-protocol blobs). This lever makes absence the steady state:
 
-- A blob with NO `.meta` object is Clean by definition. The create-after-body write is deleted; the
-  existing absent-meta fallback becomes the primary read path (its exact semantics and cost to be
-  pinned in the plan — this is the load-bearing analysis).
-- `.meta` is written ONLY by GC (condemn/spare marks — its own volume, unchanged) and by resurrect,
-  which DELETES the meta object (restoring pure absence-means-Clean) — unless the plan's analysis
-  finds a reader that needs a Clean tombstone, in which case CAS-to-Clean and the finding is
-  recorded here.
+- A blob with NO `.meta` object is Clean by definition; `.meta` becomes a pure TOMBSTONE. The full
+  transition model (user-formulated, 2026-07-13):
+  1. **Create** = body PUT only — no meta write and no meta read on the fresh-create path (the
+     dedup path's occupied-key point-read stays).
+  2. **GC condemn (retire)** = write the tombstone (meta CAS, round-stamped); body untouched.
+  3. **GC delete** = delete the body (exact token) THEN delete the meta (exact etag).
+  4. **Resurrect** = fresh body first (re-upload from the writer's own source / displacement with a
+     fresh token) THEN delete the tombstone (If-Match on the observed etag).
+  5. **Healing rule**: a GC recheck that meets a tombstone with nonzero in-degree CLEARS the
+     tombstone (spare = clear).
+  Ordering rationale: every crash window then fails toward "tombstone present while alive" — safe
+  (at worst one extra resurrect cycle) and self-healing via rule 5. The reverse order in resurrect
+  would open "absence (=Clean) while the body is dying" — adoption of an object with a queued
+  exact-token delete = dangling; the only unsafe direction, excluded by construction. Both meta
+  deletions are CONDITIONAL (If-Match) so resurrect cannot stomp a later round's re-condemn and GC
+  cannot stomp a resurrect's clear. GC deleting the meta AFTER the body is mandatory: a recycled
+  hash must not be born under a stale tombstone (create no longer reads meta); the crash window
+  (tombstone without body) heals via rule 5 at the hash's next birth.
+  The TLA+ gate models exactly these five transitions plus the crash points between step pairs,
+  with the invariant "meta absence implies no queued exact-token delete on a live token".
 - SEMANTIC change touching condemn/resurrect invariants: **TLA+ gate required** (the blob
   condemn/resurrect model), lands as the LAST commit of the round, one-command revertible, after a
   baseline soak with §0 counters proves the class decomposition.
