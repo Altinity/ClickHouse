@@ -8,11 +8,17 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcFormats.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcCursorKey.h>
 #include <Common/Exception.h>
+#include <Common/ProfileEvents.h>
 #include <Common/logger_useful.h>
 #include <algorithm>
 #include <map>
 #include <set>
 #include <limits>
+
+namespace ProfileEvents
+{
+    extern const Event CasGcEnumerationPages;
+}
 
 namespace DB::Cas
 {
@@ -220,6 +226,9 @@ ManifestSweepResult sweepManifestCursorPage(
     Backend & backend = store.backend();
     const Layout & layout = store.layout();
     const ListPage page = backend.list(layout.casManifestsPrefix(), cursor, list_budget);
+    /// §0 introspection: this pass fetches exactly one page per round (the cursor advances ACROSS
+    /// rounds, not within this call) — one increment per call, not per listed key.
+    ProfileEvents::increment(ProfileEvents::CasGcEnumerationPages);
 
     std::map<String, bool> eligible_by_prefix;
     std::map<String, std::set<String>> active_by_ns;

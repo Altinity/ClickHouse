@@ -33,6 +33,8 @@ namespace ProfileEvents
     extern const Event CasGcRetireReplaced;
     extern const Event CasGcHeartbeatFenceOuts;
     extern const Event CasGcMetaWriteAnomaly;
+    extern const Event CasGcMetaOps;
+    extern const Event CasGcEnumerationPages;
     extern const Event CasRefGlobalListPages;
     extern const Event CasRefLogBodyGets;
     extern const Event CasRefManifestBodyFoldGets;
@@ -175,6 +177,11 @@ void Gc::scheduleMetaJob(std::function<void()> job)
     /// op is advisory; the ledger + exact-token body delete are the actual safety core).
     auto run = [this, job]()
     {
+        /// §0 introspection: one per-hash freshness-meta op EXECUTED (attempt, not success) on this
+        /// bounded pool. `run` is invoked on the pool thread (the common path below) or inline on the
+        /// round's own thread (the scheduling-failure fallback below) -- either way this is pool-scoped
+        /// work, so the counter is GLOBAL-only by design (closes metrics-audit attribution artifact #6).
+        ProfileEvents::increment(ProfileEvents::CasGcMetaOps);
         try
         {
             job();
@@ -1349,8 +1356,12 @@ bool Gc::namespacePhysicallyEmpty(const RootNamespace & ns)
     Backend & backend = store->backend();
     const Layout & layout = store->layout();
     for (const String & prefix : {layout.manifestNamespacePrefix(ns), layout.namespaceFilesPrefix(ns)})
-        if (!backend.list(prefix, /*cursor*/String{}, /*limit*/1).keys.empty())
+    {
+        const ListPage page = backend.list(prefix, /*cursor*/String{}, /*limit*/1);
+        ProfileEvents::increment(ProfileEvents::CasGcEnumerationPages);
+        if (!page.keys.empty())
             return false;
+    }
     return true;
 }
 
@@ -1476,6 +1487,8 @@ void Gc::runNamespaceCleanupPasses(const CasFoldSeal & seal, const std::map<Stri
                     if (!round_still_ours() || backend.head(marker_key).exists)
                         return;
                     const ListPage page = backend.list(pass.prefix, cursor, 1000);
+                    /// §0 introspection: one page fetched, not one increment per listed key below.
+                    ProfileEvents::increment(ProfileEvents::CasGcEnumerationPages);
                     for (const ListedKey & lk : page.keys)
                     {
                         /// PER-KEY recreation guard (airtight, applied to every key of both prefixes). The
@@ -1602,6 +1615,8 @@ uint64_t deletePrefixWholesale(Backend & backend, const String & prefix, uint64_
     while (deleted < bounded_remaining)
     {
         ListPage page = backend.list(prefix, cursor, kListPageLimit);
+        /// §0 introspection: one page fetched, not one increment per listed key below.
+        ProfileEvents::increment(ProfileEvents::CasGcEnumerationPages);
         for (const auto & listed : page.keys)
         {
             if (deleted >= bounded_remaining)

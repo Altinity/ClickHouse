@@ -5,12 +5,19 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcCursorKey.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
+#include <Common/ProfileEvents.h>
 #include "cas_test_helpers.h"
 
 namespace DB::ErrorCodes
 {
 extern const int BAD_ARGUMENTS;
 extern const int CORRUPTED_DATA;
+}
+
+namespace ProfileEvents
+{
+extern const Event CasGcMetaOps;
+extern const Event CasGcEnumerationPages;
 }
 
 using namespace DB::Cas;
@@ -676,6 +683,11 @@ TEST(CasGcRound, RoundSummaryCountsManifestBodyDeletes)
 
     dropRefTransition(*backend, store->layout(), ns, "tbl", r);
 
+    /// §0 introspection: both counters are captured BEFORE the condemn+delete pipeline below, which
+    /// drives the round's meta pool (condemn/spare/delete) and its own orphan-sweep cursor pass.
+    const auto meta_ops_before = ProfileEvents::global_counters[ProfileEvents::CasGcMetaOps].load();
+    const auto pages_before = ProfileEvents::global_counters[ProfileEvents::CasGcEnumerationPages].load();
+
     /// Ack-floor drift: the owner-removed manifest body is deleted in the CONDEMNING round (post-CAS,
     /// after its -1 is adopted), while the blob's exact-token delete happens a few rounds later once the
     /// ack floor graduates its retired entry. So the two deletes fall in DIFFERENT reports now — accumulate
@@ -703,6 +715,12 @@ TEST(CasGcRound, RoundSummaryCountsManifestBodyDeletes)
     /// The manifest body is gone and the blob is gone — no-leak / no-dangle.
     EXPECT_FALSE(manifestExists(*backend, store->layout(), id));
     EXPECT_FALSE(blobExists(*backend, store->layout(), DB::UInt128(3)));
+
+    /// §0 introspection: the exact-token blob delete above scheduled at least one per-hash freshness-meta
+    /// op on the round's bounded meta pool, and every round ran its own orphan-manifest-sweep cursor pass
+    /// (default `manifest_sweep_list_budget_keys` is nonzero), fetching at least one LIST page directly.
+    EXPECT_GE(ProfileEvents::global_counters[ProfileEvents::CasGcMetaOps].load() - meta_ops_before, 1);
+    EXPECT_GE(ProfileEvents::global_counters[ProfileEvents::CasGcEnumerationPages].load() - pages_before, 1);
 }
 
 /// M1 REGRESSION (cross-round fold cursor must survive independent of trim): a folded-but-untrimmed owner
