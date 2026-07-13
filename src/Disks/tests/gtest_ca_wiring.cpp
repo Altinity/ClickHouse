@@ -909,6 +909,34 @@ TEST(CaWiringOps, MoveDirectoryMutableCollisionPolicy)
     }
 }
 
+/// D3 review pin: moveDirectory's staged-merge collision code has four (src build?, dst build?)
+/// combinations. This one — destination already holds a staged Build, source has none (a
+/// mutable-file-only staging never calls `buildFor`, see `writeFile`'s mutable branch) — proved
+/// confusable when the plan's author sketched a fix: a naive rewrite of the four-way branch can fall
+/// through to `src_st.build->abandon()` on a null build. The merge must be a pure no-op on the
+/// destination's build in this combination — no abandon, no adopt — while everything else (the
+/// mutable file carried over from the source) still merges in and the destination's own content
+/// publishes exactly as staged.
+TEST(CaWiringOps, MoveDirectoryOntoExistingDestinationBuildSurvives)
+{
+    auto storage = openWiringStorage();
+    auto tx = storage->createTransaction();
+    /// Destination already has a real blob upload staged -> a live Build.
+    writeThroughTransaction(*tx, "uui/uuid-1/all_7_7_7/data.bin", "dst-content");
+    /// Source is staged with ONLY a mutable per-part file -> parts[src_key] exists, but src_st.build
+    /// stays null (the mutable-file write path never calls buildFor).
+    writeThroughTransaction(*tx, "uui/uuid-1/tmp_z/txn_version.txt", "1");
+
+    auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
+    EXPECT_NO_THROW(ca_tx.moveDirectory("uui/uuid-1/tmp_z", "uui/uuid-1/all_7_7_7"));
+
+    /// The destination's own build published its own content untouched; the source's mutable file
+    /// rode along.
+    EXPECT_TRUE(storage->existsDirectory("uui/uuid-1/all_7_7_7"));
+    EXPECT_EQ(storage->getFileSize("uui/uuid-1/all_7_7_7/data.bin"), 11u);   /// "dst-content"
+    EXPECT_EQ(storage->tryGetInManifestBytes("uui/uuid-1/all_7_7_7/txn_version.txt"), std::optional<String>("1"));
+}
+
 TEST(CaWiringOps, FreezeViaHardLinksIntoShadow)
 {
     auto storage = openWiringStorage();
