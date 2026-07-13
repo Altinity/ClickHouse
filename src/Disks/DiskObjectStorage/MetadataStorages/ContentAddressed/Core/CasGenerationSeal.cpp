@@ -69,9 +69,6 @@ String encodeFoldSeal(const CasFoldSeal & seal)
         e->set_classification(cov.classification);
         e->set_folded_token_type(static_cast<uint32_t>(cov.folded_token.type));
         e->set_folded_token_value(cov.folded_token.value);
-        e->set_folded_cursor(cov.folded_cursor);
-        e->set_incarnation_writer_epoch(cov.incarnation.writer_epoch);
-        e->set_incarnation_build_sequence(cov.incarnation.build_sequence);
         e->set_last_folded_ref_epoch(cov.last_folded_ref_id.writer_epoch);
         e->set_last_folded_ref_sequence(cov.last_folded_ref_id.ref_sequence);
     }
@@ -127,8 +124,6 @@ CasFoldSeal decodeFoldSeal(std::string_view data)
         seal.per_ns_shard[e.key()] = ShardCoverage{
             .classification = static_cast<uint8_t>(e.classification()),
             .folded_token = Token{e.folded_token_value(), static_cast<TokenType>(token_type_raw)},
-            .folded_cursor = e.folded_cursor(),
-            .incarnation = ShardIncarnation{e.incarnation_writer_epoch(), e.incarnation_build_sequence()},
             .last_folded_ref_id = RefTxnId{e.last_folded_ref_epoch(), e.last_folded_ref_sequence()}};
     }
     readRuns(msg.blob_target_runs(), seal.blob_target_runs);

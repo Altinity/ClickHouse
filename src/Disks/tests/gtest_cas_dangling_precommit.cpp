@@ -24,7 +24,6 @@ TEST(CasDanglingPrecommit, ShardCoverageRoundTripsLastFoldedRefId)
     seal.parent_generation = 2;
     ShardCoverage cov;
     cov.classification = 1;
-    cov.folded_cursor = 7;
     cov.last_folded_ref_id = RefTxnId{4, 11};
     seal.per_ns_shard["srv/tbl@cas@/0"] = cov;
 

@@ -102,14 +102,6 @@ String renderManifestRef(const ManifestRef & r)
         .str();
 }
 
-String renderShardIncarnation(const ShardIncarnation & i)
-{
-    return JsonObj()
-        .add("writer_epoch", jsonUInt(i.writer_epoch))
-        .add("build_sequence", jsonUInt(i.build_sequence))
-        .str();
-}
-
 /// The snapshot+log ref objects (spec §Object Layout). `renderRefTxnIdObj` renders the raw
 /// `{writer_epoch, ref_sequence}` fields rather than the canonical hex render (which throws on a zero
 /// field) so inspect can dump any object, even a malformed one, without failing.
@@ -345,8 +337,6 @@ String renderShardCoverage(const ShardCoverage & c)
     return JsonObj()
         .add("classification", jsonUInt(c.classification))
         .add("folded_token", renderToken(c.folded_token))
-        .add("folded_cursor", jsonUInt(c.folded_cursor))
-        .add("incarnation", renderShardIncarnation(c.incarnation))
         .add("last_folded_ref_id", renderRefTxnIdObj(c.last_folded_ref_id))
         .str();
 }

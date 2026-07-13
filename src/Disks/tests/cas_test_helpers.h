@@ -706,9 +706,9 @@ inline uint64_t foldCursorOf(
         {
             const DB::Cas::CasFoldSeal seal = DB::Cas::decodeFoldSeal(got->bytes);
             const auto it = seal.per_ns_shard.find(cursorKeyForTest(ns, shard));
-            /// Snapshot+log ref model: the per-table durable cursor is `last_folded_ref_id` (a RefTxnId);
-            /// the legacy `folded_cursor` stays a vestigial 0. Seeds allocate `writer_epoch = 1`, so the
-            /// `ref_sequence` is the monotone cursor the seeding wrappers return and tests compare against.
+            /// Snapshot+log ref model: the per-table durable cursor is `last_folded_ref_id` (a RefTxnId).
+            /// Seeds allocate `writer_epoch = 1`, so the `ref_sequence` is the monotone cursor the seeding
+            /// wrappers return and tests compare against.
             return it != seal.per_ns_shard.end() ? it->second.last_folded_ref_id.ref_sequence : 0;
         }
         if (g == 0)

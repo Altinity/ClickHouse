@@ -170,7 +170,7 @@ TEST(CasGcFormats, FoldSealCondemnedSummaryRoundTrips)
     CasFoldSeal s;
     s.generation = 9;
     s.parent_generation = 8;
-    s.per_ns_shard["ns/0"] = ShardCoverage{.classification = 2, .folded_token = Token{"tok"}, .folded_cursor = 3, .incarnation = {}};
+    s.per_ns_shard["ns/0"] = ShardCoverage{.classification = 2, .folded_token = Token{"tok"}};
     s.blob_target_runs.push_back(RunRef{.key = "gc/gen/9/blob_target/0/0", .checksum = UInt128(0x77),
                                         .shard = 0, .generation = 9});
     s.condemned_summary[0] = CondemnedSummary{.condemned_total = 3, .pending_total = 1,
