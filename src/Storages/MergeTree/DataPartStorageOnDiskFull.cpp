@@ -346,20 +346,30 @@ void DataPartStorageOnDiskFull::createProjection(const std::string & name)
 
 void DataPartStorageOnDiskFull::beginTransaction()
 {
+    /// A borrowed projection sub-part shares the PARENT part's whole-part transaction (on a
+    /// content-addressed disk a part is one atomic unit: one manifest + one ref). It must not open its
+    /// own — riding the parent transaction is the point (B58) — so begin is a no-op here. This
+    /// centralizes the rule the 6 merge/mutate call sites used to duplicate as
+    /// `if (!isContentAddressed()) beginTransaction()`.
+    if (has_shared_transaction)
+        return;
+
     if (transaction)
-        throw Exception(ErrorCodes::LOGICAL_ERROR,
-            "Uncommitted{}transaction already exists", has_shared_transaction ? " shared " : " ");
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Uncommitted transaction already exists");
 
     transaction = volume->getDisk()->createTransaction();
 }
 
 void DataPartStorageOnDiskFull::commitTransaction()
 {
+    /// The mirror of beginTransaction: a borrowed projection sub-part rides the parent's transaction and
+    /// is published by the parent's single commit. Committing here would be committing someone else's
+    /// transaction, so it is a no-op.
+    if (has_shared_transaction)
+        return;
+
     if (!transaction)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "There is no uncommitted transaction");
-
-    if (has_shared_transaction)
-        throw Exception(ErrorCodes::LOGICAL_ERROR, "Cannot commit shared transaction");
 
     transaction->commit();
     transaction.reset();

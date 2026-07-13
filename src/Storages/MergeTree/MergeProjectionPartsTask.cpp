@@ -130,11 +130,10 @@ bool MergeProjectionPartsTask::executeStep()
         /// FIXME (alesapin) we should use some temporary storage for this,
         /// not commit each subprojection part
         ///
-        /// On a content-addressed disk the recursively-merged projection sub-part shares the parent
-        /// part's whole-part transaction (the nested MergeTask skipped its own begin), so it is committed
-        /// by the parent's single commit; committing here would throw on the shared transaction (B58).
-        if (!next_level_parts.back()->getDataPartStorage().isContentAddressed())
-            next_level_parts.back()->getDataPartStorage().commitTransaction();
+        /// A borrowed (CA) recursively-merged projection sub-part shares the parent part's whole-part
+        /// transaction (the nested MergeTask skipped its own begin), so it is committed by the parent's
+        /// single commit; the storage makes commitTransaction a no-op there, so this is unconditional (B58).
+        next_level_parts.back()->getDataPartStorage().commitTransaction();
         next_level_parts.back()->is_temp = true;
         next_level_parts.back()->temp_projection_block_number = block_num;
 

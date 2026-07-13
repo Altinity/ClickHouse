@@ -585,10 +585,9 @@ bool MergeTask::ExecuteAndFinalizeHorizontalPart::prepare() const
     if (data_part_storage->exists())
         throw Exception(ErrorCodes::DIRECTORY_ALREADY_EXISTS, "Directory {} already exists", data_part_storage->getFullPath());
 
-    /// Skip begin only for a CA projection sub-part: its storage shares the parent's already-open
-    /// transaction, so opening another would throw ("Uncommitted shared transaction already exists").
-    if (!global_ctx->projection_uses_parent_transaction)
-        data_part_storage->beginTransaction();
+    /// A borrowed projection sub-part shares the parent's already-open transaction; the storage makes
+    /// beginTransaction a no-op in that case, so this can be called unconditionally.
+    data_part_storage->beginTransaction();
 
     /// Background temp dirs cleaner will not touch tmp projection directory because
     /// it's located inside part's directory
@@ -1318,11 +1317,10 @@ void MergeTask::ExecuteAndFinalizeHorizontalPart::calculateProjectionForBlock(
             *global_ctx->data, ctx->log, result, projection, global_ctx->new_data_part.get(), ++ctx->projection_block_num, global_ctx->context);
 
         tmp_part->finalize();
-        /// On a CA disk the temp projection sub-part shares the parent part's whole-part transaction
-        /// and is committed by the parent's single commit; committing here would throw on the shared
-        /// transaction. On a non-CA disk it owns its sub-transaction and must commit it (B58).
-        if (!tmp_part->part->getDataPartStorage().isContentAddressed())
-            tmp_part->part->getDataPartStorage().commitTransaction();
+        /// A borrowed (CA) temp projection sub-part rides the parent's whole-part transaction and is
+        /// committed by the parent's single commit; the storage makes commitTransaction a no-op there,
+        /// so this can be called unconditionally (B58).
+        tmp_part->part->getDataPartStorage().commitTransaction();
         ctx->projection_parts[projection.name].emplace_back(std::move(tmp_part->part));
     }
     ctx->projections_rebuild_elapsed_ns[projection.name] += projection_watch.elapsedNanoseconds();
@@ -1364,9 +1362,9 @@ void MergeTask::ExecuteAndFinalizeHorizontalPart::finalizeProjections() const
                 *global_ctx->data, ctx->log, result, projection, global_ctx->new_data_part.get(), ++ctx->projection_block_num, global_ctx->context);
 
             temp_part->finalize();
-            /// See the matching note above: CA temp projection sub-parts ride the parent transaction.
-            if (!temp_part->part->getDataPartStorage().isContentAddressed())
-                temp_part->part->getDataPartStorage().commitTransaction();
+            /// See the matching note above: a borrowed (CA) temp projection sub-part rides the parent
+            /// transaction, so commitTransaction is a no-op and can be called unconditionally.
+            temp_part->part->getDataPartStorage().commitTransaction();
             ctx->projection_parts[projection.name].emplace_back(std::move(temp_part->part));
         }
     }
