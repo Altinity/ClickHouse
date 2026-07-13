@@ -87,7 +87,7 @@ TEST(CasPartFolderView, SizesAndBytes)
     auto v = makeView();
     EXPECT_EQ(v->fileSize("checksums.txt"), std::optional<uint64_t>(2));   /// inline: bytes size
     EXPECT_EQ(v->fileSize("data.bin"), std::optional<uint64_t>(100));      /// blob: blob_size
-    EXPECT_EQ(v->fileSize("txn_version.txt"), std::optional<uint64_t>(3)); /// mutable: value size
+    EXPECT_EQ(v->fileSize("txn_version.txt"), std::nullopt);               /// mutable: not a manifest entry
     EXPECT_EQ(v->fileSize("absent"), std::nullopt);
     EXPECT_EQ(v->inlineBytes("checksums.txt"), std::optional<String>("cs"));
     EXPECT_EQ(v->inlineBytes("data.bin"), std::nullopt);                   /// blob has no inline bytes

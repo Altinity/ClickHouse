@@ -61,12 +61,6 @@ bool PartFolderView::hasFile(const String & path) const
 
 std::optional<uint64_t> PartFolderView::fileSize(const String & path) const
 {
-    /// NOTE: the mutable-file branch is currently unreachable via the sole production caller
-    /// (`getFileSize` short-circuits every mutable-named path through `tryGetInManifestBytes`'s
-    /// force-fresh resolve before it ever reaches a view). It is kept for view-API completeness and
-    /// future direct callers; if a caller relies on it, add coverage for the mutable path.
-    if (auto mb = mutableBytes(path))
-        return mb->size();
     if (const auto * e = findFile(path))
         return e->placement == Cas::EntryPlacement::Inline ? e->inline_bytes.size() : e->blob_size;
     return std::nullopt;

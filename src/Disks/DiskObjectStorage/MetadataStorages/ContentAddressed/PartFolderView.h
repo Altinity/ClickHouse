@@ -48,7 +48,7 @@ public:
 
     const Cas::ManifestEntry * findFile(const String & path) const;
     bool hasFile(const String & path) const;                      /// entry OR non-reserved mutable
-    std::optional<uint64_t> fileSize(const String & path) const;  /// mutable / inline / blob
+    std::optional<uint64_t> fileSize(const String & path) const;  /// inline / blob
     std::optional<String> inlineBytes(const String & path) const; /// Inline entries only
     std::optional<String> mutableBytes(const String & path) const;
     std::vector<String> listChildren(const String & dir_prefix) const;
