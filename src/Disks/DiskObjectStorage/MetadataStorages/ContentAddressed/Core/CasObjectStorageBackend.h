@@ -106,6 +106,31 @@ public:
     TokenType nativeTokenType() const { return native_token_type; }
     void setNativeTokenTypeForTest(TokenType t) { native_token_type = t; }
 
+    /// ---- Token policy (single source of truth; see the .cpp) ----
+    /// Mint the incarnation token for a key we just HEAD'd or wrote: the object ETag/generation
+    /// string carried under this backend's native dialect (native_token_type).
+    Token tokenForHead(const String & etag) const
+    {
+        return Token{etag, native_token_type};
+    }
+
+    /// The token to surface for a LISTED key: present iff this backend surfaces per-key list tokens
+    /// (supportsListTokens — FALSE on a generation store, where a list-derived token is a poisoned
+    /// If-Match) AND the listing carried a non-empty etag. Matches what tokenForHead would return.
+    std::optional<Token> tokenForList(const String & etag) const
+    {
+        if (!supportsListTokens() || etag.empty())
+            return std::nullopt;
+        return Token{etag, native_token_type};
+    }
+
+    /// Whether an observed incarnation token satisfies an expected one: exact identity (value AND
+    /// type). Every conditional compare in this backend goes through here.
+    static bool tokenMatches(const Token & observed, const Token & expected)
+    {
+        return observed == expected;
+    }
+
     /// Base WriteSettings for every Native conditional write — see the .cpp for the full rationale
     /// (skips the post-upload existence/size HEAD; forces single-PUT on generation-token stores).
     WriteSettings conditionalWriteSettings() const;

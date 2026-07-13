@@ -78,3 +78,30 @@ TEST(CasBackendGeneration, ConditionalWriteSettingsForceSinglePutOnGenerationSto
     EXPECT_FALSE(ws2.s3_force_single_part_upload);
     EXPECT_EQ(ws2.s3_single_part_upload_max_bytes_override, 0u);
 }
+
+/// C1: the three token-policy helpers are the single source of truth for how a Native-mode backend
+/// mints a HEAD/PUT token, gates a LIST token, and compares tokens. Characterizes the behavior the
+/// scattered call sites have today so the consolidation stays byte-for-byte behavior-preserving.
+TEST(CasBackendGeneration, TokenPolicyHelpersAreConsistentWithDialect)
+{
+    auto b = std::make_shared<ObjectStorageBackend>(
+        DB::Cas::tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::Native);
+
+    /// ETag dialect: head/put tokens carry ETag; list surfaces the same-typed token for a non-empty etag.
+    ASSERT_EQ(b->nativeTokenType(), TokenType::ETag);
+    EXPECT_EQ(b->tokenForHead("abc").type, TokenType::ETag);
+    EXPECT_EQ(b->tokenForHead("abc"), (Token{"abc", TokenType::ETag}));
+    ASSERT_TRUE(b->tokenForList("abc").has_value());
+    EXPECT_EQ(*b->tokenForList("abc"), b->tokenForHead("abc"));   /// list token == head token (same etag)
+    EXPECT_FALSE(b->tokenForList("").has_value());                /// empty etag => no list token
+
+    /// Generation dialect (GCS): head token flips to Generation; list tokens are disabled wholesale
+    /// (poisoned If-Match), so tokenForList is always nullopt regardless of the etag.
+    b->setNativeTokenTypeForTest(TokenType::Generation);
+    EXPECT_EQ(b->tokenForHead("g1").type, TokenType::Generation);
+    EXPECT_FALSE(b->tokenForList("g1").has_value());
+
+    /// tokenMatches is exact identity (value AND type) — a same-value/different-type token never matches.
+    EXPECT_TRUE(ObjectStorageBackend::tokenMatches(Token{"x", TokenType::ETag}, Token{"x", TokenType::ETag}));
+    EXPECT_FALSE(ObjectStorageBackend::tokenMatches(Token{"x", TokenType::ETag}, Token{"x", TokenType::Emulated}));
+}

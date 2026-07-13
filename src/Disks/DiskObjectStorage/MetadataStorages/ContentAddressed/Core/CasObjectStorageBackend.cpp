@@ -173,7 +173,7 @@ std::optional<HeadResult> ObjectStorageBackend::nativeHead(const String & key)
     HeadResult hr;
     hr.exists = true;
     hr.size = metadata->size_bytes;
-    hr.token = Token{metadata->etag, native_token_type};
+    hr.token = tokenForHead(metadata->etag);
     hr.attributes = ObjectMeta(metadata->attributes.begin(), metadata->attributes.end());
     return hr;
 }
@@ -269,7 +269,7 @@ PutResult ObjectStorageBackend::nativeConditionalPut(const String & key, const S
     /// (local files) returns nullopt and we fall back to the HEAD (a cheap local stat there).
     Token token;
     if (auto etag = buf->getResultObjectETag(); etag && !etag->empty())
-        token = Token{*etag, native_token_type};
+        token = tokenForHead(*etag);
     else
     {
         /// No write-time ETag (local files) or an (anomalous) empty one: fall back to the HEAD —
@@ -312,7 +312,7 @@ public:
         /// we fall back to the HEAD (a cheap local stat there).
         Token token;
         if (auto etag = write_buf->getResultObjectETag(); etag && !etag->empty())
-            token = Token{*etag, backend.nativeTokenType()};
+            token = backend.tokenForHead(*etag);
         else
         {
             /// No write-time ETag (local) or an (anomalous) empty one: fall back to the HEAD.
@@ -740,7 +740,7 @@ PutResult ObjectStorageBackend::putOverwrite(const String & key, const String & 
     std::lock_guard lock(emu_mutex);
     if (!emuExists(key))
         return {PutOutcome::PreconditionFailed, {}};
-    if (emuObserveToken(key) != expected)
+    if (!tokenMatches(emuObserveToken(key), expected))
         return {PutOutcome::PreconditionFailed, {}};
 
     emuWrite(key, bytes, meta);
@@ -779,7 +779,7 @@ CasResult ObjectStorageBackend::casPut(const String & key, const String & bytes,
     {
         if (!exists)
             return {CasOutcome::Conflict, {}};
-        if (emuObserveToken(key) != *expected)
+        if (!tokenMatches(emuObserveToken(key), *expected))
             return {CasOutcome::Conflict, {}};
     }
 
@@ -820,7 +820,7 @@ DeleteOutcome ObjectStorageBackend::deleteExact(const String & key, const Token 
         d.kind = DeleteOutcome::Kind::NotFound;
         return d;
     }
-    if (emuObserveToken(key) != token)
+    if (!tokenMatches(emuObserveToken(key), token))
     {
         d.kind = DeleteOutcome::Kind::TokenMismatch;
         return d;
@@ -914,8 +914,8 @@ ListPage ObjectStorageBackend::list(const String & prefix, const String & cursor
             ListedKey lk;
             lk.key = child->relative_path.substr(strip.size());
             lk.size = child->metadata ? child->metadata->size_bytes : 0;
-            if (child->metadata && !child->metadata->etag.empty())
-                lk.token = Token{child->metadata->etag, native_token_type};
+            if (child->metadata)
+                lk.token = tokenForList(child->metadata->etag);
             all.push_back(std::move(lk));
         }
         std::sort(all.begin(), all.end(), [](const ListedKey & a, const ListedKey & b) { return a.key < b.key; });
@@ -954,9 +954,10 @@ ListPage ObjectStorageBackend::list(const String & prefix, const String & cursor
         lk.size = child->metadata ? child->metadata->size_bytes : 0;
         /// Surface the per-key incarnation token (matching what `head` would return, see above) so the
         /// `supportsListTokens() == true` capability is honest. A listing without an etag leaves the
-        /// token unset, which GC discover treats as Read (fail closed).
-        if (supportsListTokens() && child->metadata && !child->metadata->etag.empty())
-            lk.token = Token{child->metadata->etag, native_token_type};
+        /// token unset, which GC discover treats as Read (fail closed). The supportsListTokens()+
+        /// empty-etag gate now lives in tokenForList.
+        if (child->metadata)
+            lk.token = tokenForList(child->metadata->etag);
 
         if (page.keys.size() == limit)
         {
