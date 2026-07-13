@@ -63,7 +63,7 @@ reclaimable.
 
 Collect these for every run:
 
-- Configuration: ClickHouse binary revision, branch, pool prefix, `root_shards`, `gc_shards`,
+- Configuration: ClickHouse binary revision, branch, pool prefix, `gc_shards`,
   `dedup_cache_bytes`, `dedup_head_first_min_bytes`, `expect_continue_min_bytes`, replica count, object
   store version, and seed.
 - Pool shape: object count and bytes by prefix: `blobs`, `roots`, `_manifests`, `_files`, and `gc`.
@@ -111,20 +111,18 @@ They should be treated as first-class scenario targets, not as speculative notes
   Only `.bin`, mark files, and `primary.idx` go directly through the content blob path. Other part files
   use `CaInlineWriteBuffer`, accumulate bytes, and spill only after crossing `INLINE_CAP`. A large
   metadata/index file outside the direct-blob suffix set can create an unexpected memory spike.
-- Regular `GC` still has a `namespaces * root_shards` baseline. `discoverUniverse` expands every
-  registered namespace to every root shard. Token-diff can skip root body reads, but the round still pays
-  the universe construction and decision/fence bookkeeping cost.
-- Token-diff discovery lists the whole `roots/` prefix. `listRootShardTokens` filters after listing, but
-  the object-store `LIST` cost may include `_manifests`, `_files`, shadow namespaces, and other non-root
-  objects under `roots/`.
-- Namespace registration is monotone in the current code. `dropNamespace` clears refs/files but does not
-  remove the namespace from the registry, so repeated create/drop of many tables can leave a permanent
-  `GC` fanout until a full registry cleanup exists.
-- Root shard updates rewrite the whole root-shard object. `mutateShard` read-decodes, mutates,
-  re-encodes, and CAS-writes the whole `RootShard`. Many refs on one shard can create latency spikes,
-  CAS contention, and soft/hard manifest-limit failures.
-- `listRefs` reads every root shard in a namespace. Directory-style operations such as detach/freeze/list
-  and table drop may become unexpectedly expensive with high `root_shards` and many table namespaces.
+- Regular `GC` pays one global `LIST` of the ref area per round (`CasRefGlobalListPages`) plus a
+  body `GET` per log/snapshot not yet covered by the per-table cursors (`CasRefLogBodyGets`). The
+  per-round read cost is driven by NEW logs since the last fold, not by table count — but the LIST
+  itself still scales with the total number of ref objects, so snapshot lag (uncompacted logs)
+  inflates every round.
+- Writer-side ref state is per-table snapshot + log: each flush appends one `_log` object
+  (conditional PUT, single-writer lane), and a full-state `_snap` is published after enough aged
+  uncovered logs accumulate (`snapshot_log_count_threshold`, default 256). Snapshot publication is a
+  full-state re-encode — very wide tables pay proportionally per publish.
+- Cold readers (recovery, `fsck`, `GC` fold) pay one `GET` per log above the newest snapshot;
+  directory-style operations and table drop are driven by the per-table ref state, not by a shard
+  fanout.
 - `ca-gc-dryrun` may be incomplete for `gc_shards > 1`. `previewDeletes` currently previews
   `zeroInDegree` only for target shard `0`. This is not the delete path, but it can make the dry-run
   subset oracle blind to candidates in other target shards.
@@ -261,16 +259,16 @@ Workload:
 
 Observations:
 
-- `CasRootList`, `CasRootGet`, root-shard decode cache hit behavior, `GC` duration, and memory.
-- Registry size and root-shard count: expected namespace fanout is `tables * root_shards`, but per-round body
-  reads should be driven by changed shards when token diff can skip unchanged ones.
+- `CasRefGlobalListPages`, `CasRefLogBodyGets`, `CasRefManifestBodyFoldGets`, `GC` duration, and memory.
+- Ref-object population: per-round body reads should be driven by NEW logs since the per-table
+  cursors, not by table count; idle tables contribute only their share of the global `LIST`.
 - Query latency for the active and inactive tables.
 
 Expected:
 
 - Idle tables do not dominate `GC` CPU or S3 `GET` counts.
 - Memory does not grow with the number of tables except for bounded caches.
-- Reports must flag if `GC` does `O(tables * root_shards)` body reads every round.
+- Reports must flag if `GC` re-reads bodies it has already folded (cursor regression) every round.
 
 ### S06: 10000-column wide part
 
@@ -285,8 +283,8 @@ Workload:
 
 Observations:
 
-- Encoded manifest size, inline-entry total, `CasRootCas` latency, `CasBlobPut` count, and root-shard
-  manifest size warnings.
+- Encoded manifest size, inline-entry total, ref-append latency (`CasRefQueueWaitMicroseconds`),
+  `CasBlobPut` count, and the `kMaxManifest*` fail-closed admission limits (`CasBuild.cpp`).
 - Query open/read latency for selecting a few columns and all columns.
 - `system.trace_log` samples in manifest encode/decode.
 
@@ -338,7 +336,8 @@ Observations:
 
 Expected:
 
-- CAS contention remains bounded by `root_shards`; root-shard objects do not exceed hard limits.
+- CAS ref writes stay on the per-table single-writer append lane (no cross-table contention); the
+  ref-object count stays within the S08 per-insert sanity ceiling (`n_parts * 4 + 16`, see the card).
 - Inserts fail only for expected `MergeTree` part-count pressure, not CA metadata exceptions.
 - After forced merge and `GC`, physical bytes converge toward referenced bytes.
 
