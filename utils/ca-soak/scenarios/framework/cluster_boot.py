@@ -9,6 +9,7 @@ Two compose variants are supported: the default (`gc_shards=1`) and `gc_shards2`
 same docker-compose project (directory name `ca-soak`), so container names are stable across variants.
 """
 
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -26,6 +27,8 @@ _VARIANT_FILE = {
     "smalldedupcache": "docker-compose-small_dedup_cache.yml",
     # S12: 10-replica shared-pool compose (ch1..ch10 over one CA pool).
     "tenreplicas": "docker-compose-10replicas.yml",
+    # S15: gc_shards=8 variant (8-way sharded fold) for the target-shard comparison.
+    "gc_shards8": "docker-compose-gc_shards8.yml",
     # S22: fault-injecting S3 proxy (503/429/slow/reset) between ClickHouse and RustFS.
     "s3faultproxy": "docker-compose-s3faultproxy.yml",
     # S27: same proxy, LIST-anomaly mode (duplicate keys / dropped continuation token).
@@ -35,7 +38,7 @@ _VARIANT_FILE = {
 # Replica count per compose variant — drives the N-node Cluster + health wait + log-dir prep.
 _VARIANT_NODES = {
     None: 2, "default": 2, "gc_shards2": 2, "smalldedupcache": 2,
-    "tenreplicas": 10, "s3faultproxy": 2, "s3listproxy": 2,
+    "tenreplicas": 10, "gc_shards8": 2, "s3faultproxy": 2, "s3listproxy": 2,
 }
 
 
@@ -60,8 +63,30 @@ def _run(argv, timeout=600, log_fn=print):
 
 
 def _prep_log_dirs(node_count=2):
+    """Ensure fresh, world-writable per-node log dirs before a `docker compose up`.
+
+    A stale host-side log dir can carry files from an earlier (non-containerized, or differently-
+    owned) run — root-owned or mode 640 — that the container's uid-101 `clickhouse-server` cannot
+    open for append. `p.chmod(0o777)` only fixed the DIRECTORY's own mode, not files already inside
+    it, so a stale `clickhouse-server.log` still blocked first boot with a
+    `Poco::FileAccessDeniedException` (S01 attempt 1, 2026-07-13 task-4 campaign). Archive-then-clear
+    (mirrors `run_24h.sh`'s archive-before-restart pattern): if a dir already has content, move the
+    WHOLE dir aside into `logs/prev_<ts>/ch<i>` first — never delete data outright — then recreate a
+    fresh, empty, world-writable directory.
+    """
+    logs_dir = CA_SOAK_DIR / "logs"
+    ts = None
     for i in range(1, node_count + 1):
-        p = CA_SOAK_DIR / "logs" / f"ch{i}"
+        p = logs_dir / f"ch{i}"
+        if p.exists() and any(p.iterdir()):
+            if ts is None:
+                ts = time.strftime("%Y%m%dT%H%M%S")
+            prev_dir = logs_dir / f"prev_{ts}"
+            prev_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.move(str(p), str(prev_dir / f"ch{i}"))
+            except OSError:
+                pass  # best-effort: fall through and (re)create/chmod whatever remains
         p.mkdir(parents=True, exist_ok=True)
         try:
             p.chmod(0o777)

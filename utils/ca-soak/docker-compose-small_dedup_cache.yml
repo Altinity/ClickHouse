@@ -14,6 +14,10 @@ services:
     env_file: configs/rustfs.env
     expose:
       - "11121"
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
 
   createbucket:
     image: minio/mc:RELEASE.2025-04-16T18-13-26Z

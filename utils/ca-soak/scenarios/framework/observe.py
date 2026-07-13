@@ -17,6 +17,7 @@ must surface that as an `inconclusive` verdict (see assertions.py), not silently
 
 import json
 import subprocess
+import time
 
 # Object-store container + pool data dir (mirror of soak/pool.py and configs/storage_conf.xml:
 # endpoint http://rustfs1:11121/test/soak_pool/ -> bucket "test", prefix "soak_pool/").
@@ -292,9 +293,28 @@ def pool_shape(timeout_s: float = 120.0) -> dict:
 # GC log
 # ---------------------------------------------------------------------------
 
-def gc_log_rows(node, since_event_time: str | None = None) -> list:
+# Bounded re-poll for the GC-log flush-window artifact (2026-07-13 task-4 campaign re-audit,
+# S03/S04/S05/S11 "no GC finish rows captured for this run window"): a single `SYSTEM FLUSH LOGS` +
+# query pair can still race a GC round whose Finish row has not landed in the SystemLog's internal
+# queue yet, or the flush itself can transiently fail under load (10-20% S3 read-error campaigns).
+# That produced a false-empty window and made the downstream verdict `inconclusive` for a reason
+# that has nothing to do with GC or the pool (live check: a manual `SYSTEM FLUSH LOGS` right after
+# one such run surfaced 14 Finish rows that the card's own poll had missed). Retry a bounded number
+# of times before accepting the window is genuinely empty.
+_GC_LOG_POLL_TRIES = 3
+_GC_LOG_POLL_INTERVAL_S = 3.0
+
+
+def gc_log_rows(node, since_event_time: str | None = None, *,
+                poll_tries: int = _GC_LOG_POLL_TRIES,
+                poll_interval_s: float = _GC_LOG_POLL_INTERVAL_S) -> list:
     """Return finish rows from the GC log on one node as list of dicts. `since_event_time` filters to
-    rounds at/after a server-`now()`-captured timestamp (so a scenario sees only its own rounds)."""
+    rounds at/after a server-`now()`-captured timestamp (so a scenario sees only its own rounds).
+
+    Issues `SYSTEM FLUSH LOGS` then queries, retrying up to `poll_tries` times (sleeping
+    `poll_interval_s` between empty attempts) before giving up — see the module comment above. On
+    exhaustion this still returns [] so the caller's `inconclusive` verdict stays genuine; it is
+    never fabricated into a `pass`."""
     where = "event_type='Finish'"
     if since_event_time:
         where += f" AND event_time >= '{since_event_time}'"
@@ -306,31 +326,36 @@ def gc_log_rows(node, since_event_time: str | None = None) -> list:
             "objects_deleted", "objects_absent", "objects_replaced", "objects_spared",
             "manifests_deleted", "entries_condemned", "entries_graduated", "entries_redeleted",
             "fence_outs", "min_ack", "anomalies", "duration_ms", "error")
-    try:
-        # System log tables buffer in memory and materialize only every ~7.5 s (or on flush); the
-        # most recent GC rounds are invisible to a bare SELECT at end-checkpoint. Flush first so the
-        # caller sees ALL of its rounds (the S03 "no GC finish rows" INCONCLUSIVE was purely this —
-        # 161 rounds were present after a manual flush). Cheap and idempotent.
-        node.command("SYSTEM FLUSH LOGS")
-        txt = node.query(
-            f"SELECT {', '.join(cols)} FROM {GC_LOG} WHERE {where} "
-            f"ORDER BY event_time FORMAT TabSeparated")
-    except Exception:
-        return []
-    rows = []
-    for line in txt.splitlines():
-        parts = line.split("\t")
-        if len(parts) != len(cols):
-            continue
-        d = dict(zip(cols, parts))
-        for k in cols:
-            if k not in ("event_time", "gc_id", "trigger", "outcome", "error"):
-                try:
-                    d[k] = int(d[k])
-                except ValueError:
-                    pass
-        rows.append(d)
-    return rows
+    tries = max(1, int(poll_tries))
+    for attempt in range(tries):
+        try:
+            # System log tables buffer in memory and materialize only every ~7.5 s (or on flush); the
+            # most recent GC rounds are invisible to a bare SELECT at end-checkpoint. Flush first so
+            # the caller sees ALL of its rounds (the S03 "no GC finish rows" INCONCLUSIVE was purely
+            # this — 161 rounds were present after a manual flush). Cheap and idempotent.
+            node.command("SYSTEM FLUSH LOGS")
+            txt = node.query(
+                f"SELECT {', '.join(cols)} FROM {GC_LOG} WHERE {where} "
+                f"ORDER BY event_time FORMAT TabSeparated")
+        except Exception:
+            txt = ""
+        rows = []
+        for line in txt.splitlines():
+            parts = line.split("\t")
+            if len(parts) != len(cols):
+                continue
+            d = dict(zip(cols, parts))
+            for k in cols:
+                if k not in ("event_time", "gc_id", "trigger", "outcome", "error"):
+                    try:
+                        d[k] = int(d[k])
+                    except ValueError:
+                        pass
+            rows.append(d)
+        if rows or attempt == tries - 1:
+            return rows
+        time.sleep(poll_interval_s)
+    return []
 
 
 # GC `Error` finish rows whose message matches one of these markers are EXPECTED concurrency

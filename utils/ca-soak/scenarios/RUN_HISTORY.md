@@ -283,3 +283,44 @@ Every attempted scenario run is appended here (newest at the bottom). `run_dir` 
 | 2026-07-11T10:08:16 | S15 | 20260711 | dev | 480s | pass | eceacc2ad1d6 | 20260711T100611_S15_seed20260711 |  |
 | 2026-07-11T10:08:45 | S33 | 20260711 | dev | 480s | pass | eceacc2ad1d6 | 20260711T100816_S33_seed20260711 |  |
 | 2026-07-11T10:15:34 | S12 | 20260711 | dev | 480s | pass | ffc993a1d85b | 20260711T101423_S12_seed20260711 |  |
+| 2026-07-11T11:55:50 | S01 | 20260711 | ci | 300s | pass | 4b104c25649e | 20260711T115530_S01_seed20260711 |  |
+| 2026-07-11T15:45:50 | S04 | 20260711 | dev | 240s | inconclusive | c5a7c0409fb5 | 20260711T154517_S04_seed20260711 |  |
+| 2026-07-11T15:46:15 | S02 | 20260711 | dev | 240s | pass | c5a7c0409fb5 | 20260711T154550_S02_seed20260711 |  |
+| 2026-07-11T15:46:41 | S09 | 20260711 | dev | 240s | pass | c5a7c0409fb5 | 20260711T154615_S09_seed20260711 |  |
+| 2026-07-11T15:49:30 | S13 | 20260711 | dev | 240s | pass | c5a7c0409fb5 | 20260711T154641_S13_seed20260711 |  |
+| 2026-07-13T16:49:15 | S01 | 42 | dev | 900s | fail | f51fbab60bc0 | 20260713T164402_S01_seed42 | cluster did not become healthy after reset |
+| 2026-07-13T16:51:26 | S01 | 42 | dev | 900s | inconclusive | 84011674682b | 20260713T165106_S01_seed42 |  |
+| 2026-07-13T16:52:21 | S02 | 42 | dev | 900s | pass | 84011674682b | 20260713T165156_S02_seed42 |  |
+| 2026-07-13T16:53:16 | S03 | 42 | dev | 900s | inconclusive | 84011674682b | 20260713T165230_S03_seed42 |  |
+| 2026-07-13T16:54:32 | S04 | 42 | dev | 900s | inconclusive | 84011674682b | 20260713T165348_S04_seed42 |  |
+| 2026-07-13T16:56:13 | S05 | 42 | dev | 900s | inconclusive | 84011674682b | 20260713T165449_S05_seed42 |  |
+| 2026-07-13T16:59:31 | S06 | 42 | dev | 900s | fail | 84011674682b | 20260713T165702_S06_seed42 |  |
+| 2026-07-13T17:08:34 | S07 | 42 | dev | 900s | fail | 029c05c6553c | 20260713T170326_S07_seed42 | S07 could not trigger a manifest cap with dev-scale SQL — recorded inconclusive for the direct cap trip; the indirect fail-closed property check still runs. |
+| 2026-07-13T17:15:59 | S08 | 42 | dev | 900s | inconclusive | dcdaf479cd2c | 20260713T170920_S08_seed42 |  |
+| 2026-07-13T17:16:47 | S09 | 42 | dev | 900s | pass | dcdaf479cd2c | 20260713T171619_S09_seed42 |  |
+| 2026-07-13T17:17:20 | S10 | 42 | dev | 900s | inconclusive | dcdaf479cd2c | 20260713T171654_S10_seed42 |  |
+| 2026-07-13T17:18:29 | S11 | 42 | dev | 900s | inconclusive | dcdaf479cd2c | 20260713T171735_S11_seed42 |  |
+| 2026-07-13T17:20:01 | S12 | 42 | dev | 900s | pass | dcdaf479cd2c | 20260713T171845_S12_seed42 |  |
+| 2026-07-13T17:27:15 | S13 | 42 | dev | 900s | fail | dcdaf479cd2c | 20260713T172032_S13_seed42 | forced GC left 2 UNCONDEMNED orphan object(s) (unreachable/dangling blobs/_manifests): {'_manifests': 2}. These are NOT in the two-phase pipeline (that would be pending-gc). If explicit GC was driven concurrently with background GC (or on both replicas), this is likely the known GC-CONCURRENT-LEADER-LEAK (see BACKLOG): a divergent-fold abort orphans owner-removal events. |
+| 2026-07-13T17:29:44 | S14 | 42 | dev | 900s | pass | dcdaf479cd2c | 20260713T172829_S14_seed42 |  |
+| 2026-07-13T17:31:57 | S15 | 42 | dev | 900s | pass | dcdaf479cd2c | 20260713T172954_S15_seed42 |  |
+| 2026-07-13T17:33:13 | S16 | 42 | dev | 900s | pass | dcdaf479cd2c | 20260713T173208_S16_seed42 |  |
+| 2026-07-13T17:33:49 | S17 | 42 | dev | 900s | pass | dcdaf479cd2c | 20260713T173322_S17_seed42 |  |
+| 2026-07-13T17:34:48 | S18 | 42 | dev | 900s | pass | dcdaf479cd2c | 20260713T173358_S18_seed42 |  |
+| 2026-07-13T17:35:24 | S19 | 42 | dev | 900s | pass | dcdaf479cd2c | 20260713T173459_S19_seed42 |  |
+| 2026-07-13T17:36:02 | S20 | 42 | dev | 900s | inconclusive | dcdaf479cd2c | 20260713T173533_S20_seed42 |  |
+| 2026-07-13T17:36:42 | S21 | 42 | dev | 900s | inconclusive | dcdaf479cd2c | 20260713T173617_S21_seed42 |  |
+| 2026-07-13T17:38:10 | S22 | 42 | dev | 900s | pass | dcdaf479cd2c | 20260713T173702_S22_seed42 |  |
+| 2026-07-13T17:39:16 | S23 | 42 | dev | 900s | inconclusive | dcdaf479cd2c | 20260713T173823_S23_seed42 |  |
+| 2026-07-13T17:39:58 | S24 | 42 | dev | 900s | pass | dcdaf479cd2c | 20260713T173931_S24_seed42 |  |
+| 2026-07-13T17:40:39 | S25 | 42 | dev | 900s | pass | dcdaf479cd2c | 20260713T174008_S25_seed42 |  |
+| 2026-07-13T17:41:18 | S26 | 42 | dev | 900s | pass | dcdaf479cd2c | 20260713T174048_S26_seed42 |  |
+| 2026-07-13T17:42:15 | S27 | 42 | dev | 900s | pass | dcdaf479cd2c | 20260713T174128_S27_seed42 |  |
+| 2026-07-13T17:42:59 | S28 | 42 | dev | 900s | pass | dcdaf479cd2c | 20260713T174223_S28_seed42 |  |
+| 2026-07-13T17:43:33 | S29 | 42 | dev | 900s | inconclusive | dcdaf479cd2c | 20260713T174308_S29_seed42 |  |
+| 2026-07-13T17:44:26 | S30 | 42 | dev | 900s | pass | dcdaf479cd2c | 20260713T174349_S30_seed42 |  |
+| 2026-07-13T17:45:15 | S31 | 42 | dev | 900s | fail | dcdaf479cd2c | 20260713T174441_S31_seed42 | ca-gc-dryrun previews only target shard 0; subset-oracle blind to shard>=1 under gc_shards>1 — previewed 23 but GC reclaimed ~78 (checklist #9). previewDeletes should iterate all target shards, not just shard 0. |
+| 2026-07-13T17:46:01 | S32 | 42 | dev | 900s | pass | dcdaf479cd2c | 20260713T174536_S32_seed42 |  |
+| 2026-07-13T17:46:44 | S33 | 42 | dev | 900s | pass | dcdaf479cd2c | 20260713T174614_S33_seed42 |  |
+| 2026-07-13T17:47:38 | S34 | 42 | dev | 900s | pass | dcdaf479cd2c | 20260713T174656_S34_seed42 |  |
+| 2026-07-13T17:48:23 | S35 | 42 | dev | 900s | pass | dcdaf479cd2c | 20260713T174747_S35_seed42 |  |
