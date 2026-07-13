@@ -510,14 +510,16 @@ Workload:
 
 Observations:
 
-- `blob_reuse_resurrect`, `blob_reuse_adopt`, `blob_put`, `blob_delete`, `objects_spared`,
-  `ContentAddressedGenerationResurrectionsTotal`, and `ContentAddressedDuplicateGenerationBytes` when
-  those counters are populated.
+- `blob_reuse_resurrect`, `blob_reuse_adopt`, `blob_put`, `blob_delete`, `objects_spared` counts from
+  `system.content_addressed_log` (the CA event audit). `blob_reuse_resurrect` is the resurrection
+  signal — it fires when a writer observes a condemned token and must re-upload from source (see
+  `Build::observeAndAdmit`).
 
 Expected:
 
 - Reintroduced content is read from writer-owned source bytes, never from a condemned object.
-- Duplicate generation bytes, if any, are bounded by the hot set and later reclaimed.
+- `blob_reuse_resurrect` fires at least once across the hot cycle (proves the resurrect path is
+  exercised, not silently bypassed).
 - No `NO_RETURN` violation symptoms: a deleted token is not reused as a dependency.
 
 ### S17: detached, attach, and drop detached

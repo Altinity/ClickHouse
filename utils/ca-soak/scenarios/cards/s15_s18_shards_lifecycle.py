@@ -46,19 +46,6 @@ def _event_total(ca_events, event_type):
     return total
 
 
-def _metric_or_event(node, name):
-    """Best-effort read of a named row from system.metrics OR system.events (cumulative counter).
-    Returns int or None if neither table has it."""
-    for table in ("system.metrics", "system.events"):
-        try:
-            v = node.scalar(f"SELECT value FROM {table} WHERE metric='{name}' OR event='{name}'")
-            if v not in (None, ""):
-                return int(v)
-        except Exception:
-            continue
-    return None
-
-
 # ---------------------------------------------------------------------------
 # S15: GC target-shard comparison
 # ---------------------------------------------------------------------------
@@ -373,23 +360,22 @@ class S16(Scenario):
         gc_all = _gc_log_since(ctx)
         result.observations["gc_summary"] = gc_all.get("summary", {})
 
-        # Optional resurrection / duplicate-generation counters (record if the build exposes them).
-        res_counter = {}
-        for name in ("ContentAddressedGenerationResurrectionsTotal",
-                     "ContentAddressedDuplicateGenerationBytes"):
-            v = _metric_or_event(cl.node1, name)
-            if v is not None:
-                res_counter[name] = v
-        result.observations["resurrection_counters"] = res_counter
-        if res_counter:
-            result.add(Verdict("resurrection counters recorded",
-                               "bounded by the hot set", res_counter, "pass",
-                               "recorded; duplicate-generation bytes should be bounded and reclaimable"))
-        else:
-            result.add(Verdict.inconclusive(
-                "resurrection counters recorded", "ContentAddressedGenerationResurrectionsTotal / "
-                "ContentAddressedDuplicateGenerationBytes present",
-                "neither counter is present in system.metrics/system.events on this build"))
+        # Resurrection audit: a hot content cycle (drop -> GC-condemn -> re-insert) must surface
+        # `blob_reuse_resurrect` events in system.content_addressed_log — the CA event audit's
+        # equivalent of the removed `ContentAddressedGenerationResurrectionsTotal` /
+        # `ContentAddressedDuplicateGenerationBytes` ProfileEvents (both were zero-increment husks
+        # from the pre-incarnation-token "generation" GC design and were removed). Under the current
+        # architecture, `blob_reuse_resurrect` is the live event a writer emits when it observes a
+        # condemned token and must re-upload from source (see `Build::observeAndAdmit` in
+        # `CasBuild.cpp`); its count is already computed above in `reuse_events`.
+        resurrect_count = result.observations["reuse_events"].get("blob_reuse_resurrect", 0)
+        result.add(Verdict.check(
+            "resurrection events recorded (content_addressed_log)",
+            "blob_reuse_resurrect fires for the drop/GC-condemn/re-insert cycle",
+            f"blob_reuse_resurrect={resurrect_count}", resurrect_count > 0,
+            "" if resurrect_count > 0 else
+            "no blob_reuse_resurrect events observed across the hot cycle — either GC did not condemn "
+            "before the re-insert or the resurrect event failed to fire"))
 
         # --- INVARIANT proxy: reintroduced content is read from writer-owned source bytes, never
         # from a condemned object. We cannot directly observe the GET source, so assert the proxy:
