@@ -45,12 +45,24 @@ NODE_DOWN_CODES = (394, 209, 210, 735)
 
 # ClickHouse error code KEEPER_EXCEPTION (Common/ErrorCodes.cpp). Under chaos a node that is frozen or
 # paused PAST its Keeper session timeout (e.g. a `freeze_long`/`pause` fault longer than the ~tens-of-
-# seconds session TTL) has its ZooKeeper/Keeper session EXPIRED. A `ReplicatedMergeTree` admin op such
-# as `OPTIMIZE TABLE` (which enqueues a merge entry in Keeper) issued during that window then fails with
-# `Coordination::Exception: Session expired. (KEEPER_EXCEPTION)`. The replica re-establishes a fresh
-# session automatically within tens of seconds. This is the Keeper-coordination twin of the
-# TABLE_IS_READ_ONLY transient (B155) and, like it, is EXPECTED under chaos; a best-effort admin op with
-# no model effect (OPTIMIZE) must swallow it rather than surface a hard WORKLOAD FAILURE. See B190.
+# seconds session TTL) has its ZooKeeper/Keeper session EXPIRED or an in-flight Keeper RPC stalls while
+# that session is dying/re-establishing. Two shapes have been observed so far:
+#   * `Coordination::Exception: Session expired. (KEEPER_EXCEPTION)` -- e.g. `OPTIMIZE TABLE` (which
+#     enqueues a merge entry in Keeper) issued during that window. See B190.
+#   * `Coordination::Exception: Coordination error: Operation timeout, path ... (KEEPER_EXCEPTION)` --
+#     e.g. `ALTER ... DELETE`/`UPDATE` (which creates a mutation entry under .../mutations) racing the
+#     same window. `Coordination::Exception::fromPath` (`src/Common/ZooKeeper/KeeperException.h`)
+#     formats ALL path-bearing Keeper errors as `"Coordination error: {message}, path {path}"`, so the
+#     generic `"Coordination error"` prefix is matched too and covers OTHER not-yet-observed
+#     path-bearing Keeper-error variants (session moved, connection loss, ...) the same way.
+# The replica re-establishes a fresh session automatically within tens of seconds in both shapes. This
+# is the Keeper-coordination twin of the TABLE_IS_READ_ONLY transient (B155); EXPECTED under chaos.
+# Originally only the `Session expired` shape was recognized, and only wired into the best-effort
+# OPTIMIZE path (no model effect, swallow-and-drop; B190). Diagnosed in
+# `.superpowers/sdd/task3v2-chaos-diag-report.md`: a chaos-window `ALTER ... DELETE` hit the
+# `Operation timeout` shape on the MUTATION path (`apply_barrier`, run.py), which had NO Keeper-transient
+# tolerance at all (not even the narrower `Session expired` case) despite `apply_barrier`'s own
+# docstring claiming transport-resilience -- aborting the whole run instead of self-healing in ~70s.
 KEEPER_EXCEPTION_CODE = 999
 
 
@@ -82,15 +94,28 @@ class QueryError(RuntimeError):
         return ("Code: %d" % TABLE_IS_READ_ONLY_CODE) in b or "TABLE_IS_READ_ONLY" in b
 
     @property
-    def is_keeper_session_expired(self) -> bool:
-        """True if the server-side exception is a Keeper session-expiry transient (code 999
-        KEEPER_EXCEPTION with a `Session expired` coordination error). A node frozen/paused past its
-        Keeper session TTL under chaos loses its session and re-establishes a fresh one within tens of
-        seconds; a best-effort admin op (OPTIMIZE) that raced that window must RETRY/skip rather than
-        surface as a hard WORKLOAD FAILURE. The Keeper-coordination twin of `is_readonly` (B155). See
-        B190. Detected by parsing the ClickHouse exception body in the HTTP response."""
+    def is_keeper_transient(self) -> bool:
+        """True if the server-side exception is a Keeper-coordination transient (code 999
+        KEEPER_EXCEPTION): a node frozen/paused past its Keeper session TTL under chaos either lost its
+        session (`Session expired`) or stalled an in-flight Keeper RPC while that session was
+        dying/re-establishing (`Operation timeout`, or any other path-bearing Keeper error, all of
+        which share the generic `Coordination error` prefix -- see the `KEEPER_EXCEPTION_CODE` comment
+        above). The replica re-establishes a fresh session and self-heals within tens of seconds either
+        way; this must RETRY/reroute rather than surface as a hard WORKLOAD FAILURE. The
+        Keeper-coordination twin of `is_readonly` (B155). Originally `is_keeper_session_expired`
+        (`Session expired` only, B190); broadened to cover `Operation timeout` per
+        `.superpowers/sdd/task3v2-chaos-diag-report.md` (a chaos-window `ALTER ... DELETE` hit this
+        exact variant on the mutation path, which the narrower classifier would not have matched
+        either). Detected by parsing the ClickHouse exception body in the HTTP response."""
         b = self.body or ""
-        return ("Code: %d" % KEEPER_EXCEPTION_CODE) in b and "Session expired" in b
+        if ("Code: %d" % KEEPER_EXCEPTION_CODE) not in b:
+            return False
+        return "Session expired" in b or "Operation timeout" in b or "Coordination error" in b
+
+    # Back-compat alias: `is_keeper_session_expired` was the original (B190) name, matching only the
+    # `Session expired` shape. Kept pointing at the same (now-broadened) property so any call site
+    # still spelled the old way keeps working unchanged.
+    is_keeper_session_expired = is_keeper_transient
 
     @property
     def is_node_down(self) -> bool:
@@ -296,15 +321,36 @@ def is_mount_fenced(exc: BaseException) -> bool:
     return isinstance(exc, QueryError) and exc.is_mount_fenced
 
 
+def is_keeper_transient(exc: BaseException) -> bool:
+    """A Keeper-coordination transient (`QueryError.is_keeper_transient`, code 999 KEEPER_EXCEPTION):
+    the target replica's Keeper session expired (`Session expired`) or an in-flight Keeper RPC stalled
+    while that session was dying/re-establishing (`Operation timeout` and other path-bearing Keeper
+    errors, all sharing the generic `Coordination error` prefix). Self-heals within tens of seconds
+    once the node re-establishes its session, so it gets the same bounded retry + reroute recovery as
+    node-down/readonly/mount-fenced. Previously only recognized (as `is_keeper_session_expired`) for
+    the `Session expired` shape and wired only into the best-effort OPTIMIZE path (B190); broadened and
+    added HERE (to `retry_on_transport`, and therefore `apply_barrier`'s mutation path) per
+    `.superpowers/sdd/task3v2-chaos-diag-report.md`, whose diagnosed failure was exactly an
+    `Operation timeout` KEEPER_EXCEPTION on `ALTER ... DELETE` going unretried and aborting the run."""
+    return isinstance(exc, QueryError) and exc.is_keeper_transient
+
+
 def retry_on_transport(fn, *, attempts: int, backoff_s: float = 0.5, max_backoff_s: float = 8.0,
                        on_retry=None, sleep_fn=time.sleep):
     """Call `fn` and retry it on a NODE-DOWN failure (`is_node_down`: a connection-level transport
-    error OR a graceful-shutdown cancellation/network `QueryError`) with bounded, capped-exponential
-    backoff, up to `attempts` total tries. A persistent node-down after the budget is exhausted is
-    re-raised -- per the task spec, a node that never comes back within a generous bound IS a failure
-    (the feature must survive crash+restart). Other exceptions (a logic `QueryError`, the B137 ABORTED
-    transient that has its own retry, ...) propagate IMMEDIATELY so the caller's own handling sees them
-    unmasked.
+    error OR a graceful-shutdown cancellation/network `QueryError`), a transient `is_readonly`/
+    `is_mount_fenced`/`is_keeper_transient` `QueryError`, with bounded, capped-exponential backoff, up
+    to `attempts` total tries. A persistent failure after the budget is exhausted is re-raised -- per
+    the task spec, a node that never comes back within a generous bound IS a failure (the feature must
+    survive crash+restart). Other exceptions (a logic `QueryError`, the B137 ABORTED transient that has
+    its own retry, ...) propagate IMMEDIATELY so the caller's own handling sees them unmasked.
+
+    Budget note: with the caller's default `attempts=TRANSPORT_ATTEMPTS` (40, `run.py`) and this
+    function's default `backoff_s=0.5`/`max_backoff_s=8.0`, the capped-exponential backoff sums to
+    ~287s (~4.8 minutes) of sleep across the retry loop -- comfortably above the >=2-minute floor
+    `.superpowers/sdd/task3v2-chaos-diag-report.md` calls for (the diagnosed Keeper outage there
+    self-healed in ~66-90s), so `is_keeper_transient` reuses the SAME bounded budget as the other
+    transport-retryable classes rather than needing its own extended one.
 
     `sleep_fn` is injectable so the loop is pure-testable without real sleeps."""
     last = None
@@ -312,7 +358,7 @@ def retry_on_transport(fn, *, attempts: int, backoff_s: float = 0.5, max_backoff
         try:
             return fn()
         except Exception as e:
-            if not (is_node_down(e) or is_readonly(e) or is_mount_fenced(e)):
+            if not (is_node_down(e) or is_readonly(e) or is_mount_fenced(e) or is_keeper_transient(e)):
                 raise
             last = e
             if attempt < attempts:

@@ -334,10 +334,11 @@ class Driver:
             except QueryError as e:
                 # node-down (graceful-shutdown cancel), the transient TABLE_IS_READ_ONLY (a replica
                 # re-establishing its Keeper session after a chaos pause/restart -- esp. `both pause`),
-                # and a Keeper `Session expired` (a node frozen/paused past its Keeper session TTL, B190)
-                # are all expected under chaos. OPTIMIZE has NO model effect, so dropping it is sound;
-                # only a genuine logic error surfaces.
-                if not (e.is_node_down or e.is_readonly or e.is_mount_fenced or e.is_keeper_session_expired):
+                # and a Keeper coordination transient (`Session expired` or `Operation timeout`, a node
+                # frozen/paused past its Keeper session TTL, B190; broadened per
+                # .superpowers/sdd/task3v2-chaos-diag-report.md) are all expected under chaos. OPTIMIZE
+                # has NO model effect, so dropping it is sound; only a genuine logic error surfaces.
+                if not (e.is_node_down or e.is_readonly or e.is_mount_fenced or e.is_keeper_transient):
                     raise
             except Exception as e:
                 if not is_transport_error(e):
@@ -387,9 +388,14 @@ class Driver:
         """Drain inserts, then apply the mutation to the cluster (on op.target's replica) AND the
         model. The model mutation must see exactly the rows the cluster sees, hence the drain. Under
         chaos the mutation must LAND even if its target replica is down: it is transport-resilient and
-        reroutes to the other replica (replicated DDL/mutation; idempotent table-level effect). It is
-        applied to the model ONLY AFTER the cluster command succeeds, so a never-landed mutation
-        surfaces as a transport failure instead of silently diverging the model."""
+        reroutes to the other replica (replicated DDL/mutation; idempotent table-level effect) --
+        `_with_transport_retry`/`retry_on_transport` (cluster.py) also tolerates a transient Keeper
+        coordination error (`is_keeper_transient`: `Session expired` or `Operation timeout`, code 999
+        KEEPER_EXCEPTION) racing the mutation's Keeper-side bookkeeping (e.g. creating the entry under
+        .../mutations), per .superpowers/sdd/task3v2-chaos-diag-report.md -- previously this class went
+        unretried here and could abort the whole run on a self-healing ~70s outage. It is applied to
+        the model ONLY AFTER the cluster command succeeds, so a never-landed mutation surfaces as a
+        transport failure instead of silently diverging the model."""
         self.drain()
         if op.type == OpType.UPDATE:
             sql = update_sql(TABLE, self.model._pred_bucket(op.param))

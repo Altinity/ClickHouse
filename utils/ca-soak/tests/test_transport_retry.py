@@ -17,9 +17,11 @@ from soak.cluster import (
     QueryError,
     is_transport_error,
     is_node_down,
+    is_keeper_transient,
     retry_on_transport,
     ABORTED_CODE,
     NODE_DOWN_CODES,
+    KEEPER_EXCEPTION_CODE,
 )
 
 
@@ -44,6 +46,24 @@ def query_cancelled_error():
 def network_error():
     body = "Code: 210. DB::Exception: I/O error: Broken pipe. (NETWORK_ERROR)"
     return QueryError("Node(x:1)", 500, body, "INSERT INTO t VALUES")
+
+
+def keeper_session_expired_error():
+    # The B190 shape: `Exception::fromMessage` (no "Coordination error:" prefix).
+    body = "Code: 999. Coordination::Exception: Session expired. (KEEPER_EXCEPTION) (version 26.6.1.1)"
+    return QueryError("Node(localhost:8123)", 500, body, "OPTIMIZE TABLE ca_stress")
+
+
+def keeper_operation_timeout_error():
+    # The real reproducer from the task3v2 2h chaos soak (task3v2-chaos-diag-report.md): a mutation
+    # entry create under .../mutations hit a Keeper RPC that made no progress for 30s while ch1's
+    # session was dying/re-establishing. `Exception::fromPath` always prefixes path-bearing Keeper
+    # errors with "Coordination error: {message}, path {path}".
+    body = (
+        "Code: 999. Coordination::Exception: Coordination error: Operation timeout, "
+        "path /clickhouse/tables/ca_stress/mutations. (KEEPER_EXCEPTION) (version 26.6.1.1)"
+    )
+    return QueryError("Node(localhost:8123)", 500, body, "ALTER TABLE ca_stress DELETE WHERE bucket = 7")
 
 
 # --- classification ---------------------------------------------------------------------------
@@ -228,3 +248,112 @@ def test_backoff_is_bounded_and_capped():
     assert len(sleeps) == 7
     assert all(s <= 8.0 for s in sleeps)
     assert sleeps[0] == 0.5 and sleeps[-1] == 8.0
+
+
+# --- Keeper-coordination transients on the MUTATION path (task3v2-chaos-diag-report.md) --------
+#
+# A chaos-window `ALTER TABLE ca_stress DELETE ...` hit `Code: 999. Coordination::Exception:
+# Coordination error: Operation timeout, path /clickhouse/tables/ca_stress/mutations.
+# (KEEPER_EXCEPTION)` during a ~70s self-healing Keeper-session/mount-lease outage and aborted the
+# whole 2h run: `retry_on_transport` (which gates `apply_barrier`, the mutation path) treated no
+# KEEPER_EXCEPTION variant as retryable, even though `apply_barrier`'s own docstring claims
+# transport-resilience. Fixed by broadening the (renamed) `is_keeper_transient` classifier to match
+# BOTH the `Session expired` and `Operation timeout` KEEPER_EXCEPTION shapes and wiring it into
+# `retry_on_transport` alongside `is_node_down`/`is_readonly`/`is_mount_fenced`.
+
+def test_keeper_session_expired_is_keeper_transient():
+    e = keeper_session_expired_error()
+    assert e.is_keeper_transient is True
+    assert e.is_keeper_session_expired is True   # back-compat alias still matches
+    assert is_keeper_transient(e) is True
+
+
+def test_keeper_operation_timeout_is_keeper_transient():
+    # This is the exact variant from the diag report that the OLD narrower `Session expired`-only
+    # classifier would NOT have matched even if it had been wired into retry_on_transport.
+    e = keeper_operation_timeout_error()
+    assert e.is_keeper_transient is True
+    assert is_keeper_transient(e) is True
+
+
+def test_keeper_exception_code_constant():
+    assert KEEPER_EXCEPTION_CODE == 999
+
+
+def test_non_keeper_error_is_not_keeper_transient():
+    # A genuine, unrelated HTTP 500 (not a KEEPER_EXCEPTION at all) must NOT be classified as a
+    # Keeper transient -- fail-fast for real errors must be preserved.
+    e = unknown_table_error()
+    assert e.is_keeper_transient is False
+    assert is_keeper_transient(e) is False
+
+
+def test_keeper_code_without_recognized_text_is_not_keeper_transient():
+    # Defensive: code 999 alone (no recognized message shape) must not blanket-match -- classification
+    # is by BODY TEXT, not bare code, same discipline as the other classifiers in this module.
+    body = "Code: 999. DB::Exception: some unrelated future KEEPER_EXCEPTION shape. (KEEPER_EXCEPTION)"
+    e = QueryError("Node(x:1)", 500, body, "ALTER TABLE t DELETE WHERE 1")
+    assert e.is_keeper_transient is False
+    assert is_keeper_transient(e) is False
+
+
+def test_keeper_operation_timeout_retried_and_succeeds():
+    """The exact reproducer: `apply_barrier`'s mutation retry must tolerate `Operation timeout` and
+    succeed once the Keeper session self-heals (the real outage lasted ~66-90s; well within budget)."""
+    calls = {"n": 0}
+
+    def attempt():
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise keeper_operation_timeout_error()
+        return "ok"
+
+    out = retry_on_transport(attempt, attempts=10, sleep_fn=lambda s: None)
+    assert out == "ok"
+    assert calls["n"] == 3
+
+
+def test_keeper_session_expired_retried_and_succeeds():
+    """Regression check: the `Session expired` shape (already tolerated on the best-effort OPTIMIZE
+    path since B190) must now ALSO be tolerated on the mutation/transport-retry path."""
+    calls = {"n": 0}
+
+    def attempt():
+        calls["n"] += 1
+        if calls["n"] <= 1:
+            raise keeper_session_expired_error()
+        return "ok"
+
+    out = retry_on_transport(attempt, attempts=10, sleep_fn=lambda s: None)
+    assert out == "ok"
+    assert calls["n"] == 2
+
+
+def test_keeper_transient_budget_exhaustion_still_fails():
+    # A KEEPER_EXCEPTION that never clears (budget exhausted) must still surface loudly, same as any
+    # other transport-retryable class -- this is not an unbounded loop.
+    calls = {"n": 0}
+
+    def attempt():
+        calls["n"] += 1
+        raise keeper_operation_timeout_error()
+
+    with pytest.raises(QueryError) as ei:
+        retry_on_transport(attempt, attempts=5, sleep_fn=lambda s: None)
+    assert ei.value.is_keeper_transient
+    assert calls["n"] == 5   # exactly the bounded budget, no more
+
+
+def test_non_keeper_http_500_not_retried():
+    # A genuine (non-transport, non-Keeper) HTTP 500 -- a real logic error -- must fail FAST with no
+    # retry at all, preserving fail-fast behavior for genuine errors.
+    calls = {"n": 0}
+
+    def attempt():
+        calls["n"] += 1
+        raise unknown_table_error()
+
+    with pytest.raises(QueryError) as ei:
+        retry_on_transport(attempt, attempts=5, sleep_fn=lambda s: None)
+    assert not ei.value.is_keeper_transient
+    assert calls["n"] == 1   # raised on the first attempt, no retry
