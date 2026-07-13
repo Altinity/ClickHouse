@@ -273,8 +273,8 @@ void ASTSystemQuery::formatImpl(WriteBuffer & ostr, const FormatSettings & setti
         }
         case Type::CONTENT_ADDRESSED_GC_REBUILD:
         {
-            /// FORCE precedes the (also optional) disk name: SYSTEM CONTENT ADDRESSED GC REBUILD
-            /// [FORCE] [<disk>].
+            /// FORCE precedes the required disk name: SYSTEM CONTENT ADDRESSED GC REBUILD
+            /// [FORCE] <disk>.
             if (content_addressed_gc_rebuild_force)
                 print_keyword(" FORCE");
             if (!disk.empty())

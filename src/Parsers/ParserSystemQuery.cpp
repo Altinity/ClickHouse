@@ -476,19 +476,14 @@ bool ParserSystemQuery::parseImpl(IParser::Pos & pos, ASTPtr & node, Expected & 
         }
         case Type::CONTENT_ADDRESSED_GC_REBUILD:
         {
-            /// SYSTEM CONTENT ADDRESSED GC REBUILD [FORCE] [<disk>] [ON CLUSTER cluster]. FORCE is an
-            /// optional keyword preceding the (also optional) disk name; mirror the GC-collection
-            /// branch above for the disk/ON CLUSTER handling.
+            /// SYSTEM CONTENT ADDRESSED GC REBUILD [FORCE] <disk> [ON CLUSTER cluster]. Unlike the
+            /// per-round GC-collection command, REBUILD requires an EXPLICIT disk: the destructive
+            /// baseline rebuild must never fan out across every content-addressed disk from a bare
+            /// command. parseQueryWithOnClusterAndTarget requires the target, so omitting the disk is a
+            /// syntax error.
             res->content_addressed_gc_rebuild_force = ParserKeyword{Keyword::FORCE}.ignore(pos, expected);
-            auto saved_pos = pos;
-            Expected target_expected = expected;
-            if (!parseQueryWithOnClusterAndTarget(res, pos, target_expected, SystemQueryTargetType::Disk))
-            {
-                pos = saved_pos;
-                res->disk.clear();
-                if (!parseQueryWithOnCluster(res, pos, expected))
-                    return false;
-            }
+            if (!parseQueryWithOnClusterAndTarget(res, pos, expected, SystemQueryTargetType::Disk))
+                return false;
             break;
         }
         /// FLUSH DISTRIBUTED requires table

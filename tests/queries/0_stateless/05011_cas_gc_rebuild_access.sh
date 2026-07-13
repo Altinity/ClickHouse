@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# Tags: no-parallel
+
+CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=../shell_config.sh
+. "$CUR_DIR"/../shell_config.sh
+
+# Intent (E1):
+#  1) A role granted only "SYSTEM CONTENT ADDRESSED GARBAGE COLLECTION" is REFUSED (ACCESS_DENIED)
+#     when it runs "SYSTEM CONTENT ADDRESSED GC REBUILD <disk>", but ALLOWED to run the per-round
+#     "SYSTEM CONTENT ADDRESSED GARBAGE COLLECTION". Granting the new
+#     "SYSTEM CONTENT ADDRESSED GC REBUILD" right then permits REBUILD.
+#  2) "SYSTEM CONTENT ADDRESSED GC REBUILD" with NO disk is a SYNTAX_ERROR (required disk);
+#     naming a non-content-addressed disk yields BAD_ARGUMENTS (not a silent all-disks fan-out).
+# (No CA disk needs to exist: the privilege check and the grammar/required-disk check both fire
+#  before any disk I/O; assert on the specific error codes. The `default` disk always exists and is
+#  never content-addressed, so it deterministically yields BAD_ARGUMENTS once a check is passed.)
+
+${CLICKHOUSE_CLIENT} --multiline -q """
+DROP USER IF EXISTS user_test_05011;
+CREATE USER user_test_05011 IDENTIFIED WITH plaintext_password BY 'user_test_05011';
+REVOKE ALL ON *.* FROM user_test_05011;
+GRANT SYSTEM CONTENT ADDRESSED GARBAGE COLLECTION ON *.* TO user_test_05011;
+"""
+
+# GC-only role: REBUILD is refused; the per-round GC is allowed (fails later, on the disk-type check).
+${CLICKHOUSE_CLIENT} --multiline --user user_test_05011 --password user_test_05011 -q """
+SYSTEM CONTENT ADDRESSED GC REBUILD default; -- { serverError ACCESS_DENIED }
+SYSTEM CONTENT ADDRESSED GARBAGE COLLECTION default; -- { serverError BAD_ARGUMENTS }
+"""
+
+${CLICKHOUSE_CLIENT} --multiline -q """
+GRANT SYSTEM CONTENT ADDRESSED GC REBUILD ON *.* TO user_test_05011;
+"""
+
+# Granting the new right permits REBUILD (fails later, on the disk-type check).
+${CLICKHOUSE_CLIENT} --multiline --user user_test_05011 --password user_test_05011 -q """
+SYSTEM CONTENT ADDRESSED GC REBUILD default; -- { serverError BAD_ARGUMENTS }
+"""
+
+# REBUILD requires an explicit disk (syntax error), and never silently fans out across all disks.
+${CLICKHOUSE_CLIENT} --multiline -q """
+SYSTEM CONTENT ADDRESSED GC REBUILD; -- { clientError SYNTAX_ERROR }
+SYSTEM CONTENT ADDRESSED GC REBUILD default; -- { serverError BAD_ARGUMENTS }
+"""
+
+${CLICKHOUSE_CLIENT} --multiline -q """
+DROP USER IF EXISTS user_test_05011;
+"""

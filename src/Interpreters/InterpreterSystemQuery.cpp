@@ -1007,7 +1007,7 @@ BlockIO InterpreterSystemQuery::execute()
         }
         case Type::CONTENT_ADDRESSED_GC_REBUILD:
         {
-            getContext()->checkAccess(AccessType::SYSTEM_CONTENT_ADDRESSED_GARBAGE_COLLECTION);
+            getContext()->checkAccess(AccessType::SYSTEM_CONTENT_ADDRESSED_GC_REBUILD);
             runContentAddressedGcRebuild(query.disk, query.content_addressed_gc_rebuild_force);
             break;
         }
@@ -2249,27 +2249,18 @@ void InterpreterSystemQuery::runContentAddressedGcRebuild(const String & disk_na
             rep.live_precommits, rep.unowned_alive_manifests, rep.edges, rep.clamped_shards);
     };
 
-    if (!disk_name.empty())
-    {
-        auto disk = getContext()->getDisk(disk_name);
-        auto * ca = content_addressed_storage_of(disk);
-        if (!ca)
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Disk '{}' is not a content-addressed disk", disk_name);
-        log_and_check(disk_name, ca->runGcRebuildNow(force));   /// synchronous, one rebuild
-        return;
-    }
+    /// REBUILD requires an EXPLICIT disk (E1): the destructive baseline rebuild must never fan out
+    /// across every content-addressed disk on the node. The parser enforces this syntactically; this is
+    /// the fail-closed backstop for a directly-constructed AST.
+    if (disk_name.empty())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS,
+            "SYSTEM CONTENT ADDRESSED GC REBUILD requires an explicit disk name");
 
-    size_t ran = 0;
-    for (const auto & [name, disk] : getContext()->getDisksMap())
-    {
-        if (auto * ca = content_addressed_storage_of(disk))
-        {
-            log_and_check(name, ca->runGcRebuildNow(force));   /// synchronous, one rebuild
-            ++ran;
-        }
-    }
-    if (ran == 0)
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "No content-addressed disks are configured on this node");
+    auto disk = getContext()->getDisk(disk_name);
+    auto * ca = content_addressed_storage_of(disk);
+    if (!ca)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Disk '{}' is not a content-addressed disk", disk_name);
+    log_and_check(disk_name, ca->runGcRebuildNow(force));   /// synchronous, one rebuild
 }
 
 void InterpreterSystemQuery::loadPrimaryKeys()
@@ -2824,9 +2815,13 @@ AccessRightsElements InterpreterSystemQuery::getRequiredAccessForDDLOnCluster() 
             break;
         }
         case Type::CONTENT_ADDRESSED_GARBAGE_COLLECTION:
-        case Type::CONTENT_ADDRESSED_GC_REBUILD:
         {
             required_access.emplace_back(AccessType::SYSTEM_CONTENT_ADDRESSED_GARBAGE_COLLECTION);
+            break;
+        }
+        case Type::CONTENT_ADDRESSED_GC_REBUILD:
+        {
+            required_access.emplace_back(AccessType::SYSTEM_CONTENT_ADDRESSED_GC_REBUILD);
             break;
         }
         case Type::UNFREEZE:
