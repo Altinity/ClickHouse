@@ -3,17 +3,20 @@
 
 #include <Columns/ColumnString.h>
 #include <Columns/ColumnsNumber.h>
+#include <Columns/ColumnsDateTime.h>
+#include <DataTypes/DataTypeDateTime64.h>
 #include <DataTypes/DataTypeLowCardinality.h>
 #include <DataTypes/DataTypeString.h>
+#include <DataTypes/DataTypeUUID.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasServerRoot.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include <Processors/Sources/SourceFromSingleChunk.h>
 #include <QueryPipeline/Pipe.h>
 #include <Interpreters/Context.h>
+#include <Common/assert_cast.h>
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
-#include <base/hex.h>
 
 #include <chrono>
 
@@ -33,13 +36,13 @@ StorageSystemContentAddressedMounts::StorageSystemContentAddressedMounts(const S
     {
         {"disk", std::make_shared<DataTypeString>(), "Name of the content-addressed disk."},
         {"srid", std::make_shared<DataTypeString>(), "Server root id owning the mount slot."},
-        {"server_uuid", std::make_shared<DataTypeString>(), "UUID of the server incarnation holding the lease (hex)."},
+        {"server_uuid", std::make_shared<DataTypeUUID>(), "UUID of the server incarnation holding the lease."},
         {"hostname", std::make_shared<DataTypeString>(), "Hostname recorded in the lease body."},
         {"pid", std::make_shared<DataTypeUInt64>(), "Process id recorded in the lease body."},
         {"writer_epoch", std::make_shared<DataTypeUInt64>(), "Fenced writer epoch of the incarnation."},
         {"seq", std::make_shared<DataTypeUInt64>(), "Lease renewal sequence number."},
-        {"started_at_ms", std::make_shared<DataTypeUInt64>(), "Lease start, unix ms."},
-        {"expires_at_ms", std::make_shared<DataTypeUInt64>(), "Lease expiry, unix ms."},
+        {"started_at_ms", std::make_shared<DataTypeDateTime64>(3), "Lease start."},
+        {"expires_at_ms", std::make_shared<DataTypeDateTime64>(3), "Lease expiry."},
         {"min_active", std::make_shared<DataTypeUInt64>(), "Oldest in-flight build sequence (UINT64_MAX = farewell)."},
         {"gc_fenced", std::make_shared<DataTypeUInt8>(), "1 if GC fenced this slot out (terminal)."},
         {"state", std::make_shared<DataTypeString>(), "live | expired | terminated | fenced | corrupt."},
@@ -73,13 +76,13 @@ Pipe StorageSystemContentAddressedMounts::read(
 
     MutableColumnPtr col_disk = ColumnString::create();
     MutableColumnPtr col_srid = ColumnString::create();
-    MutableColumnPtr col_uuid = ColumnString::create();
+    MutableColumnPtr col_uuid = ColumnUUID::create();
     MutableColumnPtr col_host = ColumnString::create();
     MutableColumnPtr col_pid = ColumnUInt64::create();
     MutableColumnPtr col_epoch = ColumnUInt64::create();
     MutableColumnPtr col_seq = ColumnUInt64::create();
-    MutableColumnPtr col_started = ColumnUInt64::create();
-    MutableColumnPtr col_expires = ColumnUInt64::create();
+    MutableColumnPtr col_started = ColumnDateTime64::create(0, 3);
+    MutableColumnPtr col_expires = ColumnDateTime64::create(0, 3);
     MutableColumnPtr col_min_active = ColumnUInt64::create();
     MutableColumnPtr col_fenced = ColumnUInt8::create();
     MutableColumnPtr col_state = ColumnString::create();
@@ -143,13 +146,13 @@ Pipe StorageSystemContentAddressedMounts::read(
         {
             col_disk->insert(disk_name);
             col_srid->insert(m.srid);
-            col_uuid->insert(getHexUIntLowercase(m.lease.server_uuid));
+            assert_cast<ColumnUUID &>(*col_uuid).insertValue(UUID(m.lease.server_uuid));
             col_host->insert(m.lease.hostname);
             col_pid->insert(m.lease.pid);
             col_epoch->insert(m.lease.writer_epoch);
             col_seq->insert(m.lease.seq);
-            col_started->insert(m.lease.started_at_ms);
-            col_expires->insert(m.lease.expires_at_ms);
+            assert_cast<ColumnDateTime64 &>(*col_started).insertValue(static_cast<Decimal64>(m.lease.started_at_ms));
+            assert_cast<ColumnDateTime64 &>(*col_expires).insertValue(static_cast<Decimal64>(m.lease.expires_at_ms));
             col_min_active->insert(m.lease.min_active);
             col_fenced->insert(static_cast<UInt8>(m.lease.gc_fenced));
             col_state->insert(m.state);
