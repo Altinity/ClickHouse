@@ -165,6 +165,13 @@ Expected: fetch read cost drops from O(files) probes to one manifest read; ~30% 
 
 ## §5 Blob meta: absence means Clean {#s5-meta-absence-clean}
 
+> **ABANDONED 2026-07-14 (user decision).** This lever is NOT implemented and will NOT be revived.
+> Transition 5 (GC spare clears the tombstone) re-introduced the data-loss hole fixed on 2026-07-11
+> (see `reports/2026-07-14-cas-s5-spare-clear-reopens-dataloss.md`), and the safe add-only variant was
+> judged not worth its cost (a rebuilt two-leader gate + an absent-meta read-path redesign) for the
+> create-time PUT saving. The section below is retained as design history only. The optimization round
+> ships §1–§4 + §6; §5 is dropped.
+
 The largest PUT class (~54%) is `.meta` freshness-object traffic; its biggest sub-class is
 create-as-Clean after every new body (~263k per audit window, 23% of all PUTs) — written "so
 point-readers never fall back to a HEAD-only guess" while a fallback for absent meta ALREADY exists

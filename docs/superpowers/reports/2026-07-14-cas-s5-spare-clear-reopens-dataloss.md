@@ -88,9 +88,13 @@ Two independent adversarial audits (the two-model discipline for hard concurrenc
 
 ## Disposition {#disposition}
 
-- **§5 is BLOCKED for the opt-round.** opt-t7's WIP (`CasBuild.cpp`, `CasGc.cpp`, 5 test files) was
-  halted **uncommitted**; nothing unsafe landed.
-- **If §5 is revived,** it must adopt the 2026-07-11 add-only principle in the absence-means-Clean
+- **§5 is ABANDONED (user decision 2026-07-14) — not blocked-pending-revival, dropped.** The safe
+  add-only variant was judged not worth its cost (a rebuilt two-leader gate + an absent-meta read-path
+  redesign) for the create-time PUT saving. opt-t7's WIP was halted **uncommitted** (nothing unsafe
+  landed) and the preserving stash has been dropped; this report + the handoff are the only record.
+  The optimization round ships §1–§4 + §6. The revival task is closed.
+- **If §5 were ever revived** (not planned), it would need to adopt the 2026-07-11 add-only principle
+  in the absence-means-Clean
   representation: **the spare must NOT clear the tombstone** (drop Transition 5 / `GcSpareHeal`
   entirely). A spared hash keeps its tombstone until a **writer** resurrects it with a fresh token
   (which deletes the tombstone as part of publishing the fresh incarnation) — identical to Fix 4's
