@@ -1917,9 +1917,12 @@ TEST(RefWriterRemount, PostRemountAppendCarriesLiveEpochSortingAboveTwinLogs)
         << "the post-remount append must sort strictly above the twin's log";
 }
 
-/// C1 (wedge disposition): a wedged append lane converts to the accepted Late Predecessor case on a
-/// self-remount -- the runtime (and its wedge) is dropped, the next touch re-recovers a clean lane, and
-/// appends resume without hanging. The unfixed code kept the wedged runtime cached across the remount.
+/// C1 (wedge disposition): a wedged append lane's runtime (and its wedge) is dropped on a self-remount,
+/// the next touch re-recovers a clean lane, and appends resume without hanging. The unfixed code kept the
+/// wedged runtime cached across the remount. rev.6 Task 7: `tryRemountOnce` consults the wedge via
+/// `refLanesSettledForRemount` BEFORE this drop happens (paying `materialization_grace_ms` for it below),
+/// so the drop itself is a plain cache detach, not the wedge's disposition -- see `quiesceRefTablesForRemount`'s
+/// doc comment (`CasStore.h`) for the retired "accepted Late Predecessor case" framing this replaces.
 TEST(RefWriterRemount, DiscardsWedgeAndLaneRemainsUsable)
 {
     CasRequestBudget budget;
@@ -1929,7 +1932,16 @@ TEST(RefWriterRemount, DiscardsWedgeAndLaneRemainsUsable)
     budget.lease_safety_margin_ms = 100;
 
     auto backend = std::make_shared<RefWriterTestBackend>();
-    auto store = openStore(backend, budget);
+    /// rev.6 Task 7: the self-remount below now pays `materialization_grace_ms` for the wedge this test
+    /// deliberately leaves behind (`refLanesSettledForRemount` reports unsettled) -- inject a fake
+    /// `boot_ms_fn`/`wait_sleep_fn` (mirroring `CasRemountTmat.UnresolvedWedgePaysGraceAndMarksBoundaryUnclean`,
+    /// `gtest_cas_store.cpp`) so the wait resolves instantly instead of blocking this test for ~30 real seconds.
+    uint64_t fake_boot = 0;
+    PoolConfig config;
+    config.cas_request_budget = budget;
+    config.boot_ms_fn = [&fake_boot] { return fake_boot; };
+    config.wait_sleep_fn = [&fake_boot](uint64_t ms) { fake_boot += ms; };
+    auto store = openStoreWithConfig(backend, config);
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/remount_wedge"};
     publishEmptyPart(store, ns, "x");
@@ -1963,7 +1975,24 @@ TEST(RefWriterRemount, DiscardsWedgeAndLaneRemainsUsable)
 TEST(RefWriterRemount, SupersededLeaderMidFlushFailsClosedCreatesNoObject)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
-    auto store = openStore(backend);
+    /// rev.6 Task 7: this test parks a flush leader (`leader_active` stays true) across the ENTIRE
+    /// `tryRemountOnce` call below by construction (`release` is only set AFTER `tryRemountOnce`
+    /// returns), so `refLanesSettledForRemount`'s own drain-wait -- bounded by
+    /// `attempt_timeout_ms + lease_safety_margin_ms`, on a real `steady_clock` deadline never routed
+    /// through `wait_sleep_fn` (same as its `drainRefLanesForShutdown` sibling) -- is guaranteed to run out
+    /// its full budget. Shrink that budget to the file's usual tiny-wedge-test values so the unavoidable
+    /// real wait stays well under a second, and inject a fake `boot_ms_fn`/`wait_sleep_fn` so the
+    /// subsequent `materialization_grace_ms` wait (the drain reports unsettled either way) resolves
+    /// instantly on top.
+    CasRequestBudget budget;
+    budget.attempt_timeout_ms = 100;
+    budget.lease_safety_margin_ms = 100;
+    uint64_t fake_boot = 0;
+    PoolConfig config;
+    config.cas_request_budget = budget;
+    config.boot_ms_fn = [&fake_boot] { return fake_boot; };
+    config.wait_sleep_fn = [&fake_boot](uint64_t ms) { fake_boot += ms; };
+    auto store = openStoreWithConfig(backend, config);
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/remount_midflush"};
     publishEmptyPart(store, ns, "x");
