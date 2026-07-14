@@ -40,7 +40,6 @@
 (* Sabotage CONSTANT booleans reproduce the guarded-against states:        *)
 (*   SabForeignTakeover   -> ForeignUuidNeverAutoTakesOver violated        *)
 (*   SabEpochReset        -> WriterEpochMonotoneUnique violated            *)
-(*   SabSupersededWrites  -> SupersededWriterMakesNoMutation violated      *)
 (*   SabAdoptWedgeOnTouch -> NoPermanentWedge violated (the OLD adopt:     *)
 (*     a token mismatch at AdoptWrite fails closed PERMANENTLY -- the      *)
 (*     pre-fix `LOGICAL_ERROR` abort during `Store::open`, exit 49)        *)
@@ -57,6 +56,77 @@
 (* bug: a reclaimer that trusts the stamp directly (`clock > mount.deadline`)*)
 (* instead of waiting out the full `TTL + Drift` on ITS OWN clock after     *)
 (* observing the token hold stable (`ObservedReclaim`).                     *)
+(*                                                                          *)
+(* 2026-07-14 rev.6 round 8 (reconciled package, two independent           *)
+(* consult/review passes converged on this): rounds 2-7 iterated on how a  *)
+(* reclaim should be represented (epoch-only bump, then a bolted-on        *)
+(* `heldToken` token-chain) and kept surfacing new masked/false verdicts.  *)
+(* The root cause both passes converged on: the model's reclaim was        *)
+(* BODY-INVISIBLE while the product's reclaim is a token-guarded           *)
+(* `putOverwrite` that installs the SUCCESSOR'S BODY                       *)
+(* (`CasServerRoot.cpp:405-414`). Round 8 makes the reclaim install that    *)
+(* body (P1) and lets the model's PRE-EXISTING body classification         *)
+(* (`Renew`/`ClaimMount`/`AdoptRead`, all present since round 0/P3.1) do    *)
+(* the re-arm-blocking work -- no compensating field needed, so `heldToken` *)
+(* is deleted (P3). `Write` shrinks to a PURE LOCAL check (P2, the         *)
+(* product's `Store::mayMutate`/`refAppendFenceOk`, `CasStore.cpp:201-226`, *)
+(* reads no shared state at all): `~rejected /\ ~wedged /\ ~crashed[a] /\   *)
+(* owner=a /\ clock<fenceUntil` -- `mount#None`, `mount.uuid=a`, `epochOK`, *)
+(* `~mount.fenced` all removed as unfaithful per-write body reads the real *)
+(* write path never performs. `ClaimMount` gains a STRICT-ORDER guard      *)
+(* (P4, `CasStore.cpp:312-316`): an actor may claim/mint/reclaim only with  *)
+(* the LATEST durable epoch it holds (`localEpoch[a] >= epoch`), which     *)
+(* closes the `ClearExpiredMount` + fresh-mint re-arm path no prior round   *)
+(* caught. `SabSupersededWrites` (and `_sab_supersededwrites.cfg`) are      *)
+(* RETIRED: with `epochOK` gone from `Write` by construction, the flag has  *)
+(* nothing left to toggle. `SupersededWriterMakesNoMutation` (the          *)
+(* knowledge-based invariant) and its `localLost`/`lostThenWrote` machinery *)
+(* are KEPT -- they still have live readers/checkers (see the task         *)
+(* report's round-8 kept-vs-removed table) -- but are no longer trusted    *)
+(* in `_sab_wallclockreclaim.cfg`'s invariant list (dropped there: with a   *)
+(* faithful reclaim body a `Renew`-then-`Write` drift path COULD trip it,   *)
+(* masked only by the shallower `GlobalSupersededWriterMakesNoMutation`     *)
+(* violation -- keeping it there invites "why is this green" confusion).    *)
+(* `rev6_observe`'s GREEN (with `ObservedReclaim` enabled, no monotone      *)
+(* witness bundled) is now THE reclaim-faithfulness regression detector,    *)
+(* superseding the round-6 canary role.                                    *)
+(*                                                                          *)
+(* 2026-07-14 rev.6 round 9 (`GcFence` made Drift-aware, per the design     *)
+(* spec's own decision #2 -- "GC fence-out becomes observation-based"):     *)
+(* round 8's `rev6_observe.cfg` came back RED on the knowledge-based        *)
+(* `SupersededWriterMakesNoMutation` because `GcFence` still used a bare    *)
+(* wall-clock check (`mount.deadline <= clock`), unlike `ObservedReclaim`.  *)
+(* `GcFence`'s guard is now `mount.deadline + Drift <= clock`, which makes   *)
+(* `GcFence` and `Write` mutually exclusive on the same mount BY            *)
+(* CONSTRUCTION, for every `Drift` (see `GcFence`'s own comment for the     *)
+(* proof) -- byte-identical to the old guard at `Drift = 0`, so every       *)
+(* legacy cfg's semantics are unchanged. This is the model's gate for a     *)
+(* Task 9 C++ change (`computeHeartbeatFloor`): do not regress the model    *)
+(* back to a bare wall-clock `GcFence`.                                     *)
+(*                                                                          *)
+(* 2026-07-14 rev.6 round 10 (class audit + `ClearExpiredMount` closes the  *)
+(* class): round 9's fix stopped hiding a SECOND, previously-masked false   *)
+(* alarm on `SupersededWriterMakesNoMutation` via `ClearExpiredMount`       *)
+(* (bare `mount.deadline <= clock`, feeding `AdoptWrite`'s "vanished while  *)
+(* adopting" fallback). Decision #2's PRINCIPLE generalizes beyond the      *)
+(* fence-out flavor specifically named: ANY OBSERVER-side death verdict on *)
+(* a mount -- fence it, clear it, reclaim it -- must clear the full        *)
+(* rate-bound observation threshold (`TTL + Drift`) before concluding the  *)
+(* record is dead; `ClearExpiredMount` is GC bookkeeping on an              *)
+(* already-presumed-dead mount and follows the SAME rule `GcFence` does,   *)
+(* even though (unlike `GcFence`/`computeHeartbeatFloor`) it is not tied   *)
+(* to one specific named product function. Its guard is now                *)
+(* `mount.deadline + Drift <= clock`, same mutual-exclusion-with-`Write`    *)
+(* proof, byte-identical at `Drift = 0`. A full audit of every clock        *)
+(* comparison in this model (see the task report's round-10 table) found   *)
+(* exactly these TWO observer-side bare wall-clock sites -- `GcFence`       *)
+(* (round 9) and `ClearExpiredMount` (this round) -- and nothing else:      *)
+(* `ClaimMount`'s `expired` is HOLDER-side self-reclaim (see its own        *)
+(* comment); `Write`'s `clock < fenceUntil` is the holder's own ground      *)
+(* truth; `ObservedReclaim` was already Drift-aware by design;              *)
+(* `WallClockReclaim` is the deliberate sabotage this suite exists to       *)
+(* catch. `rev6_observe.cfg` is now fully GREEN and EXHAUSTIVE -- the       *)
+(* matrix is trustworthy against this class BY AUDIT, not by luck.          *)
 (***************************************************************************)
 EXTENDS Integers, FiniteSets
 
@@ -69,7 +139,6 @@ CONSTANTS
     TTL,                  \* lease time-to-live added to clock at claim/renew
     SabForeignTakeover,   \* FALSE = honest; TRUE drops owner=a guard on an expired-mount claim
     SabEpochReset,        \* FALSE = honest; TRUE enables an action zeroing epoch when mount cleared
-    SabSupersededWrites,  \* FALSE = honest; TRUE drops the epoch-match conjunct from Write
     SabAdoptWedgeOnTouch, \* FALSE = honest; TRUE makes an adopt token-mismatch a PERMANENT wedge
     SabAdoptIgnoresFence, \* FALSE = honest; TRUE lets AdoptRead accept a fenced same-epoch body
     Drift,                \* max extra ticks the holder's TRUE local-fence expiry outlives the stamp
@@ -79,7 +148,7 @@ VARIABLES
     owner,        \* Actors \cup {None}; sticky once non-None
     epoch,        \* 0..MaxEpoch; durable monotone counter (its own object)
     mount,        \* None, or [uuid |-> Actor, epoch |-> Nat, deadline |-> Nat, fenced |-> BOOLEAN]
-    mtoken,       \* 0..MaxToken; bumped by EVERY mount write (claim/renew/fence/adopt)
+    mtoken,       \* 0..MaxToken; bumped by EVERY mount write (claim/renew/fence/adopt/reclaim)
     clock,        \* 0..MaxClock; abstract time
     localEpoch,   \* [Actors -> 0..MaxEpoch]; the epoch an actor last allocated for itself
     localLost,    \* [Actors -> BOOLEAN]; TRUE once the actor learned it was superseded/fenced --
@@ -208,16 +277,49 @@ AllocEpoch(a) ==
 \* must clear the mechanical "dead" fact along with the knowledge flag, or `witness_reclaim`
 \* / `witness_remountafterfence` (which require the SAME uuid to write again after
 \* recovering) would become permanently unable to `Write` post-crash.
+\* rev.6 round 8 (P4, STRICT-ORDER guard, consult/review-reconciled -- closes round-7's
+\* Finding A): `strictOK == localEpoch[a] >= epoch` (same `SabForeignTakeover /\ expired`
+\* bypass as `ownerOK`) gates the THREE claim-ESTABLISHING disjuncts -- fresh mint
+\* (`mount = None`), `fencedReclaim`, and `expired /\ ~sameEpoch` -- mirroring
+\* `CasStore.cpp:312-316`'s STRICT ORDER ("allocate durable writer_epoch -> claim the mount
+\* lease"): an actor only ever claims/mints/reclaims with the LATEST durable epoch it holds.
+\* `>=`, not `=`: `sab_epochreset`'s post-`SabResetEpoch` re-mint (`localEpoch[a]` unchanged,
+\* `epoch` zeroed) must still land to reach its own violation; `=` would wedge that cfg.
+\* `refreshOK` (the SAME-epoch continuation) is deliberately NOT strictOK-gated: with P1
+\* (below) installing the successor's body on every reclaim, `sameEpoch` (`mount.epoch =
+\* localEpoch[a]`) can only hold when `a`'s own body is still exactly what it last wrote,
+\* which already implies `localEpoch[a] = epoch` (no reclaim has landed since), making
+\* `strictOK` redundant there.
+\*
+\* rev.6 round 10 (bare-wall-clock audit, HOLDER-side, no `+ Drift` needed): `expired`
+\* (`mount.deadline <= clock`, bare wall-clock, deliberately NOT touched this round) looks
+\* like `GcFence`/`ClearExpiredMount`'s pattern but is NOT an observer-side death verdict on
+\* a DIFFERENT still-alive party -- in the honest protocol `ownerOK` forces `mount.uuid = a =
+\* owner` (sticky), so this is `a` examining its OWN prior record, exactly like `Renew`'s
+\* late-renewal (which has NO expiry guard at all). Whatever `expired` decides, `ClaimMount`
+\* always installs a FRESH `fenceUntil` for `a` itself (below), so there is no second party
+\* whose STILL-VALID fence a premature verdict could ignore -- unlike `GcFence`/
+\* `ClearExpiredMount`, which act on a mount whose TRUE holder may be a physically distinct,
+\* still-alive process with its own independent `fenceUntil`. (The ONE place `expired` lets a
+\* DIFFERENT actor take over -- the `SabForeignTakeover` bypass on `ownerOK`/`strictOK` -- is
+\* the deliberate, already-flagged SABOTAGE this task exists to catch via
+\* `ForeignUuidNeverAutoTakesOver`, not a hidden honest-path gap.) Separately, `expired /\
+\* ~sameEpoch /\ strictOK` (the one `canClaim` disjunct that reads `expired` at all) is
+\* REACHABILITY-VACUOUS in the honest protocol: `refreshOK` already covers same-epoch+unfenced
+\* regardless of `expired`, `fencedReclaim` already covers fenced+diff-epoch regardless of
+\* `expired`, and the only way to reach unfenced+diff-epoch is a completed reclaim that has
+\* already advanced `epoch` past `a`'s own `localEpoch[a]` -- which `strictOK` then blocks.
 ClaimMount(a) ==
     LET expired    == (mount # None) /\ (mount.deadline <= clock)
         ownExpired == expired /\ (mount.uuid = a)
         ownerOK    == IF SabForeignTakeover /\ expired THEN TRUE ELSE owner = a
+        strictOK   == IF SabForeignTakeover /\ expired THEN TRUE ELSE localEpoch[a] >= epoch
         sameEpoch  == (mount # None) /\ (mount.uuid = a) /\ (mount.epoch = localEpoch[a])
         refreshOK  == sameEpoch /\ (~mount.fenced \/ SabAdoptIgnoresFence)
         fencedReclaim == (mount # None) /\ (mount.uuid = a) /\ mount.fenced
                          /\ (mount.epoch # localEpoch[a])
-        canClaim   == (mount = None) \/ refreshOK \/ fencedReclaim
-                      \/ (expired /\ ~sameEpoch)
+        canClaim   == (mount = None /\ strictOK) \/ refreshOK \/ (fencedReclaim /\ strictOK)
+                      \/ (expired /\ ~sameEpoch /\ strictOK)
         wasFenced  == \E e \in 0..MaxEpoch : << a, e >> \in fencedEpochs
     IN
     /\ ~rejected[a] /\ ~wedged[a]
@@ -243,7 +345,14 @@ ClaimMount(a) ==
 \*   own live epoch, FENCED     -> the fence took the token; classify by BODY (fixed
 \*                                 protocol): fenced-by-gc -> schedule remount (localLost;
 \*                                 the actor re-allocates an epoch and reclaims). Never a wedge.
-\*   newer epoch on the slot    -> learn we were superseded.
+\*   newer epoch on the slot    -> learn we were superseded. rev.6 round 8: this is now the
+\*                                 SOLE mechanism blocking re-arm after a reclaim -- P1 (below)
+\*                                 installs the successor's new-epoch body, so `mount.epoch #
+\*                                 localEpoch[a]` here IS the reclaim (no `heldToken`
+\*                                 compensating field needed, round 7's mechanism deleted).
+\*                                 Models `renewOnce`'s cached-token CAS failing ->
+\*                                 `onRenewMismatch` classifying "superseded by a newer
+\*                                 incarnation" (`CasServerRoot.cpp:785-792`).
 Renew(a) ==
     /\ ~rejected[a] /\ ~wedged[a]
     /\ mount # None
@@ -266,10 +375,42 @@ Renew(a) ==
 \* The pool's GC fences an EXPIRED, unfenced mount (computeHeartbeatFloor's token-guarded
 \* fence-out): gc_fenced = true, uuid/epoch/deadline preserved, token bumped. The fence is
 \* an ENVIRONMENT action (any GC leader; identity irrelevant to this model).
+\*
+\* rev.6 round 9 (Drift-aware, per the design spec's own decision log): the design spec
+\* (`2026-07-13-cas-ref-lease-exclusivity-rev6-design.md`, decision #2) states plainly that
+\* "GC fence-out becomes observation-based, and a `gc_fenced` lease is then a transferable
+\* certificate of observed death" -- i.e. this model's `GcFence` is the gate for a Task 9
+\* C++ change (`computeHeartbeatFloor`), not an already-settled mechanism outside this
+\* task's scope. Round 8 exposed exactly why the bare wall-clock form (`mount.deadline <=
+\* clock`) was unsound: it let a fence land while the holder's TRUE local fence
+\* (`fenceUntil`, bounded by `mount.deadline + Drift` -- see `ClaimMount`/`Renew`/
+\* `AdoptWrite`'s `\E d \in 0..Drift : fenceUntil' = clock + TTL + d`) had NOT yet expired,
+\* a false alarm previously invisible only because `Write`'s old `~mount.fenced` conjunct
+\* (removed round 8, P2) blindly trusted every fence regardless of whether it was premature.
+\*
+\* The observation-based form reduces algebraically to a single wall-clock comparison here
+\* (no new observation-state machinery needed): "the stamp has been silent for the full
+\* rate-bound wait (`TTL + Drift`) on the GC's own clock" is exactly "the clock has now
+\* passed the holder's MAXIMUM POSSIBLE `fenceUntil`" -- both count `TTL + Drift` ticks
+\* forward from the same event (the write that set `mount.deadline`). So the guard becomes
+\* `mount.deadline + Drift <= clock`, i.e. `clock >= mount.deadline + Drift`.
+\*
+\* This makes `GcFence` and `Write` MUTUALLY EXCLUSIVE ON THIS MOUNT BY CONSTRUCTION, for
+\* every `Drift`, not merely at `Drift = 0` (round 8 only showed the Drift=0 case): every
+\* write to `mount.deadline` picks its companion `fenceUntil` as `clock'' + TTL + d` for
+\* SOME `d \in 0..Drift` at the SAME clock value that produced `mount.deadline = clock'' +
+\* TTL`, so `fenceUntil <= mount.deadline + Drift` always holds (the `d = Drift` case is the
+\* tight bound; TLC explores it). `GcFence`'s guard `mount.deadline + Drift <= clock` then
+\* directly implies `fenceUntil <= mount.deadline + Drift <= clock`, i.e. `clock >=
+\* fenceUntil` -- so `Write`'s `clock < fenceUntil` conjunct is false whenever `GcFence`
+\* could act. At `Drift = 0` this is byte-identical to the old guard (`d` ranges only over
+\* `{0}`, so `fenceUntil = mount.deadline` exactly, and `mount.deadline + 0 <= clock`
+\* reduces to `mount.deadline <= clock`) -- every legacy (`Drift = 0`) cfg's semantics are
+\* therefore completely unchanged (re-run and re-verified this round regardless).
 GcFence ==
     /\ mount # None
     /\ ~mount.fenced
-    /\ mount.deadline <= clock
+    /\ mount.deadline + Drift <= clock
     /\ mtoken < MaxToken
     /\ mount' = [mount EXCEPT !.fenced = TRUE]
     /\ mtoken' = mtoken + 1
@@ -282,6 +423,9 @@ GcFence ==
 \* AdoptRead: observe our own same-epoch slot and remember the token. The FIXED protocol
 \* refuses a FENCED body at read (a fence costs an epoch): classify fenced-by-gc ->
 \* schedule remount. SabAdoptIgnoresFence models the OLD read that skipped the check.
+\* rev.6 round 8: after a reclaim installs the successor body (P1), `mount.epoch #
+\* localEpoch[a]` here too, so this guard alone already keeps a superseded `a` from ever
+\* observing a token to adopt with -- no `heldToken` needed.
 AdoptRead(a) ==
     /\ ~rejected[a] /\ ~wedged[a]
     /\ adoptObs[a] = None
@@ -316,6 +460,24 @@ AdoptRead(a) ==
 \* because `state_mutex` serializes `claim()` against `renewOnce()` and the renewal thread
 \* does not exist until AFTER `claim()` returns, `CasStore.cpp:444-473` -- this action still
 \* encodes the target DESIGN semantics the comment above has always documented).
+\* rev.6 round 7 (review M1, stated explicitly): the `selfCaused` branch below is a
+\* PRODUCT-UNREACHABLE branch -- the product's actual behavior for this exact body pattern
+\* ("same uuid, same epoch, unfenced, yet the token moved") is a HARD, FAIL-CLOSED
+\* `LOGICAL_ERROR`, not a benign continue (`CasServerRoot.cpp:729-733`, "touched while
+\* adopting our own mount slot -- failing closed"; the analogous `:768-769` explicitly says
+\* "same (uuid, epoch) unfenced -- no plausible classification -- falls through to the
+\* base's generic throw"). That fail-closed response is INTENDED DESIGN (the product authors
+\* already considered this exact case), not a gap Tasks 3-8 should read as license to soften.
+\* This branch is strictly MORE PERMISSIVE than the product and is retained only because it
+\* is product-unreachable (round 4's `state_mutex` argument) and therefore can only suppress
+\* a false-positive model witness, never add a reachable unsafe state.
+\* rev.6 round 8: round 7's `heldToken` conjunct on the success branch is DELETED -- with P1
+\* installing the successor's body on every reclaim, a reclaim also changes `mount.epoch`,
+\* so `AdoptRead`'s OWN guard (`mount.epoch = localEpoch[a]`) already refuses to observe a
+\* token in that case, and this action's success branch reverts to the faithful CAS against
+\* the OBSERVED token alone (`mtoken = adoptObs[a]`, `CasServerRoot.cpp:711`) -- this also
+\* fixes round 7's Finding B: a plain `GcFence` token bump (unrelated to any reclaim) no
+\* longer spuriously blocks `sab_fenceresurrect`'s adopt.
 AdoptWrite(a) ==
     \* `mount # None` guards the record access below -- `ClearExpiredMount` can clear `mount`
     \* without touching `adoptObs` (a reachable state even pre-round-4), so a re-read CAN
@@ -370,38 +532,52 @@ Die(a) ==
                     lostThenWrote, reclaimed, remountedAfterFence,
                     fenceUntil, obsToken, obsSince, observedReclaimEver, supersededThenWrote >>
 
-\* A mutation under the mount. Honest guard requires a LIVE, OWN, current-epoch, unfenced
-\* mount. SabSupersededWrites drops the epoch-match conjunct so a superseded holder
-\* mutates. rev.6 (2026-07-14): every liveness/authority conjunct here is a MECHANICAL
-\* truth, never a knowledge/politeness one --
-\*   epochOK          : the live epoch-conditional-write check (mount.epoch = localEpoch[a])
-\*   clock < fenceUntil: the drift-aware TRUE local-fence-deadline check (never the stamp
-\*                       `mount.deadline` -- see model header)
-\*   ~crashed[a]       : the process is actually alive (a MECHANICAL fact set by `Die`)
-\* `~localLost[a]` is DELIBERATELY ABSENT: `localLost` is PURE KNOWLEDGE (what `a` has
-\* learned) and appears in NO safety guard anywhere in this model (round 3 audit, see
-\* the classification table in the task report) -- a dangerous wall-clock-reclaim is
-\* precisely a holder that does NOT know it was superseded (drifted clock still says the
-\* lease is fine) while GLOBAL truth already moved on; baking politeness into a guard
-\* would mask exactly that bug. `lostThenWrote`/`SupersededWriterMakesNoMutation` are
-\* KEPT, unchanged in meaning, as the dedicated regression guard for the UNRELATED
-\* `SabSupersededWrites` bug class (dropping the live epoch-match check) -- a distinct
-\* axis from drift/reclaim-timing and crash-liveness, deliberately proxied by knowledge.
+\* A mutation under the mount. rev.6 round 8 (P2, consult/review-reconciled): `Write` is now
+\* a PURE LOCAL check, matching the product's actual write path exactly --
+\* `Store::mayMutate`/`refAppendFenceOk` (`CasStore.cpp:201-226`) reads NO shared state at
+\* all: `!mount_fence.lost && bootMsNow() < deadline_boot_ms`, two LOCAL atomics, never a
+\* re-read of the mount object. So `mount # None`, `mount.uuid = a`, `epochOK`
+\* (`mount.epoch = localEpoch[a]`), and `~mount.fenced` are ALL removed as unfaithful --
+\* they modeled a per-write body check the product never performs. `owner = a` is KEPT as
+\* the identity anchor (not a body read: `owner` is the sticky, clock-free, constant
+\* identity object, a faithful proxy for the writer's own cached (uuid) -- without it a
+\* non-owner could write on the shared scalar `fenceUntil`; making `fenceUntil` per-actor
+\* instead is a bigger, deliberately out-of-scope refactor). `clock < fenceUntil` remains
+\* the SOLE mechanical liveness check -- the drift-aware TRUE local-fence-deadline, never
+\* the stamp (`mount.deadline`). `~crashed[a]` remains -- the process is actually alive (a
+\* MECHANICAL fact set by `Die`).
+\*
+\* `~localLost[a]` is DELIBERATELY ABSENT (unchanged since round 3): `localLost` is PURE
+\* KNOWLEDGE (what `a` has learned), and appears in NO safety guard anywhere in this model --
+\* a dangerous wall-clock-reclaim is precisely a holder that does NOT know it was superseded
+\* (drifted clock still says the lease is fine) while GLOBAL truth already moved on; baking
+\* politeness into a guard would mask exactly that bug. `lostThenWrote`/
+\* `SupersededWriterMakesNoMutation` are KEPT (round 8: still have live readers/checkers --
+\* see the task report's kept-vs-removed table) but are no longer a universally-green
+\* regression guard: with `~mount.fenced` gone, a `Write` CAN now fire with `localLost[a] =
+\* TRUE` if the local fence is still valid at that moment. In every honest cfg this cannot
+\* happen (`localLost` is only set on a fenced/different-epoch body or a moved adopt token,
+\* all of which coincide with the fence having already expired); it becomes reachable only in
+\* `_sab_wallclockreclaim.cfg` (the drift window keeps the fence valid past a reclaim), where
+\* `GlobalSupersededWriterMakesNoMutation` fires first at a shallower depth (the direct drift
+\* Write, no `Renew` needed) -- so `SupersededWriterMakesNoMutation` is dropped from THAT
+\* cfg's invariant list (round 8) rather than left to invite "why is this masked-green"
+\* confusion.
+\*
 \* `trulySuperseded`/`supersededThenWrote` are the GLOBAL-truth witness: `epoch` (the
 \* durable counter, a SEPARATE object from `mount`) has been advanced by a completed
 \* reclaim (`ObservedReclaim`/`WallClockReclaim`) past what `a` itself last allocated --
-\* independent of whether `a` ever learned about it.
+\* independent of whether `a` ever learned about it. `Write` is guarded on NO epoch/token/
+\* global-truth quantity mirroring this invariant -- honest-path safety is a REACHABILITY
+\* argument (the fence provably expired before a reclaim, and every continuation write's
+\* OWN body-check independently refuses to re-arm it), never a guard copying the invariant.
 Write(a) ==
-    LET epochOK == IF SabSupersededWrites THEN TRUE ELSE mount.epoch = localEpoch[a]
-        trulySuperseded == epoch > localEpoch[a]
+    LET trulySuperseded == epoch > localEpoch[a]
     IN
     /\ ~rejected[a] /\ ~wedged[a]
     /\ ~crashed[a]
-    /\ mount # None
-    /\ mount.uuid = a
+    /\ owner = a
     /\ clock < fenceUntil
-    /\ ~mount.fenced
-    /\ epochOK
     /\ wrote' = wrote \union {<< a, localEpoch[a] >>}
     /\ rootEmpty' = FALSE
     /\ lostThenWrote' = (lostThenWrote \/ localLost[a])
@@ -425,10 +601,23 @@ SabResetEpoch ==
 \* Clear an expired UNFENCED mount (lets SabResetEpoch fire; also a benign honest step).
 \* A fenced slot is never cleared: in the implementation mount objects persist, and the
 \* fenced body is exactly what lets a restart classify "my old incarnation was fenced".
+\*
+\* rev.6 round 10 (Drift-aware, per decision #2's PRINCIPLE, not a specific named product
+\* function): this is an OBSERVER-side action -- some other party (GC, or a fresh incarnation
+\* discovering a stale record) declaring the CURRENT mount dead by time, exactly like
+\* `GcFence`. Decision #2's principle is not specific to the fence-out flavor: "GC fence-out
+\* becomes observation-based" is one instance of the general rule that ANY observer-side
+\* death verdict -- fence it, clear it, reclaim it -- must clear the full rate-bound
+\* observation threshold (`TTL + Drift`) before concluding the record is truly dead; clearing
+\* an expired mount record is GC bookkeeping on a mount already presumed dead, and follows the
+\* SAME rule `GcFence` does. Guard changed from `mount.deadline <= clock` to `mount.deadline +
+\* Drift <= clock` -- IDENTICAL mutual-exclusion-with-`Write` proof as `GcFence`'s (see that
+\* action's comment), byte-identical to the old guard at `Drift = 0`. Still lets
+\* `SabResetEpoch` fire once the clear lands (unchanged).
 ClearExpiredMount ==
     /\ mount # None
     /\ ~mount.fenced
-    /\ mount.deadline <= clock
+    /\ mount.deadline + Drift <= clock
     /\ mount' = None
     /\ UNCHANGED << owner, epoch, mtoken, clock, localEpoch, localLost, crashed, rejected,
                     adoptObs, fencedEpochs, wedged, wrote, rootEmpty, firstOwner,
@@ -450,34 +639,49 @@ StartObservation ==
                     lostThenWrote, reclaimed, remountedAfterFence, fenceUntil,
                     observedReclaimEver, supersededThenWrote >>
 
-\* ObservedReclaim: the FIXED protocol. Reclaim only once the token has held stable for
-\* the FULL rate-bound wait (TTL + Drift) on the reclaimer's OWN clock -- this provably
-\* guarantees clock >= fenceUntil (the holder's true fence already expired), because the
-\* holder's last renewal/claim producing this token happened at or before obsSince, and
-\* that renewal's fenceUntil is bounded by (that renewal's clock) + TTL + Drift <=
-\* obsSince + TTL + Drift <= clock.
+\* ObservedReclaim: the FIXED protocol -- the SUCCESSOR reclaim (epoch-advancing), NOT the
+\* GC fence-out (`GcFence`, non-epoch-advancing, `gc_fenced=TRUE`, uuid/epoch preserved).
+\* These are two DISTINCT product mechanisms (spec S:unclean-takeover vs S:gc-fence-out):
+\* only the successor form ever advances the durable epoch.
 \*
-\* rev.6 round 2: this bumps ONLY the durable `epoch` counter -- GLOBAL truth that a new
-\* epoch is now authoritative, exactly like `AllocEpoch` but performed by the reclaimer
-\* rather than the (unknowing) prior holder. It deliberately does NOT rewrite `mount`
-\* (that would be a SEPARATE, later write -- the model header already documents `epoch`
-\* as living in its own object, not the mount) and does NOT touch `localLost` -- setting
-\* `localLost` here would be modeling "the reclaimer's belief becomes the holder's
-\* knowledge" for free, which is exactly the politeness-implies-safety conflation this
-\* round removes. Because a full stability wait was paid, `clock >= fenceUntil` already
-\* holds by the time this can fire (see the proof above), so `Write` is independently,
-\* mechanically blocked for the old holder from this point on -- no reliance on
-\* `localLost`/`mount.epoch` needed for THIS path to stay safe.
+\* Reclaim only once the token has held stable for the FULL rate-bound wait (TTL + Drift)
+\* on the reclaimer's OWN clock -- this provably guarantees clock >= fenceUntil (the
+\* holder's true fence already expired), because the holder's last renewal/claim producing
+\* this token happened at or before obsSince, and that renewal's fenceUntil is bounded by
+\* (that renewal's clock) + TTL + Drift <= obsSince + TTL + Drift <= clock.
+\*
+\* rev.6 round 8 (P1, consult/review-reconciled -- FIXES review C1, replaces round-7's
+\* `heldToken` compensating field): INSTALLS THE SUCCESSOR'S BODY, exactly like the real
+\* token-guarded `putOverwrite` reclaim (`CasServerRoot.cpp:405-414`: same uuid, the
+\* successor's freshly-allocated `writer_epoch`, `gc_fenced=false`, fresh `expires_at_ms`,
+\* fresh token). `mount.uuid` stays `owner` (only the sticky owner ever legitimately holds
+\* this slot); `mount.epoch` becomes the JUST-bumped `epoch'` (GLOBAL truth, a separate
+\* object from `mount` per the model header, but now ALSO reflected in the body, faithfully);
+\* `deadline` and `fenced` are fresh/unfenced, matching a genuine new incarnation. Does NOT
+\* touch `localLost` -- setting `localLost` here would be modeling "the reclaimer's belief
+\* becomes the holder's knowledge" for free, exactly the politeness-implies-safety
+\* conflation round 2 removed. Does NOT touch `fenceUntil` -- that is the PREDECESSOR's own
+\* local fence, which a reclaimer cannot reach or reset.
+\*
+\* With the body now faithful, EVERY continuation-arm action's PRE-EXISTING body
+\* classification (present since round 0/P3.1, untouched by this round) independently
+\* refuses to re-arm the predecessor: `Renew`'s different-epoch branch (`mount.epoch #
+\* localEpoch[a]`); `AdoptRead`'s guard (same comparison, so no token is ever observed to
+\* adopt with); `ClaimMount`'s `refreshOK` (`sameEpoch` false). No compensating field
+\* needed -- this is why `heldToken` (round 7) is deleted in this round.
 ObservedReclaim ==
     /\ ~SabWallClockReclaim
     /\ mount # None
     /\ obsToken # None /\ obsToken = mtoken            \* token stable since obsSince
     /\ clock - obsSince >= TTL + Drift                 \* full rate-bound wait on OUR clock
     /\ epoch < MaxEpoch
+    /\ mtoken < MaxToken
     /\ epoch' = epoch + 1
+    /\ mtoken' = mtoken + 1
+    /\ mount' = [uuid |-> mount.uuid, epoch |-> epoch', deadline |-> clock + TTL, fenced |-> FALSE]
     /\ obsToken' = None
     /\ observedReclaimEver' = TRUE
-    /\ UNCHANGED << owner, mount, mtoken, clock, localEpoch, localLost, crashed, rejected,
+    /\ UNCHANGED << owner, clock, localEpoch, localLost, crashed, rejected,
                     adoptObs, fencedEpochs, wedged, wrote, rootEmpty, firstOwner, lostThenWrote,
                     reclaimed, remountedAfterFence, fenceUntil, obsSince, supersededThenWrote >>
 
@@ -485,16 +689,30 @@ ObservedReclaim ==
 \* with NO observation wait at all -- exactly the old cross-node wall-clock comparison
 \* the rev.6 design replaces. When Drift > 0 the true holder may still be safely inside
 \* its own fenceUntil at this clock value, so this can fire strictly earlier than
-\* ObservedReclaim ever could -- and, just like ObservedReclaim, it only advances the
-\* durable `epoch` (GLOBAL truth), never `localLost` (the old holder's KNOWLEDGE): the
-\* whole point of the sabotage is a reclaimer that is wrong to believe the holder is
-\* dead, so the old holder correctly does NOT learn anything here.
+\* ObservedReclaim ever could -- and, just like ObservedReclaim (round 8: same body-install,
+\* P1), it installs the successor body (epoch-advancing, fresh unfenced deadline) and never
+\* touches `localLost` (the old holder's KNOWLEDGE): the whole point of the sabotage is a
+\* reclaimer that is wrong to believe the holder is dead, so the old holder correctly does
+\* NOT learn anything here.
+\*
+\* THE LOAD-BEARING ASYMMETRY: installing the successor body does NOT block the sabotage's
+\* own violation. `Write` (round 8, P2) no longer reads `mount` AT ALL -- its only
+\* mechanical liveness check is `clock < fenceUntil`, the PREDECESSOR's own local fence,
+\* which this reclaim cannot touch or reset. The old holder's next `Write` fires on its
+\* STILL-VALID existing fence (`clock < fenceUntil` true because `Drift` bought a tick) --
+\* completely independent of what body the reclaim just installed. The asymmetry between
+\* the honest and sabotage paths therefore lives ENTIRELY in the reclaim's PRECONDITION
+\* (full `TTL + Drift` observation wait vs. trusting the stamp), never in what the reclaim
+\* writes to the body -- both write the identical kind of body.
 WallClockReclaim ==
     /\ SabWallClockReclaim
     /\ mount # None /\ clock > mount.deadline
     /\ epoch < MaxEpoch
+    /\ mtoken < MaxToken
     /\ epoch' = epoch + 1
-    /\ UNCHANGED << owner, mount, mtoken, clock, localEpoch, localLost, crashed, rejected,
+    /\ mtoken' = mtoken + 1
+    /\ mount' = [uuid |-> mount.uuid, epoch |-> epoch', deadline |-> clock + TTL, fenced |-> FALSE]
+    /\ UNCHANGED << owner, clock, localEpoch, localLost, crashed, rejected,
                     adoptObs, fencedEpochs, wedged, wrote, rootEmpty, firstOwner, lostThenWrote,
                     reclaimed, remountedAfterFence, fenceUntil, obsToken, obsSince,
                     observedReclaimEver, supersededThenWrote >>
@@ -567,10 +785,23 @@ WriterEpochMonotoneUnique ==
 
 \* A writer that has locally LEARNED it was superseded/fenced (KNOWLEDGE, via
 \* Renew/AdoptRead/Die noticing a mismatch or a crash) never enters a NEW mutation.
-\* This is the regression guard for the UNRELATED `SabSupersededWrites` bug class
-\* (dropping the live epoch-match check on `Write`) -- a distinct axis from
-\* drift/reclaim-timing, deliberately left proxied by local knowledge. See
-\* `GlobalSupersededWriterMakesNoMutation` for the rev.6 GLOBAL-truth counterpart.
+\* See `GlobalSupersededWriterMakesNoMutation` for the rev.6 GLOBAL-truth counterpart.
+\*
+\* rev.6 round 8 (P2-full, consult/review-reconciled): `SabSupersededWrites` (the sabotage
+\* flag this invariant used to be paired against) is RETIRED -- with `epochOK` removed from
+\* `Write` by construction (not conditionally), the flag has nothing left to toggle; its bug
+\* class ("a superseded holder mutates because the epoch-match check was dropped") models a
+\* per-write check the product's write path never performs (`CasStore.cpp:201-205`). This
+\* invariant and its `localLost`/`lostThenWrote` machinery are KEPT -- they still have live
+\* readers (`Write` still computes `lostThenWrote'`, and this invariant is still checked in
+\* most cfgs) -- see the task report's round-8 kept-vs-removed table for the full audit. It
+\* is NOT a universally-green regression guard any more, though: `Write` no longer checks
+\* `~mount.fenced`, so a `Write` CAN fire with `localLost[a] = TRUE` if the local fence is
+\* still valid at that moment. This is unreachable in every honest cfg (localLost only gets
+\* set once the fence has already expired) and reachable-but-masked in
+\* `_sab_wallclockreclaim.cfg` (dropped from that cfg's invariant list, round 8, to avoid
+\* "why is this green" confusion -- `GlobalSupersededWriterMakesNoMutation` fires first
+\* there at a shallower depth regardless).
 SupersededWriterMakesNoMutation ==
     ~lostThenWrote
 
@@ -580,7 +811,9 @@ SupersededWriterMakesNoMutation ==
 \* is knowledge, not a safety fact; see `Write`'s header comment). `SabWallClockReclaim`
 \* must violate this: a wall-clock-trusting reclaim can complete strictly before the
 \* true holder's `fenceUntil` expires, so the holder's next mechanically-valid `Write`
-\* lands after global truth already superseded it.
+\* lands after global truth already superseded it. Round 8: this is now THE regression
+\* guard for reclaim-body faithfulness -- `_rev6_observe.cfg`'s GREEN under this invariant
+\* (with `ObservedReclaim` enabled) supersedes the retired `_sab_supersededwrites` canary.
 GlobalSupersededWriterMakesNoMutation ==
     ~supersededThenWrote
 
@@ -612,4 +845,19 @@ W_RemountAfterFence ==
 \* the "wait for full token stability" recovery path is not vacuous.
 W_ObservedReclaim ==
     ~observedReclaimEver
+
+\* rev.6 round 7 (consult point 5, anti-wedge/anti-dead-end check): the re-arm block after
+\* an `ObservedReclaim` (round 8: the faithful successor-body install + the PRE-EXISTING body
+\* classification in `Renew`/`ClaimMount`/`AdoptRead` -- no `heldToken` any more) must NOT
+\* wedge the superseded incarnation's uuid forever -- the legitimate recovery loop (`GcFence`
+\* on the now-stale, still-unfenced successor body -> `AllocEpoch` fresh epoch, now allowed
+\* since `mount.fenced` -> `ClaimMount`'s `fencedReclaim` branch, `strictOK` satisfied since
+\* `localEpoch[a]` now equals the fresh `epoch` -> `Write`, not superseded) must still
+\* complete for the SAME actor `ObservedReclaim` fired against. Combining the two existing
+\* witnesses is exactly this claim: `observedReclaimEver` (the reclaim fired) together with
+\* some actor's `remountedAfterFence` (a full fence -> realloc -> reclaim cycle completed)
+\* proves honest-path safety is not "safe by permanent dead-end" -- the recovered
+\* incarnation writes again.
+W_RecoveryAfterObservedReclaim ==
+    ~(observedReclaimEver /\ (\E a \in Actors : remountedAfterFence[a]))
 =============================================================================

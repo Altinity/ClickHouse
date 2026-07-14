@@ -259,20 +259,37 @@ is the regression guard for the `CoveredFold` fix (proven falsifiable — it was
 
 ### Task 2: TLA+ gate — mount model observation-based reclaim {#task-2}
 
-(amended 2026-07-14, six rounds: `notLostOK` made the target violation unreachable (round 1);
+(amended 2026-07-14, TEN rounds: `notLostOK` made the target violation unreachable (round 1);
 mechanical-vs-knowledge split + `GlobalSupersededWriterMakesNoMutation` (round 2); `crashed[a]`, physics
 vs politeness (round 3); product-verified `AdoptWrite` body-check (round 4); systematic ordering sweep +
 corrected `AllocEpoch` guard (round 5); `_sab_supersededwrites` reframed as a regression canary (round
-6). See the amendment note after Step 4 below for the full account — do not re-derive the "expected
-VIOLATION of `SupersededWriterMakesNoMutation`" framing below at face value for `_sab_wallclockreclaim`,
-it was superseded by the global-truth witness, and do not re-derive `_sab_supersededwrites`'s framing
-either, it is now a canary, not a sabotage demo.)
+6); a `heldToken` token-chain fix for review C1 surfaced two further re-arm/collateral findings (round
+7); the reconciled package — reclaims install the successor's BODY, `Write` becomes pure-local,
+`heldToken` deleted, `ClaimMount` strict-order guard — fixed round 7's findings and RETIRED
+`_sab_supersededwrites`/`SabSupersededWrites` (the canary's whole mechanism became inert), but surfaced
+that `GcFence` was never made Drift-aware (round 8); `GcFence` fixed, which unmasked that
+`ClearExpiredMount` had the identical bare-wall-clock defect (round 9); `ClearExpiredMount` fixed + a
+full audit of every clock comparison in the model confirmed no further observer-side gap (round 10) —
+**the matrix is now 11 cfgs, all correct, `_rev6_observe` is FULLY GREEN AND EXHAUSTIVE.** See the
+amendment notes after Step 4 below for the full account — do not re-derive the "expected VIOLATION of
+`SupersededWriterMakesNoMutation`" framing below at face value for `_sab_wallclockreclaim` (dropped from
+its invariant list, round 8), do not look for `_sab_supersededwrites.cfg` (retired, round 8), and do not
+assume `_rev6_observe`'s expected verdict is merely "`W_ObservedReclaim` reachable, safety unverified
+beyond that point" (round 6-era framing) — it is now fully GREEN across all 7 safety invariants,
+exhaustively.)
 
-**Files:**
+**Files (final, post round-10):**
 - Modify: `docs/superpowers/models/CaCasMountCore.tla`
-- Create: `docs/superpowers/models/CaCasMountCore_rev6_observe.cfg`
+- Create: `docs/superpowers/models/CaCasMountCore_rev6_observe.cfg` (now the fully-GREEN reclaim-faithfulness
+  regression detector — see round-8/10 amendments)
 - Create: `docs/superpowers/models/CaCasMountCore_sab_wallclockreclaim.cfg`
-- Modify (amendment): `docs/superpowers/models/CaCasMountCore_sab_supersededwrites.cfg` (canary reframe)
+- Create (round 7): `docs/superpowers/models/CaCasMountCore_witness_observedreclaim.cfg`,
+  `CaCasMountCore_witness_recoveryafterobservedreclaim.cfg` (split out of `_rev6_observe.cfg` — a
+  monotone witness invariant sharing a cfg with the safety invariants it structurally pre-empts is a
+  gate defect, since TLC halts at the FIRST violated invariant)
+- **Deleted (round 8):** `docs/superpowers/models/CaCasMountCore_sab_supersededwrites.cfg` — the
+  round-6 canary reframe's whole sabotage mechanism became inert once round 8's `ClaimMount` strict-order
+  guard landed; retired rather than kept as a vacuous canary (see round-8 amendment)
 
 **Interfaces:**
 - Consumes: existing vars (`owner, epoch, mount, mtoken, clock, ...`), invariants
@@ -503,8 +520,8 @@ canary**: if it ever goes RED, an epoch-divergence path has re-opened in the mod
 ordering guard regressed) — investigate before trusting the rest of the matrix. Do not manufacture a new
 adversary mechanism to force it red again, and do not retire it.
 
-**Final full-matrix result, mechanism-verified on the final model text (all 10 official cfgs):**
-`_stage1` green (exhaustive); `_sab_foreigntakeover` → `ForeignUuidNeverAutoTakesOver`;
+**Final full-matrix result at round 6 (10 official cfgs, now SUPERSEDED — see the round 7-10 amendment
+below):** `_stage1` green (exhaustive); `_sab_foreigntakeover` → `ForeignUuidNeverAutoTakesOver`;
 `_sab_epochreset` → `WriterEpochMonotoneUnique`; `_sab_supersededwrites` → **green (canary)**, identical
 state count to `_stage1`; `_sab_adoptwedge` → `NoPermanentWedge`; `_sab_fenceresurrect` →
 `FenceCostsEpoch`; `_witness_reclaim` → `W_SameUuidReclaimsExpired`; `_witness_remountafterfence` →
@@ -513,6 +530,128 @@ point); `_sab_wallclockreclaim` → `GlobalSupersededWriterMakesNoMutation` (the
 claims with `fenceUntil = clock + TTL + Drift`; a wall-clock-trusting reclaimer fires one tick before the
 true fence expires, advancing global truth; the holder's next write is still mechanically legitimate by
 its own local clock and lands after the reclaim — exactly the story this whole task exists to catch).
+
+#### Amendment 2 (2026-07-14, rounds 7-10): body-faithful reclaim, pure-local `Write`, and closing the observer-side wall-clock class {#task-2-amendment-2}
+
+Round 6 left `_rev6_observe`'s expectation at "`W_ObservedReclaim` reachable, safety invariants hold up
+to that point" — a witness-masked cfg, not an actual proof that `ObservedReclaim` preserves safety past
+the reclaim. Making that cfg an honest, fully-checked GREEN took four more rounds, each one following
+the same discipline as rounds 1-6: implement exactly what was adjudicated, run the FULL cfg matrix (not
+just the cfgs named), and if ANY cfg deviates from its expected verdict — STOP and report with a full
+trace, never invent a fix unilaterally. Full blow-by-blow (every trace, every probe, every candidate
+considered) is in `.superpowers/sdd/rev6-task-2-report.md`; this amendment records the final story.
+
+**Round 7 — the token-chain fix, and two new findings.** An independent review flagged Critical C1: the
+model's reclaim (`ObservedReclaim`/`WallClockReclaim`) bumped only the durable `epoch` counter,
+deliberately leaving `mount` untouched (round 2's choice, to avoid masking the drift bug) — but this made
+`_rev6_observe`'s honest-path post-reclaim exploration structurally unable to show the OLD holder's
+continuation actions (`Renew`, `ClaimMount`-refresh, `AdoptRead`/`AdoptWrite`) correctly refuse to re-arm,
+because none of those actions' body-checks could see anything had changed. A design consult (working
+independently, reaching the same diagnosis) recommended a compensating `heldToken` token-chain field,
+threaded through `Renew`, `ClaimMount`'s `refreshOK`, and `AdoptWrite`'s success condition. Implemented
+verbatim — and the full matrix surfaced two further findings from the SAME root cause (a body-invisible
+reclaim needing ad hoc compensation): **Finding A**, a fourth re-arm path via `ClearExpiredMount` +
+ungated fresh-mint that no prior round's guard blocked; **Finding B**, the new `heldToken` conjunct on
+`AdoptWrite` collaterally blocked `_sab_fenceresurrect.cfg`'s intended violation (a plain `GcFence` token
+bump, unrelated to any reclaim, spuriously tripped the new check).
+
+**Round 8 — the reconciled package: reclaims install the successor's BODY.** Two independent follow-up
+passes (a design consult, and the same reviewer working separately) converged on the same deeper
+diagnosis: the model's reclaim was body-invisible while the product's real reclaim
+(`CasServerRoot.cpp:405-414`) is a token-guarded `putOverwrite` that installs the SUCCESSOR's fresh-epoch,
+unfenced body. Fix the body, and the model's PRE-EXISTING body classification (present since round 0/P3.1
+in `Renew`/`ClaimMount`/`AdoptRead`) does the re-arm-blocking work for free — no compensating field
+needed. Implemented the reconciled package (P1-P4):
+- **P1**: `ObservedReclaim`/`WallClockReclaim` install `mount' = [uuid |-> mount.uuid, epoch |-> epoch',
+  deadline |-> clock + TTL, fenced |-> FALSE]` on top of the epoch/mtoken bump.
+- **P2 (full)**: `Write` becomes a PURE LOCAL check — `~rejected /\ ~wedged /\ ~crashed[a] /\ owner = a
+  /\ clock < fenceUntil` — matching the product's real `Store::mayMutate`/`refAppendFenceOk`
+  (`CasStore.cpp:201-226`, which reads no shared state at all); `mount # None`, `mount.uuid = a`,
+  `epochOK`, `~mount.fenced` all removed as unfaithful per-write body reads the product never performs.
+  `owner = a` kept as the identity anchor (a clock-free, constant proxy for the writer's cached identity).
+- **P3**: `heldToken` (round 7) deleted entirely — no longer needed once P1 makes the body itself the
+  re-arm signal.
+- **P4**: `ClaimMount` gains `strictOK == localEpoch[a] >= epoch` on its THREE claim-establishing
+  disjuncts (fresh mint, `fencedReclaim`, `expired /\ ~sameEpoch`), mirroring `CasStore.cpp:312-316`'s
+  STRICT ORDER — this closes Finding A.
+- **Retired**: `SabSupersededWrites` (the constant) and `_sab_supersededwrites.cfg` (the round-6 canary)
+  — with `epochOK` gone from `Write` by construction, the flag has nothing left to toggle; deleting it
+  (rather than leaving a permanently-vacuous canary in the runner) was the team lead's explicit call.
+  `SupersededWriterMakesNoMutation`/`localLost`/`lostThenWrote` are KEPT (still live readers — see the
+  task report's round-8 kept-vs-removed table) but dropped from `_sab_wallclockreclaim.cfg`'s invariant
+  list (a faithful reclaim body means a `Renew`-then-`Write` drift path COULD trip it there, but only
+  behind the shallower `GlobalSupersededWriterMakesNoMutation` violation TLC always finds first — kept
+  there would invite "why is this green" confusion).
+
+This closed Finding A and Finding B, and preserved the load-bearing drift asymmetry
+(`_sab_wallclockreclaim` still correctly violates `GlobalSupersededWriterMakesNoMutation`, since P2's
+pure-local `Write` never reads the reclaim's newly-installed body at all — only the reclaim's
+PRECONDITION differs between the honest and sabotage forms, never what it writes). But the full matrix
+surfaced a **third finding**: `_rev6_observe.cfg` was STILL RED on `SupersededWriterMakesNoMutation`, via
+`GcFence` — a PRE-EXISTING, round-0/P3.1 action never updated for rev.6, using a bare wall-clock check
+(`mount.deadline <= clock`) that could fence a mount WHILE the true holder's `fenceUntil` (which includes
+`Drift`) had not yet expired. Previously invisible because `Write`'s old `~mount.fenced` conjunct
+(removed by P2) blocked any write once fenced regardless of cause; P2's faithfulness unmasked it. The
+design spec's own Decision Log had already called for this ("GC fence-out becomes observation-based,
+and a `gc_fenced` lease is then a transferable certificate of observed death") — a genuine scope gap in
+the ORIGINAL Task 2 brief (which only covered the reclaim side), not an error in round 8's work.
+
+**Round 9 — `GcFence` made Drift-aware; a second, deeper gap surfaces.** Adjudicated as the MINIMAL
+reduction (no new observation-state machinery): the observation threshold "stamp silent for `TTL +
+Drift` on the GC's own clock" reduces algebraically to "the clock has passed the holder's MAXIMUM
+possible `fenceUntil`", so `GcFence`'s guard became `mount.deadline + Drift <= clock`. This makes
+`GcFence` and `Write` mutually exclusive on the same mount BY CONSTRUCTION for every `Drift` (proof in
+the model text, `CaCasMountCore.tla`'s `GcFence` comment) — byte-identical to the old guard at `Drift =
+0`, empirically confirmed (`_stage1.cfg`'s state counts matched round 8's exactly, both runs). Fixing
+`GcFence` closed that path — but TLC then found a FOURTH, previously-masked violation through
+`ClearExpiredMount`, a separate, also pre-existing action with the IDENTICAL unsound pattern (bare
+`mount.deadline <= clock`, feeding `AdoptWrite`'s "vanished while adopting" fallback into a false
+`localLost` trip). TLC's first-violation-only behavior had hidden this the whole time — `GcFence`'s
+violation was always shallower and found first.
+
+**Round 10 — `ClearExpiredMount` fixed, and the class closed by audit, not by luck.** Adjudicated:
+decision #2's principle is not specific to the fence-out flavor — ANY observer-side death verdict on a
+mount (fence it, clear it, reclaim it) must clear the same `TTL + Drift` observation threshold before
+concluding the record is dead. `ClearExpiredMount`'s guard became `mount.deadline + Drift <= clock`
+(identical proof, identical `Drift = 0` byte-identical property), with its comment explicitly
+principle-cited rather than function-cited (unlike `GcFence`/`computeHeartbeatFloor`, no single named
+product function maps to `ClearExpiredMount` — it is GC bookkeeping on an already-presumed-dead record).
+A full audit then classified EVERY clock comparison in the model as HOLDER-side (uses its own
+`fenceUntil`, legitimately local) or OBSERVER-side (declares a possibly-different, still-alive party
+dead — must be Drift-aware):
+
+| Site | Classification | Verdict |
+|---|---|---|
+| `Write`'s `clock < fenceUntil` | HOLDER-side | the writer's own ground truth — correct as is |
+| `GcFence`'s `mount.deadline + Drift <= clock` | OBSERVER-side | Drift-aware (round 9) |
+| `ClearExpiredMount`'s `mount.deadline + Drift <= clock` | OBSERVER-side | Drift-aware (round 10) |
+| `ObservedReclaim`'s `clock - obsSince >= TTL + Drift` | OBSERVER-side | already Drift-aware by design (the reference form) |
+| `WallClockReclaim`'s `clock > mount.deadline` | OBSERVER-side | the DELIBERATE sabotage this suite exists to catch (`SabWallClockReclaim`-gated, never TRUE honestly) — not "fixed" |
+| `ClaimMount`'s `expired` (`mount.deadline <= clock`) | HOLDER-side | in the honest protocol `ownerOK` forces `mount.uuid = a = owner` (sticky) — `a` examining its OWN record, always installs a FRESH `fenceUntil` for itself regardless of the verdict, so no second party's stale fence is ever ignored; the one place a DIFFERENT actor could take over on this check (`SabForeignTakeover`'s bypass) is the deliberate sabotage `ForeignUuidNeverAutoTakesOver` exists to catch. Also separately reachability-vacuous in honest mode (see the model's own comment on `ClaimMount`) |
+| `Tick`'s `clock < MaxClock` | n/a | pure TLC finiteness bound, not a death declaration |
+
+Exactly two observer-side bare wall-clock sites existed (`GcFence`, `ClearExpiredMount`); both are now
+Drift-aware; no third was found. `_rev6_observe.cfg` is now **fully GREEN and EXHAUSTIVE**:
+2,020,927,571 states generated, 256,398,167 distinct states found, 0 states left on queue (~4m57s wall
+time) — the matrix is trustworthy against this class by audit, not by luck.
+
+**Final full-matrix result (11 cfgs, all correct, mechanism-verified on the final model text):**
+`_stage1` green, exhaustive (12,877,827 states / 2,826,549 distinct / 0 left on queue — IDENTICAL at
+`Drift = 0` across rounds 9 and 10, confirming both Drift-aware guards are byte-identical to their old
+forms there); `_sab_foreigntakeover` → `ForeignUuidNeverAutoTakesOver`; `_sab_epochreset` →
+`WriterEpochMonotoneUnique`; `_sab_adoptwedge` → `NoPermanentWedge`; `_sab_fenceresurrect` →
+`FenceCostsEpoch` (via `ClaimMount`'s `refreshOK` bypass under `SabAdoptIgnoresFence` — the SHORTEST
+counterexample TLC's breadth-first search reports; earlier rounds' reports mischaracterized this
+mechanism as routing through `AdoptWrite`, corrected in the round-10 report); `_witness_reclaim` →
+`W_SameUuidReclaimsExpired`; `_witness_remountafterfence` → `W_RemountAfterFence`; `_rev6_observe` →
+**fully GREEN, exhaustive, all 7 invariants** (`TypeOK`, `NoTwoServerUuidsOwnSameServerRoot`,
+`ForeignUuidNeverAutoTakesOver`, `WriterEpochMonotoneUnique`, `SupersededWriterMakesNoMutation`,
+`GlobalSupersededWriterMakesNoMutation`, `FenceCostsEpoch`, `NoPermanentWedge`);
+`_witness_observedreclaim` → `W_ObservedReclaim`; `_witness_recoveryafterobservedreclaim` →
+`W_RecoveryAfterObservedReclaim` (the anti-wedge/anti-dead-end check — a reclaimed incarnation's
+legitimate recovery loop still completes); `_sab_wallclockreclaim` →
+`GlobalSupersededWriterMakesNoMutation` (mechanism re-confirmed: routes through `WallClockReclaim` →
+`Write` directly, no `GcFence`/`ClearExpiredMount` step in the trace).
 
 ---
 
@@ -1105,6 +1244,17 @@ git commit -m "cas: recovery seal — epoch-closing snapshot published before a 
 ---
 
 ### Task 9: Observation-based GC fence-out {#task-9}
+
+**Carry-forward from Task 2 (rounds 9-10, 2026-07-14):** the mount model's `GcFence` AND
+`ClearExpiredMount` are already observation-based (`mount.deadline + Drift <= clock`) in
+`docs/superpowers/models/CaCasMountCore.tla` — `_rev6_observe.cfg` is fully GREEN and exhaustive against
+both. That model is the safety GATE this task implements in C++: `computeHeartbeatFloor`'s
+`stable_threshold_ms` wait below is the product-side realization of the SAME principle for the
+fence-out flavor specifically; do not regress the model back to a bare wall-clock `GcFence` while
+working this task, and if this task's C++ change reveals the product needs an analogous fix for
+whatever `ClearExpiredMount` abstracts (GC bookkeeping that clears/forgets an already-presumed-dead
+mount record, not tied to one single named function — see the Task 2 round-10 amendment), treat that as
+in-scope here too, not a new task.
 
 **Files:**
 - Modify: `Core/CasServerRoot.h` (`computeHeartbeatFloor` decl `:251-252`, `HeartbeatFloor`
