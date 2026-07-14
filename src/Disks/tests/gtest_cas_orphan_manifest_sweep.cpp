@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEvent.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcCursorKey.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasOrphanManifestSweep.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include "cas_test_helpers.h"
@@ -187,32 +188,90 @@ TEST(CasOrphanManifestSweep, CursorPageSkipsOwnedBody)
 TEST(CasSweepLateLog, LogBetweenSealedFromAndSealIdIsReportedNotRevived)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
-    registerNamespaceRaw(*backend, store->layout(), ns);
+    const Layout layout("p");   // matches openStoreForTest's PoolConfig.pool_prefix
+    registerNamespaceRaw(*backend, layout, ns);
 
     /// A recovery seal: snapshot_id = {2, UINT64_MAX} (the epoch-closing upper bound recovery for
     /// writer_epoch 3 publishes to close dead epoch 2), sealed_from = {2, 3} (the greatest id that
     /// recovery's LIST actually observed).
     RefTableSnapshot seal = minimalLiveSnapshot(ns.string(), RefTxnId{2, std::numeric_limits<uint64_t>::max()});
     seal.sealed_from = RefTxnId{2, 3};
-    writeRefSnapshotRaw(*backend, store->layout(), seal);
+    writeRefSnapshotRaw(*backend, layout, seal);
 
     /// A late log at {2, 7}: sealed_from (3) < 7 <= snapshot_id (UINT64_MAX) -- provably late.
-    writeRefLogTxnRaw(*backend, store->layout(), RefLogTxn{ns.string(), RefTxnId{2, 7}, {}});
+    const RefTxnId late_log_id{2, 7};
+    writeRefLogTxnRaw(*backend, layout, RefLogTxn{ns.string(), late_log_id, {}});
 
-    setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, /*min_active*/6);   // prefix eligible
+    setWatermarkMinActive(*backend, layout, kServerRoot, kWriterEpoch, /*min_active*/6);   // prefix eligible
+
+    /// Seed a fold-seal/gc-state fixture so `sealedRefCursor` (CasOrphanManifestSweep.cpp) sits AT
+    /// the late log's id. This isolates the no-GET assertion below from the pre-existing, UNRELATED
+    /// tail-removal-protection loop in `activeManifestKeys`, which GETs any log ABOVE the fold cursor
+    /// for orphan-manifest protection regardless of lateness -- with no such fixture that loop would
+    /// legitimately GET this exact log (a confound, not a detector bug). With the cursor at {2,7},
+    /// `!(cursor < id)` skips it there too, so the ONLY remaining way `late_log_id`'s body could be
+    /// read is a bug in the late-log detector itself.
+    CasFoldSeal fold_seal;
+    fold_seal.generation = 1;
+    ShardCoverage coverage;
+    coverage.last_folded_ref_id = late_log_id;
+    fold_seal.per_ns_shard[cursorKey(ns, /*shard*/0)] = coverage;
+    backend->putIfAbsent(layout.foldSealKey(/*generation*/1, /*attempt*/1), encodeFoldSeal(fold_seal));
+    GcState gc_state;
+    gc_state.snap_generation = 1;
+    gc_state.snap_attempt = 1;
+    backend->putIfAbsent(layout.gcStateKey(), encodeGcState(gc_state));
+
+    /// A delegating backend that counts GETs on the late log's exact key -- the
+    /// GetCountingBackend/INV-1 pattern from gtest_cas_build.cpp:602-660
+    /// (CasBuild.PutBlobCondemnedDedupNeverGetsTheDyingObject).
+    struct GetCountingBackend final : public Backend
+    {
+        explicit GetCountingBackend(BackendPtr inner_, String watched_key_)
+            : inner(std::move(inner_)), watched_key(std::move(watched_key_)) {}
+        size_t get_count = 0;
+
+        HeadResult head(const String & k) override { return inner->head(k); }
+        std::optional<GetResult> get(const String & k, Range r = {}) override
+        {
+            if (k == watched_key)
+                ++get_count;
+            return inner->get(k, r);
+        }
+        std::optional<GetStreamResult> getStream(const String & k, Range r = {}) override { return inner->getStream(k, r); }
+        ListPage list(const String & p, const String & c, size_t l) override { return inner->list(p, c, l); }
+        PutResult putIfAbsent(const String & k, const String & bts, const ObjectMeta & m = {}) override { return inner->putIfAbsent(k, bts, m); }
+        WriteSinkPtr putIfAbsentStream(const String & k, const ObjectMeta & m = {}) override { return inner->putIfAbsentStream(k, m); }
+        PutResult putOverwrite(const String & k, const String & bts, const Token & e, const ObjectMeta & m = {}) override { return inner->putOverwrite(k, bts, e, m); }
+        CasResult casPut(const String & k, const String & bts, const std::optional<Token> & e, const ObjectMeta & m = {}) override { return inner->casPut(k, bts, e, m); }
+        DeleteOutcome deleteExact(const String & k, const Token & tok) override { return inner->deleteExact(k, tok); }
+        bool supportsListTokens() const override { return inner->supportsListTokens(); }
+    private:
+        BackendPtr inner;
+        String watched_key;
+    };
+
+    const String watched_key = layout.refLogKey(ns, late_log_id);
+    auto counting = std::make_shared<GetCountingBackend>(backend, watched_key);
+    auto store = Store::open(counting, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
 
     std::vector<CasEvent> events;
     store->setEventSink([&](const CasEvent & e) { events.push_back(e); });
 
     sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5});
 
+    EXPECT_EQ(counting->get_count, 0u)
+        << "the late-log detector must never GET the log body to \"revive\" it -- the resurrect "
+           "invariant. (The fold-seal fixture above covers the late log at the cursor, so the "
+           "pre-existing tail-removal-protection loop -- unrelated to this detector -- does not "
+           "confound this assertion either.)";
+
     ASSERT_EQ(events.size(), 1u);
     EXPECT_EQ(events[0].type, CasEventType::RefLateLogDetected);
     EXPECT_EQ(events[0].namespace_, ns.string());
     EXPECT_EQ(events[0].at_version, 7u);
-    EXPECT_TRUE(backend->head(store->layout().refLogKey(ns, RefTxnId{2, 7})).exists)
+    EXPECT_TRUE(backend->head(watched_key).exists)
         << "the detector only reports the late log -- it must never delete it (that is GC's ordinary "
            "covered-log cleanup's job once folding catches up)";
 }
