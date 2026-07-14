@@ -12,6 +12,7 @@
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
 #include <Common/thread_local_rng.h>
+#include <fmt/format.h>
 #include <algorithm>
 #include <chrono>
 #include <ctime>
@@ -1498,6 +1499,15 @@ String Store::wedgedKeyForTest(const RootNamespace & ns)
     return rt->wedge ? rt->wedge->key : String{};
 }
 
+void Store::forceWedgeForTest(const RootNamespace & ns, uint64_t writer_epoch, uint64_t ref_sequence,
+                              const String & key, const String & bytes)
+{
+    const auto rt = getRefTableRuntime(ns);
+    ensureRefTableRecovered(ns, *rt);
+    std::lock_guard lock(rt->state_mutex);
+    rt->wedge = RefAppendWedge{RefTxnId{writer_epoch, ref_sequence}, key, bytes};
+}
+
 bool Store::needsStalePrecommitSweepForTest(const RootNamespace & ns)
 {
     const auto rt = getRefTableRuntime(ns);
@@ -1696,6 +1706,108 @@ void Store::runRefQueueLeader(const RootNamespace & ns, const std::shared_ptr<Re
     }
 }
 
+namespace
+{
+/// rev.6 Task 11 (spec §anomaly-policy background diagnostics): a tolerant, read-only peek at the
+/// `RefLogTxn` wire header (`CasRefLogCodec.cpp`'s `u32 format_version | u32-len ns | u64 writer_epoch |
+/// u64 ref_sequence | ...`) WITHOUT `decodeRefLogTxn`'s expected-value cross-check -- the whole point
+/// of this diagnostic is that the body is NOT expected to match this key's identity. Never validates
+/// `format_version`, never reads past the header (the op payload is irrelevant to identifying the
+/// writer), and swallows any truncation/garbage: this is a background diagnostic only, never a decode
+/// anything else depends on.
+struct ForeignRefLogHeaderPeek
+{
+    String ns;
+    uint64_t writer_epoch = 0;
+    uint64_t ref_sequence = 0;
+};
+
+std::optional<ForeignRefLogHeaderPeek> peekForeignRefLogHeader(const String & bytes)
+{
+    try
+    {
+        ReadBufferFromMemory in(bytes.data(), bytes.size());
+        uint32_t format_version = 0;
+        readBinaryLittleEndian(format_version, in);
+        ForeignRefLogHeaderPeek peek;
+        peek.ns = readLenPrefixed(in);
+        readBinaryLittleEndian(peek.writer_epoch, in);
+        readBinaryLittleEndian(peek.ref_sequence, in);
+        return peek;
+    }
+    catch (...)
+    {
+        return std::nullopt;
+    }
+}
+}
+
+void Store::reportImpossibleInterference(const String & key, const String & reason,
+                                          const std::optional<String> & offending_ns)
+{
+    LOG_ERROR(getLogger("CasStore"),
+        "CAS anomaly policy: impossible foreign interference for server_root '{}' (namespace='{}', key='{}'): "
+        "{} -- fencing this mount closed and scheduling a remount",
+        config.server_root_id, offending_ns.value_or(String{}), key, reason);
+
+    EventEmitter{*this}.emit([&](CasEvent & e)
+    {
+        e.type = CasEventType::ForeignInterference;
+        if (offending_ns)
+            e.namespace_ = *offending_ns;
+        e.reason = reason;
+        e.detail = {{"key", key}, {"server_root_id", config.server_root_id}};
+    });
+
+    /// spec §anomaly-policy: incidental-only detection, fail-closed reaction -- the SAME on_lost
+    /// mechanics a foreign/superseded lease renewal already drives (the keeper's `setFenceCallbacks`
+    /// lambda above).
+    tripMountLost();
+    scheduleRemount();
+
+    /// Diagnosis off the critical path (spec §anomaly-policy): a background task may spend a FEW
+    /// requests -- never the caller's thread, and never blocking this call's own return.
+    /// `shared_from_this()` keeps the Store alive for the thread's lifetime (mirrors
+    /// `maybeScheduleSnapshotPublish`'s dispatch).
+    auto self = shared_from_this();
+    try
+    {
+        ThreadFromGlobalPool([self, key]
+        {
+            try
+            {
+                const auto got = self->pool_backend->get(key);
+                if (!got)
+                {
+                    LOG_ERROR(getLogger("CasStore"),
+                        "CAS anomaly diagnostics: the offending object at '{}' had already vanished by the "
+                        "time the background diagnostic GET ran", key);
+                    return;
+                }
+                if (const auto peek = peekForeignRefLogHeader(got->bytes))
+                    LOG_ERROR(getLogger("CasStore"),
+                        "CAS anomaly diagnostics: offending object at '{}' ({} bytes) decodes as a ref-log "
+                        "header: namespace='{}', writer_epoch={}, ref_sequence={}",
+                        key, got->bytes.size(), peek->ns, peek->writer_epoch, peek->ref_sequence);
+                else
+                    LOG_ERROR(getLogger("CasStore"),
+                        "CAS anomaly diagnostics: offending object at '{}' ({} bytes) does not decode as a "
+                        "ref-log header -- raw and unidentified", key, got->bytes.size());
+            }
+            catch (...)
+            {
+                tryLogCurrentException(getLogger("CasStore"),
+                    "CAS anomaly diagnostics: background GET failed for '" + key + "'");
+            }
+        }).detach();
+    }
+    catch (...)
+    {
+        /// Pool exhaustion: best-effort diagnostics must never block the caller's own fail-closed throw.
+        tryLogCurrentException(getLogger("CasStore"), "CAS anomaly diagnostics dispatch failed to launch for '" + key + "'");
+    }
+}
+
 void Store::flushRefBatch(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt)
 {
     /// One flush = one carved batch through one attempted append. Contract: every ORDINARY outcome
@@ -1784,10 +1896,20 @@ void Store::flushRefBatch(const RootNamespace & ns, const std::shared_ptr<RefTab
             catch (...)
             {
                 /// `resolveByExactGet` throws CORRUPTED_DATA when the wedged key holds a DIFFERENT object
-                /// than this attempt intended -- a real conflict, never a retry signal. Surface it to every
-                /// queued caller loudly (corruption is exactly when to fail closed) and KEEP the wedge, so
-                /// the lane is left explicitly wedged for inspection rather than hanging every future caller.
-                complete_error(carve_all_pending(), std::current_exception());
+                /// than this attempt intended. Under rev.6 the mount lease makes this key exclusively ours,
+                /// so this is not a possible protocol outcome -- it is the anomaly policy's incidental
+                /// detection case (spec §anomaly-policy): fail closed LOUDLY (LOGICAL_ERROR, routed through
+                /// `reportImpossibleInterference`) to every queued caller and KEEP the wedge, so the lane is
+                /// left explicitly wedged for inspection rather than hanging every future caller.
+                reportImpossibleInterference(wedge_copy->key,
+                    fmt::format("ref-log wedge resolution for namespace '{}' txn {}-{} observed foreign bytes "
+                        "at the wedged key ({})", ns.string(), wedge_copy->txn_id.writer_epoch,
+                        wedge_copy->txn_id.ref_sequence, getCurrentExceptionMessage(/*with_stacktrace*/ false)),
+                    ns.string());
+                complete_error(carve_all_pending(), std::make_exception_ptr(Exception(ErrorCodes::LOGICAL_ERROR,
+                    "CAS ref-log append for namespace '{}': impossible foreign interference observed at the "
+                    "wedged key '{}' -- mount fenced closed and remount scheduled; see the anomaly "
+                    "diagnostics log", ns.string(), wedge_copy->key)));
                 return;
             }
             if (resolved == CasWriteOutcome::Committed)
@@ -1967,6 +2089,35 @@ void Store::flushRefBatch(const RootNamespace & ns, const std::shared_ptr<RefTab
             "before id allocation — retry against the fresh mount incarnation",
             config.server_root_id)));
         return;
+    }
+
+    /// Wedge hard contract (spec §anomaly-policy): at most one unresolved PUT per table, and the
+    /// wedge-resolution block at the top of this flush either cleared `rt->wedge` (Committed) or already
+    /// returned this whole batch closed (Unresolved / foreign interference) -- reaching HERE with a
+    /// wedge STILL set is provably unreachable via any legitimate control flow. `chassert` catches it
+    /// immediately in a debug build; the release-mode guard below refuses to allocate rather than trust
+    /// an id minted against a lane that might still be uncertain, routing the violation into the same
+    /// anomaly policy instead of an assert-only defense.
+    {
+        std::optional<String> wedged_key;
+        {
+            std::lock_guard lock(rt->state_mutex);
+            chassert(!rt->wedge, "flushRefBatch: new-id allocation attempted while the ref-log lane was still wedged");
+            if (rt->wedge)
+                wedged_key = rt->wedge->key;
+        }
+        if (wedged_key)
+        {
+            reportImpossibleInterference(*wedged_key,
+                fmt::format("flushRefBatch attempted new-id allocation for namespace '{}' while the lane "
+                    "was still wedged -- the wedge hard contract was violated", ns.string()),
+                ns.string());
+            complete_error(survivors, std::make_exception_ptr(Exception(ErrorCodes::LOGICAL_ERROR,
+                "CAS ref-log append for namespace '{}': refusing to allocate a new ref-log id while the "
+                "lane is wedged (wedge hard contract violated) -- mount fenced closed and remount scheduled",
+                ns.string())));
+            return;
+        }
     }
 
     const RefTxnId id = allocateRefTxnId();

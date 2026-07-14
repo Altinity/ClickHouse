@@ -25,6 +25,11 @@ enum class CasEventType
     BuildStart, BuildPublish, BuildAbort, Precommit, PrecommitRemoved, PrecommitReclaim,
     GateRevalidate, GateResurrect, WatermarkRenew, MountRemount,
     MountClaim, MountRelease, MountConflict,
+    /// rev.6 (spec §anomaly-policy): incidental-detection reaction to a signal that is impossible
+    /// under legitimate single-writer operation once the mount lease makes a key exclusively ours
+    /// (foreign bytes at our own wedge key; the wedge hard contract violated). See
+    /// `Store::reportImpossibleInterference`.
+    ForeignInterference,
     RefResolve, ReadMissing, DanglingAccess,
     CorruptDangle, CorruptDecode, SnapJournalIncoherent, Exception,
 };

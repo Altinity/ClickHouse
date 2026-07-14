@@ -814,6 +814,21 @@ private:
                            const std::shared_ptr<RefMutationItem> & own);
     void flushRefBatch(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt);
 
+    /// rev.6 Task 11 (spec §anomaly-policy): incidental-detection reaction for a foreign-interference
+    /// anomaly -- a signal that arrives on an operation the writer already performs (never a dedicated
+    /// probe) and that is impossible under legitimate single-writer operation once the mount lease
+    /// makes `key` exclusively ours: foreign bytes observed at our own wedge key, or the wedge hard
+    /// contract itself violated at new-id-allocation time. LOG_ERROR with full context, emit a
+    /// `ForeignInterference` CasEvent, then fence this mount closed and arm the SAME bounded
+    /// self-remount a foreign/superseded lease renewal already drives (`tripMountLost`/
+    /// `scheduleRemount` -- see the keeper's `on_lost` callback). Diagnosis is strictly off the
+    /// critical path: ONE background GET of `key` (best-effort, single attempt), decoded as far as its
+    /// ref-log header parses, logged -- never blocking or throwing on the caller's thread. Does NOT
+    /// itself throw: every call site raises its OWN `LOGICAL_ERROR` immediately after this returns, so
+    /// the message can name the specific contract that broke.
+    void reportImpossibleInterference(const String & key, const String & reason,
+                                       const std::optional<String> & offending_ns = {});
+
     /// rev.6 Task 5 (spec §clean-release drain): the certificate the clean-release farewell marker
     /// depends on. Latches `shutting_down` (so every ref mutation from here on is refused at admission,
     /// see `appendRefOps`'s entry check), then waits -- bounded by `wait_budget_ms` -- for every cached
@@ -891,6 +906,13 @@ public:
     /// (I1) The object key of the current wedge for `ns`, or empty when the lane is not wedged -- lets a
     /// test land a DIFFERENT object at the exact wedged key to exercise resolve-time CORRUPTED_DATA.
     String wedgedKeyForTest(const RootNamespace & ns);
+    /// Task 11 test seam: force this table's wedge to a synthetic value directly under `state_mutex`,
+    /// bypassing every production trigger. The ONLY way to construct the provably-unreachable state the
+    /// release-mode wedge-contract guard in `flushRefBatch` defends against (a wedge still present at
+    /// the new-id-allocation point) -- combine with `setRefPreCarveHookForTest` to install it AFTER the
+    /// top-of-flush wedge-resolution check has already run clean but BEFORE the batch is carved.
+    void forceWedgeForTest(const RootNamespace & ns, uint64_t writer_epoch, uint64_t ref_sequence,
+                           const String & key, const String & bytes);
     /// S13 fix: whether this table still owes a stale-precommit sweep (armed by recovery; re-armed by a
     /// failed attempt; cleared permanently only by a verified-clean sweep). Recovers the table (like any
     /// real read) if not already cached.

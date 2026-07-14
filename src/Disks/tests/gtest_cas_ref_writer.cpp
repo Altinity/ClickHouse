@@ -32,6 +32,7 @@ namespace DB::ErrorCodes
 extern const int ABORTED;
 extern const int FILE_DOESNT_EXIST;
 extern const int CORRUPTED_DATA;
+extern const int LOGICAL_ERROR;
 }
 
 namespace ProfileEvents
@@ -794,8 +795,11 @@ TEST(RefWriterAppendLane, I1AppendCorruptionSurfacesAndLaneStaysUsable)
     EXPECT_FALSE(store->resolveRef(other, "z").has_value());
 }
 
-/// Wedge-resolve-site CORRUPTED_DATA: a wedged lane whose key a foreign writer overwrote must surface the
-/// corruption to the triggering caller AND KEEP the wedge (fail closed on corruption), without hanging.
+/// Wedge-resolve-site foreign interference: a wedged lane whose key a foreign writer overwrote must
+/// surface the anomaly to the triggering caller AND KEEP the wedge (fail closed), without hanging.
+/// rev.6 Task 11 (spec §anomaly-policy): under the mount-lease exclusivity model this is no longer a
+/// possible protocol outcome (the wedged key is exclusively ours) -- it routes through
+/// `reportImpossibleInterference` and surfaces as `LOGICAL_ERROR` (was `CORRUPTED_DATA` pre-rev.6).
 TEST(RefWriterAppendLane, I1WedgeResolveCorruptionSurfacesAndKeepsWedge)
 {
     CasRequestBudget budget;
@@ -818,30 +822,134 @@ TEST(RefWriterAppendLane, I1WedgeResolveCorruptionSurfacesAndKeepsWedge)
     ASSERT_TRUE(store->refLaneWedgedForTest(ns));
 
     /// A foreign writer lands a DIFFERENT object at the exact wedged key; the next append's wedge resolve
-    /// observes the mismatch and must raise CORRUPTED_DATA to that caller while keeping the wedge.
+    /// observes the mismatch and must raise LOGICAL_ERROR to that caller while keeping the wedge.
     const String wedged_key = store->wedgedKeyForTest(ns);
     ASSERT_FALSE(wedged_key.empty());
     ASSERT_EQ(backend->putIfAbsent(wedged_key, "a-different-object").outcome, PutOutcome::Done);
 
     auto fut = std::async(std::launch::async, [&]
     {
-        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { store->dropRef(ns, "y"); });
+        expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&] { store->dropRef(ns, "y"); });
     });
     ASSERT_EQ(fut.wait_for(std::chrono::seconds(10)), std::future_status::ready)
-        << "the wedge-resolve corruption hung the queue instead of surfacing to the caller";
+        << "the wedge-resolve anomaly hung the queue instead of surfacing to the caller";
     fut.get();
-    EXPECT_TRUE(store->refLaneWedgedForTest(ns)) << "corruption at the wedged key must keep the lane wedged (fail closed)";
+    EXPECT_TRUE(store->refLaneWedgedForTest(ns)) << "foreign interference at the wedged key must keep the lane wedged (fail closed)";
 
     /// The queue's leader bookkeeping was restored, so a SUBSEQUENT same-table caller does not hang: it
-    /// re-hits the kept wedge and again surfaces the corruption, but promptly (a real cv hang would time
+    /// re-hits the kept wedge and again surfaces the anomaly, but promptly (a real cv hang would time
     /// out this bounded wait). This is the leg the unfixed code left blocked forever.
     auto fut2 = std::async(std::launch::async, [&]
     {
-        try { store->dropRef(ns, "y"); } catch (...) {}   /// corruption expected; we assert only "no hang"
+        try { store->dropRef(ns, "y"); } catch (...) {}   /// anomaly expected; we assert only "no hang"
     });
     ASSERT_EQ(fut2.wait_for(std::chrono::seconds(10)), std::future_status::ready)
-        << "a later same-table append hung -- the leader bookkeeping was not restored after the corruption";
+        << "a later same-table append hung -- the leader bookkeeping was not restored after the anomaly";
     fut2.get();
+}
+
+/// ===================================================================================
+/// rev.6 Task 11: wedge hard contract + anomaly policy (spec §anomaly-policy)
+/// ===================================================================================
+
+/// Foreign bytes at a wedge key (see `I1WedgeResolveCorruptionSurfacesAndKeepsWedge` above for the
+/// hang-freedom coverage) must ALSO trip the local write fence closed and audit a `ForeignInterference`
+/// event -- the full anomaly-policy reaction, not just the LOGICAL_ERROR throw.
+TEST(CasAnomalyPolicy, ForeignBytesAtWedgeKeyTripFenceAndRemount)
+{
+    CasRequestBudget budget;
+    budget.max_attempts = 1;
+    budget.attempt_timeout_ms = 100;
+    budget.operation_deadline_ms = 100;
+    budget.lease_safety_margin_ms = 100;
+
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openStore(backend, budget);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/anomaly_wedge"};
+    publishEmptyPart(store, ns, "x");
+    publishEmptyPart(store, ns, "y");
+
+    std::vector<CasEvent> seen;
+    store->setEventSink([&](const CasEvent & e) { seen.push_back(e); });
+
+    /// Wedge the lane with an ambiguous PUT that never landed.
+    backend->fault_key_substr = layout.refsNamespacePrefix(ns) + "_log/";
+    backend->fault_count = 1;
+    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { store->dropRef(ns, "x"); });
+    ASSERT_TRUE(store->refLaneWedgedForTest(ns));
+    ASSERT_TRUE(store->mayMutate()) << "the fence must not be tripped yet -- only an ordinary Unresolved wedge so far";
+
+    /// Out-of-band, a foreign writer lands DIFFERENT bytes at the exact wedged key.
+    const String wedged_key = store->wedgedKeyForTest(ns);
+    ASSERT_FALSE(wedged_key.empty());
+    ASSERT_EQ(backend->putIfAbsent(wedged_key, "a-different-object").outcome, PutOutcome::Done);
+
+    /// The next append's wedge resolve observes the mismatch: LOGICAL_ERROR (not CORRUPTED_DATA), the
+    /// fence trips closed, and a ForeignInterference event is audited.
+    expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&] { store->dropRef(ns, "y"); });
+
+    EXPECT_TRUE(store->refLaneWedgedForTest(ns)) << "foreign interference must keep the wedge (fail closed)";
+    EXPECT_FALSE(store->mayMutate()) << "the local write fence must trip closed on the anomaly";
+
+    const auto has_event = std::any_of(seen.begin(), seen.end(),
+        [](const CasEvent & e) { return e.type == CasEventType::ForeignInterference; });
+    EXPECT_TRUE(has_event) << "a ForeignInterference CasEvent must be audited";
+}
+
+/// The wedge hard contract's release-mode guard: an internal state where `rt->wedge` is STILL set at
+/// the new-id-allocation point (provably unreachable via any legitimate control flow -- the
+/// top-of-flush wedge-resolution block either clears it or returns the whole batch closed) must refuse
+/// to allocate rather than mint an id against a lane that might still be uncertain. Simulated by forcing
+/// the wedge directly via `setRefPreCarveHookForTest`'s injection point (AFTER the top-of-flush
+/// wedge-resolution check has already run clean, BEFORE the batch is carved).
+TEST(CasAnomalyPolicy, WedgeContractReleaseFailClosed)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openStore(backend);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/wedge_contract"};
+    publishEmptyPart(store, ns, "x");
+
+    std::vector<CasEvent> seen;
+    store->setEventSink([&](const CasEvent & e) { seen.push_back(e); });
+
+    store->setRefPreCarveHookForTest([&]
+    {
+        store->forceWedgeForTest(ns, /*writer_epoch*/ 1, /*ref_sequence*/ 1, "bogus/_log/key", "bogus-bytes");
+    });
+
+    /// Ground truth: no NEW `_log` object may appear -- the guard must refuse BEFORE any id is minted
+    /// or PUT attempted.
+    auto countLogObjects = [&]
+    {
+        size_t n = 0;
+        String cursor;
+        for (;;)
+        {
+            const ListPage page = backend->list(layout.refsNamespacePrefix(ns), cursor, 1000);
+            for (const ListedKey & lk : page.keys)
+            {
+                const auto parsed = layout.parseRefObjectKey(lk.key);
+                if (parsed && parsed->ns == ns && parsed->kind == RefObjectKind::Log)
+                    ++n;
+            }
+            if (page.next_cursor.empty())
+                break;
+            cursor = page.next_cursor;
+        }
+        return n;
+    };
+    const size_t log_objects_before = countLogObjects();
+
+    expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&] { store->dropRef(ns, "x"); });
+
+    EXPECT_EQ(countLogObjects(), log_objects_before) << "the release guard must refuse before allocating/PUTting a new _log object";
+    EXPECT_FALSE(store->mayMutate()) << "the local write fence must trip closed on the wedge-contract violation";
+
+    const auto has_event = std::any_of(seen.begin(), seen.end(),
+        [](const CasEvent & e) { return e.type == CasEventType::ForeignInterference; });
+    EXPECT_TRUE(has_event) << "a ForeignInterference CasEvent must be audited";
 }
 
 /// I3: a conditional write whose attempt classified Committed but whose FINAL post-write fence check
