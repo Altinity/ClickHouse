@@ -56,15 +56,27 @@ delete data a successor may have let the writer legitimately recreate.
 least one `RefNsCleanupState::Pending` item exists in the fold seal — i.e., only while an in-progress
 namespace removal (`DROP`-class event) is being physically reclaimed. The ordinary per-round fold
 hot path (the vast majority of rounds, which have no pending namespace removal) never calls it: zero
-cost there. When it does run, cost is one extra `GET gc/state` at pass entry plus one per already-
-necessary LIST page (bounded by, not additional to, the LIST+delete work the pass performs anyway).
+cost there. When it does run, the true cost is larger than a first read of the page-level checks
+suggests: one `GET gc/state` (`round_still_ours`) plus one `HEAD` on `marker_key` per LIST page
+(`CasGc.cpp:1504`) — **and, separately, one additional uncached `HEAD` on `marker_key` per listed
+key** inside the page's inner loop (`CasGc.cpp:1519`, up to 1000 per page). For a listed key that
+already carries its token from the LIST (no `HEAD` otherwise needed for its own delete), that
+per-key marker check **doubles** its request cost (1 `HEAD` + 1 `deleteExact` instead of 1
+`deleteExact` alone).
 
-**Verdict: compliant, keep.** This is not writer-defense (writer exclusivity is the mount-lease
-boundary's job, unaffected by this code) and it is not "detecting interference" speculatively — it
-is a freshness fence gating one specific, rare, genuinely destructive operation whose blast radius
-(deleting real data) justifies re-confirming the CAS-linearized `round` value immediately before
-each page of physical deletes. Matches the spec's own expected verdict for this site ("linearized by
-the single round CAS, no clocks, deposed leader fails its commit").
+**Verdict: compliant, keep — including the per-key check.** This is not writer-defense (writer
+exclusivity is the mount-lease boundary's job, unaffected by this code) and it is not "detecting
+interference" speculatively — it is a freshness fence gating one specific, rare, genuinely
+destructive operation whose blast radius (deleting real data) justifies the cost. The per-key `HEAD`
+specifically is load-bearing, not gratuitous: the comment at `CasGc.cpp:1511-1518` explains it closes
+the exact window a page-level-only check would reopen — a namespace recreation landing **mid-page**,
+after the page's own freshness check passed but before every key in it has been deleted. A
+per-**pass**-only check would be weaker still, given pages carry up to 1000 keys and a page's deletes
+are not instantaneous. No cheaper compliant alternative preserving the same recreation-safety
+guarantee was found; this per-key cost is **not** backlogged for reduction. Matches the spec's own
+expected verdict for this site ("linearized by the single round CAS, no clocks, deposed leader fails
+its commit") — the extra cost buys safety for a rare, destructive, already-expensive pass, not
+interference-detection on a hot path.
 
 ## Site 2 — zombie-steal committed-pair threading {#site-2-zombie-steal-threading}
 
@@ -132,10 +144,13 @@ provably dead per spec §Orphan Manifest Protection control #9 ("never a frozen-
 guess"). A missing watermark fails open to *not eligible* (deletes nothing), so this gate cannot
 misfire against a live writer's own in-progress prefix.
 
-**Request cost on the hot path:** one `GET` of the mount lease per unique (namespace, prefix) the
-sweep encounters in a page — this *is* the sweep's actual eligibility determination, not a
+**Request cost on the hot path:** up to N `GET`s of the mount lease per unique (namespace, prefix)
+the sweep encounters in a page, not a flat one — `floorForNamespace` walks successively shorter
+namespace prefixes in a loop (`CasOrphanManifestSweep.cpp:43-63`), issuing one `GET` per candidate
+until a durable mount body is found or the candidates are exhausted, so the count is bounded by the
+namespace's path-segment depth. This *is* the sweep's actual eligibility determination, not a
 supplementary defensive scan layered on top of it; no separate "is someone still writing" probe
-exists beyond this single durable-fact read, and repeats within a page are memoized to zero.
+exists beyond this single durable-fact lookup, and repeats within a page are memoized to zero.
 
 **Verdict: compliant, keep.** Matches the spec's own framing verbatim: "the cleanup mechanism for
 legitimately dead epochs, not a race defense."
@@ -164,6 +179,9 @@ delete attempt itself.
 
 ## Site 6 — fold-lag clamps {#site-6-fold-lag-clamps}
 
+The spec names three components under this site: "restart-on-vanish, clamp barriers, clamp
+suppression." All three are covered below.
+
 **Location:** the per-log clamp barrier,
 `Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.cpp:1014` (mechanism spans
 `CasGc.cpp:930-1094`: per-table ref-log intake, `foldManifestEdges` body reads, and the barrier
@@ -188,19 +206,52 @@ execute this pass.
 
 **Verdict: compliant, keep.** Matches the spec's own framing verbatim: "intra-node, keep."
 
+### Restart-on-vanish {#site-6-restart-on-vanish}
+
+**Location:** `Gc::fold`'s ref-log intake loop,
+`Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.cpp:983-990` (a `GET` of a
+listed log's body returns absent or the body fails to decode). This is a genuinely separate
+mechanism from the clamp barrier above: the barrier clamps a table's cursor on a not-yet-visible
+**manifest** body; restart-on-vanish aborts on a vanished or invalid **ref log** body. Both sit
+inside the brief's cited range for this site (`Core/CasGc.cpp:986-1052`).
+
+**What it defends against:** input-visibility ambiguity, not a foreign writer — the log's key was
+durable enough to be LISTed this round, so a subsequent `GET` returning absent (or bytes that fail
+to decode) means the read raced the backend's own list/read consistency window, not that anyone is
+fighting GC for the key. Setting `ref_folding_aborted = true` (`:986`, `:999`) stops folding new
+edges for the **rest of the round** — not just this table: the per-table loop's `if
+(ref_folding_aborted) break;` (`CasGc.cpp:938`) skips every table not yet visited, and the abort path
+(`:1103-1118`) discards every table's in-progress cursor advance for this round, resetting each back
+to its parent (already-durable) cursor.
+
+**Request cost on the hot path:** zero incremental, by the same logic as the clamp barrier. Nothing
+is re-fetched to confirm or diagnose the vanish; the abort simply forgoes the round's remaining
+ref-log `GET`s (a *reduction* in requests this round, not an addition) and lets every table's cursor
+— including the one that vanished — resolve on a **subsequent** round's ordinary intake `GET`, the
+exact same request every log above a table's durable cursor requires regardless of whether a prior
+round aborted.
+
+**Verdict: compliant, keep.** Matches the spec's own framing for the whole "fold-lag machinery"
+group: intra-node, keep. Consumed at `CasGc.cpp:1103` (deltas/cleanup/seal reset),
+`:1131` (namespace-removal items skipped this round), and `:1150` (Completed-item retirement skipped
+this round) — all pure in-memory carry-forward, no request spent at any consumption site either.
+
 ## Summary {#summary}
 
 | Site | Location | Verdict |
 |---|---|---|
-| 1. `gc/state` round-ownership re-read | `CasGc.cpp:1466-1473`, called `:1483`, `:1504` | Compliant — destructive-only, bounded, CAS-linearized `round`, no clocks |
+| 1. `gc/state` round-ownership re-read | `CasGc.cpp:1466-1473`, called `:1483`, `:1504`, `:1519` | Compliant — destructive-only, bounded to active namespace removal; per-page **and** per-key checks, the latter load-bearing (closes a mid-page recreation race), not backlogged for reduction |
 | 2. Zombie-steal committed-pair threading | `CasGc.h:247-248`; `CasGc.cpp:231,352,572-587` | Compliant — zero requests (absence of a re-read) |
 | 3. Deposed-leader debris handling | `CasGc.cpp:1714-1728` (reclaimed via `:1683-1712`) | Compliant — the former per-round hunt was already removed |
-| 4. Orphan-sweep prior-epoch eligibility gate | `CasOrphanManifestSweep.cpp:207-224`, memoized `:288-317` | Compliant — the sweep's own eligibility fact, not a race defense |
+| 4. Orphan-sweep prior-epoch eligibility gate | `CasOrphanManifestSweep.cpp:207-224`, memoized `:288-317`, walk `:43-63` | Compliant — the sweep's own eligibility fact (up to N `GET`s, bounded by path depth), not a race defense |
 | 5. `TokenMismatch`/404 delete tolerance | `CasOrphanManifestSweep.cpp:261-266`, `:346-366` | Compliant — tolerate-and-continue, zero incremental requests |
-| 6. Fold-lag clamps | `CasGc.cpp:930-1094` (barrier `:1014`), suppression `:1246-1261` | Compliant — barrier re-reads what would be read anyway; suppression is pure computation |
+| 6. Fold-lag clamps (barrier, suppression, restart-on-vanish) | barrier `CasGc.cpp:1014` (`:930-1094`), suppression `:1246-1261`, restart-on-vanish `:983-990` | Compliant — barrier/restart-on-vanish both re-read/re-fetch what a later round would read anyway (a reduction, not addition, of this round's requests); suppression is pure computation |
 
 All six sites are compliant with the "incidental checks only, zero S3 budget spent fighting a
 foreign writer on hot paths" principle. Site 3 documents a defense mechanism that was **already**
 brought into compliance (the per-round debris-hunting LIST was removed) prior to this audit; the
-other five were compliant by original design. **No code changes result from this audit** — only this
+other five were compliant by original design. Site 1's per-key marker check (`CasGc.cpp:1519`) is a
+real, non-trivial S3 cost — up to one extra `HEAD` per listed key on top of the per-page checks — but
+is judged load-bearing for recreation safety, not gratuitous, so it is kept as-is rather than
+backlogged for a cheaper alternative. **No code changes result from this audit** — only this
 report.
