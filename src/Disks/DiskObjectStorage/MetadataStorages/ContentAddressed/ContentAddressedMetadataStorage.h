@@ -120,6 +120,14 @@ public:
     /// unrecognized value (fail closed rather than silently defaulting to `local`).
     static StagingBackend parseStagingBackend(const Poco::Util::AbstractConfiguration & config, const std::string & config_prefix);
 
+    /// Parse `part_folder_validate` from the CAS disk config (default `always` -- byte-for-byte
+    /// pre-§3 behavior; spec 2026-07-13-cas-memory-s3-budget-optimizations-design.md §3). Extracted
+    /// as a static method (mirrors `parseStagingBackend` above) so the config-parsing logic is
+    /// unit-testable without constructing the full disk factory. Throws BAD_ARGUMENTS on an
+    /// unrecognized value OR a malformed `age` suffix (non-digit, negative, empty, or trailing
+    /// garbage) -- fail closed, never a silent fallback.
+    static ContentAddressed::PartFolderValidate parsePartFolderValidate(const Poco::Util::AbstractConfiguration & config, const std::string & config_prefix);
+
     /// Test/diagnostics: one synchronous GC round (creates an ad-hoc scheduler when disabled).
     void runOneGcRoundForTest();
 

@@ -1,15 +1,19 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/CachedPartFolderAccess.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/ProfileEvents.h>
+#include <Poco/Util/XMLConfiguration.h>
 #include <gtest/gtest.h>
 #include <latch>
+#include <sstream>
 #include <thread>
 
 namespace DB::ErrorCodes
 {
     extern const int FILE_DOESNT_EXIST;
     extern const int ABORTED;
+    extern const int BAD_ARGUMENTS;
 }
 
 namespace ProfileEvents
@@ -54,6 +58,16 @@ ContentAddressed::CachedPartFolderAccess::CacheParams cacheOn()
 {
     return {.cache_bytes = 64ULL << 20, .max_entries = 10000, .max_entry_bytes = 16ULL << 20,
             .explain_enabled = true, .validate = {}};
+}
+
+/// Mirrors gtest_cas_s3_staging.cpp's helper of the same shape: the shape a real CAS disk config
+/// has under `storage_configuration.disks.<name>`, so `config_prefix = "disk"` reads exactly like
+/// the disk factory's `config_prefix`. Used to unit-test `parsePartFolderValidate` standalone.
+Poco::AutoPtr<Poco::Util::XMLConfiguration> configWithDiskSection(const std::string & inner_xml)
+{
+    std::istringstream xml_stream( // STYLE_CHECK_ALLOW_STD_STRING_STREAM
+        "<clickhouse><disk>" + inner_xml + "</disk></clickhouse>");
+    return new Poco::Util::XMLConfiguration(xml_stream);
 }
 
 /// Every mutating backend op throws once armed — models a correlated backend outage during the
@@ -509,6 +523,90 @@ TEST(CasPartFolderAccess, ValidateAgeSkipsWithinWindowThenHeadsAfter)
     fake_now_ms += 4000;
     ASSERT_NE(access.getView(key, ContentAddressed::Freshness::ForceFresh), nullptr);
     EXPECT_GT(backend->headCount(manifest_key), heads_after_prime);
+}
+
+/// ==== §3: `parsePartFolderValidate` config parsing, standalone (mirrors CasS3Staging's
+/// parseStagingBackend coverage) -- review finding: std::stoull silently accepted a leading '-'
+/// (unsigned wraparound), so a malformed `age -5` never hit the parser's own fail-closed throw.
+/// These pin the fixed `std::from_chars`-based parsing directly, with no disk/store needed. ====
+
+TEST(CasPartFolderValidateParse, DefaultConfigParsesToAlways)
+{
+    /// No `part_folder_validate` key at all -- the byte-for-byte-pre-§3-behavior default.
+    auto config = configWithDiskSection("<scratch_path>/tmp/whatever</scratch_path>");
+    const auto v = ContentAddressedMetadataStorage::parsePartFolderValidate(*config, "disk");
+    EXPECT_EQ(v.mode, ContentAddressed::PartFolderValidate::Mode::Always);
+}
+
+TEST(CasPartFolderValidateParse, ParsesAlways)
+{
+    auto config = configWithDiskSection("<part_folder_validate>always</part_folder_validate>");
+    const auto v = ContentAddressedMetadataStorage::parsePartFolderValidate(*config, "disk");
+    EXPECT_EQ(v.mode, ContentAddressed::PartFolderValidate::Mode::Always);
+}
+
+TEST(CasPartFolderValidateParse, ParsesNever)
+{
+    auto config = configWithDiskSection("<part_folder_validate>never</part_folder_validate>");
+    const auto v = ContentAddressedMetadataStorage::parsePartFolderValidate(*config, "disk");
+    EXPECT_EQ(v.mode, ContentAddressed::PartFolderValidate::Mode::Never);
+}
+
+TEST(CasPartFolderValidateParse, ParsesPositiveAge)
+{
+    auto config = configWithDiskSection("<part_folder_validate>age 5</part_folder_validate>");
+    const auto v = ContentAddressedMetadataStorage::parsePartFolderValidate(*config, "disk");
+    EXPECT_EQ(v.mode, ContentAddressed::PartFolderValidate::Mode::Age);
+    EXPECT_EQ(v.age_seconds, 5u);
+}
+
+TEST(CasPartFolderValidateParse, AcceptsAgeZeroAsADegenerateButValidWindow)
+{
+    /// `age 0` is accepted, not rejected: it is a well-formed (if degenerate -- effectively an
+    /// almost-always-expired window) configuration, not malformed input. Only genuinely malformed
+    /// suffixes (negative, non-digit, empty, trailing garbage) fail closed below.
+    auto config = configWithDiskSection("<part_folder_validate>age 0</part_folder_validate>");
+    const auto v = ContentAddressedMetadataStorage::parsePartFolderValidate(*config, "disk");
+    EXPECT_EQ(v.mode, ContentAddressed::PartFolderValidate::Mode::Age);
+    EXPECT_EQ(v.age_seconds, 0u);
+}
+
+TEST(CasPartFolderValidateParse, NegativeAgeThrows)
+{
+    /// The bug this regression-guards: std::stoull("-5") used to return 18446744073709551611
+    /// (unsigned wraparound) instead of rejecting the leading '-'.
+    auto config = configWithDiskSection("<part_folder_validate>age -5</part_folder_validate>");
+    expectThrowsCode(ErrorCodes::BAD_ARGUMENTS,
+        [&] { ContentAddressedMetadataStorage::parsePartFolderValidate(*config, "disk"); });
+}
+
+TEST(CasPartFolderValidateParse, NonDigitAgeThrows)
+{
+    auto config = configWithDiskSection("<part_folder_validate>age abc</part_folder_validate>");
+    expectThrowsCode(ErrorCodes::BAD_ARGUMENTS,
+        [&] { ContentAddressedMetadataStorage::parsePartFolderValidate(*config, "disk"); });
+}
+
+TEST(CasPartFolderValidateParse, TrailingGarbageAfterAgeThrows)
+{
+    auto config = configWithDiskSection("<part_folder_validate>age 5abc</part_folder_validate>");
+    expectThrowsCode(ErrorCodes::BAD_ARGUMENTS,
+        [&] { ContentAddressedMetadataStorage::parsePartFolderValidate(*config, "disk"); });
+}
+
+TEST(CasPartFolderValidateParse, EmptyAgeSuffixThrows)
+{
+    auto config = configWithDiskSection("<part_folder_validate>age </part_folder_validate>");
+    expectThrowsCode(ErrorCodes::BAD_ARGUMENTS,
+        [&] { ContentAddressedMetadataStorage::parsePartFolderValidate(*config, "disk"); });
+}
+
+TEST(CasPartFolderValidateParse, UnknownValueThrows)
+{
+    /// Fail-closed: an unrecognized value must NEVER silently become `never`/`always`.
+    auto config = configWithDiskSection("<part_folder_validate>sometimes</part_folder_validate>");
+    expectThrowsCode(ErrorCodes::BAD_ARGUMENTS,
+        [&] { ContentAddressedMetadataStorage::parsePartFolderValidate(*config, "disk"); });
 }
 
 TEST(CasPartFolderAccess, AbsenceIsNeverRetained)

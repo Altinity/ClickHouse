@@ -21,6 +21,7 @@
 #include <Common/logger_useful.h>
 #include <Common/thread_local_rng.h>
 #include <Poco/Util/AbstractConfiguration.h>
+#include <charconv>
 #include <chrono>
 #include <filesystem>
 #include <ctime>
@@ -189,6 +190,31 @@ StagingBackend ContentAddressedMetadataStorage::parseStagingBackend(
         return StagingBackend::S3;
     throw Exception(ErrorCodes::BAD_ARGUMENTS,
         "Unknown staging_backend value '{}' (expected 'local' or 's3')", value);
+}
+
+ContentAddressed::PartFolderValidate ContentAddressedMetadataStorage::parsePartFolderValidate(
+    const Poco::Util::AbstractConfiguration & config, const std::string & config_prefix)
+{
+    using PartFolderValidate = ContentAddressed::PartFolderValidate;
+    const std::string value = config.getString(config_prefix + ".part_folder_validate", "always");
+    if (value == "always")
+        return {PartFolderValidate::Mode::Always, 0};
+    if (value == "never")
+        return {PartFolderValidate::Mode::Never, 0};
+    if (value.starts_with("age "))
+    {
+        /// `std::from_chars` against an UNSIGNED type never accepts a leading '-' (unlike
+        /// `std::stoull`, which silently negates modulo 2^64) -- a malformed/negative/non-digit/empty
+        /// suffix falls through to the terminal throw below instead of wrapping into an astronomical
+        /// age_seconds that behaves as skip-forever.
+        const std::string age_str = value.substr(4);
+        uint64_t age_seconds = 0;
+        const auto [ptr, ec] = std::from_chars(age_str.data(), age_str.data() + age_str.size(), age_seconds);
+        if (ec == std::errc{} && ptr == age_str.data() + age_str.size())
+            return {PartFolderValidate::Mode::Age, age_seconds};
+    }
+    throw Exception(ErrorCodes::BAD_ARGUMENTS,
+        "Unknown part_folder_validate value '{}' (expected 'always', 'never', or 'age <non-negative integer seconds>')", value);
 }
 
 void ContentAddressedMetadataStorage::runOneGcRoundForTest()

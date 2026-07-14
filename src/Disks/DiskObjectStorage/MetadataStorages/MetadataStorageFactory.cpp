@@ -26,7 +26,6 @@ namespace ErrorCodes
     extern const int INVALID_CONFIG_PARAMETER;
     extern const int LOGICAL_ERROR;
     extern const int NOT_IMPLEMENTED;
-    extern const int BAD_ARGUMENTS;
 }
 
 namespace
@@ -49,34 +48,6 @@ std::string getObjectKeyCompatiblePrefix(
     info.expand_special_macros_only = true;
     info.replica = Context::getGlobalContextInstance()->getMacros()->tryGetValue("replica");
     return Context::getGlobalContextInstance()->getMacros()->expand(prefix, info);
-}
-
-/// §3 (spec 2026-07-13-cas-memory-s3-budget-optimizations-design.md): parses `part_folder_validate` --
-/// `always` | `never` | `age <seconds>` -- fail-closed (BAD_ARGUMENTS) on anything else, never a silent
-/// fallback to `always`.
-ContentAddressed::PartFolderValidate parsePartFolderValidate(const std::string & value)
-{
-    using PartFolderValidate = ContentAddressed::PartFolderValidate;
-    if (value == "always")
-        return {PartFolderValidate::Mode::Always, 0};
-    if (value == "never")
-        return {PartFolderValidate::Mode::Never, 0};
-    if (value.starts_with("age "))
-    {
-        try
-        {
-            size_t pos = 0;
-            const std::string age_str = value.substr(4);
-            const uint64_t age_seconds = std::stoull(age_str, &pos);
-            if (pos == age_str.size())
-                return {PartFolderValidate::Mode::Age, age_seconds};
-        }
-        catch (const std::exception &)
-        {
-        }
-    }
-    throw Exception(ErrorCodes::BAD_ARGUMENTS,
-        "Unknown part_folder_validate value '{}' (expected 'always', 'never', or 'age <seconds>')", value);
 }
 
 }
@@ -329,8 +300,7 @@ static void registerContentAddressedMetadataStorage(MetadataStorageFactory & fac
         /// §3 (spec 2026-07-13-cas-memory-s3-budget-optimizations-design.md): the ForceFresh body
         /// re-proof HEAD validation policy. Default `always` is byte-for-byte pre-§3 behavior --
         /// EVERY ForceFresh re-proves the manifest body via the mandatory HEAD.
-        const auto part_folder_validate = parsePartFolderValidate(
-            config.getString(config_prefix + ".part_folder_validate", "always"));
+        const auto part_folder_validate = ContentAddressedMetadataStorage::parsePartFolderValidate(config, config_prefix);
         /// Phase-5 (part-folder cache spec): byte bound for the manifest DECODE cache (Cas::Store).
         /// `manifest_decode_cache_bytes = 0` disables decode caching entirely (diagnostic mode).
         const uint64_t manifest_decode_cache_bytes = config.getUInt64(config_prefix + ".manifest_decode_cache_bytes", 128ULL << 20);
