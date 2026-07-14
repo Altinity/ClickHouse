@@ -329,8 +329,18 @@ those that will move cold anyway, so their upload is a prepayment — when the T
 happens, the write path dedups against the already-present blobs and the move becomes
 metadata-only. **Manifest reuse** keeps repeated consolidations incremental: `ManifestId` is
 monotone, not content-derived, so the consolidator consults the previous pool-complete `_snap`
-and re-references the existing manifest when a part is unchanged (by part identity +
-`checksums.txt` hash) — no reads, no hashing, no uploads for unchanged parts.
+and re-references the existing manifest when a part is unchanged — with "unchanged" witnessed
+by **filesystem identity, not hash equality**. The frequent tier already hardlinks every part,
+so the witness is inode equality between this snapshot's hardlinks and the previous
+consolidated snapshot's local piece: same inode ⇒ same bytes, a filesystem guarantee — no
+reads, no hashing, no collision risk. (Consequence: the last consolidated snapshot's local
+piece is retained until the next consolidation — an extension of the thin-after rule.) Where
+no inode witness exists (the local piece was thinned, files were re-created), the fallback is
+a full re-hash through the write path under the pool's blob algorithm — never bare
+`checksums.txt` equality: MergeTree checksums are `CityHash128`, a non-cryptographic hash, and
+a decision to skip reading bytes must not rest on it. In-pool blob dedup has its own, separate
+collision axis, governed by the pool's pluggable blob-hash choice — deployments that require
+collision resistance run the pool on `sha256`.
 
 Optional refinement — the **age-based trickle warmer**: a low-priority background uploader
 pushes blobs of hot parts older than a threshold `A` into the pool ahead of any snapshot (a
