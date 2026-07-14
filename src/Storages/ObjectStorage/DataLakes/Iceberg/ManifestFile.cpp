@@ -14,6 +14,7 @@
 
 #include <Core/TypeId.h>
 #include <DataTypes/DataTypesDecimal.h>
+#include <Core/Defines.h>
 #include <Poco/JSON/Parser.h>
 #include <Storages/ColumnsDescription.h>
 #include <Parsers/ASTFunction.h>
@@ -175,6 +176,9 @@ ManifestFileContent::ManifestFileContent(
             ErrorCodes::ICEBERG_SPECIFICATION_VIOLATION, "Required columns are not found in manifest file: {}", f_sequence_number);
 
     Poco::JSON::Parser parser;
+    /// Bound the parser depth so deeply nested partition-spec/schema JSON is rejected cleanly
+    /// instead of overflowing the native stack in Poco's recursive parser.
+    parser.setDepth(DBMS_DEFAULT_MAX_PARSER_DEPTH);
 
     auto partition_spec_json_string = manifest_file_deserializer.tryGetAvroMetadataValue("partition-spec");
     if (!partition_spec_json_string.has_value())

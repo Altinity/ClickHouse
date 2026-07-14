@@ -22,6 +22,7 @@
 #include <Storages/ColumnsDescription.h>
 #include <base/types.h>
 #include <Core/ColumnsWithTypeAndName.h>
+#include <Core/Defines.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/IcebergWrites.h>
 #include <config.h>
 
@@ -300,6 +301,9 @@ Poco::JSON::Object::Ptr getMetadataJSONObject(
         metadata_json_str = create_fn();
 
     Poco::JSON::Parser parser; /// For some reason base/base/JSON.h can not parse this json file
+    /// Bound the parser depth so a deeply nested (attacker-controlled) metadata JSON is rejected
+    /// cleanly instead of overflowing the native stack in Poco's recursive parser.
+    parser.setDepth(DBMS_DEFAULT_MAX_PARSER_DEPTH);
     Poco::Dynamic::Var json = parser.parse(metadata_json_str);
     return json.extract<Poco::JSON::Object::Ptr>();
 }
