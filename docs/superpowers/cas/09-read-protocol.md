@@ -453,7 +453,7 @@ is intentionally empty to avoid duplication; all budget figures live in `07`.
 | In-flight read-your-writes overlay (B59, directory) | **DONE** | `hasInFlightDirectory` + `existsDirectory` prelude |
 | Projection carry-forward workaround removed | **DONE** | `registerCarriedForwardProjectionForCA` deleted |
 | Ephemeral reader pin (cross-node GC fence) | **TODO** (not implemented as of 2026-07-03) | Per-server-owned-namespace model narrows window; ephemeral-pin mechanism is the documented cross-node answer, design only |
-| Replication fetch-by-relink (zero byte cost) | **DONE (base)** | See `03-writer-protocol.md`; `manifest_hash` on Keeper znode is TODO |
+| Replication fetch-by-relink (zero byte cost) | **DONE** | See `03-writer-protocol.md`; the `manifest_hash`-on-Keeper-znode idea (B1) was REJECTED 2026-07-14 — manifest id travels in-band; replication stays disk-agnostic |
 | `manifest_size` always 0 in `Resolved` | **TODO** (minor) | B10 finding; `CasStore::resolveRef` never sets it |
 
 ---

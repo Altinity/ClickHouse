@@ -386,8 +386,15 @@ model that yields at worst **two manifests + two blob sets for one part name** �
 dedup-MISS, not a correctness bug (reachability, refcounts, and query results are all correct, and
 both blob sets are GC'd when the part is later superseded; the duplicate lives only for the part's
 lifetime). A homogeneous cluster with deterministic compression produces identical bytes → identical
-blob hash → dedup with no check at all. This rationale governs the `manifest_hash`-on-znode item
-(`ROADMAP.md §area-writer`): it is a dedup optimization, not a safety fix.
+blob hash → dedup with no check at all. This rationale settled the historical `manifest_hash`-on-znode
+idea (B1): it would have been a dedup optimization, not a safety fix — and it was **rejected outright**
+(2026-07-14) on layering grounds. Replication code stays disk-agnostic: CA adds **no field** to the
+Keeper part header, because a CA-specific field in `ReplicatedMergeTreePartHeader` would couple
+`ReplicatedMergeTree` to one disk implementation, grow the fork's upstream-contact surface, and add
+states to already-complex replication. Fetch-by-relink needs no Keeper field either — the manifest id
+travels in-band over the interserver handshake. If cross-replica manifest divergence ever needs
+*observability*, that is a pool-side fsck/`ca-inspect` concern (group live refs by part name across
+server namespaces), not a replication-protocol change.
 
 ### Same-pool relink uses `pool_uuid`, not endpoint matching {#pool-uuid-relink}
 

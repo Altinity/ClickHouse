@@ -71,7 +71,7 @@ See [`03-writer-protocol.md`](03-writer-protocol.md) for full detail.
 | Dedup cache (known-present blob cache) | **DONE** | Configurable `dedup_cache_bytes`; a hint only, never affects correctness |
 | Adaptive HEAD-before-PUT (skip body upload for known-present blobs) | **DONE** | `dedup_head_first_min_bytes` threshold |
 | Replication fetch-by-relink (same-pool part relink, zero byte cost) | **DONE** | `test_cas_replicated_relink` integration test passes |
-| `manifest_hash` field on Keeper `/parts` znode (cross-replica header divergence detection) | **TODO** | `commitPart` / `getCommitPartOps` in `ReplicatedMergeTreeSink.cpp` have no CA-specific code yet |
+| `manifest_hash` field on Keeper `/parts` znode (cross-replica header divergence detection) | **REJECTED (2026-07-14)** | B1: replication stays disk-agnostic — no CA-specific field in the Keeper part header (fork-surface + replication-complexity cost; fetch-by-relink gets the manifest id in-band). See `BACKLOG.md §obsolete`, `01-architecture.md §benign-cross-replica-divergence` |
 | Streaming `putOverwrite` path (condemned-displacement case) | **DESIRABLE** | The rare INV-1 revival/displacement path still materializes whole body; not a blocker |
 | CA INSERT peak-memory overhead vs local (~9 MiB) | **CHARACTERIZED (2026-07-10)** | Memory-profiled (`trace_type='Memory'`) on a 10 k × 10 KB FixedString INSERT: peak CA 144.5 MiB vs local 135.5 MiB; the ~95 MiB bulk is the column block (identical to local), the ~9 MiB delta is `ContentAddressedTransaction::writeFile` staging/hash buffering (`putBlob` already streams — see above — so this is a fixed write-buffer cost, not whole-file materialization). Drove test `03829` `max_memory_usage` 150M→170M. Shaving it further (stream-hash the staging buffer) is minor/optional |
 | `clickhouse local` shutdown hang (GC thread not reaped on local exit) | **TODO** | B48: background `BackgroundSchedulePool` / GC thread not joined on `LocalServer` teardown |
@@ -195,7 +195,7 @@ See [`09-read-protocol.md`](09-read-protocol.md) for full detail.
 | One-GET part open (pack small files; serve from memory) | **DESIRABLE** | Restored (was B10 #7): with B202 small parts open in ~1 GET |
 | Cacheless-read cost (every read — incl. warm/repeat — round-trips to the object store; no local byte cache) | **CHARACTERIZED (2026-07-10)** | Profiled on the CA-s3 lane: raw CA warm read ~3× local (141 ms vs 47 ms; 186 S3 GETs; warm never improves). `trace_log` hot path = `ReadBufferFromS3::nextImpl` → socket receive/poll, NOT the CA metadata layer (prefetch on, marks cached, resolve cheap, ~1.2 MB/GET). Mitigation = the opt-in file-cache disk over CA (see §area-writer "File-cache disk"): warm ≈ local, 0 S3 GETs. **Guidance:** add a cache disk for re-read-heavy workloads; it does NOT help one-shot scans (cold-populate cost makes the first read ~2× slower). |
 | `manifest_size` field in `Resolved` always 0 | **TODO** (minor, B10) | `resolveRef` never sets it; harmless but imprecise |
-| Replication fetch-by-relink (zero byte cost for same-pool parts) | **DONE (base)** | `manifest_hash` on Keeper `/parts` znode still TODO |
+| Replication fetch-by-relink (zero byte cost for same-pool parts) | **DONE** | `manifest_hash` on Keeper `/parts` znode REJECTED (B1, 2026-07-14) — manifest id travels in-band |
 
 ---
 
@@ -264,7 +264,7 @@ Validation campaign (one coherent block):
 6. ~~TLA+ clamps + suppression extension~~ — **DONE 2026-07-03** (see the row in §GC protocol).
 
 Feature/safety gates:
-7. **B1 `manifest_hash` on the Keeper `/parts` znode** — cross-replica header-divergence detection.
+7. ~~**B1 `manifest_hash` on the Keeper `/parts` znode**~~ — **REJECTED 2026-07-14** (replication stays disk-agnostic; see `BACKLOG.md §obsolete`).
 8. **B31 capability gate** — honest advertisement; reject unsupported ops at `CREATE`/`ATTACH`.
 9. **B197 `SYSTEM` control surface** — START/STOP GC, POOL READONLY, CHECK.
 10. **B13 migration path + mixed-version rollout rule** (read-new-before-write-new; the format
@@ -351,6 +351,8 @@ this roadmap. The items below are the still-actionable highlights not already co
   (delta-runs + compaction, T1) stays DESIRABLE — see [`BACKLOG.md`](BACKLOG.md) §2 and
   `specs/2026-07-02-cas-gc-snapshot-streaming-design.md`. (The superseded scoping doc
   `deferred_backlog/2026-07-01-cas-gc-runfile-obuffer-streaming.md` was removed in the 2026-07-13 grooming.)
-- **B1 manifest_hash on Keeper `/parts` znode** (HARD release gate): cross-replica header-divergence
-  detection requires a CA-specific field in `commitPart` / `getCommitPartOps`.
+- **B1 manifest_hash on Keeper `/parts` znode**: **REJECTED (2026-07-14)** — no longer a gate.
+  Replication code stays disk-agnostic (no CA-specific field in the Keeper part header); the
+  manifest id travels in-band on fetch, and manifest divergence is benign
+  (`01-architecture.md §benign-cross-replica-divergence`). See `BACKLOG.md §obsolete`.
 - **S23 idle RSS +82 MiB over budget**: confirm not unbounded in a long soak run.

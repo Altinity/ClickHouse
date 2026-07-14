@@ -47,7 +47,7 @@ zero-copy replication.
 | Methodology (TDD, TLA+, soak-driven) | **DONE** — established and applied throughout | [`02-methodology.md`](02-methodology.md) |
 | Writer protocol (build → precommit → promote) | **DONE** — including precommit-first, manifest soft/hard limits (B164b), streaming `putBlob` | [`03-writer-protocol.md`](03-writer-protocol.md) |
 | GC protocol (fold/retire/fence/recheck) | **DONE (core)** — attempt-scoped generations, snap prune, D1 shard-incarnation; remaining: run-file streaming, common-shard-prefix discovery | [`04-gc-protocol.md`](04-gc-protocol.md) |
-| Replication (fetch-by-relink) | **DONE (base)** — multi-replica shared pool works; `manifest_hash` Keeper header field not yet wired | [`03-writer-protocol.md`](03-writer-protocol.md) |
+| Replication (fetch-by-relink) | **DONE** — multi-replica shared pool works; manifest id travels in-band (interserver handshake); the `manifest_hash` Keeper-header field (B1) was REJECTED — replication stays disk-agnostic | [`03-writer-protocol.md`](03-writer-protocol.md) |
 | Formats and backend abstraction | **DONE** — one-header envelope, protobuf codecs, schema-evolution stance, `putDeterministicArtifact` | [`05-formats-and-backend.md`](05-formats-and-backend.md) |
 | TLA+ models | **DONE** — multiple models; GC safety + liveness + attempt-scoped generation proved | [`06-tla-models.md`](06-tla-models.md) |
 | S3 op-count reduction | **Partial** — dedup cache, adaptive HEAD, precommit-first, snap-prune done; HEAD-storm (B148), B168 program ongoing | [`07-s3-budget.md`](07-s3-budget.md) |
@@ -56,7 +56,7 @@ zero-copy replication.
 | Introspection (`fsck`, `ca-gc-dryrun`, audit logs) | **DONE** — `clickhouse-disks fsck`, `ca-gc-dryrun`, `system.content_addressed_log`, `system.content_addressed_garbage_collection_log` all implemented | [`08-testing-and-soak.md`](08-testing-and-soak.md) |
 | Read protocol (ref resolution, manifest fetch, ranged blobs, decode caches, read-your-writes) | **DONE** — B59 in-flight overlay, B115 position-corruption fix, shard and manifest decode caches operational | [`09-read-protocol.md`](09-read-protocol.md) |
 | Backups and disaster recovery | **DESIGN** — option survey + chosen snapshot/mirror/fetch/restore direction written 2026-07-14; implementation not started (feeds B198) | [`10-backups.md`](10-backups.md) |
-| Release readiness | **TODO** — capability gate (B31), real-S3 GC validation, backup/restore runbook, `manifest_hash`, `SYSTEM` control commands (B197), integration tests on RustFS (B125), repo hygiene (B131) | [`ROADMAP.md`](ROADMAP.md) |
+| Release readiness | **TODO** — capability gate (B31), real-S3 GC validation, backup/restore runbook, `SYSTEM` control commands (B197), integration tests on RustFS (B125), repo hygiene (B131) | [`ROADMAP.md`](ROADMAP.md) |
 
 ---
 
