@@ -338,9 +338,17 @@ piece is retained until the next consolidation — an extension of the thin-afte
 no inode witness exists (the local piece was thinned, files were re-created), the fallback is
 a full re-hash through the write path under the pool's blob algorithm — never bare
 `checksums.txt` equality: MergeTree checksums are `CityHash128`, a non-cryptographic hash, and
-a decision to skip reading bytes must not rest on it. In-pool blob dedup has its own, separate
-collision axis, governed by the pool's pluggable blob-hash choice — deployments that require
-collision resistance run the pool on `sha256`.
+a decision to skip reading bytes must not rest on it. Any hash-based equality oracle here must
+also compare the explicit file **size** (free, and it removes all unequal-length collisions);
+note that mixing part/file names into the hash adds no discriminating power to this comparison
+— it is a *same-slot* check, so the names are equal on both sides by construction. In-pool
+blob dedup has its own, separate collision axis, governed by the pool's pluggable blob-hash
+choice: deployments that require collision resistance run the pool on `sha256`, and a
+slot-bound middle tier (`ch128ctx` = content hash ∥ `xxh3_64(part_name, file_name)` ∥ size —
+see `BACKLOG.md §read-write`) defuses *cross-slot* collisions (the realistic adversarial dedup
+vector) at near-zero CPU cost, while every dedup CAS actually relies on survives: relink and
+carry-forward are reference-based, and retry idempotency, same-name replica writes, and the
+snapshot-upload → TTL-move prepayment are all same-slot.
 
 Optional refinement — the **age-based trickle warmer**: a low-priority background uploader
 pushes blobs of hot parts older than a threshold `A` into the pool ahead of any snapshot (a
