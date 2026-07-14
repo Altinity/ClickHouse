@@ -231,8 +231,8 @@ struct PoolConfig
     /// turns every ref read into a re-dispatched full-snapshot encode+PUT (the read-triggered PUT storm),
     /// since a non-Committed publish deliberately does not prune the tail (that would be data loss) and so
     /// leaves the threshold trigger latched. The interval doubles from `initial` up to `max` per
-    /// consecutive failure and resets on the next durable publish; combined with the single-in-flight gate
-    /// and the candidate-advance skip, it bounds publish dispatch to O(failures), not O(reads).
+    /// consecutive failure and resets on the next durable publish; combined with the single-in-flight
+    /// gate, it bounds publish dispatch to O(failures), not O(reads).
     uint64_t snapshot_publish_backoff_initial_ms = 200;
     uint64_t snapshot_publish_backoff_max_ms = 30000;
     /// S13 fix (DANGLING-PRECOMMIT re-opened; triage `.superpowers/sdd/s13-triage-report.md`): bounded

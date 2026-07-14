@@ -228,6 +228,15 @@ public:
                     block_this = true;                 /// the SAME captured key retried: keep blocking it
                 /// a DIFFERENT matching key under first-match-only mode falls through unblocked
             }
+            /// (I1) Independent per-key blocking: every matching key parks on its OWN release, unlike
+            /// `block_armed` above (one shared gate released all-at-once). Lets a test park two DISTINCT
+            /// `_snap/<id>` PUTs concurrently and release them in a chosen order.
+            if (independent_block_armed && key.find(independent_block_substr) != String::npos)
+            {
+                independent_blocked_keys.insert(key);
+                block_cv.notify_all();
+                block_cv.wait(lk, [&] { return independent_released_keys.count(key) != 0; });
+            }
             if (block_this)
             {
                 block_entered = true;
@@ -306,6 +315,42 @@ public:
         block_cv.wait(lk, [&] { return block_call_completed; });
     }
 
+    /// (I1 regression harness) Arms independent per-key blocking for every `putIfAbsent` matching
+    /// `substr`: unlike `armPutBlock`/`armPutBlockFirstMatchOnly` (one shared release gate), each
+    /// blocked key parks on ITS OWN release (`releaseKey`), so two distinct `_snap/<id>` PUTs can be
+    /// parked concurrently -- both past their capture point, neither yet adopted -- and released in a
+    /// chosen order. Needed to construct the small-candidate-adopts-before-a-larger-one-already-in-flight
+    /// ordering that exercises `clampedCounterSub`'s actual clamp branch.
+    void armPutBlockIndependently(const String & substr)
+    {
+        std::lock_guard g(block_mutex);
+        independent_block_substr = substr;
+        independent_block_armed = true;
+        independent_blocked_keys.clear();
+        independent_released_keys.clear();
+    }
+    /// Blocks until at least `n` distinct matching keys are currently parked.
+    void awaitAtLeastNKeysBlocked(size_t n)
+    {
+        std::unique_lock lk(block_mutex);
+        block_cv.wait(lk, [&] { return independent_blocked_keys.size() >= n; });
+    }
+    /// A snapshot of the keys currently parked under independent blocking.
+    std::set<String> blockedKeysSnapshot()
+    {
+        std::lock_guard g(block_mutex);
+        return independent_blocked_keys;
+    }
+    /// Releases exactly the given key; every OTHER independently-blocked key stays parked.
+    void releaseKey(const String & key)
+    {
+        {
+            std::lock_guard g(block_mutex);
+            independent_released_keys.insert(key);
+        }
+        block_cv.notify_all();
+    }
+
 private:
     std::mutex block_mutex;
     std::condition_variable block_cv;
@@ -315,6 +360,10 @@ private:
     bool block_call_completed = false;
     bool block_first_match_only = false;
     String blocked_key;
+    String independent_block_substr;
+    bool independent_block_armed = false;
+    std::set<String> independent_blocked_keys;
+    std::set<String> independent_released_keys;
 };
 
 }
@@ -1239,6 +1288,79 @@ TEST(RefWriterSnapshotPublish, ConcurrentOutOfOrderPublishDoesNotRegressBaseNorD
     const RefTableState oracle = independentFullReplayForTest(*backend, layout, ns, *snap_id);
     EXPECT_EQ(got->bytes, encodeRefTableSnapshot(snapshotOf(oracle, ns.string())))
         << "published snapshot bytes must equal replay(all logs through X) -- a regressed base drops txns";
+}
+
+/// (I1, review of commit 9093482176a) `clampedCounterSub`'s actual clamp-to-zero branch -- the exact
+/// hazard it exists for -- was previously unpinned: `AdoptionSubtractsCapturedCountersUnderConcurrentAppends`
+/// subtracts from a counter that never goes below the captured amount (no clamp needed), and in
+/// `ConcurrentOutOfOrderPublish...` above the SMALLER candidate is the one parked, so its adoption is
+/// skipped entirely by the T11 monotonic guard BEFORE it would ever reach the subtraction -- the clamp
+/// is never exercised either way. This test forces the one ordering the guard does NOT catch: the
+/// SMALLER candidate adopts (and subtracts) FIRST, then a LARGER candidate -- captured earlier, while
+/// the counter still held the region the smaller one just subtracted -- adopts second. Its captured
+/// count therefore double-counts that already-subtracted region, and `clampedCounterSub` must clamp
+/// to zero rather than wrap a `uint64_t` to ~`UINT64_MAX` (which would permanently re-latch the C4
+/// storm trigger in a release build -- no `chassert` to catch it). Deterministic, sleep-free: two
+/// `_snap` PUTs are parked independently (both past their own capture, neither yet adopted) via
+/// `armPutBlockIndependently`, then released in the specific order that reproduces the hazard.
+TEST(RefWriterSnapshotPublish, ClampedCounterSubClampsInsteadOfUnderflowingOnOutOfOrderAdoption)
+{
+    using ProfileEvents::global_counters;
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const RootNamespace ns{"srv1/clamp_out_of_order"};
+    PoolConfig config;
+    /// High thresholds: NO automatic background dispatch -- we drive `trySnapshotPublishOnce` directly
+    /// for full determinism.
+    config.snapshot_log_count_threshold = 1ULL << 40;
+    config.snapshot_log_bytes_threshold = 1ULL << 40;
+    auto store = openStoreWithConfig(backend, config);
+
+    publishEmptyPart(store, ns, "a");   /// tail: 2 -- publisher A's (smaller) candidate
+
+    backend->armPutBlockIndependently("_snap/");
+
+    std::thread publisher_a([&] { store->trySnapshotPublishOnce(ns); });
+    backend->awaitAtLeastNKeysBlocked(1);   /// A has captured (candidate=2 txns, count=2) and parked mid-PUT
+    const String key_a = *backend->blockedKeysSnapshot().begin();
+
+    publishEmptyPart(store, ns, "b");   /// tail: 4 -- publisher B's (larger) candidate, captured BELOW
+
+    std::thread publisher_b([&] { store->trySnapshotPublishOnce(ns); });
+    backend->awaitAtLeastNKeysBlocked(2);   /// B has ALSO captured (candidate=4 txns, count=4) and parked
+    const auto blocked = backend->blockedKeysSnapshot();
+    ASSERT_EQ(blocked.size(), 2u) << "both publishers must be parked past their own capture before either adopts";
+    String key_b;
+    for (const auto & k : blocked)
+        if (k != key_a)
+            key_b = k;
+    ASSERT_FALSE(key_b.empty());
+
+    /// Release the SMALLER candidate first: its monotonic guard passes (newest is still unset), so it
+    /// adopts -- newest becomes A's candidate, and the count drops from the live 4 to 2 (4 - captured_A=2).
+    backend->releaseKey(key_a);
+    publisher_a.join();
+    EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), 2u)
+        << "publisher A (smaller candidate) adopts first and subtracts its own captured count safely";
+
+    /// Release the LARGER candidate: its monotonic guard ALSO passes (newest=A's candidate < B's
+    /// candidate), so it reaches the subtraction with `captured_count_B == 4` -- but the live counter
+    /// is now only 2 (A's adoption already removed the overlapping region). A plain `fetch_sub` here
+    /// would wrap to ~UINT64_MAX; `clampedCounterSub` must clamp to 0 instead.
+    backend->releaseKey(key_b);
+    publisher_b.join();
+    EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), 0u)
+        << "clampedCounterSub must clamp to 0, not underflow/wrap, when B's captured count (4) already "
+           "includes the region A's earlier adoption already subtracted";
+
+    /// A wrapped counter would read as ~UINT64_MAX, permanently latching `over_threshold` (the C4
+    /// storm regression). With the huge threshold configured above, a dispatch firing here can ONLY
+    /// mean the counter is corrupted -- a clamped counter of 0 never crosses it.
+    const auto dispatched_before = global_counters[ProfileEvents::CasRefSnapshotPublishDispatched].load();
+    for (int i = 0; i < 5; ++i)
+        store->resolveRef(ns, "a");
+    store->waitForSnapshotPublishSettleForTest(ns);
+    EXPECT_EQ(global_counters[ProfileEvents::CasRefSnapshotPublishDispatched].load(), dispatched_before)
+        << "a correctly-clamped counter must never latch the threshold trigger";
 }
 
 /// ===================================================================================

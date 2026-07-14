@@ -2088,9 +2088,9 @@ void Store::maybeScheduleSnapshotPublish(const RootNamespace & ns, const std::sh
         return;
 
     /// Bound the read-triggered dispatch (spec §writer-snapshot-publication, C4). The whole decision --
-    /// the threshold trigger, the single-in-flight gate, the candidate-advance skip, the backoff
-    /// deadline -- and the `pending_snapshot_publishes` increment all happen under ONE `state_mutex`
-    /// hold, so two racing dispatchers can never both admit a publish for this table.
+    /// the threshold trigger, the single-in-flight gate, the backoff deadline -- and the
+    /// `pending_snapshot_publishes` increment all happen under ONE `state_mutex` hold, so two racing
+    /// dispatchers can never both admit a publish for this table.
     bool dispatch = false;
     {
         std::lock_guard lock(rt->state_mutex);
