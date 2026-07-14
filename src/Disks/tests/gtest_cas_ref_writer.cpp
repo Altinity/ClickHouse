@@ -879,6 +879,7 @@ TEST(CasAnomalyPolicy, ForeignBytesAtWedgeKeyTripFenceAndRemount)
     expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { store->dropRef(ns, "x"); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns));
     ASSERT_TRUE(store->mayMutate()) << "the fence must not be tripped yet -- only an ordinary Unresolved wedge so far";
+    ASSERT_EQ(store->scheduleRemountCallCountForTest(), 0u) << "no remount must have been scheduled yet by the ordinary wedge alone";
 
     /// Out-of-band, a foreign writer lands DIFFERENT bytes at the exact wedged key.
     const String wedged_key = store->wedgedKeyForTest(ns);
@@ -891,6 +892,15 @@ TEST(CasAnomalyPolicy, ForeignBytesAtWedgeKeyTripFenceAndRemount)
 
     EXPECT_TRUE(store->refLaneWedgedForTest(ns)) << "foreign interference must keep the wedge (fail closed)";
     EXPECT_FALSE(store->mayMutate()) << "the local write fence must trip closed on the anomaly";
+    /// Positively pins that `reportImpossibleInterference` called `scheduleRemount` (not just
+    /// `tripMountLost`, which alone already accounts for `mayMutate() == false` above). Counted at
+    /// `scheduleRemount`'s own entry regardless of `background_watermark` -- see that accessor's
+    /// comment for why this test deliberately does NOT enable `background_watermark` to observe a real
+    /// spawned thread: doing so was tried and makes the store's self-remount attempt race its own
+    /// still-live keeper for 30+ seconds per call (confirmed while building this test), which is not
+    /// something a fast unit test should be driving.
+    EXPECT_EQ(store->scheduleRemountCallCountForTest(), 1u)
+        << "reportImpossibleInterference must have called scheduleRemount exactly once";
 
     const auto has_event = std::any_of(seen.begin(), seen.end(),
         [](const CasEvent & e) { return e.type == CasEventType::ForeignInterference; });
@@ -942,10 +952,17 @@ TEST(CasAnomalyPolicy, WedgeContractReleaseFailClosed)
     };
     const size_t log_objects_before = countLogObjects();
 
+    ASSERT_TRUE(store->mayMutate()) << "the fence must be armed BEFORE the wedge-contract violation, or the guard would trivially pass for the wrong reason";
+    ASSERT_EQ(store->scheduleRemountCallCountForTest(), 0u) << "no remount must have been scheduled yet";
+
     expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&] { store->dropRef(ns, "x"); });
 
     EXPECT_EQ(countLogObjects(), log_objects_before) << "the release guard must refuse before allocating/PUTting a new _log object";
     EXPECT_FALSE(store->mayMutate()) << "the local write fence must trip closed on the wedge-contract violation";
+    /// See the sibling test's comment on why this checks the call-count seam (never `background_watermark`
+    /// + a real thread -- that combination makes the store's self-remount race its own still-live keeper).
+    EXPECT_EQ(store->scheduleRemountCallCountForTest(), 1u)
+        << "reportImpossibleInterference must have called scheduleRemount exactly once";
 
     const auto has_event = std::any_of(seen.begin(), seen.end(),
         [](const CasEvent & e) { return e.type == CasEventType::ForeignInterference; });

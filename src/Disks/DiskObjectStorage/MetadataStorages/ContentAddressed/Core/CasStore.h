@@ -547,6 +547,15 @@ public:
     /// keeper's on_lost callback calls `scheduleRemount`, otherwise reachable only via the background
     /// renewer's cadence. Returns true iff a recovery thread is armed after the call.
     bool scheduleRemountForTest();
+    /// Task 11 review follow-up: how many times `scheduleRemount` has been ENTERED, counted
+    /// unconditionally as its very first statement -- BEFORE the `background_watermark` early-return, so
+    /// this increments even under the default `background_watermark = false` (no thread ever spawns; a
+    /// test never pays for a real self-remount attempt racing this Store's own still-live keeper, which
+    /// -- confirmed while building this seam -- reliably takes 30+ seconds per call and is not something
+    /// a fast unit test should be driving). Positively pins that a production call site (e.g.
+    /// `reportImpossibleInterference`) actually invoked `scheduleRemount`, as opposed to merely observing
+    /// `mayMutate() == false` (which `tripMountLost` alone already accounts for).
+    uint64_t scheduleRemountCallCountForTest() const { return schedule_remount_calls_for_test.load(std::memory_order_relaxed); }
     /// Test seam: latch `remount_shutting_down` exactly as `~Store()` does at its top, WITHOUT tearing
     /// the Store down, so a test can assert `scheduleRemount` refuses to spawn once teardown has begun.
     void beginShutdownForTest();
@@ -1041,6 +1050,8 @@ private:
     std::condition_variable remount_cv;
     std::mutex remount_cv_mutex;
     ThreadFromGlobalPool remount_thread;
+    /// Task 11 review follow-up: see `scheduleRemountCallCountForTest`.
+    std::atomic<uint64_t> schedule_remount_calls_for_test{0};
 
     /// Local write fence (spec §write-fence). Permissive by default (deadline = time_point::max,
     /// lost = false), so mayMutate is true until Task 7 arms it with a real lease deadline and the

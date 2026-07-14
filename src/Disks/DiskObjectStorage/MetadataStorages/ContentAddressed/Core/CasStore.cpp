@@ -809,6 +809,11 @@ bool Store::tryRemountOnce()
 
 void Store::scheduleRemount()
 {
+    /// Task 11 review follow-up: counted unconditionally, BEFORE the `background_watermark` gate below,
+    /// so `scheduleRemountCallCountForTest` observes every entry regardless of whether a thread actually
+    /// spawns -- see that accessor's comment for why this is the seam a fast unit test should use rather
+    /// than driving a real self-remount attempt.
+    schedule_remount_calls_for_test.fetch_add(1, std::memory_order_relaxed);
     if (!config.background_watermark)
         return;   /// tests drive tryRemountOnce explicitly (the same gate as every background thread)
     if (remount_shutting_down.load() || remount_running.load())
