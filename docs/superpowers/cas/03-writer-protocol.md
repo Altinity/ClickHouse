@@ -239,29 +239,28 @@ is materialized into memory only once (the rare case), not on the common path.
 Revival = a fresh re-upload from the writer's own source bytes. `Build::resurrect` (which did a
 GET-from-existing) was deleted; `uploadFromSource` is the sole sourced revival primitive.
 
-**INV-1 exception — verified copy-forward (spec `2026-07-02-cas-copy-forward-condemned-evidence.md`):**
+**INV-1 exception — manifest-trust adoption (opt §4, 2026-07-14; supersedes the earlier copy-forward
+design of `2026-07-02-cas-copy-forward-condemned-evidence.md`):**
 a **tokenless W-EVIDENCE dep** (`adoptEvidence` — every call site adopts entries of a COMMITTED
-source manifest: `republishRef` part moves, the fetch receiver, part/file copies) has **no source
-bytes**, yet the blob it names is referenced by a live committed owner right now — resolving its
-condemned incarnation is a reference transfer, not a resurrection of garbage. For exactly these deps,
-`Build::promote`'s per-manifest-entry blob revalidation loop calls `Build::copyForwardFromCondemned`
-**inline**, gated to non-tokened leaves only (spec `2026-07-09-cas-writer-gc-simplification` D3: the
-former standalone copy-forward pre-pass is removed — this in-closure call is now the SINGLE
-copy-forward site): read the condemned-but-present incarnation IN FULL, verify fail-closed (envelope decodes + recomputed payload
-hash == content key), re-wrap under a fresh envelope (fresh `incarnation_tag`, this build's
-`build_id` — W-FRESH-TAG), and displace EXACTLY the observed incarnation via token-conditional
-`putOverwrite`. Every failure mode stays fail-closed: absent / deleted mid-flight => `ABORTED`
-(never `putIfAbsent` after a lost delete race), corrupt payload => `CORRUPTED_DATA`; a clean drifted
-token is adopted. TLA+: `WCopyForward` in `CaGcAckFloorCore` (the sourceless instantiation of the
-recreate arm — no `~present` branch); stage-1 clean, witness fires, all sabotages still refute.
-The listed `(hash, old_token)` entry settles at the next fold (exact-token mismatch => entry drops,
-the fresh incarnation untouched); an ABANDONED copy-forward (writer died before the promote CAS)
-self-heals: the dst precommit + body are durable BEFORE the pre-pass runs
-(INV-2 reachability-before-content), so the reclaim's -1 transitions the blob to zero and a fresh
-`(hash, new_token)` entry reclaims it normally.
-Motivation: the S13 soak-run-3 liveness brick — `checkParts -> renameToDetached -> moveDirectory ->
-republishRef -> promote ABORTED (condemned)` left the table readonly forever; the attach caller
-never retries.
+source manifest: `republishRef` part moves, the fetch receiver, part/file copies) names a blob that
+is referenced by a live committed owner right now — resolving it is a reference transfer, not a
+resurrection of garbage. `adoptEvidence` stamps `DepEntry.adopted = true` on exactly these entries
+(`CasBuild.cpp`). At promote, `Build::promote` no longer reads/copies/re-wraps that blob: it TRUSTS
+the durable manifest edge for an `adopted && !tokened` leaf (`isTrustedAdopt`), emitting a
+`reason="manifest-trust"` adoption event (`CasBlobAdoptTrusted`) with NO per-file `HEAD`/`GET`. The
+trust is sound because the source pins the blob (a live committed owner ⇒ in-degree ≥ 1 ⇒ GC, the
+sole deleter, cannot condemn it) AND this build's own precommit edge is durable and RE-PROVED LIVE at
+the promote owner-liveness gate BEFORE the trust fires (EDGE-BEFORE-OBSERVE; the deleted per-file
+occupancy probe is what the lever removes). `copyForwardFromCondemned` / `isCopyForwardableTokenless`
+are DELETED. The trade-off (D4 relink trust model = ordinary ReplicatedMergeTree interserver trust):
+a genuinely-absent adopted blob is no longer caught at promote — it becomes an **fsck dangling
+finding** (`CasFsck` reachable-but-absent → `report.dangling`) instead of a promote `ABORTED`. This
+scenario is unreachable in production (source-pin + durable-edge), verified by an independent
+EDGE-BEFORE-OBSERVE consult + per-test reachability proof (`opt-task-5-report.md`). A **non-adopted /
+pending / cross-algo leaf is NOT trusted** — it fails closed `LOGICAL_ERROR` (dep-set fail-close, no
+probe). `StrictValidate`/fsck are unchanged. Also incidentally fixes the S13 soak-run-3 liveness
+brick (`republishRef -> promote ABORTED (condemned)` left the table readonly forever): the adopt now
+trusts instead of aborting.
 
 **Condemned-detection commit gate (recreate a retired incarnation, do not adopt it):** a writer
 checks each observed blob incarnation against its per-hash `.meta` descriptor — a single `loadMeta`
