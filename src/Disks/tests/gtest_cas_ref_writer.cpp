@@ -2,6 +2,7 @@
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRefIntake.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRefLogCodec.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRefSnapshotCodec.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
@@ -44,6 +45,7 @@ extern const Event CasRefSnapshotPublishDispatched;
 extern const Event CasRefSnapshotPublishBackoff;
 extern const Event CasRefLatePredecessorObserved;
 extern const Event CasConditionalWriteFenceLostPostWrite;
+extern const Event CasRefRecoverySealPublished;
 }
 
 using namespace DB::Cas;
@@ -2372,4 +2374,205 @@ TEST(RefWriterAppendLane, SameRefMutationsSplitAcrossFlushes)
     const auto it = resolved->mutable_files.find("k");
     ASSERT_NE(it, resolved->mutable_files.end());
     EXPECT_TRUE(it->second == "1" || it->second == "2");
+}
+
+/// ===================================================================================
+/// rev.6 Task 8: the recovery seal (spec §recovery-seal / §seal-id / §seal-soundness). At an UNCLEAN
+/// mount, `ensureRefTableRecovered` must close every dead epoch it discovers with an immediate
+/// snapshot -- published at the UPPER BOUND of the dead-epoch region, `{liveWriterEpoch() - 1,
+/// UINT64_MAX}` -- BEFORE the table is exposed as recovered, so no late predecessor PUT from any dead
+/// epoch can ever surface to a cold fold or a fresh recovery.
+/// ===================================================================================
+
+namespace
+{
+
+/// Seeds crash-style predecessor debris for the seal tests: two DEAD epochs (1 and 2) of durable logs
+/// under `ns` -- epoch 1 births ref "a", epoch 2 adds ref "b" -- with no snapshot, and burns the
+/// durable epoch counter to exactly 2 so a subsequent `Store::open` allocates epoch 3 (both dead
+/// epochs land strictly below the fresh writer's own, as `dead_region_nonempty` requires).
+void seedSealFixtureDeadEpochs(Backend & backend, const Layout & layout, const RootNamespace & ns)
+{
+    allocateWriterEpoch(backend, layout, "test");   /// burns epoch 1
+    allocateWriterEpoch(backend, layout, "test");   /// burns epoch 2
+
+    RefLogTxn birth;
+    birth.ns = ns.string();
+    birth.txn_id = RefTxnId{1, 1};
+    birth.ops = {namespaceBirthOp(), publishCommittedOps("a", manifestRef(1, 1, 1))[0],
+                 publishCommittedOps("a", manifestRef(1, 1, 1))[1]};
+    writeRefLogTxnRaw(backend, layout, birth);
+
+    RefLogTxn mut;
+    mut.ns = ns.string();
+    mut.txn_id = RefTxnId{2, 1};
+    mut.ops = {publishCommittedOps("b", manifestRef(2, 1, 1))[0],
+               publishCommittedOps("b", manifestRef(2, 1, 1))[1]};
+    writeRefLogTxnRaw(backend, layout, mut);
+}
+
+/// Plants a same-uuid, UNCLEAN (crash-style, no farewell) predecessor mount lease at `epoch`: a bare
+/// `claimMount` followed by a GC fence-out -- mirrors `CasMountTmat.FencedPriorPaysOnlyTmat`. A fenced
+/// prior is an immediate certificate of death (`claimMountAwaitingExpiry` reclaims it on its FIRST
+/// attempt, no observation polling), so a fake-clocked successor `Store::open` above it becomes
+/// unclean deterministically, without any real sleep.
+void seedUncleanPredecessorMount(Backend & backend, const Layout & layout, uint64_t epoch)
+{
+    claimMount(backend, layout, "test", UInt128(1), epoch, /*now_ms=*/1000, /*ttl_ms=*/500);
+    fenceOutRefMount(backend, layout.mountKey("test"));
+}
+
+/// The budget every seal test's successor `Store::open` uses: a 500ms lease TTL needs a scaled-down
+/// budget (RFC cas-s3-timeout-retry-control §required-timeout-model: attempt_timeout + safety_margin <
+/// lease TTL) -- mirrors `CasMountTmat.FencedPriorPaysOnlyTmat` exactly.
+CasRequestBudget sealTestTinyBudget()
+{
+    return CasRequestBudget{
+        .attempt_timeout_ms = 50, .operation_deadline_ms = 50, .max_attempts = 1, .lease_safety_margin_ms = 50};
+}
+
+}
+
+TEST(RefWriterRecoverySeal, UncleanBoundarySealsAllDeadEpochsBeforeExposingState)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/seal_basic"};
+
+    seedSealFixtureDeadEpochs(*backend, layout, ns);
+    seedUncleanPredecessorMount(*backend, layout, /*epoch=*/2);
+
+    PoolConfig config;
+    config.server_id = UInt128(1);
+    config.mount_lease_ttl_ms = std::chrono::milliseconds(500);
+    config.cas_request_budget = sealTestTinyBudget();
+    config.materialization_grace_ms = 1000;
+    config.wait_sleep_fn = [](uint64_t) {};   /// no real sleep -- hygiene: never block a unit test on wall time
+    auto store = openStoreWithConfig(backend, config);
+    ASSERT_TRUE(store);
+    ASSERT_EQ(store->liveWriterEpoch(), 3u);
+    ASSERT_TRUE(store->uncleanEpochBoundarySeenForTest());
+
+    using ProfileEvents::global_counters;
+    const auto sealed_before = global_counters[ProfileEvents::CasRefRecoverySealPublished].load();
+
+    /// Touch the namespace -- a plain read is enough to drive recovery (and, inside it, the seal).
+    EXPECT_EQ(store->listRefs(ns).size(), 2u) << "recovery must still surface both dead-epoch refs";
+
+    EXPECT_EQ(global_counters[ProfileEvents::CasRefRecoverySealPublished].load(), sealed_before + 1);
+
+    const RefTxnId seal_id{2, UINT64_MAX};
+    const auto got = backend->get(layout.refSnapshotKey(ns, seal_id));
+    ASSERT_TRUE(got.has_value()) << "the seal must be durable at {liveWriterEpoch()-1, UINT64_MAX}";
+    const RefTableSnapshot seal = decodeRefTableSnapshot(got->bytes, ns.string(), seal_id);
+    EXPECT_EQ(seal.sealed_from, std::optional<RefTxnId>(RefTxnId{2, 1}))
+        << "sealed_from must be the greatest listed txn id";
+    ASSERT_EQ(seal.committed.size(), 2u);
+    EXPECT_EQ(seal.committed[0].ref_name, "a");
+    EXPECT_EQ(seal.committed[1].ref_name, "b");
+}
+
+TEST(RefWriterRecoverySeal, LateLogBelowSealIsInvisibleToRecoveryAndFold)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/seal_late_log"};
+
+    seedSealFixtureDeadEpochs(*backend, layout, ns);
+    seedUncleanPredecessorMount(*backend, layout, /*epoch=*/2);
+
+    {
+        PoolConfig config;
+        config.server_id = UInt128(1);
+        config.mount_lease_ttl_ms = std::chrono::milliseconds(500);
+        config.cas_request_budget = sealTestTinyBudget();
+        config.materialization_grace_ms = 1000;
+        config.wait_sleep_fn = [](uint64_t) {};
+        auto store = openStoreWithConfig(backend, config);
+        ASSERT_TRUE(store);
+        ASSERT_EQ(store->listRefs(ns).size(), 2u);
+    }   /// the seal is now durable; the store above is released (clean farewell)
+
+    /// A LATE dead-epoch log materializes out-of-band, below the seal (id {2,2} <= seal {2,MAX}) --
+    /// exactly the predecessor's one possible in-flight PUT the seal exists to neutralize.
+    RefLogTxn late;
+    late.ns = ns.string();
+    late.txn_id = RefTxnId{2, 2};
+    late.ops = {publishCommittedOps("c", manifestRef(2, 2, 1))[0], publishCommittedOps("c", manifestRef(2, 2, 1))[1]};
+    writeRefLogTxnRaw(*backend, layout, late);
+
+    /// A fresh, independent recovery (the free function, not a `Store`) must find the seal covers the
+    /// late log: "c" must NOT appear.
+    const RefTableState recovered = recoverRefTable(*backend, layout, ns);
+    ASSERT_EQ(recovered.committed.count("a"), 1u);
+    ASSERT_EQ(recovered.committed.count("b"), 1u);
+    EXPECT_EQ(recovered.committed.count("c"), 0u)
+        << "a log at or below the seal id must be treated as covered, regardless of when it materialized";
+}
+
+TEST(RefWriterRecoverySeal, CleanBoundaryDoesNotSeal)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/seal_clean_boundary"};
+
+    {
+        auto predecessor1 = openStore(backend);   /// epoch 1
+        publishEmptyPart(predecessor1, ns, "a");
+    }   /// clean farewell (drained, nothing in flight)
+    {
+        auto predecessor2 = openStore(backend);   /// epoch 2
+        publishEmptyPart(predecessor2, ns, "b");
+    }   /// clean farewell
+
+    auto successor = openStore(backend);   /// epoch 3, over a CLEAN boundary
+    ASSERT_EQ(successor->liveWriterEpoch(), 3u);
+    ASSERT_FALSE(successor->uncleanEpochBoundarySeenForTest());
+
+    using ProfileEvents::global_counters;
+    const auto sealed_before = global_counters[ProfileEvents::CasRefRecoverySealPublished].load();
+
+    EXPECT_EQ(successor->listRefs(ns).size(), 2u) << "recovery over a clean boundary must still be correct";
+    EXPECT_EQ(global_counters[ProfileEvents::CasRefRecoverySealPublished].load(), sealed_before)
+        << "a clean predecessor boundary must never publish a seal";
+
+    const RefTxnId seal_id{2, UINT64_MAX};
+    EXPECT_FALSE(backend->get(layout.refSnapshotKey(ns, seal_id)).has_value())
+        << "a clean predecessor boundary must not produce a seal snapshot";
+}
+
+TEST(RefWriterRecoverySeal, SealPutFailureFailsRecoveryClosed)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/seal_put_failure"};
+
+    seedSealFixtureDeadEpochs(*backend, layout, ns);
+    seedUncleanPredecessorMount(*backend, layout, /*epoch=*/2);
+
+    PoolConfig config;
+    config.server_id = UInt128(1);
+    config.mount_lease_ttl_ms = std::chrono::milliseconds(500);
+    config.cas_request_budget = sealTestTinyBudget();
+    config.materialization_grace_ms = 1000;
+    config.wait_sleep_fn = [](uint64_t) {};
+    auto store = openStoreWithConfig(backend, config);
+    ASSERT_TRUE(store);
+    ASSERT_EQ(store->liveWriterEpoch(), 3u);
+    ASSERT_TRUE(store->uncleanEpochBoundarySeenForTest());
+
+    const RefTxnId seal_id{2, UINT64_MAX};
+    backend->fault_key_substr = layout.refSnapshotKey(ns, seal_id);
+    backend->fault_count = 1;   /// the seal PUT's single attempt (max_attempts=1) fails ambiguously -> Unresolved
+
+    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { store->listRefs(ns); });
+    EXPECT_FALSE(backend->get(layout.refSnapshotKey(ns, seal_id)).has_value())
+        << "the failed attempt must not have actually landed the seal";
+
+    /// A second touch: the table was never exposed as recovered (the seal PUT failure threw BEFORE
+    /// `rt.recovered` was set), so this restarts recovery from scratch -- LIST, replay, and reseal --
+    /// this time with the PUT succeeding.
+    EXPECT_EQ(store->listRefs(ns).size(), 2u);
+    EXPECT_TRUE(backend->get(layout.refSnapshotKey(ns, seal_id)).has_value())
+        << "the second touch must have recovered and sealed";
 }

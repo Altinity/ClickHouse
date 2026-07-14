@@ -52,6 +52,7 @@ namespace ProfileEvents
     extern const Event CasRefSnapshotPublishDispatched;
     extern const Event CasRefSnapshotPublishBackoff;
     extern const Event CasRefLatePredecessorObserved;
+    extern const Event CasRefRecoverySealPublished;
     extern const Event CasDedupCacheHits;
     extern const Event CasDedupCacheMisses;
 }
@@ -1171,6 +1172,13 @@ void Store::ensureRefTableRecovered(const RootNamespace & ns, RefTableRuntime & 
         }
         std::sort(log_ids.begin(), log_ids.end());
 
+        /// rev.6 Task 8 (spec §recovery-seal): the greatest txn id this attempt's LIST observed across
+        /// BOTH snapshots and logs -- used below to decide whether a dead-epoch region exists to seal.
+        /// Recomputed fresh on every restart-on-vanish attempt, exactly like `greatest_snapshot`/`log_ids`.
+        std::optional<RefTxnId> greatest_listed_id = greatest_snapshot;
+        if (!log_ids.empty() && (!greatest_listed_id || *greatest_listed_id < log_ids.back()))
+            greatest_listed_id = log_ids.back();
+
         bool vanished = false;
         std::optional<RefTableSnapshot> snapshot;
         uint64_t snapshot_body_bytes = 0;   /// weight of the recovered base (spec §Byte Budget); 0 = never-born base
@@ -1210,6 +1218,52 @@ void Store::ensureRefTableRecovered(const RootNamespace & ns, RefTableRuntime & 
 
         rt.state = replay(snapshot, tail);
         rt.cleanup_markers = std::move(cleanup_markers);
+
+        /// rev.6 Task 8 (spec §recovery-seal): at an UNCLEAN mount, close every dead epoch THIS
+        /// recovery discovered with an immediate snapshot -- the seal -- published BEFORE the table is
+        /// exposed as recovered. This runs BEFORE `rt.recovered = true` below on purpose: a failed seal
+        /// PUT throws here, leaving the table unrecovered, so the NEXT touch restarts recovery from
+        /// scratch (fresh LIST, fresh replay, fresh seal attempt) rather than exposing a table whose
+        /// dead-epoch region was never actually closed (spec: "failure fails closed").
+        ///
+        /// `seal_id` is the UPPER BOUND of the dead-epoch region, not the greatest listed id: the wedge
+        /// discipline places the predecessor's one possible in-flight PUT strictly above everything it
+        /// resolved, so only the epoch-closing bound is guaranteed to dominate it (spec §seal-id) --
+        /// any later materialization from a dead epoch is born covered (`<=` seal_id) for every
+        /// observer, forever. `sealed_from` records the greatest id this recovery actually listed, the
+        /// observation horizon a later log past it is measured against (Task 12's late-log detector).
+        const uint64_t my_epoch = liveWriterEpoch();
+        const RefTxnId seal_id{my_epoch - 1, std::numeric_limits<uint64_t>::max()};
+        const bool dead_region_nonempty =
+            greatest_listed_id.has_value() && greatest_listed_id->writer_epoch < my_epoch;
+        const bool already_sealed = snapshot.has_value() && !(snapshot->snapshot_id < seal_id);
+        if (unclean_epoch_boundary_seen.load(std::memory_order_relaxed) && my_epoch >= 2
+            && dead_region_nonempty && !already_sealed && rt.state.lifecycle == RefLifecycle::Live)
+        {
+            RefTableSnapshot seal = snapshotOf(rt.state, ns.string());
+            seal.snapshot_id = seal_id;                     /// upper bound of the covered region
+            seal.sealed_from = rt.state.greatest_applied;    /// == greatest_listed_id: nothing else was applied
+            const String seal_bytes = encodeRefTableSnapshot(seal);
+            const auto fence_ok = [this] { return refAppendFenceOk(); };
+            const auto outcome = ref_request_controller->putIfAbsentControlled(
+                pool_layout.refSnapshotKey(ns, seal_id), seal_bytes, fence_ok);
+            if (outcome != CasWriteOutcome::Committed)
+                throw Exception(ErrorCodes::ABORTED,
+                    "CAS recovery seal PUT for namespace '{}' did not commit; failing recovery closed "
+                    "(the table stays unrecovered/non-writable; the next touch restarts recovery and "
+                    "re-seals)", ns.string());
+            ProfileEvents::increment(ProfileEvents::CasRefRecoverySealPublished);
+
+            /// The seal now covers everything replayed so far: feed it into the SAME bookkeeping below
+            /// (`rt.newest_snapshot_id`, `snapshot_base_state`, `tail_since_snapshot`, cache weight) as
+            /// if it were the recovered snapshot and the tail were empty -- exactly what a fresh
+            /// recovery against the now-durable seal would find.
+            snapshot = std::move(seal);
+            tail.clear();
+            tail_bytes.clear();
+            snapshot_body_bytes = seal_bytes.size();
+        }
+
         rt.recovered = true;
 
         /// Task 11 (spec §writer-snapshot-publication): seed the tail-since-snapshot bookkeeping from

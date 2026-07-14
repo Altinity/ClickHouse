@@ -729,6 +729,11 @@ private:
     };
     static constexpr size_t kMaxRefBatch = 128;
     static constexpr size_t kRefRecoveryMaxRestarts = 3;          /// spec: "bounded (3) and counted"
+    /// rev.6 Task 8 (spec §recovery-seal): a failed recovery-seal PUT (`putIfAbsentControlled` not
+    /// `Committed`) is a SEPARATE fail-closed throw -- it is not one of the restarts counted here
+    /// (those are only LIST/GET restart-on-vanish loops). It leaves `rt.recovered` false, so the table
+    /// stays unrecovered/non-writable and the NEXT touch restarts recovery from a fresh attempt 0
+    /// (re-LIST, re-replay, re-seal), never resuming this bounded loop mid-way.
     /// Fixed Phase-1 safety margin subtracted (alongside the per-table `4 + ns.size()` overhead) from
     /// the raw `ref_snapshot_max_bytes`/`ref_removal_max_bytes` hard limits before calling `admits`.
     static constexpr uint64_t kRefAdmissionSafetyMargin = 4096;
