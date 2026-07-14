@@ -105,7 +105,13 @@ public:
         /// in `startup()`. See `Cas::PoolConfig::materialization_grace_ms`. Trailing default (the same
         /// 30000 default as the `PoolConfig` field) keeps every existing positional call site compiling
         /// unmodified.
-        uint64_t materialization_grace_ms_ = 30000);
+        uint64_t materialization_grace_ms_ = 30000,
+        /// §3 (spec 2026-07-13-cas-memory-s3-budget-optimizations-design.md): the ForceFresh body
+        /// re-proof HEAD's validation policy, read from the per-disk `<part_folder_validate>` config
+        /// directive and threaded into the facade's `CacheParams` in `startup()`. Trailing default
+        /// (`Mode::Always`, byte-for-byte pre-§3 behavior) keeps every existing positional call site
+        /// compiling unmodified.
+        ContentAddressed::PartFolderValidate part_folder_validate_ = {});
 
     /// Parse `staging_backend` from the CAS disk config (default `local` — the OFF BY DEFAULT
     /// global constraint). Extracted as a static method (rather than inlined into
@@ -361,6 +367,10 @@ private:
     /// rev.6 Task 6: the per-disk `<materialization_grace_ms>` directive, threaded into `Cas::PoolConfig`
     /// in `startup()`. See `Cas::PoolConfig::materialization_grace_ms`.
     const uint64_t materialization_grace_ms;
+    /// §3: the ForceFresh body re-proof HEAD's validation policy (part_folder_validate config key),
+    /// threaded into the facade's CacheParams in startup(). Mode::Always is byte-for-byte pre-§3
+    /// behavior.
+    const ContentAddressed::PartFolderValidate part_folder_validate;
     /// Set later by the mount-time conditional-copy capability probe (a later task) — NOT const.
     /// Defaults to false (fail-close): assumed unsupported until the probe proves otherwise.
     bool conditional_copy_supported = false;

@@ -18,6 +18,20 @@ namespace DB::Cas { class Build; }
 namespace DB::ContentAddressed
 {
 
+/// §3 (spec 2026-07-13-cas-memory-s3-budget-optimizations-design.md): the ForceFresh re-proof HEAD
+/// (`readManifestShared`'s mandatory body HEAD -- an INV-NO-DANGLE fail-closed net, not protocol
+/// correctness) is configurable via the `part_folder_validate` disk setting. `Always` (the default)
+/// is byte-for-byte pre-§3 behavior: EVERY `ForceFresh` re-proves the manifest body. `Age`/`Never`
+/// may instead serve a retained view whose manifest id + mutable files still match a fresh `resolve`
+/// -- ref currency is proven either way; only the body-existence re-proof is skipped, so a real
+/// manifest change under a retained view is still caught by the resolve-vs-cache mismatch and rebuilt.
+struct PartFolderValidate
+{
+    enum class Mode : uint8_t { Always, Age, Never };
+    Mode mode = Mode::Always;
+    uint64_t age_seconds = 0;    /// only meaningful for Mode::Age
+};
+
 /// The single facade for committed content-addressed part-folder access (spec
 /// 2026-07-08-cas-part-folder-cache). Reads build immutable `PartFolderView`s; committed part-ref
 /// mutations are facade methods so cache effects are write-through, never a caller responsibility.
@@ -40,6 +54,9 @@ public:
         /// path takes a per-disk global mutex and allocates on EVERY read. Off by default so the read
         /// hit path never pays for it; the disk factory / tests turn it on when they consult explain().
         bool explain_enabled = false;
+        /// §3: the ForceFresh body re-proof policy. Default `Always` keeps `CacheParams{}` (the
+        /// unit-test default, and every pre-§3 caller) byte-for-byte unchanged.
+        PartFolderValidate validate;
     };
 
     /// NOTE: `CacheParams params_ = {}` cannot be a default ARGUMENT here — Clang's complete-class-
@@ -48,7 +65,11 @@ public:
     /// argument written inside the class body is evaluated too early. Two overloads sidestep it; the
     /// single-arg form default-constructs `CacheParams` (retention disabled) out-of-line.
     explicit CachedPartFolderAccess(Cas::StorePtr store_);
-    CachedPartFolderAccess(Cas::StorePtr store_, CacheParams params_);
+    /// `now_ms_fn_`: wall-clock ms, injected (tests) for the §3 age-window comparison AND the
+    /// retained view's `validated_at_ms` stamp -- the SAME function drives both, so a test controls
+    /// each side of the comparison exactly. Defaults to `std::chrono::system_clock` (mirrors
+    /// `Cas::Gc`'s `now_ms_fn` convention) when empty.
+    CachedPartFolderAccess(Cas::StorePtr store_, CacheParams params_, std::function<uint64_t()> now_ms_fn_ = {});
 
     /// Resolve + validated manifest read, joined into a view. nullptr = the ref is absent.
     /// EVERY mode re-proves the manifest body via `readManifestShared`'s mandatory HEAD in this
@@ -106,6 +127,9 @@ public:
 private:
     Cas::StorePtr store;
     CacheParams params;
+    /// §3: wall-clock ms; see the ctor doc comment. `std::function::operator()` is const, so this is
+    /// callable from const methods (`getView`, `buildView`) without a `mutable` qualifier.
+    std::function<uint64_t()> now_ms_fn;
 
     struct ViewWeight
     {

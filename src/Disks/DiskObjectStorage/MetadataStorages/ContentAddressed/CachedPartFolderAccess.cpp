@@ -1,8 +1,10 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/CachedPartFolderAccess.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.h>
+#include <Common/DateLUT.h>
 #include <Common/ProfileEvents.h>
 #include <Common/logger_useful.h>
 #include <base/scope_guard.h>
+#include <chrono>
 
 namespace DB::ErrorCodes
 {
@@ -19,6 +21,7 @@ namespace ProfileEvents
     extern const Event CasPartFolderViewOversizedBypasses;
     extern const Event CasPartFolderViewInvalidations;
     extern const Event CasRefRollbackBestEffortDropFailed;
+    extern const Event CasPartFolderValidateSkipped;
 }
 
 namespace CurrentMetrics
@@ -35,9 +38,11 @@ CachedPartFolderAccess::CachedPartFolderAccess(Cas::StorePtr store_)
 {
 }
 
-CachedPartFolderAccess::CachedPartFolderAccess(Cas::StorePtr store_, CacheParams params_)
-    : store(std::move(store_)), params(params_)
+CachedPartFolderAccess::CachedPartFolderAccess(Cas::StorePtr store_, CacheParams params_, std::function<uint64_t()> now_ms_fn_)
+    : store(std::move(store_)), params(params_), now_ms_fn(std::move(now_ms_fn_))
 {
+    if (!now_ms_fn)
+        now_ms_fn = []() -> uint64_t { return timeInMilliseconds(std::chrono::system_clock::now()); };
     if (params.cache_bytes > 0)
         view_cache = std::make_unique<ViewCache>(
             "LRU", CurrentMetrics::CasPartFolderCacheBytes, CurrentMetrics::CasPartFolderCacheEntries,
@@ -75,7 +80,8 @@ CachedPartFolderAccess::getView(const PartRefKey & key, Freshness freshness) con
                 /// the SAME shared decode; no manifest operation at all.
                 auto refreshed = std::make_shared<PartFolderView>(
                     key, resolved->manifest_id, resolved->manifest_size,
-                    resolved->published_at_ms, resolved->mutable_files, cached->manifest());
+                    resolved->published_at_ms, resolved->mutable_files, cached->manifest(),
+                    cached->validatedAtMs());   /// mutable-only drift did not re-prove the body
                 if (refreshed->estimatedBytes() <= params.max_entry_bytes)
                     view_cache->set(cache_key, refreshed);
                 ProfileEvents::increment(ProfileEvents::CasPartFolderViewMutableRefreshes);
@@ -84,6 +90,30 @@ CachedPartFolderAccess::getView(const PartRefKey & key, Freshness freshness) con
             }
             ProfileEvents::increment(ProfileEvents::CasPartFolderViewValidationMismatches);
             /// fall through to rebuild — the stale entry is superseded by the insert below
+        }
+    }
+
+    /// §3 (part_folder_validate): ForceFresh may serve a retained view WITHOUT the mandatory body
+    /// HEAD when the mode permits -- the ref currency is proven by `resolve` above; only the
+    /// INV-NO-DANGLE body re-proof is skipped. StrictValidate never enters here (it bypasses
+    /// retention, spec §Validate-On-Hit). A manifest_id/mutable_files mismatch still falls through to
+    /// rebuild below -- a genuine change under a retained view is caught exactly like CachedForLoad's
+    /// mismatch path above.
+    if (freshness == Freshness::ForceFresh && view_cache && params.validate.mode != PartFolderValidate::Mode::Always)
+    {
+        if (auto cached = view_cache->get(cache_key);
+            cached && cached->manifestId() == resolved->manifest_id
+            && cached->mutableFiles() == resolved->mutable_files)
+        {
+            const bool fresh_enough = params.validate.mode == PartFolderValidate::Mode::Never
+                || (now_ms_fn() - cached->validatedAtMs()) < params.validate.age_seconds * 1000ULL;
+            if (fresh_enough)
+            {
+                ProfileEvents::increment(ProfileEvents::CasPartFolderViewHits);
+                ProfileEvents::increment(ProfileEvents::CasPartFolderValidateSkipped);
+                recordDecision(cache_key, LastDecision::Hit, cached.get(), /*retained=*/true);
+                return cached;
+            }
         }
     }
 
@@ -126,7 +156,7 @@ std::shared_ptr<const PartFolderView> CachedPartFolderAccess::buildView(
     /// Fresh modes must not coalesce onto another caller's read (each ForceFresh/StrictValidate
     /// call owns its mandatory HEAD); only cold CachedForLoad builds single-flight.
     if (freshness != Freshness::CachedForLoad)
-        return PartFolderView::make(key, resolved, store->readManifestShared(resolved.manifest_id));
+        return PartFolderView::make(key, resolved, store->readManifestShared(resolved.manifest_id), now_ms_fn());
 
     std::promise<std::shared_ptr<const PartFolderView>> promise;
     std::shared_future<std::shared_ptr<const PartFolderView>> future;
@@ -151,7 +181,7 @@ std::shared_ptr<const PartFolderView> CachedPartFolderAccess::buildView(
     });
     try
     {
-        auto view = PartFolderView::make(key, resolved, store->readManifestShared(resolved.manifest_id));
+        auto view = PartFolderView::make(key, resolved, store->readManifestShared(resolved.manifest_id), now_ms_fn());
         promise.set_value(view);
         return view;
     }

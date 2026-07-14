@@ -8,13 +8,14 @@ namespace DB::ContentAddressed
 
 PartFolderView::PartFolderView(PartRefKey key_, Cas::ManifestId manifest_id_, uint64_t manifest_size_,
                                uint64_t published_at_ms_, std::map<String, String> mutable_files_,
-                               std::shared_ptr<const Cas::PartManifest> manifest_)
+                               std::shared_ptr<const Cas::PartManifest> manifest_, uint64_t validated_at_ms_)
     : key(std::move(key_))
     , manifest_id(std::move(manifest_id_))
     , manifest_size(manifest_size_)
     , published_at_ms(published_at_ms_)
     , mutable_files(std::move(mutable_files_))
     , manifest_body(std::move(manifest_))
+    , validated_at_ms(validated_at_ms_)
 {
     chassert(manifest_body);
     /// The binary-search contract: entries must be STRICTLY ascending by `path` (sorted AND unique) —
@@ -28,11 +29,12 @@ PartFolderView::PartFolderView(PartRefKey key_, Cas::ManifestId manifest_id_, ui
 }
 
 std::shared_ptr<const PartFolderView> PartFolderView::make(
-    PartRefKey key, const Cas::Resolved & resolved, std::shared_ptr<const Cas::PartManifest> manifest)
+    PartRefKey key, const Cas::Resolved & resolved, std::shared_ptr<const Cas::PartManifest> manifest,
+    uint64_t validated_at_ms)
 {
     return std::make_shared<const PartFolderView>(
         std::move(key), resolved.manifest_id, resolved.manifest_size,
-        resolved.published_at_ms, resolved.mutable_files, std::move(manifest));
+        resolved.published_at_ms, resolved.mutable_files, std::move(manifest), validated_at_ms);
 }
 
 std::optional<std::string> PartFolderView::projectionDirPrefix(const std::string & file)

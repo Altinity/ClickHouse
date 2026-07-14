@@ -24,12 +24,16 @@ class PartFolderView
 public:
     PartFolderView(PartRefKey key_, Cas::ManifestId manifest_id_, uint64_t manifest_size_,
                    uint64_t published_at_ms_, std::map<String, String> mutable_files_,
-                   std::shared_ptr<const Cas::PartManifest> manifest_);
+                   std::shared_ptr<const Cas::PartManifest> manifest_, uint64_t validated_at_ms_);
 
-    /// Convenience join of a fresh `Resolved` + its validated shared decode.
+    /// Convenience join of a fresh `Resolved` + its validated shared decode. `validated_at_ms` is the
+    /// caller's "now" (spec §3 part_folder_validate): construction is only reached after
+    /// `readManifestShared`'s mandatory HEAD, so it IS a body-proven moment. The caller supplies it
+    /// (rather than this reading a clock itself) so `CachedPartFolderAccess`'s single injectable clock
+    /// drives both this stamp and its own age-window comparison — the same seam tests use.
     static std::shared_ptr<const PartFolderView> make(
         PartRefKey key, const Cas::Resolved & resolved,
-        std::shared_ptr<const Cas::PartManifest> manifest);
+        std::shared_ptr<const Cas::PartManifest> manifest, uint64_t validated_at_ms);
 
     /// Wiring-reserved RefPayload.mutable_files keys (dot-prefixed `.ca_*`) — never user-visible.
     static bool isReservedMutableName(std::string_view name) { return name.starts_with(".ca_"); }
@@ -45,6 +49,10 @@ public:
     uint64_t publishedAtMs() const { return published_at_ms; }
     const std::map<String, String> & mutableFiles() const { return mutable_files; }
     const std::shared_ptr<const Cas::PartManifest> & manifest() const { return manifest_body; }
+    /// The wall-clock ms at which this view's manifest body was last HEAD-proven live (spec §3
+    /// part_folder_validate). A mutable-only refresh clone carries the ORIGINAL view's stamp forward
+    /// (a mutable drift did not re-prove the body).
+    uint64_t validatedAtMs() const { return validated_at_ms; }
 
     const Cas::ManifestEntry * findFile(const String & path) const;
     bool hasFile(const String & path) const;                      /// entry OR non-reserved mutable
@@ -62,6 +70,7 @@ private:
     uint64_t published_at_ms = 0;
     std::map<String, String> mutable_files;
     std::shared_ptr<const Cas::PartManifest> manifest_body;
+    uint64_t validated_at_ms = 0;
 };
 
 }

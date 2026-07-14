@@ -146,7 +146,8 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     Cas::BlobHashAlgo blob_hash_algo_,
     bool blob_hash_allow_new_,
     bool skip_access_check_,
-    uint64_t materialization_grace_ms_)
+    uint64_t materialization_grace_ms_,
+    ContentAddressed::PartFolderValidate part_folder_validate_)
     : object_storage(std::move(object_storage_))
     , storage_path_prefix(std::move(storage_path_prefix_))
     , storage_path_full(fs::path(object_storage->getRootPrefix()) / storage_path_prefix)
@@ -174,6 +175,7 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     , blob_hash_allow_new(blob_hash_allow_new_)
     , skip_access_check(skip_access_check_)
     , materialization_grace_ms(materialization_grace_ms_)
+    , part_folder_validate(part_folder_validate_)
 {
 }
 
@@ -446,7 +448,8 @@ void ContentAddressedMetadataStorage::startup()
         ContentAddressed::CachedPartFolderAccess::CacheParams{
             .cache_bytes = cas_part_folder_cache_bytes,
             .max_entries = cas_part_folder_cache_max_entries,
-            .max_entry_bytes = cas_part_folder_cache_max_entry_bytes});
+            .max_entry_bytes = cas_part_folder_cache_max_entry_bytes,
+            .validate = part_folder_validate});
 
     /// B170: bridge per-event CAS decisions to system.content_addressed_log (null sink when context
     /// is absent, e.g. unit tests — emitEvent is then a no-op single branch in the Core).

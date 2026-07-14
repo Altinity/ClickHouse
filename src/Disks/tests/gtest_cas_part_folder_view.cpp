@@ -47,7 +47,8 @@ std::shared_ptr<const ContentAddressed::PartFolderView> makeView()
     return std::make_shared<const ContentAddressed::PartFolderView>(
         ContentAddressed::PartRefKey{Cas::RootNamespace{"srv/t"}, "part_1"},
         Cas::ManifestId{Cas::RootNamespace{"srv/t"}, Cas::ManifestRef{1, 2, 3}},
-        /*manifest_size=*/1000, /*published_at_ms=*/42, std::move(mutables), manifest);
+        /*manifest_size=*/1000, /*published_at_ms=*/42, std::move(mutables), manifest,
+        /*validated_at_ms=*/42);
 }
 
 std::vector<String> sorted(std::vector<String> v) { std::sort(v.begin(), v.end()); return v; }

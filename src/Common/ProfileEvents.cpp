@@ -861,6 +861,7 @@ The server successfully detected this situation and will download merged part fr
     M(CasDedupCacheHits, "CA dedup cache: presence-cache lookups that found the hash already known-present (Build::putBlob may look up the same hash twice per call, so this counts lookups, not distinct blobs); a hit steers putBlob onto the cheap HEAD-first branch instead of an unconditional body stream — it does not itself skip a HEAD, the following HEAD still runs (Round-B §2)", ValueType::Number) \
     M(CasDedupCacheMisses, "CA dedup cache: presence-cache lookups that found no entry for the hash, falling through to the size-threshold check / normal upload path (Round-B §2)", ValueType::Number) \
     M(CasRefRecoverySealPublished, "CA ref-table recovery seals published: an unclean-mount recovery closed a dead-epoch region with an immediate snapshot at its upper bound before exposing the table as recovered (rev.6 §recovery-seal); counts only PUTs that committed, never an attempted-but-failed one", ValueType::Number) \
+    M(CasPartFolderValidateSkipped, "CA part-folder cache: ForceFresh body re-proof HEADs skipped because part_folder_validate is 'never' or the retained view's last validation is younger than the 'age' window (Round-B §3)", ValueType::Number) \
     M(S3GetObjectTagging, "Number of S3 API GetObjectTagging calls.", ValueType::Number) \
     M(S3CreateMultipartUpload, "Number of S3 API CreateMultipartUpload calls.", ValueType::Number) \
     M(S3UploadPartCopy, "Number of S3 API UploadPartCopy calls.", ValueType::Number) \
