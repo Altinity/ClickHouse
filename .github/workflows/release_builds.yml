@@ -698,7 +698,7 @@ jobs:
           fi
 
   install_packages_amd_release:
-    runs-on: [self-hosted, altinity-on-demand, altinity-builder]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_release]
     name: "Install packages (amd_release)"
     outputs:
@@ -745,7 +745,7 @@ jobs:
           fi
 
   install_packages_arm_release:
-    runs-on: [self-hosted, altinity-on-demand, altinity-builder]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester-aarch64]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_arm_release]
     name: "Install packages (arm_release)"
     outputs:
