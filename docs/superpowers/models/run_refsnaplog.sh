@@ -8,6 +8,15 @@
 #                                   at the old below-durable epoch — the epoch-route fix makes it GREEN)
 #   latepred                     -> expect VIOLATION (INV_RECOVERY; documented Phase-1 late-predecessor
 #                                   limitation, spec §late-predecessor-put — "violation found" is PASS)
+#   rev6_safe                    -> expect GREEN (coverage-at-birth seal, no late delivery possible)
+#   rev6_latedelivery            -> expect GREEN (NoDivergentFold; amended 2026-07-14 -- the
+#                                   in-flight transient is inexpressible under this model's
+#                                   reader-freeze abstraction once WriterPublishSnapshot's
+#                                   CoveredFold excludes droppedEver; see the Task 1 amendment note
+#                                   in docs/superpowers/plans/2026-07-13-cas-ref-lease-exclusivity-rev6.md)
+#   rev6_freshreader             -> expect GREEN (INV_FRESH_READER + INV_SNAP_DETERMINISTIC; the
+#                                   regression guard for the CoveredFold fix -- was RED on
+#                                   INV_SNAP_DETERMINISTIC before that fix)
 # Exits nonzero if any expectation is unmet.
 set -uo pipefail
 cd "$(dirname "$0")"
@@ -23,6 +32,9 @@ CONFIGS=(
   "sab_recreatebeforecompleted violation  INV_RECREATE"
   "sab_remountkeepsoldepoch    violation  INV_RECOVERY"
   "latepred                    violation  INV_RECOVERY"
+  "rev6_safe                   green      -"
+  "rev6_latedelivery           green      -"
+  "rev6_freshreader            green      -"
 )
 
 overall=0

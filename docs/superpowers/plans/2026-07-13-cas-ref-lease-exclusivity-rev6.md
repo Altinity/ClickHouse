@@ -58,6 +58,12 @@ consumes the previous task's interfaces). 9 independent after 2. 10 after 8. 11�
 
 ### Task 1: TLA+ gate — ref model rev.6 (`NoDivergentFold`) {#task-1}
 
+(amended 2026-07-14: `CoveredFold` fix + `_rev6_latedelivery` expectation corrected to GREEN —
+in-flight transient inexpressible under the reader-freeze abstraction; falsifiability held by
+`rev6_freshreader`. See the amendment note after Step 5 below for the full explanation and the
+verified guard names — do not re-derive the "expected VIOLATION" framing below at face value, it
+was superseded.)
+
 **Files:**
 - Modify: `docs/superpowers/models/CaRefTableSnapshotLogCore.tla`
 - Create: `docs/superpowers/models/CaRefTableSnapshotLogCore_rev6_safe.cfg`
@@ -118,6 +124,18 @@ INV_SNAP_DETERMINISTIC == Rev6MountRule =>
     \A X \in snaps : snapCov[X] = FoldIds(EmptyState, {i \in (writtenEver \ droppedEver) : i <= X})
 ```
 
+**AMENDED 2026-07-14 — load-bearing, do not omit:** the snippet above is not sufficient by itself.
+`WriterPublishSnapshot`'s own fold formula must ALSO exclude `droppedEver` under `Rev6MountRule`, or
+`INV_SNAP_DETERMINISTIC` is unsatisfiable by construction (any snapshot published at/above a dropped
+id, after the drop landed, would silently re-include it — this was caught by the gate itself, not by
+inspection, the first time this task ran):
+```tla
+CoveredFold(X) == IF Rev6MountRule
+                   THEN FoldIds(EmptyState, { i \in (writtenEver \ droppedEver) : i <= X })
+                   ELSE FoldIds(EmptyState, { i \in writtenEver : i <= X })
+\* WriterPublishSnapshot: snapCov' = [snapCov EXCEPT ![X] = CoveredFold(X)]   (was: raw refold)
+```
+
 Keep `INV_RECOVERY` for the legacy configs (guard it with `~Rev6MountRule` where the two would
 conflict is NOT needed — legacy configs set `Rev6MountRule = FALSE` so `NoDivergentFold` is
 vacuous there and `INV_RECOVERY` keeps its old meaning).
@@ -137,13 +155,19 @@ CONSTANTS MaxSeq = 4  MaxRestarts = 2
 INVARIANTS TypeOK INV_RECOVERY INV_NOFAIL INV_RECREATE NoDivergentFold INV_SNAP_DETERMINISTIC INV_FRESH_READER
 ```
 
-`_rev6_latedelivery.cfg` — the T_mat-violation demo: `LatePred = TRUE, Rev6MountRule = TRUE`,
-INVARIANTS `TypeOK NoDivergentFold` → **expected VIOLATION of `NoDivergentFold`** (an in-flight
-reader transiently sees the dropped log; this is the documented accepted transient).
+`_rev6_latedelivery.cfg` — the late-delivery-under-an-existing-snapshot demo: `LatePred = TRUE,
+Rev6MountRule = TRUE`, INVARIANTS `TypeOK NoDivergentFold` → **AMENDED 2026-07-14: expected GREEN**,
+`MaxSeq = 5` (not 4 — see amendment note after Step 5 for why 5, not 4, is the bound to use). The
+original brief expected a VIOLATION here ("an in-flight reader transiently sees the dropped log");
+that premise does not hold once `WriterPublishSnapshot` correctly excludes `droppedEver` (see the
+`CoveredFold` amendment to Step 1 above) — do not re-introduce the raw refold to manufacture a
+violation.
 
-`_rev6_freshreader.cfg` — same constants, INVARIANTS
+`_rev6_freshreader.cfg` — same constants, `MaxSeq = 5`, INVARIANTS
 `TypeOK INV_FRESH_READER INV_SNAP_DETERMINISTIC` → expected **GREEN** (fresh observers are
-deterministic; snapshots stay byte-deterministic even under violation).
+deterministic; snapshots stay byte-deterministic). This config is the regression guard for the
+`CoveredFold` fix: it was RED on `INV_SNAP_DETERMINISTIC` before the fix, proving the invariant is
+falsifiable, not vacuously green.
 
 Legacy configs are untouched except each existing `.cfg` gains `Rev6MountRule = FALSE`.
 
@@ -154,10 +178,11 @@ Expected: same PASS table as before the change (safe green, each sab red on its 
 `latepred` red = PASS). Use a subagent to summarize the log.
 
 - [ ] **Step 4: Add the three rev.6 configs to `run_refsnaplog.sh` with their expectations**
-(`rev6_safe` → GREEN, `rev6_latedelivery` → violation-is-PASS, `rev6_freshreader` → GREEN) and run
-again: `./run_refsnaplog.sh > ../../../tmp/tlc_refsnaplog_rev6.log 2>&1`. Expected: full PASS
-table. If `rev6_freshreader` is red, the model (or the design) has a hole — STOP and report; do
-not proceed to implementation tasks.
+(`rev6_safe` → GREEN, `rev6_latedelivery` → **AMENDED: GREEN, not violation-is-PASS**,
+`rev6_freshreader` → GREEN) and run again: `./run_refsnaplog.sh > ../../../tmp/tlc_refsnaplog_rev6.log
+2>&1`. Expected: full PASS table. If `rev6_freshreader` is red, the model (or the design) has a hole
+— STOP and report; do not proceed to implementation tasks. (This is exactly what happened the first
+time this task ran, with the original un-amended snippet — see the amendment note below.)
 
 - [ ] **Step 5: Commit**
 
@@ -165,6 +190,70 @@ not proceed to implementation tasks.
 git add docs/superpowers/models/CaRefTableSnapshotLogCore.tla docs/superpowers/models/*.cfg docs/superpowers/models/run_refsnaplog.sh
 git commit -m "cas: TLA ref model rev.6 — NoDivergentFold under coverage-at-birth seal"
 ```
+
+#### Amendment (2026-07-14): `CoveredFold` fix and the `_rev6_latedelivery` GREEN {#task-1-amendment}
+
+Running this task as originally written produces `rev6_freshreader` RED on
+`INV_SNAP_DETERMINISTIC` — the Step-1 snippet transcribed above never propagates `droppedEver` into
+`WriterPublishSnapshot`'s own fold, so any snapshot published at/above a dropped id, after the drop
+landed, silently re-includes it. The Step 1 section above has been amended in place with the
+`CoveredFold` fix; apply that, not the original unfixed formula.
+
+With `CoveredFold` in place, `_rev6_latedelivery` (checking `NoDivergentFold` alone) unexpectedly also
+came back GREEN rather than the originally-expected violation, at every bound tested:
+- `MaxSeq = 5`, exhaustive: no error, 35,656,456 states generated, 0 left on queue (8s) — a clean
+  proof, not a timeout.
+- `MaxSeq = 6`, exhaustive: no violation found before being stopped at 426,892,469 states generated /
+  13,277,931 states left on queue (still climbing) after ~5 minutes wall time / 10+ GB resident —
+  abandoned as impractical rather than left to explore an apparently-empty region indefinitely.
+- `MaxSeq = 12`, random simulation (`-simulate num=1000000 -depth 60`, `MaxRestarts=3`): 183,514,671
+  states checked across 1,000,000 traces in ~100s, zero violations.
+
+This is not "the bound was too small" — re-tracing the original (pre-fix) `MaxSeq=6` counterexample
+showed its violating reader had picked a snapshot whose body wrongly included the dropped id, i.e.
+that counterexample was itself the `INV_SNAP_DETERMINISTIC` defect surfacing through a different
+invariant. Once the fold is correct, no distinct counterexample has been found.
+
+**Verified guard (do not assume, check `CaRefTableSnapshotLogCore.tla` directly if this drifts):**
+`ReaderInactive == rPhase = "idle"` gates exactly six actions — `WriterBirth`, `WriterMut`,
+`WriterRemove`, `WriterRebirth`, `WriterFail`, `GcComplete` — the ordinary namespace-lifecycle writes.
+Once the model's single global reader starts (`rPhase` only ever moves forward,
+idle→scan→fetch→{done,failed,stuck}, never back to idle), none of those six can fire again for the
+rest of the run. `ReaderInactive` does **not** gate `WriterPublishSnapshot` (explicitly commented
+"off-lane; may run during a reader's recovery"), nor `GcCleanupLog`, `GcCleanupSnap`, or
+`LatePredecessorPut` — all four remain concurrent with an in-flight reader, by design. **The green
+result does not depend on publish being frozen** (it isn't); it depends on the conjunction of:
+1. ordinary writes freezing on reader-start (so any id later dropped must have been created either
+   before the reader started, or by the drop action itself — never by a concurrent ordinary write);
+2. the model's key space sorting all `_log` keys before all `_snap` keys regardless of id
+   (`KeyLt`: kind-major), so the reader's single ordered scan can only fail to enumerate a currently-
+   present snapshot if that snapshot did not yet exist at the instant its scan completed;
+3. `GcCleanupSnap` never deleting the sole/newest present snapshot (its guard requires a strictly
+   greater one to already coexist);
+4. `LatePredecessorPut`'s own precondition requiring an existing covering snapshot `X > L` before a
+   drop can happen at all — and, because that snapshot was present before or at `L`'s creation, (2)+(3)
+   guarantee the reader's scan (whether it started before or after `X` published) will always still
+   enumerate `X` or a still-newer replacement before its own scan can complete;
+5. `CoveredFold` ensuring every published `snapCov[X]` already excludes `droppedEver` as of its own
+   publish time (whether because a not-yet-landed `L` simply wasn't `writtenEver` yet, or because `L`
+   was already dropped by the time a later `X` published) — and both `droppedEver` and `writtenEver`
+   only grow, never shrink, so this stays true going forward.
+
+Chained together: whatever snapshot a reader ultimately picks is always `>= X > L` for any `L` that
+could possibly be dropped during its lifetime, so `L` can only ever land in `Reconstruct`'s *base*
+(already excluded by (5)), never its *tail* (which structurally excludes anything `<= rPickedSnap`).
+`NoDivergentFold` only constrains `rPhase = "done"` states, so the "in-flight reader transiently sees
+it" case the original brief described was never actually reachable in a way this invariant could
+observe — the only real failure mode was the `CoveredFold`/`INV_SNAP_DETERMINISTIC` bug, now fixed.
+
+**This is an abstraction-limit finding, not a stronger-than-designed system property.** The real
+system's in-flight T_mat-violation transient (accepted, spec's T_mat/seal sections — Tasks 6-8) is not
+expressible in this model, because this model serializes the reader against ordinary writes
+(property 1 above) in a way the real system does not: a real reader observes a live, concurrently-
+mutating table, not a frozen one. `_rev6_latedelivery` is therefore GREEN here as a fact about this
+model's reader-freeze abstraction, not a proof that the real system's transient cannot happen.
+`INV_FRESH_READER` remains the fresh-observer guarantee the design actually needs; `rev6_freshreader`
+is the regression guard for the `CoveredFold` fix (proven falsifiable — it was RED before the fix).
 
 ---
 

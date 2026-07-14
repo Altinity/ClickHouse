@@ -36,6 +36,17 @@
      break complete recovery; that counterexample is the documented Phase-1 limitation, retained as
      expected-fail, never removed by assuming a mount fence cancels an in-flight S3 request.
 
+   rev.6 addendum (spec 2026-07-13-cas-ref-lease-exclusivity-rev6-design.md): `Rev6MountRule`
+   models coverage-at-birth sealing a successor's mount against exactly this straggler. The late
+   PUT still lands (an in-flight S3 request cannot be cancelled) but is folded out of the
+   contract-clean oracle `WStateRev6` via the ghost `droppedEver`. `NoDivergentFold` is the strict
+   oracle-match for a finished reader and is EXPECTED TO VIOLATE under `_rev6_latedelivery` (an
+   in-flight reader may transiently observe the dropped log — the documented accepted transient,
+   error direction spare-not-delete); `INV_FRESH_READER` is the weaker post-T_mat containment that
+   any reader STARTING after the drop (`rStartedAfterDrop`) always agrees, and `INV_SNAP_DETERMINISTIC`
+   pins that published snapshot bytes stay deterministic under the same oracle. Legacy configs set
+   `Rev6MountRule = FALSE`, making all three vacuous there.
+
    Each Sabotage* constant breaks exactly one load-bearing rule and MUST yield a counterexample;
    with all Sabotage* false and LatePred false the model is GREEN. *)
 EXTENDS Integers, FiniteSets
@@ -47,7 +58,8 @@ CONSTANTS
     SabotageVanishIsCorruption,      \* reader treats a vanished selected object as corruption, not restart
     SabotageRecreateBeforeCompleted, \* namespace_birth over Removed without the durable Completed marker
     SabotageRemountKeepsOldEpoch,    \* a self-remount keeps stamping fresh appends at the old (below-durable) epoch
-    LatePred                         \* enable LatePredecessorPut (adversarial; expected-fail)
+    LatePred,                        \* enable LatePredecessorPut (adversarial; expected-fail)
+    Rev6MountRule                    \* coverage-at-birth drops a late PUT (rev.6 lease-exclusivity rule)
 
 Seqs == 1..MaxSeq
 Ops == {"none", "birth", "mut", "remove", "rebirth"}
@@ -65,15 +77,18 @@ VARIABLES
     nextId,        \* next id to allocate (1..MaxSeq+1)
     completed,     \* BOOLEAN  GC namespace-cleanup Completed for the current remove (marker durable)
     badRecreate,   \* ghost: a recreation happened without a durable Completed (sabotage only)
+    droppedEver,   \* ghost: late PUTs that landed under an existing snapshot (rev.6 coverage-at-birth)
     rPhase,        \* "idle"|"scan"|"fetch"|"done"|"failed"|"stuck"
     rScanPos,      \* last key returned by the ordered scan (resume-after-last-returned-key)
     rSeenLogs,     \* SUBSET Seqs  log ids enumerated in this scan
     rSeenSnaps,    \* SUBSET Seqs  snapshot ids enumerated in this scan
     rPickedSnap,   \* chosen snapshot id (0 = empty base)
-    rRestarts      \* restart counter
+    rRestarts,     \* restart counter
+    rStartedAfterDrop \* ghost: this reader started after the last late delivery (rev.6)
 
 vars == << op, writtenEver, logs, snaps, publishedEver, snapCov, nextId, completed,
-           badRecreate, rPhase, rScanPos, rSeenLogs, rSeenSnaps, rPickedSnap, rRestarts >>
+           badRecreate, droppedEver, rPhase, rScanPos, rSeenLogs, rSeenSnaps, rPickedSnap,
+           rRestarts, rStartedAfterDrop >>
 
 MinOf(S) == CHOOSE x \in S : \A y \in S : x <= y
 MaxOf(S) == CHOOSE x \in S : \A y \in S : x >= y
@@ -95,6 +110,9 @@ FoldIds(base, S) ==
 WState == FoldIds(EmptyState, writtenEver)               \* Replay(full history) — the oracle
 LifeBelow(L) == FoldIds(EmptyState, { i \in writtenEver : i < L }).life
 
+\* rev.6 oracle: contract-clean truth excludes never-ACKed writes dropped by coverage-at-birth
+WStateRev6 == FoldIds(EmptyState, writtenEver \ droppedEver)
+
 (* Ordered key space: all _log keys (kind 0) sort before all _snap keys (kind 1); within a kind by
    id. This is `_log` < `_snap` from `l < s` in the spec's canonical prefix order. *)
 KeyLt(a, b) == (a.kind < b.kind) \/ (a.kind = b.kind /\ a.id < b.id)
@@ -110,12 +128,14 @@ Init ==
     /\ nextId = 1
     /\ completed = FALSE
     /\ badRecreate = FALSE
+    /\ droppedEver = {}
     /\ rPhase = "idle"
     /\ rScanPos = StartPos
     /\ rSeenLogs = {}
     /\ rSeenSnaps = {}
     /\ rPickedSnap = 0
     /\ rRestarts = 0
+    /\ rStartedAfterDrop = TRUE
 
 ReaderInactive == rPhase = "idle"
 
@@ -130,7 +150,8 @@ WriterBirth ==
     /\ logs' = logs \cup {nextId}
     /\ nextId' = nextId + 1
     /\ UNCHANGED << snaps, publishedEver, snapCov, completed, badRecreate,
-                    rPhase, rScanPos, rSeenLogs, rSeenSnaps, rPickedSnap, rRestarts >>
+                    rPhase, rScanPos, rSeenLogs, rSeenSnaps, rPickedSnap, rRestarts,
+                    droppedEver, rStartedAfterDrop >>
 
 WriterMut ==
     /\ ReaderInactive
@@ -141,7 +162,8 @@ WriterMut ==
     /\ logs' = logs \cup {nextId}
     /\ nextId' = nextId + 1
     /\ UNCHANGED << snaps, publishedEver, snapCov, completed, badRecreate,
-                    rPhase, rScanPos, rSeenLogs, rSeenSnaps, rPickedSnap, rRestarts >>
+                    rPhase, rScanPos, rSeenLogs, rSeenSnaps, rPickedSnap, rRestarts,
+                    droppedEver, rStartedAfterDrop >>
 
 WriterRemove ==
     /\ ReaderInactive
@@ -153,7 +175,8 @@ WriterRemove ==
     /\ nextId' = nextId + 1
     /\ completed' = FALSE                     \* a fresh removal starts an uncompleted cleanup item
     /\ UNCHANGED << snaps, publishedEver, snapCov, badRecreate,
-                    rPhase, rScanPos, rSeenLogs, rSeenSnaps, rPickedSnap, rRestarts >>
+                    rPhase, rScanPos, rSeenLogs, rSeenSnaps, rPickedSnap, rRestarts,
+                    droppedEver, rStartedAfterDrop >>
 
 (* Recreation gate (spec §namespace-birth): namespace_birth over Removed requires the durable
    Completed marker. Honest run needs `completed`; the sabotage bypasses it and trips badRecreate. *)
@@ -168,7 +191,8 @@ WriterRebirth ==
     /\ nextId' = nextId + 1
     /\ badRecreate' = (badRecreate \/ ~completed)
     /\ UNCHANGED << snaps, publishedEver, snapCov, completed,
-                    rPhase, rScanPos, rSeenLogs, rSeenSnaps, rPickedSnap, rRestarts >>
+                    rPhase, rScanPos, rSeenLogs, rSeenSnaps, rPickedSnap, rRestarts,
+                    droppedEver, rStartedAfterDrop >>
 
 (* A definitely-failed conditional create leaves a safe id gap (spec §writer-side-linearization). *)
 WriterFail ==
@@ -176,7 +200,8 @@ WriterFail ==
     /\ nextId <= MaxSeq
     /\ nextId' = nextId + 1
     /\ UNCHANGED << op, writtenEver, logs, snaps, publishedEver, snapCov, completed, badRecreate,
-                    rPhase, rScanPos, rSeenLogs, rSeenSnaps, rPickedSnap, rRestarts >>
+                    rPhase, rScanPos, rSeenLogs, rSeenSnaps, rPickedSnap, rRestarts,
+                    droppedEver, rStartedAfterDrop >>
 
 (* GC namespace-cleanup item reaches Completed for the current removal; the writer will observe the
    marker on its next recovery LIST and may then recreate. *)
@@ -186,9 +211,18 @@ GcComplete ==
     /\ ~completed
     /\ completed' = TRUE
     /\ UNCHANGED << op, writtenEver, logs, snaps, publishedEver, snapCov, nextId, badRecreate,
-                    rPhase, rScanPos, rSeenLogs, rSeenSnaps, rPickedSnap, rRestarts >>
+                    rPhase, rScanPos, rSeenLogs, rSeenSnaps, rPickedSnap, rRestarts,
+                    droppedEver, rStartedAfterDrop >>
 
 (* ---- snapshot publication (writer, off-lane; may run during a reader's recovery) ---- *)
+
+(* rev.6 (`Rev6MountRule`): publication is copy-once-from-live (spec §recovery-seal/§seal-soundness)
+   -- a late PUT dropped at birth is "born covered ... for every observer uniformly, forever", so it
+   must never resurface in a LATER snapshot's frozen bytes either, not only in the reader oracle.
+   Legacy (`~Rev6MountRule`) keeps the original raw refold over `writtenEver`. *)
+CoveredFold(X) == IF Rev6MountRule
+                   THEN FoldIds(EmptyState, { i \in (writtenEver \ droppedEver) : i <= X })
+                   ELSE FoldIds(EmptyState, { i \in writtenEver : i <= X })
 
 WriterPublishSnapshot ==
     /\ \E X \in writtenEver :
@@ -196,9 +230,10 @@ WriterPublishSnapshot ==
         /\ \E j \in writtenEver : j > X                       \* grace: never cover the newest log
         /\ publishedEver' = publishedEver \cup {X}
         /\ snaps' = snaps \cup {X}
-        /\ snapCov' = [snapCov EXCEPT ![X] = FoldIds(EmptyState, { i \in writtenEver : i <= X })]
+        /\ snapCov' = [snapCov EXCEPT ![X] = CoveredFold(X)]
     /\ UNCHANGED << op, writtenEver, logs, nextId, completed, badRecreate,
-                    rPhase, rScanPos, rSeenLogs, rSeenSnaps, rPickedSnap, rRestarts >>
+                    rPhase, rScanPos, rSeenLogs, rSeenSnaps, rPickedSnap, rRestarts,
+                    droppedEver, rStartedAfterDrop >>
 
 (* ---- GC ref-object cleanup (may run during a reader's recovery) ---- *)
 
@@ -211,33 +246,43 @@ GcCleanupLog ==
         /\ Covered(L)
         /\ logs' = logs \ {L}
     /\ UNCHANGED << op, writtenEver, snaps, publishedEver, snapCov, nextId, completed, badRecreate,
-                    rPhase, rScanPos, rSeenLogs, rSeenSnaps, rPickedSnap, rRestarts >>
+                    rPhase, rScanPos, rSeenLogs, rSeenSnaps, rPickedSnap, rRestarts,
+                    droppedEver, rStartedAfterDrop >>
 
 GcCleanupSnap ==
     /\ \E S \in snaps :
         /\ \E X \in snaps : X > S                             \* keep the newest snapshot
         /\ snaps' = snaps \ {S}
     /\ UNCHANGED << op, writtenEver, logs, publishedEver, snapCov, nextId, completed, badRecreate,
-                    rPhase, rScanPos, rSeenLogs, rSeenSnaps, rPickedSnap, rRestarts >>
+                    rPhase, rScanPos, rSeenLogs, rSeenSnaps, rPickedSnap, rRestarts,
+                    droppedEver, rStartedAfterDrop >>
 
 (* ---- adversarial: late predecessor PUT (spec §late-predecessor-put; expected-fail) ---- *)
 
 (* A fenced predecessor's ref-log PUT materializes AFTER a successor snapshot already covered past
    its id: a durable `mut` at id L below a present snapshot, never counted by that snapshot's frozen
    bytes. Recovery through that snapshot then reconstructs a state missing L — the known Phase-1
-   loss. Enabled only under LatePred; it must break INV_RECOVERY. *)
+   loss. Enabled only under LatePred; it must break INV_RECOVERY.
+
+   rev.6 (`Rev6MountRule`): coverage-at-birth seals the successor's mount against exactly this
+   straggler — the late PUT still lands (the S3 request cannot be cancelled), but it is folded out
+   of the ghost oracle `WStateRev6` via `droppedEver`, so a reader that reconstructs against the
+   rev.6-aware oracle stays correct. `rStartedAfterDrop` marks readers that began after this landed;
+   only an in-flight reader may transiently observe the dropped log (`NoDivergentFold` vs
+   `INV_FRESH_READER`, spec §late-predecessor-put rev.6 addendum). *)
 LatePredecessorPut ==
-    /\ LatePred
+    /\ LatePred = TRUE
     /\ \E L \in Seqs :
-        /\ op[L] = "none"
-        /\ L \notin writtenEver
-        /\ \E X \in snaps : X > L                             \* a present snapshot already covers past L
-        /\ LifeBelow(L) = "live"                              \* a mid-history mut at L is well-formed
+        /\ op[L] = "none" /\ L \notin writtenEver
+        /\ \E X \in snaps : X > L          \* lands under an existing snapshot
+        /\ LifeBelow(L) = "live"
         /\ op' = [op EXCEPT ![L] = "mut"]
         /\ writtenEver' = writtenEver \cup {L}
         /\ logs' = logs \cup {L}
-    /\ UNCHANGED << snaps, publishedEver, snapCov, nextId, completed, badRecreate,
-                    rPhase, rScanPos, rSeenLogs, rSeenSnaps, rPickedSnap, rRestarts >>
+        /\ droppedEver' = IF Rev6MountRule THEN droppedEver \cup {L} ELSE droppedEver
+        /\ rStartedAfterDrop' = FALSE      \* any in-flight reader may transiently see L
+        /\ UNCHANGED <<snaps, publishedEver, snapCov, nextId, completed, badRecreate,
+                       rPhase, rScanPos, rSeenLogs, rSeenSnaps, rPickedSnap, rRestarts>>
 
 (* ---- adversarial: self-remount keeps the old epoch and a stale cache (spec §write-fence; C1) ---- *)
 
@@ -266,7 +311,8 @@ RemountStaleAppend ==
         /\ writtenEver' = writtenEver \cup {L}
         /\ logs' = logs \cup {L}
     /\ UNCHANGED << snaps, publishedEver, snapCov, nextId, completed, badRecreate,
-                    rPhase, rScanPos, rSeenLogs, rSeenSnaps, rPickedSnap, rRestarts >>
+                    rPhase, rScanPos, rSeenLogs, rSeenSnaps, rPickedSnap, rRestarts,
+                    droppedEver, rStartedAfterDrop >>
 
 (* ---- reader: one ordered scan + body fetch with restart-on-vanish ---- *)
 
@@ -279,7 +325,9 @@ ReaderStart ==
     /\ rSeenSnaps' = {}
     /\ rPickedSnap' = 0
     /\ rRestarts' = 0
-    /\ UNCHANGED << op, writtenEver, logs, snaps, publishedEver, snapCov, nextId, completed, badRecreate >>
+    /\ rStartedAfterDrop' = TRUE   \* this reader began after every late delivery so far
+    /\ UNCHANGED << op, writtenEver, logs, snaps, publishedEver, snapCov, nextId, completed,
+                    badRecreate, droppedEver >>
 
 (* One page = one key. Between pages, cleanup/publication interleave. Resume strictly after the last
    returned key. When no present key sorts after the cursor, the scan is complete: pick the greatest
@@ -297,7 +345,8 @@ ReaderScanStep ==
                   /\ rSeenSnaps' = IF k.kind = 1 THEN rSeenSnaps \cup {k.id} ELSE rSeenSnaps
                   /\ rPhase' = "scan"
                   /\ UNCHANGED << rPickedSnap, rRestarts >>
-    /\ UNCHANGED << op, writtenEver, logs, snaps, publishedEver, snapCov, nextId, completed, badRecreate >>
+    /\ UNCHANGED << op, writtenEver, logs, snaps, publishedEver, snapCov, nextId, completed,
+                    badRecreate, droppedEver, rStartedAfterDrop >>
 
 (* Fetch the picked snapshot body and every enumerated tail log (id > picked). If all present,
    complete. If a selected object vanished: honest = restart with a fresh scan (bounded/counted);
@@ -326,7 +375,8 @@ ReaderFetch ==
                          /\ rRestarts' = rRestarts + 1
                     ELSE /\ rPhase' = "stuck"
                          /\ UNCHANGED << rScanPos, rSeenLogs, rSeenSnaps, rPickedSnap, rRestarts >>
-    /\ UNCHANGED << op, writtenEver, logs, snaps, publishedEver, snapCov, nextId, completed, badRecreate >>
+    /\ UNCHANGED << op, writtenEver, logs, snaps, publishedEver, snapCov, nextId, completed,
+                    badRecreate, droppedEver, rStartedAfterDrop >>
 
 (* Self-loop so bounded counters exhausting is not a TLC deadlock (house pattern). *)
 NoOp == UNCHANGED vars
@@ -362,6 +412,25 @@ INV_NOFAIL == rPhase # "failed"
 (* (3) Recreation never observed before a durable Completed marker. *)
 INV_RECREATE == ~ badRecreate
 
+(* ---- rev.6: coverage-at-birth seal (`Rev6MountRule`) ----
+   Legacy configs set `Rev6MountRule = FALSE`, so `NoDivergentFold`/`INV_FRESH_READER`/
+   `INV_SNAP_DETERMINISTIC` are vacuous there and `INV_RECOVERY` keeps its old meaning. *)
+
+(* (4) Strict: every finished reader reconstructs the rev.6 oracle. Expected to VIOLATE under
+   `_rev6_latedelivery` (an in-flight reader may transiently see the dropped log — the documented
+   accepted transient); expected GREEN under `_rev6_safe` (no late delivery can occur there). *)
+NoDivergentFold == (rPhase = "done" /\ Rev6MountRule) => (Reconstruct = WStateRev6)
+
+(* (5) Weak (post-T_mat violation containment): a reader that STARTED after the last late
+   delivery always agrees. In-flight readers may transiently include the dropped log; folds
+   re-derive each round, error direction is spare-not-delete. *)
+INV_FRESH_READER == (rPhase = "done" /\ Rev6MountRule /\ rStartedAfterDrop)
+                        => (Reconstruct = WStateRev6)
+
+(* (6) Snapshot byte-determinism under rev.6: every published body equals the oracle fold below it. *)
+INV_SNAP_DETERMINISTIC == Rev6MountRule =>
+    \A X \in snaps : snapCov[X] = FoldIds(EmptyState, {i \in (writtenEver \ droppedEver) : i <= X})
+
 TypeOK ==
     /\ op \in [Seqs -> Ops]
     /\ writtenEver \subseteq Seqs
@@ -371,12 +440,14 @@ TypeOK ==
     /\ nextId \in 1..(MaxSeq + 1)
     /\ completed \in BOOLEAN
     /\ badRecreate \in BOOLEAN
+    /\ droppedEver \subseteq writtenEver
     /\ rPhase \in {"idle", "scan", "fetch", "done", "failed", "stuck"}
     /\ rScanPos.kind \in {-1, 0, 1}
     /\ rSeenLogs \subseteq Seqs
     /\ rSeenSnaps \subseteq Seqs
     /\ rPickedSnap \in 0..MaxSeq
     /\ rRestarts \in 0..MaxRestarts
+    /\ rStartedAfterDrop \in BOOLEAN
 
 THEOREM Spec => [](TypeOK /\ INV_RECOVERY /\ INV_NOFAIL /\ INV_RECREATE)
 =============================================================================
