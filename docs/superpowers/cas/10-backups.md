@@ -230,7 +230,7 @@ through a CAS-capable binary, see §2). Detailed in §5.
 | D `clickhouse-backup` embedded | = C1 + orchestration | | | | | | | |
 | E Iceberg/Parquet export | ✅ | ✅ | ✅ | ✅ | ✅✅ | hours–days | **longest** (re-insert) | lossy |
 | F DR replica (own pool) | ✅ | ❌ | ⚠️² | ⚠️ | ❌ | seconds | ~0 | 2× everything |
-| G CAS-native backup (§5) | ✅ | ✅ | ⚠️¹ | ✅ | ❌ | minutes | minutes | cheap (dedup + server-side copy) |
+| G CAS-native backup (§5) | ✅ | ✅ | ⚠️¹ | ✅ | ❌ | minutes (cold tier) / consolidation cadence (hot tier, §5.3) | minutes | cheap (dedup + server-side copy) |
 
 ¹ Object-level copies preserve *past* states across a GC bug, but a bug corrupting object
 bodies or the format replicates into the copy.
@@ -253,13 +253,16 @@ relink. The model is deliberately git-shaped:
 
 | Verb | Analogy | Cost |
 |------|---------|------|
-| `BACKUP` — in-pool snapshot | `git tag` | instant, zero bytes |
+| `BACKUP` — per-disk snapshot | `git tag` | instant, zero bytes, no hashing |
+| consolidate — make a chosen snapshot pool-complete (§5.3) | `git push` of node-local objects | async; sets the hot tier's DR RPO |
 | mirror — pull daemon, prod → backup pool | `git push --mirror` | continuous, sets RPO |
 | fetch — selective pull, backup pool → fresh pool | partial clone | sets RTO part 1 |
 | `RESTORE` — in-pool relink | `git checkout` | instant |
 
-One closure-walk + hash-verification primitive serves all three data movements (mirror out,
-fetch in, adoption into a live pool).
+One closure-walk + hash-verification primitive serves all three pool-to-pool movements (mirror
+out, fetch in, adoption into a live pool); consolidation is the one movement that instead goes
+through the ordinary write path — it creates new pool objects rather than copying existing
+ones.
 
 ### 5.2 In-pool snapshots {#in-pool-snapshots}
 
@@ -299,24 +302,56 @@ the long tail affordable.
 `FREEZE`/`BACKUP` already iterate all disks of the storage policy, and the part set is
 consistent (each active part lives wholly on one disk; moves are atomic at the active-set
 level). The problem is that hot-tier parts do not exist in the pool — the freshest data would
-get the weakest protection. Chosen resolution: **the snapshot uploads the hot delta into the
-pool** through the ordinary CAS write path into the shadow namespace, so the pool holds the
-full table state at the tick and the mirror/fetch layers need no changes.
+get the weakest protection. Uploading the hot delta on *every* frequent tick was considered
+and rejected: it hashes and uploads young merge churn (most hot-part generations die in merges
+before ever moving cold), and it contradicts the frequent tier's purpose — instant local
+restore.
 
-Economics: this prepays the inevitable TTL move (when the part later moves cold, the write path
-dedups against the already-uploaded blobs and the move becomes nearly free); the real cost is
-young merge churn (part generations that die hot before ever moving cold), bounded by giving
-the hot-delta upload its own, sparser cadence band than the free ref-pin band. One required
-optimization: **manifest reuse** — `ManifestId` is monotone, not content-derived, so the
-snapshotter must consult the previous shadow `_snap` and re-reference the existing manifest
-when a part is unchanged (by `checksums.txt` hash) instead of re-uploading; then a tick costs
-exactly the new/changed hot parts. Local hardlink snapshots are kept as a nearly-free fast
-path for hot-part restore on a surviving node.
+Chosen resolution: **cadence and completeness are separate axes.**
+
+1. **Frequent snapshots are per-disk native** — the natural `FREEZE` shape: hardlink clones on
+   the local disk, a shadow `_snap` on the CA disk — correlated across disks by the snapshot
+   name (the `FREEZE WITH NAME` precedent). The snapshot metadata object records which disk
+   holds which piece and whether the snapshot is pool-complete, so tooling can always answer
+   "restorable from where?". Capture is instant and involves **no hashing at all**. These
+   snapshots serve operator-error recovery with instant restore on both tiers; the hot piece's
+   durability equals the node's — by design.
+2. **Consolidation is a derived, asynchronous operation on a chosen existing snapshot** —
+   "gather snapshot X onto the pool": upload the hot pieces' blobs through the ordinary write
+   path **from the snapshot's own frozen hardlinks** (so the consistency point stays the
+   original capture moment regardless of upload duration), then publish the pool-complete
+   shadow `_snap`. Runs on its own band (e.g. daily) with an optional per-table cadence
+   override. Only pool-complete snapshots are units for the mirror (§5.4) and for full-table
+   fetch/restore (§5.5).
+
+Economics: at consolidation cadence most young churn has died; the surviving parts are mostly
+those that will move cold anyway, so their upload is a prepayment — when the TTL move later
+happens, the write path dedups against the already-present blobs and the move becomes
+metadata-only. **Manifest reuse** keeps repeated consolidations incremental: `ManifestId` is
+monotone, not content-derived, so the consolidator consults the previous pool-complete `_snap`
+and re-references the existing manifest when a part is unchanged (by part identity +
+`checksums.txt` hash) — no reads, no hashing, no uploads for unchanged parts.
+
+Optional refinement — the **age-based trickle warmer**: a low-priority background uploader
+pushes blobs of hot parts older than a threshold `A` into the pool ahead of any snapshot (a
+part that survived the young-merge window will likely reach the cold tier eventually). With
+the warmer on, consolidation degrades into publishing metadata, and TTL moves become nearly
+free as a side effect; `A` trades doomed-churn upload volume against the consolidation
+window's size.
+
+The RPO structure that falls out: operator error — the frequent cadence, both tiers; node
+loss — hot data since the last consolidation is gone (it lived only on the node); bucket
+loss — frequent cadence for the cold tier, consolidation cadence + mirror lag for the hot
+tier. Where the node-loss hot RPO is unacceptable, the lever is a per-table consolidation
+cadence — and beyond that, continuous protection of fresh data is the DR replica's job
+(§3.6), not the snapshot tier's.
 
 Restore order: everything comes up as refs on the CA disk (instantly queryable, cold); the
-storage policy re-warms hot parts in the background. Deliberate future extension (out of v1
-scope): allowing `Snapshot('name', disk='cas_disk')` for tables with no CA disk at all would
-turn the pool into a deduplicating backup store for arbitrary MergeTree tables.
+storage policy re-warms hot parts in the background; on a surviving node the local hardlink
+pieces restore hot parts instantly without any download. Deliberate future extension (out of
+v1 scope): consolidation for tables with no CA disk at all (`Snapshot('name',
+disk='cas_disk')`) would turn the pool into a deduplicating backup store for arbitrary
+MergeTree tables.
 
 ### 5.4 Mirror: the pull daemon {#mirror-daemon}
 
@@ -385,7 +420,7 @@ to the backup pool; restore writes only to the fresh pool.
 |-----------|-----------|
 | `BAK-RO` | No restore path performs any write to the backup pool; the only exception is the explicitly operator-confirmed in-place fail-over, documented as consuming the backup. |
 | `BAK-EDGE-DRIVEN-MANIFESTS` | Part-manifest reclamation is decided by in-degree edges only, never by namespace-prefix ownership; snapshots may reference manifests under dropped tables' prefixes indefinitely. |
-| `BAK-THIN-AFTER-MIRROR` | A source snapshot in a band designated for mirroring may be thinned only after its closure is durably replicated. |
+| `BAK-THIN-AFTER-MIRROR` | A snapshot designated for consolidation or mirroring may be thinned only after that operation durably completed (consolidate before thin; mirror before thin). |
 | `BAK-INDEPENDENT-RETENTION` | Destination retention is computed independently; source deletions never cascade. |
 | `BAK-NO-IDENTITY-COPY` | `gc/server-roots/*` identity objects are never replicated; every pool mints its own identity. |
 
@@ -394,8 +429,12 @@ to the backup pool; restore writes only to the fresh pool.
 1. **Pool-level volume object.** Table snapshots are per-table; "restore everything to 12:40"
    and the daemon want a pool-level unit — a light object listing the table snapshots of one
    tick. Shape and placement TBD.
-2. **Hot-delta cadence policy.** Separate config band for the hot-tier upload (recommended) vs
-   "every snapshot is always full" (simpler model, higher cost). Undecided.
+2. **Mirror scope.** Replicate only pool-complete snapshots (simple: every mirrored snapshot
+   restores a full table) vs also the cold-partial frequent snapshots (nearly free — their
+   closures are in-pool already — and it lowers the cold tier's external RPO to the frequent
+   cadence, at the cost of partial-restore semantics in the runbook). Leaning:
+   consolidated-only in v1. Related: the default age threshold `A` for the trickle warmer, if
+   built.
 3. **Daemon packaging.** `clickhouse-disks ca-backup-pull` subcommand (precedent: `fsck`,
    `ca-gc-dryrun`, `ca-gc-rebuild`, with the same readonly-mount discipline) vs a standalone
    service. v1 leaning: `clickhouse-disks` + cron.
