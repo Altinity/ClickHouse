@@ -294,6 +294,16 @@ struct BlobLocation
     uint64_t length = 0;
 };
 
+/// What one `Store::dropNamespace` call physically named for removal in its ONE removal transaction
+/// (design 2026-07-13-cas-pool-member-decommission §core): the count of committed refs and precommit
+/// bindings the removal txn's `owner_transition(old, none)` ops covered. Existing callers that only
+/// care about the removal itself may ignore the return value.
+struct DropNamespaceStats
+{
+    uint64_t committed_refs = 0;
+    uint64_t precommits = 0;
+};
+
 struct BuildInfo
 {
     std::optional<String> intended_ref;       /// "ns/ref" forensics for the envelope (diagnostic)
@@ -434,7 +444,7 @@ public:
     /// followed by `remove_namespace`, then a best-effort publish of the constant-size `Removed`
     /// snapshot. Performs NO physical deletion (no verbatim-file deletes, no tombstones) -- that is
     /// GC's namespace-cleanup item, Task 12.
-    void dropNamespace(const RootNamespace & ns);
+    DropNamespaceStats dropNamespace(const RootNamespace & ns);
 
     /// True iff this namespace's ref-table lifecycle is durably `Removed` — a table that `dropNamespace`
     /// removed and that has NOT been recreated (distinguished from a never-born namespace, whose default

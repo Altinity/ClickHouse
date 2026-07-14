@@ -2906,7 +2906,7 @@ bool Store::namespaceIsRemoved(const RootNamespace & ns)
     return rt->state.lifecycle != RefLifecycle::Live && rt->state.remove_txn_id.has_value();
 }
 
-void Store::dropNamespace(const RootNamespace & ns)
+DropNamespaceStats Store::dropNamespace(const RootNamespace & ns)
 {
     /// Task 11 (spec §Namespace Removal): one body transaction naming an exact `owner_transition`
     /// removal for every committed ref and precommit, followed by `remove_namespace` -- the removal
@@ -2923,9 +2923,14 @@ void Store::dropNamespace(const RootNamespace & ns)
         /// is the correct behavior either way (nothing to remove).
         std::lock_guard lock(rt->state_mutex);
         if (rt->state.lifecycle != RefLifecycle::Live)
-            return;
+            return {};
     }
 
+    /// Task 2 (design 2026-07-13-cas-pool-member-decommission §core): what THIS call's own removal
+    /// transaction named, filled from the SAME `state` the ops below are built from -- a retried
+    /// `build_ops` (a wedge resolving under a resumed leader) simply overwrites it with the final
+    /// durable transaction's true counts.
+    DropNamespaceStats stats;
     appendRefOps(ns, MutationScope::wholeShard(),
         [&](const RefTableState & state) -> std::vector<RefOp>
         {
@@ -2950,6 +2955,9 @@ void Store::dropNamespace(const RootNamespace & ns)
             RefOp remove;
             remove.kind = RefOpKind::RemoveNamespace;
             ops.push_back(remove);
+
+            stats.committed_refs = state.committed.size();
+            stats.precommits = state.precommits.size();
             return ops;
         },
         RootMutationOrigin::Writer, RootMutationKind::DropNamespace);
@@ -2991,6 +2999,7 @@ void Store::dropNamespace(const RootNamespace & ns)
     /// -- GC's namespace-cleanup item ({namespace, remove_txn_id}, Pending->Completed) owns that reclaim,
     /// keyed off the durable `remove_namespace` this call just appended (spec §Clean Old Ref Objects).
     /// Until GC reclaims it, a dropped namespace's ref-log objects and verbatim files remain as debris.
+    return stats;
 }
 
 std::vector<String> Store::listNamespaces(const String & prefix)

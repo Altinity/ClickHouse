@@ -59,6 +59,7 @@ String toString(CasEventType type)
         case CasEventType::MountClaim:            return "mount_claim";
         case CasEventType::MountRelease:          return "mount_release";
         case CasEventType::MountConflict:         return "mount_conflict";
+        case CasEventType::MemberDecommission:    return "member_decommission";
         case CasEventType::ForeignInterference:   return "foreign_interference";
         case CasEventType::RefLateLogDetected:    return "ref_late_log_detected";
         case CasEventType::RefResolve:            return "ref_resolve";
