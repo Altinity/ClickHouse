@@ -1,6 +1,7 @@
 #include "cas_test_helpers.h"
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasDecommission.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasServerRoot.h>
+#include <stdexcept>
 
 using namespace DB;
 using namespace DB::Cas;
@@ -14,6 +15,31 @@ StorePtr openVictim(std::shared_ptr<InMemoryBackend> backend)
 {
     return Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "victim"});
 }
+
+/// Fails `deleteExact` for one or two designated keys -- either by throwing (a transient backend
+/// hiccup) or by returning a synthetic `TokenMismatch` (a "listed but raced" outcome) -- delegating
+/// every other key to the base `InMemoryBackend` untouched. Drives the drain phases' per-object
+/// fail-close path (`deleteListedPrefix`, `CasDecommission.cpp`): a failure on one listed object must
+/// record a warning and let the rest of the sweep proceed, never abort the whole phase.
+class FailingDeleteBackend : public InMemoryBackend
+{
+public:
+    void failWithThrow(const String & key) { throw_key = key; }
+    void failWithTokenMismatch(const String & key) { mismatch_key = key; }
+
+    DeleteOutcome deleteExact(const String & key, const Token & token) override
+    {
+        if (key == throw_key)
+            throw std::runtime_error("injected transient delete failure for " + key);
+        if (key == mismatch_key)
+            return DeleteOutcome{.kind = DeleteOutcome::Kind::TokenMismatch};
+        return InMemoryBackend::deleteExact(key, token);
+    }
+
+private:
+    String throw_key;
+    String mismatch_key;
+};
 
 /// Seed one victim table with `committed` committed refs and `precommits` dangling precommit bindings,
 /// via the raw ref-log seeding helpers (fixture idiom of e.g. `gtest_cas_gc_fold.cpp`: `writeManifestRaw`
@@ -245,4 +271,39 @@ TEST(CasDecommission, DrainsDebrisStagingAndRoots)
     /// Nothing of the victim remains under staging/ or roots/ (scoped LISTs are empty).
     EXPECT_TRUE(backend->list("p/staging/victim/", "", 10).keys.empty());
     EXPECT_TRUE(backend->list("p/roots/victim/", "", 10).keys.empty());
+}
+
+/// Task 3 fail-close nuance (spec §core "Fail-close"): a per-object failure in the staging/roots drain
+/// -- a thrown exception (a transient hiccup) or a `TokenMismatch` outcome (a "listed but raced" miss)
+/// -- must record a warning and let the rest of the sweep proceed, never abort the whole phase or the
+/// whole command. One staging object throws, the roots object comes back `TokenMismatch`; the OTHER
+/// staging object must still be deleted and counted.
+TEST(CasDecommission, PerObjectFailureWarnsAndContinuesDrain)
+{
+    auto backend = std::make_shared<FailingDeleteBackend>();
+    {
+        auto victim = openVictim(backend);
+        makeTableWithRefs(*victim, "victim/db/t1", 1, 0);
+    }
+    backend->putIfAbsent("p/staging/victim/upload_ok.tmp", "x");
+    backend->putIfAbsent("p/staging/victim/upload_throws.tmp", "x");
+    backend->putIfAbsent("p/roots/victim/clickhouse_access_check_abc", "x");
+    backend->failWithThrow("p/staging/victim/upload_throws.tmp");
+    backend->failWithTokenMismatch("p/roots/victim/clickhouse_access_check_abc");
+
+    const auto report = decommissionPoolMember(
+        backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim");
+
+    EXPECT_EQ(report.staging_objects_removed, 1u)
+        << "the OTHER staging object must still be deleted despite the injected failure on its sibling";
+    EXPECT_EQ(report.mountpoint_objects_removed, 0u);
+    EXPECT_EQ(report.warnings.size(), 2u)
+        << "one warning for the thrown exception, one for the TokenMismatch outcome";
+
+    EXPECT_FALSE(backend->head("p/staging/victim/upload_ok.tmp").exists)
+        << "the healthy staging object was actually deleted, not merely skipped";
+    EXPECT_TRUE(backend->head("p/staging/victim/upload_throws.tmp").exists)
+        << "the failing object is left behind (untouched) so a re-run can retry it";
+    EXPECT_TRUE(backend->head("p/roots/victim/clickhouse_access_check_abc").exists)
+        << "TokenMismatch means nothing was actually deleted -- the object survives";
 }
