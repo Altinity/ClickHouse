@@ -580,33 +580,45 @@ TEST(CasGcAckFloor, PublishBeforeGraduationSpares)
     EXPECT_TRUE(blobExists(*backend, store->layout(), blob));
 }
 
-/// An expired mount is fenced out by the round's heartbeat step: gc_fenced is set on its body (a
+/// A dead mount is fenced out by the round's heartbeat step: gc_fenced is set on its body (a
 /// token-guarded rewrite that bumps seq). The fence is pure liveness (re-arms the write fence so a
 /// resumed sleeper can never mutate again); reclaim itself no longer depends on any mount's heartbeat —
 /// graduation paces on GC rounds. The fenced mount's own subsequent renew then fails closed, because the
 /// fence invalidated the token it held.
+///
+/// Rev.6 §token-stability observation (Task 9): the fence-out no longer trusts a bare wall-clock stamp
+/// (`expires_at_ms`) against the GC's own clock — it fences ONLY once GC has watched a mount's write
+/// token hold unchanged for the full threshold on its OWN monotonic clock. That takes (at least) two
+/// `computeHeartbeatFloor` calls spanning the threshold, so this test drives the GC leader's own
+/// (persistent) `mono_ms_fn` across two rounds: round 1 seeds the observation for both mounts; the
+/// STORE's own mount is then renewed (as a live leader would) before round 2 crosses the threshold —
+/// srid2, never renewed again after its one-shot claim, is the one that gets fenced.
 TEST(CasGcAckFloor, ExpiredMountFencedOutAndExcluded)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    // A live store (the GC leader's own mount, on the SYSTEM clock) plus a SECOND server's keeper on a
-    // FAKE clock that we freeze — so GC's own fake clock can jump past it deterministically.
     std::vector<CasEvent> events;   /// declared BEFORE the Store so it outlives the background syncer's emits (ASan 2026-07-09)
     auto store = openStoreForTest(backend);
     const Layout & layout = store->layout();
 
-    // srid2's keeper: started at fake now=1000 with ttl=100 => lease expires_at = 1100.
+    // srid2's keeper claims ONE lease via `start()` and is never renewed again — tests never enable
+    // the background renewal thread (`background_watermark` defaults to false), so this alone models a
+    // crashed process: a body that is live-shaped (not terminated, not fenced) but whose write token
+    // never changes again.
     const String srid2 = "stale-server";
-    uint64_t srid2_now = 1000;
     MountLeaseKeeper srid2_keeper(backend, layout, srid2, DB::UInt128(0x2222), /*writer_epoch=*/1,
-        std::chrono::milliseconds(100), [&] { return srid2_now; }, [] { return 0u; });
+        std::chrono::milliseconds(100), [] { return 1000u; }, [] { return 0u; });
     srid2_keeper.start();
     ASSERT_FALSE(decodeMountLease(backend->get(layout.mountKey(srid2))->bytes).gc_fenced);
 
-    // GC runs on a fake clock jumped well past srid2's deadline + margin (ttl/2 = 15000 for the store's
-    // 30s ttl). The store's own mount carries a SYSTEM-clock expires_at (~1.7e12 ms), far above the fake
-    // GC clock, so it stays live regardless of srid2's fate.
-    uint64_t gc_now = 1100 + 60000;
-    Gc gc(store, kGc, [&] { return gc_now; });
+    // The fence-out threshold on the GC leader's OWN monotonic clock — mirrors the production formula
+    // in `Gc::runRegularRound` (ttl + 5% drift allowance + one round's worth of renewal slack).
+    const uint64_t ttl_ms = static_cast<uint64_t>(store->poolConfig().mount_lease_ttl_ms.count());
+    const uint64_t threshold_ms = ttl_ms + ttl_ms / 20
+        + static_cast<uint64_t>(store->poolConfig().mount_renew_period.count());
+
+    uint64_t gc_now = 1'000'000;   // audit-only wall clock; never gates the fence decision
+    uint64_t gc_mono = 0;
+    Gc gc(store, kGc, [&] { return gc_now; }, [&] { return gc_mono; });
 
     // Capture the emitted events so we can assert the round emits exactly one GcFenceOut row for srid2.
     store->setEventSink([&](const CasEvent & e) { events.push_back(e); });
@@ -617,11 +629,20 @@ TEST(CasGcAckFloor, ExpiredMountFencedOutAndExcluded)
     writeBlobBody(*backend, layout, blob);
     writeManifestRaw(*backend, layout, ns, r, {blobEntryFor("a", blob)});
     publishCommittedTransition(*backend, layout, ns, "tbl", std::nullopt, r);
-    const RoundReport rep = gc.runRegularRound();
-    store->renewWatermarkOnce();
 
-    // The round's heartbeat step fenced srid2 out (expired on the GC clock).
-    EXPECT_EQ(rep.fence_outs, 1u);   // exactly one expired mount fenced-out this round
+    // Round 1 (mono 0): first sight of both mounts — observation starts, nothing fenced yet.
+    const RoundReport rep1 = gc.runRegularRound();
+    EXPECT_EQ(rep1.fence_outs, 0u);
+
+    // The store's OWN mount renews between rounds (as a live leader would); srid2 never does.
+    store->renewWatermarkOnce();
+    gc_mono = threshold_ms;
+
+    // Round 2 (mono == threshold): srid2's original token has held stable for the full threshold —
+    // fenced. The store's own (just-renewed) mount restarts its observation and stays live.
+    const RoundReport rep = gc.runRegularRound();
+
+    EXPECT_EQ(rep.fence_outs, 1u);   // exactly one dead mount fenced-out this round
     const MountLease fenced = decodeMountLease(backend->get(layout.mountKey(srid2))->bytes);
     EXPECT_TRUE(fenced.gc_fenced);
 
@@ -642,7 +663,6 @@ TEST(CasGcAckFloor, ExpiredMountFencedOutAndExcluded)
     // srid2's writer comes back and tries to renew: its held token was invalidated by the fence rewrite,
     // so renewOnce fails closed. (It renews on its own clock; liveness is irrelevant — the token guard
     // trips regardless.)
-    srid2_now = 1050;
     EXPECT_THROW(srid2_keeper.renewOnce(), DB::Exception);
 
     // The fence-out is pure liveness cleanup: reclaim proceeds through the normal (round-paced) pipeline

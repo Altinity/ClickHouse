@@ -522,7 +522,8 @@ MountClaimResult claimMountAwaitingExpiry(
 }
 
 HeartbeatFloor computeHeartbeatFloor(Backend & b, const Layout & l, uint64_t now_ms,
-                                     uint64_t skew_margin_ms)
+                                     uint64_t mono_now_ms, uint64_t stable_threshold_ms,
+                                     MountObservationMap & obs)
 {
     HeartbeatFloor floor;
 
@@ -542,7 +543,8 @@ HeartbeatFloor computeHeartbeatFloor(Backend & b, const Layout & l, uint64_t now
             const String & key = listed.key;
 
             /// The srid is the path segment between `serverRootsPrefix()` and the `/mount` suffix
-            /// (`<prefix>/gc/server-roots/<srid>/mount`). Used only for observability (fenced).
+            /// (`<prefix>/gc/server-roots/<srid>/mount`). Used both for observability (fenced) and as
+            /// the key into `obs`.
             const String srid = key.substr(prefix.size(),
                 key.size() - prefix.size() - mount_suffix.size());
 
@@ -554,30 +556,51 @@ HeartbeatFloor computeHeartbeatFloor(Backend & b, const Layout & l, uint64_t now
             {
                 const auto got = b.get(key);
                 if (!got)
+                {
+                    obs.erase(srid);
                     break;   /// Raced away (deleted) — nothing to classify.
+                }
 
                 const MountLease m = decodeMountLease(got->bytes);
 
                 if (m.gc_fenced)
                 {
                     ++floor.already_fenced;
+                    obs.erase(srid);   /// terminal — no further observation needed
                     break;
                 }
                 if (m.min_active == std::numeric_limits<uint64_t>::max())
                 {
                     ++floor.terminated;
+                    obs.erase(srid);   /// terminal — no further observation needed
                     break;
                 }
 
-                const bool live = now_ms <= m.expires_at_ms + skew_margin_ms;
-                const bool exhausted = attempt >= max_reclassify;
-                if (live || exhausted)
+                /// Observation-based liveness (rev.6 §token-stability observation): stable ONLY if the
+                /// SAME token was already being watched and has now held for the full threshold on our
+                /// OWN monotonic clock. Anything else — no prior observation, or a changed token (a
+                /// live renewal, including one raced against our own fence-out attempt below) —
+                /// (re)starts the observation window and counts as `live` this call.
+                const auto it = obs.find(srid);
+                const bool stable = it != obs.end() && it->second.token == got->token
+                    && mono_now_ms - it->second.first_seen_mono_ms >= stable_threshold_ms;
+
+                if (!stable)
                 {
+                    if (it == obs.end() || it->second.token != got->token)
+                        obs[srid] = MountTokenObservation{got->token, mono_now_ms};
                     ++floor.live;
                     break;
                 }
 
-                /// Expired, not terminated, not yet fenced → token-guarded fence-out preserving the
+                const bool exhausted = attempt >= max_reclassify;
+                if (exhausted)
+                {
+                    ++floor.live;   /// conservative — never exclude without a landed fence-out
+                    break;
+                }
+
+                /// Stable past the threshold, not yet fenced → token-guarded fence-out preserving the
                 /// whole body (gc_fenced = true, seq + 1).
                 MountLease fenced = m;
                 fenced.gc_fenced = true;
@@ -587,10 +610,16 @@ HeartbeatFloor computeHeartbeatFloor(Backend & b, const Layout & l, uint64_t now
                 {
                     ++floor.fenced_now;
                     floor.fenced_srids.push_back(srid);
+                    obs.erase(srid);
+                    LOG_INFO(getLogger("CasHeartbeatFloor"),
+                        "CAS GC fenced out mount lease for content-addressed server root {} at "
+                        "wall-clock ms {}: its write token held unchanged for >= {} ms on the GC "
+                        "leader's own monotonic clock (rev.6 token-stability observation)",
+                        srid, now_ms, stable_threshold_ms);
                     break;
                 }
                 /// PreconditionFailed: the holder renewed between our GET and PUT — re-GET and
-                /// reclassify (it is now live).
+                /// reclassify (the observation check above will see the new token and restart it).
             }
         }
 

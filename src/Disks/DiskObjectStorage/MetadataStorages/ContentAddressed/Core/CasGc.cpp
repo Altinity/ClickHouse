@@ -155,10 +155,12 @@ bool shouldDeferRound(size_t changed_shards, bool graduation_due, uint64_t round
     return true;
 }
 
-Gc::Gc(StorePtr store_, UInt128 gc_id_, std::function<uint64_t()> now_ms_fn_)
+Gc::Gc(StorePtr store_, UInt128 gc_id_, std::function<uint64_t()> now_ms_fn_,
+       std::function<uint64_t()> mono_ms_fn_)
     : store(std::move(store_))
     , gc_id(gc_id_)
     , now_ms_fn(std::move(now_ms_fn_))
+    , mono_ms_fn(std::move(mono_ms_fn_))
 {
     if (!store)
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Cas::Gc: store must not be null");
@@ -170,6 +172,8 @@ Gc::Gc(StorePtr store_, UInt128 gc_id_, std::function<uint64_t()> now_ms_fn_)
             return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::system_clock::now().time_since_epoch()).count());
         };
+    if (!mono_ms_fn)
+        mono_ms_fn = []() -> uint64_t { return Store::bootMs(); };
     /// Task 5: the bounded pool for this round's per-hash freshness-meta writes. Built here (ctor body),
     /// not a member-initializer, so it can safely read `store->poolConfig()` AFTER the null check above.
     const uint64_t configured_pool_size = store->poolConfig().gc_meta_pool_size;
@@ -249,12 +253,17 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     Backend & backend = store->backend();
     const uint64_t new_round = state.round + 1;
 
-    /// R1: token-guarded fence-out of expired mounts (liveness only — graduation itself paces on GC
-    /// rounds via `new_round`, not on heartbeat acks). The ONLY clock in the round (the inherited
-    /// lease-expiry contract); margin = ttl/2 (poll granularity + wall skew).
-    const uint64_t skew_margin_ms =
-        static_cast<uint64_t>(store->poolConfig().mount_lease_ttl_ms.count()) / 2;
-    const HeartbeatFloor floor = computeHeartbeatFloor(backend, layout, now_ms_fn(), skew_margin_ms);
+    /// R1: token-guarded fence-out of dead mounts (liveness only — graduation itself paces on GC
+    /// rounds via `new_round`, not on heartbeat acks). Task 9 (rev.6 §token-stability observation):
+    /// fencing no longer trusts a predecessor's stamped `expires_at_ms` against our wall clock — it
+    /// fences ONLY once `mount_obs` has watched the mount's write-token hold unchanged for the full
+    /// threshold on THIS leader's own monotonic clock (mirrors `claimMountAwaitingExpiry`'s identical
+    /// `TTL + Drift` threshold for a mount's own reopen).
+    const uint64_t ttl_ms = static_cast<uint64_t>(store->poolConfig().mount_lease_ttl_ms.count());
+    const uint64_t stable_threshold_ms =
+        ttl_ms + ttl_ms / 20 + static_cast<uint64_t>(store->poolConfig().mount_renew_period.count());
+    const HeartbeatFloor floor = computeHeartbeatFloor(backend, layout, now_ms_fn(), mono_ms_fn(),
+                                                        stable_threshold_ms, mount_obs);
     report.fence_outs = floor.fenced_now;
     if (floor.fenced_now > 0)
         ProfileEvents::increment(ProfileEvents::CasGcHeartbeatFenceOuts, floor.fenced_now);
@@ -2138,11 +2147,13 @@ RebuildReport Gc::rebuildBaseline(bool force)
         for (const RunRef & r : prior_runs[shard])
             seal.blob_target_runs.push_back(r);
 
-    /// Also fence out any expired mounts as part of the disaster-recovery pass (liveness cleanup; the
+    /// Also fence out any dead mounts as part of the disaster-recovery pass (liveness cleanup; the
     /// returned classification counts are not needed for the round mint — graduation paces on rounds).
-    const uint64_t skew_margin_ms =
-        static_cast<uint64_t>(store->poolConfig().mount_lease_ttl_ms.count()) / 2;
-    computeHeartbeatFloor(backend, layout, now_ms_fn(), skew_margin_ms);
+    /// Task 9 (rev.6 §token-stability observation): same threshold/`mount_obs` as the regular round.
+    const uint64_t ttl_ms = static_cast<uint64_t>(store->poolConfig().mount_lease_ttl_ms.count());
+    const uint64_t stable_threshold_ms =
+        ttl_ms + ttl_ms / 20 + static_cast<uint64_t>(store->poolConfig().mount_renew_period.count());
+    computeHeartbeatFloor(backend, layout, now_ms_fn(), mono_ms_fn(), stable_threshold_ms, mount_obs);
 
     /// Retired-in-snapshot (T4): the rebuilt seal's `condemned_summary` must be TOTAL over gc_shards so a
     /// subsequent regular round reads graduation/carry decisions zero-I/O off it (and its `carryParentRefs`

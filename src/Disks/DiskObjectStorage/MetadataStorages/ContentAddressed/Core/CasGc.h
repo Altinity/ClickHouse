@@ -120,10 +120,15 @@ struct RoundReport
 class Gc
 {
 public:
-    /// `now_ms_fn` is the ONLY clock in Gc (injected for tests): the ack-floor heartbeat gate uses it
-    /// for the inherited lease-expiry classification (spec: the single timing assumption). Everything
-    /// else in the round stays deterministic/clock-free.
-    Gc(StorePtr store_, UInt128 gc_id_, std::function<uint64_t()> now_ms_fn_ = {});
+    /// `now_ms_fn` is the WALL clock (injected for tests): audit/diagnostic stamps only (e.g. the
+    /// heartbeat floor's `now_ms` argument) — it never gates a fence decision. `mono_ms_fn` is the
+    /// OBSERVATION clock (Task 9, rev.6 design §token-stability observation): monotonic on this
+    /// process, injected for tests, defaults to `Store::bootMs()`, and the ONLY clock the heartbeat
+    /// gate's own fence-out threshold is measured against (mirrors `claimMountAwaitingExpiry`'s
+    /// `mono_ms_fn`, but at heartbeat-gate granularity — one GC round is one observation tick).
+    /// Everything else in the round stays deterministic/clock-free.
+    Gc(StorePtr store_, UInt128 gc_id_, std::function<uint64_t()> now_ms_fn_ = {},
+       std::function<uint64_t()> mono_ms_fn_ = {});
 
     /// One full round. Returns acquired_lease=false (nothing else done) if another leader is alive.
     /// `on_lease_acquired`, if set, is invoked ONCE, synchronously, immediately after the lease is
@@ -362,9 +367,13 @@ private:
     void scheduleMetaJob(std::function<void()> job);
 
     StorePtr store;
-    UInt128 gc_id{};
+    UInt128 gc_id{};   /// this leader's identity (random u128, never 0)
     uint64_t rebuild_edge_budget_override = 0;   /// tests force tiny batches
-    std::function<uint64_t()> now_ms_fn;   /// wall-clock ms; injected (tests), defaults to system_clock              /// this leader's identity (random u128, never 0)
+    std::function<uint64_t()> now_ms_fn;   /// wall-clock ms; injected (tests), defaults to system_clock
+    /// Task 9 (rev.6 §token-stability observation): the heartbeat gate's OWN observation clock —
+    /// monotonic on this process, injected (tests), defaults to `Store::bootMs()`. Never compared
+    /// against another node's clock; see `computeHeartbeatFloor`.
+    std::function<uint64_t()> mono_ms_fn;
     bool trim_enabled = true;     /// TEST SEAM ONLY (M1): production always trims; see setTrimEnabledForTest
     /// Phase-4 skip-unchanged (spec 2026-07-06): leader-local, in-memory count of consecutive DEFERRED
     /// rounds since the last FOLD. NOT persisted (a fresh/stolen leader starts at 0 -- conservative:
@@ -379,6 +388,12 @@ private:
     /// B160: the heartbeat observed alongside the lease (gates the steal).
     UInt128 last_seen_hb_owner{};
     uint64_t last_seen_hb_seq = 0;
+
+    /// Task 9 (rev.6 §token-stability observation): the heartbeat gate's cross-round, per-srid
+    /// write-token observation (`computeHeartbeatFloor`'s `obs` argument). In-memory only — a new
+    /// leader (after a steal, or a process restart) starts empty, which only delays fencing an
+    /// already-dead mount by one extra round (safe: never fences early).
+    MountObservationMap mount_obs;
 
     /// Task 5: bounded pool for the round's per-hash freshness-meta writes (condemn/spare/delete);
     /// sized from `PoolConfig::gc_meta_pool_size` (constructed in the ctor, after the null/id checks --

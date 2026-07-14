@@ -494,13 +494,17 @@ TEST(CasMountLease, RetiredSentinelRoundTrips)
               std::numeric_limits<uint64_t>::max());
 }
 
-/// ---- Task 7: GC heartbeat classification with token-guarded fence-out ----
+/// ---- Task 7 / Task 9: GC heartbeat classification with token-guarded, observation-based fence-out ----
 
 namespace
 {
 /// A fixed, fake "now" — no real clocks in these tests. Lease timestamps are chosen relative to it.
+/// Rev.6 §token-stability observation removed the wall clock from the fence DECISION; `kNowMs` below
+/// is threaded through only as `computeHeartbeatFloor`'s audit-only `now_ms`.
 constexpr uint64_t kNowMs = 1'000'000;
-constexpr uint64_t kSkewMarginMs = 5'000;
+/// The fence-out threshold measured on the LEADER's OWN monotonic clock (`mono_now_ms`), independent
+/// of any lease's stamped `expires_at_ms`.
+constexpr uint64_t kStableThresholdMs = 10'000;
 
 /// Seed one mount body under mountKey(srid) via the on-storage codec (`encodeMountLease` +
 /// `putIfAbsent`) — the same interface the keeper writes through.
@@ -521,6 +525,87 @@ MountLease seedMount(
     b.putIfAbsent(l.mountKey(srid), encodeMountLease(m));
     return m;
 }
+
+/// Simulate a keeper's real renewal between two `computeHeartbeatFloor` calls: a token-guarded
+/// overwrite that bumps `seq` (and so mints a fresh backend token), leaving everything else as-is.
+/// Models the one thing the observation-based fence cares about: the write token changed, so any
+/// in-progress observation of the OLD token must restart.
+void renewMount(Backend & b, const Layout & l, const String & srid)
+{
+    const auto got = b.get(l.mountKey(srid));
+    ASSERT_TRUE(got.has_value());
+    MountLease m = decodeMountLease(got->bytes);
+    m.seq += 1;
+    const PutResult res = b.putOverwrite(l.mountKey(srid), encodeMountLease(m), got->token);
+    ASSERT_EQ(res.outcome, PutOutcome::Done);
+}
+}
+
+TEST(CasHeartbeatFloor, FirstSightNeverFencesEvenIfStampLooksExpired)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+
+    /// A stamp that would have read as long-expired under the old skew-margin comparison — under
+    /// rev.6 observation the stamp is never even consulted for the fence decision.
+    seedMount(*b, l, "s1", /*expires*/ 10, /*fenced*/ false, /*min_active*/ 0);
+
+    MountObservationMap obs;
+    const HeartbeatFloor floor = computeHeartbeatFloor(*b, l, /*now_ms*/ kNowMs, /*mono_now_ms*/ 0,
+                                                         kStableThresholdMs, obs);
+
+    EXPECT_EQ(floor.fenced_now, 0u);
+    EXPECT_EQ(floor.live, 1u);
+    ASSERT_TRUE(obs.contains("s1"));
+    EXPECT_EQ(obs.at("s1").first_seen_mono_ms, 0u);
+}
+
+TEST(CasHeartbeatFloor, StableTokenPastThresholdIsFenced)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    seedMount(*b, l, "s1", /*expires*/ 10, /*fenced*/ false, /*min_active*/ 0);
+
+    MountObservationMap obs;
+    const HeartbeatFloor floor1 = computeHeartbeatFloor(*b, l, kNowMs, /*mono*/ 0, kStableThresholdMs, obs);
+    EXPECT_EQ(floor1.fenced_now, 0u);
+
+    const MountLease before = decodeMountLease(b->get(l.mountKey("s1"))->bytes);
+
+    /// No renewal in between: the SAME token, observed since mono 0, is now stable for the full
+    /// threshold on the leader's own clock.
+    const HeartbeatFloor floor2 = computeHeartbeatFloor(*b, l, kNowMs, /*mono*/ kStableThresholdMs,
+                                                          kStableThresholdMs, obs);
+
+    EXPECT_EQ(floor2.fenced_now, 1u);
+    EXPECT_EQ(floor2.fenced_srids, std::vector<String>{"s1"});
+    const MountLease fenced = decodeMountLease(b->get(l.mountKey("s1"))->bytes);
+    EXPECT_TRUE(fenced.gc_fenced);
+    EXPECT_EQ(fenced.seq, before.seq + 1);
+}
+
+TEST(CasHeartbeatFloor, RenewalBetweenRoundsRestartsObservation)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    seedMount(*b, l, "s1", /*expires*/ 10, /*fenced*/ false, /*min_active*/ 0);
+
+    MountObservationMap obs;
+    computeHeartbeatFloor(*b, l, kNowMs, /*mono*/ 0, kStableThresholdMs, obs);
+    ASSERT_TRUE(obs.contains("s1"));
+    const Token first_token = obs.at("s1").token;
+
+    renewMount(*b, l, "s1");
+    const Token renewed_token = b->get(l.mountKey("s1"))->token;
+    EXPECT_NE(renewed_token, first_token);
+
+    const HeartbeatFloor floor2 = computeHeartbeatFloor(*b, l, kNowMs, /*mono*/ kStableThresholdMs,
+                                                          kStableThresholdMs, obs);
+
+    EXPECT_EQ(floor2.fenced_now, 0u);
+    ASSERT_TRUE(obs.contains("s1"));
+    EXPECT_EQ(obs.at("s1").token, renewed_token);
+    EXPECT_EQ(obs.at("s1").first_seen_mono_ms, kStableThresholdMs);
 }
 
 TEST(CasHeartbeatFloor, ClassifiesAndFencesOut)
@@ -528,30 +613,47 @@ TEST(CasHeartbeatFloor, ClassifiesAndFencesOut)
     auto b = std::make_shared<InMemoryBackend>();
     Layout l("p");
 
-    /// two live mounts — both count into `live`.
+    /// two live mounts — genuinely renewing between the two rounds below, so their observation never
+    /// stabilizes.
     seedMount(*b, l, "s1", /*expires*/ kNowMs + 60'000, /*fenced*/ false, /*min_active*/ 0);
     seedMount(*b, l, "s2", /*expires*/ kNowMs + 60'000, /*fenced*/ false, /*min_active*/ 0);
-    /// expired-unfenced — must be fenced-out by the call.
+    /// dead — no renewal between the two rounds below — must be fenced-out by the second call.
     seedMount(*b, l, "s3", /*expires*/ kNowMs - 60'000, /*fenced*/ false, /*min_active*/ 0);
-    /// already-fenced — excluded, body byte-identical after the call (no PUT).
+    /// already-fenced — excluded, body byte-identical after both calls (no PUT).
     seedMount(*b, l, "s4", /*expires*/ kNowMs - 60'000, /*fenced*/ true, /*min_active*/ 0);
     /// terminated (min_active == UINT64_MAX) with expired-looking timestamps — excluded, not fenced.
     seedMount(*b, l, "s5", /*expires*/ kNowMs - 60'000, /*fenced*/ false,
               /*min_active*/ std::numeric_limits<uint64_t>::max());
+
+    MountObservationMap obs;
+
+    /// Round 1 (mono 0): first sight of every non-terminal mount — nothing is fence-eligible yet.
+    const HeartbeatFloor floor1 = computeHeartbeatFloor(*b, l, kNowMs, /*mono*/ 0, kStableThresholdMs, obs);
+    EXPECT_EQ(floor1.live, 3u);            // s1, s2, s3: observation just started
+    EXPECT_EQ(floor1.terminated, 1u);      // s5
+    EXPECT_EQ(floor1.fenced_now, 0u);
+    EXPECT_EQ(floor1.already_fenced, 1u);  // s4
+
+    /// s1 and s2 renew between rounds (as a live keeper would); s3 does not (it crashed).
+    renewMount(*b, l, "s1");
+    renewMount(*b, l, "s2");
 
     const auto s3_before = b->get(l.mountKey("s3"));
     const auto s4_before = b->get(l.mountKey("s4"));
     ASSERT_TRUE(s3_before.has_value());
     ASSERT_TRUE(s4_before.has_value());
 
-    const HeartbeatFloor floor = computeHeartbeatFloor(*b, l, kNowMs, kSkewMarginMs);
+    /// Round 2 (mono == threshold): s1/s2's renewed tokens restart their observation (still live);
+    /// s3's original token has now held stable for the full threshold -> fenced.
+    const HeartbeatFloor floor2 = computeHeartbeatFloor(*b, l, kNowMs, /*mono*/ kStableThresholdMs,
+                                                          kStableThresholdMs, obs);
 
-    EXPECT_EQ(floor.live, 2u);
-    EXPECT_EQ(floor.terminated, 1u);
-    EXPECT_EQ(floor.fenced_now, 1u);
-    EXPECT_EQ(floor.already_fenced, 1u);
+    EXPECT_EQ(floor2.live, 2u);            // s1, s2: renewed, observation restarted
+    EXPECT_EQ(floor2.terminated, 1u);      // s5
+    EXPECT_EQ(floor2.fenced_now, 1u);      // s3
+    EXPECT_EQ(floor2.already_fenced, 1u);  // s4
 
-    /// The expired-unfenced body was fenced: gc_fenced set, seq bumped, the rest of the body preserved.
+    /// The dead body was fenced: gc_fenced set, seq bumped, the rest of the body preserved.
     const auto s3_after = b->get(l.mountKey("s3"));
     ASSERT_TRUE(s3_after.has_value());
     const MountLease s3_prev = decodeMountLease(s3_before->bytes);
@@ -563,7 +665,7 @@ TEST(CasHeartbeatFloor, ClassifiesAndFencesOut)
     EXPECT_EQ(s3_now.hostname, s3_prev.hostname);
     EXPECT_EQ(s3_now.expires_at_ms, s3_prev.expires_at_ms);
 
-    /// The already-fenced body was not touched (no PUT).
+    /// The already-fenced body was not touched (no PUT) across either call.
     const auto s4_after = b->get(l.mountKey("s4"));
     ASSERT_TRUE(s4_after.has_value());
     EXPECT_EQ(s4_after->bytes, s4_before->bytes);
@@ -614,15 +716,23 @@ TEST(CasHeartbeatFloor, FenceOutLosesTokenRaceReclassifiesLive)
     auto b = std::make_shared<RenewOnFenceBackend>(
         l.mountKey("s1"), /*renewed_expires*/ kNowMs + 120'000);
 
-    /// One expired-unfenced mount. The function GETs it (expired), tries to fence it out, the
-    /// decorator renews it concurrently under the real token, the PUT hits PreconditionFailed, the
-    /// function re-GETs and reclassifies it as live — never fenced.
     seedMount(*b, l, "s1", /*expires*/ kNowMs - 60'000, /*fenced*/ false, /*min_active*/ 0);
 
-    const HeartbeatFloor floor = computeHeartbeatFloor(*b, l, kNowMs, kSkewMarginMs);
+    MountObservationMap obs;
+    /// Round 1: first sight, observation starts — never reaches the fence-out path (the race
+    /// decorator stays armed for round 2).
+    const HeartbeatFloor floor1 = computeHeartbeatFloor(*b, l, kNowMs, /*mono*/ 0, kStableThresholdMs, obs);
+    EXPECT_EQ(floor1.fenced_now, 0u);
 
-    EXPECT_EQ(floor.fenced_now, 0u);
-    EXPECT_EQ(floor.live, 1u);
+    /// Round 2: the token has been stable past threshold, so the function attempts the fence-out.
+    /// The decorator renews concurrently under the real token, the PUT hits PreconditionFailed, the
+    /// function re-GETs and reclassifies it as live (observation restarted on the new token) — never
+    /// fenced.
+    const HeartbeatFloor floor2 = computeHeartbeatFloor(*b, l, kNowMs, /*mono*/ kStableThresholdMs,
+                                                          kStableThresholdMs, obs);
+
+    EXPECT_EQ(floor2.fenced_now, 0u);
+    EXPECT_EQ(floor2.live, 1u);
 
     const auto after = b->get(l.mountKey("s1"));
     ASSERT_TRUE(after.has_value());
@@ -634,7 +744,8 @@ TEST(CasHeartbeatFloor, EmptyPrefixYieldsNoLiveMounts)
     auto b = std::make_shared<InMemoryBackend>();
     Layout l("p");
 
-    const HeartbeatFloor floor = computeHeartbeatFloor(*b, l, kNowMs, kSkewMarginMs);
+    MountObservationMap obs;
+    const HeartbeatFloor floor = computeHeartbeatFloor(*b, l, kNowMs, /*mono*/ 0, kStableThresholdMs, obs);
 
     EXPECT_EQ(floor.live, 0u);
     EXPECT_EQ(floor.terminated, 0u);

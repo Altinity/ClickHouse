@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <map>
 #include <optional>
 #include <string_view>
 #include <utility>
@@ -257,21 +258,52 @@ MountClaimResult claimMountAwaitingExpiry(
     const std::function<void(const MountLease &, uint64_t)> & on_wait_start = {},
     const CasEventSink & sink = {});
 
+/// One srid's cross-round token-stability observation (rev.6 design §token-stability observation),
+/// owned by the GC leader instance (`Cas::Gc::mount_obs`) and threaded through consecutive
+/// `computeHeartbeatFloor` calls — one GC round is one observation tick. Mirrors
+/// `claimMountAwaitingExpiry`'s observation loop, but at heartbeat-gate granularity rather than a
+/// tight poll loop.
+struct MountTokenObservation
+{
+    Token token;
+    uint64_t first_seen_mono_ms = 0;
+};
+
+/// Keyed by `server_root_id`. In-memory only: a fresh leader (after a steal, or a process restart)
+/// starts with an empty map, which only delays fencing an already-dead mount by one extra round while
+/// it (re)establishes the observation — safe (never fences early), never unsafe.
+using MountObservationMap = std::map<String, MountTokenObservation>;
+
 /// GC heartbeat gate (GC round protocol step 1). Run by the GC leader at the top of a round: LIST
 /// `gc/server-roots/` (O(servers), single-digit counts), GET each mount body, and classify + fence out
-/// expired mounts (liveness only — graduation itself paces on GC rounds, not on heartbeat acks).
+/// dead mounts (liveness only — graduation itself paces on GC rounds, not on heartbeat acks).
 /// Classification per body:
 ///   - `gc_fenced` already set → excluded (`already_fenced`); a fenced mount is terminal, no PUT;
 ///   - terminated (`min_active == UINT64_MAX`, the farewell sentinel stamped by
 ///     `MountLeaseKeeper::terminate`) → excluded (`terminated`). `expires_at_ms` alone cannot
 ///     distinguish a graceful farewell from a crash, so the sentinel — not the timestamps — is the
 ///     terminated marker;
-///   - live (`now_ms <= expires_at_ms + skew_margin_ms`) → counted in `live`;
-///   - else expired (past the skew-padded deadline, not terminated, not yet fenced) → FENCE-OUT: one
-///     token-guarded `putOverwrite` preserving the WHOLE body, setting `gc_fenced = true` and `seq +
-///     1`. On `Done` → excluded (`fenced_now`); on `PreconditionFailed` (the holder renewed
-///     concurrently) → re-GET and reclassify from the top (bounded retries; if still contended, count
-///     it as live — conservative, never exclude a heartbeat without a landed fence-out).
+///   - otherwise, OBSERVATION-BASED liveness (rev.6 design §token-stability observation — the same
+///     principle `claimMountAwaitingExpiry` uses for a mount's OWN reopen, applied here to the GC's
+///     fence-out): `obs` remembers, per srid, the write-token last seen and the leader's OWN
+///     monotonic clock reading (`mono_now_ms`) at the moment it first saw that token. A body whose
+///     CURRENT token differs from (or is absent from) `obs` is (re)started fresh — counted `live`,
+///     never fenced this call, regardless of what its stamped `expires_at_ms` claims (a bare
+///     wall-clock stamp is never trusted — see `claimMount`'s "certificate of death" doc). Only once
+///     the SAME token has held for `>= stable_threshold_ms` OF THE LEADER'S OWN CLOCK does the body
+///     become FENCE-eligible;
+///   - FENCE-eligible → one token-guarded `putOverwrite` preserving the WHOLE body, setting
+///     `gc_fenced = true` and `seq + 1`. On `Done` → excluded (`fenced_now`); on `PreconditionFailed`
+///     (the holder renewed concurrently — a live token change) → re-GET and reclassify from the top
+///     (bounded retries; the reclassify sees the new token and restarts the observation, counting it
+///     `live` — conservative, never exclude a heartbeat without a landed fence-out).
+///
+/// `now_ms` is WALL clock, used only for the audit/diagnostic log line — it never participates in the
+/// fence decision (mirrors `claimMountAwaitingExpiry`'s `now_ms_fn` vs `mono_ms_fn` split).
+/// `mono_now_ms` is the OBSERVATION clock: the caller's OWN monotonic reading, never compared against
+/// any other node's clock. `obs` is owned by the caller and threaded across consecutive calls (one GC
+/// leader instance, `Cas::Gc::mount_obs`) — a fresh leader starts with an empty map (safe: delays
+/// fencing one round, never fences early).
 ///
 /// The fence-out is BOTH safety and liveness. Safety: a sleeper's later renewal permanently fails
 /// (its `putOverwrite` now mismatches the fenced token → `tripMountLost`), so it can never re-arm
@@ -289,7 +321,8 @@ struct HeartbeatFloor
 };
 
 HeartbeatFloor computeHeartbeatFloor(Backend & b, const Layout & l, uint64_t now_ms,
-                                     uint64_t skew_margin_ms);
+                                     uint64_t mono_now_ms, uint64_t stable_threshold_ms,
+                                     MountObservationMap & obs);
 
 /// A read-only snapshot of one server's mount slot, for introspection (`system.content_addressed_mounts`).
 /// state: `live` (lease within TTL+skew), `expired` (lease ran out; the next GC round's heartbeat floor
