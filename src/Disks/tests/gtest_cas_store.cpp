@@ -1128,10 +1128,18 @@ TEST(CasStoreMountFence, OpenRecoversFromFenceInAdoptWindowWithFreshEpoch)
     const DB::Cas::Layout layout("p");
     fencing->fence_key = layout.mountKey("test");
 
+    /// The retry that recovers from the fence reclaims a same-uuid, different-epoch, `gc_fenced` body
+    /// -> `MountPriorState::Fenced` (rev.6 Task 4/6) -> `Store::open` pays `materialization_grace_ms`
+    /// (zero observation polling either way: a fenced prior is reclaimed on the first attempt). Inject
+    /// a no-op `wait_sleep_fn` (+ a fake `boot_ms_fn`, matching `CasMountTmat.FencedPriorPaysOnlyTmat`)
+    /// so the wait resolves instantly instead of blocking this test on ~30 real seconds.
+    uint64_t fake_boot = 0;
     DB::Cas::StorePtr store;
     ASSERT_NO_THROW(
         store = DB::Cas::Store::open(fencing,
-            DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test"}))
+            DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test",
+                .boot_ms_fn = [&fake_boot] { return fake_boot; },
+                .wait_sleep_fn = [&fake_boot](uint64_t ms) { fake_boot += ms; }}))
         << "open must recover from a fence in the adopt window, not wedge (exit-49 S13 bug)";
     ASSERT_TRUE(store);
 

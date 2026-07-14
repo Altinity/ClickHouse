@@ -1626,8 +1626,17 @@ TEST(RefWriterStalePrecommitSweep, BoundedBatchesAndInterruptionResumeAcrossMoun
 
     /// A THIRD mount (successor-of-the-successor): fresh recovery replays the two raw seed logs PLUS the
     /// first chunk's now-durable removal, sees `needs_stale_precommit_sweep` armed again, and finishes
-    /// the remaining stale precommits in exactly one further chunk (<= 1000 remain).
-    auto resumer = openStore(backend);
+    /// the remaining stale precommits in exactly one further chunk (<= 1000 remain). `successor` was
+    /// abandoned mid-wedge above -- Task 5's drain fails closed on an unresolved PUT, so no clean
+    /// farewell was written -> this reclaim is `MountPriorState::UncleanObserved` (rev.6 Task 4), which
+    /// already paid a real ~36.5s token-stability observation wait here even before Task 6 added
+    /// `materialization_grace_ms` on top. Inject a fake `boot_ms_fn` + `wait_sleep_fn` (mirroring
+    /// `CasMountTmat.UncleanOpenWaitsMaterializationGrace`) so BOTH waits resolve instantly.
+    uint64_t resumer_fake_boot = 0;
+    PoolConfig resumer_config;
+    resumer_config.boot_ms_fn = [&resumer_fake_boot] { return resumer_fake_boot; };
+    resumer_config.wait_sleep_fn = [&resumer_fake_boot](uint64_t ms) { resumer_fake_boot += ms; };
+    auto resumer = openStoreWithConfig(backend, resumer_config);
     EXPECT_NO_THROW(resumer->listRefs(ns));
 
     const RefTableState final_state = independentFullReplayForTest(*backend, layout, ns);

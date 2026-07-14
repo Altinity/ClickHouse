@@ -448,14 +448,22 @@ TEST(CasMountStartup, StaleSelfMountReclaimedAfterWait)
     const uint64_t e1 = a->writerEpoch();
 
     /// A restart of the SAME server (same uuid) must NOT abort: it waits out the stale lease (<= ~300ms)
-    /// and reclaims the mount, coming up with a strictly higher durable writer_epoch.
+    /// and reclaims the mount, coming up with a strictly higher durable writer_epoch. No clean farewell
+    /// was written (Server A's Store is still alive, never destroyed) -> the reclaim is
+    /// `MountPriorState::UncleanObserved`, so `Store::open` (rev.6 Task 6) ALSO pays a
+    /// `materialization_grace_ms` wait after the observation window; inject a fake `boot_ms_fn` +
+    /// `wait_sleep_fn` (mirroring `CasMountTmat.UncleanOpenWaitsMaterializationGrace`) so BOTH waits
+    /// resolve instantly instead of blocking this test on ~30 real seconds.
+    uint64_t a2_fake_boot = 0;
     StorePtr a2;
     EXPECT_NO_THROW(
         a2 = Store::open(b, PoolConfig{
             .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r",
             .mount_lease_ttl_ms = std::chrono::milliseconds(300),
             .mount_renew_period = std::chrono::milliseconds(100),
-            .cas_request_budget = tiny_budget}));
+            .cas_request_budget = tiny_budget,
+            .boot_ms_fn = [&a2_fake_boot] { return a2_fake_boot; },
+            .wait_sleep_fn = [&a2_fake_boot](uint64_t ms) { a2_fake_boot += ms; }}));
     ASSERT_NE(a2, nullptr);
     EXPECT_GT(a2->writerEpoch(), e1);
 }
