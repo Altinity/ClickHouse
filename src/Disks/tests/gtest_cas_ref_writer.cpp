@@ -2733,3 +2733,66 @@ TEST(RefWriterRecoverySeal, SealPutFailureFailsRecoveryClosed)
     EXPECT_TRUE(backend->get(layout.refSnapshotKey(ns, seal_id)).has_value())
         << "the second touch must have recovered and sealed";
 }
+
+/// rev.6 FINDING-1 (whole-plan final review, PART A): a LATER incarnation that recovers a table by
+/// loading a published seal (`{dead_epoch, UINT64_MAX}`, Task 8) as `greatest_snapshot` inherits that
+/// dead epoch verbatim into `RefTableState::greatest_applied` (`stateFromSnapshot`). `flushRefBatch`'s
+/// trial/shape-check id used to seed its epoch straight from `greatest_applied` and only reset it when
+/// the epoch was exactly 0, so the seal's dead epoch survived into the trial id and its `+= 1` shape
+/// probe wrapped `UINT64_MAX` to 0 -- `applyRefLogTxn` then rejected the wrapped id as not strictly
+/// greater than the seal, throwing `CORRUPTED_DATA` for every retry (an unbounded merge-retry loop in
+/// production). The REAL persisted id (`allocateRefTxnId`, always `liveWriterEpoch()`-based) was never
+/// affected -- the bug was confined to this preview. This test recovers a table from exactly such a
+/// seal and asserts an ordinary mutation afterwards commits instead of overflowing.
+TEST(RefWriterRecoverySeal, WriteAfterSealSelectedAsGreatestSnapshotCommits)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/seal_write_after_reload"};
+
+    seedSealFixtureDeadEpochs(*backend, layout, ns);
+    seedUncleanPredecessorMount(*backend, layout, /*epoch=*/2);
+
+    {
+        PoolConfig config;
+        config.server_id = UInt128(1);
+        config.mount_lease_ttl_ms = std::chrono::milliseconds(500);
+        config.cas_request_budget = sealTestTinyBudget();
+        config.materialization_grace_ms = 1000;
+        config.wait_sleep_fn = [](uint64_t) {};
+        auto store = openStoreWithConfig(backend, config);
+        ASSERT_TRUE(store);
+        ASSERT_EQ(store->liveWriterEpoch(), 3u);
+        ASSERT_TRUE(store->uncleanEpochBoundarySeenForTest());
+        EXPECT_EQ(store->listRefs(ns).size(), 2u);   /// drives recovery, which publishes the seal
+    }   /// the seal ({2, UINT64_MAX}) is now durable; the store above is released cleanly
+
+    const RefTxnId seal_id{2, UINT64_MAX};
+    ASSERT_TRUE(backend->get(layout.refSnapshotKey(ns, seal_id)).has_value())
+        << "setup invariant: the seal must be durable before the reload below";
+
+    /// A later incarnation of the SAME server (B2, matching FINDING-1's "any subsequent restart" --
+    /// same `server_id` as B1, so `claimOwnerOrThrow` treats this as a routine restart, not a foreign
+    /// takeover): a plain clean-boundary open, so its recovery does not itself seal anything -- it just
+    /// LISTs, selects the durable seal as `greatest_snapshot`, and replays an empty tail on top of it,
+    /// exactly reproducing the FINDING-1 precondition.
+    PoolConfig successor_config;
+    successor_config.server_id = UInt128(1);
+    auto successor = openStoreWithConfig(backend, successor_config);
+    ASSERT_GT(successor->liveWriterEpoch(), 2u) << "the successor's live epoch must dominate the seal's dead epoch";
+
+    try
+    {
+        publishEmptyPart(successor, ns, "c");
+    }
+    catch (const DB::Exception & e)
+    {
+        FAIL() << "an ordinary mutation on a table reloaded from a seal must commit, not overflow into "
+                  "CORRUPTED_DATA (rev.6 FINDING-1: flushRefBatch trial-id epoch seeding) -- got: "
+               << e.displayText();
+    }
+
+    const auto refs = successor->listRefs(ns);
+    EXPECT_EQ(refs.count("c"), 1u) << "the new ref must have actually committed";
+    EXPECT_EQ(refs.size(), 3u) << "the seal-recovered refs 'a' and 'b' must still be present alongside 'c'";
+}

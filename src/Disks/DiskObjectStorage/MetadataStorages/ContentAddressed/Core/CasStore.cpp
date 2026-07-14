@@ -1994,15 +1994,21 @@ void Store::flushRefBatch(const RootNamespace & ns, const std::shared_ptr<RefTab
     /// fail ONLY the offending item; survivors' ops accumulate into `final_ops` for one transaction.
     std::vector<RefOp> final_ops;
     std::vector<std::shared_ptr<RefMutationItem>> survivors;
-    RefTxnId trial_id = working.greatest_applied;
-    /// A never-born table's `greatest_applied` is `{0, 0}`; `applyRefLogTxn`'s strict-increase check
-    /// only needs a strictly greater EPOCH to accept the first trial id (RefTxnId compares epoch
-    /// first), and `admits`'s preview snapshot encoding rejects a zero epoch field regardless of
-    /// sequence. `liveWriterEpoch()` is this incarnation's nonzero epoch -- the SAME source
-    /// `allocateRefTxnId` stamps the real id with, so the trial preview and the persisted id never
-    /// disagree on epoch; these trial ids are never persisted or compared outside this loop.
-    if (trial_id.writer_epoch == 0)
-        trial_id.writer_epoch = liveWriterEpoch();
+    /// The trial epoch is ALWAYS `liveWriterEpoch()` -- the SAME source `allocateRefTxnId` stamps the
+    /// real id with, so the trial preview and the persisted id never disagree on epoch. The trial
+    /// sequence continues `greatest_applied`'s counter only when its epoch already matches the live
+    /// one (an ordinary same-incarnation append); otherwise -- a never-born table's `{0, 0}`, or a
+    /// recovery seal's `{dead_epoch, UINT64_MAX}` (spec §recovery-seal) -- the live epoch alone already
+    /// dominates `greatest_applied` (mount exclusivity guarantees `liveWriterEpoch() >=
+    /// greatest_applied.writer_epoch`), so the sequence starts fresh at 0. This also keeps the `+= 1`
+    /// previews below overflow-safe: a seal's sequence field is `UINT64_MAX`, which would otherwise wrap
+    /// to 0 and be rejected as not strictly increasing (rev.6 FINDING-1). These trial ids are never
+    /// persisted or compared outside this loop.
+    RefTxnId trial_id;
+    trial_id.writer_epoch = liveWriterEpoch();
+    trial_id.ref_sequence = (working.greatest_applied.writer_epoch == trial_id.writer_epoch)
+        ? working.greatest_applied.ref_sequence
+        : 0;
     for (const auto & it : batch)
     {
         RefTableState item_scratch = working;
