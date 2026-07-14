@@ -320,6 +320,11 @@ const MergeTreeData * MutationsInterpreter::Source::getMergeTreeData() const
     return dynamic_cast<const MergeTreeData *>(storage.get());
 }
 
+MergeTreeData::DataPartPtr MutationsInterpreter::Source::getMergeTreeDataPart() const
+{
+    return part;
+}
+
 bool MutationsInterpreter::Source::supportsLightweightDelete() const
 {
     if (part)
@@ -913,6 +918,25 @@ void MutationsInterpreter::prepare(bool dry_run)
         {
             mutation_kind.set(MutationKind::MUTATE_OTHER);
             read_columns.emplace_back(command.column_name);
+            /// If MODIFY COLUMN changes the type of a projection PK column,
+            /// rebuild the projection so reads do not observe stale layout.
+            if (const auto & merge_tree_data_part = source.getMergeTreeDataPart())
+            {
+                const auto & column = merge_tree_data_part->tryGetColumn(command.column_name);
+                if (column && command.data_type && !column->type->equals(*command.data_type))
+                {
+                    for (const auto & projection : metadata_snapshot->getProjections())
+                    {
+                        const auto & pk_columns = projection.metadata->getPrimaryKeyColumns();
+                        if (std::ranges::find(pk_columns, command.column_name) != pk_columns.end())
+                        {
+                            for (const auto & col : projection.required_columns)
+                                dependencies.emplace(col, ColumnDependency::PROJECTION);
+                            materialized_projections.insert(projection.name);
+                        }
+                    }
+                }
+            }
         }
         else
             throw Exception(ErrorCodes::UNKNOWN_MUTATION_COMMAND, "Unknown mutation command type: {}", DB::toString<int>(command.type));
