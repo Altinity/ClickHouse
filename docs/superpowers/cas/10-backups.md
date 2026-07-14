@@ -328,20 +328,30 @@ Economics: at consolidation cadence most young churn has died; the surviving par
 those that will move cold anyway, so their upload is a prepayment — when the TTL move later
 happens, the write path dedups against the already-present blobs and the move becomes
 metadata-only. **Manifest reuse** keeps repeated consolidations incremental: `ManifestId` is
-monotone, not content-derived, so the consolidator consults the previous pool-complete `_snap`
-and re-references the existing manifest when a part is unchanged — with "unchanged" witnessed
-by **filesystem identity, not hash equality**. The frequent tier already hardlinks every part,
-so the witness is inode equality between this snapshot's hardlinks and the previous
-consolidated snapshot's local piece: same inode ⇒ same bytes, a filesystem guarantee — no
-reads, no hashing, no collision risk. (Consequence: the last consolidated snapshot's local
-piece is retained until the next consolidation — an extension of the thin-after rule.) Where
-no inode witness exists (the local piece was thinned, files were re-created), the fallback is
-a full re-hash through the write path under the pool's blob algorithm — never bare
-`checksums.txt` equality: MergeTree checksums are `CityHash128`, a non-cryptographic hash, and
-a decision to skip reading bytes must not rest on it. Any hash-based equality oracle here must
-also compare the explicit file **size** (free, and it removes all unequal-length collisions);
-note that mixing part/file names into the hash adds no discriminating power to this comparison
-— it is a *same-slot* check, so the names are equal on both sides by construction. In-pool
+monotone, not content-derived, so the consolidator re-references existing manifests and blobs
+when a part is unchanged — with "unchanged" decided by a **local upload cache** (the
+borg/restic files-cache pattern), grounded in filesystem identity rather than content-hash
+equality. Every upload (consolidation or the trickle warmer — one shared cache) records
+`(path, inode, birth time, size) → pool digest`; at the next consolidation, a file whose
+`stat` identity matches its cache entry reuses the recorded digest **without reading bytes**
+— committed part files are immutable, so the filesystem identity is the witness. `statx`
+birth time is preferred over mtime/ctime because hardlinking (which the frequent tier does
+constantly) never touches it. A cache hit still goes through the ordinary cold-reuse path
+pool-side (`.meta` point-read, resurrect/copy-forward as for any non-tokened dependency), so
+the cache never bypasses pool-side safety — it only skips reading local bytes; if the pool
+object turns out absent, the file is read and uploaded normally and the cache refreshed. The
+cache is therefore purely advisory: losing it costs one re-hash pass, never correctness; the
+residual local wrong-reuse window (an inode recycled into an identical `(birth time, size)`
+slot) is negligible with nanosecond timestamps and can be closed entirely by a periodic
+verification pass. If all of a part's files resolve to the same digests as in the previous
+consolidated manifest, the `ManifestId` itself is reused; otherwise a new manifest is minted,
+still referencing the cached blob digests. A cache miss falls back to a full re-hash through
+the write path under the pool's blob algorithm — never bare `checksums.txt` equality:
+MergeTree checksums are `CityHash128`, a non-cryptographic hash, and a decision to skip
+reading bytes must not rest on it. Any hash-based equality oracle here must also compare the
+explicit file **size** (free, and it removes all unequal-length collisions); note that mixing
+part/file names into the hash adds no discriminating power to this comparison — it is a
+*same-slot* check, so the names are equal on both sides by construction. In-pool
 blob dedup has its own, separate collision axis, governed by the pool's pluggable blob-hash
 choice: deployments that require collision resistance run the pool on `sha256`, and a
 slot-bound middle tier (`ch128ctx` = content hash ∥ `xxh3_64(part_name, file_name)` ∥ size —
