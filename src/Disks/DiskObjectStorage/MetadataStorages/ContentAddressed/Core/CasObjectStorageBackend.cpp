@@ -426,7 +426,8 @@ static bool isObjectNotFound(const std::exception & e)
 static String readObjectRanged(IObjectStorage & object_storage, const String & path, Range range,
                                uint64_t known_size = 0)
 {
-    auto buf = object_storage.readObject(StoredObject(path), getReadSettings(), /*read_hint=*/std::nullopt);
+    auto buf = object_storage.readObject(
+        StoredObject(path), casSizedReadSettings(getReadSettings(), known_size), /*read_hint=*/std::nullopt);
     String content;
     if (range.whole())
     {
@@ -468,7 +469,8 @@ static String readObjectRanged(IObjectStorage & object_storage, const String & p
 static std::unique_ptr<ReadBuffer> openObjectRangedStream(IObjectStorage & object_storage, const String & path, Range range,
                                                           uint64_t known_size = 0)
 {
-    auto buf = object_storage.readObject(StoredObject(path), getReadSettings(), /*read_hint=*/std::nullopt);
+    auto buf = object_storage.readObject(
+        StoredObject(path), casSizedReadSettings(getReadSettings(), known_size), /*read_hint=*/std::nullopt);
     if (range.whole())
         return buf;
 
@@ -489,6 +491,13 @@ static std::unique_ptr<ReadBuffer> openObjectRangedStream(IObjectStorage & objec
         buf->setReadUntilPosition(range.offset + *range.length);
     buf->seek(static_cast<off_t>(range.offset), SEEK_SET);
     return buf;
+}
+
+ReadSettings casSizedReadSettings(const ReadSettings & base, uint64_t known_size)
+{
+    if (known_size == 0)
+        return base;
+    return base.adjustBufferSize(known_size + CAS_FOLD_READ_SLACK_BYTES);
 }
 
 /// =========================================================================================

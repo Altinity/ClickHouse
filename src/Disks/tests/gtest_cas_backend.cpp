@@ -16,6 +16,7 @@
 #include <Disks/tests/cas_test_helpers.h>
 #include <Disks/WriteMode.h>
 #include <IO/ReadBufferFromFileBase.h>
+#include <IO/ReadSettings.h>
 #include <IO/S3Common.h>
 #include <filesystem>
 #include <map>
@@ -622,6 +623,29 @@ TEST(CasObjectStorageBackend, RangedGetReadsOnlyTheWindow)
     const auto past = backend->get("p/obj", DB::Cas::Range{.offset = 1000000, .length = 10});
     ASSERT_TRUE(past.has_value());
     EXPECT_TRUE(past->bytes.empty());
+}
+
+/// §1 (opt round-B): the fold/point GETs read tiny bodies but a default `ReadBufferFromS3` preallocates
+/// ~1 MiB. `casSizedReadSettings` shrinks the buffer to the known body size + slack, capped at the
+/// caller's default — never larger than before, regardless of the reported size.
+TEST(CasSizedReadSettings, CapsToKnownSizePlusSlackButNeverAboveBase)
+{
+    DB::ReadSettings base;
+    base.remote_fs_settings.buffer_size = 1ULL << 20;   /// 1 MiB default
+    base.local_fs_settings.buffer_size = 1ULL << 20;
+
+    /// A ~3.7 KB fold body: buffer shrinks to size + slack, far below the 1 MiB default.
+    const auto small = DB::Cas::casSizedReadSettings(base, 3700);
+    EXPECT_EQ(small.remote_fs_settings.buffer_size, 3700 + DB::Cas::CAS_FOLD_READ_SLACK_BYTES);
+    EXPECT_EQ(small.local_fs_settings.buffer_size, 3700 + DB::Cas::CAS_FOLD_READ_SLACK_BYTES);
+
+    /// A body larger than the default is capped AT the default (never grown).
+    const auto big = DB::Cas::casSizedReadSettings(base, 8ULL << 20);
+    EXPECT_EQ(big.remote_fs_settings.buffer_size, 1ULL << 20);
+
+    /// Unknown size (0) = leave the base untouched (the metadata-fetch fallback path).
+    const auto unknown = DB::Cas::casSizedReadSettings(base, 0);
+    EXPECT_EQ(unknown.remote_fs_settings.buffer_size, 1ULL << 20);
 }
 
 /// The CountingBackend request-shape recorders that the streaming-memory gates (Task 3/4) consume:

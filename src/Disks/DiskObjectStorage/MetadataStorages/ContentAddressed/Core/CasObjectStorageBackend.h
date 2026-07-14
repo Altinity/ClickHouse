@@ -13,6 +13,13 @@
 namespace DB::Cas
 {
 
+/// §1 (Round-B): the fold/point GETs read tiny bodies (~3.7 KB avg) but a default ReadBufferFromS3
+/// preallocates ~1 MiB. When the body size is already known (the Native `get` HEADs it first), shrink
+/// the read buffer to `size + slack`, capped at the caller's default — a pure reuse of
+/// `ReadSettings::adjustBufferSize`. `known_size == 0` means "unknown", leave the settings untouched.
+constexpr uint64_t CAS_FOLD_READ_SLACK_BYTES = 4096;
+ReadSettings casSizedReadSettings(const ReadSettings & base, uint64_t known_size);
+
 #if USE_AWS_S3
 namespace detail
 {
