@@ -327,35 +327,32 @@ Chosen resolution: **cadence and completeness are separate axes.**
 Economics: at consolidation cadence most young churn has died; the surviving parts are mostly
 those that will move cold anyway, so their upload is a prepayment — when the TTL move later
 happens, the write path dedups against the already-present blobs and the move becomes
-metadata-only. **Manifest reuse** keeps repeated consolidations incremental: `ManifestId` is
-monotone, not content-derived, so the consolidator re-references existing manifests and blobs
-when a part is unchanged — with "unchanged" decided by a **local upload cache** (the
-borg/restic files-cache pattern), grounded in filesystem identity rather than content-hash
-equality. Every upload (consolidation or the trickle warmer — one shared cache) records
-`(path, inode, birth time, size) → pool digest`; at the next consolidation, a file whose
-`stat` identity matches its cache entry reuses the recorded digest **without reading bytes**
-— committed part files are immutable, so the filesystem identity is the witness. `statx`
-birth time is preferred over mtime/ctime because hardlinking (which the frequent tier does
-constantly) never touches it. A cache hit still goes through the ordinary cold-reuse path
-pool-side (`.meta` point-read, resurrect/copy-forward as for any non-tokened dependency), so
-the cache never bypasses pool-side safety — it only skips reading local bytes; if the pool
-object turns out absent, the file is read and uploaded normally and the cache refreshed. The
-cache is therefore purely advisory: losing it costs one re-hash pass, never correctness; the
-residual local wrong-reuse window (an inode recycled into an identical `(birth time, size)`
-slot) is negligible with nanosecond timestamps and can be closed entirely by a periodic
-verification pass. If all of a part's files resolve to the same digests as in the previous
-consolidated manifest, the `ManifestId` itself is reused; otherwise a new manifest is minted,
-still referencing the cached blob digests. A cache miss falls back to a full re-hash through
-the write path under the pool's blob algorithm — never bare `checksums.txt` equality:
-MergeTree checksums are `CityHash128`, a non-cryptographic hash, and a decision to skip
-reading bytes must not rest on it. Any hash-based equality oracle here must also compare the
-explicit file **size** (free, and it removes all unequal-length collisions); note that mixing
-part/file names into the hash adds no discriminating power to this comparison — it is a
-*same-slot* check, so the names are equal on both sides by construction. In-pool
-blob dedup has its own, separate collision axis, governed by the pool's pluggable blob-hash
-choice: deployments that require collision resistance run the pool on `sha256`, and a
-slot-bound middle tier (`ch128ctx` = content hash ∥ `xxh3_64(part_name, file_name)` ∥ size —
-see `BACKLOG.md §read-write`) defuses *cross-slot* collisions (the realistic adversarial dedup
+metadata-only.
+
+**Consolidation identity is hashing — the CA-native primitive, with no cross-backup
+metadata.** The consolidator simply streams every hot file of the chosen snapshot through the
+ordinary write path: hash under the pool's blob algorithm, then `putIfAbsent`/cold-reuse — a
+blob already present (from a previous consolidation or the trickle warmer) costs a `.meta`
+point-read and no upload. Incrementality therefore falls out **pool-side**: the pool is the
+only index, and the current backup is never compared against the previous one via side
+metadata. Manifest reuse falls out the same way: `ManifestId` is monotone, not
+content-derived, so when every file of a part resolves to the same digests as in the previous
+consolidated manifest, that `ManifestId` is re-referenced; otherwise a new manifest is minted
+over the (mostly deduplicated) blobs. The trickle warmer needs no bookkeeping either: a part
+crosses the age threshold exactly once, so the warmer processes the parts that crossed it
+since its last pass (cursor = a timestamp; losing it means some re-hashing that the pool
+dedups — harmless). Skip-read shortcuts were considered and **rejected**: bare
+`checksums.txt` equality (MergeTree checksums are `CityHash128`, a non-cryptographic hash —
+it must not gate a decision to skip reading bytes), and inode witnesses / borg-style files
+caches keyed by filesystem identity (correct, but cross-backup comparison over filesystem
+metadata is side state alien to the CA model, whose identity primitive *is* re-hashing). The
+price of this simplicity is one streaming read+hash of the hot tier per consolidation —
+minutes per terabyte at a daily band on a local NVMe tier; if that ever becomes a measured
+bottleneck, the lever is the pool's pluggable hash speed, not a bypass of hashing. In-pool
+blob dedup has its own collision axis, governed by that pluggable choice: deployments that
+require collision resistance run the pool on `sha256`, and a slot-bound middle tier
+(`ch128ctx` = content hash ∥ `xxh3_64(part_name, file_name)` ∥ size — see
+`BACKLOG.md §read-write`) defuses *cross-slot* collisions (the realistic adversarial dedup
 vector) at near-zero CPU cost, while every dedup CAS actually relies on survives: relink and
 carry-forward are reference-based, and retry idempotency, same-name replica writes, and the
 snapshot-upload → TTL-move prepayment are all same-slot.
