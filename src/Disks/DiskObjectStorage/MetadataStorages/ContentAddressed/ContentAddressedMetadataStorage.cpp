@@ -1323,6 +1323,16 @@ bool ContentAddressedMetadataStorage::adoptPartFromManifest(
         /// Sender identity is NON-AUTHORITATIVE: only the entries are used. The blobs are already
         /// in the shared pool (referenced by hash) — publishEntries adopts them as tokenless
         /// W-EVIDENCE and promote re-proves each fail-closed (the proven republish sequence).
+        ///
+        /// COMMIT-BEFORE-RELEASE gap (tasks #42/#43; deep-tail, interim-accepted). The relink sender is
+        /// fire-and-forget (DataPartsExchange.cpp:256-259 releases the source part before this commit), so
+        /// there is no in-degree overlap: if THIS precommitAdd edge-PUT stalls across >= 2 GC folds while
+        /// the source's Outdated part is concurrently collected and the blob has no other ref, the blob can
+        /// be reclaimed under us → a dangling committed manifest (fsck-detected). deleteExact covers every
+        /// token-CHANGE recovery; only this same-token tail remains. The real fix reuses the read-replica
+        /// GC retention floor (spec 2026-07-14-cas-readonly-replica-snapshot-pin-design.md §8.1): the
+        /// fetching replica takes a transient retention pin on the source snapshot for the relink duration.
+        /// Do NOT build a bespoke relink handshake — the Poco interserver transport is half-duplex.
         partAccess().publishEntries({receiver_ns, part_name}, decoded.entries, mutable_files,
                                     Cas::ProvenanceOp::Attach);
         return true;
