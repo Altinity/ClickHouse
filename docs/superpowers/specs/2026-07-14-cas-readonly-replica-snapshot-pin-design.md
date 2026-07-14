@@ -192,6 +192,12 @@ whose corresponding `+1` lies inside a reader-pinned window is deferred (kept so
 applied as a prefix once `S_min` advances past it). Per-round cost is O(removals newly applicable), not
 O(window). A blob is condemnable iff its edge set is empty across `current refs ∪ all pinned windows`.
 
+This overlay is the **shared retention primitive**: a pin contributes an edge-set (a snapshot-window here,
+an explicit manifest-closure for a fetch pin) with a liveness owner, and dead-owner pins are dropped
+before the fold. The reader pin is one consumer; the fetch-handoff pin
+([`2026-07-15-cas-fetch-handoff-retention-pin-design.md`](2026-07-15-cas-fetch-handoff-retention-pin-design.md))
+is an independent second consumer built on the same overlay.
+
 ### 5.3 Writer snapshot age-trigger (amendment) {#age-trigger}
 
 So a slow table's newest snapshot does not stay ancient (leaving readers nothing recent to re-base onto
@@ -240,41 +246,20 @@ Both DROP TABLE and `SYSTEM CONTENT ADDRESSED DROP POOL MEMBER` reduce to the sa
   decommission the reader's source is gone → active queries drain on their pins, new queries fail, and
   the operator repoints (replicated: another member) or detaches the reader.
 
-### 8.1 Fetch-by-relink handoff (commit-before-release) and detached {#relink-handoff}
+### 8.1 Fetch-by-relink handoff and bulk warm-up — a separate consumer of the retention overlay {#relink-handoff}
 
-The same retention floor is the correct home for the **fetch-by-relink commit-before-release gap**
-(reports `2026-07-14-cas-adoptevidence-relink-lifecycle-exposure` / `…-s5-spare-clear-…`; tasks #42/#43).
+The fetch-by-relink **commit-before-release gap** (`#42`/`#43`) and its future bulk-warm-up
+generalization are **orthogonal** to this reader/WORM feature. They share **only** the §5.2
+retention-overlay primitive (a pool-global pin contributing an edge-set to GC's fold, dead-owner pins
+dropped) and differ on every other axis — owner (a receiver **build** vs a reader **mount**), payload
+(a manifest **closure** vs a snapshot-window), liveness (**epoch-floor** vs heartbeat-lease), and
+publisher (the **sender** on the receiver's behalf vs the reader itself). They are therefore specified
+separately and are **independently shippable**: the fetch fix needs only the §5.2 primitive, not the
+reader-mount mode, the snapshot-window pin, the heartbeat-lease, or the readonly-refresh reuse.
 
-- **The gap.** The relink SENDER is fire-and-forget: `Service::processQuery` writes the manifest and
-  returns (`DataPartsExchange.cpp:256-259`), releasing its `DataPartPtr` BEFORE the receiver's
-  `adoptPartFromManifest` commit (`:720`). There is no in-degree overlap. Data loss requires the receiver's
-  `precommitAdd` edge-PUT to STALL across ≥ 2 GC folds while the source's now-`Outdated` part is
-  concurrently collected and the blob has no other ref — a deep tail. `deleteExact` already covers every
-  token-CHANGE recovery (a resurrect displaces to a fresh token → `TokenMismatch` no-op); only this
-  **same-token** tail (relink re-references at the condemn-time token) remains, and fsck detects the
-  resulting dangle.
-- **The fix, via the retention pin.** The fetching replica takes a **transient retention pin** on the
-  source's snapshot for the relink's duration: publish `gc/readers/<fetcher>` with `S_min ≤` the source
-  snapshot BEFORE fetching, release/advance after committing its own ref. §3.2's self-limiting applies
-  exactly — the pin is load-bearing only when the source has already dropped the part (`in-degree 0`),
-  i.e. the gap case; it is redundant-but-harmless for a still-current source. It is durable and
-  lease-crash-safe (fetcher dies → pin expires → GC resumes), needs **no blocking sender, no ACK, no
-  second interserver request** (the Poco interserver transport is half-duplex and cannot carry a reverse
-  ACK regardless — response-side bytes/suffix/trailer are sender→receiver and buffered). No bespoke
-  relink machinery — reuse the floor built for readers.
-- **Interim (until the pin lands): accept + document** (option C). The tail is deep and fsck-backstopped;
-  a comment at `adoptPartFromManifest` records it. Do NOT build a bespoke relink handshake for it.
-- **[B66b] relink-into-detached** (`cas/BACKLOG.md`): today `to_detached` fetches byte-stream even for
-  same-pool parts (`DataPartsExchange.cpp:523` gates relink off for `to_detached`, staging at the ACTIVE
-  path); extending `Fetcher::relinkPartToDisk` to honor `to_detached` via the `detached/<part>` fold (B181)
-  closes the RPL-4 perf cliff. It inherits the **same** commit-before-release handoff, so it takes the
-  same transient retention pin — do it together with the pin work.
-- **[B66a] concurrent-fetch torn read of shared `detached` ref on local storage** (`cas/BACKLOG.md`): a
-  shared-`detached`-style read-modify-write of a shared ref is non-atomic on `LocalObjectStorage` (safe on
-  S3's atomic PUT). This is a local-backend atomicity item, **orthogonal to the retention pin** but
-  detached-adjacent (housed here to keep the detached/relink cluster together); the fix is per-ref /
-  per-frozen-part writes (as freeze already chose, see `cas/CONSOLIDATION-COVERAGE.md`) or a local
-  put-if-absent atomicity shim — not a pin.
+See [`2026-07-15-cas-fetch-handoff-retention-pin-design.md`](2026-07-15-cas-fetch-handoff-retention-pin-design.md)
+— it owns the fetch protocol, the sender-created / receiver-build-owned / epoch-floor pin, the bulk
+write-replica warm-up extension, the interim option-C status, and the detached cluster (B66a/B66b).
 
 ## 9. Contract A — the verbatim table-level plane {#contract-a}
 
