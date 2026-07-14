@@ -99,18 +99,26 @@ chaos-recovery `unaccounted`-blob dryrun-subset flake, unrelated to the cache �
 loss; its absolute counters are deflated by early termination but its normalized rates match runs
 1-2, so it corroborates saturation.)
 
-### §2 follow-up — DEFERRED: dedup-cache validate-on-hit (skip the occupancy HEAD) {#s2-dedup-skip-head}
+### §2 follow-up — REJECTED as unsafe: dedup-cache validate-on-hit {#s2-dedup-skip-head}
 
-Recorded 2026-07-14 (deferred by the user — a documented future lever, NOT in this round). The §2
-measurement proved sizing alone gives zero HEAD reduction (the working set already fits in 64 MiB),
-and the mechanics correction established a dedup-cache HIT does not skip the occupancy `HEAD`. But the
-dedup-probe HEADs are ~73% of all HEADs (~7M of 9.6M in the audit) and NO lever in this round reduces
-them. Cutting them needs a SEMANTIC lever, not sizing: trust the dedup cache's cached presence to SKIP
-the occupancy `HEAD` on a hit — the exact structure §3 applies to the part-folder `ForceFresh` re-proof
-(`always`/`age <X>`/`never`), with the same fail-closed `INV-NO-DANGLE` trade-off (a GC over-delete
-surfaces later instead of instantly). Without it the read-class target (−40-50%) leans almost entirely
-on §4. A future round should add `dedup_validate` (mirroring `part_folder_validate`) with its own soak
-matrix.
+Considered 2026-07-14 and REJECTED (not a viable lever). The idea was to skip the occupancy `HEAD` on
+a dedup-cache hit (`putBlob` head_first, `CasBlobHead`) the way §3 skips the part-folder `ForceFresh`
+re-proof — the dedup-probe HEADs are ~73% of all HEADs, and §2 proved sizing can't cut them. But the
+`.meta` mechanics make this NOT equivalent to §3, and unsafe:
+- §3 is safe because the reader holds a LIVE committed ref → the blob is pinned (in-degree ≥ 1) at
+  `HEAD` time → the mandatory `HEAD` is a redundant bug-net. In the dedup path the writer is producing
+  content that merely MATCHES an existing blob it does not yet reference; that blob may have had
+  in-degree 0 and been fully GC-deleted since it was cached.
+- The `.meta` point-read (`observeAndAdmit`) catches only CONDEMNED (GC writes the tombstone before
+  deleting the body). After §5, a FULLY-deleted blob (body then tombstone both gone) reads as absent
+  `.meta` = Clean = "present" — indistinguishable from a live clean blob. Only the `HEAD` (or a body
+  GET) distinguishes them, so §5 makes the `HEAD` MORE load-bearing on this path, not less.
+- The build's own precommit edge pins the blob only going FORWARD (once durable); it does not
+  resurrect a body already deleted before the edge landed. That present-when-edge-landed race is
+  exactly what the `HEAD` closes; skipping it would admit a reference to a since-deleted blob = a real
+  dangle, not a bug-net.
+So the dedup-probe HEADs stay. The read-class reduction this round comes from §4 (relink) alone; the
+dedup HEADs are inherent to fail-closed dedup adoption and are NOT a safe optimization target.
 
 ## §3 Configurable cache validation (user decision) {#s3-validate-setting}
 
