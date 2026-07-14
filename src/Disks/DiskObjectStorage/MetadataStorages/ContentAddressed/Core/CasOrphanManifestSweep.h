@@ -36,7 +36,11 @@ struct ManifestSweepResult
 ///   - a 404 mid-sweep is record-and-continue, never a throw (feedback_ca_gc_never_throw_on_404);
 ///   - never GETs a condemned body to revive it (feedback_ca_resurrect_invariant) — eligibility +
 ///     exact-token delete only.
-void sweepNamespace(Store & store, const RootNamespace & ns, const BuildPrefix & prefix);
+/// Returns the number of bodies actually deleted (a `DeleteClass::Deleted`-classified exact-token
+/// delete only, never a spared `NotFound`/`TokenMismatch`) — the decommission manifest-debris drain
+/// (`Core/CasDecommission.cpp`) sums this across every eligible build prefix into
+/// `DecommissionReport::manifest_debris_removed`.
+uint64_t sweepNamespace(Store & store, const RootNamespace & ns, const BuildPrefix & prefix);
 
 /// Whether `prefix` is sweep-eligible by the durable watermark fact alone (OQ6). The watermark is resolved
 /// from the namespace's server_root_id, not by parsing writer identity. No watermark => not eligible.

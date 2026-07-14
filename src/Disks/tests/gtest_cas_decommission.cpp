@@ -45,6 +45,19 @@ void makeTableWithRefs(Store & victim, const String & ns_str, uint64_t committed
     ASSERT_EQ(victim.listRefs(ns).size(), committed);
 }
 
+/// Pre-precommit manifest debris: a staged manifest body under `ns_str`, at the store's own
+/// `writer_epoch`, named by NO owner event -- a build the writer staged and never finished (fixture
+/// idiom of `gtest_cas_orphan_manifest_sweep.cpp`'s `EligibleAndUnownedIsDeleted`). `build_sequence = 99`
+/// is picked well clear of `makeTableWithRefs`'s own committed/precommit build sequences so it can never
+/// collide with a real owned manifest key.
+void seedOrphanManifestBody(Store & victim, const String & ns_str)
+{
+    const RootNamespace ns(ns_str);
+    const ManifestRef ref{.writer_epoch = victim.writerEpoch(), .build_sequence = 99, .manifest_ordinal = 1};
+    const ManifestId id = writeManifestRaw(victim.backend(), victim.layout(), ns, ref, {});
+    ASSERT_TRUE(victim.backend().head(victim.layout().manifestKey(id)).exists);
+}
+
 }
 
 TEST(CasDecommission, RefusesLiveMember)
@@ -202,4 +215,34 @@ TEST(CasDecommission, EmitsMemberDecommissionEvents)
     EXPECT_EQ(member_events[1].detail.at("precommits"), "0");
     EXPECT_EQ(member_events[2].outcome, "end");
     EXPECT_EQ(member_events[2].detail.at("namespaces_removed"), "1");
+}
+
+/// Task 3: the manifest-debris / staging / roots drain phases fill their three `DecommissionReport`
+/// counters and leave nothing of the victim behind under `staging/` or `roots/`.
+TEST(CasDecommission, DrainsDebrisStagingAndRoots)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    {
+        auto victim = openVictim(backend);
+        makeTableWithRefs(*victim, "victim/db/t1", 1, 0);
+        seedOrphanManifestBody(*victim, "victim/db/t1");
+    }
+    /// Foreign staging + mountpoint objects, written raw (no writer machinery needed): the victim's
+    /// writers are fenced by the claim before decommission ever gets here, so these are ordinary debris,
+    /// not a live in-flight write.
+    backend->putIfAbsent("p/staging/victim/upload1.tmp", "x");
+    backend->putIfAbsent("p/staging/victim/upload2.tmp", "x");
+    backend->putIfAbsent("p/roots/victim/clickhouse_access_check_abc", "x");
+
+    const auto report = decommissionPoolMember(
+        backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim");
+
+    EXPECT_EQ(report.manifest_debris_removed, 1u);
+    EXPECT_EQ(report.staging_objects_removed, 2u);
+    EXPECT_EQ(report.mountpoint_objects_removed, 1u);
+    EXPECT_TRUE(report.warnings.empty());
+
+    /// Nothing of the victim remains under staging/ or roots/ (scoped LISTs are empty).
+    EXPECT_TRUE(backend->list("p/staging/victim/", "", 10).keys.empty());
+    EXPECT_TRUE(backend->list("p/roots/victim/", "", 10).keys.empty());
 }

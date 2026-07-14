@@ -223,10 +223,10 @@ bool prefixEligible(Store & store, const RootNamespace & ns, const BuildPrefix &
     return w.min_active > prefix.build_sequence;
 }
 
-void sweepNamespace(Store & store, const RootNamespace & ns, const BuildPrefix & prefix)
+uint64_t sweepNamespace(Store & store, const RootNamespace & ns, const BuildPrefix & prefix)
 {
     if (!prefixEligible(store, ns, prefix))
-        return;   /// not eligible by the durable watermark fact — delete nothing (controls #8/#9)
+        return 0;   /// not eligible by the durable watermark fact — delete nothing (controls #8/#9)
 
     const Layout & layout = store.layout();
     Backend & backend = store.backend();
@@ -245,7 +245,7 @@ void sweepNamespace(Store & store, const RootNamespace & ns, const BuildPrefix &
         LOG_WARNING(getLogger("CasOrphanManifestSweep"),
                     "CAS orphan sweep: namespace {} protection view unavailable ({}); skipping its deletions",
                     ns.string(), e.message());
-        return;
+        return 0;
     }
 
     /// Enumerate the ONE build prefix: cas/manifests/<ns>/<epoch-hex>-<seq-hex>/ (spec §Manifest
@@ -253,6 +253,7 @@ void sweepNamespace(Store & store, const RootNamespace & ns, const BuildPrefix &
     const String prefix_key = layout.manifestNamespacePrefix(ns)
         + renderRefTxnId(RefTxnId{prefix.writer_epoch, prefix.build_sequence}) + "/";
 
+    uint64_t deleted = 0;
     forEachListedKey(backend, prefix_key, [&](const ListedKey & listed)
     {
         if (active.count(listed.key))
@@ -263,8 +264,11 @@ void sweepNamespace(Store & store, const RootNamespace & ns, const BuildPrefix &
         const HeadResult head = backend.head(listed.key);
         if (!head.exists)
             return;
-        backend.deleteExact(listed.key, head.token);   /// NotFound/TokenMismatch spared
+        const DeleteOutcome outcome = backend.deleteExact(listed.key, head.token);   /// NotFound/TokenMismatch spared
+        if (classifyDeleteOutcome(outcome) == DeleteClass::Deleted)
+            ++deleted;
     }, 1000, onGcEnumerationPage);
+    return deleted;
 }
 
 ManifestSweepResult sweepManifestCursorPage(
