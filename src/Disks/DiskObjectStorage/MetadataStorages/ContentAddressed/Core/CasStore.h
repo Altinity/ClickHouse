@@ -796,11 +796,26 @@ private:
     /// the fresh incarnation re-recovers each table under the new `live_writer_epoch` on next touch. Runs
     /// on the remount path while the fence is still lost and AFTER `live_writer_epoch` is bumped but
     /// BEFORE the fence is re-armed, so no append allocates an id and no publisher commits from a stale
-    /// cache across the swap. The in-memory wedge is discarded with its runtime -- a remount ends the
-    /// epoch and converts an in-flight wedged PUT into the accepted Late Predecessor case (spec §Late
-    /// Predecessor PUT). Respects the same idle invariants the eviction pass uses: it never mutates a
-    /// runtime a leader still holds (the superseded flag makes that leader fail closed instead).
+    /// cache across the swap. Any in-memory wedge is discarded with its runtime -- by this point
+    /// `refLanesSettledForRemount` has already consulted it (rev.6 Task 7: `tryRemountOnce` pays
+    /// `materialization_grace_ms` above when it was unresolved), so dropping the map slot here is a pure
+    /// cache detach, not a certification of the wedge's outcome -- the recovery seal (Task 8) is what
+    /// makes the dropped-epoch region uniformly invisible to readers regardless. Respects the same idle
+    /// invariants the eviction pass uses: it never mutates a runtime a leader still holds (the superseded
+    /// flag makes that leader fail closed instead).
     void quiesceRefTablesForRemount();
+
+    /// rev.6 Task 7 (spec §Self-remount): the self-remount counterpart of `drainRefLanesForShutdown` --
+    /// same wait mechanics (snapshot the cached tables, wait each one's queue idle bounded by a budget,
+    /// then check every table's `wedge` under its own `state_mutex`) -- but WITHOUT the `shutting_down`
+    /// admission latch: self-remount mutations are already refused by the tripped mount fence, not an
+    /// admission check, so there is nothing to latch. Budget is exactly one attempt's worth
+    /// (`cas_request_budget.attempt_timeout_ms + lease_safety_margin_ms`), long enough for an in-flight
+    /// leader to observe the tripped fence and settle, never unbounded. Returns true ("settled") only
+    /// when every queue went idle within budget AND no table is left wedged -- i.e. no in-flight ref-log
+    /// conditional `PUT` from the dying epoch can still land. `tryRemountOnce` pays
+    /// `materialization_grace_ms` only when this returns false.
+    bool refLanesSettledForRemount();
 
     /// Leader loop / one flush for the ref-log append lane (recovery, wedge resolution, per-item
     /// validation, admission budget, the controlled `PUT`, and applying the committed transaction to

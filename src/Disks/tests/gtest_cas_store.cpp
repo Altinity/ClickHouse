@@ -1469,6 +1469,85 @@ TEST(CasMountTmat, FencedPriorPaysOnlyTmat)
     EXPECT_TRUE(store->uncleanEpochBoundarySeenForTest());
 }
 
+/// ==== rev.6 Task 7: conditional T_mat on self-remount (`refLanesSettledForRemount`) ====
+
+TEST(CasRemountTmat, DrainedRemountSkipsGrace)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    uint64_t fake_boot = 1'000'000;
+    std::vector<uint64_t> waits;
+    auto store = Store::open(backend, PoolConfig{
+        .pool_prefix = "p", .server_root_id = "test",
+        .mount_lease_ttl_ms = std::chrono::milliseconds(30000),
+        .boot_ms_fn = [&] { return fake_boot; },
+        .materialization_grace_ms = 30000,
+        .wait_sleep_fn = [&](uint64_t ms) { fake_boot += ms; waits.push_back(ms); },
+    });
+    ASSERT_TRUE(store);
+    EXPECT_TRUE(waits.empty()) << "a fresh mount (no predecessor) pays no wait at open";
+
+    /// Trip the fence: advance the local boot clock past the deadline (as in `WriteFenceUsesInjectedBootClock`
+    /// above) and mark the durable lease `gc_fenced` (the certificate `claimMountAwaitingExpiry` reclaims
+    /// on its FIRST attempt, no observation polling -- avoids a real sleep in this test).
+    fake_boot += 30001;
+    fenceOutMount(*backend, store->layout().mountKey("test"));
+
+    /// No in-flight ref-log PUT: `refLanesSettledForRemount` finds an empty ref-table cache and reports
+    /// settled immediately, so no T_mat is owed.
+    ASSERT_TRUE(store->tryRemountOnce());
+
+    EXPECT_TRUE(waits.empty())
+        << "a drained self-remount (no unresolved ref-log PUT) must pay no materialization-grace wait";
+    EXPECT_FALSE(store->uncleanEpochBoundarySeenForTest());
+}
+
+TEST(CasRemountTmat, UnresolvedWedgePaysGraceAndMarksBoundaryUnclean)
+{
+    CasRequestBudget budget;
+    budget.max_attempts = 1;
+    budget.attempt_timeout_ms = 100;
+    budget.operation_deadline_ms = 100;
+    budget.lease_safety_margin_ms = 100;
+
+    auto backend = std::make_shared<UnresolvedPutBackend>();
+    uint64_t fake_boot = 1'000'000;
+    std::vector<uint64_t> waits;
+    auto store = Store::open(backend, PoolConfig{
+        .pool_prefix = "p", .server_root_id = "test",
+        .mount_lease_ttl_ms = std::chrono::milliseconds(30000),
+        .cas_request_budget = budget,
+        .boot_ms_fn = [&] { return fake_boot; },
+        .materialization_grace_ms = 30000,
+        .wait_sleep_fn = [&](uint64_t ms) { fake_boot += ms; waits.push_back(ms); },
+    });
+    ASSERT_TRUE(store);
+    EXPECT_TRUE(waits.empty()) << "a fresh mount (no predecessor) pays no wait at open";
+
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv/remount_wedge"};
+    publishPart(store, ns.string(), "x", "payload");
+
+    /// Force the ref-log append `dropRef` below performs into the Unresolved/wedge outcome (as in
+    /// `CasStoreShutdown.UnresolvedWedgeSkipsFarewell`): the single attempt the budget allows fails
+    /// ambiguously.
+    backend->fault_key_substr = layout.refsNamespacePrefix(ns) + "_log/";
+    backend->fault_count = 1;
+    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { store->dropRef(ns, "x"); });
+    ASSERT_TRUE(store->refLaneWedgedForTest(ns));
+
+    /// Trip the fence exactly as in `DrainedRemountSkipsGrace` above.
+    fake_boot += 30001;
+    fenceOutMount(*backend, store->layout().mountKey("test"));
+
+    /// The wedge left behind by the failed `dropRef` above makes `refLanesSettledForRemount` report
+    /// unsettled: exactly one materialization-grace wait must be recorded, and the boundary is unclean.
+    ASSERT_TRUE(store->tryRemountOnce());
+
+    ASSERT_EQ(waits.size(), 1u);
+    EXPECT_EQ(waits[0], 30000u);
+    EXPECT_TRUE(store->uncleanEpochBoundarySeenForTest());
+}
+
 TEST(CasStore, ReadManifestSharedReturnsSharedDecodeWithoutCopy)
 {
     auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
