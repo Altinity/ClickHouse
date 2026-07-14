@@ -213,8 +213,10 @@ void ContentAddressedTransaction::adoptStagedBlob(
     }
     else
     {
-        /// Uploaded / committed: record a tokenless W-EVIDENCE dep — no pool HEAD/GET before
-        /// precommit. The publish gate (post-precommit) observes/resurrects it if needed.
+        /// Uploaded / committed: record a tokenless W-EVIDENCE dep — no pool HEAD/GET before precommit.
+        /// §4 manifest-trust: the publish gate (promote) TRUSTS this committed-source adopted leaf via the
+        /// durable manifest edge — it does NOT observe/resurrect it. Only tokened / pending-upload leaves
+        /// are resurrected (by putBlob, before promote); a genuinely-absent adopted blob is an fsck finding.
         dst_build.adoptEvidence(entry);
     }
 }

@@ -26,6 +26,7 @@ extern const Event CasMetaCas;
 extern const Event CasMetaCreateClean;
 extern const Event CasMetaAdoptBackfill;
 extern const Event CasMetaResurrectClean;
+extern const Event CasBlobAdoptTrusted;
 }
 
 namespace DB::ErrorCodes
@@ -96,18 +97,6 @@ ManifestEntry blobManifestEntryStreaming(const String & path, const String & pay
     return e;
 }
 
-/// publishOneBlobPart with the streaming (production-convention) blob id.
-ManifestId publishOneBlobPartStreaming(
-    const StorePtr & s, const RootNamespace & ns, const String & ref, const String & path, const String & payload)
-{
-    auto build = startBuildFor(s, ns, ref);
-    const ManifestId id = build->stageManifest({blobManifestEntryStreaming(path, payload)});
-    build->precommitAdd(ns, ref, id);
-    build->putBlob(streamRefOf(payload), BlobSource::fromString(payload));
-    build->promote(ns, ref, build->buildId(), id);
-    return id;
-}
-
 /// The full single-blob write flow (EDGE-BEFORE-OBSERVE wiring order):
 /// stageManifest(one entry) -> precommitAdd -> putBlob -> promote. Returns the committed ManifestId.
 ManifestId publishOneBlobPart(
@@ -158,6 +147,34 @@ private:
     String target_key;
     DB::Cas::Token condemned;
     bool fired = false;
+};
+
+/// A delegating backend that counts head()/get() calls per key. Lets a test assert the promote gate
+/// performs ZERO per-file probes on a TRUSTED adopted leaf (§4 manifest-trust): no presence HEAD on
+/// the blob key, no loadMeta GET on the blob-meta key.
+class KeyCountingBackend final : public DB::Cas::Backend
+{
+public:
+    explicit KeyCountingBackend(BackendPtr inner_) : inner(std::move(inner_)) {}
+
+    size_t headCountFor(const String & k) const { auto it = head_counts.find(k); return it == head_counts.end() ? 0 : it->second; }
+    size_t getCountFor(const String & k) const { auto it = get_counts.find(k); return it == get_counts.end() ? 0 : it->second; }
+
+    DB::Cas::HeadResult head(const String & k) override { ++head_counts[k]; return inner->head(k); }
+    std::optional<DB::Cas::GetResult> get(const String & k, DB::Cas::Range r = {}) override { ++get_counts[k]; return inner->get(k, r); }
+    std::optional<DB::Cas::GetStreamResult> getStream(const String & k, DB::Cas::Range r = {}) override { return inner->getStream(k, r); }
+    DB::Cas::ListPage list(const String & pfx, const String & c, size_t l) override { return inner->list(pfx, c, l); }
+    DB::Cas::PutResult putIfAbsent(const String & k, const String & b, const DB::Cas::ObjectMeta & meta = {}) override { return inner->putIfAbsent(k, b, meta); }
+    DB::Cas::WriteSinkPtr putIfAbsentStream(const String & k, const DB::Cas::ObjectMeta & meta = {}) override { return inner->putIfAbsentStream(k, meta); }
+    DB::Cas::PutResult putOverwrite(const String & k, const String & b, const DB::Cas::Token & e, const DB::Cas::ObjectMeta & meta = {}) override { return inner->putOverwrite(k, b, e, meta); }
+    DB::Cas::CasResult casPut(const String & k, const String & b, const std::optional<DB::Cas::Token> & e, const DB::Cas::ObjectMeta & meta = {}) override { return inner->casPut(k, b, e, meta); }
+    DB::Cas::DeleteOutcome deleteExact(const String & k, const DB::Cas::Token & t) override { return inner->deleteExact(k, t); }
+    bool supportsListTokens() const override { return inner->supportsListTokens(); }
+
+private:
+    BackendPtr inner;
+    std::map<String, size_t> head_counts;
+    std::map<String, size_t> get_counts;
 };
 
 }
@@ -509,11 +526,13 @@ TEST(CasBuild, PutBlobStreamsSourceOnceNoFullMaterialization)
 }
 
 /// B190: reuseBlob is removed (it had no production callers post-B188). Its behaviors are now covered by:
-///   - absent blob / absent-at-gate: PromoteAbsentTokenlessBlobAbortsRetryable (CasBuild) for the
-///     tokenless leaf; a tokened leaf is edge-protected (Phase A) and never re-observed at the gate.
-///   - condemned dep at gate:        PromoteBodylessCondemnedDepThrowsAbortedRetryable (CasBuild).
+///   - trusted adopted leaf at gate: PromoteTrustsAdoptedLeafNoProbeManifestTrust (CasBuild) — §4
+///     manifest-trust: a committed-source adopted leaf publishes with NO per-file probe; a tokened leaf
+///     is edge-protected (Phase A) and never re-observed at the gate.
+///   - absent adopted leaf trusted:  PromoteTrustsAdoptedLeafEvenIfBackendRaced (CasBuild) — the D4
+///     trade-off (a genuinely-absent adopted blob is caught by fsck, not the promote gate).
 ///   - evidence tokenless vs tokened: DepIsTokenedDiscriminatesPutBlobVsAdopt (CasBuildReuseBlob).
-///   - adoptEvidence lazy-observe:   AdoptedBlobVanishedIsRetryableNotFatal Part A (CasBuild).
+///   - no-dep / staging-bug fail-closed: PromoteCondemnedLeafWithoutDepAbortsFailClosed (CasBuild).
 
 TEST(CasBuildReuseBlob, DepIsTokenedDiscriminatesPutBlobVsAdopt)
 {
@@ -537,10 +556,9 @@ TEST(CasBuildReuseBlob, DepIsTokenedDiscriminatesPutBlobVsAdopt)
     EXPECT_FALSE(build->depIsTokened(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(u128Of("unknown"))}));
 }
 
-/// B190: ReuseBlobCondemnedThrowsAbortedRetryable is removed (reuseBlob is gone).
-/// Condemned-blob-at-gate behavior is covered by:
-///   PromoteBodylessCondemnedDepThrowsAbortedRetryable (the promote gate HEADs every blob leaf; a
-///   condemned HEAD ⇒ ABORTED; no GET).
+/// B190: ReuseBlobCondemnedThrowsAbortedRetryable is removed (reuseBlob is gone). §4 manifest-trust: a
+/// committed-source adopted leaf is TRUSTED at the promote gate (no HEAD/loadMeta probe), so a condemned
+/// pool blob no longer surfaces at promote — covered by PromoteTrustsAdoptedLeafNoProbeManifestTrust.
 
 TEST(CasBuild, PutBlobResurrectVanishedReUploadsHeldBody)
 {
@@ -835,211 +853,86 @@ TEST(CasBuild, PutBlobVanishDuringRevivalReUploadsNotFatal)
     EXPECT_EQ(stored->bytes.substr(h.header_len), "payload-V");
 }
 
-TEST(CasBuild, PromoteBodylessCondemnedDepThrowsAbortedRetryable)
+TEST(CasBuild, PromoteTrustsAdoptedLeafNoProbeManifestTrust)
 {
-    /// B137/B190: the promote gate's fail-closed blob revalidation (CasBuild.cpp promote step 3) HEADs
-    /// EVERY blob leaf named by the manifest. A blob whose hash is condemned (or that vanishes in the
-    /// HEAD window) must surface as ABORTED ("retry the operation") — a retryable transient, NOT a hard
-    /// FILE_DOESNT_EXIST (which became an HTTP-500 INSERT failure).
-    /// Since the copy-forward pre-pass (spec 2026-07-02-cas-copy-forward-condemned-evidence.md) a
-    /// tokenless-evidence dep DOES read the condemned-but-present object to copy it forward; with the
-    /// hook's exact-token delete landing right after the pre-pass HEAD, that read finds the object
-    /// ABSENT and fails closed — this test now pins the copy-forward "deleted mid-flight ⇒ ABORTED,
-    /// nothing written" contract (never putIfAbsent after a lost delete race).
-    auto b = std::make_shared<InMemoryBackend>();
+    /// §4 manifest-trust: a committed-source adoptEvidence leaf is TRUSTED at the promote gate — the live
+    /// source pins the blob (in-degree >= 1, not condemnable) and this build's precommit edge is durable,
+    /// so promote publishes with NO per-file HEAD (presence) and NO loadMeta GET (the condemned point-read)
+    /// and NO copy-forward. The durable manifest edge is the liveness evidence. `CasBlobAdoptTrusted` counts
+    /// the trusted leaf. A KeyCountingBackend proves zero probes on the blob key and the blob-meta key.
+    auto raw = std::make_shared<InMemoryBackend>();
+    auto counting = std::make_shared<KeyCountingBackend>(raw);
+    auto s = Store::open(counting, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     const RootNamespace ns{"srv1/tbl"};
 
-    /// 1. Write payload-X via a throwaway build to create the blob object; capture its token t0.
-    BlobRef id;
-    Token t0;
-    {
-        auto s0 = openStore(b);
-        auto build0 = s0->startBuild({});
-        id = build0->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X")).ref;
-        t0 = b->head(s0->layout().blobKey(id)).token;
-    }
-
-    DB::Cas::Layout layout("p");
-    const String blob_key = layout.blobKey(id);
-
-    /// 2. Condemn (Blob, hash(X)) via the meta (v3: the promote gate's condemned decision is a per-hash
-    ///    meta point-read, not the retire-view) so the promote gate sees the blob leaf as a condemned hit
-    ///    and must resolve it.
-    condemnMeta(*b, layout, u128Of("payload-X"), /*condemn_round*/ 1);
-
-    /// 3. Wrap the backend so the NEXT head(blob_key) returns the (present) result and THEN fires
-    ///    deleteExact(blob_key, t0) exactly once — GC's exact-token delete racing the gate's HEAD.
-    auto hook = std::make_shared<HeadThenDeleteOnceBackend>(b, blob_key, t0);
-    auto s = Store::open(hook, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
-    auto build = startBuildFor(s, ns, "part_1");
-
-    /// 4. Adopt the blob as a tokenless evidence dep (no body in hand), then stage a manifest naming it
-    ///    and precommit it. stageManifest writes the body without HEADing the blob; precommitAdd appends
-    ///    the create-precommit owner event.
-    build->adoptEvidence(blobManifestEntry("data.bin", "payload-X"));
-    const ManifestId mid = build->stageManifest({blobManifestEntry("data.bin", "payload-X")});
-    build->precommitAdd(ns, "part_1", mid);
-
-    /// 5. promote drives the gate: it HEADs blob_key [hook fires deleteExact(blob_key, t0)] → condemned
-    ///    (or vanished) HEAD → ABORTED, no GET (INV-1).
-    ///    BEFORE fix: FILE_DOESNT_EXIST (hard). AFTER fix: ABORTED "retry the operation" (retryable).
-    expectThrowsCode(DB::ErrorCodes::ABORTED,
-        [&] { build->promote(ns, "part_1", build->buildId(), mid); });
-}
-
-TEST(CasBuild, CondemnedPresentEvidenceDepCopiesForwardAtGate)
-{
-    /// S13 soak run 3 / spec 2026-07-02-cas-copy-forward-condemned-evidence.md: `republishRef`
-    /// (part move: ATTACH renameToDetached, DETACH, merge-result rename) records its deps via
-    /// adoptEvidence — tokenless W-EVIDENCE from a COMMITTED source manifest, NO source bytes in
-    /// hand. When the referenced blob's hash is condemned (v3: a per-hash meta point-read), the old
-    /// gate threw ABORTED "retry the op" — but the attach caller never retries and the table stays
-    /// readonly forever (a liveness brick, not a safety save).
-    ///
-    /// Post-fix contract (verified copy-forward): the gate reads the PRESENT dying object, verifies
-    /// payload hash == key hash, re-wraps under a fresh envelope, putOverwrite@observed-token ⇒
-    /// fresh incarnation; promote succeeds referencing ONLY the fresh token.
-    auto b = std::make_shared<InMemoryBackend>();
-    const RootNamespace ns{"srv1/tbl"};
-
-    /// 1. Publish part A over blob CF — the committed SOURCE ref republishRef reads its entries
-    ///    from (condition (a) of the invariant exception: a live committed owner references CF).
-    Token t0;
-    {
-        auto s0 = openStore(b);
-        publishOneBlobPartStreaming(s0, ns, "part_a", "data.bin", "payload-CF");
-        t0 = b->head(s0->layout().blobKey(streamRefOf("payload-CF"))).token;
-    }
-
-    DB::Cas::Layout layout("p");
-    const String blob_key = layout.blobKey(streamRefOf("payload-CF"));
-
-    /// 2. Condemn (Blob, hash(CF)) via the meta — models the fold having condemned CF after stale-view
-    ///    adoptions landed unfolded (the soak chain). Object stays PRESENT (no delete yet: a
-    ///    non-pending entry is >= 2 passes from deletion).
-    condemnMeta(*b, layout, hexToU128(streamingHexOf("payload-CF")), /*condemn_round*/ 1);
-
-    /// 3. Fresh Store (restart) — republishRef's exact body: adoptEvidence over the source manifest
-    ///    entry, stage a FRESH dst manifest, precommit, promote.
-    std::vector<CasEvent> seen;   /// declared BEFORE the Store so it outlives the background syncer's emits (ASan 2026-07-09)
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
-    s->setEventSink([&](const CasEvent & e){ seen.push_back(e); });
-    auto build = startBuildFor(s, ns, "detached_part_a");
-    build->adoptEvidence(blobManifestEntryStreaming("data.bin", "payload-CF"));
-    const ManifestId mid = build->stageManifest({blobManifestEntryStreaming("data.bin", "payload-CF")});
-    build->precommitAdd(ns, "detached_part_a", mid);
-
-    /// 4. BEFORE fix: ABORTED (condemned at commit revalidation) — the attach brick.
-    ///    AFTER fix: promote succeeds via copy-forward.
-    EXPECT_NO_THROW(build->promote(ns, "detached_part_a", build->buildId(), mid));
-    EXPECT_TRUE(s->resolveRef(ns, "detached_part_a").has_value());
-    s->setEventSink(nullptr);
-
-    /// Audit trail: exactly one `blob_copy_forward` event, naming the displaced token.
-    size_t copy_forwards = 0;
-    for (const CasEvent & e : seen)
-        if (e.type == CasEventType::BlobCopyForward)
-        {
-            ++copy_forwards;
-            /// Phase 3 T2: rendered ids are never a bare hex (ambiguous across algos) — "<algoName>:<hex>".
-            EXPECT_EQ(e.object_hash, "ch128:" + streamingHexOf("payload-CF"));
-            EXPECT_EQ(e.detail.at("displaced_token"), t0.value);
-        }
-    EXPECT_EQ(copy_forwards, 1u);
-
-    /// 5. The condemned incarnation was displaced: fresh token, same payload; GC's exact-token
-    ///    delete of the listed (hash, t0) entry is now a mismatch no-op (entry drops, new
-    ///    incarnation untouched).
-    const HeadResult hr = b->head(blob_key);
-    ASSERT_TRUE(hr.exists);
-    EXPECT_NE(hr.token, t0) << "copy-forward must mint a FRESH incarnation, never bind the listed token";
-    EXPECT_NE(b->deleteExact(blob_key, t0).kind, DeleteOutcome::Kind::Deleted)
-        << "the listed token must no longer match the object";
-    const auto stored = b->get(blob_key);
-    ASSERT_TRUE(stored.has_value());
-    const auto h = decodeEnvelopeHeader(stored->bytes, stored->bytes.size(), ObjectKind::Blob);
-    EXPECT_EQ(stored->bytes.substr(h.header_len), "payload-CF") << "payload must survive byte-identical";
-}
-
-TEST(CasBuild, PromoteCopiesForwardCondemnedEvidenceInInstalledView)
-{
-    /// The K3 in-closure copy-forward gate (Phase A, spec 2026-07-09-cas-writer-gc-simplification): a
-    /// tokenless (adoptEvidence) blob X whose hash is condemned is copied forward by the promote gate
-    /// (the single copy-forward site after D3) instead of aborting, and promote SUCCEEDS.
-    /// v3 (Task 4, spec §meta-protocols): the condemned decision is now a per-hash META POINT-READ, not
-    /// the writer's RetireView — there is no "installed view" to explicitly refresh any more (the test
-    /// name is legacy); a point-read is always live, so condemning the meta is immediately visible to K3.
-    auto b = std::make_shared<InMemoryBackend>();
-    auto s = openStore(b);
-    const RootNamespace ns{"srv1/tbl"};
-
-    /// A committed source part names X (independent live committed owner). putBlob mints X under the
-    /// production streaming-hash id, so the copy-forward verifier's payload re-hash matches the content key.
-    publishOneBlobPartStreaming(s, ns, "src_part", "data.bin", "payload-CFX");
-    const String blob_key = s->layout().blobKey(streamRefOf("payload-CFX"));
-    const Token t0 = b->head(blob_key).token;
-
-    /// A second build ADOPTS X via adoptEvidence (tokenless dep, NO putBlob ⇒ no retained source), stages,
-    /// precommits — but does NOT promote yet.
-    auto build = startBuildFor(s, ns, "part_2");
-    const ManifestEntry entry = blobManifestEntryStreaming("data.bin", "payload-CFX");
-    build->adoptEvidence(entry);
-    const ManifestId id = build->stageManifest({entry});
-    build->precommitAdd(ns, "part_2", id);
-
-    /// GC condemns X's hash in round 1 via the meta.
-    condemnMeta(*b, s->layout(), hexToU128(streamingHexOf("payload-CFX")), /*condemn_round*/ 1);
-
-    /// promote: the K3 gate sees X condemned (meta point-read) ⇒ copy-forward ⇒ commit.
-    EXPECT_NO_THROW(build->promote(ns, "part_2", build->buildId(), id));
-
-    /// The ref resolves and X rides a FRESH, non-condemned token (t0 never bound).
-    EXPECT_TRUE(s->resolveRef(ns, "part_2").has_value());
-    const HeadResult hr = b->head(blob_key);
-    ASSERT_TRUE(hr.exists);
-    EXPECT_NE(hr.token, t0) << "copy-forward must mint a FRESH incarnation, never bind the condemned token";
-    const auto lm_after = loadMetaForTest(*b, s->layout(), hexToU128(streamingHexOf("payload-CFX")));
-    ASSERT_TRUE(lm_after.has_value());
-    EXPECT_EQ(lm_after->meta.state, MetaState::Clean) << "copy-forward must flip the meta back to Clean";
-}
-
-TEST(CasBuild, PromoteAbsentTokenlessBlobAbortsRetryable)
-{
-    /// A tokenless (adoptEvidence) blob that is ABSENT at the gate (deleted, no retained source) cannot be
-    /// copied forward — copyForwardFromCondemned requires a present object to GET — so promote fails closed
-    /// (ABORTED, retryable) and no ref is published.
-    auto b = std::make_shared<InMemoryBackend>();
-    auto s = openStore(b);
-    const RootNamespace ns{"srv1/tbl"};
-
-    /// Seed X (streaming-keyed) without a committed owner, then adopt it and delete it.
+    /// A committed-source blob lives in the shared pool (seeded via a throwaway build on the same store).
     {
         auto seed = s->startBuild({});
-        seed->putBlob(streamRefOf("payload-ABS"), BlobSource::fromString("payload-ABS"));
+        seed->putBlob(streamRefOf("payload-TR"), BlobSource::fromString("payload-TR"));
     }
-    const String blob_key = s->layout().blobKey(streamRefOf("payload-ABS"));
-    const Token t0 = b->head(blob_key).token;
+    const String blob_key = s->layout().blobKey(streamRefOf("payload-TR"));
+    const String meta_key = s->layout().blobMetaKey(streamRefOf("payload-TR"));
 
     auto build = startBuildFor(s, ns, "part_1");
-    const ManifestEntry entry = blobManifestEntryStreaming("data.bin", "payload-ABS");
+    const ManifestEntry entry = blobManifestEntryStreaming("data.bin", "payload-TR");
     build->adoptEvidence(entry);
     const ManifestId id = build->stageManifest({entry});
     build->precommitAdd(ns, "part_1", id);
 
-    /// A landed GC delete: X is gone by its current token — absent with no source to re-upload.
-    ASSERT_EQ(b->deleteExact(blob_key, t0).kind, DeleteOutcome::Kind::Deleted);
+    const auto trusted_before = ProfileEvents::global_counters[ProfileEvents::CasBlobAdoptTrusted].load();
+    const size_t head_before = counting->headCountFor(blob_key);
+    const size_t meta_get_before = counting->getCountFor(meta_key);
 
-    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { build->promote(ns, "part_1", build->buildId(), id); });
-    EXPECT_FALSE(s->resolveRef(ns, "part_1").has_value());
+    build->promote(ns, "part_1", build->buildId(), id);
+
+    EXPECT_TRUE(s->resolveRef(ns, "part_1").has_value());
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasBlobAdoptTrusted].load() - trusted_before, 1);
+    EXPECT_EQ(counting->headCountFor(blob_key) - head_before, 0u) << "trust must not HEAD the adopted blob";
+    EXPECT_EQ(counting->getCountFor(meta_key) - meta_get_before, 0u) << "trust must not loadMeta the adopted blob";
+}
+
+TEST(CasBuild, PromoteTrustsAdoptedLeafEvenIfBackendRaced)
+{
+    /// §4 manifest-trust trade-off (D4 relink interserver-trust model): a committed-source adopted leaf is
+    /// published WITHOUT a presence probe. Even if the pool object raced to absent between adopt and
+    /// promote, promote does NOT re-observe it — the ref publishes. A genuinely-absent adopted blob is an
+    /// invariant violation detected by fsck (or an actual body GET on read), not caught at the promote gate.
+    /// This is the deliberate reduction from the pre-§4 "absent adopted leaf => ABORTED at gate".
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = openStore(b);
+    const RootNamespace ns{"srv1/tbl"};
+
+    /// Seed X, adopt it, then delete it out from under the build (a landed GC delete in the adopt->promote
+    /// window). The pre-§4 gate HEADed X, found it absent, and threw ABORTED; §4 trusts the durable edge.
+    {
+        auto seed = s->startBuild({});
+        seed->putBlob(streamRefOf("payload-RACE"), BlobSource::fromString("payload-RACE"));
+    }
+    const String blob_key = s->layout().blobKey(streamRefOf("payload-RACE"));
+    const Token t0 = b->head(blob_key).token;
+
+    auto build = startBuildFor(s, ns, "part_1");
+    const ManifestEntry entry = blobManifestEntryStreaming("data.bin", "payload-RACE");
+    build->adoptEvidence(entry);
+    const ManifestId id = build->stageManifest({entry});
+    build->precommitAdd(ns, "part_1", id);
+
+    ASSERT_EQ(b->deleteExact(blob_key, t0).kind, DeleteOutcome::Kind::Deleted);
+    ASSERT_FALSE(b->head(blob_key).exists);
+
+    EXPECT_NO_THROW(build->promote(ns, "part_1", build->buildId(), id));
+    EXPECT_TRUE(s->resolveRef(ns, "part_1").has_value());
 }
 
 TEST(CasBuild, PromoteCondemnedLeafWithoutDepAbortsFailClosed)
 {
     /// A manifest blob leaf with NO recorded dep (a staging-bug shape: neither putBlob nor adoptEvidence
-    /// recorded it) that is condemned at the gate must fail closed — isCopyForwardableTokenless is false,
-    /// so the gate never silently copies it forward. The no-dep shape is reachable through the public build
-    /// API (stageManifest names the leaf without any dep having been recorded), so no test accessor for the
-    /// private predicate is needed.
+    /// recorded it) must fail closed at the promote gate — isTrustedAdopt is false (no tokened dep and no
+    /// committed-source adopt), so §4 never silently publishes it. Under manifest-trust there is NO per-file
+    /// probe, so the fail-closed is a LOGICAL_ERROR decided from the dep set alone — it fires regardless of
+    /// the pool blob's presence/condemnation (here the blob is even condemned, but that is never observed).
+    /// The no-dep shape is reachable through the public build API (stageManifest names the leaf without any
+    /// dep having been recorded), so no test accessor for the private predicate is needed.
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openStore(b);
     const RootNamespace ns{"srv1/tbl"};
@@ -1054,293 +947,39 @@ TEST(CasBuild, PromoteCondemnedLeafWithoutDepAbortsFailClosed)
 
     auto build = startBuildFor(s, ns, "part_1");
     const ManifestEntry entry = blobManifestEntryStreaming("data.bin", "payload-NODEP");
-    /// NB: NO adoptEvidence(entry) — deps stays empty for this hash, so isCopyForwardableTokenless is false.
+    /// NB: NO adoptEvidence(entry) — deps stays empty for this hash, so isTrustedAdopt is false.
     const ManifestId id = build->stageManifest({entry});
     build->precommitAdd(ns, "part_1", id);
 
-    /// Condemn X (present) via the meta (v3: a per-hash point-read, not the retire-view) so the gate
-    /// sees the condemnation on the no-dep leaf.
+    /// Condemn X (present) via the meta — under §4 the gate never point-reads it (no probe on a non-trusted
+    /// leaf), so this only confirms the fail-closed does not depend on the leaf being clean.
     condemnMeta(*b, s->layout(), hexToU128(streamingHexOf("payload-NODEP")), /*condemn_round*/ 1);
 
-    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { build->promote(ns, "part_1", build->buildId(), id); });
+    expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&] { build->promote(ns, "part_1", build->buildId(), id); });
     EXPECT_FALSE(s->resolveRef(ns, "part_1").has_value());
-    /// The condemned token was never displaced (no copy-forward happened).
+    /// The pool blob was never touched (no probe, no displacement).
     EXPECT_EQ(b->head(blob_key).token, t0);
-}
-
-/// A one-shot hook: the FIRST head(target_key) returns the (stale) result and THEN displaces the
-/// incarnation via putOverwrite(target_key, <same bytes>, expected) — a racing writer's recreate /
-/// copy-forward landing in the observe->GET window. The fresh token is captured in `displaced_to`.
-class HeadThenDisplaceOnceBackend final : public DB::Cas::Backend
-{
-public:
-    /// `layout`/`hash` are v3 additions (Task 4): the hook models a COMPLETE racing writer, so after its
-    /// own displacement it also flips the per-hash meta back to Clean — mirroring what a real
-    /// copy-forward/resurrect does (step 4). Without this, the meta (a per-hash marker, not per-token)
-    /// would still read Condemned and the promote gate's OWN copy-forward would legitimately re-displace
-    /// this "racer" incarnation a second time.
-    HeadThenDisplaceOnceBackend(BackendPtr inner_, String target_key_, DB::Cas::Token expected_,
-                                DB::Cas::Layout layout_, DB::UInt128 hash_)
-        : inner(std::move(inner_)), target_key(std::move(target_key_)), expected(expected_),
-          layout(std::move(layout_)), hash(hash_) {}
-
-    DB::Cas::HeadResult head(const String & k) override
-    {
-        const DB::Cas::HeadResult hr = inner->head(k);
-        if (k == target_key && !fired)
-        {
-            fired = true;
-            const auto bytes = inner->get(target_key);
-            const auto res = inner->putOverwrite(target_key, bytes->bytes, expected);
-            EXPECT_EQ(res.outcome, DB::Cas::PutOutcome::Done);
-            displaced_to = res.token;
-
-            const DB::Cas::BlobRef ref{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(hash)};
-            const auto lm = DB::Cas::loadMeta(*inner, layout, ref);
-            const DB::Cas::BlobMeta clean{.state = DB::Cas::MetaState::Clean, .condemn_round = 0,
-                                          .size = bytes->bytes.size()};
-            if (lm)
-                DB::Cas::casMeta(*inner, layout, ref, lm->etag, clean);
-            else
-                DB::Cas::putMetaIfAbsent(*inner, layout, ref, clean);
-        }
-        return hr;
-    }
-
-    std::optional<DB::Cas::GetResult> get(const String & k, DB::Cas::Range r = {}) override { return inner->get(k, r); }
-    std::optional<DB::Cas::GetStreamResult> getStream(const String & k, DB::Cas::Range r = {}) override { return inner->getStream(k, r); }
-    DB::Cas::ListPage list(const String & p, const String & c, size_t l) override { return inner->list(p, c, l); }
-    DB::Cas::PutResult putIfAbsent(const String & k, const String & b, const DB::Cas::ObjectMeta & meta = {}) override { return inner->putIfAbsent(k, b, meta); }
-    DB::Cas::WriteSinkPtr putIfAbsentStream(const String & k, const DB::Cas::ObjectMeta & meta = {}) override { return inner->putIfAbsentStream(k, meta); }
-    DB::Cas::PutResult putOverwrite(const String & k, const String & b, const DB::Cas::Token & e, const DB::Cas::ObjectMeta & meta = {}) override { return inner->putOverwrite(k, b, e, meta); }
-    DB::Cas::CasResult casPut(const String & k, const String & b, const std::optional<DB::Cas::Token> & e, const DB::Cas::ObjectMeta & meta = {}) override { return inner->casPut(k, b, e, meta); }
-    DB::Cas::DeleteOutcome deleteExact(const String & k, const DB::Cas::Token & t) override { return inner->deleteExact(k, t); }
-    bool supportsListTokens() const override { return inner->supportsListTokens(); }
-
-    DB::Cas::Token displaced_to;
-
-private:
-    BackendPtr inner;
-    String target_key;
-    DB::Cas::Token expected;
-    DB::Cas::Layout layout;
-    DB::UInt128 hash;
-    bool fired = false;
-};
-
-/// SOAK 2026-07-03 regression (false CORRUPTED_DATA attach brick): the pool-wide content hash is
-/// the STREAMING HashingWriteBuffer convention (chunked CityHash128, block = 2048 B), which
-/// diverges from a one-shot CityHash128 for any payload larger than one block. Copy-forward's
-/// verification must recompute with the pool convention — this test uses a MULTI-BLOCK payload
-/// whose BlobId is minted exactly as the write path mints it.
-TEST(CasBuild, CopyForwardMultiBlockPayloadVerifies)
-{
-    auto b = std::make_shared<InMemoryBackend>();
-    const RootNamespace ns{"srv1/tbl"};
-
-    String payload;
-    payload.reserve(5000);
-    for (size_t i = 0; i < 5000; ++i)
-        payload.push_back(static_cast<char>('a' + (i * 131 + i / 7) % 23));
-    ASSERT_GT(payload.size(), 2 * DBMS_DEFAULT_HASHING_BLOCK_SIZE) << "must span multiple hash blocks";
-
-    /// Mint the id EXACTLY as ContentAddressedWriteBuffers does: streaming hash + lowercase hex.
-    DB::ReadBufferFromMemory in(payload.data(), payload.size());
-    DB::HashingReadBuffer hashing(in);
-    hashing.ignoreAll();
-    const String hash_hex = getHexUIntLowercase(hashing.getHash());
-    const UInt128 hash = hexToU128(hash_hex);
-    const BlobRef id{BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(hash)};
-
-    Token t0;
-    {
-        auto s0 = openStore(b);
-        auto build = startBuildFor(s0, ns, "part_a");
-        build->putBlob(id, BlobSource::fromString(payload));
-        ManifestEntry e;
-        e.path = "data.bin";
-        e.placement = EntryPlacement::Blob;
-        e.ref = DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(hash)};
-
-        e.blob_size = payload.size();
-        const ManifestId mid0 = build->stageManifest({e});
-        build->precommitAdd(ns, "part_a", mid0);
-        build->promote(ns, "part_a", build->buildId(), mid0);
-        t0 = b->head(s0->layout().blobKey(id)).token;
-    }
-
-    DB::Cas::Layout layout("p");
-    /// v3: condemn the hash via the meta (the promote gate's condemned decision is a per-hash point-read).
-    condemnMeta(*b, layout, hash, /*condemn_round*/ 1);
-
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
-    auto build = startBuildFor(s, ns, "detached_part_a");
-    ManifestEntry e;
-    e.path = "data.bin";
-    e.placement = EntryPlacement::Blob;
-    e.ref = DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(hash)};
-
-    e.blob_size = payload.size();
-    build->adoptEvidence(e);
-    const ManifestId mid = build->stageManifest({e});
-    build->precommitAdd(ns, "detached_part_a", mid);
-
-    /// BEFORE fix: one-shot CityHash mismatch => false CORRUPTED_DATA (the soak attach brick).
-    /// AFTER fix: streaming recompute matches => copy-forward displaces and promote succeeds.
-    EXPECT_NO_THROW(build->promote(ns, "detached_part_a", build->buildId(), mid));
-    EXPECT_NE(b->head(layout.blobKey(id)).token, t0);
-}
-
-TEST(CasBuild, CopyForwardTokenDriftAdoptsCleanIncarnation)
-{
-    /// Copy-forward race arm: between the pre-pass HEAD (stale condemned token) and the copy-forward
-    /// read, a racing writer displaces the condemned incarnation (their recreate landed first). The
-    /// copy-forward must ADOPT the racer's clean token — one incarnation, not a second displacement.
-    auto b = std::make_shared<InMemoryBackend>();
-    const RootNamespace ns{"srv1/tbl"};
-
-    Token t0;
-    {
-        auto s0 = openStore(b);
-        publishOneBlobPart(s0, ns, "part_a", "data.bin", "payload-DRIFT");
-        t0 = b->head(s0->layout().blobKey(idOf("payload-DRIFT"))).token;
-    }
-    DB::Cas::Layout layout("p");
-    const String blob_key = layout.blobKey(idOf("payload-DRIFT"));
-    /// v3: condemn the hash via the meta (the promote gate's condemned decision is a per-hash point-read).
-    condemnMeta(*b, layout, u128Of("payload-DRIFT"), /*condemn_round*/ 1);
-
-    auto hook = std::make_shared<HeadThenDisplaceOnceBackend>(b, blob_key, t0, layout, u128Of("payload-DRIFT"));
-    auto s = Store::open(hook, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
-    auto build = startBuildFor(s, ns, "detached_part_a");
-    build->adoptEvidence(blobManifestEntry("data.bin", "payload-DRIFT"));
-    const ManifestId mid = build->stageManifest({blobManifestEntry("data.bin", "payload-DRIFT")});
-    build->precommitAdd(ns, "detached_part_a", mid);
-    EXPECT_NO_THROW(build->promote(ns, "detached_part_a", build->buildId(), mid));
-
-    /// The final incarnation is the RACER's (adopted), not a third token from a second displacement.
-    const HeadResult hr = b->head(blob_key);
-    ASSERT_TRUE(hr.exists);
-    EXPECT_EQ(hr.token, hook->displaced_to) << "clean drifted token must be adopted, not displaced again";
-    EXPECT_NE(hr.token, t0);
-}
-
-TEST(CasBuild, CopyForwardCorruptPayloadFailsClosed)
-{
-    /// Copy-forward verification arm: the condemned-but-present object's payload no longer re-hashes
-    /// to its content key (bit rot / partial write). Copy-forward must REFUSE to re-publish the bytes
-    /// (CORRUPTED_DATA), never mint a fresh incarnation over damaged content.
-    auto b = std::make_shared<InMemoryBackend>();
-    const RootNamespace ns{"srv1/tbl"};
-
-    Token t0;
-    {
-        auto s0 = openStore(b);
-        publishOneBlobPartStreaming(s0, ns, "part_a", "data.bin", "payload-ROT");
-        t0 = b->head(s0->layout().blobKey(streamRefOf("payload-ROT"))).token;
-    }
-    DB::Cas::Layout layout("p");
-    const String blob_key = layout.blobKey(streamRefOf("payload-ROT"));
-
-    /// Corrupt ONE payload byte in place (valid envelope, damaged content); condemn the hash via the
-    /// meta (v3: a per-hash point-read, not the retire-view — condemnation no longer distinguishes
-    /// which token, so the corrupt incarnation's token doesn't need to be captured separately).
-    {
-        auto got = b->get(blob_key);
-        ASSERT_TRUE(got.has_value());
-        const auto h = decodeEnvelopeHeader(got->bytes, got->bytes.size(), ObjectKind::Blob);
-        String damaged = got->bytes;
-        damaged[h.header_len] = static_cast<char>(damaged[h.header_len] ^ 0xFF);
-        const auto res = b->putOverwrite(blob_key, damaged, t0);
-        ASSERT_EQ(res.outcome, PutOutcome::Done);
-        condemnMeta(*b, layout, hexToU128(streamingHexOf("payload-ROT")), /*condemn_round*/ 1);
-    }
-
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
-    auto build = startBuildFor(s, ns, "detached_part_a");
-    build->adoptEvidence(blobManifestEntryStreaming("data.bin", "payload-ROT"));
-    const ManifestId mid = build->stageManifest({blobManifestEntryStreaming("data.bin", "payload-ROT")});
-    build->precommitAdd(ns, "detached_part_a", mid);
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
-        [&] { build->promote(ns, "detached_part_a", build->buildId(), mid); });
-    EXPECT_FALSE(s->resolveRef(ns, "detached_part_a").has_value());
-}
-
-TEST(CasBuild, GateBodylessAdoptFullyDeletedObjectThrowsAbortedNotFatal)
-{
-    /// B190 residual (soak bug): the promote gate revalidating a blob leaf whose object is FULLY
-    /// GC-DELETED (HEAD absent, not merely condemned-present) must throw ABORTED — not the old fatal
-    /// FILE_DOESNT_EXIST.
-    ///
-    /// Scenario:
-    ///   1. Blob X exists with token t0; a tokenless dep is recorded via adoptEvidence (no body in hand).
-    ///   2. GC condemns X (retire view hit by hash) AND fully deletes the object (deleteExact → HEAD absent).
-    ///   3. The promote gate runs: HEADs the blob leaf → absent → should throw ABORTED (retryable, INV-3),
-    ///      NOT FILE_DOESNT_EXIST (fatal).
-    ///
-    /// The gate's absent-object path is distinct from the condemned-present path tested by
-    /// PromoteBodylessCondemnedDepThrowsAbortedRetryable (which fires GC delete AFTER the HEAD via
-    /// HeadThenDeleteOnceBackend). HERE the object is absent BEFORE the HEAD call.
-    auto b = std::make_shared<InMemoryBackend>();
-    const RootNamespace ns{"srv1/tbl"};
-
-    /// 1. Write payload-B190 via a throwaway build; capture its token t0.
-    BlobRef id;
-    Token t0;
-    {
-        auto s0 = openStore(b);
-        auto build0 = s0->startBuild({});
-        id = build0->putBlob(idOf("payload-B190"), BlobSource::fromString("payload-B190")).ref;
-        t0 = b->head(s0->layout().blobKey(id)).token;
-    }
-
-    DB::Cas::Layout layout("p");
-    const String blob_key = layout.blobKey(id);
-
-    /// 2. Condemn (Blob, hash(B190), t0) in the retire view AND immediately GC-delete the object.
-    injectRetire(*b, layout, /*round*/ 1, /*shard*/ 0,
-        {RetiredEntry{.kind = ObjectKind::Blob, .ref = DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(u128Of("payload-B190"))}, .token = t0, .size = 11}});
-    ASSERT_EQ(b->deleteExact(blob_key, t0).kind, DeleteOutcome::Kind::Deleted);
-    ASSERT_FALSE(b->head(blob_key).exists) << "object must be absent before the gate HEAD";
-
-    /// 3. Open a fresh Store over the raw backend — retire view (refreshed at open) sees the condemnation.
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
-    auto build = startBuildFor(s, ns, "part_1");
-
-    /// 4. Adopt the blob as a tokenless evidence dep; stage a manifest naming it; precommit. No body in hand.
-    build->adoptEvidence(blobManifestEntry("data.bin", "payload-B190"));
-    const ManifestId mid = build->stageManifest({blobManifestEntry("data.bin", "payload-B190")});
-    build->precommitAdd(ns, "part_1", mid);
-
-    /// 5. promote drives the gate: HEADs the blob leaf → absent → ABORTED (INV-3).
-    ///    BEFORE fix: threw FILE_DOESNT_EXIST → fatal INSERT failure.
-    ///    AFTER fix:  throws ABORTED (retryable) — the outer INSERT retries and re-materializes from source.
-    expectThrowsCode(DB::ErrorCodes::ABORTED,
-        [&] { build->promote(ns, "part_1", build->buildId(), mid); });
-
-    /// No ref was committed and the blob stays absent.
-    EXPECT_FALSE(s->resolveRef(ns, "part_1").has_value());
-    EXPECT_FALSE(b->head(blob_key).exists);
 }
 
 TEST(CasBuild, PromoteRevalidatesBlobPresenceFailClosed)
 {
-    /// Port of the old W-TREE-BUILD bottom-up enforcement (PutTreeEnforcesBottomUp). In the part-manifest
-    /// model stageManifest does not validate its entries' bodies (the body is just written); the fail-closed
-    /// authority moved to the promote gate (CasBuild.cpp promote step 3), which HEADs EVERY blob leaf and
-    /// ABORTs on a missing one. This is the surviving "a committed ref never names a missing dependency"
-    /// invariant.
+    /// Port of the old W-TREE-BUILD bottom-up enforcement (PutTreeEnforcesBottomUp): the surviving
+    /// "a committed ref never names a missing dependency" invariant. In the part-manifest model
+    /// stageManifest does not validate its entries' bodies. §4 manifest-trust: the fail-closed authority at
+    /// the promote gate is now the DEP SET, not a backend HEAD — a leaf named by the manifest with NO
+    /// tokened dep (never putBlob'd) and NO adopted dep (never adoptEvidence'd) is a staging bug and fails
+    /// closed with LOGICAL_ERROR (a real write always records a dep for every leaf). No per-file probe.
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openStore(b);
     const RootNamespace ns{"srv1/tbl"};
 
-    /// Stage + precommit a manifest naming a blob hash that was NEVER uploaded.
+    /// Stage + precommit a manifest naming a blob hash that was NEVER uploaded (no dep recorded).
     auto build = startBuildFor(s, ns, "part_1");
     const ManifestId mid = build->stageManifest({blobManifestEntry("data.bin", "never-uploaded")});
     build->precommitAdd(ns, "part_1", mid);
 
-    /// promote must fail closed: the blob leaf is absent at commit revalidation ⇒ ABORTED. No ref committed.
-    expectThrowsCode(DB::ErrorCodes::ABORTED,
+    /// promote must fail closed: the leaf has no tokened and no adopted dep ⇒ LOGICAL_ERROR. No ref committed.
+    expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR,
         [&] { build->promote(ns, "part_1", build->buildId(), mid); });
     EXPECT_FALSE(s->resolveRef(ns, "part_1").has_value());
 
@@ -1358,10 +997,10 @@ TEST(CasBuild, AdoptEvidenceRecordsTokenlessDep)
 {
     /// Port of AdoptFromTreeRecordsEvidence. adoptEvidence records a TOKENLESS W-EVIDENCE dep directly
     /// from a resolved ManifestEntry — a Blob entry is tokenless (depIsTokened false), an Inline entry
-    /// records nothing. The dep's EXISTENCE + copy-forwardability (tokenless-recorded vs no-dep) is
-    /// asserted end-to-end at the promote gate by CondemnedPresentEvidenceDepCopiesForwardAtGate
-    /// (positive: tokenless dep ⇒ copy-forward) and PromoteCondemnedLeafWithoutDepAbortsFailClosed
-    /// (negative control: no dep ⇒ fail closed).
+    /// records nothing. §4: whether the dep is a committed-source adopt vs absent (adopted vs no-dep) is
+    /// asserted end-to-end at the promote gate by PromoteTrustsAdoptedLeafNoProbeManifestTrust (positive:
+    /// adopted leaf ⇒ trusted, no probe) and PromoteCondemnedLeafWithoutDepAbortsFailClosed (negative
+    /// control: no dep ⇒ fail closed, LOGICAL_ERROR).
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openStore(b);
     auto build = s->startBuild({});
@@ -1775,73 +1414,6 @@ TEST(CasBuild, ConvergesUnderProductiveGc)
     EXPECT_EQ(got->bytes, content);
 }
 
-TEST(CasBuild, AdoptedBlobVanishedIsRetryableNotFatal)
-{
-    /// B188 regression: the three adopt sites in ContentAddressedTransaction previously HEADed a
-    /// committed-source blob DURING STAGING. The fix (B188) replaces those with adoptEvidence, which
-    /// records a tokenless dep WITHOUT any backend call, deferring the observation to the promote gate
-    /// (post-precommit). The gate throws retryable ABORTED when the blob is absent — not a fatal error.
-    /// B190 removes reuseBlob entirely (no production callers).
-    ///
-    /// This test validates the adoptEvidence contract at the Build API level:
-    ///   A) adoptEvidence + stageManifest + precommitAdd + promote on an absent blob → ABORTED (retryable),
-    ///      NOT FILE_DOESNT_EXIST.
-    ///   C) adoptEvidence + stageManifest + precommitAdd + promote on a PRESENT blob → succeeds (positive).
-    auto b = std::make_shared<InMemoryBackend>();
-    const RootNamespace ns{"srv1/tbl"};
-
-    /// 1. Build A: upload the blob and publish a ref that references it. Capture the blob id and token.
-    BlobRef id;
-    Token t0;
-    {
-        auto s0 = openStore(b);
-        publishOneBlobPart(s0, ns, "part_1", "f.bin", "b188-content");
-        id = idOf("b188-content");
-        t0 = b->head(s0->layout().blobKey(id)).token;
-    }
-
-    DB::Cas::Layout layout("p");
-    const String blob_key = layout.blobKey(id);
-
-    /// Part execution order is load-bearing: C runs first (needs the blob present); A runs last because it
-    /// permanently GC-deletes the blob to drive the absent-evidence gate path.
-    ///
-    /// Part C — POSITIVE: blob present; adoptEvidence + stageManifest + precommitAdd + promote succeeds.
-    {
-        auto s = openStore(b);
-        auto build = startBuildFor(s, ns, "part_2");
-        const ManifestEntry entry = blobManifestEntry("f.bin", "b188-content");
-        build->adoptEvidence(entry);
-        const ManifestId mid = build->stageManifest({entry});
-        build->precommitAdd(ns, "part_2", mid);
-        EXPECT_NO_THROW(build->promote(ns, "part_2", build->buildId(), mid));
-    }
-
-    /// Part A — NEW CONTRACT: adoptEvidence records a tokenless dep WITHOUT eager HEAD. The promote gate
-    /// observes the blob and throws ABORTED when it is absent. This is retryable — the caller retries the
-    /// whole INSERT which re-uploads from source.
-    {
-        auto s = openStore(b);
-        auto build = startBuildFor(s, ns, "part_3");
-        const ManifestEntry entry = blobManifestEntry("f.bin", "b188-content");
-
-        /// adoptEvidence must NOT throw — no eager HEAD even though we will delete the blob next.
-        EXPECT_NO_THROW(build->adoptEvidence(entry));
-        const ManifestId mid = build->stageManifest({entry});
-        /// precommitAdd must not throw either — it does not HEAD the blob.
-        EXPECT_NO_THROW(build->precommitAdd(ns, "part_3", mid));
-
-        /// Simulate the B188 race: GC deletes the blob in the adopt→promote window.
-        b->deleteExact(blob_key, t0);
-        ASSERT_FALSE(b->head(blob_key).exists);
-
-        /// promote drives the gate: it HEADs the blob leaf → absent → ABORTED (retryable). NOT the old
-        /// FILE_DOESNT_EXIST.
-        expectThrowsCode(DB::ErrorCodes::ABORTED,
-            [&] { build->promote(ns, "part_3", build->buildId(), mid); });
-    }
-}
-
 /// BUG 1 (WPromote owner==bld): promote is a PURE owner MOVE (Δ=0 — it restores no blob in-degree). The
 /// TLA+ `WPromote` requires the precommit to STILL be the live owner of the ref before the move (`owner[m]
 /// = bld`). If the precommit was removed/reclaimed (an abandon or GC reclaim appended a removal event), a
@@ -2129,9 +1701,11 @@ TEST(CasBuild, WDepSetCrossAlgoSatisfactionFailsClosed)
     /// `e_xxh3`'s (`blobs/xxh3/...`), even though the raw digest bytes are identical.
     build->putBlob(BlobRef{BlobHashAlgo::CityHash128, shared_digest}, BlobSource::fromString("abc"));
 
-    /// promote must fail closed: the xxh3:X leaf has no tokened dep and no body at its own (distinct)
-    /// key — never silently satisfied by the ch128:X entry's tokened dep.
-    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::ABORTED, [&]
+    /// promote must fail closed: the xxh3:X leaf has NO tokened dep and NO adopted dep — never silently
+    /// satisfied by the ch128:X entry's tokened dep (same digest bytes, distinct object key). §4
+    /// manifest-trust: an unsatisfied leaf is caught by the dep set (isTrustedAdopt false, not tokened) and
+    /// fails closed with LOGICAL_ERROR — a staging bug — without any backend probe on the xxh3 key.
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&]
     {
         build->promote(ns, "part_mixed", build->buildId(), id);
     });

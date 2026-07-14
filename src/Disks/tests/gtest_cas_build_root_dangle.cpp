@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFsck.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
@@ -188,17 +189,29 @@ TEST(CasBuildRootDangle, PrematureReclaimCommitFailsClosed)
     ASSERT_FALSE(backend->head(s->layout().blobKey(idOf(P))).exists)
         << "premature-reclaim setup invalid: P should have been collected after losing its precommit";
 
-    /// FAIL-CLOSED: Build B's promote must THROW (ABORTED — the precommit binding was reclaimed and/or
-    /// the dependency is gone), never silently publish a dangle. promote re-proves the precommit binding
-    /// present and every blob leaf present/recreatable, and aborts when P is missing.
-    ASSERT_ANY_THROW(b->promote(ns, "refB", b->buildId(), t2))
-        << "B171 INV-COMMIT-FAILCLOSED: promote must abort over a missing dependency, not commit a dangle";
+    /// §4 manifest-trust (test name is legacy — B171 INV-COMMIT-FAILCLOSED for an ADOPTED leaf now moves to
+    /// fsck): P is a committed-source adopted leaf, so Build B's promote TRUSTS it (no HEAD/loadMeta probe)
+    /// and COMMITS refB. On the real reuse/relink path this dangle is UNREACHABLE: precommitAdd durably
+    /// appended refB's Precommit OwnerTransition (CasBuild.cpp precommitAdd) BEFORE promote, and promote
+    /// re-proves that edge is the LIVE owner (WPromote owner==bld) BEFORE trusting P — so P has in-degree
+    /// >= 1 and GC (the sole deleter) cannot collect it. This test injects the collection DIRECTLY (a raw
+    /// deleteExact while refB's precommit is still live), which the live-precommit invariant excludes. So
+    /// promote SUCCEEDS; the dangle is not prevented at promote but DETECTED by fsck (the backstop).
+    ASSERT_NO_THROW(b->promote(ns, "refB", b->buildId(), t2))
+        << "§4: an adopted leaf is trusted at promote — a missing dependency is not re-observed here";
 
-    /// And the dangle must NOT have been committed: P still absent, refB never resolved.
+    /// Trust never fabricates the missing blob (it never touches P); refB IS committed (naming absent P).
     ASSERT_FALSE(backend->head(s->layout().blobKey(idOf(P))).exists)
-        << "B171: the missing blob must stay missing — commit must not fabricate it";
-    ASSERT_FALSE(s->resolveRef(ns, "refB").has_value())
-        << "B171: refB must NOT be committed when its closure is missing (fail-closed)";
+        << "trust never fabricates the missing blob — P stays absent";
+    ASSERT_TRUE(s->resolveRef(ns, "refB").has_value())
+        << "§4: refB commits under trust (the D4 trade-off); the dangle is caught by fsck, below";
+
+    /// THE BACKSTOP (INV-NO-DANGLE-via-fsck): fsck's reachable-but-absent scan reports refB's absent P as
+    /// dangling — this is where the B171 guarantee lives under §4. Detection moved, it did not disappear.
+    const FsckReport rep = runFsck(*s, /*detail=*/true);
+    EXPECT_GE(rep.dangling, 1u)
+        << "§4 D4 backstop: refB committed over the deleted P; fsck must report it dangling (dangling="
+        << rep.dangling << ", reachable=" << rep.reachable << ")";
 }
 
 /// (The GC-reclaim test `CasBuildRoot.AbandonedPrecommitReclaimed` -- which asserted GC AUTOMATICALLY

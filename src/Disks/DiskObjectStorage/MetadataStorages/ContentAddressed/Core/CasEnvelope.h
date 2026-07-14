@@ -21,8 +21,8 @@ namespace DB::Cas
 /// The former `logical_size` / `logical_hash` core fields were dropped (S3-native staging fix
 /// 2026-07-11): they were the only two fields not known until AFTER the payload was streamed, which
 /// blocked building the header BEFORE streaming the S3 staging blob. Nothing load-bearing read them —
-/// the read path uses the fixed payload offset `blob_header_len`, GC derives the payload size as
-/// `object_size - blob_header_len`, and `copyForwardFromCondemned` independently re-hashes the payload.
+/// the read path uses the fixed payload offset `blob_header_len` and GC derives the payload size as
+/// `object_size - blob_header_len`.
 /// compatibility_version (formerly named min_reader_version) encodes the write-down-to-floor for
 /// the payload format: a reader must fail-closed if compatibility_version > G_BUILD.
 /// (Aligned with the converged header model 2026-06-25.)

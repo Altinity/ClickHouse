@@ -15,11 +15,10 @@
 /// P1-T3a (this file, extended): the pool's `blob_hash_algo` is threaded into the three hash sites
 /// (spec §5/§6) -- `ContentAddressed::CaContentWriteBuffer` (streaming blob-body hash),
 /// `Build`'s envelope `hash_algo` field, and (transitively, via `Cas::blobHashHexOneShot`) the
-/// `poolContentHash` re-hash used by `copyForwardFromCondemned`. `poolContentHash` itself is a static
+/// `poolContentHash` content-key mint on the write path. `poolContentHash` itself is a static
 /// helper in `CasBuild.cpp` and not directly reachable from a gtest; its production callers already
-/// exercise the default `CityHash128` path (`gtest_cas_build.cpp`'s `CopyForwardMultiBlockPayloadVerifies`
-/// stays green, unmodified, proving byte-for-byte-unchanged default behavior) and it delegates to the
-/// SAME `Cas::blobHashHexOneShot` this file tests directly below.
+/// exercise the default `CityHash128` path, and it delegates to the SAME `Cas::blobHashHexOneShot`
+/// this file tests directly below.
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedWriteBuffers.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobHasher.h>

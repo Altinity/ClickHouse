@@ -251,8 +251,9 @@ EnvelopeHeader decodeEnvelopeHeader(std::string_view head_bytes, uint64_t /*obje
 
         /// The former `header_len + logical_size == object_size` size-arithmetic check was dropped with
         /// the `logical_size` core field (2026-07-11): the payload length is derived downstream as
-        /// `object_size - header_len` and re-verified where it matters (`copyForwardFromCondemned`
-        /// re-hashes the payload against the content key). `object_size` is kept for call-site symmetry.
+        /// `object_size - header_len` and is not an independently trusted field (the blob's identity is its
+        /// content key, re-hashed against the payload wherever a body is verified). `object_size` is kept
+        /// for call-site symmetry.
 
         /// [70, header_len) TLV extensions. Encode pads the area to 8-alignment with zero bytes; a valid
         /// TLV type is never 0, so a zero type marks the start of alignment padding (which must be all

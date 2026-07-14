@@ -746,7 +746,6 @@ The server successfully detected this situation and will download merged part fr
     M(CasBlobDedupCacheHit, "CA blob known-present dedup-cache hit", ValueType::Number) \
     M(CasBlobHeadFirst,  "CA blob HEAD-first attempts (P1 cache hit or P2 size threshold)", ValueType::Number) \
     M(CasBlobBodyPutAvoided, "CA blob body PUTs avoided by a HEAD-first present hit (P1/P2)", ValueType::Number) \
-    M(CasBlobCopyForward, "CA condemned blob incarnations displaced by verified copy-forward at the promote gate (tokenless committed-manifest evidence; INV-1 exception)", ValueType::Number) \
     M(CasRefBatchFlushes, "CA ref-log-append-lane flushes committed (one putIfAbsentControlled each); avg batch = CasRefBatchedMutations / this", ValueType::Number) \
     M(CasRefBatchedMutations, "CA ref mutations committed through the per-namespace ref-log batching queue", ValueType::Number) \
     M(CasRefBatchScopeCuts, "CA ref-queue carves cut early by the scope rule (same-ref repeat, non-Live-forced-solo, or WholeShard behind)", ValueType::Number) \
@@ -862,6 +861,7 @@ The server successfully detected this situation and will download merged part fr
     M(CasDedupCacheMisses, "CA dedup cache: presence-cache lookups that found no entry for the hash, falling through to the size-threshold check / normal upload path (Round-B §2)", ValueType::Number) \
     M(CasRefRecoverySealPublished, "CA ref-table recovery seals published: an unclean-mount recovery closed a dead-epoch region with an immediate snapshot at its upper bound before exposing the table as recovered (rev.6 §recovery-seal); counts only PUTs that committed, never an attempted-but-failed one", ValueType::Number) \
     M(CasPartFolderValidateSkipped, "CA part-folder cache: ForceFresh body re-proof HEADs skipped because part_folder_validate is 'never' or the retained view's last validation is younger than the 'age' window (Round-B §3)", ValueType::Number) \
+    M(CasBlobAdoptTrusted, "CA blob: relink/adopt promote leaves trusted via the durable manifest edge — no per-file HEAD/loadMeta probe (Round-B §4; reason=manifest-trust)", ValueType::Number) \
     M(S3GetObjectTagging, "Number of S3 API GetObjectTagging calls.", ValueType::Number) \
     M(S3CreateMultipartUpload, "Number of S3 API CreateMultipartUpload calls.", ValueType::Number) \
     M(S3UploadPartCopy, "Number of S3 API UploadPartCopy calls.", ValueType::Number) \

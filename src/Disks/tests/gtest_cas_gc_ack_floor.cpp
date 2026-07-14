@@ -348,8 +348,8 @@ TEST(CasGcRetire, CopyForwardedBlobSurvivesWhenRepublished)
     gc.runRegularRound();   /// -1 folds => in-degree 0 => entry (1, t0) condemned
     ASSERT_TRUE(currentEntryFor(*backend, store->layout(), DB::UInt128(1)).has_value());
 
-    /// The raw equivalent of Build::copyForwardFromCondemned: displace EXACTLY t0 with the same
-    /// verified bytes under a fresh token t1, then republish a part referencing the blob (the
+    /// The raw equivalent of a writer resurrect (Build::uploadFromSource): displace EXACTLY t0 with the
+    /// same verified bytes under a fresh token t1, then republish a part referencing the blob (the
     /// promoted dst ref of a republishRef move).
     const String blob_key = store->layout().blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::UInt128(1))});
     const Token t0 = backend->head(blob_key).token;

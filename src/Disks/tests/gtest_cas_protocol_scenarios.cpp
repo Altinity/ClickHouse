@@ -3,6 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEnvelope.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFsck.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcFormats.h>
 #include <Disks/tests/cas_test_helpers.h>
@@ -265,20 +266,18 @@ TEST(CasProtocol, RevalidateAdoptsLiveTokenWhenOnlyPhantomCondemnedAtDifferentTo
 
 TEST(CasProtocol, EvidenceHitCondemnedPresentBlobCopiesForwardInClosure)
 {
-    /// W-EVIDENCE (tokenless adopted dep) on a blob X whose hash is condemned-but-PRESENT: promote copies
-    /// X forward in-closure to a fresh live incarnation and SUCCEEDS. X here has NO independent committed
-    /// owner (a lone raw blob) — the accepted revive-for-the-live-about-to-commit-owner window. A
-    /// non-tokened leaf is the ONLY leaf promote still observes (tokened leaves are edge-protected).
-    /// v3 (Task 4, spec §meta-protocols): the condemned decision is a per-hash META POINT-READ, not the
-    /// writer's RetireView — condemning the meta is immediately visible to K3, no view install needed.
-    /// Before the copy-forward fix this aborted (INV-1 fail-closed), a liveness brick on the DETACH/freeze
-    /// adopt path.
+    /// W-EVIDENCE (tokenless adopted dep) on a blob X whose hash is condemned-but-PRESENT. §4 manifest-trust
+    /// (test name is legacy — there is no copy-forward any more): a committed-source adopted leaf is TRUSTED
+    /// at the promote gate. The gate does NOT observe X — no HEAD, no meta point-read, no displacement — it
+    /// publishes on the strength of the durable manifest edge (D4 relink trust). So promote SUCCEEDS and X's
+    /// existing incarnation is left EXACTLY as-is: the token is UNCHANGED (never displaced) and the condemned
+    /// meta is NOT flipped (the gate never reads or writes it). A non-tokened leaf is the only leaf promote
+    /// still decides on; here it is trusted (tokened leaves are edge-protected).
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openStore(b);
     const RootNamespace ns{"srv1/tbl"};
 
-    /// X pre-exists with token t0 — minted with the POOL streaming-hash id so the copy-forward verifier
-    /// accepts its payload; the manifest names it as a tokenless adopted leaf.
+    /// X pre-exists with token t0; the manifest names it as a tokenless adopted leaf.
     const String hex = streamingHexOf("payload-X");
     {
         auto seed = s->startBuild({});
@@ -294,20 +293,20 @@ TEST(CasProtocol, EvidenceHitCondemnedPresentBlobCopiesForwardInClosure)
     const ManifestId id = build->stageManifest({entry});
     build->precommitAdd(ns, "part_1", id);
 
-    /// GC condemns X's hash in round 1 via the meta.
+    /// GC condemns X's hash in round 1 via the meta — under §4 the promote gate never reads it.
     condemnMeta(*b, s->layout(), hexToU128(hex), /*condemn_round*/ 1);
 
-    /// promote: the K3 gate sees X condemned (meta point-read) ⇒ copy-forward ⇒ commit.
+    /// promote: the adopted leaf is trusted ⇒ commit, no probe, no displacement.
     EXPECT_NO_THROW(build->promote(ns, "part_1", build->buildId(), id));
 
-    /// The committed ref stands over a FRESH incarnation; the condemned token t0 is never bound.
+    /// The ref stands; X rides its ORIGINAL token t0 (trust never displaces a trusted leaf).
     EXPECT_TRUE(s->resolveRef(ns, "part_1").has_value());
-    EXPECT_NE(b->head(blob_key).token, t0);
+    EXPECT_EQ(b->head(blob_key).token, t0) << "trust must not displace the adopted blob";
 
-    /// The copy-forward flips the meta back to Clean (Task 4 step 4).
+    /// The meta is untouched — still Condemned (the gate never reads or flips it under trust).
     const auto lm_after = loadMetaForTest(*b, s->layout(), hexToU128(hex));
     ASSERT_TRUE(lm_after.has_value());
-    EXPECT_EQ(lm_after->meta.state, MetaState::Clean);
+    EXPECT_EQ(lm_after->meta.state, MetaState::Condemned) << "trust must not flip the meta";
 }
 
 TEST(CasProtocol, WedgedHeartbeatCondemnedTokenedBlobCommitsWithTokenUnchanged)
@@ -468,11 +467,14 @@ TEST(CasProtocol, DisplacedToLiveTokenCommitsAtCurrentIncarnation)
 
 TEST(CasProtocol, NewNamespacePublishGatedByShardFenceFloor)
 {
-    /// Regression test: build B adopts a blob, the ack-floor GC pipeline retires + deletes it, then B
-    /// publishes into a fresh namespace. The fence machinery is gone; the dangle is prevented by promote's
-    /// UNCONDITIONAL blob revalidation (step 3): it re-HEADs every blob leaf and, seeing the adopted blob
-    /// absent (GC deleted it) — or its condemned token in the ack-fresh retire view — fails closed (ABORTED).
-    /// The gate does not depend on any registry/shard fence floor; it is the revalidation path.
+    /// Regression test (test name is legacy — the fence machinery is gone): build B adopts a blob, the
+    /// ack-floor GC pipeline retires + deletes it, then B publishes into a fresh namespace. §4 manifest-
+    /// trust: B's leaf is a committed-source adopted leaf, so promote TRUSTS it (no HEAD/loadMeta probe) and
+    /// COMMITS. On the real path this dangle is UNREACHABLE — B's precommit edge pins the blob at in-degree
+    /// >= 1 through promote (CasBuild.cpp precommitAdd → promote's WPromote owner==bld re-proof precedes the
+    /// trust), so GC cannot delete it; here the test drives GC to delete the blob while B has NOT yet
+    /// precommitted, which the live-precommit invariant excludes. The dangle is DETECTED by fsck's
+    /// reachable-but-absent scan (the backstop), not prevented at promote.
     auto b = std::make_shared<InMemoryBackend>();
     auto s = openStore(b);
 
@@ -484,7 +486,6 @@ TEST(CasProtocol, NewNamespacePublishGatedByShardFenceFloor)
     build_a->precommitAdd(ns_a, "part_1", id_a);
     build_a->promote(ns_a, "part_1", build_a->buildId(), id_a);
     const String blob_key = s->layout().blobKey(idOf("floor-payload"));
-    const Token t0 = b->head(blob_key).token;
 
     /// 2. build B adopts the blob (tokenless W-EVIDENCE) while the view is still at round 0.
     auto build_b = startBuildFor(s, RootNamespace{"srv2/new"}, "part_x");
@@ -507,32 +508,28 @@ TEST(CasProtocol, NewNamespacePublishGatedByShardFenceFloor)
     /// The blob (unreachable) was deleted at t0.
     EXPECT_FALSE(b->head(blob_key).exists);
 
-    /// 4. build B publishes into a BRAND-NEW namespace. The unconditional blob revalidation catches the
-    /// now-absent (condemned) blob ⇒ ABORTED. It must NEVER land — landing would write a manifest naming a
-    /// deleted blob (the dangle).
+    /// 4. build B publishes into a BRAND-NEW namespace. §4 manifest-trust: the adopted leaf is trusted at
+    /// promote (no probe) ⇒ promote SUCCEEDS and commits a manifest naming the deleted blob (the dangle).
     const ManifestId id_b = build_b->stageManifest({blobEntry("data.bin", "floor-payload")});
     build_b->precommitAdd(RootNamespace{"srv2/new"}, "part_x", id_b);
-    expectThrowsCode(DB::ErrorCodes::ABORTED, [&]
-    {
-        build_b->promote(RootNamespace{"srv2/new"}, "part_x", build_b->buildId(), id_b);
-    });
+    EXPECT_NO_THROW(build_b->promote(RootNamespace{"srv2/new"}, "part_x", build_b->buildId(), id_b));
 
-    /// NO DANGLE: nothing in the new namespace names the deleted blob.
-    EXPECT_FALSE(s->resolveRef(RootNamespace{"srv2/new"}, "part_x").has_value());
-    EXPECT_EQ(b->deleteExact(blob_key, t0).kind, DeleteOutcome::Kind::NotFound);   /// long gone
+    /// The ref committed over the deleted blob (the D4 trade-off); the backstop is fsck's reachable-but-
+    /// absent scan (INV-NO-DANGLE-via-fsck).
+    EXPECT_TRUE(s->resolveRef(RootNamespace{"srv2/new"}, "part_x").has_value());
+    const FsckReport rep = runFsck(*s, /*detail=*/true);
+    EXPECT_GE(rep.dangling, 1u) << "§4 D4 backstop: part_x committed over the GC-deleted blob; fsck must "
+                                   "report it dangling (dangling=" << rep.dangling << ")";
 }
 
 TEST(CasProtocol, FreshEvidenceDepWithViewHitIsResolvedByGate)
 {
-    /// A TOKENLESS (W-EVIDENCE) leaf whose blob is condemned by hash MUST still be caught by promote's
-    /// unconditional blob revalidation. Since the copy-forward pre-pass
-    /// (spec 2026-07-02-cas-copy-forward-condemned-evidence.md) "caught" no longer means ABORTED: a
-    /// condemned-but-PRESENT incarnation is displaced by a verified copy-forward and promote SUCCEEDS.
-    /// The underlying invariant is unchanged and asserted here: the listed token t0 is never bound — the
-    /// committed ref stands over a FRESH incarnation.
-    /// v3 (Task 4, spec §meta-protocols): the condemned decision is a per-hash META POINT-READ, not the
-    /// writer's RetireView, so there is no "view round"/"fence advance" to track any more (the test name
-    /// is legacy) — condemning the meta is immediately, unconditionally visible to K3.
+    /// §4 manifest-trust (test name is legacy — the gate no longer "resolves" a tokenless leaf by observing
+    /// it): a committed-source adopted leaf whose blob is condemned-but-PRESENT is TRUSTED at the promote
+    /// gate. There is NO per-file probe (no HEAD, no meta point-read) and NO copy-forward — the durable
+    /// manifest edge is the liveness evidence (D4 relink trust). promote SUCCEEDS and X keeps its ORIGINAL
+    /// incarnation: the token t0 is UNCHANGED (never displaced). A tokened leaf is edge-protected; only a
+    /// non-tokened leaf is decided here, and a committed-source adopt is trusted.
     auto b = std::make_shared<InMemoryBackend>();
 
     DB::Cas::Layout layout("p");
@@ -557,11 +554,10 @@ TEST(CasProtocol, FreshEvidenceDepWithViewHitIsResolvedByGate)
     const ManifestId id = build->stageManifest({entry});
     build->precommitAdd(ns, "part_1", id);
 
-    /// promote's blob revalidation is unconditional — HEAD t0 condemned (meta point-read) ⇒ verified
-    /// copy-forward displaces it; promote succeeds.
+    /// promote trusts the adopted leaf ⇒ commit, no probe, no displacement.
     EXPECT_NO_THROW(build->promote(ns, "part_1", build->buildId(), id));
 
-    EXPECT_NE(b->head(blob_key).token, t0) << "the listed token must never be bound — fresh incarnation only";
+    EXPECT_EQ(b->head(blob_key).token, t0) << "trust must not displace the adopted blob";
     EXPECT_TRUE(s->resolveRef(ns, "part_1").has_value());
 }
 

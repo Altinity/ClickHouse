@@ -1298,6 +1298,13 @@ TEST(CaWiringExchange, AdoptPartFromManifestPublishesFreshLocalManifest)
 /// protocol fell back. Nothing is published (no dangling ref).
 TEST(CaWiringExchange, AdoptFailsClosedAndFallsBackOnCondemnedBlob)
 {
+    /// §4 manifest-trust (test name is legacy — adopt no longer fails closed on a raced pool blob):
+    /// adoptPartFromManifest runs the receiver's local promote, which TRUSTS the committed-source adopted
+    /// leaves via the durable manifest edge — no per-file HEAD/loadMeta probe on the pool blobs. So even if
+    /// a pool blob raced to absent, adopt SUCCEEDS and publishes the receiver ref. This matches ordinary
+    /// ReplicatedMergeTree interserver trust: the sender served the manifest from a LIVE part whose refs pin
+    /// the blobs at in-degree >= 1, so this scenario cannot arise on the real fetch path; a genuinely-absent
+    /// adopted blob is an fsck finding, not an adopt-time abort.
     auto storage = openWiringStorage();
     const auto sender_ns = storage->liveNamespace("uuid-1");
     publishWiredPart(*storage, sender_ns, "all_1_1_0");
@@ -1307,21 +1314,25 @@ TEST(CaWiringExchange, AdoptFailsClosedAndFallsBackOnCondemnedBlob)
     auto bytes = exchange->getPartManifestBytes("uui/uuid-1/all_1_1_0");
     ASSERT_TRUE(bytes.has_value());
 
-    /// Make a referenced blob ABSENT in the shared pool (the genuine missing-blob / different-pool case).
+    /// Artificially delete a referenced pool blob — the live-sender invariant excludes this on the real
+    /// path; §4 promote does not re-probe it, so adopt trusts the manifest edge and publishes.
     const auto data_key = storage->store()->layout().blobKey(idOf("payload-A"));
     const auto h = storage->store()->backend().head(data_key);
     ASSERT_TRUE(h.exists);
     ASSERT_EQ(storage->store()->backend().deleteExact(data_key, h.token).kind,
               DB::Cas::DeleteOutcome::Kind::Deleted);
 
-    /// promote re-proves every blob leaf fail-closed; an absent leaf is ABORTED -> the impl returns
-    /// FALSE (retryable, caller byte-fetches), it does NOT throw and publishes NOTHING.
+    /// §4: promote trusts the adopted leaves — no re-probe — so adopt SUCCEEDS (returns true) and publishes.
     const bool ok = exchange->adoptPartFromManifest(
         "uuid-2", "tmp-fetch_all_1_1_0", *bytes, {{"metadata_version.txt", "1"}});
-    EXPECT_FALSE(ok);
+    EXPECT_TRUE(ok) << "§4: adopt trusts the manifest edge; a raced pool blob is not re-probed at promote";
 
-    /// No dangling ref was published in the receiver namespace.
-    EXPECT_FALSE(storage->store()->resolveRef(storage->liveNamespace("uuid-2"), "tmp-fetch_all_1_1_0").has_value());
+    /// The receiver ref publishes (the D4 trade-off), and the deleted pool blob surfaces via fsck's
+    /// reachable-but-absent scan (the backstop — INV-NO-DANGLE-via-fsck).
+    EXPECT_TRUE(storage->store()->resolveRef(storage->liveNamespace("uuid-2"), "tmp-fetch_all_1_1_0").has_value());
+    const DB::Cas::FsckReport rep = DB::Cas::runFsck(*storage->store(), /*detail=*/true);
+    EXPECT_GE(rep.dangling, 1u) << "§4 D4 backstop: the deleted pool blob must surface as an fsck dangling "
+                                   "finding (dangling=" << rep.dangling << ")";
 }
 
 /// ==== Commit atomicity (B122): a publish failing mid-loop must not leave a PARTIAL commit ====

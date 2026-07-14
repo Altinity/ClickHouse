@@ -107,9 +107,12 @@ public:
     ///  1. (no writer-side retire-view refresh — removed in the 2026-07-09 writer-GC simplification;
     ///     tokened leaves are edge-protected via EDGE-BEFORE-OBSERVE);
     ///  2. stream-read the precommit manifest body; validate RefMatchesBody / ManifestNamespaceMatches;
-    ///  3. revalidate the NON-tokened blob leaves only (tokened leaves are edge-protected, not re-checked):
-    ///     presence observation + per-hash `.meta` point-read, condemned ⇒ copy-forward-from-source (fail-closed);
-    ///  4. body absent | a non-tokened blob absent | a blob condemned-and-not-recreatable ⇒ ABORTED;
+    ///  3. the NON-tokened blob leaves (tokened leaves are edge-protected, not re-checked): a committed-source
+    ///     adoptEvidence leaf is TRUSTED via the durable manifest edge — NO per-file HEAD/loadMeta probe (§4
+    ///     manifest-trust, D4 relink trust model: the live source pins the blob, in-degree >= 1); a genuinely
+    ///     absent adopted blob is an invariant violation caught by fsck, not here;
+    ///  4. a body-absent precommit or a lost owner-liveness ⇒ ABORTED; a non-tokened, non-adopted leaf (no
+    ///     tokened dep and no committed-source adopt — a staging bug) ⇒ LOGICAL_ERROR (fail closed);
     ///  5. atomically replace precommit(build_id) owner with committed(final_ref_name) owner by appending
     ///     ONE pure-move `RefOp` (old_binding={Precommit,final_ref_name,T}, new_binding={Committed,final_ref_name,T},
     ///     same manifest_ref T) and setting refs[final_ref_name];
@@ -160,6 +163,10 @@ private:
         ObjectKind kind = ObjectKind::Blob;
         std::optional<Token> token;                       /// nullopt = live-root evidence (W-EVIDENCE)
         uint64_t size = 0;
+        /// §4: true only for `adoptEvidence` — a committed-source W-EVIDENCE dep, trusted at promote. A
+        /// tokenless dep with adopted=false is a PENDING upload (`recordPendingBlobDep`) that must be
+        /// tokened by putBlob before promote; reaching promote un-tokened is a staging bug (fail closed).
+        bool adopted = false;
     };
     /// Phase 3 T2: keyed on the full `BlobRef` pair (algo + digest) — the blob identity, per spec's
     /// decree that a bare digest is never an identity. Stays an ordered `std::map` (not
@@ -183,18 +190,6 @@ private:
     /// temp file / re-emits the captured String), so it is taken by const ref and not consumed.
     void uploadFromSource(ObjectKind kind, const BlobRef & ref, const String & key, const BlobSource & source);
 
-    /// Verified copy-forward (spec 2026-07-02-cas-copy-forward-condemned-evidence.md): the narrow,
-    /// deliberate exception to INV-1's "never read the dying object" — allowed ONLY for tokenless
-    /// W-EVIDENCE deps (`adoptEvidence`: every call site adopts from a COMMITTED source manifest, so
-    /// the blob is referenced by a live committed owner and this is a reference transfer, not a
-    /// resurrection). Reads the condemned-but-present incarnation IN FULL, verifies fail-closed
-    /// (envelope decodes + recomputed payload hash == `ref`), re-wraps under a fresh envelope
-    /// (fresh incarnation_tag, this build's build_id — W-FRESH-TAG), and displaces EXACTLY the
-    /// observed incarnation via token-conditional putOverwrite. Every failure mode (absent, corrupt,
-    /// lost delete race) throws ABORTED — never a blind PUT, never putIfAbsent after a lost race.
-    /// Returns the fresh (or adopted-clean) token. O(blob) resident memory — recovery path only.
-    Token copyForwardFromCondemned(const BlobRef & ref, const String & key, HeadResult hr);
-
     /// The build's owning root namespace, derived from BuildInfo::intended_ref ("ns/ref" — the ref is the
     /// last `/`-segment; the namespace is everything before it). Sets a manifest body's root_namespace_id.
     RootNamespace manifestNamespace() const;
@@ -206,13 +201,13 @@ private:
     /// paths; only ever called on the build's OWN thread.
     void cleanupStagedManifestDebrisBestEffort();
 
-    /// A leaf is copy-forwardable iff this build holds a TOKENLESS W-EVIDENCE Blob dep for `hash`
-    /// (adoptEvidence — in production always sourced from a committed manifest, which is the copy-forward
-    /// exception's PROVENANCE; it is NOT a checked runtime guarantee here). The enforced runtime safety
-    /// rests on the caller's owner-liveness check + fold barrier (see the in-closure gate in `promote`),
-    /// exactly as the tokened resurrect did. A tokened dep, or NO dep at all (a staging bug — must fail
-    /// closed), is NOT copy-forwardable. The single gate for the promote copy-forward site (D3).
-    bool isCopyForwardableTokenless(const BlobRef & ref) const;
+    /// §4 manifest-trust: a leaf is trusted at promote iff this build holds a TOKENLESS dep recorded by
+    /// `adoptEvidence` (adopted=true) — a committed-source W-EVIDENCE adopt. The live source pins the blob
+    /// (in-degree >= 1, not condemnable) and this build's precommit edge is durable, so the durable manifest
+    /// edge is the liveness evidence: no HEAD, no loadMeta, no copy-forward. A tokened dep (edge-protected,
+    /// handled by `depIsTokened`), a tokenless PENDING-upload dep (adopted=false), or NO dep at all (a
+    /// staging bug) is NOT trusted — it fails closed. The single gate for the promote non-tokened leaf.
+    bool isTrustedAdopt(const BlobRef & ref) const;
 
     StorePtr store;
     UInt128 build_id{};

@@ -17,7 +17,7 @@ namespace ProfileEvents
     extern const Event CasBlobDedupCacheHit;
     extern const Event CasBlobHeadFirst;
     extern const Event CasBlobBodyPutAvoided;
-    extern const Event CasBlobCopyForward;
+    extern const Event CasBlobAdoptTrusted;
     extern const Event CasMetaCreateClean;
     extern const Event CasMetaAdoptBackfill;
     extern const Event CasMetaResurrectClean;
@@ -226,10 +226,14 @@ PutBlobResult Build::putBlob(const BlobRef & ref, BlobSource source)
     throw Exception(ErrorCodes::LOGICAL_ERROR, "putBlob: exhausted retries for {}", key);
 }
 
-bool Build::isCopyForwardableTokenless(const BlobRef & ref) const
+bool Build::isTrustedAdopt(const BlobRef & ref) const
 {
+    /// §4: a leaf trusted at promote iff this build holds a TOKENLESS dep recorded by adoptEvidence
+    /// (a committed-source W-EVIDENCE adopt: the source pins it, in-degree >= 1, not condemnable). A
+    /// tokenless PENDING-upload dep (recordPendingBlobDep, adopted=false) is NOT trusted — it must be
+    /// tokened by putBlob before promote; reaching promote un-tokened is a staging bug (fail closed).
     auto it = deps.find(ref);
-    return it != deps.end() && !it->second.token.has_value();
+    return it != deps.end() && !it->second.token.has_value() && it->second.adopted;
 }
 
 bool Build::depIsTokened(const BlobRef & ref) const
@@ -674,140 +678,6 @@ void Build::uploadFromSource(ObjectKind kind, const BlobRef & ref, const String 
     }
 }
 
-Token Build::copyForwardFromCondemned(const BlobRef & ref, const String & key, HeadResult hr)
-{
-    /// See the header comment: the narrow INV-1 exception for tokenless committed-manifest evidence.
-    /// Blob-only: adoptEvidence never records tree deps (trees are recreatable from retained payloads).
-    const PoolMeta & meta = store->poolMeta();
-    const PoolConfig & cfg = store->poolConfig();
-    /// Phase 3 T3: `ref` is the full blob identity (the caller — `promote`'s non-tokened-leaf
-    /// revalidation — passes `entry.ref` directly), so every meta-op below is `BlobRef`-keyed
-    /// directly, and every hex render routes through `blobIdOf(ref)`.
-
-    constexpr int max_attempts = 8;
-    for (int attempt = 0; attempt < max_attempts; ++attempt)
-    {
-        /// 1. Read the dying object IN FULL. Absent ⇒ the delete won; with no source this is
-        ///    fail-closed ABORTED (never putIfAbsent after a lost race — that would revive deleted
-        ///    data). The GET is atomic per object: we see one whole incarnation or nothing.
-        const auto got = store->backend().get(key);
-        if (!got)
-            throw Exception(ErrorCodes::ABORTED,
-                "copyForwardFromCondemned: object {} vanished before the copy-forward read — "
-                "the exact-token delete won; failing closed (retry the operation)", key);
-        if (got->token != hr.token)
-        {
-            /// The incarnation moved under us. Task 4 (spec §meta-protocols v3): condemnation is now a
-            /// per-hash META POINT-READ, not a per-token retire-view fact — a positively-Clean meta means
-            /// someone else's copy-forward/resurrect already reconciled this hash (adopt their token, no
-            /// further work); anything else (Condemned, or absent — never observed as clean) falls through
-            /// to re-verify and re-displace THIS incarnation. Safe either way: a spurious re-displacement
-            /// just costs one more GET+PUT and still lands on a verified fresh incarnation.
-            const auto lm_drift = loadMeta(store->backend(), store->layout(), ref);
-            if (lm_drift && lm_drift->meta.state == MetaState::Clean)
-                return got->token;
-            hr.token = got->token;
-        }
-
-        /// 2. Verify fail-closed before re-publishing a single byte: the envelope must decode (header
-        ///    CRC), declare a Blob of this pool, and the PAYLOAD must re-hash to the content key.
-        const EnvelopeHeader header_in = decodeEnvelopeHeader(got->bytes, got->bytes.size(), ObjectKind::Blob);
-        const std::string_view payload{got->bytes.data() + header_in.header_len,
-                                       got->bytes.size() - header_in.header_len};
-        const BlobRef payload_ref = poolContentHash(ref.algo, payload);
-        if (payload_ref != ref)
-            throw Exception(ErrorCodes::CORRUPTED_DATA,
-                "copyForwardFromCondemned: object {} payload does not verify against its content key "
-                "(payload hash {}, expected {}) — refusing to copy forward",
-                key, blobIdOf(payload_ref), blobIdOf(ref));
-
-        /// 3. Re-wrap under a fresh envelope: fresh incarnation_tag + THIS build's build_id
-        ///    (W-FRESH-TAG, B167 — the new incarnation is owned by this live build).
-        EnvelopeHeader header;
-        header.kind = ObjectKind::Blob;
-        header.hash_algo = static_cast<uint8_t>(ref.algo);
-        header.domain_id = meta.pool_id;
-        header.incarnation_tag = mintU128();
-        header.build_id = build_id;
-        header.provenance = Provenance{nowMs(), cfg.server_id, /*ch_version*/ 0, info.op};
-        header.intended_ref = info.intended_ref;
-        header.pad_to_header_len = static_cast<uint32_t>(meta.blob_header_len);
-        String bytes_out;
-        try
-        {
-            bytes_out = encodeEnvelopeHeader(header);
-        }
-        catch (const Exception & e)
-        {
-            if (e.code() != ErrorCodes::BAD_ARGUMENTS)
-                throw;
-            /// intended_ref is diagnostic-only: when it makes the header exceed blob_header_len, drop it.
-            header.intended_ref.reset();
-            bytes_out = encodeEnvelopeHeader(header);
-        }
-        bytes_out.append(payload);
-
-        /// 4. Displace EXACTLY the incarnation we read and verified — token-conditional, so a
-        ///    concurrent exact-token delete or a racing recreate surfaces as PreconditionFailed,
-        ///    never as a blind resurrection.
-        const PutResult res = store->backend().putOverwrite(key, bytes_out, hr.token);
-        if (res.outcome == PutOutcome::Done)
-        {
-            ProfileEvents::increment(ProfileEvents::CasBlobCopyForward);
-            EventEmitter{*store}.emit([&](CasEvent & e)
-            {
-                e.type = CasEventType::BlobCopyForward;
-                e.object_kind = CasEventObjectKind::Blob;
-                e.object_hash = blobIdOf(ref);
-                e.token = res.token.value;
-                e.round = 0;   /// the round is no longer a writer concept (meta point-read replaces RetireView)
-                e.outcome = "ok";
-                e.reason = "verified copy-forward of a condemned incarnation still referenced by a "
-                           "committed source manifest (tokenless evidence dep; INV-1 exception)";
-                e.detail = {{"displaced_token", hr.token.value},
-                            {"size", std::to_string(payload.size())},
-                            {"build_id", u128ToHex(build_id)}};
-            });
-
-            /// Task 4 (spec §meta-protocols v3): the displacement just landed a fresh, verified
-            /// incarnation — flip the (now-stale) Condemned meta back to Clean so the NEXT point-reader
-            /// (writer dedup-hit or another promote revalidation) never has to fall back to a HEAD-only
-            /// guess. Best-effort bounded retry on a racing meta writer (another copy-forward/resurrect,
-            /// or GC re-condemning): a Conflict just means someone else already reconciled it to the same
-            /// steady state; putMetaIfAbsent covers the (rare) case the meta was never created at all.
-            {
-                auto lm_out = loadMeta(store->backend(), store->layout(), ref);
-                const BlobMeta clean{.state = MetaState::Clean, .condemn_round = 0, .size = payload.size()};
-                constexpr int max_meta_attempts = 8;
-                for (int meta_attempt = 0; meta_attempt < max_meta_attempts; ++meta_attempt)
-                {
-                    const CasResult meta_res = lm_out
-                        ? casMeta(store->backend(), store->layout(), ref, lm_out->etag, clean)
-                        : putMetaIfAbsent(store->backend(), store->layout(), ref, clean);
-                    if (meta_res.outcome == CasOutcome::Committed)
-                        break;
-                    lm_out = loadMeta(store->backend(), store->layout(), ref);
-                    /// Exhausted retries: leave the meta as-is — best-effort (a later writer/GC pass
-                    /// reconciles it); the body-side displacement above is already durable and verified.
-                }
-            }
-            return res.token;
-        }
-
-        /// PreconditionFailed: re-observe and re-decide (absent ⇒ fail closed at the top of the loop;
-        /// clean token ⇒ adopt; condemned again ⇒ another bounded attempt).
-        const HeadResult hr2 = store->backend().head(key);
-        if (!hr2.exists)
-            throw Exception(ErrorCodes::ABORTED,
-                "copyForwardFromCondemned: object {} deleted between the verified read and the "
-                "token-conditional overwrite — failing closed (retry the operation)", key);
-        hr = hr2;
-    }
-    throw Exception(ErrorCodes::ABORTED,
-        "copyForwardFromCondemned: exhausted {} attempts for {} — every observed incarnation was "
-        "re-condemned under us; failing closed (retry the operation)", max_attempts, key);
-}
-
 void Build::adoptEvidence(const ManifestEntry & entry)
 {
     requireAlive();
@@ -819,8 +689,9 @@ void Build::adoptEvidence(const ManifestEntry & entry)
     if (entry.placement == EntryPlacement::Blob)
     {
         /// Phase 3 T2: carry `entry.ref` WHOLE (the pair, never re-derived) — this is what makes a
-        /// mixed-algo manifest's entries each dep-track under their OWN algo.
-        deps[entry.ref] = DepEntry{ObjectKind::Blob, std::nullopt, entry.blob_size};
+        /// mixed-algo manifest's entries each dep-track under their OWN algo. §4: adopted=true marks this a
+        /// committed-source W-EVIDENCE dep, trusted at promote via the durable manifest edge (no probe).
+        deps[entry.ref] = DepEntry{ObjectKind::Blob, std::nullopt, entry.blob_size, /*adopted=*/true};
     }
 }
 
@@ -1083,50 +954,49 @@ void Build::promote(const RootNamespace & target_ns, const String & final_ref_na
                     "(WPromote owner==bld)",
                     final_ref_name, u128ToHex(promote_build_id));
 
-            /// Blob-leaf revalidation (spec 2026-07-09-cas-writer-gc-simplification, Phase A): TOKENED
-            /// leaves are edge-protected — EDGE-BEFORE-OBSERVE: the precommit closure was durable BEFORE
-            /// putBlob observed them, so a condemnation in the putBlob→promote window cannot graduate (the
-            /// next fold sees the edge, d >= 1, spared), and putBlob's gate already validated them against
-            /// the installed view under that edge. They are NOT re-checked here. Every NON-tokened leaf (a
-            /// tokenless W-EVIDENCE adopt — observation-free by design, B188 — or a no-dep staging bug)
-            /// gets the single mandatory presence observation: absent => fail closed; condemned-present +
-            /// copy-forwardable => verified copy-forward (the INV-1 exception); condemned + no-dep => fail
-            /// closed.
+            /// Blob-leaf revalidation (§4 manifest-trust relink, spec 2026-07-13 §4). TOKENED leaves are
+            /// edge-protected — EDGE-BEFORE-OBSERVE: the precommit closure was durable BEFORE putBlob
+            /// observed them, so a condemnation in the putBlob→promote window cannot graduate (the next fold
+            /// sees the edge, d >= 1, spared), and putBlob's gate already validated them against the installed
+            /// view under that edge. They are NOT re-checked here. A NON-tokened leaf is EITHER a
+            /// committed-source W-EVIDENCE adopt (adoptEvidence ⇒ adopted=true) or a no-dep / pending-upload
+            /// staging bug. There is NO per-file probe on this path: an adopted leaf is TRUSTED via the
+            /// durable manifest edge (the live source pins the blob, in-degree >= 1, not condemnable) and this
+            /// build's precommit edge is durable — matching the D4 relink trust model (ordinary
+            /// ReplicatedMergeTree interserver trust). A genuinely-absent adopted blob is an invariant
+            /// violation caught by fsck, not here.
             for (const ManifestEntry & e : body.entries)
             {
                 if (e.placement != EntryPlacement::Blob)
                     continue;
                 if (depIsTokened(e.ref))
                     continue;   /// edge-protected (EDGE-BEFORE-OBSERVE); putBlob validated under the durable edge
-                const String blob_key = store->layout().blobKey(e.ref);
-                constexpr int max_reval_attempts = 8;
-                bool validated = false;
-                for (int attempt = 0; attempt < max_reval_attempts; ++attempt)
+                /// §4 manifest-trust: a tokenless adoptEvidence leaf is trusted — no HEAD, no loadMeta, no
+                /// copy-forward; the durable manifest edge is the liveness evidence. EDGE-BEFORE-TRUST: this
+                /// build's precommit edge was durably appended (`precommitAdd`, the `Precommit`
+                /// `OwnerTransition` above) BEFORE we get here, and the owner-liveness check at the top of this
+                /// closure ("WPromote owner==bld") already re-proved it is the LIVE owner — so the dst manifest
+                /// is a live precommit owner input and GC's fold pins every blob it names at in-degree >= 1
+                /// (the barrier-activated create-precommit +1, Task 12). GC is the sole deleter and respects
+                /// in-degree, so a trusted-promote leaf cannot have been condemned/deleted. The D4 backstop for
+                /// the (production-unreachable) genuinely-absent case is fsck's reachable-but-absent scan
+                /// (`CasFsck.cpp`, `++report.dangling`), NOT this gate. A tokenless PENDING-upload dep
+                /// (adopted=false) or a no-dep leaf never reaches promote un-resolved legitimately: it is a
+                /// staging bug (a pending upload that never completed) and fails closed (LOGICAL_ERROR).
+                if (!isTrustedAdopt(e.ref))
+                    throw Exception(ErrorCodes::LOGICAL_ERROR,
+                        "promote: blob leaf {} has no tokened and no adopted dep at commit — a staging bug "
+                        "(a pending upload never completed); failing closed",
+                        store->layout().blobKey(e.ref));
+                ProfileEvents::increment(ProfileEvents::CasBlobAdoptTrusted);
+                EventEmitter{*store}.emit([&](CasEvent & ev)
                 {
-                    const HeadResult hr = store->backend().head(blob_key);
-                    if (!hr.exists)
-                        throw Exception(ErrorCodes::ABORTED,
-                            "promote: blob {} absent at commit revalidation — failing closed", blob_key);
-                    /// Task 4 (spec §meta-protocols v3): the condemned decision is now a per-hash META
-                    /// POINT-READ, not the writer-side RetireView — mirrors Task 3's putBlob/uploadFromSource
-                    /// re-sourcing. An absent meta reads as "not condemned" (same convention as the writer gate).
-                    const auto lm = loadMeta(store->backend(), store->layout(), e.ref);
-                    const bool condemned = lm && lm->meta.state == MetaState::Condemned;
-                    if (condemned)
-                    {
-                        if (!isCopyForwardableTokenless(e.ref))
-                            throw Exception(ErrorCodes::ABORTED,
-                                "promote: blob {} condemned at commit revalidation — failing closed (INV-1)", blob_key);
-                        copyForwardFromCondemned(e.ref, blob_key, hr);
-                        continue;
-                    }
-                    validated = true;
-                    break;
-                }
-                if (!validated)
-                    throw Exception(ErrorCodes::ABORTED,
-                        "promote: blob {} still condemned after {} copy-forward attempts at commit revalidation — "
-                        "failing closed (INV-1)", blob_key, max_reval_attempts);
+                    ev.type = CasEventType::BlobReuseAdopt;
+                    ev.object_kind = CasEventObjectKind::Blob;
+                    ev.object_hash = blobIdOf(e.ref);
+                    ev.outcome = "adopt";
+                    ev.reason = "manifest-trust";   /// distinguishable trusted-adopt class (empty token)
+                });
             }
 
             /// BUG 1a: refuse to overwrite a live committed ref that already names a DIFFERENT manifest —
