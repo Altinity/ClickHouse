@@ -6,6 +6,7 @@
 #include <Interpreters/CancellationCode.h>
 #include <Common/Exception.h>
 #include <Common/MemoryTracker.h>
+#include <Common/SipHash.h>
 #include <Common/logger_useful.h>
 #include <Disks/IDisk.h>
 #include <IO/WriteHelpers.h>
@@ -48,28 +49,13 @@ String MergeTreePartitionExportScheduler::getExportsRelativePath() const
     return fs::path(storage.getRelativeDataPath()) / "partition_exports";
 }
 
-void MergeTreePartitionExportScheduler::throwIfAlreadyExported(const String & composite_key, bool force) const
-{
-    if (force)
-        return;
-
-    std::lock_guard lock(mutex);
-    if (tasks.contains(composite_key))
-        throw Exception(ErrorCodes::EXPORT_PARTITION_ALREADY_EXPORTED,
-            "Export with key {} already exported or it is being exported. "
-            "Set `export_merge_tree_partition_force_export` to overwrite it.",
-            composite_key);
-}
-
 void MergeTreePartitionExportScheduler::addTask(
     MergeTreePartitionExportTask descriptor, std::vector<DataPartPtr> part_references, bool force)
 {
     const auto composite_key = compositeKey(descriptor.partition_id, descriptor.destination_database, descriptor.destination_table);
     const auto transaction_id = descriptor.transaction_id;
-    String descriptor_json;
 
     String previous_transaction_id;
-    bool replaced = false;
 
     {
         std::lock_guard lock(mutex);
@@ -82,48 +68,20 @@ void MergeTreePartitionExportScheduler::addTask(
                     "Set `export_merge_tree_partition_force_export` to overwrite it.",
                     composite_key);
 
-            /// Overwrite: erase the previous task atomically here; its in-flight part exports and
-            /// its on-disk file are cleaned up below, outside the registry lock (see note).
             previous_transaction_id = it->second.descriptor.transaction_id;
-            replaced = true;
-            tasks.erase(it);
         }
 
         TaskEntry entry;
         entry.descriptor = std::move(descriptor);
         entry.part_references = std::move(part_references);
-        descriptor_json = entry.descriptor.toJsonString();
-        tasks.emplace(composite_key, std::move(entry));
+        persist(composite_key, entry.descriptor.toJsonString());
+        tasks.insert_or_assign(composite_key, std::move(entry));
     }
 
-    /// killExportPart takes export_manifests_mutex, and a part-export completion callback runs while
-    /// holding export_manifests_mutex and then takes our registry mutex. Calling killExportPart while
-    /// holding the registry mutex would therefore be an AB-BA lock inversion, so we do it here after
-    /// releasing the lock. The previous task's entry is already gone, so its late completion callbacks
-    /// find nothing and no-op.
-    if (replaced)
+    if (!previous_transaction_id.empty())
     {
         LOG_INFO(storage.log, "ExportPartition: overwriting export with key {}", composite_key);
         storage.killExportPart(previous_transaction_id);
-        removeTaskFile(previous_transaction_id);
-    }
-
-    /// The task is already in the in-memory registry (published under the lock above so the dedup
-    /// check + insert is atomic). If the durable write fails, roll the entry back so the background
-    /// scheduler does not export/commit a task whose ALTER reported failure and which would not
-    /// survive a restart anyway. The transaction_id guard avoids erasing a newer replacement that a
-    /// concurrent force-export may have installed in the meantime.
-    try
-    {
-        persist(transaction_id, descriptor_json);
-    }
-    catch (...)
-    {
-        std::lock_guard lock(mutex);
-        if (const auto it = tasks.find(composite_key);
-            it != tasks.end() && it->second.descriptor.transaction_id == transaction_id)
-            tasks.erase(it);
-        throw;
     }
 
     LOG_INFO(storage.log, "ExportPartition: scheduled export task {} (key {})", transaction_id, composite_key);
@@ -132,44 +90,32 @@ void MergeTreePartitionExportScheduler::addTask(
 
 CancellationCode MergeTreePartitionExportScheduler::kill(const String & transaction_id)
 {
-    String descriptor_json;
+    /// set the status to killed
     {
         std::lock_guard lock(mutex);
-        TaskEntry * target = nullptr;
-        for (auto & [key, entry] : tasks)
-        {
-            if (entry.descriptor.transaction_id == transaction_id)
-            {
-                target = &entry;
-                break;
-            }
-        }
 
-        if (!target)
+        const auto it = tasks.find(transaction_id);
+
+        if (it == tasks.end())
             return CancellationCode::NotFound;
 
-        if (target->descriptor.status != MergeTreePartitionExportTask::Status::PENDING)
+        if (it->second.descriptor.status != MergeTreePartitionExportTask::Status::PENDING)
             return CancellationCode::CancelCannotBeSent;
 
-        /// Serialize against the commit phase. `committing` is set under this same mutex before the
-        /// (unlocked) destination commit begins, so once it is true the data is being (or has been)
-        /// committed and the task will transition to COMPLETED; cancelling now would leave a
-        /// misleading KILLED status over already-committed data. This mirrors the replicated path,
-        /// which refuses the kill when it cannot take the per-task commit_lock.
-        if (target->committing)
+        if (it->second.committing)
         {
             LOG_INFO(storage.log, "ExportPartition: commit in progress for {}, cannot cancel export partition task", transaction_id);
             return CancellationCode::CancelCannotBeSent;
         }
 
-        target->descriptor.status = MergeTreePartitionExportTask::Status::KILLED;
-        descriptor_json = target->descriptor.toJsonString();
+        auto updated = it->second.descriptor;
+
+        updated.status = MergeTreePartitionExportTask::Status::KILLED;
+        persist(it->first, updated.toJsonString());
+        it->second.descriptor = std::move(updated);
     }
 
-    persist(transaction_id, descriptor_json);
-
-    /// Cancel any in-flight part exports for this transaction. Their completion callbacks will see
-    /// the KILLED status and skip further bookkeeping.
+    /// cancel in-flight operations
     storage.killExportPart(transaction_id);
 
     return CancellationCode::CancelSent;
@@ -351,15 +297,15 @@ void MergeTreePartitionExportScheduler::handlePartCompletion(
     const String & transaction_id, const String & part_name, const MergeTreePartExportManifest::CompletionCallbackResult & result)
 {
     bool ready_to_commit = false;
-    String descriptor_json;
-    bool should_persist = false;
 
     {
         std::lock_guard lock(mutex);
+        const String * composite_key = nullptr;
         TaskEntry * entry = nullptr;
         for (auto & [key, candidate] : tasks)
             if (candidate.descriptor.transaction_id == transaction_id)
             {
+                composite_key = &key;
                 entry = &candidate;
                 break;
             }
@@ -368,60 +314,72 @@ void MergeTreePartitionExportScheduler::handlePartCompletion(
 
         entry->in_flight_parts.erase(part_name);
 
-        auto & descriptor = entry->descriptor;
-
         /// Task already terminal (KILLED / FAILED / COMPLETED): ignore late completions.
-        if (descriptor.status != MergeTreePartitionExportTask::Status::PENDING)
+        if (entry->descriptor.status != MergeTreePartitionExportTask::Status::PENDING)
             return;
+
+        /// A cancelled export (KILL, or SYSTEM STOP MOVES) is not a real failure: leave the part
+        /// pending. If it was a KILL the status is already handled above; otherwise the next tick
+        /// retries it.
+        if (!result.success && result.exception && result.exception->code() == ErrorCodes::QUERY_WAS_CANCELLED)
+            return;
+
+        /// Persist-then-apply under the lock: mutate a copy, write it durably, then swap it in. If
+        /// the write throws we leave the in-memory descriptor unchanged (so the part is retried) and
+        /// swallow the error -- a completion callback must not surface a local disk error as a part
+        /// failure.
+        auto updated = entry->descriptor;
 
         if (result.success)
         {
-            if (auto * part = descriptor.findPart(part_name))
+            if (auto * part = updated.findPart(part_name))
             {
                 part->done = true;
                 part->paths_in_destination = result.relative_paths_in_destination_storage;
             }
-            should_persist = true;
+        }
+        else
+        {
+            updated.last_exception.message = result.exception ? result.exception->message() : "Unknown export failure";
+            updated.last_exception.part = part_name;
+            updated.last_exception.time = time(nullptr);
+            updated.last_exception.count += 1;
 
-            if (descriptor.allPartsDone() && !entry->committing)
+            if (result.exception && ExportPartitionUtils::isNonRetryableExportError(result.exception->code()))
+                updated.status = MergeTreePartitionExportTask::Status::FAILED;
+        }
+
+        try
+        {
+            persist(*composite_key, updated.toJsonString());
+        }
+        catch (...)
+        {
+            tryLogCurrentException(storage.log, "ExportPartition: failed to persist part-completion state, will retry");
+            return;
+        }
+
+        entry->descriptor = std::move(updated);
+
+        if (result.success)
+        {
+            if (entry->descriptor.allPartsDone() && !entry->committing)
             {
                 entry->committing = true;
                 ready_to_commit = true;
             }
         }
+        else if (entry->descriptor.status == MergeTreePartitionExportTask::Status::FAILED)
+        {
+            LOG_WARNING(storage.log, "ExportPartition: task {} failed on part {} with non-retryable error",
+                transaction_id, part_name);
+        }
         else
         {
-            /// A cancelled export (KILL, or SYSTEM STOP MOVES) is not a real failure: leave the part
-            /// pending. If it was a KILL the status is already handled above; otherwise the next tick
-            /// retries it.
-            if (result.exception && result.exception->code() == ErrorCodes::QUERY_WAS_CANCELLED)
-                return;
-
-            descriptor.last_exception.message = result.exception ? result.exception->message() : "Unknown export failure";
-            descriptor.last_exception.part = part_name;
-            descriptor.last_exception.time = time(nullptr);
-            descriptor.last_exception.count += 1;
-            should_persist = true;
-
-            if (result.exception && ExportPartitionUtils::isNonRetryableExportError(result.exception->code()))
-            {
-                descriptor.status = MergeTreePartitionExportTask::Status::FAILED;
-                LOG_WARNING(storage.log, "ExportPartition: task {} failed on part {} with non-retryable error (code {})",
-                    transaction_id, part_name, result.exception->code());
-            }
-            else
-            {
-                LOG_INFO(storage.log, "ExportPartition: task {} part {} failed with retryable error, will retry",
-                    transaction_id, part_name);
-            }
+            LOG_INFO(storage.log, "ExportPartition: task {} part {} failed with retryable error, will retry",
+                transaction_id, part_name);
         }
-
-        if (should_persist)
-            descriptor_json = descriptor.toJsonString();
     }
-
-    if (should_persist)
-        persist(transaction_id, descriptor_json);
 
     if (ready_to_commit)
         tryCommit(transaction_id);
@@ -492,13 +450,14 @@ void MergeTreePartitionExportScheduler::tryCommit(const String & transaction_id)
         LOG_WARNING(storage.log, "ExportPartition: commit for task {} failed: {}", transaction_id, e.message());
     }
 
-    String descriptor_json;
     {
         std::lock_guard lock(mutex);
+        const String * composite_key = nullptr;
         TaskEntry * entry = nullptr;
         for (auto & [key, candidate] : tasks)
             if (candidate.descriptor.transaction_id == transaction_id)
             {
+                composite_key = &key;
                 entry = &candidate;
                 break;
             }
@@ -506,46 +465,60 @@ void MergeTreePartitionExportScheduler::tryCommit(const String & transaction_id)
             return;
 
         entry->committing = false;
-        auto & descriptor = entry->descriptor;
 
-        /// A concurrent KILL may have won the race while we were committing.
-        if (descriptor.status != MergeTreePartitionExportTask::Status::PENDING)
+        /// A concurrent KILL may have won the race while we were committing. Its terminal state is
+        /// already durable, so there is nothing to persist here.
+        if (entry->descriptor.status != MergeTreePartitionExportTask::Status::PENDING)
+            return;
+
+        /// Persist-then-apply under the lock. Note the destination commit above already happened
+        /// (effect-first): if this local write throws, we leave the task PENDING with all parts done
+        /// so run() retries the commit -- idempotent thanks to the transaction id / commit file.
+        auto updated = entry->descriptor;
+        if (success)
         {
-            descriptor_json = descriptor.toJsonString();
-        }
-        else if (success)
-        {
-            descriptor.status = MergeTreePartitionExportTask::Status::COMPLETED;
-            descriptor_json = descriptor.toJsonString();
+            updated.status = MergeTreePartitionExportTask::Status::COMPLETED;
         }
         else
         {
-            descriptor.last_exception.message = failure ? failure->message() : "Unknown commit failure";
-            descriptor.last_exception.part = "";
-            descriptor.last_exception.time = time(nullptr);
-            descriptor.last_exception.count += 1;
+            updated.last_exception.message = failure ? failure->message() : "Unknown commit failure";
+            updated.last_exception.part = "";
+            updated.last_exception.time = time(nullptr);
+            updated.last_exception.count += 1;
 
             if (failure && ExportPartitionUtils::isNonRetryableExportError(failure->code()))
-                descriptor.status = MergeTreePartitionExportTask::Status::FAILED;
+                updated.status = MergeTreePartitionExportTask::Status::FAILED;
             /// Otherwise leave PENDING: run() will retry the commit on the next tick.
-
-            descriptor_json = descriptor.toJsonString();
         }
-    }
 
-    persist(transaction_id, descriptor_json);
+        try
+        {
+            persist(*composite_key, updated.toJsonString());
+        }
+        catch (...)
+        {
+            tryLogCurrentException(storage.log, "ExportPartition: failed to persist commit result, will retry");
+            return;
+        }
+
+        entry->descriptor = std::move(updated);
+    }
 }
 
-void MergeTreePartitionExportScheduler::persist(const String & transaction_id, const String & descriptor_json)
+void MergeTreePartitionExportScheduler::persist(const String & composite_key, const String & descriptor_json)
 {
-    std::lock_guard file_lock(persist_mutex);
-
+    /// Always called while holding the registry `mutex`, so writes are already serialized. The file
+    /// is named by a 128-bit hash of the composite key (a fixed-length, filesystem-safe, opaque
+    /// handle), so a force-replace overwrites the previous record in place. The authoritative key is
+    /// recomputed from the JSON body in loadFromDisk, so the name only needs to be deterministic and
+    /// collision-free -- sipHash128 (matching FileCacheKey) provides both.
     auto disk = storage.getDisks().front();
     const auto directory = getExportsRelativePath();
     disk->createDirectories(directory);
 
-    const auto final_path = fs::path(directory) / (transaction_id + ".json");
-    const auto tmp_path = fs::path(directory) / (transaction_id + ".json.tmp");
+    const auto file_name = sipHash128String(composite_key) + ".json";
+    const auto final_path = fs::path(directory) / file_name;
+    const auto tmp_path = fs::path(directory) / (file_name + ".tmp");
 
     {
         auto out = disk->writeFile(tmp_path, DBMS_DEFAULT_BUFFER_SIZE, WriteMode::Rewrite, storage.getContext()->getWriteSettings());
@@ -554,14 +527,6 @@ void MergeTreePartitionExportScheduler::persist(const String & transaction_id, c
     }
 
     disk->replaceFile(tmp_path, final_path);
-}
-
-void MergeTreePartitionExportScheduler::removeTaskFile(const String & transaction_id)
-{
-    std::lock_guard file_lock(persist_mutex);
-    auto disk = storage.getDisks().front();
-    const auto final_path = fs::path(getExportsRelativePath()) / (transaction_id + ".json");
-    disk->removeFileIfExists(final_path);
 }
 
 void MergeTreePartitionExportScheduler::loadFromDisk()
