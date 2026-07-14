@@ -904,7 +904,20 @@ TEST(CasRefSnapshotCodec, DecodeRejectsFutureFormatVersion)
     s.ns = "ns";
     s.snapshot_id = RefTxnId{1, 1};
     String bytes = encodeRefTableSnapshot(s);
-    bytes[0] = 2;
+    bytes[0] = 3;
+    expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION,
+        [&] { decodeRefTableSnapshot(bytes, s.ns, s.snapshot_id); });
+}
+
+/// CAS is pre-release: format version 1 (no `sealed_from`) is rejected fail-closed, exactly like any
+/// other unrecognized version -- there is no v1-reading compatibility branch to preserve.
+TEST(CasRefSnapshotCodec, DecodeRejectsFormatVersionOne)
+{
+    RefTableSnapshot s;
+    s.ns = "ns";
+    s.snapshot_id = RefTxnId{1, 1};
+    String bytes = encodeRefTableSnapshot(s);
+    bytes[0] = 1;
     expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION,
         [&] { decodeRefTableSnapshot(bytes, s.ns, s.snapshot_id); });
 }
@@ -1054,8 +1067,8 @@ TEST(CasRefSnapshotCodec, DecodeRejectsNonCanonicalCommittedRefName)
     String bytes = encodeRefTableSnapshot(s);
 
     /// Layout up to the name: u32 ver | u32 ns_len | ns bytes | u64 epoch | u64 seq | u8 lifecycle |
-    /// u32 n_committed | u32 name_len | name bytes (first committed row).
-    const size_t name_bytes_offset = 4 + 4 + s.ns.size() + 8 + 8 + 1 + 4 + 4;
+    /// u8 has_sealed_from | u32 n_committed | u32 name_len | name bytes (first committed row).
+    const size_t name_bytes_offset = 4 + 4 + s.ns.size() + 8 + 8 + 1 + 1 + 4 + 4;
     ASSERT_EQ(bytes.substr(name_bytes_offset, 2), "zz");
     bytes[name_bytes_offset] = '.';
     bytes[name_bytes_offset + 1] = '.';

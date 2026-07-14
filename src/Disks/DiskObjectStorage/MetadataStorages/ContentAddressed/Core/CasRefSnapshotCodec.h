@@ -44,6 +44,8 @@ struct RefTableSnapshot
     RefTxnId snapshot_id;
     RefLifecycle lifecycle = RefLifecycle::Live;
     std::optional<RefTxnId> remove_txn_id;      /// present iff lifecycle == Removed
+    std::optional<RefTxnId> sealed_from;        /// recovery seal upper bound (rev.6 §Recovery Seal); if
+                                                 /// present, `*sealed_from <= snapshot_id`
     std::vector<RefCommittedRow> committed;     /// sorted by canonical bytewise ref_name, no duplicates
     std::vector<RefOwnerBinding> precommits;    /// sorted by (ref_name, manifest_ref), no duplicates
 
@@ -55,27 +57,30 @@ struct RefTableSnapshot
 /// this reuses `ref_removal_max_bytes` (`CasRefLogCodec.h`) rather than a second independent constant.
 inline constexpr size_t ref_snapshot_max_bytes = ref_removal_max_bytes;
 
-/// Deterministic encode: `u32 format_version=1 | ns | snapshot_id | u8 lifecycle | [remove_txn_id if
-/// Removed] | u32 n_committed | committed rows... | u32 n_precommits | precommit rows...` (fixed-width
-/// little-endian integers, u32-length-prefixed byte strings; `snapshot_id`/`remove_txn_id` as raw
-/// writer_epoch/ref_sequence u64 pairs, not the hex render). No creation timestamp, attempt id, or map
-/// iteration order is ever written -- the encoding is a pure function of `snapshot`'s contents.
+/// Deterministic encode: `u32 format_version=2 | ns | snapshot_id | u8 lifecycle | [remove_txn_id if
+/// Removed] | u8 has_sealed_from | [sealed_from] | u32 n_committed | committed rows... | u32
+/// n_precommits | precommit rows...` (fixed-width little-endian integers, u32-length-prefixed byte
+/// strings; `snapshot_id`/`remove_txn_id`/`sealed_from` as raw writer_epoch/ref_sequence u64 pairs, not
+/// the hex render). No creation timestamp, attempt id, or map iteration order is ever written -- the
+/// encoding is a pure function of `snapshot`'s contents.
 ///
-/// Throws CORRUPTED_DATA if: `snapshot.snapshot_id` (or `remove_txn_id`, when present) has a zero
-/// field; `lifecycle == Live` but `remove_txn_id` is set, or `lifecycle == Removed` but it is unset or
-/// `committed`/`precommits` is non-empty; any row's `ref_name` is not a canonical clean relative path;
-/// any row's `manifest_ref` has a zero/out-of-range field; `committed` is not strictly ascending by
-/// `ref_name` (this also rejects a duplicate ref_name -- there is exactly one committed manifest per
-/// name); `precommits` is not strictly ascending by `(ref_name, manifest_ref)` (this also rejects an
-/// exact duplicate binding); a `precommits` entry has `kind != Precommit`; or the encoded result would
-/// exceed `ref_snapshot_max_bytes`.
+/// Throws CORRUPTED_DATA if: `snapshot.snapshot_id` (or `remove_txn_id`/`sealed_from`, when present)
+/// has a zero field; `lifecycle == Live` but `remove_txn_id` is set, or `lifecycle == Removed` but it
+/// is unset or `committed`/`precommits` is non-empty; `sealed_from` is present and `snapshot_id <
+/// *sealed_from`; any row's `ref_name` is not a canonical clean relative path; any row's `manifest_ref`
+/// has a zero/out-of-range field; `committed` is not strictly ascending by `ref_name` (this also
+/// rejects a duplicate ref_name -- there is exactly one committed manifest per name); `precommits` is
+/// not strictly ascending by `(ref_name, manifest_ref)` (this also rejects an exact duplicate binding);
+/// a `precommits` entry has `kind != Precommit`; or the encoded result would exceed
+/// `ref_snapshot_max_bytes`.
 String encodeRefTableSnapshot(const RefTableSnapshot & snapshot);
 
 /// Decode. `expected_ns`/`expected_snapshot_id` are the values recovered from the object key; the
 /// decoded body's `ns`/`snapshot_id` must equal them exactly (same key/body cross-check contract as
-/// `decodeRefLogTxn`). Throws UNKNOWN_FORMAT_VERSION for a `format_version` other than 1, and
-/// CORRUPTED_DATA for a truncated buffer, an unknown lifecycle byte, an unrecognized owner kind, or
-/// any validation failure listed on `encodeRefTableSnapshot`.
+/// `decodeRefLogTxn`). Throws UNKNOWN_FORMAT_VERSION for a `format_version` other than 2 -- format
+/// version 1 (no `sealed_from`) is rejected fail-closed, CAS is pre-release and carries no compat
+/// scaffolding -- and CORRUPTED_DATA for a truncated buffer, an unknown lifecycle byte, an unrecognized
+/// owner kind, or any validation failure listed on `encodeRefTableSnapshot`.
 RefTableSnapshot decodeRefTableSnapshot(
     std::string_view data, const String & expected_ns, const RefTxnId & expected_snapshot_id);
 

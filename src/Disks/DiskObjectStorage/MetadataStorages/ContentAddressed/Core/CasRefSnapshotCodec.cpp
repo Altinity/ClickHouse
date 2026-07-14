@@ -14,6 +14,7 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int CORRUPTED_DATA;
+    extern const int LOGICAL_ERROR;
     extern const int UNKNOWN_FORMAT_VERSION;
 }
 }
@@ -24,7 +25,7 @@ namespace DB::Cas
 namespace
 {
 
-constexpr uint32_t kRefTableSnapshotFormatVersion = 1;
+constexpr uint32_t kRefTableSnapshotFormatVersion = 2;
 
 /// Canonical-clean-relative-path check (spec §One Log Encoding, reused for snapshot ref names): shared
 /// with `CasRefLogCodec` via `CasCodecUtil.h`'s `isCanonicalRefName`/`checkCanonicalRefName` rather
@@ -175,6 +176,16 @@ void checkSnapshotInvariants(const RefTableSnapshot & snapshot)
     else if (snapshot.remove_txn_id)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableSnapshot: Live snapshot must not carry remove_txn_id");
 
+    if (snapshot.sealed_from)
+    {
+        checkTxnIdNonzero(*snapshot.sealed_from, "sealed_from");
+        if (snapshot.snapshot_id < *snapshot.sealed_from)
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "RefTableSnapshot: sealed_from {}-{} exceeds snapshot_id {}-{}",
+                snapshot.sealed_from->writer_epoch, snapshot.sealed_from->ref_sequence,
+                snapshot.snapshot_id.writer_epoch, snapshot.snapshot_id.ref_sequence);
+    }
+
     checkCommittedSorted(snapshot.committed);
     checkPrecommitsSorted(snapshot.precommits);
 }
@@ -192,6 +203,10 @@ String encodeRefTableSnapshot(const RefTableSnapshot & snapshot)
     writeBinaryLittleEndian(static_cast<uint8_t>(snapshot.lifecycle), out);
     if (snapshot.lifecycle == RefLifecycle::Removed)
         writeTxnId(out, *snapshot.remove_txn_id);
+
+    writeBinaryLittleEndian(static_cast<uint8_t>(snapshot.sealed_from.has_value()), out);
+    if (snapshot.sealed_from)
+        writeTxnId(out, *snapshot.sealed_from);
 
     writeBinaryLittleEndian(static_cast<uint32_t>(snapshot.committed.size()), out);
     for (const RefCommittedRow & row : snapshot.committed)
@@ -236,6 +251,11 @@ RefTableSnapshot decodeRefTableSnapshot(
         snapshot.lifecycle = static_cast<RefLifecycle>(lifecycle_raw);
         if (snapshot.lifecycle == RefLifecycle::Removed)
             snapshot.remove_txn_id = readTxnId(in);
+
+        uint8_t has_sealed_from = 0;
+        readBinaryLittleEndian(has_sealed_from, in);
+        if (has_sealed_from)
+            snapshot.sealed_from = readTxnId(in);
 
         uint32_t n_committed = 0;
         readBinaryLittleEndian(n_committed, in);

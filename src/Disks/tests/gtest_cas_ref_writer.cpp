@@ -457,6 +457,24 @@ TEST(RefWriterRecovery, DifferentBytesAtSelectedSnapshotIsCorruptionNotRestart)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { store->resolveRef(ns, "anything"); });
 }
 
+/// `sealed_from` (rev.6 §Recovery Seal) round-trips through the snapshot codec, and encoding rejects a
+/// `sealed_from` that is newer than the snapshot itself (the invariant: a seal only ever bounds ids
+/// already covered by this very snapshot, never a future one).
+TEST(RefSnapshotCodec, SealedFromRoundTripsAndOrderingEnforced)
+{
+    DB::Cas::RefTableSnapshot s;
+    s.ns = "ns1";
+    s.snapshot_id = DB::Cas::RefTxnId{2, UINT64_MAX};       /// a seal id: (epoch-1, MAX)
+    s.lifecycle = DB::Cas::RefLifecycle::Live;
+    s.sealed_from = DB::Cas::RefTxnId{2, 17};               /// greatest listed id
+    const auto bytes = DB::Cas::encodeRefTableSnapshot(s);
+    const auto back = DB::Cas::decodeRefTableSnapshot(bytes, "ns1", s.snapshot_id);
+    EXPECT_EQ(back, s);
+
+    s.sealed_from = DB::Cas::RefTxnId{3, 1};                /// > snapshot_id: must throw
+    EXPECT_ANY_THROW(DB::Cas::encodeRefTableSnapshot(s));
+}
+
 /// ===================================================================================
 /// Append lane: request cost + batching (spec §Common Mutation Path / §Local Batching Queue)
 /// ===================================================================================
