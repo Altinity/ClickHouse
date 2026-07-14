@@ -339,3 +339,6 @@ Every attempted scenario run is appended here (newest at the bottom). `run_dir` 
 | 2026-07-14T11:52:10 | S38 | 42 | dev | 900s | fail | c1693936a3ff | 20260714T115007_S38_seed42 |  |
 | 2026-07-14T12:20:57 | S38 | 42 | dev | 900s | fail | c1693936a3ff | 20260714T115429_S38_seed42 | quiescence failed: timed out |
 | 2026-07-14T13:41:38 | S38 | 42 | dev | 900s | fail | c1693936a3ff | 20260714T131226_S38_seed42 | quiescence failed: timed out |
+| 2026-07-14T13:54:49 | S13 | 42 | dev | 900s | pass | 2d3d57c549a5 | 20260714T134837_S13_seed42 |  |
+| 2026-07-14T13:58:15 | S15 | 42 | dev | 900s | pass | 2d3d57c549a5 | 20260714T135545_S15_seed42 |  |
+| 2026-07-14T13:59:21 | S18 | 42 | dev | 900s | pass | 2d3d57c549a5 | 20260714T135815_S18_seed42 |  |
