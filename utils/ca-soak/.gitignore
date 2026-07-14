@@ -9,3 +9,5 @@ __pycache__/
 configs/aws.env
 # Live GCS HMAC credentials for the real-GCS validation (docker-compose-gcs.yml). NEVER commit.
 configs/gcs.env
+# Rendered by framework.cluster_boot.render_tuned_config (soak-matrix config sweeps); run artifact.
+configs/storage_conf_tuned_ch*.xml

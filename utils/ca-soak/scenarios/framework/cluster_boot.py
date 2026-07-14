@@ -12,6 +12,7 @@ same docker-compose project (directory name `ca-soak`), so container names are s
 import shutil
 import subprocess
 import time
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from soak.cluster import Cluster
@@ -36,13 +37,48 @@ _VARIANT_FILE = {
     # S38: raised materialization_grace_ms (T_mat) + a published RustFS port (18121) for direct
     # object-store injection (the late-PUT test).
     "s38": "docker-compose-s38.yml",
+    # Soak-matrix config sweeps (opt §2 dedup_cache_bytes, §3 part_folder_validate): render_tuned_config
+    # writes configs/storage_conf_tuned_ch{1,2}.xml on demand; this compose mounts those instead of the
+    # fixed per-variant XML the other entries above use.
+    "tuned": "docker-compose-tuned.yml",
 }
 
 # Replica count per compose variant — drives the N-node Cluster + health wait + log-dir prep.
 _VARIANT_NODES = {
     None: 2, "default": 2, "gc_shards2": 2, "smalldedupcache": 2,
     "tenreplicas": 10, "gc_shards8": 2, "s3faultproxy": 2, "s3listproxy": 2, "s38": 2,
+    "tuned": 2,
 }
+
+
+def render_tuned_config(overrides: dict) -> None:
+    """Render configs/storage_conf_tuned_ch{1,2}.xml from the base storage_conf_ch{1,2}.xml, injecting
+    one child element per override inside the <ca> disk block (replacing a same-named child if present).
+
+    Each call re-parses the base XML from scratch, so repeated calls are idempotent by construction —
+    there is no way to accumulate stale children across runs. Soak-matrix sweeps (opt §2 dedup_cache_bytes,
+    §3 part_folder_validate) feed one variable per run through here instead of hand-authoring a
+    storage_conf_<variant>.xml + docker-compose-<variant>.yml pair per value (the S24 smalldedupcache
+    variant is the pattern this replaces for ad hoc single-knob sweeps).
+
+    Note: xml.etree.ElementTree does not round-trip comments — the rendered tuned file loses the
+    explanatory comments present in the base storage_conf_ch{1,2}.xml. That's acceptable here because
+    the tuned files are generated run artifacts (gitignored, not committed), not the source of truth.
+    """
+    for node in ("ch1", "ch2"):
+        base = CA_SOAK_DIR / "configs" / f"storage_conf_{node}.xml"
+        tree = ET.parse(base)
+        ca = tree.getroot().find("./storage_configuration/disks/ca")
+        if ca is None:
+            raise RuntimeError(f"no <ca> disk block in {base}")
+        for key, value in overrides.items():
+            existing = ca.find(key)
+            if existing is not None:
+                ca.remove(existing)
+            child = ET.SubElement(ca, key)
+            child.text = str(value)
+        tree.write(CA_SOAK_DIR / "configs" / f"storage_conf_tuned_{node}.xml",
+                   encoding="unicode", xml_declaration=False)
 
 
 def node_count_for(variant) -> int:
@@ -130,11 +166,14 @@ def archive_server_logs(tag, node_count=2, log_fn=print):
                 log_fn(f"archive_server_logs {d}: {e}")
 
 
-def reset_cluster(variant=None, *, archive_tag=None, log_fn=print, timeout_s=300) -> bool:
+def reset_cluster(variant=None, *, archive_tag=None, log_fn=print, timeout_s=300, overrides=None) -> bool:
     """Hard reset to a fresh pool: down -v (current + variant), then up -d the chosen variant, then
     wait for ALL replicas healthy. Returns True iff healthy after bring-up. The 10-replica variant
     serializes its startup (ch2 waits ch1, ..., ch10 waits ch9) so bring-up takes longer — the
-    caller passes a larger timeout for it."""
+    caller passes a larger timeout for it.
+
+    `overrides`: for variant="tuned" only — a dict of <ca> disk config overrides rendered via
+    `render_tuned_config` before `up` (see that function for the soak-matrix use case)."""
     n = node_count_for(variant)
     # The 10-replica compose serializes startup (ch2 waits ch1, ..., ch10 waits ch9) to avoid the CA
     # capability-probe race on the shared pool, so bring-up scales with node count — widen the bound.
@@ -145,6 +184,8 @@ def reset_cluster(variant=None, *, archive_tag=None, log_fn=print, timeout_s=300
     # tenreplicas file too so ch3..ch10 (defined only there) are torn down when switching away.
     _run(compose_cmd("tenreplicas", "down", "-v", "--remove-orphans"), timeout=boot_timeout, log_fn=log_fn)
     _prep_log_dirs(node_count=n)
+    if variant == "tuned" and overrides:
+        render_tuned_config(overrides)
     _run(compose_cmd(variant, "up", "-d"), timeout=boot_timeout, log_fn=log_fn)
     ok = wait_healthy(variant=variant, timeout_s=boot_timeout, log_fn=log_fn)
     if not ok:
