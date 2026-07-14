@@ -79,6 +79,26 @@ PUT-class totals — with `CasDedupCacheHits`/`CasDedupCacheMisses` as the hit-r
 (per-LOOKUP rates: `putBlob` probes the cache at more than one point, so this is not a per-blob
 dedup rate).
 
+**Measured decision (2026-07-14): keep the 64 MiB default; no factory-default flip.** Three
+10-minute phase-3 soaks, same seed (`20260714`), one variable each (the §1-built binary), combined
+`ch1+ch2` `system.metric_log` sums (full report: `.superpowers/sdd/opt-task-3-report.md`):
+
+| `dedup_cache_bytes` | `CasBlobHead` | `CasBlobBodyPutAvoided` | PUT-class (`Put`+`PutDedup`) | hit-rate |
+|---|---|---|---|---|
+| 67108864 (64 MiB, default) | 766,282 | 105,791 | 79,837 | 72.42% |
+| 268435456 (256 MiB, ×4) | 768,296 | 105,833 | 78,719 | 72.68% |
+| 1073741824 (1 GiB, ×16) † | 522,718 | 100,193 | 76,469 | 72.18% |
+
+Rationale: the two clean full runs (64 MiB, 256 MiB) executed the identical workload (6298 vs 6299
+`InsertQuery`) yet `CasBlobBodyPutAvoided` (+0.04%), the PUT-class total (−1.4%, noise), `CasBlobHead`
+(+0.26%) and the hit-rate are all flat — the recycled-hash working set already fits in ≤64 MiB, so the
+current default sits past the diminishing-returns knee and a larger cache buys zero S3-op reduction.
+Since the chosen default equals the current default, the factory default
+(`MetadataStorageFactory.cpp:267`) is unchanged. († the ×16 run aborted early on a pre-existing
+chaos-recovery `unaccounted`-blob dryrun-subset flake, unrelated to the cache — `dangling=0`, no data
+loss; its absolute counters are deflated by early termination but its normalized rates match runs
+1-2, so it corroborates saturation.)
+
 ## §3 Configurable cache validation (user decision) {#s3-validate-setting}
 
 Facts established during brainstorm: every local ref mutation already pushes invalidation THROUGH
