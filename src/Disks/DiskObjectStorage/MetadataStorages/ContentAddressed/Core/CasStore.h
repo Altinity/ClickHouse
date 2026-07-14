@@ -211,11 +211,14 @@ struct PoolConfig
     /// blocking. Empty (the production default) sleeps for real.
     std::function<void(uint64_t)> wait_sleep_fn = {};   /// test hook for open/remount waits
 
-    /// Task 11 (spec §writer-snapshot-publication): a table becomes a publish candidate once its
-    /// PUBLISHABLE tail -- entries aged past `snapshot_min_log_age_ms` AND strictly above the newest
-    /// published snapshot -- exceeds either threshold (their count / the sum of their encoded bytes),
-    /// or right after recovery replays a tail already above one (the mount-time trigger). Publication
-    /// is background and never blocks an append (see `Store::maybeScheduleSnapshotPublish`).
+    /// rev.6 Task 10 (spec §publish-from-live): a table becomes a publish candidate once its retained
+    /// tail -- every applied txn strictly above the newest published snapshot, no age filter -- exceeds
+    /// either threshold (their count / the sum of their encoded bytes), or right after recovery replays
+    /// a tail already above one (the mount-time trigger). Publication is background and never blocks an
+    /// append (see `Store::maybeScheduleSnapshotPublish`). The grace-age holdback this trigger used to
+    /// apply (spec §Late Predecessor PUT) is gone by design: the Task 8 recovery-seal plus the Task 6
+    /// materialization wait (`materialization_grace_ms` above) already make a late-arriving predecessor
+    /// write born-covered for every observer, so a young txn has nothing left to wait out.
     /// The count default trades write-side PUT volume against read-side cold-fold cost: every publish
     /// re-encodes and PUTs the FULL snapshot, so a low threshold under sustained load degenerates into
     /// a near-continuous full-snapshot PUT stream, while on the read side a cold fold pays one GET per
@@ -223,14 +226,6 @@ struct PoolConfig
     /// than the snapshot churn it avoids.
     uint64_t snapshot_log_count_threshold = 256;
     uint64_t snapshot_log_bytes_threshold = 1ULL << 20;   /// 1 MiB
-    /// Grace age (spec §Late Predecessor PUT): a candidate snapshot id `X` never covers a log younger
-    /// than this many milliseconds -- documented wall-clock risk reduction for the cross-epoch race,
-    /// not a proof. This writer times its OWN appends exactly (`Store::bootMsNow()` at commit); a
-    /// mount-replayed (pre-existing) log's age is measured from this writer's OWN recovery-completion
-    /// time instead of its true creation time, since this backend generation's `list()` carries no
-    /// per-key last-modified timestamp (`ListedKey` has none) -- conservative: it can only DELAY a
-    /// replayed log's eligibility, never advance it prematurely.
-    uint64_t snapshot_min_log_age_ms = 5000;
     /// C4 (spec §writer-snapshot-publication): bounded per-table backoff arming a dispatch cooldown after
     /// a NON-Committed publish outcome (an S3 timeout / uncertain PUT). Without it, a saturated backend
     /// turns every ref read into a re-dispatched full-snapshot encode+PUT (the read-triggered PUT storm),
@@ -475,9 +470,9 @@ public:
     /// (idempotent) if not already cached. Used by `Build::precommitAdd`'s auto-birth guard.
     bool observedNamespaceCleanupMarker(const RootNamespace & ns, const RefTxnId & remove_txn_id);
 
-    /// Task 11 (spec §writer-snapshot-publication): the synchronous core of one publish attempt --
-    /// picks the newest grace-age-eligible candidate id `X` from the retained tail, encodes
-    /// `Replay(snapshot_base_state, tail through X)`, and `putIfAbsentControlled`s it. Returns true iff
+    /// rev.6 Task 10 (spec §publish-from-live): the synchronous core of one publish attempt -- copies
+    /// the live `RefTableState` ONCE under `state_mutex` (candidate `X` = the state's `greatest_applied`
+    /// at that instant, no replay), encodes it, and `putIfAbsentControlled`s it off the lock. Returns true iff
     /// a NEW snapshot was confirmed durable this call (false covers "nothing eligible yet", "nothing
     /// new to cover", and every non-Committed outcome -- all harmless per the Failure Handling table:
     /// "Snapshot create fails: keep all logs; writer recovery remains unchanged"). Public so tests can
@@ -651,35 +646,25 @@ private:
         uint64_t snapshot_budget = 0;
         uint64_t removal_budget = 0;
 
-        /// Task 11 (spec §writer-snapshot-publication): one applied txn strictly above
-        /// `newest_snapshot_id`, retained so a grace-age-eligible candidate `X <= greatest_applied` can
-        /// be replayed from `snapshot_base_state` without re-fetching anything. `observed_at_ms` is
-        /// this writer's own commit time (own appends) or the table's recovery-completion time
-        /// (mount-replayed logs -- see `PoolConfig::snapshot_min_log_age_ms`); `encoded_bytes` avoids
-        /// re-encoding on prune. Pruned up through `X` once a snapshot covering `X` is confirmed durable.
-        struct TailLogEntry
-        {
-            RefLogTxn txn;
-            uint64_t observed_at_ms = 0;
-            uint64_t encoded_bytes = 0;
-        };
-        std::vector<TailLogEntry> tail_since_snapshot;
-        /// ATOMIC (relaxed): `enforceRefTableCacheBudget`'s pre-candidacy `total` loop sums the weight of
+        /// rev.6 Task 10 (spec §publish-from-live): the count and encoded-byte sum of every applied txn
+        /// strictly above `newest_snapshot_id` -- the threshold trigger's inputs, and the exact amounts
+        /// a successful publish's adoption subtracts back out. No per-entry retention any more: the live
+        /// `state` above IS the publish candidate body (`trySnapshotPublishOnce` copies it directly), so
+        /// there is nothing left to replay a candidate forward from. Both ATOMIC (relaxed) for the same
+        /// cross-lock `total`-loop read `enforceRefTableCacheBudget`'s pre-candidacy pass performs on
         /// EVERY cached table under `ref_queue_mutex` alone -- including hot tables whose append lane
-        /// (holding only `state_mutex`) is concurrently mutating this field. That cross-lock read is a
+        /// (holding only `state_mutex`) is concurrently mutating these fields. That cross-lock read is a
         /// data race on a plain `uint64_t` (formal UB, TSan-detectable); an atomic makes it well-defined.
         /// The gated candidate loop and every other reader/writer already hold `state_mutex`, so relaxed
-        /// ordering is sufficient (this counter carries no happens-before for other state).
+        /// ordering is sufficient (these counters carry no happens-before for other state).
+        std::atomic<uint64_t> tail_count_since_snapshot{0};
         std::atomic<uint64_t> tail_bytes_since_snapshot{0};
-        /// The state as of `newest_snapshot_id` (the never-born/empty state if this table has never had
-        /// a snapshot published) -- the base every `tail_since_snapshot` entry replays forward from.
-        RefTableState snapshot_base_state;
         std::optional<RefTxnId> newest_snapshot_id;
         /// Task 13 (spec §Byte, Memory, And CPU Budget): whole-table cache-weight bookkeeping for
-        /// `enforceRefTableCacheBudget`. `base_snapshot_bytes` is the encoded body size of
-        /// `snapshot_base_state`'s snapshot (0 for a never-born base), captured for free from the
-        /// recovered/published snapshot body -- refreshed only when the base changes (recovery + each
-        /// publish), never per mutation. The estimated resident weight is
+        /// `enforceRefTableCacheBudget`. `base_snapshot_bytes` is the encoded body size of the snapshot
+        /// at `newest_snapshot_id` (0 for a never-published table), captured for free from the
+        /// recovered/published snapshot body -- refreshed only when that snapshot changes (recovery +
+        /// each publish), never per mutation. The estimated resident weight is
         /// `base_snapshot_bytes + tail_bytes_since_snapshot`. `base_snapshot_bytes` is ATOMIC (relaxed)
         /// for the same cross-lock `total`-loop read as `tail_bytes_since_snapshot` above. `last_touch_tick`
         /// is the monotonic access stamp (`Store::ref_table_access_tick`) used to evict least-recently-

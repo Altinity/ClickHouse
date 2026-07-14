@@ -43,7 +43,6 @@ extern const Event CasRefSnapshotPutBytes;
 extern const Event CasRefSnapshotTailLogs;
 extern const Event CasRefSnapshotPublishDispatched;
 extern const Event CasRefSnapshotPublishBackoff;
-extern const Event CasRefLatePredecessorObserved;
 extern const Event CasConditionalWriteFenceLostPostWrite;
 extern const Event CasRefRecoverySealPublished;
 }
@@ -936,7 +935,6 @@ TEST(RefWriterSnapshotPublish, ThresholdTriggerPublishesCacheReplayEquivalentByt
     PoolConfig config;
     config.snapshot_log_count_threshold = 3;
     config.snapshot_log_bytes_threshold = 1ULL << 40;
-    config.snapshot_min_log_age_ms = 0;
     auto store = openStoreWithConfig(backend, config);
     const RootNamespace ns{"srv1/threshold_publish"};
 
@@ -973,7 +971,6 @@ TEST(RefWriterSnapshotPublish, PublishIncrementsSnapshotCounters)
     PoolConfig config;
     config.snapshot_log_count_threshold = 3;
     config.snapshot_log_bytes_threshold = 1ULL << 40;
-    config.snapshot_min_log_age_ms = 0;
     auto store = openStoreWithConfig(backend, config);
     const RootNamespace ns{"srv1/counter_publish"};
 
@@ -1007,7 +1004,6 @@ TEST(RefWriterSnapshotPublish, MountTimeTriggerPublishesAfterRecoveryReplaysLarg
     PoolConfig config;
     config.snapshot_log_count_threshold = 3;
     config.snapshot_log_bytes_threshold = 1ULL << 40;
-    config.snapshot_min_log_age_ms = 0;
     auto successor = openStoreWithConfig(backend, config);
 
     /// A mere READ triggers recovery; recovery alone must dispatch the mount-time publish (the table is
@@ -1025,65 +1021,96 @@ TEST(RefWriterSnapshotPublish, MountTimeTriggerPublishesAfterRecoveryReplaysLarg
     EXPECT_EQ(got->bytes, encodeRefTableSnapshot(snapshotOf(oracle, ns.string())));
 }
 
-/// Grace age (spec §Late Predecessor PUT): a candidate id never covers a log younger than
-/// `snapshot_min_log_age_ms`. Drives `trySnapshotPublishOnce` directly (bypassing thresholds/background
-/// dispatch entirely) against an injected fake clock for a fully deterministic age check.
-TEST(RefWriterSnapshotPublish, GraceAgeRespectedYoungLogNotCovered)
+/// ===================================================================================
+/// rev.6 Task 10 (spec §publish-from-live): the grace-window machinery
+/// (`snapshot_min_log_age_ms`, the tail-replay-from-`snapshot_base_state` copy-once path,
+/// `CasRefLatePredecessorObserved`) is DELETED. The Task 8 recovery-seal plus the Task 6
+/// materialization wait already make a late-arriving predecessor write born-covered for every
+/// observer by the time this writer could ever see it, so a young committed txn has nothing left to
+/// wait out -- it is immediately publish-eligible, with no time manipulation anywhere below.
+/// ===================================================================================
+
+/// A just-committed txn is covered by a publish forced immediately afterward -- no fake clock, no
+/// aging, no waiting: the OLD grace-window code would have published nothing here at all.
+TEST(RefWriterPublishFromLive, YoungTxnIsCoveredImmediately)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     const Layout layout("p");
-    const RootNamespace ns{"srv1/grace_age"};
-    uint64_t fake_now = 1000;
+    const RootNamespace ns{"srv1/publish_from_live_young"};
+    auto store = openStore(backend);
 
-    PoolConfig config;
-    config.snapshot_min_log_age_ms = 60000;
-    config.boot_ms_fn = [&fake_now] { return fake_now; };
-    /// The local write fence's deadline is ALSO measured off this same fake clock (armed at open as
-    /// `bootMsNow() + mount_lease_ttl_ms`); widen it well past the clock jump below so advancing the
-    /// fake clock to exercise the grace age does not ALSO trip the (unrelated) mount-lease fence.
-    config.mount_lease_ttl_ms = std::chrono::milliseconds(10'000'000);
-    auto store = openStoreWithConfig(backend, config);
+    /// Setup: birth the namespace and add a precommit (not the txn under test).
+    auto build = startBuildFor(store, ns, "a");
+    const ManifestId id = build->stageManifest({});
+    build->precommitAdd(ns, "a", id);
 
-    publishEmptyPart(store, ns, "a");   /// both commits stamped observed_at_ms = 1000
+    /// The ONE committed txn under test.
+    build->promote(ns, "a", build->buildId(), id);
 
-    EXPECT_FALSE(store->trySnapshotPublishOnce(ns)) << "every tail entry is still within the grace window";
-    EXPECT_FALSE(listGreatestSnapshotIdForTest(*backend, layout, ns).has_value());
-
-    fake_now += 61000;   /// past the 60s grace window
-    EXPECT_TRUE(store->trySnapshotPublishOnce(ns));
+    ASSERT_TRUE(store->trySnapshotPublishOnce(ns))
+        << "publish-from-live: a just-committed txn is immediately coverable, with no grace window";
     const auto snap_id = listGreatestSnapshotIdForTest(*backend, layout, ns);
     ASSERT_TRUE(snap_id.has_value());
-    EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), 0u);
+    const auto got = backend->get(layout.refSnapshotKey(ns, *snap_id));
+    ASSERT_TRUE(got.has_value());
+    const RefTableSnapshot snap = decodeRefTableSnapshot(got->bytes, ns.string(), *snap_id);
+    ASSERT_EQ(snap.committed.size(), 1u);
+    EXPECT_EQ(snap.committed.front().ref_name, "a")
+        << "the published snapshot body contains the just-promoted row";
 }
 
-/// B4: the Late-Predecessor-PUT observability counter. The min-log-age grace window holds a young
-/// tail region out of a candidate snapshot so a late predecessor append from a fenced epoch can
-/// still land before a snapshot covers it; each engaged window must be counted exactly once. Uses
-/// the fake-clock fixture (same as GraceAgeRespectedYoungLogNotCovered) for a deterministic age.
-TEST(RefWriterSnapshotPublish, LatePredecessorCounterCountsGraceWindowHoldback)
+/// The count trigger fires purely off the tail counters -- no aging involved -- even under a boot
+/// clock that never advances (the old code REQUIRED aging past `snapshot_min_log_age_ms` to fire).
+TEST(RefWriterSnapshotPublish, TriggerFiresOnCountAboveThresholdWithoutAging)
 {
     using ProfileEvents::global_counters;
     auto backend = std::make_shared<RefWriterTestBackend>();
-    const RootNamespace ns{"srv1/late_pred_counter"};
-    uint64_t fake_now = 1000;
+    const RootNamespace ns{"srv1/publish_from_live_trigger"};
+    uint64_t fake_now = 1'000'000;   /// frozen: never advances
 
     PoolConfig config;
-    config.snapshot_min_log_age_ms = 60000;
+    config.snapshot_log_count_threshold = 3;
+    config.snapshot_log_bytes_threshold = 1ULL << 40;
     config.boot_ms_fn = [&fake_now] { return fake_now; };
-    config.mount_lease_ttl_ms = std::chrono::milliseconds(10'000'000);   /// keep the write fence open
+    config.mount_lease_ttl_ms = std::chrono::milliseconds(10'000'000);
     auto store = openStoreWithConfig(backend, config);
 
-    publishEmptyPart(store, ns, "a");   /// tail stamped observed_at_ms = 1000 (younger than 60s)
+    const auto before = global_counters[ProfileEvents::CasRefSnapshotPublishDispatched].load();
+    publishEmptyPart(store, ns, "a");   /// tail: 2
+    publishEmptyPart(store, ns, "b");   /// tail: 4 > 3 -> dispatches, clock frozen throughout
+    store->waitForSnapshotPublishSettleForTest(ns);
 
-    const auto before = global_counters[ProfileEvents::CasRefLatePredecessorObserved].load();
-    EXPECT_FALSE(store->trySnapshotPublishOnce(ns));   /// young tail => grace window engages
-    EXPECT_EQ(global_counters[ProfileEvents::CasRefLatePredecessorObserved].load(), before + 1)
-        << "an engaged grace window must be counted exactly once per attempt";
+    EXPECT_GT(global_counters[ProfileEvents::CasRefSnapshotPublishDispatched].load(), before)
+        << "the count trigger must fire without any aging, even under a frozen clock";
+}
 
-    fake_now += 61000;   /// past the grace window: nothing is held back
-    EXPECT_TRUE(store->trySnapshotPublishOnce(ns));
-    EXPECT_EQ(global_counters[ProfileEvents::CasRefLatePredecessorObserved].load(), before + 1)
-        << "no young entry => no holdback => counter unchanged";
+/// Adoption subtracts EXACTLY the counters captured at copy time, not whatever the counters read at
+/// adoption time: while a publish's PUT is in flight (captured count/bytes fixed), more commits land
+/// on the live counters. After adoption, the counters must equal precisely the amount appended AFTER
+/// the copy -- not zero (would drop the new txns from the next publish trigger) and not negative/
+/// wrapped (an unsigned underflow).
+TEST(RefWriterSnapshotPublish, AdoptionSubtractsCapturedCountersUnderConcurrentAppends)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const RootNamespace ns{"srv1/publish_from_live_adoption"};
+    auto store = openStore(backend);
+
+    publishEmptyPart(store, ns, "a");
+    ASSERT_EQ(store->tailSinceSnapshotCountForTest(ns), 2u);
+
+    backend->armPutBlock("_snap/");
+    std::thread publisher([&] { store->trySnapshotPublishOnce(ns); });
+    backend->awaitBlockEntered();   /// the candidate (count=2) is captured; the PUT is now in flight, no lock held
+
+    publishEmptyPart(store, ns, "b");   /// +2 more commits land WHILE the publish's PUT is in flight
+    EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), 4u);
+
+    backend->releaseBlock();
+    publisher.join();
+
+    EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), 2u)
+        << "adoption must subtract only the CAPTURED count (2), leaving exactly the 2 txns appended "
+           "after the copy";
 }
 
 /// Publication must never block a concurrent append on the SAME table (spec: "Publication is
@@ -1097,7 +1124,6 @@ TEST(RefWriterSnapshotPublish, PublicationNeverBlocksConcurrentAppend)
     PoolConfig config;
     config.snapshot_log_count_threshold = 3;
     config.snapshot_log_bytes_threshold = 1ULL << 40;
-    config.snapshot_min_log_age_ms = 0;
     auto store = openStoreWithConfig(backend, config);
 
     backend->armPutBlock("_snap/");
@@ -1133,7 +1159,6 @@ TEST(RefWriterSnapshotPublish, PublishThreadOutlivesDroppedStoreHandleWithoutCra
     PoolConfig config;
     config.snapshot_log_count_threshold = 3;
     config.snapshot_log_bytes_threshold = 1ULL << 40;
-    config.snapshot_min_log_age_ms = 0;
     auto store = openStoreWithConfig(backend, config);
 
     backend->armPutBlock("_snap/");
@@ -1154,10 +1179,11 @@ TEST(RefWriterSnapshotPublish, PublishThreadOutlivesDroppedStoreHandleWithoutCra
 
 /// Review (T11) — CRITICAL: publishes are NOT serialized, so two overlapping attempts can finish out of
 /// order. An OLDER-candidate publish that lands its `_snap` PUT AFTER a newer one already adopted must
-/// NOT regress the in-memory snapshot base/newest back to its older id: doing so drops the txns
-/// committed in between from base+tail, so the NEXT published snapshot silently omits committed
-/// transactions and recovery loses refs. Deterministic, sleep-free: the fake backend blocks publish #1's
-/// PUT (capturing exactly its key) while a higher-id publish #2 runs to completion, then unblocks #1.
+/// NOT regress `newest_snapshot_id` back to its older id, and its (monotonically-skipped) adoption must
+/// NOT touch the tail counters a newer attempt already reset -- either would drop the txns committed in
+/// between, so the NEXT published snapshot would silently omit committed transactions and recovery
+/// would lose refs. Deterministic, sleep-free: the fake backend blocks publish #1's PUT (capturing
+/// exactly its key) while a higher-id publish #2 runs to completion, then unblocks #1.
 TEST(RefWriterSnapshotPublish, ConcurrentOutOfOrderPublishDoesNotRegressBaseNorDropCommittedTxns)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
@@ -1165,10 +1191,9 @@ TEST(RefWriterSnapshotPublish, ConcurrentOutOfOrderPublishDoesNotRegressBaseNorD
     const RootNamespace ns{"srv1/concurrent_publish_monotonic"};
     PoolConfig config;
     /// High thresholds: NO automatic background dispatch -- we drive `trySnapshotPublishOnce` directly
-    /// (mirrors GraceAge) for full determinism. Grace age 0 so every tail entry is immediately eligible.
+    /// for full determinism.
     config.snapshot_log_count_threshold = 1ULL << 40;
     config.snapshot_log_bytes_threshold = 1ULL << 40;
-    config.snapshot_min_log_age_ms = 0;
     auto store = openStoreWithConfig(backend, config);
 
     publishEmptyPart(store, ns, "a");   /// tail: 2 (birth+add, promote)
@@ -1182,14 +1207,16 @@ TEST(RefWriterSnapshotPublish, ConcurrentOutOfOrderPublishDoesNotRegressBaseNorD
     backend->awaitBlockEntered();   /// #1 is parked mid-PUT on `_snap/<older>`, holding no lock
 
     /// While #1 is parked, commit more txns and run publish #2 to COMPLETION: it PUTs a strictly higher
-    /// `_snap/<newer>` (unblocked) and adopts it as the base.
+    /// `_snap/<newer>` (unblocked) and adopts it, resetting the tail counters through its own candidate.
     publishEmptyPart(store, ns, "c");
     ASSERT_TRUE(store->trySnapshotPublishOnce(ns));
     const auto newest_after_2 = store->newestPublishedSnapshotIdForTest(ns);
     ASSERT_TRUE(newest_after_2.has_value());
+    ASSERT_EQ(store->tailSinceSnapshotCountForTest(ns), 0u) << "publish #2 covers everything committed so far";
 
-    /// Release #1: on the BUGGY code it now adopts its OLDER candidate, regressing newest below #2 and
-    /// dropping "c"'s txns from base+tail. The monotonic guard must skip that adoption.
+    /// Release #1: on the BUGGY code it now adopts its OLDER candidate, regressing newest below #2
+    /// and/or double-subtracting from the counters #2 already reset. The monotonic guard must skip
+    /// that adoption entirely -- both the `newest_snapshot_id` write and the counter subtraction.
     backend->releaseBlock();
     publisher1.join();
 
@@ -1197,6 +1224,9 @@ TEST(RefWriterSnapshotPublish, ConcurrentOutOfOrderPublishDoesNotRegressBaseNorD
     ASSERT_TRUE(newest_after_1.has_value());
     EXPECT_FALSE(*newest_after_1 < *newest_after_2)
         << "a late-finishing OLDER publish must not regress newest_snapshot_id below the adopted newer one";
+    EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), 0u)
+        << "publish #1's skipped (monotonically-superseded) adoption must not subtract from counters "
+           "publish #2 already reset -- an unguarded subtraction here would corrupt or underflow them";
 
     /// Independent proof no committed txn was lost: the NEXT publish's bytes must equal a full log replay.
     /// A regressed base would omit the txns committed while publish #1 was parked.
@@ -1214,10 +1244,9 @@ TEST(RefWriterSnapshotPublish, ConcurrentOutOfOrderPublishDoesNotRegressBaseNorD
 /// ===================================================================================
 /// C4: bound the read-triggered snapshot-publish dispatch (spec §writer-snapshot-publication). A
 /// fold-heavy reader must not turn every ref read into a re-dispatched full-snapshot encode+PUT: an
-/// in-flight gate admits at most one publish per table, a candidate that has not advanced is skipped,
-/// and a non-Committed outcome arms a bounded per-table backoff instead of re-triggering on the next
-/// read. The unfixed code dispatched a new publish on every trigger and never backed off, producing
-/// the soak's 46 GB/hr `_snap` PUT storm.
+/// in-flight gate admits at most one publish per table, and a non-Committed outcome arms a bounded
+/// per-table backoff instead of re-triggering on the next read. The unfixed code dispatched a new
+/// publish on every trigger and never backed off, producing the soak's 46 GB/hr `_snap` PUT storm.
 /// ===================================================================================
 
 /// Under a saturated backend (every `_snap` PUT is Unresolved), the read path must NOT re-dispatch a
@@ -1238,7 +1267,6 @@ TEST(RefWriterSnapshotPublish, C4LatchBoundedUnderSustainedNonCommittedPublish)
     PoolConfig config;
     config.snapshot_log_count_threshold = 1;
     config.snapshot_log_bytes_threshold = 1ULL << 40;
-    config.snapshot_min_log_age_ms = 0;
     config.snapshot_publish_backoff_initial_ms = 5000;   /// the frozen clock keeps the backoff armed
     config.mount_lease_ttl_ms = std::chrono::milliseconds(10'000'000);
     config.boot_ms_fn = [&fake_now] { return fake_now; };
@@ -1271,7 +1299,6 @@ TEST(RefWriterSnapshotPublish, C4InFlightGateAdmitsAtMostOne)
     PoolConfig config;
     config.snapshot_log_count_threshold = 0;   /// any nonempty tail triggers
     config.snapshot_log_bytes_threshold = 1ULL << 40;
-    config.snapshot_min_log_age_ms = 0;
     auto store = openStoreWithConfig(backend, config);
 
     publishEmptyPart(store, ns, "a");
@@ -1293,34 +1320,6 @@ TEST(RefWriterSnapshotPublish, C4InFlightGateAdmitsAtMostOne)
     store->waitForSnapshotPublishSettleForTest(ns);
 }
 
-/// When no grace-eligible tail entry has advanced past the newest snapshot (here: the whole tail is
-/// still within the grace window), the trigger must be SKIPPED at dispatch -- not dispatched to a
-/// publisher that would find nothing to cover and re-latch the trigger.
-TEST(RefWriterSnapshotPublish, C4NoAdvanceCandidateSkipsDispatch)
-{
-    using ProfileEvents::global_counters;
-    auto backend = std::make_shared<RefWriterTestBackend>();
-    const Layout layout("p");
-    const RootNamespace ns{"srv1/c4_noadvance"};
-    uint64_t fake_now = 1'000'000;
-    PoolConfig config;
-    config.snapshot_log_count_threshold = 1;
-    config.snapshot_log_bytes_threshold = 1ULL << 40;
-    config.snapshot_min_log_age_ms = 60000;   /// grace large: no tail entry is eligible yet
-    config.mount_lease_ttl_ms = std::chrono::milliseconds(10'000'000);
-    config.boot_ms_fn = [&fake_now] { return fake_now; };
-    auto store = openStoreWithConfig(backend, config);
-
-    publishEmptyPart(store, ns, "a");   /// 2 tail entries > threshold, but all within the grace window
-    const auto before = global_counters[ProfileEvents::CasRefSnapshotPublishDispatched].load();
-    for (int i = 0; i < 10; ++i)
-        store->resolveRef(ns, "a");
-    store->waitForSnapshotPublishSettleForTest(ns);
-    EXPECT_EQ(global_counters[ProfileEvents::CasRefSnapshotPublishDispatched].load(), before)
-        << "no publish is dispatched while no grace-eligible candidate advances past the newest snapshot";
-    EXPECT_FALSE(listGreatestSnapshotIdForTest(*backend, layout, ns).has_value());
-}
-
 /// A non-Committed publish defers the next dispatch by the backoff, then a read past the backoff
 /// deadline dispatches exactly one retry that publishes a durable snapshot (freshness preserved).
 TEST(RefWriterSnapshotPublish, C4BackoffDefersThenRetriesAndPublishes)
@@ -1340,7 +1339,6 @@ TEST(RefWriterSnapshotPublish, C4BackoffDefersThenRetriesAndPublishes)
     PoolConfig config;
     config.snapshot_log_count_threshold = 1;
     config.snapshot_log_bytes_threshold = 1ULL << 40;
-    config.snapshot_min_log_age_ms = 0;
     config.snapshot_publish_backoff_initial_ms = 1000;
     config.mount_lease_ttl_ms = std::chrono::milliseconds(10'000'000);
     config.boot_ms_fn = [&fake_now] { return fake_now; };
@@ -1374,139 +1372,51 @@ TEST(RefWriterSnapshotPublish, C4BackoffDefersThenRetriesAndPublishes)
 }
 
 /// ===================================================================================
-/// Publish-trigger arithmetic: only aged + uncovered entries count (spec
-/// §writer-snapshot-publication). A raw-tail-size trigger degenerates under sustained
-/// load: the grace window keeps a permanent floor of young entries in the tail, so the
-/// raw trigger is continuously true and a FULL snapshot encode+PUT is dispatched per
-/// publish latency (a measured 20-26 GB/h of `_snap` PUTs per node at ~23 txn/s).
+/// rev.6 Task 10 (spec §publish-from-live): the tail counters count ONLY applied txns strictly above
+/// `newest_snapshot_id` -- incremented per commit, subtracted (clamped) exactly by adoption. This
+/// pins that a successful publish's adoption RESETS the counters rather than merely reducing them: a
+/// buggy "subtract a fixed prune count" scheme could let the table's already-covered history keep
+/// contributing to the trigger forever.
 /// ===================================================================================
 
-/// A tail above the count threshold in which EVERY entry is still younger than the grace age must not
-/// dispatch: nothing is publishable yet, so a dispatch could only burn a full-snapshot encode for
-/// nothing. The trigger arithmetic itself (not merely the candidate-advance skip) must see zero.
-TEST(RefWriterSnapshotPublish, TriggerIgnoresYoungTailAboveCountThreshold)
-{
-    using ProfileEvents::global_counters;
-    auto backend = std::make_shared<RefWriterTestBackend>();
-    const Layout layout("p");
-    const RootNamespace ns{"srv1/trigger_young_tail"};
-    uint64_t fake_now = 1'000'000;
-    PoolConfig config;
-    config.snapshot_log_count_threshold = 3;
-    config.snapshot_log_bytes_threshold = 1ULL << 40;
-    config.snapshot_min_log_age_ms = 60000;
-    config.mount_lease_ttl_ms = std::chrono::milliseconds(10'000'000);
-    config.boot_ms_fn = [&fake_now] { return fake_now; };
-    auto store = openStoreWithConfig(backend, config);
-
-    const auto before = global_counters[ProfileEvents::CasRefSnapshotPublishDispatched].load();
-    publishEmptyPart(store, ns, "a");   /// tail: 2 (birth+add, promote), all stamped "now"
-    publishEmptyPart(store, ns, "b");   /// tail: 4 > 3, but every entry is younger than the grace age
-    for (int i = 0; i < 5; ++i)
-        store->resolveRef(ns, "a");     /// read-triggered evaluations must all decline too
-    store->waitForSnapshotPublishSettleForTest(ns);
-
-    EXPECT_EQ(global_counters[ProfileEvents::CasRefSnapshotPublishDispatched].load(), before)
-        << "an all-young tail above the count threshold must not dispatch a publish";
-    EXPECT_EQ(store->pendingSnapshotPublishesForTest(ns), 0);
-    EXPECT_FALSE(listGreatestSnapshotIdForTest(*backend, layout, ns).has_value())
-        << "no snapshot PUT may reach the backend while nothing is publishable";
-    EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), 4u);
-}
-
-/// The sustained-load degeneracy itself: a below-threshold AGED prefix under an above-threshold raw
-/// tail (the permanent young floor) must NOT dispatch -- the raw-size trigger would, covering only the
-/// two aged entries with a full snapshot PUT. Once a full threshold's worth of entries has aged, one
-/// dispatch publishes and covers the whole aged tail (the batching the threshold exists for).
-TEST(RefWriterSnapshotPublish, TriggerNotLatchedBySustainedLoadYoungFloor)
-{
-    using ProfileEvents::global_counters;
-    auto backend = std::make_shared<RefWriterTestBackend>();
-    const Layout layout("p");
-    const RootNamespace ns{"srv1/trigger_young_floor"};
-    uint64_t fake_now = 1'000'000;
-    PoolConfig config;
-    config.snapshot_log_count_threshold = 4;
-    config.snapshot_log_bytes_threshold = 1ULL << 40;
-    config.snapshot_min_log_age_ms = 60000;
-    config.mount_lease_ttl_ms = std::chrono::milliseconds(10'000'000);
-    config.boot_ms_fn = [&fake_now] { return fake_now; };
-    auto store = openStoreWithConfig(backend, config);
-
-    const auto before = global_counters[ProfileEvents::CasRefSnapshotPublishDispatched].load();
-    publishEmptyPart(store, ns, "a");   /// 2 entries stamped t0
-    fake_now += 120'000;                /// t1: the 2 old entries age past the grace window
-    publishEmptyPart(store, ns, "b");   /// +2 young entries (stamped t1)
-    publishEmptyPart(store, ns, "c");   /// +2 young: raw tail = 6 > 4, yet aged+uncovered = 2 <= 4
-    for (int i = 0; i < 5; ++i)
-        store->resolveRef(ns, "a");
-    store->waitForSnapshotPublishSettleForTest(ns);
-
-    EXPECT_EQ(global_counters[ProfileEvents::CasRefSnapshotPublishDispatched].load(), before)
-        << "a young floor above the raw-size threshold must not dispatch while the aged prefix is below it";
-    EXPECT_FALSE(listGreatestSnapshotIdForTest(*backend, layout, ns).has_value());
-    EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), 6u);
-
-    fake_now += 120'000;                /// t2: all 6 entries aged; all sit above the (absent) newest snapshot
-    store->resolveRef(ns, "a");
-    store->waitForSnapshotPublishSettleForTest(ns);
-    EXPECT_EQ(global_counters[ProfileEvents::CasRefSnapshotPublishDispatched].load(), before + 1)
-        << "once a threshold's worth of entries aged, exactly one dispatch publishes";
-    EXPECT_TRUE(listGreatestSnapshotIdForTest(*backend, layout, ns).has_value());
-    EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), 0u)
-        << "the one publish covers the whole aged tail (batched, not one PUT per few aged entries)";
-}
-
-/// Entries at/below `newest_snapshot_id` contribute NOTHING to the trigger: after a successful publish
-/// the arithmetic restarts from zero above the newest snapshot instead of counting the table's covered
-/// history. (The append lane and recovery both keep the retained tail strictly above the newest
-/// snapshot -- recovery drops covered logs, adoption prunes through the candidate -- so the per-entry
-/// uncovered check in the trigger is the defensive mirror of that invariant; this test pins the
-/// observable arithmetic: 4 covered + 2 fresh aged entries is NOT 6 > 3, it is 2 <= 3.)
+/// After a successful publish adopts `newest_snapshot_id`, the trigger arithmetic must restart from
+/// zero above it, not keep counting the table's already-covered history: 4 covered + 2 fresh entries
+/// must read as 2 (below a 3 threshold), never as 6.
 TEST(RefWriterSnapshotPublish, TriggerIgnoresEntriesCoveredByNewestSnapshot)
 {
     using ProfileEvents::global_counters;
     auto backend = std::make_shared<RefWriterTestBackend>();
     const Layout layout("p");
     const RootNamespace ns{"srv1/trigger_covered"};
-    uint64_t fake_now = 1'000'000;
     PoolConfig config;
     config.snapshot_log_count_threshold = 3;
     config.snapshot_log_bytes_threshold = 1ULL << 40;
-    config.snapshot_min_log_age_ms = 60000;
-    config.mount_lease_ttl_ms = std::chrono::milliseconds(10'000'000);
-    config.boot_ms_fn = [&fake_now] { return fake_now; };
     auto store = openStoreWithConfig(backend, config);
 
-    /// Drive ONE successful publish: 4 entries, all aged and uncovered (4 > 3).
+    const auto d0 = global_counters[ProfileEvents::CasRefSnapshotPublishDispatched].load();
+
+    /// Drive ONE successful publish: 4 entries (4 > 3).
     publishEmptyPart(store, ns, "a");
     publishEmptyPart(store, ns, "b");
-    fake_now += 120'000;
-    const auto d0 = global_counters[ProfileEvents::CasRefSnapshotPublishDispatched].load();
-    store->resolveRef(ns, "a");
     store->waitForSnapshotPublishSettleForTest(ns);
     ASSERT_EQ(global_counters[ProfileEvents::CasRefSnapshotPublishDispatched].load(), d0 + 1);
     const auto first_snap = listGreatestSnapshotIdForTest(*backend, layout, ns);
     ASSERT_TRUE(first_snap.has_value());
     EXPECT_EQ(store->newestPublishedSnapshotIdForTest(ns), first_snap);
+    ASSERT_EQ(store->tailSinceSnapshotCountForTest(ns), 0u);
 
-    /// 2 fresh aged entries: uncovered count = 2 <= 3, while the covered history (4 entries at/below
-    /// the snapshot) would push a covered-counting trigger to 6 > 3. Reads must not dispatch.
+    /// 2 fresh entries: 2 <= 3, while the covered history (4 entries at/below the snapshot) would push
+    /// a covered-counting trigger to 6 > 3. Must not dispatch.
     publishEmptyPart(store, ns, "c");
-    fake_now += 120'000;
-    for (int i = 0; i < 5; ++i)
-        store->resolveRef(ns, "c");
     store->waitForSnapshotPublishSettleForTest(ns);
     EXPECT_EQ(global_counters[ProfileEvents::CasRefSnapshotPublishDispatched].load(), d0 + 1)
         << "entries covered by the newest snapshot must not count toward the trigger";
     EXPECT_EQ(listGreatestSnapshotIdForTest(*backend, layout, ns), first_snap);
     EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), 2u);
 
-    /// Crossing the threshold with UNCOVERED aged entries alone (4 > 3) dispatches exactly one more
-    /// publish, and it covers the whole uncovered tail.
+    /// Crossing the threshold with the fresh tail alone (4 > 3) dispatches exactly one more publish,
+    /// and it covers the whole uncovered tail.
     publishEmptyPart(store, ns, "d");
-    fake_now += 120'000;
-    store->resolveRef(ns, "c");
     store->waitForSnapshotPublishSettleForTest(ns);
     EXPECT_EQ(global_counters[ProfileEvents::CasRefSnapshotPublishDispatched].load(), d0 + 2);
     const auto second_snap = listGreatestSnapshotIdForTest(*backend, layout, ns);

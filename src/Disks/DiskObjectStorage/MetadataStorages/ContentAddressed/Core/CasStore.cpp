@@ -51,7 +51,6 @@ namespace ProfileEvents
     extern const Event CasRefSnapshotTailLogs;
     extern const Event CasRefSnapshotPublishDispatched;
     extern const Event CasRefSnapshotPublishBackoff;
-    extern const Event CasRefLatePredecessorObserved;
     extern const Event CasRefRecoverySealPublished;
     extern const Event CasDedupCacheHits;
     extern const Event CasDedupCacheMisses;
@@ -1255,9 +1254,9 @@ void Store::ensureRefTableRecovered(const RootNamespace & ns, RefTableRuntime & 
             ProfileEvents::increment(ProfileEvents::CasRefRecoverySealPublished);
 
             /// The seal now covers everything replayed so far: feed it into the SAME bookkeeping below
-            /// (`rt.newest_snapshot_id`, `snapshot_base_state`, `tail_since_snapshot`, cache weight) as
-            /// if it were the recovered snapshot and the tail were empty -- exactly what a fresh
-            /// recovery against the now-durable seal would find.
+            /// (`rt.newest_snapshot_id`, the tail counters, cache weight) as if it were the recovered
+            /// snapshot and the tail were empty -- exactly what a fresh recovery against the now-durable
+            /// seal would find.
             snapshot = std::move(seal);
             tail.clear();
             tail_bytes.clear();
@@ -1266,20 +1265,16 @@ void Store::ensureRefTableRecovered(const RootNamespace & ns, RefTableRuntime & 
 
         rt.recovered = true;
 
-        /// Task 11 (spec §writer-snapshot-publication): seed the tail-since-snapshot bookkeeping from
-        /// this SAME recovery pass -- `snapshot_base_state` is the state as of the recovered snapshot
-        /// alone (an empty tail replay), and every log strictly above it is retained with THIS writer's
-        /// own recovery-completion time as its (deliberately conservative) "observed at" stamp.
-        rt.snapshot_base_state = replay(snapshot, {});
+        /// rev.6 Task 10 (spec §publish-from-live): seed the tail counters from this SAME recovery
+        /// pass -- `rt.state` above already IS `Replay(snapshot, tail)` (the mount-time trigger's
+        /// candidate body needs no separate base+tail bookkeeping any more), so only the count and byte
+        /// sum of the logs strictly above the recovered snapshot need seeding.
         rt.newest_snapshot_id = snapshot ? std::optional<RefTxnId>(snapshot->snapshot_id) : std::nullopt;
-        rt.tail_since_snapshot.clear();
-        rt.tail_bytes_since_snapshot.store(0, std::memory_order_relaxed);
-        const uint64_t mount_now = bootMsNow();
-        for (size_t i = 0; i < tail.size(); ++i)
-        {
-            rt.tail_since_snapshot.push_back(RefTableRuntime::TailLogEntry{tail[i], mount_now, tail_bytes[i]});
-            rt.tail_bytes_since_snapshot.fetch_add(tail_bytes[i], std::memory_order_relaxed);
-        }
+        rt.tail_count_since_snapshot.store(tail.size(), std::memory_order_relaxed);
+        uint64_t seeded_tail_bytes = 0;
+        for (uint64_t bytes : tail_bytes)
+            seeded_tail_bytes += bytes;
+        rt.tail_bytes_since_snapshot.store(seeded_tail_bytes, std::memory_order_relaxed);
         /// Task 11 (spec §Clean Up Old Precommits): dispatched once, from `appendRefOps`'s top level
         /// (never from here -- this call may itself be nested inside a queue leader's flush stack).
         rt.needs_stale_precommit_sweep = true;
@@ -2010,9 +2005,10 @@ void Store::flushRefBatch(const RootNamespace & ns, const std::shared_ptr<RefTab
             {
                 std::lock_guard lock(rt->state_mutex);
                 applyRefLogTxn(rt->state, final_txn);
-                /// Task 11: this commit's own txn joins the retained tail-since-snapshot (this
-                /// writer's exact append time, per PoolConfig::snapshot_min_log_age_ms's contract).
-                rt->tail_since_snapshot.push_back(RefTableRuntime::TailLogEntry{final_txn, bootMsNow(), bytes.size()});
+                /// rev.6 Task 10 (spec §publish-from-live): this commit's own txn joins the
+                /// applied-above-newest-snapshot tail counters -- the live `rt->state` just mutated
+                /// above IS the next publish candidate's body, so there is no per-entry log to retain.
+                rt->tail_count_since_snapshot.fetch_add(1, std::memory_order_relaxed);
                 rt->tail_bytes_since_snapshot.fetch_add(bytes.size(), std::memory_order_relaxed);
             }
             catch (...)
@@ -2108,43 +2104,18 @@ void Store::maybeScheduleSnapshotPublish(const RootNamespace & ns, const std::sh
             /// on the next read until the bounded backoff elapses (the read-triggered PUT-storm latch).
             && now >= rt->publish_backoff_until_ms)
         {
-            /// Threshold trigger + candidate selection, fused into one walk of the tail's aged prefix.
-            /// The trigger counts ONLY entries a publish dispatched right now could actually cover:
-            /// (a) aged past the grace window AND (b) strictly above the newest published snapshot.
-            /// Counting the RAW tail size instead degenerates under sustained load: the grace window
-            /// keeps a permanent floor of young entries in the tail (append rate x grace age of them),
-            /// so once that floor alone exceeds the count threshold the raw trigger is CONTINUOUSLY
-            /// true, and a FULL snapshot re-encode+PUT is dispatched once per publish latency -- each
-            /// covering only the handful of entries that aged since the previous one (a measured
-            /// 20-26 GB/h of `_snap` PUT traffic per node at ~23 txn/s). Counting aged+uncovered
-            /// entries restores the intended batching: a publish is dispatched only once a full
-            /// threshold's worth of coverable work has accumulated.
-            /// `observed_at_ms` is non-decreasing, so the aged entries are a prefix (one loop, stopping
-            /// at the first young entry); the last of them is the candidate the publish would pick
-            /// (mirrors `trySnapshotPublishOnce`'s selection).
-            uint64_t publishable_count = 0;
-            uint64_t publishable_bytes = 0;
-            std::optional<RefTxnId> candidate_x;
-            for (const auto & entry : rt->tail_since_snapshot)
-            {
-                const uint64_t age = now >= entry.observed_at_ms ? now - entry.observed_at_ms : 0;
-                if (age < config.snapshot_min_log_age_ms)
-                    break;
-                candidate_x = entry.txn.txn_id;
-                if (!rt->newest_snapshot_id || *rt->newest_snapshot_id < entry.txn.txn_id)
-                {
-                    ++publishable_count;
-                    publishable_bytes += entry.encoded_bytes;
-                }
-            }
+            /// rev.6 Task 10 (spec §publish-from-live): the threshold trigger reads the tail counters
+            /// directly -- no walk, no age filter. `tail_count_since_snapshot`/`tail_bytes_since_snapshot`
+            /// count ONLY applied txns strictly above `newest_snapshot_id` (maintained incrementally by
+            /// every commit and every adoption, see `flushRefBatch`/`trySnapshotPublishOnce`), so
+            /// `over_threshold` here is never true without a real, immediately-coverable candidate: unlike
+            /// the deleted grace-window scheme, there is no longer a decoupling between "counted" and
+            /// "coverable" that a separate candidate-advance check would need to close.
+            const uint64_t publishable_count = rt->tail_count_since_snapshot.load(std::memory_order_relaxed);
+            const uint64_t publishable_bytes = rt->tail_bytes_since_snapshot.load(std::memory_order_relaxed);
             const bool over_threshold = publishable_count > config.snapshot_log_count_threshold
                 || publishable_bytes > config.snapshot_log_bytes_threshold;
-            /// Candidate-advance skip: dispatch only if a grace-eligible tail entry sits strictly above
-            /// the newest published snapshot. Otherwise the publisher would find nothing new to cover
-            /// (all tail entries still within the grace window, or the newest already published) and
-            /// return without pruning -- re-latching the threshold trigger on every subsequent read.
-            if (over_threshold
-                && candidate_x && (!rt->newest_snapshot_id || *rt->newest_snapshot_id < *candidate_x))
+            if (over_threshold)
             {
                 rt->pending_snapshot_publishes.fetch_add(1, std::memory_order_relaxed);
                 dispatch = true;
@@ -2242,7 +2213,30 @@ size_t Store::tailSinceSnapshotCountForTest(const RootNamespace & ns)
     const auto rt = getRefTableRuntime(ns);
     ensureRefTableRecovered(ns, *rt);
     std::lock_guard lock(rt->state_mutex);
-    return rt->tail_since_snapshot.size();
+    return rt->tail_count_since_snapshot.load(std::memory_order_relaxed);
+}
+
+namespace
+{
+/// rev.6 Task 10 (spec §publish-from-live): a clamped-to-zero fetch-subtract for the tail counters.
+/// `trySnapshotPublishOnce` is public and NOT serialized against itself (spec: "publishes are NOT
+/// serialized, so two overlapping attempts can finish out of order") -- the T11 monotonic guard below
+/// skips a stale (superseded) adoption's subtraction outright, but it cannot see a SMALLER-candidate
+/// attempt that lands its adoption BEFORE a larger-candidate one already in flight: that ordering would
+/// have the larger attempt's `captured_count`/`captured_bytes` double-count the smaller one's
+/// already-subtracted region. A plain `fetch_sub` would then underflow the unsigned counter, wrapping it
+/// to near `UINT64_MAX` and permanently re-latching the C4 storm trigger on every subsequent read -- a
+/// release-build regression of the exact bug this rev fixes. Clamping to zero instead settles for a
+/// benign, self-healing under-count (a delayed next dispatch; the NEXT publish always captures the true
+/// live state fresh, so snapshot CONTENT is never affected) over an unsafe wraparound.
+void clampedCounterSub(std::atomic<uint64_t> & counter, uint64_t amount)
+{
+    uint64_t old_value = counter.load(std::memory_order_relaxed);
+    while (!counter.compare_exchange_weak(old_value, old_value > amount ? old_value - amount : 0,
+        std::memory_order_relaxed))
+    {
+    }
+}
 }
 
 bool Store::trySnapshotPublishOnce(const RootNamespace & ns)
@@ -2250,43 +2244,23 @@ bool Store::trySnapshotPublishOnce(const RootNamespace & ns)
     const auto rt = getRefTableRuntime(ns);
     ensureRefTableRecovered(ns, *rt);
 
+    /// rev.6 Task 10 (spec §publish-from-live): ONE copy of the live state, at a txn boundary -- no
+    /// replay, no per-entry retention. The tail counters are captured in the SAME critical section so
+    /// adoption below subtracts exactly what this attempt's candidate actually covers.
     RefTableState candidate_state;
     RefTxnId candidate_x;
-    bool have_candidate = false;
+    uint64_t captured_count = 0;
+    uint64_t captured_bytes = 0;
     {
         std::lock_guard lock(rt->state_mutex);
         if (rt->state.lifecycle != RefLifecycle::Live)
             return false;   /// nothing to (re)publish here; dropNamespace publishes its own Removed snapshot
-
-        const uint64_t now = bootMsNow();
-        RefTableState replay_state = rt->snapshot_base_state;
-        for (const auto & entry : rt->tail_since_snapshot)
-        {
-            /// Age-check BEFORE apply: a young entry must never reach the candidate state anyway, so
-            /// checking first keeps `replay_state` equal to the candidate at every step -- ONE move
-            /// after the loop instead of a full `RefTableState` copy per aged entry (the copy-per-entry
-            /// replay dominated the publish path's CPU cost on large tables).
-            const uint64_t age = now >= entry.observed_at_ms ? now - entry.observed_at_ms : 0;
-            if (age < config.snapshot_min_log_age_ms)
-            {
-                /// spec §Late Predecessor PUT: the grace window is holding this (and every younger)
-                /// tail entry out of the candidate snapshot so a late-arriving predecessor append from
-                /// a fenced epoch can still land before a snapshot covers its region. This is a distinct
-                /// observation point from `CasConditionalWriteFenceLostPostWrite` (a post-write fence
-                /// check on the writer's own conditional-write attempt): here we count each engaged
-                /// grace window on the snapshot-publish path, so the residual race is measurable, not
-                /// only mitigated. observed_at_ms is non-decreasing, so exactly one break — hence one
-                /// increment — per attempt.
-                ProfileEvents::increment(ProfileEvents::CasRefLatePredecessorObserved);
-                break;
-            }
-            applyRefLogTxn(replay_state, entry.txn);
-            candidate_x = entry.txn.txn_id;
-            have_candidate = true;
-        }
-        if (!have_candidate)
-            return false;   /// even the oldest tail entry is still within the grace window
-        candidate_state = std::move(replay_state);
+        if (rt->newest_snapshot_id && !(*rt->newest_snapshot_id < rt->state.greatest_applied))
+            return false;   /// nothing above the newest snapshot
+        candidate_state = rt->state;
+        candidate_x = rt->state.greatest_applied;
+        captured_count = rt->tail_count_since_snapshot.load(std::memory_order_relaxed);
+        captured_bytes = rt->tail_bytes_since_snapshot.load(std::memory_order_relaxed);
     }
 
     const RefTableSnapshot snap = snapshotOf(candidate_state, ns.string());
@@ -2327,32 +2301,26 @@ bool Store::trySnapshotPublishOnce(const RootNamespace & ns)
         /// Monotonic adoption guard (CRITICAL): publishes are NOT serialized, so two
         /// overlapping attempts can finish out of order (this OLDER-candidate attempt landing its PUT
         /// after a NEWER one already adopted). Adopting the older `candidate_x` here would REGRESS
-        /// `newest_snapshot_id`/`snapshot_base_state` below the tail's already-pruned prefix, silently
-        /// dropping the txns committed in between from base+tail -- the next published snapshot would then
-        /// omit committed transactions and recovery would lose refs. Skip the in-memory adoption whenever a
-        /// newer-or-equal snapshot is already adopted; the already-durable `_snap/<candidate_x>` object is
-        /// harmless (readers pick the greatest snapshot, GC reclaims covered ones). This also keeps the
-        /// Removed path monotonic: a stale Live attempt can never drag `newest_snapshot_id` back below a
-        /// `remove_txn_id` that `publishRemovedSnapshotNow` already adopted (`remove_txn_id` is allocated
-        /// after every Live txn, so it is always the greatest and this guard trips).
+        /// `newest_snapshot_id` below what a newer attempt already advanced it to -- the next published
+        /// snapshot would then omit committed transactions and recovery would lose refs. Skip the
+        /// in-memory adoption (and the counter subtraction below) whenever a newer-or-equal snapshot is
+        /// already adopted; the already-durable `_snap/<candidate_x>` object is harmless (readers pick
+        /// the greatest snapshot, GC reclaims covered ones). This also keeps the Removed path monotonic:
+        /// a stale Live attempt can never drag `newest_snapshot_id` back below a `remove_txn_id` that
+        /// `publishRemovedSnapshotNow` already adopted (`remove_txn_id` is allocated after every Live
+        /// txn, so it is always the greatest and this guard trips).
         if (rt->newest_snapshot_id && !(*rt->newest_snapshot_id < candidate_x))
             return true;
-        /// Prune by id, not by the (possibly now-stale) index computed above: more appends -- or even
-        /// another publish -- may have landed on `tail_since_snapshot` while the PUT was in flight.
-        uint64_t pruned_bytes = 0;
-        size_t prune_upto = 0;
-        while (prune_upto < rt->tail_since_snapshot.size()
-               && !(candidate_x < rt->tail_since_snapshot[prune_upto].txn.txn_id))
-        {
-            pruned_bytes += rt->tail_since_snapshot[prune_upto].encoded_bytes;
-            ++prune_upto;
-        }
-        rt->tail_since_snapshot.erase(rt->tail_since_snapshot.begin(),
-            rt->tail_since_snapshot.begin() + static_cast<ptrdiff_t>(prune_upto));
-        rt->tail_bytes_since_snapshot.fetch_sub(pruned_bytes, std::memory_order_relaxed);
+        /// rev.6 Task 10 (spec §publish-from-live): subtract exactly the counters captured at copy time
+        /// -- more appends (or even another publish's own commits) may have landed on the LIVE counters
+        /// since, and only those should remain uncovered. Clamped (see `clampedCounterSub`): an
+        /// out-of-order adoption ordering the guard above does not catch (a SMALLER candidate that
+        /// adopts before a LARGER one already in flight) could otherwise subtract an already-subtracted
+        /// region and underflow the unsigned counter.
+        clampedCounterSub(rt->tail_count_since_snapshot, captured_count);
+        clampedCounterSub(rt->tail_bytes_since_snapshot, captured_bytes);
         /// logs-per-table-after-snapshot (spec §implementation-impact): the tail this publish compacted.
-        ProfileEvents::increment(ProfileEvents::CasRefSnapshotTailLogs, prune_upto);
-        rt->snapshot_base_state = std::move(candidate_state);
+        ProfileEvents::increment(ProfileEvents::CasRefSnapshotTailLogs, captured_count);
         rt->newest_snapshot_id = candidate_x;
         /// Cache-weight base (spec §Byte, Memory, And CPU Budget): the new base is exactly the snapshot
         /// we just encoded and PUT, so its body size is the fresh base weight -- no re-encode needed.
@@ -2567,8 +2535,7 @@ void Store::publishRemovedSnapshotNow(const RootNamespace & ns)
 
     std::lock_guard lock(rt->state_mutex);
     rt->newest_snapshot_id = remove_id;
-    rt->snapshot_base_state = rt->state;   /// == the Removed state (empty committed/precommits)
-    rt->tail_since_snapshot.clear();
+    rt->tail_count_since_snapshot.store(0, std::memory_order_relaxed);
     rt->tail_bytes_since_snapshot.store(0, std::memory_order_relaxed);
 }
 
