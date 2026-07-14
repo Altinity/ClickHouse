@@ -129,7 +129,10 @@ TEST(CasMountLease, AbsentClaimThenRenewBumpsSeq)
     EXPECT_EQ(decodeMountLease(b->get(l.mountKey("r"))->bytes).seq, 2u);
 }
 
-TEST(CasMountLease, SameUuidLiveFailsForeignFailsExpiredReclaims)
+/// rev.6: a bare `claimMount` (no `proven_dead_token`) NEVER reclaims a same-uuid, different-epoch
+/// lease off a wall-clock-looking-expired stamp — only `claimMountAwaitingExpiry`'s observation loop
+/// can turn that into a reclaim. Renamed from `...ExpiredReclaims` to describe the corrected behavior.
+TEST(CasMountLease, SameUuidLiveFailsForeignFailsExpiredStillLiveDoubleStart)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout l("p");
@@ -138,8 +141,9 @@ TEST(CasMountLease, SameUuidLiveFailsForeignFailsExpiredReclaims)
     EXPECT_EQ(claimMount(*b, l, "r", UInt128(1), 8, 1050, 100).kind, MountClaimResult::LiveDoubleStart);
     // foreign uuid, even after expiry → fail closed:
     EXPECT_EQ(claimMount(*b, l, "r", UInt128(2), 1, 1200, 100).kind, MountClaimResult::ForeignOwner);
-    // same uuid after expiry → reclaim:
-    EXPECT_EQ(claimMount(*b, l, "r", UInt128(1), 9, 1200, 100).kind, MountClaimResult::Claimed);
+    // same uuid, even after the stamp LOOKS expired on our wall clock → still LiveDoubleStart: no
+    // proven_dead_token was supplied, so there is no certificate of death to reclaim on.
+    EXPECT_EQ(claimMount(*b, l, "r", UInt128(1), 9, 1200, 100).kind, MountClaimResult::LiveDoubleStart);
 }
 
 TEST(CasMountMessage, DoubleStartTextHasIdentityAndRemediation)
@@ -173,22 +177,29 @@ TEST(CasMountMessage, DoubleStartTextHasIdentityAndRemediation)
     EXPECT_NE(msg.find("gc/server-roots/replica-a/mount"), std::string::npos);
 }
 
-TEST(CasMountAwaitExpiry, PastExpiryReclaimsImmediatelyNoSleep)
+/// rev.6: a stamped `expires_at_ms` that already looks past-due on our wall clock must NOT shortcut
+/// the observation wait — the old "instant, zero-sleep" reclaim this test name described was exactly
+/// the cross-node wall-clock trust rev.6 removes. Renamed to describe the CORRECTED behavior: the
+/// wall-clock-looking-expired stamp buys nothing, the full threshold is still observed.
+TEST(CasMountAwaitExpiry, PastExpiryStillPaysTheFullObservationThreshold)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout l("p");
     /// A prior incarnation (uuid=1, epoch=7) claimed a lease live until 1100.
     ASSERT_EQ(claimMount(*b, l, "r", UInt128(1), 7, /*now*/ 1000, /*ttl*/ 100).kind, MountClaimResult::Claimed);
 
-    uint64_t now = 1200;                 // already past 1100 → the stale lease is dead
+    uint64_t wall = 1200;                // already past 1100 on wall clock — irrelevant to the decision
+    uint64_t mono = 0;
     int sleeps = 0;
-    auto now_fn = [&] { return now; };
-    auto sleep_fn = [&](uint64_t ms) { now += ms; ++sleeps; };
+    auto now_fn = [&] { return wall; };
+    auto mono_fn = [&] { return mono; };
+    auto sleep_fn = [&](uint64_t ms) { wall += ms; mono += ms; ++sleeps; };
 
     const auto r = claimMountAwaitingExpiry(
-        *b, l, "r", UInt128(1), /*our_epoch*/ 8, now_fn, /*ttl*/ 100, /*poll*/ 25, /*margin*/ 25, sleep_fn);
+        *b, l, "r", UInt128(1), /*our_epoch*/ 8, now_fn, mono_fn, /*ttl*/ 100, /*poll*/ 25, sleep_fn);
     EXPECT_EQ(r.kind, MountClaimResult::Claimed);
-    EXPECT_EQ(sleeps, 0);                                             // decided on the first attempt
+    EXPECT_GT(sleeps, 0);                                    // NOT instant — no wall-clock trust
+    EXPECT_GE(mono, 100 + 100 / 20 + 25);                     // full observation threshold paid
     EXPECT_EQ(decodeMountLease(b->get(l.mountKey("r"))->bytes).writer_epoch, 8u);   // reclaimed as us
 }
 
@@ -198,35 +209,43 @@ TEST(CasMountAwaitExpiry, FutureExpiryReclaimsAfterClockAdvances)
     Layout l("p");
     ASSERT_EQ(claimMount(*b, l, "r", UInt128(1), 7, /*now*/ 1000, /*ttl*/ 100).kind, MountClaimResult::Claimed);
 
-    uint64_t now = 1000;                 // lease live until 1100, holder does NOT renew
-    auto now_fn = [&] { return now; };
-    auto sleep_fn = [&](uint64_t ms) { now += ms; };
+    uint64_t wall = 1000;                // lease looks live until 1100, holder does NOT renew
+    uint64_t mono = 0;
+    auto now_fn = [&] { return wall; };
+    auto mono_fn = [&] { return mono; };
+    auto sleep_fn = [&](uint64_t ms) { wall += ms; mono += ms; };
 
     const auto r = claimMountAwaitingExpiry(
-        *b, l, "r", UInt128(1), /*our_epoch*/ 8, now_fn, /*ttl*/ 100, /*poll*/ 50, /*margin*/ 25, sleep_fn);
+        *b, l, "r", UInt128(1), /*our_epoch*/ 8, now_fn, mono_fn, /*ttl*/ 100, /*poll*/ 50, sleep_fn);
     EXPECT_EQ(r.kind, MountClaimResult::Claimed);
     const auto body = decodeMountLease(b->get(l.mountKey("r"))->bytes);
     EXPECT_EQ(body.writer_epoch, 8u);
     EXPECT_EQ(body.seq, 2u);                                         // reclaim continues seq (prev 1 + 1)
 }
 
+/// rev.6: a genuinely live twin now times out via BOUNDED OBSERVATION RESTARTS (its every renewal
+/// bumps the write-token, forcing a restart each poll), never via a wall-clock deadline.
 TEST(CasMountAwaitExpiry, LiveRenewingTwinTimesOutAsDoubleStart)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout l("p");
     ASSERT_EQ(claimMount(*b, l, "r", UInt128(1), 7, /*now*/ 1000, /*ttl*/ 100).kind, MountClaimResult::Claimed);
 
-    uint64_t now = 1000;
-    auto now_fn = [&] { return now; };
-    /// Each poll: time advances AND the live holder (uuid=1, epoch=7) renews its own lease.
+    uint64_t wall = 1000;
+    uint64_t mono = 0;
+    auto now_fn = [&] { return wall; };
+    auto mono_fn = [&] { return mono; };
+    /// Each poll: both clocks advance AND the live holder (uuid=1, epoch=7) renews its own lease —
+    /// the observed write-token changes on EVERY poll, forcing a restart every time.
     auto sleep_fn = [&](uint64_t ms)
     {
-        now += ms;
-        ASSERT_EQ(claimMount(*b, l, "r", UInt128(1), 7, now, 100).kind, MountClaimResult::Claimed);
+        wall += ms;
+        mono += ms;
+        ASSERT_EQ(claimMount(*b, l, "r", UInt128(1), 7, wall, 100).kind, MountClaimResult::Claimed);
     };
 
     const auto r = claimMountAwaitingExpiry(
-        *b, l, "r", UInt128(1), /*our_epoch*/ 8, now_fn, /*ttl*/ 100, /*poll*/ 20, /*margin*/ 20, sleep_fn);
+        *b, l, "r", UInt128(1), /*our_epoch*/ 8, now_fn, mono_fn, /*ttl*/ 100, /*poll*/ 20, sleep_fn);
     EXPECT_EQ(r.kind, MountClaimResult::LiveDoubleStart);
     EXPECT_EQ(decodeMountLease(b->get(l.mountKey("r"))->bytes).writer_epoch, 7u);   // still the holder's
 }
@@ -241,32 +260,37 @@ TEST(CasMountAwaitExpiry, ForeignUuidFailsClosedImmediately)
     uint64_t now = 1000;
     int sleeps = 0;
     auto now_fn = [&] { return now; };
+    auto mono_fn = [&] { return uint64_t{0}; };
     auto sleep_fn = [&](uint64_t ms) { now += ms; ++sleeps; };
 
     const auto r = claimMountAwaitingExpiry(
-        *b, l, "r", UInt128(1), /*our_epoch*/ 8, now_fn, /*ttl*/ 100, /*poll*/ 25, /*margin*/ 25, sleep_fn);
+        *b, l, "r", UInt128(1), /*our_epoch*/ 8, now_fn, mono_fn, /*ttl*/ 100, /*poll*/ 25, sleep_fn);
     EXPECT_EQ(r.kind, MountClaimResult::ForeignOwner);
     EXPECT_EQ(sleeps, 0);                                            // never waits across UUIDs
 }
 
-TEST(CasMountAwaitExpiry, SkewedFarFutureExpiryIsCappedAtTtlPlusMargin)
+/// rev.6: the predecessor's own stamped `expires_at_ms` (however skewed) is NEVER consulted for the
+/// reclaim decision any more — the wait is bounded purely by OUR OWN `ttl_ms`-derived threshold. A
+/// prior incarnation minted with an absurdly large `ttl` (so its own stamp claims aliveness for
+/// ~100000ms) still reclaims within the SAME small threshold as any other case, because that stamp is
+/// never read for timing.
+TEST(CasMountAwaitExpiry, SkewedFarFutureExpiryHasNoEffectOnObservationThreshold)
 {
     auto b = std::make_shared<InMemoryBackend>();
     Layout l("p");
-    /// A prior incarnation stamped a far-future expiry (killer clock ahead): live until 1000 + 100000,
-    /// but the holder is dead (never renews). The wait must be capped at ~ttl + margin, not block to
-    /// the absurd expiry, and fail closed (LiveDoubleStart) rather than reclaim a still-live-looking lease.
     ASSERT_EQ(claimMount(*b, l, "r", UInt128(1), 7, /*now*/ 1000, /*ttl*/ 100000).kind, MountClaimResult::Claimed);
 
-    uint64_t now = 1000;
-    auto now_fn = [&] { return now; };
-    auto sleep_fn = [&](uint64_t ms) { now += ms; };
+    uint64_t wall = 1000;
+    uint64_t mono = 0;
+    auto now_fn = [&] { return wall; };
+    auto mono_fn = [&] { return mono; };
+    auto sleep_fn = [&](uint64_t ms) { wall += ms; mono += ms; };
 
     const auto r = claimMountAwaitingExpiry(
-        *b, l, "r", UInt128(1), /*our_epoch*/ 8, now_fn, /*ttl*/ 100, /*poll*/ 20, /*margin*/ 20, sleep_fn);
-    EXPECT_EQ(r.kind, MountClaimResult::LiveDoubleStart);
-    EXPECT_LE(now, 1000u + 100u + 20u + 20u);                        // bounded ~ start + ttl + margin (+ one poll)
-    EXPECT_EQ(decodeMountLease(b->get(l.mountKey("r"))->bytes).writer_epoch, 7u);   // not reclaimed
+        *b, l, "r", UInt128(1), /*our_epoch*/ 8, now_fn, mono_fn, /*ttl*/ 100, /*poll*/ 20, sleep_fn);
+    EXPECT_EQ(r.kind, MountClaimResult::Claimed);
+    EXPECT_LE(mono, 100u + 100u / 20 + 20u + 20u);      // bounded by OUR threshold, not the predecessor's stamp
+    EXPECT_EQ(decodeMountLease(b->get(l.mountKey("r"))->bytes).writer_epoch, 8u);   // reclaimed
 }
 
 TEST(CasMountLease, KeeperStartAdoptsOurOwnClaimNotDoubleStart)
@@ -694,4 +718,121 @@ TEST(CasClaimMount, SameEpochFencedIsNotRefreshable)
     /// A DIFFERENT epoch reclaims immediately (existing branch, unchanged):
     EXPECT_EQ(claimMount(*backend, layout, "a", DB::UInt128{1}, 2, 2000, 10'000).kind,
               MountClaimResult::Claimed);
+}
+
+/// ---- rev.6 Task 4: observation-based lease reclaim (no cross-node wall-clock trust) ----
+
+/// A same-uuid, different-epoch lease whose STAMPED `expires_at_ms` looks long expired on OUR wall
+/// clock must NOT be reclaimed by that comparison alone — a clock-skewed or simply late-observing
+/// caller must never trust a bare wall-clock read across incarnations. `claimMount` (without a
+/// `proven_dead_token`) always reports `LiveDoubleStart` for this branch now; only the observation
+/// loop (`claimMountAwaitingExpiry`) may turn it into a reclaim, and only after proving death on ITS
+/// OWN clock.
+TEST(CasMountObservation, ExpiredLookingLeaseIsNotReclaimedByWallClock)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l{"p"};
+    /// Predecessor epoch 7 stamped expires_at_ms = 1000; our wall clock says 999999 (long past).
+    auto first = claimMount(*b, l, "r", UInt128(1), 7, /*now_ms=*/500, /*ttl_ms=*/500);
+    ASSERT_EQ(first.kind, MountClaimResult::Claimed);
+    auto r = claimMount(*b, l, "r", UInt128(1), /*our_epoch=*/8, /*now_ms=*/999999, 500);
+    EXPECT_EQ(r.kind, MountClaimResult::LiveDoubleStart);  /// no wall-clock trust
+}
+
+/// The observation loop reclaims once the write-token has held stable for the FULL rate-bound
+/// threshold (`ttl_ms + ttl_ms/20 + poll_interval_ms`) on its OWN (injected, fake) clock — never
+/// short-circuiting on the wall clock, which this test drives to an irrelevant, already-expired value.
+TEST(CasMountObservation, TokenStableForThresholdThenReclaimed)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l{"p"};
+    ASSERT_EQ(claimMount(*b, l, "r", UInt128(1), 7, 500, 500).kind, MountClaimResult::Claimed);
+    uint64_t mono = 0;
+    std::vector<uint64_t> sleeps;
+    auto r = claimMountAwaitingExpiry(*b, l, "r", UInt128(1), 8,
+        []{ return uint64_t{999999}; },                 /// wall clock: irrelevant
+        [&]{ return mono; },                             /// observation clock
+        /*ttl_ms=*/500, /*poll_interval_ms=*/50,
+        [&](uint64_t ms){ sleeps.push_back(ms); mono += ms; });
+    EXPECT_EQ(r.kind, MountClaimResult::Claimed);
+    EXPECT_EQ(r.prior, MountPriorState::UncleanObserved);
+    EXPECT_GE(mono, 500 + 500 / 20 + 50);               /// full threshold actually waited
+}
+
+/// A renewal DURING the observation window (the real holder is still alive) bumps the write-token —
+/// the loop must detect the mismatch and RESTART the observation from the new token, never reclaiming
+/// off a window that started watching a now-superseded token.
+TEST(CasMountObservation, RenewalDuringObservationRestartsIt)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l{"p"};
+    ASSERT_EQ(claimMount(*b, l, "r", UInt128(1), 7, 500, 500).kind, MountClaimResult::Claimed);
+
+    /// The real (still-alive) holder's keeper for epoch 7: `start()` adopts the slot `claimMount` just
+    /// wrote (no seq bump, per the ADOPT RULE), then `renewOnce()` bumps the token mid-observation.
+    uint64_t keeper_wall = 500;
+    MountLeaseKeeper keeper(b, l, "r", UInt128(1), 7, std::chrono::milliseconds(500),
+                             [&] { return keeper_wall; }, [] { return uint64_t{0}; });
+    keeper.start();
+
+    const uint64_t threshold_ms = 500 + 500 / 20 + 50;   /// = 575
+    uint64_t mono = 0;
+    bool renewed = false;
+    int wait_starts = 0;
+    auto r = claimMountAwaitingExpiry(*b, l, "r", UInt128(1), 8,
+        []{ return uint64_t{999999}; },                 /// wall clock: irrelevant
+        [&]{ return mono; },                             /// observation clock
+        /*ttl_ms=*/500, /*poll_interval_ms=*/50,
+        [&](uint64_t ms)
+        {
+            mono += ms;
+            /// Renew once, close to (but before) the first window's threshold would complete —
+            /// almost the whole first window is wasted, forcing a near-full second window.
+            if (!renewed && mono >= threshold_ms - 50)
+            {
+                renewed = true;
+                keeper.renewOnce();
+            }
+        },
+        /*on_wait_start=*/[&](const MountLease &, uint64_t) { ++wait_starts; });
+
+    EXPECT_EQ(r.kind, MountClaimResult::Claimed);
+    EXPECT_EQ(r.prior, MountPriorState::UncleanObserved);
+    EXPECT_EQ(wait_starts, 2);                           /// the renewal forced exactly one restart
+    /// The restart's own window did not begin until at least (threshold - poll) had already elapsed,
+    /// so total elapsed time is well over a single threshold window.
+    EXPECT_GE(mono, (threshold_ms - 50) + threshold_ms);
+}
+
+/// A GC-fenced lease is a terminal, already-threshold-gated certificate of death (the fence-out
+/// itself cost the predecessor an epoch) — the observation loop must reclaim it on the FIRST attempt,
+/// with zero polling/sleeping.
+TEST(CasMountObservation, GcFencedIsReclaimedInstantlyWithPriorFenced)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l{"p"};
+    ASSERT_EQ(claimMount(*b, l, "r", UInt128(1), 7, 1000, 500).kind, MountClaimResult::Claimed);
+
+    /// Fence it manually (what `computeHeartbeatFloor`'s fence-out does): gc_fenced=true, seq+1,
+    /// token-guarded.
+    {
+        auto got = b->get(l.mountKey("r"));
+        ASSERT_TRUE(got.has_value());
+        MountLease fenced = decodeMountLease(got->bytes);
+        fenced.gc_fenced = true;
+        fenced.seq += 1;
+        ASSERT_EQ(b->putOverwrite(l.mountKey("r"), encodeMountLease(fenced), got->token).outcome,
+                  PutOutcome::Done);
+    }
+
+    int sleeps = 0;
+    auto r = claimMountAwaitingExpiry(*b, l, "r", UInt128(1), /*our_epoch=*/8,
+        []{ return uint64_t{999999}; },
+        []{ return uint64_t{0}; },
+        /*ttl_ms=*/500, /*poll_interval_ms=*/50,
+        [&](uint64_t) { ++sleeps; });
+
+    EXPECT_EQ(r.kind, MountClaimResult::Claimed);
+    EXPECT_EQ(r.prior, MountPriorState::Fenced);
+    EXPECT_EQ(sleeps, 0);
 }

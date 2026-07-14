@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <optional>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -140,6 +141,17 @@ void claimOwnerOrThrow(Backend & b, const Layout & l, const String & srid, UInt1
 ///     observed token, retry on `Conflict` (bounded), and return `next`.
 uint64_t allocateWriterEpoch(Backend & b, const Layout & l, const String & srid);
 
+/// Which certificate of death justified a same-uuid, different-epoch mount reclaim (rev.6 design
+/// §token-stability observation). `None` when no reclaim of that kind happened (a fresh claim, a
+/// same-epoch refresh, `LiveDoubleStart`, `ForeignOwner`, `FencedSelf`).
+enum class MountPriorState
+{
+    None,
+    Clean,             /// the predecessor's own graceful farewell (`min_active == UINT64_MAX`)
+    Fenced,            /// the GC leader's own (already threshold-gated) fence-out (`gc_fenced`)
+    UncleanObserved,   /// OUR observation watched the write-token hold stable for the full threshold
+};
+
 /// Startup decision for the mount lease (`gc/server-roots/<srid>/mount`), run AFTER the owner gate
 /// (so `our_uuid` is the established owner). The lease is LIVENESS, not identity — the owner object
 /// already settled who may write; the lease settles whether a live incarnation currently holds the
@@ -150,13 +162,21 @@ uint64_t allocateWriterEpoch(Backend & b, const Layout & l, const String & srid)
 ///       - `gc_fenced` → terminal for THIS (uuid, epoch) — a fence costs an epoch, so refreshing it
 ///         in place would resurrect a fenced incarnation → `FencedSelf` (no write);
 ///       - otherwise → refresh (`putOverwrite` to bump seq + fresh `expires_at_ms`) → `Claimed`;
-///   - same `server_uuid`, DIFFERENT `writer_epoch`, lease EXPIRED (`expires_at_ms <= now_ms`) OR
-///     `gc_fenced` (a GC fence-out is terminal for that incarnation — its keeper can never renew
-///     again, so there is no liveness to wait for) → reclaim (overwrite with our body,
-///     seq = prev + 1) → `Claimed`;
-///   - same `server_uuid`, DIFFERENT `writer_epoch`, lease LIVE (`expires_at_ms > now_ms`) →
-///     `LiveDoubleStart` (do NOT write — a second incarnation of the same server is already up);
-///   - different `server_uuid` → `ForeignOwner` (do NOT write, regardless of expiry).
+///   - same `server_uuid`, DIFFERENT `writer_epoch` → reclaimed ONLY on a certificate of death that
+///     needs no fresh wall-clock trust (rev.6 design §token-stability observation — see
+///     `claimMountAwaitingExpiry` below for how a plain "looks expired" reading is turned into one):
+///       - `gc_fenced` (the GC leader already, itself, threshold-gated this incarnation dead; a fence
+///         costs an epoch, so its keeper can never renew again) → reclaim, `prior = Fenced`;
+///       - the clean marker (`min_active == UINT64_MAX`, the predecessor's own graceful farewell) →
+///         reclaim, `prior = Clean`;
+///       - `proven_dead_token` matches the CURRENTLY OBSERVED token (the caller itself watched this
+///         exact token hold stable for the full observation threshold) → reclaim, `prior =
+///         UncleanObserved`;
+///       - none of the above → `LiveDoubleStart` (do NOT write). In particular `expires_at_ms <=
+///         now_ms` ALONE is never sufficient — comparing a predecessor's stamp against OUR wall clock
+///         is exactly the cross-node trust rev.6 removes (a clock-skewed or merely late-observing
+///         caller must never conclude death from a bare timestamp read);
+///   - different `server_uuid` → `ForeignOwner` (do NOT write, regardless of expiry or prior state).
 struct MountClaimResult
 {
     /// Plain (unscoped) enum: callers compare with `MountClaimResult::Claimed` directly.
@@ -172,6 +192,9 @@ struct MountClaimResult
     };
     Kind kind = ForeignOwner;
     MountLease body;
+    /// Which certificate of death justified a same-uuid, different-epoch `Claimed` reclaim (`None` for
+    /// every other `Kind`, and for the absent-slot / same-epoch-refresh `Claimed` cases).
+    MountPriorState prior = MountPriorState::None;
 };
 
 /// Thrown when a mount operation observes that OUR OWN (uuid, epoch) slot was `gc_fenced` by the GC
@@ -187,9 +210,14 @@ public:
         : DB::Exception(msg, DB::ErrorCodes::ABORTED) {}
 };
 
+/// `proven_dead_token`: the write-token of a same-uuid, different-epoch lease that the CALLER already
+/// proved dead by observation (see `claimMountAwaitingExpiry`) — matching it against the CURRENTLY
+/// observed token is the ONLY way (besides `gc_fenced` / the clean marker) a same-uuid different-epoch
+/// lease is ever reclaimed. Absent (`{}`, the default) for a bare claim attempt with no such proof.
 MountClaimResult claimMount(
     Backend & b, const Layout & l, const String & srid, UInt128 our_uuid, uint64_t our_epoch,
-    uint64_t now_ms, uint64_t ttl_ms, const CasEventSink & sink = {});
+    uint64_t now_ms, uint64_t ttl_ms, const std::optional<Token> & proven_dead_token = {},
+    const CasEventSink & sink = {});
 
 /// Format the operator-actionable startup error shown when the mount lease is held by a genuinely
 /// live second server (the same `server_root_id` is mounted twice). Produced only AFTER this server
@@ -197,22 +225,34 @@ MountClaimResult claimMount(
 /// remediation is about a live twin, not about waiting.
 String mountDoubleStartMessage(const String & srid, const MountLease & existing);
 
-/// Bounded wait-for-expiry mount claim (S13 crash-recovery). Wraps `claimMount`:
-///   - first attempt decided immediately for `Claimed` (reclaimed / adopted) or `ForeignOwner`;
-///   - a `LiveDoubleStart` from OUR OWN uuid (a stale lease from a prior incarnation of this server)
-///     is waited out: poll every `poll_interval_ms` (advancing wall-clock via `now_ms_fn`, sleeping via
-///     `sleep_ms_fn`) until the lease lapses and we reclaim it (`Claimed`), or the wait bound elapses.
-/// The wait bound is latched ONCE from the first observed `expires_at_ms + margin_ms`, capped so we never
-/// block longer than `now + ttl_ms + margin_ms` (bounds a forward-clock-skewed expiry). On timeout the
-/// last `LiveDoubleStart` is returned (a genuinely live second server). The reclaim inside `claimMount`
-/// is token-guarded, so a holder that renews after our read can never be stolen from — correctness does
-/// not depend on the poll interval. `now_ms_fn` / `sleep_ms_fn` are injected so tests drive a fake clock
-/// with no real sleeping. `on_wait_start` (default no-op) is invoked once, with the observed lease and
-/// the latched wait deadline, when the function decides to wait — for an operator-visible startup log.
+/// Observation-based mount claim (S13 crash-recovery; rev.6 design §token-stability observation).
+/// Wraps `claimMount` in a loop:
+///   - first attempt decided immediately for `Claimed` (fresh / refreshed / reclaimed via `Fenced` or
+///     `Clean`), `ForeignOwner`, or `FencedSelf`;
+///   - a `LiveDoubleStart` from OUR OWN uuid (a stale lease from a prior incarnation of this server,
+///     OR a genuinely live twin — the two are indistinguishable from a bare read) is resolved by
+///     WATCHING the lease's write-token on OUR OWN clock (`mono_ms_fn`), NEVER by comparing the
+///     lease's stamped `expires_at_ms` against any clock: once the observed token has held stable for
+///     the full rate-bound threshold (`ttl_ms + ttl_ms / 20 + poll_interval_ms` — the lease TTL, a 5%
+///     clock-drift allowance, and one poll interval of discreteness; mirrors the TLA+-verified
+///     `TTL + Drift` threshold in `docs/superpowers/models/CaCasMountCore.tla`'s `ObservedReclaim`),
+///     that token is handed to `claimMount` as `proven_dead_token`, which then reclaims token-guarded
+///     (`prior = UncleanObserved`). If the token changes DURING the wait (the holder renewed, or a
+///     genuine twin is alive) the observation RESTARTS from the new token; bounded to a handful of
+///     restarts before giving up and returning the last `LiveDoubleStart` (a holder whose token keeps
+///     changing across that many restarts is alive, not dead).
+/// `now_ms_fn` is WALL clock, used only for stamping the body we (may) write / diagnostics — it never
+/// participates in the reclaim decision. `mono_ms_fn` is the OBSERVATION clock: monotonic on this
+/// process, never compared against any other node's clock, and the ONLY clock the threshold is
+/// measured against. `sleep_ms_fn` paces the poll. All three, plus `on_wait_start`, are injected so
+/// tests drive fake clocks with no real sleeping. `on_wait_start` (default no-op) fires once per
+/// observation-window start (including restarts), with the currently-observed lease and the
+/// threshold, for an operator-visible startup log.
 MountClaimResult claimMountAwaitingExpiry(
     Backend & b, const Layout & l, const String & srid, UInt128 our_uuid, uint64_t our_epoch,
     const std::function<uint64_t()> & now_ms_fn,
-    uint64_t ttl_ms, uint64_t poll_interval_ms, uint64_t margin_ms,
+    const std::function<uint64_t()> & mono_ms_fn,
+    uint64_t ttl_ms, uint64_t poll_interval_ms,
     const std::function<void(uint64_t)> & sleep_ms_fn,
     const std::function<void(const MountLease &, uint64_t)> & on_wait_start = {},
     const CasEventSink & sink = {});

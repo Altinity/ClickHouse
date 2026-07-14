@@ -336,7 +336,8 @@ void emitMountEvent(const CasEventSink & sink, CasEventType type, const String &
 
 MountClaimResult claimMount(
     Backend & b, const Layout & l, const String & srid, UInt128 our_uuid, uint64_t our_epoch,
-    uint64_t now_ms, uint64_t ttl_ms, const CasEventSink & sink)
+    uint64_t now_ms, uint64_t ttl_ms, const std::optional<Token> & proven_dead_token,
+    const CasEventSink & sink)
 {
     const String key = l.mountKey(srid);
     const auto got = b.get(key);
@@ -388,30 +389,47 @@ MountClaimResult claimMount(
         return {.kind = MountClaimResult::Claimed, .body = body};
     }
 
-    /// Same uuid, DIFFERENT epoch, GC-FENCED → reclaim IMMEDIATELY, expiry regardless. The fence-out
-    /// is terminal for that incarnation by construction (its keeper's every renewal fails the token
-    /// guard forever, so it can never write again) — there is no liveness left to wait for. This is
-    /// what makes self-remount (and a fast restart after a fence-out) instant instead of a TTL wait.
-    /// Same uuid, DIFFERENT epoch, NOT fenced, lease still LIVE → a second incarnation is genuinely
-    /// up → double-start guard.
-    if (!existing.gc_fenced && existing.expires_at_ms > now_ms)
+    /// Same uuid, DIFFERENT epoch: reclaim ONLY on a certificate of death that needs no fresh
+    /// wall-clock trust (rev.6 design §token-stability observation; TLA+ `ObservedReclaim` vs the
+    /// `WallClockReclaim` sabotage it replaces) — never by comparing `expires_at_ms` against `now_ms`:
+    ///   - `gc_fenced` → the fence-out is terminal for that incarnation by construction (its keeper's
+    ///     every renewal fails the token guard forever, so it can never write again) — there is no
+    ///     liveness left to wait for. This is what makes self-remount (and a fast restart after a
+    ///     fence-out) instant instead of an observation wait.
+    ///   - the clean marker (`min_active == UINT64_MAX`) → the predecessor's OWN graceful farewell
+    ///     (`MountLeaseKeeper::terminate`) — no observation needed either.
+    ///   - `proven_dead_token` matches the token we just read → the CALLER (`claimMountAwaitingExpiry`)
+    ///     already watched this exact token hold stable for the full observation threshold on its own
+    ///     clock; re-deriving that here from a bare wall-clock comparison would be exactly the
+    ///     cross-node trust rev.6 removes.
+    /// Anything else → `LiveDoubleStart` (do NOT write): a same-uuid, different-epoch, not fenced, not
+    /// clean-marked, not (yet) proven-dead lease may simply be a live twin, and `expires_at_ms` alone
+    /// can never distinguish that from a dead predecessor across two different clocks.
+    const bool clean_marker = existing.min_active == std::numeric_limits<uint64_t>::max();
+    const bool proven_dead = proven_dead_token && *proven_dead_token == got->token;
+    if (existing.gc_fenced || clean_marker || proven_dead)
     {
-        emitMountEvent(sink, CasEventType::MountConflict, srid, "live_double_start", &existing,
-            "same server_uuid, different writer_epoch, lease still live — a second live incarnation "
-            "already holds the mount");
-        return {.kind = MountClaimResult::LiveDoubleStart, .body = existing};
+        const MountLease body = makeMountBody(our_uuid, our_epoch, existing.seq + 1, now_ms, ttl_ms);
+        const PutResult put = b.putOverwrite(key, encodeMountLease(body), got->token);
+        if (put.outcome != PutOutcome::Done)
+            /// The mount changed under us between get and putOverwrite — someone else is racing the
+            /// reclaim. Fail closed. No re-read was done, so no conflicting identity is known.
+            return {.kind = MountClaimResult::LiveDoubleStart, .body = body};
+        const MountPriorState prior = existing.gc_fenced ? MountPriorState::Fenced
+                                     : clean_marker       ? MountPriorState::Clean
+                                                           : MountPriorState::UncleanObserved;
+        emitMountEvent(sink, CasEventType::MountClaim, srid, "reclaim", &existing,
+            existing.gc_fenced ? "same server_uuid, different writer_epoch, GC-fenced — reclaimed"
+            : clean_marker     ? "same server_uuid, different writer_epoch, clean farewell — reclaimed"
+                               : "same server_uuid, different writer_epoch, observed dead by "
+                                 "token-stability — reclaimed");
+        return {.kind = MountClaimResult::Claimed, .body = body, .prior = prior};
     }
 
-    /// Same uuid, DIFFERENT epoch, lease EXPIRED → reclaim with a fresh body (seq continues).
-    const MountLease body = makeMountBody(our_uuid, our_epoch, existing.seq + 1, now_ms, ttl_ms);
-    const PutResult put = b.putOverwrite(key, encodeMountLease(body), got->token);
-    if (put.outcome != PutOutcome::Done)
-        /// The mount changed under us between get and putOverwrite — someone else is racing the
-        /// reclaim. Fail closed. No re-read was done, so no conflicting identity is known.
-        return {.kind = MountClaimResult::LiveDoubleStart, .body = body};
-    emitMountEvent(sink, CasEventType::MountClaim, srid, "reclaim", &existing,
-        "same server_uuid, different writer_epoch, expired/fenced — reclaimed");
-    return {.kind = MountClaimResult::Claimed, .body = body};
+    emitMountEvent(sink, CasEventType::MountConflict, srid, "live_double_start", &existing,
+        "same server_uuid, different writer_epoch, not fenced/clean/proven-dead — no wall-clock trust; "
+        "the caller must run the token-stability observation wait before reclaiming");
+    return {.kind = MountClaimResult::LiveDoubleStart, .body = existing};
 }
 
 String mountDoubleStartMessage(const String & srid, const MountLease & existing)
@@ -434,10 +452,23 @@ String mountDoubleStartMessage(const String & srid, const MountLease & existing)
         existing.seq, existing.expires_at_ms, srid, srid);
 }
 
+namespace
+{
+/// Bounded number of observation restarts before giving up on a same-uuid slot whose write-token keeps
+/// changing: each restart means the token changed DURING our observation window — i.e. something is
+/// actively renewing it. A genuinely dead predecessor's token never changes again after its last
+/// renewal, so it is observed stable well within one window; only a truly LIVE writer (a real second
+/// incarnation, or the predecessor's own background renewer racing our first few polls) keeps resetting
+/// the clock. Bounding this converts "wait forever for a live twin" into the same bounded-then-report
+/// shape the old wall-clock wait had, without ever trusting a wall-clock deadline to get there.
+constexpr size_t kMaxObservationRestarts = 3;
+}
+
 MountClaimResult claimMountAwaitingExpiry(
     Backend & b, const Layout & l, const String & srid, UInt128 our_uuid, uint64_t our_epoch,
     const std::function<uint64_t()> & now_ms_fn,
-    uint64_t ttl_ms, uint64_t poll_interval_ms, uint64_t margin_ms,
+    const std::function<uint64_t()> & mono_ms_fn,
+    uint64_t ttl_ms, uint64_t poll_interval_ms,
     const std::function<void(uint64_t)> & sleep_ms_fn,
     const std::function<void(const MountLease &, uint64_t)> & on_wait_start,
     const CasEventSink & sink)
@@ -445,33 +476,49 @@ MountClaimResult claimMountAwaitingExpiry(
     /// A zero poll interval would spin; a single-ms floor keeps the loop a real (bounded) wait.
     const uint64_t poll = poll_interval_ms == 0 ? 1 : poll_interval_ms;
 
-    MountClaimResult r = claimMount(b, l, srid, our_uuid, our_epoch, now_ms_fn(), ttl_ms, sink);
-    if (r.kind != MountClaimResult::LiveDoubleStart)
-        return r;
+    /// Rate-bound observation threshold (design §token-stability observation; TLA+ `TTL + Drift`,
+    /// `CaCasMountCore.tla`'s `ObservedReclaim`): the full lease TTL, plus a 5% allowance for clock-rate
+    /// mismatch between the holder's and our own local clock, plus one poll interval for observation
+    /// discreteness. Purely a function of OUR OWN clock (`mono_ms_fn`) — no cross-node wall-clock
+    /// comparison anywhere in this loop.
+    const uint64_t threshold_ms = ttl_ms + ttl_ms / 20 + poll;
 
-    /// A same-uuid, different-epoch, still-live lease from a prior incarnation of THIS server. It is
-    /// either our own crashed process (its keeper died without releasing the lease) or a genuinely live
-    /// twin. Wait for the lease to lapse — a live twin keeps renewing and never lapses, so we time out
-    /// and report it; a dead predecessor lapses within its TTL and we reclaim (token-guarded).
-    const uint64_t start_ms = now_ms_fn();
-    uint64_t wait_deadline = r.body.expires_at_ms + margin_ms;
-    const uint64_t cap = start_ms + ttl_ms + margin_ms;
-    if (wait_deadline > cap)
-        wait_deadline = cap;
+    std::optional<Token> observed;
+    uint64_t observed_since = 0;
+    size_t restarts = 0;
 
-    if (on_wait_start)
-        on_wait_start(r.body, wait_deadline);
-
-    while (now_ms_fn() < wait_deadline)
+    while (true)
     {
-        sleep_ms_fn(poll);
-        r = claimMount(b, l, srid, our_uuid, our_epoch, now_ms_fn(), ttl_ms, sink);
+        const bool threshold_met = observed && mono_ms_fn() - observed_since >= threshold_ms;
+        MountClaimResult r = claimMount(b, l, srid, our_uuid, our_epoch, now_ms_fn(), ttl_ms,
+            threshold_met ? observed : std::nullopt, sink);
         if (r.kind != MountClaimResult::LiveDoubleStart)
             return r;
-    }
 
-    /// Timed out still LiveDoubleStart → a genuinely live second server holds the mount.
-    return r;
+        const auto got = b.get(l.mountKey(srid));
+        if (!got)
+            /// The slot vanished between claimMount's own GET and ours — the next iteration's
+            /// claimMount call claims it fresh (the absent-slot branch).
+            continue;
+
+        if (!observed || *observed != got->token)
+        {
+            if (observed && ++restarts > kMaxObservationRestarts)
+                /// The token kept changing across bounded restarts — the holder is genuinely alive
+                /// (actively renewing), not a dead predecessor. Report it rather than waiting forever.
+                return r;
+            observed = got->token;
+            observed_since = mono_ms_fn();
+            if (on_wait_start)
+                on_wait_start(r.body, threshold_ms);
+            LOG_INFO(getLogger("CasMountLease"),
+                "Attempting to mount content-addressed server root {} after node change or hard "
+                "restart; waiting ~{} ms (token-stability observation) to confirm the previous "
+                "incarnation's operations are all finalized", srid, threshold_ms);
+        }
+
+        sleep_ms_fn(poll);
+    }
 }
 
 HeartbeatFloor computeHeartbeatFloor(Backend & b, const Layout & l, uint64_t now_ms,

@@ -351,26 +351,27 @@ StorePtr Store::open(BackendPtr backend, PoolConfig config)
         validateCasRequestBudget(store->config.cas_request_budget, ttl_ms,
             static_cast<uint64_t>(store->config.mount_renew_period.count()));
 
-        /// Poll twice per renew period so a live holder's renewal is always observed within the wait;
-        /// margin = one poll interval (covers poll granularity + minor wall-clock skew). Derived from
-        /// existing config — no new knob (spec §Config).
+        /// Poll twice per renew period so a live holder's renewal is always observed within the
+        /// observation window. Derived from existing config — no new knob (spec §Config).
         const uint64_t poll_interval_ms = std::max<uint64_t>(
             1, static_cast<uint64_t>(store->config.mount_renew_period.count()) / 2);
-        const uint64_t margin_ms = poll_interval_ms;
         const auto sleep_ms = [](uint64_t ms)
         {
             std::this_thread::sleep_for(std::chrono::milliseconds(ms));
         };
-        /// Operator-visible log the moment startup decides to wait out a stale self-mount (the disk-open
-        /// path blocks up to ~ttl here, so a silent block would be confusing).
-        const auto on_wait_start = [&srid](const MountLease & held, uint64_t wait_deadline_ms)
+        /// Operator-visible log the moment startup decides to watch a stale-looking self-mount (the
+        /// disk-open path blocks up to ~threshold_ms here, so a silent block would be confusing). May
+        /// fire more than once per open: the observation restarts (and re-logs) every time the watched
+        /// lease's write-token changes before the full threshold elapses.
+        const auto on_wait_start = [&srid](const MountLease & held, uint64_t threshold_ms)
         {
             LOG_INFO(getLogger("CasStore"),
-                "CAS mount '{}': a stale mount lease is held by uuid={} epoch={} pid={} hostname={} "
-                "(expires_at_ms={}); waiting for it to lapse, then reclaiming. If a second server is "
-                "genuinely live, startup will abort once the wait bound (wait_deadline_ms={}) elapses.",
+                "CAS mount '{}': a stale-looking mount lease is held by uuid={} epoch={} pid={} "
+                "hostname={} (expires_at_ms={}); observing its write-token for up to ~{} ms before "
+                "reclaiming. If a second server is genuinely live, its renewals will keep restarting "
+                "the observation and startup will eventually abort as a live double-start.",
                 srid, u128ToHex(held.server_uuid), held.writer_epoch, held.pid, held.hostname,
-                held.expires_at_ms, wait_deadline_ms);
+                held.expires_at_ms, threshold_ms);
         };
 
         /// Mount-slot writer audit (the P1 "foreign writer" instrument): route every mount-slot
@@ -385,9 +386,11 @@ StorePtr Store::open(BackendPtr backend, PoolConfig config)
         Store * raw = store.get();
 
         /// S13 crash-recovery: a hard-killed prior incarnation leaves a stale, unreleased mount lease.
-        /// Rather than aborting, wait (bounded by ttl + margin) for that lease to lapse and reclaim it;
-        /// a genuinely live second server keeps renewing and is reported as LiveDoubleStart. The reclaim
-        /// is token-guarded (see claimMountAwaitingExpiry), so a live twin is never stolen from.
+        /// Rather than aborting, OBSERVE that lease's write-token (never its stamped `expires_at_ms`
+        /// against our wall clock) until it has held stable for the full rate-bound threshold, then
+        /// reclaim it; a genuinely live second server keeps renewing the token and is (after bounded
+        /// restarts) reported as LiveDoubleStart. The reclaim is token-guarded (see
+        /// `claimMountAwaitingExpiry`), so a live twin is never stolen from.
         ///
         /// Fence-recovery loop (P3.1 vector C): if the GC fences our own fresh lease while we are opening
         /// (the lease expired mid-open — e.g. a slow first beat — and a GC round fenced it), that is a
@@ -400,8 +403,8 @@ StorePtr Store::open(BackendPtr backend, PoolConfig config)
         {
             const MountClaimResult claim = claimMountAwaitingExpiry(
                 *store->pool_backend, store->pool_layout, srid, our_uuid, writer_epoch,
-                [&now_ms]() { return now_ms(); }, ttl_ms, poll_interval_ms, margin_ms, sleep_ms, on_wait_start,
-                emit_mount_event);
+                [&now_ms]() { return now_ms(); }, [raw] { return raw->bootMsNow(); },
+                ttl_ms, poll_interval_ms, sleep_ms, on_wait_start, emit_mount_event);
             if (claim.kind == MountClaimResult::FencedSelf)
             {
                 if (fence_recovery >= max_fence_recoveries)
@@ -628,7 +631,6 @@ bool Store::tryRemountOnce()
     const uint64_t ttl_ms = static_cast<uint64_t>(config.mount_lease_ttl_ms.count());
     const uint64_t poll_interval_ms = std::max<uint64_t>(
         1, static_cast<uint64_t>(config.mount_renew_period.count()) / 2);
-    const uint64_t margin_ms = poll_interval_ms;
 
     /// Best-effort round for the MountRemount audit event only (diagnostic, never correctness-relevant):
     /// `currentGcRound` is a live `gc/state` GET, which may itself fail on the very backend trouble that
@@ -654,13 +656,13 @@ bool Store::tryRemountOnce()
         const auto sleep_ms = [](uint64_t ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); };
         const MountClaimResult claim = claimMountAwaitingExpiry(
             *pool_backend, pool_layout, srid, our_uuid, writer_epoch,
-            now_ms, ttl_ms, poll_interval_ms, margin_ms, sleep_ms,
-            [&srid](const MountLease & held, uint64_t wait_deadline_ms)
+            now_ms, [this] { return bootMsNow(); }, ttl_ms, poll_interval_ms, sleep_ms,
+            [&srid](const MountLease & held, uint64_t threshold_ms)
             {
                 LOG_INFO(getLogger("CasStore"),
-                    "CAS self-remount '{}': waiting out a stale mount (uuid={} epoch={} expires_at_ms={}, "
-                    "wait_deadline_ms={})",
-                    srid, u128ToHex(held.server_uuid), held.writer_epoch, held.expires_at_ms, wait_deadline_ms);
+                    "CAS self-remount '{}': observing a stale-looking mount's write-token (uuid={} "
+                    "epoch={} expires_at_ms={}) for up to ~{} ms before reclaiming",
+                    srid, u128ToHex(held.server_uuid), held.writer_epoch, held.expires_at_ms, threshold_ms);
             },
             emit_mount_event);
         if (claim.kind != MountClaimResult::Claimed)

@@ -135,7 +135,7 @@ TEST(CasMountAudit, ClaimReleaseAndForeignConflictEmitEvents)
 
     const uint64_t now_ms = 1'000'000;
     /// mint for uuid 1 -> one mount_claim
-    ASSERT_EQ(claimMount(*backend, layout, "a", UInt128{1}, 1, now_ms, /*ttl_ms=*/10'000, sink).kind,
+    ASSERT_EQ(claimMount(*backend, layout, "a", UInt128{1}, 1, now_ms, /*ttl_ms=*/10'000, {}, sink).kind,
               MountClaimResult::Claimed);
     ASSERT_EQ(seen.size(), 1u);
     EXPECT_EQ(seen[0].type, CasEventType::MountClaim);
@@ -144,7 +144,7 @@ TEST(CasMountAudit, ClaimReleaseAndForeignConflictEmitEvents)
 
     /// a FOREIGN uuid claiming a live slot -> mount_conflict carrying the current holder's identity
     seen.clear();
-    (void)claimMount(*backend, layout, "a", UInt128{2}, 1, now_ms, /*ttl_ms=*/10'000, sink);
+    (void)claimMount(*backend, layout, "a", UInt128{2}, 1, now_ms, /*ttl_ms=*/10'000, {}, sink);
     ASSERT_FALSE(seen.empty());
     EXPECT_EQ(seen.back().type, CasEventType::MountConflict);
     EXPECT_EQ(seen.back().detail.at("srid"), "a");
