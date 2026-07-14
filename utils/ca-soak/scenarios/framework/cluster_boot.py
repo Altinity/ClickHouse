@@ -33,12 +33,15 @@ _VARIANT_FILE = {
     "s3faultproxy": "docker-compose-s3faultproxy.yml",
     # S27: same proxy, LIST-anomaly mode (duplicate keys / dropped continuation token).
     "s3listproxy": "docker-compose-s3faultproxy.yml",
+    # S38: raised materialization_grace_ms (T_mat) + a published RustFS port (18121) for direct
+    # object-store injection (the late-PUT test).
+    "s38": "docker-compose-s38.yml",
 }
 
 # Replica count per compose variant — drives the N-node Cluster + health wait + log-dir prep.
 _VARIANT_NODES = {
     None: 2, "default": 2, "gc_shards2": 2, "smalldedupcache": 2,
-    "tenreplicas": 10, "gc_shards8": 2, "s3faultproxy": 2, "s3listproxy": 2,
+    "tenreplicas": 10, "gc_shards8": 2, "s3faultproxy": 2, "s3listproxy": 2, "s38": 2,
 }
 
 

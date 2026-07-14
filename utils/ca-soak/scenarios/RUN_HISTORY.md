@@ -324,3 +324,18 @@ Every attempted scenario run is appended here (newest at the bottom). `run_dir` 
 | 2026-07-13T17:46:44 | S33 | 42 | dev | 900s | pass | dcdaf479cd2c | 20260713T174614_S33_seed42 |  |
 | 2026-07-13T17:47:38 | S34 | 42 | dev | 900s | pass | dcdaf479cd2c | 20260713T174656_S34_seed42 |  |
 | 2026-07-13T17:48:23 | S35 | 42 | dev | 900s | pass | dcdaf479cd2c | 20260713T174747_S35_seed42 |  |
+| 2026-07-13T18:16:47 | S06 | 44 | dev | 900s | fail | 2174a893f33d | 20260713T181600_S06_seed44 |  |
+| 2026-07-13T18:20:34 | S07 | 44 | dev | 900s | fail | 2174a893f33d | 20260713T181937_S07_seed44 | S07 could not trigger a manifest cap with dev-scale SQL — recorded inconclusive for the direct cap trip; the indirect fail-closed property check still runs. |
+| 2026-07-13T18:25:27 | S13 | 44 | dev | 900s | pass | 2174a893f33d | 20260713T182111_S13_seed44 |  |
+| 2026-07-13T18:30:51 | S06 | 45 | dev | 900s | inconclusive | 7a22bc5b700a | 20260713T182958_S06_seed45 |  |
+| 2026-07-13T18:32:12 | S07 | 45 | dev | 900s | inconclusive | 7a22bc5b700a | 20260713T183115_S07_seed45 | S07 could not trigger a manifest cap with dev-scale SQL — recorded inconclusive for the direct cap trip; the indirect fail-closed property check still runs. |
+| 2026-07-13T18:50:44 | S01 | 46 | full | 900s | pass | 7a22bc5b700a | 20260713T184953_S01_seed46 |  |
+| 2026-07-13T19:00:12 | S07 | 46 | full | 900s | inconclusive | 7a22bc5b700a | 20260713T185131_S07_seed46 | S07 could not trigger a manifest cap with dev-scale SQL — recorded inconclusive for the direct cap trip; the indirect fail-closed property check still runs. |
+| 2026-07-13T19:56:40 | S08 | 46 | ci | 900s | inconclusive | 7a22bc5b700a | 20260713T192931_S08_seed46 |  |
+| 2026-07-13T20:00:17 | S21 | 46 | ci | 900s | inconclusive | 7a22bc5b700a | 20260713T195730_S21_seed46 |  |
+| 2026-07-13T20:02:50 | S29 | 46 | full | 900s | inconclusive | 7a22bc5b700a | 20260713T200118_S29_seed46 |  |
+| 2026-07-13T20:05:10 | S02 | 46 | full | 900s | pass | 7a22bc5b700a | 20260713T200357_S02_seed46 |  |
+| 2026-07-13T20:09:08 | S03 | 46 | full | 900s | fail | 7a22bc5b700a | 20260713T200548_S03_seed46 | Node(localhost:8123) HTTP 500: Code: 236. DB::Exception: stageManifest: part-manifest PUT at 'soak_pool/cas/manifests/ca_soak_ch1/store/89c/89ccd094-87f6-4932-94d5-cbdeef131f2a@cas@/0000000000000001-00000000000009b4/000001.proto' is UNCERTAIN (retry budget exhausted) — nothing conclusive was named; the caller re-stages with a fresh ManifestId. (ABORTED) (version 26.6.1.1) / sql=INSERT INTO s03_live SELECT 12550000 + number AS id, randomString(512) AS payload FROM numbers(50000) |
+| 2026-07-14T11:52:10 | S38 | 42 | dev | 900s | fail | c1693936a3ff | 20260714T115007_S38_seed42 |  |
+| 2026-07-14T12:20:57 | S38 | 42 | dev | 900s | fail | c1693936a3ff | 20260714T115429_S38_seed42 | quiescence failed: timed out |
+| 2026-07-14T13:41:38 | S38 | 42 | dev | 900s | fail | c1693936a3ff | 20260714T131226_S38_seed42 | quiescence failed: timed out |

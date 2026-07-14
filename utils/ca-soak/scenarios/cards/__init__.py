@@ -10,3 +10,4 @@ from . import s19_s22_clone_fetch  # noqa: F401
 from . import s23_s27_misc  # noqa: F401
 from . import s28_s33_corner  # noqa: F401
 from . import s34_s35_d1_churn  # noqa: F401
+from . import s38_late_put_injection  # noqa: F401
