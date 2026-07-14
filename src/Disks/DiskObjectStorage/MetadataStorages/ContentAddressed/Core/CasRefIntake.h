@@ -121,6 +121,19 @@ RefCleanupPlan planRefCleanup(const RefTableListing & listing, const RefTxnId & 
                               const std::set<RefTxnId> & removal_logs_blocked,
                               std::optional<RefTxnId> completed_removal_snapshot = std::nullopt);
 
+/// The result of `recoverRefTableDetailed`: the replayed table state plus the two facts the T_mat
+/// late-log detector (spec §anomaly-policy, rev.6 Task 12) needs about the snapshot recovery actually
+/// selected -- its id, and (when it is a recovery seal, spec §Recovery Seal) the `sealed_from` upper
+/// bound of what that recovery's `LIST` actually observed. Both are `nullopt` exactly when recovery
+/// found no snapshot at all; `sealed_from` alone is `nullopt` whenever the selected snapshot is an
+/// ordinary published one (only a seal ever sets it).
+struct RecoveredRefTable
+{
+    RefTableState state;
+    std::optional<RefTxnId> newest_snapshot_id;
+    std::optional<RefTxnId> sealed_from;
+};
+
 /// Recover one table's state via the shared recovery equation (spec §Startup And Recovery / §Table State):
 /// one `LIST` of the table prefix, the newest valid snapshot, and replay of the later log tail through the
 /// same state machine the writer uses. This is the read-only recovery `fsck`, offline repair, and GC's
@@ -134,6 +147,12 @@ RefCleanupPlan planRefCleanup(const RefTableListing & listing, const RefTxnId & 
 /// `on_page_fetched`, if set, fires once per physical `backend.list` page across every restart attempt --
 /// a GC-owned caller's hook for a page-level ProfileEvents counter; fsck/offline-repair callers leave it
 /// unset.
+RecoveredRefTable recoverRefTableDetailed(Backend & backend, const Layout & layout, const RootNamespace & ns,
+                                          const std::function<void()> & on_page_fetched = {},
+                                          unsigned max_restarts = 3);
+
+/// Thin wrapper over `recoverRefTableDetailed` for the consumers that only need the replayed state
+/// (fsck, offline repair, the writer's own recovery-on-open, and the GC fold's owner-set builder).
 RefTableState recoverRefTable(Backend & backend, const Layout & layout, const RootNamespace & ns,
                               const std::function<void()> & on_page_fetched = {},
                               unsigned max_restarts = 3);

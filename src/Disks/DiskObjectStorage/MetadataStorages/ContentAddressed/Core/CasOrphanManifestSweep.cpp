@@ -105,6 +105,50 @@ RefTxnId sealedRefCursor(Store & store, const RootNamespace & ns)
     return RefTxnId{};
 }
 
+/// rev.6 Task 12 (spec §anomaly-policy): a listed `_log` id strictly above the recovered seal's
+/// `sealed_from` and at-or-below the seal's own `snapshot_id` provably materialized AFTER the
+/// recovery `LIST` that produced the seal -- a T_mat violation. This is LIST-only classification
+/// (the id alone, from the key); it never GETs the log body, so it never risks treating the log's
+/// operations as legitimate state (the resurrect invariant). Report via `LOG_WARNING` + one
+/// `RefLateLogDetected` event; the sweep never deletes the log itself -- GC's ordinary covered-log
+/// cleanup (`planRefCleanup`) removes it once folding catches up.
+void reportLateLogsIfAny(Store & store, const RootNamespace & ns, const RecoveredRefTable & recovered,
+                          const std::vector<RefTxnId> & logs)
+{
+    if (!recovered.sealed_from)
+        return;   /// the selected snapshot is not a seal -- no observation horizon to violate
+
+    const Layout & layout = store.layout();
+    for (const RefTxnId & id : logs)
+    {
+        if (!(*recovered.sealed_from < id))
+            continue;   /// id <= sealed_from: within the observed region, ordinary
+        if (recovered.newest_snapshot_id && *recovered.newest_snapshot_id < id)
+            continue;   /// id > the seal: not (yet) covered by it -- not provably late
+
+        LOG_WARNING(getLogger("CasOrphanManifestSweep"),
+                    "CAS T_mat violation: namespace {} log {} listed above the recovery seal's "
+                    "sealed_from {} and covered by its snapshot {} -- the store materialized a write "
+                    "after the recovery LIST; reporting only, never reviving (GC's ordinary "
+                    "covered-log cleanup removes it once folding catches up)",
+                    ns.string(), renderRefTxnId(id), renderRefTxnId(*recovered.sealed_from),
+                    renderRefTxnId(*recovered.newest_snapshot_id));
+
+        EventEmitter{store}.emit([&](CasEvent & e)
+        {
+            e.type = CasEventType::RefLateLogDetected;
+            e.namespace_ = ns.string();
+            e.at_version = id.ref_sequence;
+            e.reason = "T_mat violation: ref log listed above the recovery seal's sealed_from and "
+                       "covered by its snapshot -- reporting only, never reviving (resurrect invariant)";
+            e.detail = {{"log_id", renderRefTxnId(id)},
+                        {"key", layout.refLogKey(ns, id)},
+                        {"sealed_from", renderRefTxnId(*recovered.sealed_from)},
+                        {"seal_snapshot_id", renderRefTxnId(*recovered.newest_snapshot_id)}};
+        });
+    }
+}
+
 /// The active manifest-object-KEY set for one namespace (spec §Orphan Manifest Protection), built as the
 /// same complete view writer recovery uses:
 ///   owners in the newest snapshot + owner changes in every later log (== `recoverRefTable`'s committed
@@ -120,7 +164,8 @@ std::set<String> activeManifestKeys(Store & store, const RootNamespace & ns)
     Backend & backend = store.backend();
 
     /// Current owners = snapshot + replayed tail (committed rows + live precommits).
-    const RefTableState state = recoverRefTable(backend, layout, ns, onGcEnumerationPage);
+    const RecoveredRefTable recovered = recoverRefTableDetailed(backend, layout, ns, onGcEnumerationPage);
+    const RefTableState & state = recovered.state;
     for (const auto & [ref_name, row] : state.committed)
         active.insert(layout.manifestKey(ManifestId{ns, row.manifest_ref}));
     for (const auto & [ref_name, manifest_ref] : state.precommits)
@@ -139,6 +184,9 @@ std::set<String> activeManifestKeys(Store & store, const RootNamespace & ns)
             logs.push_back(parsed->txn_id);
     }, 1000, onGcEnumerationPage);
     std::sort(logs.begin(), logs.end());
+
+    reportLateLogsIfAny(store, ns, recovered, logs);
+
     for (const RefTxnId & id : logs)
     {
         if (!(cursor < id))

@@ -1,8 +1,11 @@
 #include <gtest/gtest.h>
 
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEvent.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasOrphanManifestSweep.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include "cas_test_helpers.h"
+#include <limits>
+#include <vector>
 
 using namespace DB::Cas;
 using namespace DB::Cas::tests;
@@ -172,4 +175,44 @@ TEST(CasOrphanManifestSweep, CursorPageSkipsOwnedBody)
     const ManifestSweepResult result = sweepManifestCursorPage(*store, "", /*list_budget*/100, /*delete_budget*/10);
     EXPECT_EQ(result.deleted, 0u);
     EXPECT_TRUE(backend->head(store->layout().manifestKey(ManifestId{ns, r})).exists);
+}
+
+/// rev.6 Task 12 (spec §anomaly-policy): a `_log` id listed strictly above a recovery seal's
+/// `sealed_from` and at-or-below the seal's own `snapshot_id` provably materialized AFTER the
+/// recovery `LIST` that produced the seal -- a T_mat violation. The sweep (which already LISTs the
+/// `_log` region for orphan-manifest protection) must report it via one `RefLateLogDetected` event
+/// and NEVER GET its body to "revive" it (the resurrect invariant): no owner state is derived from
+/// it, and the sweep itself never deletes ref-log objects (GC's ordinary covered-log cleanup does,
+/// once folding catches up).
+TEST(CasSweepLateLog, LogBetweenSealedFromAndSealIdIsReportedNotRevived)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    registerNamespaceRaw(*backend, store->layout(), ns);
+
+    /// A recovery seal: snapshot_id = {2, UINT64_MAX} (the epoch-closing upper bound recovery for
+    /// writer_epoch 3 publishes to close dead epoch 2), sealed_from = {2, 3} (the greatest id that
+    /// recovery's LIST actually observed).
+    RefTableSnapshot seal = minimalLiveSnapshot(ns.string(), RefTxnId{2, std::numeric_limits<uint64_t>::max()});
+    seal.sealed_from = RefTxnId{2, 3};
+    writeRefSnapshotRaw(*backend, store->layout(), seal);
+
+    /// A late log at {2, 7}: sealed_from (3) < 7 <= snapshot_id (UINT64_MAX) -- provably late.
+    writeRefLogTxnRaw(*backend, store->layout(), RefLogTxn{ns.string(), RefTxnId{2, 7}, {}});
+
+    setWatermarkMinActive(*backend, store->layout(), kServerRoot, kWriterEpoch, /*min_active*/6);   // prefix eligible
+
+    std::vector<CasEvent> events;
+    store->setEventSink([&](const CasEvent & e) { events.push_back(e); });
+
+    sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5});
+
+    ASSERT_EQ(events.size(), 1u);
+    EXPECT_EQ(events[0].type, CasEventType::RefLateLogDetected);
+    EXPECT_EQ(events[0].namespace_, ns.string());
+    EXPECT_EQ(events[0].at_version, 7u);
+    EXPECT_TRUE(backend->head(store->layout().refLogKey(ns, RefTxnId{2, 7})).exists)
+        << "the detector only reports the late log -- it must never delete it (that is GC's ordinary "
+           "covered-log cleanup's job once folding catches up)";
 }

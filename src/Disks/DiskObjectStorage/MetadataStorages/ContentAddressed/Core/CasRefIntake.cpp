@@ -136,8 +136,8 @@ RefCleanupPlan planRefCleanup(const RefTableListing & listing, const RefTxnId & 
     return plan;
 }
 
-RefTableState recoverRefTable(Backend & backend, const Layout & layout, const RootNamespace & ns,
-                              const std::function<void()> & on_page_fetched, unsigned max_restarts)
+RecoveredRefTable recoverRefTableDetailed(Backend & backend, const Layout & layout, const RootNamespace & ns,
+                                          const std::function<void()> & on_page_fetched, unsigned max_restarts)
 {
     for (unsigned attempt = 0;; ++attempt)
     {
@@ -208,8 +208,15 @@ RefTableState recoverRefTable(Backend & backend, const Layout & layout, const Ro
                 ns.string(), max_restarts);
         }
 
-        return replay(snapshot, tail);
+        return RecoveredRefTable{replay(snapshot, tail), snapshot_id,
+                                 snapshot ? snapshot->sealed_from : std::nullopt};
     }
+}
+
+RefTableState recoverRefTable(Backend & backend, const Layout & layout, const RootNamespace & ns,
+                              const std::function<void()> & on_page_fetched, unsigned max_restarts)
+{
+    return recoverRefTableDetailed(backend, layout, ns, on_page_fetched, max_restarts).state;
 }
 
 }

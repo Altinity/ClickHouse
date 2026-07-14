@@ -30,6 +30,13 @@ enum class CasEventType
     /// (foreign bytes at our own wedge key; the wedge hard contract violated). See
     /// `Store::reportImpossibleInterference`.
     ForeignInterference,
+    /// rev.6 (spec §anomaly-policy, Task 12): the orphan sweep's incidental, LIST-only detection of a
+    /// T_mat violation -- a `_log` object listed strictly above a recovery seal's `sealed_from` and
+    /// at-or-below the seal's `snapshot_id`, provably materialized by the store after the recovery
+    /// `LIST` that produced the seal. Report only; the sweep never GETs the log body to "revive" it
+    /// (the resurrect invariant) and never deletes it itself -- GC's ordinary covered-log cleanup
+    /// removes it once folding catches up. See `CasOrphanManifestSweep.cpp`'s `activeManifestKeys`.
+    RefLateLogDetected,
     RefResolve, ReadMissing, DanglingAccess,
     CorruptDangle, CorruptDecode, SnapJournalIncoherent, Exception,
 };
