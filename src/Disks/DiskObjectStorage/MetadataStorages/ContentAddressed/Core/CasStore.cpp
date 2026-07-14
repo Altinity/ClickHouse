@@ -499,6 +499,16 @@ Store::~Store()
             remount_thread.join();
     }
 
+    /// rev.6 Task 5 (spec §clean-release drain): the farewell marker `mount_keeper->stop()` writes is a
+    /// certificate that no in-flight ref-log conditional PUT from this incarnation can land after it --
+    /// a successor treats it as proof of a clean death (`MountPriorState::Clean`, no observation wait
+    /// needed). Writing it without an actual drain would be a protocol-safety bug: an uncertain PUT this
+    /// incarnation is still resolving could land AFTER the successor already reclaimed and started
+    /// mutating. `drainRefLanesForShutdown` is the drain; bounded by one attempt's worth of budget plus
+    /// the lease safety margin -- long enough for an in-flight attempt to resolve, never unbounded.
+    const bool drained = drainRefLanesForShutdown(
+        config.cas_request_budget.attempt_timeout_ms + config.cas_request_budget.lease_safety_margin_ms);
+
     /// Retire the merged heartbeat on a clean Store teardown: stop() runs the keeper's terminal op,
     /// which stamps the lease already-expired (expires_at_ms = now) AND folds in the watermark
     /// farewell (min_active = UINT64_MAX). Stamping it expired lets a SAME-server reopen reclaim
@@ -506,13 +516,26 @@ Store::~Store()
     /// touched the slot) must not escape the dtor — log and continue tearing down.
     if (mount_keeper)
     {
-        try
+        if (drained)
         {
-            mount_keeper->stop();
+            try
+            {
+                mount_keeper->stop();
+            }
+            catch (...)
+            {
+                tryLogCurrentException(getLogger("CasStore"), "CAS mount-lease: release during Store teardown failed");
+            }
         }
-        catch (...)
+        else
         {
-            tryLogCurrentException(getLogger("CasStore"), "CAS mount-lease: release during Store teardown failed");
+            /// Fail-closed: the drain could not certify every in-flight PUT resolved (a timeout or a
+            /// live wedge), so writing the clean farewell would be a false certificate. No terminal op --
+            /// the successor falls back to the (slower but safe) observation-based reclaim.
+            LOG_WARNING(getLogger("CasStore"),
+                "CAS store shutdown with an unresolved ref-log PUT: skipping the clean-release marker; "
+                "the next mount will treat this end as unclean");
+            mount_keeper->stopBackground();
         }
     }
 
@@ -1355,6 +1378,65 @@ size_t Store::wedgedRefLaneCount()
     return wedged;
 }
 
+bool Store::drainRefLanesForShutdown(uint64_t wait_budget_ms)
+{
+    /// Latch FIRST, then snapshot under `ref_queue_mutex` (see the `shutting_down` member comment): this
+    /// ordering is what makes the check in `appendRefOps` -- performed inside the SAME critical section
+    /// as its `pending.push_back` -- race-free against the snapshot below, for both an already-cached
+    /// table and one whose very first touch races this call.
+    shutting_down.store(true, std::memory_order_release);
+
+    std::vector<std::shared_ptr<RefTableRuntime>> runtimes;
+    {
+        std::lock_guard<std::mutex> g(ref_queue_mutex);
+        runtimes.reserve(ref_tables.size());
+        for (const auto & [_, rt] : ref_tables)
+            runtimes.push_back(rt);
+    }
+
+    /// Wait for every table's queue to go idle (no pending item, no active leader), bounded overall by
+    /// `wait_budget_ms` -- `cv.wait_until` slices against one shared deadline, never a sleep. All the
+    /// runtimes share the one `ref_queue_mutex` that guards `pending`/`leader_active` (see the
+    /// `RefTableRuntime` field comments), so a single `lk` covers every table in the loop below; each
+    /// table's OWN `cv` is what its leader/appendRefOps notifies on a state change, so the wait must
+    /// target that specific `cv`, one table at a time.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(wait_budget_ms);
+    bool timed_out = false;
+    {
+        std::unique_lock<std::mutex> lk(ref_queue_mutex);
+        for (const auto & rt : runtimes)
+        {
+            while (!(rt->pending.empty() && !rt->leader_active))
+            {
+                if (rt->cv.wait_until(lk, deadline) == std::cv_status::timeout
+                    && !(rt->pending.empty() && !rt->leader_active))
+                {
+                    timed_out = true;
+                    break;
+                }
+            }
+            if (timed_out)
+                break;
+        }
+    }
+
+    /// A queue going idle does NOT by itself prove no PUT is in flight: a wedge is recorded (under
+    /// `state_mutex`) strictly BEFORE the wedged item's caller is completed and the leader bookkeeping
+    /// reset (see `flushRefBatch`'s `Unresolved` case), so this check -- performed AFTER the wait above
+    /// -- observes it whenever the queue-idle wait itself raced a wedge. Every table is checked
+    /// regardless of `timed_out`, purely for a complete diagnostic; the return value already fails
+    /// closed on either condition alone.
+    bool any_wedge = false;
+    for (const auto & rt : runtimes)
+    {
+        std::lock_guard<std::mutex> lock(rt->state_mutex);
+        if (rt->wedge.has_value())
+            any_wedge = true;
+    }
+
+    return !timed_out && !any_wedge;
+}
+
 bool Store::observedNamespaceCleanupMarker(const RootNamespace & ns, const RefTxnId & remove_txn_id)
 {
     const auto rt = getRefTableRuntime(ns);
@@ -1401,6 +1483,13 @@ RefTxnId Store::appendRefOps(const RootNamespace & ns, MutationScope scope,
 
     const auto enqueued_at = std::chrono::steady_clock::now();
     std::unique_lock<std::mutex> lk(ref_queue_mutex);
+    /// rev.6 Task 5: refuse admission once a clean-release drain has begun (`drainRefLanesForShutdown`).
+    /// Checked in the SAME critical section as the `pending.push_back` below -- the pairing that makes
+    /// this race-free against the drain's snapshot-and-wait (see the `shutting_down` member comment).
+    if (shutting_down.load(std::memory_order_acquire))
+        throw Exception(ErrorCodes::ABORTED,
+            "CAS store is shutting down — refusing to append ref-log transactions for server_root '{}'",
+            config.server_root_id);
     rt->pending.push_back(item);
 
     while (!item->done)

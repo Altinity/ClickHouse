@@ -9,10 +9,12 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/Exception.h>
+#include <Poco/Exception.h>
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <future>
+#include <limits>
 #include <optional>
 #include <thread>
 #include <vector>
@@ -1273,6 +1275,89 @@ TEST(CasStoreRemount, ShutdownGuardRefusesToArmRemount)
     /// race-free: the armed thread never touches the handle.
     EXPECT_FALSE(store->scheduleRemountForTest())
         << "scheduleRemount must not arm a recovery thread once teardown has begun";
+}
+
+/// ==== rev.6 Task 5: clean-release drain gates the farewell marker ====
+
+namespace
+{
+/// Forces the FIRST `putIfAbsent` whose key contains `fault_key_substr` to throw an ambiguous
+/// (Unresolved-classified) exception, `fault_count` times -- the minimal one-shot subset of
+/// `RefWriterTestBackend`'s fault injection (gtest_cas_ref_writer.cpp) this file's shutdown test needs
+/// to drive a ref-log append into the `Unresolved`/wedge outcome, with `max_attempts = 1` in the budget
+/// so the single failed attempt exhausts the retry budget immediately.
+class UnresolvedPutBackend final : public DB::Cas::tests::CountingBackend
+{
+public:
+    String fault_key_substr;
+    int fault_count = 0;
+
+    DB::Cas::PutResult putIfAbsent(const String & key, const String & bytes, const DB::Cas::ObjectMeta & meta = {}) override
+    {
+        if (fault_count > 0 && !fault_key_substr.empty() && key.find(fault_key_substr) != String::npos)
+        {
+            --fault_count;
+            throw Poco::TimeoutException("UnresolvedPutBackend: simulated ambiguous result (response lost)");
+        }
+        return DB::Cas::tests::CountingBackend::putIfAbsent(key, bytes, meta);
+    }
+};
+}
+
+TEST(CasStoreShutdown, CleanStopDrainsAndWritesFarewell)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = DB::Cas::Store::open(backend, DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    publishPart(store, "srv/clean_stop", "x", "payload");
+
+    const String mount_key = store->layout().mountKey("test");
+    store.reset();   /// drives ~Store(): with no in-flight ref-log PUT, the drain must succeed.
+
+    const auto got = backend->get(mount_key);
+    ASSERT_TRUE(got.has_value());
+    const MountLease lease = decodeMountLease(got->bytes);
+    EXPECT_EQ(lease.min_active, std::numeric_limits<uint64_t>::max())
+        << "a clean drain (no in-flight ref-log PUT) must write the farewell marker";
+}
+
+TEST(CasStoreShutdown, UnresolvedWedgeSkipsFarewell)
+{
+    CasRequestBudget budget;
+    budget.max_attempts = 1;
+    budget.attempt_timeout_ms = 100;
+    budget.operation_deadline_ms = 100;
+    budget.lease_safety_margin_ms = 100;
+
+    auto backend = std::make_shared<UnresolvedPutBackend>();
+    auto store = DB::Cas::Store::open(backend, DB::Cas::PoolConfig{
+        .pool_prefix = "p", .server_root_id = "test", .cas_request_budget = budget});
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv/wedge_shutdown"};
+    publishPart(store, ns.string(), "x", "payload");
+
+    /// Force the ref-log append the drop below performs into the Unresolved/wedge outcome (as in the
+    /// wedge tests in gtest_cas_ref_writer.cpp): the single attempt the budget allows fails ambiguously.
+    backend->fault_key_substr = layout.refsNamespacePrefix(ns) + "_log/";
+    backend->fault_count = 1;
+    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { store->dropRef(ns, "x"); });
+    ASSERT_TRUE(store->refLaneWedgedForTest(ns));
+
+    const String mount_key = store->layout().mountKey("test");
+    store.reset();   /// drives ~Store(): the still-wedged lane must skip the farewell marker.
+
+    const auto got = backend->get(mount_key);
+    ASSERT_TRUE(got.has_value());
+    const MountLease lease = decodeMountLease(got->bytes);
+    EXPECT_NE(lease.min_active, std::numeric_limits<uint64_t>::max())
+        << "an unresolved ref-log PUT must skip the clean-release farewell marker";
+    EXPECT_FALSE(lease.gc_fenced);
+
+    /// A successor claimMount on this body must return LiveDoubleStart (unclean path): no certificate of
+    /// death (not fenced, not the clean farewell marker, no proven-dead observation) justifies a
+    /// same-uuid, different-epoch reclaim.
+    const MountClaimResult claim = claimMount(*backend, layout, "test", lease.server_uuid,
+        lease.writer_epoch + 1, /*now_ms=*/1, /*ttl_ms=*/30000);
+    EXPECT_EQ(claim.kind, MountClaimResult::LiveDoubleStart);
 }
 
 TEST(CasStore, ReadManifestSharedReturnsSharedDecodeWithoutCopy)

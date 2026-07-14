@@ -717,6 +717,14 @@ private:
     /// Task 13 (spec §Byte, Memory, And CPU Budget): monotonic access stamp for whole-table cache LRU
     /// eviction; bumped on every table touch, recorded in `RefTableRuntime::last_touch_tick`.
     std::atomic<uint64_t> ref_table_access_tick{0};
+    /// rev.6 Task 5 (spec §clean-release drain): latched by `drainRefLanesForShutdown` BEFORE it
+    /// snapshots `ref_tables`/waits on each table's queue -- every ordinary ref mutation (`appendRefOps`)
+    /// checks this under the SAME `ref_queue_mutex` critical section it uses to enqueue its item, so the
+    /// check-and-enqueue is atomic with the drain's snapshot-and-wait: a caller either enqueues strictly
+    /// before the drain observes this table (and the drain then waits for it), or observes this flag
+    /// already true and never enqueues at all. No caller can land a NEW item after the drain has decided
+    /// this table is idle.
+    std::atomic<bool> shutting_down{false};
 
     /// Store-wide strictly-increasing counter (spec §Ordered Ref Transaction Identifier): shared by
     /// every table of this mounted writer; a fresh writer_epoch (a new Store) restarts it at one.
@@ -779,6 +787,19 @@ private:
     void runRefQueueLeader(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt,
                            const std::shared_ptr<RefMutationItem> & own);
     void flushRefBatch(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt);
+
+    /// rev.6 Task 5 (spec §clean-release drain): the certificate the clean-release farewell marker
+    /// depends on. Latches `shutting_down` (so every ref mutation from here on is refused at admission,
+    /// see `appendRefOps`'s entry check), then waits -- bounded by `wait_budget_ms` -- for every cached
+    /// table's append queue to go idle (`pending.empty() && !leader_active`), and finally checks each
+    /// table's `wedge` under its own `state_mutex`: a queue can go idle with a wedge still recorded (the
+    /// wedged item's OWN caller already got its error and the leader bookkeeping reset -- see
+    /// `flushRefBatch`'s `Unresolved` case -- while the underlying `PUT` itself stays genuinely
+    /// unresolved). Returns true ("drained") ONLY when every queue went idle within budget AND no table
+    /// is wedged -- i.e. no in-flight ref-log conditional `PUT` from this incarnation can still land.
+    /// Fail-closed: a timeout or any remaining wedge returns false, and the caller (`~Store`) must skip
+    /// the farewell marker rather than certify a death this incarnation cannot actually prove.
+    bool drainRefLanesForShutdown(uint64_t wait_budget_ms);
 
     /// See `setRefPreCarveHookForTest`. Null in production (a no-op call site).
     std::function<void()> ref_pre_carve_hook_for_test;
