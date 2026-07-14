@@ -198,6 +198,14 @@ uint64_t Store::bootMsNow() const
     return config.boot_ms_fn ? config.boot_ms_fn() : bootMs();
 }
 
+void Store::waitSleep(uint64_t ms) const
+{
+    if (config.wait_sleep_fn)
+        config.wait_sleep_fn(ms);
+    else
+        std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+}
+
 bool Store::mayMutate() const
 {
     return !mount_fence.lost.load(std::memory_order_acquire)
@@ -355,10 +363,11 @@ StorePtr Store::open(BackendPtr backend, PoolConfig config)
         /// observation window. Derived from existing config — no new knob (spec §Config).
         const uint64_t poll_interval_ms = std::max<uint64_t>(
             1, static_cast<uint64_t>(store->config.mount_renew_period.count()) / 2);
-        const auto sleep_ms = [](uint64_t ms)
-        {
-            std::this_thread::sleep_for(std::chrono::milliseconds(ms));
-        };
+        /// rev.6 Task 6: routes through `store->waitSleep` (which itself routes through
+        /// `config.wait_sleep_fn` when a test injected one) rather than a bare `sleep_for` directly, so
+        /// a test intercepting `wait_sleep_fn` observes every wait `open` can block on -- this
+        /// observation poll AND the `materialization_grace_ms` wait below.
+        const auto sleep_ms = [s = store.get()](uint64_t ms) { s->waitSleep(ms); };
         /// Operator-visible log the moment startup decides to watch a stale-looking self-mount (the
         /// disk-open path blocks up to ~threshold_ms here, so a silent block would be confusing). May
         /// fire more than once per open: the observation restarts (and re-logs) every time the watched
@@ -398,6 +407,10 @@ StorePtr Store::open(BackendPtr backend, PoolConfig config)
         /// re-claim. Bounded so a pathological fence storm still fails closed. The fence can surface two
         /// ways: `claimMount` observes an already-fenced own slot (`FencedSelf`), or the keeper's adopt
         /// races a fence between its GET and CAS (`MountFencedException` from `start()`).
+        /// rev.6 Task 6: which certificate of death (if any) justified the reclaim FINALLY adopted below
+        /// (the last iteration's `claim` before `break` -- `claim` itself is loop-scoped). Read after the
+        /// loop to decide the materialization-grace wait.
+        MountPriorState claimed_prior = MountPriorState::None;
         constexpr int max_fence_recoveries = 3;
         for (int fence_recovery = 0; ; ++fence_recovery)
         {
@@ -423,6 +436,7 @@ StorePtr Store::open(BackendPtr backend, PoolConfig config)
                 /// with the actionable, multi-line startup error (spec §mount-safety).
                 throw Exception(ErrorCodes::ABORTED, "{}", mountDoubleStartMessage(srid, claim.body));
             }
+            claimed_prior = claim.prior;
 
             /// The mount object now holds OUR live (uuid, epoch) body. Construct + start the keeper, which
             /// ADOPTS that very (uuid, epoch) slot rather than self-tripping the double-start guard.
@@ -460,6 +474,22 @@ StorePtr Store::open(BackendPtr backend, PoolConfig config)
                 continue;
             }
             break;
+        }
+
+        /// rev.6 Task 6 (spec §Late Predecessor PUT): a reclaim over a predecessor whose death was NOT
+        /// proven clean may still have a conditional PUT from that predecessor in flight when this
+        /// incarnation starts trusting its recovery listings -- `Fenced` and `UncleanObserved` are
+        /// exactly the two `MountPriorState`s with no such proof (`Clean`, Task 5's drained farewell,
+        /// and `None`, a fresh mount / same-epoch refresh with nothing to hand over, pay nothing).
+        if (claimed_prior == MountPriorState::Fenced || claimed_prior == MountPriorState::UncleanObserved)
+        {
+            store->unclean_epoch_boundary_seen.store(true, std::memory_order_relaxed);
+            const uint64_t t_mat = store->config.materialization_grace_ms;
+            LOG_INFO(getLogger("CasStore"),
+                "Content-addressed mount {} follows an unclean predecessor; waiting {} ms "
+                "(materialization grace) for the store to finalize or drop its accepted "
+                "requests before trusting recovery listings", srid, t_mat);
+            store->waitSleep(t_mat);
         }
 
         /// Arm the local write fence: cache (uuid, epoch) and set the boottime deadline now + ttl. From

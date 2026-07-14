@@ -145,7 +145,8 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     StagingBackend staging_backend_,
     Cas::BlobHashAlgo blob_hash_algo_,
     bool blob_hash_allow_new_,
-    bool skip_access_check_)
+    bool skip_access_check_,
+    uint64_t materialization_grace_ms_)
     : object_storage(std::move(object_storage_))
     , storage_path_prefix(std::move(storage_path_prefix_))
     , storage_path_full(fs::path(object_storage->getRootPrefix()) / storage_path_prefix)
@@ -172,6 +173,7 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     , blob_hash_algo(blob_hash_algo_)
     , blob_hash_allow_new(blob_hash_allow_new_)
     , skip_access_check(skip_access_check_)
+    , materialization_grace_ms(materialization_grace_ms_)
 {
 }
 
@@ -437,6 +439,7 @@ void ContentAddressedMetadataStorage::startup()
     pool_config.manifest_sweep_list_budget_keys = manifest_sweep_list_budget_keys;
     pool_config.manifest_sweep_delete_budget_keys = manifest_sweep_delete_budget_keys;
     pool_config.gc_meta_pool_size = gc_meta_pool_size;
+    pool_config.materialization_grace_ms = materialization_grace_ms;
     cas_store = Cas::Store::open(std::move(backend), std::move(pool_config));
     pool_uuid = Cas::u128ToHex(cas_store->poolMeta().pool_id);
     part_access = std::make_unique<ContentAddressed::CachedPartFolderAccess>(cas_store,

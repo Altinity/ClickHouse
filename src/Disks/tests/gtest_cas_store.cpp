@@ -1360,6 +1360,107 @@ TEST(CasStoreShutdown, UnresolvedWedgeSkipsFarewell)
     EXPECT_EQ(claim.kind, MountClaimResult::LiveDoubleStart);
 }
 
+/// ==== rev.6 Task 6: materialization_grace_ms (T_mat) wait on unclean mount open ====
+
+TEST(CasMountTmat, UncleanOpenWaitsMaterializationGrace)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l{"p"};
+    /// Predecessor: claim epoch 7, no farewell (simulate crash: just drop the keeper) -- a bare
+    /// `claimMount` plants the lease directly, with no clean-farewell `min_active` marker and no
+    /// `gc_fenced`, so the successor below has no certificate of death until it observes one itself.
+    ASSERT_EQ(claimMount(*b, l, "test", UInt128(1), /*epoch*/ 7, /*now_ms*/ 1000, /*ttl_ms*/ 500).kind,
+              MountClaimResult::Claimed);
+
+    /// A 500ms lease TTL is far below the default `cas_request_budget` (RFC
+    /// cas-s3-timeout-retry-control §required-timeout-model requires attempt_timeout + safety_margin <
+    /// lease TTL), so scale the budget down to fit -- mirrors `CasMountStartup::StaleSelfMountReclaimedAfterWait`.
+    const CasRequestBudget tiny_budget{
+        .attempt_timeout_ms = 50, .operation_deadline_ms = 50, .max_attempts = 1, .lease_safety_margin_ms = 50};
+
+    uint64_t fake_boot = 0;
+    std::vector<uint64_t> waits;
+    StorePtr store;
+    ASSERT_NO_THROW(
+        store = Store::open(b, PoolConfig{
+            .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "test",
+            .mount_lease_ttl_ms = std::chrono::milliseconds(500),
+            .mount_renew_period = std::chrono::milliseconds(100),
+            .cas_request_budget = tiny_budget,
+            .boot_ms_fn = [&] { return fake_boot; },
+            .materialization_grace_ms = 30000,
+            .wait_sleep_fn = [&](uint64_t ms) { fake_boot += ms; waits.push_back(ms); },
+        }));
+    ASSERT_TRUE(store);
+
+    /// The token-stability observation window (>= the 500ms ttl) AND a separate, distinct 30000ms T_mat
+    /// wait must both have been recorded.
+    EXPECT_NE(std::find(waits.begin(), waits.end(), uint64_t{30000}), waits.end())
+        << "the materialization_grace_ms wait must be among the recorded waits";
+    uint64_t total = 0;
+    for (uint64_t w : waits)
+        total += w;
+    EXPECT_GE(total - 30000, 500u) << "the observation window must ALSO have been paid, on top of T_mat";
+    EXPECT_TRUE(store->uncleanEpochBoundarySeenForTest());
+}
+
+TEST(CasMountTmat, CleanOpenSkipsAllWaits)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    /// Predecessor released cleanly (drain + farewell from Task 5): open, then reset() drives ~Store(),
+    /// which -- with nothing in flight -- writes the farewell marker (min_active == UINT64_MAX).
+    auto predecessor = Store::open(b, PoolConfig{
+        .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "test"});
+    predecessor.reset();
+
+    std::vector<uint64_t> waits;
+    StorePtr successor;
+    ASSERT_NO_THROW(
+        successor = Store::open(b, PoolConfig{
+            .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "test",
+            .materialization_grace_ms = 30000,
+            .wait_sleep_fn = [&](uint64_t ms) { waits.push_back(ms); },
+        }));
+    ASSERT_TRUE(successor);
+
+    EXPECT_TRUE(waits.empty())
+        << "a clean farewell (Task 5) needs neither the observation window nor T_mat";
+    EXPECT_FALSE(successor->uncleanEpochBoundarySeenForTest());
+}
+
+TEST(CasMountTmat, FencedPriorPaysOnlyTmat)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l{"p"};
+    ASSERT_EQ(claimMount(*b, l, "test", UInt128(1), /*epoch*/ 7, /*now_ms*/ 1000, /*ttl_ms*/ 500).kind,
+              MountClaimResult::Claimed);
+    /// Predecessor lease carries gc_fenced=true: fence it directly, exactly as `computeHeartbeatFloor`'s
+    /// fence-out does (preserve the body, gc_fenced = true, seq + 1, token-guarded).
+    fenceOutMount(*b, l.mountKey("test"));
+
+    /// See UncleanOpenWaitsMaterializationGrace above: a 500ms TTL needs a scaled-down budget too.
+    const CasRequestBudget tiny_budget{
+        .attempt_timeout_ms = 50, .operation_deadline_ms = 50, .max_attempts = 1, .lease_safety_margin_ms = 50};
+
+    std::vector<uint64_t> waits;
+    StorePtr store;
+    ASSERT_NO_THROW(
+        store = Store::open(b, PoolConfig{
+            .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "test",
+            .mount_lease_ttl_ms = std::chrono::milliseconds(500),
+            .cas_request_budget = tiny_budget,
+            .materialization_grace_ms = 30000,
+            .wait_sleep_fn = [&](uint64_t ms) { waits.push_back(ms); },
+        }));
+    ASSERT_TRUE(store);
+
+    /// A GC-fenced prior is a terminal, already-threshold-gated certificate of death -- reclaimed on the
+    /// FIRST attempt, no observation polling -- so exactly one wait (T_mat) is recorded.
+    ASSERT_EQ(waits.size(), 1u);
+    EXPECT_EQ(waits[0], 30000u);
+    EXPECT_TRUE(store->uncleanEpochBoundarySeenForTest());
+}
+
 TEST(CasStore, ReadManifestSharedReturnsSharedDecodeWithoutCopy)
 {
     auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();

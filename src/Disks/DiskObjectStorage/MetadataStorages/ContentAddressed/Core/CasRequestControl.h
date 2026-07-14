@@ -115,6 +115,16 @@ struct CasRequestBudget
 /// `mount_renew_period_ms` takes no part in the inequality (the renewer keeps the fence deadline
 /// refreshed well ahead of the TTL by construction) — it is accepted only so the effective-values log
 /// line records the full picture in one place.
+///
+/// rev.6 Task 6 handover-wait invariant (design §Late Predecessor PUT): a successor mounting over an
+/// unclean predecessor pays `observation (>= mount_lease_ttl_ms) + T_mat` (`materialization_grace_ms`,
+/// `Store::open`) before trusting its recovery listings — long enough that ANY conditional PUT the
+/// predecessor could still have in flight has either landed or been dropped by ITS OWN exhausted retry
+/// budget. That holds by construction, with no separate check needed here: the predecessor's own
+/// budget bounds one logical operation's wall-clock life to `attempt_timeout_ms + lease_safety_margin_ms
+/// < mount_lease_ttl_ms` (the inequality this function already enforces at THAT predecessor's open), so
+/// `observation (>= mount_lease_ttl_ms) + T_mat >= all client timeouts + T_mat` is automatically
+/// satisfied for every predecessor this successor could ever reclaim from.
 void validateCasRequestBudget(const CasRequestBudget & budget, uint64_t mount_lease_ttl_ms, uint64_t mount_renew_period_ms);
 
 /// Outcome of a controlled CONTENT-ADDRESSED conditional create (`conditionalCreateControlled`):

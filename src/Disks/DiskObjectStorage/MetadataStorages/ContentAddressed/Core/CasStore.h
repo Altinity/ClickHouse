@@ -195,6 +195,22 @@ struct PoolConfig
     /// boot clock (`Store::bootMs`); injected by tests to drive the fence deadline deterministically.
     std::function<uint64_t()> boot_ms_fn = {};
 
+    /// rev.6 Task 6 (design §Late Predecessor PUT / §token-stability observation): the CONDITIONAL
+    /// wait `Store::open` pays after reclaiming a mount whose predecessor's death was NOT proven clean
+    /// (`MountClaimResult::prior` is `Fenced` or `UncleanObserved`) -- long enough for a still-in-flight
+    /// conditional PUT from that predecessor to either land or be dropped by its own exhausted retry
+    /// budget before this incarnation trusts its recovery listings. A `Clean` farewell (Task 5's drained
+    /// dtor) already proves no such write can still be in flight, so it pays nothing; lowering this
+    /// value increases the risk that a late-materializing predecessor write is dropped or observed
+    /// inconsistently by a reader racing this incarnation's early mutations.
+    uint64_t materialization_grace_ms = 30000;   /// T_mat; lowering increases the risk that a
+                                                  /// late-materializing predecessor write is dropped
+    /// Test hook for open/remount waits: `Store::waitSleep` -- the mount-claim observation loop's poll
+    /// AND the `materialization_grace_ms` wait above -- routes through this function when set instead
+    /// of a real `std::this_thread::sleep_for`, so a test observes every wait without actually
+    /// blocking. Empty (the production default) sleeps for real.
+    std::function<void(uint64_t)> wait_sleep_fn = {};   /// test hook for open/remount waits
+
     /// Task 11 (spec §writer-snapshot-publication): a table becomes a publish candidate once its
     /// PUBLISHABLE tail -- entries aged past `snapshot_min_log_age_ms` AND strictly above the newest
     /// published snapshot -- exceeds either threshold (their count / the sum of their encoded bytes),
@@ -539,6 +555,11 @@ public:
     /// Test seam: latch `remount_shutting_down` exactly as `~Store()` does at its top, WITHOUT tearing
     /// the Store down, so a test can assert `scheduleRemount` refuses to spawn once teardown has begun.
     void beginShutdownForTest();
+
+    /// rev.6 Task 6: sticky once a writable `open` reclaimed a mount over an unclean predecessor
+    /// (`MountPriorState::Fenced` or `UncleanObserved` -- see `materialization_grace_ms`). Never
+    /// cleared for the life of this incarnation. Task 8 reads the underlying flag; this is the test seam.
+    bool uncleanEpochBoundarySeenForTest() const { return unclean_epoch_boundary_seen.load(std::memory_order_relaxed); }
 
     /// P1 known-present blob-hash cache (design 2026-06-20, B168). A HINT only — correctness never
     /// depends on it: a hit just makes putBlob go HEAD-first, and a stale hit is caught by that HEAD.
@@ -998,6 +1019,16 @@ private:
     /// lost = false), so mayMutate is true until Task 7 arms it with a real lease deadline and the
     /// renewer trips it. Gates the ref-append mutate chokepoint.
     MountFence mount_fence;
+
+    /// rev.6 Task 6: latched true the moment a writable `open` reclaims a mount whose predecessor's
+    /// death was NOT proven clean (`MountPriorState::Fenced` or `UncleanObserved`). Sticky for the life
+    /// of this incarnation -- Task 8 consumes it; see `uncleanEpochBoundarySeenForTest`.
+    std::atomic<bool> unclean_epoch_boundary_seen{false};
+
+    /// rev.6 Task 6 / S13 observation loop: the ONE seam both `Store::open`'s mount-claim observation
+    /// poll and the `materialization_grace_ms` wait go through. Routes through `config.wait_sleep_fn`
+    /// when a test injected one, else a real `std::this_thread::sleep_for` (production, unchanged).
+    void waitSleep(uint64_t ms) const;
 
     /// Phase 1c manifest decode cache: (ManifestId, Token) -> decoded immutable PartManifest. Part
     /// manifests are immutable single-owner objects, so a token match guarantees identical bytes; the

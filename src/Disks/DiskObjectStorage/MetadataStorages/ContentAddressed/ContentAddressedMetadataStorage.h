@@ -99,7 +99,13 @@ public:
         /// per-disk `<skip_access_check>` config directive by the factory and threaded into
         /// `Cas::PoolConfig` in `startup()`. Trailing default `false` keeps every existing positional
         /// call site compiling unmodified.
-        bool skip_access_check_ = false);
+        bool skip_access_check_ = false,
+        /// rev.6 Task 6: the conditional post-reclaim wait over an unclean predecessor, read from the
+        /// per-disk `<materialization_grace_ms>` config directive and threaded into `Cas::PoolConfig`
+        /// in `startup()`. See `Cas::PoolConfig::materialization_grace_ms`. Trailing default (the same
+        /// 30000 default as the `PoolConfig` field) keeps every existing positional call site compiling
+        /// unmodified.
+        uint64_t materialization_grace_ms_ = 30000);
 
     /// Parse `staging_backend` from the CAS disk config (default `local` — the OFF BY DEFAULT
     /// global constraint). Extracted as a static method (rather than inlined into
@@ -352,6 +358,9 @@ private:
     /// Boot-time "start now, fix later": the per-disk `<skip_access_check>` directive, threaded into
     /// `Cas::PoolConfig` in `startup()`. See `Cas::PoolConfig::skip_access_check`.
     const bool skip_access_check;
+    /// rev.6 Task 6: the per-disk `<materialization_grace_ms>` directive, threaded into `Cas::PoolConfig`
+    /// in `startup()`. See `Cas::PoolConfig::materialization_grace_ms`.
+    const uint64_t materialization_grace_ms;
     /// Set later by the mount-time conditional-copy capability probe (a later task) — NOT const.
     /// Defaults to false (fail-close): assumed unsupported until the probe proves otherwise.
     bool conditional_copy_supported = false;

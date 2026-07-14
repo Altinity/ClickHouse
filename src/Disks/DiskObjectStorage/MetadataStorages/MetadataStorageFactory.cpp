@@ -303,6 +303,9 @@ static void registerContentAddressedMetadataStorage(MetadataStorageFactory & fac
         /// Task 5: bounded pool size for GC's per-hash freshness-meta writes (condemn/spare/delete) —
         /// a mass-DROP condemning ~1M blobs sequentially would take hours; see `PoolConfig::gc_meta_pool_size`.
         const uint64_t gc_meta_pool_size = config.getUInt64(config_prefix + ".gc_meta_pool_size", 16);
+        /// rev.6 Task 6 (spec §Late Predecessor PUT): the conditional post-reclaim wait `Store::open`
+        /// pays over an unclean predecessor; see `Cas::PoolConfig::materialization_grace_ms`.
+        const uint64_t materialization_grace_ms = config.getUInt64(config_prefix + ".materialization_grace_ms", 30000);
         /// S3-native staging (design 2026-07-11-cas-s3-native-staging-design.md §4, plan Task 0):
         /// `staging_backend` defaults to `local` — BYTE-FOR-BYTE the current write path, zero
         /// behavior change, no probe, no new code path taken (global constraint: OFF BY DEFAULT).
@@ -314,7 +317,7 @@ static void registerContentAddressedMetadataStorage(MetadataStorageFactory & fac
             gcs_max_conditional_put_bytes,
             part_folder_cache_bytes, part_folder_cache_max_entries, part_folder_cache_max_entry_bytes,
             manifest_decode_cache_bytes, gc_meta_pool_size, staging_backend, blob_hash_algo, blob_hash_allow_new,
-            skip_access_check);
+            skip_access_check, materialization_grace_ms);
 
         return metadata_storage;
     });
