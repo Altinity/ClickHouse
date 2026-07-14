@@ -580,7 +580,9 @@ public:
     /// (unit tests, log disabled) makes emitEvent a no-op single branch. Build/Gc reach this via
     /// their owning Store. `reason`/`detail` on the event carry the decision's full rationale.
     void setEventSink(CasEventSink sink) { event_sink_ = std::move(sink); }
-    void emitEvent(const CasEvent & e) const { if (event_sink_) event_sink_(e); }
+    /// Rvalue-only: forces every call site to `std::move` its (dead-after) `CasEvent` local, so a
+    /// site a future edit forgets to update is a COMPILE ERROR here rather than a silent deep copy.
+    void emitEvent(CasEvent && e) const { if (event_sink_) event_sink_(std::move(e)); }
     /// Cheap predicate so query-frequency hooks can skip constructing the CasEvent (+ its detail map)
     /// entirely when the log is disabled (sink null) — a true no-op on the production hot path.
     bool hasEventSink() const noexcept { return static_cast<bool>(event_sink_); }

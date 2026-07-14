@@ -319,7 +319,7 @@ Cas::CasEventSink ContentAddressedMetadataStorage::makeCasEventSink() const
     /// The configured disk name (threaded from the metadata-storage factory); falls back to
     /// storage_path_prefix for callers that don't supply one (e.g. unit tests).
     const String disk = disk_name;
-    return [ctx, disk](const Cas::CasEvent & ev)
+    return [ctx, disk](Cas::CasEvent ev)
     {
         auto log = ctx->getContentAddressedLog();
         if (!log)
@@ -330,19 +330,19 @@ Cas::CasEventSink ContentAddressedMetadataStorage::makeCasEventSink() const
         e.event_time_microseconds = timeInMicroseconds(now);
         e.event_type = toString(ev.type);
         e.disk_name = disk;
-        e.namespace_ = ev.namespace_;
-        e.ref_name = ev.ref_name;
+        e.namespace_ = std::move(ev.namespace_);
+        e.ref_name = std::move(ev.ref_name);
         e.object_kind = toString(ev.object_kind);
-        e.object_hash = ev.object_hash;
-        e.token = ev.token;
+        e.object_hash = std::move(ev.object_hash);
+        e.token = std::move(ev.token);
         e.round = ev.round;
         e.gen = ev.gen;
         e.at_version = ev.at_version;
-        e.outcome = ev.outcome;
-        e.reason = ev.reason;
+        e.outcome = std::move(ev.outcome);
+        e.reason = std::move(ev.reason);
         e.thread_id = getThreadId();
         e.query_id = CurrentThread::getQueryId();
-        e.detail = ev.detail;
+        e.detail = std::move(ev.detail);
         /// Best-effort: SystemLog::add never blocks the Core; a full queue drops the row with a warning.
         log->add(std::move(e));
     };

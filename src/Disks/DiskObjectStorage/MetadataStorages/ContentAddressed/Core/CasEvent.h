@@ -69,7 +69,11 @@ struct CasEvent
     std::map<String, String> detail;
 };
 
-using CasEventSink = std::function<void(const CasEvent &)>;
+/// Round-B opt §6: by VALUE, not `const &` -- every caller (the sink assignment in `setEventSink`
+/// and every emission site below) passes an rvalue, so the sink's own by-value parameter is
+/// move-constructed from the temporary rather than deep-copying every field (incl. the `detail` map)
+/// on the hot emitter thread.
+using CasEventSink = std::function<void(CasEvent)>;
 
 /// Collapses the repeated `if (store->hasEventSink()) { CasEvent e; e.field = …; store->emitEvent(e); }`
 /// boilerplate at every emission site into a single `emitter.emit([&](CasEvent & e){ … })`. The emitter
@@ -94,7 +98,7 @@ public:
             return;
         CasEvent event;
         build(event);
-        store.emitEvent(event);
+        store.emitEvent(std::move(event));
     }
 
 private:

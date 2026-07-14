@@ -330,7 +330,7 @@ void emitMountEvent(const CasEventSink & sink, CasEventType type, const String &
         e.detail["holder_seq"] = std::to_string(observed->seq);
         e.detail["holder_expires_at_ms"] = std::to_string(observed->expires_at_ms);
     }
-    sink(e);
+    sink(std::move(e));
 }
 }
 

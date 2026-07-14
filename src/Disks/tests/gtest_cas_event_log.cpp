@@ -5,11 +5,25 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
 #include <Disks/tests/cas_test_helpers.h>
+#include <Interpreters/ContentAddressedLog.h>
+#include <DataTypes/DataTypeLowCardinality.h>
+#include <Common/typeid_cast.h>
 #include <mutex>
 #include <vector>
 using namespace DB::Cas;
 using DB::Cas::tests::idOf;
 using DB::Cas::tests::u128Of;
+
+/// Round-B opt §6: `reason` is templated rationale (a handful of distinct strings repeated across
+/// every row), unlike `object_hash`/`token` which are genuinely per-row varied -- it belongs alongside
+/// the log's other LowCardinality columns (event_type/object_kind/outcome), not as a full String.
+TEST(ContentAddressedLog, ReasonColumnIsLowCardinality)
+{
+    const auto columns = DB::ContentAddressedLogElement::getColumnsDescription();
+    const auto & reason_col = columns.get("reason");
+    EXPECT_TRUE(typeid_cast<const DB::DataTypeLowCardinality *>(reason_col.type.get()))
+        << "reason column must be LowCardinality(String) (Round-B opt §6)";
+}
 TEST(CasEvent, ConstructAndCopyAndName)
 {
     CasEvent e;
@@ -39,13 +53,40 @@ TEST(CasEvent, StoreEmitsToSink)
     CasEvent e;
     e.type = CasEventType::BlobPut;
     e.object_hash = "h";
-    s->emitEvent(e);
+    s->emitEvent(std::move(e));
     ASSERT_EQ(seen.size(), 1u);
     EXPECT_EQ(seen[0].type, CasEventType::BlobPut);
     /// null sink => no-op (no crash, no row)
     s->setEventSink(nullptr);
-    s->emitEvent(e);
+    s->emitEvent(std::move(e));
     EXPECT_EQ(seen.size(), 1u);
+}
+
+/// Round-B opt §6: `emitEvent` takes the event BY VALUE (moved-through, not `const &`), so a
+/// caller's local is genuinely moved-from -- not merely copied via a const reference -- by the time
+/// the sink runs. Mirrors `makeCasEventSink`'s own move-out-of-the-by-value-event idiom (a small test
+/// double stands in for the `ContentAddressedLogElement` it would normally build).
+TEST(CasEvent, EmitEventMovesSourceIntoSink)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    String captured_reason;
+    std::map<String, String> captured_detail;
+    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    s->setEventSink([&](CasEvent ev)
+    {
+        captured_reason = std::move(ev.reason);
+        captured_detail = std::move(ev.detail);
+    });
+    CasEvent e;
+    e.type = CasEventType::BlobPut;
+    e.reason = "sentinel-reason";
+    e.detail["k"] = "v";
+    s->emitEvent(std::move(e));
+    EXPECT_EQ(captured_reason, "sentinel-reason");
+    EXPECT_EQ(captured_detail.at("k"), "v");
+    /// the source event must be MOVED-FROM after emit, not merely aliased/copied through
+    EXPECT_TRUE(e.reason.empty());
+    EXPECT_TRUE(e.detail.empty());
 }
 
 namespace

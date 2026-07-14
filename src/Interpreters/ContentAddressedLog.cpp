@@ -32,7 +32,7 @@ ColumnsDescription ContentAddressedLogElement::getColumnsDescription()
         {"gen", std::make_shared<DataTypeUInt64>(), "GC snapshot generation (0 if N/A)."},
         {"at_version", std::make_shared<DataTypeUInt64>(), "Manifest shard_version of the driving journal record (0 if N/A)."},
         {"outcome", lc_string, "Decision outcome (ok/adopt/resurrect/deleted/replaced/spared/absent/zeroed/skipped/...)."},
-        {"reason", std::make_shared<DataTypeString>(), "Human-readable WHY of the decision (the rationale)."},
+        {"reason", lc_string, "Human-readable WHY of the decision (the rationale) -- templated across rows, so LowCardinality."},
         {"thread_id", std::make_shared<DataTypeUInt64>(), "OS thread that emitted the event."},
         {"query_id", std::make_shared<DataTypeString>(), "Query id for correlation with system.query_log (empty if N/A)."},
         {"detail", std::make_shared<DataTypeMap>(lc_string, std::make_shared<DataTypeString>()),

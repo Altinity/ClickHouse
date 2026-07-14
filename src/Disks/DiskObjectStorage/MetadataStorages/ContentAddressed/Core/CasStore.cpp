@@ -391,7 +391,7 @@ StorePtr Store::open(BackendPtr backend, PoolConfig config)
         /// every other B170 emission site in this file already has (`hasEventSink()`/`emitEvent()`).
         /// `s` outlives the lambda: it is captured by raw pointer into the keeper, a member of
         /// `Store` destroyed before the `Store` itself.
-        const auto emit_mount_event = [s = store.get()](const CasEvent & e) { s->emitEvent(e); };
+        const auto emit_mount_event = [s = store.get()](CasEvent e) { s->emitEvent(std::move(e)); };
 
         Store * raw = store.get();
 
@@ -705,7 +705,7 @@ bool Store::tryRemountOnce()
 
         /// Mount-slot writer audit: `this` is already fully open (setEventSink ran long ago), so
         /// unlike the initial `open`, every event fired below reaches the real sink immediately.
-        const auto emit_mount_event = [this](const CasEvent & e) { emitEvent(e); };
+        const auto emit_mount_event = [this](CasEvent e) { emitEvent(std::move(e)); };
 
         const auto sleep_ms = [](uint64_t ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); };
         const MountClaimResult claim = claimMountAwaitingExpiry(
@@ -936,7 +936,7 @@ std::optional<Resolved> Store::resolveRef(const RootNamespace & ns, const String
         _ev0.object_hash = manifestRefDebugString(row.manifest_ref);
         _ev0.outcome = "resolved";
         _ev0.reason = "read-side resolve of a ref to its part manifest";
-        emitEvent(_ev0);
+        emitEvent(std::move(_ev0));
     }
     return Resolved{
         .manifest_id = ManifestId{.root_namespace = ns, .ref = row.manifest_ref},
@@ -979,7 +979,7 @@ std::shared_ptr<const PartManifest> Store::readManifestShared(const ManifestId &
             _ev1.outcome = "missing";
             _ev1.reason = "live ref names manifest but its object is missing (INV-NO-DANGLE)";
             _ev1.detail = {{"code", "FILE_DOESNT_EXIST"}, {"site", "readManifest"}};
-            emitEvent(_ev1);
+            emitEvent(std::move(_ev1));
         }
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
             "live ref names manifest at {} but its object is missing — INV-NO-DANGLE", key);
@@ -1010,7 +1010,7 @@ std::shared_ptr<const PartManifest> Store::readManifestShared(const ManifestId &
             _ev2.outcome = "corrupt";
             _ev2.reason = "manifest body `ref` does not match the journal ManifestRef (refMatchesBody)";
             _ev2.detail = {{"code", "CORRUPTED_DATA"}, {"site", "readManifest"}};
-            emitEvent(_ev2);
+            emitEvent(std::move(_ev2));
         }
         throw Exception(ErrorCodes::CORRUPTED_DATA,
             "CAS manifest at {} body ref does not match the journal ManifestRef — refMatchesBody", key);
@@ -1029,7 +1029,7 @@ std::shared_ptr<const PartManifest> Store::readManifestShared(const ManifestId &
             _ev3.outcome = "corrupt";
             _ev3.reason = "manifest body root_namespace_id does not match the owning namespace (manifestNamespaceMatches)";
             _ev3.detail = {{"code", "CORRUPTED_DATA"}, {"site", "readManifest"}};
-            emitEvent(_ev3);
+            emitEvent(std::move(_ev3));
         }
         throw Exception(ErrorCodes::CORRUPTED_DATA,
             "CAS manifest at {} body root_namespace_id does not match the owning namespace — manifestNamespaceMatches", key);
@@ -2748,7 +2748,7 @@ void Store::dropRef(const RootNamespace & ns, const String & ref_name)
         _ev3.at_version = txn_id.ref_sequence;
         _ev3.outcome = "ok";
         _ev3.reason = "dropRef: appended an owner_transition removal ref-log transaction";
-        emitEvent(_ev3);
+        emitEvent(std::move(_ev3));
     }
 }
 
