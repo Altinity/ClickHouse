@@ -275,7 +275,7 @@ amendment notes after Step 4 below for the full account — do not re-derive the
 `SupersededWriterMakesNoMutation`" framing below at face value for `_sab_wallclockreclaim` (dropped from
 its invariant list, round 8), do not look for `_sab_supersededwrites.cfg` (retired, round 8), and do not
 assume `_rev6_observe`'s expected verdict is merely "`W_ObservedReclaim` reachable, safety unverified
-beyond that point" (round 6-era framing) — it is now fully GREEN across all 7 safety invariants,
+beyond that point" (round 6-era framing) — it is now fully GREEN across all 8 checked invariants,
 exhaustively.)
 
 **Files (final, post round-10):**
@@ -299,9 +299,16 @@ exhaustively.)
 
 - [ ] **Step 1: Model clock-rate drift and the two reclaim rules**
 
-**AMENDED 2026-07-14 — this is the FINAL model text as committed, not the original brief's elided
-pseudocode (the two `<take over: ...>` placeholders below were never actually satisfiable as literally
-written — see the amendment note for why).** In `CaCasMountCore.tla`:
+**AMENDED 2026-07-14 (second pass, after re-review of `9f2d85e8439`) — this block is a SKETCH of the
+key shapes; the CANONICAL text is the committed `CaCasMountCore.tla` plus Amendment 2 below. Rounds
+7-10 changed three things relative to the first amendment of this block: (1) `ObservedReclaim` and
+`WallClockReclaim` INSTALL the successor body (`mount' = [uuid |-> mount.uuid, epoch |-> epoch',
+deadline |-> clock + TTL, fenced |-> FALSE]`) and bump `mtoken` — they are NOT `UNCHANGED
+<<mount, mtoken>>`; (2) `Write` is the PURE LOCAL check `~rejected /\ ~wedged /\ ~crashed[a] /\
+owner = a /\ clock < fenceUntil` — `epochOK` and `~mount.fenced` are GONE (product: `mayMutate`
+reads only local fence fields, `CasStore.cpp:201-205`); (3) `GcFence`/`ClearExpiredMount` are
+Drift-aware (`mount.deadline + Drift <= clock`). Do not implement from the sketch below where it
+contradicts this note.** In `CaCasMountCore.tla`:
 
 ```tla
 CONSTANTS ..., Drift,               \* max extra ticks the holder's true fence outlives the stamp
@@ -644,7 +651,7 @@ forms there); `_sab_foreigntakeover` → `ForeignUuidNeverAutoTakesOver`; `_sab_
 counterexample TLC's breadth-first search reports; earlier rounds' reports mischaracterized this
 mechanism as routing through `AdoptWrite`, corrected in the round-10 report); `_witness_reclaim` →
 `W_SameUuidReclaimsExpired`; `_witness_remountafterfence` → `W_RemountAfterFence`; `_rev6_observe` →
-**fully GREEN, exhaustive, all 7 invariants** (`TypeOK`, `NoTwoServerUuidsOwnSameServerRoot`,
+**fully GREEN, exhaustive, all 8 checked invariants** (`TypeOK`, `NoTwoServerUuidsOwnSameServerRoot`,
 `ForeignUuidNeverAutoTakesOver`, `WriterEpochMonotoneUnique`, `SupersededWriterMakesNoMutation`,
 `GlobalSupersededWriterMakesNoMutation`, `FenceCostsEpoch`, `NoPermanentWedge`);
 `_witness_observedreclaim` → `W_ObservedReclaim`; `_witness_recoveryafterobservedreclaim` →

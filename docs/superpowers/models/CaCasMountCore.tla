@@ -397,10 +397,14 @@ Renew(a) ==
 \*
 \* This makes `GcFence` and `Write` MUTUALLY EXCLUSIVE ON THIS MOUNT BY CONSTRUCTION, for
 \* every `Drift`, not merely at `Drift = 0` (round 8 only showed the Drift=0 case): every
-\* write to `mount.deadline` picks its companion `fenceUntil` as `clock'' + TTL + d` for
-\* SOME `d \in 0..Drift` at the SAME clock value that produced `mount.deadline = clock'' +
-\* TTL`, so `fenceUntil <= mount.deadline + Drift` always holds (the `d = Drift` case is the
-\* tight bound; TLC explores it). `GcFence`'s guard `mount.deadline + Drift <= clock` then
+\* HOLDER-side write to `mount.deadline` picks its companion `fenceUntil` as `clock'' + TTL
+\* + d` for SOME `d \in 0..Drift` at the SAME clock value that produced `mount.deadline =
+\* clock'' + TTL`, so `fenceUntil <= mount.deadline + Drift` always holds (the `d = Drift`
+\* case is the tight bound; TLC explores it). The two RECLAIM-side writes to
+\* `mount.deadline` (`ObservedReclaim`/`WallClockReclaim` installing the successor body)
+\* leave the DISPLACED holder's `fenceUntil` untouched while resetting `mount.deadline =
+\* clock + TTL` forward, so `fenceUntil <= mount.deadline + Drift` is preserved there too
+\* (the fence can only be FURTHER below the new deadline). `GcFence`'s guard `mount.deadline + Drift <= clock` then
 \* directly implies `fenceUntil <= mount.deadline + Drift <= clock`, i.e. `clock >=
 \* fenceUntil` -- so `Write`'s `clock < fenceUntil` conjunct is false whenever `GcFence`
 \* could act. At `Drift = 0` this is byte-identical to the old guard (`d` ranges only over
