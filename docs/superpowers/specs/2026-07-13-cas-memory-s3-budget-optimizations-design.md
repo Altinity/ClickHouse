@@ -99,6 +99,19 @@ chaos-recovery `unaccounted`-blob dryrun-subset flake, unrelated to the cache �
 loss; its absolute counters are deflated by early termination but its normalized rates match runs
 1-2, so it corroborates saturation.)
 
+### §2 follow-up — DEFERRED: dedup-cache validate-on-hit (skip the occupancy HEAD) {#s2-dedup-skip-head}
+
+Recorded 2026-07-14 (deferred by the user — a documented future lever, NOT in this round). The §2
+measurement proved sizing alone gives zero HEAD reduction (the working set already fits in 64 MiB),
+and the mechanics correction established a dedup-cache HIT does not skip the occupancy `HEAD`. But the
+dedup-probe HEADs are ~73% of all HEADs (~7M of 9.6M in the audit) and NO lever in this round reduces
+them. Cutting them needs a SEMANTIC lever, not sizing: trust the dedup cache's cached presence to SKIP
+the occupancy `HEAD` on a hit — the exact structure §3 applies to the part-folder `ForceFresh` re-proof
+(`always`/`age <X>`/`never`), with the same fail-closed `INV-NO-DANGLE` trade-off (a GC over-delete
+surfaces later instead of instantly). Without it the read-class target (−40-50%) leans almost entirely
+on §4. A future round should add `dedup_validate` (mirroring `part_folder_validate`) with its own soak
+matrix.
+
 ## §3 Configurable cache validation (user decision) {#s3-validate-setting}
 
 Facts established during brainstorm: every local ref mutation already pushes invalidation THROUGH
