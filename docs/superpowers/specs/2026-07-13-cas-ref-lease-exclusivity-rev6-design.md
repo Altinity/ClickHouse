@@ -238,6 +238,13 @@ Snapshot-id semantics are accordingly restated from "the id of the last log the 
 remains the same `<=` comparison. The seal is the only snapshot whose id is not a real transaction
 id.
 
+Scope note (2026-07-14, from the Task-8 review): the seal applies to `Live`-lifecycle tables only.
+A table whose recovered lifecycle is `Removed` is not sealed — a late rebirth PUT from a dead epoch
+may transiently resurface in a cold fold until GC's ordinary namespace-cleanup deletes the debris;
+this is bounded and self-healing (the TLA gate models only the `Live`-mutation straggler). If the
+transient proves observable in practice, extending the seal to `Removed` recoveries is the
+follow-up lever.
+
 The seal body additionally records the **greatest listed txn id** (`sealed_from`, diagnostic
 metadata): a log whose id lies in `(sealed_from, seal_id]` provably materialized after the recovery
 LIST — this is what lets the sweep report a T_mat violation (see
