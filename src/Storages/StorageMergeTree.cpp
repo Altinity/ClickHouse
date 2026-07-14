@@ -9,7 +9,7 @@
 #include <Core/QueryProcessingStage.h>
 #include <Core/ServerSettings.h>
 #include <Core/Settings.h>
-#include <Functions/generateSnowflakeID.h>
+#include <Core/UUID.h>
 #include <Databases/IDatabase.h>
 #include <Disks/supportWritingWithAppend.h>
 #include <IO/SharedThreadPools.h>
@@ -3341,13 +3341,8 @@ void StorageMergeTree::exportPartitionToTable(const PartitionCommand & command, 
         src_snapshot, getStorageID(), dest_storage, query_context);
 
     const String partition_id = getPartitionIDFromQuery(command.partition, query_context);
-    const auto composite_key = MergeTreePartitionExportScheduler::compositeKey(partition_id, dest_database, dest_table);
 
     const bool force = query_context->getSettingsRef()[Setting::export_merge_tree_partition_force_export];
-
-    /// Fail fast on a duplicate before doing part collection and mutation checks. The authoritative
-    /// atomic check happens again inside addTask.
-    partition_export_scheduler->throwIfAlreadyExported(composite_key, force);
 
     DataPartsVector parts;
     {
@@ -3389,7 +3384,7 @@ void StorageMergeTree::exportPartitionToTable(const PartitionCommand & command, 
     }
 
     MergeTreePartitionExportTask descriptor;
-    descriptor.transaction_id = generateSnowflakeIDString();
+    descriptor.transaction_id = toString(UUIDHelpers::generateV4());
     descriptor.query_id = query_context->getCurrentQueryId();
     descriptor.partition_id = partition_id;
     descriptor.source_database = getStorageID().database_name;
