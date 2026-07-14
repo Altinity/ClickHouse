@@ -162,6 +162,18 @@ point-readers never fall back to a HEAD-only guess" while a fallback for absent 
 Expected: −23% of the PUT class immediately (create-Clean), plus the resurrect-refresh share where
 delete-on-resurrect applies.
 
+## §6 `content_addressed_log` emit-path allocation trim {#s6-log-emit}
+
+Added 2026-07-14 from a trace_log memory audit during the rev.6 soak: `content_addressed_log` was the
+heaviest system-log saving thread (2.2 GB/window — but that is volume, not a bug; the flush path
+reserves correctly). The real waste is on the HOT emitter thread (folded into the insert/merge
+allocation totals): `makeCasEventSink` deep-copies every field including a full `std::map<String,
+String> detail` per event because the sink takes `const CasEvent &` (no move); and the `reason`
+column is a full `String` per row though it is templated rationale. Fix: make `CasEventSink` take the
+event by value so `makeCasEventSink` moves each field into the log element; flip `reason` to
+`LowCardinality`. The log is opt-in (off by default; soak/CI only) so this is a soak-observability
+cost — cheap and correct. No behavior change to the recorded rows. Independent of §§1-5 ordering.
+
 ## Sequencing vs rev.6 {#sequencing}
 
 1. **§0 lands first, now** (small, zero overlap; also serves the rev.6 soak task).

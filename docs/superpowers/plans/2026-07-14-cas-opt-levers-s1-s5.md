@@ -741,11 +741,36 @@ After a baseline soak with the §0 counters proves the class decomposition, run 
 
 ---
 
+### Task 8: §6 — `content_addressed_log` emit-path allocation trim
+
+Not a resize bug (the flush path reserves correctly: `SystemLog.cpp` `column->reserve(to_flush.size())`, `ContentAddressedLog.cpp` `map.reserve(detail.size())`, queue `reserved_size_rows`). Two real per-event wastes, both on the HOT emitter thread (folded into the insert/merge memory totals, not the 2.2 GiB saving-thread figure): (a) `makeCasEventSink` deep-copies every field incl. a full `std::map<String,String>` per event because the sink takes `const CasEvent &` (no move possible); (b) the `reason` column is a full `String` per row though it is templated rationale (`event_type`/`outcome`/`object_kind` are already `LowCardinality`). The log is opt-in (off by default; soak/CI only), so this is a soak-observability cost — cheap to fix, correct to fix.
+
+**Files:**
+- Modify: `Core/CasEvent.h` (`CasEventSink` typedef `:72` — take the event by value or `CasEvent &&`).
+- Modify: `Core/CasStore.h` (`emitEvent` `:583` — forward an rvalue: `if (event_sink_) event_sink_(std::move(e));`), and the `.cpp` emit call sites (`grep -n "emitEvent(" Core/CasStore.cpp` — ~8 sites; pass rvalues, `std::move` any named local whose event is dead after emit).
+- Modify: `Core/CasGc.cpp` if it invokes the sink directly (the 2nd direct sink site — thread the same rvalue).
+- Modify: `ContentAddressedMetadataStorage.cpp` (`makeCasEventSink` `:299-318` — take `CasEvent ev` by value / `&&` and `std::move` each field into the element: `e.detail = std::move(ev.detail); e.reason = std::move(ev.reason); e.namespace_ = std::move(ev.namespace_);` etc.).
+- Modify: `src/Interpreters/ContentAddressedLog.cpp` (`getColumnsDescription` `:35` — `reason` → `lc_string`).
+- Test: `src/Disks/tests/gtest_cas_build.cpp` (or wherever event-sink tests live) + a schema test near the log element.
+
+**Interfaces:**
+- Changes: `CasEventSink` = `std::function<void(CasEvent)>` (by value) — every caller passes an rvalue; the by-value param is move-constructed from a temporary at the emit site (a move, not the old deep copy). `namespace`/`ref_name` stay `String` (per-row varied); `object_hash`/`token` stay `String` (high cardinality); only `reason` flips to `LowCardinality`.
+
+- [ ] **Step 1: RED — schema test.** Assert `ContentAddressedLogElement::getColumnsDescription()` gives `reason` type `LowCardinality(String)` (today it is `String`, so this FAILS). A cheap way: find the `reason` column in the description and `EXPECT_TRUE(typeid_cast<const DataTypeLowCardinality *>(col.type.get()))`.
+- [ ] **Step 2: RED — move test.** Build a sink like `makeCasEventSink` (or call it via a stubbed context) with an rvalue `CasEvent` carrying a `detail` map with a sentinel entry; after the call, assert the produced element carries the detail AND the source event's `detail`/`reason` are moved-from (empty). Today the sink takes `const &`, so this test won't even compile against the new signature → drives the typedef change. (If a stubbed context is heavy, assert the move at the makeCasEventSink seam via a small test double that captures the element.)
+- [ ] **Step 3: Run RED.** `flock /tmp/cas_build.lock ninja -C build unit_tests_dbms > build/opt_t8_build.log 2>&1` then the two tests — expect FAIL (schema is String; move test won't compile / source not moved-from).
+- [ ] **Step 4: Implement.** Change the `CasEventSink` typedef to by-value; `emitEvent` forwards `std::move(e)`; fix the ~8 `emitEvent` call sites + the 2nd direct sink site to pass rvalues; `makeCasEventSink` takes the event by value and `std::move`s each field; `reason` → `lc_string` in `getColumnsDescription`. Allman braces.
+- [ ] **Step 5: Run GREEN.** Both tests pass.
+- [ ] **Step 6: Sweep + commit.** Global-Constraints sweep (0 failed, 977 + new tests). Commit `cas: opt §6 — content_addressed_log emit-path move + reason LowCardinality` (explicit paths).
+- [ ] **Step 7: Soak verify (optional, cheap).** In any §2/§3 matrix soak, confirm `content_addressed_log` still records every event correctly (no rows dropped/garbled by the move) and note the emitter-thread allocation delta if the metric is available. Behavior-preserving; the acceptance is "no lost/garbled rows".
+
+---
+
 ## Self-Review
 
 **Spec coverage:**
 - §0 introspection — DONE (not re-planned; its counters `CasMetaPut/Cas/Delete`, `CasMeta{CreateClean,AdoptBackfill,ResurrectClean}`, `CasGcMetaOps`, `CasGcEnumerationPages`, `CasDedupCacheHits/Misses` verified present).
-- §1 fold buffer → Task 1. §2 dedup sizing → Task 3 (+ Task 2 plumbing). §3 validate setting → Task 4. §4 manifest-trust → Task 5. §5 absence-Clean → Tasks 6 (gate) + 7 (code). Soak-config plumbing → Task 2. Sequencing §1→§2→§3→§4→§5 honored; plumbing lands early (Task 2) so §2/§3 matrices run.
+- §1 fold buffer → Task 1. §2 dedup sizing → Task 3 (+ Task 2 plumbing). §3 validate setting → Task 4. §4 manifest-trust → Task 5. §5 absence-Clean → Tasks 6 (gate) + 7 (code). Soak-config plumbing → Task 2. §6 `content_addressed_log` emit-path trim → Task 8 (independent of §1-5 ordering; can land any time). Sequencing §1→§2→§3→§4→§5 honored; plumbing lands early (Task 2) so §2/§3 matrices run.
 - Testing (spec §Testing): per-lever gtests RED-first (Tasks 1/4/5/7); §5 TLA gate before code (Task 6); 10-minute soak matrix as acceptance (Steps "Soak verify" in Tasks 1/3/4/5/7); name-set sweep after every code commit (Global Constraints + each task's sweep step).
 
 **Placeholder scan:** the `/* <fixture: ...> */` markers in Tasks 5/7 are explicit copy-from-named-sibling instructions (the sibling tests are named); the §5 TLA `.tla` body is specified by its state, five transitions, invariant, and sabotage set (the modeling is the task's creative deliverable, run to a GREEN/RED gate). No TBD/TODO.
