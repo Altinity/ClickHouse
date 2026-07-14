@@ -478,9 +478,20 @@ public:
     /// (key, bytes) resolves durable (applied to cache before the next id), or the process unmounts.
     /// Every item in the failing batch receives the SAME uncertainty exception (ABORTED); items already
     /// wedged from an EARLIER flush are retried by the NEXT call into this namespace's queue.
+    ///
+    /// `skip_stale_precommit_sweep` (Task 2 review finding 1, design 2026-07-13-cas-pool-member-decommission):
+    /// suppresses the hoisted `maybeSweepStalePrecommits` call below for THIS call only. Set ONLY by
+    /// `dropNamespace`'s own removal call: that call's `build_ops` already names every current precommit
+    /// binding (stale or not) for removal via `RemoveNamespace`, so the ordinary maintenance sweep is
+    /// redundant there -- and, left enabled, would race it: the sweep runs FIRST (hoisted at this
+    /// function's top) and reclaims any epoch-stale binding in its OWN separate transaction, so
+    /// `dropNamespace`'s later `build_ops` would see it already gone and undercount
+    /// `DropNamespaceStats::precommits`. No other caller passes `true` -- the sweep's behavior for
+    /// ordinary writers is unchanged.
     RefTxnId appendRefOps(const RootNamespace & ns, MutationScope scope,
                          std::function<std::vector<RefOp>(const RefTableState &)> build_ops,
-                         RootMutationOrigin origin, RootMutationKind kind);
+                         RootMutationOrigin origin, RootMutationKind kind,
+                         bool skip_stale_precommit_sweep = false);
 
     /// Task 11 (spec §Namespace Birth): whether namespace `ns`'s recovery observed the exact
     /// `_cleanup/<remove_txn_id>` completion marker for `remove_txn_id` -- the SOLE gate on recreating

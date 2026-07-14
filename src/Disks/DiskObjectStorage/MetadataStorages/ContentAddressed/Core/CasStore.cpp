@@ -1704,7 +1704,8 @@ bool Store::observedNamespaceCleanupMarker(const RootNamespace & ns, const RefTx
 
 RefTxnId Store::appendRefOps(const RootNamespace & ns, MutationScope scope,
                              std::function<std::vector<RefOp>(const RefTableState &)> build_ops,
-                             RootMutationOrigin origin, RootMutationKind kind)
+                             RootMutationOrigin origin, RootMutationKind kind,
+                             bool skip_stale_precommit_sweep)
 {
     const auto rt = getRefTableRuntime(ns);
     /// Hoisted here (rather than left to `flushRefBatch`'s own idempotent call) so both Task 11
@@ -1713,7 +1714,8 @@ RefTxnId Store::appendRefOps(const RootNamespace & ns, MutationScope scope,
     /// therefore always a fresh top-level invocation, never nested inside a leader's flush stack
     /// (which would deadlock the leader against itself).
     ensureRefTableRecovered(ns, *rt);
-    maybeSweepStalePrecommits(ns, rt);
+    if (!skip_stale_precommit_sweep)
+        maybeSweepStalePrecommits(ns, rt);
     maybeScheduleSnapshotPublish(ns, rt);
 
     auto item = std::make_shared<RefMutationItem>();
@@ -2960,7 +2962,13 @@ DropNamespaceStats Store::dropNamespace(const RootNamespace & ns)
             stats.precommits = state.precommits.size();
             return ops;
         },
-        RootMutationOrigin::Writer, RootMutationKind::DropNamespace);
+        RootMutationOrigin::Writer, RootMutationKind::DropNamespace,
+        /// Task 2 review finding 1: the ops above already name (and remove) every current precommit
+        /// binding regardless of epoch, making the ordinary stale-precommit maintenance sweep redundant
+        /// for THIS call -- and, left enabled, a race: the hoisted sweep runs first and would reclaim an
+        /// epoch-stale binding in its OWN transaction, so `state.precommits` above would already be
+        /// missing it and undercount `stats.precommits`. See `appendRefOps`'s doc comment.
+        /*skip_stale_precommit_sweep=*/true);
 
     /// spec §Namespace Removal (line 666): "After the transaction is durable, it applies the same
     /// operations to memory, cancels local builds, and rejects further ordinary mutations." Reaching here

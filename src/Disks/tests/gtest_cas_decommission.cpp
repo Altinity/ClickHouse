@@ -136,3 +136,70 @@ TEST(CasDecommission, RerunCountsAlreadyRemoved)
     EXPECT_EQ(second.namespaces_removed, 0u);
     EXPECT_EQ(second.namespaces_already_removed, 1u);
 }
+
+/// Task 2 review finding 1: `makeTableWithRefs`'s precommit seed uses an artificially high
+/// `writer_epoch` (999999) specifically to dodge the writer's OWN stale-precommit sweep -- which
+/// means it never exercised the path a REAL victim precommit takes. A genuine writer stamps
+/// `manifest_ref.writer_epoch` from its OWN `liveWriterEpoch()` at precommit time
+/// (`Build::precommitAdd`, CasStore.cpp:2087), i.e. the victim's era -- always LOWER than the admin
+/// mount's freshly-minted epoch (`openForDecommission` always bumps strictly higher). `appendRefOps`
+/// hoists `maybeSweepStalePrecommits` at its top (CasStore.cpp:1716), so without the
+/// `skip_stale_precommit_sweep` fix that sweep would reclaim this realistic-epoch precommit in its
+/// OWN transaction before `dropNamespace`'s removal transaction ever counts it, leaving
+/// `precommits_removed` at 0 for exactly the case that matters.
+TEST(CasDecommission, CountsRealisticEpochPrecommit)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    uint64_t victim_epoch = 0;
+    {
+        auto victim = openVictim(backend);
+        victim_epoch = victim->writerEpoch();
+        makeTableWithRefs(*victim, "victim/db/t1", /*committed=*/1, /*precommits=*/0);
+
+        const RootNamespace ns("victim/db/t1");
+        /// `build_sequence = 2`: distinct from `makeTableWithRefs`'s committed ref (`build_sequence = 1`)
+        /// -- a REAL build's `ManifestRef` is unique per build, and a colliding one would trip the ref
+        /// state machine's "manifest already has a conflicting owner" guard.
+        const ManifestRef ref{.writer_epoch = victim_epoch, .build_sequence = 2, .manifest_ordinal = 1};
+        writeManifestRaw(victim->backend(), victim->layout(), ns, ref, {});
+        addPrecommitTransition(victim->backend(), victim->layout(), ns, UInt128(1), "precommit_0", std::nullopt, ref);
+    }
+
+    const auto report = decommissionPoolMember(
+        backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim");
+
+    EXPECT_EQ(report.namespaces_removed, 1u);
+    EXPECT_EQ(report.committed_refs_removed, 1u);
+    EXPECT_EQ(report.precommits_removed, 1u);
+    EXPECT_EQ(report.edge_deltas_emitted, 2u);
+}
+
+/// Task 2 review finding 2: the `member_decommission` begin/namespace_removed/end events
+/// (CasDecommission.cpp) had no assertion at all. Wire a capturing sink (the `gtest_cas_event_log.cpp`
+/// idiom) into `decommissionPoolMember` and check the emitted sequence and its per-namespace detail.
+TEST(CasDecommission, EmitsMemberDecommissionEvents)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    {
+        auto victim = openVictim(backend);
+        makeTableWithRefs(*victim, "victim/db/t1", /*committed=*/1, /*precommits=*/0);
+    }
+
+    std::vector<CasEvent> seen;
+    (void)decommissionPoolMember(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim",
+        [&](const CasEvent & e) { seen.push_back(e); });
+
+    std::vector<CasEvent> member_events;
+    for (const auto & e : seen)
+        if (e.type == CasEventType::MemberDecommission)
+            member_events.push_back(e);
+
+    ASSERT_EQ(member_events.size(), 3u);
+    EXPECT_EQ(member_events[0].outcome, "begin");
+    EXPECT_EQ(member_events[1].outcome, "namespace_removed");
+    EXPECT_EQ(member_events[1].detail.at("namespace"), "victim/db/t1");
+    EXPECT_EQ(member_events[1].detail.at("committed"), "1");
+    EXPECT_EQ(member_events[1].detail.at("precommits"), "0");
+    EXPECT_EQ(member_events[2].outcome, "end");
+    EXPECT_EQ(member_events[2].detail.at("namespaces_removed"), "1");
+}
