@@ -124,6 +124,13 @@ class Layout;
 /// listed so the precondition stays correct once Phase 1 lands.
 bool serverRootSubtreeEmpty(Backend & b, const Layout & l, const String & srid);
 
+/// Read the owner anchor (`gc/server-roots/<srid>/owner`) WITHOUT claiming or validating identity —
+/// a plain GET+decode. nullopt = anchor absent. Decommission (design
+/// 2026-07-13-cas-pool-member-decommission §core) uses this to impersonate the victim uuid before
+/// mounting writable; `claimOwnerOrThrow` below is the identity-CLAIMING counterpart every normal
+/// open uses (and itself calls this for its own GET+decode — one decode site, no behavior change).
+std::optional<UInt128> readOwnerUuid(Backend & b, const Layout & l, const String & server_root_id);
+
 /// Claim (or validate) the sticky owner anchor that binds `srid` to a server UUID (identity).
 ///   - owner present, equal `our_uuid` → ok (return);
 ///   - owner present, different → throw `CORRUPTED_DATA` (foreign owner — fail closed);

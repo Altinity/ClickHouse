@@ -181,16 +181,23 @@ bool serverRootSubtreeEmpty(Backend & b, const Layout & l, const String & srid)
     return true;
 }
 
+std::optional<UInt128> readOwnerUuid(Backend & b, const Layout & l, const String & server_root_id)
+{
+    const auto got = b.get(l.ownerKey(server_root_id));
+    if (!got)
+        return std::nullopt;
+    return decodeOwner(got->bytes).server_uuid;
+}
+
 void claimOwnerOrThrow(Backend & b, const Layout & l, const String & srid, UInt128 our_uuid)
 {
     const String key = l.ownerKey(srid);
 
     /// Owner present → it is identity: equal UUID is ok, a different UUID fails closed regardless
     /// of any lease/clock state.
-    if (const auto got = b.get(key))
+    if (const std::optional<UInt128> owner_uuid = readOwnerUuid(b, l, srid))
     {
-        const OwnerObject owner = decodeOwner(got->bytes);
-        if (owner.server_uuid == our_uuid)
+        if (*owner_uuid == our_uuid)
             return;
         /// Mirror mountDoubleStartMessage's operator guidance: the by-far most common cause is a
         /// REGENERATED local ClickHouse uuid file (wiped /var/lib/clickhouse, a pod rescheduled
@@ -202,7 +209,7 @@ void claimOwnerOrThrow(Backend & b, const Layout & l, const String & srid, UInt1
             "or the container/pod was recreated without a persistent volume) while the pool kept the old identity. "
             "Recover by restoring the old local uuid file; or configure a fresh <server_root_id> for this disk; "
             "or — only after verifying that NO server uses this root — manually delete the owner object '{}' and restart.",
-            srid, u128ToHex(owner.server_uuid), u128ToHex(our_uuid), key);
+            srid, u128ToHex(*owner_uuid), u128ToHex(our_uuid), key);
     }
 
     /// Owner absent. Claiming is allowed ONLY over a provably-empty subtree; an absent owner over
@@ -218,12 +225,11 @@ void claimOwnerOrThrow(Backend & b, const Layout & l, const String & srid, UInt1
         return;
 
     /// Race: another process claimed between our get and our putIfAbsent. Re-read and compare.
-    const auto reread = b.get(key);
+    const std::optional<UInt128> reread = readOwnerUuid(b, l, srid);
     if (!reread)
         throw Exception(ErrorCodes::CORRUPTED_DATA,
             "CAS server-root '{}' owner anchor vanished during claim", srid);
-    const OwnerObject owner = decodeOwner(reread->bytes);
-    if (owner.server_uuid == our_uuid)
+    if (*reread == our_uuid)
         return;
     throw Exception(ErrorCodes::CORRUPTED_DATA,
         "CAS server-root '{}' was claimed by a different server during our claim (foreign owner) "

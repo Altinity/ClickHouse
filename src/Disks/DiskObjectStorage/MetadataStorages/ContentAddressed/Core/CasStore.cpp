@@ -317,198 +317,277 @@ StorePtr Store::open(BackendPtr backend, PoolConfig config)
     /// — which rides inside the `gc/server-roots/<server_root_id>/mount` lease object — is only
     /// constructed and anchored on a writable open.
     if (!store->config.read_only)
+        mountWritable(store, store->config.server_id, MountClaimPolicy::WaitForExpiry);
+
+    return store;
+}
+
+void Store::mountWritable(StorePtr & store, UInt128 our_uuid, MountClaimPolicy policy)
+{
+    /// === Mount-safety startup protocol (spec §mount-safety; Phase 0 Task 7) ===
+    /// STRICT ORDER: validate id → claim owner (identity) → allocate durable writer_epoch → claim
+    /// the mount lease (liveness) + arm the local write fence → anchor the watermark. owner / epoch
+    /// / mount / watermark are BOOTSTRAP-CONTROL writes: they establish the very right to write and
+    /// run BEFORE the write fence gates ordinary data/ref/manifest mutations. Fail closed throughout.
+    /// Shared by `open` (`policy = WaitForExpiry`, `our_uuid = config.server_id`) and
+    /// `openForDecommission` (`policy = NoWait`, `our_uuid` = the impersonated victim owner uuid;
+    /// design 2026-07-13-cas-pool-member-decommission §core) -- the two differ only in WHO they mount
+    /// as and whether a non-`Claimed`/`FencedSelf` mount result gets `open`'s bounded observation wait
+    /// or an immediate refusal.
+    const String & srid = store->config.server_root_id;
+
+    /// 1. The server_root_id is a clean relative path (mirrors the config-read validation; cheap to
+    ///    re-check here so a Store opened directly in tests is held to the same contract).
+    validateServerRootId(srid);
+
+    /// 2. Owner anchor — IDENTITY (clock-free). A foreign uuid fails closed; an absent owner over a
+    ///    non-empty subtree is CORRUPTED_DATA; a fresh empty root is claimed.
+    claimOwnerOrThrow(*store->pool_backend, store->pool_layout, srid, our_uuid);
+
+    /// 3. Durable-monotone writer_epoch — CAS-bump the sticky `epoch` object. THE BRIDGE: this
+    ///    durable value REPLACES the random `process_epoch` for identity, so the watermark + every
+    ///    manifest ref carries it (the random mint above stays for the read-only
+    ///    path, which never reaches here). Phase 2's epoch-aware sweep reads this value.
+    /// Mutable: a GC fence of our fresh lease during open (expiry mid-open racing a GC round) is
+    /// recoverable — a fence costs an epoch, so the fence-recovery loop below re-allocates a fresh
+    /// writer_epoch and re-claims (P3.1 vector C; TLA+ `NoPermanentWedge`).
+    uint64_t writer_epoch = allocateWriterEpoch(*store->pool_backend, store->pool_layout, srid);
+    store->process_epoch.store(writer_epoch, std::memory_order_relaxed);
+
+    /// 4. Mount lease — LIVENESS. Decide over the current mount object using a wall-clock `now_ms`.
+    const auto now_ms = []() -> uint64_t
     {
-        /// === Mount-safety startup protocol (spec §mount-safety; Phase 0 Task 7) ===
-        /// STRICT ORDER: validate id → claim owner (identity) → allocate durable writer_epoch → claim
-        /// the mount lease (liveness) + arm the local write fence → anchor the watermark. owner / epoch
-        /// / mount / watermark are BOOTSTRAP-CONTROL writes: they establish the very right to write and
-        /// run BEFORE the write fence gates ordinary data/ref/manifest mutations. Fail closed throughout.
-        const String & srid = store->config.server_root_id;
-        const UInt128 our_uuid = store->config.server_id;
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+    };
+    const uint64_t ttl_ms = static_cast<uint64_t>(store->config.mount_lease_ttl_ms.count());
 
-        /// 1. The server_root_id is a clean relative path (mirrors the config-read validation; cheap to
-        ///    re-check here so a Store opened directly in tests is held to the same contract).
-        validateServerRootId(srid);
+    /// CAS request budget (RFC cas-s3-timeout-retry-control §required-timeout-model, Task 5): a
+    /// writable mount refuses to open with a budget that could let a controlled attempt outlive the
+    /// mount lease it is fenced under. Throws BAD_ARGUMENTS and aborts open on an inconsistent
+    /// budget; logs the effective values once on success. The controller itself (Store's ref
+    /// mutation paths) is wired in a later task — this validates the config invariant up front.
+    validateCasRequestBudget(store->config.cas_request_budget, ttl_ms,
+        static_cast<uint64_t>(store->config.mount_renew_period.count()));
 
-        /// 2. Owner anchor — IDENTITY (clock-free). A foreign uuid fails closed; an absent owner over a
-        ///    non-empty subtree is CORRUPTED_DATA; a fresh empty root is claimed.
-        claimOwnerOrThrow(*store->pool_backend, store->pool_layout, srid, our_uuid);
+    /// Poll twice per renew period so a live holder's renewal is always observed within the
+    /// observation window. Derived from existing config — no new knob (spec §Config).
+    const uint64_t poll_interval_ms = std::max<uint64_t>(
+        1, static_cast<uint64_t>(store->config.mount_renew_period.count()) / 2);
+    /// rev.6 Task 6: routes through `store->waitSleep` (which itself routes through
+    /// `config.wait_sleep_fn` when a test injected one) rather than a bare `sleep_for` directly, so
+    /// a test intercepting `wait_sleep_fn` observes every wait `open` can block on -- this
+    /// observation poll AND the `materialization_grace_ms` wait below.
+    const auto sleep_ms = [s = store.get()](uint64_t ms) { s->waitSleep(ms); };
+    /// Operator-visible log the moment startup decides to watch a stale-looking self-mount (the
+    /// disk-open path blocks up to ~threshold_ms here, so a silent block would be confusing). May
+    /// fire more than once per open: the observation restarts (and re-logs) every time the watched
+    /// lease's write-token changes before the full threshold elapses.
+    const auto on_wait_start = [&srid](const MountLease & held, uint64_t threshold_ms)
+    {
+        LOG_INFO(getLogger("CasStore"),
+            "CAS mount '{}': a stale-looking mount lease is held by uuid={} epoch={} pid={} "
+            "hostname={} (expires_at_ms={}); observing its write-token for up to ~{} ms before "
+            "reclaiming. If a second server is genuinely live, its renewals will keep restarting "
+            "the observation and startup will eventually abort as a live double-start.",
+            srid, u128ToHex(held.server_uuid), held.writer_epoch, held.pid, held.hostname,
+            held.expires_at_ms, threshold_ms);
+    };
 
-        /// 3. Durable-monotone writer_epoch — CAS-bump the sticky `epoch` object. THE BRIDGE: this
-        ///    durable value REPLACES the random `process_epoch` for identity, so the watermark + every
-        ///    manifest ref carries it (the random mint above stays for the read-only
-        ///    path, which never reaches here). Phase 2's epoch-aware sweep reads this value.
-        /// Mutable: a GC fence of our fresh lease during open (expiry mid-open racing a GC round) is
-        /// recoverable — a fence costs an epoch, so the fence-recovery loop below re-allocates a fresh
-        /// writer_epoch and re-claims (P3.1 vector C; TLA+ `NoPermanentWedge`).
-        uint64_t writer_epoch = allocateWriterEpoch(*store->pool_backend, store->pool_layout, srid);
-        store->process_epoch.store(writer_epoch, std::memory_order_relaxed);
+    /// Mount-slot writer audit (the P1 "foreign writer" instrument): route every mount-slot
+    /// write/conflict event through the Store's own sink. `setEventSink` runs AFTER `open`
+    /// returns (the `ContentAddressedMetadataStorage` wiring), so an event fired synchronously
+    /// during this very `open` call is dropped by the still-null sink — the same startup window
+    /// every other B170 emission site in this file already has (`hasEventSink()`/`emitEvent()`).
+    /// `s` outlives the lambda: it is captured by raw pointer into the keeper, a member of
+    /// `Store` destroyed before the `Store` itself.
+    const auto emit_mount_event = [s = store.get()](CasEvent e) { s->emitEvent(std::move(e)); };
 
-        /// 4. Mount lease — LIVENESS. Decide over the current mount object using a wall-clock `now_ms`.
-        const auto now_ms = []() -> uint64_t
+    Store * raw = store.get();
+
+    /// S13 crash-recovery (`WaitForExpiry` only): a hard-killed prior incarnation leaves a stale,
+    /// unreleased mount lease. Rather than aborting, OBSERVE that lease's write-token (never its
+    /// stamped `expires_at_ms` against our wall clock) until it has held stable for the full
+    /// rate-bound threshold, then reclaim it; a genuinely live second server keeps renewing the
+    /// token and is (after bounded restarts) reported as LiveDoubleStart. The reclaim is
+    /// token-guarded (see `claimMountAwaitingExpiry`), so a live twin is never stolen from.
+    /// `NoWait` skips this observation entirely (see the policy branch below).
+    ///
+    /// Fence-recovery loop (P3.1 vector C): if the GC fences our own fresh lease while we are opening
+    /// (the lease expired mid-open — e.g. a slow first beat — and a GC round fenced it), that is a
+    /// RECOVERABLE state, not a wedge: a fence costs an epoch, so allocate a fresh writer_epoch and
+    /// re-claim. Bounded so a pathological fence storm still fails closed. The fence can surface two
+    /// ways: `claimMount` observes an already-fenced own slot (`FencedSelf`), or the keeper's adopt
+    /// races a fence between its GET and CAS (`MountFencedException` from `start()`).
+    /// rev.6 Task 6: which certificate of death (if any) justified the reclaim FINALLY adopted below
+    /// (the last iteration's `claim` before `break` -- `claim` itself is loop-scoped). Read after the
+    /// loop to decide the materialization-grace wait.
+    MountPriorState claimed_prior = MountPriorState::None;
+    constexpr int max_fence_recoveries = 3;
+    for (int fence_recovery = 0; ; ++fence_recovery)
+    {
+        MountClaimResult claim;
+        if (policy == MountClaimPolicy::WaitForExpiry)
         {
-            return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count());
-        };
-        const uint64_t ttl_ms = static_cast<uint64_t>(store->config.mount_lease_ttl_ms.count());
-
-        /// CAS request budget (RFC cas-s3-timeout-retry-control §required-timeout-model, Task 5): a
-        /// writable mount refuses to open with a budget that could let a controlled attempt outlive the
-        /// mount lease it is fenced under. Throws BAD_ARGUMENTS and aborts open on an inconsistent
-        /// budget; logs the effective values once on success. The controller itself (Store's ref
-        /// mutation paths) is wired in a later task — this validates the config invariant up front.
-        validateCasRequestBudget(store->config.cas_request_budget, ttl_ms,
-            static_cast<uint64_t>(store->config.mount_renew_period.count()));
-
-        /// Poll twice per renew period so a live holder's renewal is always observed within the
-        /// observation window. Derived from existing config — no new knob (spec §Config).
-        const uint64_t poll_interval_ms = std::max<uint64_t>(
-            1, static_cast<uint64_t>(store->config.mount_renew_period.count()) / 2);
-        /// rev.6 Task 6: routes through `store->waitSleep` (which itself routes through
-        /// `config.wait_sleep_fn` when a test injected one) rather than a bare `sleep_for` directly, so
-        /// a test intercepting `wait_sleep_fn` observes every wait `open` can block on -- this
-        /// observation poll AND the `materialization_grace_ms` wait below.
-        const auto sleep_ms = [s = store.get()](uint64_t ms) { s->waitSleep(ms); };
-        /// Operator-visible log the moment startup decides to watch a stale-looking self-mount (the
-        /// disk-open path blocks up to ~threshold_ms here, so a silent block would be confusing). May
-        /// fire more than once per open: the observation restarts (and re-logs) every time the watched
-        /// lease's write-token changes before the full threshold elapses.
-        const auto on_wait_start = [&srid](const MountLease & held, uint64_t threshold_ms)
-        {
-            LOG_INFO(getLogger("CasStore"),
-                "CAS mount '{}': a stale-looking mount lease is held by uuid={} epoch={} pid={} "
-                "hostname={} (expires_at_ms={}); observing its write-token for up to ~{} ms before "
-                "reclaiming. If a second server is genuinely live, its renewals will keep restarting "
-                "the observation and startup will eventually abort as a live double-start.",
-                srid, u128ToHex(held.server_uuid), held.writer_epoch, held.pid, held.hostname,
-                held.expires_at_ms, threshold_ms);
-        };
-
-        /// Mount-slot writer audit (the P1 "foreign writer" instrument): route every mount-slot
-        /// write/conflict event through the Store's own sink. `setEventSink` runs AFTER `open`
-        /// returns (the `ContentAddressedMetadataStorage` wiring), so an event fired synchronously
-        /// during this very `open` call is dropped by the still-null sink — the same startup window
-        /// every other B170 emission site in this file already has (`hasEventSink()`/`emitEvent()`).
-        /// `s` outlives the lambda: it is captured by raw pointer into the keeper, a member of
-        /// `Store` destroyed before the `Store` itself.
-        const auto emit_mount_event = [s = store.get()](CasEvent e) { s->emitEvent(std::move(e)); };
-
-        Store * raw = store.get();
-
-        /// S13 crash-recovery: a hard-killed prior incarnation leaves a stale, unreleased mount lease.
-        /// Rather than aborting, OBSERVE that lease's write-token (never its stamped `expires_at_ms`
-        /// against our wall clock) until it has held stable for the full rate-bound threshold, then
-        /// reclaim it; a genuinely live second server keeps renewing the token and is (after bounded
-        /// restarts) reported as LiveDoubleStart. The reclaim is token-guarded (see
-        /// `claimMountAwaitingExpiry`), so a live twin is never stolen from.
-        ///
-        /// Fence-recovery loop (P3.1 vector C): if the GC fences our own fresh lease while we are opening
-        /// (the lease expired mid-open — e.g. a slow first beat — and a GC round fenced it), that is a
-        /// RECOVERABLE state, not a wedge: a fence costs an epoch, so allocate a fresh writer_epoch and
-        /// re-claim. Bounded so a pathological fence storm still fails closed. The fence can surface two
-        /// ways: `claimMount` observes an already-fenced own slot (`FencedSelf`), or the keeper's adopt
-        /// races a fence between its GET and CAS (`MountFencedException` from `start()`).
-        /// rev.6 Task 6: which certificate of death (if any) justified the reclaim FINALLY adopted below
-        /// (the last iteration's `claim` before `break` -- `claim` itself is loop-scoped). Read after the
-        /// loop to decide the materialization-grace wait.
-        MountPriorState claimed_prior = MountPriorState::None;
-        constexpr int max_fence_recoveries = 3;
-        for (int fence_recovery = 0; ; ++fence_recovery)
-        {
-            const MountClaimResult claim = claimMountAwaitingExpiry(
+            claim = claimMountAwaitingExpiry(
                 *store->pool_backend, store->pool_layout, srid, our_uuid, writer_epoch,
                 [&now_ms]() { return now_ms(); }, [raw] { return raw->bootMsNow(); },
                 ttl_ms, poll_interval_ms, sleep_ms, on_wait_start, emit_mount_event);
-            if (claim.kind == MountClaimResult::FencedSelf)
-            {
-                if (fence_recovery >= max_fence_recoveries)
-                    throw Exception(ErrorCodes::ABORTED,
-                        "CAS mount '{}': our own mount lease was GC-fenced repeatedly during open "
-                        "({} recoveries exhausted) — a fresh writer_epoch kept being fenced before we "
-                        "could adopt it. This should not persist; investigate GC fence-out timing.",
-                        srid, max_fence_recoveries);
-                writer_epoch = allocateWriterEpoch(*store->pool_backend, store->pool_layout, srid);
-                store->process_epoch.store(writer_epoch, std::memory_order_relaxed);
-                continue;
-            }
-            if (claim.kind != MountClaimResult::Claimed)
-            {
-                /// LiveDoubleStart (waited out the bound → a live twin) or ForeignOwner → fail closed
-                /// with the actionable, multi-line startup error (spec §mount-safety).
-                throw Exception(ErrorCodes::ABORTED, "{}", mountDoubleStartMessage(srid, claim.body));
-            }
-            claimed_prior = claim.prior;
-
-            /// The mount object now holds OUR live (uuid, epoch) body. Construct + start the keeper, which
-            /// ADOPTS that very (uuid, epoch) slot rather than self-tripping the double-start guard.
-            /// The mount keeper carries the per-server build-watermark floor (`minActive`), read off the
-            /// keeper's state lock via `prepareRenew`.
-            store->mount_keeper = std::make_unique<MountLeaseKeeper>(
-                store->pool_backend, store->pool_layout, srid, our_uuid, writer_epoch,
-                store->config.mount_lease_ttl_ms, now_ms,
-                [raw] { return raw->minActive(); },
-                emit_mount_event);
-            /// Keeper ↔ fence coupling (spec §write-fence): on each successful background renew refresh
-            /// the monotonic deadline; on a superseded/foreign renew failure latch the fence to lost.
-            /// Set BEFORE startBackground so no renewal can fire before the callbacks are in place.
-            store->mount_keeper->setFenceCallbacks(
-                [raw, ttl_ms] { raw->setMountDeadline(raw->bootMsNow() + ttl_ms); },
-                [raw]
-                {
-                    raw->tripMountLost();
-                    /// Liveness counterpart of the fence-out: recover in place as a FRESH incarnation.
-                    raw->scheduleRemount();
-                });
-            try
-            {
-                store->mount_keeper->start();
-            }
-            catch (const MountFencedException &)
-            {
-                /// The GC fenced our fresh lease between the keeper's adopt GET and CAS. Recoverable:
-                /// drop this keeper, take a fresh epoch, and re-claim.
-                if (fence_recovery >= max_fence_recoveries)
-                    throw;
-                store->mount_keeper.reset();
-                writer_epoch = allocateWriterEpoch(*store->pool_backend, store->pool_layout, srid);
-                store->process_epoch.store(writer_epoch, std::memory_order_relaxed);
-                continue;
-            }
-            break;
         }
-
-        /// rev.6 Task 6 (spec §Late Predecessor PUT): a reclaim over a predecessor whose death was NOT
-        /// proven clean may still have a conditional PUT from that predecessor in flight when this
-        /// incarnation starts trusting its recovery listings -- `Fenced` and `UncleanObserved` are
-        /// exactly the two `MountPriorState`s with no such proof (`Clean`, Task 5's drained farewell,
-        /// and `None`, a fresh mount / same-epoch refresh with nothing to hand over, pay nothing).
-        if (claimed_prior == MountPriorState::Fenced || claimed_prior == MountPriorState::UncleanObserved)
+        else
         {
-            store->unclean_epoch_boundary_seen.store(true, std::memory_order_relaxed);
-            const uint64_t t_mat = store->config.materialization_grace_ms;
-            LOG_INFO(getLogger("CasStore"),
-                "Content-addressed mount {} follows an unclean predecessor; waiting {} ms "
-                "(materialization grace) for the store to finalize or drop its accepted "
-                "requests before trusting recovery listings", srid, t_mat);
-            store->waitSleep(t_mat);
+            /// NoWait (decommission gate): a single unobserved attempt -- no bounded wait-and-retry
+            /// for a stale-looking lease to lapse. Anything but Claimed/FencedSelf below is refused
+            /// immediately.
+            claim = claimMount(*store->pool_backend, store->pool_layout, srid, our_uuid, writer_epoch,
+                now_ms(), ttl_ms, /*proven_dead_token=*/{}, emit_mount_event);
         }
+        if (claim.kind == MountClaimResult::FencedSelf)
+        {
+            if (fence_recovery >= max_fence_recoveries)
+                throw Exception(ErrorCodes::ABORTED,
+                    "CAS mount '{}': our own mount lease was GC-fenced repeatedly during open "
+                    "({} recoveries exhausted) — a fresh writer_epoch kept being fenced before we "
+                    "could adopt it. This should not persist; investigate GC fence-out timing.",
+                    srid, max_fence_recoveries);
+            writer_epoch = allocateWriterEpoch(*store->pool_backend, store->pool_layout, srid);
+            store->process_epoch.store(writer_epoch, std::memory_order_relaxed);
+            continue;
+        }
+        if (claim.kind != MountClaimResult::Claimed)
+        {
+            if (policy == MountClaimPolicy::NoWait)
+                /// No FORCE variant, no wait-and-observe: the decommission gate treats any live-looking
+                /// or foreign-owner lease as an immediate refusal (design
+                /// 2026-07-13-cas-pool-member-decommission §core).
+                throw Exception(ErrorCodes::ABORTED,
+                    "CAS decommission '{}': pool member is alive or contended — mount lease held by "
+                    "uuid={} epoch={} pid={} hostname={} (expires_at_ms={}). Refusing (no FORCE variant "
+                    "exists; stop the server or wait for its lease to lapse).",
+                    srid, u128ToHex(claim.body.server_uuid), claim.body.writer_epoch, claim.body.pid,
+                    claim.body.hostname, claim.body.expires_at_ms);
+            /// LiveDoubleStart (waited out the bound → a live twin) or ForeignOwner → fail closed
+            /// with the actionable, multi-line startup error (spec §mount-safety).
+            throw Exception(ErrorCodes::ABORTED, "{}", mountDoubleStartMessage(srid, claim.body));
+        }
+        claimed_prior = claim.prior;
 
-        /// Arm the local write fence: cache (uuid, epoch) and set the boottime deadline now + ttl. From
-        /// here ordinary ref mutations (appendRefOps) are fence-gated via mayMutate.
-        store->armMountFence(our_uuid, writer_epoch,
-            store->bootMsNow() + static_cast<uint64_t>(store->config.mount_lease_ttl_ms.count()));
-        /// Gate the background renewer with `background_watermark`: it runs only in production
-        /// (`background_watermark` = context != nullptr && !read_only), never in unit tests — which
-        /// drive renewOnce (or renewWatermarkOnce) explicitly and rely on the armed sub-TTL deadline,
-        /// never on the loop. The keeper itself is still started above (it must claim/adopt the mount +
-        /// arm the fence on every writable open); only the renewal thread is conditional. The merged
-        /// heartbeat renews at `mount_renew_period` — one beat now renews the lease and the floor.
-        if (store->config.background_watermark)
-            store->mount_keeper->startBackground(store->config.mount_renew_period);
-
-        store->live_writer_epoch.store(writer_epoch, std::memory_order_release);
+        /// The mount object now holds OUR live (uuid, epoch) body. Construct + start the keeper, which
+        /// ADOPTS that very (uuid, epoch) slot rather than self-tripping the double-start guard.
+        /// The mount keeper carries the per-server build-watermark floor (`minActive`), read off the
+        /// keeper's state lock via `prepareRenew`.
+        store->mount_keeper = std::make_unique<MountLeaseKeeper>(
+            store->pool_backend, store->pool_layout, srid, our_uuid, writer_epoch,
+            store->config.mount_lease_ttl_ms, now_ms,
+            [raw] { return raw->minActive(); },
+            emit_mount_event);
+        /// Keeper ↔ fence coupling (spec §write-fence): on each successful background renew refresh
+        /// the monotonic deadline; on a superseded/foreign renew failure latch the fence to lost.
+        /// Set BEFORE startBackground so no renewal can fire before the callbacks are in place.
+        store->mount_keeper->setFenceCallbacks(
+            [raw, ttl_ms] { raw->setMountDeadline(raw->bootMsNow() + ttl_ms); },
+            [raw]
+            {
+                raw->tripMountLost();
+                /// Liveness counterpart of the fence-out: recover in place as a FRESH incarnation.
+                raw->scheduleRemount();
+            });
+        try
+        {
+            store->mount_keeper->start();
+        }
+        catch (const MountFencedException &)
+        {
+            /// The GC fenced our fresh lease between the keeper's adopt GET and CAS. Recoverable:
+            /// drop this keeper, take a fresh epoch, and re-claim.
+            if (fence_recovery >= max_fence_recoveries)
+                throw;
+            store->mount_keeper.reset();
+            writer_epoch = allocateWriterEpoch(*store->pool_backend, store->pool_layout, srid);
+            store->process_epoch.store(writer_epoch, std::memory_order_relaxed);
+            continue;
+        }
+        break;
     }
 
+    /// rev.6 Task 6 (spec §Late Predecessor PUT): a reclaim over a predecessor whose death was NOT
+    /// proven clean may still have a conditional PUT from that predecessor in flight when this
+    /// incarnation starts trusting its recovery listings -- `Fenced` and `UncleanObserved` are
+    /// exactly the two `MountPriorState`s with no such proof (`Clean`, Task 5's drained farewell,
+    /// and `None`, a fresh mount / same-epoch refresh with nothing to hand over, pay nothing).
+    if (claimed_prior == MountPriorState::Fenced || claimed_prior == MountPriorState::UncleanObserved)
+    {
+        store->unclean_epoch_boundary_seen.store(true, std::memory_order_relaxed);
+        const uint64_t t_mat = store->config.materialization_grace_ms;
+        LOG_INFO(getLogger("CasStore"),
+            "Content-addressed mount {} follows an unclean predecessor; waiting {} ms "
+            "(materialization grace) for the store to finalize or drop its accepted "
+            "requests before trusting recovery listings", srid, t_mat);
+        store->waitSleep(t_mat);
+    }
+
+    /// Arm the local write fence: cache (uuid, epoch) and set the boottime deadline now + ttl. From
+    /// here ordinary ref mutations (appendRefOps) are fence-gated via mayMutate.
+    store->armMountFence(our_uuid, writer_epoch,
+        store->bootMsNow() + static_cast<uint64_t>(store->config.mount_lease_ttl_ms.count()));
+    /// Gate the background renewer with `background_watermark`: it runs only in production
+    /// (`background_watermark` = context != nullptr && !read_only), never in unit tests — which
+    /// drive renewOnce (or renewWatermarkOnce) explicitly and rely on the armed sub-TTL deadline,
+    /// never on the loop. The keeper itself is still started above (it must claim/adopt the mount +
+    /// arm the fence on every writable open); only the renewal thread is conditional. The merged
+    /// heartbeat renews at `mount_renew_period` — one beat now renews the lease and the floor.
+    if (store->config.background_watermark)
+        store->mount_keeper->startBackground(store->config.mount_renew_period);
+
+    store->live_writer_epoch.store(writer_epoch, std::memory_order_release);
+}
+
+StorePtr Store::openForDecommission(BackendPtr backend, PoolConfig config, const String & victim_srid)
+{
+    backend = std::make_shared<InstrumentedBackend>(std::move(backend));
+    validateServerRootId(victim_srid);
+
+    config.server_root_id = victim_srid;
+    config.read_only = false;
+    config.skip_access_check = true;   /// the pool exists (the calling disk validated it); no probe writes
+
+    Layout layout(config.pool_prefix);
+
+    /// Impersonate the victim: decommission acts as "the next incarnation of that server". The claim
+    /// below is then EXACTLY the S13 reclaim semantics (`MountClaimPolicy::NoWait`): a
+    /// fenced/terminated/clean-farewell lease reclaims; a live lease refuses immediately (no bounded
+    /// observation wait -- see `mountWritable`). Owner anchor absent + mount absent = nothing to
+    /// decommission.
+    std::optional<UInt128> victim_uuid = readOwnerUuid(*backend, layout, victim_srid);
+    if (!victim_uuid)
+    {
+        if (const auto mount = backend->get(layout.mountKey(victim_srid)))
+            victim_uuid = decodeMountLease(mount->bytes).server_uuid;   /// partial hand-cleanup: adopt from the lease
+        else
+            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                "CAS decommission '{}': unknown pool member (no owner anchor and no mount lease). "
+                "Nothing to decommission; if victim objects linger without a slot, run ca-fsck.",
+                victim_srid);
+    }
+    config.server_id = *victim_uuid;
+
+    backend->checkConditionalWriteSingleAttemptSupport();
+    PoolMeta meta = PoolMeta::createOrValidate(
+        *backend, layout, config.blob_header_len, config.blob_hash_algo, config.blob_hash_allow_new);
+    const BlobHashAlgo write_algo = config.blob_hash_algo;   /// `config` is moved-from just below
+
+    /// Private ctor: make_shared cannot reach it.
+    StorePtr store(new Store(std::move(backend), std::move(config), std::move(meta)));
+
+    /// Register-before-first-write, belt-and-braces (spec §5): same invariant `open` asserts.
+    chassert(store->isAlgoAdmitted(write_algo));
+
+    /// No random `process_epoch` mint here: `open` pays that prologue because its read-only path
+    /// never reaches `mountWritable` and so needs SOME nonzero epoch, but this factory is
+    /// writer-only -- `mountWritable` below unconditionally overwrites `process_epoch` with the
+    /// freshly allocated durable `writer_epoch` before anything could observe the zero-initialized
+    /// default.
+    mountWritable(store, *victim_uuid, MountClaimPolicy::NoWait);
     return store;
 }
 

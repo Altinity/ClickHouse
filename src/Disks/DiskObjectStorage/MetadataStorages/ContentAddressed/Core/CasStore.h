@@ -350,6 +350,14 @@ class Store : public std::enable_shared_from_this<Store>
 
 public:
     static StorePtr open(BackendPtr backend, PoolConfig config);
+    /// Admin writer mount of the VICTIM `server_root_id`, for `SYSTEM CONTENT ADDRESSED DROP POOL
+    /// MEMBER` (design 2026-07-13-cas-pool-member-decommission §core). Impersonates the victim's
+    /// owner uuid (`readOwnerUuid`, or -- when the owner anchor itself is missing -- recovered from a
+    /// lingering mount lease) and mounts writable under `MountClaimPolicy::NoWait`: a live victim
+    /// lease is an immediate `ABORTED` refusal (no wait-and-observe, no FORCE variant), unlike the
+    /// bounded reclaim wait a normal `open` pays. Throws `BAD_ARGUMENTS` when there is nothing to
+    /// decommission (no owner anchor and no mount lease for `victim_srid`).
+    static StorePtr openForDecommission(BackendPtr backend, PoolConfig config, const String & victim_srid);
     ~Store();
 
     /// ---- per-server watermark surface (spec 2026-06-16-ca-build-watermark) ----
@@ -595,6 +603,22 @@ public:
 private:
 
     Store(BackendPtr backend_, PoolConfig config_, PoolMeta meta_);
+
+    /// Mount-claim policy for `mountWritable` (design 2026-07-13-cas-pool-member-decommission §core).
+    enum class MountClaimPolicy : uint8_t
+    {
+        WaitForExpiry,   /// normal server open — waits out a stale self-lease (S13)
+        NoWait,          /// decommission gate — a live lease is an immediate ABORTED refusal
+    };
+
+    /// The writable-mount startup tail shared by `open` and `openForDecommission`: owner claim →
+    /// writer_epoch → mount claim (+fence-recovery loop) → `MountLeaseKeeper` start → watermark
+    /// anchor. `our_uuid` is the identity to mount as -- `config.server_id` for a normal open, the
+    /// victim's owner uuid for decommission (impersonation). `policy` changes only what happens when
+    /// the mount claim does not resolve `Claimed`/`FencedSelf`: `WaitForExpiry` observes a stale-
+    /// looking lease and refuses (`mountDoubleStartMessage`) only once it proves genuinely live;
+    /// `NoWait` refuses immediately, with no observation wait.
+    static void mountWritable(StorePtr & store, UInt128 our_uuid, MountClaimPolicy policy);
 
     CasEventSink event_sink_;   /// B170: null = disabled (emitEvent no-op)
 
