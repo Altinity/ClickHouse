@@ -99,16 +99,18 @@ chosen design (§5) avoids the problem entirely by never replicating identity ob
 |---|--------|-------|
 | T1 | Bucket / region loss | infrastructure failure, account deletion |
 | T2 | Operator error | `DROP TABLE`, bad mutation, wrong `rm` on the pool |
-| T3 | CAS-layer bug | notably a GC bug deleting live data — acute pre-release |
+| T3 | CAS-layer bug | notably a GC bug deleting live data |
 | T4 | Credential compromise | attacker with production creds deletes everything reachable |
-| T5 | Format evolution | pre-release no-compat policy: a CAS-format copy is readable only by a binary of the matching format revision |
+| T5 | Format dependence | what the restore path requires: a CAS-capable ClickHouse binary within the format's compatibility roster, any ClickHouse, or no ClickHouse at all |
 
-T5 deserves emphasis: while the no-compat policy is in force, any backup stored in the CAS
-format has a shelf life bounded by format churn (layout moves, protobuf reshapes, hash-algo
-segments have all happened within weeks of each other). Mitigation for CAS-format backups:
-archive the reading binary (commit hash / docker image) next to each backup chain. After the
-first-release format freeze (B180) this threat downgrades to ordinary binary-format
-compatibility management.
+T5 is a structural property, not a statement about format instability: the pool format evolves
+under the documented schema-evolution rules (`05-formats-and-backend.md §schema-evolution`:
+self-describing format version, write-down-to-floor, a supported version roster), so a
+CAS-format backup is restorable by any binary within the roster. The tiers differ in what the
+restore path *requires*: a CAS-capable ClickHouse (CAS-format copies), any ClickHouse onto any
+disk type (plain MergeTree files, C1), or no ClickHouse at all (open formats, E). For
+long-retention chains, record the pool format version with the chain (the pool is
+self-describing via `_pool_meta`) so the restore runbook can pick a compatible binary.
 
 ---
 
@@ -208,14 +210,14 @@ combine with B1/B2 on the DR side. Costs 2× storage + cross-region traffic + a 
 Backup = a second CAS pool (different bucket/region/credentials) that receives **snapshot
 ref-sets + their closures by hash**: only blobs absent on the destination are copied
 (server-side `CopyObject` within a region), the result is a real pool verifiable by `fsck`.
-Incremental by construction, dedup-preserving, cheap. Shares the CAS format (T5 stays with the
-binary-archival mitigation). Detailed in §5.
+Incremental by construction, dedup-preserving, cheap. Shares the CAS format (T5: restore goes
+through a CAS-capable binary, see §2). Detailed in §5.
 
 ---
 
 ## 4. Comparison matrix {#comparison-matrix}
 
-| Option | T1 bucket loss | T2 operator error | T3 CAS bug | T4 creds | T5 format | RPO | RTO | Cost |
+| Option | T1 bucket loss | T2 operator error | T3 CAS bug | T4 creds | T5 format independence | RPO | RTO | Cost |
 |---|---|---|---|---|---|---|---|---|
 | A1 versioning stack | — | — | — | — | — | **unavailable** (probe fail-closed) | | |
 | A2 periodic sync | ✅ | ✅ | ⚠️¹ | ✅ | ❌ | hours | minutes–hour | LIST + 2× storage |
@@ -236,8 +238,8 @@ bodies or the format replicates into the copy.
 
 No single tier covers the matrix. The recommended composition: **B1+B2** (in-pool tier, ~free,
 consistency anchor) + **G** (primary DR tier; A2 with a documented runbook is its manual
-stand-in until built) + **C1 at a rare cadence** (weekly, the only format-independent
-insurance while the no-compat policy is in force). E optionally as a fourth archival tier.
+stand-in until built) + **C1 at a rare cadence** (weekly — the only tier restorable without a
+CAS-capable binary). E optionally as a fourth archival tier.
 
 ---
 
@@ -416,5 +418,6 @@ to the backup pool; restore writes only to the fresh pool.
 - `08-testing-and-soak.md` — `fsck` (backup verification), `ca-gc-rebuild` (restore step),
   S18 (shadow reachability).
 - `BACKLOG.md` — B198 (this document is its design base), "out-of-band staging adoption via
-  verified copy-forward" (the fetch/adoption primitive), B180 format freeze (retires T5),
-  AD-3 day-2 runbook (restore procedures belong there once implemented).
+  verified copy-forward" (the fetch/adoption primitive), B180 format-version breadcrumb (the
+  self-description T5's roster rule leans on), AD-3 day-2 runbook (restore procedures belong
+  there once implemented).
