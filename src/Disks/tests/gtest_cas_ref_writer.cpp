@@ -5,8 +5,9 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasOrphanManifestSweep.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRefIntake.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRefLogCodec.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRefSnapshotCodec.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasRefLogFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasRefSnapshotFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/Exception.h>
@@ -132,7 +133,7 @@ RefTableState independentFullReplayForTest(Backend & backend, const Layout & lay
     for (const RefTxnId & id : ids)
     {
         const auto got = backend.get(layout.refLogKey(ns, id));
-        applyRefLogTxn(state, decodeRefLogTxn(got->bytes, ns.string(), id));
+        applyRefLogTxn(state, decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns.string(), id));
     }
     return state;
 }
@@ -525,7 +526,8 @@ TEST(RefWriterRecovery, DifferentBytesAtSelectedSnapshotIsCorruptionNotRestart)
     foreign.ns = other_ns.string();
     foreign.snapshot_id = snap_x;
     foreign.lifecycle = RefLifecycle::Live;
-    backend->putIfAbsent(layout.refSnapshotKey(ns, snap_x), DB::Cas::encodeRefTableSnapshot(foreign));
+    backend->putIfAbsent(layout.refSnapshotKey(ns, snap_x),
+                         DB::Cas::sealObject(DB::Cas::FormatId::RefSnapshot, DB::Cas::encodeRefTableSnapshot(foreign)));
 
     auto store = openStore(backend);
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { store->resolveRef(ns, "anything"); });
@@ -1151,7 +1153,8 @@ TEST(RefWriterSnapshotPublish, ThresholdTriggerPublishesCacheReplayEquivalentByt
     /// The independent oracle: replay every `_log/` object directly, ignoring the snapshot entirely.
     const RefTableState oracle = independentFullReplayForTest(*backend, layout, ns, *snap_id);
     const String expected_bytes = encodeRefTableSnapshot(snapshotOf(oracle, ns.string()));
-    EXPECT_EQ(got->bytes, expected_bytes) << "published snapshot bytes must equal replay(logs through X)";
+    EXPECT_EQ(openObject(FormatId::RefSnapshot, got->bytes), expected_bytes)
+        << "published snapshot bytes must equal replay(logs through X)";
 }
 
 /// Task 13 (spec §implementation-impact): a threshold snapshot publish increments the writer-side
@@ -1215,7 +1218,7 @@ TEST(RefWriterSnapshotPublish, MountTimeTriggerPublishesAfterRecoveryReplaysLarg
     const auto got = backend->get(layout.refSnapshotKey(ns, *snap_id));
     ASSERT_TRUE(got.has_value());
     const RefTableState oracle = independentFullReplayForTest(*backend, layout, ns, *snap_id);
-    EXPECT_EQ(got->bytes, encodeRefTableSnapshot(snapshotOf(oracle, ns.string())));
+    EXPECT_EQ(openObject(FormatId::RefSnapshot, got->bytes), encodeRefTableSnapshot(snapshotOf(oracle, ns.string())));
 }
 
 /// ===================================================================================
@@ -1250,7 +1253,7 @@ TEST(RefWriterPublishFromLive, YoungTxnIsCoveredImmediately)
     ASSERT_TRUE(snap_id.has_value());
     const auto got = backend->get(layout.refSnapshotKey(ns, *snap_id));
     ASSERT_TRUE(got.has_value());
-    const RefTableSnapshot snap = decodeRefTableSnapshot(got->bytes, ns.string(), *snap_id);
+    const RefTableSnapshot snap = decodeRefTableSnapshot(openObject(FormatId::RefSnapshot, got->bytes), ns.string(), *snap_id);
     ASSERT_EQ(snap.committed.size(), 1u);
     EXPECT_EQ(snap.committed.front().ref_name, "a")
         << "the published snapshot body contains the just-promoted row";
@@ -1434,7 +1437,7 @@ TEST(RefWriterSnapshotPublish, ConcurrentOutOfOrderPublishDoesNotRegressBaseNorD
     const auto got = backend->get(layout.refSnapshotKey(ns, *snap_id));
     ASSERT_TRUE(got.has_value());
     const RefTableState oracle = independentFullReplayForTest(*backend, layout, ns, *snap_id);
-    EXPECT_EQ(got->bytes, encodeRefTableSnapshot(snapshotOf(oracle, ns.string())))
+    EXPECT_EQ(openObject(FormatId::RefSnapshot, got->bytes), encodeRefTableSnapshot(snapshotOf(oracle, ns.string())))
         << "published snapshot bytes must equal replay(all logs through X) -- a regressed base drops txns";
 }
 
@@ -2270,7 +2273,7 @@ TEST(RefWriterNamespaceRemoval, TxnNamesEveryOwnerThenRemoveNamespace)
     ASSERT_TRUE(newest_log.has_value());
     const auto got = backend->get(layout.refLogKey(ns, *newest_log));
     ASSERT_TRUE(got.has_value());
-    const RefLogTxn removal_txn = decodeRefLogTxn(got->bytes, ns.string(), *newest_log);
+    const RefLogTxn removal_txn = decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns.string(), *newest_log);
 
     ASSERT_FALSE(removal_txn.ops.empty());
     EXPECT_EQ(removal_txn.ops.back().kind, RefOpKind::RemoveNamespace);
@@ -2304,7 +2307,7 @@ TEST(RefWriterNamespaceRemoval, RemovedSnapshotPublished)
 
     const auto got = backend->get(layout.refSnapshotKey(ns, *remove_id));
     ASSERT_TRUE(got.has_value());
-    const RefTableSnapshot snap = decodeRefTableSnapshot(got->bytes, ns.string(), *remove_id);
+    const RefTableSnapshot snap = decodeRefTableSnapshot(openObject(FormatId::RefSnapshot, got->bytes), ns.string(), *remove_id);
     EXPECT_EQ(snap.lifecycle, RefLifecycle::Removed);
     ASSERT_TRUE(snap.remove_txn_id.has_value());
     EXPECT_EQ(*snap.remove_txn_id, *remove_id);
@@ -2642,7 +2645,7 @@ TEST(RefWriterRecoverySeal, UncleanBoundarySealsAllDeadEpochsBeforeExposingState
     const RefTxnId seal_id{2, UINT64_MAX};
     const auto got = backend->get(layout.refSnapshotKey(ns, seal_id));
     ASSERT_TRUE(got.has_value()) << "the seal must be durable at {liveWriterEpoch()-1, UINT64_MAX}";
-    const RefTableSnapshot seal = decodeRefTableSnapshot(got->bytes, ns.string(), seal_id);
+    const RefTableSnapshot seal = decodeRefTableSnapshot(openObject(FormatId::RefSnapshot, got->bytes), ns.string(), seal_id);
     EXPECT_EQ(seal.sealed_from, std::optional<RefTxnId>(RefTxnId{2, 1}))
         << "sealed_from must be the greatest listed txn id";
     ASSERT_EQ(seal.committed.size(), 2u);
@@ -2872,7 +2875,7 @@ TEST(RefWriterRecoverySeal, ConcurrentTouchDuringSealPutWaitsInsteadOfRacing)
 
     const auto got = backend->get(seal_key);
     ASSERT_TRUE(got.has_value()) << "the seal must be durable";
-    const RefTableSnapshot seal = decodeRefTableSnapshot(got->bytes, ns.string(), seal_id);
+    const RefTableSnapshot seal = decodeRefTableSnapshot(openObject(FormatId::RefSnapshot, got->bytes), ns.string(), seal_id);
     ASSERT_EQ(seal.committed.size(), 2u);
     EXPECT_TRUE(store->listRefs(ns).size() == 2u)
         << "both callers must converge on the same fully-recovered state";

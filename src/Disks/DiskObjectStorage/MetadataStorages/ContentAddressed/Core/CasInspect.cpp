@@ -5,8 +5,9 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasFoldSealFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestCodec.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRefLogCodec.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRefSnapshotCodec.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasRefLogFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasRefSnapshotFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasServerRoot.h>
 #include <Common/Exception.h>
 #include <fmt/format.h>
@@ -457,9 +458,11 @@ String caInspectToJson(const Layout & layout, const String & key, std::string_vi
             throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
                 "ca-inspect: key under cas/refs is not a recognized ref-object key '{}'", key);
         if (parsed->kind == RefObjectKind::Snap)
-            return renderRefTableSnapshot(decodeRefTableSnapshot(bytes, parsed->ns.string(), parsed->txn_id));
+            return renderRefTableSnapshot(decodeRefTableSnapshot(
+                openObject(FormatId::RefSnapshot, bytes), parsed->ns.string(), parsed->txn_id));
         if (parsed->kind == RefObjectKind::Log)
-            return renderRefLogTxn(decodeRefLogTxn(bytes, parsed->ns.string(), parsed->txn_id));
+            return renderRefLogTxn(decodeRefLogTxn(
+                openObject(FormatId::RefLog, bytes), parsed->ns.string(), parsed->txn_id));
         /// A `_cleanup` marker is a zero-byte object — nothing to decode, so render its key-derived facts.
         return JsonObj()
             .add("object", jsonEscape("ref_cleanup_marker"))

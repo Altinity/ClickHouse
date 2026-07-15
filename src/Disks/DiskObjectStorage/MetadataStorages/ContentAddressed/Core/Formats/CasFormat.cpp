@@ -102,7 +102,17 @@ constexpr uint64_t kKiB = 1024;
 constexpr uint64_t kMiB = 1024 * 1024;
 
 /// Caps are 100-1000x above realistic sizes (hitting one is corrupt object or protocol bug).
-/// RefLog/RefSnapshot caps are provisional until phase 3 re-derives the byte budgets for JSON.
+/// RefLog/RefSnapshot caps were re-derived for JSON in phase 3: object_cap 64 MiB (decompressed)
+/// comfortably covers the JSON-inflated removal-class txn / full snapshot -- the codec self-checks
+/// `ref_txn_max_bytes` = 1 MiB / `ref_removal_max_bytes` = `ref_snapshot_max_bytes` = 64 MiB over the
+/// text before sealing. line_cap == object_cap here (not a smaller streaming-style cap): these are
+/// WHOLE-READ formats (the object is fully materialized under object_cap), so a per-line cap adds no
+/// memory protection of its own -- line_cap exists to bound O(line) STREAMING formats. A line_cap
+/// below the object budget would create a write/read split: `admits` measures whole-txn text against
+/// the object budget with no per-line check, so a single ref payload near the budget would be
+/// ACCEPTED on write and then REJECTED on decode -- a persisted, undecodable, self-inflicted wedge of
+/// the ref lane. The binary codec these replace had no per-record cap either; matching that capacity
+/// is a re-encode, not a new restriction.
 /// Compression policy is per-type and deterministic (no size threshold): Always = the object can
 /// grow large and is stored under a `.zst` key suffix; PinnedRaw = deterministic byte-adoption
 /// formats; Never = always-small singletons, bare cat-able.
@@ -111,8 +121,8 @@ constexpr FormatTraits TRAITS[] =
     {FormatId::Blob,         "cas_blob",          TextFamily::PayloadHybrid, KeyStrictness::Tolerant, CompressionPolicy::Never,     256,        256},
     {FormatId::BlobMeta,     "cas_blob_meta",     TextFamily::Control,       KeyStrictness::Tolerant, CompressionPolicy::Never,     1 * kMiB,   64 * kKiB},
     {FormatId::PoolMeta,     "cas_pool_meta",     TextFamily::Control,       KeyStrictness::Tolerant, CompressionPolicy::Never,     1 * kMiB,   64 * kKiB},
-    {FormatId::RefLog,       "cas_ref_log",       TextFamily::Control,       KeyStrictness::Tolerant, CompressionPolicy::Always,    64 * kMiB,  64 * kKiB},
-    {FormatId::RefSnapshot,  "cas_ref_snap",      TextFamily::Control,       KeyStrictness::Tolerant, CompressionPolicy::Always,    64 * kMiB,  64 * kKiB},
+    {FormatId::RefLog,       "cas_ref_log",       TextFamily::Control,       KeyStrictness::Tolerant, CompressionPolicy::Always,    64 * kMiB,  64 * kMiB},
+    {FormatId::RefSnapshot,  "cas_ref_snap",      TextFamily::Control,       KeyStrictness::Tolerant, CompressionPolicy::Always,    64 * kMiB,  64 * kMiB},
     {FormatId::Manifest,     "cas_ref_shard",     TextFamily::Control,       KeyStrictness::Tolerant, CompressionPolicy::Never,     64 * kMiB,  64 * kKiB},
     {FormatId::PartManifest, "cas_part_manifest", TextFamily::PayloadHybrid, KeyStrictness::Tolerant, CompressionPolicy::Always,    256 * kMiB, 64 * kKiB},
     {FormatId::RunFile,      "cas_run",           TextFamily::RecordStream,  KeyStrictness::Strict,   CompressionPolicy::PinnedRaw, 0,          4 * kKiB},

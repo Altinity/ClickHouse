@@ -6,6 +6,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasServerRoot.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasFoldSealFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasGcStateFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcCursorKey.h>
 #include <Common/Exception.h>
 #include <Common/ProfileEvents.h>
@@ -248,7 +249,7 @@ std::set<String> activeManifestKeys(Store & store, const RootNamespace & ns, Lat
         const auto got = backend.get(layout.refLogKey(ns, id));
         if (!got)
             continue;   /// vanished (a concurrent cleanup published a covering snapshot) -- its -1 was folded
-        const RefLogTxn txn = decodeRefLogTxn(got->bytes, ns.string(), id);
+        const RefLogTxn txn = decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns.string(), id);
         for (const RefManifestEdge & edge : manifestEdgesOfTxn(txn))
             if (edge.change < 0)
                 active.insert(layout.manifestKey(edge.manifest_id));

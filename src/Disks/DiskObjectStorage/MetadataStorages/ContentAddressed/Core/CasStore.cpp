@@ -2,6 +2,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasCodecUtil.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasGcStateFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInstrumentedBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasBlobEnvelopeFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasProbe.h>
@@ -1274,7 +1275,7 @@ void Store::ensureRefTableRecovered(const RootNamespace & ns, RefTableRuntime & 
                 vanished = true;   /// covered by a newer snapshot published-before-delete; restart
             else
             {
-                snapshot = decodeRefTableSnapshot(got->bytes, ns.string(), *greatest_snapshot);
+                snapshot = decodeRefTableSnapshot(openObject(FormatId::RefSnapshot, got->bytes), ns.string(), *greatest_snapshot);
                 snapshot_body_bytes = got->bytes.size();
             }
         }
@@ -1293,7 +1294,7 @@ void Store::ensureRefTableRecovered(const RootNamespace & ns, RefTableRuntime & 
                     vanished = true;
                     break;
                 }
-                tail.push_back(decodeRefLogTxn(got->bytes, ns.string(), id));
+                tail.push_back(decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns.string(), id));
                 tail_bytes.push_back(got->bytes.size());
             }
         }
@@ -1343,7 +1344,7 @@ void Store::ensureRefTableRecovered(const RootNamespace & ns, RefTableRuntime & 
             RefTableSnapshot seal = snapshotOf(rt.state, ns.string());
             seal.snapshot_id = seal_id;                     /// upper bound of the covered region
             seal.sealed_from = rt.state.greatest_applied;    /// == greatest_listed_id: nothing else was applied
-            const String seal_bytes = encodeRefTableSnapshot(seal);
+            const String seal_bytes = sealObject(FormatId::RefSnapshot, encodeRefTableSnapshot(seal));
             const auto fence_ok = [this] { return refAppendFenceOk(); };
             /// fix-round F3 follow-up (review Critical): the `SCOPE_EXIT` above mutates
             /// `recovery_in_progress` and notifies `recovery_cv`, and it MUST run with `state_mutex`
@@ -1832,12 +1833,12 @@ void Store::runRefQueueLeader(const RootNamespace & ns, const std::shared_ptr<Re
 namespace
 {
 /// rev.6 Task 11 (spec §anomaly-policy background diagnostics): a tolerant, read-only peek at the
-/// `RefLogTxn` wire header (`CasRefLogCodec.cpp`'s `u32 format_version | u32-len ns | u64 writer_epoch |
-/// u64 ref_sequence | ...`) WITHOUT `decodeRefLogTxn`'s expected-value cross-check -- the whole point
-/// of this diagnostic is that the body is NOT expected to match this key's identity. Never validates
-/// `format_version`, never reads past the header (the op payload is irrelevant to identifying the
-/// writer), and swallows any truncation/garbage: this is a background diagnostic only, never a decode
-/// anything else depends on.
+/// `cas_ref_log` TEXT object (codecs-v3 phase 3) WITHOUT `decodeRefLogTxn`'s expected-value cross-check
+/// -- the whole point of this diagnostic is that the body is NOT expected to match this key's identity.
+/// It `openObject`s the stored `.zst`, skips the header line, and reads `ns`/`we`/`rs` off the meta
+/// line (`we`/`rs` are decimal u64 strings). Never validates the header `v`, never reads past the meta
+/// line (the ops are irrelevant to identifying the writer), and swallows any truncation/garbage: this
+/// is a background diagnostic only, never a decode anything else depends on.
 struct ForeignRefLogHeaderPeek
 {
     String ns;
@@ -1849,13 +1850,25 @@ std::optional<ForeignRefLogHeaderPeek> peekForeignRefLogHeader(const String & by
 {
     try
     {
-        ReadBufferFromMemory in(bytes.data(), bytes.size());
-        uint32_t format_version = 0;
-        readBinaryLittleEndian(format_version, in);
+        const String text = openObject(FormatId::RefLog, bytes);
+        ReadBufferFromMemory in(text.data(), text.size());
+        const uint64_t line_cap = traitsFor(FormatId::RefLog).line_cap;
+        readLine(in, line_cap, "cas_ref_log");   /// header line -- skip
+        const String meta = readLine(in, line_cap, "cas_ref_log");
+        ReadBufferFromMemory m(meta.data(), meta.size());
+        JsonObjectReader r(m, KeyStrictness::Tolerant, "cas_ref_log");
         ForeignRefLogHeaderPeek peek;
-        peek.ns = readLenPrefixed(in);
-        readBinaryLittleEndian(peek.writer_epoch, in);
-        readBinaryLittleEndian(peek.ref_sequence, in);
+        bool saw_ns = false, saw_we = false, saw_rs = false;
+        String key;
+        while (r.nextKey(key))
+        {
+            if (key == "ns") { peek.ns = r.readString(); saw_ns = true; }
+            else if (key == "we") { peek.writer_epoch = r.readU64String(); saw_we = true; }
+            else if (key == "rs") { peek.ref_sequence = r.readU64String(); saw_rs = true; }
+            else r.skipUnknown(key);
+        }
+        if (!saw_ns || !saw_we || !saw_rs)
+            return std::nullopt;
         return peek;
     }
     catch (...)
@@ -2044,7 +2057,7 @@ void Store::flushRefBatch(const RootNamespace & ns, const std::shared_ptr<RefTab
                 /// check costs nothing and documents the invariant).
                 if (rt->wedge && rt->wedge->txn_id == wedge_copy->txn_id)
                 {
-                    const RefLogTxn wedged_txn = decodeRefLogTxn(wedge_copy->bytes, ns.string(), wedge_copy->txn_id);
+                    const RefLogTxn wedged_txn = decodeRefLogTxn(openObject(FormatId::RefLog, wedge_copy->bytes), ns.string(), wedge_copy->txn_id);
                     applyRefLogTxn(rt->state, wedged_txn);
                     rt->wedge.reset();
                 }
@@ -2254,7 +2267,7 @@ void Store::flushRefBatch(const RootNamespace & ns, const std::shared_ptr<RefTab
     String bytes;
     try
     {
-        bytes = encodeRefLogTxn(final_txn);
+        bytes = sealObject(FormatId::RefLog, encodeRefLogTxn(final_txn));
     }
     catch (...)
     {
@@ -2547,7 +2560,7 @@ bool Store::trySnapshotPublishOnce(const RootNamespace & ns)
     String bytes;
     try
     {
-        bytes = encodeRefTableSnapshot(snap);
+        bytes = sealObject(FormatId::RefSnapshot, encodeRefTableSnapshot(snap));
     }
     catch (...)
     {
@@ -2806,7 +2819,7 @@ void Store::publishRemovedSnapshotNow(const RootNamespace & ns)
     removed_snap.snapshot_id = remove_id;
     removed_snap.lifecycle = RefLifecycle::Removed;
     removed_snap.remove_txn_id = remove_id;
-    const String bytes = encodeRefTableSnapshot(removed_snap);
+    const String bytes = sealObject(FormatId::RefSnapshot, encodeRefTableSnapshot(removed_snap));
     const String key = pool_layout.refSnapshotKey(ns, remove_id);
     const auto fence_ok = [this] { return refAppendFenceOk(); };
     const CasWriteOutcome outcome = ref_request_controller->putIfAbsentControlled(key, bytes, fence_ok);

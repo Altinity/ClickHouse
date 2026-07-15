@@ -230,7 +230,7 @@ TEST(CasLayout, RefObjectKeyRoundTrips)
     const RefTxnId id{7, 0x8e};
 
     const String log_key = l.refLogKey(ns, id);
-    EXPECT_EQ(log_key, "p/cas/refs/srv1/tbl@cas@/_log/0000000000000007-000000000000008e");
+    EXPECT_EQ(log_key, "p/cas/refs/srv1/tbl@cas@/_log/0000000000000007-000000000000008e.zst");
     const auto parsed_log = l.parseRefObjectKey(log_key);
     ASSERT_TRUE(parsed_log.has_value());
     EXPECT_EQ(parsed_log->ns, ns);
@@ -238,7 +238,7 @@ TEST(CasLayout, RefObjectKeyRoundTrips)
     EXPECT_EQ(parsed_log->txn_id, id);
 
     const String snap_key = l.refSnapshotKey(ns, id);
-    EXPECT_EQ(snap_key, "p/cas/refs/srv1/tbl@cas@/_snap/0000000000000007-000000000000008e.proto");
+    EXPECT_EQ(snap_key, "p/cas/refs/srv1/tbl@cas@/_snap/0000000000000007-000000000000008e.zst");
     const auto parsed_snap = l.parseRefObjectKey(snap_key);
     ASSERT_TRUE(parsed_snap.has_value());
     EXPECT_EQ(parsed_snap->ns, ns);

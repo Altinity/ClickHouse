@@ -1,0 +1,722 @@
+#include "cas_format_test_battery.h"
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRefIds.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasRefLogFormat.h>
+#include <Disks/tests/cas_test_helpers.h>
+#include <Common/Exception.h>
+#include <random>
+#include <vector>
+
+/// v3 text codec tests for `cas_ref_log` (codecs-v3 phase 3). Split out of the retired
+/// `gtest_cas_ref_codecs.cpp` and re-pointed at the TEXT codec: the encoder-side validation tests are
+/// format-agnostic (they only assert `encodeRefLogTxn` throws) and carry over verbatim; the old
+/// binary-offset byte-patch decode tests (`bytes[k] = 99`) are gone — the shape-level corruption
+/// classes (truncation, `v`+1 forward-gate, wrong type, leading garbage) are now covered by the
+/// `CasFormatBattery.RefLog` row below. `RefTxnId` render/parse coverage lives here too (it rode in
+/// the same suite and is independent of either ref codec).
+
+using namespace DB::Cas;
+using DB::Cas::tests::expectThrowsCode;
+
+namespace
+{
+
+ManifestRef manifestRef(uint64_t epoch, uint64_t seq, uint32_t ordinal)
+{
+    return ManifestRef{epoch, seq, ordinal};
+}
+
+}
+
+/// ===================================================================================
+/// RefTxnId: render / parse
+/// ===================================================================================
+
+TEST(CasRefCodec, RenderCanonicalForm)
+{
+    EXPECT_EQ(renderRefTxnId(RefTxnId{7, 0x8e}), "0000000000000007-000000000000008e");
+    EXPECT_EQ(renderRefTxnId(RefTxnId{1, 1}), "0000000000000001-0000000000000001");
+    EXPECT_EQ(renderRefTxnId(RefTxnId{0xffffffffffffffffULL, 0xffffffffffffffffULL}),
+        "ffffffffffffffff-ffffffffffffffff");
+}
+
+TEST(CasRefCodec, RenderRejectsZeroComponent)
+{
+    EXPECT_THROW(renderRefTxnId(RefTxnId{0, 1}), DB::Exception);
+    EXPECT_THROW(renderRefTxnId(RefTxnId{1, 0}), DB::Exception);
+    EXPECT_THROW(renderRefTxnId(RefTxnId{0, 0}), DB::Exception);
+}
+
+TEST(CasRefCodec, ParseRoundTrip)
+{
+    for (const RefTxnId id : {RefTxnId{7, 0x8e}, RefTxnId{1, 1}, RefTxnId{255, 2}, RefTxnId{0x100000000ULL, 3},
+                               RefTxnId{0x8000000000000000ULL, 0x8000000000000000ULL},
+                               RefTxnId{0xffffffffffffffffULL, 0xffffffffffffffffULL}})
+    {
+        const String rendered = renderRefTxnId(id);
+        const auto parsed = parseRefTxnId(rendered);
+        ASSERT_TRUE(parsed.has_value());
+        EXPECT_EQ(*parsed, id);
+    }
+}
+
+TEST(CasRefCodec, ParseRejectsShort)
+{
+    EXPECT_FALSE(parseRefTxnId("000000000000007-000000000000008e").has_value());   /// 32 chars, one short
+    EXPECT_FALSE(parseRefTxnId("7-8e").has_value());
+    EXPECT_FALSE(parseRefTxnId("").has_value());
+}
+
+TEST(CasRefCodec, ParseRejectsLong)
+{
+    EXPECT_FALSE(parseRefTxnId("00000000000000007-000000000000008e").has_value());  /// 34 chars, one long
+    EXPECT_FALSE(parseRefTxnId("0000000000000007-000000000000008e0").has_value());
+}
+
+TEST(CasRefCodec, ParseRejectsUppercase)
+{
+    EXPECT_FALSE(parseRefTxnId("0000000000000007-00000000000000AE").has_value());
+    EXPECT_FALSE(parseRefTxnId("0000000000000007-000000000000008E").has_value());
+    EXPECT_FALSE(parseRefTxnId("0000000000000007-00000000000000Ae").has_value());  /// mixed case
+}
+
+TEST(CasRefCodec, ParseRejectsZeroComponent)
+{
+    EXPECT_FALSE(parseRefTxnId("0000000000000000-000000000000008e").has_value());
+    EXPECT_FALSE(parseRefTxnId("0000000000000007-0000000000000000").has_value());
+    EXPECT_FALSE(parseRefTxnId("0000000000000000-0000000000000000").has_value());
+}
+
+TEST(CasRefCodec, ParseRejectsNonHexGarbage)
+{
+    EXPECT_FALSE(parseRefTxnId("000000000000000g-000000000000008e").has_value());
+    EXPECT_FALSE(parseRefTxnId("!!!!!!!!!!!!!!!!-000000000000008e").has_value());
+    EXPECT_FALSE(parseRefTxnId("0000000000000007_000000000000008e").has_value());  /// wrong separator
+}
+
+TEST(CasRefCodec, ParseRejectsMisplacedSeparator)
+{
+    /// 17 hex digits then '-' then 15: same total length (33), dash at the wrong index -- the kind of
+    /// shape that, read naively without a fixed dash position, could be mistaken for an in-range but
+    /// overflowing first component.
+    EXPECT_FALSE(parseRefTxnId("00000000000000078-00000000000000e").has_value());
+}
+
+TEST(CasRefCodec, OrderMatchesLexicalOrderOfRender)
+{
+    const std::vector<uint64_t> values{1, 2, 255, 1ULL << 32, 1ULL << 63};
+    std::vector<RefTxnId> ids;
+    for (uint64_t epoch : values)
+        for (uint64_t seq : values)
+            ids.push_back(RefTxnId{epoch, seq});
+
+    std::mt19937 rng(42);
+    for (int iter = 0; iter < 200; ++iter)
+    {
+        const RefTxnId & a = ids[rng() % ids.size()];
+        const RefTxnId & b = ids[rng() % ids.size()];
+        const String ra = renderRefTxnId(a);
+        const String rb = renderRefTxnId(b);
+        EXPECT_EQ(a < b, ra < rb) << ra << " vs " << rb;
+        EXPECT_EQ(a == b, ra == rb);
+    }
+}
+
+/// ===================================================================================
+/// RefLogTxn: round trip
+/// ===================================================================================
+
+TEST(CasRefCodec, RoundTripNamespaceBirth)
+{
+    RefLogTxn txn;
+    txn.ns = "srv1/db/table@cas@";
+    txn.txn_id = RefTxnId{1, 1};
+    RefOp op;
+    op.kind = RefOpKind::NamespaceBirth;
+    txn.ops.push_back(op);
+
+    const String bytes = encodeRefLogTxn(txn);
+    const RefLogTxn decoded = decodeRefLogTxn(bytes, txn.ns, txn.txn_id);
+    EXPECT_EQ(decoded, txn);
+}
+
+TEST(CasRefCodec, RoundTripRemoveNamespace)
+{
+    RefLogTxn txn;
+    txn.ns = "srv1/db/table@cas@";
+    txn.txn_id = RefTxnId{1, 2};
+    RefOp op;
+    op.kind = RefOpKind::RemoveNamespace;
+    txn.ops.push_back(op);
+
+    const String bytes = encodeRefLogTxn(txn);
+    const RefLogTxn decoded = decodeRefLogTxn(bytes, txn.ns, txn.txn_id);
+    EXPECT_EQ(decoded, txn);
+}
+
+TEST(CasRefCodec, RoundTripSetPayload)
+{
+    RefLogTxn txn;
+    txn.ns = "srv1/db/table@cas@";
+    txn.txn_id = RefTxnId{3, 5};
+    RefOp op;
+    op.kind = RefOpKind::SetPayload;
+    op.ref_name = "all_1_1_0";
+    op.expected_manifest_ref = manifestRef(3, 4, 1);
+    op.payload = "mutable-ref-payload-bytes";
+    op.published_at_ms = 1717000000000ULL;
+    txn.ops.push_back(op);
+
+    const String bytes = encodeRefLogTxn(txn);
+    const RefLogTxn decoded = decodeRefLogTxn(bytes, txn.ns, txn.txn_id);
+    EXPECT_EQ(decoded, txn);
+}
+
+TEST(CasRefCodec, RoundTripSetPayloadEmptyPayload)
+{
+    RefLogTxn txn;
+    txn.ns = "ns";
+    txn.txn_id = RefTxnId{1, 1};
+    RefOp op;
+    op.kind = RefOpKind::SetPayload;
+    op.ref_name = "r";
+    op.expected_manifest_ref = manifestRef(1, 1, 1);
+    op.payload = "";
+    op.published_at_ms = 0;
+    txn.ops.push_back(op);
+
+    const String bytes = encodeRefLogTxn(txn);
+    const RefLogTxn decoded = decodeRefLogTxn(bytes, txn.ns, txn.txn_id);
+    EXPECT_EQ(decoded, txn);
+}
+
+TEST(CasRefCodec, RoundTripOwnerTransitionAdd)
+{
+    /// new-only = add: no old_binding, a fresh new_binding.
+    RefLogTxn txn;
+    txn.ns = "ns";
+    txn.txn_id = RefTxnId{1, 1};
+    RefOp op;
+    op.kind = RefOpKind::OwnerTransition;
+    op.new_binding = RefOwnerBinding{RefOwnerKind::Precommit, "all_1_1_0", manifestRef(1, 1, 1)};
+    txn.ops.push_back(op);
+
+    const String bytes = encodeRefLogTxn(txn);
+    const RefLogTxn decoded = decodeRefLogTxn(bytes, txn.ns, txn.txn_id);
+    EXPECT_EQ(decoded, txn);
+    ASSERT_TRUE(decoded.ops[0].new_binding.has_value());
+    EXPECT_FALSE(decoded.ops[0].old_binding.has_value());
+}
+
+TEST(CasRefCodec, RoundTripOwnerTransitionRemoval)
+{
+    /// old-only = removal: an old_binding, no new_binding.
+    RefLogTxn txn;
+    txn.ns = "ns";
+    txn.txn_id = RefTxnId{1, 1};
+    RefOp op;
+    op.kind = RefOpKind::OwnerTransition;
+    op.old_binding = RefOwnerBinding{RefOwnerKind::Precommit, "all_1_1_0", manifestRef(1, 1, 1)};
+    txn.ops.push_back(op);
+
+    const String bytes = encodeRefLogTxn(txn);
+    const RefLogTxn decoded = decodeRefLogTxn(bytes, txn.ns, txn.txn_id);
+    EXPECT_EQ(decoded, txn);
+    EXPECT_FALSE(decoded.ops[0].new_binding.has_value());
+    ASSERT_TRUE(decoded.ops[0].old_binding.has_value());
+}
+
+TEST(CasRefCodec, RoundTripOwnerTransitionReplace)
+{
+    /// both present = replace.
+    RefLogTxn txn;
+    txn.ns = "ns";
+    txn.txn_id = RefTxnId{1, 1};
+    RefOp op;
+    op.kind = RefOpKind::OwnerTransition;
+    op.old_binding = RefOwnerBinding{RefOwnerKind::Precommit, "all_1_1_0", manifestRef(1, 1, 1)};
+    op.new_binding = RefOwnerBinding{RefOwnerKind::Committed, "all_1_1_0", manifestRef(1, 1, 1)};
+    txn.ops.push_back(op);
+
+    const String bytes = encodeRefLogTxn(txn);
+    const RefLogTxn decoded = decodeRefLogTxn(bytes, txn.ns, txn.txn_id);
+    EXPECT_EQ(decoded, txn);
+    ASSERT_TRUE(decoded.ops[0].old_binding.has_value());
+    ASSERT_TRUE(decoded.ops[0].new_binding.has_value());
+}
+
+TEST(CasRefCodec, RoundTripMultipleOpsInOneTransaction)
+{
+    RefLogTxn txn;
+    txn.ns = "ns";
+    txn.txn_id = RefTxnId{9, 100};
+
+    RefOp birth;
+    birth.kind = RefOpKind::NamespaceBirth;
+    txn.ops.push_back(birth);
+
+    RefOp add;
+    add.kind = RefOpKind::OwnerTransition;
+    add.new_binding = RefOwnerBinding{RefOwnerKind::Precommit, "a/b/c", manifestRef(9, 1, 1)};
+    txn.ops.push_back(add);
+
+    RefOp payload;
+    payload.kind = RefOpKind::SetPayload;
+    payload.ref_name = "a/b/c";
+    payload.expected_manifest_ref = manifestRef(9, 1, 1);
+    payload.payload = "x";
+    payload.published_at_ms = 42;
+    txn.ops.push_back(payload);
+
+    const String bytes = encodeRefLogTxn(txn);
+    const RefLogTxn decoded = decodeRefLogTxn(bytes, txn.ns, txn.txn_id);
+    EXPECT_EQ(decoded, txn);
+    EXPECT_EQ(decoded.ops.size(), 3u);
+}
+
+/// A re-encode of a decoded transaction is byte-identical (the encoder is a pure function of the txn).
+TEST(CasRefCodec, ByteIdenticalReencode)
+{
+    RefLogTxn txn;
+    txn.ns = "srv1/db/table@cas@";
+    txn.txn_id = RefTxnId{9, 100};
+
+    RefOp birth;
+    birth.kind = RefOpKind::NamespaceBirth;
+    txn.ops.push_back(birth);
+
+    RefOp add;
+    add.kind = RefOpKind::OwnerTransition;
+    add.old_binding = RefOwnerBinding{RefOwnerKind::Precommit, "a/b/c", manifestRef(9, 1, 1)};
+    add.new_binding = RefOwnerBinding{RefOwnerKind::Committed, "a/b/c", manifestRef(9, 1, 1)};
+    txn.ops.push_back(add);
+
+    RefOp payload;
+    payload.kind = RefOpKind::SetPayload;
+    payload.ref_name = "a/b/c";
+    payload.expected_manifest_ref = manifestRef(9, 1, 1);
+    payload.payload = "some-payload";
+    payload.published_at_ms = 1717000000000ULL;
+    txn.ops.push_back(payload);
+
+    const String bytes1 = encodeRefLogTxn(txn);
+    const RefLogTxn decoded = decodeRefLogTxn(bytes1, txn.ns, txn.txn_id);
+    const String bytes2 = encodeRefLogTxn(decoded);
+    EXPECT_EQ(bytes1, bytes2);
+}
+
+/// ===================================================================================
+/// RefLogTxn: validation rejections (encoder-side + key/body binding + truncation)
+/// ===================================================================================
+
+TEST(CasRefCodec, EncodeRejectsZeroTxnId)
+{
+    RefLogTxn txn;
+    txn.ns = "ns";
+    txn.txn_id = RefTxnId{0, 1};
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(txn); });
+}
+
+TEST(CasRefCodec, DecodeRejectsTruncatedBuffer)
+{
+    RefLogTxn txn;
+    txn.ns = "ns";
+    txn.txn_id = RefTxnId{1, 1};
+    RefOp op;
+    op.kind = RefOpKind::SetPayload;
+    op.ref_name = "r";
+    op.expected_manifest_ref = manifestRef(1, 1, 1);
+    op.payload = "some payload";
+    txn.ops.push_back(op);
+    const String bytes = encodeRefLogTxn(txn);
+
+    /// Dropping the trailing bytes leaves the final line without its '\n' terminator -> fail closed.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { decodeRefLogTxn(bytes.substr(0, bytes.size() - 3), txn.ns, txn.txn_id); });
+}
+
+TEST(CasRefCodec, DecodeRejectsBodyNamespaceMismatch)
+{
+    RefLogTxn txn;
+    txn.ns = "ns-a";
+    txn.txn_id = RefTxnId{1, 1};
+    RefOp op;
+    op.kind = RefOpKind::NamespaceBirth;
+    txn.ops.push_back(op);
+    const String bytes = encodeRefLogTxn(txn);
+
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { decodeRefLogTxn(bytes, "ns-b", txn.txn_id); });
+}
+
+TEST(CasRefCodec, DecodeRejectsBodyTxnIdMismatch)
+{
+    RefLogTxn txn;
+    txn.ns = "ns";
+    txn.txn_id = RefTxnId{1, 1};
+    RefOp op;
+    op.kind = RefOpKind::NamespaceBirth;
+    txn.ops.push_back(op);
+    const String bytes = encodeRefLogTxn(txn);
+
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { decodeRefLogTxn(bytes, txn.ns, RefTxnId{1, 2}); });
+}
+
+TEST(CasRefCodec, EncodeRejectsEmptyRefName)
+{
+    RefLogTxn txn;
+    txn.ns = "ns";
+    txn.txn_id = RefTxnId{1, 1};
+    RefOp op;
+    op.kind = RefOpKind::SetPayload;
+    op.ref_name = "";
+    op.expected_manifest_ref = manifestRef(1, 1, 1);
+    txn.ops.push_back(op);
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(txn); });
+}
+
+TEST(CasRefCodec, EncodeRejectsDotRefName)
+{
+    RefLogTxn txn;
+    txn.ns = "ns";
+    txn.txn_id = RefTxnId{1, 1};
+    RefOp op;
+    op.kind = RefOpKind::SetPayload;
+    op.ref_name = ".";
+    op.expected_manifest_ref = manifestRef(1, 1, 1);
+    txn.ops.push_back(op);
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(txn); });
+}
+
+TEST(CasRefCodec, EncodeRejectsDotDotSegment)
+{
+    RefLogTxn txn;
+    txn.ns = "ns";
+    txn.txn_id = RefTxnId{1, 1};
+    RefOp op;
+    op.kind = RefOpKind::SetPayload;
+    op.ref_name = "a/../b";
+    op.expected_manifest_ref = manifestRef(1, 1, 1);
+    txn.ops.push_back(op);
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(txn); });
+}
+
+TEST(CasRefCodec, EncodeRejectsRepeatedSeparator)
+{
+    RefLogTxn txn;
+    txn.ns = "ns";
+    txn.txn_id = RefTxnId{1, 1};
+    RefOp op;
+    op.kind = RefOpKind::SetPayload;
+    op.ref_name = "a//b";
+    op.expected_manifest_ref = manifestRef(1, 1, 1);
+    txn.ops.push_back(op);
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(txn); });
+}
+
+TEST(CasRefCodec, EncodeRejectsLeadingSlash)
+{
+    RefLogTxn txn;
+    txn.ns = "ns";
+    txn.txn_id = RefTxnId{1, 1};
+    RefOp op;
+    op.kind = RefOpKind::SetPayload;
+    op.ref_name = "/a";
+    op.expected_manifest_ref = manifestRef(1, 1, 1);
+    txn.ops.push_back(op);
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(txn); });
+}
+
+TEST(CasRefCodec, EncodeRejectsTrailingSlash)
+{
+    RefLogTxn txn;
+    txn.ns = "ns";
+    txn.txn_id = RefTxnId{1, 1};
+    RefOp op;
+    op.kind = RefOpKind::SetPayload;
+    op.ref_name = "a/";
+    op.expected_manifest_ref = manifestRef(1, 1, 1);
+    txn.ops.push_back(op);
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(txn); });
+}
+
+TEST(CasRefCodec, EncodeRejectsBackslash)
+{
+    RefLogTxn txn;
+    txn.ns = "ns";
+    txn.txn_id = RefTxnId{1, 1};
+    RefOp op;
+    op.kind = RefOpKind::SetPayload;
+    op.ref_name = "a\\b";
+    op.expected_manifest_ref = manifestRef(1, 1, 1);
+    txn.ops.push_back(op);
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(txn); });
+}
+
+TEST(CasRefCodec, EncodeRejectsNonCanonicalOwnerBindingRefName)
+{
+    RefLogTxn txn;
+    txn.ns = "ns";
+    txn.txn_id = RefTxnId{1, 1};
+    RefOp op;
+    op.kind = RefOpKind::OwnerTransition;
+    op.new_binding = RefOwnerBinding{RefOwnerKind::Precommit, "..", manifestRef(1, 1, 1)};
+    txn.ops.push_back(op);
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(txn); });
+}
+
+TEST(CasRefCodec, EncodeRejectsEmbeddedNulRefName)
+{
+    RefLogTxn txn;
+    txn.ns = "ns";
+    txn.txn_id = RefTxnId{1, 1};
+    RefOp op;
+    op.kind = RefOpKind::SetPayload;
+    op.ref_name = String("a\0b", 3);   /// embedded NUL byte -- never legitimate in a ref name
+    op.expected_manifest_ref = manifestRef(1, 1, 1);
+    txn.ops.push_back(op);
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(txn); });
+}
+
+TEST(CasRefCodec, EncodeRejectsTooManyOps)
+{
+    RefLogTxn txn;
+    txn.ns = "ns";
+    txn.txn_id = RefTxnId{1, 1};
+    for (size_t i = 0; i < ref_txn_max_ops + 1; ++i)
+    {
+        RefOp op;
+        op.kind = RefOpKind::NamespaceBirth;
+        txn.ops.push_back(op);
+    }
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(txn); });
+}
+
+TEST(CasRefCodec, EncodeAllowsExactlyMaxOps)
+{
+    RefLogTxn txn;
+    txn.ns = "ns";
+    txn.txn_id = RefTxnId{1, 1};
+    for (size_t i = 0; i < ref_txn_max_ops; ++i)
+    {
+        RefOp op;
+        op.kind = RefOpKind::NamespaceBirth;
+        txn.ops.push_back(op);
+    }
+    const String bytes = encodeRefLogTxn(txn);
+    const RefLogTxn decoded = decodeRefLogTxn(bytes, txn.ns, txn.txn_id);
+    EXPECT_EQ(decoded.ops.size(), ref_txn_max_ops);
+}
+
+TEST(CasRefCodec, EncodeRejectsOversizedNormalTransaction)
+{
+    RefLogTxn txn;
+    txn.ns = "ns";
+    txn.txn_id = RefTxnId{1, 1};
+    RefOp op;
+    op.kind = RefOpKind::SetPayload;
+    op.ref_name = "r";
+    op.expected_manifest_ref = manifestRef(1, 1, 1);
+    op.payload = String(ref_txn_max_bytes + 1, 'x');
+    txn.ops.push_back(op);
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(txn); });
+}
+
+TEST(CasRefCodec, RemovalClassTransactionLiftsByteBudgetAboveNormalLimit)
+{
+    /// A RemoveNamespace transaction carrying a payload bigger than the NORMAL limit but within the
+    /// REMOVAL limit must succeed -- proving the removal-class flag actually lifts the byte budget
+    /// rather than merely being ignored.
+    RefLogTxn txn;
+    txn.ns = "ns";
+    txn.txn_id = RefTxnId{1, 1};
+
+    RefOp remove;
+    remove.kind = RefOpKind::RemoveNamespace;
+    txn.ops.push_back(remove);
+
+    RefOp payload;
+    payload.kind = RefOpKind::SetPayload;
+    payload.ref_name = "r";
+    payload.expected_manifest_ref = manifestRef(1, 1, 1);
+    payload.payload = String(ref_txn_max_bytes + 1024, 'x');
+    txn.ops.push_back(payload);
+
+    const String bytes = encodeRefLogTxn(txn);
+    EXPECT_GT(bytes.size(), ref_txn_max_bytes);
+    const RefLogTxn decoded = decodeRefLogTxn(bytes, txn.ns, txn.txn_id);
+    EXPECT_EQ(decoded, txn);
+}
+
+TEST(CasRefCodec, RemovalClassTransactionStillRejectsBeyondRemovalLimit)
+{
+    RefLogTxn txn;
+    txn.ns = "ns";
+    txn.txn_id = RefTxnId{1, 1};
+
+    RefOp remove;
+    remove.kind = RefOpKind::RemoveNamespace;
+    txn.ops.push_back(remove);
+
+    RefOp payload;
+    payload.kind = RefOpKind::SetPayload;
+    payload.ref_name = "r";
+    payload.expected_manifest_ref = manifestRef(1, 1, 1);
+    payload.payload = String(ref_removal_max_bytes + 1, 'x');
+    txn.ops.push_back(payload);
+
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(txn); });
+}
+
+TEST(CasRefCodec, RemovalClassTransactionNotCappedOnOpCount)
+{
+    /// A removal-class transaction may exceed `ref_txn_max_ops` -- only the (much larger) byte budget
+    /// bounds it, per spec ("its operation count is bounded by that byte limit").
+    RefLogTxn txn;
+    txn.ns = "ns";
+    txn.txn_id = RefTxnId{1, 1};
+
+    RefOp remove;
+    remove.kind = RefOpKind::RemoveNamespace;
+    txn.ops.push_back(remove);
+    for (size_t i = 0; i < ref_txn_max_ops + 10; ++i)
+    {
+        RefOp op;
+        op.kind = RefOpKind::NamespaceBirth;
+        txn.ops.push_back(op);
+    }
+
+    const String bytes = encodeRefLogTxn(txn);
+    const RefLogTxn decoded = decodeRefLogTxn(bytes, txn.ns, txn.txn_id);
+    EXPECT_EQ(decoded.ops.size(), txn.ops.size());
+}
+
+TEST(CasRefCodec, EncodeAllowsExactlyMaxBytesNormalTransaction)
+{
+    RefLogTxn txn;
+    txn.ns = "ns";
+    txn.txn_id = RefTxnId{1, 1};
+    RefOp op;
+    op.kind = RefOpKind::SetPayload;
+    op.ref_name = "r";
+    op.expected_manifest_ref = manifestRef(1, 1, 1);
+    op.payload = "";
+    txn.ops.push_back(op);
+
+    const size_t base_size = encodeRefLogTxn(txn).size();
+    ASSERT_LE(base_size, ref_txn_max_bytes);
+    /// Every added 'x' is one un-escaped byte inside the JSON payload string, so the encoded size grows
+    /// one-for-one to exactly the cap.
+    txn.ops[0].payload = String(ref_txn_max_bytes - base_size, 'x');
+
+    const String bytes = encodeRefLogTxn(txn);
+    EXPECT_EQ(bytes.size(), ref_txn_max_bytes);
+    const RefLogTxn decoded = decodeRefLogTxn(bytes, txn.ns, txn.txn_id);
+    EXPECT_EQ(decoded, txn);
+}
+
+TEST(CasRefCodec, EncodeAllowsExactlyMaxRemovalBytes)
+{
+    RefLogTxn txn;
+    txn.ns = "ns";
+    txn.txn_id = RefTxnId{1, 1};
+    RefOp remove;
+    remove.kind = RefOpKind::RemoveNamespace;
+    txn.ops.push_back(remove);
+    RefOp payload_op;
+    payload_op.kind = RefOpKind::SetPayload;
+    payload_op.ref_name = "r";
+    payload_op.expected_manifest_ref = manifestRef(1, 1, 1);
+    payload_op.payload = "";
+    txn.ops.push_back(payload_op);
+
+    const size_t base_size = encodeRefLogTxn(txn).size();
+    ASSERT_LE(base_size, ref_removal_max_bytes);
+    txn.ops[1].payload = String(ref_removal_max_bytes - base_size, 'x');
+
+    const String bytes = encodeRefLogTxn(txn);
+    EXPECT_EQ(bytes.size(), ref_removal_max_bytes);
+    const RefLogTxn decoded = decodeRefLogTxn(bytes, txn.ns, txn.txn_id);
+    EXPECT_EQ(decoded, txn);
+}
+
+/// ManifestRef field validation, enforced by the log codec (spec's "invalid identifiers are rejected"
+/// binds both codecs). Encoder-side only -- the decode path re-runs the identical checks and is
+/// covered by the round-trips + the battery.
+
+TEST(CasRefCodec, EncodeRejectsZeroManifestRefWriterEpochInOwnerBinding)
+{
+    RefLogTxn txn;
+    txn.ns = "ns";
+    txn.txn_id = RefTxnId{1, 1};
+    RefOp op;
+    op.kind = RefOpKind::OwnerTransition;
+    op.new_binding = RefOwnerBinding{RefOwnerKind::Precommit, "r", manifestRef(0, 1, 1)};
+    txn.ops.push_back(op);
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(txn); });
+}
+
+TEST(CasRefCodec, EncodeRejectsZeroManifestRefBuildSequenceInOwnerBinding)
+{
+    RefLogTxn txn;
+    txn.ns = "ns";
+    txn.txn_id = RefTxnId{1, 1};
+    RefOp op;
+    op.kind = RefOpKind::OwnerTransition;
+    op.new_binding = RefOwnerBinding{RefOwnerKind::Precommit, "r", manifestRef(1, 0, 1)};
+    txn.ops.push_back(op);
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(txn); });
+}
+
+TEST(CasRefCodec, EncodeRejectsOutOfRangeManifestOrdinalInOwnerBinding)
+{
+    RefLogTxn txn;
+    txn.ns = "ns";
+    txn.txn_id = RefTxnId{1, 1};
+    RefOp op;
+    op.kind = RefOpKind::OwnerTransition;
+    op.new_binding = RefOwnerBinding{RefOwnerKind::Precommit, "r", manifestRef(1, 1, 0)};
+    txn.ops.push_back(op);
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(txn); });
+}
+
+TEST(CasRefCodec, EncodeRejectsZeroManifestRefInSetPayload)
+{
+    RefLogTxn txn;
+    txn.ns = "ns";
+    txn.txn_id = RefTxnId{1, 1};
+    RefOp op;
+    op.kind = RefOpKind::SetPayload;
+    op.ref_name = "r";
+    op.expected_manifest_ref = manifestRef(1, 1, 0);
+    txn.ops.push_back(op);
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefLogTxn(txn); });
+}
+
+/// ===================================================================================
+/// Shape-level failure-mode battery (truncation / v+1 gate / wrong type / leading garbage)
+/// ===================================================================================
+
+TEST(CasFormatBattery, RefLog)
+{
+    RefLogTxn txn;
+    txn.ns = "ns";
+    txn.txn_id = RefTxnId{1, 1};
+    RefOp op;
+    op.kind = RefOpKind::SetPayload;
+    op.ref_name = "all_1_1_0";
+    op.expected_manifest_ref = manifestRef(1, 1, 1);
+    op.payload = "p";
+    op.published_at_ms = 42;
+    txn.ops.push_back(op);
+
+    const String ns = txn.ns;
+    const RefTxnId id = txn.txn_id;
+    runFormatBattery({FormatId::RefLog,
+        [txn] { return sealObject(FormatId::RefLog, encodeRefLogTxn(txn)); },
+        [ns, id](std::string_view s) { decodeRefLogTxn(openObject(FormatId::RefLog, s), ns, id); },
+        "{\"type\":\"cas_ref_log\",\"v\":3}\n"
+        "{\"ns\":\"ns\",\"we\":\"1\",\"rs\":\"1\"}\n"
+        "{\"op\":\"set_payload\",\"rn\":\"all_1_1_0\",\"me\":\"1\",\"mb\":\"1\",\"mo\":1,\"pl\":\"p\",\"ts\":42}\n"
+        "{\"n\":1}\n"});
+}

@@ -117,17 +117,20 @@ public:
         return prefix + "/cas/refs/";
     }
 
-    /// Immutable transaction log object (spec §Object Layout): `<prefix>/cas/refs/<ns>/_log/<render>`.
+    /// Immutable transaction log object (spec §Object Layout):
+    /// `<prefix>/cas/refs/<ns>/_log/<render>.zst`. codecs-v3 phase 3: the log is the text `cas_ref_log`
+    /// under the Always/`.zst` `storedSuffix` (the point-GET constructs the key with the suffix; no try-both).
     String refLogKey(const RootNamespace & ns, const RefTxnId & id) const
     {
-        return refsNamespacePrefix(ns) + "_log/" + renderRefTxnId(id);
+        return refsNamespacePrefix(ns) + "_log/" + renderRefTxnId(id) + String(storedSuffix(FormatId::RefLog));
     }
 
-    /// Writer-published table snapshot (spec §Object Layout): `.../_snap/<render>.proto`. Snapshot `X`
-    /// reuses the `RefTxnId` of the last log it covers -- it does not allocate its own identifier.
+    /// Writer-published table snapshot (spec §Object Layout): `.../_snap/<render>.zst`. codecs-v3
+    /// phase 3: the pre-v3 `.proto` suffix is gone — the snapshot is the text `cas_ref_snap` under the
+    /// Always/`.zst` `storedSuffix`. Snapshot `X` reuses the `RefTxnId` of the last log it covers.
     String refSnapshotKey(const RootNamespace & ns, const RefTxnId & id) const
     {
-        return refsNamespacePrefix(ns) + "_snap/" + renderRefTxnId(id) + ".proto";
+        return refsNamespacePrefix(ns) + "_snap/" + renderRefTxnId(id) + String(storedSuffix(FormatId::RefSnapshot));
     }
 
     /// Namespace-removal completion marker (spec §Object Layout): a zero-byte object at
@@ -142,9 +145,10 @@ public:
     /// `RefTxnId`. Strict: returns `std::nullopt` -- never throws -- for anything that is not one of
     /// OUR ref-object keys: a foreign top-level prefix, a missing namespace/kind/id segment, an
     /// unrecognized kind directory (this also excludes a bare numeric-shard ref-key shape,
-    /// `cas/refs/<ns>/<shard>`, which has no kind directory at all), a `_snap` id missing its `.proto`
-    /// suffix, a `_log`/`_cleanup` id carrying any extension, trailing garbage after the id, or a
-    /// non-canonical `RefTxnId` render (delegates to `parseRefTxnId`).
+    /// `cas/refs/<ns>/<shard>`, which has no kind directory at all), a `_log`/`_snap` id missing its
+    /// `.zst` suffix (codecs-v3 phase 3: both are Always-compressed text), a `_cleanup` id carrying any
+    /// extension, trailing garbage after the id, or a non-canonical `RefTxnId` render (delegates to
+    /// `parseRefTxnId`).
     std::optional<ParsedRefObjectKey> parseRefObjectKey(std::string_view key) const
     {
         const String base = casRefsPrefix();
@@ -178,16 +182,19 @@ public:
             return std::nullopt;
 
         std::string_view render = id_part;
-        if (kind == RefObjectKind::Snap)
+        if (kind == RefObjectKind::Snap || kind == RefObjectKind::Log)
         {
-            constexpr std::string_view kProtoSuffix = ".proto";
-            if (!render.ends_with(kProtoSuffix))
+            /// codecs-v3 phase 3: `_log` and `_snap` are Always-compressed text stored under a `.zst`
+            /// suffix (the pre-v3 `_snap` `.proto` suffix is gone; `_log` used to carry none). `_cleanup`
+            /// stays a bare zero-byte marker (non-family, uncompressed).
+            constexpr std::string_view kZstSuffix = ".zst";
+            if (!render.ends_with(kZstSuffix))
                 return std::nullopt;
-            render.remove_suffix(kProtoSuffix.size());
+            render.remove_suffix(kZstSuffix.size());
         }
         else if (render.find('.') != std::string_view::npos)
         {
-            return std::nullopt;   /// `_log`/`_cleanup` ids never carry an extension
+            return std::nullopt;   /// `_cleanup` ids never carry an extension
         }
 
         const auto txn_id = parseRefTxnId(render);

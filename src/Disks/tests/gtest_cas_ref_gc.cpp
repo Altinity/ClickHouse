@@ -6,6 +6,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRefIntake.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasTextFormat.h>
 #include "cas_test_helpers.h"
 
 #include <Common/ProfileEvents.h>
@@ -477,7 +478,7 @@ TEST(CasRefGc, RemoveNamespaceCompletesAndPublishesMarkerDeterministically)
     const auto parsed_snap_key = layout.parseRefObjectKey(removed_snap_key);
     ASSERT_TRUE(parsed_snap_key.has_value());
     const RefTableSnapshot removed = decodeRefTableSnapshot(
-        snap_after_gc1->bytes, ns.string(), parsed_snap_key->txn_id);
+        openObject(FormatId::RefSnapshot, snap_after_gc1->bytes), ns.string(), parsed_snap_key->txn_id);
     EXPECT_EQ(removed.lifecycle, RefLifecycle::Removed);
     EXPECT_TRUE(removed.committed.empty());
 

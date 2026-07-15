@@ -15,8 +15,8 @@ shape. Design: `docs/superpowers/specs/2026-07-15-cas-codecs-v3-design.md`; refe
 | Key (under the pool prefix) | Object | Codec | Writer |
 |---|---|---|---|
 | `_pool_meta` | pool identity + floors | `CasPoolMetaFormat` | pool create/admit |
-| `cas/refs/<ns>/…_log` | ref transaction log | `CasRefLogFormat`* | writer commit path |
-| `cas/refs/<ns>/…_snap` | complete ref table | `CasRefSnapshotFormat`* | writer/GC fold |
+| `cas/refs/<ns>/…_log` | ref transaction log | `CasRefLogFormat` (`.zst`) | writer commit path |
+| `cas/refs/<ns>/…_snap` | complete ref table | `CasRefSnapshotFormat` (`.zst`) | writer/GC fold |
 | `cas/refs/<ns>/…` cleanup marker | key-only presence marker (empty body) | — | GC |
 | `cas/manifests/<ns>/<epoch>/<seq>/<ordinal>` | part manifest | `CasPartManifestFormat`* | part build |
 | blob keys (`CasLayout::blobKey`) | blob envelope + payload | `CasBlobEnvelopeFormat` | uploads |
@@ -35,8 +35,9 @@ the CA protobuf build target are removed. **Phase 5 (runs) is DONE**: the GC sou
 (`cas_run`) is sorted NDJSON via `CasRecordStreamFormat` (streamed, no seek), integrity is the
 whole-file seal-checksum, and the part-manifest cleanup run + `RunFileReader::seek` + `RunMerger` are
 gone — `CasRunFile` survives only as the phase-6-owned embedded part-manifest (`ManifestEntries`)
-codec. Phases 4 (blob meta) and 7 (blob envelope) are likewise text. Remaining `*` rows = phases 3/6
-(refsnaplog, part manifest).
+codec. Phases 4 (blob meta) and 7 (blob envelope) are likewise text. **Phase 3 (refsnaplog) is
+DONE**: `cas_ref_log` (`CasRefLogFormat`) and `cas_ref_snap` (`CasRefSnapshotFormat`) are canonical
+JSON text sealed Always/`.zst`. Remaining `*` rows = phase 6 (part manifest).
 
 ## Codec table
 

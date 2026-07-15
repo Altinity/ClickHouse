@@ -3,6 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFsck.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasGcStateFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasFoldSealFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRunFile.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestCodec.h>
@@ -195,7 +196,7 @@ void checkSnapshotOracle(Backend & backend, const Layout & layout, const RootNam
         const auto got_base = backend.get(layout.refSnapshotKey(ns, *it));
         if (!got_base)
             continue;   /// vanished; try the next older snapshot
-        base = decodeRefTableSnapshot(got_base->bytes, ns.string(), *it);
+        base = decodeRefTableSnapshot(openObject(FormatId::RefSnapshot, got_base->bytes), ns.string(), *it);
         base_id = *it;
         break;
     }
@@ -213,16 +214,18 @@ void checkSnapshotOracle(Backend & backend, const Layout & layout, const RootNam
         const auto got_log = backend.get(layout.refLogKey(ns, id));
         if (!got_log)
             return;   /// a covered log was cleaned/vanished: oracle unavailable for X -> skip, not error
-        tail.push_back(decodeRefLogTxn(got_log->bytes, ns.string(), id));
+        tail.push_back(decodeRefLogTxn(openObject(FormatId::RefLog, got_log->bytes), ns.string(), id));
     }
 
     /// Reconstruct the state AT X and re-encode. `replay` revalidates the base snapshot in full and applies
     /// the tail through the SAME state machine the writer used; the last applied id is X, so `snapshotOf`
     /// yields a snapshot with id X whose bytes must equal the published object.
     const RefTableState reconstructed = replay(base, tail);
+    /// `recomputed` is canonical TEXT; the stored object is Always/`.zst`, so compare against the
+    /// DECOMPRESSED stored bytes (zstd byte-determinism is not relied on here -- the canonical text is).
     const String recomputed = encodeRefTableSnapshot(snapshotOf(reconstructed, ns.string()));
     ++report.snapshot_oracle_checked;
-    if (recomputed != got_x->bytes)
+    if (recomputed != openObject(FormatId::RefSnapshot, got_x->bytes))
     {
         ++report.snapshot_oracle_mismatches;
         FsckObject o;

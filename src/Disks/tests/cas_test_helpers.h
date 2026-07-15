@@ -14,8 +14,9 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasFoldSealFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestCodec.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestId.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRefLogCodec.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRefSnapshotCodec.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasRefLogFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasRefSnapshotFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include <Common/Exception.h>
 #include <Common/thread_local_rng.h>
@@ -767,7 +768,7 @@ inline void writeRefSnapshotRaw(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::RefTableSnapshot & snapshot)
 {
     const String key = layout.refSnapshotKey(DB::Cas::RootNamespace{snapshot.ns}, snapshot.snapshot_id);
-    backend.putIfAbsent(key, DB::Cas::encodeRefTableSnapshot(snapshot));
+    backend.putIfAbsent(key, DB::Cas::sealObject(DB::Cas::FormatId::RefSnapshot, DB::Cas::encodeRefTableSnapshot(snapshot)));
 }
 
 /// Writes `txn` at `_log/<txn_id>` (create-if-absent).
@@ -775,7 +776,7 @@ inline void writeRefLogTxnRaw(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::RefLogTxn & txn)
 {
     const String key = layout.refLogKey(DB::Cas::RootNamespace{txn.ns}, txn.txn_id);
-    backend.putIfAbsent(key, DB::Cas::encodeRefLogTxn(txn));
+    backend.putIfAbsent(key, DB::Cas::sealObject(DB::Cas::FormatId::RefLog, DB::Cas::encodeRefLogTxn(txn)));
 }
 
 /// A `Live` snapshot naming exactly `committed` (already-sorted-by-ref_name input expected) with no

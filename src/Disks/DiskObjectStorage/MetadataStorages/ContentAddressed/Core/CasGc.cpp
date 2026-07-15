@@ -8,8 +8,8 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcShardPlan.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasOrphanManifestSweep.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRefIntake.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRefLogCodec.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRefSnapshotCodec.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasRefLogFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasRefSnapshotFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasCodecUtil.h>
 #include <IO/ReadBufferFromMemory.h>
 #include <IO/WriteBufferFromString.h>
@@ -994,7 +994,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             RefLogTxn txn;
             try
             {
-                txn = decodeRefLogTxn(got->bytes, ns_str, log_id);
+                txn = decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns_str, log_id);
             }
             catch (const Exception & e)
             {
@@ -1575,7 +1575,8 @@ void Gc::runNamespaceCleanupPasses(const CasFoldSeal & seal, const std::map<Stri
                 removed.snapshot_id = item.remove_txn_id;
                 removed.lifecycle = RefLifecycle::Removed;
                 removed.remove_txn_id = item.remove_txn_id;
-                backend.putIfAbsent(layout.refSnapshotKey(item.ns, item.remove_txn_id), encodeRefTableSnapshot(removed));
+                backend.putIfAbsent(layout.refSnapshotKey(item.ns, item.remove_txn_id),
+                                    sealObject(FormatId::RefSnapshot, encodeRefTableSnapshot(removed)));
             }
         }
     }

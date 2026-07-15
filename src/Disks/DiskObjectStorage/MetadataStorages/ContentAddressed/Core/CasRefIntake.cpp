@@ -1,4 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRefIntake.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasTextFormat.h>
 #include <Common/Exception.h>
 #include <algorithm>
 
@@ -180,7 +181,7 @@ RecoveredRefTable recoverRefTableDetailed(Backend & backend, const Layout & layo
             if (!got)
                 vanished = true;
             else
-                snapshot = decodeRefTableSnapshot(got->bytes, ns.string(), *snapshot_id);
+                snapshot = decodeRefTableSnapshot(openObject(FormatId::RefSnapshot, got->bytes), ns.string(), *snapshot_id);
         }
 
         /// Replay every log with id greater than the selected snapshot, in id order.
@@ -196,7 +197,7 @@ RecoveredRefTable recoverRefTableDetailed(Backend & backend, const Layout & layo
                     vanished = true;
                     break;
                 }
-                tail.push_back(decodeRefLogTxn(got->bytes, ns.string(), id));
+                tail.push_back(decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns.string(), id));
             }
 
         if (vanished)
