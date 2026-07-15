@@ -19,8 +19,8 @@ shape. Design: `docs/superpowers/specs/2026-07-15-cas-codecs-v3-design.md`; refe
 | `cas/refs/<ns>/…_snap` | complete ref table | `CasRefSnapshotFormat`* | writer/GC fold |
 | `cas/refs/<ns>/…` cleanup marker | key-only presence marker (empty body) | — | GC |
 | `cas/manifests/<ns>/<epoch>/<seq>/<ordinal>` | part manifest | `CasPartManifestFormat`* | part build |
-| blob keys (`CasLayout::blobKey`) | blob envelope + payload | `CasBlobEnvelopeFormat`* | uploads |
-| blob-meta keys (`CasLayout::blobMetaKey`) | freshness sidecar | `CasBlobMetaFormat`* | dedup/GC |
+| blob keys (`CasLayout::blobKey`) | blob envelope + payload | `CasBlobEnvelopeFormat` | uploads |
+| blob-meta keys (`CasLayout::blobMetaKey`) | freshness sidecar | `CasBlobMetaFormat` | dedup/GC |
 | `gc/state`, `gc/hb` | GC state / leader heartbeat | `CasGcStateFormat` | GC |
 | `gc/gen/<g>/attempt/<a>/outcomes/…​.zst` | outcome log | `CasGcOutcomesFormat` (`.zst`) | GC |
 | `gc/gen/<g>/attempt/<a>/fold_seal` | fold seal (deterministic) | `CasFoldSealFormat` | GC |
@@ -35,7 +35,8 @@ the CA protobuf build target are removed. **Phase 5 (runs) is DONE**: the GC sou
 (`cas_run`) is sorted NDJSON via `CasRecordStreamFormat` (streamed, no seek), integrity is the
 whole-file seal-checksum, and the part-manifest cleanup run + `RunFileReader::seek` + `RunMerger` are
 gone — `CasRunFile` survives only as the phase-6-owned embedded part-manifest (`ManifestEntries`)
-codec. Remaining `*` rows = phases 3/4/6/7 (refsnaplog, blob meta, part manifest, blob envelope).
+codec. Phases 4 (blob meta) and 7 (blob envelope) are likewise text. Remaining `*` rows = phases 3/6
+(refsnaplog, part manifest).
 
 ## Codec table
 
