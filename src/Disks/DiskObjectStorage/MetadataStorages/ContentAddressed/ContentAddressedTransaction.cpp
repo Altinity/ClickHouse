@@ -291,26 +291,29 @@ bool ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
     if (st.published)
         return false;   /// already durable (published at the lock-free rename) — never re-publish
 
-    if (!st.build && st.entries.empty())
+    if (!st.build && st.entries.empty() && st.content_removed.empty())
     {
         /// Mutable-only staging: the MVCC layer's autocommit one-shots (txn_version.txt
-        /// fill-in/rewrite) and metadata_version bumps on a COMMITTED part.
+        /// fill-in/rewrite) and metadata_version bumps on a COMMITTED part -- and (Task 8) the
+        /// harmless residue of a removeDirectory that already superseded this staging's marks
+        /// (content_removed cleared to empty; nothing left to publish).
         publishMutableFilesDelta(ns, ref, st);
         st.published = true;
         return false;   /// updateRefPayload mutates an existing ref — never a new ref to roll back
     }
 
-    /// Committed-ref standalone writes (all-tree-part-files Task 4, spec 2026-07-14-cas-all-tree-
-    /// part-files-design.md §4): `st.entries` here holds only the CHANGED/ADDED entries (see
-    /// stageBlobPartFile / the inline writeFile path) — never the whole part once the ref already
-    /// exists. Carry every OTHER committed entry forward and republish once via the repoint path
-    /// (Task 3), rather than letting the Build path below replace the manifest with just the delta
-    /// (which Task 2's promote guard would now reject with ABORTED for a genuine content change, or
-    /// silently drop the untouched files for a pre-Task-2 build). Handles both sub-cases the
-    /// interface allows: entries staged WITH a Build (this transaction uploaded new content) and,
-    /// forward-looking to Task 5/6, WITHOUT one (an entry staged some other way — e.g. a former
-    /// mutable per-part file once it becomes an ordinary tree entry).
-    if (!st.entries.empty())
+    /// Committed-ref standalone writes AND removal marks (all-tree-part-files Task 4 + Task 8, spec
+    /// 2026-07-14-cas-all-tree-part-files-design.md §4/§6): `st.entries` here holds only the
+    /// CHANGED/ADDED entries (see stageBlobPartFile / the inline writeFile path) — never the whole
+    /// part once the ref already exists; `st.content_removed` holds paths a same-transaction
+    /// unlinkFile staged for removal (§6). Carry every OTHER committed entry forward (minus any
+    /// content_removed path) and republish once via the repoint path (Task 3), rather than letting
+    /// the Build path below replace the manifest with just the delta (which Task 2's promote guard
+    /// would now reject with ABORTED for a genuine content change, or silently drop the untouched
+    /// files for a pre-Task-2 build). Handles both sub-cases the interface allows: entries staged
+    /// WITH a Build (this transaction uploaded new content) and WITHOUT one (a former mutable
+    /// per-part file that is now an ordinary tree entry, or a marks-only removal with no writes).
+    if (!st.entries.empty() || !st.content_removed.empty())
     {
         if (auto view = metadata_storage.partAccess().getView({ns, ref}, ContentAddressed::Freshness::ForceFresh))
         {
@@ -328,7 +331,7 @@ bool ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
                 /// + `precommitAdd`, which already names every hash this transaction is about to upload
                 /// — purely to hold that edge across the upload loop. Once `repointRef`'s own promote
                 /// makes the real (merged) manifest live, this scratch precommit is abandoned; it never
-                /// gets promoted.
+                /// gets promoted. A marks-only removal never enters this sub-block (`st.build` is null).
                 const Cas::ManifestId scratch_id = st.build->stageManifest(st.entries);
                 st.build->precommitAdd(ns, ref, scratch_id);
                 uploadPendingBlobs(st);
@@ -336,8 +339,9 @@ bool ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
 
             std::vector<Cas::ManifestEntry> merged;
             for (const auto & e : view->manifest()->entries)
-                if (std::none_of(st.entries.begin(), st.entries.end(),
-                                 [&](const Cas::ManifestEntry & s) { return s.path == e.path; }))
+                if (!st.content_removed.contains(e.path)
+                    && std::none_of(st.entries.begin(), st.entries.end(),
+                                     [&](const Cas::ManifestEntry & s) { return s.path == e.path; }))
                     merged.push_back(e);
             for (auto & s : st.entries)
                 merged.push_back(std::move(s));
@@ -355,7 +359,7 @@ bool ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
 
     if (!st.build)
         throw Exception(ErrorCodes::LOGICAL_ERROR,
-            "ContentAddressedTransaction: staged entries for {}/{} without a Build", ns.string(), ref);
+            "ContentAddressedTransaction: staged entries or removal marks for {}/{} without a Build", ns.string(), ref);
 
     /// Write path (rev. 15): stage the part manifest body (mints a ManifestId), precommitAdd a
     /// build-intent owner (closure now protected by reachability), upload the pending blobs, then
@@ -844,6 +848,14 @@ void ContentAddressedTransaction::removeDirectory(const std::string & path)
     if (auto r = routeOf(path); r && !r->ref.empty() && r->file.empty())
     {
         metadata_storage.partAccess().dropRefIfPresent(r->refKey());
+        /// all-tree-part-files Task 8 (B123 evolution, spec 2026-07-14-cas-all-tree-part-files-design.md
+        /// §6): this transaction's staged removal marks for the SAME ref (content_removed, populated by
+        /// unlinkFile's per-file unlinks that the MergeTree fast-removal path issues right before this
+        /// call) are superseded by the whole-part ref-drop just performed above — discard them so
+        /// publishStaging's committed-ref repoint branch never chases an already-dropped ref, and the
+        /// dominant removal path pays zero repoints (one ref-drop only).
+        if (auto * st = findStaging(*r))
+            st->content_removed.clear();
         return;
     }
 }
@@ -1155,6 +1167,10 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
             }
             for (const auto & file : src_st.mutable_removed)
                 dst_st.mutable_removed.insert(file);
+            /// all-tree-part-files Task 8: carry any staged removal marks forward too (symmetric with
+            /// mutable_removed above) — a re-key of the staging key must not silently drop them.
+            for (const auto & file : src_st.content_removed)
+                dst_st.content_removed.insert(file);
             /// B188: move pending blobs from src to dst — they will be uploaded in dst's publishStaging.
             for (auto & pb : src_st.pending_blobs)
                 dst_st.pending_blobs.push_back(std::move(pb));
@@ -1364,30 +1380,28 @@ void ContentAddressedTransaction::replaceFile(const std::string & path_from, con
 
 void ContentAddressedTransaction::unlinkFile(const std::string & path, bool /*if_exists*/, bool /*should_remove_objects*/)
 {
-    /// Part file. Three sub-cases:
-    ///   1. A file STAGED in this transaction (content entry or mutable bytes): drop the staged state
-    ///      so it never reaches the published tree.
-    ///   2. A MUTABLE file that exists only in the COMMITTED payload: stage it for removal so commit
-    ///      publishes the deletion via updateRefPayload (the MVCC removeTmpMetadataFile shape).
-    ///   3. A COMMITTED CONTENT file (not staged here, not mutable): **deliberate NO-OP**.
+    /// Part file. Two sub-cases:
+    ///   1. A file STAGED in this transaction (content entry or legacy mutable bytes): drop the
+    ///      staged state so it never reaches the published tree.
+    ///   2. A COMMITTED CONTENT file (not staged here): all-tree-part-files Task 8 (B123 evolution,
+    ///      spec 2026-07-14-cas-all-tree-part-files-design.md §6) — stage a REMOVAL MARK
+    ///      (`content_removed`). The mark is resolved at publish (`publishStaging`): a repoint
+    ///      republishes the manifest minus the removed paths, UNLESS this same transaction also
+    ///      drops the whole part directory (`removeDirectory`), in which case the mark is
+    ///      superseded — see `removeDirectory` below.
     ///
     /// B123 — LOAD-BEARING INVARIANT, do not "fix" with a blanket fail-closed assert:
     /// On a content-addressed disk a committed part is ONE atomic ref (its manifest tree); the removal
     /// UNIT is the whole-part ref-drop done by `removeDirectory(<part>)`, NOT per-file unlinks. The
     /// MergeTree fast-removal path (IMergeTreeDataPart::remove) unlinks EVERY part file one-by-one and
-    /// THEN calls `removeDirectory` — so these per-file unlinks of committed content files MUST be
-    /// no-ops here, and `removeDirectory` is what actually frees the part. An assertion that "a
-    /// committed content-file unlink never happens" would therefore fire on every normal part removal
-    /// and break it.
-    ///
-    /// The cost of this design is a narrow FAIL-OPEN: if some caller ever unlinks a SINGLE committed
-    /// content file expecting it gone WITHOUT dropping the whole part, the bytes survive in the
-    /// manifest (a no-op here), whereas on a non-CAS disk the file would actually be deleted. This
-    /// shape does NOT occur in MergeTree today (a committed content file is only ever removed as part
-    /// of a whole-part removal, i.e. followed by `removeDirectory`); the invariant holds because the
-    /// MergeTree layer treats a part directory as the indivisible removal unit. If that ever changes
-    /// (a code path that surgically deletes one committed content file and relies on it being gone),
-    /// this no-op becomes a correctness bug and the removal must instead go through ref-drop.
+    /// THEN calls `removeDirectory` — so a batched per-file unlink storm immediately followed by a
+    /// ref-drop in the SAME transaction must cost exactly one ref-drop and zero repoints, not one
+    /// repoint per unlinked file. `removeDirectory` clears any marks staged here for the same ref
+    /// before the transaction publishes, which is what makes the storm-then-drop shape free. A lone
+    /// surgical unlink NOT followed by a ref-drop in the same transaction (ATTACH's
+    /// `removeVersionMetadata`, a future backfill/repair delete) resolves to one repoint-remove —
+    /// this closes the file's former fail-open (a committed content file could never actually be
+    /// deleted on its own; see the pre-Task-8 comment this replaces).
     if (auto r = routeOf(path); r && !r->file.empty())
     {
         auto & st = stagingFor(*r);
@@ -1400,9 +1414,8 @@ void ContentAddressedTransaction::unlinkFile(const std::string & path, bool /*if
         /// eagerly because the same hash may still be referenced by another staged entry.
         std::erase_if(st.entries, [&](const Cas::ManifestEntry & e) { return e.path == r->file; });
         st.mutable_files.erase(r->file);
-        if (!staged_here && ContentAddressed::isMutablePerPartFile(r->file))
-            st.mutable_removed.insert(r->file);
-        /// else: a committed CONTENT file → sub-case 3, the deliberate no-op documented above.
+        if (!staged_here)
+            st.content_removed.insert(r->file);
         return;
     }
 

@@ -93,6 +93,14 @@ private:
         std::vector<Cas::ManifestEntry> entries;   /// staged manifest entries (uploads + adoptions)
         std::map<std::string, std::string> mutable_files;
         std::set<std::string> mutable_removed;     /// staged deletions for a COMMITTED part's payload
+        std::set<std::string> content_removed;     /// all-tree-part-files Task 8 (B123 evolution, spec
+                                                   /// 2026-07-14-cas-all-tree-part-files-design.md §6):
+                                                   /// staged removal marks for a COMMITTED part's TREE
+                                                   /// entries. Resolved at publish (publishStaging): a
+                                                   /// repoint carries the committed manifest forward
+                                                   /// minus these paths, UNLESS the same transaction also
+                                                   /// drops the whole part (removeDirectory), in which
+                                                   /// case the marks are superseded (see removeDirectory).
         bool published = false;                    /// the ref is already durably published (at the
                                                    /// lock-free rename); commit() must not re-publish it.
 

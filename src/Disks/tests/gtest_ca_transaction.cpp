@@ -267,3 +267,87 @@ TEST(CaTransactionAllTree, CommittedTxnVersionStoreRepoints)
     const auto rep = DB::Cas::runFsck(*storage->store(), /*detail*/false);
     EXPECT_EQ(rep.dangling, 0u);
 }
+
+/// all-tree-part-files Task 8 (B123 evolution, spec 2026-07-14-cas-all-tree-part-files-design.md §6):
+/// a lone surgical unlink of ONE committed content file (not followed by a whole-part removal in the
+/// same transaction — the ATTACH `removeVersionMetadata` shape) must actually delete the file via a
+/// repoint-remove, closing the pre-Task-8 fail-open (unlinkFile of a committed content file used to be
+/// an unconditional no-op).
+TEST(CaTransactionRemove, SurgicalUnlinkRepoints)
+{
+    auto storage = openTxStorage();
+
+    /// 1. Commit a part with txn_version.txt among its files.
+    {
+        auto tx = storage->createTransaction();
+        writeFileTx(*tx, "uui/uuid-remove-1/tmp_insert_all_1_1_0/checksums.txt", "cs-bytes");
+        writeFileTx(*tx, "uui/uuid-remove-1/tmp_insert_all_1_1_0/data.bin", "the-data-bytes");
+        writeFileTx(*tx, "uui/uuid-remove-1/tmp_insert_all_1_1_0/txn_version.txt",
+            "creation_tid: (1,1,00000000-0000-0000-0000-000000000000)");
+        tx->moveDirectory("uui/uuid-remove-1/tmp_insert_all_1_1_0", "uui/uuid-remove-1/all_1_1_0");
+        tx->commit(DB::NoCommitOptions{});
+    }
+    ASSERT_TRUE(storage->existsFile("uui/uuid-remove-1/all_1_1_0/txn_version.txt"));
+
+    const uint64_t repoints_before = ProfileEvents::global_counters[ProfileEvents::CasRefRepoint].load();
+
+    /// 2. A single-op transaction unlinks ONLY txn_version.txt on the already-committed part (mirrors
+    /// ATTACH's removeVersionMetadata: no dir-drop in the same transaction).
+    {
+        auto tx = storage->createTransaction();
+        tx->unlinkFile("uui/uuid-remove-1/all_1_1_0/txn_version.txt", /*if_exists=*/false, /*should_remove_objects=*/true);
+        tx->commit(DB::NoCommitOptions{});
+    }
+
+    /// 3. The file is honestly gone, the untouched files survive (carry-forward), exactly one repoint
+    /// fired, and an independent fsck reachability walk finds nothing dangling.
+    EXPECT_FALSE(storage->existsFile("uui/uuid-remove-1/all_1_1_0/txn_version.txt"));
+    EXPECT_EQ(storage->getFileSize("uui/uuid-remove-1/all_1_1_0/checksums.txt"), 8u);
+    EXPECT_EQ(storage->getFileSize("uui/uuid-remove-1/all_1_1_0/data.bin"), 14u);
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasRefRepoint].load(), repoints_before + 1);
+
+    const auto rep = DB::Cas::runFsck(*storage->store(), /*detail*/false);
+    EXPECT_EQ(rep.dangling, 0u);
+}
+
+/// all-tree-part-files Task 8 (B123 evolution, spec §6): the DOMINANT CA removal path — the MergeTree
+/// fast-removal shape that unlinks every part file one by one and THEN calls removeDirectory — must
+/// stay exactly one ref-drop and pay ZERO repoints. The per-file removal marks staged by the unlink
+/// storm are superseded by the ref-drop, not individually repointed.
+TEST(CaTransactionRemove, UnlinkStormThenDirDropIsOneRefDrop)
+{
+    auto storage = openTxStorage();
+
+    /// 1. Commit a part with three files.
+    {
+        auto tx = storage->createTransaction();
+        writeFileTx(*tx, "uui/uuid-remove-2/tmp_insert_all_1_1_0/checksums.txt", "cs-bytes");
+        writeFileTx(*tx, "uui/uuid-remove-2/tmp_insert_all_1_1_0/data.bin", "the-data-bytes");
+        writeFileTx(*tx, "uui/uuid-remove-2/tmp_insert_all_1_1_0/txn_version.txt",
+            "creation_tid: (1,1,00000000-0000-0000-0000-000000000000)");
+        tx->moveDirectory("uui/uuid-remove-2/tmp_insert_all_1_1_0", "uui/uuid-remove-2/all_1_1_0");
+        tx->commit(DB::NoCommitOptions{});
+    }
+    ASSERT_TRUE(storage->existsDirectory("uui/uuid-remove-2/all_1_1_0"));
+
+    const uint64_t repoints_before = ProfileEvents::global_counters[ProfileEvents::CasRefRepoint].load();
+
+    /// 2. The MergeTree fast-removal shape (IMergeTreeDataPart::remove, B123): unlink every file
+    /// one-by-one, THEN removeDirectory the part — all in one transaction.
+    {
+        auto tx = storage->createTransaction();
+        tx->unlinkFile("uui/uuid-remove-2/all_1_1_0/checksums.txt", /*if_exists=*/false, /*should_remove_objects=*/true);
+        tx->unlinkFile("uui/uuid-remove-2/all_1_1_0/data.bin", /*if_exists=*/false, /*should_remove_objects=*/true);
+        tx->unlinkFile("uui/uuid-remove-2/all_1_1_0/txn_version.txt", /*if_exists=*/false, /*should_remove_objects=*/true);
+        tx->removeDirectory("uui/uuid-remove-2/all_1_1_0");
+        tx->commit(DB::NoCommitOptions{});
+    }
+
+    /// 3. The whole part is gone via the single ref-drop; the storm of marks never repointed anything.
+    EXPECT_FALSE(storage->existsDirectory("uui/uuid-remove-2/all_1_1_0"));
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasRefRepoint].load(), repoints_before)
+        << "unlink-storm-then-dir-drop must supersede the marks, not repoint per file";
+
+    const auto rep = DB::Cas::runFsck(*storage->store(), /*detail*/false);
+    EXPECT_EQ(rep.dangling, 0u);
+}
