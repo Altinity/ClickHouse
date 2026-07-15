@@ -22,6 +22,7 @@
 #include <Disks/DiskObjectStorage/DiskObjectStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/IMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasDecommission.h>
 #include <Disks/IDisk.h>
 #include <Formats/FormatSchemaInfo.h>
 #include <Functions/UserDefined/ExternalUserDefinedExecutableFunctionsLoader.h>
@@ -96,6 +97,7 @@
 #include <Common/typeid_cast.h>
 #include <Common/SystemAllocatedMemoryHolder.h>
 #include <base/sleep.h>
+#include <fmt/ranges.h>
 
 #include "config.h"
 
@@ -1009,6 +1011,76 @@ BlockIO InterpreterSystemQuery::execute()
         {
             getContext()->checkAccess(AccessType::SYSTEM_CONTENT_ADDRESSED_GC_REBUILD);
             runContentAddressedGcRebuild(query.disk, query.content_addressed_gc_rebuild_force);
+            break;
+        }
+        case Type::CONTENT_ADDRESSED_DROP_POOL_MEMBER:
+        {
+            getContext()->checkAccess(AccessType::SYSTEM_CONTENT_ADDRESSED_DROP_POOL_MEMBER);
+
+            /// Same content-addressed-disk detection as runContentAddressedGarbageCollection /
+            /// runContentAddressedGcRebuild: plain (non-object-storage) disks throw NOT_IMPLEMENTED
+            /// from getMetadataStorage - that simply means "not content-addressed" for our purposes.
+            auto content_addressed_storage_of = [](const DiskPtr & disk) -> ContentAddressedMetadataStorage *
+            {
+                MetadataStoragePtr md;
+                try
+                {
+                    md = disk->getMetadataStorage();
+                }
+                catch (const Exception & e)
+                {
+                    if (e.code() == ErrorCodes::NOT_IMPLEMENTED)
+                        return nullptr;
+                    throw;
+                }
+                if (!md || !md->isContentAddressed())
+                    return nullptr;
+                return dynamic_cast<ContentAddressedMetadataStorage *>(md.get());
+            };
+
+            auto disk = getContext()->getDisk(query.disk);
+            auto * ca = content_addressed_storage_of(disk);
+            if (!ca)
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                    "SYSTEM CONTENT ADDRESSED DROP POOL MEMBER: disk '{}' is not a content-addressed disk", query.disk);
+
+            const auto & host_store = ca->store();
+            const auto report = Cas::decommissionPoolMember(host_store->poolBackendPtr(), host_store->poolConfig(), query.replica);
+
+            /// One-row summary result set (precedent: SYNC_FILESYSTEM_CACHE's MutableColumns/
+            /// SourceFromSingleChunk construction above).
+            ColumnsDescription columns{NamesAndTypesList{
+                {"srid", std::make_shared<DataTypeString>()},
+                {"namespaces_removed", std::make_shared<DataTypeUInt64>()},
+                {"namespaces_already_removed", std::make_shared<DataTypeUInt64>()},
+                {"committed_refs_removed", std::make_shared<DataTypeUInt64>()},
+                {"precommits_removed", std::make_shared<DataTypeUInt64>()},
+                {"manifest_debris_removed", std::make_shared<DataTypeUInt64>()},
+                {"staging_objects_removed", std::make_shared<DataTypeUInt64>()},
+                {"mountpoint_objects_removed", std::make_shared<DataTypeUInt64>()},
+                {"slot_removed", std::make_shared<DataTypeUInt8>()},
+                {"warnings", std::make_shared<DataTypeString>()},
+            }};
+            Block sample_block;
+            for (const auto & column : columns)
+                sample_block.insert({column.type->createColumn(), column.type, column.name});
+
+            MutableColumns res_columns = sample_block.cloneEmptyColumns();
+            size_t i = 0;
+            res_columns[i++]->insert(report.srid);
+            res_columns[i++]->insert(report.namespaces_removed);
+            res_columns[i++]->insert(report.namespaces_already_removed);
+            res_columns[i++]->insert(report.committed_refs_removed);
+            res_columns[i++]->insert(report.precommits_removed);
+            res_columns[i++]->insert(report.manifest_debris_removed);
+            res_columns[i++]->insert(report.staging_objects_removed);
+            res_columns[i++]->insert(report.mountpoint_objects_removed);
+            res_columns[i++]->insert(static_cast<UInt8>(report.slot_removed));
+            res_columns[i++]->insert(fmt::format("{}", fmt::join(report.warnings, "; ")));
+
+            size_t num_rows = res_columns[0]->size();
+            auto source = std::make_shared<SourceFromSingleChunk>(std::make_shared<const Block>(std::move(sample_block)), Chunk(std::move(res_columns), num_rows));
+            result.pipeline = QueryPipeline(std::move(source));
             break;
         }
         case Type::FLUSH_LOGS:
@@ -2822,6 +2894,11 @@ AccessRightsElements InterpreterSystemQuery::getRequiredAccessForDDLOnCluster() 
         case Type::CONTENT_ADDRESSED_GC_REBUILD:
         {
             required_access.emplace_back(AccessType::SYSTEM_CONTENT_ADDRESSED_GC_REBUILD);
+            break;
+        }
+        case Type::CONTENT_ADDRESSED_DROP_POOL_MEMBER:
+        {
+            required_access.emplace_back(AccessType::SYSTEM_CONTENT_ADDRESSED_DROP_POOL_MEMBER);
             break;
         }
         case Type::UNFREEZE:

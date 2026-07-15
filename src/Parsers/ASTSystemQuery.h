@@ -4,6 +4,7 @@
 #include <Parsers/IAST.h>
 #include <Parsers/SyncReplicaMode.h>
 #include <Server/ServerType.h>
+#include <base/EnumReflection.h>
 
 #include "config.h"
 
@@ -148,6 +149,7 @@ public:
         RESET_DDL_WORKER,
         CONTENT_ADDRESSED_GARBAGE_COLLECTION,
         CONTENT_ADDRESSED_GC_REBUILD,
+        CONTENT_ADDRESSED_DROP_POOL_MEMBER,
         END
     };
 
@@ -270,3 +272,14 @@ protected:
 
 
 }
+
+/// Type has grown past the default magic_enum range [-128, 127] (130+ entries and counting, one per
+/// SYSTEM sub-command): both the type-detection loop in ParserSystemQuery.cpp (which iterates
+/// magic_enum::enum_values<Type>() to try every command's auto-derived keyword phrase) and
+/// ASTSystemQuery::typeToString's index table silently drop/OOB-index any value past the range without
+/// this. Matches the GeometryColumnType / Coordination::OpNum precedent for a large enum.
+template <> struct magic_enum::customize::enum_range<DB::ASTSystemQuery::Type>
+{
+    static constexpr int min = 0;
+    static constexpr int max = 255;
+};

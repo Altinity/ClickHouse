@@ -284,6 +284,15 @@ void ASTSystemQuery::formatImpl(WriteBuffer & ostr, const FormatSettings & setti
             }
             break;
         }
+        case Type::CONTENT_ADDRESSED_DROP_POOL_MEMBER:
+        {
+            /// SYSTEM CONTENT ADDRESSED DROP POOL MEMBER <srid> FROM DISK <disk> -- both required, both
+            /// quoted string literals (unlike the sibling CONTENT_ADDRESSED_* commands' bare identifier
+            /// disk target: an srid is an opaque server-root path, not necessarily identifier-shaped).
+            ostr << ' ' << quoteString(replica);
+            print_keyword(" FROM DISK ") << quoteString(disk);
+            break;
+        }
         case Type::RESTART_DISK:
         case Type::WAIT_BLOBS_CLEANUP:
         case Type::CLEAR_DISK_METADATA_CACHE:
