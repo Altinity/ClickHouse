@@ -19,6 +19,7 @@ set (CLICKHOUSE_DISKS_SOURCES
     CommandCaGcDryRun.cpp
     CommandCaGcRebuild.cpp
     CommandCaInspect.cpp
+    CommandCaDropMember.cpp
     CommandGetCurrentDiskAndPath.cpp
     Utils.cpp)
 

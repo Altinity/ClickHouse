@@ -341,6 +341,7 @@ void DisksApp::registerCommands()
     command_descriptions.emplace("ca-gc-dryrun", makeCommandCaGcDryRun());
     command_descriptions.emplace("ca-gc-rebuild", makeCommandCaGcRebuild());
     command_descriptions.emplace("ca-inspect", makeCommandCaInspect());
+    command_descriptions.emplace("ca-drop-member", makeCommandCaDropMember());
     command_descriptions.emplace("help", makeCommandHelp(*this));
 #if CLICKHOUSE_CLOUD
     command_descriptions.emplace("packed-io", makeCommandPackedIO());
