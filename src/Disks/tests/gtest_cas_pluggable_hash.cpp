@@ -32,13 +32,12 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestCodec.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasPoolMeta.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasPoolMetaFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include "cas_test_helpers.h"
 
 #include <IO/WriteBufferFromFile.h>
 
-#include <cas_format.pb.h>
 
 #include <algorithm>
 #include <filesystem>
@@ -54,7 +53,6 @@ extern const int UNKNOWN_FORMAT_VERSION;
 using namespace DB::Cas;
 using namespace DB::Cas::tests;
 
-namespace Proto = ::clickhouse::cas::format;
 
 namespace
 {
@@ -712,22 +710,23 @@ TEST(CasPluggableHash, ReaderGenerationIsRaisedToThree)
         { Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"}); });
     }
 
-    /// BACKWARD floor (Task 12): a pool whose header `compatibility_version` is BELOW generation 3 was
-    /// written by an older build holding the removed pre-snapshot+log ref format; it must fail closed at
-    /// open rather than mis-recover every table from a fresh-looking empty ref prefix. Craft it at the
-    /// proto layer: take a fresh (generation-3) pool-meta and stamp its header down to `G_BUILD - 1`.
+    /// BACKWARD floor (Task 12): a pool whose header `v` (compatibility_version) is BELOW generation 3
+    /// was written by an older build holding the removed pre-snapshot+log ref format; it must fail
+    /// closed at open rather than mis-recover every table from a fresh-looking empty ref prefix. Craft
+    /// it at the text layer: take a fresh (generation-3) pool-meta and rewrite its line-1 version gate
+    /// down to `G_BUILD - 1` (an older build would have stamped exactly that).
     {
         auto backend = std::make_shared<InMemoryBackend>();
         const Layout layout("p");
         PoolMeta pm = PoolMeta::createOrValidate(*backend, layout, /*blob_header_len*/ 256, BlobHashAlgo::CityHash128);
         const String fresh_bytes = encodePoolMeta(pm);
 
-        Proto::PoolMetaProto msg;
-        ASSERT_TRUE(msg.ParseFromString(fresh_bytes));
-        ASSERT_EQ(msg.header().compatibility_version(), G_BUILD);   // sanity: a fresh pool is at the floor
-        msg.mutable_header()->set_compatibility_version(G_BUILD - 1);
-        std::string downgraded;
-        ASSERT_TRUE(msg.SerializeToString(&downgraded));
+        const String from = "\"v\":" + std::to_string(G_BUILD);
+        const String to = "\"v\":" + std::to_string(G_BUILD - 1);
+        const auto pos = fresh_bytes.find(from);
+        ASSERT_NE(pos, String::npos);   // sanity: a fresh pool stamps the header at the floor
+        String downgraded = fresh_bytes;
+        downgraded.replace(pos, from.size(), to);
         ASSERT_TRUE(backend->casPut(layout.poolMetaKey(), downgraded, backend->get(layout.poolMetaKey())->token).outcome == CasOutcome::Committed);
 
         /// `decodePoolMeta`'s backward floor rejects the downgraded bytes directly...

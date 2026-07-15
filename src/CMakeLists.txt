@@ -702,10 +702,6 @@ target_link_libraries(dbms PUBLIC ch_contrib::sparsehash)
 if (TARGET ch_contrib::protobuf)
     target_link_libraries(dbms PRIVATE ch_contrib::protobuf)
     target_link_libraries (clickhouse_common_io PUBLIC ch_contrib::protobuf)
-
-    # CA content-addressed metadata protobuf codecs (pool meta, gc state, fold seal, ...).
-    add_subdirectory("Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Proto")
-    target_link_libraries(dbms PRIVATE clickhouse_cas_proto)
 endif ()
 
 if (TARGET clickhouse_grpc_protos)
@@ -902,11 +898,6 @@ if (ENABLE_TESTS)
         clickhouse_common_zookeeper_base
         clickhouse_common_config
         clickhouse_common_zookeeper)
-
-    if (TARGET clickhouse_cas_proto)
-        # Tests that include <cas_format.pb.h> directly need the proto include path (SYSTEM PUBLIC).
-        target_link_libraries(unit_tests_dbms PRIVATE clickhouse_cas_proto)
-    endif ()
 
     if (TARGET ch_contrib::simdjson)
         target_link_libraries(unit_tests_dbms PRIVATE ch_contrib::simdjson)

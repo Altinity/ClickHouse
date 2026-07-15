@@ -22,10 +22,10 @@ namespace ErrorCodes
 namespace DB::Cas
 {
 
-/// Binary codec helpers (Plan 3c-tail: JSON family removed — all mutable objects are now protobuf;
-/// see `CasFormat.h` + `cas_format.proto`). Hashed/identity objects (envelope, tree payload,
-/// blob payloads, gc/snap) use the standard IO helpers directly — these named wrappers exist so a
-/// 128-bit serialization can never be mis-paired with the wrong byte order.
+/// Binary codec helpers shared by the remaining custom-binary codecs (the refsnaplog log/snapshot
+/// objects and `CasStore`'s mutable-files payload). The control-plane objects moved to the v3 text
+/// codecs in `Core/Formats/` (codecs-v3 phase 2); these named wrappers survive for the length-prefixed
+/// binary bodies and exist so a 128-bit serialization can never be mis-paired with the wrong byte order.
 
 /// ---------------------------------------------------------------------------------------------
 /// On-disk UInt128 wire forms. CAS serializes a 128-bit hash in two distinct non-hex byte orders,

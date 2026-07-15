@@ -14,20 +14,25 @@ shape. Design: `docs/superpowers/specs/2026-07-15-cas-codecs-v3-design.md`; refe
 
 | Key (under the pool prefix) | Object | Codec | Writer |
 |---|---|---|---|
-| `_pool_meta` | pool identity + floors | `CasPoolMetaFormat`* | pool create/admit |
+| `_pool_meta` | pool identity + floors | `CasPoolMetaFormat` | pool create/admit |
 | `cas/refs/<ns>/…_log` | ref transaction log | `CasRefLogFormat`* | writer commit path |
 | `cas/refs/<ns>/…_snap` | complete ref table | `CasRefSnapshotFormat`* | writer/GC fold |
 | `cas/refs/<ns>/…` cleanup marker | key-only presence marker (empty body) | — | GC |
 | `cas/manifests/<ns>/<epoch>/<seq>/<ordinal>` | part manifest | `CasPartManifestFormat`* | part build |
 | blob keys (`CasLayout::blobKey`) | blob envelope + payload | `CasBlobEnvelopeFormat`* | uploads |
 | blob-meta keys (`CasLayout::blobMetaKey`) | freshness sidecar | `CasBlobMetaFormat`* | dedup/GC |
-| `gc/state`, `gc/hb` | GC state / leader heartbeat | `CasGcStateFormat`* | GC |
-| `gc/gen/<g>/attempt/<a>/…` | fold seal, runs, outcomes | `CasFoldSealFormat`* / `CasRecordStreamFormat`* / `CasGcOutcomesFormat`* | GC |
-| `gc/server-roots/<srid>/{owner,epoch,mount}` | server-root singletons | `CasServerRootFormats`* | mount |
+| `gc/state`, `gc/hb` | GC state / leader heartbeat | `CasGcStateFormat` | GC |
+| `gc/gen/<g>/attempt/<a>/outcomes/…​.zst` | outcome log | `CasGcOutcomesFormat` (`.zst`) | GC |
+| `gc/gen/<g>/attempt/<a>/fold_seal` | fold seal (deterministic) | `CasFoldSealFormat` | GC |
+| `gc/gen/<g>/…​/runs` | GC record-stream runs | `CasRecordStreamFormat`* | GC |
+| `gc/server-roots/<srid>/{owner,epoch,mount}` | server-root singletons | `CasServerRootFormats` | mount |
 | `roots/…` | raw passthrough (verbatim) | — (never interpreted) | upper layers |
 
-`*` = still the legacy binary codec; the row flips as each phase of the migration lands
-(phases 2–8 in the design spec).
+`*` = still the legacy binary codec; the row flips as each phase of the migration lands. **Phase 2
+(control plane) is DONE**: `cas_pool_meta`, `cas_gc_state` + `cas_gc_hb`, `cas_gc_outcomes`,
+`cas_fold_seal`, and `cas_owner`/`cas_epoch`/`cas_mount_lease` are text, and the protobuf codecs +
+the CA protobuf build target are removed. Remaining `*` rows = phases 3–8 (refsnaplog, runs,
+part manifest, blob envelope, blob meta).
 
 ## Codec table
 
