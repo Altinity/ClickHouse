@@ -1,5 +1,5 @@
 ---
-description: 'Design for the CAS fetch-handoff retention pin: a sender-created, receiver-build-owned, epoch-floor pin that seals the commit-before-release gap in same-pool fetch-by-relink (#42/#43) by keeping a fetched part''s blobs alive across the sender-release → receiver-commit handoff, reusing the GC retention-overlay primitive shared with the read-only replica design. Generalizes to bulk write-replica warm-up.'
+description: 'Design for the CAS fetch-handoff retention pin: a sender-created, receiver-build-owned pin cleaned by the server''s `min_active` heartbeat build-watermark floor, sealing the commit-before-release gap in same-pool fetch-by-relink (#42/#43) by keeping a fetched part''s blobs alive across the sender-release → receiver-commit handoff, reusing the GC retention-overlay primitive shared with the read-only replica design. Generalizes to bulk write-replica warm-up.'
 sidebar_label: 'CAS Fetch-Handoff Retention Pin'
 sidebar_position: 20260715
 slug: /superpowers/specs/cas-fetch-handoff-retention-pin-design
@@ -55,7 +55,7 @@ other axis:
 | Owner | a reader **mount** (a node serving SELECTs) | a **build** of the receiving writer-replica |
 | Payload | snapshot-window `{ns, S_min, L_max}` | a manifest **closure** (blob set); many closures / a window for warm-up |
 | Lifetime | long — `max_execution_time`; heartbeated | short — one fetch; no heartbeat |
-| Self-clean | reader-lease heartbeat | **epoch-floor** (build liveness) |
+| Self-clean | reader-lease heartbeat (TTL) | **`min_active`** heartbeat build-watermark floor |
 | Publisher | the reader itself | the **sender**, on behalf of the receiver's build |
 | Extra deps | reader-mount mode + readonly-refresh | **none** beyond the primitive |
 
@@ -84,8 +84,9 @@ this spec is self-contained):
   the cheap warm-up shape). The primitive is agnostic to which; ownership and liveness are the axes that
   distinguish consumers, not the payload shape.
 
-This spec adds a second **owner kind** to that primitive: a **build-owned** pin cleaned by epoch-floor
-(§[Liveness](#liveness)), alongside the reader's mount-owned, heartbeat-cleaned pin.
+This spec adds a second **owner kind** to that primitive: a **build-owned** pin cleaned by the server's
+`min_active` heartbeat build-watermark floor (§[Liveness](#liveness)), alongside the reader's mount-owned,
+lease-TTL-cleaned pin.
 
 ## Fetch-handoff protocol — single part (v1) {#protocol}
 
@@ -124,28 +125,41 @@ so this is two additional small metadata ops on an already-metadata operation.
 
 - Pin PUT **fails** at the sender → abort the relink for this part and fall back to byte-stream fetch
   (fail-loud, existing path). Never proceed relink without the pin.
-- Sender **crashes** after the PUT → the pin is epoch-floor-collected later (§[Liveness](#liveness)); the
-  fetch fails and the receiver retries. Extra retention until collection, never a loss.
-- Receiver **crashes** after receiving the reply, before the DELETE → epoch-floor-collected.
+- Sender **crashes** after the PUT → the pin is reaped later by the `min_active` heartbeat floor
+  (§[Liveness](#liveness)); the fetch fails and the receiver retries. Extra retention until collection,
+  never a loss.
+- Receiver **crashes** after receiving the reply, before the DELETE → reaped by the `min_active` floor
+  (its build falls below the floor, or its `srid` is fenced/expired).
 - Pin PUT **stalls** → the sender is still holding the part during the stall, so blobs stay protected;
   the fetch is merely slow.
 
-## Liveness / self-cleaning — epoch-floor {#liveness}
+## Liveness / self-cleaning — the heartbeat build-watermark floor (`min_active`) {#liveness}
 
-The pin is owned by the receiver's `{server_root_id, build_id}`. GC honors it **iff** the `srid`'s
-mount-lease is alive **and** `build_id ≥` the `srid`'s current durable **epoch floor**; otherwise it is
-collectible. When the receiver crashes and remounts it bumps its durable-monotone epoch, so the stale
-build's `build_id` falls **under the floor** and its pin becomes collectible — cleanup rides the
-`writer_epoch` identity CAS already maintains. This is **observation-based**: no wall-clock TTL, no clock
-skew dependency (consistent with the rev.6 liveness model — a wall-clock TTL was considered and
-rejected).
+Cleanup rides an **existing published watermark**, so GC reaps stale pins with ~zero new machinery. Each
+server already stamps a **build-watermark floor, `min_active`, onto its mount-lease heartbeat**
+(`gc/server-roots/<srid>/mount` — merged into the same `SingleWriterSlot` renewal PUT that stamps the
+lease clock; `CasServerRoot.h` `MountLeaseKeeper`, `min_active_fn_`; `min_active == UINT64_MAX` is the
+graceful-farewell sentinel). GC's per-round heartbeat gate `computeHeartbeatFloor` **already** LISTs
+`gc/server-roots/` and GETs every mount body for liveness classification, so it **already holds each
+server's `min_active`** — no new published state, no extra read.
 
-**Known limitation (bounded, safe).** A pin **leaked within a still-live mount** (a fetch aborts but the
-node stays up and does not bump its epoch) is retained until the next epoch bump. This is extra retention
-only — it never loses data (fail-close direction). If leak latency ever bites, the upgrade is a
-**republished in-flight set**: the receiver heartbeats its live fetch `build_id`s (as read-replica §4
-readers already self-heal by re-publishing), and GC collects fetch-pins absent from the set. Not built in
-v1; epoch-floor is the v1 predicate (user decision, 2026-07-15).
+In that same pass, GC **reaps (deletes)** a fetch-pin `gc/fetch-pins/<srid>/<build_id>` when either:
+
+- `build_id < srid.min_active` — the build that took the pin is no longer active on its server (committed
+  or aborted); or
+- the `srid` is terminated / fenced / lease-expired — the whole server is gone (the coarse backstop).
+
+This is **observation-based** — the floor is a build sequence, not a clock (no wall-clock TTL, no skew
+dependency; consistent with the rev.6 liveness model) — and **prompt even within a still-live mount**:
+`min_active` advances as the server's builds complete, with **no** dependence on a remount / epoch bump.
+There is therefore no "leaked pin lingers until remount" limitation. The receiver's happy-path DELETE
+after its ref commit becomes a mere latency optimization; GC's heartbeat-floor pass is the authoritative
+reaper.
+
+**Integration point (verify in the plan).** The receiver's `min_active` must **cover its in-flight
+fetch/relink build for the whole fetch**, so the floor keeps `build_id ≥ min_active` (pin honored) until
+that build commits or aborts. If a fetch/relink build is not already reflected in the Store's
+`min_active_fn_`, wire it in — this is the single integration point to confirm during implementation.
 
 ## Bulk write-replica warm-up (future extension) {#warmup}
 
@@ -156,7 +170,7 @@ one part per request. It is the same build-owned pin, generalized:
   batch is "the whole snapshot" — the source's **snapshot-window** directly. This is why the primitive
   admits a window payload for build-owned pins, not only single-closure. On the payload axis the warm-up
   pin converges toward the reader shape; it stays distinct on ownership (build, not mount) and liveness
-  (epoch-floor, not heartbeat).
+  (the writer's `min_active` build-watermark floor, not a reader-lease TTL).
 - **Lifetime:** created by the source while it can enumerate its current snapshot's parts, released once
   the receiver has relinked the batch. Still short-lived relative to a reader query.
 
@@ -203,7 +217,8 @@ build a bespoke relink handshake in the meantime — the transport-level seals a
 
 - Reader-mount / snapshot-isolated SELECT serving — that is the read-replica spec.
 - The bulk warm-up implementation — §[Warm-up](#warmup) is a future extension; v1 is single-part.
-- Wall-clock TTL pins — rejected in favor of epoch-floor (observation-based).
+- Wall-clock TTL pins — rejected in favor of the `min_active` heartbeat build-watermark floor
+  (observation-based; the floor is a build sequence, not a clock).
 - Any change to byte-streaming fetch (cross-pool / non-relink) — it stays fire-and-forget; the receiver
   copies bytes and holds no dependency on the source's post-send part lifetime.
 
@@ -212,7 +227,7 @@ build a bespoke relink handshake in the meantime — the transport-level seals a
 The core retention invariant — *a blob in any live pin's edge-set is never reclaimed* — is covered by the
 read-replica's `CaReadPinCore` gate over the shared primitive. The fetch-handoff adds two properties
 worth a small model extension before implementation: (a) **commit-before-release ordering** — the sender
-pins before releasing, so `in-degree ≥ 1` holds continuously across the handoff; (b) **epoch-floor
-liveness** — a pin is collectible exactly when its owning build is provably superseded or its `srid`
-lease is dead, and never while the build is live. Model the sender-release / receiver-commit / GC-fold
-interleavings against a stalled receiver commit.
+pins before releasing, so `in-degree ≥ 1` holds continuously across the handoff; (b) **`min_active`-floor
+liveness** — a pin is reapable exactly when its owning build has dropped below its server's published
+`min_active` (or the `srid` is fenced/expired), and never while the build is still active. Model the
+sender-release / receiver-commit / GC-fold interleavings against a stalled receiver commit.

@@ -252,14 +252,16 @@ The fetch-by-relink **commit-before-release gap** (`#42`/`#43`) and its future b
 generalization are **orthogonal** to this reader/WORM feature. They share **only** the §5.2
 retention-overlay primitive (a pool-global pin contributing an edge-set to GC's fold, dead-owner pins
 dropped) and differ on every other axis — owner (a receiver **build** vs a reader **mount**), payload
-(a manifest **closure** vs a snapshot-window), liveness (**epoch-floor** vs heartbeat-lease), and
-publisher (the **sender** on the receiver's behalf vs the reader itself). They are therefore specified
-separately and are **independently shippable**: the fetch fix needs only the §5.2 primitive, not the
-reader-mount mode, the snapshot-window pin, the heartbeat-lease, or the readonly-refresh reuse.
+(a manifest **closure** vs a snapshot-window), liveness (the writer's **`min_active`** build-watermark
+floor vs the reader's lease TTL), and publisher (the **sender** on the receiver's behalf vs the reader
+itself). They are therefore specified separately and are **independently shippable**: the fetch fix needs
+only the §5.2 primitive, not the reader-mount mode, the snapshot-window pin, the reader-lease, or the
+readonly-refresh reuse.
 
 See [`2026-07-15-cas-fetch-handoff-retention-pin-design.md`](2026-07-15-cas-fetch-handoff-retention-pin-design.md)
-— it owns the fetch protocol, the sender-created / receiver-build-owned / epoch-floor pin, the bulk
-write-replica warm-up extension, the interim option-C status, and the detached cluster (B66a/B66b).
+— it owns the fetch protocol, the sender-created / receiver-build-owned pin cleaned by the `min_active`
+heartbeat floor, the bulk write-replica warm-up extension, the interim option-C status, and the detached
+cluster (B66a/B66b).
 
 ## 9. Contract A — the verbatim table-level plane {#contract-a}
 
