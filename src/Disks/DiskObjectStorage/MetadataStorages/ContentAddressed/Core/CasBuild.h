@@ -135,7 +135,15 @@ public:
     /// hazard the design calls out — "promote a precommit whose copy did not complete" — has no code
     /// path to occur through: promotion is not a recoverable/resumable operation, only a synchronous
     /// one that either completes within the writing process or never happens at all.
-    void promote(const RootNamespace & target_ns, const String & final_ref_name, UInt128 build_id, const ManifestId & id);
+    /// `allow_repoint` (all-tree-part-files Task 2, spec §4, TLA+ `WRepoint`): opts into an INTENDED
+    /// repoint of a committed ref that already names a DIFFERENT manifest -- a standalone write/remove
+    /// on an already-committed part (the committed-publish machinery's missing piece; the promote guard's
+    /// own error text already named it: "use republishRef for an intended repoint"). Default `false`
+    /// preserves the existing unique-ref guard byte-for-byte: a committed ref naming a different manifest
+    /// still throws ABORTED. With `true`, the guard is skipped and the old committed binding is retired
+    /// in the SAME ref-log record as the ordinary precommit->committed promotion, plus a
+    /// `CasEventType::RefRepoint` audit event -- every effective repoint is loud by construction.
+    void promote(const RootNamespace & target_ns, const String & final_ref_name, UInt128 build_id, const ManifestId & id, bool allow_repoint = false);
 
     /// Carry the mutable per-ref payload (txn_version.txt, ...) that promote writes into the ref's mutable files.
     void setPendingMutableFiles(std::map<String, String> files) { pending_mutable_files = std::move(files); }

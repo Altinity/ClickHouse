@@ -1471,6 +1471,64 @@ TEST(CasBuild, PromoteSucceedsWhenPrecommitIsLiveOwner)
     EXPECT_EQ(s->resolveRef(ns, "part_1")->manifest_id, id);
 }
 
+/// all-tree-part-files Task 2 (spec 2026-07-14-cas-all-tree-part-files-design.md §4, TLA+ `WRepoint`):
+/// `promote`'s existing unique-ref guard (BUG 1a) refuses to overwrite a committed ref naming a
+/// DIFFERENT manifest -- correct for an ACCIDENTAL double-publish, but there is no way to perform an
+/// INTENDED repoint (a standalone write/remove on an already-committed part) without it. `allow_repoint`
+/// opts into exactly that: the guard's throw is skipped, and the committed-transition RefOp (old =
+/// the currently-committed manifest, new = the incoming one) is appended in the SAME ref-log record as
+/// the ordinary precommit->committed promotion -- the C++ realization of `WRepoint`'s one-event
+/// old-binding/new-binding shape (Phase 0, task-1 gate). Without the flag, behavior is BYTE-IDENTICAL
+/// to today (BUG 1a still fires).
+TEST(CasBuildRepoint, PromoteRepointsCommittedRef)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = openStore(b);
+    const RootNamespace ns{"srv1/tbl"};
+
+    /// Publish ref "part_1" -> M1 through the normal build path.
+    auto build1 = startBuildFor(s, ns, "part_1");
+    build1->putBlob(idOf("m1"), BlobSource::fromString("m1"));
+    const ManifestId m1_id = build1->stageManifest({blobManifestEntry("data.bin", "m1")});
+    build1->precommitAdd(ns, "part_1", m1_id);
+    build1->promote(ns, "part_1", build1->buildId(), m1_id);
+    ASSERT_TRUE(s->resolveRef(ns, "part_1").has_value());
+    EXPECT_EQ(s->resolveRef(ns, "part_1")->manifest_id, m1_id);
+
+    /// A second build stages M2 (one extra entry) onto the SAME ref.
+    auto build2 = startBuildFor(s, ns, "part_1");
+    build2->putBlob(idOf("m2"), BlobSource::fromString("m2"));
+    build2->putBlob(idOf("m2x"), BlobSource::fromString("m2x"));
+    const ManifestId m2_id = build2->stageManifest({blobManifestEntry("data.bin", "m2"), blobManifestEntry("extra.bin", "m2x")});
+    build2->precommitAdd(ns, "part_1", m2_id);
+
+    /// allow_repoint = false (the default) -> ABORTED, existing invariant untouched; M1 still resolves.
+    expectThrowsCode(DB::ErrorCodes::ABORTED,
+        [&] { build2->promote(ns, "part_1", build2->buildId(), m2_id); });
+    EXPECT_EQ(s->resolveRef(ns, "part_1")->manifest_id, m1_id);
+
+    /// The failed no-flag attempt threw BEFORE appendRefOps returned, so build2's precommit is still the
+    /// live owner (no removal was appended) -- the SAME build/manifest can be retried with the flag.
+    std::vector<CasEvent> events;
+    s->setEventSink([&](const CasEvent & e) { events.push_back(e); });
+    EXPECT_NO_THROW(build2->promote(ns, "part_1", build2->buildId(), m2_id, /*allow_repoint=*/true));
+    auto resolved = s->resolveRef(ns, "part_1");
+    ASSERT_TRUE(resolved);
+    EXPECT_EQ(resolved->manifest_id.ref, m2_id.ref);
+
+    /// Every effective repoint is loud (spec §4): exactly one RefRepoint event, naming the ref and the
+    /// old manifest it replaced.
+    size_t repoint_events = 0;
+    for (const CasEvent & e : events)
+        if (e.type == CasEventType::RefRepoint)
+        {
+            ++repoint_events;
+            EXPECT_EQ(e.ref_name, "part_1");
+            EXPECT_EQ(e.detail.at("old_manifest"), manifestRefDebugString(m1_id.ref));
+        }
+    EXPECT_EQ(repoint_events, 1u);
+}
+
 /// BUG 2 (WAbandonPrecommit; delete-after-sealed-decrements): once `precommitAdd` has made a manifest a
 /// LIVE precommit owner input, `abandon` must NOT writer-delete its body. The TLA+ `WAbandonPrecommit`
 /// appends a REMOVAL event (`old = precommit(build_id, final_ref, T)`, `new = none`) and NEVER deletes

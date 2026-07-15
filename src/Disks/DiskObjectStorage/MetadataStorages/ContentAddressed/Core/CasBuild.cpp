@@ -894,7 +894,7 @@ void Build::precommitAdd(const RootNamespace & target_ns, const String & final_r
     });
 }
 
-void Build::promote(const RootNamespace & target_ns, const String & final_ref_name, UInt128 promote_build_id, const ManifestId & id)
+void Build::promote(const RootNamespace & target_ns, const String & final_ref_name, UInt128 promote_build_id, const ManifestId & id, bool allow_repoint)
 {
     requireAlive();
 
@@ -922,6 +922,11 @@ void Build::promote(const RootNamespace & target_ns, const String & final_ref_na
     /// blocking the per-namespace batching queue; it is idempotent under a re-run (a retry sees its own
     /// fresh token). Accepted — Phase B replaces the heavy body-dance with a meta CAS anyway.
 
+    /// all-tree-part-files Task 2 (spec §4, TLA+ `WRepoint`): the manifest the ref currently commits,
+    /// when this promote is retiring it via an intended repoint (`allow_repoint`) rather than the
+    /// ordinary first-time-commit path. Set inside the closure below; read after it returns to decide
+    /// whether the `RefRepoint` audit event fires.
+    std::optional<ManifestRef> repoint_old;
     store->appendRefOps(target_ns, MutationScope::ref(final_ref_name),
         [&](const RefTableState & state) -> std::vector<RefOp>
         {
@@ -1000,17 +1005,24 @@ void Build::promote(const RootNamespace & target_ns, const String & final_ref_na
             }
 
             /// BUG 1a: refuse to overwrite a live committed ref that already names a DIFFERENT manifest —
-            /// that would orphan the old manifest (its owner-removal `-1` is never emitted). This enforces
-            /// the model's `RefFreeFor` guard (WPromote requires it). A re-promote of the SAME manifest_ref
-            /// is idempotent and allowed (the state machine's own promote precondition below would reject
-            /// it as "precommit absent" anyway once idempotent republish skips this call — see
-            /// `republishRef`). Fail-closed with ABORTED (not LOGICAL_ERROR): a conflicting durable state
-            /// the caller handles, never a must-not-happen invariant.
+            /// that would orphan the old manifest (its owner-removal `-1` is never emitted) UNLESS the
+            /// caller opted into an intended repoint (`allow_repoint`, all-tree-part-files Task 2, TLA+
+            /// `WRepoint`) -- a standalone write/remove on an already-committed part. Without the flag
+            /// this enforces the model's `RefFreeFor` guard (`WPromote` requires it) exactly as before. A
+            /// re-promote of the SAME manifest_ref is idempotent and allowed regardless (the state
+            /// machine's own promote precondition below would reject it as "precommit absent" anyway once
+            /// idempotent republish skips this call — see `republishRef`). Fail-closed with ABORTED (not
+            /// LOGICAL_ERROR): a conflicting durable state the caller handles, never a must-not-happen
+            /// invariant.
             if (const auto it = state.committed.find(final_ref_name);
                 it != state.committed.end() && !(it->second.manifest_ref == id.ref))
-                throw Exception(ErrorCodes::ABORTED,
-                    "promote: ref '{}' already names a different committed manifest — refusing to overwrite "
-                    "(unique-ref invariant; use republishRef for an intended repoint)", final_ref_name);
+            {
+                if (!allow_repoint)
+                    throw Exception(ErrorCodes::ABORTED,
+                        "promote: ref '{}' already names a different committed manifest — refusing to overwrite "
+                        "(unique-ref invariant; use republishRef for an intended repoint)", final_ref_name);
+                repoint_old = it->second.manifest_ref;
+            }
 
             /// Promotion is a PURE OWNER MOVE (spec §Promote): the SAME manifest_ref T moves from
             /// precommit to committed in one atomic transaction, together with the SetPayload op that
@@ -1019,6 +1031,21 @@ void Build::promote(const RootNamespace & target_ns, const String & final_ref_na
             /// blob deltas; the activating `+1` came from GC's barrier-activation of the create-precommit
             /// op (Task 12).
             std::vector<RefOp> ops;
+            /// all-tree-part-files Task 2: an intended repoint additionally retires the OLD committed
+            /// binding in this SAME ref-log record -- a separate OwnerTransition (old=Committed(repoint_old),
+            /// new=absent), since one RefOwnerBinding cannot carry both the retired-committed and the
+            /// promoted-precommit manifests at once (CasRefLogCodec.h). Together with the transition op
+            /// below, this record's net effect is the TLA+ `WRepoint` one-event shape: ref moves directly
+            /// from the old manifest to the new one. Mirrors `publishCommittedTransition`'s old-removal
+            /// shape (cas_test_helpers.h) minus the add-precommit step, which already landed earlier as
+            /// this build's own `precommitAdd`.
+            if (repoint_old)
+            {
+                RefOp old_removal;
+                old_removal.kind = RefOpKind::OwnerTransition;
+                old_removal.old_binding = RefOwnerBinding{RefOwnerKind::Committed, final_ref_name, *repoint_old};
+                ops.push_back(old_removal);
+            }
             RefOp transition;
             transition.kind = RefOpKind::OwnerTransition;
             transition.old_binding = RefOwnerBinding{RefOwnerKind::Precommit, final_ref_name, id.ref};
@@ -1049,6 +1076,27 @@ void Build::promote(const RootNamespace & target_ns, const String & final_ref_na
         e.reason = "promote: atomic owner move precommit(build_id) -> ref(final_ref_name) after fail-closed reval";
         e.detail = {{"build_seq", std::to_string(build_seq)}};
     });
+
+    /// all-tree-part-files Task 2 (spec §4): the low-level audit event for an intended repoint. The
+    /// ProfileEvent counter + LOG_WARNING are owned by `CachedPartFolderAccess::repointRef` (Task 3),
+    /// the user-facing primitive that calls into this promote -- adding them here too would double-fire
+    /// once Task 3 lands. This event alone is per-call-site accurate regardless of which caller opted
+    /// into `allow_repoint`.
+    if (repoint_old)
+    {
+        EventEmitter{*store}.emit([&](CasEvent & e)
+        {
+            e.type = CasEventType::RefRepoint;
+            e.namespace_ = target_ns.string();
+            e.ref_name = final_ref_name;
+            e.object_kind = CasEventObjectKind::Manifest;
+            e.object_hash = manifestRefDebugString(id.ref);
+            e.outcome = "repointed";
+            e.reason = "promote(allow_repoint=true): committed ref retargeted from an old manifest to a "
+                       "new one in one ref-log record -- standalone write/remove on a committed part";
+            e.detail = {{"old_manifest", manifestRefDebugString(*repoint_old)}};
+        });
+    }
 }
 
 void Build::abandon()
