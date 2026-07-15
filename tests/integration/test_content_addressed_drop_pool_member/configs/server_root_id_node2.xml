@@ -2,7 +2,7 @@
     <!-- Phase 0 (mount safety): each server owning a DISTINCT layout subtree inside the shared pool.
          Two servers must never write the same server_root_id tree (spec §mount-safety), so this is a
          per-instance override merged onto the shared storage_conf.xml disk definitions. The read-only
-         fsck window shares node2's own srid -- it never claims a mount, so no conflict. -->
+         fsck window shares node2's own srid: it never claims a mount, so no conflict. -->
     <storage_configuration>
         <disks>
             <disk_content_addressed_dpm>

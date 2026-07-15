@@ -2,7 +2,7 @@
     <storage_configuration>
         <disks>
             <!-- Both nodes load this SAME base config, so they mount the SAME pool (the bucket is the
-                 single source of truth; no Keeper) -- exactly the shared-pool model test's topology.
+                 single source of truth; no Keeper): exactly the shared-pool model test's topology.
                  RustFS (not MinIO) enforces the conditional-PUT (If-None-Match) semantics the
                  snapshot+log writer linearization relies on. -->
             <disk_content_addressed_dpm>
