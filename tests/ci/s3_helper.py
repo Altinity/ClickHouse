@@ -143,7 +143,7 @@ class S3Helper:
                 logging.info("Processing file without compression")
             logging.info("File is too large, do not provide content type")
 
-        self.client.upload_file(file_path, bucket_name, s3_path, ExtraArgs=metadata)
+        self.client.upload_file(str(file_path), bucket_name, s3_path, ExtraArgs=metadata)
         url = self.s3_url(bucket_name, s3_path)
         logging.info("Upload %s to %s Meta: %s", file_path, url, metadata)
         return url
@@ -227,7 +227,7 @@ class S3Helper:
                 for i in range(5):
                     try:
                         self.client.upload_file(
-                            file_path, bucket_name, s3_path, ExtraArgs=metadata
+                            str(file_path), bucket_name, s3_path, ExtraArgs=metadata
                         )
                         break
                     except Exception as ex:
