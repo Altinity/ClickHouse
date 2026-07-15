@@ -230,6 +230,10 @@ after their decisions are already durable — but the estimate is not a proof).
 - `writeFileUsingBlobWritingFunction` and `copyFile` behavior on CA under the funnel (today's
   behavior preserved; route through the hook or keep rejecting — audit at draft time).
 - The destructive-op audit inventory (phase 1).
+- Seal breadth: the default is broad (ANY mutating operation after `precommit` throws); the
+  settled minimum is staging mutations. The phase-1 plan must verify no legitimate verbatim
+  write occurs between `precommit` and `commit` in one transaction; if one exists, narrow the
+  seal to the staging domain for that class rather than weakening the throw.
 - `removePartsInRangeFromWorkingSet` path verification (phase 3).
 - Whether any lock-held plain-commit call site needs an explicit `precommit` (driven by the
   `CasImplicitPrecommitInCommit` soak numbers).
