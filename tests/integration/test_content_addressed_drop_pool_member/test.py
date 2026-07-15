@@ -156,8 +156,13 @@ def test_drop_dead_pool_member_heals_the_pool():
     # (9) Drive GC (node1's background GC is already running against the shared pool) to reclaim
     #     node2's now-unreferenced content, then poll for the blob count to drain back to baseline --
     #     the authoritative "no content leftovers" proof, mirroring the ref-snaplog integration test's
-    #     idiom. Then a read-only fsck over the drained pool must report clean (no dangling, no
+    #     idiom. node1's own t1 is still alive at this point and its blobs legitimately stay in the
+    #     pool, so a drain-to-baseline check is only meaningful after t1 is dropped too -- its survival
+    #     was already proven byte-for-byte in step 7, so drop it now and demand the pool drain to
+    #     EMPTY: node2's content via the decommission, t1's via the ordinary drop, no leftovers from
+    #     either. Then a read-only fsck over the drained pool must report clean (no dangling, no
     #     unaccounted objects).
+    node1.query("DROP TABLE t1 SYNC")
     final = _count(BLOBS_PREFIX)
     for _ in range(RECLAIM_RETRIES):
         final = _count(BLOBS_PREFIX)
