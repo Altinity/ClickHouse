@@ -966,11 +966,13 @@ TEST(CasStore, DropRefAppendsJournalAtomically)
 /// Task 10 renamed this from "...WithoutJournal": updateRefPayload now DOES append an immutable
 /// `set_payload` ref-log transaction (spec §Update Payload) -- the old journal-free in-place field
 /// mutation had no equivalent once persistence is an append-only log; every change, even payload-only,
-/// must be a logged operation to be part of the ordered history. The surviving contract is the
-/// user-visible one: mutable_files updates are observable through resolveRef. The manifest edge cannot
-/// change on this path -- the `RefMutableFilesUpdate` carrier deliberately has no `manifest_ref` field,
-/// so a reachability change is structurally impossible here (it goes through publish/drop instead).
-TEST(CasStore, UpdateRefPayloadUpdatesMutableFiles)
+/// must be a logged operation to be part of the ordered history. All-tree-part-files Task 9: the
+/// carrier's mutable-file map is gone -- `published_at_ms` is the only field left to mutate. The
+/// surviving contract is the user-visible one: a `published_at_ms` update is observable through
+/// resolveRef and the manifest edge cannot change on this path -- the `RefPayloadUpdate` carrier
+/// deliberately has no `manifest_ref` field, so a reachability change is structurally impossible here
+/// (it goes through publish/drop/repoint instead).
+TEST(CasStore, UpdateRefPayloadUpdatesPublishedAtMs)
 {
     auto b = std::make_shared<InMemoryBackend>();
     auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
@@ -979,13 +981,12 @@ TEST(CasStore, UpdateRefPayloadUpdatesMutableFiles)
     const ManifestId id = publishPart(s, ns.string(), "part_1", "payload-1");
     const ManifestRef manifest_ref = id.ref;
 
-    /// Seed a mutable file first (publish leaves mutable_files empty).
-    s->updateRefPayload(ns, "part_1", [](RefMutableFilesUpdate & r) { r.mutable_files["txn_version.txt"] = "1"; });
-    s->updateRefPayload(ns, "part_1", [](RefMutableFilesUpdate & r) { r.mutable_files["txn_version.txt"] = "7"; });
+    s->updateRefPayload(ns, "part_1", [](RefPayloadUpdate & r) { r.published_at_ms = 1; });
+    s->updateRefPayload(ns, "part_1", [](RefPayloadUpdate & r) { r.published_at_ms = 7; });
 
     auto after = s->resolveRef(ns, "part_1");
     ASSERT_TRUE(after.has_value());
-    EXPECT_EQ(after->mutable_files.at("txn_version.txt"), "7");
+    EXPECT_EQ(after->published_at_ms, 7u);
     EXPECT_EQ(after->manifest_id.ref, manifest_ref);
 }
 

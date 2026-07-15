@@ -99,10 +99,10 @@ private:
     bool temp_ownership_transferred = false;   /// B188: set after on_finalized; the dtor skips removeTempFile
 };
 
-/// Write buffer for bytes that live INSIDE pool metadata (a mutable per-part file staged into
-/// RefPayload.mutable_files, or a verbatim namespace file PUT on finalize). Accumulates in memory
-/// (the bytes are tiny) and hands them to the callback at finalize; the callback decides where
-/// they go and whether they are durable immediately (verbatim) or at commit (mutable staging).
+/// Write buffer for bytes that live INSIDE pool metadata (a small inline part file staged into the
+/// manifest tree, or a verbatim namespace file PUT on finalize). Accumulates in memory (the bytes are
+/// tiny) and hands them to the callback at finalize; the callback decides where they go and whether
+/// they are durable immediately (verbatim) or at commit (staged into the part's manifest entries).
 class CaInlineWriteBuffer : public WriteBufferFromFileBase
 {
 public:

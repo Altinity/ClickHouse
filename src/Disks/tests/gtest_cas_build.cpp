@@ -1061,13 +1061,11 @@ TEST(CasBuild, PublishHappyPathRoundTrip)
 
     const ManifestId id = build->stageManifest({blobManifestEntry("data.bin", "hello world")});
     build->precommitAdd(ns, "part_1", id);
-    build->setPendingMutableFiles({{"txn_version.txt", "1"}});
     build->promote(ns, "part_1", build->buildId(), id);
 
     auto r = s->resolveRef(ns, "part_1");
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(r->manifest_id, id);
-    EXPECT_EQ(r->mutable_files.at("txn_version.txt"), "1");
 
     /// Read the manifest back and locate its single blob leaf.
     const PartManifest manifest = s->readManifest(id);

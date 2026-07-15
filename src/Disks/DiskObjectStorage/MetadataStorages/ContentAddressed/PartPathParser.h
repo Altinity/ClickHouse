@@ -1,5 +1,4 @@
 #pragma once
-#include <array>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -49,32 +48,6 @@ std::string mirroredArchiveNamespace(const std::string & table_uuid);
 /// indistinguishable from a part file in the Atomic layout, so the name is reserved — never a part
 /// dir; its contents are table-level verbatim files. ClickHouse part names never take this form.
 inline constexpr std::string_view kDeduplicationLogsDirName = "deduplication_logs";
-
-/// The canonical set of MUTABLE per-part files: bytes differ between two parts that are otherwise
-/// byte-identical in column data, so they MUST NOT contribute to part identity and MUST NOT be
-/// shared through the content-addressed tree. The wiring stores exactly this set in the ref's
-/// RefPayload.mutable_files (D-W3); the tree builder excludes exactly this set (B23: one constant
-/// makes "excluded from identity" and "stored per-ref" the same concept by construction).
-inline constexpr std::array<std::string_view, 3> kMutablePerPartFiles{
-    "uuid.txt", "txn_version.txt", "metadata_version.txt"};
-
-/// True iff file is a mutable per-part file (see kMutablePerPartFiles). Matches the LAST path
-/// component (a detached part's files carry a <detached_part>/ prefix inside the shared detached
-/// ref, B36/B46/B62) and treats the atomic-write sibling tmp (txn_version.txt.tmp,
-/// VersionMetadataOnDisk) as mutable too — otherwise a standalone autocommit write of the tmp on a
-/// committed part would republish the part with a one-file tree (data loss).
-constexpr bool isMutablePerPartFile(std::string_view file)
-{
-    const auto slash = file.rfind('/');
-    const std::string_view basename = (slash == std::string_view::npos) ? file : file.substr(slash + 1);
-    std::string_view stem = basename;
-    if (stem.ends_with(".tmp"))
-        stem = stem.substr(0, stem.size() - 4);
-    for (const auto & name : kMutablePerPartFiles)
-        if (basename == name || stem == name)
-            return true;
-    return false;
-}
 
 struct PartFilePath
 {

@@ -1,6 +1,5 @@
 #pragma once
 #include <base/types.h>
-#include <map>
 #include <optional>
 
 namespace DB
@@ -40,16 +39,16 @@ public:
     /// Receiver side: decode the transferred manifest body, run a normal LOCAL build over the
     /// shared-pool blobs (adopt-by-hash; NO blob body read from the sender), stage a FRESH
     /// receiver-local manifest in the RECEIVER namespace (derived from table_uuid; the sender's
-    /// root_namespace_id is ignored), precommitAdd + promote it (fail-closed blob revalidation),
-    /// carrying the transferred mutable per-part files. Returns true iff a local manifest was
-    /// committed and the ref is live. Returns false — publishing NOTHING — on ANY retryable failure
-    /// (decode/validation/stage/precommit/promote, including a condemned/absent blob: ABORTED); the
-    /// caller falls back to a byte fetch.
+    /// root_namespace_id is ignored), precommitAdd + promote it (fail-closed blob revalidation) --
+    /// the manifest is self-contained (all-tree-part-files Task 7: every per-part file, formerly-
+    /// mutable ones included, rides in `entries`; there is no separate sidecar to transfer). Returns
+    /// true iff a local manifest was committed and the ref is live. Returns false — publishing
+    /// NOTHING — on ANY retryable failure (decode/validation/stage/precommit/promote, including a
+    /// condemned/absent blob: ABORTED); the caller falls back to a byte fetch.
     virtual bool adoptPartFromManifest(
         const String & table_uuid,
         const String & part_name,
-        const String & manifest_bytes,
-        const std::map<String, String> & mutable_files) = 0;
+        const String & manifest_bytes) = 0;
 };
 
 }

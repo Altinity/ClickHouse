@@ -2534,12 +2534,12 @@ TEST(RefWriterAppendLane, SameRefMutationsSplitAcrossFlushes)
     });
 
     const uint64_t put_before = backend->putTotal();
-    std::thread t_a([&] { store->updateRefPayload(ns, "a", [](RefMutableFilesUpdate & r) { r.mutable_files["k"] = "1"; }); });
+    std::thread t_a([&] { store->updateRefPayload(ns, "a", [](RefPayloadUpdate & r) { r.published_at_ms = 1; }); });
     {
         std::unique_lock lk(m);
         cv.wait(lk, [&] { return entered; });
     }
-    std::thread t_b([&] { store->updateRefPayload(ns, "a", [](RefMutableFilesUpdate & r) { r.mutable_files["k"] = "2"; }); });
+    std::thread t_b([&] { store->updateRefPayload(ns, "a", [](RefPayloadUpdate & r) { r.published_at_ms = 2; }); });
     while (store->refQueuePendingForTest(ns) < 2)
         std::this_thread::yield();
     cv.notify_all();
@@ -2551,9 +2551,7 @@ TEST(RefWriterAppendLane, SameRefMutationsSplitAcrossFlushes)
     /// Neither mutation was lost or corrupted -- the ref still resolves with one of the two writes.
     const auto resolved = store->resolveRef(ns, "a");
     ASSERT_TRUE(resolved.has_value());
-    const auto it = resolved->mutable_files.find("k");
-    ASSERT_NE(it, resolved->mutable_files.end());
-    EXPECT_TRUE(it->second == "1" || it->second == "2");
+    EXPECT_TRUE(resolved->published_at_ms == 1 || resolved->published_at_ms == 2);
 }
 
 /// ===================================================================================

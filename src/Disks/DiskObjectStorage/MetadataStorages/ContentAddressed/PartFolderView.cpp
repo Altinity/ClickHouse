@@ -7,13 +7,12 @@ namespace DB::ContentAddressed
 {
 
 PartFolderView::PartFolderView(PartRefKey key_, Cas::ManifestId manifest_id_, uint64_t manifest_size_,
-                               uint64_t published_at_ms_, std::map<String, String> mutable_files_,
+                               uint64_t published_at_ms_,
                                std::shared_ptr<const Cas::PartManifest> manifest_, uint64_t validated_at_ms_)
     : key(std::move(key_))
     , manifest_id(std::move(manifest_id_))
     , manifest_size(manifest_size_)
     , published_at_ms(published_at_ms_)
-    , mutable_files(std::move(mutable_files_))
     , manifest_body(std::move(manifest_))
     , validated_at_ms(validated_at_ms_)
 {
@@ -34,7 +33,7 @@ std::shared_ptr<const PartFolderView> PartFolderView::make(
 {
     return std::make_shared<const PartFolderView>(
         std::move(key), resolved.manifest_id, resolved.manifest_size,
-        resolved.published_at_ms, resolved.mutable_files, std::move(manifest), validated_at_ms);
+        resolved.published_at_ms, std::move(manifest), validated_at_ms);
 }
 
 std::optional<std::string> PartFolderView::projectionDirPrefix(const std::string & file)
@@ -56,9 +55,7 @@ const Cas::ManifestEntry * PartFolderView::findFile(const String & path) const
 
 bool PartFolderView::hasFile(const String & path) const
 {
-    if (findFile(path))
-        return true;
-    return !isReservedMutableName(path) && mutable_files.contains(path);
+    return findFile(path) != nullptr;
 }
 
 std::optional<uint64_t> PartFolderView::fileSize(const String & path) const
@@ -76,23 +73,13 @@ std::optional<String> PartFolderView::inlineBytes(const String & path) const
     return std::nullopt;
 }
 
-std::optional<String> PartFolderView::mutableBytes(const String & path) const
-{
-    if (isReservedMutableName(path))
-        return std::nullopt;
-    const auto it = mutable_files.find(path);
-    if (it == mutable_files.end())
-        return std::nullopt;
-    return it->second;
-}
-
 std::vector<String> PartFolderView::listChildren(const String & dir_prefix) const
 {
-    /// First-component collapse over entries + non-reserved mutables. This is bit-identical to the
-    /// pre-view code for every real manifest: a part directory always needed first-component collapse,
-    /// and a projection directory is STRUCTURALLY FLAT in MergeTree — a projection part folder holds
-    /// only column/checksum/metadata files, never a nested subdirectory — so for a projection prefix
-    /// the collapse equals the old uncollapsed `substr(prefix)` (no further '/' to collapse). The
+    /// First-component collapse over entries. This is bit-identical to the pre-view code for every
+    /// real manifest: a part directory always needed first-component collapse, and a projection
+    /// directory is STRUCTURALLY FLAT in MergeTree — a projection part folder holds only
+    /// column/checksum/metadata files, never a nested subdirectory — so for a projection prefix the
+    /// collapse equals the old uncollapsed `substr(prefix)` (no further '/' to collapse). The
     /// collapse is therefore an invariant-preserving unification, not a behavior change.
     std::unordered_set<String> names;
     auto add = [&](const String & full)
@@ -106,31 +93,20 @@ std::vector<String> PartFolderView::listChildren(const String & dir_prefix) cons
     const auto [first, last] = Cas::entryRange(manifest_body->entries, dir_prefix);
     for (const auto * e = first; e != last; ++e)
         add(e->path);
-    for (const auto & [file, _] : mutable_files)
-        if (!isReservedMutableName(file))
-            add(file);
     return {std::make_move_iterator(names.begin()), std::make_move_iterator(names.end())};
 }
 
 bool PartFolderView::hasDirectory(const String & dir_prefix) const
 {
     const auto [first, last] = Cas::entryRange(manifest_body->entries, dir_prefix);
-    if (first != last)
-        return true;
-    for (const auto & [file, _] : mutable_files)
-        if (file.starts_with(dir_prefix))
-            return true;
-    return false;
+    return first != last;
 }
 
 size_t PartFolderView::estimatedBytes() const
 {
-    /// Conservative cache weight (spec §Memory Bound): fixed overhead + mutable payload +
-    /// manifest_size (deliberately over-counts the shared decode — safe direction; Phase 5 notes).
-    size_t bytes = 256;
-    for (const auto & [k, v] : mutable_files)
-        bytes += k.size() + v.size() + 64;
-    return bytes + manifest_size;
+    /// Conservative cache weight (spec §Memory Bound): fixed overhead + manifest_size (deliberately
+    /// over-counts the shared decode — safe direction; Phase 5 notes).
+    return 256 + manifest_size;
 }
 
 }

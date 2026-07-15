@@ -314,31 +314,32 @@ std::unique_ptr<WriteBufferFromFileBase> DiskObjectStorageTransaction::writeFile
                 "Content-addressed metadata storage did not produce a ContentAddressedTransaction");
 
         /// Append is serviceable (read-modify-rewrite) only for a non-part / table-level verbatim file.
-        /// A part file is either a content blob (the key is the content hash — append is meaningless) or a
-        /// mutable per-part file (always rewritten whole), so append on a part-file path is unsupported.
+        /// A part file is either a content blob (the key is the content hash — append is meaningless) or
+        /// a small inline entry (always rewritten whole), so append on a part-file path is unsupported.
         if (mode == WriteMode::Append && ContentAddressed::isPartFilePath(path))
             throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Disk does not support WriteMode::Append for content part files");
 
-        /// Autocommit cannot work for CONTENT part files: their manifest + ref are published only
-        /// when `commit` invokes `metadata_transaction->commit`, which the buffer finalize does not
-        /// trigger. Non-part / table-level files (e.g. format_version.txt) are written verbatim to a
-        /// direct object key and are durable on finalize with no commit involvement, so autocommit is
+        /// Autocommit cannot work for a CONTENT BLOB part file (column data/marks, primary.idx): a
+        /// part's blobs are always written together as one build, whose manifest + ref publish only
+        /// when `commit` invokes `metadata_transaction->commit` -- the buffer finalize alone does not
+        /// trigger that. Non-part / table-level files (e.g. format_version.txt) are written verbatim to
+        /// a direct object key and are durable on finalize with no commit involvement, so autocommit is
         /// fine for them.
         ///
-        /// A MUTABLE per-part file (txn_version.txt / metadata_version.txt and their atomic-write
-        /// .tmp siblings) IS autocommittable: it stages inline into recorded_mutable and the
-        /// mutable-only commit branch publishes it to the part's per-ref sidecar WITHOUT touching the
-        /// manifest or ref. The MVCC layer writes txn_version.txt this way through the bare disk (no
-        /// part transaction), so each create/write/replace is its own autocommit one-shot — this is
-        /// the path that makes transactional INSERT's creation-CSN fill-in, removal-TID rewrite, and
-        /// rollback work on a content-addressed disk. The buffer finalize does not trigger commit, so
-        /// wrap the inline buffer in a finalize callback that commits this one-shot transaction (the
-        /// inner buffer's own finalize stages the bytes into recorded_mutable first; the outer
-        /// callback then publishes the sidecar).
+        /// A small INLINE-eligible part file (uuid.txt / metadata_version.txt / txn_version.txt and
+        /// their atomic-write .tmp siblings, checksums.txt, columns.txt, ...) IS autocommittable: it is
+        /// a standalone one-shot write, never part of a multi-file part build, so wrap the inline
+        /// buffer in a finalize callback that commits this one-shot transaction. All-tree-part-files
+        /// Task 4/9: the write lands as an ordinary manifest entry; if the ref is already committed,
+        /// `publishStaging`'s repoint branch carries the rest of the part forward and republishes once
+        /// -- this is the path that makes transactional INSERT's creation-CSN fill-in, removal-TID
+        /// rewrite, and rollback work on a content-addressed disk (formerly the MVCC layer's dedicated
+        /// "mutable per-part file" concept; the predicate that scoped it to three hardcoded names is
+        /// gone, so the boundary is now simply "not a content blob").
         if (autocommit && ContentAddressed::isPartFilePath(path))
         {
             auto p = ContentAddressed::parsePartFilePath(path);
-            if (!p || p->file.empty() || !ContentAddressed::isMutablePerPartFile(p->file))
+            if (!p || p->file.empty() || ContentAddressed::partFileMustStayBlob(p->file))
                 throw Exception(
                     ErrorCodes::NOT_IMPLEMENTED,
                     "Autocommit writes are not supported for content part files on a content-addressed disk");
@@ -350,14 +351,14 @@ std::unique_ptr<WriteBufferFromFileBase> DiskObjectStorageTransaction::writeFile
         }
 
         /// The returned buffer (a ContentAddressedWriteBuffer for a content blob, or a
-        /// ContentAddressedInlineWriteBuffer for a non-autocommit mutable per-part file) captures a bare
+        /// ContentAddressedInlineWriteBuffer for a non-autocommit small entry) captures a bare
         /// `[this]` of `content_addressed_transaction` in its finalize / pin-blob callbacks
         /// (on_finalized -> recorded[...], on_pin_blob -> recordBlobInSession -> persistSession reading
         /// `this->session`). These buffers are deferred-finalized: MergedBlockOutputStream's Finalizer
         /// stores them and calls finish() LATER, possibly from another thread or after the part storage /
         /// transaction would otherwise be torn down on an async-insert / cancel / exception-unwind path. If
         /// the buffer outlives the transaction, that `[this]` dangles -> persistSession touches a freed
-        /// session -> heap corruption (the suspected CA-S3 SIGSEGV). Mirror the mutable-file branch above
+        /// session -> heap corruption (the suspected CA-S3 SIGSEGV). Mirror the autocommit branch above
         /// (and the verbatim branch below): pin the DiskObjectStorageTransaction via
         /// `disk_tx = shared_from_this()` for the lifetime of the returned buffer. Because this transaction
         /// owns `metadata_transaction` (the ContentAddressedTransaction) by shared_ptr, holding `disk_tx`

@@ -79,7 +79,8 @@ void applyOwnerTransition(RefTableState & state, const RefOp & op)
     }
 
     /// Promote (spec §Promote): the SAME ref_name and manifest_ref move from Precommit to Committed
-    /// in one atomic step; the resulting row's payload starts empty (installed by a later set_payload).
+    /// in one atomic step; the resulting row's `published_at_ms` starts unset (installed by the
+    /// companion set_payload op in the same transaction, or a later one).
     if (has_old && has_new && op.old_binding->kind == RefOwnerKind::Precommit
         && op.new_binding->kind == RefOwnerKind::Committed
         && op.old_binding->ref_name == op.new_binding->ref_name
@@ -111,7 +112,10 @@ void applyOwnerTransition(RefTableState & state, const RefOp & op)
 }
 
 /// The `set_payload` op kind (spec §Update Payload): the committed ref must still name
-/// `expected_manifest_ref`; replaces the complete mutable payload without touching the manifest edge.
+/// `expected_manifest_ref`; replaces the opaque `payload` blob and `published_at_ms` without touching
+/// the manifest edge. All-tree-part-files Task 9: production never populates `payload` with anything
+/// anymore (the mutable-file map it used to carry is gone) -- the op still applies whatever bytes a
+/// caller gives it (codec/state-machine test coverage keys off this).
 void applySetPayload(RefTableState & state, const RefOp & op)
 {
     if (state.lifecycle != RefLifecycle::Live)

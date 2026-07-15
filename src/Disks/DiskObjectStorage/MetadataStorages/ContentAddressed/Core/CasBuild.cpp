@@ -1028,10 +1028,10 @@ void Build::promote(const RootNamespace & target_ns, const String & final_ref_na
 
             /// Promotion is a PURE OWNER MOVE (spec §Promote): the SAME manifest_ref T moves from
             /// precommit to committed in one atomic transaction, together with the SetPayload op that
-            /// installs the initial mutable payload (spec: "the initial payload arrives via a separate
-            /// set_payload op, in the same transaction or a later one" -- here, the same one). It emits NO
-            /// blob deltas; the activating `+1` came from GC's barrier-activation of the create-precommit
-            /// op (Task 12).
+            /// stamps `published_at_ms` (spec: "the initial stamp arrives via a separate set_payload op,
+            /// in the same transaction or a later one" -- here, the same one; all-tree-part-files Task 9
+            /// dropped the mutable-file payload this op used to also carry). It emits NO blob deltas; the
+            /// activating `+1` came from GC's barrier-activation of the create-precommit op (Task 12).
             std::vector<RefOp> ops;
             /// all-tree-part-files Task 2: an intended repoint additionally retires the OLD committed
             /// binding in this SAME ref-log record -- a separate OwnerTransition (old=Committed(repoint_old),
@@ -1062,7 +1062,6 @@ void Build::promote(const RootNamespace & target_ns, const String & final_ref_na
             payload_op.kind = RefOpKind::SetPayload;
             payload_op.ref_name = final_ref_name;
             payload_op.expected_manifest_ref = id.ref;
-            payload_op.payload = encodeMutableFilesPayload(pending_mutable_files);
             payload_op.published_at_ms = nowMs();
             ops.push_back(payload_op);
             return ops;

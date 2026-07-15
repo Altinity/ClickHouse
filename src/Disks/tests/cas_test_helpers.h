@@ -769,8 +769,8 @@ inline DB::Cas::RefTableSnapshot minimalLiveSnapshot(
     return s;
 }
 
-/// One committed row naming `ref_name` -> `manifest_ref` with an empty payload (tests that don't care
-/// about the mutable-files payload use this; `Store::encodeMutableFilesPayload` builds a real one).
+/// One committed row naming `ref_name` -> `manifest_ref` with `published_at_ms` left at its default
+/// (0, unset) — for tests that don't care about the publish stamp.
 inline DB::Cas::RefCommittedRow committedRow(const String & ref_name, const DB::Cas::ManifestRef & manifest_ref)
 {
     DB::Cas::RefCommittedRow row;

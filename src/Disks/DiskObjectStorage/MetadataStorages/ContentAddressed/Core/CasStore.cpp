@@ -66,40 +66,6 @@ namespace DB::Cas
 /// pathological live-lock and never a legitimate steady state.
 static constexpr size_t MAX_CAS_ATTEMPTS = 100;
 
-/// Task 10: declared in CasStore.h (shared with CasBuild.cpp's promote). Wire: `u32 count | (u32
-/// klen+bytes, u32 vlen+bytes)...`. `std::map` already iterates sorted by key, so this is a pure
-/// function of the map's contents with no separate sort step. Reuses the shared `writeLenPrefixed`/
-/// `readLenPrefixed` (`CasCodecUtil.h`, with their >UInt32 guard) rather than open-coding the same
-/// length-prefixed-string shape a fourth time (already shared by `CasRefLogCodec`/`CasRefSnapshotCodec`).
-String encodeMutableFilesPayload(const std::map<String, String> & files)
-{
-    WriteBufferFromOwnString out;
-    writeBinaryLittleEndian(static_cast<uint32_t>(files.size()), out);
-    for (const auto & [k, v] : files)
-    {
-        writeLenPrefixed(out, k);
-        writeLenPrefixed(out, v);
-    }
-    return out.str();
-}
-
-std::map<String, String> decodeMutableFilesPayload(const String & payload)
-{
-    std::map<String, String> files;
-    if (payload.empty())
-        return files;
-    ReadBufferFromMemory in(payload.data(), payload.size());
-    uint32_t count = 0;
-    readBinaryLittleEndian(count, in);
-    for (uint32_t i = 0; i < count; ++i)
-    {
-        const String k = readLenPrefixed(in);
-        const String v = readLenPrefixed(in);
-        files[k] = v;
-    }
-    return files;
-}
-
 Store::Store(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
     : pool_backend(std::move(backend_))
     , config(std::move(config_))
@@ -1036,7 +1002,6 @@ std::optional<Resolved> Store::resolveRef(const RootNamespace & ns, const String
     return Resolved{
         .manifest_id = ManifestId{.root_namespace = ns, .ref = row.manifest_ref},
         .manifest_size = 0,
-        .mutable_files = decodeMutableFilesPayload(row.payload),
         .published_at_ms = row.published_at_ms,
     };
 }
@@ -1187,7 +1152,6 @@ std::map<String, Resolved> Store::listRefs(const RootNamespace & ns)
         result.emplace(ref_name, Resolved{
             .manifest_id = ManifestId{.root_namespace = ns, .ref = row.manifest_ref},
             .manifest_size = 0,
-            .mutable_files = decodeMutableFilesPayload(row.payload),
             .published_at_ms = row.published_at_ms,
         });
     return result;
@@ -2907,12 +2871,13 @@ void Store::dropRef(const RootNamespace & ns, const String & ref_name)
 }
 
 void Store::updateRefPayload(const RootNamespace & ns, const String & ref_name,
-                             std::function<void(RefMutableFilesUpdate &)> mutator)
+                             std::function<void(RefPayloadUpdate &)> mutator)
 {
     /// Task 10 (spec §Update Payload): one `set_payload` ref-log transaction. EVERY change (even
     /// payload-only) is an explicit logged operation -- the immutable append-only log has no other way
-    /// to record it (spec: "The operation replaces the complete mutable payload and does not change the
-    /// manifest edge").
+    /// to record it. All-tree-part-files Task 9: the payload this op carries has shrunk to just
+    /// `published_at_ms` (the mutable-file map is gone; every per-part file is an ordinary manifest
+    /// tree entry now, republished via `repointRef`, never through this side channel).
     appendRefOps(ns, MutationScope::ref(ref_name),
         [&](const RefTableState & state) -> std::vector<RefOp>
         {
@@ -2921,11 +2886,10 @@ void Store::updateRefPayload(const RootNamespace & ns, const String & ref_name,
                 throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
                     "updateRefPayload: no such ref {} in namespace {}", ref_name, ns.string());
 
-            /// The mutator edits only the mutable payload; the carrier deliberately carries no
+            /// The mutator edits only `published_at_ms`; the carrier deliberately carries no
             /// `manifest_ref`, so a reachability change is structurally impossible here (it goes through
-            /// publish/drop instead). The persisted encoding is one opaque `payload` blob.
-            RefMutableFilesUpdate update;
-            update.mutable_files = decodeMutableFilesPayload(it->second.payload);
+            /// publish/drop/repoint instead).
+            RefPayloadUpdate update;
             update.published_at_ms = it->second.published_at_ms;
 
             mutator(update);
@@ -2934,7 +2898,6 @@ void Store::updateRefPayload(const RootNamespace & ns, const String & ref_name,
             op.kind = RefOpKind::SetPayload;
             op.ref_name = ref_name;
             op.expected_manifest_ref = it->second.manifest_ref;
-            op.payload = encodeMutableFilesPayload(update.mutable_files);
             op.published_at_ms = update.published_at_ms;
             return {op};
         },

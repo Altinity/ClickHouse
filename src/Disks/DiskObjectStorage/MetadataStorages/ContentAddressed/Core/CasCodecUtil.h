@@ -76,7 +76,7 @@ inline String readFixedBytes(ReadBuffer & in, size_t n)
 }
 
 /// Length-prefixed byte string, shared by every codec that embeds one (`CasRefLogCodec`,
-/// `CasRefSnapshotCodec`, and `CasStore`'s `encodeMutableFilesPayload`): `u32 length (LE) | bytes`.
+/// `CasRefSnapshotCodec`): `u32 length (LE) | bytes`.
 /// The explicit guard (rather than relying on an op/byte budget elsewhere to keep every string short)
 /// is the point where a length silently truncated by the `u32` cast would otherwise corrupt the wire.
 inline void writeLenPrefixed(WriteBuffer & out, const String & s)

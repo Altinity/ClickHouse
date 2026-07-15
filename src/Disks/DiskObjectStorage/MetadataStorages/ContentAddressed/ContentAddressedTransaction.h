@@ -91,8 +91,6 @@ private:
     {
         Cas::BuildPtr build;                       /// nullptr until the first content upload
         std::vector<Cas::ManifestEntry> entries;   /// staged manifest entries (uploads + adoptions)
-        std::map<std::string, std::string> mutable_files;
-        std::set<std::string> mutable_removed;     /// staged deletions for a COMMITTED part's payload
         std::set<std::string> content_removed;     /// all-tree-part-files Task 8 (B123 evolution, spec
                                                    /// 2026-07-14-cas-all-tree-part-files-design.md §6):
                                                    /// staged removal marks for a COMMITTED part's TREE
@@ -154,15 +152,6 @@ private:
     /// Shared by `publishStaging`'s normal path and its committed-ref repoint branch.
     void uploadPendingBlobs(PartStaging & st);
 
-    /// Apply `st.mutable_files`/`st.mutable_removed` onto the COMMITTED ref's payload (no-op if both
-    /// empty). Shared by the mutable-only staging branch and the committed-ref repoint branch: a
-    /// repoint republishes `entries` but never touches `mutable_files` itself (`repointRef`, Task 3,
-    /// intentionally carries no mutable-payload parameter -- the all-tree-part-files migration this
-    /// plan implements is moving every mutable per-part file INTO entries; until Task 6 flips
-    /// `isMutablePerPartFile`, a standalone write can still legitimately arrive bundled with a
-    /// mutable_files delta in the SAME transaction, which must not be silently dropped).
-    void publishMutableFilesDelta(const Cas::RootNamespace & ns, const std::string & ref, PartStaging & st);
-
     /// B190 Task 4: unified adopt helper that collapses the 6 inline pending/uploaded dispatch
     /// blocks in createHardLink / moveFile (cross-part) / moveDirectory (two-build merge).
     ///
@@ -178,9 +167,10 @@ private:
     void adoptStagedBlob(const PartStaging::PendingBlob * pb, const Cas::ManifestEntry & entry,
                          PartStaging & dst_st, Cas::Build & dst_build, bool copy_pending);
 
-    /// Publish one staged part durably (putTree + publish, or updateRefPayload for a mutable-only
-    /// staging) and mark it `published`. Idempotent: a no-op if already published. Returns true iff
-    /// this call newly CREATED a ref that did not exist before (for commit()'s rollback tracking).
+    /// Publish one staged part durably (putTree + publish, or a repoint for a standalone write/remove
+    /// on an already-committed part) and mark it `published`. Idempotent: a no-op if already
+    /// published. Returns true iff this call newly CREATED a ref that did not exist before (for
+    /// commit()'s rollback tracking).
     bool publishStaging(const Cas::RootNamespace & ns, const std::string & ref, PartStaging & st);
 };
 

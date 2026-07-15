@@ -46,11 +46,12 @@ enum class StagingBackend
 ///                  enumerates from Store::listNamespaces("shadow/..."))
 ///   generic files  SERVER_ID/_disk                  verbatim namespace files (access probes)
 ///
-/// Mutable per-part files live IN RefPayload.mutable_files (D-W3) — no sidecar objects. Their
-/// bytes (and future inline tree entries) are served through DiskObjectStorage::prepareRead's CA
-/// branch via tryGetInManifestBytes; getStorageObjects returns a sized placeholder with an EMPTY
-/// remote key for them (any consumer bypassing the prepareRead branch fails loudly, never reads
-/// wrong bytes).
+/// Small per-part files (uuid.txt, metadata_version.txt, txn_version.txt, checksums.txt, ...) are
+/// Inline-placement manifest tree entries — no sidecar objects (all-tree-part-files Task 6/9: the
+/// former mutable-file/entry split is gone). Their bytes are served through
+/// DiskObjectStorage::prepareRead's CA branch via tryGetInManifestBytes; getStorageObjects returns a
+/// sized placeholder with an EMPTY remote key for them (any consumer bypassing the prepareRead branch
+/// fails loudly, never reads wrong bytes).
 class ContentAddressedMetadataStorage final : public IMetadataStorage, public IContentAddressedExchange
 {
 public:
@@ -185,8 +186,7 @@ public:
     const String & getPoolUUID() const override { return pool_uuid; }
     std::optional<String> getPartManifestBytes(const String & part_path) const override;
     bool adoptPartFromManifest(
-        const String & table_uuid, const String & part_name,
-        const String & manifest_bytes, const std::map<String, String> & mutable_files) override;
+        const String & table_uuid, const String & part_name, const String & manifest_bytes) override;
 
     /// ==== wiring-internal surface (the transaction + the disk's prepareRead CA branch) ====
 
@@ -216,9 +216,9 @@ public:
     /// Callers append their own unique leaf, e.g. `"/" + getRandomASCIIString(32) + ".tmp"`.
     String stagingKeyPrefix() const;
 
-    /// Bytes that live INSIDE pool metadata rather than as their own object: a mutable per-part
-    /// file's bytes from RefPayload.mutable_files, an Inline-placement tree entry, or a verbatim
-    /// namespace file. nullopt = the path is blob-backed (a real storage object).
+    /// Bytes that live INSIDE pool metadata rather than as their own object: an Inline-placement
+    /// manifest tree entry, or a verbatim namespace file. nullopt = the path is blob-backed (a real
+    /// storage object).
     std::optional<String> tryGetInManifestBytes(const std::string & path) const;
 
     /// The CA read entry, part 1 of 2, called by DiskObjectStorage::prepareRead BEFORE the generic

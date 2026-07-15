@@ -42,14 +42,12 @@ Cas::ManifestEntry inlineEntry(const String & path, const String & bytes)
 
 /// Publish `entries` as committed ref `ns/ref` through the real writer protocol.
 Cas::ManifestId publishPart(const Cas::StorePtr & store, const Cas::RootNamespace & ns,
-                            const String & ref, std::vector<Cas::ManifestEntry> entries,
-                            std::map<String, String> mutable_files = {})
+                            const String & ref, std::vector<Cas::ManifestEntry> entries)
 {
     auto build = store->startBuild(Cas::BuildInfo{.intended_ref = ns.string() + "/" + ref,
                                                   .intended_namespace = ns, .op = Cas::ProvenanceOp::Insert});
     const Cas::ManifestId id = build->stageManifest(entries);
     build->precommitAdd(ns, ref, id);
-    build->setPendingMutableFiles(std::move(mutable_files));
     build->promote(ns, ref, build->buildId(), id);
     return id;
 }
@@ -176,8 +174,8 @@ TEST(CasPartFolderAccess, GetViewServesCommittedFolder)
     auto backend = std::make_shared<CountingBackend>();
     auto store = openStoreForTest(backend);
     const Cas::RootNamespace ns{"srv/t1"};
-    publishPart(store, ns, "part_1", {inlineEntry("checksums.txt", "cs"), inlineEntry("count.txt", "1")},
-                {{"txn_version.txt", "v1"}});
+    publishPart(store, ns, "part_1",
+                {inlineEntry("checksums.txt", "cs"), inlineEntry("count.txt", "1"), inlineEntry("txn_version.txt", "v1")});
 
     ContentAddressed::CachedPartFolderAccess access(store);
     const ContentAddressed::PartRefKey key{ns, "part_1"};
@@ -185,7 +183,7 @@ TEST(CasPartFolderAccess, GetViewServesCommittedFolder)
     auto view = access.getView(key, ContentAddressed::Freshness::CachedForLoad);
     ASSERT_NE(view, nullptr);
     EXPECT_NE(view->findFile("checksums.txt"), nullptr);
-    EXPECT_EQ(view->mutableBytes("txn_version.txt"), std::optional<String>("v1"));
+    EXPECT_EQ(view->inlineBytes("txn_version.txt"), std::optional<String>("v1"));
 
     /// Absent ref => nullptr, never an exception, never retained (nothing to retain in Phase 2).
     EXPECT_EQ(access.getView({ns, "absent"}, ContentAddressed::Freshness::CachedForLoad), nullptr);
@@ -230,14 +228,8 @@ TEST(CasPartFolderAccess, WritePrimitivesRoundTrip)
                                                   .intended_namespace = ns, .op = Cas::ProvenanceOp::Insert});
     const Cas::ManifestId id = build->stageManifest({inlineEntry("checksums.txt", "cs")});
     build->precommitAdd(ns, "part_1", id);
-    access.promoteBuild(*build, key, build->buildId(), id, {{"txn_version.txt", "v1"}});
+    access.promoteBuild(*build, key, build->buildId(), id);
     ASSERT_TRUE(access.existsRef(key, ContentAddressed::Freshness::ForceFresh));
-
-    /// updateMutableFiles is visible to a force-fresh resolve immediately.
-    access.updateMutableFiles(key, [](Cas::RefMutableFilesUpdate & payload) { payload.mutable_files["txn_version.txt"] = "v2"; });
-    auto resolved = access.resolve(key, ContentAddressed::Freshness::ForceFresh);
-    ASSERT_TRUE(resolved.has_value());
-    EXPECT_EQ(resolved->mutable_files.at("txn_version.txt"), "v2");
 
     /// dropRefIfPresent: replay-safe (absent ref is success, not failure).
     access.dropRefIfPresent(key);
@@ -257,7 +249,7 @@ TEST(CasPartFolderAccess, RepublishRefMovesCommittedRef)
     auto store = openStoreForTest(backend);
     const Cas::RootNamespace ns{"srv/t1"};
     ContentAddressed::CachedPartFolderAccess access(store);
-    publishPart(store, ns, "src_part", {inlineEntry("checksums.txt", "cs")}, {{"txn_version.txt", "v1"}});
+    publishPart(store, ns, "src_part", {inlineEntry("checksums.txt", "cs"), inlineEntry("txn_version.txt", "v1")});
 
     EXPECT_FALSE(access.republishRef({ns, "absent"}, {ns, "dst"}));   /// absent source: nothing written
 
@@ -266,7 +258,7 @@ TEST(CasPartFolderAccess, RepublishRefMovesCommittedRef)
     auto view = access.getView({ns, "dst_part"}, ContentAddressed::Freshness::ForceFresh);
     ASSERT_NE(view, nullptr);
     EXPECT_NE(view->findFile("checksums.txt"), nullptr);
-    EXPECT_EQ(view->mutableBytes("txn_version.txt"), std::optional<String>("v1"));   /// carried over
+    EXPECT_EQ(view->inlineBytes("txn_version.txt"), std::optional<String>("v1"));   /// carried over
 }
 
 TEST(CasPartFolderAccess, RepublishRefIdempotentRedriveAndConflict)
@@ -277,13 +269,16 @@ TEST(CasPartFolderAccess, RepublishRefIdempotentRedriveAndConflict)
     ContentAddressed::CachedPartFolderAccess access(store);
 
     /// Re-drive: dst already committed with the SAME content (a prior attempt's promote landed,
-    /// only dropRef(src) was interrupted), and src's mutable payload drifted afterwards.
-    publishPart(store, ns, "src", {inlineEntry("f", "same")}, {{"txn_version.txt", "v2"}});
-    publishPart(store, ns, "dst", {inlineEntry("f", "same")}, {{"txn_version.txt", "v1"}});
+    /// only dropRef(src) was interrupted) -- idempotent-skip: drop src, dst's manifest is untouched
+    /// (all-tree-part-files Task 9: there is no separate mutable payload left to drift/re-sync --
+    /// identical `entries` is the whole idempotency contract now).
+    publishPart(store, ns, "src", {inlineEntry("f", "same")});
+    publishPart(store, ns, "dst", {inlineEntry("f", "same")});
+    const auto dst_id_before = access.resolve({ns, "dst"}, ContentAddressed::Freshness::ForceFresh)->manifest_id;
     ASSERT_TRUE(access.republishRef({ns, "src"}, {ns, "dst"}));
     EXPECT_FALSE(access.existsRef({ns, "src"}, ContentAddressed::Freshness::ForceFresh));
     auto resolved = access.resolve({ns, "dst"}, ContentAddressed::Freshness::ForceFresh);
-    EXPECT_EQ(resolved->mutable_files.at("txn_version.txt"), "v2");   /// re-synced from src
+    EXPECT_EQ(resolved->manifest_id, dst_id_before) << "idempotent re-drive must not mint a fresh manifest";
 
     /// Conflict: dst committed with DIFFERENT content — fail closed, src untouched.
     publishPart(store, ns, "src2", {inlineEntry("f", "one")});
@@ -345,57 +340,17 @@ TEST(CasPartFolderAccess, BaselineRequestCountsWithoutRetention)
 
 /// ==== Phase 4 (retention) semantics battery: spec §Testing acceptance criteria ====
 
-TEST(CasPartFolderAccess, MutableRefreshWithoutManifestRead)
-{
-    auto backend = std::make_shared<CountingBackend>();
-    auto store = openStoreForTest(backend);
-    const Cas::Layout layout("p");
-    const Cas::RootNamespace ns{"srv/t1"};
-    ContentAddressed::CachedPartFolderAccess access(store, cacheOn());
-    const auto id = publishPart(store, ns, "part_1", {inlineEntry("f", "x")}, {{"txn_version.txt", "v1"}});
-    const ContentAddressed::PartRefKey key{ns, "part_1"};
-    const String manifest_key = layout.manifestKey(id);
-
-    ASSERT_NE(access.getView(key, ContentAddressed::Freshness::CachedForLoad), nullptr);   /// retained
-    /// RAW-store mutation: the write bypasses the facade (validate-on-hit must cope — this is the
-    /// mutation-site-not-routed / foreign-writer shape the compare exists for). The retained entry
-    /// survives, so the next read exercises the manifest-match + mutable-drift CLONE path.
-    store->updateRefPayload(ns, "part_1", [](Cas::RefMutableFilesUpdate & p) { p.mutable_files["txn_version.txt"] = "v2"; });
-    backend->resetCounts();
-
-    auto view = access.getView(key, ContentAddressed::Freshness::CachedForLoad);
-    ASSERT_NE(view, nullptr);
-    EXPECT_EQ(view->mutableBytes("txn_version.txt"), std::optional<String>("v2"));   /// read-your-writes
-    EXPECT_EQ(backend->headCount(manifest_key), 0u);                                 /// clone: no HEAD
-    EXPECT_EQ(backend->getCount(manifest_key), 0u);                                  /// and no GET
-    EXPECT_EQ(access.explain(key).last_decision,
-              ContentAddressed::CachedPartFolderAccess::LastDecision::MutableRefresh);
-}
-
-TEST(CasPartFolderAccess, WriteThroughEraseThenRebuild)
-{
-    auto backend = std::make_shared<CountingBackend>();
-    auto store = openStoreForTest(backend);
-    const Cas::Layout layout("p");
-    const Cas::RootNamespace ns{"srv/t1"};
-    ContentAddressed::CachedPartFolderAccess access(store, cacheOn());
-    const auto id = publishPart(store, ns, "part_1", {inlineEntry("f", "x")}, {{"txn_version.txt", "v1"}});
-    const ContentAddressed::PartRefKey key{ns, "part_1"};
-    const String manifest_key = layout.manifestKey(id);
-
-    ASSERT_NE(access.getView(key, ContentAddressed::Freshness::CachedForLoad), nullptr);
-    access.updateMutableFiles(key, [](Cas::RefMutableFilesUpdate & p) { p.mutable_files["txn_version.txt"] = "v2"; });
-    backend->resetCounts();
-
-    auto view = access.getView(key, ContentAddressed::Freshness::CachedForLoad);
-    ASSERT_NE(view, nullptr);
-    EXPECT_EQ(view->mutableBytes("txn_version.txt"), std::optional<String>("v2"));
-    EXPECT_EQ(backend->headCount(manifest_key), 1u);   /// erase => cold rebuild re-HEADs...
-    EXPECT_EQ(backend->getCount(manifest_key), 0u);    /// ...but the decode cache absorbs the GET
-    EXPECT_EQ(access.explain(key).last_decision,
-              ContentAddressed::CachedPartFolderAccess::LastDecision::Miss);
-}
-
+/// REMOVED (all-tree-part-files Task 9, spec 2026-07-14-cas-all-tree-part-files-design.md §3):
+/// `MutableRefreshWithoutManifestRead` and `WriteThroughEraseThenRebuild` proved the cache facade's
+/// `LastDecision::MutableRefresh` fast path -- a cheap re-check that could serve a retained view whose
+/// manifest was unchanged but whose separate mutable payload had drifted, without a manifest re-read.
+/// That whole two-tier freshness model is gone: every per-part file is an ordinary manifest entry now,
+/// so ANY content change is a manifest change (`repointRef`) and the existing manifest-id staleness
+/// check (`getView`'s `cached->manifestId() == resolved->manifest_id` compare) is the only freshness
+/// check left -- there is no cheaper "payload-only" path to test separately. Coverage that remains
+/// valid: `MismatchRebuildAfterRepublish` below proves the cache correctly rebuilds when the manifest
+/// id changes under a retained view (the one case the deleted tests' "erase => cold rebuild" half also
+/// exercised); `gtest_cas_repoint.cpp` (Task 3) proves `repointRef` erases the affected view on success.
 TEST(CasPartFolderAccess, MismatchRebuildAfterRepublish)
 {
     auto backend = std::make_shared<CountingBackend>();

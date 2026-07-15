@@ -146,9 +146,6 @@ public:
     /// `CasEventType::RefRepoint` audit event -- every effective repoint is loud by construction.
     void promote(const RootNamespace & target_ns, const String & final_ref_name, UInt128 build_id, const ManifestId & id, bool allow_repoint = false);
 
-    /// Carry the mutable per-ref payload (txn_version.txt, ...) that promote writes into the ref's mutable files.
-    void setPendingMutableFiles(std::map<String, String> files) { pending_mutable_files = std::move(files); }
-
     /// Retire seq so the GC watermark floor can advance; staged manifest debris is best-effort cleaned
     /// (the Phase-1d orphan sweep is the durable backstop).
     void abandon();
@@ -236,7 +233,6 @@ private:
     String precommit_final_ref;
     ManifestRef precommit_manifest;
 
-    std::map<String, String> pending_mutable_files;       /// promote writes these into the ref's mutable files
     std::vector<ManifestId> staged_manifests;             /// for best-effort abandon cleanup
 
     std::map<DepKey, DepEntry> deps;                      /// the W-DEP-SET (blob-only now)

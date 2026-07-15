@@ -52,7 +52,11 @@ struct RefOp
 
     String ref_name;                               /// SetPayload
     ManifestRef expected_manifest_ref;              /// SetPayload
-    String payload;                                 /// SetPayload
+    String payload;                                 /// SetPayload -- opaque wire carrier; all-tree-
+                                                     /// part-files Task 9: production never populates
+                                                     /// this anymore (always empty), but the field
+                                                     /// stays on the wire (codec/state-machine test
+                                                     /// coverage keys off it as a generic byte carrier)
     uint64_t published_at_ms = 0;                   /// SetPayload
 
     bool operator==(const RefOp &) const = default;

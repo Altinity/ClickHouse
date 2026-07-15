@@ -23,7 +23,10 @@ enum class RefLifecycle : uint8_t
 };
 
 /// One committed (ref name -> manifest) row (spec's `CommittedRef`): the complete current mapping
-/// entry, including the mutable ref payload (spec's `mutable_files`).
+/// entry. All-tree-part-files Task 9: `payload` is an opaque wire carrier production never populates
+/// anymore (every per-part file is an ordinary manifest tree entry now) -- kept on the wire as a
+/// generic byte carrier (codec/state-machine test coverage keys off it); `published_at_ms` is the
+/// only field a caller still legitimately sets.
 struct RefCommittedRow
 {
     String ref_name;

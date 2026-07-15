@@ -265,27 +265,20 @@ struct Resolved
     /// from the owning root context, spec §Object Identity And Ownership).
     ManifestId manifest_id;
     uint64_t manifest_size = 0;
-    std::map<String, String> mutable_files;
     uint64_t published_at_ms = 0;   /// publish wall-clock (epoch ms); 0 = unset
 };
 
-/// The `{mutable_files, published_at_ms}` carrier `updateRefPayload`'s mutator edits in place: the one
-/// set_payload transaction replaces the complete mutable payload without touching the manifest edge, so
-/// the mutator has no way to express (and no need to reject) a `manifest_ref` change -- a reachability
-/// change goes through publish/drop instead.
-struct RefMutableFilesUpdate
+/// The carrier `updateRefPayload`'s mutator edits in place (all-tree-part-files Task 9, spec
+/// 2026-07-14-cas-all-tree-part-files-design.md §3: the mutable-file concept -- and the map this
+/// carrier used to hold -- is gone; every per-part file is now an ordinary manifest tree entry). What
+/// survives is the `published_at_ms` stamp, which is not part of the manifest edge, so `set_payload`
+/// remains the one place it is updated in isolation (e.g. a re-stamp with no content change). The
+/// carrier deliberately carries no `manifest_ref`, so a reachability change is structurally impossible
+/// here -- that goes through publish/drop/repoint instead.
+struct RefPayloadUpdate
 {
-    std::map<String, String> mutable_files;
     uint64_t published_at_ms = 0;   /// publish wall-clock (epoch ms); 0 = unset
 };
-
-/// Task 10: the deterministic encoding of a committed ref's mutable payload (`Resolved::mutable_files` /
-/// `RefMutableFilesUpdate::mutable_files`) inside one `RefCommittedRow.payload` -- an OPAQUE blob from the
-/// ref-log/snapshot codecs' point of view (spec §Snapshot Format: "mutable_files: deterministic ref
-/// payload"). Shared by `Store`'s own dropRef/updateRefPayload/resolveRef/listRefs and by `Build::promote`
-/// (the `set_payload` op that installs a precommit's initial payload). Defined in CasStore.cpp.
-String encodeMutableFilesPayload(const std::map<String, String> & files);
-std::map<String, String> decodeMutableFilesPayload(const String & payload);
 
 struct BlobLocation
 {
@@ -439,7 +432,7 @@ public:
     /// ---- ref lifecycle (Task 10: persisted on the snapshot+log protocol, spec §Writer Algorithms) ----
     void dropRef(const RootNamespace & ns, const String & ref_name);            /// one owner_transition removal txn
     void updateRefPayload(const RootNamespace & ns, const String & ref_name,
-                          std::function<void(RefMutableFilesUpdate &)> mutator);   /// one set_payload txn
+                          std::function<void(RefPayloadUpdate &)> mutator);   /// one set_payload txn
     /// Task 11 (spec §Namespace Removal): one ref-log transaction naming every owner's exact removal
     /// followed by `remove_namespace`, then a best-effort publish of the constant-size `Removed`
     /// snapshot. Performs NO physical deletion (no verbatim-file deletes, no tombstones) -- that is

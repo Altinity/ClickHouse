@@ -186,7 +186,6 @@ TEST(CasPromoteRepublish, RepublishReDriveOverCommittedDstIsIdempotent)
             build->adoptEvidence(entry);
         const ManifestId id = build->stageManifest(src_manifest.entries);
         build->precommitAdd(ns, dst_ref, id);
-        build->setPendingMutableFiles(resolved_src->mutable_files);
         build->promote(ns, dst_ref, build->buildId(), id);
         /// Deliberately NO dropRef(ns, src_ref) here -- this is the simulated crash.
     }
@@ -218,85 +217,15 @@ TEST(CasPromoteRepublish, RepublishReDriveOverCommittedDstIsIdempotent)
     EXPECT_EQ(storage->getFileSize(dst_path + "/data.bin"), 9u);
 }
 
-/// Final-review hardening: on the idempotent-skip path, dst's `mutable_files` must be RE-SYNCED from
-/// src's CURRENT resolve, not left at whatever snapshot was captured by the crashed attempt. Simulates
-/// src's `mutable_files` drifting (e.g. a `metadata_version.txt` rewrite) AFTER the crashed
-/// `promote(dst)` but BEFORE the re-drive: the re-drive must carry the drifted value onto dst, not the
-/// stale one dst already has.
-TEST(CasPromoteRepublish, RepublishReDriveResyncsDriftedMutableFiles)
-{
-    auto storage = openTxStorage();
-    const auto ns = storage->liveNamespace("uuid-promote-republish-mutable");
-    const String src_ref = "all_3_3_0";
-    const String dst_ref = "detached_all_3_3_0";
-    const String src_path = "uui/uuid-promote-republish-mutable/" + src_ref;
-    const String dst_path = "uui/uuid-promote-republish-mutable/" + dst_ref;
-
-    /// 1. Publish a committed src part via the normal write flow.
-    {
-        auto tx = storage->createTransaction();
-        writeFileTx(*tx, "uui/uuid-promote-republish-mutable/tmp_insert_" + src_ref + "/data.bin", "payload-A");
-        tx->moveDirectory("uui/uuid-promote-republish-mutable/tmp_insert_" + src_ref, src_path);
-        tx->commit(DB::NoCommitOptions{});
-    }
-    ASSERT_TRUE(storage->store()->resolveRef(ns, src_ref).has_value());
-
-    /// 2. Construct the "crash-before-dropRef(src)" state exactly as in
-    ///    RepublishReDriveOverCommittedDstIsIdempotent: dst gets committed with a SNAPSHOT of src's
-    ///    (currently empty) mutable_files, src is left committed (the simulated crash).
-    const auto resolved_src = storage->store()->resolveRef(ns, src_ref);
-    ASSERT_TRUE(resolved_src.has_value());
-    ASSERT_TRUE(resolved_src->mutable_files.empty()) << "sanity: no mutable files yet before the drift";
-    const PartManifest src_manifest = storage->store()->readManifest(resolved_src->manifest_id);
-    {
-        auto build = storage->store()->startBuild(
-            BuildInfo{.intended_ref = ns.string() + "/" + dst_ref, .intended_namespace = ns});
-        for (const auto & entry : src_manifest.entries)
-            build->adoptEvidence(entry);
-        const ManifestId id = build->stageManifest(src_manifest.entries);
-        build->precommitAdd(ns, dst_ref, id);
-        build->setPendingMutableFiles(resolved_src->mutable_files);
-        build->promote(ns, dst_ref, build->buildId(), id);
-        /// Deliberately NO dropRef(ns, src_ref) here -- this is the simulated crash.
-    }
-    const auto resolved_dst_before = storage->store()->resolveRef(ns, dst_ref);
-    ASSERT_TRUE(resolved_dst_before.has_value());
-    const ManifestId dst_id_before = resolved_dst_before->manifest_id;
-    ASSERT_TRUE(resolved_dst_before->mutable_files.empty());
-
-    /// 3. DRIFT: src's mutable_files change AFTER the crashed promote(dst) but BEFORE the re-drive
-    ///    (e.g. a metadata_version.txt bump that landed on the still-committed src). Mutable-fields-only
-    ///    write -- the same primitive the autocommit one-shot path uses, no reachability change.
-    storage->store()->updateRefPayload(ns, src_ref, [](RefMutableFilesUpdate & payload)
-    {
-        payload.mutable_files["metadata_version.txt"] = "7";
-    });
-    ASSERT_EQ(storage->store()->resolveRef(ns, src_ref)->mutable_files.at("metadata_version.txt"), "7");
-    ASSERT_TRUE(storage->store()->resolveRef(ns, dst_ref)->mutable_files.empty())
-        << "sanity: the direct src write must not have touched dst";
-
-    /// 4. RE-DRIVE: both endpoints already committed-ref part paths -- moveDirectory's "move any
-    ///    COMMITTED source ref" branch calls republishRef(src, dst) for real, hitting the idempotent-skip
-    ///    path (same `entries`, drifted `mutable_files`).
-    {
-        auto tx = storage->createTransaction();
-        tx->moveDirectory(src_path, dst_path);
-        tx->commit(DB::NoCommitOptions{});
-    }
-
-    /// 5. src dropped, dst's ManifestId UNCHANGED (still idempotent -- no fresh manifest minted), but
-    ///    dst's mutable_files now carry the DRIFTED value from src's current resolve, not the stale
-    ///    snapshot dst already had.
-    EXPECT_FALSE(storage->store()->resolveRef(ns, src_ref).has_value())
-        << "src ref must be dropped by the re-drive";
-    const auto resolved_dst_after = storage->store()->resolveRef(ns, dst_ref);
-    ASSERT_TRUE(resolved_dst_after.has_value());
-    EXPECT_EQ(resolved_dst_after->manifest_id, dst_id_before)
-        << "the re-sync must only touch mutable fields -- the manifest identity must stay idempotent";
-    EXPECT_EQ(resolved_dst_after->mutable_files.at("metadata_version.txt"), "7")
-        << "dst's mutable_files must be re-synced from src's CURRENT resolve on the idempotent-skip path, "
-           "not left at the stale pre-drift snapshot (final-review Minor (c))";
-}
+/// REMOVED (all-tree-part-files Task 9, spec 2026-07-14-cas-all-tree-part-files-design.md §3):
+/// `RepublishReDriveResyncsDriftedMutableFiles` proved that `republishRef`'s idempotent-skip path
+/// re-synced dst's `mutable_files` from src's CURRENT resolve when src's mutable payload drifted
+/// between the crashed attempt and the re-drive. That side channel is gone -- `metadata_version.txt`
+/// etc. are ordinary manifest entries now, so a src drift of that kind changes `entries`, and
+/// `republishRef`'s idempotency check (`dst_manifest->entries != src_manifest->entries`) now correctly
+/// treats it as a genuine content conflict (ABORTED) rather than silently resyncing a side payload --
+/// there is no longer a "same content, drifted sidecar" state to re-sync. `RepublishReDriveOver-
+/// CommittedDstIsIdempotent` above remains the live coverage for the idempotent-skip path itself.
 
 /// Companion conflict case: a re-drive where dst is committed to DIFFERENT content than src is a
 /// genuine conflict (an ATTACH-onto-existing-name collision), not a re-drive -- it must fail closed

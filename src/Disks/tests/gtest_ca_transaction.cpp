@@ -192,6 +192,54 @@ TEST(CaTransactionRepoint, StandaloneWriteOnCommittedPartRepoints)
     EXPECT_EQ(rep.dangling, 0u);
 }
 
+/// Task 9 coverage gap (closed here, folded in from the T8 review): ONE uncommitted transaction that
+/// BOTH writes a file and unlinks a DIFFERENT file of the SAME already-committed part must resolve to
+/// exactly ONE repoint carrying the write, the removal, AND every untouched file forward together --
+/// not two independent repoints, and not a lost update from one staged change clobbering the other.
+/// `publishStaging`'s Task 4/8 merge already handles `st.entries` and `st.content_removed` together
+/// (both conditions can be true on the same staging); this pins that the combined shape actually works
+/// end to end through the real transaction, not just through each half in isolation.
+TEST(CaTransactionRepoint, CombinedWriteAndUnlinkSameTxnRepointsOnce)
+{
+    auto storage = openTxStorage();
+
+    /// 1. Commit a part with three files.
+    {
+        auto tx = storage->createTransaction();
+        writeFileTx(*tx, "uui/uuid-combo-1/tmp_insert_all_1_1_0/checksums.txt", "old-checksums");
+        writeFileTx(*tx, "uui/uuid-combo-1/tmp_insert_all_1_1_0/data.bin", "the-data-bytes");
+        writeFileTx(*tx, "uui/uuid-combo-1/tmp_insert_all_1_1_0/txn_version.txt",
+            "creation_tid: (1,1,00000000-0000-0000-0000-000000000000)");
+        tx->moveDirectory("uui/uuid-combo-1/tmp_insert_all_1_1_0", "uui/uuid-combo-1/all_1_1_0");
+        tx->commit(DB::NoCommitOptions{});
+    }
+    ASSERT_TRUE(storage->existsFile("uui/uuid-combo-1/all_1_1_0/txn_version.txt"));
+
+    const uint64_t repoints_before = ProfileEvents::global_counters[ProfileEvents::CasRefRepoint].load();
+
+    /// 2. ONE transaction: write checksums.txt (new bytes) AND unlink txn_version.txt (a DIFFERENT
+    /// file of the same part) -- must resolve to exactly one repoint carrying both changes plus the
+    /// untouched data.bin.
+    {
+        auto tx = storage->createTransaction();
+        writeFileTx(*tx, "uui/uuid-combo-1/all_1_1_0/checksums.txt", "new-checksums-longer");
+        tx->unlinkFile("uui/uuid-combo-1/all_1_1_0/txn_version.txt", /*if_exists=*/false, /*should_remove_objects=*/true);
+        tx->commit(DB::NoCommitOptions{});
+    }
+
+    /// 3. The written file is updated, the unlinked file is honestly gone, the untouched file survives
+    /// (carry-forward), exactly ONE repoint fired (not two, not zero), and fsck finds nothing dangling.
+    EXPECT_EQ(storage->getFileSize("uui/uuid-combo-1/all_1_1_0/checksums.txt"), 20u);
+    EXPECT_FALSE(storage->existsFile("uui/uuid-combo-1/all_1_1_0/txn_version.txt"));
+    EXPECT_EQ(storage->getFileSize("uui/uuid-combo-1/all_1_1_0/data.bin"), 14u)
+        << "carry-forward: the untouched file must survive a combined write+unlink on the same part";
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasRefRepoint].load(), repoints_before + 1)
+        << "one uncommitted transaction combining a write and an unlink must resolve to exactly one repoint";
+
+    const auto rep = DB::Cas::runFsck(*storage->store(), /*detail*/false);
+    EXPECT_EQ(rep.dangling, 0u);
+}
+
 /// all-tree-part-files Task 6 (spec 2026-07-14-cas-all-tree-part-files-design.md §4): the mutable-
 /// per-part-file branch is deleted from `writeFile` -- uuid.txt/metadata_version.txt/txn_version.txt
 /// now flow down the ordinary content path, landing in the manifest like any other file.
@@ -209,8 +257,6 @@ TEST(CaTransactionAllTree, BuildTimeSidecarsLandInManifest)
     const auto ns = storage->liveNamespace("uuid-alltree-1");
     const auto resolved = storage->store()->resolveRef(ns, "all_1_1_0");
     ASSERT_TRUE(resolved.has_value());
-    EXPECT_TRUE(resolved->mutable_files.empty())
-        << "the three sidecar files must no longer be staged into RefPayload.mutable_files";
 
     const DB::Cas::PartManifest manifest = storage->store()->readManifest(resolved->manifest_id);
     const auto & entries = manifest.entries;
@@ -224,9 +270,9 @@ TEST(CaTransactionAllTree, BuildTimeSidecarsLandInManifest)
     EXPECT_EQ(txn_version_entry->placement, DB::Cas::EntryPlacement::Inline);
     EXPECT_EQ(meta_version_entry->inline_bytes, "3");
 
-    /// And they are readable through the normal read path (Task 6's fallback fix in existsFile /
-    /// getFileSize / tryGetInManifestBytes — reachable because `isMutablePerPartFile` still classifies
-    /// these names, but they are no longer found in `mutable_files`).
+    /// And they are readable through the normal read path — Task 9 deleted the ForceFresh special
+    /// case these reads used to go through; they now resolve purely via the manifest view like any
+    /// other entry (existsFile / getFileSize / tryGetInManifestBytes).
     EXPECT_TRUE(storage->existsFile("uui/uuid-alltree-1/all_1_1_0/metadata_version.txt"));
     EXPECT_EQ(storage->getFileSize("uui/uuid-alltree-1/all_1_1_0/metadata_version.txt"), 1u);
 }

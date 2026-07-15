@@ -1113,11 +1113,11 @@ MergeTreeData::MutableDataPartPtr Fetcher::relinkPartToDisk(
     /// transferred body, stages its OWN local manifest over the shared-pool blobs (adopt-by-hash), and
     /// promotes it with fail-closed blob revalidation (the GC-race safety the old 4-step pin protocol
     /// carried). Self-contained: uuid.txt/metadata_version.txt are ordinary entries in the transferred
-    /// manifest (task 6), so there is no sidecar to reconstruct — the mutable_files argument is empty.
-    /// Returns false if a referenced blob is missing/condemned in this pool — relink not possible, the
-    /// caller falls back to a byte fetch; nothing was published (no dangling ref).
+    /// manifest (task 6, and task 9 dropped the now-unused sidecar parameter entirely) — there is no
+    /// sidecar to reconstruct. Returns false if a referenced blob is missing/condemned in this pool —
+    /// relink not possible, the caller falls back to a byte fetch; nothing was published (no dangling ref).
     /// Trust boundary is the interserver channel, as for a normal part fetch — see adoptPartFromManifest.
-    const bool published = ca_meta->adoptPartFromManifest(*table_uuid, part_dir, sender_manifest_bytes, /*mutable_files=*/{});
+    const bool published = ca_meta->adoptPartFromManifest(*table_uuid, part_dir, sender_manifest_bytes);
     if (!published)
         return nullptr;
 

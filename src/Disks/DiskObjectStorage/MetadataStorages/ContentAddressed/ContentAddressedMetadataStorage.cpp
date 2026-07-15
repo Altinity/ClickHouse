@@ -697,21 +697,11 @@ bool ContentAddressedMetadataStorage::existsFile(const std::string & path) const
     if (!r || r->file.empty())
         return false;
 
-    if (ContentAddressed::isMutablePerPartFile(r->file))
-    {
-        /// Force-fresh (Pillar B): read-your-writes for a just-written mutable file — no TTL-stale manifest.
-        auto resolved = partAccess().resolve(r->refKey(), ContentAddressed::Freshness::ForceFresh);
-        if (resolved && !ContentAddressed::PartFolderView::isReservedMutableName(r->file)
-            && resolved->mutable_files.contains(r->file))
-            return true;
-        /// all-tree-part-files Task 6: uuid.txt/metadata_version.txt/txn_version.txt now flow through
-        /// the ordinary content path (`writeFile` no longer stages them as mutable) -- fall through to
-        /// the manifest-entry lookup below when not found as a legacy mutable payload. Safe to serve a
-        /// CACHED view here (not force-fresh): every committed-ref write that could have moved this
-        /// entry (`repointRef`/`promoteBuild`) erases the cached view on success, so a stale hit is
-        /// impossible by construction, not by freshness policy.
-    }
-
+    /// All-tree-part-files Task 9: uuid.txt/metadata_version.txt/txn_version.txt flow through the
+    /// ordinary content path like any other file (Task 6) -- no ForceFresh special case is needed.
+    /// Safe to serve a CACHED view here: every committed-ref write that could have moved this entry
+    /// (`repointRef`/`promoteBuild`) erases the cached view on success, so a stale hit is impossible
+    /// by construction, not by freshness policy.
     auto view = partAccess().getView(r->refKey(), ContentAddressed::Freshness::CachedForLoad);
     return view && view->findFile(r->file);
 }
@@ -871,7 +861,7 @@ bool ContentAddressedMetadataStorage::existsFileOrDirectory(const std::string & 
     {
         auto p = ContentAddressed::parsePartFilePath(path);
         auto r = p ? route(*p) : std::nullopt;
-        if (r && !r->ref.empty() && !r->file.empty() && !ContentAddressed::isMutablePerPartFile(r->file))
+        if (r && !r->ref.empty() && !r->file.empty())
         {
             auto view = partAccess().getView(r->refKey(), ContentAddressed::Freshness::CachedForLoad);
             if (!view)
@@ -899,18 +889,6 @@ uint64_t ContentAddressedMetadataStorage::getFileSize(const std::string & path) 
     auto r = route(*p);
     if (!r || r->file.empty())
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: not a part file path: {}", path);
-
-    if (ContentAddressed::isMutablePerPartFile(r->file))
-    {
-        /// Force-fresh (Pillar B): read-your-writes for a just-written mutable file.
-        auto resolved = partAccess().resolve(r->refKey(), ContentAddressed::Freshness::ForceFresh);
-        if (resolved && !ContentAddressed::PartFolderView::isReservedMutableName(r->file))
-            if (auto it = resolved->mutable_files.find(r->file); it != resolved->mutable_files.end())
-                return it->second.size();
-        /// all-tree-part-files Task 6: fall through to the manifest-entry lookup (see existsFile) —
-        /// not found as a legacy mutable payload does not mean absent, now that writeFile stages
-        /// these names as ordinary entries.
-    }
 
     auto view = partAccess().getView(r->refKey(), ContentAddressed::Freshness::CachedForLoad);
     if (!view)
@@ -1139,17 +1117,6 @@ std::optional<StoredObjects> ContentAddressedMetadataStorage::getStorageObjectsI
     if (!r || r->file.empty())
         return std::nullopt;
 
-    if (ContentAddressed::isMutablePerPartFile(r->file))
-    {
-        /// Force-fresh (Pillar B), same contract as existsFile/tryGetInManifestBytes.
-        auto resolved = partAccess().resolve(r->refKey(), ContentAddressed::Freshness::ForceFresh);
-        if (resolved && !ContentAddressed::PartFolderView::isReservedMutableName(r->file))
-            if (const auto it = resolved->mutable_files.find(r->file); it != resolved->mutable_files.end())
-                /// Sized empty-key placeholder — same shape getStorageObjects returns for in-manifest bytes.
-                return StoredObjects{StoredObject("", path, it->second.size())};
-        /// all-tree-part-files Task 6: fall through to the manifest-entry lookup (see existsFile).
-    }
-
     auto view = partAccess().getView(r->refKey(), ContentAddressed::Freshness::CachedForLoad);
     if (!view)
         return std::nullopt;
@@ -1183,17 +1150,6 @@ std::optional<String> ContentAddressedMetadataStorage::tryGetInManifestBytes(con
     auto r = route(*p);
     if (!r || r->file.empty())
         return std::nullopt;
-
-    if (ContentAddressed::isMutablePerPartFile(r->file))
-    {
-        /// Force-fresh (Pillar B): MVCC txn_version / mutable-file read — must not serve a TTL-stale manifest.
-        auto resolved = partAccess().resolve(r->refKey(), ContentAddressed::Freshness::ForceFresh);
-        if (resolved && !ContentAddressed::PartFolderView::isReservedMutableName(r->file))
-            if (auto it = resolved->mutable_files.find(r->file); it != resolved->mutable_files.end())
-                return it->second;
-        /// all-tree-part-files Task 6: fall through to the manifest-entry lookup (see existsFile) —
-        /// uuid.txt/metadata_version.txt/txn_version.txt now flow through the ordinary content path.
-    }
 
     auto view = partAccess().getView(r->refKey(), ContentAddressed::Freshness::CachedForLoad);
     if (!view)
@@ -1289,8 +1245,7 @@ std::optional<String> ContentAddressedMetadataStorage::getPartManifestBytes(cons
 /// defended against a hostile peer, so relink-by-manifest adds no new trust surface. (See the retracted
 /// umbrella "RBAC bypass" finding.)
 bool ContentAddressedMetadataStorage::adoptPartFromManifest(
-    const String & table_uuid, const String & part_name,
-    const String & manifest_bytes, const std::map<String, String> & mutable_files)
+    const String & table_uuid, const String & part_name, const String & manifest_bytes)
 {
     if (read_only)
         throw Exception(ErrorCodes::READONLY, "Content-addressed disk is opened read-only: adoptPartFromManifest is rejected");
@@ -1339,8 +1294,7 @@ bool ContentAddressedMetadataStorage::adoptPartFromManifest(
         /// GC retention floor (spec 2026-07-14-cas-readonly-replica-snapshot-pin-design.md §8.1): the
         /// fetching replica takes a transient retention pin on the source snapshot for the relink duration.
         /// Do NOT build a bespoke relink handshake — the Poco interserver transport is half-duplex.
-        partAccess().publishEntries({receiver_ns, part_name}, decoded.entries, mutable_files,
-                                    Cas::ProvenanceOp::Attach);
+        partAccess().publishEntries({receiver_ns, part_name}, decoded.entries, Cas::ProvenanceOp::Attach);
         return true;
     }
     catch (const Exception & e)

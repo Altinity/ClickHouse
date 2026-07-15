@@ -37,17 +37,18 @@ std::shared_ptr<const ContentAddressed::PartFolderView> makeView()
         e.inline_bytes = bytes;
         manifest->entries.push_back(e);
     };
-    /// Canonical (sorted) order — the ctor chasserts it.
+    /// Canonical (sorted) order — the ctor chasserts it. All-tree-part-files Task 9: `txn_version.txt`
+    /// is an ordinary Inline entry now, not a separate mutable payload.
     add("checksums.txt", Cas::EntryPlacement::Inline, "cs", 2);
     add("data.bin", Cas::EntryPlacement::Blob, "", 100);
     add("p.proj/checksums.txt", Cas::EntryPlacement::Inline, "pc", 2);
     add("p.proj/data.bin", Cas::EntryPlacement::Blob, "", 50);
+    add("txn_version.txt", Cas::EntryPlacement::Inline, "ver", 3);
 
-    std::map<String, String> mutables{{"txn_version.txt", "ver"}, {".ca_hidden", "x"}};
     return std::make_shared<const ContentAddressed::PartFolderView>(
         ContentAddressed::PartRefKey{Cas::RootNamespace{"srv/t"}, "part_1"},
         Cas::ManifestId{Cas::RootNamespace{"srv/t"}, Cas::ManifestRef{1, 2, 3}},
-        /*manifest_size=*/1000, /*published_at_ms=*/42, std::move(mutables), manifest,
+        /*manifest_size=*/1000, /*published_at_ms=*/42, manifest,
         /*validated_at_ms=*/42);
 }
 
@@ -62,8 +63,7 @@ TEST(CasPartFolderView, FindFileAndHasFile)
     EXPECT_EQ(v->findFile("data.bin")->blob_size, 100u);
     EXPECT_EQ(v->findFile("absent.bin"), nullptr);
     EXPECT_TRUE(v->hasFile("p.proj/data.bin"));
-    EXPECT_TRUE(v->hasFile("txn_version.txt"));      /// non-reserved mutable counts
-    EXPECT_FALSE(v->hasFile(".ca_hidden"));          /// reserved mutable is invisible
+    EXPECT_TRUE(v->hasFile("txn_version.txt"));      /// an ordinary Inline entry
     EXPECT_FALSE(v->hasFile("p.proj"));              /// a directory, not a file
 }
 
@@ -88,12 +88,11 @@ TEST(CasPartFolderView, SizesAndBytes)
     auto v = makeView();
     EXPECT_EQ(v->fileSize("checksums.txt"), std::optional<uint64_t>(2));   /// inline: bytes size
     EXPECT_EQ(v->fileSize("data.bin"), std::optional<uint64_t>(100));      /// blob: blob_size
-    EXPECT_EQ(v->fileSize("txn_version.txt"), std::nullopt);               /// mutable: not a manifest entry
+    EXPECT_EQ(v->fileSize("txn_version.txt"), std::optional<uint64_t>(3)); /// inline: bytes size
     EXPECT_EQ(v->fileSize("absent"), std::nullopt);
     EXPECT_EQ(v->inlineBytes("checksums.txt"), std::optional<String>("cs"));
     EXPECT_EQ(v->inlineBytes("data.bin"), std::nullopt);                   /// blob has no inline bytes
-    EXPECT_EQ(v->mutableBytes("txn_version.txt"), std::optional<String>("ver"));
-    EXPECT_EQ(v->mutableBytes(".ca_hidden"), std::nullopt);                /// reserved filtered
+    EXPECT_EQ(v->inlineBytes("txn_version.txt"), std::optional<String>("ver"));
     EXPECT_GE(v->estimatedBytes(), 1000u);                                 /// >= manifest_size
 }
 

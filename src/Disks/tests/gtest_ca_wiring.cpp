@@ -175,20 +175,6 @@ TEST(CaPartPathParser, DetachedNamedTableIsKnownAmbiguityFoldedAsReservedDir)
     EXPECT_FALSE(parseTableUuid("data/db/detached").has_value());
 }
 
-TEST(CaPartPathParser, MutablePerPartFiles)
-{
-    EXPECT_TRUE(isMutablePerPartFile("uuid.txt"));
-    EXPECT_TRUE(isMutablePerPartFile("txn_version.txt"));
-    EXPECT_TRUE(isMutablePerPartFile("metadata_version.txt"));
-    // Atomic-write sibling tmp (VersionMetadataOnDisk) stages as mutable too.
-    EXPECT_TRUE(isMutablePerPartFile("txn_version.txt.tmp"));
-    // Detached form: prefixed by the detached part dir, matched on the basename (B62).
-    EXPECT_TRUE(isMutablePerPartFile("attaching_all_0_0_0/metadata_version.txt"));
-    EXPECT_FALSE(isMutablePerPartFile("columns.txt"));
-    EXPECT_FALSE(isMutablePerPartFile("data.bin"));
-    EXPECT_FALSE(isMutablePerPartFile("uuid.txt2"));
-}
-
 TEST(CaPartPathParser, RawPathSplitMemoizedAcrossClassifiers)
 {
     // The CA read path runs isPartFilePath then parsePartFilePath on the SAME raw path several times
@@ -278,6 +264,21 @@ DB::Cas::ManifestEntry wiringBlobEntry(const String & path, const String & paylo
     return e;
 }
 
+/// All-tree-part-files Task 6/9: the small per-part files (uuid.txt, metadata_version.txt, ...) are
+/// ordinary Inline-placement manifest entries now — this is the low-level Build-API equivalent of
+/// what `ContentAddressedTransaction::writeFile`'s inline candidate path stages in production.
+DB::Cas::ManifestEntry wiringInlineEntry(const String & path, const String & bytes)
+{
+    DB::Cas::ManifestEntry e;
+    e.path = path;
+    e.placement = DB::Cas::EntryPlacement::Inline;
+    e.ref = DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(u128Of(bytes))};
+
+    e.blob_size = bytes.size();
+    e.inline_bytes = bytes;
+    return e;
+}
+
 std::shared_ptr<DB::ContentAddressedMetadataStorage> openWiringStorage()
 {
     auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
@@ -287,7 +288,8 @@ std::shared_ptr<DB::ContentAddressedMetadataStorage> openWiringStorage()
     return storage;
 }
 
-/// One part with a content blob, a projection file, and the mutable per-part files, published
+/// One part with a content blob, a projection file, and the small per-part files (uuid.txt,
+/// metadata_version.txt — ordinary Inline entries now, all-tree-part-files Task 6/9), published
 /// through the real Build into `ns` under `ref`.
 void publishWiredPart(
     DB::ContentAddressedMetadataStorage & storage, const DB::Cas::RootNamespace & ns, const String & ref)
@@ -302,19 +304,20 @@ void publishWiredPart(
     info.intended_namespace = ns;
     auto build = storage.store()->startBuild(info);
 
+    /// Strictly ascending canonical path order (PartFolderView's binary-search precondition):
+    /// data.bin < metadata_version.txt < p.proj/data.bin < uuid.txt.
     const auto id = build->stageManifest(
-        {wiringBlobEntry("data.bin", "payload-A"), wiringBlobEntry("p.proj/data.bin", "payload-B")});
+        {wiringBlobEntry("data.bin", "payload-A"), wiringInlineEntry("metadata_version.txt", "5"),
+         wiringBlobEntry("p.proj/data.bin", "payload-B"), wiringInlineEntry("uuid.txt", "u-123")});
     build->precommitAdd(ns, ref, id);
     build->putBlob(idOf("payload-A"), DB::Cas::BlobSource::fromString("payload-A"));
     build->putBlob(idOf("payload-B"), DB::Cas::BlobSource::fromString("payload-B"));
-    /// The mutable per-part files ride into RootRef.mutable_files via promote (was RefPayload).
-    build->setPendingMutableFiles({{"uuid.txt", "u-123"}, {"metadata_version.txt", "5"}});
     build->promote(ns, ref, build->buildId(), id);
 
     /// promote stamps published_at_ms with nowMs(); the read assertions want a FIXED stamp, so pin it
-    /// through the mutable-only updateRefPayload path (no journal record — same as a payload-only edit).
+    /// through the set_payload path (no journal record for anything but the stamp itself).
     storage.store()->updateRefPayload(ns, ref,
-        [](DB::Cas::RefMutableFilesUpdate & r) { r.published_at_ms = 1700000000ULL * 1000; });   /// epoch ms; getLastModified /1000
+        [](DB::Cas::RefPayloadUpdate & r) { r.published_at_ms = 1700000000ULL * 1000; });   /// epoch ms; getLastModified /1000
 }
 
 }
@@ -347,7 +350,7 @@ TEST(CaWiringRead, ResolvesPublishedPart)
     EXPECT_FALSE(storage->existsDirectory("uui/uuid-2"));
 
     /// Part dir listing: nested keys collapse to their first component; the publish stamp
-    /// (published_at_ms typed field) never surfaces as a dir entry; mutable files DO surface.
+    /// (published_at_ms typed field) never surfaces as a dir entry — every staged file does.
     auto names = storage->listDirectory("uui/uuid-1/all_1_1_0");
     std::sort(names.begin(), names.end());
     EXPECT_EQ(names, (std::vector<std::string>{"data.bin", "metadata_version.txt", "p.proj", "uuid.txt"}));
@@ -366,7 +369,7 @@ TEST(CaWiringRead, ResolvesPublishedPart)
     EXPECT_FALSE(objects[0].remote_path.empty());
     EXPECT_EQ(objects[0].bytes_size, 9u);
 
-    /// Mutable per-part file: bytes live in the shard manifest.
+    /// Small Inline entry: bytes live in the shard manifest, not as their own object.
     EXPECT_TRUE(storage->existsFile("uui/uuid-1/all_1_1_0/uuid.txt"));
     EXPECT_EQ(storage->getFileSize("uui/uuid-1/all_1_1_0/uuid.txt"), 5u);
     EXPECT_EQ(storage->tryGetInManifestBytes("uui/uuid-1/all_1_1_0/uuid.txt"), std::optional<String>("u-123"));
@@ -402,7 +405,13 @@ TEST(CaWiringRead, BlobViewPlanRidesTheStandardPipeline)
         DB::readStringUntilEOF(manifest_bytes, *buf);
     }
     EXPECT_EQ(manifest_bytes, "u-123");
-    EXPECT_FALSE(storage->getBlobViewPlan("uui/uuid-1/all_1_1_0/uuid.txt").has_value());
+    /// Not a `getBlobViewPlan` call on the in-manifest path here (all-tree Task 6/9: uuid.txt is now
+    /// a real Inline manifest entry): `getBlobViewPlan`'s only production caller
+    /// (`DiskObjectStorage::prepareRead`) never reaches it once `prepareInManifestRead` returns true
+    /// above — `getBlobViewPlan`'s precondition is "confirmed not in-manifest-servable," which calling
+    /// it directly on an Inline path violates. Pre-Task-9 this assertion passed only by coincidence
+    /// (uuid.txt was not a manifest entry at all, so `findFile` returned not-found, not because
+    /// `getBlobViewPlan` gracefully handles an Inline entry it does find).
 
     /// Blob-backed file: a real physical key and a payload-sized window whose extent equals
     /// the object's readable size (a right-bounded read never overshoots the window).
@@ -874,17 +883,13 @@ TEST(CaWiringOps, RemovalsDropRefsAndNamespaces)
 /// — via `ContentAddressedTransaction::moveFile` directly. That dance no longer exists in production:
 /// Task 5's `supportsAtomicFileWrites` short-circuit makes `VersionMetadataOnDisk::storeInfoToData-
 /// PartStorage` write `txn_version.txt` directly in one shot on a CA disk, with no `.tmp` file and no
-/// rename ever produced. `moveFile`'s legacy "rename FROM a committed mutable-per-part-file, source
-/// not staged in this transaction" branch (`ContentAddressedTransaction.cpp`, `isMutablePerPartFile
-/// (dst->file)`) is consequently now genuinely unreachable in production and was left AS-IS (still
-/// keyed off `mutable_files`, which Task 6 stopped populating) rather than rebuilt against `entries` —
-/// a same-ref content rename-with-removal needs the general committed-content-removal primitive
-/// Task 8 (`PartStaging::content_removed`) adds, and building a one-off version here for a dead path
-/// would be unused surface area. The test's trailing assertion (unlinking a committed mutable file)
-/// depends on that same not-yet-built primitive. Coverage that remains valid: Task 5's own capability
-/// test proves no `.tmp` file is ever created; `CaTransactionAllTree.CommittedTxnVersionStoreRepoints`
-/// (`gtest_ca_transaction.cpp`) proves the real, live path — a standalone write of `txn_version.txt`
-/// directly onto an already-committed part — repoints correctly.
+/// rename ever produced. Task 9 completed the cleanup this comment used to defer: `moveFile`'s legacy
+/// "rename FROM a committed mutable-per-part-file, source not staged in this transaction" branch is
+/// now DELETED (it had been provably unreachable since Task 5, and rebuilding it against `entries`
+/// would only add unused surface for a dead path). Coverage that remains valid: Task 5's own
+/// capability test proves no `.tmp` file is ever created; `CaTransactionAllTree.CommittedTxnVersion-
+/// StoreRepoints` (`gtest_ca_transaction.cpp`) proves the real, live path — a standalone write of
+/// `txn_version.txt` directly onto an already-committed part — repoints correctly.
 
 TEST(CaWiringOps, VerbatimMoveAndUnlink)
 {
@@ -982,12 +987,15 @@ TEST(CaWiringOps, MoveDirectoryMutableCollisionPolicy)
     /// Identical bytes → benign, no throw (source-wins, idempotent). Both parts carry real content so
     /// the eager publish-at-rename builds a proper ref (a mutable-only staging would instead hit
     /// updateRefPayload on a not-yet-committed ref — unrelated to the collision policy under test).
+    /// data.bin must ALSO match now: all-tree Task 9 generalized the differing-bytes collision check
+    /// from the legacy mutable-file names to every entry, so a differing data.bin would (correctly)
+    /// throw too and defeat this block's "benign" premise.
     {
         auto storage = openWiringStorage();
         auto tx = storage->createTransaction();
         writeThroughTransaction(*tx, "uui/uuid-1/tmp_y/data.bin", "d1");
         writeThroughTransaction(*tx, "uui/uuid-1/tmp_y/txn_version.txt", "SAME");
-        writeThroughTransaction(*tx, "uui/uuid-1/all_8_8_8/data.bin", "d2");
+        writeThroughTransaction(*tx, "uui/uuid-1/all_8_8_8/data.bin", "d1");
         writeThroughTransaction(*tx, "uui/uuid-1/all_8_8_8/txn_version.txt", "SAME");
         auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
         EXPECT_NO_THROW(ca_tx.moveDirectory("uui/uuid-1/tmp_y", "uui/uuid-1/all_8_8_8"));
@@ -1231,14 +1239,15 @@ TEST(CaWiringExchange, GetPartManifestBytesReturnsBodyForCommittedPart)
     ASSERT_TRUE(bytes.has_value());
     EXPECT_FALSE(bytes->empty());
 
-    /// The transferred body decodes to the SAME blob entries the part names (the receiver uses ONLY
-    /// these). The sender's ManifestRef/namespace/digest are present but non-authoritative downstream.
+    /// The transferred body decodes to the SAME entries the part names — the blob entries AND the
+    /// per-part files (uuid.txt/metadata_version.txt are ordinary tree entries now, all-tree Task 6/9).
+    /// The sender's ManifestRef/namespace/digest are present but non-authoritative downstream.
     const DB::Cas::PartManifest decoded = DB::Cas::decodePartManifest(*bytes);
-    ASSERT_EQ(decoded.entries.size(), 2u);
+    ASSERT_EQ(decoded.entries.size(), 4u);
     EXPECT_EQ(decoded.entries[0].path, "data.bin");
     EXPECT_EQ(decoded.entries[0].ref.digest.toU128(), u128Of("payload-A"));
-    EXPECT_EQ(decoded.entries[1].path, "p.proj/data.bin");
-    EXPECT_EQ(decoded.entries[1].ref.digest.toU128(), u128Of("payload-B"));
+    EXPECT_EQ(decoded.entries[2].path, "p.proj/data.bin");
+    EXPECT_EQ(decoded.entries[2].ref.digest.toU128(), u128Of("payload-B"));
 
     /// An absent part is not a committed CA part here -> no offer.
     EXPECT_FALSE(exchange->getPartManifestBytes("uui/uuid-1/all_9_9_9").has_value());
@@ -1274,8 +1283,7 @@ TEST(CaWiringExchange, AdoptPartFromManifestPublishesFreshLocalManifest)
 
     /// Adopt into a DIFFERENT table (uuid-2). The transferred body's root_namespace_id is the sender's
     /// (uuid-1) — the receiver must IGNORE it and use uuid-2.
-    const bool ok = exchange->adoptPartFromManifest(
-        "uuid-2", "tmp-fetch_all_1_1_0", *bytes, {{"metadata_version.txt", "1"}});
+    const bool ok = exchange->adoptPartFromManifest("uuid-2", "tmp-fetch_all_1_1_0", *bytes);
     EXPECT_TRUE(ok);
 
     /// The adopted ref is live in the RECEIVER namespace and loadable.
@@ -1284,7 +1292,7 @@ TEST(CaWiringExchange, AdoptPartFromManifestPublishesFreshLocalManifest)
     ASSERT_TRUE(receiver_resolved.has_value());
     const DB::Cas::PartManifest receiver_manifest =
         storage->store()->readManifest(receiver_resolved->manifest_id);
-    ASSERT_EQ(receiver_manifest.entries.size(), 2u);
+    ASSERT_EQ(receiver_manifest.entries.size(), 4u);
     EXPECT_EQ(receiver_manifest.entries[0].ref.digest.toU128(), u128Of("payload-A"));
 
     /// FRESH receiver-local identity: a DIFFERENT ManifestId from the sender's, in the RECEIVER namespace.
@@ -1293,9 +1301,6 @@ TEST(CaWiringExchange, AdoptPartFromManifestPublishesFreshLocalManifest)
     EXPECT_EQ(receiver_resolved->manifest_id.root_namespace.string(), receiver_ns.string())
         << "the adopted manifest must live in the receiver namespace (derived from table_uuid), not the sender's";
     EXPECT_FALSE(receiver_ns.string() == sender_ns.string());
-
-    /// The transferred mutable per-part file rode in via promote.
-    EXPECT_EQ(receiver_resolved->mutable_files.at("metadata_version.txt"), "1");
 
     /// NO blob body was uploaded: the shared blobs' incarnations are untouched by the adopt.
     EXPECT_EQ(storage->store()->backend().head(data_key).token, data_tok_before)
@@ -1333,8 +1338,7 @@ TEST(CaWiringExchange, AdoptFailsClosedAndFallsBackOnCondemnedBlob)
               DB::Cas::DeleteOutcome::Kind::Deleted);
 
     /// §4: promote trusts the adopted leaves — no re-probe — so adopt SUCCEEDS (returns true) and publishes.
-    const bool ok = exchange->adoptPartFromManifest(
-        "uuid-2", "tmp-fetch_all_1_1_0", *bytes, {{"metadata_version.txt", "1"}});
+    const bool ok = exchange->adoptPartFromManifest("uuid-2", "tmp-fetch_all_1_1_0", *bytes);
     EXPECT_TRUE(ok) << "§4: adopt trusts the manifest edge; a raced pool blob is not re-probed at promote";
 
     /// The receiver ref publishes (the D4 trade-off), and the deleted pool blob surfaces via fsck's
@@ -1345,13 +1349,12 @@ TEST(CaWiringExchange, AdoptFailsClosedAndFallsBackOnCondemnedBlob)
                                    "finding (dangling=" << rep.dangling << ")";
 }
 
-/// All-tree task 7: relink self-containment. Task 6 routes uuid.txt/metadata_version.txt through the
-/// content path, so a committed part's manifest ENTRIES already carry these files — the receiver no
-/// longer needs a mutable_files sidecar to reconstruct them (Fetcher::relinkPartToDisk now passes an
-/// empty map). Unlike `publishWiredPart` above (which still exercises the legacy setPendingMutableFiles
-/// channel for the lower-level payload tests), this publishes a part whose per-part files are ordinary
-/// manifest entries, then adopts it with an EMPTY mutable_files map — mirroring the post-task-7 call
-/// site exactly.
+/// All-tree task 7/9: relink self-containment. Task 6 routes uuid.txt/metadata_version.txt through
+/// the content path, so a committed part's manifest ENTRIES already carry these files — the receiver
+/// no longer needs a mutable_files sidecar to reconstruct them. Task 9 completed the cleanup:
+/// `adoptPartFromManifest` no longer even HAS a sidecar parameter (Fetcher::relinkPartToDisk's call
+/// site simply dropped the argument). This publishes a part whose per-part files are ordinary
+/// manifest entries and adopts it, mirroring the post-task-9 call site exactly.
 TEST(CaWiringExchange, AdoptPartFromManifestSelfContainedWithoutMutableFilesSidecar)
 {
     auto storage = openWiringStorage();
@@ -1378,16 +1381,14 @@ TEST(CaWiringExchange, AdoptPartFromManifestSelfContainedWithoutMutableFilesSide
     const DB::Cas::PartManifest decoded = DB::Cas::decodePartManifest(*bytes);
     ASSERT_EQ(decoded.entries.size(), 3u) << "uuid.txt/metadata_version.txt travel as ordinary entries";
 
-    /// Adopt with an EMPTY mutable_files map — exactly what Fetcher::relinkPartToDisk passes now that
-    /// the manifest is self-contained (no sidecar reconstruction from a wire-transferred header).
-    const bool ok = exchange->adoptPartFromManifest("uuid-2", "tmp-fetch_all_1_1_0", *bytes, {});
+    /// No sidecar parameter to pass anymore — exactly what Fetcher::relinkPartToDisk's call looks like
+    /// now that the manifest is self-contained (no reconstruction from a wire-transferred header).
+    const bool ok = exchange->adoptPartFromManifest("uuid-2", "tmp-fetch_all_1_1_0", *bytes);
     EXPECT_TRUE(ok);
 
     const auto receiver_ns = storage->liveNamespace("uuid-2");
     auto resolved = storage->store()->resolveRef(receiver_ns, "tmp-fetch_all_1_1_0");
     ASSERT_TRUE(resolved.has_value());
-    EXPECT_TRUE(resolved->mutable_files.empty())
-        << "no sidecar was carried in — the per-part files rode in as ordinary manifest entries";
 
     const DB::Cas::PartManifest receiver_manifest = storage->store()->readManifest(resolved->manifest_id);
     ASSERT_EQ(receiver_manifest.entries.size(), 3u);
@@ -1549,7 +1550,7 @@ TEST(CaWiringReadOnly, ObserveOnlyOpenReadsButRejectsWrites)
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::READONLY,
         [&] { ro->createTransaction(); });
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::READONLY,
-        [&] { ro->adoptPartFromManifest("uuid-1", "tmp-fetch", std::string{}, {}); });
+        [&] { ro->adoptPartFromManifest("uuid-1", "tmp-fetch", std::string{}); });
 }
 
 TEST(CaWiringRead, UnsetPublishedAtMsReturnsEpoch)
@@ -1564,7 +1565,7 @@ TEST(CaWiringRead, UnsetPublishedAtMsReturnsEpoch)
 
     /// Ensure published_at_ms is unset (the default is 0).
     storage->store()->updateRefPayload(storage->liveNamespace("uuid-1"), "all_1_1_0",
-        [](DB::Cas::RefMutableFilesUpdate & r) { r.published_at_ms = 0; });
+        [](DB::Cas::RefPayloadUpdate & r) { r.published_at_ms = 0; });
 
     EXPECT_EQ(storage->getLastModified("uui/uuid-1/all_1_1_0").epochTime(), 0);
 }

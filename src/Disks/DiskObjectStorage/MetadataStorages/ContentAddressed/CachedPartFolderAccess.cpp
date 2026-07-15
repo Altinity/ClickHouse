@@ -15,7 +15,6 @@ namespace DB::ErrorCodes
 namespace ProfileEvents
 {
     extern const Event CasPartFolderViewHits;
-    extern const Event CasPartFolderViewMutableRefreshes;
     extern const Event CasPartFolderViewValidationMismatches;
     extern const Event CasPartFolderViewMisses;
     extern const Event CasPartFolderViewOversizedBypasses;
@@ -71,23 +70,9 @@ CachedPartFolderAccess::getView(const PartRefKey & key, Freshness freshness) con
         {
             if (cached->manifestId() == resolved->manifest_id)
             {
-                if (cached->mutableFiles() == resolved->mutable_files)
-                {
-                    ProfileEvents::increment(ProfileEvents::CasPartFolderViewHits);
-                    recordDecision(cache_key, LastDecision::Hit, cached.get(), /*retained=*/true);
-                    return cached;
-                }
-                /// 2b: manifest unchanged, mutable-only drift (txn_version bumps) — clone around
-                /// the SAME shared decode; no manifest operation at all.
-                auto refreshed = std::make_shared<PartFolderView>(
-                    key, resolved->manifest_id, resolved->manifest_size,
-                    resolved->published_at_ms, resolved->mutable_files, cached->manifest(),
-                    cached->validatedAtMs());   /// mutable-only drift did not re-prove the body
-                if (refreshed->estimatedBytes() <= params.max_entry_bytes)
-                    view_cache->set(cache_key, refreshed);
-                ProfileEvents::increment(ProfileEvents::CasPartFolderViewMutableRefreshes);
-                recordDecision(cache_key, LastDecision::MutableRefresh, refreshed.get(), /*retained=*/true);
-                return refreshed;
+                ProfileEvents::increment(ProfileEvents::CasPartFolderViewHits);
+                recordDecision(cache_key, LastDecision::Hit, cached.get(), /*retained=*/true);
+                return cached;
             }
             ProfileEvents::increment(ProfileEvents::CasPartFolderViewValidationMismatches);
             /// fall through to rebuild — the stale entry is superseded by the insert below
@@ -97,14 +82,14 @@ CachedPartFolderAccess::getView(const PartRefKey & key, Freshness freshness) con
     /// §3 (part_folder_validate): ForceFresh may serve a retained view WITHOUT the mandatory body
     /// HEAD when the mode permits -- the ref currency is proven by `resolve` above; only the
     /// INV-NO-DANGLE body re-proof is skipped. StrictValidate never enters here (it bypasses
-    /// retention, spec §Validate-On-Hit). A manifest_id/mutable_files mismatch still falls through to
-    /// rebuild below -- a genuine change under a retained view is caught exactly like CachedForLoad's
-    /// mismatch path above.
+    /// retention, spec §Validate-On-Hit). A manifest_id mismatch still falls through to rebuild below
+    /// -- a genuine change under a retained view is caught exactly like CachedForLoad's mismatch path
+    /// above. All-tree-part-files Task 9: the former `mutableFiles()` comparison is gone -- every
+    /// content change is now a manifest change (`repointRef`), so `manifestId()` alone proves currency.
     if (freshness == Freshness::ForceFresh && view_cache && params.validate.mode != PartFolderValidate::Mode::Always)
     {
         if (auto cached = view_cache->get(cache_key);
-            cached && cached->manifestId() == resolved->manifest_id
-            && cached->mutableFiles() == resolved->mutable_files)
+            cached && cached->manifestId() == resolved->manifest_id)
         {
             const bool fresh_enough = params.validate.mode == PartFolderValidate::Mode::Never
                 || (now_ms_fn() - cached->validatedAtMs()) < params.validate.age_seconds * 1000ULL;
@@ -214,17 +199,14 @@ bool CachedPartFolderAccess::existsRef(const PartRefKey & key, Freshness freshne
 }
 
 void CachedPartFolderAccess::promoteBuild(Cas::Build & build, const PartRefKey & key, UInt128 build_id,
-                                          const Cas::ManifestId & manifest_id, std::map<String, String> mutable_files,
-                                          bool allow_repoint)
+                                          const Cas::ManifestId & manifest_id, bool allow_repoint)
 {
-    build.setPendingMutableFiles(std::move(mutable_files));
     build.promote(key.ns, key.ref, build_id, manifest_id, allow_repoint);
     eraseView(key);
 }
 
 void CachedPartFolderAccess::publishEntries(const PartRefKey & dst,
-    const std::vector<Cas::ManifestEntry> & entries, std::map<String, String> mutable_files, Cas::ProvenanceOp op,
-    bool allow_repoint)
+    const std::vector<Cas::ManifestEntry> & entries, Cas::ProvenanceOp op, bool allow_repoint)
 {
     auto build = store->startBuild(Cas::BuildInfo{.intended_ref = dst.ns.string() + "/" + dst.ref,
                                                   .intended_namespace = dst.ns, .op = op});
@@ -236,14 +218,14 @@ void CachedPartFolderAccess::publishEntries(const PartRefKey & dst,
     /// single-owner ManifestId, so dst gets its own id), then move ownership in.
     const Cas::ManifestId id = build->stageManifest(entries);
     build->precommitAdd(dst.ns, dst.ref, id);
-    promoteBuild(*build, dst, build->buildId(), id, std::move(mutable_files), allow_repoint);
+    promoteBuild(*build, dst, build->buildId(), id, allow_repoint);
 }
 
 bool CachedPartFolderAccess::republishRef(const PartRefKey & src, const PartRefKey & dst)
 {
     /// Move a COMMITTED ref (rev. 15 §republish): content addressing has no rename. Force-fresh
-    /// source read (RENAME/move: stale mutable_files must not carry to dst); readManifestShared's
-    /// mandatory HEAD re-proves the source body (write evidence is never a cached view).
+    /// source read; readManifestShared's mandatory HEAD re-proves the source body (write evidence is
+    /// never a cached view).
     auto resolved = store->resolveRef(src.ns, src.ref);
     if (!resolved)
         return false;
@@ -253,8 +235,9 @@ bool CachedPartFolderAccess::republishRef(const PartRefKey & src, const PartRefK
     /// and only dropRef(src) was interrupted. Compare CONTENT (path-sorted `entries`, not the whole
     /// manifest — ref/namespace/digest legitimately differ): same content => finish the rename by
     /// dropping src; a different-content dst is a genuine conflict => fail closed (never silently
-    /// drop src's content). `mutable_files` is NOT part of the idempotency key and can have drifted
-    /// on src between the crashed promote(dst) and this re-drive — re-sync it onto dst.
+    /// drop src's content). All-tree-part-files Task 9: the former mutable_files re-sync on this path
+    /// is gone -- every per-part file is an ordinary entry now, so the `entries` compare above already
+    /// covers it (a drifted `metadata_version.txt` etc. IS a content difference, caught by the throw).
     if (auto dst_resolved = store->resolveRef(dst.ns, dst.ref))
     {
         const auto dst_manifest = store->readManifestShared(dst_resolved->manifest_id);
@@ -262,20 +245,11 @@ bool CachedPartFolderAccess::republishRef(const PartRefKey & src, const PartRefK
             throw Exception(ErrorCodes::ABORTED,
                 "republishRef: destination '{}' is already committed with different content — refusing "
                 "(rename/attach conflict)", dst.ns.string() + "/" + dst.ref);
-        if (dst_resolved->mutable_files != resolved->mutable_files)
-        {
-            const std::map<String, String> current_mutable_files = resolved->mutable_files;
-            updateMutableFiles(dst, [&](Cas::RefMutableFilesUpdate & payload)
-            {
-                payload.mutable_files = current_mutable_files;
-            });
-        }
         dropRef(src);
         return true;
     }
 
-    /// Mutable files carry over (a rename is not a new part). promote stamps the dst publish clock.
-    publishEntries(dst, src_manifest->entries, resolved->mutable_files, Cas::ProvenanceOp::Other);
+    publishEntries(dst, src_manifest->entries, Cas::ProvenanceOp::Other);
     dropRef(src);
     return true;
 }
@@ -297,18 +271,12 @@ bool CachedPartFolderAccess::repointRef(const PartRefKey & key, std::vector<Cas:
             return false;
     }
     /// `publishEntries` takes `entries` by const&, so it is read here after the call without issue.
-    publishEntries(key, entries, /*mutable_files=*/{}, op, /*allow_repoint=*/true);
+    publishEntries(key, entries, op, /*allow_repoint=*/true);
     ProfileEvents::increment(ProfileEvents::CasRefRepoint);
     LOG_WARNING(getLogger("CachedPartFolderAccess"),
         "Repointed committed ref {}/{} ({} entries) — standalone write/remove on a committed part",
         key.ns.string(), key.ref, entries.size());
     return true;
-}
-
-void CachedPartFolderAccess::updateMutableFiles(const PartRefKey & key, std::function<void(Cas::RefMutableFilesUpdate &)> mutator)
-{
-    store->updateRefPayload(key.ns, key.ref, std::move(mutator));
-    eraseView(key);
 }
 
 void CachedPartFolderAccess::dropRef(const PartRefKey & key)
