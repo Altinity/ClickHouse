@@ -39,8 +39,17 @@ Fixed in `codecs_proposal_v3.md` and already agreed; summarized for self-contain
 - **Parsing/writing:** the `ReadHelpers`/`WriteHelpers` JSON primitives (the `JSONEachRow` code
   path) — streaming pull parsing over `ReadBuffer`, hand-rolled deterministic writers. No DOM
   library.
-- **Compression:** optional whole-object single-frame `zstd` (magic-sniffed, XXH64 on, declared
-  content size checked against the per-type cap before allocation). Deterministic types pinned raw.
+- **Compression (amended 2026-07-16):** per-type deterministic policy `Never` / `Always` /
+  `PinnedRaw` — no size threshold. `Always` types (the ones that can grow large: `cas_ref_log`,
+  `cas_ref_snap`, `cas_part_manifest`, `cas_gc_outcomes`) are stored under a **`.zst` key suffix**
+  and compressed regardless of instance size; always-small types and deterministic types
+  (`cas_run`, `cas_fold_seal` — adoption byte-compare) are raw with no suffix. The suffix keeps
+  constructed-key point-GETs deterministic (no try-both, no flags in refs) and makes listings
+  self-describing (`aws s3 cp … | zstdcat | jq`). One zstd frame, XXH64 checksum on, declared
+  content size checked against the per-type cap before allocation. The body magic is validated
+  against the policy (mismatch → `CORRUPTED_DATA`), not sniffed as a writer's free choice. Key
+  builders take the suffix from the traits table; key parsers (`parseRefObjectKey`, fsck/sweep
+  classifiers) strip it — each in its format's migration phase.
 - **Integrity:** every guard names its consumer; storage-level corruption detection delegated
   (S3 checksums, zstd frame, MergeTree `checksums.txt`, `fsck`). Runs are guarded by the seal-held
   whole-file CityHash128 verified at the end of every full read. Padding zones ("no smuggling") are
@@ -65,17 +74,17 @@ retired set `CART` was removed 2026-07-10, and the blob-meta sidecar was missing
 
 | Object | Key (`CasLayout`) | Today | v3 `type` | Family | Compression | Deterministic |
 |---|---|---|---|---|---|---|
-| Pool meta | `poolMetaKey` | proto | `cas_pool_meta` | Control | below threshold | no |
-| Ref log txn | `refLogKey` | custom binary (`kRefLogTxnFormatVersion` + len-prefixed) | `cas_ref_log` | Control | optional | no |
-| Ref snapshot | `refSnapshotKey` | custom binary | `cas_ref_snap` | Control | **yes** | no |
+| Pool meta | `poolMetaKey` | proto | `cas_pool_meta` | Control | never (always small) | no |
+| Ref log txn | `refLogKey` | custom binary (`kRefLogTxnFormatVersion` + len-prefixed) | `cas_ref_log` | Control | **always, `.zst`** | no |
+| Ref snapshot | `refSnapshotKey` | custom binary | `cas_ref_snap` | Control | **always, `.zst`** | no |
 | Ref cleanup marker | `refCleanupMarkerKey` | empty body (key-only presence marker) | — | non-family (documented in registry) | — | — |
-| Part manifest | `manifestKey` | `CAPT` hybrid (binary header + embedded `CARN`) | `cas_part_manifest` | Payload hybrid (JSON descriptor + banner payload zone) | yes | no |
+| Part manifest | `manifestKey` | `CAPT` hybrid (binary header + embedded `CARN`) | `cas_part_manifest` | Payload hybrid (JSON descriptor + banner payload zone) | **always, `.zst`** | no |
 | GC run | `blobTargetRunKey` | `CARN` blocks + footer | `cas_run` | Record stream | no | **yes** |
 | Part-manifest cleanup run | `partManifestCleanupKey` | `CARN` | — | **deleted** (sealed but never read) | — | — |
 | Fold seal | `foldSealKey` | proto (`CasGenerationSeal`) | `cas_fold_seal` | Control | no | **yes** |
-| GC state | `gcStateKey` | proto | `cas_gc_state` | Control | below threshold | no |
+| GC state | `gcStateKey` | proto | `cas_gc_state` | Control | never (always small) | no |
 | GC heartbeat | `gcHbKey` | 24-byte raw, unversioned | `cas_gc_hb` | Control | no | no |
-| GC outcomes | `outcomesKey` | proto | `cas_gc_outcomes` | Control | yes | no |
+| GC outcomes | `outcomesKey` | proto | `cas_gc_outcomes` | Control | **always, `.zst`** | no |
 | Owner anchor | `ownerKey` | proto | `cas_owner` | Control | no | no |
 | Server epoch | `epochKey` | proto | `cas_epoch` | Control | no | no |
 | Mount lease | `mountKey` | proto | `cas_mount_lease` | Control | no | no |
@@ -202,7 +211,7 @@ Eight steps, each independently green, each format cutting over atomically in on
 
 - Per-object JSON key mappings (field tables) under the naming policy.
 - Refsnaplog byte-budget values for JSON inflation.
-- Exact per-type caps and compression thresholds (constants next to `CasFormat` table).
+- Exact per-type caps (constants next to the `CasFormat` table).
 - README initial content (step 1 deliverable).
 - Soak measurement of the deterministic-run 2× cost; the re-binarize fallback triggers only on
   evidence.

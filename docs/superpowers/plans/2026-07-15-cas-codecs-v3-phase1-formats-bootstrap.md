@@ -15,7 +15,7 @@
 - **Error taxonomy:** malformed/truncated/over-cap/wrong-type/duplicate-key/whitespace → `CORRUPTED_DATA`; future `v` / unknown `!`-prefixed key → `UNKNOWN_FORMAT_VERSION`. No other codes on decode paths.
 - **Canonical text only:** readers accept no whitespace outside JSON strings (our writers emit none). Lines end with `\n`.
 - **JSON value conventions:** hashes/ids = lowercase fixed-width hex strings; unbounded `u64` = decimal strings; structurally bounded integers (counts, lengths, ms timestamps) = JSON numbers.
-- **zstd:** level 3, whole-object single frame, checksum flag ON, declared content size mandatory; compression threshold 4096 bytes; sniff by magic `28 B5 2F FD`.
+- **zstd (amended 2026-07-16):** level 3, whole-object single frame, checksum flag ON, declared content size mandatory. Policy is per-type and deterministic — `Never` / `Always` / `PinnedRaw`, NO size threshold. `Always` types (`cas_ref_log`, `cas_ref_snap`, `cas_part_manifest`, `cas_gc_outcomes`) are stored under a `.zst` key suffix and compressed regardless of size; the body magic (`28 B5 2F FD`) is validated against the policy, not sniffed as a free choice. Key builders take the suffix from `storedSuffix` (later phases).
 - **`v` stamping:** `writeHeaderLine` uses `currentCompatibilityVersion` (= `G_BUILD` = 3 today). The `G_BUILD` 3→4 bump is a **phase 2** decision (first persisted cutover), not phase 1.
 - **Naming:** JSON keys 2–5 chars; `type` strings `cas_<object>`.
 - **Build:** `ninja -C <build_dir> unit_tests_dbms` with output redirected to a log in the build dir (no `-j`, no `nproc`). Use an existing configured build dir (check `ls -d build*`; examples below use `build_debug` — substitute what exists).
@@ -181,7 +181,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 ```cpp
 enum class TextFamily : uint8_t { Control = 1, RecordStream = 2, PayloadHybrid = 3 };
 enum class KeyStrictness : uint8_t { Tolerant = 1, Strict = 2 };
-enum class CompressionPolicy : uint8_t { Never = 1, Optional = 2, PinnedRaw = 3 };
+enum class CompressionPolicy : uint8_t { Never = 1, Always = 2, PinnedRaw = 3 };
 struct FormatTraits
 {
     FormatId id;
@@ -194,6 +194,7 @@ struct FormatTraits
 };
 const FormatTraits & traitsFor(FormatId id);              /// LOGICAL_ERROR for Roster (reserved)
 const FormatTraits * traitsForType(std::string_view type); /// nullptr when unknown
+std::string_view storedSuffix(FormatId id);               /// ".zst" for Always, "" otherwise
 ```
 
 - [ ] **Step 1: Write the failing tests** (append to `gtest_cas_text_format.cpp`)
@@ -222,6 +223,14 @@ TEST(CasFormatTraits, CompleteUniqueAndGated)
     EXPECT_EQ(traitsFor(FormatId::RunFile).strictness, KeyStrictness::Strict);
     EXPECT_EQ(traitsFor(FormatId::FoldSeal).compression, CompressionPolicy::PinnedRaw);
     EXPECT_EQ(traitsFor(FormatId::FoldSeal).strictness, KeyStrictness::Strict);
+    /// .zst key suffix is exactly the Always set (can-grow-large types).
+    EXPECT_EQ(storedSuffix(FormatId::RefSnapshot), ".zst");
+    EXPECT_EQ(storedSuffix(FormatId::RefLog), ".zst");
+    EXPECT_EQ(storedSuffix(FormatId::PartManifest), ".zst");
+    EXPECT_EQ(storedSuffix(FormatId::GcOutcomes), ".zst");
+    EXPECT_EQ(storedSuffix(FormatId::PoolMeta), "");
+    EXPECT_EQ(storedSuffix(FormatId::FoldSeal), "");
+    EXPECT_EQ(storedSuffix(FormatId::RunFile), "");
 }
 ```
 
@@ -250,20 +259,23 @@ constexpr uint64_t kMiB = 1024 * 1024;
 
 /// Caps are 100-1000x above realistic sizes (hitting one = corrupt object or protocol bug).
 /// RefLog/RefSnapshot caps are provisional until phase 3 re-derives the byte budgets for JSON.
+/// Compression policy is per-type and deterministic (no size threshold): Always = the object can
+/// grow large and is stored under a `.zst` key suffix; PinnedRaw = deterministic byte-adoption
+/// formats; Never = always-small singletons, bare cat-able.
 constexpr FormatTraits TRAITS[] =
 {
     {FormatId::Blob,         "cas_blob",          TextFamily::PayloadHybrid, KeyStrictness::Tolerant, CompressionPolicy::Never,     256,        256},
     {FormatId::BlobMeta,     "cas_blob_meta",     TextFamily::Control,       KeyStrictness::Tolerant, CompressionPolicy::Never,     1 * kMiB,   64 * kKiB},
     {FormatId::PoolMeta,     "cas_pool_meta",     TextFamily::Control,       KeyStrictness::Tolerant, CompressionPolicy::Never,     1 * kMiB,   64 * kKiB},
-    {FormatId::RefLog,       "cas_ref_log",       TextFamily::Control,       KeyStrictness::Tolerant, CompressionPolicy::Optional,  64 * kMiB,  64 * kKiB},
-    {FormatId::RefSnapshot,  "cas_ref_snap",      TextFamily::Control,       KeyStrictness::Tolerant, CompressionPolicy::Optional,  64 * kMiB,  64 * kKiB},
-    {FormatId::Manifest,     "cas_ref_shard",     TextFamily::Control,       KeyStrictness::Tolerant, CompressionPolicy::Optional,  64 * kMiB,  64 * kKiB},
-    {FormatId::PartManifest, "cas_part_manifest", TextFamily::PayloadHybrid, KeyStrictness::Tolerant, CompressionPolicy::Optional,  256 * kMiB, 64 * kKiB},
+    {FormatId::RefLog,       "cas_ref_log",       TextFamily::Control,       KeyStrictness::Tolerant, CompressionPolicy::Always,    64 * kMiB,  64 * kKiB},
+    {FormatId::RefSnapshot,  "cas_ref_snap",      TextFamily::Control,       KeyStrictness::Tolerant, CompressionPolicy::Always,    64 * kMiB,  64 * kKiB},
+    {FormatId::Manifest,     "cas_ref_shard",     TextFamily::Control,       KeyStrictness::Tolerant, CompressionPolicy::Never,     64 * kMiB,  64 * kKiB},
+    {FormatId::PartManifest, "cas_part_manifest", TextFamily::PayloadHybrid, KeyStrictness::Tolerant, CompressionPolicy::Always,    256 * kMiB, 64 * kKiB},
     {FormatId::RunFile,      "cas_run",           TextFamily::RecordStream,  KeyStrictness::Strict,   CompressionPolicy::PinnedRaw, 0,          4 * kKiB},
     {FormatId::FoldSeal,     "cas_fold_seal",     TextFamily::Control,       KeyStrictness::Strict,   CompressionPolicy::PinnedRaw, 256 * kMiB, 64 * kKiB},
     {FormatId::GcState,      "cas_gc_state",      TextFamily::Control,       KeyStrictness::Tolerant, CompressionPolicy::Never,     1 * kMiB,   64 * kKiB},
     {FormatId::GcHeartbeat,  "cas_gc_hb",         TextFamily::Control,       KeyStrictness::Tolerant, CompressionPolicy::Never,     1 * kMiB,   64 * kKiB},
-    {FormatId::GcOutcomes,   "cas_gc_outcomes",   TextFamily::Control,       KeyStrictness::Tolerant, CompressionPolicy::Optional,  256 * kMiB, 64 * kKiB},
+    {FormatId::GcOutcomes,   "cas_gc_outcomes",   TextFamily::Control,       KeyStrictness::Tolerant, CompressionPolicy::Always,    256 * kMiB, 64 * kKiB},
     {FormatId::Owner,        "cas_owner",         TextFamily::Control,       KeyStrictness::Tolerant, CompressionPolicy::Never,     1 * kMiB,   64 * kKiB},
     {FormatId::ServerEpoch,  "cas_epoch",         TextFamily::Control,       KeyStrictness::Tolerant, CompressionPolicy::Never,     1 * kMiB,   64 * kKiB},
     {FormatId::MountLease,   "cas_mount_lease",   TextFamily::Control,       KeyStrictness::Tolerant, CompressionPolicy::Never,     1 * kMiB,   64 * kKiB},
@@ -284,6 +296,11 @@ const FormatTraits * traitsForType(std::string_view type)
         if (t.type == type)
             return &t;
     return nullptr;
+}
+
+std::string_view storedSuffix(FormatId id)
+{
+    return traitsFor(id).compression == CompressionPolicy::Always ? ".zst" : "";
 }
 ```
 
@@ -878,8 +895,9 @@ std::optional<TextHeader> sniffHeaderLine(std::string_view bytes)
 
 ```cpp
 bool looksZstd(std::string_view bytes);              /// magic 28 B5 2F FD
-String sealObject(FormatId id, String text);         /// policy-driven writer wrap
-String openObject(FormatId id, std::string_view stored); /// sniff, cap-before-alloc, decompress
+String sealObject(FormatId id, String text);         /// Always -> one zstd frame (any size); else identity
+String openObject(FormatId id, std::string_view stored); /// compressed body only legal on Always
+                                                          /// (cap-before-alloc); raw body always accepted
 ```
 
 - [ ] **Step 1: Failing tests** (append)
@@ -887,9 +905,12 @@ String openObject(FormatId id, std::string_view stored); /// sniff, cap-before-a
 ```cpp
 TEST(CasZstdArm, SealOpenPolicyAndCaps)
 {
-    /// Small Optional object stays raw; big one compresses; both open identically.
-    String small = "{\"type\":\"cas_ref_snap\",\"v\":3}\n{}\n";
-    EXPECT_EQ(sealObject(FormatId::RefSnapshot, small), small);
+    /// Always types compress regardless of size (no threshold — the .zst key must be
+    /// constructible without knowing the body); a raw body is still readable (repair path).
+    const String small = "{\"type\":\"cas_ref_snap\",\"v\":3}\n{}\n";
+    const String sealed_small = sealObject(FormatId::RefSnapshot, small);
+    ASSERT_TRUE(looksZstd(sealed_small));
+    EXPECT_EQ(openObject(FormatId::RefSnapshot, sealed_small), small);
     EXPECT_EQ(openObject(FormatId::RefSnapshot, small), small);
 
     String big = "{\"type\":\"cas_ref_snap\",\"v\":3}\n{\"pad\":\"";
@@ -900,9 +921,11 @@ TEST(CasZstdArm, SealOpenPolicyAndCaps)
     EXPECT_LT(sealed.size(), big.size());
     EXPECT_EQ(openObject(FormatId::RefSnapshot, sealed), big);
 
-    /// PinnedRaw formats never compress on write and reject compressed input on read.
+    /// Never and PinnedRaw formats never compress on write and reject compressed input on read.
     EXPECT_EQ(sealObject(FormatId::FoldSeal, big), big);
+    EXPECT_EQ(sealObject(FormatId::PoolMeta, big), big);
     expectCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { openObject(FormatId::FoldSeal, sealed); });
+    expectCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { openObject(FormatId::PoolMeta, sealed); });
 
     /// Declared content size over the cap fails BEFORE the output allocation: 65 MiB of text
     /// against RefSnapshot's 64 MiB cap (compresses to ~nothing, so the test is cheap on disk
@@ -933,13 +956,12 @@ bool looksZstd(std::string_view bytes)
 namespace
 {
 constexpr int kZstdLevel = 3;
-constexpr size_t kCompressThreshold = 4096;
 }
 
 String sealObject(FormatId id, String text)
 {
     const FormatTraits & t = traitsFor(id);
-    if (t.compression != CompressionPolicy::Optional || text.size() < kCompressThreshold)
+    if (t.compression != CompressionPolicy::Always)
         return text;
 
     ZSTD_CCtx * cctx = ZSTD_createCCtx();
@@ -963,7 +985,7 @@ String openObject(FormatId id, std::string_view stored)
     const FormatTraits & t = traitsFor(id);
     if (!looksZstd(stored))
         return String(stored);
-    if (t.compression != CompressionPolicy::Optional)
+    if (t.compression != CompressionPolicy::Always)
         throw Exception(ErrorCodes::CORRUPTED_DATA,
             "CAS {}: compressed object in a format whose policy is raw", t.type);
 
@@ -1206,9 +1228,10 @@ Expected: all PASS.
 # CAS persisted formats — the living registry
 
 Every persisted CAS object is a text file: header line `{"type":"cas_<object>","v":N}`, body
-(one JSON object / sorted NDJSON records / raw payload zone), optional `{"n":…}` trailer,
-optionally wrapped in ONE zstd frame (sniff by magic; checksum on; declared content size checked
-against the cap before allocation). `CasTextFormat.{h,cpp}` is the only code that knows this
+(one JSON object / sorted NDJSON records / raw payload zone), optional `{"n":…}` trailer.
+Can-grow-large types are stored under a **`.zst` key suffix** and are ALWAYS one zstd frame
+(checksum on; declared content size checked against the cap before allocation); always-small and
+deterministic types are raw. `CasTextFormat.{h,cpp}` is the only code that knows this
 shape. Design: `docs/superpowers/specs/2026-07-15-cas-codecs-v3-design.md`; reference:
 `docs/superpowers/cas/codecs_proposal_v3.md`.
 

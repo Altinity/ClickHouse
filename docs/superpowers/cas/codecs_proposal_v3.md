@@ -98,12 +98,20 @@ trailer  {"n":...}-style JSON line where the body is line-structured (streams, m
   touching the body: `v > G_BUILD` → `UNKNOWN_FORMAT_VERSION`. There is no `writer_version` and no
   `format_version`; forensic provenance is carried by `ch` and `bld` where it matters (envelope).
   `currentCompatibilityVersion` and `changePoints` in `CasFormat.h` stay as the stamping machinery.
-- **Compression** is whole-object, single-frame `zstd`, sniffed by the standard zstd magic
-  (`28 B5 2F FD`): a CAS object begins either with `{` or with the zstd magic, nothing else.
-  The zstd frame checksum (XXH64) is **enabled**, and the frame's declared content size is
-  mandatory — the reader checks it against the per-type cap **before** decompressing
-  (decompression-bomb guard, cap-before-alloc preserved from v2). Readers accept both arms
-  unconditionally; writing compressed is a per-type policy, and deterministic types are pinned raw.
+- **Compression** is whole-object, single-frame `zstd`, and the policy is **per type and
+  deterministic** (amended 2026-07-16): `Always` types are stored under a **`.zst` key suffix**
+  and compressed regardless of instance size; everything else is raw with no suffix. `Always` is
+  assigned by one rule — the object can grow large: `cas_ref_log`, `cas_ref_snap`,
+  `cas_part_manifest`, `cas_gc_outcomes`. Always-small types stay bare `cat`-able JSON, and the
+  deterministic types (`cas_run`, `cas_fold_seal`) stay raw despite their size — adoption compares
+  bytes, and compressed bytes are only as stable as the vendored zstd version. There is no size
+  threshold: a threshold would make the key a function of the body, breaking constructed-key
+  point-GETs (`manifestKey`, `refSnapshotKey`). The zstd frame checksum (XXH64) is **enabled**,
+  the declared content size is mandatory and checked against the per-type cap **before**
+  decompressing (cap-before-alloc), and the body magic is **validated against the policy** —
+  a compressed body in a raw type or vice versa is `CORRUPTED_DATA`, not a writer's choice.
+  A CAS object still begins either with `{` or with the zstd magic (`28 B5 2F FD`), nothing else,
+  and `.zst` is the standard extension every tool recognizes (`unzstd`, `zstdcat`).
 
 ### Families By Role {#families-by-role}
 
@@ -160,11 +168,11 @@ One JSON object per file. Example (heartbeat, formerly the 24-byte unversioned e
 
 - Tiny singletons (`cas_pool_meta`, `cas_gc_state`, `cas_gc_hb`, `cas_owner`, `cas_epoch`,
   `cas_mount_lease`, `cas_blob_meta`) are written and read whole; RTT dominates parse by orders of
-  magnitude, so text costs nothing measurable. They stay below the compression threshold and
-  remain bare `cat`-able JSON. `cas_blob_meta` is CAS-swapped — the token semantics of the
+  magnitude, so text costs nothing measurable. They are pinned raw (`Never`) and remain bare
+  `cat`-able JSON. `cas_blob_meta` is CAS-swapped — the token semantics of the
   dedup/resurrect gate are untouched by the encoding.
-- Bigger control objects (`cas_ref_snap` complete tables, removal-class `cas_ref_log`
-  transactions, `cas_gc_outcomes`) compress well and typically ship as one zstd frame;
+- Can-grow-large control objects (`cas_ref_snap` complete tables, `cas_ref_log` transactions,
+  `cas_gc_outcomes`) are `Always`-compressed under `.zst` keys;
   `zstdcat | jq` replaces `CasInspect`. The ref log — the commit point and the single most
   debugging-valuable object in the protocol — becomes a readable transaction list. The refsnaplog
   key↔body binding check (the decoded `ns`/`txn_id` must match the key the object was read from)
@@ -347,8 +355,9 @@ Exactly the objects that pass through `putDeterministicArtifact` (byte-compare a
 byte-deterministic: the **fold seal** and the **GC runs**. For them: pinned raw (never compressed),
 strict keys, fixed field order, sorted iteration — properties of our hand-rolled writers, enforced
 by golden tests, with no canonical-JSON machinery (no floats exist in any CAS object). Everything
-else (CAS-by-token or write-once-by-coordinate objects) is free to compress; golden tests for
-compressed formats assert decoded content plus a pinned-zstd byte snapshot, as in v2.
+else follows the per-type compression policy (`Always` under `.zst` keys for can-grow-large types,
+raw otherwise); golden tests for `Always` formats assert decoded content plus a pinned-zstd byte
+snapshot.
 
 ## Schema Evolution And Mixed-Version Mounts {#schema-evolution-and-mixed-version-mounts}
 
@@ -435,16 +444,16 @@ blob-meta sidecar was missing).
 |---|---|---|---|---|---|
 | Blob | `CABL` binary core 70 B + TLV | `cas_blob` | Payload hybrid | payload: none (structural) | JSON header line padded to 256; drop `hash_algo`, `domain_id`, `header_hash`, `writer_version`; TLV → `!`-keys |
 | Blob meta sidecar | fixed 22-byte binary | `cas_blob_meta` | Control | no (tiny) | one-line JSON; CAS/resurrect token semantics untouched |
-| Pool meta | `CAPM` proto | `cas_pool_meta` | Control | below threshold | JSON |
-| Ref log txn | custom binary, versioned, no magic | `cas_ref_log` | Control | optional | JSON; key↔body binding check stays; byte budgets re-derived |
-| Ref snapshot | custom binary | `cas_ref_snap` | Control | **yes** | JSON; the complete ref table becomes readable |
+| Pool meta | `CAPM` proto | `cas_pool_meta` | Control | no (always small) | JSON |
+| Ref log txn | custom binary, versioned, no magic | `cas_ref_log` | Control | **always, `.zst`** | JSON; key↔body binding check stays; byte budgets re-derived |
+| Ref snapshot | custom binary | `cas_ref_snap` | Control | **always, `.zst`** | JSON; the complete ref table becomes readable |
 | Ref cleanup marker | empty body | — | non-family | — | unchanged: key-only presence marker, documented in the registry |
-| Part manifest | `CAPT` hybrid (binary header + embedded `CARN`) | `cas_part_manifest` | Payload hybrid | yes | JSON descriptor + banner payload zone; embedded stream, `RunKind::ManifestEntries`, `payload_digest` deleted |
+| Part manifest | `CAPT` hybrid (binary header + embedded `CARN`) | `cas_part_manifest` | Payload hybrid | **always, `.zst`** | JSON descriptor + banner payload zone; embedded stream, `RunKind::ManifestEntries`, `payload_digest` deleted |
 | GC runs | `CARN` blocks + footer index | `cas_run` | Record stream | no — deterministic | sorted NDJSON + trailer; blocks/footer/`seek` deleted; seal checksum verified on every read |
-| GC state | `CAGT` proto | `cas_gc_state` | Control | below threshold | JSON |
+| GC state | `CAGT` proto | `cas_gc_state` | Control | no (always small) | JSON |
 | GC heartbeat | 24-byte raw, unversioned | `cas_gc_hb` | Control | no (tiny) | JSON; the exception dies |
 | Fold seal | proto (`CasGenerationSeal`) | `cas_fold_seal` | Control | **no — deterministic** | JSON, strict keys |
-| Outcome log | `CAGO` proto | `cas_gc_outcomes` | Control | yes | JSON |
+| Outcome log | `CAGO` proto | `cas_gc_outcomes` | Control | **always, `.zst`** | JSON |
 | Owner anchor | `CAOW` proto | `cas_owner` | Control | no (tiny) | JSON |
 | Server epoch | `CAEP` proto | `cas_epoch` | Control | no (tiny) | JSON |
 | Mount lease | `CAML` proto | `cas_mount_lease` | Control | no (tiny) | JSON |
@@ -583,11 +592,12 @@ Pre-release, single cutover per format, each step lands green on its own:
    `RunKind::ManifestEntries`.
 7. **Blob envelope** — JSON header line, pad verification, field drops; golden tests re-pinned;
    `blob_header_len` stays 256.
-8. **Finish** — compression on for `cas_ref_snap` / `cas_gc_outcomes` / `cas_part_manifest` per the
-   policy table (deterministic formats pinned raw, golden tests pin both arms); provider-metadata
-   mirror in the backend PUT path; protobuf build wiring removed; docs updated
+8. **Finish** — provider-metadata mirror in the backend PUT path (`Content-Type` per family,
+   `application/zstd` for `.zst` objects); protobuf build wiring removed; docs updated
    (`05-formats-and-backend.md` envelope + evolution sections, `codecs.md` retitled historical,
-   README finalized); `CasInspect` gutted or removed.
+   README finalized); `CasInspect` gutted or removed. (Compression needs no separate step: the
+   `.zst` suffix and the `Always` policy land with each format's own cutover, since the key
+   changes together with the body.)
 
 Steps 1–2 deliver the bulk of the value (readable control plane, uniform shape, protobuf mostly
 gone); 3–7 convert the rest and delete the exceptions; 8 is switch-flips and hygiene. Formats are
