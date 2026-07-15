@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasPoolMeta.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasPoolMetaFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestCodec.h>
@@ -335,11 +335,12 @@ TEST(CasPoolMeta, RoundTripAndReadability)
     pm.algos_used = {static_cast<uint8_t>(BlobHashAlgo::CityHash128)};
 
     const String encoded = encodePoolMeta(pm);
-    /// Pure protobuf (not JSON); the CAPM magic is the CasHeader.magic fixed32 field (little-endian,
-    /// so the 4 bytes read "CAPM"), carried INSIDE the message, not at byte 0.
+    /// v3 text form: a header line + one JSON body object, human-readable (jq/less friendly). No binary
+    /// magic; the object starts with '{' and names its type so a reader can identify it by eye.
     ASSERT_GE(encoded.size(), 8u);
-    EXPECT_NE(encoded.find(String("CAPM")), String::npos);
-    EXPECT_NE(encoded.front(), '{');
+    EXPECT_EQ(encoded.front(), '{');
+    EXPECT_NE(encoded.find(String("cas_pool_meta")), String::npos);
+    EXPECT_EQ(encoded.find(String("CAPM")), String::npos);
 
     PoolMeta decoded = decodePoolMeta(encoded);
     EXPECT_EQ(decoded.pool_id, pm.pool_id);

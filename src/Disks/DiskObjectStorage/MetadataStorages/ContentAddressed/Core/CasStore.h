@@ -6,7 +6,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEvent.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasPoolMeta.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasPoolMetaFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestCodec.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestId.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRefStateMachine.h>

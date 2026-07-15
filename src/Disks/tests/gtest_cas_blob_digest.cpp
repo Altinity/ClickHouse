@@ -17,7 +17,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcShardPlan.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasPoolMeta.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasPoolMetaFormat.h>
 #include "cas_test_helpers.h"
 
 #include <base/defines.h>

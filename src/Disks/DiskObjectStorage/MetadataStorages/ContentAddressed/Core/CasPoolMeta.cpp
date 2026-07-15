@@ -1,8 +1,6 @@
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasPoolMeta.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasCodecUtil.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasFormat.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
-#include <cas_format.pb.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasPoolMetaFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
 #include <Common/Exception.h>
 #include <Common/thread_local_rng.h>
 #include <algorithm>
@@ -12,59 +10,15 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
-    extern const int CORRUPTED_DATA;
     extern const int LOGICAL_ERROR;
-    extern const int UNKNOWN_FORMAT_VERSION;
 }
 }
 
 namespace DB::Cas
 {
 
-namespace Proto = ::clickhouse::cas::format;
-
 namespace
 {
-
-/// Pool-wide constant invariant over `blob_header_len`, enforced in two contexts with different
-/// error codes:
-///   - at creation, a bad value is the CALLER's config mistake => BAD_ARGUMENTS;
-///   - on decode, a persisted object violating it is corruption => CORRUPTED_DATA.
-/// `blob_header_len` must be 8-aligned and within [96, 16 KiB].
-void validateBlobHeaderLen(uint64_t blob_header_len, int error_code, std::string_view what)
-{
-    if (blob_header_len < 96)
-        throw Exception(error_code, "CAS {}: blob_header_len must be >= 96, got {}", what, blob_header_len);
-    if (blob_header_len % 8 != 0)
-        throw Exception(error_code, "CAS {}: blob_header_len must be a multiple of 8, got {}", what, blob_header_len);
-    if (blob_header_len > 16 * 1024)
-        throw Exception(error_code, "CAS {}: blob_header_len must be <= 16384, got {}", what, blob_header_len);
-}
-
-/// `algos_used` invariants (Phase 3 T4): non-empty, strictly increasing (implies no duplicates), and
-/// every entry a value `BlobHashAlgo` actually admits (`blobHashAlgoName` throws `BAD_ARGUMENTS` for
-/// anything else -- re-thrown here under the caller-selected `error_code` so a corrupt persisted value
-/// reports CORRUPTED_DATA rather than BAD_ARGUMENTS).
-void validateAlgosUsed(const std::vector<uint8_t> & algos_used, int error_code, std::string_view what)
-{
-    if (algos_used.empty())
-        throw Exception(error_code, "CAS {}: algos_used must be non-empty", what);
-    for (size_t i = 0; i < algos_used.size(); ++i)
-    {
-        try
-        {
-            blobHashAlgoName(static_cast<BlobHashAlgo>(algos_used[i]));
-        }
-        catch (const Exception &)
-        {
-            throw Exception(error_code, "CAS {}: algos_used contains an unknown algo {}", what, algos_used[i]);
-        }
-        if (i > 0 && algos_used[i] <= algos_used[i - 1])
-            throw Exception(error_code,
-                "CAS {}: algos_used must be strictly sorted with no duplicates, got {} at index {} not after {}",
-                what, algos_used[i], i, algos_used[i - 1]);
-    }
-}
 
 /// Two `thread_local_rng` u64 draws composed into a 128-bit id.
 UInt128 mintPoolId()
@@ -74,77 +28,6 @@ UInt128 mintPoolId()
     return (hi << 64) | lo;
 }
 
-}
-
-String encodePoolMeta(const PoolMeta & pm)
-{
-    Cas::Proto::PoolMetaProto msg;
-
-    /// Set CasHeader as field 1 (pure protobuf — no binary prefix).
-    auto * hdr = msg.mutable_header();
-    hdr->set_magic(magicFor(FormatId::PoolMeta));
-    hdr->set_writer_version(currentWriterVersion());
-    hdr->set_compatibility_version(currentCompatibilityVersion());
-
-    msg.set_pool_id(u128ToBytesBE(pm.pool_id));
-    msg.set_blob_header_len(pm.blob_header_len);
-    msg.set_min_reader_generation(pm.min_reader_generation);
-    for (uint8_t algo : pm.algos_used)
-        msg.add_algos_used(algo);
-
-    std::string out;
-    if (!msg.SerializeToString(&out))
-        throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS pool meta: protobuf serialization failed");
-    return out;
-}
-
-PoolMeta decodePoolMeta(std::string_view data)
-{
-    if (data.empty())
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS pool meta: empty object");
-
-    /// Parse the whole message directly (pure protobuf, no binary prefix).
-    Cas::Proto::PoolMetaProto msg;
-    if (!msg.ParseFromArray(data.data(), static_cast<int>(data.size())))
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS pool meta: protobuf parse failed");
-
-    /// Check magic then compatibility_version BEFORE reading any other fields.
-    if (msg.header().magic() != magicFor(FormatId::PoolMeta))
-        throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "CAS pool meta: bad magic (got 0x{:08x}, expected 0x{:08x})",
-            msg.header().magic(), magicFor(FormatId::PoolMeta));
-    checkCompatibility(msg.header().compatibility_version(), "pool meta");
-
-    PoolMeta pm;
-    pm.pool_id = u128FromBytesBE(msg.pool_id(), "pool meta pool_id");
-    pm.blob_header_len = msg.blob_header_len();
-    pm.min_reader_generation = msg.min_reader_generation();
-    pm.algos_used.assign(msg.algos_used().begin(), msg.algos_used().end());
-
-    /// A persisted object violating the constant invariant is corruption, not a config error.
-    validateBlobHeaderLen(pm.blob_header_len, ErrorCodes::CORRUPTED_DATA, "pool meta");
-    validateAlgosUsed(pm.algos_used, ErrorCodes::CORRUPTED_DATA, "pool meta");
-
-    /// Startup gate (forward): if min_reader_generation > G_BUILD, this binary is too old to open the pool.
-    if (G_BUILD < pm.min_reader_generation)
-        throw Exception(ErrorCodes::UNKNOWN_FORMAT_VERSION,
-            "CAS pool meta: pool requires reader generation {} but this build supports at most {}",
-            pm.min_reader_generation, G_BUILD);
-
-    /// Startup gate (backward, Task 12): the ref state changed INCOMPATIBLY from the mutable
-    /// pre-generation-3 ref-shard objects to immutable `_log`/`_snap` objects at generation
-    /// `kRefSnapshotLogGeneration`. A pool written by an older build stamps its pool-meta
-    /// `compatibility_version` below that generation and holds pre-generation-3 ref-shard-format refs
-    /// this build cannot read; fail closed rather than silently mis-recovering every table from a
-    /// fresh-looking empty ref prefix. CAS is pre-release (no data to migrate) -- the pool must be recreated.
-    if (msg.header().compatibility_version() < kRefSnapshotLogGeneration)
-        throw Exception(ErrorCodes::UNKNOWN_FORMAT_VERSION,
-            "CAS pool meta: pool was written with the removed pre-generation-3 mutable ref-shard format "
-            "(compatibility generation {}); this build reads only the snapshot+log ref format "
-            "(generation {}+). The pool is not openable; CAS is pre-release -- recreate it.",
-            msg.header().compatibility_version(), kRefSnapshotLogGeneration);
-
-    return pm;
 }
 
 namespace
@@ -230,7 +113,7 @@ PoolMeta PoolMeta::createOrValidate(
     BlobHashAlgo blob_hash_algo, bool allow_new)
 {
     /// The passed config is the caller's responsibility — reject bad values before any I/O.
-    validateBlobHeaderLen(blob_header_len, ErrorCodes::BAD_ARGUMENTS, "pool meta");
+    validatePoolBlobHeaderLen(blob_header_len, ErrorCodes::BAD_ARGUMENTS, "pool meta");
     /// Defense against a garbage `static_cast` past the caller's own boundary: `blobHashAlgoName`
     /// throws BAD_ARGUMENTS for anything `BlobHashAlgo` does not actually admit.
     blobHashAlgoName(blob_hash_algo);
