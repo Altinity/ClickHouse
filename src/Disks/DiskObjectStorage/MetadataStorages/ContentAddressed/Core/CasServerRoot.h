@@ -1,6 +1,7 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEvent.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasSingleWriterSlot.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasServerRootFormats.h>
 #include <Common/Exception.h>
 #include <base/types.h>
 #include <base/extended_types.h>
@@ -68,47 +69,10 @@ inline void validateServerRootId(const String & id)
     }
 }
 
-/// Phase 0 (mount safety) per-server-root control objects. Each is a pure-protobuf mutable object
-/// carrying a CasHeader (magic + checkCompatibility, UInt128 in big-endian 16-byte form). Decode
-/// fails closed with CORRUPTED_DATA on bad bytes.
-
-/// Owner anchor (`gc/server-roots/<srid>/owner`): binds the configured `server_root_id` to the
-/// server UUID that owns the subtree.
-struct OwnerObject
-{
-    UInt128 server_uuid{};
-};
-
-/// Writer-epoch fence (`gc/server-roots/<srid>/epoch`): the monotone next writer epoch to hand out.
-struct ServerEpoch
-{
-    uint64_t next_writer_epoch = 0;
-};
-
-/// Mount lease (`gc/server-roots/<srid>/mount`): the current live mount holder of the subtree.
-struct MountLease
-{
-    UInt128 server_uuid{};
-    uint64_t writer_epoch = 0;
-    String hostname;
-    uint64_t pid = 0;
-    uint64_t started_at_ms = 0;
-    uint64_t seq = 0;
-    uint64_t expires_at_ms = 0;
-    /// Merged heartbeat field: the per-server build-watermark floor rides the SAME object as the lease,
-    /// so one renewal PUT stamps both.
-    uint64_t min_active = 0;          /// oldest in-flight build_seq; UINT64_MAX = retired (farewell)
-    bool gc_fenced = false;           /// set ONLY by GC fence-out of an expired lease; terminal
-};
-
-String encodeOwner(const OwnerObject & o);
-OwnerObject decodeOwner(std::string_view data);
-
-String encodeServerEpoch(const ServerEpoch & e);
-ServerEpoch decodeServerEpoch(std::string_view data);
-
-String encodeMountLease(const MountLease & m);
-MountLease decodeMountLease(std::string_view data);
+/// The per-server-root control objects (owner / epoch / mount-lease) and their text codecs moved to
+/// Formats/CasServerRootFormats (codecs-v3 phase 2); this header includes that one so the protocol
+/// logic below (claimOwnerOrThrow / allocateWriterEpoch / claimMount / MountLeaseKeeper) keeps
+/// referring to OwnerObject / ServerEpoch / MountLease / encode* / decode* unchanged.
 
 class Backend;
 class Layout;

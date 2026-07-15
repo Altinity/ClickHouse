@@ -1,0 +1,160 @@
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasServerRootFormats.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasTextFormat.h>
+#include <Common/Exception.h>
+#include <IO/ReadBufferFromMemory.h>
+#include <IO/WriteBufferFromString.h>
+#include <IO/WriteHelpers.h>
+
+namespace DB
+{
+namespace ErrorCodes
+{
+    extern const int CORRUPTED_DATA;
+}
+}
+
+namespace DB::Cas
+{
+
+namespace
+{
+
+/// Read the single body line of a control singleton (fail-closed on a missing/oversized line).
+String readBodyLine(ReadBuffer & in, FormatId id, std::string_view what)
+{
+    return readLine(in, traitsFor(id).line_cap, what);
+}
+
+}
+
+String encodeOwner(const OwnerObject & o)
+{
+    WriteBufferFromOwnString out;
+    writeHeaderLine(out, FormatId::Owner);
+    bool first = true;
+    writeKey(out, "su", first);
+    writeHex128Value(out, o.server_uuid);
+    closeObject(out, first);
+    writeChar('\n', out);
+    out.finalize();
+    return out.str();
+}
+
+OwnerObject decodeOwner(std::string_view data)
+{
+    ReadBufferFromMemory in(data.data(), data.size());
+    expectHeaderLine(in, FormatId::Owner);
+    const String body = readBodyLine(in, FormatId::Owner, "owner");
+    ReadBufferFromMemory body_in(body.data(), body.size());
+    JsonObjectReader r(body_in, KeyStrictness::Tolerant, "owner");
+
+    OwnerObject o;
+    bool saw = false;
+    String key;
+    while (r.nextKey(key))
+    {
+        if (key == "su")
+        {
+            o.server_uuid = r.readHex128();
+            saw = true;
+        }
+        else
+            r.skipUnknown(key);
+    }
+    if (!saw)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS owner: missing su");
+    if (!body_in.eof() || !in.eof())
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS owner: trailing bytes");
+    return o;
+}
+
+String encodeServerEpoch(const ServerEpoch & e)
+{
+    WriteBufferFromOwnString out;
+    writeHeaderLine(out, FormatId::ServerEpoch);
+    bool first = true;
+    writeKey(out, "nwe", first);
+    writeU64StringValue(out, e.next_writer_epoch);
+    closeObject(out, first);
+    writeChar('\n', out);
+    out.finalize();
+    return out.str();
+}
+
+ServerEpoch decodeServerEpoch(std::string_view data)
+{
+    ReadBufferFromMemory in(data.data(), data.size());
+    expectHeaderLine(in, FormatId::ServerEpoch);
+    const String body = readBodyLine(in, FormatId::ServerEpoch, "server-epoch");
+    ReadBufferFromMemory body_in(body.data(), body.size());
+    JsonObjectReader r(body_in, KeyStrictness::Tolerant, "server-epoch");
+
+    ServerEpoch e;
+    bool saw = false;
+    String key;
+    while (r.nextKey(key))
+    {
+        if (key == "nwe")
+        {
+            e.next_writer_epoch = r.readU64String();
+            saw = true;
+        }
+        else
+            r.skipUnknown(key);
+    }
+    if (!saw)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS server-epoch: missing nwe");
+    if (!body_in.eof() || !in.eof())
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS server-epoch: trailing bytes");
+    return e;
+}
+
+String encodeMountLease(const MountLease & m)
+{
+    WriteBufferFromOwnString out;
+    writeHeaderLine(out, FormatId::MountLease);
+    bool first = true;
+    writeKey(out, "su", first);  writeHex128Value(out, m.server_uuid);
+    writeKey(out, "we", first);  writeU64StringValue(out, m.writer_epoch);
+    writeKey(out, "hn", first);  writeStringValue(out, m.hostname);
+    writeKey(out, "pid", first); writeIntText(m.pid, out);
+    writeKey(out, "sat", first); writeIntText(m.started_at_ms, out);
+    writeKey(out, "seq", first); writeU64StringValue(out, m.seq);
+    writeKey(out, "eat", first); writeIntText(m.expires_at_ms, out);
+    writeKey(out, "ma", first);  writeU64StringValue(out, m.min_active);
+    writeKey(out, "fen", first); writeBoolValue(out, m.gc_fenced);
+    closeObject(out, first);
+    writeChar('\n', out);
+    out.finalize();
+    return out.str();
+}
+
+MountLease decodeMountLease(std::string_view data)
+{
+    ReadBufferFromMemory in(data.data(), data.size());
+    expectHeaderLine(in, FormatId::MountLease);
+    const String body = readBodyLine(in, FormatId::MountLease, "mount-lease");
+    ReadBufferFromMemory body_in(body.data(), body.size());
+    JsonObjectReader r(body_in, KeyStrictness::Tolerant, "mount-lease");
+
+    MountLease m;
+    String key;
+    while (r.nextKey(key))
+    {
+        if (key == "su") m.server_uuid = r.readHex128();
+        else if (key == "we") m.writer_epoch = r.readU64String();
+        else if (key == "hn") m.hostname = r.readString();
+        else if (key == "pid") m.pid = r.readU64Number();
+        else if (key == "sat") m.started_at_ms = r.readU64Number();
+        else if (key == "seq") m.seq = r.readU64String();
+        else if (key == "eat") m.expires_at_ms = r.readU64Number();
+        else if (key == "ma") m.min_active = r.readU64String();
+        else if (key == "fen") m.gc_fenced = r.readBool();
+        else r.skipUnknown(key);
+    }
+    if (!body_in.eof() || !in.eof())
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS mount-lease: trailing bytes");
+    return m;
+}
+
+}
