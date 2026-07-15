@@ -518,3 +518,68 @@ TEST(CasDecommission, ManifestDebrisFailureKeepsSlotThenResumes)
     EXPECT_FALSE(backend->head(debris_key).exists);
     EXPECT_FALSE(backend->get("p/gc/server-roots/victim/mount").has_value());
 }
+
+/// Task 5 (Task-1 carry-forward, escalated by review): mid-retirement crash-safety RELIES on
+/// `openForDecommission`'s owner-anchor-absent + mount-lease-present fallback ("partial hand-cleanup:
+/// adopt from the lease", `CasStore.cpp`) -- the slot-retirement loop (Task 4) deletes
+/// `epochKey`/`ownerKey`/`mountKey` in that exact order, so a crash between the second and third delete
+/// leaves precisely this byte-state (owner anchor gone, mount lease still present). No prior test
+/// exercised this recovery path, even though it is load-bearing for every fail-and-resume scenario the
+/// drain-phase tests already cover -- those all crash EARLIER (mid-drain, warnings non-empty, slot
+/// retirement never even starts), never mid-retirement itself.
+///
+/// `claimOwnerOrThrow` (`CasServerRoot.cpp`) gates the owner-absent path a SECOND, stricter way: it
+/// only re-claims over a PROVABLY EMPTY data subtree (`serverRootSubtreeEmpty`: `cas/refs/<srid>/`,
+/// `cas/manifests/<srid>/`, `roots/<srid>/` all empty) -- an absent owner over EXISTING data means the
+/// identity was lost and must never be silently re-claimed. A victim with a real table trips this (its
+/// `cas/refs/victim/...` ref-log/snapshot debris is NEVER physically deleted by decommission itself --
+/// only GC's own later namespace-cleanup reclaims it -- so the subtree stays non-empty right after a
+/// real drain). This test therefore uses a victim with NO namespaces at all: identity persisted
+/// (mount/owner/epoch exist from a real graceful close), data subtree genuinely empty -- the exact
+/// precondition the fallback is designed for. Simulate the crash directly: claim the slot once (exactly
+/// `decommissionPoolMember`'s own first step), let it close gracefully (the mount-lease keeper's
+/// farewell stamp, same as a real `admin.reset()`), then manually strike `epochKey`+`ownerKey`, leaving
+/// `mountKey`. A `decommissionPoolMember` re-run must resolve identity via the mount-lease fallback and
+/// finish retiring the slot; a further re-run then sees no anchor at all and is refused as unknown.
+TEST(CasDecommission, MidRetirementCrashResumesViaMountLeaseFallback)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    { auto victim = openVictim(backend); }   /// identity only -- no namespace, so the subtree stays empty
+
+    const Layout layout("p");
+    /// Claim the slot once, exactly as `decommissionPoolMember`'s own first step would -- this (re)writes
+    /// fresh epoch/owner/mount control objects. Closing gracefully (scope exit) stamps the mount lease's
+    /// farewell, matching what a real slot retirement's `admin.reset()` does right before its delete loop.
+    {
+        auto admin = Store::openForDecommission(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "chk"}, "victim");
+    }
+
+    /// Manually strike epoch + owner, leaving the mount -- the exact aftermath of a crash between
+    /// slot-retirement's second and third delete (`CasDecommission.cpp`'s `slot_keys` order: epoch,
+    /// owner, mount).
+    for (const String & key : {layout.epochKey("victim"), layout.ownerKey("victim")})
+    {
+        const auto head = backend->head(key);
+        ASSERT_TRUE(head.exists);
+        backend->deleteExact(key, head.token);
+    }
+    ASSERT_FALSE(backend->get(layout.epochKey("victim")).has_value());
+    ASSERT_FALSE(backend->get(layout.ownerKey("victim")).has_value());
+    ASSERT_TRUE(backend->get(layout.mountKey("victim")).has_value())
+        << "the mount lease must survive -- it is the resume anchor the fallback reads";
+
+    const auto report = decommissionPoolMember(
+        backend, PoolConfig{.pool_prefix = "p", .server_root_id = "a2"}, "victim");
+
+    EXPECT_TRUE(report.warnings.empty());
+    EXPECT_EQ(report.namespaces_removed, 0u);
+    EXPECT_TRUE(report.slot_removed);
+    EXPECT_FALSE(backend->get(layout.epochKey("victim")).has_value());
+    EXPECT_FALSE(backend->get(layout.ownerKey("victim")).has_value());
+    EXPECT_FALSE(backend->get(layout.mountKey("victim")).has_value());
+
+    expectThrowsCode(ErrorCodes::BAD_ARGUMENTS, [&]
+    {
+        decommissionPoolMember(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "a3"}, "victim");
+    });
+}
