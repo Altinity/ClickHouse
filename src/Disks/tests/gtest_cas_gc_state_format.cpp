@@ -1,0 +1,108 @@
+#include "cas_format_test_battery.h"
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasGcStateFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
+
+using namespace DB::Cas;
+
+namespace DB::ErrorCodes { extern const int CORRUPTED_DATA; }
+
+TEST(CasFormatBattery, GcState)
+{
+    GcState s;
+    s.round = 4;
+    s.gc_shards = 1;
+    s.snap_generation = 9;
+    s.snap_pruned_through = 7;
+    s.snap_attempt = 3;
+    s.manifest_sweep_cursor = "";
+    s.lease = GcLease{UInt128(1), 12};
+    runFormatBattery({FormatId::GcState,
+        [&] { return sealObject(FormatId::GcState, encodeGcState(s)); },
+        [](std::string_view d) { decodeGcState(std::string(openObject(FormatId::GcState, d))); },
+        "{\"type\":\"cas_gc_state\",\"v\":3}\n"
+        "{\"rnd\":\"4\",\"gcs\":1,\"sg\":\"9\",\"spt\":\"7\",\"sa\":\"3\",\"msc\":\"\","
+        "\"lo\":\"00000000000000000000000000000001\",\"ls\":\"12\"}\n"});
+}
+
+TEST(CasFormatBattery, GcHeartbeat)
+{
+    GcHeartbeat hb{UInt128(1), 1741};
+    runFormatBattery({FormatId::GcHeartbeat,
+        [&] { return sealObject(FormatId::GcHeartbeat, encodeGcHeartbeat(hb)); },
+        [](std::string_view d) { decodeGcHeartbeat(std::string(openObject(FormatId::GcHeartbeat, d))); },
+        "{\"type\":\"cas_gc_hb\",\"v\":3}\n"
+        "{\"by\":\"00000000000000000000000000000001\",\"seq\":\"1741\"}\n"});
+}
+
+/// ---------- field round-trips (migrated from gtest_cas_gc_formats.cpp, re-pointed at the text codec) ----------
+
+TEST(CasGcStateFormat, RoundTripsCoreFields)
+{
+    GcState s;
+    s.round = 7;
+    s.gc_shards = 1;
+    s.snap_generation = 12;
+    s.lease.owner = hexToU128("00000000000000000000000000000005");
+    s.lease.seq = 5;
+    auto d = decodeGcState(encodeGcState(s));
+    EXPECT_EQ(d.round, 7u);
+    EXPECT_EQ(d.gc_shards, 1u);
+    EXPECT_EQ(d.snap_generation, 12u);
+    EXPECT_EQ(d.lease.owner, hexToU128("00000000000000000000000000000005"));
+    EXPECT_EQ(d.lease.seq, 5u);
+}
+
+TEST(CasGcStateFormat, SnapPrunedThroughAndAttemptAndCursorRoundTrip)
+{
+    GcState s;
+    s.gc_shards = 2;
+    s.snap_generation = 42;
+    s.snap_pruned_through = 38;
+    s.snap_attempt = 7;
+    s.manifest_sweep_cursor = "p/cas/manifests/server/store/abc/table@cas@/writer/42/aa/id";
+    auto d = decodeGcState(encodeGcState(s));
+    EXPECT_EQ(d.snap_pruned_through, 38u);
+    EXPECT_EQ(d.snap_attempt, 7u);
+    EXPECT_EQ(d.manifest_sweep_cursor, s.manifest_sweep_cursor);
+}
+
+TEST(CasGcStateFormat, DefaultsRoundTrip)
+{
+    GcState s;   /// gc_shards defaults to 1
+    EXPECT_EQ(s.gc_shards, 1u);
+    auto d = decodeGcState(encodeGcState(s));
+    EXPECT_EQ(d.round, 0u);
+    EXPECT_EQ(d.snap_attempt, 0u);
+    EXPECT_TRUE(d.manifest_sweep_cursor.empty());
+    EXPECT_EQ(d.lease.owner, UInt128{});
+}
+
+TEST(CasGcStateFormat, RejectsZeroGcShards)
+{
+    const String bad = "{\"type\":\"cas_gc_state\",\"v\":3}\n"
+                       "{\"rnd\":\"0\",\"gcs\":0,\"sg\":\"0\",\"spt\":\"0\",\"sa\":\"0\",\"msc\":\"\","
+                       "\"lo\":\"00000000000000000000000000000000\",\"ls\":\"0\"}\n";
+    EXPECT_THROW(decodeGcState(bad), DB::Exception);
+}
+
+TEST(CasGcStateFormat, GarbageFailsClosed)
+{
+    EXPECT_THROW(decodeGcState(String("")), DB::Exception);
+    EXPECT_THROW(decodeGcState(String("not a cas object\n")), DB::Exception);
+}
+
+TEST(CasGcHeartbeatFormat, RoundTripAndBoundaries)
+{
+    GcHeartbeat hb;
+    hb.owner = hexToU128("0123456789abcdeffedcba9876543210");
+    hb.hb_seq = 12345;
+    GcHeartbeat d = decodeGcHeartbeat(encodeGcHeartbeat(hb));
+    EXPECT_EQ(d.owner, hb.owner);
+    EXPECT_EQ(d.hb_seq, 12345u);
+
+    GcHeartbeat z;
+    z.owner = hexToU128("ffffffffffffffffffffffffffffffff");
+    z.hb_seq = 0;
+    EXPECT_EQ(decodeGcHeartbeat(encodeGcHeartbeat(z)).owner, z.owner);
+    EXPECT_THROW(decodeGcHeartbeat(String("short")), DB::Exception);
+}

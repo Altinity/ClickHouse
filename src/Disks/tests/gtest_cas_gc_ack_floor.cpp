@@ -5,6 +5,7 @@
 #include <vector>
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEvent.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFsck.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.h>

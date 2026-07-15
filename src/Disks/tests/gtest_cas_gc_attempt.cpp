@@ -2,7 +2,7 @@
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFsck.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcFormats.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasGcStateFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include "cas_test_helpers.h"
 

@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartPathParser.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobInDegree.h>
 
 /// M-W wiring tier (design 2026-06-11 section 7 tier 3): the ClickHouse-facing translation layer
 /// tested through its own seams. Task 1: PartPathParser — the path-classification rows ported from

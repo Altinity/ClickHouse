@@ -2,8 +2,8 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobDigest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobRef.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcFormats.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGenerationSeal.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEnvelope.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasFoldSealFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestId.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRunFile.h>
@@ -16,6 +16,28 @@
 
 namespace DB::Cas
 {
+
+/// One condemned object. `condemn_round` is the round that condemned the incarnation, used by GC's
+/// round-paced graduation gate. IN-MEMORY ONLY (retired-in-snapshot 2026-07-10): the durable `RetiredSet`
+/// object family is gone; this struct lives solely as the element type of `RetiredMergeResult` (below),
+/// populated from the `kCondemned` rows decoded out of the source-edge runs. (Relocated here from the
+/// deleted CasGcFormats.h in the codecs-v3 phase-2 cutover — it has no wire codec, so it did not move
+/// to Formats/.)
+struct RetiredEntry
+{
+    ObjectKind kind = ObjectKind::Blob;
+    BlobRef ref{};
+    Token token;          /// the exact incarnation token GC observed (exact-token delete)
+    uint64_t size = 0;
+    uint64_t condemn_round = 0;   /// the GC round that condemned this incarnation (round-paced
+                                  /// graduation: an entry graduates only once condemn_round < the
+                                  /// current round). Consulted by GC only; the writer never reads it.
+    bool delete_pending = false;  /// two-phase graduation (spec Task-9 amendment): floor-passed and
+                                  /// published for deletion; the NEXT pass executes the exact-token
+                                  /// delete (pre-CAS, safe at any leader staleness) and drops the entry.
+                                  /// Terminal: a pending entry is never un-pended (writers keep seeing
+                                  /// it condemned and recreate).
+};
 
 /// Sealed source-edge run row tags (spec §2.1). `kEdgeActive`/`kZeroMarker` were promoted from a
 /// `.cpp`-local anonymous namespace: `kCondemned` (the retired-in-snapshot row, Task 2) needs to
