@@ -1,8 +1,15 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFsck.h>
 #include <Disks/tests/cas_test_helpers.h>
+#include <Common/ProfileEvents.h>
 #include <filesystem>
+
+namespace ProfileEvents
+{
+extern const Event CasRefRepoint;
+}
 
 /// B151: CA publish-at-rename lock-scope tests.
 /// Proves that a freshly-written part's FINAL manifest ref is published at the lock-free
@@ -145,4 +152,42 @@ TEST(CaTransactionInlining, EagerFileInlinedDataBinBlobbed)
 
     /// And the inlined file is still readable through the normal read path.
     EXPECT_EQ(storage->getFileSize("uui/uuid-9/all_1_1_0/checksums.txt"), 13u);
+}
+
+/// all-tree-part-files Task 4 (spec 2026-07-14-cas-all-tree-part-files-design.md §4): a standalone
+/// write of ONE file onto an ALREADY-COMMITTED part must carry every other file of that part forward
+/// (a repoint, Task 3), never replace the manifest with just the touched file.
+TEST(CaTransactionRepoint, StandaloneWriteOnCommittedPartRepoints)
+{
+    auto storage = openTxStorage();
+
+    /// 1. Write a part (checksums.txt inline + data.bin blob) through a normal transaction; commit.
+    {
+        auto tx = storage->createTransaction();
+        writeFileTx(*tx, "uui/uuid-repoint/tmp_insert_all_1_1_0/checksums.txt", "old-checksums");
+        writeFileTx(*tx, "uui/uuid-repoint/tmp_insert_all_1_1_0/data.bin", "the-data-bytes");
+        tx->moveDirectory("uui/uuid-repoint/tmp_insert_all_1_1_0", "uui/uuid-repoint/all_1_1_0");
+        tx->commit(DB::NoCommitOptions{});
+    }
+    ASSERT_TRUE(storage->existsFile("uui/uuid-repoint/all_1_1_0/checksums.txt"));
+    ASSERT_TRUE(storage->existsFile("uui/uuid-repoint/all_1_1_0/data.bin"));
+
+    const uint64_t repoints_before = ProfileEvents::global_counters[ProfileEvents::CasRefRepoint].load();
+
+    /// 2. New transaction: standalone write of checksums.txt onto the ALREADY-COMMITTED part.
+    {
+        auto tx = storage->createTransaction();
+        writeFileTx(*tx, "uui/uuid-repoint/all_1_1_0/checksums.txt", "new-checksums-longer");
+        tx->commit(DB::NoCommitOptions{});
+    }
+
+    /// 3. The new content is served, the untouched file is carried forward unchanged, exactly one
+    /// repoint fired, and an independent fsck reachability walk finds nothing dangling.
+    EXPECT_EQ(storage->getFileSize("uui/uuid-repoint/all_1_1_0/checksums.txt"), 20u);
+    EXPECT_EQ(storage->getFileSize("uui/uuid-repoint/all_1_1_0/data.bin"), 14u)
+        << "carry-forward: the untouched file must survive a standalone write on the same part";
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasRefRepoint].load(), repoints_before + 1);
+
+    const auto rep = DB::Cas::runFsck(*storage->store(), /*detail*/false);
+    EXPECT_EQ(rep.dangling, 0u);
 }

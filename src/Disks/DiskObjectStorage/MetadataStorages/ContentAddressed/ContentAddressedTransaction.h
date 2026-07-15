@@ -140,6 +140,21 @@ private:
 
     void cleanupPendingTempFiles() noexcept;   /// B188: remove all parts' pending temp files (commit/abort/dtor)
 
+    /// B189/Task 4: upload every pending blob of `st` whose hash is still referenced by `st.entries`
+    /// (an orphaned pending blob -- its entry removed by unlinkFile/replaceFile -- is skipped; its
+    /// temp file is still cleaned by cleanupPendingTempFiles at commit end) through `st.build`.
+    /// Shared by `publishStaging`'s normal path and its committed-ref repoint branch.
+    void uploadPendingBlobs(PartStaging & st);
+
+    /// Apply `st.mutable_files`/`st.mutable_removed` onto the COMMITTED ref's payload (no-op if both
+    /// empty). Shared by the mutable-only staging branch and the committed-ref repoint branch: a
+    /// repoint republishes `entries` but never touches `mutable_files` itself (`repointRef`, Task 3,
+    /// intentionally carries no mutable-payload parameter -- the all-tree-part-files migration this
+    /// plan implements is moving every mutable per-part file INTO entries; until Task 6 flips
+    /// `isMutablePerPartFile`, a standalone write can still legitimately arrive bundled with a
+    /// mutable_files delta in the SAME transaction, which must not be silently dropped).
+    void publishMutableFilesDelta(const Cas::RootNamespace & ns, const std::string & ref, PartStaging & st);
+
     /// B190 Task 4: unified adopt helper that collapses the 6 inline pending/uploaded dispatch
     /// blocks in createHardLink / moveFile (cross-part) / moveDirectory (two-build merge).
     ///

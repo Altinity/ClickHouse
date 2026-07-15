@@ -230,47 +230,8 @@ ContentAddressedTransaction::routeOf(const std::string & path) const
     return metadata_storage.route(*p);
 }
 
-bool ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, const std::string & ref, PartStaging & st)
+void ContentAddressedTransaction::uploadPendingBlobs(PartStaging & st)
 {
-    if (st.published)
-        return false;   /// already durable (published at the lock-free rename) — never re-publish
-
-    if (!st.build && st.entries.empty())
-    {
-        /// Mutable-only staging: the MVCC layer's autocommit one-shots (txn_version.txt
-        /// fill-in/rewrite) and metadata_version bumps on a COMMITTED part.
-        if (!st.mutable_files.empty() || !st.mutable_removed.empty())
-        {
-            metadata_storage.partAccess().updateMutableFiles({ns, ref}, [&](Cas::RefMutableFilesUpdate & payload)
-            {
-                for (const auto & [name, bytes] : st.mutable_files)
-                    payload.mutable_files[name] = bytes;
-                for (const auto & name : st.mutable_removed)
-                    payload.mutable_files.erase(name);
-            });
-        }
-        st.published = true;
-        return false;   /// updateRefPayload mutates an existing ref — never a new ref to roll back
-    }
-
-    if (!st.build)
-        throw Exception(ErrorCodes::LOGICAL_ERROR,
-            "ContentAddressedTransaction: staged entries for {}/{} without a Build", ns.string(), ref);
-
-    /// Write path (rev. 15): stage the part manifest body (mints a ManifestId), precommitAdd a
-    /// build-intent owner (closure now protected by reachability), upload the pending blobs, then
-    /// promote — an atomic owner move that revalidates every non-tokened blob fail-closed.
-    ///
-    /// ORDERING IS LOAD-BEARING (EDGE-BEFORE-OBSERVE, spec 2026-07-09-cas-writer-gc-simplification):
-    /// precommitAdd's durable closure names EVERY blob hash BEFORE putBlob makes the first backend
-    /// observation. This is what lets promote skip re-validating tokened leaves (a condemnation in the
-    /// putBlob→promote window cannot graduate — the next fold sees the edge). Moving putBlob before
-    /// precommitAdd would adopt an incarnation with no protecting edge (the pre-B188 dangle shape) and
-    /// trips the EDGE-BEFORE-OBSERVE fail-closed throw in Build::observeAndAdmit; the TLA+ order
-    /// sabotage (Gate A) is the formal guard.
-    const Cas::ManifestId id = st.build->stageManifest(st.entries);
-    st.build->precommitAdd(ns, ref, id);
-
     /// B189: build the set of blob hashes actually referenced by the staged manifest. Only Blob
     /// entries represent pending content uploads — Inline are not pending blobs. A pending_blob whose
     /// hash is NOT in this set had its entry removed by unlinkFile/replaceFile and must not be uploaded
@@ -310,6 +271,106 @@ bool ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
         }
         st.build->putBlob(pb.ref, std::move(source));
     }
+}
+
+void ContentAddressedTransaction::publishMutableFilesDelta(const Cas::RootNamespace & ns, const std::string & ref, PartStaging & st)
+{
+    if (st.mutable_files.empty() && st.mutable_removed.empty())
+        return;
+    metadata_storage.partAccess().updateMutableFiles({ns, ref}, [&](Cas::RefMutableFilesUpdate & payload)
+    {
+        for (const auto & [name, bytes] : st.mutable_files)
+            payload.mutable_files[name] = bytes;
+        for (const auto & name : st.mutable_removed)
+            payload.mutable_files.erase(name);
+    });
+}
+
+bool ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, const std::string & ref, PartStaging & st)
+{
+    if (st.published)
+        return false;   /// already durable (published at the lock-free rename) — never re-publish
+
+    if (!st.build && st.entries.empty())
+    {
+        /// Mutable-only staging: the MVCC layer's autocommit one-shots (txn_version.txt
+        /// fill-in/rewrite) and metadata_version bumps on a COMMITTED part.
+        publishMutableFilesDelta(ns, ref, st);
+        st.published = true;
+        return false;   /// updateRefPayload mutates an existing ref — never a new ref to roll back
+    }
+
+    /// Committed-ref standalone writes (all-tree-part-files Task 4, spec 2026-07-14-cas-all-tree-
+    /// part-files-design.md §4): `st.entries` here holds only the CHANGED/ADDED entries (see
+    /// stageBlobPartFile / the inline writeFile path) — never the whole part once the ref already
+    /// exists. Carry every OTHER committed entry forward and republish once via the repoint path
+    /// (Task 3), rather than letting the Build path below replace the manifest with just the delta
+    /// (which Task 2's promote guard would now reject with ABORTED for a genuine content change, or
+    /// silently drop the untouched files for a pre-Task-2 build). Handles both sub-cases the
+    /// interface allows: entries staged WITH a Build (this transaction uploaded new content) and,
+    /// forward-looking to Task 5/6, WITHOUT one (an entry staged some other way — e.g. a former
+    /// mutable per-part file once it becomes an ordinary tree entry).
+    if (!st.entries.empty())
+    {
+        if (auto view = metadata_storage.partAccess().getView({ns, ref}, ContentAddressed::Freshness::ForceFresh))
+        {
+            if (st.build)
+            {
+                /// EDGE-BEFORE-OBSERVE (spec 2026-07-09-cas-writer-gc-simplification) is still load-
+                /// bearing here: a fresh blob's hash must be durably NAMED by a live precommit's
+                /// manifest body before `putBlob` makes its first backend observation. `repointRef`
+                /// below promotes through its OWN internal build (`adoptEvidence`, no `putBlob`) — it
+                /// protects entries whose content ALREADY exists (the carried-forward ones, and this
+                /// transaction's uploads once they land), but cannot itself protect a brand-new upload
+                /// made mid-repoint. So THIS build stages+precommits a SCRATCH manifest over
+                /// `st.entries` (BEFORE it is merged/moved below) — exactly the same closure the normal
+                /// (non-repoint) path further down establishes with `st.build->stageManifest(st.entries)`
+                /// + `precommitAdd`, which already names every hash this transaction is about to upload
+                /// — purely to hold that edge across the upload loop. Once `repointRef`'s own promote
+                /// makes the real (merged) manifest live, this scratch precommit is abandoned; it never
+                /// gets promoted.
+                const Cas::ManifestId scratch_id = st.build->stageManifest(st.entries);
+                st.build->precommitAdd(ns, ref, scratch_id);
+                uploadPendingBlobs(st);
+            }
+
+            std::vector<Cas::ManifestEntry> merged;
+            for (const auto & e : view->manifest()->entries)
+                if (std::none_of(st.entries.begin(), st.entries.end(),
+                                 [&](const Cas::ManifestEntry & s) { return s.path == e.path; }))
+                    merged.push_back(e);
+            for (auto & s : st.entries)
+                merged.push_back(std::move(s));
+
+            metadata_storage.partAccess().repointRef({ns, ref}, std::move(merged), Cas::ProvenanceOp::Other);
+            if (st.build)
+                st.build->abandon();   /// scratch precommit's protecting job is done; the real manifest is live
+            /// `repointRef` republishes `entries` only -- carry any bundled mutable_files delta forward
+            /// as a separate (already-independently-durable, spec §Two-Level API) payload update.
+            publishMutableFilesDelta(ns, ref, st);
+            st.published = true;
+            return false;   /// a repoint never creates a new ref
+        }
+    }
+
+    if (!st.build)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "ContentAddressedTransaction: staged entries for {}/{} without a Build", ns.string(), ref);
+
+    /// Write path (rev. 15): stage the part manifest body (mints a ManifestId), precommitAdd a
+    /// build-intent owner (closure now protected by reachability), upload the pending blobs, then
+    /// promote — an atomic owner move that revalidates every non-tokened blob fail-closed.
+    ///
+    /// ORDERING IS LOAD-BEARING (EDGE-BEFORE-OBSERVE, spec 2026-07-09-cas-writer-gc-simplification):
+    /// precommitAdd's durable closure names EVERY blob hash BEFORE putBlob makes the first backend
+    /// observation. This is what lets promote skip re-validating tokened leaves (a condemnation in the
+    /// putBlob→promote window cannot graduate — the next fold sees the edge). Moving putBlob before
+    /// precommitAdd would adopt an incarnation with no protecting edge (the pre-B188 dangle shape) and
+    /// trips the EDGE-BEFORE-OBSERVE fail-closed throw in Build::observeAndAdmit; the TLA+ order
+    /// sabotage (Gate A) is the formal guard.
+    const Cas::ManifestId id = st.build->stageManifest(st.entries);
+    st.build->precommitAdd(ns, ref, id);
+    uploadPendingBlobs(st);
 
     const bool ref_existed = metadata_storage.partAccess().existsRef({ns, ref}, ContentAddressed::Freshness::ForceFresh);
     metadata_storage.partAccess().promoteBuild(*st.build, {ns, ref}, st.build->buildId(), id, st.mutable_files);
