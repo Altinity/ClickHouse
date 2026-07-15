@@ -922,7 +922,8 @@ void Build::promote(const RootNamespace & target_ns, const String & final_ref_na
     /// blocking the per-namespace batching queue; it is idempotent under a re-run (a retry sees its own
     /// fresh token). Accepted — Phase B replaces the heavy body-dance with a meta CAS anyway.
 
-    /// all-tree-part-files Task 2 (spec §4, TLA+ `WRepoint`): the manifest the ref currently commits,
+    /// all-tree-part-files Task 2 (spec §4/§7 corrected note -- WDropRef+WPromote composition): the
+    /// manifest the ref currently commits,
     /// when this promote is retiring it via an intended repoint (`allow_repoint`) rather than the
     /// ordinary first-time-commit path. Set inside the closure below; read after it returns to decide
     /// whether the `RefRepoint` audit event fires.
@@ -1006,8 +1007,9 @@ void Build::promote(const RootNamespace & target_ns, const String & final_ref_na
 
             /// BUG 1a: refuse to overwrite a live committed ref that already names a DIFFERENT manifest —
             /// that would orphan the old manifest (its owner-removal `-1` is never emitted) UNLESS the
-            /// caller opted into an intended repoint (`allow_repoint`, all-tree-part-files Task 2, TLA+
-            /// `WRepoint`) -- a standalone write/remove on an already-committed part. Without the flag
+            /// caller opted into an intended repoint (`allow_repoint`, all-tree-part-files Task 2; modeled
+            /// as the WDropRef+WPromote composition, spec §7 corrected note) -- a standalone
+            /// write/remove on an already-committed part. Without the flag
             /// this enforces the model's `RefFreeFor` guard (`WPromote` requires it) exactly as before. A
             /// re-promote of the SAME manifest_ref is idempotent and allowed regardless (the state
             /// machine's own promote precondition below would reject it as "precommit absent" anyway once
@@ -1035,7 +1037,11 @@ void Build::promote(const RootNamespace & target_ns, const String & final_ref_na
             /// binding in this SAME ref-log record -- a separate OwnerTransition (old=Committed(repoint_old),
             /// new=absent), since one RefOwnerBinding cannot carry both the retired-committed and the
             /// promoted-precommit manifests at once (CasRefLogCodec.h). Together with the transition op
-            /// below, this record's net effect is the TLA+ `WRepoint` one-event shape: ref moves directly
+            /// below, this record atomically composes two verified model shapes -- this removal is `WDropRef`'s
+            /// and the transition is `WPromote`'s; `applyRefLogTxn`'s whole-record scratch apply makes the
+            /// composition a sound refinement (no intra-record intermediate state is observable; spec §7
+            /// corrected note). NOT `WRepoint` -- that action requires an unowned destination, while this
+            /// trigger always promotes a live precommit. Ref still moves directly
             /// from the old manifest to the new one. Mirrors `publishCommittedTransition`'s old-removal
             /// shape (cas_test_helpers.h) minus the add-precommit step, which already landed earlier as
             /// this build's own `precommitAdd`.

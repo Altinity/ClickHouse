@@ -135,7 +135,8 @@ public:
     /// hazard the design calls out — "promote a precommit whose copy did not complete" — has no code
     /// path to occur through: promotion is not a recoverable/resumable operation, only a synchronous
     /// one that either completes within the writing process or never happens at all.
-    /// `allow_repoint` (all-tree-part-files Task 2, spec §4, TLA+ `WRepoint`): opts into an INTENDED
+    /// `allow_repoint` (all-tree-part-files Task 2, spec §4/§7; modeled as the atomic composition of
+    /// TLA+ `WDropRef` + `WPromote` -- see the corrected Phase-0 note in the spec): opts into an INTENDED
     /// repoint of a committed ref that already names a DIFFERENT manifest -- a standalone write/remove
     /// on an already-committed part (the committed-publish machinery's missing piece; the promote guard's
     /// own error text already named it: "use republishRef for an intended repoint"). Default `false`

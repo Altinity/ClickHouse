@@ -208,12 +208,26 @@ is still present); if not, add it and run the gate green before any code. Expect
 invariant — precommit protects the new closure, the old manifest ages out through the normal
 fold/retire path.
 
-**Phase 0 run 2026-07-15:** `WRepoint` (`CaGcRootLocalPartManifestCore.tla:377-394`) already
-covers the same-key repoint trigger — verified against all three preconditions (source-committed
-/ destination-unowned; one journal event carrying both bindings; no writer-identity-vs-original-
-publisher check), and `AtMostOneCommittedManifestPerRef` is preserved by construction (the single
-atomic `EXCEPT` retargets both owner entries in one step). Gate green at `a4fdb2f30fd` (TLC
-`CaGcRootLocalPartManifestCore_live`, no errors, 16m47s).
+**Phase 0 run 2026-07-15 (CORRECTED after the Task-2 review):** `WRepoint`
+(`CaGcRootLocalPartManifestCore.tla:377-394`) does **NOT** directly model the implemented trigger:
+`WRepoint` requires `owner[mNew] = None` (destination completely unowned), while the real trigger
+always promotes a manifest that is an ALREADY-LIVE PRECOMMIT (`WPromote`'s domain) — the original
+note's "destination-unowned verified" claim was false for the actual C++ shape. The correct safety
+argument for what Task 2 implemented: the record's op1 (old-committed removal) is exactly
+`WDropRef`'s shape and op2 (precommit→committed) is exactly `WPromote`'s shape; the sequential
+composition `WDropRef(mOld); WPromote(mNew)` is valid in the verified model (after `WDropRef`,
+`RefFreeFor(ref, mNew)` holds, satisfying `WPromote`'s precondition); packaging both ops in ONE
+write-once `RefLogTxn` is a sound refinement because `applyRefLogTxn` validates and applies every
+op on a scratch copy replaced only on whole-transaction success (no intra-transaction intermediate
+state is ever observable — atomicity only removes a race window the model tolerates), and the
+per-op validation re-encodes `RefFreeFor` (the removal branch requires exact-match of the current
+committed binding, the promote branch re-checks the ref is free). `AtMostOneCommittedManifestPerRef`
+therefore holds for the implemented shape. TLC re-confirmation run 2026-07-15 against tree
+`a4fdb2f30fd` (recorded in note commit `681997a4991`): `CaGcRootLocalPartManifestCore_live`, no
+errors, 16m47s — this verifies the constituent `WDropRef`/`WPromote` actions and the invariant;
+it does not (and need not) contain a joint same-key-repoint action. Optional future hardening:
+a dedicated `WRepointFromPrecommit` joint action + re-run would pin the composition as a single
+model transition; not required given the refinement argument above.
 
 ## 8. Testing {#testing}
 
