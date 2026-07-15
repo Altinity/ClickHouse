@@ -175,3 +175,29 @@ after 7 days). This file is the log.
 - 2026-07-15 10:39 UTC — watchdog: 20-min all-tree milestone soak RUNNING (ca-soak cluster up ~1 min: ch1/ch2/keeper/rustfs; log utils/ca-soak/logs/soak_t12_milestone.log growing; load 6.83 = soak warming up); T12 CLOSED 5/5 earlier; T12-commit review at decom-review. Disk 73%. Verdict: OK.
 - 2026-07-15 10:59 UTC — watchdog: milestone soak at t≈21min (window ending): cluster up, log growing 10:59; ch2 "Up 1 min" = chaos freeze_long fault + recovery per stage plan (metrics-tick skips during node-down are harness-expected). Mid-window S3-budget snapshot delivered to user (avoided-ops ≈ half the would-be budget; GC enum 11 pages/round vs ~300 audit baseline). Disk 73%, load normalizing (0.62). Verdict: OK — awaiting final verdicts report.
 - 2026-07-15 11:19 UTC — watchdog: QUIESCED for user-requested reboot. #49 run killed cleanly (2 min in, re-run after reboot), docker stopped, state checkpointed at 22a4f734a2f (ledger REBOOT CHECKPOINT = resume point), memory updated, teammates stood down. Verdict: OK (intentional quiescence — no work should be running).
+14:16 RESUME: #49 full stateless gate relaunched (bs5pv69dj); watchdog cron recreated; binary fresh @6fb325d30e6. OK
+14:30 WATCHDOG: #49 full run healthy — container up 10+min, server alive (GC r127), pre-test tpch dataset load from S3 in progress (316s elapsed, expected); outer log buffered at config-merge (cosmetic); disk 73%. OK
+15:00 #49 run1: server died @1533 — 01603 column-TTL ordering inversion; FIXED de8a38b1e87 (eager part-file unlinks), RED→GREEN+922/922; review in flight; full gate relaunched. OK
+15:00 WATCHDOG: #49 run2 in setup phase (launched 14:58, dataset preload expected ~15min); ttl-fix-review reading code (no report yet, 5min in); disk 77%, load ok. OK
+15:27 WATCHDOG: #49 run2 in test phase (~3078 OK, 12 FAIL so far (list captured, triage after run)), load ok, disk 77%. OK
+15:46 WATCHDOG: #49 run2 alive, 6728 OK / 38 FAIL (snapshot in tmp/gate49_fails_snapshot.txt), no server death, disk 77%. OK
+16:06 WATCHDOG: #49 run2 alive, 10376 OK / 54 FAIL, no server death, disk 78%. OK
+16:09 #49 run2 DONE: 10376/55/81, zero server deaths; triage agent dispatched. OK
+16:26 WATCHDOG: triage plain-lane perf run in container (9 min, hits preload phase); cluster-A recheck queued behind it; inventory committed 359027a6f71; disk 77%. OK
+16:41 #49 CLOSED GREEN (55/55 not-CA; contention+debris+infra). Starting codecs phase-2 integration. OK
+16:47 WATCHDOG: codecs2-integrator applied patch, on build iteration 2 (compile-fix loop, expected for unbuilt draft); no commits yet (correct order); disk 77%. OK
+17:06 WATCHDOG: integrator woken, build4 + unit sweep done (checking results); disk 77%. OK
+17:22 phase-2 APPROVED; phase-4 + nits wave dispatched to integrator. OK
+17:26 WATCHDOG: integrator nits commit landed (adcd600b289), phase-4 build running (load 9.9); codecs5-planner still in reading phase (plan file untouched 11min — watch next tick); disk 77%. OK
+17:29 wave-2 integrated (926/926); review + phase-7 running in parallel. OK
+17:33 phase-5 plan committed; planner->drafter (draft-codecs5); 3 parallel lines. OK
+17:38 phase-7 integrated (917/917); review dispatched; #48 soak next. OK
+17:45 phase-7 APPROVED (2 low nits); nits+soak dispatched. OK
+19:19 nits 889195b7e64 landed; #48 soak launching; stamp in parallel. OK
+19:26 WATCHDOG: #48 soak ~6min in (tick 9, pool 3.2GB, 0 Fatal/Logical live); phase-5 drafter at 18 files; disk 77%. OK
+19:47 #48 SOAK GREEN (800089 ops, fsck 0/0, PHASE3 OK); phase-5 integration + phase-3 JIT plan dispatched. OK
+19:44 #48 soak GREEN: PHASE3 OK, 800089 ops, final+recovery checkpoints OK, fsck reachable=2731 unreachable=0 dangling=0 dryrun=0, 0 ABORTED inserts, 91 node_down transport-retries (avail-only), 0 Fatal/Logical. Teardown done. OK
+20:05 phase-5 integrated (918/918, mixed history annotated); review dispatched. OK
+20:06 WATCHDOG: phase-5 review in flight (8min, report pending — normal); soak cluster torn down; integrator+drafter standing by; disk 77%. OK
+20:15 phase-5 approved-with-nits; fix wave + phase-3 draft dispatched in parallel. OK
+20:26 WATCHDOG: fix-wave edits in tree (CasFsck/CasBlobInDegree per announced scope, window OPEN, build pending); phase-3 drafter at 11 files; disk 77%. OK
