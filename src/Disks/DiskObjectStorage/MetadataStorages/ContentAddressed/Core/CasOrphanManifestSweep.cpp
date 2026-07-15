@@ -223,7 +223,8 @@ bool prefixEligible(Store & store, const RootNamespace & ns, const BuildPrefix &
     return w.min_active > prefix.build_sequence;
 }
 
-uint64_t sweepNamespace(Store & store, const RootNamespace & ns, const BuildPrefix & prefix)
+uint64_t sweepNamespace(Store & store, const RootNamespace & ns, const BuildPrefix & prefix,
+                        std::vector<String> * warnings)
 {
     if (!prefixEligible(store, ns, prefix))
         return 0;   /// not eligible by the durable watermark fact — delete nothing (controls #8/#9)
@@ -234,7 +235,11 @@ uint64_t sweepNamespace(Store & store, const RootNamespace & ns, const BuildPref
     /// Build the protection view. A corrupt snapshot / invalid transaction throws (spec §Orphan Manifest
     /// Protection: "a missing snapshot body, invalid transaction, or incomplete ordered view causes the
     /// sweep to skip deletion and surface the error. It never substitutes an empty owner set."). Skip this
-    /// namespace's deletions on such a throw rather than deleting against a wrong (empty) view.
+    /// namespace's deletions on such a throw rather than deleting against a wrong (empty) view. When a
+    /// caller opted in (`warnings != nullptr`), this "cannot confirm emptiness" also lands in `*warnings`
+    /// -- not just the log -- so a decommission run does not silently report a clean drain that never
+    /// happened (spec §core "Fail-close"; the log-only default stays exactly as before for every other
+    /// caller, which treats this the same way the periodic sweep always has: skip and retry next round).
     std::set<String> active;
     try
     {
@@ -245,6 +250,9 @@ uint64_t sweepNamespace(Store & store, const RootNamespace & ns, const BuildPref
         LOG_WARNING(getLogger("CasOrphanManifestSweep"),
                     "CAS orphan sweep: namespace {} protection view unavailable ({}); skipping its deletions",
                     ns.string(), e.message());
+        if (warnings)
+            warnings->push_back("CAS orphan sweep: namespace " + ns.string() + " protection view unavailable ("
+                                 + e.message() + "); skipped, emptiness not confirmed");
         return 0;
     }
 
@@ -260,13 +268,27 @@ uint64_t sweepNamespace(Store & store, const RootNamespace & ns, const BuildPref
             return;   /// owned by a committed/precommit owner — never sweep (control #8)
 
         /// Exact-token delete: HEAD for the current token, then deleteExact. A 404 between HEAD and
-        /// delete (or a TokenMismatch — a fresh owner reclaimed it) is tolerated (record-and-continue).
-        const HeadResult head = backend.head(listed.key);
-        if (!head.exists)
-            return;
-        const DeleteOutcome outcome = backend.deleteExact(listed.key, head.token);   /// NotFound/TokenMismatch spared
-        if (classifyDeleteOutcome(outcome) == DeleteClass::Deleted)
-            ++deleted;
+        /// delete (or a TokenMismatch — a fresh owner reclaimed it) is tolerated (record-and-continue),
+        /// same as always, regardless of `warnings` -- that is the normal "someone else already reclaimed
+        /// it" race, not a failure. A THROWN exception (a transient backend hiccup) is the one thing
+        /// `warnings` changes: opted-in (non-null), it is recorded and the sweep moves to the next key;
+        /// opted-out (nullptr, every pre-existing caller), it propagates exactly as before (fail-close).
+        try
+        {
+            const HeadResult head = backend.head(listed.key);
+            if (!head.exists)
+                return;
+            const DeleteOutcome outcome = backend.deleteExact(listed.key, head.token);   /// NotFound/TokenMismatch spared
+            if (classifyDeleteOutcome(outcome) == DeleteClass::Deleted)
+                ++deleted;
+        }
+        catch (...)
+        {
+            if (!warnings)
+                throw;
+            warnings->push_back("CAS orphan sweep: " + listed.key + " delete failed: "
+                                 + getCurrentExceptionMessage(/*with_stacktrace=*/false));
+        }
     }, 1000, onGcEnumerationPage);
     return deleted;
 }

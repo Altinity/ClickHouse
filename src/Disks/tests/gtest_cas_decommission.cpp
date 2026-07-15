@@ -19,13 +19,22 @@ StorePtr openVictim(std::shared_ptr<InMemoryBackend> backend)
 /// Fails `deleteExact` for one or two designated keys -- either by throwing (a transient backend
 /// hiccup) or by returning a synthetic `TokenMismatch` (a "listed but raced" outcome) -- delegating
 /// every other key to the base `InMemoryBackend` untouched. Drives the drain phases' per-object
-/// fail-close path (`deleteListedPrefix`, `CasDecommission.cpp`): a failure on one listed object must
-/// record a warning and let the rest of the sweep proceed, never abort the whole phase.
+/// fail-close path (`deleteListedPrefix`/`sweepNamespace`, `CasDecommission.cpp`/
+/// `CasOrphanManifestSweep.cpp`): a failure on one listed object must record a warning and let the rest
+/// of the sweep proceed, never abort the whole phase.
+///
+/// Also fails any `get`/`list` whose key/prefix CONTAINS a designated namespace substring -- models a
+/// fully unreadable protection view (a corrupt snapshot / unavailable ref range) for exactly one
+/// namespace, without touching anything else. `victim/db2` in `ManifestDebrisPhaseFailuresWarnAndContinue`
+/// below carries NO ref objects of its own, so this cannot also break Task 2's namespace-erasure loop
+/// (`listNamespaces` never discovers it) -- it is reachable only from `sweepNamespace`'s
+/// `activeManifestKeys` call in the manifest-debris drain.
 class FailingDeleteBackend : public InMemoryBackend
 {
 public:
     void failWithThrow(const String & key) { throw_key = key; }
     void failWithTokenMismatch(const String & key) { mismatch_key = key; }
+    void failNamespaceReads(const String & ns_substring) { unreadable_ns_substring = ns_substring; }
 
     DeleteOutcome deleteExact(const String & key, const Token & token) override
     {
@@ -36,9 +45,28 @@ public:
         return InMemoryBackend::deleteExact(key, token);
     }
 
+    std::optional<GetResult> get(const String & key, Range range = {}) override
+    {
+        maybeFailUnreadable(key);
+        return InMemoryBackend::get(key, range);
+    }
+
+    ListPage list(const String & prefix, const String & cursor, size_t limit) override
+    {
+        maybeFailUnreadable(prefix);
+        return InMemoryBackend::list(prefix, cursor, limit);
+    }
+
 private:
+    void maybeFailUnreadable(const String & key) const
+    {
+        if (!unreadable_ns_substring.empty() && key.find(unreadable_ns_substring) != String::npos)
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "injected unreadable protection view for {}", key);
+    }
+
     String throw_key;
     String mismatch_key;
+    String unreadable_ns_substring;
 };
 
 /// Seed one victim table with `committed` committed refs and `precommits` dangling precommit bindings,
@@ -75,13 +103,17 @@ void makeTableWithRefs(Store & victim, const String & ns_str, uint64_t committed
 /// `writer_epoch`, named by NO owner event -- a build the writer staged and never finished (fixture
 /// idiom of `gtest_cas_orphan_manifest_sweep.cpp`'s `EligibleAndUnownedIsDeleted`). `build_sequence = 99`
 /// is picked well clear of `makeTableWithRefs`'s own committed/precommit build sequences so it can never
-/// collide with a real owned manifest key.
-void seedOrphanManifestBody(Store & victim, const String & ns_str)
+/// collide with a real owned manifest key. Returns the seeded body's `ManifestId` so a caller can target
+/// it (e.g. its exact object key) for further fixture setup.
+ManifestId seedOrphanManifestBody(Store & victim, const String & ns_str)
 {
     const RootNamespace ns(ns_str);
     const ManifestRef ref{.writer_epoch = victim.writerEpoch(), .build_sequence = 99, .manifest_ordinal = 1};
     const ManifestId id = writeManifestRaw(victim.backend(), victim.layout(), ns, ref, {});
-    ASSERT_TRUE(victim.backend().head(victim.layout().manifestKey(id)).exists);
+    /// EXPECT, not ASSERT: this function returns a value now, and ASSERT_* expands to a bare `return;`
+    /// -- invalid in a non-void function.
+    EXPECT_TRUE(victim.backend().head(victim.layout().manifestKey(id)).exists);
+    return id;
 }
 
 }
@@ -306,4 +338,48 @@ TEST(CasDecommission, PerObjectFailureWarnsAndContinuesDrain)
         << "the failing object is left behind (untouched) so a re-run can retry it";
     EXPECT_TRUE(backend->head("p/roots/victim/clickhouse_access_check_abc").exists)
         << "TokenMismatch means nothing was actually deleted -- the object survives";
+}
+
+/// Review finding (Task 3 fix): the manifest-debris drain (spec §core step 4) must honor the SAME
+/// tolerate-and-continue contract as `deleteListedPrefix` above -- it did not. Two failure classes,
+/// both inside `sweepNamespace` (`CasOrphanManifestSweep.cpp`): a per-key `deleteExact` that throws
+/// (`victim/db/t1`'s orphan body), and a namespace whose protection view is unreadable
+/// (`activeManifestKeys` throws for `victim/db2`, which carries NO ref objects of its own so Task 2's
+/// `listNamespaces` never touches it -- isolating this failure to the manifest-debris phase alone).
+/// Both must land in `report.warnings` (so `warnings.empty() == false`, the signal the future
+/// slot-deletion phase gates on) and neither may abort the run: the healthy `victim/db/t1` namespace
+/// erasure and the staging drain must still complete normally.
+TEST(CasDecommission, ManifestDebrisPhaseFailuresWarnAndContinue)
+{
+    auto backend = std::make_shared<FailingDeleteBackend>();
+    String debris_key;
+    {
+        auto victim = openVictim(backend);
+        makeTableWithRefs(*victim, "victim/db/t1", 1, 0);
+        const ManifestId debris_id = seedOrphanManifestBody(*victim, "victim/db/t1");
+        debris_key = victim->layout().manifestKey(debris_id);
+        /// No makeTableWithRefs for "victim/db2" -- it has manifest debris but no ref objects, so
+        /// `listNamespaces` (Task 2) never lists it.
+        seedOrphanManifestBody(*victim, "victim/db2");
+    }
+    backend->failWithThrow(debris_key);
+    backend->failNamespaceReads("victim/db2");
+    backend->putIfAbsent("p/staging/victim/upload_ok.tmp", "x");
+
+    const auto report = decommissionPoolMember(
+        backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim");
+
+    EXPECT_EQ(report.namespaces_removed, 1u)
+        << "victim/db/t1's namespace erasure (Task 2) is untouched by either injected failure";
+    EXPECT_EQ(report.manifest_debris_removed, 0u)
+        << "neither group's body was actually deleted: t1's throws, db2's protection view never even "
+           "reaches the delete loop";
+    EXPECT_EQ(report.warnings.size(), 2u)
+        << "one warning for the thrown per-key delete, one for the unreadable protection view";
+    EXPECT_EQ(report.staging_objects_removed, 1u)
+        << "the staging phase still ran to completion after the manifest-debris phase's failures -- "
+           "the whole command did not abort";
+
+    EXPECT_TRUE(backend->head(debris_key).exists)
+        << "the failing object is left behind (untouched) so a re-run can retry it";
 }

@@ -131,7 +131,7 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
         });
         for (const auto & [ns_str, writer_epoch, build_sequence] : groups)
             report.manifest_debris_removed += sweepNamespace(
-                *admin, RootNamespace(ns_str), BuildPrefix{writer_epoch, build_sequence});
+                *admin, RootNamespace(ns_str), BuildPrefix{writer_epoch, build_sequence}, &report.warnings);
     }
 
     /// Phase: staging sweep. The victim's own `<pool_prefix>/staging/<srid>/` area -- the same prefix

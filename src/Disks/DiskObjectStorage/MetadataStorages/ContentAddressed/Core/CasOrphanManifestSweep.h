@@ -3,6 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include <base/types.h>
 #include <optional>
+#include <vector>
 
 namespace DB::Cas
 {
@@ -40,7 +41,18 @@ struct ManifestSweepResult
 /// delete only, never a spared `NotFound`/`TokenMismatch`) — the decommission manifest-debris drain
 /// (`Core/CasDecommission.cpp`) sums this across every eligible build prefix into
 /// `DecommissionReport::manifest_debris_removed`.
-uint64_t sweepNamespace(Store & store, const RootNamespace & ns, const BuildPrefix & prefix);
+///
+/// `warnings`, when non-null, OPTS IN to the decommission drain's tolerate-and-continue contract (spec
+/// §core "Fail-close"): a per-key transient failure (a thrown backend exception on `head`/`deleteExact`)
+/// is pushed onto `*warnings` and the sweep continues with the next key, instead of throwing out of
+/// this call; likewise a protection-view-unavailable namespace (the pre-existing corrupt-snapshot skip
+/// below) also pushes a "cannot confirm emptiness" warning, not just a `LOG_WARNING`. `warnings ==
+/// nullptr` (the default, every pre-existing caller) preserves the original behaviour exactly: a
+/// per-key failure propagates as an exception (fail-close default), and the protection-view skip is
+/// log-only. `NotFound`/`TokenMismatch` delete outcomes stay silently spared either way — those are the
+/// normal "a fresh owner reclaimed it" race the periodic sweep expects, not a failure to warn about.
+uint64_t sweepNamespace(Store & store, const RootNamespace & ns, const BuildPrefix & prefix,
+                        std::vector<String> * warnings = nullptr);
 
 /// Whether `prefix` is sweep-eligible by the durable watermark fact alone (OQ6). The watermark is resolved
 /// from the namespace's server_root_id, not by parsing writer identity. No watermark => not eligible.
