@@ -101,12 +101,6 @@ struct FormatChangePoint
 /// ({1,1} for every class today).
 std::span<const FormatChangePoint> changePoints(FormatId id);
 
-/// THE reader rule for the hashed binary envelope (CasEnvelope). `compatibility_version` is the
-/// slot in the binary envelope core that was previously named `min_reader_version`; the semantics
-/// are unchanged: > G_BUILD → fail-closed. `what` names the object in the error message.
-/// (Used by CasEnvelope.cpp; kept here to avoid a circular dependency.)
-void gateOnRead(uint32_t compatibility_version, std::string_view what);
-
 /// ---- v3 text-format registry -----------------------------------------------------------------
 /// One row per persisted object class (spec 2026-07-15 §corrected-object-inventory). The row is
 /// the single source of the header-line `type`, the family, the strictness of unknown keys, the

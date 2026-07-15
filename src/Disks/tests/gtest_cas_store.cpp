@@ -350,10 +350,14 @@ TEST(CasPoolMeta, RejectsBadConstantsAtCreation)
     auto b = std::make_shared<InMemoryBackend>();
     Layout layout("p");
 
-    /// not 8-aligned
+    /// not 8-aligned (above the floor, so it is the alignment rule that rejects it)
     expectThrowsCode(DB::ErrorCodes::BAD_ARGUMENTS,
-        [&] { PoolMeta::createOrValidate(*b, layout, 100); });
-    /// below the 96-byte floor
+        [&] { PoolMeta::createOrValidate(*b, layout, 250); });
+    /// below the v3 envelope floor (240) but 8-aligned: rejected by the floor, not the alignment rule.
+    /// Without the raised floor this pool would pass creation and LOGICAL_ERROR on the first blob write.
+    expectThrowsCode(DB::ErrorCodes::BAD_ARGUMENTS,
+        [&] { PoolMeta::createOrValidate(*b, layout, 128); });
+    /// well below the floor
     expectThrowsCode(DB::ErrorCodes::BAD_ARGUMENTS,
         [&] { PoolMeta::createOrValidate(*b, layout, 64); });
     /// above the 16 KiB ceiling

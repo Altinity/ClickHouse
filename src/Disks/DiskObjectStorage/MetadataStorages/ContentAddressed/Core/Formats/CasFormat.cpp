@@ -96,11 +96,6 @@ void checkCompatibility(uint32_t compatibility_version, std::string_view what)
             what, compatibility_version, G_BUILD);
 }
 
-void gateOnRead(uint32_t compatibility_version, std::string_view what)
-{
-    checkCompatibility(compatibility_version, what);
-}
-
 namespace
 {
 constexpr uint64_t kKiB = 1024;
