@@ -1,4 +1,3 @@
-import json
 import shlex
 import time
 
@@ -126,17 +125,21 @@ def test_drop_dead_pool_member_heals_the_pool():
         sleep_time=1.0,
     )
 
-    # (6) Decommission the dead member from node1.
-    report_json = node1.query(
-        "SYSTEM CONTENT ADDRESSED DROP POOL MEMBER '{}' FROM DISK '{}' FORMAT JSONEachRow".format(
-            SRID2, CA_DISK
-        )
-    ).strip()
-    report = json.loads(report_json)
-    assert report["srid"] == SRID2, report
-    assert int(report["namespaces_removed"]) >= 1, report
-    assert int(report["slot_removed"]) == 1, report
-    assert report["warnings"] == "", report
+    # (6) Decommission the dead member from node1. SYSTEM queries do not accept a FORMAT clause
+    #     (ParserSystemQuery is not part of ParserQueryWithOutput), so parse the default TSV row.
+    #     Column order matches the interpreter's ColumnsDescription: srid, namespaces_removed,
+    #     namespaces_already_removed, committed_refs_removed, precommits_removed,
+    #     manifest_debris_removed, staging_objects_removed, mountpoint_objects_removed,
+    #     slot_removed, warnings.
+    report_tsv = node1.query(
+        "SYSTEM CONTENT ADDRESSED DROP POOL MEMBER '{}' FROM DISK '{}'".format(SRID2, CA_DISK)
+    ).rstrip("\n")
+    fields = report_tsv.split("\t")
+    assert len(fields) == 10, report_tsv
+    assert fields[0] == SRID2, report_tsv
+    assert int(fields[1]) >= 1, report_tsv  # namespaces_removed
+    assert int(fields[8]) == 1, report_tsv  # slot_removed
+    assert fields[9] == "", report_tsv  # warnings
 
     # (7) node1's own data survives the whole flow untouched.
     assert int(node1.query("SELECT count() FROM t1")) == n1_count
