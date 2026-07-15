@@ -188,18 +188,22 @@ namespace
 /// files. Trigger: a column-TTL merge removes the expired column's files from the tmp part after
 /// finalize (`01603_remove_column_ttl`). Non-part-file paths (verbatim table files, loose
 /// mountpoint files) stay DEFERRED: their `unlinkFile` branches delete durable objects
-/// immediately, which must not happen before the commit decision.
-bool isContentAddressedPartFile(const std::string & path)
+/// immediately, which must not happen before the commit decision. The classification is delegated
+/// to the transaction's own `stagesPartFileUnlink` — the ONE predicate `unlinkFile` itself
+/// branches on — because a parser-level gate diverges from the router on single-component
+/// detached paths and would eager-dispatch a durable delete.
+bool isEagerContentAddressedUnlink(const MetadataTransactionPtr & tx, const std::string & path)
 {
-    auto parsed = ContentAddressed::parsePartFilePath(path);
-    return parsed && !parsed->file.empty();
+    const auto * ca_tx = dynamic_cast<const ContentAddressedTransaction *>(tx.get());
+    return ca_tx && ca_tx->stagesPartFileUnlink(path);
 }
 
 }
 
 void DiskObjectStorageTransaction::removeFile(const std::string & path)
 {
-    if (metadata_storage->isContentAddressed() && isContentAddressedPartFile(path))
+    /// CA part-file unlinks dispatch eagerly — see isEagerContentAddressedUnlink.
+    if (isEagerContentAddressedUnlink(metadata_transaction, path))
     {
         metadata_transaction->unlinkFile(path, /*if_exists=*/false, /*should_remove_objects=*/true);
         return;
@@ -213,8 +217,8 @@ void DiskObjectStorageTransaction::removeFile(const std::string & path)
 
 void DiskObjectStorageTransaction::removeSharedFile(const std::string & path, bool keep_shared_data)
 {
-    /// CA part-file unlinks dispatch eagerly — see isContentAddressedPartFile.
-    if (metadata_storage->isContentAddressed() && isContentAddressedPartFile(path))
+    /// CA part-file unlinks dispatch eagerly — see isEagerContentAddressedUnlink.
+    if (isEagerContentAddressedUnlink(metadata_transaction, path))
     {
         metadata_transaction->unlinkFile(path, /*if_exists=*/false, /*should_remove_objects=*/!keep_shared_data);
         return;
@@ -250,8 +254,8 @@ void DiskObjectStorageTransaction::removeSharedRecursive(
 
 void DiskObjectStorageTransaction::removeSharedFileIfExists(const std::string & path, bool keep_shared_data)
 {
-    /// CA part-file unlinks dispatch eagerly — see isContentAddressedPartFile.
-    if (metadata_storage->isContentAddressed() && isContentAddressedPartFile(path))
+    /// CA part-file unlinks dispatch eagerly — see isEagerContentAddressedUnlink.
+    if (isEagerContentAddressedUnlink(metadata_transaction, path))
     {
         metadata_transaction->unlinkFile(path, /*if_exists=*/true, /*should_remove_objects=*/!keep_shared_data);
         return;
@@ -281,8 +285,8 @@ void DiskObjectStorageTransaction::removeRecursive(const std::string & path)
 
 void DiskObjectStorageTransaction::removeFileIfExists(const std::string & path)
 {
-    /// CA part-file unlinks dispatch eagerly — see isContentAddressedPartFile.
-    if (metadata_storage->isContentAddressed() && isContentAddressedPartFile(path))
+    /// CA part-file unlinks dispatch eagerly — see isEagerContentAddressedUnlink.
+    if (isEagerContentAddressedUnlink(metadata_transaction, path))
     {
         metadata_transaction->unlinkFile(path, /*if_exists=*/true, /*should_remove_objects=*/true);
         return;
@@ -299,8 +303,8 @@ void DiskObjectStorageTransaction::removeSharedFiles(const RemoveBatchRequest & 
     for (const auto & [path, if_exists] : files)
     {
         const bool should_remove_objects = !keep_all_batch_data && !file_names_remove_metadata_only.contains(fs::path(path).filename());
-        /// CA part-file unlinks dispatch eagerly — see isContentAddressedPartFile.
-        if (metadata_storage->isContentAddressed() && isContentAddressedPartFile(path))
+        /// CA part-file unlinks dispatch eagerly — see isEagerContentAddressedUnlink.
+        if (isEagerContentAddressedUnlink(metadata_transaction, path))
         {
             metadata_transaction->unlinkFile(path, if_exists, should_remove_objects);
             continue;

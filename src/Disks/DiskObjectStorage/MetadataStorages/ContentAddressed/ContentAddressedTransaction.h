@@ -78,6 +78,16 @@ public:
     void unlinkFile(const std::string & path, bool if_exists, bool should_remove_objects) override;
     void truncateFile(const std::string & path, size_t size) override;
 
+    /// True when `unlinkFile(path)` would take the in-memory part-staging branch (drop a staged
+    /// entry / stage a removal mark) — the only branch safe to dispatch EAGERLY from
+    /// `DiskObjectStorageTransaction`; false for the verbatim table-file / loose-mountpoint
+    /// branches, whose durable deletes must stay deferred to commit. Mirrors `unlinkFile`'s own
+    /// branch condition (`route().file` non-empty), NOT the raw parser's: a single-component
+    /// detached path (table dir / "detached" / x) parses with a non-empty file but ROUTES to
+    /// ref="detached/x", file="" — a parser-based gate would eager-dispatch a durable delete
+    /// (review finding on `de8a38b1e87`).
+    bool stagesPartFileUnlink(const std::string & path) const;
+
     ~ContentAddressedTransaction() override;
 
 protected:

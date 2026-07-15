@@ -904,6 +904,33 @@ TEST(CaWiringOps, VerbatimMoveAndUnlink)
     EXPECT_FALSE(storage->existsFile("uui/uuid-1/mutation_5.txt"));
 }
 
+/// `stagesPartFileUnlink` is the eager-dispatch gate `DiskObjectStorageTransaction` uses to decide
+/// whether an unlink is an in-memory staging op (safe to run in program order) or a durable delete
+/// (must stay deferred to commit). It must mirror `unlinkFile`'s own branch predicate — the ROUTER's
+/// classification, not the raw parser's: a single-component detached path parses with a non-empty
+/// file but routes to ref=`detached/<x>`, file="", where `unlinkFile` takes a DURABLE branch.
+/// A parser-based gate eager-dispatched that durable delete (review finding on `de8a38b1e87`).
+TEST(CaWiringOps, StagedUnlinkGateMirrorsUnlinkRouting)
+{
+    auto storage = openWiringStorage();
+    auto tx = storage->createTransaction();
+    const auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
+
+    /// In-memory staging branch: eager-safe.
+    EXPECT_TRUE(ca_tx.stagesPartFileUnlink("uui/uuid-1/all_1_1_0/data.bin"));
+    EXPECT_TRUE(ca_tx.stagesPartFileUnlink("uui/uuid-1/tmp_merge_all_1_1_0/Age.bin"));
+    EXPECT_TRUE(ca_tx.stagesPartFileUnlink("uui/uuid-1/all_1_1_0/proj.proj/data.bin"));
+    EXPECT_TRUE(ca_tx.stagesPartFileUnlink("uui/uuid-1/detached/attaching_all_0_0_0/metadata_version.txt"));
+
+    /// The divergence case: parses as a part FILE (part_name="detached", file="loose_marker") but
+    /// routes to ref="detached/loose_marker", file="" — unlinkFile's durable fallthrough.
+    EXPECT_FALSE(ca_tx.stagesPartFileUnlink("uui/uuid-1/detached/loose_marker"));
+
+    /// Durable branches: verbatim table-level file, loose mountpoint object.
+    EXPECT_FALSE(ca_tx.stagesPartFileUnlink("uui/uuid-1/mutation_5.txt"));
+    EXPECT_FALSE(ca_tx.stagesPartFileUnlink("some_loose_file.txt"));
+}
+
 TEST(CaWiringOps, TableRenameMovesRefsFilesAndDetached)
 {
     auto storage = openWiringStorage();
