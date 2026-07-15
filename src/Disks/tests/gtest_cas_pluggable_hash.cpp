@@ -26,7 +26,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasCodecUtil.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEnvelope.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFsck.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
@@ -673,7 +673,7 @@ TEST(CasPluggableHash, ForeignAlgoSegmentIsDebrisNotOurs)
 }
 
 /// ============================================================================================
-/// CAS reader-generation gate (`Core/CasFormat.h`'s `G_BUILD`) is raised to 3 for the Task-12 ref
+/// CAS reader-generation gate (`Core/Formats/CasFormat.h`'s `G_BUILD`) is raised to 3 for the Task-12 ref
 /// snapshot+log format: a build older than generation 3 holds the removed generation-2 mutable ref
 /// manifest and cannot decode the immutable `_log`/`_snap` ref objects. `PoolMeta::createOrValidate`'s
 /// open-time CAS-raise now targets 3, and `decodePoolMeta` fail-closes BOTH on a FUTURE

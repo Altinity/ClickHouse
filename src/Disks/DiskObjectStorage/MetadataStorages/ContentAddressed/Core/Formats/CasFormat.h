@@ -62,6 +62,13 @@ enum class FormatId : uint16_t
     Owner = 16,           /// owner anchor (server_root_id -> server UUID); magic "CAOW"
     ServerEpoch = 17,     /// writer-epoch fence (next_writer_epoch); magic "CAEP"
     MountLease = 18,      /// live mount lease; magic "CAML"
+    /// v3 text-format cutover (2026-07-15 design): ids for persisted objects that predate the
+    /// registry — refsnaplog, the blob-meta sidecar, and the GC heartbeat (formerly the 24-byte
+    /// unversioned exception). Values are frozen; never reuse.
+    RefLog = 19,          /// cas_ref_log     — ref transaction log object
+    RefSnapshot = 20,     /// cas_ref_snap    — complete per-namespace ref table
+    BlobMeta = 21,        /// cas_blob_meta   — per-blob freshness sidecar
+    GcHeartbeat = 22,     /// cas_gc_hb       — GC leader heartbeat
 };
 
 /// Per-type magic: the 4 ASCII bytes of each object class encoded as a little-endian uint32. Used in
@@ -99,5 +106,33 @@ std::span<const FormatChangePoint> changePoints(FormatId id);
 /// are unchanged: > G_BUILD → fail-closed. `what` names the object in the error message.
 /// (Used by CasEnvelope.cpp; kept here to avoid a circular dependency.)
 void gateOnRead(uint32_t compatibility_version, std::string_view what);
+
+/// ---- v3 text-format registry -----------------------------------------------------------------
+/// One row per persisted object class (spec 2026-07-15 §corrected-object-inventory). The row is
+/// the single source of the header-line `type`, the family, the strictness of unknown keys, the
+/// compression policy, and the fail-closed size caps. A format missing here cannot be decoded.
+
+enum class TextFamily : uint8_t { Control = 1, RecordStream = 2, PayloadHybrid = 3 };
+enum class KeyStrictness : uint8_t { Tolerant = 1, Strict = 2 };
+enum class CompressionPolicy : uint8_t { Never = 1, Always = 2, PinnedRaw = 3 };
+
+struct FormatTraits
+{
+    FormatId id;
+    std::string_view type;      /// header-line "type" value
+    TextFamily family;
+    KeyStrictness strictness;
+    CompressionPolicy compression;
+    uint64_t object_cap;        /// max DECOMPRESSED object bytes; 0 = uncapped (streamed)
+    uint64_t line_cap;          /// max bytes of one text line
+};
+
+/// Traits for `id`. LOGICAL_ERROR for `FormatId::Roster` (reserved, unbuilt — has no traits row).
+const FormatTraits & traitsFor(FormatId id);
+/// Traits for a header-line `type` string, or nullptr when `type` is not a registered format.
+const FormatTraits * traitsForType(std::string_view type);
+/// The key-suffix a stored object of `id` is written under: ".zst" when its compression policy is
+/// `Always`, "" otherwise. Callers building a key never inspect the body to decide the suffix.
+std::string_view storedSuffix(FormatId id);
 
 }

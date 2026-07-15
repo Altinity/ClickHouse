@@ -132,6 +132,7 @@ add_headers_and_sources(dbms Disks/DiskObjectStorage/MetadataStorages/PlainRewri
 add_headers_and_sources(dbms Disks/DiskObjectStorage/MetadataStorages/Web)
 add_headers_and_sources(dbms Disks/DiskObjectStorage/MetadataStorages/ContentAddressed)
 add_headers_and_sources(dbms Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core)
+add_headers_and_sources(dbms Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats)
 if (TARGET ch_contrib::sqlite)
     add_headers_and_sources(dbms Databases/SQLite)
 endif()

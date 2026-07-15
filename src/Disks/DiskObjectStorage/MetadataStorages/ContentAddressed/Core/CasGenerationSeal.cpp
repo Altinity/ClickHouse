@@ -1,5 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGenerationSeal.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasFormat.h>
 /// Included by basename via clickhouse_cas_proto's SYSTEM include dir so the generated header's
 /// reserved identifiers don't trip -Weverything -Werror.
 #include <cas_format.pb.h>
