@@ -3,6 +3,8 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include <base/types.h>
 #include <optional>
+#include <set>
+#include <utility>
 #include <vector>
 
 namespace DB::Cas
@@ -15,6 +17,14 @@ struct BuildPrefix
     uint64_t writer_epoch = 0;
     uint64_t build_sequence = 0;
 };
+
+/// fix-round F9 (author-review: `reportLateLogsIfAny` re-emits the same `LOG_WARNING` +
+/// `RefLateLogDetected` event every sweep pass, with no dedup, until GC's ordinary covered-log cleanup
+/// finally removes the log -- which can be many rounds later). A one-shot in-memory latch, keyed by
+/// (namespace, rendered log id), OWNED BY THE LEADER (one `Gc` instance's lifetime -- a fresh leader,
+/// after a steal or a process restart, starts with an empty set, at worst re-emitting once) and passed
+/// down through `sweepNamespace`/`activeManifestKeys` to suppress a repeat report of the SAME anomaly.
+using LateLogDedup = std::set<std::pair<String, String>>;
 
 struct ManifestSweepResult
 {
@@ -51,8 +61,11 @@ struct ManifestSweepResult
 /// per-key failure propagates as an exception (fail-close default), and the protection-view skip is
 /// log-only. `NotFound`/`TokenMismatch` delete outcomes stay silently spared either way — those are the
 /// normal "a fresh owner reclaimed it" race the periodic sweep expects, not a failure to warn about.
+/// `dedup`, when non-null, is threaded to `reportLateLogsIfAny` (see `LateLogDedup`'s own doc comment)
+/// -- `nullptr` (the default, every pre-existing caller) preserves the original behaviour exactly: no
+/// dedup, every provably-late log is reported on every pass that lists it.
 uint64_t sweepNamespace(Store & store, const RootNamespace & ns, const BuildPrefix & prefix,
-                        std::vector<String> * warnings = nullptr);
+                        std::vector<String> * warnings = nullptr, LateLogDedup * dedup = nullptr);
 
 /// Whether `prefix` is sweep-eligible by the durable watermark fact alone (OQ6). The watermark is resolved
 /// from the namespace's server_root_id, not by parsing writer identity. No watermark => not eligible.
@@ -65,6 +78,7 @@ ManifestSweepResult sweepManifestCursorPage(
     Store & store,
     const String & cursor,
     uint64_t list_budget,
-    uint64_t delete_budget);
+    uint64_t delete_budget,
+    LateLogDedup * dedup = nullptr);
 
 }

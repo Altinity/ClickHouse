@@ -126,7 +126,7 @@ RefTxnId sealedRefCursor(Store & store, const RootNamespace & ns)
 /// ownsAndSawUncleanBoundaryFor`): a listed log strictly below its own live epoch, with no snapshot
 /// at all to explain its presence, is then unambiguous.
 void reportLateLogsIfAny(Store & store, const RootNamespace & ns, const RecoveredRefTable & recovered,
-                          const std::vector<RefTxnId> & logs)
+                          const std::vector<RefTxnId> & logs, LateLogDedup * dedup)
 {
     const Layout & layout = store.layout();
 
@@ -138,6 +138,11 @@ void reportLateLogsIfAny(Store & store, const RootNamespace & ns, const Recovere
                 continue;   /// id <= sealed_from: within the observed region, ordinary
             if (recovered.newest_snapshot_id && *recovered.newest_snapshot_id < id)
                 continue;   /// id > the seal: not (yet) covered by it -- not provably late
+            /// fix-round F9: skip a repeat report of the SAME (namespace, log id) anomaly -- see
+            /// `LateLogDedup`'s doc comment. `dedup == nullptr` (every pre-existing caller) preserves
+            /// the original always-report behaviour exactly.
+            if (dedup && !dedup->insert({ns.string(), renderRefTxnId(id)}).second)
+                continue;
 
             LOG_WARNING(getLogger("CasOrphanManifestSweep"),
                         "CAS T_mat violation: namespace {} log {} listed above the recovery seal's "
@@ -171,6 +176,9 @@ void reportLateLogsIfAny(Store & store, const RootNamespace & ns, const Recovere
     {
         if (id.writer_epoch >= my_epoch)
             continue;   /// not from a dead epoch relative to THIS incarnation
+        /// fix-round F9: same dedup latch as the seal-based branch above.
+        if (dedup && !dedup->insert({ns.string(), renderRefTxnId(id)}).second)
+            continue;
 
         LOG_WARNING(getLogger("CasOrphanManifestSweep"),
                     "CAS T_mat violation (empty-dead-region carve-out): namespace {} log {} is from a "
@@ -203,7 +211,7 @@ void reportLateLogsIfAny(Store & store, const RootNamespace & ns, const Recovere
 /// Keys (not ManifestIds) so a listed object key can be tested directly. Throws on a corrupt snapshot /
 /// invalid transaction (via `recoverRefTable` / `decodeRefLogTxn`); the caller SKIPS the namespace's
 /// deletions on such a throw rather than substituting an empty owner set.
-std::set<String> activeManifestKeys(Store & store, const RootNamespace & ns)
+std::set<String> activeManifestKeys(Store & store, const RootNamespace & ns, LateLogDedup * dedup)
 {
     std::set<String> active;
     const Layout & layout = store.layout();
@@ -231,7 +239,7 @@ std::set<String> activeManifestKeys(Store & store, const RootNamespace & ns)
     }, 1000, onGcEnumerationPage);
     std::sort(logs.begin(), logs.end());
 
-    reportLateLogsIfAny(store, ns, recovered, logs);
+    reportLateLogsIfAny(store, ns, recovered, logs, dedup);
 
     for (const RefTxnId & id : logs)
     {
@@ -270,7 +278,7 @@ bool prefixEligible(Store & store, const RootNamespace & ns, const BuildPrefix &
 }
 
 uint64_t sweepNamespace(Store & store, const RootNamespace & ns, const BuildPrefix & prefix,
-                        std::vector<String> * warnings)
+                        std::vector<String> * warnings, LateLogDedup * dedup)
 {
     if (!prefixEligible(store, ns, prefix))
         return 0;   /// not eligible by the durable watermark fact — delete nothing (controls #8/#9)
@@ -289,7 +297,7 @@ uint64_t sweepNamespace(Store & store, const RootNamespace & ns, const BuildPref
     std::set<String> active;
     try
     {
-        active = activeManifestKeys(store, ns);
+        active = activeManifestKeys(store, ns, dedup);
     }
     catch (const Exception & e)
     {
@@ -343,7 +351,8 @@ ManifestSweepResult sweepManifestCursorPage(
     Store & store,
     const String & cursor,
     uint64_t list_budget,
-    uint64_t delete_budget)
+    uint64_t delete_budget,
+    LateLogDedup * dedup)
 {
     ManifestSweepResult result;
     result.next_cursor = cursor;
@@ -395,7 +404,7 @@ ManifestSweepResult sweepManifestCursorPage(
             /// namespace's deletions and surface the error, never substitute an empty owner set.
             try
             {
-                active_it->second = activeManifestKeys(store, parsed->ns);
+                active_it->second = activeManifestKeys(store, parsed->ns, dedup);
             }
             catch (const Exception & e)
             {

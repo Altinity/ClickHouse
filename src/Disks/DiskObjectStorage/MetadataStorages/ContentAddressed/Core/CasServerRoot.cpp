@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <set>
 #include <string_view>
 #include <unistd.h>
 
@@ -357,9 +358,9 @@ MountClaimResult claimMount(
             /// Raced with a concurrent writer between get and putIfAbsent. Treat as a live double
             /// start — fail closed; never overwrite a slot that appeared under us. No re-read was
             /// done, so no conflicting identity is known to attach to an event.
-            return {.kind = MountClaimResult::LiveDoubleStart, .body = body};
+            return {.kind = MountClaimResult::LiveDoubleStart, .body = body, .token = std::nullopt};
         emitMountEvent(sink, CasEventType::MountClaim, srid, "mint", nullptr, "fresh mount slot minted");
-        return {.kind = MountClaimResult::Claimed, .body = body};
+        return {.kind = MountClaimResult::Claimed, .body = body, .token = std::nullopt};
     }
 
     const MountLease existing = decodeMountLease(got->bytes);
@@ -370,7 +371,7 @@ MountClaimResult claimMount(
     {
         emitMountEvent(sink, CasEventType::MountConflict, srid, "foreign_owner", &existing,
             "mount slot is held by a foreign server_uuid — refusing to take over across identities");
-        return {.kind = MountClaimResult::ForeignOwner, .body = existing};
+        return {.kind = MountClaimResult::ForeignOwner, .body = existing, .token = std::nullopt};
     }
 
     /// Same uuid + same epoch: it is OUR OWN claim — but a FENCED body is terminal for this
@@ -384,15 +385,19 @@ MountClaimResult claimMount(
             emitMountEvent(sink, CasEventType::MountConflict, srid, "fenced_by_gc", &existing,
                 "own (uuid, epoch) mount slot is GC-fenced — terminal for this incarnation; "
                 "recover with a fresh writer_epoch");
-            return {.kind = MountClaimResult::FencedSelf, .body = existing};
+            return {.kind = MountClaimResult::FencedSelf, .body = existing, .token = std::nullopt};
         }
         const MountLease body = makeMountBody(our_uuid, our_epoch, existing.seq + 1, now_ms, ttl_ms);
         const PutResult put = b.putOverwrite(key, encodeMountLease(body), got->token);
         if (put.outcome != PutOutcome::Done)
-            return {.kind = MountClaimResult::LiveDoubleStart, .body = body};
+            /// The mount changed under us between get and putOverwrite: `got->token` is now KNOWN
+            /// STALE (that mismatch is exactly why the put failed), not merely unknown -- leaving
+            /// `.token` unset (rather than handing back a token the caller would wrongly treat as
+            /// current) is deliberate, matching the identical race below.
+            return {.kind = MountClaimResult::LiveDoubleStart, .body = body, .token = std::nullopt};
         emitMountEvent(sink, CasEventType::MountClaim, srid, "refresh", &existing,
             "own claim replayed — refreshed seq + expiry");
-        return {.kind = MountClaimResult::Claimed, .body = body};
+        return {.kind = MountClaimResult::Claimed, .body = body, .token = std::nullopt};
     }
 
     /// Same uuid, DIFFERENT epoch: reclaim ONLY on a certificate of death that needs no fresh
@@ -419,8 +424,9 @@ MountClaimResult claimMount(
         const PutResult put = b.putOverwrite(key, encodeMountLease(body), got->token);
         if (put.outcome != PutOutcome::Done)
             /// The mount changed under us between get and putOverwrite — someone else is racing the
-            /// reclaim. Fail closed. No re-read was done, so no conflicting identity is known.
-            return {.kind = MountClaimResult::LiveDoubleStart, .body = body};
+            /// reclaim. Fail closed. `got->token` is now KNOWN STALE (that mismatch is exactly why the
+            /// put failed) -- leaving `.token` unset is deliberate, not an oversight.
+            return {.kind = MountClaimResult::LiveDoubleStart, .body = body, .token = std::nullopt};
         const MountPriorState prior = existing.gc_fenced ? MountPriorState::Fenced
                                      : clean_marker       ? MountPriorState::Clean
                                                            : MountPriorState::UncleanObserved;
@@ -429,13 +435,16 @@ MountClaimResult claimMount(
             : clean_marker     ? "same server_uuid, different writer_epoch, clean farewell — reclaimed"
                                : "same server_uuid, different writer_epoch, observed dead by "
                                  "token-stability — reclaimed");
-        return {.kind = MountClaimResult::Claimed, .body = body, .prior = prior};
+        return {.kind = MountClaimResult::Claimed, .body = body, .prior = prior, .token = std::nullopt};
     }
 
     emitMountEvent(sink, CasEventType::MountConflict, srid, "live_double_start", &existing,
         "same server_uuid, different writer_epoch, not fenced/clean/proven-dead — no wall-clock trust; "
         "the caller must run the token-stability observation wait before reclaiming");
-    return {.kind = MountClaimResult::LiveDoubleStart, .body = existing};
+    /// fix-round F8: no write was attempted on this path -- `got->token` is exactly the CURRENT body's
+    /// token (what we just read is what's still there), so it is safe to hand back for the caller's
+    /// observation loop to compare across polls without a redundant re-GET.
+    return {.kind = MountClaimResult::LiveDoubleStart, .body = existing, .token = got->token};
 }
 
 String mountDoubleStartMessage(const String & srid, const MountLease & existing)
@@ -470,6 +479,11 @@ namespace
 constexpr size_t kMaxObservationRestarts = 3;
 }
 
+uint64_t mountObservationThresholdMs(uint64_t ttl_ms, uint64_t cadence_ms)
+{
+    return ttl_ms + ttl_ms / 20 + cadence_ms;
+}
+
 MountClaimResult claimMountAwaitingExpiry(
     Backend & b, const Layout & l, const String & srid, UInt128 our_uuid, uint64_t our_epoch,
     const std::function<uint64_t()> & now_ms_fn,
@@ -486,8 +500,9 @@ MountClaimResult claimMountAwaitingExpiry(
     /// `CaCasMountCore.tla`'s `ObservedReclaim`): the full lease TTL, plus a 5% allowance for clock-rate
     /// mismatch between the holder's and our own local clock, plus one poll interval for observation
     /// discreteness. Purely a function of OUR OWN clock (`mono_ms_fn`) — no cross-node wall-clock
-    /// comparison anywhere in this loop.
-    const uint64_t threshold_ms = ttl_ms + ttl_ms / 20 + poll;
+    /// comparison anywhere in this loop. fix-round F4: shared with `Gc`'s two call sites via
+    /// `mountObservationThresholdMs` -- see its doc comment.
+    const uint64_t threshold_ms = mountObservationThresholdMs(ttl_ms, poll);
 
     std::optional<Token> observed;
     uint64_t observed_since = 0;
@@ -501,19 +516,40 @@ MountClaimResult claimMountAwaitingExpiry(
         if (r.kind != MountClaimResult::LiveDoubleStart)
             return r;
 
-        const auto got = b.get(l.mountKey(srid));
-        if (!got)
-            /// The slot vanished between claimMount's own GET and ours — the next iteration's
-            /// claimMount call claims it fresh (the absent-slot branch).
-            continue;
+        /// fix-round F8 (author-review: double GET per iteration -- `claimMount` already reads the
+        /// current body once and used to just discard its token). Reuse `r.token` whenever `claimMount`
+        /// set it (the common case: no write was attempted, so what it read is still current) instead of
+        /// re-GETting the SAME key here. The rare stale-race branches deliberately leave `.token` unset
+        /// (see their own comments), so this still falls back to a fresh read exactly there.
+        std::optional<Token> current_token = r.token;
+        if (!current_token)
+        {
+            const auto got = b.get(l.mountKey(srid));
+            if (!got)
+            {
+                /// The slot vanished between claimMount's own GET and ours — normally self-resolving
+                /// within one more `claimMount` call (which re-mints fresh on an absent slot), but under
+                /// slot churn (something else concurrently removing/re-minting it) that resolution could
+                /// keep losing the same race. fix-round F5: pace this like every other iteration and
+                /// count it toward the SAME bounded restart budget the token-churn case below uses,
+                /// instead of spinning `get`/`claimMount`/`put` at backend RTT with no sleep and no bound
+                /// — a persistently vanishing slot is exactly as "alive and contended" as a persistently
+                /// renewing token.
+                if (++restarts > kMaxObservationRestarts)
+                    return r;
+                sleep_ms_fn(poll);
+                continue;
+            }
+            current_token = got->token;
+        }
 
-        if (!observed || *observed != got->token)
+        if (!observed || *observed != *current_token)
         {
             if (observed && ++restarts > kMaxObservationRestarts)
                 /// The token kept changing across bounded restarts — the holder is genuinely alive
                 /// (actively renewing), not a dead predecessor. Report it rather than waiting forever.
                 return r;
-            observed = got->token;
+            observed = *current_token;
             observed_since = mono_ms_fn();
             if (on_wait_start)
                 on_wait_start(r.body, threshold_ms);
@@ -532,6 +568,15 @@ HeartbeatFloor computeHeartbeatFloor(Backend & b, const Layout & l, uint64_t now
                                      MountObservationMap & obs)
 {
     HeartbeatFloor floor;
+
+    /// fix-round F7 (author-review): `obs` is keyed by every srid this leader has EVER observed, but a
+    /// srid removed from the LIST entirely (its `/mount` key gone -- e.g. `SYSTEM CONTENT ADDRESSED
+    /// DROP POOL MEMBER`) is never visited by the loop below again, so its entry would otherwise linger
+    /// forever (~150-250 B/srid, worse on a long-lived leader across many decommissions). Track every
+    /// srid actually seen THIS pass and prune anything else out of `obs` at the end -- disjoint from the
+    /// mid-loop `obs.erase(srid)` calls below (those fire for a srid seen but now terminal/fenced/gone
+    /// this pass; this is for a srid not seen AT ALL).
+    std::set<String> seen_srids;
 
     const String prefix = l.serverRootsPrefix();
     String cursor;
@@ -553,6 +598,7 @@ HeartbeatFloor computeHeartbeatFloor(Backend & b, const Layout & l, uint64_t now
             /// the key into `obs`.
             const String srid = key.substr(prefix.size(),
                 key.size() - prefix.size() - mount_suffix.size());
+            seen_srids.insert(srid);
 
             /// Fence-out on PreconditionFailed re-GETs and reclassifies from the top; bound the retries
             /// so a pathologically contended holder cannot spin forever. On exhaustion the entry is
@@ -633,6 +679,10 @@ HeartbeatFloor computeHeartbeatFloor(Backend & b, const Layout & l, uint64_t now
             break;
         cursor = page.next_cursor;
     }
+
+    /// fix-round F7: prune every `obs` entry for a srid this pass's LIST never saw at all.
+    for (auto it = obs.begin(); it != obs.end(); )
+        it = seen_srids.count(it->first) ? std::next(it) : obs.erase(it);
 
     return floor;
 }

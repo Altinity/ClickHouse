@@ -170,6 +170,11 @@ String renderRefTableSnapshot(const RefTableSnapshot & s)
         .add("snapshot_id", renderRefTxnIdObj(s.snapshot_id))
         .add("lifecycle", jsonEscape(refLifecycleName(s.lifecycle)))
         .add("remove_txn_id", s.remove_txn_id ? renderRefTxnIdObj(*s.remove_txn_id) : "null")
+        /// fix-round F10 (author-review): without this, a recovery seal (rev.6 §recovery-seal) is
+        /// indistinguishable from an ordinary snapshot in clickhouse-disks/inspect -- an operator
+        /// investigating a `RefLateLogDetected` event (whose detail cites this same field) can't see
+        /// the observation horizon it was measured against. `null` for an ordinary (non-seal) snapshot.
+        .add("sealed_from", s.sealed_from ? renderRefTxnIdObj(*s.sealed_from) : "null")
         .add("committed", jsonArray(committed))
         .add("precommits", jsonArray(precommits))
         .str();

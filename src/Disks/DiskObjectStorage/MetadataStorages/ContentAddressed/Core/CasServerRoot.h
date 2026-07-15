@@ -203,6 +203,13 @@ struct MountClaimResult
     /// Which certificate of death justified a same-uuid, different-epoch `Claimed` reclaim (`None` for
     /// every other `Kind`, and for the absent-slot / same-epoch-refresh `Claimed` cases).
     MountPriorState prior = MountPriorState::None;
+    /// fix-round F8 (author-review): the backend token of the body this result observed, for
+    /// `LiveDoubleStart` only (a fresh `Claimed`/`FencedSelf`/`ForeignOwner` write/observe has no
+    /// separate "prior body's token to remember" use). `claimMountAwaitingExpiry`'s observation loop
+    /// used to re-GET the mount key itself just to recover this token that `claimMount` had already
+    /// read one line earlier and thrown away -- one wasted GET per iteration. Empty for every other
+    /// `Kind` (nothing to compare against).
+    std::optional<Token> token;
 };
 
 /// Thrown when a mount operation observes that OUR OWN (uuid, epoch) slot was `gc_fenced` by the GC
@@ -256,6 +263,16 @@ String mountDoubleStartMessage(const String & srid, const MountLease & existing)
 /// tests drive fake clocks with no real sleeping. `on_wait_start` (default no-op) fires once per
 /// observation-window start (including restarts), with the currently-observed lease and the
 /// threshold, for an operator-visible startup log.
+/// fix-round F4 (author-review: the `ttl_ms + ttl_ms / 20 + cadence_ms` formula was hand-duplicated at
+/// THREE call sites -- here, `Gc::runRegularRound`'s heartbeat gate, and `Gc`'s disaster-recovery
+/// baseline rebuild -- with a retune of one site silently missing another (the DR rebuild path is the
+/// easy one to forget, since it only runs on recovery, not on every round). One shared function so a
+/// future retune only has one place to change. `cadence_ms` is the caller's own poll/heartbeat
+/// interval -- `claimMountAwaitingExpiry` passes its (floor'd) `poll_interval_ms`, `Gc` passes
+/// `mount_renew_period` -- the formula itself (TTL + 5% clock-drift allowance + one cadence interval of
+/// observation discreteness) is what stays identical across every caller.
+uint64_t mountObservationThresholdMs(uint64_t ttl_ms, uint64_t cadence_ms);
+
 MountClaimResult claimMountAwaitingExpiry(
     Backend & b, const Layout & l, const String & srid, UInt128 our_uuid, uint64_t our_epoch,
     const std::function<uint64_t()> & now_ms_fn,

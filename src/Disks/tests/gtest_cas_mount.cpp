@@ -250,6 +250,74 @@ TEST(CasMountAwaitExpiry, LiveRenewingTwinTimesOutAsDoubleStart)
     EXPECT_EQ(decodeMountLease(b->get(l.mountKey("r"))->bytes).writer_epoch, 7u);   // still the holder's
 }
 
+namespace
+{
+/// fix-round F5 harness: makes the mount key vanish to EVERY `get()`, unconditionally, while the real
+/// underlying object stays put -- forcing `claimMount`'s own internal GET to take the absent-slot race
+/// branch every call (its `putIfAbsent` then fails against the real, still-present object, returning
+/// `LiveDoubleStart` with no token -- fix-round F8 leaves `.token` unset on exactly this branch, since
+/// no re-read was done). That in turn forces `claimMountAwaitingExpiry`'s F8 fallback re-GET, which
+/// ALSO sees the slot as vanished -- deterministically reproducing "the slot vanished between
+/// claimMount's own GET and ours" on EVERY loop iteration, not just a lucky one-shot race.
+class AlwaysVanishesBackend final : public DB::Cas::Backend
+{
+public:
+    explicit AlwaysVanishesBackend(std::shared_ptr<DB::Cas::Backend> inner_) : inner(std::move(inner_)) {}
+    String watched_key;
+
+    std::optional<DB::Cas::GetResult> get(const String & k, DB::Cas::Range r = {}) override
+    {
+        if (k == watched_key)
+            return std::nullopt;
+        return inner->get(k, r);
+    }
+    std::optional<DB::Cas::GetStreamResult> getStream(const String & k, DB::Cas::Range r = {}) override { return inner->getStream(k, r); }
+    DB::Cas::HeadResult head(const String & k) override { return inner->head(k); }
+    DB::Cas::ListPage list(const String & p, const String & c, size_t l) override { return inner->list(p, c, l); }
+    DB::Cas::PutResult putIfAbsent(const String & k, const String & b, const DB::Cas::ObjectMeta & m = {}) override { return inner->putIfAbsent(k, b, m); }
+    DB::Cas::WriteSinkPtr putIfAbsentStream(const String & k, const DB::Cas::ObjectMeta & m = {}) override { return inner->putIfAbsentStream(k, m); }
+    DB::Cas::PutResult putOverwrite(const String & k, const String & b, const DB::Cas::Token & e, const DB::Cas::ObjectMeta & m = {}) override { return inner->putOverwrite(k, b, e, m); }
+    DB::Cas::CasResult casPut(const String & k, const String & b, const std::optional<DB::Cas::Token> & e, const DB::Cas::ObjectMeta & m = {}) override { return inner->casPut(k, b, e, m); }
+    DB::Cas::DeleteOutcome deleteExact(const String & k, const DB::Cas::Token & t) override { return inner->deleteExact(k, t); }
+    bool supportsListTokens() const override { return inner->supportsListTokens(); }
+
+private:
+    std::shared_ptr<DB::Cas::Backend> inner;
+};
+}
+
+/// fix-round F5 (author-review: `!got -> continue` in the observation loop, with no sleep and outside
+/// the restart limit, spins `get`/`claimMount`/`put` at backend RTT under persistent slot churn). A
+/// backend that makes the mount slot look vanished to every GET must still terminate (bounded restarts,
+/// not an infinite loop) AND must pace itself (the injected `sleep_fn` must actually fire) rather than
+/// busy-spin.
+TEST(CasMountAwaitExpiry, PersistentSlotVanishPacesAndBoundsRestartsInsteadOfSpinning)
+{
+    auto inner = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    /// A real slot exists underneath (uuid 1, epoch 7) so `claimMount`'s absent-slot `putIfAbsent`
+    /// genuinely fails every time (never accidentally re-mints).
+    ASSERT_EQ(claimMount(*inner, l, "r", UInt128(1), 7, /*now*/ 1000, /*ttl*/ 100).kind, MountClaimResult::Claimed);
+
+    auto vanishing = std::make_shared<AlwaysVanishesBackend>(inner);
+    vanishing->watched_key = l.mountKey("r");
+
+    uint64_t wall = 1000;
+    uint64_t mono = 0;
+    int sleeps = 0;
+    auto now_fn = [&] { return wall; };
+    auto mono_fn = [&] { return mono; };
+    auto sleep_fn = [&](uint64_t ms) { wall += ms; mono += ms; ++sleeps; };
+
+    const auto r = claimMountAwaitingExpiry(
+        *vanishing, l, "r", UInt128(1), /*our_epoch*/ 8, now_fn, mono_fn, /*ttl*/ 100, /*poll*/ 20, sleep_fn);
+    EXPECT_EQ(r.kind, MountClaimResult::LiveDoubleStart) << "must terminate (bounded), not loop forever";
+    EXPECT_GT(sleeps, 0) << "a persistently vanishing slot must still pace via sleep_fn, not busy-spin";
+    /// The real epoch-7 lease is untouched -- every `putIfAbsent` attempt against it genuinely fails
+    /// (the object is still there), so it is never accidentally re-minted over.
+    EXPECT_EQ(decodeMountLease(inner->get(l.mountKey("r"))->bytes).writer_epoch, 7u);
+}
+
 TEST(CasMountAwaitExpiry, ForeignUuidFailsClosedImmediately)
 {
     auto b = std::make_shared<InMemoryBackend>();
@@ -606,6 +674,40 @@ TEST(CasHeartbeatFloor, RenewalBetweenRoundsRestartsObservation)
     ASSERT_TRUE(obs.contains("s1"));
     EXPECT_EQ(obs.at("s1").token, renewed_token);
     EXPECT_EQ(obs.at("s1").first_seen_mono_ms, kStableThresholdMs);
+}
+
+/// fix-round F7 (author-review: `Gc::mount_obs` not pruned for srids gone from LIST -> slow unbounded
+/// growth on a long-lived leader, worsened by pool-member decommission). A srid whose `/mount` key is
+/// removed ENTIRELY (not merely fenced/terminated -- those already `obs.erase` themselves mid-loop) is
+/// never visited by a later LIST pass again, so its observation entry must be pruned at end-of-round,
+/// not linger in `obs` forever.
+TEST(CasHeartbeatFloor, UnseenSridPrunedFromObservationMap)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    seedMount(*b, l, "s1", /*expires*/ 10, /*fenced*/ false, /*min_active*/ 0);
+    seedMount(*b, l, "s2", /*expires*/ 10, /*fenced*/ false, /*min_active*/ 0);
+
+    MountObservationMap obs;
+    computeHeartbeatFloor(*b, l, kNowMs, /*mono*/ 0, kStableThresholdMs, obs);
+    ASSERT_TRUE(obs.contains("s1"));
+    ASSERT_TRUE(obs.contains("s2"));
+
+    /// s2's `/mount` key is removed entirely -- e.g. `SYSTEM CONTENT ADDRESSED DROP POOL MEMBER` -- so
+    /// no future LIST pass will ever visit it again. s1 renews (a live keeper would), so its OWN
+    /// observation restarts and it stays `live` -- isolating this test to the pruning behavior alone,
+    /// not confounding it with s1 also becoming fence-eligible (which would erase its `obs` entry too,
+    /// for an unrelated reason).
+    renewMount(*b, l, "s1");
+    const auto s2_key = l.mountKey("s2");
+    const auto got = b->get(s2_key);
+    ASSERT_TRUE(got.has_value());
+    ASSERT_EQ(b->deleteExact(s2_key, got->token).kind, DeleteOutcome::Kind::Deleted);
+
+    computeHeartbeatFloor(*b, l, kNowMs, /*mono*/ kStableThresholdMs, kStableThresholdMs, obs);
+    EXPECT_TRUE(obs.contains("s1"));
+    EXPECT_FALSE(obs.contains("s2"))
+        << "a srid removed from the LIST entirely must be pruned from obs, not linger forever";
 }
 
 TEST(CasHeartbeatFloor, ClassifiesAndFencesOut)

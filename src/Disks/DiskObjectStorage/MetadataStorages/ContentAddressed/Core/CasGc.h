@@ -5,6 +5,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGcOutcomes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestCodec.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestId.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasOrphanManifestSweep.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRefIntake.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include <Common/ThreadPool.h>
@@ -394,6 +395,12 @@ private:
     /// leader (after a steal, or a process restart) starts empty, which only delays fencing an
     /// already-dead mount by one extra round (safe: never fences early).
     MountObservationMap mount_obs;
+
+    /// fix-round F9 (author-review): `reportLateLogsIfAny`'s one-shot in-memory dedup latch, OWNED BY
+    /// THIS leader instance (see `LateLogDedup`'s doc comment) -- in-memory only, exactly like
+    /// `mount_obs` above: a fresh leader (after a steal or a process restart) starts empty, at worst
+    /// re-emitting one already-reported anomaly once.
+    LateLogDedup late_log_dedup;
 
     /// Task 5: bounded pool for the round's per-hash freshness-meta writes (condemn/spare/delete);
     /// sized from `PoolConfig::gc_meta_pool_size` (constructed in the ctor, after the null/id checks --

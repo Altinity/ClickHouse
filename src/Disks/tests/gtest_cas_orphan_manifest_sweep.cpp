@@ -275,3 +275,55 @@ TEST(CasSweepLateLog, LogBetweenSealedFromAndSealIdIsReportedNotRevived)
         << "the detector only reports the late log -- it must never delete it (that is GC's ordinary "
            "covered-log cleanup's job once folding catches up)";
 }
+
+/// fix-round F9 (author-review: `reportLateLogsIfAny` re-emits the same warning + `RefLateLogDetected`
+/// event every sweep pass, with no dedup, until GC's ordinary covered-log cleanup removes the log --
+/// which can be many rounds later). Two passes over the SAME durably-late log: with a `LateLogDedup`
+/// latch threaded through, only the FIRST pass emits; without one (the default, `nullptr` -- every
+/// pre-existing caller), both passes emit, preserving the original always-report behaviour exactly.
+TEST(CasSweepLateLog, SecondPassSuppressedWithDedupLatchButNotWithoutOne)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    const RootNamespace ns{"00/aa@cas@"};
+    const Layout layout("p");
+    registerNamespaceRaw(*backend, layout, ns);
+
+    RefTableSnapshot seal = minimalLiveSnapshot(ns.string(), RefTxnId{2, std::numeric_limits<uint64_t>::max()});
+    seal.sealed_from = RefTxnId{2, 3};
+    writeRefSnapshotRaw(*backend, layout, seal);
+    const RefTxnId late_log_id{2, 7};
+    writeRefLogTxnRaw(*backend, layout, RefLogTxn{ns.string(), late_log_id, {}});
+    setWatermarkMinActive(*backend, layout, kServerRoot, kWriterEpoch, /*min_active*/6);
+
+    auto store = openStoreForTest(backend);
+    std::vector<CasEvent> events;
+    store->setEventSink([&](const CasEvent & e) { events.push_back(e); });
+
+    /// Two passes WITH a dedup latch threaded through: the log is still durably there (nothing folds
+    /// or deletes it between passes), so without the fix this would emit twice.
+    LateLogDedup dedup;
+    sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5},
+                   /*warnings*/ nullptr, &dedup);
+    sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5},
+                   /*warnings*/ nullptr, &dedup);
+
+    size_t late_log_events = 0;
+    for (const CasEvent & e : events)
+        if (e.type == CasEventType::RefLateLogDetected)
+            ++late_log_events;
+    EXPECT_EQ(late_log_events, 1u)
+        << "a second pass over the SAME still-durable late log must not re-emit with a dedup latch";
+
+    /// Two MORE passes with NO latch (the default): the pre-existing always-report behaviour is
+    /// preserved exactly -- every pre-existing caller (none of them pass a latch) is unaffected.
+    events.clear();
+    sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5});
+    sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5});
+
+    late_log_events = 0;
+    for (const CasEvent & e : events)
+        if (e.type == CasEventType::RefLateLogDetected)
+            ++late_log_events;
+    EXPECT_EQ(late_log_events, 2u)
+        << "with no latch (every pre-existing caller), both passes must still emit -- unchanged default";
+}

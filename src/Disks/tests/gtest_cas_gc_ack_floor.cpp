@@ -671,6 +671,48 @@ TEST(CasGcAckFloor, ExpiredMountFencedOutAndExcluded)
     EXPECT_TRUE(runRoundsUntilAbsent(store, gc, *backend, layout, blob));
 }
 
+/// fix-round F6 (author-review: `Gc`'s own `mono_ms_fn` used to default to the RAW static `Store::
+/// bootMs()`, bypassing the Store's own injectable `config.boot_ms_fn` -- a time-controlled test can
+/// desync the mount side's fake clock from the GC side's real one). This mirrors
+/// `ExpiredMountFencedOutAndExcluded` exactly, except: the Store is opened with an injected
+/// `boot_ms_fn` driving a FAKE clock that barely advances in real time, and `Gc` is constructed WITHOUT
+/// an explicit `mono_ms_fn` -- exercising the DEFAULT under test. If the default still read the real
+/// wall clock, this round would see essentially zero elapsed mono time and never cross the fence-out
+/// threshold; the fix makes it default to `store->bootMsNow()`, which tracks the SAME fake clock.
+TEST(CasGcAckFloor, DefaultMonoClockTracksStoresInjectedBootClockNotWallClock)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    uint64_t fake_boot = 0;
+    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test",
+        .boot_ms_fn = [&] { return fake_boot; }});
+    const Layout & layout = store->layout();
+
+    // A stale mount, exactly as `ExpiredMountFencedOutAndExcluded`: one claim, never renewed again.
+    const String srid2 = "stale-server";
+    MountLeaseKeeper srid2_keeper(backend, layout, srid2, DB::UInt128(0x2222), /*writer_epoch=*/1,
+        std::chrono::milliseconds(100), [] { return 1000u; }, [&] { return fake_boot; });
+    srid2_keeper.start();
+    ASSERT_FALSE(decodeMountLease(backend->get(layout.mountKey(srid2))->bytes).gc_fenced);
+
+    const uint64_t ttl_ms = static_cast<uint64_t>(store->poolConfig().mount_lease_ttl_ms.count());
+    const uint64_t threshold_ms = ttl_ms + ttl_ms / 20
+        + static_cast<uint64_t>(store->poolConfig().mount_renew_period.count());
+
+    // `Gc` constructed with only `now_ms_fn` -- `mono_ms_fn` is left at its DEFAULT (the fix under test).
+    Gc gc(store, kGc, [] { return 1'000'000u; });
+
+    const RoundReport rep1 = gc.runRegularRound();
+    EXPECT_EQ(rep1.fence_outs, 0u);
+
+    store->renewWatermarkOnce();
+    fake_boot = threshold_ms;   // advance the FAKE clock only; this test runs in well under a millisecond
+
+    const RoundReport rep2 = gc.runRegularRound();
+    EXPECT_EQ(rep2.fence_outs, 1u)
+        << "Gc's default mono_ms_fn must track the Store's injected boot clock, not the real wall clock";
+    EXPECT_TRUE(decodeMountLease(backend->get(layout.mountKey(srid2))->bytes).gc_fenced);
+}
+
 /// deleteExact against a blob the writer RECREATED (fresh incarnation, different token) between the pending
 /// publish and the deleting pass lands TokenMismatch — a terminal-OK outcome recorded as a replace: the
 /// fresh incarnation is a live object and survives. report.replaced counts it.
