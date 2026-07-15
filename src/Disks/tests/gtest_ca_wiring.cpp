@@ -1003,31 +1003,62 @@ TEST(CaWiringOps, MoveDirectoryMutableCollisionPolicy)
 }
 
 /// D3 review pin: moveDirectory's staged-merge collision code has four (src build?, dst build?)
-/// combinations. This one — destination already holds a staged Build, source has none (a
-/// mutable-file-only staging never calls `buildFor`, see `writeFile`'s mutable branch) — proved
+/// combinations. This one — destination already holds a staged Build, source has none — proved
 /// confusable when the plan's author sketched a fix: a naive rewrite of the four-way branch can fall
 /// through to `src_st.build->abandon()` on a null build. The merge must be a pure no-op on the
-/// destination's build in this combination — no abandon, no adopt — while everything else (the
-/// mutable file carried over from the source) still merges in and the destination's own content
+/// destination's build in this combination — no abandon, no adopt — while everything else (any
+/// removal marks carried from the source) still merges in and the destination's own content
 /// publishes exactly as staged.
+///
+/// T9-review fix (all-tree-part-files): the ORIGINAL construction staged the source via a
+/// `txn_version.txt` WRITE, relying on the pre-Task-6 "the mutable-file write path never calls
+/// buildFor" fact to keep `src_st.build` null. Since Task 6/9, `writeFile`'s inline-candidate path
+/// (which `txn_version.txt` now takes — it is an ordinary tree entry, not a mutable sidecar file)
+/// unconditionally calls `buildFor` for ANY inline entry, so the source silently acquired a REAL
+/// Build and this test drifted onto the *other* merge branch (`else if (src_st.build)`) without
+/// failing — both branches produce the same externally-visible result (assertions passed either
+/// way), so the drift was invisible. Fixed by staging the source via `unlinkFile` instead of a
+/// write: Task 8's removal-mark staging (`content_removed`) is the one remaining staging shape that
+/// genuinely never calls `buildFor` (`publishStaging`'s own `!st.build && ...` guard depends on
+/// this), so `parts[src_key]` exists but `src_st.build` stays null again, restoring the test's
+/// documented precondition.
+///
+/// Made RED-able (the review's ask): `Build::abandon()` unconditionally emits a `BuildAbort`
+/// `CasEvent` (`CasBuild.cpp`) — this only happens if the buggy `else if (src_st.build)` branch
+/// runs `src_st.build->abandon()`. Registering an event sink (`Cas::Store::setEventSink`, the same
+/// public test hook `gtest_cas_event_log.cpp` uses) and asserting no `BuildAbort` event fires is a
+/// genuine behavioral discriminator between the two merge branches — not just "assertions pass
+/// either way" — so a future regression that gives the source a Build again fails this test loudly.
 TEST(CaWiringOps, MoveDirectoryOntoExistingDestinationBuildSurvives)
 {
     auto storage = openWiringStorage();
+    std::vector<DB::Cas::CasEvent> events;
+    storage->store()->setEventSink([&](const DB::Cas::CasEvent & e) { events.push_back(e); });
+
     auto tx = storage->createTransaction();
     /// Destination already has a real blob upload staged -> a live Build.
     writeThroughTransaction(*tx, "uui/uuid-1/all_7_7_7/data.bin", "dst-content");
-    /// Source is staged with ONLY a mutable per-part file -> parts[src_key] exists, but src_st.build
-    /// stays null (the mutable-file write path never calls buildFor).
-    writeThroughTransaction(*tx, "uui/uuid-1/tmp_z/txn_version.txt", "1");
+    /// Source is staged with ONLY a removal mark (Task 8's content_removed staging) -> parts[src_key]
+    /// exists, but src_st.build stays null (unlinkFile never calls buildFor).
+    tx->unlinkFile("uui/uuid-1/tmp_z/txn_version.txt", /*if_exists=*/false, /*should_remove_objects=*/true);
 
     auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
     EXPECT_NO_THROW(ca_tx.moveDirectory("uui/uuid-1/tmp_z", "uui/uuid-1/all_7_7_7"));
 
-    /// The destination's own build published its own content untouched; the source's mutable file
-    /// rode along.
+    /// The destination's own build published its own content untouched. The source's removal mark
+    /// names a path that was never actually committed anywhere, so it is a harmless no-op once
+    /// merged into the destination's (first-time-published) staging.
     EXPECT_TRUE(storage->existsDirectory("uui/uuid-1/all_7_7_7"));
     EXPECT_EQ(storage->getFileSize("uui/uuid-1/all_7_7_7/data.bin"), 11u);   /// "dst-content"
-    EXPECT_EQ(storage->tryGetInManifestBytes("uui/uuid-1/all_7_7_7/txn_version.txt"), std::optional<String>("1"));
+    EXPECT_FALSE(storage->tryGetInManifestBytes("uui/uuid-1/all_7_7_7/txn_version.txt").has_value());
+
+    /// The discriminator: no BuildAbort event means src_st.build->abandon() was never called, i.e.
+    /// the intended neither-branch no-op merge ran, not the two-builds merge-and-abandon branch.
+    EXPECT_FALSE(std::any_of(events.begin(), events.end(),
+        [](const DB::Cas::CasEvent & e) { return e.type == DB::Cas::CasEventType::BuildAbort; }))
+        << "src_st.build->abandon() fired — the source unexpectedly has a real Build again";
+
+    storage->store()->setEventSink(nullptr);
 }
 
 TEST(CaWiringOps, FreezeViaHardLinksIntoShadow)
