@@ -697,18 +697,14 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
         throw Exception(ErrorCodes::NOT_IMPLEMENTED,
             "ContentAddressedTransaction::writeFile: not a part file path: {}", path);
 
-    /// A MUTABLE per-part file stages into the part's payload map; commit publishes it (with the
-    /// part for a staged part, via updateRefPayload for a committed one).
-    if (ContentAddressed::isMutablePerPartFile(r->file))
-    {
-        return std::make_unique<ContentAddressed::CaInlineWriteBuffer>(
-            [this, route = *r](std::string bytes)
-            {
-                auto & st = stagingFor(route);
-                st.mutable_files[route.file] = std::move(bytes);
-                st.mutable_removed.erase(route.file);
-            });
-    }
+    /// all-tree-part-files Task 6 (spec 2026-07-14-cas-all-tree-part-files-design.md §4): the former
+    /// mutable-per-part-file branch (uuid.txt/metadata_version.txt/txn_version.txt staging directly
+    /// into `mutable_files`) is DELETED here — these three names now fall through to the ordinary
+    /// content path below like any other tree file. `kMutablePerPartFiles`/`isMutablePerPartFile`
+    /// itself stays (Task 9 sweeps the remaining readers that still special-case it); the ONLY change
+    /// is that `writeFile` no longer POPULATES `mutable_files` for them. During part build they land
+    /// in the initial manifest with every other staged file; a standalone write on an already-
+    /// committed part repoints (Task 4).
 
     /// A CONTENT part file that must stay a blob (per-column data/marks, primary.idx): spill + hash,
     /// then stage the blob as PENDING (B188 precommit-first). The blob is NOT uploaded/promoted here;
@@ -946,11 +942,14 @@ void ContentAddressedTransaction::createHardLink(const std::string & path_from, 
             }
         /// Force-fresh (Pillar B): projection hardlink source — carry the current payload.
         auto resolved = metadata_storage.partAccess().resolve(src->refKey(), ContentAddressed::Freshness::ForceFresh);
-        if (!resolved || !resolved->mutable_files.contains(src->file))
-            throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
-                "ContentAddressed: createHardLink source mutable file missing: {}", path_from);
-        dst_st.mutable_files[dst->file] = resolved->mutable_files.at(src->file);
-        return;
+        if (resolved && resolved->mutable_files.contains(src->file))
+        {
+            dst_st.mutable_files[dst->file] = resolved->mutable_files.at(src->file);
+            return;
+        }
+        /// all-tree-part-files Task 6: not found as a legacy mutable payload (staged or committed) —
+        /// fall through to the content-file path below, which handles uuid.txt/metadata_version.txt/
+        /// txn_version.txt exactly like any other entry now that `writeFile` stages them there.
     }
 
     /// Content file. Prefer an entry staged earlier in THIS transaction (the destination Build
@@ -1123,6 +1122,20 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
             PartStaging & src_st = src_it->second;
             for (auto & entry : src_st.entries)
             {
+                /// all-tree-part-files Task 6: uuid.txt/metadata_version.txt/txn_version.txt now stage
+                /// as ordinary entries, so they need the SAME collision policy the `mutable_files` loop
+                /// below already enforces for them — differing content at the same path is a genuine
+                /// collision (fail loud), identical content is a benign idempotent re-key. Scoped to
+                /// former-mutable names only: the general entries-merge policy (source-wins, no
+                /// collision check) for ordinary content files is UNCHANGED.
+                if (ContentAddressed::isMutablePerPartFile(entry.path))
+                    if (const auto existing = std::find_if(dst_st.entries.begin(), dst_st.entries.end(),
+                            [&](const Cas::ManifestEntry & e) { return e.path == entry.path; });
+                        existing != dst_st.entries.end() && !(*existing == entry))
+                        throw Exception(ErrorCodes::LOGICAL_ERROR,
+                            "ContentAddressed: moveDirectory mutable-file collision on '{}' ({} -> {}): "
+                            "source and destination staged different bytes for the same file",
+                            entry.path, src->ref, dst->ref);
                 std::erase_if(dst_st.entries, [&](const Cas::ManifestEntry & e) { return e.path == entry.path; });
                 dst_st.entries.push_back(std::move(entry));
             }

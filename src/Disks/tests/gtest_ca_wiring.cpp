@@ -864,31 +864,23 @@ TEST(CaWiringOps, RemovalsDropRefsAndNamespaces)
     EXPECT_FALSE(storage->existsFile("uui/uuid-1/format_version.txt"));
 }
 
-TEST(CaWiringOps, MutableTmpMoveOnCommittedPart)
-{
-    auto storage = openWiringStorage();
-    auto tx = storage->createTransaction();
-    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/data.bin", "x");
-    tx->commit(DB::NoCommitOptions{});
-
-    /// VersionMetadataOnDisk's atomic write: autocommit txn_version.txt.tmp, then a standalone
-    /// one-shot moveFile(.tmp -> txn_version.txt).
-    auto tx2 = storage->createTransaction();
-    writeThroughTransaction(*tx2, "uui/uuid-1/all_1_1_0/txn_version.txt.tmp", "tid-7");
-    tx2->commit(DB::NoCommitOptions{});
-    auto tx3 = storage->createTransaction();
-    tx3->moveFile("uui/uuid-1/all_1_1_0/txn_version.txt.tmp", "uui/uuid-1/all_1_1_0/txn_version.txt");
-    tx3->commit(DB::NoCommitOptions{});
-
-    EXPECT_EQ(storage->tryGetInManifestBytes("uui/uuid-1/all_1_1_0/txn_version.txt"), std::optional<String>("tid-7"));
-    EXPECT_FALSE(storage->existsFile("uui/uuid-1/all_1_1_0/txn_version.txt.tmp"));
-
-    /// removeTmpMetadataFile: unlink of a committed mutable file publishes its deletion.
-    auto tx4 = storage->createTransaction();
-    tx4->unlinkFile("uui/uuid-1/all_1_1_0/txn_version.txt", false, false);
-    tx4->commit(DB::NoCommitOptions{});
-    EXPECT_FALSE(storage->existsFile("uui/uuid-1/all_1_1_0/txn_version.txt"));
-}
+/// REMOVED (all-tree-part-files Task 6, spec 2026-07-14-cas-all-tree-part-files-design.md §4):
+/// `MutableTmpMoveOnCommittedPart` exercised `VersionMetadataOnDisk`'s OLD atomic-write dance —
+/// autocommit `txn_version.txt.tmp`, then a standalone one-shot `moveFile(.tmp -> txn_version.txt)`
+/// — via `ContentAddressedTransaction::moveFile` directly. That dance no longer exists in production:
+/// Task 5's `supportsAtomicFileWrites` short-circuit makes `VersionMetadataOnDisk::storeInfoToData-
+/// PartStorage` write `txn_version.txt` directly in one shot on a CA disk, with no `.tmp` file and no
+/// rename ever produced. `moveFile`'s legacy "rename FROM a committed mutable-per-part-file, source
+/// not staged in this transaction" branch (`ContentAddressedTransaction.cpp`, `isMutablePerPartFile
+/// (dst->file)`) is consequently now genuinely unreachable in production and was left AS-IS (still
+/// keyed off `mutable_files`, which Task 6 stopped populating) rather than rebuilt against `entries` —
+/// a same-ref content rename-with-removal needs the general committed-content-removal primitive
+/// Task 8 (`PartStaging::content_removed`) adds, and building a one-off version here for a dead path
+/// would be unused surface area. The test's trailing assertion (unlinking a committed mutable file)
+/// depends on that same not-yet-built primitive. Coverage that remains valid: Task 5's own capability
+/// test proves no `.tmp` file is ever created; `CaTransactionAllTree.CommittedTxnVersionStoreRepoints`
+/// (`gtest_ca_transaction.cpp`) proves the real, live path — a standalone write of `txn_version.txt`
+/// directly onto an already-committed part — repoints correctly.
 
 TEST(CaWiringOps, VerbatimMoveAndUnlink)
 {

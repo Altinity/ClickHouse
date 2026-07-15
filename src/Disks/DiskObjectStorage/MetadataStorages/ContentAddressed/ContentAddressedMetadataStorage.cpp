@@ -701,8 +701,15 @@ bool ContentAddressedMetadataStorage::existsFile(const std::string & path) const
     {
         /// Force-fresh (Pillar B): read-your-writes for a just-written mutable file — no TTL-stale manifest.
         auto resolved = partAccess().resolve(r->refKey(), ContentAddressed::Freshness::ForceFresh);
-        return resolved && !ContentAddressed::PartFolderView::isReservedMutableName(r->file)
-            && resolved->mutable_files.contains(r->file);
+        if (resolved && !ContentAddressed::PartFolderView::isReservedMutableName(r->file)
+            && resolved->mutable_files.contains(r->file))
+            return true;
+        /// all-tree-part-files Task 6: uuid.txt/metadata_version.txt/txn_version.txt now flow through
+        /// the ordinary content path (`writeFile` no longer stages them as mutable) -- fall through to
+        /// the manifest-entry lookup below when not found as a legacy mutable payload. Safe to serve a
+        /// CACHED view here (not force-fresh): every committed-ref write that could have moved this
+        /// entry (`repointRef`/`promoteBuild`) erases the cached view on success, so a stale hit is
+        /// impossible by construction, not by freshness policy.
     }
 
     auto view = partAccess().getView(r->refKey(), ContentAddressed::Freshness::CachedForLoad);
@@ -900,7 +907,9 @@ uint64_t ContentAddressedMetadataStorage::getFileSize(const std::string & path) 
         if (resolved && !ContentAddressed::PartFolderView::isReservedMutableName(r->file))
             if (auto it = resolved->mutable_files.find(r->file); it != resolved->mutable_files.end())
                 return it->second.size();
-        throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no object for {}", path);
+        /// all-tree-part-files Task 6: fall through to the manifest-entry lookup (see existsFile) —
+        /// not found as a legacy mutable payload does not mean absent, now that writeFile stages
+        /// these names as ordinary entries.
     }
 
     auto view = partAccess().getView(r->refKey(), ContentAddressed::Freshness::CachedForLoad);
@@ -1134,13 +1143,11 @@ std::optional<StoredObjects> ContentAddressedMetadataStorage::getStorageObjectsI
     {
         /// Force-fresh (Pillar B), same contract as existsFile/tryGetInManifestBytes.
         auto resolved = partAccess().resolve(r->refKey(), ContentAddressed::Freshness::ForceFresh);
-        if (!resolved || ContentAddressed::PartFolderView::isReservedMutableName(r->file))
-            return std::nullopt;
-        const auto it = resolved->mutable_files.find(r->file);
-        if (it == resolved->mutable_files.end())
-            return std::nullopt;
-        /// Sized empty-key placeholder — same shape getStorageObjects returns for in-manifest bytes.
-        return StoredObjects{StoredObject("", path, it->second.size())};
+        if (resolved && !ContentAddressed::PartFolderView::isReservedMutableName(r->file))
+            if (const auto it = resolved->mutable_files.find(r->file); it != resolved->mutable_files.end())
+                /// Sized empty-key placeholder — same shape getStorageObjects returns for in-manifest bytes.
+                return StoredObjects{StoredObject("", path, it->second.size())};
+        /// all-tree-part-files Task 6: fall through to the manifest-entry lookup (see existsFile).
     }
 
     auto view = partAccess().getView(r->refKey(), ContentAddressed::Freshness::CachedForLoad);
@@ -1181,12 +1188,11 @@ std::optional<String> ContentAddressedMetadataStorage::tryGetInManifestBytes(con
     {
         /// Force-fresh (Pillar B): MVCC txn_version / mutable-file read — must not serve a TTL-stale manifest.
         auto resolved = partAccess().resolve(r->refKey(), ContentAddressed::Freshness::ForceFresh);
-        if (!resolved || ContentAddressed::PartFolderView::isReservedMutableName(r->file))
-            return std::nullopt;
-        auto it = resolved->mutable_files.find(r->file);
-        if (it == resolved->mutable_files.end())
-            return std::nullopt;
-        return it->second;
+        if (resolved && !ContentAddressed::PartFolderView::isReservedMutableName(r->file))
+            if (auto it = resolved->mutable_files.find(r->file); it != resolved->mutable_files.end())
+                return it->second;
+        /// all-tree-part-files Task 6: fall through to the manifest-entry lookup (see existsFile) —
+        /// uuid.txt/metadata_version.txt/txn_version.txt now flow through the ordinary content path.
     }
 
     auto view = partAccess().getView(r->refKey(), ContentAddressed::Freshness::CachedForLoad);

@@ -191,3 +191,79 @@ TEST(CaTransactionRepoint, StandaloneWriteOnCommittedPartRepoints)
     const auto rep = DB::Cas::runFsck(*storage->store(), /*detail*/false);
     EXPECT_EQ(rep.dangling, 0u);
 }
+
+/// all-tree-part-files Task 6 (spec 2026-07-14-cas-all-tree-part-files-design.md §4): the mutable-
+/// per-part-file branch is deleted from `writeFile` -- uuid.txt/metadata_version.txt/txn_version.txt
+/// now flow down the ordinary content path, landing in the manifest like any other file.
+TEST(CaTransactionAllTree, BuildTimeSidecarsLandInManifest)
+{
+    auto storage = openTxStorage();
+    auto tx = storage->createTransaction();
+    writeFileTx(*tx, "uui/uuid-alltree-1/tmp_insert_all_1_1_0/uuid.txt", "part-uuid-bytes");
+    writeFileTx(*tx, "uui/uuid-alltree-1/tmp_insert_all_1_1_0/metadata_version.txt", "3");
+    writeFileTx(*tx, "uui/uuid-alltree-1/tmp_insert_all_1_1_0/txn_version.txt", "creation_tid: (1,1,00000000-0000-0000-0000-000000000000)");
+    writeFileTx(*tx, "uui/uuid-alltree-1/tmp_insert_all_1_1_0/data.bin", "the-data-bytes");
+    tx->moveDirectory("uui/uuid-alltree-1/tmp_insert_all_1_1_0", "uui/uuid-alltree-1/all_1_1_0");
+    tx->commit(DB::NoCommitOptions{});
+
+    const auto ns = storage->liveNamespace("uuid-alltree-1");
+    const auto resolved = storage->store()->resolveRef(ns, "all_1_1_0");
+    ASSERT_TRUE(resolved.has_value());
+    EXPECT_TRUE(resolved->mutable_files.empty())
+        << "the three sidecar files must no longer be staged into RefPayload.mutable_files";
+
+    const DB::Cas::PartManifest manifest = storage->store()->readManifest(resolved->manifest_id);
+    const auto & entries = manifest.entries;
+    const auto * uuid_entry = findByName(entries, "uuid.txt");
+    const auto * meta_version_entry = findByName(entries, "metadata_version.txt");
+    const auto * txn_version_entry = findByName(entries, "txn_version.txt");
+    ASSERT_TRUE(uuid_entry && meta_version_entry && txn_version_entry)
+        << "all three sidecar files must land in the manifest as ordinary tree entries";
+    EXPECT_EQ(uuid_entry->placement, DB::Cas::EntryPlacement::Inline);
+    EXPECT_EQ(meta_version_entry->placement, DB::Cas::EntryPlacement::Inline);
+    EXPECT_EQ(txn_version_entry->placement, DB::Cas::EntryPlacement::Inline);
+    EXPECT_EQ(meta_version_entry->inline_bytes, "3");
+
+    /// And they are readable through the normal read path (Task 6's fallback fix in existsFile /
+    /// getFileSize / tryGetInManifestBytes — reachable because `isMutablePerPartFile` still classifies
+    /// these names, but they are no longer found in `mutable_files`).
+    EXPECT_TRUE(storage->existsFile("uui/uuid-alltree-1/all_1_1_0/metadata_version.txt"));
+    EXPECT_EQ(storage->getFileSize("uui/uuid-alltree-1/all_1_1_0/metadata_version.txt"), 1u);
+}
+
+/// A standalone one-shot write of txn_version.txt onto an ALREADY-COMMITTED part (the MVCC creation-
+/// CSN fill-in / removal-TID rewrite shape) must repoint (Task 4), never orphan the rest of the part.
+TEST(CaTransactionAllTree, CommittedTxnVersionStoreRepoints)
+{
+    auto storage = openTxStorage();
+
+    /// 1. Commit a part WITHOUT txn_version.txt.
+    {
+        auto tx = storage->createTransaction();
+        writeFileTx(*tx, "uui/uuid-alltree-2/tmp_insert_all_1_1_0/checksums.txt", "cs-bytes");
+        writeFileTx(*tx, "uui/uuid-alltree-2/tmp_insert_all_1_1_0/data.bin", "the-data-bytes");
+        tx->moveDirectory("uui/uuid-alltree-2/tmp_insert_all_1_1_0", "uui/uuid-alltree-2/all_1_1_0");
+        tx->commit(DB::NoCommitOptions{});
+    }
+    ASSERT_FALSE(storage->existsFile("uui/uuid-alltree-2/all_1_1_0/txn_version.txt"));
+
+    const uint64_t repoints_before = ProfileEvents::global_counters[ProfileEvents::CasRefRepoint].load();
+
+    /// 2. A single-op transaction writes ONLY txn_version.txt onto the already-committed part (mirrors
+    /// the MVCC one-shot autocommit shape: no other file touched in this transaction).
+    {
+        auto tx = storage->createTransaction();
+        writeFileTx(*tx, "uui/uuid-alltree-2/all_1_1_0/txn_version.txt", "creation_tid: (2,2,00000000-0000-0000-0000-000000000000)");
+        tx->commit(DB::NoCommitOptions{});
+    }
+
+    /// 3. Exactly one repoint; the new file is served; the original files are intact (carry-forward).
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasRefRepoint].load(), repoints_before + 1);
+    EXPECT_TRUE(storage->existsFile("uui/uuid-alltree-2/all_1_1_0/txn_version.txt"));
+    EXPECT_EQ(storage->getFileSize("uui/uuid-alltree-2/all_1_1_0/txn_version.txt"), 56u);
+    EXPECT_EQ(storage->getFileSize("uui/uuid-alltree-2/all_1_1_0/checksums.txt"), 8u);
+    EXPECT_EQ(storage->getFileSize("uui/uuid-alltree-2/all_1_1_0/data.bin"), 14u);
+
+    const auto rep = DB::Cas::runFsck(*storage->store(), /*detail*/false);
+    EXPECT_EQ(rep.dangling, 0u);
+}
