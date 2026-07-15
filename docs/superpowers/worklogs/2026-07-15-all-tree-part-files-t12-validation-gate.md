@@ -66,3 +66,15 @@ the relink-eligibility branch first, not a copy-paste test) — recorded as a sc
 line (`docs/superpowers/cas/BACKLOG.md` §10) instead of rushed into the gate.
 
 All 4 gate steps: **PASS**. Full details in `.superpowers/sdd/all-tree/task-12-report.md`.
+
+## Milestone 20-min soak {#milestone-soak}
+
+`utils/ca-soak/logs/soak_t12_milestone.log`: `python3 -m soak.run --seed 20260715 --phase 3
+--duration 1200` on a fresh cluster (T12's rebuilt binary) — **GREEN**, `SOAK_EXIT=0`, `PHASE3 OK`.
+fsck `unreachable=0`/`dangling=0` at both recovery checkpoints and the final converge checkpoint; 0
+`ABORTED`-retried inserts; 214 transport-retried op attempts (`node_down` class, driver-retried
+through 2 fired faults + 1 restart) — all availability-class, not correctness. Four measured
+findings from live introspection during the run are on BACKLOG as `db28579459a`
+(`PART-REMOVAL-REPOINT`, `GC-EMPTY-SHARD-PROBES`, `REF-QUEUE-WAIT`, `RUSTFS-ERROR-XML`) — see that
+commit, not re-derived here. Teardown: `docker compose down -v` (green run, no log archiving
+needed).
