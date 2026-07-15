@@ -113,9 +113,12 @@ def test_drop_dead_pool_member_heals_the_pool():
 
     # (5) Wait until node1 observes node2's mount as no longer live (expired once its lease's TTL
     #     elapses with no renewal, since there was no graceful farewell to mark it terminated instead).
+    #     min() because node1 sees the pool through TWO disks (the writable disk + the disk_ca_ro
+    #     fsck window), so the mounts table carries one row per disk view for the same srid --
+    #     aggregate to a single row for the equality assert.
     assert_eq_with_retry(
         node1,
-        "SELECT state != 'live' FROM system.content_addressed_mounts WHERE srid = '{}'".format(
+        "SELECT min(state != 'live') FROM system.content_addressed_mounts WHERE srid = '{}'".format(
             SRID2
         ),
         "1",
