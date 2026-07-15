@@ -163,7 +163,7 @@ lost their index because nothing seeks into them.
 One JSON object per file. Example (heartbeat, formerly the 24-byte unversioned exception):
 
 ```text
-{"type":"cas_gc_hb","v":1,"by":"<32hex>","seq":"1741"}
+{"type":"cas_gc_hb","v":3,"by":"<32hex>","seq":"1741"}
 ```
 
 - Tiny singletons (`cas_pool_meta`, `cas_gc_state`, `cas_gc_hb`, `cas_owner`, `cas_epoch`,
@@ -192,7 +192,7 @@ The GC data plane: unbounded-cardinality sorted record sets, written once per GC
 generation/attempt/shard, always read whole.
 
 ```text
-{"type":"cas_run","v":1,"kind":"source_edge"}
+{"type":"cas_run","v":3,"kind":"source_edge"}
 {"b":"01<digest-hex>","s":"<32hex>","m":"edge"}
 {"b":"01<digest-hex>","s":"<32hex>","m":"zero"}
 ...
@@ -237,7 +237,7 @@ text that base64 would blind.
 **Shape: JSON descriptor lines, then a raw payload zone with `head -v`-style banners:**
 
 ```text
-{"type":"cas_part_manifest","v":1}
+{"type":"cas_part_manifest","v":3}
 {"path":"columns.txt","inline":{"off":0,"len":34}}
 {"path":"count.txt","inline":{"off":56,"len":7}}
 {"path":"data.bin","blob":{"hash":"<hex>","size":"184549376"}}
