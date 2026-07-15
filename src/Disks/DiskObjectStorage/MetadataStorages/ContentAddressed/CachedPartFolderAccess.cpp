@@ -22,6 +22,7 @@ namespace ProfileEvents
     extern const Event CasPartFolderViewInvalidations;
     extern const Event CasRefRollbackBestEffortDropFailed;
     extern const Event CasPartFolderValidateSkipped;
+    extern const Event CasRefRepoint;
 }
 
 namespace CurrentMetrics
@@ -213,15 +214,17 @@ bool CachedPartFolderAccess::existsRef(const PartRefKey & key, Freshness freshne
 }
 
 void CachedPartFolderAccess::promoteBuild(Cas::Build & build, const PartRefKey & key, UInt128 build_id,
-                                          const Cas::ManifestId & manifest_id, std::map<String, String> mutable_files)
+                                          const Cas::ManifestId & manifest_id, std::map<String, String> mutable_files,
+                                          bool allow_repoint)
 {
     build.setPendingMutableFiles(std::move(mutable_files));
-    build.promote(key.ns, key.ref, build_id, manifest_id);
+    build.promote(key.ns, key.ref, build_id, manifest_id, allow_repoint);
     eraseView(key);
 }
 
 void CachedPartFolderAccess::publishEntries(const PartRefKey & dst,
-    const std::vector<Cas::ManifestEntry> & entries, std::map<String, String> mutable_files, Cas::ProvenanceOp op)
+    const std::vector<Cas::ManifestEntry> & entries, std::map<String, String> mutable_files, Cas::ProvenanceOp op,
+    bool allow_repoint)
 {
     auto build = store->startBuild(Cas::BuildInfo{.intended_ref = dst.ns.string() + "/" + dst.ref,
                                                   .intended_namespace = dst.ns, .op = op});
@@ -233,7 +236,7 @@ void CachedPartFolderAccess::publishEntries(const PartRefKey & dst,
     /// single-owner ManifestId, so dst gets its own id), then move ownership in.
     const Cas::ManifestId id = build->stageManifest(entries);
     build->precommitAdd(dst.ns, dst.ref, id);
-    promoteBuild(*build, dst, build->buildId(), id, std::move(mutable_files));
+    promoteBuild(*build, dst, build->buildId(), id, std::move(mutable_files), allow_repoint);
 }
 
 bool CachedPartFolderAccess::republishRef(const PartRefKey & src, const PartRefKey & dst)
@@ -274,6 +277,31 @@ bool CachedPartFolderAccess::republishRef(const PartRefKey & src, const PartRefK
     /// Mutable files carry over (a rename is not a new part). promote stamps the dst publish clock.
     publishEntries(dst, src_manifest->entries, resolved->mutable_files, Cas::ProvenanceOp::Other);
     dropRef(src);
+    return true;
+}
+
+bool CachedPartFolderAccess::repointRef(const PartRefKey & key, std::vector<Cas::ManifestEntry> entries, Cas::ProvenanceOp op)
+{
+    /// Byte-equal no-op: compare the candidate `entries` directly against the CURRENTLY committed
+    /// manifest's decoded entries — the same structural comparison `republishRef`'s BUG 1c fix uses
+    /// above (`dst_manifest->entries != src_manifest->entries`). This must NOT stage a candidate
+    /// manifest first: `stageManifest` mints a non-content-derived `ManifestRef` (epoch/build_seq/
+    /// ordinal) AND durably PUTs the encoded body on every call (CasBuild.cpp), so staging-then-
+    /// comparing IDs would itself be a pool mutation on the byte-equal path — violating the "ZERO
+    /// pool mutations" contract this primitive exists to provide.
+    auto resolved = resolve(key, Freshness::ForceFresh);
+    if (resolved)
+    {
+        const auto committed_manifest = store->readManifestShared(resolved->manifest_id);
+        if (committed_manifest->entries == entries)
+            return false;
+    }
+    /// `publishEntries` takes `entries` by const&, so it is read here after the call without issue.
+    publishEntries(key, entries, /*mutable_files=*/{}, op, /*allow_repoint=*/true);
+    ProfileEvents::increment(ProfileEvents::CasRefRepoint);
+    LOG_WARNING(getLogger("CachedPartFolderAccess"),
+        "Repointed committed ref {}/{} ({} entries) — standalone write/remove on a committed part",
+        key.ns.string(), key.ref, entries.size());
     return true;
 }
 

@@ -774,6 +774,7 @@ The server successfully detected this situation and will download merged part fr
     M(CasBlobGetStream,  "CA blob get-stream S3 ops", ValueType::Number) \
     M(CasBlobDelete,     "CA blob delete S3 ops", ValueType::Number) \
     M(CasBlobList,       "CA blob list S3 ops", ValueType::Number) \
+    M(CasRefRepoint, "CA committed-ref repoints (standalone write/remove on a committed part republished the manifest)", ValueType::Number) \
     M(CasManifestPut,        "CA manifest put S3 ops", ValueType::Number) \
     M(CasManifestPutDedup,   "CA manifest put-dedup S3 ops", ValueType::Number) \
     M(CasManifestOverwrite,  "CA manifest overwrite S3 ops", ValueType::Number) \

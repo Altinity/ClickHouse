@@ -89,15 +89,26 @@ public:
     /// direction). Committed-ref mutations anywhere else in wiring are style-check failures.
 
     /// The transaction's terminal publish: pending mutable payload + the atomic owner move.
+    /// `allow_repoint` (all-tree-part-files Task 2/3): threads through to `Build::promote`, opting
+    /// into retargeting a committed ref that already names a DIFFERENT manifest.
     void promoteBuild(Cas::Build & build, const PartRefKey & key, UInt128 build_id,
-                      const Cas::ManifestId & manifest_id, std::map<String, String> mutable_files);
+                      const Cas::ManifestId & manifest_id, std::map<String, String> mutable_files,
+                      bool allow_repoint = false);
     /// The shared committed-publish sequence (spec §Two-Level API, level 2): adopt-evidence over
     /// `entries`, stage a FRESH manifest, precommit, promote. Used by republishRef and by
     /// adoptPartFromManifest (their bodies were near-duplicates).
     void publishEntries(const PartRefKey & dst, const std::vector<Cas::ManifestEntry> & entries,
-                        std::map<String, String> mutable_files, Cas::ProvenanceOp op);
+                        std::map<String, String> mutable_files, Cas::ProvenanceOp op,
+                        bool allow_repoint = false);
     /// Move a COMMITTED ref by republish + drop-source. false = absent source (nothing written).
     bool republishRef(const PartRefKey & src, const PartRefKey & dst);
+    /// Standalone write/remove on an already-COMMITTED part (all-tree-part-files Task 3, spec §4):
+    /// republishes `key`'s manifest with `entries`. Byte-equal candidate (same decoded entries as the
+    /// currently committed manifest) is a ZERO-pool-mutation no-op, returns false. Otherwise republishes
+    /// via `publishEntries(allow_repoint=true)`, audits loudly (`ProfileEvents::CasRefRepoint` +
+    /// `LOG_WARNING`; `Build::promote` itself emits the `CasEventType::RefRepoint` event), erases the
+    /// cached view, and returns true. `key` must already resolve (a repoint targets a committed ref).
+    bool repointRef(const PartRefKey & key, std::vector<Cas::ManifestEntry> entries, Cas::ProvenanceOp op);
     /// Mutable-only committed update (autocommit one-shots on a COMMITTED part). NO journal event.
     void updateMutableFiles(const PartRefKey & key, std::function<void(Cas::RefMutableFilesUpdate &)> mutator);
     void dropRef(const PartRefKey & key);
