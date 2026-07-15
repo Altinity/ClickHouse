@@ -115,6 +115,9 @@ public:
     /// Verify the accumulated whole-file checksum against the seal's `RunRef.checksum`; CORRUPTED_DATA on
     /// mismatch. Call after draining the run and before acting on its records.
     void verifyAgainst(const UInt128 & expected);
+    /// The accumulated whole-file checksum after draining the run — non-throwing, for a read-only auditor
+    /// (fsck) that catalogues a mismatch and continues instead of failing closed. Call after draining.
+    UInt128 accumulatedChecksum();
 
 private:
     friend SourceEdgeRunView openSourceEdgeRun(std::string_view bytes);

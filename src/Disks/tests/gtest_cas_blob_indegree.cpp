@@ -254,6 +254,40 @@ DecodedRun decodeRun(InMemoryBackend & backend, const RunRef & run)
 
 }
 
+/// Per-consumer whole-file seal-checksum RED tests (codecs-v3 phase 5, Task 6): a run whose ROWS are
+/// well-formed (so `cursor.advance()` never aborts first) but whose `RunRef.checksum` disagrees with the
+/// stored bytes must fail closed at each deletion-deriving consumer BEFORE any decision is produced. The
+/// stored bytes are the valid run; only the seal checksum handed to the consumer is wrong.
+TEST(CasBlobInDegree, FoldSealChecksumMismatchFailsClosed)
+{
+    InMemoryBackend backend;
+    Layout layout{"pool"};
+    const RunRef good = writeSourceEdgeRun(backend, layout, /*gen*/1, /*attempt*/0, /*shard*/0,
+                                           /*condemned*/{}, /*edges*/{{b(1), s(1)}});
+    RunRef bad = good;
+    bad.checksum = good.checksum + 1;   /// rows still parse; only the seal disagrees
+    std::vector<RunRef> prior{bad};
+    std::vector<RunRef> out;
+    /// A delta on a DIFFERENT blob forces the two-cursor merge to stream the prior run to completion, so
+    /// the end-of-segment verifyAgainst fires (not a row-invariant abort).
+    EXPECT_THROW(
+        foldDeltasIntoGeneration(backend, layout, prior, /*new*/2, /*attempt*/0, /*shard*/0,
+                                 std::vector<BlobDelta>{{bh(2), s(1), false}}, out),
+        DB::Exception);
+}
+
+TEST(CasBlobInDegree, ZeroInDegreeSealChecksumMismatchFailsClosed)
+{
+    InMemoryBackend backend;
+    Layout layout{"pool"};
+    const RunRef good = writeSourceEdgeRun(backend, layout, /*gen*/1, /*attempt*/0, /*shard*/0,
+                                           /*condemned*/{}, /*edges*/{{b(1), s(1)}});
+    RunRef bad = good;
+    bad.checksum = good.checksum + 1;
+    std::vector<RunRef> runs{bad};
+    EXPECT_THROW(zeroInDegree(backend, runs), DB::Exception);
+}
+
 TEST(CasThreeCursorMerge, FloorBoundary)
 {
     InMemoryBackend backend;

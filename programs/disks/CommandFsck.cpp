@@ -104,6 +104,7 @@ public:
                     case Cas::FsckClass::AwaitingGc:  c = "awaiting-gc"; break;
                     case Cas::FsckClass::Unaccounted: c = "unaccounted"; break;
                     case Cas::FsckClass::SnapshotOracleMismatch: c = "snapshot-oracle-mismatch"; break;
+                    case Cas::FsckClass::CorruptedRun: c = "corrupted-run"; break;
                 }
                 std::cout << c << "\t" << o.key << "\t" << o.size;
                 for (const auto & r : o.reachable_from)

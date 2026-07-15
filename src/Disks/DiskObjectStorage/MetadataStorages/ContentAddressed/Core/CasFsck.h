@@ -32,6 +32,10 @@ enum class FsckClass : uint8_t
                    /// PERSISTENT occurrences should be impossible (INV-2 reachability-before-content)
     SnapshotOracleMismatch,  /// a published table snapshot's bytes diverge from an independent replay of
                              /// its logs (spec §Snapshot Publication oracle) — cache/codec corruption, ERROR
+    CorruptedRun,  /// a gc source-edge run's whole-file seal-checksum (RunRef.checksum) disagrees with the
+                   /// stored bytes (codecs-v3 phase 5) — cataloged so the read-only audit enumerates every
+                   /// finding in one pass; the deletion-deriving consumers (fold/zeroInDegree/previewDeletes)
+                   /// still fail closed on the same mismatch. ERROR
 };
 
 struct FsckObject
@@ -68,6 +72,11 @@ struct FsckReport
     uint64_t snapshot_oracle_mismatches = 0;
     uint64_t snapshot_oracle_checked = 0;
 
+    /// GC source-edge runs whose whole-file seal-checksum did not match the stored bytes (codecs-v3
+    /// phase 5). Cataloged (with the run key in `objects`) and the audit CONTINUES — a read-only auditor
+    /// enumerates all problems in one pass rather than aborting on the first corrupt run.
+    uint64_t corrupted_runs = 0;
+
     uint64_t physical_bytes = 0;
     uint64_t referenced_logical_bytes = 0;
     uint64_t total_blob_refs = 0;
@@ -81,7 +90,7 @@ struct FsckReport
     std::vector<FsckObject> objects;
 
     double dedupRatio() const { return distinct_blobs ? double(total_blob_refs) / double(distinct_blobs) : 0.0; }
-    bool clean() const { return dangling == 0 && meta_without_body == 0 && snapshot_oracle_mismatches == 0; }
+    bool clean() const { return dangling == 0 && meta_without_body == 0 && snapshot_oracle_mismatches == 0 && corrupted_runs == 0; }
 };
 
 /// Independent reachability check: recompute reachability from the authoritative refs (NEVER from

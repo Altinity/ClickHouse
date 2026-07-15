@@ -480,9 +480,18 @@ void runFsckImpl(Store & store, bool detail, const FsckProgress & on_progress, c
                         if (on_progress && ++rows % 65536 == 0)
                             on_progress("reading gc snapshot runs", in_run_hashes.size(), rows);
                     }
-                    /// Whole-file seal-checksum (codecs-v3 phase 5): verify the drained run against the
-                    /// seal's RunRef.checksum. Fsck is read-only — a mismatch surfaces as CORRUPTED_DATA.
-                    reader.verifyAgainst(run.checksum);
+                    /// Whole-file seal-checksum (codecs-v3 phase 5): compare the drained run's accumulated
+                    /// checksum to the seal's RunRef.checksum. Fsck is a read-only auditor — instead of
+                    /// throwing (which would abort the whole scan on the first corrupt run), CATALOGUE the
+                    /// mismatch as a CorruptedRun finding (with the run key) and CONTINUE so the audit
+                    /// enumerates every problem in one pass. The deletion-deriving consumers
+                    /// (fold/zeroInDegree/previewDeletes) still fail closed on the same mismatch.
+                    if (reader.accumulatedChecksum() != run.checksum)
+                    {
+                        ++report.corrupted_runs;
+                        if (detail)
+                            report.objects.push_back(FsckObject{.key = run.key, .cls = FsckClass::CorruptedRun, .reachable_from = {}});
+                    }
                 }
             }
         }

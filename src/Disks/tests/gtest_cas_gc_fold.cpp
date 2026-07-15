@@ -3,6 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFsck.h>
 #include "cas_test_helpers.h"
 
 using namespace DB::Cas;
@@ -323,6 +324,81 @@ TEST(CasGcFold, PreviewResolvesCarriedRef)
         EXPECT_NE(e.ref, (DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(blob)})) << "still-referenced blob must not be surfaced (carried ref resolved to in-degree 1)";
     EXPECT_EQ(inDegreeOf(*backend, store->layout(), blob), 1)
         << "in-degree through the carried parent ref is 1";
+}
+
+/// Per-consumer whole-file seal-checksum RED tests (codecs-v3 phase 5, Task 6) at the seal-driven
+/// consumers. Setup: fold one referenced blob into a sealed generation, then corrupt the persisted
+/// seal's blob_target_runs[0].checksum (the stored run bytes stay valid), so the abort comes from the
+/// seal-checksum verify, not a row invariant.
+namespace
+{
+String corruptSealedRunChecksum(InMemoryBackend & backend, const Layout & layout, const GcState & st)
+{
+    const String sk = layout.foldSealKey(st.snap_generation, st.snap_attempt);
+    const auto existing = backend.get(sk);
+    auto seal = decodeFoldSeal(existing->bytes);
+    if (seal.blob_target_runs.empty())
+        return {};
+    const String run_key = seal.blob_target_runs.front().key;
+    seal.blob_target_runs.front().checksum = seal.blob_target_runs.front().checksum + 1;
+    backend.putOverwrite(sk, encodeFoldSeal(seal), existing->token);
+    return run_key;
+}
+}
+
+TEST(CasGcFold, PreviewDeletesSealChecksumMismatchFailsClosed)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r = ref("srv-a:1", 1, 0xAA);
+    const UInt128 blob = DB::UInt128(1);
+    writeBlobBody(*backend, store->layout(), blob);
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", blob)});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+
+    Gc gc(store, kGc);
+    gc.runRegularRound();   // seals gen-1 with one blob_target run
+    const auto st = decodeGcState(backend->get(store->layout().gcStateKey())->bytes);
+    ASSERT_FALSE(corruptSealedRunChecksum(*backend, store->layout(), st).empty());
+
+    // A deletion preview must never be derived from an unverified run: fail closed.
+    Gc gc2(store, kGc);   // fresh read of the corrupted seal
+    EXPECT_THROW(gc2.previewDeletes(), DB::Exception);
+}
+
+TEST(CasGcFold, FsckSealChecksumMismatchCataloguedAndAuditCompletes)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openStoreForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r = ref("srv-a:1", 1, 0xAA);
+    const UInt128 blob = DB::UInt128(1);
+    writeBlobBody(*backend, store->layout(), blob);
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", blob)});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+
+    Gc gc(store, kGc);
+    gc.runRegularRound();
+    const auto st = decodeGcState(backend->get(store->layout().gcStateKey())->bytes);
+
+    /// A present-but-unreferenced blob (written AFTER the round so GC never touches it) is what makes
+    /// fsck enter its GC-pipeline classification path (guarded by a non-empty unreferenced set), which
+    /// is where it streams + seal-checksum-verifies the snapshot runs.
+    writeBlobBody(*backend, store->layout(), DB::UInt128(2));
+
+    const String bad_run_key = corruptSealedRunChecksum(*backend, store->layout(), st);
+    ASSERT_FALSE(bad_run_key.empty());
+
+    // fsck is a read-only auditor: it must CATALOGUE the corrupt run and COMPLETE, not abort the scan.
+    FsckReport report;
+    EXPECT_NO_THROW(report = runFsck(*store, /*detail*/ true));
+    EXPECT_GE(report.corrupted_runs, 1u);
+    bool catalogued = false;
+    for (const auto & o : report.objects)
+        if (o.cls == FsckClass::CorruptedRun && o.key == bad_run_key)
+            catalogued = true;
+    EXPECT_TRUE(catalogued) << "the corrupt run must be catalogued with its key";
 }
 
 /// A mid-log clamp must be RECOVERABLE (spec §Step 3 transaction atomicity). A single log carrying two

@@ -261,6 +261,11 @@ void SourceEdgeRunView::verifyAgainst(const UInt128 & expected)
     reader->verifyAgainst(expected);
 }
 
+UInt128 SourceEdgeRunView::accumulatedChecksum()
+{
+    return reader->accumulatedChecksum();
+}
+
 SourceEdgeRunView openSourceEdgeRun(std::string_view bytes)
 {
     return SourceEdgeRunView(std::make_unique<ReadBufferFromMemory>(bytes.data(), bytes.size()));
