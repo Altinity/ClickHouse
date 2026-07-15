@@ -311,6 +311,10 @@ public:
     /// disk transaction delegates writes to the metadata transaction's content-addressed buffer.
     virtual bool isContentAddressed() const { return false; }
 
+    /// True when a file write through this metadata storage publishes atomically, i.e. no partial
+    /// content is ever observable under the file's final name (see `IDataPartStorage::supportsAtomicFileWrites`).
+    virtual bool supportsAtomicFileWrites() const { return false; }
+
     using BlobsToRemove = std::unordered_map<StoredObject, LocationSet>;
     virtual BlobsToRemove getBlobsToRemove(const ClusterConfigurationPtr & /*cluster*/, int64_t /*max_count*/) { return {}; }
     virtual int64_t recordAsRemoved(const StoredObjects & /*blobs*/) { return 0; }

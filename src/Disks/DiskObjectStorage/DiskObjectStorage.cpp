@@ -776,6 +776,11 @@ bool DiskObjectStorage::isContentAddressed() const
     return metadata_storage->isContentAddressed();
 }
 
+bool DiskObjectStorage::supportsAtomicFileWrites() const
+{
+    return metadata_storage->supportsAtomicFileWrites();
+}
+
 
 String DiskObjectStorage::getReadResourceName() const
 {

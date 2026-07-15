@@ -156,6 +156,7 @@ public:
     bool supportsStat() const override { return false; }
     bool isReadOnly() const override { return read_only; }
     bool isContentAddressed() const override { return true; }
+    bool supportsAtomicFileWrites() const override { return true; }
     bool supportsTransactionalMutableFiles() const override { return true; }
     bool areBlobPathsRandom() const override { return false; }
     uint32_t getHardlinkCount(const std::string &) const override { return 0; }

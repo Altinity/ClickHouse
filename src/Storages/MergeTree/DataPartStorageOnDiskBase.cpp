@@ -262,6 +262,11 @@ bool DataPartStorageOnDiskBase::isContentAddressed() const
     return volume->getDisk()->isContentAddressed();
 }
 
+bool DataPartStorageOnDiskBase::supportsAtomicFileWrites() const
+{
+    return volume->getDisk()->supportsAtomicFileWrites();
+}
+
 std::optional<String> DataPartStorageOnDiskBase::getCacheName() const
 {
     if (volume->getDisk()->supportsCache())

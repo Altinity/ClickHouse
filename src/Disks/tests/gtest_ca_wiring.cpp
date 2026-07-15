@@ -251,6 +251,7 @@ TEST(CaPartPathParser, SplitCacheEvictionStaysCorrect)
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedExchange.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/Plain/MetadataStorageFromPlainObjectStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBackend.h>
@@ -316,6 +317,19 @@ void publishWiredPart(
         [](DB::Cas::RefMutableFilesUpdate & r) { r.published_at_ms = 1700000000ULL * 1000; });   /// epoch ms; getLastModified /1000
 }
 
+}
+
+/// `supportsAtomicFileWrites` (all-tree task 5): the CA metadata storage publishes a file write in
+/// one shot, so `VersionMetadataOnDisk::storeInfoToDataPartStorage` can skip the tmp+replace dance.
+/// A plain (non-content-addressed) metadata storage keeps the base-class default of `false`.
+TEST(CaWiringCapability, SupportsAtomicFileWrites)
+{
+    auto ca_storage = openWiringStorage();
+    EXPECT_TRUE(ca_storage->supportsAtomicFileWrites());
+
+    auto plain_storage = std::make_shared<DB::MetadataStorageFromPlainObjectStorage>(
+        DB::Cas::tests::makeLocalObjectStorageForTest(), "", /*object_metadata_cache_size=*/0);
+    EXPECT_FALSE(plain_storage->supportsAtomicFileWrites());
 }
 
 TEST(CaWiringRead, ResolvesPublishedPart)

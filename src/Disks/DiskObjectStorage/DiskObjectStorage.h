@@ -219,6 +219,8 @@ public:
 
     bool isContentAddressed() const override;
 
+    bool supportsAtomicFileWrites() const override;
+
     /// Get structure of object storage this disk works with. Examples:
     /// DiskObjectStorage(S3ObjectStorage)
     /// DiskObjectStorage(CachedObjectStorage(S3ObjectStorage))
