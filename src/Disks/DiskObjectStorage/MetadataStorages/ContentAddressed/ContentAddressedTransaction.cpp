@@ -1,7 +1,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedWriteBuffers.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEnvelope.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasBlobEnvelopeFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
 #include <IO/ReadBufferFromFile.h>
 #include <IO/ReadBufferFromFileView.h>
@@ -9,6 +9,7 @@
 #include <IO/WriteBufferFromFile.h>
 #include <IO/copyData.h>
 #include <Common/thread_local_rng.h>
+#include <Common/config_version.h>
 #include <algorithm>
 #include <filesystem>
 #include <unordered_set>
@@ -615,28 +616,16 @@ std::string ContentAddressedTransaction::buildS3StagingBlobHeader(
 
     Cas::EnvelopeHeader header;
     header.kind = Cas::ObjectKind::Blob;
-    /// Phase 3 T4: `PoolMeta` no longer records a single pool-wide algo (mixed-algo pools, `algos_used`)
-    /// -- a write-mint context always uses this Store's NODE-LOCAL write algo.
-    header.hash_algo = static_cast<uint8_t>(store->writeAlgo());
-    header.domain_id = meta.pool_id;
     header.incarnation_tag = (static_cast<UInt128>(thread_local_rng()) << 64) | thread_local_rng();
     header.build_id = 0;   /// not known at stream time; diagnostic-only (not read by GC/read paths)
+    /// ch = the real ClickHouse VERSION_INTEGER (diagnostic-only; consistent with `Build::buildHeader`).
+    /// The v3 envelope drops hash_algo/domain_id/writer_version, so forensics ride on ch + bld.
     header.provenance = Cas::Provenance{
-        /*created_at_ms*/ 0, cfg.server_id, /*ch_version*/ 0, Cas::ProvenanceOp::Other};
+        /*created_at_ms*/ 0, cfg.server_id, VERSION_INTEGER, Cas::ProvenanceOp::Other};
     header.intended_ref = route.ns.string() + "/" + route.ref;
-    header.pad_to_header_len = static_cast<uint32_t>(meta.blob_header_len);
-    try
-    {
-        return Cas::encodeEnvelopeHeader(header);
-    }
-    catch (const Exception & e)
-    {
-        if (e.code() != ErrorCodes::BAD_ARGUMENTS)
-            throw;
-        /// intended_ref is diagnostic-only: when it makes the header exceed blob_header_len, drop it.
-        header.intended_ref.reset();
-        return Cas::encodeEnvelopeHeader(header);
-    }
+    /// The v3 codec pads to the pool's fixed header length and TRUNCATES a too-long intended_ref
+    /// internally (it is diagnostic-only), so the old drop-and-retry is gone — one encode call.
+    return Cas::encodeEnvelopeHeader(header, static_cast<uint32_t>(meta.blob_header_len));
 }
 
 std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(

@@ -1,6 +1,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobMeta.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEnvelope.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasBlobEnvelopeFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRequestControl.h>
 #include <IO/WriteBufferFromString.h>
 #include <IO/WriteHelpers.h>
@@ -8,6 +8,7 @@
 #include <Common/logger_useful.h>
 #include <Common/ProfileEvents.h>
 #include <Common/thread_local_rng.h>
+#include <Common/config_version.h>
 #include <base/defines.h>
 #include <algorithm>
 #include <chrono>
@@ -380,28 +381,16 @@ void Build::uploadFromSource(ObjectKind kind, const BlobRef & ref, const String 
     {
         EnvelopeHeader header;
         header.kind = kind;
-        header.hash_algo = static_cast<uint8_t>(ref.algo);
-        header.domain_id = meta.pool_id;
         header.incarnation_tag = mintU128();
         header.build_id = build_id;
-        header.provenance = Provenance{nowMs(), cfg.server_id, /*ch_version*/ 0, info.op};
+        /// ch = the real ClickHouse VERSION_INTEGER (diagnostic-only; no decision reads it) — the v3
+        /// envelope drops writer_version/hash_algo/domain_id, so forensics ride on ch + bld.
+        header.provenance = Provenance{nowMs(), cfg.server_id, VERSION_INTEGER, info.op};
         if (kind == ObjectKind::Blob)
             header.intended_ref = info.intended_ref;
-        /// Both blobs and trees pad to the pool's fixed header length, so every object's payload starts
-        /// at a constant offset (a constant-shift locate for blobs; uniform layout for trees).
-        header.pad_to_header_len = static_cast<uint32_t>(meta.blob_header_len);
-        try
-        {
-            return encodeEnvelopeHeader(header);
-        }
-        catch (const Exception & e)
-        {
-            if (e.code() != ErrorCodes::BAD_ARGUMENTS)
-                throw;
-            /// intended_ref is diagnostic-only: when it makes the header exceed blob_header_len, drop it.
-            header.intended_ref.reset();
-            return encodeEnvelopeHeader(header);
-        }
+        /// The v3 codec pads to the pool's fixed header length and TRUNCATES a too-long intended_ref
+        /// internally (it is diagnostic-only), so the old drop-and-retry is gone — one encode call.
+        return encodeEnvelopeHeader(header, static_cast<uint32_t>(meta.blob_header_len));
     };
 
     const CasEventObjectKind ev_kind = toEventKind(kind);

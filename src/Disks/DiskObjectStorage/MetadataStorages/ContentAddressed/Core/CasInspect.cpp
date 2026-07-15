@@ -1,6 +1,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInspect.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobMeta.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEnvelope.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasBlobEnvelopeFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasGcStateFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasFoldSealFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
@@ -434,10 +434,9 @@ String renderEnvelopeHeader(const EnvelopeHeader & h)
 {
     return JsonObj()
         .add("kind", jsonEscape(objectKindName(h.kind)))
-        .add("hash_algo", jsonUInt(h.hash_algo))
-        .add("writer_version", jsonUInt(h.writer_version))
+        /// hash_algo / writer_version / domain_id dropped in the v3 envelope (identity lives in the
+        /// key; forensics ride on ch + bld); `compatibility_version` is the header `v`.
         .add("compatibility_version", jsonUInt(h.compatibility_version))
-        .add("domain_id", jsonHex(h.domain_id))
         .add("incarnation_tag", jsonHex(h.incarnation_tag))
         .add("build_id", jsonHex(h.build_id))
         .add("header_len", jsonUInt(h.header_len))

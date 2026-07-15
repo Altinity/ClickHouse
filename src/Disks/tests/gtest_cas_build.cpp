@@ -5,7 +5,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEnvelope.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasBlobEnvelopeFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasGcStateFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestCodec.h>
@@ -192,9 +192,9 @@ TEST(CasBuild, PutBlobWritesEnvelopeWithFixedHeader)
     ASSERT_TRUE(raw.has_value());
     auto h = decodeEnvelopeHeader(raw->bytes, raw->bytes.size(), ObjectKind::Blob);
     EXPECT_EQ(h.header_len, s->poolMeta().blob_header_len);   /// 256
-    /// `logical_size`/`logical_hash` were dropped 2026-07-11 — identity is the content key and the
-    /// payload starts at the fixed offset `header_len`.
-    EXPECT_EQ(h.domain_id, s->poolMeta().pool_id);
+    /// `logical_size`/`logical_hash` were dropped 2026-07-11, and `domain_id` in codecs-v3 phase 7
+    /// (the pool id no longer travels in the envelope) — identity is the content key and the payload
+    /// starts at the fixed offset `header_len`.
     EXPECT_EQ(h.build_id, build->buildId());
     EXPECT_NE(h.incarnation_tag, UInt128{});
     EXPECT_EQ(raw->bytes.substr(h.header_len), "hello world");

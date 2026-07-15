@@ -538,11 +538,9 @@ TEST(CasS3Staging, PromoteOverCondemnedBlobResurrectsWithFreshTagNotVerbatim)
     /// a fixed 256-byte CABL envelope with its OWN incarnation_tag.
     DB::Cas::EnvelopeHeader staging_h;
     staging_h.kind = DB::Cas::ObjectKind::Blob;
-    staging_h.hash_algo = 1;
-    staging_h.domain_id = store->poolMeta().pool_id;
     staging_h.incarnation_tag = DB::UInt128(0xC0FFEE);   /// the create-time tag
-    staging_h.pad_to_header_len = static_cast<uint32_t>(store->poolMeta().blob_header_len);
-    const std::string staging_header = DB::Cas::encodeEnvelopeHeader(staging_h);
+    const std::string staging_header = DB::Cas::encodeEnvelopeHeader(
+        staging_h, static_cast<uint32_t>(store->poolMeta().blob_header_len));
     ASSERT_EQ(staging_header.size(), store->poolMeta().blob_header_len);
     const std::string staging_bytes = staging_header + payload;
     backend->putIfAbsent(staging_key, staging_bytes);

@@ -4,7 +4,7 @@
 #include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobMeta.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEnvelope.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasBlobEnvelopeFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasGcStateFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
@@ -113,23 +113,22 @@ inline DB::Cas::BlobRef idOf(const String & bytes)
     return DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(u128Of(bytes))};
 }
 
-/// Write a Blob object: a fixed-length (pad_to_header_len = blob_header_len) envelope followed by the
-/// raw payload, keyed by content. Mirrors what Build::putBlob will emit (Task 11).
+/// Write a Blob object: a fixed-length (blob_header_len) envelope followed by the raw payload, keyed
+/// by content. Mirrors what Build::putBlob will emit (Task 11).
 inline DB::Cas::BlobRef writeBlobRaw(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const String & payload,
-    uint64_t blob_header_len, const DB::UInt128 & domain_id)
+    uint64_t blob_header_len, [[maybe_unused]] const DB::UInt128 & domain_id)
 {
     const DB::Cas::BlobRef id = idOf(payload);
 
+    /// v3 envelope: domain_id/hash_algo dropped (identity is the content key); the `domain_id` param
+    /// is kept for call-site compatibility but no longer stamped.
     DB::Cas::EnvelopeHeader header;
     header.kind = DB::Cas::ObjectKind::Blob;
-    header.hash_algo = 1;
-    header.domain_id = domain_id;
     header.incarnation_tag = DB::UInt128(0x1234);
     header.build_id = DB::UInt128(0x5678);
-    header.pad_to_header_len = static_cast<uint32_t>(blob_header_len);
 
-    const String head = DB::Cas::encodeEnvelopeHeader(header);
+    const String head = DB::Cas::encodeEnvelopeHeader(header, static_cast<uint32_t>(blob_header_len));
     backend.putIfAbsent(layout.blobKey(id), head + payload);
     return id;
 }
@@ -540,8 +539,8 @@ inline DB::Cas::Token displaceObjectToken(
         DB::Cas::decodeEnvelopeHeader(got->bytes, got->bytes.size(), kind);
     /// A fresh, distinct incarnation_tag forces a distinct body so the displaced token differs.
     header.incarnation_tag = header.incarnation_tag + DB::UInt128(1);
-    header.pad_to_header_len = header.header_len;   /// preserve the exact header length on re-encode
-    const String new_head = DB::Cas::encodeEnvelopeHeader(header);
+    /// Re-encode at the SAME header length the object was decoded with (the v3 pad target).
+    const String new_head = DB::Cas::encodeEnvelopeHeader(header, header.header_len);
     const String body = new_head + got->bytes.substr(header.header_len);
 
     return backend.putOverwrite(key, body, got->token).token;
@@ -579,12 +578,9 @@ inline void writeBlobBody(
 {
     DB::Cas::EnvelopeHeader header;
     header.kind = DB::Cas::ObjectKind::Blob;
-    header.hash_algo = 1;
-    header.domain_id = DB::UInt128(0x42);
     header.incarnation_tag = DB::UInt128(0x1234);
     header.build_id = DB::UInt128(0x5678);
-    header.pad_to_header_len = static_cast<uint32_t>(blob_header_len);
-    const String head = DB::Cas::encodeEnvelopeHeader(header);
+    const String head = DB::Cas::encodeEnvelopeHeader(header, static_cast<uint32_t>(blob_header_len));
     backend.putIfAbsent(layout.blobKey(DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(hash)}), head + String("x"));
 }
 

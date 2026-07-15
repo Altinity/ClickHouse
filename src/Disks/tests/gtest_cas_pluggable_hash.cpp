@@ -25,7 +25,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasCodecUtil.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEnvelope.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasBlobEnvelopeFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFsck.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.h>
@@ -226,46 +226,10 @@ TEST(CasPluggableHash, ContentWriteBufferLocalModeCityHash128Unchanged)
     EXPECT_EQ(got_hash_hex, blobHashHexOneShot(BlobHashAlgo::CityHash128, payload));
 }
 
-/// Round-trip at the `Build`/`Store` level (in-memory backend -- no live disk/S3 needed): a `Store`
-/// opened with `PoolConfig::blob_hash_algo = XXH3_128` must record it in `PoolMeta` AND stamp it onto
-/// every envelope it writes (`Build::uploadFromSource`'s `header.hash_algo`, P1-T3a task item 3) --
-/// the envelope `hash_algo` field becomes a truthful, per-pool value instead of the inert literal `1`.
-TEST(CasPluggableHash, StoreWithXxh3AlgoStampsEnvelopeHashAlgo)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    auto store = Store::open(backend,
-        PoolConfig{.pool_prefix = "p", .server_root_id = "test", .blob_hash_algo = BlobHashAlgo::XXH3_128});
-    EXPECT_EQ(store->writeAlgo(), BlobHashAlgo::XXH3_128);
-    EXPECT_EQ(store->poolMeta().algos_used, (std::vector<uint8_t>{static_cast<uint8_t>(BlobHashAlgo::XXH3_128)}));
-
-    auto build = store->startBuild({});
-    const std::string payload = "hello xxh3 world";
-    auto ref = build->putBlob(BlobRef{BlobHashAlgo::XXH3_128, codecFor(BlobHashAlgo::XXH3_128).fromHex(blobHashHexOneShot(BlobHashAlgo::XXH3_128, payload))}, BlobSource::fromString(payload));
-
-    const auto raw = backend->get(store->layout().blobKey(ref.ref));
-    ASSERT_TRUE(raw.has_value());
-    const EnvelopeHeader h = decodeEnvelopeHeader(raw->bytes, raw->bytes.size(), ObjectKind::Blob);
-    EXPECT_EQ(h.hash_algo, static_cast<uint8_t>(BlobHashAlgo::XXH3_128));
-}
-
-/// The DEFAULT pool (no `blob_hash_algo` override) must still stamp `hash_algo = 1` (CityHash128) --
-/// the pre-existing literal, now driven by `PoolMeta` instead of hardcoded, so a default pool's
-/// envelope bytes are unchanged.
-TEST(CasPluggableHash, StoreWithDefaultAlgoStampsEnvelopeHashAlgoOne)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
-    EXPECT_EQ(store->writeAlgo(), BlobHashAlgo::CityHash128);
-    EXPECT_EQ(store->poolMeta().algos_used, (std::vector<uint8_t>{static_cast<uint8_t>(BlobHashAlgo::CityHash128)}));
-
-    auto build = store->startBuild({});
-    auto ref = build->putBlob(idOf("hello world"), BlobSource::fromString("hello world"));
-
-    const auto raw = backend->get(store->layout().blobKey(ref.ref));
-    ASSERT_TRUE(raw.has_value());
-    const EnvelopeHeader h = decodeEnvelopeHeader(raw->bytes, raw->bytes.size(), ObjectKind::Blob);
-    EXPECT_EQ(h.hash_algo, 1u);
-}
+/// (codecs-v3 phase 7) The two former `Store...StampsEnvelopeHashAlgo...` tests were REMOVED: the v3
+/// blob envelope no longer carries a `hash_algo` field (the algo identity lives in the blob KEY, spec
+/// §blob-envelope). Algo correctness for the write path is covered by the P1-T3b blob-body-PATH-key
+/// tests below (they assert the blob key uses the pool's algo), which is the surviving source of truth.
 
 /// ---- P1-T3b: the pool's blob_hash_algo threaded into blob-body PATH keys (spec §3/§10) ----
 
@@ -367,12 +331,9 @@ TEST(CasPluggableHash, Sha256BlobSeenByCondemnSweepAndFsckNotSilentlySkipped)
     {
         EnvelopeHeader header;
         header.kind = ObjectKind::Blob;
-        header.hash_algo = static_cast<uint8_t>(BlobHashAlgo::Sha256);
-        header.domain_id = store->poolMeta().pool_id;
         header.incarnation_tag = UInt128(0x1234);
         header.build_id = UInt128(0x5678);
-        header.pad_to_header_len = static_cast<uint32_t>(store->poolMeta().blob_header_len);
-        backend->putIfAbsent(blob_key, encodeEnvelopeHeader(header) + payload);
+        backend->putIfAbsent(blob_key, encodeEnvelopeHeader(header, static_cast<uint32_t>(store->poolMeta().blob_header_len)) + payload);
     }
     ASSERT_TRUE(backend->head(blob_key).exists) << "the sha256 blob body must be present before the sweep";
 
@@ -616,12 +577,9 @@ TEST(CasPluggableHash, ForeignAlgoSegmentIsDebrisNotOurs)
         const String key = store->layout().blobKey(ref);
         EnvelopeHeader header;
         header.kind = ObjectKind::Blob;
-        header.hash_algo = static_cast<uint8_t>(algo);
-        header.domain_id = store->poolMeta().pool_id;
         header.incarnation_tag = UInt128(0x1234);
         header.build_id = UInt128(0x5678);
-        header.pad_to_header_len = static_cast<uint32_t>(store->poolMeta().blob_header_len);
-        backend->putIfAbsent(key, encodeEnvelopeHeader(header) + payload);
+        backend->putIfAbsent(key, encodeEnvelopeHeader(header, static_cast<uint32_t>(store->poolMeta().blob_header_len)) + payload);
         return {ref, key};
     };
     const auto [ch_ref, ch_key] = writeOwnOrphan(BlobHashAlgo::CityHash128, 5001);
@@ -779,12 +737,9 @@ TEST(CasPluggableHash, TwoAlgoOrphansBothFullyReclaimed)
         const String key = store->layout().blobKey(ref);
         EnvelopeHeader header;
         header.kind = ObjectKind::Blob;
-        header.hash_algo = static_cast<uint8_t>(algo);
-        header.domain_id = store->poolMeta().pool_id;
         header.incarnation_tag = UInt128(0x1234);
         header.build_id = UInt128(0x5678);
-        header.pad_to_header_len = static_cast<uint32_t>(store->poolMeta().blob_header_len);
-        backend->putIfAbsent(key, encodeEnvelopeHeader(header) + payload);
+        backend->putIfAbsent(key, encodeEnvelopeHeader(header, static_cast<uint32_t>(store->poolMeta().blob_header_len)) + payload);
         return {ref, key};
     };
     const auto [ch_ref, ch_key] = writeOwnOrphan(BlobHashAlgo::CityHash128, 5001);
