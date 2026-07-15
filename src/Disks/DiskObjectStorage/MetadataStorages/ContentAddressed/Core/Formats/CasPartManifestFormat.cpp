@@ -1,0 +1,304 @@
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasPartManifestFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasTextFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasWireVocab.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasCodecUtil.h>
+#include <Common/Exception.h>
+#include <IO/ReadBufferFromMemory.h>
+#include <IO/WriteBufferFromString.h>
+#include <IO/WriteHelpers.h>
+#include <city.h>
+#include <algorithm>
+#include <optional>
+
+namespace DB
+{
+namespace ErrorCodes
+{
+    extern const int CORRUPTED_DATA;
+}
+}
+
+namespace DB::Cas
+{
+
+namespace
+{
+
+std::string_view placementToWord(EntryPlacement p)
+{
+    switch (p)
+    {
+        case EntryPlacement::Inline: return "inline";
+        case EntryPlacement::Blob:   return "blob";
+    }
+    throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: unknown placement {}", static_cast<int>(p));
+}
+
+EntryPlacement placementFromWord(std::string_view w)
+{
+    if (w == "inline") return EntryPlacement::Inline;
+    if (w == "blob")   return EntryPlacement::Blob;
+    throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: unknown placement '{}'", w);
+}
+
+/// One entry-record line: {"p","pm", then either the Blob's "ha"/"h"/"sz" or the Inline's "il"}.
+void writeEntryRecord(WriteBuffer & out, const ManifestEntry & e)
+{
+    bool first = true;
+    writeKey(out, "p", first);
+    writeStringValue(out, e.path);
+    writeKey(out, "pm", first);
+    writeStringValue(out, placementToWord(e.placement));
+    if (e.placement == EntryPlacement::Blob)
+    {
+        writeBlobRefFields(out, first, e.ref);   /// ha + h
+        writeKey(out, "sz", first);
+        writeIntText(e.blob_size, out);
+    }
+    else
+    {
+        writeKey(out, "il", first);
+        writeIntText(e.inline_bytes.size(), out);
+    }
+    closeObject(out, first);
+    writeChar('\n', out);
+}
+
+/// The exact banner text for one Inline entry's payload-zone chunk: `==> <path> il=<n> <==`. Takes
+/// `path`/`n` explicitly (not a `ManifestEntry`): on decode, `inline_bytes` is not yet populated at
+/// the point the expected banner is computed (that's the whole point of reading it from here first).
+String bannerFor(std::string_view path, uint64_t n)
+{
+    return "==> " + String(path) + " il=" + std::to_string(n) + " <==";
+}
+
+}
+
+String encodePartManifest(const PartManifest & m)
+{
+    /// Canonical path order + duplicate-path rejection (matches the retired binary codec's contract).
+    std::vector<const ManifestEntry *> sorted;
+    sorted.reserve(m.entries.size());
+    for (const auto & e : m.entries)
+        sorted.push_back(&e);
+    std::sort(sorted.begin(), sorted.end(),
+              [](const ManifestEntry * a, const ManifestEntry * b) { return a->path < b->path; });
+    for (size_t i = 1; i < sorted.size(); ++i)
+        if (sorted[i]->path == sorted[i - 1]->path)
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: duplicate path '{}'", sorted[i]->path);
+
+    WriteBufferFromOwnString out;
+    writeHeaderLine(out, FormatId::PartManifest);
+
+    /// descriptor meta line: ManifestRef (me/mb/mo, shared rendering with refsnaplog) + root
+    /// namespace + payload digest.
+    {
+        bool first = true;
+        writeManifestRefFields(out, first, "", m.ref);
+        writeKey(out, "ns", first);
+        writeStringValue(out, m.root_namespace_id.string());
+        writeKey(out, "pd", first);
+        writeHex128Value(out, m.payload_digest);
+        closeObject(out, first);
+        writeChar('\n', out);
+    }
+
+    for (const ManifestEntry * e : sorted)
+        writeEntryRecord(out, *e);
+
+    writeTrailerLine(out, sorted.size());
+
+    /// payload zone: one banner + raw bytes + '\n' per Inline entry, in path order. Blob entries
+    /// carry no payload-zone bytes (their bytes live in a separately addressed CAS blob).
+    for (const ManifestEntry * e : sorted)
+    {
+        if (e->placement != EntryPlacement::Inline)
+            continue;
+        const String banner = bannerFor(e->path, e->inline_bytes.size());
+        out.write(banner.data(), banner.size());
+        writeChar('\n', out);
+        out.write(e->inline_bytes.data(), e->inline_bytes.size());
+        writeChar('\n', out);
+    }
+
+    out.finalize();
+    return out.str();
+}
+
+PartManifest decodePartManifest(std::string_view data)
+{
+    ReadBufferFromMemory in(data.data(), data.size());
+    expectHeaderLine(in, FormatId::PartManifest);
+    const uint64_t line_cap = traitsFor(FormatId::PartManifest).line_cap;
+
+    PartManifest m;
+
+    /// descriptor meta line
+    {
+        const String meta = readLine(in, line_cap, "cas_part_manifest");
+        ReadBufferFromMemory mm(meta.data(), meta.size());
+        JsonObjectReader r(mm, KeyStrictness::Tolerant, "cas_part_manifest");
+        std::optional<uint64_t> me, mb, mo;
+        std::optional<String> ns;
+        std::optional<UInt128> pd;
+        String key;
+        while (r.nextKey(key))
+        {
+            if (key == "me") me = r.readU64String();
+            else if (key == "mb") mb = r.readU64String();
+            else if (key == "mo") mo = r.readU64Number();
+            else if (key == "ns") ns = r.readString();
+            else if (key == "pd") pd = r.readHex128();
+            else r.skipUnknown(key);
+        }
+        if (!me || !mb || !mo)
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: descriptor missing me/mb/mo");
+        if (!ns)
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: descriptor missing ns");
+        if (!pd)
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: descriptor missing pd");
+        m.ref = manifestRefFromFields(*me, *mb, *mo, "PartManifest", "descriptor");
+        m.root_namespace_id = RootNamespace(*ns);
+        m.payload_digest = *pd;
+        if (!mm.eof())
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: junk after descriptor line");
+    }
+
+    /// entry record lines, until the trailer. Inline entries remember their declared `il` length so
+    /// the payload zone below can read exactly that many raw bytes back into `inline_bytes`.
+    /// Index-aligned with `m.entries` (Blob entries push an unused 0 placeholder).
+    std::vector<uint64_t> inline_lens;
+    while (true)
+    {
+        const String line = readLine(in, line_cap, "cas_part_manifest");
+        ReadBufferFromMemory l(line.data(), line.size());
+        JsonObjectReader r(l, KeyStrictness::Tolerant, "cas_part_manifest");
+        String key;
+        if (!r.nextKey(key))
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: empty line");
+
+        if (key == "n")
+        {
+            const uint64_t declared_n = r.readU64Number();
+            while (r.nextKey(key))
+                r.skipUnknown(key);
+            if (!l.eof())
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: junk after trailer");
+            if (declared_n != m.entries.size())
+                throw Exception(ErrorCodes::CORRUPTED_DATA,
+                    "PartManifest: trailer count {} != {} records", declared_n, m.entries.size());
+            break;
+        }
+
+        if (key != "p")
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: record must start with \"p\"");
+        ManifestEntry e;
+        e.path = r.readString();
+        std::optional<String> pm, ha, h;
+        std::optional<uint64_t> sz, il;
+        while (r.nextKey(key))
+        {
+            if (key == "pm") pm = r.readString();
+            else if (key == "ha") ha = r.readString();
+            else if (key == "h") h = r.readString();
+            else if (key == "sz") sz = r.readU64Number();
+            else if (key == "il") il = r.readU64Number();
+            else r.skipUnknown(key);
+        }
+        if (!l.eof())
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: junk after record");
+        if (!pm)
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: entry '{}' missing pm", e.path);
+        e.placement = placementFromWord(*pm);
+
+        if (e.placement == EntryPlacement::Blob)
+        {
+            if (!ha || !h || !sz)
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: blob entry '{}' missing ha/h/sz", e.path);
+            const BlobHashAlgo algo = blobHashAlgoFromWord(*ha, "PartManifest entry");
+            e.ref = BlobRef{algo, codecFor(algo).fromHex(*h)};
+            e.blob_size = *sz;
+            inline_lens.push_back(0);   /// unused for Blob; keeps inline_lens index-aligned with entries
+        }
+        else
+        {
+            if (!il)
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: inline entry '{}' missing il", e.path);
+            inline_lens.push_back(*il);   /// bytes filled from the payload zone below
+        }
+        m.entries.push_back(std::move(e));
+    }
+
+    /// payload zone: for each Inline entry, in the same order it appeared above, a banner line then
+    /// exactly `il` raw bytes then a terminating '\n'.
+    for (size_t i = 0; i < m.entries.size(); ++i)
+    {
+        if (m.entries[i].placement != EntryPlacement::Inline)
+            continue;
+        const uint64_t n = inline_lens[i];
+        const String banner_line = readLine(in, line_cap, "cas_part_manifest payload zone");
+        const String expected = bannerFor(m.entries[i].path, n);
+        if (banner_line != expected)
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "PartManifest: payload-zone banner mismatch, expected '{}', got '{}'", expected, banner_line);
+        m.entries[i].inline_bytes = readFixedBytes(in, n);
+        const String terminator = readFixedBytes(in, 1);
+        if (terminator[0] != '\n')
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "PartManifest: payload-zone chunk for '{}' missing terminating newline", m.entries[i].path);
+    }
+
+    if (!in.eof())
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: trailing bytes after the payload zone");
+
+    return m;
+}
+
+UInt128 computePayloadDigest(const PartManifest & m)
+{
+    /// Digest the canonical encoding with payload_digest zeroed, so the digest does not depend on
+    /// itself (it would be circular otherwise) and is stable for identical bodies, changing whenever
+    /// ref / namespace / entries change. Uses the CAS content-hash primitive (CityHash128) over the
+    /// deterministic encodePartManifest bytes - the same primitive blob/tree hashing uses.
+    PartManifest probe = m;
+    probe.payload_digest = UInt128{};
+    const String bytes = encodePartManifest(probe);
+    const auto h = CityHash_v1_0_2::CityHash128(bytes.data(), bytes.size());
+    return (static_cast<UInt128>(h.high64) << 64) | static_cast<UInt128>(h.low64);
+}
+
+bool refMatchesBody(const ManifestRef & journal_ref, const PartManifest & body)
+{
+    return journal_ref == body.ref;
+}
+
+bool manifestNamespaceMatches(const RootNamespace & owning, const PartManifest & body)
+{
+    return owning == body.root_namespace_id;
+}
+
+const ManifestEntry * findEntry(const std::vector<ManifestEntry> & entries, std::string_view path)
+{
+    const auto it = std::lower_bound(entries.begin(), entries.end(), path,
+        [](const ManifestEntry & e, std::string_view p) { return std::string_view(e.path) < p; });
+    if (it == entries.end() || std::string_view(it->path) != path)
+        return nullptr;
+    return &*it;
+}
+
+std::pair<const ManifestEntry *, const ManifestEntry *>
+entryRange(const std::vector<ManifestEntry> & entries, std::string_view dir_prefix)
+{
+    if (dir_prefix.empty())
+        return {entries.data(), entries.data() + entries.size()};
+    /// Every path starting with `dir_prefix` compares >= `dir_prefix`, and prefixed paths form a
+    /// contiguous run from the first such position.
+    const auto first = std::lower_bound(entries.begin(), entries.end(), dir_prefix,
+        [](const ManifestEntry & e, std::string_view p) { return std::string_view(e.path) < p; });
+    auto last = first;
+    while (last != entries.end() && std::string_view(last->path).starts_with(dir_prefix))
+        ++last;
+    return {entries.data() + (first - entries.begin()), entries.data() + (last - entries.begin())};
+}
+
+}
