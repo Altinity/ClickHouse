@@ -325,12 +325,6 @@ private:
     /// shard object to tombstone+reclaim; physical namespace reclamation is the namespace-cleanup item.)
 
 
-    /// Write the part-manifest cleanup bundle(s) for one fold generation: a write-once record listing
-    /// every owner-removed (ManifestId, token) whose body delete is deferred to recheck. Keyed by
-    /// owner_shard (one bundle for gc_shards==1). Appends the produced RunRefs to `out`.
-    void writePartManifestCleanupBundle(uint64_t generation, uint64_t attempt, uint64_t owner_shard,
-                                        const std::map<ManifestId, Token> & cleanup, std::vector<RunRef> & out);
-
     /// B9 retention (attempt-scoped). The SOLE reclaimer — bounded per round and FAIL-OPEN on a benign
     /// 404 (never throw during a prune — it would only wedge GC):
     ///   WHOLESALE generation-retention: every generation at or below the retention floor

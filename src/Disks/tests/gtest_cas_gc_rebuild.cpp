@@ -381,7 +381,7 @@ TEST(CasGcRebuild, OrphanBlobCondemnedInRebuiltRun)
     bool found_edge_condemned = false;
     for (const RunRef & r : seal.blob_target_runs)
     {
-        RunFileReader reader = openSourceEdgeRun(*backend, r.key);
+        auto reader = openSourceEdgeRun(*backend, r.key);
         String k, p;
         while (reader.next(k, p))
         {

@@ -76,9 +76,9 @@ uint64_t manifestCleanupShard(const ManifestId & id, uint64_t gc_shards);
 /// (under `blobTargetRunKey(new_generation, shard, 0)`), exactly as `foldDeltasIntoGeneration`
 /// does. Returning the durable write here (rather than an in-memory map) keeps the round driver
 /// stateless: it simply constructs a `ShardReducer` per shard, calls `reduce`, and the sealed
-/// run is already present for `zeroInDegree` / `inDegreeInGeneration` consumers. An in-memory
-/// return value is unnecessary because the backend is directly queryable; tests use
-/// `inDegreeInGeneration` over an `InMemoryBackend`.
+/// run is already present for the `zeroInDegree` consumer (and the fold's two-cursor merge). An
+/// in-memory return value is unnecessary because the backend is directly queryable; tests read the
+/// sealed run back over an `InMemoryBackend`.
 class ShardReducer
 {
 public:

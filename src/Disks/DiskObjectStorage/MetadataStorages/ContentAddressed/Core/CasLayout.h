@@ -358,13 +358,9 @@ public:
                + std::to_string(shard) + "/" + std::to_string(seq);
     }
 
-    /// One part-manifest cleanup bundle:
-    ///   <prefix>/gc/gen/<generation>/attempt/<attempt>/part_manifest_cleanup/<owner_shard>/<seq>
-    String partManifestCleanupKey(uint64_t generation, uint64_t attempt, uint64_t owner_shard, uint64_t seq) const
-    {
-        return gcGenAttemptPrefix(generation, attempt) + "part_manifest_cleanup/"
-               + std::to_string(owner_shard) + "/" + std::to_string(seq);
-    }
+    /// (partManifestCleanupKey removed in codecs-v3 phase 5 with the part-manifest cleanup RUN: the run
+    /// object had no reader — manifest cleanups execute inline from the in-memory `mf_cleanup` map — so
+    /// the durable bundle + its key were dead weight. The `part_manifest_cleanup/` subtree is gone.)
 
     /// (retiredKey removed 2026-07-10 with the retired-in-snapshot refactor — condemned state rides the
     /// source-edge runs as kCondemned rows + the fold seal's condemned_summary, so there is no separate

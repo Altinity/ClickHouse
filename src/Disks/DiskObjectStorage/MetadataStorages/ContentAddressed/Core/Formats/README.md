@@ -24,15 +24,18 @@ shape. Design: `docs/superpowers/specs/2026-07-15-cas-codecs-v3-design.md`; refe
 | `gc/state`, `gc/hb` | GC state / leader heartbeat | `CasGcStateFormat` | GC |
 | `gc/gen/<g>/attempt/<a>/outcomes/…​.zst` | outcome log | `CasGcOutcomesFormat` (`.zst`) | GC |
 | `gc/gen/<g>/attempt/<a>/fold_seal` | fold seal (deterministic) | `CasFoldSealFormat` | GC |
-| `gc/gen/<g>/…​/runs` | GC record-stream runs | `CasRecordStreamFormat`* | GC |
+| `gc/gen/<g>/…​/runs` | GC source-edge record-stream runs | `CasRecordStreamFormat` | GC |
 | `gc/server-roots/<srid>/{owner,epoch,mount}` | server-root singletons | `CasServerRootFormats` | mount |
 | `roots/…` | raw passthrough (verbatim) | — (never interpreted) | upper layers |
 
 `*` = still the legacy binary codec; the row flips as each phase of the migration lands. **Phase 2
 (control plane) is DONE**: `cas_pool_meta`, `cas_gc_state` + `cas_gc_hb`, `cas_gc_outcomes`,
 `cas_fold_seal`, and `cas_owner`/`cas_epoch`/`cas_mount_lease` are text, and the protobuf codecs +
-the CA protobuf build target are removed. Remaining `*` rows = phases 3–8 (refsnaplog, runs,
-part manifest, blob envelope, blob meta).
+the CA protobuf build target are removed. **Phase 5 (runs) is DONE**: the GC source-edge data plane
+(`cas_run`) is sorted NDJSON via `CasRecordStreamFormat` (streamed, no seek), integrity is the
+whole-file seal-checksum, and the part-manifest cleanup run + `RunFileReader::seek` + `RunMerger` are
+gone — `CasRunFile` survives only as the phase-6-owned embedded part-manifest (`ManifestEntries`)
+codec. Remaining `*` rows = phases 3/4/6/7 (refsnaplog, blob meta, part manifest, blob envelope).
 
 ## Codec table
 

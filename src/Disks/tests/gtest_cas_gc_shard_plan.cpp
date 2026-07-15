@@ -152,15 +152,15 @@ TEST(CasGcShardReducer, MergesDeltasToInDegree)
     EXPECT_NE(runs0[0].key, runs1[0].key) << "shard-0 and shard-1 run keys must be distinct";
 
     /// Read back in-degree from the sealed runs (resolved via each reduce's returned refs).
-    const int64_t indeg_b1 = inDegreeInGeneration(*backend, runs0, b1);
-    const int64_t indeg_b2 = inDegreeInGeneration(*backend, runs1, b2);
+    const int64_t indeg_b1 = inDegreeInRuns(*backend, runs0, b1);
+    const int64_t indeg_b2 = inDegreeInRuns(*backend, runs1, b2);
     EXPECT_EQ(indeg_b1, 1) << "b1 in-degree after reduce must be 1";
     EXPECT_EQ(indeg_b2, 1) << "b2 in-degree after reduce must be 1";
 
     /// Cross-shard reads: shard-0's run must not contain b2; shard-1's run must not contain b1.
-    EXPECT_EQ(inDegreeInGeneration(*backend, runs0, b2), 0)
+    EXPECT_EQ(inDegreeInRuns(*backend, runs0, b2), 0)
         << "shard-0 run must not mention b2";
-    EXPECT_EQ(inDegreeInGeneration(*backend, runs1, b1), 0)
+    EXPECT_EQ(inDegreeInRuns(*backend, runs1, b1), 0)
         << "shard-1 run must not mention b1";
 }
 
@@ -332,13 +332,13 @@ TEST(CasGcShardCoordinator, ShardedFoldRoutesDeltasToOwningShards)
                                            std::move(buckets[shard]));
     }
 
-    EXPECT_EQ(inDegreeInGeneration(*backend, shard_runs[0], b0), 1)
+    EXPECT_EQ(inDegreeInRuns(*backend, shard_runs[0], b0), 1)
         << "b0 must fold into shard-0 with in-degree 1";
-    EXPECT_EQ(inDegreeInGeneration(*backend, shard_runs[1], b1), 1)
+    EXPECT_EQ(inDegreeInRuns(*backend, shard_runs[1], b1), 1)
         << "b1 must fold into shard-1 with in-degree 1";
-    EXPECT_EQ(inDegreeInGeneration(*backend, shard_runs[1], b0), 0)
+    EXPECT_EQ(inDegreeInRuns(*backend, shard_runs[1], b0), 0)
         << "b0 must NOT appear in shard-1's run";
-    EXPECT_EQ(inDegreeInGeneration(*backend, shard_runs[0], b1), 0)
+    EXPECT_EQ(inDegreeInRuns(*backend, shard_runs[0], b1), 0)
         << "b1 must NOT appear in shard-0's run";
 }
 
@@ -427,9 +427,9 @@ TEST(CasGcShardEquivalence, SingleShardMatchesPhase1dInDegree)
         /// generation is snap_generation - 1 for the first full round. Use inDegreeOf (which reads
         /// currentGenerationOf = completion generation) for the final in-degrees.
         const std::vector<RunRef> shard0 = runsForShard(*backend, layout, /*shard=*/0);
-        const int64_t iA = inDegreeInGeneration(*backend, shard0, refA);
-        const int64_t iB = inDegreeInGeneration(*backend, shard0, refB);
-        const int64_t iC = inDegreeInGeneration(*backend, shard0, refC);
+        const int64_t iA = inDegreeInRuns(*backend, shard0, refA);
+        const int64_t iB = inDegreeInRuns(*backend, shard0, refB);
+        const int64_t iC = inDegreeInRuns(*backend, shard0, refC);
         return {iA, iB, iC};
     };
 
@@ -519,14 +519,14 @@ TEST(CasGcShardTwoReplica, DisjointShardsConcurrentPerShardRuns)
         << "shard-1 blob-target run must be durably written by r1.reduce";
 
     /// (c) MERGED IN-DEGREE — the merged in-degrees across both shards equal the expected edge multiset.
-    EXPECT_EQ(inDegreeInGeneration(*backend, runs0, b0), 2)
+    EXPECT_EQ(inDegreeInRuns(*backend, runs0, b0), 2)
         << "b0 in-degree must be 2 in shard-0 run";
-    EXPECT_EQ(inDegreeInGeneration(*backend, runs1, b1), 1)
+    EXPECT_EQ(inDegreeInRuns(*backend, runs1, b1), 1)
         << "b1 in-degree must be 1 in shard-1 run";
     /// Cross-shard: each blob must be absent from the other shard's run.
-    EXPECT_EQ(inDegreeInGeneration(*backend, runs0, b1), 0)
+    EXPECT_EQ(inDegreeInRuns(*backend, runs0, b1), 0)
         << "b1 must NOT appear in shard-0's run (cross-shard disjointness)";
-    EXPECT_EQ(inDegreeInGeneration(*backend, runs1, b0), 0)
+    EXPECT_EQ(inDegreeInRuns(*backend, runs1, b0), 0)
         << "b0 must NOT appear in shard-1's run (cross-shard disjointness)";
 }
 
@@ -624,9 +624,9 @@ TEST(CasGcShardRetireDrain, ReclaimsDroppableBlobOwnedByNonZeroShard)
     const GcState live = decodeGcState(backend->get(layout.gcStateKey())->bytes);
     ASSERT_GT(live.snap_generation, 0u);
     ASSERT_EQ(live.gc_shards, kGcShards) << "the pool must be running with gc_shards=2";
-    EXPECT_EQ(inDegreeInGeneration(*backend, runsForShard(*backend, layout, /*shard=*/0), BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(blob_shard0)}), 1)
+    EXPECT_EQ(inDegreeInRuns(*backend, runsForShard(*backend, layout, /*shard=*/0), BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(blob_shard0)}), 1)
         << "shard-0 blob in-degree must be 1 while live";
-    EXPECT_EQ(inDegreeInGeneration(*backend, runsForShard(*backend, layout, /*shard=*/1), BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(blob_shard1)}), 1)
+    EXPECT_EQ(inDegreeInRuns(*backend, runsForShard(*backend, layout, /*shard=*/1), BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(blob_shard1)}), 1)
         << "shard-1 blob in-degree must be 1 while live";
     EXPECT_TRUE(blobExists(blob_shard0));
     EXPECT_TRUE(blobExists(blob_shard1));
@@ -639,9 +639,9 @@ TEST(CasGcShardRetireDrain, ReclaimsDroppableBlobOwnedByNonZeroShard)
     /// After drop + fixpoint: BOTH blobs are retired and exact-token deleted, and BOTH owner-removed
     /// manifest bodies are collected. The shard-1 blob is the regression's teeth — pre-`5f5fa5f` it
     /// would still exist here because retire/previewDeletes never scanned shard 1.
-    EXPECT_EQ(inDegreeInGeneration(*backend, runsForShard(*backend, layout, /*shard=*/0), BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(blob_shard0)}), 0)
+    EXPECT_EQ(inDegreeInRuns(*backend, runsForShard(*backend, layout, /*shard=*/0), BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(blob_shard0)}), 0)
         << "shard-0 blob in-degree must be 0 after drop";
-    EXPECT_EQ(inDegreeInGeneration(*backend, runsForShard(*backend, layout, /*shard=*/1), BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(blob_shard1)}), 0)
+    EXPECT_EQ(inDegreeInRuns(*backend, runsForShard(*backend, layout, /*shard=*/1), BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(blob_shard1)}), 0)
         << "shard-1 blob in-degree must be 0 after drop";
     EXPECT_FALSE(blobExists(blob_shard0)) << "shard-0 droppable blob must be reclaimed";
     EXPECT_FALSE(blobExists(blob_shard1))

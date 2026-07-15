@@ -10,7 +10,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRefIntake.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRefLogCodec.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRefSnapshotCodec.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRunFile.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasCodecUtil.h>
 #include <IO/ReadBufferFromMemory.h>
 #include <IO/WriteBufferFromString.h>
@@ -18,7 +17,6 @@
 #include <Common/ProfileEvents.h>
 #include <Common/logger_useful.h>
 #include <base/defines.h>
-#include <city.h>
 #include <unordered_set>
 #include <algorithm>
 #include <limits>
@@ -67,12 +65,6 @@ namespace DB::Cas
 
 namespace
 {
-
-UInt128 cityHash128(const String & bytes)
-{
-    const auto h = CityHash_v1_0_2::CityHash128(bytes.data(), bytes.size());
-    return (static_cast<UInt128>(h.high64) << 64) | static_cast<UInt128>(h.low64);
-}
 
 /// §0 introspection: the `on_page_fetched` hook GC passes to every `forEachListedKey`/`recoverRefTable`
 /// call it owns (never passed by fsck/offline-repair callers of those shared helpers) -- one increment
@@ -1329,8 +1321,9 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             result.fold_seal.condemned_summary[shard] = summarize(result.retired_merge[shard].still_retired);
         }
     }
-    writePartManifestCleanupBundle(new_generation, attempt, /*owner_shard*/0, result.mf_cleanup,
-                                   result.fold_seal.part_manifest_cleanup);
+    /// (codecs-v3 phase 5) The part-manifest cleanup RUN + its fold-seal record are removed: the run
+    /// object had no reader — the manifest cleanups execute inline from `result.mf_cleanup` (below /
+    /// the recheck path), so the durable bundle was pure dead weight. `result.mf_cleanup` is unchanged.
 
     /// Write-once CasFoldSeal: its existence marks fold complete. The fold seal is DETERMINISTIC (same
     /// fold inputs => byte-identical seal), so it goes through `putDeterministicArtifact`: a byte-equal
@@ -1586,42 +1579,6 @@ void Gc::runNamespaceCleanupPasses(const CasFoldSeal & seal, const std::map<Stri
             }
         }
     }
-}
-
-void Gc::writePartManifestCleanupBundle(uint64_t generation, uint64_t attempt, uint64_t owner_shard,
-                                        const std::map<ManifestId, Token> & cleanup, std::vector<RunRef> & out)
-{
-    if (cleanup.empty())
-        return;
-    Backend & backend = store->backend();
-    const Layout & layout = store->layout();
-
-    /// One write-once run: key = manifestKey, payload = the token to exact-token-delete with. The map is
-    /// ordered by ManifestId; manifestKey is monotone in that ordering for a fixed namespace, but across
-    /// namespaces it is not, so sort the produced rows by key for a byte-reproducible run (OQ5).
-    std::vector<std::pair<String, String>> rows;
-    rows.reserve(cleanup.size());
-    for (const auto & [id, token] : cleanup)
-        rows.emplace_back(layout.manifestKey(id), token.value);
-    std::sort(rows.begin(), rows.end(), [](const auto & a, const auto & b) { return a.first < b.first; });
-
-    DB::WriteBufferFromOwnString buf;
-    RunHeader header;
-    header.kind = RunKind::ManifestEntries;
-    header.key_schema = 1;
-    RunFileWriter writer(buf, header);
-    for (const auto & [key, value] : rows)
-        writer.append(key, value);
-    writer.finish();
-    const String run_bytes = buf.str();
-
-    const String run_key = layout.partManifestCleanupKey(generation, attempt, owner_shard, 0);
-    /// The cleanup bundle is a DETERMINISTIC artifact (same cleanup map => byte-reproducible run, OQ5), in
-    /// the same artifact class as the in-degree runs and the fold/completion seals: a byte-equal occupant
-    /// is our own deterministic replay (adopt, no-op) and divergent bytes fail closed with CORRUPTED_DATA
-    /// rather than letting a divergent bundle disagree with the adopted snapshot.
-    putDeterministicArtifact(backend, run_key, run_bytes);
-    out.push_back(RunRef{.key = run_key, .checksum = cityHash128(run_bytes)});
 }
 
 namespace
@@ -2280,7 +2237,7 @@ std::vector<Gc::PreviewEntry> Gc::previewDeletes()
         /// stays WRITE-FREE (`openSourceEdgeRun` is a pure reader). Output is a superset of the above.
         for (const RunRef & run : shard_runs)
         {
-            RunFileReader reader = openSourceEdgeRun(backend, run.key);
+            SourceEdgeRunView reader = openSourceEdgeRun(backend, run.key);
             String key;
             String payload;
             while (reader.next(key, payload))
@@ -2301,6 +2258,9 @@ std::vector<Gc::PreviewEntry> Gc::previewDeletes()
                 e.reason = row.delete_pending ? "delete_pending" : "awaiting_graduation";
                 out.push_back(std::move(e));
             }
+            /// Whole-file seal-checksum (codecs-v3 phase 5): verify the drained run before its condemned
+            /// rows are trusted in the preview. Fail-closed on mismatch.
+            reader.verifyAgainst(run.checksum);
         }
     }
     return out;

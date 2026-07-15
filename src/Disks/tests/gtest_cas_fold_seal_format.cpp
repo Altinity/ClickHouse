@@ -17,7 +17,6 @@ CasFoldSeal sampleFoldSeal()
     seal.per_ns_shard["ns1/0"] = ShardCoverage{.classification = 2, .folded_token = Token{"tok-a"}};
     seal.per_ns_shard["ns1/1"] = ShardCoverage{.classification = 1, .folded_token = Token{}};
     seal.blob_target_runs.push_back(RunRef{.key = "gc/gen/7/blob_target/0/0", .checksum = UInt128(0xABCDEF)});
-    seal.part_manifest_cleanup.push_back(RunRef{.key = "gc/gen/7/part_manifest_cleanup/0/0", .checksum = UInt128(0x1234)});
     return seal;
 }
 }
@@ -56,7 +55,6 @@ TEST(CasFoldSealFormat, RoundTripsAllFields)
     ASSERT_EQ(out.blob_target_runs.size(), 1u);
     EXPECT_EQ(out.blob_target_runs[0].key, "gc/gen/7/blob_target/0/0");
     EXPECT_EQ(out.blob_target_runs[0].checksum, UInt128(0xABCDEF));
-    ASSERT_EQ(out.part_manifest_cleanup.size(), 1u);
     EXPECT_EQ(out, in);
 }
 

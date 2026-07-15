@@ -485,7 +485,7 @@ inline std::vector<DB::Cas::RetiredEntry> currentRetiredSet(
     {
         if (run.shard != shard)
             continue;
-        DB::Cas::RunFileReader r = DB::Cas::openSourceEdgeRun(backend, run.key);
+        auto r = DB::Cas::openSourceEdgeRun(backend, run.key);
         String k, p;
         while (r.next(k, p))
         {
@@ -671,11 +671,37 @@ inline std::vector<DB::Cas::RunRef> runsForShard(
     }
 }
 
+/// Stream the sealed in-degree run segments `runs` and count the active source edges (`kEdgeActive`
+/// rows) for `ref`. Test-side replacement for the deleted per-blob point query `inDegreeInGeneration`
+/// (codecs-v3 phase 5: a `cas_run` is a sequential NDJSON stream with no random access, so a blob's
+/// in-degree is recomputed by a full stream-and-count rather than a seek). A condemned / zero-marker
+/// row is not an active edge, so it contributes 0 — matching the old point query's semantics.
+inline int64_t inDegreeInRuns(
+    DB::Cas::Backend & backend, const std::vector<DB::Cas::RunRef> & runs, const DB::Cas::BlobRef & ref)
+{
+    int64_t degree = 0;
+    for (const DB::Cas::RunRef & run : runs)
+    {
+        auto r = DB::Cas::openSourceEdgeRun(backend, run.key);
+        String k, p;
+        while (r.next(k, p))
+        {
+            if (p.empty() || p[0] != DB::Cas::kEdgeActive)
+                continue;
+            DB::Cas::BlobRef row_ref;
+            DB::UInt128 source_id{};
+            DB::Cas::SourceEdgeKeyCodec::parse(k, row_ref, source_id);   // throws CORRUPTED_DATA on malformed (fail-closed)
+            if (row_ref == ref)
+                ++degree;
+        }
+    }
+    return degree;
+}
+
 /// The in-degree of a blob in the current GC generation's sealed run (0 when absent/zeroed).
 inline int64_t inDegreeOf(DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::UInt128 & hash)
 {
-    return DB::Cas::inDegreeInGeneration(backend, runsForShard(backend, layout, /*shard*/0),
-                                         legacyMetaTestRef(hash));
+    return inDegreeInRuns(backend, runsForShard(backend, layout, /*shard*/0), legacyMetaTestRef(hash));
 }
 
 /// The cursor key "ns/shard" — matches CasGcCursorKey::cursorKey.

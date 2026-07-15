@@ -21,8 +21,8 @@ namespace DB::Cas
 /// generation G may physically live under an OLDER generation's key namespace, so the key alone no longer
 /// implies the generation, and per-shard association must not parse the key path. `blob_target_runs`
 /// refs SET both at every write point (the fold's `foldDeltasIntoGeneration` and the ref-carry copy).
-/// `part_manifest_cleanup` and other outcome RunRefs are per-generation-local and MAY leave the defaults
-/// (0/0) — those consumers still key by construction and never resolve through the shard/generation here.
+/// Other outcome RunRefs (if any) are per-generation-local and MAY leave the defaults (0/0) — those
+/// consumers still key by construction and never resolve through the shard/generation here.
 struct RunRef
 {
     String key;
@@ -96,7 +96,9 @@ struct CasFoldSeal
     uint64_t parent_generation = 0;
     std::map<String, ShardCoverage> per_ns_shard;   /// "ns/shard" -> coverage
     std::vector<RunRef> blob_target_runs;           /// the blob in-degree run segments this gen sealed
-    std::vector<RunRef> part_manifest_cleanup;      /// the part-manifest cleanup bundles this gen sealed
+    /// (`part_manifest_cleanup` removed in codecs-v3 phase 5: the cleanup RUN object had no reader —
+    /// manifest cleanups execute inline from the in-memory `mf_cleanup` map — so the durable bundle and
+    /// this seal record were dead weight.)
     std::map<uint64_t, CondemnedSummary> condemned_summary;   /// gc-shard -> summary; TOTAL over gc_shards
     /// Namespace-cleanup items (spec §Step 6), keyed by "<ns>\n<remove-txn-render>". Carried forward each
     /// generation until Completed. Empty on a pool that has never removed a namespace.
@@ -105,7 +107,7 @@ struct CasFoldSeal
 };
 
 /// v3 text (spec §control-plane, DETERMINISTIC — PinnedRaw): header line + a meta line
-/// {"g","pg"} + tagged record lines (fixed section order: cov/btr/pmc/cnd/nsc, each sorted) + {"n":count}
+/// {"g","pg"} + tagged record lines (fixed section order: cov/btr/cnd/nsc, each sorted) + {"n":count}
 /// trailer. Byte-reproducible for the putDeterministicArtifact retry-equality contract.
 String encodeFoldSeal(const CasFoldSeal & seal);
 CasFoldSeal decodeFoldSeal(std::string_view data);

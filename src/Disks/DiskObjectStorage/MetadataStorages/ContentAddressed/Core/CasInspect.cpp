@@ -357,11 +357,6 @@ String renderFoldSeal(const CasFoldSeal & seal)
     for (const auto & r : seal.blob_target_runs)
         blob_target_runs.push_back(renderRunRef(r));
 
-    std::vector<String> part_manifest_cleanup;
-    part_manifest_cleanup.reserve(seal.part_manifest_cleanup.size());
-    for (const auto & r : seal.part_manifest_cleanup)
-        part_manifest_cleanup.push_back(renderRunRef(r));
-
     /// Retired-in-snapshot (spec §5): per-gc-shard summary of the `kCondemned` rows the seal's runs
     /// carry, replacing the removed `GcState::retired_refs` dump.
     JsonObj condemned_summary;
@@ -377,7 +372,6 @@ String renderFoldSeal(const CasFoldSeal & seal)
         .add("parent_generation", jsonUInt(seal.parent_generation))
         .add("per_ns_shard", per_ns_shard.str())
         .add("blob_target_runs", jsonArray(blob_target_runs))
-        .add("part_manifest_cleanup", jsonArray(part_manifest_cleanup))
         .add("condemned_summary", condemned_summary.str())
         .str();
 }

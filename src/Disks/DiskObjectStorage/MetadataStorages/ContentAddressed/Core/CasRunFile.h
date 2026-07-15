@@ -13,17 +13,15 @@
 namespace DB::Cas
 {
 
-/// Dense block-framed sorted binary run (spec §Backpressure And Journal Encoding). This is the hot
-/// data-plane format: no per-record protobuf tags, no varints in the framing scalars, fixed-width
-/// CRC32C per block, sparse footer index. `payload` is specialized by `kind`; the key schema is fixed
-/// per kind (blob_hash; (blob_hash, source_id); (target_shard, blob_hash); etc.). The format is
-/// deterministic so a write-once run is byte-reproducible for resume/adoption (OQ5).
+/// Dense block-framed sorted binary run: fixed-width CRC32C per block, sparse footer index. Since
+/// codecs-v3 phase 5 the ONLY surviving kind is `ManifestEntries` — the stream embedded in a `CAPT`
+/// part manifest (`CasManifestCodec`), read sequentially. The standalone source-edge `cas_run` object
+/// moved to the sorted-NDJSON `Formats/CasRecordStreamFormat`; the dead `BlobDelta`/`SourceEdge`/
+/// `TargetShardDelta` kinds are removed. Phase 6 deletes this whole file when it converts the embedded
+/// manifest stream to text.
 enum class RunKind : uint8_t
 {
-    BlobDelta = 2,
-    SourceEdge = 3,
-    ManifestEntries = 4,
-    TargetShardDelta = 5,
+    ManifestEntries = 4,   /// value frozen; embedded part-manifest entry stream (phase-6-owned)
 };
 
 /// Block sizing (OQ5). Target a large sequential block; hard-cap any single block.
@@ -37,7 +35,7 @@ struct RunHeader
 {
     char magic[4] = {'C', 'A', 'R', 'N'};
     uint16_t format_version = kRunFormatVersion;
-    RunKind kind = RunKind::BlobDelta;
+    RunKind kind = RunKind::ManifestEntries;
     uint8_t key_schema = 0;     /// fixed per kind; meaning owned by the producer
     uint8_t codec = kRunCodecNone;
     uint32_t block_size = kRunTargetBlockSize;
@@ -77,17 +75,16 @@ private:
     bool finished = false;
 };
 
-/// Streaming reader. `next` yields records in stored (sorted) order. `seek(key)` repositions the
-/// cursor to the first record whose key >= `key`, using the sparse footer index to skip whole blocks
-/// (one ranged read region per touched block).
+/// Sequential reader. `next` yields records in stored (sorted) order. (Random-access `seek` was deleted
+/// in codecs-v3 phase 5 with its only caller; the surviving consumer — the embedded part-manifest
+/// stream in `CasManifestCodec` — reads sequentially.)
 ///
 /// Two modes, one interface (spec 2026-07-02 snapshot-streaming §RunFileReader modes):
 ///   - BORROWED: zero-copy over caller-owned bytes; the whole run is already resident (the caller
 ///     materialized it). Resident state is the caller's buffer plus one decoded block.
 ///   - STREAMING: reads a WRITE-ONCE run object off a `Backend` at O(one block) resident memory. Open
-///     is exactly `head` + one tail ranged `get` (footer) + one body `getStream`; a `seek` costs one
-///     extra ranged `get` per touched block. There is NO whole-run member — the resident-memory proof
-///     is structural.
+///     is exactly `head` + one tail ranged `get` (footer) + one body `getStream`. There is NO whole-run
+///     member — the resident-memory proof is structural.
 ///
 /// Fail-closed in BOTH modes: an absent key, a truncated/short stream, or ANY CRC failure throws
 /// CORRUPTED_DATA — never a partial record.
@@ -104,7 +101,6 @@ public:
     RunFileReader(Backend & backend_, const String & key_);
 
     bool next(String & key, String & payload);
-    void seek(std::string_view key);
     RunKind kind() const { return header.kind; }
     uint8_t keySchema() const { return header.key_schema; }
 
@@ -154,34 +150,8 @@ private:
     bool exhausted = false;
 };
 
-/// K-way merge over several sorted `RunFileReader`s. `next` advances all readers positioned at the
-/// smallest key and returns that key together with EVERY payload stored for it (across all inputs and
-/// across duplicate-key records within one input). Inputs must share a key ordering (they do: keys are
-/// byte-compared).
-///
-/// Memory: with STREAMING `RunFileReader`s the merge is O(inputs * block_size) resident — each reader
-/// holds only the footer index plus one decoded block, and the merge front is O(inputs). With
-/// BORROWED readers the caller already owns the whole run bytes; the merge adds only the per-reader
-/// block cursor on top.
-class RunMerger
-{
-public:
-    explicit RunMerger(std::vector<std::unique_ptr<RunFileReader>> readers_);
-    bool next(String & key, std::vector<String> & payloads_for_key);
-
-private:
-    struct Front
-    {
-        size_t reader_idx = 0;
-        String key;
-        String payload;
-        bool valid = false;
-    };
-
-    void pull(size_t reader_idx);
-
-    std::vector<std::unique_ptr<RunFileReader>> readers;
-    std::vector<Front> fronts;   /// one current front record per reader
-};
+/// (`RunMerger` — the k-way merge — deleted in codecs-v3 phase 5: no production caller ever existed
+/// (the fold uses a hand-rolled two-cursor loop), and the source-edge runs it merged moved to
+/// `Formats/CasRecordStreamFormat`.)
 
 }

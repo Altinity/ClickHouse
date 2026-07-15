@@ -38,7 +38,7 @@ RefNsCleanupState nsCleanupStateFromWord(std::string_view w)
     throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: unknown ns-cleanup state '{}'", w);
 }
 
-/// Emit one run record (`k` = "btr" or "pmc"); the caller sorts the vector by key first.
+/// Emit one run record (`k` = "btr"); the caller sorts the vector by key first.
 void writeRun(WriteBuffer & out, std::string_view kind, const RunRef & r)
 {
     bool first = true;
@@ -93,8 +93,6 @@ String encodeFoldSeal(const CasFoldSeal & seal)
 
     writeSortedRuns(out, "btr", seal.blob_target_runs);
     n += seal.blob_target_runs.size();
-    writeSortedRuns(out, "pmc", seal.part_manifest_cleanup);
-    n += seal.part_manifest_cleanup.size();
 
     /// condemned summary (std::map<uint64> => shard-sorted)
     for (const auto & [shard, s] : seal.condemned_summary)
@@ -199,7 +197,7 @@ CasFoldSeal decodeFoldSeal(std::string_view data)
             cov.folded_token = Token{tv, tt};
             seal.per_ns_shard[map_key] = cov;
         }
-        else if (kind == "btr" || kind == "pmc")
+        else if (kind == "btr")
         {
             RunRef run;
             while (r.nextKey(key))
@@ -210,7 +208,7 @@ CasFoldSeal decodeFoldSeal(std::string_view data)
                 else if (key == "gen") run.generation = r.readU64String();
                 else throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS fold seal: unknown run key '{}'", key);
             }
-            (kind == "btr" ? seal.blob_target_runs : seal.part_manifest_cleanup).push_back(run);
+            seal.blob_target_runs.push_back(run);
         }
         else if (kind == "cnd")
         {

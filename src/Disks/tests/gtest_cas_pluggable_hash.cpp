@@ -871,8 +871,8 @@ TEST(CasPluggableHash, SameDigestDifferentAlgoDistinctBodiesAndSettlement)
         const GcState st = decodeGcState(backend->get(store->layout().gcStateKey())->bytes);
         const CasFoldSeal seal = decodeFoldSeal(
             backend->get(store->layout().foldSealKey(st.snap_generation, st.snap_attempt))->bytes);
-        EXPECT_EQ(inDegreeInGeneration(*backend, seal.blob_target_runs, ref_ch), 1);
-        EXPECT_EQ(inDegreeInGeneration(*backend, seal.blob_target_runs, ref_xx), 1);
+        EXPECT_EQ(inDegreeInRuns(*backend, seal.blob_target_runs, ref_ch), 1);
+        EXPECT_EQ(inDegreeInRuns(*backend, seal.blob_target_runs, ref_xx), 1);
     }
 
     /// Dropping ONLY `part_a`'s committed ref condemns+reclaims ONLY `ch128:X`; `xxh3:X` (the SAME

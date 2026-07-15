@@ -477,107 +477,11 @@ bool RunFileReader::next(String & key, String & payload)
     return true;
 }
 
-void RunFileReader::seek(std::string_view seek_key)
-{
-    exhausted = false;
-    if (index.empty())
-    {
-        exhausted = true;
-        return;
-    }
-    /// After any seek the linear stream is no longer authoritative: ALL subsequent blocks (this one and
-    /// every block reached by later next()s) come via ranged gets (streaming mode). The pure-linear
-    /// fold path never seeks, so this never regresses the 3-request open profile.
-    seeked = true;
-    /// Find the FIRST block whose max_key >= key (sparse index): that block holds the first record
-    /// with stored_key >= key. Choosing the LAST block whose min_key <= key (the previous formula)
-    /// violated the "first key >= target" contract when an exact key is duplicated across a block
-    /// boundary (the writer permits equal keys): min_key of the LATER duplicate-starting block also
-    /// compares <= target, so the earlier duplicates were silently skipped (2026-07-11 Phase 3
-    /// design consult finding; latent until then because every production seek used a strict PREFIX
-    /// of the stored keys, which no full key can equal).
-    size_t target = index.size();
-    for (size_t b = 0; b < index.size(); ++b)
-    {
-        if (index[b].max_key >= seek_key)
-        {
-            target = b;
-            break;
-        }
-    }
-    if (target == index.size())
-    {
-        /// Every stored key < seek_key: position at the end (next() yields nothing).
-        exhausted = true;
-        return;
-    }
-    loadBlock(target);
-    /// Advance within the block to the first record with stored_key >= key.
-    String k, p;
-    size_t save_pos = cur_block_pos;
-    uint32_t save_rec = cur_record_no;
-    while (cur_record_no < cur_block_records)
-    {
-        save_pos = cur_block_pos;
-        save_rec = cur_record_no;
-        if (!next(k, p))
-            return;
-        if (k >= seek_key)
-        {
-            /// rewind one record so the next next() re-yields it
-            cur_block_pos = save_pos;
-            cur_record_no = save_rec;
-            return;
-        }
-    }
-}
-
-/// ---- merger ----
-
-RunMerger::RunMerger(std::vector<std::unique_ptr<RunFileReader>> readers_) : readers(std::move(readers_))
-{
-    fronts.resize(readers.size());
-    for (size_t i = 0; i < readers.size(); ++i)
-        pull(i);
-}
-
-void RunMerger::pull(size_t reader_idx)
-{
-    Front & f = fronts[reader_idx];
-    f.reader_idx = reader_idx;
-    f.valid = readers[reader_idx]->next(f.key, f.payload);
-}
-
-bool RunMerger::next(String & key, std::vector<String> & payloads_for_key)
-{
-    /// Find the smallest valid front key.
-    bool any = false;
-    String min_key;
-    for (const auto & f : fronts)
-    {
-        if (!f.valid)
-            continue;
-        if (!any || f.key < min_key)
-        {
-            min_key = f.key;
-            any = true;
-        }
-    }
-    if (!any)
-        return false;
-
-    key = min_key;
-    payloads_for_key.clear();
-    /// Drain every front (and every consecutive duplicate-key record per reader) equal to min_key.
-    for (size_t i = 0; i < fronts.size(); ++i)
-    {
-        while (fronts[i].valid && fronts[i].key == min_key)
-        {
-            payloads_for_key.push_back(fronts[i].payload);
-            pull(i);
-        }
-    }
-    return true;
-}
+/// (`RunFileReader::seek` and `RunMerger` deleted in codecs-v3 phase 5. `seek` had one production
+/// caller — the also-deleted `inDegreeInGeneration` — and `RunMerger` had none; the source-edge
+/// `cas_run` object moved to the sequential NDJSON `CasRecordStreamFormat`. This binary `CARN` reader/
+/// writer survives ONLY for the `RunKind::ManifestEntries` stream embedded in a `CAPT` part manifest
+/// (`CasManifestCodec`), which reads it sequentially — phase 6 removes `CasRunFile` entirely when it
+/// converts that embedded stream. The `seeked` member is now always false, kept until then.)
 
 }

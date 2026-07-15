@@ -5,6 +5,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRunFile.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasRecordStreamFormat.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <IO/WriteBufferFromString.h>
 #include <Common/Exception.h>
@@ -18,7 +19,7 @@ namespace
 UInt128 b(uint64_t n) { return UInt128(n); }
 UInt128 s(uint64_t n) { return UInt128(n); }   // source-edge id
 /// A `BlobRef` (CityHash128) for the same literal `n` — every existing test's `BlobDelta.ref` /
-/// `BlobCandidate.ref` / `inDegreeInGeneration` argument is a `BlobRef` as of Phase 3 T3.
+/// `BlobCandidate.ref` / `inDegreeInRuns` argument is a `BlobRef` as of Phase 3 T3.
 BlobRef bh(uint64_t n) { return BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(UInt128(n))}; }
 }
 
@@ -99,7 +100,7 @@ TEST(CasBlobInDegree, SameEdgeActivatedTwiceCountsOnce)
     foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{}, 1, /*attempt*/0, 0, deltas, runs);
     ASSERT_FALSE(runs.empty());
 
-    const int64_t deg = inDegreeInGeneration(backend, runs, bh(1));
+    const int64_t deg = DB::Cas::tests::inDegreeInRuns(backend, runs, bh(1));
     EXPECT_EQ(deg, 1);   /// deduplicated, not 2
 
     const auto zero = zeroInDegree(backend, runs);
@@ -135,10 +136,26 @@ TEST(CasBlobInDegree, FoldDeltaDivergentBytesThrowsCorrupted)
 ///
 /// The retired input is no longer a separate `prior_retired` vector — the prior generation's `kCondemned`
 /// rows RIDE the source-edge run at the zero-sentinel key. These helpers build such a prior run directly
-/// (option (b) from the T3 brief: `RunFileWriter` + `encodeCondemnedRow`) and decode a run for assertions.
+/// (via the sorted-NDJSON `SourceEdgeRunWriter`, codecs-v3 phase 5) and decode a run for assertions.
 
 namespace
 {
+
+/// A `kCondemned` sentinel record for `h` at the zero source_id, carrying the condemned incarnation.
+SourceEdgeRecord condemnedRec(UInt128 h, const CondemnedRow & row)
+{
+    return SourceEdgeRecord{.ref = BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(h)},
+                            .source_id = UInt128{0}, .marker = kCondemned,
+                            .delete_pending = row.delete_pending, .token = row.token,
+                            .size = row.size, .condemn_round = row.condemn_round};
+}
+
+/// An active-edge record (`kEdgeActive`) for `h` at source `sid`.
+SourceEdgeRecord edgeRec(UInt128 h, UInt128 sid)
+{
+    return SourceEdgeRecord{.ref = BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(h)},
+                            .source_id = sid, .marker = kEdgeActive};
+}
 
 /// head_blob / peek_head stub: present with a fixed token/size.
 std::function<std::optional<HeadResult>(const BlobRef &)> headPresent(const String & tok, uint64_t size)
@@ -171,30 +188,33 @@ RunRef writeSourceEdgeRun(InMemoryBackend & backend, const Layout & layout,
                           const std::vector<std::pair<UInt128, CondemnedRow>> & condemned,
                           const std::vector<std::pair<UInt128, UInt128>> & edges = {})
 {
-    std::vector<std::pair<String, String>> rows;
+    std::vector<SourceEdgeRecord> recs;
     for (const auto & [h, row] : condemned)
-        rows.emplace_back(SourceEdgeKeyCodec::key(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(h)}, UInt128{0}), encodeCondemnedRow(row));
+        recs.push_back(condemnedRec(h, row));
     for (const auto & [h, sid] : edges)
-        rows.emplace_back(SourceEdgeKeyCodec::key(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(h)}, sid), String(1, kEdgeActive));
-    std::stable_sort(rows.begin(), rows.end(),
-        [](const auto & a, const auto & bb) { return a.first < bb.first; });
+        recs.push_back(edgeRec(h, sid));
+    /// The writer requires non-decreasing (ref, source_id) order (sentinels at source_id 0 sort first
+    /// per blob, exactly reproducing the old raw-key order).
+    std::stable_sort(recs.begin(), recs.end(), [](const SourceEdgeRecord & a, const SourceEdgeRecord & bb)
+    {
+        if (a.ref < bb.ref)
+            return true;
+        if (bb.ref < a.ref)
+            return false;
+        return a.source_id < bb.source_id;
+    });
 
     DB::WriteBufferFromOwnString out;
-    RunHeader header;
-    header.kind = RunKind::SourceEdge;
-    header.key_schema = kSourceEdgeKeySchema;
-    RunFileWriter writer(out, header);
-    for (const auto & [k, p] : rows)
-        writer.append(k, p);
+    SourceEdgeRunWriter writer(out);
+    for (const auto & rec : recs)
+        writer.append(rec);
     writer.finish();
+    out.finalize();
 
     const String bytes = out.str();
     const String key = layout.blobTargetRunKey(gen, attempt, shard, 0);
     backend.putIfAbsent(key, bytes);
-    const auto h = CityHash_v1_0_2::CityHash128(bytes.data(), bytes.size());
-    return RunRef{.key = key,
-                  .checksum = (static_cast<UInt128>(h.high64) << 64) | static_cast<UInt128>(h.low64),
-                  .shard = shard, .generation = gen};
+    return RunRef{.key = key, .checksum = sourceEdgeRunChecksum(bytes), .shard = shard, .generation = gen};
 }
 
 struct DecodedRun
@@ -207,7 +227,7 @@ struct DecodedRun
 DecodedRun decodeRun(InMemoryBackend & backend, const RunRef & run)
 {
     DecodedRun d;
-    RunFileReader r = openSourceEdgeRun(backend, run.key);
+    auto r = openSourceEdgeRun(backend, run.key);
     /// Every run this test helper decodes is CityHash128 (16-byte), so `.toU128()` is a
     /// provably-exact round trip.
     String k, p;
@@ -470,14 +490,14 @@ TEST(CasTwoCursorMerge, MalformedRunFailsClosed)
     {
         InMemoryBackend backend;
         DB::WriteBufferFromOwnString out;
-        RunHeader header;
-        header.kind = RunKind::SourceEdge;
-        header.key_schema = kSourceEdgeKeySchema;
-        RunFileWriter writer(out, header);
-        writer.append(SourceEdgeKeyCodec::key(bh(1), UInt128{0}), String(1, kEdgeActive));   // edge at sentinel key
+        SourceEdgeRunWriter writer(out);
+        writer.append(edgeRec(1, UInt128{0}));   // edge at sentinel key
         writer.finish();
-        const RunRef bad{.key = layout.blobTargetRunKey(1, 0, 0, 0), .checksum = {}, .shard = 0, .generation = 1};
-        backend.putIfAbsent(bad.key, out.str());
+        out.finalize();
+        const String bytes = out.str();
+        const RunRef bad{.key = layout.blobTargetRunKey(1, 0, 0, 0),
+                         .checksum = sourceEdgeRunChecksum(bytes), .shard = 0, .generation = 1};
+        backend.putIfAbsent(bad.key, bytes);
 
         std::vector<RunRef> runs2;
         EXPECT_THROW(foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{bad}, 2, 0, 0, {}, runs2),
@@ -488,16 +508,16 @@ TEST(CasTwoCursorMerge, MalformedRunFailsClosed)
     {
         InMemoryBackend backend;
         DB::WriteBufferFromOwnString out;
-        RunHeader header;
-        header.kind = RunKind::SourceEdge;
-        header.key_schema = kSourceEdgeKeySchema;
-        RunFileWriter writer(out, header);
+        SourceEdgeRunWriter writer(out);
         /// Same (b,0) key twice (equal keys are allowed by the writer) — two condemned sentinels for b1.
-        writer.append(SourceEdgeKeyCodec::key(bh(1), UInt128{0}), encodeCondemnedRow(condemnedRowFor(1)));
-        writer.append(SourceEdgeKeyCodec::key(bh(1), UInt128{0}), encodeCondemnedRow(condemnedRowFor(2)));
+        writer.append(condemnedRec(1, condemnedRowFor(1)));
+        writer.append(condemnedRec(1, condemnedRowFor(2)));
         writer.finish();
-        const RunRef bad{.key = layout.blobTargetRunKey(1, 0, 0, 0), .checksum = {}, .shard = 0, .generation = 1};
-        backend.putIfAbsent(bad.key, out.str());
+        out.finalize();
+        const String bytes = out.str();
+        const RunRef bad{.key = layout.blobTargetRunKey(1, 0, 0, 0),
+                         .checksum = sourceEdgeRunChecksum(bytes), .shard = 0, .generation = 1};
+        backend.putIfAbsent(bad.key, bytes);
 
         std::vector<RunRef> runs2;
         EXPECT_THROW(foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{bad}, 2, 0, 0, {}, runs2),
@@ -668,27 +688,6 @@ TEST(CasCondemnedRow, TruncatedPayloadFailsClosed)
     EXPECT_THROW(DB::Cas::decodeCondemnedRow(bytes), DB::Exception);
 }
 
-TEST(CasSourceEdgeRun, TypedOpenRejectsWrongSchemaAndKind)
-{
-    /// A run written with today's writer carries key_schema 0 -> the typed open must fail closed.
-    /// Build a minimal run body via RunFileWriter with a deliberately wrong header.
-    DB::WriteBufferFromOwnString out;
-    DB::Cas::RunHeader header;
-    header.kind = DB::Cas::RunKind::SourceEdge;
-    header.key_schema = 0;                                    // pre-refactor schema
-    DB::Cas::RunFileWriter writer(out, header);
-    writer.finish();
-    EXPECT_THROW(DB::Cas::openSourceEdgeRun(out.str()), DB::Exception);
-
-    DB::WriteBufferFromOwnString out2;
-    DB::Cas::RunHeader h2;
-    h2.kind = DB::Cas::RunKind::ManifestEntries;              // wrong kind, right schema
-    h2.key_schema = DB::Cas::kSourceEdgeKeySchema;
-    DB::Cas::RunFileWriter w2(out2, h2);
-    w2.finish();
-    EXPECT_THROW(DB::Cas::openSourceEdgeRun(out2.str()), DB::Exception);
-}
-
 TEST(CasSourceEdgeRun, SourceEdgeIdZeroIsReserved)
 {
     /// The zero source_id is the sentinel namespace; producers fail closed on a zero hash
@@ -749,8 +748,8 @@ TEST(CasBlobInDegree, TwoAlgoFoldSettlesBothInOneShardRun)
         {{ch_x, s(1), false}, {sha_y_ref, s(1), false}}, runs1);
     ASSERT_FALSE(runs1.empty());
 
-    EXPECT_EQ(inDegreeInGeneration(backend, runs1, ch_x), 1);
-    EXPECT_EQ(inDegreeInGeneration(backend, runs1, sha_y_ref), 1);
+    EXPECT_EQ(DB::Cas::tests::inDegreeInRuns(backend, runs1, ch_x), 1);
+    EXPECT_EQ(DB::Cas::tests::inDegreeInRuns(backend, runs1, sha_y_ref), 1);
     EXPECT_TRUE(zeroInDegree(backend, runs1).empty());
 
     /// Remove both edges in gen 2: each transitions to zero independently, condemned per its own ref.
@@ -764,6 +763,6 @@ TEST(CasBlobInDegree, TwoAlgoFoldSettlesBothInOneShardRun)
     std::vector<BlobRef> condemned_refs{rmr.still_retired[0].ref, rmr.still_retired[1].ref};
     EXPECT_NE(std::find(condemned_refs.begin(), condemned_refs.end(), ch_x), condemned_refs.end());
     EXPECT_NE(std::find(condemned_refs.begin(), condemned_refs.end(), sha_y_ref), condemned_refs.end());
-    EXPECT_EQ(inDegreeInGeneration(backend, runs2, ch_x), 0);
-    EXPECT_EQ(inDegreeInGeneration(backend, runs2, sha_y_ref), 0);
+    EXPECT_EQ(DB::Cas::tests::inDegreeInRuns(backend, runs2, ch_x), 0);
+    EXPECT_EQ(DB::Cas::tests::inDegreeInRuns(backend, runs2, sha_y_ref), 0);
 }

@@ -450,10 +450,10 @@ void runFsckImpl(Store & store, bool detail, const FsckProgress & on_progress, c
                 for (const RunRef & run : decodeFoldSeal(seal_got->bytes).blob_target_runs)
                 {
                     checkDeadline(deadline, "reading gc snapshot runs");
-                    /// Typed open (spec §2.1): every source-edge run reader goes through openSourceEdgeRun.
-                    /// Fsck keys off the row's hash (via the run's own `SourceEdgeKeyCodec`, derived from
-                    /// its `key_schema` — Task 4, never from pool meta).
-                    RunFileReader reader = openSourceEdgeRun(backend, run.key);
+                    /// Typed open: the source-edge run reader goes through openSourceEdgeRun (the NDJSON
+                    /// header gates type == cas_run + kind == source_edge). Fsck keys off the row's hash
+                    /// (the record's own algo-prefixed key, never from pool meta).
+                    SourceEdgeRunView reader = openSourceEdgeRun(backend, run.key);
                     String key;
                     String payload;
                     while (reader.next(key, payload))
@@ -480,6 +480,9 @@ void runFsckImpl(Store & store, bool detail, const FsckProgress & on_progress, c
                         if (on_progress && ++rows % 65536 == 0)
                             on_progress("reading gc snapshot runs", in_run_hashes.size(), rows);
                     }
+                    /// Whole-file seal-checksum (codecs-v3 phase 5): verify the drained run against the
+                    /// seal's RunRef.checksum. Fsck is read-only — a mismatch surfaces as CORRUPTED_DATA.
+                    reader.verifyAgainst(run.checksum);
                 }
             }
         }

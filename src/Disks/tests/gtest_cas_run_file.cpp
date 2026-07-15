@@ -20,7 +20,7 @@ String writeRun(const std::vector<std::pair<String, String>> & recs, uint32_t bl
 {
     DB::WriteBufferFromOwnString out;
     RunHeader h;
-    h.kind = RunKind::BlobDelta;
+    h.kind = RunKind::ManifestEntries;
     h.key_schema = 0;
     h.block_size = block_size;
     RunFileWriter w(out, h);
@@ -84,64 +84,6 @@ TEST(CasRunFile, KeysMustBeNonDecreasing)
     {
         EXPECT_EQ(e.code(), DB::ErrorCodes::LOGICAL_ERROR);
     }
-}
-
-TEST(CasRunFile, SeekToKeyRange)
-{
-    std::vector<std::pair<String, String>> recs;
-    for (int i = 0; i < 100; ++i)
-    {
-        char k[8];
-        std::snprintf(k, sizeof(k), "k%03d", i);
-        recs.emplace_back(String(k), std::to_string(i));
-    }
-    const String bytes = writeRun(recs, /*block_size*/ 24);
-    RunFileReader r{std::string_view(bytes)};
-    r.seek("k050");
-    String k, p;
-    ASSERT_TRUE(r.next(k, p));
-    EXPECT_EQ(k, "k050");      /// first key >= "k050"
-    EXPECT_EQ(p, "50");
-    /// Seeking to a key between two stored keys lands on the next-greater.
-    RunFileReader r2{std::string_view(bytes)};
-    r2.seek("k0509");          /// no exact match; next is k051
-    ASSERT_TRUE(r2.next(k, p));
-    EXPECT_EQ(k, "k051");
-}
-
-TEST(CasRunFile, SeekLandsOnFirstOfDuplicateKeySpanningBlocks)
-{
-    /// The writer permits EQUAL keys (non-decreasing append order), so an exact key may legitimately
-    /// span a block boundary. `seek`'s contract is "position at the FIRST record with key >= target";
-    /// picking the LAST block whose min_key <= target lands past the earlier duplicates and silently
-    /// skips them (2026-07-11 Phase 3 design consult finding — latent today, since every production
-    /// seek uses a strict PREFIX of the stored keys, which no full key can equal).
-    /// block_size=1 makes every record exceed the target, sealing one record per block:
-    /// blocks [aa] [kk] [kk] [kk] [zz] — the duplicate "kk" spans two block boundaries.
-    const std::vector<std::pair<String, String>> recs =
-        {{"aa", "0"}, {"kk", "1"}, {"kk", "2"}, {"kk", "3"}, {"zz", "4"}};
-    const String bytes = writeRun(recs, /*block_size=*/1);
-
-    RunFileReader r{std::string_view(bytes)};
-    r.seek("kk");
-    std::vector<std::pair<String, String>> got;
-    String k, p;
-    while (r.next(k, p))
-        got.emplace_back(k, p);
-    const std::vector<std::pair<String, String>> expected =
-        {{"kk", "1"}, {"kk", "2"}, {"kk", "3"}, {"zz", "4"}};
-    EXPECT_EQ(got, expected);
-}
-
-TEST(CasRunFile, SeekPastEveryKeyIsExhausted)
-{
-    /// A target greater than every stored key positions at the end: next() yields nothing.
-    const std::vector<std::pair<String, String>> recs = {{"aa", "0"}, {"bb", "1"}, {"cc", "2"}};
-    const String bytes = writeRun(recs, /*block_size=*/1);
-    RunFileReader r{std::string_view(bytes)};
-    r.seek("zz");
-    String k, p;
-    EXPECT_FALSE(r.next(k, p));
 }
 
 TEST(CasRunFile, CorruptedPayloadFailsClosed)
@@ -310,56 +252,6 @@ TEST(CasRunFile, TruncationSweepFailsClosed)
         expectCorruptedData("truncated prefix", [&] { constructAndDrain(valid.substr(0, k)); });
 }
 
-TEST(CasRunFile, MergeTwoDisjointRuns)
-{
-    const String a = writeRun({{"a", "1"}, {"c", "3"}, {"e", "5"}});
-    const String b = writeRun({{"b", "2"}, {"d", "4"}, {"f", "6"}});
-    std::vector<std::unique_ptr<RunFileReader>> rs;
-    rs.push_back(std::make_unique<RunFileReader>(std::string_view(a)));
-    rs.push_back(std::make_unique<RunFileReader>(std::string_view(b)));
-    RunMerger m(std::move(rs));
-    String k;
-    std::vector<String> vs;
-    std::vector<String> seen;
-    while (m.next(k, vs))
-    {
-        EXPECT_EQ(vs.size(), 1u);
-        seen.push_back(k);
-    }
-    EXPECT_EQ(seen, (std::vector<String>{"a", "b", "c", "d", "e", "f"}));
-}
-
-TEST(CasRunFile, MergeCoalescesSameKeyAcrossRuns)
-{
-    /// Same key "k" present in both runs -> one merged key with both payloads.
-    const String a = writeRun({{"k", "from-a"}, {"z", "9"}});
-    const String b = writeRun({{"k", "from-b"}});
-    std::vector<std::unique_ptr<RunFileReader>> rs;
-    rs.push_back(std::make_unique<RunFileReader>(std::string_view(a)));
-    rs.push_back(std::make_unique<RunFileReader>(std::string_view(b)));
-    RunMerger m(std::move(rs));
-    String k;
-    std::vector<String> vs;
-    ASSERT_TRUE(m.next(k, vs));
-    EXPECT_EQ(k, "k");
-    ASSERT_EQ(vs.size(), 2u);
-    /// Payloads come in reader order: run a first, then run b.
-    EXPECT_EQ(vs[0], "from-a");
-    EXPECT_EQ(vs[1], "from-b");
-    ASSERT_TRUE(m.next(k, vs));
-    EXPECT_EQ(k, "z");
-    EXPECT_FALSE(m.next(k, vs));
-}
-
-TEST(CasRunFile, MergeEmptyInput)
-{
-    std::vector<std::unique_ptr<RunFileReader>> rs;   /// no readers
-    RunMerger m(std::move(rs));
-    String k;
-    std::vector<String> vs;
-    EXPECT_FALSE(m.next(k, vs));
-}
-
 /// ---- streaming mode (Backend seam) ----
 
 namespace
@@ -403,30 +295,7 @@ TEST(CasRunFileStreaming, MultiBlockStreamMatchesBorrowed)
     while (r.next(k, p))
         streamed.emplace_back(k, p);
     EXPECT_EQ(streamed, recs);
-    EXPECT_EQ(r.kind(), RunKind::BlobDelta);
-}
-
-TEST(CasRunFileStreaming, SeekUsesOneRangedGet)
-{
-    auto backend = std::make_shared<CountingBackend>();
-    const String key = "runs/seekme";
-    const auto recs = buildMultiBlockRunInBackend(*backend, key, 2000, 4096);
-
-    backend->resetCounts();
-    RunFileReader r(*backend, key);
-    /// Open profile: head=1, tail get=1, body getStream=1.
-    ASSERT_EQ(backend->headCount(key), 1u);
-    ASSERT_EQ(backend->getCount(key), 1u);
-    ASSERT_EQ(backend->getStreamCount(key), 1u);
-
-    const uint64_t gets_before_seek = backend->getCount(key);
-    r.seek("k001000");
-    String k, p;
-    ASSERT_TRUE(r.next(k, p));
-    EXPECT_EQ(k, "k001000");
-    /// The seek touched exactly one block => exactly one extra ranged get.
-    EXPECT_EQ(backend->getCount(key), gets_before_seek + 1);
-    EXPECT_EQ(backend->getStreamCount(key), 1u);   /// no new stream opened
+    EXPECT_EQ(r.kind(), RunKind::ManifestEntries);
 }
 
 TEST(CasRunFileStreaming, OpenIsThreeRequestsAndBlockBoundedRanges)
@@ -523,7 +392,7 @@ TEST(CasRunFileStreaming, LargeFooterBeyondTailProbeReadsExactWindow)
         String out_bytes;
         DB::WriteBufferFromString out(out_bytes);
         RunHeader header;
-        header.kind = RunKind::SourceEdge;
+        header.kind = RunKind::ManifestEntries;
         header.block_size = 4096;
         RunFileWriter writer(out, header);
         String big_key(1024, 'k');
@@ -549,17 +418,4 @@ TEST(CasRunFileStreaming, LargeFooterBeyondTailProbeReadsExactWindow)
     EXPECT_EQ(backend->headCount(key), 1u);
     EXPECT_EQ(backend->getCount(key), 2u);
     EXPECT_EQ(backend->getStreamCount(key), 1u);
-}
-
-TEST(CasRunFile, MixedWidthKeysAcrossBlockBoundary)      /// spec §9.10 — Phase 3 T3
-{
-    /// tiny blocks: one record per block; a 33->49-byte width transition lands exactly on a block
-    /// boundary; seek by both prefixes; absent prefix positions on the next greater key.
-    const String k1(33, 'a'), k2(33, 'b'), k3(49, 'c'), k4(49, 'd');
-    const String bytes = writeRun({{k1, "1"}, {k2, "2"}, {k3, "3"}, {k4, "4"}}, /*block_size*/ 1);
-    RunFileReader r{std::string_view(bytes)};
-    r.seek(k3.substr(0, 17));                            /// a 17-byte prefix of the 49-byte key
-    String k, p;
-    ASSERT_TRUE(r.next(k, p));
-    EXPECT_EQ(k, k3);
 }

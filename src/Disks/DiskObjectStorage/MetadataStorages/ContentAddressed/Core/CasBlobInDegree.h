@@ -6,8 +6,10 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasFoldSealFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestId.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRunFile.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasSourceEdgeMarkers.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasToken.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasRecordStreamFormat.h>
+#include <memory>
 #include <base/types.h>
 #include <base/extended_types.h>
 #include <cstdint>
@@ -39,13 +41,10 @@ struct RetiredEntry
                                   /// it condemned and recreate).
 };
 
-/// Sealed source-edge run row tags (spec §2.1). `kEdgeActive`/`kZeroMarker` were promoted from a
-/// `.cpp`-local anonymous namespace: `kCondemned` (the retired-in-snapshot row, Task 2) needs to
-/// share the tag byte space, and `decodeCondemnedRow` (a public entry point) must be able to
-/// recognize its own tag.
-constexpr char kEdgeActive = 0x01;   // sealed-run row: a surviving active edge
-constexpr char kZeroMarker = 0x00;   // sealed-run row: blob transitioned to zero this generation
-constexpr char kCondemned  = 0x02;   // sealed-run row: blob retired-in-snapshot (spec §2.1)
+/// The sealed source-edge run row tags (`kEdgeActive`/`kZeroMarker`/`kCondemned`, spec §2.1) moved to
+/// `Core/CasSourceEdgeMarkers.h` (codecs-v3 phase 5) so the backend-free `Formats/CasRecordStreamFormat`
+/// codec shares one definition with this subsystem (included above; the constants stay in namespace
+/// `DB::Cas`, so every current user is unaffected).
 
 /// Source-edge run key schema (Phase 3 T3, mixed-algo pools): a SINGLE schema, self-describing per
 /// row via the leading algo byte — replaces the pool-wide-width schemas 1/2 (DELETED, along with
@@ -71,8 +70,9 @@ public:
     /// Parse a key. Throws `NOT_IMPLEMENTED` on an unknown algo byte, `CORRUPTED_DATA` on a wrong
     /// total length for a known algo. Zero-tails the digest (beyond the algo's own width).
     static void parse(std::string_view key, BlobRef & ref, UInt128 & source_id);
-    /// The sparse-index seek prefix for a blob: algo(u8) ++ digest[blobHashLenFor(algo)].
-    static String seekPrefix(const BlobRef & ref);
+    /// (`seekPrefix` deleted in codecs-v3 phase 5 with the random-access `seek` path — runs are now a
+    /// sequential NDJSON stream with no offset index; `key`/`parse` remain as the packed-key bridge
+    /// between the NDJSON records and the fold/preview/fsck consumers.)
 };
 
 /// Deterministic 16-byte id of a source edge (ManifestId, path). Distinctness only — not reconstructable.
@@ -97,13 +97,42 @@ struct CondemnedRow
 String encodeCondemnedRow(const CondemnedRow & row);          // [0x02][flags][token_type][round][size][len][value]
 CondemnedRow decodeCondemnedRow(std::string_view payload);    // throws CORRUPTED_DATA per spec §2.1
 
-/// Typed open (spec §2.1): validates kind == SourceEdge and key_schema == kSourceEdgeKeySchema,
-/// fails closed otherwise. ALL source-edge run readers go through this.
-///   - borrowed-memory overload: zero-copy over caller-owned bytes.
-///   - streaming overload: opens the write-once run object off `backend` at O(one block) resident
-///     memory (the fold/preview readers use this; the returned reader is move-constructed).
-RunFileReader openSourceEdgeRun(std::string_view bytes);
-RunFileReader openSourceEdgeRun(Backend & backend, const String & key);
+/// Bridges the backend-free `Formats/CasRecordStreamFormat` NDJSON reader (codecs-v3 phase 5) to the
+/// `(key, payload)` BYTE interface the fold / `zeroInDegree` / `previewDeletes` / `fsck` consumers use:
+/// `next` reconstructs the packed `SourceEdgeKeyCodec` key and the original payload bytes (a single
+/// marker byte for an edge / zero row, or the `encodeCondemnedRow` blob for a condemned row) from the
+/// decoded NDJSON record. So the codec stays backend-free while the consumers keep their exact parse /
+/// compare logic. The whole-object chained CityHash128 is accumulated as the run streams; `verifyAgainst`
+/// checks it against the fold seal's `RunRef.checksum` AFTER the run is fully drained and BEFORE the
+/// caller acts on it (a deletion decision).
+class SourceEdgeRunView
+{
+public:
+    /// false once the run's `{"n"}` trailer is consumed (the trailer count is verified there). `key` is
+    /// the reconstructed `SourceEdgeKeyCodec::key(ref, source_id)`; `payload` is the original marker byte
+    /// or `encodeCondemnedRow` bytes.
+    bool next(String & key, String & payload);
+    /// Verify the accumulated whole-file checksum against the seal's `RunRef.checksum`; CORRUPTED_DATA on
+    /// mismatch. Call after draining the run and before acting on its records.
+    void verifyAgainst(const UInt128 & expected);
+
+private:
+    friend SourceEdgeRunView openSourceEdgeRun(std::string_view bytes);
+    friend SourceEdgeRunView openSourceEdgeRun(Backend & backend, const String & key);
+    explicit SourceEdgeRunView(std::unique_ptr<ReadBuffer> stream_);
+
+    std::unique_ptr<ReadBuffer> stream;             /// owns the backend stream / memory buffer the reader borrows
+    std::unique_ptr<SourceEdgeRunReader> reader;    /// over *stream (non-movable => held by pointer, destroyed before stream)
+};
+
+/// Typed open (spec §2.1): the header line gates `type == cas_run` + `kind == source_edge`, fail-closed
+/// otherwise (the pre-phase-5 kind/key_schema binary gate is replaced by the NDJSON header gate). ALL
+/// source-edge run readers go through this.
+///   - borrowed-memory overload: reads over caller-owned bytes (the caller must keep them alive).
+///   - streaming overload: opens the write-once run object off `backend` via `getStream` at O(one line)
+///     resident memory (the fold / preview / fsck readers use this).
+SourceEdgeRunView openSourceEdgeRun(std::string_view bytes);
+SourceEdgeRunView openSourceEdgeRun(Backend & backend, const String & key);
 
 /// Write-once for a DETERMINISTIC artifact (same inputs => byte-identical bytes): the blob in-degree
 /// runs AND the fold/completion seals. `putIfAbsent`; on a `PreconditionFailed` the key is already
@@ -229,10 +258,8 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
 /// empty `runs` is an empty baseline. Resolution is by ref (2026-07-02 T0), never by key construction.
 std::vector<BlobCandidate> zeroInDegree(Backend & backend, const std::vector<RunRef> & runs);
 
-/// The in-degree of one blob in the sealed run named by `runs` (the seal's `blob_target_runs` for one
-/// shard): 0 when the blob is absent from the run (or written as an explicit transitioned-to-0 row), else
-/// its count. Used by `Gc::previewDeletes` and by tests (the round itself settles candidates inside the
-/// three-cursor merge; there is no per-candidate point query anymore).
-int64_t inDegreeInGeneration(Backend & backend, const std::vector<RunRef> & runs, const BlobRef & ref);
+/// (`inDegreeInGeneration` deleted in codecs-v3 phase 5: it was the ONLY caller of `RunFileReader::seek`
+/// and had no production caller itself — `Gc::previewDeletes` uses `zeroInDegree` + a `kCondemned` scan,
+/// never a per-blob point query. Runs are now a sequential NDJSON stream with no random access.)
 
 }
