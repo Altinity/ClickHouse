@@ -1,0 +1,90 @@
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasBlobMetaFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasTextFormat.h>
+#include <Common/Exception.h>
+#include <IO/ReadBufferFromMemory.h>
+#include <IO/WriteBufferFromString.h>
+#include <IO/WriteHelpers.h>
+
+namespace DB
+{
+namespace ErrorCodes
+{
+    extern const int CORRUPTED_DATA;
+}
+}
+
+namespace DB::Cas
+{
+
+namespace
+{
+
+std::string_view metaStateToWord(MetaState s)
+{
+    switch (s)
+    {
+        case MetaState::Clean:     return "clean";
+        case MetaState::Condemned: return "condemned";
+    }
+    throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS blob meta: unknown MetaState {}", static_cast<int>(s));
+}
+
+MetaState metaStateFromWord(std::string_view w)
+{
+    if (w == "clean")     return MetaState::Clean;
+    if (w == "condemned") return MetaState::Condemned;
+    throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS blob meta: unknown state '{}'", w);
+}
+
+}
+
+String encodeBlobMeta(const BlobMeta & meta)
+{
+    WriteBufferFromOwnString out;
+    writeHeaderLine(out, FormatId::BlobMeta);
+    bool first = true;
+    writeKey(out, "st", first);
+    writeStringValue(out, metaStateToWord(meta.state));
+    writeKey(out, "cr", first);
+    writeU64StringValue(out, meta.condemn_round);
+    writeKey(out, "sz", first);
+    writeU64StringValue(out, meta.size);
+    closeObject(out, first);
+    writeChar('\n', out);
+    out.finalize();
+    return out.str();
+}
+
+BlobMeta decodeBlobMeta(std::string_view bytes)
+{
+    ReadBufferFromMemory in(bytes.data(), bytes.size());
+    expectHeaderLine(in, FormatId::BlobMeta);
+    const String body = readLine(in, traitsFor(FormatId::BlobMeta).line_cap, "blob meta");
+    ReadBufferFromMemory body_in(body.data(), body.size());
+    JsonObjectReader r(body_in, KeyStrictness::Tolerant, "blob meta");
+
+    BlobMeta m;
+    bool saw_state = false;
+    String key;
+    while (r.nextKey(key))
+    {
+        if (key == "st")
+        {
+            m.state = metaStateFromWord(r.readString());
+            saw_state = true;
+        }
+        else if (key == "cr")
+            m.condemn_round = r.readU64String();
+        else if (key == "sz")
+            m.size = r.readU64String();
+        else
+            r.skipUnknown(key);
+    }
+    if (!saw_state)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS blob meta: missing st");
+    if (!body_in.eof() || !in.eof())
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS blob meta: trailing bytes");
+    return m;
+}
+
+}
