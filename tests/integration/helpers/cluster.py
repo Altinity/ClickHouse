@@ -2828,7 +2828,9 @@ class ClickHouseCluster:
                         "Got exception pulling images: %s", kwargs["exception"]
                     )
 
-            retry(log_function=logging_pulling_images)(run_and_check)(images_pull_cmd)
+            retry(log_function=logging_pulling_images)(run_and_check)(
+                images_pull_cmd, timeout=900
+            )
 
             if self.with_zookeeper_secure and self.base_zookeeper_cmd:
                 logging.debug("Setup ZooKeeper Secure")
