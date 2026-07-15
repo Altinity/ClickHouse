@@ -208,6 +208,13 @@ is still present); if not, add it and run the gate green before any code. Expect
 invariant — precommit protects the new closure, the old manifest ages out through the normal
 fold/retire path.
 
+**Phase 0 run 2026-07-15:** `WRepoint` (`CaGcRootLocalPartManifestCore.tla:377-394`) already
+covers the same-key repoint trigger — verified against all three preconditions (source-committed
+/ destination-unowned; one journal event carrying both bindings; no writer-identity-vs-original-
+publisher check), and `AtMostOneCommittedManifestPerRef` is preserved by construction (the single
+atomic `EXCEPT` retargets both owner entries in one step). Gate green at `a4fdb2f30fd` (TLC
+`CaGcRootLocalPartManifestCore_live`, no errors, 16m47s).
+
 ## 8. Testing {#testing}
 
 - **Unit (Core):** `repointRef` add / overwrite / remove / byte-equal no-op; audit event emission;
