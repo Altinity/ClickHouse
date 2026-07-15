@@ -6,6 +6,7 @@
 #include <IO/WriteBufferFromString.h>
 #include <vector>
 
+using namespace DB;
 using namespace DB::Cas;
 
 namespace DB::ErrorCodes

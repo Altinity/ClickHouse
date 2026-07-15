@@ -49,7 +49,7 @@ struct SourceEdgeRecord
     UInt128 source_id{};
     char marker = kEdgeActive;
     bool delete_pending = false;
-    Token token;
+    Token token{};
     uint64_t size = 0;
     uint64_t condemn_round = 0;
 };
