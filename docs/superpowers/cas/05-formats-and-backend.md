@@ -606,8 +606,12 @@ The following are designed but **not yet built** (pre-release, no breaking chang
 - **Durable roster** (`pool-meta` extension): `{members: {server_id: {path, G_build}}}` — one GET
   to read all members, CAS to update own entry. Floor = `min(G_build)` over members. Write a format
   `V` iff `min_reader(V) ≤ floor AND V ≤ setting`. Collocated with `RootsRegistry`.
-- **B200 — deliberate decommission** (`SYSTEM DROP CONTENT ADDRESSED POOL MEMBER <server_id>`).
-  Never auto-removes for inactivity; long-absent member pins the floor (safe default).
+- **B200 — deliberate decommission** — **IMPLEMENTED 2026-07-15, without the roster** (grammar
+  landed as `SYSTEM CONTENT ADDRESSED DROP POOL MEMBER '<server_id>' FROM DISK '<disk>'`; spec
+  `2026-07-13-cas-pool-member-decommission-design.md`). Never auto-removes for inactivity;
+  a long-absent member pins shared floors until deliberately dropped (safe default). Roster
+  forward-hook stays Part IV: when the durable roster lands, decommission additionally removes
+  the member's roster entry.
 
 These are designed so the door is provably open, but nothing in frozen bytes depends on them.
 
@@ -644,7 +648,7 @@ converted off JSON for cleanup but their protobuf is not an interchange contract
 | LIST consistency probe in `Cas::Probe` | TODO | see §10 |
 | Durable roster + `max_content_addressable_pool_format` setting | DEFERRED | Part IV, pre-release |
 | gc-snap → protobuf | DEFERRED | lowest-priority; keep binary+zstd |
-| B200 deliberate decommission | DEFERRED | needs roster first |
+| B200 deliberate decommission | **DONE 2026-07-15** | implemented WITHOUT the roster (`SYSTEM CONTENT ADDRESSED DROP POOL MEMBER` + `ca-drop-member`); roster entry removal = Part IV forward-hook |
 | Merkle tree-layer intermediate object | REJECTED | see §6 |
 | JSON for control objects | REJECTED | abandoned 2026-06-24 |
 | `CHCA` single magic with kind byte | REJECTED | replaced by per-kind `CABL`/`CATR` magic |

@@ -141,6 +141,25 @@ Before discovery, GC runs one **heartbeat fence pass** (`computeHeartbeatFloor`,
 
 The result is a `HeartbeatFloor{live, terminated, fenced_now, already_fenced, fenced_srids}` (counts + one `GcFenceOut` audit event per fenced srid). Fence-outs must complete before discovery, so every fenced writer's last commits are durable before the sweep.
 
+#### Fence vs decommission — a dead member's footprint outlives the fence {#fence-vs-decommission}
+
+The fence pass settles **liveness only**: a fenced member can no longer write, but its footprint —
+frozen watermark authority, stale precommits, staging debris, roots objects, and the mount/owner/epoch
+slot itself — stays in the pool indefinitely (a long-absent member pinning shared floors is the safe
+default). Erasing that footprint is a **deliberate operator action**:
+`SYSTEM CONTENT ADDRESSED DROP POOL MEMBER '<server_id>' FROM DISK '<disk>'` (also
+`clickhouse-disks ca-drop-member`), specified in
+[`specs/2026-07-13-cas-pool-member-decommission-design.md`](../specs/2026-07-13-cas-pool-member-decommission-design.md).
+Decommission impersonates the dead member as a **WRITER** (it claims the victim's mount via
+`Store::openForDecommission` and refuses a live one) — `GC` still never invents a ref transition.
+Drain-phase failures are per-object tolerated (warned + continued) but any warning keeps the slot
+**terminated, not deleted**, so a re-run re-drains; only a fully clean run retires the slot
+(farewell stamp, then `epoch → owner → mount` deletion, mount last for crash-safe resume).
+Known limitation (fail-closed): a mid-retirement crash on a victim that still has namespace debris
+(`ref-log`/`_snap` objects not yet physically reclaimed by GC) is refused on re-run by the
+`serverRootSubtreeEmpty` gate until GC's namespace-cleanup catches up — an availability narrowing,
+never data loss.
+
 **SUPERSEDED (v3 freshness-meta):** this pass used to ALSO compute a writer-ack floor `min_ack = min(observed_gc_round)` over live heartbeats, and graduation was gated on it. The `observed_gc_round` field was removed (`cas_format.proto` reserved 10 — the writer-side retired-view ack floor is gone). **Graduation now paces on GC rounds** — a retired entry graduates one round after it is condemned (via `new_round`), not on heartbeat acks — and the writer's condemned-detection is a per-hash `.meta` point-read (§3.4, `03 §merged-heartbeat`). `CaGcAckFloorZombie.tla` (`06 §area-11`) models the historical ack-floor ordering; only its GC-round-pipeline half stays current.
 
 ### 3.2 Fold {#fold}

@@ -11,7 +11,7 @@ doc_type: 'reference'
 
 **Date:** 2026-07-13
 **Branch:** `cas-gc-rebuild`
-**Status:** design (brainstormed + section-by-section approved by user 2026-07-13)
+**Status:** **IMPLEMENTED 2026-07-15** (plan `2026-07-13-cas-pool-member-decommission.md`, tasks 1-6 landed `03b3b95de44`..`e375fafa5e0` incl. review-fix commits `1b5a7f5faf3`/`3d641996a1a`/`51ff6879864`; integration test = Task 7, landing separately; docs = Task 8). Known fail-closed narrowing: mid-retirement crash resume on a victim with remaining namespace debris is refused by `serverRootSubtreeEmpty` until GC namespace-cleanup catches up. Originally: design (brainstormed + section-by-section approved by user 2026-07-13)
 **Supersedes:** the deferred B200 sketch in `docs/superpowers/cas/05-formats-and-backend.md`
 §deferred-rollout ("`SYSTEM DROP CONTENT ADDRESSED POOL MEMBER`, needs roster first") — this design
 implements deliberate decommission WITHOUT the durable roster (which still does not exist), and renames
