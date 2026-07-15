@@ -1341,6 +1341,66 @@ TEST(CaWiringExchange, AdoptFailsClosedAndFallsBackOnCondemnedBlob)
                                    "finding (dangling=" << rep.dangling << ")";
 }
 
+/// All-tree task 7: relink self-containment. Task 6 routes uuid.txt/metadata_version.txt through the
+/// content path, so a committed part's manifest ENTRIES already carry these files — the receiver no
+/// longer needs a mutable_files sidecar to reconstruct them (Fetcher::relinkPartToDisk now passes an
+/// empty map). Unlike `publishWiredPart` above (which still exercises the legacy setPendingMutableFiles
+/// channel for the lower-level payload tests), this publishes a part whose per-part files are ordinary
+/// manifest entries, then adopts it with an EMPTY mutable_files map — mirroring the post-task-7 call
+/// site exactly.
+TEST(CaWiringExchange, AdoptPartFromManifestSelfContainedWithoutMutableFilesSidecar)
+{
+    auto storage = openWiringStorage();
+    const auto sender_ns = storage->liveNamespace("uuid-1");
+
+    DB::Cas::BuildInfo info;
+    info.intended_ref = sender_ns.string() + "/all_1_1_0";
+    info.intended_namespace = sender_ns;
+    auto build = storage->store()->startBuild(info);
+    const auto id = build->stageManifest(
+        {wiringBlobEntry("data.bin", "payload-A"),
+         wiringBlobEntry("uuid.txt", "payload-uuid"),
+         wiringBlobEntry("metadata_version.txt", "payload-mv")});
+    build->precommitAdd(sender_ns, "all_1_1_0", id);
+    build->putBlob(idOf("payload-A"), DB::Cas::BlobSource::fromString("payload-A"));
+    build->putBlob(idOf("payload-uuid"), DB::Cas::BlobSource::fromString("payload-uuid"));
+    build->putBlob(idOf("payload-mv"), DB::Cas::BlobSource::fromString("payload-mv"));
+    build->promote(sender_ns, "all_1_1_0", build->buildId(), id);
+
+    auto * exchange = dynamic_cast<DB::IContentAddressedExchange *>(storage.get());
+    ASSERT_NE(exchange, nullptr);
+    auto bytes = exchange->getPartManifestBytes("uui/uuid-1/all_1_1_0");
+    ASSERT_TRUE(bytes.has_value());
+    const DB::Cas::PartManifest decoded = DB::Cas::decodePartManifest(*bytes);
+    ASSERT_EQ(decoded.entries.size(), 3u) << "uuid.txt/metadata_version.txt travel as ordinary entries";
+
+    /// Adopt with an EMPTY mutable_files map — exactly what Fetcher::relinkPartToDisk passes now that
+    /// the manifest is self-contained (no sidecar reconstruction from a wire-transferred header).
+    const bool ok = exchange->adoptPartFromManifest("uuid-2", "tmp-fetch_all_1_1_0", *bytes, {});
+    EXPECT_TRUE(ok);
+
+    const auto receiver_ns = storage->liveNamespace("uuid-2");
+    auto resolved = storage->store()->resolveRef(receiver_ns, "tmp-fetch_all_1_1_0");
+    ASSERT_TRUE(resolved.has_value());
+    EXPECT_TRUE(resolved->mutable_files.empty())
+        << "no sidecar was carried in — the per-part files rode in as ordinary manifest entries";
+
+    const DB::Cas::PartManifest receiver_manifest = storage->store()->readManifest(resolved->manifest_id);
+    ASSERT_EQ(receiver_manifest.entries.size(), 3u);
+    bool has_uuid_entry = false;
+    bool has_metadata_version_entry = false;
+    for (const auto & entry : receiver_manifest.entries)
+    {
+        if (entry.path == "uuid.txt")
+            has_uuid_entry = true;
+        if (entry.path == "metadata_version.txt")
+            has_metadata_version_entry = true;
+    }
+    EXPECT_TRUE(has_uuid_entry) << "uuid.txt must read back as an ordinary content entry, not mutable_files";
+    EXPECT_TRUE(has_metadata_version_entry)
+        << "metadata_version.txt must read back as an ordinary content entry, not mutable_files";
+}
+
 /// ==== Commit atomicity (B122): a publish failing mid-loop must not leave a PARTIAL commit ====
 
 #include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>

@@ -117,13 +117,13 @@ private:
     /// part name, exactly as for a byte-fetched part), loads the part from the shared manifest, and
     /// returns it. Returns nullptr if the relink is not possible (the transferred manifest's blobs are
     /// not resolvable in this pool — missing/condemned), in which case the caller falls back to a byte fetch.
+    /// Self-contained (all-tree task 7): the transferred manifest alone is enough to rebuild the part — no
+    /// separate uuid/metadata_version wire fields to reconstruct as a sidecar.
     MergeTreeData::MutableDataPartPtr relinkPartToDisk(
         const String & part_name,
         const String & tmp_prefix,
         DiskPtr disk,
-        const String & sender_manifest_bytes,
-        UUID part_uuid,
-        Int32 metadata_version);
+        const String & sender_manifest_bytes);
 
     MergeTreeData::MutableDataPartPtr downloadPartToDiskRemoteMeta(
        const String & part_name,
