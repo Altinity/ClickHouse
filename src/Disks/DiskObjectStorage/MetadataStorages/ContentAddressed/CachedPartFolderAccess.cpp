@@ -273,9 +273,29 @@ bool CachedPartFolderAccess::repointRef(const PartRefKey & key, std::vector<Cas:
     /// `publishEntries` takes `entries` by const&, so it is read here after the call without issue.
     publishEntries(key, entries, op, /*allow_repoint=*/true);
     ProfileEvents::increment(ProfileEvents::CasRefRepoint);
-    LOG_WARNING(getLogger("CachedPartFolderAccess"),
-        "Repointed committed ref {}/{} ({} entries) — standalone write/remove on a committed part",
-        key.ns.string(), key.ref, entries.size());
+    if (resolved)
+    {
+        /// Post-all-tree, a standalone write/remove on a committed part (Task 4's committed-file
+        /// write, Task 8's removal-mark resolution, Task 9's uuid.txt/metadata_version.txt/
+        /// txn_version.txt fill-ins) resolves through repoint routinely — it is the designed
+        /// mechanism, not an anomaly. WARNING here trained operators to ignore it (it fires on
+        /// every ordinary DROP/REPLACE/ATTACH/freeze); DEBUG keeps the trail without the noise. The
+        /// counter stays unconditional — it is the operator-facing signal now.
+        LOG_DEBUG(getLogger("CachedPartFolderAccess"),
+            "Repointed committed ref {}/{} ({} entries) — standalone write/remove on a committed part",
+            key.ns.string(), key.ref, entries.size());
+    }
+    else
+    {
+        /// `!resolved` means this call repointed a key with no prior committed ref to repoint —
+        /// unreachable today (every caller only invokes repointRef on an already-resolving key; see
+        /// BACKLOG "repointRef non-resolving-key audit gap"), so if it ever fires it is a genuine
+        /// anomaly, not the routine case above. Stays at WARNING.
+        LOG_WARNING(getLogger("CachedPartFolderAccess"),
+            "repointRef published {}/{} ({} entries) with no prior committed ref to repoint — "
+            "unexpected call shape (see BACKLOG repointRef non-resolving-key audit gap)",
+            key.ns.string(), key.ref, entries.size());
+    }
     return true;
 }
 
