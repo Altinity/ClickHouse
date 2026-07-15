@@ -9473,15 +9473,7 @@ std::pair<MergeTreeData::MutableDataPartPtr, scope_guard> MergeTreeData::cloneAn
             params);
     }
 
-    /// On a same-disk content-addressed clone with no caller transaction, `freeze` self-creates ONE
-    /// whole-part transaction and has ALREADY written `metadata_version.txt` into it from
-    /// `params.metadata_version_to_write` (the part is published atomically at its commit). Writing it
-    /// again here would be a separate per-file autocommit `writeFile` of a part file, which the CA disk
-    /// rejects (B21 guard). So skip the post-clone write in exactly that case; every other path keeps
-    /// the original behavior.
-    const bool metadata_version_written_by_freeze
-        = on_same_disk && !params.external_transaction && src_part_storage->isContentAddressed();
-    if (params.metadata_version_to_write.has_value() && !metadata_version_written_by_freeze)
+    if (params.metadata_version_to_write.has_value())
     {
         chassert(!params.keep_metadata_version);
         auto out_metadata = dst_part_storage->writeFile(IMergeTreeDataPart::METADATA_VERSION_FILE_NAME, 4096, getContext()->getWriteSettings());
