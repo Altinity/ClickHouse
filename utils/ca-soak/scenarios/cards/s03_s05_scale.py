@@ -176,6 +176,21 @@ class S03(Scenario):
             "" if blob_list == 0 else "regular idle GC listed blob objects — it should be ref-log "
                                       "driven, not an orphan sweep; investigate"))
 
+        # --- CasRefRepoint == 0: this card is pure INSERT + background merge + GC, no
+        # FREEZE/ATTACH/DETACH/MOVE/REPLACE PARTITION anywhere — no standalone (non-transactional)
+        # write/remove on an already-committed part should ever occur, so repointRef
+        # (CachedPartFolderAccess.cpp) has nothing to repoint. A nonzero count here means some op in
+        # this "green path" workload took the standalone-repoint route unexpectedly (all-tree Tasks
+        # 4/8/9's designed trigger set is freeze/ATTACH/DETACH/MOVE/REPLACE PARTITION-shaped, none of
+        # which this card exercises).
+        repoints = int(delta.get("CasRefRepoint", 0))
+        result.add(Verdict.check(
+            "CasRefRepoint == 0 on the non-transactional profile",
+            "0 (no standalone write/remove on a committed part in a pure insert/merge/GC workload)",
+            repoints, repoints == 0,
+            "" if repoints == 0 else "unexpected standalone repoint of a committed ref during idle "
+                                     "GC — investigate which op took the repointRef path"))
+
         # --- memory bounded, not by live-object count ---------------------------------------
         peak = _common.record_peak_memory(result, smp, label="peak MemoryResident during idle GC")
         if peak is not None:
@@ -335,7 +350,7 @@ class S04(Scenario):
         delta = counters().get("_total", {})
         result.observations["drain_counters"] = {k: int(delta.get(k, 0)) for k in (
             "CasBlobHead", "CasBlobDelete", "CasGcPut", "CasGcDelete", "CasGcGet",
-            "CasBlobList", "CasRefGlobalListPages", "CasRefLogBodyGets")}
+            "CasBlobList", "CasRefGlobalListPages", "CasRefLogBodyGets", "CasRefRepoint")}
 
         # --- deleted/round, durations, replaced/spared from the GC log --------------------
         gc_all = _gc_log_since(ctx)
@@ -377,6 +392,16 @@ class S04(Scenario):
             replaced == 0 and spared == 0,
             "" if (replaced == 0 and spared == 0) else
             "exact-token mismatch deletes happened with no live writers — investigate"))
+
+        # --- CasRefRepoint == 0: this card's drain window is DROP TABLE + forced GC, no
+        # FREEZE/ATTACH/DETACH/MOVE/REPLACE PARTITION — see S03's identical check for the rationale.
+        repoints = int(delta.get("CasRefRepoint", 0))
+        result.add(Verdict.check(
+            "CasRefRepoint == 0 on the non-transactional profile",
+            "0 (no standalone write/remove on a committed part during a DROP+GC-drain workload)",
+            repoints, repoints == 0,
+            "" if repoints == 0 else "unexpected standalone repoint of a committed ref during "
+                                     "orphan drain — investigate which op took the repointRef path"))
 
         # one kept table still has queryable data -> replica oracle.
         if keep_tables:
@@ -540,6 +565,16 @@ class S05(Scenario):
             "0 (no full blob enumeration in regular rounds)",
             blob_list, blob_list == 0,
             "" if blob_list == 0 else "GC enumerated blob objects on a sparse-write round"))
+
+        # --- CasRefRepoint == 0: sparse INSERT + background merge + GC only, no
+        # FREEZE/ATTACH/DETACH/MOVE/REPLACE PARTITION — see S03's identical check for the rationale.
+        repoints = int(delta.get("CasRefRepoint", 0))
+        result.add(Verdict.check(
+            "CasRefRepoint == 0 on the non-transactional profile",
+            "0 (no standalone write/remove on a committed part in a pure insert/merge/GC workload)",
+            repoints, repoints == 0,
+            "" if repoints == 0 else "unexpected standalone repoint of a committed ref during "
+                                     "sparse-write GC — investigate which op took the repointRef path"))
 
         # --- memory does not grow with table count -----------------------------------------
         peak = _common.record_peak_memory(result, smp,
