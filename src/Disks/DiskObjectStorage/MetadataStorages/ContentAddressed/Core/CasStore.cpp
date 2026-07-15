@@ -12,6 +12,7 @@
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
 #include <Common/thread_local_rng.h>
+#include <base/scope_guard.h>
 #include <fmt/format.h>
 #include <algorithm>
 #include <chrono>
@@ -515,9 +516,24 @@ void Store::mountWritable(StorePtr & store, UInt128 our_uuid, MountClaimPolicy p
     /// incarnation starts trusting its recovery listings -- `Fenced` and `UncleanObserved` are
     /// exactly the two `MountPriorState`s with no such proof (`Clean`, Task 5's drained farewell,
     /// and `None`, a fresh mount / same-epoch refresh with nothing to hand over, pay nothing).
-    if (claimed_prior == MountPriorState::Fenced || claimed_prior == MountPriorState::UncleanObserved)
+    /// fix-round F2(b): an EXHAUSTIVE switch, not a positive allowlist -- a future `MountPriorState`
+    /// enumerator with no proof of clean death must fail the BUILD (a missing `-Wswitch` case), never
+    /// silently fall through to "clean" and under-seal.
+    bool unclean_reclaim;
+    switch (claimed_prior)
     {
-        store->unclean_epoch_boundary_seen.store(true, std::memory_order_relaxed);
+        case MountPriorState::None:
+        case MountPriorState::Clean:
+            unclean_reclaim = false;
+            break;
+        case MountPriorState::Fenced:
+        case MountPriorState::UncleanObserved:
+            unclean_reclaim = true;
+            break;
+    }
+    if (unclean_reclaim)
+    {
+        store->unclean_epoch_boundary_seen_at.store(writer_epoch, std::memory_order_relaxed);
         const uint64_t t_mat = store->config.materialization_grace_ms;
         LOG_INFO(getLogger("CasStore"),
             "Content-addressed mount {} follows an unclean predecessor; waiting {} ms "
@@ -813,7 +829,7 @@ bool Store::tryRemountOnce()
         /// its listings. The common case (no in-flight `PUT` when the fence tripped) skips the wait.
         if (!refLanesSettledForRemount())
         {
-            unclean_epoch_boundary_seen.store(true, std::memory_order_relaxed);
+            unclean_epoch_boundary_seen_at.store(writer_epoch, std::memory_order_relaxed);
             LOG_INFO(getLogger("CasStore"),
                 "Self-remount of content-addressed mount {} with an unresolved ref-log PUT; waiting {} ms "
                 "(materialization grace) before re-listing", srid, config.materialization_grace_ms);
@@ -1188,18 +1204,39 @@ std::shared_ptr<Store::RefTableRuntime> Store::getRefTableRuntime(const RootName
 
 void Store::ensureRefTableRecovered(const RootNamespace & ns, RefTableRuntime & rt)
 {
-    /// Held for the WHOLE recovery (including its I/O): there is nothing safe to do with an unrecovered
+    /// Held for the WHOLE recovery's LIST+replay: there is nothing safe to do with an unrecovered
     /// table's `state` anyway, so a concurrent second caller for the SAME namespace blocking here is
     /// correct, not a missed-concurrency opportunity -- and this only affects each table's FIRST touch
     /// per mounted Store (spec §Startup And Recovery: "one LIST ... cache the resulting complete table
-    /// state").
+    /// state"). fix-round F3: the one exception is the recovery seal's encode+PUT, released below --
+    /// `recovery_in_progress` (not the mutex) is what serializes concurrent callers across that window;
+    /// see its doc comment for why.
     {
-    std::lock_guard lock(rt.state_mutex);
+    std::unique_lock lock(rt.state_mutex);
     /// Whole-table LRU stamp (spec §Byte, Memory, And CPU Budget): every touch -- warm or cold --
     /// marks this table most-recently-used so `enforceRefTableCacheBudget` evicts idle tables first.
     rt.last_touch_tick = ref_table_access_tick.fetch_add(1, std::memory_order_relaxed) + 1;
     if (rt.recovered)
         return;
+
+    /// fix-round F3: a concurrent second caller waits here rather than racing an independent
+    /// LIST+replay+seal attempt against the first caller's unlocked seal PUT below.
+    while (rt.recovery_in_progress)
+    {
+        ++rt.recovery_waiters_for_test;
+        rt.recovery_cv.wait(lock);
+        --rt.recovery_waiters_for_test;
+    }
+    if (rt.recovered)
+        return;   /// the caller we waited on already finished it
+
+    rt.recovery_in_progress = true;
+    /// Cleared + broadcast on every exit from here, success or exception, so a waiter above is never
+    /// left hanging on an error that escapes the unlocked seal PUT.
+    SCOPE_EXIT({
+        rt.recovery_in_progress = false;
+        rt.recovery_cv.notify_all();
+    });
 
     for (uint64_t attempt = 0; ; ++attempt)
     {
@@ -1309,6 +1346,17 @@ void Store::ensureRefTableRecovered(const RootNamespace & ns, RefTableRuntime & 
         /// PUT throws here, leaving the table unrecovered, so the NEXT touch restarts recovery from
         /// scratch (fresh LIST, fresh replay, fresh seal attempt) rather than exposing a table whose
         /// dead-epoch region was never actually closed (spec: "failure fails closed").
+        /// fix-round F3: the encode+PUT itself runs OUTSIDE `state_mutex` (unlocked/relocked just below,
+        /// mirroring `trySnapshotPublishOnce`'s copy-under-lock/PUT-outside shape) -- it is the one part
+        /// of recovery that can run the full ~90s retry envelope, and holding the mutex across it stalls
+        /// every other touch of this table plus `wedgedRefLaneCount`'s whole-store walk (which locks each
+        /// table's `state_mutex` in turn). `recovery_in_progress` (set above), not the mutex, is what
+        /// keeps a concurrent second caller for this SAME table from redoing this same work during the
+        /// unlocked window -- see its doc comment. Nothing else can mutate `rt.state`/`rt.cleanup_markers`
+        /// meanwhile: every OTHER touch-point calls this function first and would block in the wait loop
+        /// above; `rt` itself cannot be destroyed underneath us (the caller's own `shared_ptr` keeps it
+        /// alive regardless of the mutex, which is also what protects it from `enforceRefTableCacheBudget`
+        /// -- eviction only ever considers a table at `use_count() == 1`).
         ///
         /// `seal_id` is the UPPER BOUND of the dead-epoch region, not the greatest listed id: the wedge
         /// discipline places the predecessor's one possible in-flight PUT strictly above everything it
@@ -1321,7 +1369,11 @@ void Store::ensureRefTableRecovered(const RootNamespace & ns, RefTableRuntime & 
         const bool dead_region_nonempty =
             greatest_listed_id.has_value() && greatest_listed_id->writer_epoch < my_epoch;
         const bool already_sealed = snapshot.has_value() && !(snapshot->snapshot_id < seal_id);
-        if (unclean_epoch_boundary_seen.load(std::memory_order_relaxed) && my_epoch >= 2
+        /// fix-round F2(a): compare against the SPECIFIC epoch a reclaim was marked unclean for, not a
+        /// sticky "ever" bool -- a table recovered for the first time (or reloaded after LRU eviction)
+        /// under a LATER, perfectly clean epoch boundary must not get a parasitic seal just because
+        /// SOME earlier, unrelated boundary in this incarnation's life was unclean.
+        if (unclean_epoch_boundary_seen_at.load(std::memory_order_relaxed) == my_epoch && my_epoch >= 2
             && dead_region_nonempty && !already_sealed && rt.state.lifecycle == RefLifecycle::Live)
         {
             RefTableSnapshot seal = snapshotOf(rt.state, ns.string());
@@ -1329,8 +1381,10 @@ void Store::ensureRefTableRecovered(const RootNamespace & ns, RefTableRuntime & 
             seal.sealed_from = rt.state.greatest_applied;    /// == greatest_listed_id: nothing else was applied
             const String seal_bytes = encodeRefTableSnapshot(seal);
             const auto fence_ok = [this] { return refAppendFenceOk(); };
+            lock.unlock();
             const auto outcome = ref_request_controller->putIfAbsentControlled(
                 pool_layout.refSnapshotKey(ns, seal_id), seal_bytes, fence_ok);
+            lock.lock();
             if (outcome != CasWriteOutcome::Committed)
                 throw Exception(ErrorCodes::ABORTED,
                     "CAS recovery seal PUT for namespace '{}' did not commit; failing recovery closed "

@@ -112,39 +112,85 @@ RefTxnId sealedRefCursor(Store & store, const RootNamespace & ns)
 /// operations as legitimate state (the resurrect invariant). Report via `LOG_WARNING` + one
 /// `RefLateLogDetected` event; the sweep never deletes the log itself -- GC's ordinary covered-log
 /// cleanup (`planRefCleanup`) removes it once folding catches up.
+///
+/// fix-round F1 (author-review: "seal skipped on an empty dead-region ... detector blind in that
+/// hole"): when the dead region a recovery observed was EMPTY (`dead_region_nonempty` false in
+/// `ensureRefTableRecovered`), no seal is published at all -- `recovered.sealed_from` stays nullopt,
+/// and the branch above never fires, even for the exact failure the seal exists to catch (the
+/// namespace's first-ever txn in flight at crash, materializing only after the recovery LIST). There
+/// is no PER-NAMESPACE durable trace to detect this from cold storage (nothing was ever published),
+/// so the general cross-process case stays a documented carve-out -- same footing as the Removed
+/// carve-out (a namespace-removal snapshot that is also not a "seal" by this same field). What CAN be
+/// caught cheaply, with zero risk of a false positive, is the narrow case where the very same Store
+/// that lived through the unclean reclaim is also the one running this check (`Store::
+/// ownsAndSawUncleanBoundaryFor`): a listed log strictly below its own live epoch, with no snapshot
+/// at all to explain its presence, is then unambiguous.
 void reportLateLogsIfAny(Store & store, const RootNamespace & ns, const RecoveredRefTable & recovered,
                           const std::vector<RefTxnId> & logs)
 {
-    if (!recovered.sealed_from)
-        return;   /// the selected snapshot is not a seal -- no observation horizon to violate
-
     const Layout & layout = store.layout();
+
+    if (recovered.sealed_from)
+    {
+        for (const RefTxnId & id : logs)
+        {
+            if (!(*recovered.sealed_from < id))
+                continue;   /// id <= sealed_from: within the observed region, ordinary
+            if (recovered.newest_snapshot_id && *recovered.newest_snapshot_id < id)
+                continue;   /// id > the seal: not (yet) covered by it -- not provably late
+
+            LOG_WARNING(getLogger("CasOrphanManifestSweep"),
+                        "CAS T_mat violation: namespace {} log {} listed above the recovery seal's "
+                        "sealed_from {} and covered by its snapshot {} -- the store materialized a write "
+                        "after the recovery LIST; reporting only, never reviving (GC's ordinary "
+                        "covered-log cleanup removes it once folding catches up)",
+                        ns.string(), renderRefTxnId(id), renderRefTxnId(*recovered.sealed_from),
+                        renderRefTxnId(*recovered.newest_snapshot_id));
+
+            EventEmitter{store}.emit([&](CasEvent & e)
+            {
+                e.type = CasEventType::RefLateLogDetected;
+                e.namespace_ = ns.string();
+                e.at_version = id.ref_sequence;
+                e.reason = "T_mat violation: ref log listed above the recovery seal's sealed_from and "
+                           "covered by its snapshot -- reporting only, never reviving (resurrect invariant)";
+                e.detail = {{"log_id", renderRefTxnId(id)},
+                            {"key", layout.refLogKey(ns, id)},
+                            {"sealed_from", renderRefTxnId(*recovered.sealed_from)},
+                            {"seal_snapshot_id", renderRefTxnId(*recovered.newest_snapshot_id)}};
+            });
+        }
+        return;
+    }
+
+    if (recovered.newest_snapshot_id || !store.ownsAndSawUncleanBoundaryFor(ns))
+        return;   /// an ordinary (non-seal) snapshot exists, or no same-process signal available
+
+    const uint64_t my_epoch = store.liveWriterEpoch();
     for (const RefTxnId & id : logs)
     {
-        if (!(*recovered.sealed_from < id))
-            continue;   /// id <= sealed_from: within the observed region, ordinary
-        if (recovered.newest_snapshot_id && *recovered.newest_snapshot_id < id)
-            continue;   /// id > the seal: not (yet) covered by it -- not provably late
+        if (id.writer_epoch >= my_epoch)
+            continue;   /// not from a dead epoch relative to THIS incarnation
 
         LOG_WARNING(getLogger("CasOrphanManifestSweep"),
-                    "CAS T_mat violation: namespace {} log {} listed above the recovery seal's "
-                    "sealed_from {} and covered by its snapshot {} -- the store materialized a write "
-                    "after the recovery LIST; reporting only, never reviving (GC's ordinary "
-                    "covered-log cleanup removes it once folding catches up)",
-                    ns.string(), renderRefTxnId(id), renderRefTxnId(*recovered.sealed_from),
-                    renderRefTxnId(*recovered.newest_snapshot_id));
+                    "CAS T_mat violation (empty-dead-region carve-out): namespace {} log {} is from a "
+                    "dead epoch (writer_epoch {} < live {}) with no snapshot at all to explain its "
+                    "presence -- this incarnation's own unclean-reclaim recovery found the namespace "
+                    "empty and published no seal, so the log must have materialized after that "
+                    "recovery's LIST; reporting only, never reviving",
+                    ns.string(), renderRefTxnId(id), id.writer_epoch, my_epoch);
 
         EventEmitter{store}.emit([&](CasEvent & e)
         {
             e.type = CasEventType::RefLateLogDetected;
             e.namespace_ = ns.string();
             e.at_version = id.ref_sequence;
-            e.reason = "T_mat violation: ref log listed above the recovery seal's sealed_from and "
-                       "covered by its snapshot -- reporting only, never reviving (resurrect invariant)";
+            e.reason = "T_mat violation: ref log from a dead epoch with no covering snapshot at all "
+                       "(empty-dead-region carve-out, same-process detection) -- reporting only, "
+                       "never reviving (resurrect invariant)";
             e.detail = {{"log_id", renderRefTxnId(id)},
                         {"key", layout.refLogKey(ns, id)},
-                        {"sealed_from", renderRefTxnId(*recovered.sealed_from)},
-                        {"seal_snapshot_id", renderRefTxnId(*recovered.newest_snapshot_id)}};
+                        {"live_writer_epoch", std::to_string(my_epoch)}};
         });
     }
 }

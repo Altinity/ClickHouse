@@ -1,7 +1,9 @@
 #include <gtest/gtest.h>
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEvent.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasOrphanManifestSweep.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRefIntake.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRefLogCodec.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRefSnapshotCodec.h>
@@ -2732,6 +2734,129 @@ TEST(RefWriterRecoverySeal, SealPutFailureFailsRecoveryClosed)
     EXPECT_EQ(store->listRefs(ns).size(), 2u);
     EXPECT_TRUE(backend->get(layout.refSnapshotKey(ns, seal_id)).has_value())
         << "the second touch must have recovered and sealed";
+}
+
+/// rev.6 fix-round F1 (author-review: "seal skipped on an empty dead-region ... detector blind in
+/// that hole"). When a namespace's dead region is completely EMPTY at recovery time -- no snapshot,
+/// no log at all, i.e. the namespace's very first-ever touch coincides with an unclean boundary --
+/// `dead_region_nonempty` is false, no seal is published, and the seal-based detector
+/// (`reportLateLogsIfAny`'s `recovered.sealed_from` branch) never fires. This reproduces the finding's
+/// exact failure: the namespace's first-ever txn `(E,1)` is "in flight at crash", i.e. it lands
+/// durably only AFTER this incarnation's recovery already ran and found nothing, and proves the
+/// same-process carve-out extension (`Store::ownsAndSawUncleanBoundaryFor`) still reports it even
+/// though no seal object exists anywhere to detect it from.
+TEST(RefWriterRecoverySeal, EmptyDeadRegionCarveOutStillReportsSameProcessNamespace)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"test/f1_empty_carveout"};   /// matches openStoreWithConfig's own server_root_id
+
+    seedUncleanPredecessorMount(*backend, layout, /*epoch=*/1);   /// predecessor dies uncleanly at epoch 1
+
+    PoolConfig config;
+    config.server_id = UInt128(1);
+    config.mount_lease_ttl_ms = std::chrono::milliseconds(500);
+    config.cas_request_budget = sealTestTinyBudget();
+    config.materialization_grace_ms = 1000;
+    config.wait_sleep_fn = [](uint64_t) {};
+    auto store = openStoreWithConfig(backend, config);
+    ASSERT_TRUE(store);
+    ASSERT_EQ(store->liveWriterEpoch(), 2u);
+    ASSERT_TRUE(store->uncleanEpochBoundarySeenForTest());
+
+    using ProfileEvents::global_counters;
+    const auto sealed_before = global_counters[ProfileEvents::CasRefRecoverySealPublished].load();
+
+    /// Touch `ns` for the FIRST time ever: its LIST finds literally nothing, so `dead_region_nonempty`
+    /// is false and no seal is published -- the carve-out this finding is about.
+    EXPECT_TRUE(store->listRefs(ns).empty());
+    EXPECT_EQ(global_counters[ProfileEvents::CasRefRecoverySealPublished].load(), sealed_before)
+        << "an empty dead region must not publish a seal";
+
+    /// The namespace's first-ever txn, (epoch 1, seq 1), was in flight at crash and materializes only
+    /// NOW -- strictly after the recovery LIST above already ran and found nothing.
+    RefLogTxn late;
+    late.ns = ns.string();
+    late.txn_id = RefTxnId{1, 1};
+    late.ops = {namespaceBirthOp(), publishCommittedOps("a", manifestRef(1, 1, 1))[0],
+                publishCommittedOps("a", manifestRef(1, 1, 1))[1]};
+    writeRefLogTxnRaw(*backend, layout, late);
+
+    std::vector<CasEvent> events;
+    store->setEventSink([&](const CasEvent & e) { events.push_back(e); });
+
+    /// `prefix.writer_epoch (1) < store's live epoch (2)` makes `prefixEligible` return true
+    /// unconditionally (old-epoch debris always drains) -- no separate watermark fixture needed;
+    /// `floorForNamespace` resolves `ns`'s mount lease through `store`'s own already-durable one.
+    sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = 1, .build_sequence = 1});
+
+    ASSERT_EQ(events.size(), 1u);
+    EXPECT_EQ(events[0].type, CasEventType::RefLateLogDetected);
+    EXPECT_EQ(events[0].namespace_, ns.string());
+    EXPECT_EQ(events[0].at_version, 1u);
+    EXPECT_TRUE(backend->get(layout.refLogKey(ns, late.txn_id)).has_value())
+        << "the detector only reports the late log -- it must never delete or revive it";
+}
+
+/// rev.6 fix-round F3 (author-review: "seal encode+PUT under `rt.state_mutex`" up to the ~90s retry
+/// envelope, unlike the publish path which deliberately encodes+PUTs OUTSIDE the lock). Proves the
+/// fix two ways: (1) `state_mutex` is actually free while the seal PUT is in flight -- a concurrent
+/// SECOND caller for the SAME table reaches `ensureRefTableRecovered`'s wait (not merely blocks trying
+/// to acquire the mutex, which the pre-fix code would ALSO exhibit and prove nothing); (2) it waits
+/// rather than racing an independent LIST+replay+seal attempt against the SAME seal key -- exactly one
+/// seal PUT ever lands, and both callers converge on the same correct, fully-recovered state.
+TEST(RefWriterRecoverySeal, ConcurrentTouchDuringSealPutWaitsInsteadOfRacing)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/seal_concurrent"};
+
+    seedSealFixtureDeadEpochs(*backend, layout, ns);
+    seedUncleanPredecessorMount(*backend, layout, /*epoch=*/2);
+
+    PoolConfig config;
+    config.server_id = UInt128(1);
+    config.mount_lease_ttl_ms = std::chrono::milliseconds(500);
+    config.cas_request_budget = sealTestTinyBudget();
+    config.materialization_grace_ms = 1000;
+    config.wait_sleep_fn = [](uint64_t) {};
+    auto store = openStoreWithConfig(backend, config);
+    ASSERT_TRUE(store);
+    ASSERT_EQ(store->liveWriterEpoch(), 3u);
+    ASSERT_TRUE(store->uncleanEpochBoundarySeenForTest());
+
+    const RefTxnId seal_id{2, std::numeric_limits<uint64_t>::max()};
+    const String seal_key = layout.refSnapshotKey(ns, seal_id);
+    backend->armPutBlock(seal_key);
+
+    /// t1 drives recovery; its seal PUT parks inside the (test-)blocked `putIfAbsent`. Reaching that
+    /// block is only possible with `state_mutex` released -- the pre-fix code held the lock across the
+    /// WHOLE PUT, so this thread would never even get here for a second caller to race against.
+    std::thread t1([&] { store->listRefs(ns); });
+    backend->awaitBlockEntered();
+
+    /// t2 touches the SAME table while t1's seal PUT is still parked. Deterministically wait for it to
+    /// actually reach `ensureRefTableRecovered`'s `recovery_cv` wait (mirrors
+    /// `RefWriterAppendLane.InvalidBatchEntryGetsOwnExceptionBatchSurvives`'s `yield()`-poll idiom) --
+    /// not a sleep, and not merely "t2 is blocked on the mutex" (t1 does not hold it here).
+    std::thread t2([&] { store->listRefs(ns); });
+    while (store->refRecoveryWaitersForTest(ns) < 1)
+        std::this_thread::yield();
+
+    const uint64_t put_attempts_before_release = backend->putTotal();
+    backend->releaseBlock();
+    t1.join();
+    t2.join();
+
+    EXPECT_EQ(backend->putTotal(), put_attempts_before_release + 1)
+        << "t2 must not have raced its own independent seal PUT -- exactly one attempt total";
+
+    const auto got = backend->get(seal_key);
+    ASSERT_TRUE(got.has_value()) << "the seal must be durable";
+    const RefTableSnapshot seal = decodeRefTableSnapshot(got->bytes, ns.string(), seal_id);
+    ASSERT_EQ(seal.committed.size(), 2u);
+    EXPECT_TRUE(store->listRefs(ns).size() == 2u)
+        << "both callers must converge on the same fully-recovered state";
 }
 
 /// rev.6 FINDING-1 (whole-plan final review, PART A): a LATER incarnation that recovers a table by

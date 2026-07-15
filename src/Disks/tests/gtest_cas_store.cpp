@@ -30,6 +30,11 @@ extern const int FILE_DOESNT_EXIST;
 extern const int LOGICAL_ERROR;
 }
 
+namespace ProfileEvents
+{
+extern const Event CasRefRecoverySealPublished;
+}
+
 using namespace DB::Cas;
 using DB::Cas::tests::blobEntryFor;
 using DB::Cas::tests::expectThrowsCode;
@@ -1546,6 +1551,81 @@ TEST(CasRemountTmat, UnresolvedWedgePaysGraceAndMarksBoundaryUnclean)
     ASSERT_EQ(waits.size(), 1u);
     EXPECT_EQ(waits[0], 30000u);
     EXPECT_TRUE(store->uncleanEpochBoundarySeenForTest());
+}
+
+/// rev.6 fix-round F2(a): the pre-fix `unclean_epoch_boundary_seen` was a STICKY bool -- once ANY
+/// remount in this incarnation's life was unclean, EVERY later table recovery (including a table
+/// touched for the first time under a LATER, perfectly clean epoch boundary -- `tryRemountOnce`'s own
+/// `quiesceRefTablesForRemount` clears the whole ref-table cache on every remount, so this is the
+/// COMMON case, not an edge case) got a parasitic seal attempt. The fix compares the specific epoch a
+/// reclaim was marked unclean for against the table's own recovery epoch, not "was any transition ever
+/// unclean". This drives TWO self-remounts (unclean, then clean) and proves a table recovered for the
+/// first time strictly after both does NOT seal, even though its own data predates the FIRST (unclean)
+/// boundary and `dead_region_nonempty` is true for it.
+TEST(CasRemountTmat, CleanRemountAfterEarlierUncleanOneDoesNotSealALateTouchedTable)
+{
+    CasRequestBudget budget;
+    budget.max_attempts = 1;
+    budget.attempt_timeout_ms = 100;
+    budget.operation_deadline_ms = 100;
+    budget.lease_safety_margin_ms = 100;
+
+    auto backend = std::make_shared<UnresolvedPutBackend>();
+    uint64_t fake_boot = 1'000'000;
+    auto store = Store::open(backend, PoolConfig{
+        .pool_prefix = "p", .server_root_id = "test",
+        .mount_lease_ttl_ms = std::chrono::milliseconds(30000),
+        .cas_request_budget = budget,
+        .boot_ms_fn = [&] { return fake_boot; },
+        .materialization_grace_ms = 30000,
+        .wait_sleep_fn = [&](uint64_t ms) { fake_boot += ms; },
+    });
+    ASSERT_TRUE(store);
+
+    const Layout & layout = store->layout();
+    const RootNamespace ns1{"srv/table_a"};
+    const RootNamespace ns2{"srv/table_b"};
+    publishPart(store, ns1.string(), "x", "payload-a");
+    /// ns2's epoch-1 data: never touched again by this incarnation until the final check below, well
+    /// after both remounts -- the "table recovered for the first time, late" the fix must not over-seal.
+    /// Distinct content from ns1's part: identical payloads collide on the same blob and race
+    /// `Build::observeAndAdmit`'s newborn-debris watermark, unrelated to what this test is about.
+    publishPart(store, ns2.string(), "y", "payload-b");
+
+    /// Force ns1's ref-log append into the Unresolved/wedge outcome (mirrors
+    /// `UnresolvedWedgePaysGraceAndMarksBoundaryUnclean` above).
+    backend->fault_key_substr = layout.refsNamespacePrefix(ns1) + "_log/";
+    backend->fault_count = 1;
+    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { store->dropRef(ns1, "x"); });
+    ASSERT_TRUE(store->refLaneWedgedForTest(ns1));
+
+    /// Self-remount #1: UNCLEAN (the wedge above). Epoch 1 -> 2.
+    fake_boot += 30001;
+    fenceOutMount(*backend, store->layout().mountKey("test"));
+    ASSERT_TRUE(store->tryRemountOnce());
+    ASSERT_EQ(store->liveWriterEpoch(), 2u);
+    ASSERT_TRUE(store->uncleanEpochBoundarySeenForTest());
+
+    /// Self-remount #2: CLEAN (no wedge left behind -- `quiesceRefTablesForRemount` already cleared the
+    /// cache, so `refLanesSettledForRemount` finds an empty ref-table cache). Epoch 2 -> 3.
+    fake_boot += 30001;
+    fenceOutMount(*backend, store->layout().mountKey("test"));
+    ASSERT_TRUE(store->tryRemountOnce());
+    ASSERT_EQ(store->liveWriterEpoch(), 3u);
+
+    using ProfileEvents::global_counters;
+    const auto sealed_before = global_counters[ProfileEvents::CasRefRecoverySealPublished].load();
+
+    /// ns2's FIRST recovery under this incarnation happens now, at epoch 3 -- strictly after both
+    /// remounts. `dead_region_nonempty` is true for it (its only data is at epoch 1 < 3).
+    EXPECT_EQ(store->listRefs(ns2).size(), 1u);
+
+    EXPECT_EQ(global_counters[ProfileEvents::CasRefRecoverySealPublished].load(), sealed_before)
+        << "a table recovered for the first time under a LATER, clean epoch boundary must not seal, "
+           "even though an EARLIER, unrelated boundary in this incarnation's life was unclean";
+    const RefTxnId stale_seal_id{2, std::numeric_limits<uint64_t>::max()};
+    EXPECT_FALSE(backend->get(layout.refSnapshotKey(ns2, stale_seal_id)).has_value())
+        << "no seal must have been published at the STALE (epoch-2) boundary for ns2";
 }
 
 TEST(CasStore, ReadManifestSharedReturnsSharedDecodeWithoutCopy)

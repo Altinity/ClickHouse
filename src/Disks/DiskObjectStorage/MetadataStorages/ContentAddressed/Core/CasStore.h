@@ -594,10 +594,34 @@ public:
     /// the Store down, so a test can assert `scheduleRemount` refuses to spawn once teardown has begun.
     void beginShutdownForTest();
 
-    /// rev.6 Task 6: sticky once a writable `open` reclaimed a mount over an unclean predecessor
-    /// (`MountPriorState::Fenced` or `UncleanObserved` -- see `materialization_grace_ms`). Never
-    /// cleared for the life of this incarnation. Task 8 reads the underlying flag; this is the test seam.
-    bool uncleanEpochBoundarySeenForTest() const { return unclean_epoch_boundary_seen.load(std::memory_order_relaxed); }
+    /// rev.6 Task 6 / fix-round F2: true once ANY writable `open`/self-remount of this incarnation's
+    /// lifetime reclaimed a mount over an unclean predecessor (`MountPriorState::Fenced` or
+    /// `UncleanObserved` -- see `materialization_grace_ms`) -- a lifetime diagnostic signal, sticky by
+    /// design. Task 8's seal-gating decision does NOT use this coarse signal any more (see
+    /// `unclean_epoch_boundary_seen_at`, F2 fix: a per-epoch high-water-mark, not a forever-sticky bool);
+    /// this stays as the test/observability seam.
+    bool uncleanEpochBoundarySeenForTest() const { return unclean_epoch_boundary_seen_at.load(std::memory_order_relaxed) != 0; }
+
+    /// rev.6 fix-round F1: TRUE iff `ns` is scoped under THIS Store's own mounted `server_root_id` AND
+    /// this incarnation's live epoch's predecessor died uncleanly (F2's per-epoch high-water-mark).
+    /// A narrow, same-process, NEVER-false-positive signal: `reportLateLogsIfAny`'s empty-dead-region
+    /// extension (author-review F1: "seal skipped on an empty dead-region ... detector blind in that
+    /// hole") uses it to catch a first-ever, in-flight-at-crash txn even though no seal was published
+    /// for it -- but ONLY when the SAME Store instance that observed the reclaim is also the one
+    /// running the check (the common single-leader-affinity case). A GC leader sweeping a FOREIGN
+    /// srid's namespace, or a wholly separate process (`clickhouse-disks fsck`), gets nothing from
+    /// this -- that residual gap is the documented carve-out: no cross-process durable marker exists
+    /// for the empty-dead-region case (unlike a non-empty one, which the recovery seal covers), and
+    /// the finding itself rates the gap double-rare and self-healing (closed by this namespace's own
+    /// first real snapshot of the new epoch).
+    bool ownsAndSawUncleanBoundaryFor(const RootNamespace & ns) const
+    {
+        const String & prefix = config.server_root_id;
+        const String & full = ns.string();
+        return full.size() > prefix.size() && full.compare(0, prefix.size(), prefix) == 0
+            && full[prefix.size()] == '/'
+            && unclean_epoch_boundary_seen_at.load(std::memory_order_relaxed) == liveWriterEpoch();
+    }
 
     /// P1 known-present blob-hash cache (design 2026-06-20, B168). A HINT only — correctness never
     /// depends on it: a hit just makes putBlob go HEAD-first, and a stale hit is caught by that HEAD.
@@ -696,6 +720,26 @@ private:
     {
         std::mutex state_mutex;
         bool recovered = false;
+        /// fix-round F3 (author-review: seal encode+PUT running under `state_mutex` for up to the
+        /// ~90s retry envelope stalls every other touch of this table, plus `wedgedRefLaneCount`'s
+        /// whole-store walk). `ensureRefTableRecovered` releases `state_mutex` around the seal's
+        /// encode+PUT only (mirroring `trySnapshotPublishOnce`'s copy-under-lock/PUT-outside shape) --
+        /// this flag is what keeps a concurrent second caller for the SAME namespace, arriving during
+        /// that unlocked window, from redoing an independent LIST+replay+seal attempt that would race
+        /// the SAME seal key (a losing racer's `putIfAbsentControlled` returns `Unresolved` --
+        /// `CasWriteOutcome` has no distinguishable "someone else already created it" -- which the
+        /// existing `!= Committed -> throw ABORTED` check would misreport as a real failure). Instead
+        /// the second caller waits on `recovery_cv` and re-checks `recovered` once the first caller
+        /// finishes, exactly the concurrent-second-caller contract `ensureRefTableRecovered`'s own top
+        /// comment already promises -- just no longer implemented by holding the mutex itself for the
+        /// I/O. Both guarded by `state_mutex`.
+        bool recovery_in_progress = false;
+        std::condition_variable recovery_cv;
+        /// Test-only: how many callers are PARKED in the `recovery_cv` wait above, right now. A plain
+        /// count (guarded by `state_mutex`, like everything else here) -- lets a test deterministically
+        /// `yield()`-poll for "a second caller has actually reached the wait" instead of racing a
+        /// blocked backend call against thread scheduling (mirrors `refQueuePendingForTest`'s idiom).
+        uint64_t recovery_waiters_for_test = 0;
         RefTableState state;
         /// Retained `_cleanup/<remove-txn-id>` markers observed at recovery (Task 11's recreation
         /// gate consumes these via `observedNamespaceCleanupMarker`).
@@ -1025,6 +1069,17 @@ public:
         return it == ref_tables.end() ? 0 : it->second->pending.size();
     }
 
+    /// fix-round F3 test seam: how many concurrent `ensureRefTableRecovered` callers for `ns` are
+    /// PARKED right now waiting on the leader's in-flight recovery (see `RefTableRuntime::
+    /// recovery_waiters_for_test`) -- lets a test `yield()`-poll for "a second caller actually reached
+    /// the wait" deterministically, mirroring `refQueuePendingForTest` above.
+    uint64_t refRecoveryWaitersForTest(const RootNamespace & ns)
+    {
+        const auto rt = getRefTableRuntime(ns);
+        std::lock_guard<std::mutex> g(rt->state_mutex);
+        return rt->recovery_waiters_for_test;
+    }
+
     /// Task 13 cache-eviction test seams: how many whole ref tables are cached right now, and whether a
     /// specific table's runtime is currently materialized (recovered) in the cache -- a table that was
     /// evicted reports false until its next touch re-recovers it.
@@ -1110,10 +1165,16 @@ private:
     /// renewer trips it. Gates the ref-append mutate chokepoint.
     MountFence mount_fence;
 
-    /// rev.6 Task 6: latched true the moment a writable `open` reclaims a mount whose predecessor's
-    /// death was NOT proven clean (`MountPriorState::Fenced` or `UncleanObserved`). Sticky for the life
-    /// of this incarnation -- Task 8 consumes it; see `uncleanEpochBoundarySeenForTest`.
-    std::atomic<bool> unclean_epoch_boundary_seen{false};
+    /// rev.6 Task 6, fix-round F2: the `writer_epoch` a writable `open`/self-remount JUST reclaimed over
+    /// an unclean predecessor (`MountPriorState::Fenced` or `UncleanObserved`) -- 0 = never. A per-epoch
+    /// HIGH-WATER-MARK, not a sticky bool: `ensureRefTableRecovered`'s seal gate (Task 8) compares this
+    /// against the table's OWN `my_epoch` for EXACT equality, so only a table recovered while THIS
+    /// SPECIFIC transition's dead region is still current gets sealed. A plain sticky bool (the
+    /// pre-fix shape) would over-seal every later touch of a cold/LRU-evicted table across ANY
+    /// subsequent -- including perfectly clean -- epoch boundary, since it never told "which" transition
+    /// was unclean, only "was any transition EVER unclean" (parasitic `_snap` PUTs for the process's
+    /// life). `uncleanEpochBoundarySeenForTest` keeps the coarse "ever" reading for observability.
+    std::atomic<uint64_t> unclean_epoch_boundary_seen_at{0};
 
     /// rev.6 Task 6 / S13 observation loop: the ONE seam both `Store::open`'s mount-claim observation
     /// poll and the `materialization_grace_ms` wait go through. Routes through `config.wait_sleep_fn`
