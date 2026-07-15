@@ -245,6 +245,24 @@ public:
                 block_entered = true;
                 block_cv.notify_all();
                 block_cv.wait(lk, [&] { return !block_armed; });
+                /// fix-round F3-1a (CRITICAL, unlock-throw race harness): on release, behave like
+                /// `corrupt_key_substr` above instead of proceeding normally -- a foreign writer landed
+                /// DIFFERENT bytes at this exact key while we were parked, so our own attempt is a
+                /// PROVEN conflict once `putIfAbsentControlled`'s resolve-before-reissue GETs it. Lets a
+                /// test make the recovery seal's PUT throw CORRUPTED_DATA from INSIDE the unlocked
+                /// window, deterministically, instead of merely returning a non-Committed outcome.
+                if (block_throw_corrupted_on_release)
+                {
+                    lk.unlock();
+                    CountingBackend::putIfAbsent(key, bytes + String("\x01_FOREIGN_DIFFERENT"));
+                    {
+                        std::lock_guard g(block_mutex);
+                        block_call_completed = true;
+                    }
+                    block_cv.notify_all();
+                    throw Poco::TimeoutException(
+                        "RefWriterTestBackend: a foreign different object landed on release; response lost");
+                }
             }
         }
         const PutResult r = CountingBackend::putIfAbsent(key, bytes, meta);
@@ -255,6 +273,9 @@ public:
         block_cv.notify_all();
         return r;
     }
+    /// See `putIfAbsent`'s `block_this` branch. Set before spawning any thread that could race
+    /// `putIfAbsent`, like `corrupt_key_substr`/`fault_key_substr` above -- not itself lock-protected.
+    bool block_throw_corrupted_on_release = false;
 
     /// "Deliver" the earlier ambiguous write: the request DID eventually land server-side, the caller
     /// just never saw the ack. No-op if no fault has fired since the last delivery.
@@ -2857,6 +2878,139 @@ TEST(RefWriterRecoverySeal, ConcurrentTouchDuringSealPutWaitsInsteadOfRacing)
     ASSERT_EQ(seal.committed.size(), 2u);
     EXPECT_TRUE(store->listRefs(ns).size() == 2u)
         << "both callers must converge on the same fully-recovered state";
+}
+
+/// fix-round F3 follow-up (review Critical): the seal PUT can THROW instead of returning -- a
+/// cross-process seal conflict makes `putIfAbsentControlled` observe DIFFERENT valid bytes at the
+/// seal key and throw `CORRUPTED_DATA` (the in-process `recovery_in_progress` flag cannot serialize
+/// another PROCESS). The fix re-acquires `state_mutex` before letting that exception propagate, so
+/// the `SCOPE_EXIT` that clears `recovery_in_progress` and notifies `recovery_cv` always runs WITH
+/// the lock. This test pins the deterministically-checkable half of that contract: the exception
+/// propagates to the caller, and a SUBSEQUENT touch of the same table neither hangs on a stale
+/// `recovery_in_progress` nor succeeds spuriously -- it restarts recovery and fails closed on the
+/// same durable conflict. The unlocked-mutation data race itself is only observable under TSan
+/// (tracked by the sanitizer-compatibility task); a functional test cannot go RED on it because the
+/// pre-fix unwind still cleared the flag, just without the mutex.
+TEST(RefWriterRecoverySeal, SealPutConflictThrowPropagatesAndDoesNotWedgeRecovery)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/seal_conflict_throw"};
+
+    seedSealFixtureDeadEpochs(*backend, layout, ns);
+    seedUncleanPredecessorMount(*backend, layout, /*epoch=*/2);
+
+    PoolConfig config;
+    config.server_id = UInt128(1);
+    config.mount_lease_ttl_ms = std::chrono::milliseconds(500);
+    config.cas_request_budget = sealTestTinyBudget();
+    config.materialization_grace_ms = 1000;
+    config.wait_sleep_fn = [](uint64_t) {};
+    auto store = openStoreWithConfig(backend, config);
+    ASSERT_TRUE(store);
+    ASSERT_EQ(store->liveWriterEpoch(), 3u);
+    ASSERT_TRUE(store->uncleanEpochBoundarySeenForTest());
+
+    /// A foreign writer lands a DIFFERENT object at the seal key and our response is lost: the
+    /// request controller's resolve-before-reissue then observes the different bytes and
+    /// `putIfAbsentControlled` throws `CORRUPTED_DATA` out of the unlocked seal-PUT window.
+    const RefTxnId seal_id{2, std::numeric_limits<uint64_t>::max()};
+    backend->corrupt_key_substr = layout.refSnapshotKey(ns, seal_id);
+    backend->corrupt_count = 1;
+
+    /// The conflict must propagate to the recovering caller, not be swallowed.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { store->listRefs(ns); });
+
+    /// The load-bearing assertion: recovery must be RESTARTABLE -- `recovery_in_progress` was cleared
+    /// on the exception path, so this second touch parks on nothing and runs its own recovery attempt.
+    /// The foreign object still occupies the seal key durably; the retry's fresh LIST+replay finds it,
+    /// decodes it, and ADOPTS it as already-sealed -- correct system behavior (write-once + byte-adopt:
+    /// in a genuine cross-process race this durable object IS the winner's valid seal, and a losing
+    /// racer converging on it rather than re-fighting for the same key is the whole point of write-once
+    /// semantics). The point of this second touch is that it converges cleanly instead of hanging on a
+    /// wedged flag.
+    EXPECT_EQ(store->listRefs(ns).size(), 2u)
+        << "the retry must converge on the durable (foreign) seal, not wedge or re-throw forever";
+    EXPECT_EQ(store->refRecoveryWaitersForTest(ns), 0u)
+        << "no phantom waiter may remain parked on recovery_cv after the exception path";
+}
+
+/// fix-round F3-1a (review Critical, concurrent half): unlike the sequential test above, THIS test can
+/// go genuinely RED without the fix -- not merely "UB only visible under TSan". A second caller
+/// actively PARKED in `recovery_cv.wait(lock)` while the first caller's PUT is unlocked and about to
+/// throw exercises the classic lost-wakeup shape: if `SCOPE_EXIT` clears `recovery_in_progress` and
+/// calls `notify_all()` WITHOUT holding `state_mutex` (the pre-fix bug), that write/notify can race the
+/// waiter's own check-then-sleep sequence and be missed entirely -- `std::condition_variable` makes no
+/// promise of a spurious wakeup, so a lost notify here can hang the second caller FOREVER, not just
+/// leave a data race for a sanitizer to catch. This is exactly why the fix re-acquires the lock before
+/// letting the exception escape: the notify is then guaranteed to happen only where a waiter checking
+/// its predicate under the SAME lock cannot miss it.
+TEST(RefWriterRecoverySeal, SealPutThrowsMidFlightSecondParkedCallerDoesNotHang)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/seal_conflict_throw_concurrent"};
+
+    seedSealFixtureDeadEpochs(*backend, layout, ns);
+    seedUncleanPredecessorMount(*backend, layout, /*epoch=*/2);
+
+    PoolConfig config;
+    config.server_id = UInt128(1);
+    config.mount_lease_ttl_ms = std::chrono::milliseconds(500);
+    config.cas_request_budget = sealTestTinyBudget();
+    config.materialization_grace_ms = 1000;
+    config.wait_sleep_fn = [](uint64_t) {};
+    auto store = openStoreWithConfig(backend, config);
+    ASSERT_TRUE(store);
+    ASSERT_EQ(store->liveWriterEpoch(), 3u);
+    ASSERT_TRUE(store->uncleanEpochBoundarySeenForTest());
+
+    const RefTxnId seal_id{2, std::numeric_limits<uint64_t>::max()};
+    const String seal_key = layout.refSnapshotKey(ns, seal_id);
+    backend->armPutBlock(seal_key);
+    backend->block_throw_corrupted_on_release = true;
+
+    /// t1 drives recovery; its seal PUT parks inside the blocked `putIfAbsent`, `state_mutex` released.
+    /// FATAL gtest assertion macros (`expectThrowsCode`'s `FAIL()`) are documented as unsafe off the
+    /// main thread, so capture via `exception_ptr` instead (mirrors `RefWriterAppendLane.
+    /// InvalidBatchEntryGetsOwnExceptionBatchSurvives`'s `t_bad` pattern) and assert on the main thread
+    /// after both joins.
+    std::exception_ptr t1_error;
+    std::thread t1([&] { try { store->listRefs(ns); } catch (...) { t1_error = std::current_exception(); } });
+    backend->awaitBlockEntered();
+
+    /// t2 touches the SAME table while t1's seal PUT is still parked -- deterministically wait for it
+    /// to actually reach `recovery_cv.wait` (mirrors `ConcurrentTouchDuringSealPutWaitsInsteadOfRacing`).
+    std::exception_ptr t2_error;
+    std::thread t2([&] { try { store->listRefs(ns); } catch (...) { t2_error = std::current_exception(); } });
+    while (store->refRecoveryWaitersForTest(ns) < 1)
+        std::this_thread::yield();
+
+    /// Release: t1's PUT lands the foreign-different object and throws CORRUPTED_DATA -- the load-bearing
+    /// assertion below. t2 then retries its OWN fresh recovery against a namespace whose seal key now
+    /// durably holds that foreign-different (garbage-suffixed) body; whether ITS decode/replay ultimately
+    /// throws or tolerates the trailing garbage is an unrelated implementation detail this test does not
+    /// pin -- the property under test is only that `t2.join()` returns AT ALL (bounded time, not a hang).
+    backend->releaseBlock();
+    t1.join();
+    t2.join();
+
+    ASSERT_TRUE(t1_error != nullptr) << "the seal PUT conflict must propagate to the recovering caller";
+    try
+    {
+        std::rethrow_exception(t1_error);
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA);
+    }
+    catch (...)
+    {
+        FAIL() << "t1 threw a non-DB::Exception";
+    }
+
+    EXPECT_EQ(store->refRecoveryWaitersForTest(ns), 0u)
+        << "no phantom waiter may remain parked on recovery_cv after either exception path";
 }
 
 /// rev.6 FINDING-1 (whole-plan final review, PART A): a LATER incarnation that recovers a table by

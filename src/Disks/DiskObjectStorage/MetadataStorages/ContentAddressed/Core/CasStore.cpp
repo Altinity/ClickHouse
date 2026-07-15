@@ -1381,9 +1381,28 @@ void Store::ensureRefTableRecovered(const RootNamespace & ns, RefTableRuntime & 
             seal.sealed_from = rt.state.greatest_applied;    /// == greatest_listed_id: nothing else was applied
             const String seal_bytes = encodeRefTableSnapshot(seal);
             const auto fence_ok = [this] { return refAppendFenceOk(); };
+            /// fix-round F3 follow-up (review Critical): the `SCOPE_EXIT` above mutates
+            /// `recovery_in_progress` and notifies `recovery_cv`, and it MUST run with `state_mutex`
+            /// held. `putIfAbsentControlled` can THROW (its contract: `CORRUPTED_DATA` when it
+            /// observes DIFFERENT valid bytes at the key -- a cross-process seal conflict, which
+            /// `recovery_in_progress` cannot serialize); if that exception escaped between `unlock`
+            /// and `lock`, the unwind would run the `SCOPE_EXIT` UNLOCKED -- a data race on the plain
+            /// bool and an unlocked notify. So re-acquire the lock before letting any exception
+            /// propagate. NOTE this obligation is NEW relative to `trySnapshotPublishOnce` (the
+            /// pattern this mirrors): that precedent has no scope-exit spanning its unlocked call and
+            /// no cross-caller flag to clean up -- do not weaken this by analogy to it.
             lock.unlock();
-            const auto outcome = ref_request_controller->putIfAbsentControlled(
-                pool_layout.refSnapshotKey(ns, seal_id), seal_bytes, fence_ok);
+            CasWriteOutcome outcome;
+            try
+            {
+                outcome = ref_request_controller->putIfAbsentControlled(
+                    pool_layout.refSnapshotKey(ns, seal_id), seal_bytes, fence_ok);
+            }
+            catch (...)
+            {
+                lock.lock();
+                throw;
+            }
             lock.lock();
             if (outcome != CasWriteOutcome::Committed)
                 throw Exception(ErrorCodes::ABORTED,
