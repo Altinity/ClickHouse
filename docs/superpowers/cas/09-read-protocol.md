@@ -24,8 +24,7 @@ served in one of four ways:
 
 | Access kind | How served |
 |---|---|
-| **Inline entry** (small eager files — `checksums.txt`, `columns.txt`, `count.txt`, `primary.idx`, `serialization.json`, `metadata_version.txt`, `partition.dat`) | Memory — decoded from the tree catalog's inline-data section; no S3 op at all |
-| **Mutable per-part file** (`txn_version.txt`, etc.) | Memory — from the `mutable_files` map in the `Resolved` struct (inlined into the root shard at commit time, 0 extra S3 ops) |
+| **Inline entry** (small eager files — `checksums.txt`, `columns.txt`, `count.txt`, `primary.idx`, `serialization.json`, `uuid.txt`, `txn_version.txt`, `metadata_version.txt`, `partition.dat`) | Memory — decoded from the tree catalog's inline-data section; no S3 op at all |
 | **Blob-backed file** (`.bin`, `.mrk`, `primary.idx` above the inline threshold) | Ranged S3 GET — one `GET` per column file per part open, bounded by `[payload_offset, payload_end)` |
 | **Verbatim file** (loose `roots/<server>/<path>` objects, `@cas@/_files/` namespace files) | Plain `IObjectStorage::readObject` — no CAS indirection |
 
@@ -57,11 +56,14 @@ on the read path.
    shard (see §6 for the decode cache).
 3. Look up `ref_name` in `root->refs`. A miss returns `std::nullopt`; `FILE_DOESNT_EXIST` is not
    thrown here — the callers that assert presence do so explicitly.
-4. On a hit, return `Resolved{manifest_id, mutable_files, published_at_ms}`. Note: `manifest_size`
+4. On a hit, return `Resolved{manifest_id, mutable_files, published_at_ms}` — `mutable_files` is the
+   now-legacy per-ref sidecar (§9.1 below), pending removal; every part file, including the former
+   mutable set, is an ordinary manifest entry. Note: `manifest_size`
    in the returned struct is always `0` — this is a known minor gap (B10 finding in `ROADMAP.md`).
 
 `allow_stale = true` (the normal read path) permits the shard decode cache TTL fast-path (see §6).
-`allow_stale = false` (the publish gate and force-fresh mutable-file reads) always issues a HEAD.
+`allow_stale = false` (the publish gate and force-fresh reads of write-time part files, §9.1) always
+issues a HEAD.
 
 ---
 
@@ -359,13 +361,23 @@ each keys the manifest by the full post-part-dir path, which is already the nest
 
 **Status: DONE** (`ContentAddressedMetadataStorage.cpp:891–948`)
 
-### 9.1 Mutable per-part files {#mutable-per-part}
+### 9.1 Write-time part files (formerly "mutable per-part files") {#mutable-per-part}
 
-Files classified as `isMutablePerPartFile` (e.g. `txn_version.txt`) are inlined into the
-root shard's `RootRef.mutable_files` map at commit time — 0 extra S3 ops (see
-`07-s3-budget.md §1.3`). On read, `tryGetInManifestBytes` performs a force-fresh
-(`allow_stale = false`) `resolveRef` and returns the bytes from `resolved->mutable_files`.
-Force-fresh is required here to guarantee read-your-writes for MVCC transaction versions.
+Since the all-tree part-files migration (spec `2026-07-15-cas-all-tree-part-files-design.md`, Task 6),
+`uuid.txt`/`txn_version.txt`/`metadata_version.txt` are written through the ordinary content path and
+read exactly like any other manifest entry — see §9.2's `Placement::Inline` mechanism, given their
+size. Nothing populates `RootRef.mutable_files` for these names anymore.
+
+`existsFile`/`getFileSize`/`getStorageObjects`/`tryGetInManifestBytes` still route these three names
+through a dedicated `isMutablePerPartFile`-gated code path today: a force-fresh (`allow_stale = false`)
+`resolveRef` that checks the now-always-empty `mutable_files` map, then falls through to the ordinary
+manifest-entry lookup (`Freshness::CachedForLoad`) — the residue of the pre-all-tree design, kept until
+Task 9's schema-deletion sweep removes the `isMutablePerPartFile` predicate and its callers entirely.
+The `CachedForLoad` fallthrough remains safe for read-your-writes because `CachedPartFolderAccess`'s
+write path (every committed-ref mutation, including a repoint) is write-through into the same retained
+view the read consults, validated against a fresh resolve on every hit (the Validate-On-Hit Protocol,
+`CachedPartFolderAccess.h`) — the dedicated force-fresh HEAD these three files used to specifically
+need is no longer load-bearing for them, though the code has not yet been simplified to say so.
 
 ### 9.2 Inline tree entries {#inline-tree}
 
@@ -447,7 +459,7 @@ is intentionally empty to avoid duplication; all budget figures live in `07`.
 | `PackedFilesReader` latent B115 (statistics path) | **DONE (fix in place)** | Upstream-relevant; current statistics consumer is still sequential, so not yet triggered |
 | Column pruning (structural — per-file `lookupPath`) | **DONE** | No separate filter; reader requests only needed files |
 | Inline tree-entry reads (0 S3 ops) | **DONE** | `Placement::Inline`; `tryGetInManifestBytes` |
-| Mutable per-part file reads (force-fresh) | **DONE** | `isMutablePerPartFile` → force-fresh `resolveRef` |
+| Write-time part files (`uuid.txt`/`txn_version.txt`/`metadata_version.txt`) as ordinary entries | **DONE** | All-tree Task 6; served by the Inline/blob path above, §9.1 |
 | Verbatim file reads (loose + `_files/`) | **DONE** | No manifest indirection |
 | In-flight read-your-writes overlay (B59, blobs) | **DONE** | `tryGetInFlightStorageObjects` / `tryReadFileInFlight` / `tryGetInFlightFileSize` |
 | In-flight read-your-writes overlay (B59, directory) | **DONE** | `hasInFlightDirectory` + `existsDirectory` prelude |

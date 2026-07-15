@@ -1259,7 +1259,7 @@ std::unique_ptr<ReadBufferFromFileBase> ContentAddressedMetadataStorage::readBlo
         std::move(impl), path, location.offset, location.offset + location.length);
 }
 
-/// ==== IContentAddressedExchange (M-W T11; B7 part_manifest_v1) ====
+/// ==== IContentAddressedExchange (M-W T11; B7 part_manifest_v2, self-contained since all-tree Task 7) ====
 
 std::optional<String> ContentAddressedMetadataStorage::getPartManifestBytes(const String & part_path) const
 {
@@ -1295,7 +1295,7 @@ bool ContentAddressedMetadataStorage::adoptPartFromManifest(
     if (read_only)
         throw Exception(ErrorCodes::READONLY, "Content-addressed disk is opened read-only: adoptPartFromManifest is rejected");
 
-    /// Receiver side (B7 part_manifest_v1). Sender identity is NON-AUTHORITATIVE: we ignore the decoded
+    /// Receiver side (B7 part_manifest_v2). Sender identity is NON-AUTHORITATIVE: we ignore the decoded
     /// ManifestRef, root_namespace_id and payload_digest, and use ONLY the entries. We run a normal
     /// LOCAL build (the proven republishRef sequence) over the SHARED-pool blobs — adopted by hash via
     /// adoptEvidence, NO blob body transferred — then stage a FRESH receiver-local ManifestId in the

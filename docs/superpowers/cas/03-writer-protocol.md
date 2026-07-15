@@ -333,7 +333,9 @@ Once all blobs are uploaded, `Build::promote` performs the **fail-closed commit*
    {old_binding = {Precommit, final_ref_name, build_id, manifest_ref},
     new_binding = {Committed, final_ref_name, manifest_ref}}
    ```
-   The `RootRef` entry (in `root.refs`) carries `mutable_files` and `published_at_ms`.
+   The `RootRef` entry (in `root.refs`) carries `published_at_ms`; a part's own files (including
+   `uuid.txt`/`txn_version.txt`/`metadata_version.txt`) are ordinary entries in the manifest this
+   ref points to, not a separate per-ref payload (`01 §part-manifests`).
 6. Clear `precommitted = false`. The precommit binding is gone; the committed binding now carries
    the object's in-degree.
 
@@ -532,9 +534,10 @@ This is the writer-side layer that makes MergeTree transactions (`BEGIN`/`COMMIT
 transactions, snapshot isolation, mutation/`DELETE`-in-transaction) work on a CAS disk. The MVCC
 **engine** — snapshot/CSN assignment, `TransactionLog`, visibility, the in-memory `DataPartsLock`
 serialization — is storage-agnostic and unchanged; the CAS-side job is solely to satisfy the per-part
-`txn_version.txt` storage contract. `txn_version.txt` (`VersionMetadata` / `VersionMetadataOnDisk`) is
-one of the `isMutablePerPartFile` set (with `uuid.txt`, `metadata_version.txt`): excluded from
-`computePartId` and stored in the per-ref sidecar, not the immutable manifest (§mutable-vs-immutable).
+`txn_version.txt` storage contract. Since the all-tree part-files migration (spec
+`2026-07-15-cas-all-tree-part-files-design.md`), `txn_version.txt` (`VersionMetadata` /
+`VersionMetadataOnDisk`) — along with `uuid.txt` and `metadata_version.txt` — is written through the
+same content path as any other part file: an ordinary manifest entry, not a separate per-ref sidecar.
 
 ### The transaction gate is decoupled from append {#txn-gate}
 
@@ -555,44 +558,47 @@ dedup window relies on. Flipping `supportWritingWithAppend` would defeat that de
 disarm the `DiskObjectStorageTransaction` append guard (CAS's content-addressed write branch cannot
 append). So a *narrow* new capability, not the easy reuse of the append flag.
 
-### `replaceFile` for mutable-file destinations {#txn-replacefile}
+### `replaceFile`/`moveFile` mutable-file routing — superseded by the atomic single-write path {#txn-replacefile}
 
-`VersionMetadataOnDisk` rewrites `txn_version.txt` as `txn_version.txt.tmp` (Rewrite) then
-`replaceFile(tmp, txn_version.txt)` **inside the part-commit transaction**.
-`ContentAddressedTransaction::replaceFile` (`ContentAddressedTransaction.cpp:1163`) is `moveFile` that
-overwrites the destination: for a mutable per-part-file destination it routes the bytes into the
-part's `recorded_mutable` (sidecar) staging (`isMutablePerPartFile(dst->file)`), dropping any staged
-destination state first; a content-file destination keeps the blob `moveFile` behavior.
+Since Task 5's `supportsAtomicFileWrites` capability (`ContentAddressedMetadataStorage::
+supportsAtomicFileWrites() == true`), `VersionMetadataOnDisk::storeInfoToDataPartStorage` takes a
+single atomic `writeFile` for `txn_version.txt` — no `.tmp` file, no `replaceFile` call. The tmp
+(`txn_version.txt.tmp`, `Rewrite`) + `replaceFile(tmp, txn_version.txt)` dance this section used to
+describe only runs on disks that lack atomic file writes.
 
-A mutable file's `.tmp` must **itself** match `isMutablePerPartFile` — i.e. `<mutable>.tmp`
-(`txn_version.txt.tmp`) is recognized as mutable. Otherwise a standalone autocommit of the `.tmp`
-would treat it as ordinary content, republish a one-file manifest, and **clobber the part**.
+Consequently, `ContentAddressedTransaction::moveFile`'s legacy mutable-per-part-file destination
+routing (`isMutablePerPartFile(dst->file)`: re-stage the committed bytes under the destination via a
+force-fresh resolve, mark the source removed) is dead in production for CA — no `.tmp` file is ever
+created to rename into place. The branch is still present in code (Task 9's mechanical sweep removes
+it along with the rest of the mutable-file concept) but unreached by any current CA write path.
 
-### The mutable-only commit branch (single most important invariant) {#txn-mutable-only}
+### CSN fill-in / removal-TID rewrites on a committed part — an ordinary standalone-write repoint {#txn-mutable-only}
 
 Filling in the **creation CSN** on `COMMIT`, and **locking/unlocking the removal TID**
 (`tryLockRemovalTID`/`unlockRemovalTID`) when a `DELETE`/mutation/`DROP`/`TRUNCATE`-in-transaction
 marks an **already-committed** part for removal, both rewrite `txn_version.txt` on a part whose ref is
-already published — via a fresh autocommit transaction. The naive commit path would build
-`manifest.blobs = recorded` (empty, since no content changed) and republish the ref to an **empty
-manifest**, recomputing `part_id` over nothing and **clobbering the part**.
+already published — via a fresh autocommit transaction. Since `txn_version.txt` is now an ordinary
+manifest entry (Task 6), this is an ordinary **committed-ref standalone write** (§4 above, Task 4),
+not a special mutable-only case: `writeFile` stages the one changed entry, and `publishStaging`'s
+repoint branch carries every OTHER committed entry forward and republishes one manifest via
+`repointRef` — never recomputing over an empty set, so the part is never clobbered. A byte-identical
+rewrite resolves through `repointRef`'s byte-equal check with zero pool mutations (Task 3).
 
-The fix is the mutable-only branch in `publishStaging` (`ContentAddressedTransaction.cpp:251`): detect
-**`recorded` (content) empty + `recorded_mutable`/`recorded_mutable_removed` non-empty + a ref already
-exists** for `(namespace, ref)`. In that case:
+The pre-all-tree mechanism this section used to describe — a dedicated "mutable-only" `publishStaging`
+branch that skipped manifest staging entirely and merged into the ref's separate `RootRef.mutable_files`
+payload via `updateRefPayload` — is superseded for these three files. That branch
+(`ContentAddressedTransaction.cpp`'s `!st.build && st.entries.empty() && st.content_removed.empty()`
+guard) still exists to serve the now-legacy `mutable_files`/`mutable_removed` fields until Task 9's
+schema-deletion sweep removes them, but nothing in the current write path populates those fields for
+`uuid.txt`/`txn_version.txt`/`metadata_version.txt` anymore.
 
-- Do **not** stage a manifest, do **not** recompute `part_id`, do **not** republish the ref. Instead
-  call `updateRefPayload` to merge the changed mutable files into the existing ref's
-  `RootRef.mutable_files` map in place (and erase removed ones), **keeping the existing
-  `part_id`/manifest/ref**.
+The whole-part INSERT path is unaffected either way: it stages the full content set, so the repoint
+branch does not trigger — `publishStaging`'s `Build` path runs as normal.
 
-The whole-part INSERT path is unaffected: it has content in `recorded`, so the mutable-only branch does
-not trigger.
-
-**Fail closed.** If `recorded` is empty and `recorded_mutable` is non-empty but staged **entries exist
-without a Build** where a content commit is required (no existing ref to update), that is a real
-error — `publishStaging` throws `LOGICAL_ERROR` rather than publish a standalone empty sidecar / a
-one-file manifest. A mutable rewrite of a non-existent part never fabricates a part.
+**Fail closed**, restated for the current shape: if a transaction stages a removal mark or a changed
+entry for a part with no existing ref and no `Build`, `publishStaging` throws `LOGICAL_ERROR` rather
+than publish a standalone one-file/empty manifest — a rewrite or removal on a non-existent part never
+fabricates or clobbers a part.
 
 ### Rollback and the MVCC-on-CAS lifecycle {#txn-rollback}
 

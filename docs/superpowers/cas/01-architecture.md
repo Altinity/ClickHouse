@@ -80,8 +80,9 @@ embedding the `server_root_id`, e.g. `srv1/<table_uuid>`) — the key-building c
 `CasLayout.h`) does not hardcode a separate `<server_root_id>` path segment itself. Its body is a JSON
 shard manifest containing:
 
-- `refs` — a map `part_name → PartManifestRef` (the current part-manifest pointer + mutable per-part fields
-  like `txn_version.txt`, `metadata_version.txt`).
+- `refs` — a map `part_name → PartManifestRef` (the current part-manifest pointer for that part; the
+  part's files — including `uuid.txt`, `txn_version.txt`, `metadata_version.txt` — are ordinary entries
+  in the pointed-to manifest, see "Part manifests (immutable)" below, not a separate per-ref sidecar).
 - `journal` — an append-only log of `+/-` ownership events; events are retained until the GC trim (gated by `gc_trim_min_events`/`gc_trim_body_soft_limit`) advances past the sealed fold cursor covering them (INV-JOURNAL-COVERAGE).
 - `incarnation` — a durable, strictly monotone pair `(writer_epoch, build_sequence)` stamped at
   (re)creation and never changed for that object's life. Closes the ABA hazard: a fold cursor keyed by
@@ -114,9 +115,15 @@ A third kind, `pack_slice` — member of a pack object at `(pack_hash, abs_offse
 a reserved placement but has no `EntryPlacement` enum value in the current code (not implemented as of
 2026-07-03).
 
-The per-part mutable files (`uuid.txt`, `txn_version.txt`, `metadata_version.txt`) are **excluded from the
-manifest** and kept in the ref shard's `RefPayload` for that part. This is what lets two parts with
-identical content share one manifest while having distinct identity and transaction state.
+The per-part write-time files `uuid.txt`, `txn_version.txt`, and `metadata_version.txt` are ordinary
+manifest entries like any other part file (all-tree part-files migration, spec
+`2026-07-15-cas-all-tree-part-files-design.md`) — there is no separate mutable sidecar. A single-file
+change on an already-committed part (`metadata_version.txt` on `ATTACH`, `txn_version.txt` on
+commit/mutation) resolves through a committed-ref repoint: the transaction carries every unchanged
+entry forward and republishes one manifest with the changed/removed paths applied; a byte-identical
+rewrite is a zero-pool-mutation no-op (`repointRef`). Two parts sharing every file's bytes, including
+these three, still share one manifest by ordinary content-addressing; a differing byte in any of them
+— same as any other file — yields a distinct manifest.
 
 PartManifest bodies live at `cas/manifests/<ns>/<writer_epoch>/<build_sequence>/<ordinal>.proto` (as with ref
 shards, `<ns>` is the opaque namespace string that typically embeds `server_root_id`; `<ordinal>` is a

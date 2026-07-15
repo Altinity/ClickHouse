@@ -850,7 +850,11 @@ TEST(CaWiringOps, RemovalsDropRefsAndNamespaces)
     tx->commit(DB::NoCommitOptions{});
     storage->store()->putNamespaceFile(storage->liveNamespace("uuid-1"), "format_version.txt", "1\n");
 
-    /// The fast-removal path: per-file unlinks are no-ops; removeDirectory(<part>) drops the ref.
+    /// The fast-removal path (all-tree Task 8, B123 evolution): per-file unlinks stage removal marks
+    /// (`content_removed`) but nothing durable changes until commit; removeDirectory(<part>) drops the
+    /// ref and supersedes any marks staged for it in the SAME transaction — still exactly one ref-drop,
+    /// zero repoints. `existsFile` below stays true because this whole sequence is one uncommitted
+    /// transaction (`tx2`), not because the unlink was a no-op.
     auto tx2 = storage->createTransaction();
     tx2->unlinkFile("uui/uuid-1/all_1_1_0/data.bin", false, false);
     EXPECT_TRUE(storage->existsFile("uui/uuid-1/all_1_1_0/data.bin"));   /// still committed
@@ -1123,7 +1127,7 @@ TEST(CaWiringGc, DroppedPartIsReclaimedByRounds)
     storage->runOneGcRoundForTest();
 
     EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/all_1_1_0"));
-    /// The relink offer (B7 part_manifest_v1): a reclaimed part is no longer a committed CA part here,
+    /// The relink offer (B7 part_manifest_v2): a reclaimed part is no longer a committed CA part here,
     /// so getPartManifestBytes offers NOTHING and the sender streams bytes — the documented fallback.
     EXPECT_FALSE(exchange->getPartManifestBytes("uui/uuid-1/all_1_1_0").has_value());
 
@@ -1208,7 +1212,7 @@ TEST(CaWiringGc, DisplacedTreeBlobsReclaimedThroughRealPath)
         << "retired+deleted next round); unreachable=" << after.unreachable;
 }
 
-/// ==== M-W Task 11 / B7: the DataPartsExchange facade (manifest relink, part_manifest_v1) ====
+/// ==== M-W Task 11 / B7: the DataPartsExchange facade (manifest relink, part_manifest_v2) ====
 
 /// B7 sender side: getPartManifestBytes returns the COMMITTED part's encoded PartManifest body — the
 /// opaque payload the receiver decodes. The bytes must decode to the same entries the part was

@@ -12,11 +12,13 @@ namespace DB
 /// concrete class (the design's "small purpose-built facade instead of dynamic_cast into the
 /// concrete class").
 ///
-/// Relink wire contract (B7 part-manifest model, maintainer-approved part_manifest_v1): the sender
-/// transmits {pool_uuid, encoded PartManifest body}; the legacy `part_id` cookie field carries the
-/// opaque manifest bytes (replica-internal wire on this branch — no protocol field changes). Sender
-/// identity in the body (ManifestRef, root_namespace_id, payload_digest) is NON-AUTHORITATIVE — the
-/// receiver uses ONLY the entries, runs a normal LOCAL build over the SHARED-pool blobs (adopted by
+/// Relink wire contract (B7 part-manifest model, maintainer-approved part_manifest_v2 — self-contained
+/// since all-tree Task 7: no separate metadata_version wire field, the transferred manifest alone is
+/// enough to rebuild the part): the sender transmits {pool_uuid, encoded PartManifest body}; the
+/// legacy `part_id` cookie field carries the opaque manifest bytes (replica-internal wire on this
+/// branch — no protocol field changes). Sender identity in the body (ManifestRef, root_namespace_id,
+/// payload_digest) is NON-AUTHORITATIVE — the receiver uses ONLY the entries, runs a normal LOCAL
+/// build over the SHARED-pool blobs (adopted by
 /// hash; no blob body is transferred), and publishes its OWN fresh receiver-local ManifestId. A blob
 /// no longer present/condemned makes adoptPartFromManifest return false and the caller falls back to
 /// the byte fetch — exactly where the old 4-step pin protocol fell back.
