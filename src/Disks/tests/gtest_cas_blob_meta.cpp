@@ -13,22 +13,9 @@ extern const int CORRUPTED_DATA;
 using namespace DB::Cas;
 using namespace DB::Cas::tests;
 
-TEST(CasBlobMeta, CodecRoundTripsBothStates)
-{
-    for (MetaState s : {MetaState::Clean, MetaState::Condemned})
-    {
-        BlobMeta m{.version = 1, .state = s, .condemn_round = 42, .size = 1 << 20};
-        const BlobMeta back = decodeBlobMeta(encodeBlobMeta(m));
-        EXPECT_EQ(static_cast<uint8_t>(back.state), static_cast<uint8_t>(s));
-        EXPECT_EQ(back.condemn_round, 42u);
-        EXPECT_EQ(back.size, 1u << 20);
-    }
-}
-
-TEST(CasBlobMeta, DecodeRejectsBadMagic)
-{
-    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [] { decodeBlobMeta("not-a-meta-object"); });
-}
+/// Codec tests (round-trip both states, fail-closed decode) moved to gtest_cas_blob_meta_format.cpp
+/// with the v3 text cutover; the lifecycle + inspect tests below stay — they exercise the Core ops
+/// and CasInspect against the stable encode/decode signatures and must pass unchanged.
 
 TEST(CasBlobMeta, PutIfAbsentThenCasTransitions)
 {
