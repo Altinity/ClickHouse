@@ -152,6 +152,9 @@ void ASTSystemQuery::formatImpl(WriteBuffer & ostr, const FormatSettings & setti
         Type::CLEAR_FILESYSTEM_CACHE,
         Type::SYNC_FILESYSTEM_CACHE,
         Type::CLEAR_QUERY_CACHE,
+        /// The grammar parses `<srid> FROM DISK <disk>` before `ON CLUSTER` (ParserSystemQuery.cpp),
+        /// so the round-trip format must print it last too.
+        Type::CONTENT_ADDRESSED_DROP_POOL_MEMBER,
     };
 
     if (!queries_with_on_cluster_at_end.contains(type) && !cluster.empty())

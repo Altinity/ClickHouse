@@ -9,6 +9,7 @@
 #include <Parsers/ParserOptimizeQuery.h>
 #include <Parsers/ParserRenameQuery.h>
 #include <Parsers/ParserAttachAccessEntity.h>
+#include <Parsers/ParserSystemQuery.h>
 #include <Parsers/Lexer.h>
 #include <Parsers/parseQuery.h>
 #include <Parsers/Kusto/ParserKQLQuery.h>
@@ -380,6 +381,32 @@ INSTANTIATE_TEST_SUITE_P(ParserRenameQuery, ParserTest,
         {
             "RENAME TABLE eligible_test TO eligible_test2",
             "RENAME TABLE eligible_test TO eligible_test2"
+        }
+})));
+
+// SYSTEM CONTENT ADDRESSED DROP POOL MEMBER: srid and disk are both required quoted string literals
+// (an srid is an opaque server-root path, not identifier-shaped); ON CLUSTER round-trips as a bare
+// identifier (ASTQueryWithOnCluster::formatOnCluster uses backQuoteIfNeed, no quoting needed for a
+// plain name), even though the parser also accepts a quoted string literal for it on input.
+INSTANTIATE_TEST_SUITE_P(ParserSystemQuery, ParserTest,
+    ::testing::Combine(
+        ::testing::Values(std::make_shared<ParserSystemQuery>()),
+        ::testing::ValuesIn(std::initializer_list<ParserTestCase>{
+        {
+            "SYSTEM CONTENT ADDRESSED DROP POOL MEMBER 'srv1' FROM DISK 'disk1'",
+            "SYSTEM CONTENT ADDRESSED DROP POOL MEMBER 'srv1' FROM DISK 'disk1'"
+        },
+        {
+            "SYSTEM CONTENT ADDRESSED DROP POOL MEMBER 'srv1' FROM DISK 'disk1' ON CLUSTER my_cluster",
+            "SYSTEM CONTENT ADDRESSED DROP POOL MEMBER 'srv1' FROM DISK 'disk1' ON CLUSTER my_cluster"
+        },
+        {
+            "SYSTEM CONTENT ADDRESSED DROP POOL MEMBER 'srv1'",   // missing FROM DISK
+            nullptr
+        },
+        {
+            "SYSTEM CONTENT ADDRESSED DROP POOL MEMBER FROM DISK 'disk1'",   // missing srid
+            nullptr
         }
 })));
 
