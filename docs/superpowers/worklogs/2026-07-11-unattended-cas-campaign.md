@@ -159,3 +159,30 @@ work did not regress the suite; triage fix-vs-backlog.
 
 Durable state: `.superpowers/sdd/progress.md` (detailed ledger), specs under `docs/superpowers/specs/`,
 plans under `docs/superpowers/plans/`, memory files for each project.
+
+## Phase-2 (sha256) execution — T1-T3 landed, T4 consult in flight
+- P2-T1 (b932a0430eb): BlobDigest strong type + PoolMeta-scoped DigestCodec. Shard-gate green
+  (shardOf==v>>64 over 200 randoms → existing pools never reshard). 13/13 + battery green.
+- P2-T2 (4218c5e84a4): Sha256BlobHasher (OpenSSL EVP streaming, RAII, fail-close) + one-shot. NIST golden
+  vectors + 200KiB chunked streaming==one-shot+passthrough. Agent bailed on bg build; controller finished.
+- P2-T3 (959dff93c53): ManifestEntry.blob_hash→BlobDigest + variable-len manifest codec (blob_hash_len u8 header,
+  no back-compat, validated {16,32}). ~48 minimal shims. 648/648 green. Controller-reviewed codec+GC-fold+tests.
+- P2-T4 (settlement core: srcEdgeRunKey/blobShard/BlobDelta widening + schema 1/2 + digest_len threading):
+  HIGHEST-RISK (delete-identity). Running a codex xhigh consult on the EXECUTION (order/shard preservation,
+  T4/T5 shim-boundary safety, silent-leak exposure of deferring the two silent sites to T5) BEFORE dispatch.
+  Reply → tmp/consult_t4_reply.md. BASE = 959dff93c53.
+
+## Phase-2 (sha256) COMPLETE — T1-T7 landed + real-S3 validated (2026-07-11)
+7 commits b932a0430eb..6c7a88602fb on cas-gc-rebuild:
+- T1 BlobDigest strong type + PoolMeta-scoped DigestCodec (shard-gate: shardOf==v>>64, existing pools never reshard)
+- T2 Sha256BlobHasher (OpenSSL EVP streaming, NIST vectors)
+- T3 ManifestEntry.blob_hash->BlobDigest + variable-length manifest codec (blob_hash_len header, no back-compat)
+- T4 settlement source-edge key/shard widening, fail-closed on 32-byte (codex xhigh consult-hardened:
+  SourceEdgeKeyCodec, fold schema-coherence gate, foldManifestEdges width-injection gate, teeth test)
+- T5 (crux) meta/dedup/outcome/write-mint widen + ATOMIC port of the 2 silent-leak sites (CasGc condemn-sweep +
+  CasFsck) -> codec.fromHex; legacyBlobId128 removed; 32-byte GC live. Crux test RED-on-revert of either site.
+- T6 Build write-path completion (objectKey/deps/inline-hash->pool algo, inline==blob) + lift factory guard (atomic)
+- T7 real-S3 (rustfs) validation: blobs under blobs/sha256/<64hex>, SELECT correct, GC exact-token reclaim,
+  dangling==0 throughout, physical_bytes->0. The silent-leak crux proven over real S3.
+Discipline: 1 codex xhigh consult (T4), multiple teeth tests (RED-on-revert), thorough controller review of every
+task (esp. T4/T5 delete-path), unit 802/802 + real-S3. Agents bailed on bg builds (T2/T6) -> controller finished.
