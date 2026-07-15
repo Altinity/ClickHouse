@@ -5,6 +5,7 @@
 #include "Common/logger_useful.h"
 #include <Common/ZooKeeper/Types.h>
 #include <Common/ZooKeeper/ZooKeeper.h>
+#include <Common/ZooKeeper/KeeperException.h>
 #include <Common/ProfileEvents.h>
 #include <Common/FailPoint.h>
 #include <Common/escapeForFileName.h>
@@ -34,10 +35,16 @@ namespace ErrorCodes
 namespace FailPoints
 {
     extern const char export_partition_status_change_throw[];
+    extern const char export_partition_processed_paths_sync_fail[];
 }
 
 namespace
 {
+    /// Value published into destination_file_paths when a processed/ Keeper refresh
+    /// is incomplete (or a leaf is unreadable), so system.replicated_partition_exports
+    /// can show that the in-memory mirror failed to sync instead of silently under-counting.
+    constexpr std::string_view zk_sync_failed_marker = "<failed to read from zk>";
+
     /// Describes pending commits
     struct CommitRecoveryWork
     {
@@ -116,14 +123,6 @@ namespace
         return out;
     }
 
-    /// Fetch all per-part processed leaves under <entry_path>/processed and build a
-    /// fresh map keyed by part_name. Returns the destination file paths recorded for
-    /// each finished part.
-    ///
-    /// Same lenient semantics as readLastExceptionPerReplica: nullopt means
-    /// "nothing actionable" (transient ZK error) and callers MUST skip the
-    /// assignment to preserve the in-memory mirror across glitches. An engaged
-    /// empty map means the read succeeded and no part has finished yet.
     std::optional<std::map<String, std::vector<String>>> readDestinationFilePathsPerPart(
         const zkutil::ZooKeeperPtr & zk,
         const std::filesystem::path & entry_path,
@@ -139,8 +138,9 @@ namespace
         ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGetChildren);
         if (Coordination::Error::ZOK != zk->tryGetChildren(container_path, children))
         {
-            LOG_INFO(log, "ExportPartition Manifest Updating Task: failed to list processed leaves for {}, leaving in-memory copy untouched", log_key);
-            return std::nullopt;
+            LOG_INFO(log, "ExportPartition Manifest Updating Task: failed to list processed leaves for {}, publishing sync-failed marker", log_key);
+            out.emplace(String(zk_sync_failed_marker), std::vector<String>{String(zk_sync_failed_marker)});
+            return out;
         }
 
         if (children.empty())
@@ -161,11 +161,18 @@ namespace
             Coordination::GetResponse response;
             try
             {
+                /// Simulate a non-ZNONODE multi-get failure so the catch path below
+                /// publishes the sync-failed marker (same shape as operator[] rethrow).
+                fiu_do_on(FailPoints::export_partition_processed_paths_sync_fail,
+                {
+                    throw zkutil::KeeperException(Coordination::Error::ZCONNECTIONLOSS);
+                });
                 response = responses[i];
             }
             catch (...)
             {
-                LOG_WARNING(log, "ExportPartition Manifest Updating Task: ZK error fetching processed leaf {} for {}, skipping", children[i], log_key);
+                LOG_WARNING(log, "ExportPartition Manifest Updating Task: ZK error fetching processed leaf {} for {}, publishing sync-failed marker", children[i], log_key);
+                out.emplace(children[i], std::vector<String>{String(zk_sync_failed_marker)});
                 continue;
             }
 
@@ -179,7 +186,8 @@ namespace
             }
             catch (...)
             {
-                LOG_WARNING(log, "ExportPartition Manifest Updating Task: malformed processed JSON for {} (leaf {}), ignoring", log_key, children[i]);
+                LOG_WARNING(log, "ExportPartition Manifest Updating Task: malformed processed JSON for {} (leaf {}), publishing sync-failed marker", log_key, children[i]);
+                out.emplace(children[i], std::vector<String>{String(zk_sync_failed_marker)});
             }
         }
 

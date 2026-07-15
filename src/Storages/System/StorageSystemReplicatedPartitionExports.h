@@ -32,7 +32,9 @@ struct ReplicatedPartitionExportInfo
 
     /// Per-part destination file paths, keyed by part name. Mirrors the
     /// <export-entry>/processed/<part>/paths_in_destination data from ZooKeeper.
-    /// Empty until parts complete; partial during PENDING.
+    /// Empty until parts complete; partial during PENDING. May contain
+    /// "<failed to read from zk>" when a Keeper refresh was incomplete or a
+    /// processed leaf could not be parsed.
     std::map<String, std::vector<String>> destination_file_paths_per_part;
 
     /// Iceberg commit-time paths surfaced from <export-entry>/commit_info.

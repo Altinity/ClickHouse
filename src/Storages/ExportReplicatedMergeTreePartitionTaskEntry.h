@@ -47,6 +47,9 @@ struct ExportReplicatedMergeTreePartitionTaskEntry
     /// poll() cycle and on status-change handler invocations; served verbatim to
     /// system.replicated_partition_exports without any extra ZK read at query time.
     /// An empty map means no part has finished exporting yet for this task.
+    /// Incomplete Keeper refreshes (or unreadable processed leaves) publish
+    /// "<failed to read from zk>" as a whole-map key, or as the sole path value
+    /// for the affected part leaf.
     mutable std::map<String, std::vector<String>> destination_file_paths_per_part;
 
     /// In-memory mirror of the <export-entry>/commit_info znode (written atomically
