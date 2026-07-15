@@ -2923,12 +2923,11 @@ TEST(RefWriterRecoverySeal, SealPutConflictThrowPropagatesAndDoesNotWedgeRecover
 
     /// The load-bearing assertion: recovery must be RESTARTABLE -- `recovery_in_progress` was cleared
     /// on the exception path, so this second touch parks on nothing and runs its own recovery attempt.
-    /// The foreign object still occupies the seal key durably; the retry's fresh LIST+replay finds it,
-    /// decodes it, and ADOPTS it as already-sealed -- correct system behavior (write-once + byte-adopt:
-    /// in a genuine cross-process race this durable object IS the winner's valid seal, and a losing
-    /// racer converging on it rather than re-fighting for the same key is the whole point of write-once
-    /// semantics). The point of this second touch is that it converges cleanly instead of hanging on a
-    /// wedged flag.
+    /// The retry finds the foreign object durable at the seal key and ADOPTS it (write-once byte-adopt).
+    /// NOTE: in this fixture the object is corrupted-but-decodable (trailing garbage tolerated by
+    /// `decodeRefTableSnapshot`) -- the adoption-of-a-corrupt-seal tolerance is flagged as a separate
+    /// open finding (see "F3-1a side-finding" in the rev6 findings doc); THIS test pins the
+    /// no-wedge/restartability contract, not the decode laxity.
     EXPECT_EQ(store->listRefs(ns).size(), 2u)
         << "the retry must converge on the durable (foreign) seal, not wedge or re-throw forever";
     EXPECT_EQ(store->refRecoveryWaitersForTest(ns), 0u)
