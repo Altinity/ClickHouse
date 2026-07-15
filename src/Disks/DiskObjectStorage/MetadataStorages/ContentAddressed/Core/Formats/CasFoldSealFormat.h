@@ -4,6 +4,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasToken.h>
 #include <base/types.h>
 #include <base/extended_types.h>
+#include <cstdint>
 #include <map>
 #include <string>
 #include <string_view>
@@ -103,6 +104,9 @@ struct CasFoldSeal
     bool operator==(const CasFoldSeal &) const = default;
 };
 
+/// v3 text (spec §control-plane, DETERMINISTIC — PinnedRaw): header line + a meta line
+/// {"g","pg"} + tagged record lines (fixed section order: cov/btr/pmc/cnd/nsc, each sorted) + {"n":count}
+/// trailer. Byte-reproducible for the putDeterministicArtifact retry-equality contract.
 String encodeFoldSeal(const CasFoldSeal & seal);
 CasFoldSeal decodeFoldSeal(std::string_view data);
 
