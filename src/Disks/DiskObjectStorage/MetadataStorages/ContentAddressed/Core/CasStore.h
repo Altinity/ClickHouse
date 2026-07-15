@@ -537,6 +537,11 @@ public:
     const PoolMeta & poolMeta() const { return meta; }
     const Layout & layout() const { return pool_layout; }
     Backend & backend() { return *pool_backend; }
+    /// The owning `BackendPtr` itself (not just a reference into it): the decommission slot-retirement
+    /// phase (`CasDecommission.cpp`) must keep the backend alive across `admin.reset()` -- the graceful
+    /// close that stamps the mount's farewell -- to physically delete the control objects afterward. A
+    /// bare `Backend &` from `backend()` would dangle the instant the owning `Store` is destroyed.
+    BackendPtr poolBackendPtr() const { return pool_backend; }
 
     /// CAS mixed-algo pools (Phase 3 T4/T5, design 2026-07-11-cas-mixed-algo-pools-design.md §5):
     /// the NODE-LOCAL algo this Store mints NEW content with (`PoolConfig::blob_hash_algo` -- never

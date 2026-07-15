@@ -3,6 +3,11 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasServerRoot.h>
 #include <stdexcept>
 
+namespace DB::ErrorCodes
+{
+    extern const int S3_ERROR;
+}
+
 using namespace DB;
 using namespace DB::Cas;
 using namespace DB::Cas::tests;
@@ -35,6 +40,8 @@ public:
     void failWithThrow(const String & key) { throw_key = key; }
     void failWithTokenMismatch(const String & key) { mismatch_key = key; }
     void failNamespaceReads(const String & ns_substring) { unreadable_ns_substring = ns_substring; }
+    /// Clears every injected failure -- the resume half of a fail-then-retry test (Task 4).
+    void disarm() { throw_key.clear(); mismatch_key.clear(); unreadable_ns_substring.clear(); }
 
     DeleteOutcome deleteExact(const String & key, const Token & token) override
     {
@@ -187,25 +194,13 @@ TEST(CasDecommission, ErasesAllVictimNamespaces)
     EXPECT_EQ(report.precommits_removed, 1u);
     EXPECT_EQ(report.edge_deltas_emitted, 4u);
 
-    /// The namespaces are durably Removed — visible to a fresh admin store.
-    auto check = Store::openForDecommission(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "chk"}, "victim");
-    EXPECT_TRUE(check->namespaceIsRemoved(RootNamespace("victim/db/t1")));
-    EXPECT_TRUE(check->namespaceIsRemoved(RootNamespace("victim/db/t2")));
-}
-
-TEST(CasDecommission, RerunCountsAlreadyRemoved)
-{
-    auto backend = std::make_shared<InMemoryBackend>();
-    {
-        auto victim = openVictim(backend);
-        makeTableWithRefs(*victim, "victim/db/t1", 1, 0);
-    }
-    (void)decommissionPoolMember(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "a1"}, "victim");
-    /// Task 4 will delete the slot on success and make a full re-run BAD_ARGUMENTS; until then a
-    /// re-run must skip the Removed namespace idempotently.
-    const auto second = decommissionPoolMember(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "a2"}, "victim");
-    EXPECT_EQ(second.namespaces_removed, 0u);
-    EXPECT_EQ(second.namespaces_already_removed, 1u);
+    /// Task 4: a clean drain (nothing under staging/roots/manifest-debris here, so `warnings` stays
+    /// empty) removes the pool slot -- a fresh `Store::openForDecommission` for "victim" is no longer
+    /// possible (`RemovesSlotAndMakesRerunUnknown` proves the BAD_ARGUMENTS shape directly), so a
+    /// "still durably Removed" check can no longer go through a re-opened admin store the way it did
+    /// before Task 4 landed.
+    EXPECT_TRUE(report.warnings.empty());
+    EXPECT_TRUE(report.slot_removed);
 }
 
 /// Task 2 review finding 1: `makeTableWithRefs`'s precommit seed uses an artificially high
@@ -382,4 +377,144 @@ TEST(CasDecommission, ManifestDebrisPhaseFailuresWarnAndContinue)
 
     EXPECT_TRUE(backend->head(debris_key).exists)
         << "the failing object is left behind (untouched) so a re-run can retry it";
+}
+
+/// Task 4: a clean drain (no warnings) removes the pool slot -- the three control objects
+/// (`mount`/`owner`/`epoch`) are gone -- and a re-run of the SAME srid is now `BAD_ARGUMENTS`
+/// ("unknown member"), exactly like `RefusesUnknownMember` for an srid that never existed.
+TEST(CasDecommission, RemovesSlotAndMakesRerunUnknown)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    {
+        auto victim = openVictim(backend);
+        makeTableWithRefs(*victim, "victim/db/t1", 1, 0);
+    }
+    const auto report = decommissionPoolMember(
+        backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim");
+    EXPECT_TRUE(report.slot_removed);
+    EXPECT_TRUE(report.warnings.empty());
+    EXPECT_FALSE(backend->get("p/gc/server-roots/victim/mount").has_value());
+    EXPECT_FALSE(backend->get("p/gc/server-roots/victim/owner").has_value());
+    EXPECT_FALSE(backend->get("p/gc/server-roots/victim/epoch").has_value());
+
+    expectThrowsCode(ErrorCodes::BAD_ARGUMENTS, [&]
+    {
+        decommissionPoolMember(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "a2"}, "victim");
+    });
+}
+
+/// Delegates every op to `inner`, except `deleteExact`: while `armed`, any key starting with
+/// `fail_prefix` throws an injected transient failure instead of deleting -- models a real backend
+/// transiently failing to delete under one whole prefix. `disarm()` clears the failure (the resume
+/// half of `FailedDrainKeepsSlotThenResumes`). Forwards every pure-virtual `Backend` member (the
+/// `CasBackend.h` list) to `inner` untouched.
+class FailDeletesUnderPrefixBackend : public Backend
+{
+public:
+    FailDeletesUnderPrefixBackend(std::shared_ptr<InMemoryBackend> inner_, String fail_prefix_)
+        : inner(std::move(inner_)), fail_prefix(std::move(fail_prefix_))
+    {
+    }
+
+    void disarm() { armed = false; }
+
+    std::optional<GetResult> get(const String & key, Range range = {}) override { return inner->get(key, range); }
+    std::optional<GetStreamResult> getStream(const String & key, Range range = {}) override { return inner->getStream(key, range); }
+    HeadResult head(const String & key) override { return inner->head(key); }
+    PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta = {}) override
+    {
+        return inner->putIfAbsent(key, bytes, meta);
+    }
+    WriteSinkPtr putIfAbsentStream(const String & key, const ObjectMeta & meta = {}) override
+    {
+        return inner->putIfAbsentStream(key, meta);
+    }
+    PutResult putOverwrite(const String & key, const String & bytes, const Token & expected, const ObjectMeta & meta = {}) override
+    {
+        return inner->putOverwrite(key, bytes, expected, meta);
+    }
+    CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected, const ObjectMeta & meta = {}) override
+    {
+        return inner->casPut(key, bytes, expected, meta);
+    }
+    DeleteOutcome deleteExact(const String & key, const Token & token) override
+    {
+        if (armed && key.starts_with(fail_prefix))
+            throw Exception(ErrorCodes::S3_ERROR, "injected transient delete failure for {}", key);
+        return inner->deleteExact(key, token);
+    }
+    ListPage list(const String & prefix, const String & cursor, size_t limit) override { return inner->list(prefix, cursor, limit); }
+    bool supportsListTokens() const override { return inner->supportsListTokens(); }
+
+private:
+    std::shared_ptr<InMemoryBackend> inner;
+    String fail_prefix;
+    bool armed = true;
+};
+
+/// Task 4 fail-close: a drain failure under the roots prefix keeps the slot terminated-but-present
+/// (`report.slot_removed == false`, the mount object survives as the resume anchor). Once the fault is
+/// cleared, a re-run finishes the job: the already-erased namespace is counted as
+/// `namespaces_already_removed`, the leftover roots object is finally swept, and the slot is removed.
+TEST(CasDecommission, FailedDrainKeepsSlotThenResumes)
+{
+    auto inner = std::make_shared<InMemoryBackend>();
+    {
+        auto victim = Store::open(inner, PoolConfig{.pool_prefix = "p", .server_root_id = "victim"});
+        makeTableWithRefs(*victim, "victim/db/t1", 1, 0);
+    }
+    inner->putIfAbsent("p/roots/victim/loose_file", "x");
+
+    auto failing = std::make_shared<FailDeletesUnderPrefixBackend>(inner, "p/roots/victim/");
+    const auto first = decommissionPoolMember(
+        failing, PoolConfig{.pool_prefix = "p", .server_root_id = "a1"}, "victim");
+    EXPECT_FALSE(first.warnings.empty());
+    EXPECT_FALSE(first.slot_removed);
+    EXPECT_TRUE(inner->get("p/gc/server-roots/victim/mount").has_value())
+        << "slot kept -- resume anchor";
+
+    failing->disarm();
+    const auto second = decommissionPoolMember(
+        failing, PoolConfig{.pool_prefix = "p", .server_root_id = "a2"}, "victim");
+    EXPECT_TRUE(second.warnings.empty());
+    EXPECT_TRUE(second.slot_removed);
+    EXPECT_EQ(second.namespaces_already_removed, 1u);
+    EXPECT_EQ(second.mountpoint_objects_removed, 1u);
+}
+
+/// Task 4 fail-close, manifest-debris variant (review follow-up: the plan's own example only exercises
+/// a roots-phase failure). A per-key `deleteExact` throw inside the manifest-debris drain must ALSO
+/// keep the slot: `report.slot_removed == false`, the mount object survives, and once the injected
+/// failure is cleared a re-run drains the leftover debris and removes the slot.
+TEST(CasDecommission, ManifestDebrisFailureKeepsSlotThenResumes)
+{
+    auto backend = std::make_shared<FailingDeleteBackend>();
+    String debris_key;
+    {
+        auto victim = openVictim(backend);
+        makeTableWithRefs(*victim, "victim/db/t1", 1, 0);
+        const ManifestId debris_id = seedOrphanManifestBody(*victim, "victim/db/t1");
+        debris_key = victim->layout().manifestKey(debris_id);
+    }
+    backend->failWithThrow(debris_key);
+
+    const auto first = decommissionPoolMember(
+        backend, PoolConfig{.pool_prefix = "p", .server_root_id = "a1"}, "victim");
+    EXPECT_FALSE(first.warnings.empty());
+    EXPECT_FALSE(first.slot_removed);
+    EXPECT_EQ(first.manifest_debris_removed, 0u);
+    EXPECT_TRUE(backend->get("p/gc/server-roots/victim/mount").has_value())
+        << "slot kept -- resume anchor";
+    EXPECT_TRUE(backend->head(debris_key).exists)
+        << "the failing object is left behind (untouched) so a re-run can retry it";
+
+    backend->disarm();
+    const auto second = decommissionPoolMember(
+        backend, PoolConfig{.pool_prefix = "p", .server_root_id = "a2"}, "victim");
+    EXPECT_TRUE(second.warnings.empty());
+    EXPECT_TRUE(second.slot_removed);
+    EXPECT_EQ(second.namespaces_already_removed, 1u);
+    EXPECT_EQ(second.manifest_debris_removed, 1u);
+    EXPECT_FALSE(backend->head(debris_key).exists);
+    EXPECT_FALSE(backend->get("p/gc/server-roots/victim/mount").has_value());
 }

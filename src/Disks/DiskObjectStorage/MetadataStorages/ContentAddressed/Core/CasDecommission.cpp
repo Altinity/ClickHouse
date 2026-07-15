@@ -147,15 +147,71 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
     report.mountpoint_objects_removed += deleteListedPrefix(
         admin->backend(), admin->layout().serverRootDataPrefix(victim_srid), report.warnings);
 
-    EventEmitter{*admin}.emit([&](CasEvent & e)
+    /// Phase: slot retirement -- STRICTLY LAST, and only over a clean drain (fail-close: an unconfirmed
+    /// drain keeps the resume anchor; the operator re-runs). `layout`/`pool_backend` are copied out
+    /// BEFORE `admin.reset()` below -- `admin` (and the `Store` it owns) is gone the instant the
+    /// graceful close runs, so nothing after that point may dereference it. `Layout` is a cheap value
+    /// type (one `String`); `poolBackendPtr()` shares ownership of the backend so it outlives the Store.
+    const Layout layout = admin->layout();
+    const BackendPtr pool_backend = admin->poolBackendPtr();
+    if (report.warnings.empty())
     {
+        /// Graceful close of the admin store: `Store::~Store`'s mount-lease keeper stamps the lease
+        /// already-expired and folds in the watermark farewell (`min_active = UINT64_MAX`) -- the
+        /// `terminated` state (`CasServerRoot.cpp`).
+        admin.reset();
+
+        /// Delete the control objects; the mount body LAST -- it is the claim/resume anchor, so a crash
+        /// between deletes must never leave an owner/epoch-less but still-mounted slot, only a
+        /// still-claimable one. A per-key failure here is itself a drain-incomplete signal: record it
+        /// and stop (the remaining keys, including the mount, survive so a re-run can retry).
+        const std::vector<String> slot_keys = {layout.epochKey(victim_srid), layout.ownerKey(victim_srid),
+                                                layout.mountKey(victim_srid)};
+        bool all_deleted = true;
+        for (const String & key : slot_keys)
+        {
+            if (const auto got = pool_backend->get(key))
+            {
+                try
+                {
+                    pool_backend->deleteExact(key, got->token);
+                }
+                catch (...)
+                {
+                    report.warnings.push_back("slot delete failed: " + key + ": "
+                                              + getCurrentExceptionMessage(/*with_stacktrace=*/false));
+                    all_deleted = false;
+                    break;   /// keep the remaining keys — mount survives ⇒ resume works
+                }
+            }
+        }
+        report.slot_removed = all_deleted;
+    }
+    else
+    {
+        report.slot_removed = false;
+        LOG_WARNING(getLogger("CasDecommission"),
+            "CAS decommission '{}': drain incomplete ({} warnings) — mount slot kept (terminated); "
+            "re-run the command to finish", victim_srid, report.warnings.size());
+        admin.reset();   /// graceful close still stamps the farewell — the slot reads `terminated`
+    }
+
+    /// The `end` event is emitted via `sink` directly, not `EventEmitter{*admin}`: `admin` is gone by
+    /// now. This also means its `warnings` count reflects the FINAL total, including a slot-delete
+    /// failure appended just above -- `EventEmitter`'s own zero-cost-when-absent guard is reproduced by
+    /// the `if (sink)` below.
+    if (sink)
+    {
+        CasEvent e;
         e.type = CasEventType::MemberDecommission;
         e.outcome = "end";
         e.reason = "decommission finished";
         e.detail = {{"srid", victim_srid},
                     {"namespaces_removed", std::to_string(report.namespaces_removed)},
-                    {"warnings", std::to_string(report.warnings.size())}};
-    });
+                    {"warnings", std::to_string(report.warnings.size())},
+                    {"slot_removed", report.slot_removed ? "1" : "0"}};
+        sink(std::move(e));
+    }
     return report;
 }
 
