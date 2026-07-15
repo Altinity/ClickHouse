@@ -11,7 +11,7 @@ cluster = ClickHouseCluster(__file__)
 # analogue of zero-copy replication, spec §4).
 STORAGE_POLICY = "content_addressed_shared"
 
-# The shared pool's blob prefix inside the `root` MinIO bucket. The relink proof is that the fetch does
+# The shared pool's blob prefix inside the `test` RustFS bucket. The relink proof is that the fetch does
 # NOT create new objects under here: relink publishes a ref (per-server, under store/), never a blob.
 BLOBS_PREFIX = "shared_pool/blobs/"
 
@@ -24,7 +24,7 @@ def start_cluster():
         "node1",
         main_configs=["configs/storage_conf.xml", "configs/server_root_id_node1.xml"],
         macros={"replica": "node1"},
-        with_minio=True,
+        with_rustfs=True,
         with_zookeeper=True,
         stay_alive=True,
     )
@@ -32,7 +32,7 @@ def start_cluster():
         "node2",
         main_configs=["configs/storage_conf.xml", "configs/server_root_id_node2.xml"],
         macros={"replica": "node2"},
-        with_minio=True,
+        with_rustfs=True,
         with_zookeeper=True,
         stay_alive=True,
     )
@@ -45,8 +45,8 @@ def start_cluster():
 
 
 def count_blobs():
-    objects = cluster.minio_client.list_objects(
-        cluster.minio_bucket, BLOBS_PREFIX, recursive=True
+    objects = cluster.rustfs_client.list_objects(
+        cluster.rustfs_bucket, BLOBS_PREFIX, recursive=True
     )
     return len(list(objects))
 

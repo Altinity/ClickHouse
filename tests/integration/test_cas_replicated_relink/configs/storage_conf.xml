@@ -8,10 +8,13 @@
                 <!-- A single shared bucket path. BOTH replicas load this same config, so they mount
                      the SAME content-addressed pool (the bucket is the single source of truth). The
                      shared pool is what makes fetch-by-relink possible: a part written by one replica
-                     is already present (as blobs + manifest) for the other to publish a ref to. -->
-                <endpoint>http://minio1:9001/root/shared_pool/</endpoint>
-                <access_key_id>minio</access_key_id>
-                <secret_access_key>ClickHouse_Minio_P@ssw0rd</secret_access_key>
+                     is already present (as blobs + manifest) for the other to publish a ref to.
+                     RustFS (not MinIO) enforces the conditional-PUT/DELETE semantics CasProbe's
+                     fail-closed startup capability check (B31) requires: MinIO does not enforce
+                     conditional deletes, so a CA pool over MinIO refuses to mount at all. -->
+                <endpoint>http://rustfs1:11121/test/shared_pool/</endpoint>
+                <access_key_id>clickhouse</access_key_id>
+                <secret_access_key>clickhouse</secret_access_key>
                 <!-- Two replicas mounting one pool: mandatory, else the second mounter refuses to
                      attach (PoolMeta ownership check). This is the N-mounter enablement (spec §6). -->
                 <content_addressed_allow_shared_pool>1</content_addressed_allow_shared_pool>
