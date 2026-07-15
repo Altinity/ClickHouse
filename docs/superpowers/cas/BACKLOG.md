@@ -158,6 +158,8 @@ These are real scale/budget findings; most are variants of "O(N) GC / per-op amp
 - **[03-writer-protocol B172 status]** — DOC — Still lists S3-staging blob upload as TODO; opt-in S3-native staging landed. Update.
 - **[codecs.md standardization]** — DOC (proposed) — Complete the magic table (`OwnerProto`/`ServerEpochProto`/`MountLeaseProto`/`FoldSealProto`); decide the `RunRef.checksum` / `PartManifest.payload_digest` CRC-boundary before release; standardize binary version fields (`compatibility_version` vs local `format_version`); type `CARN` record streams at open. `codecs_proposal_v2.md` is the PROPOSED target structure (not adopted; one pre-release cutover).
 - **[README refresh]** — DOC — Release-readiness roll-up still lists items now closed (B31) and open (this backlog); refresh once this grooming lands.
+- **[07-s3-budget §1.3 all-tree cost row]** — DOC — §1.3 claims mutable-file rewrites cost "0 extra S3 ops (code-derived)"; FALSE post-all-tree for the standalone-rewrite case (a `txn_version.txt` CSN fill-in on a committed part is now a full repoint: stage + precommit + promote PUTs). Still true for the initial whole-part INSERT (carry-forward). Substantive cost-accounting rewrite, not find/replace (T11 review 2026-07-15).
+- **[10-backups manifest-sharing rationale]** — DOC — `10-backups.md:287,466` attributes FREEZE manifest-sharing to "mutable per-part fields live in the `RefPayload`"; the sharing *outcome* still holds (same part bytes ⇒ same tree), but the stated *reason* is gone (ordinary content-addressing now, no payload carve-out). Needs a careful rewrite — the dedup claim carries real correctness weight (T11 review 2026-07-15).
 
 ## 13. Minor / polish {#minor}
 

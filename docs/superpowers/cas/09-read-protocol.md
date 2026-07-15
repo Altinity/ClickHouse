@@ -373,11 +373,17 @@ through a dedicated `isMutablePerPartFile`-gated code path today: a force-fresh 
 `resolveRef` that checks the now-always-empty `mutable_files` map, then falls through to the ordinary
 manifest-entry lookup (`Freshness::CachedForLoad`) — the residue of the pre-all-tree design, kept until
 Task 9's schema-deletion sweep removes the `isMutablePerPartFile` predicate and its callers entirely.
-The `CachedForLoad` fallthrough remains safe for read-your-writes because `CachedPartFolderAccess`'s
-write path (every committed-ref mutation, including a repoint) is write-through into the same retained
-view the read consults, validated against a fresh resolve on every hit (the Validate-On-Hit Protocol,
-`CachedPartFolderAccess.h`) — the dedicated force-fresh HEAD these three files used to specifically
-need is no longer load-bearing for them, though the code has not yet been simplified to say so.
+The `CachedForLoad` fallthrough remains safe for read-your-writes, but the load-bearing mechanism is
+`Store::resolveRef` itself, not the view cache: every write path ends in `eraseView`, so the next read
+is a guaranteed cache *miss* that calls `resolveRef` directly — and `resolveRef`'s `allow_stale`
+parameter is a no-op by design (`CasStore.cpp`, the mounted writer is the only writer of the
+namespace's ref state, so it unconditionally reads `rt->state.committed` under `state_mutex`). Since
+`appendRefOps` blocks the writing thread until `applyRefLogTxn` has updated that same mutex-protected
+map, any subsequent same-process read — same or different thread — observes the commit, unconditional
+on freshness mode. (The Validate-On-Hit Protocol of `CachedPartFolderAccess.h` additionally guards
+cache *hits*, but by construction never runs on the post-write miss.) The dedicated force-fresh HEAD
+these three files used to specifically need is no longer load-bearing for them, though the code has
+not yet been simplified to say so.
 
 ### 9.2 Inline tree entries {#inline-tree}
 
