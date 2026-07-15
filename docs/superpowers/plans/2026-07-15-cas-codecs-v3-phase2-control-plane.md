@@ -1817,7 +1817,7 @@ This is a pipelining DAG, NOT detailed plans — each phase gets its own just-in
 
 **Scope:** convert `CasManifestCodec` to a JSON descriptor (one line per entry: `path` + inline `off`/`len` or `blob` ref) followed by a `head -v`-banner raw payload zone, `Always`/`.zst`. Regenerate + verify banners/padding as a deterministic function of the entries (no smuggling). DELETE the embedded `CARN` stream path, `RunKind::ManifestEntries`, and `payload_digest`. Enforce inline caps (1 MiB/entry, 16 MiB total) and the descriptor line cap.
 
-**Consumes:** phase-1 `CasTextFormat` shape; **phase-2 Task 1** wire-value vocabulary (`BlobRef` for large-file entries); **phase-5** — `RunKind::ManifestEntries` and the embedded-stream code are deleted as part of phase 5's run refactor, and phase 6 removes the last consumer. The two phases touch the same `RunKind` enum and the manifest's embedded-stream path.
+**Consumes:** phase-1 `CasTextFormat` shape; **phase-2 Task 1** wire-value vocabulary (`BlobRef` for large-file entries); **phase-5** — CORRECTED at phase-5 JIT planning (2026-07-15): `RunKind::ManifestEntries` and the CARN embedded-stream framing are NOT deleted by phase 5 — `CasManifestCodec` still consumes them with no private framing, so `Core/CasRunFile.{h,cpp}` stays ALIVE through phase 5 (pruned of `seek`/`RunMerger`/dead kinds) as the phase-6-owned embedded-manifest codec; phase 6 deletes it entirely. See the phase-5 plan, FLAG 1.
 
 **Parallel-draftable:** **NO.** Sequence after phase 5: the embedded-`CARN`-stream deletion and `RunKind::ManifestEntries` removal are shared surface. Drafting phase 6 against a not-yet-refactored run layer would race the phase-5 deletions.
 
