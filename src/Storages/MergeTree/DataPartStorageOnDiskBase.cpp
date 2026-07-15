@@ -561,7 +561,9 @@ MutableDataPartStoragePtr DataPartStorageOnDiskBase::freeze(
         /// is part of the single whole-part commit. On a content-addressed disk the part is published
         /// atomically at `commit`; a separate post-clone autocommit `writeFile` of this part file (what
         /// `cloneAndLoadDataPart` does for non-CA disks) would hit the per-file-autocommit guard (B21).
-        /// `cloneAndLoadDataPart` skips its own write when `freeze` already wrote it here.
+        /// `cloneAndLoadDataPart`'s own post-clone write now runs unconditionally (the freeze special
+        /// case was dropped with all-tree Task 10): identical bytes land as a byte-equal repoint
+        /// no-op, differing bytes as a legal repoint.
         if (params.metadata_version_to_write.has_value())
         {
             chassert(!params.keep_metadata_version);
