@@ -54,3 +54,8 @@ counts/lengths/ms-timestamps = numbers; units documented here per object as code
 - A key prefixed `!` is critical: a reader that does not understand it fails closed.
 - Padding zones (blob header pad, manifest banners) are deterministic and verified — no
   unaccounted bytes in any object.
+- `openObject` policy asymmetry: a compressed body under a raw-compression policy is rejected
+  (`CORRUPTED_DATA`), but a NON-zstd body under an `Always` policy is passed through verbatim as
+  canonical text — an intentional uncompressed-repair path, not an "`Always` ⇒ must be compressed"
+  enforcement. In practice the mismatch never arises: `Always` objects are read via a constructed
+  `.zst`-suffixed key, so a raw body is not GETtable at that key.

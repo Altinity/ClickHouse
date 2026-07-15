@@ -46,11 +46,12 @@ GcState decodeGcState(std::string_view data)
     JsonObjectReader r(body_in, KeyStrictness::Tolerant, "gc/state");
 
     GcState state;
+    bool saw_gcs = false;
     String key;
     while (r.nextKey(key))
     {
         if (key == "rnd") state.round = r.readU64String();
-        else if (key == "gcs") state.gc_shards = r.readU64Number();
+        else if (key == "gcs") { state.gc_shards = r.readU64Number(); saw_gcs = true; }
         else if (key == "sg") state.snap_generation = r.readU64String();
         else if (key == "spt") state.snap_pruned_through = r.readU64String();
         else if (key == "sa") state.snap_attempt = r.readU64String();
@@ -59,6 +60,10 @@ GcState decodeGcState(std::string_view data)
         else if (key == "ls") state.lease.seq = r.readU64String();
         else r.skipUnknown(key);
     }
+    /// Fail closed on an absent gcs: the writer always emits it, so a missing key means a corrupt object.
+    /// Do NOT silently keep the struct default (1) — that would hide corruption (no-fallback principle).
+    if (!saw_gcs)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS gc/state: missing gcs");
     if (state.gc_shards == 0)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS gc/state: gc_shards must be >= 1");
     if (!body_in.eof() || !in.eof())

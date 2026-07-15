@@ -316,11 +316,9 @@ TEST(CasPoolMeta, CreateThenReopen)
 TEST(CasPoolMeta, FailClosed)
 {
     Layout layout("p");
-    /// Garbage bytes that are not a valid protobuf pool-meta => CORRUPTED_DATA (createOrValidate path).
-    /// The converged-header future-compat fail-closed (compatibility_version > G_BUILD =>
-    /// UNKNOWN_FORMAT_VERSION) is covered at the codec level by CasHeaderGolden.PoolMetaFailClosedOnGarbage;
-    /// a future object is now a VALID protobuf with a higher header.compatibility_version, not a magic
-    /// prefix, so it cannot be hand-crafted here without the proto headers.
+    /// Garbage bytes are not a valid cas_pool_meta text object => CORRUPTED_DATA at the header line
+    /// (createOrValidate path). The future-version fail-closed (v > G_BUILD => UNKNOWN_FORMAT_VERSION)
+    /// is exercised at the codec level by the battery's per-row v+1 gate.
     auto b2 = std::make_shared<InMemoryBackend>();
     b2->putIfAbsent(layout.poolMetaKey(), "garbage");
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,

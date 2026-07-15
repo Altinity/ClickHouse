@@ -85,6 +85,16 @@ TEST(CasGcStateFormat, RejectsZeroGcShards)
     EXPECT_THROW(decodeGcState(bad), DB::Exception);
 }
 
+TEST(CasGcStateFormat, RejectsAbsentGcShards)
+{
+    /// An absent gcs key must fail closed (the writer always emits it) rather than silently defaulting
+    /// to the struct's gc_shards = 1 — a missing shard count means a corrupt object, not "use the floor".
+    const String bad = "{\"type\":\"cas_gc_state\",\"v\":3}\n"
+                       "{\"rnd\":\"0\",\"sg\":\"0\",\"spt\":\"0\",\"sa\":\"0\",\"msc\":\"\","
+                       "\"lo\":\"00000000000000000000000000000000\",\"ls\":\"0\"}\n";
+    EXPECT_THROW(decodeGcState(bad), DB::Exception);
+}
+
 TEST(CasGcStateFormat, GarbageFailsClosed)
 {
     EXPECT_THROW(decodeGcState(String("")), DB::Exception);
