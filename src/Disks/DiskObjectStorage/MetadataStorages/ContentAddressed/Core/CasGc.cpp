@@ -1,4 +1,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasTextFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBackendListing.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobMeta.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEvent.h>
@@ -535,7 +537,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     for (auto & [shard, log] : outcomes)
     {
         const String key = layout.outcomesKey(generation, attempt, new_round, shard);
-        const String body = encodeOutcomeLog(log);
+        const String body = sealObject(FormatId::GcOutcomes, encodeOutcomeLog(log));
         if (backend.putIfAbsent(key, body).outcome == PutOutcome::PreconditionFailed)
         {
             const auto existing = backend.get(key);
@@ -544,7 +546,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
                     "CAS gc: outcome log at {} vanished between putIfAbsent and read", key);
             if (existing->bytes != body)
             {
-                try { log = decodeOutcomeLog(existing->bytes); }
+                try { log = decodeOutcomeLog(openObject(FormatId::GcOutcomes, existing->bytes)); }
                 catch (const Exception & e)
                 {
                     throw Exception(ErrorCodes::ABORTED,

@@ -1,19 +1,19 @@
 #pragma once
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobDigest.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobRef.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEnvelope.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasToken.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEnvelope.h>
 #include <base/types.h>
-#include <base/extended_types.h>
+#include <cstdint>
 #include <string_view>
 #include <vector>
 
 namespace DB::Cas
 {
 
-/// Retire outcomes (spec §7 R4) — what the recheck decided per retired entry. One object per
-/// gc/gen/<generation>/attempt/<attempt>/outcomes/<round>/<shard>; written once (`putIfAbsent` —
-/// idempotent replay reads and verifies). 412-saves (replaced) are a health metric.
+/// Retire outcomes (spec §7 R4): what the recheck decided per retired entry. One object per
+/// `gc/gen/{g}/attempt/{a}/outcomes/{round}/{shard}`, written once. v3 text: header line + one flat
+/// JSON record per entry (insertion order) + {"n":count} trailer; Always-compressed (.zst key).
 enum class OutcomeKind : uint8_t
 {
     Deleted = 1,    /// exact-token delete landed
@@ -30,10 +30,6 @@ struct OutcomeEntry
     OutcomeKind outcome = OutcomeKind::Spared;
 };
 
-/// Outcome log (`GcOutcomeLogProto`, magic CAGO), one object per
-/// gc/gen/<generation>/attempt/<attempt>/outcomes/<round>/<shard>: a `CasHeader` followed by a
-/// repeated `GcOutcomeEntryProto` list (kind/hash/token/token_type/outcome/hash_algo per entry, in
-/// insertion order).
 struct OutcomeLog
 {
     std::vector<OutcomeEntry> entries;

@@ -2,6 +2,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobHasher.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEnvelope.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestId.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRefIds.h>
 #include <Common/Exception.h>
@@ -369,10 +370,13 @@ public:
     /// source-edge runs as kCondemned rows + the fold seal's condemned_summary, so there is no separate
     /// retired-list object key. The `retired/` subtree is never written or read.)
 
-    /// Outcomes key: <prefix>/gc/gen/<generation>/attempt/<attempt>/outcomes/<round>/<shard>
+    /// Outcomes key: <prefix>/gc/gen/<generation>/attempt/<attempt>/outcomes/<round>/<shard>.zst
+    /// The `.zst` suffix comes from the traits table (cas_gc_outcomes is the one Always-compressed
+    /// control object): a constructed key names the compressed object deterministically, no body sniff.
     String outcomesKey(uint64_t generation, uint64_t attempt, uint64_t round, uint64_t shard) const
     {
-        return gcGenAttemptPrefix(generation, attempt) + "outcomes/" + std::to_string(round) + "/" + std::to_string(shard);
+        return gcGenAttemptPrefix(generation, attempt) + "outcomes/" + std::to_string(round) + "/" + std::to_string(shard)
+            + String(storedSuffix(FormatId::GcOutcomes));
     }
 
     /// Prefix that covers every root-shard manifest and namespace file (GC round discovery).
