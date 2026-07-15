@@ -254,3 +254,14 @@ TEST(CasZstdArm, SealOpenPolicyAndCaps)
     corrupted[corrupted.size() / 2] ^= 0x01;
     expectCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { openObject(FormatId::RefSnapshot, corrupted); });
 }
+
+TEST(CasTextValueEscaping, ForwardSlashPinnedUnescaped)
+{
+    /// Goes RED if the global escape_forward_slashes default ever leaks back into CAS string values.
+    /// CAS values are dense with '/' (ref-paths, fold-seal keys); their bytes must be CAS-owned so
+    /// cas_fold_seal byte-determinism and every golden text file are independent of the global default.
+    DB::WriteBufferFromOwnString out;
+    writeStringValue(out, "ns/shard/all_1_2_0");
+    out.finalize();
+    EXPECT_EQ(out.str(), "\"ns/shard/all_1_2_0\"");
+}

@@ -33,7 +33,17 @@ namespace
 {
 const FormatSettings & jsonWriteSettings()
 {
-    static const FormatSettings settings;
+    /// CAS owns the JSON escaping alphabet for its text codecs — NOT the ClickHouse-wide default.
+    /// writeJSONString consults FormatSettings::JSON::escape_forward_slashes (default true); a '/'
+    /// in a CAS string value (ref-paths, fold-seal map keys "ns/shard", run keys) must render as
+    /// '/', not '\/'. cas_fold_seal byte-determinism (putDeterministicArtifact retry-equality) and
+    /// every golden text file depend on this being independent of the global default (Phase-1 review).
+    static const FormatSettings settings = []
+    {
+        FormatSettings s;
+        s.json.escape_forward_slashes = false;
+        return s;
+    }();
     return settings;
 }
 
@@ -74,6 +84,11 @@ void writeU64StringValue(WriteBuffer & out, uint64_t v)
     writeChar('"', out);
     writeIntText(v, out);
     writeChar('"', out);
+}
+
+void writeBoolValue(WriteBuffer & out, bool v)
+{
+    writeCString(v ? "true" : "false", out);
 }
 
 void closeObject(WriteBuffer & out, bool & first)

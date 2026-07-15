@@ -25,6 +25,8 @@ void writeKey(WriteBuffer & out, std::string_view key, bool & first);
 void writeStringValue(WriteBuffer & out, std::string_view s);
 void writeHex128Value(WriteBuffer & out, const UInt128 & v);
 void writeU64StringValue(WriteBuffer & out, uint64_t v);
+/// Writes a bare JSON bool literal (true/false); pairs with JsonObjectReader::readBool.
+void writeBoolValue(WriteBuffer & out, bool v);
 /// Writes '}' ("{}" when no key was written).
 void closeObject(WriteBuffer & out, bool & first);
 
