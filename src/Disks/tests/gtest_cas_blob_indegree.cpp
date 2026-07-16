@@ -25,6 +25,10 @@ BlobRef bh(uint64_t n) { return BlobRef{BlobHashAlgo::CityHash128, BlobDigest::f
 /// NOT format constants — the SourceEdge run is a plain NDJSON stream (`CasRecordStreamFormat`) with no
 /// block framing of its own — they only pin the same byte-size scale the (now-deleted, codecs-v3 phase 6)
 /// `CasRunFile` block codec used, so the multi-block-sized fixtures below stay meaningfully large.
+/// (Previously read straight off `CasRunFile.h`'s own `kRunTargetBlockSize`/`kRunHardCapBlockSize`; this
+/// file's `#include` of that header looked removable when `CasRunFile` was deleted in the phase-6 cutover,
+/// but these two thresholds turned out to be the only remaining users — hence the local, explicitly-legacy
+/// copies here instead of a dangling include. Values unchanged.)
 constexpr uint32_t kLegacyBlockSize = 256u * 1024u;
 constexpr uint32_t kLegacyHardCapBlockSize = 1024u * 1024u;
 }
