@@ -4,7 +4,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasGcStateFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRunFile.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasRecordStreamFormat.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <IO/WriteBufferFromString.h>
@@ -21,6 +20,13 @@ UInt128 s(uint64_t n) { return UInt128(n); }   // source-edge id
 /// A `BlobRef` (CityHash128) for the same literal `n` — every existing test's `BlobDelta.ref` /
 /// `BlobCandidate.ref` / `inDegreeInRuns` argument is a `BlobRef` as of Phase 3 T3.
 BlobRef bh(uint64_t n) { return BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(UInt128(n))}; }
+
+/// Scale thresholds for the "the run genuinely spans several blocks" sanity assertions below. These are
+/// NOT format constants — the SourceEdge run is a plain NDJSON stream (`CasRecordStreamFormat`) with no
+/// block framing of its own — they only pin the same byte-size scale the (now-deleted, codecs-v3 phase 6)
+/// `CasRunFile` block codec used, so the multi-block-sized fixtures below stay meaningfully large.
+constexpr uint32_t kLegacyBlockSize = 256u * 1024u;
+constexpr uint32_t kLegacyHardCapBlockSize = 1024u * 1024u;
 }
 
 TEST(CasBlobInDegree, FoldStartsFromEmptyPriorGeneration)
@@ -590,8 +596,8 @@ TEST(CasBlobInDegree, FoldStreamsPriorRunBlockBounded)
     ASSERT_TRUE(gen1_run.has_value());
     const String gen1_run_bytes = gen1_run->bytes;
     /// Sanity: the prior run really spans several blocks (else the block-bounded assertions are
-    /// vacuous). Blocks seal at kRunTargetBlockSize (256KB); ~820KB is 3-4 blocks.
-    ASSERT_GT(gen1_run_bytes.size(), static_cast<size_t>(kRunTargetBlockSize) * 3);
+    /// vacuous). Blocks seal at kLegacyBlockSize (256KB); ~820KB is 3-4 blocks.
+    ASSERT_GT(gen1_run_bytes.size(), static_cast<size_t>(kLegacyBlockSize) * 3);
 
     /// Reset counters and fold gen 2 with a small delta: remove one edge and add another. The prior
     /// gen-1 run must be consumed via the streaming cursor (head + tail get + body getStream + per-seq
@@ -624,7 +630,7 @@ TEST(CasBlobInDegree, FoldStreamsPriorRunBlockBounded)
     /// large runs — ~13k blocks — spill the footer past the probe and add one exact-footer get; a note
     /// for that regime lives in the streaming reader's open comment).
     EXPECT_LE(backend.maxRangedGetLen(gen1_run_key),
-              static_cast<uint64_t>(kRunHardCapBlockSize) + 64u * 1024u);
+              static_cast<uint64_t>(kLegacyHardCapBlockSize) + 64u * 1024u);
     /// Streaming open touches the prior run's tail probe (and at most one exact-footer get); it is never
     /// re-materialized whole.
     EXPECT_LE(backend.getCount(gen1_run_key), 2u);
@@ -664,7 +670,7 @@ TEST(CasBlobInDegree, ZeroInDegreeStreamsBlockBounded)
     const auto gen2_run = backend.get(gen2_run_key);
     ASSERT_TRUE(gen2_run.has_value());
     /// Sanity: the run genuinely spans several blocks (else the block-bounded assertions are vacuous).
-    ASSERT_GT(gen2_run->bytes.size(), static_cast<size_t>(kRunTargetBlockSize) * 3);
+    ASSERT_GT(gen2_run->bytes.size(), static_cast<size_t>(kLegacyBlockSize) * 3);
 
     backend.resetCounts();
     const auto zero_c = zeroInDegree(backend, runs2_c);
@@ -682,7 +688,7 @@ TEST(CasBlobInDegree, ZeroInDegreeStreamsBlockBounded)
     EXPECT_GE(backend.getStreamCount(gen2_run_key), 1u);
     /// Every ranged-get window stays within one block + the footer allowance (the seam memory bound).
     EXPECT_LE(backend.maxRangedGetLen(gen2_run_key),
-              static_cast<uint64_t>(kRunHardCapBlockSize) + 64u * 1024u);
+              static_cast<uint64_t>(kLegacyHardCapBlockSize) + 64u * 1024u);
     /// Streaming open touches the tail probe (and at most one exact-footer get); never re-materialized whole.
     EXPECT_LE(backend.getCount(gen2_run_key), 2u);
 }

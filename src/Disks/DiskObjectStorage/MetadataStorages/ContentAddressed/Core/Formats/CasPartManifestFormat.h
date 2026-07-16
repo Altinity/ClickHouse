@@ -14,8 +14,8 @@ namespace DB::Cas
 
 /// v3 text codec for `cas_part_manifest` (codecs-v3 phase 6): the immutable root-local part-manifest
 /// body, replacing the legacy "CAPT"-magic binary codec (`CasManifestCodec.h`/`.cpp`, an embedded
-/// "CARN"-framed `RunFile` of entries; retired by a later task of this phase — the interface here is
-/// unchanged, only the wire shape is new). Text shape (`PayloadHybrid` family, spec §text-shape):
+/// "CARN"-framed `RunFile` of entries) — both were retired in the phase-6 cutover task (the interface
+/// here is unchanged, only the wire shape is new). Text shape (`PayloadHybrid` family, spec §text-shape):
 ///
 ///   header line                 {"type":"cas_part_manifest","v":N}
 ///   descriptor meta line         {"me","mb","mo"} (the ManifestRef, shared rendering with

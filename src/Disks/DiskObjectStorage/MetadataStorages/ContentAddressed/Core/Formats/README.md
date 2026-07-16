@@ -18,7 +18,7 @@ shape. Design: `docs/superpowers/specs/2026-07-15-cas-codecs-v3-design.md`; refe
 | `cas/refs/<ns>/…_log` | ref transaction log | `CasRefLogFormat` (`.zst`) | writer commit path |
 | `cas/refs/<ns>/…_snap` | complete ref table | `CasRefSnapshotFormat` (`.zst`) | writer/GC fold |
 | `cas/refs/<ns>/…` cleanup marker | key-only presence marker (empty body) | — | GC |
-| `cas/manifests/<ns>/<epoch>/<seq>/<ordinal>` | part manifest | `CasPartManifestFormat`* | part build |
+| `cas/manifests/<ns>/<epoch>/<seq>/<ordinal>` | part manifest | `CasPartManifestFormat` | part build |
 | blob keys (`CasLayout::blobKey`) | blob envelope + payload | `CasBlobEnvelopeFormat` | uploads |
 | blob-meta keys (`CasLayout::blobMetaKey`) | freshness sidecar | `CasBlobMetaFormat` | dedup/GC |
 | `gc/state`, `gc/hb` | GC state / leader heartbeat | `CasGcStateFormat` | GC |
@@ -28,16 +28,21 @@ shape. Design: `docs/superpowers/specs/2026-07-15-cas-codecs-v3-design.md`; refe
 | `gc/server-roots/<srid>/{owner,epoch,mount}` | server-root singletons | `CasServerRootFormats` | mount |
 | `roots/…` | raw passthrough (verbatim) | — (never interpreted) | upper layers |
 
-`*` = still the legacy binary codec; the row flips as each phase of the migration lands. **Phase 2
-(control plane) is DONE**: `cas_pool_meta`, `cas_gc_state` + `cas_gc_hb`, `cas_gc_outcomes`,
+**Phase 2 (control plane) is DONE**: `cas_pool_meta`, `cas_gc_state` + `cas_gc_hb`, `cas_gc_outcomes`,
 `cas_fold_seal`, and `cas_owner`/`cas_epoch`/`cas_mount_lease` are text, and the protobuf codecs +
 the CA protobuf build target are removed. **Phase 5 (runs) is DONE**: the GC source-edge data plane
 (`cas_run`) is sorted NDJSON via `CasRecordStreamFormat` (streamed, no seek), integrity is the
 whole-file seal-checksum, and the part-manifest cleanup run + `RunFileReader::seek` + `RunMerger` are
-gone — `CasRunFile` survives only as the phase-6-owned embedded part-manifest (`ManifestEntries`)
-codec. Phases 4 (blob meta) and 7 (blob envelope) are likewise text. **Phase 3 (refsnaplog) is
+gone. Phases 4 (blob meta) and 7 (blob envelope) are likewise text. **Phase 3 (refsnaplog) is
 DONE**: `cas_ref_log` (`CasRefLogFormat`) and `cas_ref_snap` (`CasRefSnapshotFormat`) are canonical
-JSON text sealed Always/`.zst`. Remaining `*` rows = phase 6 (part manifest).
+JSON text sealed Always/`.zst`. **Phase 6 (part manifest) is DONE**: `cas_part_manifest` is the
+`PayloadHybrid` text shape (header + descriptor meta + sorted entry records + `{"n":…}` trailer +
+banner payload zone) via `CasPartManifestFormat`, keyed `.zst` (was `.proto`); the embedded "CAPT"
+binary header and the "CARN" block-framed `RunFile` of manifest entries are gone, and with them the
+whole binary run-codec family — both the standalone `cas_run` binary form phase 5 replaced and the
+embedded manifest-entries binary form phase 6 replaced — `Core/CasRunFile.{h,cpp}` is deleted. This
+was the last legacy-binary row in the bucket map above: the object-inventory migration to text is
+complete.
 
 ## Codec table
 

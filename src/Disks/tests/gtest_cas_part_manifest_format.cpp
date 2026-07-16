@@ -348,3 +348,83 @@ TEST(CasPartManifestFormat, InlineRecordIlMismatchWithPayloadZoneBannerFailsClos
     bad.replace(pos, needle.size(), "\"il\":13");
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodePartManifest(bad); });
 }
+
+/// ==== migrated from gtest_cas_manifest_codec.cpp (deleted in the phase-6 binary->text cutover,
+/// Task 3): these exercise refMatchesBody/manifestNamespaceMatches/findEntry/entryRange, pure
+/// functions carried over verbatim from the retired binary codec (untouched by the wire-shape
+/// migration) — reusing this file's own sample() fixture instead of reintroducing a second one. ====
+
+TEST(CasPartManifestFormat, RefMatchesBodyAcceptsExactRef)
+{
+    const PartManifest m = sample();
+    /// The journal ref equals the body ref -> true.
+    EXPECT_TRUE(refMatchesBody(m.ref, m));
+}
+
+TEST(CasPartManifestFormat, RefMatchesBodyRejectsEachFieldMismatch)
+{
+    const PartManifest m = sample();
+    ManifestRef wrong_writer = m.ref; wrong_writer.writer_epoch = m.ref.writer_epoch + 1;
+    ManifestRef wrong_seq = m.ref;    wrong_seq.build_sequence = m.ref.build_sequence + 1;
+    ManifestRef wrong_inst = m.ref;   wrong_inst.manifest_ordinal = m.ref.manifest_ordinal + 1;
+    EXPECT_FALSE(refMatchesBody(wrong_writer, m));
+    EXPECT_FALSE(refMatchesBody(wrong_seq, m));
+    EXPECT_FALSE(refMatchesBody(wrong_inst, m));
+}
+
+TEST(CasPartManifestFormat, ManifestNamespaceMatchesAcceptsOwningNs)
+{
+    const PartManifest m = sample();
+    EXPECT_TRUE(manifestNamespaceMatches(m.root_namespace_id, m));
+}
+
+TEST(CasPartManifestFormat, ManifestNamespaceMatchesRejectsForeignNs)
+{
+    const PartManifest m = sample();
+    /// sample()'s namespace is "00/aa@cas@" — pick a genuinely foreign one and a strict-prefix one.
+    EXPECT_FALSE(manifestNamespaceMatches(RootNamespace("00/bb@cas@"), m));
+    /// A namespace that is a prefix but not equal is still a mismatch (no loose comparison).
+    EXPECT_FALSE(manifestNamespaceMatches(RootNamespace("00/aa"), m));
+}
+
+TEST(CasPartManifestFormat, FindEntryBinarySearch)
+{
+    std::vector<ManifestEntry> entries;
+    for (const char * p : {"a.txt", "b/inner.txt", "b/z.txt", "c.txt"})
+    {
+        ManifestEntry e;
+        e.path = p;
+        e.placement = EntryPlacement::Inline;
+        e.inline_bytes = "v";
+        entries.push_back(e);
+    }
+    EXPECT_NE(findEntry(entries, "a.txt"), nullptr);
+    EXPECT_EQ(findEntry(entries, "a.txt")->path, "a.txt");
+    EXPECT_NE(findEntry(entries, "c.txt"), nullptr);          /// last element
+    EXPECT_EQ(findEntry(entries, "b"), nullptr);              /// prefix of a path, not a path
+    EXPECT_EQ(findEntry(entries, "zzz"), nullptr);            /// past the end
+    EXPECT_EQ(findEntry({}, "a"), nullptr);                   /// empty
+}
+
+TEST(CasPartManifestFormat, EntryRangeContiguousPrefix)
+{
+    std::vector<ManifestEntry> entries;
+    for (const char * p : {"a.txt", "p.proj/data.bin", "p.proj/x.txt", "q.txt"})
+    {
+        ManifestEntry e;
+        e.path = p;
+        e.placement = EntryPlacement::Inline;
+        e.inline_bytes = "v";
+        entries.push_back(e);
+    }
+    auto [first, last] = entryRange(entries, "p.proj/");
+    ASSERT_EQ(last - first, 2);
+    EXPECT_EQ(first->path, "p.proj/data.bin");
+    EXPECT_EQ((last - 1)->path, "p.proj/x.txt");
+
+    auto [w1, w2] = entryRange(entries, "");                  /// empty prefix = whole span
+    EXPECT_EQ(w2 - w1, 4);
+
+    auto [n1, n2] = entryRange(entries, "zzz/");              /// no match
+    EXPECT_EQ(n1, n2);
+}

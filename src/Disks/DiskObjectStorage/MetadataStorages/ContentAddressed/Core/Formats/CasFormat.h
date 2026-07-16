@@ -53,8 +53,14 @@ enum class FormatId : uint16_t
     /// 10 (RootsRegistry) deleted in Task 4 — discovery authority moved to LIST(cas/refs/).
     GcOutcomes = 11,
     /// Phase 1a (CA GC root-local part-manifest redesign):
-    PartManifest = 12,    /// immutable root-local part manifest body; magic "CAPT" (see plan note: "CAPM" is taken by PoolMeta)
-    RunFile = 13,         /// dense block-framed sorted binary data-plane run; magic "CARN"
+    PartManifest = 12,    /// immutable root-local part manifest body (`cas_part_manifest`); PayloadHybrid
+                          /// text codec (`Formats/CasPartManifestFormat`), no magic — retired the "CAPT"
+                          /// binary framing in the codecs-v3 phase-6 cutover.
+    RunFile = 13,         /// backs the `cas_run` GC source-edge NDJSON record stream
+                          /// (`Formats/CasRecordStreamFormat`); no magic, `PinnedRaw` (no compression).
+                          /// The id number is inherited from the original binary block-framed run codec
+                          /// (`CasRunFile.{h,cpp}`, magic "CARN") that this FormatId once named; that
+                          /// codec is deleted as of the codecs-v3 phase-6 cutover.
     FoldSeal = 14,        /// write-once gc/gen/<gen>/fold_seal (coverage + blob_target/cleanup runs); magic "CAFS"
     /// 15 (CompletionSeal) retired with the one-pass ack-floor round (fence/recheck/delete/trim phases
     /// removed) — the fold seal is now the sole per-generation coverage record.

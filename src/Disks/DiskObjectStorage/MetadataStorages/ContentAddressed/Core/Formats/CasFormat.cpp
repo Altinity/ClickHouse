@@ -60,8 +60,6 @@ uint32_t magicFor(FormatId id)
         case FormatId::PoolMeta:      return 0x4D504143u; /// "CAPM"
         case FormatId::GcState:       return 0x54474143u; /// "CAGT"
         case FormatId::GcOutcomes:    return 0x4F474143u; /// "CAGO"
-        case FormatId::PartManifest:   return 0x54504143u; /// "CAPT" (NOT "CAPM"; that is PoolMeta)
-        case FormatId::RunFile:        return 0x4E524143u; /// "CARN"
         case FormatId::FoldSeal:       return 0x53464143u; /// "CAFS"
         case FormatId::Owner:          return 0x574F4143u; /// "CAOW"
         case FormatId::ServerEpoch:    return 0x50454143u; /// "CAEP"
@@ -71,6 +69,8 @@ uint32_t magicFor(FormatId id)
         case FormatId::RefSnapshot:
         case FormatId::BlobMeta:
         case FormatId::GcHeartbeat:
+        case FormatId::PartManifest:
+        case FormatId::RunFile:
             break;
     }
     throw Exception(ErrorCodes::LOGICAL_ERROR,

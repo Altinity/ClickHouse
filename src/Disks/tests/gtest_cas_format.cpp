@@ -71,17 +71,17 @@ TEST(CasFormat, MagicForEachMutableObjectClass)
     EXPECT_EQ(le32toStr(magicFor(FormatId::PoolMeta)),      "CAPM");
     EXPECT_EQ(le32toStr(magicFor(FormatId::GcState)),       "CAGT");
     EXPECT_EQ(le32toStr(magicFor(FormatId::GcOutcomes)),    "CAGO");
-    EXPECT_EQ(le32toStr(magicFor(FormatId::PartManifest)),    "CAPT");
-    EXPECT_EQ(le32toStr(magicFor(FormatId::RunFile)),         "CARN");
     EXPECT_EQ(le32toStr(magicFor(FormatId::FoldSeal)),        "CAFS");
-    /// Guard the documented collision: PartManifest must NOT reuse PoolMeta's "CAPM".
-    EXPECT_NE(magicFor(FormatId::PartManifest), magicFor(FormatId::PoolMeta));
 }
 
 TEST(CasFormat, MagicForUndefinedClassThrowsLogicalError)
 {
     /// Roster has no mutable protobuf magic defined — it must throw LOGICAL_ERROR. (Tree and GcSnap
-    /// were removed from the enum entirely in the rev. 15 part-manifest redesign.)
+    /// were removed from the enum entirely in the rev. 15 part-manifest redesign.) `PartManifest` and
+    /// `RunFile` joined this "no magic" group in the codecs-v3 phase-6 cutover — both are pure text
+    /// formats now (`CasPartManifestFormat`, `CasRecordStreamFormat`) with no on-disk magic bytes; their
+    /// former "CAPT"/"CARN" binary magics are gone along with the deleted `CasRunFile`/`CasManifestCodec`
+    /// binary codecs.
     try
     {
         magicFor(FormatId::Roster);
@@ -102,8 +102,6 @@ TEST(CasFormat, MagicsAreDistinct)
         magicFor(FormatId::PoolMeta),
         magicFor(FormatId::GcState),
         magicFor(FormatId::GcOutcomes),
-        magicFor(FormatId::PartManifest),
-        magicFor(FormatId::RunFile),
         magicFor(FormatId::FoldSeal),
     };
     for (size_t i = 0; i < std::size(magics); ++i)
