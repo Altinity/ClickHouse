@@ -581,6 +581,15 @@ void MultipleDisksObjectStorageTransaction::copyFile(const std::string & from_fi
 
 void DiskObjectStorageTransaction::commit()
 {
+    /// [TXN-ONE-PIPELINE] An eager staging-overlay transaction (e.g. CA) must route every mutating method
+    /// straight to the metadata transaction at call time and keep this queue empty. A non-empty queue here
+    /// means a mutating method bypassed `dispatch` — which would re-introduce the two-timeline split this
+    /// design eliminates. Fail closed with a real throw (NOT chassert, which is a no-op in release builds).
+    if (metadata_storage->transactionIsStagingOverlay() && !operations_to_execute.empty())
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "An eager staging-overlay transaction must not queue deferred operations "
+            "(a mutating method bypassed dispatch): {} queued", operations_to_execute.size());
+
     auto component_guard = Coordination::setCurrentComponent("DiskObjectStorageTransaction::commit");
     for (size_t i = 0; i < operations_to_execute.size(); ++i)
     {
@@ -625,6 +634,13 @@ void DiskObjectStorageTransaction::commit()
 
 TransactionCommitOutcomeVariant DiskObjectStorageTransaction::tryCommit(const TransactionCommitOptionsVariant & options)
 {
+    /// [TXN-ONE-PIPELINE] See commit(): an eager staging-overlay transaction must never queue deferred
+    /// operations. Fail closed (real throw, not chassert) if a mutating method bypassed `dispatch`.
+    if (metadata_storage->transactionIsStagingOverlay() && !operations_to_execute.empty())
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "An eager staging-overlay transaction must not queue deferred operations "
+            "(a mutating method bypassed dispatch): {} queued", operations_to_execute.size());
+
     for (size_t i = 0; i < operations_to_execute.size(); ++i)
     {
         try
