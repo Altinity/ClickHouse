@@ -123,6 +123,46 @@ TEST(CaTransactionLockScope, CommittedRefMoveDoesNotSpuriouslyPublish)
     EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/all_2_2_0"));
 }
 
+/// [TXN-ONE-PIPELINE] B183 migration gate: a scratch ref durably published at the part's own (tmp)
+/// BUILD path by a nested sub-storage must be dropped on the staged-source tmp->final finalize, and
+/// commit() must publish the AUTHORITATIVE staged manifest (not the scratch content). This mirrors
+/// `createTemporaryTextIndexStorage`, which publishes scratch under the new_data_part's STILL-TMP
+/// relative path (`MergeTask.cpp` uses `getDataPartStorage().getRelativePath()`) — i.e. the SOURCE of
+/// the tmp->final rename, which is exactly what `moveDirectory`'s `dropRefIfPresent(src->refKey())`
+/// drops. (The plan's destination-path scenario would not reproduce this: `publishStaging`'s
+/// repoint-merge would carry the scratch file forward.)
+TEST(CaTransactionLockScope, StagedFinalizeDropsForeignScratchRef)
+{
+    auto storage = openTxStorage();
+
+    /// A SEPARATE transaction (the nested text-index sub-storage) durably publishes a committed ref at
+    /// the tmp BUILD path holding only a scratch file under `text_index_tmp/`.
+    {
+        auto scratch_tx = storage->createTransaction();
+        writeFileTx(*scratch_tx, "uui/uuid-7/tmp_merge_all_1_1_0/text_index_tmp/scratch.bin", "scratch");
+        scratch_tx->commit(DB::NoCommitOptions{});
+    }
+    ASSERT_TRUE(storage->existsDirectory("uui/uuid-7/tmp_merge_all_1_1_0"));
+
+    /// The real part build: stage the authoritative data.bin under the SAME tmp path, then finalize
+    /// tmp->final. The staged-source finalize drops the foreign scratch ref at the tmp path.
+    auto tx = storage->createTransaction();
+    writeFileTx(*tx, "uui/uuid-7/tmp_merge_all_1_1_0/data.bin", std::string(50000, 'D'));
+    tx->moveDirectory("uui/uuid-7/tmp_merge_all_1_1_0", "uui/uuid-7/all_1_1_0");
+    tx->commit(DB::NoCommitOptions{});
+
+    /// The published manifest is the authoritative one (has data.bin), not the scratch ref.
+    const auto ns = storage->liveNamespace("uuid-7");
+    const auto resolved = storage->store()->resolveRef(ns, "all_1_1_0");
+    ASSERT_TRUE(resolved.has_value());
+    const auto manifest = storage->store()->readManifest(resolved->manifest_id);
+    EXPECT_TRUE(findByName(manifest.entries, "data.bin"));
+    EXPECT_FALSE(findByName(manifest.entries, "scratch.bin"));
+
+    /// The foreign scratch ref at the tmp build path is gone (dropped, not carried forward).
+    EXPECT_FALSE(storage->existsDirectory("uui/uuid-7/tmp_merge_all_1_1_0"));
+}
+
 /// Plan 2d: a small eager metadata file (checksums.txt) is staged INLINE — it rides the single tree
 /// object (one-GET part open) — while per-column data (data.bin) stays a standalone Blob (preserving
 /// column-read selectivity). The inlined file is still readable through the normal read path.
