@@ -726,6 +726,18 @@ private:
     /// synchronization is CacheBase-internal). Declared after event_sink_, pool_backend, meta, and
     /// pool_layout so it is constructed after (and destroyed before) all four.
     CasManifestReader manifest_reader;
+    /// The writer ref-log / ref-table subsystem (spec §Decomposition), extracted from Store. Owns the
+    /// whole-table ref cache, the append lane + wedge protocol, snapshot publication, stale-precommit
+    /// sweep, cache-budget eviction, the remount/shutdown drain, and the CAS retry controller -- with
+    /// the two ref mutexes. Declared AFTER event_sink_, pool_backend, meta, pool_layout, plain_objects
+    /// and manifest_reader so it is constructed after (and destroyed before) every dependency it is
+    /// injected with; its callbacks reach mount/watermark state now owned by `mount_runtime` (declared
+    /// AFTER this member), but they capture `Store` and run only at runtime after the Store is fully
+    /// constructed -- exactly as in the pre-3.5 layout, where the mount raw-members these callbacks reach
+    /// were also declared after `ref_ledger`. `~Store` still calls `ref_ledger.drainRefLanesForShutdown`
+    /// explicitly, sequenced between `mount_runtime.stopRemountThread()` and
+    /// `mount_runtime.finishTeardown()` exactly as before.
+    CasRefLedger ref_ledger;
     /// The mount / write-fence / build-watermark / self-remount runtime (spec §Decomposition), extracted
     /// from Store (source-layout §3.5). Owns the `MountLeaseKeeper`, the local `MountFence`, the per-server
     /// build watermark (`process_epoch` + the `builds_mutex`-guarded seq/registry) and its in-flight-build
@@ -735,23 +747,16 @@ private:
     /// + a `remount_attempt` callback (== `Store::tryRemountOnce`, which STAYS on Store: the claim/recovery
     /// ORCHESTRATION drives these owned primitives).
     ///
-    /// Declared BEFORE `ref_ledger` (source-layout §3.5, a deliberate reversal of the pre-3.5 raw-member
-    /// order): `ref_ledger` is injected with callbacks that reach INTO mount state (live epoch, the append/
-    /// publish fence predicate, the boot clock, `mayMutate`, the unclean-epoch high-water-mark), so
-    /// `mount_runtime` must OUTLIVE it. Reverse-of-declaration destruction makes `mount_runtime` destroyed
-    /// LAST. Declared after event_sink_, pool_backend, config and pool_layout so it is constructed after
-    /// every dependency it is injected with; its own callbacks (fence/on-lost) reach only its own state.
+    /// Declared AFTER `ref_ledger` -- preserving the pre-3.5 relative order VERBATIM (the mount raw-members
+    /// this component replaces all sat after `ref_ledger`), so `mount_runtime` is destroyed FIRST and
+    /// `ref_ledger` LAST. verification-C (2026-07-16): both orders were proven equally safe -- `~Store`
+    /// quiesces both subsystems before ANY member dtor runs (stopRemountThread ->
+    /// ref_ledger.drainRefLanesForShutdown -> mount_runtime.finishTeardown), and the ledger's async paths
+    /// pin `Store::shared_from_this`, so no ledger->mount callback can fire during destruction in either
+    /// order. Both safe ⇒ this is a pure behavior-preserving relocation, so the ORIGINAL order is kept and
+    /// NO member-order change is introduced. Declared after event_sink_, pool_backend, config and
+    /// pool_layout so it is constructed after every dependency it is injected with.
     CasMountRuntime mount_runtime;
-    /// The writer ref-log / ref-table subsystem (spec §Decomposition), extracted from Store. Owns the
-    /// whole-table ref cache, the append lane + wedge protocol, snapshot publication, stale-precommit
-    /// sweep, cache-budget eviction, the remount/shutdown drain, and the CAS retry controller -- with
-    /// the two ref mutexes. Declared AFTER event_sink_, pool_backend, meta, pool_layout, plain_objects,
-    /// manifest_reader and mount_runtime so it is constructed after (and destroyed before) every
-    /// dependency it is injected with; its callbacks reach mount/watermark state now owned by
-    /// `mount_runtime` (invoked only at runtime, after Store is fully constructed).
-    /// `~Store` still calls `ref_ledger.drainRefLanesForShutdown` explicitly, sequenced between
-    /// `mount_runtime.stopRemountThread()` and `mount_runtime.finishTeardown()` exactly as before.
-    CasRefLedger ref_ledger;
 
     /// Serializes `tryRemountOnce` (whose claim/recovery ORCHESTRATION stays on Store). STAYS here with
     /// its guarded critical section (source-layout §3.5): the self-remount thread-lifecycle locks + fence

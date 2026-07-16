@@ -81,22 +81,14 @@ Store::Store(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
     /// later via setEventSink; the reference observes that assignment). Owns the decode cache, built
     /// from the same config bytes the Store ctor used before.
     , manifest_reader(*pool_backend, pool_layout, meta, event_sink_, config.manifest_decode_cache_bytes)
-    /// Mount / write-fence / build-watermark / self-remount runtime (source-layout §3.5). Injected with
-    /// backend/layout + the `MountConfig` slice + `server_root_id` + the event-sink reference + the pool
-    /// `cas_request_budget` + the `remount_attempt` callback (== `Store::tryRemountOnce`, whose claim/
-    /// recovery ORCHESTRATION stays on Store). The callback captures `this`; it is invoked only at runtime
-    /// (post-construction). Declared BEFORE `ref_ledger` (mount outlives ledger — ledger callbacks reach
-    /// mount state), so it is also constructed before it.
-    , mount_runtime(
-          pool_backend, pool_layout, config.mountConfig(), config.server_root_id, event_sink_,
-          config.cas_request_budget,
-          [this] { return tryRemountOnce(); })
     /// Ref-log / ref-table subsystem (source-layout §3.4). Injected with backend/layout + the
     /// RefLedgerConfig slice + the event-sink reference + the pool `cas_request_budget` + the RAW mount
     /// `boot_ms_fn` (for its retry controller), plus callbacks into the mount/watermark state that lives
     /// on `mount_runtime` (reached through Store delegates). The callbacks capture `this`; they are
-    /// invoked only at runtime (post-construction), so referencing `mount_runtime` (declared before
-    /// `ref_ledger`) is safe.
+    /// invoked only at runtime (post-construction), so referencing `mount_runtime` (declared AFTER
+    /// `ref_ledger`, hence constructed after it) is safe -- exactly as the pre-3.5 layout referenced the
+    /// mount raw-members that also followed `ref_ledger`. Declared/constructed BEFORE `mount_runtime`,
+    /// preserving the original member order verbatim (see the header note; verification-C).
     , ref_ledger(
           pool_backend, pool_layout, config.refLedgerConfig(), event_sink_, config.cas_request_budget,
           config.boot_ms_fn,
@@ -109,6 +101,16 @@ Store::Store(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
               { reportImpossibleInterference(key, reason, offending_ns); },
           [this] { return std::static_pointer_cast<void>(shared_from_this()); },
           [this] (const RootNamespace & ns) { cancelInflightBuildsForNamespace(ns); })
+    /// Mount / write-fence / build-watermark / self-remount runtime (source-layout §3.5). Injected with
+    /// backend/layout + the `MountConfig` slice + `server_root_id` + the event-sink reference + the pool
+    /// `cas_request_budget` + the `remount_attempt` callback (== `Store::tryRemountOnce`, whose claim/
+    /// recovery ORCHESTRATION stays on Store). The callback captures `this`; it is invoked only at runtime
+    /// (post-construction). Declared/constructed AFTER `ref_ledger`, preserving the original member order
+    /// verbatim (mount destroyed first, ledger last; both orders proven safe -- see the header note).
+    , mount_runtime(
+          pool_backend, pool_layout, config.mountConfig(), config.server_root_id, event_sink_,
+          config.cas_request_budget,
+          [this] { return tryRemountOnce(); })
 {
     if (config.dedup_cache_bytes > 0)
         dedup_cache = std::make_unique<DedupCache>(
