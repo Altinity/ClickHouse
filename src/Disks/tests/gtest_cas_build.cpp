@@ -8,7 +8,8 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasBlobEnvelopeFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasGcStateFormat.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestCodec.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasPartManifestFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestId.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <IO/HashingReadBuffer.h>
@@ -218,8 +219,8 @@ TEST(CasBuild, StageManifestUsesPerBuildOrdinals)
     EXPECT_EQ(second.ref.manifest_ordinal, 2u);
     /// Canonical hex build directory (spec §Manifest Identifier): `<epoch-hex>-<build-seq-hex>/`.
     const String build_segment = renderRefTxnId(RefTxnId{s->writerEpoch(), build->buildSeq()});
-    EXPECT_EQ(s->layout().manifestKey(first), "p/cas/manifests/test/tbl@cas@/" + build_segment + "/000001.proto");
-    EXPECT_EQ(s->layout().manifestKey(second), "p/cas/manifests/test/tbl@cas@/" + build_segment + "/000002.proto");
+    EXPECT_EQ(s->layout().manifestKey(first), "p/cas/manifests/test/tbl@cas@/" + build_segment + "/000001.zst");
+    EXPECT_EQ(s->layout().manifestKey(second), "p/cas/manifests/test/tbl@cas@/" + build_segment + "/000002.zst");
 
     auto next_build = startBuildFor(s, ns, "all_2_2_0");
     const ManifestId next = next_build->stageManifest({blobManifestEntry("c.bin", "c")});
@@ -1872,7 +1873,7 @@ TEST(CasBuildStageManifestRetry, AmbiguousTimeoutsThenCommitSucceedsWithinBudget
     EXPECT_EQ(b->put_attempts, 3) << "two faulted attempts + the committing third";
     const auto got = b->get(s->layout().manifestKey(id));
     ASSERT_TRUE(got.has_value()) << "the staged manifest body must be durable";
-    EXPECT_EQ(decodePartManifest(got->bytes).ref, id.ref);
+    EXPECT_EQ(decodePartManifest(openObject(FormatId::PartManifest, got->bytes)).ref, id.ref);
 }
 
 /// Ambiguous-but-landed: the FIRST attempt's response is lost AFTER the write actually landed

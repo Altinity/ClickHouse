@@ -1056,7 +1056,7 @@ std::shared_ptr<const PartManifest> Store::readManifestShared(const ManifestId &
             "manifest at {} vanished between head and get — INV-NO-DANGLE", key);
     ProfileEvents::increment(ProfileEvents::CasPartFolderManifestGets);
 
-    PartManifest body = decodePartManifest(object->bytes);
+    PartManifest body = decodePartManifest(openObject(FormatId::PartManifest, object->bytes));
 
     /// refMatchesBody: the journal ManifestRef must equal the body's self-described `ref`. A mismatch
     /// means the ref addresses the WRONG object (spec §Object Identity And Ownership).

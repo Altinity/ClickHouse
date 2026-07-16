@@ -242,7 +242,7 @@ public:
     }
 
     /// Part manifest body key (spec §Manifest Identifier, canonical hex form):
-    ///   <prefix>/cas/manifests/<ns>/<epoch-hex>-<build-seq-hex>/<000001>.proto
+    ///   <prefix>/cas/manifests/<ns>/<epoch-hex>-<build-seq-hex>/<000001>.zst
     /// The build-scoped directory reuses `RefTxnId`'s hex rendering for `{writer_epoch,
     /// build_sequence}` (same durable-epoch fence and hex width as a ref transaction id, per spec --
     /// a different counter with different semantics, not the same identifier). `manifest_ordinal` is a
@@ -256,12 +256,12 @@ public:
              + manifestOrdinalFileName(id.ref.manifest_ordinal);
     }
 
-    /// Inverse of `manifestKey`: parses `<prefix>/cas/manifests/<ns>/<epoch-hex>-<seq-hex>/<NNNNNN>.proto`.
+    /// Inverse of `manifestKey`: parses `<prefix>/cas/manifests/<ns>/<epoch-hex>-<seq-hex>/<NNNNNN>.zst`.
     /// Strict: rejects the old decimal directory shape (it is not two fixed-width hex fields joined by
-    /// '-'), a missing namespace/build/ordinal segment, trailing garbage, a non-`.proto` or wrong-width
-    /// ordinal file, and an out-of-range or non-canonical ordinal. Foreign/malformed keys return
-    /// `std::nullopt`, never throw -- LIST sweep / fsck classify by key shape, not by validity. All
-    /// manifest-path parsing (sweep, fsck) routes through this one function.
+    /// '-'), a missing namespace/build/ordinal segment, trailing garbage, a file not ending in the
+    /// registered suffix or of the wrong width, and an out-of-range or non-canonical ordinal.
+    /// Foreign/malformed keys return `std::nullopt`, never throw -- LIST sweep / fsck classify by key
+    /// shape, not by validity. All manifest-path parsing (sweep, fsck) routes through this one function.
     std::optional<ManifestId> parseManifestKey(std::string_view key) const
     {
         const String base = casManifestsPrefix();
@@ -288,9 +288,9 @@ public:
         if (!build)
             return std::nullopt;
 
-        constexpr std::string_view kProtoSuffix = ".proto";
+        const std::string_view kManifestSuffix = storedSuffix(FormatId::PartManifest);
         constexpr size_t kOrdinalDigits = 6;
-        if (file.size() != kOrdinalDigits + kProtoSuffix.size() || !file.ends_with(kProtoSuffix))
+        if (file.size() != kOrdinalDigits + kManifestSuffix.size() || !file.ends_with(kManifestSuffix))
             return std::nullopt;
         const std::string_view ordinal_str = file.substr(0, kOrdinalDigits);
         uint32_t ordinal = 0;

@@ -1,6 +1,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobMeta.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasBlobEnvelopeFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRequestControl.h>
 #include <IO/WriteBufferFromString.h>
 #include <IO/WriteHelpers.h>
@@ -753,10 +754,14 @@ ManifestId Build::stageManifest(std::vector<ManifestEntry> entries)
     body.root_namespace_id = owning_ns;
     body.entries = std::move(entries);
     body.payload_digest = computePayloadDigest(body);
-    const String encoded = encodePartManifest(body);
-    if (encoded.size() > kMaxManifestEncodedBytes)
+    /// The cap is measured over the canonical TEXT (pre-seal), not the sealed/compressed PUT bytes:
+    /// JSON inflates relative to the old binary form, but 256 MiB remains a comfortable bound for the
+    /// largest realistic manifest.
+    const String encoded_text = encodePartManifest(body);
+    if (encoded_text.size() > kMaxManifestEncodedBytes)
         throw Exception(ErrorCodes::LIMIT_EXCEEDED,
-            "stageManifest: encoded manifest {} bytes exceeds cap {}", encoded.size(), kMaxManifestEncodedBytes);
+            "stageManifest: encoded manifest {} bytes exceeds cap {}", encoded_text.size(), kMaxManifestEncodedBytes);
+    const String encoded = sealObject(FormatId::PartManifest, encoded_text);
 
     const ManifestId id{owning_ns, ref};
     const String key = store->layout().manifestKey(id);
@@ -899,7 +904,7 @@ void Build::promote(const RootNamespace & target_ns, const String & final_ref_na
     if (!body_got)
         throw Exception(ErrorCodes::ABORTED,
             "promote: manifest body absent at {} — failing closed (retry with a fresh ManifestId)", manifest_key);
-    const PartManifest body = decodePartManifest(body_got->bytes);
+    const PartManifest body = decodePartManifest(openObject(FormatId::PartManifest, body_got->bytes));
     if (!refMatchesBody(id.ref, body))
         throw Exception(ErrorCodes::ABORTED, "promote: RefMatchesBody failed for {}", manifest_key);
     if (!manifestNamespaceMatches(target_ns, body))

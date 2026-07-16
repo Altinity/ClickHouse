@@ -79,8 +79,8 @@ TEST(CasManifestId, UsableInUnorderedContainers)
 
 TEST(CasManifestId, ManifestOrdinalFileName)
 {
-    EXPECT_EQ(manifestOrdinalFileName(1), "000001.proto");
-    EXPECT_EQ(manifestOrdinalFileName(999999), "999999.proto");
+    EXPECT_EQ(manifestOrdinalFileName(1), "000001.zst");
+    EXPECT_EQ(manifestOrdinalFileName(999999), "999999.zst");
     EXPECT_THROW(manifestOrdinalFileName(0), DB::Exception);
     EXPECT_THROW(manifestOrdinalFileName(1000000), DB::Exception);
 }

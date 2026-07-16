@@ -327,6 +327,7 @@ TEST(CasObservability, CaInspectDecodesPartManifestToJson)
     e.placement = EntryPlacement::Inline;
     e.inline_bytes = "hello";
     m.entries = {e};
+    m.payload_digest = computePayloadDigest(m);
 
     const ManifestId id{.root_namespace = ns, .ref = m.ref};
     const String key = layout.manifestKey(id);

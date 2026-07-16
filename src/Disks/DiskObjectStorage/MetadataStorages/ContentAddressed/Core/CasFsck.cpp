@@ -6,7 +6,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRunFile.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestCodec.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasPartManifestFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestId.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasOrphanManifestSweep.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRefIntake.h>
@@ -299,7 +299,7 @@ void runFsckImpl(Store & store, bool detail, const FsckProgress & on_progress, c
                 continue;
             }
 
-            PartManifest body = decodePartManifest(got->bytes);
+            PartManifest body = decodePartManifest(openObject(FormatId::PartManifest, got->bytes));
             if (!refMatchesBody(id.ref, body) || !manifestNamespaceMatches(id.root_namespace, body))
             {
                 ++report.dangling;

@@ -88,7 +88,7 @@ TEST(CasLayout, RelocatedRefAndManifestKeys)
     id.ref.manifest_ordinal = 1;
     const String key = l.manifestKey(id);
     EXPECT_EQ(key, "p/cas/manifests/srid/store/ab/uuid@cas@/"
-        "0000000000000001-0000000000000412/000001.proto");
+        "0000000000000001-0000000000000412/000001.zst");
     EXPECT_EQ(key.find("/_manifests/"), String::npos) << key;
 }
 
@@ -174,7 +174,7 @@ TEST(CasLayout, ManifestKeyShape)
     const String key = l.manifestKey(id);
     EXPECT_EQ(key,
         "p/cas/manifests/srv-a/3f2e-uuid@cas@/"
-        "0000000000000007-0000000000000412/000001.proto");
+        "0000000000000007-0000000000000412/000001.zst");
 }
 
 TEST(CasLayout, ManifestsSegmentReserved)
@@ -200,27 +200,28 @@ TEST(CasLayout, ManifestKeyHexRoundTrip)
     const String key = l.manifestKey(id);
     EXPECT_EQ(key,
         "p/cas/manifests/srv-a/3f2e-uuid@cas@/"
-        "0000000000000007-000000000000008e/000042.proto");
+        "0000000000000007-000000000000008e/000042.zst");
 
     const auto parsed = l.parseManifestKey(key);
     ASSERT_TRUE(parsed.has_value());
     EXPECT_EQ(parsed->root_namespace, id.root_namespace);
     EXPECT_EQ(parsed->ref, id.ref);
 
-    /// The old two-directory decimal shape (`<writer_epoch>/<build_sequence>/<ordinal>.proto`) is no
+    /// The old two-directory decimal shape (`<writer_epoch>/<build_sequence>/<ordinal>.zst`) is no
     /// longer canonical: the segment right before the file is a plain decimal number, not two
     /// fixed-width hex fields joined by '-', so `parseRefTxnId` rejects it.
-    EXPECT_FALSE(l.parseManifestKey("p/cas/manifests/srv-a/3f2e-uuid@cas@/7/142/000042.proto").has_value());
-    /// Foreign prefix, missing build segment, non-.proto file, and out-of-range ordinal are all rejected.
+    EXPECT_FALSE(l.parseManifestKey("p/cas/manifests/srv-a/3f2e-uuid@cas@/7/142/000042.zst").has_value());
+    /// Foreign prefix, missing build segment, non-registered-suffix file, and out-of-range ordinal
+    /// are all rejected.
     EXPECT_FALSE(l.parseManifestKey("p/cas/refs/srv-a/3f2e-uuid@cas@/"
-        "0000000000000007-000000000000008e/000042.proto").has_value());
-    EXPECT_FALSE(l.parseManifestKey("p/cas/manifests/0000000000000007-000000000000008e/000042.proto").has_value());
+        "0000000000000007-000000000000008e/000042.zst").has_value());
+    EXPECT_FALSE(l.parseManifestKey("p/cas/manifests/0000000000000007-000000000000008e/000042.zst").has_value());
     EXPECT_FALSE(l.parseManifestKey("p/cas/manifests/srv-a/3f2e-uuid@cas@/"
         "0000000000000007-000000000000008e/000042.bin").has_value());
     EXPECT_FALSE(l.parseManifestKey("p/cas/manifests/srv-a/3f2e-uuid@cas@/"
-        "0000000000000007-000000000000008e/000000.proto").has_value());
+        "0000000000000007-000000000000008e/000000.zst").has_value());
     EXPECT_FALSE(l.parseManifestKey("p/cas/manifests/srv-a/3f2e-uuid@cas@/"
-        "0000000000000007-000000000000008E/000042.proto").has_value());   /// uppercase hex
+        "0000000000000007-000000000000008E/000042.zst").has_value());   /// uppercase hex
 }
 
 TEST(CasLayout, RefObjectKeyRoundTrips)

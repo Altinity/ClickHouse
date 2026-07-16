@@ -31,8 +31,9 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestCodec.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasPartManifestFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasPoolMetaFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include "cas_test_helpers.h"
 
@@ -467,7 +468,7 @@ TEST(CasPluggableHash, Sha256BuildWritesFullWidthDigestAndInlineEqualsBlob)
     /// truncated by the manifest codec or by anything upstream of `stageManifest`.
     const auto manifest_bytes = backend->get(store->layout().manifestKey(mid));
     ASSERT_TRUE(manifest_bytes.has_value());
-    const PartManifest read_back = decodePartManifest(manifest_bytes->bytes);
+    const PartManifest read_back = decodePartManifest(openObject(FormatId::PartManifest, manifest_bytes->bytes));
     ASSERT_EQ(read_back.entries.size(), 2u);
     const auto read_blob_it = std::find_if(read_back.entries.begin(), read_back.entries.end(),
         [](const ManifestEntry & e) { return e.placement == EntryPlacement::Blob; });

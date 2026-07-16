@@ -13,7 +13,7 @@ namespace DB::Cas
 /// it can be exercised directly against encoder output in unit tests, with no disk / object storage
 /// involved.
 ///
-/// Dispatch is by KEY SHAPE, most-specific first (`cas/manifests/.../NNNNNN.proto` before the
+/// Dispatch is by KEY SHAPE, most-specific first (`cas/manifests/.../NNNNNN.zst` before the
 /// `cas/refs/` root-shard prefix, `/mount` and `/fold_seal` suffixes, then the pool-wide `gc/state`
 /// and `blobs/` prefix). u128 / token / hash fields render as lowercase hex strings (matching
 /// `u128ToHex`), never as an array of bytes or a raw struct dump.

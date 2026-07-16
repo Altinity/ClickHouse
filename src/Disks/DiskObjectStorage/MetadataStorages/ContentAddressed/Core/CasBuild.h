@@ -2,7 +2,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobRef.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestId.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestCodec.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasPartManifestFormat.h>
 #include <atomic>
 #include <functional>
 #include <map>
@@ -86,7 +86,7 @@ public:
     void recordPendingBlobDep(const BlobRef & ref, uint64_t size);
 
     /// Mint a root-local part ManifestId, write its body under
-    /// `cas/manifests/<ns>/<writer_epoch>/<build_sequence>/000001.proto` via the Store's shared
+    /// `cas/manifests/<ns>/<writer_epoch>/<build_sequence>/000001.zst` via the Store's shared
     /// `CasRequestController` (`putIfAbsentControlled`: budgeted attempts + resolve-before-reissue,
     /// chaos-tolerance-report §Task B; NO preliminary HEAD — the manifest_ordinal is per-build
     /// monotone). Enforces the OQ7 caps fail-closed BEFORE the body write returns (and therefore before

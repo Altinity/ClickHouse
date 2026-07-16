@@ -1,5 +1,6 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasFormat.h>
 #include <base/types.h>
 #include <base/extended_types.h>
 #include <fmt/format.h>
@@ -18,7 +19,7 @@ namespace DB::Cas
 ///                          never reused for that server root.
 ///   build_sequence       - monotone build sequence inside one writer incarnation; part of identity
 ///                          and of the build-scoped debris prefix.
-///   manifest_ordinal     - monotone ordinal inside one build, rendered as `000001.proto` in the key.
+///   manifest_ordinal     - monotone ordinal inside one build, rendered as `000001.zst` in the key.
 struct ManifestRef
 {
     uint64_t writer_epoch = 0;
@@ -75,14 +76,15 @@ struct ShardIncarnation
 
 inline constexpr uint32_t kMaxManifestOrdinal = 999999;
 
-/// Six-digit filename for a per-build part-manifest ordinal: `000001.proto` through `999999.proto`.
-/// `0` is reserved as an invalid sentinel and is never emitted.
+/// Six-digit filename for a per-build part-manifest ordinal: `000001.zst` through `999999.zst`
+/// (the registered v3 stored suffix for `FormatId::PartManifest`). `0` is reserved as an invalid
+/// sentinel and is never emitted.
 inline String manifestOrdinalFileName(uint32_t manifest_ordinal)
 {
     if (manifest_ordinal == 0 || manifest_ordinal > kMaxManifestOrdinal)
         throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
             "Manifest ordinal must be in [1, {}], got {}", kMaxManifestOrdinal, manifest_ordinal);
-    return fmt::format("{:06}.proto", manifest_ordinal);
+    return fmt::format("{:06}{}", manifest_ordinal, storedSuffix(FormatId::PartManifest));
 }
 
 inline String manifestRefDebugString(const ManifestRef & ref)

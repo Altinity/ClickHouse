@@ -12,7 +12,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasFoldSealFormat.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestCodec.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasPartManifestFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestId.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasRefLogFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasRefSnapshotFormat.h>
@@ -152,7 +152,8 @@ inline DB::Cas::ManifestId writeManifestRaw(
     body.root_namespace_id = ns;
     body.entries = entries;
     body.payload_digest = DB::Cas::computePayloadDigest(body);
-    backend.putIfAbsent(layout.manifestKey(id), DB::Cas::encodePartManifest(body));
+    backend.putIfAbsent(layout.manifestKey(id),
+        DB::Cas::sealObject(DB::Cas::FormatId::PartManifest, DB::Cas::encodePartManifest(body)));
     return id;
 }
 

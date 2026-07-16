@@ -4,7 +4,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasGcStateFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasFoldSealFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasIds.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestCodec.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasPartManifestFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasRefLogFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasRefSnapshotFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasTextFormat.h>
@@ -444,12 +444,12 @@ String renderEnvelopeHeader(const EnvelopeHeader & h)
 
 String caInspectToJson(const Layout & layout, const String & key, std::string_view bytes)
 {
-    /// Most-specific first: `cas/manifests/.../NNNNNN.proto` before the pool-wide `cas/refs/`
+    /// Most-specific first: `cas/manifests/.../NNNNNN.zst` before the pool-wide `cas/refs/`
     /// prefix, the `/mount` and `/fold_seal` suffixes before the pool-wide `gc/state` exact match,
     /// the `/retired/` segment before the pool-wide `blobs/` prefix, and (v3) the `.meta` sibling
     /// suffix before the bare `blobs/` prefix it also matches.
-    if (key.starts_with(layout.casManifestsPrefix()) && key.ends_with(".proto"))
-        return renderPartManifest(decodePartManifest(bytes));
+    if (key.starts_with(layout.casManifestsPrefix()) && key.ends_with(storedSuffix(FormatId::PartManifest)))
+        return renderPartManifest(decodePartManifest(openObject(FormatId::PartManifest, bytes)));
 
     if (key.starts_with(layout.casRefsPrefix()))
     {

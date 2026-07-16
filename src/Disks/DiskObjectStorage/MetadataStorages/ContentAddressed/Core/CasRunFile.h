@@ -14,11 +14,13 @@ namespace DB::Cas
 {
 
 /// Dense block-framed sorted binary run: fixed-width CRC32C per block, sparse footer index. Since
-/// codecs-v3 phase 5 the ONLY surviving kind is `ManifestEntries` — the stream embedded in a `CAPT`
-/// part manifest (`CasManifestCodec`), read sequentially. The standalone source-edge `cas_run` object
-/// moved to the sorted-NDJSON `Formats/CasRecordStreamFormat`; the dead `BlobDelta`/`SourceEdge`/
-/// `TargetShardDelta` kinds are removed. Phase 6 deletes this whole file when it converts the embedded
-/// manifest stream to text.
+/// codecs-v3 phase 5 the ONLY surviving kind was `ManifestEntries` — the stream embedded in the
+/// legacy "CAPT" binary part-manifest codec (`CasManifestCodec`, deleted in the phase-6 cutover
+/// task), read sequentially. The standalone source-edge `cas_run` object moved to the sorted-NDJSON
+/// `Formats/CasRecordStreamFormat`; the dead `BlobDelta`/`SourceEdge`/`TargetShardDelta` kinds are
+/// removed. `ManifestEntries` -- and therefore this whole file -- is now unused in production (the
+/// part-manifest body is text, no embedded run); left in place pending a follow-up cleanup task
+/// (its own dedicated `gtest_cas_run_file.cpp` still exercises it directly).
 enum class RunKind : uint8_t
 {
     ManifestEntries = 4,   /// value frozen; embedded part-manifest entry stream (phase-6-owned)
@@ -76,8 +78,9 @@ private:
 };
 
 /// Sequential reader. `next` yields records in stored (sorted) order. (Random-access `seek` was deleted
-/// in codecs-v3 phase 5 with its only caller; the surviving consumer — the embedded part-manifest
-/// stream in `CasManifestCodec` — reads sequentially.)
+/// in codecs-v3 phase 5 with its only caller; the former consumer — the embedded part-manifest stream
+/// in the now-deleted `CasManifestCodec` — read sequentially, and is the only production caller this
+/// file ever had.)
 ///
 /// Two modes, one interface (spec 2026-07-02 snapshot-streaming §RunFileReader modes):
 ///   - BORROWED: zero-copy over caller-owned bytes; the whole run is already resident (the caller

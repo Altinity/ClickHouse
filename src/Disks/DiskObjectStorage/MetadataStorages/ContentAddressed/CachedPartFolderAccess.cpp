@@ -256,18 +256,34 @@ bool CachedPartFolderAccess::republishRef(const PartRefKey & src, const PartRefK
 
 bool CachedPartFolderAccess::repointRef(const PartRefKey & key, std::vector<Cas::ManifestEntry> entries, Cas::ProvenanceOp op)
 {
-    /// Byte-equal no-op: compare the candidate `entries` directly against the CURRENTLY committed
-    /// manifest's decoded entries — the same structural comparison `republishRef`'s BUG 1c fix uses
-    /// above (`dst_manifest->entries != src_manifest->entries`). This must NOT stage a candidate
-    /// manifest first: `stageManifest` mints a non-content-derived `ManifestRef` (epoch/build_seq/
-    /// ordinal) AND durably PUTs the encoded body on every call (CasBuild.cpp), so staging-then-
-    /// comparing IDs would itself be a pool mutation on the byte-equal path — violating the "ZERO
-    /// pool mutations" contract this primitive exists to provide.
+    /// Byte-equal no-op: compare the candidate `entries` against the CURRENTLY committed manifest's
+    /// decoded entries. This must NOT stage a candidate manifest first: `stageManifest` mints a
+    /// non-content-derived `ManifestRef` (epoch/build_seq/ordinal) AND durably PUTs the encoded body
+    /// on every call (CasBuild.cpp), so staging-then-comparing IDs would itself be a pool mutation on
+    /// the byte-equal path — violating the "ZERO pool mutations" contract this primitive exists to
+    /// provide.
+    ///
+    /// codecs-v3 phase 6: the comparison must be SYMMETRIC. `committed_manifest->entries` already went
+    /// through one `decodePartManifest` round-trip, which does not carry `blob_size` for Inline
+    /// entries on the wire (it is redundant with `inline_bytes.size()` and excluded from both the
+    /// canonical encoding and the payload digest — see `CasPartManifestFormat.cpp`'s
+    /// `writeEntryRecord`/`decodePartManifest`). Comparing that against the freshly-constructed
+    /// `entries` directly (whose `blob_size` a caller may have set non-canonically, e.g. `= bytes.
+    /// size()`) is an apples-to-oranges struct compare that can spuriously report a difference and
+    /// force an unnecessary repoint. Route the candidate through the identical encode/decode
+    /// round-trip before comparing — mirrors `republishRef`'s BUG 1c compare just above, which is
+    /// symmetric for the same reason (both sides there are already decoded).
     auto resolved = resolve(key, Freshness::ForceFresh);
     if (resolved)
     {
         const auto committed_manifest = store->readManifestShared(resolved->manifest_id);
-        if (committed_manifest->entries == entries)
+        Cas::PartManifest probe;
+        probe.ref = committed_manifest->ref;
+        probe.root_namespace_id = committed_manifest->root_namespace_id;
+        probe.entries = entries;
+        probe.payload_digest = Cas::computePayloadDigest(probe);
+        const Cas::PartManifest canonical_candidate = Cas::decodePartManifest(Cas::encodePartManifest(probe));
+        if (committed_manifest->entries == canonical_candidate.entries)
             return false;
     }
     /// `publishEntries` takes `entries` by const&, so it is read here after the call without issue.

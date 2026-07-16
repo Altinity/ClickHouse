@@ -693,7 +693,7 @@ bool Gc::foldManifestEdges(const ManifestId & id, int sign, std::vector<BlobDelt
         return false;   /// raced delete between HEAD and GET — record-and-continue (never throw on a 404)
     ProfileEvents::increment(ProfileEvents::CasRefManifestBodyFoldGets);   /// spec §GC Budget H
 
-    const PartManifest body = decodePartManifest(got->bytes);
+    const PartManifest body = decodePartManifest(openObject(FormatId::PartManifest, got->bytes));
     if (!refMatchesBody(id.ref, body))
         throw Exception(ErrorCodes::CORRUPTED_DATA,
             "CAS gc fold: manifest body ref mismatch at {} (refMatchesBody fail-closed)", key);

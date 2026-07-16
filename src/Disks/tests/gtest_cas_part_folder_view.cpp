@@ -15,7 +15,7 @@ TEST(CasPartRefKey, CacheKeyIsUnambiguous)
 }
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartFolderView.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasManifestCodec.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasPartManifestFormat.h>
 #include <algorithm>
 
 namespace

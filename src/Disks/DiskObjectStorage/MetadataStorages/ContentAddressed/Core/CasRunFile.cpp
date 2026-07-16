@@ -480,8 +480,10 @@ bool RunFileReader::next(String & key, String & payload)
 /// (`RunFileReader::seek` and `RunMerger` deleted in codecs-v3 phase 5. `seek` had one production
 /// caller — the also-deleted `inDegreeInGeneration` — and `RunMerger` had none; the source-edge
 /// `cas_run` object moved to the sequential NDJSON `CasRecordStreamFormat`. This binary `CARN` reader/
-/// writer survives ONLY for the `RunKind::ManifestEntries` stream embedded in a `CAPT` part manifest
-/// (`CasManifestCodec`), which reads it sequentially — phase 6 removes `CasRunFile` entirely when it
-/// converts that embedded stream. The `seeked` member is now always false, kept until then.)
+/// writer used to survive ONLY for the `RunKind::ManifestEntries` stream embedded in a `CAPT` part
+/// manifest (`CasManifestCodec`, which read it sequentially); that codec was deleted in the phase-6
+/// cutover task, so `RunKind::ManifestEntries` has no production caller left — this file is now a
+/// deletion candidate for a follow-up cleanup task. The `seeked` member is now always false, kept
+/// until then.)
 
 }
