@@ -177,7 +177,11 @@ namespace
             }
 
             if (response.error != Coordination::Error::ZOK)
+            {
+                LOG_WARNING(log, "ExportPartition Manifest Updating Task: could not read processed leaf {} for {} (error {}), publishing sync-failed marker", children[i], log_key, response.error);
+                out.emplace(children[i], std::vector<String>{String(zk_sync_failed_marker)});
                 continue;
+            }
 
             try
             {
@@ -192,6 +196,36 @@ namespace
         }
 
         return out;
+    }
+
+    /// True when the cached `/processed` mirror carries a `zk_sync_failed_marker` sentinel,
+    /// published whenever a listing or a leaf read/parse failed. Such a mirror is incomplete
+    /// and must be refreshed again on the next poll.
+    bool destinationFilePathsMirrorHasSyncFailure(const std::map<String, std::vector<String>> & cached_paths)
+    {
+        for (const auto & [part_name, destination_paths] : cached_paths)
+        {
+            if (part_name == zk_sync_failed_marker)
+                return true;
+            for (const auto & destination_path : destination_paths)
+                if (destination_path == zk_sync_failed_marker)
+                    return true;
+        }
+        return false;
+    }
+
+    bool skipReadingDestinationFilePaths(
+        ExportReplicatedMergeTreePartitionTaskEntry::Status status,
+        const std::map<String, std::vector<String>> & cached_paths,
+        size_t number_of_parts)
+    {
+        if (status == ExportReplicatedMergeTreePartitionTaskEntry::Status::PENDING)
+            return false;
+        if (destinationFilePathsMirrorHasSyncFailure(cached_paths))
+            return false;
+        if (status == ExportReplicatedMergeTreePartitionTaskEntry::Status::COMPLETED)
+            return cached_paths.size() == number_of_parts;
+        return true;
     }
 
     /// Read the optional <entry_path>/commit_info znode and return the parsed entry.
@@ -553,8 +587,14 @@ void ExportPartitionManifestUpdatingTask::poll()
                 continue;
             }
 
-            auto destination_file_paths_per_part = readDestinationFilePathsPerPart(
-                zk, fs::path(entry_path), key, log);
+            const bool skip_processed_refresh =
+                has_local_entry
+                && skipReadingDestinationFilePaths(*status, local_entry->destination_file_paths_per_part, metadata.number_of_parts);
+
+            std::optional<std::map<String, std::vector<String>>> destination_file_paths_per_part;
+            if (!skip_processed_refresh)
+                destination_file_paths_per_part = readDestinationFilePathsPerPart(
+                    zk, fs::path(entry_path), key, log);
 
             /// If we hold the cleanup lock, enforce the task timeout and recover uncommitted exports.
             /// Entries are never removed here, so we always fall through to refresh / addTask below.
@@ -832,22 +872,17 @@ void ExportPartitionManifestUpdatingTask::handleStatusChanges()
             auto fetched = readLastExceptionPerReplica(
                 zk, export_path, key, log);
 
-            /// Refresh per-part destination paths and commit_info on the status flip too,
-            /// so the system table observes the COMPLETED state and the committed file
-            /// paths in the same poll cycle.
-            auto destination_file_paths_per_part = readDestinationFilePathsPerPart(
-                    zk, export_path, key, log);
-            if (destination_file_paths_per_part)
+            if (!skipReadingDestinationFilePaths(*new_status, it->destination_file_paths_per_part, it->manifest.number_of_parts))
             {
-                it->destination_file_paths_per_part = std::move(*destination_file_paths_per_part);
+                auto destination_file_paths_per_part = readDestinationFilePathsPerPart(
+                    zk, export_path, key, log);
+                it->destination_file_paths_per_part = std::move(destination_file_paths_per_part);
             }
 
-            /// commit_info is written atomically with the COMPLETED status, so only read it on that
-            /// transition. The status leaf was read above, so this read observes the matching
-            /// commit_info; FAILED / KILLED never produce a commit_info znode.
             if (*new_status == ExportReplicatedMergeTreePartitionTaskEntry::Status::COMPLETED)
             {
-                it->commit_info = readCommitInfo(zk, export_path, key, log);
+                if (auto fetched_commit_info = readCommitInfo(zk, export_path, key, log))
+                    it->commit_info = std::move(fetched_commit_info);
             }
 
             /// If status changed to KILLED, cancel local export operations
