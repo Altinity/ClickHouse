@@ -806,11 +806,13 @@ void ExportPartitionManifestUpdatingTask::handleStatusChanges()
                 continue;
             }
 
+            const auto export_path = fs::path(storage.zookeeper_path) / "exports" / key;
+
             ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperRequests);
             ProfileEvents::increment(ProfileEvents::ExportPartitionZooKeeperGet);
             /// get new status from zk
             std::string new_status_string;
-            if (!zk->tryGet(fs::path(storage.zookeeper_path) / "exports" / key / "status", new_status_string))
+            if (!zk->tryGet(export_path / "status", new_status_string))
             {
                 LOG_WARNING(log, "ExportPartition Manifest Updating Task: Failed to get new status for task {}, skipping", key);
                 local_status_changes.pop();
@@ -828,13 +830,13 @@ void ExportPartitionManifestUpdatingTask::handleStatusChanges()
             LOG_INFO(log, "ExportPartition Manifest Updating task: status changed for task {}. New status: {}", key, magic_enum::enum_name(*new_status).data());
 
             auto fetched = readLastExceptionPerReplica(
-                zk, fs::path(storage.zookeeper_path) / "exports" / key, key, log);
+                zk, export_path, key, log);
 
             /// Refresh per-part destination paths and commit_info on the status flip too,
             /// so the system table observes the COMPLETED state and the committed file
             /// paths in the same poll cycle.
             auto destination_file_paths_per_part = readDestinationFilePathsPerPart(
-                    zk, fs::path(storage.zookeeper_path) / "exports" / key, key, log);
+                    zk, export_path, key, log);
             if (destination_file_paths_per_part)
             {
                 it->destination_file_paths_per_part = std::move(*destination_file_paths_per_part);
@@ -845,7 +847,7 @@ void ExportPartitionManifestUpdatingTask::handleStatusChanges()
             /// commit_info; FAILED / KILLED never produce a commit_info znode.
             if (*new_status == ExportReplicatedMergeTreePartitionTaskEntry::Status::COMPLETED)
             {
-                it->commit_info = readCommitInfo(zk, fs::path(storage.zookeeper_path) / "exports" / key, key, log);
+                it->commit_info = readCommitInfo(zk, export_path, key, log);
             }
 
             /// If status changed to KILLED, cancel local export operations
