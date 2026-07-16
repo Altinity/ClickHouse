@@ -792,7 +792,7 @@ jobs:
           fi
 
   stateless_tests_amd_binary_old_analyzer_s3_storage_databasereplicated_parallel:
-    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester, 16c]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_binary]
     name: "Stateless tests (amd_binary, old analyzer, s3 storage, DatabaseReplicated, parallel)"
     outputs:
@@ -886,7 +886,7 @@ jobs:
           fi
 
   stateless_tests_amd_binary_parallelreplicas_s3_storage_parallel:
-    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester, 16c]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_amd_binary]
     name: "Stateless tests (amd_binary, ParallelReplicas, s3 storage, parallel)"
     outputs:
@@ -980,7 +980,7 @@ jobs:
           fi
 
   stateless_tests_arm_binary_parallel:
-    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester-aarch64]
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester-aarch64, 16c]
     needs: [config_workflow, dockers_build_amd, dockers_build_arm, build_arm_binary]
     name: "Stateless tests (arm_binary, parallel)"
     outputs:
