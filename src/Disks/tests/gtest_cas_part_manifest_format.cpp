@@ -9,12 +9,10 @@ using namespace DB::Cas;
 namespace
 {
 
-/// NOT `Disks/tests/cas_test_helpers.h`'s `DB::Cas::tests::expectThrowsCode`: that header transitively
-/// pulls in `CasManifestCodec.h` (via `CasGc.h`), which still defines `EntryPlacement`/`ManifestEntry`/
-/// `PartManifest` verbatim (the retired binary codec, untouched until Task 3 of this phase) — the same
-/// names `CasPartManifestFormat.h` now also defines. Any translation unit including both headers hits a
-/// redefinition error, so this test file stays clear of `cas_test_helpers.h` entirely and inlines its
-/// own copy of the same tiny assertion instead.
+/// NOT `Disks/tests/cas_test_helpers.h`'s `DB::Cas::tests::expectThrowsCode`: pulling in that header
+/// drags along a large chunk of the CAS backend/store machinery this file has no other need for, so it
+/// stays clear of `cas_test_helpers.h` entirely and inlines its own copy of the same tiny assertion
+/// instead.
 template <typename F>
 void expectThrowsCode(int expected_code, F && fn)
 {
