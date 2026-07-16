@@ -204,17 +204,6 @@ public:
 
     void checkTableCanBeRenamed(const StorageID & new_name) const override;
 
-    /// CAS replication 2b (B33 partial lift). On a content-addressed disk the replication-QUEUE clone
-    /// paths (queue-driven REPLACE/MOVE/ATTACH PARTITION FROM -> cloneAndLoadDataPart on the queue) have
-    /// not yet been audited for CA — a different call stack than the non-replicated ALTER PARTITION the
-    /// base check audited (B21). Fail those closed here until Phase 3.2 audits them, then defer to the
-    /// base check for everything else.
-    void checkAlterPartitionIsPossible(
-        const PartitionCommands & commands,
-        const StorageMetadataPtr & metadata_snapshot,
-        const Settings & settings,
-        ContextPtr local_context) const override;
-
     void rename(const String & new_path_to_table_data, const StorageID & new_table_id) override;
 
     ActionLock getActionLock(StorageActionBlockType action_type) override;

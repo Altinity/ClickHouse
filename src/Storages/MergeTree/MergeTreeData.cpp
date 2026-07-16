@@ -5734,6 +5734,13 @@ MergeTreeData::PartsToRemoveFromZooKeeper MergeTreeData::removePartsInRangeFromW
         /// On a plain disk the rename in renameTempPartAndAdd is already durable, so this is a no-op
         /// there. Commit the disk storage transaction here (CA only) so the ref is published before the
         /// in-memory rollback; the part still ends up Outdated, exactly as on a plain disk.
+        ///
+        /// [TXN-ONE-PIPELINE] (`2026-07-16-cas-txn-one-pipeline-design.md`, Audit 7 / Tension 2): this
+        /// hand-placed `commitTransaction()` is NOT made redundant by moving publication into `commit`
+        /// — it is the direct consequence of that design. There is no `precommit` phase under the
+        /// one-pipeline model, and this rollback path (by construction, to keep the part Outdated) never
+        /// reaches `MergeTreeData::Transaction::commit`, the only other place a disk transaction is
+        /// committed. So this call remains the ONLY thing that publishes the empty cover's ref. Keep it.
         if (new_data_part->getDataPartStorage().isContentAddressed()
             && new_data_part->getDataPartStorage().hasActiveTransaction())
             new_data_part->getDataPartStorage().commitTransaction();

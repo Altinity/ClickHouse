@@ -462,9 +462,11 @@ StorageReplicatedMergeTree::StorageReplicatedMergeTree(
         /// replication-queue CLONE paths (queue-driven REPLACE/MOVE/ATTACH PARTITION FROM, the
         /// cloneAndLoadDataPart-on-the-queue path) were audited in Phase 3.2: they reach the SAME
         /// whole-part ContentAddressedTransaction the non-replicated stack uses (see
-        /// checkAlterPartitionIsPossible below), NOT the per-file-autocommit B21 mode, so they are now
-        /// permitted. The zero-copy lockSharedData/unlockSharedData calls these reach are safe no-ops on
-        /// CA (they early-return on !supportZeroCopyReplication, which CA is).
+        /// `MergeTreeData::checkAlterPartitionIsPossible`, reached here by dynamic dispatch — the
+        /// Phase 3.2 fail-closed override in this class was a pure delegation and was deleted by the
+        /// tail de-patch), NOT the per-file-autocommit B21 mode, so they are now permitted. The
+        /// zero-copy lockSharedData/unlockSharedData calls these reach are safe no-ops on CA (they
+        /// early-return on !supportZeroCopyReplication, which CA is).
     }
 
     initializeDirectoriesAndFormatVersion(relative_data_path_, LoadingStrictnessLevel::ATTACH <= mode, date_column_name);
@@ -7416,33 +7418,6 @@ void StorageReplicatedMergeTree::checkTableCanBeRenamed(const StorageID & new_na
                         "Cannot move Replicated table to Ordinary database, because zookeeper_path contains implicit "
                         "'uuid' macro. If you really want to rename table, you should edit metadata file first "
                         "and restart server or reattach the table.");
-}
-
-void StorageReplicatedMergeTree::checkAlterPartitionIsPossible(
-    const PartitionCommands & commands,
-    const StorageMetadataPtr & metadata_snapshot,
-    const Settings & settings,
-    ContextPtr local_context) const
-{
-    /// CAS replication Phase 3.2 (B33 lift complete). The cross-table partition-clone commands on a
-    /// Replicated table are driven through the replication QUEUE (`replacePartitionFrom` /
-    /// `movePartitionToTable` enqueue a `REPLACE_RANGE` that `executeReplaceRange` clones via
-    /// `cloneAndLoadDataPart` on the queue). The Phase 3.2 audit traced that call stack on a CA disk:
-    /// `executeReplaceRange` / `replacePartitionFrom` / `movePartitionToTable` all reach
-    /// `MergeTreeData::cloneAndLoadDataPart` with `must_on_same_disk=true` (REPLACE/MOVE) or with a
-    /// same-pool source (ATTACH), no `external_transaction`, and `copy_instead_of_hardlink=false` on CA
-    /// (CA disks return `supportZeroCopyReplication()==false`, so `isStoredOnRemoteDiskWithZeroCopySupport`
-    /// is false). That routes the same-disk clone through `DataPartStorageOnDiskBase::freeze`, which —
-    /// since no caller transaction is supplied and the disk is content-addressed — self-creates ONE
-    /// whole-part `ContentAddressedTransaction` (see `DataPartStorageOnDiskBase::freeze` ~L519) so all
-    /// files land in a single content-addressed part. This is the SAME audited+verified whole-part clone
-    /// the non-replicated ALTER PARTITION stack uses (M9 W2, B21 resolved) — NOT the per-file-autocommit
-    /// B21 corruption mode. So we no longer fail these closed here: delegate to the base check, which
-    /// already permits `REPLACE`/`MOVE`/`ATTACH PARTITION` on CA and keeps `FREEZE`/`FETCH PARTITION`
-    /// gated. The only residual caveat (identical for the non-replicated path) is cross-disk
-    /// `MOVE ... TO DISK/VOLUME`, which byte-copies via `clonePart`/`freezeRemote` (safe re-content-address,
-    /// not the corrupting path); the base check cannot distinguish the destination and lets it through.
-    MergeTreeData::checkAlterPartitionIsPossible(commands, metadata_snapshot, settings, local_context);
 }
 
 void StorageReplicatedMergeTree::rename(const String & new_path_to_table_data, const StorageID & new_table_id)
