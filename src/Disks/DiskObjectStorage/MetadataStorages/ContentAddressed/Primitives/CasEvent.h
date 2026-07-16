@@ -1,5 +1,4 @@
 #pragma once
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
 #include <base/types.h>
 #include <base/extended_types.h>
 #include <functional>
@@ -46,16 +45,6 @@ enum class CasEventType
 };
 
 enum class CasEventObjectKind { None, Blob, Manifest, Root, Snap };
-
-/// Map an internal `ObjectKind` to the audit-log `CasEventObjectKind`. Single source for the mapping
-/// previously open-coded as a ternary at each emission site.
-inline CasEventObjectKind toEventKind(ObjectKind kind)
-{
-    switch (kind)
-    {
-        case ObjectKind::Blob: return CasEventObjectKind::Blob;
-    }
-}
 
 struct CasEvent
 {

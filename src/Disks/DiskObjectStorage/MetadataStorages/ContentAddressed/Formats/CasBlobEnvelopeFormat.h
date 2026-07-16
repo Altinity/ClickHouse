@@ -1,5 +1,6 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEvent.h>
 #include <base/types.h>
 #include <base/extended_types.h>
 #include <cstdint>
@@ -80,6 +81,18 @@ EnvelopeHeader decodeEnvelopeHeader(std::string_view head_bytes, uint64_t object
 inline uint64_t payloadOffset(const EnvelopeHeader & header)
 {
     return static_cast<uint64_t>(header.header_len);
+}
+
+/// Map an internal `ObjectKind` to the audit-log `CasEventObjectKind`. Single source for the mapping
+/// previously open-coded as a ternary at each emission site. Lives here (Formats) rather than in
+/// CasEvent.h (Primitives) so the include direction Formats -> Primitives is respected and
+/// `CasEvent` stays dependency-free.
+inline CasEventObjectKind toEventKind(ObjectKind kind)
+{
+    switch (kind)
+    {
+        case ObjectKind::Blob: return CasEventObjectKind::Blob;
+    }
 }
 
 }
