@@ -13,6 +13,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPlainObjects.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasManifestReader.h>
 #include <Common/CacheBase.h>
 #include <Common/CurrentMetrics.h>
 #include <Common/HashTable/Hash.h>
@@ -281,12 +282,7 @@ struct RefPayloadUpdate
     uint64_t published_at_ms = 0;   /// publish wall-clock (epoch ms); 0 = unset
 };
 
-struct BlobLocation
-{
-    String key;
-    uint64_t offset = 0;                      /// payload start within the object
-    uint64_t length = 0;
-};
+/// (`BlobLocation` moved to Pool/CasManifestReader.h with `locate`.)
 
 /// What one `Store::dropNamespace` call physically named for removal in its ONE removal transaction
 /// (design 2026-07-13-cas-pool-member-decommission §core): the count of committed refs and precommit
@@ -625,7 +621,7 @@ public:
     bool dedupCacheContains(const BlobRef & ref) const;
     void dedupCacheAdd(const BlobRef & ref);
     /// Test seam: retained bytes of the manifest decode cache (0 when disabled).
-    size_t manifestDecodeCacheBytesForTest() const { return manifest_cache ? manifest_cache->sizeInBytes() : 0; }
+    size_t manifestDecodeCacheBytesForTest() const { return manifest_reader.manifestDecodeCacheBytes(); }
 
     /// ---- B170 event audit (system.content_addressed_log) ----
     /// The wiring injects a sink (CasEvent -> SystemLog row) when the log is configured; null sink
@@ -1106,6 +1102,11 @@ private:
     /// (spec §Decomposition). Stateless over `Backend &` + `const Layout &`; declared AFTER
     /// pool_backend and pool_layout so it is constructed after (and destroyed before) both.
     CasPlainObjects plain_objects;
+    /// The manifest read path + decode cache + locate, extracted from Store (spec §Decomposition).
+    /// Injected with backend/layout/meta + the event-sink reference; owns the decode cache (whose
+    /// synchronization is CacheBase-internal). Declared after event_sink_, pool_backend, meta, and
+    /// pool_layout so it is constructed after (and destroyed before) all four.
+    CasManifestReader manifest_reader;
     /// Per-server build watermark (spec 2026-06-16-ca-build-watermark). process_epoch is a random
     /// nonzero u64 minted once at open: GC checks it for EQUALITY (an object stamped with a different
     /// epoch is from a dead incarnation), never for ordering. next_build_seq is a strictly-increasing
@@ -1171,40 +1172,7 @@ private:
     /// when a test injected one, else a real `std::this_thread::sleep_for` (production, unchanged).
     void waitSleep(uint64_t ms) const;
 
-    /// Phase 1c manifest decode cache: (ManifestId, Token) -> decoded immutable PartManifest. Part
-    /// manifests are immutable single-owner objects, so a token match guarantees identical bytes; the
-    /// Token component lets the cache fail closed if the backend object is re-incarnated under the same
-    /// id. Unlike the old content-hash tree cache there is NO cross-id sharing — each publish has a
-    /// unique ManifestId (spec §Read Path Scope: per-instance cache, less sharing, intentional). The
-    /// read path resolves `route` per file, so caching makes a repeated same-part read O(1) decodes.
-    /// Phase 5 (part-folder cache spec): byte-weighted LRU (`ManifestDecodeCache` below) instead of the
-    /// old count-only bound, since decoded manifests carry inline bytes and can each be megabytes.
-    struct ManifestCacheKey
-    {
-        ManifestId manifest_id;
-        Token token;
-        bool operator==(const ManifestCacheKey &) const = default;
-    };
-    struct ManifestCacheKeyHash
-    {
-        size_t operator()(const ManifestCacheKey & k) const;
-    };
-    /// Phase 5 (part-folder cache spec): byte-weighted so a server that reads very many parts (each
-    /// decode carrying megabytes of inline bytes) has an honest memory ceiling instead of the old
-    /// count-only bound (16384 entries, multi-GB worst case). Same key, same fail-closed token
-    /// semantics as before; nullptr <=> decode caching disabled (manifest_decode_cache_bytes == 0).
-    struct PartManifestWeight
-    {
-        size_t operator()(const PartManifest & m) const
-        {
-            size_t bytes = 256;
-            for (const auto & e : m.entries)
-                bytes += e.path.size() + e.inline_bytes.size() + 96;
-            return bytes;
-        }
-    };
-    using ManifestDecodeCache = CacheBase<ManifestCacheKey, PartManifest, ManifestCacheKeyHash, PartManifestWeight>;
-    std::unique_ptr<ManifestDecodeCache> manifest_cache;
+    /// The manifest decode cache + read path moved to `manifest_reader` (Pool/CasManifestReader.h).
 
     /// NOTE (M-C2): the ref-log is never trimmed here — trimming needs GC's fold state
     /// (`last_folded_ref_id`, INV-JOURNAL-COVERAGE), which is GC state landing in M-C3.

@@ -77,15 +77,15 @@ Store::Store(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
     /// Plain-object surface component: binds to this Store's own backend + layout (declared after
     /// both, so this reference-holding member is constructed last and destroyed first).
     , plain_objects(*pool_backend, pool_layout)
+    /// Manifest reader component: backend/layout/meta by reference + the event-sink reference (set
+    /// later via setEventSink; the reference observes that assignment). Owns the decode cache, built
+    /// from the same config bytes the Store ctor used before.
+    , manifest_reader(*pool_backend, pool_layout, meta, event_sink_, config.manifest_decode_cache_bytes)
 {
     if (config.dedup_cache_bytes > 0)
         dedup_cache = std::make_unique<DedupCache>(
             "LRU", CurrentMetrics::end(), CurrentMetrics::end(),
             config.dedup_cache_bytes, DedupCache::NO_MAX_COUNT, DedupCache::DEFAULT_SIZE_RATIO);
-    if (config.manifest_decode_cache_bytes > 0)
-        manifest_cache = std::make_unique<ManifestDecodeCache>(
-            "LRU", CurrentMetrics::end(), CurrentMetrics::end(),
-            config.manifest_decode_cache_bytes, /*max_count=*/16384, ManifestDecodeCache::DEFAULT_SIZE_RATIO);
 
     /// Task 10: the ref-log writer path's retry controller. `config.boot_ms_fn` -- the SAME fake-clock
     /// seam the local write fence uses -- is reused here rather than adding a second clock knob; both
@@ -943,130 +943,21 @@ std::optional<Resolved> Store::resolveRef(const RootNamespace & ns, const String
     };
 }
 
-size_t Store::ManifestCacheKeyHash::operator()(const ManifestCacheKey & k) const
-{
-    /// Combine the manifest-id hash with the token's bytes + type. The token is part of the key so a
-    /// re-incarnation under the same id misses (the immutable bytes changed identity).
-    const size_t h1 = std::hash<ManifestId>{}(k.manifest_id);
-    const size_t h2 = std::hash<String>{}(k.token.value);
-    const size_t h3 = std::hash<uint8_t>{}(static_cast<uint8_t>(k.token.type));
-    size_t h = h1;
-    h ^= h2 + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
-    h ^= h3 + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
-    return h;
-}
-
+/// The manifest read path (readManifest / readManifestShared / locate) + its decode cache live in
+/// the `manifest_reader` component (Pool/CasManifestReader.h); these are thin delegates.
 std::shared_ptr<const PartManifest> Store::readManifestShared(const ManifestId & id)
 {
-    /// A live ref naming a missing manifest body is INV-NO-DANGLE (spec §Read Path Scope: "fail-closed
-    /// behavior when a committed ref names a missing manifest"). Never substitute an empty manifest.
-    const String key = pool_layout.manifestKey(id);
-
-    /// HEAD first for the current token: on a (id, token) cache hit, the immutable decode is reused
-    /// with no get and no re-decode. A missing object surfaces INV-NO-DANGLE.
-    const HeadResult head = pool_backend->head(key);
-    if (!head.exists)
-    {
-        if (hasEventSink())
-        {
-            CasEvent _ev1;
-            _ev1.type = CasEventType::ReadMissing;
-            _ev1.object_kind = CasEventObjectKind::Manifest;
-            _ev1.object_hash = manifestRefDebugString(id.ref);
-            _ev1.outcome = "missing";
-            _ev1.reason = "live ref names manifest but its object is missing (INV-NO-DANGLE)";
-            _ev1.detail = {{"code", "FILE_DOESNT_EXIST"}, {"site", "readManifest"}};
-            emitEvent(std::move(_ev1));
-        }
-        throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
-            "live ref names manifest at {} but its object is missing — INV-NO-DANGLE", key);
-    }
-
-    if (manifest_cache)
-        if (auto cached = manifest_cache->get(ManifestCacheKey{.manifest_id = id, .token = head.token}))
-            return cached;
-
-    std::optional<GetResult> object = pool_backend->get(key);
-    if (!object)
-        throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
-            "manifest at {} vanished between head and get — INV-NO-DANGLE", key);
-    ProfileEvents::increment(ProfileEvents::CasPartFolderManifestGets);
-
-    PartManifest body = decodePartManifest(openObject(FormatId::PartManifest, object->bytes));
-
-    /// refMatchesBody: the journal ManifestRef must equal the body's self-described `ref`. A mismatch
-    /// means the ref addresses the WRONG object (spec §Object Identity And Ownership).
-    if (!refMatchesBody(id.ref, body))
-    {
-        if (hasEventSink())
-        {
-            CasEvent _ev2;
-            _ev2.type = CasEventType::CorruptDecode;
-            _ev2.object_kind = CasEventObjectKind::Manifest;
-            _ev2.object_hash = manifestRefDebugString(id.ref);
-            _ev2.outcome = "corrupt";
-            _ev2.reason = "manifest body `ref` does not match the journal ManifestRef (refMatchesBody)";
-            _ev2.detail = {{"code", "CORRUPTED_DATA"}, {"site", "readManifest"}};
-            emitEvent(std::move(_ev2));
-        }
-        throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "CAS manifest at {} body ref does not match the journal ManifestRef — refMatchesBody", key);
-    }
-
-    /// manifestNamespaceMatches: the body's root_namespace_id must equal the owning root namespace. A
-    /// mismatch is a cross-namespace dangle and would hand the debris sweep the wrong authority.
-    if (!manifestNamespaceMatches(id.root_namespace, body))
-    {
-        if (hasEventSink())
-        {
-            CasEvent _ev3;
-            _ev3.type = CasEventType::CorruptDecode;
-            _ev3.object_kind = CasEventObjectKind::Manifest;
-            _ev3.object_hash = manifestRefDebugString(id.ref);
-            _ev3.outcome = "corrupt";
-            _ev3.reason = "manifest body root_namespace_id does not match the owning namespace (manifestNamespaceMatches)";
-            _ev3.detail = {{"code", "CORRUPTED_DATA"}, {"site", "readManifest"}};
-            emitEvent(std::move(_ev3));
-        }
-        throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "CAS manifest at {} body root_namespace_id does not match the owning namespace — manifestNamespaceMatches", key);
-    }
-
-    auto decoded = std::make_shared<PartManifest>(std::move(body));
-    if (manifest_cache)
-        manifest_cache->set(ManifestCacheKey{.manifest_id = id, .token = head.token}, decoded);
-    return decoded;
+    return manifest_reader.readManifestShared(id);
 }
 
 PartManifest Store::readManifest(const ManifestId & id)
 {
-    return *readManifestShared(id);
+    return manifest_reader.readManifest(id);
 }
 
 BlobLocation Store::locate(const ManifestEntry & entry) const
 {
-    /// A ranged read into the content object: the payload starts at a constant offset for blobs
-    /// (the pool's fixed blob_header_len — no per-object header read). Inline carries no standalone
-    /// object location (there is no Subtree placement on a part manifest).
-    switch (entry.placement)
-    {
-        case EntryPlacement::Blob:
-        {
-            /// Phase 3 T2: the blob's object key is built directly from the entry's own `ref` (algo +
-            /// digest) -- no pool-scoped codec needed, since the key no longer depends on a pool-wide
-            /// width assumption.
-            return BlobLocation{
-                .key = pool_layout.blobKey(entry.ref),
-                .offset = meta.blob_header_len,
-                .length = entry.blob_size,
-            };
-        }
-        case EntryPlacement::Inline:
-            throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                "entry placement {} has no blob location", static_cast<int>(entry.placement));
-    }
-    throw Exception(ErrorCodes::BAD_ARGUMENTS,
-        "entry placement {} has no blob location", static_cast<int>(entry.placement));
+    return manifest_reader.locate(entry);
 }
 
 std::map<String, Resolved> Store::listRefs(const RootNamespace & ns)
