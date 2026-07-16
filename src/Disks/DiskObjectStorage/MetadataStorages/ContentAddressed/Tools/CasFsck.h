@@ -1,6 +1,6 @@
 #pragma once
 
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasStore.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
 
@@ -102,7 +102,7 @@ struct FsckReport
 /// LIST page stuck in S3-client retries is bounded separately by the disk's S3 retry/timeout
 /// settings, not here. `namespace_prefix`, if non-empty, scopes the scan to namespaces with this
 /// prefix and skips the pool-wide unreachable classification (dangling-only mode).
-FsckReport runFsck(Store & store, bool detail, FsckProgress on_progress = {},
+FsckReport runFsck(Pool & store, bool detail, FsckProgress on_progress = {},
                    std::optional<std::chrono::steady_clock::time_point> deadline = {},
                    bool partial_on_deadline = false, const String & namespace_prefix = {});
 

@@ -1,5 +1,5 @@
 #pragma once
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasStore.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPartManifestFormat.h>
@@ -55,7 +55,7 @@ BlobRef poolContentHash(BlobHashAlgo algo, std::string_view payload);
 class Build
 {
 public:
-    Build(StorePtr store_, UInt128 build_id_,
+    Build(PoolPtr store_, UInt128 build_id_,
           uint64_t build_seq_, uint64_t epoch_, BuildInfo info_);
     ~Build();
 
@@ -86,7 +86,7 @@ public:
     void recordPendingBlobDep(const BlobRef & ref, uint64_t size);
 
     /// Mint a root-local part ManifestId, write its body under
-    /// `cas/manifests/<ns>/<writer_epoch>/<build_sequence>/000001.zst` via the Store's shared
+    /// `cas/manifests/<ns>/<writer_epoch>/<build_sequence>/000001.zst` via the Pool's shared
     /// `CasRequestController` (`putIfAbsentControlled`: budgeted attempts + resolve-before-reissue,
     /// chaos-tolerance-report §Task B; NO preliminary HEAD — the manifest_ordinal is per-build
     /// monotone). Enforces the OQ7 caps fail-closed BEFORE the body write returns (and therefore before
@@ -151,7 +151,7 @@ public:
     void abandon();
 
     /// spec §Namespace Removal ("After the transaction is durable, it ... cancels local builds"): called
-    /// by `Store::dropNamespace` for every in-flight build ONCE its removal transaction is durable. If
+    /// by `Pool::dropNamespace` for every in-flight build ONCE its removal transaction is durable. If
     /// this build's owning namespace equals `removed_ns`, mark it cancelled so every further operation
     /// fails closed at `requireAlive` (ABORTED); a build in any other namespace is left untouched.
     /// Cross-thread safe: reads only the immutable `info` (the owning namespace) and stores ONE atomic --
@@ -215,14 +215,14 @@ private:
     /// staging bug) is NOT trusted — it fails closed. The single gate for the promote non-tokened leaf.
     bool isTrustedAdopt(const BlobRef & ref) const;
 
-    StorePtr store;
+    PoolPtr store;
     UInt128 build_id{};
     uint64_t build_seq{};                                 /// per-process monotone seq (spec 2026-06-16)
-    uint64_t epoch{};                                     /// owning Store's process_epoch
+    uint64_t epoch{};                                     /// owning Pool's process_epoch
     uint32_t next_manifest_ordinal = 1;                   /// per-build monotone manifest ordinal
     BuildInfo info;
     bool alive = true;
-    /// spec §Namespace Removal: set by `cancelForNamespaceRemoval` (from `Store::dropNamespace`'s thread)
+    /// spec §Namespace Removal: set by `cancelForNamespaceRemoval` (from `Pool::dropNamespace`'s thread)
     /// once this build's owning namespace is durably removed. Atomic because it is WRITTEN cross-thread
     /// and READ by `requireAlive` on the build's own thread. Once cancelled, every further op fails closed.
     std::atomic<bool> cancelled{false};

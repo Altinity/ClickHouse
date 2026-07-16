@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBuild.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasStore.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h>
@@ -56,9 +56,9 @@ using DB::Cas::tests::writeBlobRaw;
 namespace
 {
 
-StorePtr openStore(const std::shared_ptr<InMemoryBackend> & b)
+PoolPtr openStore(const std::shared_ptr<InMemoryBackend> & b)
 {
-    return Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    return Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
 }
 
 /// A single-blob manifest entry naming `payload` at `path` (the entry the part's manifest carries).
@@ -69,7 +69,7 @@ ManifestEntry blobEntry(const String & path, const String & payload)
 
 /// Start a build whose `intended_ref` is "ns/ref" — REQUIRED: stageManifest derives the manifest's
 /// owning namespace by splitting intended_ref on the LAST '/'. (See Build::manifestNamespace.)
-BuildPtr startBuildFor(const StorePtr & s, const RootNamespace & ns, const String & ref)
+BuildPtr startBuildFor(const PoolPtr & s, const RootNamespace & ns, const String & ref)
 {
     BuildInfo info;
     info.intended_ref = ns.string() + "/" + ref;
@@ -80,7 +80,7 @@ BuildPtr startBuildFor(const StorePtr & s, const RootNamespace & ns, const Strin
 /// blob via putBlob, stages the manifest, precommits, then promotes. Returns the committed ManifestId.
 /// Mirrors what the old single-call `publish` did on the tree model.
 ManifestId publishBlobPart(
-    const StorePtr & s, const RootNamespace & ns, const String & ref, const String & path, const String & payload)
+    const PoolPtr & s, const RootNamespace & ns, const String & ref, const String & path, const String & payload)
 {
     auto build = startBuildFor(s, ns, ref);
     /// Wiring order (EDGE-BEFORE-OBSERVE): stageManifest -> precommitAdd -> putBlob -> promote.
@@ -95,7 +95,7 @@ ManifestId publishBlobPart(
 /// locate → ranged GET) and assert it returns `payload`. This is the INV-NO-DANGLE check: every named
 /// object resolves and reads.
 void assertPartReads(
-    const std::shared_ptr<InMemoryBackend> & b, const StorePtr & s,
+    const std::shared_ptr<InMemoryBackend> & b, const PoolPtr & s,
     const RootNamespace & ns, const String & ref, const String & path, const String & payload)
 {
     auto r = s->resolveRef(ns, ref);
@@ -231,7 +231,7 @@ TEST(CasProtocol, RevalidateAdoptsLiveTokenWhenOnlyPhantomCondemnedAtDifferentTo
 
     DB::Cas::Layout layout("p");
     {
-        auto s0 = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+        auto s0 = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
         writeBlobRaw(*b, s0->layout(), "payload-X", s0->poolMeta().blob_header_len, s0->poolMeta().pool_id);
     }
     const String blob_key = layout.blobKey(idOf("payload-X"));
@@ -244,7 +244,7 @@ TEST(CasProtocol, RevalidateAdoptsLiveTokenWhenOnlyPhantomCondemnedAtDifferentTo
     /// Fence to round 1 BEFORE opening the store, so the store's open-time refresh lands the view at
     /// round 1 already populated.
 
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});   /// open-time refresh ⇒ view round 1
+    auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});   /// open-time refresh ⇒ view round 1
     /// Wiring order: stage + precommit (durable edge) BEFORE the adopting putBlob.
     auto build = startBuildFor(s, ns, "part_1");
     const ManifestId id = build->stageManifest({blobEntry("data.bin", "payload-X")});

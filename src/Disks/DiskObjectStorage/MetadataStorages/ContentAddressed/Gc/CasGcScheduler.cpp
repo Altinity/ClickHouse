@@ -31,7 +31,7 @@ namespace
 }
 
 CasGcScheduler::CasGcScheduler(
-    Cas::StorePtr store_,
+    Cas::PoolPtr store_,
     std::chrono::seconds interval_,
     const String & log_name,
     String disk_name_,

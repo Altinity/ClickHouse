@@ -3,7 +3,7 @@
 #include <cmath>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBuild.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasStore.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
@@ -56,14 +56,14 @@ using DB::Cas::tests::writeRawBlobBody;
 namespace
 {
 
-StorePtr openStore(const std::shared_ptr<InMemoryBackend> & b)
+PoolPtr openStore(const std::shared_ptr<InMemoryBackend> & b)
 {
-    return Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    return Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
 }
 
 /// Start a build whose owning manifest namespace + final ref name are `ns`/`ref` (promote/stageManifest
 /// derive the manifest namespace by splitting BuildInfo::intended_ref on the LAST '/').
-BuildPtr startBuildFor(const StorePtr & s, const RootNamespace & ns, const String & ref)
+BuildPtr startBuildFor(const PoolPtr & s, const RootNamespace & ns, const String & ref)
 {
     BuildInfo info;
     info.intended_ref = ns.string() + "/" + ref;
@@ -102,7 +102,7 @@ ManifestEntry blobManifestEntryStreaming(const String & path, const String & pay
 /// The full single-blob write flow (EDGE-BEFORE-OBSERVE wiring order):
 /// stageManifest(one entry) -> precommitAdd -> putBlob -> promote. Returns the committed ManifestId.
 ManifestId publishOneBlobPart(
-    const StorePtr & s, const RootNamespace & ns, const String & ref, const String & path, const String & payload)
+    const PoolPtr & s, const RootNamespace & ns, const String & ref, const String & path, const String & payload)
 {
     auto build = startBuildFor(s, ns, ref);
     const ManifestId id = build->stageManifest({blobManifestEntry(path, payload)});
@@ -112,7 +112,7 @@ ManifestId publishOneBlobPart(
     return id;
 }
 
-/// A one-shot backend hook (mirrors the WriteCountingBackend delegation pattern in gtest_cas_store.cpp):
+/// A one-shot backend hook (mirrors the WriteCountingBackend delegation pattern in gtest_cas_pool.cpp):
 /// it delegates every op to a wrapped Backend, but the FIRST time head(target_key) is called it fires a
 /// deleteExact(target_key, condemned_token) AFTER computing the (present) HEAD result and BEFORE returning
 /// it — simulating GC's exact-token content delete landing in the writer's HEAD->GET window (B136).
@@ -585,9 +585,9 @@ TEST(CasBuild, PutBlobResurrectVanishedReUploadsHeldBody)
 
     /// 3. Wrap the backend so the NEXT head(blob_key) returns the (present) result and THEN fires
     ///    deleteExact(blob_key, t0) exactly once — GC's delete in the HEAD->GET window. Open a FRESH
-    ///    Store over the hook so its retire view (refreshed at open) sees the condemnation.
+    ///    Pool over the hook so its retire view (refreshed at open) sees the condemnation.
     auto hook = std::make_shared<HeadThenDeleteOnceBackend>(b, blob_key, t0);
-    auto s = Store::open(hook, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    auto s = Pool::open(hook, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     auto build = s->startBuild({});
 
     /// 4. putBlob with a re-invokable body.
@@ -666,9 +666,9 @@ TEST(CasBuild, PutBlobCondemnedDedupNeverGetsTheDyingObject)
     b->deleteExact(blob_key, t0);
     ASSERT_FALSE(b->head(blob_key).exists);
 
-    /// 3. Open a fresh Store over a GET-counting wrapper; the retire view sees the condemnation at open.
+    /// 3. Open a fresh Pool over a GET-counting wrapper; the retire view sees the condemnation at open.
     auto counting = std::make_shared<GetCountingBackend>(b, blob_key);
-    auto s = Store::open(counting, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    auto s = Pool::open(counting, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     auto build = s->startBuild({});
 
     /// 4. putBlob Y — the object is absent (was deleted). The dedup-hit (PreconditionFailed) path
@@ -737,9 +737,9 @@ TEST(CasBuild, PutBlobCondemnedDedupPresentNeverGetsTheDyingObject)
     condemnMeta(*b, layout, u128Of("payload-Z"), /*condemn_round*/ 1);
     ASSERT_TRUE(b->head(blob_key).exists) << "blob must be PRESENT for the condemned-present path";
 
-    /// 3. Open a fresh Store over a GET-counting wrapper.
+    /// 3. Open a fresh Pool over a GET-counting wrapper.
     auto counting = std::make_shared<GetCountingBackend>(b, blob_key);
-    auto s = Store::open(counting, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    auto s = Pool::open(counting, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     auto build = s->startBuild({});
 
     /// 4. putBlob Z: putIfAbsentStream → PreconditionFailed (object present) → observeAndAdmit →
@@ -831,7 +831,7 @@ TEST(CasBuild, PutBlobVanishDuringRevivalReUploadsNotFatal)
     /// The blob does NOT need to pre-exist: the scripted backend models the conditional-PUT 412
     /// (object present at PUT time) independently of the inner store, then reports absent on HEAD.
     auto scripted = std::make_shared<ScriptedVanishBackend>(raw, blob_key);
-    auto s = Store::open(scripted, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    auto s = Pool::open(scripted, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     /// Wiring order (EDGE-BEFORE-OBSERVE): the revive re-observes via observeAndAdmit, which requires a
     /// durable precommit edge — stageManifest -> precommitAdd before putBlob.
     const RootNamespace ns_v{"srv/tbl"};
@@ -864,7 +864,7 @@ TEST(CasBuild, PromoteTrustsAdoptedLeafNoProbeManifestTrust)
     /// the trusted leaf. A KeyCountingBackend proves zero probes on the blob key and the blob-meta key.
     auto raw = std::make_shared<InMemoryBackend>();
     auto counting = std::make_shared<KeyCountingBackend>(raw);
-    auto s = Store::open(counting, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    auto s = Pool::open(counting, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     const RootNamespace ns{"srv1/tbl"};
 
     /// A committed-source blob lives in the shared pool (seeded via a throwaway build on the same store).
@@ -1189,7 +1189,7 @@ TEST(CasBuild, FirstPublishMakesNamespaceDiscoverable)
     /// After Task 4 the registry is deleted; a namespace becomes discoverable via LIST(cas/refs/)
     /// once its first ref shard exists (created by precommitAdd/promote).
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     const RootNamespace ns{"srv9/fresh"};
 
     EXPECT_TRUE(s->listNamespaces("").empty());
@@ -1239,13 +1239,13 @@ TEST(CasBuild, AdoptEvidenceNoBackendOp)
 
     auto raw = std::make_shared<InMemoryBackend>();
     auto counting = std::make_shared<LocalCountingBackend>(raw);
-    auto s = Store::open(counting, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    auto s = Pool::open(counting, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     auto build = s->startBuild({});
 
     /// A Blob ManifestEntry. adoptEvidence is called on a hand-crafted entry — that IS the B188 interface.
     const ManifestEntry entry = blobManifestEntry("b188.bin", "b188-content");
 
-    /// Reset the counters after Store::open (which may HEAD/GET gc/server-roots etc. during startup).
+    /// Reset the counters after Pool::open (which may HEAD/GET gc/server-roots etc. during startup).
     counting->heads = 0;
     counting->stream_puts = 0;
     counting->gets = 0;
@@ -1304,7 +1304,7 @@ TEST(CasBuild, ConvergesUnderProductiveGc)
     BlobRef h;
     Token h_token0;
     {
-        auto s0 = Store::open(b, cfg);
+        auto s0 = Pool::open(b, cfg);
         publishOneBlobPart(s0, ns, "part_1", "f", content);
         h = idOf(content);
         h_token0 = b->head(s0->layout().blobKey(h)).token;
@@ -1323,10 +1323,10 @@ TEST(CasBuild, ConvergesUnderProductiveGc)
                       .size = content.size()}});
     condemnMeta(*b, layout, u128Of(content), /*condemn_round*/ 1);
 
-    /// 3. Open the live Store and start build B. B dedup-hits the condemned H and re-uploads from
+    /// 3. Open the live Pool and start build B. B dedup-hits the condemned H and re-uploads from
     ///    source (uploadFromSource via putBlob): a fresh incarnation, a NEW token. B stays ACTIVE for
     ///    the whole adversarial loop — its build_seq is never retired below.
-    auto s = Store::open(b, cfg);
+    auto s = Pool::open(b, cfg);
     const String blob_key = s->layout().blobKey(h);
     auto build_b = startBuildFor(s, ns, "part_2");
 
@@ -1863,7 +1863,7 @@ TEST(CasBuildStageManifestRetry, AmbiguousTimeoutsThenCommitSucceedsWithinBudget
     CasRequestBudget budget;
     budget.retry_initial_backoff_ms = 0;
     auto b = std::make_shared<ManifestPutFaultBackend>();
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .cas_request_budget = budget});
+    auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .cas_request_budget = budget});
     const RootNamespace ns{"srv/tbl"};
 
     auto build = startBuildFor(s, ns, "part_retry");
@@ -1934,7 +1934,7 @@ TEST(CasBuildStageManifestRetry, BudgetExhaustionMapsToAborted)
     budget.max_attempts = 3;
     budget.retry_initial_backoff_ms = 0;   /// no real sleeps; the backoff schedule has its own tests
     auto b = std::make_shared<ManifestPutFaultBackend>();
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .cas_request_budget = budget});
+    auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .cas_request_budget = budget});
     const RootNamespace ns{"srv/tbl"};
 
     auto build = startBuildFor(s, ns, "part_exhausted");
@@ -2033,13 +2033,13 @@ private:
 };
 
 /// Zero-backoff store over a BlobPutFaultBackend: the sleep schedule has its own controller-level
-/// tests; these Store-level tests pin the retry/resolve/abort semantics without real sleeps.
-StorePtr openBlobFaultStore(const std::shared_ptr<BlobPutFaultBackend> & b, uint32_t max_attempts = CasRequestBudget{}.max_attempts)
+/// tests; these Pool-level tests pin the retry/resolve/abort semantics without real sleeps.
+PoolPtr openBlobFaultStore(const std::shared_ptr<BlobPutFaultBackend> & b, uint32_t max_attempts = CasRequestBudget{}.max_attempts)
 {
     CasRequestBudget budget;
     budget.max_attempts = max_attempts;
     budget.retry_initial_backoff_ms = 0;
-    return Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .cas_request_budget = budget});
+    return Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .cas_request_budget = budget});
 }
 
 /// A replayable BlobSource that COUNTS its own re-streams — pins INV-1's "retry = fresh re-stream

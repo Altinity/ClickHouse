@@ -1,7 +1,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEvent.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasStore.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFoldSealFormat.h>
@@ -38,10 +38,10 @@ void onGcEnumerationPage()
 /// A namespace is rooted by `server_root_id`, but that id is a clean relative path and can contain
 /// slashes. Try namespace prefixes from longest to shortest and accept the first durable mount body.
 /// No mount => no authority => fail open / not eligible. On the writable path the mount's
-/// `writer_epoch` is the same durable value the old watermark's `epoch` carried (CasStore.cpp "THE
+/// `writer_epoch` is the same durable value the old watermark's `epoch` carried (CasPool.cpp "THE
 /// BRIDGE"), so `{writer_epoch, min_active}` are consumed exactly where `ServerWatermark::{epoch,
 /// min_active}` were.
-std::optional<MountLease> floorForNamespace(Store & store, const RootNamespace & ns)
+std::optional<MountLease> floorForNamespace(Pool & store, const RootNamespace & ns)
 {
     const String & value = ns.string();
     size_t pos = value.size();
@@ -89,7 +89,7 @@ std::optional<ListedManifestObject> parseListedManifestObject(const Layout & lay
 /// fold seal at `(snap_generation, snap_attempt)`; {0,0} when no seal covers it yet (fresh pool). A
 /// manifest removed by a log ABOVE this cursor has NOT had its `-1` decrement folded, so its body is still
 /// load-bearing (delete-after-sealed-decrements).
-RefTxnId sealedRefCursor(Store & store, const RootNamespace & ns)
+RefTxnId sealedRefCursor(Pool & store, const RootNamespace & ns)
 {
     const Layout & layout = store.layout();
     const auto state_got = store.backend().get(layout.gcStateKey());
@@ -122,11 +122,11 @@ RefTxnId sealedRefCursor(Store & store, const RootNamespace & ns)
 /// is no PER-NAMESPACE durable trace to detect this from cold storage (nothing was ever published),
 /// so the general cross-process case stays a documented carve-out -- same footing as the Removed
 /// carve-out (a namespace-removal snapshot that is also not a "seal" by this same field). What CAN be
-/// caught cheaply, with zero risk of a false positive, is the narrow case where the very same Store
-/// that lived through the unclean reclaim is also the one running this check (`Store::
+/// caught cheaply, with zero risk of a false positive, is the narrow case where the very same Pool
+/// that lived through the unclean reclaim is also the one running this check (`Pool::
 /// ownsAndSawUncleanBoundaryFor`): a listed log strictly below its own live epoch, with no snapshot
 /// at all to explain its presence, is then unambiguous.
-void reportLateLogsIfAny(Store & store, const RootNamespace & ns, const RecoveredRefTable & recovered,
+void reportLateLogsIfAny(Pool & store, const RootNamespace & ns, const RecoveredRefTable & recovered,
                           const std::vector<RefTxnId> & logs, LateLogDedup * dedup)
 {
     const Layout & layout = store.layout();
@@ -212,7 +212,7 @@ void reportLateLogsIfAny(Store & store, const RootNamespace & ns, const Recovere
 /// Keys (not ManifestIds) so a listed object key can be tested directly. Throws on a corrupt snapshot /
 /// invalid transaction (via `recoverRefTable` / `decodeRefLogTxn`); the caller SKIPS the namespace's
 /// deletions on such a throw rather than substituting an empty owner set.
-std::set<String> activeManifestKeys(Store & store, const RootNamespace & ns, LateLogDedup * dedup)
+std::set<String> activeManifestKeys(Pool & store, const RootNamespace & ns, LateLogDedup * dedup)
 {
     std::set<String> active;
     const Layout & layout = store.layout();
@@ -259,7 +259,7 @@ std::set<String> activeManifestKeys(Store & store, const RootNamespace & ns, Lat
 
 }
 
-bool prefixEligible(Store & store, const RootNamespace & ns, const BuildPrefix & prefix)
+bool prefixEligible(Pool & store, const RootNamespace & ns, const BuildPrefix & prefix)
 {
     /// OQ6: durable watermark fact only. A missing watermark => NOT eligible (control #9: never a
     /// frozen-seq / judged-dead guess). Compare writer_epoch first, then build_sequence, so old-epoch
@@ -278,7 +278,7 @@ bool prefixEligible(Store & store, const RootNamespace & ns, const BuildPrefix &
     return w.min_active > prefix.build_sequence;
 }
 
-uint64_t sweepNamespace(Store & store, const RootNamespace & ns, const BuildPrefix & prefix,
+uint64_t sweepNamespace(Pool & store, const RootNamespace & ns, const BuildPrefix & prefix,
                         std::vector<String> * warnings, LateLogDedup * dedup)
 {
     if (!prefixEligible(store, ns, prefix))
@@ -349,7 +349,7 @@ uint64_t sweepNamespace(Store & store, const RootNamespace & ns, const BuildPref
 }
 
 ManifestSweepResult sweepManifestCursorPage(
-    Store & store,
+    Pool & store,
     const String & cursor,
     uint64_t list_budget,
     uint64_t delete_budget,

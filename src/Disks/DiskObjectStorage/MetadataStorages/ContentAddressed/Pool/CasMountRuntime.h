@@ -25,8 +25,8 @@ using BuildPtr = std::shared_ptr<Build>;
 
 /// Per-owner config slice for the mount-runtime subsystem (spec §PoolConfig Slices). A PROJECTION of the
 /// flat `PoolConfig` fields, built on demand by `PoolConfig::mountConfig` and passed BY VALUE to
-/// `CasMountRuntime` (Phase 3.5). Lives here (not in `CasStore.h`) so `CasMountRuntime.h` -- a lower-layer
-/// header `CasStore.h` includes for the `mount_runtime` member -- carries its own config type; the flat
+/// `CasMountRuntime` (Phase 3.5). Lives here (not in `CasPool.h`) so `CasMountRuntime.h` -- a lower-layer
+/// header `CasPool.h` includes for the `mount_runtime` member -- carries its own config type; the flat
 /// `PoolConfig` fields stay put so every external caller (wiring, tests) that sets them is unchanged.
 struct MountConfig
 {
@@ -57,7 +57,7 @@ struct MountFence
 {
     UInt128 server_uuid{};
     uint64_t writer_epoch = 0;
-    /// Permissive default (set in the Store ctor): until something arms a real lease deadline, the
+    /// Permissive default (set in the Pool ctor): until something arms a real lease deadline, the
     /// fence allows mutations — so existing tests and pre-Task-7 behavior are unchanged. UINT64_MAX =
     /// unarmed (never expires); otherwise a CLOCK_BOOTTIME-milliseconds instant.
     std::atomic<uint64_t> deadline_boot_ms{std::numeric_limits<uint64_t>::max()};
@@ -65,18 +65,18 @@ struct MountFence
 };
 
 /// The mount / write-fence / build-watermark / self-remount runtime (spec §Decomposition), extracted
-/// from `Cas::Store` (Phase 3.5 source-layout). It owns the `MountLeaseKeeper` (the mount-lease
+/// from `Cas::Pool` (Phase 3.5 source-layout). It owns the `MountLeaseKeeper` (the mount-lease
 /// heartbeat), the local `MountFence`, the per-server build watermark (`process_epoch` +
 /// `builds_mutex`/`next_build_seq`/`active_build_seqs`/`inflight_builds`), the live-incarnation
 /// `live_writer_epoch`, the unclean-epoch-boundary high-water-mark, and the self-remount recovery thread
-/// (with its own thread-lifecycle locks). `Store` keeps the CLAIM/RECOVERY orchestration
+/// (with its own thread-lifecycle locks). `Pool` keeps the CLAIM/RECOVERY orchestration
 /// (`open`/`mountWritable`/`openForDecommission`/`tryRemountOnce`) and drives these owned PRIMITIVES;
-/// `remount_mutex` (which serializes `tryRemountOnce`'s orchestration) therefore STAYS on `Store`.
+/// `remount_mutex` (which serializes `tryRemountOnce`'s orchestration) therefore STAYS on `Pool`.
 ///
-/// PURE relocation from `Store` -- zero logic, flow, or lock change. Environment is injected by
-/// reference/value (no `Store &` back-reference): the backend, the layout, the `MountConfig` slice, the
+/// PURE relocation from `Pool` -- zero logic, flow, or lock change. Environment is injected by
+/// reference/value (no `Pool &` back-reference): the backend, the layout, the `MountConfig` slice, the
 /// `server_root_id`, the event sink, the pool `CasRequestBudget`, and the `remount_attempt` callback
-/// (== `Store::tryRemountOnce`, the body the recovery thread loops on). `Store` keeps thin public
+/// (== `Pool::tryRemountOnce`, the body the recovery thread loops on). `Pool` keeps thin public
 /// delegates for every currently-public method so the wiring, `Build`, `Gc`, the `ref_ledger` callbacks,
 /// and every test call site are unchanged.
 class CasMountRuntime
@@ -89,12 +89,12 @@ public:
         String server_root_id_,
         const CasEventSink & event_sink_,
         CasRequestBudget cas_request_budget_,
-        /// The body the self-remount recovery thread loops on (== `Store::tryRemountOnce`). Bound at
-        /// construction; captures the owning `Store` (invoked only at runtime, post-construction).
+        /// The body the self-remount recovery thread loops on (== `Pool::tryRemountOnce`). Bound at
+        /// construction; captures the owning `Pool` (invoked only at runtime, post-construction).
         std::function<bool()> remount_attempt_);
 
     /// ---- per-server watermark surface (spec 2026-06-16-ca-build-watermark) ----
-    /// process_epoch: random nonzero per Store (process). GC checks epoch EQUALITY, never ordering.
+    /// process_epoch: random nonzero per Pool (process). GC checks epoch EQUALITY, never ordering.
     uint64_t epoch() const { return process_epoch.load(std::memory_order_acquire); }
     uint64_t writerEpoch() const { return process_epoch.load(std::memory_order_acquire); }
     /// The GC floor: the oldest in-flight build_seq, or next_build_seq when no build is active (so a
@@ -121,14 +121,14 @@ public:
     /// RFC pre-attempt fence check: extends `mayMutate` with the REMAINING budget check -- an attempt
     /// is not even started unless there is enough of the mount lease left for one more attempt_timeout
     /// plus the lease safety margin. Passed as `fence_ok` to every `CasRequestController` call the
-    /// ref-log writer path makes (via the `ref_ledger`'s `fence_ok_fn`, which `Store` binds to this).
+    /// ref-log writer path makes (via the `ref_ledger`'s `fence_ok_fn`, which `Pool` binds to this).
     bool refAppendFenceOk() const;
 
     /// The writer_epoch of the LIVE mount incarnation. Bumped by `tryRemountOnce` (self-remount after a
     /// GC fence-out) — a `Build` minted under an older epoch fails closed on its next step.
     uint64_t liveWriterEpoch() const { return live_writer_epoch.load(std::memory_order_acquire); }
 
-    /// ---- build registry (populated by Store::startBuild, retired by the Build) ----
+    /// ---- build registry (populated by Pool::startBuild, retired by the Build) ----
     /// Allocate a strictly-increasing build_seq and add it to the active set.
     uint64_t allocateBuildSeq();
     /// Register the in-flight build so `dropNamespace`'s post-durable cancellation can reach it (weak_ptr).
@@ -137,12 +137,12 @@ public:
     void retireBuildSeq(uint64_t seq);
     /// Cancel every in-flight build targeting `ns` once its removal transaction is durable (spec
     /// §Namespace Removal: "cancels local builds"). Collects the live shared_ptrs under `builds_mutex`
-    /// and cancels OUTSIDE the lock. Injected into `ref_ledger` (via a Store delegate) as the
+    /// and cancels OUTSIDE the lock. Injected into `ref_ledger` (via a Pool delegate) as the
     /// `cancel_inflight_builds` callback.
     void cancelInflightBuildsForNamespace(const RootNamespace & ns);
 
     /// ---- process epoch (identity) ----
-    /// Mint the random NONZERO `process_epoch` (`Store::open`'s read-only prologue). GC checks it for
+    /// Mint the random NONZERO `process_epoch` (`Pool::open`'s read-only prologue). GC checks it for
     /// equality only (a different epoch == a dead incarnation).
     void mintRandomProcessEpoch();
     /// Set `process_epoch` to the durable `writer_epoch` (the identity bridge). `order` is caller-chosen
@@ -156,7 +156,7 @@ public:
     /// Construct the `MountLeaseKeeper` adopting (our_uuid, writer_epoch) and wire its fence callbacks
     /// (renew-ok refreshes the fence deadline; on-lost latches the fence + arms a self-remount) plus its
     /// build-watermark `minActive` reader and the event sink -- all captured on THIS runtime. Encapsulates
-    /// the pre-move keeper-construction block verbatim; `keeperStart` is separate so `Store`'s claim
+    /// the pre-move keeper-construction block verbatim; `keeperStart` is separate so `Pool`'s claim
     /// orchestration can catch `MountFencedException` and retry (`keeperReset` + a fresh epoch).
     void installKeeper(UInt128 our_uuid, uint64_t writer_epoch, const std::function<uint64_t()> & now_ms);
     void keeperStart();                                       /// adopt the slot (durable when it returns)
@@ -166,7 +166,7 @@ public:
     bool hasKeeper() const { return static_cast<bool>(mount_keeper); }
 
     /// The `writer_epoch` a writable open/self-remount JUST reclaimed over an unclean predecessor -- a
-    /// per-epoch high-water-mark (relaxed), 0 = never. Set by `Store`'s claim orchestration.
+    /// per-epoch high-water-mark (relaxed), 0 = never. Set by `Pool`'s claim orchestration.
     void setUncleanEpochBoundarySeenAt(uint64_t v);
     uint64_t uncleanEpochBoundarySeenAtRelaxed() const
     {
@@ -195,7 +195,7 @@ public:
     /// ---- self-remount recovery (liveness counterpart of the fence-out safety rule) ----
     /// `scheduleRemount` (called from the keeper's renew-failure path in production; gated on
     /// `background_watermark` like every background thread) runs the `remount_attempt` callback
-    /// (`Store::tryRemountOnce`) with exponential backoff until it succeeds or teardown begins.
+    /// (`Pool::tryRemountOnce`) with exponential backoff until it succeeds or teardown begins.
     void scheduleRemount();
     /// Test seam: drive the arm/refuse path directly. Returns true iff a recovery thread is armed after.
     bool scheduleRemountForTest();
@@ -208,7 +208,7 @@ public:
         return schedule_remount_calls_for_test.load(std::memory_order_relaxed);
     }
 
-    /// ---- teardown (driven by ~Store, in this order) ----
+    /// ---- teardown (driven by ~Pool, in this order) ----
     /// Stop + join the self-remount recovery thread FIRST (it may otherwise re-create the keeper).
     void stopRemountThread();
     /// Retire the merged heartbeat: `drained` (from the ref-ledger drain) selects the clean farewell
@@ -216,17 +216,17 @@ public:
     /// remount-thread re-join.
     void finishTeardown(bool drained);
 
-    /// rev.6 Task 6 / S13 observation loop: the ONE seam both `Store::open`'s mount-claim observation
+    /// rev.6 Task 6 / S13 observation loop: the ONE seam both `Pool::open`'s mount-claim observation
     /// poll and the `materialization_grace_ms` wait go through. Routes through `config.wait_sleep_fn`
     /// when a test injected one, else a real `std::this_thread::sleep_for` (production, unchanged).
     void waitSleep(uint64_t ms) const;
 
-    /// The keeper's event callback routes here (mirrors `Store::emitEvent`): the injected sink reference
+    /// The keeper's event callback routes here (mirrors `Pool::emitEvent`): the injected sink reference
     /// observes the late `setEventSink` assignment exactly as the pre-move `s->emitEvent` capture did.
     void emitEvent(CasEvent && e) const { if (event_sink) event_sink(std::move(e)); }
 
 private:
-    /// ---- injected environment (no `Store` back-reference); initialized first, in this order ----
+    /// ---- injected environment (no `Pool` back-reference); initialized first, in this order ----
     BackendPtr backend_ptr;
     const Layout & layout;
     MountConfig config;

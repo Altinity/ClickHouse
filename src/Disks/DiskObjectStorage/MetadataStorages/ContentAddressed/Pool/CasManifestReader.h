@@ -21,13 +21,13 @@ struct BlobLocation
     uint64_t length = 0;
 };
 
-/// The manifest read path, extracted from `Store` (spec §Decomposition): the mandatory-HEAD +
+/// The manifest read path, extracted from `Pool` (spec §Decomposition): the mandatory-HEAD +
 /// fail-closed-validation + decode of a part manifest, plus the token-gated byte-weighted decode
-/// cache and blob `locate`. Environment is injected by reference (no `Store` back-reference): the
+/// cache and blob `locate`. Environment is injected by reference (no `Pool` back-reference): the
 /// backend, the layout, the pool meta (for the fixed `blob_header_len`), and the event sink.
 ///
 /// The decode cache is a `CacheBase` LRU — its synchronization is INTERNAL to `CacheBase`; this
-/// component owns no `Store`-level mutex. `nullptr` <=> caching disabled
+/// component owns no `Pool`-level mutex. `nullptr` <=> caching disabled
 /// (`manifest_decode_cache_bytes == 0`).
 class CasManifestReader
 {

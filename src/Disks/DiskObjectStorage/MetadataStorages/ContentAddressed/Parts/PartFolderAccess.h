@@ -38,7 +38,7 @@ enum class Freshness
 // ===== PartFolderView (merge #7: the value/view over the pool) =====
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPartManifestFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasStore.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <memory>
 #include <optional>
 #include <string>
@@ -50,7 +50,7 @@ namespace DB::ContentAddressed
 /// Immutable snapshot of one resolved committed part/projection folder (spec
 /// 2026-07-08-cas-part-folder-cache §PartFolderView). Index-free: the decoder guarantees strictly
 /// ascending canonical path order, so file lookup is a binary search and directory listing is a
-/// contiguous range scan over the SHARED decode (`manifest` is the same object the Store's
+/// contiguous range scan over the SHARED decode (`manifest` is the same object the Pool's
 /// manifest cache holds). No I/O; never mutated after construction. All answers are pure functions
 /// of the members. All-tree-part-files Task 9: the mutable-files serving this view used to provide
 /// (a separate out-of-band payload, refreshed independently of the manifest) is gone — every
@@ -108,7 +108,7 @@ private:
 }
 
 // ===== PartFolderValidate + CachedPartFolderAccess (merge #7: the cache of one mechanism) =====
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasStore.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Common/CacheBase.h>
 #include <Common/CurrentMetrics.h>
 #include <functional>
@@ -171,12 +171,12 @@ public:
     /// nested class's (`CacheParams`) default member initializers can be evaluated, and a default
     /// argument written inside the class body is evaluated too early. Two overloads sidestep it; the
     /// single-arg form default-constructs `CacheParams` (retention disabled) out-of-line.
-    explicit CachedPartFolderAccess(Cas::StorePtr store_);
+    explicit CachedPartFolderAccess(Cas::PoolPtr store_);
     /// `now_ms_fn_`: wall-clock ms, injected (tests) for the §3 age-window comparison AND the
     /// retained view's `validated_at_ms` stamp -- the SAME function drives both, so a test controls
     /// each side of the comparison exactly. Defaults to `std::chrono::system_clock` (mirrors
     /// `Cas::Gc`'s `now_ms_fn` convention) when empty.
-    CachedPartFolderAccess(Cas::StorePtr store_, CacheParams params_, std::function<uint64_t()> now_ms_fn_ = {});
+    CachedPartFolderAccess(Cas::PoolPtr store_, CacheParams params_, std::function<uint64_t()> now_ms_fn_ = {});
 
     /// Resolve + validated manifest read, joined into a view. nullptr = the ref is absent.
     /// EVERY mode re-proves the manifest body via `readManifestShared`'s mandatory HEAD in this
@@ -239,7 +239,7 @@ public:
     size_t explainJournalSizeForTest() const;
 
 private:
-    Cas::StorePtr store;
+    Cas::PoolPtr store;
     CacheParams params;
     /// §3: wall-clock ms; see the ctor doc comment. `std::function::operator()` is const, so this is
     /// callable from const methods (`getView`, `buildView`) without a `mutable` qualifier.

@@ -94,7 +94,7 @@ BlobSource BlobSource::fromString(String bytes)
     return source;
 }
 
-Build::Build(StorePtr store_, UInt128 build_id_,
+Build::Build(PoolPtr store_, UInt128 build_id_,
              uint64_t build_seq_, uint64_t epoch_, BuildInfo info_)
     : store(std::move(store_))
     , build_id(build_id_)
@@ -477,7 +477,7 @@ void Build::uploadFromSource(ObjectKind kind, const BlobRef & ref, const String 
     /// `count()` (total bytes written so far) — the streaming equivalent of the old pre-materialized
     /// size check, with no full in-memory copy. A mismatch is a LOGICAL_ERROR (a buggy/racing source).
     ///
-    /// The whole conditional create rides the Store's shared request controller
+    /// The whole conditional create rides the Pool's shared request controller
     /// (`conditionalCreateControlled` — availfix, chaos-tolerance-report §Task B verdict's "any other
     /// controller-bypassing conditional-write call site"): budgeted attempts + fence-gated backoff +
     /// exact-key OCCUPANCY resolve, replacing the old bare single attempt whose whole S3-blip tolerance
@@ -736,7 +736,7 @@ ManifestId Build::stageManifest(std::vector<ManifestEntry> entries)
         throw Exception(ErrorCodes::LIMIT_EXCEEDED,
             "stageManifest: total inline {} bytes exceeds cap {}", inline_total, kMaxManifestInlineBytesTotal);
 
-    /// Mint the identity. `epoch` is the Store's durable writer_epoch; `build_seq` is monotone inside
+    /// Mint the identity. `epoch` is the Pool's durable writer_epoch; `build_seq` is monotone inside
     /// that epoch; `manifest_ordinal` is monotone inside this Build. Together with the owning namespace
     /// this gives NoManifestIdReuse by construction, with no random manifest instance id.
     if (next_manifest_ordinal > kMaxManifestOrdinal)
@@ -765,7 +765,7 @@ ManifestId Build::stageManifest(std::vector<ManifestEntry> entries)
     const ManifestId id{owning_ns, ref};
     const String key = store->layout().manifestKey(id);
 
-    /// Body PUT through the Store's shared request controller (chaos-tolerance-report §Task B):
+    /// Body PUT through the Pool's shared request controller (chaos-tolerance-report §Task B):
     /// budgeted attempts + resolve-before-reissue, replacing the old bare single-attempt write whose
     /// whole S3-blip tolerance was ONE ~3s adaptive-timeout attempt (a 19s object-store pause killed an
     /// INSERT through it while every plain read/write path survived — v3 soak evidence). Reissuing this
@@ -777,7 +777,7 @@ ManifestId Build::stageManifest(std::vector<ManifestEntry> entries)
     /// PreconditionFailed->LOGICAL_ERROR mapping.
     ///
     /// fence_ok is the ref lane's own mount predicate (`refAppendFenceOk`: fence not lost + enough
-    /// lease left for one more attempt): staging runs on this writable Store under that same mount
+    /// lease left for one more attempt): staging runs on this writable Pool under that same mount
     /// lease, and a fenced writer must not keep PUTting bodies ahead of a precommitAdd that would fail
     /// the same fence anyway. There is no ref-table runtime here, so the lane's extra
     /// `superseded_by_remount` term does not apply.
@@ -1129,7 +1129,7 @@ void Build::abandon()
     /// BUG 2 / TLA+ `WAbandonPrecommit`: if this build made a manifest a LIVE precommit owner input
     /// (`precommitAdd` ran), abandoning it must NOT writer-delete that body. Instead append an exact
     /// precommit-removal ref-log transaction (spec §Remove Precommit), mirroring EXACTLY the removal
-    /// shape `Store::dropRef` and the fenced-successor stale-precommit sweep use (an old_binding naming
+    /// shape `Pool::dropRef` and the fenced-successor stale-precommit sweep use (an old_binding naming
     /// the exact precommit, no new_binding). GC then folds the `-1` blob decrements and deletes the
     /// body only after they are sealed (delete-after-sealed-decrements). Deleting a live precommit body
     /// here would strand GC's fold barrier (live precommit, missing body → clamp forever) or lose the

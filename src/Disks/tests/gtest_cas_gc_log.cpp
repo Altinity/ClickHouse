@@ -2,7 +2,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBuild.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasStore.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcScheduler.h>
 #include <Disks/tests/cas_test_helpers.h>
 
@@ -14,8 +14,8 @@
 /// Unit coverage for the CA GC scheduler's logging sink (the source of
 /// `system.content_addressed_garbage_collection_log`). The scheduler emits a Start + Finish
 /// `GcRoundLogRecord` per round through the injected `GcRoundLogger`; here we capture the records in
-/// a vector and assert their shape over a real (in-memory) Store driven through a dropped-then-
-/// collectable object — the same Store/Backend fixture the B140 reclaim test uses.
+/// a vector and assert their shape over a real (in-memory) Pool driven through a dropped-then-
+/// collectable object — the same Pool/Backend fixture the B140 reclaim test uses.
 ///
 /// NOTE on ProfileEvents: `runOneRoundNow` runs on THIS (bare gtest) thread, which has no attached
 /// `ThreadStatus`, so the scheduler's `CurrentThread::isInitialized()` guard skips per-round
@@ -37,7 +37,7 @@ namespace
 {
 
 /// Publish one part `ref` with a single content blob whose payload is `payload`. Returns the manifest id.
-ManifestId publishPart(const StorePtr & s, const String & ns, const String & ref, const String & payload)
+ManifestId publishPart(const PoolPtr & s, const String & ns, const String & ref, const String & payload)
 {
     const RootNamespace nsr{ns};
     BuildInfo info;
@@ -70,7 +70,7 @@ TEST(CasGcLog, EmitsStartFinishWithCounts)
     /// (no direct Gc handle to override per-instance) expecting each to fold; force fold-every-round
     /// (Phase-4 Lever A would otherwise defer once the pool quiesces, stalling the mark-then-delete
     /// pipeline within the round budget).
-    auto store = Store::open(backend,
+    auto store = Pool::open(backend,
         PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_fold_max_defer_rounds = 0});
     const RootNamespace ns{"srv1/tbl"};
 
@@ -175,7 +175,7 @@ public:
         return InMemoryBackend::head(key);
     }
 
-    /// Armed only after Store::open, so opening (which reads/initialises gc state) succeeds.
+    /// Armed only after Pool::open, so opening (which reads/initialises gc state) succeeds.
     std::atomic<bool> arm{false};
 };
 
@@ -195,7 +195,7 @@ public:
 TEST(CasGcSchedulerSteal, ManualRoundNeverStealsEvenADeadIncumbent)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
 
     /// A foreign incumbent takes the lease and then DIES (never renews, never heartbeats).
     const UInt128 kIncumbent = hexToU128("00000000000000000000000000000abc");
@@ -221,7 +221,7 @@ TEST(CasGcSchedulerSteal, ManualRoundNeverStealsEvenADeadIncumbent)
 TEST(CasGcSchedulerSteal, ManualRoundNeverStealsALiveHeartbeatingIncumbent)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
 
     const UInt128 kIncumbent = hexToU128("00000000000000000000000000000abc");
     Gc incumbent(store, kIncumbent);
@@ -244,7 +244,7 @@ TEST(CasGcSchedulerSteal, ManualRoundNeverStealsALiveHeartbeatingIncumbent)
 TEST(CasGcLog, AbortedFinishOnThrowingRound)
 {
     auto backend = std::make_shared<ThrowingBackend>();
-    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
 
     std::vector<Rec> rows;
     DB::ContentAddressed::CasGcScheduler sched(
@@ -270,7 +270,7 @@ TEST(CasGcLog, AbortedFinishOnThrowingRound)
 TEST(CasGcHealth, ReflectsLeadershipAndPendingReclaim)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = Store::open(backend,
+    auto store = Pool::open(backend,
         PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_fold_max_defer_rounds = 0});
     const RootNamespace ns{"srv1/tbl"};
     publishPart(store, ns.string(), "all_0_0_0", "hello-cas-gc-health");

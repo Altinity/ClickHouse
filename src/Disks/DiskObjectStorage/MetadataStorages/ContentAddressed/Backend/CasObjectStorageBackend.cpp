@@ -148,7 +148,7 @@ void ObjectStorageBackend::checkStorePreconditions()
 /// IObjectStorage (LocalObjectStorage) to exercise OTHER behaviors in isolation — the established
 /// convention throughout this test suite (see e.g. gtest_cas_backend_generation.cpp). A REAL writable
 /// mount, by contrast, always reaches this check: runCapabilityProbe (CasProbe.cpp) calls it for
-/// every non-read-only Store::open, so production never silently runs Native-mode conditional writes
+/// every non-read-only Pool::open, so production never silently runs Native-mode conditional writes
 /// under the disk's default (~500-attempt) transparent retry policy.
 void ObjectStorageBackend::checkConditionalWriteSingleAttemptSupport()
 {
@@ -560,7 +560,7 @@ std::optional<GetResult> ObjectStorageBackend::get(const String & key, Range ran
 
         /// The object may be deleted between the HEAD above and the GET below (a GC or concurrent
         /// writer racing the read window). Catch the not-found signal and honor the `optional`
-        /// contract — callers such as `Store::loadShardDecoded` already handle a nullopt return and
+        /// contract — callers such as `Pool::loadShardDecoded` already handle a nullopt return and
         /// treat it as "raced a deletion, absent". Any other error (network, auth, corruption)
         /// propagates unchanged — fail-closed by construction.
         GetResult gr;

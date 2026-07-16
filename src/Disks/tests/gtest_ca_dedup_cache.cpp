@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBuild.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasStore.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/ProfileEvents.h>
@@ -63,7 +63,7 @@ PoolConfig cfg(uint64_t cache_bytes, uint64_t head_first_min_bytes)
 /// Task 2: the cache itself — add then contains.
 TEST(CaDedupCache, AddThenContains)
 {
-    auto s = Store::open(std::make_shared<InMemoryBackend>(), cfg(64ULL << 20, 1ULL << 20));
+    auto s = Pool::open(std::make_shared<InMemoryBackend>(), cfg(64ULL << 20, 1ULL << 20));
     const DB::UInt128 h = u128Of("x");
     EXPECT_FALSE(s->dedupCacheContains(DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(h)}));
     s->dedupCacheAdd(DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(h)});
@@ -73,7 +73,7 @@ TEST(CaDedupCache, AddThenContains)
 /// Task 2: dedup_cache_bytes == 0 disables the cache — add is a no-op, contains is always false.
 TEST(CaDedupCache, DisabledNeverContains)
 {
-    auto s = Store::open(std::make_shared<InMemoryBackend>(), cfg(/*cache_bytes*/ 0, 1ULL << 20));
+    auto s = Pool::open(std::make_shared<InMemoryBackend>(), cfg(/*cache_bytes*/ 0, 1ULL << 20));
     const DB::UInt128 h = u128Of("x");
     s->dedupCacheAdd(DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(h)});
     EXPECT_FALSE(s->dedupCacheContains(DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(h)}));
@@ -83,7 +83,7 @@ TEST(CaDedupCache, DisabledNeverContains)
 /// earliest-added hash is evicted while a recently-added one survives.
 TEST(CaDedupCache, BoundedByBytes)
 {
-    auto s = Store::open(std::make_shared<InMemoryBackend>(), cfg(/*cache_bytes*/ 256, 1ULL << 20));
+    auto s = Pool::open(std::make_shared<InMemoryBackend>(), cfg(/*cache_bytes*/ 256, 1ULL << 20));
     const DB::UInt128 first = u128Of("k0");
     s->dedupCacheAdd(DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(first)});
     for (int i = 1; i < 100; ++i)
@@ -93,12 +93,12 @@ TEST(CaDedupCache, BoundedByBytes)
 }
 
 /// Task 5 (P1): a cache hit takes the HEAD-first path and skips the body PUT entirely.
-/// (Counters are reset right before each measured putBlob — Store::open's probe/watermark and
+/// (Counters are reset right before each measured putBlob — Pool::open's probe/watermark and
 /// startBuild's heartbeat issue their own backend ops that are irrelevant to the trade-off under test.)
 TEST(CaDedupCache, HitTakesHeadFirstNoBodyPut)
 {
     auto counting = std::make_shared<CountingBackend>(std::make_shared<InMemoryBackend>());
-    auto s = Store::open(counting, cfg(64ULL << 20, 1ULL << 20));
+    auto s = Pool::open(counting, cfg(64ULL << 20, 1ULL << 20));
 
     /// First writer: small body, cold cache, below the P2 size threshold ⇒ a normal body PUT.
     auto b1 = s->startBuild({});
@@ -136,7 +136,7 @@ TEST(CaDedupCache, HitMissCountersIncrement)
 {
     using ProfileEvents::global_counters;
     auto counting = std::make_shared<CountingBackend>(std::make_shared<InMemoryBackend>());
-    auto s = Store::open(counting, cfg(64ULL << 20, 1ULL << 20));
+    auto s = Pool::open(counting, cfg(64ULL << 20, 1ULL << 20));
 
     const auto miss_before = global_counters[ProfileEvents::CasDedupCacheMisses].load();
     const auto hits_before = global_counters[ProfileEvents::CasDedupCacheHits].load();
@@ -171,7 +171,7 @@ TEST(CaDedupCache, HitMissCountersIncrement)
 TEST(CaDedupCache, StaleHitFallsThroughToPut)
 {
     auto counting = std::make_shared<CountingBackend>(std::make_shared<InMemoryBackend>());
-    auto s = Store::open(counting, cfg(64ULL << 20, 1ULL << 20));
+    auto s = Pool::open(counting, cfg(64ULL << 20, 1ULL << 20));
 
     /// Poison the cache: claim "stale" is present though nothing was ever uploaded.
     s->dedupCacheAdd(DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(u128Of("stale"))});
@@ -192,7 +192,7 @@ TEST(CaDedupCache, StaleHitFallsThroughToPut)
 TEST(CaDedupCache, LargeBlobMissTakesHeadFirst)
 {
     auto counting = std::make_shared<CountingBackend>(std::make_shared<InMemoryBackend>());
-    auto s = Store::open(counting, cfg(64ULL << 20, /*head_first_min_bytes*/ 1));
+    auto s = Pool::open(counting, cfg(64ULL << 20, /*head_first_min_bytes*/ 1));
 
     auto b = s->startBuild({});
     counting->heads = 0;

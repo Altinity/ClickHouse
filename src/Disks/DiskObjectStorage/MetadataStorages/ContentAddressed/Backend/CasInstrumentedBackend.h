@@ -10,7 +10,7 @@ namespace DB::Cas
 /// Every CA S3 op flows through the abstract `Backend` seam. `InstrumentedBackend` is a transparent
 /// decorator that wraps an inner `BackendPtr`, delegates every method faithfully, and increments a
 /// ProfileEvent keyed by the key's NAMESPACE × the OPERATION+OUTCOME. Wrapping the pool backend once
-/// in `Store::open` makes writer AND GC ops attributable, for both the S3 and in-memory backends.
+/// in `Pool::open` makes writer AND GC ops attributable, for both the S3 and in-memory backends.
 ///
 /// Motivation: `part_log` shows `put=0` because PUTs ride a background threadpool, so we need a
 /// backend-level chokepoint to attribute the S3 op-count (PUTs/HEADs/404s/412s/LISTs) by CA op type.

@@ -4,7 +4,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcShardPlan.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasStore.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Common/ProfileEvents.h>
 #include "cas_test_helpers.h"
 
@@ -62,19 +62,19 @@ bool manifestExists(InMemoryBackend & b, const Layout & layout, const ManifestId
     return b.head(layout.manifestKey(id)).exists;
 }
 
-StorePtr openTestStore(std::shared_ptr<InMemoryBackend> & out_backend)
+PoolPtr openTestStore(std::shared_ptr<InMemoryBackend> & out_backend)
 {
     out_backend = std::make_shared<InMemoryBackend>();
-    return Store::open(out_backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    return Pool::open(out_backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
 }
 
-StorePtr openTestStoreWithConfig(std::shared_ptr<InMemoryBackend> & out_backend, PoolConfig config)
+PoolPtr openTestStoreWithConfig(std::shared_ptr<InMemoryBackend> & out_backend, PoolConfig config)
 {
     out_backend = std::make_shared<InMemoryBackend>();
-    return Store::open(out_backend, std::move(config));
+    return Pool::open(out_backend, std::move(config));
 }
 
-GcState readState(InMemoryBackend & b, const Store & s)
+GcState readState(InMemoryBackend & b, const Pool & s)
 {
     const auto got = b.get(s.layout().gcStateKey());
     if (!got)
@@ -88,7 +88,7 @@ GcState readState(InMemoryBackend & b, const Store & s)
 /// Whether ANY gc-shard's adopted-seal run still holds a `kCondemned` row (retired-in-snapshot T4: the
 /// retired state rides the snapshot run, not a separate retired-list object) — the ack-floor deletion
 /// pipeline is still in flight while this is true.
-bool anyRetiredPending(InMemoryBackend & b, const Store & s)
+bool anyRetiredPending(InMemoryBackend & b, const Pool & s)
 {
     return anyCondemnedInSeal(b, s.layout());
 }
@@ -99,7 +99,7 @@ bool anyRetiredPending(InMemoryBackend & b, const Store & s)
 /// graduate -> delete pipeline, so "fixpoint" is reached only when a round did NO work AND the current
 /// retired list is empty (nothing still in flight). Returns the number of rounds that held the lease and
 /// did work. Bounded so a non-converging core fails downstream assertions rather than hanging.
-size_t driveToFixpoint(InMemoryBackend & backend, const StorePtr & store, Gc & gc)
+size_t driveToFixpoint(InMemoryBackend & backend, const PoolPtr & store, Gc & gc)
 {
     size_t working_rounds = 0;
     for (size_t r = 0; r < 64; ++r)
@@ -582,7 +582,7 @@ TEST(CasGcRound, PreviewReportsCondemnedRowsAndIsWriteFree)
 TEST(CasGcRound, CarryRoundPreservesCondemnedSummaryVerbatim)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = Store::open(backend,
+    auto store = Pool::open(backend,
         PoolConfig{.pool_prefix = "p", .server_root_id = "test",
                    .gc_shards = 2});
     const RootNamespace ns{"00/aa@cas@"};
@@ -995,7 +995,7 @@ TEST(CasGcSnapRetention, PrunesOldGenerationsKeepingLastThree)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     /// keep the default 3 generations; one root shard so cursor keys are "ns/0".
-    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_snap_generations_to_keep = 3, .gc_fold_max_defer_rounds = 0});
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_snap_generations_to_keep = 3, .gc_fold_max_defer_rounds = 0});
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(1, 0xAA);
 
@@ -1046,7 +1046,7 @@ TEST(CasGcSnapRetention, PrunesOldGenerationsKeepingLastThree)
 TEST(CasGcSnapRetention, WholesalePruneReclaimsAllAttemptsIncludingRetiredOutcomes)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_snap_generations_to_keep = 3, .gc_fold_max_defer_rounds = 0});
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_snap_generations_to_keep = 3, .gc_fold_max_defer_rounds = 0});
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(1, 0xAA);
 
@@ -1119,7 +1119,7 @@ TEST(CasGcSnapRetention, ReclaimsNonAdoptedCurrentGenAttemptViaRetention)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     /// keep=3 retention floor (matches WholesalePruneReclaimsAllAttemptsIncludingRetiredOutcomes).
-    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_snap_generations_to_keep = 3, .gc_fold_max_defer_rounds = 0});
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_snap_generations_to_keep = 3, .gc_fold_max_defer_rounds = 0});
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(1, 0xAA);
     writeBlobBody(*backend, store->layout(), DB::UInt128(1));
@@ -1178,7 +1178,7 @@ TEST(CasGcRetention, PruneRetainsLiveReferencedRun)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     /// keep=1: the retention floor is aggressive so the cursor reaches gen-1's neighbourhood fast.
-    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_snap_generations_to_keep = 1, .gc_fold_max_defer_rounds = 0});
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_snap_generations_to_keep = 1, .gc_fold_max_defer_rounds = 0});
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(1, 0xAA);
 
@@ -1237,7 +1237,7 @@ TEST(CasGcRetention, PruneRetainsLiveReferencedRun)
 TEST(CasGcRetention, HandOffDeletesSupersededRef)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_snap_generations_to_keep = 1, .gc_fold_max_defer_rounds = 0});
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_snap_generations_to_keep = 1, .gc_fold_max_defer_rounds = 0});
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r1 = ref(1, 0xAA);
 
@@ -1295,7 +1295,7 @@ TEST(CasGcRetention, HandOffDeletesSupersededRef)
 TEST(CasGcSnapRetention, KeepZeroPrunesNothing)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_snap_generations_to_keep = 0});
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_snap_generations_to_keep = 0});
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(1, 0xAA);
 

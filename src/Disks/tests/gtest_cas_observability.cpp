@@ -6,7 +6,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasInspect.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasStore.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Common/ProfileEvents.h>
 #include <algorithm>
@@ -27,17 +27,17 @@ using DB::Cas::tests::currentRetiredSet;
 namespace
 {
 
-StorePtr openStore(std::shared_ptr<InMemoryBackend> & b)
+PoolPtr openStore(std::shared_ptr<InMemoryBackend> & b)
 {
     b = std::make_shared<InMemoryBackend>();
-    return Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    return Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
 }
 
 /// Publish ONE ref naming a single-blob part through the real writer sequence (mirrors
 /// `publishOneBlobPart` in `gtest_cas_gc_leak.cpp`, duplicated here because that helper has internal
 /// linkage in its own translation unit).
 ManifestId publishOneBlobPart(
-    const StorePtr & s, const RootNamespace & ns, const String & ref, const String & payload)
+    const PoolPtr & s, const RootNamespace & ns, const String & ref, const String & payload)
 {
     BuildInfo info;
     info.intended_ref = ns.string() + "/" + ref;
@@ -64,7 +64,7 @@ ManifestId publishOneBlobPart(
 TEST(CasObservability, StageManifestEmitsManifestPut)
 {
     std::shared_ptr<InMemoryBackend> b;
-    std::vector<CasEvent> seen;   /// declared BEFORE the Store so it outlives the background syncer's emits (ASan 2026-07-09)
+    std::vector<CasEvent> seen;   /// declared BEFORE the Pool so it outlives the background syncer's emits (ASan 2026-07-09)
     auto s = openStore(b);
     s->setEventSink([&](const CasEvent & e){ seen.push_back(e); });
 
@@ -95,7 +95,7 @@ TEST(CasObservability, StageManifestEmitsManifestPut)
 TEST(CasObservability, AbandonEmitsPrecommitRemoved)
 {
     std::shared_ptr<InMemoryBackend> b;
-    std::vector<CasEvent> seen;   /// declared BEFORE the Store so it outlives the background syncer's emits (ASan 2026-07-09)
+    std::vector<CasEvent> seen;   /// declared BEFORE the Pool so it outlives the background syncer's emits (ASan 2026-07-09)
     auto s = openStore(b);
 
     const RootNamespace ns{"srv/tbl@cas@"};
@@ -128,7 +128,7 @@ TEST(CasObservability, AbandonEmitsPrecommitRemoved)
 TEST(CasObservability, AbandonWithoutPrecommitEmitsNoPrecommitRemoved)
 {
     std::shared_ptr<InMemoryBackend> b;
-    std::vector<CasEvent> seen;   /// declared BEFORE the Store so it outlives the background syncer's emits (ASan 2026-07-09)
+    std::vector<CasEvent> seen;   /// declared BEFORE the Pool so it outlives the background syncer's emits (ASan 2026-07-09)
     auto s = openStore(b);
 
     const RootNamespace ns{"srv/tbl@cas@"};
@@ -160,7 +160,7 @@ TEST(CasObservability, AbandonWithoutPrecommitEmitsNoPrecommitRemoved)
 TEST(CasObservability, ResurrectSupersedeEmitsOnlyRetireReplacedWithOldToken)
 {
     std::shared_ptr<InMemoryBackend> b;
-    std::vector<CasEvent> seen;   /// declared BEFORE the Store so it outlives the background syncer's emits (ASan 2026-07-09)
+    std::vector<CasEvent> seen;   /// declared BEFORE the Pool so it outlives the background syncer's emits (ASan 2026-07-09)
     auto s = openStore(b);
     const RootNamespace ns{"test/tbl"};
     const String P = "resurrect-payload-audit";

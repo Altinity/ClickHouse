@@ -3,7 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasStore.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/tests/cas_test_helpers.h>
 
 #include <string>
@@ -16,10 +16,10 @@ namespace
 {
 
 /// The dangle is about the SINGLE snap shard's in-degree, and one cursor_key covers both refs.
-StorePtr openTestStore(std::shared_ptr<InMemoryBackend> & out_backend)
+PoolPtr openTestStore(std::shared_ptr<InMemoryBackend> & out_backend)
 {
     out_backend = std::make_shared<InMemoryBackend>();
-    return Store::open(out_backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    return Pool::open(out_backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
 }
 
 size_t runGcToFixpoint(Gc & gc, size_t max_rounds = 64)

@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 #include <filesystem>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBuild.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasStore.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPartManifestFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
@@ -32,9 +32,9 @@ using namespace DB::Cas;
 namespace
 {
 
-StorePtr openStore(const std::shared_ptr<InMemoryBackend> & b)
+PoolPtr openStore(const std::shared_ptr<InMemoryBackend> & b)
 {
-    return Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    return Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
 }
 
 /// One inline-entry manifest naming `path` with content `bytes` (distinct bytes => distinct content).
@@ -51,7 +51,7 @@ std::vector<ManifestEntry> inlineEntries(const String & path, const String & byt
 
 /// The full write flow for an INLINE-only manifest: stageManifest -> precommitAdd -> promote. Returns
 /// the committed ManifestId.
-ManifestId publishCommitted(const StorePtr & s, const RootNamespace & ns, const String & ref,
+ManifestId publishCommitted(const PoolPtr & s, const RootNamespace & ns, const String & ref,
                             const std::vector<ManifestEntry> & entries)
 {
     auto build = s->startBuild(BuildInfo{.intended_ref = ns.string() + "/" + ref, .intended_namespace = ns});

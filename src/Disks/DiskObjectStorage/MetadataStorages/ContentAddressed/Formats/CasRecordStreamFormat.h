@@ -22,7 +22,7 @@ namespace DB::Cas
 /// compression) + `Strict` (byte-deterministic for `putDeterministicArtifact` adoption).
 ///
 /// PHYSICAL LAYERING (spec §code-placement): this file is backend-free — it takes a `ReadBuffer &` /
-/// `WriteBuffer &` and never includes `CasBackend.h`/`CasStore.h`/`CasBlobInDegree.h`. `Core/` owns the
+/// `WriteBuffer &` and never includes `CasBackend.h`/`CasPool.h`/`CasBlobInDegree.h`. `Core/` owns the
 /// stream and the packed-key/condemned-row bridge (`CasBlobInDegree`'s `openSourceEdgeRun` +
 /// `SourceEdgeRunView`/`SourceEdgeRunBuilder`), because `SourceEdgeKeyCodec` and `encodeCondemnedRow`
 /// live in `Core/`.

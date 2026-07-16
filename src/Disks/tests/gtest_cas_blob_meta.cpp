@@ -58,7 +58,7 @@ TEST(CasBlobMeta, DeleteMetaExactMatchesEtag)
 /// Phase 3 T3 (mixed-algo pools, was CAS pluggable-blob-hash Phase 2 Task 5 crux Test 2): the `.meta`
 /// API round-trips a 32-byte (`sha256`-width) `BlobRef` key — the meta object lands under a 64-hex
 /// key, exercising the SAME `putMetaIfAbsent`/`loadMeta`/`casMeta`/`deleteMetaExact` surface Build/Gc
-/// use, just at a wider algo. No `Store`/pool-config bypass is needed here: these ops take only a
+/// use, just at a wider algo. No `Pool`/pool-config bypass is needed here: these ops take only a
 /// `Backend`/`Layout`/`BlobRef` and derive their own codec internally.
 TEST(CasBlobMeta, PutLoadCasDeleteRoundTripAtWidth32)
 {
@@ -102,7 +102,7 @@ TEST(CasBlobMeta, DedupCacheAdmitsWidth32Digest)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     PoolConfig cfg{.pool_prefix = "p", .server_root_id = "test", .dedup_cache_bytes = 64ULL << 20};
-    auto store = Store::open(backend, cfg);
+    auto store = Pool::open(backend, cfg);
 
     BlobDigest wide;
     for (size_t i = 0; i < wide.bytes.size(); ++i)

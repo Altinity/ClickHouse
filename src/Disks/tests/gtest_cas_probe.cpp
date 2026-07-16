@@ -3,7 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInstrumentedBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasProbe.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasStore.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/Exception.h>
 
@@ -71,8 +71,8 @@ TEST(CasProbe, PassesOnEmulatedLocal)
 
 /// B135: two servers mounting the SAME shared CA pool concurrently must not race on the probe keys.
 /// We simulate "a concurrent mounter's probe is in flight" by PRE-SEEDING the fixed-name probe key
-/// `<pool>/_probe/token` over a shared backend, then opening the Store. With the OLD fixed-key probe
-/// the open's `putIfAbsent("<pool>/_probe/token", …)` returns PreconditionFailed and `Store::open`
+/// `<pool>/_probe/token` over a shared backend, then opening the Pool. With the OLD fixed-key probe
+/// the open's `putIfAbsent("<pool>/_probe/token", …)` returns PreconditionFailed and `Pool::open`
 /// throws NOT_IMPLEMENTED ("putIfAbsent on a fresh key returned PreconditionFailed"). With the
 /// per-mount unique probe prefix `<pool>/_probe/<rand>/token`, the seeded key does not collide and
 /// the open succeeds — exactly the concurrent-shared-pool-mount behaviour we need.
@@ -85,10 +85,10 @@ TEST(CasProbe, ConcurrentMountsDoNotCollide)
 
     /// A real (second) mount over the same shared pool must still succeed — its probe runs under a
     /// fresh per-mount-unique prefix and never touches the seeded fixed key.
-    EXPECT_NO_THROW(Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"}));
+    EXPECT_NO_THROW(Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"}));
 
     /// And two genuinely-concurrent mounts (distinct unique prefixes) both succeed over one backend.
-    EXPECT_NO_THROW(Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"}));
+    EXPECT_NO_THROW(Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"}));
 
     /// The seeded fixed-key artifact is untouched (the probe never collided with it).
     EXPECT_TRUE(b->get("p/_probe/token").has_value());
@@ -116,8 +116,8 @@ TEST(CasProbe, FailsClosedOnStorePreconditions)
     EXPECT_TRUE(b->list("p/.cas_probe", "", 10).keys.empty());
 }
 
-/// `Store::open` wraps the pool backend in `InstrumentedBackend` BEFORE calling `runCapabilityProbe`
-/// (see CasStore.cpp), so the hook must actually fire THROUGH the wrapper on the real mount path —
+/// `Pool::open` wraps the pool backend in `InstrumentedBackend` BEFORE calling `runCapabilityProbe`
+/// (see CasPool.cpp), so the hook must actually fire THROUGH the wrapper on the real mount path —
 /// not just on a raw backend, which `FailsClosedOnStorePreconditions` above already covers.
 TEST(CasProbe, StorePreconditionsFireThroughInstrumentedWrapper)
 {
@@ -146,7 +146,7 @@ TEST(CasProbe, FailsClosedOnMissingSingleAttemptClient)
 }
 
 /// The same fail-closed refusal through the actual capability probe (Step 0b) — the real gate a
-/// writable Store::open goes through, not just the hook in isolation above.
+/// writable Pool::open goes through, not just the hook in isolation above.
 TEST(CasProbe, MissingSingleAttemptClientFailsCapabilityProbe)
 {
     auto b = std::make_shared<ObjectStorageBackend>(

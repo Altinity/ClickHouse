@@ -2,7 +2,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEvent.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasStore.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
 #include <set>
@@ -16,7 +16,7 @@ namespace
 
 /// Delete every object listed under `prefix` by its listed (or, absent a list-token backend, HEAD'd)
 /// token. This backs the staging and roots drain phases below: the victim's writers are fenced by the
-/// decommission claim (`Store::openForDecommission`), so nothing should be racing these deletes, and a
+/// decommission claim (`Pool::openForDecommission`), so nothing should be racing these deletes, and a
 /// plain exact-token delete of every listed object is race-free.
 ///
 /// Fail-close (spec §core "Fail-close", plan Global Constraints): a per-object failure -- a thrown
@@ -71,7 +71,7 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
     DecommissionReport report;
     report.srid = victim_srid;
 
-    StorePtr admin = Store::openForDecommission(std::move(backend), std::move(config), victim_srid);
+    PoolPtr admin = Pool::openForDecommission(std::move(backend), std::move(config), victim_srid);
     if (sink)
         admin->setEventSink(sink);
 
@@ -149,14 +149,14 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
 
     /// Phase: slot retirement -- STRICTLY LAST, and only over a clean drain (fail-close: an unconfirmed
     /// drain keeps the resume anchor; the operator re-runs). `layout`/`pool_backend` are copied out
-    /// BEFORE `admin.reset()` below -- `admin` (and the `Store` it owns) is gone the instant the
+    /// BEFORE `admin.reset()` below -- `admin` (and the `Pool` it owns) is gone the instant the
     /// graceful close runs, so nothing after that point may dereference it. `Layout` is a cheap value
-    /// type (one `String`); `poolBackendPtr()` shares ownership of the backend so it outlives the Store.
+    /// type (one `String`); `poolBackendPtr()` shares ownership of the backend so it outlives the Pool.
     const Layout layout = admin->layout();
     const BackendPtr pool_backend = admin->poolBackendPtr();
     if (report.warnings.empty())
     {
-        /// Graceful close of the admin store: `Store::~Store`'s mount-lease keeper stamps the lease
+        /// Graceful close of the admin store: `Pool::~Pool`'s mount-lease keeper stamps the lease
         /// already-expired and folds in the watermark farewell (`min_active = UINT64_MAX`) -- the
         /// `terminated` state (`CasServerRoot.cpp`).
         admin.reset();

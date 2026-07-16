@@ -224,7 +224,7 @@ TEST(CasMountAudit, KeeperForeignConflictRefusesAndNamesHolder)
     EXPECT_EQ(seen.back().detail.at("holder_uuid"), u128ToHex(uuid_x));
 }
 
-/// `Store::open` can fail before/inside `doStart` (e.g. a foreign-conflict refusal, see
+/// `Pool::open` can fail before/inside `doStart` (e.g. a foreign-conflict refusal, see
 /// `KeeperForeignConflictRefusesAndNamesHolder` above) — the keeper is destroyed without ever having
 /// claimed anything. Teardown must not throw "release before start"; there is nothing to release. A
 /// stop AFTER a successful start still performs the farewell (covered by

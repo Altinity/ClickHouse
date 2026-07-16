@@ -14,8 +14,8 @@
 namespace DB::Cas
 {
 
-// ==== Ref-ledger carrier types (moved here from CasStore.h in Phase 3.4 to break the
-//      CasStore.h <-> CasRefLedger.h include cycle; same DB::Cas names, definitions only). ====
+// ==== Ref-ledger carrier types (moved here from CasPool.h in Phase 3.4 to break the
+//      CasPool.h <-> CasRefLedger.h include cycle; same DB::Cas names, definitions only). ====
 /// Whether a root-shard mutation originates from the writer path (user-visible publish/drop/precommit)
 /// or from GC/maintenance. Diagnostic-only (`toString`, event logging): recorded on the mutation item.
 enum class RootMutationOrigin : uint8_t
@@ -101,7 +101,7 @@ struct RefPayloadUpdate
 };
 
 
-/// What one `Store::dropNamespace` call physically named for removal in its ONE removal transaction
+/// What one `Pool::dropNamespace` call physically named for removal in its ONE removal transaction
 /// (design 2026-07-13-cas-pool-member-decommission §core): the count of committed refs and precommit
 /// bindings the removal txn's `owner_transition(old, none)` ops covered. Existing callers that only
 /// care about the removal itself may ignore the return value.
@@ -113,7 +113,7 @@ struct DropNamespaceStats
 
 /// Per-owner config slice for the ref-ledger subsystem (spec §PoolConfig Slices). A PROJECTION of the
 /// flat `PoolConfig` fields, built on demand by `PoolConfig::refLedgerConfig` and passed BY VALUE to
-/// `CasRefLedger` (Phase 3.4). Lives here (not in `CasStore.h`) so `CasRefLedger.h` can include it
+/// `CasRefLedger` (Phase 3.4). Lives here (not in `CasPool.h`) so `CasRefLedger.h` can include it
 /// without an include cycle. `server_root_id` is the pool identity string used in the ref-lane's
 /// diagnostic error messages; `boot_ms`/`wait_sleep` are intentionally NOT here -- they reach the
 /// ledger as ctor callbacks (see `MountConfig` + the `CasRefLedger` ctor).

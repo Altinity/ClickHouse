@@ -512,7 +512,7 @@ namespace DB::Cas
 
 /// The ordered ref-transaction identifier (spec §Ordered Ref Transaction Identifier). A successful
 /// writer mount establishes a strictly newer `writer_epoch`; within an epoch the mounted writer
-/// allocates `ref_sequence` from a Store-wide strictly increasing counter at append time. Both fields
+/// allocates `ref_sequence` from a Pool-wide strictly increasing counter at append time. Both fields
 /// are nonzero for a valid id -- {0, 0} is never a real transaction. `writer_epoch` is the primary
 /// ordering component, so tuple order matches the intended timeline even across an epoch restart that
 /// resets `ref_sequence` back to one.

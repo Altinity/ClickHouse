@@ -3,7 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasStore.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include "cas_test_helpers.h"
 
 using namespace DB::Cas;
@@ -52,7 +52,7 @@ bool blobExists(InMemoryBackend & b, const Layout & layout, const UInt128 & hash
 
 /// Whether the CURRENT retired list (any gc-shard) still holds an entry — the ack-floor deletion pipeline
 /// is in flight while this is true.
-bool anyRetiredPending(const StorePtr & s)
+bool anyRetiredPending(const PoolPtr & s)
 {
     /// Retired-in-snapshot (T4): condemned state rides the adopted fold seal's kCondemned rows, not a
     /// separate retired list — reconstruct the in-flight set from the seal.
@@ -62,7 +62,7 @@ bool anyRetiredPending(const StorePtr & s)
 /// Drive regular GC to a fixpoint over the ACK-FLOOR round (advancing the store's own mount ack after each
 /// round so the floor follows the committed round; stay alive while any work counter is nonzero OR the
 /// current retired list still holds an in-flight entry).
-size_t runGcToFixpoint(const StorePtr & s, Gc & gc, size_t max_rounds = 64)
+size_t runGcToFixpoint(const PoolPtr & s, Gc & gc, size_t max_rounds = 64)
 {
     size_t rounds = 0;
     for (; rounds < max_rounds; ++rounds)

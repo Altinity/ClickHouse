@@ -610,7 +610,7 @@ std::string ContentAddressedTransaction::buildS3StagingBlobHeader(
     /// fields and minus `build_id`, which is not known until commit and is diagnostic-only). A FRESH
     /// `incarnation_tag` per staging object keeps the incarnation zone unique; the header is padded to
     /// the pool's fixed `blob_header_len` so the payload starts at a constant offset.
-    const Cas::StorePtr & store = metadata_storage.store();
+    const Cas::PoolPtr & store = metadata_storage.store();
     const Cas::PoolMeta & meta = store->poolMeta();
     const Cas::PoolConfig & cfg = store->poolConfig();
 
@@ -736,7 +736,7 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
         /// to a fresh per-mount S3 staging object while hashing — no local-disk round trip. Otherwise
         /// (the OFF BY DEFAULT global constraint, or a probe fail-close) fall through to the existing,
         /// byte-for-byte-unchanged local-temp-file path below.
-        /// P1-T3a (CAS pluggable blob hash): hash with this Store's NODE-LOCAL write algo, not a
+        /// P1-T3a (CAS pluggable blob hash): hash with this Pool's NODE-LOCAL write algo, not a
         /// hardcoded cityHash128 (Phase 3 T4: `PoolMeta` no longer records a single pool-wide algo --
         /// mixed-algo pools track `algos_used`; `writeAlgo()` is the write-mint accessor now).
         const auto hash_algo = metadata_storage.store()->writeAlgo();

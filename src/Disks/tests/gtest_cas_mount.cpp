@@ -382,9 +382,9 @@ TEST(CasMountLease, KeeperStartAdoptsOurOwnClaimNotDoubleStart)
 TEST(CasMountFence, SupersededWriterRefusedNoS3Read)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto store = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "r"});
+    auto store = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "r"});
 
-    /// Permissive default: a Store that has NOT armed the fence allows mutations.
+    /// Permissive default: a Pool that has NOT armed the fence allows mutations.
     EXPECT_TRUE(store->mayMutate());
 
     /// Latching loss: once the renewer trips the fence it stays lost (purely local — no S3 read).
@@ -400,12 +400,12 @@ TEST(CasMountFence, SupersededWriterRefusedNoS3Read)
 TEST(CasMountStartup, SecondServerSameRootFailsClosed)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto s1 = Store::open(b, PoolConfig{
+    auto s1 = Pool::open(b, PoolConfig{
         .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r"});
     /// A second server (different uuid) on the SAME server_root_id + same backend → fail closed
     /// (the owner gate rejects the foreign uuid before any mount/epoch mutation).
     EXPECT_THROW(
-        Store::open(b, PoolConfig{
+        Pool::open(b, PoolConfig{
             .pool_prefix = "p", .server_id = UInt128(2), .server_root_id = "r"}),
         DB::Exception);
 }
@@ -413,17 +413,17 @@ TEST(CasMountStartup, SecondServerSameRootFailsClosed)
 TEST(CasMountStartup, WriterEpochStrictlyIncreasesAcrossReopen)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto s1 = Store::open(b, PoolConfig{
+    auto s1 = Pool::open(b, PoolConfig{
         .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r"});
     const uint64_t e1 = s1->writerEpoch();
 
-    /// Simulate shutdown: the Store dtor stops the keeper, whose terminate() retires the lease
+    /// Simulate shutdown: the Pool dtor stops the keeper, whose terminate() retires the lease
     /// (stamps it already-expired). The owner + the durable epoch object stay sticky.
     s1.reset();
 
     /// Same server reopen → reclaims the (now-expired, different-epoch) mount and allocates a strictly
     /// higher durable writer_epoch.
-    auto s2 = Store::open(b, PoolConfig{
+    auto s2 = Pool::open(b, PoolConfig{
         .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r"});
     const uint64_t e2 = s2->writerEpoch();
     EXPECT_GT(e2, e1);
@@ -435,7 +435,7 @@ TEST(CasMountReadOnly, ForeignOwnedPoolOpensWithoutMutation)
     Layout l("p");
 
     /// Server A claims the pool (writable): owner = uuid(1), a durable epoch + a live mount lease.
-    auto a = Store::open(b, PoolConfig{
+    auto a = Pool::open(b, PoolConfig{
         .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r"});
 
     /// Capture the control objects BEFORE the read-only open so we can prove it mutated nothing.
@@ -449,9 +449,9 @@ TEST(CasMountReadOnly, ForeignOwnedPoolOpensWithoutMutation)
     /// A READ-ONLY observer with a DIFFERENT server_id on the SAME backend/server_root_id must NOT
     /// throw — a read-only mount never participates in the owner/epoch/mount protocol, so a pool
     /// owned by another server_uuid is freely observable.
-    StorePtr ro;
+    PoolPtr ro;
     EXPECT_NO_THROW(
-        ro = Store::open(b, PoolConfig{
+        ro = Pool::open(b, PoolConfig{
             .pool_prefix = "p", .server_id = UInt128(2), .server_root_id = "r",
             .read_only = true}));
     EXPECT_NE(ro, nullptr);
@@ -473,7 +473,7 @@ TEST(CasMountReadOnly, ForeignOwnedPoolOpensWithoutMutation)
     EXPECT_EQ(epoch_after->bytes, epoch_before->bytes);
 }
 
-/// Store::open must call validateCasRequestBudget itself (not just the free function in isolation —
+/// Pool::open must call validateCasRequestBudget itself (not just the free function in isolation —
 /// see gtest_cas_request_control.cpp for that): an inconsistent cas_request_budget must refuse a
 /// writable mount end-to-end (RFC cas-s3-timeout-retry-control §required-timeout-model), never mount
 /// silently with a budget that could let a controlled attempt outlive the lease it is fenced under.
@@ -487,7 +487,7 @@ TEST(CasMountStartup, RefusesWritableOpenWithInconsistentCasRequestBudget)
         .attempt_timeout_ms = 25000, .operation_deadline_ms = 25000, .max_attempts = 3, .lease_safety_margin_ms = 5000};
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::BAD_ARGUMENTS, [&]
     {
-        Store::open(b, PoolConfig{
+        Pool::open(b, PoolConfig{
             .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r",
             .mount_lease_ttl_ms = std::chrono::milliseconds(30000),
             .cas_request_budget = bad_budget});
@@ -498,16 +498,16 @@ TEST(CasMountStartup, StaleSelfMountReclaimedAfterWait)
 {
     auto b = std::make_shared<InMemoryBackend>();
 
-    /// Server A opens writable with a SHORT lease TTL and KEEPS its Store alive with NO background
+    /// Server A opens writable with a SHORT lease TTL and KEEPS its Pool alive with NO background
     /// renewer (background_watermark defaults false) — i.e. it simulates a crashed process: the mount
     /// lease survives with a future expires_at_ms but is never renewed.
     /// This test's short lease TTL is far below the CasRequestBudget defaults (RFC
     /// cas-s3-timeout-retry-control §required-timeout-model requires attempt_timeout + safety_margin <
     /// lease TTL), so it also scales down cas_request_budget to fit — the budget itself is not
-    /// exercised here, only Store::open's validateCasRequestBudget startup gate.
+    /// exercised here, only Pool::open's validateCasRequestBudget startup gate.
     const CasRequestBudget tiny_budget{
         .attempt_timeout_ms = 50, .operation_deadline_ms = 50, .max_attempts = 1, .lease_safety_margin_ms = 50};
-    auto a = Store::open(b, PoolConfig{
+    auto a = Pool::open(b, PoolConfig{
         .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r",
         .mount_lease_ttl_ms = std::chrono::milliseconds(300),
         .mount_renew_period = std::chrono::milliseconds(100),
@@ -517,15 +517,15 @@ TEST(CasMountStartup, StaleSelfMountReclaimedAfterWait)
 
     /// A restart of the SAME server (same uuid) must NOT abort: it waits out the stale lease (<= ~300ms)
     /// and reclaims the mount, coming up with a strictly higher durable writer_epoch. No clean farewell
-    /// was written (Server A's Store is still alive, never destroyed) -> the reclaim is
-    /// `MountPriorState::UncleanObserved`, so `Store::open` (rev.6 Task 6) ALSO pays a
+    /// was written (Server A's Pool is still alive, never destroyed) -> the reclaim is
+    /// `MountPriorState::UncleanObserved`, so `Pool::open` (rev.6 Task 6) ALSO pays a
     /// `materialization_grace_ms` wait after the observation window; inject a fake `boot_ms_fn` +
     /// `wait_sleep_fn` (mirroring `CasMountTmat.UncleanOpenWaitsMaterializationGrace`) so BOTH waits
     /// resolve instantly instead of blocking this test on ~30 real seconds.
     uint64_t a2_fake_boot = 0;
-    StorePtr a2;
+    PoolPtr a2;
     EXPECT_NO_THROW(
-        a2 = Store::open(b, PoolConfig{
+        a2 = Pool::open(b, PoolConfig{
             .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r",
             .mount_lease_ttl_ms = std::chrono::milliseconds(300),
             .mount_renew_period = std::chrono::milliseconds(100),

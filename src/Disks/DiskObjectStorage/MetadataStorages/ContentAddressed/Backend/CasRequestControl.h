@@ -118,7 +118,7 @@ struct CasRequestBudget
 ///
 /// rev.6 Task 6 handover-wait invariant (design §Late Predecessor PUT): a successor mounting over an
 /// unclean predecessor pays `observation (>= mount_lease_ttl_ms) + T_mat` (`materialization_grace_ms`,
-/// `Store::open`) before trusting its recovery listings — long enough that ANY conditional PUT the
+/// `Pool::open`) before trusting its recovery listings — long enough that ANY conditional PUT the
 /// predecessor could still have in flight has either landed or been dropped by ITS OWN exhausted retry
 /// budget. That holds by construction, with no separate check needed here: the predecessor's own
 /// budget bounds one logical operation's wall-clock life to `attempt_timeout_ms + lease_safety_margin_ms
@@ -164,7 +164,7 @@ public:
     /// `sleep_ms_`: the inter-attempt backoff sleep, defaulting to a real `std::this_thread::sleep_for`;
     /// tests inject a recorder/no-op to assert the backoff schedule without wall-clock waits. The
     /// controller only ever sleeps BETWEEN attempts of one logical operation, on the calling thread,
-    /// with no Store mutex held (every call site — the ref append lane's leader, `stageManifest`, blob
+    /// with no Pool mutex held (every call site — the ref append lane's leader, `stageManifest`, blob
     /// uploads, snapshot publishes — invokes the controller outside its locks; the append lane's
     /// LEADERSHIP is deliberately held across the sleep: same-table appends must queue behind an
     /// unresolved predecessor PUT anyway, per spec §Writer-Side Linearization).
@@ -234,8 +234,8 @@ public:
                                                 const std::function<bool()> & fence_ok);
 
     /// Test-only: replace the inter-attempt backoff sleep (e.g. with a no-op) on an already-constructed
-    /// controller — for tests that reach the controller only through a fully-wired Store/disk and cannot
-    /// pass the ctor parameter (see `Store::setCasRetrySleepForTest`). Passing an empty function restores
+    /// controller — for tests that reach the controller only through a fully-wired Pool/disk and cannot
+    /// pass the ctor parameter (see `Pool::setCasRetrySleepForTest`). Passing an empty function restores
     /// the real sleep. Not thread-safe: call before driving any traffic through the controller.
     void setSleepFnForTest(std::function<void(uint64_t)> sleep_ms_);
 

@@ -6,7 +6,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasStore.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include "cas_test_helpers.h"
 
 namespace DB::ErrorCodes
@@ -21,10 +21,10 @@ using DB::Cas::tests::injectRetire;
 namespace
 {
 
-StorePtr makeStoreWithShards(std::shared_ptr<InMemoryBackend> & out_backend, uint64_t gc_shards = 1)
+PoolPtr makeStoreWithShards(std::shared_ptr<InMemoryBackend> & out_backend, uint64_t gc_shards = 1)
 {
     out_backend = std::make_shared<InMemoryBackend>();
-    return Store::open(out_backend,
+    return Pool::open(out_backend,
         PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_shards = gc_shards});
 }
 
@@ -102,7 +102,7 @@ TEST(CasGcShardIncarnation, ListNamespacesFromRefsNotRegistry)
 /// (self-floor: `fence_round` self-floors to `currentGcRound()` on the create-if-absent branch).
 ///
 /// Scenario (registry-free create-race):
-///   1. Open a Store (gc/state absent).
+///   1. Open a Pool (gc/state absent).
 ///   2. Write blob b1's body directly to the backend (present, not yet condemned).
 ///   3. Inject gc/state at round 1 with b1 condemned (its current token in the retired set).
 ///      b1's body is still PRESENT — this simulates GC having fenced+retired b1 but not yet

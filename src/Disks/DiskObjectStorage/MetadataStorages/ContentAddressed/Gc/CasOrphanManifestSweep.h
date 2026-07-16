@@ -1,6 +1,6 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasStore.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <base/types.h>
 #include <optional>
 #include <set>
@@ -64,18 +64,18 @@ struct ManifestSweepResult
 /// `dedup`, when non-null, is threaded to `reportLateLogsIfAny` (see `LateLogDedup`'s own doc comment)
 /// -- `nullptr` (the default, every pre-existing caller) preserves the original behaviour exactly: no
 /// dedup, every provably-late log is reported on every pass that lists it.
-uint64_t sweepNamespace(Store & store, const RootNamespace & ns, const BuildPrefix & prefix,
+uint64_t sweepNamespace(Pool & store, const RootNamespace & ns, const BuildPrefix & prefix,
                         std::vector<String> * warnings = nullptr, LateLogDedup * dedup = nullptr);
 
 /// Whether `prefix` is sweep-eligible by the durable watermark fact alone (OQ6). The watermark is resolved
 /// from the namespace's server_root_id, not by parsing writer identity. No watermark => not eligible.
-bool prefixEligible(Store & store, const RootNamespace & ns, const BuildPrefix & prefix);
+bool prefixEligible(Pool & store, const RootNamespace & ns, const BuildPrefix & prefix);
 
 /// Cursor-paced bounded orphan part-manifest sweep over `cas/manifests/`. The cursor is a best-effort
 /// cleanup cursor, never reachability authority. It deletes at most `delete_budget` keys from at most
 /// `list_budget` listed keys.
 ManifestSweepResult sweepManifestCursorPage(
-    Store & store,
+    Pool & store,
     const String & cursor,
     uint64_t list_budget,
     uint64_t delete_budget,

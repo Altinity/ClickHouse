@@ -16,9 +16,9 @@ namespace
 {
 
 /// Open a store for the VICTIM srid over `backend` (the pool's future dead member).
-StorePtr openVictim(std::shared_ptr<InMemoryBackend> backend)
+PoolPtr openVictim(std::shared_ptr<InMemoryBackend> backend)
 {
-    return Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "victim"});
+    return Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "victim"});
 }
 
 /// Fails `deleteExact` for one or two designated keys -- either by throwing (a transient backend
@@ -83,7 +83,7 @@ private:
 /// are seeded at an artificially high `writer_epoch` so the writer's own stale-precommit sweep (armed
 /// unconditionally by this table's recovery, unrelated to decommission -- spec §Clean Up Old Precommits)
 /// never reclaims them, in its OWN separate transaction, ahead of `dropNamespace`'s removal.
-void makeTableWithRefs(Store & victim, const String & ns_str, uint64_t committed, uint64_t precommits)
+void makeTableWithRefs(Pool & victim, const String & ns_str, uint64_t committed, uint64_t precommits)
 {
     const RootNamespace ns(ns_str);
     Backend & backend = victim.backend();
@@ -112,7 +112,7 @@ void makeTableWithRefs(Store & victim, const String & ns_str, uint64_t committed
 /// is picked well clear of `makeTableWithRefs`'s own committed/precommit build sequences so it can never
 /// collide with a real owned manifest key. Returns the seeded body's `ManifestId` so a caller can target
 /// it (e.g. its exact object key) for further fixture setup.
-ManifestId seedOrphanManifestBody(Store & victim, const String & ns_str)
+ManifestId seedOrphanManifestBody(Pool & victim, const String & ns_str)
 {
     const RootNamespace ns(ns_str);
     const ManifestRef ref{.writer_epoch = victim.writerEpoch(), .build_sequence = 99, .manifest_ordinal = 1};
@@ -132,7 +132,7 @@ TEST(CasDecommission, RefusesLiveMember)
 
     expectThrowsCode(ErrorCodes::ABORTED, [&]
     {
-        Store::openForDecommission(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim");
+        Pool::openForDecommission(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim");
     });
 }
 
@@ -145,7 +145,7 @@ TEST(CasDecommission, ClaimsDeadMemberAndBumpsEpoch)
         victim_epoch = victim->writerEpoch();
     }   /// graceful close: lease stamped already-expired + farewell — the slot is claimable
 
-    auto admin = Store::openForDecommission(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim");
+    auto admin = Pool::openForDecommission(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim");
     ASSERT_TRUE(admin != nullptr);
     EXPECT_GT(admin->writerEpoch(), victim_epoch);
     /// The admin store IS the victim server root now (impersonation).
@@ -157,7 +157,7 @@ TEST(CasDecommission, RefusesUnknownMember)
     auto backend = std::make_shared<InMemoryBackend>();
     expectThrowsCode(ErrorCodes::BAD_ARGUMENTS, [&]
     {
-        Store::openForDecommission(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "never_existed");
+        Pool::openForDecommission(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "never_existed");
     });
 }
 
@@ -166,10 +166,10 @@ TEST(CasDecommission, SecondConcurrentDecommissionRefused)
     auto backend = std::make_shared<InMemoryBackend>();
     { auto victim = openVictim(backend); }
 
-    auto first = Store::openForDecommission(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim");
+    auto first = Pool::openForDecommission(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim");
     expectThrowsCode(ErrorCodes::ABORTED, [&]
     {
-        Store::openForDecommission(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin2"}, "victim");
+        Pool::openForDecommission(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin2"}, "victim");
     });
 }
 
@@ -195,7 +195,7 @@ TEST(CasDecommission, ErasesAllVictimNamespaces)
     EXPECT_EQ(report.edge_deltas_emitted, 4u);
 
     /// Task 4: a clean drain (nothing under staging/roots/manifest-debris here, so `warnings` stays
-    /// empty) removes the pool slot -- a fresh `Store::openForDecommission` for "victim" is no longer
+    /// empty) removes the pool slot -- a fresh `Pool::openForDecommission` for "victim" is no longer
     /// possible (`RemovesSlotAndMakesRerunUnknown` proves the BAD_ARGUMENTS shape directly), so a
     /// "still durably Removed" check can no longer go through a re-opened admin store the way it did
     /// before Task 4 landed.
@@ -207,9 +207,9 @@ TEST(CasDecommission, ErasesAllVictimNamespaces)
 /// `writer_epoch` (999999) specifically to dodge the writer's OWN stale-precommit sweep -- which
 /// means it never exercised the path a REAL victim precommit takes. A genuine writer stamps
 /// `manifest_ref.writer_epoch` from its OWN `liveWriterEpoch()` at precommit time
-/// (`Build::precommitAdd`, CasStore.cpp:2087), i.e. the victim's era -- always LOWER than the admin
+/// (`Build::precommitAdd`, CasPool.cpp:2087), i.e. the victim's era -- always LOWER than the admin
 /// mount's freshly-minted epoch (`openForDecommission` always bumps strictly higher). `appendRefOps`
-/// hoists `maybeSweepStalePrecommits` at its top (CasStore.cpp:1716), so without the
+/// hoists `maybeSweepStalePrecommits` at its top (CasPool.cpp:1716), so without the
 /// `skip_stale_precommit_sweep` fix that sweep would reclaim this realistic-epoch precommit in its
 /// OWN transaction before `dropNamespace`'s removal transaction ever counts it, leaving
 /// `precommits_removed` at 0 for exactly the case that matters.
@@ -460,7 +460,7 @@ TEST(CasDecommission, FailedDrainKeepsSlotThenResumes)
 {
     auto inner = std::make_shared<InMemoryBackend>();
     {
-        auto victim = Store::open(inner, PoolConfig{.pool_prefix = "p", .server_root_id = "victim"});
+        auto victim = Pool::open(inner, PoolConfig{.pool_prefix = "p", .server_root_id = "victim"});
         makeTableWithRefs(*victim, "victim/db/t1", 1, 0);
     }
     inner->putIfAbsent("p/roots/victim/loose_file", "x");
@@ -521,7 +521,7 @@ TEST(CasDecommission, ManifestDebrisFailureKeepsSlotThenResumes)
 
 /// Task 5 (Task-1 carry-forward, escalated by review): mid-retirement crash-safety RELIES on
 /// `openForDecommission`'s owner-anchor-absent + mount-lease-present fallback ("partial hand-cleanup:
-/// adopt from the lease", `CasStore.cpp`) -- the slot-retirement loop (Task 4) deletes
+/// adopt from the lease", `CasPool.cpp`) -- the slot-retirement loop (Task 4) deletes
 /// `epochKey`/`ownerKey`/`mountKey` in that exact order, so a crash between the second and third delete
 /// leaves precisely this byte-state (owner anchor gone, mount lease still present). No prior test
 /// exercised this recovery path, even though it is load-bearing for every fail-and-resume scenario the
@@ -551,7 +551,7 @@ TEST(CasDecommission, MidRetirementCrashResumesViaMountLeaseFallback)
     /// fresh epoch/owner/mount control objects. Closing gracefully (scope exit) stamps the mount lease's
     /// farewell, matching what a real slot retirement's `admin.reset()` does right before its delete loop.
     {
-        auto admin = Store::openForDecommission(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "chk"}, "victim");
+        auto admin = Pool::openForDecommission(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "chk"}, "victim");
     }
 
     /// Manually strike epoch + owner, leaving the mount -- the exact aftermath of a crash between

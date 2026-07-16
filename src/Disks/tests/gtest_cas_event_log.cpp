@@ -2,7 +2,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBuild.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEvent.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasStore.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Interpreters/ContentAddressedLog.h>
@@ -47,8 +47,8 @@ TEST(CasEvent, ConstructAndCopyAndName)
 TEST(CasEvent, StoreEmitsToSink)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    std::vector<CasEvent> seen;   /// declared BEFORE the Store so it outlives the background syncer's emits (ASan 2026-07-09)
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    std::vector<CasEvent> seen;   /// declared BEFORE the Pool so it outlives the background syncer's emits (ASan 2026-07-09)
+    auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     s->setEventSink([&](const CasEvent & e){ seen.push_back(e); });
     CasEvent e;
     e.type = CasEventType::BlobPut;
@@ -71,7 +71,7 @@ TEST(CasEvent, EmitEventMovesSourceIntoSink)
     auto b = std::make_shared<InMemoryBackend>();
     String captured_reason;
     std::map<String, String> captured_detail;
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     s->setEventSink([&](CasEvent ev)
     {
         captured_reason = std::move(ev.reason);
@@ -94,7 +94,7 @@ namespace
 
 /// A single-blob part: upload one blob, stage a one-entry manifest naming it, precommit + promote the
 /// ref. Returns the blob's object_hash (lowercase hex) so the test can filter the captured rows by it.
-String publishOneBlobPart(const StorePtr & s, const String & ns, const String & ref, const String & payload)
+String publishOneBlobPart(const PoolPtr & s, const String & ns, const String & ref, const String & payload)
 {
     const RootNamespace nsr{ns};
     BuildInfo info;
@@ -117,7 +117,7 @@ String publishOneBlobPart(const StorePtr & s, const String & ns, const String & 
 }
 
 /// Whether the CURRENT retired list (any gc-shard) still holds an entry (ack-floor pipeline in flight).
-bool anyRetiredPending(const StorePtr & s)
+bool anyRetiredPending(const PoolPtr & s)
 {
     /// Retired-in-snapshot (T4): condemned state rides the adopted fold seal's kCondemned rows, not a
     /// separate retired list — reconstruct the in-flight set from the seal.
@@ -126,7 +126,7 @@ bool anyRetiredPending(const StorePtr & s)
 
 /// Drive regular GC to a fixpoint over the ACK-FLOOR round (renew the store's mount ack after each round;
 /// stay alive while any work counter is nonzero OR an in-flight retired entry remains).
-void runGcToFixpoint(const StorePtr & s, Gc & gc, size_t max_rounds = 64)
+void runGcToFixpoint(const PoolPtr & s, Gc & gc, size_t max_rounds = 64)
 {
     for (size_t r = 0; r < max_rounds; ++r)
     {
@@ -157,13 +157,13 @@ bool hasType(const std::vector<CasEvent> & events, CasEventType t)
 TEST(CasEvent, LifecycleReconstructionFromRows)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    /// Declared BEFORE the Store so they OUTLIVE it: the Store's background retired-view syncer can emit
-    /// (e.g. a view-advance event) right up to the Store's destructor, and a sink capturing locals that
+    /// Declared BEFORE the Pool so they OUTLIVE it: the Pool's background retired-view syncer can emit
+    /// (e.g. a view-advance event) right up to the Pool's destructor, and a sink capturing locals that
     /// die first is a use-after-scope (found by ASan 2026-07-09; the production sink captures the Context
     /// shared_ptr by value and is immune).
     std::vector<CasEvent> events;
     std::mutex events_mutex;
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
 
     s->setEventSink([&](const CasEvent & e)
     {

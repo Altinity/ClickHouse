@@ -5,7 +5,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasStore.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include "cas_test_helpers.h"
 
 using namespace DB::Cas;
@@ -202,7 +202,7 @@ TEST(CasGcRoundDefer, IdleRoundDefersAndReadsNoGeneration)
 TEST(CasGcRoundDefer, IdleRoundDefersUnderShardedGc)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = Store::open(backend,
+    auto store = Pool::open(backend,
         PoolConfig{.pool_prefix = "p", .server_root_id = "test",
                    .gc_shards = 2});
     const RootNamespace ns{"00/aa@cas@"};
@@ -285,7 +285,7 @@ TEST(CasGcRoundDefer, DueGraduationForcesFoldAndSparesReReferencedBlob)
 TEST(CasGcRoundDefer, DueGraduationIsSoleFoldTriggerAtHighThreshold)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = Store::open(backend,
+    auto store = Pool::open(backend,
         PoolConfig{.pool_prefix = "p", .server_root_id = "test",
                    .gc_fold_threshold = 1000, .gc_fold_max_defer_rounds = 1000});
     const Layout & layout = store->layout();
@@ -342,7 +342,7 @@ TEST(CasGcRoundDefer, DueGraduationIsSoleFoldTriggerAtHighThreshold)
 TEST(CasGcRoundDefer, BoundedDeferralForcesFoldWithinWindow)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = Store::open(backend,
+    auto store = Pool::open(backend,
         PoolConfig{.pool_prefix = "p", .server_root_id = "test",
                    .gc_fold_threshold = 100, .gc_fold_max_defer_rounds = 3});
     const RootNamespace ns{"00/aa@cas@"};

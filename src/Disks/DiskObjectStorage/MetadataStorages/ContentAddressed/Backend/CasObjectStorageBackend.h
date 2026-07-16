@@ -98,7 +98,7 @@ public:
     Token resurrectStaged(const String & staging_key, const String & blob_key,
                           const String & fresh_header, uint64_t staging_payload_offset) override;
 
-    /// Store-level precondition: on a Native, generation-dialect (GCS) backend, fail closed if the
+    /// Pool-level precondition: on a Native, generation-dialect (GCS) backend, fail closed if the
     /// bucket has object versioning enabled — see Backend::checkStorePreconditions.
     void checkStorePreconditions() override;
 

@@ -6,7 +6,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPartManifestFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasStore.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/Exception.h>
 #include <Poco/Exception.h>
@@ -70,7 +70,7 @@ private:
 /// read-path tests (the same shape as `publishPart` in gtest_cas_gc_log.cpp). The manifest entry path
 /// is `data.bin` unless `entry_path` overrides it.
 ManifestId publishPart(
-    const StorePtr & s, const String & ns, const String & ref, const String & payload,
+    const PoolPtr & s, const String & ns, const String & ref, const String & payload,
     const String & entry_path = "data.bin")
 {
     const RootNamespace nsr{ns};
@@ -113,7 +113,7 @@ ManifestRef manifestRefFor(const String & tag)
 /// So write a blob body for each Blob entry (addressed by its hash) and record it as W-EVIDENCE before
 /// staging. Inline entries need no body. Returns the published ManifestId.
 ManifestId publishPartWithEntries(
-    const StorePtr & s, const String & ns, const String & ref, std::vector<ManifestEntry> entries)
+    const PoolPtr & s, const String & ns, const String & ref, std::vector<ManifestEntry> entries)
 {
     const RootNamespace nsr{ns};
     BuildInfo info;
@@ -134,7 +134,7 @@ ManifestId publishPartWithEntries(
 }
 }
 
-TEST(CasStore, ReadOnlyOpenSkipsProbe)
+TEST(CasPool, ReadOnlyOpenSkipsProbe)
 {
     auto shared = std::make_shared<DB::Cas::InMemoryBackend>();
 
@@ -143,13 +143,13 @@ TEST(CasStore, ReadOnlyOpenSkipsProbe)
     cfg.server_id = DB::UInt128(1);
     cfg.server_root_id = "test";
     /// Writable open: creates _pool_meta and runs the probe (which writes+cleans up).
-    DB::Cas::Store::open(std::make_shared<WriteCountingBackend>(shared), cfg);
+    DB::Cas::Pool::open(std::make_shared<WriteCountingBackend>(shared), cfg);
 
     /// Read-only re-open over the SAME data must perform ZERO writes (no probe, meta already present).
     auto counter = std::make_shared<WriteCountingBackend>(shared);
     DB::Cas::PoolConfig ro = cfg;
     ro.read_only = true;
-    auto store = DB::Cas::Store::open(counter, ro);
+    auto store = DB::Cas::Pool::open(counter, ro);
     EXPECT_EQ(counter->writes, 0u);
     ASSERT_NE(store, nullptr);
 }
@@ -180,7 +180,7 @@ private:
 };
 }
 
-TEST(CasStore, SkipAccessCheckOpenSkipsProbeButStaysWritable)
+TEST(CasPool, SkipAccessCheckOpenSkipsProbeButStaysWritable)
 {
     auto shared = std::make_shared<DB::Cas::InMemoryBackend>();
 
@@ -192,7 +192,7 @@ TEST(CasStore, SkipAccessCheckOpenSkipsProbeButStaysWritable)
     /// Baseline: a normal writable open runs the capability probe (PUT+delete of `_probe/` keys).
     {
         auto watch = std::make_shared<ProbeWatchingBackend>(shared);
-        auto s = DB::Cas::Store::open(watch, cfg);
+        auto s = DB::Cas::Pool::open(watch, cfg);
         ASSERT_NE(s, nullptr);
         EXPECT_TRUE(watch->probe_touched) << "the probe must run by default";
     }
@@ -206,7 +206,7 @@ TEST(CasStore, SkipAccessCheckOpenSkipsProbeButStaysWritable)
         sac.server_id = DB::UInt128(2);
         sac.server_root_id = "srv-2";
         sac.skip_access_check = true;
-        auto s = DB::Cas::Store::open(watch, sac);
+        auto s = DB::Cas::Pool::open(watch, sac);
         ASSERT_NE(s, nullptr);
         EXPECT_FALSE(watch->probe_touched) << "skip_access_check must perform no probe I/O";
 
@@ -224,7 +224,7 @@ namespace
 /// A backend whose checkConditionalWriteSingleAttemptSupport ALWAYS throws — a stand-in for a
 /// Native-mode backend with no working single-attempt client (see
 /// ObjectStorageBackend::checkConditionalWriteSingleAttemptSupport). Pins that skip_access_check does
-/// NOT bypass this gate: the regression this guards is reverting Store::open's skip_access_check
+/// NOT bypass this gate: the regression this guards is reverting Pool::open's skip_access_check
 /// branch back to the naive "wrap the whole probe" shape, which would silently skip this check too.
 class ThrowingSingleAttemptBackend final : public DB::Cas::Backend
 {
@@ -250,7 +250,7 @@ private:
 };
 }
 
-TEST(CasStore, SkipAccessCheckStillEnforcesSingleAttemptGate)
+TEST(CasPool, SkipAccessCheckStillEnforcesSingleAttemptGate)
 {
     auto backend = std::make_shared<ThrowingSingleAttemptBackend>(std::make_shared<DB::Cas::InMemoryBackend>());
 
@@ -263,10 +263,10 @@ TEST(CasStore, SkipAccessCheckStillEnforcesSingleAttemptGate)
     /// skip_access_check must NOT bypass checkConditionalWriteSingleAttemptSupport (RFC
     /// cas-s3-timeout-retry-control): a writable open still refuses to mount on a backend that cannot
     /// prove single-attempt conditional-write support, exactly as it does without skip_access_check.
-    EXPECT_THROW(DB::Cas::Store::open(backend, cfg), DB::Exception);
+    EXPECT_THROW(DB::Cas::Pool::open(backend, cfg), DB::Exception);
 }
 
-TEST(CasStore, MinActiveTracksInFlightBuilds)
+TEST(CasPool, MinActiveTracksInFlightBuilds)
 {
     auto backend = std::make_shared<DB::Cas::InMemoryBackend>();
     DB::Cas::PoolConfig cfg;
@@ -274,7 +274,7 @@ TEST(CasStore, MinActiveTracksInFlightBuilds)
     cfg.server_id = DB::UInt128(1);
     cfg.server_root_id = "test";
     cfg.background_watermark = false;
-    auto store = DB::Cas::Store::open(backend, cfg);
+    auto store = DB::Cas::Pool::open(backend, cfg);
 
     ASSERT_EQ(store->minActive(), store->peekNextBuildSeq());   /// no builds: floor == next seq
     auto b1 = store->startBuild({});                            /// seq 1
@@ -286,7 +286,7 @@ TEST(CasStore, MinActiveTracksInFlightBuilds)
     ASSERT_EQ(store->minActive(), store->peekNextBuildSeq());   /// empty again
 }
 
-TEST(CasStore, BuildSeqIsStrictlyMonotone)
+TEST(CasPool, BuildSeqIsStrictlyMonotone)
 {
     auto backend = std::make_shared<DB::Cas::InMemoryBackend>();
     DB::Cas::PoolConfig cfg;
@@ -294,7 +294,7 @@ TEST(CasStore, BuildSeqIsStrictlyMonotone)
     cfg.server_id = DB::UInt128(1);
     cfg.server_root_id = "test";
     cfg.background_watermark = false;
-    auto store = DB::Cas::Store::open(backend, cfg);
+    auto store = DB::Cas::Pool::open(backend, cfg);
     auto a = store->startBuild({});
     auto sa = a->buildSeq();
     a->abandon();
@@ -453,39 +453,39 @@ TEST(CasPoolMeta, CasConflictReReadsWinner)
     EXPECT_EQ(result.blob_header_len, 256u);
 }
 
-TEST(CasStore, OpenFailsClosedOnNonEnforcingBackend)
+TEST(CasPool, OpenFailsClosedOnNonEnforcingBackend)
 {
     auto b = std::make_shared<InMemoryBackend>();
     b->setEnforceTokens(false);
     expectThrowsCode(DB::ErrorCodes::NOT_IMPLEMENTED,
-        [&] { Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"}); });   /// the probe error contract
+        [&] { Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"}); });   /// the probe error contract
 }
 
-TEST(CasStore, OpenCreatesPoolMetaAndReopens)
+TEST(CasPool, OpenCreatesPoolMetaAndReopens)
 {
     auto b = std::make_shared<InMemoryBackend>();
     /// Two CONCURRENT opens over the same POOL: a shared pool is the multi-server model, so each
     /// mounts a DISTINCT server_root_id (and a distinct server_id) — same-root same-uuid co-mounting
     /// is correctly fail-closed by the mount-safety protocol. This test only asserts that pool-meta is
     /// pool-authoritative and shared across opens.
-    auto s1 = Store::open(b, PoolConfig{
+    auto s1 = Pool::open(b, PoolConfig{
         .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "srv-1"});
-    auto s2 = Store::open(b, PoolConfig{
+    auto s2 = Pool::open(b, PoolConfig{
         .pool_prefix = "p", .server_id = UInt128(2), .server_root_id = "srv-2"});
     EXPECT_EQ(s1->poolMeta().pool_id, s2->poolMeta().pool_id);      /// pool authoritative
 }
 
-TEST(CasStore, OpenWithExplicitConstantsCreatesThem)
+TEST(CasPool, OpenWithExplicitConstantsCreatesThem)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .blob_header_len = 512});
+    auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .blob_header_len = 512});
     EXPECT_EQ(s->poolMeta().blob_header_len, 512u);                 /// config applies at creation
 }
 
-TEST(CasStore, VerbatimFilesLifecycle)
+TEST(CasPool, VerbatimFilesLifecycle)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     RootNamespace ns{"srv1/tbl"};
     s->putNamespaceFile(ns, "format_version.txt", "1\n");
     s->putNamespaceFile(ns, "uuid.txt", "abc");
@@ -497,10 +497,10 @@ TEST(CasStore, VerbatimFilesLifecycle)
     EXPECT_EQ(s->getNamespaceFile(ns, "uuid.txt"), String("def"));
 }
 
-TEST(CasStore, ListNamespaceFilesEmpty)
+TEST(CasPool, ListNamespaceFilesEmpty)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     RootNamespace ns{"srv1/tbl"};
     EXPECT_TRUE(s->listNamespaceFiles(ns).empty());
 }
@@ -510,10 +510,10 @@ TEST(CasStore, ListNamespaceFilesEmpty)
 /// Phase 1c read path: a published ref resolves to a ManifestId; readManifest returns the immutable
 /// body; locate yields a ranged blob read; an Inline entry has no location. Replaces the old
 /// resolveRef().tree_id / readTree round trip (the tree model is gone — a part is a single ManifestId).
-TEST(CasStore, ResolveReturnsManifestId)
+TEST(CasPool, ResolveReturnsManifestId)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     const RootNamespace ns{"srv1/tbl"};
 
     /// blob "hello world" + an inline file, published through the real Build write path.
@@ -566,10 +566,10 @@ TEST(CasStore, ResolveReturnsManifestId)
 /// body raw (writeManifestRaw, the on-storage write fixture) at a ManifestId, then resolve through a
 /// committed binding that names a DIFFERENT ManifestRef pointing at the SAME object key — so the head
 /// succeeds, the body decodes, but refMatchesBody fails => CORRUPTED_DATA.
-TEST(CasStore, ReadManifestValidatesBodyAndFailsClosed)
+TEST(CasPool, ReadManifestValidatesBodyAndFailsClosed)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     const RootNamespace ns{"srv1/tbl"};
     Layout layout("p");
 
@@ -623,10 +623,10 @@ TEST(CasStore, ReadManifestValidatesBodyAndFailsClosed)
 }
 
 /// findEntry and entryRange over a decoded part manifest's canonical-path-ordered entries.
-TEST(CasStore, LookupAndListOverManifestEntries)
+TEST(CasPool, LookupAndListOverManifestEntries)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     const RootNamespace ns{"srv1/tbl"};
 
     /// A multi-file/multi-directory part: top-level + a projection subdir.
@@ -668,10 +668,10 @@ TEST(CasStore, LookupAndListOverManifestEntries)
 /// the second readManifest must be served from the cache (no second GET of the body). A fresh publish
 /// under a DIFFERENT ref name mints a NEW ManifestId (and a new shard token), so the cache misses and
 /// the body is fetched again. A CountingBackend asserts the body GET count.
-TEST(CasStore, ManifestCacheIsKeyedByIdAndToken)
+TEST(CasPool, ManifestCacheIsKeyedByIdAndToken)
 {
     auto b = std::make_shared<DB::Cas::tests::CountingBackend>();
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     const RootNamespace ns{"srv1/tbl"};
     Layout layout("p");
 
@@ -717,7 +717,7 @@ TEST(CasStore, ManifestCacheIsKeyedByIdAndToken)
 
 /// Phase 5 (part-folder cache spec): manifest_cache is now a byte-weighted CacheBase LRU instead of a
 /// count-only bound, since decoded manifests carry inline bytes and can each be megabytes.
-TEST(CasStore, ManifestDecodeCacheIsByteBounded)
+TEST(CasPool, ManifestDecodeCacheIsByteBounded)
 {
     auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
     const DB::Cas::Layout layout("p");
@@ -749,7 +749,7 @@ TEST(CasStore, ManifestDecodeCacheIsByteBounded)
 
     DB::Cas::PoolConfig config{.pool_prefix = "p", .server_root_id = "test"};
     config.manifest_decode_cache_bytes = 2ULL << 20;
-    auto store = DB::Cas::Store::open(backend, std::move(config));
+    auto store = DB::Cas::Pool::open(backend, std::move(config));
 
     uint64_t total_gets = 0;
     for (int round = 0; round < 2; ++round)
@@ -771,13 +771,13 @@ TEST(CasStore, ManifestDecodeCacheIsByteBounded)
     EXPECT_LE(store->manifestDecodeCacheBytesForTest(), 2ULL << 20);
 }
 
-TEST(CasStore, ResolveDecodeCacheInvalidatesOnWrite)
+TEST(CasPool, ResolveDecodeCacheInvalidatesOnWrite)
 {
     /// B113: resolveRef uses a token-validated shard-manifest decode cache. A write to the shard
     /// mints a new token, so a subsequent resolve must observe the change (cache must NOT serve a
     /// stale decoded manifest). Without token invalidation this would still see the dropped ref.
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     RootNamespace ns{"srv1/tbl"};
 
     publishPart(s, ns.string(), "part_1", "payload-1");
@@ -786,7 +786,7 @@ TEST(CasStore, ResolveDecodeCacheInvalidatesOnWrite)
     ASSERT_TRUE(s->resolveRef(ns, "part_1").has_value());
     ASSERT_TRUE(s->resolveRef(ns, "part_1").has_value());
 
-    /// Write through the Store (mutateShard => new shard token), removing part_1.
+    /// Write through the Pool (mutateShard => new shard token), removing part_1.
     s->dropRef(ns, "part_1");
 
     /// The cache must invalidate on the token change: resolve now reflects the drop.
@@ -794,10 +794,10 @@ TEST(CasStore, ResolveDecodeCacheInvalidatesOnWrite)
     EXPECT_TRUE(s->listRefs(ns).empty());
 }
 
-TEST(CasStore, ResolveAbsentRefAndAbsentNamespace)
+TEST(CasPool, ResolveAbsentRefAndAbsentNamespace)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     RootNamespace ns{"srv1/tbl"};
 
     /// A freshly-opened pool has no shard manifests: an absent shard is an empty manifest, so resolve
@@ -806,14 +806,14 @@ TEST(CasStore, ResolveAbsentRefAndAbsentNamespace)
     EXPECT_TRUE(s->listRefs(ns).empty());
 }
 
-TEST(CasStore, ListRefsMergesAllShards)
+TEST(CasPool, ListRefsMergesAllShards)
 {
     /// Task 10: refs are no longer sharded (the snapshot+log protocol caches one coherent table state
     /// per namespace, not one manifest per shard) -- this now proves listRefs returns every committed
     /// ref of a table built from a single multi-owner transaction, the closest surviving analogue of
     /// the old "merges refs spread across shards" contract.
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     Layout layout("p");
     RootNamespace ns{"srv1/tbl"};
 
@@ -839,12 +839,12 @@ TEST(CasStore, ListRefsMergesAllShards)
 
 /// Task A (2026-07-03 CREATE/load HEAD storm): an empty namespace must cost exactly one LIST of the
 /// namespace's ref-shard prefix and ZERO HEADs — not one HEAD per root shard (32 by default). Measure
-/// deltas around the listRefs call: Store::open itself may LIST (probe/pool-meta), so the pre-call
+/// deltas around the listRefs call: Pool::open itself may LIST (probe/pool-meta), so the pre-call
 /// counts are the baseline.
-TEST(CasStore, ListRefsEmptyNamespaceCostsOneListZeroHeads)
+TEST(CasPool, ListRefsEmptyNamespaceCostsOneListZeroHeads)
 {
     auto b = std::make_shared<DB::Cas::tests::CountingBackend>();
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     RootNamespace ns{"srv1/tbl"};
 
     const uint64_t heads_before = b->headTotal();
@@ -861,14 +861,14 @@ TEST(CasStore, ListRefsEmptyNamespaceCostsOneListZeroHeads)
 
 /// listRefs must return every committed ref of a table, correctly, regardless of how many refs the
 /// table holds (Task 10: there is no more shard fan-out to discover -- see the comment inside).
-TEST(CasStore, ListRefsReturnsSameContentAsBefore)
+TEST(CasPool, ListRefsReturnsSameContentAsBefore)
 {
     /// Task 10: there is no more per-shard HEAD fan-out to bound (a warm listRefs costs ZERO requests;
     /// a cold one costs exactly the one recovery LIST, already covered by
     /// ListRefsEmptyNamespaceCostsOneListZeroHeads) -- this now just proves the returned content is
     /// correct for a multi-ref table built from a single raw ref-log fixture.
     auto b = std::make_shared<DB::Cas::tests::CountingBackend>();
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     Layout layout("p");
     RootNamespace ns{"srv1/tbl"};
 
@@ -894,10 +894,10 @@ TEST(CasStore, ListRefsReturnsSameContentAsBefore)
 /// A stray key under the namespace's ref-object prefix that does not parse as one of Task 10's
 /// `_cleanup`/`_log`/`_snap` kinds (a foreign/corrupt object) must not break listRefs — it is skipped
 /// defensively, listRefs still returns the legit refs and never throws.
-TEST(CasStore, ListRefsSkipsForeignKeys)
+TEST(CasPool, ListRefsSkipsForeignKeys)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     Layout layout("p");
     RootNamespace ns{"srv1/tbl"};
 
@@ -919,10 +919,10 @@ TEST(CasStore, ListRefsSkipsForeignKeys)
 }
 
 /// readManifest fails CLOSED on a corrupt or kind-mismatched manifest body addressed by a live id.
-TEST(CasStore, ReadManifestFailsClosed)
+TEST(CasPool, ReadManifestFailsClosed)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     Layout layout("p");
     const RootNamespace ns{"srv1/tbl"};
 
@@ -945,14 +945,14 @@ TEST(CasStore, ReadManifestFailsClosed)
 
 /// ---------- ref lifecycle: dropRef / updateRefPayload / dropNamespace ----------
 
-TEST(CasStore, DropRefAppendsJournalAtomically)
+TEST(CasPool, DropRefAppendsJournalAtomically)
 {
     /// Task 10: the OLD shared-journal record assertions are gone (there is no shared mutable journal
     /// object anymore — dropRef appends its OWN immutable ref-log transaction); the surviving
     /// behavioral contract is: the drop is atomic (visible to resolveRef only once durable), and
     /// dropping a missing ref is fail-closed, never a silent no-op.
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     RootNamespace ns{"srv1/tbl"};
 
     publishPart(s, ns.string(), "part_1", "payload-1");
@@ -975,10 +975,10 @@ TEST(CasStore, DropRefAppendsJournalAtomically)
 /// resolveRef and the manifest edge cannot change on this path -- the `RefPayloadUpdate` carrier
 /// deliberately has no `manifest_ref` field, so a reachability change is structurally impossible here
 /// (it goes through publish/drop/repoint instead).
-TEST(CasStore, UpdateRefPayloadUpdatesPublishedAtMs)
+TEST(CasPool, UpdateRefPayloadUpdatesPublishedAtMs)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     RootNamespace ns{"srv1/tbl"};
 
     const ManifestId id = publishPart(s, ns.string(), "part_1", "payload-1");
@@ -997,10 +997,10 @@ TEST(CasStore, UpdateRefPayloadUpdatesPublishedAtMs)
 /// performs NO physical deletion at all -- verbatim files survive until GC's namespace-cleanup item
 /// (Task 12) reclaims the whole `@cas@` namespace. So after the drop every ref resolves away and
 /// `listRefs` is empty, but the verbatim files remain readable.
-TEST(CasStore, DropNamespaceRemovesEveryOwnerButLeavesFilesForGc)
+TEST(CasPool, DropNamespaceRemovesEveryOwnerButLeavesFilesForGc)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     RootNamespace ns{"srv1/tbl"};
 
     const std::vector<String> ref_names{"alpha", "bravo", "charlie"};
@@ -1030,13 +1030,13 @@ TEST(CasStore, DropNamespaceRemovesEveryOwnerButLeavesFilesForGc)
     expectThrowsCode(DB::ErrorCodes::FILE_DOESNT_EXIST, [&] { s->dropRef(ns, "alpha"); });
 }
 
-TEST(CasStore, ListNamespacesFromRefsTree)
+TEST(CasPool, ListNamespacesFromRefsTree)
 {
     /// listNamespaces = LIST-based discovery (Task 4): enumerates distinct full namespace strings
     /// from ref shards under `cas/refs/`. The wiring uses it for directory-style enumeration of
     /// opaque namespace strings (M-W).
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
 
     EXPECT_TRUE(s->listNamespaces("").empty());   /// fresh pool: no ref shards yet
 
@@ -1060,11 +1060,11 @@ TEST(CasStore, ListNamespacesFromRefsTree)
     EXPECT_TRUE(s->listNamespaces("nope/").empty());
 }
 
-TEST(CasStore, ListMirroredChildren)
+TEST(CasPool, ListMirroredChildren)
 {
     using namespace DB::Cas;
     auto b = std::make_shared<InMemoryBackend>();
-    auto store = Store::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    auto store = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     /// Seed two shadow archives by writing a verbatim file into each (creates the prefix in S3).
     store->putNamespaceFile(RootNamespace{"shadow/bk1/store/3f2/3f2a-uuid@cas@"}, "x", "1");
     store->putNamespaceFile(RootNamespace{"shadow/bk2/store/3f2/3f2a-uuid@cas@"}, "x", "1");
@@ -1088,7 +1088,7 @@ namespace
 /// body for the armed key — reproducing the S13 window: the GC's token-guarded fence-out lands
 /// between the keeper adopt's GET and its CAS. The caller's subsequent token-guarded `putOverwrite`
 /// then fails `PreconditionFailed`, the adopt re-reads, sees `gc_fenced`, and throws
-/// `MountFencedException` — which `Store::open`'s fence-recovery loop must turn into a fresh-epoch
+/// `MountFencedException` — which `Pool::open`'s fence-recovery loop must turn into a fresh-epoch
 /// retry rather than a permanent wedge (P3.1 vector C).
 class FenceInAdoptWindowBackend final : public DB::Cas::Backend
 {
@@ -1132,20 +1132,20 @@ TEST(CasStoreMountFence, OpenRecoversFromFenceInAdoptWindowWithFreshEpoch)
 {
     auto inner = std::make_shared<InMemoryBackend>();
     auto fencing = std::make_shared<FenceInAdoptWindowBackend>(inner);
-    /// Arm the one-shot fence on the mount slot. Store::open first claims the mount (fresh mint), then
+    /// Arm the one-shot fence on the mount slot. Pool::open first claims the mount (fresh mint), then
     /// the keeper adopts it — the adopt's GET trips the fence, its CAS fails, and open must recover.
     const DB::Cas::Layout layout("p");
     fencing->fence_key = layout.mountKey("test");
 
     /// The retry that recovers from the fence reclaims a same-uuid, different-epoch, `gc_fenced` body
-    /// -> `MountPriorState::Fenced` (rev.6 Task 4/6) -> `Store::open` pays `materialization_grace_ms`
+    /// -> `MountPriorState::Fenced` (rev.6 Task 4/6) -> `Pool::open` pays `materialization_grace_ms`
     /// (zero observation polling either way: a fenced prior is reclaimed on the first attempt). Inject
     /// a no-op `wait_sleep_fn` (+ a fake `boot_ms_fn`, matching `CasMountTmat.FencedPriorPaysOnlyTmat`)
     /// so the wait resolves instantly instead of blocking this test on ~30 real seconds.
     uint64_t fake_boot = 0;
-    DB::Cas::StorePtr store;
+    DB::Cas::PoolPtr store;
     ASSERT_NO_THROW(
-        store = DB::Cas::Store::open(fencing,
+        store = DB::Cas::Pool::open(fencing,
             DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test",
                 .boot_ms_fn = [&fake_boot] { return fake_boot; },
                 .wait_sleep_fn = [&fake_boot](uint64_t ms) { fake_boot += ms; }}))
@@ -1167,11 +1167,11 @@ TEST(CasStoreMountFence, OpenRecoversFromFenceInAdoptWindowWithFreshEpoch)
 /// A CLOCK_MONOTONIC freeze cannot be simulated in a unit test, so we exercise the injected-fn seam: a
 /// fake boot clock that we advance past the ttl must flip mayMutate to false and make a gated mutate
 /// fail closed with ABORTED.
-TEST(CasStore, WriteFenceUsesInjectedBootClock)
+TEST(CasPool, WriteFenceUsesInjectedBootClock)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     uint64_t fake_boot = 1'000'000;   /// arbitrary boottime origin (ms)
-    auto store = DB::Cas::Store::open(backend, DB::Cas::PoolConfig{
+    auto store = DB::Cas::Pool::open(backend, DB::Cas::PoolConfig{
         .pool_prefix = "p",
         .server_root_id = "test",
         .mount_lease_ttl_ms = std::chrono::milliseconds(30000),
@@ -1279,15 +1279,15 @@ TEST(CasStoreRemount, ShutdownGuardRefusesToArmRemount)
     auto backend = std::make_shared<InMemoryBackend>();
     /// background_watermark = true so scheduleRemount actually arms a recovery thread in production mode
     /// (the same gate every background thread checks).
-    auto store = DB::Cas::Store::open(backend,
+    auto store = DB::Cas::Pool::open(backend,
         DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test", .background_watermark = true});
 
-    /// Teardown has begun: ~Store() latches this at its very top, BEFORE its only remount-thread join.
+    /// Teardown has begun: ~Pool() latches this at its very top, BEFORE its only remount-thread join.
     store->beginShutdownForTest();
 
     /// A lease-renewal failure firing DURING teardown re-enters scheduleRemount (the keeper's on_lost
     /// callback). With the guard it must refuse to spawn; without it, it arms remount_thread AFTER
-    /// ~Store()'s join — the leftover joinable ThreadFromGlobalPool handle then abort()s the process at
+    /// ~Pool()'s join — the leftover joinable ThreadFromGlobalPool handle then abort()s the process at
     /// member destruction (std::terminate). Reading joinable() immediately after the synchronous call is
     /// race-free: the armed thread never touches the handle.
     EXPECT_FALSE(store->scheduleRemountForTest())
@@ -1324,11 +1324,11 @@ public:
 TEST(CasStoreShutdown, CleanStopDrainsAndWritesFarewell)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = DB::Cas::Store::open(backend, DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    auto store = DB::Cas::Pool::open(backend, DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     publishPart(store, "srv/clean_stop", "x", "payload");
 
     const String mount_key = store->layout().mountKey("test");
-    store.reset();   /// drives ~Store(): with no in-flight ref-log PUT, the drain must succeed.
+    store.reset();   /// drives ~Pool(): with no in-flight ref-log PUT, the drain must succeed.
 
     const auto got = backend->get(mount_key);
     ASSERT_TRUE(got.has_value());
@@ -1346,7 +1346,7 @@ TEST(CasStoreShutdown, UnresolvedWedgeSkipsFarewell)
     budget.lease_safety_margin_ms = 100;
 
     auto backend = std::make_shared<UnresolvedPutBackend>();
-    auto store = DB::Cas::Store::open(backend, DB::Cas::PoolConfig{
+    auto store = DB::Cas::Pool::open(backend, DB::Cas::PoolConfig{
         .pool_prefix = "p", .server_root_id = "test", .cas_request_budget = budget});
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv/wedge_shutdown"};
@@ -1360,7 +1360,7 @@ TEST(CasStoreShutdown, UnresolvedWedgeSkipsFarewell)
     ASSERT_TRUE(store->refLaneWedgedForTest(ns));
 
     const String mount_key = store->layout().mountKey("test");
-    store.reset();   /// drives ~Store(): the still-wedged lane must skip the farewell marker.
+    store.reset();   /// drives ~Pool(): the still-wedged lane must skip the farewell marker.
 
     const auto got = backend->get(mount_key);
     ASSERT_TRUE(got.has_value());
@@ -1397,9 +1397,9 @@ TEST(CasMountTmat, UncleanOpenWaitsMaterializationGrace)
 
     uint64_t fake_boot = 0;
     std::vector<uint64_t> waits;
-    StorePtr store;
+    PoolPtr store;
     ASSERT_NO_THROW(
-        store = Store::open(b, PoolConfig{
+        store = Pool::open(b, PoolConfig{
             .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "test",
             .mount_lease_ttl_ms = std::chrono::milliseconds(500),
             .mount_renew_period = std::chrono::milliseconds(100),
@@ -1424,16 +1424,16 @@ TEST(CasMountTmat, UncleanOpenWaitsMaterializationGrace)
 TEST(CasMountTmat, CleanOpenSkipsAllWaits)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    /// Predecessor released cleanly (drain + farewell from Task 5): open, then reset() drives ~Store(),
+    /// Predecessor released cleanly (drain + farewell from Task 5): open, then reset() drives ~Pool(),
     /// which -- with nothing in flight -- writes the farewell marker (min_active == UINT64_MAX).
-    auto predecessor = Store::open(b, PoolConfig{
+    auto predecessor = Pool::open(b, PoolConfig{
         .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "test"});
     predecessor.reset();
 
     std::vector<uint64_t> waits;
-    StorePtr successor;
+    PoolPtr successor;
     ASSERT_NO_THROW(
-        successor = Store::open(b, PoolConfig{
+        successor = Pool::open(b, PoolConfig{
             .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "test",
             .materialization_grace_ms = 30000,
             .wait_sleep_fn = [&](uint64_t ms) { waits.push_back(ms); },
@@ -1460,9 +1460,9 @@ TEST(CasMountTmat, FencedPriorPaysOnlyTmat)
         .attempt_timeout_ms = 50, .operation_deadline_ms = 50, .max_attempts = 1, .lease_safety_margin_ms = 50};
 
     std::vector<uint64_t> waits;
-    StorePtr store;
+    PoolPtr store;
     ASSERT_NO_THROW(
-        store = Store::open(b, PoolConfig{
+        store = Pool::open(b, PoolConfig{
             .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "test",
             .mount_lease_ttl_ms = std::chrono::milliseconds(500),
             .cas_request_budget = tiny_budget,
@@ -1485,7 +1485,7 @@ TEST(CasRemountTmat, DrainedRemountSkipsGrace)
     auto backend = std::make_shared<InMemoryBackend>();
     uint64_t fake_boot = 1'000'000;
     std::vector<uint64_t> waits;
-    auto store = Store::open(backend, PoolConfig{
+    auto store = Pool::open(backend, PoolConfig{
         .pool_prefix = "p", .server_root_id = "test",
         .mount_lease_ttl_ms = std::chrono::milliseconds(30000),
         .boot_ms_fn = [&] { return fake_boot; },
@@ -1521,7 +1521,7 @@ TEST(CasRemountTmat, UnresolvedWedgePaysGraceAndMarksBoundaryUnclean)
     auto backend = std::make_shared<UnresolvedPutBackend>();
     uint64_t fake_boot = 1'000'000;
     std::vector<uint64_t> waits;
-    auto store = Store::open(backend, PoolConfig{
+    auto store = Pool::open(backend, PoolConfig{
         .pool_prefix = "p", .server_root_id = "test",
         .mount_lease_ttl_ms = std::chrono::milliseconds(30000),
         .cas_request_budget = budget,
@@ -1576,7 +1576,7 @@ TEST(CasRemountTmat, CleanRemountAfterEarlierUncleanOneDoesNotSealALateTouchedTa
 
     auto backend = std::make_shared<UnresolvedPutBackend>();
     uint64_t fake_boot = 1'000'000;
-    auto store = Store::open(backend, PoolConfig{
+    auto store = Pool::open(backend, PoolConfig{
         .pool_prefix = "p", .server_root_id = "test",
         .mount_lease_ttl_ms = std::chrono::milliseconds(30000),
         .cas_request_budget = budget,
@@ -1632,7 +1632,7 @@ TEST(CasRemountTmat, CleanRemountAfterEarlierUncleanOneDoesNotSealALateTouchedTa
         << "no seal must have been published at the STALE (epoch-2) boundary for ns2";
 }
 
-TEST(CasStore, ReadManifestSharedReturnsSharedDecodeWithoutCopy)
+TEST(CasPool, ReadManifestSharedReturnsSharedDecodeWithoutCopy)
 {
     auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
     const DB::Cas::Layout layout("p");
@@ -1644,7 +1644,7 @@ TEST(CasStore, ReadManifestSharedReturnsSharedDecodeWithoutCopy)
         {DB::Cas::tests::namespaceBirthOp(), DB::Cas::tests::publishCommittedOps("part_1", ref)[0],
          DB::Cas::tests::publishCommittedOps("part_1", ref)[1]}});
 
-    auto store = DB::Cas::Store::open(backend,
+    auto store = DB::Cas::Pool::open(backend,
         DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     const auto resolved = store->resolveRef(ns, "part_1");
     ASSERT_TRUE(resolved.has_value());
@@ -1662,13 +1662,13 @@ TEST(CasStore, ReadManifestSharedReturnsSharedDecodeWithoutCopy)
 }
 
 /// Coverage gap (Task 13a): restores the get/exists/remove roundtrip for the mount access-check probe
-/// object. The old `CasStore.MountpointObjectRoundTrip` was dropped in the refactor; the wiring test only
+/// object. The old `CasPool.MountpointObjectRoundTrip` was dropped in the refactor; the wiring test only
 /// exercises `putMountpointObject` + `existsFile`, leaving `getMountpointObject`'s value round-trip and
-/// `removeMountpointObject` unasserted even though both `Store` methods remain live.
-TEST(CasStore, MountpointObjectRoundTrip)
+/// `removeMountpointObject` unasserted even though both `Pool` methods remain live.
+TEST(CasPool, MountpointObjectRoundTrip)
 {
     auto b = std::make_shared<DB::Cas::InMemoryBackend>();
-    auto store = DB::Cas::Store::open(b, DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    auto store = DB::Cas::Pool::open(b, DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     const String key = "srv1/clickhouse_access_check_abc";
     EXPECT_FALSE(store->getMountpointObject(key).has_value());
     EXPECT_FALSE(store->mountpointObjectExists(key));

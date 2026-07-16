@@ -148,7 +148,7 @@ bool shouldDeferRound(size_t changed_shards, bool graduation_due, uint64_t round
     return true;
 }
 
-Gc::Gc(StorePtr store_, UInt128 gc_id_, std::function<uint64_t()> now_ms_fn_,
+Gc::Gc(PoolPtr store_, UInt128 gc_id_, std::function<uint64_t()> now_ms_fn_,
        std::function<uint64_t()> mono_ms_fn_)
     : store(std::move(store_))
     , gc_id(gc_id_)
@@ -165,8 +165,8 @@ Gc::Gc(StorePtr store_, UInt128 gc_id_, std::function<uint64_t()> now_ms_fn_,
             return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::system_clock::now().time_since_epoch()).count());
         };
-    /// fix-round F6 (author-review): default to `store->bootMsNow()`, not the raw static `Store::bootMs()`
-    /// -- the latter bypasses the Store's own injectable `config.boot_ms_fn`, so a time-controlled test
+    /// fix-round F6 (author-review): default to `store->bootMsNow()`, not the raw static `Pool::bootMs()`
+    /// -- the latter bypasses the Pool's own injectable `config.boot_ms_fn`, so a time-controlled test
     /// that fakes the mount's clock via `boot_ms_fn` (but constructs a `Gc` without an explicit
     /// `mono_ms_fn`) would silently run its GC-side threshold math against the REAL wall clock while the
     /// mount side runs against the fake one -- two desynced clocks passing for the same test.
@@ -2274,7 +2274,7 @@ void Gc::rememberObservation(const GcLease & lease)
     last_seen_seq = lease.seq;
 }
 
-void Gc::pulseHeartbeat(Store & store, UInt128 gc_id)
+void Gc::pulseHeartbeat(Pool & store, UInt128 gc_id)
 {
     const String key = store.layout().gcHbKey();
     const auto got = store.backend().get(key);

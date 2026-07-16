@@ -117,7 +117,7 @@ CasNs classifyCasNs(const String & key)
     /// part manifests under `cas/manifests/<ns>/...`. Without these two rules every ref-shard and
     /// manifest request misclassified as Other — the 2026-07-03 operator-stand CREATE TABLE storm
     /// showed up as `CasOtherHeadMiss=102` when it was really 3 all-shard ref sweeps (see
-    /// `Store::listRefs`).
+    /// `Pool::listRefs`).
     if (key.find("/cas/refs/") != String::npos)
         return CasNs::Root;
     if (key.find("/cas/manifests/") != String::npos)

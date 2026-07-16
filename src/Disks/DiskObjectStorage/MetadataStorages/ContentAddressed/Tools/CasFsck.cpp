@@ -96,7 +96,7 @@ bool parseBuildPrefix(const Layout & layout, const String & key, BuildPrefix & o
 /// Fails CLOSED on any ambiguity (a malformed label, a dropped-then-recreated ref that throws, a
 /// corrupt current manifest): treated as "still referenced", i.e. the original conservative verdict.
 /// The fix can only SHRINK false positives — it must never hide a real one.
-bool blobStillReferenced(Store & store, const Layout & layout,
+bool blobStillReferenced(Pool & store, const Layout & layout,
                           const String & bkey, const std::vector<String> & labels, const Deadline & deadline)
 {
     if (labels.empty())
@@ -112,7 +112,7 @@ bool blobStillReferenced(Store & store, const Layout & layout,
         try
         {
             /// FRESH read via `recoverRefTable` (a full LIST + replay), NOT `store.resolveRef` -- the
-            /// mounted Store caches its `RefTableState` and never re-recovers it, so a concurrent EXTERNAL
+            /// mounted Pool caches its `RefTableState` and never re-recovers it, so a concurrent EXTERNAL
             /// ref write (the B207 race) is invisible to the cache. The recovery equation sees every log.
             const RootNamespace rns{ns_part};
             const RefTableState table = recoverRefTable(store.backend(), layout, rns);
@@ -239,7 +239,7 @@ void checkSnapshotOracle(Backend & backend, const Layout & layout, const RootNam
     }
 }
 
-void runFsckImpl(Store & store, bool detail, const FsckProgress & on_progress, const Deadline & deadline,
+void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, const Deadline & deadline,
                   const String & namespace_prefix, FsckReport & report)
 {
     const Layout & layout = store.layout();
@@ -264,7 +264,7 @@ void runFsckImpl(Store & store, bool detail, const FsckProgress & on_progress, c
     for (const String & ns_str : store.listNamespaces(namespace_prefix))
     {
         const RootNamespace ns{ns_str};
-        /// FRESH recovery (LIST + replay), NOT the mounted Store's cached `listRefs`: fsck is a read-only
+        /// FRESH recovery (LIST + replay), NOT the mounted Pool's cached `listRefs`: fsck is a read-only
         /// audit that must see the authoritative durable ref state, including any external write.
         const RefTableState table = recoverRefTable(backend, layout, ns);
         /// Snapshot integrity oracle (spec §Snapshot Publication): verify this table's newest published
@@ -653,7 +653,7 @@ void runFsckImpl(Store & store, bool detail, const FsckProgress & on_progress, c
 
 }
 
-FsckReport runFsck(Store & store, bool detail, FsckProgress on_progress,
+FsckReport runFsck(Pool & store, bool detail, FsckProgress on_progress,
                    std::optional<std::chrono::steady_clock::time_point> deadline,
                    bool partial_on_deadline, const String & namespace_prefix)
 {

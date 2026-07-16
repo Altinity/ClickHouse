@@ -1,5 +1,5 @@
 #pragma once
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasStore.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Common/ThreadPool.h>
 #include <base/types.h>
@@ -63,7 +63,7 @@ class CasGcScheduler
 {
 public:
     CasGcScheduler(
-        Cas::StorePtr store_,
+        Cas::PoolPtr store_,
         std::chrono::seconds interval_,
         const String & log_name,
         String disk_name_,
@@ -109,7 +109,7 @@ private:
     Cas::RoundReport runRoundLogged(Cas::Gc & round_gc, GcRoundLogRecord::Trigger trigger,
                                      std::function<void()> on_lease_acquired = {}, bool allow_steal = true);
 
-    const Cas::StorePtr store;
+    const Cas::PoolPtr store;
     const std::chrono::seconds interval;
     const std::chrono::milliseconds hb_interval;   /// B160: heartbeat cadence H = interval/4
     const LoggerPtr log;

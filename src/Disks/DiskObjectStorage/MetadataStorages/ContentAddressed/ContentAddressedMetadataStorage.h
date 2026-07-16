@@ -7,7 +7,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Parts/PartFolderAccess.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Parts/PartFolderAccess.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcScheduler.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasStore.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Interpreters/Context_fwd.h>
 #include <memory>
 #include <mutex>
@@ -35,7 +35,7 @@ enum class StagingBackend
 /// Content-addressed metadata storage — the M-W wiring (design 2026-06-11 section 4): a THIN
 /// translator between the IMetadataStorage read surface and the Cas:: core. ClickHouse path
 /// parsing (PartPathParser) + namespace mapping (D-W1) + StoredObjects construction; NO protocol
-/// state, NO internals-exposing accessors — the protocol lives in Cas::Store/Build/Gc.
+/// state, NO internals-exposing accessors — the protocol lives in Cas::Pool/Build/Gc.
 ///
 /// Namespace mapping (M-W decision D-W1, shadow refined during T2; detached folded in B181):
 ///   live part      SERVER_ID/TABLE_UUID            ref = PART_DIR
@@ -43,7 +43,7 @@ enum class StagingBackend
 ///   FREEZE shadow  the LITERAL shadow table dir     ref = PART_DIR
 ///                  (shadow/BACKUP/store/U3/UUID or shadow/BACKUP/data/DB/TBL — bijective with
 ///                  the disk path for both Atomic and non-Atomic layouts, so the shadow tree
-///                  enumerates from Store::listNamespaces("shadow/..."))
+///                  enumerates from Pool::listNamespaces("shadow/..."))
 ///   generic files  SERVER_ID/_disk                  verbatim namespace files (access probes)
 ///
 /// Small per-part files (uuid.txt, metadata_version.txt, txn_version.txt, checksums.txt, ...) are
@@ -167,7 +167,7 @@ public:
 
     MetadataTransactionPtr createTransaction() override;
 
-    /// Disk lifecycle (DiskObjectStorage start/stop): open/close the Cas::Store (fail-closed probe
+    /// Disk lifecycle (DiskObjectStorage start/stop): open/close the Cas::Pool (fail-closed probe
     /// + pool-format check) and drive the GC scheduler.
     void startup() override;
     void shutdown() override;
@@ -194,7 +194,7 @@ public:
     /// ==== wiring-internal surface (the transaction + the disk's prepareRead CA branch) ====
 
     /// The opened pool. Throws LOGICAL_ERROR before startup — every caller is post-startup.
-    const Cas::StorePtr & store() const;
+    const Cas::PoolPtr & store() const;
     /// The facade, by REFERENCE (dot-syntax call sites — the committed-ref style guard bans raw
     /// `->` mutation tokens in wiring). Throws LOGICAL_ERROR before startup, like store().
     ContentAddressed::CachedPartFolderAccess & partAccess() const;
@@ -360,7 +360,7 @@ private:
     const uint64_t cas_part_folder_cache_bytes;
     const uint64_t cas_part_folder_cache_max_entries;
     const uint64_t cas_part_folder_cache_max_entry_bytes;
-    /// Phase 5 (part-folder cache spec): byte bound for the manifest DECODE cache (Cas::Store), threaded
+    /// Phase 5 (part-folder cache spec): byte bound for the manifest DECODE cache (Cas::Pool), threaded
     /// into PoolConfig in startup(). 0 disables decode caching entirely (diagnostic mode).
     const uint64_t manifest_decode_cache_bytes;
     /// Task 5: bounded pool size for GC's per-hash freshness-meta writes, threaded into PoolConfig.
@@ -387,11 +387,11 @@ private:
     /// Defaults to false (fail-close): assumed unsupported until the probe proves otherwise.
     bool conditional_copy_supported = false;
 
-    /// Set by startup (Store::open is fail-closed; empty store == not started).
-    Cas::StorePtr cas_store;
+    /// Set by startup (Pool::open is fail-closed; empty store == not started).
+    Cas::PoolPtr cas_store;
     /// The part-folder access facade (spec 2026-07-08-cas-part-folder-cache): the ONLY normal path
     /// for committed part/projection reads and committed part-ref mutations. Constructed in
-    /// startup right after Store::open; reset in shutdown before cas_store.
+    /// startup right after Pool::open; reset in shutdown before cas_store.
     std::unique_ptr<ContentAddressed::CachedPartFolderAccess> part_access;
     String pool_uuid;
     std::unique_ptr<ContentAddressed::CasGcScheduler> gc_scheduler;
@@ -433,7 +433,7 @@ private:
     /// and appends it to the SystemLog (best-effort). Returns an empty sink when context is null.
     ContentAddressed::GcRoundLogger makeGcRoundLogger() const;
 
-    /// Build the per-event CAS audit sink (B170): the std::function the Store calls on every
+    /// Build the per-event CAS audit sink (B170): the std::function the Pool calls on every
     /// content-addressed decision. Captures the ContextPtr, converts the decoupled Core POD
     /// `Cas::CasEvent` into a ContentAddressedLogElement, and appends it to the SystemLog
     /// (best-effort). Returns an empty sink when context is null (unit tests).

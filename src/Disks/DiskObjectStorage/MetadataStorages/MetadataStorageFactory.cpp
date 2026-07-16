@@ -301,13 +301,13 @@ static void registerContentAddressedMetadataStorage(MetadataStorageFactory & fac
         /// re-proof HEAD validation policy. Default `always` is byte-for-byte pre-§3 behavior --
         /// EVERY ForceFresh re-proves the manifest body via the mandatory HEAD.
         const auto part_folder_validate = ContentAddressedMetadataStorage::parsePartFolderValidate(config, config_prefix);
-        /// Phase-5 (part-folder cache spec): byte bound for the manifest DECODE cache (Cas::Store).
+        /// Phase-5 (part-folder cache spec): byte bound for the manifest DECODE cache (Cas::Pool).
         /// `manifest_decode_cache_bytes = 0` disables decode caching entirely (diagnostic mode).
         const uint64_t manifest_decode_cache_bytes = config.getUInt64(config_prefix + ".manifest_decode_cache_bytes", 128ULL << 20);
         /// Task 5: bounded pool size for GC's per-hash freshness-meta writes (condemn/spare/delete) —
         /// a mass-DROP condemning ~1M blobs sequentially would take hours; see `PoolConfig::gc_meta_pool_size`.
         const uint64_t gc_meta_pool_size = config.getUInt64(config_prefix + ".gc_meta_pool_size", 16);
-        /// rev.6 Task 6 (spec §Late Predecessor PUT): the conditional post-reclaim wait `Store::open`
+        /// rev.6 Task 6 (spec §Late Predecessor PUT): the conditional post-reclaim wait `Pool::open`
         /// pays over an unclean predecessor; see `Cas::PoolConfig::materialization_grace_ms`.
         const uint64_t materialization_grace_ms = config.getUInt64(config_prefix + ".materialization_grace_ms", 30000);
         /// S3-native staging (design 2026-07-11-cas-s3-native-staging-design.md §4, plan Task 0):

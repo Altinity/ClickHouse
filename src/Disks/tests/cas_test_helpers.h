@@ -17,7 +17,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefLogFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasStore.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Common/Exception.h>
 #include <Common/thread_local_rng.h>
 
@@ -79,9 +79,9 @@ inline DB::ObjectStoragePtr makeLocalObjectStorageForTest()
     return std::make_shared<DB::LocalObjectStorage>(std::move(settings));
 }
 
-/// ---- on-storage write fixtures (shared by the Store read/lifecycle/build tests, Tasks 9-13) ----
+/// ---- on-storage write fixtures (shared by the Pool read/lifecycle/build tests, Tasks 9-13) ----
 ///
-/// These produce objects through the SAME codecs the Store reads — the documented on-storage
+/// These produce objects through the SAME codecs the Pool reads — the documented on-storage
 /// interface, not white-box pokes — so a test asserts a real round trip across the format boundary.
 
 /// CityHash128 of bytes, composed into the canonical lowercase-hex id.
@@ -195,7 +195,7 @@ inline DB::Cas::RefOp ownerTransitionOp(
 /// and write `RefLogTxn{ns, txn_id, ops}` via `writeRefLogTxnRaw`. Returns the allocated `ref_sequence`.
 /// `ops` must form a REPLAY-VALID transaction: `fsck`/recovery replay them through the same state
 /// machine the writer uses, and the GC edge extractor reads their manifest edges. The bytes are real
-/// wire-format (the same codec `Store`'s recovery reads) -- never hand-rolled.
+/// wire-format (the same codec `Pool`'s recovery reads) -- never hand-rolled.
 inline uint64_t appendRefLogSeed(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout,
     const DB::Cas::RootNamespace & ns, std::vector<DB::Cas::RefOp> ops)
@@ -449,7 +449,7 @@ inline bool blobAbsent(DB::Cas::Backend & backend, const DB::Cas::Layout & layou
 /// deleted by round K+2 (condemn at K -> graduate to delete_pending at K+1, unconditionally -> physical
 /// delete at K+2). Returns true as soon as the blob became absent.
 inline bool runRoundsUntilAbsent(
-    const DB::Cas::StorePtr & store, DB::Cas::Gc & gc, DB::Cas::Backend & backend,
+    const DB::Cas::PoolPtr & store, DB::Cas::Gc & gc, DB::Cas::Backend & backend,
     const DB::Cas::Layout & layout, const DB::UInt128 & hash, int max_rounds = 8)
 {
     for (int i = 0; i < max_rounds; ++i)
@@ -556,7 +556,7 @@ inline DB::Cas::Token displaceBlobToken(
 
 /// ---- GC-core (Phase 1d) test helpers over the part-manifest model ----
 
-/// Open a Store over `backend`.
+/// Open a Pool over `backend`.
 ///
 /// `gc_fold_max_defer_rounds` defaults to the PoolConfig default (8) -- unchanged behaviour for every
 /// existing caller. A test that drives MANY consecutive genuinely-idle `runRegularRound` calls and
@@ -564,10 +564,10 @@ inline DB::Cas::Token displaceBlobToken(
 /// what Phase-4 Lever A (spec 2026-07-06-cas-gc-round-skip-unchanged) is designed to skip -- passes 0
 /// here to force fold-every-round (shouldDeferRound's liveness bound: rounds_since_last_fold(0) >= 0
 /// is always true).
-inline DB::Cas::StorePtr openStoreForTest(
+inline DB::Cas::PoolPtr openStoreForTest(
     std::shared_ptr<DB::Cas::InMemoryBackend> backend, uint64_t gc_fold_max_defer_rounds = 8)
 {
-    return DB::Cas::Store::open(std::move(backend),
+    return DB::Cas::Pool::open(std::move(backend),
         DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test",
                             .gc_fold_max_defer_rounds = gc_fold_max_defer_rounds});
 }
@@ -759,9 +759,9 @@ inline void setWatermarkMinActive(
 
 /// ---- Task 10 ref snapshot+log raw fixtures ----
 /// Mirror the pre-Task-10 `appendOwnerEvent`/`publishRaw` helpers above, but for the new snapshot+log
-/// object layout: write a ref-object body directly via the SAME codecs `Store`'s recovery reads,
+/// object layout: write a ref-object body directly via the SAME codecs `Pool`'s recovery reads,
 /// bypassing the writer's own append lane entirely. Used to seed pre-existing table state before a
-/// fresh `Store` ever touches the namespace (recovery tests), and to control exact keys/bytes
+/// fresh `Pool` ever touches the namespace (recovery tests), and to control exact keys/bytes
 /// (restart-on-vanish tests).
 
 /// Writes `snapshot` at `_snap/<snapshot_id>.proto` (create-if-absent).

@@ -10,7 +10,7 @@
 #include <DataTypes/DataTypeUUID.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasStore.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Processors/Sources/SourceFromSingleChunk.h>
 #include <QueryPipeline/Pipe.h>
 #include <Interpreters/Context.h>
@@ -117,7 +117,7 @@ Pipe StorageSystemContentAddressedMounts::read(
         if (!ca)
             continue;
 
-        Cas::StorePtr store;
+        Cas::PoolPtr store;
         try
         {
             store = ca->store();

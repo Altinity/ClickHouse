@@ -1,7 +1,7 @@
 #pragma once
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEvent.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasStore.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 
 #include <cstdint>
 #include <string>
@@ -31,8 +31,8 @@ struct DecommissionReport
 
 /// Operator-driven offline erasure of a DEAD pool member's namespace (`SYSTEM CONTENT ADDRESSED DROP
 /// POOL MEMBER`, design 2026-07-13-cas-pool-member-decommission §core). Opens an admin writer mount
-/// impersonating `victim_srid` (`Store::openForDecommission` -- fail-closed on a live member) and
-/// erases every one of the victim's namespaces via the ordinary `Store::dropNamespace` writer path:
+/// impersonating `victim_srid` (`Pool::openForDecommission` -- fail-closed on a live member) and
+/// erases every one of the victim's namespaces via the ordinary `Pool::dropNamespace` writer path:
 /// this call is a WRITER, never GC, and never invents a ref transition of its own. `sink` (when set)
 /// receives `MemberDecommission` audit events for the run's begin/per-namespace/end.
 DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,

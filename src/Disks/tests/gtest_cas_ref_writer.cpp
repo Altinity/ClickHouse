@@ -8,7 +8,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefLogFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasStore.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/Exception.h>
 #include <Common/ProfileEvents.h>
@@ -64,24 +64,24 @@ using DB::Cas::tests::writeRefSnapshotRaw;
 namespace
 {
 
-StorePtr openStore(const BackendPtr & backend, CasRequestBudget budget = {})
+PoolPtr openStore(const BackendPtr & backend, CasRequestBudget budget = {})
 {
-    return Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .cas_request_budget = budget});
+    return Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .cas_request_budget = budget});
 }
 
 /// Task 11: like `openStore`, but the caller supplies (and owns) the rest of the config -- snapshot
 /// thresholds, grace age, a fake `boot_ms_fn`, etc. `pool_prefix`/`server_root_id` are pinned so every
 /// test in this file addresses the same pool shape.
-StorePtr openStoreWithConfig(const BackendPtr & backend, PoolConfig config)
+PoolPtr openStoreWithConfig(const BackendPtr & backend, PoolConfig config)
 {
     config.pool_prefix = "p";
     config.server_root_id = "test";
-    return Store::open(backend, std::move(config));
+    return Pool::open(backend, std::move(config));
 }
 
 /// Mirrors gtest_cas_build.cpp's startBuildFor/publishOneBlobPart, minus the blob (an empty-entry
 /// manifest is a legal, blob-free part -- the ref-writer tests only care about ref/manifest identity).
-BuildPtr startBuildFor(const StorePtr & s, const RootNamespace & ns, const String & ref)
+BuildPtr startBuildFor(const PoolPtr & s, const RootNamespace & ns, const String & ref)
 {
     BuildInfo info;
     info.intended_namespace = ns;
@@ -89,7 +89,7 @@ BuildPtr startBuildFor(const StorePtr & s, const RootNamespace & ns, const Strin
     return s->startBuild(info);
 }
 
-ManifestId publishEmptyPart(const StorePtr & s, const RootNamespace & ns, const String & ref)
+ManifestId publishEmptyPart(const PoolPtr & s, const RootNamespace & ns, const String & ref)
 {
     auto build = startBuildFor(s, ns, ref);
     const ManifestId id = build->stageManifest({});
@@ -139,7 +139,7 @@ RefTableState independentFullReplayForTest(Backend & backend, const Layout & lay
 }
 
 /// The greatest `_snap/<id>.proto` key currently present for `ns`, found via a fresh LIST (independent
-/// of the Store's own cached bookkeeping).
+/// of the Pool's own cached bookkeeping).
 std::optional<RefTxnId> listGreatestSnapshotIdForTest(Backend & backend, const Layout & layout, const RootNamespace & ns)
 {
     std::optional<RefTxnId> greatest;
@@ -333,7 +333,7 @@ public:
     /// Blocks until the PREVIOUSLY-blocked `putIfAbsent` call has actually RETURNED (not merely been
     /// unblocked) -- i.e. its underlying `CountingBackend::putIfAbsent` has completed. Deterministic,
     /// sleep-free way to observe a detached background caller's own work finishing when the TEST no
-    /// longer holds anything (e.g. a Store handle) that call would otherwise let it wait on.
+    /// longer holds anything (e.g. a Pool handle) that call would otherwise let it wait on.
     void awaitBlockedCallCompleted()
     {
         std::unique_lock lk(block_mutex);
@@ -736,7 +736,7 @@ TEST(RefWriterAppendLane, WedgedAppendObservedDurableAppliesBeforeNextId)
     EXPECT_FALSE(store->resolveRef(ns, "y").has_value()) << "the next mutation committed normally afterward";
 }
 
-/// B3: `Store::wedgedRefLaneCount()` (the accessor `CasGcScheduler::gcHealth()` reads for
+/// B3: `Pool::wedgedRefLaneCount()` (the accessor `CasGcScheduler::gcHealth()` reads for
 /// `system.content_addressed_mounts.wedged_namespace_count`) must count EXACTLY the tables with a live
 /// wedge -- neither a cached-but-healthy table nor an unrelated table's own successful mutation may move
 /// it, and it must track the wedge's full lifecycle (0 -> 1 -> 0), not just a one-shot snapshot.
@@ -1342,14 +1342,14 @@ TEST(RefWriterSnapshotPublish, PublicationNeverBlocksConcurrentAppend)
     EXPECT_TRUE(listGreatestSnapshotIdForTest(*backend, layout, ns).has_value());
 }
 
-/// Review caution (T10 review): a dispatched background publish must never outlive the Store object
+/// Review caution (T10 review): a dispatched background publish must never outlive the Pool object
 /// it operates on -- `maybeScheduleSnapshotPublish` captures `shared_from_this()` BY VALUE into the
 /// dispatch lambda specifically to guarantee this (the classic "background thread references a
 /// dangling owner" shutdown segfault, avoided here since a shared_ptr copy keeps the object alive for
 /// as long as the thread holds it, regardless of what every OTHER holder does). Proves it directly:
-/// blocks a dispatched publish mid-PUT, drops the TEST's own (only) Store handle while still blocked,
-/// and confirms via a `weak_ptr` that the Store demonstrably survives on the blocked thread's own
-/// reference alone. Then unblocks it with no live Store handle anywhere in this test any more -- a
+/// blocks a dispatched publish mid-PUT, drops the TEST's own (only) Pool handle while still blocked,
+/// and confirms via a `weak_ptr` that the Pool demonstrably survives on the blocked thread's own
+/// reference alone. Then unblocks it with no live Pool handle anywhere in this test any more -- a
 /// dangling-pointer crash here would abort the whole test binary, the strongest possible signal for
 /// this specific hazard.
 TEST(RefWriterSnapshotPublish, PublishThreadOutlivesDroppedStoreHandleWithoutCrashing)
@@ -1364,16 +1364,16 @@ TEST(RefWriterSnapshotPublish, PublishThreadOutlivesDroppedStoreHandleWithoutCra
     backend->armPutBlock("_snap/");
     publishEmptyPart(store, ns, "a");
     publishEmptyPart(store, ns, "b");   /// tail reaches 4 (> 3) -> dispatches a background publish
-    backend->awaitBlockEntered();       /// stuck mid-PUT, holding its OWN shared_ptr<Store> copy
+    backend->awaitBlockEntered();       /// stuck mid-PUT, holding its OWN shared_ptr<Pool> copy
 
-    std::weak_ptr<Store> weak_store = store;
-    store.reset();   /// drop the ONLY Store handle this test holds
+    std::weak_ptr<Pool> weak_store = store;
+    store.reset();   /// drop the ONLY Pool handle this test holds
     EXPECT_FALSE(weak_store.expired())
-        << "the blocked background thread's own shared_ptr copy must keep the Store alive";
+        << "the blocked background thread's own shared_ptr copy must keep the Pool alive";
 
     backend->releaseBlock();
     /// Deterministic, sleep-free: waits for the blocked call to actually RETURN (not merely unblock),
-    /// entirely through the backend -- this test holds no Store handle to wait on any more.
+    /// entirely through the backend -- this test holds no Pool handle to wait on any more.
     backend->awaitBlockedCallCompleted();
 }
 
@@ -1755,7 +1755,7 @@ TEST(RefWriterStalePrecommitSweep, BoundedBatchesAndInterruptionResumeAcrossMoun
         e1 = predecessor->writerEpoch();
     }   /// predecessor released; only its epoch is needed -- the stale precommits are seeded raw below
 
-    /// Seed kTotalStale precommits directly (bypassing any Store) under the predecessor's epoch,
+    /// Seed kTotalStale precommits directly (bypassing any Pool) under the predecessor's epoch,
     /// spread over two raw log objects (each within the per-transaction 1000-op ENCODE cap) so recovery
     /// costs only two GETs, not kTotalStale of them.
     {
@@ -1991,7 +1991,7 @@ namespace
 {
 
 /// Fence out the mount lease so `tryRemountOnce` reclaims a fresh incarnation (mirrors
-/// gtest_cas_store.cpp's fenceOutMount, without its ASSERT_ macros so it can run outside a fixture).
+/// gtest_cas_pool.cpp's fenceOutMount, without its ASSERT_ macros so it can run outside a fixture).
 void fenceOutRefMount(Backend & backend, const String & mount_key)
 {
     const auto got = backend.get(mount_key);
@@ -2001,7 +2001,7 @@ void fenceOutRefMount(Backend & backend, const String & mount_key)
     backend.putOverwrite(mount_key, encodeMountLease(m), got->token);
 }
 
-/// The greatest `_log/<id>` transaction id currently present for `ns` (independent of any Store cache).
+/// The greatest `_log/<id>` transaction id currently present for `ns` (independent of any Pool cache).
 std::optional<RefTxnId> listGreatestLogIdForTest(Backend & backend, const Layout & layout, const RootNamespace & ns)
 {
     std::optional<RefTxnId> greatest;
@@ -2025,7 +2025,7 @@ std::optional<RefTxnId> listGreatestLogIdForTest(Backend & backend, const Layout
 
 /// Seed a same-uuid TWIN incarnation that bumped the durable writer_epoch and durably DROPPED `ref_name`
 /// (its committed binding `old_ref`) at `{twin_epoch, 1}` -- an id that sorts strictly above every log a
-/// Store wrote under its own (lower) open-time epoch. Returns the twin's epoch.
+/// Pool wrote under its own (lower) open-time epoch. Returns the twin's epoch.
 uint64_t seedTwinDrop(Backend & backend, const Layout & layout, const RootNamespace & ns,
                       const String & ref_name, const ManifestRef & old_ref)
 {
@@ -2056,7 +2056,7 @@ TEST(RefWriterRemount, ReRecoversStaleCacheToTwinDrop)
     ASSERT_TRUE(store->resolveRef(ns, "a").has_value());
     const uint64_t e1 = store->liveWriterEpoch();
 
-    /// A same-uuid twin bumped the durable epoch and durably dropped "a"; this Store's warm cache never
+    /// A same-uuid twin bumped the durable epoch and durably dropped "a"; this Pool's warm cache never
     /// observed it.
     const uint64_t twin_epoch = seedTwinDrop(*backend, layout, ns, "a", a_id.ref);
     ASSERT_GT(twin_epoch, e1);
@@ -2107,7 +2107,7 @@ TEST(RefWriterRemount, PostRemountAppendCarriesLiveEpochSortingAboveTwinLogs)
 /// wedged runtime cached across the remount. rev.6 Task 7: `tryRemountOnce` consults the wedge via
 /// `refLanesSettledForRemount` BEFORE this drop happens (paying `materialization_grace_ms` for it below),
 /// so the drop itself is a plain cache detach, not the wedge's disposition -- see `quiesceRefTablesForRemount`'s
-/// doc comment (`CasStore.h`) for the retired "accepted Late Predecessor case" framing this replaces.
+/// doc comment (`CasPool.h`) for the retired "accepted Late Predecessor case" framing this replaces.
 TEST(RefWriterRemount, DiscardsWedgeAndLaneRemainsUsable)
 {
     CasRequestBudget budget;
@@ -2120,7 +2120,7 @@ TEST(RefWriterRemount, DiscardsWedgeAndLaneRemainsUsable)
     /// rev.6 Task 7: the self-remount below now pays `materialization_grace_ms` for the wedge this test
     /// deliberately leaves behind (`refLanesSettledForRemount` reports unsettled) -- inject a fake
     /// `boot_ms_fn`/`wait_sleep_fn` (mirroring `CasRemountTmat.UnresolvedWedgePaysGraceAndMarksBoundaryUnclean`,
-    /// `gtest_cas_store.cpp`) so the wait resolves instantly instead of blocking this test for ~30 real seconds.
+    /// `gtest_cas_pool.cpp`) so the wait resolves instantly instead of blocking this test for ~30 real seconds.
     uint64_t fake_boot = 0;
     PoolConfig config;
     config.cas_request_budget = budget;
@@ -2570,7 +2570,7 @@ namespace
 
 /// Seeds crash-style predecessor debris for the seal tests: two DEAD epochs (1 and 2) of durable logs
 /// under `ns` -- epoch 1 births ref "a", epoch 2 adds ref "b" -- with no snapshot, and burns the
-/// durable epoch counter to exactly 2 so a subsequent `Store::open` allocates epoch 3 (both dead
+/// durable epoch counter to exactly 2 so a subsequent `Pool::open` allocates epoch 3 (both dead
 /// epochs land strictly below the fresh writer's own, as `dead_region_nonempty` requires).
 void seedSealFixtureDeadEpochs(Backend & backend, const Layout & layout, const RootNamespace & ns)
 {
@@ -2595,7 +2595,7 @@ void seedSealFixtureDeadEpochs(Backend & backend, const Layout & layout, const R
 /// Plants a same-uuid, UNCLEAN (crash-style, no farewell) predecessor mount lease at `epoch`: a bare
 /// `claimMount` followed by a GC fence-out -- mirrors `CasMountTmat.FencedPriorPaysOnlyTmat`. A fenced
 /// prior is an immediate certificate of death (`claimMountAwaitingExpiry` reclaims it on its FIRST
-/// attempt, no observation polling), so a fake-clocked successor `Store::open` above it becomes
+/// attempt, no observation polling), so a fake-clocked successor `Pool::open` above it becomes
 /// unclean deterministically, without any real sleep.
 void seedUncleanPredecessorMount(Backend & backend, const Layout & layout, uint64_t epoch)
 {
@@ -2603,7 +2603,7 @@ void seedUncleanPredecessorMount(Backend & backend, const Layout & layout, uint6
     fenceOutRefMount(backend, layout.mountKey("test"));
 }
 
-/// The budget every seal test's successor `Store::open` uses: a 500ms lease TTL needs a scaled-down
+/// The budget every seal test's successor `Pool::open` uses: a 500ms lease TTL needs a scaled-down
 /// budget (RFC cas-s3-timeout-retry-control §required-timeout-model: attempt_timeout + safety_margin <
 /// lease TTL) -- mirrors `CasMountTmat.FencedPriorPaysOnlyTmat` exactly.
 CasRequestBudget sealTestTinyBudget()
@@ -2682,7 +2682,7 @@ TEST(RefWriterRecoverySeal, LateLogBelowSealIsInvisibleToRecoveryAndFold)
     late.ops = {publishCommittedOps("c", manifestRef(2, 2, 1))[0], publishCommittedOps("c", manifestRef(2, 2, 1))[1]};
     writeRefLogTxnRaw(*backend, layout, late);
 
-    /// A fresh, independent recovery (the free function, not a `Store`) must find the seal covers the
+    /// A fresh, independent recovery (the free function, not a `Pool`) must find the seal covers the
     /// late log: "c" must NOT appear.
     const RefTableState recovered = recoverRefTable(*backend, layout, ns);
     ASSERT_EQ(recovered.committed.count("a"), 1u);
@@ -2765,7 +2765,7 @@ TEST(RefWriterRecoverySeal, SealPutFailureFailsRecoveryClosed)
 /// (`reportLateLogsIfAny`'s `recovered.sealed_from` branch) never fires. This reproduces the finding's
 /// exact failure: the namespace's first-ever txn `(E,1)` is "in flight at crash", i.e. it lands
 /// durably only AFTER this incarnation's recovery already ran and found nothing, and proves the
-/// same-process carve-out extension (`Store::ownsAndSawUncleanBoundaryFor`) still reports it even
+/// same-process carve-out extension (`Pool::ownsAndSawUncleanBoundaryFor`) still reports it even
 /// though no seal object exists anywhere to detect it from.
 TEST(RefWriterRecoverySeal, EmptyDeadRegionCarveOutStillReportsSameProcessNamespace)
 {

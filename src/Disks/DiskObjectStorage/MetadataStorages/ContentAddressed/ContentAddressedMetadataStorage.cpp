@@ -312,7 +312,7 @@ ContentAddressed::GcRoundLogger ContentAddressedMetadataStorage::makeGcRoundLogg
 
 Cas::CasEventSink ContentAddressedMetadataStorage::makeCasEventSink() const
 {
-    /// Unit tests pass a null context (no system logs); the Store then runs without a sink.
+    /// Unit tests pass a null context (no system logs); the Pool then runs without a sink.
     if (!context)
         return {};
     auto ctx = context;
@@ -389,7 +389,7 @@ void ContentAddressedMetadataStorage::startup()
     /// a read-only backend), run no watermark, start no GC, and fail the mutating surface closed.
     read_only = object_storage->isReadOnly();
 
-    /// Native mode rides real conditional ops (probed fail-closed by Store::open); Local object
+    /// Native mode rides real conditional ops (probed fail-closed by Pool::open); Local object
     /// storage has none, so the backend emulates exact token semantics in-process (single server).
     const auto mode = object_storage->getType() == ObjectStorageType::Local
         ? Cas::ObjectStorageBackend::Mode::EmulatedSingleProcess
@@ -468,7 +468,7 @@ void ContentAddressedMetadataStorage::startup()
     pool_config.manifest_sweep_delete_budget_keys = manifest_sweep_delete_budget_keys;
     pool_config.gc_meta_pool_size = gc_meta_pool_size;
     pool_config.materialization_grace_ms = materialization_grace_ms;
-    cas_store = Cas::Store::open(std::move(backend), std::move(pool_config));
+    cas_store = Cas::Pool::open(std::move(backend), std::move(pool_config));
     pool_uuid = Cas::u128ToHex(cas_store->poolMeta().pool_id);
     part_access = std::make_unique<ContentAddressed::CachedPartFolderAccess>(cas_store,
         ContentAddressed::CachedPartFolderAccess::CacheParams{
@@ -547,7 +547,7 @@ void ContentAddressedMetadataStorage::shutdown()
     cas_store.reset();
 }
 
-const Cas::StorePtr & ContentAddressedMetadataStorage::store() const
+const Cas::PoolPtr & ContentAddressedMetadataStorage::store() const
 {
     if (!cas_store)
         throw Exception(ErrorCodes::LOGICAL_ERROR,
@@ -626,7 +626,7 @@ Cas::RootNamespace ContentAddressedMetadataStorage::shadowNamespace(const std::s
 {
     /// The LITERAL shadow table dir (shadow/<backup>/store/<u3>/<uuid> or .../data/<db>/<tbl>):
     /// bijective with the disk path for both layouts, pool-global (backups are read by any
-    /// replica), and the shadow tree enumerates from Store::listNamespaces("shadow/").
+    /// replica), and the shadow tree enumerates from Pool::listNamespaces("shadow/").
     /// CANONICALIZED: the Unfreezer hands the dir with a trailing slash (T13 finding).
     return Cas::RootNamespace{canonicalDiskPath(shadow_table_dir)};
 }

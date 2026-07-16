@@ -3,7 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEvent.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcShardPlan.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasStore.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include "cas_test_helpers.h"
 #include <limits>
 #include <vector>
@@ -254,7 +254,7 @@ TEST(CasSweepLateLog, LogBetweenSealedFromAndSealIdIsReportedNotRevived)
 
     const String watched_key = layout.refLogKey(ns, late_log_id);
     auto counting = std::make_shared<GetCountingBackend>(backend, watched_key);
-    auto store = Store::open(counting, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    auto store = Pool::open(counting, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
 
     std::vector<CasEvent> events;
     store->setEventSink([&](const CasEvent & e) { events.push_back(e); });

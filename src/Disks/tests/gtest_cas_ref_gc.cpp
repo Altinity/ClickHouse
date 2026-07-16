@@ -5,7 +5,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasStore.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include "cas_test_helpers.h"
 
@@ -64,7 +64,7 @@ void seedCommittedAt(
 }
 
 /// Drive regular rounds, renewing the mount ack after each, until quiescent or `max_rounds`.
-size_t runToFixpoint(const StorePtr & s, Gc & gc, size_t max_rounds = 64)
+size_t runToFixpoint(const PoolPtr & s, Gc & gc, size_t max_rounds = 64)
 {
     size_t rounds = 0;
     for (; rounds < max_rounds; ++rounds)
@@ -413,7 +413,7 @@ TEST(CasRefGc, RefSnaplogLifecycleE2E)
 TEST(CasRefGc, RemoveNamespaceCompletesAndPublishesMarkerDeterministically)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test",
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test",
                                                  .gc_fold_max_defer_rounds = 0});
     const Layout & layout = store->layout();
     const RootNamespace ns{"test/tbl"};
@@ -514,7 +514,7 @@ TEST(CasRefGc, RemovedNamespaceCoveredLogsCleanedByCompletingRound)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     /// Default fold cadence (gc_fold_max_defer_rounds = 8): the quiesced-pool regime where the gap bites.
-    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     const Layout & layout = store->layout();
     const RootNamespace ns{"test/tbl"};
 
@@ -801,7 +801,7 @@ TEST(CasRefGc, PendingPassEpochFiltersManifestDeletes)
 TEST(CasRefGc, RecreatedNamespaceRetiresCleanupItemAndStopsChurn)
 {
     auto backend = std::make_shared<CountingBackend>();
-    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test",
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test",
                                                  .gc_fold_max_defer_rounds = 0});
     const Layout & layout = store->layout();
     const RootNamespace ns{"test/tbl"};
@@ -874,7 +874,7 @@ TEST(CasRefGc, RecreatedNamespaceRetiresCleanupItemAndStopsChurn)
 TEST(CasRefGc, CompletedItemRepublishesCrashLostRemovedSnapshotThenRetires)
 {
     auto backend = std::make_shared<CountingBackend>();
-    auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test",
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test",
                                                  .gc_fold_max_defer_rounds = 0});
     const Layout & layout = store->layout();
     const RootNamespace ns{"test/tbl"};

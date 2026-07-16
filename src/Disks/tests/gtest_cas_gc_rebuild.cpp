@@ -6,7 +6,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasStore.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include "cas_test_helpers.h"
 
 using namespace DB::Cas;
@@ -444,7 +444,7 @@ TEST(CasGcRebuild, OrphanBlobCondemnedInRebuiltRun)
 TEST(CasGcClampSuppression, LandedEdgeBehindClampNeverDeleted)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    std::vector<CasEvent> seen;   /// declared BEFORE the Store so it outlives the background syncer's emits (ASan 2026-07-09)
+    std::vector<CasEvent> seen;   /// declared BEFORE the Pool so it outlives the background syncer's emits (ASan 2026-07-09)
     auto store = openStoreForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
 

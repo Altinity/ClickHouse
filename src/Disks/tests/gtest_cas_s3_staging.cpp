@@ -7,7 +7,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasProbe.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasStore.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
 #include <Disks/DiskCommitTransactionOptions.h>
 #include <IO/ReadHelpers.h>
@@ -197,14 +197,14 @@ public:
     }
 };
 
-DB::Cas::StorePtr openStagingStore(const std::shared_ptr<RecordingStagingBackend> & b)
+DB::Cas::PoolPtr openStagingStore(const std::shared_ptr<RecordingStagingBackend> & b)
 {
-    return DB::Cas::Store::open(b, DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    return DB::Cas::Pool::open(b, DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
 }
 
 /// A build whose owning manifest namespace / final ref name are `ns`/`ref` (mirrors gtest_cas_build's
 /// `startBuildFor`: promote/stageManifest derive the namespace by splitting `intended_ref` on the LAST '/').
-DB::Cas::BuildPtr startStagingBuild(const DB::Cas::StorePtr & s, const DB::Cas::RootNamespace & ns, const String & ref)
+DB::Cas::BuildPtr startStagingBuild(const DB::Cas::PoolPtr & s, const DB::Cas::RootNamespace & ns, const String & ref)
 {
     DB::Cas::BuildInfo info;
     info.intended_ref = ns.string() + "/" + ref;
@@ -214,7 +214,7 @@ DB::Cas::BuildPtr startStagingBuild(const DB::Cas::StorePtr & s, const DB::Cas::
 /// Stage a one-blob manifest and precommit it (so the EDGE-BEFORE-OBSERVE fail-closed check in
 /// `observeAndAdmit` holds), returning the build ready for a `putBlob` promote of `hash`.
 DB::Cas::BuildPtr precommittedBuildFor(
-    const DB::Cas::StorePtr & s, const DB::Cas::RootNamespace & ns, const String & ref,
+    const DB::Cas::PoolPtr & s, const DB::Cas::RootNamespace & ns, const String & ref,
     const DB::UInt128 & hash, uint64_t blob_size)
 {
     DB::Cas::BuildPtr build = startStagingBuild(s, ns, ref);

@@ -140,7 +140,7 @@ using WriteSinkPtr = std::unique_ptr<WriteSink>;
 /// TOKEN ⟹ CONTENT PRECONDITION (read-path caches depend on this): a token must uniquely identify
 /// the byte-content of the incarnation it labels — i.e. `head(k).token == prior get(k).token` MUST
 /// imply the bytes are unchanged. The protocol's SAFETY only needs the contrapositive (changed
-/// bytes ⟹ a new token, so a stale CAS/delete is rejected), but `Cas::Store`'s read-path decode
+/// bytes ⟹ a new token, so a stale CAS/delete is rejected), but `Cas::Pool`'s read-path decode
 /// cache (`readShardDecoded`) skips a re-`get`+decode on a token match, so a backend whose token
 /// could REPEAT across different content would make it serve stale manifests (wrong results). Holds
 /// for every backend in use: S3 ETag is content-derived; the emulated/in-memory backends mint a
@@ -191,7 +191,7 @@ public:
     ///          the persisted folded token, saving a GET per unchanged shard.
     virtual bool supportsListTokens() const = 0;
 
-    /// Store-level preconditions beyond per-op conditional semantics — checked by the capability
+    /// Pool-level preconditions beyond per-op conditional semantics — checked by the capability
     /// probe BEFORE the op battery. Default: nothing to check. The S3 backend fails closed here
     /// when a generation-dialect (GCS) bucket has object versioning enabled: every token-exact
     /// DELETE would archive a noncurrent generation instead of reclaiming storage, so GC

@@ -147,12 +147,12 @@ namespace CurrentMetrics
 namespace DB::ContentAddressed
 {
 
-CachedPartFolderAccess::CachedPartFolderAccess(Cas::StorePtr store_)
+CachedPartFolderAccess::CachedPartFolderAccess(Cas::PoolPtr store_)
     : CachedPartFolderAccess(std::move(store_), CacheParams{})
 {
 }
 
-CachedPartFolderAccess::CachedPartFolderAccess(Cas::StorePtr store_, CacheParams params_, std::function<uint64_t()> now_ms_fn_)
+CachedPartFolderAccess::CachedPartFolderAccess(Cas::PoolPtr store_, CacheParams params_, std::function<uint64_t()> now_ms_fn_)
     : store(std::move(store_)), params(params_), now_ms_fn(std::move(now_ms_fn_))
 {
     if (!now_ms_fn)

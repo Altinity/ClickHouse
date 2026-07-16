@@ -1,4 +1,4 @@
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasStore.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBuild.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasCodecUtil.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h>
@@ -62,29 +62,29 @@ namespace ProfileEvents
 namespace DB::Cas
 {
 
-Store::Store(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
+Pool::Pool(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
     : pool_backend(std::move(backend_))
     , config(std::move(config_))
     , meta(std::move(meta_))
     /// Seed the monotone admitted-algo cache from the pool state `createOrValidate` already
     /// established (fresh create, steady-state member, or a just-completed admission union) --
-    /// register-before-first-write (spec §5) means this Store's own `writeAlgo()` is ALWAYS a
+    /// register-before-first-write (spec §5) means this Pool's own `writeAlgo()` is ALWAYS a
     /// member by the time the constructor runs.
     , admitted_algos(meta.algos_used)
     /// Phase 3 T2/T3: `Layout` no longer captures a pool algo -- every blob key is built from a
     /// `BlobRef` (algo + digest) directly, so the constructor takes only the pool prefix.
     , pool_layout(config.pool_prefix)
-    /// Plain-object surface component: binds to this Store's own backend + layout (declared after
+    /// Plain-object surface component: binds to this Pool's own backend + layout (declared after
     /// both, so this reference-holding member is constructed last and destroyed first).
     , plain_objects(*pool_backend, pool_layout)
     /// Manifest reader component: backend/layout/meta by reference + the event-sink reference (set
     /// later via setEventSink; the reference observes that assignment). Owns the decode cache, built
-    /// from the same config bytes the Store ctor used before.
+    /// from the same config bytes the Pool ctor used before.
     , manifest_reader(*pool_backend, pool_layout, meta, event_sink_, config.manifest_decode_cache_bytes)
     /// Ref-log / ref-table subsystem (source-layout §3.4). Injected with backend/layout + the
     /// RefLedgerConfig slice + the event-sink reference + the pool `cas_request_budget` + the RAW mount
     /// `boot_ms_fn` (for its retry controller), plus callbacks into the mount/watermark state that lives
-    /// on `mount_runtime` (reached through Store delegates). The callbacks capture `this`; they are
+    /// on `mount_runtime` (reached through Pool delegates). The callbacks capture `this`; they are
     /// invoked only at runtime (post-construction), so referencing `mount_runtime` (declared AFTER
     /// `ref_ledger`, hence constructed after it) is safe -- exactly as the pre-3.5 layout referenced the
     /// mount raw-members that also followed `ref_ledger`. Declared/constructed BEFORE `mount_runtime`,
@@ -103,8 +103,8 @@ Store::Store(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
           [this] (const RootNamespace & ns) { cancelInflightBuildsForNamespace(ns); })
     /// Mount / write-fence / build-watermark / self-remount runtime (source-layout §3.5). Injected with
     /// backend/layout + the `MountConfig` slice + `server_root_id` + the event-sink reference + the pool
-    /// `cas_request_budget` + the `remount_attempt` callback (== `Store::tryRemountOnce`, whose claim/
-    /// recovery ORCHESTRATION stays on Store). The callback captures `this`; it is invoked only at runtime
+    /// `cas_request_budget` + the `remount_attempt` callback (== `Pool::tryRemountOnce`, whose claim/
+    /// recovery ORCHESTRATION stays on Pool). The callback captures `this`; it is invoked only at runtime
     /// (post-construction). Declared/constructed AFTER `ref_ledger`, preserving the original member order
     /// verbatim (mount destroyed first, ledger last; both orders proven safe -- see the header note).
     , mount_runtime(
@@ -118,17 +118,17 @@ Store::Store(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
             config.dedup_cache_bytes, DedupCache::NO_MAX_COUNT, DedupCache::DEFAULT_SIZE_RATIO);
 }
 
-bool Store::isAlgoAdmitted(BlobHashAlgo algo) const
+bool Pool::isAlgoAdmitted(BlobHashAlgo algo) const
 {
     const auto v = static_cast<uint8_t>(algo);
     std::lock_guard lock(admitted_algos_mutex);
     return std::binary_search(admitted_algos.begin(), admitted_algos.end(), v);
 }
 
-std::vector<uint8_t> Store::refreshAdmittedAlgos()
+std::vector<uint8_t> Pool::refreshAdmittedAlgos()
 {
     /// A direct GET+decode of `_pool_meta`, not a re-run of `createOrValidate`'s admission logic --
-    /// this Store's OWN algo is already admitted (register-before-first-write, spec §5), so all this
+    /// this Pool's OWN algo is already admitted (register-before-first-write, spec §5), so all this
     /// needs is the CURRENT authoritative `algos_used`, unioned into the monotone cache.
     const auto existing = pool_backend->get(pool_layout.poolMetaKey());
 
@@ -146,7 +146,7 @@ std::vector<uint8_t> Store::refreshAdmittedAlgos()
     return admitted_algos;
 }
 
-bool Store::dedupCacheContains(const BlobRef & ref) const
+bool Pool::dedupCacheContains(const BlobRef & ref) const
 {
     /// Task 3 (Round-B §0.3 introspection): raw lookup counters on the presence cache itself, disabled
     /// (nullptr `dedup_cache`) means neither counter moves -- the short-circuit below never reaches the
@@ -167,7 +167,7 @@ bool Store::dedupCacheContains(const BlobRef & ref) const
     return false;
 }
 
-void Store::dedupCacheAdd(const BlobRef & ref)
+void Pool::dedupCacheAdd(const BlobRef & ref)
 {
     if (dedup_cache)
         dedup_cache->set(ref, std::make_shared<DedupPresent>());
@@ -175,44 +175,44 @@ void Store::dedupCacheAdd(const BlobRef & ref)
 
 /// ==== mount-runtime delegates (source-layout §3.5) ==== The mount lease keeper, the local write
 /// fence, the per-server build watermark, the live-incarnation epoch, and the self-remount recovery
-/// thread live in the `mount_runtime` member (Pool/CasMountRuntime.h); Store keeps these thin public
+/// thread live in the `mount_runtime` member (Pool/CasMountRuntime.h); Pool keeps these thin public
 /// forwarders so the wiring, Build, Gc, the ref-ledger callbacks, and every test call site are unchanged.
-uint64_t Store::bootMs()
+uint64_t Pool::bootMs()
 {
     return CasMountRuntime::bootMs();
 }
 
-uint64_t Store::bootMsNow() const
+uint64_t Pool::bootMsNow() const
 {
     return mount_runtime.bootMsNow();
 }
 
-bool Store::mayMutate() const
+bool Pool::mayMutate() const
 {
     return mount_runtime.mayMutate();
 }
 
-void Store::tripMountLost()
+void Pool::tripMountLost()
 {
     mount_runtime.tripMountLost();
 }
 
-bool Store::refAppendFenceOk() const
+bool Pool::refAppendFenceOk() const
 {
     return mount_runtime.refAppendFenceOk();
 }
 
-void Store::setMountDeadline(uint64_t deadline_boot_ms)
+void Pool::setMountDeadline(uint64_t deadline_boot_ms)
 {
     mount_runtime.setMountDeadline(deadline_boot_ms);
 }
 
-void Store::armMountFence(UInt128 server_uuid, uint64_t writer_epoch, uint64_t deadline_boot_ms)
+void Pool::armMountFence(UInt128 server_uuid, uint64_t writer_epoch, uint64_t deadline_boot_ms)
 {
     mount_runtime.armMountFence(server_uuid, writer_epoch, deadline_boot_ms);
 }
 
-StorePtr Store::open(BackendPtr backend, PoolConfig config)
+PoolPtr Pool::open(BackendPtr backend, PoolConfig config)
 {
     /// B168 P0: wrap the pool backend once, transparently, so EVERY CA S3 op — probe, pool-meta,
     /// writer, GC, watermark — flows through the per-namespace/op ProfileEvents chokepoint. The
@@ -233,7 +233,7 @@ StorePtr Store::open(BackendPtr backend, PoolConfig config)
             /// shared pool concurrently never collide on the (formerly fixed) `<pool>/_probe/token` /
             /// `<pool>/_probe/cas` keys. Without this, the loser of the `putIfAbsent` race aborts startup
             /// with PreconditionFailed (and the winner's cleanup delete can cascade into the loser). With a
-            /// fresh random 128-bit id per `Store::open`, each mounter validates conditional-op support
+            /// fresh random 128-bit id per `Pool::open`, each mounter validates conditional-op support
             /// independently. A crashed mount leaves harmless `_probe/<rand>/...` debris under the `_probe/`
             /// namespace only (never the content planes) — acceptable.
             const UInt128 probe_uid = (static_cast<UInt128>(thread_local_rng()) << 64) | thread_local_rng();
@@ -257,16 +257,16 @@ StorePtr Store::open(BackendPtr backend, PoolConfig config)
     const BlobHashAlgo write_algo = config.blob_hash_algo;   /// `config` is moved-from just below
 
     /// Private ctor: make_shared cannot reach it.
-    StorePtr store(new Store(std::move(backend), std::move(config), std::move(meta)));
+    PoolPtr store(new Pool(std::move(backend), std::move(config), std::move(meta)));
 
     /// Register-before-first-write, belt-and-braces (spec §5): `createOrValidate` above already
     /// admitted/validated the write algo, so the freshly-seeded cache must already contain it -- a
-    /// violation here would mean a build/write could reach this Store naming an algo that was never
+    /// violation here would mean a build/write could reach this Pool naming an algo that was never
     /// durably admitted (the invariant this whole design rests on).
     chassert(store->isAlgoAdmitted(write_algo));
 
     /// Per-server watermark (spec 2026-06-16-ca-build-watermark): mint the random NONZERO `process_epoch`
-    /// once per Store (GC checks it for equality only -- a different epoch == a dead incarnation). The
+    /// once per Pool (GC checks it for equality only -- a different epoch == a dead incarnation). The
     /// masking/redraw detail lives in `CasMountRuntime::mintRandomProcessEpoch`.
     store->mount_runtime.mintRandomProcessEpoch();
 
@@ -280,7 +280,7 @@ StorePtr Store::open(BackendPtr backend, PoolConfig config)
     return store;
 }
 
-void Store::mountWritable(StorePtr & store, UInt128 our_uuid, MountClaimPolicy policy)
+void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy policy)
 {
     /// === Mount-safety startup protocol (spec §mount-safety; Phase 0 Task 7) ===
     /// STRICT ORDER: validate id → claim owner (identity) → allocate durable writer_epoch → claim
@@ -295,7 +295,7 @@ void Store::mountWritable(StorePtr & store, UInt128 our_uuid, MountClaimPolicy p
     const String & srid = store->config.server_root_id;
 
     /// 1. The server_root_id is a clean relative path (mirrors the config-read validation; cheap to
-    ///    re-check here so a Store opened directly in tests is held to the same contract).
+    ///    re-check here so a Pool opened directly in tests is held to the same contract).
     validateServerRootId(srid);
 
     /// 2. Owner anchor — IDENTITY (clock-free). A foreign uuid fails closed; an absent owner over a
@@ -323,7 +323,7 @@ void Store::mountWritable(StorePtr & store, UInt128 our_uuid, MountClaimPolicy p
     /// CAS request budget (RFC cas-s3-timeout-retry-control §required-timeout-model, Task 5): a
     /// writable mount refuses to open with a budget that could let a controlled attempt outlive the
     /// mount lease it is fenced under. Throws BAD_ARGUMENTS and aborts open on an inconsistent
-    /// budget; logs the effective values once on success. The controller itself (Store's ref
+    /// budget; logs the effective values once on success. The controller itself (Pool's ref
     /// mutation paths) is wired in a later task — this validates the config invariant up front.
     validateCasRequestBudget(store->config.cas_request_budget, ttl_ms,
         static_cast<uint64_t>(store->config.mount_renew_period.count()));
@@ -343,7 +343,7 @@ void Store::mountWritable(StorePtr & store, UInt128 our_uuid, MountClaimPolicy p
     /// lease's write-token changes before the full threshold elapses.
     const auto on_wait_start = [&srid](const MountLease & held, uint64_t threshold_ms)
     {
-        LOG_INFO(getLogger("CasStore"),
+        LOG_INFO(getLogger("CasPool"),
             "CAS mount '{}': a stale-looking mount lease is held by uuid={} epoch={} pid={} "
             "hostname={} (expires_at_ms={}); observing its write-token for up to ~{} ms before "
             "reclaiming. If a second server is genuinely live, its renewals will keep restarting "
@@ -353,15 +353,15 @@ void Store::mountWritable(StorePtr & store, UInt128 our_uuid, MountClaimPolicy p
     };
 
     /// Mount-slot writer audit (the P1 "foreign writer" instrument): route every mount-slot
-    /// write/conflict event through the Store's own sink. `setEventSink` runs AFTER `open`
+    /// write/conflict event through the Pool's own sink. `setEventSink` runs AFTER `open`
     /// returns (the `ContentAddressedMetadataStorage` wiring), so an event fired synchronously
     /// during this very `open` call is dropped by the still-null sink — the same startup window
     /// every other B170 emission site in this file already has (`hasEventSink()`/`emitEvent()`).
     /// `s` outlives the lambda: it is captured by raw pointer into the keeper, a member of
-    /// `Store` destroyed before the `Store` itself.
+    /// `Pool` destroyed before the `Pool` itself.
     const auto emit_mount_event = [s = store.get()](CasEvent e) { s->emitEvent(std::move(e)); };
 
-    Store * raw = store.get();
+    Pool * raw = store.get();
 
     /// S13 crash-recovery (`WaitForExpiry` only): a hard-killed prior incarnation leaves a stale,
     /// unreleased mount lease. Rather than aborting, OBSERVE that lease's write-token (never its
@@ -480,7 +480,7 @@ void Store::mountWritable(StorePtr & store, UInt128 our_uuid, MountClaimPolicy p
     {
         store->mount_runtime.setUncleanEpochBoundarySeenAt(writer_epoch);
         const uint64_t t_mat = store->config.materialization_grace_ms;
-        LOG_INFO(getLogger("CasStore"),
+        LOG_INFO(getLogger("CasPool"),
             "Content-addressed mount {} follows an unclean predecessor; waiting {} ms "
             "(materialization grace) for the store to finalize or drop its accepted "
             "requests before trusting recovery listings", srid, t_mat);
@@ -503,7 +503,7 @@ void Store::mountWritable(StorePtr & store, UInt128 our_uuid, MountClaimPolicy p
     store->mount_runtime.setLiveWriterEpoch(writer_epoch);
 }
 
-StorePtr Store::openForDecommission(BackendPtr backend, PoolConfig config, const String & victim_srid)
+PoolPtr Pool::openForDecommission(BackendPtr backend, PoolConfig config, const String & victim_srid)
 {
     backend = std::make_shared<InstrumentedBackend>(std::move(backend));
     validateServerRootId(victim_srid);
@@ -538,7 +538,7 @@ StorePtr Store::openForDecommission(BackendPtr backend, PoolConfig config, const
     const BlobHashAlgo write_algo = config.blob_hash_algo;   /// `config` is moved-from just below
 
     /// Private ctor: make_shared cannot reach it.
-    StorePtr store(new Store(std::move(backend), std::move(config), std::move(meta)));
+    PoolPtr store(new Pool(std::move(backend), std::move(config), std::move(meta)));
 
     /// Register-before-first-write, belt-and-braces (spec §5): same invariant `open` asserts.
     chassert(store->isAlgoAdmitted(write_algo));
@@ -552,7 +552,7 @@ StorePtr Store::openForDecommission(BackendPtr backend, PoolConfig config, const
     return store;
 }
 
-Store::~Store()
+Pool::~Pool()
 {
     /// Teardown order is load-bearing and unchanged from the pre-3.5 inline sequence (source-layout §3.5
     /// only relocated the mount/remount mechanics into `mount_runtime`):
@@ -569,7 +569,7 @@ Store::~Store()
     /// incarnation is still resolving could land AFTER the successor already reclaimed and started
     /// mutating. `drainRefLanesForShutdown` is the drain; bounded by one attempt's worth of budget plus
     /// the lease safety margin -- long enough for an in-flight attempt to resolve, never unbounded. It
-    /// stays on `Store` (mediating the mount↔ledger coupling), sequenced between the two mount-runtime
+    /// stays on `Pool` (mediating the mount↔ledger coupling), sequenced between the two mount-runtime
     /// teardown steps exactly as before.
     const bool drained = ref_ledger.drainRefLanesForShutdown(
         config.cas_request_budget.attempt_timeout_ms + config.cas_request_budget.lease_safety_margin_ms);
@@ -583,32 +583,32 @@ Store::~Store()
 
 /// The plain-object surface (namespace files + mountpoint objects) is implemented by the stateless
 /// `plain_objects` component (spec §Decomposition); these are thin delegates preserving the API.
-void Store::putNamespaceFile(const RootNamespace & ns, const String & name, const String & bytes)
+void Pool::putNamespaceFile(const RootNamespace & ns, const String & name, const String & bytes)
 {
     plain_objects.putNamespaceFile(ns, name, bytes);
 }
 
-std::optional<String> Store::getNamespaceFile(const RootNamespace & ns, const String & name)
+std::optional<String> Pool::getNamespaceFile(const RootNamespace & ns, const String & name)
 {
     return plain_objects.getNamespaceFile(ns, name);
 }
 
-std::vector<String> Store::listNamespaceFiles(const RootNamespace & ns)
+std::vector<String> Pool::listNamespaceFiles(const RootNamespace & ns)
 {
     return plain_objects.listNamespaceFiles(ns);
 }
 
-uint64_t Store::minActive()
+uint64_t Pool::minActive()
 {
     return mount_runtime.minActive();
 }
 
-uint64_t Store::peekNextBuildSeq()
+uint64_t Pool::peekNextBuildSeq()
 {
     return mount_runtime.peekNextBuildSeq();
 }
 
-bool Store::tryRemountOnce()
+bool Pool::tryRemountOnce()
 {
     std::lock_guard serialize(remount_mutex);
 
@@ -632,7 +632,7 @@ bool Store::tryRemountOnce()
         try { return currentGcRound(); } catch (...) { return 0; }
     };
 
-    /// The same startup protocol as Store::open steps 2-4, as a FRESH incarnation (the old one is
+    /// The same startup protocol as Pool::open steps 2-4, as a FRESH incarnation (the old one is
     /// dead by the fence-out contract and its keeper never re-mints). Open THROWS on any failure
     /// (startup is fail-closed); the remount RETURNS false instead — the recovery loop retries.
     try
@@ -650,7 +650,7 @@ bool Store::tryRemountOnce()
             now_ms, [this] { return bootMsNow(); }, ttl_ms, poll_interval_ms, sleep_ms,
             [&srid](const MountLease & held, uint64_t threshold_ms)
             {
-                LOG_INFO(getLogger("CasStore"),
+                LOG_INFO(getLogger("CasPool"),
                     "CAS self-remount '{}': observing a stale-looking mount's write-token (uuid={} "
                     "epoch={} expires_at_ms={}) for up to ~{} ms before reclaiming",
                     srid, u128ToHex(held.server_uuid), held.writer_epoch, held.expires_at_ms, threshold_ms);
@@ -658,7 +658,7 @@ bool Store::tryRemountOnce()
             emit_mount_event);
         if (claim.kind != MountClaimResult::Claimed)
         {
-            LOG_WARNING(getLogger("CasStore"),
+            LOG_WARNING(getLogger("CasPool"),
                 "CAS self-remount '{}': mount not claimable ({}); will retry", srid,
                 claim.kind == MountClaimResult::ForeignOwner ? "foreign owner — never taking over"
                                                              : "a live twin holds the lease");
@@ -672,7 +672,7 @@ bool Store::tryRemountOnce()
         if (!ref_ledger.refLanesSettledForRemount())
         {
             mount_runtime.setUncleanEpochBoundarySeenAt(writer_epoch);
-            LOG_INFO(getLogger("CasStore"),
+            LOG_INFO(getLogger("CasPool"),
                 "Self-remount of content-addressed mount {} with an unresolved ref-log PUT; waiting {} ms "
                 "(materialization grace) before re-listing", srid, config.materialization_grace_ms);
             mount_runtime.waitSleep(config.materialization_grace_ms);
@@ -706,7 +706,7 @@ bool Store::tryRemountOnce()
         if (config.background_watermark)
             mount_runtime.keeperStartBackground(config.mount_renew_period);
 
-        LOG_INFO(getLogger("CasStore"),
+        LOG_INFO(getLogger("CasPool"),
             "CAS self-remount '{}': recovered as writer_epoch {} (fresh incarnation; older builds fail closed)",
             srid, writer_epoch);
         EventEmitter{*this}.emit([&](CasEvent & e)
@@ -722,7 +722,7 @@ bool Store::tryRemountOnce()
     }
     catch (...)
     {
-        tryLogCurrentException(getLogger("CasStore"), "CAS self-remount attempt failed; will retry");
+        tryLogCurrentException(getLogger("CasPool"), "CAS self-remount attempt failed; will retry");
         EventEmitter{*this}.emit([&](CasEvent & e)
         {
             e.type = CasEventType::MountRemount;
@@ -738,28 +738,28 @@ bool Store::tryRemountOnce()
 
 /// The self-remount recovery thread + the merged-heartbeat renew live in `mount_runtime`
 /// (Pool/CasMountRuntime.h); these are thin delegates. `mount_runtime`'s `remount_attempt` callback is
-/// bound to `Store::tryRemountOnce` (the claim/recovery orchestration that stays on Store).
-bool Store::scheduleRemountForTest()
+/// bound to `Pool::tryRemountOnce` (the claim/recovery orchestration that stays on Pool).
+bool Pool::scheduleRemountForTest()
 {
     return mount_runtime.scheduleRemountForTest();
 }
 
-void Store::beginShutdownForTest()
+void Pool::beginShutdownForTest()
 {
     mount_runtime.beginShutdownForTest();
 }
 
-void Store::renewWatermarkOnce()
+void Pool::renewWatermarkOnce()
 {
     mount_runtime.renewWatermarkOnce();
 }
 
-void Store::retireBuildSeq(uint64_t seq)
+void Pool::retireBuildSeq(uint64_t seq)
 {
     mount_runtime.retireBuildSeq(seq);
 }
 
-BuildPtr Store::startBuild(BuildInfo info)
+BuildPtr Pool::startBuild(BuildInfo info)
 {
     /// Mint a globally-unique build id from two thread_local_rng draws (random u128).
     const UInt64 hi = thread_local_rng();
@@ -768,7 +768,7 @@ BuildPtr Store::startBuild(BuildInfo info)
 
     /// Strictly-increasing per-process build_seq carried by the Build (spec 2026-06-16). The Build is
     /// added to the active set here and retired on publish/abandon/dtor, so minActive — the GC floor
-    /// the Store-owned watermark renews — tracks in-flight builds. The build registry lives on
+    /// the Pool-owned watermark renews — tracks in-flight builds. The build registry lives on
     /// `mount_runtime` (source-layout §3.5).
     const uint64_t seq = mount_runtime.allocateBuildSeq();
 
@@ -781,17 +781,17 @@ BuildPtr Store::startBuild(BuildInfo info)
 
 /// The manifest read path (readManifest / readManifestShared / locate) + its decode cache live in
 /// the `manifest_reader` component (Pool/CasManifestReader.h); these are thin delegates.
-std::shared_ptr<const PartManifest> Store::readManifestShared(const ManifestId & id)
+std::shared_ptr<const PartManifest> Pool::readManifestShared(const ManifestId & id)
 {
     return manifest_reader.readManifestShared(id);
 }
 
-PartManifest Store::readManifest(const ManifestId & id)
+PartManifest Pool::readManifest(const ManifestId & id)
 {
     return manifest_reader.readManifest(id);
 }
 
-BlobLocation Store::locate(const ManifestEntry & entry) const
+BlobLocation Pool::locate(const ManifestEntry & entry) const
 {
     return manifest_reader.locate(entry);
 }
@@ -844,10 +844,10 @@ std::optional<ForeignRefLogHeaderPeek> peekForeignRefLogHeader(const String & by
 }
 }
 
-void Store::reportImpossibleInterference(const String & key, const String & reason,
+void Pool::reportImpossibleInterference(const String & key, const String & reason,
                                           const std::optional<String> & offending_ns)
 {
-    LOG_ERROR(getLogger("CasStore"),
+    LOG_ERROR(getLogger("CasPool"),
         "CAS anomaly policy: impossible foreign interference for server_root '{}' (namespace='{}', key='{}'): "
         "{} -- fencing this mount closed and scheduling a remount",
         config.server_root_id, offending_ns.value_or(String{}), key, reason);
@@ -869,7 +869,7 @@ void Store::reportImpossibleInterference(const String & key, const String & reas
 
     /// Diagnosis off the critical path (spec §anomaly-policy): a background task may spend a FEW
     /// requests -- never the caller's thread, and never blocking this call's own return.
-    /// `shared_from_this()` keeps the Store alive for the thread's lifetime (mirrors
+    /// `shared_from_this()` keeps the Pool alive for the thread's lifetime (mirrors
     /// `maybeScheduleSnapshotPublish`'s dispatch).
     auto self = shared_from_this();
     try
@@ -881,24 +881,24 @@ void Store::reportImpossibleInterference(const String & key, const String & reas
                 const auto got = self->pool_backend->get(key);
                 if (!got)
                 {
-                    LOG_ERROR(getLogger("CasStore"),
+                    LOG_ERROR(getLogger("CasPool"),
                         "CAS anomaly diagnostics: the offending object at '{}' had already vanished by the "
                         "time the background diagnostic GET ran", key);
                     return;
                 }
                 if (const auto peek = peekForeignRefLogHeader(got->bytes))
-                    LOG_ERROR(getLogger("CasStore"),
+                    LOG_ERROR(getLogger("CasPool"),
                         "CAS anomaly diagnostics: offending object at '{}' ({} bytes) decodes as a ref-log "
                         "header: namespace='{}', writer_epoch={}, ref_sequence={}",
                         key, got->bytes.size(), peek->ns, peek->writer_epoch, peek->ref_sequence);
                 else
-                    LOG_ERROR(getLogger("CasStore"),
+                    LOG_ERROR(getLogger("CasPool"),
                         "CAS anomaly diagnostics: offending object at '{}' ({} bytes) does not decode as a "
                         "ref-log header -- raw and unidentified", key, got->bytes.size());
             }
             catch (...)
             {
-                tryLogCurrentException(getLogger("CasStore"),
+                tryLogCurrentException(getLogger("CasPool"),
                     "CAS anomaly diagnostics: background GET failed for '" + key + "'");
             }
         }).detach();
@@ -906,11 +906,11 @@ void Store::reportImpossibleInterference(const String & key, const String & reas
     catch (...)
     {
         /// Pool exhaustion: best-effort diagnostics must never block the caller's own fail-closed throw.
-        tryLogCurrentException(getLogger("CasStore"), "CAS anomaly diagnostics dispatch failed to launch for '" + key + "'");
+        tryLogCurrentException(getLogger("CasPool"), "CAS anomaly diagnostics dispatch failed to launch for '" + key + "'");
     }
 }
 
-uint64_t Store::currentGcRound() const
+uint64_t Pool::currentGcRound() const
 {
     /// Task 5: read `gc/state` once (no CAS loop — a point-in-time read is sufficient; a concurrent
     /// GC advance only makes the returned round larger, which is strictly more conservative for the
@@ -921,32 +921,32 @@ uint64_t Store::currentGcRound() const
     return decodeGcState(state_bytes->bytes).round;
 }
 
-void Store::removeNamespaceFile(const RootNamespace & ns, const String & name)
+void Pool::removeNamespaceFile(const RootNamespace & ns, const String & name)
 {
     plain_objects.removeNamespaceFile(ns, name);
 }
 
-void Store::putMountpointObject(const String & key, const String & bytes)
+void Pool::putMountpointObject(const String & key, const String & bytes)
 {
     plain_objects.putMountpointObject(key, bytes);
 }
 
-std::optional<String> Store::getMountpointObject(const String & key)
+std::optional<String> Pool::getMountpointObject(const String & key)
 {
     return plain_objects.getMountpointObject(key);
 }
 
-bool Store::mountpointObjectExists(const String & key)
+bool Pool::mountpointObjectExists(const String & key)
 {
     return plain_objects.mountpointObjectExists(key);
 }
 
-void Store::removeMountpointObject(const String & key)
+void Pool::removeMountpointObject(const String & key)
 {
     plain_objects.removeMountpointObject(key);
 }
 
-std::vector<String> Store::listNamespaces(const String & prefix)
+std::vector<String> Pool::listNamespaces(const String & prefix)
 {
     /// LIST-based discovery authority (Task 4): enumerate distinct full namespace strings
     /// from ref shards under `cas/refs/` UNION verbatim-file namespaces under `roots/`.
@@ -1013,7 +1013,7 @@ std::vector<String> Store::listNamespaces(const String & prefix)
     return {found.begin(), found.end()};
 }
 
-std::vector<String> Store::listMirroredChildren(const String & prefix)
+std::vector<String> Pool::listMirroredChildren(const String & prefix)
 {
     /// Loose LIST of the mirrored subtree (design §5.3). Returns the distinct next-path-segment
     /// names. NOT authoritative — callers must re-check `listRefs` per candidate before surfacing
@@ -1055,46 +1055,46 @@ std::vector<String> Store::listMirroredChildren(const String & prefix)
 
 
 /// ==== ref-ledger delegates (source-layout §3.4) ==== The ref-log / ref-table subsystem lives in the
-/// `ref_ledger` member (Pool/CasRefLedger.h); Store keeps these thin public forwarders so the wiring,
+/// `ref_ledger` member (Pool/CasRefLedger.h); Pool keeps these thin public forwarders so the wiring,
 /// Build, Gc, and every test call site is unchanged.
 
-void Store::setCasRetrySleepForTest(std::function<void(uint64_t)> sleep_fn)
+void Pool::setCasRetrySleepForTest(std::function<void(uint64_t)> sleep_fn)
 {
     ref_ledger.setCasRetrySleepForTest(std::move(sleep_fn));
 }
 
-std::optional<Resolved> Store::resolveRef(const RootNamespace & ns, const String & ref_name, bool allow_stale)
+std::optional<Resolved> Pool::resolveRef(const RootNamespace & ns, const String & ref_name, bool allow_stale)
 {
     return ref_ledger.resolveRef(ns, ref_name, allow_stale);
 }
 
-std::map<String, Resolved> Store::listRefs(const RootNamespace & ns)
+std::map<String, Resolved> Pool::listRefs(const RootNamespace & ns)
 {
     return ref_ledger.listRefs(ns);
 }
 
-void Store::dropRef(const RootNamespace & ns, const String & ref_name)
+void Pool::dropRef(const RootNamespace & ns, const String & ref_name)
 {
     ref_ledger.dropRef(ns, ref_name);
 }
 
-void Store::updateRefPayload(const RootNamespace & ns, const String & ref_name,
+void Pool::updateRefPayload(const RootNamespace & ns, const String & ref_name,
                              std::function<void(RefPayloadUpdate &)> mutator)
 {
     ref_ledger.updateRefPayload(ns, ref_name, std::move(mutator));
 }
 
-DropNamespaceStats Store::dropNamespace(const RootNamespace & ns)
+DropNamespaceStats Pool::dropNamespace(const RootNamespace & ns)
 {
     return ref_ledger.dropNamespace(ns);
 }
 
-bool Store::namespaceIsRemoved(const RootNamespace & ns)
+bool Pool::namespaceIsRemoved(const RootNamespace & ns)
 {
     return ref_ledger.namespaceIsRemoved(ns);
 }
 
-RefTxnId Store::appendRefOps(const RootNamespace & ns, MutationScope scope,
+RefTxnId Pool::appendRefOps(const RootNamespace & ns, MutationScope scope,
                              std::function<std::vector<RefOp>(const RefTableState &)> build_ops,
                              RootMutationOrigin origin, RootMutationKind kind,
                              bool skip_stale_precommit_sweep)
@@ -1102,32 +1102,32 @@ RefTxnId Store::appendRefOps(const RootNamespace & ns, MutationScope scope,
     return ref_ledger.appendRefOps(ns, std::move(scope), std::move(build_ops), origin, kind, skip_stale_precommit_sweep);
 }
 
-bool Store::observedNamespaceCleanupMarker(const RootNamespace & ns, const RefTxnId & remove_txn_id)
+bool Pool::observedNamespaceCleanupMarker(const RootNamespace & ns, const RefTxnId & remove_txn_id)
 {
     return ref_ledger.observedNamespaceCleanupMarker(ns, remove_txn_id);
 }
 
-bool Store::trySnapshotPublishOnce(const RootNamespace & ns)
+bool Pool::trySnapshotPublishOnce(const RootNamespace & ns)
 {
     return ref_ledger.trySnapshotPublishOnce(ns);
 }
 
-size_t Store::wedgedRefLaneCount()
+size_t Pool::wedgedRefLaneCount()
 {
     return ref_ledger.wedgedRefLaneCount();
 }
 
-CasWriteOutcome Store::stagingPutIfAbsent(std::string_view key, std::string_view bytes, Token * out_token)
+CasWriteOutcome Pool::stagingPutIfAbsent(std::string_view key, std::string_view bytes, Token * out_token)
 {
     return ref_ledger.stagingPutIfAbsent(key, bytes, out_token);
 }
 
-CasCreateResult Store::stagingConditionalCreate(std::string_view key, const std::function<PutResult()> & attempt)
+CasCreateResult Pool::stagingConditionalCreate(std::string_view key, const std::function<PutResult()> & attempt)
 {
     return ref_ledger.stagingConditionalCreate(key, attempt);
 }
 
-void Store::cancelInflightBuildsForNamespace(const RootNamespace & ns)
+void Pool::cancelInflightBuildsForNamespace(const RootNamespace & ns)
 {
     /// Delegate to `mount_runtime` (the build registry moved there, source-layout §3.5). Invoked by
     /// `ref_ledger` through the `cancel_inflight_builds` callback once its removal transaction is durable
@@ -1135,48 +1135,48 @@ void Store::cancelInflightBuildsForNamespace(const RootNamespace & ns)
     mount_runtime.cancelInflightBuildsForNamespace(ns);
 }
 
-uint64_t Store::refRecoveryRestartsForTest(const RootNamespace & ns)
+uint64_t Pool::refRecoveryRestartsForTest(const RootNamespace & ns)
 {
     return ref_ledger.refRecoveryRestartsForTest(ns);
 }
 
-bool Store::refLaneWedgedForTest(const RootNamespace & ns)
+bool Pool::refLaneWedgedForTest(const RootNamespace & ns)
 {
     return ref_ledger.refLaneWedgedForTest(ns);
 }
 
-String Store::wedgedKeyForTest(const RootNamespace & ns)
+String Pool::wedgedKeyForTest(const RootNamespace & ns)
 {
     return ref_ledger.wedgedKeyForTest(ns);
 }
 
-void Store::forceWedgeForTest(const RootNamespace & ns, uint64_t writer_epoch, uint64_t ref_sequence,
+void Pool::forceWedgeForTest(const RootNamespace & ns, uint64_t writer_epoch, uint64_t ref_sequence,
                               const String & key, const String & bytes)
 {
     ref_ledger.forceWedgeForTest(ns, writer_epoch, ref_sequence, key, bytes);
 }
 
-bool Store::needsStalePrecommitSweepForTest(const RootNamespace & ns)
+bool Pool::needsStalePrecommitSweepForTest(const RootNamespace & ns)
 {
     return ref_ledger.needsStalePrecommitSweepForTest(ns);
 }
 
-void Store::waitForSnapshotPublishSettleForTest(const RootNamespace & ns)
+void Pool::waitForSnapshotPublishSettleForTest(const RootNamespace & ns)
 {
     ref_ledger.waitForSnapshotPublishSettleForTest(ns);
 }
 
-int Store::pendingSnapshotPublishesForTest(const RootNamespace & ns)
+int Pool::pendingSnapshotPublishesForTest(const RootNamespace & ns)
 {
     return ref_ledger.pendingSnapshotPublishesForTest(ns);
 }
 
-std::optional<RefTxnId> Store::newestPublishedSnapshotIdForTest(const RootNamespace & ns)
+std::optional<RefTxnId> Pool::newestPublishedSnapshotIdForTest(const RootNamespace & ns)
 {
     return ref_ledger.newestPublishedSnapshotIdForTest(ns);
 }
 
-size_t Store::tailSinceSnapshotCountForTest(const RootNamespace & ns)
+size_t Pool::tailSinceSnapshotCountForTest(const RootNamespace & ns)
 {
     return ref_ledger.tailSinceSnapshotCountForTest(ns);
 }

@@ -34,7 +34,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPartManifestFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPoolMetaFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasStore.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include "cas_test_helpers.h"
 
 #include <IO/WriteBufferFromFile.h>
@@ -227,7 +227,7 @@ TEST(CasPluggableHash, ContentWriteBufferLocalModeCityHash128Unchanged)
     EXPECT_EQ(got_hash_hex, blobHashHexOneShot(BlobHashAlgo::CityHash128, payload));
 }
 
-/// (codecs-v3 phase 7) The two former `Store...StampsEnvelopeHashAlgo...` tests were REMOVED: the v3
+/// (codecs-v3 phase 7) The two former `Pool...StampsEnvelopeHashAlgo...` tests were REMOVED: the v3
 /// blob envelope no longer carries a `hash_algo` field (the algo identity lives in the blob KEY, spec
 /// §blob-envelope). Algo correctness for the write path is covered by the P1-T3b blob-body-PATH-key
 /// tests below (they assert the blob key uses the pool's algo), which is the surviving source of truth.
@@ -242,7 +242,7 @@ TEST(CasPluggableHash, ContentWriteBufferLocalModeCityHash128Unchanged)
 TEST(CasPluggableHash, Xxh3BlobLandsUnderAlgoSegmentAndIsDiscoveredCleanByFsck)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = Store::open(backend,
+    auto store = Pool::open(backend,
         PoolConfig{.pool_prefix = "p", .server_root_id = "test",
                    .blob_hash_algo = BlobHashAlgo::XXH3_128});
 
@@ -300,7 +300,7 @@ TEST(CasPluggableHash, Xxh3BlobLandsUnderAlgoSegmentAndIsDiscoveredCleanByFsck)
 /// the catch, but a real sha256 blob no longer does.
 ///
 /// This test constructs a `sha256`-algo pool DIRECTLY via `PoolConfig` (this bypasses only the
-/// disk-config *factory* guard in `MetadataStorageFactory.cpp`, which Task 6 removes — `Store::open`
+/// disk-config *factory* guard in `MetadataStorageFactory.cpp`, which Task 6 removes — `Pool::open`
 /// itself has never gated on algo) and writes an unreferenced blob body straight at its 64-hex
 /// content-addressed key (bypassing `Build::putBlob`, whose OWN internal `logical_hash` stays a
 /// fixed 128-bit representation until a later task — see the Task 5 report). It then drives BOTH
@@ -312,7 +312,7 @@ TEST(CasPluggableHash, Xxh3BlobLandsUnderAlgoSegmentAndIsDiscoveredCleanByFsck)
 TEST(CasPluggableHash, Sha256BlobSeenByCondemnSweepAndFsckNotSilentlySkipped)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = Store::open(backend,
+    auto store = Pool::open(backend,
         PoolConfig{.pool_prefix = "p", .server_root_id = "test",
                    .blob_hash_algo = BlobHashAlgo::Sha256});
     ASSERT_EQ(blobHashLenFor(store->writeAlgo()), 32u) << "sha256 must derive a 32-byte digest width";
@@ -408,7 +408,7 @@ TEST(CasPluggableHash, Sha256BlobSeenByCondemnSweepAndFsckNotSilentlySkipped)
 TEST(CasPluggableHash, Sha256BuildWritesFullWidthDigestAndInlineEqualsBlob)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = Store::open(backend,
+    auto store = Pool::open(backend,
         PoolConfig{.pool_prefix = "p", .server_root_id = "test",
                    .blob_hash_algo = BlobHashAlgo::Sha256});
     ASSERT_EQ(blobHashLenFor(store->writeAlgo()), 32u) << "sha256 must derive a 32-byte digest width";
@@ -491,8 +491,8 @@ TEST(CasPluggableHash, Sha256BuildWritesFullWidthDigestAndInlineEqualsBlob)
 /// validation at `foldManifestEdges` with refresh-on-miss.
 /// ============================================================================================
 
-/// spec §9.8 -- THE race regression this task exists to close. Each `Store`'s `admitted_algos` cache
-/// is a MONOTONE snapshot seeded once at `Store::open` and never re-read on its own; if node A admits
+/// spec §9.8 -- THE race regression this task exists to close. Each `Pool`'s `admitted_algos` cache
+/// is a MONOTONE snapshot seeded once at `Pool::open` and never re-read on its own; if node A admits
 /// a brand-new algo and publishes a manifest naming it, node B's stale cache must NOT fail the fold
 /// closed forever -- `foldManifestEdges` must refresh `_pool_meta` on the very first miss and accept
 /// once the fresh read proves the algo genuinely admitted. Node B is opened BEFORE node A performs the
@@ -503,7 +503,7 @@ TEST(CasPluggableHash, StaleAlgoRegistryRefreshOnMiss)
     auto backend = std::make_shared<InMemoryBackend>();
 
     /// Node B opens FIRST -- its admitted-cache seeds at {ch128} only, before sha256 exists anywhere.
-    auto store_b = Store::open(backend,
+    auto store_b = Pool::open(backend,
         PoolConfig{.pool_prefix = "p", .server_root_id = "b",
                    .blob_hash_algo = BlobHashAlgo::CityHash128});
     ASSERT_TRUE(store_b->isAlgoAdmitted(BlobHashAlgo::CityHash128));
@@ -511,7 +511,7 @@ TEST(CasPluggableHash, StaleAlgoRegistryRefreshOnMiss)
 
     /// Node A opens SECOND, admits sha256 via the opt-in flag, and publishes a manifest naming a
     /// sha256 blob through the real Build path (putBlob -> stageManifest -> precommitAdd -> promote).
-    auto store_a = Store::open(backend,
+    auto store_a = Pool::open(backend,
         PoolConfig{.pool_prefix = "p", .server_root_id = "a",
                    .blob_hash_algo = BlobHashAlgo::Sha256, .blob_hash_allow_new = true});
     ASSERT_TRUE(store_a->isAlgoAdmitted(BlobHashAlgo::Sha256));
@@ -558,11 +558,11 @@ TEST(CasPluggableHash, StaleAlgoRegistryRefreshOnMiss)
 TEST(CasPluggableHash, ForeignAlgoSegmentIsDebrisNotOurs)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = Store::open(backend,
+    auto store = Pool::open(backend,
         PoolConfig{.pool_prefix = "p", .server_root_id = "test",
                    .blob_hash_algo = BlobHashAlgo::CityHash128});
     /// Admit sha256 into the SAME pool from a second mount, then pull the union into `store`'s cache.
-    Store::open(backend,
+    Pool::open(backend,
         PoolConfig{.pool_prefix = "p", .server_root_id = "test2",
                    .blob_hash_algo = BlobHashAlgo::Sha256, .blob_hash_allow_new = true});
     store->refreshAdmittedAlgos();
@@ -647,7 +647,7 @@ TEST(CasPluggableHash, ReaderGenerationIsRaisedToThree)
     /// `PoolMeta::createOrValidate`, now targets `G_BUILD == 3`).
     {
         auto backend = std::make_shared<InMemoryBackend>();
-        auto store = Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+        auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
         EXPECT_EQ(store->poolMeta().min_reader_generation, 3u);
 
         const auto meta_bytes = backend->get(store->layout().poolMetaKey());
@@ -666,7 +666,7 @@ TEST(CasPluggableHash, ReaderGenerationIsRaisedToThree)
         ASSERT_TRUE(backend->casPut(layout.poolMetaKey(), encodePoolMeta(pm), backend->get(layout.poolMetaKey())->token).outcome == CasOutcome::Committed);
 
         expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [&]
-        { Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"}); });
+        { Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"}); });
     }
 
     /// BACKWARD floor (Task 12): a pool whose header `v` (compatibility_version) is BELOW generation 3
@@ -690,9 +690,9 @@ TEST(CasPluggableHash, ReaderGenerationIsRaisedToThree)
 
         /// `decodePoolMeta`'s backward floor rejects the downgraded bytes directly...
         expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [&] { decodePoolMeta(downgraded); });
-        /// ...and so does a full `Store::open` (decoding the pool-meta is its first fail-closed step).
+        /// ...and so does a full `Pool::open` (decoding the pool-meta is its first fail-closed step).
         expectThrowsCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [&]
-        { Store::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"}); });
+        { Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"}); });
     }
 }
 
@@ -716,12 +716,12 @@ TEST(CasPluggableHash, ReaderGenerationIsRaisedToThree)
 TEST(CasPluggableHash, TwoAlgoOrphansBothFullyReclaimed)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = Store::open(backend,
+    auto store = Pool::open(backend,
         PoolConfig{.pool_prefix = "p", .server_root_id = "test",
                    .blob_hash_algo = BlobHashAlgo::CityHash128, .gc_fold_max_defer_rounds = 0});
     /// Admit sha256 into the SAME pool from a second mount, then pull the union into `store`'s cache
     /// (mirrors `ForeignAlgoSegmentIsDebrisNotOurs`'s admission fixture).
-    Store::open(backend,
+    Pool::open(backend,
         PoolConfig{.pool_prefix = "p", .server_root_id = "test2",
                    .blob_hash_algo = BlobHashAlgo::Sha256, .blob_hash_allow_new = true});
     store->refreshAdmittedAlgos();
@@ -798,10 +798,10 @@ TEST(CasPluggableHash, TwoAlgoOrphansBothFullyReclaimed)
 TEST(CasPluggableHash, SameDigestDifferentAlgoDistinctBodiesAndSettlement)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = Store::open(backend,
+    auto store = Pool::open(backend,
         PoolConfig{.pool_prefix = "p", .server_root_id = "test",
                    .blob_hash_algo = BlobHashAlgo::CityHash128, .gc_fold_max_defer_rounds = 0});
-    Store::open(backend,
+    Pool::open(backend,
         PoolConfig{.pool_prefix = "p", .server_root_id = "test2",
                    .blob_hash_algo = BlobHashAlgo::XXH3_128, .blob_hash_allow_new = true});
     store->refreshAdmittedAlgos();

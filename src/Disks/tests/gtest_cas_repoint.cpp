@@ -32,7 +32,7 @@ ManifestEntry inlineEntry(const String & path, const String & bytes)
 }
 
 /// Publish `entries` as committed ref `ns/ref` through the real writer protocol.
-ManifestId publishPart(const StorePtr & store, const RootNamespace & ns, const String & ref,
+ManifestId publishPart(const PoolPtr & store, const RootNamespace & ns, const String & ref,
                        std::vector<ManifestEntry> entries)
 {
     auto build = store->startBuild(BuildInfo{.intended_ref = ns.string() + "/" + ref,

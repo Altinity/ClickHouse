@@ -136,7 +136,7 @@ uint64_t allocateWriterEpoch(Backend & b, const Layout & l, const String & srid)
                     srid);
             /// Fresh empty root: reserve 0 as a sentinel (0 means "no epoch", UINT64_MAX is the
             /// retired sentinel), so the first epoch handed out is 1 — matching the random
-            /// `process_epoch` draw (CasStore.cpp re-draws on 0) and the TLA+ model (first
+            /// `process_epoch` draw (CasPool.cpp re-draws on 0) and the TLA+ model (first
             /// AllocEpoch makes epoch=1).
             current.next_writer_epoch = 1;
         }
@@ -173,7 +173,7 @@ MountLease makeMountBody(UInt128 uuid, uint64_t epoch, uint64_t seq, uint64_t no
 }
 
 /// Mirrors `mountDoubleStartMessage`'s identity fields. The mount-audit sink is not yet installed
-/// during `Store::open`, so at first-open these refusal messages are the only holder-identity
+/// during `Pool::open`, so at first-open these refusal messages are the only holder-identity
 /// carrier in err.log — name the toucher inline rather than just the key.
 String describeMountHolder(const MountLease & m)
 {
@@ -625,7 +625,7 @@ MountLeaseKeeper::MountLeaseKeeper(
 SingleWriterSlot::RenewPayload MountLeaseKeeper::prepareRenew() const
 {
     /// Carry the two dynamic fields (both read OFF the state lock — the merged floor callback reaches
-    /// into the Store's own lock): `value` = wall-clock `now_ms` (so `encodeBody` stamps a fresh
+    /// into the Pool's own lock): `value` = wall-clock `now_ms` (so `encodeBody` stamps a fresh
     /// `expires_at_ms = now_ms + ttl`), `value2` = `min_active` (the build-watermark floor).
     return {.value = now_ms_fn(), .value2 = min_active_fn()};
 }
@@ -746,7 +746,7 @@ SingleWriterSlot::Token MountLeaseKeeper::claim(const String & body)
 void MountLeaseKeeper::onRenewSucceeded()
 {
     /// A successful background renew extended the durable lease. Refresh the local write-fence
-    /// deadline (the Store translates this to `steady_clock::now() + ttl`, monotonic). No S3 read.
+    /// deadline (the Pool translates this to `steady_clock::now() + ttl`, monotonic). No S3 read.
     if (on_renew_ok)
         on_renew_ok();
 }
@@ -896,7 +896,7 @@ void SingleWriterSlot::recordWrite(uint64_t new_seq, const Token & token)
 void SingleWriterSlot::doStart()
 {
     /// Compute the per-call payload BEFORE taking state_mutex: a subclass callback (the watermark's
-    /// min_active hook) may reach into the Store's own lock, so we never hold state_mutex across it.
+    /// min_active hook) may reach into the Pool's own lock, so we never hold state_mutex across it.
     const RenewPayload payload = prepareRenew();
 
     std::lock_guard lock(state_mutex);
@@ -943,7 +943,7 @@ void SingleWriterSlot::doTerminate()
 
     std::lock_guard lock(state_mutex);
     if (seq == 0)
-        /// Never started (e.g. `Store::open` failed before/inside `doStart`) — nothing was claimed,
+        /// Never started (e.g. `Pool::open` failed before/inside `doStart`) — nothing was claimed,
         /// so there is nothing to release. A never-started slot is inert: BOTH/ALL terminate calls on
         /// it are quiet no-ops, and — unlike the genuinely-started path below — we do NOT set `dead`,
         /// so a second no-op call takes this same early-return rather than tripping the "double

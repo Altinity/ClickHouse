@@ -114,7 +114,7 @@ void CasMountRuntime::renewWatermarkOnce()
     /// Renew the merged heartbeat (lease + build-watermark floor). A read-only open never anchored the
     /// keeper; there is nothing to renew (fail closed rather than fabricate one).
     if (!mount_keeper)
-        throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS heartbeat: renewWatermarkOnce on a read-only Store");
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS heartbeat: renewWatermarkOnce on a read-only Pool");
     mount_keeper->renewOnce();
 }
 
@@ -161,7 +161,7 @@ void CasMountRuntime::cancelInflightBuildsForNamespace(const RootNamespace & ns)
 void CasMountRuntime::mintRandomProcessEpoch()
 {
     /// Per-server watermark (spec 2026-06-16-ca-build-watermark). process_epoch is a random NONZERO
-    /// value minted once per Store: GC checks it for equality only (a different epoch == a dead
+    /// value minted once per Pool: GC checks it for equality only (a different epoch == a dead
     /// incarnation). It rides through the watermark protobuf codec (uint64 field — full range). For
     /// safety and to avoid the 0/UINT64_MAX sentinels, mask to 52 bits (collision-safe for an
     /// equality-only token) and re-draw on 0 (UINT64_MAX is the retired sentinel).
@@ -300,7 +300,7 @@ void CasMountRuntime::stopRemountThread()
 
 void CasMountRuntime::finishTeardown(bool drained)
 {
-    /// Retire the merged heartbeat on a clean Store teardown: stop() runs the keeper's terminal op,
+    /// Retire the merged heartbeat on a clean Pool teardown: stop() runs the keeper's terminal op,
     /// which stamps the lease already-expired (expires_at_ms = now) AND folds in the watermark
     /// farewell (min_active = UINT64_MAX). Stamping it expired lets a SAME-server reopen reclaim
     /// immediately (the durable epoch + owner stay sticky). A throw here (e.g. a foreign incarnation
@@ -315,7 +315,7 @@ void CasMountRuntime::finishTeardown(bool drained)
             }
             catch (...)
             {
-                tryLogCurrentException(getLogger("CasStore"), "CAS mount-lease: release during Store teardown failed");
+                tryLogCurrentException(getLogger("CasPool"), "CAS mount-lease: release during Pool teardown failed");
             }
         }
         else
@@ -323,7 +323,7 @@ void CasMountRuntime::finishTeardown(bool drained)
             /// Fail-closed: the drain could not certify every in-flight PUT resolved (a timeout or a
             /// live wedge), so writing the clean farewell would be a false certificate. No terminal op --
             /// the successor falls back to the (slower but safe) observation-based reclaim.
-            LOG_WARNING(getLogger("CasStore"),
+            LOG_WARNING(getLogger("CasPool"),
                 "CAS store shutdown with an unresolved ref-log PUT: skipping the clean-release marker; "
                 "the next mount will treat this end as unclean");
             mount_keeper->stopBackground();

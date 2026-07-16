@@ -11,8 +11,8 @@ namespace DB::Cas
 
 /// The plain-object surface of the pool: loose, non-content-addressed objects whose key is chosen by
 /// the caller (namespace files under `roots/<ns>/_files/`, and loose mountpoint objects). Extracted
-/// from `Store` (spec §Decomposition, warm-up): it is STATELESS over `Backend &` + `const Layout &`
-/// -- it owns no `Store` mutex and holds no `Store` back-reference, so `Store` keeps thin delegates
+/// from `Pool` (spec §Decomposition, warm-up): it is STATELESS over `Backend &` + `const Layout &`
+/// -- it owns no `Pool` mutex and holds no `Pool` back-reference, so `Pool` keeps thin delegates
 /// with identical signatures and the external API is unchanged.
 ///
 /// The three `cas*Object` helpers are the shared head+conditional-write / head+deleteExact loops that

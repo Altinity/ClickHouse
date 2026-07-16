@@ -43,9 +43,9 @@ namespace DB::Cas
 /// bookkeeping). The noun ("watermark") and verb ("farewell") used in every fail-closed message are
 /// passed to the base constructor. Subclasses differ ONLY in EXPLICIT policy hooks:
 ///   - `prepareRenew`     — runs OFF the state lock before each body encode, returning a per-call
-///                          payload (the watermark reads `min_active` from a Store callback here).
+///                          payload (the watermark reads `min_active` from a Pool callback here).
 ///                          Keeping it off `state_mutex` is load-bearing: the watermark callback
-///                          reaches into the Store's own lock.
+///                          reaches into the Pool's own lock.
 ///   - `encodeBody`       — builds the slot's exact JSON bytes for a given `seq` and payload;
 ///   - `claim`            — the slot-specific anchor sequence in `start` (the watermark's
 ///                          head→putIfAbsent/putOverwrite dance), returning the token we now hold;
@@ -483,7 +483,7 @@ class MountLeaseKeeper final : public SingleWriterSlot
 {
 public:
     /// `min_active_fn_` is read OFF the state lock on each beat (via `prepareRenew`) and stamped into
-    /// the mount body — the merged watermark floor. It reaches into the Store's own lock, so it must
+    /// the mount body — the merged watermark floor. It reaches into the Pool's own lock, so it must
     /// never run under `state_mutex`.
     MountLeaseKeeper(
         BackendPtr backend_, const Layout & layout_, const String & srid_, UInt128 server_uuid_,
@@ -499,17 +499,17 @@ public:
     void stop() { doTerminate(); }
 
     /// Join the renewal thread BEFORE this object's own `std::function` members (`on_renew_ok` /
-    /// `on_lost`, which reach back into the Store) are destroyed. The base `~SingleWriterSlot` also
+    /// `on_lost`, which reach back into the Pool) are destroyed. The base `~SingleWriterSlot` also
     /// calls `stopBackground`, but it runs AFTER the derived members are gone — a renewal firing
     /// `on_lost` in that window would call a destroyed `std::function`. Stopping here closes that window.
     ~MountLeaseKeeper() override { stopBackground(); }
 
-    /// Local write-fence coupling (set once by `Store::open` before `startBackground`): the keeper is
+    /// Local write-fence coupling (set once by `Pool::open` before `startBackground`): the keeper is
     /// the ONLY thing that touches S3 for the lease, so the fence must reflect the live lease without a
-    /// per-write S3 read. On each SUCCESSFUL background renew the keeper calls `on_renew_ok` (the Store
+    /// per-write S3 read. On each SUCCESSFUL background renew the keeper calls `on_renew_ok` (the Pool
     /// refreshes its monotonic fence deadline); when background renewal FAILS (a foreign/superseded
-    /// touch makes `renewOnce` throw and the loop stop) the keeper calls `on_lost` (the Store latches
-    /// its fence to lost). Both default to no-op so a keeper used without a Store is inert.
+    /// touch makes `renewOnce` throw and the loop stop) the keeper calls `on_lost` (the Pool latches
+    /// its fence to lost). Both default to no-op so a keeper used without a Pool is inert.
     void setFenceCallbacks(std::function<void()> on_renew_ok_, std::function<void()> on_lost_)
     {
         on_renew_ok = std::move(on_renew_ok_);

@@ -302,8 +302,8 @@ TEST(CaTransactionInlining, EagerFileInlinedDataBinBlobbed)
     tx->moveDirectory("uui/uuid-9/tmp_insert_all_1_1_0", "uui/uuid-9/all_1_1_0");
     tx->commit(DB::NoCommitOptions{});
 
-    /// Resolve the published part to its manifest and inspect placements (the Store read API, as in
-    /// gtest_cas_store.cpp: resolveRef -> readManifest).
+    /// Resolve the published part to its manifest and inspect placements (the Pool read API, as in
+    /// gtest_cas_pool.cpp: resolveRef -> readManifest).
     const auto ns = storage->liveNamespace("uuid-9");
     const auto resolved = storage->store()->resolveRef(ns, "all_1_1_0");
     ASSERT_TRUE(resolved.has_value());

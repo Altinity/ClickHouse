@@ -22,18 +22,18 @@ namespace DB::Cas
 {
 
 /// The writer ref-log / ref-table subsystem (spec §Writer Algorithms / §Table State / §Decomposition),
-/// extracted from `Cas::Store` (Phase 3.4 source-layout). It owns the whole-table ref cache
+/// extracted from `Cas::Pool` (Phase 3.4 source-layout). It owns the whole-table ref cache
 /// (`ref_tables`), the append lane (flat-combining flush leader + wedge protocol), snapshot publication,
 /// stale-precommit sweep, cache-budget eviction, and the remount/shutdown drain coordination -- together
 /// with the two mutexes that guard them (`ref_queue_mutex` and the per-table `state_mutex`) and the
 /// CAS retry controller the ref-log writer path uses.
 ///
-/// PURE relocation from `Store` -- zero logic change. Environment is injected by reference/value (no
-/// `Store &` back-reference): the backend, the layout, the `RefLedgerConfig` slice, the event sink, the
-/// pool-level `CasRequestBudget`, plus callbacks for the mount/watermark state that STAYS on `Store`
+/// PURE relocation from `Pool` -- zero logic change. Environment is injected by reference/value (no
+/// `Pool &` back-reference): the backend, the layout, the `RefLedgerConfig` slice, the event sink, the
+/// pool-level `CasRequestBudget`, plus callbacks for the mount/watermark state that STAYS on `Pool`
 /// (live writer epoch, the append/publish fence predicate, the boot clock, `mayMutate`, the unclean-
 /// epoch-boundary high-water-mark, the impossible-interference anomaly reaction, the owner pin for the
-/// detached publish task, and the in-flight-build cancellation on namespace removal). `Store` keeps thin
+/// detached publish task, and the in-flight-build cancellation on namespace removal). `Pool` keeps thin
 /// public delegates for every currently-public method so wiring/tests are unchanged.
 class CasRefLedger
 {
@@ -45,16 +45,16 @@ public:
         const CasEventSink & event_sink_,
         CasRequestBudget cas_request_budget_,
         /// The RAW mount `boot_ms_fn` (may be empty), forwarded to the retry controller's `now_ms` seam
-        /// exactly as the pre-decomposition `Store` ctor did (behavior-identical clock).
+        /// exactly as the pre-decomposition `Pool` ctor did (behavior-identical clock).
         std::function<uint64_t()> controller_boot_ms_fn,
-        /// Callbacks into mount/watermark state that stays on `Store` (bound at construction):
-        std::function<uint64_t()> live_epoch_fn_,          /// Store::liveWriterEpoch
-        std::function<bool()> fence_ok_fn_,                 /// Store::refAppendFenceOk
-        std::function<uint64_t()> boot_ms_now_fn_,          /// Store::bootMsNow
-        std::function<bool()> may_mutate_,                  /// Store::mayMutate
-        std::function<uint64_t()> unclean_boundary_epoch_,  /// Store::unclean_epoch_boundary_seen_at (relaxed load)
+        /// Callbacks into mount/watermark state that stays on `Pool` (bound at construction):
+        std::function<uint64_t()> live_epoch_fn_,          /// Pool::liveWriterEpoch
+        std::function<bool()> fence_ok_fn_,                 /// Pool::refAppendFenceOk
+        std::function<uint64_t()> boot_ms_now_fn_,          /// Pool::bootMsNow
+        std::function<bool()> may_mutate_,                  /// Pool::mayMutate
+        std::function<uint64_t()> unclean_boundary_epoch_,  /// Pool::unclean_epoch_boundary_seen_at (relaxed load)
         std::function<void(const String &, const String &, const std::optional<String> &)> on_impossible_interference_,
-        std::function<std::shared_ptr<void>()> pin_owner_,  /// Store::shared_from_this (pins owner for the detached publish task)
+        std::function<std::shared_ptr<void>()> pin_owner_,  /// Pool::shared_from_this (pins owner for the detached publish task)
         std::function<void(const RootNamespace &)> cancel_inflight_builds_);
 
     /// ---- read side (spec §6) ----
@@ -68,7 +68,7 @@ public:
     DropNamespaceStats dropNamespace(const RootNamespace & ns);
     bool namespaceIsRemoved(const RootNamespace & ns);
 
-    /// ==== writer ref-log append lane (Task 10, spec §Writer Algorithms) ==== (see the Store delegate's
+    /// ==== writer ref-log append lane (Task 10, spec §Writer Algorithms) ==== (see the Pool delegate's
     /// doc comment for the full contract; body is verbatim here).
     RefTxnId appendRefOps(const RootNamespace & ns, MutationScope scope,
                          std::function<std::vector<RefOp>(const RefTableState &)> build_ops,
@@ -79,7 +79,7 @@ public:
     bool trySnapshotPublishOnce(const RootNamespace & ns);
     size_t wedgedRefLaneCount();
 
-    /// ---- remount / shutdown coordination (called by the owning Store) ----
+    /// ---- remount / shutdown coordination (called by the owning Pool) ----
     void quiesceRefTablesForRemount();
     bool refLanesSettledForRemount();
     bool drainRefLanesForShutdown(uint64_t wait_budget_ms);
@@ -93,7 +93,7 @@ public:
     CasCreateResult stagingConditionalCreate(std::string_view key, const std::function<PutResult()> & attempt);
 
     /// `EventEmitter` concept hooks (Primitives/CasEvent.h): the ledger emits `CasEvent`s through the
-    /// same `EventEmitter{*this}` helper the Store used, and forwards a couple of direct emissions -- all
+    /// same `EventEmitter{*this}` helper the Pool used, and forwards a couple of direct emissions -- all
     /// onto the injected `event_sink`. Kept as members (not bare `event_sink(...)` calls) so
     /// `EventEmitter<CasRefLedger>` compiles unchanged and the emission idiom matches the pre-move code.
     bool hasEventSink() const noexcept { return static_cast<bool>(event_sink); }
@@ -141,7 +141,7 @@ public:
     }
 
 private:
-    /// ---- injected environment (no `Store` back-reference); initialized first, in this order ----
+    /// ---- injected environment (no `Pool` back-reference); initialized first, in this order ----
     Backend & backend;
     const Layout & layout;
     RefLedgerConfig config;
@@ -241,7 +241,7 @@ private:
         /// each publish), never per mutation. The estimated resident weight is
         /// `base_snapshot_bytes + tail_bytes_since_snapshot`. `base_snapshot_bytes` is ATOMIC (relaxed)
         /// for the same cross-lock `total`-loop read as `tail_bytes_since_snapshot` above. `last_touch_tick`
-        /// is the monotonic access stamp (`Store::ref_table_access_tick`) used to evict least-recently-
+        /// is the monotonic access stamp (`Pool::ref_table_access_tick`) used to evict least-recently-
         /// touched tables first; it is read only in the `use_count()==1`-gated candidate loop (no
         /// concurrent writer there), so it stays a plain `uint64_t`.
         std::atomic<uint64_t> base_snapshot_bytes{0};
@@ -311,8 +311,8 @@ private:
     /// this table is idle.
     std::atomic<bool> shutting_down{false};
 
-    /// Store-wide strictly-increasing counter (spec §Ordered Ref Transaction Identifier): shared by
-    /// every table of this mounted writer; a fresh writer_epoch (a new Store) restarts it at one.
+    /// Pool-wide strictly-increasing counter (spec §Ordered Ref Transaction Identifier): shared by
+    /// every table of this mounted writer; a fresh writer_epoch (a new Pool) restarts it at one.
     std::atomic<uint64_t> next_ref_sequence{1};
     /// The epoch component is the LIVE mount incarnation's writer_epoch, not the open-time
     /// `process_epoch`: a self-remount allocates a strictly-greater durable writer_epoch, so every ref
@@ -322,7 +322,7 @@ private:
     /// table log id" (spec §Ordered Ref Transaction Identifier / §Step 1).
     RefTxnId allocateRefTxnId() { return RefTxnId{live_epoch_fn(), next_ref_sequence.fetch_add(1)}; }
 
-    /// The CAS-owned retry controller (Task 5) this Store's ref-log writer path uses for every
+    /// The CAS-owned retry controller (Task 5) this Pool's ref-log writer path uses for every
     /// conditional log/snapshot `PUT` and uncertain-result resolution. Also shared (via the Build
     /// friendship) by `Build::stageManifest`'s part-manifest body `PUT` (chaos-tolerance-report
     /// §Task B) and by `Build::uploadFromSource`'s blob-body create — both the streaming

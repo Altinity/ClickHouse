@@ -3,7 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasStore.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/tests/cas_test_helpers.h>
 
 #include <iostream>
@@ -39,15 +39,15 @@ using DB::Cas::tests::appendOwnerEvent;
 namespace
 {
 
-StorePtr openTestStore(std::shared_ptr<InMemoryBackend> & out_backend)
+PoolPtr openTestStore(std::shared_ptr<InMemoryBackend> & out_backend)
 {
     out_backend = std::make_shared<InMemoryBackend>();
-    return Store::open(out_backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    return Pool::open(out_backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
 }
 
 /// Whether the CURRENT retired list (any gc-shard) still holds an entry — the ack-floor deletion pipeline
 /// (condemn -> graduate -> delete) is in flight while this is true.
-bool anyRetiredPending(const StorePtr & s)
+bool anyRetiredPending(const PoolPtr & s)
 {
     /// Retired-in-snapshot (T4): condemned state rides the adopted fold seal's kCondemned rows, not a
     /// separate retired list — reconstruct the in-flight set from the seal.
@@ -59,7 +59,7 @@ bool anyRetiredPending(const StorePtr & s)
 /// it. The loop renews the store's own heartbeat after each round (`renewWatermarkOnce`, unrelated to
 /// graduation timing but keeping the build-watermark floor and lease current) and stays alive while ANY
 /// work counter is nonzero OR the current retired list still holds an in-flight entry.
-size_t runGcToFixpoint(const StorePtr & s, Gc & gc, size_t max_rounds = 64)
+size_t runGcToFixpoint(const PoolPtr & s, Gc & gc, size_t max_rounds = 64)
 {
     size_t rounds = 0;
     for (; rounds < max_rounds; ++rounds)
@@ -94,7 +94,7 @@ ManifestEntry blobEntry(const String & path, const String & payload)
 /// makes the first backend observation. Returns the published `ManifestId` so a caller can later HEAD
 /// its body / assert reclaim.
 ManifestId publishTwoBlobPart(
-    const StorePtr & s, const RootNamespace & ns, const String & ref,
+    const PoolPtr & s, const RootNamespace & ns, const String & ref,
     const String & payload_a, const String & payload_b)
 {
     BuildInfo info;
@@ -112,7 +112,7 @@ ManifestId publishTwoBlobPart(
 
 /// Publish ONE ref naming a single-blob part through the real writer sequence. Returns its ManifestId.
 ManifestId publishOneBlobPart(
-    const StorePtr & s, const RootNamespace & ns, const String & ref, const String & payload)
+    const PoolPtr & s, const RootNamespace & ns, const String & ref, const String & payload)
 {
     BuildInfo info;
     info.intended_ref = ns.string() + "/" + ref;
@@ -125,7 +125,7 @@ ManifestId publishOneBlobPart(
 }
 
 /// Whether a blob's body object is present in the backend (HEADs blobKey directly — the GC retire path
-/// HEADs the object key, never the Store's manifest decode cache).
+/// HEADs the object key, never the Pool's manifest decode cache).
 bool blobPresent(const std::shared_ptr<InMemoryBackend> & b, const Layout & layout, const String & payload)
 {
     return b->head(layout.blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(u128Of(payload))})).exists;
@@ -142,7 +142,7 @@ bool manifestPresent(const std::shared_ptr<InMemoryBackend> & b, const Layout & 
 /// bytes are durable in the backend but no journal owner names them yet; the caller installs partB as
 /// the new owner via a REPOINT (see displaceAndGc). Returns partB's ManifestId.
 ManifestId stagePartBClosure(
-    const StorePtr & s, const RootNamespace & ns, const String & ref,
+    const PoolPtr & s, const RootNamespace & ns, const String & ref,
     const String & payload_a, const String & payload_b)
 {
     BuildInfo info;
@@ -167,7 +167,7 @@ ManifestId stagePartBClosure(
 /// now-zero-in-degree blobs, and recheck cleanup deletes partA's owner-removed body. Returns the fsck
 /// report so the caller can assert the no-leak end state (partA's blobs AND body gone, unreachable==0).
 FsckReport displaceAndGc(
-    const StorePtr & s, const std::shared_ptr<InMemoryBackend> & b,
+    const PoolPtr & s, const std::shared_ptr<InMemoryBackend> & b,
     const RootNamespace & ns, const String & ref, const ManifestId & part_a)
 {
     /// Stage partB's full closure (blobs + body present), then repoint the ref from partA to partB.

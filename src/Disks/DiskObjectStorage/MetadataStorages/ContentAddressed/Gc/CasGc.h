@@ -7,7 +7,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasStore.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Common/ThreadPool.h>
 #include <atomic>
 #include <functional>
@@ -124,11 +124,11 @@ public:
     /// `now_ms_fn` is the WALL clock (injected for tests): audit/diagnostic stamps only (e.g. the
     /// heartbeat floor's `now_ms` argument) — it never gates a fence decision. `mono_ms_fn` is the
     /// OBSERVATION clock (Task 9, rev.6 design §token-stability observation): monotonic on this
-    /// process, injected for tests, defaults to `Store::bootMs()`, and the ONLY clock the heartbeat
+    /// process, injected for tests, defaults to `Pool::bootMs()`, and the ONLY clock the heartbeat
     /// gate's own fence-out threshold is measured against (mirrors `claimMountAwaitingExpiry`'s
     /// `mono_ms_fn`, but at heartbeat-gate granularity — one GC round is one observation tick).
     /// Everything else in the round stays deterministic/clock-free.
-    Gc(StorePtr store_, UInt128 gc_id_, std::function<uint64_t()> now_ms_fn_ = {},
+    Gc(PoolPtr store_, UInt128 gc_id_, std::function<uint64_t()> now_ms_fn_ = {},
        std::function<uint64_t()> mono_ms_fn_ = {});
 
     /// One full round. Returns acquired_lease=false (nothing else done) if another leader is alive.
@@ -152,7 +152,7 @@ public:
 
     /// B160 advisory heartbeat: bump <prefix>/gc/hb to {gc_id, hb_seq+1}. Best-effort (a lost CAS is
     /// harmless — the next pulse retries). Touches NO Gc instance state. Static by design.
-    static void pulseHeartbeat(Store & store, UInt128 gc_id);
+    static void pulseHeartbeat(Pool & store, UInt128 gc_id);
 
 
     /// One previewed deletion the next regular round would make, with the reason it is eligible.
@@ -361,12 +361,12 @@ private:
     /// mutates across iterations while this job may still be queued).
     void scheduleMetaJob(std::function<void()> job);
 
-    StorePtr store;
+    PoolPtr store;
     UInt128 gc_id{};   /// this leader's identity (random u128, never 0)
     uint64_t rebuild_edge_budget_override = 0;   /// tests force tiny batches
     std::function<uint64_t()> now_ms_fn;   /// wall-clock ms; injected (tests), defaults to system_clock
     /// Task 9 (rev.6 §token-stability observation): the heartbeat gate's OWN observation clock —
-    /// monotonic on this process, injected (tests), defaults to `Store::bootMs()`. Never compared
+    /// monotonic on this process, injected (tests), defaults to `Pool::bootMs()`. Never compared
     /// against another node's clock; see `computeHeartbeatFloor`.
     std::function<uint64_t()> mono_ms_fn;
     bool trim_enabled = true;     /// TEST SEAM ONLY (M1): production always trims; see setTrimEnabledForTest

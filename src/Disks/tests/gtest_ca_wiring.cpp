@@ -231,7 +231,7 @@ TEST(CaPartPathParser, SplitCacheEvictionStaysCorrect)
     EXPECT_EQ(splitCacheMissesForTest(), misses_before_reparse + 1);
 }
 
-/// ==== M-W Task 2: the read side over Cas::Store ====
+/// ==== M-W Task 2: the read side over Cas::Pool ====
 /// Fixture: publish parts through the CORE API, then read through the IMetadataStorage surface of
 /// the rewritten ContentAddressedMetadataStorage (real ctor over a Local object storage; the
 /// backend self-selects EmulatedSingleProcess token semantics).
@@ -1027,7 +1027,7 @@ TEST(CaWiringOps, MoveDirectoryMutableCollisionPolicy)
 ///
 /// Made RED-able (the review's ask): `Build::abandon()` unconditionally emits a `BuildAbort`
 /// `CasEvent` (`CasBuild.cpp`) — this only happens if the buggy `else if (src_st.build)` branch
-/// runs `src_st.build->abandon()`. Registering an event sink (`Cas::Store::setEventSink`, the same
+/// runs `src_st.build->abandon()`. Registering an event sink (`Cas::Pool::setEventSink`, the same
 /// public test hook `gtest_cas_event_log.cpp` uses) and asserting no `BuildAbort` event fires is a
 /// genuine behavioral discriminator between the two merge branches — not just "assertions pass
 /// either way" — so a future regression that gives the source a Build again fails this test loudly.
@@ -2244,7 +2244,7 @@ TEST(CaWiringOps, OrphanedPendingBlobNotUploadedAfterReplace)
 /// BEFORE any blob work and touches nothing.
 ///
 /// These tests drive the REAL writer sequence (stageManifest -> precommitAdd -> putBlob -> promote) against
-/// a raw in-memory Store (no background GC → deterministic), and condemn the blob's CURRENT token by seeding
+/// a raw in-memory Pool (no background GC → deterministic), and condemn the blob's CURRENT token by seeding
 /// gc/state + the per-hash freshness meta the way a real GC condemn does (see `seedCondemnBlobToken` below).
 
 namespace DB::ErrorCodes
@@ -2255,10 +2255,10 @@ namespace DB::ErrorCodes
 namespace
 {
 
-DB::Cas::StorePtr openResurrectStore(std::shared_ptr<DB::Cas::InMemoryBackend> & out_backend)
+DB::Cas::PoolPtr openResurrectStore(std::shared_ptr<DB::Cas::InMemoryBackend> & out_backend)
 {
     out_backend = std::make_shared<DB::Cas::InMemoryBackend>();
-    return DB::Cas::Store::open(
+    return DB::Cas::Pool::open(
         out_backend, DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
 }
 
@@ -2266,7 +2266,7 @@ DB::Cas::StorePtr openResurrectStore(std::shared_ptr<DB::Cas::InMemoryBackend> &
 /// shape — RetiredEntry, exact-token delete, unchanged by this task) AND condemning the per-hash freshness
 /// meta, which is what the writer's condemned decision ACTUALLY point-reads (spec §meta-protocols v3).
 /// Bumps the round so the retirement is a fresh one; leaves the object itself in place (condemn, NOT delete).
-void seedCondemnBlobToken(DB::Cas::Store & store, const DB::UInt128 & hash,
+void seedCondemnBlobToken(DB::Cas::Pool & store, const DB::UInt128 & hash,
                           [[maybe_unused]] const DB::Cas::Token & token, [[maybe_unused]] uint64_t size)
 {
     using namespace DB::Cas;
@@ -2354,7 +2354,7 @@ TEST(CaWiringResurrect, PromoteIgnoresCondemnedTokenedBlobEdgeProtected)
 /// This drives that guard the DETERMINISTIC way: a promote whose precommit was NEVER added (so the binding
 /// is simply absent). The original "precommit added, then REMOVED out from under a still-live build" shape is
 /// NOT reachable by any deterministic single-threaded in-runtime actor: `Build::abandon` marks the build
-/// not-alive (`requireAlive` → LOGICAL_ERROR) and `Store::dropNamespace` cancels the build (`requireAlive` →
+/// not-alive (`requireAlive` → LOGICAL_ERROR) and `Pool::dropNamespace` cancels the build (`requireAlive` →
 /// ABORTED) — BOTH trip `requireAlive` at promote's first line, before this closure ever runs. Only a narrow
 /// promote-vs-dropNamespace RACE (dropNamespace clears the binding in the window between promote's
 /// `requireAlive` and its append closure) reaches the closure guard, which is therefore a defensive backstop

@@ -23,7 +23,7 @@ namespace DB::Cas
 {
 
 /// Binary codec helpers shared by the remaining custom-binary codecs (the refsnaplog log/snapshot
-/// objects and `CasStore`'s mutable-files payload). The control-plane objects moved to the v3 text
+/// objects and `CasPool`'s mutable-files payload). The control-plane objects moved to the v3 text
 /// codecs in `Core/Formats/` (codecs-v3 phase 2); these named wrappers survive for the length-prefixed
 /// binary bodies and exist so a 128-bit serialization can never be mis-paired with the wrong byte order.
 

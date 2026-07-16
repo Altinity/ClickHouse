@@ -41,7 +41,7 @@ Cas::ManifestEntry inlineEntry(const String & path, const String & bytes)
 }
 
 /// Publish `entries` as committed ref `ns/ref` through the real writer protocol.
-Cas::ManifestId publishPart(const Cas::StorePtr & store, const Cas::RootNamespace & ns,
+Cas::ManifestId publishPart(const Cas::PoolPtr & store, const Cas::RootNamespace & ns,
                             const String & ref, std::vector<Cas::ManifestEntry> entries)
 {
     auto build = store->startBuild(Cas::BuildInfo{.intended_ref = ns.string() + "/" + ref,
@@ -697,7 +697,7 @@ TEST(CasPartFolderAccess, DropNamespaceErasesAllViews)
 
     /// Recreation end-to-end (Task 12, snapshot+log §Namespace Birth): recreating the namespace requires
     /// GC's `_cleanup/<remove_txn_id>` completion marker; a warm writer re-observes it via one exact-key
-    /// re-check (`Store::observedNamespaceCleanupMarker`). This file has no GC harness, so we publish the
+    /// re-check (`Pool::observedNamespaceCleanupMarker`). This file has no GC harness, so we publish the
     /// marker directly -- the removal already published a `Removed` snapshot at `remove_txn_id`, so read
     /// that id and write the marker, exactly as GC's namespace-cleanup item would. Republishing part_1
     /// under the SAME name must then be admitted and serve a fresh RECREATED view via validate-on-hit,

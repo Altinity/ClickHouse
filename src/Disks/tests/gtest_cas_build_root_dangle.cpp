@@ -3,7 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasStore.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/tests/cas_test_helpers.h>
 
 #include <string>
@@ -16,10 +16,10 @@ namespace
 {
 
 /// Mirrors the B140 repro.
-StorePtr openTestStore(std::shared_ptr<InMemoryBackend> & out_backend)
+PoolPtr openTestStore(std::shared_ptr<InMemoryBackend> & out_backend)
 {
     out_backend = std::make_shared<InMemoryBackend>();
-    return Store::open(out_backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    return Pool::open(out_backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
 }
 
 size_t runGcToFixpoint(Gc & gc, size_t max_rounds = 64)
@@ -59,7 +59,7 @@ ManifestEntry blobEntry(const String & name, const String & payload)
 }
 
 /// B171 build-root / precommit, RED repro of the B140-dangle at unit level driven entirely through the
-/// public Build/Store/Gc API (no snap injection):
+/// public Build/Pool/Gc API (no snap injection):
 ///
 ///   Build A uploads blob P and publishes refA -> t1 -> { data.bin: P }. A is then RELEASED (dtor),
 ///   retiring its build_seq so the GC watermark `min_active` advances PAST A. P now carries A's

@@ -79,7 +79,7 @@ CasRefLedger::CasRefLedger(
     , pin_owner(std::move(pin_owner_))
     , cancel_inflight_builds(std::move(cancel_inflight_builds_))
 {
-    /// Task 10: the ref-log writer path's retry controller (relocated verbatim from the Store ctor).
+    /// Task 10: the ref-log writer path's retry controller (relocated verbatim from the Pool ctor).
     /// The raw mount `boot_ms_fn` -- the SAME fake-clock seam the local write fence uses -- is reused
     /// here rather than adding a second clock knob; both are monotonic-ms clocks and tests that need
     /// deterministic deadline behavior already inject it.
@@ -89,7 +89,7 @@ CasRefLedger::CasRefLedger(
 CasWriteOutcome CasRefLedger::stagingPutIfAbsent(std::string_view key, std::string_view bytes, Token * out_token)
 {
     /// Behavior-identical to the previously-inlined controller+fence at `CasBuild.cpp` stageManifest:
-    /// the ref lane's own mount predicate (`fence_ok_fn` == `Store::refAppendFenceOk`, no per-table
+    /// the ref lane's own mount predicate (`fence_ok_fn` == `Pool::refAppendFenceOk`, no per-table
     /// `superseded_by_remount` term -- there is no ref-table runtime here) gates every attempt.
     return ref_request_controller->putIfAbsentControlled(key, bytes, fence_ok_fn, out_token);
 }
@@ -192,7 +192,7 @@ void CasRefLedger::ensureRefTableRecovered(const RootNamespace & ns, RefTableRun
     /// Held for the WHOLE recovery's LIST+replay: there is nothing safe to do with an unrecovered
     /// table's `state` anyway, so a concurrent second caller for the SAME namespace blocking here is
     /// correct, not a missed-concurrency opportunity -- and this only affects each table's FIRST touch
-    /// per mounted Store (spec §Startup And Recovery: "one LIST ... cache the resulting complete table
+    /// per mounted Pool (spec §Startup And Recovery: "one LIST ... cache the resulting complete table
     /// state"). fix-round F3: the one exception is the recovery seal's encode+PUT, released below --
     /// `recovery_in_progress` (not the mutex) is what serializes concurrent callers across that window;
     /// see its doc comment for why.
@@ -1337,7 +1337,7 @@ void CasRefLedger::maybeScheduleSnapshotPublish(const RootNamespace & ns, const 
 
     /// Off the mutation hot path (spec §writer-snapshot-publication): `trySnapshotPublishOnce` never
     /// touches the append queue, so dispatching it onto an unrelated global-pool thread can never
-    /// deadlock a flush leader. `pin_owner()` (the Store's `shared_from_this`) keeps the Store -- and
+    /// deadlock a flush leader. `pin_owner()` (the Pool's `shared_from_this`) keeps the Pool -- and
     /// hence this ledger member -- alive for the thread's lifetime, exactly as the pre-decomposition
     /// `shared_from_this()` capture did.
     auto owner = pin_owner();
@@ -1351,7 +1351,7 @@ void CasRefLedger::maybeScheduleSnapshotPublish(const RootNamespace & ns, const 
             }
             catch (...)
             {
-                tryLogCurrentException(getLogger("CasStore"), "CAS background snapshot publish attempt failed");
+                tryLogCurrentException(getLogger("CasPool"), "CAS background snapshot publish attempt failed");
             }
             {
                 std::lock_guard lock(rt->state_mutex);
@@ -1374,7 +1374,7 @@ void CasRefLedger::maybeScheduleSnapshotPublish(const RootNamespace & ns, const 
             rt->pending_snapshot_publishes.fetch_sub(1, std::memory_order_relaxed);
         }
         rt->publish_settle_cv.notify_all();
-        tryLogCurrentException(getLogger("CasStore"), "CAS background snapshot-publish dispatch failed to launch");
+        tryLogCurrentException(getLogger("CasPool"), "CAS background snapshot-publish dispatch failed to launch");
     }
 }
 
@@ -1563,7 +1563,7 @@ void CasRefLedger::sweepStalePrecommitsForRead(const RootNamespace & ns, const s
     catch (...)
     {
         ProfileEvents::increment(ProfileEvents::CasRefSweepDeferred);
-        tryLogCurrentException(getLogger("CasStore"),
+        tryLogCurrentException(getLogger("CasPool"),
             "CAS stale-precommit sweep deferred for namespace '" + ns.string()
                 + "' (a read-only caller observed the failure and is proceeding with its own read)");
     }
@@ -1917,9 +1917,9 @@ DropNamespaceStats CasRefLedger::dropNamespace(const RootNamespace & ns)
     /// just-removed namespace. The append lane is the real linearization authority (an `owner_transition`
     /// on a non-Live namespace is rejected by the state machine regardless); this stops wasted work early
     /// and surfaces a clear error. Builds in OTHER namespaces self-filter (no-op). The build registry
-    /// (`inflight_builds`) lives on the owning Store, so the cancellation runs through the injected
+    /// (`inflight_builds`) lives on the owning Pool, so the cancellation runs through the injected
     /// `cancel_inflight_builds` callback (which collects the live shared_ptrs under `builds_mutex` and
-    /// cancels OUTSIDE it -- see `Store::cancelInflightBuildsForNamespace`).
+    /// cancels OUTSIDE it -- see `Pool::cancelInflightBuildsForNamespace`).
     cancel_inflight_builds(ns);
 
     /// spec §Namespace Removal: "After the removal transaction is durable, the writer also publishes
@@ -1931,7 +1931,7 @@ DropNamespaceStats CasRefLedger::dropNamespace(const RootNamespace & ns)
     }
     catch (...)
     {
-        tryLogCurrentException(getLogger("CasStore"), "CAS dropNamespace: publishing the Removed snapshot failed (best-effort)");
+        tryLogCurrentException(getLogger("CasPool"), "CAS dropNamespace: publishing the Removed snapshot failed (best-effort)");
     }
 
     /// The writer performs NO physical deletion of ref-log/snapshot objects or verbatim namespace files
