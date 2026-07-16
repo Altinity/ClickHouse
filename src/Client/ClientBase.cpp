@@ -2916,9 +2916,7 @@ bool ClientBase::processQueryText(const String & text)
 
 String ClientBase::getPrompt() const
 {
-    String result = prompt;
-    boost::replace_all(result, "{database}", default_database.empty() ? "default" : default_database);
-    return result;
+    return prompt;
 }
 
 
@@ -3060,7 +3058,6 @@ void ClientBase::initAIProvider()
         LOG_DEBUG(logger, "Failed to initialize AI SQL generator: {}", e.what());
     }
 }
-#endif
 
 std::string ClientBase::executeQueryForSingleString(const std::string & query)
 {
@@ -3133,23 +3130,6 @@ std::string ClientBase::executeQueryForSingleString(const std::string & query)
     }
 }
 
-void ClientBase::syncDefaultDatabase()
-{
-    try
-    {
-        const auto db = executeQueryForSingleString("SELECT currentDatabase()");
-        if (!db.empty())
-            default_database = db;
-        else
-            LOG_WARNING(getLogger("ClientBase"), "syncDefaultDatabase: server returned empty result for SELECT currentDatabase()");
-    }
-    catch (...)
-    {
-        LOG_WARNING(getLogger("ClientBase"), "syncDefaultDatabase: failed to query current database from server: {}", getCurrentExceptionMessage(false));
-    }
-}
-
-#if USE_CLIENT_AI
 bool ClientBase::checkAIProviderAcknowledgment()
 {
     // If API key came from environment and user hasn't acknowledged yet, ask for confirmation
