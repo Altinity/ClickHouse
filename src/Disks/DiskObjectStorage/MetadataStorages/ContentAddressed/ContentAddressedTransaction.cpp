@@ -227,14 +227,6 @@ ContentAddressedTransaction::routeOf(const std::string & path) const
     return metadata_storage.route(*p);
 }
 
-bool ContentAddressedTransaction::stagesPartFileUnlink(const std::string & path) const
-{
-    /// Must stay the SAME predicate as unlinkFile's in-memory branch below (`route().file`
-    /// non-empty) — see the header comment for the parser-vs-router divergence this guards.
-    auto r = routeOf(path);
-    return r && !r->file.empty();
-}
-
 void ContentAddressedTransaction::uploadPendingBlobs(PartStaging & st)
 {
     /// B189: build the set of blob hashes actually referenced by the staged manifest. Only Blob
