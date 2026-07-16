@@ -127,6 +127,18 @@ protected:
         const ReadSettings & read_settings,
         const WriteSettings & write_settings);
 
+protected:
+    /// [TXN-ONE-PIPELINE] Route one metadata effect either into the FIFO replay queue (ordinary object
+    /// storage) or straight to the metadata transaction at call time (eager staging overlay, e.g. CA).
+    template <typename Operation>
+    void dispatch(Operation && operation)
+    {
+        if (metadata_storage->transactionIsStagingOverlay())
+            operation(metadata_transaction);
+        else
+            operations_to_execute.emplace_back(std::forward<Operation>(operation));
+    }
+
 private:
     std::unique_ptr<WriteBufferFromFileBase> writeFileImpl( /// NOLINT
         bool autocommit,

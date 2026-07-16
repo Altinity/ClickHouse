@@ -157,6 +157,9 @@ public:
     bool supportsStat() const override { return false; }
     bool isReadOnly() const override { return read_only; }
     bool isContentAddressed() const override { return true; }
+    /// [TXN-ONE-PIPELINE] CA transactions are eager staging overlays: every mutating disk-transaction
+    /// method routes straight to the metadata transaction at call time, never into the FIFO queue.
+    bool transactionIsStagingOverlay() const override { return true; }
     bool supportsAtomicFileWrites() const override { return true; }
     bool supportsTransactionalMutableFiles() const override { return true; }
     bool areBlobPathsRandom() const override { return false; }

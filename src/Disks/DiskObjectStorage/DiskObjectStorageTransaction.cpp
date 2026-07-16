@@ -112,7 +112,7 @@ MultipleDisksObjectStorageTransaction::MultipleDisksObjectStorageTransaction(
 
 void DiskObjectStorageTransaction::createDirectory(const std::string & path)
 {
-    operations_to_execute.push_back([path](MetadataTransactionPtr tx)
+    dispatch([path](MetadataTransactionPtr tx)
     {
         tx->createDirectory(path);
     });
@@ -120,7 +120,7 @@ void DiskObjectStorageTransaction::createDirectory(const std::string & path)
 
 void DiskObjectStorageTransaction::createDirectories(const std::string & path)
 {
-    operations_to_execute.push_back([path](MetadataTransactionPtr tx)
+    dispatch([path](MetadataTransactionPtr tx)
     {
         tx->createDirectoryRecursive(path);
     });
@@ -147,12 +147,7 @@ void DiskObjectStorageTransaction::moveDirectory(const std::string & from_path, 
 
 void DiskObjectStorageTransaction::moveFile(const String & from_path, const String & to_path)
 {
-    /// all-tree-part-files Task 6: the CA eager-dispatch hook for a mutable-per-part-file rename
-    /// (B182, `isContentAddressedMutablePartFileRename`) is DELETED — its only trigger was the
-    /// `txn_version.txt.tmp` -> `txn_version.txt` MVCC rename, which no longer exists on a CA disk
-    /// (Task 5's `supportsAtomicFileWrites` short-circuit writes `txn_version.txt` directly, no tmp
-    /// file, no rename). Every moveFile now goes through the ordinary deferred-to-commit path.
-    operations_to_execute.push_back([from_path, to_path](MetadataTransactionPtr tx)
+    dispatch([from_path, to_path](MetadataTransactionPtr tx)
     {
         tx->moveFile(from_path, to_path);
     });
@@ -160,7 +155,7 @@ void DiskObjectStorageTransaction::moveFile(const String & from_path, const Stri
 
 void DiskObjectStorageTransaction::truncateFile(const String & path, size_t size)
 {
-    operations_to_execute.push_back([path, size](MetadataTransactionPtr tx)
+    dispatch([path, size](MetadataTransactionPtr tx)
     {
         tx->truncateFile(path, size);
     });
@@ -168,9 +163,7 @@ void DiskObjectStorageTransaction::truncateFile(const String & path, size_t size
 
 void DiskObjectStorageTransaction::replaceFile(const std::string & from_path, const std::string & to_path)
 {
-    /// all-tree-part-files Task 6: see moveFile — the CA eager-dispatch hook for a mutable-per-part-
-    /// file rename (B182) is deleted; its only trigger no longer exists on a CA disk.
-    operations_to_execute.push_back([from_path, to_path](MetadataTransactionPtr tx)
+    dispatch([from_path, to_path](MetadataTransactionPtr tx)
     {
         tx->replaceFile(from_path, to_path);
     });
@@ -235,14 +228,14 @@ void DiskObjectStorageTransaction::removeSharedRecursive(
 {
     if (!keep_all_shared_data && file_names_remove_metadata_only.empty())
     {
-        operations_to_execute.push_back([path](MetadataTransactionPtr tx)
+        dispatch([path](MetadataTransactionPtr tx)
         {
             tx->removeRecursive(path, /*should_remove_objects=*/nullptr);
         });
     }
     else
     {
-        operations_to_execute.push_back([path, keep_all_shared_data, file_names_remove_metadata_only](MetadataTransactionPtr tx)
+        dispatch([path, keep_all_shared_data, file_names_remove_metadata_only](MetadataTransactionPtr tx)
         {
             tx->removeRecursive(path, /*should_remove_objects=*/[keep_all_shared_data, file_names_remove_metadata_only](const std::string & relative_path)
             {
@@ -269,7 +262,7 @@ void DiskObjectStorageTransaction::removeSharedFileIfExists(const std::string & 
 
 void DiskObjectStorageTransaction::removeDirectory(const std::string & path)
 {
-    operations_to_execute.push_back([path](MetadataTransactionPtr tx)
+    dispatch([path](MetadataTransactionPtr tx)
     {
         tx->removeDirectory(path);
     });
@@ -277,7 +270,7 @@ void DiskObjectStorageTransaction::removeDirectory(const std::string & path)
 
 void DiskObjectStorageTransaction::removeRecursive(const std::string & path)
 {
-    operations_to_execute.push_back([path](MetadataTransactionPtr tx)
+    dispatch([path](MetadataTransactionPtr tx)
     {
         tx->removeRecursive(path, /*should_remove_objects=*/nullptr);
     });
@@ -619,7 +612,7 @@ std::vector<std::string> DiskObjectStorageTransaction::listInFlightDirectory(con
 
 void DiskObjectStorageTransaction::setReadOnly(const std::string & path)
 {
-    operations_to_execute.push_back([path](MetadataTransactionPtr tx)
+    dispatch([path](MetadataTransactionPtr tx)
     {
         tx->setReadOnly(path);
     });
@@ -627,7 +620,7 @@ void DiskObjectStorageTransaction::setReadOnly(const std::string & path)
 
 void DiskObjectStorageTransaction::setLastModified(const std::string & path, const Poco::Timestamp & timestamp)
 {
-    operations_to_execute.push_back([path, timestamp](MetadataTransactionPtr tx)
+    dispatch([path, timestamp](MetadataTransactionPtr tx)
     {
         tx->setLastModified(path, timestamp);
     });
@@ -635,7 +628,7 @@ void DiskObjectStorageTransaction::setLastModified(const std::string & path, con
 
 void DiskObjectStorageTransaction::chmod(const String & path, mode_t mode)
 {
-    operations_to_execute.push_back([path, mode](MetadataTransactionPtr tx)
+    dispatch([path, mode](MetadataTransactionPtr tx)
     {
         tx->chmod(path, mode);
     });

@@ -311,6 +311,13 @@ public:
     /// disk transaction delegates writes to the metadata transaction's content-addressed buffer.
     virtual bool isContentAddressed() const { return false; }
 
+    /// [TXN-ONE-PIPELINE] True when a transaction from this storage stages every mutation into a
+    /// transaction-private overlay at call time (eager) rather than queuing effects for FIFO replay in
+    /// commit. When true, DiskObjectStorageTransaction routes every mutating method straight to the
+    /// metadata transaction and keeps its own operations_to_execute queue empty. Default false
+    /// (ordinary object storage).
+    virtual bool transactionIsStagingOverlay() const { return false; }
+
     /// True when a file write through this metadata storage publishes atomically, i.e. no partial
     /// content is ever observable under the file's final name (see `IDataPartStorage::supportsAtomicFileWrites`).
     virtual bool supportsAtomicFileWrites() const { return false; }
