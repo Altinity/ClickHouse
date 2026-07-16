@@ -4,6 +4,8 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFsck.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/ProfileEvents.h>
+#include <IO/ReadHelpers.h>
+#include <IO/ReadSettings.h>
 #include <filesystem>
 
 namespace ProfileEvents
@@ -161,6 +163,31 @@ TEST(CaTransactionLockScope, StagedFinalizeDropsForeignScratchRef)
 
     /// The foreign scratch ref at the tmp build path is gone (dropped, not carried forward).
     EXPECT_FALSE(storage->existsDirectory("uui/uuid-7/tmp_merge_all_1_1_0"));
+}
+
+/// [TXN-ONE-PIPELINE] After a tmp->final re-key, a read THROUGH the open transaction resolves the
+/// staged content under the FINAL path (read-your-writes), before commit(); the inner-directory
+/// overlay is likewise re-keyed and answers under the final path. The staged file lives under an
+/// inner projection dir because the directory overlay tracks INNER dirs only — the part dir itself
+/// answers `hasInFlightDirectory`=false by contract (removeIfNeeded clean early-return; see
+/// `CaWiringInFlight`), so asserting the bare part dir would contradict that invariant.
+TEST(CaTransactionLockScope, ReadYourWritesAfterReKey)
+{
+    auto storage = openTxStorage();
+    auto tx = storage->createTransaction();
+    auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
+
+    writeFileTx(*tx, "uui/uuid-3/tmp_insert_all_1_1_0/p.proj/checksums.txt", "the-checksums");
+    tx->moveDirectory("uui/uuid-3/tmp_insert_all_1_1_0", "uui/uuid-3/all_1_1_0");
+
+    /// The overlay answers the final path before commit (read-your-writes).
+    auto buf = ca_tx.tryReadFileInFlight("uui/uuid-3/all_1_1_0/p.proj/checksums.txt", DB::ReadSettings{}, std::nullopt);
+    ASSERT_NE(buf, nullptr);
+    std::string got;
+    DB::readStringUntilEOF(got, *buf);
+    EXPECT_EQ(got, "the-checksums");
+    /// The inner-directory overlay is re-keyed too and resolves under the final path.
+    EXPECT_TRUE(ca_tx.hasInFlightDirectory("uui/uuid-3/all_1_1_0/p.proj"));
 }
 
 /// Plan 2d: a small eager metadata file (checksums.txt) is staged INLINE — it rides the single tree
