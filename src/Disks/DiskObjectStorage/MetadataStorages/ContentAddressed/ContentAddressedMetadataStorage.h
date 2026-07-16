@@ -3,9 +3,9 @@
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedExchange.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartPathParser.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartRefKey.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartFolderView.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/CachedPartFolderAccess.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartFolderAccess.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartFolderAccess.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartFolderAccess.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/CasGcScheduler.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include <Interpreters/Context_fwd.h>

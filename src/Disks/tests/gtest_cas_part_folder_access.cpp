@@ -1,4 +1,4 @@
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/CachedPartFolderAccess.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartFolderAccess.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.h>
 #include <Disks/tests/cas_test_helpers.h>

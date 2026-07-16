@@ -1,4 +1,4 @@
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartRefKey.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartFolderAccess.h>
 #include <gtest/gtest.h>
 
 using namespace DB;
@@ -14,7 +14,7 @@ TEST(CasPartRefKey, CacheKeyIsUnambiguous)
     EXPECT_TRUE((k1 == ContentAddressed::PartRefKey{Cas::RootNamespace{"a"}, "b/c"}));
 }
 
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartFolderView.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartFolderAccess.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasPartManifestFormat.h>
 #include <algorithm>
 

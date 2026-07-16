@@ -1,6 +1,113 @@
 #pragma once
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartFolderView.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartRefKey.h>
+// ===== PartRefKey (merge #7: the routed part identity) =====
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasTypes.h>
+#include <base/types.h>
+
+namespace DB::ContentAddressed
+{
+
+/// The stable identity of a committed part or projection folder (spec
+/// 2026-07-08-cas-part-folder-cache §PartRefKey): owning root namespace + ref name
+/// ("<part>" or "detached/<part>", B181 fold).
+struct PartRefKey
+{
+    Cas::RootNamespace ns{""};
+    String ref;
+
+    bool operator==(const PartRefKey & o) const { return ns.string() == o.ns.string() && ref == o.ref; }
+
+    /// Canonical map key. '\0' cannot occur in namespace strings or ref names (both derive from
+    /// disk paths), so the join is unambiguous even though refs may contain '/'.
+    String cacheKey() const { return ns.string() + '\0' + ref; }
+};
+
+/// Read-freshness policy at the part-folder access boundary (spec §Freshness). The
+/// mutable-read-vs-write-evidence distinction is carried by the METHOD, not a fourth value:
+/// mutable per-part reads call `resolve` (no manifest involved); write-path source reads call
+/// `getView`, which under ForceFresh always re-proves the manifest body (mandatory HEAD in
+/// `readManifestShared` — a fresh ref resolve alone proves ref currency, NOT body existence).
+enum class Freshness
+{
+    CachedForLoad,   /// repeated load-window reads; stale-tolerant resolve (allow_stale=true)
+    ForceFresh,      /// mutable per-part reads and write-path source reads; resolve fresh
+    StrictValidate,  /// fsck/debug: bypass retained views entirely; fresh resolve + validated read
+};
+
+}
+
+// ===== PartFolderView (merge #7: the value/view over the pool) =====
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasPartManifestFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasTypes.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
+#include <memory>
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace DB::ContentAddressed
+{
+
+/// Immutable snapshot of one resolved committed part/projection folder (spec
+/// 2026-07-08-cas-part-folder-cache §PartFolderView). Index-free: the decoder guarantees strictly
+/// ascending canonical path order, so file lookup is a binary search and directory listing is a
+/// contiguous range scan over the SHARED decode (`manifest` is the same object the Store's
+/// manifest cache holds). No I/O; never mutated after construction. All answers are pure functions
+/// of the members. All-tree-part-files Task 9: the mutable-files serving this view used to provide
+/// (a separate out-of-band payload, refreshed independently of the manifest) is gone — every
+/// per-part file is an ordinary manifest tree entry now, served by `findFile` like anything else; a
+/// content change is always a manifest change (`repointRef`), so the existing manifest-id staleness
+/// check is the only freshness check this view needs.
+class PartFolderView
+{
+public:
+    PartFolderView(PartRefKey key_, Cas::ManifestId manifest_id_, uint64_t manifest_size_,
+                   uint64_t published_at_ms_,
+                   std::shared_ptr<const Cas::PartManifest> manifest_, uint64_t validated_at_ms_);
+
+    /// Convenience join of a fresh `Resolved` + its validated shared decode. `validated_at_ms` is the
+    /// caller's "now" (spec §3 part_folder_validate): construction is only reached after
+    /// `readManifestShared`'s mandatory HEAD, so it IS a body-proven moment. The caller supplies it
+    /// (rather than this reading a clock itself) so `CachedPartFolderAccess`'s single injectable clock
+    /// drives both this stamp and its own age-window comparison — the same seam tests use.
+    static std::shared_ptr<const PartFolderView> make(
+        PartRefKey key, const Cas::Resolved & resolved,
+        std::shared_ptr<const Cas::PartManifest> manifest, uint64_t validated_at_ms);
+
+    /// A projection DIRECTORY is recognized by its LAST path component (.proj / .tmp_proj) — the
+    /// PoC recognizer (B64, also matches the nested detached-staging shape). `file` is the ROUTED
+    /// in-tree file path. Returns the "<file>/" prefix, or nullopt when not a projection dir.
+    static std::optional<std::string> projectionDirPrefix(const std::string & file);
+
+    const PartRefKey & refKey() const { return key; }
+    const Cas::ManifestId & manifestId() const { return manifest_id; }
+    uint64_t manifestSize() const { return manifest_size; }
+    uint64_t publishedAtMs() const { return published_at_ms; }
+    const std::shared_ptr<const Cas::PartManifest> & manifest() const { return manifest_body; }
+    /// The wall-clock ms at which this view's manifest body was last HEAD-proven live (spec §3
+    /// part_folder_validate). A mutable-only refresh clone carries the ORIGINAL view's stamp forward
+    /// (a mutable drift did not re-prove the body).
+    uint64_t validatedAtMs() const { return validated_at_ms; }
+
+    const Cas::ManifestEntry * findFile(const String & path) const;
+    bool hasFile(const String & path) const;
+    std::optional<uint64_t> fileSize(const String & path) const;  /// inline / blob
+    std::optional<String> inlineBytes(const String & path) const; /// Inline entries only
+    std::vector<String> listChildren(const String & dir_prefix) const;
+    bool hasDirectory(const String & dir_prefix) const;
+    size_t estimatedBytes() const;
+
+private:
+    PartRefKey key;
+    Cas::ManifestId manifest_id;
+    uint64_t manifest_size = 0;
+    uint64_t published_at_ms = 0;
+    std::shared_ptr<const Cas::PartManifest> manifest_body;
+    uint64_t validated_at_ms = 0;
+};
+
+}
+
+// ===== PartFolderValidate + CachedPartFolderAccess (merge #7: the cache of one mechanism) =====
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
 #include <Common/CacheBase.h>
 #include <Common/CurrentMetrics.h>
