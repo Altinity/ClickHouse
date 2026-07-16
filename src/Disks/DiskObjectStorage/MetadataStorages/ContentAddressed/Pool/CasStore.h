@@ -98,6 +98,31 @@ inline std::string_view toString(RootMutationKind kind)
     return "Unknown";
 }
 
+/// Per-owner config slices (spec §PoolConfig Slices). These are PROJECTIONS of the flat `PoolConfig`
+/// fields, built on demand by `PoolConfig::refLedgerConfig` / `PoolConfig::mountConfig` and passed
+/// BY VALUE to the ref-ledger / mount-runtime components (Phase 3-4-5). `PoolConfig` keeps its flat
+/// fields, so external callers (wiring, tests) that set them are unchanged — see the projection
+/// accessors' note below.
+struct RefLedgerConfig
+{
+    uint64_t snapshot_log_count_threshold = 256;
+    uint64_t snapshot_log_bytes_threshold = 1ULL << 20;
+    uint64_t snapshot_publish_backoff_initial_ms = 200;
+    uint64_t snapshot_publish_backoff_max_ms = 30000;
+    uint64_t precommit_sweep_backoff_initial_ms = 200;
+    uint64_t precommit_sweep_backoff_max_ms = 30000;
+    uint64_t ref_table_cache_bytes = 256ULL << 20;
+};
+
+struct MountConfig
+{
+    std::chrono::milliseconds mount_lease_ttl_ms{30000};
+    std::chrono::milliseconds mount_renew_period{10000};
+    uint64_t materialization_grace_ms = 30000;
+    std::function<uint64_t()> boot_ms_fn = {};
+    std::function<void(uint64_t)> wait_sleep_fn = {};
+};
+
 struct PoolConfig
 {
     String pool_prefix;
@@ -258,6 +283,35 @@ struct PoolConfig
     /// table. 0 = unbounded (eviction disabled). The estimate is the base snapshot body size plus the
     /// retained log-tail bytes; both are already tracked, so a mutation costs no extra encode.
     uint64_t ref_table_cache_bytes = 256ULL << 20;   /// 256 MiB
+
+    /// Projection accessors (spec §PoolConfig Slices, Option Y): build the per-owner typed slice from
+    /// the flat fields above, for BY-VALUE injection into the ref-ledger / mount-runtime components.
+    /// The fields stay flat here so every external caller (wiring, tests) that sets them is unchanged;
+    /// the slices are derived, not stored. `boot_ms_fn` is intentionally in `MountConfig` and reaches
+    /// the ref-ledger as a ctor callback (not duplicated into `RefLedgerConfig`).
+    RefLedgerConfig refLedgerConfig() const
+    {
+        return RefLedgerConfig{
+            .snapshot_log_count_threshold = snapshot_log_count_threshold,
+            .snapshot_log_bytes_threshold = snapshot_log_bytes_threshold,
+            .snapshot_publish_backoff_initial_ms = snapshot_publish_backoff_initial_ms,
+            .snapshot_publish_backoff_max_ms = snapshot_publish_backoff_max_ms,
+            .precommit_sweep_backoff_initial_ms = precommit_sweep_backoff_initial_ms,
+            .precommit_sweep_backoff_max_ms = precommit_sweep_backoff_max_ms,
+            .ref_table_cache_bytes = ref_table_cache_bytes,
+        };
+    }
+
+    MountConfig mountConfig() const
+    {
+        return MountConfig{
+            .mount_lease_ttl_ms = mount_lease_ttl_ms,
+            .mount_renew_period = mount_renew_period,
+            .materialization_grace_ms = materialization_grace_ms,
+            .boot_ms_fn = boot_ms_fn,
+            .wait_sleep_fn = wait_sleep_fn,
+        };
+    }
 };
 
 struct Resolved
