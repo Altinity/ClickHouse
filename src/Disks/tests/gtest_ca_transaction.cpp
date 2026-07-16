@@ -210,6 +210,57 @@ TEST(CaTransactionLockScope, OverlayProgramOrder)
     EXPECT_EQ(storage->getFileSize("uui/uuid-5/all_1_1_0/a.txt"), 2u);
 }
 
+/// [02941 root-cause] A carried-forward projection sidecar (createHardLink from a COMMITTED source part
+/// into a mutated tmp part) must be readable through the transaction's in-flight read path BOTH at the
+/// tmp build path (loadProjections runs here during MutateTask finalize) AND after the tmp->final re-key.
+/// This is the exact sequence MATERIALIZE PROJECTION drives on a part that already has the projection.
+/// If the in-flight read returns empty, the mutated part's in-memory projection sub-part loads with 0
+/// marks (the 02941 "Empty marks file: 0, must be: 144" corruption on a same-session projection SELECT).
+TEST(CaTransactionLockScope, InFlightReadCarriedForwardProjectionSidecar)
+{
+    auto storage = openTxStorage();
+
+    /// 1. Commit a source part with a small INLINE projection sidecar (marks-like) + a blob.
+    {
+        auto tx = storage->createTransaction();
+        writeFileTx(*tx, "uui/uuid-proj/tmp_insert_all_1_1_0/data.bin", "the-main-data-bytes");
+        writeFileTx(*tx, "uui/uuid-proj/tmp_insert_all_1_1_0/aaaa.proj/data.cmrk4", "PROJMARKS9");
+        tx->moveDirectory("uui/uuid-proj/tmp_insert_all_1_1_0", "uui/uuid-proj/all_1_1_0");
+        tx->commit(DB::NoCommitOptions{});
+    }
+    ASSERT_TRUE(storage->existsFile("uui/uuid-proj/all_1_1_0/aaaa.proj/data.cmrk4"));
+
+    /// 2. Mutation: build a new tmp part + carry the projection sidecar forward via createHardLink.
+    auto tx = storage->createTransaction();
+    auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
+    writeFileTx(*tx, "uui/uuid-proj/tmp_mut_all_1_1_0_2/data.bin", "mutated-main-data");
+    ca_tx.createHardLink("uui/uuid-proj/all_1_1_0/aaaa.proj/data.cmrk4",
+                         "uui/uuid-proj/tmp_mut_all_1_1_0_2/aaaa.proj/data.cmrk4");
+
+    /// 2a. loadProjections timing: read the carried sidecar in-flight at the TMP build path (pre-re-key).
+    {
+        auto buf = ca_tx.tryReadFileInFlight("uui/uuid-proj/tmp_mut_all_1_1_0_2/aaaa.proj/data.cmrk4", DB::ReadSettings{}, std::nullopt);
+        ASSERT_NE(buf, nullptr) << "carried-forward projection sidecar not readable in-flight at the tmp path";
+        std::string got; DB::readStringUntilEOF(got, *buf);
+        EXPECT_EQ(got, "PROJMARKS9");
+        EXPECT_EQ(ca_tx.tryGetInFlightFileSize("uui/uuid-proj/tmp_mut_all_1_1_0_2/aaaa.proj/data.cmrk4"),
+                  std::optional<uint64_t>(10));
+    }
+
+    /// 2b. After the tmp->final re-key (Phase 1), the sidecar must still resolve at the final path.
+    tx->moveDirectory("uui/uuid-proj/tmp_mut_all_1_1_0_2", "uui/uuid-proj/all_1_1_0_2");
+    {
+        auto buf = ca_tx.tryReadFileInFlight("uui/uuid-proj/all_1_1_0_2/aaaa.proj/data.cmrk4", DB::ReadSettings{}, std::nullopt);
+        ASSERT_NE(buf, nullptr) << "carried-forward projection sidecar not readable in-flight at the final path after re-key";
+        std::string got; DB::readStringUntilEOF(got, *buf);
+        EXPECT_EQ(got, "PROJMARKS9");
+    }
+
+    /// 3. And after commit it is durable + correct.
+    tx->commit(DB::NoCommitOptions{});
+    EXPECT_EQ(storage->getFileSize("uui/uuid-proj/all_1_1_0_2/aaaa.proj/data.cmrk4"), 10u);
+}
+
 /// [TXN-ONE-PIPELINE] Audit 5: on a commit, only refs this commit CREATED are eligible for rollback;
 /// a repoint of an already-existing ref is NEVER dropped as compensation. `publishStaging` returns
 /// false for the repoint path (a committed ref exists), so the repoint is never recorded in
