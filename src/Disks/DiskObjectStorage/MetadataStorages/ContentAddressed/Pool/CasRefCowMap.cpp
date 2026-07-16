@@ -14,8 +14,12 @@ std::pair<const String &, const RefCommittedRow &> RefCowMap::const_iterator::op
 void RefCowMap::const_iterator::normalize()
 {
     /// Drop overlay tombstones (and the base row each one shadows) until the next live overlay
-    /// entry, or exhaustion.
-    while (overlay_it != overlay_end && !overlay_it->second.has_value())
+    /// entry, or exhaustion. A tombstone is only actually consumed once it is next-in-merge-order
+    /// (its key <= base_it's current key, the same tie-break the final at_overlay check below
+    /// uses) -- a tombstone further ahead than base_it must stay put, or base_it would later walk
+    /// straight past its (still-hidden) target with nothing left in overlay to hide it.
+    while (overlay_it != overlay_end && !overlay_it->second.has_value()
+           && (base_it == base_end || overlay_it->first <= base_it->first))
     {
         const String key = overlay_it->first;
         ++overlay_it;
