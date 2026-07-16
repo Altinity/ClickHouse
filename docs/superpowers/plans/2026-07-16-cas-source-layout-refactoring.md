@@ -96,19 +96,21 @@ git grep -l -- "$OLD" -- 'src' 'programs' | xargs -r sed -i "s#${OLD}#${NEW}#g"
 **Interfaces:**
 - Produces: the confirmed post-v3 file inventory (exact surviving names), the baseline `[  PASSED  ]` count, and the resolved placement of drift files (`CasSourceEdgeMarkers.h`, `CasPoolMeta.{h,cpp}`, `CasWireVocab`/`CasRefWireVocab`). Every later task's `git mv`/merge inputs are validated against this map.
 
-> **WHY THIS TASK EXISTS (flag to reviewer):** This plan was written against the PRE-v3 tree (2026-07-16). The spec's precondition (`§Precondition: Codecs V3 Is Landed`) is **not yet met** — the current tree still contains `Core/CasCodecUtil.h`, `Core/Formats/CasWireVocab.{h,cpp}`, `Core/Formats/CasRefWireVocab.{h,cpp}`, `Core/CasSourceEdgeMarkers.h`, and lacks a `CasPoolMeta.h`. Codecs v3 (steps 1–8) is in flight in parallel. **Execution of this plan MUST NOT start until v3 is landed and green.** This task is the hard gate.
+> **RECONCILED 2026-07-16 (post-v3 tree verified).** Codecs v3 **IS landed and green** — this task's hard-gate is removed. Verified ground truth: `Core/CasManifestCodec.{h,cpp}` and `Core/CasRunFile.{h,cpp}` are gone (v3 phase-6), `Core/Proto/` is gone, `Core/CasPoolMeta.h` is gone (the type moved to `Formats/CasPoolMetaFormat.h`), and `Core/Formats/` is fully populated (14 format-pairs + README). **BUT v3 did NOT do everything the earlier draft assumed:** `Core/CasCodecUtil.h` **survives** (live utility used by 8 files), `Core/Formats/CasWireVocab.{h,cpp}` and `Core/Formats/CasRefWireVocab.{h,cpp}` **survive** (they are Formats files), `Core/CasSourceEdgeMarkers.h` survives, `Core/CasInspect.{h,cpp}` survives (NOT gutted), and `Core/CasBlobMetaFormat.{h,cpp}` exists in Formats. Placement of these drift files is resolved in Step 4. **This task is now a read-only baseline snapshot, not a gate.**
 
-- [ ] **Step 1: Verify codecs v3 is landed**
+- [ ] **Step 1: Confirm the post-v3 baseline (informational, not a gate)**
 
 Run:
 ```bash
 cd /home/mfilimonov/workspace/ClickHouse/master
-# v3 removes these; their absence is the landed signal:
-git ls-files | grep -E 'ContentAddressed/Core/CasCodecUtil.h|Core/Proto|Formats/CasWireVocab|Formats/CasRefWireVocab' || echo "V3-LANDED-CANDIDATE"
-# v3 creates the per-object Formats registry README and the CasPoolMeta logic/format split:
-git ls-files | grep -E 'ContentAddressed/Formats/README.md|ContentAddressed/.*CasPoolMeta\.(h|cpp)'
+# v3-landed signals (all must hold):
+git ls-files | grep -E 'ContentAddressed/Core/(CasManifestCodec|CasRunFile)\.|ContentAddressed/Core/Proto/' && echo "UNEXPECTED: v3 remnants present" || echo "v3-removed: OK"
+git ls-files | grep -E 'ContentAddressed/Core/Formats/README.md' && echo "Formats registry: OK"
+git ls-files | grep -E 'ContentAddressed/Core/CasPoolMeta\.h$' && echo "UNEXPECTED: CasPoolMeta.h present" || echo "CasPoolMeta.h gone (type is in Formats/CasPoolMetaFormat.h): OK"
+# Drift files that SURVIVED v3 (expected present — they get homes in Step 4):
+git ls-files | grep -E 'ContentAddressed/Core/CasCodecUtil.h|Formats/CasWireVocab|Formats/CasRefWireVocab|Core/CasSourceEdgeMarkers.h|Core/CasInspect\.'
 ```
-Expected once v3 is landed: the first command prints `V3-LANDED-CANDIDATE`; the second shows the Formats README and a `CasPoolMeta.{h,cpp}` pair. **If v3 is not landed, STOP** and report to the team lead — do not proceed.
+Expected: the v3-removed / Formats-registry / CasPoolMeta.h checks print `OK`; the last command lists `CasCodecUtil.h`, `CasWireVocab.{h,cpp}`, `CasRefWireVocab.{h,cpp}`, `CasSourceEdgeMarkers.h`, `CasInspect.{h,cpp}` — all present, all resolved in Step 4.
 
 - [ ] **Step 2: Snapshot the authoritative post-v3 inventory**
 
@@ -125,11 +127,13 @@ Run SP-1 with `<tag>=baseline`. Record the `[  PASSED  ]` count from `build/gtes
 
 - [ ] **Step 4: Resolve drift-file placement against the spec target layout**
 
-For each file present in the post-v3 tree but NOT explicitly named in the spec's Target Layout, decide its layer (record the decision in `tmp/cas_baseline_inventory.txt`):
-  - `CasSourceEdgeMarkers.h` (a dependency-free POD header consumed by `CasRecordStreamFormat.h` and `CasBlobInDegree.h`) → **`Primitives/`** (zero outward deps; matches the Primitives layer definition). Confirm it still exists and its consumers before phase 2.
-  - `CasPoolMeta.{h,cpp}` (post-v3 logic half) → **`Pool/`** per spec; confirm v3 produced a `.h` (pre-v3 had only `.cpp`).
-  - `CasWireVocab`/`CasRefWireVocab` → confirm v3 either removed them or folded them into `Formats/`; if any survive, they belong in **`Formats/`** (persisted vocabulary). Record their exact surviving names — they feed the phase-2 move map.
-  - `CasInspect.{h,cpp}` → per spec it is "gutted to a thin decompress-print or deleted" by v3; if it survives, it moves to **`Tools/`**. Record its fate.
+Drift-file placement is RESOLVED (verified 2026-07-16). Record these in `tmp/cas_baseline_inventory.txt`:
+  - `CasSourceEdgeMarkers.h` (a dependency-free POD header consumed by `CasRecordStreamFormat.h` and `CasBlobInDegree.h`) → **`Primitives/`** (zero outward deps; matches the Primitives layer definition). Present; moved in Task 2.1.
+  - `CasCodecUtil.h` → **`Primitives/`** (NEW resolution — v3 did NOT delete it). It is the identifier/varint/hex codec-helper header; it includes only `Core/CasIds.h` + `Core/CasManifestId.h` (→ `Primitives/CasTypes.h` after merge #1) plus external `IO/`+`Common/`. Its 8 consumers span `Formats`, `Pool`, and `Gc`, so it must sit in the **leftmost** layer they all may include — `Primitives`. It stays a **separate file** (not folded into `CasTypes.h`; merge #1 absorbs only the six identity headers). Moved in Task 2.1.
+  - `CasPoolMeta` → **only `Core/CasPoolMeta.cpp` exists — there is NO `CasPoolMeta.h`.** The `PoolMeta` struct + `createOrValidate` live in `Formats/CasPoolMetaFormat.h`; the `.cpp` includes that header. So the spec's `Pool/CasPoolMeta.{h,cpp}` is realized as `Pool/CasPoolMeta.cpp` alone (the format/type half already lives in `Formats/`). Do NOT synthesize a header (no drive-by, invariant #5). Moved in Task 2.4 as `.cpp`-only.
+  - `CasWireVocab.{h,cpp}` / `CasRefWireVocab.{h,cpp}` → **both SURVIVE in `Core/Formats/`** and move to **`Formats/`** as part of the `Core/Formats/* → Formats/*` bulk move (Task 2.2). No separate handling needed.
+  - `CasBlobMetaFormat.{h,cpp}` → present in `Core/Formats/` (not called out in the spec's Formats list but is a Formats file); moves with `Core/Formats/* → Formats/*` (Task 2.2). Its logic half `CasBlobMeta.{h,cpp}` (both files present) moves to `Pool/` (Task 2.4).
+  - `CasInspect.{h,cpp}` → **SURVIVES v3** (NOT gutted). Moves to **`Tools/`** (Task 2.6).
 
 - [ ] **Step 5: Confirm no in-flight conflicting work on the CA tree**
 
@@ -213,9 +217,9 @@ Claude-Session: https://claude.ai/code/session_01PeC1dg2dXBh55xkaZ63U1P"
 - Remove/absorb: `Core/CasIds.h`, `Core/CasToken.h`, `Core/CasBlobDigest.h`, `Core/CasBlobRef.h`, `Core/CasManifestId.h`, `Core/CasRefIds.h`
 - Sweep: all six paths across `src/` + `programs/` (heavily used — `gtest_cas_ids.cpp`, `gtest_cas_blob_digest.cpp`, `gtest_cas_blob_ref.cpp`, `gtest_cas_manifest_id.cpp`, and most CA cpp/h files).
 
-**Interfaces:** Produces: `RootNamespace`, `Token`, `BlobDigest`, `BlobRef`, `ManifestId`, `RefTxnId` + hex helpers, all in `CasTypes.h`, names unchanged. (Hex helpers stay here — their pre-v3 home `CasCodecUtil` was removed by v3.)
+**Interfaces:** Produces: `RootNamespace`, `Token`, `BlobDigest`, `BlobRef`, `ManifestId`, `RefTxnId`, all in `CasTypes.h`, names unchanged. **The codec/hex helpers do NOT come here** — they live in `CasCodecUtil.h`, which v3 did NOT delete and which stays a separate Primitives file (see Task 0 Step 4). Merge #1 absorbs ONLY the six identity headers.
 
-- [ ] **Step 1:** `git mv Core/CasIds.h Core/CasTypes.h` (largest/most-central input keeps history), then append the other five headers' bodies in dependency order (digest → ref → manifestid → token → refids), dropping each `#pragma once` and now-internal cross-includes. `git rm` the other five.
+- [ ] **Step 1:** `git mv Core/CasIds.h Core/CasTypes.h` (largest/most-central input keeps history), then append the other five headers' bodies in dependency order (digest → ref → manifestid → token → refids), dropping each `#pragma once` and now-internal cross-includes. `git rm` the other five. Note `CasCodecUtil.h` includes `Core/CasIds.h` + `Core/CasManifestId.h`; after this merge those become `Core/CasTypes.h` — the SP-3 sweep (Step 2) repoints them.
 - [ ] **Step 2:** SP-3 six times (one per absorbed header), each `OLD_SUBPATH=Core/<Name>.h` → `NEW_SUBPATH=Core/CasTypes.h`. The `CasIds.h` path is already gone via `git mv`; sweep it too so consumers repoint to `CasTypes.h`.
 - [ ] **Step 3:** SP-2 delta **−5** (6 inputs → 1 result). Merge Gate `<tag>=merge1`.
 - [ ] **Step 4: Commit** — `cas(refactor): merge identity micro-headers into CasTypes`.
@@ -298,6 +302,7 @@ One phase, several commits. Move commits contain **no** content edits (SP-2 conf
 - `Core/CasXXH3.h` → `Primitives/CasXXH3.h`
 - `Core/CasEvent.{h,cpp}` → `Primitives/CasEvent.{h,cpp}`  *(the `toEventKind` direction fix is Task 2.9, a separate content commit — move the file as-is here)*
 - `Core/CasSourceEdgeMarkers.h` → `Primitives/CasSourceEdgeMarkers.h`  *(placement resolved in Task 0 Step 4)*
+- `Core/CasCodecUtil.h` → `Primitives/CasCodecUtil.h`  *(survived v3; placement resolved in Task 0 Step 4 — leftmost layer its Formats/Pool/Gc consumers may all include)*
 
 - [ ] **Step 1:** `git mv` each pair above (NO content edits).
 - [ ] **Step 2:** SP-2 — count **unchanged**; `git log --follow` on `Primitives/CasTypes.h` shows pre-move history.
@@ -310,9 +315,8 @@ One phase, several commits. Move commits contain **no** content edits (SP-2 conf
 ### Task 2.2: Move `Formats/`
 
 **Files (git mv, accumulate):**
-- `Core/Formats/*` → `Formats/*` (all v3 per-object format files + `README.md`)
+- `Core/Formats/*` → `Formats/*` (all 14 v3 per-object format pairs + `README.md`). This bulk move INCLUDES the survivors resolved in Task 0 Step 4: `CasWireVocab.{h,cpp}`, `CasRefWireVocab.{h,cpp}`, and `CasBlobMetaFormat.{h,cpp}` — they are already under `Core/Formats/`, so no separate handling.
 - `Core/CasLayout.{h,cpp}` → `Formats/CasLayout.{h,cpp}` (keys are part of the persisted schema → joins Formats)
-- Any surviving `CasWireVocab`/`CasRefWireVocab` (per Task 0 Step 4) → `Formats/`
 
 - [ ] **Step 1:** `git mv Core/Formats/<each> Formats/<each>`; `git mv Core/CasLayout.{h,cpp} Formats/`.
 - [ ] **Step 2:** `git add -A` only (part of the single move commit).
@@ -336,8 +340,8 @@ One phase, several commits. Move commits contain **no** content edits (SP-2 conf
 - `Core/CasBuild.{h,cpp}` → `Pool/CasBuild.{h,cpp}` *(→ `CasPartWriteTxn` in phase 5)*
 - `Core/CasRefProtocol.{h,cpp}` → `Pool/CasRefProtocol.{h,cpp}`
 - `Core/CasServerRoot.{h,cpp}` → `Pool/CasServerRoot.{h,cpp}`
-- `Core/CasPoolMeta.{h,cpp}` → `Pool/CasPoolMeta.{h,cpp}`
-- `Core/CasBlobMeta.{h,cpp}` → `Pool/CasBlobMeta.{h,cpp}`
+- `Core/CasPoolMeta.cpp` → `Pool/CasPoolMeta.cpp` **(`.cpp` ONLY — there is no `CasPoolMeta.h`; the `PoolMeta` type + codec live in `Formats/CasPoolMetaFormat.h`, per Task 0 Step 4)**
+- `Core/CasBlobMeta.{h,cpp}` → `Pool/CasBlobMeta.{h,cpp}` (both files present; logic half of the freshness sidecar)
 
 > The new `Pool/` component files (`CasRefLedger`, `CasMountRuntime`, `CasManifestReader`, `CasPlainObjects`, `CasBlobUploader`) do NOT exist yet — they are created in phases 3–4. Do not stub them here.
 
@@ -388,7 +392,7 @@ Claude-Session: https://claude.ai/code/session_01PeC1dg2dXBh55xkaZ63U1P"
 
 **Files:**
 - Modify: all `#include` sites across `src/`, `programs/` (scripted).
-- Modify: `src/CMakeLists.txt:133-135` — replace the `Core` and `Core/Formats` directory lines with the seven new subdirs.
+- Modify: `src/CMakeLists.txt:134-135` — remove the `Core` and `Core/Formats` directory lines (verified at those line numbers 2026-07-16) and add the seven new subdirs. Keep line 133 (the top-level `.../ContentAddressed` line).
 
 **Interfaces:** Produces the first buildable state of phase 2. Consumes the move commit's new paths.
 
@@ -641,7 +645,7 @@ git grep -l -- 'CasBuild\|Cas::Build\|BuildPtr\|BuildInfo\|startBuild' -- src pr
 ## Self-Review (author checklist — completed)
 
 **Spec coverage:**
-- §Precondition (v3 landed) → Task 0. ✅
+- §Precondition (v3 landed) → Task 0 (RECONCILED 2026-07-16: v3 verified landed; hard-gate removed; drift-file placements resolved — `CasCodecUtil.h`→Primitives, `CasSourceEdgeMarkers.h`→Primitives, `CasWireVocab`/`CasRefWireVocab`/`CasBlobMetaFormat`→Formats, `CasPoolMeta.cpp`-only→Pool, `CasInspect`→Tools). ✅
 - §Target Layout (7 subdirs + facade) → Phase 2 (Tasks 2.1–2.7) + CMake 2.8. ✅
 - §Include Direction Rule + `toEventKind` fix → Task 2.9; README rule → Task 2.10. ✅
 - §Merges #1–#8 → Tasks 1.1–1.8 (mapped by number). ✅
@@ -658,7 +662,7 @@ git grep -l -- 'CasBuild\|Cas::Build\|BuildPtr\|BuildInfo\|startBuild' -- src pr
 
 ## Flags For The Team Lead (places the spec is NOT a pure scripted move)
 
-1. **Precondition unmet at planning time:** current tree is PRE-v3. Execution is HARD-GATED on codecs v3 landing (Task 0). The plan is written against the spec's post-v3 target; Task 0 re-verifies exact surviving names + resolves drift (`CasSourceEdgeMarkers.h`→Primitives, `CasPoolMeta.h` existence, `CasWireVocab`/`CasRefWireVocab` fate, `CasInspect` fate).
+1. **Precondition MET (reconciled 2026-07-16):** codecs v3 is landed and green — the Task 0 hard-gate is removed. The original draft was written against the pre-v3 tree and wrongly assumed v3 would delete `CasCodecUtil.h` / `CasWireVocab` / `CasRefWireVocab` and gut `CasInspect`; it did NOT. Resolved drift placements: `CasCodecUtil.h`→**Primitives** (survived, separate file; NOT folded into `CasTypes.h`), `CasSourceEdgeMarkers.h`→**Primitives**, `CasWireVocab`/`CasRefWireVocab`/`CasBlobMetaFormat`→**Formats** (survived, move with the `Core/Formats/*` bulk), `CasPoolMeta`→**Pool** as **`.cpp`-only** (no `.h` exists; type lives in `Formats/CasPoolMetaFormat.h`), `CasInspect`→**Tools** (survived).
 2. **CMake is a real edit (not a move):** the CA dir uses per-directory `add_headers_and_sources` (non-recursive glob), so the seven new subdirs REQUIRE explicit `src/CMakeLists.txt` lines and removal of the `Core`/`Core/Formats` lines (Task 2.8). gtests are `GLOB_RECURSE`-discovered — no test-CMake edit needed.
 3. **Phases 3–4 are hand C++ surgery, NOT scripted:** god-object decomposition moves members between classes, adds ctor env/callbacks, adds delegates, removes friendships, splits `PoolConfig`. This is the spec-acknowledged "more than a move" area. Mitigated by wholesale lock+state moves, per-component commits, teardown-order verification, and the mandatory umbrella review.
 4. **Merges #7 and #8 tidy internal declaration order** — their diffs are not purely line-mechanical (reorder-only, no logic).
