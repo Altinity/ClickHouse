@@ -1073,18 +1073,21 @@ TEST(CaWiringOps, MoveDirectoryOntoExistingDestinationBuildSurvives)
     auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
     EXPECT_NO_THROW(ca_tx.moveDirectory("uui/uuid-1/tmp_z", "uui/uuid-1/all_7_7_7"));
 
-    /// The destination's own build published its own content untouched. The source's removal mark
-    /// names a path that was never actually committed anywhere, so it is a harmless no-op once
-    /// merged into the destination's (first-time-published) staging.
-    EXPECT_TRUE(storage->existsDirectory("uui/uuid-1/all_7_7_7"));
-    EXPECT_EQ(storage->getFileSize("uui/uuid-1/all_7_7_7/data.bin"), 11u);   /// "dst-content"
-    EXPECT_FALSE(storage->tryGetInManifestBytes("uui/uuid-1/all_7_7_7/txn_version.txt").has_value());
-
-    /// The discriminator: no BuildAbort event means src_st.build->abandon() was never called, i.e.
-    /// the intended neither-branch no-op merge ran, not the two-builds merge-and-abandon branch.
+    /// The discriminator: no BuildAbort event means src_st.build->abandon() was never called during
+    /// the re-key merge, i.e. the intended neither-branch no-op merge ran, not the two-builds
+    /// merge-and-abandon branch. Checked right after the re-key so it stays scoped to the merge.
     EXPECT_FALSE(std::any_of(events.begin(), events.end(),
         [](const DB::Cas::CasEvent & e) { return e.type == DB::Cas::CasEventType::BuildAbort; }))
         << "src_st.build->abandon() fired — the source unexpectedly has a real Build again";
+
+    /// [TXN-ONE-PIPELINE] the re-key does not publish; the destination's build is materialized only at
+    /// commit(). The destination's own build then publishes its own content untouched; the source's
+    /// removal mark names a path never committed anywhere, so it is a harmless no-op once merged into
+    /// the destination's (first-time-published) staging.
+    tx->commit(DB::NoCommitOptions{});
+    EXPECT_TRUE(storage->existsDirectory("uui/uuid-1/all_7_7_7"));
+    EXPECT_EQ(storage->getFileSize("uui/uuid-1/all_7_7_7/data.bin"), 11u);   /// "dst-content"
+    EXPECT_FALSE(storage->tryGetInManifestBytes("uui/uuid-1/all_7_7_7/txn_version.txt").has_value());
 
     storage->store()->setEventSink(nullptr);
 }

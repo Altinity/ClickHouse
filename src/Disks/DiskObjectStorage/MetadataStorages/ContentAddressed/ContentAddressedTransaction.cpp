@@ -1117,30 +1117,20 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
             }
             parts.erase(src_it);
 
-            /// B151: this is a freshly-written part being finalized tmp->final (the ONLY rename shape
-            /// with a STAGED source here — DETACH/ATTACH/delete_tmp renames have a COMMITTED source and
-            /// MISS this branch). renameParts() runs lock-free, so publish the FINAL ref NOW (off the
-            /// data_parts lock) and mark it published; commit() then skips it. Single publish — the tmp
-            /// ref was never durably published, so the republishRef below is a no-op for it.
-            publishStaging(dst->ns, dst->ref, parts[dst_key]);
-            /// B151 rollback safety: this ref was published BEFORE the owning transaction's commit
-            /// decision (renameParts() precedes the ZK multi). If the transaction is abandoned, the
-            /// destructor drops it (see ~ContentAddressedTransaction).
-            rename_published_refs.emplace_back(dst->ns, dst->ref);
+            /// [TXN-ONE-PIPELINE]: a freshly-written part finalized tmp->final is re-keyed in the
+            /// overlay above (entries/marks/pending blobs/build moved src->dst). The durable publish
+            /// happens only in commit() (the existing publishStaging loop), NOT here — renameParts()
+            /// no longer publishes off the data_parts lock. No early-published ref to compensate on
+            /// abort (see ~ContentAddressedTransaction).
         }
 
         if (had_staged_source)
         {
-            /// A freshly-written part finalized tmp->final: the staged manifest published above is the
-            /// part's AUTHORITATIVE content. The B151 invariant assumes the tmp ref "was never durably
-            /// published", so the move below would be a no-op — but a nested sub-storage CAN durably
-            /// publish a committed ref AT THE PART'S OWN PATH: the vertical-merge / mutation text-index
-            /// builder (MergeTask / MutateTask createTemporaryTextIndexStorage) writes scratch under
-            /// `<part>/text_index_tmp/` through a SEPARATE DataPartStorage whose own commitTransaction
-            /// publishes a committed `<part>` ref holding only those scratch files. republishing that
-            /// over the just-published real manifest CLOBBERS the part (skip-index / statistics files
-            /// vanish from the tree, B183). Drop the spurious scratch ref instead — its blobs become
-            /// unreachable and GC reclaims them; the real manifest at `dst` stands.
+            /// B183: a nested text-index sub-storage (MergeTask/MutateTask createTemporaryTextIndexStorage)
+            /// may have DURABLY published a committed scratch ref at THIS part's own path holding only
+            /// `<part>/text_index_tmp/` files. That ref is not ours and is not staged; drop it now so the
+            /// overlay we publish in commit() is the authoritative manifest. Independent of our publish
+            /// timing (it targets an already-committed foreign ref), so it stays a call-time drop.
             metadata_storage.partAccess().dropRefIfPresent(src->refKey());
             return;
         }

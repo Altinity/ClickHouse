@@ -11,10 +11,10 @@ namespace ProfileEvents
 extern const Event CasRefRepoint;
 }
 
-/// B151: CA publish-at-rename lock-scope tests.
-/// Proves that a freshly-written part's FINAL manifest ref is published at the lock-free
-/// tmp->final rename (moveDirectory), not deferred to commit() which runs under the data_parts
-/// lock. This is the core of the B151 fix.
+/// [TXN-ONE-PIPELINE] CA publish-at-commit lock-scope tests.
+/// Proves that a freshly-written part's FINAL manifest ref is published only by commit(); the
+/// tmp->final rename (moveDirectory) is a pure re-key of the transaction-private overlay and
+/// publishes nothing. This inverts the former B151 publish-at-rename behavior.
 
 namespace
 {
@@ -51,9 +51,9 @@ const DB::Cas::ManifestEntry * findByName(const std::vector<DB::Cas::ManifestEnt
 
 }
 
-/// B151: a freshly-written part is PUBLISHED at the (lock-free) tmp->final rename, so the final ref
-/// resolves AFTER moveDirectory and BEFORE commit().
-TEST(CaTransactionLockScope, PublishHappensAtRenameNotCommit)
+/// [TXN-ONE-PIPELINE] A freshly-written part is published by commit(), NOT at the tmp->final rename.
+/// moveDirectory only re-keys the transaction overlay; the durable ref appears at commit().
+TEST(CaTransactionLockScope, PublishHappensAtCommitNotRename)
 {
     auto storage = openTxStorage();
     auto tx = storage->createTransaction();
@@ -64,34 +64,34 @@ TEST(CaTransactionLockScope, PublishHappensAtRenameNotCommit)
 
     tx->moveDirectory("uui/uuid-1/tmp_insert_all_1_1_0", "uui/uuid-1/all_1_1_0");
 
-    /// Published at the rename — before commit().
-    EXPECT_TRUE(storage->existsDirectory("uui/uuid-1/all_1_1_0"));
-    EXPECT_TRUE(storage->existsFile("uui/uuid-1/all_1_1_0/data.bin"));
-    EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/tmp_insert_all_1_1_0"));
+    /// Re-key only: the final ref is NOT durable yet.
+    EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/all_1_1_0"));
 
     tx->commit(DB::NoCommitOptions{});
+
+    /// Published by commit().
     EXPECT_TRUE(storage->existsDirectory("uui/uuid-1/all_1_1_0"));
+    EXPECT_TRUE(storage->existsFile("uui/uuid-1/all_1_1_0/data.bin"));
     EXPECT_EQ(storage->getFileSize("uui/uuid-1/all_1_1_0/data.bin"), 9u);
 }
 
-/// B151 rollback safety: a ref published at the lock-free rename must be DROPPED if the transaction
-/// is abandoned (destructed without commit) — e.g. a ZK multi failure rolls back after renameParts().
-TEST(CaTransactionLockScope, RenamePublishedRefDroppedOnAbandon)
+/// [TXN-ONE-PIPELINE] An abandoned transaction (destructed without commit) never published, so the
+/// final ref is simply absent — no early-published ref to drop.
+TEST(CaTransactionLockScope, AbandonedPartLeavesNoRef)
 {
     auto storage = openTxStorage();
     {
         auto tx = storage->createTransaction();
         writeFileTx(*tx, "uui/uuid-1/tmp_insert_all_3_3_0/data.bin", "abandoned");
         tx->moveDirectory("uui/uuid-1/tmp_insert_all_3_3_0", "uui/uuid-1/all_3_3_0");
-        EXPECT_TRUE(storage->existsDirectory("uui/uuid-1/all_3_3_0"));   /// published at the rename
-        /// tx goes out of scope here WITHOUT commit() — abandon/rollback.
+        EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/all_3_3_0"));   /// not published at the rename
+        /// tx goes out of scope WITHOUT commit().
     }
-    /// The early-published ref must have been dropped by the destructor.
     EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/all_3_3_0"));
 }
 
-/// A COMMITTED transaction must NOT drop its rename-published ref.
-TEST(CaTransactionLockScope, RenamePublishedRefSurvivesCommit)
+/// [TXN-ONE-PIPELINE] commit() publishes the re-keyed part.
+TEST(CaTransactionLockScope, RefPublishedByCommit)
 {
     auto storage = openTxStorage();
     {
