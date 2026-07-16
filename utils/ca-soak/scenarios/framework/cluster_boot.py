@@ -37,6 +37,9 @@ _VARIANT_FILE = {
     # S38: raised materialization_grace_ms (T_mat) + a published RustFS port (18121) for direct
     # object-store injection (the late-PUT test).
     "s38": "docker-compose-s38.yml",
+    # S36/S37: local+CA (and local+local+CA) multi-disk storage policies (ca_local / ca_local3)
+    # alongside the same shared CA disk, for MOVE PART/PARTITION and policy-driven tiering tests.
+    "multidisk": "docker-compose-multidisk.yml",
     # Soak-matrix config sweeps (opt §2 dedup_cache_bytes, §3 part_folder_validate): render_tuned_config
     # writes configs/storage_conf_tuned_ch{1,2}.xml on demand; this compose mounts those instead of the
     # fixed per-variant XML the other entries above use.
@@ -47,7 +50,7 @@ _VARIANT_FILE = {
 _VARIANT_NODES = {
     None: 2, "default": 2, "gc_shards2": 2, "smalldedupcache": 2,
     "tenreplicas": 10, "gc_shards8": 2, "s3faultproxy": 2, "s3listproxy": 2, "s38": 2,
-    "tuned": 2,
+    "tuned": 2, "multidisk": 2,
 }
 
 
