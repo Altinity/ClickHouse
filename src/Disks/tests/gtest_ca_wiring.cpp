@@ -244,6 +244,7 @@ TEST(CaPartPathParser, SplitCacheEvictionStaysCorrect)
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasFsck.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasLayout.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasFormat.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <IO/ReadHelpers.h>
 #include <IO/ReadPipeline.h>
@@ -1508,20 +1509,27 @@ public:
     }
 };
 
-/// True for a per-part manifest BODY object (<...>/cas/manifests/<namespace...>/<epoch-seq>/<NNNNNN>.proto)
+/// True for a per-part manifest BODY object (<...>/cas/manifests/<namespace...>/<epoch-seq>/<NNNNNN>.zst)
 /// — the FIRST durable object `publishStaging` writes for a part (via `Build::stageManifest`). Since Task B
 /// (chaos-tolerance-report) that write rides the CAS request controller: a transient fault is retried
 /// (budgeted attempts + resolve-before-reissue), so an injected fault must be PERSISTENT to fail the
 /// publish — the controller exhausts its budget and `stageManifest` throws ABORTED out of `publishStaging`.
 /// Exactly one body per part (retries re-PUT the same per-part key), so counting FIRST attempts isolates
 /// part publishes one-for-one. Ref-log txns (`cas/refs/.../_log/...`), tree blobs (`blobs/`), GC state
-/// (`gc/`) and verbatim files are excluded. Replaces the mutable root-shard-manifest object the test used
-/// to count, which the removed `RootShardManifest` format wrote at `cas/refs/<ns>/<shard_number>` (commit
-/// 318291fe5e5 deleted that format — its all-digits key no longer exists, so the old predicate never
-/// matched and the fault never fired, silently turning this into a no-op that passed a partial commit).
+/// (`gc/`) and verbatim files are excluded.
+///
+/// The suffix is taken from `storedSuffix(FormatId::PartManifest)` (the registered v3 stored suffix, now
+/// `.zst`) rather than hard-coded: codecs-v3 phase-3 made the part manifest an Always-compressed text
+/// object, changing the body key from the pre-v3 `.proto` to `.zst`. The old hard-coded
+/// `.ends_with(".proto")` stopped matching after that cutover, so the fault never fired and this
+/// (test-local) predicate silently no-op'd — the same failure mode this comment already recorded for the
+/// earlier `RootShardManifest` removal (commit `318291fe5e5`, whose all-digits key stopped matching).
+/// Sourcing the suffix from the format registry keeps the predicate correct across future
+/// compression-policy changes.
 bool isPartManifestBodyPath(const std::string & path)
 {
-    return path.find("/cas/manifests/") != std::string::npos && path.ends_with(".proto");
+    return path.find("/cas/manifests/") != std::string::npos
+        && path.ends_with(DB::Cas::storedSuffix(DB::Cas::FormatId::PartManifest));
 }
 
 std::shared_ptr<FaultyLocalObjectStorage> makeFaultyStorageForTest()
