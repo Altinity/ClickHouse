@@ -3,7 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBuild.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasProbe.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
@@ -153,7 +153,7 @@ private:
     bool did_finalize = false;
 };
 
-/// Task 5 of the S3-native staging plan: the promote path (`Build::putBlob` with
+/// Task 5 of the S3-native staging plan: the promote path (`PartWriteTxn::putBlob` with
 /// `BlobSource::server_side_copy_from` set) drives a WRITE-ONCE conditional server-side copy through
 /// the SAME condemn/resurrect gate the streaming path uses. This backend is a `DB::Cas::InMemoryBackend`
 /// (which models conditional create, so it honors both the write-once `promoteStaged` and the
@@ -197,27 +197,27 @@ public:
     }
 };
 
-DB::Cas::PoolPtr openStagingStore(const std::shared_ptr<RecordingStagingBackend> & b)
+DB::Cas::PoolPtr openStagingPool(const std::shared_ptr<RecordingStagingBackend> & b)
 {
     return DB::Cas::Pool::open(b, DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
 }
 
 /// A build whose owning manifest namespace / final ref name are `ns`/`ref` (mirrors gtest_cas_build's
 /// `startBuildFor`: promote/stageManifest derive the namespace by splitting `intended_ref` on the LAST '/').
-DB::Cas::BuildPtr startStagingBuild(const DB::Cas::PoolPtr & s, const DB::Cas::RootNamespace & ns, const String & ref)
+DB::Cas::PartWriteTxnPtr startStagingBuild(const DB::Cas::PoolPtr & s, const DB::Cas::RootNamespace & ns, const String & ref)
 {
-    DB::Cas::BuildInfo info;
+    DB::Cas::PartWriteInfo info;
     info.intended_ref = ns.string() + "/" + ref;
-    return s->startBuild(info);
+    return s->beginPartWrite(info);
 }
 
 /// Stage a one-blob manifest and precommit it (so the EDGE-BEFORE-OBSERVE fail-closed check in
 /// `observeAndAdmit` holds), returning the build ready for a `putBlob` promote of `hash`.
-DB::Cas::BuildPtr precommittedBuildFor(
+DB::Cas::PartWriteTxnPtr precommittedBuildFor(
     const DB::Cas::PoolPtr & s, const DB::Cas::RootNamespace & ns, const String & ref,
     const DB::UInt128 & hash, uint64_t blob_size)
 {
-    DB::Cas::BuildPtr build = startStagingBuild(s, ns, ref);
+    DB::Cas::PartWriteTxnPtr build = startStagingBuild(s, ns, ref);
     const DB::Cas::ManifestId id = build->stageManifest({DB::Cas::tests::blobEntryFor("col.bin", hash, blob_size)});
     build->precommitAdd(ns, ref, id);
     return build;
@@ -380,7 +380,7 @@ TEST(CasS3Staging, ContentWriteBufferS3ModeStreamsToSinkAndFinalizes)
     /// (b) on_finalized fired exactly once with the correct cityHash128 hex, size, and staging key.
     /// The pool-wide content hash is the STREAMING `HashingWriteBuffer` convention (chunked
     /// cityHash128, block = 2048 B), which diverges from a one-shot `CityHash_v1_0_2::CityHash128`
-    /// call for a payload spanning more than one block (see `gtest_cas_build.cpp`'s
+    /// call for a payload spanning more than one block (see `gtest_cas_part_write.cpp`'s
     /// `CopyForwardMultiBlockPayloadVerifies`, which documents and exercises the same divergence).
     /// This payload (5234 bytes) spans multiple 2048-byte blocks, so the expected hash must be
     /// recomputed with the SAME streaming convention via `HashingReadBuffer`, not a one-shot call.
@@ -432,7 +432,7 @@ TEST(CasS3Staging, ContentWriteBufferS3ModeCancelCancelsSinkAndSkipsFinalize)
     EXPECT_FALSE(on_finalized_called);
 }
 
-/// Task 5 of the S3-native staging plan: the promote path. `Build::putBlob` with
+/// Task 5 of the S3-native staging plan: the promote path. `PartWriteTxn::putBlob` with
 /// `BlobSource::server_side_copy_from` set drives a WRITE-ONCE conditional SERVER-SIDE COPY through the
 /// SAME condemn/resurrect gate as the streaming path (spec 2026-07-11-cas-s3-native-staging §5/§9). The
 /// four cases below use `RecordingStagingBackend` (an emulated backend that models conditional create
@@ -444,7 +444,7 @@ TEST(CasS3Staging, ContentWriteBufferS3ModeCancelCancelsSinkAndSkipsFinalize)
 TEST(CasS3Staging, PromoteViaServerSideCopyCreatesFreshBlobTokenedDep)
 {
     auto backend = std::make_shared<RecordingStagingBackend>();
-    auto store = openStagingStore(backend);
+    auto store = openStagingPool(backend);
     const DB::Cas::RootNamespace ns{"srv1/nsA"};
     const std::string ref = "part_a";
 
@@ -484,7 +484,7 @@ TEST(CasS3Staging, PromoteViaServerSideCopyCreatesFreshBlobTokenedDep)
 TEST(CasS3Staging, PromoteOverExistingCleanBlobAdoptsAndNeverOverwrites)
 {
     auto backend = std::make_shared<RecordingStagingBackend>();
-    auto store = openStagingStore(backend);
+    auto store = openStagingPool(backend);
     const DB::Cas::RootNamespace ns{"srv1/nsB"};
     const std::string ref = "part_b";
 
@@ -524,7 +524,7 @@ TEST(CasS3Staging, PromoteOverExistingCleanBlobAdoptsAndNeverOverwrites)
 TEST(CasS3Staging, PromoteOverCondemnedBlobResurrectsWithFreshTagNotVerbatim)
 {
     auto backend = std::make_shared<RecordingStagingBackend>();
-    auto store = openStagingStore(backend);
+    auto store = openStagingPool(backend);
     const DB::Cas::RootNamespace ns{"srv1/nsC"};
     const std::string ref = "part_c";
 
@@ -607,9 +607,9 @@ TEST(CasS3Staging, PromoteOverCondemnedBlobResurrectsWithFreshTagNotVerbatim)
 /// (`Cas::probeConditionalCopy`) is decoupled from that (it exercises `copyObjectConditional` directly
 /// against the object storage), so it reports S3 staging as usable independent of the backend mode. This
 /// lets `writeFile` take the S3-staging code path (stream to a staging object while hashing) WITHOUT
-/// needing a live/native conditional-copy backend for the promote: `Build::putBlob`'s
+/// needing a live/native conditional-copy backend for the promote: `PartWriteTxn::putBlob`'s
 /// `promoteStaged`/`resurrectStaged` seams (Native-mode only — see `CasObjectStorageBackend.cpp`) are
-/// already covered directly against `Cas::Build`/`RecordingStagingBackend` above (Task 5) and against a
+/// already covered directly against `Cas::PartWriteTxn`/`RecordingStagingBackend` above (Task 5) and against a
 /// live backend in Task 7's `with_rustfs` integration test; these two tests only ever exercise an S3
 /// pending blob that is either NEVER referenced (the B189 orphan shape — publishStaging skips its
 /// `putBlob`) or read BEFORE commit, so `promoteStaged` is never reached here.
@@ -676,9 +676,9 @@ TEST(CasS3Staging, SuccessfulCommitRemovesOrphanedS3StagingObject)
     /// orphan.bin forces the S3-staging blob path (a ".bin" suffix always stays a blob, per
     /// `partFileMustStayBlob`); it is unlinked below before commit.
     writeThroughS3Transaction(ca_tx, "uui/uuid-1/all_1_1_0/orphan.bin", std::string(300, 'x'));
-    /// checksums.txt is small and NOT blob-forcing: an INLINE entry that gives the part's Build a real
+    /// checksums.txt is small and NOT blob-forcing: an INLINE entry that gives the part's PartWriteTxn a real
     /// (non-orphaned) manifest entry, so `publishStaging` takes its normal path (not the early-return
-    /// mutable-only/no-Build branch).
+    /// mutable-only/no-PartWriteTxn branch).
     writeThroughS3Transaction(ca_tx, "uui/uuid-1/all_1_1_0/checksums.txt", "sums");
 
     DB::RelativePathsWithMetadata staged_before;

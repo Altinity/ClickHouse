@@ -22,7 +22,7 @@ struct LoadedMeta
     Token etag;
 };
 
-/// The shared meta-ops layer used by BOTH Build (writer) and Gc. Key-agnostic across all backends.
+/// The shared meta-ops layer used by BOTH PartWriteTxn (writer) and Gc. Key-agnostic across all backends.
 /// Requires strong read-after-write consistency for the 1-GET adopt (S3 since 2020, RustFS yes).
 ///
 /// Phase 3 T2/T3 (mixed-algo pools): keyed by the full `BlobRef` pair -- the codec is derived INSIDE

@@ -1,5 +1,5 @@
 #include <gtest/gtest.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBuild.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
@@ -16,7 +16,7 @@ namespace
 {
 
 /// Mirrors the B140 repro.
-PoolPtr openTestStore(std::shared_ptr<InMemoryBackend> & out_backend)
+PoolPtr openTestPool(std::shared_ptr<InMemoryBackend> & out_backend)
 {
     out_backend = std::make_shared<InMemoryBackend>();
     return Pool::open(out_backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
@@ -59,36 +59,36 @@ ManifestEntry blobEntry(const String & name, const String & payload)
 }
 
 /// B171 build-root / precommit, RED repro of the B140-dangle at unit level driven entirely through the
-/// public Build/Pool/Gc API (no snap injection):
+/// public PartWriteTxn/Pool/Gc API (no snap injection):
 ///
-///   Build A uploads blob P and publishes refA -> t1 -> { data.bin: P }. A is then RELEASED (dtor),
+///   PartWriteTxn A uploads blob P and publishes refA -> t1 -> { data.bin: P }. A is then RELEASED (dtor),
 ///   retiring its build_seq so the GC watermark `min_active` advances PAST A. P now carries A's
 ///   `cas_owner` and is no longer protected by any in-flight build.
 ///
-///   Build B starts and ADOPTS the same blob P via tokenless evidence (adoptEvidence — the cross-node
+///   PartWriteTxn B starts and ADOPTS the same blob P via tokenless evidence (adoptEvidence — the cross-node
 ///   adopt case), assembles t2 -> { other.bin: P }, and `precommit(t2)` — which publishes a durable
 ///   build-root ref so GC's fold lifts the in-degree of P's closure.
 ///
 ///   refA is dropped + watermark renewed; GC runs to fixpoint. P is protected by B's precommit edge,
-///   so GC must NOT delete it. Build B then publishes refB -> t2 successfully.
+///   so GC must NOT delete it. PartWriteTxn B then publishes refB -> t2 successfully.
 ///
 /// THE POSITIVE INVARIANT: the whole flow must succeed AND P must survive, because B's precommit pins
 /// P's closure across A's retire + GC (B171 two-phase commit; `checkAndResolveDeps` proves closure
 /// present at publish time).
 /// Spec: docs/superpowers/specs/2026-06-18-ca-build-root-precommit-cpp-impl.md (§F.1)
-TEST(CasBuildRootDangle, SharedBlobSurvivesSourceDropDuringBuild)
+TEST(CasPartWriteTxnRootDangle, SharedBlobSurvivesSourceDropDuringBuild)
 {
     std::shared_ptr<InMemoryBackend> backend;
-    auto s = openTestStore(backend);
+    auto s = openTestPool(backend);
     const RootNamespace ns{"test/tbl"};
     const String P = "shared-blob-payload-P";
 
-    /// Build A: upload P, publish refA -> manifest -> { data.bin: P }, then release A so its build_seq
+    /// PartWriteTxn A: upload P, publish refA -> manifest -> { data.bin: P }, then release A so its build_seq
     /// retires and min_active advances past it.
     {
-        BuildInfo info;
+        PartWriteInfo info;
         info.intended_ref = ns.string() + "/refA";
-        auto a = s->startBuild(info);
+        auto a = s->beginPartWrite(info);
         a->putBlob(idOf(P), BlobSource::fromString(P));
         const ManifestId id = a->stageManifest({blobEntry("data.bin", P)});
         a->precommitAdd(ns, "refA", id);
@@ -96,11 +96,11 @@ TEST(CasBuildRootDangle, SharedBlobSurvivesSourceDropDuringBuild)
     }
     s->renewWatermarkOnce();   /// A is gone; min_active now advances past A's build_seq
 
-    /// Build B: adopt the SAME blob P (cross-node adopt — tokenless evidence via adoptEvidence), assemble
+    /// PartWriteTxn B: adopt the SAME blob P (cross-node adopt — tokenless evidence via adoptEvidence), assemble
     /// its manifest, and precommitAdd it. The precommit pins P's closure (fold +1 edge) for the build.
-    BuildInfo binfo;
+    PartWriteInfo binfo;
     binfo.intended_ref = ns.string() + "/refB";
-    auto b = s->startBuild(binfo);
+    auto b = s->beginPartWrite(binfo);
     const ManifestEntry pe = blobEntry("other.bin", P);
     b->adoptEvidence(pe);
     const ManifestId t2 = b->stageManifest({pe});
@@ -115,15 +115,15 @@ TEST(CasBuildRootDangle, SharedBlobSurvivesSourceDropDuringBuild)
     Gc gc(s, u128Of("gc-b171"));
     runGcToFixpoint(gc);
 
-    /// Build B commits refB by promoting its precommit. Should succeed end-to-end; if it throws (e.g.
+    /// PartWriteTxn B commits refB by promoting its precommit. Should succeed end-to-end; if it throws (e.g.
     /// ABORTED because the blob is gone) that is itself the RED outcome.
     ASSERT_NO_THROW(b->promote(ns, "refB", b->buildId(), t2))
-        << "B171: Build B's promote must succeed — the precommit should have kept P alive";
+        << "B171: PartWriteTxn B's promote must succeed — the precommit should have kept P alive";
 
     /// The blob B references must still be present (no dangle), and refB must resolve.
     ASSERT_TRUE(backend->head(s->layout().blobKey(idOf(P))).exists)
-        << "B171-dangle: GC deleted the shared blob P that Build B adopted — its cas_owner was the "
-        << "retired Build A and the stub precommit published no build-root edge, so inDeg(P) hit 0 "
+        << "B171-dangle: GC deleted the shared blob P that PartWriteTxn B adopted — its cas_owner was the "
+        << "retired PartWriteTxn A and the stub precommit published no build-root edge, so inDeg(P) hit 0 "
         << "and the single content-delete site removed it. refB now dangles.";
     ASSERT_TRUE(s->resolveRef(ns, "refB").has_value())
         << "B171: refB must resolve to its committed manifest";
@@ -133,25 +133,25 @@ TEST(CasBuildRootDangle, SharedBlobSurvivesSourceDropDuringBuild)
 /// (e.g. a live build whose watermark renewer froze and was falsely judged dead), the real commit must
 /// NEVER publish a table ref over a missing dependency. It must fail closed — abort — never dangle.
 ///
-/// Setup mirrors the primary repro: Build A publishes refA -> t1 -> { data.bin: P } then retires; Build
+/// Setup mirrors the primary repro: PartWriteTxn A publishes refA -> t1 -> { data.bin: P } then retires; PartWriteTxn
 /// B adopts P, assembles t2 -> { other.bin: P }, and precommits t2 (a real build-root edge now protects
 /// P). We then SIMULATE the premature reclaim by manually dropping the build-root ref (as GC's reclaim
 /// would) AND dropping refA, then renew the watermark and run GC to fixpoint. With P's only protection
-/// (the precommit edge) gone and its owner retired, GC deletes P. Build B's publish must now ABORT
+/// (the precommit edge) gone and its owner retired, GC deletes P. PartWriteTxn B's publish must now ABORT
 /// (`checkAndResolveDeps` finds the adopted blob absent and not re-creatable) instead of committing a dangle.
 /// Spec: docs/superpowers/specs/2026-06-18-ca-build-root-precommit-design.md (§4.4, §4.6)
-TEST(CasBuildRootDangle, PrematureReclaimCommitFailsClosed)
+TEST(CasPartWriteTxnRootDangle, PrematureReclaimCommitFailsClosed)
 {
     std::shared_ptr<InMemoryBackend> backend;
-    auto s = openTestStore(backend);
+    auto s = openTestPool(backend);
     const RootNamespace ns{"test/tbl"};
     const String P = "shared-blob-payload-P-reclaim";
 
-    /// Build A: upload P, publish refA -> manifest, retire A so min_active advances past it.
+    /// PartWriteTxn A: upload P, publish refA -> manifest, retire A so min_active advances past it.
     {
-        BuildInfo info;
+        PartWriteInfo info;
         info.intended_ref = ns.string() + "/refA";
-        auto a = s->startBuild(info);
+        auto a = s->beginPartWrite(info);
         a->putBlob(idOf(P), BlobSource::fromString(P));
         const ManifestId id = a->stageManifest({blobEntry("data.bin", P)});
         a->precommitAdd(ns, "refA", id);
@@ -159,11 +159,11 @@ TEST(CasBuildRootDangle, PrematureReclaimCommitFailsClosed)
     }
     s->renewWatermarkOnce();
 
-    /// Build B: adopt P via tokenless evidence, assemble its manifest, precommitAdd it (the precommit
+    /// PartWriteTxn B: adopt P via tokenless evidence, assemble its manifest, precommitAdd it (the precommit
     /// owner binding for refB now protects P with a +1 fold edge).
-    BuildInfo binfo;
+    PartWriteInfo binfo;
     binfo.intended_ref = ns.string() + "/refB";
-    auto b = s->startBuild(binfo);
+    auto b = s->beginPartWrite(binfo);
     const ManifestEntry pe2 = blobEntry("other.bin", P);
     b->adoptEvidence(pe2);
     const ManifestId t2 = b->stageManifest({pe2});
@@ -190,9 +190,9 @@ TEST(CasBuildRootDangle, PrematureReclaimCommitFailsClosed)
         << "premature-reclaim setup invalid: P should have been collected after losing its precommit";
 
     /// §4 manifest-trust (test name is legacy — B171 INV-COMMIT-FAILCLOSED for an ADOPTED leaf now moves to
-    /// fsck): P is a committed-source adopted leaf, so Build B's promote TRUSTS it (no HEAD/loadMeta probe)
+    /// fsck): P is a committed-source adopted leaf, so PartWriteTxn B's promote TRUSTS it (no HEAD/loadMeta probe)
     /// and COMMITS refB. On the real reuse/relink path this dangle is UNREACHABLE: precommitAdd durably
-    /// appended refB's Precommit OwnerTransition (CasBuild.cpp precommitAdd) BEFORE promote, and promote
+    /// appended refB's Precommit OwnerTransition (CasPartWriteTxn.cpp precommitAdd) BEFORE promote, and promote
     /// re-proves that edge is the LIVE owner (WPromote owner==bld) BEFORE trusting P — so P has in-degree
     /// >= 1 and GC (the sole deleter) cannot collect it. This test injects the collection DIRECTLY (a raw
     /// deleteExact while refB's precommit is still live), which the live-precommit invariant excludes. So
@@ -214,7 +214,7 @@ TEST(CasBuildRootDangle, PrematureReclaimCommitFailsClosed)
         << rep.dangling << ", reachable=" << rep.reachable << ")";
 }
 
-/// (The GC-reclaim test `CasBuildRoot.AbandonedPrecommitReclaimed` -- which asserted GC AUTOMATICALLY
+/// (The GC-reclaim test `CasPartWriteTxnRoot.AbandonedPrecommitReclaimed` -- which asserted GC AUTOMATICALLY
 /// reclaims an abandoned precommit of a judged-dead build and then collects its closure -- was removed
 /// with the snapshot+log ref model. Per spec §Responsibility Boundary, reclaiming an abandoned precommit
 /// is now the WRITER's job (it appends the exact `owner_transition` removal on recovery); GC never scans
@@ -226,18 +226,18 @@ TEST(CasBuildRootDangle, PrematureReclaimCommitFailsClosed)
 /// pinned blobs) must survive a full GC run, and the build must still be able to promote it. In the
 /// snapshot+log model GC never reclaims a precommit at all, so this is purely a liveness pin: the live
 /// precommit's `+1` fold edge keeps its exclusively-owned blob alive across GC.
-TEST(CasBuildRoot, LivePrecommitNotReclaimed)
+TEST(CasPartWriteTxnRoot, LivePrecommitNotReclaimed)
 {
     std::shared_ptr<InMemoryBackend> backend;
-    auto s = openTestStore(backend);
+    auto s = openTestPool(backend);
     const RootNamespace ns{"test/tbl"};
     const String Q = "live-build-blob-payload-Q";
 
-    /// Build B stays ALIVE: upload Q, assemble, precommitAdd — and we DO NOT retire its seq. So
+    /// PartWriteTxn B stays ALIVE: upload Q, assemble, precommitAdd — and we DO NOT retire its seq. So
     /// `min_active <= build_seq` (B is in-flight) and the watermark keeps a live, advancing seq.
-    BuildInfo binfo;
+    PartWriteInfo binfo;
     binfo.intended_ref = ns.string() + "/refLive";
-    auto b = s->startBuild(binfo);
+    auto b = s->beginPartWrite(binfo);
     b->putBlob(idOf(Q), BlobSource::fromString(Q));
     const ManifestId t = b->stageManifest({blobEntry("data.bin", Q)});
     b->precommitAdd(ns, "refLive", t);

@@ -98,7 +98,7 @@ private:
 TEST(CasGcReplay, FreshAttemptRerunCompletes)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(1, 0xAA);
     writeBlobBody(*backend, store->layout(), DB::UInt128(1));
@@ -127,7 +127,7 @@ TEST(CasGcReplay, FreshAttemptRerunCompletes)
 TEST(CasGcReplay, DeposedRoundRerunsUnderFreshAttempt)
 {
     auto backend = std::make_shared<InterruptRoundCasBackend>(/*gc_state_key*/ "p/gc/state");
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     ASSERT_EQ(store->layout().gcStateKey(), "p/gc/state");   // guard the injected key against layout drift
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(1, 0xAA);

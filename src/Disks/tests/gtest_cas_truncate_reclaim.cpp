@@ -1,5 +1,5 @@
 #include <gtest/gtest.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBuild.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
@@ -30,7 +30,7 @@ using DB::Cas::tests::u128Of;
 namespace
 {
 
-PoolPtr openTestStore(std::shared_ptr<InMemoryBackend> & out_backend)
+PoolPtr openTestPool(std::shared_ptr<InMemoryBackend> & out_backend)
 {
     out_backend = std::make_shared<InMemoryBackend>();
     return Pool::open(out_backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
@@ -44,9 +44,9 @@ ManifestId publishPart2(
     const String & payload_a, const String & payload_b)
 {
     const RootNamespace nsr{ns};
-    BuildInfo info;
+    PartWriteInfo info;
     info.intended_ref = ns + "/" + ref;
-    auto build = s->startBuild(info);
+    auto build = s->beginPartWrite(info);
 
     ManifestEntry ea;
     ea.path = "data.bin";
@@ -109,7 +109,7 @@ size_t runGcToFixpoint(const PoolPtr & s, Gc & gc, size_t max_rounds = 64)
 TEST(CasTruncateReclaim, PerRefDropOfSharedBlobsReclaimsToZero)
 {
     std::shared_ptr<InMemoryBackend> b;
-    auto s = openTestStore(b);
+    auto s = openTestPool(b);
     const RootNamespace ns{"srv1/tbl"};
 
     constexpr int N = 32;
@@ -175,7 +175,7 @@ TEST(CasTruncateReclaim, PerRefDropOfSharedBlobsReclaimsToZero)
 TEST(CasTruncateReclaim, TruncateThenKeepInsertingStillReclaims)
 {
     std::shared_ptr<InMemoryBackend> b;
-    auto s = openTestStore(b);
+    auto s = openTestPool(b);
     const RootNamespace ns{"srv1/tbl"};
 
     /// Pre-truncate generation (the soak's ops < 451).
@@ -233,7 +233,7 @@ TEST(CasTruncateReclaim, TruncateThenKeepInsertingStillReclaims)
 TEST(CasTruncateReclaim, DropNamespaceOfSharedBlobsReclaimsToZero)
 {
     std::shared_ptr<InMemoryBackend> b;
-    auto s = openTestStore(b);
+    auto s = openTestPool(b);
     const RootNamespace ns{"srv1/tbl"};
 
     constexpr int N = 32;

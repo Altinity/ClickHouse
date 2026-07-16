@@ -68,7 +68,7 @@ private:
 TEST(CasFsck, CleanManifestPoolHasNoDangling)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(1, 0xAA);
     writeBlobBody(*backend, store->layout(), DB::UInt128(1));
@@ -83,7 +83,7 @@ TEST(CasFsck, CleanManifestPoolHasNoDangling)
 TEST(CasFsck, OwnerVisibleMissingManifestBodyIsError)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(1, 0xAA);
     publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);  // no body written
@@ -96,7 +96,7 @@ TEST(CasFsck, OwnerVisibleMissingManifestBodyIsError)
 TEST(CasFsck, ReachableBlobMissingIsError)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(1, 0xAA);
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});  // no blob body
@@ -110,7 +110,7 @@ TEST(CasFsck, ReachableBlobMissingIsError)
 TEST(CasFsck, ReclaimablePrePrecommitBodyIsInfo)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     /// Discovery is LIST-based (`listNamespaces` scans `cas/refs/`); seed a birth-only ref log so the
     /// namespace is discoverable but holds NO committed owner -- the manifest body below is orphan debris.
@@ -129,7 +129,7 @@ TEST(CasFsck, ReclaimablePrePrecommitBodyIsInfo)
 TEST(CasFsck, CondemnedBlobClassifiesPendingGc)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(1, 0xA1);
     writeBlobBody(*backend, store->layout(), DB::UInt128(1));
@@ -160,7 +160,7 @@ TEST(CasFsck, CondemnedBlobClassifiesPendingGc)
 TEST(CasFsck, DroppedButUnfoldedBlobClassifiesAwaitingGc)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(1, 0xA1);
     writeBlobBody(*backend, store->layout(), DB::UInt128(1));
@@ -181,7 +181,7 @@ TEST(CasFsck, DroppedButUnfoldedBlobClassifiesAwaitingGc)
 TEST(CasFsck, GcNeverRanClassifiesAwaitingGc)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     writeBlobBody(*backend, store->layout(), DB::UInt128(5));   /// present, never referenced, no gc/state
 
     const FsckReport rep = runFsck(*store, /*detail*/true);
@@ -195,7 +195,7 @@ TEST(CasFsck, GcNeverRanClassifiesAwaitingGc)
 TEST(CasFsck, ForeignBlobClassifiesUnaccounted)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(1, 0xA1);
     writeBlobBody(*backend, store->layout(), DB::UInt128(1));
@@ -218,7 +218,7 @@ TEST(CasFsck, ForeignBlobClassifiesUnaccounted)
 TEST(CasFsck, MetaWithoutBodyIsFlagged)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const DB::UInt128 h = u128Of("meta-without-body");
     writeMetaClean(*backend, store->layout(), h, /*size*/ 10);   /// meta only, no body written
 
@@ -237,7 +237,7 @@ TEST(CasFsck, MetaWithoutBodyIsFlagged)
 TEST(CasFsck, BodyWithoutMetaIsBenign)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const DB::UInt128 h = u128Of("body-without-meta");
     writeBlobBody(*backend, store->layout(), h);   /// body only, no meta written
 
@@ -253,7 +253,7 @@ TEST(CasFsck, BodyWithoutMetaIsBenign)
 TEST(CasFsckSnapshotOracle, PublishedSnapshotMatchingReplayIsClean)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(1, 0xAA);
     writeBlobBody(*backend, store->layout(), DB::UInt128(1));
@@ -276,7 +276,7 @@ TEST(CasFsckSnapshotOracle, PublishedSnapshotMatchingReplayIsClean)
 TEST(CasFsckSnapshotOracle, ForgedSnapshotDivergingFromReplayIsError)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(1, 0xAA);
     writeBlobBody(*backend, store->layout(), DB::UInt128(1));
@@ -307,7 +307,7 @@ TEST(CasFsckSnapshotOracle, ForgedSnapshotDivergingFromReplayIsError)
 TEST(CasFsckSnapshotOracle, CleanedLogsSkipOracleWithoutFalsePositive)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(1, 0xAA);
     writeBlobBody(*backend, store->layout(), DB::UInt128(1));
@@ -334,7 +334,7 @@ TEST(CasFsckSnapshotOracle, CleanedLogsSkipOracleWithoutFalsePositive)
 TEST(CasFsckPartial, DeadlineReturnsAccumulatedCountsInsteadOfThrowing)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(1, 0xAA);
     writeBlobBody(*backend, store->layout(), DB::UInt128(1));
@@ -355,7 +355,7 @@ TEST(CasFsckPartial, DeadlineReturnsAccumulatedCountsInsteadOfThrowing)
 TEST(CasFsckScoped, NamespacePrefixChecksOnlyMatchingRefsDanglingOnly)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
 
     const RootNamespace ns_a{"nsa"};
     const ManifestRef r_a = ref(1, 0xA1);
@@ -386,7 +386,7 @@ TEST(CasFsckScoped, NamespacePrefixChecksOnlyMatchingRefsDanglingOnly)
 TEST(CasFsck, PhantomDanglingFromRepublishedRefIsReresolvedAway)
 {
     auto backend = std::make_shared<RepublishOnListBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r1 = ref(1, 0xA1);
     const ManifestRef r2 = ref(2, 0xA2);
@@ -421,7 +421,7 @@ TEST(CasFsck, PhantomDanglingFromRepublishedRefIsReresolvedAway)
 TEST(CasFsck, PhantomDanglingFromDroppedRefIsReresolvedAway)
 {
     auto backend = std::make_shared<RepublishOnListBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r1 = ref(1, 0xA1);
     const DB::UInt128 h1 = u128Of("b207-phantom-dropped");
@@ -451,7 +451,7 @@ TEST(CasFsck, PhantomDanglingFromDroppedRefIsReresolvedAway)
 TEST(CasFsck, RealDanglingStillCaughtAfterReresolve)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(1, 0xA1);
     const DB::UInt128 h = u128Of("b207-real-dangle");

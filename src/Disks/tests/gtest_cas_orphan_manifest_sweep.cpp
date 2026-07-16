@@ -25,7 +25,7 @@ ManifestRef ref(uint64_t seq, uint64_t inst)
 TEST(CasOrphanManifestSweep, EligibleAndUnownedIsDeleted)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     registerNamespaceRaw(*backend, store->layout(), ns);
     const ManifestRef r = ref(5, 0xAB);
@@ -40,7 +40,7 @@ TEST(CasOrphanManifestSweep, EligibleAndUnownedIsDeleted)
 TEST(CasOrphanManifestSweep, OwnedBodyIsSkipped)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(5, 0xAB);
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
@@ -61,7 +61,7 @@ TEST(CasOrphanManifestSweep, OwnedBodyIsSkipped)
 TEST(CasOrphanManifestSweep, PendingCommittedRemovalBodyIsSkipped)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(5, 0xAB);
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
@@ -79,7 +79,7 @@ TEST(CasOrphanManifestSweep, PendingCommittedRemovalBodyIsSkipped)
 TEST(CasOrphanManifestSweep, EmitsNoBlobDeltas)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(5, 0xAB);
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
@@ -95,7 +95,7 @@ TEST(CasOrphanManifestSweep, EmitsNoBlobDeltas)
 TEST(CasOrphanManifestSweep, CursorPageAdvancesAndWrapsWithListBudget)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     registerNamespaceRaw(*backend, store->layout(), ns);
     const ManifestRef r1 = ref(5, 0xE1);
@@ -119,7 +119,7 @@ TEST(CasOrphanManifestSweep, CursorPageAdvancesAndWrapsWithListBudget)
 TEST(CasOrphanManifestSweep, NoWatermarkIsNotAuthority)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(5, 0xAB);
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
@@ -131,7 +131,7 @@ TEST(CasOrphanManifestSweep, NoWatermarkIsNotAuthority)
 TEST(CasOrphanManifestSweep, CursorPageDeletesEligibleUnownedBody)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     registerNamespaceRaw(*backend, store->layout(), ns);
     const ManifestRef r = ref(5, 0xAC);
@@ -147,7 +147,7 @@ TEST(CasOrphanManifestSweep, CursorPageDeletesEligibleUnownedBody)
 TEST(CasOrphanManifestSweep, CursorPageRespectsDeleteBudget)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     registerNamespaceRaw(*backend, store->layout(), ns);
     const ManifestRef r1 = ref(5, 0xAD);
@@ -166,7 +166,7 @@ TEST(CasOrphanManifestSweep, CursorPageRespectsDeleteBudget)
 TEST(CasOrphanManifestSweep, CursorPageSkipsOwnedBody)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(5, 0xAF);
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
@@ -189,7 +189,7 @@ TEST(CasSweepLateLog, LogBetweenSealedFromAndSealIdIsReportedNotRevived)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     const RootNamespace ns{"00/aa@cas@"};
-    const Layout layout("p");   // matches openStoreForTest's PoolConfig.pool_prefix
+    const Layout layout("p");   // matches openPoolForTest's PoolConfig.pool_prefix
     registerNamespaceRaw(*backend, layout, ns);
 
     /// A recovery seal: snapshot_id = {2, UINT64_MAX} (the epoch-closing upper bound recovery for
@@ -224,8 +224,8 @@ TEST(CasSweepLateLog, LogBetweenSealedFromAndSealIdIsReportedNotRevived)
     backend->putIfAbsent(layout.gcStateKey(), encodeGcState(gc_state));
 
     /// A delegating backend that counts GETs on the late log's exact key -- the
-    /// GetCountingBackend/INV-1 pattern from gtest_cas_build.cpp:602-660
-    /// (CasBuild.PutBlobCondemnedDedupNeverGetsTheDyingObject).
+    /// GetCountingBackend/INV-1 pattern from gtest_cas_part_write.cpp:602-660
+    /// (CasPartWriteTxn.PutBlobCondemnedDedupNeverGetsTheDyingObject).
     struct GetCountingBackend final : public Backend
     {
         explicit GetCountingBackend(BackendPtr inner_, String watched_key_)
@@ -295,7 +295,7 @@ TEST(CasSweepLateLog, SecondPassSuppressedWithDedupLatchButNotWithoutOne)
     writeRefLogTxnRaw(*backend, layout, RefLogTxn{ns.string(), late_log_id, {}});
     setWatermarkMinActive(*backend, layout, kServerRoot, kWriterEpoch, /*min_active*/6);
 
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     std::vector<CasEvent> events;
     store->setEventSink([&](const CasEvent & e) { events.push_back(e); });
 

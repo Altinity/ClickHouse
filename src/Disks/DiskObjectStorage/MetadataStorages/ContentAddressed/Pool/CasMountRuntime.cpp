@@ -1,5 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasMountRuntime.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBuild.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
 #include <Common/thread_local_rng.h>
@@ -126,7 +126,7 @@ uint64_t CasMountRuntime::allocateBuildSeq()
     return s;
 }
 
-void CasMountRuntime::registerInflightBuild(uint64_t seq, const BuildPtr & build)
+void CasMountRuntime::registerInflightBuild(uint64_t seq, const PartWriteTxnPtr & build)
 {
     /// Register for `dropNamespace`'s post-durable build cancellation (spec §Namespace Removal). weak_ptr:
     /// the wiring owns the returned shared_ptr; `retireBuildSeq` (publish/abandon/dtor) removes the entry.
@@ -147,7 +147,7 @@ void CasMountRuntime::cancelInflightBuildsForNamespace(const RootNamespace & ns)
     /// (`cancelForNamespaceRemoval` only stores an atomic). Relocated verbatim from `dropNamespace`'s
     /// tail; invoked by `ref_ledger` through the `cancel_inflight_builds` callback once its removal
     /// transaction is durable (spec §Namespace Removal: "cancels local builds").
-    std::vector<BuildPtr> builds_to_check;
+    std::vector<PartWriteTxnPtr> builds_to_check;
     {
         std::lock_guard lk(builds_mutex);
         for (const auto & entry : inflight_builds)

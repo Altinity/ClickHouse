@@ -1,4 +1,4 @@
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBuild.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobMeta.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
@@ -78,7 +78,7 @@ uint64_t nowMs()
 /// 2026-07-03 soak, a false `CORRUPTED_DATA` re-bricked the attach path copy-forward exists to fix).
 ///
 /// Phase 3 T2 (mixed-algo pools): returns the full `BlobRef` pair, at `algo`'s own width (via
-/// `codecFor`, `CasBlobRef.h`) — never a bare digest. Exported (declared in `CasBuild.h`) so the
+/// `codecFor`, `CasBlobRef.h`) — never a bare digest. Exported (declared in `CasPartWriteTxn.h`) so the
 /// wiring's inline-candidate hashing (`ContentAddressedTransaction.cpp`) can mint the SAME way the
 /// streaming blob path does, rather than reimplementing the hex round-trip inline.
 BlobRef poolContentHash(BlobHashAlgo algo, std::string_view payload)
@@ -94,8 +94,8 @@ BlobSource BlobSource::fromString(String bytes)
     return source;
 }
 
-Build::Build(PoolPtr store_, UInt128 build_id_,
-             uint64_t build_seq_, uint64_t epoch_, BuildInfo info_)
+PartWriteTxn::PartWriteTxn(PoolPtr store_, UInt128 build_id_,
+             uint64_t build_seq_, uint64_t epoch_, PartWriteInfo info_)
     : store(std::move(store_))
     , build_id(build_id_)
     , build_seq(build_seq_)
@@ -110,40 +110,40 @@ Build::Build(PoolPtr store_, UInt128 build_id_,
         e.ref_name = info.intended_ref.value_or("");
         e.token = u128ToHex(build_id);
         e.outcome = "started";
-        e.reason = "startBuild: build in-flight";
+        e.reason = "beginPartWrite: build in-flight";
         e.detail = {{"build_seq", std::to_string(build_seq)}, {"epoch", std::to_string(epoch)}};
     });
 }
 
-Build::~Build()
+PartWriteTxn::~PartWriteTxn()
 {
-    /// Crash semantics: the Build dtor retires the build_seq so the GC watermark floor (minActive) can
+    /// Crash semantics: the PartWriteTxn dtor retires the build_seq so the GC watermark floor (minActive) can
     /// advance even if neither publish nor abandon ran (idempotent — safe if already retired).
     store->retireBuildSeq(build_seq);
 }
 
-void Build::requireAlive() const
+void PartWriteTxn::requireAlive() const
 {
     if (!alive)
-        throw Exception(ErrorCodes::LOGICAL_ERROR, "Build has been abandoned; no further operations allowed");
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "PartWriteTxn has been abandoned; no further operations allowed");
     /// spec §Namespace Removal: `dropNamespace` cancels in-flight builds once its removal transaction is
     /// durable. A cancelled build must not promote/precommit a fresh owner into the just-removed namespace
     /// (nor stage more debris there), so every further op fails closed here -- fast, before any backend
     /// work, with a clear diagnostic (the append lane would reject a promote/precommit anyway).
     if (cancelled.load(std::memory_order_acquire))
         throw Exception(ErrorCodes::ABORTED,
-            "Build cancelled: its owning namespace was removed (dropNamespace) while this build was "
+            "PartWriteTxn cancelled: its owning namespace was removed (dropNamespace) while this build was "
             "in flight; restart the build only after the namespace is recreated");
     /// Self-remount (fence-out recovery) supersedes the mount incarnation this build was minted
     /// under; its write fence already interrupted the build mid-flight, so every further step fails
     /// closed and the caller restarts the build under the live epoch.
     if (const uint64_t live = store->liveWriterEpoch(); epoch != live)
         throw Exception(ErrorCodes::ABORTED,
-            "Build (writer_epoch {}) belongs to a superseded mount incarnation (live epoch {}) — "
+            "PartWriteTxn (writer_epoch {}) belongs to a superseded mount incarnation (live epoch {}) — "
             "the mount was fenced out and self-remounted; restart the build", epoch, live);
 }
 
-PutBlobResult Build::putBlob(const BlobRef & ref, BlobSource source)
+PutBlobResult PartWriteTxn::putBlob(const BlobRef & ref, BlobSource source)
 {
     requireAlive();
 
@@ -228,7 +228,7 @@ PutBlobResult Build::putBlob(const BlobRef & ref, BlobSource source)
     throw Exception(ErrorCodes::LOGICAL_ERROR, "putBlob: exhausted retries for {}", key);
 }
 
-bool Build::isTrustedAdopt(const BlobRef & ref) const
+bool PartWriteTxn::isTrustedAdopt(const BlobRef & ref) const
 {
     /// §4: a leaf trusted at promote iff this build holds a TOKENLESS dep recorded by adoptEvidence
     /// (a committed-source W-EVIDENCE adopt: the source pins it, in-degree >= 1, not condemnable). A
@@ -238,7 +238,7 @@ bool Build::isTrustedAdopt(const BlobRef & ref) const
     return it != deps.end() && !it->second.token.has_value() && it->second.adopted;
 }
 
-bool Build::depIsTokened(const BlobRef & ref) const
+bool PartWriteTxn::depIsTokened(const BlobRef & ref) const
 {
     /// Discriminator for B156b: a putBlob'd blob records a TOKENED dep (recreatable by retrying), an
     /// adoptFromTree carry-forward records a TOKENLESS W-EVIDENCE dep (not recreatable — pinned by a
@@ -248,7 +248,7 @@ bool Build::depIsTokened(const BlobRef & ref) const
     return it != deps.end() && it->second.token.has_value();
 }
 
-uint64_t Build::observeAndAdmit(ObjectKind kind, const BlobRef & ref, const String & key)
+uint64_t PartWriteTxn::observeAndAdmit(ObjectKind kind, const BlobRef & ref, const String & key)
 {
     /// EDGE-BEFORE-OBSERVE (spec 2026-07-09-cas-writer-gc-simplification): the durable-precommit guard
     /// lives in the 4-arg overload below, scoped to its ADOPT branch only — NOT here. A HEAD result
@@ -268,12 +268,12 @@ uint64_t Build::observeAndAdmit(ObjectKind kind, const BlobRef & ref, const Stri
         ///      The gate catches FILE_DOESNT_EXIST here and re-throws it as ABORTED (see
         ///      gateObserveAndAdmit below) so the INSERT layer sees the uniform retryable error.
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
-            "Build::observeAndAdmit: object {} vanished (GC-deleted) before observe; "
+            "PartWriteTxn::observeAndAdmit: object {} vanished (GC-deleted) before observe; "
             "caller must re-upload/re-materialize from source", key);
     return observeAndAdmit(kind, ref, key, hr);
 }
 
-uint64_t Build::observeAndAdmit(ObjectKind kind, const BlobRef & ref, const String & key, const HeadResult & hr)
+uint64_t PartWriteTxn::observeAndAdmit(ObjectKind kind, const BlobRef & ref, const String & key, const HeadResult & hr)
 {
     /// `hr.exists` is guaranteed by the caller (the 3-arg wrapper checked it; the putBlob HEAD-first
     /// path only calls this on a present HEAD). Avoids a redundant second HEAD on the dedup-hit path.
@@ -283,7 +283,7 @@ uint64_t Build::observeAndAdmit(ObjectKind kind, const BlobRef & ref, const Stri
     const uint64_t header_len = store->poolMeta().blob_header_len;
     if (hr.size < header_len)
         throw Exception(ErrorCodes::CORRUPTED_DATA,
-            "Build: {} object {} size {} is below the pool blob header length {}",
+            "PartWriteTxn: {} object {} size {} is below the pool blob header length {}",
             kind == ObjectKind::Blob ? "blob" : "manifest", key, hr.size, header_len);
     const uint64_t logical_size = hr.size - header_len;
 
@@ -315,7 +315,7 @@ uint64_t Build::observeAndAdmit(ObjectKind kind, const BlobRef & ref, const Stri
             e.reason = "observed token is condemned (meta point-read); caller must re-upload from source (INV-1)";
         });
         throw Exception(ErrorCodes::ABORTED,
-            "Build::observeAndAdmit: condemned token for {} — caller must re-upload from source bytes (INV-1)",
+            "PartWriteTxn::observeAndAdmit: condemned token for {} — caller must re-upload from source bytes (INV-1)",
             key);
     }
 
@@ -330,7 +330,7 @@ uint64_t Build::observeAndAdmit(ObjectKind kind, const BlobRef & ref, const Stri
     /// signal).
     if (!precommitted)
         throw Exception(ErrorCodes::LOGICAL_ERROR,
-            "Build::observeAndAdmit: EDGE-BEFORE-OBSERVE invariant violated — adopting an existing "
+            "PartWriteTxn::observeAndAdmit: EDGE-BEFORE-OBSERVE invariant violated — adopting an existing "
             "incarnation before this build's precommit is durable would admit {} ({}) under the original "
             "writer's build_id with no newborn-debris watermark protection",
             key, kind == ObjectKind::Blob ? "blob" : "manifest");
@@ -364,7 +364,7 @@ uint64_t Build::observeAndAdmit(ObjectKind kind, const BlobRef & ref, const Stri
     return logical_size;
 }
 
-void Build::uploadFromSource(ObjectKind kind, const BlobRef & ref, const String & key, const BlobSource & source)
+void PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef & ref, const String & key, const BlobSource & source)
 {
     /// INV-1 (revival-from-source): re-upload a condemned or absent object from the writer's OWN
     /// re-readable source — NEVER calls backend().get to read the dying object. W-FRESH-TAG: fresh
@@ -493,7 +493,7 @@ void Build::uploadFromSource(ObjectKind kind, const BlobRef & ref, const String 
     /// propagates every deterministic local failure — LOGICAL_ERROR, NOT_IMPLEMENTED (the promoteStaged
     /// mode guard), BAD_ARGUMENTS (escaping buildHeader's second encode), CORRUPTED_DATA — from the
     /// attempt unchanged (a caller/config bug reissue would only replay — pinned by
-    /// `CasBuild.PutBlobWrongSizeFailsClosed` and the controller-level
+    /// `CasPartWriteTxn.PutBlobWrongSizeFailsClosed` and the controller-level
     /// `DeterministicLocalFailuresPropagateInstantly`).
     auto streamIfAbsent = [&]() -> PutResult
     {
@@ -667,7 +667,7 @@ void Build::uploadFromSource(ObjectKind kind, const BlobRef & ref, const String 
     }
 }
 
-void Build::adoptEvidence(const ManifestEntry & entry)
+void PartWriteTxn::adoptEvidence(const ManifestEntry & entry)
 {
     requireAlive();
 
@@ -684,15 +684,15 @@ void Build::adoptEvidence(const ManifestEntry & entry)
     }
 }
 
-void Build::recordPendingBlobDep(const BlobRef & ref, uint64_t size)
+void PartWriteTxn::recordPendingBlobDep(const BlobRef & ref, uint64_t size)
 {
     requireAlive();
     deps[ref] = DepEntry{ObjectKind::Blob, std::nullopt, size};
 }
 
-RootNamespace Build::manifestNamespace() const
+RootNamespace PartWriteTxn::manifestNamespace() const
 {
-    /// The wiring sets the owning namespace EXPLICITLY (BuildInfo::intended_namespace). This is the
+    /// The wiring sets the owning namespace EXPLICITLY (PartWriteInfo::intended_namespace). This is the
     /// authoritative source: a ref can itself contain `/` (the `detached/<part>` fold, B181), so we
     /// must NOT recover the namespace by splitting intended_ref on the last `/` — that would yield a
     /// spurious `<ns>/detached` namespace and the precommit namespace-match check would throw.
@@ -710,7 +710,7 @@ RootNamespace Build::manifestNamespace() const
     return RootNamespace{intended.substr(0, slash)};
 }
 
-ManifestId Build::stageManifest(std::vector<ManifestEntry> entries)
+ManifestId PartWriteTxn::stageManifest(std::vector<ManifestEntry> entries)
 {
     requireAlive();
 
@@ -737,7 +737,7 @@ ManifestId Build::stageManifest(std::vector<ManifestEntry> entries)
             "stageManifest: total inline {} bytes exceeds cap {}", inline_total, kMaxManifestInlineBytesTotal);
 
     /// Mint the identity. `epoch` is the Pool's durable writer_epoch; `build_seq` is monotone inside
-    /// that epoch; `manifest_ordinal` is monotone inside this Build. Together with the owning namespace
+    /// that epoch; `manifest_ordinal` is monotone inside this PartWriteTxn. Together with the owning namespace
     /// this gives NoManifestIdReuse by construction, with no random manifest instance id.
     if (next_manifest_ordinal > kMaxManifestOrdinal)
         throw Exception(ErrorCodes::LIMIT_EXCEEDED,
@@ -811,7 +811,7 @@ ManifestId Build::stageManifest(std::vector<ManifestEntry> entries)
     return id;
 }
 
-void Build::precommitAdd(const RootNamespace & target_ns, const String & final_ref_name, const ManifestId & id)
+void PartWriteTxn::precommitAdd(const RootNamespace & target_ns, const String & final_ref_name, const ManifestId & id)
 {
     requireAlive();
 
@@ -886,7 +886,7 @@ void Build::precommitAdd(const RootNamespace & target_ns, const String & final_r
     });
 }
 
-void Build::promote(const RootNamespace & target_ns, const String & final_ref_name, UInt128 promote_build_id, const ManifestId & id, bool allow_repoint)
+void PartWriteTxn::promote(const RootNamespace & target_ns, const String & final_ref_name, UInt128 promote_build_id, const ManifestId & id, bool allow_repoint)
 {
     requireAlive();
 
@@ -1096,7 +1096,7 @@ void Build::promote(const RootNamespace & target_ns, const String & final_ref_na
     }
 }
 
-void Build::abandon()
+void PartWriteTxn::abandon()
 {
     if (cancelled.load(std::memory_order_acquire))
     {
@@ -1162,7 +1162,7 @@ void Build::abandon()
     }
 
     /// No longer in-flight: retire the seq so the per-server active-build floor (`min_active`) can advance
-    /// (idempotent). This runs AFTER the precommit removal above (mirrors `Build::promote`, which retires
+    /// (idempotent). This runs AFTER the precommit removal above (mirrors `PartWriteTxn::promote`, which retires
     /// after its commit) so the build stays active until its precommit binding's removal is durable:
     /// retiring first would advance `min_active` past a build whose precommit binding is still live in the
     /// ref log, letting a freshness-window consumer judge the manifest build-dead while an un-removed
@@ -1183,7 +1183,7 @@ void Build::abandon()
     });
 }
 
-void Build::cleanupStagedManifestDebrisBestEffort()
+void PartWriteTxn::cleanupStagedManifestDebrisBestEffort()
 {
     /// Best-effort writer cleanup of THIS build's pre-precommit/staged `_manifests` debris (spec
     /// §Pre-Precommit Part-Manifest Debris). The common case is writer cleanup; a missed object is
@@ -1205,12 +1205,12 @@ void Build::cleanupStagedManifestDebrisBestEffort()
     }
 }
 
-void Build::cancelForNamespaceRemoval(const RootNamespace & removed_ns)
+void PartWriteTxn::cancelForNamespaceRemoval(const RootNamespace & removed_ns)
 {
     /// Only cancel a build that actually targets the removed namespace. `manifestNamespace` reads only
     /// the immutable `info` set at construction, so this is safe to call from `dropNamespace`'s thread
     /// while the build's own thread runs. A build whose owning namespace cannot be determined (a
-    /// malformed diagnostic-only BuildInfo) is left alone — the append lane still fails closed on any op
+    /// malformed diagnostic-only PartWriteInfo) is left alone — the append lane still fails closed on any op
     /// it later attempts against the now-Removed namespace.
     std::optional<RootNamespace> mine;
     try

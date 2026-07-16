@@ -1,5 +1,5 @@
 #include <gtest/gtest.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBuild.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEvent.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
@@ -44,7 +44,7 @@ TEST(CasEvent, ConstructAndCopyAndName)
     EXPECT_EQ(toString(CasEventObjectKind::Manifest), "manifest");
 }
 
-TEST(CasEvent, StoreEmitsToSink)
+TEST(CasEvent, PoolEmitsToSink)
 {
     auto b = std::make_shared<InMemoryBackend>();
     std::vector<CasEvent> seen;   /// declared BEFORE the Pool so it outlives the background syncer's emits (ASan 2026-07-09)
@@ -97,9 +97,9 @@ namespace
 String publishOneBlobPart(const PoolPtr & s, const String & ns, const String & ref, const String & payload)
 {
     const RootNamespace nsr{ns};
-    BuildInfo info;
+    PartWriteInfo info;
     info.intended_ref = ns + "/" + ref;
-    auto build = s->startBuild(info);
+    auto build = s->beginPartWrite(info);
     build->putBlob(idOf(payload), BlobSource::fromString(payload));
     ManifestEntry e;
     e.path = "data.bin";

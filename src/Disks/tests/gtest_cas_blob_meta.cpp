@@ -20,7 +20,7 @@ using namespace DB::Cas::tests;
 TEST(CasBlobMeta, PutIfAbsentThenCasTransitions)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const BlobRef ref{BlobHashAlgo::CityHash128, BlobDigest::fromU128(u128Of("hash-a"))};
 
     const CasResult created = putMetaIfAbsent(*backend, store->layout(), ref,
@@ -46,7 +46,7 @@ TEST(CasBlobMeta, PutIfAbsentThenCasTransitions)
 TEST(CasBlobMeta, DeleteMetaExactMatchesEtag)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const BlobRef ref{BlobHashAlgo::CityHash128, BlobDigest::fromU128(u128Of("hash-b"))};
     putMetaIfAbsent(*backend, store->layout(), ref, BlobMeta{.state = MetaState::Condemned});
     const auto lm = loadMeta(*backend, store->layout(), ref);
@@ -57,7 +57,7 @@ TEST(CasBlobMeta, DeleteMetaExactMatchesEtag)
 
 /// Phase 3 T3 (mixed-algo pools, was CAS pluggable-blob-hash Phase 2 Task 5 crux Test 2): the `.meta`
 /// API round-trips a 32-byte (`sha256`-width) `BlobRef` key — the meta object lands under a 64-hex
-/// key, exercising the SAME `putMetaIfAbsent`/`loadMeta`/`casMeta`/`deleteMetaExact` surface Build/Gc
+/// key, exercising the SAME `putMetaIfAbsent`/`loadMeta`/`casMeta`/`deleteMetaExact` surface PartWriteTxn/Gc
 /// use, just at a wider algo. No `Pool`/pool-config bypass is needed here: these ops take only a
 /// `Backend`/`Layout`/`BlobRef` and derive their own codec internally.
 TEST(CasBlobMeta, PutLoadCasDeleteRoundTripAtWidth32)

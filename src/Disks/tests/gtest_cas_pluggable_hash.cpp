@@ -14,16 +14,16 @@
 ///
 /// P1-T3a (this file, extended): the pool's `blob_hash_algo` is threaded into the three hash sites
 /// (spec §5/§6) -- `ContentAddressed::CaContentWriteBuffer` (streaming blob-body hash),
-/// `Build`'s envelope `hash_algo` field, and (transitively, via `Cas::blobHashHexOneShot`) the
+/// `PartWriteTxn`'s envelope `hash_algo` field, and (transitively, via `Cas::blobHashHexOneShot`) the
 /// `poolContentHash` content-key mint on the write path. `poolContentHash` itself is a static
-/// helper in `CasBuild.cpp` and not directly reachable from a gtest; its production callers already
+/// helper in `CasPartWriteTxn.cpp` and not directly reachable from a gtest; its production callers already
 /// exercise the default `CityHash128` path, and it delegates to the SAME `Cas::blobHashHexOneShot`
 /// this file tests directly below.
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasBlobHasher.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBuild.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasCodecUtil.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFormat.h>
@@ -250,9 +250,9 @@ TEST(CasPluggableHash, Xxh3BlobLandsUnderAlgoSegmentAndIsDiscoveredCleanByFsck)
     const std::string payload = makeMultiBlockPayload();
     const BlobRef id{BlobHashAlgo::XXH3_128, codecFor(BlobHashAlgo::XXH3_128).fromHex(blobHashHexOneShot(BlobHashAlgo::XXH3_128, payload))};
 
-    BuildInfo info;
+    PartWriteInfo info;
     info.intended_ref = ns.string() + "/rb";
-    auto build = store->startBuild(info);
+    auto build = store->beginPartWrite(info);
     build->putBlob(id, BlobSource::fromString(payload));
 
     /// The blob body landed under the algo-segmented path -- readable there, not at the legacy
@@ -302,7 +302,7 @@ TEST(CasPluggableHash, Xxh3BlobLandsUnderAlgoSegmentAndIsDiscoveredCleanByFsck)
 /// This test constructs a `sha256`-algo pool DIRECTLY via `PoolConfig` (this bypasses only the
 /// disk-config *factory* guard in `MetadataStorageFactory.cpp`, which Task 6 removes — `Pool::open`
 /// itself has never gated on algo) and writes an unreferenced blob body straight at its 64-hex
-/// content-addressed key (bypassing `Build::putBlob`, whose OWN internal `logical_hash` stays a
+/// content-addressed key (bypassing `PartWriteTxn::putBlob`, whose OWN internal `logical_hash` stays a
 /// fixed 128-bit representation until a later task — see the Task 5 report). It then drives BOTH
 /// crux sites and asserts the blob is CLASSIFIED, not silently skipped as foreign.
 ///
@@ -389,12 +389,12 @@ TEST(CasPluggableHash, Sha256BlobSeenByCondemnSweepAndFsckNotSilentlySkipped)
 /// CAS pluggable-blob-hash Phase 2 Task 6 -- end-to-end sha256 WRITE path (in-memory; the real
 /// wiring-level integration + soak is Task 7).
 ///
-/// Before this task, `Build`'s OWN write-path internals stayed a fixed 128-bit representation
-/// downstream of the mint (`poolContentHash`/`Build::putBlob`'s `logical_hash`, the `deps` map key, the
+/// Before this task, `PartWriteTxn`'s OWN write-path internals stayed a fixed 128-bit representation
+/// downstream of the mint (`poolContentHash`/`PartWriteTxn::putBlob`'s `logical_hash`, the `deps` map key, the
 /// event-log `object_hash` render, and `objectKey`) -- safe only because the disk-config factory guard
-/// (`MetadataStorageFactory.cpp`) blocked any real sha256 pool from reaching `Build` at all (see the
+/// (`MetadataStorageFactory.cpp`) blocked any real sha256 pool from reaching `PartWriteTxn` at all (see the
 /// Task 5 report and the "Task 6+" comments this task removes). Task 6 finishes those sites AND lifts
-/// the guard in the SAME commit. This test drives a REAL `Build` (`putBlob` -> `stageManifest` ->
+/// the guard in the SAME commit. This test drives a REAL `PartWriteTxn` (`putBlob` -> `stageManifest` ->
 /// `precommitAdd` -> `promote`) on a `Sha256` pool and asserts:
 ///   1. the blob lands under `blobs/sha256/<64-hex>` and the manifest entry's `blob_hash`, read back via
 ///      `decodePartManifest`, is the FULL 32-byte digest (bytes beyond 16 are non-zero for a real sha256
@@ -420,14 +420,14 @@ TEST(CasPluggableHash, Sha256BuildWritesFullWidthDigestAndInlineEqualsBlob)
     ASSERT_EQ(hex.size(), 64u) << "sha256 renders 64 lowercase hex chars";
     const BlobRef id{BlobHashAlgo::Sha256, codec.fromHex(hex)};
 
-    BuildInfo info;
+    PartWriteInfo info;
     info.intended_ref = ns.string() + "/part1";
-    auto build = store->startBuild(info);
+    auto build = store->beginPartWrite(info);
     const PutBlobResult ref = build->putBlob(id, BlobSource::fromString(payload));
     EXPECT_EQ(ref.size, payload.size());
 
     /// THE CRUX (blob side): the blob body lands under the sha256-segmented path, addressed by the
-    /// FULL 64-hex key -- `Build::putBlob`'s internal `logical_hash` must not have silently narrowed it
+    /// FULL 64-hex key -- `PartWriteTxn::putBlob`'s internal `logical_hash` must not have silently narrowed it
     /// to a 32-hex (128-bit) key before this task.
     const String blob_key = store->layout().blobKey(id);
     EXPECT_NE(blob_key.find("/blobs/sha256/"), String::npos) << blob_key;
@@ -510,7 +510,7 @@ TEST(CasPluggableHash, StaleAlgoRegistryRefreshOnMiss)
     ASSERT_FALSE(store_b->isAlgoAdmitted(BlobHashAlgo::Sha256));
 
     /// Node A opens SECOND, admits sha256 via the opt-in flag, and publishes a manifest naming a
-    /// sha256 blob through the real Build path (putBlob -> stageManifest -> precommitAdd -> promote).
+    /// sha256 blob through the real PartWriteTxn path (putBlob -> stageManifest -> precommitAdd -> promote).
     auto store_a = Pool::open(backend,
         PoolConfig{.pool_prefix = "p", .server_root_id = "a",
                    .blob_hash_algo = BlobHashAlgo::Sha256, .blob_hash_allow_new = true});
@@ -520,9 +520,9 @@ TEST(CasPluggableHash, StaleAlgoRegistryRefreshOnMiss)
     const std::string payload = makeMultiBlockPayload();
     const BlobRef id{BlobHashAlgo::Sha256, codecFor(BlobHashAlgo::Sha256).fromHex(blobHashHexOneShot(BlobHashAlgo::Sha256, payload))};
 
-    BuildInfo info;
+    PartWriteInfo info;
     info.intended_ref = ns.string() + "/part1";
-    auto build = store_a->startBuild(info);
+    auto build = store_a->beginPartWrite(info);
     build->putBlob(id, BlobSource::fromString(payload));
 
     ManifestEntry e;
@@ -823,9 +823,9 @@ TEST(CasPluggableHash, SameDigestDifferentAlgoDistinctBodiesAndSettlement)
 
     const RootNamespace ns{"srv1/tbl"};
 
-    BuildInfo info_a;
+    PartWriteInfo info_a;
     info_a.intended_ref = ns.string() + "/part_a";
-    auto build_a = store->startBuild(info_a);
+    auto build_a = store->beginPartWrite(info_a);
     build_a->putBlob(ref_ch, BlobSource::fromString(body_ch));
     ManifestEntry e_a;
     e_a.path = "a.bin"; e_a.placement = EntryPlacement::Blob; e_a.ref = ref_ch; e_a.blob_size = body_ch.size();
@@ -833,9 +833,9 @@ TEST(CasPluggableHash, SameDigestDifferentAlgoDistinctBodiesAndSettlement)
     build_a->precommitAdd(ns, "part_a", mid_a);
     build_a->promote(ns, "part_a", build_a->buildId(), mid_a);
 
-    BuildInfo info_b;
+    PartWriteInfo info_b;
     info_b.intended_ref = ns.string() + "/part_b";
-    auto build_b = store->startBuild(info_b);
+    auto build_b = store->beginPartWrite(info_b);
     build_b->putBlob(ref_xx, BlobSource::fromString(body_xx));
     ManifestEntry e_b;
     e_b.path = "b.bin"; e_b.placement = EntryPlacement::Blob; e_b.ref = ref_xx; e_b.blob_size = body_xx.size();

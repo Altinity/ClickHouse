@@ -238,11 +238,11 @@ struct PoolConfig
 };
 
 
-struct BuildInfo
+struct PartWriteInfo
 {
     std::optional<String> intended_ref;       /// "ns/ref" forensics for the envelope (diagnostic)
     /// The owning root namespace, set EXPLICITLY by the wiring. When present it is authoritative for
-    /// the manifest's owning namespace (Build::manifestNamespace), so a ref that itself contains '/'
+    /// the manifest's owning namespace (PartWriteTxn::manifestNamespace), so a ref that itself contains '/'
     /// (the `detached/<part>` fold, B181) is staged in the TABLE namespace — NOT in a spurious
     /// `<ns>/detached` namespace produced by splitting intended_ref on the last '/'. Absent ⇒ fall
     /// back to splitting intended_ref on the last '/' (the diagnostic-only path used by Core tests).
@@ -250,8 +250,8 @@ struct BuildInfo
     ProvenanceOp op = ProvenanceOp::Other;
 };
 
-class Build;
-using BuildPtr = std::shared_ptr<Build>;
+class PartWriteTxn;
+using PartWriteTxnPtr = std::shared_ptr<PartWriteTxn>;
 class Gc;
 class Pool;
 using PoolPtr = std::shared_ptr<Pool>;
@@ -260,8 +260,8 @@ using PoolPtr = std::shared_ptr<Pool>;
 /// failure refuses the pool (design §6). The read side has no GC awareness and no tokens (spec §6).
 class Pool : public std::enable_shared_from_this<Pool>
 {
-    /// Build/Gc reach the ref-log lane only through Pool's PUBLIC surface now (the ref subsystem moved
-    /// to the `ref_ledger` member): Build's staging PUTs go through `stagingPutIfAbsent`/
+    /// PartWriteTxn/Gc reach the ref-log lane only through Pool's PUBLIC surface now (the ref subsystem moved
+    /// to the `ref_ledger` member): PartWriteTxn's staging PUTs go through `stagingPutIfAbsent`/
     /// `stagingConditionalCreate` (which encapsulate the controller call + fence), its ref mutations
     /// through the public `appendRefOps`/`observedNamespaceCleanupMarker` delegates; Gc uses the public
     /// `wedgedRefLaneCount`. No `friend` needed -- both prior friendships were removed in Phase 3.4.
@@ -318,10 +318,10 @@ public:
     static uint64_t bootMs();
 
     /// ---- write side ----
-    BuildPtr startBuild(BuildInfo info);                          /// W-HEARTBEAT durable before return
+    PartWriteTxnPtr beginPartWrite(PartWriteInfo info);                          /// W-HEARTBEAT durable before return
     /// Remove a build_seq from the active set; idempotent (safe from publish/abandon/dtor). Public
-    /// Build-facing surface: a `Build` retires its own seq on finalize/abandon/dtor (previously reached
-    /// via `friend class Build`, removed in source-layout §3.4).
+    /// PartWriteTxn-facing surface: a `PartWriteTxn` retires its own seq on finalize/abandon/dtor (previously reached
+    /// via `friend class PartWriteTxn`, removed in source-layout §3.4).
     void retireBuildSeq(uint64_t seq);
 
     /// ---- read side (spec §6) ----
@@ -372,14 +372,14 @@ public:
     /// ==== writer ref-log append lane (Task 10, spec §Writer Algorithms) ====
     ///
     /// The ONE entry point every ref mutation funnels through -- Pool's own dropRef/updateRefPayload
-    /// above, and (as a friend) Build's precommitAdd/promote/abandon. This is the SOLE ref-persistence
+    /// above, and (as a friend) PartWriteTxn's precommitAdd/promote/abandon. This is the SOLE ref-persistence
     /// lane now: the legacy per-(ns,shard) mutable manifest format was removed once GC/sweep/fsck/inspect
     /// were rewired onto the snapshot+log ref protocol (Task 12).
     ///
     /// `build_ops(state)` is invoked from the per-namespace flush leader with the table's CURRENT cached
     /// state (reflecting every earlier item of the SAME batch already applied) -- exactly the atomicity
     /// the old per-shard closure got from running inside the shard's own CAS loop. It may perform
-    /// arbitrary caller-side I/O (Build's blob revalidation) and throw to reject ONLY this item; a
+    /// arbitrary caller-side I/O (PartWriteTxn's blob revalidation) and throw to reject ONLY this item; a
     /// LOGICAL_ERROR/ABORTED/etc it throws propagates to the item's own caller without touching any
     /// other queued item. It returns the ops this call contributes to the batch's one transaction.
     /// `scope` reuses `MutationScope` (Ref(name) may co-batch; WholeShard runs solo -- used here for
@@ -408,7 +408,7 @@ public:
     /// Task 11 (spec §Namespace Birth): whether namespace `ns`'s recovery observed the exact
     /// `_cleanup/<remove_txn_id>` completion marker for `remove_txn_id` -- the SOLE gate on recreating
     /// a `Removed` namespace (an empty physical prefix is never sufficient). Recovers the table
-    /// (idempotent) if not already cached. Used by `Build::precommitAdd`'s auto-birth guard.
+    /// (idempotent) if not already cached. Used by `PartWriteTxn::precommitAdd`'s auto-birth guard.
     bool observedNamespaceCleanupMarker(const RootNamespace & ns, const RefTxnId & remove_txn_id);
 
     /// rev.6 Task 10 (spec §publish-from-live): the synchronous core of one publish attempt -- copies
@@ -444,7 +444,7 @@ public:
     bool mountpointObjectExists(const String & key);
     void removeMountpointObject(const String & key);
 
-    /// Internal surface for Build (same TU family; not for the wiring):
+    /// Internal surface for PartWriteTxn (same TU family; not for the wiring):
     const PoolConfig & poolConfig() const { return config; }
     const PoolMeta & poolMeta() const { return meta; }
     const Layout & layout() const { return pool_layout; }
@@ -455,9 +455,9 @@ public:
     /// bare `Backend &` from `backend()` would dangle the instant the owning `Pool` is destroyed.
     BackendPtr poolBackendPtr() const { return pool_backend; }
 
-    /// Staging PUT surface for `Build` (source-layout §3.4): both wrap the ref-ledger's retry controller
-    /// AND the ref-lane fence predicate, so `Build` reaches neither directly (the `friend` is gone).
-    /// Behavior-identical to the previously-inlined controller+fence at CasBuild.cpp stageManifest /
+    /// Staging PUT surface for `PartWriteTxn` (source-layout §3.4): both wrap the ref-ledger's retry controller
+    /// AND the ref-lane fence predicate, so `PartWriteTxn` reaches neither directly (the `friend` is gone).
+    /// Behavior-identical to the previously-inlined controller+fence at CasPartWriteTxn.cpp stageManifest /
     /// uploadFromSource; thin delegates to `ref_ledger`.
     CasWriteOutcome stagingPutIfAbsent(std::string_view key, std::string_view bytes, Token * out_token = nullptr);
     CasCreateResult stagingConditionalCreate(std::string_view key, const std::function<PutResult()> & attempt);
@@ -484,7 +484,7 @@ public:
     std::vector<uint8_t> refreshAdmittedAlgos();
 
     /// The writer_epoch of the LIVE mount incarnation. Bumped by `tryRemountOnce` (self-remount
-    /// after a GC fence-out) — a `Build` minted under an older epoch fails closed on its next step.
+    /// after a GC fence-out) — a `PartWriteTxn` minted under an older epoch fails closed on its next step.
     uint64_t liveWriterEpoch() const { return mount_runtime.liveWriterEpoch(); }
 
     /// Self-remount after a GC fence-out (liveness counterpart of the fence-out safety rule): the
@@ -552,7 +552,7 @@ public:
 
     /// ---- B170 event audit (system.content_addressed_log) ----
     /// The wiring injects a sink (CasEvent -> SystemLog row) when the log is configured; null sink
-    /// (unit tests, log disabled) makes emitEvent a no-op single branch. Build/Gc reach this via
+    /// (unit tests, log disabled) makes emitEvent a no-op single branch. PartWriteTxn/Gc reach this via
     /// their owning Pool. `reason`/`detail` on the event carry the decision's full rationale.
     void setEventSink(CasEventSink sink) { event_sink_ = std::move(sink); }
     /// Rvalue-only: forces every call site to `std::move` its (dead-after) `CasEvent` local, so a

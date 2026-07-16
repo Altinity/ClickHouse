@@ -37,7 +37,7 @@ TEST(CasGcRoundDefer, PredicateTruthTable)
 TEST(CasGcRoundDefer, GraduationDueDetectsDuePendingAndRoundCrossing)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const Layout & layout = store->layout();
 
     /// Adopt a seal whose shard-0 summary holds one condemned-but-not-yet-graduated entry (round 2).
@@ -69,7 +69,7 @@ TEST(CasGcRoundDefer, GraduationDueDetectsDuePendingAndRoundCrossing)
 TEST(CasGcRoundDefer, GraduationDueFailsClosedWhenSealMissing)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const Layout & layout = store->layout();
 
     injectCondemnedSummarySeal(*backend, layout, /*generation*/1, /*attempt*/1, /*gc_shards*/1,
@@ -91,7 +91,7 @@ TEST(CasGcRoundDefer, GraduationDueFailsClosedWhenSealMissing)
 TEST(CasGcRoundDefer, GraduationDueFalseOnAllZeroSummary)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const Layout & layout = store->layout();
 
     injectCondemnedSummarySeal(*backend, layout, /*generation*/1, /*attempt*/1, /*gc_shards*/2,
@@ -115,7 +115,7 @@ TEST(CasGcRoundDefer, GraduationDueFalseOnAllZeroSummary)
 TEST(CasGcRoundDefer, ChangedShardCountIsZeroWhenQuiescent)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r1{.writer_epoch = 1, .build_sequence = 1, .manifest_ordinal = 0xAA};
@@ -160,7 +160,7 @@ TEST(CasGcRoundDefer, ChangedShardCountIsZeroWhenQuiescent)
 TEST(CasGcRoundDefer, IdleRoundDefersAndReadsNoGeneration)
 {
     auto backend = std::make_shared<CountingBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r{.writer_epoch = 1, .build_sequence = 1, .manifest_ordinal = 0xAA};
     writeBlobBody(*backend, store->layout(), UInt128(1));
@@ -226,7 +226,7 @@ TEST(CasGcRoundDefer, IdleRoundDefersUnderShardedGc)
 TEST(CasGcRoundDefer, DueGraduationForcesFoldAndSparesReReferencedBlob)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const UInt128 blob(1);
     const ManifestRef r1{.writer_epoch = 1, .build_sequence = 1, .manifest_ordinal = 0xAA};

@@ -88,7 +88,7 @@ CasRefLedger::CasRefLedger(
 
 CasWriteOutcome CasRefLedger::stagingPutIfAbsent(std::string_view key, std::string_view bytes, Token * out_token)
 {
-    /// Behavior-identical to the previously-inlined controller+fence at `CasBuild.cpp` stageManifest:
+    /// Behavior-identical to the previously-inlined controller+fence at `CasPartWriteTxn.cpp` stageManifest:
     /// the ref lane's own mount predicate (`fence_ok_fn` == `Pool::refAppendFenceOk`, no per-table
     /// `superseded_by_remount` term -- there is no ref-table runtime here) gates every attempt.
     return ref_request_controller->putIfAbsentControlled(key, bytes, fence_ok_fn, out_token);
@@ -96,7 +96,7 @@ CasWriteOutcome CasRefLedger::stagingPutIfAbsent(std::string_view key, std::stri
 
 CasCreateResult CasRefLedger::stagingConditionalCreate(std::string_view key, const std::function<PutResult()> & attempt)
 {
-    /// Behavior-identical to the previously-inlined controller+fence at `CasBuild.cpp` uploadFromSource.
+    /// Behavior-identical to the previously-inlined controller+fence at `CasPartWriteTxn.cpp` uploadFromSource.
     return ref_request_controller->conditionalCreateControlled(key, attempt, fence_ok_fn);
 }
 

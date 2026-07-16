@@ -30,10 +30,10 @@ bool partFileMustStayBlob(std::string_view file_name);
 
 }
 
-/// The M-W write-path wiring: accumulates ClickHouse operations and maps them to ONE Cas::Build
+/// The M-W write-path wiring: accumulates ClickHouse operations and maps them to ONE Cas::PartWriteTxn
 /// per written part at commit (design 2026-06-11 section 4; plan D-W2).
 ///
-/// T3 state: writeFile (content blobs through a spill+hash buffer into Build::putBlob; mutable
+/// T3 state: writeFile (content blobs through a spill+hash buffer into PartWriteTxn::putBlob; mutable
 /// per-part bytes staged; verbatim namespace files durable on finalize) + commit (one
 /// putTree+publish per staged part, with the typed `published_at_ms` stamp) + destructor
 /// abandon. Remaining operations land task by task (T5 carry-forward/renames, T6 removals, T7
@@ -97,12 +97,12 @@ protected:
     ContentAddressedMetadataStorage & metadata_storage;
 
 private:
-    /// One part being assembled by this transaction (D-W2: ONE Cas::Build per written part,
+    /// One part being assembled by this transaction (D-W2: ONE Cas::PartWriteTxn per written part,
     /// opened lazily at the FIRST staged write — W-ANCHOR requires the watermark durable
     /// before the first PUT, and buffer finalize uploads immediately).
     struct PartStaging
     {
-        Cas::BuildPtr build;                       /// nullptr until the first content upload
+        Cas::PartWriteTxnPtr build;                       /// nullptr until the first content upload
         std::vector<Cas::ManifestEntry> entries;   /// staged manifest entries (uploads + adoptions)
         std::set<std::string> content_removed;     /// all-tree-part-files Task 8 (B123 evolution, spec
                                                    /// 2026-07-14-cas-all-tree-part-files-design.md §6):
@@ -147,7 +147,7 @@ private:
     /// B188: return a pointer to the pending (staged-but-not-yet-uploaded) blob for `hash`, or nullptr
     /// if not pending (already uploaded or never staged).
     const PartStaging::PendingBlob * findPendingBlob(const PartStaging & st, const Cas::BlobRef & ref) const;
-    Cas::Build & buildFor(const ContentAddressedMetadataStorage::Route & r, PartStaging & st);
+    Cas::PartWriteTxn & buildFor(const ContentAddressedMetadataStorage::Route & r, PartStaging & st);
     std::optional<ContentAddressedMetadataStorage::Route> routeOf(const std::string & path) const;
 
     void cleanupPendingTempFiles() noexcept;   /// B188: remove all parts' pending temp files (commit/abort/dtor)
@@ -171,7 +171,7 @@ private:
     /// `pb == nullptr` (uploaded / committed): dst_build.adoptEvidence(entry) — tokenless W-EVIDENCE,
     /// no pool HEAD/GET before precommit.
     void adoptStagedBlob(const PartStaging::PendingBlob * pb, const Cas::ManifestEntry & entry,
-                         PartStaging & dst_st, Cas::Build & dst_build, bool copy_pending);
+                         PartStaging & dst_st, Cas::PartWriteTxn & dst_build, bool copy_pending);
 
     /// Publish one staged part durably (putTree + publish, or a repoint for a standalone write/remove
     /// on an already-committed part) and mark it `published`. Idempotent: a no-op if already

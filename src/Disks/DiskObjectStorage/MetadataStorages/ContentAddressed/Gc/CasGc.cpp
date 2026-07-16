@@ -88,7 +88,7 @@ uint64_t deletePrefixWholesale(Backend & backend, const String & prefix, uint64_
 /// GC freshness meta is ADD-ONLY: GC may publish `Condemned`, and may REMOVE the meta once the exact body
 /// token is confirmed deleted/absent (`deleteConfirmedMeta`), but it NEVER transitions `Condemned ->
 /// Clean` on a spare. The SOLE `-> Clean` transition is a WRITER that has already displaced the body with
-/// a fresh incarnation token (`Build::uploadFromSource` + `writeResurrectMetaClean`). Rationale: a deposed leader that cleared a
+/// a fresh incarnation token (`PartWriteTxn::uploadFromSource` + `writeResurrectMetaClean`). Rationale: a deposed leader that cleared a
 /// spare's meta then lost its round CAS would leave a durable stray-`Clean` over a still-condemned body;
 /// a writer reading `Clean` would reuse the exact condemned token, which a stale pre-CAS exact-token
 /// redelete then deletes -- live-blob data loss (INV_NO_LOSS). Removing the clear restores the exact-token

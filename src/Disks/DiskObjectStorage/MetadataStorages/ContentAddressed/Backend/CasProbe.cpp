@@ -44,7 +44,7 @@ void runCapabilityProbe(Backend & backend, const String & probe_prefix)
     try
     {
         // ---- Step 0: store-level preconditions (backend-specific; throws = mount refused). ----
-        backend.checkStorePreconditions();
+        backend.checkPoolPreconditions();
 
         // ---- Step 0b: single-attempt conditional-write support (RFC cas-s3-timeout-retry-control;
         // throws = mount refused). Separate from Step 0 so each is independently unit-testable. ----

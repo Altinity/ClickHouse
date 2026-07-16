@@ -101,14 +101,14 @@ TEST(CasProbe, ConcurrentMountsDoNotCollide)
 class PreconditionRefusingBackend : public InMemoryBackend
 {
 public:
-    void checkStorePreconditions() override
+    void checkPoolPreconditions() override
     {
         throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED,
             "test: store precondition violated (e.g. bucket versioning enabled)");
     }
 };
 
-TEST(CasProbe, FailsClosedOnStorePreconditions)
+TEST(CasProbe, FailsClosedOnPoolPreconditions)
 {
     auto b = std::make_shared<PreconditionRefusingBackend>();
     EXPECT_THROW(runCapabilityProbe(*b, "p/.cas_probe"), DB::Exception);
@@ -118,8 +118,8 @@ TEST(CasProbe, FailsClosedOnStorePreconditions)
 
 /// `Pool::open` wraps the pool backend in `InstrumentedBackend` BEFORE calling `runCapabilityProbe`
 /// (see CasPool.cpp), so the hook must actually fire THROUGH the wrapper on the real mount path —
-/// not just on a raw backend, which `FailsClosedOnStorePreconditions` above already covers.
-TEST(CasProbe, StorePreconditionsFireThroughInstrumentedWrapper)
+/// not just on a raw backend, which `FailsClosedOnPoolPreconditions` above already covers.
+TEST(CasProbe, PoolPreconditionsFireThroughInstrumentedWrapper)
 {
     auto inner = std::make_shared<PreconditionRefusingBackend>();
     InstrumentedBackend wrapped(inner);
@@ -156,7 +156,7 @@ TEST(CasProbe, MissingSingleAttemptClientFailsCapabilityProbe)
     EXPECT_TRUE(b->list("p/.cas_probe", "", 10).keys.empty());
 }
 
-/// Mirrors StorePreconditionsFireThroughInstrumentedWrapper: the real mount path wraps the backend in
+/// Mirrors PoolPreconditionsFireThroughInstrumentedWrapper: the real mount path wraps the backend in
 /// InstrumentedBackend BEFORE calling runCapabilityProbe, so this check must fire through it too.
 TEST(CasProbe, MissingSingleAttemptClientFiresThroughInstrumentedWrapper)
 {

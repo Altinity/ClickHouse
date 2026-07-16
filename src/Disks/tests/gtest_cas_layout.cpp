@@ -296,7 +296,7 @@ TEST(CasLayout, ParseRefObjectKeyRejections)
 }
 
 /// C3: blobKey/parseBlobKey are inverses; pins the grammar before relocating the definitions
-/// from CasBuild.cpp to CasLayout.cpp (relocation must not change a single byte of output).
+/// from CasPartWriteTxn.cpp to CasLayout.cpp (relocation must not change a single byte of output).
 TEST(CasLayout, BlobKeyRoundTripsThroughParse)
 {
     DB::Cas::Layout layout("pool0");

@@ -108,10 +108,10 @@ ObjectStorageBackend::ObjectStorageBackend(ObjectStoragePtr object_storage_, Mod
 #endif
 }
 
-/// See Backend::checkStorePreconditions. Only the Native, generation-dialect (GCS) combination has
+/// See Backend::checkPoolPreconditions. Only the Native, generation-dialect (GCS) combination has
 /// anything to check: a token-exact DELETE on a versioned bucket archives a noncurrent generation
 /// instead of reclaiming storage, so GC "reclaim" would silently stop reclaiming.
-void ObjectStorageBackend::checkStorePreconditions()
+void ObjectStorageBackend::checkPoolPreconditions()
 {
     if (mode != Mode::Native || native_token_type != TokenType::Generation)
         return;
@@ -867,7 +867,7 @@ PutResult ObjectStorageBackend::promoteStaged(const String & staging_key, const 
     /// Counted with the same RFC cas-s3-timeout-retry-control attempt/outcome counters as every other
     /// conditional write (finalizeConditionalWriteInstrumented's contract): the copy is a conditional
     /// create attempt too, and it rides `CasRequestController::conditionalCreateControlled` from
-    /// `Build::uploadFromSource` — an uncounted attempt would hide SDK-vs-controller retry accounting.
+    /// `PartWriteTxn::uploadFromSource` — an uncounted attempt would hide SDK-vs-controller retry accounting.
     /// A resolved `!created` is counted Unresolved (the 412 does not prove WHO created the occupant),
     /// mirroring the PUT paths.
     recordConditionalWriteAttemptStarted();

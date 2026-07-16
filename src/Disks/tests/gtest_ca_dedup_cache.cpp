@@ -1,5 +1,5 @@
 #include <gtest/gtest.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBuild.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/tests/cas_test_helpers.h>
@@ -94,14 +94,14 @@ TEST(CaDedupCache, BoundedByBytes)
 
 /// Task 5 (P1): a cache hit takes the HEAD-first path and skips the body PUT entirely.
 /// (Counters are reset right before each measured putBlob — Pool::open's probe/watermark and
-/// startBuild's heartbeat issue their own backend ops that are irrelevant to the trade-off under test.)
+/// beginPartWrite's heartbeat issue their own backend ops that are irrelevant to the trade-off under test.)
 TEST(CaDedupCache, HitTakesHeadFirstNoBodyPut)
 {
     auto counting = std::make_shared<CountingBackend>(std::make_shared<InMemoryBackend>());
     auto s = Pool::open(counting, cfg(64ULL << 20, 1ULL << 20));
 
     /// First writer: small body, cold cache, below the P2 size threshold ⇒ a normal body PUT.
-    auto b1 = s->startBuild({});
+    auto b1 = s->beginPartWrite({});
     counting->stream_puts = 0;
     b1->putBlob(idOf("dup"), BlobSource::fromString("dup"));
     EXPECT_EQ(counting->stream_puts, 1u);
@@ -110,9 +110,9 @@ TEST(CaDedupCache, HitTakesHeadFirstNoBodyPut)
     /// The head-first hit ADOPTS an existing incarnation, so it must run under a durable precommit edge
     /// (EDGE-BEFORE-OBSERVE: stageManifest -> precommitAdd before putBlob). Counters are reset AFTER that
     /// ceremony so only the measured putBlob is counted.
-    BuildInfo info2;
+    PartWriteInfo info2;
     info2.intended_ref = "srv/tbl/ref2";
-    auto b2 = s->startBuild(info2);
+    auto b2 = s->beginPartWrite(info2);
     ManifestEntry e2;
     e2.path = "data.bin";
     e2.placement = EntryPlacement::Blob;
@@ -130,7 +130,7 @@ TEST(CaDedupCache, HitTakesHeadFirstNoBodyPut)
 /// independently of what putBlob does with the answer. First lookup of a fresh hash misses (nothing
 /// cached yet); the identical second writer's lookup hits (the first writer's dedupCacheAdd populated
 /// the entry). putBlob's HEAD-first branch re-checks dedupCacheContains a second time purely to
-/// attribute CasBlobBodyPutAvoided to the cache (CasBuild.cpp), so a genuine hit can bump
+/// attribute CasBlobBodyPutAvoided to the cache (CasPartWriteTxn.cpp), so a genuine hit can bump
 /// CasDedupCacheHits twice for one putBlob call -- hence GE, not EQ, on the hit delta below.
 TEST(CaDedupCache, HitMissCountersIncrement)
 {
@@ -142,7 +142,7 @@ TEST(CaDedupCache, HitMissCountersIncrement)
     const auto hits_before = global_counters[ProfileEvents::CasDedupCacheHits].load();
 
     /// First writer: cold cache, small body below the P2 size threshold -> the lookup misses.
-    auto b1 = s->startBuild({});
+    auto b1 = s->beginPartWrite({});
     b1->putBlob(idOf("dup"), BlobSource::fromString("dup"));
     EXPECT_EQ(global_counters[ProfileEvents::CasDedupCacheMisses].load() - miss_before, 1);
 
@@ -150,9 +150,9 @@ TEST(CaDedupCache, HitMissCountersIncrement)
     /// head-first hit ADOPTS an existing incarnation, so it must run under a durable precommit edge
     /// (EDGE-BEFORE-OBSERVE: stageManifest -> precommitAdd before putBlob), mirroring
     /// HitTakesHeadFirstNoBodyPut above.
-    BuildInfo info2;
+    PartWriteInfo info2;
     info2.intended_ref = "srv/tbl/ref2";
-    auto b2 = s->startBuild(info2);
+    auto b2 = s->beginPartWrite(info2);
     ManifestEntry e2;
     e2.path = "data.bin";
     e2.placement = EntryPlacement::Blob;
@@ -176,7 +176,7 @@ TEST(CaDedupCache, StaleHitFallsThroughToPut)
     /// Poison the cache: claim "stale" is present though nothing was ever uploaded.
     s->dedupCacheAdd(DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(u128Of("stale"))});
 
-    auto b = s->startBuild({});
+    auto b = s->beginPartWrite({});
     counting->heads = 0;
     counting->stream_puts = 0;
     auto ref = b->putBlob(idOf("stale"), BlobSource::fromString("stale"));
@@ -194,7 +194,7 @@ TEST(CaDedupCache, LargeBlobMissTakesHeadFirst)
     auto counting = std::make_shared<CountingBackend>(std::make_shared<InMemoryBackend>());
     auto s = Pool::open(counting, cfg(64ULL << 20, /*head_first_min_bytes*/ 1));
 
-    auto b = s->startBuild({});
+    auto b = s->beginPartWrite({});
     counting->heads = 0;
     counting->stream_puts = 0;
     b->putBlob(idOf("big"), BlobSource::fromString("big"));

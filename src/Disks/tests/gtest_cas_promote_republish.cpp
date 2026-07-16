@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 #include <filesystem>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBuild.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPartManifestFormat.h>
@@ -10,7 +10,7 @@
 #include <Common/Exception.h>
 
 /// RED/characterization tests for design doc 2026-07-08-cas-promote-over-committed-leak-fix-design.md:
-///   BUG 1a (PROMOTE-OVER-COMMITTED-LEAK): `Build::promote` silently overwrites `refs[final_ref_name]`
+///   BUG 1a (PROMOTE-OVER-COMMITTED-LEAK): `PartWriteTxn::promote` silently overwrites `refs[final_ref_name]`
 ///   when it already names a DIFFERENT committed manifest, orphaning the old manifest (leak). The fix
 ///   (Task 2) makes this throw `ABORTED` instead.
 ///   BUG 1c: `republishRef`'s only idempotency gate is "source absent" -- a re-drive after a crash
@@ -32,7 +32,7 @@ using namespace DB::Cas;
 namespace
 {
 
-PoolPtr openStore(const std::shared_ptr<InMemoryBackend> & b)
+PoolPtr openPool(const std::shared_ptr<InMemoryBackend> & b)
 {
     return Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
 }
@@ -54,7 +54,7 @@ std::vector<ManifestEntry> inlineEntries(const String & path, const String & byt
 ManifestId publishCommitted(const PoolPtr & s, const RootNamespace & ns, const String & ref,
                             const std::vector<ManifestEntry> & entries)
 {
-    auto build = s->startBuild(BuildInfo{.intended_ref = ns.string() + "/" + ref, .intended_namespace = ns});
+    auto build = s->beginPartWrite(PartWriteInfo{.intended_ref = ns.string() + "/" + ref, .intended_namespace = ns});
     const ManifestId id = build->stageManifest(entries);
     build->precommitAdd(ns, ref, id);
     build->promote(ns, ref, build->buildId(), id);
@@ -90,13 +90,13 @@ void writeFileTx(DB::IMetadataTransaction & tx, const std::string & path, const 
 TEST(CasPromoteRepublish, PromoteOverDifferentCommittedRefFailsClosed)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = openStore(b);
+    auto s = openPool(b);
     const RootNamespace ns{"srv/tbl@cas@"};
     const String ref = "all_0_0_0";
 
     publishCommitted(s, ns, ref, inlineEntries("f", "AAA"));   // committed T_old
 
-    auto build2 = s->startBuild(BuildInfo{.intended_ref = ns.string() + "/" + ref, .intended_namespace = ns});
+    auto build2 = s->beginPartWrite(PartWriteInfo{.intended_ref = ns.string() + "/" + ref, .intended_namespace = ns});
     const ManifestId id2 = build2->stageManifest(inlineEntries("f", "BBB"));   // DIFFERENT content
     build2->precommitAdd(ns, ref, id2);
 
@@ -118,13 +118,13 @@ TEST(CasPromoteRepublish, PromoteOverDifferentCommittedRefFailsClosed)
 TEST(CasPromoteRepublish, PromoteSameManifestIsIdempotent)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = openStore(b);
+    auto s = openPool(b);
     const RootNamespace ns{"srv/tbl@cas@"};
     const String ref = "all_0_0_0";
     const ManifestId id = publishCommitted(s, ns, ref, inlineEntries("f", "AAA"));
 
     /// Re-precommit + re-promote the SAME id onto the same ref: allowed (same manifest_ref).
-    auto build2 = s->startBuild(BuildInfo{.intended_ref = ns.string() + "/" + ref, .intended_namespace = ns});
+    auto build2 = s->beginPartWrite(PartWriteInfo{.intended_ref = ns.string() + "/" + ref, .intended_namespace = ns});
     build2->precommitAdd(ns, ref, id);
     EXPECT_NO_THROW(build2->promote(ns, ref, build2->buildId(), id));
 }
@@ -134,11 +134,11 @@ TEST(CasPromoteRepublish, PromoteSameManifestIsIdempotent)
 TEST(CasPromoteRepublish, PromoteOverAbsentRefSucceeds)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = openStore(b);
+    auto s = openPool(b);
     const RootNamespace ns{"srv/tbl@cas@"};
     const String ref = "all_0_0_0";
 
-    auto build = s->startBuild(BuildInfo{.intended_ref = ns.string() + "/" + ref, .intended_namespace = ns});
+    auto build = s->beginPartWrite(PartWriteInfo{.intended_ref = ns.string() + "/" + ref, .intended_namespace = ns});
     const ManifestId id = build->stageManifest(inlineEntries("f", "AAA"));
     build->precommitAdd(ns, ref, id);
     EXPECT_NO_THROW(build->promote(ns, ref, build->buildId(), id));
@@ -180,8 +180,8 @@ TEST(CasPromoteRepublish, RepublishReDriveOverCommittedDstIsIdempotent)
     ASSERT_TRUE(resolved_src.has_value());
     const PartManifest src_manifest = storage->store()->readManifest(resolved_src->manifest_id);
     {
-        auto build = storage->store()->startBuild(
-            BuildInfo{.intended_ref = ns.string() + "/" + dst_ref, .intended_namespace = ns});
+        auto build = storage->store()->beginPartWrite(
+            PartWriteInfo{.intended_ref = ns.string() + "/" + dst_ref, .intended_namespace = ns});
         for (const auto & entry : src_manifest.entries)
             build->adoptEvidence(entry);
         const ManifestId id = build->stageManifest(src_manifest.entries);
@@ -281,10 +281,10 @@ TEST(CasPromoteRepublish, RepublishReDriveOverDifferentContentDstFailsClosed)
 TEST(CasPromoteRepublish, AbandonEmitsRemovalBeforeRetire)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = openStore(b);
+    auto s = openPool(b);
     const RootNamespace ns{"srv/tbl@cas@"};
     const String ref = "all_0_0_0";
-    auto build = s->startBuild(BuildInfo{.intended_ref = ns.string() + "/" + ref, .intended_namespace = ns});
+    auto build = s->beginPartWrite(PartWriteInfo{.intended_ref = ns.string() + "/" + ref, .intended_namespace = ns});
     const ManifestId id = build->stageManifest(inlineEntries("f", "AAA"));
     build->precommitAdd(ns, ref, id);
     build->abandon();
@@ -293,7 +293,7 @@ TEST(CasPromoteRepublish, AbandonEmitsRemovalBeforeRetire)
     /// a FRESH precommitAdd for the SAME (ref_name, manifest_ref) must succeed -- if abandon had left
     /// the exact binding live, this would instead throw CORRUPTED_DATA ("add precommit ... already
     /// exists").
-    auto rebuild = s->startBuild(BuildInfo{.intended_ref = ns.string() + "/" + ref, .intended_namespace = ns});
+    auto rebuild = s->beginPartWrite(PartWriteInfo{.intended_ref = ns.string() + "/" + ref, .intended_namespace = ns});
     EXPECT_NO_THROW(rebuild->precommitAdd(ns, ref, id))
         << "abandon() must append the exact precommit-removal transaction before returning";
 }

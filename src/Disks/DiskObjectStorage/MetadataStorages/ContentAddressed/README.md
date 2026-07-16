@@ -24,7 +24,7 @@ Primitives → Formats → Backend → Pool → Gc → Tools ≈ Parts → facad
 - **`Backend/`** — the token-aware storage seam: `CasBackend` (the contract),
   `CasObjectStorageBackend`, `CasInMemoryBackend`, `CasInstrumentedBackend`,
   `CasRequestControl`, `CasProbe`.
-- **`Pool/`** — the pool engine: `CasPool` (composition root), `CasBuild`
+- **`Pool/`** — the pool engine: `CasPool` (composition root), `CasPartWriteTxn`
   (one-part write transaction), `CasRefProtocol` (ref-table replay + intake),
   `CasServerRoot` (mount-claim protocol + single-writer slot + staging sweeper),
   `CasPoolMeta`, `CasBlobMeta`.
@@ -60,10 +60,5 @@ To understand a request end to end, read in this order:
 1. `ContentAddressedMetadataStorage` — the facade / routing.
 2. `Parts/PartFolderAccess` (`PartRefKey` → the folder view / cache).
 3. `Pool/CasPool` — the pool composition root and `open` protocol.
-4. `Pool/CasBuild` — one-part write transaction.
+4. `Pool/CasPartWriteTxn` — one-part write transaction.
 5. `Gc/CasGc` — the GC round engine.
-
-> Note: `Pool/CasBuild` is renamed to `CasPartWriteTxn` in the renames phase of
-> the source-layout refactoring (`Pool/CasStore` was already renamed to
-> `CasPool` above); this reading order will be updated to the new name once
-> that rename lands.

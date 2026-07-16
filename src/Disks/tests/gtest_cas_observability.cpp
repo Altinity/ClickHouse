@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 #include <Disks/tests/cas_test_helpers.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBuild.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEvent.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
@@ -27,7 +27,7 @@ using DB::Cas::tests::currentRetiredSet;
 namespace
 {
 
-PoolPtr openStore(std::shared_ptr<InMemoryBackend> & b)
+PoolPtr openPool(std::shared_ptr<InMemoryBackend> & b)
 {
     b = std::make_shared<InMemoryBackend>();
     return Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
@@ -39,9 +39,9 @@ PoolPtr openStore(std::shared_ptr<InMemoryBackend> & b)
 ManifestId publishOneBlobPart(
     const PoolPtr & s, const RootNamespace & ns, const String & ref, const String & payload)
 {
-    BuildInfo info;
+    PartWriteInfo info;
     info.intended_ref = ns.string() + "/" + ref;
-    auto build = s->startBuild(info);
+    auto build = s->beginPartWrite(info);
     DB::Cas::ManifestEntry e;
     e.path = "data.bin";
     e.placement = EntryPlacement::Blob;
@@ -58,18 +58,18 @@ ManifestId publishOneBlobPart(
 
 }
 
-/// B170/Task 1 (Part A audit events): `Build::stageManifest` writes a part-manifest body but never
+/// B170/Task 1 (Part A audit events): `PartWriteTxn::stageManifest` writes a part-manifest body but never
 /// emitted an audit row for it — the log could not answer "when was this manifest written." Verifies
 /// the emitted `ManifestPut` event (exactly once per successful stage).
 TEST(CasObservability, StageManifestEmitsManifestPut)
 {
     std::shared_ptr<InMemoryBackend> b;
     std::vector<CasEvent> seen;   /// declared BEFORE the Pool so it outlives the background syncer's emits (ASan 2026-07-09)
-    auto s = openStore(b);
+    auto s = openPool(b);
     s->setEventSink([&](const CasEvent & e){ seen.push_back(e); });
 
     const RootNamespace ns{"srv/tbl@cas@"};
-    auto build = s->startBuild(BuildInfo{.intended_ref = ns.string() + "/all_0_0_0", .intended_namespace = ns});
+    auto build = s->beginPartWrite(PartWriteInfo{.intended_ref = ns.string() + "/all_0_0_0", .intended_namespace = ns});
     ManifestEntry e;
     e.path = "f";
     e.placement = EntryPlacement::Inline;
@@ -88,7 +88,7 @@ TEST(CasObservability, StageManifestEmitsManifestPut)
     EXPECT_FALSE(it->token.empty());
 }
 
-/// `Build::abandon` removes a live precommit's owner binding (the correctness-bearing step) but never
+/// `PartWriteTxn::abandon` removes a live precommit's owner binding (the correctness-bearing step) but never
 /// audited the removal — the log could not distinguish "never precommitted" from "precommitted then
 /// abandoned." Verifies the emitted `PrecommitRemoved` event (exactly once, only when a precommit was
 /// actually live).
@@ -96,10 +96,10 @@ TEST(CasObservability, AbandonEmitsPrecommitRemoved)
 {
     std::shared_ptr<InMemoryBackend> b;
     std::vector<CasEvent> seen;   /// declared BEFORE the Pool so it outlives the background syncer's emits (ASan 2026-07-09)
-    auto s = openStore(b);
+    auto s = openPool(b);
 
     const RootNamespace ns{"srv/tbl@cas@"};
-    auto build = s->startBuild(BuildInfo{.intended_ref = ns.string() + "/all_0_0_0", .intended_namespace = ns});
+    auto build = s->beginPartWrite(PartWriteInfo{.intended_ref = ns.string() + "/all_0_0_0", .intended_namespace = ns});
     ManifestEntry e;
     e.path = "f";
     e.placement = EntryPlacement::Inline;
@@ -129,10 +129,10 @@ TEST(CasObservability, AbandonWithoutPrecommitEmitsNoPrecommitRemoved)
 {
     std::shared_ptr<InMemoryBackend> b;
     std::vector<CasEvent> seen;   /// declared BEFORE the Pool so it outlives the background syncer's emits (ASan 2026-07-09)
-    auto s = openStore(b);
+    auto s = openPool(b);
 
     const RootNamespace ns{"srv/tbl@cas@"};
-    auto build = s->startBuild(BuildInfo{.intended_ref = ns.string() + "/all_0_0_0", .intended_namespace = ns});
+    auto build = s->beginPartWrite(PartWriteInfo{.intended_ref = ns.string() + "/all_0_0_0", .intended_namespace = ns});
     ManifestEntry e;
     e.path = "f";
     e.placement = EntryPlacement::Inline;
@@ -161,7 +161,7 @@ TEST(CasObservability, ResurrectSupersedeEmitsOnlyRetireReplacedWithOldToken)
 {
     std::shared_ptr<InMemoryBackend> b;
     std::vector<CasEvent> seen;   /// declared BEFORE the Pool so it outlives the background syncer's emits (ASan 2026-07-09)
-    auto s = openStore(b);
+    auto s = openPool(b);
     const RootNamespace ns{"test/tbl"};
     const String P = "resurrect-payload-audit";
 

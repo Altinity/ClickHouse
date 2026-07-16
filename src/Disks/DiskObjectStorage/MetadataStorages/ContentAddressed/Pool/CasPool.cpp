@@ -1,5 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBuild.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasCodecUtil.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
@@ -150,9 +150,9 @@ bool Pool::dedupCacheContains(const BlobRef & ref) const
 {
     /// Task 3 (Round-B §0.3 introspection): raw lookup counters on the presence cache itself, disabled
     /// (nullptr `dedup_cache`) means neither counter moves -- the short-circuit below never reaches the
-    /// probe. `Build::putBlob` calls this seam up to twice on a genuine hit (once to pick the
+    /// probe. `PartWriteTxn::putBlob` calls this seam up to twice on a genuine hit (once to pick the
     /// HEAD-first branch, once more just to attribute `CasBlobBodyPutAvoided` to the cache -- see
-    /// CasBuild.cpp), so `CasDedupCacheHits` counts LOOKUPS, not distinct blobs or putBlob calls. A hit
+    /// CasPartWriteTxn.cpp), so `CasDedupCacheHits` counts LOOKUPS, not distinct blobs or putBlob calls. A hit
     /// does not itself skip the HEAD that follows in putBlob's HEAD-first branch -- it steers the call
     /// onto that cheap branch instead of an unconditional body stream; the body PUT is what a hit
     /// actually avoids.
@@ -176,7 +176,7 @@ void Pool::dedupCacheAdd(const BlobRef & ref)
 /// ==== mount-runtime delegates (source-layout §3.5) ==== The mount lease keeper, the local write
 /// fence, the per-server build watermark, the live-incarnation epoch, and the self-remount recovery
 /// thread live in the `mount_runtime` member (Pool/CasMountRuntime.h); Pool keeps these thin public
-/// forwarders so the wiring, Build, Gc, the ref-ledger callbacks, and every test call site are unchanged.
+/// forwarders so the wiring, PartWriteTxn, Gc, the ref-ledger callbacks, and every test call site are unchanged.
 uint64_t Pool::bootMs()
 {
     return CasMountRuntime::bootMs();
@@ -759,20 +759,20 @@ void Pool::retireBuildSeq(uint64_t seq)
     mount_runtime.retireBuildSeq(seq);
 }
 
-BuildPtr Pool::startBuild(BuildInfo info)
+PartWriteTxnPtr Pool::beginPartWrite(PartWriteInfo info)
 {
     /// Mint a globally-unique build id from two thread_local_rng draws (random u128).
     const UInt64 hi = thread_local_rng();
     const UInt64 lo = thread_local_rng();
     const UInt128 build_id = (static_cast<UInt128>(hi) << 64) | lo;
 
-    /// Strictly-increasing per-process build_seq carried by the Build (spec 2026-06-16). The Build is
+    /// Strictly-increasing per-process build_seq carried by the PartWriteTxn (spec 2026-06-16). The PartWriteTxn is
     /// added to the active set here and retired on publish/abandon/dtor, so minActive — the GC floor
     /// the Pool-owned watermark renews — tracks in-flight builds. The build registry lives on
     /// `mount_runtime` (source-layout §3.5).
     const uint64_t seq = mount_runtime.allocateBuildSeq();
 
-    auto build = std::make_shared<Build>(shared_from_this(), build_id, seq, liveWriterEpoch(), std::move(info));
+    auto build = std::make_shared<PartWriteTxn>(shared_from_this(), build_id, seq, liveWriterEpoch(), std::move(info));
     /// Register for `dropNamespace`'s post-durable build cancellation (spec §Namespace Removal). weak_ptr:
     /// the wiring owns the returned shared_ptr; `retireBuildSeq` (publish/abandon/dtor) removes the entry.
     mount_runtime.registerInflightBuild(seq, build);
@@ -1056,7 +1056,7 @@ std::vector<String> Pool::listMirroredChildren(const String & prefix)
 
 /// ==== ref-ledger delegates (source-layout §3.4) ==== The ref-log / ref-table subsystem lives in the
 /// `ref_ledger` member (Pool/CasRefLedger.h); Pool keeps these thin public forwarders so the wiring,
-/// Build, Gc, and every test call site is unchanged.
+/// PartWriteTxn, Gc, and every test call site is unchanged.
 
 void Pool::setCasRetrySleepForTest(std::function<void(uint64_t)> sleep_fn)
 {

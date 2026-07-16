@@ -142,7 +142,7 @@ void threadSleepMs(uint64_t ms)
 /// reissuing only replays the same failure — up to ~12 minutes of budget × putBlob's outer loop at
 /// the defaults — and buries the root cause behind a retryable ABORTED. The set:
 ///   LOGICAL_ERROR   — a local invariant violation (e.g. uploadFromSource's source-size check; pinned
-///                     by `CasBuild.PutBlobWrongSizeFailsClosed`, which caught exactly this class)
+///                     by `CasPartWriteTxn.PutBlobWrongSizeFailsClosed`, which caught exactly this class)
 ///   NOT_IMPLEMENTED — a mode/capability guard (e.g. `promoteStaged` on a backend without a native
 ///                     conditional server-side copy) — a deterministic configuration bug
 ///   BAD_ARGUMENTS   — a deterministic encode/argument rejection (e.g. BAD_ARGUMENTS escaping
@@ -376,7 +376,7 @@ CasCreateResult CasRequestController::conditionalCreateControlled(
             /// A deterministic LOCAL bug surfaced by the attempt itself — a caller/config error, never
             /// a wire ambiguity; reissuing would only replay it. Propagate unchanged: instant, loud,
             /// exactly the pre-controller behavior (see isDeterministicLocalFailure for the set and the
-            /// per-code rationale; `CasBuild.PutBlobWrongSizeFailsClosed` pinned the LOGICAL_ERROR
+            /// per-code rationale; `CasPartWriteTxn.PutBlobWrongSizeFailsClosed` pinned the LOGICAL_ERROR
             /// member). This deliberately DIFFERS from `putIfAbsentControlled`'s everything-Unresolved:
             /// that lane's byte-exact resolve makes retrying any unproven error harmless, while
             /// retrying a broken source/mode/encode here is pure noise. Fail-safe either way — a

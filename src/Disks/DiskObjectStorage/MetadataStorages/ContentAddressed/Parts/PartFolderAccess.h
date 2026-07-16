@@ -120,7 +120,7 @@ private:
 #include <unordered_map>
 #include <vector>
 
-namespace DB::Cas { class Build; }
+namespace DB::Cas { class PartWriteTxn; }
 
 namespace DB::ContentAddressed
 {
@@ -196,9 +196,9 @@ public:
     /// direction). Committed-ref mutations anywhere else in wiring are style-check failures.
 
     /// The transaction's terminal publish: the atomic owner move.
-    /// `allow_repoint` (all-tree-part-files Task 2/3): threads through to `Build::promote`, opting
+    /// `allow_repoint` (all-tree-part-files Task 2/3): threads through to `PartWriteTxn::promote`, opting
     /// into retargeting a committed ref that already names a DIFFERENT manifest.
-    void promoteBuild(Cas::Build & build, const PartRefKey & key, UInt128 build_id,
+    void promoteBuild(Cas::PartWriteTxn & build, const PartRefKey & key, UInt128 build_id,
                       const Cas::ManifestId & manifest_id, bool allow_repoint = false);
     /// The shared committed-publish sequence (spec §Two-Level API, level 2): adopt-evidence over
     /// `entries`, stage a FRESH manifest, precommit, promote. Used by republishRef and by
@@ -211,7 +211,7 @@ public:
     /// republishes `key`'s manifest with `entries`. Byte-equal candidate (same decoded entries as the
     /// currently committed manifest) is a ZERO-pool-mutation no-op, returns false. Otherwise republishes
     /// via `publishEntries(allow_repoint=true)`, audits loudly (`ProfileEvents::CasRefRepoint` +
-    /// `LOG_WARNING`; `Build::promote` itself emits the `CasEventType::RefRepoint` event), erases the
+    /// `LOG_WARNING`; `PartWriteTxn::promote` itself emits the `CasEventType::RefRepoint` event), erases the
     /// cached view, and returns true. `key` must already resolve (a repoint targets a committed ref).
     bool repointRef(const PartRefKey & key, std::vector<Cas::ManifestEntry> entries, Cas::ProvenanceOp op);
     void dropRef(const PartRefKey & key);

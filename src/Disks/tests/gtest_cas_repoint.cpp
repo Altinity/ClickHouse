@@ -1,13 +1,13 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Parts/PartFolderAccess.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBuild.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/ProfileEvents.h>
 
 /// Task 3 (all-tree-part-files plan, 2026-07-15): `CachedPartFolderAccess::repointRef` -- the audited
 /// primitive a standalone write/remove on an already-COMMITTED part must go through once the mutable
 /// per-part file set is empty (spec 2026-07-14-cas-all-tree-part-files-design.md §4). It republishes
-/// the whole manifest with the new entry set, riding `Build::promote`'s `allow_repoint` mode (Task 2).
+/// the whole manifest with the new entry set, riding `PartWriteTxn::promote`'s `allow_repoint` mode (Task 2).
 
 namespace ProfileEvents
 {
@@ -35,7 +35,7 @@ ManifestEntry inlineEntry(const String & path, const String & bytes)
 ManifestId publishPart(const PoolPtr & store, const RootNamespace & ns, const String & ref,
                        std::vector<ManifestEntry> entries)
 {
-    auto build = store->startBuild(BuildInfo{.intended_ref = ns.string() + "/" + ref,
+    auto build = store->beginPartWrite(PartWriteInfo{.intended_ref = ns.string() + "/" + ref,
                                              .intended_namespace = ns, .op = ProvenanceOp::Insert});
     const ManifestId id = build->stageManifest(entries);
     build->precommitAdd(ns, ref, id);
@@ -48,13 +48,13 @@ ManifestId publishPart(const PoolPtr & store, const RootNamespace & ns, const St
 /// Byte-equal candidate: the exact same entries republished onto an already-committed ref must be a
 /// ZERO-mutation no-op -- no fresh manifest staged, no ref-log record appended, no `RefRepoint` event.
 /// `stageManifest` mints a non-content-derived `ManifestRef` AND durably PUTs the body on every call
-/// (CasBuild.cpp), so this can only hold if the no-op check compares candidate `entries` directly
+/// (CasPartWriteTxn.cpp), so this can only hold if the no-op check compares candidate `entries` directly
 /// against the currently-committed manifest's DECODED entries -- never by staging first (the same
 /// structural comparison `republishRef`'s BUG 1c fix uses).
 TEST(CasRepoint, ByteEqualIsNoOp)
 {
     auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
-    auto store = DB::Cas::tests::openStoreForTest(backend);
+    auto store = DB::Cas::tests::openPoolForTest(backend);
     const RootNamespace ns{"srv/t1"};
     DB::ContentAddressed::CachedPartFolderAccess access(store);
     const auto id = publishPart(store, ns, "part_1", {inlineEntry("checksums.txt", "cs")});
@@ -76,7 +76,7 @@ TEST(CasRepoint, ByteEqualIsNoOp)
 TEST(CasRepoint, AddFileRepoints)
 {
     auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
-    auto store = DB::Cas::tests::openStoreForTest(backend);
+    auto store = DB::Cas::tests::openPoolForTest(backend);
     const RootNamespace ns{"srv/t1"};
     DB::ContentAddressed::CachedPartFolderAccess access(
         store, {.cache_bytes = 64ULL << 20, .max_entries = 10000, .max_entry_bytes = 16ULL << 20,

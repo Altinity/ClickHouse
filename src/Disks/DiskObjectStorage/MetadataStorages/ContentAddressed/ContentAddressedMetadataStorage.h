@@ -35,7 +35,7 @@ enum class StagingBackend
 /// Content-addressed metadata storage — the M-W wiring (design 2026-06-11 section 4): a THIN
 /// translator between the IMetadataStorage read surface and the Cas:: core. ClickHouse path
 /// parsing (PartPathParser) + namespace mapping (D-W1) + StoredObjects construction; NO protocol
-/// state, NO internals-exposing accessors — the protocol lives in Cas::Pool/Build/Gc.
+/// state, NO internals-exposing accessors — the protocol lives in Cas::Pool/PartWriteTxn/Gc.
 ///
 /// Namespace mapping (M-W decision D-W1, shadow refined during T2; detached folded in B181):
 ///   live part      SERVER_ID/TABLE_UUID            ref = PART_DIR

@@ -4,7 +4,7 @@
 #include <set>
 #include <vector>
 
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBuild.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEvent.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h>
@@ -74,7 +74,7 @@ private:
 TEST(CasGcRetire, ManifestBodyDeletedAfterDecrementsSealed)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref("srv-a:1", 1, 0xAA);
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
@@ -92,7 +92,7 @@ TEST(CasGcRetire, ManifestBodyDeletedAfterDecrementsSealed)
 TEST(CasGcRecheck, PublishRacingFenceSparesBlob)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r1 = ref("srv-a:1", 1, 0xA1);
     const ManifestRef r2 = ref("srv-a:1", 2, 0xA2);
@@ -117,7 +117,7 @@ TEST(CasGcRecheck, PublishRacingFenceSparesBlob)
 TEST(CasGcRecheck, UnreferencedBlobDeletedExactToken)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref("srv-a:1", 1, 0xAA);
     writeBlobBody(*backend, store->layout(), DB::UInt128(1));
@@ -137,7 +137,7 @@ TEST(CasGcRecheck, UnreferencedBlobDeletedExactToken)
 TEST(CasGcRetire, CondemnWritesMetaCondemned)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref("srv-a:1", 1, 0xAA);
     writeBlobBody(*backend, store->layout(), DB::UInt128(1));
@@ -159,7 +159,7 @@ TEST(CasGcRetire, CondemnWritesMetaCondemned)
 TEST(CasGcRetire, DeleteRemovesBodyAndMeta)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref("srv-a:1", 1, 0xAA);
     writeBlobBody(*backend, store->layout(), DB::UInt128(1));
@@ -189,7 +189,7 @@ TEST(CasGcRetire, DeleteRemovesBodyAndMeta)
 TEST(CasGcRetire, SpareLeavesMetaCondemned)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
 
     /// A content-addressed body + Clean meta via a real fresh upload, so a later writer dedup-attempt
@@ -198,7 +198,7 @@ TEST(CasGcRetire, SpareLeavesMetaCondemned)
     const UInt128 hash = u128Of(payload);
     const BlobRef id = idOf(payload);
     {
-        auto seed = store->startBuild({});
+        auto seed = store->beginPartWrite({});
         seed->putBlob(id, BlobSource::fromString(payload));
     }
     const Token t_seed = backend->head(store->layout().blobKey(id)).token;
@@ -242,7 +242,7 @@ TEST(CasGcRetire, SpareLeavesMetaCondemned)
     /// Only a WRITER re-publishes Clean, and only by displacing the body with a fresh incarnation token:
     /// a dedup-attempt on the condemned hash resurrects (uploadFromSource) — the body token CHANGES and
     /// the meta flips to Clean WITH that token change.
-    auto build = store->startBuild({});
+    auto build = store->beginPartWrite({});
     auto ref_w = build->putBlob(id, BlobSource::fromString(payload));
     EXPECT_EQ(ref_w.ref, id);
     const Token t_resurrect = backend->head(store->layout().blobKey(id)).token;
@@ -267,7 +267,7 @@ TEST(CasGcRetire, SpareLeavesMetaCondemned)
 TEST(CasGcRetire, StaleRedeleteAfterSpareDoesNotDeleteLiveReuse)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
 
     const String payload = "two-leader-stale-redelete-payload";
@@ -275,7 +275,7 @@ TEST(CasGcRetire, StaleRedeleteAfterSpareDoesNotDeleteLiveReuse)
     const BlobRef id = idOf(payload);
     const String blob_key = store->layout().blobKey(id);
     {
-        auto seed = store->startBuild({});
+        auto seed = store->beginPartWrite({});
         seed->putBlob(id, BlobSource::fromString(payload));
     }
 
@@ -310,7 +310,7 @@ TEST(CasGcRetire, StaleRedeleteAfterSpareDoesNotDeleteLiveReuse)
     /// A writer dedup-hits h. It point-reads Condemned and RESURRECTS to a fresh token t2
     /// (uploadFromSource) — it never reuses t1.
     {
-        auto build = store->startBuild({});
+        auto build = store->beginPartWrite({});
         build->putBlob(id, BlobSource::fromString(payload));
     }
     const Token t2 = backend->head(blob_key).token;
@@ -337,7 +337,7 @@ TEST(CasGcRetire, StaleRedeleteAfterSpareDoesNotDeleteLiveReuse)
 TEST(CasGcRetire, CopyForwardedBlobSurvivesWhenRepublished)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r1 = ref("srv-a:1", 1, 0xA1);
     writeBlobBody(*backend, store->layout(), DB::UInt128(1));
@@ -349,7 +349,7 @@ TEST(CasGcRetire, CopyForwardedBlobSurvivesWhenRepublished)
     gc.runRegularRound();   /// -1 folds => in-degree 0 => entry (1, t0) condemned
     ASSERT_TRUE(currentEntryFor(*backend, store->layout(), DB::UInt128(1)).has_value());
 
-    /// The raw equivalent of a writer resurrect (Build::uploadFromSource): displace EXACTLY t0 with the
+    /// The raw equivalent of a writer resurrect (PartWriteTxn::uploadFromSource): displace EXACTLY t0 with the
     /// same verified bytes under a fresh token t1, then republish a part referencing the blob (the
     /// promoted dst ref of a republishRef move).
     const String blob_key = store->layout().blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::UInt128(1))});
@@ -380,7 +380,7 @@ TEST(CasGcRetire, CopyForwardedBlobSurvivesWhenRepublished)
 TEST(CasGcRetire, AbandonedCopyForwardDropsEntryWithoutWrongTokenDelete)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r1 = ref("srv-a:1", 1, 0xA1);
     writeBlobBody(*backend, store->layout(), DB::UInt128(1));
@@ -418,7 +418,7 @@ TEST(CasGcRetire, AbandonedCopyForwardDropsEntryWithoutWrongTokenDelete)
 TEST(CasGcRecheck, CompletionInheritsFoldAttempt)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref("srv-a:1", 1, 0xAA);
     writeBlobBody(*backend, store->layout(), DB::UInt128(1));
@@ -453,7 +453,7 @@ TEST(CasGcRecheck, CompletionInheritsFoldAttempt)
 TEST(CasGcAckFloor, NoOpRoundDoesNotMutateRefShards)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt,
         ManifestRef{.writer_epoch = 1, .build_sequence = 1, .manifest_ordinal = 1});
@@ -495,7 +495,7 @@ TEST(CasGcAckFloor, NoOpRoundDoesNotMutateRefShards)
 TEST(CasGcAckFloor, CondemnThenGraduatesNextRoundThenDeletes)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref("srv-a:1", 1, 0xAA);
     const UInt128 blob = DB::UInt128(1);
@@ -546,7 +546,7 @@ TEST(CasGcAckFloor, CondemnThenGraduatesNextRoundThenDeletes)
 TEST(CasGcAckFloor, PublishBeforeGraduationSpares)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r1 = ref("srv-a:1", 1, 0xA1);
     const ManifestRef r2 = ref("srv-a:1", 2, 0xA2);
@@ -598,7 +598,7 @@ TEST(CasGcAckFloor, ExpiredMountFencedOutAndExcluded)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     std::vector<CasEvent> events;   /// declared BEFORE the Pool so it outlives the background syncer's emits (ASan 2026-07-09)
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const Layout & layout = store->layout();
 
     // srid2's keeper claims ONE lease via `start()` and is never renewed again — tests never enable
@@ -680,7 +680,7 @@ TEST(CasGcAckFloor, ExpiredMountFencedOutAndExcluded)
 /// an explicit `mono_ms_fn` -- exercising the DEFAULT under test. If the default still read the real
 /// wall clock, this round would see essentially zero elapsed mono time and never cross the fence-out
 /// threshold; the fix makes it default to `store->bootMsNow()`, which tracks the SAME fake clock.
-TEST(CasGcAckFloor, DefaultMonoClockTracksStoresInjectedBootClockNotWallClock)
+TEST(CasGcAckFloor, DefaultMonoClockTracksPoolsInjectedBootClockNotWallClock)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     uint64_t fake_boot = 0;
@@ -720,7 +720,7 @@ TEST(CasGcAckFloor, DefaultMonoClockTracksStoresInjectedBootClockNotWallClock)
 TEST(CasGcAckFloor, RecreatedBlobDeleteIsTokenMismatchOk)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref("srv-a:1", 1, 0xAA);
     const UInt128 blob = DB::UInt128(1);
@@ -768,7 +768,7 @@ TEST(CasGcAckFloor, RecreatedBlobDeleteIsTokenMismatchOk)
 TEST(CasGcAckFloor, ResumeAfterCrashBetweenRetiredPutAndStateCas)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref("srv-a:1", 1, 0xAA);
     const UInt128 blob = DB::UInt128(1);
@@ -826,7 +826,7 @@ TEST(CasGcAckFloor, ResumeAfterCrashBetweenRetiredPutAndStateCas)
 TEST(CasGcAckFloor, TokenMismatchOnAbsentBlobSettlesAsAbsentAndDropsMeta)
 {
     auto backend = std::make_shared<TokenMismatchOnAbsentBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref("srv-a:1", 1, 0xAA);
     const UInt128 blob = DB::UInt128(1);

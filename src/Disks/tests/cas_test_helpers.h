@@ -115,7 +115,7 @@ inline DB::Cas::BlobRef idOf(const String & bytes)
 }
 
 /// Write a Blob object: a fixed-length (blob_header_len) envelope followed by the raw payload, keyed
-/// by content. Mirrors what Build::putBlob will emit (Task 11).
+/// by content. Mirrors what PartWriteTxn::putBlob will emit (Task 11).
 inline DB::Cas::BlobRef writeBlobRaw(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const String & payload,
     uint64_t blob_header_len, [[maybe_unused]] const DB::UInt128 & domain_id)
@@ -139,7 +139,7 @@ inline DB::Cas::BlobRef writeBlobRaw(
 inline void registerNamespaceRaw(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout, const DB::Cas::RootNamespace & ns);
 
-/// Write a part-manifest body object directly via the manifest codec, exactly as Build::stageManifest
+/// Write a part-manifest body object directly via the manifest codec, exactly as PartWriteTxn::stageManifest
 /// emits it. Returns the ManifestId. Used by GC fold/retire/fsck tests to stage owner targets.
 inline DB::Cas::ManifestId writeManifestRaw(
     DB::Cas::Backend & backend, const DB::Cas::Layout & layout,
@@ -564,7 +564,7 @@ inline DB::Cas::Token displaceBlobToken(
 /// what Phase-4 Lever A (spec 2026-07-06-cas-gc-round-skip-unchanged) is designed to skip -- passes 0
 /// here to force fold-every-round (shouldDeferRound's liveness bound: rounds_since_last_fold(0) >= 0
 /// is always true).
-inline DB::Cas::PoolPtr openStoreForTest(
+inline DB::Cas::PoolPtr openPoolForTest(
     std::shared_ptr<DB::Cas::InMemoryBackend> backend, uint64_t gc_fold_max_defer_rounds = 8)
 {
     return DB::Cas::Pool::open(std::move(backend),

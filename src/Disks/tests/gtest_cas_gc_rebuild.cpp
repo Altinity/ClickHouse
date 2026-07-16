@@ -38,7 +38,7 @@ ManifestRef ref(uint64_t seq, uint64_t inst)
 TEST(CasGcBaselineGuard, GenuinelyFreshPoolIsUnaffected)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(1, 0xAA);
     writeBlobBody(*backend, store->layout(), DB::UInt128(1));
@@ -54,7 +54,7 @@ TEST(CasGcBaselineGuard, GenuinelyFreshPoolIsUnaffected)
 TEST(CasGcBaselineGuard, AbsentAdoptedSealFailsClosed)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(1, 0xAA);
     writeBlobBody(*backend, store->layout(), DB::UInt128(1));
@@ -82,7 +82,7 @@ TEST(CasGcRebuild, RecoversLostStateAndConverges)
     /// gc_fold_max_defer_rounds=0: this test drives MANY consecutive rounds via runRoundsUntilAbsent
     /// expecting every one to fold (Phase-4 Lever A would otherwise defer once the pool quiesces,
     /// stalling the reclaim loop below the 8-round budget); force fold-every-round.
-    auto store = openStoreForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef live_r = ref(1, 0xA1);
     const ManifestRef dead_r = ref(2, 0xA2);
@@ -130,7 +130,7 @@ TEST(CasGcRebuild, RecoversLostStateAndConverges)
 TEST(CasGcRebuild, RecoversLostGenerationArtifact)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(1, 0xA1);
     writeBlobBody(*backend, store->layout(), DB::UInt128(1));
@@ -166,7 +166,7 @@ TEST(CasGcRebuild, RecoversLostGenerationArtifact)
 TEST(CasGcRebuild, HealthyStateRequiresForce)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(1, 0xA1);
     writeBlobBody(*backend, store->layout(), DB::UInt128(1));
@@ -189,7 +189,7 @@ TEST(CasGcRebuild, HealthyStateRequiresForce)
 TEST(CasGcRebuild, MissingCommittedManifestRefuses)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef a = ref(1, 0xA1);
     const ManifestRef b = ref(2, 0xB2);
@@ -227,7 +227,7 @@ TEST(CasGcRebuild, MissingCommittedManifestRefuses)
 TEST(CasGcRebuild, LivePrecommitEdgesIncluded)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef pre = ref(7, 0xC1);
     writeBlobBody(*backend, store->layout(), DB::UInt128(9));
@@ -257,7 +257,7 @@ TEST(CasGcRebuild, LivePrecommitEdgesIncluded)
 TEST(CasGcRebuild, BatchedRebuildProtectsAllRefs)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     for (uint64_t i = 1; i <= 6; ++i)
     {
@@ -294,11 +294,11 @@ TEST(CasGcRebuild, BatchedRebuildProtectsAllRefs)
 TEST(CasGcRebuild, UnownedAliveManifestOverProtected)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
 
     /// A LIVE build pins min_active at its build_seq, so higher build sequences are not provably dead.
-    auto live_build = store->startBuild({});
+    auto live_build = store->beginPartWrite({});
     store->renewWatermarkOnce();
 
     /// An unowned manifest from build_seq 7 (no journal events at all — the trimmed shape).
@@ -331,7 +331,7 @@ TEST(CasGcRebuild, UnownedAliveManifestOverProtected)
 TEST(CasGcRebuild, LeaseConflictRefuses)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(1, 0xA1);
     writeBlobBody(*backend, store->layout(), DB::UInt128(1));
@@ -355,7 +355,7 @@ TEST(CasGcRebuild, LeaseConflictRefuses)
 TEST(CasGcRebuild, OrphanBlobCondemnedInRebuiltRun)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
     const RootNamespace ns{"00/aa@cas@"};
 
     /// An edge-bearing blob (committed ref) and an ORPHAN blob (a body with no owner at all) —
@@ -445,7 +445,7 @@ TEST(CasGcClampSuppression, LandedEdgeBehindClampNeverDeleted)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     std::vector<CasEvent> seen;   /// declared BEFORE the Pool so it outlives the background syncer's emits (ASan 2026-07-09)
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
 
     /// Folded baseline: blob X referenced by committed tbl_a (manifest m1) on shard 1.

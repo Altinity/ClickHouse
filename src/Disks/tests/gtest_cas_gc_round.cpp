@@ -62,13 +62,13 @@ bool manifestExists(InMemoryBackend & b, const Layout & layout, const ManifestId
     return b.head(layout.manifestKey(id)).exists;
 }
 
-PoolPtr openTestStore(std::shared_ptr<InMemoryBackend> & out_backend)
+PoolPtr openTestPool(std::shared_ptr<InMemoryBackend> & out_backend)
 {
     out_backend = std::make_shared<InMemoryBackend>();
     return Pool::open(out_backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
 }
 
-PoolPtr openTestStoreWithConfig(std::shared_ptr<InMemoryBackend> & out_backend, PoolConfig config)
+PoolPtr openTestPoolWithConfig(std::shared_ptr<InMemoryBackend> & out_backend, PoolConfig config)
 {
     out_backend = std::make_shared<InMemoryBackend>();
     return Pool::open(out_backend, std::move(config));
@@ -179,7 +179,7 @@ TEST(CasGcCursorKey, RoundTripsAndMatchesLegacyFormat)
 TEST(CasGcLease, FreshPoolAcquiresAndRenews)
 {
     std::shared_ptr<InMemoryBackend> b;
-    auto s = openTestStore(b);
+    auto s = openTestPool(b);
     Gc gc(s, kGc);
 
     EXPECT_TRUE(gc.runRegularRound().acquired_lease);
@@ -197,7 +197,7 @@ TEST(CasGcLease, FreshPoolAcquiresAndRenews)
 TEST(CasGcLease, ContenderBacksOffWhileIncumbentRenews)
 {
     std::shared_ptr<InMemoryBackend> b;
-    auto s = openTestStore(b);
+    auto s = openTestPool(b);
     Gc gc1(s, kGcA);
     Gc gc2(s, kGcB);
 
@@ -213,7 +213,7 @@ TEST(CasGcLease, ContenderBacksOffWhileIncumbentRenews)
 TEST(CasGcLease, StealAfterObservedNonRenewalAdvancesLease)
 {
     std::shared_ptr<InMemoryBackend> b;
-    auto s = openTestStore(b);
+    auto s = openTestPool(b);
     Gc gc1(s, kGcA);
     Gc gc2(s, kGcB);
 
@@ -231,7 +231,7 @@ TEST(CasGcLease, HeartbeatBlocksFalseStealOfAliveLeader)
     /// B160: a slow-but-alive incumbent whose lease.seq is frozen for its (long) round must NOT be
     /// stolen from, because its advisory heartbeat keeps advancing.
     std::shared_ptr<InMemoryBackend> b;
-    auto s = openTestStore(b);
+    auto s = openTestPool(b);
     Gc gc1(s, kGcA);
     Gc gc2(s, kGcB);
 
@@ -256,7 +256,7 @@ TEST(CasGcLease, HeartbeatBlocksFalseStealOfAliveLeader)
 TEST(CasGcLease, ManualObservationNeverArmsTheLoopsStealDecision)
 {
     std::shared_ptr<InMemoryBackend> b;
-    auto s = openTestStore(b);
+    auto s = openTestPool(b);
     Gc gc1(s, kGcA);
     Gc gc2(s, kGcB);   /// plays the scheduler's ONE shared Gc, observed by both manual and loop calls
 
@@ -296,7 +296,7 @@ TEST(CasGcLease, WithoutAcquireTimePulseFirstRoundStealsDeterministically)
     /// pulses `gc/hb` and never renews - exactly what happened before `on_lease_acquired` existed.
     /// gc2's SECOND observation of the same frozen (owner, seq, hb) steals, per the documented protocol.
     std::shared_ptr<InMemoryBackend> b;
-    auto s = openTestStore(b);
+    auto s = openTestPool(b);
     Gc gc1(s, kGcA);
     Gc gc2(s, kGcB);
 
@@ -317,7 +317,7 @@ TEST(CasGcLease, AcquireTimePulseProtectsNewLeadersFirstRound)
     /// advanced relative to its first and backs off instead of stealing - exactly what never happened
     /// pre-fix, when `i_am_leader` (and hence every pulse) was gated on the round having already returned.
     std::shared_ptr<InMemoryBackend> b;
-    auto s = openTestStore(b);
+    auto s = openTestPool(b);
     Gc gc1(s, kGcA);
     Gc gc2(s, kGcB);
 
@@ -334,7 +334,7 @@ TEST(CasGcLease, FailoverStealOnceHeartbeatStops)
     /// B160: once the incumbent stops heartbeating (it died), a follower observing the now-frozen
     /// heartbeat steals — automatic failover is preserved.
     std::shared_ptr<InMemoryBackend> b;
-    auto s = openTestStore(b);
+    auto s = openTestPool(b);
     Gc gc1(s, kGcA);
     Gc gc2(s, kGcB);
 
@@ -352,7 +352,7 @@ TEST(CasGcLease, DeadIncumbentThenRevivedIncumbentWinsRace)
     /// A stalled incumbent that revives and renews BEFORE the contender's second look resets the
     /// contender's window: gc2's second observation sees a NEW seq => NOT steal-eligible => backs off.
     std::shared_ptr<InMemoryBackend> b;
-    auto s = openTestStore(b);
+    auto s = openTestPool(b);
     Gc gc1(s, kGcA);
     Gc gc2(s, kGcB);
 
@@ -370,7 +370,7 @@ TEST(CasGcLease, ConcurrentStealLosesCas)
     /// owner on storage must be unperturbed. The injected conflict left the object unchanged, so gc2's
     /// NEXT round is steal-eligible again and succeeds.
     std::shared_ptr<InMemoryBackend> b;
-    auto s = openTestStore(b);
+    auto s = openTestPool(b);
     Gc gc1(s, kGcA);
     Gc gc2(s, kGcB);
 
@@ -392,7 +392,7 @@ TEST(CasGcLease, CreateConflictReReadsWithinTheBound)
     /// The contender re-reads and falls through within its bounded (2) CAS attempts — the re-read still
     /// finds the key absent, so the second attempt creates and acquires.
     std::shared_ptr<InMemoryBackend> b;
-    auto s = openTestStore(b);
+    auto s = openTestPool(b);
     Gc gc(s, hexToU128("0000000000000000000000000000000c"));
 
     b->failNextCasPut(s->layout().gcStateKey());
@@ -406,7 +406,7 @@ TEST(CasGcLease, CtorFailsClosedOnBadArguments)
 {
     /// Guards: a null store and gc_id == 0 (reserved for "lease never held") are caller bugs.
     std::shared_ptr<InMemoryBackend> b;
-    auto s = openTestStore(b);
+    auto s = openTestPool(b);
     expectThrowsCode(DB::ErrorCodes::BAD_ARGUMENTS, [&] { Gc(nullptr, kGc); });
     expectThrowsCode(DB::ErrorCodes::BAD_ARGUMENTS, [&] { Gc(s, DB::UInt128(0)); });
 }
@@ -417,7 +417,7 @@ TEST(CasGcLease, IncumbentRenewConflictRetriesOnceAndAcquires)
     /// is retried ONCE within the bounded (2) CAS attempts => acquired. Never acquired=true without a
     /// Committed CAS — storage must carry the seq the SECOND (committed) attempt wrote.
     std::shared_ptr<InMemoryBackend> b;
-    auto s = openTestStore(b);
+    auto s = openTestPool(b);
     Gc gc(s, hexToU128("0000000000000000000000000000000d"));
 
     ASSERT_TRUE(gc.runRegularRound().acquired_lease);            /// create: seq 1
@@ -434,7 +434,7 @@ TEST(CasGcLease, VanishedStateAfterObservationFailsClosed)
     /// deletion. Recreating a default state would reset round/cursors; the lease protocol
     /// must fail closed (CORRUPTED_DATA) instead.
     std::shared_ptr<InMemoryBackend> b;
-    auto s = openTestStore(b);
+    auto s = openTestPool(b);
     Gc gc1(s, kGcA);
     Gc gc2(s, kGcB);
 
@@ -457,7 +457,7 @@ TEST(CasGcLease, VanishedStateAfterObservationFailsClosed)
 TEST(CasGcRound, PublishDropReclaimsBlobAndManifestToFixpoint)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(1, 0xAA);
     const ManifestId id{ns, r};
@@ -492,7 +492,7 @@ TEST(CasGcRound, PublishDropReclaimsBlobAndManifestToFixpoint)
 TEST(CasGcRound, CondemnRoundSealSummaryCountsCondemned)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(1, 0xAA);
     writeBlobBody(*backend, store->layout(), DB::UInt128(1));
@@ -535,7 +535,7 @@ TEST(CasGcRound, CondemnRoundSealSummaryCountsCondemned)
 TEST(CasGcRound, PreviewReportsCondemnedRowsAndIsWriteFree)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(1, 0xAA);
     const UInt128 blob = DB::UInt128(1);
@@ -633,7 +633,7 @@ TEST(CasGcRound, CarryRoundPreservesCondemnedSummaryVerbatim)
 TEST(CasGcRound, NonAdoptedAttemptSealIgnored)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(1, 0xAA);
     writeBlobBody(*backend, store->layout(), DB::UInt128(1));
@@ -669,7 +669,7 @@ TEST(CasGcRound, NonAdoptedAttemptSealIgnored)
 TEST(CasGcRound, RoundSummaryCountsManifestBodyDeletes)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(1, 0xCC);
     const ManifestId id{ns, r};
@@ -735,7 +735,7 @@ TEST(CasGcRound, EnumerationPagesCountedEvenWithSweepBudgetZeroed)
     config.server_root_id = "test";
     config.manifest_sweep_list_budget_keys = 0;   /// disables the orphan sweep's own LIST entirely
     config.gc_fold_max_defer_rounds = 0;          /// force fold-every-round (Phase-4 Lever A would defer)
-    auto store = openTestStoreWithConfig(backend, config);
+    auto store = openTestPoolWithConfig(backend, config);
 
     Gc gc(store, kGc);
     const auto pages_before = ProfileEvents::global_counters[ProfileEvents::CasGcEnumerationPages].load();
@@ -755,7 +755,7 @@ TEST(CasGcRound, EnumerationPagesCountedEvenWithSweepBudgetZeroed)
 TEST(CasGcRound, FoldCursorSurvivesAcrossRoundsWithoutTrim)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(1, 0xAA);
 
@@ -790,7 +790,7 @@ TEST(CasGcRound, FoldCursorSurvivesAcrossRoundsWithoutTrim)
 TEST(CasGcRound, SharedBlobSparedUntilBothRefsDrop)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r1 = ref(1, 0xA1);
     const ManifestRef r2 = ref(2, 0xA2);
@@ -829,7 +829,7 @@ TEST(CasGcRound, SharedBlobSparedUntilBothRefsDrop)
 TEST(CasGcRound, RepublishDuringFenceWindowSparesOnlyReReferencedBlob)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r1 = ref(1, 0xB1);
     const ManifestRef r2 = ref(2, 0xB2);
@@ -869,7 +869,7 @@ TEST(CasGcRound, RepublishDuringFenceWindowSparesOnlyReReferencedBlob)
 TEST(CasGcRound, IdempotentRerunAtFixpointIsNoOp)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(1, 0xAA);
     const ManifestId id{ns, r};
@@ -909,7 +909,7 @@ TEST(CasGcRound, IdempotentRerunAtFixpointIsNoOp)
 TEST(CasGcRound, SplitBrainLeadersOnlyDuplicateWork)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref(1, 0xAA);
     const ManifestId id{ns, r};
@@ -1334,7 +1334,7 @@ TEST(CasGcRound, OrphanManifestCursorSweepDeletesAndPersistsCursor)
     /// This test drives MANY consecutive rounds expecting each to sweep + persist the cursor; force
     /// fold-every-round (Phase-4 Lever A would otherwise defer once the pool quiesces).
     config.gc_fold_max_defer_rounds = 0;
-    auto store = openTestStoreWithConfig(backend, config);
+    auto store = openTestPoolWithConfig(backend, config);
 
     const RootNamespace ns{"test/aa@cas@"};
     registerNamespaceRaw(*backend, store->layout(), ns);
@@ -1365,7 +1365,7 @@ TEST(CasGcRound, OrphanManifestCursorSweepDeletesAndPersistsCursor)
 TEST(CasGcRound, FoldManifestEdgesEmitsOnePlusEdgePerBlob)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
 
     const ManifestRef r = ref(1, 0xAA);
@@ -1387,7 +1387,7 @@ TEST(CasGcRound, FoldManifestEdgesEmitsOnePlusEdgePerBlob)
 TEST(CasGcRound, ReFoldOfRemovalIsIdempotent)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
 
     const ManifestRef r = ref(1, 0xAA);
@@ -1414,7 +1414,7 @@ TEST(CasGcRound, ReFoldOfRemovalIsIdempotent)
 TEST(CasGcRound, TwoManifestsTwoSourceEdgesDropOneSpares)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
 
     const ManifestRef r1 = ref(1, 0xAA);

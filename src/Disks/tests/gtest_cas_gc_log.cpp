@@ -1,5 +1,5 @@
 #include <gtest/gtest.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBuild.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
@@ -40,9 +40,9 @@ namespace
 ManifestId publishPart(const PoolPtr & s, const String & ns, const String & ref, const String & payload)
 {
     const RootNamespace nsr{ns};
-    BuildInfo info;
+    PartWriteInfo info;
     info.intended_ref = ns + "/" + ref;
-    auto build = s->startBuild(info);
+    auto build = s->beginPartWrite(info);
     build->putBlob(idOf(payload), BlobSource::fromString(payload));
 
     ManifestEntry e;

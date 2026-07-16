@@ -119,7 +119,7 @@ private:
 TEST(CasGcAttempt, DeposedFoldAttemptDoesNotWedge)
 {
     auto backend = std::make_shared<InterruptRoundCasBackend>(/*gc_state_key*/ "p/gc/state");
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     ASSERT_EQ(store->layout().gcStateKey(), "p/gc/state");   // guard the injected key against layout drift
 
     const RootNamespace ns{"00/aa@cas@"};

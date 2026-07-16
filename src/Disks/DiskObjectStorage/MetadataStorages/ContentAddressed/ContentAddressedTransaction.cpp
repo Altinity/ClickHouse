@@ -1,6 +1,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBuild.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <IO/ReadBufferFromFile.h>
@@ -93,7 +93,7 @@ ContentAddressedTransaction::~ContentAddressedTransaction()
     cleanupPendingTempFiles();
 
     /// An uncommitted transaction's uploads become min_active-spared debris: abandon every
-    /// still-open Build so its build_seq is retired. Replaces the PoC's pin machinery.
+    /// still-open PartWriteTxn so its build_seq is retired. Replaces the PoC's pin machinery.
     if (committed)
         return;
 
@@ -121,12 +121,12 @@ ContentAddressedTransaction::stagingFor(const ContentAddressedMetadataStorage::R
     return parts[{r.ns.string(), r.ref}];
 }
 
-Cas::Build & ContentAddressedTransaction::buildFor(
+Cas::PartWriteTxn & ContentAddressedTransaction::buildFor(
     const ContentAddressedMetadataStorage::Route & r, PartStaging & st)
 {
     if (!st.build)
-        st.build = metadata_storage.store()->startBuild(
-            Cas::BuildInfo{.intended_ref = r.ns.string() + "/" + r.ref,
+        st.build = metadata_storage.store()->beginPartWrite(
+            Cas::PartWriteInfo{.intended_ref = r.ns.string() + "/" + r.ref,
                            .intended_namespace = r.ns, .op = Cas::ProvenanceOp::Insert});
     return *st.build;
 }
@@ -154,7 +154,7 @@ void ContentAddressedTransaction::cleanupPendingTempFiles() noexcept
                 /// Task 6 (S3-native staging plan): a successful commit deletes the S3 staging object
                 /// HERE — `committed` is only ever true when EVERY part's `publishStaging` ran to
                 /// completion (commit() sets it right before this call), which means every referenced
-                /// pending blob was already promoted (`Build::putBlob` → `promoteStaged`/`resurrectStaged`)
+                /// pending blob was already promoted (`PartWriteTxn::putBlob` → `promoteStaged`/`resurrectStaged`)
                 /// or, for a B189-orphaned pending blob (its entry removed by `unlinkFile`/`replaceFile`
                 /// before commit), was never going to be promoted at all — either way the staging object
                 /// is no longer needed as a resurrect source, so it is safe to reclaim now.
@@ -198,7 +198,7 @@ ContentAddressedTransaction::findPendingBlob(const PartStaging & st, const Cas::
 
 void ContentAddressedTransaction::adoptStagedBlob(
     const PartStaging::PendingBlob * pb, const Cas::ManifestEntry & entry,
-    PartStaging & dst_st, Cas::Build & dst_build, bool copy_pending)
+    PartStaging & dst_st, Cas::PartWriteTxn & dst_build, bool copy_pending)
 {
     if (pb)
     {
@@ -245,7 +245,7 @@ void ContentAddressedTransaction::uploadPendingBlobs(PartStaging & st)
         if (!referenced_hashes.count(pb.ref))
             continue;   /// B189: orphaned pending blob (entry removed by unlinkFile/replaceFile) — skip
         /// Task 5 (plan docs/superpowers/plans/2026-07-11-cas-s3-native-staging.md): each pending blob
-        /// is promoted through the SAME condemn/resurrect gate in `Build::putBlob`. Only the upload
+        /// is promoted through the SAME condemn/resurrect gate in `PartWriteTxn::putBlob`. Only the upload
         /// primitive differs by staging backend:
         ///   - `StagingBackend::Local`: `write_payload` re-reads the local staged temp file and streams
         ///     it into a write-once `putIfAbsentStream` create (byte-for-byte the pre-Task-5 path).
@@ -292,10 +292,10 @@ bool ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
     /// part once the ref already exists; `st.content_removed` holds paths a same-transaction
     /// unlinkFile staged for removal (§6). Carry every OTHER committed entry forward (minus any
     /// content_removed path) and republish once via the repoint path (Task 3), rather than letting
-    /// the Build path below replace the manifest with just the delta (which Task 2's promote guard
+    /// the PartWriteTxn path below replace the manifest with just the delta (which Task 2's promote guard
     /// would now reject with ABORTED for a genuine content change, or silently drop the untouched
     /// files for a pre-Task-2 build). Handles both sub-cases the interface allows: entries staged
-    /// WITH a Build (this transaction uploaded new content) and WITHOUT one (a former mutable
+    /// WITH a PartWriteTxn (this transaction uploaded new content) and WITHOUT one (a former mutable
     /// per-part file that is now an ordinary tree entry, or a marks-only removal with no writes).
     if (!st.entries.empty() || !st.content_removed.empty())
     {
@@ -351,7 +351,7 @@ bool ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
     /// observation. This is what lets promote skip re-validating tokened leaves (a condemnation in the
     /// putBlob→promote window cannot graduate — the next fold sees the edge). Moving putBlob before
     /// precommitAdd would adopt an incarnation with no protecting edge (the pre-B188 dangle shape) and
-    /// trips the EDGE-BEFORE-OBSERVE fail-closed throw in Build::observeAndAdmit; the TLA+ order
+    /// trips the EDGE-BEFORE-OBSERVE fail-closed throw in PartWriteTxn::observeAndAdmit; the TLA+ order
     /// sabotage (Gate A) is the formal guard.
     const Cas::ManifestId id = st.build->stageManifest(st.entries);
     st.build->precommitAdd(ns, ref, id);
@@ -606,7 +606,7 @@ void ContentAddressedTransaction::stageBlobPartFile(
 std::string ContentAddressedTransaction::buildS3StagingBlobHeader(
     const ContentAddressedMetadataStorage::Route & route) const
 {
-    /// Mirror `Build::uploadFromSource`'s `buildHeader` (minus the dropped `logical_size`/`logical_hash`
+    /// Mirror `PartWriteTxn::uploadFromSource`'s `buildHeader` (minus the dropped `logical_size`/`logical_hash`
     /// fields and minus `build_id`, which is not known until commit and is diagnostic-only). A FRESH
     /// `incarnation_tag` per staging object keeps the incarnation zone unique; the header is padded to
     /// the pool's fixed `blob_header_len` so the payload starts at a constant offset.
@@ -618,7 +618,7 @@ std::string ContentAddressedTransaction::buildS3StagingBlobHeader(
     header.kind = Cas::ObjectKind::Blob;
     header.incarnation_tag = (static_cast<UInt128>(thread_local_rng()) << 64) | thread_local_rng();
     header.build_id = 0;   /// not known at stream time; diagnostic-only (not read by GC/read paths)
-    /// ch = the real ClickHouse VERSION_INTEGER (diagnostic-only; consistent with `Build::buildHeader`).
+    /// ch = the real ClickHouse VERSION_INTEGER (diagnostic-only; consistent with `PartWriteTxn::buildHeader`).
     /// The v3 envelope drops hash_algo/domain_id/writer_version, so forensics ride on ch + bld.
     header.provenance = Cas::Provenance{
         /*created_at_ms*/ 0, cfg.server_id, VERSION_INTEGER, Cas::ProvenanceOp::Other};
@@ -790,7 +790,7 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
         [this, route = *r](std::string bytes)
         {
             /// Phase 3 T2: mint via the ONE write mint, `Cas::poolContentHash` (algo, payload) -> BlobRef
-            /// (`CasBuild.h`) -- the SAME mint the streaming blob path's callers use, so an inline file
+            /// (`CasPartWriteTxn.h`) -- the SAME mint the streaming blob path's callers use, so an inline file
             /// and a standalone blob of identical content get the same ref (same content hash identity)
             /// under EVERY algo, including sha256.
             const auto hash_algo = metadata_storage.store()->writeAlgo();
@@ -798,13 +798,13 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
             if (bytes.size() <= INLINE_CAP)
             {
                 auto & st = stagingFor(route);
-                /// An inline (no-blob) entry still requires a Build. `publishStaging` stages the
+                /// An inline (no-blob) entry still requires a PartWriteTxn. `publishStaging` stages the
                 /// manifest body, precommits, and promotes the ref even for a part with NO blob uploads;
                 /// it asserts `st.build != nullptr` whenever `st.entries` is non-empty. Without this, a
                 /// part whose files are ALL inline (a tiny/empty merge output, every file <= INLINE_CAP)
-                /// reaches `publishStaging` with entries but no Build -> LOGICAL_ERROR "staged entries
-                /// without a Build" -> server crash under abort_on_logical_error (CRASH-CA-S3, pre-existing
-                /// since the inline-files feature). The blob path already establishes the Build via
+                /// reaches `publishStaging` with entries but no PartWriteTxn -> LOGICAL_ERROR "staged entries
+                /// without a PartWriteTxn" -> server crash under abort_on_logical_error (CRASH-CA-S3, pre-existing
+                /// since the inline-files feature). The blob path already establishes the PartWriteTxn via
                 /// `buildFor`; the inline path must do the same.
                 buildFor(route, st);
                 Cas::ManifestEntry entry;
@@ -956,7 +956,7 @@ void ContentAddressedTransaction::createHardLink(const std::string & path_from, 
 
     auto & dst_st = stagingFor(*dst);
 
-    /// Content file. Prefer an entry staged earlier in THIS transaction (the destination Build
+    /// Content file. Prefer an entry staged earlier in THIS transaction (the destination PartWriteTxn
     /// re-observes the blob via cold reuse — its own dependency); else carry forward from the
     /// COMMITTED source part (adoptFromTree: tokenless evidence pinned by the witnessed live
     /// source tree, W-EVIDENCE).

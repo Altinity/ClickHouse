@@ -1,5 +1,5 @@
 #include <gtest/gtest.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBuild.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
@@ -56,7 +56,7 @@ using DB::Cas::tests::writeBlobRaw;
 namespace
 {
 
-PoolPtr openStore(const std::shared_ptr<InMemoryBackend> & b)
+PoolPtr openPool(const std::shared_ptr<InMemoryBackend> & b)
 {
     return Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
 }
@@ -68,12 +68,12 @@ ManifestEntry blobEntry(const String & path, const String & payload)
 }
 
 /// Start a build whose `intended_ref` is "ns/ref" — REQUIRED: stageManifest derives the manifest's
-/// owning namespace by splitting intended_ref on the LAST '/'. (See Build::manifestNamespace.)
-BuildPtr startBuildFor(const PoolPtr & s, const RootNamespace & ns, const String & ref)
+/// owning namespace by splitting intended_ref on the LAST '/'. (See PartWriteTxn::manifestNamespace.)
+PartWriteTxnPtr startBuildFor(const PoolPtr & s, const RootNamespace & ns, const String & ref)
 {
-    BuildInfo info;
+    PartWriteInfo info;
     info.intended_ref = ns.string() + "/" + ref;
-    return s->startBuild(info);
+    return s->beginPartWrite(info);
 }
 
 /// The full write flow for a part whose only file is `payload` at `path` (blob placement). Uploads the
@@ -120,7 +120,7 @@ TEST(CasProtocol, FenceConflictCondemnedTokenedBlobCommitsWithTokenUnchanged)
     /// it) and promote does NOT re-validate or re-upload the tokened leaf. promote COMMITS with the blob's
     /// token UNCHANGED; the premature condemn is invisible to the client.
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = openStore(b);
+    auto s = openPool(b);
     const RootNamespace ns{"srv1/tbl"};
 
     /// Wiring order: stage + precommit (durable edge) BEFORE putBlob observes X (records token t0).
@@ -151,7 +151,7 @@ TEST(CasProtocol, RevalidateReObservesStaleTokenKeepsWhenUnchanged)
     /// Under EDGE-BEFORE-OBSERVE the tokened leaf is NOT re-observed at the promote gate at all — it is
     /// edge-protected — so promote commits in place with the token UNCHANGED (no HEAD, no rewrite).
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = openStore(b);
+    auto s = openPool(b);
     const RootNamespace ns{"srv1/tbl"};
 
     /// X pre-exists out-of-band; the build dedup-adopts it via putBlob (records the current token t0).
@@ -184,7 +184,7 @@ TEST(CasProtocol, RevalidateReObservesStaleTokenAdoptsWhenDisplaced)
     /// re-HEAD happens. The commit still rides the displaced object correctly because the manifest names
     /// the HASH, not a token — this is the black-box "displaced object still reads by content key" check.
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = openStore(b);
+    auto s = openPool(b);
     const RootNamespace ns{"srv1/tbl"};
 
     writeBlobRaw(*b, s->layout(), "payload-X", s->poolMeta().blob_header_len, s->poolMeta().pool_id);
@@ -275,13 +275,13 @@ TEST(CasProtocol, EvidenceHitCondemnedPresentBlobCopiesForwardInClosure)
     /// meta is NOT flipped (the gate never reads or writes it). A non-tokened leaf is the only leaf promote
     /// still decides on; here it is trusted (tokened leaves are edge-protected).
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = openStore(b);
+    auto s = openPool(b);
     const RootNamespace ns{"srv1/tbl"};
 
     /// X pre-exists with token t0; the manifest names it as a tokenless adopted leaf.
     const String hex = streamingHexOf("payload-X");
     {
-        auto seed = s->startBuild({});
+        auto seed = s->beginPartWrite({});
         seed->putBlob(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hexToU128(hex))}, BlobSource::fromString("payload-X"));
     }
     const String blob_key = s->layout().blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hexToU128(hex))});
@@ -320,7 +320,7 @@ TEST(CasProtocol, WedgedHeartbeatCondemnedTokenedBlobCommitsWithTokenUnchanged)
     /// The genuine dead-build case (precommit reclaimed ⇒ owner check aborts, NO re-upload) is covered
     /// separately by CaWiringResurrect.PromoteAbandonedPrecommitAbortsWithoutResurrect.
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = openStore(b);
+    auto s = openPool(b);
     const RootNamespace ns{"srv1/tbl"};
 
     /// Wiring order: stage + precommit (durable edge) BEFORE putBlob observes X.
@@ -347,7 +347,7 @@ TEST(CasProtocol, AbandonLeavesDebrisAndDisables)
     /// abandon leaves the uploaded blob + staged manifest body as debris (reaped by the orphan sweep);
     /// no owner transition is touched, and further build ops fail LOGICAL_ERROR (requireAlive).
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = openStore(b);
+    auto s = openPool(b);
     const RootNamespace ns{"srv1/tbl"};
 
     auto build = startBuildFor(s, ns, "part_1");
@@ -372,7 +372,7 @@ TEST(CasProtocol, DropReattachThroughDetachedNamespace)
     /// from ns; then re-publish part_1 back in ns + drop from detached. The BLOB is never re-uploaded
     /// (its token is stable throughout); each namespace gets its own single-owner manifest.
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = openStore(b);
+    auto s = openPool(b);
     const RootNamespace ns{"srv1/tbl"};
     const RootNamespace detached{"srv1/tbl/detached"};
 
@@ -409,7 +409,7 @@ TEST(CasProtocol, FreezeIntoShadowNamespace)
     /// FREEZE survives the table's part lifecycle (design §4): a shadow ref is a reachability root that
     /// outlives the dropped live ref.
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = openStore(b);
+    auto s = openPool(b);
     const RootNamespace ns{"srv1/tbl"};
     const RootNamespace shadow{"shadow/backup1/tbl"};
 
@@ -433,7 +433,7 @@ TEST(CasProtocol, DisplacedToLiveTokenCommitsAtCurrentIncarnation)
     /// EDGE-BEFORE-OBSERVE); the commit is correct by content addressing, not by revalidation. The old
     /// conservative ABORTED has no manifest-model analog.
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = openStore(b);
+    auto s = openPool(b);
     const RootNamespace ns{"srv1/tbl"};
 
     writeBlobRaw(*b, s->layout(), "payload-X", s->poolMeta().blob_header_len, s->poolMeta().pool_id);
@@ -472,14 +472,14 @@ TEST(CasProtocol, NewNamespacePublishGatedByShardFenceFloor)
     /// ack-floor GC pipeline retires + deletes it, then B publishes into a fresh namespace. §4 manifest-
     /// trust: B's leaf is a committed-source adopted leaf, so promote TRUSTS it (no HEAD/loadMeta probe) and
     /// COMMITS. On the real path this dangle is UNREACHABLE — B's precommit edge pins the blob at in-degree
-    /// >= 1 through promote (CasBuild.cpp precommitAdd → promote's WPromote owner==bld re-proof precedes the
+    /// >= 1 through promote (CasPartWriteTxn.cpp precommitAdd → promote's WPromote owner==bld re-proof precedes the
     /// trust), so GC cannot delete it; here the test drives GC to delete the blob while B has NOT yet
     /// precommitted, which the live-precommit invariant excludes. The dangle is DETECTED by fsck's
     /// reachable-but-absent scan (the backstop), not prevented at promote.
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = openStore(b);
+    auto s = openPool(b);
 
-    /// 1. part_1 → a blob in namespace A, through the real Build.
+    /// 1. part_1 → a blob in namespace A, through the real PartWriteTxn.
     const RootNamespace ns_a{"srv1/tbl"};
     auto build_a = startBuildFor(s, ns_a, "part_1");
     build_a->putBlob(idOf("floor-payload"), BlobSource::fromString("floor-payload"));
@@ -536,15 +536,15 @@ TEST(CasProtocol, FreshEvidenceDepWithViewHitIsResolvedByGate)
     DB::Cas::Layout layout("p");
     const String hex = streamingHexOf("payload-fresh-ev");
     {
-        auto s0 = openStore(b);
-        auto build0 = s0->startBuild({});
+        auto s0 = openPool(b);
+        auto build0 = s0->beginPartWrite({});
         build0->putBlob(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hexToU128(hex))}, BlobSource::fromString("payload-fresh-ev"));
     }
     const String blob_key = layout.blobKey(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hexToU128(hex))});
     const Token t0 = b->head(blob_key).token;
     condemnMeta(*b, layout, hexToU128(hex), /*condemn_round*/ 1);
 
-    auto s = openStore(b);
+    auto s = openPool(b);
 
     const RootNamespace ns{"srv1/tbl"};
     auto build = startBuildFor(s, ns, "part_1");
@@ -565,13 +565,13 @@ TEST(CasProtocol, FreshEvidenceDepWithViewHitIsResolvedByGate)
 TEST(CasProtocol, AdoptedLeafCarriesRealBlobSize)
 {
     /// B92 round-trip (re-expressed on the manifest model): an adopted leaf must carry its real
-    /// blob_size, NOT 0. Build A publishes a blob; build B adopts that leaf into a second ref. The
+    /// blob_size, NOT 0. PartWriteTxn A publishes a blob; build B adopts that leaf into a second ref. The
     /// adopted manifest's entry must report the same non-zero blob_size as the original.
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = openStore(b);
+    auto s = openPool(b);
     const RootNamespace ns{"srv1/tbl"};
 
-    /// Build A: a blob with a real payload so blob_size > 0.
+    /// PartWriteTxn A: a blob with a real payload so blob_size > 0.
     const ManifestId id_a = publishBlobPart(s, ns, "ref_a", "data.bin", "payload-B92");
 
     const PartManifest manifest_a = s->readManifest(id_a);
@@ -581,7 +581,7 @@ TEST(CasProtocol, AdoptedLeafCarriesRealBlobSize)
     EXPECT_NE(size_a, 0u) << "ref A blob_size must be non-zero";
     EXPECT_EQ(size_a, String("payload-B92").size());
 
-    /// Build B: adopt the same leaf, publish as ref_b (no re-upload).
+    /// PartWriteTxn B: adopt the same leaf, publish as ref_b (no re-upload).
     auto build_b = startBuildFor(s, ns, "ref_b");
     ASSERT_TRUE(entry_a != nullptr);
     build_b->adoptEvidence(*entry_a);

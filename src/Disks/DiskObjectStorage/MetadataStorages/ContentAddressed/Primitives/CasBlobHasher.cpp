@@ -251,7 +251,7 @@ String blobHashHexOneShot(BlobHashAlgo algo, std::string_view bytes)
     {
         case BlobHashAlgo::CityHash128:
         {
-            /// The POOL-WIDE content-hash convention (mirrors `poolContentHash` in `CasBuild.cpp`):
+            /// The POOL-WIDE content-hash convention (mirrors `poolContentHash` in `CasPartWriteTxn.cpp`):
             /// the streaming `HashingReadBuffer` hash (chunked `CityHash128WithSeed`, chained per
             /// `DBMS_DEFAULT_HASHING_BLOCK_SIZE`), NOT a one-shot `CityHash128WithSeed` call (which
             /// diverges for any payload larger than one hash block).

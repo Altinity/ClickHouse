@@ -207,7 +207,7 @@ TEST(CasDecommission, ErasesAllVictimNamespaces)
 /// `writer_epoch` (999999) specifically to dodge the writer's OWN stale-precommit sweep -- which
 /// means it never exercised the path a REAL victim precommit takes. A genuine writer stamps
 /// `manifest_ref.writer_epoch` from its OWN `liveWriterEpoch()` at precommit time
-/// (`Build::precommitAdd`, CasPool.cpp:2087), i.e. the victim's era -- always LOWER than the admin
+/// (`PartWriteTxn::precommitAdd`, CasPool.cpp:2087), i.e. the victim's era -- always LOWER than the admin
 /// mount's freshly-minted epoch (`openForDecommission` always bumps strictly higher). `appendRefOps`
 /// hoists `maybeSweepStalePrecommits` at its top (CasPool.cpp:1716), so without the
 /// `skip_stale_precommit_sweep` fix that sweep would reclaim this realistic-epoch precommit in its

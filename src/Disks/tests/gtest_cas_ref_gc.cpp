@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBuild.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
@@ -116,7 +116,7 @@ public:
 TEST(CasRefGc, LargeRefScanFoldsEveryLogExactlyOnce)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/aa@cas@"};
 
@@ -146,7 +146,7 @@ TEST(CasRefGc, LargeRefScanFoldsEveryLogExactlyOnce)
 TEST(CasRefGc, ConcurrentLogAfterScanIsFoldedNextRound)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/aa@cas@"};
 
@@ -180,7 +180,7 @@ TEST(CasRefGc, ConcurrentLogAfterScanIsFoldedNextRound)
 TEST(CasRefGc, FoldBarrierClampsBelowMissingBodyThenFoldsOnAppear)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/aa@cas@"};
 
@@ -208,7 +208,7 @@ TEST(CasRefGc, FoldBarrierClampsBelowMissingBodyThenFoldsOnAppear)
 TEST(CasRefGc, EdgeCancellationAddThenRemoveReclaimsBlob)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/aa@cas@"};
 
@@ -234,7 +234,7 @@ TEST(CasRefGc, EdgeCancellationAddThenRemoveReclaimsBlob)
 TEST(CasRefGc, LosingGenerationCommitAdoptsNothingDeletesNothing)
 {
     auto backend = std::make_shared<DeposeRoundCommitBackend>();
-    auto store = openStoreForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/aa@cas@"};
 
@@ -270,7 +270,7 @@ TEST(CasRefGc, LosingGenerationCommitAdoptsNothingDeletesNothing)
 TEST(CasRefGc, RefObjectCleanupHonorsAllThreeConditions)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/aa@cas@"};
 
@@ -322,7 +322,7 @@ TEST(CasRefGc, RefIntakeIncrementsObservabilityCounters)
     const auto cleaned_before    = global_counters[ProfileEvents::CasRefCleanupObjectsDeleted].load();
 
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/aa@cas@"};
 
@@ -356,7 +356,7 @@ TEST(CasRefGc, RefIntakeIncrementsObservabilityCounters)
 TEST(CasRefGc, RefSnaplogLifecycleE2E)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
     const Layout & layout = store->layout();
     const RootNamespace ns_a{"00/aa@cas@"};
     const RootNamespace ns_b{"00/bb@cas@"};
@@ -420,9 +420,9 @@ TEST(CasRefGc, RemoveNamespaceCompletesAndPublishesMarkerDeterministically)
 
     /// Real writer: publish a committed part, then DROP the whole namespace (remove_namespace).
     {
-        BuildInfo info;
+        PartWriteInfo info;
         info.intended_ref = ns.string() + "/part_1";
-        auto build = store->startBuild(info);
+        auto build = store->beginPartWrite(info);
         const ManifestId id = build->stageManifest({});
         build->precommitAdd(ns, "part_1", id);
         build->promote(ns, "part_1", build->buildId(), id);
@@ -487,9 +487,9 @@ TEST(CasRefGc, RemoveNamespaceCompletesAndPublishesMarkerDeterministically)
     /// cache miss, so a fresh `namespace_birth` is admitted (spec §Namespace Birth) without a remount. The
     /// recreation carries a strictly greater `RefTxnId`, continuing the same ordered history.
     {
-        BuildInfo info;
+        PartWriteInfo info;
         info.intended_ref = ns.string() + "/part_2";
-        auto build = store->startBuild(info);
+        auto build = store->beginPartWrite(info);
         const ManifestId id2 = build->stageManifest({});
         ASSERT_NO_THROW(build->precommitAdd(ns, "part_2", id2))
             << "recreation after GC published the _cleanup marker must be admitted from a warm mount";
@@ -521,10 +521,10 @@ TEST(CasRefGc, RemovedNamespaceCoveredLogsCleanedByCompletingRound)
     /// Real writer: publish several committed parts (each is a `_log`), then DROP the whole namespace.
     for (int i = 1; i <= 4; ++i)
     {
-        BuildInfo info;
+        PartWriteInfo info;
         const String part = "part_" + std::to_string(i);
         info.intended_ref = ns.string() + "/" + part;
-        auto build = store->startBuild(info);
+        auto build = store->beginPartWrite(info);
         const ManifestId id = build->stageManifest({});
         build->precommitAdd(ns, part, id);
         build->promote(ns, part, build->buildId(), id);
@@ -586,7 +586,7 @@ TEST(CasRefGc, RemovedNamespaceCoveredLogsCleanedByCompletingRound)
 TEST(CasRefGc, MalformedRefKeyAbortsRefFoldingNoPartialDelta)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/aa@cas@"};
 
@@ -616,7 +616,7 @@ TEST(CasRefGc, MalformedRefKeyAbortsRefFoldingNoPartialDelta)
 TEST(CasRefGc, InvalidRefLogBodyAbortsFoldNoPartialDelta)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/aa@cas@"};
 
@@ -647,7 +647,7 @@ TEST(CasRefGc, InvalidRefLogBodyAbortsFoldNoPartialDelta)
 TEST(CasRefGc, BaselineGuardRefusesWhenSnapshotSurvivesWithoutLogsOrCursor)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
     const Layout & layout = store->layout();
 
     /// Table A is healthy (a committed ref with its manifest+blob, no snapshot), giving GC a normal table
@@ -685,7 +685,7 @@ TEST(CasRefGc, BaselineGuardRefusesWhenSnapshotSurvivesWithoutLogsOrCursor)
 TEST(CasRefGc, StaleLeaderPendingPassAbortsOnCompletionMarker)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/aa@cas@"};
 
@@ -725,7 +725,7 @@ TEST(CasRefGc, StaleLeaderPendingPassAbortsOnCompletionMarker)
 TEST(CasRefGc, StaleLeaderPendingPassAbortsWhenRoundAdvanced)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/aa@cas@"};
 
@@ -764,7 +764,7 @@ TEST(CasRefGc, StaleLeaderPendingPassAbortsWhenRoundAdvanced)
 TEST(CasRefGc, PendingPassEpochFiltersManifestDeletes)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/aa@cas@"};
 
@@ -808,9 +808,9 @@ TEST(CasRefGc, RecreatedNamespaceRetiresCleanupItemAndStopsChurn)
 
     /// Real writer: publish a committed part, then DROP the whole namespace.
     {
-        BuildInfo info;
+        PartWriteInfo info;
         info.intended_ref = ns.string() + "/part_1";
-        auto build = store->startBuild(info);
+        auto build = store->beginPartWrite(info);
         const ManifestId id = build->stageManifest({});
         build->precommitAdd(ns, "part_1", id);
         build->promote(ns, "part_1", build->buildId(), id);
@@ -880,9 +880,9 @@ TEST(CasRefGc, CompletedItemRepublishesCrashLostRemovedSnapshotThenRetires)
     const RootNamespace ns{"test/tbl"};
 
     {
-        BuildInfo info;
+        PartWriteInfo info;
         info.intended_ref = ns.string() + "/part_1";
-        auto build = store->startBuild(info);
+        auto build = store->beginPartWrite(info);
         const ManifestId id = build->stageManifest({});
         build->precommitAdd(ns, "part_1", id);
         build->promote(ns, "part_1", build->buildId(), id);
@@ -955,7 +955,7 @@ public:
 TEST(CasRefGc, PendingPassPerKeyMarkerGuardSparesWarmSameEpochRecreation)
 {
     auto backend = std::make_shared<MarkerAppearsAfterFirstHeadBackend>();
-    auto store = openStoreForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
     const Layout & layout = store->layout();
     const RootNamespace ns{"00/aa@cas@"};
 

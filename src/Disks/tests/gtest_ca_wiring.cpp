@@ -240,7 +240,7 @@ TEST(CaPartPathParser, SplitCacheEvictionStaysCorrect)
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedExchange.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/Plain/MetadataStorageFromPlainObjectStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBuild.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
@@ -267,7 +267,7 @@ DB::Cas::ManifestEntry wiringBlobEntry(const String & path, const String & paylo
 }
 
 /// All-tree-part-files Task 6/9: the small per-part files (uuid.txt, metadata_version.txt, ...) are
-/// ordinary Inline-placement manifest entries now — this is the low-level Build-API equivalent of
+/// ordinary Inline-placement manifest entries now — this is the low-level PartWriteTxn-API equivalent of
 /// what `ContentAddressedTransaction::writeFile`'s inline candidate path stages in production.
 DB::Cas::ManifestEntry wiringInlineEntry(const String & path, const String & bytes)
 {
@@ -292,19 +292,19 @@ std::shared_ptr<DB::ContentAddressedMetadataStorage> openWiringStorage()
 
 /// One part with a content blob, a projection file, and the small per-part files (uuid.txt,
 /// metadata_version.txt — ordinary Inline entries now, all-tree-part-files Task 6/9), published
-/// through the real Build into `ns` under `ref`.
+/// through the real PartWriteTxn into `ns` under `ref`.
 void publishWiredPart(
     DB::ContentAddressedMetadataStorage & storage, const DB::Cas::RootNamespace & ns, const String & ref)
 {
-    /// Port off the removed Build::putTree/publish API onto the part-manifest write flow
-    /// (startBuild → stageManifest → precommitAdd → putBlob → promote). The wiring sets the owning
+    /// Port off the removed PartWriteTxn::putTree/publish API onto the part-manifest write flow
+    /// (beginPartWrite → stageManifest → precommitAdd → putBlob → promote). The wiring sets the owning
     /// namespace EXPLICITLY (intended_namespace) — faithful to ContentAddressedTransaction — so a
     /// `detached/<part>` ref (which itself contains '/') is staged in the TABLE namespace, not in a
     /// spurious `<ns>/detached` namespace. intended_ref stays as "ns/ref" diagnostic forensics.
-    DB::Cas::BuildInfo info;
+    DB::Cas::PartWriteInfo info;
     info.intended_ref = ns.string() + "/" + ref;
     info.intended_namespace = ns;
-    auto build = storage.store()->startBuild(info);
+    auto build = storage.store()->beginPartWrite(info);
 
     /// Strictly ascending canonical path order (PartFolderView's binary-search precondition):
     /// data.bin < metadata_version.txt < p.proj/data.bin < uuid.txt.
@@ -663,11 +663,11 @@ TEST(CaWiringWrite, ContentRoundTripThroughTransaction)
 
 TEST(CaWiringWrite, InlineOnlyPartPublishesWithoutBuildCrash)
 {
-    /// Regression (CRASH-CA-S3 "staged entries without a Build"): a part whose files are ALL inline
+    /// Regression (CRASH-CA-S3 "staged entries without a PartWriteTxn"): a part whose files are ALL inline
     /// — no `partFileMustStayBlob` file (`.bin`/`.mrk*`/`primary.idx`), e.g. an EMPTY merge output that
     /// writes only `checksums.txt`/`count.txt` and no `data.bin` — staged manifest entries via the
-    /// inline write path, which did NOT establish a Build (only the blob path did, via `buildFor`). So
-    /// `publishStaging` reached its `st.build != nullptr` invariant with entries but no Build and threw
+    /// inline write path, which did NOT establish a PartWriteTxn (only the blob path did, via `buildFor`). So
+    /// `publishStaging` reached its `st.build != nullptr` invariant with entries but no PartWriteTxn and threw
     /// LOGICAL_ERROR — a SERVER CRASH under `abort_on_logical_error`. Writing only inline metadata files
     /// to a fresh part and committing must SUCCEED and publish the part. (Bug pre-existed the inline-files
     /// feature; fix: the inline path now calls `buildFor` like the blob path.)
@@ -710,7 +710,7 @@ TEST(CaWiringWrite, UncommittedTransactionPublishesNothing)
     {
         auto tx = storage->createTransaction();
         writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/data.bin", "doomed");
-        /// destroyed without commit => Build abandoned (uploads are heartbeat-gated debris)
+        /// destroyed without commit => PartWriteTxn abandoned (uploads are heartbeat-gated debris)
     }
     EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/all_1_1_0"));
     EXPECT_FALSE(storage->existsFile("uui/uuid-1/all_1_1_0/data.bin"));
@@ -1005,7 +1005,7 @@ TEST(CaWiringOps, MoveDirectoryMutableCollisionPolicy)
 }
 
 /// D3 review pin: moveDirectory's staged-merge collision code has four (src build?, dst build?)
-/// combinations. This one — destination already holds a staged Build, source has none — proved
+/// combinations. This one — destination already holds a staged PartWriteTxn, source has none — proved
 /// confusable when the plan's author sketched a fix: a naive rewrite of the four-way branch can fall
 /// through to `src_st.build->abandon()` on a null build. The merge must be a pure no-op on the
 /// destination's build in this combination — no abandon, no adopt — while everything else (any
@@ -1017,7 +1017,7 @@ TEST(CaWiringOps, MoveDirectoryMutableCollisionPolicy)
 /// buildFor" fact to keep `src_st.build` null. Since Task 6/9, `writeFile`'s inline-candidate path
 /// (which `txn_version.txt` now takes — it is an ordinary tree entry, not a mutable sidecar file)
 /// unconditionally calls `buildFor` for ANY inline entry, so the source silently acquired a REAL
-/// Build and this test drifted onto the *other* merge branch (`else if (src_st.build)`) without
+/// PartWriteTxn and this test drifted onto the *other* merge branch (`else if (src_st.build)`) without
 /// failing — both branches produce the same externally-visible result (assertions passed either
 /// way), so the drift was invisible. Fixed by staging the source via `unlinkFile` instead of a
 /// write: Task 8's removal-mark staging (`content_removed`) is the one remaining staging shape that
@@ -1025,12 +1025,12 @@ TEST(CaWiringOps, MoveDirectoryMutableCollisionPolicy)
 /// this), so `parts[src_key]` exists but `src_st.build` stays null again, restoring the test's
 /// documented precondition.
 ///
-/// Made RED-able (the review's ask): `Build::abandon()` unconditionally emits a `BuildAbort`
-/// `CasEvent` (`CasBuild.cpp`) — this only happens if the buggy `else if (src_st.build)` branch
+/// Made RED-able (the review's ask): `PartWriteTxn::abandon()` unconditionally emits a `BuildAbort`
+/// `CasEvent` (`CasPartWriteTxn.cpp`) — this only happens if the buggy `else if (src_st.build)` branch
 /// runs `src_st.build->abandon()`. Registering an event sink (`Cas::Pool::setEventSink`, the same
 /// public test hook `gtest_cas_event_log.cpp` uses) and asserting no `BuildAbort` event fires is a
 /// genuine behavioral discriminator between the two merge branches — not just "assertions pass
-/// either way" — so a future regression that gives the source a Build again fails this test loudly.
+/// either way" — so a future regression that gives the source a PartWriteTxn again fails this test loudly.
 TEST(CaWiringOps, MoveDirectoryOntoExistingDestinationBuildSurvives)
 {
     auto storage = openWiringStorage();
@@ -1038,7 +1038,7 @@ TEST(CaWiringOps, MoveDirectoryOntoExistingDestinationBuildSurvives)
     storage->store()->setEventSink([&](const DB::Cas::CasEvent & e) { events.push_back(e); });
 
     auto tx = storage->createTransaction();
-    /// Destination already has a real blob upload staged -> a live Build.
+    /// Destination already has a real blob upload staged -> a live PartWriteTxn.
     writeThroughTransaction(*tx, "uui/uuid-1/all_7_7_7/data.bin", "dst-content");
     /// Source is staged with ONLY a removal mark (Task 8's content_removed staging) -> parts[src_key]
     /// exists, but src_st.build stays null (unlinkFile never calls buildFor).
@@ -1052,7 +1052,7 @@ TEST(CaWiringOps, MoveDirectoryOntoExistingDestinationBuildSurvives)
     /// merge-and-abandon branch. Checked right after the re-key so it stays scoped to the merge.
     EXPECT_FALSE(std::any_of(events.begin(), events.end(),
         [](const DB::Cas::CasEvent & e) { return e.type == DB::Cas::CasEventType::BuildAbort; }))
-        << "src_st.build->abandon() fired — the source unexpectedly has a real Build again";
+        << "src_st.build->abandon() fired — the source unexpectedly has a real PartWriteTxn again";
 
     /// [TXN-ONE-PIPELINE] the re-key does not publish; the destination's build is materialized only at
     /// commit(). The destination's own build then publishes its own content untouched; the source's
@@ -1396,10 +1396,10 @@ TEST(CaWiringExchange, AdoptPartFromManifestSelfContainedWithoutMutableFilesSide
     auto storage = openWiringStorage();
     const auto sender_ns = storage->liveNamespace("uuid-1");
 
-    DB::Cas::BuildInfo info;
+    DB::Cas::PartWriteInfo info;
     info.intended_ref = sender_ns.string() + "/all_1_1_0";
     info.intended_namespace = sender_ns;
-    auto build = storage->store()->startBuild(info);
+    auto build = storage->store()->beginPartWrite(info);
     const auto id = build->stageManifest(
         {wiringBlobEntry("data.bin", "payload-A"),
          wiringBlobEntry("uuid.txt", "payload-uuid"),
@@ -1483,7 +1483,7 @@ public:
 };
 
 /// True for a per-part manifest BODY object (<...>/cas/manifests/<namespace...>/<epoch-seq>/<NNNNNN>.zst)
-/// — the FIRST durable object `publishStaging` writes for a part (via `Build::stageManifest`). Since Task B
+/// — the FIRST durable object `publishStaging` writes for a part (via `PartWriteTxn::stageManifest`). Since Task B
 /// (chaos-tolerance-report) that write rides the CAS request controller: a transient fault is retried
 /// (budgeted attempts + resolve-before-reissue), so an injected fault must be PERSISTENT to fail the
 /// publish — the controller exhausts its budget and `stageManifest` throws ABORTED out of `publishStaging`.
@@ -2312,9 +2312,9 @@ TEST(CaWiringResurrect, PromoteIgnoresCondemnedTokenedBlobEdgeProtected)
     const String ref = "all_1_1_0";
     const String P = "resurrect-me";
 
-    BuildInfo info;
+    PartWriteInfo info;
     info.intended_ref = ns.string() + "/" + ref;
-    auto build = store->startBuild(info);
+    auto build = store->beginPartWrite(info);
 
     const ManifestId id = build->stageManifest({wiringBlobEntry("data.bin", P)});
     build->precommitAdd(ns, ref, id);
@@ -2353,7 +2353,7 @@ TEST(CaWiringResurrect, PromoteIgnoresCondemnedTokenedBlobEdgeProtected)
 ///
 /// This drives that guard the DETERMINISTIC way: a promote whose precommit was NEVER added (so the binding
 /// is simply absent). The original "precommit added, then REMOVED out from under a still-live build" shape is
-/// NOT reachable by any deterministic single-threaded in-runtime actor: `Build::abandon` marks the build
+/// NOT reachable by any deterministic single-threaded in-runtime actor: `PartWriteTxn::abandon` marks the build
 /// not-alive (`requireAlive` → LOGICAL_ERROR) and `Pool::dropNamespace` cancels the build (`requireAlive` →
 /// ABORTED) — BOTH trip `requireAlive` at promote's first line, before this closure ever runs. Only a narrow
 /// promote-vs-dropNamespace RACE (dropNamespace clears the binding in the window between promote's
@@ -2370,9 +2370,9 @@ TEST(CaWiringResurrect, PromoteWithoutLivePrecommitAbortsWithoutResurrect)
     const String ref = "all_2_2_0";
     const String P = "abandoned-me";
 
-    BuildInfo info;
+    PartWriteInfo info;
     info.intended_ref = ns.string() + "/" + ref;
-    auto build = store->startBuild(info);
+    auto build = store->beginPartWrite(info);
 
     /// Stage the manifest and upload the (fresh) blob, but DO NOT precommitAdd — so the precommit owner
     /// binding is absent from the ref-table state when promote runs. A fresh putBlob needs no precommit

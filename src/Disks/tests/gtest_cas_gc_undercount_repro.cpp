@@ -77,7 +77,7 @@ RefOwnerBinding committed(const String & ref_name, const ManifestRef & r)
 TEST(CasGcUndercount, H2_DropThenRepointFromSameOldIsIdempotentNoUnderflow)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r1 = ref(1, 0xB1);
     const ManifestRef r2 = ref(2, 0xB2);
@@ -165,7 +165,7 @@ public:
 TEST(CasGcUndercount, H1_DrainAfterDeposedRemovalFoldDoesNotUnderflow)
 {
     auto backend = std::make_shared<InterruptRoundCasBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     ASSERT_EQ(store->layout().gcStateKey(), "p/gc/state");
 
     const RootNamespace ns{"00/aa@cas@"};
@@ -272,7 +272,7 @@ TEST(CasGcUndercount, H1b_FenceWindowRemovalReFoldedNextRoundUnderflows)
     /// which only runs on the round-commit CAS that ADVANCES snap_generation. With immutable logs an idle
     /// round DEFERS (never advancing the generation), so a default store would never fire the injection --
     /// forcing a fold each round keeps the fence-window injection point (and its re-fold) reachable.
-    auto store = openStoreForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
     ASSERT_EQ(store->layout().gcStateKey(), "p/gc/state");
 
     const RootNamespace ns{"00/aa@cas@"};

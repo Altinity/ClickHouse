@@ -1,5 +1,5 @@
 #include <gtest/gtest.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBuild.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPoolMetaFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
@@ -64,7 +64,7 @@ private:
     std::shared_ptr<DB::Cas::Backend> inner;
 };
 
-/// Publish one part `ref` through the REAL Build write path: stage a manifest holding a single content
+/// Publish one part `ref` through the REAL PartWriteTxn write path: stage a manifest holding a single content
 /// blob whose payload is `payload`, precommit-add into the owning shard, then promote precommit ->
 /// committed. Returns the published ManifestId. This is the canonical write-side fixture for the
 /// read-path tests (the same shape as `publishPart` in gtest_cas_gc_log.cpp). The manifest entry path
@@ -74,9 +74,9 @@ ManifestId publishPart(
     const String & entry_path = "data.bin")
 {
     const RootNamespace nsr{ns};
-    BuildInfo info;
+    PartWriteInfo info;
     info.intended_ref = ns + "/" + ref;
-    auto build = s->startBuild(info);
+    auto build = s->beginPartWrite(info);
     build->putBlob(idOf(payload), BlobSource::fromString(payload));
 
     ManifestEntry e;
@@ -107,7 +107,7 @@ ManifestRef manifestRefFor(const String & tag)
         .manifest_ordinal = ordinal};
 }
 
-/// Publish a part holding the given manifest entries verbatim through the real Build. Used by read-path
+/// Publish a part holding the given manifest entries verbatim through the real PartWriteTxn. Used by read-path
 /// lookup/list tests that want a precise multi-entry manifest. Each Blob entry's body MUST be present at
 /// promote: the promote gate revalidates EVERY blob leaf with a HEAD and fails closed on an absent body.
 /// So write a blob body for each Blob entry (addressed by its hash) and record it as W-EVIDENCE before
@@ -116,9 +116,9 @@ ManifestId publishPartWithEntries(
     const PoolPtr & s, const String & ns, const String & ref, std::vector<ManifestEntry> entries)
 {
     const RootNamespace nsr{ns};
-    BuildInfo info;
+    PartWriteInfo info;
     info.intended_ref = ns + "/" + ref;
-    auto build = s->startBuild(info);
+    auto build = s->beginPartWrite(info);
     for (const auto & e : entries)
         if (e.placement == EntryPlacement::Blob)
         {
@@ -211,8 +211,8 @@ TEST(CasPool, SkipAccessCheckOpenSkipsProbeButStaysWritable)
         EXPECT_FALSE(watch->probe_touched) << "skip_access_check must perform no probe I/O";
 
         /// Prove the mount is genuinely WRITABLE, not merely non-null — a read_only open would also
-        /// satisfy the two assertions above. Publish a part through the real Build write path
-        /// (startBuild/putBlob/stageManifest/precommitAdd/promote) and read it back.
+        /// satisfy the two assertions above. Publish a part through the real PartWriteTxn write path
+        /// (beginPartWrite/putBlob/stageManifest/precommitAdd/promote) and read it back.
         publishPart(s, "srv-2/tbl", "part_1", "payload-x");
         const auto r = s->resolveRef(DB::Cas::RootNamespace{"srv-2/tbl"}, "part_1");
         ASSERT_TRUE(r.has_value()) << "skip_access_check open must accept real writes, not just open";
@@ -277,8 +277,8 @@ TEST(CasPool, MinActiveTracksInFlightBuilds)
     auto store = DB::Cas::Pool::open(backend, cfg);
 
     ASSERT_EQ(store->minActive(), store->peekNextBuildSeq());   /// no builds: floor == next seq
-    auto b1 = store->startBuild({});                            /// seq 1
-    auto b2 = store->startBuild({});                            /// seq 2
+    auto b1 = store->beginPartWrite({});                            /// seq 1
+    auto b2 = store->beginPartWrite({});                            /// seq 2
     ASSERT_EQ(store->minActive(), 1u);
     b1->abandon();                                              /// finishes seq 1
     ASSERT_EQ(store->minActive(), 2u);                          /// floor advances
@@ -295,10 +295,10 @@ TEST(CasPool, BuildSeqIsStrictlyMonotone)
     cfg.server_root_id = "test";
     cfg.background_watermark = false;
     auto store = DB::Cas::Pool::open(backend, cfg);
-    auto a = store->startBuild({});
+    auto a = store->beginPartWrite({});
     auto sa = a->buildSeq();
     a->abandon();
-    auto b = store->startBuild({});
+    auto b = store->beginPartWrite({});
     ASSERT_GT(b->buildSeq(), sa);                               /// never reused, never lower
 }
 
@@ -516,11 +516,11 @@ TEST(CasPool, ResolveReturnsManifestId)
     auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     const RootNamespace ns{"srv1/tbl"};
 
-    /// blob "hello world" + an inline file, published through the real Build write path.
+    /// blob "hello world" + an inline file, published through the real PartWriteTxn write path.
     const String payload = "hello world";
-    BuildInfo info;
+    PartWriteInfo info;
     info.intended_ref = ns.string() + "/part_1";
-    auto build = s->startBuild(info);
+    auto build = s->beginPartWrite(info);
     build->putBlob(idOf(payload), BlobSource::fromString(payload));
 
     ManifestEntry blob_entry;
@@ -608,7 +608,7 @@ TEST(CasPool, ReadManifestValidatesBodyAndFailsClosed)
 
     /// (3) a committed ref naming a manifest with NO body present => readManifest throws
     /// FILE_DOESNT_EXIST (INV-NO-DANGLE surfaced on the read path). resolveRef itself SUCCEEDS — refs
-    /// are pure manifest state. A raw ref-log fixture (not the real Build path, which validates the
+    /// are pure manifest state. A raw ref-log fixture (not the real PartWriteTxn path, which validates the
     /// body exists at promote) is the only way to construct this state.
     {
         const ManifestRef missing_ref = manifestRefFor("never-staged");
@@ -701,7 +701,7 @@ TEST(CasPool, ManifestCacheIsKeyedByIdAndToken)
 
     /// A fresh publish under a DIFFERENT ref name mints a NEW ManifestId: the cache (keyed by id) misses.
     /// (Promoting a different manifest over the SAME committed ref is a distinct promote-over-committed
-    /// leak that `Build::promote` now forbids — see the CasPromoteRepublish tests.)
+    /// leak that `PartWriteTxn::promote` now forbids — see the CasPromoteRepublish tests.)
     const ManifestId id2 = publishPart(s, ns.string(), "part_2", "payload-2");
     EXPECT_FALSE(id2 == id1);                       /// a new publish never reuses a ManifestId
     const String key2 = layout.manifestKey(id2);
@@ -1128,7 +1128,7 @@ private:
 
 }
 
-TEST(CasStoreMountFence, OpenRecoversFromFenceInAdoptWindowWithFreshEpoch)
+TEST(CasPoolMountFence, OpenRecoversFromFenceInAdoptWindowWithFreshEpoch)
 {
     auto inner = std::make_shared<InMemoryBackend>();
     auto fencing = std::make_shared<FenceInAdoptWindowBackend>(inner);
@@ -1211,10 +1211,10 @@ void fenceOutMount(DB::Cas::Backend & backend, const String & mount_key)
 
 }
 
-TEST(CasStoreRemount, FenceOutThenSelfRemountRestoresWrites)
+TEST(CasPoolRemount, FenceOutThenSelfRemountRestoresWrites)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = DB::Cas::tests::openStoreForTest(backend);
+    auto store = DB::Cas::tests::openPoolForTest(backend);
     const String mount_key = store->layout().mountKey("test");
     const uint64_t epoch_before = decodeMountLease(backend->get(mount_key)->bytes).writer_epoch;
     EXPECT_EQ(store->liveWriterEpoch(), epoch_before);
@@ -1237,11 +1237,11 @@ TEST(CasStoreRemount, FenceOutThenSelfRemountRestoresWrites)
     EXPECT_NO_THROW(store->renewWatermarkOnce());
 }
 
-TEST(CasStoreRemount, OldEpochBuildFailsClosedAfterRemount)
+TEST(CasPoolRemount, OldEpochBuildFailsClosedAfterRemount)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = DB::Cas::tests::openStoreForTest(backend);
-    auto build = store->startBuild({});
+    auto store = DB::Cas::tests::openPoolForTest(backend);
+    auto build = store->beginPartWrite({});
 
     fenceOutMount(*backend, store->layout().mountKey("test"));
     ASSERT_TRUE(store->tryRemountOnce());
@@ -1251,14 +1251,14 @@ TEST(CasStoreRemount, OldEpochBuildFailsClosedAfterRemount)
         [&] { build->putBlob(DB::Cas::tests::idOf("x"), DB::Cas::BlobSource::fromString("x")); });
 
     /// A FRESH build under the live incarnation works.
-    auto fresh = store->startBuild({});
+    auto fresh = store->beginPartWrite({});
     EXPECT_NO_THROW(fresh->putBlob(DB::Cas::tests::idOf("y"), DB::Cas::BlobSource::fromString("y")));
 }
 
-TEST(CasStoreRemount, ForeignOwnerIsNeverTakenOver)
+TEST(CasPoolRemount, ForeignOwnerIsNeverTakenOver)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = DB::Cas::tests::openStoreForTest(backend);
+    auto store = DB::Cas::tests::openPoolForTest(backend);
     const String mount_key = store->layout().mountKey("test");
 
     /// A genuinely foreign uuid holds the mount (live or not — foreign is terminal for the claim).
@@ -1274,7 +1274,7 @@ TEST(CasStoreRemount, ForeignOwnerIsNeverTakenOver)
     EXPECT_EQ(decodeMountLease(backend->get(mount_key)->bytes).server_uuid, foreign.server_uuid);
 }
 
-TEST(CasStoreRemount, ShutdownGuardRefusesToArmRemount)
+TEST(CasPoolRemount, ShutdownGuardRefusesToArmRemount)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     /// background_watermark = true so scheduleRemount actually arms a recovery thread in production mode
@@ -1321,7 +1321,7 @@ public:
 };
 }
 
-TEST(CasStoreShutdown, CleanStopDrainsAndWritesFarewell)
+TEST(CasPoolShutdown, CleanStopDrainsAndWritesFarewell)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = DB::Cas::Pool::open(backend, DB::Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
@@ -1337,7 +1337,7 @@ TEST(CasStoreShutdown, CleanStopDrainsAndWritesFarewell)
         << "a clean drain (no in-flight ref-log PUT) must write the farewell marker";
 }
 
-TEST(CasStoreShutdown, UnresolvedWedgeSkipsFarewell)
+TEST(CasPoolShutdown, UnresolvedWedgeSkipsFarewell)
 {
     CasRequestBudget budget;
     budget.max_attempts = 1;
@@ -1537,7 +1537,7 @@ TEST(CasRemountTmat, UnresolvedWedgePaysGraceAndMarksBoundaryUnclean)
     publishPart(store, ns.string(), "x", "payload");
 
     /// Force the ref-log append `dropRef` below performs into the Unresolved/wedge outcome (as in
-    /// `CasStoreShutdown.UnresolvedWedgeSkipsFarewell`): the single attempt the budget allows fails
+    /// `CasPoolShutdown.UnresolvedWedgeSkipsFarewell`): the single attempt the budget allows fails
     /// ambiguously.
     backend->fault_key_substr = layout.refsNamespacePrefix(ns) + "_log/";
     backend->fault_count = 1;
@@ -1593,7 +1593,7 @@ TEST(CasRemountTmat, CleanRemountAfterEarlierUncleanOneDoesNotSealALateTouchedTa
     /// ns2's epoch-1 data: never touched again by this incarnation until the final check below, well
     /// after both remounts -- the "table recovered for the first time, late" the fix must not over-seal.
     /// Distinct content from ns1's part: identical payloads collide on the same blob and race
-    /// `Build::observeAndAdmit`'s newborn-debris watermark, unrelated to what this test is about.
+    /// `PartWriteTxn::observeAndAdmit`'s newborn-debris watermark, unrelated to what this test is about.
     publishPart(store, ns2.string(), "y", "payload-b");
 
     /// Force ns1's ref-log append into the Unresolved/wedge outcome (mirrors

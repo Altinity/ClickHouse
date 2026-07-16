@@ -1,5 +1,5 @@
 #include <gtest/gtest.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBuild.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
@@ -39,7 +39,7 @@ using DB::Cas::tests::appendOwnerEvent;
 namespace
 {
 
-PoolPtr openTestStore(std::shared_ptr<InMemoryBackend> & out_backend)
+PoolPtr openTestPool(std::shared_ptr<InMemoryBackend> & out_backend)
 {
     out_backend = std::make_shared<InMemoryBackend>();
     return Pool::open(out_backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
@@ -89,7 +89,7 @@ ManifestEntry blobEntry(const String & path, const String & payload)
 }
 
 /// Publish ONE ref naming a two-blob part through the REAL writer transaction sequence — the exact order
-/// the wiring drives (EDGE-BEFORE-OBSERVE): `startBuild -> stageManifest(entries) -> precommitAdd ->
+/// the wiring drives (EDGE-BEFORE-OBSERVE): `beginPartWrite -> stageManifest(entries) -> precommitAdd ->
 /// putBlob(each body) -> promote`. The durable precommit closure names every blob hash before putBlob
 /// makes the first backend observation. Returns the published `ManifestId` so a caller can later HEAD
 /// its body / assert reclaim.
@@ -97,9 +97,9 @@ ManifestId publishTwoBlobPart(
     const PoolPtr & s, const RootNamespace & ns, const String & ref,
     const String & payload_a, const String & payload_b)
 {
-    BuildInfo info;
+    PartWriteInfo info;
     info.intended_ref = ns.string() + "/" + ref;
-    auto build = s->startBuild(info);
+    auto build = s->beginPartWrite(info);
 
     const ManifestId id = build->stageManifest({blobEntry("data.bin", payload_a),
                                                 blobEntry("data.cmrk3", payload_b)});
@@ -114,9 +114,9 @@ ManifestId publishTwoBlobPart(
 ManifestId publishOneBlobPart(
     const PoolPtr & s, const RootNamespace & ns, const String & ref, const String & payload)
 {
-    BuildInfo info;
+    PartWriteInfo info;
     info.intended_ref = ns.string() + "/" + ref;
-    auto build = s->startBuild(info);
+    auto build = s->beginPartWrite(info);
     const ManifestId id = build->stageManifest({blobEntry("data.bin", payload)});
     build->precommitAdd(ns, ref, id);
     build->putBlob(idOf(payload), BlobSource::fromString(payload));
@@ -138,16 +138,16 @@ bool manifestPresent(const std::shared_ptr<InMemoryBackend> & b, const Layout & 
 }
 
 /// Stage partB's full closure (its two distinct blob bodies + its manifest body) through the REAL
-/// writer primitives WITHOUT publishing an owner — `startBuild -> putBlob(each) -> stageManifest`. The
+/// writer primitives WITHOUT publishing an owner — `beginPartWrite -> putBlob(each) -> stageManifest`. The
 /// bytes are durable in the backend but no journal owner names them yet; the caller installs partB as
 /// the new owner via a REPOINT (see displaceAndGc). Returns partB's ManifestId.
 ManifestId stagePartBClosure(
     const PoolPtr & s, const RootNamespace & ns, const String & ref,
     const String & payload_a, const String & payload_b)
 {
-    BuildInfo info;
+    PartWriteInfo info;
     info.intended_ref = ns.string() + "/" + ref;
-    auto build = s->startBuild(info);
+    auto build = s->beginPartWrite(info);
     build->putBlob(idOf(payload_a), BlobSource::fromString(payload_a));
     build->putBlob(idOf(payload_b), BlobSource::fromString(payload_b));
     const ManifestId id = build->stageManifest({blobEntry("data.bin", payload_a),
@@ -197,7 +197,7 @@ FsckReport displaceAndGc(
 TEST(CasGcLeak, DisplacedPartBlobsReclaimedFoldBetween)
 {
     std::shared_ptr<InMemoryBackend> b;
-    auto s = openTestStore(b);
+    auto s = openTestPool(b);
     const RootNamespace ns{"test/tbl"};
     const String ref = "all_0_0_0";
 
@@ -235,7 +235,7 @@ TEST(CasGcLeak, DisplacedPartBlobsReclaimedFoldBetween)
 TEST(CasGcLeak, DisplacedPartBlobsReclaimedNoFoldBetween)
 {
     std::shared_ptr<InMemoryBackend> b;
-    auto s = openTestStore(b);
+    auto s = openTestPool(b);
     const RootNamespace ns{"test/tbl"};
     const String ref = "all_0_0_0";
 
@@ -262,7 +262,7 @@ TEST(CasGcLeak, DisplacedPartBlobsReclaimedNoFoldBetween)
 TEST(CasGcLeak, DroppedPartFullyReclaimed)
 {
     std::shared_ptr<InMemoryBackend> b;
-    auto s = openTestStore(b);
+    auto s = openTestPool(b);
     const RootNamespace ns{"test/tbl"};
     const String ref = "all_1_1_0";
 
@@ -308,7 +308,7 @@ TEST(CasGcLeak, DroppedPartFullyReclaimed)
 TEST(CasGcLeak, ResurrectReplacedIncarnationReclaimed)
 {
     std::shared_ptr<InMemoryBackend> b;
-    auto s = openTestStore(b);
+    auto s = openTestPool(b);
     const RootNamespace ns{"test/tbl"};
     const String P = "resurrect-payload";
 
@@ -362,7 +362,7 @@ TEST(CasGcLeak, ResurrectReplacedIncarnationReclaimed)
 TEST(CasGcLeak, ResurrectReplacedReclaimIsIdempotent)
 {
     std::shared_ptr<InMemoryBackend> b;
-    auto s = openTestStore(b);
+    auto s = openTestPool(b);
     const RootNamespace ns{"test/tbl"};
     const String P = "resurrect-payload-idem";
 
@@ -416,7 +416,7 @@ TEST(CasGcLeak, ResurrectReplacedReclaimIsIdempotent)
 TEST(CasGcLeak, ResurrectReplacedTokenIsCondemnedInMeta)
 {
     std::shared_ptr<InMemoryBackend> b;
-    auto s = openTestStore(b);
+    auto s = openTestPool(b);
     const RootNamespace ns{"test/tbl"};
     Gc gc(s, hexToU128("00000000000000000000000000000006"));
     const String P = "resurrect-payload-view";
@@ -463,7 +463,7 @@ TEST(CasGcLeak, ResurrectReplacedTokenIsCondemnedInMeta)
 TEST(CasReuseGcRace, ReuseOfBlobDeletedBeforePublish)
 {
     std::shared_ptr<InMemoryBackend> b;
-    auto s = openTestStore(b);
+    auto s = openTestPool(b);
     const RootNamespace ns{"test/tbl"};
     const String B = "shared-blob-payload";
     const String U = "build2-unique-blob";
@@ -475,9 +475,9 @@ TEST(CasReuseGcRace, ReuseOfBlobDeletedBeforePublish)
     /// stage a manifest or precommit — the scenario is that GC deletes B BEFORE build2 publishes a manifest
     /// naming it. (Staging+precommitting BEFORE the drop would make the precommit's activating +1 PIN B —
     /// B would never reach in-degree 0 and GC could not delete it, so the race could not be reproduced.)
-    BuildInfo info;
+    PartWriteInfo info;
     info.intended_ref = ns.string() + "/part_2";
-    auto build2 = s->startBuild(info);
+    auto build2 = s->beginPartWrite(info);
 
     ManifestEntry eb;
     eb.path = "data.bin";
@@ -510,7 +510,7 @@ TEST(CasReuseGcRace, ReuseOfBlobDeletedBeforePublish)
     /// so the promote gate TRUSTS it (no HEAD/loadMeta probe) and commits — it does NOT re-observe the
     /// deleted B. This is the accepted D4 trade-off. On the real reuse/relink path B CANNOT be deleted
     /// while build2's precommit edge is live: precommitAdd durably appends the Precommit OwnerTransition
-    /// (CasBuild.cpp precommitAdd) BEFORE promote, and promote re-proves that edge live (WPromote
+    /// (CasPartWriteTxn.cpp precommitAdd) BEFORE promote, and promote re-proves that edge live (WPromote
     /// owner==bld) BEFORE it trusts the leaf — so B has in-degree >= 1 and GC (the sole deleter) cannot
     /// collect it. This test injects the loss DIRECTLY (raw GC-to-fixpoint after dropping EVERY owner,
     /// with build2 not yet precommitted), which the live-precommit invariant excludes. So the dangle is

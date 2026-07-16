@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBuild.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
@@ -21,7 +21,7 @@ using DB::Cas::tests::injectRetire;
 namespace
 {
 
-PoolPtr makeStoreWithShards(std::shared_ptr<InMemoryBackend> & out_backend, uint64_t gc_shards = 1)
+PoolPtr makePoolWithShards(std::shared_ptr<InMemoryBackend> & out_backend, uint64_t gc_shards = 1)
 {
     out_backend = std::make_shared<InMemoryBackend>();
     return Pool::open(out_backend,
@@ -42,7 +42,7 @@ TEST(CasGcShardIncarnation, DiscoveryEqualsPresentShards)
     for (const uint64_t gc_shards : {1u, 4u})
     {
         std::shared_ptr<InMemoryBackend> backend;
-        auto store = makeStoreWithShards(backend, gc_shards);
+        auto store = makePoolWithShards(backend, gc_shards);
         Gc gc(store, hexToU128("0000000000000000000000000000000a"));
 
         const RootNamespace ns_a{"srv1/tblA"};
@@ -75,7 +75,7 @@ TEST(CasGcShardIncarnation, ListNamespacesFromRefsNotRegistry)
     for (const uint64_t gc_shards : {1u, 4u})
     {
         std::shared_ptr<InMemoryBackend> backend;
-        auto store = makeStoreWithShards(backend, gc_shards);
+        auto store = makePoolWithShards(backend, gc_shards);
 
         const RootNamespace ns_a{"srv1/tblA"};
 
@@ -123,7 +123,7 @@ TEST(CasGcShardIncarnation, NewbornPrecommitProtectsDedupBlobAgainstConcurrentDr
     for (const uint64_t gc_shards : {1u, 4u})
     {
         std::shared_ptr<InMemoryBackend> backend;
-        auto store = makeStoreWithShards(backend, gc_shards);
+        auto store = makePoolWithShards(backend, gc_shards);
         const RootNamespace ns_b{"srv1/tblB"};
 
         /// --- Phase 1: Write b1's body directly (before any GC). ---
@@ -133,7 +133,7 @@ TEST(CasGcShardIncarnation, NewbornPrecommitProtectsDedupBlobAgainstConcurrentDr
         const String b1_hex = streamingHexOf(b1_payload);
         const BlobRef b1_ref{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hexToU128(b1_hex))};
         {
-            auto seed = store->startBuild({});
+            auto seed = store->beginPartWrite({});
             seed->putBlob(b1_ref, BlobSource::fromString(b1_payload));
         }
         const String b1_key = store->layout().blobKey(b1_ref);
@@ -153,9 +153,9 @@ TEST(CasGcShardIncarnation, NewbornPrecommitProtectsDedupBlobAgainstConcurrentDr
             << "currentGcRound() must return the injected round";
 
         /// --- Phase 3: Writer for NEWBORN ns B — b1 condemned but body present ---
-        BuildInfo info_b;
+        PartWriteInfo info_b;
         info_b.intended_ref = ns_b.string() + "/part_b1";
-        auto build_b = store->startBuild(info_b);
+        auto build_b = store->beginPartWrite(info_b);
 
         /// Adopt b1 by tokenless evidence (simulating the dedup case: the writer observed b1
         /// present BEFORE the GC round — no HEAD here, just evidence).

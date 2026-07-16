@@ -186,7 +186,7 @@ public:
     /// throws) when the fence is lost or the budget is exhausted before a definite outcome is reached.
     /// `out_token` (optional): set ONLY on a `Committed` return, to the committed incarnation's token —
     /// the attempt's own `PutResult` token, or the token the resolve GET observed when it proved an
-    /// earlier ambiguous attempt landed. Lets audit emitters (e.g. `Build::stageManifest`'s
+    /// earlier ambiguous attempt landed. Lets audit emitters (e.g. `PartWriteTxn::stageManifest`'s
     /// `ManifestPut` event) keep the token without a follow-up HEAD. Untouched on any other return.
     CasWriteOutcome putIfAbsentControlled(std::string_view key, std::string_view bytes,
                                           const std::function<bool()> & fence_ok, Token * out_token = nullptr);
@@ -204,7 +204,7 @@ public:
 
     /// Controlled conditional create for CONTENT-ADDRESSED write-once keys whose body CANNOT be
     /// byte-compared across attempts — the blob-body `putIfAbsentStream` create and `promoteStaged`'s
-    /// conditional server-side copy (`Build::uploadFromSource`). Byte-exact resolve
+    /// conditional server-side copy (`PartWriteTxn::uploadFromSource`). Byte-exact resolve
     /// (`resolveByExactGet`) is impossible there BY DESIGN: W-FRESH-TAG mints a fresh
     /// `incarnation_tag` into the envelope header on every re-stream, so two attempts of the same
     /// logical create legitimately differ in bytes. The identity authority is the KEY itself (it

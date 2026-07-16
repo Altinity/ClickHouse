@@ -44,7 +44,7 @@ struct PutBlobResult
 BlobRef poolContentHash(BlobHashAlgo algo, std::string_view payload);
 
 /// The writer protocol (spec §5, CA GC root-local part-manifest redesign rev. 15) — the W-rules live
-/// HERE, not in the wiring. One Build per written ref. Thread-compat: a Build is used by ONE thread (the
+/// HERE, not in the wiring. One PartWriteTxn per written ref. Thread-compat: a PartWriteTxn is used by ONE thread (the
 /// wiring's commit path); the per-hash freshness meta it point-reads (`CasBlobMeta.h`) is itself
 /// thread-safe (a plain backend point-read/CAS, no shared in-memory state).
 ///
@@ -52,12 +52,12 @@ BlobRef poolContentHash(BlobHashAlgo algo, std::string_view payload);
 /// create-precommit owner-transition ref-log op to the target ref's shard) -> putBlob (blob bodies) ->
 /// promote (atomic single-shard owner move precommit->committed, fail-closed revalidation). Only blobs
 /// stay content-addressed; a part is one immutable single-owner ManifestId.
-class Build
+class PartWriteTxn
 {
 public:
-    Build(PoolPtr store_, UInt128 build_id_,
-          uint64_t build_seq_, uint64_t epoch_, BuildInfo info_);
-    ~Build();
+    PartWriteTxn(PoolPtr store_, UInt128 build_id_,
+          uint64_t build_seq_, uint64_t epoch_, PartWriteInfo info_);
+    ~PartWriteTxn();
 
     /// W-FRESH-TAG: every upload attempt mints a fresh random incarnation_tag.
     /// New content: streaming PUT If-None-Match:*; on PreconditionFailed ⇒ the cold-reuse rule
@@ -95,7 +95,7 @@ public:
     /// The id is recorded for best-effort `abandon` cleanup.
     ManifestId stageManifest(std::vector<ManifestEntry> entries);
 
-    /// Build-intent owner add (spec §Precommit Add) — there is no `_precommits` namespace. ONE
+    /// PartWriteTxn-intent owner add (spec §Precommit Add) — there is no `_precommits` namespace. ONE
     /// `appendRefOps` call appending an OwnerTransition `RefOp` (new_binding = {Precommit,
     /// final_ref_name, id.ref}) to final_ref_name's ref-log entry, so the later promote is an atomic
     /// owner move over that same entry. Needs NO body-exists HEAD as a safety authority: GC and
@@ -120,16 +120,16 @@ public:
     ///     is non-activating and was rejected at step 4 (the writer re-stages with a fresh ManifestId).
     ///
     /// CRASH-RECOVERY INVARIANT (S3-native staging plan Task 6, design §6 "crash between
-    /// precommitAdd(edge) and copy"): a `Build` is a plain in-memory C++ object owned by the wiring's
+    /// precommitAdd(edge) and copy"): a `PartWriteTxn` is a plain in-memory C++ object owned by the wiring's
     /// `ContentAddressedTransaction` — it is NEVER persisted and NEVER resumed across a process
     /// restart. There is no "replay a precommit" code path anywhere in the core: `promote` is called
     /// synchronously, in-process, strictly AFTER every referenced blob's `putBlob` (which for S3
     /// staging drives `promoteStaged`'s conditional copy) has already returned successfully. If the
     /// process exits between `precommitAdd` and `promote` (e.g. between staging a blob and its
-    /// server-side-copy promote completing), the `Build` object is simply lost with it: nothing ever
+    /// server-side-copy promote completing), the `PartWriteTxn` object is simply lost with it: nothing ever
     /// "wakes up" that precommit and finishes promoting it. The precommit's owner binding is left as a
     /// dead intent in the ref log and is REMOVED (never promoted) by an exact precommit-removal ref-log
-    /// transaction -- the current writer's own `Build::abandon` if it is still mounted, otherwise a
+    /// transaction -- the current writer's own `PartWriteTxn::abandon` if it is still mounted, otherwise a
     /// fenced successor's stale-precommit sweep (spec §Clean Up Old Precommits). `GC` folds the resulting
     /// `-1` manifest edge but never detects or removes a dead precommit itself. So the
     /// hazard the design calls out — "promote a precommit whose copy did not complete" — has no code
@@ -196,7 +196,7 @@ private:
     /// temp file / re-emits the captured String), so it is taken by const ref and not consumed.
     void uploadFromSource(ObjectKind kind, const BlobRef & ref, const String & key, const BlobSource & source);
 
-    /// The build's owning root namespace, derived from BuildInfo::intended_ref ("ns/ref" — the ref is the
+    /// The build's owning root namespace, derived from PartWriteInfo::intended_ref ("ns/ref" — the ref is the
     /// last `/`-segment; the namespace is everything before it). Sets a manifest body's root_namespace_id.
     RootNamespace manifestNamespace() const;
 
@@ -220,7 +220,7 @@ private:
     uint64_t build_seq{};                                 /// per-process monotone seq (spec 2026-06-16)
     uint64_t epoch{};                                     /// owning Pool's process_epoch
     uint32_t next_manifest_ordinal = 1;                   /// per-build monotone manifest ordinal
-    BuildInfo info;
+    PartWriteInfo info;
     bool alive = true;
     /// spec §Namespace Removal: set by `cancelForNamespaceRemoval` (from `Pool::dropNamespace`'s thread)
     /// once this build's owning namespace is durably removed. Atomic because it is WRITTEN cross-thread

@@ -113,7 +113,7 @@ size_t PartFolderView::estimatedBytes() const
 }
 
 // ===== from CachedPartFolderAccess.cpp (merge #7) =====
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBuild.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Common/DateLUT.h>
 #include <Common/ProfileEvents.h>
 #include <Common/logger_useful.h>
@@ -312,7 +312,7 @@ bool CachedPartFolderAccess::existsRef(const PartRefKey & key, Freshness freshne
     return resolve(key, freshness).has_value();
 }
 
-void CachedPartFolderAccess::promoteBuild(Cas::Build & build, const PartRefKey & key, UInt128 build_id,
+void CachedPartFolderAccess::promoteBuild(Cas::PartWriteTxn & build, const PartRefKey & key, UInt128 build_id,
                                           const Cas::ManifestId & manifest_id, bool allow_repoint)
 {
     build.promote(key.ns, key.ref, build_id, manifest_id, allow_repoint);
@@ -322,7 +322,7 @@ void CachedPartFolderAccess::promoteBuild(Cas::Build & build, const PartRefKey &
 void CachedPartFolderAccess::publishEntries(const PartRefKey & dst,
     const std::vector<Cas::ManifestEntry> & entries, Cas::ProvenanceOp op, bool allow_repoint)
 {
-    auto build = store->startBuild(Cas::BuildInfo{.intended_ref = dst.ns.string() + "/" + dst.ref,
+    auto build = store->beginPartWrite(Cas::PartWriteInfo{.intended_ref = dst.ns.string() + "/" + dst.ref,
                                                   .intended_namespace = dst.ns, .op = op});
     /// Tokenless W-EVIDENCE dep per entry — NO pool HEAD/GET before precommit; promote re-proves
     /// each fail-closed. Inline entries record nothing (adoptEvidence skips them).
@@ -373,7 +373,7 @@ bool CachedPartFolderAccess::repointRef(const PartRefKey & key, std::vector<Cas:
     /// Byte-equal no-op: compare the candidate `entries` against the CURRENTLY committed manifest's
     /// decoded entries. This must NOT stage a candidate manifest first: `stageManifest` mints a
     /// non-content-derived `ManifestRef` (epoch/build_seq/ordinal) AND durably PUTs the encoded body
-    /// on every call (CasBuild.cpp), so staging-then-comparing IDs would itself be a pool mutation on
+    /// on every call (CasPartWriteTxn.cpp), so staging-then-comparing IDs would itself be a pool mutation on
     /// the byte-equal path — violating the "ZERO pool mutations" contract this primitive exists to
     /// provide.
     ///

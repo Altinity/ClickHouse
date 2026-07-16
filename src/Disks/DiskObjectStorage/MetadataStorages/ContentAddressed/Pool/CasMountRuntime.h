@@ -20,8 +20,8 @@
 namespace DB::Cas
 {
 
-class Build;
-using BuildPtr = std::shared_ptr<Build>;
+class PartWriteTxn;
+using PartWriteTxnPtr = std::shared_ptr<PartWriteTxn>;
 
 /// Per-owner config slice for the mount-runtime subsystem (spec §PoolConfig Slices). A PROJECTION of the
 /// flat `PoolConfig` fields, built on demand by `PoolConfig::mountConfig` and passed BY VALUE to
@@ -77,7 +77,7 @@ struct MountFence
 /// reference/value (no `Pool &` back-reference): the backend, the layout, the `MountConfig` slice, the
 /// `server_root_id`, the event sink, the pool `CasRequestBudget`, and the `remount_attempt` callback
 /// (== `Pool::tryRemountOnce`, the body the recovery thread loops on). `Pool` keeps thin public
-/// delegates for every currently-public method so the wiring, `Build`, `Gc`, the `ref_ledger` callbacks,
+/// delegates for every currently-public method so the wiring, `PartWriteTxn`, `Gc`, the `ref_ledger` callbacks,
 /// and every test call site are unchanged.
 class CasMountRuntime
 {
@@ -125,14 +125,14 @@ public:
     bool refAppendFenceOk() const;
 
     /// The writer_epoch of the LIVE mount incarnation. Bumped by `tryRemountOnce` (self-remount after a
-    /// GC fence-out) — a `Build` minted under an older epoch fails closed on its next step.
+    /// GC fence-out) — a `PartWriteTxn` minted under an older epoch fails closed on its next step.
     uint64_t liveWriterEpoch() const { return live_writer_epoch.load(std::memory_order_acquire); }
 
-    /// ---- build registry (populated by Pool::startBuild, retired by the Build) ----
+    /// ---- build registry (populated by Pool::beginPartWrite, retired by the PartWriteTxn) ----
     /// Allocate a strictly-increasing build_seq and add it to the active set.
     uint64_t allocateBuildSeq();
     /// Register the in-flight build so `dropNamespace`'s post-durable cancellation can reach it (weak_ptr).
-    void registerInflightBuild(uint64_t seq, const BuildPtr & build);
+    void registerInflightBuild(uint64_t seq, const PartWriteTxnPtr & build);
     /// Remove a build_seq from the active set + inflight map; idempotent (safe from publish/abandon/dtor).
     void retireBuildSeq(uint64_t seq);
     /// Cancel every in-flight build targeting `ns` once its removal transaction is durable (spec
@@ -250,11 +250,11 @@ private:
     uint64_t next_build_seq = 1;
     std::set<uint64_t> active_build_seqs;
     /// In-flight builds keyed by build_seq (mirrors `active_build_seqs`' lifecycle: populated in
-    /// `startBuild`, removed in `retireBuildSeq`). `dropNamespace` upgrades these weak_ptrs AFTER its
+    /// `beginPartWrite`, removed in `retireBuildSeq`). `dropNamespace` upgrades these weak_ptrs AFTER its
     /// removal transaction is durable and cancels those targeting the removed namespace (spec §Namespace
     /// Removal: "cancels local builds"). weak_ptr because the wiring owns the shared_ptr; an expired entry
     /// (a build already destroyed) is simply skipped. Guarded by builds_mutex.
-    std::map<uint64_t, std::weak_ptr<Build>> inflight_builds;
+    std::map<uint64_t, std::weak_ptr<PartWriteTxn>> inflight_builds;
 
     /// Mount-lease heartbeat (spec §mount-safety, Phase 0 Task 7). Constructed + started on a writable
     /// open AFTER the owner/epoch/mount startup protocol; renews the mount lease async off the write

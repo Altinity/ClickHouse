@@ -29,7 +29,7 @@ ManifestRef ref(const String &, uint64_t seq, uint64_t inst)
 TEST(CasGcFold, FoldAdoptsAttemptEqualsLeaseSeq)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref("srv-a:1", 1, 0xAA);
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
@@ -49,7 +49,7 @@ TEST(CasGcFold, FoldAdoptsAttemptEqualsLeaseSeq)
 TEST(CasGcFold, CommittedAddEmitsPlusOnePerBlob)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref("srv-a:1", 1, 0xAA);
     writeManifestRaw(*backend, store->layout(), ns, r,
@@ -67,7 +67,7 @@ TEST(CasGcFold, CommittedAddEmitsPlusOnePerBlob)
 TEST(CasGcFold, RemovalEmitsMinusOne)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref("srv-a:1", 1, 0xAA);
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
@@ -84,7 +84,7 @@ TEST(CasGcFold, RemovalEmitsMinusOne)
 TEST(CasGcFold, PrecommitBodyPresentEmitsPlusOne)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref("srv-a:1", 1, 0xAA);
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
@@ -98,7 +98,7 @@ TEST(CasGcFold, PrecommitBodyPresentEmitsPlusOne)
 TEST(CasGcFold, PrecommitMissingBodyEmitsNoDelta)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref("srv-a:1", 1, 0xAA);
     addPrecommitTransition(*backend, store->layout(), ns, DB::UInt128(7), "tbl", std::nullopt, r);
@@ -112,7 +112,7 @@ TEST(CasGcFold, PrecommitMissingBodyEmitsNoDelta)
 TEST(CasGcFold, FoldBarrierHaltsCursorAtLiveMissingBodyPrecommit)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref("srv-a:1", 1, 0xAA);
     const uint64_t v = addPrecommitTransition(*backend, store->layout(), ns, DB::UInt128(7), "tbl", std::nullopt, r);
@@ -130,7 +130,7 @@ TEST(CasGcFold, FoldBarrierHaltsCursorAtLiveMissingBodyPrecommit)
 TEST(CasGcFold, PromoteOfActivatedPrecommitEmitsNoDelta)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref("srv-a:1", 1, 0xAA);
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
@@ -149,7 +149,7 @@ TEST(CasGcFold, PromoteOfActivatedPrecommitEmitsNoDelta)
 TEST(CasGcFold, CommittedMissingBodyClampsCursorAndRecordsAnomaly)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref("srv-a:1", 1, 0xAA);
     const uint64_t v = publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);  // no body
@@ -165,7 +165,7 @@ TEST(CasGcFold, CommittedMissingBodyClampsCursorAndRecordsAnomaly)
 TEST(CasGcFold, RefMismatchFailsClosed)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref("srv-a:1", 1, 0xAA);
     PartManifest bad;
@@ -183,7 +183,7 @@ TEST(CasGcFold, RefMismatchFailsClosed)
 TEST(CasGcFold, RemovalWithMissingOldBodyClampsAndRecordsAnomaly)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref("srv-a:1", 1, 0xAA);
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
@@ -219,7 +219,7 @@ TEST(CasGcFold, EmptyDeltaShardCarriesParentRunRef)
     /// gc_fold_max_defer_rounds=0 forces fold-every-round: this test exercises the pure-ref-carry FOLD
     /// path on an idle round; without it the round would DEFER (re-adopt the sealed generation) and never
     /// mint the carried generation this test inspects.
-    auto store = openStoreForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref("srv-a:1", 1, 0xAA);
     writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
@@ -259,7 +259,7 @@ TEST(CasGcFold, EmptyDeltaShardCarriesParentRunRef)
 TEST(CasGcFold, FoldResolvesThroughCarriedRef)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r1 = ref("srv-a:1", 1, 0xAA);
     writeManifestRaw(*backend, store->layout(), ns, r1, {blobEntryFor("a", DB::UInt128(1))});
@@ -296,7 +296,7 @@ TEST(CasGcFold, PreviewResolvesCarriedRef)
     /// gc_fold_max_defer_rounds=0 forces the idle second round to FOLD (pure ref-carry) rather than
     /// DEFER, so the current seal's `blob_target_runs` point at the parent generation's key (the carried
     /// ref this test resolves through).
-    auto store = openStoreForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref("srv-a:1", 1, 0xAA);
     const UInt128 blob = DB::UInt128(1);
@@ -349,7 +349,7 @@ String corruptSealedRunChecksum(InMemoryBackend & backend, const Layout & layout
 TEST(CasGcFold, PreviewDeletesSealChecksumMismatchFailsClosed)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref("srv-a:1", 1, 0xAA);
     const UInt128 blob = DB::UInt128(1);
@@ -370,7 +370,7 @@ TEST(CasGcFold, PreviewDeletesSealChecksumMismatchFailsClosed)
 TEST(CasGcFold, FsckSealChecksumMismatchCataloguedAndAuditCompletes)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref("srv-a:1", 1, 0xAA);
     const UInt128 blob = DB::UInt128(1);
@@ -411,7 +411,7 @@ TEST(CasGcFold, FsckSealChecksumMismatchCataloguedAndAuditCompletes)
 TEST(CasGcFold, MidLogClampPreservesEarlierRemovalBodyAndRecovers)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef a = ref("srv-a:1", 1, 0xAA);
     const ManifestRef b = ref("srv-a:2", 2, 0xBB);
@@ -456,7 +456,7 @@ TEST(CasGcFold, MidLogClampPreservesEarlierRemovalBodyAndRecovers)
 TEST(CasGcFold, DeadPrecommitWithMissingBodyIsSkippedNotClampedForever)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
     /// The namespace's server-root prefix is "srv"; seed its watermark floor so build_sequence 5 is retired.
     const RootNamespace ns{"srv/tbl"};
     setWatermarkMinActive(*backend, store->layout(), "srv", /*writer_epoch*/1, /*min_active*/10);
@@ -485,7 +485,7 @@ TEST(CasGcFold, DeadPrecommitWithMissingBodyIsSkippedNotClampedForever)
 TEST(CasGcFold, SingleAnomalySuppressesEveryDestructiveActionInTheRound)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef a = ref("srv-a:1", 1, 0xAA);
     const ManifestRef b = ref("srv-a:2", 2, 0xBB);
@@ -526,7 +526,7 @@ TEST(CasGcFold, SingleAnomalySuppressesEveryDestructiveActionInTheRound)
 TEST(CasGcFold, RoundSideAnomalySuppressesNamespaceAndRefLogCleanupToo)
 {
     auto backend = std::make_shared<InMemoryBackend>();
-    auto store = openStoreForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
+    auto store = openPoolForTest(backend, /*gc_fold_max_defer_rounds*/ 0);
     const Layout & layout = store->layout();
     Gc gc(store, kGc);
 

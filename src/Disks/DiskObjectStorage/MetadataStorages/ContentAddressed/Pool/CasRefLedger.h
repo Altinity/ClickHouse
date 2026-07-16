@@ -84,10 +84,10 @@ public:
     bool refLanesSettledForRemount();
     bool drainRefLanesForShutdown(uint64_t wait_budget_ms);
 
-    /// Staging PUT wrappers for `Build` (design 2026-07-16 source-layout §3.4): encapsulate BOTH the
-    /// retry-controller call AND the ref-lane fence predicate (`fence_ok_fn`), so `Build` no longer
-    /// reaches the controller or `refAppendFenceOk` directly (the `friend class Build` is gone).
-    /// Behavior-identical to the previously-inlined controller+fence at `CasBuild.cpp` stageManifest /
+    /// Staging PUT wrappers for `PartWriteTxn` (design 2026-07-16 source-layout §3.4): encapsulate BOTH the
+    /// retry-controller call AND the ref-lane fence predicate (`fence_ok_fn`), so `PartWriteTxn` no longer
+    /// reaches the controller or `refAppendFenceOk` directly (the `friend class PartWriteTxn` is gone).
+    /// Behavior-identical to the previously-inlined controller+fence at `CasPartWriteTxn.cpp` stageManifest /
     /// uploadFromSource.
     CasWriteOutcome stagingPutIfAbsent(std::string_view key, std::string_view bytes, Token * out_token);
     CasCreateResult stagingConditionalCreate(std::string_view key, const std::function<PutResult()> & attempt);
@@ -323,9 +323,9 @@ private:
     RefTxnId allocateRefTxnId() { return RefTxnId{live_epoch_fn(), next_ref_sequence.fetch_add(1)}; }
 
     /// The CAS-owned retry controller (Task 5) this Pool's ref-log writer path uses for every
-    /// conditional log/snapshot `PUT` and uncertain-result resolution. Also shared (via the Build
-    /// friendship) by `Build::stageManifest`'s part-manifest body `PUT` (chaos-tolerance-report
-    /// §Task B) and by `Build::uploadFromSource`'s blob-body create — both the streaming
+    /// conditional log/snapshot `PUT` and uncertain-result resolution. Also shared (via the PartWriteTxn
+    /// friendship) by `PartWriteTxn::stageManifest`'s part-manifest body `PUT` (chaos-tolerance-report
+    /// §Task B) and by `PartWriteTxn::uploadFromSource`'s blob-body create — both the streaming
     /// `putIfAbsentStream` PUT and `promoteStaged`'s conditional server-side copy — via
     /// `conditionalCreateControlled` (availfix). The controller is stateless per call (immutable
     /// budget/clock/sleep — the sleep fn mutates only through the test-only seam, before traffic), so

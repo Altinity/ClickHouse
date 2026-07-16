@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <cmath>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBuild.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
@@ -56,18 +56,18 @@ using DB::Cas::tests::writeRawBlobBody;
 namespace
 {
 
-PoolPtr openStore(const std::shared_ptr<InMemoryBackend> & b)
+PoolPtr openPool(const std::shared_ptr<InMemoryBackend> & b)
 {
     return Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
 }
 
 /// Start a build whose owning manifest namespace + final ref name are `ns`/`ref` (promote/stageManifest
-/// derive the manifest namespace by splitting BuildInfo::intended_ref on the LAST '/').
-BuildPtr startBuildFor(const PoolPtr & s, const RootNamespace & ns, const String & ref)
+/// derive the manifest namespace by splitting PartWriteInfo::intended_ref on the LAST '/').
+PartWriteTxnPtr startBuildFor(const PoolPtr & s, const RootNamespace & ns, const String & ref)
 {
-    BuildInfo info;
+    PartWriteInfo info;
     info.intended_ref = ns.string() + "/" + ref;
-    return s->startBuild(info);
+    return s->beginPartWrite(info);
 }
 
 /// A one-entry Blob ManifestEntry for `payload` at `path` (the build's stageManifest entry).
@@ -181,11 +181,11 @@ private:
 
 }
 
-TEST(CasBuild, PutBlobWritesEnvelopeWithFixedHeader)
+TEST(CasPartWriteTxn, PutBlobWritesEnvelopeWithFixedHeader)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = openStore(b);
-    auto build = s->startBuild({});
+    auto s = openPool(b);
+    auto build = s->beginPartWrite({});
     auto ref = build->putBlob(idOf("hello world"), BlobSource::fromString("hello world"));
     EXPECT_EQ(ref.size, 11u);
 
@@ -201,10 +201,10 @@ TEST(CasBuild, PutBlobWritesEnvelopeWithFixedHeader)
     EXPECT_EQ(raw->bytes.substr(h.header_len), "hello world");
 }
 
-TEST(CasBuild, StageManifestUsesPerBuildOrdinals)
+TEST(CasPartWriteTxn, StageManifestUsesPerBuildOrdinals)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = openStore(b);
+    auto s = openPool(b);
     const RootNamespace ns{"test/tbl@cas@"};
 
     auto build = startBuildFor(s, ns, "all_1_1_0");
@@ -229,19 +229,19 @@ TEST(CasBuild, StageManifestUsesPerBuildOrdinals)
     EXPECT_EQ(next.ref.manifest_ordinal, 1u);
 }
 
-/// B171: the `cas_owner` owner-triple stamping (`Build::ownerMeta`) was DELETED — protection is now
+/// B171: the `cas_owner` owner-triple stamping (`PartWriteTxn::ownerMeta`) was DELETED — protection is now
 /// the build-root precommit edge (reachability), not revocable object metadata GC reads per-candidate.
-/// The old `CasBuild.BlobCarriesOwnerTripleInMetadata` asserted that stamping; its coverage is replaced
-/// by the build-root precommit/reclaim tests (`CasBuildRoot*`, `CasBuildRootDangle*`), which prove a
+/// The old `CasPartWriteTxn.BlobCarriesOwnerTripleInMetadata` asserted that stamping; its coverage is replaced
+/// by the build-root precommit/reclaim tests (`CasPartWriteTxnRoot*`, `CasPartWriteTxnRootDangle*`), which prove a
 /// written-but-unreferenced object is protected by a live precommit and collectable once it is abandoned.
 
-TEST(CasBuild, PutBlobDedupSecondWriterAdopts)
+TEST(CasPartWriteTxn, PutBlobDedupSecondWriterAdopts)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = openStore(b);
+    auto s = openPool(b);
 
     /// First writer FRESH-uploads (legal pre-precommit — newborn-debris watermark).
-    auto build_a = s->startBuild({});
+    auto build_a = s->beginPartWrite({});
     auto ref_a = build_a->putBlob(idOf("dup"), BlobSource::fromString("dup"));
     const Token token_a = b->head(s->layout().blobKey(ref_a.ref)).token;
 
@@ -261,11 +261,11 @@ TEST(CasBuild, PutBlobDedupSecondWriterAdopts)
 /// Task 3 (spec §meta-protocols v3): the writer's dedup gate no longer consults the RetireView for the
 /// condemned decision — it point-reads the per-hash freshness meta instead. A fresh (absent -> present)
 /// upload must WRITE that meta as Clean so future point-readers (other writers, GC) can see it.
-TEST(CasBuild, PutBlobFreshUploadWritesCleanMeta)
+TEST(CasPartWriteTxn, PutBlobFreshUploadWritesCleanMeta)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = openStore(b);
-    auto build = s->startBuild({});
+    auto s = openPool(b);
+    auto build = s->beginPartWrite({});
 
     const String payload = "fresh-meta-payload";
     auto ref = build->putBlob(idOf(payload), BlobSource::fromString(payload));
@@ -279,7 +279,7 @@ TEST(CasBuild, PutBlobFreshUploadWritesCleanMeta)
 
 /// §0 introspection: a fresh body upload writes the Clean meta exactly once through the
 /// `putMetaIfAbsent` choke point (`CasMetaPut`), tagged with its reason (`CasMetaCreateClean`).
-TEST(CasBuildMetaCounters, CreateCleanAndChokePointCountOnFreshBody)
+TEST(CasPartWriteTxnMetaCounters, CreateCleanAndChokePointCountOnFreshBody)
 {
     /// Fresh body upload writes the Clean meta exactly once: CasMetaPut +1 (choke point)
     /// and CasMetaCreateClean +1 (reason). Reuse the fixture of the nearest putBlob test.
@@ -287,8 +287,8 @@ TEST(CasBuildMetaCounters, CreateCleanAndChokePointCountOnFreshBody)
     const auto reason_before = ProfileEvents::global_counters[ProfileEvents::CasMetaCreateClean].load();
 
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = openStore(b);
-    auto build = s->startBuild({});
+    auto s = openPool(b);
+    auto build = s->beginPartWrite({});
 
     const String payload = "fresh-meta-payload-counters";
     auto ref = build->putBlob(idOf(payload), BlobSource::fromString(payload));
@@ -303,13 +303,13 @@ TEST(CasBuildMetaCounters, CreateCleanAndChokePointCountOnFreshBody)
 /// `putMetaIfAbsent` choke point (`CasMetaPut`), tagged with its reason (`CasMetaAdoptBackfill`). No
 /// existing test elsewhere in the suite drives this branch: every other pre-seeded raw body in this file
 /// pairs `writeRawBlobBody` with `writeMetaClean`, which skips the `!lm` backfill branch entirely.
-TEST(CasBuildMetaCounters, AdoptBackfillCountsChokePointAndReason)
+TEST(CasPartWriteTxnMetaCounters, AdoptBackfillCountsChokePointAndReason)
 {
     const auto put_before = ProfileEvents::global_counters[ProfileEvents::CasMetaPut].load();
     const auto reason_before = ProfileEvents::global_counters[ProfileEvents::CasMetaAdoptBackfill].load();
 
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = openStore(b);
+    auto s = openPool(b);
 
     const String payload = "adopt-backfill-payload-counters";
     const UInt128 hash = u128Of(payload);
@@ -342,10 +342,10 @@ TEST(CasBuildMetaCounters, AdoptBackfillCountsChokePointAndReason)
 /// The adopt decision is driven PURELY by the meta point-read — no RetireView is ever seeded in this
 /// test. A pre-existing body plus an independent Clean meta must be adopted (no putOverwrite/re-upload:
 /// the pre-seeded incarnation's token survives untouched), and the meta stays Clean.
-TEST(CasBuild, PutBlobAdoptsWhenMetaCleanNoRetireView)
+TEST(CasPartWriteTxn, PutBlobAdoptsWhenMetaCleanNoRetireView)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = openStore(b);
+    auto s = openPool(b);
 
     const String payload = "adopt-meta-payload";
     const UInt128 hash = u128Of(payload);
@@ -384,10 +384,10 @@ TEST(CasBuild, PutBlobAdoptsWhenMetaCleanNoRetireView)
 /// which is compiled out in release. A putBlob that reaches the adopt path with NO precommit (the wiring
 /// order stageManifest -> precommitAdd -> putBlob violated) must fail closed with a real LOGICAL_ERROR,
 /// not silently adopt a blob the newborn-debris watermark does not cover.
-TEST(CasBuild, AdoptBeforePrecommitFailsClosed)
+TEST(CasPartWriteTxn, AdoptBeforePrecommitFailsClosed)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = openStore(b);
+    auto s = openPool(b);
 
     const String payload = "adopt-before-precommit-payload";
     const UInt128 hash = u128Of(payload);
@@ -414,10 +414,10 @@ TEST(CasBuild, AdoptBeforePrecommitFailsClosed)
 /// — again, no RetireView is seeded. A condemned meta must cause putBlob to displace the body (a fresh
 /// token, the old one never returns — INV-NO-RETURN, unchanged body mechanics) AND flip the meta back
 /// to Clean.
-TEST(CasBuild, PutBlobResurrectsWhenMetaCondemned)
+TEST(CasPartWriteTxn, PutBlobResurrectsWhenMetaCondemned)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = openStore(b);
+    auto s = openPool(b);
 
     const String payload = "resurrect-meta-payload";
     const UInt128 hash = u128Of(payload);
@@ -433,7 +433,7 @@ TEST(CasBuild, PutBlobResurrectsWhenMetaCondemned)
     const Token t0 = b->head(blob_key).token;
 
     /// NO retire-view seeding anywhere: the resurrect must be decided purely from the meta point-read.
-    auto build = s->startBuild({});
+    auto build = s->beginPartWrite({});
     auto ref = build->putBlob(id, BlobSource::fromString(payload));
     EXPECT_EQ(ref.ref, id);
 
@@ -451,13 +451,13 @@ TEST(CasBuild, PutBlobResurrectsWhenMetaCondemned)
 
 /// §0 introspection: the resurrect (condemned-displacement) meta flip goes through the `casMeta`
 /// choke point (`CasMetaCas`), tagged with its reason (`CasMetaResurrectClean`).
-TEST(CasBuildMetaCounters, ResurrectCountsCasAndReason)
+TEST(CasPartWriteTxnMetaCounters, ResurrectCountsCasAndReason)
 {
     const auto cas_before = ProfileEvents::global_counters[ProfileEvents::CasMetaCas].load();
     const auto reason_before = ProfileEvents::global_counters[ProfileEvents::CasMetaResurrectClean].load();
 
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = openStore(b);
+    auto s = openPool(b);
 
     const String payload = "resurrect-meta-payload-counters";
     const UInt128 hash = u128Of(payload);
@@ -470,7 +470,7 @@ TEST(CasBuildMetaCounters, ResurrectCountsCasAndReason)
     writeMetaClean(*b, s->layout(), hash, payload.size());
     condemnMeta(*b, s->layout(), hash, /*condemn_round*/ 1);
 
-    auto build = s->startBuild({});
+    auto build = s->beginPartWrite({});
     auto ref = build->putBlob(id, BlobSource::fromString(payload));
     EXPECT_EQ(ref.ref, id);
 
@@ -478,11 +478,11 @@ TEST(CasBuildMetaCounters, ResurrectCountsCasAndReason)
     EXPECT_GE(ProfileEvents::global_counters[ProfileEvents::CasMetaResurrectClean].load() - reason_before, 1);
 }
 
-TEST(CasBuild, PutBlobWrongSizeFailsClosed)
+TEST(CasPartWriteTxn, PutBlobWrongSizeFailsClosed)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = openStore(b);
-    auto build = s->startBuild({});
+    auto s = openPool(b);
+    auto build = s->beginPartWrite({});
 
     BlobSource lying;
     lying.size = 11;   /// declares 11 but writes 5
@@ -500,11 +500,11 @@ TEST(CasBuild, PutBlobWrongSizeFailsClosed)
 /// previous implementation buffered the whole blob into a `String source_bytes` first (a full in-memory
 /// copy whose peak grew ~linearly with the blob size — the OOM); that pass would invoke `write_payload`
 /// before the sink write. One invocation here is the streaming-not-materializing guarantee.
-TEST(CasBuild, PutBlobStreamsSourceOnceNoFullMaterialization)
+TEST(CasPartWriteTxn, PutBlobStreamsSourceOnceNoFullMaterialization)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = openStore(b);
-    auto build = s->startBuild({});
+    auto s = openPool(b);
+    auto build = s->beginPartWrite({});
 
     const String payload = "streamed-not-materialized";
     int invocations = 0;
@@ -528,22 +528,22 @@ TEST(CasBuild, PutBlobStreamsSourceOnceNoFullMaterialization)
 }
 
 /// B190: reuseBlob is removed (it had no production callers post-B188). Its behaviors are now covered by:
-///   - trusted adopted leaf at gate: PromoteTrustsAdoptedLeafNoProbeManifestTrust (CasBuild) — §4
+///   - trusted adopted leaf at gate: PromoteTrustsAdoptedLeafNoProbeManifestTrust (CasPartWriteTxn) — §4
 ///     manifest-trust: a committed-source adopted leaf publishes with NO per-file probe; a tokened leaf
 ///     is edge-protected (Phase A) and never re-observed at the gate.
-///   - absent adopted leaf trusted:  PromoteTrustsAdoptedLeafEvenIfBackendRaced (CasBuild) — the D4
+///   - absent adopted leaf trusted:  PromoteTrustsAdoptedLeafEvenIfBackendRaced (CasPartWriteTxn) — the D4
 ///     trade-off (a genuinely-absent adopted blob is caught by fsck, not the promote gate).
-///   - evidence tokenless vs tokened: DepIsTokenedDiscriminatesPutBlobVsAdopt (CasBuildReuseBlob).
-///   - no-dep / staging-bug fail-closed: PromoteCondemnedLeafWithoutDepAbortsFailClosed (CasBuild).
+///   - evidence tokenless vs tokened: DepIsTokenedDiscriminatesPutBlobVsAdopt (CasPartWriteTxnReuseBlob).
+///   - no-dep / staging-bug fail-closed: PromoteCondemnedLeafWithoutDepAbortsFailClosed (CasPartWriteTxn).
 
-TEST(CasBuildReuseBlob, DepIsTokenedDiscriminatesPutBlobVsAdopt)
+TEST(CasPartWriteTxnReuseBlob, DepIsTokenedDiscriminatesPutBlobVsAdopt)
 {
     /// B156b discriminator unit: putBlob records a TOKENED dep (token observed at upload time),
     /// adoptEvidence records a TOKENLESS W-EVIDENCE dep (no token; liveness from the source ref).
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = openStore(b);
+    auto s = openPool(b);
 
-    auto build = s->startBuild({});
+    auto build = s->beginPartWrite({});
 
     /// putBlob'd hash ⇒ tokened.
     build->putBlob(idOf("written"), BlobSource::fromString("written"));
@@ -562,7 +562,7 @@ TEST(CasBuildReuseBlob, DepIsTokenedDiscriminatesPutBlobVsAdopt)
 /// committed-source adopted leaf is TRUSTED at the promote gate (no HEAD/loadMeta probe), so a condemned
 /// pool blob no longer surfaces at promote — covered by PromoteTrustsAdoptedLeafNoProbeManifestTrust.
 
-TEST(CasBuild, PutBlobResurrectVanishedReUploadsHeldBody)
+TEST(CasPartWriteTxn, PutBlobResurrectVanishedReUploadsHeldBody)
 {
     auto b = std::make_shared<InMemoryBackend>();
 
@@ -570,8 +570,8 @@ TEST(CasBuild, PutBlobResurrectVanishedReUploadsHeldBody)
     BlobRef id;
     Token t0;
     {
-        auto s0 = openStore(b);
-        auto build0 = s0->startBuild({});
+        auto s0 = openPool(b);
+        auto build0 = s0->beginPartWrite({});
         id = build0->putBlob(idOf("payload-X"), BlobSource::fromString("payload-X")).ref;
         t0 = b->head(s0->layout().blobKey(id)).token;
     }
@@ -588,7 +588,7 @@ TEST(CasBuild, PutBlobResurrectVanishedReUploadsHeldBody)
     ///    Pool over the hook so its retire view (refreshed at open) sees the condemnation.
     auto hook = std::make_shared<HeadThenDeleteOnceBackend>(b, blob_key, t0);
     auto s = Pool::open(hook, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
-    auto build = s->startBuild({});
+    auto build = s->beginPartWrite({});
 
     /// 4. putBlob with a re-invokable body.
     ///    BEFORE fix: putIfAbsent -> PreconditionFailed -> observeAndAdmit HEAD (present, condemned)
@@ -616,7 +616,7 @@ TEST(CasBuild, PutBlobResurrectVanishedReUploadsHeldBody)
 /// INV-1 (revival-from-source): a condemned blob is NEVER read via GET to revive it.
 /// putBlob on a condemned-dedup hit must re-upload from its OWN source bytes — never calling
 /// backend().get(blob_key). This test counts backend GETs on the blob key and asserts zero.
-TEST(CasBuild, PutBlobCondemnedDedupNeverGetsTheDyingObject)
+TEST(CasPartWriteTxn, PutBlobCondemnedDedupNeverGetsTheDyingObject)
 {
     /// A delegating backend that counts get() calls on a specific key to assert INV-1.
     struct GetCountingBackend final : public DB::Cas::Backend
@@ -651,8 +651,8 @@ TEST(CasBuild, PutBlobCondemnedDedupNeverGetsTheDyingObject)
     BlobRef id;
     Token t0;
     {
-        auto s0 = openStore(b);
-        auto build0 = s0->startBuild({});
+        auto s0 = openPool(b);
+        auto build0 = s0->beginPartWrite({});
         id = build0->putBlob(idOf("payload-Y"), BlobSource::fromString("payload-Y")).ref;
         t0 = b->head(s0->layout().blobKey(id)).token;
     }
@@ -669,7 +669,7 @@ TEST(CasBuild, PutBlobCondemnedDedupNeverGetsTheDyingObject)
     /// 3. Open a fresh Pool over a GET-counting wrapper; the retire view sees the condemnation at open.
     auto counting = std::make_shared<GetCountingBackend>(b, blob_key);
     auto s = Pool::open(counting, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
-    auto build = s->startBuild({});
+    auto build = s->beginPartWrite({});
 
     /// 4. putBlob Y — the object is absent (was deleted). The dedup-hit (PreconditionFailed) path
     ///    won't fire (object is gone, so putIfAbsentStream → Done on the first attempt).
@@ -690,7 +690,7 @@ TEST(CasBuild, PutBlobCondemnedDedupNeverGetsTheDyingObject)
 
 /// INV-1 variant: blob is PRESENT and condemned (GC hasn't fired the delete yet). putBlob dedup-hits
 /// it via PreconditionFailed, sees condemned token, and must re-upload from source — NEVER GET.
-TEST(CasBuild, PutBlobCondemnedDedupPresentNeverGetsTheDyingObject)
+TEST(CasPartWriteTxn, PutBlobCondemnedDedupPresentNeverGetsTheDyingObject)
 {
     struct GetCountingBackend final : public DB::Cas::Backend
     {
@@ -724,8 +724,8 @@ TEST(CasBuild, PutBlobCondemnedDedupPresentNeverGetsTheDyingObject)
     BlobRef id;
     Token t0;
     {
-        auto s0 = openStore(b);
-        auto build0 = s0->startBuild({});
+        auto s0 = openPool(b);
+        auto build0 = s0->beginPartWrite({});
         id = build0->putBlob(idOf("payload-Z"), BlobSource::fromString("payload-Z")).ref;
         t0 = b->head(s0->layout().blobKey(id)).token;
     }
@@ -740,7 +740,7 @@ TEST(CasBuild, PutBlobCondemnedDedupPresentNeverGetsTheDyingObject)
     /// 3. Open a fresh Pool over a GET-counting wrapper.
     auto counting = std::make_shared<GetCountingBackend>(b, blob_key);
     auto s = Pool::open(counting, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
-    auto build = s->startBuild({});
+    auto build = s->beginPartWrite({});
 
     /// 4. putBlob Z: putIfAbsentStream → PreconditionFailed (object present) → observeAndAdmit →
     ///    sees condemned token → must call uploadFromSource (NOT resurrect/GET).
@@ -757,7 +757,7 @@ TEST(CasBuild, PutBlobCondemnedDedupPresentNeverGetsTheDyingObject)
     EXPECT_EQ(raw->bytes.substr(hdr.header_len), "payload-Z");
 }
 
-TEST(CasBuild, PutBlobVanishDuringRevivalReUploadsNotFatal)
+TEST(CasPartWriteTxn, PutBlobVanishDuringRevivalReUploadsNotFatal)
 {
     /// B190 sibling (INV-3): inside uploadFromSource the post-412 path re-observes via the 3-arg
     /// observeAndAdmit. If the object is GC-deleted in the window (present at the conditional PUT
@@ -855,7 +855,7 @@ TEST(CasBuild, PutBlobVanishDuringRevivalReUploadsNotFatal)
     EXPECT_EQ(stored->bytes.substr(h.header_len), "payload-V");
 }
 
-TEST(CasBuild, PromoteTrustsAdoptedLeafNoProbeManifestTrust)
+TEST(CasPartWriteTxn, PromoteTrustsAdoptedLeafNoProbeManifestTrust)
 {
     /// §4 manifest-trust: a committed-source adoptEvidence leaf is TRUSTED at the promote gate — the live
     /// source pins the blob (in-degree >= 1, not condemnable) and this build's precommit edge is durable,
@@ -869,7 +869,7 @@ TEST(CasBuild, PromoteTrustsAdoptedLeafNoProbeManifestTrust)
 
     /// A committed-source blob lives in the shared pool (seeded via a throwaway build on the same store).
     {
-        auto seed = s->startBuild({});
+        auto seed = s->beginPartWrite({});
         seed->putBlob(streamRefOf("payload-TR"), BlobSource::fromString("payload-TR"));
     }
     const String blob_key = s->layout().blobKey(streamRefOf("payload-TR"));
@@ -893,7 +893,7 @@ TEST(CasBuild, PromoteTrustsAdoptedLeafNoProbeManifestTrust)
     EXPECT_EQ(counting->getCountFor(meta_key) - meta_get_before, 0u) << "trust must not loadMeta the adopted blob";
 }
 
-TEST(CasBuild, PromoteTrustsAdoptedLeafEvenIfBackendRaced)
+TEST(CasPartWriteTxn, PromoteTrustsAdoptedLeafEvenIfBackendRaced)
 {
     /// §4 manifest-trust trade-off (D4 relink interserver-trust model): a committed-source adopted leaf is
     /// published WITHOUT a presence probe. Even if the pool object raced to absent between adopt and
@@ -901,13 +901,13 @@ TEST(CasBuild, PromoteTrustsAdoptedLeafEvenIfBackendRaced)
     /// invariant violation detected by fsck (or an actual body GET on read), not caught at the promote gate.
     /// This is the deliberate reduction from the pre-§4 "absent adopted leaf => ABORTED at gate".
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = openStore(b);
+    auto s = openPool(b);
     const RootNamespace ns{"srv1/tbl"};
 
     /// Seed X, adopt it, then delete it out from under the build (a landed GC delete in the adopt->promote
     /// window). The pre-§4 gate HEADed X, found it absent, and threw ABORTED; §4 trusts the durable edge.
     {
-        auto seed = s->startBuild({});
+        auto seed = s->beginPartWrite({});
         seed->putBlob(streamRefOf("payload-RACE"), BlobSource::fromString("payload-RACE"));
     }
     const String blob_key = s->layout().blobKey(streamRefOf("payload-RACE"));
@@ -926,7 +926,7 @@ TEST(CasBuild, PromoteTrustsAdoptedLeafEvenIfBackendRaced)
     EXPECT_TRUE(s->resolveRef(ns, "part_1").has_value());
 }
 
-TEST(CasBuild, PromoteCondemnedLeafWithoutDepAbortsFailClosed)
+TEST(CasPartWriteTxn, PromoteCondemnedLeafWithoutDepAbortsFailClosed)
 {
     /// A manifest blob leaf with NO recorded dep (a staging-bug shape: neither putBlob nor adoptEvidence
     /// recorded it) must fail closed at the promote gate — isTrustedAdopt is false (no tokened dep and no
@@ -936,12 +936,12 @@ TEST(CasBuild, PromoteCondemnedLeafWithoutDepAbortsFailClosed)
     /// The no-dep shape is reachable through the public build API (stageManifest names the leaf without any
     /// dep having been recorded), so no test accessor for the private predicate is needed.
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = openStore(b);
+    auto s = openPool(b);
     const RootNamespace ns{"srv1/tbl"};
 
     /// X exists (streaming-keyed) but THIS build records NO dep for it (no putBlob, no adoptEvidence).
     {
-        auto seed = s->startBuild({});
+        auto seed = s->beginPartWrite({});
         seed->putBlob(streamRefOf("payload-NODEP"), BlobSource::fromString("payload-NODEP"));
     }
     const String blob_key = s->layout().blobKey(streamRefOf("payload-NODEP"));
@@ -963,7 +963,7 @@ TEST(CasBuild, PromoteCondemnedLeafWithoutDepAbortsFailClosed)
     EXPECT_EQ(b->head(blob_key).token, t0);
 }
 
-TEST(CasBuild, PromoteRevalidatesBlobPresenceFailClosed)
+TEST(CasPartWriteTxn, PromoteRevalidatesBlobPresenceFailClosed)
 {
     /// Port of the old W-TREE-BUILD bottom-up enforcement (PutTreeEnforcesBottomUp): the surviving
     /// "a committed ref never names a missing dependency" invariant. In the part-manifest model
@@ -972,7 +972,7 @@ TEST(CasBuild, PromoteRevalidatesBlobPresenceFailClosed)
     /// tokened dep (never putBlob'd) and NO adopted dep (never adoptEvidence'd) is a staging bug and fails
     /// closed with LOGICAL_ERROR (a real write always records a dep for every leaf). No per-file probe.
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = openStore(b);
+    auto s = openPool(b);
     const RootNamespace ns{"srv1/tbl"};
 
     /// Stage + precommit a manifest naming a blob hash that was NEVER uploaded (no dep recorded).
@@ -995,7 +995,7 @@ TEST(CasBuild, PromoteRevalidatesBlobPresenceFailClosed)
     EXPECT_TRUE(s->resolveRef(ns, "part_1").has_value());
 }
 
-TEST(CasBuild, AdoptEvidenceRecordsTokenlessDep)
+TEST(CasPartWriteTxn, AdoptEvidenceRecordsTokenlessDep)
 {
     /// Port of AdoptFromTreeRecordsEvidence. adoptEvidence records a TOKENLESS W-EVIDENCE dep directly
     /// from a resolved ManifestEntry — a Blob entry is tokenless (depIsTokened false), an Inline entry
@@ -1004,8 +1004,8 @@ TEST(CasBuild, AdoptEvidenceRecordsTokenlessDep)
     /// adopted leaf ⇒ trusted, no probe) and PromoteCondemnedLeafWithoutDepAbortsFailClosed (negative
     /// control: no dep ⇒ fail closed, LOGICAL_ERROR).
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = openStore(b);
-    auto build = s->startBuild({});
+    auto s = openPool(b);
+    auto build = s->beginPartWrite({});
 
     const ManifestEntry adopted = blobManifestEntry("data.bin", "source-blob");
     build->adoptEvidence(adopted);
@@ -1020,13 +1020,13 @@ TEST(CasBuild, AdoptEvidenceRecordsTokenlessDep)
     EXPECT_FALSE(build->depIsTokened(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(u128Of("abc"))}));
 }
 
-TEST(CasBuild, AbandonRemovesStagedDebrisAndDisables)
+TEST(CasPartWriteTxn, AbandonRemovesStagedDebrisAndDisables)
 {
-    /// Port of AbandonLeavesDebrisAndDisables to the new abandon semantics (CasBuild.cpp abandon):
+    /// Port of AbandonLeavesDebrisAndDisables to the new abandon semantics (CasPartWriteTxn.cpp abandon):
     /// abandon best-effort exact-token-DELETEs this build's STAGED manifest debris, leaves blob bodies
     /// (full GC's job via min_active), and disables the build (further ops throw via requireAlive).
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = openStore(b);
+    auto s = openPool(b);
     const RootNamespace ns{"srv1/tbl"};
     auto build = startBuildFor(s, ns, "ref");
 
@@ -1051,10 +1051,10 @@ TEST(CasBuild, AbandonRemovesStagedDebrisAndDisables)
     expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&] { build->precommitAdd(ns, "ref", mid); });
 }
 
-TEST(CasBuild, PublishHappyPathRoundTrip)
+TEST(CasPartWriteTxn, PublishHappyPathRoundTrip)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = openStore(b);
+    auto s = openPool(b);
     const RootNamespace ns{"srv1/tbl"};
     auto build = startBuildFor(s, ns, "part_1");
 
@@ -1080,14 +1080,14 @@ TEST(CasBuild, PublishHappyPathRoundTrip)
     EXPECT_EQ(got->bytes, "hello world");
 }
 
-TEST(CasBuild, PromoteCrossNamespaceManifestFailsClosed)
+TEST(CasPartWriteTxn, PromoteCrossNamespaceManifestFailsClosed)
 {
     /// Port of PublishRequiresTreeInDepSet. The W-DEP-SET "root must be a built/adopted dep" authority
     /// is gone (the tree object model it guarded is gone); the surviving fail-closed authority that
     /// refuses an inconsistent commit target is the namespace consistency check in precommitAdd/promote
-    /// (CasBuild.cpp): a manifest whose root_namespace != the target namespace is a bug ⇒ LOGICAL_ERROR.
+    /// (CasPartWriteTxn.cpp): a manifest whose root_namespace != the target namespace is a bug ⇒ LOGICAL_ERROR.
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = openStore(b);
+    auto s = openPool(b);
     const RootNamespace ns{"srv1/tbl"};
     const RootNamespace other_ns{"srv1/other"};
 
@@ -1103,13 +1103,13 @@ TEST(CasBuild, PromoteCrossNamespaceManifestFailsClosed)
         [&] { build->promote(other_ns, "part_1", build->buildId(), id); });
 }
 
-/// (CasBuild.PublishOwnThreadConflictRetries was removed with the legacy mutable ref-shard lane: it
+/// (CasPartWriteTxn.PublishOwnThreadConflictRetries was removed with the legacy mutable ref-shard lane: it
 /// injected a Conflict on the promote's shard `casPut` and asserted the shard re-read/retry. The ref model
 /// has no shard CAS -- promote appends a write-once ref-log object via `putIfAbsentControlled`, and an
 /// uncertain create is resolved by exact-key observation, covered by the ref-writer uncertain-result tests
 /// (`gtest_cas_ref_writer.cpp`), not a CAS retry.)
 
-TEST(CasBuild, PublishIntoSecondNamespaceSameBlob)
+TEST(CasPartWriteTxn, PublishIntoSecondNamespaceSameBlob)
 {
     /// Port of PublishIntoSecondNamespaceSameTree. A part manifest is single-owner and namespace-qualified
     /// (precommitAdd/promote enforce id.root_namespace == target_ns), so the SAME ManifestId cannot be
@@ -1117,7 +1117,7 @@ TEST(CasBuild, PublishIntoSecondNamespaceSameBlob)
     /// test protected is preserved at the BLOB plane: the shared blob is uploaded ONCE and adopted by the
     /// second build (its token is unchanged after the second publish).
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = openStore(b);
+    auto s = openPool(b);
     const RootNamespace ns1{"srv1/tbl"};
     const RootNamespace ns2{"srv1/tbl/detached"};
 
@@ -1155,10 +1155,10 @@ TEST(CasBuild, PublishIntoSecondNamespaceSameBlob)
 /// TABLE now serialize through the append lane's per-namespace batching queue instead (exercised by
 /// gtest_cas_ref_writer.cpp's co-batch/queue tests). What remains a real regression to guard is the
 /// end-to-end outcome: two builds publishing distinct refs into one namespace both land correctly.
-TEST(CasBuild, TwoBuildsPublishToSameNamespaceBothLand)
+TEST(CasPartWriteTxn, TwoBuildsPublishToSameNamespaceBothLand)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = openStore(b);
+    auto s = openPool(b);
     const RootNamespace ns{"srv1/tbl"};
     const String ref1 = "a";
     const String ref2 = "b";
@@ -1184,7 +1184,7 @@ TEST(CasBuild, TwoBuildsPublishToSameNamespaceBothLand)
     EXPECT_EQ(s->listRefs(ns).size(), 2u);
 }
 
-TEST(CasBuild, FirstPublishMakesNamespaceDiscoverable)
+TEST(CasPartWriteTxn, FirstPublishMakesNamespaceDiscoverable)
 {
     /// After Task 4 the registry is deleted; a namespace becomes discoverable via LIST(cas/refs/)
     /// once its first ref shard exists (created by precommitAdd/promote).
@@ -1201,7 +1201,7 @@ TEST(CasBuild, FirstPublishMakesNamespaceDiscoverable)
     EXPECT_EQ(all[0], "srv9/fresh");
 }
 
-TEST(CasBuild, AdoptEvidenceNoBackendOp)
+TEST(CasPartWriteTxn, AdoptEvidenceNoBackendOp)
 {
     /// B188: adoptEvidence records a TOKENLESS W-EVIDENCE dep from an already-resolved ManifestEntry
     /// WITHOUT any backend call (no HEAD, no GET, no PUT).
@@ -1240,7 +1240,7 @@ TEST(CasBuild, AdoptEvidenceNoBackendOp)
     auto raw = std::make_shared<InMemoryBackend>();
     auto counting = std::make_shared<LocalCountingBackend>(raw);
     auto s = Pool::open(counting, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
-    auto build = s->startBuild({});
+    auto build = s->beginPartWrite({});
 
     /// A Blob ManifestEntry. adoptEvidence is called on a hand-crafted entry — that IS the B188 interface.
     const ManifestEntry entry = blobManifestEntry("b188.bin", "b188-content");
@@ -1272,7 +1272,7 @@ TEST(CasBuild, AdoptEvidenceNoBackendOp)
     EXPECT_FALSE(build->depIsTokened(BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(u128Of("xy"))}));
 }
 
-TEST(CasBuild, ConvergesUnderProductiveGc)
+TEST(CasPartWriteTxn, ConvergesUnderProductiveGc)
 {
     /// B167/B171 LIVENESS — the re-upload/condemn livelock, now closed by the build-root precommit edge.
     ///
@@ -1282,7 +1282,7 @@ TEST(CasBuild, ConvergesUnderProductiveGc)
     /// zero-in-degree candidate every round, kept RE-CONDEMNING and exact-token-DELETING that fresh
     /// incarnation in the build's upload→commit window. The build never converged → livelock.
     ///
-    /// THE FIX (B171): protection is the build-root PRECOMMIT EDGE. Build B precommits its manifest (naming
+    /// THE FIX (B171): protection is the build-root PRECOMMIT EDGE. PartWriteTxn B precommits its manifest (naming
     /// H) BEFORE the adversarial loop, so the GC fold lifts H to in-degree ≥ 1 — H is never even a
     /// zero-in-degree candidate and is SPARED every round until B promotes (the committed ref then pins H).
     ///
@@ -1299,7 +1299,7 @@ TEST(CasBuild, ConvergesUnderProductiveGc)
     cfg.background_watermark = false;
     const String content = "shared-content";
 
-    /// 1. Build A creates H ("shared-content"), publishes a part referencing it, then drops the ref.
+    /// 1. PartWriteTxn A creates H ("shared-content"), publishes a part referencing it, then drops the ref.
     ///    Capture H's first incarnation token so we can condemn exactly it.
     BlobRef h;
     Token h_token0;
@@ -1339,7 +1339,7 @@ TEST(CasBuild, ConvergesUnderProductiveGc)
     ASSERT_TRUE(after_reupload.exists);
     EXPECT_NE(after_reupload.token, h_token0);   /// a genuinely fresh incarnation
 
-    /// 4. Build B stages its manifest referencing H and PRECOMMITS it (build-root edge). H is now
+    /// 4. PartWriteTxn B stages its manifest referencing H and PRECOMMITS it (build-root edge). H is now
     ///    protected by reachability: the GC fold lifts H to in-degree ≥ 1 from the precommit.
     const ManifestId mid_b = build_b->stageManifest({blobManifestEntry("f", content)});
     build_b->precommitAdd(ns, "part_2", mid_b);
@@ -1420,10 +1420,10 @@ TEST(CasBuild, ConvergesUnderProductiveGc)
 /// Δ=0 move would re-publish a committed ref over blobs whose in-degree was already decremented to 0 — GC
 /// then deletes them ⇒ a reachable committed manifest with dangling blobs (INV_NO_DANGLE violation).
 /// promote MUST fail closed (ABORTED) unless the precommit is the current live owner binding of the ref.
-TEST(CasBuild, PromoteFailsClosedWhenPrecommitNoLongerLiveOwner)
+TEST(CasPartWriteTxn, PromoteFailsClosedWhenPrecommitNoLongerLiveOwner)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = openStore(b);
+    auto s = openPool(b);
     const RootNamespace ns{"srv1/tbl"};
     auto build = startBuildFor(s, ns, "part_1");
 
@@ -1455,10 +1455,10 @@ TEST(CasBuild, PromoteFailsClosedWhenPrecommitNoLongerLiveOwner)
 
 /// BUG 1 happy path: a promote whose precommit is STILL the live owner succeeds (the guard must not
 /// reject the normal commit). Distinct from PublishHappyPathRoundTrip in that it pins the WPromote guard.
-TEST(CasBuild, PromoteSucceedsWhenPrecommitIsLiveOwner)
+TEST(CasPartWriteTxn, PromoteSucceedsWhenPrecommitIsLiveOwner)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = openStore(b);
+    auto s = openPool(b);
     const RootNamespace ns{"srv1/tbl"};
     auto build = startBuildFor(s, ns, "part_1");
 
@@ -1480,10 +1480,10 @@ TEST(CasBuild, PromoteSucceedsWhenPrecommitIsLiveOwner)
 /// the ordinary precommit->committed promotion -- the C++ realization of `WRepoint`'s one-event
 /// old-binding/new-binding shape (Phase 0, task-1 gate). Without the flag, behavior is BYTE-IDENTICAL
 /// to today (BUG 1a still fires).
-TEST(CasBuildRepoint, PromoteRepointsCommittedRef)
+TEST(CasPartWriteTxnRepoint, PromoteRepointsCommittedRef)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = openStore(b);
+    auto s = openPool(b);
     const RootNamespace ns{"srv1/tbl"};
 
     /// Publish ref "part_1" -> M1 through the normal build path.
@@ -1535,10 +1535,10 @@ TEST(CasBuildRepoint, PromoteRepointsCommittedRef)
 /// the body — GC decrements the precommit's blob edges and deletes the body only after the decrement is
 /// sealed. Writer-deleting a live precommit body strands GC's fold barrier (live precommit, missing body
 /// → clamp forever) or loses the activating +1.
-TEST(CasBuild, AbandonAppendsPrecommitRemovalAndKeepsLivePrecommitBody)
+TEST(CasPartWriteTxn, AbandonAppendsPrecommitRemovalAndKeepsLivePrecommitBody)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = openStore(b);
+    auto s = openPool(b);
     const RootNamespace ns{"srv1/tbl"};
     auto build = startBuildFor(s, ns, "part_1");
 
@@ -1569,10 +1569,10 @@ TEST(CasBuild, AbandonAppendsPrecommitRemovalAndKeepsLivePrecommitBody)
 /// BUG 2 regression for the never-precommitted path: a manifest that was STAGED but never precommitted is
 /// still best-effort writer-deleted by abandon (pre-precommit debris) — only a LIVE precommit body is
 /// spared. Confirms the fix narrows the skip to the precommitted manifest exactly.
-TEST(CasBuild, AbandonStillDeletesNeverPrecommittedStagedDebris)
+TEST(CasPartWriteTxn, AbandonStillDeletesNeverPrecommittedStagedDebris)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = openStore(b);
+    auto s = openPool(b);
     const RootNamespace ns{"srv1/tbl"};
     auto build = startBuildFor(s, ns, "part_1");
 
@@ -1601,12 +1601,12 @@ TEST(CasBuild, AbandonStillDeletesNeverPrecommittedStagedDebris)
 namespace
 {
 
-/// Mirrors `CasBuild.cpp`'s private `kMaxManifestEncodedBytes` (256 MiB). There is no way to read a
+/// Mirrors `CasPartWriteTxn.cpp`'s private `kMaxManifestEncodedBytes` (256 MiB). There is no way to read a
 /// file-local `constexpr` from a different translation unit, so this is kept in sync by hand — if that
 /// cap ever changes, update this one to match.
 constexpr uint64_t kExpectedManifestEncodedCap = 256ULL << 20;
 
-/// The exact encoded size `Build::stageManifest` would compute for a single Blob-placement entry whose
+/// The exact encoded size `PartWriteTxn::stageManifest` would compute for a single Blob-placement entry whose
 /// path is `path_len` bytes long, staged under `ns` — measured through the SAME `encodePartManifest`
 /// codec `stageManifest` calls, so this is an exact reproduction rather than a hand-derived estimate.
 /// `ref` and `payload_digest` are fixed-width fields (20 and 16 bytes respectively): their VALUES don't
@@ -1669,10 +1669,10 @@ ManifestEntry wideBlobManifestEntry(size_t path_len)
 /// Boundary case 1/2: a manifest whose encoded size is the LARGEST that still fits under the cap stages
 /// successfully. Proves the cap enforcement isn't overly conservative — a real just-under-the-limit
 /// manifest is not mistakenly rejected.
-TEST(CasBuild, ManifestCapEncodedBytesJustUnderStagesSuccessfully)
+TEST(CasPartWriteTxn, ManifestCapEncodedBytesJustUnderStagesSuccessfully)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = openStore(b);
+    auto s = openPool(b);
     const RootNamespace ns{"srv1/tbl"};
 
     const size_t path_len_over = findManifestEncodedCapBoundaryPathLen(ns);
@@ -1690,10 +1690,10 @@ TEST(CasBuild, ManifestCapEncodedBytesJustUnderStagesSuccessfully)
 /// Boundary case 2/2: a manifest whose encoded size exceeds the cap by the smallest possible margin
 /// (one more path byte than the passing case above) throws `LIMIT_EXCEEDED` fail-closed, BEFORE the body
 /// write — no manifest object lands in the backend for the rejected attempt.
-TEST(CasBuild, ManifestCapEncodedBytesOverThrowsBeforeBodyWrite)
+TEST(CasPartWriteTxn, ManifestCapEncodedBytesOverThrowsBeforeBodyWrite)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = openStore(b);
+    auto s = openPool(b);
     const RootNamespace ns{"srv1/tbl"};
 
     const size_t path_len_over = findManifestEncodedCapBoundaryPathLen(ns);
@@ -1726,14 +1726,14 @@ TEST(CasBuild, ManifestCapEncodedBytesOverThrowsBeforeBodyWrite)
 /// two entries carrying the SAME digest VALUE under TWO DIFFERENT algos (`ch128:X` / `xxh3:X`). Only
 /// `ch128:X`'s body is ever putBlob'd; `xxh3:X`'s body never lands anywhere. Promote MUST fail closed —
 /// the tokened `ch128:X` dep must NEVER be read as satisfying the non-tokened `xxh3:X` leaf.
-/// This test is RED (wrongly passes / silently promotes) if `Build::deps` (the W-DEP-SET) were keyed on
+/// This test is RED (wrongly passes / silently promotes) if `PartWriteTxn::deps` (the W-DEP-SET) were keyed on
 /// a bare digest instead of the full `BlobRef` pair: both entries would collapse to the SAME map key
 /// (the digest alone), so `depIsTokened` would report the xxh3 leaf as edge-protected via the ch128
 /// entry's putBlob and promote would skip its revalidation (and hence its absence) entirely.
-TEST(CasBuild, WDepSetCrossAlgoSatisfactionFailsClosed)
+TEST(CasPartWriteTxn, WDepSetCrossAlgoSatisfactionFailsClosed)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = openStore(b);
+    auto s = openPool(b);
     const RootNamespace ns{"srv/tbl"};
 
     const BlobDigest shared_digest = BlobDigest::fromU128(u128Of("shared-digest-value"));
@@ -1856,7 +1856,7 @@ private:
 /// to "absent" by the controller's exact-GET), then a clean third attempt. The old single-attempt
 /// path fails the whole stage on the FIRST timeout (the observed 19s-pause INSERT kill); the
 /// controller path must ride its attempt budget and succeed.
-TEST(CasBuildStageManifestRetry, AmbiguousTimeoutsThenCommitSucceedsWithinBudget)
+TEST(CasPartWriteTxnStageManifestRetry, AmbiguousTimeoutsThenCommitSucceedsWithinBudget)
 {
     /// Zero backoff: the retry semantics are under test here, not the (controller-level-tested)
     /// inter-attempt sleep schedule — keep the suite free of real sleeps.
@@ -1880,10 +1880,10 @@ TEST(CasBuildStageManifestRetry, AmbiguousTimeoutsThenCommitSucceedsWithinBudget
 /// server-side. Resolve-before-reissue's exact-GET observes the identical bytes and reports
 /// Committed — the stage succeeds WITHOUT a reissue (no duplicate PUT of the object), and the
 /// `ManifestPut` audit event carries the landed incarnation's token (from the resolve GET).
-TEST(CasBuildStageManifestRetry, AmbiguousLandedWriteResolvesToCommittedWithoutReissue)
+TEST(CasPartWriteTxnStageManifestRetry, AmbiguousLandedWriteResolvesToCommittedWithoutReissue)
 {
     auto b = std::make_shared<ManifestPutFaultBackend>();
-    auto s = openStore(b);
+    auto s = openPool(b);
     const RootNamespace ns{"srv/tbl"};
 
     std::vector<CasEvent> events;
@@ -1908,10 +1908,10 @@ TEST(CasBuildStageManifestRetry, AmbiguousLandedWriteResolvesToCommittedWithoutR
 /// A DIFFERENT object at the exact staged key (a foreign body ahead of our ambiguous attempt) is a
 /// proven conflict — the NoManifestIdReuse invariant broke — and must stay the loud CORRUPTED_DATA
 /// class: never a retry signal, never silently adopted.
-TEST(CasBuildStageManifestRetry, DifferentObjectAtKeyStaysLoudConflict)
+TEST(CasPartWriteTxnStageManifestRetry, DifferentObjectAtKeyStaysLoudConflict)
 {
     auto b = std::make_shared<ManifestPutFaultBackend>();
-    auto s = openStore(b);
+    auto s = openPool(b);
     const RootNamespace ns{"srv/tbl"};
 
     auto build = startBuildFor(s, ns, "part_conflict");
@@ -1928,7 +1928,7 @@ TEST(CasBuildStageManifestRetry, DifferentObjectAtKeyStaysLoudConflict)
 /// Unresolved after `max_attempts` and stageManifest maps it to ABORTED — the same retryable abort
 /// class the ref-log lane's exhausted budget maps to. Nothing was durably named: the caller
 /// re-stages with a fresh ManifestId.
-TEST(CasBuildStageManifestRetry, BudgetExhaustionMapsToAborted)
+TEST(CasPartWriteTxnStageManifestRetry, BudgetExhaustionMapsToAborted)
 {
     CasRequestBudget budget;
     budget.max_attempts = 3;
@@ -1949,7 +1949,7 @@ TEST(CasBuildStageManifestRetry, BudgetExhaustionMapsToAborted)
 /// =====================================================================================
 /// Task B follow-up (availfix): the two conditional-create paths that still bypassed the request
 /// controller — the BLOB body `putIfAbsentStream` create and `promoteStaged`'s conditional
-/// server-side copy (both issued inside `Build::uploadFromSource`'s streamIfAbsent) — now ride the
+/// server-side copy (both issued inside `PartWriteTxn::uploadFromSource`'s streamIfAbsent) — now ride the
 /// same budgeted-attempts machinery. Reissue re-streams from the writer's REPLAYABLE source
 /// (`BlobSource::write_payload` re-reads the staged temp file / re-issues the copy from the intact
 /// staging object — INV-1, never a GET-revive); ambiguity resolves by exact-key OCCUPANCY (the key
@@ -2034,7 +2034,7 @@ private:
 
 /// Zero-backoff store over a BlobPutFaultBackend: the sleep schedule has its own controller-level
 /// tests; these Pool-level tests pin the retry/resolve/abort semantics without real sleeps.
-PoolPtr openBlobFaultStore(const std::shared_ptr<BlobPutFaultBackend> & b, uint32_t max_attempts = CasRequestBudget{}.max_attempts)
+PoolPtr openBlobFaultPool(const std::shared_ptr<BlobPutFaultBackend> & b, uint32_t max_attempts = CasRequestBudget{}.max_attempts)
 {
     CasRequestBudget budget;
     budget.max_attempts = max_attempts;
@@ -2063,10 +2063,10 @@ BlobSource countingSource(const String & payload, int & payload_streams)
 /// path failed the whole INSERT on the FIRST timeout (the raw Poco::TimeoutException escaped
 /// putBlob); the controller path rides its budget, RE-STREAMING the payload from the writer's own
 /// replayable source on every attempt.
-TEST(CasBuildBlobPutRetry, AmbiguousTimeoutsThenCommitRestreamsFromSource)
+TEST(CasPartWriteTxnBlobPutRetry, AmbiguousTimeoutsThenCommitRestreamsFromSource)
 {
     auto b = std::make_shared<BlobPutFaultBackend>();
-    auto s = openBlobFaultStore(b);
+    auto s = openBlobFaultPool(b);
     const RootNamespace ns{"srv/tbl"};
     const String payload = "blob-payload-A";
 
@@ -2088,10 +2088,10 @@ TEST(CasBuildBlobPutRetry, AmbiguousTimeoutsThenCommitRestreamsFromSource)
 /// server-side. The occupancy resolve observes the key present and the existing 412 machinery takes
 /// over — the occupant is ADOPTED (content-addressed identity: any occupant of this key IS the
 /// content), with NO reissue and NO second body upload.
-TEST(CasBuildBlobPutRetry, AmbiguousLandedWriteAdoptsOccupantWithoutReupload)
+TEST(CasPartWriteTxnBlobPutRetry, AmbiguousLandedWriteAdoptsOccupantWithoutReupload)
 {
     auto b = std::make_shared<BlobPutFaultBackend>();
-    auto s = openBlobFaultStore(b);
+    auto s = openBlobFaultPool(b);
     const RootNamespace ns{"srv/tbl"};
     const String payload = "blob-payload-B";
 
@@ -2126,10 +2126,10 @@ TEST(CasBuildBlobPutRetry, AmbiguousLandedWriteAdoptsOccupantWithoutReupload)
 /// and the ref-log lane map their exhausted budgets to. putBlob's own bounded condemned-churn loop
 /// (8 rounds) re-drives the upload before the ABORTED escapes, so the total attempt count is
 /// controller budget × that outer bound.
-TEST(CasBuildBlobPutRetry, BudgetExhaustionMapsToAborted)
+TEST(CasPartWriteTxnBlobPutRetry, BudgetExhaustionMapsToAborted)
 {
     auto b = std::make_shared<BlobPutFaultBackend>();
-    auto s = openBlobFaultStore(b, /*max_attempts=*/3);
+    auto s = openBlobFaultPool(b, /*max_attempts=*/3);
     const RootNamespace ns{"srv/tbl"};
     const String payload = "blob-payload-C";
 
@@ -2157,10 +2157,10 @@ TEST(CasBuildBlobPutRetry, BudgetExhaustionMapsToAborted)
 /// promoteStaged conditional copy, ambiguous-but-landed: the copy's response is lost AFTER the
 /// destination was created. The occupancy resolve observes the destination present and the occupant
 /// is adopted — Committed-in-effect WITHOUT a re-copy.
-TEST(CasBuildPromoteStagedRetry, AmbiguousCopyLandedAdoptsDestinationWithoutRecopy)
+TEST(CasPartWriteTxnPromoteStagedRetry, AmbiguousCopyLandedAdoptsDestinationWithoutRecopy)
 {
     auto b = std::make_shared<BlobPutFaultBackend>();
-    auto s = openBlobFaultStore(b);
+    auto s = openBlobFaultPool(b);
     const RootNamespace ns{"srv/tbl"};
     const String payload = "staged-payload-A";
     /// The staging object: [pool-fixed-length envelope header][payload], promoted VERBATIM by the copy.
@@ -2196,10 +2196,10 @@ TEST(CasBuildPromoteStagedRetry, AmbiguousCopyLandedAdoptsDestinationWithoutReco
 /// promoteStaged conditional copy, ambiguous-and-absent: the first copy attempt times out with
 /// nothing landing; the resolve observes the destination absent and the copy is REISSUED from the
 /// (intact, still-staged) source object — the second attempt commits.
-TEST(CasBuildPromoteStagedRetry, AmbiguousCopyAbsentReattemptsAndCommits)
+TEST(CasPartWriteTxnPromoteStagedRetry, AmbiguousCopyAbsentReattemptsAndCommits)
 {
     auto b = std::make_shared<BlobPutFaultBackend>();
-    auto s = openBlobFaultStore(b);
+    auto s = openBlobFaultPool(b);
     const RootNamespace ns{"srv/tbl"};
     const String payload = "staged-payload-B";
     const String staging_key = "p/staging/test/blob-b";

@@ -22,28 +22,28 @@ TEST(CasBackendGeneration, StampedTokenTypeFollowsNativeKind)
     EXPECT_EQ(hr.token.type, TokenType::Generation);
 }
 
-/// checkStorePreconditions on a Native, generation-dialect (GCS) backend consults
+/// checkPoolPreconditions on a Native, generation-dialect (GCS) backend consults
 /// isBucketVersioningEnabled. LocalObjectStorage does not override that method, so it inherits the
 /// IObjectStorage base default, which returns nullopt (the check is inconclusive). Per the hook's
 /// documented behaviour, an inconclusive check must NOT fail closed — only a CONFIRMED `true` throws.
-TEST(CasBackendGeneration, CheckStorePreconditionsProceedsOnUnknownVersioning)
+TEST(CasBackendGeneration, CheckPoolPreconditionsProceedsOnUnknownVersioning)
 {
     auto b = std::make_shared<ObjectStorageBackend>(
         DB::Cas::tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::Native);
     b->setNativeTokenTypeForTest(TokenType::Generation);
 
-    EXPECT_NO_THROW(b->checkStorePreconditions());
+    EXPECT_NO_THROW(b->checkPoolPreconditions());
 }
 
 /// The ETag-dialect (AWS-compatible) backend never consults bucket versioning at all — the check is
 /// a silent no-op for any backend that is not Native + TokenType::Generation.
-TEST(CasBackendGeneration, CheckStorePreconditionsNoOpOnEtagDialect)
+TEST(CasBackendGeneration, CheckPoolPreconditionsNoOpOnEtagDialect)
 {
     auto b = std::make_shared<ObjectStorageBackend>(
         DB::Cas::tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::Native);
     ASSERT_EQ(b->nativeTokenType(), TokenType::ETag);
 
-    EXPECT_NO_THROW(b->checkStorePreconditions());
+    EXPECT_NO_THROW(b->checkPoolPreconditions());
 }
 
 /// GCS enforces NO preconditions on CompleteMultipartUpload (measured 2026-07-03), so a conditional

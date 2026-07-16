@@ -67,7 +67,7 @@ public:
 std::unique_ptr<IHashingWriteBuffer> makeBlobHashingWriteBuffer(BlobHashAlgo algo, WriteBuffer & sink);
 
 /// One-shot hash of `bytes` for `algo`, used by the re-hash / copy-forward path (`poolContentHash` in
-/// `CasBuild.cpp`) and by tests. `CityHash128` goes through `HashingReadBuffer` -- the SAME chunked
+/// `CasPartWriteTxn.cpp`) and by tests. `CityHash128` goes through `HashingReadBuffer` -- the SAME chunked
 /// convention the write side uses (a one-shot `CityHash128WithSeed` call diverges from the chunked
 /// hash for any payload larger than one hash block). `XXH3_128` uses the one-shot `XXH3_128bits`
 /// call, which is defined to agree with the streaming digest. `Sha256` uses OpenSSL's one-shot

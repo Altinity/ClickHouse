@@ -99,8 +99,8 @@ public:
                           const String & fresh_header, uint64_t staging_payload_offset) override;
 
     /// Pool-level precondition: on a Native, generation-dialect (GCS) backend, fail closed if the
-    /// bucket has object versioning enabled — see Backend::checkStorePreconditions.
-    void checkStorePreconditions() override;
+    /// bucket has object versioning enabled — see Backend::checkPoolPreconditions.
+    void checkPoolPreconditions() override;
 
     /// Fail-closed precondition (RFC cas-s3-timeout-retry-control): throws LOGICAL_ERROR when Native
     /// mode has no single-attempt client (single_attempt_s3_client, built in the ctor) — see

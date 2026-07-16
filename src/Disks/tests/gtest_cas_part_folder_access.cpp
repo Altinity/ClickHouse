@@ -1,6 +1,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Parts/PartFolderAccess.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBuild.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/ProfileEvents.h>
 #include <Poco/Util/XMLConfiguration.h>
@@ -44,7 +44,7 @@ Cas::ManifestEntry inlineEntry(const String & path, const String & bytes)
 Cas::ManifestId publishPart(const Cas::PoolPtr & store, const Cas::RootNamespace & ns,
                             const String & ref, std::vector<Cas::ManifestEntry> entries)
 {
-    auto build = store->startBuild(Cas::BuildInfo{.intended_ref = ns.string() + "/" + ref,
+    auto build = store->beginPartWrite(Cas::PartWriteInfo{.intended_ref = ns.string() + "/" + ref,
                                                   .intended_namespace = ns, .op = Cas::ProvenanceOp::Insert});
     const Cas::ManifestId id = build->stageManifest(entries);
     build->precommitAdd(ns, ref, id);
@@ -118,7 +118,7 @@ private:
 TEST(CasPartFolderAccess, RetainedHitSkipsManifestHead)
 {
     auto backend = std::make_shared<CountingBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const Cas::Layout layout("p");
     const Cas::RootNamespace ns{"srv/t1"};
     ContentAddressed::CachedPartFolderAccess access(store, cacheOn());
@@ -142,7 +142,7 @@ TEST(CasPartFolderAccess, RetainedHitSkipsManifestHead)
 TEST(CasPartFolderAccess, HitPathJournalEmptyAndCheapWhenExplainDisabled)
 {
     auto backend = std::make_shared<CountingBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const Cas::Layout layout("p");
     const Cas::RootNamespace ns{"srv/t1"};
     /// Retention ON, explain journal OFF (the production default): the hit path must take neither the
@@ -172,7 +172,7 @@ TEST(CasPartFolderAccess, HitPathJournalEmptyAndCheapWhenExplainDisabled)
 TEST(CasPartFolderAccess, GetViewServesCommittedFolder)
 {
     auto backend = std::make_shared<CountingBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const Cas::RootNamespace ns{"srv/t1"};
     publishPart(store, ns, "part_1",
                 {inlineEntry("checksums.txt", "cs"), inlineEntry("count.txt", "1"), inlineEntry("txn_version.txt", "v1")});
@@ -195,7 +195,7 @@ TEST(CasPartFolderAccess, GetViewServesCommittedFolder)
 TEST(CasPartFolderAccess, GetViewFailsClosedOnMissingBody)
 {
     auto backend = std::make_shared<CountingBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const Cas::Layout layout("p");
     const Cas::RootNamespace ns{"srv/t1"};
     const auto id = publishPart(store, ns, "part_1", {inlineEntry("checksums.txt", "cs")});
@@ -218,13 +218,13 @@ TEST(CasPartFolderAccess, GetViewFailsClosedOnMissingBody)
 TEST(CasPartFolderAccess, WritePrimitivesRoundTrip)
 {
     auto backend = std::make_shared<CountingBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const Cas::RootNamespace ns{"srv/t1"};
     ContentAddressed::CachedPartFolderAccess access(store);
     const ContentAddressed::PartRefKey key{ns, "part_1"};
 
     /// promoteBuild: the transaction's terminal publish step, through the facade.
-    auto build = store->startBuild(Cas::BuildInfo{.intended_ref = ns.string() + "/part_1",
+    auto build = store->beginPartWrite(Cas::PartWriteInfo{.intended_ref = ns.string() + "/part_1",
                                                   .intended_namespace = ns, .op = Cas::ProvenanceOp::Insert});
     const Cas::ManifestId id = build->stageManifest({inlineEntry("checksums.txt", "cs")});
     build->precommitAdd(ns, "part_1", id);
@@ -246,7 +246,7 @@ TEST(CasPartFolderAccess, WritePrimitivesRoundTrip)
 TEST(CasPartFolderAccess, RepublishRefMovesCommittedRef)
 {
     auto backend = std::make_shared<CountingBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const Cas::RootNamespace ns{"srv/t1"};
     ContentAddressed::CachedPartFolderAccess access(store);
     publishPart(store, ns, "src_part", {inlineEntry("checksums.txt", "cs"), inlineEntry("txn_version.txt", "v1")});
@@ -264,7 +264,7 @@ TEST(CasPartFolderAccess, RepublishRefMovesCommittedRef)
 TEST(CasPartFolderAccess, RepublishRefIdempotentRedriveAndConflict)
 {
     auto backend = std::make_shared<CountingBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const Cas::RootNamespace ns{"srv/t1"};
     ContentAddressed::CachedPartFolderAccess access(store);
 
@@ -290,7 +290,7 @@ TEST(CasPartFolderAccess, RepublishRefIdempotentRedriveAndConflict)
 TEST(CasPartFolderAccess, ExplainRecordsDecisions)
 {
     auto backend = std::make_shared<CountingBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const Cas::RootNamespace ns{"srv/t1"};
     ContentAddressed::CachedPartFolderAccess access(store, {.explain_enabled = true, .validate = {}});
     publishPart(store, ns, "part_1", {inlineEntry("checksums.txt", "cs")});
@@ -318,7 +318,7 @@ TEST(CasPartFolderAccess, ExplainRecordsDecisions)
 TEST(CasPartFolderAccess, BaselineRequestCountsWithoutRetention)
 {
     auto backend = std::make_shared<CountingBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const Cas::Layout layout("p");
     const Cas::RootNamespace ns{"srv/t1"};
     ContentAddressed::CachedPartFolderAccess access(store);
@@ -354,7 +354,7 @@ TEST(CasPartFolderAccess, BaselineRequestCountsWithoutRetention)
 TEST(CasPartFolderAccess, MismatchRebuildAfterRepublish)
 {
     auto backend = std::make_shared<CountingBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const Cas::Layout layout("p");
     const Cas::RootNamespace ns{"srv/t1"};
     ContentAddressed::CachedPartFolderAccess access(store, cacheOn());
@@ -384,7 +384,7 @@ TEST(CasPartFolderAccess, MismatchRebuildAfterRepublish)
 TEST(CasPartFolderAccess, ForceFreshFailsClosedWhileRetainedViewExists)
 {
     auto backend = std::make_shared<CountingBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const Cas::Layout layout("p");
     const Cas::RootNamespace ns{"srv/t1"};
     ContentAddressed::CachedPartFolderAccess access(store, cacheOn());
@@ -410,7 +410,7 @@ TEST(CasPartFolderAccess, ForceFreshFailsClosedWhileRetainedViewExists)
 TEST(CasPartFolderAccess, ValidateNeverServesRetainedViewWithoutBodyHead)
 {
     auto backend = std::make_shared<CountingBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const Cas::Layout layout("p");
     const Cas::RootNamespace ns{"srv/t1"};
     const auto id = publishPart(store, ns, "part_1", {inlineEntry("checksums.txt", "cs")});
@@ -433,7 +433,7 @@ TEST(CasPartFolderAccess, ValidateNeverServesRetainedViewWithoutBodyHead)
 TEST(CasPartFolderAccess, ValidateAlwaysStillHeadsEveryForceFresh)
 {
     auto backend = std::make_shared<CountingBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const Cas::Layout layout("p");
     const Cas::RootNamespace ns{"srv/t1"};
     const auto id = publishPart(store, ns, "part_1", {inlineEntry("checksums.txt", "cs")});
@@ -450,7 +450,7 @@ TEST(CasPartFolderAccess, ValidateAlwaysStillHeadsEveryForceFresh)
 TEST(CasPartFolderAccess, ValidateAgeSkipsWithinWindowThenHeadsAfter)
 {
     auto backend = std::make_shared<CountingBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const Cas::Layout layout("p");
     const Cas::RootNamespace ns{"srv/t1"};
     const auto id = publishPart(store, ns, "part_1", {inlineEntry("checksums.txt", "cs")});
@@ -567,7 +567,7 @@ TEST(CasPartFolderValidateParse, UnknownValueThrows)
 TEST(CasPartFolderAccess, AbsenceIsNeverRetained)
 {
     auto backend = std::make_shared<CountingBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const Cas::RootNamespace ns{"srv/t1"};
     ContentAddressed::CachedPartFolderAccess access(store, cacheOn());
     publishPart(store, ns, "part_1", {inlineEntry("f", "x")});
@@ -587,7 +587,7 @@ TEST(CasPartFolderAccess, AbsenceIsNeverRetained)
 TEST(CasPartFolderAccess, OversizedViewServedNotRetained)
 {
     auto backend = std::make_shared<CountingBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const Cas::Layout layout("p");
     const Cas::RootNamespace ns{"srv/t1"};
     /// max_entry_bytes = 1: every real view (>= the 256-byte fixed overhead alone) is oversized.
@@ -615,7 +615,7 @@ TEST(CasPartFolderAccess, OversizedViewServedNotRetained)
 TEST(CasPartFolderAccess, DisabledModeKeepsBaseline)
 {
     auto backend = std::make_shared<CountingBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const Cas::Layout layout("p");
     const Cas::RootNamespace ns{"srv/t1"};
     /// CacheParams{} (cache_bytes == 0): the explicit disable switch, same as the single-arg ctor.
@@ -638,7 +638,7 @@ TEST(CasPartFolderAccess, DisabledModeKeepsBaseline)
 TEST(CasPartFolderAccess, SingleFlightColdBuild)
 {
     auto backend = std::make_shared<CountingBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const Cas::Layout layout("p");
     const Cas::RootNamespace ns{"srv/t1"};
     ContentAddressed::CachedPartFolderAccess access(store, cacheOn());
@@ -668,7 +668,7 @@ TEST(CasPartFolderAccess, SingleFlightColdBuild)
 TEST(CasPartFolderAccess, DropNamespaceErasesAllViews)
 {
     auto backend = std::make_shared<CountingBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     const Cas::RootNamespace ns{"srv/t1"};
     ContentAddressed::CachedPartFolderAccess access(store, cacheOn());
     publishPart(store, ns, "part_1", {inlineEntry("f", "x")});
@@ -718,7 +718,7 @@ TEST(CasPartFolderAccess, DropNamespaceErasesAllViews)
 TEST(CasPartFolderAccess, BestEffortRollbackDropCountsAndSurvivesABackendOutage)
 {
     auto backend = std::make_shared<RollbackFaultBackend>();
-    auto store = openStoreForTest(backend);
+    auto store = openPoolForTest(backend);
     ContentAddressed::CachedPartFolderAccess access(store, cacheOn());
 
     const Cas::RootNamespace ns_a{"srv/ta"};

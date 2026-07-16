@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBuild.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEvent.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.h>
@@ -64,29 +64,29 @@ using DB::Cas::tests::writeRefSnapshotRaw;
 namespace
 {
 
-PoolPtr openStore(const BackendPtr & backend, CasRequestBudget budget = {})
+PoolPtr openPool(const BackendPtr & backend, CasRequestBudget budget = {})
 {
     return Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .cas_request_budget = budget});
 }
 
-/// Task 11: like `openStore`, but the caller supplies (and owns) the rest of the config -- snapshot
+/// Task 11: like `openPool`, but the caller supplies (and owns) the rest of the config -- snapshot
 /// thresholds, grace age, a fake `boot_ms_fn`, etc. `pool_prefix`/`server_root_id` are pinned so every
 /// test in this file addresses the same pool shape.
-PoolPtr openStoreWithConfig(const BackendPtr & backend, PoolConfig config)
+PoolPtr openPoolWithConfig(const BackendPtr & backend, PoolConfig config)
 {
     config.pool_prefix = "p";
     config.server_root_id = "test";
     return Pool::open(backend, std::move(config));
 }
 
-/// Mirrors gtest_cas_build.cpp's startBuildFor/publishOneBlobPart, minus the blob (an empty-entry
+/// Mirrors gtest_cas_part_write.cpp's startBuildFor/publishOneBlobPart, minus the blob (an empty-entry
 /// manifest is a legal, blob-free part -- the ref-writer tests only care about ref/manifest identity).
-BuildPtr startBuildFor(const PoolPtr & s, const RootNamespace & ns, const String & ref)
+PartWriteTxnPtr startBuildFor(const PoolPtr & s, const RootNamespace & ns, const String & ref)
 {
-    BuildInfo info;
+    PartWriteInfo info;
     info.intended_namespace = ns;
     info.intended_ref = ns.string() + "/" + ref;
-    return s->startBuild(info);
+    return s->beginPartWrite(info);
 }
 
 ManifestId publishEmptyPart(const PoolPtr & s, const RootNamespace & ns, const String & ref)
@@ -400,7 +400,7 @@ private:
 TEST(RefWriterRecovery, EmptyNamespaceRecoversToEmptyState)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
-    auto store = openStore(backend);
+    auto store = openPool(backend);
     const RootNamespace ns{"srv1/never_touched"};
 
     EXPECT_TRUE(store->listRefs(ns).empty());
@@ -418,7 +418,7 @@ TEST(RefWriterRecovery, BirthOnlyLogNoSnapshotRecoversToEmptyLiveTable)
 
     writeRefLogTxnRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{1, 1}, {namespaceBirthOp()}});
 
-    auto store = openStore(backend);
+    auto store = openPool(backend);
     EXPECT_TRUE(store->listRefs(ns).empty());
 }
 
@@ -436,7 +436,7 @@ TEST(RefWriterRecovery, BirthPlusPrecommitPromoteAcrossTwoLogsNoSnapshot)
     writeRefLogTxnRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{1, 2},
         {publishCommittedOps("part_1", m1)[1]}});
 
-    auto store = openStore(backend);
+    auto store = openPool(backend);
     const auto resolved = store->resolveRef(ns, "part_1");
     ASSERT_TRUE(resolved.has_value());
     EXPECT_EQ(resolved->manifest_id.ref, m1);
@@ -472,7 +472,7 @@ TEST(RefWriterRecovery, SnapshotPlusTailRecovery)
     tail_ops.push_back(publishCommittedOps("b", mb)[1]);
     writeRefLogTxnRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{1, 6}, tail_ops});
 
-    auto store = openStore(backend);
+    auto store = openPool(backend);
     EXPECT_FALSE(store->resolveRef(ns, "a").has_value());
     const auto b = store->resolveRef(ns, "b");
     ASSERT_TRUE(b.has_value());
@@ -501,7 +501,7 @@ TEST(RefWriterRecovery, RestartOnVanishConvergesOnNewerSnapshot)
         writeRefSnapshotRaw(*backend, layout, minimalLiveSnapshot(ns.string(), snap_y, {committedRow("b", mb)}));
     };
 
-    auto store = openStore(backend);
+    auto store = openPool(backend);
     const auto b = store->resolveRef(ns, "b");
     ASSERT_TRUE(b.has_value());
     EXPECT_EQ(b->manifest_id.ref, mb);
@@ -529,7 +529,7 @@ TEST(RefWriterRecovery, DifferentBytesAtSelectedSnapshotIsCorruptionNotRestart)
     backend->putIfAbsent(layout.refSnapshotKey(ns, snap_x),
                          DB::Cas::sealObject(DB::Cas::FormatId::RefSnapshot, DB::Cas::encodeRefTableSnapshot(foreign)));
 
-    auto store = openStore(backend);
+    auto store = openPool(backend);
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { store->resolveRef(ns, "anything"); });
 }
 
@@ -558,7 +558,7 @@ TEST(RefSnapshotCodec, SealedFromRoundTripsAndOrderingEnforced)
 TEST(RefWriterAppendLane, WarmIsolatedMutationCostsOneCreateZeroReads)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
-    auto store = openStore(backend);
+    auto store = openPool(backend);
     const RootNamespace ns{"srv1/warm"};
     publishEmptyPart(store, ns, "part_1");   /// setup: births + populates the table (not measured)
     ASSERT_TRUE(store->resolveRef(ns, "part_1").has_value());
@@ -579,7 +579,7 @@ TEST(RefWriterAppendLane, WarmIsolatedMutationCostsOneCreateZeroReads)
 TEST(RefWriterAppendLane, CompatibleMutationsShareOneCreate)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
-    auto store = openStore(backend);
+    auto store = openPool(backend);
     const RootNamespace ns{"srv1/cobatch"};
     publishEmptyPart(store, ns, "a");
     publishEmptyPart(store, ns, "b");
@@ -623,7 +623,7 @@ TEST(RefWriterAppendLane, CompatibleMutationsShareOneCreate)
 TEST(RefWriterAppendLane, InvalidBatchEntryGetsOwnExceptionBatchSurvives)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
-    auto store = openStore(backend);
+    auto store = openPool(backend);
     const RootNamespace ns{"srv1/invalid_entry"};
     publishEmptyPart(store, ns, "good");
 
@@ -678,7 +678,7 @@ TEST(RefWriterAppendLane, WedgedLaneBlocksSameTableWhileOtherTableProceeds)
     budget.lease_safety_margin_ms = 100;
 
     auto backend = std::make_shared<RefWriterTestBackend>();
-    auto store = openStore(backend, budget);
+    auto store = openPool(backend, budget);
     const Layout & layout = store->layout();
     const RootNamespace ns_a{"srv1/wedge_a"};
     const RootNamespace ns_b{"srv1/wedge_b"};
@@ -711,7 +711,7 @@ TEST(RefWriterAppendLane, WedgedAppendObservedDurableAppliesBeforeNextId)
     budget.lease_safety_margin_ms = 100;
 
     auto backend = std::make_shared<RefWriterTestBackend>();
-    auto store = openStore(backend, budget);
+    auto store = openPool(backend, budget);
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/wedge_unwedge"};
     publishEmptyPart(store, ns, "x");
@@ -749,7 +749,7 @@ TEST(RefWriterAppendLane, WedgedRefLaneCountTracksExactlyTheWedgedTableThroughIt
     budget.lease_safety_margin_ms = 100;
 
     auto backend = std::make_shared<RefWriterTestBackend>();
-    auto store = openStore(backend, budget);
+    auto store = openPool(backend, budget);
     const Layout & layout = store->layout();
     const RootNamespace ns_a{"srv1/wedge_count_a"};
     const RootNamespace ns_b{"srv1/wedge_count_b"};
@@ -791,7 +791,7 @@ TEST(RefWriterAppendLane, WedgedRefLaneCountTracksExactlyTheWedgedTableThroughIt
 TEST(RefWriterAppendLane, I1AppendCorruptionSurfacesAndLaneStaysUsable)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
-    auto store = openStore(backend);
+    auto store = openPool(backend);
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/i1_append"};
     const RootNamespace other{"srv1/i1_other"};
@@ -834,7 +834,7 @@ TEST(RefWriterAppendLane, I1WedgeResolveCorruptionSurfacesAndKeepsWedge)
     budget.lease_safety_margin_ms = 100;
 
     auto backend = std::make_shared<RefWriterTestBackend>();
-    auto store = openStore(backend, budget);
+    auto store = openPool(backend, budget);
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/i1_wedge"};
     publishEmptyPart(store, ns, "x");
@@ -889,7 +889,7 @@ TEST(CasAnomalyPolicy, ForeignBytesAtWedgeKeyTripFenceAndRemount)
     budget.lease_safety_margin_ms = 100;
 
     auto backend = std::make_shared<RefWriterTestBackend>();
-    auto store = openStore(backend, budget);
+    auto store = openPool(backend, budget);
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/anomaly_wedge"};
     publishEmptyPart(store, ns, "x");
@@ -941,7 +941,7 @@ TEST(CasAnomalyPolicy, ForeignBytesAtWedgeKeyTripFenceAndRemount)
 TEST(CasAnomalyPolicy, WedgeContractReleaseFailClosed)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
-    auto store = openStore(backend);
+    auto store = openPool(backend);
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/wedge_contract"};
     publishEmptyPart(store, ns, "x");
@@ -1017,7 +1017,7 @@ TEST(CasRequestControllerFenceLoss, I3PostWriteFenceLossIsCounted)
 
 /// Task B (stageManifest rides the controller): a Committed return surfaces the committed
 /// incarnation's token — from the attempt's own PutResult, and equally from a resolve that proves an
-/// earlier ambiguous attempt landed — so audit emitters (`Build::stageManifest`'s `ManifestPut`
+/// earlier ambiguous attempt landed — so audit emitters (`PartWriteTxn::stageManifest`'s `ManifestPut`
 /// event) keep their token without a follow-up HEAD.
 TEST(CasRequestController, CommittedSurfacesTokenFromPutAndFromResolve)
 {
@@ -1049,7 +1049,7 @@ TEST(CasRequestController, CommittedSurfacesTokenFromPutAndFromResolve)
 TEST(RefTableCacheEviction, WholeTableEvictionUnderBudgetReRecovers)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
-    auto store = openStoreWithConfig(backend,
+    auto store = openPoolWithConfig(backend,
         PoolConfig{.pool_prefix = "p", .server_root_id = "test", .ref_table_cache_bytes = 1});
     const RootNamespace ns_a{"srv1/evict_a"};
     const RootNamespace ns_b{"srv1/evict_b"};
@@ -1078,7 +1078,7 @@ TEST(RefTableCacheEviction, WholeTableEvictionUnderBudgetReRecovers)
 TEST(RefTableCacheEviction, ZeroBudgetDisablesEviction)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
-    auto store = openStoreWithConfig(backend,
+    auto store = openPoolWithConfig(backend,
         PoolConfig{.pool_prefix = "p", .server_root_id = "test", .ref_table_cache_bytes = 0});
     for (const String & n : {String("srv1/keep_a"), String("srv1/keep_b"), String("srv1/keep_c")})
         publishEmptyPart(store, RootNamespace{n}, "x");
@@ -1097,7 +1097,7 @@ TEST(RefTableCacheEviction, WedgedTableIsNeverEvicted)
     budget.lease_safety_margin_ms = 100;
 
     auto backend = std::make_shared<RefWriterTestBackend>();
-    auto store = openStoreWithConfig(backend,
+    auto store = openPoolWithConfig(backend,
         PoolConfig{.pool_prefix = "p", .server_root_id = "test",
                    .cas_request_budget = budget, .ref_table_cache_bytes = 1});
     const Layout & layout = store->layout();
@@ -1134,7 +1134,7 @@ TEST(RefWriterSnapshotPublish, ThresholdTriggerPublishesCacheReplayEquivalentByt
     PoolConfig config;
     config.snapshot_log_count_threshold = 3;
     config.snapshot_log_bytes_threshold = 1ULL << 40;
-    auto store = openStoreWithConfig(backend, config);
+    auto store = openPoolWithConfig(backend, config);
     const RootNamespace ns{"srv1/threshold_publish"};
 
     publishEmptyPart(store, ns, "a");   /// tail: 2 (birth+add, promote)
@@ -1171,7 +1171,7 @@ TEST(RefWriterSnapshotPublish, PublishIncrementsSnapshotCounters)
     PoolConfig config;
     config.snapshot_log_count_threshold = 3;
     config.snapshot_log_bytes_threshold = 1ULL << 40;
-    auto store = openStoreWithConfig(backend, config);
+    auto store = openPoolWithConfig(backend, config);
     const RootNamespace ns{"srv1/counter_publish"};
 
     publishEmptyPart(store, ns, "a");
@@ -1195,7 +1195,7 @@ TEST(RefWriterSnapshotPublish, MountTimeTriggerPublishesAfterRecoveryReplaysLarg
 
     {
         /// Predecessor: default (high) thresholds, so nothing publishes yet. 3 parts -> 6 tail entries.
-        auto predecessor = openStore(backend);
+        auto predecessor = openPool(backend);
         publishEmptyPart(predecessor, ns, "a");
         publishEmptyPart(predecessor, ns, "b");
         publishEmptyPart(predecessor, ns, "c");
@@ -1204,7 +1204,7 @@ TEST(RefWriterSnapshotPublish, MountTimeTriggerPublishesAfterRecoveryReplaysLarg
     PoolConfig config;
     config.snapshot_log_count_threshold = 3;
     config.snapshot_log_bytes_threshold = 1ULL << 40;
-    auto successor = openStoreWithConfig(backend, config);
+    auto successor = openPoolWithConfig(backend, config);
 
     /// A mere READ triggers recovery; recovery alone must dispatch the mount-time publish (the table is
     /// never otherwise mutated by this mount).
@@ -1237,7 +1237,7 @@ TEST(RefWriterPublishFromLive, YoungTxnIsCoveredImmediately)
     auto backend = std::make_shared<RefWriterTestBackend>();
     const Layout layout("p");
     const RootNamespace ns{"srv1/publish_from_live_young"};
-    auto store = openStore(backend);
+    auto store = openPool(backend);
 
     /// Setup: birth the namespace and add a precommit (not the txn under test).
     auto build = startBuildFor(store, ns, "a");
@@ -1273,7 +1273,7 @@ TEST(RefWriterSnapshotPublish, TriggerFiresOnCountAboveThresholdWithoutAging)
     config.snapshot_log_bytes_threshold = 1ULL << 40;
     config.boot_ms_fn = [&fake_now] { return fake_now; };
     config.mount_lease_ttl_ms = std::chrono::milliseconds(10'000'000);
-    auto store = openStoreWithConfig(backend, config);
+    auto store = openPoolWithConfig(backend, config);
 
     const auto before = global_counters[ProfileEvents::CasRefSnapshotPublishDispatched].load();
     publishEmptyPart(store, ns, "a");   /// tail: 2
@@ -1293,7 +1293,7 @@ TEST(RefWriterSnapshotPublish, AdoptionSubtractsCapturedCountersUnderConcurrentA
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     const RootNamespace ns{"srv1/publish_from_live_adoption"};
-    auto store = openStore(backend);
+    auto store = openPool(backend);
 
     publishEmptyPart(store, ns, "a");
     ASSERT_EQ(store->tailSinceSnapshotCountForTest(ns), 2u);
@@ -1324,7 +1324,7 @@ TEST(RefWriterSnapshotPublish, PublicationNeverBlocksConcurrentAppend)
     PoolConfig config;
     config.snapshot_log_count_threshold = 3;
     config.snapshot_log_bytes_threshold = 1ULL << 40;
-    auto store = openStoreWithConfig(backend, config);
+    auto store = openPoolWithConfig(backend, config);
 
     backend->armPutBlock("_snap/");
 
@@ -1352,14 +1352,14 @@ TEST(RefWriterSnapshotPublish, PublicationNeverBlocksConcurrentAppend)
 /// reference alone. Then unblocks it with no live Pool handle anywhere in this test any more -- a
 /// dangling-pointer crash here would abort the whole test binary, the strongest possible signal for
 /// this specific hazard.
-TEST(RefWriterSnapshotPublish, PublishThreadOutlivesDroppedStoreHandleWithoutCrashing)
+TEST(RefWriterSnapshotPublish, PublishThreadOutlivesDroppedPoolHandleWithoutCrashing)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     const RootNamespace ns{"srv1/publish_outlives_store"};
     PoolConfig config;
     config.snapshot_log_count_threshold = 3;
     config.snapshot_log_bytes_threshold = 1ULL << 40;
-    auto store = openStoreWithConfig(backend, config);
+    auto store = openPoolWithConfig(backend, config);
 
     backend->armPutBlock("_snap/");
     publishEmptyPart(store, ns, "a");
@@ -1394,7 +1394,7 @@ TEST(RefWriterSnapshotPublish, ConcurrentOutOfOrderPublishDoesNotRegressBaseNorD
     /// for full determinism.
     config.snapshot_log_count_threshold = 1ULL << 40;
     config.snapshot_log_bytes_threshold = 1ULL << 40;
-    auto store = openStoreWithConfig(backend, config);
+    auto store = openPoolWithConfig(backend, config);
 
     publishEmptyPart(store, ns, "a");   /// tail: 2 (birth+add, promote)
     publishEmptyPart(store, ns, "b");   /// tail: 4 -- greatest_applied is publish #1's candidate
@@ -1464,7 +1464,7 @@ TEST(RefWriterSnapshotPublish, ClampedCounterSubClampsInsteadOfUnderflowingOnOut
     /// for full determinism.
     config.snapshot_log_count_threshold = 1ULL << 40;
     config.snapshot_log_bytes_threshold = 1ULL << 40;
-    auto store = openStoreWithConfig(backend, config);
+    auto store = openPoolWithConfig(backend, config);
 
     publishEmptyPart(store, ns, "a");   /// tail: 2 -- publisher A's (smaller) candidate
 
@@ -1544,7 +1544,7 @@ TEST(RefWriterSnapshotPublish, C4LatchBoundedUnderSustainedNonCommittedPublish)
     config.mount_lease_ttl_ms = std::chrono::milliseconds(10'000'000);
     config.boot_ms_fn = [&fake_now] { return fake_now; };
     config.cas_request_budget = budget;
-    auto store = openStoreWithConfig(backend, config);
+    auto store = openPoolWithConfig(backend, config);
 
     /// Every `_snap` PUT throws Unresolved (backend saturated), from the very first publish attempt.
     backend->fault_key_substr = "_snap/";
@@ -1572,7 +1572,7 @@ TEST(RefWriterSnapshotPublish, C4InFlightGateAdmitsAtMostOne)
     PoolConfig config;
     config.snapshot_log_count_threshold = 0;   /// any nonempty tail triggers
     config.snapshot_log_bytes_threshold = 1ULL << 40;
-    auto store = openStoreWithConfig(backend, config);
+    auto store = openPoolWithConfig(backend, config);
 
     publishEmptyPart(store, ns, "a");
     store->waitForSnapshotPublishSettleForTest(ns);   /// drain the setup publishes; tail is compacted
@@ -1616,7 +1616,7 @@ TEST(RefWriterSnapshotPublish, C4BackoffDefersThenRetriesAndPublishes)
     config.mount_lease_ttl_ms = std::chrono::milliseconds(10'000'000);
     config.boot_ms_fn = [&fake_now] { return fake_now; };
     config.cas_request_budget = budget;
-    auto store = openStoreWithConfig(backend, config);
+    auto store = openPoolWithConfig(backend, config);
 
     /// Fail ONLY the first `_snap` PUT (arms the backoff); later PUTs succeed.
     backend->fault_key_substr = "_snap/";
@@ -1664,7 +1664,7 @@ TEST(RefWriterSnapshotPublish, TriggerIgnoresEntriesCoveredByNewestSnapshot)
     PoolConfig config;
     config.snapshot_log_count_threshold = 3;
     config.snapshot_log_bytes_threshold = 1ULL << 40;
-    auto store = openStoreWithConfig(backend, config);
+    auto store = openPoolWithConfig(backend, config);
 
     const auto d0 = global_counters[ProfileEvents::CasRefSnapshotPublishDispatched].load();
 
@@ -1711,7 +1711,7 @@ TEST(RefWriterStalePrecommitSweep, SweepsOnlyStaleEpochPrecommitsKeepsCurrentEpo
 
     {
         /// A predecessor writer leaves THREE precommits dangling (a crash before promote).
-        auto predecessor = openStore(backend);
+        auto predecessor = openPool(backend);
         for (const String & name : {"stale_a", "stale_b", "stale_c"})
         {
             auto build = startBuildFor(predecessor, ns, name);
@@ -1723,7 +1723,7 @@ TEST(RefWriterStalePrecommitSweep, SweepsOnlyStaleEpochPrecommitsKeepsCurrentEpo
 
     /// The successor allocates a strictly higher durable writer_epoch; its own FRESH precommit must
     /// survive the sweep its very first touch of the table triggers.
-    auto successor = openStore(backend);
+    auto successor = openPool(backend);
     auto build = startBuildFor(successor, ns, "fresh_x");
     const ManifestId fresh_id = build->stageManifest({});
     build->precommitAdd(ns, "fresh_x", fresh_id);   /// this call's own appendRefOps hoists the sweep first
@@ -1751,7 +1751,7 @@ TEST(RefWriterStalePrecommitSweep, BoundedBatchesAndInterruptionResumeAcrossMoun
 
     uint64_t e1;
     {
-        auto predecessor = openStore(backend);
+        auto predecessor = openPool(backend);
         e1 = predecessor->writerEpoch();
     }   /// predecessor released; only its epoch is needed -- the stale precommits are seeded raw below
 
@@ -1790,7 +1790,7 @@ TEST(RefWriterStalePrecommitSweep, BoundedBatchesAndInterruptionResumeAcrossMoun
     budget.lease_safety_margin_ms = 100;
     PoolConfig config;
     config.cas_request_budget = budget;
-    auto successor = openStoreWithConfig(backend, config);
+    auto successor = openPoolWithConfig(backend, config);
 
     backend->fault_key_substr = layout.refsNamespacePrefix(ns) + "_log/";
     backend->fault_count = 1;   /// hits exactly the sweep's FIRST removal chunk's PUT
@@ -1821,7 +1821,7 @@ TEST(RefWriterStalePrecommitSweep, BoundedBatchesAndInterruptionResumeAcrossMoun
     PoolConfig resumer_config;
     resumer_config.boot_ms_fn = [&resumer_fake_boot] { return resumer_fake_boot; };
     resumer_config.wait_sleep_fn = [&resumer_fake_boot](uint64_t ms) { resumer_fake_boot += ms; };
-    auto resumer = openStoreWithConfig(backend, resumer_config);
+    auto resumer = openPoolWithConfig(backend, resumer_config);
     EXPECT_NO_THROW(resumer->listRefs(ns));
 
     const RefTableState final_state = independentFullReplayForTest(*backend, layout, ns);
@@ -1874,7 +1874,7 @@ TEST(RefWriterStalePrecommitSweep, FailedSweepRearmsAndRetriesUntilClean)
         PoolConfig pred_config;
         pred_config.mount_lease_ttl_ms = std::chrono::milliseconds(10'000'000);
         pred_config.boot_ms_fn = fake_clock;
-        auto predecessor = openStoreWithConfig(backend, pred_config);
+        auto predecessor = openPoolWithConfig(backend, pred_config);
         for (const String & name : {"stale_a", "stale_b", "stale_c"})
         {
             auto build = startBuildFor(predecessor, ns, name);
@@ -1895,7 +1895,7 @@ TEST(RefWriterStalePrecommitSweep, FailedSweepRearmsAndRetriesUntilClean)
     config.cas_request_budget = budget;
     config.mount_lease_ttl_ms = std::chrono::milliseconds(10'000'000);
     config.boot_ms_fn = fake_clock;
-    auto successor = openStoreWithConfig(backend, config);
+    auto successor = openPoolWithConfig(backend, config);
 
     std::vector<CasEvent> seen;
     successor->setEventSink([&](const CasEvent & e) { seen.push_back(e); });
@@ -1960,11 +1960,11 @@ TEST(RefWriterStalePrecommitSweep, VerifiedCleanSweepClearsFlagWithoutEvents)
     const RootNamespace ns{"srv1/precommit_sweep_clean"};
 
     {
-        auto predecessor = openStore(backend);
+        auto predecessor = openPool(backend);
         publishEmptyPart(predecessor, ns, "committed_x");   /// committed work only; nothing dangles
     }
 
-    auto successor = openStore(backend);
+    auto successor = openPool(backend);
     std::vector<CasEvent> seen;
     successor->setEventSink([&](const CasEvent & e) { seen.push_back(e); });
 
@@ -2048,7 +2048,7 @@ uint64_t seedTwinDrop(Backend & backend, const Layout & layout, const RootNamesp
 TEST(RefWriterRemount, ReRecoversStaleCacheToTwinDrop)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
-    auto store = openStore(backend);
+    auto store = openPool(backend);
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/remount_twin_view"};
 
@@ -2079,7 +2079,7 @@ TEST(RefWriterRemount, ReRecoversStaleCacheToTwinDrop)
 TEST(RefWriterRemount, PostRemountAppendCarriesLiveEpochSortingAboveTwinLogs)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
-    auto store = openStore(backend);
+    auto store = openPool(backend);
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/remount_epoch_order"};
 
@@ -2126,7 +2126,7 @@ TEST(RefWriterRemount, DiscardsWedgeAndLaneRemainsUsable)
     config.cas_request_budget = budget;
     config.boot_ms_fn = [&fake_boot] { return fake_boot; };
     config.wait_sleep_fn = [&fake_boot](uint64_t ms) { fake_boot += ms; };
-    auto store = openStoreWithConfig(backend, config);
+    auto store = openPoolWithConfig(backend, config);
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/remount_wedge"};
     publishEmptyPart(store, ns, "x");
@@ -2177,7 +2177,7 @@ TEST(RefWriterRemount, SupersededLeaderMidFlushFailsClosedCreatesNoObject)
     config.cas_request_budget = budget;
     config.boot_ms_fn = [&fake_boot] { return fake_boot; };
     config.wait_sleep_fn = [&fake_boot](uint64_t ms) { fake_boot += ms; };
-    auto store = openStoreWithConfig(backend, config);
+    auto store = openPoolWithConfig(backend, config);
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/remount_midflush"};
     publishEmptyPart(store, ns, "x");
@@ -2238,7 +2238,7 @@ TEST(RefWriterRemount, SupersededLeaderMidFlushFailsClosedCreatesNoObject)
 TEST(RefWriterNamespaceRemoval, TxnNamesEveryOwnerThenRemoveNamespace)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
-    auto store = openStore(backend);
+    auto store = openPool(backend);
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/remove_shape"};
 
@@ -2294,7 +2294,7 @@ TEST(RefWriterNamespaceRemoval, TxnNamesEveryOwnerThenRemoveNamespace)
 TEST(RefWriterNamespaceRemoval, RemovedSnapshotPublished)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
-    auto store = openStore(backend);
+    auto store = openPool(backend);
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/remove_snapshot"};
 
@@ -2326,7 +2326,7 @@ TEST(RefWriterNamespaceRemoval, RemovedSnapshotPublished)
 TEST(RefWriterNamespaceRemoval, MalformedShapeWithRemoveNamespaceNotFinalRejectedBeforeAnyCreate)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
-    auto store = openStore(backend);
+    auto store = openPool(backend);
     const RootNamespace ns{"srv1/malformed_shape"};
     publishEmptyPart(store, ns, "a");   /// births the table so the malformed item isn't ALSO rejected
                                         /// for the unrelated reason "namespace_birth was needed first"
@@ -2358,7 +2358,7 @@ TEST(RefWriterNamespaceRemoval, MalformedShapeWithRemoveNamespaceNotFinalRejecte
 TEST(RefWriterNamespaceRemoval, DropNamespaceCancelsInFlightBuildAndNextOpThrows)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
-    auto store = openStore(backend);
+    auto store = openPool(backend);
     const RootNamespace ns{"srv1/remove_cancels_build"};
 
     publishEmptyPart(store, ns, "committed");   /// births the table + one committed ref
@@ -2396,7 +2396,7 @@ TEST(RefWriterNamespaceRemoval, RemovalAppendFailureLeavesBuildAliveAndNamespace
     budget.lease_safety_margin_ms = 100;
 
     auto backend = std::make_shared<RefWriterTestBackend>();
-    auto store = openStore(backend, budget);
+    auto store = openPool(backend, budget);
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/remove_fault_keeps_build"};
 
@@ -2423,7 +2423,7 @@ TEST(RefWriterNamespaceRemoval, RemovalAppendFailureLeavesBuildAliveAndNamespace
 TEST(RefWriterNamespaceRemoval, DropNamespaceDoesNotCancelBuildsInOtherNamespaces)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
-    auto store = openStore(backend);
+    auto store = openPool(backend);
     const RootNamespace ns_dropped{"srv1/remove_me"};
     const RootNamespace ns_other{"srv1/keep_me"};
 
@@ -2458,7 +2458,7 @@ TEST(RefWriterNamespaceBirth, BirthFromRemovedRejectedWithoutMarkerAcceptedWithM
 
     RefTxnId remove_id;
     {
-        auto store = openStore(backend);
+        auto store = openPool(backend);
         publishEmptyPart(store, ns, "a");
         store->dropNamespace(ns);
         const auto id = store->newestPublishedSnapshotIdForTest(ns);
@@ -2468,7 +2468,7 @@ TEST(RefWriterNamespaceBirth, BirthFromRemovedRejectedWithoutMarkerAcceptedWithM
 
     /// A fresh mount, no marker observed: rejected.
     {
-        auto store2 = openStore(backend);
+        auto store2 = openPool(backend);
         auto build = startBuildFor(store2, ns, "reborn");
         const ManifestId id = build->stageManifest({});
         expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { build->precommitAdd(ns, "reborn", id); });
@@ -2480,7 +2480,7 @@ TEST(RefWriterNamespaceBirth, BirthFromRemovedRejectedWithoutMarkerAcceptedWithM
 
     /// A further fresh mount, marker now observed: birth succeeds.
     {
-        auto store3 = openStore(backend);
+        auto store3 = openPool(backend);
         auto build = startBuildFor(store3, ns, "reborn");
         const ManifestId id = build->stageManifest({});
         EXPECT_NO_THROW(build->precommitAdd(ns, "reborn", id));
@@ -2501,7 +2501,7 @@ TEST(RefWriterNamespaceBirth, BirthFromRemovedRejectedWithoutMarkerAcceptedWithM
 TEST(RefWriterNamespaceBirth, BirthFromNeverBornNeedsNoMarker)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
-    auto store = openStore(backend);
+    auto store = openPool(backend);
     const RootNamespace ns{"srv1/virgin"};
 
     EXPECT_FALSE(store->observedNamespaceCleanupMarker(ns, RefTxnId{1, 1}));
@@ -2518,7 +2518,7 @@ TEST(RefWriterNamespaceBirth, BirthFromNeverBornNeedsNoMarker)
 TEST(RefWriterAppendLane, SameRefMutationsSplitAcrossFlushes)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
-    auto store = openStore(backend);
+    auto store = openPool(backend);
     const RootNamespace ns{"srv1/samerefsplit"};
     publishEmptyPart(store, ns, "a");
     ASSERT_TRUE(store->resolveRef(ns, "a").has_value());
@@ -2629,7 +2629,7 @@ TEST(RefWriterRecoverySeal, UncleanBoundarySealsAllDeadEpochsBeforeExposingState
     config.cas_request_budget = sealTestTinyBudget();
     config.materialization_grace_ms = 1000;
     config.wait_sleep_fn = [](uint64_t) {};   /// no real sleep -- hygiene: never block a unit test on wall time
-    auto store = openStoreWithConfig(backend, config);
+    auto store = openPoolWithConfig(backend, config);
     ASSERT_TRUE(store);
     ASSERT_EQ(store->liveWriterEpoch(), 3u);
     ASSERT_TRUE(store->uncleanEpochBoundarySeenForTest());
@@ -2669,7 +2669,7 @@ TEST(RefWriterRecoverySeal, LateLogBelowSealIsInvisibleToRecoveryAndFold)
         config.cas_request_budget = sealTestTinyBudget();
         config.materialization_grace_ms = 1000;
         config.wait_sleep_fn = [](uint64_t) {};
-        auto store = openStoreWithConfig(backend, config);
+        auto store = openPoolWithConfig(backend, config);
         ASSERT_TRUE(store);
         ASSERT_EQ(store->listRefs(ns).size(), 2u);
     }   /// the seal is now durable; the store above is released (clean farewell)
@@ -2698,15 +2698,15 @@ TEST(RefWriterRecoverySeal, CleanBoundaryDoesNotSeal)
     const RootNamespace ns{"srv1/seal_clean_boundary"};
 
     {
-        auto predecessor1 = openStore(backend);   /// epoch 1
+        auto predecessor1 = openPool(backend);   /// epoch 1
         publishEmptyPart(predecessor1, ns, "a");
     }   /// clean farewell (drained, nothing in flight)
     {
-        auto predecessor2 = openStore(backend);   /// epoch 2
+        auto predecessor2 = openPool(backend);   /// epoch 2
         publishEmptyPart(predecessor2, ns, "b");
     }   /// clean farewell
 
-    auto successor = openStore(backend);   /// epoch 3, over a CLEAN boundary
+    auto successor = openPool(backend);   /// epoch 3, over a CLEAN boundary
     ASSERT_EQ(successor->liveWriterEpoch(), 3u);
     ASSERT_FALSE(successor->uncleanEpochBoundarySeenForTest());
 
@@ -2737,7 +2737,7 @@ TEST(RefWriterRecoverySeal, SealPutFailureFailsRecoveryClosed)
     config.cas_request_budget = sealTestTinyBudget();
     config.materialization_grace_ms = 1000;
     config.wait_sleep_fn = [](uint64_t) {};
-    auto store = openStoreWithConfig(backend, config);
+    auto store = openPoolWithConfig(backend, config);
     ASSERT_TRUE(store);
     ASSERT_EQ(store->liveWriterEpoch(), 3u);
     ASSERT_TRUE(store->uncleanEpochBoundarySeenForTest());
@@ -2771,7 +2771,7 @@ TEST(RefWriterRecoverySeal, EmptyDeadRegionCarveOutStillReportsSameProcessNamesp
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     const Layout layout("p");
-    const RootNamespace ns{"test/f1_empty_carveout"};   /// matches openStoreWithConfig's own server_root_id
+    const RootNamespace ns{"test/f1_empty_carveout"};   /// matches openPoolWithConfig's own server_root_id
 
     seedUncleanPredecessorMount(*backend, layout, /*epoch=*/1);   /// predecessor dies uncleanly at epoch 1
 
@@ -2781,7 +2781,7 @@ TEST(RefWriterRecoverySeal, EmptyDeadRegionCarveOutStillReportsSameProcessNamesp
     config.cas_request_budget = sealTestTinyBudget();
     config.materialization_grace_ms = 1000;
     config.wait_sleep_fn = [](uint64_t) {};
-    auto store = openStoreWithConfig(backend, config);
+    auto store = openPoolWithConfig(backend, config);
     ASSERT_TRUE(store);
     ASSERT_EQ(store->liveWriterEpoch(), 2u);
     ASSERT_TRUE(store->uncleanEpochBoundarySeenForTest());
@@ -2842,7 +2842,7 @@ TEST(RefWriterRecoverySeal, ConcurrentTouchDuringSealPutWaitsInsteadOfRacing)
     config.cas_request_budget = sealTestTinyBudget();
     config.materialization_grace_ms = 1000;
     config.wait_sleep_fn = [](uint64_t) {};
-    auto store = openStoreWithConfig(backend, config);
+    auto store = openPoolWithConfig(backend, config);
     ASSERT_TRUE(store);
     ASSERT_EQ(store->liveWriterEpoch(), 3u);
     ASSERT_TRUE(store->uncleanEpochBoundarySeenForTest());
@@ -2907,7 +2907,7 @@ TEST(RefWriterRecoverySeal, SealPutConflictThrowPropagatesAndDoesNotWedgeRecover
     config.cas_request_budget = sealTestTinyBudget();
     config.materialization_grace_ms = 1000;
     config.wait_sleep_fn = [](uint64_t) {};
-    auto store = openStoreWithConfig(backend, config);
+    auto store = openPoolWithConfig(backend, config);
     ASSERT_TRUE(store);
     ASSERT_EQ(store->liveWriterEpoch(), 3u);
     ASSERT_TRUE(store->uncleanEpochBoundarySeenForTest());
@@ -2960,7 +2960,7 @@ TEST(RefWriterRecoverySeal, SealPutThrowsMidFlightSecondParkedCallerDoesNotHang)
     config.cas_request_budget = sealTestTinyBudget();
     config.materialization_grace_ms = 1000;
     config.wait_sleep_fn = [](uint64_t) {};
-    auto store = openStoreWithConfig(backend, config);
+    auto store = openPoolWithConfig(backend, config);
     ASSERT_TRUE(store);
     ASSERT_EQ(store->liveWriterEpoch(), 3u);
     ASSERT_TRUE(store->uncleanEpochBoundarySeenForTest());
@@ -3039,7 +3039,7 @@ TEST(RefWriterRecoverySeal, WriteAfterSealSelectedAsGreatestSnapshotCommits)
         config.cas_request_budget = sealTestTinyBudget();
         config.materialization_grace_ms = 1000;
         config.wait_sleep_fn = [](uint64_t) {};
-        auto store = openStoreWithConfig(backend, config);
+        auto store = openPoolWithConfig(backend, config);
         ASSERT_TRUE(store);
         ASSERT_EQ(store->liveWriterEpoch(), 3u);
         ASSERT_TRUE(store->uncleanEpochBoundarySeenForTest());
@@ -3057,7 +3057,7 @@ TEST(RefWriterRecoverySeal, WriteAfterSealSelectedAsGreatestSnapshotCommits)
     /// exactly reproducing the FINDING-1 precondition.
     PoolConfig successor_config;
     successor_config.server_id = UInt128(1);
-    auto successor = openStoreWithConfig(backend, successor_config);
+    auto successor = openPoolWithConfig(backend, successor_config);
     ASSERT_GT(successor->liveWriterEpoch(), 2u) << "the successor's live epoch must dominate the seal's dead epoch";
 
     try
