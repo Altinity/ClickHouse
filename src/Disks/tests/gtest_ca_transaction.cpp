@@ -210,6 +210,35 @@ TEST(CaTransactionLockScope, OverlayProgramOrder)
     EXPECT_EQ(storage->getFileSize("uui/uuid-5/all_1_1_0/a.txt"), 2u);
 }
 
+/// [TXN-ONE-PIPELINE] Audit 5: on a commit, only refs this commit CREATED are eligible for rollback;
+/// a repoint of an already-existing ref is NEVER dropped as compensation. `publishStaging` returns
+/// false for the repoint path (a committed ref exists), so the repoint is never recorded in
+/// `created_refs` and the pre-existing part survives with its content carried forward.
+TEST(CaTransactionLockScope, CommitRollbackSparesPreexistingRef)
+{
+    auto storage = openTxStorage();
+
+    /// Pre-existing committed part.
+    {
+        auto tx = storage->createTransaction();
+        writeFileTx(*tx, "uui/uuid-8/tmp_insert_all_1_1_0/data.bin", "orig");
+        tx->moveDirectory("uui/uuid-8/tmp_insert_all_1_1_0", "uui/uuid-8/all_1_1_0");
+        tx->commit(DB::NoCommitOptions{});
+    }
+    ASSERT_TRUE(storage->existsDirectory("uui/uuid-8/all_1_1_0"));
+
+    /// A standalone write on the committed part repoints the EXISTING ref. Even if a later part in the
+    /// same commit were to fail, the existing ref must survive: the repoint returns false from
+    /// `publishStaging`, so it never enters `created_refs` and is never dropped on the error path.
+    {
+        auto tx = storage->createTransaction();
+        writeFileTx(*tx, "uui/uuid-8/all_1_1_0/metadata_version.txt", "1");
+        tx->commit(DB::NoCommitOptions{});
+    }
+    EXPECT_TRUE(storage->existsDirectory("uui/uuid-8/all_1_1_0"));
+    EXPECT_TRUE(storage->existsFile("uui/uuid-8/all_1_1_0/data.bin"));   /// original content carried forward
+}
+
 /// Plan 2d: a small eager metadata file (checksums.txt) is staged INLINE — it rides the single tree
 /// object (one-GET part open) — while per-column data (data.bin) stays a standalone Blob (preserving
 /// column-read selectivity). The inlined file is still readable through the normal read path.
