@@ -53,7 +53,7 @@ TEST(CasFormatIds, NewIdsExistWithFrozenValues)
 TEST(CasFormatTraits, CompleteUniqueAndGated)
 {
     /// Completeness: every FormatId except the reserved Roster has traits.
-    const FormatId all[] = {FormatId::Blob, FormatId::Manifest, FormatId::GcState, FormatId::PoolMeta,
+    const FormatId all[] = {FormatId::Blob, FormatId::GcState, FormatId::PoolMeta,
                             FormatId::GcOutcomes, FormatId::PartManifest, FormatId::RunFile,
                             FormatId::FoldSeal, FormatId::Owner, FormatId::ServerEpoch, FormatId::MountLease,
                             FormatId::RefLog, FormatId::RefSnapshot, FormatId::BlobMeta, FormatId::GcHeartbeat};

@@ -29,7 +29,6 @@ std::span<const FormatChangePoint> changePoints(FormatId id)
     switch (id)
     {
         case FormatId::Blob:
-        case FormatId::Manifest:
         case FormatId::GcState:
         case FormatId::PoolMeta:
         case FormatId::Roster:
@@ -47,34 +46,6 @@ std::span<const FormatChangePoint> changePoints(FormatId id)
             return BASELINE;
     }
     throw Exception(ErrorCodes::LOGICAL_ERROR, "CasFormat: unknown FormatId {}", static_cast<int>(id));
-}
-
-uint32_t magicFor(FormatId id)
-{
-    /// Each magic is 4 ASCII bytes stored as little-endian fixed32.
-    /// "CABL" = 0x4C424143, "CARS" = 0x53524143, etc.
-    switch (id)
-    {
-        case FormatId::Blob:          return 0x4C424143u; /// "CABL"
-        case FormatId::Manifest:      return 0x53524143u; /// "CARS"
-        case FormatId::PoolMeta:      return 0x4D504143u; /// "CAPM"
-        case FormatId::GcState:       return 0x54474143u; /// "CAGT"
-        case FormatId::GcOutcomes:    return 0x4F474143u; /// "CAGO"
-        case FormatId::FoldSeal:       return 0x53464143u; /// "CAFS"
-        case FormatId::Owner:          return 0x574F4143u; /// "CAOW"
-        case FormatId::ServerEpoch:    return 0x50454143u; /// "CAEP"
-        case FormatId::MountLease:     return 0x4C4D4143u; /// "CAML"
-        case FormatId::Roster:
-        case FormatId::RefLog:
-        case FormatId::RefSnapshot:
-        case FormatId::BlobMeta:
-        case FormatId::GcHeartbeat:
-        case FormatId::PartManifest:
-        case FormatId::RunFile:
-            break;
-    }
-    throw Exception(ErrorCodes::LOGICAL_ERROR,
-        "CasFormat: no magic defined for FormatId {}", static_cast<int>(id));
 }
 
 uint32_t currentWriterVersion()
@@ -123,7 +94,6 @@ constexpr FormatTraits TRAITS[] =
     {FormatId::PoolMeta,     "cas_pool_meta",     TextFamily::Control,       KeyStrictness::Tolerant, CompressionPolicy::Never,     1 * kMiB,   64 * kKiB},
     {FormatId::RefLog,       "cas_ref_log",       TextFamily::Control,       KeyStrictness::Tolerant, CompressionPolicy::Always,    64 * kMiB,  64 * kMiB},
     {FormatId::RefSnapshot,  "cas_ref_snap",      TextFamily::Control,       KeyStrictness::Tolerant, CompressionPolicy::Always,    64 * kMiB,  64 * kMiB},
-    {FormatId::Manifest,     "cas_ref_shard",     TextFamily::Control,       KeyStrictness::Tolerant, CompressionPolicy::Never,     64 * kMiB,  64 * kKiB},
     {FormatId::PartManifest, "cas_part_manifest", TextFamily::PayloadHybrid, KeyStrictness::Tolerant, CompressionPolicy::Always,    256 * kMiB, 64 * kKiB},
     {FormatId::RunFile,      "cas_run",           TextFamily::RecordStream,  KeyStrictness::Strict,   CompressionPolicy::PinnedRaw, 0,          4 * kKiB},
     {FormatId::FoldSeal,     "cas_fold_seal",     TextFamily::Control,       KeyStrictness::Strict,   CompressionPolicy::PinnedRaw, 256 * kMiB, 64 * kKiB},

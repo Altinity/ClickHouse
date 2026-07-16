@@ -41,7 +41,9 @@ enum class FormatId : uint16_t
     Blob = 1,
     /// 2 (Tree) and 4 (GcSnap) retired in the rev. 15 root-local part-manifest redesign — no on-disk
     /// compat to honor (CA pre-release). The survivors keep their numeric values; no two share a value.
-    Manifest = 3,
+    /// 3 (Manifest, magic CARS, "cas_ref_shard") retired 2026-07-10 with the retired-in-snapshot
+    /// refactor — the mutable root-shard ref format was replaced by the ref snapshot+log objects
+    /// (RefSnapshot/RefLog below). Id 3 and magic CARS (0x53524143) are freed; never reuse.
     GcState = 5,
     /// 6 (RetiredSet, magic CART) retired 2026-07-10 with the retired-in-snapshot refactor — condemned
     /// state rides the source-edge runs + fold-seal condemned_summary. Id 6 and magic CART (0x54524143)
@@ -76,10 +78,6 @@ enum class FormatId : uint16_t
     BlobMeta = 21,        /// cas_blob_meta   — per-blob freshness sidecar
     GcHeartbeat = 22,     /// cas_gc_hb       — GC leader heartbeat
 };
-
-/// Per-type magic: the 4 ASCII bytes of each object class encoded as a little-endian uint32. Used in
-/// CasHeader.magic. Throws LOGICAL_ERROR for an unexpected id.
-uint32_t magicFor(FormatId id);
 
 /// What this build stamps as writer_version on every object it writes. Pre-roster: always G_BUILD.
 uint32_t currentWriterVersion();
