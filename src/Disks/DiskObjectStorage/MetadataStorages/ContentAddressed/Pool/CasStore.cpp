@@ -81,11 +81,22 @@ Store::Store(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
     /// later via setEventSink; the reference observes that assignment). Owns the decode cache, built
     /// from the same config bytes the Store ctor used before.
     , manifest_reader(*pool_backend, pool_layout, meta, event_sink_, config.manifest_decode_cache_bytes)
+    /// Mount / write-fence / build-watermark / self-remount runtime (source-layout §3.5). Injected with
+    /// backend/layout + the `MountConfig` slice + `server_root_id` + the event-sink reference + the pool
+    /// `cas_request_budget` + the `remount_attempt` callback (== `Store::tryRemountOnce`, whose claim/
+    /// recovery ORCHESTRATION stays on Store). The callback captures `this`; it is invoked only at runtime
+    /// (post-construction). Declared BEFORE `ref_ledger` (mount outlives ledger — ledger callbacks reach
+    /// mount state), so it is also constructed before it.
+    , mount_runtime(
+          pool_backend, pool_layout, config.mountConfig(), config.server_root_id, event_sink_,
+          config.cas_request_budget,
+          [this] { return tryRemountOnce(); })
     /// Ref-log / ref-table subsystem (source-layout §3.4). Injected with backend/layout + the
     /// RefLedgerConfig slice + the event-sink reference + the pool `cas_request_budget` + the RAW mount
-    /// `boot_ms_fn` (for its retry controller), plus callbacks into the mount/watermark state that stays
-    /// on Store. The callbacks capture `this`; they are invoked only at runtime (post-construction), so
-    /// referencing Store members declared after `ref_ledger` is safe.
+    /// `boot_ms_fn` (for its retry controller), plus callbacks into the mount/watermark state that lives
+    /// on `mount_runtime` (reached through Store delegates). The callbacks capture `this`; they are
+    /// invoked only at runtime (post-construction), so referencing `mount_runtime` (declared before
+    /// `ref_ledger`) is safe.
     , ref_ledger(
           pool_backend, pool_layout, config.refLedgerConfig(), event_sink_, config.cas_request_budget,
           config.boot_ms_fn,
@@ -93,7 +104,7 @@ Store::Store(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
           [this] { return refAppendFenceOk(); },
           [this] { return bootMsNow(); },
           [this] { return mayMutate(); },
-          [this] { return unclean_epoch_boundary_seen_at.load(std::memory_order_relaxed); },
+          [this] { return mount_runtime.uncleanEpochBoundarySeenAtRelaxed(); },
           [this] (const String & key, const String & reason, const std::optional<String> & offending_ns)
               { reportImpossibleInterference(key, reason, offending_ns); },
           [this] { return std::static_pointer_cast<void>(shared_from_this()); },
@@ -160,64 +171,43 @@ void Store::dedupCacheAdd(const BlobRef & ref)
         dedup_cache->set(ref, std::make_shared<DedupPresent>());
 }
 
+/// ==== mount-runtime delegates (source-layout §3.5) ==== The mount lease keeper, the local write
+/// fence, the per-server build watermark, the live-incarnation epoch, and the self-remount recovery
+/// thread live in the `mount_runtime` member (Pool/CasMountRuntime.h); Store keeps these thin public
+/// forwarders so the wiring, Build, Gc, the ref-ledger callbacks, and every test call site are unchanged.
 uint64_t Store::bootMs()
 {
-    struct timespec ts{};
-    clock_gettime(CLOCK_BOOTTIME, &ts);
-    return static_cast<uint64_t>(ts.tv_sec) * 1000 + static_cast<uint64_t>(ts.tv_nsec) / 1000000;
+    return CasMountRuntime::bootMs();
 }
 
 uint64_t Store::bootMsNow() const
 {
-    return config.boot_ms_fn ? config.boot_ms_fn() : bootMs();
-}
-
-void Store::waitSleep(uint64_t ms) const
-{
-    if (config.wait_sleep_fn)
-        config.wait_sleep_fn(ms);
-    else
-        std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+    return mount_runtime.bootMsNow();
 }
 
 bool Store::mayMutate() const
 {
-    return !mount_fence.lost.load(std::memory_order_acquire)
-        && bootMsNow() < mount_fence.deadline_boot_ms.load(std::memory_order_acquire);
+    return mount_runtime.mayMutate();
 }
 
 void Store::tripMountLost()
 {
-    mount_fence.lost.store(true, std::memory_order_release);
+    mount_runtime.tripMountLost();
 }
 
 bool Store::refAppendFenceOk() const
 {
-    /// RFC pre-attempt check: mount fence not lost AND now < lease_deadline AND now + attempt_timeout +
-    /// lease_safety_margin < lease_deadline -- `mayMutate` only checks the first two; this adds the
-    /// REMAINING-budget check so a controlled attempt is never even started unless it could plausibly
-    /// finish (with its own safety margin) before the lease expires.
-    if (mount_fence.lost.load(std::memory_order_acquire))
-        return false;
-    const uint64_t now = bootMsNow();
-    const uint64_t deadline = mount_fence.deadline_boot_ms.load(std::memory_order_acquire);
-    if (now >= deadline)
-        return false;
-    const uint64_t margin = config.cas_request_budget.attempt_timeout_ms + config.cas_request_budget.lease_safety_margin_ms;
-    return margin < deadline - now;
+    return mount_runtime.refAppendFenceOk();
 }
 
 void Store::setMountDeadline(uint64_t deadline_boot_ms)
 {
-    mount_fence.deadline_boot_ms.store(deadline_boot_ms, std::memory_order_release);
+    mount_runtime.setMountDeadline(deadline_boot_ms);
 }
 
 void Store::armMountFence(UInt128 server_uuid, uint64_t writer_epoch, uint64_t deadline_boot_ms)
 {
-    mount_fence.server_uuid = server_uuid;
-    mount_fence.writer_epoch = writer_epoch;
-    mount_fence.deadline_boot_ms.store(deadline_boot_ms, std::memory_order_release);
-    mount_fence.lost.store(false, std::memory_order_release);
+    mount_runtime.armMountFence(server_uuid, writer_epoch, deadline_boot_ms);
 }
 
 StorePtr Store::open(BackendPtr backend, PoolConfig config)
@@ -273,17 +263,10 @@ StorePtr Store::open(BackendPtr backend, PoolConfig config)
     /// durably admitted (the invariant this whole design rests on).
     chassert(store->isAlgoAdmitted(write_algo));
 
-    /// Per-server watermark (spec 2026-06-16-ca-build-watermark). process_epoch is a random NONZERO
-    /// value minted once per Store: GC checks it for equality only (a different epoch == a dead
-    /// incarnation). It rides through the watermark protobuf codec (uint64 field — full range). For
-    /// safety and to avoid the 0/UINT64_MAX sentinels, mask to 52 bits (collision-safe for an
-    /// equality-only token) and re-draw on 0 (UINT64_MAX is the retired sentinel).
-    constexpr uint64_t EPOCH_MASK = (1ULL << 52) - 1;
-    store->process_epoch.store(
-        (thread_local_rng() ^ (static_cast<uint64_t>(thread_local_rng()) << 32)) & EPOCH_MASK,
-        std::memory_order_relaxed);
-    if (store->process_epoch.load(std::memory_order_relaxed) == 0)
-        store->process_epoch.store(1, std::memory_order_relaxed);
+    /// Per-server watermark (spec 2026-06-16-ca-build-watermark): mint the random NONZERO `process_epoch`
+    /// once per Store (GC checks it for equality only -- a different epoch == a dead incarnation). The
+    /// masking/redraw detail lives in `CasMountRuntime::mintRandomProcessEpoch`.
+    store->mount_runtime.mintRandomProcessEpoch();
 
     /// W-ANCHOR: the per-server watermark must be durable BEFORE any object PUT. A read-only open
     /// must never mutate the pool (the probe is skipped above for the same reason), so the watermark
@@ -325,7 +308,7 @@ void Store::mountWritable(StorePtr & store, UInt128 our_uuid, MountClaimPolicy p
     /// recoverable — a fence costs an epoch, so the fence-recovery loop below re-allocates a fresh
     /// writer_epoch and re-claims (P3.1 vector C; TLA+ `NoPermanentWedge`).
     uint64_t writer_epoch = allocateWriterEpoch(*store->pool_backend, store->pool_layout, srid);
-    store->process_epoch.store(writer_epoch, std::memory_order_relaxed);
+    store->mount_runtime.setProcessEpoch(writer_epoch, std::memory_order_relaxed);
 
     /// 4. Mount lease — LIVENESS. Decide over the current mount object using a wall-clock `now_ms`.
     const auto now_ms = []() -> uint64_t
@@ -347,11 +330,11 @@ void Store::mountWritable(StorePtr & store, UInt128 our_uuid, MountClaimPolicy p
     /// observation window. Derived from existing config — no new knob (spec §Config).
     const uint64_t poll_interval_ms = std::max<uint64_t>(
         1, static_cast<uint64_t>(store->config.mount_renew_period.count()) / 2);
-    /// rev.6 Task 6: routes through `store->waitSleep` (which itself routes through
+    /// rev.6 Task 6: routes through `mount_runtime.waitSleep` (which itself routes through
     /// `config.wait_sleep_fn` when a test injected one) rather than a bare `sleep_for` directly, so
     /// a test intercepting `wait_sleep_fn` observes every wait `open` can block on -- this
     /// observation poll AND the `materialization_grace_ms` wait below.
-    const auto sleep_ms = [s = store.get()](uint64_t ms) { s->waitSleep(ms); };
+    const auto sleep_ms = [s = store.get()](uint64_t ms) { s->mount_runtime.waitSleep(ms); };
     /// Operator-visible log the moment startup decides to watch a stale-looking self-mount (the
     /// disk-open path blocks up to ~threshold_ms here, so a silent block would be confusing). May
     /// fire more than once per open: the observation restarts (and re-logs) every time the watched
@@ -424,7 +407,7 @@ void Store::mountWritable(StorePtr & store, UInt128 our_uuid, MountClaimPolicy p
                     "could adopt it. This should not persist; investigate GC fence-out timing.",
                     srid, max_fence_recoveries);
             writer_epoch = allocateWriterEpoch(*store->pool_backend, store->pool_layout, srid);
-            store->process_epoch.store(writer_epoch, std::memory_order_relaxed);
+            store->mount_runtime.setProcessEpoch(writer_epoch, std::memory_order_relaxed);
             continue;
         }
         if (claim.kind != MountClaimResult::Claimed)
@@ -445,29 +428,17 @@ void Store::mountWritable(StorePtr & store, UInt128 our_uuid, MountClaimPolicy p
         }
         claimed_prior = claim.prior;
 
-        /// The mount object now holds OUR live (uuid, epoch) body. Construct + start the keeper, which
-        /// ADOPTS that very (uuid, epoch) slot rather than self-tripping the double-start guard.
-        /// The mount keeper carries the per-server build-watermark floor (`minActive`), read off the
-        /// keeper's state lock via `prepareRenew`.
-        store->mount_keeper = std::make_unique<MountLeaseKeeper>(
-            store->pool_backend, store->pool_layout, srid, our_uuid, writer_epoch,
-            store->config.mount_lease_ttl_ms, now_ms,
-            [raw] { return raw->minActive(); },
-            emit_mount_event);
-        /// Keeper ↔ fence coupling (spec §write-fence): on each successful background renew refresh
-        /// the monotonic deadline; on a superseded/foreign renew failure latch the fence to lost.
-        /// Set BEFORE startBackground so no renewal can fire before the callbacks are in place.
-        store->mount_keeper->setFenceCallbacks(
-            [raw, ttl_ms] { raw->setMountDeadline(raw->bootMsNow() + ttl_ms); },
-            [raw]
-            {
-                raw->tripMountLost();
-                /// Liveness counterpart of the fence-out: recover in place as a FRESH incarnation.
-                raw->scheduleRemount();
-            });
+        /// The mount object now holds OUR live (uuid, epoch) body. `installKeeper` constructs the keeper
+        /// -- which ADOPTS that very (uuid, epoch) slot rather than self-tripping the double-start guard --
+        /// AND wires its `minActive` build-watermark reader, its event sink, and the fence-coupling
+        /// callbacks (renew-ok refreshes the monotonic deadline; on-lost latches the fence + arms a
+        /// self-remount), all captured on `mount_runtime` (see `CasMountRuntime::installKeeper`).
+        /// `keeperStart` is separate so this claim orchestration can catch `MountFencedException` and
+        /// retry with a fresh epoch.
+        store->mount_runtime.installKeeper(our_uuid, writer_epoch, now_ms);
         try
         {
-            store->mount_keeper->start();
+            store->mount_runtime.keeperStart();
         }
         catch (const MountFencedException &)
         {
@@ -475,9 +446,9 @@ void Store::mountWritable(StorePtr & store, UInt128 our_uuid, MountClaimPolicy p
             /// drop this keeper, take a fresh epoch, and re-claim.
             if (fence_recovery >= max_fence_recoveries)
                 throw;
-            store->mount_keeper.reset();
+            store->mount_runtime.keeperReset();
             writer_epoch = allocateWriterEpoch(*store->pool_backend, store->pool_layout, srid);
-            store->process_epoch.store(writer_epoch, std::memory_order_relaxed);
+            store->mount_runtime.setProcessEpoch(writer_epoch, std::memory_order_relaxed);
             continue;
         }
         break;
@@ -505,13 +476,13 @@ void Store::mountWritable(StorePtr & store, UInt128 our_uuid, MountClaimPolicy p
     }
     if (unclean_reclaim)
     {
-        store->unclean_epoch_boundary_seen_at.store(writer_epoch, std::memory_order_relaxed);
+        store->mount_runtime.setUncleanEpochBoundarySeenAt(writer_epoch);
         const uint64_t t_mat = store->config.materialization_grace_ms;
         LOG_INFO(getLogger("CasStore"),
             "Content-addressed mount {} follows an unclean predecessor; waiting {} ms "
             "(materialization grace) for the store to finalize or drop its accepted "
             "requests before trusting recovery listings", srid, t_mat);
-        store->waitSleep(t_mat);
+        store->mount_runtime.waitSleep(t_mat);
     }
 
     /// Arm the local write fence: cache (uuid, epoch) and set the boottime deadline now + ttl. From
@@ -525,9 +496,9 @@ void Store::mountWritable(StorePtr & store, UInt128 our_uuid, MountClaimPolicy p
     /// arm the fence on every writable open); only the renewal thread is conditional. The merged
     /// heartbeat renews at `mount_renew_period` — one beat now renews the lease and the floor.
     if (store->config.background_watermark)
-        store->mount_keeper->startBackground(store->config.mount_renew_period);
+        store->mount_runtime.keeperStartBackground(store->config.mount_renew_period);
 
-    store->live_writer_epoch.store(writer_epoch, std::memory_order_release);
+    store->mount_runtime.setLiveWriterEpoch(writer_epoch);
 }
 
 StorePtr Store::openForDecommission(BackendPtr backend, PoolConfig config, const String & victim_srid)
@@ -581,70 +552,31 @@ StorePtr Store::openForDecommission(BackendPtr backend, PoolConfig config, const
 
 Store::~Store()
 {
-    /// Refuse any further self-remount arming for the rest of teardown. Latched under the thread mutex
-    /// (paired with scheduleRemount's checks) BEFORE the join below, so a keeper on_lost firing during
-    /// teardown can never re-arm remount_thread after we join it.
-    {
-        std::lock_guard g(remount_thread_mutex);
-        remount_shutting_down.store(true);
-    }
-    /// Stop the self-remount recovery loop FIRST: it may otherwise re-create the keeper below us.
-    remount_stop.store(true);
-    remount_cv.notify_all();
-    {
-        std::lock_guard g(remount_thread_mutex);
-        if (remount_thread.joinable())
-            remount_thread.join();
-    }
+    /// Teardown order is load-bearing and unchanged from the pre-3.5 inline sequence (source-layout §3.5
+    /// only relocated the mount/remount mechanics into `mount_runtime`):
+    ///
+    /// 1. Stop + join the self-remount recovery thread FIRST (it may otherwise re-create the keeper
+    ///    below us). `stopRemountThread` latches `remount_shutting_down` under the thread mutex before
+    ///    the join, so a keeper on_lost firing during teardown can never re-arm the thread after we join.
+    mount_runtime.stopRemountThread();
 
-    /// rev.6 Task 5 (spec §clean-release drain): the farewell marker `mount_keeper->stop()` writes is a
+    /// 2. rev.6 Task 5 (spec §clean-release drain): the farewell marker the keeper's `stop()` writes is a
     /// certificate that no in-flight ref-log conditional PUT from this incarnation can land after it --
     /// a successor treats it as proof of a clean death (`MountPriorState::Clean`, no observation wait
     /// needed). Writing it without an actual drain would be a protocol-safety bug: an uncertain PUT this
     /// incarnation is still resolving could land AFTER the successor already reclaimed and started
     /// mutating. `drainRefLanesForShutdown` is the drain; bounded by one attempt's worth of budget plus
-    /// the lease safety margin -- long enough for an in-flight attempt to resolve, never unbounded.
+    /// the lease safety margin -- long enough for an in-flight attempt to resolve, never unbounded. It
+    /// stays on `Store` (mediating the mount↔ledger coupling), sequenced between the two mount-runtime
+    /// teardown steps exactly as before.
     const bool drained = ref_ledger.drainRefLanesForShutdown(
         config.cas_request_budget.attempt_timeout_ms + config.cas_request_budget.lease_safety_margin_ms);
 
-    /// Retire the merged heartbeat on a clean Store teardown: stop() runs the keeper's terminal op,
-    /// which stamps the lease already-expired (expires_at_ms = now) AND folds in the watermark
-    /// farewell (min_active = UINT64_MAX). Stamping it expired lets a SAME-server reopen reclaim
-    /// immediately (the durable epoch + owner stay sticky). A throw here (e.g. a foreign incarnation
-    /// touched the slot) must not escape the dtor — log and continue tearing down.
-    if (mount_keeper)
-    {
-        if (drained)
-        {
-            try
-            {
-                mount_keeper->stop();
-            }
-            catch (...)
-            {
-                tryLogCurrentException(getLogger("CasStore"), "CAS mount-lease: release during Store teardown failed");
-            }
-        }
-        else
-        {
-            /// Fail-closed: the drain could not certify every in-flight PUT resolved (a timeout or a
-            /// live wedge), so writing the clean farewell would be a false certificate. No terminal op --
-            /// the successor falls back to the (slower but safe) observation-based reclaim.
-            LOG_WARNING(getLogger("CasStore"),
-                "CAS store shutdown with an unresolved ref-log PUT: skipping the clean-release marker; "
-                "the next mount will treat this end as unclean");
-            mount_keeper->stopBackground();
-        }
-    }
-
-    /// Belt-and-suspenders re-join. The shutting-down flag makes scheduleRemount a no-op above, so this
-    /// is normally not joinable; it closes the residual window where a keeper on_lost between the first
-    /// join and stop() observed the flag late.
-    {
-        std::lock_guard g(remount_thread_mutex);
-        if (remount_thread.joinable())
-            remount_thread.join();
-    }
+    /// 3. Retire the merged heartbeat: `finishTeardown` runs the keeper's terminal op on a clean drain
+    /// (stamping the lease already-expired + folding in the watermark farewell so a SAME-server reopen
+    /// reclaims immediately) or the fail-closed no-terminal-op on an unresolved PUT, then does the
+    /// belt-and-suspenders remount-thread re-join. See `CasMountRuntime::finishTeardown`.
+    mount_runtime.finishTeardown(drained);
 }
 
 /// The plain-object surface (namespace files + mountpoint objects) is implemented by the stateless
@@ -666,14 +598,12 @@ std::vector<String> Store::listNamespaceFiles(const RootNamespace & ns)
 
 uint64_t Store::minActive()
 {
-    std::lock_guard lk(builds_mutex);
-    return active_build_seqs.empty() ? next_build_seq : *active_build_seqs.begin();
+    return mount_runtime.minActive();
 }
 
 uint64_t Store::peekNextBuildSeq()
 {
-    std::lock_guard lk(builds_mutex);
-    return next_build_seq;
+    return mount_runtime.peekNextBuildSeq();
 }
 
 bool Store::tryRemountOnce()
@@ -739,48 +669,40 @@ bool Store::tryRemountOnce()
         /// its listings. The common case (no in-flight `PUT` when the fence tripped) skips the wait.
         if (!ref_ledger.refLanesSettledForRemount())
         {
-            unclean_epoch_boundary_seen_at.store(writer_epoch, std::memory_order_relaxed);
+            mount_runtime.setUncleanEpochBoundarySeenAt(writer_epoch);
             LOG_INFO(getLogger("CasStore"),
                 "Self-remount of content-addressed mount {} with an unresolved ref-log PUT; waiting {} ms "
                 "(materialization grace) before re-listing", srid, config.materialization_grace_ms);
-            waitSleep(config.materialization_grace_ms);
+            mount_runtime.waitSleep(config.materialization_grace_ms);
         }
 
         /// Swap the keeper for the new incarnation. The old keeper's renewal loop already stopped on
         /// its failed renew; never run its terminal op (the slot now belongs to the new claim).
-        Store * raw = this;
-        if (mount_keeper)
-            mount_keeper->stopBackground();
-        mount_keeper = std::make_unique<MountLeaseKeeper>(
-            pool_backend, pool_layout, srid, our_uuid, writer_epoch,
-            config.mount_lease_ttl_ms, now_ms,
-            [raw] { return raw->minActive(); },
-            emit_mount_event);
-        mount_keeper->setFenceCallbacks(
-            [raw, ttl_ms] { raw->setMountDeadline(raw->bootMsNow() + ttl_ms); },
-            [raw]
-            {
-                raw->tripMountLost();
-                raw->scheduleRemount();
-            });
-        mount_keeper->start();
+        /// `installKeeper` re-wires the SAME fence/min-active/event callbacks on `mount_runtime` as the
+        /// initial `open` did -- so the granular mechanics here are the exact same primitives, in the
+        /// exact same order, as `mountWritable`'s.
+        if (mount_runtime.hasKeeper())
+            mount_runtime.keeperStopBackground();
+        mount_runtime.installKeeper(our_uuid, writer_epoch, now_ms);
+        mount_runtime.keeperStart();
 
         /// Re-establish the ref-protocol incarnation BEFORE re-arming the fence (spec §Startup And
-        /// Recovery / §write-fence). Order is load-bearing: `start()` refreshes the lease deadline but
-        /// does NOT clear `lost`, so the fence stays closed here and no append/publish can race the swap.
+        /// Recovery / §write-fence). Order is load-bearing: `keeperStart` refreshes the lease deadline
+        /// but does NOT clear `lost`, so the fence stays closed here and no append/publish can race the
+        /// swap.
         /// 1. Bump the live epoch so every subsequent `allocateRefTxnId` sorts strictly above any older
         ///    (dead-incarnation or twin) durable log. Do this BEFORE `armMountFence` so there is no window
         ///    where the gate is open while the epoch is still stale. Keep `process_epoch` (the identity
         ///    accessors) equal to it.
-        live_writer_epoch.store(writer_epoch, std::memory_order_release);
-        process_epoch.store(writer_epoch, std::memory_order_release);
+        mount_runtime.setLiveWriterEpoch(writer_epoch);
+        mount_runtime.setProcessEpoch(writer_epoch, std::memory_order_release);
         /// 2. Drain publishers and drop the cached tables so each re-recovers under the new epoch on next
         ///    touch (and any leader still holding an orphaned runtime fails closed). While the fence is lost.
         ref_ledger.quiesceRefTablesForRemount();
         /// 3. Re-open the gate. From here appends allocate ids under the new epoch and touch fresh runtimes.
-        armMountFence(our_uuid, writer_epoch, bootMsNow() + ttl_ms);
+        mount_runtime.armMountFence(our_uuid, writer_epoch, mount_runtime.bootMsNow() + ttl_ms);
         if (config.background_watermark)
-            mount_keeper->startBackground(config.mount_renew_period);
+            mount_runtime.keeperStartBackground(config.mount_renew_period);
 
         LOG_INFO(getLogger("CasStore"),
             "CAS self-remount '{}': recovered as writer_epoch {} (fresh incarnation; older builds fail closed)",
@@ -812,74 +734,27 @@ bool Store::tryRemountOnce()
     }
 }
 
-void Store::scheduleRemount()
-{
-    /// Task 11 review follow-up: counted unconditionally, BEFORE the `background_watermark` gate below,
-    /// so `scheduleRemountCallCountForTest` observes every entry regardless of whether a thread actually
-    /// spawns -- see that accessor's comment for why this is the seam a fast unit test should use rather
-    /// than driving a real self-remount attempt.
-    schedule_remount_calls_for_test.fetch_add(1, std::memory_order_relaxed);
-    if (!config.background_watermark)
-        return;   /// tests drive tryRemountOnce explicitly (the same gate as every background thread)
-    if (remount_shutting_down.load() || remount_running.load())
-        return;
-    std::lock_guard g(remount_thread_mutex);
-    if (remount_shutting_down.load() || remount_running.load())
-        return;
-    if (remount_thread.joinable())
-        remount_thread.join();   /// a PREVIOUS recovery finished; reap it before starting a new one
-    remount_running.store(true);
-    remount_thread = ThreadFromGlobalPool([this]
-    {
-        uint64_t backoff_ms = 1000;
-        while (!remount_stop.load())
-        {
-            if (tryRemountOnce())
-                break;
-            std::unique_lock lk(remount_cv_mutex);
-            remount_cv.wait_for(lk, std::chrono::milliseconds(backoff_ms),
-                                [this] { return remount_stop.load(); });
-            backoff_ms = std::min<uint64_t>(backoff_ms * 2, 30000);
-        }
-        remount_running.store(false);
-    });
-}
-
+/// The self-remount recovery thread + the merged-heartbeat renew live in `mount_runtime`
+/// (Pool/CasMountRuntime.h); these are thin delegates. `mount_runtime`'s `remount_attempt` callback is
+/// bound to `Store::tryRemountOnce` (the claim/recovery orchestration that stays on Store).
 bool Store::scheduleRemountForTest()
 {
-    scheduleRemount();
-    std::lock_guard g(remount_thread_mutex);
-    return remount_thread.joinable();
+    return mount_runtime.scheduleRemountForTest();
 }
 
 void Store::beginShutdownForTest()
 {
-    std::lock_guard g(remount_thread_mutex);
-    remount_shutting_down.store(true);
+    mount_runtime.beginShutdownForTest();
 }
 
 void Store::renewWatermarkOnce()
 {
-    /// Renew the merged heartbeat (lease + build-watermark floor). A read-only open never anchored the
-    /// keeper; there is nothing to renew (fail closed rather than fabricate one).
-    if (!mount_keeper)
-        throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS heartbeat: renewWatermarkOnce on a read-only Store");
-    mount_keeper->renewOnce();
-}
-
-uint64_t Store::allocateBuildSeq()
-{
-    std::lock_guard lk(builds_mutex);
-    const uint64_t s = next_build_seq++;
-    active_build_seqs.insert(s);
-    return s;
+    mount_runtime.renewWatermarkOnce();
 }
 
 void Store::retireBuildSeq(uint64_t seq)
 {
-    std::lock_guard lk(builds_mutex);
-    active_build_seqs.erase(seq);
-    inflight_builds.erase(seq);
+    mount_runtime.retireBuildSeq(seq);
 }
 
 BuildPtr Store::startBuild(BuildInfo info)
@@ -891,16 +766,14 @@ BuildPtr Store::startBuild(BuildInfo info)
 
     /// Strictly-increasing per-process build_seq carried by the Build (spec 2026-06-16). The Build is
     /// added to the active set here and retired on publish/abandon/dtor, so minActive — the GC floor
-    /// the Store-owned watermark renews — tracks in-flight builds.
-    const uint64_t seq = allocateBuildSeq();
+    /// the Store-owned watermark renews — tracks in-flight builds. The build registry lives on
+    /// `mount_runtime` (source-layout §3.5).
+    const uint64_t seq = mount_runtime.allocateBuildSeq();
 
     auto build = std::make_shared<Build>(shared_from_this(), build_id, seq, liveWriterEpoch(), std::move(info));
     /// Register for `dropNamespace`'s post-durable build cancellation (spec §Namespace Removal). weak_ptr:
     /// the wiring owns the returned shared_ptr; `retireBuildSeq` (publish/abandon/dtor) removes the entry.
-    {
-        std::lock_guard lk(builds_mutex);
-        inflight_builds[seq] = build;
-    }
+    mount_runtime.registerInflightBuild(seq, build);
     return build;
 }
 
@@ -988,9 +861,9 @@ void Store::reportImpossibleInterference(const String & key, const String & reas
 
     /// spec §anomaly-policy: incidental-only detection, fail-closed reaction -- the SAME on_lost
     /// mechanics a foreign/superseded lease renewal already drives (the keeper's `setFenceCallbacks`
-    /// lambda above).
-    tripMountLost();
-    scheduleRemount();
+    /// lambda). The fence + self-remount now live on `mount_runtime`.
+    mount_runtime.tripMountLost();
+    mount_runtime.scheduleRemount();
 
     /// Diagnosis off the critical path (spec §anomaly-policy): a background task may spend a FEW
     /// requests -- never the caller's thread, and never blocking this call's own return.
@@ -1254,19 +1127,10 @@ CasCreateResult Store::stagingConditionalCreate(std::string_view key, const std:
 
 void Store::cancelInflightBuildsForNamespace(const RootNamespace & ns)
 {
-    /// Collect the live shared_ptrs under `builds_mutex`, cancel OUTSIDE it
-    /// (`cancelForNamespaceRemoval` only stores an atomic). Relocated verbatim from `dropNamespace`'s
-    /// tail; invoked by `ref_ledger` through the `cancel_inflight_builds` callback once its removal
-    /// transaction is durable (spec §Namespace Removal: "cancels local builds").
-    std::vector<BuildPtr> builds_to_check;
-    {
-        std::lock_guard lk(builds_mutex);
-        for (const auto & entry : inflight_builds)
-            if (auto build = entry.second.lock())
-                builds_to_check.push_back(std::move(build));
-    }
-    for (const auto & build : builds_to_check)
-        build->cancelForNamespaceRemoval(ns);
+    /// Delegate to `mount_runtime` (the build registry moved there, source-layout §3.5). Invoked by
+    /// `ref_ledger` through the `cancel_inflight_builds` callback once its removal transaction is durable
+    /// (spec §Namespace Removal: "cancels local builds").
+    mount_runtime.cancelInflightBuildsForNamespace(ns);
 }
 
 uint64_t Store::refRecoveryRestartsForTest(const RootNamespace & ns)
