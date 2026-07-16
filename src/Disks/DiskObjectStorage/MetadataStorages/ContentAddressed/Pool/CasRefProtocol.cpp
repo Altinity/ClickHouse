@@ -1,4 +1,4 @@
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasRefProtocol.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
 #include <Common/Exception.h>
 #include <algorithm>
 
@@ -336,7 +336,7 @@ bool admits(const RefTableState & state, const RefOp & op, uint64_t snapshot_bud
 }
 
 // ===== Merged from CasRefIntake.cpp (merge #8) =====
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasTextFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Common/Exception.h>
 #include <algorithm>
 

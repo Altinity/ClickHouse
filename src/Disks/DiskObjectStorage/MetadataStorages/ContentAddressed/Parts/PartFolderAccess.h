@@ -1,6 +1,6 @@
 #pragma once
 // ===== PartRefKey (merge #7: the routed part identity) =====
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasTypes.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <base/types.h>
 
 namespace DB::ContentAddressed
@@ -36,9 +36,9 @@ enum class Freshness
 }
 
 // ===== PartFolderView (merge #7: the value/view over the pool) =====
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasPartManifestFormat.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasTypes.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPartManifestFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasStore.h>
 #include <memory>
 #include <optional>
 #include <string>
@@ -108,7 +108,7 @@ private:
 }
 
 // ===== PartFolderValidate + CachedPartFolderAccess (merge #7: the cache of one mechanism) =====
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasStore.h>
 #include <Common/CacheBase.h>
 #include <Common/CurrentMetrics.h>
 #include <functional>

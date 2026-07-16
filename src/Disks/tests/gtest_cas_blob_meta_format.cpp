@@ -1,5 +1,5 @@
 #include "cas_format_test_battery.h"
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasBlobMetaFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobMetaFormat.h>
 #include <IO/ReadBufferFromMemory.h>
 
 using namespace DB::Cas;

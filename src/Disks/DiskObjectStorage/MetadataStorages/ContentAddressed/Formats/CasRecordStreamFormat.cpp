@@ -1,6 +1,6 @@
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasRecordStreamFormat.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasTextFormat.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasWireVocab.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRecordStreamFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasWireVocab.h>
 #include <Common/Exception.h>
 #include <IO/ReadBufferFromMemory.h>
 #include <IO/WriteHelpers.h>

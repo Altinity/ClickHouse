@@ -1,5 +1,5 @@
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasRefWireVocab.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasTextFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefWireVocab.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Common/Exception.h>
 
 namespace DB

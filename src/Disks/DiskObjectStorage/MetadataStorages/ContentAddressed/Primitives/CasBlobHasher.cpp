@@ -1,4 +1,4 @@
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBlobHasher.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasBlobHasher.h>
 
 #include <IO/BufferWithOwnMemory.h>
 #include <IO/HashingReadBuffer.h>
@@ -18,7 +18,7 @@
 /// effect, same prefixed names as `Functions/FunctionsHashing.h` uses.
 /// xxHash is included through this wrapper (which marks it a system header) to suppress the vendored-C
 /// warnings from lz4's shadowing copy under `-Werror -Weverything`. See `CasXXH3.h`.
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasXXH3.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasXXH3.h>
 
 namespace DB
 {

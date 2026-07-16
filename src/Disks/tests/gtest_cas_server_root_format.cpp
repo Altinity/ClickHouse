@@ -1,6 +1,6 @@
 #include "cas_format_test_battery.h"
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasServerRootFormats.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasTypes.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasServerRootFormats.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <limits>
 
 using namespace DB::Cas;

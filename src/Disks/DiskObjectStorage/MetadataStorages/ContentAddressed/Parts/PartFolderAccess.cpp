@@ -1,4 +1,4 @@
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/PartFolderAccess.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Parts/PartFolderAccess.h>
 // ===== from PartFolderView.cpp (merge #7) =====
 #include <base/defines.h>
 #include <algorithm>
@@ -113,7 +113,7 @@ size_t PartFolderView::estimatedBytes() const
 }
 
 // ===== from CachedPartFolderAccess.cpp (merge #7) =====
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBuild.h>
 #include <Common/DateLUT.h>
 #include <Common/ProfileEvents.h>
 #include <Common/logger_useful.h>
