@@ -1,15 +1,20 @@
 #pragma once
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasEvent.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasSingleWriterSlot.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/Formats/CasServerRootFormats.h>
+#include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Common/Exception.h>
+#include <Common/Logger.h>
+#include <Common/ThreadPool.h>
 #include <base/types.h>
 #include <base/extended_types.h>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <string_view>
 #include <utility>
@@ -22,6 +27,136 @@ namespace ErrorCodes
     extern const int BAD_ARGUMENTS;
     extern const int ABORTED;
 }
+}
+
+// ===== Merged from CasSingleWriterSlot.h (merge #3): base class, must precede MountLeaseKeeper =====
+namespace DB::Cas
+{
+
+/// Durable single-writer-slot state machine used by the per-server merged heartbeat
+/// (`CasServerRoot.h`, `MountLeaseKeeper`): anchors a key that has EXACTLY ONE writer, renews it
+/// asynchronously off the write path, and ends with a terminal op; any precondition failure during
+/// renewal means a foreign touch — fail closed with an exception, never re-mint.
+///
+/// This base owns the common machinery (the `seq`/`last_token`/`dead` state, the renewal thread and
+/// its loop, `renewOnce`/`startBackground`/`stopBackground`/`lastRenewTime`, and the start/terminal
+/// bookkeeping). The noun ("watermark") and verb ("farewell") used in every fail-closed message are
+/// passed to the base constructor. Subclasses differ ONLY in EXPLICIT policy hooks:
+///   - `prepareRenew`     — runs OFF the state lock before each body encode, returning a per-call
+///                          payload (the watermark reads `min_active` from a Store callback here).
+///                          Keeping it off `state_mutex` is load-bearing: the watermark callback
+///                          reaches into the Store's own lock.
+///   - `encodeBody`       — builds the slot's exact JSON bytes for a given `seq` and payload;
+///   - `claim`            — the slot-specific anchor sequence in `start` (the watermark's
+///                          head→putIfAbsent/putOverwrite dance), returning the token we now hold;
+///   - `terminate`        — the terminal op (the watermark's retiring putOverwrite), run under the
+///                          state lock after `dead` is set, owning its own fail-closed throws and
+///                          final bookkeeping.
+///
+/// Every observable op (the JSON body bytes, the anchor put sequence, the renew cadence, the
+/// foreign-touch fail-close conditions and message wording, the stop semantics) is reproduced
+/// exactly by the subclass hooks, with no conditionals in the base that would blur the
+/// single-writer/fail-closed contract.
+class SingleWriterSlot
+{
+public:
+    /// `slot_name_` is the noun in every message ("watermark"); `terminal_verb_` is the
+    /// verb used in the start/renew/terminal guards ("farewell").
+    SingleWriterSlot(
+        BackendPtr backend_, String key_, std::string_view slot_name_, std::string_view terminal_verb_,
+        std::string_view logger_name_);
+
+    /// Stops the background thread only (no terminal op). Destruction without a terminal op is the
+    /// crash path: the slot persists, its seq stops advancing, and full GC observes the frozen seq.
+    virtual ~SingleWriterSlot();
+
+    /// seq++ via putOverwrite against the last token we wrote; LOGICAL_ERROR on a foreign touch
+    /// (single-writer fail-closed contract).
+    void renewOnce();
+
+    void startBackground(std::chrono::milliseconds period);
+    void stopBackground();   /// idempotent
+
+    /// Local-clock bound for diagnostics: when the background loop stops (renewal failure), this
+    /// stops advancing.
+    std::chrono::steady_clock::time_point lastRenewTime() const;
+
+protected:
+    /// Per-call payload prepared OFF the state lock and handed to `encodeBody`. Subclasses needing
+    /// dynamic values (the mount lease's `now_ms` + merged `min_active`) carry them through this opaque
+    /// token. `value2` is a second scalar for slots that renew more than one dynamic field per beat (the
+    /// merged heartbeat: `value` = now_ms, `value2` = min_active).
+    struct RenewPayload
+    {
+        uint64_t value = 0;
+        uint64_t value2 = 0;
+    };
+
+    using Token = ::DB::Cas::Token;
+
+    /// === policy hooks (see class comment) ===
+    virtual RenewPayload prepareRenew() const = 0;
+    virtual String encodeBody(uint64_t seq, const RenewPayload & payload) const = 0;
+    virtual Token claim(const String & body) = 0;
+
+    /// === optional background-renewal observation hooks (default no-op) ===
+    /// Called from the background loop after a SUCCESSFUL `renewOnce` (off `state_mutex`); the
+    /// mount-lease keeper refreshes the local write-fence deadline here. The watermark keeper does not
+    /// override it (no-op), so its behavior is unchanged.
+    virtual void onRenewSucceeded() {}
+    /// Called from the background loop when `renewOnce` THREW (the loop is about to stop, off
+    /// `state_mutex`); the mount-lease keeper latches the write fence to lost here. Default no-op.
+    virtual void onRenewFailed() {}
+
+    /// Called when the token-guarded renew PUT hits PreconditionFailed. The base contract stays
+    /// fail-closed and LOUD; subclasses may re-read and throw a more precisely classified
+    /// exception (the mount keeper distinguishes a GC fence of our own expired lease from a
+    /// genuine foreign writer). MUST throw — a renew mismatch never continues.
+    virtual void onRenewMismatch(const String & mismatched_key);
+
+    /// Runs the slot's terminal op against the held `last_token`. Called under `state_mutex` with
+    /// `dead` already set (so renewal can never race it). Owns its own fail-closed throws and final
+    /// bookkeeping (the watermark bumps seq/last_token/last_renew_time on its retiring putOverwrite).
+    /// May throw — `dead` stays set regardless.
+    virtual void terminate() = 0;
+
+    /// Anchors the slot for seq=1 — durable when `doStart` returns. Subclasses expose this under their
+    /// own public name (`start`). Computes the payload off the lock, then runs the policy `claim`.
+    void doStart();
+
+    /// Stops the background thread, takes the state lock, runs the dead/seq guards (e.g.
+    /// "double farewell" / "discard before start"), sets `dead`, and delegates the op to `terminate`.
+    /// Subclasses expose this under their own public name (`farewell`/`discard`).
+    void doTerminate();
+
+    /// Bookkeeping after a successful write of the given seq/token: records seq, the token we now
+    /// hold, and the local-clock renew time. Must be called under `state_mutex`.
+    void recordWrite(uint64_t new_seq, const Token & token);
+
+    BackendPtr backend;
+    String key;
+
+    mutable std::mutex state_mutex;
+    uint64_t seq = 0;            /// 0 = not started
+    Token last_token;            /// the incarnation WE wrote — the only one we ever renew
+    bool dead = false;           /// set by the terminal op
+
+private:
+    void backgroundLoop(std::chrono::milliseconds period);
+
+    std::string_view slot_name;
+    std::string_view terminal_verb;
+
+    std::chrono::steady_clock::time_point last_renew_time;
+
+    std::mutex background_mutex;
+    std::condition_variable wakeup;
+    bool stop_requested = false;
+    ThreadFromGlobalPool thread;
+
+    LoggerPtr log;
+};
+
 }
 
 namespace DB::Cas
@@ -401,5 +536,43 @@ private:
     std::function<void()> on_lost;
     CasEventSink event_sink;
 };
+
+}
+
+// ===== Merged from CasStagingSweeper.h (merge #3): mount-scoped sweeper, bypasses Backend into IObjectStorage by design =====
+namespace DB::Cas
+{
+
+/// Mount-lease-scoped staging sweeper (S3-native staging plan
+/// `docs/superpowers/plans/2026-07-11-cas-s3-native-staging.md` Task 6; design
+/// `docs/superpowers/specs/2026-07-11-cas-s3-native-staging-design.md` §6 crash & orphan handling).
+///
+/// A leaked S3 staging object happens two ways: (1) an exception between `promoteStaged` succeeding and
+/// `cleanupPendingTempFiles` deleting the staging key (`ContentAddressedTransaction.cpp`), or (2) an
+/// aborted/cancelled transaction whose pending blobs were staged but never promoted — by design,
+/// `cleanupPendingTempFiles` deliberately leaves an S3 staging object in place on the abort path (never a
+/// bare `fs::remove` on a remote key), so this sweeper is its ONLY reclaimer. Debris from either case is
+/// bounded to `staging/<mount_id>/` — the ONE mount that could ever have written under that prefix, since
+/// every staging key this mount ever mints comes from `ContentAddressedMetadataStorage::stagingKeyPrefix()`
+/// (`physicalKey(pool_prefix + "/staging/" + server_root_id)`), keyed by THIS mount's own `server_root_id`.
+///
+/// LEASE-FENCE (fail-closed, never fail-open): `sweepOwnMountStaging` removes ONLY objects whose key
+/// starts with the given `mount_staging_prefix` — pass your OWN mount's prefix, never another mount's.
+/// The caller (`ContentAddressedMetadataStorage::startup()`) invokes this exactly once, at mount start,
+/// with `stagingKeyPrefix() + "/"` — the SAME prefix construction the writer uses to mint staging keys, so
+/// this sweep can never reach a different mount's `staging/<other_mount_id>/` subtree: no other writer
+/// ever stages a key under THIS mount's own `server_root_id` prefix, and this function never lists or
+/// touches anything outside the prefix it is given.
+///
+/// Best-effort and NEVER THROWS: one stubborn key (or a LIST failure) must never abort the sweep of the
+/// rest, and must never fail the mount (mirrors `feedback_ca_gc_never_throw_on_404` — a throw here would
+/// only wedge startup, not GC, but the same fail-open-on-error discipline applies to any best-effort
+/// reclaim of debris).
+///
+/// GC excludes `staging/` entirely: GC blob discovery LISTs `Layout::blobsPrefix()`
+/// (`<pool_prefix>/blobs/`) — a distinct top-level prefix from `staging/`, `cas/refs/`, and
+/// `cas/manifests/` (see `CasLayout.h`) — so a `staging/` object is never listed, HEAD'd, or condemned by
+/// GC's fold. This sweeper is the ONLY reclaimer of `staging/` debris.
+void sweepOwnMountStaging(IObjectStorage & object_storage, const String & mount_staging_prefix) noexcept;
 
 }

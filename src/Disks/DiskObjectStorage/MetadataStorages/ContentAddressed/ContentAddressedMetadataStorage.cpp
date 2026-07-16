@@ -5,7 +5,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasObjectStorageBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasProbe.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStagingSweeper.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasServerRoot.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/StaticDirectoryIterator.h>
 #include <IO/ReadBufferFromFileView.h>
 #include <IO/ReadBufferFromMemory.h>
