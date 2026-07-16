@@ -18,7 +18,7 @@ against the code as of 2026-07-15; several numbered docs (`05-formats-and-backen
 section) lag the code and are updated in the last migration step.
 
 **Scope:** every persisted format under
-`src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/`. Pre-release rules apply: no
+`src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/`. Pre-release rules apply: no
 persisted data exists in the wild, so there is no dual-read compatibility scaffolding — one cutover
 per format, one new baseline.
 

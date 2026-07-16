@@ -14,7 +14,7 @@ The audit proposes local fixes inside the existing structure; this document prop
 itself. Where the two disagree, this document wins for new work.
 
 **Scope:** every persisted format under
-`src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/`. Pre-release rules apply: no
+`src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/`. Pre-release rules apply: no
 persisted data exists in the wild, so there is no dual-read compatibility scaffolding — one cutover,
 one new baseline.
 

@@ -359,10 +359,10 @@ merge amplification factor, and GC round cadence.
 - `docs/superpowers/reports/2026-06-15-ca-soak-opcount-and-rustfs-findings.md` — ground-fix research; instrumented soak A1b definitive attribution.
 - `docs/superpowers/reports/2026-06-15-unattended-night-opcount-fixes.md` — #1 ETag fix + #4 root_shards widen + soak #6/#7 results.
 - `docs/superpowers/reports/2026-06-17-ca-s3-opcount-optimization-proposals.md` — P0–P9 proposals + corrected cost table.
-- `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasBuild.cpp` — write path; `putBlob`, `precommitAdd`, `promote`.
-- `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasStore.cpp` — `readShardDecoded`, `resolveRef`, `readManifest`, dedup-cache API.
-- `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasGc.cpp` — GC round: `runRegularRound` (heartbeat floor → fold + three-cursor merge → pre-CAS deletes → single CAS), `snapPruneOldGenerations`, `discoverUniverse`, `computeDiscoverDecisions`. `computeHeartbeatFloor` in `CasServerRoot.cpp`.
-- `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/CasObjectStorageBackend.cpp` — `nativeConditionalPut` (ETag capture), `deleteExact`.
+- `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBuild.cpp` — write path; `putBlob`, `precommitAdd`, `promote`.
+- `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasStore.cpp` — `readShardDecoded`, `resolveRef`, `readManifest`, dedup-cache API.
+- `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp` — GC round: `runRegularRound` (heartbeat floor → fold + three-cursor merge → pre-CAS deletes → single CAS), `snapPruneOldGenerations`, `discoverUniverse`, `computeDiscoverDecisions`. `computeHeartbeatFloor` in `CasServerRoot.cpp`.
+- `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasObjectStorageBackend.cpp` — `nativeConditionalPut` (ETag capture), `deleteExact`.
 
 ## Shard-mutation queue effect (2026-07-03) {#shard-queue-budget}
 

@@ -10,7 +10,7 @@ doc_type: 'reference'
 # CAS Codec Reference {#cas-codec-reference}
 
 **Status:** audit/reference for
-`src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Core/`.
+`src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/`.
 
 This document maps every persisted CAS format used by the Core layer: where objects are stored, what
 bytes they contain, which code creates them, which code consumes them, why the format exists, and

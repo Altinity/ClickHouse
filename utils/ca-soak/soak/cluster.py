@@ -71,7 +71,7 @@ KEEPER_EXCEPTION_CODE = 999
 # `Code: 499 ... (S3_ERROR)`. The CAS conditional-write path makes this especially sharp: every CAS
 # conditional PUT (part manifests, ref-log appends, ...) deliberately runs on a SINGLE-ATTEMPT S3
 # client (RFC cas-s3-timeout-retry-control; `ObjectStorageBackend::conditionalWriteSettings`,
-# src/.../ContentAddressed/Core/CasObjectStorageBackend.cpp) whose one attempt gets the ADAPTIVE
+# src/.../ContentAddressed/Backend/CasObjectStorageBackend.cpp) whose one attempt gets the ADAPTIVE
 # first-attempt timeout (~3s receive for a small PUT, src/IO/ConnectionTimeouts.cpp) — so any S3
 # blip longer than ~3s fails a CAS write with zero server-side retries, where upstream non-CAS S3
 # traffic would have retried through it (~500 attempts). Diagnosed on the task3 v3 2h soak
