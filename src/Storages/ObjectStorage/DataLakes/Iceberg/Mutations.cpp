@@ -715,6 +715,12 @@ void alter(
     if (params.size() != 1)
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Iceberg alter supports exactly one command at a time, got {}", params.size());
 
+    /// The command was marked as a no-op by AlterCommands::prepare (e.g. RENAME/DROP COLUMN IF EXISTS
+    /// for a missing column, or ADD COLUMN IF NOT EXISTS for an existing one), so there is nothing to
+    /// write into the Iceberg metadata.
+    if (params[0].ignore)
+        return;
+
     for (size_t i = 0; i < MAX_TRANSACTION_RETRIES; ++i)
     {
         auto log = getLogger("IcebergMutations");
