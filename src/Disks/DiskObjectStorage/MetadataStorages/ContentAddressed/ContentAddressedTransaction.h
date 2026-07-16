@@ -109,8 +109,8 @@ private:
                                                    /// minus these paths, UNLESS the same transaction also
                                                    /// drops the whole part (removeDirectory), in which
                                                    /// case the marks are superseded (see removeDirectory).
-        bool published = false;                    /// the ref is already durably published (at the
-                                                   /// lock-free rename); commit() must not re-publish it.
+        bool published = false;                    /// set by publishStaging during commit(); the commit
+                                                   /// loop is idempotent (never re-publishes a staging).
 
         /// `staging_key`: the local temp path (`StagingBackend::Local`) or the S3 staging object key
         /// (`StagingBackend::S3`, plan `docs/superpowers/plans/2026-07-11-cas-s3-native-staging.md`
@@ -125,13 +125,6 @@ private:
     /// stagings never collide.
     std::map<std::pair<std::string, std::string>, PartStaging> parts;
     bool committed = false;
-
-    /// Refs published EARLY (at the lock-free tmp->final rename in moveDirectory), BEFORE the
-    /// owning transaction's commit decision. If the transaction is abandoned (destructed without a
-    /// successful commit() — e.g. a ZK multi failure on the replicated INSERT path rolls back AFTER
-    /// renameParts() already published), these durable refs must be dropped, else a rolled-back
-    /// insert's part survives as an orphan ref (resurrection / unexpected-part on restart). B151.
-    std::vector<std::pair<Cas::RootNamespace, std::string>> rename_published_refs;
 
     /// Stage a CONTENT part file as a blob: record the pending upload + a tokenless dependency
     /// and add/replace its manifest entry. Shared by the streaming-blob path

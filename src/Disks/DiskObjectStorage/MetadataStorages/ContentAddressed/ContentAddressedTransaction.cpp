@@ -95,13 +95,9 @@ ContentAddressedTransaction::~ContentAddressedTransaction()
     if (committed)
         return;
 
-    /// Drop refs we published early at the rename (B151) — the transaction did not commit, so a
-    /// rolled-back insert must not leave a durable orphan ref. Best-effort: a failed drop leaves
-    /// GC-reclaimable debris (and the replicated restart's ZK reconcile detaches an unexpected
-    /// part), never a masked exception out of the destructor.
-    for (const auto & [ns, ref] : rename_published_refs)
-        metadata_storage.partAccess().dropRefBestEffort({ns, ref});
-
+    /// [TXN-ONE-PIPELINE] No refs are published before commit() any more (moveDirectory tmp->final is a
+    /// pure re-key, Task 1.1), so an abandoned transaction has no early-published ref to compensate — the
+    /// final ref simply never became durable. The only cleanup left is abandoning still-open Builds below.
     for (auto & [key, st] : parts)
     {
         if (!st.build)
@@ -285,7 +281,7 @@ void ContentAddressedTransaction::uploadPendingBlobs(PartStaging & st)
 bool ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, const std::string & ref, PartStaging & st)
 {
     if (st.published)
-        return false;   /// already durable (published at the lock-free rename) — never re-publish
+        return false;   /// this staging was already published earlier in this commit loop — never re-publish
 
     if (!st.build && st.entries.empty() && st.content_removed.empty())
     {
@@ -375,7 +371,8 @@ bool ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
 
 void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &)
 {
-    /// Publish each staged part not already published at the lock-free rename (B151). Commit
+    /// Publish each staged part. [TXN-ONE-PIPELINE] This is the ONLY place a ref becomes durable — the
+    /// tmp->final rename is a pure overlay re-key. Commit
     /// atomicity (B122): there is no multi-ref atomic publish, so a publish that throws after
     /// earlier parts already published would leave a PARTIAL commit — some refs durably visible while
     /// the transaction reports failure, diverging the durable pool from the disk layer's all-or-nothing
