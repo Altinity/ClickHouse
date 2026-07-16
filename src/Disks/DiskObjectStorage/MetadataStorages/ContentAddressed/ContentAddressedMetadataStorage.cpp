@@ -1124,7 +1124,7 @@ std::optional<StoredObjects> ContentAddressedMetadataStorage::getStorageObjectsI
     if (!entry)
         return std::nullopt;
     if (entry->placement == Cas::EntryPlacement::Inline)
-        return StoredObjects{StoredObject("", path, entry->inline_bytes.size())};
+        return StoredObjects{StoredObject("", path, entry->size())};
     const auto location = store()->locate(*entry);
     return StoredObjects{StoredObject(location.key, path, location.length)};
 }

@@ -42,10 +42,14 @@ enum class EntryPlacement : uint8_t
     Blob = 2,     /// bytes stored as a content-addressed blob at blobKey(blob_hash)
 };
 
-/// One file entry inside a part manifest. `ref`/`blob_size` are meaningful only for `Blob`;
-/// `inline_bytes` only for `Inline`. `ref` (mixed-algo pools, Phase 3 T2) is the FULL blob identity —
-/// the algo travels WITH the digest, per-entry, so a manifest may carry entries minted under
-/// different hash algos (additive algo switching, no migration): a bare digest is never the identity.
+/// One file entry inside a part manifest. `ref` is meaningful only for `Blob`; `inline_bytes` only
+/// for `Inline`. `blob_size` is the raw Blob byte count (0 for `Inline` — decode never fills it for
+/// an inline entry, since the wire format carries no redundant size for inline bytes). Use `size()`
+/// for the entry's logical file size regardless of placement; no consumer should branch on
+/// `placement` just to answer "how big is this file". `ref` (mixed-algo pools, Phase 3 T2) is the
+/// FULL blob identity — the algo travels WITH the digest, per-entry, so a manifest may carry entries
+/// minted under different hash algos (additive algo switching, no migration): a bare digest is never
+/// the identity.
 struct ManifestEntry
 {
     String path;
@@ -54,6 +58,13 @@ struct ManifestEntry
     uint64_t blob_size = 0;
     String inline_bytes;
     bool operator==(const ManifestEntry &) const = default;
+
+    /// The single source of truth for this entry's logical file size, independent of where its bytes
+    /// live. Closes the bug class behind 02941: an Inline entry carried forward from a decoded
+    /// manifest has `blob_size == 0` (decode never fills it for Inline), so a consumer that read
+    /// `blob_size` directly instead of branching on `placement` (or, worse, forgot to branch at all)
+    /// silently saw size 0 for a non-empty file.
+    uint64_t size() const { return placement == EntryPlacement::Inline ? inline_bytes.size() : blob_size; }
 };
 
 /// The immutable body of a single root-local part manifest (spec §Part Manifest Reference And

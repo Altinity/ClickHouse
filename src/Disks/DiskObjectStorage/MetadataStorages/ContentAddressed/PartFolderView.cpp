@@ -61,7 +61,7 @@ bool PartFolderView::hasFile(const String & path) const
 std::optional<uint64_t> PartFolderView::fileSize(const String & path) const
 {
     if (const auto * e = findFile(path))
-        return e->placement == Cas::EntryPlacement::Inline ? e->inline_bytes.size() : e->blob_size;
+        return e->size();
     return std::nullopt;
 }
 

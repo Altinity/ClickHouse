@@ -265,14 +265,14 @@ bool CachedPartFolderAccess::repointRef(const PartRefKey & key, std::vector<Cas:
     ///
     /// codecs-v3 phase 6: the comparison must be SYMMETRIC. `committed_manifest->entries` already went
     /// through one `decodePartManifest` round-trip, which does not carry `blob_size` for Inline
-    /// entries on the wire (it is redundant with `inline_bytes.size()` and excluded from both the
-    /// canonical encoding and the payload digest — see `CasPartManifestFormat.cpp`'s
-    /// `writeEntryRecord`/`decodePartManifest`). Comparing that against the freshly-constructed
-    /// `entries` directly (whose `blob_size` a caller may have set non-canonically, e.g. `= bytes.
-    /// size()`) is an apples-to-oranges struct compare that can spuriously report a difference and
-    /// force an unnecessary repoint. Route the candidate through the identical encode/decode
-    /// round-trip before comparing — mirrors `republishRef`'s BUG 1c compare just above, which is
-    /// symmetric for the same reason (both sides there are already decoded).
+    /// entries on the wire (it is redundant with `inline_bytes.size()`, use `ManifestEntry::size()` for
+    /// the logical size instead, and it is excluded from both the canonical encoding and the payload
+    /// digest — see `CasPartManifestFormat.cpp`'s `writeEntryRecord`/`decodePartManifest`). The
+    /// freshly-constructed `entries` are now built the same way (the inline write path no longer sets
+    /// `blob_size`), but a straight struct compare against them is still not guaranteed byte-identical
+    /// (canonical path ordering, etc.), so route the candidate through the identical encode/decode
+    /// round-trip before comparing regardless — mirrors `republishRef`'s BUG 1c compare just above,
+    /// which is symmetric for the same reason (both sides there are already decoded).
     auto resolved = resolve(key, Freshness::ForceFresh);
     if (resolved)
     {

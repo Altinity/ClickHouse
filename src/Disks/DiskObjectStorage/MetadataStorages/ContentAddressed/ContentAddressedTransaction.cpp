@@ -456,12 +456,12 @@ std::optional<StoredObjects> ContentAddressedTransaction::tryGetInFlightStorageO
             const auto location = metadata_storage.store()->locate(*entry);
             return StoredObjects{StoredObject(location.key, path, location.length)};
         }
-        /// An Inline entry carries its bytes in `inline_bytes`; `blob_size` is meaningful only for Blob
-        /// entries (see ManifestEntry) and is 0 for an inline entry carried forward from a decoded
-        /// source manifest (createHardLink). Report the inline byte count so an in-flight read of a
-        /// carried-forward inline sidecar (e.g. a MATERIALIZE-PROJECTION projection marks file) resolves
-        /// to its real size, matching the committed getStorageObjects path.
-        return StoredObjects{StoredObject("", path, entry->inline_bytes.size())};
+        /// An Inline entry carries its bytes in `inline_bytes`; `size()` (not `blob_size`, which is 0
+        /// for an inline entry carried forward from a decoded source manifest — createHardLink) reports
+        /// the real inline byte count, so an in-flight read of a carried-forward inline sidecar (e.g. a
+        /// MATERIALIZE-PROJECTION projection marks file) resolves to its real size, matching the
+        /// committed getStorageObjects path.
+        return StoredObjects{StoredObject("", path, entry->size())};
     }
     return {};
 }
@@ -521,11 +521,11 @@ std::optional<uint64_t> ContentAddressedTransaction::tryGetInFlightFileSize(cons
     if (it == parts.end())
         return {};
     if (const auto * entry = findStagedEntry(*r))
-        /// Inline entries size from `inline_bytes` (`blob_size` is Blob-only and is 0 for an inline
-        /// entry carried forward via createHardLink from a decoded source manifest). Without this, an
-        /// in-flight size query for a carried-forward inline sidecar returns 0 — the 02941
-        /// MATERIALIZE-PROJECTION "Empty marks file: 0, must be: 144" corruption on a same-session read.
-        return entry->placement == Cas::EntryPlacement::Inline ? entry->inline_bytes.size() : entry->blob_size;
+        /// `size()` (not `blob_size` directly, which is 0 for an inline entry carried forward via
+        /// createHardLink from a decoded source manifest). Without this, an in-flight size query for a
+        /// carried-forward inline sidecar returns 0 — the 02941 MATERIALIZE-PROJECTION "Empty marks
+        /// file: 0, must be: 144" corruption on a same-session read.
+        return entry->size();
     return {};
 }
 
@@ -811,7 +811,8 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
                 entry.path = route.file;
                 entry.placement = Cas::EntryPlacement::Inline;
                 entry.ref = ref;   /// content hash identity (same for inline and blob of same content)
-                entry.blob_size = bytes.size();
+                /// `blob_size` stays 0 (its default) for an Inline entry — matching decode, which never
+                /// fills it for Inline. `entry.size()` is the logical size, derived from `inline_bytes`.
                 entry.inline_bytes = std::move(bytes);
                 std::erase_if(st.entries, [&](const Cas::ManifestEntry & e) { return e.path == entry.path; });
                 st.entries.push_back(std::move(entry));
