@@ -62,11 +62,6 @@ namespace ProfileEvents
 namespace DB::Cas
 {
 
-/// Runaway brake on CAS/conditional-write retry loops. These keys are single-owner (one writer per
-/// namespace by construction), so a contention storm is impossible — the bound only catches a
-/// pathological live-lock and never a legitimate steady state.
-static constexpr size_t MAX_CAS_ATTEMPTS = 100;
-
 Store::Store(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
     : pool_backend(std::move(backend_))
     , config(std::move(config_))
@@ -79,6 +74,9 @@ Store::Store(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
     /// Phase 3 T2/T3: `Layout` no longer captures a pool algo -- every blob key is built from a
     /// `BlobRef` (algo + digest) directly, so the constructor takes only the pool prefix.
     , pool_layout(config.pool_prefix)
+    /// Plain-object surface component: binds to this Store's own backend + layout (declared after
+    /// both, so this reference-holding member is constructed last and destroyed first).
+    , plain_objects(*pool_backend, pool_layout)
 {
     if (config.dedup_cache_bytes > 0)
         dedup_cache = std::make_unique<DedupCache>(
@@ -642,83 +640,21 @@ Store::~Store()
     }
 }
 
-void Store::casPutObject(const String & full_key, const String & bytes)
-{
-    /// head + putIfAbsent/putOverwrite loop. Single-owner keys make a contention storm impossible;
-    /// the bound is a runaway brake.
-    for (size_t attempt = 0; attempt < MAX_CAS_ATTEMPTS; ++attempt)
-    {
-        HeadResult head = pool_backend->head(full_key);
-        if (!head.exists)
-        {
-            if (pool_backend->putIfAbsent(full_key, bytes).outcome == PutOutcome::Done)
-                return;
-        }
-        else
-        {
-            if (pool_backend->putOverwrite(full_key, bytes, head.token).outcome == PutOutcome::Done)
-                return;
-        }
-        /// PreconditionFailed ⇒ the observed state changed under us; re-head and retry.
-    }
-    throw Exception(ErrorCodes::ABORTED, "object CAS contention on '{}'", full_key);
-}
-
-std::optional<String> Store::casGetObject(const String & full_key)
-{
-    std::optional<GetResult> result = pool_backend->get(full_key);
-    if (!result)
-        return std::nullopt;
-    return result->bytes;
-}
-
-void Store::casRemoveObject(const String & full_key)
-{
-    /// head + deleteExact loop; no-op when absent. Single-owner keys; the bound is a runaway brake.
-    for (size_t attempt = 0; attempt < MAX_CAS_ATTEMPTS; ++attempt)
-    {
-        const HeadResult head = pool_backend->head(full_key);
-        if (!head.exists)
-            return;
-        const DeleteOutcome outcome = pool_backend->deleteExact(full_key, head.token);
-        if (outcome.kind == DeleteOutcome::Kind::Deleted || outcome.kind == DeleteOutcome::Kind::NotFound)
-            return;
-        /// TokenMismatch: a concurrent rewrite — re-head and retry.
-    }
-    throw Exception(ErrorCodes::ABORTED, "object CAS contention on '{}' (runaway live-lock brake)", full_key);
-}
-
+/// The plain-object surface (namespace files + mountpoint objects) is implemented by the stateless
+/// `plain_objects` component (spec §Decomposition); these are thin delegates preserving the API.
 void Store::putNamespaceFile(const RootNamespace & ns, const String & name, const String & bytes)
 {
-    casPutObject(pool_layout.namespaceFileKey(ns, name), bytes);
+    plain_objects.putNamespaceFile(ns, name, bytes);
 }
 
 std::optional<String> Store::getNamespaceFile(const RootNamespace & ns, const String & name)
 {
-    return casGetObject(pool_layout.namespaceFileKey(ns, name));
+    return plain_objects.getNamespaceFile(ns, name);
 }
 
 std::vector<String> Store::listNamespaceFiles(const RootNamespace & ns)
 {
-    const String prefix = pool_layout.namespaceFilesPrefix(ns);
-    std::vector<String> names;
-    String cursor;
-    while (true)
-    {
-        ListPage page = pool_backend->list(prefix, cursor, /*limit*/ 1000);
-        for (const ListedKey & listed : page.keys)
-        {
-            /// Strip the prefix to yield the bare flat file name.
-            if (listed.key.size() >= prefix.size() && listed.key.compare(0, prefix.size(), prefix) == 0)
-                names.push_back(listed.key.substr(prefix.size()));
-        }
-        if (page.next_cursor.empty())
-            break;
-        cursor = page.next_cursor;
-    }
-    /// The InMemoryBackend lists sorted, but sort explicitly to stay backend-agnostic.
-    std::sort(names.begin(), names.end());
-    return names;
+    return plain_objects.listNamespaceFiles(ns);
 }
 
 uint64_t Store::minActive()
@@ -2919,30 +2855,27 @@ void Store::updateRefPayload(const RootNamespace & ns, const String & ref_name,
 
 void Store::removeNamespaceFile(const RootNamespace & ns, const String & name)
 {
-    casRemoveObject(pool_layout.namespaceFileKey(ns, name));
+    plain_objects.removeNamespaceFile(ns, name);
 }
 
 void Store::putMountpointObject(const String & key, const String & bytes)
 {
-    casPutObject(pool_layout.mountpointObjectKey(key), bytes);
+    plain_objects.putMountpointObject(key, bytes);
 }
 
 std::optional<String> Store::getMountpointObject(const String & key)
 {
-    return casGetObject(pool_layout.mountpointObjectKey(key));
+    return plain_objects.getMountpointObject(key);
 }
 
 bool Store::mountpointObjectExists(const String & key)
 {
-    /// HEAD (metadata), not a body GET: the probed path may resolve to a DIRECTORY (e.g. the `store`
-    /// pool sub-dir traversed by system.remote_data_paths). The backend's metadata path treats a
-    /// directory as not-an-object (B38), so this returns false instead of a body read throwing EISDIR.
-    return pool_backend->head(pool_layout.mountpointObjectKey(key)).exists;
+    return plain_objects.mountpointObjectExists(key);
 }
 
 void Store::removeMountpointObject(const String & key)
 {
-    casRemoveObject(pool_layout.mountpointObjectKey(key));
+    plain_objects.removeMountpointObject(key);
 }
 
 bool Store::namespaceIsRemoved(const RootNamespace & ns)

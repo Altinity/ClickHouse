@@ -12,6 +12,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPlainObjects.h>
 #include <Common/CacheBase.h>
 #include <Common/CurrentMetrics.h>
 #include <Common/HashTable/Hash.h>
@@ -670,14 +671,6 @@ private:
     /// Remove a build_seq from the active set; idempotent (safe from publish/abandon/dtor).
     void retireBuildSeq(uint64_t seq);
 
-    /// ---- plain-object CAS helpers (shared by namespace-file and mountpoint-object paths) ----
-    /// head + putIfAbsent/putOverwrite loop (bounded by MAX_CAS_ATTEMPTS); throws ABORTED on live-lock.
-    void casPutObject(const String & full_key, const String & bytes);
-    /// Plain get → bytes; returns nullopt when absent.
-    std::optional<String> casGetObject(const String & full_key);
-    /// head + deleteExact loop; no-op when absent. Throws ABORTED on live-lock.
-    void casRemoveObject(const String & full_key);
-
     /// ==== writer ref-log append lane (Task 10, spec §Writer Algorithms / §Local Batching Queue) ====
 
     /// At most one outstanding uncertain `PUT` per table (spec §Writer-Side Linearization). Retained
@@ -1109,6 +1102,10 @@ private:
     using DedupCache = CacheBase<BlobRef, DedupPresent, BlobRefHash, DedupWeight>;
     std::unique_ptr<DedupCache> dedup_cache;
     Layout pool_layout;
+    /// The plain-object surface (namespace files + loose mountpoint objects), extracted from Store
+    /// (spec §Decomposition). Stateless over `Backend &` + `const Layout &`; declared AFTER
+    /// pool_backend and pool_layout so it is constructed after (and destroyed before) both.
+    CasPlainObjects plain_objects;
     /// Per-server build watermark (spec 2026-06-16-ca-build-watermark). process_epoch is a random
     /// nonzero u64 minted once at open: GC checks it for EQUALITY (an object stamped with a different
     /// epoch is from a dead incarnation), never for ordering. next_build_seq is a strictly-increasing
