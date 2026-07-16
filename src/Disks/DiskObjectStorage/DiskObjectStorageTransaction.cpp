@@ -128,18 +128,7 @@ void DiskObjectStorageTransaction::createDirectories(const std::string & path)
 
 void DiskObjectStorageTransaction::moveDirectory(const std::string & from_path, const std::string & to_path)
 {
-    /// CA: dispatch the rename EAGERLY (mirroring the createHardLink CA early-dispatch) instead of
-    /// queuing a deferred lambda that fires inside commit() under the data_parts lock. For a
-    /// content-addressed disk this is where a freshly-written part is published to its FINAL manifest
-    /// ref; renameParts() runs LOCK-FREE in the replicated paths, so the publish happens off the
-    /// data_parts lock (B151).
-    if (metadata_storage->isContentAddressed())
-    {
-        metadata_transaction->moveDirectory(from_path, to_path);
-        return;
-    }
-
-    operations_to_execute.push_back([from_path, to_path](MetadataTransactionPtr tx)
+    dispatch([from_path, to_path](MetadataTransactionPtr tx)
     {
         tx->moveDirectory(from_path, to_path);
     });
@@ -418,7 +407,10 @@ void DiskObjectStorageTransaction::writeFileUsingBlobWritingFunction(
     /// We always use mode Rewrite because we simulate append using metadata and different files
     object.bytes_size = std::move(write_blob_function)(blob_path, WriteMode::Rewrite, /*object_attributes=*/std::nullopt);
 
-    operations_to_execute.push_back([object, mode](MetadataTransactionPtr tx)
+    /// [TXN-ONE-PIPELINE] Routed through dispatch for uniformity. Unreachable on CA (Audit 6):
+    /// generateObjectKeyForPath above throws NOT_IMPLEMENTED first, so CA never reaches this metadata
+    /// effect and never queues. On ordinary storage dispatch queues exactly as before.
+    dispatch([object, mode](MetadataTransactionPtr tx)
     {
         if (mode == WriteMode::Rewrite)
         {
@@ -436,22 +428,13 @@ void DiskObjectStorageTransaction::writeFileUsingBlobWritingFunction(
 
 void DiskObjectStorageTransaction::createHardLink(const std::string & src_path, const std::string & dst_path)
 {
-    /// CA read-your-writes: a content-addressed transaction stages a hardlinked file into its per-part
-    /// `recorded` map so a reader holding the transaction can resolve it before commit — exactly as
-    /// `writeFile` stages eagerly (it has no `operations_to_execute` entry; commit publishes from the
-    /// staging). A carried-forward projection is hardlinked into the open whole-part transaction during a
-    /// mutation, and `loadProjections` (which runs in the SAME finalize, before commit) must see it via
-    /// the directory overlay. Deferring the hardlink to commit replay (the default below) would hide it
-    /// until after `loadProjections` ran, so the carried projection registered empty (B58/B63). The
-    /// metadata-level `createHardLink` is a map assignment (idempotent), so staging it eagerly and NOT
-    /// queuing it is equivalent to the queued replay — commit publishes the manifest from the staging.
-    if (metadata_storage->isContentAddressed())
-    {
-        metadata_transaction->createHardLink(src_path, dst_path);
-        return;
-    }
-
-    operations_to_execute.push_back([src_path, dst_path](MetadataTransactionPtr tx)
+    /// For CA `dispatch` runs eagerly (call-time), which is load-bearing for read-your-writes: a
+    /// carried-forward projection hardlinked into the open whole-part transaction during a mutation must
+    /// be visible to `loadProjections` (same finalize, before commit) via the directory overlay. Deferring
+    /// it to commit replay would hide it until after `loadProjections` ran (B58/B63). The metadata-level
+    /// `createHardLink` is an idempotent map assignment, so eager staging is equivalent to the queued
+    /// replay — commit publishes the manifest from the staging.
+    dispatch([src_path, dst_path](MetadataTransactionPtr tx)
     {
         tx->createHardLink(src_path, dst_path);
     });
@@ -574,7 +557,10 @@ void DiskObjectStorageTransaction::copyFileImpl(
 
     runner.waitForAllToFinishAndRethrowFirstError();
 
-    operations_to_execute.push_back([blobs_to_create, missing_locations, to_file_path](MetadataTransactionPtr tx)
+    /// [TXN-ONE-PIPELINE] Routed through dispatch for uniformity. Unreachable on CA (Audit 6):
+    /// copyFileImpl calls generateObjectKeyForPath above, which throws NOT_IMPLEMENTED on CA before this
+    /// point, so CA never queues here. On ordinary storage dispatch queues exactly as before.
+    dispatch([blobs_to_create, missing_locations, to_file_path](MetadataTransactionPtr tx)
     {
         for (const auto & blob : blobs_to_create)
             tx->recordBlobsReplication(blob, missing_locations);
