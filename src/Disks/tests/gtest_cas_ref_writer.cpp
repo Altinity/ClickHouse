@@ -575,6 +575,25 @@ TEST(RefWriterAppendLane, WarmIsolatedMutationCostsOneCreateZeroReads)
     EXPECT_FALSE(store->resolveRef(ns, "part_1").has_value());
 }
 
+/// Phase 3 (spec 2026-07-17-cas-reftable-cow-map-design.md §Materialization): each of these N
+/// publishes is its own isolated (unbatched) flush touching exactly one NEW ref -- if
+/// `flushRefBatch` did not materialize `rt->state.committed` after installing each flush's
+/// transaction, the overlay would grow by ~1 entry per flush and this would read back ~N,
+/// defeating the whole point of the COW map for a long-running table.
+TEST(RefWriterAppendLane, MaterializeKeepsOverlaySmallAcrossManyIsolatedFlushes)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"srv1/cowmap"};
+
+    constexpr int kRefs = 20;
+    for (int i = 0; i < kRefs; ++i)
+        publishEmptyPart(store, ns, "ref" + std::to_string(i));
+
+    EXPECT_LE(store->committedOverlayEntriesForTest(ns), 1u);
+    EXPECT_EQ(store->listRefs(ns).size(), static_cast<size_t>(kRefs));   /// sanity: all N really committed
+}
+
 /// `B` compatible queued mutations share one create (spec §Writer Budget).
 TEST(RefWriterAppendLane, CompatibleMutationsShareOneCreate)
 {

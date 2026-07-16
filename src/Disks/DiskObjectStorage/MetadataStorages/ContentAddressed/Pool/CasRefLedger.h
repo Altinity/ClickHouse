@@ -112,6 +112,7 @@ public:
     int pendingSnapshotPublishesForTest(const RootNamespace & ns);
     std::optional<RefTxnId> newestPublishedSnapshotIdForTest(const RootNamespace & ns);
     size_t tailSinceSnapshotCountForTest(const RootNamespace & ns);
+    size_t committedOverlayEntriesForTest(const RootNamespace & ns);
     void setRefPreCarveHookForTest(std::function<void()> hook) { ref_pre_carve_hook_for_test = std::move(hook); }
 
     size_t refQueuePendingForTest(const RootNamespace & ns)

@@ -665,6 +665,7 @@ public:
     /// Task 11 test seam: count of applied txns retained above `newestPublishedSnapshotIdForTest` (the
     /// tail a snapshot candidate would replay from).
     size_t tailSinceSnapshotCountForTest(const RootNamespace & ns);
+    size_t committedOverlayEntriesForTest(const RootNamespace & ns);
 
     /// Test-only hook: called by `flushRefBatch`
     /// right before it carves a batch, i.e. AFTER the table is already recovered -- the one otherwise

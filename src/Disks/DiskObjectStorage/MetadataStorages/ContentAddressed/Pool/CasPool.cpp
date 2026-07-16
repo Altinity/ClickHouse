@@ -1181,4 +1181,9 @@ size_t Pool::tailSinceSnapshotCountForTest(const RootNamespace & ns)
     return ref_ledger.tailSinceSnapshotCountForTest(ns);
 }
 
+size_t Pool::committedOverlayEntriesForTest(const RootNamespace & ns)
+{
+    return ref_ledger.committedOverlayEntriesForTest(ns);
+}
+
 }

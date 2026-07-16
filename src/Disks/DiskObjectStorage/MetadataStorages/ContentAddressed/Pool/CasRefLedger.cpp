@@ -1213,6 +1213,14 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
             {
                 std::lock_guard lock(rt->state_mutex);
                 applyRefLogTxn(rt->state, final_txn);
+                /// COW-map materialize (spec 2026-07-17-cas-reftable-cow-map-design.md
+                /// §Materialization): fold this flush's overlay into a fresh immutable base HERE,
+                /// under the SAME state_mutex critical section as the install above, so
+                /// `rt->state.committed` is back to "base + empty overlay" before the next flush's
+                /// trial copies (`working = rt->state`, CasRefLedger.cpp:1006) begin -- an O(n) fold
+                /// once per flush, replacing what used to be an implicit O(n) copy on every trial
+                /// anyway.
+                rt->state.committed.materialize();
                 /// rev.6 Task 10 (spec §publish-from-live): this commit's own txn joins the
                 /// applied-above-newest-snapshot tail counters -- the live `rt->state` just mutated
                 /// above IS the next publish candidate's body, so there is no per-entry log to retain.
@@ -1426,6 +1434,14 @@ size_t CasRefLedger::tailSinceSnapshotCountForTest(const RootNamespace & ns)
     ensureRefTableRecovered(ns, *rt);
     std::lock_guard lock(rt->state_mutex);
     return rt->tail_count_since_snapshot.load(std::memory_order_relaxed);
+}
+
+size_t CasRefLedger::committedOverlayEntriesForTest(const RootNamespace & ns)
+{
+    const auto rt = getRefTableRuntime(ns);
+    ensureRefTableRecovered(ns, *rt);
+    std::lock_guard lock(rt->state_mutex);
+    return rt->state.committed.overlayEntriesForTest();
 }
 
 namespace
