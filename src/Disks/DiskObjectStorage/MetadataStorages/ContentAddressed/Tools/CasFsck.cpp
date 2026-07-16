@@ -272,7 +272,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
         /// mismatch, making the report not `clean()`) on a genuine divergence; skips silently when the
         /// covered logs were already cleaned or an object vanished mid-check.
         checkSnapshotOracle(backend, layout, ns, detail, deadline, report);
-        for (const auto & [ref_name, row] : table.committed)
+        for (const auto [ref_name, row] : table.committed)
         {
             const ManifestId id{ns, row.manifest_ref};
             const String mkey = layout.manifestKey(id);

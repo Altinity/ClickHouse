@@ -3,6 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefLogFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCowMap.h>
 #include <base/types.h>
 #include <cstdint>
 #include <map>
@@ -151,7 +152,7 @@ struct RefTableState
     std::optional<RefTxnId> remove_txn_id;
     RefTxnId greatest_applied{};                       /// {0, 0} = no transaction applied yet
 
-    std::map<String, RefCommittedRow> committed;                     /// keyed by ref_name
+    RefCowMap committed;                                              /// keyed by ref_name
     std::set<std::pair<String, ManifestRef>> precommits;             /// (ref_name, manifest_ref)
 };
 
@@ -214,13 +215,15 @@ struct RefTableState
 void applyRefLogTxn(RefTableState & state, const RefLogTxn & txn);
 
 /// The canonical snapshot of `state` under `ns` (spec §Snapshot Format): `committed` sorted by
-/// bytewise `ref_name` (guaranteed by `std::map<String, ...>`'s iteration order) and `precommits`
-/// sorted by `(ref_name, manifest_ref)` (guaranteed by `std::set<std::pair<String, ManifestRef>>`'s
-/// iteration order, since `ManifestRef::operator<` matches the tuple order `CasRefSnapshotCodec`
-/// itself sorts by). `snapshot_id` is `state.greatest_applied`; a `Removed` state produces zero rows
-/// plus `remove_txn_id`, per spec. Does not itself enforce that the result is encodable (a
-/// never-born state's `snapshot_id` is `{0, 0}`, which `encodeRefTableSnapshot` already rejects) --
-/// that check already lives in the codec and need not be duplicated here.
+/// bytewise `ref_name` (guaranteed by `RefCowMap`'s sorted merge-iteration order,
+/// `Pool/CasRefCowMap.h` -- the same ordering `std::map<String, ...>` gave before it, by design)
+/// and `precommits` sorted by `(ref_name, manifest_ref)` (guaranteed by
+/// `std::set<std::pair<String, ManifestRef>>`'s iteration order, since `ManifestRef::operator<`
+/// matches the tuple order `CasRefSnapshotCodec` itself sorts by). `snapshot_id` is
+/// `state.greatest_applied`; a `Removed` state produces zero rows plus `remove_txn_id`, per spec.
+/// Does not itself enforce that the result is encodable (a never-born state's `snapshot_id` is
+/// `{0, 0}`, which `encodeRefTableSnapshot` already rejects) -- that check already lives in the
+/// codec and need not be duplicated here.
 RefTableSnapshot snapshotOf(const RefTableState & state, const String & ns);
 
 /// `TableState = Replay(S_X.state, tail(X))` (spec §Table State) in one call: starts from `snapshot`

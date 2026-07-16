@@ -22,7 +22,7 @@ namespace
 /// the same admission budget this invariant protects.
 bool manifestAlreadyOwned(const RefTableState & state, const ManifestRef & manifest_ref)
 {
-    for (const auto & [name, row] : state.committed)
+    for (const auto [name, row] : state.committed)
         if (row.manifest_ref == manifest_ref)
             return true;
     for (const auto & [name, ref] : state.precommits)
@@ -126,8 +126,14 @@ void applySetPayload(RefTableState & state, const RefOp & op)
         throw Exception(ErrorCodes::CORRUPTED_DATA,
             "RefTableState: set_payload '{}' no longer names its expected_manifest_ref", op.ref_name);
 
-    it->second.payload = op.payload;
-    it->second.published_at_ms = op.published_at_ms;
+    /// `RefCowMap`'s iterator is read-only (Pool/CasRefCowMap.h): a write always goes through
+    /// `insert_or_assign`, never through the found iterator in place. Copy the row, apply the same
+    /// two field mutations the old in-place code did, and write the whole row back -- this IS the
+    /// COW map's single-row copy-out (spec §Mechanism), not a whole-table one.
+    RefCommittedRow updated = it->second;
+    updated.payload = op.payload;
+    updated.published_at_ms = op.published_at_ms;
+    state.committed.insert_or_assign(op.ref_name, std::move(updated));
 }
 
 /// One operation's local preconditions and effect (spec §State Transitions), shared by
@@ -206,9 +212,10 @@ void checkRemoveNamespaceOrdering(const std::vector<RefOp> & ops)
 /// re-implementing a second, independently-maintained copy of its validation (sortedness, no
 /// duplicates, canonical names, nonzero ids, `manifest_ref` field validity, lifecycle/remove_txn_id
 /// coupling) that could silently miss a case. Concretely: a hand-built snapshot with two committed
-/// rows sharing one `ref_name` would otherwise DROP the second row via `std::map::emplace` below --
-/// the same phantom-alive class of bug as a promote's silent displacement (see `applyOwnerTransition`
-/// above), just reached through snapshot loading instead of a transaction.
+/// rows sharing one `ref_name` would otherwise DROP the second row via `RefCowMap::emplace` below
+/// (same no-overwrite-on-existing-key semantics as `std::map::emplace`) -- the same phantom-alive
+/// class of bug as a promote's silent displacement (see `applyOwnerTransition` above), just reached
+/// through snapshot loading instead of a transaction.
 RefTableState stateFromSnapshot(const RefTableSnapshot & snapshot)
 {
     const String bytes = encodeRefTableSnapshot(snapshot);
@@ -233,7 +240,7 @@ RefLogTxn buildHypotheticalRemovalTxn(const RefTableState & state, const RefTxnI
     RefLogTxn txn;
     txn.txn_id = placeholder_txn_id;
 
-    for (const auto & [name, row] : state.committed)
+    for (const auto [name, row] : state.committed)
     {
         RefOp op;
         op.kind = RefOpKind::OwnerTransition;
@@ -286,8 +293,8 @@ RefTableSnapshot snapshotOf(const RefTableState & state, const String & ns)
     snapshot.remove_txn_id = state.remove_txn_id;
 
     snapshot.committed.reserve(state.committed.size());
-    for (const auto & [name, row] : state.committed)
-        snapshot.committed.push_back(row);   /// std::map<String, ...> iterates sorted by ref_name
+    for (const auto [name, row] : state.committed)
+        snapshot.committed.push_back(row);   /// RefCowMap iterates sorted by ref_name (Pool/CasRefCowMap.h)
 
     snapshot.precommits.reserve(state.precommits.size());
     for (const auto & [name, manifest_ref] : state.precommits)

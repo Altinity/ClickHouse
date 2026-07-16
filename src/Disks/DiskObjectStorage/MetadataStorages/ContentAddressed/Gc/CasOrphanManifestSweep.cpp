@@ -221,7 +221,7 @@ std::set<String> activeManifestKeys(Pool & store, const RootNamespace & ns, Late
     /// Current owners = snapshot + replayed tail (committed rows + live precommits).
     const RecoveredRefTable recovered = recoverRefTableDetailed(backend, layout, ns, onGcEnumerationPage);
     const RefTableState & state = recovered.state;
-    for (const auto & [ref_name, row] : state.committed)
+    for (const auto [ref_name, row] : state.committed)
         active.insert(layout.manifestKey(ManifestId{ns, row.manifest_ref}));
     for (const auto & [ref_name, manifest_ref] : state.precommits)
         active.insert(layout.manifestKey(ManifestId{ns, manifest_ref}));

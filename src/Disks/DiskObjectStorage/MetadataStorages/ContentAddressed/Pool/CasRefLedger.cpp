@@ -168,7 +168,7 @@ std::map<String, Resolved> CasRefLedger::listRefs(const RootNamespace & ns)
 
     std::map<String, Resolved> result;
     std::lock_guard lock(rt->state_mutex);
-    for (const auto & [ref_name, row] : rt->state.committed)
+    for (const auto [ref_name, row] : rt->state.committed)
         result.emplace(ref_name, Resolved{
             .manifest_id = ManifestId{.root_namespace = ns, .ref = row.manifest_ref},
             .manifest_size = 0,
@@ -1877,7 +1877,7 @@ DropNamespaceStats CasRefLedger::dropNamespace(const RootNamespace & ns)
                 return {};   /// raced: another caller already removed it since our check above
 
             std::vector<RefOp> ops;
-            for (const auto & [ref_name, row] : state.committed)
+            for (const auto [ref_name, row] : state.committed)
             {
                 RefOp op;
                 op.kind = RefOpKind::OwnerTransition;

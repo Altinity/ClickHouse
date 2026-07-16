@@ -1986,7 +1986,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
 
         /// Committed owners: a missing/invalid body under a committed ref is DATA LOSS the rebuild must
         /// not bless (INV_NO_DANGLE) -- refuse.
-        for (const auto & [ref_name, row] : st.committed)
+        for (const auto [ref_name, row] : st.committed)
         {
             const ManifestId id{ns, row.manifest_ref};
             owned_manifest_keys.insert(layout.manifestKey(id));

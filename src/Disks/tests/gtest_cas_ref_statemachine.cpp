@@ -117,7 +117,7 @@ void expectStatesEqual(const RefTableState & a, const RefTableState & b)
 RefLogTxn buildRemovalTxnForTest(const RefTableState & state, const String & ns, RefTxnId id)
 {
     std::vector<RefOp> ops;
-    for (const auto & [name, row] : state.committed)
+    for (const auto [name, row] : state.committed)
         ops.push_back(removeCommittedOp(name, row.manifest_ref));
     for (const auto & [name, mref] : state.precommits)
         ops.push_back(removePrecommitOp(name, mref));
