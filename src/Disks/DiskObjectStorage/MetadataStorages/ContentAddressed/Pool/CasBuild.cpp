@@ -524,8 +524,7 @@ void Build::uploadFromSource(ObjectKind kind, const BlobRef & ref, const String 
             return sink->finalize();
         };
 
-        const CasCreateResult res = store->ref_request_controller->conditionalCreateControlled(
-            key, one_attempt, [this] { return store->refAppendFenceOk(); });
+        const CasCreateResult res = store->stagingConditionalCreate(key, one_attempt);
         switch (res.outcome)
         {
             case CasCreateOutcome::Committed:
@@ -783,8 +782,7 @@ ManifestId Build::stageManifest(std::vector<ManifestEntry> entries)
     /// the same fence anyway. There is no ref-table runtime here, so the lane's extra
     /// `superseded_by_remount` term does not apply.
     Token manifest_token;
-    const CasWriteOutcome put_outcome = store->ref_request_controller->putIfAbsentControlled(
-        key, encoded, [this] { return store->refAppendFenceOk(); }, &manifest_token);
+    const CasWriteOutcome put_outcome = store->stagingPutIfAbsent(key, encoded, &manifest_token);
     if (put_outcome == CasWriteOutcome::DefiniteFailure)
         throw Exception(ErrorCodes::ABORTED,
             "stageManifest: part-manifest PUT at '{}' definitively failed (non-retryable rejection); "

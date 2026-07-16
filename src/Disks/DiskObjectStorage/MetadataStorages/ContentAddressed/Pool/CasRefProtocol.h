@@ -14,6 +14,121 @@
 namespace DB::Cas
 {
 
+// ==== Ref-ledger carrier types (moved here from CasStore.h in Phase 3.4 to break the
+//      CasStore.h <-> CasRefLedger.h include cycle; same DB::Cas names, definitions only). ====
+/// Whether a root-shard mutation originates from the writer path (user-visible publish/drop/precommit)
+/// or from GC/maintenance. Diagnostic-only (`toString`, event logging): recorded on the mutation item.
+enum class RootMutationOrigin : uint8_t
+{
+    Writer,
+    Gc,
+};
+
+/// The write-scope of one `appendRefOps` call (ref-append-lane batching): which part of the table the
+/// call touches. The flat-combining batch builder admits at most ONE mutation per ref name into a
+/// single flush (per-ref durable histories stay bit-identical to the unbatched protocol) and flushes
+/// `WholeShard` calls SOLO (dropNamespace and anything touching multiple refs wholesale).
+struct MutationScope
+{
+    enum class Kind : uint8_t { Ref, WholeShard };
+    Kind kind = Kind::WholeShard;
+    String ref_name;   /// set iff kind == Ref
+
+    static MutationScope ref(String name) { return {Kind::Ref, std::move(name)}; }
+    static MutationScope wholeShard() { return {Kind::WholeShard, {}}; }
+};
+
+/// Kind of mutation being applied, used in diagnostic logging and metrics. Does not affect behaviour.
+enum class RootMutationKind : uint8_t
+{
+    Publish,
+    Drop,
+    Precommit,
+    Promote,
+    Abandon,
+    UpdateRefPayload,
+    DropNamespace,
+    ReclaimPrecommit,
+};
+
+/// Human-readable name for `RootMutationOrigin` (diagnostic logging).
+inline std::string_view toString(RootMutationOrigin origin)
+{
+    switch (origin)
+    {
+        case RootMutationOrigin::Writer: return "Writer";
+        case RootMutationOrigin::Gc:     return "Gc";
+    }
+    return "Unknown";
+}
+
+/// Human-readable name for `RootMutationKind` (diagnostic logging).
+inline std::string_view toString(RootMutationKind kind)
+{
+    switch (kind)
+    {
+        case RootMutationKind::Publish:           return "Publish";
+        case RootMutationKind::Drop:              return "Drop";
+        case RootMutationKind::Precommit:         return "Precommit";
+        case RootMutationKind::Promote:           return "Promote";
+        case RootMutationKind::Abandon:           return "Abandon";
+        case RootMutationKind::UpdateRefPayload:  return "UpdateRefPayload";
+        case RootMutationKind::DropNamespace:     return "DropNamespace";
+        case RootMutationKind::ReclaimPrecommit:  return "ReclaimPrecommit";
+    }
+    return "Unknown";
+}
+struct Resolved
+{
+    /// The namespace-qualified identity of the part manifest this ref names. The owning RootNamespace
+    /// + the ref's manifest_ref form the ManifestId (the ref carries no namespace itself — that comes
+    /// from the owning root context, spec §Object Identity And Ownership).
+    ManifestId manifest_id;
+    uint64_t manifest_size = 0;
+    uint64_t published_at_ms = 0;   /// publish wall-clock (epoch ms); 0 = unset
+};
+
+/// The carrier `updateRefPayload`'s mutator edits in place (all-tree-part-files Task 9, spec
+/// 2026-07-14-cas-all-tree-part-files-design.md §3: the mutable-file concept -- and the map this
+/// carrier used to hold -- is gone; every per-part file is now an ordinary manifest tree entry). What
+/// survives is the `published_at_ms` stamp, which is not part of the manifest edge, so `set_payload`
+/// remains the one place it is updated in isolation (e.g. a re-stamp with no content change). The
+/// carrier deliberately carries no `manifest_ref`, so a reachability change is structurally impossible
+/// here -- that goes through publish/drop/repoint instead.
+struct RefPayloadUpdate
+{
+    uint64_t published_at_ms = 0;   /// publish wall-clock (epoch ms); 0 = unset
+};
+
+
+/// What one `Store::dropNamespace` call physically named for removal in its ONE removal transaction
+/// (design 2026-07-13-cas-pool-member-decommission §core): the count of committed refs and precommit
+/// bindings the removal txn's `owner_transition(old, none)` ops covered. Existing callers that only
+/// care about the removal itself may ignore the return value.
+struct DropNamespaceStats
+{
+    uint64_t committed_refs = 0;
+    uint64_t precommits = 0;
+};
+
+/// Per-owner config slice for the ref-ledger subsystem (spec §PoolConfig Slices). A PROJECTION of the
+/// flat `PoolConfig` fields, built on demand by `PoolConfig::refLedgerConfig` and passed BY VALUE to
+/// `CasRefLedger` (Phase 3.4). Lives here (not in `CasStore.h`) so `CasRefLedger.h` can include it
+/// without an include cycle. `server_root_id` is the pool identity string used in the ref-lane's
+/// diagnostic error messages; `boot_ms`/`wait_sleep` are intentionally NOT here -- they reach the
+/// ledger as ctor callbacks (see `MountConfig` + the `CasRefLedger` ctor).
+struct RefLedgerConfig
+{
+    String server_root_id;
+    uint64_t snapshot_log_count_threshold = 256;
+    uint64_t snapshot_log_bytes_threshold = 1ULL << 20;
+    uint64_t snapshot_publish_backoff_initial_ms = 200;
+    uint64_t snapshot_publish_backoff_max_ms = 30000;
+    uint64_t precommit_sweep_backoff_initial_ms = 200;
+    uint64_t precommit_sweep_backoff_max_ms = 30000;
+    uint64_t ref_table_cache_bytes = 256ULL << 20;
+};
+
 /// The in-memory table state (spec §Responsibility Boundary / §Table State):
 /// `TableState = Replay(S_X.state, tail(X))`. This struct, `applyRefLogTxn`, `snapshotOf`, and
 /// `replay` are the ONE shared implementation of that equation -- used verbatim by the writer, its
