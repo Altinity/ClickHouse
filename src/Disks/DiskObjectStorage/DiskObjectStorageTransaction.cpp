@@ -280,89 +280,20 @@ std::unique_ptr<WriteBufferFromFileBase> DiskObjectStorageTransaction::writeFile
 
     WriteSettings enriched_settings = updateIOSchedulingSettings(settings, read_resource_name, write_resource_name);
 
+    /// [TXN-ONE-PIPELINE] Give the metadata storage a chance to own the write (e.g. a content-addressed
+    /// hash-on-write buffer whose blob key is known only after the last byte). It returns a fully-wrapped
+    /// buffer (hash-on-write + append RMW + inline/blob split + autocommit/lifetime pin using `owner`), or
+    /// nullptr to fall through to the generic up-front-key streaming path below. Called BEFORE the append
+    /// check so a CA storage (which reports no native append) can service a verbatim append via
+    /// read-modify-rewrite inside the hook and reject a part-file append there.
+    if (auto buffer = metadata_transaction->tryCreateWriteBuffer(
+            shared_from_this(), path, buf_size, mode, enriched_settings, autocommit))
+        return buffer;
+
     /// NOTE: We check it here and not after writing blob because in case of plain/plain-rewritable metadata storages
     ///       undo of disk tx will actually remove existing data.
-    /// A content-addressed metadata storage reports no native append, but CAN service an append on a
-    /// non-part / table-level VERBATIM file (e.g. the mutation entry mutation_<n>.txt, to which the MVCC
-    /// commit appends the CSN line in afterCommit) by read-modify-rewrite: the file is a verbatim object
-    /// at a stable key and is fully readable, so the existing bytes are carried forward and the new bytes
-    /// written after them (handled in the CA write path below). Append on a CA PART file stays rejected.
-    if (mode == WriteMode::Append && !metadata_storage->supportWritingWithAppend()
-        && !metadata_storage->isContentAddressed())
+    if (mode == WriteMode::Append && !metadata_storage->supportWritingWithAppend())
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Disk does not support WriteMode::Append");
-
-    /// Gated content-addressed write path. For a content-addressed metadata storage the blob key
-    /// is the content hash, which is only known after all bytes have been written, so the up-front
-    /// `generateObjectKeyForPath` + streaming `writeObject` path below cannot be used. Instead we
-    /// delegate to the content-addressed transaction's own buffer, which spills + hashes + uploads
-    /// the content on finalize and records the resulting blob. The manifest + ref are then published
-    /// when `commit` invokes `metadata_transaction->commit` (no `operations_to_execute` entry is
-    /// needed here). This branch leaves every other metadata type's behavior unchanged.
-    if (metadata_storage->isContentAddressed())
-    {
-        auto * content_addressed_transaction = dynamic_cast<ContentAddressedTransaction *>(metadata_transaction.get());
-        if (!content_addressed_transaction)
-            throw Exception(
-                ErrorCodes::LOGICAL_ERROR,
-                "Content-addressed metadata storage did not produce a ContentAddressedTransaction");
-
-        /// Append is serviceable (read-modify-rewrite) only for a non-part / table-level verbatim file.
-        /// A part file is either a content blob (the key is the content hash — append is meaningless) or
-        /// a small inline entry (always rewritten whole), so append on a part-file path is unsupported.
-        if (mode == WriteMode::Append && ContentAddressed::isPartFilePath(path))
-            throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Disk does not support WriteMode::Append for content part files");
-
-        /// Autocommit cannot work for a CONTENT BLOB part file (column data/marks, primary.idx): a
-        /// part's blobs are always written together as one build, whose manifest + ref publish only
-        /// when `commit` invokes `metadata_transaction->commit` -- the buffer finalize alone does not
-        /// trigger that. Non-part / table-level files (e.g. format_version.txt) are written verbatim to
-        /// a direct object key and are durable on finalize with no commit involvement, so autocommit is
-        /// fine for them.
-        ///
-        /// A small INLINE-eligible part file (uuid.txt / metadata_version.txt / txn_version.txt and
-        /// their atomic-write .tmp siblings, checksums.txt, columns.txt, ...) IS autocommittable: it is
-        /// a standalone one-shot write, never part of a multi-file part build, so wrap the inline
-        /// buffer in a finalize callback that commits this one-shot transaction. All-tree-part-files
-        /// Task 4/9: the write lands as an ordinary manifest entry; if the ref is already committed,
-        /// `publishStaging`'s repoint branch carries the rest of the part forward and republishes once
-        /// -- this is the path that makes transactional INSERT's creation-CSN fill-in, removal-TID
-        /// rewrite, and rollback work on a content-addressed disk (formerly the MVCC layer's dedicated
-        /// "mutable per-part file" concept; the predicate that scoped it to three hardcoded names is
-        /// gone, so the boundary is now simply "not a content blob").
-        if (autocommit && ContentAddressed::isPartFilePath(path))
-        {
-            auto p = ContentAddressed::parsePartFilePath(path);
-            if (!p || p->file.empty() || ContentAddressed::partFileMustStayBlob(p->file))
-                throw Exception(
-                    ErrorCodes::NOT_IMPLEMENTED,
-                    "Autocommit writes are not supported for content part files on a content-addressed disk");
-
-            auto inner = content_addressed_transaction->writeFile(path, buf_size, mode, enriched_settings);
-            auto commit_callback = [disk_tx = shared_from_this()](size_t) mutable { disk_tx->commit(); };
-            return std::make_unique<WriteBufferWithFinalizeCallback>(
-                std::move(inner), std::move(commit_callback), path, /*create_blob_if_empty=*/true);
-        }
-
-        /// The returned buffer (a ContentAddressedWriteBuffer for a content blob, or a
-        /// ContentAddressedInlineWriteBuffer for a non-autocommit small entry) captures a bare
-        /// `[this]` of `content_addressed_transaction` in its finalize / pin-blob callbacks
-        /// (on_finalized -> recorded[...], on_pin_blob -> recordBlobInSession -> persistSession reading
-        /// `this->session`). These buffers are deferred-finalized: MergedBlockOutputStream's Finalizer
-        /// stores them and calls finish() LATER, possibly from another thread or after the part storage /
-        /// transaction would otherwise be torn down on an async-insert / cancel / exception-unwind path. If
-        /// the buffer outlives the transaction, that `[this]` dangles -> persistSession touches a freed
-        /// session -> heap corruption (the suspected CA-S3 SIGSEGV). Mirror the autocommit branch above
-        /// (and the verbatim branch below): pin the DiskObjectStorageTransaction via
-        /// `disk_tx = shared_from_this()` for the lifetime of the returned buffer. Because this transaction
-        /// owns `metadata_transaction` (the ContentAddressedTransaction) by shared_ptr, holding `disk_tx`
-        /// keeps that `[this]` valid until the buffer (and so this callback) is destroyed after finalize.
-        /// No cycle: the transaction does not hold the buffer, so releasing the callback releases the
-        /// transaction.
-        auto inner = content_addressed_transaction->writeFile(path, buf_size, mode, enriched_settings);
-        auto keep_alive_callback = [disk_tx = shared_from_this()](size_t) mutable {};
-        return std::make_unique<WriteBufferWithFinalizeCallback>(
-            std::move(inner), std::move(keep_alive_callback), path, /*create_blob_if_empty=*/true);
-    }
 
     StoredObject object(metadata_transaction->generateObjectKeyForPath(path).serialize(), path);
     ForkWriteBuffer::WriteBufferPtrs writers;

@@ -57,7 +57,16 @@ public:
 
     void createMetadataFile(const std::string & path, const StoredObjects & objects) override;
 
-    /// The disk-layer write entry (DiskObjectStorageTransaction's CA branch calls this directly).
+    /// [TXN-ONE-PIPELINE] The generic write-buffer hook (`DiskObjectStorageTransaction::writeFileImpl`
+    /// calls this): CA owns its write because a blob key is a content hash, known only after the last
+    /// byte. Returns the fully-wrapped buffer (hash-on-write + append RMW + inline/blob split +
+    /// autocommit/lifetime pin via `owner`).
+    std::unique_ptr<WriteBufferFromFileBase> tryCreateWriteBuffer(
+        const std::shared_ptr<IDiskTransaction> & owner,
+        const std::string & path, size_t buf_size, WriteMode mode,
+        const WriteSettings & settings, bool autocommit) override;
+
+    /// The inner content-addressed write buffer (hash-on-write / inline). `tryCreateWriteBuffer` wraps it.
     std::unique_ptr<WriteBufferFromFileBase> writeFile(
         const std::string & path,
         size_t buf_size,

@@ -8,6 +8,8 @@
 #include <IO/ReadBufferFromMemory.h>
 #include <IO/WriteBufferFromFile.h>
 #include <IO/copyData.h>
+#include <Disks/IO/WriteBufferWithFinalizeCallback.h>
+#include <Disks/IDiskTransaction.h>
 #include <Common/thread_local_rng.h>
 #include <Common/config_version.h>
 #include <algorithm>
@@ -615,6 +617,51 @@ std::string ContentAddressedTransaction::buildS3StagingBlobHeader(
     /// The v3 codec pads to the pool's fixed header length and TRUNCATES a too-long intended_ref
     /// internally (it is diagnostic-only), so the old drop-and-retry is gone — one encode call.
     return Cas::encodeEnvelopeHeader(header, static_cast<uint32_t>(meta.blob_header_len));
+}
+
+std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::tryCreateWriteBuffer(
+    const std::shared_ptr<IDiskTransaction> & owner,
+    const std::string & path, size_t buf_size, WriteMode mode,
+    const WriteSettings & settings, bool autocommit)
+{
+    /// [TXN-ONE-PIPELINE] CA owns the write (moved verbatim from the disk layer's former CA write block).
+    /// Append is serviceable (read-modify-rewrite) only for a non-part / table-level verbatim file
+    /// (handled inside writeFile). A part file is a content blob or a whole-rewritten inline entry, so
+    /// append on a part-file path is unsupported.
+    if (mode == WriteMode::Append && ContentAddressed::isPartFilePath(path))
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Disk does not support WriteMode::Append for content part files");
+
+    /// Autocommit cannot work for a CONTENT BLOB part file (column data/marks, primary.idx): a part's
+    /// blobs are always written together as one build, whose manifest + ref publish only when commit()
+    /// runs. A small INLINE-eligible part file IS autocommittable (a standalone one-shot write): the write
+    /// lands as an ordinary manifest entry and, if the ref is already committed, `publishStaging`'s repoint
+    /// branch carries the rest of the part forward and republishes once (the transactional-INSERT
+    /// creation-CSN fill-in / removal-TID rewrite / rollback path). Verbatim / table-level files (not part
+    /// files) are durable on finalize regardless of `autocommit`.
+    if (autocommit && ContentAddressed::isPartFilePath(path))
+    {
+        auto p = ContentAddressed::parsePartFilePath(path);
+        if (!p || p->file.empty() || ContentAddressed::partFileMustStayBlob(p->file))
+            throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+                "Autocommit writes are not supported for content part files on a content-addressed disk");
+
+        auto inner = writeFile(path, buf_size, mode, settings);
+        auto commit_callback = [owner](size_t) mutable { owner->commit(); };
+        return std::make_unique<WriteBufferWithFinalizeCallback>(
+            std::move(inner), std::move(commit_callback), path, /*create_blob_if_empty=*/true);
+    }
+
+    /// Non-autocommit (or verbatim autocommit): pin the owning disk transaction for the returned buffer's
+    /// lifetime. The CA write buffers capture a bare `this` in their deferred finalize / pin-blob callbacks;
+    /// MergedBlockOutputStream may finalize them LATER (another thread, or after the part storage /
+    /// transaction would otherwise be torn down on async-insert / cancel / exception-unwind). Holding
+    /// `owner` (which owns this ContentAddressedTransaction by shared_ptr) keeps that `this` valid until the
+    /// buffer — and so this callback — is destroyed after finalize (the B90 CA-S3 lifetime fix, now
+    /// expressed generically via `owner`). No cycle: the transaction does not hold the buffer.
+    auto inner = writeFile(path, buf_size, mode, settings);
+    auto keep_alive_callback = [owner](size_t) mutable {};
+    return std::make_unique<WriteBufferWithFinalizeCallback>(
+        std::move(inner), std::move(keep_alive_callback), path, /*create_blob_if_empty=*/true);
 }
 
 std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(

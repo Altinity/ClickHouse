@@ -27,6 +27,8 @@ namespace ErrorCodes
     extern const int NOT_IMPLEMENTED;
 }
 
+struct IDiskTransaction;
+
 /// Tries to provide some "transactions" interface, which allow
 /// to execute (commit) operations simultaneously. We don't provide
 /// any snapshot isolation here, so no read operations in transactions
@@ -114,6 +116,16 @@ public:
     {
         throwNotImplemented();
     }
+
+    /// [TXN-ONE-PIPELINE] Optional per-metadata write buffer. Returns a ready-to-use buffer when the
+    /// metadata implementation owns its write mechanism (e.g. a content-addressed hash-on-write buffer
+    /// whose blob key is known only after the last byte). `owner` is the disk transaction that must be
+    /// kept alive for the returned buffer's lifetime and, when `autocommit`, committed from the finalize
+    /// callback. Default nullptr: the caller uses the generic streaming write path unchanged.
+    virtual std::unique_ptr<WriteBufferFromFileBase> tryCreateWriteBuffer(
+        const std::shared_ptr<IDiskTransaction> & /*owner*/,
+        const std::string & /*path*/, size_t /*buf_size*/, WriteMode /*mode*/,
+        const WriteSettings & /*settings*/, bool /*autocommit*/) { return nullptr; }
 
     /// Metadata related methods
 
