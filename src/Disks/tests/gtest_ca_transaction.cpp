@@ -190,6 +190,26 @@ TEST(CaTransactionLockScope, ReadYourWritesAfterReKey)
     EXPECT_TRUE(ca_tx.hasInFlightDirectory("uui/uuid-3/all_1_1_0/p.proj"));
 }
 
+/// [TXN-ONE-PIPELINE] Program order in the overlay: create -> delete -> create leaves the file PRESENT
+/// (no delayed delete fires after the later create); delete of a staged file makes it absent to reads.
+TEST(CaTransactionLockScope, OverlayProgramOrder)
+{
+    auto storage = openTxStorage();
+    auto tx = storage->createTransaction();
+    auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
+
+    writeFileTx(*tx, "uui/uuid-5/tmp_insert_all_1_1_0/a.txt", "v1");
+    ca_tx.unlinkFile("uui/uuid-5/tmp_insert_all_1_1_0/a.txt", /*if_exists=*/false, /*should_remove_objects=*/true);
+    EXPECT_EQ(ca_tx.tryReadFileInFlight("uui/uuid-5/tmp_insert_all_1_1_0/a.txt", DB::ReadSettings{}, std::nullopt), nullptr);
+
+    writeFileTx(*tx, "uui/uuid-5/tmp_insert_all_1_1_0/a.txt", "v2");
+    tx->moveDirectory("uui/uuid-5/tmp_insert_all_1_1_0", "uui/uuid-5/all_1_1_0");
+    tx->commit(DB::NoCommitOptions{});
+
+    ASSERT_TRUE(storage->existsFile("uui/uuid-5/all_1_1_0/a.txt"));
+    EXPECT_EQ(storage->getFileSize("uui/uuid-5/all_1_1_0/a.txt"), 2u);
+}
+
 /// Plan 2d: a small eager metadata file (checksums.txt) is staged INLINE — it rides the single tree
 /// object (one-GET part open) — while per-column data (data.bin) stays a standalone Blob (preserving
 /// column-read selectivity). The inlined file is still readable through the normal read path.
