@@ -22,6 +22,19 @@ inline constexpr std::string_view kShadowDirName = "shadow";
 /// (the PoC contract, B36); the transaction/read routing re-splits it.
 inline constexpr std::string_view kDetachedDirName = "detached";
 
+/// The MergeTree part-mover staging directory (`MergeTreeData::MOVING_DIR_NAME`,
+/// `MergeTreeData.h`). A part being relocated to another disk (explicit `ALTER … MOVE
+/// PART|PARTITION`, or a background TTL/policy move) is cloned under TABLE/moving/<part>/
+/// before the atomic rename into its final place. `parsePartFilePath` reports such a path with
+/// part_name == kMovingDirName and the real part dir as the FIRST component of `file` -- the
+/// exact same shape `kDetachedDirName` already produces (the PoC contract, B36), for free, on
+/// the Atomic layout (no parser change needed there: "moving" already lands on `part_idx`
+/// because it is the component right after the table <uuid>, same as "detached"). Unlike
+/// detached, `route()` folds this DIRECTLY onto the part's FINAL live ref (no prefix): the
+/// destination CA transaction publishes under that final identity, so the later
+/// moveDirectory(moving/<part> -> <part>) collapses to a same-key no-op.
+inline constexpr std::string_view kMovingDirName = "moving";
+
 /// B181: detached parts live INSIDE the table's OWN archive namespace as refs keyed by this
 /// prefix — `detached/PART` versus a live `PART`. One namespace per table; the live-vs-detached
 /// name collision is impossible because the ref names differ. The routing prepends this to the

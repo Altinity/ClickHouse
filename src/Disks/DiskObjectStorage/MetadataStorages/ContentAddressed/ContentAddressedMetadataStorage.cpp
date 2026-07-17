@@ -657,6 +657,17 @@ ContentAddressedMetadataStorage::route(const ContentAddressed::PartFilePath & p)
         r.file = file;
         return r;
     }
+    if (p.part_name == ContentAddressed::kMovingDirName)
+    {
+        /// L1 (MOVE-to-CA fix): re-split exactly like detached, but fold onto the part's FINAL
+        /// live ref directly -- no "moving/" prefix. An empty p.file (the bare <table>/moving
+        /// container dir) yields an empty ref, same convention as the detached container.
+        r.ns = liveNamespace(p.table_uuid);
+        auto [part, file] = splitFirstComponent(p.file);
+        r.ref = part;
+        r.file = file;
+        return r;
+    }
     r.ns = liveNamespace(p.table_uuid);
     r.ref = p.part_name;
     r.file = p.file;

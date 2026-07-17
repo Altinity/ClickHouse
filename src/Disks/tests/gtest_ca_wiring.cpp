@@ -136,6 +136,17 @@ TEST(CaPartPathParser, DetachedPathsReportTheSharedDetachedComponent)
     EXPECT_EQ(d->file, "attaching_all_0_0_0/metadata_version.txt");
 }
 
+TEST(CaPartPathParser, MovingPathsReportTheSharedMovingComponent)
+{
+    // Atomic layout: "moving" lands on part_idx for free (it is the component right after the
+    // table <uuid>, same mechanism as "detached" -- no parser change needed here, only route()).
+    auto d = parsePartFilePath("uui/uuid-1/moving/all_1_1_0/data.bin");
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(d->table_uuid, "uuid-1");
+    EXPECT_EQ(d->part_name, std::string(kMovingDirName));
+    EXPECT_EQ(d->file, "all_1_1_0/data.bin");
+}
+
 TEST(CaPartPathParser, DetachedPathsNonAtomicFoldIntoTheTableNamespace)
 {
     // U#6: the Ordinary/non-Atomic detached form data/<db>/<table>/detached/<part>/<file> must fold
@@ -535,6 +546,35 @@ TEST(CaWiringRoute, DetachedFoldsIntoTableNamespaceWithPrefixedRef)
     ASSERT_TRUE(rc.has_value());
     EXPECT_EQ(rc->ns.string(), storage->liveNamespace("uuid-1").string());
     EXPECT_EQ(rc->ref, "detached/broken_all_1_1_0");
+    EXPECT_TRUE(rc->file.empty());
+}
+
+TEST(CaWiringRoute, MovingFoldsOntoTheFinalLiveRefWithoutPrefix)
+{
+    /// L1 (MOVE-to-CA fix): the mover clones a part under TABLE/moving/<part>/ before the
+    /// atomic rename into place. Unlike `detached`, a moved part must resolve DIRECTLY onto its
+    /// final live ref (no prefix) -- the destination CA transaction publishes under that final
+    /// identity, so the later moveDirectory(moving/<part> -> <part>) collapses to a same-key
+    /// no-op instead of colliding with every other part on the shared ref "moving".
+    auto storage = openWiringStorage();
+    auto p = parsePartFilePath("store/uui/uuid-1/moving/all_1_1_0/data.bin");
+    ASSERT_TRUE(p.has_value());
+    EXPECT_EQ(p->part_name, std::string(kMovingDirName));
+    EXPECT_EQ(p->file, "all_1_1_0/data.bin");
+
+    auto r = storage->route(*p);
+    ASSERT_TRUE(r.has_value());
+    EXPECT_EQ(r->ns.string(), storage->liveNamespace("uuid-1").string());
+    EXPECT_EQ(r->ref, "all_1_1_0");
+    EXPECT_EQ(r->file, "data.bin");
+
+    /// The bare moving CONTAINER dir TABLE/moving routes to the table ns with an empty ref.
+    auto pc = parsePartFilePath("store/uui/uuid-1/moving");
+    ASSERT_TRUE(pc.has_value());
+    auto rc = storage->route(*pc);
+    ASSERT_TRUE(rc.has_value());
+    EXPECT_EQ(rc->ns.string(), storage->liveNamespace("uuid-1").string());
+    EXPECT_TRUE(rc->ref.empty());
     EXPECT_TRUE(rc->file.empty());
 }
 
