@@ -1,6 +1,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h>
 
 #include <Common/Exception.h>
+#include <Common/LoggingHelpers.h>
 #include <Common/ProfileEvents.h>
 #include <Common/logger_useful.h>
 
@@ -199,13 +200,31 @@ void validateCasRequestBudget(const CasRequestBudget & budget, uint64_t mount_le
         mount_lease_ttl_ms, mount_renew_period_ms);
 }
 
+namespace
+{
+/// Shared by both public entry points below so the log line and the exception's message text can
+/// never drift apart. Rate-limited (not per-distinct-`why` -- `LogSeriesLimiter` keys on the LOGGER
+/// NAME only, so under a sustained outage where `why` keeps changing slightly, only the first message
+/// in each window prints; this is the intended throttle, not a bug). Raised from the old implicit
+/// Information-level visibility (fix #37 phase 3) to Warning: this condition is expected to self-heal
+/// (the caller retries), but an operator watching CAS logs directly should see it without having to
+/// know to look at system.replication_queue.
+void logCasWriteRetryLater(const String & why)
+{
+    LogSeriesLimiter log(getLogger("CasWriteRetryLater"), /*allowed_count=*/1, /*interval_s=*/30);
+    LOG_WARNING(log, "CAS write could not be committed ({}); retrying later", why);
+}
+}
+
 [[noreturn]] void throwCasWriteRetryLater(const String & why)
 {
+    logCasWriteRetryLater(why);
     throw Exception(ErrorCodes::NETWORK_ERROR, "CAS write could not be committed ({}); retrying later", why);
 }
 
 std::exception_ptr makeCasWriteRetryLaterExceptionPtr(const String & why)
 {
+    logCasWriteRetryLater(why);
     return std::make_exception_ptr(
         Exception(ErrorCodes::NETWORK_ERROR, "CAS write could not be committed ({}); retrying later", why));
 }
