@@ -1,6 +1,3 @@
--- Tags: no-parallel-replicas
--- Tag no-parallel-replicas: decorrelation can't clone ReadFromPreparedSource on 25.8 (NOT_IMPLEMENTED). See Altinity/ClickHouse#2051.
-
 -- Constraint reduction can collapse a filter into a bare correlated subquery
 -- (here `b < d` is always false given the constraint, leaving only the subquery).
 -- A correlated subquery used as a whole predicate cannot be decorrelated, so the
