@@ -342,3 +342,36 @@ Every attempted scenario run is appended here (newest at the bottom). `run_dir` 
 | 2026-07-14T13:54:49 | S13 | 42 | dev | 900s | pass | 2d3d57c549a5 | 20260714T134837_S13_seed42 |  |
 | 2026-07-14T13:58:15 | S15 | 42 | dev | 900s | pass | 2d3d57c549a5 | 20260714T135545_S15_seed42 |  |
 | 2026-07-14T13:59:21 | S18 | 42 | dev | 900s | pass | 2d3d57c549a5 | 20260714T135815_S18_seed42 |  |
+| 2026-07-15T10:30:19 | S03 | 1 | dev | 900s | inconclusive | 47ce91e05eb9 | 20260715T102739_S03_seed1 |  |
+| 2026-07-16T18:20:48 | S36 | 1 | dev | 900s | fail | e3a165dfa15d | 20260716T181544_S36_seed1 | cluster did not become healthy after reset |
+| 2026-07-16T20:05:05 | S36 | 1 | dev | 900s | fail | e3a165dfa15d | 20260716T200002_S36_seed1 | cluster did not become healthy after reset |
+| 2026-07-16T20:19:22 | S36 | 1 | dev | 900s | fail | e3a165dfa15d | 20260716T201906_S36_seed1 | Node(localhost:8123) HTTP 500: Code: 236. DB::Exception: promote: ref 'moving' already names a different committed manifest — refusing to overwrite (unique-ref invariant; use republishRef for an intended repoint). (ABORTED) (version 26.6.1.1) / sql=ALTER TABLE s36_move MOVE PART '0_0_0_0' TO DISK 'ca' |
+| 2026-07-16T20:39:15 | S37 | 1 | dev | 900s | fail | 03f6da7a1ec3 | 20260716T203706_S37_seed1 |  |
+| 2026-07-17T00:25:03 | S36 | 1 | dev | 900s | fail | e114f8c88e9c | 20260717T002305_S36_seed1 |  |
+| 2026-07-17T00:43:01 | S36 | 1 | dev | 900s | pass | 26590e4aa55f | 20260717T004047_S36_seed1 |  |
+| 2026-07-17T00:45:32 | S37 | 1 | dev | 900s | fail | 26590e4aa55f | 20260717T004323_S37_seed1 |  |
+| 2026-07-17T00:50:22 | S37 | 1 | dev | 900s | fail | 93bb65eb8e82 | 20260717T005005_S37_seed1 | Node(localhost:8124) HTTP 400: Code: 36. DB::Exception: Table doesn't have any table TTL expression, cannot remove. (BAD_ARGUMENTS) (version 26.6.1.1) / sql=ALTER TABLE s37_ttl REMOVE TTL |
+| 2026-07-17T00:54:37 | S37 | 1 | dev | 900s | fail | a2c420d1fd26 | 20260717T005228_S37_seed1 |  |
+| 2026-07-17T01:51:43 | S39 | 1 | dev | 900s | fail | 58b4d1b8759c | 20260717T015047_S39_seed1 | Node(localhost:8123) HTTP 500: Code: 210. DB::Exception: CAS write could not be committed (stageManifest: part-manifest PUT at 'soak_pool/cas/manifests/ca_soak_ch1/store/c94/c945a7a9-4578-4b78-bdd0-6ec0e42ead78@cas@/0000000000000001-000000000000000b/000001.zst' is UNCERTAIN (retry budget exhausted) — nothing conclusive was named; the caller re-stages with a fresh ManifestId); retrying later. (NETWORK_ERROR) (version 26.6.1.1) / sql=INSERT INTO s39_lease SELECT 4000 + number AS id, randomString(512) AS payload FROM numbers(500) |
+| 2026-07-17T02:02:35 | S39 | 1 | dev | 900s | fail | 3104f162abd4 | 20260717T020015_S39_seed1 | Node(localhost:8123) HTTP 500: Code: 210. DB::Exception: CAS write could not be committed (stageManifest: part-manifest PUT at 'soak_pool/cas/manifests/ca_soak_ch1/store/2a7/2a740e92-6007-4b67-b9f5-20062b1be4a7@cas@/0000000000000001-000000000000000d/000001.zst' is UNCERTAIN (retry budget exhausted) — nothing conclusive was named; the caller re-stages with a fresh ManifestId); retrying later. (NETWORK_ERROR) (version 26.6.1.1) / sql=INSERT INTO s39_lease SELECT 8000 + number AS id, randomString(512) AS payload FROM numbers(500) |
+| 2026-07-17T02:11:50 | S39 | 1 | dev | 900s | fail | 82bec8e77655 | 20260717T020400_S39_seed1 | quiescence failed: Node(localhost:8124) HTTP 404: Code: 60. DB::Exception: Table default.s39_lease does not exist. (UNKNOWN_TABLE) (version 26.6.1.1) / sql=SYSTEM SYNC REPLICA s39_lease |
+| 2026-07-17T02:21:07 | S39 | 1 | dev | 900s | pass | 8e39ea2fba4d | 20260717T021323_S39_seed1 |  |
+| 2026-07-17T02:23:46 | S37 | 1 | dev | 900s | fail | 8e39ea2fba4d | 20260717T022127_S37_seed1 |  |
+| 2026-07-17T03:35:04 | S01 | 1 | ci | 900s | fail | cdac5ce8409c | 20260717T033430_S01_seed1 | S01 peak RSS grew 531 MiB during a 512 MiB blob upload — investigate Build::putBlob materializing BlobSource into a String before putIfAbsentStream (README known first investigation target) |
+| 2026-07-17T03:35:44 | S02 | 1 | ci | 900s | pass | cdac5ce8409c | 20260717T033504_S02_seed1 |  |
+| 2026-07-17T03:40:19 | S03 | 1 | ci | 900s | inconclusive | cdac5ce8409c | 20260717T033545_S03_seed1 |  |
+| 2026-07-17T03:42:09 | S04 | 1 | ci | 900s | inconclusive | 314489f00c5d | 20260717T034019_S04_seed1 |  |
+| 2026-07-17T03:50:30 | S05 | 1 | ci | 900s | inconclusive | 314489f00c5d | 20260717T034209_S05_seed1 |  |
+| 2026-07-17T03:53:07 | S06 | 1 | ci | 900s | inconclusive | 314489f00c5d | 20260717T035030_S06_seed1 |  |
+| 2026-07-17T03:55:49 | S07 | 1 | ci | 900s | inconclusive | 314489f00c5d | 20260717T035307_S07_seed1 | S07 could not trigger a manifest cap with dev-scale SQL — recorded inconclusive for the direct cap trip; the indirect fail-closed property check still runs. |
+| 2026-07-17T04:11:42 | S09 | 1 | ci | 900s | pass | 314489f00c5d | 20260717T041049_S09_seed1 |  |
+| 2026-07-17T04:12:42 | S10 | 1 | ci | 900s | inconclusive | 314489f00c5d | 20260717T041142_S10_seed1 |  |
+| 2026-07-17T04:19:49 | S11 | 1 | ci | 900s | inconclusive | 314489f00c5d | 20260717T041242_S11_seed1 |  |
+| 2026-07-17T04:22:20 | S12 | 1 | ci | 900s | pass | 314489f00c5d | 20260717T041949_S12_seed1 |  |
+| 2026-07-17T09:14:10 | S40 | 1 | ci | 900s | pass | 77484196b0d5 | 20260717T090957_S40_seed1 | quiescence failed: <urlopen error [Errno 111] Connection refused> |
+| 2026-07-17T09:49:38 | S39 | 1 | ci | 900s | fail | 01b5ec7deeb5 | 20260717T094921_S39_seed1 | leg A's fault window must be shorter than the renew period so it can overlap AT MOST one renewal beat -- a window >= the renew period can fault two consecutive beats and (correctly) near the lease deadline, which is leg B's job, not leg A's |
+| 2026-07-17T09:54:31 | S39 | 1 | dev | 900s | pass | 01b5ec7deeb5 | 20260717T095134_S39_seed1 |  |
+| 2026-07-17T09:57:12 | S36 | 1 | dev | 900s | pass | e08fb29bc7d3 | 20260717T095448_S36_seed1 |  |
+| 2026-07-17T09:59:21 | S37 | 1 | dev | 900s | fail | e08fb29bc7d3 | 20260717T095712_S37_seed1 |  |
+| 2026-07-17T09:43:29 | dl_probe | - | - | ~300s | pass | 01b5ec7deeb5 | build/test_dl_probe_postfix.log | acked-then-lost regression gate (T4 Step 1, original reproducer, tracked in tools/); submitted=2466 acked=2466 PRESENT=2466 LOST(acked-but-absent)=0 (pre-fix baseline was ~198/1314 lost); ch2 exited post-pause (known B200, tolerated, does not affect LOST) |
+| 2026-07-17T09:59:29 | soak-phase3 | 42 | full | 1200s | pass | e08fb29bc7d3 | build/test_soak_postfix.log | T4 Step 4: 20m row-count-oracle soak, sync inserts, seed=42 (the chaos recipe that originally exposed R4's loss); recovery + final converge checkpoints all OK (count=813264, fsck reachable=974 unreachable=0 dangling=0 dryrun_count=0); checkpoint model==observed, no deficit; ABORTED-retried INSERT attempts=0 (node_down=81 driver-retried, all recovered) |
