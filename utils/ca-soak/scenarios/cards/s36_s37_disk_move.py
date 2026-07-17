@@ -284,9 +284,20 @@ class S36(Scenario):
                                  fsck_off_ca.get("dangling"), fsck_off_ca.get("dangling") == 0))
 
         # OFF-CA drops the CAS refs the two moved parts held; deferred GC must reclaim that content
-        # within a bounded number of rounds (no permanent orphans).
+        # (no permanent orphans). Mirrors checkpoint.end_checkpoint's two-step drive: a bounded
+        # residual after forced_gc_to_fixpoint is typically CONDEMNED content (fsck pending-gc) that
+        # only graduates once the ack floor advances via each server's periodic retired-view sync
+        # (~mount_renew_period) -- which forced_gc_to_fixpoint's faster poll can outrun, reporting a
+        # "stable" but nonzero residual as if it were the true fixpoint. drain_condemned_pipeline
+        # drives that graduation to completion; only a residual that survives BOTH steps is a real
+        # leak.
         residual, history = gc_mod.forced_gc_to_fixpoint(
             cl, lifecycle.unreachable_probe(), log_fn=ctx.log)
+        if residual and residual > 0:
+            ctx.log(f"S36: draining condemned graduation pipeline after OFF-CA move (residual={residual})")
+            residual, drain_hist = gc_mod.drain_condemned_pipeline(
+                cl, lifecycle.unreachable_probe(), log_fn=ctx.log)
+            history = history + drain_hist
         result.observations["gc_after_off_ca"] = {"residual": residual, "rounds": len(history),
                                                    "history": history}
         result.add(Verdict.check(
@@ -315,23 +326,36 @@ class S36(Scenario):
         cl.node1.command(f"SYSTEM SYNC REPLICA {dedup_table_a}", timeout=120)
         cl.node1.command(f"SYSTEM SYNC REPLICA {dedup_table_b}", timeout=120)
 
-        # Move table A's part to CA first -- pays the real upload cost. Table B's part is
-        # byte-identical, so ITS move must dedup-resolve the blobs instead of re-uploading them.
+        # A/B differential: table A's move pays the real upload cost (CasBlobPut > 0 in ITS OWN
+        # window); table B's byte-identical move must then dedup-resolve those same blobs instead
+        # of re-uploading them (CasBlobPut == 0 in ITS OWN window). CasBlobPutDedup is recorded as
+        # an observation only, not a pass-condition: when the dedup resolves above the per-blob
+        # path (identical whole-part manifest), that counter never increments even though B
+        # correctly performed zero uploads -- the real requirement is "did not re-upload", which
+        # CasBlobPut captures directly.
+        counters_dedup_a = _common.counters_window(ctx)
         cl.node1.command(f"ALTER TABLE {dedup_table_a} MOVE PARTITION ID 'all' TO DISK 'ca'", timeout=300)
+        delta_a = counters_dedup_a().get("_total", {})
+        a_puts = int(delta_a.get("CasBlobPut", 0))
+        a_dedup_puts = int(delta_a.get("CasBlobPutDedup", 0))
 
-        counters_dedup = _common.counters_window(ctx)
+        counters_dedup_b = _common.counters_window(ctx)
         cl.node1.command(f"ALTER TABLE {dedup_table_b} MOVE PARTITION ID 'all' TO DISK 'ca'", timeout=300)
-        dedup_delta = counters_dedup().get("_total", {})
-        raw_puts = int(dedup_delta.get("CasBlobPut", 0))
-        dedup_puts = int(dedup_delta.get("CasBlobPutDedup", 0))
-        result.observations["dedup_on_to_ca_counters"] = {"CasBlobPut": raw_puts, "CasBlobPutDedup": dedup_puts}
-        dedup_ok = dedup_puts > 0 and raw_puts == 0
+        delta_b = counters_dedup_b().get("_total", {})
+        b_puts = int(delta_b.get("CasBlobPut", 0))
+        b_dedup_puts = int(delta_b.get("CasBlobPutDedup", 0))
+
+        result.observations["dedup_on_to_ca_counters"] = {
+            "table_a_CasBlobPut": a_puts, "table_a_CasBlobPutDedup": a_dedup_puts,
+            "table_b_CasBlobPut": b_puts, "table_b_CasBlobPutDedup": b_dedup_puts,
+        }
+        dedup_ok = a_puts > 0 and b_puts == 0
         result.add(Verdict.check(
             "MOVE TO-CA of byte-identical content dedups instead of re-uploading",
-            "CasBlobPutDedup > 0 and CasBlobPut == 0 for the second (duplicate) move",
-            f"CasBlobPut={raw_puts} CasBlobPutDedup={dedup_puts}", dedup_ok,
+            "table A uploads (CasBlobPut>0) and table B's byte-identical move does not (CasBlobPut==0)",
+            f"table_a CasBlobPut={a_puts} / table_b CasBlobPut={b_puts}", dedup_ok,
             "" if dedup_ok else
-            "the second MOVE of byte-identical content re-uploaded blobs instead of dedup-resolving them"))
+            "table A's real upload or table B's dedup-skip did not happen as expected"))
 
         oracle_dedup_a = cl.node1.query(sql.table_checksum_query(dedup_table_a)).strip()
         oracle_dedup_b = cl.node1.query(sql.table_checksum_query(dedup_table_b)).strip()
