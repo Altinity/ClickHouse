@@ -186,11 +186,6 @@
   message: 'Not found column __table1.'
   check_types:
   - DatabaseReplicated
-- name: 01710_projection_additional_filters
-  reason: 'KNOWN: Upstream issue ClickHouse#104219; fixed upstream ClickHouse#104296, not backported to 25.8. See Altinity/ClickHouse#2054.'
-  message: result differs with reference
-  check_types:
-  - ParallelReplicas
 
 # Regex rules should be ordered from most specific to least specific.
 # regex: true applies to name, message, and not_message fields, but not to reason or check_types fields.
