@@ -610,7 +610,8 @@ MountLeaseKeeper::MountLeaseKeeper(
     BackendPtr backend_, const Layout & layout_, const String & srid_, UInt128 server_uuid_,
     uint64_t writer_epoch_, std::chrono::milliseconds ttl_, std::function<uint64_t()> now_ms_fn_,
     std::function<uint64_t()> min_active_fn_,
-    CasEventSink event_sink_)
+    CasEventSink event_sink_,
+    std::chrono::milliseconds lease_safety_margin_)
     : SingleWriterSlot(std::move(backend_), layout_.mountKey(srid_), "mount-lease", "release", "CasMountLeaseKeeper")
     , srid(srid_)
     , server_uuid(server_uuid_)
@@ -619,7 +620,23 @@ MountLeaseKeeper::MountLeaseKeeper(
     , now_ms_fn(std::move(now_ms_fn_))
     , min_active_fn(std::move(min_active_fn_))
     , event_sink(std::move(event_sink_))
+    , lease_safety_margin(lease_safety_margin_)
 {
+}
+
+void MountLeaseKeeper::refreshConfirmedDeadline()
+{
+    confirmed_deadline_ms = now_ms_fn() + static_cast<uint64_t>(ttl.count());
+}
+
+bool MountLeaseKeeper::shouldFenceOnTransientRenewFailure()
+{
+    /// Defensive: should never observe 0 here (see the member's doc comment) -- fail closed if it ever did.
+    if (confirmed_deadline_ms == 0)
+        return true;
+    const uint64_t now = now_ms_fn();
+    const uint64_t margin = static_cast<uint64_t>(lease_safety_margin.count());
+    return now + margin >= confirmed_deadline_ms;
 }
 
 SingleWriterSlot::RenewPayload MountLeaseKeeper::prepareRenew() const
@@ -663,6 +680,7 @@ SingleWriterSlot::Token MountLeaseKeeper::claim(const String & body)
                 "CAS mount-lease: key '{}' appeared between head and putIfAbsent — concurrent writer on our mount slot", key);
         emitMountEvent(event_sink, CasEventType::MountClaim, srid, "mint", nullptr,
             "mount slot absent — keeper minted it directly (no prior claimMount)");
+        refreshConfirmedDeadline();
         return res.token;
     }
 
@@ -740,13 +758,16 @@ SingleWriterSlot::Token MountLeaseKeeper::claim(const String & body)
     }
     emitMountEvent(event_sink, CasEventType::MountClaim, srid, "adopt", &observed,
         "adopted our own already-live (uuid, epoch) mount slot");
+    refreshConfirmedDeadline();
     return res.token;
 }
 
 void MountLeaseKeeper::onRenewSucceeded()
 {
-    /// A successful background renew extended the durable lease. Refresh the local write-fence
-    /// deadline (the Pool translates this to `steady_clock::now() + ttl`, monotonic). No S3 read.
+    /// A successful background renew extended the durable lease. Refresh OUR OWN confirmed-deadline
+    /// bookkeeping (fix #37 phase 1) as well as the local write-fence deadline (the Pool translates this
+    /// to `steady_clock::now() + ttl`, monotonic). No S3 read either way.
+    refreshConfirmedDeadline();
     if (on_renew_ok)
         on_renew_ok();
 }
@@ -917,6 +938,10 @@ void SingleWriterSlot::renewOnce()
     const RenewPayload payload = prepareRenew();
 
     std::lock_guard lock(state_mutex);
+    /// Reset BEFORE the guards below: a `dead`/`seq==0` throw (a programming-bug guard, not a backend
+    /// outcome) must not be misread as a CONFIRMED mismatch by `backgroundLoop` -- it falls into the
+    /// TRANSIENT bucket by leaving this false, exactly like a `putOverwrite` exception below.
+    last_renew_failure_was_confirmed_mismatch = false;
     if (dead)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS {}: renew after {} on key '{}'", slot_name, terminal_verb, key);
     if (seq == 0)
@@ -925,7 +950,12 @@ void SingleWriterSlot::renewOnce()
     const String body = encodeBody(seq + 1, payload);
     const PutResult res = backend->putOverwrite(key, body, last_token);
     if (res.outcome != PutOutcome::Done)
+    {
+        /// The PUT completed and observed a foreign token -- a CONFIRMED mismatch (proven
+        /// supersession), not a transient failure. Mark it BEFORE calling the hook, which always throws.
+        last_renew_failure_was_confirmed_mismatch = true;
         onRenewMismatch(key);
+    }
 
     recordWrite(seq + 1, res.token);
 }
@@ -994,8 +1024,11 @@ std::chrono::steady_clock::time_point SingleWriterSlot::lastRenewTime() const
 
 void SingleWriterSlot::backgroundLoop(std::chrono::milliseconds period)
 {
-    /// A failed renewal is logged and stops the loop, so lastRenewTime (and the slot's seq) stop
-    /// advancing and GC observes the frozen seq. No retry, no re-mint.
+    /// A CONFIRMED mismatch, or a TRANSIENT failure once `shouldFenceOnTransientRenewFailure` says the
+    /// lease deadline has neared, stops the loop for good: lastRenewTime (and the slot's seq) stop
+    /// advancing and GC observes the frozen seq. No retry, no re-mint. A TRANSIENT failure while the
+    /// deadline is still safely away keeps the loop alive -- the mount-lease protocol guarantees no
+    /// other writer can claim the slot before that deadline, so retrying is safe (fix #37 phase 1).
     std::unique_lock lock(background_mutex);
     while (!stop_requested)
     {
@@ -1009,6 +1042,18 @@ void SingleWriterSlot::backgroundLoop(std::chrono::milliseconds period)
         }
         catch (...)
         {
+            /// `renewOnce` and this loop run on the SAME background thread, sequentially -- no
+            /// synchronization needed to read the flag it just set.
+            const bool confirmed = last_renew_failure_was_confirmed_mismatch;
+            if (!confirmed && !shouldFenceOnTransientRenewFailure())
+            {
+                tryLogCurrentException(log, fmt::format(
+                    "CAS {}: background renewal failed transiently, retrying while the lease is still valid",
+                    slot_name));
+                lock.lock();
+                continue;
+            }
+
             tryLogCurrentException(
                 log, fmt::format("CAS {}: background renewal failed, the {} stops advancing", slot_name, slot_name));
             /// Notify the subclass that renewal failed and the loop is stopping (off `state_mutex`).

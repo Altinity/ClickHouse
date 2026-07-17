@@ -108,6 +108,18 @@ protected:
     /// `state_mutex`); the mount-lease keeper latches the write fence to lost here. Default no-op.
     virtual void onRenewFailed() {}
 
+    /// Fix #37 phase 1 (over-fencing): called from the background loop when `renewOnce` threw and the
+    /// throw was NOT a confirmed mismatch (`onRenewMismatch` -- an observed PUT outcome proving
+    /// supersession; see the flag this checks, `last_renew_failure_was_confirmed_mismatch`, in the
+    /// private section below). Returning `true` means "treat as terminal now" -- fence immediately, the
+    /// legacy behavior and the correct default for a subclass with no lease-deadline concept.
+    /// `MountLeaseKeeper` overrides this to ride out a TRANSIENT exception (a `putOverwrite` that threw
+    /// before any outcome was observed -- a timeout, 5xx, or connection reset) while its last CONFIRMED
+    /// lease has not yet reached its safety-margin boundary: the mount-lease protocol guarantees no
+    /// other writer can claim the slot before that deadline, so continuing to retry (not fencing) is
+    /// safe. Called OFF `state_mutex`, same as `onRenewFailed`.
+    virtual bool shouldFenceOnTransientRenewFailure() { return true; }
+
     /// Called when the token-guarded renew PUT hits PreconditionFailed. The base contract stays
     /// fail-closed and LOUD; subclasses may re-read and throw a more precisely classified
     /// exception (the mount keeper distinguishes a GC fence of our own expired lease from a
@@ -148,6 +160,15 @@ private:
     std::string_view terminal_verb;
 
     std::chrono::steady_clock::time_point last_renew_time;
+
+    /// Fix #37 phase 1: set immediately before `renewOnce` invokes `onRenewMismatch` (which always
+    /// throws) so `backgroundLoop`'s catch block can tell a CONFIRMED mismatch (the PUT completed and
+    /// observed a foreign token -- proven supersession) apart from a TRANSIENT exception
+    /// (`putOverwrite` itself threw before any outcome was observed, or a defensive `dead`/`seq==0`
+    /// guard fired). Reset to `false` at the top of every `renewOnce` call. `renewOnce` and
+    /// `backgroundLoop` run on the SAME background thread, sequentially, so no synchronization is
+    /// needed for this flag.
+    bool last_renew_failure_was_confirmed_mismatch = false;
 
     std::mutex background_mutex;
     std::condition_variable wakeup;
@@ -479,7 +500,7 @@ std::vector<MountInfo> listMounts(Backend & backend, const Layout & layout, uint
 ///   - foreign uuid → fail closed;
 ///   - absent → `putIfAbsent`; expired-our-uuid (any epoch) → `putOverwrite` reclaim.
 /// After `start`, `renewOnce` (base) keeps the slot alive and already fails closed on a foreign touch.
-class MountLeaseKeeper final : public SingleWriterSlot
+class MountLeaseKeeper : public SingleWriterSlot
 {
 public:
     /// `min_active_fn_` is read OFF the state lock on each beat (via `prepareRenew`) and stamped into
@@ -489,7 +510,8 @@ public:
         BackendPtr backend_, const Layout & layout_, const String & srid_, UInt128 server_uuid_,
         uint64_t writer_epoch_, std::chrono::milliseconds ttl_, std::function<uint64_t()> now_ms_fn_,
         std::function<uint64_t()> min_active_fn_,
-        CasEventSink event_sink_ = {});
+        CasEventSink event_sink_ = {},
+        std::chrono::milliseconds lease_safety_margin_ = std::chrono::milliseconds(2000));
 
     /// Claims (adopts) the mount slot for (server_uuid, writer_epoch) with seq following the observed
     /// one — durable when `start` returns.
@@ -524,8 +546,17 @@ protected:
     void onRenewSucceeded() override;
     void onRenewFailed() override;
     void onRenewMismatch(const String & mismatched_key) override;
+    /// Fix #37 phase 1: fence immediately only once our last CONFIRMED lease (the last successful
+    /// `claim`/renew) has reached its safety-margin boundary -- `confirmed_deadline_ms - now <=
+    /// lease_safety_margin`. Until then the mount-lease protocol still guarantees exclusivity.
+    bool shouldFenceOnTransientRenewFailure() override;
 
 private:
+    /// Refreshes `confirmed_deadline_ms` from `now_ms_fn` + `ttl`. Called on every point this keeper
+    /// KNOWS it holds a live lease: both success paths of `claim` (mint and adopt), and every
+    /// successful background renew (`onRenewSucceeded`).
+    void refreshConfirmedDeadline();
+
     String srid;
     UInt128 server_uuid;
     uint64_t writer_epoch;
@@ -535,6 +566,12 @@ private:
     std::function<void()> on_renew_ok;
     std::function<void()> on_lost;
     CasEventSink event_sink;
+    std::chrono::milliseconds lease_safety_margin;
+    /// BOOTTIME-ms deadline (same clock as `now_ms_fn`/`MountFence`, and for the SAME suspend-safety
+    /// reason -- see `MountFence`'s doc comment in `CasMountRuntime.h`) of the last CONFIRMED lease.
+    /// 0 = none yet (`claim` always sets this before `startBackground` can run, so
+    /// `shouldFenceOnTransientRenewFailure` observing 0 is defensive, not an expected steady state).
+    uint64_t confirmed_deadline_ms = 0;
 };
 
 }

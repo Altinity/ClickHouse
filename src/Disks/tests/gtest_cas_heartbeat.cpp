@@ -6,7 +6,14 @@
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/Exception.h>
 
+#include <atomic>
 #include <limits>
+#include <thread>
+
+namespace DB::ErrorCodes
+{
+    extern const int NETWORK_ERROR;
+}
 
 using namespace DB::Cas;
 
@@ -26,6 +33,17 @@ void seedOwnClaim(Backend & b, const Layout & l, const String & srid, UInt128 uu
 {
     ASSERT_EQ(claimMount(b, l, srid, uuid, epoch, now_ms, ttl_ms).kind, MountClaimResult::Claimed);
 }
+
+/// Fix #37 phase 1: `shouldFenceOnTransientRenewFailure` is `protected` on `MountLeaseKeeper` (it is an
+/// internal decision hook, not part of the public keeper API) -- promote it to `public` here so these
+/// tests can drive it directly, without needing a real background thread.
+class TestableMountLeaseKeeper : public MountLeaseKeeper
+{
+public:
+    using MountLeaseKeeper::MountLeaseKeeper;
+    using MountLeaseKeeper::shouldFenceOnTransientRenewFailure;
+    using MountLeaseKeeper::onRenewSucceeded;
+};
 }
 
 TEST(CasHeartbeat, AnchorCarriesFloor)
@@ -337,4 +355,169 @@ TEST(CasHeartbeat, RenewOverFencedOwnSlotIsClassifiedNotForeign)
     EXPECT_EQ(seen.back().type, CasEventType::MountConflict);
     EXPECT_EQ(seen.back().detail.at("branch"), "fenced_by_gc");
     EXPECT_EQ(seen.back().detail.at("holder_uuid"), u128ToHex(uuid));
+}
+
+/// Fix #37 phase 1: a TRANSIENT renewal failure (the background loop's `renewOnce` threw, but NOT via a
+/// confirmed `onRenewMismatch`) must not fence while the last confirmed lease still has more than
+/// `lease_safety_margin` left before it would expire -- the mount-lease protocol guarantees no other
+/// writer can claim the slot before that deadline, so riding it out is safe.
+TEST(CasHeartbeat, TransientRetryStaysWithinLeaseDeadline)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    Layout layout("pool");
+    const String srid = "test";
+    const UInt128 uuid(0x1234);
+    uint64_t now_ms = 1000;
+    seedOwnClaim(*backend, layout, srid, uuid, /*epoch=*/9, now_ms, /*ttl_ms=*/1000);
+
+    TestableMountLeaseKeeper keeper(backend, layout, srid, uuid, /*writer_epoch=*/9,
+                                     std::chrono::milliseconds(1000), [&] { return now_ms; },
+                                     [] { return uint64_t{0}; }, CasEventSink{},
+                                     /*lease_safety_margin=*/std::chrono::milliseconds(100));
+    keeper.start();   /// claim() anchors confirmed_deadline_ms = 1000 (now) + 1000 (ttl) = 2000
+
+    /// Well before the deadline's safety margin (2000 - 100 = 1900): must NOT fence.
+    now_ms = 1500;
+    EXPECT_FALSE(keeper.shouldFenceOnTransientRenewFailure());
+
+    /// At/after the safety-margin boundary: must fence.
+    now_ms = 1900;
+    EXPECT_TRUE(keeper.shouldFenceOnTransientRenewFailure());
+    now_ms = 2000;
+    EXPECT_TRUE(keeper.shouldFenceOnTransientRenewFailure());
+}
+
+/// A successful renew extends the confirmed deadline -- the boundary that WOULD have tripped against
+/// the OLD deadline no longer does against the refreshed one. `confirmed_deadline_ms` is refreshed by
+/// `onRenewSucceeded` (the hook the real background loop calls after a successful beat -- see
+/// `CasPool.cpp`'s note that unit tests drive `renewOnce` directly and never through the loop, so this
+/// test calls the promoted `onRenewSucceeded` itself to model exactly what one successful real beat
+/// does), not by a bare `renewOnce` call in isolation.
+TEST(CasHeartbeat, SuccessfulRenewExtendsTransientRetryDeadline)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    Layout layout("pool");
+    const String srid = "test";
+    const UInt128 uuid(0x1234);
+    uint64_t now_ms = 1000;
+    seedOwnClaim(*backend, layout, srid, uuid, /*epoch=*/9, now_ms, /*ttl_ms=*/1000);
+
+    TestableMountLeaseKeeper keeper(backend, layout, srid, uuid, /*writer_epoch=*/9,
+                                     std::chrono::milliseconds(1000), [&] { return now_ms; },
+                                     [] { return uint64_t{0}; }, CasEventSink{},
+                                     /*lease_safety_margin=*/std::chrono::milliseconds(100));
+    keeper.start();   /// confirmed_deadline_ms = 2000
+
+    now_ms = 1900;
+    ASSERT_TRUE(keeper.shouldFenceOnTransientRenewFailure()) << "sanity: 1900 trips the OLD deadline";
+
+    /// A renew at now_ms=1900 succeeds; onRenewSucceeded (as the background loop would call it)
+    /// refreshes confirmed_deadline_ms to 1900 + 1000 = 2900.
+    keeper.renewOnce();
+    keeper.onRenewSucceeded();
+    EXPECT_FALSE(keeper.shouldFenceOnTransientRenewFailure())
+        << "the refreshed deadline (2900, margin 100) must not trip at now_ms=1900 any more";
+}
+
+namespace
+{
+/// Wraps an `InMemoryBackend` so `putOverwrite` throws a TRANSIENT (non-mismatch) exception for the
+/// first `fault_count` calls, then delegates normally. Models a `putOverwrite` that fails before any
+/// outcome is observed (timeout / 5xx / connection reset) -- exactly the case fix #37 phase 1 targets,
+/// as opposed to a `PreconditionFailed` (a CONFIRMED, backend-observed mismatch).
+class TransientPutOverwriteFaultBackend final : public InMemoryBackend
+{
+public:
+    int fault_count = 0;
+
+    PutResult putOverwrite(const String & k, const String & b, const Token & e, const ObjectMeta & m = {}) override
+    {
+        if (fault_count > 0)
+        {
+            --fault_count;
+            throw DB::Exception(DB::ErrorCodes::NETWORK_ERROR, "injected transient putOverwrite fault");
+        }
+        return InMemoryBackend::putOverwrite(k, b, e, m);
+    }
+};
+}
+
+/// Real background thread: two transient faults, then the third beat lands. The loop must NOT stop and
+/// must NOT fence (on_lost never fires) -- it just keeps retrying at the normal period.
+TEST(CasHeartbeat, BackgroundLoopRetriesTransientFailureWithoutFencingOrStopping)
+{
+    auto backend = std::make_shared<TransientPutOverwriteFaultBackend>();
+    Layout layout("pool");
+    const String srid = "test";
+    const UInt128 uuid(0x1234);
+    uint64_t now_ms = 1000;
+    seedOwnClaim(*backend, layout, srid, uuid, /*epoch=*/9, now_ms, /*ttl_ms=*/30000);
+
+    std::atomic<bool> lost{false};
+    MountLeaseKeeper keeper(backend, layout, srid, uuid, /*writer_epoch=*/9, std::chrono::milliseconds(30000),
+                            [&] { return now_ms; }, [] { return uint64_t{0}; }, CasEventSink{},
+                            std::chrono::milliseconds(2000));
+    keeper.setFenceCallbacks([] {}, [&] { lost = true; });
+    keeper.start();   /// the adopt-path putOverwrite must land BEFORE the faults are armed below.
+
+    /// Arm the faults only for the BACKGROUND renewals under test -- `start`'s own adopt-path
+    /// putOverwrite above must not be faulted, or it throws straight out of this test body instead of
+    /// exercising the loop's transient-retry path.
+    backend->fault_count = 2;
+    keeper.startBackground(std::chrono::milliseconds(20));
+
+    /// Bounded poll (not a blind sleep): waits for the REAL background thread to land a renewal past
+    /// the two faults. Generous 5s timeout; a background-thread test cannot be made synchronous without
+    /// a dedicated test seam this codebase does not have (see gtest_cas_pool.cpp's preference for
+    /// synchronous renewOnce-driven tests elsewhere -- not applicable here, since the loop-continuation
+    /// behavior under test only exists inside backgroundLoop itself).
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    uint64_t seq = 1;
+    while (std::chrono::steady_clock::now() < deadline)
+    {
+        seq = decodeMountLease(backend->get(layout.mountKey(srid))->bytes).seq;
+        if (seq >= 2)
+            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    keeper.stopBackground();
+
+    EXPECT_GE(seq, 2u) << "background loop never recovered from the transient faults";
+    EXPECT_FALSE(lost.load()) << "a transient putOverwrite failure must not trip the fence";
+}
+
+/// A CONFIRMED mismatch (a foreign incarnation lands on the slot) must fence immediately, even with the
+/// deadline nowhere near expiry -- the other half of fix #37 phase 1's distinction.
+TEST(CasHeartbeat, BackgroundLoopFencesImmediatelyOnConfirmedMismatch)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    Layout layout("pool");
+    const String srid = "test";
+    const UInt128 uuid(0x1234);
+    uint64_t now_ms = 1000;
+    seedOwnClaim(*backend, layout, srid, uuid, /*epoch=*/9, now_ms, /*ttl_ms=*/30000);
+
+    std::atomic<bool> lost{false};
+    MountLeaseKeeper keeper(backend, layout, srid, uuid, /*writer_epoch=*/9, std::chrono::milliseconds(30000),
+                            [&] { return now_ms; }, [] { return uint64_t{0}; }, CasEventSink{},
+                            std::chrono::milliseconds(2000));
+    keeper.setFenceCallbacks([] {}, [&] { lost = true; });
+    keeper.start();
+
+    /// A foreign incarnation overwrites the slot BEFORE the first background beat.
+    const HeadResult h = backend->head(layout.mountKey(srid));
+    MountLease foreign;
+    foreign.server_uuid = uuid;
+    foreign.writer_epoch = 9;
+    foreign.seq = 99;
+    ASSERT_EQ(backend->putOverwrite(layout.mountKey(srid), encodeMountLease(foreign), h.token).outcome,
+              PutOutcome::Done);
+
+    keeper.startBackground(std::chrono::milliseconds(20));
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!lost.load() && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    keeper.stopBackground();
+
+    EXPECT_TRUE(lost.load()) << "a confirmed foreign-owner mismatch must fence immediately";
 }
