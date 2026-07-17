@@ -182,8 +182,13 @@ public:
     /// (I1) On a matching `putIfAbsent`, a FOREIGN writer lands a DIFFERENT object at the exact key and
     /// then this attempt's response is lost -- so the controller's resolve-before-reissue GET observes
     /// different bytes and must raise CORRUPTED_DATA (a proven conflict, never a retry signal).
+    /// By default the foreign object is the attempt's own bytes plus a trailing marker -- UNDECODABLE
+    /// for zstd-framed objects (the frame size no longer matches), which is exactly right for tests
+    /// that pin fail-closed handling of a corrupt object. Tests that instead need a VALID foreign
+    /// object (e.g. a real cross-process seal to be adopted on retry) set `corrupt_foreign_bytes`.
     String corrupt_key_substr;
     int corrupt_count = 0;
+    String corrupt_foreign_bytes;
 
     std::optional<GetResult> get(const String & key, Range range = {}) override
     {
@@ -208,7 +213,8 @@ public:
         {
             --corrupt_count;
             /// A foreign writer lands a DIFFERENT object at this exact key; then our own response is lost.
-            CountingBackend::putIfAbsent(key, bytes + String("\x01_FOREIGN_DIFFERENT"));
+            CountingBackend::putIfAbsent(
+                key, corrupt_foreign_bytes.empty() ? bytes + String("\x01_FOREIGN_DIFFERENT") : corrupt_foreign_bytes);
             throw Poco::TimeoutException("RefWriterTestBackend: a foreign different object landed; response lost");
         }
         if (fault_count > 0 && !fault_key_substr.empty() && key.find(fault_key_substr) != String::npos)
@@ -2936,7 +2942,24 @@ TEST(RefWriterRecoverySeal, SealPutConflictThrowPropagatesAndDoesNotWedgeRecover
     /// A foreign writer lands a DIFFERENT object at the seal key and our response is lost: the
     /// request controller's resolve-before-reissue then observes the different bytes and
     /// `putIfAbsentControlled` throws `CORRUPTED_DATA` out of the unlocked seal-PUT window.
+    /// The foreign object is a VALID cross-process seal (same ns, same seal id) whose content
+    /// provably differs from anything this recovery would produce: THREE committed rows against the
+    /// fixture's two. Validity matters: since the zstd object framing (formats v3), a byte-mangled
+    /// object no longer decodes at all -- the old "trailing garbage tolerated by
+    /// `decodeRefTableSnapshot`" laxity (the F3-1a side-finding) is closed by the frame check, and an
+    /// UNDECODABLE foreign seal now correctly fails recovery closed instead of being adopted.
     const RefTxnId seal_id{2, std::numeric_limits<uint64_t>::max()};
+    RefTableSnapshot foreign;
+    foreign.ns = ns.string();
+    foreign.snapshot_id = seal_id;
+    foreign.lifecycle = RefLifecycle::Live;
+    foreign.sealed_from = RefTxnId{2, 1};
+    foreign.committed = {
+        DB::Cas::RefCommittedRow{.ref_name = "a", .manifest_ref = manifestRef(1, 1, 1), .payload = "", .published_at_ms = 0},
+        DB::Cas::RefCommittedRow{.ref_name = "b", .manifest_ref = manifestRef(2, 1, 1), .payload = "", .published_at_ms = 0},
+        DB::Cas::RefCommittedRow{.ref_name = "c", .manifest_ref = manifestRef(2, 1, 2), .payload = "", .published_at_ms = 0},
+    };
+    backend->corrupt_foreign_bytes = DB::Cas::sealObject(DB::Cas::FormatId::RefSnapshot, DB::Cas::encodeRefTableSnapshot(foreign));
     backend->corrupt_key_substr = layout.refSnapshotKey(ns, seal_id);
     backend->corrupt_count = 1;
 
@@ -2945,12 +2968,10 @@ TEST(RefWriterRecoverySeal, SealPutConflictThrowPropagatesAndDoesNotWedgeRecover
 
     /// The load-bearing assertion: recovery must be RESTARTABLE -- `recovery_in_progress` was cleared
     /// on the exception path, so this second touch parks on nothing and runs its own recovery attempt.
-    /// The retry finds the foreign object durable at the seal key and ADOPTS it (write-once byte-adopt).
-    /// NOTE: in this fixture the object is corrupted-but-decodable (trailing garbage tolerated by
-    /// `decodeRefTableSnapshot`) -- the adoption-of-a-corrupt-seal tolerance is flagged as a separate
-    /// open finding (see "F3-1a side-finding" in the rev6 findings doc); THIS test pins the
-    /// no-wedge/restartability contract, not the decode laxity.
-    EXPECT_EQ(store->listRefs(ns).size(), 2u)
+    /// The retry lists the foreign seal as the newest durable snapshot and ADOPTS it wholesale --
+    /// THREE refs (the foreign seal's content), not the two this process's own fold would have
+    /// produced, proving the converged state is the durable foreign object rather than a local recompute.
+    EXPECT_EQ(store->listRefs(ns).size(), 3u)
         << "the retry must converge on the durable (foreign) seal, not wedge or re-throw forever";
     EXPECT_EQ(store->refRecoveryWaitersForTest(ns), 0u)
         << "no phantom waiter may remain parked on recovery_cv after the exception path";
