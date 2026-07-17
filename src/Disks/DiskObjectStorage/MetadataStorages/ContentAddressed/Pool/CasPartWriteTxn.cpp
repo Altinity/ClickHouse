@@ -850,14 +850,18 @@ void PartWriteTxn::precommitAdd(const RootNamespace & target_ns, const String & 
                 /// Task 11 (spec §Namespace Birth): recreating a `Removed` namespace requires the
                 /// EXACT `_cleanup/<remove_txn_id>` completion marker from this table's own recovery --
                 /// an empty physical prefix is never sufficient. A never-born table (`remove_txn_id`
-                /// absent) needs no marker at all.
+                /// absent) needs no marker at all. Fix #37 phase 2: this is a namespace-rebirth RACE,
+                /// not a terminal rejection -- it resolves once GC's namespace-cleanup item publishes
+                /// the marker, so it retries later via throwCasWriteRetryLater rather than staying
+                /// ABORTED. It also ESCAPES to the same caller sequence (`publishEntries`,
+                /// `PartFolderAccess.cpp`) as `stageManifest`/`promote`, its immediate neighbors, both
+                /// already rerouted -- leaving this one ABORTED would let it defeat the merge backoff
+                /// mid-sequence, exactly the Fix-2 defect.
                 if (state.remove_txn_id.has_value()
                     && !store->observedNamespaceCleanupMarker(target_ns, *state.remove_txn_id))
-                    throw Exception(ErrorCodes::ABORTED,
-                        "precommitAdd: namespace '{}' was removed (remove_txn_id {}-{}) and recreation "
-                        "requires the exact _cleanup completion marker from GC's namespace-cleanup item, "
-                        "which has not yet been observed (spec §Namespace Birth)",
-                        target_ns.string(), state.remove_txn_id->writer_epoch, state.remove_txn_id->ref_sequence);
+                    throwCasWriteRetryLater(fmt::format(
+                        "namespace '{}' recreation pending GC cleanup-marker (remove_txn_id {}-{})",
+                        target_ns.string(), state.remove_txn_id->writer_epoch, state.remove_txn_id->ref_sequence));
                 RefOp birth;
                 birth.kind = RefOpKind::NamespaceBirth;
                 ops.push_back(birth);

@@ -2486,12 +2486,13 @@ TEST(RefWriterNamespaceBirth, BirthFromRemovedRejectedWithoutMarkerAcceptedWithM
         remove_id = *id;
     }   /// mount released
 
-    /// A fresh mount, no marker observed: rejected.
+    /// A fresh mount, no marker observed: rejected (NETWORK_ERROR, fix #37 phase 2 -- a namespace-
+    /// rebirth race that resolves once GC's cleanup marker is observed, not a terminal rejection).
     {
         auto store2 = openPool(backend);
         auto build = startBuildFor(store2, ns, "reborn");
         const ManifestId id = build->stageManifest({});
-        expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { build->precommitAdd(ns, "reborn", id); });
+        expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { build->precommitAdd(ns, "reborn", id); });
     }
 
     /// GC's namespace-cleanup item (Task 12) publishes the exact completion marker -- simulated here
