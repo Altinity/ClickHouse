@@ -1,4 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasCodecUtil.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <IO/ReadBufferFromMemory.h>
@@ -19,7 +20,6 @@ namespace DB
 {
 namespace ErrorCodes
 {
-    extern const int ABORTED;
     extern const int FILE_DOESNT_EXIST;
     extern const int LIMIT_EXCEEDED;
     extern const int LOGICAL_ERROR;
@@ -228,11 +228,11 @@ void CasRefLedger::ensureRefTableRecovered(const RootNamespace & ns, RefTableRun
         if (attempt > 0)
         {
             if (attempt > kRefRecoveryMaxRestarts)
-                throw Exception(ErrorCodes::ABORTED,
+                throwCasWriteRetryLater(fmt::format(
                     "CAS ref-table recovery for namespace '{}' restarted {} times (a selected snapshot or "
                     "log object kept vanishing between its LIST and GET) — giving up; this bound is a "
                     "runaway brake against a pathological cleanup race, not an expected steady state",
-                    ns.string(), attempt - 1);
+                    ns.string(), attempt - 1));
             ++rt.recovery_restarts;
             ProfileEvents::increment(ProfileEvents::CasRefRecoveryRestarts);
         }
@@ -390,10 +390,10 @@ void CasRefLedger::ensureRefTableRecovered(const RootNamespace & ns, RefTableRun
             }
             lock.lock();
             if (outcome != CasWriteOutcome::Committed)
-                throw Exception(ErrorCodes::ABORTED,
+                throwCasWriteRetryLater(fmt::format(
                     "CAS recovery seal PUT for namespace '{}' did not commit; failing recovery closed "
                     "(the table stays unrecovered/non-writable; the next touch restarts recovery and "
-                    "re-seals)", ns.string());
+                    "re-seals)", ns.string()));
             ProfileEvents::increment(ProfileEvents::CasRefRecoverySealPublished);
 
             /// The seal now covers everything replayed so far: feed it into the SAME bookkeeping below
@@ -796,9 +796,9 @@ RefTxnId CasRefLedger::appendRefOps(const RootNamespace & ns, MutationScope scop
     /// Checked in the SAME critical section as the `pending.push_back` below -- the pairing that makes
     /// this race-free against the drain's snapshot-and-wait (see the `shutting_down` member comment).
     if (shutting_down.load(std::memory_order_acquire))
-        throw Exception(ErrorCodes::ABORTED,
+        throwCasWriteRetryLater(fmt::format(
             "CAS store is shutting down — refusing to append ref-log transactions for server_root '{}'",
-            config.server_root_id);
+            config.server_root_id));
     rt->pending.push_back(item);
 
     while (!item->done)
@@ -901,7 +901,7 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
     /// Fails the WHOLE queue -- every caller would have gotten the same refusal alone.
     if (!may_mutate())
     {
-        complete_error(carve_all_pending(), std::make_exception_ptr(Exception(ErrorCodes::ABORTED,
+        complete_error(carve_all_pending(), makeCasWriteRetryLaterExceptionPtr(fmt::format(
             "CAS mount lost / lease expired — refusing to append ref-log transactions for server_root '{}'",
             config.server_root_id)));
         return;
@@ -915,7 +915,7 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
     /// reaching this AFTER passing `mayMutate` above proves the swap happened.
     if (rt->superseded_by_remount.load(std::memory_order_acquire))
     {
-        complete_error(carve_all_pending(), std::make_exception_ptr(Exception(ErrorCodes::ABORTED,
+        complete_error(carve_all_pending(), makeCasWriteRetryLaterExceptionPtr(fmt::format(
             "CAS ref-log append for server_root '{}': this cached table was superseded by a self-remount — "
             "retry against the fresh mount incarnation",
             config.server_root_id)));
@@ -983,7 +983,7 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
                 /// Still Unresolved: fail every CURRENTLY queued item with the SAME uncertainty
                 /// exception and do not allocate a new id. A later call into this namespace's queue
                 /// retries the resolve.
-                complete_error(carve_all_pending(), std::make_exception_ptr(Exception(ErrorCodes::ABORTED,
+                complete_error(carve_all_pending(), makeCasWriteRetryLaterExceptionPtr(fmt::format(
                     "CAS ref-log append for namespace '{}' txn {}-{} is still UNCERTAIN — the append lane "
                     "stays wedged until the SAME key resolves durable or a conclusive rejection is observed",
                     ns.string(), wedge_copy->txn_id.writer_epoch, wedge_copy->txn_id.ref_sequence)));
@@ -1141,7 +1141,7 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
     /// (which also checks the flag) is the airtight backstop for the narrow window past this point.
     if (rt->superseded_by_remount.load(std::memory_order_acquire))
     {
-        complete_error(survivors, std::make_exception_ptr(Exception(ErrorCodes::ABORTED,
+        complete_error(survivors, makeCasWriteRetryLaterExceptionPtr(fmt::format(
             "CAS ref-log append for server_root '{}': this cached table was superseded by a self-remount "
             "before id allocation — retry against the fresh mount incarnation",
             config.server_root_id)));
@@ -1270,7 +1270,7 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
         case CasWriteOutcome::DefiniteFailure:
         {
             ProfileEvents::increment(ProfileEvents::CasRefAppendDefiniteFailure);
-            complete_error(survivors, std::make_exception_ptr(Exception(ErrorCodes::ABORTED,
+            complete_error(survivors, makeCasWriteRetryLaterExceptionPtr(fmt::format(
                 "CAS ref-log append for namespace '{}' definitively failed (non-retryable rejection); "
                 "cached state is unchanged and txn id {}-{} is a safe gap",
                 ns.string(), id.writer_epoch, id.ref_sequence)));
@@ -1283,7 +1283,7 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
                 rt->wedge = RefAppendWedge{id, key, bytes};
             }
             ProfileEvents::increment(ProfileEvents::CasRefAppendWedged);
-            complete_error(survivors, std::make_exception_ptr(Exception(ErrorCodes::ABORTED,
+            complete_error(survivors, makeCasWriteRetryLaterExceptionPtr(fmt::format(
                 "CAS ref-log append for namespace '{}' txn {}-{} is UNCERTAIN (retry budget exhausted) — "
                 "the append lane is wedged until the SAME key resolves durable or a conclusive rejection "
                 "is observed; this outcome is unproven, not failure",
