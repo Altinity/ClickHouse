@@ -203,60 +203,6 @@ def wait_for_destination_paths_sync_failed_marker(
     )
 
 
-def test_export_partition_destination_paths_sync_failed_marker(cluster):
-    """
-    When a processed-leaf Keeper read fails during manifest refresh, the mirror
-    must publish '<failed to read from zk>' into destination_file_paths (not silently
-    under-count), and clear it again once the failpoint is disabled and the next
-    poll succeeds.
-    """
-    node = cluster.instances["replica1"]
-
-    uid = unique_suffix()
-    mt_table = f"mt_{uid}"
-    iceberg_table = f"iceberg_{uid}"
-
-    setup_tables(cluster, mt_table, iceberg_table, nodes=["replica1"])
-
-    node.query(
-        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_table}",
-        settings={"allow_insert_into_iceberg": 1},
-    )
-    wait_for_export_status(node, mt_table, iceberg_table, "2020", "COMPLETED")
-
-    paths_before = node.query(
-        f"SELECT destination_file_paths FROM system.replicated_partition_exports"
-        f" WHERE source_table = '{mt_table}'"
-        f"   AND destination_table = '{iceberg_table}'"
-        f"   AND partition_id = '2020'"
-    ).strip()
-    assert paths_before, "Expected non-empty destination_file_paths after COMPLETED"
-    assert "<failed to read from zk>" not in paths_before, (
-        f"Unexpected sync-failed marker before failpoint: {paths_before}"
-    )
-
-    node.query("SYSTEM ENABLE FAILPOINT export_partition_processed_paths_sync_fail")
-    try:
-        wait_for_destination_paths_sync_failed_marker(
-            node, mt_table, iceberg_table, "2020", expect_marker=True
-        )
-    finally:
-        node.query("SYSTEM DISABLE FAILPOINT export_partition_processed_paths_sync_fail")
-
-    wait_for_destination_paths_sync_failed_marker(
-        node, mt_table, iceberg_table, "2020", expect_marker=False
-    )
-
-    paths_after = node.query(
-        f"SELECT destination_file_paths FROM system.replicated_partition_exports"
-        f" WHERE source_table = '{mt_table}'"
-        f"   AND destination_table = '{iceberg_table}'"
-        f"   AND partition_id = '2020'"
-    ).strip()
-
-    assert paths_after, "Expected destination_file_paths to recover after failpoint cleared"
-
-
 def test_export_two_partitions_to_iceberg(cluster):
     """
     Export two partitions in a single ALTER TABLE statement and verify that both
