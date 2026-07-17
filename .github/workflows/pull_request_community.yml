@@ -2073,6 +2073,102 @@ jobs:
           . ./ci/tmp/praktika_setup_env.sh
           PYTHONUNBUFFERED=1 python3 -m praktika run 'Stateless tests (arm_binary, sequential)' --workflow "Community PR" --ci --timestamp
 
+  stateless_tests_arm_binary_content_addressed_storage_parallel:
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester-aarch64, 16c]
+    needs: [build_amd_debug, build_arm_binary, config_workflow, fast_test, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel]
+    if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhcm1fYmluYXJ5LCBjb250ZW50X2FkZHJlc3NlZCBzdG9yYWdlLCBwYXJhbGxlbCk=') }}
+    name: "Stateless tests (arm_binary, content_addressed storage, parallel)"
+    outputs:
+      data: ${{ steps.run.outputs.DATA }}
+      pipeline_status: ${{ steps.run.outputs.pipeline_status || 'undefined' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Setup
+        uses: ./.github/actions/runner_setup
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          test_name: "Stateless tests (arm_binary, content_addressed storage, parallel)"
+
+      - name: Prepare env script
+        run: |
+          rm -rf ./ci/tmp
+          mkdir -p ./ci/tmp
+          cat > ./ci/tmp/praktika_setup_env.sh << 'ENV_SETUP_SCRIPT_EOF'
+          export PYTHONPATH=./ci:.:
+
+          cat > ./ci/tmp/workflow_job.json << 'EOF'
+          ${{ toJson(job) }}
+          EOF
+          cat > ./ci/tmp/workflow_status.json << 'EOF'
+          ${{ toJson(needs) }}
+          EOF
+          ENV_SETUP_SCRIPT_EOF
+
+      - name: Download artifact CH_ARM_BIN
+        uses: actions/download-artifact@v8
+        with:
+          name: CH_ARM_BIN
+          path: ./ci/tmp
+
+      - name: Run
+        id: run
+        run: |
+          . ./ci/tmp/praktika_setup_env.sh
+          PYTHONUNBUFFERED=1 python3 -m praktika run 'Stateless tests (arm_binary, content_addressed storage, parallel)' --workflow "Community PR" --ci --timestamp
+
+  stateless_tests_arm_binary_content_addressed_s3_storage_parallel:
+    runs-on: [self-hosted, altinity-on-demand, altinity-func-tester-aarch64, 16c]
+    needs: [build_amd_debug, build_arm_binary, config_workflow, fast_test, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel]
+    if: ${{ !cancelled() && !contains(needs.*.outputs.pipeline_status, 'failure') && !contains(needs.*.outputs.pipeline_status, 'undefined') && !contains(fromJson(needs.config_workflow.outputs.data).workflow_config.cache_success_base64, 'U3RhdGVsZXNzIHRlc3RzIChhcm1fYmluYXJ5LCBjb250ZW50X2FkZHJlc3NlZCBzMyBzdG9yYWdlLCBwYXJhbGxlbCk=') }}
+    name: "Stateless tests (arm_binary, content_addressed s3 storage, parallel)"
+    outputs:
+      data: ${{ steps.run.outputs.DATA }}
+      pipeline_status: ${{ steps.run.outputs.pipeline_status || 'undefined' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.CHECKOUT_REF }}
+
+      - name: Setup
+        uses: ./.github/actions/runner_setup
+      - name: Docker setup
+        uses: ./.github/actions/docker_setup
+        with:
+          test_name: "Stateless tests (arm_binary, content_addressed s3 storage, parallel)"
+
+      - name: Prepare env script
+        run: |
+          rm -rf ./ci/tmp
+          mkdir -p ./ci/tmp
+          cat > ./ci/tmp/praktika_setup_env.sh << 'ENV_SETUP_SCRIPT_EOF'
+          export PYTHONPATH=./ci:.:
+
+          cat > ./ci/tmp/workflow_job.json << 'EOF'
+          ${{ toJson(job) }}
+          EOF
+          cat > ./ci/tmp/workflow_status.json << 'EOF'
+          ${{ toJson(needs) }}
+          EOF
+          ENV_SETUP_SCRIPT_EOF
+
+      - name: Download artifact CH_ARM_BIN
+        uses: actions/download-artifact@v8
+        with:
+          name: CH_ARM_BIN
+          path: ./ci/tmp
+
+      - name: Run
+        id: run
+        run: |
+          . ./ci/tmp/praktika_setup_env.sh
+          PYTHONUNBUFFERED=1 python3 -m praktika run 'Stateless tests (arm_binary, content_addressed s3 storage, parallel)' --workflow "Community PR" --ci --timestamp
+
   integration_tests_amd_asan_ubsan_db_disk_old_analyzer_1_6:
     runs-on: [self-hosted, altinity-on-demand, altinity-func-tester, 16c]
     needs: [build_amd_asan_ubsan, build_amd_debug, build_arm_binary, config_workflow, fast_test, stateless_tests_amd_debug_parallel, stateless_tests_arm_binary_parallel]
