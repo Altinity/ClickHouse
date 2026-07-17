@@ -24,18 +24,38 @@ class RunnerLabels:
         "altinity-on-demand",
         "altinity-func-tester-aarch64",
     ]
-    AMD_LARGE = ["self-hosted", "altinity-on-demand", "altinity-func-tester"]
-    ARM_LARGE = ["self-hosted", "altinity-on-demand", "altinity-func-tester-aarch64"]
-    AMD_MEDIUM = ["self-hosted", "altinity-on-demand", "altinity-func-tester"]
-    ARM_MEDIUM = ["self-hosted", "altinity-on-demand", "altinity-func-tester-aarch64"]
-    AMD_MEDIUM_CPU = ["self-hosted", "altinity-on-demand", "altinity-func-tester"]
-    ARM_MEDIUM_CPU = ["self-hosted", "altinity-on-demand", "altinity-func-tester-aarch64"]
+    AMD_LARGE = ["self-hosted", "altinity-on-demand", "altinity-builder", "64g"]
+    ARM_LARGE = [
+        "self-hosted",
+        "altinity-on-demand",
+        "altinity-func-tester-aarch64",
+        "16c",
+    ]
+    AMD_MEDIUM = ["self-hosted", "altinity-on-demand", "altinity-func-tester", "16c"]
+    ARM_MEDIUM = [
+        "self-hosted",
+        "altinity-on-demand",
+        "altinity-func-tester-aarch64",
+        "16c",
+    ]
+    AMD_MEDIUM_CPU = ["self-hosted", "altinity-on-demand", "altinity-builder", "16c"]
+    ARM_MEDIUM_CPU = [
+        "self-hosted",
+        "altinity-on-demand",
+        "altinity-func-tester-aarch64",
+        "16c",
+    ]
     AMD_MEDIUM_MEM = ["self-hosted", "altinity-on-demand", "altinity-func-tester"]
     ARM_MEDIUM_MEM = ["self-hosted", "altinity-on-demand", "altinity-func-tester-aarch64"]
-    AMD_SMALL = ["self-hosted", "altinity-on-demand", "altinity-style-checker"]
-    ARM_SMALL = ["self-hosted", "altinity-on-demand", "altinity-style-checker-aarch64"]
-    AMD_SMALL_MEM = ["self-hosted", "altinity-on-demand", "altinity-style-checker"]
-    ARM_SMALL_MEM = ["self-hosted", "altinity-on-demand", "altinity-style-checker-aarch64"]
+    AMD_SMALL = ["self-hosted", "altinity-on-demand", "altinity-func-tester"]
+    ARM_SMALL = ["self-hosted", "altinity-on-demand", "altinity-func-tester-aarch64"]
+    AMD_SMALL_MEM = ["self-hosted", "altinity-on-demand", "altinity-func-tester", "32g"]
+    ARM_SMALL_MEM = [
+        "self-hosted",
+        "altinity-on-demand",
+        "altinity-func-tester-aarch64",
+        "32g",
+    ]
     STYLE_CHECK_AMD = ["self-hosted", "altinity-on-demand", "altinity-style-checker"]
     STYLE_CHECK_ARM = [
         "self-hosted",
