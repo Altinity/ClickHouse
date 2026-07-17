@@ -107,7 +107,7 @@ std::shared_ptr<FakeConditionalCopyObjectStorage> makeFakeConditionalCopyStorage
     return std::make_shared<FakeConditionalCopyObjectStorage>(std::move(settings), mode);
 }
 
-/// A fake object-store sink for Task 4 of the S3-native staging plan (`DB::ContentAddressed::CaContentWriteBuffer`'s
+/// A fake object-store sink for Task 4 of the S3-native staging plan (`DB::Cas::CaContentWriteBuffer`'s
 /// S3-staging constructor): an in-memory `WriteBufferFromFileBase` that records every byte written to
 /// it, plus whether `cancelImpl`/`finalizeImpl` ran. This is enough to prove the S3-staging mode
 /// streams to the SINK (not to a local temp file) while hashing, without needing a real object storage
@@ -238,7 +238,7 @@ TEST(CasS3Staging, ParsesS3BackendFromConfig)
 {
     auto config = configWithDiskSection("<staging_backend>s3</staging_backend>");
 
-    EXPECT_EQ(DB::ContentAddressedMetadataStorage::parseStagingBackend(*config, "disk"), DB::StagingBackend::S3);
+    EXPECT_EQ(DB::ContentAddressedMetadataStorage::parseStagingBackend(*config, "disk"), DB::Cas::StagingBackend::S3);
 }
 
 TEST(CasS3Staging, DefaultConfigParsesToLocalBackend)
@@ -246,7 +246,7 @@ TEST(CasS3Staging, DefaultConfigParsesToLocalBackend)
     /// No `staging_backend` key at all — the OFF BY DEFAULT arm.
     auto config = configWithDiskSection("<scratch_path>/tmp/whatever</scratch_path>");
 
-    EXPECT_EQ(DB::ContentAddressedMetadataStorage::parseStagingBackend(*config, "disk"), DB::StagingBackend::Local);
+    EXPECT_EQ(DB::ContentAddressedMetadataStorage::parseStagingBackend(*config, "disk"), DB::Cas::StagingBackend::Local);
 }
 
 TEST(CasS3Staging, UnknownBackendValueThrows)
@@ -264,7 +264,7 @@ TEST(CasS3Staging, DefaultConstructedStorageReportsLocalAndNoConditionalCopy)
         DB::Cas::tests::makeLocalObjectStorageForTest(), "pool", "srv1", "test",
         std::filesystem::temp_directory_path() / "cas_s3_staging_default_scratch", nullptr);
 
-    EXPECT_EQ(storage->stagingBackend(), DB::StagingBackend::Local);
+    EXPECT_EQ(storage->stagingBackend(), DB::Cas::StagingBackend::Local);
     EXPECT_FALSE(storage->conditionalCopySupported());
 }
 
@@ -346,7 +346,7 @@ TEST(CasS3Staging, ContentWriteBufferS3ModeStreamsToSinkAndFinalizes)
     /// envelope encoder).
     const std::string envelope_header(256, 'H');
 
-    auto buf = std::make_unique<DB::ContentAddressed::CaContentWriteBuffer>(
+    auto buf = std::make_unique<DB::Cas::CaContentWriteBuffer>(
         std::move(sink),
         staging_key,
         envelope_header,
@@ -403,7 +403,7 @@ TEST(CasS3Staging, ContentWriteBufferS3ModeCancelCancelsSinkAndSkipsFinalize)
 
     bool on_finalized_called = false;
 
-    auto buf = std::make_unique<DB::ContentAddressed::CaContentWriteBuffer>(
+    auto buf = std::make_unique<DB::Cas::CaContentWriteBuffer>(
         std::move(sink),
         staging_key,
         /*envelope_header=*/std::string(256, 'H'),
@@ -646,7 +646,7 @@ std::shared_ptr<DB::ContentAddressedMetadataStorage> makeS3StagingMetadataStorag
         /*cas_part_folder_cache_max_entry_bytes_=*/16ULL << 20,
         /*manifest_decode_cache_bytes_=*/128ULL << 20,
         /*gc_meta_pool_size_=*/16,
-        DB::StagingBackend::S3);
+        DB::Cas::StagingBackend::S3);
 }
 
 /// Mirrors gtest_ca_wiring.cpp's helper of the same shape.

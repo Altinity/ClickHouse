@@ -1120,7 +1120,7 @@ MergeTreeData::MutableDataPartPtr Fetcher::relinkPartToDisk(
     const String part_dir = tmp_prefix + part_name;
     const auto part_relative_path = data.getRelativeDataPath();
 
-    auto table_uuid = ContentAddressed::parseTableUuid(part_relative_path);
+    auto table_uuid = Cas::parseTableUuid(part_relative_path);
     if (!table_uuid)
         throw Exception(ErrorCodes::LOGICAL_ERROR,
             "Cannot derive content-addressed table uuid from data path {} for relink of part {}",

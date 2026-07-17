@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
 
-using DB::ContentAddressed::partFileMustStayBlob;
+using DB::Cas::partFileMustStayBlob;
 
 TEST(CaInlinePlacement, ColumnAndMarkFilesStayBlob)
 {

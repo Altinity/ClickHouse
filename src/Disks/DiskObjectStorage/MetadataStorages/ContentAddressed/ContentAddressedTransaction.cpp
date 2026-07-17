@@ -34,7 +34,7 @@ namespace ErrorCodes
 }
 }
 
-namespace DB::ContentAddressed
+namespace DB::Cas
 {
 
 namespace
@@ -148,7 +148,7 @@ void ContentAddressedTransaction::cleanupPendingTempFiles() noexcept
     {
         for (const auto & pb : st.pending_blobs)
         {
-            if (pb.backend == StagingBackend::Local)
+            if (pb.backend == Cas::StagingBackend::Local)
             {
                 std::error_code ec;
                 std::filesystem::remove(pb.staging_key, ec);
@@ -227,7 +227,7 @@ void ContentAddressedTransaction::adoptStagedBlob(
 std::optional<ContentAddressedMetadataStorage::Route>
 ContentAddressedTransaction::routeOf(const std::string & path) const
 {
-    auto p = ContentAddressed::parsePartFilePath(path);
+    auto p = Cas::parsePartFilePath(path);
     if (!p)
         return std::nullopt;
     return metadata_storage.route(*p);
@@ -251,16 +251,16 @@ void ContentAddressedTransaction::uploadPendingBlobs(PartStaging & st)
         /// Each pending blob
         /// is promoted through the SAME condemn/resurrect gate in `PartWriteTxn::putBlob`. Only the upload
         /// primitive differs by staging backend:
-        ///   - `StagingBackend::Local`: `write_payload` re-reads the local staged temp file and streams
+        ///   - `Cas::StagingBackend::Local`: `write_payload` re-reads the local staged temp file and streams
         ///     it into a write-once `putIfAbsentStream` create; the local-staging path remains
         ///     byte-for-byte compatible with its previous behavior.
-        ///   - `StagingBackend::S3`: the bytes already live in an S3 staging object (`pb.staging_key`);
+        ///   - `Cas::StagingBackend::S3`: the bytes already live in an S3 staging object (`pb.staging_key`);
         ///     `server_side_copy_from` drives a WRITE-ONCE conditional SERVER-SIDE COPY (and an
         ///     unconditional resurrect copy FROM the staging object for a condemned incarnation). No
         ///     local read-back — `write_payload` is left unset.
         Cas::BlobSource source;
         source.size = pb.size;
-        if (pb.backend == StagingBackend::S3)
+        if (pb.backend == Cas::StagingBackend::S3)
         {
             source.server_side_copy_from = pb.staging_key;
         }
@@ -303,7 +303,7 @@ bool ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
     /// per-part file that is now an ordinary tree entry, or a marks-only removal with no writes).
     if (!st.entries.empty() || !st.content_removed.empty())
     {
-        if (auto view = metadata_storage.partAccess().getView({ns, ref}, ContentAddressed::Freshness::ForceFresh))
+        if (auto view = metadata_storage.partAccess().getView({ns, ref}, Cas::Freshness::ForceFresh))
         {
             if (st.build)
             {
@@ -361,7 +361,7 @@ bool ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
     st.build->precommitAdd(ns, ref, id);
     uploadPendingBlobs(st);
 
-    const bool ref_existed = metadata_storage.partAccess().existsRef({ns, ref}, ContentAddressed::Freshness::ForceFresh);
+    const bool ref_existed = metadata_storage.partAccess().existsRef({ns, ref}, Cas::Freshness::ForceFresh);
     metadata_storage.partAccess().promoteBuild(*st.build, {ns, ref}, st.build->buildId(), id);
     st.published = true;
     return !ref_existed;
@@ -488,12 +488,12 @@ std::unique_ptr<ReadBufferFromFileBase> ContentAddressedTransaction::tryReadFile
         {
             /// A pending blob has not been uploaded yet — serve reads from the staging area (the
             /// same bytes that will be promoted to the pool in publishStaging post-precommit): a local
-            /// temp file for `StagingBackend::Local`, or the S3 staging object for `StagingBackend::S3`
+            /// temp file for `Cas::StagingBackend::Local`, or the S3 staging object for `Cas::StagingBackend::S3`
             /// (`staging_key` is a remote object key there, never a
             /// local path, so `ReadBufferFromFile` would misinterpret it as a filesystem path).
             if (const auto * pb = findPendingBlob(it->second, entry->ref))
             {
-                if (pb->backend == StagingBackend::S3)
+                if (pb->backend == Cas::StagingBackend::S3)
                 {
                     /// The staging object holds `[header][payload]`
                     /// (the fixed-length `blob_header_len` CABL envelope, so the promote can stay a
@@ -589,12 +589,12 @@ void ContentAddressedTransaction::createMetadataFile(const std::string &, const 
 
 void ContentAddressedTransaction::stageBlobPartFile(
     const ContentAddressedMetadataStorage::Route & route,
-    const Cas::BlobRef & ref, size_t size, const std::string & staging_key, StagingBackend backend)
+    const Cas::BlobRef & ref, size_t size, const std::string & staging_key, Cas::StagingBackend backend)
 {
     /// Do not upload here. Record the pending blob (uploaded post-precommit in publishStaging)
     /// and a tokenless dependency; putBlob later overwrites it with the tokened dependency.
     /// The staging bytes are kept (the transaction owns them) — a local temp file for
-    /// `StagingBackend::Local`, or an S3 staging object for `StagingBackend::S3`.
+    /// `Cas::StagingBackend::Local`, or an S3 staging object for `Cas::StagingBackend::S3`.
     auto & st = stagingFor(route);
     st.pending_blobs.push_back({ref, staging_key, size, backend});
     buildFor(route, st).recordPendingBlobDep(ref, size);
@@ -642,7 +642,7 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::tryCreateW
     /// Append is serviceable (read-modify-rewrite) only for a non-part / table-level verbatim file
     /// (handled inside writeFile). A part file is a content blob or a whole-rewritten inline entry, so
     /// append on a part-file path is unsupported.
-    if (mode == WriteMode::Append && ContentAddressed::isPartFilePath(path))
+    if (mode == WriteMode::Append && Cas::isPartFilePath(path))
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Disk does not support WriteMode::Append for content part files");
 
     /// Autocommit cannot work for a CONTENT BLOB part file (column data/marks, primary.idx): a part's
@@ -652,10 +652,10 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::tryCreateW
     /// branch carries the rest of the part forward and republishes once (the transactional-INSERT
     /// creation-CSN fill-in / removal-TID rewrite / rollback path). Verbatim / table-level files (not part
     /// files) are durable on finalize regardless of `autocommit`.
-    if (autocommit && ContentAddressed::isPartFilePath(path))
+    if (autocommit && Cas::isPartFilePath(path))
     {
-        auto p = ContentAddressed::parsePartFilePath(path);
-        if (!p || p->file.empty() || ContentAddressed::partFileMustStayBlob(p->file))
+        auto p = Cas::parsePartFilePath(path);
+        if (!p || p->file.empty() || Cas::partFileMustStayBlob(p->file))
             throw Exception(ErrorCodes::NOT_IMPLEMENTED,
                 "Autocommit writes are not supported for content part files on a content-addressed disk");
 
@@ -685,9 +685,9 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
     /// the disk layer's autocommit contract for them rides exactly this). Append is serviced by
     /// read-modify-rewrite: the existing bytes are carried forward (the MVCC mutation-entry CSN
     /// append depends on this).
-    if (!ContentAddressed::isPartFilePath(path))
+    if (!Cas::isPartFilePath(path))
     {
-        if (auto tf = ContentAddressed::parseTableFilePath(path))
+        if (auto tf = Cas::parseTableFilePath(path))
         {
             const Cas::RootNamespace ns = metadata_storage.liveNamespace(tf->table_uuid);
             const std::string name = tf->tail;
@@ -695,7 +695,7 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
             if (mode == WriteMode::Append)
                 if (auto existing = metadata_storage.store()->getNamespaceFile(ns, name))
                     prefix_bytes = std::move(*existing);
-            return std::make_unique<ContentAddressed::CaInlineWriteBuffer>(
+            return std::make_unique<Cas::CaInlineWriteBuffer>(
                 [this, ns, name, carried = std::move(prefix_bytes)](std::string bytes)
                 {
                     metadata_storage.store()->putNamespaceFile(ns, name, carried + bytes);
@@ -707,14 +707,14 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
         if (mode == WriteMode::Append)
             if (auto existing = metadata_storage.store()->getMountpointObject(key))
                 prefix_bytes = std::move(*existing);
-        return std::make_unique<ContentAddressed::CaInlineWriteBuffer>(
+        return std::make_unique<Cas::CaInlineWriteBuffer>(
             [this, key, carried = std::move(prefix_bytes)](std::string bytes)
             {
                 metadata_storage.store()->putMountpointObject(key, carried + bytes);
             });
     }
 
-    auto p = ContentAddressed::parsePartFilePath(path);
+    auto p = Cas::parsePartFilePath(path);
     auto r = p ? metadata_storage.route(*p) : std::nullopt;
     if (!r || r->file.empty())
         throw Exception(ErrorCodes::NOT_IMPLEMENTED,
@@ -733,7 +733,7 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
     /// `publishStaging` uploads it (Local) or promotes the S3 staging object post-precommit.
     /// recordPendingBlobDep (inside stageBlobPartFile) records a tokenless dependency without any
     /// pool operation at staging time.
-    if (ContentAddressed::partFileMustStayBlob(r->file))
+    if (Cas::partFileMustStayBlob(r->file))
     {
         /// S3-native staging:
         /// when this disk opted in (`staging_backend=s3`) AND the mount-time capability probe
@@ -749,7 +749,7 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
         /// parse it back at that SAME width via `Cas::codecFor(hash_algo)` (never a pool-wide
         /// `DigestCodec`, which no longer exists) into a full `BlobRef` pair.
 
-        if (metadata_storage.stagingBackend() == StagingBackend::S3 && metadata_storage.conditionalCopySupported())
+        if (metadata_storage.stagingBackend() == Cas::StagingBackend::S3 && metadata_storage.conditionalCopySupported())
         {
             const std::string staging_key = metadata_storage.stagingKeyPrefix() + "/" + getRandomASCIIString(32) + ".tmp";
             auto object_sink = metadata_storage.objectStorage()->writeObject(StoredObject(staging_key), WriteMode::Rewrite);
@@ -760,7 +760,7 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
             /// buffer writes this header first, UNHASHED and excluded from the reported size, so the
             /// content key stays the pool's hash of `payload` and `blob_size` stays the payload size.
             std::string envelope_header = buildS3StagingBlobHeader(*r);
-            return std::make_unique<ContentAddressed::CaContentWriteBuffer>(
+            return std::make_unique<Cas::CaContentWriteBuffer>(
                 std::move(object_sink),
                 staging_key,
                 std::move(envelope_header),
@@ -771,11 +771,11 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
                 [this, route = *r, hash_algo](const std::string & hash_hex, size_t size, const std::string & key)
                 {
                     const Cas::BlobRef ref{hash_algo, Cas::codecFor(hash_algo).fromHex(hash_hex)};
-                    stageBlobPartFile(route, ref, size, key, StagingBackend::S3);
+                    stageBlobPartFile(route, ref, size, key, Cas::StagingBackend::S3);
                 });
         }
 
-        return std::make_unique<ContentAddressed::CaContentWriteBuffer>(
+        return std::make_unique<Cas::CaContentWriteBuffer>(
             metadata_storage.scratchPath(),
             hash_algo,
             buf_size,
@@ -784,14 +784,14 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
             [this, route = *r, hash_algo](const std::string & hash_hex, size_t size, const std::string & temp_path)
             {
                 const Cas::BlobRef ref{hash_algo, Cas::codecFor(hash_algo).fromHex(hash_hex)};
-                stageBlobPartFile(route, ref, size, temp_path, StagingBackend::Local);
+                stageBlobPartFile(route, ref, size, temp_path, Cas::StagingBackend::Local);
             });
     }
 
     /// Inline candidate (small eager metadata): buffer in memory, decide at finalize. <= INLINE_CAP
     /// rides the single tree object as an Inline entry (one-GET part open); an oversized
     /// candidate spills to a blob (the safety net).
-    return std::make_unique<ContentAddressed::CaInlineWriteBuffer>(
+    return std::make_unique<Cas::CaInlineWriteBuffer>(
         [this, route = *r](std::string bytes)
         {
             /// Mint via the one write hash function, `Cas::poolContentHash` (algorithm, payload) -> BlobRef
@@ -839,11 +839,11 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
                 /// Until stageBlobPartFile takes ownership, WE own the temp file — mirror the blob path,
                 /// where CaContentWriteBuffer's dtor removes it unless the callback succeeded. If
                 /// stageBlobPartFile throws, drop the orphan instead of leaking it into scratch. This
-                /// fallback is always `StagingBackend::Local` — an oversized inline candidate is rare
+                /// fallback is always `Cas::StagingBackend::Local` — an oversized inline candidate is rare
                 /// enough (a safety net, not a hot path) that S3-staging mode does not cover it.
                 bool staged = false;
                 SCOPE_EXIT({ if (!staged) { std::error_code ec; std::filesystem::remove(temp_path, ec); } });
-                stageBlobPartFile(route, ref, bytes.size(), temp_path, StagingBackend::Local);
+                stageBlobPartFile(route, ref, bytes.size(), temp_path, Cas::StagingBackend::Local);
                 staged = true;
             }
         });
@@ -885,15 +885,15 @@ void ContentAddressedTransaction::removeRecursive(const std::string & path, cons
     /// deletion, which CA always defers, so it is intentionally ignored here.
 
     /// FREEZE shadow shapes first (a shadow table dir also satisfies parseTableUuid).
-    if (ContentAddressed::isShadowPath(path))
+    if (Cas::isShadowPath(path))
     {
-        if (auto p = ContentAddressed::parsePartFilePath(path); p && !p->backup_name.empty() && p->file.empty())
+        if (auto p = Cas::parsePartFilePath(path); p && !p->backup_name.empty() && p->file.empty())
         {
             const auto ns = ContentAddressedMetadataStorage::shadowNamespace(p->shadow_table_dir);
             metadata_storage.partAccess().dropRefIfPresent({ns, p->part_name});
             return;
         }
-        if (ContentAddressed::endsWithTableUuidPair(path))
+        if (Cas::endsWithTableUuidPair(path))
         {
             metadata_storage.partAccess().dropNamespace(ContentAddressedMetadataStorage::shadowNamespace(path));
             return;
@@ -910,17 +910,17 @@ void ContentAddressedTransaction::removeRecursive(const std::string & path, cons
 
     /// Table dir: the table's namespace (live + folded-in detached refs) and every verbatim
     /// file go in one dropNamespace.
-    if (auto uuid = ContentAddressed::parseTableUuid(path))
+    if (auto uuid = Cas::parseTableUuid(path))
     {
         metadata_storage.partAccess().dropNamespace(metadata_storage.liveNamespace(*uuid));
         return;
     }
 
-    if (auto p = ContentAddressed::parsePartFilePath(path))
+    if (auto p = Cas::parsePartFilePath(path))
     {
         auto r = metadata_storage.route(*p);
         /// The detached CONTAINER dir (DROP DETACHED / table-detach): drop all detached refs.
-        if (r && r->ref.empty() && p->part_name == ContentAddressed::kDetachedDirName)
+        if (r && r->ref.empty() && p->part_name == Cas::kDetachedDirName)
         {
             for (const auto & ref : metadata_storage.detachedRefNames(r->ns))
                 metadata_storage.partAccess().dropRefIfPresent({r->ns, ref});
@@ -929,7 +929,7 @@ void ContentAddressedTransaction::removeRecursive(const std::string & path, cons
         /// The moving CONTAINER dir (MOVE-to-CA fix, mirrors detached): the mover's crash-cleanup
         /// (MergeTreeData.cpp, MOVING_DIR_NAME) calls this at table load to reclaim every staging
         /// ref an interrupted move left behind.
-        if (r && r->ref.empty() && p->part_name == ContentAddressed::kMovingDirName)
+        if (r && r->ref.empty() && p->part_name == Cas::kMovingDirName)
         {
             for (const auto & ref : metadata_storage.movingRefNames(r->ns))
                 metadata_storage.partAccess().dropRefIfPresent({r->ns, ref});
@@ -948,7 +948,7 @@ void ContentAddressedTransaction::removeRecursive(const std::string & path, cons
     }
 
     /// Table-level SUBDIRECTORY (deduplication_logs/): remove every verbatim file under it.
-    if (auto tf = ContentAddressed::parseTableFilePath(path))
+    if (auto tf = Cas::parseTableFilePath(path))
     {
         const auto ns = metadata_storage.liveNamespace(tf->table_uuid);
         const std::string prefix = tf->tail + "/";
@@ -1003,7 +1003,7 @@ void ContentAddressedTransaction::createHardLink(const std::string & path_from, 
     /// record a TOKENLESS W-EVIDENCE dep for its blob (no HEAD before precommit; promote re-proves it).
     /// ForceFresh getView == resolveRef(allow_stale=false) + readManifestShared, so this is the same
     /// request pattern as before, now instrumented via the facade.
-    auto view = metadata_storage.partAccess().getView(src->refKey(), ContentAddressed::Freshness::ForceFresh);
+    auto view = metadata_storage.partAccess().getView(src->refKey(), Cas::Freshness::ForceFresh);
     if (!view)
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
             "ContentAddressed: createHardLink source part missing: {}", path_from);
@@ -1035,8 +1035,8 @@ void ContentAddressedTransaction::setReadOnly(const std::string &)
 
 void ContentAddressedTransaction::moveDirectory(const std::string & path_from, const std::string & path_to)
 {
-    auto src_p = ContentAddressed::parsePartFilePath(path_from);
-    auto dst_p = ContentAddressed::parsePartFilePath(path_to);
+    auto src_p = Cas::parsePartFilePath(path_from);
+    auto dst_p = Cas::parsePartFilePath(path_to);
     auto src = src_p ? metadata_storage.route(*src_p) : std::nullopt;
     auto dst = dst_p ? metadata_storage.route(*dst_p) : std::nullopt;
 
@@ -1053,9 +1053,9 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
     /// two namespaces, but re-driving the SAME rename completes it. There is no in-call compensation;
     /// true atomicity would need a durable move-journal (deliberately out of scope — it would touch the
     /// tested GC/journal layer). On partial failure we log loudly so the split state is diagnosable.
-    if (auto src_table = ContentAddressed::parseTableUuid(path_from))
+    if (auto src_table = Cas::parseTableUuid(path_from))
     {
-        if (auto dst_table = ContentAddressed::parseTableUuid(path_to))
+        if (auto dst_table = Cas::parseTableUuid(path_to))
         {
             const auto from_ns = metadata_storage.liveNamespace(*src_table);
             const auto to_ns = metadata_storage.liveNamespace(*dst_table);
@@ -1210,10 +1210,10 @@ void ContentAddressedTransaction::moveFile(const std::string & path_from, const 
 {
     /// Verbatim table-level files and loose mountpoint files: physically move the object (the
     /// mutation entry tmp_mutation_N.txt -> mutation_N.txt rename; already durable from its finalize).
-    if (!ContentAddressed::isPartFilePath(path_from) && !ContentAddressed::isPartFilePath(path_to))
+    if (!Cas::isPartFilePath(path_from) && !Cas::isPartFilePath(path_to))
     {
-        auto move_table_verbatim = [&](const ContentAddressed::TableFilePath & src_tf,
-                                       const ContentAddressed::TableFilePath & dst_tf)
+        auto move_table_verbatim = [&](const Cas::TableFilePath & src_tf,
+                                       const Cas::TableFilePath & dst_tf)
         {
             const Cas::RootNamespace src_ns = metadata_storage.liveNamespace(src_tf.table_uuid);
             const Cas::RootNamespace dst_ns = metadata_storage.liveNamespace(dst_tf.table_uuid);
@@ -1236,8 +1236,8 @@ void ContentAddressedTransaction::moveFile(const std::string & path_from, const 
             metadata_storage.store()->putNamespaceFile(dst_ns, dst_tf.tail, *bytes);
             metadata_storage.store()->removeNamespaceFile(src_ns, src_tf.tail);
         };
-        auto src_tf = ContentAddressed::parseTableFilePath(path_from);
-        auto dst_tf = ContentAddressed::parseTableFilePath(path_to);
+        auto src_tf = Cas::parseTableFilePath(path_from);
+        auto dst_tf = Cas::parseTableFilePath(path_to);
         if (src_tf && dst_tf)
         {
             move_table_verbatim(*src_tf, *dst_tf);
@@ -1370,7 +1370,7 @@ void ContentAddressedTransaction::unlinkFile(const std::string & path, bool /*if
 
     /// Verbatim table-level / loose mountpoint file: reclaim the object NOW (GC never scans them;
     /// a pruned mutation entry would otherwise leak until DROP.
-    if (auto tf = ContentAddressed::parseTableFilePath(path))
+    if (auto tf = Cas::parseTableFilePath(path))
     {
         metadata_storage.store()->removeNamespaceFile(metadata_storage.liveNamespace(tf->table_uuid), tf->tail);
         return;
@@ -1387,7 +1387,7 @@ void ContentAddressedTransaction::truncateFile(const std::string &, size_t)
 
 }
 
-namespace DB::ContentAddressed
+namespace DB::Cas
 {
 
 CaContentWriteBuffer::CaContentWriteBuffer(

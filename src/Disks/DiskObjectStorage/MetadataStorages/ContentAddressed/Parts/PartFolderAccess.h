@@ -15,7 +15,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace DB::ContentAddressed
+namespace DB::Cas
 {
 
 /// Stable identity of a committed part or projection folder: its owning root namespace and
@@ -111,7 +111,7 @@ private:
 
 namespace DB::Cas { class PartWriteTxn; }
 
-namespace DB::ContentAddressed
+namespace DB::Cas
 {
 
 /// Controls whether `ForceFresh` must re-prove the manifest body on every access. `Always` (the default)

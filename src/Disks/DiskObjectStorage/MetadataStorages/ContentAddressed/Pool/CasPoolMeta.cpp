@@ -28,11 +28,6 @@ UInt128 mintPoolId()
     return (hi << 64) | lo;
 }
 
-}
-
-namespace
-{
-
 /// Whether `config_algo` is already a registered member of `pool.algos_used`. Membership, not the
 /// opt-in flag, is the steady-state check. `algos_used` is kept sorted, so this is a binary search.
 bool isAlgoAdmittedIn(const PoolMeta & pool, BlobHashAlgo config_algo)

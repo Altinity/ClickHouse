@@ -10,7 +10,7 @@
 #include <algorithm>
 #include <optional>
 
-namespace DB::ContentAddressed
+namespace DB::Cas
 {
 
 namespace

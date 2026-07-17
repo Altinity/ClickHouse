@@ -4,7 +4,7 @@
 #include <string_view>
 #include <vector>
 
-namespace DB::ContentAddressed
+namespace DB::Cas
 {
 
 /// Classifies disk-relative ClickHouse paths for the content-addressed metadata-storage wiring.

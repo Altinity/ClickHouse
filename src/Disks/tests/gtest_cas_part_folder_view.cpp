@@ -7,11 +7,11 @@ TEST(CasPartRefKey, CacheKeyIsUnambiguous)
 {
     /// Refs may contain '/' (the `detached/<part>` fold, B181); the '\0' join keeps
     /// (ns="a", ref="b/c") distinct from (ns="a/b", ref="c").
-    const ContentAddressed::PartRefKey k1{Cas::RootNamespace{"a"}, "b/c"};
-    const ContentAddressed::PartRefKey k2{Cas::RootNamespace{"a/b"}, "c"};
+    const Cas::PartRefKey k1{Cas::RootNamespace{"a"}, "b/c"};
+    const Cas::PartRefKey k2{Cas::RootNamespace{"a/b"}, "c"};
     EXPECT_NE(k1.cacheKey(), k2.cacheKey());
     EXPECT_FALSE(k1 == k2);
-    EXPECT_TRUE((k1 == ContentAddressed::PartRefKey{Cas::RootNamespace{"a"}, "b/c"}));
+    EXPECT_TRUE((k1 == Cas::PartRefKey{Cas::RootNamespace{"a"}, "b/c"}));
 }
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Parts/PartFolderAccess.h>
@@ -23,7 +23,7 @@ namespace
 
 using namespace DB;
 
-std::shared_ptr<const ContentAddressed::PartFolderView> makeView()
+std::shared_ptr<const Cas::PartFolderView> makeView()
 {
     auto manifest = std::make_shared<Cas::PartManifest>();
     auto add = [&](const char * path, Cas::EntryPlacement placement, const char * bytes, uint64_t blob_size)
@@ -45,8 +45,8 @@ std::shared_ptr<const ContentAddressed::PartFolderView> makeView()
     add("p.proj/data.bin", Cas::EntryPlacement::Blob, "", 50);
     add("txn_version.txt", Cas::EntryPlacement::Inline, "ver", 3);
 
-    return std::make_shared<const ContentAddressed::PartFolderView>(
-        ContentAddressed::PartRefKey{Cas::RootNamespace{"srv/t"}, "part_1"},
+    return std::make_shared<const Cas::PartFolderView>(
+        Cas::PartRefKey{Cas::RootNamespace{"srv/t"}, "part_1"},
         Cas::ManifestId{Cas::RootNamespace{"srv/t"}, Cas::ManifestRef{1, 2, 3}},
         /*manifest_size=*/1000, manifest,
         /*validated_at_ms=*/42);
@@ -98,7 +98,7 @@ TEST(CasPartFolderView, SizesAndBytes)
 
 TEST(CasPartFolderView, ProjectionDirPrefixRecognizer)
 {
-    using V = ContentAddressed::PartFolderView;
+    using V = Cas::PartFolderView;
     EXPECT_EQ(V::projectionDirPrefix("p.proj"), std::optional<std::string>("p.proj/"));
     EXPECT_EQ(V::projectionDirPrefix("a/b.tmp_proj"), std::optional<std::string>("a/b.tmp_proj/"));
     EXPECT_EQ(V::projectionDirPrefix("data.bin"), std::nullopt);

@@ -142,7 +142,7 @@ private:
         /// `CaContentWriteBuffer` at finalize. The backend selects cleanup and read-your-writes:
         /// local files are removed by this transaction, whereas aborted S3 objects must remain
         /// available to the mount-lease sweeper and to recovery of the promote source.
-        struct PendingBlob { Cas::BlobRef ref; std::string staging_key; uint64_t size = 0; StagingBackend backend = StagingBackend::Local; };
+        struct PendingBlob { Cas::BlobRef ref; std::string staging_key; uint64_t size = 0; Cas::StagingBackend backend = Cas::StagingBackend::Local; };
         std::vector<PendingBlob> pending_blobs;    /// Staged blobs uploaded after the manifest edge is precommitted.
     };
 
@@ -156,7 +156,7 @@ private:
     /// (Local or S3-staging, `backend` says which) and the always-Local inline-cap fallback.
     void stageBlobPartFile(const ContentAddressedMetadataStorage::Route & route,
                            const Cas::BlobRef & ref, size_t size, const std::string & staging_key,
-                           StagingBackend backend);
+                           Cas::StagingBackend backend);
 
     /// Builds the fixed-length CABL envelope header for a staging blob, with a fresh `incarnation_tag`,
     /// so the S3 staging object holds `[header][payload]` and the promote
@@ -211,7 +211,7 @@ private:
 
 }
 
-namespace DB::ContentAddressed
+namespace DB::Cas
 {
 
 /// Part files that must NOT be inlined into the tree: per-column data (`.bin`) and marks (`.mrk*`/

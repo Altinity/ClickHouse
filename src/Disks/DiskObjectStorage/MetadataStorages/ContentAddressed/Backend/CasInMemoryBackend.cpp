@@ -61,11 +61,6 @@ private:
     bool done_ = false;
 };
 
-}
-
-namespace
-{
-
 /// The windowed slice of `data` for `range`, with the same clamping `get` documents: an offset at or
 /// past EOF yields an empty result; an open-ended length runs to EOF. Shared by `get` and `getStream`
 /// so the two stay in lockstep.

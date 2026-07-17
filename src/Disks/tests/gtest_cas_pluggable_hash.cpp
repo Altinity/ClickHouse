@@ -13,7 +13,7 @@
 /// `ConcurrentAdmissionUnions` below.
 ///
 /// P1-T3a (this file, extended): the pool's `blob_hash_algo` is threaded into the three hash sites
-/// (spec §5/§6) -- `ContentAddressed::CaContentWriteBuffer` (streaming blob-body hash),
+/// (spec §5/§6) -- `Cas::CaContentWriteBuffer` (streaming blob-body hash),
 /// `PartWriteTxn`'s envelope `hash_algo` field, and (transitively, via `Cas::blobHashHexOneShot`) the
 /// `poolContentHash` content-key mint on the write path. `poolContentHash` itself is a static
 /// helper in `CasPartWriteTxn.cpp` and not directly reachable from a gtest; its production callers already
@@ -163,7 +163,7 @@ TEST(CasPluggableHash, ConcurrentAdmissionUnions)
 
 /// ---- P1-T3a: the pool's blob_hash_algo threaded into the streaming write-buffer hash site ----
 
-/// `ContentAddressed::CaContentWriteBuffer`'s LOCAL-staging constructor (the everyday spill-to-temp-file
+/// `Cas::CaContentWriteBuffer`'s LOCAL-staging constructor (the everyday spill-to-temp-file
 /// mode `ContentAddressedTransaction::writeFile` uses), built with `BlobHashAlgo::XXH3_128`, must hash
 /// the streamed payload with xxh3 -- agreeing with the standalone `blobHashHexOneShot` one-shot helper
 /// (the same convention `poolContentHash`'s re-hash uses).
@@ -174,7 +174,7 @@ TEST(CasPluggableHash, ContentWriteBufferLocalModeHashesWithSelectedAlgoXxh3)
 
     std::string got_hash_hex;
     size_t got_size = 0;
-    auto buf = std::make_unique<DB::ContentAddressed::CaContentWriteBuffer>(
+    auto buf = std::make_unique<DB::Cas::CaContentWriteBuffer>(
         temp_dir,
         BlobHashAlgo::XXH3_128,
         /*buf_size=*/8192,
@@ -210,7 +210,7 @@ TEST(CasPluggableHash, ContentWriteBufferLocalModeCityHash128Unchanged)
     const auto temp_dir = (std::filesystem::temp_directory_path() / "cas_pluggable_hash_ch128_local").string();
 
     std::string got_hash_hex;
-    auto buf = std::make_unique<DB::ContentAddressed::CaContentWriteBuffer>(
+    auto buf = std::make_unique<DB::Cas::CaContentWriteBuffer>(
         temp_dir,
         BlobHashAlgo::CityHash128,
         /*buf_size=*/8192,

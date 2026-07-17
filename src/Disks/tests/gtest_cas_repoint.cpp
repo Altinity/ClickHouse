@@ -56,9 +56,9 @@ TEST(CasRepoint, ByteEqualIsNoOp)
     auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
     auto store = DB::Cas::tests::openPoolForTest(backend);
     const RootNamespace ns{"srv/t1"};
-    DB::ContentAddressed::CachedPartFolderAccess access(store);
+    DB::Cas::CachedPartFolderAccess access(store);
     const auto id = publishPart(store, ns, "part_1", {inlineEntry("checksums.txt", "cs")});
-    const DB::ContentAddressed::PartRefKey key{ns, "part_1"};
+    const DB::Cas::PartRefKey key{ns, "part_1"};
 
     backend->resetCounts();
     const uint64_t repoints_before = ProfileEvents::global_counters[ProfileEvents::CasRefRepoint].load();
@@ -78,13 +78,13 @@ TEST(CasRepoint, AddFileRepoints)
     auto backend = std::make_shared<DB::Cas::tests::CountingBackend>();
     auto store = DB::Cas::tests::openPoolForTest(backend);
     const RootNamespace ns{"srv/t1"};
-    DB::ContentAddressed::CachedPartFolderAccess access(
+    DB::Cas::CachedPartFolderAccess access(
         store, {.cache_bytes = 64ULL << 20, .max_entries = 10000, .max_entry_bytes = 16ULL << 20,
                 .explain_enabled = false, .validate = {}});
     const auto id_before = publishPart(store, ns, "part_1", {inlineEntry("checksums.txt", "cs")});
-    const DB::ContentAddressed::PartRefKey key{ns, "part_1"};
+    const DB::Cas::PartRefKey key{ns, "part_1"};
     /// Warm the retained view so the erase-on-success cache discipline is actually exercised.
-    ASSERT_NE(access.getView(key, DB::ContentAddressed::Freshness::CachedForLoad), nullptr);
+    ASSERT_NE(access.getView(key, DB::Cas::Freshness::CachedForLoad), nullptr);
 
     const uint64_t repoints_before = ProfileEvents::global_counters[ProfileEvents::CasRefRepoint].load();
     const std::vector<ManifestEntry> new_entries{inlineEntry("checksums.txt", "cs"), inlineEntry("metadata_version.txt", "7")};
@@ -96,7 +96,7 @@ TEST(CasRepoint, AddFileRepoints)
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasRefRepoint].load(), repoints_before + 1);
 
     /// The view a caller reads next must reflect the new file, not a stale retained one.
-    auto view = access.getView(key, DB::ContentAddressed::Freshness::CachedForLoad);
+    auto view = access.getView(key, DB::Cas::Freshness::CachedForLoad);
     ASSERT_NE(view, nullptr);
     EXPECT_TRUE(view->hasFile("metadata_version.txt"));
 }

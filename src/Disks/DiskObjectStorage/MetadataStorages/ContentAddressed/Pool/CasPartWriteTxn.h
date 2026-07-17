@@ -29,7 +29,7 @@ struct BlobSource
     /// WRITE-ONCE conditional SERVER-SIDE COPY (`Backend::promoteStaged`) instead of streaming
     /// `write_payload` — and resurrects a condemned incarnation by an unconditional server-side copy
     /// from the SAME staging object (`Backend::resurrectStaged`), never a read of the condemned blob
-    /// (`feedback_ca_resurrect_invariant`). Unset (the default, `StagingBackend::Local`) ⇒ the local
+    /// (revival must always be a fresh write from the source). Unset (the default, `StagingBackend::Local`) ⇒ the local
     /// streaming path is byte-for-byte unchanged and `write_payload` is the source.
     std::optional<String> server_side_copy_from;
     /// Build a re-readable source backed by an owned string; intended for small payloads and tests.

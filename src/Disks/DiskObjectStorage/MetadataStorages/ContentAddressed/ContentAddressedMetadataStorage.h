@@ -14,7 +14,7 @@
 
 namespace Poco::Util { class AbstractConfiguration; }
 
-namespace DB
+namespace DB::Cas
 {
 
 /// Selects where a content-addressed blob is staged before it is published.
@@ -29,6 +29,11 @@ enum class StagingBackend
     Local,
     S3,
 };
+
+}
+
+namespace DB
+{
 
 /// Adapts ClickHouse's `IMetadataStorage` path-based interface to the content-addressed pool.
 ///
@@ -84,7 +89,7 @@ public:
         uint64_t gc_meta_pool_size_ = 16,
         /// Selects local or opt-in object-store staging. The trailing default preserves the existing
         /// local write path for callers that do not configure S3 staging.
-        StagingBackend staging_backend_ = StagingBackend::Local,
+        Cas::StagingBackend staging_backend_ = Cas::StagingBackend::Local,
         /// Selects the pool's blob content-hash function. The default `CityHash128` preserves the
         /// existing key encoding for positional callers.
         Cas::BlobHashAlgo blob_hash_algo_ = Cas::BlobHashAlgo::CityHash128,
@@ -99,16 +104,16 @@ public:
         uint64_t materialization_grace_ms_ = 30000,
         /// Configures when retained part-folder views must revalidate their manifest body. The
         /// default `Mode::Always` retains the strict validation behavior used by existing callers.
-        ContentAddressed::PartFolderValidate part_folder_validate_ = {});
+        Cas::PartFolderValidate part_folder_validate_ = {});
 
     /// Parses `staging_backend`, defaulting to `local`. Throws `BAD_ARGUMENTS` for an unrecognized
     /// value rather than silently selecting a backend.
-    static StagingBackend parseStagingBackend(const Poco::Util::AbstractConfiguration & config, const std::string & config_prefix);
+    static Cas::StagingBackend parseStagingBackend(const Poco::Util::AbstractConfiguration & config, const std::string & config_prefix);
 
     /// Parses `part_folder_validate`, defaulting to `always`. The `age` form accepts only a
     /// non-negative integer number of seconds; malformed input and unknown modes throw
     /// `BAD_ARGUMENTS` instead of silently selecting a policy.
-    static ContentAddressed::PartFolderValidate parsePartFolderValidate(const Poco::Util::AbstractConfiguration & config, const std::string & config_prefix);
+    static Cas::PartFolderValidate parsePartFolderValidate(const Poco::Util::AbstractConfiguration & config, const std::string & config_prefix);
 
     /// Runs one synchronous GC round for tests and diagnostics. If the scheduler is not running,
     /// this lazily creates one so repeated calls retain the same lease-observation history.
@@ -129,7 +134,7 @@ public:
     /// disk has no scheduler because GC is disabled, the disk is read-only, or startup has not run.
     /// Holds `gc_scheduler_mutex` for the entire call so a concurrent system-table query cannot
     /// observe a scheduler while `shutdown` destroys it.
-    std::optional<ContentAddressed::CasGcScheduler::GcHealth> gcHealth() const;
+    std::optional<Cas::CasGcScheduler::GcHealth> gcHealth() const;
 
     MetadataStorageType getType() const override { return MetadataStorageType::ContentAddressed; }
     const std::string & getPath() const override { return storage_path_full; }
@@ -200,12 +205,12 @@ public:
     /// Returns the cached part-folder facade by reference. Throws `LOGICAL_ERROR` before `startup`.
     /// Committed part-folder reads and mutations go through this facade so cache validation remains
     /// centralized.
-    ContentAddressed::CachedPartFolderAccess & partAccess() const;
+    Cas::CachedPartFolderAccess & partAccess() const;
     const std::string & serverRootId() const { return server_root_id; }
     const std::string & scratchPath() const { return local_scratch_path; }
     /// Returns the configured staging backend. `Local` is the behavior-preserving default; callers
     /// must also check `conditionalCopySupported` before using S3 promotion.
-    StagingBackend stagingBackend() const { return staging_backend; }
+    Cas::StagingBackend stagingBackend() const { return staging_backend; }
     /// Returns the mount-time conditional-copy capability result. It starts false and becomes true
     /// only after the backend proves write-once copy semantics, so S3 promotion fails closed.
     bool conditionalCopySupported() const { return conditional_copy_supported; }
@@ -291,11 +296,11 @@ public:
         std::string file;   /// empty => the path is the part dir itself
 
         /// The (ns, ref) identity subset — what the part-folder access layer keys on.
-        ContentAddressed::PartRefKey refKey() const { return {ns, ref}; }
+        Cas::PartRefKey refKey() const { return {ns, ref}; }
     };
     /// Converts a parsed path into the namespace/reference/file tuple used by the part-folder
     /// facade. Returns nullopt only when the parsed path cannot be routed.
-    std::optional<Route> route(const ContentAddressed::PartFilePath & p) const;
+    std::optional<Route> route(const Cas::PartFilePath & p) const;
 
     /// Returns full `detached/<part>` reference names in a namespace.
     std::vector<std::string> detachedRefNames(const Cas::RootNamespace & ns) const;
@@ -331,10 +336,10 @@ public:
         /// (a defined shape) instead of switching on an indeterminate enum (UB). Matches the
         /// existing unreachable-fallthrough choice at the bottom of existsDirectory/listDirectory.
         DirShape shape = DirShape::GenericIntermediate;
-        std::optional<ContentAddressed::PartFilePath> p;
+        std::optional<Cas::PartFilePath> p;
         std::optional<Route> r;
         std::optional<std::string> uuid;
-        std::optional<ContentAddressed::TableFilePath> tf;
+        std::optional<Cas::TableFilePath> tf;
         std::optional<std::string> projection_prefix;
     };
 
@@ -372,7 +377,7 @@ private:
     /// Bounded pool size for GC's per-hash freshness-metadata writes.
     const uint64_t gc_meta_pool_size;
     /// Configured staging backend; `Local` preserves the existing write path.
-    const StagingBackend staging_backend;
+    const Cas::StagingBackend staging_backend;
     /// Blob content-hash function passed to `Cas::PoolConfig`.
     const Cas::BlobHashAlgo blob_hash_algo;
     /// Whether `blob_hash_algo` may be admitted into the pool's persisted `algos_used` set.
@@ -382,7 +387,7 @@ private:
     /// Grace period for materialization after an unclean predecessor, passed to `Cas::PoolConfig`.
     const uint64_t materialization_grace_ms;
     /// Policy controlling when retained part-folder views revalidate their manifest body.
-    const ContentAddressed::PartFolderValidate part_folder_validate;
+    const Cas::PartFolderValidate part_folder_validate;
     /// Set by the mount-time conditional-copy capability probe — not const because the result is
     /// unavailable until startup.
     /// Defaults to false (fail-close): assumed unsupported until the probe proves otherwise.
@@ -393,9 +398,9 @@ private:
     /// The part-folder access facade: the normal path
     /// for committed part/projection reads and committed part-ref mutations. Constructed in
     /// startup right after Pool::open; reset in shutdown before cas_store.
-    std::unique_ptr<ContentAddressed::CachedPartFolderAccess> part_access;
+    std::unique_ptr<Cas::CachedPartFolderAccess> part_access;
     String pool_uuid;
-    std::unique_ptr<ContentAddressed::CasGcScheduler> gc_scheduler;
+    std::unique_ptr<Cas::CasGcScheduler> gc_scheduler;
     /// Guards lazy scheduler creation in `runOneGcRoundForTest` and `runGarbageCollectionRoundNow`
     /// against a racing manual `SYSTEM ... GC` on another query thread; the round itself runs OUTSIDE
     /// this lock (CasGcScheduler::runOneRoundNow has its own gc_round_mutex for that). Also taken around
@@ -434,7 +439,7 @@ private:
     /// Build the GC round sink: the std::function the scheduler calls per Start/Finish. Captures the
     /// ContextPtr, converts the POD GcRoundLogRecord into a ContentAddressedGarbageCollectionLogElement,
     /// and appends it to the SystemLog (best-effort). Returns an empty sink when context is null.
-    ContentAddressed::GcRoundLogger makeGcRoundLogger() const;
+    Cas::GcRoundLogger makeGcRoundLogger() const;
 
     /// Builds the per-event CAS audit sink: the `std::function` the pool calls on every
     /// content-addressed decision. Captures the ContextPtr, converts the decoupled Core POD

@@ -10,7 +10,7 @@
 #include <map>
 #include <mutex>
 
-namespace DB::ContentAddressed
+namespace DB::Cas
 {
 
 /// The decoupled, pure-data record the Disks-layer GC scheduler emits per round. It carries NO

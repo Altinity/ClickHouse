@@ -149,12 +149,12 @@ TEST(CasLayout, RegistryDeletedGcDiscoveryViaList)
 
 TEST(CasLayout, CasArchiveSuffixConstant)
 {
-    EXPECT_EQ(DB::ContentAddressed::kCasArchiveSuffix, "@cas@");
+    EXPECT_EQ(DB::Cas::kCasArchiveSuffix, "@cas@");
 }
 
 TEST(CasVfsPaths, MirroredArchiveNamespace)
 {
-    using DB::ContentAddressed::mirroredArchiveNamespace;
+    using DB::Cas::mirroredArchiveNamespace;
     /// Atomic: bare uuid -> store/<u3>/<uuid>@cas@
     EXPECT_EQ(mirroredArchiveNamespace("3f2a0000-0000-0000-0000-000000000001"),
               "store/3f2/3f2a0000-0000-0000-0000-000000000001@cas@");

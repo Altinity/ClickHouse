@@ -92,7 +92,7 @@ void addFirstComponent(std::unordered_set<std::string> & out, const std::string 
 /// table-dir surfaces under its logical (unsuffixed) name in directory listings.
 std::string stripCasArchiveSuffix(std::string s)
 {
-    const auto & suffix = ContentAddressed::kCasArchiveSuffix;
+    const auto & suffix = Cas::kCasArchiveSuffix;
     if (s.size() >= suffix.size() && std::string_view(s).ends_with(suffix))
         s.resize(s.size() - suffix.size());
     return s;
@@ -144,12 +144,12 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     uint64_t cas_part_folder_cache_max_entry_bytes_,
     uint64_t manifest_decode_cache_bytes_,
     uint64_t gc_meta_pool_size_,
-    StagingBackend staging_backend_,
+    Cas::StagingBackend staging_backend_,
     Cas::BlobHashAlgo blob_hash_algo_,
     bool blob_hash_allow_new_,
     bool skip_access_check_,
     uint64_t materialization_grace_ms_,
-    ContentAddressed::PartFolderValidate part_folder_validate_)
+    Cas::PartFolderValidate part_folder_validate_)
     : object_storage(std::move(object_storage_))
     , storage_path_prefix(std::move(storage_path_prefix_))
     , storage_path_full(fs::path(object_storage->getRootPrefix()) / storage_path_prefix)
@@ -181,22 +181,22 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
 {
 }
 
-StagingBackend ContentAddressedMetadataStorage::parseStagingBackend(
+Cas::StagingBackend ContentAddressedMetadataStorage::parseStagingBackend(
     const Poco::Util::AbstractConfiguration & config, const std::string & config_prefix)
 {
     const std::string value = config.getString(config_prefix + ".staging_backend", "local");
     if (value == "local")
-        return StagingBackend::Local;
+        return Cas::StagingBackend::Local;
     if (value == "s3")
-        return StagingBackend::S3;
+        return Cas::StagingBackend::S3;
     throw Exception(ErrorCodes::BAD_ARGUMENTS,
         "Unknown staging_backend value '{}' (expected 'local' or 's3')", value);
 }
 
-ContentAddressed::PartFolderValidate ContentAddressedMetadataStorage::parsePartFolderValidate(
+Cas::PartFolderValidate ContentAddressedMetadataStorage::parsePartFolderValidate(
     const Poco::Util::AbstractConfiguration & config, const std::string & config_prefix)
 {
-    using PartFolderValidate = ContentAddressed::PartFolderValidate;
+    using PartFolderValidate = Cas::PartFolderValidate;
     const std::string value = config.getString(config_prefix + ".part_folder_validate", "always");
     if (value == "always")
         return {PartFolderValidate::Mode::Always, 0};
@@ -225,11 +225,11 @@ void ContentAddressedMetadataStorage::runOneGcRoundForTest()
     /// scheduler per call would acquire the lease on the first call and then back off forever
     /// ("incumbent alive" - its own previous incarnation). Recreating the scheduler for every call
     /// would therefore make every round after the first a silent no-op.
-    ContentAddressed::CasGcScheduler * sched;
+    Cas::CasGcScheduler * sched;
     {
         std::lock_guard lock(gc_scheduler_mutex);
         if (!gc_scheduler)
-            gc_scheduler = std::make_unique<ContentAddressed::CasGcScheduler>(
+            gc_scheduler = std::make_unique<Cas::CasGcScheduler>(
                 store(), gc_interval, fmt::format("{}::ContentAddressedGC", storage_path_full),
                 disk_name, makeGcRoundLogger());
         sched = gc_scheduler.get();
@@ -237,7 +237,7 @@ void ContentAddressedMetadataStorage::runOneGcRoundForTest()
     sched->runOneRoundNow();
 }
 
-std::optional<ContentAddressed::CasGcScheduler::GcHealth> ContentAddressedMetadataStorage::gcHealth() const
+std::optional<Cas::CasGcScheduler::GcHealth> ContentAddressedMetadataStorage::gcHealth() const
 {
     /// Holds gc_scheduler_mutex for the WHOLE call (unlike runOneGcRoundForTest/runGarbageCollectionRoundNow,
     /// which only borrow the lock to snapshot the raw pointer before releasing it): this is what lets it
@@ -250,7 +250,7 @@ std::optional<ContentAddressed::CasGcScheduler::GcHealth> ContentAddressedMetada
     return gc_scheduler->gcHealth();
 }
 
-ContentAddressed::GcRoundLogger ContentAddressedMetadataStorage::makeGcRoundLogger() const
+Cas::GcRoundLogger ContentAddressedMetadataStorage::makeGcRoundLogger() const
 {
     /// Unit tests pass a null context (no system logs); the scheduler then runs without a sink.
     if (!context)
@@ -259,7 +259,7 @@ ContentAddressed::GcRoundLogger ContentAddressedMetadataStorage::makeGcRoundLogg
     /// The configured disk name (threaded from the metadata-storage factory); falls back to
     /// storage_path_prefix for callers that don't supply one (e.g. unit tests).
     const String disk = disk_name;
-    return [ctx, disk](const ContentAddressed::GcRoundLogRecord & r)
+    return [ctx, disk](const Cas::GcRoundLogRecord & r)
     {
         auto log = ctx->getContentAddressedGarbageCollectionLog();
         if (!log)
@@ -268,26 +268,26 @@ ContentAddressed::GcRoundLogger ContentAddressedMetadataStorage::makeGcRoundLogg
         const auto now = std::chrono::system_clock::now();
         e.event_time = std::chrono::system_clock::to_time_t(now);
         e.event_time_microseconds = timeInMicroseconds(now);
-        e.event_type = r.event_type == ContentAddressed::GcRoundLogRecord::EventType::Start
+        e.event_type = r.event_type == Cas::GcRoundLogRecord::EventType::Start
             ? ContentAddressedGarbageCollectionLogElement::START
             : ContentAddressedGarbageCollectionLogElement::FINISH;
         e.disk_name = r.disk_name.empty() ? disk : r.disk_name;
         e.gc_id = r.gc_id;
-        e.trigger = r.trigger == ContentAddressed::GcRoundLogRecord::Trigger::Manual
+        e.trigger = r.trigger == Cas::GcRoundLogRecord::Trigger::Manual
             ? ContentAddressedGarbageCollectionLogElement::MANUAL
             : ContentAddressedGarbageCollectionLogElement::SCHEDULED;
         switch (r.outcome)
         {
-            case ContentAddressed::GcRoundLogRecord::Outcome::Unknown:
+            case Cas::GcRoundLogRecord::Outcome::Unknown:
                 e.outcome = ContentAddressedGarbageCollectionLogElement::UNKNOWN;
                 break;
-            case ContentAddressed::GcRoundLogRecord::Outcome::Success:
+            case Cas::GcRoundLogRecord::Outcome::Success:
                 e.outcome = ContentAddressedGarbageCollectionLogElement::SUCCESS;
                 break;
-            case ContentAddressed::GcRoundLogRecord::Outcome::NotALeader:
+            case Cas::GcRoundLogRecord::Outcome::NotALeader:
                 e.outcome = ContentAddressedGarbageCollectionLogElement::NOT_A_LEADER;
                 break;
-            case ContentAddressed::GcRoundLogRecord::Outcome::Failed:
+            case Cas::GcRoundLogRecord::Outcome::Failed:
                 e.outcome = ContentAddressedGarbageCollectionLogElement::FAILED;
                 break;
         }
@@ -356,16 +356,16 @@ Cas::RoundReport ContentAddressedMetadataStorage::runGarbageCollectionRoundNow()
             "Garbage collection is not enabled on this content-addressed disk");
     /// Mirror runOneGcRoundForTest: a STABLE scheduler instance across calls (the lease's
     /// observation-window steal protocol compares consecutive observations of the same gc_id).
-    ContentAddressed::CasGcScheduler * sched;
+    Cas::CasGcScheduler * sched;
     {
         std::lock_guard lock(gc_scheduler_mutex);
         if (!gc_scheduler)
-            gc_scheduler = std::make_unique<ContentAddressed::CasGcScheduler>(
+            gc_scheduler = std::make_unique<Cas::CasGcScheduler>(
                 store(), gc_interval, fmt::format("{}::ContentAddressedGC", storage_path_full),
                 disk_name, makeGcRoundLogger());
         sched = gc_scheduler.get();
     }
-    return sched->runOneRoundNow(ContentAddressed::GcRoundLogRecord::Trigger::Manual);
+    return sched->runOneRoundNow(Cas::GcRoundLogRecord::Trigger::Manual);
 }
 
 Cas::RebuildReport ContentAddressedMetadataStorage::runGcRebuildNow(bool force)
@@ -471,8 +471,8 @@ void ContentAddressedMetadataStorage::startup()
     pool_config.materialization_grace_ms = materialization_grace_ms;
     cas_store = Cas::Pool::open(std::move(backend), std::move(pool_config));
     pool_uuid = Cas::u128ToHex(cas_store->poolMeta().pool_id);
-    part_access = std::make_unique<ContentAddressed::CachedPartFolderAccess>(cas_store,
-        ContentAddressed::CachedPartFolderAccess::CacheParams{
+    part_access = std::make_unique<Cas::CachedPartFolderAccess>(cas_store,
+        Cas::CachedPartFolderAccess::CacheParams{
             .cache_bytes = cas_part_folder_cache_bytes,
             .max_entries = cas_part_folder_cache_max_entries,
             .max_entry_bytes = cas_part_folder_cache_max_entry_bytes,
@@ -492,7 +492,7 @@ void ContentAddressedMetadataStorage::startup()
     /// Fail-close, never fail-open: an unsupported or non-enforcing backend just falls back to local
     /// staging (`conditional_copy_supported` stays `false`) — this is NOT a mount failure, unlike the
     /// mandatory battery, because `local` staging remains fully functional.
-    if (staging_backend == StagingBackend::S3 && !read_only)
+    if (staging_backend == Cas::StagingBackend::S3 && !read_only)
     {
         const String probe_prefix = physicalKey(pool_prefix + "/staging/" + server_root_id + "/probe");
         conditional_copy_supported = Cas::probeConditionalCopy(*object_storage, probe_prefix);
@@ -521,7 +521,7 @@ void ContentAddressedMetadataStorage::startup()
     /// further gating is needed because the scheduler's lease coordinates concurrent mounters.
     if (context && gc_enabled && !read_only)
     {
-        gc_scheduler = std::make_unique<ContentAddressed::CasGcScheduler>(
+        gc_scheduler = std::make_unique<Cas::CasGcScheduler>(
             cas_store, gc_interval, fmt::format("{}::ContentAddressedGC", storage_path_full),
             disk_name, makeGcRoundLogger());
         gc_scheduler->start();
@@ -554,7 +554,7 @@ const Cas::PoolPtr & ContentAddressedMetadataStorage::store() const
     return cas_store;
 }
 
-ContentAddressed::CachedPartFolderAccess & ContentAddressedMetadataStorage::partAccess() const
+Cas::CachedPartFolderAccess & ContentAddressedMetadataStorage::partAccess() const
 {
     if (!part_access)
         throw Exception(ErrorCodes::LOGICAL_ERROR,
@@ -613,7 +613,7 @@ Cas::RootNamespace ContentAddressedMetadataStorage::liveNamespace(const std::str
     /// Path mirroring: the namespace is the table's canonical disk path with the
     /// content-addressed boundary marked by `@cas@` on the table-dir segment, prefixed by the
     /// configured `server_root_id`. e.g. `<server_root_id>/store/3f2/3f2a…@cas@`.
-    return Cas::RootNamespace{serverPrefix() + "/" + ContentAddressed::mirroredArchiveNamespace(table_uuid)};
+    return Cas::RootNamespace{serverPrefix() + "/" + Cas::mirroredArchiveNamespace(table_uuid)};
 }
 
 bool ContentAddressedMetadataStorage::namespaceFilesReadable(const Cas::RootNamespace & ns) const
@@ -632,7 +632,7 @@ Cas::RootNamespace ContentAddressedMetadataStorage::shadowNamespace(const std::s
 
 
 std::optional<ContentAddressedMetadataStorage::Route>
-ContentAddressedMetadataStorage::route(const ContentAddressed::PartFilePath & p) const
+ContentAddressedMetadataStorage::route(const Cas::PartFilePath & p) const
 {
     Route r;
     if (!p.backup_name.empty())
@@ -642,7 +642,7 @@ ContentAddressedMetadataStorage::route(const ContentAddressed::PartFilePath & p)
         r.file = p.file;
         return r;
     }
-    if (p.part_name == ContentAddressed::kDetachedDirName)
+    if (p.part_name == Cas::kDetachedDirName)
     {
         /// The parser reports detached paths with part_name == "detached" and the real detached
         /// part dir as the first component of `file`. Detached parts share the table namespace and
@@ -652,11 +652,11 @@ ContentAddressedMetadataStorage::route(const ContentAddressed::PartFilePath & p)
         /// container dir) yields an empty ref → the filtered-container listing path.
         r.ns = liveNamespace(p.table_uuid);
         auto [part, file] = splitFirstComponent(p.file);
-        r.ref = part.empty() ? "" : std::string(ContentAddressed::kDetachedRefPrefix) + part;
+        r.ref = part.empty() ? "" : std::string(Cas::kDetachedRefPrefix) + part;
         r.file = file;
         return r;
     }
-    if (p.part_name == ContentAddressed::kMovingDirName)
+    if (p.part_name == Cas::kMovingDirName)
     {
         /// L1 (MOVE-to-CA fix): re-split exactly like detached, folding onto a `moving/`-PREFIXED
         /// ref (kMovingRefPrefix) -- NOT the part's final ref directly. Publishing the clone under
@@ -669,7 +669,7 @@ ContentAddressedMetadataStorage::route(const ContentAddressed::PartFilePath & p)
         /// <table>/moving container dir) yields an empty ref, same convention as detached.
         r.ns = liveNamespace(p.table_uuid);
         auto [part, file] = splitFirstComponent(p.file);
-        r.ref = part.empty() ? "" : std::string(ContentAddressed::kMovingRefPrefix) + part;
+        r.ref = part.empty() ? "" : std::string(Cas::kMovingRefPrefix) + part;
         r.file = file;
         return r;
     }
@@ -683,7 +683,7 @@ std::vector<std::string> ContentAddressedMetadataStorage::detachedRefNames(const
 {
     std::vector<std::string> refs;
     for (const auto & [ref, _] : store()->listRefs(ns))
-        if (ref.starts_with(ContentAddressed::kDetachedRefPrefix))
+        if (ref.starts_with(Cas::kDetachedRefPrefix))
             refs.push_back(ref);
     return refs;
 }
@@ -692,7 +692,7 @@ std::vector<std::string> ContentAddressedMetadataStorage::movingRefNames(const C
 {
     std::vector<std::string> refs;
     for (const auto & [ref, _] : store()->listRefs(ns))
-        if (ref.starts_with(ContentAddressed::kMovingRefPrefix))
+        if (ref.starts_with(Cas::kMovingRefPrefix))
             refs.push_back(ref);
     return refs;
 }
@@ -701,9 +701,9 @@ std::vector<std::string> ContentAddressedMetadataStorage::movingRefNames(const C
 
 bool ContentAddressedMetadataStorage::existsFile(const std::string & path) const
 {
-    if (!ContentAddressed::isPartFilePath(path))
+    if (!Cas::isPartFilePath(path))
     {
-        if (auto tf = ContentAddressed::parseTableFilePath(path))
+        if (auto tf = Cas::parseTableFilePath(path))
         {
             const auto ns = liveNamespace(tf->table_uuid);
             return namespaceFilesReadable(ns) && store()->getNamespaceFile(ns, tf->tail).has_value();
@@ -715,7 +715,7 @@ bool ContentAddressedMetadataStorage::existsFile(const std::string & path) const
         return store()->mountpointObjectExists(serverPrefix() + "/" + path);
     }
 
-    auto p = ContentAddressed::parsePartFilePath(path);
+    auto p = Cas::parsePartFilePath(path);
     if (!p || p->file.empty())
         return false;
     auto r = route(*p);
@@ -727,7 +727,7 @@ bool ContentAddressedMetadataStorage::existsFile(const std::string & path) const
     /// Safe to serve a CACHED view here: every committed-ref write that could have moved this entry
     /// (`repointRef`/`promoteBuild`) erases the cached view on success, so a stale hit is impossible
     /// by construction, not by freshness policy.
-    auto view = partAccess().getView(r->refKey(), ContentAddressed::Freshness::CachedForLoad);
+    auto view = partAccess().getView(r->refKey(), Cas::Freshness::CachedForLoad);
     return view && view->findFile(r->file);
 }
 
@@ -737,15 +737,15 @@ ContentAddressedMetadataStorage::DirRoute ContentAddressedMetadataStorage::class
 
     /// FREEZE shadow namespace — routed BEFORE the live branches (a shadow table dir also
     /// satisfies parseTableUuid).
-    if (ContentAddressed::isShadowPath(path))
+    if (Cas::isShadowPath(path))
     {
-        if (auto p = ContentAddressed::parsePartFilePath(path); p && !p->backup_name.empty() && p->file.empty())
+        if (auto p = Cas::parsePartFilePath(path); p && !p->backup_name.empty() && p->file.empty())
         {
             dr.shape = DirShape::ShadowPart;
             dr.p = std::move(p);
             return dr;
         }
-        if (ContentAddressed::endsWithTableUuidPair(path))
+        if (Cas::endsWithTableUuidPair(path))
         {
             dr.shape = DirShape::ShadowTable;
             return dr;
@@ -756,24 +756,24 @@ ContentAddressedMetadataStorage::DirRoute ContentAddressedMetadataStorage::class
 
     /// The Atomic `store/<u3>` shard dir (see listDirectory): route to the generic existence signal
     /// before parseTableUuid/parseTableFilePath misclaim it as a non-Atomic table.
-    if (ContentAddressed::isAtomicShardDir(path))
+    if (Cas::isAtomicShardDir(path))
     {
         dr.shape = DirShape::AtomicShard;
         return dr;
     }
 
-    if (auto uuid = ContentAddressed::parseTableUuid(path))
+    if (auto uuid = Cas::parseTableUuid(path))
     {
         dr.shape = DirShape::TableDir;
         dr.uuid = std::move(uuid);
         return dr;
     }
 
-    if (auto p = ContentAddressed::parsePartFilePath(path))
+    if (auto p = Cas::parsePartFilePath(path))
     {
         auto r = route(*p);
         /// The detached CONTAINER dir <table>/detached.
-        if (r && r->ref.empty() && p->part_name == ContentAddressed::kDetachedDirName)
+        if (r && r->ref.empty() && p->part_name == Cas::kDetachedDirName)
         {
             dr.shape = DirShape::DetachedContainer;
             dr.p = std::move(p);
@@ -783,7 +783,7 @@ ContentAddressedMetadataStorage::DirRoute ContentAddressedMetadataStorage::class
         /// The moving CONTAINER dir <table>/moving (MOVE-to-CA fix): the mover's crash-cleanup
         /// (MergeTreeData.cpp, MOVING_DIR_NAME) existsDirectory/removeRecursive's this bare path
         /// at every table load to reclaim a staging ref left behind by an interrupted move.
-        if (r && r->ref.empty() && p->part_name == ContentAddressed::kMovingDirName)
+        if (r && r->ref.empty() && p->part_name == Cas::kMovingDirName)
         {
             dr.shape = DirShape::MovingContainer;
             dr.p = std::move(p);
@@ -801,7 +801,7 @@ ContentAddressedMetadataStorage::DirRoute ContentAddressedMetadataStorage::class
         /// A projection dir.
         if (r && !r->ref.empty())
         {
-            if (auto prefix = ContentAddressed::PartFolderView::projectionDirPrefix(r->file))
+            if (auto prefix = Cas::PartFolderView::projectionDirPrefix(r->file))
             {
                 dr.shape = DirShape::ProjectionDir;
                 dr.p = std::move(p);
@@ -814,7 +814,7 @@ ContentAddressedMetadataStorage::DirRoute ContentAddressedMetadataStorage::class
     }
 
     /// A table-level SUBDIRECTORY (deduplication_logs/...).
-    if (auto tf = ContentAddressed::parseTableFilePath(path))
+    if (auto tf = Cas::parseTableFilePath(path))
     {
         dr.shape = DirShape::TableSubdir;
         dr.tf = std::move(tf);
@@ -833,7 +833,7 @@ bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) 
     {
         case DirShape::ShadowPart:
             return partAccess().existsRef(Route{shadowNamespace(dr.p->shadow_table_dir), dr.p->part_name, ""}.refKey(),
-                                          ContentAddressed::Freshness::CachedForLoad);
+                                          Cas::Freshness::CachedForLoad);
         case DirShape::ShadowTable:
             return !store()->listRefs(shadowNamespace(path)).empty();
         case DirShape::ShadowIntermediate:
@@ -866,11 +866,11 @@ bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) 
             return !movingRefNames(dr.r->ns).empty();
         case DirShape::PartDir:
             /// Exists iff its ref is present.
-            return partAccess().existsRef(dr.r->refKey(), ContentAddressed::Freshness::CachedForLoad);
+            return partAccess().existsRef(dr.r->refKey(), Cas::Freshness::CachedForLoad);
         case DirShape::ProjectionDir:
         {
             /// At least one tree entry (or mutable file) under its prefix.
-            auto view = partAccess().getView(dr.r->refKey(), ContentAddressed::Freshness::CachedForLoad);
+            auto view = partAccess().getView(dr.r->refKey(), Cas::Freshness::CachedForLoad);
             return view && view->hasDirectory(*dr.projection_prefix);
         }
         case DirShape::TableSubdir:
@@ -895,13 +895,13 @@ bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) 
 
 bool ContentAddressedMetadataStorage::existsFileOrDirectory(const std::string & path) const
 {
-    if (ContentAddressed::isPartFilePath(path))
+    if (Cas::isPartFilePath(path))
     {
-        auto p = ContentAddressed::parsePartFilePath(path);
+        auto p = Cas::parsePartFilePath(path);
         auto r = p ? route(*p) : std::nullopt;
         if (r && !r->ref.empty() && !r->file.empty())
         {
-            auto view = partAccess().getView(r->refKey(), ContentAddressed::Freshness::CachedForLoad);
+            auto view = partAccess().getView(r->refKey(), Cas::Freshness::CachedForLoad);
             if (!view)
                 return false;
             return view->hasFile(r->file) || view->hasDirectory(r->file + "/");
@@ -912,7 +912,7 @@ bool ContentAddressedMetadataStorage::existsFileOrDirectory(const std::string & 
 
 uint64_t ContentAddressedMetadataStorage::getFileSize(const std::string & path) const
 {
-    if (!ContentAddressed::isPartFilePath(path))
+    if (!Cas::isPartFilePath(path))
     {
         if (auto bytes = tryGetInManifestBytes(path))   /// verbatim table-level file
             return bytes->size();
@@ -921,14 +921,14 @@ uint64_t ContentAddressedMetadataStorage::getFileSize(const std::string & path) 
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no object for {}", path);
     }
 
-    auto p = ContentAddressed::parsePartFilePath(path);
+    auto p = Cas::parsePartFilePath(path);
     if (!p || p->file.empty())
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: not a part file path: {}", path);
     auto r = route(*p);
     if (!r || r->file.empty())
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: not a part file path: {}", path);
 
-    auto view = partAccess().getView(r->refKey(), ContentAddressed::Freshness::CachedForLoad);
+    auto view = partAccess().getView(r->refKey(), Cas::Freshness::CachedForLoad);
     if (!view)
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no ref for {}", path);
     if (auto size = view->fileSize(r->file))
@@ -945,7 +945,7 @@ Poco::Timestamp ContentAddressedMetadataStorage::getLastModified(const std::stri
     /// stamps only feed cleanup TTLs and system tables).
     auto resolve_stamp = [&](const Route & r) -> Poco::Timestamp
     {
-        auto resolved = partAccess().resolve(r.refKey(), ContentAddressed::Freshness::CachedForLoad);
+        auto resolved = partAccess().resolve(r.refKey(), Cas::Freshness::CachedForLoad);
         if (!resolved)
             throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no ref for {}", path);
         if (resolved->published_at_ms == 0)
@@ -954,7 +954,7 @@ Poco::Timestamp ContentAddressedMetadataStorage::getLastModified(const std::stri
         return Poco::Timestamp::fromEpochTime(static_cast<time_t>(resolved->published_at_ms / 1000));
     };
 
-    if (auto p = ContentAddressed::parsePartFilePath(path))
+    if (auto p = Cas::parsePartFilePath(path))
     {
         auto r = route(*p);
         if (r && !r->ref.empty())
@@ -975,7 +975,7 @@ std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const st
         {
             /// Shadow PART dir: the frozen part's file names (first components).
             auto view = partAccess().getView(Route{shadowNamespace(dr.p->shadow_table_dir), dr.p->part_name, ""}.refKey(),
-                                             ContentAddressed::Freshness::CachedForLoad);
+                                             Cas::Freshness::CachedForLoad);
             return view ? view->listChildren("") : std::vector<std::string>{};
         }
         case DirShape::ShadowTable:
@@ -1027,7 +1027,7 @@ std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const st
             /// Detached part names (prefix stripped; never files).
             std::vector<std::string> result;
             for (const auto & ref : detachedRefNames(dr.r->ns))
-                result.push_back(ref.substr(ContentAddressed::kDetachedRefPrefix.size()));
+                result.push_back(ref.substr(Cas::kDetachedRefPrefix.size()));
             return result;
         }
         case DirShape::MovingContainer:
@@ -1035,7 +1035,7 @@ std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const st
             /// Staging part names (prefix stripped), mirrors DetachedContainer.
             std::vector<std::string> result;
             for (const auto & ref : movingRefNames(dr.r->ns))
-                result.push_back(ref.substr(ContentAddressed::kMovingRefPrefix.size()));
+                result.push_back(ref.substr(Cas::kMovingRefPrefix.size()));
             return result;
         }
         case DirShape::PartDir:
@@ -1043,13 +1043,13 @@ std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const st
             /// A part dir (live, detached part, shadow handled separately): logical file names,
             /// nested keys collapsed to their first component (projections surface as ONE
             /// <proj>.proj entry).
-            auto view = partAccess().getView(dr.r->refKey(), ContentAddressed::Freshness::CachedForLoad);
+            auto view = partAccess().getView(dr.r->refKey(), Cas::Freshness::CachedForLoad);
             return view ? view->listChildren("") : std::vector<std::string>{};
         }
         case DirShape::ProjectionDir:
         {
             /// Inner names with the <proj>.proj/ prefix stripped.
-            auto view = partAccess().getView(dr.r->refKey(), ContentAddressed::Freshness::CachedForLoad);
+            auto view = partAccess().getView(dr.r->refKey(), Cas::Freshness::CachedForLoad);
             return view ? view->listChildren(*dr.projection_prefix) : std::vector<std::string>{};
         }
         case DirShape::TableSubdir:
@@ -1090,12 +1090,12 @@ bool ContentAddressedMetadataStorage::isDirectoryEmpty(const std::string & path)
     /// DiskObjectStorage::removeDirectory proceeds straight to the ref-unlink instead of throwing
     /// CANNOT_RMDIR per removal. The same applies to a projection subdirectory. The detached
     /// CONTAINER and TABLE dirs keep the listing-based emptiness (DROP TABLE's non-empty guard).
-    if (auto p = ContentAddressed::parsePartFilePath(path))
+    if (auto p = Cas::parsePartFilePath(path))
     {
         auto r = route(*p);
         if (r && !r->ref.empty() && r->file.empty())
             return true;
-        if (r && !r->ref.empty() && ContentAddressed::PartFolderView::projectionDirPrefix(r->file))
+        if (r && !r->ref.empty() && Cas::PartFolderView::projectionDirPrefix(r->file))
             return true;
     }
     return !iterateDirectory(path)->isValid();
@@ -1110,9 +1110,9 @@ StoredObjects ContentAddressedMetadataStorage::getStorageObjects(const std::stri
     if (auto bytes = tryGetInManifestBytes(path))
         return {StoredObject("", path, bytes->size())};
 
-    if (!ContentAddressed::isPartFilePath(path))
+    if (!Cas::isPartFilePath(path))
     {
-        if (ContentAddressed::parseTableFilePath(path))
+        if (Cas::parseTableFilePath(path))
             throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
                 "ContentAddressed: table-level verbatim file is in-manifest, not a storage object: {}", path);
         /// A loose mountpoint object: a real plain object at roots/<server_root_id>/<path>. The
@@ -1125,14 +1125,14 @@ StoredObjects ContentAddressedMetadataStorage::getStorageObjects(const std::stri
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no object for {}", path);
     }
 
-    auto p = ContentAddressed::parsePartFilePath(path);
+    auto p = Cas::parsePartFilePath(path);
     if (!p || p->file.empty())
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: not a part file path: {}", path);
     auto r = route(*p);
     if (!r || r->file.empty())
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: not a part file path: {}", path);
 
-    auto view = partAccess().getView(r->refKey(), ContentAddressed::Freshness::CachedForLoad);
+    auto view = partAccess().getView(r->refKey(), Cas::Freshness::CachedForLoad);
     if (!view)
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no ref for {}", path);
     if (const auto * entry = view->findFile(r->file))
@@ -1150,20 +1150,20 @@ std::optional<StoredObjects> ContentAddressedMetadataStorage::getStorageObjectsI
 {
     /// Non-part shapes (verbatim table files, loose mountpoint objects) are rare paths — the
     /// generic two-step is fine for them.
-    if (!ContentAddressed::isPartFilePath(path))
+    if (!Cas::isPartFilePath(path))
     {
         if (existsFile(path))
             return getStorageObjects(path);
         return std::nullopt;
     }
-    auto p = ContentAddressed::parsePartFilePath(path);
+    auto p = Cas::parsePartFilePath(path);
     if (!p || p->file.empty())
         return std::nullopt;
     auto r = route(*p);
     if (!r || r->file.empty())
         return std::nullopt;
 
-    auto view = partAccess().getView(r->refKey(), ContentAddressed::Freshness::CachedForLoad);
+    auto view = partAccess().getView(r->refKey(), Cas::Freshness::CachedForLoad);
     if (!view)
         return std::nullopt;
     const auto * entry = view->findFile(r->file);
@@ -1180,9 +1180,9 @@ std::optional<String> ContentAddressedMetadataStorage::tryGetInManifestBytes(con
     if (!cas_store)
         return std::nullopt;
 
-    if (!ContentAddressed::isPartFilePath(path))
+    if (!Cas::isPartFilePath(path))
     {
-        if (auto tf = ContentAddressed::parseTableFilePath(path))
+        if (auto tf = Cas::parseTableFilePath(path))
         {
             const auto ns = liveNamespace(tf->table_uuid);
             return namespaceFilesReadable(ns) ? store()->getNamespaceFile(ns, tf->tail) : std::nullopt;
@@ -1190,14 +1190,14 @@ std::optional<String> ContentAddressedMetadataStorage::tryGetInManifestBytes(con
         return std::nullopt;   /// loose files are plain objects, not in-manifest bytes
     }
 
-    auto p = ContentAddressed::parsePartFilePath(path);
+    auto p = Cas::parsePartFilePath(path);
     if (!p || p->file.empty())
         return std::nullopt;
     auto r = route(*p);
     if (!r || r->file.empty())
         return std::nullopt;
 
-    auto view = partAccess().getView(r->refKey(), ContentAddressed::Freshness::CachedForLoad);
+    auto view = partAccess().getView(r->refKey(), Cas::Freshness::CachedForLoad);
     if (!view)
         return std::nullopt;
     return view->inlineBytes(r->file);
@@ -1225,15 +1225,15 @@ bool ContentAddressedMetadataStorage::prepareInManifestRead(
 std::optional<ContentAddressedMetadataStorage::BlobViewPlan> ContentAddressedMetadataStorage::getBlobViewPlan(
     const std::string & path) const
 {
-    if (!ContentAddressed::isPartFilePath(path))
+    if (!Cas::isPartFilePath(path))
         return std::nullopt;
-    auto p = ContentAddressed::parsePartFilePath(path);
+    auto p = Cas::parsePartFilePath(path);
     if (!p || p->file.empty())
         return std::nullopt;
     auto r = route(*p);
     if (!r || r->file.empty())
         return std::nullopt;
-    auto view = partAccess().getView(r->refKey(), ContentAddressed::Freshness::CachedForLoad);
+    auto view = partAccess().getView(r->refKey(), Cas::Freshness::CachedForLoad);
     if (!view)
         return std::nullopt;
     if (const auto * entry = view->findFile(r->file))
@@ -1271,14 +1271,14 @@ std::optional<String> ContentAddressedMetadataStorage::getPartManifestBytes(cons
     /// it canonically. nullopt when the path is not a committed content-addressed part here (no ref =>
     /// no relink offer; the sender streams bytes). A live ref to a missing/corrupt manifest throws
     /// (INV-NO-DANGLE surfaced, never substituted) — the same fail-loud contract as partAccess().getView.
-    auto p = ContentAddressed::parsePartFilePath(part_path);
+    auto p = Cas::parsePartFilePath(part_path);
     if (!p)
         return std::nullopt;
     auto r = route(*p);
     if (!r || r->ref.empty())
         return std::nullopt;
 
-    auto view = partAccess().getView(r->refKey(), ContentAddressed::Freshness::ForceFresh);
+    auto view = partAccess().getView(r->refKey(), Cas::Freshness::ForceFresh);
     if (!view)
         return std::nullopt;
     return Cas::encodePartManifest(*view->manifest());

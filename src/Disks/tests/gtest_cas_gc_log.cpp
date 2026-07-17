@@ -31,7 +31,7 @@ namespace DB::ErrorCodes
 using namespace DB::Cas;
 using DB::Cas::tests::idOf;
 using DB::Cas::tests::u128Of;
-using Rec = DB::ContentAddressed::GcRoundLogRecord;
+using Rec = DB::Cas::GcRoundLogRecord;
 
 namespace
 {
@@ -82,7 +82,7 @@ TEST(CasGcLog, EmitsStartFinishWithCounts)
     store->renewWatermarkOnce();
 
     std::vector<Rec> rows;
-    DB::ContentAddressed::CasGcScheduler sched(
+    DB::Cas::CasGcScheduler sched(
         store, std::chrono::seconds(1), "test::gc", "ca",
         [&](const Rec & r) { rows.push_back(r); });
 
@@ -202,7 +202,7 @@ TEST(CasGcSchedulerSteal, ManualRoundNeverStealsEvenADeadIncumbent)
     Gc incumbent(store, kIncumbent);
     ASSERT_TRUE(incumbent.runRegularRound().acquired_lease);
 
-    DB::ContentAddressed::CasGcScheduler sched(store, std::chrono::seconds(1), "test::gc", "ca");
+    DB::Cas::CasGcScheduler sched(store, std::chrono::seconds(1), "test::gc", "ca");
 
     /// obs #1: records the incumbent's (owner, seq, hb=absent).
     EXPECT_FALSE(sched.runOneRoundNow(Rec::Trigger::Manual).acquired_lease);
@@ -227,7 +227,7 @@ TEST(CasGcSchedulerSteal, ManualRoundNeverStealsALiveHeartbeatingIncumbent)
     Gc incumbent(store, kIncumbent);
     ASSERT_TRUE(incumbent.runRegularRound().acquired_lease);
 
-    DB::ContentAddressed::CasGcScheduler sched(store, std::chrono::seconds(1), "test::gc", "ca");
+    DB::Cas::CasGcScheduler sched(store, std::chrono::seconds(1), "test::gc", "ca");
 
     /// obs #1: records (owner=incumbent, seq, hb=absent).
     EXPECT_FALSE(sched.runOneRoundNow(Rec::Trigger::Manual).acquired_lease);
@@ -247,7 +247,7 @@ TEST(CasGcLog, AbortedFinishOnThrowingRound)
     auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
 
     std::vector<Rec> rows;
-    DB::ContentAddressed::CasGcScheduler sched(
+    DB::Cas::CasGcScheduler sched(
         store, std::chrono::seconds(1), "test::gc", "ca",
         [&](const Rec & r) { rows.push_back(r); });
 
@@ -277,7 +277,7 @@ TEST(CasGcHealth, ReflectsLeadershipAndPendingReclaim)
     store->dropRef(ns, "all_0_0_0");
     store->renewWatermarkOnce();
 
-    DB::ContentAddressed::CasGcScheduler sched(store, std::chrono::seconds(1), "test::gc", "ca", {});
+    DB::Cas::CasGcScheduler sched(store, std::chrono::seconds(1), "test::gc", "ca", {});
 
     const auto h0 = sched.gcHealth();
     EXPECT_FALSE(h0.is_leader);

@@ -36,7 +36,7 @@ namespace CurrentMetrics
     extern const Metric CasPartFolderCacheEntries;
 }
 
-namespace DB::ContentAddressed
+namespace DB::Cas
 {
 
 PartFolderView::PartFolderView(PartRefKey key_, Cas::ManifestId manifest_id_, uint64_t manifest_size_,

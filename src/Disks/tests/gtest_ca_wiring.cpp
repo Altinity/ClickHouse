@@ -7,7 +7,7 @@
 /// the PoC's gtest_content_addressed_metadata.cpp (the behavior that survived the SQL suites) plus
 /// the shadow/detached/mutable rows the later tasks route on.
 
-using namespace DB::ContentAddressed;
+using namespace DB::Cas;
 
 TEST(CaPartPathParser, ParsePartFilePathAtomic)
 {

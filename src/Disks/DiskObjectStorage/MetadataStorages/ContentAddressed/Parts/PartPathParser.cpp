@@ -2,7 +2,7 @@
 #include <array>
 #include <utility>
 
-namespace DB::ContentAddressed
+namespace DB::Cas
 {
 
 /// Split a path into non-empty components, treating repeated or leading/trailing '/' characters as
