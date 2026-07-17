@@ -1484,6 +1484,8 @@ TEST(CasPartWriteTxn, PromoteSucceedsWhenPrecommitIsLiveOwner)
 TEST(CasPartWriteTxnRepoint, PromoteRepointsCommittedRef)
 {
     auto b = std::make_shared<InMemoryBackend>();
+    /// The sink target must outlive the Pool: `~Pool` emits terminate events into the sink.
+    std::vector<CasEvent> events;
     auto s = openPool(b);
     const RootNamespace ns{"srv1/tbl"};
 
@@ -1511,7 +1513,6 @@ TEST(CasPartWriteTxnRepoint, PromoteRepointsCommittedRef)
 
     /// The failed no-flag attempt threw BEFORE appendRefOps returned, so build2's precommit is still the
     /// live owner (no removal was appended) -- the SAME build/manifest can be retried with the flag.
-    std::vector<CasEvent> events;
     s->setEventSink([&](const CasEvent & e) { events.push_back(e); });
     EXPECT_NO_THROW(build2->promote(ns, "part_1", build2->buildId(), m2_id, /*allow_repoint=*/true));
     auto resolved = s->resolveRef(ns, "part_1");
@@ -1885,10 +1886,11 @@ TEST(CasPartWriteTxnStageManifestRetry, AmbiguousTimeoutsThenCommitSucceedsWithi
 TEST(CasPartWriteTxnStageManifestRetry, AmbiguousLandedWriteResolvesToCommittedWithoutReissue)
 {
     auto b = std::make_shared<ManifestPutFaultBackend>();
+    /// The sink target must outlive the Pool: `~Pool` emits terminate events into the sink.
+    std::vector<CasEvent> events;
     auto s = openPool(b);
     const RootNamespace ns{"srv/tbl"};
 
-    std::vector<CasEvent> events;
     s->setEventSink([&](const CasEvent & e) { events.push_back(e); });
 
     auto build = startBuildFor(s, ns, "part_landed");
@@ -2093,11 +2095,12 @@ TEST(CasPartWriteTxnBlobPutRetry, AmbiguousTimeoutsThenCommitRestreamsFromSource
 TEST(CasPartWriteTxnBlobPutRetry, AmbiguousLandedWriteAdoptsOccupantWithoutReupload)
 {
     auto b = std::make_shared<BlobPutFaultBackend>();
+    /// The sink target must outlive the Pool: `~Pool` emits terminate events into the sink.
+    std::vector<CasEvent> events;
     auto s = openBlobFaultPool(b);
     const RootNamespace ns{"srv/tbl"};
     const String payload = "blob-payload-B";
 
-    std::vector<CasEvent> events;
     s->setEventSink([&](const CasEvent & e) { events.push_back(e); });
 
     auto build = startBuildFor(s, ns, "part_blob_landed");
@@ -2164,6 +2167,8 @@ TEST(CasPartWriteTxnBlobPutRetry, BudgetExhaustionMapsToNetworkErrorAndEscapesIm
 TEST(CasPartWriteTxnPromoteStagedRetry, AmbiguousCopyLandedAdoptsDestinationWithoutRecopy)
 {
     auto b = std::make_shared<BlobPutFaultBackend>();
+    /// The sink target must outlive the Pool: `~Pool` emits terminate events into the sink.
+    std::vector<CasEvent> events;
     auto s = openBlobFaultPool(b);
     const RootNamespace ns{"srv/tbl"};
     const String payload = "staged-payload-A";
@@ -2172,7 +2177,6 @@ TEST(CasPartWriteTxnPromoteStagedRetry, AmbiguousCopyLandedAdoptsDestinationWith
     const String staging_bytes = String(s->poolMeta().blob_header_len, 'h') + payload;
     ASSERT_EQ(b->putIfAbsent(staging_key, staging_bytes).outcome, PutOutcome::Done);
 
-    std::vector<CasEvent> events;
     s->setEventSink([&](const CasEvent & e) { events.push_back(e); });
 
     auto build = startBuildFor(s, ns, "part_copy_landed");

@@ -254,9 +254,9 @@ TEST(CasSweepLateLog, LogBetweenSealedFromAndSealIdIsReportedNotRevived)
 
     const String watched_key = layout.refLogKey(ns, late_log_id);
     auto counting = std::make_shared<GetCountingBackend>(backend, watched_key);
-    auto store = Pool::open(counting, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
-
+    /// The sink target must outlive the Pool: `~Pool` emits terminate events into the sink.
     std::vector<CasEvent> events;
+    auto store = Pool::open(counting, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
     store->setEventSink([&](const CasEvent & e) { events.push_back(e); });
 
     sweepNamespace(*store, ns, BuildPrefix{.writer_epoch = kWriterEpoch, .build_sequence = 5});
@@ -295,8 +295,9 @@ TEST(CasSweepLateLog, SecondPassSuppressedWithDedupLatchButNotWithoutOne)
     writeRefLogTxnRaw(*backend, layout, RefLogTxn{ns.string(), late_log_id, {}});
     setWatermarkMinActive(*backend, layout, kServerRoot, kWriterEpoch, /*min_active*/6);
 
-    auto store = openPoolForTest(backend);
+    /// The sink target must outlive the Pool: `~Pool` emits terminate events into the sink.
     std::vector<CasEvent> events;
+    auto store = openPoolForTest(backend);
     store->setEventSink([&](const CasEvent & e) { events.push_back(e); });
 
     /// Two passes WITH a dedup latch threaded through: the log is still durably there (nothing folds

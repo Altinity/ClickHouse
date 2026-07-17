@@ -1343,7 +1343,8 @@ TEST(CasPoolShutdown, UnresolvedWedgeSkipsFarewell)
     auto backend = std::make_shared<UnresolvedPutBackend>();
     auto store = DB::Cas::Pool::open(backend, DB::Cas::PoolConfig{
         .pool_prefix = "p", .server_root_id = "test", .cas_request_budget = budget});
-    const Layout & layout = store->layout();
+    /// By value: `layout` is used after `store.reset()` below, a reference would dangle.
+    const Layout layout = store->layout();
     const RootNamespace ns{"srv/wedge_shutdown"};
     publishPart(store, ns.string(), "x", "payload");
 
