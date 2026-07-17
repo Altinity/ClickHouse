@@ -32,6 +32,7 @@ to the same fixed 30s TTL constant.
 """
 
 import json as _json
+import threading
 import time
 import urllib.request
 
@@ -109,21 +110,36 @@ class S39(Scenario):
 
         # --- Leg A: SHORT fault (< lease TTL) -- the mount lease must survive ---
         since_a = node.scalar("SELECT toString(now())")
-        _ctl("/config", {"rate": 1.0, "modes": ["503"], "methods": ["PUT", "POST"],
-                         "seed": 39})
         short_s = int(p["short_fault_s"])
         assert short_s < _MOUNT_LEASE_TTL_S, "leg A's fault window must stay under the lease TTL"
-        try:
-            # Best-effort: a write attempted WHILE armed may itself be faulted and fail/retry via
-            # the CAS layer's own budget -- this leg is not asserting the INSERT succeeds mid-fault,
-            # only that the background mount-lease renewer rides out the window without fencing.
-            sql.insert_random(node, _TABLE, rows=rows // 4, payload_bytes=payload, op_id=rows,
-                              timeout=short_s + 15)
-        except Exception as e:
-            ctx.log(f"S39 leg A INSERT under fault (expected to possibly fail/retry): {e}")
-        time.sleep(short_s)
+        assert short_s < _MOUNT_RENEW_PERIOD_S, (
+            "leg A's fault window must be shorter than the renew period so it can overlap AT MOST "
+            "one renewal beat -- a window >= the renew period can fault two consecutive beats and "
+            "(correctly) near the lease deadline, which is leg B's job, not leg A's")
+        # The best-effort write MUST run in a background thread, NOT inline: a blocking insert keeps
+        # retrying under the fault for its whole CAS budget (~20s), which would keep the fault armed
+        # for insert-duration + short_s -- far past the lease TTL -- and the renewer would then
+        # (correctly) fence, defeating the "short fault must NOT fence" assertion. This leg asserts
+        # the RENEWER rides out the window, not that the INSERT succeeds; the write is only here to
+        # put load on the write path while armed. Decoupling it keeps the armed window EXACTLY
+        # short_s, and since short_s < renew_period the window can fault at most one beat -> one
+        # transient retry -> no deadline breach -> no fence, by construction.
+        errs_a: list[str] = []
+        def _bg_write_a():
+            try:
+                sql.insert_random(node, _TABLE, rows=rows // 4, payload_bytes=payload, op_id=rows,
+                                  timeout=short_s + 15)
+            except Exception as e:
+                errs_a.append(str(e))
+        _ctl("/config", {"rate": 1.0, "modes": ["503"], "methods": ["PUT", "POST"], "seed": 39})
+        writer_a = threading.Thread(target=_bg_write_a, daemon=True)
+        writer_a.start()
+        time.sleep(short_s)                     # armed window is EXACTLY short_s, write-independent
         _ctl("/config", {"rate": 0.0})
-        time.sleep(_MOUNT_RENEW_PERIOD_S / 2)   # let any in-flight renewal beat land
+        writer_a.join(timeout=30)               # reap the background writer (faulted or completed)
+        if errs_a:
+            ctx.log(f"S39 leg A background INSERT under fault (expected to possibly fail/retry): {errs_a[0]}")
+        time.sleep(_MOUNT_RENEW_PERIOD_S / 2)   # let the post-clear renewal beat land
 
         transient_a = _text_log_count(node, since_a,
                                       "background renewal failed transiently, retrying while the lease is still valid")
