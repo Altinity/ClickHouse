@@ -1,6 +1,6 @@
 import re
 
-from ci.defs.defs import BuildTypes, JobNames
+from ci.defs.defs import JobNames
 from ci.defs.job_configs import JobConfigs
 from ci.jobs.scripts.workflow_hooks.new_tests_check import (
     has_new_functional_tests,
@@ -8,6 +8,8 @@ from ci.jobs.scripts.workflow_hooks.new_tests_check import (
 )
 from ci.jobs.scripts.workflow_hooks.pr_labels_and_category import Labels
 from ci.praktika.info import Info
+from ci.praktika.runtime import RunConfig
+from ci.praktika.settings import Settings
 
 
 def only_docs(changed_files):
@@ -31,10 +33,10 @@ DO_NOT_TEST_JOBS = [
 ]
 
 PRELIMINARY_JOBS = [
-    JobNames.STYLE_CHECK,
+    # JobNames.STYLE_CHECK,
     JobNames.FAST_TEST,
-    "Build (amd_tidy)",
-    "Build (arm_tidy)",
+    # "Build (amd_tidy)",
+    # "Build (arm_tidy)",
 ]
 
 BUILDS_FOR_TESTS = [
@@ -61,6 +63,23 @@ FUNCTIONAL_TEST_FLAKY_CHECK_JOBS = [
     "Stateless tests (amd_debug, flaky check)",
     "Stateless tests (amd_binary, flaky check)",
 ]
+
+# The aarch64/arm exclude tags are meant to skip arm *tests*, but the arm release
+# build and its docker jobs are release artifacts, not tests, so they must keep
+# running even when arm tests are excluded.
+DOCKER_REQUIRED_ARM_JOBS = {
+    "Build (arm_release)",
+    Settings.DOCKER_BUILD_ARM_LINUX_JOB_NAME,
+    Settings.DOCKER_BUILD_MANIFEST_JOB_NAME,
+}
+
+
+def is_ci_excluded_by_tag(job_name, tag):
+    if tag in ("aarch64", "arm") and job_name in DOCKER_REQUIRED_ARM_JOBS:
+        return False
+
+    return tag in job_name.lower()
+
 
 # Must match ci.workflows.pull_request.KEEPER_STRESS_PR_NAME
 KEEPER_STRESS_PR_NAME = "Keeper Stress Tests (PR)"
@@ -125,13 +144,6 @@ def should_skip_job(job_name):
 
     if Labels.NO_FAST_TESTS in _info_cache.pr_labels and job_name in PRELIMINARY_JOBS:
         return True, f"Skipped, labeled with '{Labels.NO_FAST_TESTS}'"
-
-    if (
-        job_name in (JobNames.SMOKE_TEST_MACOS, f"{JobNames.FAST_TEST} ({BuildTypes.ARM_DARWIN})")
-        and _info_cache.pr_number
-        and Labels.CI_MACOS not in _info_cache.pr_labels
-    ):
-        return True, f"Skipped, not labeled with '{Labels.CI_MACOS}'"
 
     if (
         JobNames.BUILD_TOOLCHAIN in job_name
@@ -261,6 +273,16 @@ def should_skip_job(job_name):
     ):
         return True, "Skipped, not labeled with 'pr-performance'"
 
+    # The CI tags live in workflow_config.custom_data (see parse_ci_tags.py),
+    # which runs as a pre-hook, so the value is present by the time this runs.
+    ci_exclude_tags = (
+        RunConfig.from_fs(_info_cache.workflow_name).custom_data.get("ci_exclude_tags")
+        or []
+    )
+    for tag in ci_exclude_tags:
+        if is_ci_excluded_by_tag(job_name, tag):
+            return True, f"Skipped, job name includes excluded tag '{tag}'"
+
     # If only CI scripts changed (no product code), run a minimal set of tests
     # to validate the CI pipeline: stateless batch 1 and amd_asan_ubsan integration batch 1.
     # Individual coverage test jobs run normally, but the LLVM merge/report job is skipped
@@ -271,19 +293,24 @@ def should_skip_job(job_name):
         if job_name == JobNames.LLVM_COVERAGE:
             return True, "Skipped: only CI scripts changed; skipping coverage merge to preserve master coverage number"
 
-        if JobNames.STATELESS in job_name:
-            match = re.search(r"(\d)/\d", job_name)
-            if match and match.group(1) != "1" or "sequential" in job_name:
-                return True, "Skipped: only CI scripts changed; running stateless batch 1 only"
+    # NOTE (strtgbb): disabled this feature for now
+    # If only the functional tests script changed, run only the first batch of stateless tests
+    # if changed_files and all(
+    #     f.startswith("ci/") and f.endswith(".py") for f in changed_files
+    # ):
+    #     if JobNames.STATELESS in job_name:
+    #         match = re.search(r"(\d)/\d", job_name)
+    #         if match and match.group(1) != "1" or "sequential" in job_name:
+    #             return True, "Skipped: only CI scripts changed; running stateless batch 1 only"
 
-        if JobNames.INTEGRATION in job_name:
-            match = re.search(r"(\d)/\d", job_name)
-            if (
-                match
-                and match.group(1) != "1"
-                or "sequential" in job_name
-                or "_asan" not in job_name
-            ):
-                return True, "Skipped: only CI scripts changed; running amd_asan_ubsan integration batch 1 only"
+    #     if JobNames.INTEGRATION in job_name:
+    #         match = re.search(r"(\d)/\d", job_name)
+    #         if (
+    #             match
+    #             and match.group(1) != "1"
+    #             or "sequential" in job_name
+    #             or "_asan" not in job_name
+    #         ):
+    #             return True, "Skipped: only CI scripts changed; running amd_asan_ubsan integration batch 1 only"
 
     return False, ""

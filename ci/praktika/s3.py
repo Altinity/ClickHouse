@@ -4,8 +4,9 @@ import mimetypes
 import os
 import time
 from pathlib import Path
-from typing import Any, Dict
+from typing import Dict, Optional
 from urllib.parse import quote
+import re
 
 from ._environment import _Environment
 from .settings import Settings
@@ -21,6 +22,38 @@ except ImportError:
     BOTO3_AVAILABLE = False
     ClientError = None
     NoCredentialsError = None
+
+sensitive_var_pattern = re.compile(r"[A-Z_]*(SECRET|PASSWORD|KEY|TOKEN|AZURE)[A-Z_]*")
+sensitive_strings = {
+    var: value for var, value in os.environ.items() if sensitive_var_pattern.match(var)
+}
+
+
+def scan_file_for_sensitive_data(file_content, file_name):
+    """
+    Scan the content of a file for sensitive strings.
+    Raises ValueError if any sensitive values are found.
+    """
+
+    def clean_line(line):
+        for name, value in sensitive_strings.items():
+            line = line.replace(value, f"SECRET[{name}]")
+        return line
+
+    matches = []
+    for line_number, line in enumerate(file_content.splitlines(), start=1):
+        for name, value in sensitive_strings.items():
+            if value in line:
+                matches.append((file_name, line_number, clean_line(line)))
+
+    if not matches:
+        return
+
+    print(f"ERROR: Sensitive values found in {file_name}")
+    for file_name, line_number, match in matches:
+        print(f"{file_name}:{line_number}: {match}")
+
+    raise ValueError(f"Sensitive values found in {file_name}")
 
 
 class S3:
@@ -62,14 +95,14 @@ class S3:
 
     @dataclasses.dataclass
     class Object:
-        AcceptRanges: str
-        Expiration: str
-        LastModified: str
-        ContentLength: int
-        ETag: str
-        ContentType: str
-        ServerSideEncryption: str
-        Metadata: Dict
+        AcceptRanges: Optional[str] = None
+        Expiration: Optional[str] = None
+        LastModified: Optional[str] = None
+        ContentLength: Optional[int] = None
+        ETag: Optional[str] = None
+        ContentType: Optional[str] = None
+        ServerSideEncryption: Optional[str] = None
+        Metadata: Dict = dataclasses.field(default_factory=dict)
 
         def has_tags(self, tags):
             meta = self.Metadata
@@ -110,6 +143,15 @@ class S3:
         s3_full_path = s3_path
         if not s3_full_path.endswith(file_name) and not with_rename:
             s3_full_path = f"{s3_path}/{Path(local_path).name}"
+
+        # NOTE (strtgbb): compressed files either come from _upload_file_to_s3, and are already scanned, or are low risk statistics files.
+        if Path(local_path).suffix.lower() not in (".gz", ".zst", ".bz2", ".xz"):
+            try:
+                file_content = Path(local_path).read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                print(f"WARNING: Failed to scan file {local_path}, unknown encoding")
+            else:
+                scan_file_for_sensitive_data(file_content, Path(local_path).name)
 
         # Use boto3 if available, otherwise fall back to AWS CLI
         if BOTO3_AVAILABLE and cls._get_boto3_client():
@@ -235,7 +277,7 @@ class S3:
             f"aws s3api put-object --bucket {bucket} --key {key} --body {local_path}"
         )
         if if_none_matched:
-            command += f' --if-none-match "*"'
+            command += ' --if-none-match "*"'
         if if_match:
             command += f' --if-match "{if_match}"'
         if metadata:
@@ -398,7 +440,10 @@ class S3:
         if not output:
             return None
         else:
-            return cls.Object(**json.loads(output))
+            data = json.loads(output)
+            object_fields = {field.name for field in dataclasses.fields(cls.Object)}
+            object_data = {k: v for k, v in data.items() if k in object_fields}
+            return cls.Object(**object_data)
 
     @classmethod
     def assert_read_access(cls, s3_path):
@@ -451,6 +496,11 @@ class S3:
                     print(
                         f"NOTE: File [{local_file_path}] exceeds threshold [Settings.COMPRESS_THRESHOLD_MB:{Settings.COMPRESS_THRESHOLD_MB}] - compress"
                     )
+                    try:
+                        file_content = Path(local_file_path).read_text(encoding="utf-8")
+                        scan_file_for_sensitive_data(file_content, Path(local_file_path).name)
+                    except UnicodeDecodeError:
+                        print(f"WARNING: Failed to scan file {local_file_path}, unknown encoding")
                     text = False
                     local_file_path = Utils.compress_file(local_file_path)
             html_link = S3.copy_file_to_s3(
@@ -622,7 +672,7 @@ class S3:
                     if version == 0:
                         # DESTRUCTIVE: Version 0 overwrites without conditions (NOT safe for concurrent use)
                         print(
-                            f"Uploading file with version 0 (destructive reset) using boto3"
+                            "Uploading file with version 0 (destructive reset) using boto3"
                         )
                         client.upload_file(
                             str(local_path), bucket, key, ExtraArgs=extra_args
@@ -691,7 +741,7 @@ class S3:
             if version == 0:
                 # DESTRUCTIVE: Version 0 uploads without conditions (NOT safe for concurrent use)
                 print(
-                    f"Uploading file with version 0 (destructive reset) using AWS CLI"
+                    "Uploading file with version 0 (destructive reset) using AWS CLI"
                 )
                 result_uploaded = cls.put(
                     s3_path=s3_path,

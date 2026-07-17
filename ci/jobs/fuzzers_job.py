@@ -33,8 +33,9 @@ def main():
             # TODO: attach gdb
             # and ch.attach_gdb()
 
-        if ch.create_log_export_config():
-            ch.start_log_exports(check_start_time=stop_watch.start_time)
+        # Note (strtgbb): We don't use this
+        # if ch.create_log_export_config():
+        #     ch.start_log_exports(check_start_time=stop_watch.start_time)
 
     if res:
         print("AST Fuzzer")
@@ -50,7 +51,7 @@ def main():
 
     # stop log replication
     Shell.check(
-        f"./ci/jobs/scripts/functional_tests/setup_log_cluster.sh --stop-log-replication",
+        "./ci/jobs/scripts/functional_tests/setup_log_cluster.sh --stop-log-replication",
         verbose=True,
     )
 

@@ -124,8 +124,10 @@ DB::CommandPtr makeCommandChangeDirectory();
 DB::CommandPtr makeCommandLink();
 DB::CommandPtr makeCommandMove();
 DB::CommandPtr makeCommandRead();
+DB::CommandPtr makeCommandReadBitmap();
 DB::CommandPtr makeCommandRemove();
 DB::CommandPtr makeCommandWrite();
+DB::CommandPtr makeCommandSed();
 DB::CommandPtr makeCommandMkDir();
 DB::CommandPtr makeCommandSwitchDisk();
 DB::CommandPtr makeCommandGetCurrentDiskAndPath();
@@ -136,6 +138,7 @@ DB::CommandPtr makeCommandCaGcDryRun();
 DB::CommandPtr makeCommandCaGcRebuild();
 DB::CommandPtr makeCommandCaInspect();
 DB::CommandPtr makeCommandCaDropMember();
+DB::CommandPtr makeCommandReadChecksums();
 #if CLICKHOUSE_CLOUD
 DB::CommandPtr makeCommandPackedIO();
 #endif

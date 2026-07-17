@@ -368,6 +368,18 @@ void LocalObjectStorage::removeObjectsIfExist(const StoredObjects & objects)
         removeObjectIfExists(object);
 }
 
+namespace
+{
+/// The concurrent-disappearance class for a best-effort local listing: an entry
+/// removed mid-stat (ENOENT) or whose parent path component was concurrently
+/// replaced by a non-directory (ENOTDIR). Mirrors libc++'s own `__is_dne_error`.
+/// Every other error (EACCES, EIO, ...) is a real failure and must propagate.
+bool isVanishedEntryError(const std::error_code & error)
+{
+    return error == std::errc::no_such_file_or_directory || error == std::errc::not_a_directory;
+}
+}
+
 ObjectMetadata LocalObjectStorage::getObjectMetadata(const std::string & path, bool) const
 {
     ObjectMetadata object_metadata;
@@ -391,7 +403,7 @@ std::optional<ObjectMetadata> LocalObjectStorage::tryGetObjectMetadata(const std
     auto time = fs::last_write_time(path, error);
     if (error)
     {
-        if (error == std::errc::no_such_file_or_directory)
+        if (isVanishedEntryError(error))
             return {};
         throw fs::filesystem_error("Got unexpected error while getting last write time", path, error);
     }
@@ -402,16 +414,12 @@ std::optional<ObjectMetadata> LocalObjectStorage::tryGetObjectMetadata(const std
     if (fs::is_directory(path, error))
         return {};
 
-    /// The file may be removed by a concurrent operation between the last_write_time above and this
-    /// stat (TOCTOU). A real object store snapshots its metadata, so a concurrently-deleted object is
-    /// simply absent rather than surfacing a raw filesystem error — treat a vanished file as a missing
-    /// object (nullopt), exactly like the last_write_time branch above. (On a content-addressed pool
-    /// this is hit by a background MERGE's listObjects-driven ref unlink racing a sibling part's
-    /// mutable per-ref sidecar removal, e.g. refs/<part>.txn_version.txt.tmp.meta or refs/delete_tmp_<part>.meta.)
     object_metadata.size_bytes = fs::file_size(path, error);
     if (error)
     {
-        if (error == std::errc::no_such_file_or_directory)
+        /// The entry may vanish between the two stat calls (concurrent removal),
+        /// or a parent path component may be concurrently replaced by a file.
+        if (isVanishedEntryError(error))
             return {};
         throw fs::filesystem_error("Got unexpected error while getting file size", path, error);
     }
@@ -424,106 +432,102 @@ std::optional<ObjectMetadata> LocalObjectStorage::tryGetObjectMetadata(const std
 
 void LocalObjectStorage::listObjects(const std::string & path, RelativePathsWithMetadata & children, size_t/* max_keys */) const
 {
-    /// A path containing an embedded NUL byte is never valid on a POSIX filesystem: `std::string`/`fs::path`
-    /// preserve it, but every native syscall below (`opendir`, `stat`, ...) truncates at the first NUL via
-    /// `.c_str()`, so "descend into a subdirectory" silently re-opens the truncated prefix instead of the
-    /// real child (STID 1615-3a7b: the AST fuzzer injects a `\0` into an `icebergLocal(...)` path literal).
-    /// Because `is_directory()` on that truncated prefix keeps reporting the prefix itself (which does
-    /// exist and is a directory) for every entry, the walk below never makes progress and spins forever
-    /// pushing more iterators onto `stack` — reject fail-closed up front instead of looping.
+    /// A path with an embedded NUL is malformed: libc truncates every syscall
+    /// argument at the NUL while our `std::string`/`fs::path` keep the full
+    /// value, so the traversal below would re-open the same truncated directory
+    /// and queue ever-longer NUL-bearing child paths that never converge (an
+    /// unbounded loop for a directory that holds only subdirectories). A
+    /// `readdir` entry name never contains a NUL, so this single up-front check
+    /// guarantees no path derived during traversal can reintroduce one.
     if (path.find('\0') != std::string::npos)
         throw fs::filesystem_error(
-            "Path contains an embedded NUL byte", path, std::make_error_code(std::errc::invalid_argument));
+            "Path contains an embedded NUL byte", path,
+            std::make_error_code(std::errc::invalid_argument));
 
     if (!fs::exists(path) || !fs::is_directory(path))
         return;
 
-    /// A real object store snapshots its listing, so a directory or file removed by a concurrent operation
-    /// while the listing is in progress simply does not appear — it never surfaces a raw filesystem error
-    /// to the caller. The throwing `recursive_directory_iterator` does NOT emulate that: when it yields a
-    /// subdirectory and then tries to recurse into it, a concurrent removal of that subdirectory makes its
-    /// `operator++` throw `no_such_file_or_directory` AND end the whole walk (libc++ resets the iterator on
-    /// a failed recursion). On a content-addressed pool this is hit by `unlinkPartDirRefs` listing the
-    /// `refs/` prefix (e.g. for a background MERGE) while another transaction removes a sibling part's
-    /// detached ref dir (e.g. `refs/detached.deleting_<part>`). Walk with an explicit stack of plain
-    /// (non-recursive) `directory_iterator`s using the error_code overloads, so a subdirectory that vanishes
-    /// before we descend into it is simply skipped and the remaining siblings are still enumerated.
-    std::vector<fs::directory_iterator> stack;
+    /// Listing is a best-effort snapshot driven with the non-throwing
+    /// `error_code` overloads. Tolerate ONLY the concurrent-disappearance class
+    /// (see `isVanishedEntryError`) - such an entry is simply omitted, mirroring
+    /// how a remote object store omits a concurrently-deleted object. Any other
+    /// error (EACCES, EIO, ...) is propagated, so a caller never reads a
+    /// silently truncated listing. The same tolerance is applied by
+    /// `tryGetObjectMetadata` below for the per-entry metadata stat.
+    auto throw_unless_vanished = [&](const std::error_code & e, const fs::path & at)
     {
+        if (!isVanishedEntryError(e))
+            throw fs::filesystem_error("Cannot list local object storage directory", at, e);
+    };
+
+    /// We descend with an explicit stack of non-recursive `directory_iterator`s
+    /// rather than a single `recursive_directory_iterator`. The recursive
+    /// iterator opens each child directory with `opendir` while incrementing and,
+    /// if that `opendir` fails (e.g. the directory was concurrently removed), it
+    /// resets itself to `end()` - silently dropping every later, still-present
+    /// sibling. Listing only the open directory at a time lets a vanished
+    /// directory skip just its own subtree while the remaining entries are still
+    /// reported. Each directory is fully drained before any subdirectory is
+    /// opened, so an invalid path (e.g. a NUL-truncated argument) fails fast on
+    /// the per-entry stat instead of recursing.
+    std::vector<fs::path> pending_dirs;
+    pending_dirs.emplace_back(path);
+
+    while (!pending_dirs.empty())
+    {
+        const fs::path dir = std::move(pending_dirs.back());
+        pending_dirs.pop_back();
+
         std::error_code ec;
-        fs::directory_iterator it(path, ec);
+        fs::directory_iterator it(dir, ec);
         if (ec)
         {
-            if (ec == std::errc::no_such_file_or_directory)
-                return;
-            throw fs::filesystem_error("Got unexpected error while listing directory", path, ec);
-        }
-        stack.push_back(std::move(it));
-    }
-
-    const fs::directory_iterator end;
-    while (!stack.empty())
-    {
-        if (stack.back() == end)
-        {
-            stack.pop_back();
+            /// The directory itself vanished (or a path component was replaced)
+            /// before we could open it: omit only this subtree, keep the rest.
+            throw_unless_vanished(ec, dir);
             continue;
         }
 
-        const fs::directory_entry entry = *stack.back();
-
-        /// Advance the current level first; a removal that races our descent below then cannot make us
-        /// revisit or get stuck. Use the error_code overload — a vanished sibling just ends this level.
-        std::error_code ec;
-        stack.back().increment(ec);
-        if (ec)
+        const fs::directory_iterator end;
+        while (it != end)
         {
-            if (ec == std::errc::no_such_file_or_directory)
+            const fs::path entry_path = it->path();
+            const bool is_dir = it->is_directory(ec); /// follows symlinks
+            if (ec)
             {
-                stack.pop_back();
-                continue;
+                throw_unless_vanished(ec, entry_path); /// entry vanished before we could stat it: skip it
             }
-            throw fs::filesystem_error("Got unexpected error while listing directory", path, ec);
-        }
-
-        /// Never follow a symlink to descend into it: `directory_entry::is_directory()` resolves through
-        /// symlinks (like `stat`), so a symlink cycle (e.g. `root/loop -> .`) would otherwise make this
-        /// walk repeatedly re-open the same directories forever. `is_symlink()` uses `symlink_status`
-        /// (like `lstat`) and never follows the final component, so it correctly identifies the entry
-        /// itself regardless of its target. This matches the previous `recursive_directory_iterator`
-        /// default (`directory_options::none` does not follow directory symlinks either); a symlink is
-        /// then handled below like any other non-directory entry (and, if it resolves to a directory,
-        /// `tryGetObjectMetadata`'s own `is_directory` guard excludes it from the listing).
-        std::error_code symlink_ec;
-        const bool is_symlink = entry.is_symlink(symlink_ec);
-
-        std::error_code dir_ec;
-        if (!is_symlink && entry.is_directory(dir_ec))
-        {
-            /// Descend. If the directory was removed between enumeration and now, opening its stream fails
-            /// with no_such_file_or_directory — skip it (it is absent from the snapshot) instead of throwing.
-            std::error_code open_ec;
-            fs::directory_iterator child(entry.path(), open_ec);
-            if (open_ec)
+            else if (is_dir)
             {
-                if (open_ec == std::errc::no_such_file_or_directory)
-                    continue;
-                throw fs::filesystem_error("Got unexpected error while listing directory", entry.path(), open_ec);
+                /// Descend only into real subdirectories, never into symlinks,
+                /// matching the no-follow-symlink default of the recursive
+                /// iterator (avoids cycles). A symlink-to-directory is neither
+                /// descended into nor reported as an object. The symlink probe
+                /// is the fourth stat in this path: route its error through the
+                /// same disappearance filter so a real error (EACCES, EIO) is
+                /// not silently dropped while a vanished entry is skipped.
+                std::error_code sym_ec;
+                const bool is_symlink = it->is_symlink(sym_ec);
+                if (sym_ec)
+                    throw_unless_vanished(sym_ec, entry_path);
+                else if (!is_symlink)
+                    pending_dirs.push_back(entry_path);
             }
-            stack.push_back(std::move(child));
-            continue;
+            else
+            {
+                if (auto metadata = tryGetObjectMetadata(entry_path, /*with_tags=*/ false))
+                    children.emplace_back(std::make_shared<RelativePathWithMetadata>(entry_path, std::move(*metadata)));
+            }
+
+            it.increment(ec);
+            if (ec)
+            {
+                /// `increment` resets the iterator to end() on error; a vanished
+                /// entry only affects this directory, the worklist preserves the rest.
+                throw_unless_vanished(ec, dir);
+                break;
+            }
         }
-        if (dir_ec && dir_ec != std::errc::no_such_file_or_directory)
-            throw fs::filesystem_error("Got unexpected error while listing directory", entry.path(), dir_ec);
-
-        /// A file entry may also be removed by a concurrent operation before we stat it (TOCTOU).
-        /// `tryGetObjectMetadata` returns nullopt when the file vanished, so skip such entries instead of
-        /// throwing — mirroring how a real object store omits a concurrently-deleted object from the listing.
-        auto object_metadata = tryGetObjectMetadata(entry.path(), false);
-        if (!object_metadata)
-            continue;
-
-        children.emplace_back(std::make_shared<RelativePathWithMetadata>(entry.path(), std::move(*object_metadata)));
     }
 }
 

@@ -134,12 +134,15 @@ def get_additional_envs(info, check_name: str) -> List[str]:
     result.append("RANDOMIZE_KEEPER_FEATURE_FLAGS=1")
     if "azure" in check_name:
         result.append("USE_AZURE_STORAGE_FOR_MERGE_TREE=1")
+        result.extend([
+            "AZURE_STORAGE_KEY=$AZURE_STORAGE_KEY",
+            "AZURE_ACCOUNT_NAME=$AZURE_ACCOUNT_NAME",
+            "AZURE_CONTAINER_NAME=$AZURE_CONTAINER_NAME",
+            "AZURE_STORAGE_ACCOUNT_URL=$AZURE_STORAGE_ACCOUNT_URL",
+        ])
 
     if "s3" in check_name:
         result.append("USE_S3_STORAGE_FOR_MERGE_TREE=1")
-
-    if "serverfuzz" in info.job_name:
-        result.append("ENABLE_SERVER_FUZZER=1")
 
     result.append(
         f"STRESS_GLOBAL_TIME_LIMIT={'3600' if is_extended_run() else '1200'}"
@@ -263,7 +266,7 @@ def run_stress_test(upgrade_check: bool = False) -> None:
 
     packages_path = temp_path
 
-    docker_image = DockerImage.get_docker_image("clickhouse/stress-test").pull_image()
+    docker_image = DockerImage.get_docker_image("altinityinfra/stress-test").pull_image()
 
     server_log_path = temp_path / "server_log"
     server_log_path.mkdir(parents=True, exist_ok=True)

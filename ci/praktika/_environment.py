@@ -44,6 +44,11 @@ class _Environment(MetaClasses.Serializable):
     TRACEBACKS: List[str] = dataclasses.field(default_factory=list)
     WORKFLOW_JOB_DATA: Dict[str, Any] = dataclasses.field(default_factory=dict)
     JOB_KV_DATA: Dict[str, Any] = dataclasses.field(default_factory=dict)
+    # Keys present in JOB_KV_DATA when the job started, i.e. inherited from the
+    # initial (config) job. Used in Runner._post_run to emit only the KV data a
+    # job itself added as the job's `data` output, instead of re-emitting the
+    # whole inherited bucket into every job's output (toJson(needs)).
+    JOB_KV_DATA_BASE_KEYS: List[str] = dataclasses.field(default_factory=list)
     COMMIT_AUTHORS: List[str] = dataclasses.field(default_factory=list)
     WORKFLOW_CONFIG: Optional[Dict[str, Any]] = None
     name = "environment"
@@ -170,23 +175,27 @@ class _Environment(MetaClasses.Serializable):
             else:
                 assert False, "TODO: not supported"
 
-            INSTANCE_TYPE = (
-                os.getenv("INSTANCE_TYPE", None)
-                or Shell.get_output("ec2metadata --instance-type")
-                or ""
-            )
-            INSTANCE_ID = (
-                os.getenv("INSTANCE_ID", None)
-                or Shell.get_output("ec2metadata --instance-id")
-                or ""
-            )
-            INSTANCE_LIFE_CYCLE = (
-                os.getenv("INSTANCE_LIFE_CYCLE", None)
-                or Shell.get_output(
-                    "curl -s --fail http://169.254.169.254/latest/meta-data/instance-life-cycle"
-                )
-                or ""
-            )
+            # NOTE (strtgbb): Override instance metadata, we don't use it
+            # INSTANCE_TYPE = (
+            #     os.getenv("INSTANCE_TYPE", None)
+            #     or Shell.get_output("ec2metadata --instance-type")
+            #     or ""
+            # )
+            # INSTANCE_ID = (
+            #     os.getenv("INSTANCE_ID", None)
+            #     or Shell.get_output("ec2metadata --instance-id")
+            #     or ""
+            # )
+            # INSTANCE_LIFE_CYCLE = (
+            #     os.getenv("INSTANCE_LIFE_CYCLE", None)
+            #     or Shell.get_output(
+            #         "curl -s --fail http://169.254.169.254/latest/meta-data/instance-life-cycle"
+            #     )
+            #     or ""
+            # )
+            INSTANCE_TYPE = "altinity-self-hosted"
+            INSTANCE_ID = "altinity-self-hosted"
+            INSTANCE_LIFE_CYCLE = "altinity-self-hosted"
 
         else:
             print("WARNING: Local execution - dummy Environment will be generated")
@@ -263,27 +272,66 @@ class _Environment(MetaClasses.Serializable):
         # Job names are normalized in the workflow status file
         normalized_job_name = Utils.normalize_string(Settings.CI_CONFIG_JOB_NAME)
         config_job_data = workflow_status_data.get(normalized_job_name, {})
-        data_str = config_job_data.get("outputs", {}).get("data", "{}")
-        env_dict = json.loads(data_str) if isinstance(data_str, str) else data_str
+        data_str = config_job_data.get("outputs", {}).get("data", "")
+        # A suppressed output may surface either as a missing key or as a blank
+        # string - do not let json.loads choke on the latter before the
+        # explicit error below
+        if isinstance(data_str, str):
+            env_dict = json.loads(data_str) if data_str.strip() else None
+        else:
+            env_dict = data_str
+        if not env_dict or "SHA" not in env_dict:
+            raise RuntimeError(
+                f"Job output [data] of the [{Settings.CI_CONFIG_JOB_NAME}] job is empty or missing. "
+                "If that job itself succeeded, the runner has likely suppressed the output: "
+                "it refuses to export a job output that matches a secret pattern "
+                "(look for a [##[warning]Skip output 'data' since it may contain secret] line "
+                f"at the very end of the [{Settings.CI_CONFIG_JOB_NAME}] job log)"
+            )
+
+        # JOB_KV_DATA is stored as opaque base64 in the initial job's output
+        # (see Runner.run) to keep user-authored strings such as changed file
+        # paths from matching a secret pattern and suppressing the output -
+        # decode it back into a dict here
+        kv_data = env_dict.get("JOB_KV_DATA")
+        if isinstance(kv_data, str):
+            env_dict["JOB_KV_DATA"] = (
+                json.loads(Utils.from_base64(kv_data)) if kv_data else {}
+            )
+
+        # User-authored free text is stripped from the initial job's output
+        # (see Runner.run: the runner drops outputs matching secret patterns) -
+        # restore it from the local event payload
+        event_file_path = os.getenv("GITHUB_EVENT_PATH", "")
+        if event_file_path and Path(event_file_path).is_file():
+            with open(event_file_path, "r", encoding="utf-8") as f:
+                github_event = json.load(f)
+            if "pull_request" in github_event:
+                env_dict["PR_BODY"] = github_event["pull_request"]["body"] or ""
+                env_dict["PR_TITLE"] = github_event["pull_request"]["title"] or ""
+            elif github_event.get("head_commit"):
+                env_dict["COMMIT_MESSAGE"] = (
+                    github_event["head_commit"]["message"] or ""
+                )
 
         # Reread instance metadata from the host
-        env_dict["INSTANCE_TYPE"] = (
-            os.getenv("INSTANCE_TYPE", None)
-            or Shell.get_output("ec2metadata --instance-type")
-            or ""
-        )
-        env_dict["INSTANCE_ID"] = (
-            os.getenv("INSTANCE_ID", None)
-            or Shell.get_output("ec2metadata --instance-id")
-            or ""
-        )
-        env_dict["INSTANCE_LIFE_CYCLE"] = (
-            os.getenv("INSTANCE_LIFE_CYCLE", None)
-            or Shell.get_output(
-                "curl -s --fail http://169.254.169.254/latest/meta-data/instance-life-cycle"
-            )
-            or ""
-        )
+        # env_dict["INSTANCE_TYPE"] = (
+        #     os.getenv("INSTANCE_TYPE", None)
+        #     or Shell.get_output("ec2metadata --instance-type")
+        #     or ""
+        # )
+        # env_dict["INSTANCE_ID"] = (
+        #     os.getenv("INSTANCE_ID", None)
+        #     or Shell.get_output("ec2metadata --instance-id")
+        #     or ""
+        # )
+        # env_dict["INSTANCE_LIFE_CYCLE"] = (
+        #     os.getenv("INSTANCE_LIFE_CYCLE", None)
+        #     or Shell.get_output(
+        #         "curl -s --fail http://169.254.169.254/latest/meta-data/instance-life-cycle"
+        #     )
+        #     or ""
+        # )
 
         # Override WORKFLOW_JOB_DATA with the current job's data so that
         # check_run_id refers to this job rather than to the config job whose
@@ -325,7 +373,7 @@ class _Environment(MetaClasses.Serializable):
                 env = cls.from_workflow_data()
                 env.dump()
                 return env
-            except FileNotFoundError as e:
+            except FileNotFoundError:
                 # For workflows without Config job
                 print(
                     f"NOTE: Workflow context file [{Settings.WORKFLOW_STATUS_FILE}] does not exist - read context from GH event"
@@ -381,7 +429,7 @@ class _Environment(MetaClasses.Serializable):
             prefix = f"REFs/{branch}"
         assert sha or latest
         if latest:
-            prefix += f"/latest"
+            prefix += "/latest"
         elif sha:
             prefix += f"/{sha}"
         return prefix

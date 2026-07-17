@@ -1,11 +1,10 @@
 import copy
-import fnmatch
 import hashlib
 import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Any, Iterable, List, Optional
+from typing import Any, List, Optional
 
 from . import Artifact
 from .utils import Shell, Utils
@@ -79,7 +78,7 @@ class Job:
         # experimental jobs that are not yet stable enough to be enforced.
         force_success: bool = False
 
-        enable_commit_status: bool = False
+        enable_commit_status: bool = True
 
         enable_gh_auth: bool = False
 

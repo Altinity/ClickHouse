@@ -559,6 +559,11 @@ scope_guard AccessControl::subscribeForChanges(const std::vector<UUID> & ids, co
     return changes_notifier->subscribeForChanges(ids, handler);
 }
 
+scope_guard AccessControl::subscribeForBatchFinished(const OnBatchFinishedHandler & handler) const
+{
+    return changes_notifier->subscribeForBatchFinished(handler);
+}
+
 bool AccessControl::insertImpl(const UUID & id, const AccessEntityPtr & entity, bool replace_if_exists, bool throw_if_exists, UUID * conflicting_id)
 {
     if (MultipleAccessStorage::insertImpl(id, entity, replace_if_exists, throw_if_exists, conflicting_id))
@@ -636,9 +641,6 @@ AuthResult AccessControl::authenticate(const Credentials & credentials, const Po
                 error_code = ErrorCodes::REQUIRED_PASSWORD;
 
             message << R"(
-
-If you use ClickHouse Cloud, the password can be reset at https://clickhouse.cloud/
-on the settings page for the corresponding service.
 
 If you have installed ClickHouse and forgot password you can reset it in the configuration file.
 The password for default user is typically located at /etc/clickhouse-server/users.d/default-password.xml

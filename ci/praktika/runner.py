@@ -152,6 +152,18 @@ class Runner:
         else:
             print("Read GH Environment from workflow data")
             env = _Environment.from_workflow_data()
+        # Record the KV-data keys inherited from the initial (config) job so the
+        # job's `data` output later carries only what this job itself added (see
+        # _post_run), not the whole inherited bucket duplicated into every job.
+        env.JOB_KV_DATA_BASE_KEYS = list(env.JOB_KV_DATA.keys())
+
+        try:
+            version_string = Info().get_kv_data("version")['string']
+            os.environ["CLICKHOUSE_VERSION_STRING"] = version_string
+            env.CLICKHOUSE_VERSION_STRING = version_string
+        except Exception as e:
+            print(e)
+
         env.JOB_NAME = job.name
         os.environ["JOB_NAME"] = job.name
         os.environ["CHECK_NAME"] = job.name
@@ -192,16 +204,17 @@ class Runner:
         if job.requires and not _is_praktika_job(job.name):
             print("Download required artifacts")
             required_artifacts = []
+            required_gh_artifacts = []
             job_names_with_provides = {
                 j.name for j in workflow.jobs if j.provides
             }
             for requires_artifact_name in job.requires:
                 for artifact in workflow.artifacts:
-                    if (
-                        artifact.name == requires_artifact_name
-                        and artifact.type == Artifact.Type.S3
-                    ):
-                        required_artifacts.append(artifact)
+                    if artifact.name == requires_artifact_name:
+                        if artifact.type == Artifact.Type.S3:
+                            required_artifacts.append(artifact)
+                        elif artifact.type == Artifact.Type.GH:
+                            required_gh_artifacts.append(artifact)
                         break
                 else:
                     if requires_artifact_name in job_names_with_provides:
@@ -255,6 +268,88 @@ class Runner:
 
                     if artifact.compress_zst:
                         Utils.decompress_file(Path(Settings.INPUT_DIR) / artifact_path)
+
+            # GH artifacts are downloaded by workflow YAML steps. If they are missing (e.g. rerun after
+            # short GH retention expiry), attempt fallback to matching S3 artifact by name.
+            for gh_artifact in required_gh_artifacts:
+                if isinstance(gh_artifact.path, (tuple, list)):
+                    gh_paths = gh_artifact.path
+                else:
+                    gh_paths = [gh_artifact.path]
+
+                expected_local_paths = []
+                unresolved_pattern = False
+                for gh_path in gh_paths:
+                    if "*" in gh_path:
+                        unresolved_pattern = True
+                        continue
+                    expected_local_paths.append(Path(Settings.INPUT_DIR) / Path(gh_path).name)
+
+                if expected_local_paths and all(p.exists() for p in expected_local_paths):
+                    continue
+
+                if unresolved_pattern and not expected_local_paths:
+                    print(
+                        f"WARNING: Cannot resolve expected local path for GH artifact [{gh_artifact.name}] with wildcard path [{gh_artifact.path}] - skip S3 fallback"
+                    )
+                    continue
+
+                s3_fallback_name = (
+                    gh_artifact.name[:-3]
+                    if gh_artifact.name.endswith("_GH")
+                    else gh_artifact.name
+                )
+                s3_fallback_artifact = None
+                for artifact in workflow.artifacts:
+                    if (
+                        artifact.name == s3_fallback_name
+                        and artifact.type == Artifact.Type.S3
+                    ):
+                        s3_fallback_artifact = artifact
+                        break
+
+                if not s3_fallback_artifact:
+                    print(
+                        f"WARNING: GH artifact [{gh_artifact.name}] is missing and no S3 fallback artifact [{s3_fallback_name}] is configured"
+                    )
+                    continue
+
+                print(
+                    f"GH artifact [{gh_artifact.name}] is missing; fallback to S3 artifact [{s3_fallback_artifact.name}]"
+                )
+                fallback_prefix = env.get_s3_prefix()
+
+                fallback_artifact = dataclasses.replace(s3_fallback_artifact)
+                if fallback_artifact.compress_zst:
+                    assert not isinstance(
+                        fallback_artifact.path, (tuple, list)
+                    ), "Not yes supported for compressed artifacts"
+                    fallback_artifact.path = f"{Path(fallback_artifact.path).name}.zst"
+
+                if isinstance(fallback_artifact.path, (tuple, list)):
+                    fallback_paths = fallback_artifact.path
+                else:
+                    fallback_paths = [fallback_artifact.path]
+
+                for fallback_path in fallback_paths:
+                    recursive = False
+                    include_pattern = ""
+                    if "*" in fallback_path:
+                        s3_path = f"{Settings.S3_ARTIFACT_PATH}/{fallback_prefix}/{Utils.normalize_string(fallback_artifact._provided_by)}/"
+                        recursive = True
+                        include_pattern = Path(fallback_path).name
+                        assert "*" in include_pattern
+                    else:
+                        s3_path = f"{Settings.S3_ARTIFACT_PATH}/{fallback_prefix}/{Utils.normalize_string(fallback_artifact._provided_by)}/{Path(fallback_path).name}"
+                    S3.copy_file_from_s3(
+                        s3_path=s3_path,
+                        local_path=Settings.INPUT_DIR,
+                        recursive=recursive,
+                        include_pattern=include_pattern,
+                    )
+
+                    if fallback_artifact.compress_zst:
+                        Utils.decompress_file(Path(Settings.INPUT_DIR) / fallback_path)
 
         if not local_run and job.needs_submodules and Settings.ENABLE_SUBMODULE_CACHE:
             self._restore_submodule_cache()
@@ -467,8 +562,8 @@ class Runner:
             print(f"Custom --count [{count}] will be passed to job's script")
             cmd += f" --count {count}"
         if debug:
-            print(f"Custom --debug will be passed to job's script")
-            cmd += f" --debug"
+            print("Custom --debug will be passed to job's script")
+            cmd += " --debug"
         if path:
             print(f"Custom --path [{path}] will be passed to job's script")
             cmd += f" --path {path}"
@@ -486,7 +581,7 @@ class Runner:
             preserve_stdio=preserve_stdio,
             timeout_shell_cleanup=job.timeout_shell_cleanup,
         ) as process:
-            start_time = Utils.timestamp()
+            Utils.timestamp()
 
             exit_code = process.wait()
 
@@ -495,7 +590,7 @@ class Runner:
             # reading the result file or writing the host-side result, so that the
             # host user can open them without a PermissionError.
             if job.run_in_docker and not no_docker and from_root:
-                print(f"--- Fixing file ownership after running docker as root")
+                print("--- Fixing file ownership after running docker as root")
                 uid = os.getuid()
                 gid = os.getgid()
                 chown_cmd = f"docker run --rm --user root --volume {host_dir_q}:{current_dir} --workdir={current_dir} {docker} chown -R {uid}:{gid} {Settings.TEMP_DIR}"
@@ -580,7 +675,7 @@ class Runner:
         result.update_duration()
         result.set_files([Settings.RUN_LOG], strict=False)
         if job.force_success and not result.is_ok():
-            print(f"NOTE: Job has force_success=True - overriding status to OK")
+            print("NOTE: Job has force_success=True - overriding status to OK")
             result.set_status(Result.Status.OK)
         return result
 
@@ -657,11 +752,38 @@ class Runner:
                     result.set_link(link)
 
         # run after post hooks as they might modify workflow kv data
-        job_outputs = env.JOB_KV_DATA
+        # Non-initial jobs inherit the whole JOB_KV_DATA from the initial (config)
+        # job at startup (see _setup_env / _Environment.from_workflow_data). Emit
+        # only the keys this job itself added, so every job's `data` output does
+        # not re-duplicate the inherited bucket into toJson(needs).
+        base_keys = set(env.JOB_KV_DATA_BASE_KEYS or [])
+        job_outputs = {
+            k: v for k, v in env.JOB_KV_DATA.items() if k not in base_keys
+        }
         print(f"Job's output: [{list(job_outputs.keys())}]")
         if is_initial_job:
             output = dataclasses.asdict(env)
             output["pipeline_status"] = "success"
+            # User-authored free text must not be embedded into the job output:
+            # the GitHub Actions runner scans outputs with built-in secret
+            # patterns (e.g. "Bearer <chars>") and silently drops the whole
+            # output on a match, which makes every downstream job skip.
+            # Downstream jobs restore these fields from the event payload in
+            # _Environment.from_workflow_data.
+            output["PR_BODY"] = ""
+            output["PR_TITLE"] = ""
+            output["COMMIT_MESSAGE"] = ""
+            # JOB_KV_DATA carries user-authored strings too (e.g. the
+            # `changed_files`/`changed_integration_tests` paths a PR can name
+            # arbitrarily), so a path matching a secret pattern would suppress
+            # the whole output the same way. The downstream-visible `data`
+            # output only needs `workflow_config` as plain JSON (for the GitHub
+            # Actions `if: fromJson(...).workflow_config` expressions); the rest
+            # is consumed solely by _Environment.from_workflow_data. Encode the
+            # whole bucket as opaque base64 so no raw user text can match a
+            # pattern - base64 is already used for `cache_success_base64` in the
+            # same output, so it is known to pass the masker.
+            output["JOB_KV_DATA"] = Utils.to_base64(json.dumps(env.JOB_KV_DATA))
         else:
             output = job_outputs
         with open(env.JOB_OUTPUT_STREAM, "a", encoding="utf8") as f:
@@ -730,7 +852,7 @@ class Runner:
 
         # always in the end
         if workflow.enable_cache:
-            print(f"Run CI cache hook")
+            print("Run CI cache hook")
             if result.is_ok():
                 CacheRunnerHooks.post_run(workflow, job)
 
@@ -766,11 +888,11 @@ class Runner:
                     env.add_workflow_error(
                         "Failed to post GH commit status for the job"
                     )
-                    print(f"ERROR: Failed to post commit status for the job")
+                    print("ERROR: Failed to post commit status for the job")
 
         # Always run report generation at the end to finalize workflow status with latest job result
         if workflow.enable_report:
-            print(f"Run html report hook")
+            print("Run html report hook")
             status_updated = HtmlRunnerHooks.post_run(workflow, job)
             if status_updated:
                 print(f"Update GH commit status [{result.name}]: [{status_updated}]")
@@ -814,12 +936,17 @@ class Runner:
                     comment_tags_and_bodies={"summary": summary_body},
                     only_update=True,
                 ):
-                    print(f"ERROR: failed to post CI summary")
+                    print("ERROR: failed to post CI summary")
             except Exception as e:
                 print(f"ERROR: failed to post CI summary, ex: {e}")
                 traceback.print_exc()
 
         if workflow.enable_report:
+            # Altinity workflow report
+            cmd = f"PR_NUMBER={env.PR_NUMBER} ./.github/actions/create_workflow_report/workflow_report_hook.sh"
+            workflow_report_url = Shell.get_output(cmd).splitlines()[-1]
+            print(f"::notice ::Workflow report: {workflow_report_url}")
+
             # to make it visible in GH Actions annotations
             print(f"::notice ::Job report: {report_url}")
 
@@ -977,7 +1104,7 @@ class Runner:
                 print(f"ERROR: Setup env script failed with exception [{e}]")
                 traceback.print_exc()
                 Info().store_traceback()
-            print(f"=== Setup env finished ===\n\n")
+            print("=== Setup env finished ===\n\n")
         else:
             self.generate_local_run_environment(
                 workflow, job, pr=pr, sha=sha, branch=branch
@@ -1006,7 +1133,7 @@ class Runner:
                 print(f"ERROR: Pre-run script failed with exception [{e}]")
                 traceback.print_exc()
                 Info().store_traceback()
-            print(f"=== Pre run finished ===\n\n")
+            print("=== Pre run finished ===\n\n")
 
         prehook_result = None
         if res and run_hooks and job.pre_hooks:
@@ -1054,7 +1181,7 @@ class Runner:
                     f"Job got terminated with an error, exit code [{run_code}]"
                 ).dump()
 
-            print(f"=== Run script finished ===\n\n")
+            print("=== Run script finished ===\n\n")
 
         if run_hooks:
             result = self._get_result_object(
@@ -1075,7 +1202,7 @@ class Runner:
                 result.results.append(
                     Result.create_from(name="Post Hooks", results=results_, stopwatch=sw_)
                 )
-                print(f"=== Post hooks finished ===")
+                print("=== Post hooks finished ===")
 
             if not local_run:
                 print(f"=== Post run script [{job.name}], workflow [{workflow.name}] ===")
@@ -1083,7 +1210,7 @@ class Runner:
                     result, workflow, job, run_code
                 )
                 res = res and post_res
-                print(f"=== Post run script finished ===")
+                print("=== Post run script finished ===")
 
             result.dump()
 

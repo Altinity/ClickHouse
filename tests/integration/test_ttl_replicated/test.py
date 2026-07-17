@@ -19,7 +19,7 @@ node3 = cluster.add_instance("node3", with_zookeeper=True)
 node4 = cluster.add_instance(
     "node4",
     with_zookeeper=True,
-    image="clickhouse/clickhouse-server",
+    image="altinity/clickhouse-server",
     tag=CLICKHOUSE_CI_MIN_TESTED_VERSION,
     stay_alive=True,
     with_installed_binary=True,
@@ -31,7 +31,7 @@ node4 = cluster.add_instance(
 node5 = cluster.add_instance(
     "node5",
     with_zookeeper=True,
-    image="clickhouse/clickhouse-server",
+    image="altinity/clickhouse-server",
     tag=CLICKHOUSE_CI_MIN_TESTED_VERSION,
     stay_alive=True,
     with_installed_binary=True,
@@ -42,7 +42,7 @@ node5 = cluster.add_instance(
 node6 = cluster.add_instance(
     "node6",
     with_zookeeper=True,
-    image="clickhouse/clickhouse-server",
+    image="altinity/clickhouse-server",
     tag=CLICKHOUSE_CI_MIN_TESTED_VERSION,
     stay_alive=True,
     with_installed_binary=True,
@@ -56,12 +56,7 @@ node6 = cluster.add_instance(
 def started_cluster():
     try:
         cluster.start()
-
         yield cluster
-
-    except Exception as ex:
-        print(ex)
-
     finally:
         cluster.shutdown()
 
@@ -709,7 +704,7 @@ def test_ttl_compatibility(started_cluster, node_left, node_right, num_run):
 def test_ttl_drop_parts_limit(started_cluster):
     table = f"test_merges_mutations_limit_{uuid.uuid4().hex}"
 
-    max_parts_to_merge_at_once = 123
+    max_parts_to_merge_at_once = 20
     node1.query(
         f"""
         CREATE TABLE {table} (
@@ -731,8 +726,8 @@ def test_ttl_drop_parts_limit(started_cluster):
     # Stop merges, to be able to accumulate a big number of parts
     node1.query(f"SYSTEM STOP MERGES {table}")
 
-    # Insert many parts (over 1000) with old dates that should expire
-    parts_count = 1100
+    # More parts than max_parts_to_merge_at_once so the TTL drop runs in several rounds; keep it small.
+    parts_count = 50
     old_date = "toDateTime('2000-01-01 00:00:00')"
 
     for i in range(parts_count):

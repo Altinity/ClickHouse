@@ -1,7 +1,6 @@
 import argparse
 import os
 import platform
-import time
 import sys
 from pathlib import Path
 
@@ -15,7 +14,7 @@ from ci.jobs.scripts.functional_tests_results import FTResultsProcessor
 from ci.praktika.info import Info
 from ci.praktika.result import Result
 from ci.praktika.settings import Settings
-from ci.praktika.utils import ContextManager, MetaClasses, Shell, Utils
+from ci.praktika.utils import MetaClasses, Shell, Utils
 
 current_directory = Utils.cwd()
 build_dir = f"{current_directory}/ci/tmp/fast_build"
@@ -65,6 +64,7 @@ def clone_submodules():
         "contrib/StringZilla",
         "contrib/rust_vendor",
         "contrib/clickstack",
+        "contrib/libpng",
     ]
 
     res = Shell.check("git submodule sync", verbose=True, strict=True)
@@ -183,9 +183,19 @@ def main():
 
             stages = [JobStages.CONFIG, JobStages.TEST]
             resolved_clickhouse_bin_path = clickhouse_bin_path.resolve()
-            Utils.link(resolved_clickhouse_bin_path, resolved_clickhouse_bin_path.parent / "clickhouse-server")
-            Utils.link(resolved_clickhouse_bin_path, resolved_clickhouse_bin_path.parent / "clickhouse-client")
-            Utils.link(resolved_clickhouse_bin_path, resolved_clickhouse_bin_path.parent / "clickhouse-local")
+            for tool in (
+                "clickhouse-server",
+                "clickhouse-client",
+                "clickhouse-local",
+                "clickhouse-benchmark",
+                "clickhouse-compressor",
+                "clickhouse-disks",
+                "clickhouse-extract-from-config",
+                "clickhouse-format",
+                "clickhouse-obfuscator",
+                "clickhouse-su",
+            ):
+                Utils.link(resolved_clickhouse_bin_path, resolved_clickhouse_bin_path.parent / tool)
             Shell.check(f"chmod +x {resolved_clickhouse_bin_path}", strict=True)
 
             break
@@ -207,21 +217,27 @@ def main():
     # builds (pr_number == 0) are allowed to write entries.
     if info.pr_number > 0:
         os.environ["SCCACHE_S3_READ_ONLY"] = "true"
-    if info.is_local_run:
+    if info.is_local_run or info.is_community_pr:
         print("NOTE: It's a local run")
         if os.environ.get("SCCACHE_ENDPOINT"):
             print(f"NOTE: Using custom sccache endpoint: {os.environ['SCCACHE_ENDPOINT']}")
-        if os.environ.get("AWS_ACCESS_KEY_ID"):
+        if os.environ.get("AWS_ACCESS_KEY_ID") and not info.is_community_pr:
             print("NOTE: Using custom AWS credentials for sccache")
         else:
+            print("NOTE: Community contribution or local run - set sccache to run without AWS credentials")
             os.environ["SCCACHE_S3_NO_CREDENTIALS"] = "true"
+            # NOTE (strtgbb): sccache will throw an error if AWS credentials are present with SCCACHE_S3_NO_CREDENTIALS=1
+            os.environ.pop("AWS_SECRET_ACCESS_KEY", None)
+            os.environ.pop("AWS_ACCESS_KEY_ID", None)
     else:
-        os.environ["CH_HOSTNAME"] = (
-            "https://build-cache.eu-west-1.aws.clickhouse-staging.com"
-        )
-        os.environ["CH_USER"] = "ci_builder"
-        os.environ["CH_PASSWORD"] = chcache_secret.get_value()
-        os.environ["CH_USE_LOCAL_CACHE"] = "false"
+        pass
+        # NOTE (strtgbb): Not used yet, but we should look into setting up the secrets for it
+        # os.environ["CH_HOSTNAME"] = (
+        #     "https://build-cache.eu-west-1.aws.clickhouse-staging.com"
+        # )
+        # os.environ["CH_USER"] = "ci_builder"
+        # os.environ["CH_PASSWORD"] = chcache_secret.get_value()
+        # os.environ["CH_USE_LOCAL_CACHE"] = "false"
 
     Utils.add_to_PATH(
         f"{os.path.dirname(clickhouse_bin_path)}:{current_directory}/tests"
@@ -261,7 +277,7 @@ def main():
                 -DENABLE_TESTS=0 -DENABLE_UTILS=0 -DENABLE_THINLTO=0 -DENABLE_NURAFT=1 -DENABLE_SIMDJSON=1 \
                 -DENABLE_LEXER_TEST=1 \
                 -DBUILD_STRIPPED_BINARY=1 \
-                -DENABLE_JEMALLOC=1 -DENABLE_LIBURING=1 -DENABLE_YAML_CPP=1 -DENABLE_RUST=1 \
+                -DENABLE_JEMALLOC=1 -DENABLE_LIBURING=1 -DENABLE_YAML_CPP=1 -DENABLE_RUST=1 -DENABLE_LIBPNG=1 \
                 -B {build_dir_normalized}",
                 workdir=repo_path_normalized,
             )
@@ -350,7 +366,7 @@ def main():
 
         test_exit_code = CH.run_test(fast_test_command)
 
-        test_results = FTResultsProcessor(wd=Settings.OUTPUT_DIR).run(
+        test_results = FTResultsProcessor(wd=Settings.OUTPUT_DIR, test_options=["fast"]).run(
             runner_exit_code=test_exit_code,
         )
         if test_exit_code != 0:

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tags: long, zookeeper, no-shared-merge-tree, no-content-addressed-storage
+# Tags: long, zookeeper, no-shared-merge-tree, no-parallel, no-content-addressed-storage
 # no-content-addressed-storage: test asserts system.parts.path is an absolute local FS path; on a content_addressed disk the path is a relative object-storage key (orthogonal part-file path-shape)
 # no-shared-merge-tree: depend on local fs (remove parts)
 

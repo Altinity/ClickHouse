@@ -59,17 +59,36 @@ from minio import Minio
 
 from . import pytest_xdist_logging_to_separate_files
 from .client import Client, QueryRuntimeException
-from .config_cluster import *
+from .config_cluster import (
+    dremio_pass,
+    dremio_user,
+    minio_access_key,
+    minio_secret_key,
+    mongo_pass,
+    mongo_user,
+    mysql_pass,
+    mysql_user,
+    nats_pass,
+    nats_user,
+    odbc_mysql_db,
+    odbc_mysql_uid,
+    odbc_psql_db,
+    odbc_psql_user,
+    pg_db,
+    pg_pass,
+    pg_user,
+)
 from .kazoo_client import KazooClientWithImplicitRetries
 from .random_settings import write_random_settings_config
 from .retry_decorator import retry
-from .test_tools import assert_eq_with_retry, exec_query_with_retry
+from .test_tools import exec_query_with_retry
 
 HELPERS_DIR = p.dirname(__file__)
 CLICKHOUSE_ROOT_DIR = p.join(p.dirname(__file__), "../../..")
 LOCAL_DOCKER_COMPOSE_DIR = p.join(CLICKHOUSE_ROOT_DIR, "tests/integration/compose/")
 DEFAULT_ENV_NAME = ".env"
 
+sensitive_var_pattern = re.compile(r"[A-Z_]*(SECRET|PASSWORD|KEY|TOKEN|AZURE)[A-Z_]*")
 
 def find_default_config_path():
     path = os.environ.get("CLICKHOUSE_TESTS_BASE_CONFIG_DIR", None)
@@ -120,7 +139,8 @@ CLICKHOUSE_ERROR_LOG_FILE = "/var/log/clickhouse-server/clickhouse-server.err.lo
 # Minimum version we use in integration tests to check compatibility with old releases
 # Keep in mind that we only support upgrading between releases that are at most 1 year different.
 # This means that this minimum need to be, at least, 1 year older than the current release
-CLICKHOUSE_CI_MIN_TESTED_VERSION = "23.3"
+# NOTE(vnemkov): this is a docker tag, make sure it doesn't include initial 'v'
+CLICKHOUSE_CI_MIN_TESTED_VERSION = "23.3.19.33.altinitystable"
 
 # `Nullable(Tuple)` experimental feature is introduced in 26.1. This has lead to changes in the output return type
 # of many aggregate functions from `Tuple(...)` to `Nullable(Tuple(...))`. This version can be used as baseline to do
@@ -600,7 +620,7 @@ class ClickHouseCluster:
         #    [1]: https://github.com/ClickHouse/ClickHouse/issues/43426#issuecomment-1368512678
         self.env_variables["ASAN_OPTIONS"] = "use_sigaltstack=0"
         # In integration tests we spawn multiple servers, so let's aim to not more then 5GiB
-        self.env_variables["TSAN_OPTIONS"] = f"use_sigaltstack=0 memory_limit_mb=5120"
+        self.env_variables["TSAN_OPTIONS"] = "use_sigaltstack=0 memory_limit_mb=5120"
         self.env_variables["CLICKHOUSE_WATCHDOG_ENABLE"] = "0"
         self.env_variables["CLICKHOUSE_NATS_TLS_SECURE"] = "0"
 
@@ -941,7 +961,7 @@ class ClickHouseCluster:
             logging.debug(f"Removed :{self.instances_dir}")
 
         if with_spark:
-            import pyspark
+            pass
 
             # (
             #     pyspark.sql.SparkSession.builder.appName("spark_test")
@@ -1197,7 +1217,7 @@ class ClickHouseCluster:
                 if unstopped_containers:
                     logging.debug(f"Left unstopped containers: {unstopped_containers}")
                 else:
-                    logging.debug(f"Unstopped containers killed.")
+                    logging.debug("Unstopped containers killed.")
             else:
                 logging.debug(f"No running containers for project: {self.project_name}")
         except Exception as ex:
@@ -1370,7 +1390,7 @@ class ClickHouseCluster:
 
         env_variables["keeper_binary"] = binary_path
         env_variables["keeper_cmd_prefix"] = keeper_cmd_prefix
-        env_variables["image"] = "clickhouse/integration-test:" + DOCKER_BASE_TAG
+        env_variables["image"] = "altinityinfra/integration-test:" + DOCKER_BASE_TAG
         env_variables["user"] = str(os.getuid())
         env_variables["keeper_fs"] = "bind"
         for i in range(1, 4):
@@ -2120,7 +2140,7 @@ class ClickHouseCluster:
         hostname=None,
         env_variables=None,
         instance_env_variables=False,
-        image="clickhouse/integration-test",
+        image="altinityinfra/integration-test",
         tag=None,
         # keep the docker container running when clickhouse server is stopped
         stay_alive=False,
@@ -3240,7 +3260,7 @@ class ClickHouseCluster:
                 subprocess.check_call(  # STYLE_CHECK_ALLOW_SUBPROCESS_CHECK_CALL
                     self.base_kafka_cmd + ["logs"], stdout=f
                 )
-        except Exception as e:
+        except Exception:
             logging.debug("Unable to get logs from docker.")
         raise Exception("Kafka is not available")
 
@@ -3357,7 +3377,7 @@ class ClickHouseCluster:
                 subprocess.check_call(  # STYLE_CHECK_ALLOW_SUBPROCESS_CHECK_CALL
                     self.base_minio_cmd + ["logs"], stdout=f
                 )
-        except Exception as e:
+        except Exception:
             logging.debug("Unable to get logs from docker.")
 
         raise Exception("Can't wait Minio to start")
@@ -3498,7 +3518,6 @@ class ClickHouseCluster:
 
             start = time.time()
             sr_started = False
-            sr_auth_started = False
             while time.time() - start < timeout:
                 try:
                     sr_client._send_request(sr_client.url)
@@ -3644,7 +3663,7 @@ class ClickHouseCluster:
 
         try:
             self.cleanup()
-        except Exception as e:
+        except Exception:
             logging.warning("Cleanup failed:{e}")
 
         try:
@@ -3671,7 +3690,7 @@ class ClickHouseCluster:
                     )
 
             self.login_to_ecr()
-            retry(log_function=logging_pulling_images, retries=3, delay=8, jitter=8)(run_and_check, images_pull_cmd, timeout=180)
+            retry(log_function=logging_pulling_images, retries=3, delay=8, jitter=8)(run_and_check, images_pull_cmd, timeout=600)
 
             def logging_compose_up(**kwargs):
                 if "exception" in kwargs:
@@ -3985,7 +4004,7 @@ class ClickHouseCluster:
                 self.up_called = True
                 self.rabbitmq_docker_id = self.get_instance_docker_id("rabbitmq1")
                 time.sleep(2)
-                logging.debug(f"RabbitMQ checking container try")
+                logging.debug("RabbitMQ checking container try")
                 self.wait_rabbitmq_to_start()
 
             if self.with_nats and self.base_nats_cmd:
@@ -4186,7 +4205,7 @@ class ClickHouseCluster:
             if self.with_letsencrypt_pebble and self.base_letsencrypt_pebble_cmd:
                 letsencrypt_pebble_pull_cmd = self.base_letsencrypt_pebble_cmd + ["pull"]
                 retry(log_function=logging_pulling_images, retries=3, delay=8, jitter=8)(
-                    run_and_check, letsencrypt_pebble_pull_cmd, timeout=180
+                    run_and_check, letsencrypt_pebble_pull_cmd, timeout=600
                 )
                 letsencrypt_pebble_start_cmd = self.base_letsencrypt_pebble_cmd + common_opts
                 run_and_check(letsencrypt_pebble_start_cmd)
@@ -4201,7 +4220,7 @@ class ClickHouseCluster:
                 )
                 run_and_check(arrowflight_start_cmd)
 
-                logging.error(f'Trying to connect to Arrowflight...')
+                logging.error('Trying to connect to Arrowflight...')
                 self.wait_arrowflight_to_start()
 
             clickhouse_start_cmd = self.base_cmd + ["up", "-d", "--no-recreate"]
@@ -4424,10 +4443,32 @@ class ClickHouseCluster:
     def _unpause_container(self, instance_name):
         subprocess_check_call(self.base_cmd + ["unpause", instance_name])
 
+    def _signal_clickhouse_in_container(self, instance_name, signal_name):
+        # Returns True if a `clickhouse` process was signaled inside the
+        # container; False if no such process exists so callers can fall
+        # back to signaling the container's main process.
+        container_id = self.get_container_id(instance_name)
+        result = self.exec_in_container(
+            container_id,
+            ["bash", "-c", "pkill -{} clickhouse; echo $?".format(signal_name)],
+            nothrow=True,
+            user="root",
+        )
+        last_line = (result or "").strip().splitlines()[-1] if result else ""
+        return last_line == "0"
+
     def _pause_container_using_signal(self, instance_name):
+        # ClickHouse runs as a child of the bash entrypoint at PID 1, and
+        # bash does not propagate uncatchable signals to children, so we
+        # must target the `clickhouse` process directly. For non-ClickHouse
+        # containers (Kafka, MongoDB, etc.) PID 1 is the service itself.
+        if self._signal_clickhouse_in_container(instance_name, "STOP"):
+            return
         subprocess_check_call(self.base_cmd + ["kill", "--signal=SIGSTOP", instance_name])
 
     def _unpause_container_using_signal(self, instance_name):
+        if self._signal_clickhouse_in_container(instance_name, "CONT"):
+            return
         subprocess_check_call(self.base_cmd + ["kill", "--signal=SIGCONT", instance_name])
 
     def _wait_for_pause_effective(self, instance_name, timeout):
@@ -4857,7 +4898,7 @@ class ClickHouseInstance:
         hostname=None,
         env_variables=None,
         instance_env_variables=False,
-        image="clickhouse/integration-test",
+        image="altinityinfra/integration-test",
         tag="latest",
         stay_alive=False,
         ipv4_address=None,
@@ -4897,7 +4938,7 @@ class ClickHouseInstance:
         if pids_limit is not None:
             self.pids_limit = f"pids_limit: {pids_limit}"
         else:
-            self.pids_limit = f"pids_limit: 5000"
+            self.pids_limit = "pids_limit: 5000"
 
         self.base_config_dir = (
             p.abspath(p.join(base_path, base_config_dir)) if base_config_dir else None
@@ -5388,6 +5429,7 @@ class ClickHouseInstance:
             raise Exception(
                 "clickhouse can be stopped only with stay_alive=True instance"
             )
+
         try:
             ps_clickhouse = self.exec_in_container(
                 ["bash", "-c", "ps --no-header -C clickhouse"], nothrow=True, user="root"
@@ -5395,6 +5437,26 @@ class ClickHouseInstance:
             if not ps_clickhouse:
                 logging.warning("ClickHouse process already stopped")
                 return False
+
+            # Under LLVM coverage the server runs several times slower and writes its
+            # .profraw only on a graceful shutdown (the libprofile atexit handler, or
+            # dumpCoverageReportIfPossible() on the forced-shutdown path). Escalating to
+            # SIGKILL loses everything this process executed. So for a graceful stop give
+            # the server a much larger window to finish shutting down (and flush coverage)
+            # before the force-kill below. We detect a coverage build from
+            # system.build_options (cached; the server is confirmed up at this point),
+            # which is reliable - unlike LLVM_PROFILE_FILE, which is set for every
+            # container regardless of build. restart_clickhouse() delegates here, so it
+            # is covered too.
+            if not kill and stop_wait_sec < 180:
+                if getattr(self, "_built_with_llvm_coverage", None) is None:
+                    try:
+                        self._built_with_llvm_coverage = self.is_built_with_llvm_coverage()
+                    except Exception as e:
+                        logging.warning(f"Could not detect LLVM coverage build: {e}")
+                        self._built_with_llvm_coverage = False
+                if self._built_with_llvm_coverage:
+                    stop_wait_sec = 180
 
             self.exec_in_container(
                 ["bash", "-c", "pkill {} clickhouse".format("-9" if kill else "-15")],
@@ -5473,7 +5535,7 @@ class ClickHouseInstance:
                 try:
                     self.wait_start(start_wait_sec + start_time - time.time())
                     return exec_id
-                except Exception as e:
+                except Exception:
                     logging.warning(
                         f"Current start attempt failed. Will kill {pid} just in case."
                     )
@@ -5513,7 +5575,7 @@ class ClickHouseInstance:
             if time.time() > start_time + start_wait_sec:
                 break
         logging.error(
-            f"No time left to start. But process is still running. Will dump threads."
+            "No time left to start. But process is still running. Will dump threads."
         )
         ps_clickhouse = self.exec_in_container(
             ["bash", "-c", "ps -C clickhouse"], nothrow=True, user="root"
@@ -5536,7 +5598,7 @@ class ClickHouseInstance:
                 return
             time.sleep(1)
         logging.error(
-            f"No time left to shutdown. Process is still running. Will dump threads."
+            "No time left to shutdown. Process is still running. Will dump threads."
         )
         ps_clickhouse = self.exec_in_container(
             ["bash", "-c", "ps -C clickhouse"], nothrow=True, user="root"
@@ -5608,7 +5670,7 @@ class ClickHouseInstance:
     def grep_in_log(
         self, substring, from_host=False, filename="clickhouse-server.log", after=None, only_latest=False
     ):
-        logging.debug(f"grep in log called %s", substring)
+        logging.debug("grep in log called %s", substring)
         if after is not None:
             after_opt = "-A{}".format(after)
         else:
@@ -5821,7 +5883,7 @@ class ClickHouseInstance:
         # wait start
         time_left = begin_time + stop_start_wait_sec - time.time()
         if time_left <= 0:
-            raise Exception(f"No time left during restart")
+            raise Exception("No time left during restart")
         else:
             self.wait_start(time_left)
 
@@ -5902,7 +5964,7 @@ class ClickHouseInstance:
         # wait start
         time_left = begin_time + stop_start_wait_sec - time.time()
         if time_left <= 0:
-            raise Exception(f"No time left during restart")
+            raise Exception("No time left during restart")
         else:
             self.wait_start(time_left)
 
@@ -6120,7 +6182,7 @@ class ClickHouseInstance:
                 delimiter = d
                 break
         else:
-            raise Exception(f"Couldn't find a suitable delimiter")
+            raise Exception("Couldn't find a suitable delimiter")
         replace = shlex.quote(replace)
         replacement = shlex.quote(replacement)
         self.exec_in_container(
@@ -6227,17 +6289,16 @@ class ClickHouseInstance:
 
         if (
             self.randomize_settings
-            and self.image == "clickhouse/integration-test"
+            and self.image == "altinityinfra/integration-test"
             and self.tag == DOCKER_BASE_TAG
             and self.base_config_dir == DEFAULT_BASE_CONFIG_DIR
         ):
             # If custom main config is used, do not apply random settings to it
             write_random_settings_config(Path(users_d_dir) / "0_random_settings.xml")
 
-        version = None
         version_parts = self.tag.split(".")
         if version_parts[0].isdigit() and version_parts[1].isdigit():
-            version = {"major": int(version_parts[0]), "minor": int(version_parts[1])}
+            {"major": int(version_parts[0]), "minor": int(version_parts[1])}
 
         logging.debug("Generate and write macros file")
         macros = self.macros.copy()

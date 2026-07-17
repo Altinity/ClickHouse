@@ -3,11 +3,13 @@
 #include <Disks/IDiskTransaction.h>
 #include <Disks/SingleDiskVolume.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/StoredObject.h>
+#include <IO/PackedFilesReader.h>
 #include <IO/ReadBufferFromFileBase.h>
 #include <IO/ReadHelpers.h>
 #include <IO/ReadPipeline.h>
 #include <IO/WriteBufferFromFileBase.h>
 #include <Interpreters/Context.h>
+#include <Storages/MergeTree/MergeTreeIndicesSerialization.h>
 #include <Common/FailPoint.h>
 #include <Common/typeid_cast.h>
 
@@ -73,6 +75,11 @@ bool DataPartStorageOnDiskFull::existsFile(const std::string & name) const
     /// (e.g. projection temp blocks on a content-addressed disk). Consult the held transaction first.
     if (transaction && transaction->tryGetInFlightFileSize(path).has_value())
         return true;
+    if (looksLikePackedSkipIndexFile(name))
+    {
+        if (auto reader = getSkipIndicesPackedReader(); reader && reader->exists(name))
+            return true;
+    }
     return volume->getDisk()->existsFile(path);
 }
 
@@ -166,6 +173,11 @@ size_t DataPartStorageOnDiskFull::getFileSize(const String & file_name) const
     if (transaction)
         if (auto size = transaction->tryGetInFlightFileSize(path))
             return *size;
+    if (looksLikePackedSkipIndexFile(file_name))
+    {
+        if (auto reader = getSkipIndicesPackedReader(); reader && reader->exists(file_name))
+            return reader->getFileSize(file_name);
+    }
     return volume->getDisk()->getFileSize(path);
 }
 
@@ -249,6 +261,27 @@ void DataPartStorageOnDiskFull::prepareRead(
         }
     }
 
+    if (looksLikePackedSkipIndexFile(name))
+    {
+        if (auto reader = getSkipIndicesPackedReader(); reader && reader->exists(name))
+        {
+            /// Packed substreams skip the disk's normal pipeline (filesystem cache,
+            /// async prefetch, etc.) and read through PackedFilesReader::readFile, which
+            /// opens the archive via the underlying disk and wraps the result with
+            /// ReadBufferFromFileView at the right offset. The archive's current location is
+            /// captured here and passed in, so the reader holds no path of its own.
+            auto disk = volume->getDisk();
+            String archive_path = fs::path(root_path) / part_dir / String(SKIP_INDICES_PACKED_FILENAME);
+            ReadPipeline::BufferCreator creator =
+                [reader, disk, archive_path, name, read_hint](const StoredObject &, const ReadSettings & s, bool, bool)
+                {
+                    return reader->readFile(disk, archive_path, name, s, read_hint);
+                };
+            pipeline.setSource(std::move(creator), StoredObjects{StoredObject{}}, settings);
+            return;
+        }
+    }
+
     volume->getDisk()->prepareRead(path, settings, read_hint, pipeline);
 }
 
@@ -264,6 +297,14 @@ std::unique_ptr<ReadBufferFromFileBase> DataPartStorageOnDiskFull::readFileIfExi
     if (transaction)
         if (auto rb = transaction->tryReadFileInFlight(path, settings, read_hint))
             return rb;
+    if (looksLikePackedSkipIndexFile(name))
+    {
+        if (auto reader = getSkipIndicesPackedReader(); reader && reader->exists(name))
+            return reader->readFile(
+                volume->getDisk(),
+                fs::path(root_path) / part_dir / String(SKIP_INDICES_PACKED_FILENAME),
+                name, settings, read_hint);
+    }
     return volume->getDisk()->readFileIfExists(path, settings, read_hint);
 }
 

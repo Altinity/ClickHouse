@@ -6,6 +6,7 @@
 #include <Common/SymbolIndex.h>
 #include <Common/FramePointers.h>
 #include <Common/ErrnoException.h>
+#include <Common/setThreadName.h>
 #include <Daemon/BaseDaemon.h>
 #include <Daemon/CrashWriter.h>
 #include <base/sleep.h>
@@ -300,6 +301,8 @@ SignalListener::SignalListener(BaseDaemon * daemon_, LoggerPtr log_, TerminateRe
 
 void SignalListener::run()
 {
+    setThreadName(ThreadName::SIGNAL_LISTENER);
+
     if (daemon)
     {
         build_id = [this]{ return daemon->build_id; };
@@ -632,16 +635,16 @@ try
     }
 
     /// Advice the user to send it manually.
-    if (std::string_view(VERSION_OFFICIAL).contains("official build"))
+    if (std::string_view(VERSION_OFFICIAL).contains("altinity build"))
     {
         /// Approximate support period, upper bound.
         if (time(nullptr) - makeDate(DateLUT::instance(), static_cast<UInt8>(2000 + VERSION_MAJOR), static_cast<UInt8>(VERSION_MINOR), 1) < (365 + 30) * 86400)
         {
-            LOG_FATAL(log, "Report this error to https://github.com/ClickHouse/ClickHouse/issues");
+            LOG_FATAL(log, "Report this error to https://github.com/Altinity/ClickHouse/issues");
         }
         else
         {
-            LOG_FATAL(log, "ClickHouse version {} is old and should be upgraded to the latest version.", VERSION_STRING);
+            // LOG_FATAL(log, "ClickHouse version {} is old and should be upgraded to the latest version.", VERSION_STRING);
         }
     }
 

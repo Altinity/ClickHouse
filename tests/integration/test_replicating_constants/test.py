@@ -1,6 +1,6 @@
 import pytest
 
-from helpers.cluster import ClickHouseCluster
+from helpers.cluster import CLICKHOUSE_CI_MIN_TESTED_VERSION, ClickHouseCluster
 
 cluster = ClickHouseCluster(__file__)
 
@@ -8,8 +8,8 @@ node1 = cluster.add_instance("node1", with_zookeeper=True)
 node2 = cluster.add_instance(
     "node2",
     with_zookeeper=True,
-    image="clickhouse/clickhouse-server",
-    tag="23.3",
+    image="altinity/clickhouse-server",
+    tag="23.3.19.33.altinitystable",
     with_installed_binary=True,
 )
 
