@@ -922,6 +922,15 @@ void ContentAddressedTransaction::removeRecursive(const std::string & path, cons
                 metadata_storage.partAccess().dropRefIfPresent({r->ns, ref});
             return;
         }
+        /// The moving CONTAINER dir (MOVE-to-CA fix, mirrors detached): the mover's crash-cleanup
+        /// (MergeTreeData.cpp, MOVING_DIR_NAME) calls this at table load to reclaim every staging
+        /// ref an interrupted move left behind.
+        if (r && r->ref.empty() && p->part_name == ContentAddressed::kMovingDirName)
+        {
+            for (const auto & ref : metadata_storage.movingRefNames(r->ns))
+                metadata_storage.partAccess().dropRefIfPresent({r->ns, ref});
+            return;
+        }
         /// A single part dir (live or detached): drop its ref.
         if (r && !r->ref.empty() && r->file.empty())
         {

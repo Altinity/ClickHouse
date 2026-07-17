@@ -659,12 +659,18 @@ ContentAddressedMetadataStorage::route(const ContentAddressed::PartFilePath & p)
     }
     if (p.part_name == ContentAddressed::kMovingDirName)
     {
-        /// L1 (MOVE-to-CA fix): re-split exactly like detached, but fold onto the part's FINAL
-        /// live ref directly -- no "moving/" prefix. An empty p.file (the bare <table>/moving
-        /// container dir) yields an empty ref, same convention as the detached container.
+        /// L1 (MOVE-to-CA fix): re-split exactly like detached, folding onto a `moving/`-PREFIXED
+        /// ref (kMovingRefPrefix) -- NOT the part's final ref directly. Publishing the clone under
+        /// the final ref before the mover's swap would break move crash-atomicity: a crash between
+        /// the clone commit and swapClonedPart would leave a committed LIVE ref that never went
+        /// through the swap, and moving/'s own startup cleanup couldn't distinguish that premature
+        /// ref from a real live part. The staging ref keeps the pre-swap clone un-live; the mover's
+        /// rename does a real ref repoint moving/<part> -> <part> (the same committed-ref-repoint
+        /// path merge-result/delete_tmp renames already use). An empty p.file (the bare
+        /// <table>/moving container dir) yields an empty ref, same convention as detached.
         r.ns = liveNamespace(p.table_uuid);
         auto [part, file] = splitFirstComponent(p.file);
-        r.ref = part;
+        r.ref = part.empty() ? "" : std::string(ContentAddressed::kMovingRefPrefix) + part;
         r.file = file;
         return r;
     }
@@ -679,6 +685,15 @@ std::vector<std::string> ContentAddressedMetadataStorage::detachedRefNames(const
     std::vector<std::string> refs;
     for (const auto & [ref, _] : store()->listRefs(ns))
         if (ref.starts_with(ContentAddressed::kDetachedRefPrefix))
+            refs.push_back(ref);
+    return refs;
+}
+
+std::vector<std::string> ContentAddressedMetadataStorage::movingRefNames(const Cas::RootNamespace & ns) const
+{
+    std::vector<std::string> refs;
+    for (const auto & [ref, _] : store()->listRefs(ns))
+        if (ref.starts_with(ContentAddressed::kMovingRefPrefix))
             refs.push_back(ref);
     return refs;
 }
@@ -766,6 +781,16 @@ ContentAddressedMetadataStorage::DirRoute ContentAddressedMetadataStorage::class
             dr.r = std::move(r);
             return dr;
         }
+        /// The moving CONTAINER dir <table>/moving (MOVE-to-CA fix): the mover's crash-cleanup
+        /// (MergeTreeData.cpp, MOVING_DIR_NAME) existsDirectory/removeRecursive's this bare path
+        /// at every table load to reclaim a staging ref left behind by an interrupted move.
+        if (r && r->ref.empty() && p->part_name == ContentAddressed::kMovingDirName)
+        {
+            dr.shape = DirShape::MovingContainer;
+            dr.p = std::move(p);
+            dr.r = std::move(r);
+            return dr;
+        }
         /// A part dir (live, detached, or shadow).
         if (r && !r->ref.empty() && r->file.empty())
         {
@@ -837,6 +862,9 @@ bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) 
         case DirShape::DetachedContainer:
             /// Exists iff it has at least one ref (B181).
             return !detachedRefNames(dr.r->ns).empty();
+        case DirShape::MovingContainer:
+            /// Exists iff it has at least one staging ref (MOVE-to-CA fix, mirrors DetachedContainer).
+            return !movingRefNames(dr.r->ns).empty();
         case DirShape::PartDir:
             /// Exists iff its ref is present.
             return partAccess().existsRef(dr.r->refKey(), ContentAddressed::Freshness::CachedForLoad);
@@ -1001,6 +1029,14 @@ std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const st
             std::vector<std::string> result;
             for (const auto & ref : detachedRefNames(dr.r->ns))
                 result.push_back(ref.substr(ContentAddressed::kDetachedRefPrefix.size()));
+            return result;
+        }
+        case DirShape::MovingContainer:
+        {
+            /// Staging part names (prefix stripped), mirrors DetachedContainer.
+            std::vector<std::string> result;
+            for (const auto & ref : movingRefNames(dr.r->ns))
+                result.push_back(ref.substr(ContentAddressed::kMovingRefPrefix.size()));
             return result;
         }
         case DirShape::PartDir:

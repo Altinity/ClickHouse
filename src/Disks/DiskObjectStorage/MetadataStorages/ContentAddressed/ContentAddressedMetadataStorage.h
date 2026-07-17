@@ -297,6 +297,11 @@ public:
     /// Full `detached/<part>` ref names in a namespace (B181: detached parts fold into the table ns).
     std::vector<std::string> detachedRefNames(const Cas::RootNamespace & ns) const;
 
+    /// Full `moving/<part>` STAGING ref names in a namespace (MOVE-to-CA fix, mirrors
+    /// detachedRefNames): the mover's crash-cleanup (MergeTreeData.cpp, MOVING_DIR_NAME) enumerates
+    /// and drops these at table load if a move was interrupted mid-flight.
+    std::vector<std::string> movingRefNames(const Cas::RootNamespace & ns) const;
+
     /// C4: the ONE fixed dispatch order `existsDirectory`/`listDirectory` route a path through
     /// (shadow -> atomic-shard -> table-uuid -> part -> subdir -> generic), previously implemented
     /// twice and kept in sync by hand. `classifyDirectory` (private, below) computes it once; both
@@ -311,6 +316,7 @@ public:
         AtomicShard,
         TableDir,
         DetachedContainer,
+        MovingContainer,
         PartDir,
         ProjectionDir,
         TableSubdir,

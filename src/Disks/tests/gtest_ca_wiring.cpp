@@ -570,13 +570,15 @@ TEST(CaWiringRoute, DetachedFoldsIntoTableNamespaceWithPrefixedRef)
     EXPECT_TRUE(rc->file.empty());
 }
 
-TEST(CaWiringRoute, MovingFoldsOntoTheFinalLiveRefWithoutPrefix)
+TEST(CaWiringRoute, MovingFoldsOntoAPrefixedStagingRef)
 {
     /// L1 (MOVE-to-CA fix): the mover clones a part under TABLE/moving/<part>/ before the
-    /// atomic rename into place. Unlike `detached`, a moved part must resolve DIRECTLY onto its
-    /// final live ref (no prefix) -- the destination CA transaction publishes under that final
-    /// identity, so the later moveDirectory(moving/<part> -> <part>) collapses to a same-key
-    /// no-op instead of colliding with every other part on the shared ref "moving".
+    /// atomic rename into place. Mirroring `detached`, a moved part resolves onto a
+    /// `moving/`-PREFIXED staging ref -- NOT the part's final live ref directly. Publishing under
+    /// the final ref before the mover's swap would break move crash-atomicity (a crash between the
+    /// clone commit and the swap would leave a committed live ref that never went through the
+    /// swap). The staging ref keeps the pre-swap clone un-live; the mover's rename does a real ref
+    /// repoint moving/<part> -> <part>.
     auto storage = openWiringStorage();
     auto p = parsePartFilePath("store/uui/uuid-1/moving/all_1_1_0/data.bin");
     ASSERT_TRUE(p.has_value());
@@ -586,7 +588,7 @@ TEST(CaWiringRoute, MovingFoldsOntoTheFinalLiveRefWithoutPrefix)
     auto r = storage->route(*p);
     ASSERT_TRUE(r.has_value());
     EXPECT_EQ(r->ns.string(), storage->liveNamespace("uuid-1").string());
-    EXPECT_EQ(r->ref, "all_1_1_0");
+    EXPECT_EQ(r->ref, "moving/all_1_1_0");
     EXPECT_EQ(r->file, "data.bin");
 
     /// The bare moving CONTAINER dir TABLE/moving routes to the table ns with an empty ref.
@@ -675,6 +677,7 @@ TEST(CaWiringRoute, DirShapeDispatchOrderIsStable)
     EXPECT_EQ(storage->classifyDirectoryForTest("uui/uuid-1").shape,            DS::TableDir);
     EXPECT_EQ(storage->classifyDirectoryForTest("uui/uuid-1/all_1_1_0").shape,  DS::PartDir);
     EXPECT_EQ(storage->classifyDirectoryForTest("uui/uuid-1/detached").shape,   DS::DetachedContainer);
+    EXPECT_EQ(storage->classifyDirectoryForTest("uui/uuid-1/moving").shape,    DS::MovingContainer);
     EXPECT_EQ(storage->classifyDirectoryForTest("shadow/bk1/store/uui/uuid-1").shape, DS::ShadowTable);
     EXPECT_EQ(storage->classifyDirectoryForTest("shadow/bk1").shape,            DS::ShadowIntermediate);
     EXPECT_EQ(storage->classifyDirectoryForTest("uui/uuid-1/deduplication_logs").shape, DS::TableSubdir);

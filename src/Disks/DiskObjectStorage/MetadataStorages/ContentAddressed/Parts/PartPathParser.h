@@ -29,10 +29,13 @@ inline constexpr std::string_view kDetachedDirName = "detached";
 /// part_name == kMovingDirName and the real part dir as the FIRST component of `file` -- the
 /// exact same shape `kDetachedDirName` already produces (the PoC contract, B36), for free, on
 /// the Atomic layout (no parser change needed there: "moving" already lands on `part_idx`
-/// because it is the component right after the table <uuid>, same as "detached"). Unlike
-/// detached, `route()` folds this DIRECTLY onto the part's FINAL live ref (no prefix): the
-/// destination CA transaction publishes under that final identity, so the later
-/// moveDirectory(moving/<part> -> <part>) collapses to a same-key no-op.
+/// because it is the component right after the table <uuid>, same as "detached"). Mirroring
+/// detached, `route()` folds this onto a `moving/`-PREFIXED ref (kMovingRefPrefix) -- NOT the
+/// part's final ref directly. Publishing the clone under the final ref would break move
+/// crash-atomicity: a crash between the clone commit and the mover's rename would leave a
+/// committed live ref before the swap ever happened, and `moving/`'s own startup cleanup
+/// couldn't tell that premature ref apart from a real live part. The staging ref keeps the
+/// pre-swap clone un-live; the mover's rename does a real ref repoint moving/<part> -> <part>.
 inline constexpr std::string_view kMovingDirName = "moving";
 
 /// B181: detached parts live INSIDE the table's OWN archive namespace as refs keyed by this
@@ -42,6 +45,13 @@ inline constexpr std::string_view kMovingDirName = "moving";
 /// table's refs filtered to this prefix (stripped for display). No parallel detached namespace
 /// exists anymore (the old `detachedNamespace` is gone).
 inline constexpr std::string_view kDetachedRefPrefix = "detached/";
+
+/// MOVE-to-CA fix: mirrors kDetachedRefPrefix exactly, but for the mover's `moving/` staging
+/// dir instead of `detached/`. Keeps a moved-but-not-yet-swapped part's ref distinct from its
+/// eventual live ref `<part>`, so the destination CA transaction (`clonePart`'s CA branch) can
+/// publish it WITHOUT prematurely making it live or colliding with an existing live part of the
+/// same name.
+inline constexpr std::string_view kMovingRefPrefix = "moving/";
 
 /// The content-addressing boundary marker: a SUFFIX on a table-dir segment (`…/<uuid>@cas@`), not a
 /// path segment. It marks where the mirrored ClickHouse path ends and the content-addressed archive
