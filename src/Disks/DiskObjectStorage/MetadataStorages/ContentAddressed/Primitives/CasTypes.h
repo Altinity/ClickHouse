@@ -171,18 +171,15 @@ public:
         chassert(len == 16 || len == 32, "DigestCodec: digest length must be 16 or 32 bytes");
     }
 
-    /// Returns the algorithm-specific digest width in bytes.
-    uint64_t digestLen() const { return len; }
-
-    /// Renders exactly `2 * digestLen()` lowercase hex chars.
+    /// Renders exactly `2 * len` lowercase hex chars.
     String toHex(const BlobDigest & d) const
     {
         checkZeroTail(d, "toHex");
         return hexString(d.bytes.data(), len);
     }
 
-    /// Requires exactly `2 * digestLen()` hex chars; throws `BAD_ARGUMENTS` otherwise (wrong
-    /// width or a non-hex character). Zero-fills the tail beyond `digestLen()`.
+    /// Requires exactly `2 * len` hex chars; throws `BAD_ARGUMENTS` otherwise (wrong
+    /// width or a non-hex character). Zero-fills the tail beyond `len`.
     BlobDigest fromHex(std::string_view hex) const
     {
         if (hex.size() != 2 * len)
@@ -202,15 +199,15 @@ public:
         return d;
     }
 
-    /// Serializes exactly `digestLen()` raw bytes, big-endian (i.e. `bytes[0:digestLen()]`).
+    /// Serializes exactly `len` raw bytes, big-endian (i.e. `bytes[0:len]`).
     String toBytesBE(const BlobDigest & d) const
     {
         checkZeroTail(d, "toBytesBE");
         return String(reinterpret_cast<const char *>(d.bytes.data()), len);
     }
 
-    /// Requires exactly `digestLen()` bytes; throws `BAD_ARGUMENTS` otherwise. Zero-fills the
-    /// tail beyond `digestLen()`.
+    /// Requires exactly `len` bytes; throws `BAD_ARGUMENTS` otherwise. Zero-fills the
+    /// tail beyond `len`.
     BlobDigest fromBytesBE(std::string_view b) const
     {
         if (b.size() != len)

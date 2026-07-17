@@ -1,19 +1,13 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <IO/ReadBuffer.h>
-#include <IO/ReadHelpers.h>
-#include <IO/WriteBuffer.h>
-#include <IO/WriteHelpers.h>
 #include <Common/Exception.h>
-#include <limits>
 #include <string_view>
 
 namespace DB
 {
 namespace ErrorCodes
 {
-    extern const int ATTEMPT_TO_READ_AFTER_EOF;
-    extern const int CANNOT_READ_ALL_DATA;
     extern const int CORRUPTED_DATA;
 }
 }
@@ -21,34 +15,14 @@ namespace ErrorCodes
 namespace DB::Cas
 {
 
-/// Shared low-level byte-encoding helpers for CAS. They cover fixed-width integers, length-prefixed
-/// byte strings, exact reads, and validation of identifiers embedded in persisted data. They remain
-/// independent of any particular object format so that a 128-bit serialization cannot accidentally
-/// be paired with the wrong byte order.
+/// Shared low-level byte-encoding helpers for CAS: the big-endian `UInt128` wire form, exact reads,
+/// and validation of identifiers embedded in persisted data. They remain independent of any
+/// particular object format.
 
-/// ---------------------------------------------------------------------------------------------
-/// On-disk UInt128 wire forms. CAS serializes a 128-bit hash in two distinct non-hex byte orders,
-/// and BOTH are FROZEN — changing the bytes breaks every object already written. These named, typed
-/// helpers exist so a 128-bit (de)serialization can never be mis-paired with the wrong order: a site
-/// asks for the order it means by name instead of open-coding it. (The lowercase-hex form lives in
-/// `CasIds.h` as `u128ToHex` / `hexToU128` and is out of scope here.)
+/// On-disk UInt128 wire form: the 16-byte big-endian representation used by raw CAS byte fields and
+/// key components. It is FROZEN — changing the bytes breaks every object already written. (The
+/// lowercase-hex form lives in `CasTypes.h` as `u128ToHex` / `hexToU128` and is out of scope here.)
 ///
-/// Writes `v` as the frozen 16-byte little-endian CAS representation.
-inline void writeU128LE(WriteBuffer & out, const UInt128 & v)
-{
-    writeBinaryLittleEndian(v, out);
-}
-
-/// Reads one frozen 16-byte little-endian CAS value from `in`.
-inline UInt128 readU128LE(ReadBuffer & in)
-{
-    UInt128 v;
-    readBinaryLittleEndian(v, in);
-    return v;
-}
-
-/// BE 16-byte form — used by raw CAS byte fields and key components to encode `UInt128` in
-/// big-endian order.
 /// Converts `v` to the frozen 16-byte big-endian representation used in raw byte fields and keys.
 inline std::string u128ToBytesBE(const UInt128 & v)
 {
@@ -86,50 +60,6 @@ inline String readFixedBytes(ReadBuffer & in, size_t n)
     String s(n, '\0');
     in.readStrict(s.data(), n);
     return s;
-}
-
-/// Length-prefixed byte string: `u32 length (LE) | bytes`. Codecs that use this helper must keep
-/// the prefix and payload adjacent in the encoded body.
-/// The explicit guard (rather than relying on an op/byte budget elsewhere to keep every string short)
-/// is the point where a length silently truncated by the `u32` cast would otherwise corrupt the wire.
-/// Throws `CORRUPTED_DATA` if the string cannot be represented by the `UInt32` prefix.
-inline void writeLenPrefixed(WriteBuffer & out, const String & s)
-{
-    if (s.size() > std::numeric_limits<uint32_t>::max())
-        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS codec: string field of {} bytes exceeds UInt32 length prefix", s.size());
-    writeBinaryLittleEndian(static_cast<uint32_t>(s.size()), out);
-    out.write(s.data(), s.size());
-}
-
-/// Reads the `UInt32` little-endian length and then exactly that many bytes. Truncated input is
-/// reported by `readFixedBytes` as `CORRUPTED_DATA` before it can cause an oversized allocation.
-inline String readLenPrefixed(ReadBuffer & in)
-{
-    uint32_t len = 0;
-    readBinaryLittleEndian(len, in);
-    return readFixedBytes(in, len);
-}
-
-/// Decode-boundary guard. The codecs parse fully materialized objects, so running out of bytes is
-/// data corruption, not an IO condition: translate the standard reading errors into CORRUPTED_DATA —
-/// the code the protocol layers and tests pin for truncated persisted objects.
-/// Executes `f` and preserves every exception except the two standard EOF-related read exceptions,
-/// which are rethrown as `CORRUPTED_DATA` with `what` identifying the object being decoded.
-template <typename F>
-auto decodeGuarded(std::string_view what, F && f)
-{
-    try
-    {
-        return f();
-    }
-    catch (const Exception & e)
-    {
-        /// This translation is only safe because the guarded lambdas read exclusively from in-memory
-        /// buffers — no real IO inside, so these codes cannot mean a transient read failure.
-        if (e.code() == ErrorCodes::CANNOT_READ_ALL_DATA || e.code() == ErrorCodes::ATTEMPT_TO_READ_AFTER_EOF)
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: truncated encoded data ({})", what, e.message());
-        throw;
-    }
 }
 
 /// Canonical clean relative path for ref/file names: non-empty, no NUL byte, no backslash, and no

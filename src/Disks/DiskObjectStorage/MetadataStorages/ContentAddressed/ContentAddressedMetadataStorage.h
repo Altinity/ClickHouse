@@ -201,7 +201,6 @@ public:
     /// Committed part-folder reads and mutations go through this facade so cache validation remains
     /// centralized.
     ContentAddressed::CachedPartFolderAccess & partAccess() const;
-    const std::string & serverId() const { return server_id; }
     const std::string & serverRootId() const { return server_root_id; }
     const std::string & scratchPath() const { return local_scratch_path; }
     /// Returns the configured staging backend. `Local` is the behavior-preserving default; callers

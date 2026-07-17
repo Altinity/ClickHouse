@@ -38,10 +38,6 @@ struct RetiredEntry
                                   /// it condemned and recreate).
 };
 
-/// The single source-edge key schema. Keys describe their digest width with the leading algorithm byte,
-/// so one run may contain rows from multiple hash algorithms without a pool-wide width setting.
-constexpr uint8_t kSourceEdgeKeySchema = 3;
-
 /// Backend-independent codec for source-edge keys. A key is `algo` (u8), the digest at that algorithm's
 /// native width, and `source_id` (16 bytes, big-endian). The packed byte order is exactly
 /// `(BlobRef, source_id)` order, which lets the fold merge compare keys directly. The leading algorithm

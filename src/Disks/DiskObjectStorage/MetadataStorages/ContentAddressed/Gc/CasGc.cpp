@@ -1703,16 +1703,6 @@ std::optional<CasFoldSeal> Gc::readFoldSeal(uint64_t generation, uint64_t attemp
     return std::nullopt;
 }
 
-std::map<String, ShardCoverage> Gc::readSealedCursors(uint64_t generation, uint64_t attempt)
-{
-    /// One-pass round: the fold seal at the adopted (generation, attempt) IS the coverage record
-    /// (completion seals are a retired concept — pre-cutover pools are unsupported, pre-release).
-    /// Absent => empty (fresh pool, cursor 0).
-    if (const auto fold = readFoldSeal(generation, attempt))
-        return fold->per_ns_shard;
-    return {};
-}
-
 std::vector<std::pair<RootNamespace, uint64_t>> Gc::discoverUniverse()
 {
     /// LIST-based table discovery: the discovery authority rests on LIST(cas/refs/).

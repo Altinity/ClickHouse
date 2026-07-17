@@ -907,7 +907,6 @@ void SingleWriterSlot::recordWrite(uint64_t new_seq, const Token & token)
 {
     seq = new_seq;
     last_token = token;
-    last_renew_time = std::chrono::steady_clock::now();
 }
 
 void SingleWriterSlot::doStart()
@@ -1012,16 +1011,10 @@ void SingleWriterSlot::stopBackground()
     to_join.join();
 }
 
-std::chrono::steady_clock::time_point SingleWriterSlot::lastRenewTime() const
-{
-    std::lock_guard lock(state_mutex);
-    return last_renew_time;
-}
-
 void SingleWriterSlot::backgroundLoop(std::chrono::milliseconds period)
 {
     /// A CONFIRMED mismatch, or a TRANSIENT failure once `shouldFenceOnTransientRenewFailure` says the
-    /// lease deadline has neared, stops the loop for good: lastRenewTime (and the slot's seq) stop
+    /// lease deadline has neared, stops the loop for good: the slot's seq stops
     /// advancing and GC observes the frozen seq. No retry, no re-mint. A TRANSIENT failure while the
     /// deadline is still safely away keeps the loop alive -- the mount-lease protocol guarantees no
     /// other writer can claim the slot before that deadline, so retrying is safe.

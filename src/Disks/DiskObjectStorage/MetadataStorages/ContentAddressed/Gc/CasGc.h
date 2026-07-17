@@ -349,12 +349,6 @@ private:
     /// Read the fold seal for (generation, attempt) (nullopt when absent). Used by resume + parent-cursor reads.
     std::optional<CasFoldSeal> readFoldSeal(uint64_t generation, uint64_t attempt);
 
-    /// The per-(ns,shard) fold cursor coverage as of `generation`, read from the fold seal at
-    /// (generation, attempt) (the one-pass round's coverage record; empty when absent). This is what the
-    /// next fold keys its parent cursor off, so a folded event is never re-folded from 0 (no in-degree
-    /// double-count).
-    std::map<String, ShardCoverage> readSealedCursors(uint64_t generation, uint64_t attempt);
-
     /// Update the remembered observation (steal protocol step 3/4).
     void rememberObservation(const GcLease & lease);
 
@@ -412,13 +406,6 @@ private:
     std::atomic<uint64_t> meta_anomaly_count{0};
 
 public:
-    /// TEST SEAM: thin public wrapper so unit tests can call foldManifestEdges without driving a full round.
-    bool foldManifestEdgesForTest(const ManifestId & id, bool activation, std::vector<BlobDelta> & deltas,
-                                   std::map<ManifestId, Token> & cleanup)
-    {
-        return foldManifestEdges(id, activation ? +1 : -1, deltas, cleanup);
-    }
-
     /// TEST SEAM: expose LIST-based namespace/shard discovery so unit tests can assert the
     /// discovered universe equals the set of present ref shards without driving a full round.
     std::vector<std::pair<RootNamespace, uint64_t>> discoverUniverseForTest()

@@ -60,7 +60,6 @@ public:
     /// must be non-null and its entries must be strictly ascending by canonical path; this is the
     /// ordering required by the binary-search and range-scan helpers.
     PartFolderView(PartRefKey key_, Cas::ManifestId manifest_id_, uint64_t manifest_size_,
-                   uint64_t published_at_ms_,
                    std::shared_ptr<const Cas::PartManifest> manifest_, uint64_t validated_at_ms_);
 
     /// Joins a fresh `Resolved` with its validated shared decode. `validated_at_ms` is supplied by
@@ -78,8 +77,6 @@ public:
 
     const PartRefKey & refKey() const { return key; }
     const Cas::ManifestId & manifestId() const { return manifest_id; }
-    uint64_t manifestSize() const { return manifest_size; }
-    uint64_t publishedAtMs() const { return published_at_ms; }
     const std::shared_ptr<const Cas::PartManifest> & manifest() const { return manifest_body; }
     /// The wall-clock ms at which this view's manifest body was last proven live by a HEAD. A
     /// refresh that changes only ref metadata carries the original stamp forward because it did not
@@ -105,7 +102,6 @@ private:
     PartRefKey key;
     Cas::ManifestId manifest_id;
     uint64_t manifest_size = 0;
-    uint64_t published_at_ms = 0;
     std::shared_ptr<const Cas::PartManifest> manifest_body;
     uint64_t validated_at_ms = 0;
 };
@@ -227,7 +223,7 @@ public:
 
     /// ==== diagnostics ====
     enum class LastDecision : uint8_t
-    { Hit, Mismatch, Miss, OversizedBypass, StrictBypass, ForceFreshRead, Invalidated };
+    { Hit, Miss, OversizedBypass, StrictBypass, ForceFreshRead, Invalidated };
     struct ExplainResult
     {
         bool retained = false;             /// whether the last-served view is currently retained
@@ -237,8 +233,6 @@ public:
     };
     /// Returns the test/log-only decision record for `key`; an absent key yields the default result.
     ExplainResult explain(const PartRefKey & key) const;
-    /// Clears retained views and the diagnostic journal; test-only.
-    void clearForTest();
     /// Test-only: number of entries in the decision journal (0 whenever explain is disabled).
     size_t explainJournalSizeForTest() const;
 

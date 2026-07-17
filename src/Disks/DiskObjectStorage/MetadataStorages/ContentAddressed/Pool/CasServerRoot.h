@@ -38,7 +38,7 @@ namespace DB::Cas
 /// renewal means a foreign touch — fail closed with an exception, never re-mint.
 ///
 /// This base owns the common machinery (the `seq`/`last_token`/`dead` state, the renewal thread and
-/// its loop, `renewOnce`/`startBackground`/`stopBackground`/`lastRenewTime`, and the start/terminal
+/// its loop, `renewOnce`/`startBackground`/`stopBackground`, and the start/terminal
 /// bookkeeping). The noun ("watermark") and verb ("farewell") used in every fail-closed message are
 /// passed to the base constructor. Subclasses differ ONLY in EXPLICIT policy hooks:
 ///   - `prepareRenew`     — runs OFF the state lock before each body encode, returning a per-call
@@ -80,10 +80,6 @@ public:
     /// Requests renewal-thread termination and joins it. Safe to call repeatedly, including after a
     /// renewal failure or from destruction; it does not perform the slot's terminal operation.
     void stopBackground();
-
-    /// Local-clock bound for diagnostics: when the background loop stops (renewal failure), this
-    /// stops advancing.
-    std::chrono::steady_clock::time_point lastRenewTime() const;
 
 protected:
     /// Per-call payload prepared OFF the state lock and handed to `encodeBody`. Subclasses needing
@@ -132,7 +128,7 @@ protected:
 
     /// Runs the slot's terminal op against the held `last_token`. Called under `state_mutex` with
     /// `dead` already set (so renewal can never race it). Owns its own fail-closed throws and final
-    /// bookkeeping (the watermark bumps seq/last_token/last_renew_time on its retiring putOverwrite).
+    /// bookkeeping (the watermark bumps seq/last_token on its retiring putOverwrite).
     /// May throw — `dead` stays set regardless.
     virtual void terminate() = 0;
 
@@ -162,8 +158,6 @@ private:
 
     std::string_view slot_name;
     std::string_view terminal_verb;
-
-    std::chrono::steady_clock::time_point last_renew_time;
 
     /// Set immediately before `renewOnce` invokes `onRenewMismatch` (which always
     /// throws) so `backgroundLoop`'s catch block can tell a CONFIRMED mismatch (the PUT completed and

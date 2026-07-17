@@ -135,11 +135,12 @@ private:
 ///     the lease is work-dedup only (see `CasGcScheduler`), not a coordination primitive.
 ///
 /// `CoordinatorPlan` is a tiny policy object that encodes these invariants for callers and tests; it
-/// holds no durable state and performs no I/O. The booleans are constant for any `gc_shards >= 1`.
+/// holds no state and performs no I/O. The booleans are constant for any `gc_shards >= 1`, so the
+/// shard count passed at construction is documentation only.
 class CoordinatorPlan
 {
 public:
-    explicit CoordinatorPlan(uint64_t gc_shards_) : gc_shards(gc_shards_) {}
+    explicit CoordinatorPlan(uint64_t /*gc_shards_*/) {}
 
     /// One global fence covers the whole fence universe — never one fence per shard.
     bool hasSingleGlobalFence() const { return true; }
@@ -155,11 +156,6 @@ public:
 
     /// The global fence is a coordinator-only step.
     bool requiresCoordinatorForFence() const { return true; }
-
-    uint64_t shardCount() const { return gc_shards; }
-
-private:
-    uint64_t gc_shards;
 };
 
 /// Format a GC cursor key from a root namespace and shard index.

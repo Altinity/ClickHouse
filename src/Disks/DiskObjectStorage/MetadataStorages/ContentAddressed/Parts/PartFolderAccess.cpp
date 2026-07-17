@@ -7,12 +7,10 @@ namespace DB::ContentAddressed
 {
 
 PartFolderView::PartFolderView(PartRefKey key_, Cas::ManifestId manifest_id_, uint64_t manifest_size_,
-                               uint64_t published_at_ms_,
                                std::shared_ptr<const Cas::PartManifest> manifest_, uint64_t validated_at_ms_)
     : key(std::move(key_))
     , manifest_id(std::move(manifest_id_))
     , manifest_size(manifest_size_)
-    , published_at_ms(published_at_ms_)
     , manifest_body(std::move(manifest_))
     , validated_at_ms(validated_at_ms_)
 {
@@ -33,7 +31,7 @@ std::shared_ptr<const PartFolderView> PartFolderView::make(
 {
     return std::make_shared<const PartFolderView>(
         std::move(key), resolved.manifest_id, resolved.manifest_size,
-        resolved.published_at_ms, std::move(manifest), validated_at_ms);
+        std::move(manifest), validated_at_ms);
 }
 
 std::optional<std::string> PartFolderView::projectionDirPrefix(const std::string & file)
@@ -514,14 +512,6 @@ CachedPartFolderAccess::ExplainResult CachedPartFolderAccess::explain(const Part
     /// namespace-wide) and costs one more `CacheBase` lookup on this test/log-only path.
     result.retained = view_cache && view_cache->get(key.cacheKey()) != nullptr;
     return result;
-}
-
-void CachedPartFolderAccess::clearForTest()
-{
-    std::lock_guard lock(explain_mutex);
-    explain_map.clear();
-    if (view_cache)
-        view_cache->clear();
 }
 
 }

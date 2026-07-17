@@ -37,8 +37,8 @@ trailer, followed by a banner-framed raw payload zone for inline file bytes.
 Authoritative per-format traits (type string, family, strictness, compression policy, caps) live
 in `CasFormat.cpp` (`TRAITS`), asserted complete by `gtest_cas_text_format.cpp`. Key naming: keys
 2–5 chars; fixed-width `UInt128` identities = 32-char lowercase hex strings; blob digests =
-algo-length hex (`2 * digestLen()`), rendered with their algo name (`sha256:ab12…`) wherever a
-bare hex would be ambiguous; unbounded u64 = decimal strings; bounded counts/lengths/ms-timestamps
+algo-width hex (two chars per digest byte), rendered with their algo name (`sha256:ab12…`) wherever
+a bare hex would be ambiguous; unbounded u64 = decimal strings; bounded counts/lengths/ms-timestamps
 = numbers; units documented here per object as codecs land.
 
 ## Evolution rules (one screen)
