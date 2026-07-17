@@ -38,9 +38,22 @@ Spec §Testing item 4 required a write-after-close audit: mutating part-storage 
 **Files:**
 - Create: `tests/queries/0_stateless/<NNNNN>_insert_dedup_disk_commit_failpoint.sql` (number assigned by `add-test`)
 - Create: `tests/queries/0_stateless/<NNNNN>_insert_dedup_disk_commit_failpoint.reference`
+- Modify: `src/Common/FailPoint.cpp` (register the new failpoint)
+- Modify: `src/Storages/MergeTree/DataPartStorageOnDiskFull.cpp` (`commitTransaction`)
 
 **Interfaces:**
-- Produces: the stateless test name `<NNNNN>_insert_dedup_disk_commit_failpoint`, used by Task 2 Step 5 as the fix's pass gate.
+- Produces: the stateless test name `<NNNNN>_insert_dedup_disk_commit_failpoint` (used by Task 2 Step 5 as the fix's pass gate) and the failpoint name `part_storage_fail_commit_transaction`.
+
+**Why a NEW failpoint (implementation finding):** the generic
+`disk_object_storage_fail_commit_metadata_transaction` fires on EVERY `DiskObjectStorageTransaction`
+commit — including the autocommit one-shot transactions that wrap ordinary disk ops (the very
+first is the temp-part `createDirectories` in `MergeTreeDataWriter::writeTempPartImpl`), so an
+enabled-failpoint INSERT dies before any part exists and never reaches the `Keeper` multi — the
+phantom-dedup condition is not exercised (verified empirically: the test PASSED on the pre-fix
+binary). The new failpoint lives in `DataPartStorageOnDiskFull::commitTransaction` — the close of
+the PART's deferred disk transaction — which by construction is exactly the operation the fix
+moves: pre-fix it is reached from `MergeTreeData::Transaction::commit` (post-`Keeper`), post-fix
+from `renameParts` (pre-`Keeper`). Same test, same failpoint; only the outcome flips with the fix.
 
 - [ ] **Step 1: Allocate the test**
 
@@ -49,7 +62,56 @@ cd /home/mfilimonov/workspace/ClickHouse/master
 ./tests/queries/0_stateless/add-test insert_dedup_disk_commit_failpoint
 ```
 
-Note the assigned `<NNNNN>` printed by the tool.
+Note the assigned `<NNNNN>` printed by the tool. (Already done on the first attempt: `05014`.)
+
+- [ ] **Step 1b: Add the failpoint**
+
+In `src/Common/FailPoint.cpp`, add to the REGULAR failpoints list (next to
+`disk_object_storage_fail_commit_metadata_transaction`):
+
+```cpp
+    REGULAR(part_storage_fail_commit_transaction) \
+```
+
+(match the exact macro style of the surrounding lines). In
+`src/Storages/MergeTree/DataPartStorageOnDiskFull.cpp`, mirror the include/extern pattern used by
+`DiskObjectStorageTransaction.cpp` for its failpoint (`#include <Common/FailPoint.h>`, a
+`namespace FailPoints { extern const char part_storage_fail_commit_transaction[]; }` block, and
+`ErrorCodes::FAULT_INJECTED`), then inject it in `commitTransaction` right before the commit:
+
+```cpp
+void DataPartStorageOnDiskFull::commitTransaction()
+{
+    /// The mirror of beginTransaction: a borrowed projection sub-part rides the parent's transaction and
+    /// is published by the parent's single commit. Committing here would be committing someone else's
+    /// transaction, so it is a no-op.
+    if (has_shared_transaction)
+        return;
+
+    if (!transaction)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "There is no uncommitted transaction");
+
+    /// Regression gate for the part-durability-before-Keeper-commit invariant: lets a test fail the
+    /// close of the PART's deferred disk transaction specifically (autocommit one-shot disk ops are
+    /// not affected, unlike disk_object_storage_fail_commit_metadata_transaction).
+    fiu_do_on(FailPoints::part_storage_fail_commit_transaction,
+    {
+        throw Exception(ErrorCodes::FAULT_INJECTED, "part_storage_fail_commit_transaction");
+    });
+
+    transaction->commit();
+    transaction.reset();
+}
+```
+
+- [ ] **Step 1c: Incremental build of the pre-fix binary with the failpoint**
+
+```bash
+cd /home/mfilimonov/workspace/ClickHouse/master/build
+ninja clickhouse > build_t1_failpoint.log 2>&1
+```
+
+Analyze the log tail; expected: success (recompiles `FailPoint.cpp`, `DataPartStorageOnDiskFull.cpp`, links).
 
 - [ ] **Step 2: Write the test SQL**
 
@@ -58,7 +120,7 @@ Content of `tests/queries/0_stateless/<NNNNN>_insert_dedup_disk_commit_failpoint
 ```sql
 -- Tags: zookeeper, no-fasttest, no-parallel
 -- no-fasttest: needs an object-storage disk (storage_policy 's3_cache').
--- no-parallel: enables a server-global failpoint on the object-storage disk commit.
+-- no-parallel: enables a server-global failpoint on the part disk-transaction commit.
 
 DROP TABLE IF EXISTS t_dedup_disk_commit SYNC;
 
@@ -67,14 +129,15 @@ ENGINE = ReplicatedMergeTree('/clickhouse/tables/{database}/t_dedup_disk_commit'
 ORDER BY k
 SETTINGS storage_policy = 's3_cache';
 
-SYSTEM ENABLE FAILPOINT disk_object_storage_fail_commit_metadata_transaction;
+SYSTEM ENABLE FAILPOINT part_storage_fail_commit_transaction;
 
--- The disk-storage commit of the inserted part fails. The part must NOT be registered in Keeper:
--- before the fix the disk commit ran only in MergeTreeData::Transaction::commit, AFTER the Keeper
--- multi had durably created the block_id dedup znode, so this failure left a phantom dedup token.
+-- The close of the inserted part's disk-storage transaction fails. The part must NOT be
+-- registered in Keeper: before the fix that close ran only in MergeTreeData::Transaction::commit,
+-- AFTER the Keeper multi had durably created the block_id dedup znode, so this failure left a
+-- phantom dedup token.
 INSERT INTO t_dedup_disk_commit SETTINGS insert_deduplicate = 1, insert_keeper_fault_injection_probability = 0 VALUES (1, 'x'); -- { serverError FAULT_INJECTED }
 
-SYSTEM DISABLE FAILPOINT disk_object_storage_fail_commit_metadata_transaction;
+SYSTEM DISABLE FAILPOINT part_storage_fail_commit_transaction;
 
 -- Byte-identical retry of the failed INSERT: it must really insert. Before the fix it silently
 -- deduplicated against the phantom block_id ("already exists ... ignoring it") and was acked with
@@ -107,8 +170,8 @@ Analyze `build/test_dedup_failpoint_prefix.log` with a subagent. Expected: the t
 - [ ] **Step 4: Commit the test (expected-fail state is fine — it documents the bug)**
 
 ```bash
-git add tests/queries/0_stateless/<NNNNN>_insert_dedup_disk_commit_failpoint.sql tests/queries/0_stateless/<NNNNN>_insert_dedup_disk_commit_failpoint.reference
-git commit -m "cas: failing regression test — INSERT dedup vs disk-commit failure (acked-then-lost, spec 2026-07-17-part-durability-before-keeper-commit)"
+git add tests/queries/0_stateless/<NNNNN>_insert_dedup_disk_commit_failpoint.sql tests/queries/0_stateless/<NNNNN>_insert_dedup_disk_commit_failpoint.reference src/Common/FailPoint.cpp src/Storages/MergeTree/DataPartStorageOnDiskFull.cpp
+git commit -m "cas: failing regression test + part_storage_fail_commit_transaction failpoint — INSERT dedup vs part disk-commit failure (acked-then-lost, spec 2026-07-17-part-durability-before-keeper-commit)"
 ```
 
 ---

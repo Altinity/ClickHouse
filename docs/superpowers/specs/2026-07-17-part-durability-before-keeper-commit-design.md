@@ -197,12 +197,17 @@ data loss.
 ## Testing {#testing}
 
 1. **Generic failpoint regression test** (works on plain S3 — the upstream shape — no CA needed):
-   replicated table on an object-storage policy, `SYSTEM ENABLE FAILPOINT
-   disk_object_storage_fail_commit_metadata_transaction`, sync `INSERT` with
-   `insert_deduplicate=1` (fails), disable the failpoint, re-issue the byte-identical `INSERT`,
-   `SELECT count()`. Before the fix: the failpoint fires after the multi → the retry falsely
-   dedups → 0 rows. After: the failpoint fires in `renameParts`, before the multi → the retry
-   inserts → 1 row.
+   replicated table on an object-storage policy, a failpoint failing the part disk-transaction
+   close, sync `INSERT` with `insert_deduplicate=1` (fails), disable the failpoint, re-issue the
+   byte-identical `INSERT`, `SELECT count()`. Before the fix: the close fires after the multi →
+   the retry falsely dedups → 0 rows. After: it fires in `renameParts`, before the multi → the
+   retry inserts → 1 row. Implementation note (found empirically): the pre-existing
+   `disk_object_storage_fail_commit_metadata_transaction` cannot be used — it also fires on the
+   autocommit one-shot transactions wrapping ordinary disk ops (first hit: temp-part
+   `createDirectories`), killing the insert before any `Keeper` state exists. The test adds a
+   targeted `part_storage_fail_commit_transaction` failpoint inside
+   `DataPartStorageOnDiskFull::commitTransaction` — by construction the exact operation the fix
+   repositions.
 2. **CA integration scenario S40** built from the dl_probe reproducer (tracked at
    `utils/ca-soak/tools/dl_probe.py` by the plan; `build/` is git-ignored): rustfs pause past the
    write budget + replica kill under continuous sync inserts. Gating verdicts: fault schedule
