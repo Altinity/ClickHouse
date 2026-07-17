@@ -123,7 +123,7 @@ namespace
         return out;
     }
 
-    std::optional<std::map<String, std::vector<String>>> readDestinationFilePathsPerPart(
+    std::map<String, std::vector<String>> readDestinationFilePathsPerPart(
         const zkutil::ZooKeeperPtr & zk,
         const std::filesystem::path & entry_path,
         const std::string & log_key,
