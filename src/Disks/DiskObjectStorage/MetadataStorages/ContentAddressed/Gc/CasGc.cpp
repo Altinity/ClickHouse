@@ -2322,9 +2322,18 @@ bool Gc::acquireOrRenewLease(GcState & state, Token & state_token, bool allow_st
         GcHeartbeat hb;
         if (const auto hb_got = store->backend().get(store->layout().gcHbKey()))
             hb = decodeGcHeartbeat(hb_got->bytes);
+        /// Observation-based heartbeat liveness, symmetric with the frozen-lease-tuple check below:
+        /// ANY movement of the observed (owner, hb_seq) pair between this contender's two ticks is
+        /// proof of life, and `hb_seq` values are comparable only under the SAME remembered hb owner.
+        /// Deliberately NOT compared against `current.lease.owner`: a deposed leader's heartbeat
+        /// thread keeps pulsing (with `owner = itself`) until its next round resets `i_am_leader`,
+        /// and its writes can race out the live new leader's pulses — an hb pair that keeps moving
+        /// under the OLD owner's name must still read as "alive", or a live, pulsing new leader gets
+        /// its lease stolen. An hb owner change re-arms the window (this tick's pair is remembered
+        /// below); a steal happens only once the lease tuple AND the hb pair are both frozen across
+        /// a full window.
         const bool hb_alive = has_observation
-            && hb.owner == current.lease.owner
-            && hb.hb_seq > last_seen_hb_seq;
+            && (hb.owner != last_seen_hb_owner || hb.hb_seq > last_seen_hb_seq);
 
         const bool incumbent_renewed = !has_observation
             || current.lease.owner != last_seen_owner

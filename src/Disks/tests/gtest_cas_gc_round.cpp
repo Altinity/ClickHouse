@@ -46,6 +46,7 @@ namespace
 const UInt128 kGc = hexToU128("00000000000000000000000000000001");
 const UInt128 kGcA = hexToU128("0000000000000000000000000000000a");
 const UInt128 kGcB = hexToU128("0000000000000000000000000000000b");
+const UInt128 kGcC = hexToU128("0000000000000000000000000000000c");
 
 ManifestRef ref(uint64_t seq, uint64_t inst)
 {
@@ -327,6 +328,46 @@ TEST(CasGcLease, AcquireTimePulseProtectsNewLeadersFirstRound)
     EXPECT_FALSE(gc2.runRegularRound().acquired_lease);   /// obs #2: hb advanced since obs #1 => alive => NO steal
 
     EXPECT_EQ(readState(*b, *s).lease.owner, kGcA);       /// gc1 keeps the lease through its whole first round
+}
+
+TEST(CasGcLease, StaleOwnerHeartbeatDoesNotEnableFalseSteal)
+{
+    /// A deposed leader's heartbeat thread keeps pulsing until its next round notices the lost lease
+    /// (`i_am_leader` is only reset there), and `pulseHeartbeat` stamps `owner = self` while a losing
+    /// CAS write silently vanishes — so a zombie old leader can keep `gc/hb.owner` pointing at ITSELF
+    /// even while the live new leader is pulsing too. The liveness gate must therefore treat ANY
+    /// movement of the observed (owner, hb_seq) pair between a follower's two ticks as "someone is
+    /// alive": comparing hb_seq is only meaningful against the SAME remembered hb owner. The old
+    /// predicate compared `hb.owner` with the LEASE owner instead, so a zombie-owned hb read as
+    /// "not the leader's heartbeat" on both ticks and a live, pulsing new leader got its lease stolen.
+    std::shared_ptr<InMemoryBackend> b;
+    auto s = openTestPool(b);
+    Gc gc1(s, kGcA);
+    Gc gc2(s, kGcB);
+    Gc gc3(s, kGcC);
+
+    /// gc1 leads, beats, then dies mid-round; gc2 legitimately steals the lease.
+    ASSERT_TRUE(gc1.runRegularRound().acquired_lease);
+    Gc::pulseHeartbeat(*s, kGcA);
+    EXPECT_FALSE(gc2.runRegularRound().acquired_lease);   /// obs #1 of gc1's frozen tuple
+    EXPECT_TRUE(gc2.runRegularRound().acquired_lease);    /// obs #2: frozen lease + frozen hb => steal
+    ASSERT_EQ(readState(*b, *s).lease.owner, kGcB);
+
+    /// gc2 is now mid-long-round (lease tuple frozen) and PULSING — but gc1's zombie heartbeat
+    /// thread interleaves after every gc2 pulse, so the follower gc3 only ever OBSERVES gc1-owned
+    /// heartbeats. The pair keeps moving, which is proof of life.
+    Gc::pulseHeartbeat(*s, kGcB);
+    Gc::pulseHeartbeat(*s, kGcA);                          /// zombie masks gc2's pulse
+    EXPECT_FALSE(gc3.runRegularRound().acquired_lease);   /// obs #1: records (hb owner=A, seq)
+    Gc::pulseHeartbeat(*s, kGcB);
+    Gc::pulseHeartbeat(*s, kGcA);                          /// zombie masks again
+    EXPECT_FALSE(gc3.runRegularRound().acquired_lease);   /// obs #2: hb pair MOVED => alive => NO steal
+    EXPECT_EQ(readState(*b, *s).lease.owner, kGcB);       /// the live leader keeps its lease
+
+    /// Liveness is preserved: once everything genuinely freezes (gc2 dead, zombie gone), the next
+    /// tick completes the window — obs #2 above already re-armed on the now-frozen (lease, hb) pair.
+    EXPECT_TRUE(gc3.runRegularRound().acquired_lease);    /// still frozen a full tick later => steal
+    EXPECT_EQ(readState(*b, *s).lease.owner, kGcC);
 }
 
 TEST(CasGcLease, FailoverStealOnceHeartbeatStops)

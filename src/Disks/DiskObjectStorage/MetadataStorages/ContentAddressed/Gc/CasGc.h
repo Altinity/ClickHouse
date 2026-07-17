@@ -374,7 +374,9 @@ private:
     bool has_observation = false;
     UInt128 last_seen_owner{};
     uint64_t last_seen_seq = 0;
-    /// Heartbeat observed alongside the lease (gates the steal).
+    /// Heartbeat pair observed alongside the lease (gates the steal): a steal requires the lease
+    /// tuple AND this (owner, hb_seq) pair to be frozen across a full window. `hb_seq` is compared
+    /// only when the remembered hb owner matches; an owner change counts as movement (alive).
     UInt128 last_seen_hb_owner{};
     uint64_t last_seen_hb_seq = 0;
 
