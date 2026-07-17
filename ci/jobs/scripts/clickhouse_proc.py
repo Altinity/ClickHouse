@@ -9,6 +9,7 @@ import time
 import threading
 import traceback
 import uuid
+import zipfile
 from collections import defaultdict
 from pathlib import Path
 from typing import List
@@ -163,16 +164,41 @@ class ClickHouseProc:
         print("Failed to start minio")
         return False
 
+    RUSTFS_VERSION = "1.0.0-beta.9"
+
+    def download_rustfs(self, rustfs_bin):
+        machine = platform.machine()
+        if machine not in ("x86_64", "aarch64", "arm64"):
+            print(f"unsupported architecture for rustfs [{machine}]")
+            return False
+        arch = "aarch64" if machine in ("aarch64", "arm64") else "x86_64"
+        url = (
+            f"https://github.com/rustfs/rustfs/releases/download/{self.RUSTFS_VERSION}"
+            f"/rustfs-linux-{arch}-musl-v{self.RUSTFS_VERSION}.zip"
+        )
+        zip_path = f"{temp_dir}/rustfs.zip"
+        if not Shell.check(
+            f"curl -sSfL --retry 3 --retry-delay 5 -o {zip_path} {url}", verbose=True
+        ):
+            print(f"failed to download rustfs from {url}")
+            return False
+        # The release zip contains the single `rustfs` binary at its root.
+        with zipfile.ZipFile(zip_path) as archive:
+            archive.extract("rustfs", temp_dir)
+        os.remove(zip_path)
+        os.chmod(rustfs_bin, 0o755)
+        return True
+
     def start_rustfs(self):
         # RustFS backs the content-addressed-over-S3 pool (M-W D-W8): the incarnation pool needs
         # ENFORCED conditional operations (a wrong-token DELETE must fail with 412), which MinIO
-        # OSS lacks - the CA disk's fail-closed capability probe rejects it. The static binary
-        # lives at ci/tmp/rustfs (extracted from rustfs/rustfs:1.0.0-beta.8); the data dir is
-        # wiped per run so no pool state bleeds between runs. MinIO keeps serving the non-CA s3
-        # disks on its own port.
+        # OSS lacks - the CA disk's fail-closed capability probe rejects it. The static (musl)
+        # binary is downloaded from the RustFS GitHub release into ci/tmp/rustfs when absent
+        # (CI wipes ci/tmp per run); the data dir is wiped per run so no pool state bleeds
+        # between runs. MinIO keeps serving the non-CA s3 disks on its own port.
         rustfs_bin = f"{temp_dir}/rustfs"
-        if not Path(rustfs_bin).is_file():
-            print(f"rustfs binary not found at {rustfs_bin}")
+        if not Path(rustfs_bin).is_file() and not self.download_rustfs(rustfs_bin):
+            print(f"rustfs binary not found at {rustfs_bin} and download failed")
             return False
         data_dir = f"{temp_dir}/rustfs_data"
         Shell.check(f"rm -rf {data_dir} && mkdir -p {data_dir}", verbose=True)
