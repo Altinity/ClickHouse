@@ -869,22 +869,6 @@ void MountLeaseKeeper::terminate()
     recordWrite(seq + 1, res.token);
 }
 
-}
-
-#include <Common/Exception.h>
-#include <Common/logger_useful.h>
-
-namespace DB
-{
-namespace ErrorCodes
-{
-    extern const int LOGICAL_ERROR;
-}
-}
-
-namespace DB::Cas
-{
-
 SingleWriterSlot::SingleWriterSlot(
     BackendPtr backend_, String key_, std::string_view slot_name_, std::string_view terminal_verb_,
     std::string_view logger_name_)
@@ -1057,13 +1041,6 @@ void SingleWriterSlot::backgroundLoop(std::chrono::milliseconds period)
         lock.lock();
     }
 }
-
-}
-
-#include <Common/logger_useful.h>
-
-namespace DB::Cas
-{
 
 void sweepOwnMountStaging(IObjectStorage & object_storage, const String & mount_staging_prefix) noexcept
 {

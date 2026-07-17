@@ -1,7 +1,40 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Parts/PartFolderAccess.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
+#include <Common/DateLUT.h>
+#include <Common/ProfileEvents.h>
+#include <Common/logger_useful.h>
 #include <base/defines.h>
+#include <base/scope_guard.h>
 #include <algorithm>
+#include <chrono>
 #include <unordered_set>
+
+namespace DB
+{
+namespace ErrorCodes
+{
+    extern const int FILE_DOESNT_EXIST;
+    extern const int ABORTED;
+}
+}
+
+namespace ProfileEvents
+{
+    extern const Event CasPartFolderViewHits;
+    extern const Event CasPartFolderViewValidationMismatches;
+    extern const Event CasPartFolderViewMisses;
+    extern const Event CasPartFolderViewOversizedBypasses;
+    extern const Event CasPartFolderViewInvalidations;
+    extern const Event CasRefRollbackBestEffortDropFailed;
+    extern const Event CasPartFolderValidateSkipped;
+    extern const Event CasRefRepoint;
+}
+
+namespace CurrentMetrics
+{
+    extern const Metric CasPartFolderCacheBytes;
+    extern const Metric CasPartFolderCacheEntries;
+}
 
 namespace DB::ContentAddressed
 {
@@ -103,42 +136,6 @@ size_t PartFolderView::estimatedBytes() const
     /// the shared decode, which is safe because eviction should happen before the budget is exceeded.
     return 256 + manifest_size;
 }
-
-}
-
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
-#include <Common/DateLUT.h>
-#include <Common/ProfileEvents.h>
-#include <Common/logger_useful.h>
-#include <base/scope_guard.h>
-#include <chrono>
-
-namespace DB::ErrorCodes
-{
-    extern const int FILE_DOESNT_EXIST;
-    extern const int ABORTED;
-}
-
-namespace ProfileEvents
-{
-    extern const Event CasPartFolderViewHits;
-    extern const Event CasPartFolderViewValidationMismatches;
-    extern const Event CasPartFolderViewMisses;
-    extern const Event CasPartFolderViewOversizedBypasses;
-    extern const Event CasPartFolderViewInvalidations;
-    extern const Event CasRefRollbackBestEffortDropFailed;
-    extern const Event CasPartFolderValidateSkipped;
-    extern const Event CasRefRepoint;
-}
-
-namespace CurrentMetrics
-{
-    extern const Metric CasPartFolderCacheBytes;
-    extern const Metric CasPartFolderCacheEntries;
-}
-
-namespace DB::ContentAddressed
-{
 
 CachedPartFolderAccess::CachedPartFolderAccess(Cas::PoolPtr store_)
     : CachedPartFolderAccess(std::move(store_), CacheParams{})

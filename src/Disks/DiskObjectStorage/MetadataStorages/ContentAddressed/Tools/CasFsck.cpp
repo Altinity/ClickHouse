@@ -18,9 +18,12 @@
 #include <unordered_map>
 #include <unordered_set>
 
-namespace DB::ErrorCodes
+namespace DB
+{
+namespace ErrorCodes
 {
     extern const int TIMEOUT_EXCEEDED;
+}
 }
 
 namespace DB::Cas

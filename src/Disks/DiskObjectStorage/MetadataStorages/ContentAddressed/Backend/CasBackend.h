@@ -12,9 +12,12 @@
 #include <string_view>
 #include <vector>
 
-namespace DB::ErrorCodes
+namespace DB
+{
+namespace ErrorCodes
 {
     extern const int NOT_IMPLEMENTED;
+}
 }
 
 namespace DB::Cas

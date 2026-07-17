@@ -1,6 +1,19 @@
 #pragma once
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPartManifestFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
+#include <Common/CacheBase.h>
+#include <Common/CurrentMetrics.h>
 #include <base/types.h>
+#include <functional>
+#include <future>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <unordered_map>
+#include <vector>
 
 namespace DB::ContentAddressed
 {
@@ -33,18 +46,6 @@ enum class Freshness
     StrictValidate,  /// fsck/debug: bypass retained views entirely; fresh resolve + validated read
 };
 
-}
-
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPartManifestFormat.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
-#include <memory>
-#include <optional>
-#include <string>
-#include <vector>
-
-namespace DB::ContentAddressed
-{
 
 /// Immutable snapshot of one resolved committed part/projection folder. Index-free: the decoder guarantees strictly
 /// ascending canonical path order, so file lookup is a binary search and directory listing is a
@@ -107,18 +108,6 @@ private:
 };
 
 }
-
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
-#include <Common/CacheBase.h>
-#include <Common/CurrentMetrics.h>
-#include <functional>
-#include <future>
-#include <map>
-#include <memory>
-#include <mutex>
-#include <optional>
-#include <unordered_map>
-#include <vector>
 
 namespace DB::Cas { class PartWriteTxn; }
 

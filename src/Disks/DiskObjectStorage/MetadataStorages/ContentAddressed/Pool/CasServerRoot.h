@@ -176,11 +176,6 @@ private:
     LoggerPtr log;
 };
 
-}
-
-namespace DB::Cas
-{
-
 /// Validate a `server_root_id` — the explicit, configured identity of the content-addressed layout
 /// subtree a server owns. It is a clean relative path: it composes into the
 /// object-key tree (`gc/server-roots/<srid>/...`, `roots/<srid>/...`), so the same hygiene the layout
@@ -584,11 +579,6 @@ private:
     /// `shouldFenceOnTransientRenewFailure` observing 0 is defensive, not an expected steady state).
     uint64_t confirmed_deadline_ms = 0;
 };
-
-}
-
-namespace DB::Cas
-{
 
 /// Mount-lease-scoped staging sweeper for objects left behind by S3-native staging.
 ///

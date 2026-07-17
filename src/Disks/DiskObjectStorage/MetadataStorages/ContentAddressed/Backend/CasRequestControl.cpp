@@ -26,13 +26,16 @@ namespace ProfileEvents
     extern const Event CasConditionalWriteFenceLostPostWrite;
 }
 
-namespace DB::ErrorCodes
+namespace DB
+{
+namespace ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
     extern const int CORRUPTED_DATA;
     extern const int LOGICAL_ERROR;
     extern const int NETWORK_ERROR;
     extern const int NOT_IMPLEMENTED;
+}
 }
 
 namespace DB::Cas

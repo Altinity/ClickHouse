@@ -22,6 +22,18 @@
 #include <base/scope_guard.h>
 #include <ctime>
 
+namespace fs = std::filesystem;
+
+namespace DB
+{
+namespace ErrorCodes
+{
+    extern const int FILE_DOESNT_EXIST;
+    extern const int LOGICAL_ERROR;
+    extern const int NOT_IMPLEMENTED;
+}
+}
+
 namespace DB::ContentAddressed
 {
 
@@ -49,13 +61,6 @@ bool partFileMustStayBlob(std::string_view file_name)
 
 namespace DB
 {
-
-namespace ErrorCodes
-{
-    extern const int FILE_DOESNT_EXIST;
-    extern const int LOGICAL_ERROR;
-    extern const int NOT_IMPLEMENTED;
-}
 
 namespace
 {
@@ -1381,8 +1386,6 @@ void ContentAddressedTransaction::truncateFile(const std::string &, size_t)
 }
 
 }
-
-namespace fs = std::filesystem;
 
 namespace DB::ContentAddressed
 {

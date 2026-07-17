@@ -19,17 +19,6 @@
 namespace DB
 {
 
-namespace ContentAddressed
-{
-
-/// Part files that must NOT be inlined into the tree: per-column data (`.bin`) and marks (`.mrk*`/
-/// `.cmrk*`) — inlining them would force a full-part fetch and destroy column-read selectivity — plus
-/// `primary.idx`, which can be large (a size-threshold inlining of small primary.idx is a follow-up).
-/// Everything else (the small eager metadata files) is an inline candidate, subject to INLINE_CAP.
-bool partFileMustStayBlob(std::string_view file_name);
-
-}
-
 /// Owns the metadata-side overlay for one object-storage transaction. Part files are accumulated by
 /// routed namespace/ref, then published as manifest trees and refs by `commit`; verbatim namespace
 /// and mountpoint files are written immediately when their buffers finalize. A part uses one
@@ -224,6 +213,12 @@ private:
 
 namespace DB::ContentAddressed
 {
+
+/// Part files that must NOT be inlined into the tree: per-column data (`.bin`) and marks (`.mrk*`/
+/// `.cmrk*`) — inlining them would force a full-part fetch and destroy column-read selectivity — plus
+/// `primary.idx`, which can be large (a size-threshold inlining of small primary.idx is a follow-up).
+/// Everything else (the small eager metadata files) is an inline candidate, subject to INLINE_CAP.
+bool partFileMustStayBlob(std::string_view file_name);
 
 /// Writes a CONTENT part file while computing its content hash. The blob key is only known
 /// once all bytes are written, so the buffer spills to a unique local temp file while hashing with
