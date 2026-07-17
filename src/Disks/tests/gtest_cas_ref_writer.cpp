@@ -36,6 +36,7 @@ extern const int ABORTED;
 extern const int FILE_DOESNT_EXIST;
 extern const int CORRUPTED_DATA;
 extern const int LOGICAL_ERROR;
+extern const int NETWORK_ERROR;
 }
 
 namespace ProfileEvents
@@ -707,7 +708,7 @@ TEST(RefWriterAppendLane, WedgedLaneBlocksSameTableWhileOtherTableProceeds)
     backend->fault_key_substr = layout.refsNamespacePrefix(ns_a) + "_log/";
     backend->fault_count = 1;
 
-    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { store->dropRef(ns_a, "x"); });
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns_a, "x"); });
     EXPECT_TRUE(store->refLaneWedgedForTest(ns_a));
 
     /// A different table proceeds normally while ns_a stays wedged.
@@ -716,7 +717,7 @@ TEST(RefWriterAppendLane, WedgedLaneBlocksSameTableWhileOtherTableProceeds)
 
     /// Retrying ns_a does not allocate a later id: the wedge's own key was never actually written
     /// (the fault never wrote through), so resolution still finds it absent -- still uncertain.
-    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { store->dropRef(ns_a, "x"); });
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns_a, "x"); });
     EXPECT_TRUE(store->refLaneWedgedForTest(ns_a));
     EXPECT_TRUE(store->resolveRef(ns_a, "x").has_value()) << "the wedged (never-resolved) drop must not have applied";
 }
@@ -739,7 +740,7 @@ TEST(RefWriterAppendLane, WedgedAppendObservedDurableAppliesBeforeNextId)
     backend->fault_key_substr = layout.refsNamespacePrefix(ns) + "_log/";
     backend->fault_count = 1;
 
-    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { store->dropRef(ns, "x"); });
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns));
     ASSERT_TRUE(store->resolveRef(ns, "x").has_value()) << "not yet applied while wedged";
 
@@ -780,7 +781,7 @@ TEST(RefWriterAppendLane, WedgedRefLaneCountTracksExactlyTheWedgedTableThroughIt
     backend->fault_key_substr = layout.refsNamespacePrefix(ns_a) + "_log/";
     backend->fault_count = 1;
 
-    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { store->dropRef(ns_a, "x"); });
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns_a, "x"); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns_a));
     EXPECT_EQ(store->wedgedRefLaneCount(), 1u);
 
@@ -862,7 +863,7 @@ TEST(RefWriterAppendLane, I1WedgeResolveCorruptionSurfacesAndKeepsWedge)
     /// Wedge the lane with an ambiguous PUT that never landed.
     backend->fault_key_substr = layout.refsNamespacePrefix(ns) + "_log/";
     backend->fault_count = 1;
-    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { store->dropRef(ns, "x"); });
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns));
 
     /// A foreign writer lands a DIFFERENT object at the exact wedged key; the next append's wedge resolve
@@ -920,7 +921,7 @@ TEST(CasAnomalyPolicy, ForeignBytesAtWedgeKeyTripFenceAndRemount)
     /// Wedge the lane with an ambiguous PUT that never landed.
     backend->fault_key_substr = layout.refsNamespacePrefix(ns) + "_log/";
     backend->fault_count = 1;
-    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { store->dropRef(ns, "x"); });
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns));
     ASSERT_TRUE(store->mayMutate()) << "the fence must not be tripped yet -- only an ordinary Unresolved wedge so far";
     ASSERT_EQ(store->scheduleRemountCallCountForTest(), 0u) << "no remount must have been scheduled yet by the ordinary wedge alone";
@@ -1126,7 +1127,7 @@ TEST(RefTableCacheEviction, WedgedTableIsNeverEvicted)
     /// Wedge ns_w's append lane with one ambiguous (Unresolved) PUT that exhausts the single-attempt budget.
     backend->fault_key_substr = layout.refsNamespacePrefix(ns_w) + "_log/";
     backend->fault_count = 1;
-    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { store->dropRef(ns_w, "x"); });
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns_w, "x"); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns_w));
 
     /// Pressure the cache with other tables. ns_w is idle and over the 1-byte budget, but its wedged lane
@@ -2154,7 +2155,7 @@ TEST(RefWriterRemount, DiscardsWedgeAndLaneRemainsUsable)
     /// Wedge the lane with an ambiguous PUT that never landed server-side.
     backend->fault_key_substr = layout.refsNamespacePrefix(ns) + "_log/";
     backend->fault_count = 1;
-    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { store->dropRef(ns, "x"); });
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns));
 
     fenceOutRefMount(*backend, layout.mountKey("test"));
@@ -2428,7 +2429,7 @@ TEST(RefWriterNamespaceRemoval, RemovalAppendFailureLeavesBuildAliveAndNamespace
     backend->fault_key_substr = layout.refsNamespacePrefix(ns) + "_log/";
     backend->fault_count = 1;
 
-    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { store->dropNamespace(ns); });
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropNamespace(ns); });
 
     /// The removal did not apply: the namespace stays Live and its committed ref still resolves.
     ASSERT_TRUE(store->resolveRef(ns, "committed").has_value()) << "a failed removal leaves the namespace Live";
@@ -2765,7 +2766,7 @@ TEST(RefWriterRecoverySeal, SealPutFailureFailsRecoveryClosed)
     backend->fault_key_substr = layout.refSnapshotKey(ns, seal_id);
     backend->fault_count = 1;   /// the seal PUT's single attempt (max_attempts=1) fails ambiguously -> Unresolved
 
-    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { store->listRefs(ns); });
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->listRefs(ns); });
     EXPECT_FALSE(backend->get(layout.refSnapshotKey(ns, seal_id)).has_value())
         << "the failed attempt must not have actually landed the seal";
 
