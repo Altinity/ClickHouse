@@ -1,5 +1,5 @@
 ---
-description: 'Design spec for [TXN-ONE-PIPELINE]: the CA disk transaction becomes one pipeline — every operation executes at call time in its domain-appropriate place, a new two-phase precommit/commit contract owns the publish, and the accumulated per-method isContentAddressed branches in upstream code are deleted.'
+description: 'Revised design for [TXN-ONE-PIPELINE]: every CA operation updates one eager transaction overlay, and the existing disk commit publishes it without a new precommit API.'
 sidebar_label: 'CAS one-pipeline disk transaction'
 sidebar_position: 62
 slug: /superpowers/specs/2026-07-15-cas-txn-one-pipeline-design
@@ -9,237 +9,306 @@ doc_type: 'reference'
 
 # CAS One-Pipeline Disk Transaction Design {#cas-txn-one-pipeline-design}
 
-**Status:** approved design, 2026-07-15. Supersedes the staged-intents wording of the
-`[TXN-ONE-PIPELINE]` entry in `docs/superpowers/cas/BACKLOG.md` §4.
+**Status:** revised design for review, 2026-07-15. This document supersedes the staged-intent,
+subclass, and two-phase disk-transaction variants previously recorded for
+`[TXN-ONE-PIPELINE]`. The A/B/C classification in
+`docs/superpowers/cas/upstream-patch-inventory.md` remains the source of truth for the existing
+patch inventory, but not for implementation order where it assumes a new disk `precommit` phase.
 
-**Goal:** eliminate the two-pipeline dispatch split (eager vs deferred-to-commit) in the CA disk
-transaction as a class, not per symptom. Every operation executes at call time; a standard
-two-phase `precommit`/`commit` disk-transaction contract owns the publish; all twelve class-A
-`isContentAddressed()` patches in upstream code (inventory:
-`docs/superpowers/cas/upstream-patch-inventory.md`) are deleted together with the mechanism that
-made them necessary. The result is a net deletion: fewer than a hundred added lines, all generic,
-none naming CA.
+**Goal:** remove the eager/deferred split from a CA disk transaction. Every operation changes one
+transaction-private overlay when it is called. The existing disk `commit` is the only operation
+that makes that overlay visible in the durable CAS namespace. No new transaction phase, part
+storage method, or early MergeTree call site is added.
 
-**Sequencing (decision):** lands FIRST, before codecs v3
-(`2026-07-15-cas-codecs-v3-design.md`) and the source-layout refactoring
-(`2026-07-15-cas-source-layout-refactoring-design.md`). It is a behavior change and is validated
-against the tree the soak history knows; it also shrinks the upstream patch surface before the
-layout refactoring demands its quiet zero-behavior-change window.
+**Fork constraint:** the design minimizes the surface shared with upstream ClickHouse. The main
+code receives only generic routing and write-buffer extension points needed to remove the current
+per-method `isContentAddressed` branches. CA publication and rollback remain inside the CA
+metadata transaction.
 
 ## Motivation {#motivation}
 
-The `01603` column-TTL abort (`de8a38b1e87`), the B58 lost-projection manifests, and the B63
-silently-wrong projection aggregates were all one bug class: within a single CA disk transaction,
-some operations executed eagerly (`writeFile`, `createHardLink`, `moveDirectory`, later part-file
-unlinks) while others deferred to commit replay, and order between the two pipelines inverted.
-Each per-method `isContentAddressed()` branch in `DiskObjectStorageTransaction.cpp` was added
-through one of those bugs.
+The `01603` column-TTL failure, the B58 lost-projection manifests, and the B63 silently incorrect
+projection aggregates had one cause: a single CA transaction had two execution timelines.
+`writeFile`, `createHardLink`, `moveDirectory`, and later part-file unlinks changed CA staging at
+call time, while other operations waited in `operations_to_execute` until `commit`. Program order
+between the eager and deferred timelines was not preserved.
 
-Why CA cannot live like plain s3 (everything deferred, replayed at commit) — verified against the
-code, load-bearing for this design:
+CA also requires read-your-writes before `commit`. Projection loading, projection read-back,
+checksum construction, and manifest construction inspect a part while its parent transaction is
+still open. Replaying a deferred queue in `commit`, or in an additional late preparation phase,
+cannot make those operations visible to an earlier read.
 
-- Plain s3 survives on two escape hatches. First, **early sub-commits**: a rebuilt projection's
-  sub-transaction commits early (`MutateTask.cpp:1819`), making its files readable before the
-  parent commits. Second, **fail-open readers**: `loadProjections` checks `existsDirectory` and
-  silently skips what it cannot see (`IMergeTreeDataPart.cpp:1384`).
-- Whole-part atomicity closes both hatches on CA. An early sub-commit publishes half a part (the
-  B21/B36 corruption class), so projection sub-parts must ride the parent transaction — and then
-  pre-commit readers (`loadProjections`, the temp-projection read-back) can only be served by the
-  transaction's own staging. Reader blindness on CA is not a perf loss but a correctness loss:
-  the manifest and `checksums.txt` are built from what the transaction sees (B58), and the B63
-  workaround that registered projections while blind produced silently wrong aggregates.
-- Therefore the transaction's staging must be up to date at the moment of every call — operations
-  must execute when invoked. Once anything is eager, a coexisting deferred queue recreates the
-  inversion class, so the queue must not exist for CA at all.
+The required invariant is therefore simpler than a two-phase protocol:
 
-Verified along the way: upstream plain s3 still has the reader-blindness wart today — a mutation
-always wraps the new part storage in a disk transaction (`MutateTask.cpp:3153`), carried-forward
-projection hardlinks are queued (`DataPartStorageOnDiskFull.cpp:307`), and `loadProjections` at
-finalize silently skips them, so the mutated part lives in memory without those projections until
-reload, and downstream consumers of the in-memory map (`MergedBlockOutputStream.cpp:222`,
-`MergeTask.cpp:1180`, `DataPartsExchange.cpp:235`) act on the blind state. Recorded as a backlog
-observation (candidate upstream issue), out of scope here.
+> A CA transaction has one mutable view. Every operation updates that view at call time, and every
+> read through the transaction observes it.
 
-## The Model {#model}
+Once this invariant holds, operation order is ordinary program order. There is no delayed delete
+that can fire after a later create, no special eager-unlink classification, and no need to repair
+ordering independently in each disk method.
 
-One rule, no domains crossing in time:
+## Transaction Model {#transaction-model}
 
-1. **Every operation executes at call time**, in its domain-appropriate place:
-   - part-file operations (write, hardlink, rename, unlink) apply to the transaction's
-     **staging overlay** — the transaction-private in-memory state backed by scratch bytes;
-   - verbatim table-level and mountpoint operations (including deletes) apply to the
-     **real location** immediately.
-2. **`precommit` lifts staging into the real place**: for each staged part — manifest from the
-   overlay → `precommitAdd` → upload missing blobs → promote → publish the ref. After a
-   successful `precommit` the transaction is **sealed**: any further mutating operation throws
-   `LOGICAL_ERROR` (a caller writing past the published manifest is a correctness violation).
-3. **`commit` finalizes bookkeeping only**: marks the transaction committed (disarming the abort
-   compensation) and performs residual cleanup (B188 staged-temp removal). It has no durable
-   role left.
-4. **Abort** (undo / destructor of an uncommitted transaction) discards staging and compensates
-   the only thing `precommit` lifted — the refs it published (the existing `dropRefBestEffort`
-   mechanism, now tied to an explicit phase). Already-executed immediate destructive operations
-   are **not** rolled back.
+A CA transaction has three externally relevant states: `Open`, `Committed`, and `Aborted`.
 
-Point 4 adopts the local-disk semantics MergeTree was written against: `FakeDiskTransaction`
-executes everything immediately, deletes included, with no rollback. The deferred durable delete
-was a guarantee the object-storage transaction added on top of MergeTree's base model; CA gives
-it up for uniformity. Deferred deletes (intents) were rejected because they reintroduce a second
-execution time and with it an ABA hazard: create (immediate) → delete (deferred) → create
-(immediate) → the deferred delete fires at commit and destroys the recreated file. With
-everything immediate, program order is total by construction and no ordering rules are needed.
+1. In `Open`, every mutation executes immediately against the transaction overlay. This includes
+   writes, creates, hardlinks, deletes, file moves, directory moves, and ref moves. "Immediately"
+   means that the transaction view changes at the call site; it does not mean that the shared live
+   ref is published at that point.
+2. Reads combine the transaction overlay with the committed base state. They observe preceding
+   writes, renames, and deletes from the same transaction.
+3. `commit` seals the overlay and performs the only durable publication. It constructs manifests,
+   runs the internal CAS build protocol, promotes blobs as needed, publishes or moves refs, and
+   applies the final overlay state.
+4. `undo` or destruction before a successful `commit` discards the overlay and private staging.
+   Since no live ref was published early, abort does not compensate an early destination ref.
 
-## Mechanism {#mechanism}
+Blob bytes may be written to a private local or S3 staging backend while the transaction is open.
+That is still eager staging: the bytes and their metadata are available to the transaction but
+not reachable through a live ref. The existing internal ordering
+`precommitAdd` → blob upload/adoption → promote remains part of `commit`; `precommitAdd` is a
+CAS GC-safety primitive and is not a public disk-transaction phase.
 
-### The dispatch funnel {#dispatch-funnel}
+The implementation must not represent deletes as a second list of actions to replay after the
+overlay. A delete changes the overlay immediately, just like a create. For example, create →
+delete → create leaves the path present in the final overlay; no delayed delete remains to
+produce an ABA failure during `commit`.
 
-`DiskObjectStorageTransaction` keeps its single class (no subclass, no base split — decided).
-All mutating methods route through one funnel:
+## Why There Is No Disk Precommit {#why-there-is-no-disk-precommit}
+
+An earlier version introduced `IDiskTransaction::precommit`,
+`IMetadataTransaction::precommit`, and `IDataPartStorage::publishStagedData`. Their purpose was to
+publish CA refs after the final part rename but before the external `Keeper` decision and before
+the `data_parts` lock. That is not a CA transaction-order requirement.
+
+The current Replicated flow already defines the general order as:
+
+1. `MergeTreeData::Transaction::renameParts`;
+2. `Keeper::tryMultiNoThrow`;
+3. `MergeTreeData::Transaction::commit`;
+4. `IDataPartStorage::commitTransaction` and the underlying disk `commit`.
+
+The hardware-error recovery branch may deliberately delay step 4 while it determines whether the
+`Keeper` multi succeeded. The final disk `commit` also currently runs from the general
+`MergeTreeData::Transaction::commit` path, including paths that hold `data_parts`.
+
+This ordering applies to every real deferred disk transaction reached through
+`IDataPartStorage`; it is not introduced by CA. A CA-only `precommit` would give one metadata
+implementation an extra visibility boundary while leaving the general `Keeper`/disk ordering
+unchanged. It would therefore not solve the general atomicity question. It would instead add:
+
+- two similarly named preparation concepts: the existing
+  `IDataPartStorage::precommitTransaction` writer hook and a new disk publish phase;
+- a second part-storage bridge such as `publishStagedData`;
+- new calls in shared `MergeTree` paths and special handling for self-owned transactions;
+- compensation for refs deliberately published before the existing commit decision.
+
+That is disproportionate for `[TXN-ONE-PIPELINE]` and increases the fork's conflict surface.
+Consequently this design leaves the existing ClickHouse commit call sites and transaction API
+unchanged. `IDataPartStorage::precommitTransaction` retains its current writer/finalization
+meaning and remains a noop for `DataPartStorageOnDiskFull`.
+
+If the ordering between an external `Keeper` decision and a real disk transaction must change,
+it needs a separate design covering all affected disk implementations. Likewise, moving remote
+I/O out of `data_parts` is a general commit-positioning/performance problem, not a reason to add a
+CA-only correctness phase.
+
+The window after a successful `Keeper` multi and before disk `commit` uses the existing
+`ReplicatedMergeTree` unknown-result and missing-part recovery semantics. If the process
+terminates in that window, the client receives no acknowledgement and must retry according to the
+normal idempotent insert contract. On restart, `checkPartsImpl` finds the part in the replica's
+`Keeper` part set but not on disk and places it into the replication queue. The part-check thread
+then searches other replicas for the part or a covering part and fetches it through the ordinary
+mechanism. If no replica can provide it, `onPartIsLostForever` and
+`createEmptyPartInsteadOfLost` replace it with an empty part and account it in
+`lost_part_count`.
+
+This may lose data when the last copy disappeared before disk `commit`, but that is the explicit
+general lost-part behavior, not a CA-specific transaction protocol to repair in this change. A
+targeted fault-injection test should document that CA follows this existing path; it is a
+regression test, not a separate architectural audit or a gate requiring a new recovery mechanism.
+
+## Dispatch Funnel {#dispatch-funnel}
+
+`DiskObjectStorageTransaction` remains one class. Every mutating method routes its metadata
+effect through one generic helper:
 
 ```cpp
-void dispatch(std::function<void(MetadataTransactionPtr)> op)
+template <typename Operation>
+void dispatch(Operation && operation)
 {
     if (metadata_storage->transactionIsStagingOverlay())
-        op(metadata_transaction);
+        operation(metadata_transaction);
     else
-        operations_to_execute.push_back(std::move(op));
+        operations_to_execute.emplace_back(std::forward<Operation>(operation));
 }
 ```
 
-`IMetadataStorage::transactionIsStagingOverlay` is a generic capability ("my transaction is a
-staging overlay; apply operations to it in program order"), `false` by default, `true` for CA.
-Every mutating method body becomes the same one-liner for all disks. The eager-unlink gate
-(`isEagerContentAddressedUnlink`, `stagesPartFileUnlink` and its gtest) is deleted: with
-immediate verbatim deletes there is nothing left to classify. The `moveFile`/`replaceFile`
-residual gap (part-file→part-file shape still deferred) closes automatically.
-`MultipleDisksObjectStorageTransaction` inherits the funnel unchanged. A cheap
-`chassert(operations_to_execute.empty())` in the eager path of `commit` serves as a tripwire
-against future code bypassing the funnel; `undo` finds an empty queue on CA and CA abort is
-handled wholly by the metadata transaction.
+`IMetadataStorage::transactionIsStagingOverlay` returns `false` by default and `true` for CA. For
+ordinary object-storage metadata, behavior is unchanged: effects enter
+`operations_to_execute` and replay in FIFO order during `commit` or `tryCommit`. For CA, effects
+update `ContentAddressedTransaction` immediately and the disk-layer queue remains empty.
 
-### The write-buffer hook {#write-buffer-hook}
+`DiskObjectStorageTransaction::commit` and `tryCommit` validate in release builds that an eager
+transaction has an empty queue. A future method that bypasses `dispatch` therefore fails before
+publication rather than silently recreating two timelines.
 
-`writeFile` is the one operation whose *mechanism* differs, not its moment (the blob key is the
-content hash, known only after the last byte; the buffer is the operation). Generic extension
-point at the top of `writeFileImpl`:
+The funnel deletes the existing per-method CA branches together: the CA `writeFile` block,
+`createHardLink`, the disk-layer `moveDirectory` branch, the eager-unlink predicate and its six
+callers, and the `moveFile`/`replaceFile` gaps. `MultipleDisksObjectStorageTransaction` uses the
+same policy.
+
+## Write-Buffer Hook {#write-buffer-hook}
+
+`writeFile` differs in mechanism, not execution time: a CA blob key is its content hash and is
+known only when the last byte has been written. `writeFileImpl` therefore starts with a generic
+transaction hook:
 
 ```cpp
-if (auto buf = metadata_transaction->tryCreateWriteBuffer(path, buf_size, mode, settings, autocommit))
-    return buf;
+if (auto buffer = metadata_transaction->tryCreateWriteBuffer(
+        path, buf_size, mode, settings, autocommit))
+    return buffer;
 ```
 
-Default returns `nullptr` (every existing metadata type unchanged); `ContentAddressedTransaction`
-returns its hash-on-write buffer. The entire ~85-line CA block in `writeFileImpl` (append RMW,
-autocommit-inline vs content-blob split, the keep-alive pin) moves into the CA tree. Exact hook
-signature (and how the autocommit finalize callback obtains the disk transaction for the
-`precommit`+`commit` pair) is a plan-level decision.
+The default returns `nullptr`, preserving every existing metadata implementation. CA returns its
+hash-on-write staging buffer. Append read/modify/write, inline-versus-blob selection, and the
+transaction lifetime pin move from `DiskObjectStorageTransaction.cpp` into
+`ContentAddressedTransaction`.
 
-### The two-phase contract {#two-phase-contract}
+An autocommit buffer retains the owning disk transaction and calls its existing `commit` from the
+finalize callback. There is no `precommit` call and no separate metadata publication path.
 
-- `IDiskTransaction::precommit` — new virtual, noop default. Ordinary disks unchanged.
-- `DiskObjectStorageTransaction::precommit` forwards to `IMetadataTransaction::precommit`
-  (noop default there as well).
-- `ContentAddressedTransaction::precommit` = the entire publish (today's `publishStaging` loop
-  moves here from `commit`), then seal.
-- `ContentAddressedTransaction::commit`: if `precommit` has not run, runs it implicitly
-  (idempotent, flag-guarded — classic commit-implies-prepare) with observability:
-  ProfileEvent `CasImplicitPrecommitInCommit` + a debug log line, so a mis-positioned hot path
-  (publish under the `data_parts` lock) surfaces in soak metrics instead of aborting rare
-  recovery branches. Then bookkeeping as in [The Model](#model). `tryCommit` follows the same
-  semantics.
-- Mutating operation after `precommit` → fail-loud `LOGICAL_ERROR` (correctness invariant, the
-  settled asymmetry: missed positioning is counted and logged; writing past the seal throws).
-- **Autocommit one-shots** call `precommit` then `commit` explicitly from the finalize callback:
-  they are commit-positioned by design and must not pollute the implicit-precommit metric, whose
-  purpose is to catch mis-positioned hot paths.
-- `moveDirectory` becomes a **pure staging re-key** (tmp prefix → final name in the overlay).
-  B151's rename-window publish and the whole `rename_published_refs` machinery are deleted in
-  the same phase — the publish cannot live in two places.
+## Overlay Responsibilities {#overlay-responsibilities}
 
-### Precommit call sites {#call-sites}
+The overlay must cover every operation that can otherwise escape into a different execution
+timeline:
 
-- **Replicated:** at the end of `MergeTreeData::Transaction::renameParts` — `precommit` each
-  renamed part's storage via a new `IDataPartStorage::precommitTransaction` (mirror of
-  `commitTransaction`). This positions the publish before the ZK multi for every Replicated path
-  without touching `ReplicatedMergeTreeSink`.
-- **Plain MergeTree:** in `MergeTreeData::Transaction::commit`, before acquiring the
-  `data_parts` lock. Call paths that enter with the lock already held rely on implicit
-  precommit; the metric shows in soak whether any of them is hot enough to deserve an explicit
-  call.
-- **Self-owned transactions** (`DataPartStorageOnDiskBase::freeze`,
-  `MergeTreeData::restorePartFromBackup`, the byte-fetch landing path in `DataPartsExchange`):
-  explicit `precommit`+`commit` pair (inventory step 6, in scope).
-- **B58 projection sites** are not touched: a projection sub-part rides the parent whole-part
-  transaction; the shared-transaction rule is expressed once at `getProjectionPartBuilder`
-  (inventory step 6's "express the rule once").
-- `MergeTreeData::removePartsInRangeFromWorkingSet`: the hand-placed `commitTransaction` for the
-  empty covering part becomes unnecessary once `precommit` publishes before the in-memory
-  rollback; the plan must verify `precommit` actually fires on this path before deleting the
-  workaround (inventory flags this medium-confidence).
+- part-file entries and pending blob payloads;
+- removal of part files;
+- projection-prefix and part-directory re-keying;
+- committed-ref moves, drops, and replacements performed through the transaction;
+- verbatim table-level and mountpoint mutations reached through the same transaction.
 
-## De-Patching Scope {#de-patching-scope}
+This is a semantic requirement, not necessarily one container. The implementation may keep
+specialized maps for file entries, refs, and namespace files as long as every method mutates them
+at call time and every transaction read resolves the combined view consistently.
 
-Everything class **A** from `docs/superpowers/cas/upstream-patch-inventory.md` (12 hunks), plus
-the flagged-B shrinks of inventory step 6 (`freeze`/`restore` to the two-phase pair, the
-shared-transaction rule expressed once), plus the two class-C deletions (the redundant
-`StorageReplicatedMergeTree::checkAlterPartitionIsPossible` override, `.cpp` + `.h`). Extracting
-the B37/B90/`LocalObjectStorage` robustness fixes as standalone upstream contributions stays out
-of scope (backlog).
+The plan must specify collision behavior for rename and replacement in the overlay. The rule is
+the same as the corresponding filesystem operation applied in program order; it must not be
+reconstructed later from independently replayed intent lists.
 
-## Migration Phases And Gates {#migration-phases}
+## `moveDirectory` Responsibilities {#move-directory-responsibilities}
+
+For a staged tmp-to-final part move, `ContentAddressedTransaction::moveDirectory` only re-keys the
+transaction view from the temporary ref to the final ref. It does not call `publishStaging`.
+
+The same rule applies to committed-ref operations performed through an open CA transaction: the
+overlay records the source as absent and the destination as present, and reads observe that
+result. The durable ref operation occurs in `commit`.
+
+This removes B151 early publication, `rename_published_refs`, and destructor compensation for an
+early destination ref. The B183 temporary text-index case must be represented in the overlay so
+that a scratch ref cannot overwrite the authoritative final part manifest; preserving that
+invariant is a migration gate.
+
+## Commit And Abort {#commit-and-abort}
+
+`ContentAddressedTransaction::commit` owns the complete transition from overlay to durable state:
+
+1. freeze the overlay against further mutation;
+2. derive the final manifest/ref/namespace-file changes;
+3. establish CAS GC protection with the internal `Cas::Build::precommitAdd` protocol;
+4. upload or adopt referenced pending blobs;
+5. promote manifests and apply final ref changes;
+6. mark the transaction committed and remove private staging.
+
+There is no atomic backend operation spanning several refs. Existing commit-time compensation
+for refs newly created before a later publication failure therefore remains necessary. This is
+commit failure handling, not compensation for publication before the commit decision. The plan
+must separately audit updates of existing refs because dropping an existing ref is not a valid
+rollback for a failed repoint.
+
+Before `commit`, `undo` is simple: discard the overlay, abandon its builds, and remove private
+staging. No mutation of the shared live namespace should have occurred. After `commit` succeeds,
+the disk transaction is complete and is reset by its existing owner.
+
+## Upstream Surface {#upstream-surface}
+
+The intended shared-code delta is limited to:
+
+- one generic eager-overlay capability used by the dispatch funnel;
+- one generic metadata-transaction write-buffer hook;
+- routing every mutating `DiskObjectStorageTransaction` method through the funnel;
+- release-build verification that eager transactions never populate
+  `operations_to_execute`.
+
+The design does not add or change:
+
+- `IDiskTransaction::precommit`;
+- `IMetadataTransaction::precommit`;
+- `IDataPartStorage::publishStagedData`;
+- `IDataPartStorage::precommitTransaction` or any of its call sites;
+- `MergeTreeData::Transaction::renameParts` or the Replicated `Keeper` call sequence;
+- explicit `precommit`/`commit` pairs in freeze, restore, fetch, or other self-owned paths.
+
+CA-specific overlay and publication behavior stays under
+`src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed`.
+
+## Migration Phases And Gates {#migration-phases-and-gates}
 
 | Phase | Content | Gate |
 |---|---|---|
-| 1. Contract + publish repositioning | `precommit` at all three levels; CA `precommit` = publish, `commit` = bookkeeping; seal; implicit-precommit + ProfileEvent; autocommit pairs; explicit call sites (`renameParts`, plain `commit`, `freeze`, `restore`, fetch); `moveDirectory` demoted to re-key; B151 + `rename_published_refs` deleted | build + full cas-gtest + CA-default stateless + failpoint tests for abort between `precommit` and `commit` |
-| 2. The funnel | `dispatch` + capability + `tryCreateWriteBuffer` hook; delete all per-method CA branches (`writeFile` block, `createHardLink`, `moveDirectory`, unlink gate ×6 + predicate + gtest, `moveFile`/`replaceFile` comment tombstones) | build + battery + CA-default stateless (01603 among them) |
-| 3. Tail de-patch | `removePartsInRangeFromWorkingSet` workaround removal (after path verification), C deletions | build + battery |
-| Final gate | full CA-default stateless run + ca-soak (time-driven phase-3 profile); targeted: `01603_remove_column_ttl`, `02941` (carried-forward projections) | both green |
+| 1. Complete the overlay | Stage all CA mutations, including deletes and ref moves; make transaction reads resolve the overlay; make staged tmp-to-final `moveDirectory` a pure re-key | CA gtests; read-your-writes and operation-order tests; B183 text-index regression |
+| 2. Publish only in commit | Remove B151 early publication and `rename_published_refs`; make `commit` materialize the complete overlay; simplify pre-commit `undo` | Commit-failure compensation tests; regression test that termination after the `Keeper` multi enters the ordinary missing-part recovery path |
+| 3. Funnel and write hook | Add the generic dispatch capability and write-buffer hook; route all mutating methods through the funnel; delete per-method CA branches | Build; CA battery; CA-default stateless; targeted `01603_remove_column_ttl` and `02941` |
+| 4. Tail de-patch | Re-evaluate remaining B and C inventory items against the new invariant and delete only those made redundant | Build and CA battery |
+| Final | Run full CA-default stateless and time-driven phase-3 ca-soak | All green; no CA operation bypasses the overlay or populates the disk queue |
 
-Phase-1 plan work includes the **destructive-op audit**: enumerate every verbatim / mountpoint /
-ref-drop delete site reachable on CA and verify none sits in an abortable multi-op transaction
-that expects rollback (the estimate is none — mutation-entry removal and part cleanup happen
-after their decisions are already durable — but the estimate is not a proof).
+Each phase must be independently reviewable. Existing workarounds are removed only after their
+replacement invariant and targeted regression test are present in the same phase.
 
 ## Rejected Alternatives {#rejected-alternatives}
 
-- **Staged delete intents materialized at `commit`** (the earlier backlog wording) — rejected:
-  intents are a second execution time, reintroducing the inversion class in a corner and
-  requiring an ABA-closing per-path rule (create → delete-intent → create → the intent fires at
-  commit and destroys the recreated file). Everything-immediate makes program order total by
-  construction.
-- **Keep the queue, replay at `precommit`** — fixes write-write order and manifest completeness,
-  but not write-read order: pre-precommit readers exist by necessity (whole-part atomicity bans
-  the early sub-commits plain s3 uses), and a queued future is invisible to them. See
-  [Motivation](#motivation).
-- **Publish at disk `commit`** — an announced-but-unreadable window in the Replicated recovery
-  branch (disk `commit` can run minutes after the ZK multi) plus S3 round-trips under the
-  `data_parts` lock. Note the earlier "publish must precede the ZK announce" rationale was
-  overstated — `PreActive` fences owner reads and a fetch of a `PreActive` part already
-  fails-and-retries on plain s3 (an accepted upstream race) — but the recovery-branch window and
-  the lock positioning stand.
-- **`ContentAddressedDiskTransaction` subclass / split base** — rejected in favor of the funnel:
-  a subclass whose every override would be the same one-liner adds a type for no semantic
-  difference; a base split buys a compile-time guarantee at the cost of a permanent conflict tax
-  on the most-conflicted upstream file. The funnel expresses the decision once, generically.
+- **Deferred delete intents:** they retain a second execution time and permit an ABA sequence in
+  which an old delete removes a later create.
+- **Replay the disk queue in `commit`:** it preserves write/write order but does not provide
+  read-your-writes before `commit`.
+- **Replay the disk queue in a new `precommit`:** it has the same early-read problem and adds an
+  API without removing the need for an eager transaction view.
+- **A CA-specific disk `precommit`:** the motivating `Keeper`/disk ordering is general to real
+  disk transactions. A CA-only phase does not solve it and expands the upstream patch surface.
+- **Reuse `IDataPartStorage::precommitTransaction`:** it is a writer/finalization hook with many
+  call sites before the final rename. Changing its meaning would be both confusing and
+  conflict-prone.
+- **Add `IDataPartStorage::publishStagedData`:** it is another public name for an early CA-only
+  visibility boundary that this design does not require.
+- **Publish from `moveDirectory`:** it gives an ordinary filesystem operation a hidden transaction
+  phase, relies on path classification to recognize the final rename, and requires abort
+  compensation for work performed before `commit`.
+- **A CA disk-transaction subclass or split base:** the semantic difference is the dispatch
+  policy already expressed by the generic funnel. A new hierarchy would enlarge a frequently
+  conflicting upstream file.
 
-## Deferred To Plans {#deferred-to-plans}
+## Plan-Time Audits {#plan-time-audits}
 
-- Exact names/signatures: `transactionIsStagingOverlay`, `tryCreateWriteBuffer`,
-  `precommitTransaction` (naming may be adjusted at draft time).
-- The autocommit finalize-callback plumbing for the explicit `precommit`+`commit` pair.
-- `writeFileUsingBlobWritingFunction` and `copyFile` behavior on CA under the funnel (today's
-  behavior preserved; route through the hook or keep rejecting — audit at draft time).
-- The destructive-op audit inventory (phase 1).
-- Seal breadth: the default is broad (ANY mutating operation after `precommit` throws); the
-  settled minimum is staging mutations. The phase-1 plan must verify no legitimate verbatim
-  write occurs between `precommit` and `commit` in one transaction; if one exists, narrow the
-  seal to the staging domain for that class rather than weakening the throw.
-- `removePartsInRangeFromWorkingSet` path verification (phase 3).
-- Whether any lock-held plain-commit call site needs an explicit `precommit` (driven by the
-  `CasImplicitPrecommitInCommit` soak numbers).
+- Inventory every mutation currently applied directly to a live ref, namespace file, or
+  mountpoint and assign it an overlay representation.
+- Verify transaction reads after write, delete, rename, replace, projection re-key, and committed
+  ref move.
+- Verify B183 temporary text-index behavior without early publication.
+- Verify with one fault-injection regression that process termination after successful `Keeper`
+  publication but before disk `commit` enters the existing missing-part fetch/lost-part path; do
+  not introduce CA-specific recovery for this window.
+- Audit multi-ref commit failure and existing-ref repoint behavior; do not use unconditional ref
+  deletion as rollback.
+- Audit `writeFileUsingBlobWritingFunction` and `copyFile`. Preserve current rejection where
+  support is absent; do not introduce a fallback behavior.
+- Re-evaluate the empty-covering-part `commitTransaction` workaround before deleting it; the new
+  design does not assume that moving publication into `commit` automatically makes the workaround
+  redundant.
 
-## Backlog Observations Recorded Here {#backlog-observations}
+## Backlog Observation {#backlog-observation}
 
-- Upstream plain s3 loses carried-forward projections from the in-memory part after a mutation
-  until part reload (verified chain in [Motivation](#motivation)); candidate for an upstream
-  issue with `MergeTask.cpp:1180` / `DataPartsExchange.cpp:235` as the consumer evidence.
+Plain object storage can leave carried-forward projections absent from an in-memory mutated part
+until reload because queued hardlinks are invisible to `loadProjections`. This is a candidate
+upstream issue, but fixing ordinary object-storage read-your-writes is outside this design.
