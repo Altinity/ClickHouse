@@ -1,4 +1,13 @@
-# Part Durability Before Keeper Commit — Implementation Plan
+---
+description: 'Implementation plan for the renameParts disk-transaction close: failing failpoint test, the one-function fix, the S40 scenario gate, validation gates, bookkeeping and the upstream draft.'
+sidebar_label: 'Part durability plan'
+sidebar_position: 64
+slug: /superpowers/plans/2026-07-17-part-durability-before-keeper-commit
+title: 'Part Durability Before Keeper Commit — Implementation Plan'
+doc_type: 'reference'
+---
+
+# Part Durability Before Keeper Commit — Implementation Plan {#part-durability-plan}
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -8,7 +17,7 @@
 
 **Tech Stack:** C++ (`src/Storages/MergeTree`), stateless SQL test with a failpoint, ca-soak scenario framework (Python).
 
-## Global Constraints
+## Global Constraints {#global-constraints}
 
 - Branch `cas-gc-rebuild`; new commits only — no rebase, no amend, **never push**.
 - Allman braces; comment style of the surrounding code; function names without `()` in prose.
@@ -18,13 +27,13 @@
 - Stateless test: use `./tests/queries/0_stateless/add-test <name>` to allocate the number; only strictly necessary tags.
 - The compose repro cluster (`ca-soak-*`) may be recycled (all forensic evidence is committed); `down -v` + `up` remounts the rebuilt binary.
 
-## Plan-time audit (done while writing this plan — record, no action)
+## Plan-time audit (done while writing this plan — record, no action) {#plan-time-audit}
 
 Spec §Testing item 4 required a write-after-close audit: mutating part-storage operations that route through the open disk transaction are `createFile`/`moveFile`/`replaceFile`/`removeFile`/`removeFileIfExists`/`createProjection`/`createDirectories`/`removeRecursive`/`removeSharedRecursive`/`renameTo` (via `executeWriteOperation`). Between `renameParts` and `Transaction::commit`, the only such calls across all ten call sites are `renameTo(temporary_part_relative_path)` on the sink's **rollback** branches (`ReplicatedMergeTreeSink.cpp:1059/:1076`), which under the fix intentionally run over a closed transaction through the autocommit route (CA committed-source move) — exactly the spec's rollback semantics. `writeTransactionFile` bypasses the transaction entirely (`DataPartStorageOnDiskBase.cpp:1110-1114`). **PASS — no blocker.**
 
 ---
 
-### Task 1: Failing regression test (generic failpoint, plain-S3 shape)
+### Task 1: Failing regression test (generic failpoint, plain-S3 shape) {#task-1-failing-regression-test}
 
 **Files:**
 - Create: `tests/queries/0_stateless/<NNNNN>_insert_dedup_disk_commit_failpoint.sql` (number assigned by `add-test`)
@@ -104,7 +113,7 @@ git commit -m "cas: failing regression test — INSERT dedup vs disk-commit fail
 
 ---
 
-### Task 2: The fix — close disk transactions in renameParts
+### Task 2: The fix — close disk transactions in renameParts {#task-2-the-fix}
 
 **Files:**
 - Modify: `src/Storages/MergeTree/MergeTreeData.cpp:8770-8778` (`MergeTreeData::Transaction::renameParts`)
@@ -246,7 +255,7 @@ Dispatch a normal code-review subagent (NOT umbrella) over the two commits (test
 
 ---
 
-### Task 3: S40 scenario card (CA integration repro as a permanent gate)
+### Task 3: S40 scenario card (CA integration repro as a permanent gate) {#task-3-s40-scenario-card}
 
 **Files:**
 - Create: `utils/ca-soak/scenarios/cards/s40_insert_dedup_outage.py`
@@ -301,7 +310,9 @@ _TABLE = "s40_dedup_outage"
 
 
 def _dock(*args):
-    subprocess.run(["docker", *args], capture_output=True)
+    # check=True: a wrong container name or a docker failure must FAIL the fault schedule (and
+    # via the fault-schedule verdict, the run) — never silently skip the fault and pass vacuously.
+    subprocess.run(["docker", *args], capture_output=True, check=True)
 
 
 @register
@@ -312,13 +323,15 @@ class S40(Scenario):
     expect_exception = True   # inserts DO fail loudly during the outage; CA-log exception rows are expected
 
     # The pause must exceed the 90s CAS write budget, so there is no meaningfully faster dev preset.
+    # min_acked: anti-vacuity floor for the primary verdict (the dl_probe baseline acked ~1300 in
+    # 150s with 8 writers; 200 is a safe lower bound even on a slow host).
     param_table = {
         "dev": {"insert_window_s": 150, "pause_s": 105, "kill_after_s": 16, "ch2_down_s": 50,
-                "writers": 6, "payload_bytes": 20000},
+                "writers": 6, "payload_bytes": 20000, "min_acked": 200},
         "ci": {"insert_window_s": 150, "pause_s": 105, "kill_after_s": 16, "ch2_down_s": 50,
-               "writers": 8, "payload_bytes": 20000},
+               "writers": 8, "payload_bytes": 20000, "min_acked": 200},
         "full": {"insert_window_s": 300, "pause_s": 105, "kill_after_s": 16, "ch2_down_s": 50,
-                 "writers": 8, "payload_bytes": 20000},
+                 "writers": 8, "payload_bytes": 20000, "min_acked": 400},
     }
 
     def run(self, ctx, result):
@@ -332,6 +345,8 @@ class S40(Scenario):
         acked_lock = threading.Lock()
         next_id = [0]
         id_lock = threading.Lock()
+        insert_failures = [0]      # outage-induced insert exceptions — must be > 0 or the fault never bit
+        fault_errors = []          # exceptions from the fault thread — must be empty or the run is vacuous
         stop_at = time.time() + float(p["insert_window_s"])
 
         def writer():
@@ -352,21 +367,29 @@ class S40(Scenario):
                             acked.add(i)
                         break
                     except Exception:
+                        with acked_lock:
+                            insert_failures[0] += 1
                         time.sleep(1.5)
 
         def faults():
-            time.sleep(8)
-            ctx.log("S40: PAUSE rustfs")
-            _dock("pause", "ca-soak-rustfs1-1")
-            time.sleep(float(p["kill_after_s"]) - 8)
-            ctx.log("S40: KILL ch2")
-            _dock("kill", "ca-soak-ch2-1")
-            time.sleep(float(p["ch2_down_s"]))
-            ctx.log("S40: START ch2")
-            _dock("start", "ca-soak-ch2-1")
-            time.sleep(float(p["pause_s"]) - float(p["kill_after_s"]) - float(p["ch2_down_s"]))
-            ctx.log("S40: UNPAUSE rustfs")
-            _dock("unpause", "ca-soak-rustfs1-1")
+            try:
+                time.sleep(8)
+                ctx.log("S40: PAUSE rustfs")
+                _dock("pause", "ca-soak-rustfs1-1")
+                time.sleep(float(p["kill_after_s"]) - 8)
+                ctx.log("S40: KILL ch2")
+                _dock("kill", "ca-soak-ch2-1")
+                time.sleep(float(p["ch2_down_s"]))
+                ctx.log("S40: START ch2")
+                _dock("start", "ca-soak-ch2-1")
+                time.sleep(float(p["pause_s"]) - float(p["kill_after_s"]) - float(p["ch2_down_s"]))
+                ctx.log("S40: UNPAUSE rustfs")
+                _dock("unpause", "ca-soak-rustfs1-1")
+            except Exception as e:   # propagate to a gating verdict — a failed fault = no test
+                fault_errors.append(str(e))
+                # Best-effort un-fault so the cluster is not left paused/down for the next scenario.
+                subprocess.run(["docker", "unpause", "ca-soak-rustfs1-1"], capture_output=True)
+                subprocess.run(["docker", "start", "ca-soak-ch2-1"], capture_output=True)
 
         ft = threading.Thread(target=faults, daemon=True)
         ft.start()
@@ -391,8 +414,25 @@ class S40(Scenario):
             f"SELECT id FROM {_TABLE} ORDER BY id").split())
         lost = sorted(acked - present)
         ctx.write_json("s40_acked_vs_present.json",
-                       {"acked": len(acked), "present": len(present), "lost": lost[:100]})
+                       {"acked": len(acked), "present": len(present), "lost": lost[:100],
+                        "insert_failures": insert_failures[0], "fault_errors": fault_errors})
 
+        # Anti-vacuity gates: the run only means something if the fault schedule really executed,
+        # the outage really disturbed inserts, and a meaningful number of inserts were acked.
+        result.add(Verdict.check(
+            "fault schedule executed", "no docker/fault-thread errors",
+            "; ".join(fault_errors) if fault_errors else "clean", not fault_errors,
+            "a wrong container name or docker failure must fail the run, not skip the fault"))
+        result.add(Verdict.check(
+            "outage disturbed inserts", "insert_failures > 0",
+            f"insert_failures={insert_failures[0]}", insert_failures[0] > 0,
+            "zero failed inserts across a 105s S3 pause + replica kill means the fault never bit"))
+        result.add(Verdict.check(
+            "meaningful acked volume", f"acked >= {int(p['min_acked'])}",
+            f"acked={len(acked)}", len(acked) >= int(p["min_acked"]),
+            "too few acked inserts -> the primary verdict would be vacuous"))
+
+        # PRIMARY verdict — the data-loss gate.
         result.add(Verdict.check(
             "every acked insert is present", "lost == 0",
             f"acked={len(acked)} present={len(present)} lost={len(lost)} (ids {lost[:10]}...)" if lost
@@ -400,24 +440,24 @@ class S40(Scenario):
             not lost,
             "an acked-but-absent id = the dedup-phantom data loss (report 2026-07-17)"))
 
-        # The smoking-gun log line must not fire for parts that do not exist.
+        # OBSERVATION ONLY (non-gating): count the cross-replica dedup log lines. A retry can
+        # legitimately deduplicate against a REAL part (a 100s client timeout on an insert that
+        # then commits durably), so a bare count cannot distinguish phantom from legitimate dedup
+        # — the PRIMARY verdict above is what detects phantoms (a phantom dedup implies a lost id).
         for n in ctx.cluster.nodes():
             try:
                 n.query("SYSTEM FLUSH LOGS", timeout=60)
             except Exception:
                 pass
         since = ctx.extra["since_event_time"]
-        ghost_dedups = node.scalar(
+        dedup_lines = node.scalar(
             f"SELECT count() FROM system.text_log "
             f"WHERE event_time >= '{since}' "
             f"AND message LIKE '%already exists on other replicas as part%'")
-        result.add(Verdict.check(
-            "no cross-replica dedup against a phantom part", "0 ghost dedups",
-            f"text_log ghost-dedup lines: {ghost_dedups}", int(ghost_dedups) == 0,
-            "with the fix no block_id can outlive a failed disk commit, so this line "
-            "can only fire for parts that really exist on a replica; any hit needs triage"))
+        ctx.log(f"S40 observation: cross-replica dedup lines = {dedup_lines} (non-gating)")
+        ctx.write_json("s40_dedup_lines.json", {"dedup_lines": int(dedup_lines)})
 
-        _common.standard_end(ctx, result, [_TABLE])
+        _common.standard_end(ctx, result, [_TABLE], expect_exception=True)
 ```
 
 - [ ] **Step 3: Register the card**
@@ -435,7 +475,7 @@ cd /home/mfilimonov/workspace/ClickHouse/master/utils/ca-soak
 python3 -m scenarios.run --scenario S40 --scale ci --seed 1 > ../../build/test_s40_run.log 2>&1
 ```
 
-Analyze `build/test_s40_run.log` with a subagent. Expected: **pass** — `lost=0`, ghost-dedup verdict green (or, if the line fires for a part that exists, adjust the second verdict's query to exclude parts present in `system.parts` and re-run; the primary verdict is `lost == 0`). If `lost > 0`: STOP — the fix does not close the reproduction; return to the spec with the S40 artifacts.
+Analyze `build/test_s40_run.log` with a subagent. Expected: **pass** — all three anti-vacuity verdicts green (`fault schedule executed`, `insert_failures > 0`, `acked >= min_acked`) and the primary verdict `lost == 0`. The dedup-line count is a logged observation, not a gate. If `lost > 0`: STOP — the fix does not close the reproduction; return to the spec with the S40 artifacts. If an anti-vacuity verdict fails: fix the harness issue (container name, insert path) and re-run — the run proved nothing yet.
 
 - [ ] **Step 5: Commit**
 
@@ -446,18 +486,27 @@ git commit -m "cas: S40 scenario — acked-then-lost INSERT gate (S3 outage + re
 
 ---
 
-### Task 4: Validation gates on the fixed binary
+### Task 4: Validation gates on the fixed binary {#task-4-validation-gates}
 
 **Files:** none created (logs only, under `build/`).
 
 **Interfaces:**
 - Consumes: fixed binary + recycled cluster from Task 3.
 
-- [ ] **Step 1: dl_probe rerun (the original reproduction)**
+- [ ] **Step 1: Track the original reproducer, then rerun it**
+
+`build/` is git-ignored, so the reproducer the spec cites (`build/dl_probe.py`) is untracked and
+the gate would not be reproducible from a clean checkout. Move it into the tracked tools area
+first (S40 is the permanent scenario gate; the tracked script is the raw original reproducer,
+kept for forensics and manual reruns):
 
 ```bash
 cd /home/mfilimonov/workspace/ClickHouse/master
-python3 build/dl_probe.py > build/test_dl_probe_postfix.log 2>&1
+mkdir -p utils/ca-soak/tools
+cp build/dl_probe.py utils/ca-soak/tools/dl_probe.py
+git add utils/ca-soak/tools/dl_probe.py
+git commit -m "cas: track the acked-then-lost reproducer (dl_probe) in utils/ca-soak/tools"
+python3 utils/ca-soak/tools/dl_probe.py > build/test_dl_probe_postfix.log 2>&1
 ```
 
 Analyze with a subagent. Expected: `LOST(acked-but-absent)=0` (pre-fix: ~198/1314). Non-zero → STOP, same rule as S40 Step 4.
@@ -499,7 +548,7 @@ git commit -m "cas: validation gates for the renameParts durability fix (dl_prob
 
 ---
 
-### Task 5: Bookkeeping + upstream submission prep
+### Task 5: Bookkeeping + upstream submission prep {#task-5-bookkeeping-upstream}
 
 **Files:**
 - Modify: `docs/superpowers/cas/BACKLOG.md` (the `*** CRITICAL` entry)

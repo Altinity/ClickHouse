@@ -203,9 +203,12 @@ data loss.
    `SELECT count()`. Before the fix: the failpoint fires after the multi → the retry falsely
    dedups → 0 rows. After: the failpoint fires in `renameParts`, before the multi → the retry
    inserts → 1 row.
-2. **CA integration scenario S40** built from `build/dl_probe.py` (rustfs pause past the write
-   budget + replica kill under continuous sync inserts; verdicts: acked == present, fsck clean,
-   no `"already exists on other replicas"` for absent parts).
+2. **CA integration scenario S40** built from the dl_probe reproducer (tracked at
+   `utils/ca-soak/tools/dl_probe.py` by the plan; `build/` is git-ignored): rustfs pause past the
+   write budget + replica kill under continuous sync inserts. Gating verdicts: fault schedule
+   executed, outage disturbed inserts, meaningful acked volume, and acked == present (the
+   data-loss gate); the cross-replica dedup-line count is a non-gating observation, because a
+   client-timeout-then-commit makes some dedups legitimate. Plus fsck clean at quiescence.
 3. **Existing gates**: `Ca*` gtest battery unchanged (CA-layer publish semantics did not move —
    only the caller of `commitTransaction` did); S39 (#37 fence tolerance) green; S36/S37 green;
    20-minute soak with the checkpoint row-count oracle.
