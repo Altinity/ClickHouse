@@ -213,10 +213,31 @@ class S39(Scenario):
                 "no-visibility defect may have resurfaced"))
 
         # Post-recovery: a fresh write must succeed once the fault clears and the self-remount lands.
-        sql.insert_random(node, _TABLE, rows=rows // 4, payload_bytes=payload, op_id=4 * rows)
-        final_count = node.scalar(f"SELECT count() FROM {_TABLE}")
-        result.add(Verdict.check("post-recovery INSERT succeeds and is visible", "> 0", f"{final_count}",
-                                  int(final_count or 0) > 0))
+        # Recovery is ASYNCHRONOUS -- self-remount (~16s per the #37 spec) plus the replication-queue
+        # backoff -- and under load it routinely exceeds `settle_s`, so a single bare INSERT here is
+        # flaky: it throws the (correct, expected) retry-later NETWORK_ERROR while recovery is still in
+        # flight and crashes the leg. POLL instead: retry the write until it lands within a generous
+        # budget. A retry-later NETWORK_ERROR means "not recovered yet", NOT a failure; the verdict is
+        # the whole point of #37 -- writes RESUME after the fault clears, they are not permanently wedged.
+        recovered = False
+        last_err = ""
+        recover_deadline = time.monotonic() + 90
+        while time.monotonic() < recover_deadline:
+            try:
+                sql.insert_random(node, _TABLE, rows=rows // 4, payload_bytes=payload, op_id=4 * rows,
+                                  timeout=30)
+                recovered = True
+                break
+            except Exception as e:
+                last_err = str(e)
+                time.sleep(3)
+        final_count = node.scalar(f"SELECT count() FROM {_TABLE}") if recovered else "0"
+        result.add(Verdict.check(
+            "post-recovery INSERT succeeds within the recovery budget (writes resume, not wedged)",
+            "an INSERT lands within 90s of the fault clearing", f"recovered={recovered} count={final_count}",
+            recovered and int(final_count or 0) > 0,
+            "" if recovered else f"no write succeeded within 90s after the fault cleared -- self-remount "
+                                 f"recovery did not resume writes (last error: {last_err[:200]})"))
 
         _common.assert_replicas_agree(result, cl, sql.table_checksum_query(_TABLE),
                                       name="S39 replica agreement")
