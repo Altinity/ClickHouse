@@ -2,9 +2,11 @@
 #include <Backups/BackupEntryFromImmutableFile.h>
 #include <Backups/BackupEntryWrappedWith.h>
 #include <Backups/BackupSettings.h>
+#include <Core/Defines.h>
 #include <Disks/IDiskTransaction.h>
 #include <Disks/SingleDiskVolume.h>
 #include <Disks/TemporaryFileOnDisk.h>
+#include <IO/copyData.h>
 #include <IO/ReadBufferFromFileBase.h>
 #include <IO/ReadBufferFromString.h>
 #include <IO/ReadPipeline.h>
@@ -652,6 +654,51 @@ MutableDataPartStoragePtr DataPartStorageOnDiskBase::freezeRemote(
     return create(single_disk_volume, to, dir_path, /*initialize=*/ !to_detached && !params.external_transaction);
 }
 
+namespace
+{
+
+/// Recursively copy every file under `source_path` on `src_disk` into `destination_path` through
+/// `dst_transaction`'s NON-autocommit `writeFile` (IDiskTransaction::writeFile, NOT
+/// writeFileWithAutoCommit) -- the same primitive `freeze` already uses for a single file (the
+/// metadata_version.txt write, DataPartStorageOnDiskBase::freeze). Cross-disk, so it cannot reuse
+/// Backup()/BackupImpl: that helper's transactional branch calls transaction->copyFile, which is
+/// SAME-disk only (DiskObjectStorageTransaction::copyFile throws NOT_IMPLEMENTED across disks on
+/// CA), and its non-transactional branch always autocommits per file via IDisk::copyFile /
+/// copyDirectoryContent. Sequential, not the parallel copyThroughBuffers thread pool: a
+/// content-addressed transaction batches every file into ONE eventual manifest, and its staging
+/// map is not mutex-guarded; MOVE is a background, latency-insensitive operation, so
+/// parallelizing this is a deferred optimization, not a correctness requirement.
+void copyDirectoryContentIntoTransaction(
+    IDisk & src_disk,
+    const String & source_path,
+    IDiskTransaction & dst_transaction,
+    const String & destination_path,
+    const ReadSettings & read_settings,
+    const WriteSettings & write_settings,
+    const std::function<void()> & cancellation_hook)
+{
+    dst_transaction.createDirectories(destination_path);
+    for (auto it = src_disk.iterateDirectory(source_path); it->isValid(); it->next())
+    {
+        auto source = it->path();
+        auto destination = fs::path(destination_path) / it->name();
+
+        if (src_disk.existsDirectory(source))
+        {
+            copyDirectoryContentIntoTransaction(
+                src_disk, source, dst_transaction, destination, read_settings, write_settings, cancellation_hook);
+            continue;
+        }
+
+        auto in = src_disk.readFile(source, read_settings);
+        auto out = dst_transaction.writeFile(destination, DBMS_DEFAULT_BUFFER_SIZE, WriteMode::Rewrite, write_settings);
+        copyData(*in, *out, cancellation_hook);
+        out->finalize();
+    }
+}
+
+}
+
 MutableDataPartStoragePtr DataPartStorageOnDiskBase::clonePart(
     const std::string & to,
     const std::string & dir_path,
@@ -671,18 +718,46 @@ MutableDataPartStoragePtr DataPartStorageOnDiskBase::clonePart(
                         dir_path, getRelativePath(), path_to_clone, fullPath(dst_disk, path_to_clone));
     }
 
-    try
+    if (dst_disk->isContentAddressed())
     {
-        dst_disk->createDirectories(to);
-        src_disk->copyDirectoryContent(getRelativePath(), dst_disk, path_to_clone, read_settings, write_settings, cancellation_hook);
+        /// L2 (MOVE-to-CA fix): a content-addressed disk models a part as ONE atomic unit (N
+        /// files -> one manifest -> one ref). The generic per-file autocommit path below would
+        /// publish a separate one-file ref per file -- colliding on the shared "moving" ref
+        /// before L1, and throwing NOT_IMPLEMENTED on a non-first content file even after L1
+        /// ("Autocommit writes are not supported for content part files"). Run the whole clone
+        /// through ONE self-created disk transaction instead, mirroring freeze's
+        /// owned_transaction shape -- but streaming cross-disk bytes, since freeze's Backup() is
+        /// same-disk hardlink/copyFile (throws NOT_IMPLEMENTED for CA cross-disk).
+        auto clone_transaction = dst_disk->createTransaction();
+        try
+        {
+            copyDirectoryContentIntoTransaction(
+                *src_disk, getRelativePath(), *clone_transaction, path_to_clone,
+                read_settings, write_settings, cancellation_hook);
+            clone_transaction->commit();
+        }
+        catch (...)
+        {
+            LOG_WARNING(log, "Rolling back transaction after failed attempt to move a data part to {}", path_to_clone);
+            clone_transaction->undo();
+            throw;
+        }
     }
-    catch (...)
+    else
     {
-        /// It's safe to remove it recursively (even with zero-copy-replication)
-        /// because we've just did full copy through copyDirectoryContent
-        LOG_WARNING(log, "Removing directory {} after failed attempt to move a data part", path_to_clone);
-        dst_disk->removeRecursive(path_to_clone);
-        throw;
+        try
+        {
+            dst_disk->createDirectories(to);
+            src_disk->copyDirectoryContent(getRelativePath(), dst_disk, path_to_clone, read_settings, write_settings, cancellation_hook);
+        }
+        catch (...)
+        {
+            /// It's safe to remove it recursively (even with zero-copy-replication)
+            /// because we've just did full copy through copyDirectoryContent
+            LOG_WARNING(log, "Removing directory {} after failed attempt to move a data part", path_to_clone);
+            dst_disk->removeRecursive(path_to_clone);
+            throw;
+        }
     }
 
     auto single_disk_volume = std::make_shared<SingleDiskVolume>(dst_disk->getName(), dst_disk, 0);
