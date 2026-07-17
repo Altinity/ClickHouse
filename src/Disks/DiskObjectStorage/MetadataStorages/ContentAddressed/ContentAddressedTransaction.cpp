@@ -1174,9 +1174,12 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
 
             /// [TXN-ONE-PIPELINE]: a freshly-written part finalized tmp->final is re-keyed in the
             /// overlay above (entries/marks/pending blobs/build moved src->dst). The durable publish
-            /// happens only in commit() (the existing publishStaging loop), NOT here — renameParts()
-            /// no longer publishes off the data_parts lock. No early-published ref to compensate on
-            /// abort (see ~ContentAddressedTransaction).
+            /// happens only in this transaction's commit (the existing publishStaging loop), NOT in
+            /// this method. Since the part-durability fix (spec
+            /// 2026-07-17-part-durability-before-keeper-commit-design.md), MergeTree calls that
+            /// commit from Transaction::renameParts — still off the data_parts lock, and BEFORE the
+            /// Keeper multi. No early-published ref to compensate on abort within this method
+            /// (see ~ContentAddressedTransaction).
         }
 
         if (had_staged_source)
