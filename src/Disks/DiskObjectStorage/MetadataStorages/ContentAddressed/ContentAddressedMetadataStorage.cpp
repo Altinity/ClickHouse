@@ -40,6 +40,7 @@ namespace ErrorCodes
     extern const int READONLY;
     extern const int BAD_ARGUMENTS;
     extern const int ABORTED;
+    extern const int NETWORK_ERROR;
 }
 
 namespace
@@ -1305,8 +1306,9 @@ bool ContentAddressedMetadataStorage::adoptPartFromManifest(
     /// via the durable manifest edge (no per-file HEAD/loadMeta probe); a genuinely-absent adopted blob is
     /// an invariant violation caught by fsck, not here — the D4 relink trust model (ordinary
     /// ReplicatedMergeTree interserver trust). A retryable promote failure (a body-absent precommit, a
-    /// precommit that is no longer the live owner, or a ref conflict => ABORTED), a manifest decode
-    /// failure, or any other error returns false, publishing NOTHING, so the caller byte-fetches instead.
+    /// precommit that is no longer the live owner, or a ref conflict => `ABORTED` or `NETWORK_ERROR`, the
+    /// retry-later class), a manifest decode failure, or any other error returns false, publishing NOTHING,
+    /// so the caller byte-fetches instead.
 
     Cas::PartManifest decoded;
     try
@@ -1346,13 +1348,15 @@ bool ContentAddressedMetadataStorage::adoptPartFromManifest(
     }
     catch (const Exception & e)
     {
-        /// ABORTED = a body-absent precommit, a precommit binding that is no longer the live owner, or a
-        /// ref conflict: retryable, the caller byte-fetches. §4 manifest-trust: promote no longer probes
-        /// the adopted pool blobs, so an absent/condemned blob no longer surfaces here — that invariant
-        /// violation is a fsck finding (D4 relink trust), not a relink abort. Any other exception: fail
-        /// SAFE to a byte fetch too (publish nothing), but log it as it is not the expected retryable path.
-        if (e.code() == ErrorCodes::ABORTED)
-            LOG_INFO(getLogger("ContentAddressedMetadataStorage"), "Relink of part {} aborted (body-absent precommit, "
+        /// `ABORTED` or `NETWORK_ERROR` = a body-absent precommit, a precommit binding that is no longer
+        /// the live owner, or a ref conflict: retryable, the caller byte-fetches. (The retry-later class
+        /// was rerouted from `ABORTED` to `NETWORK_ERROR` so the merge backoff engages; both are still the
+        /// expected path here.) §4 manifest-trust: promote no longer probes the adopted pool blobs, so an
+        /// absent/condemned blob no longer surfaces here — that invariant violation is a fsck finding (D4
+        /// relink trust), not a relink abort. Any other exception: fail SAFE to a byte fetch too (publish
+        /// nothing), but log it as it is not the expected retryable path.
+        if (e.code() == ErrorCodes::ABORTED || e.code() == ErrorCodes::NETWORK_ERROR)
+            LOG_INFO(getLogger("ContentAddressedMetadataStorage"), "Relink of part {} deferred (body-absent precommit, "
                 "precommit not the live owner, or a ref conflict): {}; caller falls back to a byte fetch", part_name, e.message());
         else
             LOG_WARNING(getLogger("ContentAddressedMetadataStorage"), "Relink of part {} failed with an unexpected error: {}; caller falls back to a "
