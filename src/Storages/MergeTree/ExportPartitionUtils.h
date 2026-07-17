@@ -8,6 +8,7 @@
 #include <Common/ZooKeeper/ZooKeeper.h>
 #include "Storages/IStorage.h"
 #include <Storages/StorageInMemoryMetadata.h>
+#include <Storages/MergeTree/MergeTreeData.h>
 #include <config.h>
 
 #if USE_AVRO
@@ -100,12 +101,20 @@ namespace ExportPartitionUtils
         const ContextPtr & context);
 
 #if USE_AVRO
-    /// Verifies the source MergeTree partition key matches the destination Iceberg
-    /// partition spec (source-ids and transforms in order). Throws BAD_ARGUMENTS on
-    /// mismatch.
+    /// Verifies the source MergeTree partition key is compatible with the destination Iceberg
+    /// partition spec: every destination partition field must be single-valued across the exported
+    /// source partition (which the commit path requires - it writes one partition tuple per export).
+    /// A field is proven either structurally (the source key already applies the matching transform
+    /// on that column) or dynamically, by checking the destination transform is constant over the
+    /// partition's actual [min, max] folded across `parts`. `bucket` is non-monotonic and can only be
+    /// matched structurally. Throws BAD_ARGUMENTS when a field cannot be proven.
     void verifyIcebergPartitionCompatibility(
         const Poco::JSON::Object::Ptr & metadata_object,
-        const ASTPtr & partition_key_ast);
+        const StorageMetadataPtr & source_metadata,
+        const StorageMetadataPtr & destination_metadata,
+        const MergeTreeData::DataPartsVector & parts,
+        const String & partition_id,
+        const ContextPtr & context);
 #endif
 }
 

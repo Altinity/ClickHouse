@@ -770,21 +770,25 @@ def test_partition_transform_compatibility_accepted(cluster):
 
 def test_partition_transform_compatibility_rejected(cluster):
     """
-    Verify that mismatched partition specs are rejected with BAD_ARGUMENTS.
+    Verify that partition specs that cannot be exported are rejected with BAD_ARGUMENTS.
+
+    Acceptance is data-dependent: a source partition must map to a single Iceberg partition. The
+    mismatch cases below therefore use data that makes the source partition span several
+    destination partitions (a single-row partition would be trivially single-valued and accepted).
 
     Cases covered:
-    1. Compound field order reversed: MergeTree (year, region) vs Iceberg (region, year)
-    2. Transform mismatch on same column: year-transform vs identity
-    3. Bucket count mismatch: bucket[8] vs bucket[16]
-    4. Truncate width mismatch: truncate[4] vs truncate[8]
-    5. Field-count mismatch: 2-field MergeTree vs 1-field Iceberg
-    6. Unsupported MergeTree expression (intDiv — not an Iceberg transform)
+    1. Transform mismatch on the same column: year-transform source vs identity destination, where
+       the year partition contains several distinct dates.
+    2. Bucket count mismatch: bucket[8] vs bucket[16] (bucket is non-monotonic, always structural).
+    3. Truncate width mismatch: truncate[4] source vs truncate[8] destination, with values sharing
+       the 4-char prefix but differing within the first 8 chars.
+    4. Unsupported MergeTree expression (intDiv) vs identity, with one bucket spanning several years.
+    5. Destination partitions by a column that is not in the source partition key.
     """
     node = cluster.instances["replica1"]
     uid = unique_suffix()
 
     def assert_rejected(mt, iceberg, description):
-        # The compatibility check fires synchronously; any partition ID works here.
         pid = first_partition_id(node, mt)
         error = node.query_and_get_error(
             f"ALTER TABLE {mt} EXPORT PARTITION ID '{pid}' TO TABLE {iceberg}",
@@ -794,53 +798,45 @@ def test_partition_transform_compatibility_rejected(cluster):
             f"[{description}] Expected BAD_ARGUMENTS, got: {error!r}"
         )
 
-    # 1. Compound field order reversed
-    cols = "id Int64, year Int32, region String"
-    t = f"mt_rej_1_{uid}"; i = f"iceberg_rej_1_{uid}"
-    make_rmt(node, t, cols, "(year, region)")
-    node.query(f"INSERT INTO {t} VALUES (1, 2020, 'EU')")
-    make_iceberg_s3(node, i, cols, "(region, year)")
-    assert_rejected(t, i, "compound field order reversed")
-
-    # 2. Transform mismatch: MergeTree year-transform, Iceberg identity on same Date col
+    # 1. year-transform source vs identity destination: a year partition holds several dates.
     cols = "id Int64, event_date Date"
-    t = f"mt_rej_2_{uid}"; i = f"iceberg_rej_2_{uid}"
+    t = f"mt_rej_1_{uid}"; i = f"iceberg_rej_1_{uid}"
     make_rmt(node, t, cols, "toYearNumSinceEpoch(event_date)")
-    node.query(f"INSERT INTO {t} VALUES (1, '2020-01-01')")
+    node.query(f"INSERT INTO {t} VALUES (1, '2020-01-01'), (2, '2020-12-31')")
     make_iceberg_s3(node, i, cols, "event_date")   # identity, not year-transform
-    assert_rejected(t, i, "year-transform vs identity on same column")
+    assert_rejected(t, i, "year-transform source vs identity destination")
 
-    # 3. Bucket count mismatch: bucket[8] vs bucket[16]
+    # 2. Bucket count mismatch: bucket[8] vs bucket[16]
     cols = "id Int64, user_id Int64"
-    t = f"mt_rej_3_{uid}"; i = f"iceberg_rej_3_{uid}"
+    t = f"mt_rej_2_{uid}"; i = f"iceberg_rej_2_{uid}"
     make_rmt(node, t, cols, "icebergBucket(8, user_id)")
     node.query(f"INSERT INTO {t} VALUES (1, 42)")
     make_iceberg_s3(node, i, cols, "icebergBucket(16, user_id)")
     assert_rejected(t, i, "bucket[8] vs bucket[16]")
 
-    # 4. Truncate width mismatch: truncate[4] vs truncate[8]
+    # 3. Truncate width mismatch: values share the 4-char prefix but differ within 8 chars.
     cols = "id Int64, category String"
-    t = f"mt_rej_4_{uid}"; i = f"iceberg_rej_4_{uid}"
+    t = f"mt_rej_3_{uid}"; i = f"iceberg_rej_3_{uid}"
     make_rmt(node, t, cols, "icebergTruncate(4, category)")
-    node.query(f"INSERT INTO {t} VALUES (1, 'clickhouse')")
+    node.query(f"INSERT INTO {t} VALUES (1, 'clickhouse'), (2, 'clickfmt')")
     make_iceberg_s3(node, i, cols, "icebergTruncate(8, category)")
-    assert_rejected(t, i, "truncate[4] vs truncate[8]")
+    assert_rejected(t, i, "truncate[4] source vs truncate[8] destination")
 
-    # 5. Field-count mismatch: MergeTree has 2 fields, Iceberg has 1
-    cols = "id Int64, year Int32, region String"
-    t = f"mt_rej_5_{uid}"; i = f"iceberg_rej_5_{uid}"
-    make_rmt(node, t, cols, "(year, region)")
-    node.query(f"INSERT INTO {t} VALUES (1, 2020, 'EU')")
-    make_iceberg_s3(node, i, cols, "year")
-    assert_rejected(t, i, "2-field MergeTree vs 1-field Iceberg")
-
-    # 6. Unsupported MergeTree expression: intDiv(year, 100) is not an Iceberg transform
+    # 4. Unsupported MergeTree expression vs identity: one intDiv bucket spans several years.
     cols = "id Int64, year Int32"
-    t = f"mt_rej_6_{uid}"; i = f"iceberg_rej_6_{uid}"
+    t = f"mt_rej_4_{uid}"; i = f"iceberg_rej_4_{uid}"
     make_rmt(node, t, cols, "intDiv(year, 100)")
-    node.query(f"INSERT INTO {t} VALUES (1, 2020)")
+    node.query(f"INSERT INTO {t} VALUES (1, 2000), (2, 2099)")
     make_iceberg_s3(node, i, cols, "year")
-    assert_rejected(t, i, "unsupported MergeTree expression intDiv")
+    assert_rejected(t, i, "intDiv source vs identity destination")
+
+    # 5. Destination partitions by a column absent from the source partition key.
+    cols = "id Int64, year Int32"
+    t = f"mt_rej_5_{uid}"; i = f"iceberg_rej_5_{uid}"
+    make_rmt(node, t, cols, "year")
+    node.query(f"INSERT INTO {t} VALUES (1, 2020)")
+    make_iceberg_s3(node, i, cols, "id")   # identity on id, which the source does not partition by
+    assert_rejected(t, i, "destination partitions by a non-source-key column")
 
 
 def test_partition_key_compatibility_check(cluster):
@@ -926,6 +922,179 @@ def test_partition_key_compatibility_check(cluster):
         f"ALTER TABLE {mt_table} EXPORT PARTITION ID '2020' TO TABLE {iceberg_match}",
         settings={"allow_insert_into_iceberg": 1},
     )
+
+
+def test_partition_transform_equivalence_gate(cluster):
+    """
+    The Iceberg partition-compatibility gate accepts a source partition key whose transform is
+    equivalent to (or finer than) the destination Iceberg transform when the exported partition is
+    provably single-valued for every destination field, and rejects it otherwise. The gate runs
+    synchronously at EXPORT time: acceptance means the ALTER does not throw, rejection means it
+    throws BAD_ARGUMENTS.
+    """
+    node = cluster.instances["replica1"]
+    settings = {"allow_insert_into_iceberg": 1}
+
+    def run_case(name, columns, source_key, dest_key, rows, *, expect_ok):
+        uid = unique_suffix()
+        mt_table = f"mt_{name}_{uid}"
+        iceberg_table = f"iceberg_{name}_{uid}"
+        make_rmt(node, mt_table, columns, source_key, replica_name="replica1")
+        node.query(f"INSERT INTO {mt_table} VALUES {rows}")
+        make_iceberg_s3(node, iceberg_table, columns, partition_by=dest_key)
+        pid = first_partition_id(node, mt_table)
+        statement = f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{pid}' TO TABLE {iceberg_table}"
+        if expect_ok:
+            node.query(statement, settings=settings)
+        else:
+            error = node.query_and_get_error(statement, settings=settings)
+            assert "BAD_ARGUMENTS" in error, f"{name}: expected BAD_ARGUMENTS, got: {error!r}"
+
+    dt = "id Int64, event_time DateTime"
+
+    # toDate -> day: rows within one day map to a single Iceberg day partition.
+    run_case("todate_day", dt, "toDate(event_time)", "toRelativeDayNum(event_time)",
+             "(1, '2024-03-05 01:00:00'), (2, '2024-03-05 20:00:00')", expect_ok=True)
+
+    # toYYYYMM -> month: different days of the same month map to a single month partition.
+    run_case("toyyyymm_month", dt, "toYYYYMM(event_time)", "toMonthNumSinceEpoch(event_time)",
+             "(1, '2024-03-01 00:00:00'), (2, '2024-03-20 00:00:00')", expect_ok=True)
+
+    # toStartOfHour -> hour.
+    run_case("startofhour_hour", dt, "toStartOfHour(event_time)", "toRelativeHourNum(event_time)",
+             "(1, '2024-03-05 12:00:00'), (2, '2024-03-05 12:59:00')", expect_ok=True)
+
+    # Finer source (day + country) into a day-partitioned destination: the extra column is allowed.
+    run_case("finer_day", "id Int64, event_time DateTime, country String",
+             "(toDate(event_time), country)", "toRelativeDayNum(event_time)",
+             "(1, '2024-03-05 01:00:00', 'US'), (2, '2024-03-05 20:00:00', 'US')", expect_ok=True)
+
+    # Compound field order reversed: matching is by column, so (year, region) into (region, year)
+    # is accepted - the destination spec defines the written tuple order.
+    run_case("reversed_order", "id Int64, year Int32, region String",
+             "(year, region)", "(region, year)", "(1, 2020, 'EU')", expect_ok=True)
+
+    # Superset source: a (year, region) source into a year-only destination is finer, so accepted.
+    run_case("superset", "id Int64, year Int32, region String",
+             "(year, region)", "year", "(1, 2020, 'EU')", expect_ok=True)
+
+    # Coarser source: a month partition spans several days, so it cannot map to one day partition.
+    run_case("coarser_day", dt, "toYYYYMM(event_time)", "toRelativeDayNum(event_time)",
+             "(1, '2024-03-01 00:00:00'), (2, '2024-03-20 00:00:00')", expect_ok=False)
+
+    # bucket is non-monotonic: an identity source cannot satisfy a bucket destination via min/max.
+    run_case("bucket_needs_structural", "id Int64, k Int64", "k", "icebergBucket(8, k)",
+             "(1, 10), (2, 10)", expect_ok=False)
+
+
+def test_export_partition_todate_source_matches_day_metadata(cluster):
+    """
+    End-to-end: a source partitioned by toDate(event_time) exports into a day-partitioned Iceberg
+    table through the min/max refinement, and the day value written to the Iceberg metadata matches
+    the exported data.
+    """
+    node = cluster.instances["replica1"]
+
+    uid = unique_suffix()
+    mt_table = f"mt_todate_{uid}"
+    iceberg_table = f"iceberg_todate_{uid}"
+
+    make_rmt(node, mt_table, "id Int64, event_time DateTime", "toDate(event_time)",
+             replica_name="replica1")
+    node.query(
+        f"INSERT INTO {mt_table} VALUES "
+        f"(1, '2024-03-05 01:00:00'), (2, '2024-03-05 12:00:00'), (3, '2024-03-05 23:00:00')"
+    )
+    make_iceberg_s3(node, iceberg_table, "id Int64, event_time DateTime",
+                    partition_by="toRelativeDayNum(event_time)")
+
+    pid = first_partition_id(node, mt_table)
+    node.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{pid}' TO TABLE {iceberg_table}",
+        settings={"allow_insert_into_iceberg": 1},
+    )
+    wait_for_export_status(node, mt_table, iceberg_table, pid, "COMPLETED")
+
+    count = int(node.query(f"SELECT count() FROM {iceberg_table}").strip())
+    assert count == 3, f"Expected 3 rows after export, got {count}"
+
+    expected_day = int(node.query(
+        f"SELECT DISTINCT toRelativeDayNum(event_time) FROM {iceberg_table}"
+    ).strip())
+
+    query_id = f"todate_{uid}"
+    node.query(
+        f"SELECT * FROM {iceberg_table}",
+        query_id=query_id,
+        settings={"iceberg_metadata_log_level": "manifest_file_entry"},
+    )
+    entries = fetch_manifest_entries(node, query_id)
+    partitions = _data_file_partition_records(entries)
+    assert partitions, "No data-file partition records found in manifest entries"
+    meta_days = {int(_partition_scalar(p, "event_time")) for p in partitions}
+    assert meta_days == {expected_day}, (
+        f"Metadata day {meta_days} must equal toRelativeDayNum {expected_day}."
+    )
+
+
+def test_export_partition_timezone_literal_partition_key(cluster):
+    """
+    A timezone argument in the partition key (toRelativeDayNum(event_time, 'UTC')) must not break
+    Iceberg table creation or the export compatibility gate; previously it threw a `Bad get`.
+    """
+    node = cluster.instances["replica1"]
+
+    uid = unique_suffix()
+    mt_table = f"mt_tz_{uid}"
+    iceberg_table = f"iceberg_tz_{uid}"
+
+    make_rmt(node, mt_table, "id Int64, event_time DateTime", "toRelativeDayNum(event_time, 'UTC')",
+             replica_name="replica1")
+    node.query(
+        f"INSERT INTO {mt_table} VALUES (1, '2024-03-05 01:00:00'), (2, '2024-03-05 23:00:00')"
+    )
+    # Creating the destination with the same timezone-qualified key exercises the getPartitionField fix.
+    make_iceberg_s3(node, iceberg_table, "id Int64, event_time DateTime",
+                    partition_by="toRelativeDayNum(event_time, 'UTC')")
+
+    pid = first_partition_id(node, mt_table)
+    node.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{pid}' TO TABLE {iceberg_table}",
+        settings={"allow_insert_into_iceberg": 1},
+    )
+    wait_for_export_status(node, mt_table, iceberg_table, pid, "COMPLETED")
+    assert int(node.query(f"SELECT count() FROM {iceberg_table}").strip()) == 2
+
+
+def test_export_partition_lossy_cast_dynamic_accept(cluster):
+    """
+    A lossy Int64 -> Int32 partition-column cast is accepted by the dynamic proof when the
+    partition's values fit the destination type and map to a single Iceberg bucket. Source and
+    destination use different truncate widths, so the field is proven via min/max rather than a
+    structural match.
+    """
+    node = cluster.instances["replica1"]
+
+    uid = unique_suffix()
+    mt_table = f"mt_lossy_{uid}"
+    iceberg_table = f"iceberg_lossy_{uid}"
+
+    make_rmt(node, mt_table, "id Int64, val Int64", "icebergTruncate(10, val)",
+             replica_name="replica1")
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 100), (2, 109)")
+    make_iceberg_s3(node, iceberg_table, "id Int64, val Int32",
+                    partition_by="icebergTruncate(1000000, val)")
+
+    pid = first_partition_id(node, mt_table)
+    node.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{pid}' TO TABLE {iceberg_table}",
+        settings={
+            "allow_insert_into_iceberg": 1,
+            "export_merge_tree_part_allow_lossy_cast": 1,
+        },
+    )
+    wait_for_export_status(node, mt_table, iceberg_table, pid, "COMPLETED")
+    assert int(node.query(f"SELECT count() FROM {iceberg_table}").strip()) == 2
 
 
 def test_export_data_files_are_not_cleaned_up_on_commit_failure(cluster):

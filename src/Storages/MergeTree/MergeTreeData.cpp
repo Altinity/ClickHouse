@@ -6700,6 +6700,12 @@ void MergeTreeData::exportPartToTable(
     auto source_metadata_ptr = getInMemoryMetadataPtr();
     auto destination_metadata_ptr = dest_storage->getInMemoryMetadataPtr();
 
+    auto part = getPartIfExists(part_name, {MergeTreeDataPartState::Active, MergeTreeDataPartState::Outdated});
+
+    if (!part)
+        throw Exception(ErrorCodes::NO_SUCH_DATA_PART, "No such data part '{}' to export in table '{}'",
+                        part_name, getStorageID().getFullTableName());
+
     std::string iceberg_metadata_json;
 
     if (dest_storage->isDataLake())
@@ -6745,7 +6751,11 @@ void MergeTreeData::exportPartToTable(
 
             ExportPartitionUtils::verifyIcebergPartitionCompatibility(
                 metadata_object,
-                source_metadata_ptr->getPartitionKeyAST());
+                source_metadata_ptr,
+                destination_metadata_ptr,
+                {part},
+                part->info.getPartitionId(),
+                query_context);
         }
 #else
         (void)iceberg_metadata_json_;
@@ -6764,12 +6774,6 @@ void MergeTreeData::exportPartToTable(
         if (query_to_string(source_metadata_ptr->getPartitionKeyAST()) != query_to_string(destination_metadata_ptr->getPartitionKeyAST()))
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Tables have different partition key");
     }
-
-    auto part = getPartIfExists(part_name, {MergeTreeDataPartState::Active, MergeTreeDataPartState::Outdated});
-
-    if (!part)
-        throw Exception(ErrorCodes::NO_SUCH_DATA_PART, "No such data part '{}' to export in table '{}'",
-                        part_name, getStorageID().getFullTableName());
 
     if (part->getState() == MergeTreeDataPartState::Outdated && !allow_outdated_parts)
         throw Exception(

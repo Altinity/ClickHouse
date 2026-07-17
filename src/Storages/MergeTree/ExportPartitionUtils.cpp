@@ -7,6 +7,7 @@
 #include "Storages/ExportReplicatedMergeTreePartitionManifest.h"
 #include "Storages/ExportReplicatedMergeTreePartitionTaskEntry.h"
 #include <Storages/MergeTree/MergeTreeData.h>
+#include <algorithm>
 #include <filesystem>
 #include <thread>
 #include <unordered_set>
@@ -18,8 +19,18 @@
 #include <Interpreters/ExpressionActions.h>
 
 #if USE_AVRO
+#include <Storages/MergeTree/IMergeTreeDataPart.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
 #include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
+#include <Parsers/ASTFunction.h>
+#include <Parsers/ASTIdentifier.h>
+#include <Parsers/ASTLiteral.h>
+#include <Parsers/ASTExpressionList.h>
+#include <Functions/FunctionFactory.h>
+#include <Functions/CastOverloadResolver.h>
+#include <Interpreters/castColumn.h>
+#include <DataTypes/DataTypesNumber.h>
+#include <DataTypes/DataTypeString.h>
 #endif
 
 namespace ProfileEvents
@@ -75,6 +86,9 @@ namespace ErrorCodes
 namespace Setting
 {
     extern const SettingsBool export_merge_tree_part_allow_lossy_cast;
+#if USE_AVRO
+    extern const SettingsTimezone iceberg_partition_timezone;
+#endif
 }
 
 namespace FailPoints
@@ -482,9 +496,145 @@ namespace ExportPartitionUtils
     }
 
 #if USE_AVRO
+namespace
+{
+    /// One top-level term of the source MergeTree PARTITION BY, canonicalized for comparison against a
+    /// destination Iceberg partition field. `transform` holds the ClickHouse function name that
+    /// parseTransformAndArgument yields for the equivalent Iceberg transform ("toRelativeDayNum",
+    /// "identity", "icebergBucket", ...); std::nullopt marks a term that is not directly
+    /// Iceberg-representable and can therefore only satisfy a destination field via the dynamic proof.
+    struct SourcePartitionTerm
+    {
+        String column;
+        std::optional<String> transform;
+        std::optional<Int64> argument;
+    };
+
+    std::vector<SourcePartitionTerm> parseSourcePartitionTerms(const ASTPtr & partition_key_ast)
+    {
+        /// The same functions getPartitionField maps 1:1 to an Iceberg transform.
+        static const std::unordered_set<String> iceberg_representable = {
+            "identity", "toYearNumSinceEpoch", "toMonthNumSinceEpoch",
+            "toRelativeDayNum", "toRelativeHourNum", "icebergBucket", "icebergTruncate"};
+
+        std::vector<SourcePartitionTerm> terms;
+        if (!partition_key_ast)
+            return terms;
+
+        auto parse_one = [&](const ASTPtr & element)
+        {
+            if (const auto * ident = element->as<ASTIdentifier>())
+            {
+                terms.push_back({ident->name(), std::optional<String>("identity"), std::nullopt});
+                return;
+            }
+
+            const auto * func = element->as<ASTFunction>();
+            if (!func)
+                return;
+
+            std::optional<String> column;
+            std::optional<Int64> argument;
+            for (const auto & child : func->children)
+            {
+                const auto * expression_list = child->as<ASTExpressionList>();
+                if (!expression_list)
+                    continue;
+                for (const auto & arg : expression_list->children)
+                {
+                    if (const auto * id = arg->as<ASTIdentifier>())
+                        column = id->name();
+                    else if (const auto * lit = arg->as<ASTLiteral>(); lit && lit->value.getType() != Field::Types::String)
+                        argument = lit->value.safeGet<Int64>();
+                }
+            }
+            if (!column)
+                return;
+
+            std::optional<String> transform;
+            if (iceberg_representable.contains(func->name))
+                transform = func->name;
+            terms.push_back({*column, transform, argument});
+        };
+
+        if (const auto * func = partition_key_ast->as<ASTFunction>(); func && func->name == "tuple")
+        {
+            for (const auto & child : func->children)
+                if (const auto * expression_list = child->as<ASTExpressionList>())
+                    for (const auto & element : expression_list->children)
+                        parse_one(element);
+        }
+        else
+            parse_one(partition_key_ast);
+
+        return terms;
+    }
+
+    /// Fold [min, max] of the partition-key column at `slot` across all parts of the partition.
+    /// Returns false if no part exposes an initialized min/max for that column.
+    bool foldPartitionColumnBounds(
+        const MergeTreeData::DataPartsVector & parts, size_t slot, Field & out_min, Field & out_max)
+    {
+        bool found = false;
+        for (const auto & part : parts)
+        {
+            if (!part->minmax_idx || !part->minmax_idx->initialized || slot >= part->minmax_idx->hyperrectangle.size())
+                continue;
+            auto range = part->minmax_idx->hyperrectangle[slot];
+            range.shrinkToIncludedIfPossible();
+            if (!found)
+            {
+                out_min = range.left;
+                out_max = range.right;
+                found = true;
+            }
+            else
+            {
+                if (range.left < out_min)
+                    out_min = range.left;
+                if (out_max < range.right)
+                    out_max = range.right;
+            }
+        }
+        return found;
+    }
+
+    /// Apply the destination Iceberg transform (rebuilt as a ClickHouse function, mirroring
+    /// ChunkPartitioner and the commit path) to a 2-row column holding [cast(min), cast(max)] and
+    /// return whether both rows map to the same value.
+    bool destinationTransformIsConstant(
+        const Iceberg::TransformAndArgument & transform, const ColumnWithTypeAndName & values, const ContextPtr & context)
+    {
+        auto function = FunctionFactory::instance().get(transform.transform_name, context);
+        const size_t num_rows = values.column->size();
+
+        ColumnsWithTypeAndName arguments;
+        if (transform.argument)
+            arguments.push_back({DataTypeUInt64().createColumnConst(num_rows, *transform.argument),
+                                 std::make_shared<DataTypeUInt64>(), "width"});
+        arguments.push_back(values);
+        if (transform.time_zone)
+            arguments.push_back({DataTypeString().createColumnConst(num_rows, *transform.time_zone),
+                                 std::make_shared<DataTypeString>(), "timezone"});
+
+        const auto result_type = function->getReturnType(arguments);
+        const auto result = function->build(arguments)->execute(arguments, result_type, num_rows, /*dry_run=*/ false);
+
+        Field first;
+        Field second;
+        result->get(0, first);
+        result->get(1, second);
+        return first == second;
+    }
+}
+
     void verifyIcebergPartitionCompatibility(
         const Poco::JSON::Object::Ptr & metadata_object,
-        const ASTPtr & partition_key_ast)
+        const StorageMetadataPtr & source_metadata,
+        const StorageMetadataPtr & destination_metadata,
+        const MergeTreeData::DataPartsVector & parts,
+        const String & partition_id,
+        const ContextPtr & context)
     {
         const auto original_schema_id = metadata_object->getValue<Int64>(Iceberg::f_current_schema_id);
         const auto partition_spec_id  = metadata_object->getValue<Int64>(Iceberg::f_default_spec_id);
@@ -520,83 +670,138 @@ namespace ExportPartitionUtils
         if (!current_schema_json || !partition_spec_json)
             return;
 
-        /// Build column_name → Iceberg source-id from the destination schema (and the inverse).
-        std::unordered_map<String, Int32> column_name_to_source_id;
         std::unordered_map<Int32, String> source_id_to_column_name;
         {
             const auto schema_fields = current_schema_json->getArray(Iceberg::f_fields);
             for (size_t i = 0; i < schema_fields->size(); ++i)
             {
                 auto f = schema_fields->getObject(static_cast<UInt32>(i));
-                const auto col_name  = f->getValue<String>(Iceberg::f_name);
-                const auto source_id = f->getValue<Int32>(Iceberg::f_id);
-                column_name_to_source_id[col_name]  = source_id;
-                source_id_to_column_name[source_id] = col_name;
+                source_id_to_column_name[f->getValue<Int32>(Iceberg::f_id)] = f->getValue<String>(Iceberg::f_name);
             }
         }
-
         auto source_id_to_name = [&](Int32 id) -> String
         {
             auto it = source_id_to_column_name.find(id);
             return it != source_id_to_column_name.end() ? it->second : fmt::format("<unknown source_id={}>", id);
         };
 
-        /// Convert the MergeTree PARTITION BY AST into the equivalent Iceberg spec.
-        Poco::JSON::Array::Ptr expected_fields;
-        try
-        {
-            const auto expected_spec = Iceberg::getPartitionSpec(
-                partition_key_ast, column_name_to_source_id).first;
-            expected_fields = expected_spec->getArray(Iceberg::f_fields);
-        }
-        catch (const Exception & e)
-        {
-            throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                "Cannot export partition to Iceberg table: the source MergeTree partition "
-                "key cannot be represented as an Iceberg partition spec: {}", e.message());
-        }
-
         const auto actual_fields = partition_spec_json->getArray(Iceberg::f_fields);
-        const size_t expected_size = expected_fields ? expected_fields->size() : 0;
-        const size_t actual_size   = actual_fields   ? actual_fields->size()   : 0;
+        const size_t actual_size = actual_fields ? actual_fields->size() : 0;
 
-        if (expected_size != actual_size)
-            throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                "Cannot export partition to Iceberg table: partition scheme mismatch. "
-                "Source MergeTree has {} partition field(s), destination Iceberg table has {}.",
-                expected_size, actual_size);
+        const auto source_terms = parseSourcePartitionTerms(source_metadata->getPartitionKeyAST());
 
-        for (size_t i = 0; i < expected_size; ++i)
+        /// A partitioned source cannot be exported into an unpartitioned Iceberg table: there is no
+        /// destination partitioning to satisfy and the result would silently drop the source layout.
+        if (actual_size == 0)
         {
-            auto ef = expected_fields->getObject(static_cast<UInt32>(i));
-            auto af = actual_fields->getObject(static_cast<UInt32>(i));
-
-            const auto expected_source_id = ef->getValue<Int32>(Iceberg::f_source_id);
-            const auto actual_source_id   = af->getValue<Int32>(Iceberg::f_source_id);
-            const auto expected_transform = ef->getValue<String>(Iceberg::f_transform);
-            const auto actual_transform   = af->getValue<String>(Iceberg::f_transform);
-
-            /// Normalize both transform names through parseTransformAndArgument so that
-            /// equivalent aliases ("day"/"days", "hour"/"hours", "year"/"years", etc.)
-            /// produced by different writers (ClickHouse vs Spark/Trino) compare equal.
-            /// Comparison is on {function_name, argument}; time_zone is writer-specific
-            /// and not part of the partition spec identity.
-            const auto expected_canonical = Iceberg::parseTransformAndArgument(expected_transform, "");
-            const auto actual_canonical   = Iceberg::parseTransformAndArgument(actual_transform, "");
-            const bool transforms_match =
-                (expected_canonical && actual_canonical)
-                    ? (expected_canonical->transform_name == actual_canonical->transform_name
-                       && expected_canonical->argument    == actual_canonical->argument)
-                    : (expected_transform == actual_transform);
-
-            if (expected_source_id != actual_source_id || !transforms_match)
+            if (!source_terms.empty())
                 throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                    "Cannot export partition to Iceberg table: partition field {} mismatch. "
-                    "Source MergeTree maps to column '{}' (source_id={}) transform='{}', "
-                    "but destination Iceberg has column '{}' (source_id={}) transform='{}'.",
-                    i,
-                    source_id_to_name(expected_source_id), expected_source_id, expected_transform,
-                    source_id_to_name(actual_source_id),   actual_source_id,   actual_transform);
+                    "Cannot export partition to Iceberg table: partition scheme mismatch. "
+                    "Source MergeTree is partitioned but the destination Iceberg table is unpartitioned.");
+            return;
+        }
+
+        const auto & source_partition_key = source_metadata->getPartitionKey();
+        const auto minmax_column_names = MergeTreeData::getMinMaxColumnsNames(source_partition_key);
+        const auto minmax_column_types = MergeTreeData::getMinMaxColumnsTypes(source_partition_key);
+        const auto destination_sample = destination_metadata->getSampleBlockNonMaterialized();
+        const String partition_timezone = context->getSettingsRef()[Setting::iceberg_partition_timezone];
+
+        for (UInt32 i = 0; i < actual_size; ++i)
+        {
+            const auto af = actual_fields->getObject(i);
+            const auto dest_source_id = af->getValue<Int32>(Iceberg::f_source_id);
+            const auto dest_transform = af->getValue<String>(Iceberg::f_transform);
+            const String column = source_id_to_name(dest_source_id);
+            const auto dest_canonical = Iceberg::parseTransformAndArgument(dest_transform, "");
+
+            const std::optional<Int64> dest_argument = dest_canonical && dest_canonical->argument
+                ? std::optional<Int64>(static_cast<Int64>(*dest_canonical->argument)) : std::nullopt;
+
+            /// Fast path: the source already applies the matching transform on this column, so every
+            /// source partition is single-valued for this field by construction (covers bucket too).
+            bool matched_structurally = false;
+            for (const auto & term : source_terms)
+            {
+                if (term.column == column && term.transform && dest_canonical
+                    && *term.transform == dest_canonical->transform_name && term.argument == dest_argument)
+                {
+                    matched_structurally = true;
+                    break;
+                }
+            }
+            if (matched_structurally)
+                continue;
+
+            /// bucket is a hash: not order-preserving, so per-partition min/max cannot prove
+            /// single-valuedness. It (and any transform we cannot reconstruct) must match structurally.
+            if (!dest_canonical || dest_canonical->transform_name == "icebergBucket")
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                    "Cannot export partition to Iceberg table: destination field on column '{}' uses "
+                    "transform '{}', which requires the source MergeTree to be partitioned by the matching "
+                    "function.", column, dest_transform);
+
+            /// Dynamic proof: the destination transform must be constant across the partition's data.
+            const auto slot_it = std::find(minmax_column_names.begin(), minmax_column_names.end(), column);
+            if (slot_it == minmax_column_names.end())
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                    "Cannot export partition to Iceberg table: destination partitions by column '{}' "
+                    "(transform '{}'), which is not part of the source MergeTree partition key.",
+                    column, dest_transform);
+            const size_t slot = static_cast<size_t>(slot_it - minmax_column_names.begin());
+            const auto & source_type = minmax_column_types[slot];
+
+            /// A NULL value forms its own Iceberg partition, so a nullable column may split the source
+            /// partition; min/max cannot rule that out. Require a structural match for such columns.
+            if (source_type->isNullable())
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                    "Cannot export partition to Iceberg table: column '{}' is Nullable, so a NULL forms a "
+                    "separate Iceberg partition; partition the source by the matching Iceberg transform.",
+                    column);
+
+            Field min_value;
+            Field max_value;
+            if (!foldPartitionColumnBounds(parts, slot, min_value, max_value))
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                    "Cannot export partition to Iceberg table: no min/max statistics available for column "
+                    "'{}' in partition '{}'; cannot validate partitioning.", column, partition_id);
+
+            if (!destination_sample.has(column))
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                    "Cannot export partition to Iceberg table: destination column '{}' not found.", column);
+            const auto destination_type = destination_sample.getByName(column).type;
+
+            /// The written value is transform(cast(source_col)). A value-preserving cast is
+            /// order-preserving, so the transform stays monotonic and the endpoints prove
+            /// single-valuedness. A lossy cast may wrap, so require it to be monotonic over this
+            /// partition's actual range; otherwise the partition genuinely spans several Iceberg
+            /// partitions and cannot be committed as one.
+            bool cast_is_monotonic = canBeSafelyCast(source_type, destination_type);
+            if (!cast_is_monotonic)
+            {
+                const auto cast_function
+                    = createInternalCast({source_type, column}, destination_type, CastType::nonAccurate, {}, context);
+                cast_is_monotonic = cast_function->hasInformationAboutMonotonicity()
+                    && cast_function->getMonotonicityForRange(*source_type, min_value, max_value).is_monotonic;
+            }
+            if (!cast_is_monotonic)
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                    "Cannot export partition to Iceberg table: values of column '{}' in partition '{}' cross "
+                    "a non-monotonic cast boundary to the destination type {}, so the partition maps to "
+                    "multiple Iceberg partitions.", column, partition_id, destination_type->getName());
+
+            auto values_column = source_type->createColumn();
+            values_column->insert(min_value);
+            values_column->insert(max_value);
+            const ColumnWithTypeAndName cast_values{
+                castColumn({std::move(values_column), source_type, column}, destination_type), destination_type, column};
+
+            const auto dest_transform_with_tz = Iceberg::parseTransformAndArgument(dest_transform, partition_timezone);
+            if (!destinationTransformIsConstant(*dest_transform_with_tz, cast_values, context))
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                    "Cannot export partition to Iceberg table: partition '{}' spans multiple destination "
+                    "partitions for column '{}' (transform '{}'). A source MergeTree partition must map to a "
+                    "single Iceberg partition.", partition_id, column, dest_transform);
         }
     }
 #endif

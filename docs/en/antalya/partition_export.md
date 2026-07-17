@@ -24,6 +24,19 @@ The manifest file produced by the commit contains a summary field `clickhouse.ex
 
 The Iceberg manifest files contain statistics about the data. Exporting a merge tree partition is a non ephemeral long running task, in which nodes can be turned off and turned on. This means the stats of individual files need to be persisted somewhere in order to produce the final manifest. This is implemented through sidecars. Each data file exported will contain a "sibling" sidecar file named `<data_file_name>_clickhouse_export_part_sidecar.avro`. ClickHouse does not clean up these files, and they can be safely deleted once the data is comitted.
 
+#### Source partition key compatibility
+
+Because the commit writes a single partition tuple per exported partition, every destination Iceberg partition field must be single-valued across the exported source partition. A source `PARTITION BY` field is accepted when either:
+
+- It structurally matches the destination transform on the same column. The functions with a direct Iceberg equivalent are `identity` (a bare column), `toYearNumSinceEpoch` (`year`), `toMonthNumSinceEpoch` (`month`), `toRelativeDayNum` (`day`), `toRelativeHourNum` (`hour`), `icebergTruncate` (`truncate`), and `icebergBucket` (`bucket`).
+- Or the destination transform is proven constant over the exported partition's actual `[min, max]`. This accepts other equivalent or finer keys - for example `PARTITION BY toDate(ts)` or `toYYYYMM(ts)` or `toStartOfHour(ts)` into a destination partitioned by `day(ts)` / `month(ts)` / `hour(ts)`, a bare `Date` column into a `day` transform, or a source that adds extra partition columns on top of the destination's.
+
+The proof uses each part's min/max statistics, so it is data-dependent: a partition whose rows would span more than one destination partition (for example a monthly source partition exported into a daily destination that actually contains several days) is rejected with a `BAD_ARGUMENTS` error at `EXPORT` time.
+
+`bucket` is a hash and is not order-preserving, so it can only be matched structurally: the source must be partitioned by `icebergBucket(N, col)` with the same `N`.
+
+Lossy partition-column casts (allowed via `export_merge_tree_part_allow_lossy_cast`) are supported as long as the cast stays order-preserving over the partition's actual values; a partition whose values cross the destination type's overflow boundary is rejected. A `Nullable` partition column is only accepted through a structural match, because a `NULL` forms its own Iceberg partition.
+
 ### On plain object storage exports:
 
 Each MergeTree part will become a separate file with the following name convention: `<table_directory>/<partitioning>/<data_part_name>_<merge_tree_part_checksum>.<format>`. To ensure atomicity, a commit file containing the relative paths of all exported parts is also shipped. A data file should only be considered part of the dataset if a commit file references it. The commit file will be named using the following convention: `<table_directory>/commit_<partition_id>_<transaction_id>`.

@@ -8565,7 +8565,11 @@ void StorageReplicatedMergeTree::exportPartitionToTable(const PartitionCommand &
 
         ExportPartitionUtils::verifyIcebergPartitionCompatibility(
             metadata_object,
-            src_snapshot->getPartitionKeyAST());
+            src_snapshot,
+            destination_snapshot,
+            parts,
+            partition_id,
+            query_context);
 
         std::ostringstream oss;     // STYLE_CHECK_ALLOW_STD_STRING_STREAM
         oss.exceptions(std::ios::failbit);
