@@ -79,7 +79,7 @@ bool isAccessDenied(const S3Exception & e)
 }
 #endif
 
-CasWriteOutcome classifyConditionalWriteResult(const std::exception & e)
+CasWriteOutcome classifyConditionalWriteResult([[maybe_unused]] const std::exception & e)
 {
 #if USE_AWS_S3
     /// `PreconditionFailed`/`NoSuchKey` (a lost If-None-Match/If-Match — see
