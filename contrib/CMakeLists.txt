@@ -236,10 +236,6 @@ add_contrib(simdcomp-cmake simdcomp)
 
 add_contrib (numactl-cmake numactl)
 
-# CRC32C: a tiny, dependency-free checksum library. Built unconditionally because the content-addressed
-# storage core (CasRunFile) uses it for per-block integrity; google-cloud-cpp also depends on it.
-add_contrib (crc32c-cmake crc32c)
-
 # Google Cloud Cpp
 if(ENABLE_LIBRARIES AND (OS_LINUX OR OS_DARWIN OR OS_FREEBSD) AND (ARCH_AMD64 OR (ARCH_AARCH64 AND NOT NO_ARMV81_OR_HIGHER)))
     set(ENABLE_GOOGLE_CLOUD_CPP_DEFAULT ON)
@@ -249,6 +245,7 @@ endif()
 option(ENABLE_GOOGLE_CLOUD_CPP "Enable Google Cloud Cpp" ${ENABLE_GOOGLE_CLOUD_CPP_DEFAULT})
 if(ENABLE_GOOGLE_CLOUD_CPP)
     add_contrib (nlohmann-json-cmake nlohmann-json)
+    add_contrib (crc32c-cmake crc32c)
     add_contrib (google-cloud-cpp-cmake google-cloud-cpp) # requires grpc, protobuf, absl, nlohmann's json, crc32c
 else()
     message(STATUS "Not using Google Cloud Cpp")
