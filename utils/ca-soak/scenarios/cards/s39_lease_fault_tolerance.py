@@ -82,9 +82,15 @@ class S39(Scenario):
     title = "mount-lease resilience under a degraded-but-alive S3 (fix #37)"
     priority = "P1"
     compose_variant = "s3faultproxy"
+    # INVARIANT (every scale row must keep this, see `_MOUNT_LEASE_TTL_S`/`_MOUNT_RENEW_PERIOD_S`
+    # above and the leg-A/leg-B asserts below): short_fault_s < _MOUNT_RENEW_PERIOD_S (10) and
+    # << _MOUNT_LEASE_TTL_S (30), so the short leg overlaps AT MOST one renewal beat and can never
+    # fence; long_fault_s > _MOUNT_LEASE_TTL_S (30) + a safety margin, so the long leg reliably
+    # fences. The `ci` row previously set short_fault_s=15 (>= the renew period), which violated
+    # this invariant and made leg A's own soundness assert raise.
     param_table = {
         "dev": {"short_fault_s": 8, "long_fault_s": 40, "settle_s": 20, "rows": 2000, "payload_bytes": 512},
-        "ci": {"short_fault_s": 15, "long_fault_s": 50, "settle_s": 40, "rows": 20000, "payload_bytes": 1024},
+        "ci": {"short_fault_s": 9, "long_fault_s": 50, "settle_s": 40, "rows": 20000, "payload_bytes": 1024},
         "full": {"short_fault_s": 20, "long_fault_s": 60, "settle_s": 60, "rows": 100000, "payload_bytes": 2048},
     }
 

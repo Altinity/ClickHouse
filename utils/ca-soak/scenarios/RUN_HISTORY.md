@@ -375,3 +375,6 @@ Every attempted scenario run is appended here (newest at the bottom). `run_dir` 
 | 2026-07-17T09:57:12 | S36 | 1 | dev | 900s | pass | e08fb29bc7d3 | 20260717T095448_S36_seed1 |  |
 | 2026-07-17T09:59:21 | S37 | 1 | dev | 900s | fail | e08fb29bc7d3 | 20260717T095712_S37_seed1 |  |
 | 2026-07-17T09:59:29 | soak-phase3 | 42 | full | 1200s | pass | e08fb29bc7d3 | build/test_soak_postfix.log | T4 Step 4: 20m row-count-oracle soak, sync inserts, seed=42 (the chaos recipe that originally exposed R4's loss); recovery + final converge checkpoints all OK (count=813264, fsck reachable=974 unreachable=0 dangling=0 dryrun_count=0); checkpoint model==observed, no deficit; ABORTED-retried INSERT attempts=0 (node_down=81 driver-retried, all recovered) |
+| 2026-07-17T10:53:40 | S37 | 1 | dev | 900s | fail | 70b360471b47 | 20260717T105322_S37_seed1 | Node(localhost:8123) HTTP 500: Code: 384. DB::Exception: Cannot move part 'all_0_0_0' because it's participating in background process. (PART_IS_TEMPORARILY_LOCKED) (version 26.6.1.1) / sql=ALTER TABLE s37_ttl MOVE PARTITION ID 'all' TO VOLUME 'hot' |
+| 2026-07-17T10:57:01 | S37 | 1 | dev | 900s | pass | 9926f38ba23d | 20260717T105454_S37_seed1 |  |
+| 2026-07-17T11:01:16 | S37 | 1 | dev | 900s | pass | 9926f38ba23d | 20260717T105908_S37_seed1 |  |

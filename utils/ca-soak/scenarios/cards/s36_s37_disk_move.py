@@ -66,6 +66,23 @@ def _parts_by_disk(node, table, partition=None):
     return out
 
 
+def _move_with_lock_retry(node, alter_sql, *, timeout=600, retries=10, sleep_s=2.0):
+    """Run an `ALTER TABLE ... MOVE PART|PARTITION` statement, retrying a bounded number of times
+    if it raises `PART_IS_TEMPORARILY_LOCKED` ("participating in background process"): a background
+    merge/mutation grabbing the same part right after an insert or a replicated DDL (e.g. right
+    after `REMOVE TTL`) is a benign, transient race with ClickHouse's own part-locking, not a real
+    MOVE failure -- retry until the background process releases the lock. Any other error (or the
+    retry budget running out) propagates immediately, unchanged."""
+    for attempt in range(retries):
+        try:
+            node.command(alter_sql, timeout=timeout)
+            return
+        except Exception as e:
+            if "PART_IS_TEMPORARILY_LOCKED" not in str(e) or attempt == retries - 1:
+                raise
+            time.sleep(sleep_s)
+
+
 def _wait_all_on_disk(node, table, disk_name, *, partition=None, timeout_s=120, poll_s=2.0):
     """Poll system.parts until every active part of `table` (optionally scoped to `partition`) sits
     on `disk_name`, or the timeout elapses. Returns the final {part: disk} placement."""
@@ -569,8 +586,11 @@ class S37(Scenario):
         reader_ttl = _spawn_reader(
             cl.node1, f"SELECT count() FROM {ttl_table} FORMAT Null", errors_ttl_back, stop_ttl_back)
         try:
-            cl.node1.command(f"ALTER TABLE {ttl_table} MOVE PARTITION ID 'all' TO VOLUME 'hot'",
-                             timeout=600)
+            # `REMOVE TTL` just above is a replicated ALTER; a background merge/mutation racing its
+            # replication can still hold the part under `PART_IS_TEMPORARILY_LOCKED` for a moment --
+            # retry rather than let a benign race fail the whole scenario (observed 2026-07-17).
+            _move_with_lock_retry(
+                cl.node1, f"ALTER TABLE {ttl_table} MOVE PARTITION ID 'all' TO VOLUME 'hot'")
         finally:
             stop_ttl_back.set()
             reader_ttl.join(timeout=10)
@@ -682,6 +702,13 @@ class S37(Scenario):
                                      oracle_mixed_after, oracle_mixed_after == oracle_mixed))
 
         # --- chaos leg: restart mid-policy-triggered MOVE (TTL volume move) -----------------------
+        # `ttl_table` already holds the rows from the TTL leg above (never truncated here — the
+        # pre-existing rows make the checksum-stability check stronger, since a half-moved part
+        # would corrupt more than just the newly-inserted partition). The oracle must therefore be
+        # self-grounding: read the row count right before this insert and add `ttl_rows`, rather
+        # than comparing against the constant `ttl_rows` alone (that constant only ever matched an
+        # empty table and made this verdict unsatisfiable on every run).
+        rows_before_chaos_insert = int(cl.node1.scalar(f"SELECT count() FROM {ttl_table}") or -1)
         gen_chaos = (f"SELECT number AS id, now() - 10 AS ts, randomString({ttl_payload}) AS payload "
                     f"FROM numbers({ttl_rows})")
         sql.insert_values(cl.node1, ttl_table, gen_chaos, timeout=600)
@@ -695,8 +722,12 @@ class S37(Scenario):
 
         def _mover():
             try:
-                cl.node1.command(f"ALTER TABLE {ttl_table} MOVE PARTITION ID 'all' TO VOLUME 'cas'",
-                                 timeout=600)
+                # Same benign lock race as the move-back leg above can in principle fire here too
+                # (a background merge on the part just inserted); retry it so the kill below races
+                # the actual MOVE instead of an unrelated transient lock -- any other error (in
+                # particular the kill itself, mid-flight) still propagates to the `except` below.
+                _move_with_lock_retry(
+                    cl.node1, f"ALTER TABLE {ttl_table} MOVE PARTITION ID 'all' TO VOLUME 'cas'")
             except Exception as e:  # noqa: BLE001 - the kill is expected to abort this
                 move_error["err"] = str(e)[:300]
 
@@ -717,15 +748,17 @@ class S37(Scenario):
             rows_after = int(cl.node1.scalar(f"SELECT count() FROM {ttl_table}") or -1)
             chaos_placement_after = _parts_by_disk(cl.node1, ttl_table)
             oracle_after_chaos = cl.node1.query(sql.table_checksum_query(ttl_table)).strip()
+            expected_rows = rows_before_chaos_insert + ttl_rows
             consistent = (
-                rows_after == ttl_rows and
+                rows_after == expected_rows and
                 len(chaos_placement_after) >= 1 and
                 oracle_after_chaos == oracle_before_chaos)
             result.observations["chaos_placement_after"] = chaos_placement_after
             result.observations["chaos_rows_after"] = rows_after
             result.add(Verdict.check(
                 "restart mid-policy-MOVE is atomic (complete-or-rollback)",
-                f"rows=={ttl_rows}, one consistent copy, checksum unchanged",
+                f"rows=={expected_rows} (pre-existing {rows_before_chaos_insert} + inserted {ttl_rows}), "
+                f"one consistent copy, checksum unchanged",
                 f"rows={rows_after} disks={set(chaos_placement_after.values())} "
                 f"checksum_stable={oracle_after_chaos == oracle_before_chaos} "
                 f"mover_error={move_error.get('err')}",
