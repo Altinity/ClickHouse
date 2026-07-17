@@ -127,6 +127,62 @@ struct CasRequestBudget
 /// satisfied for every predecessor this successor could ever reclaim from.
 void validateCasRequestBudget(const CasRequestBudget & budget, uint64_t mount_lease_ttl_ms, uint64_t mount_renew_period_ms);
 
+/// Throw the recoverable "CAS write could not be committed, retry later" condition.
+///
+/// WHY NETWORK_ERROR (this replaces an earlier ABORTED throw):
+/// A content-addressed write can fail for a reason that is neither the caller's fault
+/// nor permanent: the mount-lease / write fence was lost (e.g. a renewal PUT timed out
+/// against a slow or throttling object store), or a conditional PUT exhausted its retry
+/// budget mid-outage. The right response is "abandon this attempt, try again later" --
+/// which is precisely what a transient error means.
+///
+/// It previously threw ABORTED, which was actively harmful to background merges:
+/// ReplicatedMergeMutateTaskBase treats ABORTED as "merge deliberately cancelled
+/// (shutdown / DROP / merges-blocker), not an error", so it neither records
+/// last_exception_time_ms nor lets ReplicatedMergeTreeQueue's exponential backoff
+/// engage. Under a sustained store outage the queue re-executed the merge roughly every
+/// 2 seconds, recomputing the whole (possibly multi-GiB) output part every time for the
+/// entire outage -- hundreds of full recomputes, and invisible in system.replication_queue.
+///
+/// NETWORK_ERROR is the best-fitting EXISTING code:
+///   - it is NOT in the merge "retry silently, no backoff" exemption set (only ABORTED
+///     and PART_IS_TEMPORARILY_LOCKED are), so the existing backoff -- capped by
+///     max_postpone_time_for_failed_replicated_merges_ms -- engages automatically;
+///   - it is already in ClickHouse's transient/retryable taxonomy
+///     (checkDataPart::isRetryableException lists it beside ABORTED), so a part under
+///     verification is not misread as corrupted;
+///   - nothing on the merge / insert / replication commit path special-cases it in a way
+///     that would misfire (ZooKeeper retriability keys on Coordination::Exception, a
+///     different type), and it is not caught specially on the CAS write path.
+///
+/// Honest caveat: NETWORK_ERROR is coarser than the true condition. For the
+/// throttled-store / timed-out / lost-lease cases it is accurate; for a purely logical
+/// fence loss (e.g. the namespace is being dropped) it slightly overstates "network".
+/// The precise cause is always in the exception MESSAGE, never inferred from the code.
+///
+/// If that imprecision ever matters -- operator confusion, or a future upstream change
+/// that attaches merge-path handling to NETWORK_ERROR and reintroduces a collision --
+/// switch to a dedicated code (e.g. CONTENT_ADDRESSED_WRITE_RETRY_LATER) by changing the
+/// single throw below. A dedicated code is honest and collision-proof by construction
+/// (backoff still engages, since only ABORTED / PART_IS_TEMPORARILY_LOCKED are exempt);
+/// the only extra work is one appended line in ErrorCodes.cpp and, optionally, adding it
+/// to checkDataPart::isRetryableException and an HTTP-status mapping for the foreground
+/// INSERT client. We deliberately kept NETWORK_ERROR for now to add zero new coupling to
+/// generic ClickHouse code, consistent with the rest of the CAS layer.
+///
+/// SCOPE: only the ESCAPING retry-later throws route here (fence lost / write outcome
+/// uncertain / conditional-create Unresolved). The ABORTED values used as internal
+/// control-flow signals (the condemned/vanished "re-upload from source" signal caught
+/// inside putBlob), and the startup/decommission and generic live-lock-brake ABORTEDs,
+/// keep their meaning and are NOT rerouted here.
+[[noreturn]] void throwCasWriteRetryLater(const String & why);
+
+/// Same classification as `throwCasWriteRetryLater`, but returns the exception as a
+/// `std::exception_ptr` for call sites that fail a pending future/promise (`CasRefLedger`'s
+/// `complete_error`) rather than throw directly. Both entry points route through the SAME
+/// construction internally, so the error code / message shape has exactly one place that decides it.
+std::exception_ptr makeCasWriteRetryLaterExceptionPtr(const String & why);
+
 /// Outcome of a controlled CONTENT-ADDRESSED conditional create (`conditionalCreateControlled`):
 ///   - Committed:  an attempt's own request completed (2xx) and the final fence check held — `token`
 ///     names the created incarnation.

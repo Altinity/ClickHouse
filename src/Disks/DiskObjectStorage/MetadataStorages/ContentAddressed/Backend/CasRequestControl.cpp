@@ -30,6 +30,7 @@ namespace DB::ErrorCodes
     extern const int BAD_ARGUMENTS;
     extern const int CORRUPTED_DATA;
     extern const int LOGICAL_ERROR;
+    extern const int NETWORK_ERROR;
     extern const int NOT_IMPLEMENTED;
 }
 
@@ -196,6 +197,17 @@ void validateCasRequestBudget(const CasRequestBudget & budget, uint64_t mount_le
         budget.attempt_timeout_ms, budget.operation_deadline_ms, budget.max_attempts,
         budget.lease_safety_margin_ms, budget.retry_initial_backoff_ms, budget.retry_max_backoff_ms,
         mount_lease_ttl_ms, mount_renew_period_ms);
+}
+
+[[noreturn]] void throwCasWriteRetryLater(const String & why)
+{
+    throw Exception(ErrorCodes::NETWORK_ERROR, "CAS write could not be committed ({}); retrying later", why);
+}
+
+std::exception_ptr makeCasWriteRetryLaterExceptionPtr(const String & why)
+{
+    return std::make_exception_ptr(
+        Exception(ErrorCodes::NETWORK_ERROR, "CAS write could not be committed ({}); retrying later", why));
 }
 
 CasRequestController::CasRequestController(BackendPtr backend_, CasRequestBudget budget_, std::function<uint64_t()> now_ms_,

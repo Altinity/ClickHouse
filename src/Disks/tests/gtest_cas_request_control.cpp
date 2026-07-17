@@ -17,6 +17,12 @@
 
 using namespace DB::Cas;
 
+namespace DB::ErrorCodes
+{
+    extern const int NETWORK_ERROR;
+    extern const int ABORTED;
+}
+
 namespace ProfileEvents
 {
     extern const Event CasConditionalWriteAttempts;
@@ -41,6 +47,48 @@ namespace DB::ErrorCodes
 TEST(CasRequestControl, SuccessIsAlwaysCommitted)
 {
     EXPECT_EQ(classifyConditionalWriteResult(), CasWriteOutcome::Committed);
+}
+
+/// Fix #37 phase 2: the retry-later throw must be NETWORK_ERROR, never ABORTED -- ABORTED is silently
+/// swallowed by ReplicatedMergeMutateTaskBase (no backoff, no last_exception), which is exactly the
+/// defect this fix closes.
+TEST(CasWriteRetryLater, ThrowsNetworkErrorNotAborted)
+{
+    bool threw = false;
+    try
+    {
+        throwCasWriteRetryLater("test cause");
+        FAIL() << "throwCasWriteRetryLater must always throw";
+    }
+    catch (const DB::Exception & e)
+    {
+        threw = true;
+        EXPECT_EQ(e.code(), DB::ErrorCodes::NETWORK_ERROR);
+        EXPECT_NE(e.code(), DB::ErrorCodes::ABORTED);
+        EXPECT_NE(e.message().find("test cause"), String::npos) << e.message();
+        EXPECT_NE(e.message().find("retrying later"), String::npos) << e.message();
+    }
+    EXPECT_TRUE(threw);
+}
+
+/// The exception_ptr twin (for call sites that fail a pending future/promise rather than throw
+/// directly, e.g. CasRefLedger's queued-append completion paths) must carry the SAME classification.
+TEST(CasWriteRetryLater, ExceptionPtrVariantCarriesSameClassification)
+{
+    const std::exception_ptr eptr = makeCasWriteRetryLaterExceptionPtr("another cause");
+    bool threw = false;
+    try
+    {
+        std::rethrow_exception(eptr);
+        FAIL() << "expected a thrown exception";
+    }
+    catch (const DB::Exception & e)
+    {
+        threw = true;
+        EXPECT_EQ(e.code(), DB::ErrorCodes::NETWORK_ERROR);
+        EXPECT_NE(e.message().find("another cause"), String::npos) << e.message();
+    }
+    EXPECT_TRUE(threw);
 }
 
 #if USE_AWS_S3
