@@ -1,6 +1,6 @@
 #pragma once
 
-/// Isolated include wrapper + tiny helper API for the xxHash XXH3-128 hash used by `CasBlobHasher`.
+/// Isolated include wrapper + tiny helper API for the xxHash XXH3-128 hash used by `CasBlobHashingWriteBuffer`.
 ///
 /// Two problems this header contains in one place:
 ///   1. In the `dbms` target a plain `#include <xxhash.h>` resolves to lz4's bundled copy
@@ -13,7 +13,7 @@
 ///      attribute that trips `-Wused-but-marked-unused` at every call site. `#pragma clang system_header`
 ///      marks the rest of THIS header (and everything it includes, plus the helper calls below) as a
 ///      system header, so ALL of those warnings are suppressed here — without disabling warnings for any
-///      real `CasBlobHasher` code, which only ever touches the clean `DB::Cas` helpers defined below.
+///      real `CasBlobHashingWriteBuffer` code, which only ever touches the clean `DB::Cas` helpers defined below.
 ///
 /// The explicit include is a build-selection detail: it does not change the XXH3-128 algorithm or
 /// the digest representation exposed to CAS. Keeping the dependency and warning suppression here
@@ -29,7 +29,7 @@
 namespace DB::Cas
 {
 
-/// Owns one streaming XXH3-128 state and exposes only the operations needed by `CasBlobHasher`.
+/// Owns one streaming XXH3-128 state and exposes only the operations needed by `CasBlobHashingWriteBuffer`.
 /// The state is allocated by the constructor and released by the destructor; the wrapper is
 /// deliberately non-copyable because copying an xxHash state would make ownership and continuation
 /// semantics ambiguous. Callers normally check `valid` immediately after construction, then feed

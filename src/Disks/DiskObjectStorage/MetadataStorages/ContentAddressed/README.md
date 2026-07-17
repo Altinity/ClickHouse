@@ -74,10 +74,13 @@ per-subsystem subdirectories with a strict one-direction include rule.
 Primitives → Formats → Backend → Pool → Gc → Tools ≈ Parts → facade (top level)
 ```
 
-- **`Primitives/`** — the vocabulary, zero outward dependencies: `CasTypes.h`
-  (identity types: `RootNamespace`, `Token`, `BlobDigest`, `BlobRef`,
-  `ManifestId`, `RefTxnId`), `CasBlobHasher`, `CasXXH3`, `CasCodecUtil`
-  (identifier/varint/hex codec helpers), `CasEvent` (audit-event POD + sink).
+- **`Primitives/`** — the vocabulary, zero outward dependencies: `CasBlobDigest`
+  (`BlobHashAlgo` + `BlobDigest` + `DigestCodec` + `BlobRef` — blob identity),
+  `CasTypes.h` (the other identity types: `RootNamespace`, `Token`,
+  `ManifestId`, `RefTxnId`), `CasBlobHashingWriteBuffer` (streaming
+  hash-and-passthrough machinery), `CasXxh3Streamer` (the isolated vendored
+  xxHash wrapper), `CasCodecUtil` (identifier/hex codec helpers), `CasEvent`
+  (audit-event POD + sink).
 - **`Formats/`** — everything persisted: bytes **and** keys. The per-object
   text/format files (`CasFormat`, `CasTextFormat`, `CasPartManifestFormat`,
   `CasRefLogFormat`, …) plus `CasLayout` (the object-key schema). See

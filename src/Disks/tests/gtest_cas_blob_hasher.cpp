@@ -1,10 +1,10 @@
 #include <gtest/gtest.h>
 
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasBlobHasher.h>
-/// `CasXXH3.h` is the isolated xxHash wrapper (a system header): it gives us `Cas::xxh3_128_oneshot`
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasBlobHashingWriteBuffer.h>
+/// `CasXxh3Streamer.h` is the isolated xxHash wrapper (a system header): it gives us `Cas::xxh3_128_oneshot`
 /// as an independent one-shot reference without pulling raw xxHash symbols (or their warnings) into
 /// this test — see the header's own comment for the lz4-shadowing / `-Werror` reasons.
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasXXH3.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasXxh3Streamer.h>
 #include <IO/HashingWriteBuffer.h>
 #include <IO/WriteBufferFromString.h>
 #include <base/extended_types.h>

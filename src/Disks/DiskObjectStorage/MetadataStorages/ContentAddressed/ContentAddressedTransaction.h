@@ -1,7 +1,7 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/IMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasBlobHasher.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasBlobHashingWriteBuffer.h>
 #include <Disks/WriteMode.h>
 #include <Core/Defines.h>
 #include <IO/WriteBufferFromFile.h>
@@ -310,7 +310,7 @@ private:
     /// Built via `Cas::makeBlobHashingWriteBuffer(hash_algo, *sink)`:
     /// `CityHash128` is a thin adapter over the pre-existing `HashingWriteBuffer` convention (byte-for-byte
     /// unchanged); `XXH3_128` hashes with the pool's selected algo instead.
-    std::unique_ptr<Cas::IHashingWriteBuffer> hashing;
+    std::unique_ptr<Cas::IBlobHashingWriteBuffer> hashing;
     bool temp_ownership_transferred = false;   /// Set after successful `on_finalized`; the destructor skips local cleanup.
 };
 
