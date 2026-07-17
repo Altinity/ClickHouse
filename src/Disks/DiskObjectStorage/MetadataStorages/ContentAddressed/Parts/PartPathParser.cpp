@@ -163,15 +163,17 @@ static std::optional<PartDirAnchor> findPartDirComponent(const std::vector<std::
         return std::nullopt; // table dir, no part component after the uuid
     }
 
-    // No uuid anchor: a non-Atomic table path. The MergeTree `detached` dir is a reserved table-level
-    // subdir (data/<db>/<table>/detached/<part>/...), exactly like the Atomic layout where the uuid
-    // anchor makes `detached` the part_name. Anchor on it FIRST (leftmost, index >= 1): the right-to-
-    // left part-dir scan below would otherwise anchor on the INNER <part>-shaped component and fold
-    // `detached` into a spurious table id (data/<db>/<table>/detached) that DROP TABLE never cleans,
-    // orphaning a permanently-live ref (U#6). Mirrors route()'s part_name == kDetachedDirName folding.
+    // No uuid anchor: a non-Atomic table path. `detached` (data/<db>/<table>/detached/<part>/...)
+    // and `moving` (data/<db>/<table>/moving/<part>/...) are both reserved table-level subdirs,
+    // exactly like the Atomic layout where the uuid anchor makes them the part_name for free.
+    // Anchor on either FIRST (leftmost, index >= 1): the right-to-left part-dir scan below would
+    // otherwise anchor on the INNER <part>-shaped component and fold the reserved dir into a
+    // spurious table id (data/<db>/<table>/detached or .../moving) that DROP TABLE never cleans,
+    // orphaning a permanently-live ref (U#6, extended to `moving` by the MOVE-to-CA fix). Mirrors
+    // route()'s part_name == kDetachedDirName / kMovingDirName folding.
     for (size_t i = 1; i < p.size(); ++i)
-        if (p[i] == kDetachedDirName)
-            return PartDirAnchor{0, i}; // table id = the whole path before `detached`
+        if (p[i] == kDetachedDirName || p[i] == kMovingDirName)
+            return PartDirAnchor{0, i}; // table id = the whole path before the reserved dir
 
     // ACCEPTED LIMITATION: a non-Atomic database or table literally named `detached` is misparsed
     // by this anchor — e.g. data/db/detached/all_1_1_0/... folds to table id "data/db" with

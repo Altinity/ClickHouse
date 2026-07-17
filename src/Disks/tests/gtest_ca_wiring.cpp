@@ -147,6 +147,27 @@ TEST(CaPartPathParser, MovingPathsReportTheSharedMovingComponent)
     EXPECT_EQ(d->file, "all_1_1_0/data.bin");
 }
 
+TEST(CaPartPathParser, MovingPathsNonAtomicFoldIntoTheTableNamespace)
+{
+    // Mirrors DetachedPathsNonAtomicFoldIntoTheTableNamespace (U#6): without an explicit anchor
+    // the right-to-left part-dir scan would anchor on the INNER real part dir and fold "moving"
+    // into a spurious table_uuid ("data/<db>/<table>/moving"), diverging from the table's real
+    // namespace -- the identical bug class the detached anchor was added to prevent.
+    auto d = parsePartFilePath("data/db/tbl/moving/all_1_1_0/data.bin");
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(d->table_uuid, "data/db/tbl");
+    EXPECT_EQ(d->part_name, std::string(kMovingDirName));
+    EXPECT_EQ(d->file, "all_1_1_0/data.bin");
+
+    // The bare non-Atomic moving CONTAINER dir folds to part_name == "moving" with an empty
+    // file, exactly like the Atomic container.
+    auto c = parsePartFilePath("data/db/tbl/moving");
+    ASSERT_TRUE(c.has_value());
+    EXPECT_EQ(c->table_uuid, "data/db/tbl");
+    EXPECT_EQ(c->part_name, std::string(kMovingDirName));
+    EXPECT_TRUE(c->file.empty());
+}
+
 TEST(CaPartPathParser, DetachedPathsNonAtomicFoldIntoTheTableNamespace)
 {
     // U#6: the Ordinary/non-Atomic detached form data/<db>/<table>/detached/<part>/<file> must fold
