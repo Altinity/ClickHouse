@@ -11,6 +11,7 @@
 #include <Common/thread_local_rng.h>
 #include <Common/config_version.h>
 #include <base/defines.h>
+#include <fmt/format.h>
 #include <algorithm>
 #include <chrono>
 
@@ -131,16 +132,16 @@ void PartWriteTxn::requireAlive() const
     /// (nor stage more debris there), so every further op fails closed here -- fast, before any backend
     /// work, with a clear diagnostic (the append lane would reject a promote/precommit anyway).
     if (cancelled.load(std::memory_order_acquire))
-        throw Exception(ErrorCodes::ABORTED,
+        throwCasWriteRetryLater(
             "PartWriteTxn cancelled: its owning namespace was removed (dropNamespace) while this build was "
             "in flight; restart the build only after the namespace is recreated");
     /// Self-remount (fence-out recovery) supersedes the mount incarnation this build was minted
     /// under; its write fence already interrupted the build mid-flight, so every further step fails
     /// closed and the caller restarts the build under the live epoch.
     if (const uint64_t live = store->liveWriterEpoch(); epoch != live)
-        throw Exception(ErrorCodes::ABORTED,
+        throwCasWriteRetryLater(fmt::format(
             "PartWriteTxn (writer_epoch {}) belongs to a superseded mount incarnation (live epoch {}) — "
-            "the mount was fenced out and self-remounted; restart the build", epoch, live);
+            "the mount was fenced out and self-remounted; restart the build", epoch, live));
 }
 
 PutBlobResult PartWriteTxn::putBlob(const BlobRef & ref, BlobSource source)
@@ -537,12 +538,12 @@ void PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef & ref, const 
         /// Unresolved = budget exhausted or fence lost without a definite outcome. Nothing referenced
         /// this incarnation (deps/meta are recorded only on a definite outcome); a late-landing body is
         /// inert debris behind the content-addressed key — a future writer of the same content adopts
-        /// or displaces it through the normal occupancy machinery. ABORTED = the same retryable abort
-        /// class stageManifest and the ref lane map their exhausted budgets to.
-        throw Exception(ErrorCodes::ABORTED,
+        /// or displaces it through the normal occupancy machinery. NETWORK_ERROR = the same retryable
+        /// abort class stageManifest and the ref lane map their exhausted budgets to (fix #37 phase 2).
+        throwCasWriteRetryLater(fmt::format(
             "uploadFromSource: conditional create at '{}' is UNCERTAIN (retry budget exhausted or mount "
             "fence lost) — nothing was acknowledged; retry re-uploads from the writer's own source (INV-1)",
-            key);
+            key));
     };
 
     /// Phase 1: try If-None-Match upload (object absent or race with another writer).
@@ -784,18 +785,18 @@ ManifestId PartWriteTxn::stageManifest(std::vector<ManifestEntry> entries)
     Token manifest_token;
     const CasWriteOutcome put_outcome = store->stagingPutIfAbsent(key, encoded, &manifest_token);
     if (put_outcome == CasWriteOutcome::DefiniteFailure)
-        throw Exception(ErrorCodes::ABORTED,
+        throwCasWriteRetryLater(fmt::format(
             "stageManifest: part-manifest PUT at '{}' definitively failed (non-retryable rejection); "
-            "nothing was named — the caller re-stages with a fresh ManifestId", key);
+            "nothing was named — the caller re-stages with a fresh ManifestId", key));
     /// Unresolved = budget exhausted (or fence lost) without a definite outcome. Unlike the ref-log
     /// lane there is nothing to wedge: this id was never named by any owner transition
     /// (`next_manifest_ordinal` is already past it, so no re-stage ever reuses the key), and a
-    /// late-landing body is inert unreferenced debris for the orphan-manifest sweep. ABORTED = the
-    /// same retryable abort class the ref lane's exhausted budget maps to.
+    /// late-landing body is inert unreferenced debris for the orphan-manifest sweep. NETWORK_ERROR =
+    /// the same retryable abort class the ref lane's exhausted budget maps to (fix #37 phase 2).
     if (put_outcome == CasWriteOutcome::Unresolved)
-        throw Exception(ErrorCodes::ABORTED,
+        throwCasWriteRetryLater(fmt::format(
             "stageManifest: part-manifest PUT at '{}' is UNCERTAIN (retry budget exhausted) — "
-            "nothing conclusive was named; the caller re-stages with a fresh ManifestId", key);
+            "nothing conclusive was named; the caller re-stages with a fresh ManifestId", key));
 
     EventEmitter{*store}.emit([&](CasEvent & e)
     {
@@ -900,13 +901,13 @@ void PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
     const String manifest_key = store->layout().manifestKey(id);
     const auto body_got = store->backend().get(manifest_key);
     if (!body_got)
-        throw Exception(ErrorCodes::ABORTED,
-            "promote: manifest body absent at {} — failing closed (retry with a fresh ManifestId)", manifest_key);
+        throwCasWriteRetryLater(fmt::format(
+            "promote: manifest body absent at {} — failing closed (retry with a fresh ManifestId)", manifest_key));
     const PartManifest body = decodePartManifest(openObject(FormatId::PartManifest, body_got->bytes));
     if (!refMatchesBody(id.ref, body))
-        throw Exception(ErrorCodes::ABORTED, "promote: RefMatchesBody failed for {}", manifest_key);
+        throwCasWriteRetryLater(fmt::format("promote: RefMatchesBody failed for {}", manifest_key));
     if (!manifestNamespaceMatches(target_ns, body))
-        throw Exception(ErrorCodes::ABORTED, "promote: ManifestNamespaceMatches failed for {}", manifest_key);
+        throwCasWriteRetryLater(fmt::format("promote: ManifestNamespaceMatches failed for {}", manifest_key));
 
     /// D3 (spec 2026-07-09-cas-writer-gc-simplification): the copy-forward pre-pass is removed — the
     /// in-closure blob revalidation below is now the SINGLE copy-forward site. Trade-off: the rare
@@ -946,11 +947,11 @@ void PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
             /// `id.ref` alone identifies the build (spec: "there is no second
             /// build token"), so an exact-binding lookup answers the same question directly.
             if (!state.precommits.contains({final_ref_name, id.ref}))
-                throw Exception(ErrorCodes::ABORTED,
+                throwCasWriteRetryLater(fmt::format(
                     "promote: precommit owner binding for ref '{}' (build {}) was removed (abandon or GC "
                     "reclaim) and is no longer the live owner — failing closed; the build must restart "
                     "(WPromote owner==bld)",
-                    final_ref_name, u128ToHex(promote_build_id));
+                    final_ref_name, u128ToHex(promote_build_id)));
 
             /// Blob-leaf revalidation (§4 manifest-trust relink, spec 2026-07-13 §4). TOKENED leaves are
             /// edge-protected — EDGE-BEFORE-OBSERVE: the precommit closure was durable BEFORE putBlob
@@ -1012,9 +1013,9 @@ void PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
                 it != state.committed.end() && !(it->second.manifest_ref == id.ref))
             {
                 if (!allow_repoint)
-                    throw Exception(ErrorCodes::ABORTED,
+                    throwCasWriteRetryLater(fmt::format(
                         "promote: ref '{}' already names a different committed manifest — refusing to overwrite "
-                        "(unique-ref invariant; use republishRef for an intended repoint)", final_ref_name);
+                        "(unique-ref invariant; use republishRef for an intended repoint)", final_ref_name));
                 repoint_old = it->second.manifest_ref;
             }
 
