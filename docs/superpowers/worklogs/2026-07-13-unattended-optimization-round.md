@@ -201,3 +201,8 @@ after 7 days). This file is the log.
 20:06 WATCHDOG: phase-5 review in flight (8min, report pending — normal); soak cluster torn down; integrator+drafter standing by; disk 77%. OK
 20:15 phase-5 approved-with-nits; fix wave + phase-3 draft dispatched in parallel. OK
 20:26 WATCHDOG: fix-wave edits in tree (CasFsck/CasBlobInDegree per announced scope, window OPEN, build pending); phase-3 drafter at 11 files; disk 77%. OK
+20:46 WATCHDOG: phase-3 drafter at 29 files, last edit 20:34 (12min quiet — finishing DRAFT.md/patch likely; ping threshold next tick); integrator+reviewer warm-idle; disk 77%. OK
+20:53 phase-3 draft in; integration + phase-6 planning running in parallel. OK
+
+--- 2026-07-16 (post-compaction, Opus, quota recovered) ---
+WATCHDOG 00:2x: nothing running (no ninja/ch/soak/docker procs), nothing hung, no pending triage. Disk 77%, no debris. HEAD=b6a78066b09 (phase-6 plan) + b44b7952ffc (phase-3). #48 soak archived GREEN; #49 gate closed. Per protocol -> proceed next queued item = codecs-v3 PHASE-6 (embedded manifest stream). Dispatching one fresh implementer (Sonnet 5/medium, subagent-driven-development, per-task build+test+commit) per POLICY RESET standing rules. INTERVENED: none — normal campaign advance.
