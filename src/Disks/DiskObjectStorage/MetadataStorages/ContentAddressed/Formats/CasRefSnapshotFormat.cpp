@@ -69,9 +69,10 @@ void checkPrecommitsSorted(const std::vector<RefOwnerBinding> & rows)
     }
 }
 
-/// Whole-object validation (identical rule set to the retired binary codec): txn-id nonzero-ness, the
-/// Live/Removed shape, the sealed_from bound, and sortedness. Applied to both the object about to be
-/// encoded and the object just decoded.
+/// Whole-object validation: transaction IDs must be nonzero, lifecycle determines whether removal
+/// metadata and rows are allowed, `sealed_from` must not be later than `snapshot_id`, and both row
+/// vectors must be strictly sorted. Applying the same checks before encoding and after decoding
+/// keeps malformed caller state and malformed stored data subject to the same contract.
 void checkSnapshotInvariants(const RefTableSnapshot & snapshot)
 {
     checkTxnIdNonzero(snapshot.snapshot_id, "snapshot_id");
@@ -154,6 +155,10 @@ struct ManifestFields
     std::optional<uint64_t> me;
     std::optional<uint64_t> mb;
     std::optional<uint64_t> mo;
+
+    /// Reconstruct a manifest reference after the tolerant reader has collected all three flat
+    /// fields. Missing fields are malformed input; `manifestRefFromFields` performs the remaining
+    /// range checks and reports the same corruption context as the row decoder.
     ManifestRef build(std::string_view what) const
     {
         if (!me || !mb || !mo)
@@ -171,7 +176,6 @@ String encodeRefTableSnapshot(const RefTableSnapshot & snapshot)
     WriteBufferFromOwnString out;
     writeHeaderLine(out, FormatId::RefSnapshot);
 
-    /// meta line
     {
         bool first = true;
         writeKey(out, "ns", first);
@@ -210,7 +214,6 @@ RefTableSnapshot decodeRefTableSnapshot(
 
     RefTableSnapshot snapshot;
 
-    /// meta line
     {
         const String line = readLine(in, line_cap, "cas_ref_snap");
         ReadBufferFromMemory m(line.data(), line.size());
@@ -318,7 +321,9 @@ RefTableSnapshot decodeRefTableSnapshot(
             throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableSnapshot: unknown row kind '{}'", k);
     }
 
-    /// Key↔body binding (spec §Object Layout).
+    /// The object key is supplied separately from the body. Check the binding before accepting any
+    /// decoded state so bytes stored under one namespace or snapshot ID cannot be interpreted as
+    /// another object.
     if (snapshot.ns != expected_ns || snapshot.snapshot_id != expected_snapshot_id)
         throw Exception(ErrorCodes::CORRUPTED_DATA,
             "RefTableSnapshot: body (ns='{}', snapshot_id={}-{}) does not match the key it was read from "

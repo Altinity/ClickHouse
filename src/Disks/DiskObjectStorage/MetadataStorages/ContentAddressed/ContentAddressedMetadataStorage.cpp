@@ -223,8 +223,8 @@ void ContentAddressedMetadataStorage::runOneGcRoundForTest()
     /// The pacing scheduler must be STABLE across calls: the lease's observation-window steal
     /// protocol compares consecutive observations of the SAME observer (gc_id), so an ad-hoc
     /// scheduler per call would acquire the lease on the first call and then back off forever
-    /// ("incumbent alive" - its own previous incarnation). Found by the M-W retro: the original
-    /// per-call one-shot made every round after the first a silent no-op.
+    /// ("incumbent alive" - its own previous incarnation). Recreating the scheduler for every call
+    /// would therefore make every round after the first a silent no-op.
     ContentAddressed::CasGcScheduler * sched;
     {
         std::lock_guard lock(gc_scheduler_mutex);
@@ -401,7 +401,7 @@ void ContentAddressedMetadataStorage::startup()
     /// object storage has none). That emulation is per-process: two servers pointed at the SAME local
     /// pool (e.g. an NFS/shared mount) each keep independent token state and would silently violate
     /// the CAS invariants — the capability probe cannot detect this (each process passes it alone).
-    /// Make a shared-pool misconfiguration visible (review #1 / B25), but at INFO — NOT WARNING.
+    /// Make a shared-pool misconfiguration visible at INFO, not WARNING.
     /// An inline `disk = disk(... object_storage_type=local ...)` opens the disk on the QUERY thread, so
     /// a WARNING is forwarded to the client at the functional-test default `send_logs_level=warning` and
     /// fails EVERY such query (clickhouse-test fails a test on ANY client stderr). At INFO the message
@@ -426,7 +426,7 @@ void ContentAddressedMetadataStorage::startup()
     /// The configured prefix is an endpoint sub-path and usually carries a TRAILING slash
     /// ("content_addressed_s3/"); Cas::Layout joins components with '/', and a doubled slash in
     /// keys is backend-hostile (RustFS rejects "p//_probe" LIST prefixes with InvalidArgument -
-    /// T13 finding; MinIO and the emulation merely tolerated it).
+    /// Some backends reject such prefixes while others merely tolerate them).
     while (!pool_prefix.empty() && pool_prefix.back() == '/')
         pool_prefix.pop_back();
     if (mode == Cas::ObjectStorageBackend::Mode::EmulatedSingleProcess)
@@ -455,7 +455,7 @@ void ContentAddressedMetadataStorage::startup()
     pool_config.background_watermark = (context != nullptr) && !read_only;
     pool_config.read_only = read_only;
     pool_config.skip_access_check = skip_access_check;
-    /// Node-local write algo (spec §5): `PoolMeta::createOrValidate` accepts it with no write once
+    /// The node-local write algorithm: `PoolMeta::createOrValidate` accepts it with no write once
     /// it is a member of the pool's `algos_used`; a not-yet-admitted algo is admitted via
     /// `blob_hash_allow_new` or refused (BAD_ARGUMENTS, the default).
     pool_config.blob_hash_algo = blob_hash_algo;
@@ -478,12 +478,11 @@ void ContentAddressedMetadataStorage::startup()
             .max_entry_bytes = cas_part_folder_cache_max_entry_bytes,
             .validate = part_folder_validate});
 
-    /// B170: bridge per-event CAS decisions to system.content_addressed_log (null sink when context
+    /// Bridge per-event CAS decisions to `system.content_addressed_log` (null sink when context
     /// is absent, e.g. unit tests — emitEvent is then a no-op single branch in the Core).
     cas_store->setEventSink(makeCasEventSink());
 
-    /// S3-native staging Task 3 (design `docs/superpowers/specs/2026-07-11-cas-s3-native-staging-design.md`
-    /// §3): the OPTIONAL mount-time capability probe for a write-once conditional server-side copy.
+    /// The optional mount-time capability probe for a write-once conditional server-side copy.
     /// Only relevant when this disk opted in to `staging_backend=s3`; `Local` (the default,
     /// global constraint: OFF BY DEFAULT) takes NO probe here — `conditional_copy_supported` simply
     /// stays at its `false` default and is never consulted on the local path. Skipped in
@@ -503,8 +502,7 @@ void ContentAddressedMetadataStorage::startup()
                 "staging_backend=s3 requested but the object storage does not enforce conditional "
                 "copy; falling back to local staging");
 
-        /// S3-native staging Task 6 (mount-lease-scoped staging sweeper, design §6): reclaim THIS
-        /// mount's own leaked `staging/<server_root_id>/` debris (a promote whose staging-delete never
+        /// Reclaim this mount's own leaked `staging/<server_root_id>/` debris (a promote whose staging-delete never
         /// ran, or an aborted transaction's never-promoted staging object — see
         /// `cleanupPendingTempFiles`) at mount start. Only runs when the S3 path is actually usable
         /// (`conditional_copy_supported`) — an unsupported/fail-closed-to-local mount never wrote any
@@ -520,7 +518,7 @@ void ContentAddressedMetadataStorage::startup()
 
     /// The background GC scheduler runs only on the disk-factory path (context non-null) and when
     /// enabled - the lease makes concurrent schedulers across mounters safe (work dedup), so no
-    /// further gating is needed (D-W5).
+    /// further gating is needed because the scheduler's lease coordinates concurrent mounters.
     if (context && gc_enabled && !read_only)
     {
         gc_scheduler = std::make_unique<ContentAddressed::CasGcScheduler>(
@@ -536,7 +534,7 @@ void ContentAddressedMetadataStorage::shutdown()
     {
         /// stop() joins the background threads and takes no lock of its own (loop()/heartbeatLoop()
         /// never touch gc_scheduler_mutex) -- safe to run unlocked. The destructive step is
-        /// gc_scheduler.reset(): B3's gcHealth() (reachable from an unprivileged SELECT on
+        /// gc_scheduler.reset(): `gcHealth` (reachable from an unprivileged SELECT on
         /// system.content_addressed_mounts, unlike the admin-only GC commands) dereferences the raw
         /// scheduler pointer under gc_scheduler_mutex, so the reset must serialize against it under the
         /// SAME mutex or a concurrent gcHealth() call races a use-after-free on the scheduler object.
@@ -573,18 +571,18 @@ MetadataTransactionPtr ContentAddressedMetadataStorage::createTransaction()
 
 String ContentAddressedMetadataStorage::stagingKeyPrefix() const
 {
-    /// Mirrors the Task 3 probe's own prefix construction (`startup()`'s `probe_prefix` above), minus
+    /// Mirrors the probe's own prefix construction (`startup`'s `probe_prefix` above), minus
     /// the probe's own `/probe` leaf — this is the writer-owned sibling subtree of the SAME
     /// `staging/<server_root_id>/` area. `store()` throws LOGICAL_ERROR before startup; every caller
     /// (writeFile, via a transaction) runs post-startup.
     return physicalKey(store()->poolConfig().pool_prefix + "/staging/" + server_root_id);
 }
 
-/// ==== D-W1 namespace mapping ====
+/// ==== namespace mapping ====
 
 std::string ContentAddressedMetadataStorage::serverPrefix() const
 {
-    /// Phase 1 layout: live namespaces and mirrored live-tree files are rooted by the configured
+    /// Live namespaces and mirrored live-tree files are rooted by the configured
     /// `server_root_id`, not by the ClickHouse ServerUUID-derived token. `ServerUUID` is only the
     /// mount owner token; `server_root_id` is the persistent layout identity.
     return server_root_id;
@@ -612,7 +610,7 @@ bool ContentAddressedMetadataStorage::liveTreeDirHasChildren(const std::string &
 
 Cas::RootNamespace ContentAddressedMetadataStorage::liveNamespace(const std::string & table_uuid) const
 {
-    /// Path-mirroring (design §5.1): the namespace IS the table's canonical disk path with the
+    /// Path mirroring: the namespace is the table's canonical disk path with the
     /// content-addressed boundary marked by `@cas@` on the table-dir segment, prefixed by the
     /// configured `server_root_id`. e.g. `<server_root_id>/store/3f2/3f2a…@cas@`.
     return Cas::RootNamespace{serverPrefix() + "/" + ContentAddressed::mirroredArchiveNamespace(table_uuid)};
@@ -628,7 +626,7 @@ Cas::RootNamespace ContentAddressedMetadataStorage::shadowNamespace(const std::s
     /// The LITERAL shadow table dir (shadow/<backup>/store/<u3>/<uuid> or .../data/<db>/<tbl>):
     /// bijective with the disk path for both layouts, pool-global (backups are read by any
     /// replica), and the shadow tree enumerates from Pool::listNamespaces("shadow/").
-    /// CANONICALIZED: the Unfreezer hands the dir with a trailing slash (T13 finding).
+    /// Canonicalize because the unfreezer can hand the directory a trailing slash.
     return Cas::RootNamespace{canonicalDiskPath(shadow_table_dir)};
 }
 
@@ -647,7 +645,7 @@ ContentAddressedMetadataStorage::route(const ContentAddressed::PartFilePath & p)
     if (p.part_name == ContentAddressed::kDetachedDirName)
     {
         /// The parser reports detached paths with part_name == "detached" and the real detached
-        /// part dir as the first component of `file` (the PoC contract, B36). B181 folds detached
+        /// part dir as the first component of `file`. Detached parts share the table namespace and
         /// INTO the table's OWN archive namespace: each detached part is a ref keyed by
         /// `detached/<part>` (vs a live `<part>`), so the re-split here keeps the table namespace
         /// and prepends the `detached/` ref prefix. An empty `p.file` (the bare `<table>/detached`
@@ -663,7 +661,7 @@ ContentAddressedMetadataStorage::route(const ContentAddressed::PartFilePath & p)
         /// L1 (MOVE-to-CA fix): re-split exactly like detached, folding onto a `moving/`-PREFIXED
         /// ref (kMovingRefPrefix) -- NOT the part's final ref directly. Publishing the clone under
         /// the final ref before the mover's swap would break move crash-atomicity: a crash between
-        /// the clone commit and swapClonedPart would leave a committed LIVE ref that never went
+        /// the clone publication and swapClonedPart would leave a committed LIVE ref that never went
         /// through the swap, and moving/'s own startup cleanup couldn't distinguish that premature
         /// ref from a real live part. The staging ref keeps the pre-swap clone un-live; the mover's
         /// rename does a real ref repoint moving/<part> -> <part> (the same committed-ref-repoint
@@ -710,10 +708,10 @@ bool ContentAddressedMetadataStorage::existsFile(const std::string & path) const
             const auto ns = liveNamespace(tf->table_uuid);
             return namespaceFilesReadable(ns) && store()->getNamespaceFile(ns, tf->tail).has_value();
         }
-        /// A loose mountpoint object (design §5.2): a plain object at roots/<server_root_id>/<path>.
+        /// A loose mountpoint object is a plain object at roots/<server_root_id>/<path>.
         /// Use a HEAD-based existence check (directory-safe), NOT a body read: the traversal in
         /// system.remote_data_paths probes existsFile on directory-shaped pool paths (e.g. `store`), and a
-        /// body read (getMountpointObject) throws "Is a directory". A directory is not-a-file (B38).
+        /// body read (getMountpointObject) throws "Is a directory". A directory is not a file.
         return store()->mountpointObjectExists(serverPrefix() + "/" + path);
     }
 
@@ -724,8 +722,8 @@ bool ContentAddressedMetadataStorage::existsFile(const std::string & path) const
     if (!r || r->file.empty())
         return false;
 
-    /// All-tree-part-files Task 9: uuid.txt/metadata_version.txt/txn_version.txt flow through the
-    /// ordinary content path like any other file (Task 6) -- no ForceFresh special case is needed.
+    /// Per-part files flow through the ordinary content path like any other file; no ForceFresh
+    /// special case is needed.
     /// Safe to serve a CACHED view here: every committed-ref write that could have moved this entry
     /// (`repointRef`/`promoteBuild`) erases the cached view on success, so a stale hit is impossible
     /// by construction, not by freshness policy.
@@ -844,7 +842,7 @@ bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) 
             /// under this path still has a LIVE ref. A raw object LIST of the mirrored subtree would count
             /// tombstoned-but-not-yet-GC'd shard/manifest objects — CA removal is tombstone + deferred GC
             /// (`removeRecursive`/`dropNamespace` only tombstone; `Cas::Gc` physically deletes later) — so a
-            /// just-`UNFREEZE`d backup dir would spuriously "exist" until a GC round runs (B3/B186). Instead
+            /// just-`UNFREEZE`d backup dir would spuriously "exist" until a GC round runs. Instead
             /// enumerate the namespaces exactly as `removeRecursive` does (`listNamespaces(scope)`) and
             /// consult the tombstone-aware `listRefs` (as the `endsWithTableUuidPair` case above does), so
             /// existence is consistent with the ref-level signal and independent of GC timing.
@@ -858,10 +856,10 @@ bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) 
         case DirShape::AtomicShard:
             return liveTreeDirHasChildren(path);
         case DirShape::TableDir:
-            /// Table dir exists iff it has at least one committed part (the PoC's refs-only rule).
+            /// A table directory exists iff it has at least one committed part.
             return !store()->listRefs(liveNamespace(*dr.uuid)).empty();
         case DirShape::DetachedContainer:
-            /// Exists iff it has at least one ref (B181).
+            /// Exists iff it has at least one reference.
             return !detachedRefNames(dr.r->ns).empty();
         case DirShape::MovingContainer:
             /// Exists iff it has at least one staging ref (MOVE-to-CA fix, mirrors DetachedContainer).
@@ -990,7 +988,7 @@ std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const st
         }
         case DirShape::ShadowIntermediate:
         {
-            /// Enumerate children via a scoped S3 LIST of the mirrored subtree (design §5.3). A
+            /// Enumerate children via a scoped LIST of the mirrored subtree. A
             /// mirrored LIST naturally surfaces intermediate path segments AND `@cas@`-suffixed
             /// table dirs; strip the trailing `@cas@` for the logical view. Loose LIST is fine: the
             /// existing listRefs re-check filters out dropped-but-registered archives so they don't
@@ -1010,7 +1008,7 @@ std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const st
             return listLiveTreeChildren(path);
         case DirShape::TableDir:
         {
-            /// Part names (live + B181 detached `detached/<part>` refs) + table-level verbatim
+            /// Part names (live and `detached/<part>` references) plus table-level verbatim
             /// file names; addFirstComponent collapses both to their first path segment (live part
             /// names and the single `detached` subdir, exactly like a nested verbatim file).
             const auto ns = liveNamespace(*dr.uuid);
@@ -1026,7 +1024,7 @@ std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const st
         }
         case DirShape::DetachedContainer:
         {
-            /// Detached part names (prefix stripped; never files, B36/B181).
+            /// Detached part names (prefix stripped; never files).
             std::vector<std::string> result;
             for (const auto & ref : detachedRefNames(dr.r->ns))
                 result.push_back(ref.substr(ContentAddressed::kDetachedRefPrefix.size()));
@@ -1090,7 +1088,7 @@ bool ContentAddressedMetadataStorage::isDirectoryEmpty(const std::string & path)
 {
     /// A part directory's files are virtual (derived from the tree): report it EMPTY so
     /// DiskObjectStorage::removeDirectory proceeds straight to the ref-unlink instead of throwing
-    /// CANNOT_RMDIR per removal (the PoC's B45). Same for a projection subdir (B60). The detached
+    /// CANNOT_RMDIR per removal. The same applies to a projection subdirectory. The detached
     /// CONTAINER and TABLE dirs keep the listing-based emptiness (DROP TABLE's non-empty guard).
     if (auto p = ContentAddressed::parsePartFilePath(path))
     {
@@ -1119,7 +1117,7 @@ StoredObjects ContentAddressedMetadataStorage::getStorageObjects(const std::stri
                 "ContentAddressed: table-level verbatim file is in-manifest, not a storage object: {}", path);
         /// A loose mountpoint object: a real plain object at roots/<server_root_id>/<path>. The
         /// StoredObject key must be the PHYSICAL path (physicalKey-adjusted for Local backends).
-        /// Probe with a HEAD (directory-safe, B38), NOT a body read: `system.remote_data_paths`
+        /// Probe with a HEAD (directory-safe), not a body read: `system.remote_data_paths`
         /// may reach here on a directory-shaped pool path and a GET would throw "Is a directory".
         const std::string pool_key = store()->layout().mountpointObjectKey(serverPrefix() + "/" + path);
         if (store()->mountpointObjectExists(serverPrefix() + "/" + path))
@@ -1189,7 +1187,7 @@ std::optional<String> ContentAddressedMetadataStorage::tryGetInManifestBytes(con
             const auto ns = liveNamespace(tf->table_uuid);
             return namespaceFilesReadable(ns) ? store()->getNamespaceFile(ns, tf->tail) : std::nullopt;
         }
-        return std::nullopt;   /// loose files are plain objects, not in-manifest bytes (design §5.2)
+        return std::nullopt;   /// loose files are plain objects, not in-manifest bytes
     }
 
     auto p = ContentAddressed::parsePartFilePath(path);
@@ -1263,11 +1261,11 @@ std::unique_ptr<ReadBufferFromFileBase> ContentAddressedMetadataStorage::readBlo
         std::move(impl), path, location.offset, location.offset + location.length);
 }
 
-/// ==== IContentAddressedExchange (M-W T11; B7 part_manifest_v2, self-contained since all-tree Task 7) ====
+/// ==== `IContentAddressedExchange` ====
 
 std::optional<String> ContentAddressedMetadataStorage::getPartManifestBytes(const String & part_path) const
 {
-    /// Sender side (B7): the committed part's encoded `PartManifest` body — the opaque payload the
+    /// Sender side: the committed part's encoded `PartManifest` body — the opaque payload the
     /// receiver decodes. Resolve the part path to its (ns, ref) exactly as the read surface does
     /// (route), resolve the committed ref to its ManifestId, read the immutable manifest, and re-encode
     /// it canonically. nullopt when the path is not a committed content-addressed part here (no ref =>
@@ -1298,14 +1296,14 @@ bool ContentAddressedMetadataStorage::adoptPartFromManifest(
     if (read_only)
         throw Exception(ErrorCodes::READONLY, "Content-addressed disk is opened read-only: adoptPartFromManifest is rejected");
 
-    /// Receiver side (B7 part_manifest_v2). Sender identity is NON-AUTHORITATIVE: we ignore the decoded
+    /// Receiver side. Sender identity is non-authoritative: we ignore the decoded
     /// ManifestRef, root_namespace_id and payload_digest, and use ONLY the entries. We run a normal
     /// LOCAL build (the proven republishRef sequence) over the SHARED-pool blobs — adopted by hash via
     /// adoptEvidence, NO blob body transferred — then stage a FRESH receiver-local ManifestId in the
-    /// RECEIVER namespace, precommitAdd, and promote. §4 manifest-trust: promote TRUSTS the adopted leaves
+    /// receiver namespace, `precommitAdd`, and promote. Promotion trusts the adopted leaves
     /// via the durable manifest edge (no per-file HEAD/loadMeta probe); a genuinely-absent adopted blob is
-    /// an invariant violation caught by fsck, not here — the D4 relink trust model (ordinary
-    /// ReplicatedMergeTree interserver trust). A retryable promote failure (a body-absent precommit, a
+    /// an invariant violation caught by fsck, not here — the ordinary
+    /// ReplicatedMergeTree interserver trust. A retryable promote failure (a body-absent precommit, a
     /// precommit that is no longer the live owner, or a ref conflict => `ABORTED` or `NETWORK_ERROR`, the
     /// retry-later class), a manifest decode failure, or any other error returns false, publishing NOTHING,
     /// so the caller byte-fetches instead.
@@ -1332,28 +1330,28 @@ bool ContentAddressedMetadataStorage::adoptPartFromManifest(
     {
         /// Sender identity is NON-AUTHORITATIVE: only the entries are used. The blobs are already
         /// in the shared pool (referenced by hash) — publishEntries adopts them as tokenless
-        /// W-EVIDENCE and promote re-proves each fail-closed (the proven republish sequence).
+        /// W-EVIDENCE; promotion trusts them through the durable manifest edge (no per-blob re-probe).
         ///
-        /// COMMIT-BEFORE-RELEASE gap (tasks #42/#43; deep-tail, interim-accepted). The relink sender is
+        /// There is a commit-before-release gap. The relink sender is
         /// fire-and-forget (DataPartsExchange.cpp:256-259 releases the source part before this commit), so
         /// there is no in-degree overlap: if THIS precommitAdd edge-PUT stalls across >= 2 GC folds while
         /// the source's Outdated part is concurrently collected and the blob has no other ref, the blob can
         /// be reclaimed under us → a dangling committed manifest (fsck-detected). deleteExact covers every
-        /// token-CHANGE recovery; only this same-token tail remains. The real fix reuses the read-replica
-        /// GC retention floor (spec 2026-07-14-cas-readonly-replica-snapshot-pin-design.md §8.1): the
-        /// fetching replica takes a transient retention pin on the source snapshot for the relink duration.
+        /// token-CHANGE recovery; only this same-token tail remains. A retention floor for read-replica
+        /// snapshots is the intended protection for the source manifest while this asynchronous relink
+        /// is in progress, but that protocol is not wired here yet; the current same-token tail remains
+        /// an acknowledged fsck-detectable risk.
         /// Do NOT build a bespoke relink handshake — the Poco interserver transport is half-duplex.
         partAccess().publishEntries({receiver_ns, part_name}, decoded.entries, Cas::ProvenanceOp::Attach);
         return true;
     }
     catch (const Exception & e)
     {
-        /// `ABORTED` or `NETWORK_ERROR` = a body-absent precommit, a precommit binding that is no longer
-        /// the live owner, or a ref conflict: retryable, the caller byte-fetches. (The retry-later class
-        /// was rerouted from `ABORTED` to `NETWORK_ERROR` so the merge backoff engages; both are still the
-        /// expected path here.) §4 manifest-trust: promote no longer probes the adopted pool blobs, so an
-        /// absent/condemned blob no longer surfaces here — that invariant violation is a fsck finding (D4
-        /// relink trust), not a relink abort. Any other exception: fail SAFE to a byte fetch too (publish
+        /// `ABORTED` or `NETWORK_ERROR` means a body-absent precommit, a precommit binding that is no longer
+        /// the live owner, or a ref conflict: retryable, the caller byte-fetches. Both codes are part of
+        /// the retry-later path so merge backoff can engage. Promotion trusts the adopted pool blobs through the durable manifest edge,
+        /// so an absent or condemned blob is an fsck finding, not a relink abort. Any other exception:
+        /// fail safe to a byte fetch too (publish
         /// nothing), but log it as it is not the expected retryable path.
         if (e.code() == ErrorCodes::ABORTED || e.code() == ErrorCodes::NETWORK_ERROR)
             LOG_INFO(getLogger("ContentAddressedMetadataStorage"), "Relink of part {} deferred (body-absent precommit, "

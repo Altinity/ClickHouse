@@ -75,7 +75,8 @@ void writeBlobRefFields(WriteBuffer & out, bool & first, const BlobRef & r)
 
 void writeManifestRefFields(WriteBuffer & out, bool & first, std::string_view prefix, const ManifestRef & r)
 {
-    /// Concatenate the prefix into each key name. Keys stay 2-5 chars ("me"/"mb"/"mo", or "ome"/"nmo").
+    /// Concatenate the prefix into each key name. Keys stay 2-5 characters ("me"/"mb"/"mo", or
+    /// "ome"/"nmo"), preserving the flat JSON shape used by the ref codecs and part manifests.
     const String me = String(prefix) + "me";
     const String mb = String(prefix) + "mb";
     const String mo = String(prefix) + "mo";
@@ -90,6 +91,8 @@ void writeManifestRefFields(WriteBuffer & out, bool & first, std::string_view pr
 ManifestRef manifestRefFromFields(uint64_t writer_epoch, uint64_t build_sequence, uint64_t manifest_ordinal,
                                   std::string_view caller, std::string_view what)
 {
+    /// Check the upper bound before narrowing the caller-supplied value to the in-memory ordinal
+    /// type. `checkManifestRef` then applies the shared nonzero and lower-bound checks.
     if (manifest_ordinal > kMaxManifestOrdinal)
         throw Exception(ErrorCodes::CORRUPTED_DATA,
             "CAS {}: {} manifest_ordinal {} out of range", caller, what, manifest_ordinal);
@@ -97,7 +100,6 @@ ManifestRef manifestRefFromFields(uint64_t writer_epoch, uint64_t build_sequence
     r.writer_epoch = writer_epoch;
     r.build_sequence = build_sequence;
     r.manifest_ordinal = static_cast<uint32_t>(manifest_ordinal);
-    /// Full field validation (nonzero we/bs, ordinal in [1, max]) — the same rule the binary codec applied.
     checkManifestRef(r, caller, what);
     return r;
 }

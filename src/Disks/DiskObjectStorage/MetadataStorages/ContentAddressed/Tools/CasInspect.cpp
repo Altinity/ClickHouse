@@ -103,9 +103,10 @@ String renderManifestRef(const ManifestRef & r)
         .str();
 }
 
-/// The snapshot+log ref objects (spec §Object Layout). `renderRefTxnIdObj` renders the raw
-/// `{writer_epoch, ref_sequence}` fields rather than the canonical hex render (which throws on a zero
-/// field) so inspect can dump any object, even a malformed one, without failing.
+/// Snapshot and log ref objects use `RefTxnId` values with `writer_epoch` and `ref_sequence` fields.
+/// `renderRefTxnIdObj` renders those raw numeric fields rather than the canonical hex form, which
+/// rejects a zero field, so inspection can dump any object, including a malformed one, without
+/// failing while rendering its identifiers.
 String renderRefTxnIdObj(const RefTxnId & id)
 {
     return JsonObj()
@@ -171,10 +172,10 @@ String renderRefTableSnapshot(const RefTableSnapshot & s)
         .add("snapshot_id", renderRefTxnIdObj(s.snapshot_id))
         .add("lifecycle", jsonEscape(refLifecycleName(s.lifecycle)))
         .add("remove_txn_id", s.remove_txn_id ? renderRefTxnIdObj(*s.remove_txn_id) : "null")
-        /// fix-round F10 (author-review): without this, a recovery seal (rev.6 §recovery-seal) is
-        /// indistinguishable from an ordinary snapshot in clickhouse-disks/inspect -- an operator
-        /// investigating a `RefLateLogDetected` event (whose detail cites this same field) can't see
-        /// the observation horizon it was measured against. `null` for an ordinary (non-seal) snapshot.
+        /// A recovery seal records the greatest transaction id observed by the recovery `LIST`.
+        /// This value is the lower boundary for identifying a log that materialized after that
+        /// `LIST` but is covered by the seal; it is also needed by `RefLateLogDetected` diagnostics.
+        /// Ordinary snapshots do not establish such an observation boundary and therefore use `null`.
         .add("sealed_from", s.sealed_from ? renderRefTxnIdObj(*s.sealed_from) : "null")
         .add("committed", jsonArray(committed))
         .add("precommits", jsonArray(precommits))
@@ -235,9 +236,9 @@ String placementName(EntryPlacement p)
 /// data, not part-manifest identity, and may be arbitrarily large / non-UTF8.
 String renderManifestEntry(const ManifestEntry & e)
 {
-    /// Phase 3 T2: render `blobIdOf(e.ref)` ("<algoName>:<hex>") — the rendered id must never be a bare
-    /// hex (ambiguous across algos in a mixed-algo pool) and needs no manifest-wide width any more:
-    /// each entry's own `ref.algo` determines its digest width.
+    /// Render `blobIdOf(e.ref)` ("<algoName>:<hex>"). The algorithm must remain part of the
+    /// rendered identity: a bare digest is ambiguous in a pool containing algorithms with different
+    /// digest widths, and each entry's own `ref.algo` determines its width.
     return JsonObj()
         .add("path", jsonEscape(e.path))
         .add("placement", jsonEscape(placementName(e.placement)))
@@ -358,8 +359,9 @@ String renderFoldSeal(const CasFoldSeal & seal)
     for (const auto & r : seal.blob_target_runs)
         blob_target_runs.push_back(renderRunRef(r));
 
-    /// Retired-in-snapshot (spec §5): per-gc-shard summary of the `kCondemned` rows the seal's runs
-    /// carry, replacing the removed `GcState::retired_refs` dump.
+    /// A fold seal carries per-GC-shard totals for `kCondemned` rows in its source runs. Render the
+    /// summary from the seal itself; the older separate retired-reference object is no longer part
+    /// of the current layout.
     JsonObj condemned_summary;
     for (const auto & [shard, cs] : seal.condemned_summary)
         condemned_summary.add(std::to_string(shard), JsonObj()
@@ -411,9 +413,9 @@ String metaStateName(MetaState s)
     return "unknown";
 }
 
-/// The per-hash `.meta` descriptor sibling of a blob body (spec §raw-body-refinement, v3): a
-/// FRESHNESS MARKER (Clean/Condemned), not the blob's payload — rendered separately from
-/// `renderEnvelopeHeader`, which still decodes the (unchanged, still-enveloped) body itself.
+/// The per-hash `.meta` descriptor is the blob body's sibling and records its freshness state
+/// (`Clean` or `Condemned`), not its payload. It is rendered separately from `renderEnvelopeHeader`:
+/// the body remains an enveloped object, while the descriptor has its own format.
 String renderBlobMeta(const BlobMeta & m)
 {
     return JsonObj()
@@ -429,8 +431,8 @@ String renderEnvelopeHeader(const EnvelopeHeader & h)
 {
     return JsonObj()
         .add("kind", jsonEscape(objectKindName(h.kind)))
-        /// hash_algo / writer_version / domain_id dropped in the v3 envelope (identity lives in the
-        /// key; forensics ride on ch + bld); `compatibility_version` is the header `v`.
+        /// The blob identity is carried by the object key, so the envelope keeps only the provenance
+        /// fields needed for forensics (`ch` and `bld`) together with its compatibility version.
         .add("compatibility_version", jsonUInt(h.compatibility_version))
         .add("incarnation_tag", jsonHex(h.incarnation_tag))
         .add("build_id", jsonHex(h.build_id))
@@ -446,8 +448,7 @@ String caInspectToJson(const Layout & layout, const String & key, std::string_vi
 {
     /// Most-specific first: `cas/manifests/.../NNNNNN.zst` before the pool-wide `cas/refs/`
     /// prefix, the `/mount` and `/fold_seal` suffixes before the pool-wide `gc/state` exact match,
-    /// the `/retired/` segment before the pool-wide `blobs/` prefix, and (v3) the `.meta` sibling
-    /// suffix before the bare `blobs/` prefix it also matches.
+    /// and the `.meta` sibling suffix before the bare `blobs/` prefix it also matches.
     if (key.starts_with(layout.casManifestsPrefix()) && key.ends_with(storedSuffix(FormatId::PartManifest)))
         return renderPartManifest(decodePartManifest(openObject(FormatId::PartManifest, bytes)));
 
@@ -480,9 +481,9 @@ String caInspectToJson(const Layout & layout, const String & key, std::string_vi
     if (key.ends_with("/fold_seal"))
         return renderFoldSeal(decodeFoldSeal(bytes));
 
-    /// The per-hash meta descriptor (v3): `blobMetaKey(id) == blobKey(id) + ".meta"`, so it ALSO
-    /// matches `blobsPrefix()` below — must be checked first or it would wrongly decode as an
-    /// envelope. The body itself (non-`.meta`) is unchanged: it still carries its envelope.
+    /// `blobMetaKey(id) == blobKey(id) + ".meta"`, so a meta descriptor also matches
+    /// `blobsPrefix()` below. Check it first or it would be decoded incorrectly as an envelope. A
+    /// non-`.meta` blob body still carries its envelope.
     if (key.starts_with(layout.blobsPrefix()) && key.ends_with(".meta"))
         return renderBlobMeta(decodeBlobMeta(bytes));
 

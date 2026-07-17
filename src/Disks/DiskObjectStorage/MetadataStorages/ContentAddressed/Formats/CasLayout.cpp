@@ -5,9 +5,8 @@
 namespace DB::Cas
 {
 
-/// Defined out-of-line from CasLayout.h: the header cannot include CasBlobRef.h (that would cycle
-/// back through CasBlobDigest.h -> CasPoolMeta.h -> CasLayout.h). A .cpp has the complete BlobRef
-/// type and the hash-algo helpers with no cycle, so declaration and definition co-locate here.
+/// Blob-key operations are kept together with their parsing inverse. `CasTypes.h` supplies the
+/// complete `BlobRef` type and the hash-algorithm helpers used to render and validate the path.
 String Layout::blobKey(const BlobRef & ref) const
 {
     return shardedKey("blobs/" + String(blobHashAlgoName(ref.algo)), blobHexOf(ref));

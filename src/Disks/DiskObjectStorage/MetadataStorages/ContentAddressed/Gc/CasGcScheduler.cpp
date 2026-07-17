@@ -38,8 +38,9 @@ CasGcScheduler::CasGcScheduler(
     GcRoundLogger logger_)
     : store(std::move(store_))
     , interval(interval_)
-    /// B160: heartbeat cadence H = interval/4 (>= 50ms), comfortably below the follower's observation
-    /// window W (= interval), so a live leader's pulse always advances within W.
+    /// Keep the advisory pulse comfortably inside the follower's observation window. The lower
+    /// bound prevents an unusually small configured interval from creating an excessively busy
+    /// heartbeat worker.
     , hb_interval(std::max<std::chrono::milliseconds>(
           std::chrono::milliseconds(50),
           std::chrono::duration_cast<std::chrono::milliseconds>(interval_) / 4))
@@ -64,7 +65,7 @@ void CasGcScheduler::start()
         return;
     stopping = false;
     thread = ThreadFromGlobalPool([this] { loop(); });
-    hb_thread = ThreadFromGlobalPool([this] { heartbeatLoop(); });   /// B160
+    hb_thread = ThreadFromGlobalPool([this] { heartbeatLoop(); });
 }
 
 void CasGcScheduler::stop()
@@ -76,7 +77,7 @@ void CasGcScheduler::stop()
     wake.notify_all();
     if (thread.joinable())
         thread.join();
-    if (hb_thread.joinable())   /// B160
+    if (hb_thread.joinable())
         hb_thread.join();
 }
 
@@ -144,8 +145,8 @@ Cas::RoundReport CasGcScheduler::runRoundLogged(Cas::Gc & round_gc, GcRoundLogRe
         const Cas::RoundReport rep = round_gc.runRegularRound(std::move(on_lease_acquired), allow_steal);
         if (rep.acquired_lease)
         {
-            /// B3: feeds gcHealth() -- per-scheduler, unlike the retired process-global CurrentMetrics
-            /// gauges these replace (clobbered with >= 2 CAS disks in one process).
+            /// Keep health state per scheduler. Process-global gauges cannot distinguish multiple
+            /// content-addressed disks in one server process.
             pending_reclaim.fetch_add(
                 static_cast<Int64>(rep.condemned) - static_cast<Int64>(rep.redeleted),
                 std::memory_order_relaxed);
@@ -192,7 +193,7 @@ Cas::RoundReport CasGcScheduler::runOneRoundNow(GcRoundLogRecord::Trigger trigge
     /// steal a live incumbent — see Cas::Gc::runRegularRound's doc comment. Dead-incumbent recovery
     /// stays the loop's job (bounded ~2*interval; loop() below passes the default allow_steal=true).
     const Cas::RoundReport report = runRoundLogged(gc, trigger, [this] { onLeaseAcquired(); }, /*allow_steal=*/false);
-    i_am_leader.store(report.acquired_lease, std::memory_order_relaxed);   /// B160: gate the heartbeat, same as loop()
+    i_am_leader.store(report.acquired_lease, std::memory_order_relaxed);
     return report;
 }
 
@@ -223,7 +224,7 @@ void CasGcScheduler::loop()
             /// deterministically once that first round outlasts them. allow_steal defaults to true here
             /// (the loop is the ONLY caller allowed to execute the steal CAS).
             const Cas::RoundReport report = runRoundLogged(gc, GcRoundLogRecord::Trigger::Scheduled, [this] { onLeaseAcquired(); });
-            i_am_leader.store(report.acquired_lease, std::memory_order_relaxed);   /// B160: gate the heartbeat
+            i_am_leader.store(report.acquired_lease, std::memory_order_relaxed);
             if (report.acquired_lease)
             {
                 consecutive_backoffs = 0;
@@ -234,9 +235,10 @@ void CasGcScheduler::loop()
             else
             {
                 /// NEVER silent: a follower backing off is the normal multi-mounter state, but a
-                /// pool where THIS scheduler never leads must be observable (the lease layer is
-                /// outside the TLA+ model's liveness - a misuse that starves rounds, like the
-                /// retro's fresh-gc_id-per-call test-hook bug, would otherwise log nothing).
+                /// pool where this scheduler never leads must be observable. The lease layer
+                /// handles safety, while these messages expose a liveness problem such as every
+                /// round using a new scheduler identity and never accumulating the observations
+                /// needed for dead-incumbent recovery.
                 ++consecutive_backoffs;
                 if (consecutive_backoffs % 10 == 0)
                     LOG_INFO(log, "CA GC: lease held by another mounter for {} consecutive ticks "
@@ -249,7 +251,7 @@ void CasGcScheduler::loop()
         {
             /// Idempotent round - the next tick retries; failures must never kill the pacing thread.
             /// runRoundLogged already emitted the Aborted Finish row before rethrowing.
-            i_am_leader.store(false, std::memory_order_relaxed);   /// B160: a failed round => assume not leading
+            i_am_leader.store(false, std::memory_order_relaxed);
             tryLogCurrentException(log, "CA GC round failed (will retry next tick)");
         }
     }
@@ -257,9 +259,10 @@ void CasGcScheduler::loop()
 
 void CasGcScheduler::heartbeatLoop()
 {
-    /// B160: while this node holds the lease, bump gc/hb every hb_interval (H <= W) so a follower
-    /// never falsely steals from us while a long round freezes our lease.seq. Independent of round
-    /// progress; advisory (a missed/lost pulse is harmless). Shares the stop signal with loop().
+    /// Advance the advisory heartbeat independently of round progress. A long round updates the
+    /// durable lease only when it completes, so without these pulses a follower could mistake a
+    /// live leader for a dead one during the observation window. A missed pulse is harmless because
+    /// the heartbeat is advisory and the next cadence retries it.
     while (true)
     {
         {

@@ -26,7 +26,7 @@ namespace DB::Cas
 /// decision ever reads them.
 uint64_t retiredLogicalSize(ObjectKind kind, uint64_t object_size, uint64_t blob_header_len);
 
-/// Phase-4 skip-unchanged decision (spec 2026-07-06). Pure. Returns true iff the current round may be
+/// Pure skip-unchanged decision. Returns true iff the current round may be
 /// DEFERRED (re-adopt the sealed generation, no fold/delete). A round MUST fold when: enough shards
 /// changed (>= fold_threshold), OR a destructive decision is due (graduation_due), OR the defer bound
 /// is reached (rounds_since_last_fold >= fold_max_defer_rounds). The graduation_due term is the
@@ -35,8 +35,8 @@ bool shouldDeferRound(size_t changed_shards, bool graduation_due, uint64_t round
                       uint64_t fold_threshold, uint64_t fold_max_defer_rounds);
 
 /// One anomaly the fold surfaced (a clamped cursor — a missing committed/removal body, or the fold
-/// barrier on a live missing-body precommit). Surfaced to fsck/logs; NEVER a throw (record-and-continue,
-/// per feedback_ca_gc_never_throw_on_404).
+/// barrier on a live missing-body precommit). Surfaced to fsck/logs; recording an anomaly never throws:
+/// the round records the problem and continues, while the affected shard remains conservatively clamped.
 struct RoundAnomaly
 {
     RootNamespace ns;
@@ -45,10 +45,9 @@ struct RoundAnomaly
     String reason;
 };
 
-/// What one runRegularRound did (counters are health metrics, not protocol state).
-/// Outcome of `Gc::rebuildBaseline` (spec 2026-07-03-cas-gc-rebuild-design.md): either performed
-/// (with the minted numbering + coverage counters) or refused (fail-closed; `refusal` says why and
-/// nothing was committed — gc/state is untouched by a refused rebuild).
+/// Outcome of `Gc::rebuildBaseline`: either a live-conservative baseline was published, with its minted
+/// numbering and coverage counters, or the rebuild was refused. Refusal is fail-closed: `refusal` says
+/// why, no partial baseline is committed, and `gc/state` remains untouched.
 struct RebuildReport
 {
     bool performed = false;
@@ -59,15 +58,18 @@ struct RebuildReport
     uint64_t shards = 0;
     uint64_t committed_refs = 0;
     uint64_t live_precommits = 0;
-    uint64_t unowned_alive_manifests = 0;   /// over-protected trimmed-but-live class (design delta 2)
+    /// Trimmed-but-live manifests kept over-protected because ownership could not be proved.
+    uint64_t unowned_alive_manifests = 0;
     uint64_t edges = 0;
     uint64_t clamped_shards = 0;
 };
 
+/// Counters and diagnostics returned by one `runRegularRound`. These values describe work attempted or
+/// observed by the round; durable `gc/state` and the fold artifacts remain the protocol state.
 struct RoundReport
 {
     bool acquired_lease = false;  /// false => another leader is alive; nothing else was done
-    /// Phase-4 skip-unchanged (spec 2026-07-06): true iff this round DEFERRED (re-adopted the sealed
+    /// True iff this round deferred (re-adopted the sealed
     /// in-degree generation instead of folding). A deferred round performs no fold, no pre-CAS
     /// deletes, and no gc/state CAS -- every other RoundReport field below is meaningless/zero on it.
     bool deferred = false;
@@ -77,13 +79,13 @@ struct RoundReport
     uint64_t absent = 0;
     uint64_t replaced = 0;        /// 412-saves — a health metric
     uint64_t spared = 0;
-    uint64_t manifests_deleted = 0;  /// owner-removed manifest bodies deleted (B11 — distinct from blob deletes)
-    /// Retired-cursor pipeline observability (Task 11): the pipeline's per-round transitions.
+    uint64_t manifests_deleted = 0;  /// owner-removed manifest bodies deleted, distinct from blob deletes
+    /// Retired-cursor pipeline observability: the pipeline's per-round transitions.
     size_t condemned = 0;         /// entries newly condemned into the retired list this round
     size_t graduated = 0;         /// entries newly floor-passed (published delete_pending) this round
     size_t redeleted = 0;         /// pending deletes executed this round (exact-token blob deletes)
     size_t fence_outs = 0;        /// expired mounts fenced-out by the round's heartbeat floor
-    /// Task 5: per-hash freshness META write ops (condemn/spare/delete) that threw on the bounded pool
+    /// Per-hash freshness-meta write ops (condemn/spare/delete) that threw on the bounded pool
     /// this round. Advisory-only failures (never wedge the round) but a persistently non-zero count means
     /// the writer's meta point-read gate is drifting from the ledger -- an operator signal, not a protocol
     /// input.
@@ -95,6 +97,8 @@ struct RoundReport
     {
         anomalies.push_back(RoundAnomaly{.ns = ns_, .shard = shard_, .id = id_, .reason = reason_});
     }
+
+    /// Return whether this report already contains an anomaly for the specified namespace and shard.
     bool hasAnomaly(const RootNamespace & ns_, uint64_t shard_) const
     {
         for (const RoundAnomaly & a : anomalies)
@@ -104,17 +108,17 @@ struct RoundReport
     }
 };
 
-/// Leader-paced regular GC (ack-floor redesign, spec 2026-07-02): ONE pass per round — heartbeat
+/// Leader-paced regular GC: one pass per round — heartbeat
 /// ack floor -> fold (three-cursor merge) -> pre-CAS deletes of previously-published pending
-/// entries -> single gc/state CAS -> post-CAS cleanup/trim, over the root-local part-manifest model. The lease is WORK DEDUP ONLY —
-/// every step is idempotent and split-brain-safe (monotone gc/state, append-by-unique-path retire/
-/// outcome logs, exact-token deletes); the Phase-0 model (CaGcRootLocalPartManifestCore.tla) proves the
-/// round safe with NO leadership assumption at all. A stale leader can only duplicate work, never roll
-/// back state or mis-delete.
+/// entries -> single `gc/state` CAS -> post-CAS cleanup/trim, over the root-local part-manifest model. The lease is work deduplication only —
+/// every step is idempotent and split-brain-safe (monotone `gc/state`, append-by-unique-path retire and
+/// outcome logs, exact-token deletes). These properties mean that a stale leader can duplicate work but
+/// cannot roll back state or delete a newer object incarnation; the safety argument does not depend on
+/// the lease being perfectly exclusive.
 ///
 /// LEASE / STEAL WINDOW (deterministic — this class NEVER reads a clock). The lease lives inside
-/// gc/state as {owner, seq} and moves only by CAS on the whole gc/state object. See
-/// acquireOrRenewLease for the full observation/renew/steal protocol (unchanged by the redesign).
+/// `gc/state` as {owner, seq} and moves only by CAS on the whole `gc/state` object. The
+/// `acquireOrRenewLease` method implements the observation, renewal, and steal protocol.
 ///
 /// NOT thread-safe: one pacing thread drives a Gc instance. gc_id uniqueness across instances
 /// (a random u128) is a CALLER obligation — duplicate ids make two leaders indistinguishable.
@@ -123,7 +127,7 @@ class Gc
 public:
     /// `now_ms_fn` is the WALL clock (injected for tests): audit/diagnostic stamps only (e.g. the
     /// heartbeat floor's `now_ms` argument) — it never gates a fence decision. `mono_ms_fn` is the
-    /// OBSERVATION clock (Task 9, rev.6 design §token-stability observation): monotonic on this
+    /// OBSERVATION clock: monotonic on this
     /// process, injected for tests, defaults to `Pool::bootMs()`, and the ONLY clock the heartbeat
     /// gate's own fence-out threshold is measured against (mirrors `claimMountAwaitingExpiry`'s
     /// `mono_ms_fn`, but at heartbeat-gate granularity — one GC round is one observation tick).
@@ -134,7 +138,7 @@ public:
     /// One full round. Returns acquired_lease=false (nothing else done) if another leader is alive.
     /// `on_lease_acquired`, if set, is invoked ONCE, synchronously, immediately after the lease is
     /// acquired/renewed and BEFORE the (potentially long) fold begins - the scheduler uses this to
-    /// mark itself leader and fire the first advisory heartbeat pulse right away (B160/P3-B1: a new
+    /// mark itself leader and fire the first advisory heartbeat pulse right away: a new
     /// leader's first round must not run unprotected for the whole fold before the pacing thread's
     /// post-round bookkeeping would otherwise have set it). Never called when the lease is not held;
     /// exceptions from the callback propagate like any other round failure (the caller is expected to
@@ -150,12 +154,13 @@ public:
     /// dead-incumbent recovery stays the loop's job.
     RoundReport runRegularRound(std::function<void()> on_lease_acquired = {}, bool allow_steal = true);
 
-    /// B160 advisory heartbeat: bump <prefix>/gc/hb to {gc_id, hb_seq+1}. Best-effort (a lost CAS is
+    /// Advisory heartbeat: bump <prefix>/gc/hb to {gc_id, hb_seq+1}. Best-effort (a lost CAS is
     /// harmless — the next pulse retries). Touches NO Gc instance state. Static by design.
     static void pulseHeartbeat(Pool & store, UInt128 gc_id);
 
 
-    /// One previewed deletion the next regular round would make, with the reason it is eligible.
+    /// One deletion that the next regular round would preview, with the reason it is eligible. This is
+    /// diagnostic data only and does not carry the durable token or authorization for a delete by itself.
     struct PreviewEntry
     {
         ObjectKind kind = ObjectKind::Blob;
@@ -174,7 +179,7 @@ public:
     /// it). The {preview} ⊆ {genuinely-unreachable} guarantee holds ONLY at quiescence. No CAS/delete.
     std::vector<PreviewEntry> previewDeletes();
 
-    /// Raw baseline rebuild — the gc/state disaster-recovery command (spec 2026-07-03). Recomputes
+    /// Raw baseline rebuild — the `gc/state` disaster-recovery command. Recomputes
     /// the in-degree snapshot from raw owner state (committed refs + live precommits + the unowned
     /// not-provably-dead over-protection), mints round/generation above every surviving ack/number,
     /// publishes EMPTY retired lists, and CASes gc/state. Live-conservative; fail-closed refusals.
@@ -182,18 +187,18 @@ public:
 
     void setRebuildEdgeBudgetForTest(uint64_t n) { rebuild_edge_budget_override = n; }
 
-    /// TEST SEAM (M1 regression): disable the round's journal trim so a folded event stays in the journal
-    /// across rounds — exactly the Phase-3 lazy-trim / partial-trim-after-crash condition under which the
+    /// TEST SEAM: disable the round's journal trim so a folded event stays in the journal
+    /// across rounds — exactly the lazy-trim / partial-trim-after-crash condition under which the
     /// next round's fold MUST recover the exact sealed cursor (else it re-folds the event and double-counts
     /// blob in-degree). Production never calls this; trim is always enabled.
     void setTrimEnabledForTest(bool enabled) { trim_enabled = enabled; }
 
-    /// (GC-side abandoned-precommit reclaim was removed with the snapshot+log ref model: dead-precommit
-    /// cleanup is now the writer's job -- it appends exact `owner_transition` removals in ref logs, spec
-    /// §Failed Precommit Cleanup / §Clean Up Old Precommits. `GC` never invents a ref transition.)
+    /// Abandoned-precommit cleanup belongs to the writer: it appends exact `owner_transition` removals in
+    /// ref logs. GC never invents a ref transition, because doing so could make the fold disagree with the
+    /// writer's durable ownership history.
 
-    /// DELETE-SITE AUDIT (closeout invariant; grep `deleteExact` under Core/): the round's pre-CAS
-    /// redelete phase (R3 in runRegularRound) holds the ONLY content (blob reachability) delete in
+    /// DELETE-SITE INVARIANT: the round's pre-CAS
+    /// redelete phase in `runRegularRound` holds the ONLY content (blob reachability) delete in
     /// the whole core, restricted to previously-published delete_pending entries.
     /// The recheck's manifest-body exact-token delete (after its decrements are sealed), the retired-set
     /// drop, the resume path (GC metadata), dropNamespace (verbatim files), and the capability probe
@@ -207,11 +212,11 @@ private:
     /// renewing our own are unaffected.
     bool acquireOrRenewLease(GcState & state, Token & state_token, bool allow_steal);
 
-    /// What one R1 fold produced (spec rev. 15 §Fold Owner Transitions). The blob deltas are sealed
+    /// What one fold produced. The blob deltas are sealed
     /// into a write-once generation; `fold_seal` is the durable index of WHAT WAS FOLDED (a CasFoldSeal),
     /// `root_shards` the discovered universe, `mf_cleanup` the part-manifest cleanup work keyed by
     /// ManifestId (owner-removed bodies whose exact-token delete is deferred until their decrements are
-    /// sealed — spec §Retire), and `retired_merge` the per-gc-shard ack-floor retired-cursor outcome.
+    /// sealed), and `retired_merge` the per-gc-shard ack-floor retired-cursor outcome.
     struct FoldResult
     {
         CasFoldSeal fold_seal;
@@ -220,16 +225,16 @@ private:
         /// Ack-floor one-pass round: the retired-cursor outcome per gc-shard (settled entries, new
         /// condemnations, floor-passed pendings, and the prior pendings to delete pre-CAS).
         std::vector<RetiredMergeResult> retired_merge;
-        /// The round's one global ref LIST, grouped per table (spec §Step 1). Reused post-CAS for
+        /// The round's one global ref LIST, grouped per table. Reused post-CAS for
         /// ref-object cleanup (covered logs / superseded snapshots) so a second LIST is never issued.
         std::map<String, RefTableListing> ref_tables;
         /// The single suppress-deletes decision for this round (any clamp / ref-folding abort). Computed
         /// once in fold() and threaded here so the merge-side reducers and the post-CAS ref/namespace
-        /// cleanup share ONE value — they can never desync (A10).
+        /// cleanup share one value, so they cannot desynchronise.
         bool suppress_destructive = false;
     };
 
-    /// R1 (spec rev. 15 §Fold Owner Transitions): per changed root shard, stream the ONE ordered
+    /// Per changed root shard, stream the one ordered
     /// RootOwnerEvent journal in transition_version order and dispatch each event by comparing
     /// old_binding.manifest_ref to new_binding.manifest_ref:
     ///   - EQUAL (an owner move, e.g. a promote Precommit->Committed at the SAME ref) => NO blob delta,
@@ -237,14 +242,14 @@ private:
     ///   - TRUE REMOVAL (old present, the ref not owned afterwards) => read the OLD body, emit -1 per
     ///     blob entry + queue the body for cleanup (an old precommit never activated emitted no edges);
     ///   - ACTIVATION (new present) => read the NEW body, emit +1 per blob entry, SUBJECT TO THE FOLD
-    ///     BARRIER (control #23): do NOT advance the durable fold cursor past a RootOwnerEvent that
+    ///     BARRIER: do not advance the durable fold cursor past a `RootOwnerEvent` that
     ///     leaves a LIVE precommit binding whose manifest body is not present+valid; re-read each round.
     /// 404 RULE: a body that is PRESENT-but-invalid (ref/namespace mismatch) is genuine corruption =>
     /// CORRUPTED_DATA (hard). A MISSING body (404) is handled by where it appears: a precommit
     /// activation new missing body => no edges + barrier holds the cursor; a committed/promote new
     /// missing body or a true-removal old body missing at removal-fold => fail-closed FOR THAT DECISION
     /// (clamp the shard's last_folded_ref_id below it, record the anomaly, stop folding THIS shard) —
-    /// never guess a delta, never throw/wedge (feedback_ca_gc_never_throw_on_404).
+    /// never guess a delta and never wedge the round on a missing body.
     /// On success `state` carries the committed snap_generation and `state_token` the committed gc/state
     /// token. The committed pair is THREADED into retire, never re-read (zombie-steal protection).
     /// Round-paced graduation: `current_round` (= state.round + 1, the SAME basis condemn_round is
@@ -264,18 +269,18 @@ private:
 
 
 
-    /// Ref-object cleanup (spec §Step 6 / §Concurrent Startup And Cleanup): delete each table's ref logs
+    /// Ref-object cleanup: delete each table's ref logs
     /// covered by BOTH the durable fold cursor AND a durable snapshot, and snapshots older than the newest
     /// observed one, in batches of <=1000 exact keys. A remove_namespace log is retained until its
     /// namespace-cleanup item is durably Completed; ONCE Completed, that item's `remove_txn_id` is the
-    /// covering snapshot of the whole tail and its logs are cleaned in the SAME round (spec §Namespace
-    /// Removal republication path). Runs post-CAS (durable cursor), AFTER `runNamespaceCleanupPasses` has
+    /// covering snapshot of the whole tail and its logs are cleaned in the same round. Runs post-CAS
+    /// (durable cursor), after `runNamespaceCleanupPasses` has
     /// made the `Removed` snapshot durable, and only on a clamp-free round (`suppress_destructive == false`).
     /// Acts only on keys THIS round's scan returned (reused via `folded.ref_tables`), so a covering snapshot
     /// -- observed or just-republished -- is always durable before any deletion it authorizes.
     void cleanupRefObjects(const FoldResult & folded, bool suppress_destructive);
 
-    /// Namespace-cleanup item passes (spec §Step 6): for each item in the committed seal, a Pending item
+    /// Namespace-cleanup item passes: for each item in the committed seal, a Pending item
     /// runs a bounded exact-key enumerate-and-delete pass over the removed namespace's physical `@cas@`
     /// prefixes (manifest bodies + verbatim files); a Completed item publishes the `_cleanup` marker and
     /// republishes the constant-size `Removed` snapshot (both idempotent `putIfAbsent`). Runs post-CAS.
@@ -283,7 +288,7 @@ private:
     /// successor round Completed and the writer recreated: the Pending pass re-reads gc/state (aborting
     /// unless `durable.round == new_round` under our lease) and aborts on the `_cleanup` marker's presence
     /// HEAD'd PER KEY -- the exact recreation precondition for both a cold (successor-epoch) and a warm
-    /// (same-epoch) recreation, spec §Namespace Birth. A cheap greater-epoch skip on manifest keys is kept
+    /// (same-epoch) recreation. A cheap greater-epoch skip on manifest keys is kept
     /// as defense-in-depth.
     /// `ref_tables` is this round's own global LIST: the `Removed`-snapshot republication is gated on it
     /// so a snapshot a recreated namespace already superseded is never re-created (the per-round churn).
@@ -303,21 +308,21 @@ private:
     /// Fresh pool (no shards yet) => empty result.
     std::vector<std::pair<RootNamespace, uint64_t>> discoverUniverse();
 
-    /// Task 3 (Phase 4 Lever A): the two cheap pre-fold GC round-defer signals — both computed from
+    /// The two cheap pre-fold GC round-defer signals — both computed from
     /// state already reachable before the fold's snapshot merge (O(retired)/O(shards), no snapshot
     /// read), so `runRegularRound` can decide DEFER-vs-FOLD before paying the fold's cost.
     ///
     /// True iff a graduation is due this round, read ZERO-I/O from the adopted fold seal's per-shard
-    /// `condemned_summary` (retired-in-snapshot T4): `∃ shard: pending_total > 0 ||
+    /// `condemned_summary` (retired-in-snapshot): `∃ shard: pending_total > 0 ||
     /// oldest_nonpending_condemn_round < current_round`. `snap_generation == 0` (fresh pool) => false.
-    /// This is the load-bearing SAFETY signal (Task-1 TLA+ gate, GREEN): it forces a fold before any
+    /// This is the load-bearing safety signal: it forces a fold before any
     /// destructive decision. FAIL-CLOSED: a missing / undecodable seal, or a summary not TOTAL over
     /// gc_shards, is corrupt GC bookkeeping — returns TRUE (forces a fold so the round's own fail-closed
     /// path surfaces it); a round must never silently defer on corrupt bookkeeping.
     bool graduationDue(const GcState & state, uint64_t current_round);
 
     /// The number of tables (namespaces) with at least one ref log above their sealed durable cursor --
-    /// the pre-fold DEFER signal (spec §Step 1). Computed from one `LIST cas/refs/` compared against the
+    /// the pre-fold DEFER signal. Computed from one `LIST cas/refs/` compared against the
     /// per-table cursors in the adopted fold seal at `state.snap_generation`/`snap_attempt`.
     size_t changedShardCount(const GcState & state);
 
@@ -325,7 +330,7 @@ private:
     /// shard object to tombstone+reclaim; physical namespace reclamation is the namespace-cleanup item.)
 
 
-    /// B9 retention (attempt-scoped). The SOLE reclaimer — bounded per round and FAIL-OPEN on a benign
+    /// Attempt-scoped generation retention. The sole reclaimer — bounded per round and fail-open on a benign
     /// 404 (never throw during a prune — it would only wedge GC):
     ///   WHOLESALE generation-retention: every generation at or below the retention floor
     ///   (`adopted_generation - gc_snap_generations_to_keep`) is reclaimed by LISTing its whole
@@ -353,9 +358,9 @@ private:
     /// Update the remembered observation (steal protocol step 3/4).
     void rememberObservation(const GcLease & lease);
 
-    /// Task 5: submit one per-hash freshness-meta op (condemn/spare/delete) to the bounded `meta_pool`.
+    /// Submit one per-hash freshness-meta op (condemn/spare/delete) to the bounded `meta_pool`.
     /// NEVER throws: `job` is wrapped in its own try/catch (an exception increments `meta_anomaly_count`
-    /// + a log line, per feedback_ca_gc_never_throw_on_404); if scheduling itself fails (e.g. resource
+    /// + a log line); if scheduling itself fails (e.g. resource
     /// exhaustion) the op runs inline rather than being silently lost. Callers must capture every value
     /// `job` touches BY VALUE (never by reference to a loop-local like the fold's `cur_blob`, which
     /// mutates across iterations while this job may still be queued).
@@ -365,12 +370,12 @@ private:
     UInt128 gc_id{};   /// this leader's identity (random u128, never 0)
     uint64_t rebuild_edge_budget_override = 0;   /// tests force tiny batches
     std::function<uint64_t()> now_ms_fn;   /// wall-clock ms; injected (tests), defaults to system_clock
-    /// Task 9 (rev.6 §token-stability observation): the heartbeat gate's OWN observation clock —
+    /// The heartbeat gate's own observation clock —
     /// monotonic on this process, injected (tests), defaults to `Pool::bootMs()`. Never compared
     /// against another node's clock; see `computeHeartbeatFloor`.
     std::function<uint64_t()> mono_ms_fn;
-    bool trim_enabled = true;     /// TEST SEAM ONLY (M1): production always trims; see setTrimEnabledForTest
-    /// Phase-4 skip-unchanged (spec 2026-07-06): leader-local, in-memory count of consecutive DEFERRED
+    bool trim_enabled = true;     /// TEST SEAM ONLY: production always trims; see setTrimEnabledForTest
+    /// Leader-local, in-memory count of consecutive deferred
     /// rounds since the last FOLD. NOT persisted (a fresh/stolen leader starts at 0 -- conservative:
     /// it may fold one round sooner than a long-lived leader would, never later). Reset to 0 whenever
     /// a round folds; incremented on every DEFER. Bounds batching via `gc_fold_max_defer_rounds`.
@@ -380,23 +385,23 @@ private:
     bool has_observation = false;
     UInt128 last_seen_owner{};
     uint64_t last_seen_seq = 0;
-    /// B160: the heartbeat observed alongside the lease (gates the steal).
+    /// Heartbeat observed alongside the lease (gates the steal).
     UInt128 last_seen_hb_owner{};
     uint64_t last_seen_hb_seq = 0;
 
-    /// Task 9 (rev.6 §token-stability observation): the heartbeat gate's cross-round, per-srid
+    /// The heartbeat gate's cross-round, per-srid
     /// write-token observation (`computeHeartbeatFloor`'s `obs` argument). In-memory only — a new
     /// leader (after a steal, or a process restart) starts empty, which only delays fencing an
     /// already-dead mount by one extra round (safe: never fences early).
     MountObservationMap mount_obs;
 
-    /// fix-round F9 (author-review): `reportLateLogsIfAny`'s one-shot in-memory dedup latch, OWNED BY
+    /// `reportLateLogsIfAny`'s one-shot in-memory dedup latch, owned by
     /// THIS leader instance (see `LateLogDedup`'s doc comment) -- in-memory only, exactly like
     /// `mount_obs` above: a fresh leader (after a steal or a process restart) starts empty, at worst
     /// re-emitting one already-reported anomaly once.
     LateLogDedup late_log_dedup;
 
-    /// Task 5: bounded pool for the round's per-hash freshness-meta writes (condemn/spare/delete);
+    /// Bounded pool for the round's per-hash freshness-meta writes (condemn/spare/delete);
     /// sized from `PoolConfig::gc_meta_pool_size` (constructed in the ctor, after the null/id checks --
     /// never touches a possibly-null `store` at member-init time). A `unique_ptr` (not a plain member)
     /// so construction can happen in the ctor body, after validating `store`.
@@ -414,26 +419,27 @@ public:
         return foldManifestEdges(id, activation ? +1 : -1, deltas, cleanup);
     }
 
-    /// TEST SEAM (Task 4): expose LIST-based namespace/shard discovery so unit tests can assert the
+    /// TEST SEAM: expose LIST-based namespace/shard discovery so unit tests can assert the
     /// discovered universe equals the set of present ref shards without driving a full round.
     std::vector<std::pair<RootNamespace, uint64_t>> discoverUniverseForTest()
     {
         return discoverUniverse();
     }
 
-    /// TEST SEAM (Task 3): expose the two cheap pre-fold GC round-defer signals so unit tests can
+    /// TEST SEAM: expose the two cheap pre-fold GC round-defer signals so unit tests can
     /// assert them directly without driving a full round.
     bool graduationDueForTest(const GcState & state, uint64_t current_round)
     {
         return graduationDue(state, current_round);
     }
 
+    /// Test-only access to the changed-shard signal used before a fold.
     size_t changedShardCountForTest(const GcState & state)
     {
         return changedShardCount(state);
     }
 
-    /// TEST SEAM (spec §Step 6 straggler safety): drive one namespace-cleanup pass directly so a test can
+    /// TEST SEAM: drive one namespace-cleanup pass directly so a test can
     /// stage the exact stale-leader interleaving (a Pending item whose namespace a successor Completed +
     /// recreated) without racing a live round. Production drives this only through `runRegularRound`.
     void runNamespaceCleanupPassesForTest(const CasFoldSeal & seal,

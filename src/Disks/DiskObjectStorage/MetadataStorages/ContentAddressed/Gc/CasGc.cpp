@@ -5,7 +5,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobMeta.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEvent.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcShardPlan.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcShardPlan.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefLogFormat.h>
@@ -66,7 +65,7 @@ namespace DB::Cas
 namespace
 {
 
-/// §0 introspection: the `on_page_fetched` hook GC passes to every `forEachListedKey`/`recoverRefTable`
+/// The `on_page_fetched` hook GC passes to every `forEachListedKey`/`recoverRefTable`
 /// call it owns (never passed by fsck/offline-repair callers of those shared helpers) -- one increment
 /// per physical LIST page, never per listed key.
 void onGcEnumerationPage()
@@ -74,15 +73,14 @@ void onGcEnumerationPage()
     ProfileEvents::increment(ProfileEvents::CasGcEnumerationPages);
 }
 
-/// Defined below; forward-declared so the post-CAS hand-off delete in `runRegularRound` (Task 7) can
+/// Defined below; forward-declared so the post-CAS hand-off delete in `runRegularRound` can
 /// reach the same wholesale LIST-delete helper the retention prune uses.
 uint64_t deletePrefixWholesale(Backend & backend, const String & prefix, uint64_t bounded_remaining);
 
-/// Task 5 (spec 2026-07-09 §raw-body-refinement, v3) + ADD-ONLY (spec 2026-07-11 deposed-leader
-/// `clearSparedMeta` fix): the per-hash freshness-meta ops GC schedules on the bounded pool. All are
-/// best-effort/idempotent by design -- the meta is only a point-read freshness marker for the writer/
-/// promote gate (Task 3/4); the ledger retired-set + the exact-token body delete remain the actual safety
-/// core (unchanged by this task). A lost CAS here is never a correctness problem, only a (rare,
+/// The per-hash freshness-meta operations GC schedules on the bounded pool are
+/// best-effort/idempotent by design. The meta is only a point-read freshness marker for the writer/
+/// promote gate; the ledger retired-set + the exact-token body delete remain the actual safety
+/// core. A lost CAS here is never a correctness problem, only a (rare,
 /// self-healing) staleness window for the NEXT point-reader.
 ///
 /// GC freshness meta is ADD-ONLY: GC may publish `Condemned`, and may REMOVE the meta once the exact body
@@ -94,7 +92,7 @@ uint64_t deletePrefixWholesale(Backend & backend, const String & prefix, uint64_
 /// redelete then deletes -- live-blob data loss (INV_NO_LOSS). Removing the clear restores the exact-token
 /// delete argument in full: once a hash is `Condemned`, observing `Clean` means EITHER the condemned body
 /// is absent OR a writer already changed its incarnation token, so every stale `deleteExact(t1)` finds the
-/// body absent or `TokenMismatch`. See `reports/2026-07-11-cas-deposed-leader-stray-clean-meta.md`.
+/// body absent or `TokenMismatch`.
 
 /// Write the per-hash meta to Condemned: a blob newly entering the retired set this round (either the
 /// fresh zero-in-degree condemn, or a resurrect-supersede re-condemn of the current token). Absent meta
@@ -112,7 +110,7 @@ void writeCondemnedMeta(Backend & backend, const Layout & layout, const BlobRef 
 }
 
 /// Drop the meta after its body was physically deleted (or already found absent) by the round's
-/// exact-token delete. NO tombstone -- an absent meta reads exactly like a Clean one (Task 3/4: "absent
+/// exact-token delete. NO tombstone -- an absent meta reads exactly like a Clean one (absent
 /// means not condemned"). Idempotent: an already-absent meta, or one a racing writer/GC pass already
 /// moved, is a silent no-op.
 void deleteConfirmedMeta(Backend & backend, const Layout & layout, const BlobRef & ref)
@@ -165,7 +163,7 @@ Gc::Gc(PoolPtr store_, UInt128 gc_id_, std::function<uint64_t()> now_ms_fn_,
             return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::system_clock::now().time_since_epoch()).count());
         };
-    /// fix-round F6 (author-review): default to `store->bootMsNow()`, not the raw static `Pool::bootMs()`
+    /// Use `store->bootMsNow()`, not the raw static `Pool::bootMs()`
     /// -- the latter bypasses the Pool's own injectable `config.boot_ms_fn`, so a time-controlled test
     /// that fakes the mount's clock via `boot_ms_fn` (but constructs a `Gc` without an explicit
     /// `mono_ms_fn`) would silently run its GC-side threshold math against the REAL wall clock while the
@@ -174,7 +172,7 @@ Gc::Gc(PoolPtr store_, UInt128 gc_id_, std::function<uint64_t()> now_ms_fn_,
     /// production (no test seam in play) is unaffected.
     if (!mono_ms_fn)
         mono_ms_fn = [s = store]() -> uint64_t { return s->bootMsNow(); };
-    /// Task 5: the bounded pool for this round's per-hash freshness-meta writes. Built here (ctor body),
+    /// Build the bounded pool for this round's per-hash freshness-meta writes here (ctor body),
     /// not a member-initializer, so it can safely read `store->poolConfig()` AFTER the null check above.
     const uint64_t configured_pool_size = store->poolConfig().gc_meta_pool_size;
     const size_t pool_size = static_cast<size_t>(std::max<uint64_t>(1, configured_pool_size));
@@ -185,14 +183,14 @@ Gc::Gc(PoolPtr store_, UInt128 gc_id_, std::function<uint64_t()> now_ms_fn_,
 void Gc::scheduleMetaJob(std::function<void()> job)
 {
     /// Wrap once: `run` is safe to invoke either on the pool or inline (the scheduling-failure fallback
-    /// below), and NEVER lets an exception escape (feedback_ca_gc_never_throw_on_404 -- a per-hash meta
+    /// below), and NEVER lets an exception escape: a per-hash meta
     /// op is advisory; the ledger + exact-token body delete are the actual safety core).
     auto run = [this, job]()
     {
-        /// §0 introspection: one per-hash freshness-meta op EXECUTED (attempt, not success) on this
+        /// Count one per-hash freshness-meta op EXECUTED (attempt, not success) on this
         /// bounded pool. `run` is invoked on the pool thread (the common path below) or inline on the
         /// round's own thread (the scheduling-failure fallback below) -- either way this is pool-scoped
-        /// work, so the counter is GLOBAL-only by design (closes metrics-audit attribution artifact #6).
+        /// work, so the counter is GLOBAL-only by design.
         ProfileEvents::increment(ProfileEvents::CasGcMetaOps);
         try
         {
@@ -232,14 +230,14 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     if (!report.acquired_lease)
         return report;
 
-    /// B160/P3-B1: fire the acquire-time hook BEFORE the long fold below, not after the round
+    /// Fire the acquire-time hook BEFORE the long fold below, not after the round
     /// returns - a new leader's first round could otherwise run for the whole fold with no
     /// heartbeat cover, letting a follower steal deterministically once it freezes (owner, seq)
     /// across two of its own ticks.
     if (on_lease_acquired)
         on_lease_acquired();
 
-    /// Task 5: this round's per-hash meta-write anomaly tally starts fresh (folded into the report
+    /// This round's per-hash meta-write anomaly tally starts fresh (folded into the report
     /// after `meta_pool->wait()`, below).
     meta_anomaly_count.store(0, std::memory_order_relaxed);
 
@@ -253,14 +251,14 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     Backend & backend = store->backend();
     const uint64_t new_round = state.round + 1;
 
-    /// R1: token-guarded fence-out of dead mounts (liveness only — graduation itself paces on GC
-    /// rounds via `new_round`, not on heartbeat acks). Task 9 (rev.6 §token-stability observation):
-    /// fencing no longer trusts a predecessor's stamped `expires_at_ms` against our wall clock — it
+    /// Token-guarded fence-out of dead mounts (liveness only — graduation itself paces on GC
+    /// rounds via `new_round`, not on heartbeat acks). Fencing no longer trusts a predecessor's stamped
+    /// `expires_at_ms` against our wall clock — it
     /// fences ONLY once `mount_obs` has watched the mount's write-token hold unchanged for the full
     /// threshold on THIS leader's own monotonic clock (mirrors `claimMountAwaitingExpiry`'s identical
     /// `TTL + Drift` threshold for a mount's own reopen).
     const uint64_t ttl_ms = static_cast<uint64_t>(store->poolConfig().mount_lease_ttl_ms.count());
-    /// fix-round F4: shared with `claimMountAwaitingExpiry`'s identical formula via
+    /// The formula is shared with `claimMountAwaitingExpiry` via
     /// `mountObservationThresholdMs` -- see its doc comment (CasServerRoot.h).
     const uint64_t stable_threshold_ms = mountObservationThresholdMs(
         ttl_ms, static_cast<uint64_t>(store->poolConfig().mount_renew_period.count()));
@@ -286,7 +284,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
             e.detail = {{"srid", srid}};
         });
 
-    /// B170: the round's heartbeat classification (what mounts are live/terminated/fenced this round).
+    /// Emit the round's heartbeat classification (what mounts are live/terminated/fenced this round).
     EventEmitter{*store}.emit([&](CasEvent & e)
     {
         e.type = CasEventType::GcFence;
@@ -301,7 +299,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
                     {"already_fenced", std::to_string(floor.already_fenced)}};
     });
 
-    /// Phase-4 skip-unchanged (spec 2026-07-06): decide DEFER vs FOLD from cheap pre-fold signals.
+    /// Decide DEFER vs FOLD from cheap pre-fold signals.
     /// A DEFER round re-adopts the sealed generation — no fold, no delete, no gc/state write — so a
     /// slow idle/small-delta round no longer rebuilds the whole in-degree snapshot. Safety: a due
     /// graduation forces a FOLD (graduationDue), so no destructive decision runs on a stale snapshot.
@@ -331,7 +329,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         rounds_since_last_fold_ = 0;   /// this round folds
     }
 
-    /// B170: fold begins — the round's single pass.
+    /// Emit that the round's single pass begins.
     EventEmitter{*store}.emit([&](CasEvent & e)
     {
         e.type = CasEventType::GcFoldBegin;
@@ -341,7 +339,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         e.reason = "R2: one-pass fold (edges x deltas x retired) into a new durable generation";
     });
 
-    /// T0 hand-off (Task 7): capture the PARENT seal's run refs BEFORE fold mutates
+    /// Capture the PARENT seal's run refs BEFORE fold mutates
     /// `state.snap_generation`/`snap_attempt` in-memory (CasGc.cpp:838). We compare these against the
     /// NEW seal's refs post-CAS to detect a ref that moved OFF an already-pruned generation (the
     /// wholesale prune skipped it while it was still referenced and its cursor advanced past it), and
@@ -350,7 +348,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     if (const auto parent_seal = readFoldSeal(state.snap_generation, state.snap_attempt))
         parent_seal_runs = parent_seal->blob_target_runs;
 
-    /// R2: the pass — discovery, windows, and the three-cursor merge (spare / graduate / condemn).
+    /// The pass performs discovery, windowing, and the three-cursor merge (spare / graduate / condemn).
     FoldResult folded = fold(state, state_token, report, new_round);
 
     EventEmitter{*store}.emit([&](CasEvent & e)
@@ -368,8 +366,8 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     const uint64_t generation = state.snap_generation;   /// set in-memory by fold; committed below
     const uint64_t attempt = state.snap_attempt;
 
-    /// R3: PRE-CAS deletes — ONLY entries the PREVIOUS pass published as delete_pending (justified by
-    /// durable state, safe at any leader staleness — Task-9 amendment), plus outcome bookkeeping for
+    /// PRE-CAS deletes affect ONLY entries the PREVIOUS pass published as delete_pending (justified by
+    /// durable state and safe at any leader staleness), plus outcome bookkeeping for
     /// every settled entry. THE SINGLE CONTENT-DELETE SITE.
     std::map<uint64_t, OutcomeLog> outcomes;
     for (uint64_t shard = 0; shard < folded.retired_merge.size(); ++shard)
@@ -383,7 +381,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
                     "CAS gc: delete of blob {} created a delete marker — versioning is enabled "
                     "on the pool (mis-provisioned; the capability probe must reject this)", blobIdOf(entry.ref));
 
-            /// Quirk (rustfs, observed 2026-07-11): a conditional delete (`If-Match`) against an ABSENT
+            /// A RustFS quirk: a conditional delete (`If-Match`) against an ABSENT
             /// object can answer HTTP 412 (precondition failed) instead of 404 — we map that 412 to
             /// TokenMismatch. Backend-agnostically disambiguate here: a genuine TokenMismatch means the
             /// object exists under a different (fresh) token; if a follow-up HEAD shows the object is
@@ -406,7 +404,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
                                                                                 : OutcomeKind::Replaced;
             OutcomeEntry outcome{.kind = entry.kind, .ref = entry.ref, .token = entry.token, .outcome = outcome_kind};
             const String del_outcome{deleteClassName(del_class)};
-            /// B170: the single content-delete site — attributable per row. TokenMismatch (a writer
+            /// The single content-delete site is attributable per row. TokenMismatch (a writer
             /// recreated the incarnation) is terminal-OK: the fresh incarnation is a live object.
             EventEmitter{*store}.emit([&](CasEvent & e)
             {
@@ -427,7 +425,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
             outcomes[shard].entries.push_back(std::move(outcome));
             ++report.redeleted;
             ProfileEvents::increment(ProfileEvents::CasGcRetiredRedeleted);
-            /// Task 5: drop the per-hash meta only on Deleted/NotFound — a Replaced (TokenMismatch) outcome
+            /// Drop the per-hash meta only on Deleted/NotFound — a Replaced (TokenMismatch) outcome
             /// means a writer already resurrected a fresh incarnation at this hash (INV-1), and that
             /// writer's own resurrect path already flipped the meta back to Clean; blindly deleting here
             /// would race that legitimate Clean write for no reason (the meta is advisory, but there is no
@@ -445,7 +443,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
                     "CAS gc: delete_pending blob {} recovered in-degree — structurally impossible under "
                     "the ack floor (spared anyway, fail-closed); investigate",
                     blobIdOf(entry.ref));
-            /// B170: the spare verdict — a publish re-pinned the candidate before graduation.
+            /// Emit the spare verdict — a publish re-pinned the candidate before graduation.
             EventEmitter{*store}.emit([&](CasEvent & e)
             {
                 e.type = CasEventType::GcRecheckVerdict;
@@ -460,21 +458,21 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
             outcomes[shard].entries.push_back(OutcomeEntry{.kind = entry.kind, .ref = entry.ref,
                                                            .token = entry.token, .outcome = OutcomeKind::Spared});
             ProfileEvents::increment(ProfileEvents::CasGcRetiredSpared);
-            /// ADD-ONLY (spec 2026-07-11 deposed-leader `clearSparedMeta` fix): a spare does NOT touch the
+            /// A spare does NOT touch the
             /// meta. GC freshness meta is add-only — GC never publishes `Clean`. The in-degree recovered,
             /// but the meta stays `Condemned` (conservative marker) until a WRITER displaces the body with
             /// a fresh incarnation token (`uploadFromSource` + `writeResurrectMetaClean`) — the SOLE
             /// `Condemned -> Clean` transition. Clearing here on a
             /// deposed leader that then lost its round CAS would strand a stray-`Clean` over a still-live
             /// condemned token and lose the reuse to a stale exact-token redelete (INV_NO_LOSS); see
-            /// `reports/2026-07-11-cas-deposed-leader-stray-clean-meta.md`. The next `putBlob` self-heals
+            /// The next `putBlob` self-heals
             /// the marker: `observeAndAdmit` refuses same-token adoption on `Condemned` and resurrects.
         }
         for (const RetiredEntry & entry : merge.graduated)
         {
             ++report.graduated;
             ProfileEvents::increment(ProfileEvents::CasGcRetiredGraduated);
-            /// B170: floor-passed — republished pending; the NEXT pass executes the delete.
+            /// Floor-passed — republished pending; the NEXT pass executes the delete.
             EventEmitter{*store}.emit([&](CasEvent & e)
             {
                 e.type = CasEventType::GcRecheckVerdict;
@@ -494,7 +492,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
             ProfileEvents::increment(ProfileEvents::CasGcRetireReplaced);
             /// RESURRECT-REUPLOAD-ORPHAN: the current object token differed from a stale retired entry;
             /// the fold superseded that entry and re-condemned the current token in the same window.
-            /// `detail["superseded_token"]` (audit fix, 2026-07-08) carries the STALE token the supersede
+            /// `detail["superseded_token"]` carries the STALE token the supersede
             /// dropped — `entry.token` above is only the fresh CURRENT token, and without the old one
             /// this event cannot tell an operator WHICH incarnation was replaced.
             EventEmitter{*store}.emit([&](CasEvent & e)
@@ -510,7 +508,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
                            "incarnation; superseded the stale entry and re-condemned the current token";
                 e.detail = {{"superseded_token", replaced.old_token.value}};
             });
-            /// Task 5: the supersede is ALSO a blob entering the retired set fresh (a re-condemn of the
+            /// The supersede is ALSO a blob entering the retired set fresh (a re-condemn of the
             /// CURRENT token) — write the meta Condemned exactly like a fresh `head_blob` condemn would,
             /// so a NEXT writer's point-read gate sees it. `peek_head` itself stays side-effect-free (it
             /// runs once per closed candidate, not just on a real supersede — see its own comment).
@@ -558,7 +556,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         }
     }
 
-    /// Task 5: wait for the round's whole batch of per-hash freshness-meta writes (condemned during the
+    /// Wait for the round's whole batch of per-hash freshness-meta writes (condemned during the
     /// fold above, spared/redeleted-confirmed during R3 above) BEFORE the round's retired-list publish and
     /// its single gc/state CAS below — the writer's meta point-read gate must see this round's condemns
     /// durable no later than the ledger it is paired with. `wait()` never throws here: every scheduled job
@@ -566,15 +564,15 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     meta_pool->wait();
     report.meta_write_anomalies = meta_anomaly_count.load(std::memory_order_relaxed);
 
-    /// R4: retired-in-snapshot (T4) — there is NO separate retired-list object to publish anymore. The
+    /// Retired-in-snapshot — there is NO separate retired-list object to publish anymore. The
     /// round's surviving condemned entries were already sealed as `kCondemned` rows inside the fold's
     /// `blob_target_runs` (durable before this CAS, via `putDeterministicArtifact`), and the per-shard
     /// `condemned_summary` the seal carries makes the next round's graduation/carry decisions zero-I/O.
 
-    /// R5: the SINGLE round CAS — round, adopted (generation, attempt), retention cursor.
+    /// The SINGLE round CAS publishes the round, adopted (generation, attempt), and retention cursor.
     GcState next = state;
     next.round = new_round;
-    /// T0: the generations the adopted seal's runs physically live in (reference-parent carry can point a
+    /// The generations the adopted seal's runs physically live in (reference-parent carry can point a
     /// current shard's run back at an older generation's key). Retention must never reclaim these.
     std::set<uint64_t> referenced_generations;
     for (const RunRef & r : folded.fold_seal.blob_target_runs)
@@ -588,7 +586,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     state_token = res.token;
     report.round = state.round;
 
-    /// R5b post-CAS: T0 reference-parent HAND-OFF DELETE (Task 7). `pruneSupersededGenerations` SKIPS a
+    /// Post-CAS reference-parent HAND-OFF DELETE. `pruneSupersededGenerations` SKIPS a
     /// generation the live seal still references AND advances `snap_pruned_through` PAST it
     /// (CasGc.cpp:1066 computes the cursor as `g - 1` after the loop increments `g` over every skipped
     /// generation). So once a skipped generation is behind the cursor, the wholesale prune NEVER revisits
@@ -623,8 +621,8 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         }
     }
 
-    /// R6 post-CAS: owner-removed manifest bodies — deleted ONLY now, after their decrements were
-    /// ADOPTED by the round CAS (delete-after-sealed-decrements, control #11). Best-effort: a crash
+    /// Post-CAS: owner-removed manifest bodies — deleted ONLY now, after their decrements were
+    /// ADOPTED by the round CAS (delete-after-sealed-decrements). Best-effort: a crash
     /// here leaks bodies to the orphan sweep, never a dangle.
     for (const auto & [id, token] : folded.mf_cleanup)
     {
@@ -646,13 +644,13 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         });
     }
 
-    /// Ref-object cleanup + namespace-cleanup item passes (spec §Step 6), post-CAS so the durable fold
+    /// Ref-object cleanup + namespace-cleanup item passes, post-CAS so the durable fold
     /// cursor is committed. `suppress_destructive` (any clamp or ref-folding abort this round) gates the
     /// deletes; the idempotent marker / `Removed`-snapshot republication for a Completed item still runs.
     ///
     /// ORDER IS LOAD-BEARING: `runNamespaceCleanupPasses` runs FIRST because it republishes the `Removed`
     /// snapshot for a Completed item (via idempotent putIfAbsent) -- and only after that snapshot is
-    /// durable may `cleanupRefObjects` delete the logs it covers (spec §Step 6: "a covering snapshot is
+    /// durable may `cleanupRefObjects` delete the logs it covers: a covering snapshot is
     /// always durable before any deletion it authorizes"). A concurrent recovering reader that misses this
     /// republication and later GETs a now-deleted log restarts with a fresh LIST and observes the durable
     /// `Removed` snapshot -- a complete constant-size state with no tail to replay. Running cleanup first
@@ -691,7 +689,7 @@ bool Gc::foldManifestEdges(const ManifestId & id, int sign, std::vector<BlobDelt
     const auto got = backend.get(key);
     if (!got)
         return false;   /// raced delete between HEAD and GET — record-and-continue (never throw on a 404)
-    ProfileEvents::increment(ProfileEvents::CasRefManifestBodyFoldGets);   /// spec §GC Budget H
+    ProfileEvents::increment(ProfileEvents::CasRefManifestBodyFoldGets);   /// one body GET per manifest fold
 
     const PartManifest body = decodePartManifest(openObject(FormatId::PartManifest, got->bytes));
     if (!refMatchesBody(id.ref, body))
@@ -700,12 +698,12 @@ bool Gc::foldManifestEdges(const ManifestId & id, int sign, std::vector<BlobDelt
     if (!manifestNamespaceMatches(id.root_namespace, body))
         throw Exception(ErrorCodes::CORRUPTED_DATA,
             "CAS gc fold: manifest body namespace mismatch at {} (manifestNamespaceMatches fail-closed)", key);
-    /// Phase 3 T2: the Phase-2 manifest-wide `blob_hash_len` foreign-width gate is GONE (the field
+    /// The manifest-wide `blob_hash_len` foreign-width gate is GONE (the field
     /// itself was deleted — entries now carry their own per-entry algo/width). `decodePartManifest`
     /// already fail-closes on an algo byte this BUILD does not know (`blobHashAlgoName` throws
     /// CORRUPTED_DATA there) -- but a known algo may still not be ADMITTED to THIS pool yet (a stale
     /// in-memory `admitted_algos` cache reading a manifest another node already admitted a new algo
-    /// for). Per-entry admission validation (Phase 3 T5, spec §5/§9.8): refresh-on-miss BEFORE
+    /// for). Per-entry admission validation refreshes on miss BEFORE
     /// failing closed, so a genuinely fresh admission is never mistaken for corruption.
     for (const ManifestEntry & entry : body.entries)
         if (entry.placement == EntryPlacement::Blob && !store->isAlgoAdmitted(entry.ref.algo))
@@ -729,13 +727,12 @@ bool Gc::foldManifestEdges(const ManifestId & id, int sign, std::vector<BlobDelt
     for (const ManifestEntry & entry : body.entries)
         if (entry.placement == EntryPlacement::Blob)
         {
-            /// Phase 3 T3: the fold now settles the FULL `BlobRef` pair natively -- no bare-digest
-            /// bridge (the T2 TEMPORARY sites are gone).
+            /// The fold settles the FULL `BlobRef` pair natively -- no bare-digest bridge remains.
             deltas.push_back(BlobDelta{
                 .ref = entry.ref,
                 .source_id = sourceEdgeId(id, entry.path),
                 .remove = (sign < 0)});
-            /// B170: a folded owner edge over this blob (the manifest-model analog of the old
+            /// A folded owner edge over this blob (the manifest-model analog of the old
             /// `RootAdd`). +1 = the manifest's owner activated this blob's reference; -1 =
             /// the owner was removed, dropping the reference. Reconstructs WHY a blob's in-degree moved.
             EventEmitter{*store}.emit([&](CasEvent & ev)
@@ -765,7 +762,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     FoldResult result;
 
     /// 1. One global paginated LIST of cas/refs/, grouped into per-table (log / snapshot / cleanup-marker)
-    /// listings (spec §Step 1: Enumerate Once). This single enumeration serves BOTH ref-log intake and
+    /// listings. This single enumeration serves BOTH ref-log intake and
     /// ref-object cleanup planning. Resume is by explicit last-returned-key (`ListPage::next_cursor`).
     std::vector<String> ref_object_keys;
     {
@@ -786,7 +783,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             ProfileEvents::increment(ProfileEvents::CasRefGlobalListPages);
     }
 
-    /// A malformed ref-object key or namespace aborts ref folding for the whole round (spec §Step 2): the
+    /// A malformed ref-object key or namespace aborts ref folding for the whole round: the
     /// round produces no ref delta, advances no cursor, and authorizes no destructive work -- recorded as
     /// an anomaly (which drives `suppress_destructive`), never a throw that wedges the round.
     std::map<String, RefTableListing> ref_tables;
@@ -810,7 +807,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     /// the fold seal at the adopted (snap_generation, snap_attempt) (the fold seal IS the coverage record).
     /// Absent => fresh pool (cursor 0). A folded event must never be re-folded from 0 (that double-counts
     /// blob in-degree => silent over-pin/leak).
-    /// (б)-audit (spec 2026-07-03-cas-gc-rebuild-design.md Part 1): a live gc/state whose adopted
+    /// A live `gc/state` whose adopted
     /// fold seal OBJECT is MISSING is corrupt bookkeeping, never an empty baseline — treating it as
     /// empty would re-fold only journal tails and mass-condemn everything the lost snapshot
     /// protected. NOTE the distinction from a PRESENT seal with an empty per_ns_shard (a legitimate
@@ -825,8 +822,8 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     const std::map<String, ShardCoverage> parent_cursors =
         adopted_seal ? adopted_seal->per_ns_shard : std::map<String, ShardCoverage>{};
 
-    /// Retired-in-snapshot (T4): the prior generation's condemned entries RIDE the source-edge run as
-    /// `kCondemned` sentinel rows (T3), so the round no longer reads any separate retired-list object —
+    /// Retired-in-snapshot: the prior generation's condemned entries RIDE the source-edge run as
+    /// `kCondemned` sentinel rows, so the round no longer reads any separate retired-list object —
     /// the parent seal's `blob_target_runs` ARE the retired input. The per-gc-shard `condemned_summary`
     /// the seal carries below is distilled from the `still_retired` rows each shard re-emits, making the
     /// next round's `graduationDue` / pure-carry decisions zero-I/O.
@@ -835,7 +832,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
 
     /// Condemn-time observation: ONE HEAD per new zero-transition captures the exact incarnation token
     /// the eventual delete carries (absent => a prior landed delete => nothing to condemn). Emits the
-    /// B170 candidate trail (IndegZero / GcRetireObserve / BlobRetire) exactly where the decision is made.
+    /// Candidate trail (IndegZero / GcRetireObserve / BlobRetire) exactly where the decision is made.
     const auto head_blob = [&](const BlobRef & ref) -> std::optional<HeadResult>
     {
         EventEmitter{*store}.emit([&](CasEvent & e)
@@ -877,9 +874,9 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         });
         HeadResult adjusted = observed;
         adjusted.size = retiredLogicalSize(ObjectKind::Blob, observed.size, store->poolMeta().blob_header_len);
-        /// Task 5: this candidate unconditionally becomes a fresh `RetiredEntry` in `closeBlob` (the ONLY
+        /// This candidate unconditionally becomes a fresh `RetiredEntry` in `closeBlob` (the ONLY
         /// caller of `head_blob`) whenever this lambda returns a value — so this is exactly the round's
-        /// side-effecting condemn site. Write the meta Condemned so the writer's point-read gate (Task 3/4)
+        /// side-effecting condemn site. Write the meta Condemned so the writer's point-read gate
         /// sees it. MUST capture `ref`/`condemn_round`/size BY VALUE (not by reference to `cur_blob`,
         /// which the fold's tight streaming loop mutates across iterations while this job may still be
         /// queued on the pool).
@@ -888,7 +885,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         return adjusted;
     };
 
-    /// Side-effect-free peek (audit fix, 2026-07-08): the fold's resurrect-supersede branch (inside
+    /// Side-effect-free peek: the fold's resurrect-supersede branch (inside
     /// `foldDeltasIntoGeneration`) needs the CURRENT token to detect that a resurrect replaced a stale
     /// retired entry, but must NOT emit the fresh-condemn trail or bump `CasGcRetiredCondemned` — that
     /// hook is `head_blob` above, reserved for a genuinely NEW zero-in-degree candidate. A supersede's
@@ -926,10 +923,10 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     if (const auto fold_seal = readFoldSeal(state.snap_generation, state.snap_attempt))
         discover_ref_seal = *fold_seal;
 
-    /// Each fully-folded remove_namespace transaction seeds a namespace-cleanup item (spec §Remove Namespace).
+    /// Each fully-folded remove_namespace transaction seeds a namespace-cleanup item.
     std::vector<std::pair<RootNamespace, RefTxnId>> new_removals;
 
-    /// 2-3. Ref-log intake (spec §Step 2 Decode / §Step 3 Produce Manifest-Edge Delta): for each table,
+    /// 2-3. Ref-log intake: for each table,
     /// GET every log with id > its durable cursor in ascending id order, decode+validate the body, and
     /// fold each explicit owner-change into `foldManifestEdges` (which reads the manifest body and appends
     /// per-blob `BlobDelta`s to `deltas`). The durable cursor advances per FULLY folded log; a missing
@@ -949,7 +946,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         const RefTxnId cursor = cursor_it != parent_cursors.end()
             ? cursor_it->second.last_folded_ref_id : RefTxnId{};
 
-        /// Baseline guard (spec §Offline Recovery): a table with NO sealed cursor whose logs at/below its
+        /// Baseline guard: a table with NO sealed cursor whose logs at/below its
         /// newest snapshot have all been cleaned means a prior fold advanced+cleaned them and then gc/state
         /// was lost -- folding from {0,0} would miss those edges and mass-condemn their blobs. Fail closed;
         /// recover with the explicit rebuild. A fresh table (writer already snapshotted, logs still present)
@@ -980,7 +977,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
                 break;
 
             /// GET + decode the new log body. A missing or invalid log body aborts ref folding for the whole
-            /// round (spec §Step 2): the listed key was durable, so absence is input-visibility ambiguity,
+            /// round: the listed key was durable, so absence is input-visibility ambiguity,
             /// never a partial ref delta.
             const auto got = backend.get(layout.refLogKey(ns, log_id));
             if (!got)
@@ -990,7 +987,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
                                      "ref log body vanished mid-fold: ref folding aborted this round");
                 break;
             }
-            ProfileEvents::increment(ProfileEvents::CasRefLogBodyGets);   /// spec §GC Budget K: one body GET per new log
+            ProfileEvents::increment(ProfileEvents::CasRefLogBodyGets);   /// one body GET per new log
             RefLogTxn txn;
             try
             {
@@ -1006,7 +1003,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
                 break;
             }
 
-            /// Fold every explicit manifest edge of the log (spec §Step 3). A transaction applies
+            /// Fold every explicit manifest edge of the log. A transaction applies
             /// ATOMICALLY ("either the complete transaction applies or none of it applies"): stage this
             /// log's blob deltas and owner-removed manifest cleanup in PER-LOG buffers and merge them into
             /// the round buffers only once the WHOLE log folds. A mid-log clamp DISCARDS the staged buffers
@@ -1019,7 +1016,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             std::map<ManifestId, Token> log_mf_cleanup;
             for (const RefManifestEdge & edge : manifestEdgesOfTxn(txn))
             {
-                ProfileEvents::increment(ProfileEvents::CasRefEmittedEdges);   /// spec §Step 3: one manifest-edge event
+                ProfileEvents::increment(ProfileEvents::CasRefEmittedEdges);   /// one manifest-edge event
                 if (foldManifestEdges(edge.manifest_id, edge.change, log_deltas, log_mf_cleanup))
                     continue;
 
@@ -1085,7 +1082,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
                 result.mf_cleanup.emplace(mid, tok);
 
             /// A fully-folded remove_namespace transaction hands its {ns, remove_txn_id} to the
-            /// namespace-cleanup item (spec §Remove Namespace); its owner-removal edges were folded above.
+            /// namespace-cleanup item; its owner-removal edges were folded above.
             if (const auto removal = removalTxnId(txn))
                 new_removals.emplace_back(ns, *removal);
             resolved_through = log_id;     /// this log fully folded
@@ -1099,7 +1096,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             folded_any = true;
     }
 
-    /// All-or-nothing (spec §Step 2): a malformed key/body anywhere aborts the round's ref folding. Discard
+    /// All-or-nothing: a malformed key/body anywhere aborts the round's ref folding. Discard
     /// every ref delta and cursor advance already accumulated, carry each table's parent cursor verbatim,
     /// and let the recorded anomaly suppress destructive work.
     if (ref_folding_aborted)
@@ -1119,11 +1116,11 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         }
     }
 
-    /// Reuse the round's single ref LIST for post-CAS ref-object cleanup (spec §Step 1: one LIST serves
+    /// Reuse the round's single ref LIST for post-CAS ref-object cleanup: one LIST serves
     /// intake AND cleanup planning).
     result.ref_tables = ref_tables;
 
-    /// Namespace-cleanup items (spec §Step 6): carry the parent generation's items forward, add a Pending
+    /// Namespace-cleanup items: carry the parent generation's items forward, add a Pending
     /// item for each remove_namespace transaction folded this round (skipped on a ref-folding abort), and
     /// promote a Pending item to Completed once its physical `@cas@` prefixes (manifest bodies + verbatim
     /// files) are empty. The Pending->Completed transition depends only on physical emptiness, so a carried
@@ -1174,7 +1171,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
                 ++it;
         }
 
-    /// T0 (2026-07-02 snapshot-streaming): the parent generation's per-shard run segments, resolved from
+    /// The parent generation's per-shard run segments, resolved from
     /// the parent fold seal's `blob_target_runs` and grouped by the ref's explicit `shard`. The same seal
     /// `discover_ref_seal` the token-diff already read is the run source — consumers resolve runs THROUGH
     /// refs (a run sealed for the parent generation may physically live under an older generation's key),
@@ -1183,14 +1180,14 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     for (const RunRef & r : discover_ref_seal.blob_target_runs)
         parent_runs_by_shard[r.shard].push_back(r);
 
-    /// PURE REF-CARRY (spec §T0, plan's governing interpretation): a gc-shard with an EMPTY delta bucket
+    /// PURE REF-CARRY: a gc-shard with an EMPTY delta bucket
     /// AND an EMPTY retired input list neither reads nor writes its run — the new fold_seal copies the
     /// parent's `RunRef`s VERBATIM (key/checksum/shard/generation) so the next round resolves them. This
     /// is deterministic (same refs for the same inputs), so seal determinism / crash-replay adoption hold.
     /// An empty delta with a NON-EMPTY retired list still runs the merge: settlement must happen every
     /// pass (carried/graduated/redeleted entries), and that pass reads the run to recompute in-degrees.
     /// Distill one shard's `condemned_summary` entry from the `kCondemned` rows it re-emitted this pass
-    /// (`still_retired` mirrors those rows exactly — T3). Folding shards call this; it makes the next
+    /// (`still_retired` mirrors those rows exactly). Folding shards call this; it makes the next
     /// round's `graduationDue` and pure-carry decisions read only the seal, never a run.
     auto summarize = [](const std::vector<RetiredEntry> & still) -> CondemnedSummary
     {
@@ -1245,7 +1242,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     };
 
 
-    /// CLAMP SUPPRESSION (2026-07-03, spec amendment; found live as 31 dangling blobs): any clamp
+    /// CLAMP SUPPRESSION: any clamp
     /// this pass means landed-before-cut events may be UNFOLDED behind a clamped cursor — the
     /// floor's "landed before cut => folded before graduation" lemma does not hold, so this pass
     /// must not graduate NOR execute pending deletes (the merge carries everything; condemnation
@@ -1286,7 +1283,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     }
     else
     {
-        /// SHARDED PATH (gc_shards > 1) — target-sharded reducers (spec §Sharding Model). Each blob's
+        /// SHARDED PATH (gc_shards > 1) — target-sharded reducers. Each blob's
         /// `BlobDelta` carries its full signed edge stream; `blobShard(blob_hash, gc_shards)` partitions
         /// the stream into `gc_shards` disjoint buckets. Each bucket folds via its own `ShardReducer`
         /// into `blobTargetRunKey(new_generation, shard, 0)`. The `RootOwnerEvent`'s paired old/new
@@ -1321,7 +1318,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             result.fold_seal.condemned_summary[shard] = summarize(result.retired_merge[shard].still_retired);
         }
     }
-    /// (codecs-v3 phase 5) The part-manifest cleanup RUN + its fold-seal record are removed: the run
+    /// The part-manifest cleanup RUN + its fold-seal record are removed: the run
     /// object had no reader — the manifest cleanups execute inline from `result.mf_cleanup` (below /
     /// the recheck path), so the durable bundle was pure dead weight. `result.mf_cleanup` is unchanged.
 
@@ -1350,7 +1347,7 @@ void Gc::runManifestSweepCursorPass(GcState & state, Token & state_token)
         return;
 
     const uint64_t delete_budget = store->poolConfig().manifest_sweep_delete_budget_keys;
-    /// fix-round F9: `late_log_dedup` is this leader instance's own one-shot latch (see `LateLogDedup`'s
+    /// `late_log_dedup` is this leader instance's own one-shot latch (see `LateLogDedup`'s
     /// doc comment) -- threaded through so `reportLateLogsIfAny` stops re-emitting the SAME anomaly on
     /// every pass that lists it.
     const ManifestSweepResult result = sweepManifestCursorPage(
@@ -1398,8 +1395,8 @@ void Gc::cleanupRefObjects(const FoldResult & folded, bool suppress_destructive)
     Backend & backend = store->backend();
     const Layout & layout = store->layout();
 
-    /// A remove_namespace log is retained until its namespace-cleanup item is durably Completed (spec
-    /// §Step 6 condition 3): its owner-removal edges must stay foldable until the physical reclaim is done.
+    /// A remove_namespace log is retained until its namespace-cleanup item is durably Completed:
+    /// its owner-removal edges must stay foldable until the physical reclaim is done.
     /// Once Completed, the item's `remove_txn_id` also names the constant-size `Removed` snapshot -- the
     /// covering snapshot of the WHOLE tail (every log id <= remove_txn_id). `runNamespaceCleanupPasses`
     /// ran first this round and made that snapshot durable (idempotent putIfAbsent), so we hand its id to
@@ -1428,7 +1425,7 @@ void Gc::cleanupRefObjects(const FoldResult & folded, bool suppress_destructive)
         if (h.exists)
         {
             backend.deleteExact(key, h.token);
-            ProfileEvents::increment(ProfileEvents::CasRefCleanupObjectsDeleted);   /// spec §GC Budget D
+            ProfileEvents::increment(ProfileEvents::CasRefCleanupObjectsDeleted);   /// cleanup object deletion
         }
     };
 
@@ -1465,10 +1462,10 @@ void Gc::runNamespaceCleanupPasses(const CasFoldSeal & seal, const std::map<Stri
     const Layout & layout = store->layout();
 
     /// Re-read gc/state and confirm this round is still the durable round under our lease. Compare the
-    /// ROUND (strictly incremented on every commit, spec §GC State), never `lease.seq` -- a
+    /// ROUND (strictly incremented on every commit), never `lease.seq` -- a
     /// deposed-then-re-elected owner can present the same seq. A false here means a successor advanced past
     /// us; the destructive Pending pass below must not run against a namespace that successor may have
-    /// Completed and the writer recreated (spec §Step 6 straggler safety).
+    /// Completed and the writer recreated.
     const auto round_still_ours = [&]() -> bool
     {
         const auto got = backend.get(layout.gcStateKey());
@@ -1490,9 +1487,9 @@ void Gc::runNamespaceCleanupPasses(const CasFoldSeal & seal, const std::map<Stri
                 return;
 
             /// The completion marker's PRESENCE is the exact precondition a successor uses before recreating
-            /// this namespace ("observing an empty physical prefix is not sufficient", spec §Namespace
-            /// Birth). If a successor already Completed this item, the marker exists and the writer may have
-            /// recreated live objects under these prefixes -- abort the pass on marker-present.
+            /// this namespace ("observing an empty physical prefix is not sufficient"). If a successor
+            /// already Completed this item, the marker exists and the writer may have recreated live objects
+            /// under these prefixes -- abort the pass on marker-present.
             const String marker_key = layout.refCleanupMarkerKey(item.ns, item.remove_txn_id);
 
             /// Bounded exact-key enumerate-and-delete over the removed namespace's physical `@cas@` prefixes
@@ -1510,13 +1507,13 @@ void Gc::runNamespaceCleanupPasses(const CasFoldSeal & seal, const std::map<Stri
                     if (!round_still_ours() || backend.head(marker_key).exists)
                         return;
                     const ListPage page = backend.list(pass.prefix, cursor, 1000);
-                    /// §0 introspection: one page fetched, not one increment per listed key below.
+                    /// One page fetched, not one increment per listed key below.
                     ProfileEvents::increment(ProfileEvents::CasGcEnumerationPages);
                     for (const ListedKey & lk : page.keys)
                     {
                         /// PER-KEY recreation guard (airtight, applied to every key of both prefixes). The
-                        /// `_cleanup` marker's presence is the exact precondition for ANY recreation (spec
-                        /// §Namespace Birth). Checking it per key -- not just per page -- closes the window
+                        /// `_cleanup` marker's presence is the exact precondition for ANY recreation.
+                        /// Checking it per key -- not just per page -- closes the window
                         /// where a recreation lands mid-page: a manifest body is deleted only if the marker
                         /// was still absent immediately before its delete. This covers a WARM recreation too
                         /// (`observedNamespaceCleanupMarker` reuses the same `live_writer_epoch` -- bumped only
@@ -1592,7 +1589,7 @@ namespace
 ///
 /// 404 / NotFound is FAIL-OPEN: an object that vanished between LIST and delete (a concurrent crashed
 /// attempt, or a racing prune) is already reclaimed — never throw on a benign missing GC-internal object
-/// during a prune (it would only wedge GC; feedback_ca_gc_never_throw_on_404). A genuine TokenMismatch is
+/// during a prune (it would only wedge GC). A genuine TokenMismatch is
 /// likewise tolerated here: the object was rewritten under us (another attempt is live at this key) — the
 /// safe direction during a best-effort prune is to leave it for a later round, never to force-delete.
 uint64_t deletePrefixWholesale(Backend & backend, const String & prefix, uint64_t bounded_remaining)
@@ -1603,7 +1600,7 @@ uint64_t deletePrefixWholesale(Backend & backend, const String & prefix, uint64_
     while (deleted < bounded_remaining)
     {
         ListPage page = backend.list(prefix, cursor, kListPageLimit);
-        /// §0 introspection: one page fetched, not one increment per listed key below.
+        /// One page fetched, not one increment per listed key below.
         ProfileEvents::increment(ProfileEvents::CasGcEnumerationPages);
         for (const auto & listed : page.keys)
         {
@@ -1658,13 +1655,13 @@ void Gc::pruneSupersededGenerations(uint64_t adopted_generation, uint64_t attemp
         uint64_t pruned = 0;
         for (; g <= prune_floor && pruned < kMaxPrunePerRound; ++g, ++pruned)
         {
-            /// T0 (2026-07-02 snapshot-streaming): a generation whose run the LIVE adopted seal still
+            /// A generation whose run the LIVE adopted seal still
             /// references (reference-parent carry: an idle shard's current run physically lives at an
             /// older generation's key) must NOT be reclaimed — deleting it would strand the live seal's
             /// ref. Skip its prefix delete; the run stays alive as long as it is referenced. NOTE the
             /// cursor still advances past this skipped generation (see the `g - 1` cursor note above), so
             /// the wholesale prune NEVER revisits it once it is behind the cursor. LEAK-FREEDOM therefore
-            /// rests on the Task-7 post-CAS hand-off in `runRegularRound`: the round that finally moves the
+            /// rests on the post-CAS hand-off in `runRegularRound`: the round that finally moves the
             /// ref OFF this generation (a later delta writes a fresh run) wholesale-deletes this whole
             /// prefix right after its CAS. So every formerly-referenced generation is eventually FULLY
             /// reclaimed — either here (if the ref moved off before the cursor reached it, WholesalePrune*
@@ -1718,7 +1715,7 @@ std::map<String, ShardCoverage> Gc::readSealedCursors(uint64_t generation, uint6
 
 std::vector<std::pair<RootNamespace, uint64_t>> Gc::discoverUniverse()
 {
-    /// LIST-based table discovery (spec §Step 1): the discovery authority rests on LIST(cas/refs/).
+    /// LIST-based table discovery: the discovery authority rests on LIST(cas/refs/).
     /// Under the snapshot+log ref model there is one immutable-object stream per table (no numeric shards),
     /// so each present table is reported once as `(ns, 0)`. Consistency requirement: the backend must give
     /// read-your-writes LIST enumeration (S3 strongly consistent; InMemoryBackend by construction).
@@ -1739,7 +1736,7 @@ std::vector<std::pair<RootNamespace, uint64_t>> Gc::discoverUniverse()
 
 bool Gc::graduationDue(const GcState & state, uint64_t current_round)
 {
-    /// Retired-in-snapshot (T4): the graduation signal is read from the adopted fold seal's per-shard
+    /// Retired-in-snapshot: the graduation signal is read from the adopted fold seal's per-shard
     /// `condemned_summary` — ZERO backend I/O beyond the single seal read. A summary distilled from this
     /// generation's `kCondemned` rows says, per shard, how many entries are `delete_pending` (a graduation
     /// is already published) and the oldest non-pending condemn round (one crosses the floor once
@@ -1775,7 +1772,7 @@ bool Gc::graduationDue(const GcState & state, uint64_t current_round)
 size_t Gc::changedShardCount(const GcState & state)
 {
     /// The number of tables with at least one ref log above their sealed cursor -- the pre-fold DEFER
-    /// signal (spec §Step 1). Lenient parse: a malformed key is simply not counted here; the fold's own
+    /// signal. Lenient parse: a malformed key is simply not counted here; the fold's own
     /// `groupRefKeys` does the strict validation and round-abort. `parseRefObjectKey` never throws.
     const Layout & layout = store->layout();
     Backend & backend = store->backend();
@@ -1810,7 +1807,7 @@ size_t Gc::changedShardCount(const GcState & state)
 
 RebuildReport Gc::rebuildBaseline(bool force)
 {
-    /// The gc/state disaster-recovery command (spec 2026-07-03-cas-gc-rebuild-design.md Part 2).
+    /// The `gc/state` disaster-recovery command.
     /// DRY: the engine is the round's own bricks — discoverUniverse for the universe,
     /// foldManifestEdges(+1) for edge emission, foldDeltasIntoGeneration with EMPTY priors
     /// (attempt-iterated for O(budget) memory), computeHeartbeatFloor for the round mint.
@@ -1919,7 +1916,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
     std::vector<std::vector<BlobDelta>> buckets(gc_shards);
     std::vector<std::vector<RunRef>> prior_runs(gc_shards);
     std::vector<uint64_t> attempt_of(gc_shards, 0);
-    /// Retired-in-snapshot (T6): the final flush folds the orphan condemn synth deltas ALONGSIDE the
+    /// Retired-in-snapshot: the final flush folds the orphan condemn synth deltas ALONGSIDE the
     /// edges into one run, so `condemn_seed_head` (the captured tokens/sizes) and `condemn_round_stamp`
     /// are set after the pipeline-blindness LIST/HEAD below and consumed by the LAST `flush_shard` per
     /// shard. Empty/0 until then keeps mid-traversal budget flushes behavior-identical to the legacy
@@ -1939,7 +1936,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
         buckets[shard].clear();
         prior_runs[shard] = std::move(out);
     };
-    /// Phase 3 T3/T5: `edge_bearing` is `BlobRef`-keyed natively; the pipeline-blindness LIST/HEAD
+    /// `edge_bearing` is `BlobRef`-keyed natively; the pipeline-blindness LIST/HEAD
     /// sweep below derives each listed key's `BlobRef` from its OWN `<algo>` path segment
     /// (`Layout::parseBlobKey`), so a mixed-algo pool's blobs under EVERY admitted algo are
     /// recognized in one sweep, not just the pool's node-local write algo.
@@ -1973,7 +1970,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
         seen_ns.insert(ns.string());
         ++rep.shards;
 
-        /// Recover the table via the shared snapshot+tail equation (spec §Offline Recovery): the current
+        /// Recover the table via the shared snapshot+tail equation: the current
         /// owner set is exactly the committed rows plus live precommits it yields. The rebuilt cursor is
         /// the greatest RefTxnId that verified view included.
         const RefTableState st = recoverRefTable(backend, layout, ns, onGcEnumerationPage);
@@ -2019,7 +2016,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
     }
     rep.namespaces = seen_ns.size();
 
-    /// Trimmed-but-live precommits (design delta 2): a build alive across trim has NO journal
+    /// Trimmed-but-live precommits: a build alive across trim has NO journal
     /// evidence; its manifests look unowned. Include edges of every manifest that is unowned AND
     /// not provably build-dead (the watermark fact) — over-protect. An unowned manifest that later
     /// dies without journal evidence leaks its edges until a future rebuild (documented, bounded,
@@ -2032,7 +2029,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
         {
             if (owned_manifest_keys.contains(k.key))
                 return;
-            /// The one shared manifest-path parser (spec §Manifest Identifier canonical hex form),
+            /// The one shared manifest-path parser for the canonical hexadecimal manifest identifier,
             /// also used by fsck's parseBuildPrefix and the orphan sweep's parseListedManifestObject.
             const auto parsed = layout.parseManifestKey(k.key);
             if (!parsed)
@@ -2057,12 +2054,12 @@ RebuildReport Gc::rebuildBaseline(bool force)
     /// zero rebuilt edges is condemned at the minted round. Graduation still waits for every mount to
     /// ack past that round (the normal floor) — in model terms this is exactly the GComplete
     /// condemnation the next pass would perform if the fold were omniscient. This LIST/HEAD sweep runs
-    /// BEFORE the run flush (retired-in-snapshot T6): the orphans are folded into the SAME single flush
+    /// BEFORE the run flush (retired-in-snapshot): the orphans are folded into the SAME single flush
     /// pass as the edges (no separate second fold, no orphan attempt run), so it needs the COMPLETE
     /// `edge_bearing` set from the traversal above.
     std::vector<std::vector<RetiredEntry>> zero_condemned(gc_shards);
     {
-        /// Path-derived BlobRef (Phase 3 T5): every listed key under `blobsPrefix()` -- across EVERY
+        /// Path-derived BlobRef: every listed key under `blobsPrefix()` -- across EVERY
         /// admitted algo, not just the pool's node-local write algo -- is classified by parsing its
         /// OWN `<algo>` path segment. `.meta` siblings and any foreign/malformed key shape parse to
         /// `std::nullopt` and are skipped as debris, mirroring the pre-mixed-algo sweep's identical
@@ -2087,7 +2084,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
     /// condemn_round stamped on the full-traversal condemns folded into the runs below).
     const uint64_t round = std::max({max_fence_round, state.round, max_gen}) + 1;
 
-    /// Retired-in-snapshot seeding (T3/T6): append each full-traversal condemn's synthetic +edge/-edge
+    /// Retired-in-snapshot seeding: append each full-traversal condemn's synthetic +edge/-edge
     /// pair (reserved `source_id = UInt128{1}`, net in-degree 0 — the pair cancels) into its shard's
     /// bucket, and expose the already-captured exact token/size through `condemn_seed_head`. The SINGLE
     /// `flush_shard` below then folds these alongside the real edges: the fold's own fresh-condemn path
@@ -2120,15 +2117,15 @@ RebuildReport Gc::rebuildBaseline(bool force)
 
     /// Also fence out any dead mounts as part of the disaster-recovery pass (liveness cleanup; the
     /// returned classification counts are not needed for the round mint — graduation paces on rounds).
-    /// Task 9 (rev.6 §token-stability observation): same threshold/`mount_obs` as the regular round.
+    /// Use the same threshold/`mount_obs` as the regular round.
     const uint64_t ttl_ms = static_cast<uint64_t>(store->poolConfig().mount_lease_ttl_ms.count());
-    /// fix-round F4: shared with `claimMountAwaitingExpiry`'s identical formula via
+    /// Share the identical formula with `claimMountAwaitingExpiry` via
     /// `mountObservationThresholdMs` -- see its doc comment (CasServerRoot.h).
     const uint64_t stable_threshold_ms = mountObservationThresholdMs(
         ttl_ms, static_cast<uint64_t>(store->poolConfig().mount_renew_period.count()));
     computeHeartbeatFloor(backend, layout, now_ms_fn(), mono_ms_fn(), stable_threshold_ms, mount_obs);
 
-    /// Retired-in-snapshot (T4): the rebuilt seal's `condemned_summary` must be TOTAL over gc_shards so a
+    /// Retired-in-snapshot: the rebuilt seal's `condemned_summary` must be TOTAL over gc_shards so a
     /// subsequent regular round reads graduation/carry decisions zero-I/O off it (and its `carryParentRefs`
     /// totality check does not fail closed). The full-traversal condemns seeded above are all fresh and
     /// non-pending, condemned at `round`.
@@ -2152,7 +2149,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
     next.round = round;
     next.snap_generation = generation;
     next.snap_attempt = seal_attempt;
-    /// Retired-in-snapshot (T6): the orphan condemns now live as `kCondemned` rows IN the rebuilt runs
+    /// Retired-in-snapshot: the orphan condemns now live as `kCondemned` rows IN the rebuilt runs
     /// (folded into the single flush above) — there is no separate `RetiredSet` object family, so the
     /// rebuild mints none.
     next.manifest_sweep_cursor = "";
@@ -2202,7 +2199,7 @@ std::vector<Gc::PreviewEntry> Gc::previewDeletes()
     const Layout & layout = store->layout();
     Backend & backend = store->backend();
 
-    /// Resolve the run objects THROUGH the adopted seal's refs (2026-07-02 T0), never by
+    /// Resolve the run objects THROUGH the adopted seal's refs, never by
     /// `blobTargetRunKey` construction: with reference-parent carry a shard's current run may physically
     /// live under an older generation's key, and the seal ref is the only authority for the real key.
     /// Group the adopted `blob_target_runs` by the ref's explicit `shard`. Absent seal => no candidates.
@@ -2232,7 +2229,7 @@ std::vector<Gc::PreviewEntry> Gc::previewDeletes()
             out.push_back(std::move(e));
         }
 
-        /// Retired-in-snapshot (spec §5): stream the SAME adopted seal runs and emit every `kCondemned`
+        /// Retired-in-snapshot: stream the SAME adopted seal runs and emit every `kCondemned`
         /// sentinel row. The stored token IS the authority — NO HEAD here (a HEAD would defeat the point
         /// and cost I/O). `delete_pending` rows are deleted next fold; the rest await graduation. Preview
         /// stays WRITE-FREE (`openSourceEdgeRun` is a pure reader). Output is a superset of the above.
@@ -2259,7 +2256,7 @@ std::vector<Gc::PreviewEntry> Gc::previewDeletes()
                 e.reason = row.delete_pending ? "delete_pending" : "awaiting_graduation";
                 out.push_back(std::move(e));
             }
-            /// Whole-file seal-checksum (codecs-v3 phase 5): verify the drained run before its condemned
+            /// Whole-file seal-checksum: verify the drained run before its condemned
             /// rows are trusted in the preview. Fail-closed on mismatch.
             reader.verifyAgainst(run.checksum);
         }

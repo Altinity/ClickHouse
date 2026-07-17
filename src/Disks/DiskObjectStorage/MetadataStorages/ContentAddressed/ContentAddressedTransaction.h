@@ -30,98 +30,131 @@ bool partFileMustStayBlob(std::string_view file_name);
 
 }
 
-/// The M-W write-path wiring: accumulates ClickHouse operations and maps them to ONE Cas::PartWriteTxn
-/// per written part at commit (design 2026-06-11 section 4; plan D-W2).
+/// Owns the metadata-side overlay for one object-storage transaction. Part files are accumulated by
+/// routed namespace/ref, then published as manifest trees and refs by `commit`; verbatim namespace
+/// and mountpoint files are written immediately when their buffers finalize. A part uses one
+/// `Cas::PartWriteTxn`, created lazily before the first staged dependency, so the durable manifest
+/// edge is established before the pool observes or uploads a new blob.
 ///
-/// T3 state: writeFile (content blobs through a spill+hash buffer into PartWriteTxn::putBlob; mutable
-/// per-part bytes staged; verbatim namespace files durable on finalize) + commit (one
-/// putTree+publish per staged part, with the typed `published_at_ms` stamp) + destructor
-/// abandon. Remaining operations land task by task (T5 carry-forward/renames, T6 removals, T7
-/// detached/ATTACH/FREEZE, T8 read-your-writes) — each with wiring tests; the SQL suites gate the
-/// completed milestone (T13).
+/// Content blobs are first represented by local or S3 staging objects and are uploaded only during
+/// publication. Inline entries remain in the manifest tree when they fit `INLINE_CAP`. The
+/// destructor removes private local staging, leaves aborted S3 staging for the mount-lease sweeper,
+/// and abandons any open part builds; it never publishes an uncommitted ref.
 class ContentAddressedTransaction : public IMetadataTransaction
 {
 public:
+    /// Borrows the metadata storage for the transaction lifetime; staged builds and resources are
+    /// owned by this transaction and finalized or abandoned by `commit`/destruction.
     explicit ContentAddressedTransaction(ContentAddressedMetadataStorage & metadata_storage_);
 
     bool supportsChmod() const override { return false; }
 
+    /// Publishes every staged part. Publication is ordered so each new blob is named by a durable
+    /// precommit edge first; if a later part fails, only refs created by this call are compensated.
     void commit(const TransactionCommitOptionsVariant & options) override;
+
+    /// Accepts only `NoCommitOptions`, delegates to `commit`, and returns its successful outcome.
     TransactionCommitOutcomeVariant tryCommit(const TransactionCommitOptionsVariant & options) override;
 
+    /// Unsupported because content-addressed keys are generated from payload hashes, not paths.
     ObjectStorageKey generateObjectKeyForPath(const std::string & path) override;
+    /// Returns no removal list: shared CAS objects are reclaimed only by garbage collection.
     StoredObjects getSubmittedForRemovalBlobs() override;
 
+    /// Resolves a staged entry to its committed-style storage description. Pending blobs return no
+    /// object because their bytes still reside in staging and must be read through the overlay path.
     std::optional<StoredObjects> tryGetInFlightStorageObjects(const std::string & path) const override;
+    /// Opens an inline entry, pending local/S3 staging object, or already uploaded blob for a
+    /// read-your-writes operation; returns null when the path is outside this transaction's overlay.
     std::unique_ptr<ReadBufferFromFileBase> tryReadFileInFlight(
         const std::string & path, const ReadSettings & settings, std::optional<size_t> read_hint) const override;
+    /// Returns the logical size of a staged entry, including inline bytes and pending blob payloads.
     std::optional<uint64_t> tryGetInFlightFileSize(const std::string & path) const override;
+    /// Reports only inner staged directories. The bare part directory intentionally remains absent
+    /// so cleanup of a temporary, dedup-rejected part does not treat it as a real directory.
     bool hasInFlightDirectory(const std::string & path) const override;
+    /// Lists immediate child names visible in the staged directory overlay.
     std::vector<std::string> listInFlightDirectory(const std::string & path) const override;
 
+    /// This legacy object-list operation has no content-addressed equivalent and throws.
     void createMetadataFile(const std::string & path, const StoredObjects & objects) override;
 
-    /// [TXN-ONE-PIPELINE] The generic write-buffer hook (`DiskObjectStorageTransaction::writeFileImpl`
-    /// calls this): CA owns its write because a blob key is a content hash, known only after the last
-    /// byte. Returns the fully-wrapped buffer (hash-on-write + append RMW + inline/blob split +
-    /// autocommit/lifetime pin via `owner`).
+    /// Creates the buffer used by the disk transaction for this path. The returned wrapper keeps
+    /// `owner` alive until deferred finalization, because its callback captures this transaction;
+    /// it also applies the content-addressed append and autocommit rules before selecting a blob,
+    /// inline, or verbatim-file buffer. Part blobs cannot be published independently of their
+    /// manifest, while an inline-eligible standalone part file may commit through the repoint path.
     std::unique_ptr<WriteBufferFromFileBase> tryCreateWriteBuffer(
         const std::shared_ptr<IDiskTransaction> & owner,
         const std::string & path, size_t buf_size, WriteMode mode,
         const WriteSettings & settings, bool autocommit) override;
 
-    /// The inner content-addressed write buffer (hash-on-write / inline). `tryCreateWriteBuffer` wraps it.
+    /// Creates the inner buffer for a content-addressed path. Part blobs are hashed while being
+    /// staged, small metadata files are accumulated in memory and classified at finalize, and
+    /// verbatim namespace or mountpoint files are read-modify-written when append is requested.
     std::unique_ptr<WriteBufferFromFileBase> writeFile(
         const std::string & path,
         size_t buf_size,
         WriteMode mode,
         const WriteSettings & settings);
 
+    /// Directory creation is a metadata no-op because object storage has no directory objects.
     void createDirectory(const std::string & path) override;
+    /// Recursive directory creation is likewise a no-op; entries create their own prefixes.
     void createDirectoryRecursive(const std::string & path) override;
+    /// Drops a part ref, or does nothing for a non-part directory. A whole-part drop supersedes any
+    /// per-file removal marks staged earlier in this transaction.
     void removeDirectory(const std::string & path) override;
+    /// Removes refs, namespace files, and shadow objects while leaving shared CAS objects to GC.
     void removeRecursive(const std::string & path, const ShouldRemoveObjectsPredicate & should_remove_objects) override;
+    /// Copies an entry between parts, preserving pending staging ownership and tokenless evidence.
     void createHardLink(const std::string & path_from, const std::string & path_to) override;
+    /// These filesystem metadata operations are unsupported because CAS metadata is immutable and
+    /// object storage exposes neither POSIX timestamps nor mode bits.
     void setLastModified(const std::string & path, const Poco::Timestamp & timestamp) override;
     void chmod(const String & path, mode_t mode) override;
     void setReadOnly(const std::string & path) override;
+    /// Re-keys or merges staged part entries without publishing early; non-part paths use the
+    /// corresponding object-storage copy/remove semantics.
     void moveDirectory(const std::string & path_from, const std::string & path_to) override;
+    /// Moves a staged entry and its pending ownership, or copies/removes a verbatim object as needed.
     void moveFile(const std::string & path_from, const std::string & path_to) override;
+    /// Replaces the destination while preserving the source's content-addressed ownership rules.
     void replaceFile(const std::string & path_from, const std::string & path_to) override;
+    /// Unlinks a staged entry or records a removal mark for an already committed manifest; shared
+    /// blobs are never deleted directly.
     void unlinkFile(const std::string & path, bool if_exists, bool should_remove_objects) override;
+    /// Truncation is not representable without rewriting the content and is unsupported.
     void truncateFile(const std::string & path, size_t size) override;
 
+    /// Abandons open builds and cleans owned staging without publishing an uncommitted ref.
     ~ContentAddressedTransaction() override;
 
 protected:
     ContentAddressedMetadataStorage & metadata_storage;
 
 private:
-    /// One part being assembled by this transaction (D-W2: ONE Cas::PartWriteTxn per written part,
-    /// opened lazily at the FIRST staged write — W-ANCHOR requires the watermark durable
-    /// before the first PUT, and buffer finalize uploads immediately).
+    /// State for one routed part. The build is opened lazily at the first staged write so every
+    /// manifest dependency is recorded by the same `Cas::PartWriteTxn`; pending blobs remain in
+    /// staging until publication.
     struct PartStaging
     {
-        Cas::PartWriteTxnPtr build;                       /// nullptr until the first content upload
+        /// Created lazily when a staged blob, inline entry, or adopted entry first needs publication.
+        Cas::PartWriteTxnPtr build;
         std::vector<Cas::ManifestEntry> entries;   /// staged manifest entries (uploads + adoptions)
-        std::set<std::string> content_removed;     /// all-tree-part-files Task 8 (B123 evolution, spec
-                                                   /// 2026-07-14-cas-all-tree-part-files-design.md §6):
-                                                   /// staged removal marks for a COMMITTED part's TREE
-                                                   /// entries. Resolved at publish (publishStaging): a
-                                                   /// repoint carries the committed manifest forward
-                                                   /// minus these paths, UNLESS the same transaction also
-                                                   /// drops the whole part (removeDirectory), in which
-                                                   /// case the marks are superseded (see removeDirectory).
+        /// Paths removed from a committed part's manifest by this transaction. Publication carries
+        /// forward all other committed entries. If `removeDirectory` drops the whole ref in the same
+        /// transaction, that ref-drop supersedes these marks and clears them.
+        std::set<std::string> content_removed;
         bool published = false;                    /// set by publishStaging during commit(); the commit
                                                    /// loop is idempotent (never re-publishes a staging).
 
-        /// `staging_key`: the local temp path (`StagingBackend::Local`) or the S3 staging object key
-        /// (`StagingBackend::S3`, plan `docs/superpowers/plans/2026-07-11-cas-s3-native-staging.md`
-        /// Task 4) that `CaContentWriteBuffer::on_finalized` handed back. `backend` selects which:
-        /// `cleanupPendingTempFiles` only `fs::remove`s `Local` entries — an `S3` staging object is
-        /// reclaimed by the promote path or the mount-lease sweeper (a later task), never here.
+        /// `staging_key` is either a private local temp path or an S3 staging object key returned by
+        /// `CaContentWriteBuffer` at finalize. The backend selects cleanup and read-your-writes:
+        /// local files are removed by this transaction, whereas aborted S3 objects must remain
+        /// available to the mount-lease sweeper and to recovery of the promote source.
         struct PendingBlob { Cas::BlobRef ref; std::string staging_key; uint64_t size = 0; StagingBackend backend = StagingBackend::Local; };
-        std::vector<PendingBlob> pending_blobs;    /// B188: spilled+hashed locally; uploaded post-precommit
+        std::vector<PendingBlob> pending_blobs;    /// Staged blobs uploaded after the manifest edge is precommitted.
     };
 
     /// Keyed by (namespace string, ref name) — the routed identity, so live/detached/shadow
@@ -136,30 +169,39 @@ private:
                            const Cas::BlobRef & ref, size_t size, const std::string & staging_key,
                            StagingBackend backend);
 
-    /// S3-native staging fix 2026-07-11: build the fixed-length CABL envelope header for a staging blob,
-    /// with a FRESH `incarnation_tag`, so the S3 staging object holds `[header][payload]` and the promote
+    /// Builds the fixed-length CABL envelope header for a staging blob, with a fresh `incarnation_tag`,
+    /// so the S3 staging object holds `[header][payload]` and the promote
     /// stays a verbatim server-side copy. `build_id` is left 0 (not known at stream time; diagnostic-only).
     std::string buildS3StagingBlobHeader(const ContentAddressedMetadataStorage::Route & route) const;
 
+    /// Returns (and, when necessary, creates) the staging state for a routed namespace/ref.
     PartStaging & stagingFor(const ContentAddressedMetadataStorage::Route & r);
+    /// Finds existing staging state without creating an entry; returns nullptr when untouched.
     PartStaging * findStaging(const ContentAddressedMetadataStorage::Route & r);
+    /// Finds the staged manifest entry for a routed file without consulting committed storage.
     const Cas::ManifestEntry * findStagedEntry(const ContentAddressedMetadataStorage::Route & r) const;
-    /// B188: return a pointer to the pending (staged-but-not-yet-uploaded) blob for `hash`, or nullptr
-    /// if not pending (already uploaded or never staged).
+    /// Returns the pending (staged but not yet uploaded) blob for `ref`, or nullptr when it has
+    /// already been uploaded or was never staged.
     const PartStaging::PendingBlob * findPendingBlob(const PartStaging & st, const Cas::BlobRef & ref) const;
+    /// Returns the part build, creating it lazily with the routed ref as its intended destination.
     Cas::PartWriteTxn & buildFor(const ContentAddressedMetadataStorage::Route & r, PartStaging & st);
+    /// Parses a disk path and maps a part-file path to its namespace/ref/file route.
     std::optional<ContentAddressedMetadataStorage::Route> routeOf(const std::string & path) const;
 
-    void cleanupPendingTempFiles() noexcept;   /// B188: remove all parts' pending temp files (commit/abort/dtor)
+    /// Removes local staging files after commit or abort. On a successful commit it also removes
+    /// S3 staging objects; aborted S3 objects are intentionally retained for lease-scoped cleanup.
+    void cleanupPendingTempFiles() noexcept;
 
-    /// B189/Task 4: upload every pending blob of `st` whose hash is still referenced by `st.entries`
-    /// (an orphaned pending blob -- its entry removed by unlinkFile/replaceFile -- is skipped; its
-    /// temp file is still cleaned by cleanupPendingTempFiles at commit end) through `st.build`.
-    /// Shared by `publishStaging`'s normal path and its committed-ref repoint branch.
+    /// Uploads through `st.build` only the pending blobs still referenced by `st.entries`. An entry
+    /// removed by `unlinkFile` or `replaceFile` is skipped, but its staging resource is still cleaned
+    /// by `cleanupPendingTempFiles`. Used for both new refs and committed-ref repoints.
     void uploadPendingBlobs(PartStaging & st);
 
-    /// B190 Task 4: unified adopt helper that collapses the 6 inline pending/uploaded dispatch
-    /// blocks in createHardLink / moveFile (cross-part) / moveDirectory (two-build merge).
+    /// Adopts a manifest entry into another part while preserving its storage state. For a pending
+    /// blob, `copy_pending` controls whether the staging record is copied (hardlink semantics) or
+    /// has already been moved by the caller; either way the destination records a dependency. For
+    /// an uploaded or committed blob, the destination records tokenless evidence and does not
+    /// perform a pool read before precommit.
     ///
     /// `pb != nullptr` (pending, not yet uploaded):
     ///   - `copy_pending=true`  → push a copy of *pb into dst_st.pending_blobs (hardlink semantics:
@@ -168,35 +210,32 @@ private:
     ///     just record the dep without any additional push.
     ///   In both cases: dst_build.recordPendingBlobDep(entry.file_hash, entry.file_size).
     ///
-    /// `pb == nullptr` (uploaded / committed): dst_build.adoptEvidence(entry) — tokenless W-EVIDENCE,
-    /// no pool HEAD/GET before precommit.
     void adoptStagedBlob(const PartStaging::PendingBlob * pb, const Cas::ManifestEntry & entry,
                          PartStaging & dst_st, Cas::PartWriteTxn & dst_build, bool copy_pending);
 
-    /// Publish one staged part durably (putTree + publish, or a repoint for a standalone write/remove
-    /// on an already-committed part) and mark it `published`. Idempotent: a no-op if already
-    /// published. Returns true iff this call newly CREATED a ref that did not exist before (for
-    /// commit()'s rollback tracking).
+    /// Publishes one staged part, either by promoting a newly staged manifest or by repointing an
+    /// existing ref after carrying its unchanged entries forward. It is idempotent within the commit
+    /// loop and marks the staging as published. Returns true only when this call created a previously
+    /// absent ref, allowing `commit` to compensate for a later partial publication failure.
     bool publishStaging(const Cas::RootNamespace & ns, const std::string & ref, PartStaging & st);
 };
 
 }
 
-// ===== Merged from ContentAddressedWriteBuffers.h (merge #2) =====
 namespace DB::ContentAddressed
 {
 
-/// Write buffer for a CONTENT part file (M-W T3). The blob key is the content hash, only known
+/// Writes a CONTENT part file while computing its content hash. The blob key is only known
 /// once all bytes are written, so the buffer spills to a unique local temp file while hashing with
-/// `hash_algo` (P1-T3a, `Cas::makeBlobHashingWriteBuffer` — the pool-wide selectable blob-hash
+/// `hash_algo` (`Cas::makeBlobHashingWriteBuffer` — the pool's selectable blob-hash
 /// function the wiring defines; the core never re-hashes payloads). `CityHash128` stays the thin
 /// `HashingWriteBuffer` adapter (byte-for-byte unchanged); `XXH3_128` hashes with xxh3 instead. On
 /// finalize it hands (hash_hex, size, temp_path)
-/// to the owning transaction; B188: the transaction owns the temp file post-finalize and uploads it
+/// to the owning transaction; the transaction owns the staging resource after finalize and uploads it
 /// post-precommit, so finalizeImpl no longer removes it. cancelImpl and the destructor (on error
 /// paths) still remove it.
 ///
-/// S3-native staging (Task 4, plan `docs/superpowers/plans/2026-07-11-cas-s3-native-staging.md`):
+/// In S3 staging mode:
 /// a SECOND constructor streams directly to an already-opened object-store sink (an S3 staging
 /// object) while hashing, instead of spilling to a local temp file — see its own doc comment below.
 /// The local-temp-file constructor above is UNCHANGED byte-for-byte; this is an independent mode
@@ -222,7 +261,7 @@ public:
     /// object at `object_key` (e.g. `object_storage->writeObject(StoredObject(object_key), ...)`).
     ///
     /// `envelope_header` is the fixed-length (`blob_header_len`) CABL envelope header the transaction
-    /// built for this staging blob (S3-native staging fix 2026-07-11). It is written to the sink FIRST —
+    /// built for this staging blob. It is written to the sink FIRST —
     /// UNHASHED and NOT counted in the reported size — so the staging object holds `[header][payload]`
     /// and the promote can stay a verbatim server-side copy. Excluding the header from the hash is
     /// CRITICAL: the content key must be the pool's selected hash of `payload` alone (else the random
@@ -235,7 +274,7 @@ public:
     /// `object_key` as its third argument (in place of a local temp path) and `getFileName()` returns
     /// it too. `cancelImpl` only cancels `object_store_sink` — it never attempts to delete the
     /// (possibly partially-written) staging object; reclaiming an orphaned staging object after a
-    /// cancelled write is the mount-lease sweeper's job (a later task), not this buffer's.
+    /// cancelled write belongs to the mount-lease sweeper, not this buffer.
     CaContentWriteBuffer(
         std::unique_ptr<WriteBufferFromFileBase> object_store_sink,
         std::string object_key,
@@ -252,9 +291,14 @@ public:
     std::string getFileName() const override;
 
 private:
+    /// Feeds bytes to the hashing/staging sink while preserving the base write-buffer contract.
     void nextImpl() override;
+    /// Finalizes the sink, computes the content hash, and transfers the staging resource through
+    /// `on_finalized`; after that callback succeeds, the transaction owns cleanup.
     void finalizeImpl() override;
+    /// Cancels the sink and removes local staging. S3 staging is left for lease-scoped reclamation.
     void cancelImpl() noexcept override;
+    /// Removes the local staging path when ownership has not been transferred to the transaction.
     void removeTempFile() noexcept;
 
     OnFinalized on_finalized;
@@ -268,11 +312,11 @@ private:
     /// The spill sink: a local WriteBufferFromFile (Local mode) or the caller-supplied object-store
     /// sink (S3 mode). Either way it is a SECOND per-stream buffer wrapped by `hashing` below.
     std::unique_ptr<WriteBufferFromFileBase> sink;
-    /// Built via `Cas::makeBlobHashingWriteBuffer(hash_algo, *sink)` (P1-T3a, pluggable blob hash):
+    /// Built via `Cas::makeBlobHashingWriteBuffer(hash_algo, *sink)`:
     /// `CityHash128` is a thin adapter over the pre-existing `HashingWriteBuffer` convention (byte-for-byte
     /// unchanged); `XXH3_128` hashes with the pool's selected algo instead.
     std::unique_ptr<Cas::IHashingWriteBuffer> hashing;
-    bool temp_ownership_transferred = false;   /// B188: set after on_finalized; the dtor skips removeTempFile
+    bool temp_ownership_transferred = false;   /// Set after successful `on_finalized`; the destructor skips local cleanup.
 };
 
 /// Write buffer for bytes that live INSIDE pool metadata (a small inline part file staged into the
@@ -291,7 +335,10 @@ public:
     std::string getFileName() const override;
 
 private:
+    /// Appends bytes to the in-memory payload under the base write-buffer contract.
     void nextImpl() override;
+    /// Hands the complete inline payload to the callback; the callback decides whether it is staged
+    /// in a manifest or written immediately as a verbatim file.
     void finalizeImpl() override;
 
     OnInlined on_inlined;

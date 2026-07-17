@@ -105,9 +105,10 @@ PoolMeta decodePoolMeta(std::string_view data)
     ReadBufferFromMemory in(data.data(), data.size());
     const TextHeader header = expectHeaderLine(in, FormatId::PoolMeta);
 
-    /// Backward floor (Task 12): a pool written with the removed pre-generation-3 mutable ref-shard
-    /// format holds refs this build cannot read — fail closed. (v is always >= 3 on write; the gate
-    /// exists for a hypothetical older object.) The forward floor is expectHeaderLine's checkCompatibility.
+    /// Ref state before the snapshot+log model used mutable per-namespace ref-shard objects. That
+    /// representation was removed, so this build has no decoder with which to interpret such a pool;
+    /// reject it before reading the metadata body. Writers always emit the current generation, while
+    /// `expectHeaderLine` separately rejects a future generation that this build cannot understand.
     if (header.v < kRefSnapshotLogGeneration)
         throw Exception(ErrorCodes::UNKNOWN_FORMAT_VERSION,
             "CAS pool meta: pool was written with the removed pre-generation-3 ref-shard format "

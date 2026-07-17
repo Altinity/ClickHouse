@@ -46,7 +46,7 @@ namespace DB::Cas
 namespace
 {
 
-/// OQ7 backpressure caps, enforced fail-closed in stageManifest BEFORE the body write returns.
+/// Backpressure caps, enforced fail-closed in stageManifest before the body write returns.
 constexpr uint64_t kMaxManifestEntries = 1048576;
 constexpr uint64_t kMaxManifestEncodedBytes = 256ULL << 20;        /// 256 MiB
 constexpr uint64_t kMaxManifestInlineBytesTotal = 16ULL << 20;     /// 16 MiB
@@ -69,18 +69,16 @@ uint64_t nowMs()
 
 }
 
-/// The POOL-WIDE content-hash convention, with the pool's selected `algo` (P1-T3a, CAS
-/// pluggable-blob-hash design §5): `Cas::blobHashHexOneShot` uses the SAME streaming/chunked
-/// convention the write path uses for `CityHash128` (`ContentAddressedWriteBuffers`: `getHashHex` ->
+/// The pool-wide content-hash convention, with the selected `algo`: `Cas::blobHashHexOneShot` uses the same
+/// streaming/chunked convention the write path uses for `CityHash128` (`ContentAddressedWriteBuffers`: `getHashHex` ->
 /// `BlobId` -> `hexToU128`) and the one-shot `XXH3_128bits` call for `XXH3_128` (defined to agree
-/// with its own streaming digest). The core otherwise NEVER re-hashes payloads; copy-forward is the
-/// one sanctioned re-verification and MUST use this convention — a one-shot `CityHash128` (as opposed
-/// to the chunked convention) diverges for any payload larger than one hash block (found live:
-/// 2026-07-03 soak, a false `CORRUPTED_DATA` re-bricked the attach path copy-forward exists to fix).
+/// with its own streaming digest). The core otherwise never re-hashes payloads; any copy-forward
+/// re-verification must use this convention. A one-shot `CityHash128` instead of the chunked convention
+/// diverges for payloads larger than one hash block and can report valid stored content as `CORRUPTED_DATA`.
 ///
-/// Phase 3 T2 (mixed-algo pools): returns the full `BlobRef` pair, at `algo`'s own width (via
-/// `codecFor`, `CasBlobRef.h`) — never a bare digest. Exported (declared in `CasPartWriteTxn.h`) so the
-/// wiring's inline-candidate hashing (`ContentAddressedTransaction.cpp`) can mint the SAME way the
+/// Returns the full `BlobRef` pair at `algo`'s own width (via `codecFor`) — never a bare digest. Exported
+/// (declared in `CasPartWriteTxn.h`) so the wiring's inline-candidate hashing
+/// (`ContentAddressedTransaction.cpp`) can mint the same way the
 /// streaming blob path does, rather than reimplementing the hex round-trip inline.
 BlobRef poolContentHash(BlobHashAlgo algo, std::string_view payload)
 {
@@ -103,8 +101,8 @@ PartWriteTxn::PartWriteTxn(PoolPtr store_, UInt128 build_id_,
     , epoch(epoch_)
     , info(std::move(info_))
 {
-    /// B170: a build began (W-HEARTBEAT durable). build_id/seq/epoch identify it for token-join
-    /// attribution against the GC delete rows.
+    /// A build began. `build_id`, `build_seq`, and `epoch` identify it for token-join attribution
+    /// against the GC delete rows.
     EventEmitter{*store}.emit([&](CasEvent & e)
     {
         e.type = CasEventType::BuildStart;
@@ -127,7 +125,7 @@ void PartWriteTxn::requireAlive() const
 {
     if (!alive)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "PartWriteTxn has been abandoned; no further operations allowed");
-    /// spec §Namespace Removal: `dropNamespace` cancels in-flight builds once its removal transaction is
+    /// `dropNamespace` cancels in-flight builds once its removal transaction is
     /// durable. A cancelled build must not promote/precommit a fresh owner into the just-removed namespace
     /// (nor stage more debris there), so every further op fails closed here -- fast, before any backend
     /// work, with a clear diagnostic (the append lane would reject a promote/precommit anyway).
@@ -149,7 +147,7 @@ PutBlobResult PartWriteTxn::putBlob(const BlobRef & ref, BlobSource source)
     requireAlive();
 
     const PoolConfig & cfg = store->poolConfig();
-    /// Phase 3 T2/T3: `putBlob` writes the blob identified by `ref` directly -- the caller (the
+    /// `putBlob` writes the blob identified by `ref` directly -- the caller (the
     /// write-mint site) already produced the full `BlobRef` pair (algo + digest), so there is no hex
     /// round-trip here anymore. `logical_ref` is the blob identity end-to-end from here on: the dedup
     /// cache, the dep map, and every downstream event render key off THIS value directly.
@@ -163,9 +161,9 @@ PutBlobResult PartWriteTxn::putBlob(const BlobRef & ref, BlobSource source)
     /// against `source.size` at each streaming write site (via the sink buffer's `count()`), not by a
     /// full pre-materialization, so peak memory is bounded by the write-buffer, not the blob size.
 
-    /// B168 P1/P2: HEAD-before-PUT on a likely dedup hit (cache says present) or a large body (where a
+    /// HEAD-before-PUT on a likely dedup hit (cache says present) or a large body (where a
     /// wasted body-PUT that 412s is expensive — and on a store that early-closes a doomed conditional
-    /// PUT, the broken-pipe + retry storm of B187). A present HEAD ⇒ admit without streaming the body;
+    /// PUT, the broken-pipe and retry storm caused by early rejection). A present HEAD ⇒ admit without streaming the body;
     /// a stale/absent HEAD ⇒ fall through to the normal conditional upload. SAFE by construction: we
     /// always genuinely observe present-at-round before skipping the body, so the cache can never cause
     /// a dangle (a stale hit just HEADs 404 and uploads).
@@ -198,7 +196,7 @@ PutBlobResult PartWriteTxn::putBlob(const BlobRef & ref, BlobSource source)
         /// hr.exists == false OR condemned-ABORTED → fall through to uploadFromSource / fresh upload.
     }
 
-    /// B136 / INV-1: fresh-upload path + condemned-dedup recovery. Try the primary upload via
+    /// Fresh-upload path + condemned-dedup recovery under INV-1. Try the primary upload via
     /// uploadFromSource (which handles condemned-present via putOverwrite and absent via putIfAbsentStream
     /// without any backend().get). Bounded loop guards against rare concurrent-condemnation churn.
     constexpr int max_attempts = 8;
@@ -207,7 +205,7 @@ PutBlobResult PartWriteTxn::putBlob(const BlobRef & ref, BlobSource source)
         try
         {
             uploadFromSource(ObjectKind::Blob, logical_ref, key, source);
-            /// P1: this hash is now known-present — future writers can HEAD-first and skip the body.
+            /// This hash is now known-present — future writers can HEAD-first and skip the body.
             store->dedupCacheAdd(logical_ref);
             return PutBlobResult{ref, source.size};
         }
@@ -217,7 +215,7 @@ PutBlobResult PartWriteTxn::putBlob(const BlobRef & ref, BlobSource source)
             /// source (bounded). Two cases produce it:
             ///   • a racing writer displaced the condemned token before our putOverwrite landed and
             ///     their fresh incarnation is itself already condemned (observeAndAdmit → ABORTED); or
-            ///   • the object was GC-deleted during the post-412 revival re-observe (B190 sibling):
+            ///   • the object was GC-deleted during the post-412 revival re-observe:
             ///     reviveObserve converts FILE_DOESNT_EXIST → ABORTED so the vanish re-uploads here
             ///     rather than escaping FATAL. Both are rare races covered by the bounded loop.
             if (e.code() != ErrorCodes::ABORTED || attempt + 1 == max_attempts)
@@ -251,7 +249,7 @@ bool PartWriteTxn::depIsTokened(const BlobRef & ref) const
 
 uint64_t PartWriteTxn::observeAndAdmit(ObjectKind kind, const BlobRef & ref, const String & key)
 {
-    /// EDGE-BEFORE-OBSERVE (spec 2026-07-09-cas-writer-gc-simplification): the durable-precommit guard
+    /// EDGE-BEFORE-OBSERVE: the durable-precommit guard
     /// lives in the 4-arg overload below, scoped to its ADOPT branch only — NOT here. A HEAD result
     /// reached through this wrapper (e.g. `reviveObserve`'s post-race re-observe) can resolve to EITHER
     /// the condemned/ABORTED branch or the adopt branch once the 4-arg overload point-reads the meta;
@@ -290,10 +288,10 @@ uint64_t PartWriteTxn::observeAndAdmit(ObjectKind kind, const BlobRef & ref, con
 
     const CasEventObjectKind ev_kind = toEventKind(kind);
 
-    /// Task 3 (spec §meta-protocols v3): the condemned decision is now a per-hash META POINT-READ, not
-    /// the writer-side RetireView. `absent` meta means "not condemned" — GC always writes a `Condemned`
+    /// The condemned decision is a per-hash META POINT-READ, not
+    /// the retired-view snapshot. `absent` meta means "not condemned" — GC always writes a `Condemned`
     /// meta BEFORE it ever deletes a body, so an absent meta is exactly as live as a `Clean` one.
-    /// Phase 3 T3: the meta ops layer is `BlobRef`-keyed directly (derives its codec from `ref.algo`
+    /// The meta ops layer is `BlobRef`-keyed directly (derives its codec from `ref.algo`
     /// internally). Every event-log render below uses `blobIdOf(ref)` ("<algoName>:<hex>"), never a
     /// bare hex.
     const auto lm = loadMeta(store->backend(), store->layout(), ref);
@@ -311,7 +309,7 @@ uint64_t PartWriteTxn::observeAndAdmit(ObjectKind kind, const BlobRef & ref, con
             e.object_kind = ev_kind;
             e.object_hash = blobIdOf(ref);
             e.token = hr.token.value;
-            e.round = 0;   /// the round is no longer a writer concept (meta point-read replaces RetireView)
+            e.round = 0;   /// the round is no longer a writer concept (meta point-read replaces the retired view)
             e.outcome = "condemned";
             e.reason = "observed token is condemned (meta point-read); caller must re-upload from source (INV-1)";
         });
@@ -320,7 +318,7 @@ uint64_t PartWriteTxn::observeAndAdmit(ObjectKind kind, const BlobRef & ref, con
             key);
     }
 
-    /// EDGE-BEFORE-OBSERVE (spec 2026-07-09-cas-writer-gc-simplification): from here on we are about to
+    /// EDGE-BEFORE-OBSERVE: from here on we are about to
     /// ADOPT the live (non-condemned) incarnation as our own dependency — safe ONLY under this build's
     /// durable precommit closure, because an adopted blob carries the ORIGINAL writer's build_id, so the
     /// newborn-debris watermark does not cover it. (The condemned branch above is unaffected — it
@@ -348,7 +346,7 @@ uint64_t PartWriteTxn::observeAndAdmit(ObjectKind kind, const BlobRef & ref, con
     }
 
     /// Adopt the current incarnation — free, no bytes moved.
-    /// B170: reuse ADOPTED an existing incarnation's token as NOT condemned (per the meta point-read).
+    /// Reuse an ADOPTED existing incarnation's token as NOT condemned (per the meta point-read).
     /// Was the CAREUSE adopt audit line. Token-join this against a later blob_delete
     /// of the same hash/token to pin a reuse-of-an-object-being-deleted race.
     EventEmitter{*store}.emit([&](CasEvent & e)
@@ -357,7 +355,7 @@ uint64_t PartWriteTxn::observeAndAdmit(ObjectKind kind, const BlobRef & ref, con
         e.object_kind = ev_kind;
         e.object_hash = blobIdOf(ref);
         e.token = hr.token.value;
-        e.round = 0;   /// the round is no longer a writer concept (meta point-read replaces RetireView)
+        e.round = 0;   /// the round is no longer a writer concept (meta point-read replaces the retired view)
         e.outcome = "adopt";
         e.reason = "observed token not condemned (meta point-read); adopted the live incarnation (no bytes moved)";
     });
@@ -370,13 +368,13 @@ void PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef & ref, const 
     /// INV-1 (revival-from-source): re-upload a condemned or absent object from the writer's OWN
     /// re-readable source — NEVER calls backend().get to read the dying object. W-FRESH-TAG: fresh
     /// incarnation_tag and this build's build_id so the new incarnation is owned by THIS live build
-    /// (the B167 fix — the prior resurrect was the lone gap). The payload is STREAMED into the put sink
+    /// (the source-based resurrection rule closes the prior ownership gap). The payload is STREAMED into the put sink
     /// (`source.write_payload`), never materialized into a full in-memory copy on the common
     /// If-None-Match path; `source.write_payload` is re-invoked on each attempt (it re-reads the staged
     /// temp file), which is exactly what preserves INV-1 across retries.
     const PoolMeta & meta = store->poolMeta();
     const PoolConfig & cfg = store->poolConfig();
-    /// Phase 3 T3: `ref` is the full blob identity (algo + digest) end-to-end -- the `.meta` API is
+    /// `ref` is the full blob identity (algo + digest) end-to-end -- the `.meta` API is
     /// `BlobRef`-keyed directly, and the dep map + every event render below key off `ref` too.
 
     auto buildHeader = [&]() -> String
@@ -397,7 +395,7 @@ void PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef & ref, const 
 
     const CasEventObjectKind ev_kind = toEventKind(kind);
 
-    /// Revival-local wrapper for the post-412 re-observe (B190 sibling, INV-3). On the post-412 path a
+    /// Revival-local wrapper for the post-412 re-observe (INV-3). On the post-412 path a
     /// racing writer is assumed to have (re-)created the object, so we adopt its token via the 3-arg
     /// observeAndAdmit. But the object can be GC-deleted in the window (present at the conditional PUT
     /// → 412, gone at the subsequent HEAD), making the 3-arg overload throw FILE_DOESNT_EXIST. The
@@ -430,14 +428,14 @@ void PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef & ref, const 
             e.object_kind = ev_kind;
             e.object_hash = blobIdOf(ref);
             e.token = tok.value;
-            e.round = 0;   /// the round is no longer a writer concept (meta point-read replaces RetireView)
+            e.round = 0;   /// the round is no longer a writer concept (meta point-read replaces the retired view)
             e.outcome = "ok";
             e.reason = "uploadFromSource: fresh incarnation streamed from writer's own re-readable source (INV-1)";
             e.detail = {{"size", std::to_string(source.size)}, {"build_id", u128ToHex(build_id)}};
         });
     };
 
-    /// Task 3 (spec §meta-protocols v3) meta write for the FRESH (absent -> present) upload cases: the
+    /// Meta write for the FRESH (absent -> present) upload cases: the
     /// body just transitioned via If-None-Match, so the freshness meta is created as Clean.
     /// `putMetaIfAbsent` — a Conflict just means a racing writer already created it (fine; both agree
     /// on the same Clean steady state).
@@ -479,7 +477,7 @@ void PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef & ref, const 
     /// size check, with no full in-memory copy. A mismatch is a LOGICAL_ERROR (a buggy/racing source).
     ///
     /// The whole conditional create rides the Pool's shared request controller
-    /// (`conditionalCreateControlled` — availfix, chaos-tolerance-report §Task B verdict's "any other
+    /// (`conditionalCreateControlled` — the retry controller's "any other
     /// controller-bypassing conditional-write call site"): budgeted attempts + fence-gated backoff +
     /// exact-key OCCUPANCY resolve, replacing the old bare single attempt whose whole S3-blip tolerance
     /// was ONE ~3s adaptive-timeout attempt. Reissue is sound for BOTH primitives: the streaming PUT
@@ -500,7 +498,7 @@ void PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef & ref, const 
     {
         const auto one_attempt = [&]() -> PutResult
         {
-            /// S3-native staging promote (spec 2026-07-11-cas-s3-native-staging §5/§8): when the source
+            /// S3-native staging promote: when the source
             /// carries a server-side-copy descriptor, the write-once CREATE primitive is a conditional
             /// server-side copy of the staging object to `key` (`If-None-Match:*`) instead of a
             /// client-side streaming PUT. Same write-once contract (`Done` + dest-ETag token on created,
@@ -509,7 +507,7 @@ void PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef & ref, const 
             if (source.server_side_copy_from)
                 return store->backend().promoteStaged(*source.server_side_copy_from, key);
 
-            /// B171: no owner metadata (protection is the precommit edge — reachability, not `cas_owner`).
+            /// No owner metadata is needed: protection is the precommit edge — reachability, not `cas_owner`.
             /// A throw mid-stream abandons the sink (its dtor cancels): nothing is ever published by a
             /// failed attempt except via the storage's own late-landing ambiguity, which the controller
             /// resolves.
@@ -539,14 +537,14 @@ void PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef & ref, const 
         /// this incarnation (deps/meta are recorded only on a definite outcome); a late-landing body is
         /// inert debris behind the content-addressed key — a future writer of the same content adopts
         /// or displaces it through the normal occupancy machinery. NETWORK_ERROR = the same retryable
-        /// abort class stageManifest and the ref lane map their exhausted budgets to (fix #37 phase 2).
+        /// abort class stageManifest and the ref lane map their exhausted budgets to.
         throwCasWriteRetryLater(fmt::format(
             "uploadFromSource: conditional create at '{}' is UNCERTAIN (retry budget exhausted or mount "
             "fence lost) — nothing was acknowledged; retry re-uploads from the writer's own source (INV-1)",
             key));
     };
 
-    /// Phase 1: try If-None-Match upload (object absent or race with another writer).
+    /// Try the If-None-Match upload (object absent or race with another writer).
     {
         const PutResult res = streamIfAbsent();
         if (res.outcome == PutOutcome::Done)
@@ -581,8 +579,8 @@ void PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef & ref, const 
         return;
     }
 
-    /// Task 3 (spec §meta-protocols v3): the condemned decision is now a per-hash META POINT-READ, not
-    /// the writer-side RetireView. `lm` (and its etag) is reused below to flip a condemned meta back to
+    /// The condemned decision is a per-hash META POINT-READ, not
+    /// the retired-view snapshot. `lm` (and its etag) is reused below to flip a condemned meta back to
     /// Clean once the resurrect displacement lands.
     const auto lm = loadMeta(store->backend(), store->layout(), ref);
     const bool condemned = lm && lm->meta.state == MetaState::Condemned;
@@ -596,11 +594,11 @@ void PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef & ref, const 
     /// Condemned: displace the condemned incarnation with our fresh source.
     if (source.server_side_copy_from)
     {
-        /// S3-native staging RESURRECT (spec §5/§9, INV-NO-RETURN fix 2026-07-11): re-establish a fresh
+        /// S3-native staging RESURRECT (INV-NO-RETURN): re-establish a fresh
         /// incarnation by re-uploading OUR OWN staging PAYLOAD under a FRESHLY-tagged envelope header —
         /// NEVER a read/copy of the condemned `key` (`feedback_ca_resurrect_invariant`). We reach here
         /// ONLY after the per-hash meta point-read observed `Condemned` just above, so this overwrites a
-        /// condemned body, never a live blob (INV: never overwrite a live blob, spec §9).
+        /// condemned body, never a live blob (INV: never overwrite a live blob).
         ///
         /// CRITICAL — a VERBATIM server-side copy of the create-time staging object would reproduce the
         /// condemned incarnation's exact bytes ⇒ identical ETag ⇒ the queued exact-token delete of the
@@ -678,7 +676,7 @@ void PartWriteTxn::adoptEvidence(const ManifestEntry & entry)
     /// Inline / Blob placements (no Subtree): only blobs are content-addressed.
     if (entry.placement == EntryPlacement::Blob)
     {
-        /// Phase 3 T2: carry `entry.ref` WHOLE (the pair, never re-derived) — this is what makes a
+        /// Carry `entry.ref` WHOLE (the pair, never re-derived) — this is what makes a
         /// mixed-algo manifest's entries each dep-track under their OWN algo. §4: adopted=true marks this a
         /// committed-source W-EVIDENCE dep, trusted at promote via the durable manifest edge (no probe).
         deps[entry.ref] = DepEntry{ObjectKind::Blob, std::nullopt, entry.blob_size, /*adopted=*/true};
@@ -694,7 +692,7 @@ void PartWriteTxn::recordPendingBlobDep(const BlobRef & ref, uint64_t size)
 RootNamespace PartWriteTxn::manifestNamespace() const
 {
     /// The wiring sets the owning namespace EXPLICITLY (PartWriteInfo::intended_namespace). This is the
-    /// authoritative source: a ref can itself contain `/` (the `detached/<part>` fold, B181), so we
+    /// authoritative source: a ref can itself contain `/` (the `detached/<part>` fold), so we
     /// must NOT recover the namespace by splitting intended_ref on the last `/` — that would yield a
     /// spurious `<ns>/detached` namespace and the precommit namespace-match check would throw.
     if (info.intended_namespace)
@@ -715,7 +713,7 @@ ManifestId PartWriteTxn::stageManifest(std::vector<ManifestEntry> entries)
 {
     requireAlive();
 
-    /// Fail-closed caps (OQ7) — checked BEFORE the body write so no owner transition can ever name a
+    /// Fail-closed caps — checked BEFORE the body write so no owner transition can ever name a
     /// manifest that breaches a cap. Inline payload is read on every part-open and every owner
     /// transition, so cap the total, not only per-entry.
     if (entries.size() > kMaxManifestEntries)
@@ -754,9 +752,8 @@ ManifestId PartWriteTxn::stageManifest(std::vector<ManifestEntry> entries)
     body.root_namespace_id = owning_ns;
     body.entries = std::move(entries);
     body.payload_digest = computePayloadDigest(body);
-    /// The cap is measured over the canonical TEXT (pre-seal), not the sealed/compressed PUT bytes:
-    /// JSON inflates relative to the old binary form, but 256 MiB remains a comfortable bound for the
-    /// largest realistic manifest.
+    /// The cap is measured over the canonical text before sealing, not the compressed PUT bytes.
+    /// 256 MiB comfortably bounds the largest realistic manifest, including its JSON structure.
     const String encoded_text = encodePartManifest(body);
     if (encoded_text.size() > kMaxManifestEncodedBytes)
         throw Exception(ErrorCodes::LIMIT_EXCEEDED,
@@ -766,7 +763,7 @@ ManifestId PartWriteTxn::stageManifest(std::vector<ManifestEntry> entries)
     const ManifestId id{owning_ns, ref};
     const String key = store->layout().manifestKey(id);
 
-    /// Body PUT through the Pool's shared request controller (chaos-tolerance-report §Task B):
+    /// Body PUT through the Pool's shared request controller:
     /// budgeted attempts + resolve-before-reissue, replacing the old bare single-attempt write whose
     /// whole S3-blip tolerance was ONE ~3s adaptive-timeout attempt (a 19s object-store pause killed an
     /// INSERT through it while every plain read/write path survived — v3 soak evidence). Reissuing this
@@ -792,7 +789,7 @@ ManifestId PartWriteTxn::stageManifest(std::vector<ManifestEntry> entries)
     /// lane there is nothing to wedge: this id was never named by any owner transition
     /// (`next_manifest_ordinal` is already past it, so no re-stage ever reuses the key), and a
     /// late-landing body is inert unreferenced debris for the orphan-manifest sweep. NETWORK_ERROR =
-    /// the same retryable abort class the ref lane's exhausted budget maps to (fix #37 phase 2).
+    /// the same retryable abort class the ref lane's exhausted budget maps to.
     if (put_outcome == CasWriteOutcome::Unresolved)
         throwCasWriteRetryLater(fmt::format(
             "stageManifest: part-manifest PUT at '{}' is UNCERTAIN (retry budget exhausted) — "
@@ -823,14 +820,14 @@ void PartWriteTxn::precommitAdd(const RootNamespace & target_ns, const String & 
             "precommitAdd: manifest namespace '{}' != target namespace '{}'",
             id.root_namespace.string(), target_ns.string());
 
-    /// Task 10 (spec §Add Precommit / §Namespace Birth): one `owner_transition` create-precommit op.
+    /// One `owner_transition` create-precommit op.
     /// No body HEAD — a missing body is a legal fail-closed, non-activating intent, unchanged from the
     /// old protocol. Precommit ownership carries NO separate build token: `id.ref` (writer_epoch,
-    /// build_sequence, manifest_ordinal) IS the build identity (spec
+    /// build_sequence, manifest_ordinal) IS the build identity (the tuple
     /// §Transaction Log Format: "there is no second build token"). `build_ops` is invoked from inside
     /// the per-namespace flush, so it sees the table's CURRENT state including any earlier item of the
     /// same batch; when that state is not `Live` (never born, or `Removed`), it prepends
-    /// `namespace_birth` in the SAME transaction (spec §Namespace Birth: "The birth transaction
+    /// `namespace_birth` in the SAME transaction (the birth transaction
     /// normally also adds the first precommit").
     store->appendRefOps(target_ns, MutationScope::ref(final_ref_name),
         [&](const RefTableState & state) -> std::vector<RefOp>
@@ -839,7 +836,7 @@ void PartWriteTxn::precommitAdd(const RootNamespace & target_ns, const String & 
             /// legitimate re-drive calling precommitAdd+promote again for content that is already
             /// live -- see `promote`'s matching no-op guard). Nothing to append: re-adding a precommit
             /// for an already-owned manifest would violate "no conflicting owner may name the same
-            /// manifest" (spec §Add Precommit), which the state machine enforces for every OTHER case.
+            /// manifest", which the state machine enforces for every OTHER case.
             if (const auto it = state.committed.find(final_ref_name);
                 it != state.committed.end() && it->second.manifest_ref == id.ref)
                 return {};
@@ -847,10 +844,10 @@ void PartWriteTxn::precommitAdd(const RootNamespace & target_ns, const String & 
             std::vector<RefOp> ops;
             if (state.lifecycle != RefLifecycle::Live)
             {
-                /// Task 11 (spec §Namespace Birth): recreating a `Removed` namespace requires the
+                /// Recreating a `Removed` namespace requires the
                 /// EXACT `_cleanup/<remove_txn_id>` completion marker from this table's own recovery --
                 /// an empty physical prefix is never sufficient. A never-born table (`remove_txn_id`
-                /// absent) needs no marker at all. Fix #37 phase 2: this is a namespace-rebirth RACE,
+                /// absent) needs no marker at all. This is a namespace-rebirth RACE,
                 /// not a terminal rejection -- it resolves once GC's namespace-cleanup item publishes
                 /// the marker, so it retries later via throwCasWriteRetryLater rather than staying
                 /// ABORTED. It also ESCAPES to the same caller sequence (`publishEntries`,
@@ -913,13 +910,13 @@ void PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
     if (!manifestNamespaceMatches(target_ns, body))
         throwCasWriteRetryLater(fmt::format("promote: ManifestNamespaceMatches failed for {}", manifest_key));
 
-    /// D3 (spec 2026-07-09-cas-writer-gc-simplification): the copy-forward pre-pass is removed — the
+    /// The copy-forward pre-pass is removed — the
     /// in-closure blob revalidation below is now the SINGLE copy-forward site. Trade-off: the rare
     /// condemned-tokenless copy-forward (a GET+PUT) now runs inside the append lane's flush, briefly
     /// blocking the per-namespace batching queue; it is idempotent under a re-run (a retry sees its own
-    /// fresh token). Accepted — Phase B replaces the heavy body-dance with a meta CAS anyway.
+    /// fresh token). The meta CAS is the only remaining coordination for this rare case.
 
-    /// all-tree-part-files Task 2 (spec §4/§7 corrected note -- WDropRef+WPromote composition): the
+    /// The intended-repoint operation is an atomic composition of `WDropRef` and `WPromote`: the
     /// manifest the ref currently commits,
     /// when this promote is retiring it via an intended repoint (`allow_repoint`) rather than the
     /// ordinary first-time-commit path. Set inside the closure below; read after it returns to decide
@@ -937,18 +934,18 @@ void PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
                 it != state.committed.end() && it->second.manifest_ref == id.ref)
                 return {};
 
-            /// NO writer-side view refresh here (spec 2026-07-09-cas-writer-gc-simplification D5, TLA+
+            /// NO writer-side view refresh here:
             /// Gate A): promote-time view freshness is not load-bearing — tokened leaves are edge-protected
             /// (EDGE-BEFORE-OBSERVE) and the tokenless K3 gate below reads the live view, which the floor
             /// guarantees contains every graduated entry (in EVERY view >= condemn round + 1).
 
-            /// BUG 1 / TLA+ `WPromote` guard (`owner[m] = bld`): a promote is a PURE owner MOVE that emits
+            /// The `WPromote` owner guard (`owner[m] = bld`): a promote is a PURE owner MOVE that emits
             /// NO blob delta (Δ=0) — it restores no blob in-degree. It is therefore only sound when the
             /// precommit is STILL the live owner of the ref: if an abandon or GC reclaim already appended
             /// a removal of the precommit binding, the blobs' in-degree was already decremented and a Δ=0
             /// move would re-publish a committed ref over to-be-deleted blobs ⇒ a dangling committed
             /// manifest (INV_NO_DANGLE). `RefTableState.precommits` materializes live ownership directly:
-            /// `id.ref` alone identifies the build (spec: "there is no second
+            /// `id.ref` alone identifies the build (there is no second
             /// build token"), so an exact-binding lookup answers the same question directly.
             if (!state.precommits.contains({final_ref_name, id.ref}))
                 throwCasWriteRetryLater(fmt::format(
@@ -957,7 +954,7 @@ void PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
                     "(WPromote owner==bld)",
                     final_ref_name, u128ToHex(promote_build_id)));
 
-            /// Blob-leaf revalidation (§4 manifest-trust relink, spec 2026-07-13 §4). TOKENED leaves are
+            /// Blob-leaf revalidation. TOKENED leaves are
             /// edge-protected — EDGE-BEFORE-OBSERVE: the precommit closure was durable BEFORE putBlob
             /// observed them, so a condemnation in the putBlob→promote window cannot graduate (the next fold
             /// sees the edge, d >= 1, spared), and putBlob's gate already validated them against the installed
@@ -965,7 +962,7 @@ void PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
             /// committed-source W-EVIDENCE adopt (adoptEvidence ⇒ adopted=true) or a no-dep / pending-upload
             /// staging bug. There is NO per-file probe on this path: an adopted leaf is TRUSTED via the
             /// durable manifest edge (the live source pins the blob, in-degree >= 1, not condemnable) and this
-            /// build's precommit edge is durable — matching the D4 relink trust model (ordinary
+            /// build's precommit edge is durable — matching the relink trust model (ordinary
             /// ReplicatedMergeTree interserver trust). A genuinely-absent adopted blob is an invariant
             /// violation caught by fsck, not here.
             for (const ManifestEntry & e : body.entries)
@@ -980,8 +977,8 @@ void PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
                 /// `OwnerTransition` above) BEFORE we get here, and the owner-liveness check at the top of this
                 /// closure ("WPromote owner==bld") already re-proved it is the LIVE owner — so the dst manifest
                 /// is a live precommit owner input and GC's fold pins every blob it names at in-degree >= 1
-                /// (the barrier-activated create-precommit +1, Task 12). GC is the sole deleter and respects
-                /// in-degree, so a trusted-promote leaf cannot have been condemned/deleted. The D4 backstop for
+                /// (the barrier-activated create-precommit +1). GC is the sole deleter and respects
+                /// in-degree, so a trusted-promote leaf cannot have been condemned/deleted. The backstop for
                 /// the (production-unreachable) genuinely-absent case is fsck's reachable-but-absent scan
                 /// (`CasFsck.cpp`, `++report.dangling`), NOT this gate. A tokenless PENDING-upload dep
                 /// (adopted=false) or a no-dep leaf never reaches promote un-resolved legitimately: it is a
@@ -1004,8 +1001,8 @@ void PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
 
             /// BUG 1a: refuse to overwrite a live committed ref that already names a DIFFERENT manifest —
             /// that would orphan the old manifest (its owner-removal `-1` is never emitted) UNLESS the
-            /// caller opted into an intended repoint (`allow_repoint`, all-tree-part-files Task 2; modeled
-            /// as the WDropRef+WPromote composition, spec §7 corrected note) -- a standalone
+            /// caller opted into an intended repoint (`allow_repoint`, modeled as the `WDropRef`+`WPromote`
+            /// composition) -- a standalone
             /// write/remove on an already-committed part. Without the flag
             /// this enforces the model's `RefFreeFor` guard (`WPromote` requires it) exactly as before. A
             /// re-promote of the SAME manifest_ref is idempotent and allowed regardless (the state
@@ -1023,20 +1020,20 @@ void PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
                 repoint_old = it->second.manifest_ref;
             }
 
-            /// Promotion is a PURE OWNER MOVE (spec §Promote): the SAME manifest_ref T moves from
+            /// Promotion is a PURE OWNER MOVE: the SAME manifest_ref T moves from
             /// precommit to committed in one atomic transaction, together with the SetPayload op that
-            /// stamps `published_at_ms` (spec: "the initial stamp arrives via a separate set_payload op,
-            /// in the same transaction or a later one" -- here, the same one; all-tree-part-files Task 9
+            /// stamps `published_at_ms` (the initial stamp arrives via a separate set_payload op,
+            /// in the same transaction or a later one -- here, the same one;
             /// dropped the mutable-file payload this op used to also carry). It emits NO blob deltas; the
-            /// activating `+1` came from GC's barrier-activation of the create-precommit op (Task 12).
+            /// activating `+1` came from GC's barrier-activation of the create-precommit op.
             std::vector<RefOp> ops;
-            /// all-tree-part-files Task 2: an intended repoint additionally retires the OLD committed
+            /// An intended repoint additionally retires the OLD committed
             /// binding in this SAME ref-log record -- a separate OwnerTransition (old=Committed(repoint_old),
             /// new=absent), since one RefOwnerBinding cannot carry both the retired-committed and the
             /// promoted-precommit manifests at once (CasRefLogCodec.h). Together with the transition op
             /// below, this record atomically composes two verified model shapes -- this removal is `WDropRef`'s
             /// and the transition is `WPromote`'s; `applyRefLogTxn`'s whole-record scratch apply makes the
-            /// composition a sound refinement (no intra-record intermediate state is observable; spec §7
+            /// composition a sound refinement (no intra-record intermediate state is observable;
             /// corrected note). NOT `WRepoint` -- that action requires an unowned destination, while this
             /// trigger always promotes a live precommit. Ref still moves directly
             /// from the old manifest to the new one. Mirrors `publishCommittedTransition`'s old-removal
@@ -1079,10 +1076,10 @@ void PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
         e.detail = {{"build_seq", std::to_string(build_seq)}};
     });
 
-    /// all-tree-part-files Task 2 (spec §4): the low-level audit event for an intended repoint. The
-    /// ProfileEvent counter + LOG_WARNING are owned by `CachedPartFolderAccess::repointRef` (Task 3),
+    /// The low-level audit event for an intended repoint. The ProfileEvent counter + LOG_WARNING are
+    /// owned by `CachedPartFolderAccess::repointRef`,
     /// the user-facing primitive that calls into this promote -- adding them here too would double-fire
-    /// once Task 3 lands. This event alone is per-call-site accurate regardless of which caller opted
+    /// once the caller-level instrumentation is installed. This event alone is per-call-site accurate regardless of which caller opted
     /// into `allow_repoint`.
     if (repoint_old)
     {
@@ -1133,7 +1130,7 @@ void PartWriteTxn::abandon()
 
     /// BUG 2 / TLA+ `WAbandonPrecommit`: if this build made a manifest a LIVE precommit owner input
     /// (`precommitAdd` ran), abandoning it must NOT writer-delete that body. Instead append an exact
-    /// precommit-removal ref-log transaction (spec §Remove Precommit), mirroring EXACTLY the removal
+    /// precommit-removal ref-log transaction, mirroring EXACTLY the removal
     /// shape `Pool::dropRef` and the fenced-successor stale-precommit sweep use (an old_binding naming
     /// the exact precommit, no new_binding). GC then folds the `-1` blob decrements and deletes the
     /// body only after they are sealed (delete-after-sealed-decrements). Deleting a live precommit body
@@ -1176,7 +1173,7 @@ void PartWriteTxn::abandon()
 
     cleanupStagedManifestDebrisBestEffort();
 
-    /// B170: the build was abandoned; its uploads become GC-reclaimable debris.
+    /// The build was abandoned; its uploads become GC-reclaimable debris.
     EventEmitter{*store}.emit([&](CasEvent & e)
     {
         e.type = CasEventType::BuildAbort;
@@ -1190,9 +1187,8 @@ void PartWriteTxn::abandon()
 
 void PartWriteTxn::cleanupStagedManifestDebrisBestEffort()
 {
-    /// Best-effort writer cleanup of THIS build's pre-precommit/staged `_manifests` debris (spec
-    /// §Pre-Precommit Part-Manifest Debris). The common case is writer cleanup; a missed object is
-    /// benign — the Phase-1d namespace-scoped orphan sweep reclaims it. Exact-token delete only; never
+    /// Best-effort writer cleanup of THIS build's pre-precommit/staged `_manifests` debris. The common case
+    /// is writer cleanup; a missed object is benign — the namespace-scoped orphan sweep reclaims it. Exact-token delete only; never
     /// throws. SKIP the manifest that became a live precommit owner: its body is a live precommit input
     /// whose deletion is GC's job after the sealed decrement (never writer-delete it).
     for (const ManifestId & id : staged_manifests)

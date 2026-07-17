@@ -1,5 +1,4 @@
 #pragma once
-#include <cstddef>
 #include <cstdint>
 #include <span>
 #include <string_view>
@@ -7,113 +6,112 @@
 namespace DB::Cas
 {
 
+/// Shared vocabulary and policy registry for persisted content-addressed objects. The registry
+/// supplies the version gate and the per-object text-file traits used by the codecs in this
+/// directory; it does not own object bytes or storage lifecycle state.
+
 /// The highest pool-format generation this build understands. A build keeps every decoder for
 /// generations 1..G_BUILD (new code always reads old); an object is readable iff its
 /// compatibility_version <= G_BUILD. Bump this (and append a change-point in CasFormat.cpp) when a new
 /// format generation is introduced.
 ///
-/// Raised 1 -> 2 (CAS mixed-algo pools, Phase 3 T5 controller-review extension): the schema-3
-/// algo-prefixed settlement key (`SourceEdgeKeyCodec`, `Core/CasBlobInDegree.h`) landed in Task 3 with
-/// NO accompanying reader-generation bump, leaving the gate a no-op constant -- a generation-1 build
-/// could still open a pool whose GC state it cannot actually decode. `PoolMeta::createOrValidate`
-/// (`CasPoolMeta.cpp`) already CAS-raises `min_reader_generation` to `G_BUILD` on every successful
-/// open/admission; bumping this constant to 2 makes that raise land at 2 and makes a persisted
-/// `min_reader_generation > 2` (e.g. a future generation-3 pool) correctly fail-closed here.
+/// Generation 2 is the first generation that understands mixed-algorithm pools: the schema-3
+/// source-edge settlement key includes the algorithm prefix, so a generation-1 reader can open the
+/// pool but cannot decode its GC state. Pool admission CAS-raises `min_reader_generation` to this
+/// build's own floor (`G_BUILD`), and a persisted floor above `G_BUILD` fails closed.
 ///
-/// Raised 2 -> 3 (Task 12, ref snapshot+log format): the table ref state moved from the mutable
-/// pre-generation-3 ref-shard objects to immutable `_log`/`_snap` objects -- a BREAKING ref-format
-/// change. The forward gate above is not sufficient (a generation-2 pool's `compatibility_version` still
-/// passes `<= G_BUILD`), so `decodePoolMeta` adds an explicit BACKWARD floor: a pool whose pool-meta
-/// `compatibility_version < 3` holds unreadable pre-generation-3 ref-shard-format refs and fails closed
-/// at open. CAS is pre-release, so no migration exists -- such a pool must be recreated.
+/// Generation 3 replaces mutable ref-shard objects with immutable `_log` and `_snap` objects. The
+/// per-object forward gate cannot reject an old pool whose version is still at most 3, so pool-meta
+/// decoding also applies `kRefSnapshotLogGeneration` as a backward floor. Pools below that floor
+/// contain refs this build cannot decode and must be recreated; there is no migration path in the
+/// pre-release format.
 constexpr uint32_t G_BUILD = 3;
 
-/// The pool-format generation at which the ref state became immutable snapshot+log objects (Task 12).
-/// A pool-meta `compatibility_version` below this cannot be opened by this build (its refs are the
-/// removed pre-generation-3 mutable ref-shard format). See the backward floor in
-/// `CasPoolMeta.cpp::decodePoolMeta`.
+/// The pool-format generation at which ref state became immutable snapshot+log objects. Pool metadata
+/// below this value cannot be opened because its refs use the removed mutable ref-shard format; the
+/// backward-floor check is applied by `decodePoolMeta`.
 constexpr uint32_t kRefSnapshotLogGeneration = 3;
 
-/// The registry of every self-describing persisted object class. For hashed binary objects the 4-byte
-/// magic doubles as the on-disk identifier; this enum is what the version tables key on.
+/// Stable identifiers for every self-describing persisted object class. The text registry uses the
+/// corresponding `type` string as the on-disk identity. Numeric values are part of the format history:
+/// retired values remain unused so an old object can never be mistaken for a later class.
 enum class FormatId : uint16_t
 {
     Blob = 1,
-    /// 2 (Tree) and 4 (GcSnap) retired in the rev. 15 root-local part-manifest redesign — no on-disk
-    /// compat to honor (CA pre-release). The survivors keep their numeric values; no two share a value.
-    /// 3 (Manifest, magic CARS, "cas_ref_shard") retired 2026-07-10 with the retired-in-snapshot
-    /// refactor — the mutable root-shard ref format was replaced by the ref snapshot+log objects
-    /// (RefSnapshot/RefLog below). Id 3 and magic CARS (0x53524143) are freed; never reuse.
+    /// Values 2, 3, and 4 are retired. The former tree and GC-snapshot classes were replaced by the
+    /// root-local part manifest, while the former mutable `cas_ref_shard` class was replaced by the
+    /// immutable `RefSnapshot` and `RefLog` objects. Keep all three values unused.
     GcState = 5,
-    /// 6 (RetiredSet, magic CART) retired 2026-07-10 with the retired-in-snapshot refactor — condemned
-    /// state rides the source-edge runs + fold-seal condemned_summary. Id 6 and magic CART (0x54524143)
-    /// are freed; never reuse.
-    /// 7 (Watermark) retired with the ack-floor merge — the build-watermark floor rides the mount-lease
-    /// beat (MountLease), there is no standalone watermark object anymore.
+    /// Value 6 is retired: condemned state now rides source-edge runs and the fold-seal
+    /// `condemned_summary`. Keep it unused. Value 7 is also retired: the build-watermark floor is
+    /// carried by the `MountLease` beat rather than a standalone object.
     PoolMeta = 8,
     Roster = 9,
-    /// 10 (RootsRegistry) deleted in Task 4 — discovery authority moved to LIST(cas/refs/).
+    /// Value 10 is retired: discovery authority is the `cas/refs/` listing rather than a roots
+    /// registry object.
     GcOutcomes = 11,
-    /// Phase 1a (CA GC root-local part-manifest redesign):
-    PartManifest = 12,    /// immutable root-local part manifest body (`cas_part_manifest`); PayloadHybrid
-                          /// text codec (`Formats/CasPartManifestFormat`), no magic — retired the "CAPT"
-                          /// binary framing in the codecs-v3 phase-6 cutover.
-    RunFile = 13,         /// backs the `cas_run` GC source-edge NDJSON record stream
-                          /// (`Formats/CasRecordStreamFormat`); no magic, `PinnedRaw` (no compression).
-                          /// The id number is inherited from the original binary block-framed run codec
-                          /// (`CasRunFile.{h,cpp}`, magic "CARN") that this FormatId once named; that
-                          /// codec is deleted as of the codecs-v3 phase-6 cutover.
-    FoldSeal = 14,        /// write-once gc/gen/<gen>/fold_seal (coverage + blob_target/cleanup runs); magic "CAFS"
-    /// 15 (CompletionSeal) retired with the one-pass ack-floor round (fence/recheck/delete/trim phases
-    /// removed) — the fold seal is now the sole per-generation coverage record.
-    /// Phase 0 (mount safety): per-server-root control objects under gc/server-roots/<server_root_id>/.
-    Owner = 16,           /// owner anchor (server_root_id -> server UUID); magic "CAOW"
-    ServerEpoch = 17,     /// writer-epoch fence (next_writer_epoch); magic "CAEP"
-    MountLease = 18,      /// live mount lease; magic "CAML"
-    /// v3 text-format cutover (2026-07-15 design): ids for persisted objects that predate the
-    /// registry — refsnaplog, the blob-meta sidecar, and the GC heartbeat (formerly the 24-byte
-    /// unversioned exception). Values are frozen; never reuse.
+    PartManifest = 12,    /// Immutable root-local `cas_part_manifest` payload-hybrid text object.
+    RunFile = 13,         /// Deterministic, uncompressed `cas_run` GC source-edge NDJSON stream.
+    FoldSeal = 14,        /// Write-once `cas_fold_seal` coverage and blob-target/cleanup-run object.
+    /// Value 15 is retired: the fold seal is the sole per-generation coverage record after the
+    /// one-pass GC round. The following three classes are per-server-root mount-safety objects.
+    Owner = 16,           /// `cas_owner` anchor from server-root ID to server UUID.
+    ServerEpoch = 17,     /// `cas_epoch` writer-epoch fence carrying `next_writer_epoch`.
+    MountLease = 18,      /// Live `cas_mount_lease` object.
+    /// These identifiers cover objects that were added to the registry after their initial codecs:
+    /// the ref transaction log, complete ref snapshot, blob freshness sidecar, and GC heartbeat.
+    /// Their values are frozen and must never be reused.
     RefLog = 19,          /// cas_ref_log     — ref transaction log object
     RefSnapshot = 20,     /// cas_ref_snap    — complete per-namespace ref table
     BlobMeta = 21,        /// cas_blob_meta   — per-blob freshness sidecar
     GcHeartbeat = 22,     /// cas_gc_hb       — GC leader heartbeat
 };
 
-/// What this build stamps as writer_version on every object it writes. Pre-roster: always G_BUILD.
+/// Returns the writer generation stamped on newly written objects. The current pre-roster writer
+/// always stamps `G_BUILD`.
 uint32_t currentWriterVersion();
 
-/// What this build stamps as compatibility_version on every object it writes. Pre-roster: always
-/// G_BUILD (the write-down-to-floor branch defers until a roster is available). Readers check
-/// compatibility_version > G_BUILD and fail closed.
+/// Returns the compatibility generation stamped on newly written objects. Until the roster and
+/// write-down-to-floor policy exist, this is always `G_BUILD`; readers reject values above `G_BUILD`.
 uint32_t currentCompatibilityVersion();
 
-/// THE reader rule. `compatibility_version` is read from an object's CasHeader; if it exceeds what
-/// this build understands (G_BUILD), fail closed with UNKNOWN_FORMAT_VERSION — never misread a
-/// future object. `what` names the object class in the error message.
+/// Applies the common fail-closed reader gate. If an object's `compatibility_version` exceeds
+/// `G_BUILD`, throws `UNKNOWN_FORMAT_VERSION` before the caller interprets the body; `what` identifies
+/// the object in the exception message.
 void checkCompatibility(uint32_t compatibility_version, std::string_view what);
 
-/// One entry of a class's format history: at global generation `generation` the class's serialization
-/// changed, and a reader must understand at least `min_reader` to read an object written at it.
-/// Additive change => append {gen, <prior min_reader>}; breaking change => append {gen, gen}.
+/// One append-only entry in a class's format history. At `generation`, the class's serialization
+/// changed, and a reader must understand at least `min_reader` to read an object written at that
+/// generation. Additive changes retain the previous reader floor; breaking changes set the floor to
+/// the change generation itself.
 struct FormatChangePoint
 {
     uint16_t generation;
     uint16_t min_reader;
 };
 
-/// The append-only change-point history for `id`, oldest first. Generation 1 is the frozen baseline
-/// ({1,1} for every class today).
+/// Returns the append-only change-point history for `id`, oldest first. Every class currently has the
+/// frozen generation-1 baseline `{1, 1}`; future changes append entries without editing old ones.
 std::span<const FormatChangePoint> changePoints(FormatId id);
 
-/// ---- v3 text-format registry -----------------------------------------------------------------
-/// One row per persisted object class (spec 2026-07-15 §corrected-object-inventory). The row is
-/// the single source of the header-line `type`, the family, the strictness of unknown keys, the
-/// compression policy, and the fail-closed size caps. A format missing here cannot be decoded.
+/// The text-format registry has one row per decodable persisted object. Each row is the single source
+/// for the header-line `type`, body family, unknown-key policy, compression policy, and fail-closed
+/// size caps. A format missing from this registry cannot be decoded.
 
+/// The shape of a text object body: a materialized control object, a streamed sorted record sequence,
+/// or a descriptor followed by raw payload bytes.
 enum class TextFamily : uint8_t { Control = 1, RecordStream = 2, PayloadHybrid = 3 };
+
+/// Whether a decoder skips unknown ordinary keys or rejects them. Critical keys prefixed with `!`
+/// are rejected by all families because they signal a required extension.
 enum class KeyStrictness : uint8_t { Tolerant = 1, Strict = 2 };
+
+/// Deterministic storage policy. `Always` uses whole-object zstd and a `.zst` key suffix; `Never`
+/// remains raw; `PinnedRaw` is raw because byte adoption compares the serialized bytes.
 enum class CompressionPolicy : uint8_t { Never = 1, Always = 2, PinnedRaw = 3 };
 
+/// Codec metadata for one registered text object. The byte caps apply to decompressed object content
+/// and individual text lines; `object_cap == 0` means a streamed format has no whole-object cap.
 struct FormatTraits
 {
     FormatId id;
@@ -125,12 +123,15 @@ struct FormatTraits
     uint64_t line_cap;          /// max bytes of one text line
 };
 
-/// Traits for `id`. LOGICAL_ERROR for `FormatId::Roster` (reserved, unbuilt — has no traits row).
+/// Returns the traits for `id`. Throws `LOGICAL_ERROR` for `FormatId::Roster`, which is reserved and
+/// has no codec or traits row yet.
 const FormatTraits & traitsFor(FormatId id);
-/// Traits for a header-line `type` string, or nullptr when `type` is not a registered format.
+/// Looks up a header-line `type` string. Returns nullptr for an unregistered type; it does not throw
+/// because callers use this result to classify the input before decoding it.
 const FormatTraits * traitsForType(std::string_view type);
-/// The key-suffix a stored object of `id` is written under: ".zst" when its compression policy is
-/// `Always`, "" otherwise. Callers building a key never inspect the body to decide the suffix.
+/// Returns the storage-key suffix for `id`: `.zst` for `Always`, and an empty suffix otherwise.
+/// Key builders use this policy directly so a point lookup never has to inspect the object body or
+/// try multiple keys.
 std::string_view storedSuffix(FormatId id);
 
 }

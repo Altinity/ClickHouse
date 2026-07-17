@@ -251,10 +251,10 @@ String blobHashHexOneShot(BlobHashAlgo algo, std::string_view bytes)
     {
         case BlobHashAlgo::CityHash128:
         {
-            /// The POOL-WIDE content-hash convention (mirrors `poolContentHash` in `CasPartWriteTxn.cpp`):
-            /// the streaming `HashingReadBuffer` hash (chunked `CityHash128WithSeed`, chained per
-            /// `DBMS_DEFAULT_HASHING_BLOCK_SIZE`), NOT a one-shot `CityHash128WithSeed` call (which
-            /// diverges for any payload larger than one hash block).
+            /// Preserve the blob content-hash convention used by `poolContentHash`: hash through
+            /// `HashingReadBuffer` in `DBMS_DEFAULT_HASHING_BLOCK_SIZE` chunks, chaining
+            /// `CityHash128WithSeed`. A one-shot `CityHash128WithSeed` call would produce a different
+            /// result for payloads larger than one hash block.
             ReadBufferFromMemory in(bytes.data(), bytes.size());
             HashingReadBuffer hashing(in);
             hashing.ignoreAll();

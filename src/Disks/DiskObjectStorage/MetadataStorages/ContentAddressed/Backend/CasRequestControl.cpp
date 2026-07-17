@@ -92,7 +92,7 @@ CasWriteOutcome classifyConditionalWriteResult(const std::exception & e)
 #endif
     /// Poco::Net::NetException (connection loss) / Poco::TimeoutException (client-side timeout) and
     /// every other error type: the request's fate is unproven — fail toward "resolve before
-    /// reissuing" (RFC cas-s3-timeout-retry-control §resolve-before-reissuing), never toward a false
+    /// reissuing, never toward a false
     /// DefiniteFailure.
     return CasWriteOutcome::Unresolved;
 }
@@ -133,14 +133,14 @@ uint64_t steadyClockNowMs()
 }
 
 /// The default inter-attempt backoff sleep. NOT a race-fix sleep: it is deliberate, bounded,
-/// fence-gated pacing of reissues toward a recovering object store (RFC cas-s3-timeout-retry-control
-/// §Configuration), and it is injectable so tests never wait on it.
+/// fence-gated pacing of reissues toward a recovering object store, and it is injectable so tests
+/// never wait on it.
 void threadSleepMs(uint64_t ms)
 {
     std::this_thread::sleep_for(std::chrono::milliseconds(ms));
 }
 
-/// Deterministic CALLER/local bugs the create retry loop must surface INSTANTLY (availfix review M1):
+/// Deterministic caller/local bugs the create retry loop must surface immediately:
 /// reissuing only replays the same failure — up to ~12 minutes of budget × putBlob's outer loop at
 /// the defaults — and buries the root cause behind a retryable ABORTED. The set:
 ///   LOGICAL_ERROR   — a local invariant violation (e.g. uploadFromSource's source-size check; pinned
@@ -176,8 +176,8 @@ void validateCasRequestBudget(const CasRequestBudget & budget, uint64_t mount_le
           && budget.lease_safety_margin_ms < mount_lease_ttl_ms - budget.attempt_timeout_ms))
         throw Exception(ErrorCodes::BAD_ARGUMENTS,
             "CAS request budget rejected: attempt_timeout_ms ({}) + lease_safety_margin_ms ({}) must be "
-            "strictly less than the mount lease TTL ({} ms) — RFC cas-s3-timeout-retry-control "
-            "§required-timeout-model. A writable mount refuses to open with this budget.",
+            "strictly less than the mount lease TTL ({} ms). A writable mount refuses to open with "
+            "this budget.",
             budget.attempt_timeout_ms, budget.lease_safety_margin_ms, mount_lease_ttl_ms);
     if (!(budget.attempt_timeout_ms <= budget.operation_deadline_ms))
         throw Exception(ErrorCodes::BAD_ARGUMENTS,
@@ -205,8 +205,8 @@ namespace
 /// Shared by both public entry points below so the log line and the exception's message text can
 /// never drift apart. Rate-limited (not per-distinct-`why` -- `LogSeriesLimiter` keys on the LOGGER
 /// NAME only, so under a sustained outage where `why` keeps changing slightly, only the first message
-/// in each window prints; this is the intended throttle, not a bug). Raised from the old implicit
-/// Information-level visibility (fix #37 phase 3) to Warning: this condition is expected to self-heal
+/// in each window prints; this is the intended throttle, not a bug). Warning-level visibility is
+/// intentional: this condition is expected to self-heal
 /// (the caller retries), but an operator watching CAS logs directly should see it without having to
 /// know to look at system.replication_queue.
 void logCasWriteRetryLater(const String & why)
@@ -259,7 +259,7 @@ uint64_t CasRequestController::backoffBeforeAttempt(uint32_t next_attempt) const
 
 bool CasRequestController::pauseBeforeReissue(uint32_t completed_attempt, uint64_t deadline_ms, const std::function<bool()> & fence_ok)
 {
-    /// Fence BEFORE the sleep (RFC §ack-and-cache-rules step 1 applied to the whole loop, not just the
+    /// Fence BEFORE the sleep (the pre-attempt fence rule applies to the whole loop, not just the
     /// attempt): a fence lost mid-backoff aborts the operation instantly — sleeping first would keep a
     /// fenced writer alive for up to a full backoff cap after it lost its right to write.
     if (!fence_ok())
@@ -287,7 +287,7 @@ CasWriteOutcome CasRequestController::resolveByExactGet(std::string_view key, st
     catch (const std::exception &)
     {
         /// The GET itself failed (network, auth, ...): the object's identity cannot be proven either
-        /// way — RFC §resolve-before-reissuing leaves this Unresolved, exactly like an absent read.
+        /// way — an unresolved read leaves this Unresolved, exactly like an absent read.
         return CasWriteOutcome::Unresolved;
     }
 
@@ -305,8 +305,7 @@ CasWriteOutcome CasRequestController::resolveByExactGet(std::string_view key, st
     /// ambiguity. Fail closed rather than silently treating it as Unresolved/DefiniteFailure.
     throw Exception(ErrorCodes::CORRUPTED_DATA,
         "CasRequestController: exact-key resolution at '{}' observed a DIFFERENT object than the one "
-        "this attempt intended to create — a real conflict (RFC cas-s3-timeout-retry-control "
-        "§resolve-before-reissuing), not a retryable ambiguity", key_s);
+        "this attempt intended to create — a real conflict, not a retryable ambiguity", key_s);
 }
 
 CasWriteOutcome CasRequestController::putIfAbsentControlled(
@@ -318,7 +317,7 @@ CasWriteOutcome CasRequestController::putIfAbsentControlled(
 
     for (uint32_t attempt = 1; attempt <= budget.max_attempts; ++attempt)
     {
-        /// Gate BEFORE every attempt (RFC §ack-and-cache-rules step 1 / §required-timeout-model): the
+        /// Gate BEFORE every attempt: the
         /// local mount fence must still hold, and there must be enough of the operation's own deadline
         /// left for one more attempt to plausibly complete. Neither check sends anything to the backend.
         if (!fence_ok())
@@ -350,7 +349,7 @@ CasWriteOutcome CasRequestController::putIfAbsentControlled(
 
         if (attempt_outcome == CasWriteOutcome::Unresolved)
         {
-            /// Resolve-before-reissue (RFC §resolve-before-reissuing). May throw CORRUPTED_DATA (a real
+            /// Resolve-before-reissue. May throw CORRUPTED_DATA (a real
             /// conflict) straight out of this call — that is never a retry signal.
             attempt_outcome = resolveByExactGet(key_s, bytes_s, &committed_token);
             if (attempt_outcome == CasWriteOutcome::Unresolved)
@@ -365,10 +364,9 @@ CasWriteOutcome CasRequestController::putIfAbsentControlled(
         }
 
         /// attempt_outcome == Committed here (either the attempt's own 2xx, or resolution found
-        /// identical bytes). Final fence check before reporting success (RFC §ack-and-cache-rules step
-        /// 4): a fence lost here means the write may have landed but this call must never claim it did.
-        /// Count this "response observed after the local fence" leg (spec §Late Predecessor PUT's
-        /// best-effort diagnostic) separately from the generic Unresolved classifier so a cross-epoch
+        /// identical bytes). Final fence check before reporting success: a fence lost here means the
+        /// write may have landed but this call must never claim it did. Count this "response observed
+        /// after the local fence" leg separately from the generic Unresolved classifier so a cross-epoch
         /// fence loss is visible rather than folded into ordinary retry-budget exhaustion.
         if (!fence_ok())
         {
@@ -391,7 +389,7 @@ CasCreateResult CasRequestController::conditionalCreateControlled(
 
     for (uint32_t attempt_no = 1; attempt_no <= budget.max_attempts; ++attempt_no)
     {
-        /// Same pre-attempt gates as putIfAbsentControlled (RFC §required-timeout-model).
+        /// Same pre-attempt gates as putIfAbsentControlled.
         if (!fence_ok())
             return {CasCreateOutcome::Unresolved, {}};
         if (now_ms() + budget.attempt_timeout_ms > deadline_ms)
@@ -407,8 +405,8 @@ CasCreateResult CasRequestController::conditionalCreateControlled(
             /// A deterministic LOCAL bug surfaced by the attempt itself — a caller/config error, never
             /// a wire ambiguity; reissuing would only replay it. Propagate unchanged: instant, loud,
             /// exactly the pre-controller behavior (see isDeterministicLocalFailure for the set and the
-            /// per-code rationale; `CasPartWriteTxn.PutBlobWrongSizeFailsClosed` pinned the LOGICAL_ERROR
-            /// member). This deliberately DIFFERS from `putIfAbsentControlled`'s everything-Unresolved:
+            /// per-code rationale). This deliberately differs from `putIfAbsentControlled`'s
+            /// everything-Unresolved:
             /// that lane's byte-exact resolve makes retrying any unproven error harmless, while
             /// retrying a broken source/mode/encode here is pure noise. Fail-safe either way — a
             /// propagated exception is never a false Committed.
@@ -417,7 +415,7 @@ CasCreateResult CasRequestController::conditionalCreateControlled(
             /// A whitelisted synchronous rejection PROVES the request was never applied: surface the
             /// original exception — the blob lane's callers always saw the raw storage error's root
             /// cause, and losing it behind an outcome enum here would only degrade diagnostics
-            /// (cf. stagefix-review M2). Anything else is ambiguous: fall through to the occupancy
+            /// Anything else is ambiguous: fall through to the occupancy
             /// resolve below.
             if (classifyConditionalWriteResult(e) == CasWriteOutcome::DefiniteFailure)
                 throw;
@@ -428,7 +426,7 @@ CasCreateResult CasRequestController::conditionalCreateControlled(
             if (put->outcome == PutOutcome::PreconditionFailed)
                 return {CasCreateOutcome::Occupied, {}};
 
-            /// Done. Final fence check before reporting success (RFC §ack-and-cache-rules): a fence
+            /// Done. Final fence check before reporting success: a fence
             /// lost here means the write may have landed but this call must never claim it did.
             if (!fence_ok())
             {

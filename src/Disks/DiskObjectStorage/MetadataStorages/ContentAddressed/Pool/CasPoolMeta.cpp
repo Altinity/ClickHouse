@@ -33,9 +33,8 @@ UInt128 mintPoolId()
 namespace
 {
 
-/// Whether `config_algo` is already a registered member of `pool.algos_used` (steady-state check --
-/// spec §5: "membership, not the flag, is the steady-state check"). `algos_used` is kept sorted, so
-/// this is a binary search.
+/// Whether `config_algo` is already a registered member of `pool.algos_used`. Membership, not the
+/// opt-in flag, is the steady-state check. `algos_used` is kept sorted, so this is a binary search.
 bool isAlgoAdmittedIn(const PoolMeta & pool, BlobHashAlgo config_algo)
 {
     const auto v = static_cast<uint8_t>(config_algo);
@@ -55,9 +54,9 @@ String joinAlgoNames(const std::vector<uint8_t> & algos_used)
     return out;
 }
 
-/// Fail-closed on a non-admitted algo without the opt-in flag (spec §5: admission is EXPLICIT
+/// Fail-closed on a non-admitted algo without the opt-in flag: admission is EXPLICIT
 /// opt-in; the default stays fail-closed -- a changed config alone must never silently turn a pool
-/// mixed). Never touches the pool.
+/// mixed. Never touches the pool.
 [[noreturn]] void throwNotAdmitted(const PoolMeta & pool, BlobHashAlgo config_algo)
 {
     throw Exception(ErrorCodes::BAD_ARGUMENTS,
@@ -66,14 +65,14 @@ String joinAlgoNames(const std::vector<uint8_t> & algos_used)
         joinAlgoNames(pool.algos_used), blobHashAlgoName(config_algo));
 }
 
-/// The relaxed admission check (spec §5, RELAXES the Phase 1/2 `checkBlobHashAlgoMatches` fail-close):
+/// The relaxed admission check (replaces an earlier fail-close that required the single pool algo to match):
 /// `pm`/`token` are the most-recently-read `_pool_meta` state (present, decoded, valid). Already a
 /// member of `algos_used` => OK, no write (steady state). Not a member and `!allow_new` =>
 /// `BAD_ARGUMENTS` (the pool is never touched). Not a member and `allow_new` => CAS-union `config_algo`
 /// into `algos_used` (recomputed from the FRESH value on every retry -- union-only, so there is no
 /// ABA) and raises `min_reader_generation` to THIS build's own floor (`G_BUILD`, `CasFormat.h`) in
-/// the SAME write (spec §5: "first registration of a schema-3-bearing algo also raises
-/// `min_reader_generation`" -- a build that cannot decode schema-3 settlement state has an OLDER
+/// the SAME write (first registration of a schema-3-bearing algo also raises
+/// `min_reader_generation` -- a build that cannot decode schema-3 settlement state has an OLDER
 /// `G_BUILD` and is correctly refused by the startup gate once a future generation bump lands here).
 /// On a CAS conflict, re-read and retry the whole decision (a concurrent admitter may have unioned a
 /// DIFFERENT algo, or the very one we wanted, in the meantime).
@@ -121,7 +120,7 @@ PoolMeta PoolMeta::createOrValidate(
     const String key = layout.poolMetaKey();
 
     /// Present => the pool is authoritative; ignore the passed config's blob_header_len and run the
-    /// flag-gated admission check (spec §5) rather than the old single-value fail-close.
+    /// flag-gated admission check rather than the old single-value fail-close.
     if (auto existing = backend.get(key))
     {
         PoolMeta pm = decodePoolMeta(existing->bytes);
@@ -142,7 +141,7 @@ PoolMeta PoolMeta::createOrValidate(
         return pm;
 
     /// Lost the race: the winner's object MUST be present now. The loser UNIONS its algo via the SAME
-    /// flag-gated admission path as a reopen (spec §5), instead of the old unconditional fail-close.
+    /// flag-gated admission path as a reopen, instead of the old unconditional fail-close.
     auto winner = backend.get(key);
     if (!winner)
         throw Exception(ErrorCodes::LOGICAL_ERROR,

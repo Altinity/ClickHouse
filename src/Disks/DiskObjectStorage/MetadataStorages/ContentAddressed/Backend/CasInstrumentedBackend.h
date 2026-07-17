@@ -5,20 +5,21 @@
 namespace DB::Cas
 {
 
-/// B168 P0: per-namespace S3 op instrumentation.
+/// Per-namespace and per-operation instrumentation for the content-addressed storage seam.
 ///
-/// Every CA S3 op flows through the abstract `Backend` seam. `InstrumentedBackend` is a transparent
-/// decorator that wraps an inner `BackendPtr`, delegates every method faithfully, and increments a
-/// ProfileEvent keyed by the key's NAMESPACE × the OPERATION+OUTCOME. Wrapping the pool backend once
-/// in `Pool::open` makes writer AND GC ops attributable, for both the S3 and in-memory backends.
-///
-/// Motivation: `part_log` shows `put=0` because PUTs ride a background threadpool, so we need a
-/// backend-level chokepoint to attribute the S3 op-count (PUTs/HEADs/404s/412s/LISTs) by CA op type.
+/// Every content-addressed storage operation flows through the abstract `Backend` seam.
+/// `InstrumentedBackend` is a transparent decorator: it owns an inner `BackendPtr`, delegates every
+/// operation, and increments a `ProfileEvent` keyed by the key's namespace and the operation's
+/// outcome. The pool wraps its backend once in `Pool::open`, which includes operations issued by
+/// background writers and GC as well as foreground calls, for both object-storage and in-memory
+/// backends. This backend-level chokepoint is needed because background PUTs are not attributable
+/// through the foreground request that scheduled them.
 
 /// Namespace of a CA key, classified by substring of the key path (6 classes; `Server` is currently
 /// unreachable through this classifier — the per-server control subtree lives under
 /// `/gc/server-roots/<server_root_id>/...` and classifies as Gc).
 ///   <prefix>/blobs/..        → Blob
+///   <prefix>/cas/refs/..      → Root  (immutable ref logs, snapshots, and cleanup markers)
 ///   <prefix>/cas/manifests/.. → Manifest
 ///   <prefix>/roots/..        → Root  (incl. /roots/<ns>/_files/ and mountpoint objects)
 ///   <prefix>/gc/..           → Gc
@@ -34,7 +35,7 @@ enum class CasNs : uint8_t
 };
 static constexpr size_t CAS_NS_COUNT = 6;
 
-/// Operation + outcome class (10 classes), mapped from the Backend method and its return value.
+/// Operation + outcome class (11 classes), mapped from the `Backend` method and its return value.
 ///   putIfAbsent / putIfAbsentStream finalize → Done ⇒ Put ; PreconditionFailed ⇒ PutDedup
 ///   putOverwrite                              → Done ⇒ Overwrite ; PreconditionFailed ⇒ CasConflict
 ///   casPut                                    → Committed ⇒ Cas ; Conflict ⇒ CasConflict
@@ -59,20 +60,31 @@ enum class CasOp : uint8_t
 };
 static constexpr size_t CAS_OP_COUNT = 11;
 
-/// Classify a key into its namespace by substring. See CasNs.
+/// Classify a key into its namespace by substring. The order is significant where a more specific
+/// layout such as `cas/refs/` must be recognized before a generic fallback; unknown key families
+/// are intentionally counted as `Other`.
 CasNs classifyCasNs(const String & key);
 
-/// Increment the ProfileEvent for (ns, op). The table lives in the .cpp.
+/// Increment the `ProfileEvent` corresponding to `(ns, op)`. The row-major table is defined in the
+/// implementation and must remain aligned with the `CasNs` and `CasOp` enum values.
 void incrementCasEvent(CasNs ns, CasOp op);
 
+/// Transparent `Backend` decorator that records operation counts without changing the wrapped
+/// backend's results, exceptions, or state transitions. The inner backend is owned by this object.
+/// For streaming creates, namespace classification happens when the sink is created and the
+/// `Put`/`PutDedup` event is emitted only when `finalize` returns, because the outcome is unavailable
+/// earlier.
 class InstrumentedBackend final : public Backend
 {
 public:
     explicit InstrumentedBackend(BackendPtr inner_) : inner(std::move(inner_)) {}
 
+    /// Capability checks are deliberately uninstrumented: they do not represent storage operations.
     void checkPoolPreconditions() override { inner->checkPoolPreconditions(); }
     void checkConditionalWriteSingleAttemptSupport() override { inner->checkConditionalWriteSingleAttemptSupport(); }
 
+    /// Delegate the read and count it after the inner call succeeds or returns absent. Exceptions
+    /// propagate unchanged and therefore do not produce a separate outcome event.
     std::optional<GetResult> get(const String & key, Range range = {}) override
     {
         auto result = inner->get(key, range);
@@ -80,6 +92,7 @@ public:
         return result;
     }
 
+    /// Delegate a forward-only read stream and count the request after the stream is acquired.
     std::optional<GetStreamResult> getStream(const String & key, Range range = {}) override
     {
         auto result = inner->getStream(key, range);
@@ -87,6 +100,7 @@ public:
         return result;
     }
 
+    /// Count `Head` or `HeadMiss` from the returned presence flag after delegating to the backend.
     HeadResult head(const String & key) override
     {
         HeadResult result = inner->head(key);
@@ -94,6 +108,7 @@ public:
         return result;
     }
 
+    /// Count a successful create as `Put` and an existing-key precondition result as `PutDedup`.
     PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta = {}) override
     {
         PutResult result = inner->putIfAbsent(key, bytes, meta);
@@ -101,8 +116,11 @@ public:
         return result;
     }
 
+    /// Return a sink that records the create outcome when its `finalize` is called.
     WriteSinkPtr putIfAbsentStream(const String & key, const ObjectMeta & meta = {}) override;
 
+    /// Count a successful token-conditional overwrite as `Overwrite`; a precondition conflict is
+    /// counted as `CasConflict`.
     PutResult putOverwrite(const String & key, const String & bytes, const Token & expected,
                            const ObjectMeta & meta = {}) override
     {
@@ -111,6 +129,7 @@ public:
         return result;
     }
 
+    /// Count a committed compare-and-swap as `Cas`; conflicts are counted as `CasConflict`.
     CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected,
                      const ObjectMeta & meta = {}) override
     {
@@ -119,6 +138,7 @@ public:
         return result;
     }
 
+    /// Delegate token-exact deletion and count every returned deletion outcome as `Delete`.
     DeleteOutcome deleteExact(const String & key, const Token & token) override
     {
         DeleteOutcome outcome = inner->deleteExact(key, token);
@@ -126,6 +146,7 @@ public:
         return outcome;
     }
 
+    /// Delegate one paginated listing and classify the prefix used for the request.
     ListPage list(const String & prefix, const String & cursor, size_t limit) override
     {
         ListPage page = inner->list(prefix, cursor, limit);
@@ -133,8 +154,11 @@ public:
         return page;
     }
 
+    /// This capability is a property of the wrapped backend, not an operation to count.
     bool supportsListTokens() const override { return inner->supportsListTokens(); }
 
+    /// Count a successful staged promotion as a create of the destination blob; an existing
+    /// destination is the same deduplication outcome as `putIfAbsent`.
     PutResult promoteStaged(const String & staging_key, const String & blob_key) override
     {
         PutResult result = inner->promoteStaged(staging_key, blob_key);
@@ -143,6 +167,8 @@ public:
         return result;
     }
 
+    /// Count a staged resurrection as an unconditional overwrite of the destination blob. The
+    /// wrapped backend remains responsible for its fresh-header and condemned-token guarantees.
     Token resurrectStaged(const String & staging_key, const String & blob_key,
                           const String & fresh_header, uint64_t staging_payload_offset) override
     {

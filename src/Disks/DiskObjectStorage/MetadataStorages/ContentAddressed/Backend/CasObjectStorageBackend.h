@@ -13,10 +13,11 @@
 namespace DB::Cas
 {
 
-/// §1 (Round-B): the fold/point GETs read tiny bodies (~3.7 KB avg) but a default ReadBufferFromS3
-/// preallocates ~1 MiB. When the body size is already known (the Native `get` HEADs it first), shrink
-/// the read buffer to `size + slack`, capped at the caller's default — a pure reuse of
-/// `ReadSettings::adjustBufferSize`. `known_size == 0` means "unknown", leave the settings untouched.
+/// Fold and point GETs commonly read tiny bodies (about 3.7 KiB on the measured workload), while the
+/// default `ReadBufferFromS3` allocation is about 1 MiB. If the caller already knows the object size,
+/// use `ReadSettings::adjustBufferSize` to request a buffer of `known_size + slack`, without exceeding
+/// the caller's configured default. A zero `known_size` means that the size is unknown and preserves
+/// the supplied settings unchanged.
 constexpr uint64_t CAS_FOLD_READ_SLACK_BYTES = 4096;
 ReadSettings casSizedReadSettings(const ReadSettings & base, uint64_t known_size);
 
@@ -29,15 +30,18 @@ namespace detail
 /// `ObjectStorageBackend`. See the definition for the exact matching rules.
 PutOutcome finalizeConditionalWrite(WriteBuffer & buf);
 
-/// Retry strategy for the single-attempt conditional-write client (RFC cas-s3-timeout-retry-control
-/// §disable-transparent-conditional-write-retries): `ShouldRetry` always refuses, and every
-/// consultation is counted (CasConditionalWriteSdkRetries — see CasRequestControl.h) since it proves
-/// the SDK believed the first attempt was inconclusive or failed. Exposed here for unit tests only —
-/// production callers get it wired into `ObjectStorageBackend`'s ctor automatically.
+/// Retry strategy for the client used by conditional writes. `ShouldRetry` always refuses a second
+/// HTTP attempt: an uncertain conditional write must be resolved by CAS code, where the mount fence,
+/// operation budget, and exact-key state are visible, rather than by the generic SDK. Each consultation
+/// is counted because it proves that the SDK considered the first attempt inconclusive or failed.
+/// Exposed here for unit tests; production callers receive it through `ObjectStorageBackend`'s
+/// constructor.
 class SingleAttemptRetryStrategy final : public Aws::Client::RetryStrategy
 {
 public:
+    /// Record that the SDK considered retrying, then refuse the retry.
     bool ShouldRetry(const Aws::Client::AWSError<Aws::Client::CoreErrors> &, long) const override;
+    /// Return no delay; `ShouldRetry` rejects the attempt immediately afterward.
     long CalculateDelayBeforeNextRetry(const Aws::Client::AWSError<Aws::Client::CoreErrors> &, long) const override;
     long GetMaxAttempts() const override { return 1; }
 };
@@ -60,34 +64,52 @@ class ObjectStorageBackend final : public Backend
 public:
     enum class Mode { Native, EmulatedSingleProcess };
 
-    /// conditional_single_put_cap_: the GCS single-PUT budget for conditional writes on a
-    /// generation-token store (see conditionalWriteSettings) — irrelevant on ETag-dialect stores.
-    /// Defaulted so existing call sites (AWS/ETag stores, tests) compile unchanged.
+    /// Construct a backend over `object_storage`. Native mode uses the storage's conditional
+    /// operations and native token dialect; `EmulatedSingleProcess` serializes operations locally for
+    /// tests and local development. The generation-token store limit applies only to Native mode:
+    /// generation stores must use a single PUT because their multipart completion path does not enforce
+    /// the precondition.
     ObjectStorageBackend(ObjectStoragePtr object_storage_, Mode mode_, uint64_t conditional_single_put_cap_ = 1ULL << 30);
 
+    /// Read an object or return `nullopt` if it is absent. Native mode HEADs first so the returned
+    /// token identifies the incarnation whose bytes are read; a not-found race is also reported as
+    /// `nullopt`, while unrelated storage errors propagate.
     std::optional<GetResult> get(const String & key, Range range) override;
+    /// Open a forward-only ranged stream for a write-once object. The stream is not materialized in
+    /// memory; mutable objects must use `get` because their contents may change while it is open.
     std::optional<GetStreamResult> getStream(const String & key, Range range = {}) override;
+    /// Return the current size, attributes, and incarnation token, or an absent `HeadResult`.
     HeadResult head(const String & key) override;
     /// S3 ETags are content-derived and surfaced in list responses — TRUE for ETag-token Native
     /// and EmulatedSingleProcess modes. FALSE on a generation-token store (GCS): the XML LIST
     /// surfaces MD5-style ETags in the response BODY, which the conditional dialect's header-level
-    /// rewrite cannot map to generations — a list-derived "token" is a poisoned `If-Match` (the
-    /// first live GC round on GCS died exactly there, fail-closed by the dialect's format guard).
+    /// rewrite cannot map to generations. A list-derived token would therefore be an invalid
+    /// `If-Match` token; generation stores deliberately omit it and make GC re-read each shard.
     /// Consumers already treat absent list tokens as Read/fail-closed (GC discover re-reads every
     /// shard — a cost, not a correctness change).
     bool supportsListTokens() const override { return native_token_type != TokenType::Generation; }
+    /// Create `key` only if it is absent. On a precondition failure the object is untouched and the
+    /// result has no token; on success the token identifies the newly written incarnation.
     PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta = {}) override;
 
     /// Native mode: true streaming — bytes flow straight into the object storage's write buffer with
     /// `If-None-Match: *` riding on the request. EmulatedSingleProcess mode: memory-buffered delegation
     /// to putIfAbsent (acceptable: this mode exists for unit tests only).
     WriteSinkPtr putIfAbsentStream(const String & key, const ObjectMeta & meta = {}) override;
+    /// Replace `key` only when its current token exactly equals `expected`; a mismatch leaves the
+    /// existing incarnation untouched. Storage exceptions propagate instead of being reported as a
+    /// successful or failed precondition.
     PutResult putOverwrite(const String & key, const String & bytes, const Token & expected, const ObjectMeta & meta = {}) override;
+    /// Perform a compare-and-set: `expected == nullopt` means create-if-absent. A conflict leaves the
+    /// object untouched; a committed result carries the new incarnation token.
     CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected, const ObjectMeta & meta = {}) override;
+    /// Remove only the incarnation matching `token`, preserving the object on a mismatch and exposing
+    /// whether the storage created a delete marker.
     DeleteOutcome deleteExact(const String & key, const Token & token) override;
+    /// Return a page after `cursor`; the next cursor is the last returned key and is empty at the end.
     ListPage list(const String & prefix, const String & cursor, size_t limit) override;
 
-    /// S3-native staging promote seams (spec 2026-07-11-cas-s3-native-staging §8). Native mode only —
+    /// S3-native staging promote seams. Native mode only —
     /// EmulatedSingleProcess (LocalObjectStorage) has no server-side conditional copy and is never
     /// selected for S3 staging, so both throw `NOT_IMPLEMENTED` there (fail closed).
     /// `promoteStaged`: WRITE-ONCE conditional copy via `IObjectStorage::copyObjectConditional`.
@@ -98,13 +120,15 @@ public:
     Token resurrectStaged(const String & staging_key, const String & blob_key,
                           const String & fresh_header, uint64_t staging_payload_offset) override;
 
-    /// Pool-level precondition: on a Native, generation-dialect (GCS) backend, fail closed if the
+    /// Pool-level precondition: on a Native, generation-dialect (GCS) backend, reject the pool if the
     /// bucket has object versioning enabled — see Backend::checkPoolPreconditions.
     void checkPoolPreconditions() override;
 
-    /// Fail-closed precondition (RFC cas-s3-timeout-retry-control): throws LOGICAL_ERROR when Native
-    /// mode has no single-attempt client (single_attempt_s3_client, built in the ctor) — see
-    /// Backend::checkConditionalWriteSingleAttemptSupport. No-op for EmulatedSingleProcess.
+    /// Fail-closed precondition for writable Native mode: require the request-scoped client that
+    /// disables transparent conditional-write retries. Without it, an SDK retry could cross the
+    /// mount lease boundary or turn an uncertain result into a misleading precondition failure.
+    /// The constructor may leave the client absent for test construction over non-S3 storage; this
+    /// check is the mount-time gate. No-op for `EmulatedSingleProcess`.
     void checkConditionalWriteSingleAttemptSupport() override;
 
     /// The token kind this backend's object storage mints: TokenType::ETag for AWS-compatible
@@ -138,8 +162,9 @@ public:
         return observed == expected;
     }
 
-    /// Base WriteSettings for every Native conditional write — see the .cpp for the full rationale
-    /// (skips the post-upload existence/size HEAD; forces single-PUT on generation-token stores).
+    /// Build settings shared by every Native conditional write. They skip the racy post-upload
+    /// existence/size check, force single-part uploads for generation-token stores, and select the
+    /// request-scoped single-attempt S3 client when available.
     WriteSettings conditionalWriteSettings() const;
     WriteSettings conditionalWriteSettingsForTest() const { return conditionalWriteSettings(); }
 
@@ -151,15 +176,12 @@ private:
     const uint64_t conditional_single_put_cap;
 
 #if USE_AWS_S3
-    /// Single-attempt S3 client for conditional writes (RFC cas-s3-timeout-retry-control
-    /// §disable-transparent-conditional-write-retries): a cheap clone of the underlying object
-    /// storage's shared client (same connection pool/credentials, see Client::cloneWithConfigurationOverride)
-    /// with SDK retries disabled, so a lost response surfaces to CAS immediately instead of the
-    /// generic ~500-attempt retry policy silently continuing past the mount lease. Built once in the
-    /// ctor for Native mode; null when the object storage is not S3-backed (EmulatedSingleProcess /
-    /// local tests) — conditionalWriteSettings then leaves the disk's own client in place, so Native
-    /// mode over a non-S3 backend keeps compiling but is NOT single-attempt (not expected in practice:
-    /// Native mode is only ever mounted over an S3-like conditional dialect).
+    /// Single-attempt S3 client for conditional writes: a cheap clone of the underlying shared client
+    /// with the same connection pool and credentials, but with SDK retries disabled. This ensures a
+    /// lost response reaches CAS as an uncertain result instead of being hidden by the generic retry
+    /// policy after the mount lease may have expired. Built once for Native mode; absent for non-S3
+    /// storage used by local tests. `conditionalWriteSettings` leaves the disk's client in place in
+    /// that case, while the mount-time capability check rejects writable Native mode.
     std::shared_ptr<const S3::Client> single_attempt_s3_client;
 #endif
 
@@ -168,8 +190,10 @@ private:
     std::map<String, uint64_t> emu_tokens;
     uint64_t emu_seq = 0;
 
-    /// ---- Native helpers ----
+    /// Look up Native metadata and convert the storage ETag or generation to this backend's token.
     std::optional<HeadResult> nativeHead(const String & key);
+    /// Write a body with the condition already encoded in `ws`, finalize it, classify a lost
+    /// precondition, and return the new token when the write succeeds.
     PutResult nativeConditionalPut(const String & key, const String & bytes, const WriteSettings & ws, const ObjectMeta & meta);
 
     /// ---- Emulated helpers (caller holds emu_mutex) ----
@@ -180,10 +204,13 @@ private:
     const String emu_root;             /// object_storage->getCommonKeyPrefix() captured at construction
     String emuPath(const String & key) const;   /// logical key -> physical object-storage path
 
+    /// The caller holds `emu_mutex` for all four helpers below, preserving the exists/read and
+    /// observe/write checks as one process-local operation.
     bool emuExists(const String & key) const;
     String emuRead(const String & key, Range range) const;
     void emuWrite(const String & key, const String & bytes, const ObjectMeta & meta);
-    Token emuObserveToken(const String & key);   /// seeds emu_tokens lazily for pre-existing keys
+    /// Return the current emulated token, lazily assigning one to a pre-existing object.
+    Token emuObserveToken(const String & key);
 };
 
 }

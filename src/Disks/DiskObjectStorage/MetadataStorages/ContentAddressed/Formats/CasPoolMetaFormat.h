@@ -13,32 +13,54 @@ namespace DB::Cas
 class Backend;
 class Layout;
 
-/// `_pool_meta` — pool identity + the pool-wide constants every build/read agrees on (spec §4).
-/// v3 text form: header line + one JSON body object
+/// `_pool_meta` — the pool identity and the pool-wide constants that every reader and writer must
+/// agree on. The v3 text representation is a header line followed by one JSON body object:
 /// {"pid":"<32hex>","hln":<blob_header_len>,"mrg":<min_reader_generation>,"alg":"<algo-words>"}.
-/// The POOL is authoritative on reopen: constants come FROM this object; `createOrValidate`'s config
-/// args apply only at first creation. `pool_id` doubles as the envelope domain_id — stable for life.
+///
+/// The persisted object is authoritative after creation. On reopen, `createOrValidate` uses its
+/// `blob_header_len` and reader-generation floor rather than replacing them with local configuration;
+/// the configuration's hash algorithm may only be admitted through the explicit opt-in path. The
+/// `pool_id` is also the envelope `domain_id`, so it remains stable for the entire pool lifetime.
 struct PoolMeta
 {
     UInt128 pool_id{};
     uint64_t blob_header_len = 0;
     uint64_t min_reader_generation = 0;
-    /// Every hash algo ever admitted, as static_cast<uint8_t>(BlobHashAlgo), sorted + append-only.
+    /// Every hash algorithm ever admitted, encoded as `static_cast<uint8_t>(BlobHashAlgo)`, in strictly
+    /// increasing order. Admission only appends a new algorithm to this durable set.
     std::vector<uint8_t> algos_used;
 
+    /// Creates the pool metadata if `_pool_meta` is absent, or validates and possibly admits the
+    /// configured hash algorithm if it already exists. Initial creation validates the supplied header
+    /// size and records this build's reader-generation floor. Reopen ignores the supplied header size,
+    /// because changing it would move the blob payload offset for existing objects; a new hash algorithm
+    /// is rejected unless `allow_new` is set, and concurrent admission is retried from fresh metadata.
     static PoolMeta createOrValidate(
         Backend &, const Layout &, uint64_t blob_header_len,
         BlobHashAlgo blob_hash_algo = BlobHashAlgo::CityHash128, bool allow_new = false);
 };
 
+/// Serializes valid pool metadata as the versioned `_pool_meta` text object. The output includes the
+/// format header, one JSON body line, and its terminating newline; it is suitable for a conditional
+/// backend write and preserves the sorted algorithm set as comma-separated vocabulary words.
 String encodePoolMeta(const PoolMeta &);
+
+/// Parses and validates a persisted `_pool_meta` object. Unknown JSON keys are tolerated for additive
+/// evolution, while missing required data, malformed values, invariant violations, an unsupported
+/// ref-state generation, or a pool requiring a newer reader produce an exception with the appropriate
+/// corruption or compatibility error code.
 PoolMeta decodePoolMeta(std::string_view);
 
-/// Pure invariant checks over the pool constants, shared by decodePoolMeta (a persisted violation is
-/// corruption => pass CORRUPTED_DATA) and PoolMeta::createOrValidate (a bad caller config => pass
-/// BAD_ARGUMENTS). `blob_header_len` must be 8-aligned and within [96, 16 KiB]; `algos_used` must be
-/// non-empty, strictly increasing, and every entry a real BlobHashAlgo.
+/// Checks the fixed blob-envelope size invariant. The length must be 8-byte aligned, at most 16 KiB,
+/// and at least 240 bytes: v3's mandatory envelope fields, framing, and newline consume 225 bytes at
+/// type maxima, while 240 leaves room for a diagnostic `ref`. The caller supplies the error code so
+/// persisted violations can be reported as `CORRUPTED_DATA` and bad creation arguments as
+/// `BAD_ARGUMENTS`.
 void validatePoolBlobHeaderLen(uint64_t blob_header_len, int error_code, std::string_view what);
+
+/// Checks that every admitted hash algorithm is known, that the set is non-empty, and that its numeric
+/// representation is strictly increasing with no duplicates. The caller supplies the error code to
+/// distinguish invalid persisted metadata from invalid creation or admission input.
 void validatePoolAlgosUsed(const std::vector<uint8_t> & algos_used, int error_code, std::string_view what);
 
 }

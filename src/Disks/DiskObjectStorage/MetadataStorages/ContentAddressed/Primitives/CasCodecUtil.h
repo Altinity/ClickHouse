@@ -1,6 +1,5 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <IO/ReadBuffer.h>
 #include <IO/ReadHelpers.h>
 #include <IO/WriteBuffer.h>
@@ -22,10 +21,10 @@ namespace ErrorCodes
 namespace DB::Cas
 {
 
-/// Binary codec helpers shared by the remaining custom-binary codecs (the refsnaplog log/snapshot
-/// objects and `CasPool`'s mutable-files payload). The control-plane objects moved to the v3 text
-/// codecs in `Core/Formats/` (codecs-v3 phase 2); these named wrappers survive for the length-prefixed
-/// binary bodies and exist so a 128-bit serialization can never be mis-paired with the wrong byte order.
+/// Shared low-level byte-encoding helpers for CAS. They cover fixed-width integers, length-prefixed
+/// byte strings, exact reads, and validation of identifiers embedded in persisted data. They remain
+/// independent of any particular object format so that a 128-bit serialization cannot accidentally
+/// be paired with the wrong byte order.
 
 /// ---------------------------------------------------------------------------------------------
 /// On-disk UInt128 wire forms. CAS serializes a 128-bit hash in two distinct non-hex byte orders,
@@ -34,12 +33,23 @@ namespace DB::Cas
 /// asks for the order it means by name instead of open-coding it. (The lowercase-hex form lives in
 /// `CasIds.h` as `u128ToHex` / `hexToU128` and is out of scope here.)
 ///
-/// LE binary form — used by the hashed/identity codecs (envelope header fields, the canonical tree
-/// payload, the gc snapshot body): exactly `writeBinaryLittleEndian` / `readBinaryLittleEndian`.
-inline void writeU128LE(WriteBuffer & out, const UInt128 & v) { writeBinaryLittleEndian(v, out); }
-inline UInt128 readU128LE(ReadBuffer & in) { UInt128 v; readBinaryLittleEndian(v, in); return v; }
+/// Writes `v` as the frozen 16-byte little-endian CAS representation.
+inline void writeU128LE(WriteBuffer & out, const UInt128 & v)
+{
+    writeBinaryLittleEndian(v, out);
+}
 
-/// BE 16-byte form — used by protobuf `bytes` fields to encode UInt128 values in big-endian order.
+/// Reads one frozen 16-byte little-endian CAS value from `in`.
+inline UInt128 readU128LE(ReadBuffer & in)
+{
+    UInt128 v;
+    readBinaryLittleEndian(v, in);
+    return v;
+}
+
+/// BE 16-byte form — used by raw CAS byte fields and key components to encode `UInt128` in
+/// big-endian order.
+/// Converts `v` to the frozen 16-byte big-endian representation used in raw byte fields and keys.
 inline std::string u128ToBytesBE(const UInt128 & v)
 {
     std::string out(16, '\0');
@@ -48,6 +58,8 @@ inline std::string u128ToBytesBE(const UInt128 & v)
     return out;
 }
 
+/// Parses a frozen 16-byte big-endian value. `what` identifies the containing field in corruption
+/// diagnostics; any other length is malformed persisted data and raises `CORRUPTED_DATA`.
 inline UInt128 u128FromBytesBE(const std::string & b, std::string_view what)
 {
     if (b.size() != 16)
@@ -65,6 +77,7 @@ inline UInt128 u128FromBytesBE(const std::string & b, std::string_view what)
 /// Comparing against `available` as the exact remainder is valid because all CAS codec decoding
 /// reads from `ReadBufferFromMemory`: the whole object is in memory, so `available` is exactly
 /// the number of bytes left.
+/// Throws `CORRUPTED_DATA` before allocating when the encoded object cannot contain `n` bytes.
 inline String readFixedBytes(ReadBuffer & in, size_t n)
 {
     if (n > in.available())
@@ -75,10 +88,11 @@ inline String readFixedBytes(ReadBuffer & in, size_t n)
     return s;
 }
 
-/// Length-prefixed byte string, shared by every codec that embeds one (`CasRefLogCodec`,
-/// `CasRefSnapshotCodec`): `u32 length (LE) | bytes`.
+/// Length-prefixed byte string: `u32 length (LE) | bytes`. Codecs that use this helper must keep
+/// the prefix and payload adjacent in the encoded body.
 /// The explicit guard (rather than relying on an op/byte budget elsewhere to keep every string short)
 /// is the point where a length silently truncated by the `u32` cast would otherwise corrupt the wire.
+/// Throws `CORRUPTED_DATA` if the string cannot be represented by the `UInt32` prefix.
 inline void writeLenPrefixed(WriteBuffer & out, const String & s)
 {
     if (s.size() > std::numeric_limits<uint32_t>::max())
@@ -87,6 +101,8 @@ inline void writeLenPrefixed(WriteBuffer & out, const String & s)
     out.write(s.data(), s.size());
 }
 
+/// Reads the `UInt32` little-endian length and then exactly that many bytes. Truncated input is
+/// reported by `readFixedBytes` as `CORRUPTED_DATA` before it can cause an oversized allocation.
 inline String readLenPrefixed(ReadBuffer & in)
 {
     uint32_t len = 0;
@@ -97,6 +113,8 @@ inline String readLenPrefixed(ReadBuffer & in)
 /// Decode-boundary guard. The codecs parse fully materialized objects, so running out of bytes is
 /// data corruption, not an IO condition: translate the standard reading errors into CORRUPTED_DATA —
 /// the code the protocol layers and tests pin for truncated persisted objects.
+/// Executes `f` and preserves every exception except the two standard EOF-related read exceptions,
+/// which are rethrown as `CORRUPTED_DATA` with `what` identifying the object being decoded.
 template <typename F>
 auto decodeGuarded(std::string_view what, F && f)
 {
@@ -114,11 +132,12 @@ auto decodeGuarded(std::string_view what, F && f)
     }
 }
 
-/// Canonical clean relative path, shared by every codec that embeds a ref/file name in its body
-/// (`CasRefLogCodec`, `CasRefSnapshotCodec`): non-empty, no NUL byte, no backslash, and no segment
-/// that is empty (rejects a leading/trailing/doubled '/'), ".", or "..". Names in this family
-/// originate from part names -- a NUL byte is never legitimate there, so it fails closed rather than
-/// being silently truncated or passed through.
+/// Canonical clean relative path for ref/file names: non-empty, no NUL byte, no backslash, and no
+/// segment that is empty (rejects a leading/trailing/doubled '/'), ".", or "..". Names in this
+/// family originate from part names -- a NUL byte is never legitimate there, so it fails closed
+/// rather than being silently truncated or passed through.
+/// Returns true only for a non-empty relative path whose slash-separated components are all normal
+/// names; it does not normalize or rewrite the input.
 inline bool isCanonicalRefName(std::string_view name)
 {
     if (name.empty() || name.find('\0') != std::string_view::npos || name.find('\\') != std::string_view::npos)
@@ -140,6 +159,7 @@ inline bool isCanonicalRefName(std::string_view name)
 
 /// Throws CORRUPTED_DATA naming both `caller` (the codec, e.g. "RefLogTxn") and `what` (the field,
 /// e.g. "set_payload ref_name") when `name` fails `isCanonicalRefName`.
+/// On success, the input is unchanged; on failure, no partial normalization is attempted.
 inline void checkCanonicalRefName(std::string_view name, std::string_view caller, std::string_view what)
 {
     if (!isCanonicalRefName(name))
@@ -147,11 +167,13 @@ inline void checkCanonicalRefName(std::string_view name, std::string_view caller
             "{}: {} is not a canonical clean relative path: '{}'", caller, what, name);
 }
 
-/// `ManifestRef` field validity, shared by every codec that embeds one (`CasRefLogCodec`,
-/// `CasRefSnapshotCodec`): `writer_epoch`/`build_sequence` nonzero, `manifest_ordinal` in
+/// `ManifestRef` field validity, shared by the ref codecs (`CasRefLogFormat`,
+/// `CasRefSnapshotFormat`): `writer_epoch`/`build_sequence` nonzero, `manifest_ordinal` in
 /// `[1, kMaxManifestOrdinal]` -- the same range `manifestOrdinalFileName` (`CasManifestId.h`) enforces
 /// at key-construction time. Throws CORRUPTED_DATA naming both `caller` (the codec) and `what` (the
 /// field, e.g. "set_payload manifest_ref").
+/// This keeps the value-level invariant aligned with the range enforced by manifest-key construction
+/// before either a codec encoder or decoder accepts the reference.
 inline void checkManifestRef(const ManifestRef & ref, std::string_view caller, std::string_view what)
 {
     if (ref.writer_epoch == 0 || ref.build_sequence == 0)

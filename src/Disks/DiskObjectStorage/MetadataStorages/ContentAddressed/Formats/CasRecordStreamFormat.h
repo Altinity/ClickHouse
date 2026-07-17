@@ -1,7 +1,6 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasSourceEdgeMarkers.h>
 #include <IO/ReadBuffer.h>
 #include <IO/WriteBuffer.h>
@@ -15,17 +14,17 @@
 namespace DB::Cas
 {
 
-/// The v3 `cas_run` codec (codecs-v3 phase 5): the GC source-edge in-degree data plane as sorted
-/// NDJSON, replacing the `CARN` block-framed binary run. This is the `RecordStream` family
+/// The `cas_run` codec represents the GC source-edge in-degree data plane as sorted NDJSON. This is
+/// the `RecordStream` family
 /// (`FormatId::RunFile`): unbounded-cardinality sorted records, `object_cap = 0` (NEVER materialized
 /// whole — streamed one line at a time over a `ReadBuffer`), `line_cap = 4 KiB`, `PinnedRaw` (no
 /// compression) + `Strict` (byte-deterministic for `putDeterministicArtifact` adoption).
 ///
-/// PHYSICAL LAYERING (spec §code-placement): this file is backend-free — it takes a `ReadBuffer &` /
-/// `WriteBuffer &` and never includes `CasBackend.h`/`CasPool.h`/`CasBlobInDegree.h`. `Core/` owns the
-/// stream and the packed-key/condemned-row bridge (`CasBlobInDegree`'s `openSourceEdgeRun` +
-/// `SourceEdgeRunView`/`SourceEdgeRunBuilder`), because `SourceEdgeKeyCodec` and `encodeCondemnedRow`
-/// live in `Core/`.
+/// This file is backend-free: it accepts caller-owned `ReadBuffer`/`WriteBuffer` objects and never
+/// includes backend or GC subsystem headers. The GC layer owns the stream lifetime and the bridge to
+/// packed keys and condemned rows; this codec owns only the durable text representation and its
+/// identifier-layer types. Keeping that boundary physical prevents storage or GC dependencies from
+/// leaking into the format implementation.
 ///
 /// File shape:
 ///   {"type":"cas_run","v":3,"kind":"source_edge"}                      header line (type + v + kind gate)
@@ -35,8 +34,8 @@ namespace DB::Cas
 ///
 /// The record key `b` is the algo BYTE as two lowercase hex chars followed by the digest hex at the
 /// algo's width; `s` is the 32-hex source id. String-sorting records by (b, s) reproduces the current
-/// binary (algo, digest, source_id) BYTE order (lowercase hex preserves unsigned byte order and the
-/// algo byte is emitted first) — the invariant the fold's two-cursor merge depends on. The row-tag word
+/// `(algorithm, digest, source_id)` byte order (lowercase hex preserves unsigned byte order and the
+/// algorithm byte is emitted first) — the invariant the fold's two-cursor merge depends on. The row-tag word
 /// `m` maps to the `kEdgeActive`/`kZeroMarker`/`kCondemned` bytes; a `condemned` row additionally
 /// carries the retired incarnation (`pend`/`tt`/`tv`/`sz`/`cr`).
 
@@ -57,8 +56,9 @@ struct SourceEdgeRecord
 /// The header-line `kind` word for the only live `cas_run` kind.
 inline constexpr std::string_view kSourceEdgeKindWord = "source_edge";
 
-/// Write the typed header line `{"type":"cas_run","v":G_BUILD,"kind":"<kind>"}\n` (fixed key order for
-/// byte-determinism). `writeHeaderLine` (phase 1) writes only type+v; `cas_run` carries the extra `kind`.
+/// Write the typed header line `{"type":"cas_run","v":G_BUILD,"kind":"<kind>"}\n` with a fixed key
+/// order for byte-determinism. The `kind` field distinguishes the record schema within the run
+/// family, so a reader can reject a valid run of the wrong kind before interpreting any records.
 void writeRunHeaderLine(WriteBuffer & out, std::string_view kind);
 
 /// Read + gate the typed header line: `type` must be `cas_run`, `v` is gated by `checkCompatibility`
@@ -75,8 +75,18 @@ void expectRunHeaderLine(ReadBuffer & in, std::string_view expected_kind);
 class SourceEdgeRunWriter
 {
 public:
+    /// Write the typed source-edge header immediately. The writer borrows `out` for its entire
+    /// lifetime; the caller must keep it alive and must call `finish` exactly once after the final
+    /// record so the count trailer is present.
     explicit SourceEdgeRunWriter(WriteBuffer & out_);
+
+    /// Append one record in non-decreasing `(ref, source_id)` order. Equal keys are allowed because
+    /// the merge layer may produce multiple rows for the same key. A regression is a producer
+    /// programming error and raises `LOGICAL_ERROR`; no partial record is written for that call.
     void append(const SourceEdgeRecord & rec);
+
+    /// Write the record-count trailer and mark the stream finished. Calling `finish` twice raises
+    /// `LOGICAL_ERROR`; appending after it is likewise rejected so a completed run cannot be extended.
     void finish();
 
 private:
@@ -105,13 +115,25 @@ UInt128 sourceEdgeRunChecksum(std::string_view stored_bytes);
 class SourceEdgeRunReader
 {
 public:
+    /// Construct a reader that borrows `in`, hashes every byte read, and validates the typed header
+    /// before exposing any record. The caller must drain the reader through the trailer before using
+    /// `verifyAgainst`, because the seal covers the complete object rather than only decoded rows.
     explicit SourceEdgeRunReader(ReadBuffer & in_);
     SourceEdgeRunReader(const SourceEdgeRunReader &) = delete;
     SourceEdgeRunReader & operator=(const SourceEdgeRunReader &) = delete;
 
+    /// Decode the next record in stored order. Returns `false` only after consuming and validating
+    /// the count trailer and confirming that it is the final line; malformed or truncated input
+    /// raises `CORRUPTED_DATA`.
     bool next(SourceEdgeRecord & rec);
+
+    /// Compare the accumulated whole-object checksum with the seal recorded for the run. Call only
+    /// after `next` has returned `false`; a mismatch raises `CORRUPTED_DATA` so callers can verify
+    /// the run before acting on decoded condemned rows.
     void verifyAgainst(const UInt128 & expected);
-    /// The whole-object hash accumulated so far (meaningful once the trailer has been consumed).
+
+    /// Return the whole-object hash accumulated so far. It is meaningful for seal verification only
+    /// after the trailer has been consumed, when the reader has hashed every byte of the object.
     UInt128 accumulatedChecksum();
 
 private:

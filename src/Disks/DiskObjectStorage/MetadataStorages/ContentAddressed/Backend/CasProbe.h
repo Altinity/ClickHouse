@@ -8,34 +8,40 @@ namespace DB::Cas
 
 /// Run the capability battery against `backend`, using throwaway keys under `probe_prefix`.
 ///
-/// The probe validates that the backend:
-///   1. Enforces conditional-create (putIfAbsent prevents overwrites).
-///   2. Enforces conditional-overwrite (putOverwrite rejects wrong-token updates).
-///   3. Enforces casPut semantics (create-if-absent, conflict-on-existing, conflict-on-stale, commit-on-current).
-///   4. Enforces conditional-delete (deleteExact with a wrong token is REJECTED and the object survives).
-///   5. Supports list-after-write (object appears in the listing after creation).
-///   6. Does NOT create versioning delete markers (deleteExact on success must have created_delete_marker == false).
-///   7. Supports list-after-delete (object disappears from the listing after deletion).
+/// The probe validates the backend preconditions required by a writable content-addressed pool:
+///   1. Store-level safety checks pass, including the requirement that conditional writes use one
+///      underlying HTTP attempt. Hidden SDK retries can outlive the writer's mount lease and obscure
+///      whether a conditional operation committed; retries must therefore be explicit CAS state-machine
+///      transitions rather than transparent client behavior.
+///   2. Conditional-create and conditional-overwrite are enforced (`putIfAbsent` prevents overwrites,
+///      and `putOverwrite` rejects a wrong-token update).
+///   3. `casPut` supports create-if-absent, conflict-on-existing, conflict-on-stale, and commit-on-current.
+///   4. Conditional-delete is enforced (`deleteExact` with a wrong token is rejected and the object survives).
+///   5. Listing reflects both creation and deletion of a probe object.
+///   6. Successful deletion does not create a versioning delete marker. A content-addressed pool cannot
+///      reclaim storage correctly from a versioned bucket: garbage-collection deletes would archive old
+///      versions instead of removing objects, and repeated ref updates would accumulate versions.
 ///
 /// On any failed check, throws a DB::Exception(ErrorCodes::NOT_IMPLEMENTED) with a message naming the
 /// specific failed check. This is fail-closed: a backend that does not pass the battery MUST NOT be
 /// used to coordinate a content-addressed pool.
 ///
-/// Cleanup of probe keys is best-effort and runs unconditionally (even after a failed check, after
-/// the throw is caught by the caller, or on a passing run). Within this function, cleanup runs at the
-/// end (after the battery completes or after a failure — via RAII scope guard).
+/// Cleanup of probe keys is best-effort and runs unconditionally: after the battery completes, or on
+/// the failure path immediately before the check-failing exception is rethrown. Cleanup itself suppresses
+/// exceptions so that it cannot hide the capability-check failure.
 void runCapabilityProbe(Backend & backend, const String & probe_prefix);
 
 /// Probe whether `object_storage` ENFORCES a write-once conditional server-side copy
 /// (`IObjectStorage::copyObjectConditional`, `If-None-Match: *`) — an OPTIONAL capability, unlike
-/// the mandatory battery above (`runCapabilityProbe`). Only meaningful for a disk configured with
-/// `staging_backend=s3` (design `docs/superpowers/specs/2026-07-11-cas-s3-native-staging-design.md`
-/// §3): when the backend does not enforce the precondition, the S3-native staging promote path is
-/// UNSAFE (it could silently overwrite a live blob), so the metadata layer must fall back to local
-/// staging rather than refuse to mount.
+/// the mandatory battery above (`runCapabilityProbe`). It is meaningful only for a disk configured
+/// with `staging_backend=s3`. S3-native staging promotes a temporary object into a content-addressed
+/// blob with this copy; if the destination precondition is ignored, the copy can silently overwrite a
+/// live blob. Such a backend is unsafe for S3-native staging, so the metadata layer must fall back to
+/// local staging rather than refuse to mount.
 ///
 /// Goes directly through `IObjectStorage`, not through `Backend`/`CasProbe`'s battery — this keeps
-/// the probe decoupled from the (later-task) S3-staging promote machinery it is gating.
+/// the probe decoupled from the `Backend`'s content-addressed operations. The metadata layer uses the
+/// result only to decide whether the optional S3-native staging path is safe to enable.
 ///
 /// Writes a tiny throwaway object at `<probe_prefix>/src`, conditionally copies it to
 /// `<probe_prefix>/dst` (expects `created == true` — a fresh destination), then repeats the SAME
@@ -49,8 +55,8 @@ void runCapabilityProbe(Backend & backend, const String & probe_prefix);
 /// This function never throws — the caller treats `false` as "fall back to local staging", never as
 /// a mount failure.
 ///
-/// Cleanup of the probe objects (`src`, `dst`) is best-effort and runs unconditionally (RAII scope
-/// guard), mirroring `runCapabilityProbe`.
+/// Cleanup of the probe objects (`src`, `dst`) is best-effort and runs unconditionally on normal and
+/// exceptional exits, mirroring `runCapabilityProbe`.
 bool probeConditionalCopy(IObjectStorage & object_storage, const String & probe_prefix);
 
 }

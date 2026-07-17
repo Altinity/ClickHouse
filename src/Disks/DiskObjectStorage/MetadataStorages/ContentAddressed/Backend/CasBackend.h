@@ -24,6 +24,9 @@ namespace DB::Cas
 /// "cas_owner" = "<server_id_hex>:<epoch>:<build_seq>" — the owner triple the GC watermark reads.
 using ObjectMeta = std::map<String, String>;
 
+/// A byte window requested from an object. An absent length means that the window extends to EOF.
+/// Backends use the same semantics for materialized and forward-only reads: the offset is exact,
+/// while a backend may expose an advisory end when its underlying read buffer cannot enforce one.
 struct Range
 {
     uint64_t offset = 0;
@@ -31,6 +34,9 @@ struct Range
     bool whole() const { return offset == 0 && !length; }
 };
 
+/// Materialized object bytes together with the incarnation and user metadata observed by the read.
+/// The token identifies the exact object version whose bytes are in `bytes`; callers may use it to
+/// validate a subsequent token-conditional mutation.
 struct GetResult
 {
     String bytes;
@@ -47,6 +53,9 @@ struct GetStreamResult
     Token token;
 };
 
+/// Metadata returned by `Backend::head`. For an absent key, `exists` is false and the other fields
+/// retain their defaults; for a present key, `size`, `token`, and `attributes` describe one current
+/// incarnation as observed by the backend.
 struct HeadResult
 {
     bool exists = false;
@@ -55,12 +64,16 @@ struct HeadResult
     ObjectMeta attributes;
 };
 
+/// Outcome of a write-once create or a token-conditional overwrite. A precondition failure means
+/// that the backend preserved the existing object; it is an expected result, not an exception.
 enum class PutOutcome : uint8_t
 {
     Done,                 /// object written; the returned PutResult.token is the new incarnation's token
     PreconditionFailed,   /// If-None-Match hit an existing key / If-Match mismatched — nothing changed
 };
 
+/// Outcome of a compare-and-set write. `Conflict` means that the expected token (or expected
+/// absence) did not match and that the backend left the object unchanged.
 enum class CasOutcome : uint8_t
 {
     Committed,
@@ -81,11 +94,16 @@ struct WriteResultT
 using PutResult = WriteResultT<PutOutcome>;
 using CasResult = WriteResultT<CasOutcome>;
 
+/// Result of deleting one exact incarnation. `TokenMismatch` and `NotFound` are deliberately
+/// distinct: the former proves that another incarnation is now current, while the latter means
+/// there is no object to remove. `created_delete_marker` exposes a storage-versioning behavior
+/// that is incompatible with current-object reclamation.
 struct DeleteOutcome
 {
     enum class Kind : uint8_t { Deleted, TokenMismatch, NotFound } kind = Kind::NotFound;
-    /// TRUE if the backend reported a delete marker was created (versioning enabled) — the probe
-    /// fails the pool on this (protocol spec §2: current-object mode requires versioning never enabled).
+    /// TRUE if the backend reported a delete marker was created because versioning is enabled. The
+    /// capability probe rejects this for the current-object storage model: exact deletion must reclaim
+    /// the current object rather than archive a noncurrent version.
     bool created_delete_marker = false;
 };
 
@@ -100,6 +118,8 @@ struct ListedKey
     uint64_t size = 0;
     std::optional<Token> token;   /// present iff supportsListTokens() == true
 };
+/// One page returned by `Backend::list`. `keys` contains only the requested prefix and the cursor
+/// resumes strictly after the last returned key; an empty cursor marks the end of the enumeration.
 struct ListPage
 {
     std::vector<ListedKey> keys;
@@ -129,12 +149,12 @@ public:
 
 using WriteSinkPtr = std::unique_ptr<WriteSink>;
 
-/// The ~8-op token-aware storage seam (design §3). TOKEN SEMANTICS ARE THE CONTRACT:
+/// Token-aware storage seam used by the content-addressed pool. TOKEN SEMANTICS ARE THE CONTRACT:
 ///   - every present key has exactly one current incarnation identified by an opaque Token;
 ///   - putOverwrite/casPut succeed only against the expected current token (or expected absence);
 ///   - deleteExact removes ONLY the incarnation whose token matches — wrong token MUST be a
 ///     TokenMismatch with the object untouched (backends that silently ignore the condition are
-///     rejected by Cas::Probe);
+///     rejected by `Cas::Probe`);
 ///   - conditional PUTs are protocol hygiene; casPut and deleteExact are SAFETY-critical.
 ///
 /// TOKEN ⟹ CONTENT PRECONDITION (read-path caches depend on this): a token must uniquely identify
@@ -145,7 +165,9 @@ using WriteSinkPtr = std::unique_ptr<WriteSink>;
 /// could REPEAT across different content would make it serve stale manifests (wrong results). Holds
 /// for every backend in use: S3 ETag is content-derived; the emulated/in-memory backends mint a
 /// strictly-monotonic sequence that is never reused. A backend with a weak/recycled token must NOT
-/// be used as a Cas pool (and Probe should grow a check for this — tracked in the backlog).
+/// be used as a Cas pool. The capability probe currently verifies conditional-operation behavior but
+/// does not test token non-reuse across different contents, so this invariant remains a requirement
+/// of every backend implementation.
 ///
 /// Most ops take/return whole `String` bodies — sufficient for manifests, trees, and probe/GC
 /// objects. LARGE content blobs stream through `putIfAbsentStream` (see `WriteSink`); reads stay
@@ -155,7 +177,9 @@ class Backend
 public:
     virtual ~Backend() = default;
 
-    virtual std::optional<GetResult> get(const String & key, Range range = {}) = 0;   /// nullopt = absent
+    /// Reads the selected bytes and their token, or returns nullopt when the key is absent. For a
+    /// mutable object, callers must use this materialized form so the body is fixed before parsing.
+    virtual std::optional<GetResult> get(const String & key, Range range = {}) = 0;
 
     /// Forward-only stream over the object's `range` (default: whole object) for WRITE-ONCE objects
     /// (runs, seals). The returned `stream` yields exactly the window's bytes and nothing is
@@ -164,18 +188,38 @@ public:
     /// CAVEAT: the window END is advisory on storages where `setReadUntilPosition` is a hint
     /// (LocalObjectStorage) — the stream may yield bytes past the window; consumers MUST bound their
     /// own consumption (RunFileReader bounds to its data_end). The window START is always exact.
-    virtual std::optional<GetStreamResult> getStream(const String & key, Range range = {}) = 0;   /// nullopt = absent
+    virtual std::optional<GetStreamResult> getStream(const String & key, Range range = {}) = 0;
+
+    /// Returns the current incarnation's existence, size, token, and metadata without reading its
+    /// body. The result describes one point-in-time observation; a later operation must use the
+    /// returned token when it needs to protect against replacement.
     virtual HeadResult head(const String & key) = 0;
+
+    /// Creates `key` only when it is absent. `PreconditionFailed` leaves the existing object intact;
+    /// storage failures are reported as exceptions. On success, the returned token identifies the
+    /// newly created incarnation.
     virtual PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta = {}) = 0;
     /// Streaming variant of putIfAbsent — see WriteSink. Large content blobs use this; whole-String
     /// ops remain for manifests, trees, probe and GC objects.
     virtual WriteSinkPtr putIfAbsentStream(const String & key, const ObjectMeta & meta = {}) = 0;
+
+    /// Replaces the current object only when its token equals `expected`. A mismatch leaves the
+    /// object unchanged and returns `PreconditionFailed`; the returned token is meaningful only on
+    /// `Done`.
     virtual PutResult putOverwrite(const String & key, const String & bytes, const Token & expected,
                                    const ObjectMeta & meta = {}) = 0;
     /// expected == nullopt => create-if-absent CAS (the first write of a root manifest).
+    /// A non-null expected token conditionally replaces that exact current incarnation. Conflicts
+    /// leave the object unchanged and are returned as an outcome rather than an exception.
     virtual CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected,
                              const ObjectMeta & meta = {}) = 0;
+
+    /// Deletes only the current incarnation identified by `token`. A token mismatch must leave the
+    /// object untouched; the result distinguishes that case from an already absent key.
     virtual DeleteOutcome deleteExact(const String & key, const Token & token) = 0;
+
+    /// Lists one page of keys under `prefix`, starting after `cursor` and returning at most `limit`
+    /// entries. `ListPage::next_cursor` is the only supported continuation state.
     virtual ListPage list(const String & prefix, const String & cursor, size_t limit) = 0;
 
     /// Capability fact about the LIST seam: TRUE iff this backend can surface a per-key incarnation
@@ -198,17 +242,17 @@ public:
     /// "reclaim" would silently stop reclaiming.
     virtual void checkPoolPreconditions() {}
 
-    /// Fail-closed precondition (RFC cas-s3-timeout-retry-control): a Native-mode backend MUST have a
+    /// Fail-closed precondition: a Native-mode backend MUST have a
     /// working single-attempt conditional-write path before it coordinates a WRITABLE pool — silently
     /// running CAS conditional writes under the disk's default (~500-attempt) transparent retry policy
-    /// is exactly the hazard the RFC forbids. Checked by the capability probe alongside
+    /// is exactly the hazard this seam forbids. Checked by the capability probe alongside
     /// checkPoolPreconditions. Default: nothing to check (EmulatedSingleProcess and non-S3 backends
     /// are not gated here — see ObjectStorageBackend's override for the one backend that is).
     virtual void checkConditionalWriteSingleAttemptSupport() {}
 
     /// WRITE-ONCE conditional SERVER-SIDE COPY of `staging_key` to `blob_key` (`If-None-Match:*` on the
-    /// destination) — the S3-native staging promote's create primitive (spec 2026-07-11-cas-s3-native-staging
-    /// §8). `Done` + `token` = the destination ETag (the new incarnation token, exactly the role the
+    /// destination) — the S3-native staging promote's create primitive. `Done` + `token` = the
+    /// destination ETag (the new incarnation token, exactly the role the
     /// streaming `putIfAbsentStream` PUT's ETag plays) when this call created `blob_key`;
     /// `PreconditionFailed` when `blob_key` already existed — NOTHING was changed (same write-once
     /// contract as `putIfAbsentStream`). No LIVE object is ever overwritten by this call.
@@ -216,7 +260,7 @@ public:
     /// DEFAULT: fail closed (`NOT_IMPLEMENTED`) — a backend without a native, enforced conditional
     /// server-side copy is NEVER selected for S3 staging (the mount-time probe fell back to Local
     /// staging + `putIfAbsentStream`), so this must throw rather than silently degrade to an
-    /// unconditional overwrite (the fail-open path CLAUDE.md forbids).
+    /// unconditional overwrite. The caller must use local staging when this primitive is unavailable.
     virtual PutResult promoteStaged(const String & /*staging_key*/, const String & /*blob_key*/)
     {
         throw Exception(ErrorCodes::NOT_IMPLEMENTED,
@@ -224,15 +268,16 @@ public:
     }
 
     /// UNCONDITIONAL re-upload of the writer's OWN staging PAYLOAD over `blob_key` under a FRESH-tagged
-    /// envelope header — the sanctioned condemned-RESURRECT overwrite (spec §5/§9, INV-NO-RETURN fix
-    /// 2026-07-11). The backend reads the payload from `staging_key` skipping the first
+    /// envelope header — the sanctioned condemned-object resurrection overwrite. The backend reads
+    /// the payload from `staging_key` skipping the first
     /// `staging_payload_offset` bytes (the staging object's own envelope header), prepends `fresh_header`
     /// (built by the caller with a freshly-minted `incarnation_tag`), and writes `[fresh_header][payload]`
     /// to `blob_key`. The source is ALWAYS the writer's OWN staging object, NEVER a read/copy of the
-    /// condemned `blob_key` (`feedback_ca_resurrect_invariant`). The fresh header guarantees the
-    /// resurrected body — and hence its ETag/token — DIFFERS from the condemned incarnation, so a queued
+    /// condemned `blob_key`. The fresh header guarantees the resurrected body — and hence its
+    /// ETag/token — differs from the condemned incarnation, so a queued
     /// exact-token delete of the condemned incarnation can never match the live resurrection
-    /// (INV-NO-RETURN). The caller MUST have observed the current incarnation as `Condemned` (per-hash
+    /// (`INV-NO-RETURN`).
+    /// The caller MUST have observed the current incarnation as `Condemned` (per-hash
     /// meta point-read) before calling this, so it overwrites a condemned body, never a live blob (INV:
     /// never overwrite a live blob). Returns the fresh incarnation token.
     /// DEFAULT: fail closed (`NOT_IMPLEMENTED`), same rationale as `promoteStaged`.
@@ -247,14 +292,15 @@ public:
 using BackendPtr = std::shared_ptr<Backend>;
 
 /// Walk every key under `prefix` exactly once, resuming by the backend's explicit last-returned-key
-/// cursor (ListPage::next_cursor, empty => done). The one paginated LIST/cursor loop that GC, fsck,
-/// and the sweeps all re-implemented (~10 sites).
+/// cursor (`ListPage::next_cursor`, empty => done). This centralizes the pagination contract shared by
+/// GC, fsck, and cleanup sweeps: each returned key is delivered once, and the backend's cursor is the
+/// only state used to request the next page.
 ///
 /// `on_page_fetched`, if set, fires exactly once per physical `backend.list` call (including an
 /// empty/undersized final page) — a GC-owned caller's hook for a page-level ProfileEvents counter,
 /// without misattributing a non-GC caller (e.g. fsck) that leaves it unset. Trails `page_limit`
 /// (rather than sitting before it) so the two existing callers that override `page_limit`
-/// (`Gc::fold`, `CasFsck.cpp`'s `listAll`) needed no change.
+/// (`Gc::fold`, `CasFsck.cpp`'s `listAll`) can override `page_limit` without changing callback order.
 inline void forEachListedKey(Backend & backend, const String & prefix,
                              const std::function<void(const ListedKey &)> & cb,
                              size_t page_limit = 1000,
@@ -278,6 +324,9 @@ inline void forEachListedKey(Backend & backend, const String & prefix,
 /// (blob + manifest delete) and the orphan-manifest sweep each mapped by hand.
 enum class DeleteClass : uint8_t { Deleted, Absent, Replaced };
 
+/// Converts a backend-specific delete outcome into the three states used by cleanup callers. The
+/// default branch is fail-safe: an unknown value is treated as `Replaced`, so cleanup never reports
+/// an unverified deletion as successful.
 inline DeleteClass classifyDeleteOutcome(const DeleteOutcome & d)
 {
     switch (d.kind)
@@ -289,6 +338,8 @@ inline DeleteClass classifyDeleteOutcome(const DeleteOutcome & d)
     return DeleteClass::Replaced;   /// unreachable; fail-safe toward "leave it" (never a false Deleted)
 }
 
+/// Returns the stable lowercase label used when reporting a normalized delete result. Unknown enum
+/// values are labeled `replaced`, matching `classifyDeleteOutcome`'s fail-safe behavior.
 inline std::string_view deleteClassName(DeleteClass c)
 {
     switch (c)

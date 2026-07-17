@@ -19,7 +19,9 @@ namespace DB::Cas
 namespace
 {
 
-/// Read the single body line of a control singleton (fail-closed on a missing/oversized line).
+/// Read exactly the one JSON body line allowed by a server-root control object. `readLine` rejects a
+/// missing newline and a line over the format-specific cap; each decoder separately checks that no
+/// bytes follow this line, so a concatenated object cannot be accepted accidentally.
 String readBodyLine(ReadBuffer & in, FormatId id, std::string_view what)
 {
     return readLine(in, traitsFor(id).line_cap, what);

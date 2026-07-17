@@ -3,16 +3,17 @@
 #include <base/extended_types.h>
 #include <functional>
 #include <map>
+#include <utility>
 
 namespace DB::Cas
 {
 
-/// Decoupled, pure-data per-event record (mirrors GcRoundLogRecord's design: NO Interpreters
-/// dependency). The metadata storage converts it into a ContentAddressedLogElement and forwards it
-/// to the SystemLog. Keeping it a plain POD lets the Core (and its unit tests) stay free of the
-/// system-log machinery. B170: the log must reconstruct every entity's whole lifetime, so every
-/// state-changing decision, every GC internal transition, and every error/anomaly is an event,
-/// each carrying its full rationale in `reason`/`detail`.
+/// Names the append-only audit events emitted by content-addressed storage. The metadata storage
+/// converts each `CasEvent` into a `ContentAddressedLogElement` and forwards it to the `SystemLog`;
+/// this layer deliberately keeps only pure data so the core and its unit tests do not depend on
+/// system-log machinery. The event log reconstructs each entity's lifetime, so this taxonomy
+/// includes state-changing decisions, GC transitions, and errors or anomalies rather than only
+/// successful user-visible operations.
 enum class CasEventType
 {
     BlobPut, BlobReuseAdopt, BlobReuseResurrect, BlobRetire, BlobRetireReplaced, BlobDelete, BlobForget,
@@ -24,28 +25,38 @@ enum class CasEventType
     BuildStart, BuildPublish, BuildAbort, Precommit, PrecommitRemoved, PrecommitReclaim,
     GateRevalidate, GateResurrect, WatermarkRenew, MountRemount,
     MountClaim, MountRelease, MountConflict,
-    /// Pool-member decommission (design 2026-07-13-cas-pool-member-decommission §core): the
-    /// operator-driven offline erasure of a DEAD pool member's namespace, run by
-    /// `decommissionPoolMember` as a WRITER (never GC). `outcome` is "begin"/"namespace_removed"/"end".
+    /// Operator-driven erasure of a dead pool member's namespace. `decommissionPoolMember` runs as
+    /// a writer, never as GC: it claims the member's mount, drains its namespaces and debris, and
+    /// deletes the mount slot only after the drain is confirmed. The slot is the interrupted-operation
+    /// resume anchor, so a failed drain leaves it terminated for a later retry. `outcome` is one of
+    /// "begin", "namespace_removed", or "end".
     MemberDecommission,
-    /// rev.6 (spec §anomaly-policy): incidental-detection reaction to a signal that is impossible
-    /// under legitimate single-writer operation once the mount lease makes a key exclusively ours
-    /// (foreign bytes at our own wedge key; the wedge hard contract violated). See
-    /// `Pool::reportImpossibleInterference`.
+    /// Incidental-detection reaction to foreign bytes at a ref-log wedge key owned by this mount.
+    /// The mount lease makes the key exclusive, so this is impossible under legitimate
+    /// single-writer operation and indicates that the wedge hard contract was violated. The
+    /// reaction records the anomaly and fails the local write path closed; it does not treat the
+    /// foreign bytes as valid ref-log state.
     ForeignInterference,
-    /// rev.6 (spec §anomaly-policy, Task 12): the orphan sweep's incidental, LIST-only detection of a
-    /// T_mat violation -- a `_log` object listed strictly above a recovery seal's `sealed_from` and
-    /// at-or-below the seal's `snapshot_id`, provably materialized by the store after the recovery
-    /// `LIST` that produced the seal. Report only; the sweep never GETs the log body to "revive" it
-    /// (the resurrect invariant) and never deletes it itself -- GC's ordinary covered-log cleanup
-    /// removes it once folding catches up. See `CasOrphanManifestSweep.cpp`'s `activeManifestKeys`.
+    /// Report-only result of the orphan sweep's LIST-based detection of a late ref-log object: its
+    /// id is above a recovery seal's `sealed_from` and at or below the seal's `snapshot_id`, so the
+    /// object was materialized after the LIST that produced the seal. The sweep does not GET the
+    /// body and accidentally revive its operations, and does not delete the object itself; GC's
+    /// ordinary covered-log cleanup removes it after folding catches up.
     RefLateLogDetected,
     RefResolve, ReadMissing, DanglingAccess,
     CorruptDangle, CorruptDecode, SnapJournalIncoherent, Exception,
 };
 
+/// Identifies the kind of object described by a `CasEvent`. `None` is used for events about a
+/// protocol action, mount, or anomaly that is not tied to one stored object.
 enum class CasEventObjectKind { None, Blob, Manifest, Root, Snap };
 
+/// Pure-data event passed from the content-addressed core to the metadata-storage audit-log sink.
+/// Fields that do not apply to an event remain empty or zero. `reason` is mandatory for decisions
+/// and must explain why the operation took its outcome; `detail` carries structured facts needed
+/// to reconstruct the event without parsing the free-form reason. Hashes are lowercase hexadecimal,
+/// tokens identify object incarnations, and the numeric fields identify GC rounds, snapshot
+/// generations, or the manifest journal version as applicable.
 struct CasEvent
 {
     CasEventType type = CasEventType::BlobPut;
@@ -62,29 +73,30 @@ struct CasEvent
     std::map<String, String> detail;
 };
 
-/// Round-B opt §6: by VALUE, not `const &` -- every caller (the sink assignment in `setEventSink`
-/// and every emission site below) passes an rvalue, so the sink's own by-value parameter is
-/// move-constructed from the temporary rather than deep-copying every field (incl. the `detail` map)
-/// on the hot emitter thread.
+/// Receives events by value so emission sites can move the complete record, including its `detail`
+/// map, into the sink instead of deep-copying it on the emitter thread. Emission sites pass an rvalue
+/// for a completed event; the sink consumes that event while converting it to the system-log row.
 using CasEventSink = std::function<void(CasEvent)>;
 
-/// Collapses the repeated `if (store->hasEventSink()) { CasEvent e; e.field = …; store->emitEvent(e); }`
-/// boilerplate at every emission site into a single `emitter.emit([&](CasEvent & e){ … })`. The emitter
-/// seeds the ONLY identity that is constant across every site — the owning Pool (the event sink) — and
-/// the per-call code that fills the varying fields (type/reason/round/hashes/…) lives in the builder.
+/// Builds and emits a `CasEvent` for a store that owns the event sink. The builder supplies the
+/// per-event fields; the emitter supplies the sink owner shared by all events from that store.
 ///
-/// ZERO-COST when the sink is absent: the builder runs ONLY inside the `hasEventSink` guard, so a disabled
-/// log constructs no `CasEvent` and does no per-call work (the production hot path stays a single branch).
-/// Behavior-preserving: the builder fills the SAME fields with the SAME values it did inline, so the emitted
-/// event is byte-for-byte identical. Templated on the store type to avoid a Core header-layering cycle
-/// (`CasPool.h` includes this header); any `S` exposing `hasEventSink`/`emitEvent` works.
+/// If the store has no sink, the builder is not invoked and no event is constructed; the disabled
+/// path is therefore only the sink-presence check. Otherwise, `emit` moves the completed event into
+/// `emitEvent`, preserving the fields supplied by the builder without adding a copy. This class is
+/// templated to avoid a header-layering cycle (`CasPool.h` includes this header); any `S` exposing
+/// `hasEventSink` and `emitEvent` with the expected contracts can be used.
 template <typename S>
 class EventEmitter
 {
 public:
+    /// Keeps a reference to the store; the store must outlive this short-lived emitter.
     explicit EventEmitter(const S & store_) : store(store_) {}
 
     template <typename Builder>
+    /// Invokes `build` only when the store has an enabled sink, then moves the resulting event into
+    /// the store. `Builder` must accept `CasEvent &` and may populate any applicable fields; any
+    /// exception from the builder or the store is propagated to the caller.
     void emit(Builder && build) const
     {
         if (!store.hasEventSink())
@@ -101,9 +113,14 @@ private:
 template <typename S>
 EventEmitter(const S &) -> EventEmitter<S>;
 
-/// snake_case names for the SystemLog `event_type` / `object_kind` columns. Every enumerator MUST
-/// map to a stable string (the table is queried by these names).
+/// Converts an event taxonomy value to the stable snake_case name stored in the `SystemLog`
+/// `event_type` column. Every enumerator must have a mapping because these names are queried by
+/// users and are part of the audit-log schema; an unknown value raises a logical-error exception.
 String toString(CasEventType type);
+
+/// Converts an object-kind value to the stable snake_case name stored in the `SystemLog`
+/// `object_kind` column. An unknown value raises a logical-error exception rather than silently
+/// producing an unrecognized schema value.
 String toString(CasEventObjectKind kind);
 
 }

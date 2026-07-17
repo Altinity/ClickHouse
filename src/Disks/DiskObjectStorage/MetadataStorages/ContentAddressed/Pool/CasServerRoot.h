@@ -29,7 +29,6 @@ namespace ErrorCodes
 }
 }
 
-// ===== Merged from CasSingleWriterSlot.h (merge #3): base class, must precede MountLeaseKeeper =====
 namespace DB::Cas
 {
 
@@ -66,16 +65,21 @@ public:
         BackendPtr backend_, String key_, std::string_view slot_name_, std::string_view terminal_verb_,
         std::string_view logger_name_);
 
-    /// Stops the background thread only (no terminal op). Destruction without a terminal op is the
-    /// crash path: the slot persists, its seq stops advancing, and full GC observes the frozen seq.
+    /// Stops the background thread only (no terminal op). Destruction without a terminal op leaves
+    /// the slot persisted, with its seq no longer advancing, so full GC observes frozen state.
     virtual ~SingleWriterSlot();
 
     /// seq++ via putOverwrite against the last token we wrote; LOGICAL_ERROR on a foreign touch
     /// (single-writer fail-closed contract).
     void renewOnce();
 
+    /// Starts periodic renewal. The period controls only the wake-up cadence; a failed renewal stops
+    /// the loop and is not silently re-armed by a later call.
     void startBackground(std::chrono::milliseconds period);
-    void stopBackground();   /// idempotent
+
+    /// Requests renewal-thread termination and joins it. Safe to call repeatedly, including after a
+    /// renewal failure or from destruction; it does not perform the slot's terminal operation.
+    void stopBackground();
 
     /// Local-clock bound for diagnostics: when the background loop stops (renewal failure), this
     /// stops advancing.
@@ -108,7 +112,7 @@ protected:
     /// `state_mutex`); the mount-lease keeper latches the write fence to lost here. Default no-op.
     virtual void onRenewFailed() {}
 
-    /// Fix #37 phase 1 (over-fencing): called from the background loop when `renewOnce` threw and the
+    /// Called from the background loop when `renewOnce` threw and the
     /// throw was NOT a confirmed mismatch (`onRenewMismatch` -- an observed PUT outcome proving
     /// supersession; see the flag this checks, `last_renew_failure_was_confirmed_mismatch`, in the
     /// private section below). Returning `true` means "treat as terminal now" -- fence immediately, the
@@ -161,7 +165,7 @@ private:
 
     std::chrono::steady_clock::time_point last_renew_time;
 
-    /// Fix #37 phase 1: set immediately before `renewOnce` invokes `onRenewMismatch` (which always
+    /// Set immediately before `renewOnce` invokes `onRenewMismatch` (which always
     /// throws) so `backgroundLoop`'s catch block can tell a CONFIRMED mismatch (the PUT completed and
     /// observed a foreign token -- proven supersession) apart from a TRANSIENT exception
     /// (`putOverwrite` itself threw before any outcome was observed, or a defensive `dead`/`seq==0`
@@ -184,7 +188,7 @@ namespace DB::Cas
 {
 
 /// Validate a `server_root_id` — the explicit, configured identity of the content-addressed layout
-/// subtree a server owns (spec §mount-safety). It is a clean relative path: it composes into the
+/// subtree a server owns. It is a clean relative path: it composes into the
 /// object-key tree (`gc/server-roots/<srid>/...`, `roots/<srid>/...`), so the same hygiene the layout
 /// applies to a namespace applies here (mirrors `CasLayout.h::checkNamespace`):
 ///   - non-empty;
@@ -225,30 +229,28 @@ inline void validateServerRootId(const String & id)
     }
 }
 
-/// The per-server-root control objects (owner / epoch / mount-lease) and their text codecs moved to
-/// Formats/CasServerRootFormats (codecs-v3 phase 2); this header includes that one so the protocol
-/// logic below (claimOwnerOrThrow / allocateWriterEpoch / claimMount / MountLeaseKeeper) keeps
-/// referring to OwnerObject / ServerEpoch / MountLease / encode* / decode* unchanged.
+/// The per-server-root control objects (owner, epoch, and mount lease) and their text codecs are kept
+/// in `Formats/CasServerRootFormats`. This header includes those definitions so the protocol logic
+/// below can use `OwnerObject`, `ServerEpoch`, `MountLease`, and their `encode`/`decode` functions
+/// without duplicating the wire-format implementation.
 
 class Backend;
 class Layout;
 
-/// Mount-safety claim logic (Phase 0). These are the identity + epoch-allocation steps a server
+/// Mount-safety claim logic. These are the identity and epoch-allocation steps a server
 /// runs at startup over its `server_root_id` subtree, BEFORE any ordinary data write. They fail
 /// closed (`ErrorCodes::CORRUPTED_DATA`); there is no re-mint or silent-recreate fallback.
 
 /// TRUE iff the whole `server_root_id` subtree is provably empty — `list(prefix, "", 1)` (limit 1)
 /// over EACH of the three subtrees that can hold this server root's data
-/// (`cas/refs/<srid>/`, `cas/manifests/<srid>/`, `roots/<srid>/`) returns no keys. The `cas/refs`
-/// and `cas/manifests` prefixes carry no data until Phase 1 relocates into them, but all three are
-/// listed so the precondition stays correct once Phase 1 lands.
+/// (`cas/refs/<srid>/`, `cas/manifests/<srid>/`, `roots/<srid>/`) returns no keys. All three are
+/// listed so the precondition holds regardless of which subtree a prior incarnation wrote into.
 bool serverRootSubtreeEmpty(Backend & b, const Layout & l, const String & srid);
 
 /// Read the owner anchor (`gc/server-roots/<srid>/owner`) WITHOUT claiming or validating identity —
-/// a plain GET+decode. nullopt = anchor absent. Decommission (design
-/// 2026-07-13-cas-pool-member-decommission §core) uses this to impersonate the victim uuid before
-/// mounting writable; `claimOwnerOrThrow` below is the identity-CLAIMING counterpart every normal
-/// open uses (and itself calls this for its own GET+decode — one decode site, no behavior change).
+/// a plain GET+decode. nullopt = anchor absent. Pool-member decommission uses this to read the
+/// victim UUID before mounting writable; `claimOwnerOrThrow` below is the identity-claiming
+/// counterpart used by normal opens and reuses this GET+decode path.
 std::optional<UInt128> readOwnerUuid(Backend & b, const Layout & l, const String & server_root_id);
 
 /// Claim (or validate) the sticky owner anchor that binds `srid` to a server UUID (identity).
@@ -269,8 +271,8 @@ void claimOwnerOrThrow(Backend & b, const Layout & l, const String & srid, UInt1
 ///     observed token, retry on `Conflict` (bounded), and return `next`.
 uint64_t allocateWriterEpoch(Backend & b, const Layout & l, const String & srid);
 
-/// Which certificate of death justified a same-uuid, different-epoch mount reclaim (rev.6 design
-/// §token-stability observation). `None` when no reclaim of that kind happened (a fresh claim, a
+/// Which certificate of death justified a same-uuid, different-epoch mount reclaim. `None` when no
+/// reclaim of that kind happened (a fresh claim, a
 /// same-epoch refresh, `LiveDoubleStart`, `ForeignOwner`, `FencedSelf`).
 enum class MountPriorState
 {
@@ -291,7 +293,7 @@ enum class MountPriorState
 ///         in place would resurrect a fenced incarnation → `FencedSelf` (no write);
 ///       - otherwise → refresh (`putOverwrite` to bump seq + fresh `expires_at_ms`) → `Claimed`;
 ///   - same `server_uuid`, DIFFERENT `writer_epoch` → reclaimed ONLY on a certificate of death that
-///     needs no fresh wall-clock trust (rev.6 design §token-stability observation — see
+///     needs no fresh wall-clock trust (see
 ///     `claimMountAwaitingExpiry` below for how a plain "looks expired" reading is turned into one):
 ///       - `gc_fenced` (the GC leader already, itself, threshold-gated this incarnation dead; a fence
 ///         costs an epoch, so its keeper can never renew again) → reclaim, `prior = Fenced`;
@@ -302,7 +304,7 @@ enum class MountPriorState
 ///         UncleanObserved`;
 ///       - none of the above → `LiveDoubleStart` (do NOT write). In particular `expires_at_ms <=
 ///         now_ms` ALONE is never sufficient — comparing a predecessor's stamp against OUR wall clock
-///         is exactly the cross-node trust rev.6 removes (a clock-skewed or merely late-observing
+///         is unsafe because a clock-skewed or merely late-observing
 ///         caller must never conclude death from a bare timestamp read);
 ///   - different `server_uuid` → `ForeignOwner` (do NOT write, regardless of expiry or prior state).
 struct MountClaimResult
@@ -314,8 +316,8 @@ struct MountClaimResult
         LiveDoubleStart,
         ForeignOwner,
         /// Same (uuid, epoch) as ours, but the body is `gc_fenced`: terminal for THIS epoch — a fence
-        /// costs an epoch. The caller must re-open with a fresh `writer_epoch` (see Task 4's open
-        /// retry); refreshing/adopting a fenced body in place is never correct.
+        /// costs an epoch. The caller must re-open with a fresh `writer_epoch`; refreshing or adopting
+        /// a fenced body in place is never correct.
         FencedSelf,
     };
     Kind kind = ForeignOwner;
@@ -323,7 +325,7 @@ struct MountClaimResult
     /// Which certificate of death justified a same-uuid, different-epoch `Claimed` reclaim (`None` for
     /// every other `Kind`, and for the absent-slot / same-epoch-refresh `Claimed` cases).
     MountPriorState prior = MountPriorState::None;
-    /// fix-round F8 (author-review): the backend token of the body this result observed, for
+    /// The backend token of the body this result observed, for
     /// `LiveDoubleStart` only (a fresh `Claimed`/`FencedSelf`/`ForeignOwner` write/observe has no
     /// separate "prior body's token to remember" use). `claimMountAwaitingExpiry`'s observation loop
     /// used to re-GET the mount key itself just to recover this token that `claimMount` had already
@@ -360,7 +362,7 @@ MountClaimResult claimMount(
 /// remediation is about a live twin, not about waiting.
 String mountDoubleStartMessage(const String & srid, const MountLease & existing);
 
-/// Observation-based mount claim (S13 crash-recovery; rev.6 design §token-stability observation).
+/// Observation-based mount claim for restart recovery.
 /// Wraps `claimMount` in a loop:
 ///   - first attempt decided immediately for `Claimed` (fresh / refreshed / reclaimed via `Fenced` or
 ///     `Clean`), `ForeignOwner`, or `FencedSelf`;
@@ -369,8 +371,8 @@ String mountDoubleStartMessage(const String & srid, const MountLease & existing)
 ///     WATCHING the lease's write-token on OUR OWN clock (`mono_ms_fn`), NEVER by comparing the
 ///     lease's stamped `expires_at_ms` against any clock: once the observed token has held stable for
 ///     the full rate-bound threshold (`ttl_ms + ttl_ms / 20 + poll_interval_ms` — the lease TTL, a 5%
-///     clock-drift allowance, and one poll interval of discreteness; mirrors the TLA+-verified
-///     `TTL + Drift` threshold in `docs/superpowers/models/CaCasMountCore.tla`'s `ObservedReclaim`),
+///     clock-drift allowance, and one poll interval of discreteness. This rate bound ensures that a
+///     holder which last renewed before the observation began can no longer be within its lease.
 ///     that token is handed to `claimMount` as `proven_dead_token`, which then reclaims token-guarded
 ///     (`prior = UncleanObserved`). If the token changes DURING the wait (the holder renewed, or a
 ///     genuine twin is alive) the observation RESTARTS from the new token; bounded to a handful of
@@ -383,14 +385,10 @@ String mountDoubleStartMessage(const String & srid, const MountLease & existing)
 /// tests drive fake clocks with no real sleeping. `on_wait_start` (default no-op) fires once per
 /// observation-window start (including restarts), with the currently-observed lease and the
 /// threshold, for an operator-visible startup log.
-/// fix-round F4 (author-review: the `ttl_ms + ttl_ms / 20 + cadence_ms` formula was hand-duplicated at
-/// THREE call sites -- here, `Gc::runRegularRound`'s heartbeat gate, and `Gc`'s disaster-recovery
-/// baseline rebuild -- with a retune of one site silently missing another (the DR rebuild path is the
-/// easy one to forget, since it only runs on recovery, not on every round). One shared function so a
-/// future retune only has one place to change. `cadence_ms` is the caller's own poll/heartbeat
-/// interval -- `claimMountAwaitingExpiry` passes its (floor'd) `poll_interval_ms`, `Gc` passes
-/// `mount_renew_period` -- the formula itself (TTL + 5% clock-drift allowance + one cadence interval of
-/// observation discreteness) is what stays identical across every caller.
+/// All callers use this shared formula so a future adjustment cannot silently leave the startup
+/// observation path and either GC heartbeat path with different thresholds. `cadence_ms` is the
+/// caller's own poll or heartbeat interval; the additional interval accounts for observation
+/// discreteness, while `ttl_ms / 20` allows for a five-percent clock-rate difference.
 uint64_t mountObservationThresholdMs(uint64_t ttl_ms, uint64_t cadence_ms);
 
 MountClaimResult claimMountAwaitingExpiry(
@@ -402,7 +400,7 @@ MountClaimResult claimMountAwaitingExpiry(
     const std::function<void(const MountLease &, uint64_t)> & on_wait_start = {},
     const CasEventSink & sink = {});
 
-/// One srid's cross-round token-stability observation (rev.6 design §token-stability observation),
+/// One `server_root_id`'s cross-round token-stability observation,
 /// owned by the GC leader instance (`Cas::Gc::mount_obs`) and threaded through consecutive
 /// `computeHeartbeatFloor` calls — one GC round is one observation tick. Mirrors
 /// `claimMountAwaitingExpiry`'s observation loop, but at heartbeat-gate granularity rather than a
@@ -425,9 +423,9 @@ using MountObservationMap = std::map<String, MountTokenObservation>;
 ///   - `gc_fenced` already set → excluded (`already_fenced`); a fenced mount is terminal, no PUT;
 ///   - terminated (`min_active == UINT64_MAX`, the farewell sentinel stamped by
 ///     `MountLeaseKeeper::terminate`) → excluded (`terminated`). `expires_at_ms` alone cannot
-///     distinguish a graceful farewell from a crash, so the sentinel — not the timestamps — is the
+///     distinguish a graceful farewell from an unclean stop, so the sentinel — not the timestamps — is the
 ///     terminated marker;
-///   - otherwise, OBSERVATION-BASED liveness (rev.6 design §token-stability observation — the same
+///   - otherwise, observation-based liveness (the same
 ///     principle `claimMountAwaitingExpiry` uses for a mount's OWN reopen, applied here to the GC's
 ///     fence-out): `obs` remembers, per srid, the write-token last seen and the leader's OWN
 ///     monotonic clock reading (`mono_now_ms`) at the moment it first saw that token. A body whose
@@ -452,7 +450,7 @@ using MountObservationMap = std::map<String, MountTokenObservation>;
 /// The fence-out is BOTH safety and liveness. Safety: a sleeper's later renewal permanently fails
 /// (its `putOverwrite` now mismatches the fenced token → `tripMountLost`), so it can never re-arm
 /// without a fresh `open`. Liveness: a dead server's stale mount slot must not linger forever.
-/// Preserving the body keeps S13 recovery intact: a same-uuid reopen reads the current body and
+/// Preserving the body keeps restart recovery intact: a same-uuid reopen reads the current body and
 /// reclaims through the normal expired-our-uuid branch.
 struct HeartbeatFloor
 {
@@ -539,14 +537,33 @@ public:
     }
 
 protected:
+    /// Reads the current wall-clock stamp and watermark floor without holding the base state lock;
+    /// the callbacks can acquire the Pool lock, so reversing this order would deadlock renewal.
     RenewPayload prepareRenew() const override;
+
+    /// Encodes one complete mount body, combining the sequence assigned by the base slot with the
+    /// dynamic values returned by `prepareRenew`.
     String encodeBody(uint64_t seq_, const RenewPayload & payload) const override;
+
+    /// Adopts or claims the mount object for this `(server_uuid, writer_epoch)`, returning the token
+    /// from the durable write that the base slot must retain for its next token-guarded renewal.
     Token claim(const String & body) override;
+
+    /// Stamps the terminal, already-expired mount body and folds the watermark farewell into it;
+    /// the base state lock and `dead` flag prevent another renewal from racing this write.
     void terminate() override;
+
+    /// Refreshes the Pool's local write-fence deadline after a confirmed lease renewal.
     void onRenewSucceeded() override;
+
+    /// Latches the Pool's local write fence when renewal can no longer prove that this incarnation
+    /// owns the mount slot.
     void onRenewFailed() override;
+
+    /// Re-reads a failed renewal and classifies a GC fence of this incarnation separately from a
+    /// foreign writer; both outcomes remain terminal and fail closed.
     void onRenewMismatch(const String & mismatched_key) override;
-    /// Fix #37 phase 1: fence immediately only once our last CONFIRMED lease (the last successful
+    /// Fence immediately only once our last CONFIRMED lease (the last successful
     /// `claim`/renew) has reached its safety-margin boundary -- `confirmed_deadline_ms - now <=
     /// lease_safety_margin`. Until then the mount-lease protocol still guarantees exclusivity.
     bool shouldFenceOnTransientRenewFailure() override;
@@ -576,13 +593,10 @@ private:
 
 }
 
-// ===== Merged from CasStagingSweeper.h (merge #3): mount-scoped sweeper, bypasses Backend into IObjectStorage by design =====
 namespace DB::Cas
 {
 
-/// Mount-lease-scoped staging sweeper (S3-native staging plan
-/// `docs/superpowers/plans/2026-07-11-cas-s3-native-staging.md` Task 6; design
-/// `docs/superpowers/specs/2026-07-11-cas-s3-native-staging-design.md` §6 crash & orphan handling).
+/// Mount-lease-scoped staging sweeper for objects left behind by S3-native staging.
 ///
 /// A leaked S3 staging object happens two ways: (1) an exception between `promoteStaged` succeeding and
 /// `cleanupPendingTempFiles` deleting the staging key (`ContentAddressedTransaction.cpp`), or (2) an

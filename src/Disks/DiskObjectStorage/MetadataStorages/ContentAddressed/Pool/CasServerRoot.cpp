@@ -27,8 +27,9 @@ namespace ErrorCodes
 namespace DB::Cas
 {
 
-/// The owner/epoch/mount-lease wire codecs moved to Formats/CasServerRootFormats (codecs-v3 phase 2);
-/// only the mount-safety protocol logic (claim/allocate/keeper) lives here now.
+/// The owner, epoch, and mount-lease wire codecs are implemented in
+/// `Formats/CasServerRootFormats`; this file contains the mount-safety protocol logic that uses
+/// those codecs.
 
 namespace
 {
@@ -41,9 +42,9 @@ bool prefixHasAnyKey(Backend & b, const String & prefix)
 
 bool serverRootSubtreeEmpty(Backend & b, const Layout & l, const String & srid)
 {
-    /// All three subtrees that can ever hold this server root's data. Today only `roots/<srid>/`
-    /// is populated; Phase 1 relocates ref/manifest data under `cas/refs`/`cas/manifests`. List all
-    /// three so the precondition is correct once Phase 1 lands.
+    /// All three subtrees that can ever hold this server root's data: `roots/<srid>/` (verbatim
+    /// files), `cas/refs/<srid>/` (ref objects), and `cas/manifests/<srid>/` (part manifests). List
+    /// all three so an owner or epoch can never be re-created over data in any part of the subtree.
     if (prefixHasAnyKey(b, l.casRefsServerPrefix(srid)))
         return false;
     if (prefixHasAnyKey(b, l.casManifestsServerPrefix(srid)))
@@ -136,8 +137,7 @@ uint64_t allocateWriterEpoch(Backend & b, const Layout & l, const String & srid)
                     srid);
             /// Fresh empty root: reserve 0 as a sentinel (0 means "no epoch", UINT64_MAX is the
             /// retired sentinel), so the first epoch handed out is 1 — matching the random
-            /// `process_epoch` draw (CasPool.cpp re-draws on 0) and the TLA+ model (first
-            /// AllocEpoch makes epoch=1).
+            /// `process_epoch` draw (CasPool.cpp re-draws on 0): the first allocated epoch is 1.
             current.next_writer_epoch = 1;
         }
 
@@ -181,7 +181,7 @@ String describeMountHolder(const MountLease & m)
         u128ToHex(m.server_uuid), m.hostname, m.pid, m.writer_epoch, m.seq, m.expires_at_ms);
 }
 
-/// The mount-slot writer audit (the P1 "foreign writer" instrument): every mount-slot WRITE
+/// The mount-slot "foreign writer" audit instrument: every mount-slot WRITE
 /// (`MountClaim`/`MountRelease`) and every OBSERVED foreign/conflicting body (`MountConflict`)
 /// becomes one `system.content_addressed_log` row. `observed` is the CURRENT decoded body at the
 /// point of decision — for a conflict it carries the identity that made us refuse (holder_uuid/
@@ -247,8 +247,8 @@ MountClaimResult claimMount(
 
     /// Same uuid + same epoch: it is OUR OWN claim — but a FENCED body is terminal for this
     /// (uuid, epoch): the GC dropped its ack from the floor when it fenced. Refreshing it in place
-    /// would resurrect a fenced incarnation (TLA+ `FenceCostsEpoch` sabotage) — the caller must
-    /// re-open with a fresh writer_epoch instead ("a fence costs an epoch").
+    /// would resurrect a fenced incarnation — a fence permanently consumes this `(server_uuid,
+    /// writer_epoch)` pair, so the caller must re-open with a fresh `writer_epoch`.
     if (existing.writer_epoch == our_epoch)
     {
         if (existing.gc_fenced)
@@ -272,8 +272,7 @@ MountClaimResult claimMount(
     }
 
     /// Same uuid, DIFFERENT epoch: reclaim ONLY on a certificate of death that needs no fresh
-    /// wall-clock trust (rev.6 design §token-stability observation; TLA+ `ObservedReclaim` vs the
-    /// `WallClockReclaim` sabotage it replaces) — never by comparing `expires_at_ms` against `now_ms`:
+    /// wall-clock trust — never by comparing `expires_at_ms` against `now_ms`:
     ///   - `gc_fenced` → the fence-out is terminal for that incarnation by construction (its keeper's
     ///     every renewal fails the token guard forever, so it can never write again) — there is no
     ///     liveness left to wait for. This is what makes self-remount (and a fast restart after a
@@ -283,7 +282,7 @@ MountClaimResult claimMount(
     ///   - `proven_dead_token` matches the token we just read → the CALLER (`claimMountAwaitingExpiry`)
     ///     already watched this exact token hold stable for the full observation threshold on its own
     ///     clock; re-deriving that here from a bare wall-clock comparison would be exactly the
-    ///     cross-node trust rev.6 removes.
+    ///     cross-node trust would make a clock-skewed or delayed observer unsafe.
     /// Anything else → `LiveDoubleStart` (do NOT write): a same-uuid, different-epoch, not fenced, not
     /// clean-marked, not (yet) proven-dead lease may simply be a live twin, and `expires_at_ms` alone
     /// can never distinguish that from a dead predecessor across two different clocks.
@@ -312,7 +311,7 @@ MountClaimResult claimMount(
     emitMountEvent(sink, CasEventType::MountConflict, srid, "live_double_start", &existing,
         "same server_uuid, different writer_epoch, not fenced/clean/proven-dead — no wall-clock trust; "
         "the caller must run the token-stability observation wait before reclaiming");
-    /// fix-round F8: no write was attempted on this path -- `got->token` is exactly the CURRENT body's
+    /// No write was attempted on this path -- `got->token` is exactly the CURRENT body's
     /// token (what we just read is what's still there), so it is safe to hand back for the caller's
     /// observation loop to compare across polls without a redundant re-GET.
     return {.kind = MountClaimResult::LiveDoubleStart, .body = existing, .token = got->token};
@@ -367,12 +366,11 @@ MountClaimResult claimMountAwaitingExpiry(
     /// A zero poll interval would spin; a single-ms floor keeps the loop a real (bounded) wait.
     const uint64_t poll = poll_interval_ms == 0 ? 1 : poll_interval_ms;
 
-    /// Rate-bound observation threshold (design §token-stability observation; TLA+ `TTL + Drift`,
-    /// `CaCasMountCore.tla`'s `ObservedReclaim`): the full lease TTL, plus a 5% allowance for clock-rate
+    /// Rate-bound observation threshold: the full lease TTL, plus a 5% allowance for clock-rate
     /// mismatch between the holder's and our own local clock, plus one poll interval for observation
-    /// discreteness. Purely a function of OUR OWN clock (`mono_ms_fn`) — no cross-node wall-clock
-    /// comparison anywhere in this loop. fix-round F4: shared with `Gc`'s two call sites via
-    /// `mountObservationThresholdMs` -- see its doc comment.
+    /// discreteness. It is measured only with OUR OWN clock (`mono_ms_fn`); no cross-node wall-clock
+    /// comparison participates in this loop. The shared helper keeps the startup and GC thresholds
+    /// identical.
     const uint64_t threshold_ms = mountObservationThresholdMs(ttl_ms, poll);
 
     std::optional<Token> observed;
@@ -387,8 +385,7 @@ MountClaimResult claimMountAwaitingExpiry(
         if (r.kind != MountClaimResult::LiveDoubleStart)
             return r;
 
-        /// fix-round F8 (author-review: double GET per iteration -- `claimMount` already reads the
-        /// current body once and used to just discard its token). Reuse `r.token` whenever `claimMount`
+        /// `claimMount` already read the current body. Reuse `r.token` whenever `claimMount`
         /// set it (the common case: no write was attempted, so what it read is still current) instead of
         /// re-GETting the SAME key here. The rare stale-race branches deliberately leave `.token` unset
         /// (see their own comments), so this still falls back to a fresh read exactly there.
@@ -401,7 +398,7 @@ MountClaimResult claimMountAwaitingExpiry(
                 /// The slot vanished between claimMount's own GET and ours — normally self-resolving
                 /// within one more `claimMount` call (which re-mints fresh on an absent slot), but under
                 /// slot churn (something else concurrently removing/re-minting it) that resolution could
-                /// keep losing the same race. fix-round F5: pace this like every other iteration and
+                /// keep losing the same race. Pace this like every other iteration and
                 /// count it toward the SAME bounded restart budget the token-churn case below uses,
                 /// instead of spinning `get`/`claimMount`/`put` at backend RTT with no sleep and no bound
                 /// — a persistently vanishing slot is exactly as "alive and contended" as a persistently
@@ -440,7 +437,7 @@ HeartbeatFloor computeHeartbeatFloor(Backend & b, const Layout & l, uint64_t now
 {
     HeartbeatFloor floor;
 
-    /// fix-round F7 (author-review): `obs` is keyed by every srid this leader has EVER observed, but a
+    /// `obs` is keyed by every srid this leader has EVER observed, but a
     /// srid removed from the LIST entirely (its `/mount` key gone -- e.g. `SYSTEM CONTENT ADDRESSED
     /// DROP POOL MEMBER`) is never visited by the loop below again, so its entry would otherwise linger
     /// forever (~150-250 B/srid, worse on a long-lived leader across many decommissions). Track every
@@ -499,7 +496,7 @@ HeartbeatFloor computeHeartbeatFloor(Backend & b, const Layout & l, uint64_t now
                     break;
                 }
 
-                /// Observation-based liveness (rev.6 §token-stability observation): stable ONLY if the
+                /// Observation-based liveness: stable ONLY if the
                 /// SAME token was already being watched and has now held for the full threshold on our
                 /// OWN monotonic clock. Anything else — no prior observation, or a changed token (a
                 /// live renewal, including one raced against our own fence-out attempt below) —
@@ -537,7 +534,7 @@ HeartbeatFloor computeHeartbeatFloor(Backend & b, const Layout & l, uint64_t now
                     LOG_INFO(getLogger("CasHeartbeatFloor"),
                         "CAS GC fenced out mount lease for content-addressed server root {} at "
                         "wall-clock ms {}: its write token held unchanged for >= {} ms on the GC "
-                        "leader's own monotonic clock (rev.6 token-stability observation)",
+                        "leader's own monotonic clock (token-stability observation)",
                         srid, now_ms, stable_threshold_ms);
                     break;
                 }
@@ -551,7 +548,7 @@ HeartbeatFloor computeHeartbeatFloor(Backend & b, const Layout & l, uint64_t now
         cursor = page.next_cursor;
     }
 
-    /// fix-round F7: prune every `obs` entry for a srid this pass's LIST never saw at all.
+    /// Prune every `obs` entry for a srid this pass's LIST never saw at all.
     for (auto it = obs.begin(); it != obs.end(); )
         it = seen_srids.count(it->first) ? std::next(it) : obs.erase(it);
 
@@ -691,7 +688,7 @@ SingleWriterSlot::Token MountLeaseKeeper::claim(const String & body)
             "CAS mount-lease: key '{}' vanished between head and get while claiming", key);
     const MountLease observed = decodeMountLease(got->bytes);
 
-    /// Foreign uuid → fail closed (no cross-UUID takeover, ever). The P1 payload: the CURRENT decoded
+    /// Foreign uuid → fail closed (no cross-UUID takeover, ever). The audit payload: the CURRENT decoded
     /// body's identity is exactly WHO touched the slot.
     if (observed.server_uuid != server_uuid)
     {
@@ -716,7 +713,7 @@ SingleWriterSlot::Token MountLeaseKeeper::claim(const String & body)
 
     /// Same (uuid, epoch) but FENCED: the GC fenced our fresh lease before we adopted it (the
     /// lease expired mid-open — e.g. a slow first beat). Terminal for THIS epoch; the open path
-    /// recovers by allocating a fresh writer_epoch and re-claiming (TLA+ `NoPermanentWedge`).
+    /// recovers by allocating a fresh `writer_epoch` and re-claiming.
     if (observed.gc_fenced)
     {
         emitMountEvent(event_sink, CasEventType::MountConflict, srid, "fenced_by_gc", &observed,
@@ -733,7 +730,8 @@ SingleWriterSlot::Token MountLeaseKeeper::claim(const String & body)
     if (res.outcome != PutOutcome::Done)
     {
         /// The slot moved between our GET and PUT. Diagnose by the CURRENT body, not the token
-        /// (2026-07-06 root cause: the only same-(uuid,epoch)-preserving toucher is the GC fence).
+        /// The current body is the useful diagnostic: a GC fence is the only same-(uuid, epoch)-preserving
+        /// touch that can normally occur during adoption.
         const auto reread = backend->get(key);
         if (reread)
         {
@@ -765,7 +763,7 @@ SingleWriterSlot::Token MountLeaseKeeper::claim(const String & body)
 void MountLeaseKeeper::onRenewSucceeded()
 {
     /// A successful background renew extended the durable lease. Refresh OUR OWN confirmed-deadline
-    /// bookkeeping (fix #37 phase 1) as well as the local write-fence deadline (the Pool translates this
+    /// bookkeeping as well as the local write-fence deadline (the Pool translates this
     /// to `steady_clock::now() + ttl`, monotonic). No S3 read either way.
     refreshConfirmedDeadline();
     if (on_renew_ok)
@@ -873,7 +871,6 @@ void MountLeaseKeeper::terminate()
 
 }
 
-// ===== Merged from CasSingleWriterSlot.cpp (merge #3) =====
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
 
@@ -902,8 +899,7 @@ SingleWriterSlot::SingleWriterSlot(
 SingleWriterSlot::~SingleWriterSlot()
 {
     /// Stop the renewal thread only — deliberately NO terminal op. Destruction without a terminal op
-    /// is the crash path: the slot object persists, its seq stops advancing, and full GC observes the
-    /// frozen seq.
+    /// leaves the slot object persisted with a frozen seq, which full GC observes as stale state.
     stopBackground();
 }
 
@@ -978,7 +974,7 @@ void SingleWriterSlot::doTerminate()
         /// it are quiet no-ops, and — unlike the genuinely-started path below — we do NOT set `dead`,
         /// so a second no-op call takes this same early-return rather than tripping the "double
         /// terminate" throw below. Throwing here only turned an already-failing teardown into extra
-        /// `LOGICAL_ERROR` noise (2026-07-06 S13 post-mortem).
+        /// `LOGICAL_ERROR` noise during teardown.
         return;
     if (dead)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS {}: double {} on key '{}'", slot_name, terminal_verb, key);
@@ -1028,7 +1024,7 @@ void SingleWriterSlot::backgroundLoop(std::chrono::milliseconds period)
     /// lease deadline has neared, stops the loop for good: lastRenewTime (and the slot's seq) stop
     /// advancing and GC observes the frozen seq. No retry, no re-mint. A TRANSIENT failure while the
     /// deadline is still safely away keeps the loop alive -- the mount-lease protocol guarantees no
-    /// other writer can claim the slot before that deadline, so retrying is safe (fix #37 phase 1).
+    /// other writer can claim the slot before that deadline, so retrying is safe.
     std::unique_lock lock(background_mutex);
     while (!stop_requested)
     {
@@ -1071,7 +1067,6 @@ void SingleWriterSlot::backgroundLoop(std::chrono::milliseconds period)
 
 }
 
-// ===== Merged from CasStagingSweeper.cpp (merge #3) =====
 #include <Common/logger_useful.h>
 
 namespace DB::Cas

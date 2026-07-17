@@ -19,12 +19,11 @@ namespace
 /// decommission claim (`Pool::openForDecommission`), so nothing should be racing these deletes, and a
 /// plain exact-token delete of every listed object is race-free.
 ///
-/// Fail-close (spec §core "Fail-close", plan Global Constraints): a per-object failure -- a thrown
-/// exception (a transient backend hiccup) or a `TokenMismatch`/`NotFound`/vanished-before-HEAD delete
-/// outcome -- is recorded as a WARNING and the sweep continues to the next object. This is the ONLY
-/// tolerated-and-continue class in the whole feature; the caller keeps the pool slot on any non-empty
-/// `DecommissionReport::warnings` (Task 4) so a re-run drains whatever this pass left behind, rather
-/// than reporting a clean drain that never happened. Returns the count actually deleted.
+/// A per-object failure — a backend exception, a `TokenMismatch` or `NotFound` outcome, or an object
+/// disappearing between `LIST` and `HEAD` — is recorded as a warning and does not prevent the remaining
+/// objects from being attempted. The caller keeps the pool slot whenever warnings are present, so the
+/// terminated slot remains available as a resume anchor instead of being deleted after an unconfirmed
+/// drain. Returns only the objects whose exact-token delete was reported as `Deleted`.
 uint64_t deleteListedPrefix(Backend & backend, const String & prefix, std::vector<String> & warnings)
 {
     uint64_t deleted = 0;
@@ -83,9 +82,9 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
         e.detail = {{"srid", victim_srid}};
     });
 
-    /// Phase: namespace erasure. `listNamespaces` unions `cas/refs/` and `roots/`; only entries with a
-    /// present ref-object prefix are droppable tables -- a roots-only entry is mountpoint debris handled
-    /// by the roots sweep (Task 3).
+    /// `listNamespaces` includes names discovered under both `cas/refs/` and `roots/`. A name is a
+    /// droppable table only when its refs prefix is present; roots-only names are loose mountpoint debris
+    /// and must be left for the roots sweep below.
     for (const String & ns_str : admin->listNamespaces(victim_srid))
     {
         const RootNamespace ns(ns_str);
@@ -96,7 +95,7 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
         }
         const auto ref_objects = admin->backend().list(admin->layout().refsNamespacePrefix(ns), /*cursor=*/"", /*limit=*/1);
         if (ref_objects.keys.empty())
-            continue;   /// not a table (roots-only listing entry)
+            continue;   /// A roots-only listing entry is not a table namespace.
 
         const auto stats = admin->dropNamespace(ns);
         ++report.namespaces_removed;
@@ -115,15 +114,15 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
         });
     }
 
-    /// Phase: manifest-debris drain. MUST precede any future slot deletion (Task 4): deleting the mount
-    /// body would destroy the watermark authority (`floorForNamespace` -> nullopt -> "not eligible") and
-    /// strand this debris forever (spec §core step 4). We are the epoch authority here -- every
-    /// old-epoch build prefix is eligible (`prefix.writer_epoch < w.writer_epoch`,
-    /// `CasOrphanManifestSweep.cpp`), so a scoped sweep over the victim's `cas/manifests/` build
-    /// prefixes removes the rest by exact token.
+    /// Manifest debris must be removed before the mount slot: deleting the mount body removes the
+    /// watermark authority, after which `floorForNamespace` returns no value and the ordinary orphan
+    /// sweep cannot prove that old-epoch debris is eligible. The decommission claim has advanced the
+    /// writer epoch, so every build prefix with `prefix.writer_epoch < w.writer_epoch` is eligible here.
+    /// Group the listed keys by namespace and build prefix so each group can use the exact-token orphan
+    /// sweep while the mount body still supplies its authority.
     {
         const String debris_prefix = admin->layout().casManifestsPrefix() + victim_srid;
-        std::set<std::tuple<String, uint64_t, uint64_t>> groups;   /// (namespace, writer_epoch, build_sequence)
+        std::set<std::tuple<String, uint64_t, uint64_t>> groups;   /// (namespace, writer epoch, build sequence)
         forEachListedKey(admin->backend(), debris_prefix, [&](const ListedKey & listed)
         {
             if (const auto parsed = admin->layout().parseManifestKey(listed.key))
@@ -134,37 +133,33 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
                 *admin, RootNamespace(ns_str), BuildPrefix{writer_epoch, build_sequence}, &report.warnings);
     }
 
-    /// Phase: staging sweep. The victim's own `<pool_prefix>/staging/<srid>/` area -- the same prefix
-    /// `sweepOwnMountStaging` (`CasStagingSweeper.h`) owns for a live mount's own leaked debris. That
-    /// helper takes an `IObjectStorage`, unavailable at this `Backend`-only layer, so this drains the
-    /// same prefix directly.
+    /// Drain the victim's own `<pool_prefix>/staging/<srid>/` area. The live-mount staging helper uses
+    /// an `IObjectStorage`, while this command intentionally works at the `Backend` layer, so the same
+    /// prefix is listed and deleted directly. The claim fences the victim's writers during this sweep.
     report.staging_objects_removed += deleteListedPrefix(
         admin->backend(), admin->poolConfig().pool_prefix + "/staging/" + victim_srid + "/", report.warnings);
 
-    /// Phase: roots sweep. The victim's mountpoint objects (`Layout::serverRootDataPrefix`,
-    /// `mountpointObjectKey`, `CasLayout.h`) -- loose, non-content-addressed files with no epoch of
-    /// their own, but the victim's writers are fenced by the claim, so no write can race the sweep.
+    /// Drain the victim's mountpoint objects. These are loose, non-content-addressed files under
+    /// `Layout::serverRootDataPrefix`; they have no writer epoch of their own, so the claim is what
+    /// prevents a returning victim from racing this deletion.
     report.mountpoint_objects_removed += deleteListedPrefix(
         admin->backend(), admin->layout().serverRootDataPrefix(victim_srid), report.warnings);
 
-    /// Phase: slot retirement -- STRICTLY LAST, and only over a clean drain (fail-close: an unconfirmed
-    /// drain keeps the resume anchor; the operator re-runs). `layout`/`pool_backend` are copied out
-    /// BEFORE `admin.reset()` below -- `admin` (and the `Pool` it owns) is gone the instant the
-    /// graceful close runs, so nothing after that point may dereference it. `Layout` is a cheap value
-    /// type (one `String`); `poolBackendPtr()` shares ownership of the backend so it outlives the Pool.
+    /// Retire the slot strictly last and only after a clean drain. Copy the layout and shared backend
+    /// before `admin.reset()`: graceful close destroys the `Pool`, while the backend must remain alive to
+    /// delete the slot objects afterwards.
     const Layout layout = admin->layout();
     const BackendPtr pool_backend = admin->poolBackendPtr();
     if (report.warnings.empty())
     {
-        /// Graceful close of the admin store: `Pool::~Pool`'s mount-lease keeper stamps the lease
-        /// already-expired and folds in the watermark farewell (`min_active = UINT64_MAX`) -- the
-        /// `terminated` state (`CasServerRoot.cpp`).
+        /// Graceful close stamps an already-expired lease and the watermark farewell
+        /// (`min_active = UINT64_MAX`), making the slot `terminated` before its control objects are
+        /// removed.
         admin.reset();
 
-        /// Delete the control objects; the mount body LAST -- it is the claim/resume anchor, so a crash
-        /// between deletes must never leave an owner/epoch-less but still-mounted slot, only a
-        /// still-claimable one. A per-key failure here is itself a drain-incomplete signal: record it
-        /// and stop (the remaining keys, including the mount, survive so a re-run can retry).
+        /// Delete epoch and owner before the mount body. The mount body is the claim/resume anchor: a
+        /// failure between deletes must leave a still-claimable slot, never an owner/epoch-less mounted
+        /// slot. Stop after the first failure so the remaining keys, including the mount, survive retry.
         const std::vector<String> slot_keys = {layout.epochKey(victim_srid), layout.ownerKey(victim_srid),
                                                 layout.mountKey(victim_srid)};
         bool all_deleted = true;
@@ -181,7 +176,7 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
                     report.warnings.push_back("slot delete failed: " + key + ": "
                                               + getCurrentExceptionMessage(/*with_stacktrace=*/false));
                     all_deleted = false;
-                    break;   /// keep the remaining keys — mount survives ⇒ resume works
+                    break;   /// Keep the remaining keys, including the mount, so a rerun can resume.
                 }
             }
         }
@@ -193,7 +188,7 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
         LOG_WARNING(getLogger("CasDecommission"),
             "CAS decommission '{}': drain incomplete ({} warnings) — mount slot kept (terminated); "
             "re-run the command to finish", victim_srid, report.warnings.size());
-        admin.reset();   /// graceful close still stamps the farewell — the slot reads `terminated`
+        admin.reset();   /// Graceful close still stamps the farewell, leaving the slot `terminated`.
     }
 
     /// The `end` event is emitted via `sink` directly, not `EventEmitter{*admin}`: `admin` is gone by

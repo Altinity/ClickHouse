@@ -27,20 +27,19 @@ namespace DB::Cas
 namespace
 {
 
-/// §0 introspection: the `on_page_fetched` hook this file's own GC-owned enumeration passes to
-/// `forEachListedKey`/`recoverRefTable` -- one increment per physical LIST page, never per listed key.
+/// Hook used by this file's GC-owned enumeration calls to `forEachListedKey` and `recoverRefTable`.
+/// It increments once per physical LIST page, never once per listed key.
 void onGcEnumerationPage()
 {
     ProfileEvents::increment(ProfileEvents::CasGcEnumerationPages);
 }
 
-/// The build-watermark floor now rides the per-server mount lease (ack-floor merge, spec 2026-07-02).
-/// A namespace is rooted by `server_root_id`, but that id is a clean relative path and can contain
-/// slashes. Try namespace prefixes from longest to shortest and accept the first durable mount body.
-/// No mount => no authority => fail open / not eligible. On the writable path the mount's
-/// `writer_epoch` is the same durable value the old watermark's `epoch` carried (CasPool.cpp "THE
-/// BRIDGE"), so `{writer_epoch, min_active}` are consumed exactly where `ServerWatermark::{epoch,
-/// min_active}` were.
+/// The durable build floor is stored in the per-server mount lease together with the writer epoch. A
+/// namespace is rooted by `server_root_id`, but that id is a clean relative path and can contain slashes.
+/// Try namespace prefixes from longest to shortest and accept the first durable mount body. Without a
+/// mount there is no deletion authority, so the caller must leave the prefix untouched. The mount's
+/// `writer_epoch` and `min_active` are the single durable epoch/floor pair used for eligibility, including
+/// across process replacement and the retired sentinel.
 std::optional<MountLease> floorForNamespace(Pool & store, const RootNamespace & ns)
 {
     const String & value = ns.string();
@@ -70,9 +69,9 @@ struct ListedManifestObject
     String key;
 };
 
-/// Delegates to the one shared `Layout::parseManifestKey` (spec §Manifest Identifier canonical hex
-/// form) instead of hand-rolling a second parser -- see also `CasFsck.cpp`'s `parseBuildPrefix`, which
-/// now routes through the same function.
+/// Delegates to the shared `Layout::parseManifestKey`, which validates the canonical manifest-key
+/// encoding. Keeping parsing in `Layout` avoids a second interpretation of the manifest path and ensures
+/// the sweep and filesystem checker derive the same namespace and build identity.
 std::optional<ListedManifestObject> parseListedManifestObject(const Layout & layout, const String & key)
 {
     const auto parsed = layout.parseManifestKey(key);
@@ -85,10 +84,10 @@ std::optional<ListedManifestObject> parseListedManifestObject(const Layout & lay
         .key = key};
 }
 
-/// The table's durable `last_folded_ref_id` (spec §Orphan Manifest Protection), read from the adopted
-/// fold seal at `(snap_generation, snap_attempt)`; {0,0} when no seal covers it yet (fresh pool). A
-/// manifest removed by a log ABOVE this cursor has NOT had its `-1` decrement folded, so its body is still
-/// load-bearing (delete-after-sealed-decrements).
+/// Reads the table's durable `last_folded_ref_id` from the adopted fold seal at
+/// `(snap_generation, snap_attempt)`. `{0, 0}` means that no seal covers the table yet, as for a fresh
+/// pool. A manifest removed by a log above this cursor has not had its `-1` decrement folded, so its body
+/// remains load-bearing until the fold catches up.
 RefTxnId sealedRefCursor(Pool & store, const RootNamespace & ns)
 {
     const Layout & layout = store.layout();
@@ -106,26 +105,18 @@ RefTxnId sealedRefCursor(Pool & store, const RootNamespace & ns)
     return RefTxnId{};
 }
 
-/// rev.6 Task 12 (spec §anomaly-policy): a listed `_log` id strictly above the recovered seal's
-/// `sealed_from` and at-or-below the seal's own `snapshot_id` provably materialized AFTER the
-/// recovery `LIST` that produced the seal -- a T_mat violation. This is LIST-only classification
-/// (the id alone, from the key); it never GETs the log body, so it never risks treating the log's
-/// operations as legitimate state (the resurrect invariant). Report via `LOG_WARNING` + one
-/// `RefLateLogDetected` event; the sweep never deletes the log itself -- GC's ordinary covered-log
-/// cleanup (`planRefCleanup`) removes it once folding catches up.
+/// A listed `_log` id strictly above the recovered seal's `sealed_from` and at or below the seal's own
+/// `snapshot_id` was materialized after the recovery `LIST` that produced the seal. This is a LIST-only
+/// classification: the id from the key is enough, so the detector never GETs the log body and cannot
+/// accidentally treat its operations as legitimate state. It reports a warning and one
+/// `RefLateLogDetected` event; ordinary covered-log cleanup removes the log once folding catches up.
 ///
-/// fix-round F1 (author-review: "seal skipped on an empty dead-region ... detector blind in that
-/// hole"): when the dead region a recovery observed was EMPTY (`dead_region_nonempty` false in
-/// `ensureRefTableRecovered`), no seal is published at all -- `recovered.sealed_from` stays nullopt,
-/// and the branch above never fires, even for the exact failure the seal exists to catch (the
-/// namespace's first-ever txn in flight at crash, materializing only after the recovery LIST). There
-/// is no PER-NAMESPACE durable trace to detect this from cold storage (nothing was ever published),
-/// so the general cross-process case stays a documented carve-out -- same footing as the Removed
-/// carve-out (a namespace-removal snapshot that is also not a "seal" by this same field). What CAN be
-/// caught cheaply, with zero risk of a false positive, is the narrow case where the very same Pool
-/// that lived through the unclean reclaim is also the one running this check (`Pool::
-/// ownsAndSawUncleanBoundaryFor`): a listed log strictly below its own live epoch, with no snapshot
-/// at all to explain its presence, is then unambiguous.
+/// Recovery may observe an empty dead region and publish no seal. There is then no per-namespace durable
+/// trace that can prove, after a process change, that a later dead-epoch log materialized after recovery's
+/// `LIST`; this cross-process case remains intentionally undetectable here. The same `Pool` instance can
+/// nevertheless identify the narrow safe case: if it recorded the unclean reclaim, has no snapshot at all,
+/// and lists a log from an epoch below its current epoch, that log is unambiguously late. The detector
+/// reports this case without reading or reviving the log.
 void reportLateLogsIfAny(Pool & store, const RootNamespace & ns, const RecoveredRefTable & recovered,
                           const std::vector<RefTxnId> & logs, LateLogDedup * dedup)
 {
@@ -139,9 +130,8 @@ void reportLateLogsIfAny(Pool & store, const RootNamespace & ns, const Recovered
                 continue;   /// id <= sealed_from: within the observed region, ordinary
             if (recovered.newest_snapshot_id && *recovered.newest_snapshot_id < id)
                 continue;   /// id > the seal: not (yet) covered by it -- not provably late
-            /// fix-round F9: skip a repeat report of the SAME (namespace, log id) anomaly -- see
-            /// `LateLogDedup`'s doc comment. `dedup == nullptr` (every pre-existing caller) preserves
-            /// the original always-report behaviour exactly.
+            /// The optional leader-owned latch prevents the same durable anomaly from being emitted on
+            /// every sweep pass while ordinary covered-log cleanup is still catching up.
             if (dedup && !dedup->insert({ns.string(), renderRefTxnId(id)}).second)
                 continue;
 
@@ -177,7 +167,7 @@ void reportLateLogsIfAny(Pool & store, const RootNamespace & ns, const Recovered
     {
         if (id.writer_epoch >= my_epoch)
             continue;   /// not from a dead epoch relative to THIS incarnation
-        /// fix-round F9: same dedup latch as the seal-based branch above.
+        /// Apply the same optional leader-owned suppression as in the seal-based branch.
         if (dedup && !dedup->insert({ns.string(), renderRefTxnId(id)}).second)
             continue;
 
@@ -204,7 +194,7 @@ void reportLateLogsIfAny(Pool & store, const RootNamespace & ns, const Recovered
     }
 }
 
-/// The active manifest-object-KEY set for one namespace (spec §Orphan Manifest Protection), built as the
+/// The active manifest-object-key set for one namespace, built as the
 /// same complete view writer recovery uses:
 ///   owners in the newest snapshot + owner changes in every later log (== `recoverRefTable`'s committed
 ///   rows and live precommits) + manifests removed anywhere in the tail above the durable
@@ -261,8 +251,9 @@ std::set<String> activeManifestKeys(Pool & store, const RootNamespace & ns, Late
 
 bool prefixEligible(Pool & store, const RootNamespace & ns, const BuildPrefix & prefix)
 {
-    /// OQ6: durable watermark fact only. A missing watermark => NOT eligible (control #9: never a
-    /// frozen-seq / judged-dead guess). Compare writer_epoch first, then build_sequence, so old-epoch
+    /// Eligibility comes only from the durable mount-lease floor. A missing floor means NOT eligible;
+    /// do not replace that authority check with a frozen-sequence or judged-dead guess. Compare
+    /// `writer_epoch` first, then `build_sequence`, so old-epoch
     /// debris drains after a process restart even when its build_sequence is above the current min_active.
     const auto floor = floorForNamespace(store, ns);
     if (!floor)
@@ -287,14 +278,14 @@ uint64_t sweepNamespace(Pool & store, const RootNamespace & ns, const BuildPrefi
     const Layout & layout = store.layout();
     Backend & backend = store.backend();
 
-    /// Build the protection view. A corrupt snapshot / invalid transaction throws (spec §Orphan Manifest
-    /// Protection: "a missing snapshot body, invalid transaction, or incomplete ordered view causes the
-    /// sweep to skip deletion and surface the error. It never substitutes an empty owner set."). Skip this
-    /// namespace's deletions on such a throw rather than deleting against a wrong (empty) view. When a
+    /// Build the protection view. A missing snapshot body, an invalid transaction, or an incomplete
+    /// ordered view throws, causing the sweep to skip deletion and surface the error; it never substitutes
+    /// an empty owner set. Skip this namespace's deletions on such a throw rather than deleting against a
+    /// wrong (empty) view. When a
     /// caller opted in (`warnings != nullptr`), this "cannot confirm emptiness" also lands in `*warnings`
     /// -- not just the log -- so a decommission run does not silently report a clean drain that never
-    /// happened (spec §core "Fail-close"; the log-only default stays exactly as before for every other
-    /// caller, which treats this the same way the periodic sweep always has: skip and retry next round).
+    /// happened; the log-only default stays exactly as before for every other caller, which treats this
+    /// the same way the periodic sweep always has: skip and retry next round.
     std::set<String> active;
     try
     {
@@ -311,8 +302,8 @@ uint64_t sweepNamespace(Pool & store, const RootNamespace & ns, const BuildPrefi
         return 0;
     }
 
-    /// Enumerate the ONE build prefix: cas/manifests/<ns>/<epoch-hex>-<seq-hex>/ (spec §Manifest
-    /// Identifier canonical hex form -- same rendering `Layout::manifestKey` uses).
+    /// Enumerate the ONE build prefix: cas/manifests/<ns>/<epoch-hex>-<seq-hex>/ in the canonical
+    /// hexadecimal form -- the same rendering `Layout::manifestKey` uses.
     const String prefix_key = layout.manifestNamespacePrefix(ns)
         + renderRefTxnId(RefTxnId{prefix.writer_epoch, prefix.build_sequence}) + "/";
 
@@ -320,7 +311,7 @@ uint64_t sweepNamespace(Pool & store, const RootNamespace & ns, const BuildPrefi
     forEachListedKey(backend, prefix_key, [&](const ListedKey & listed)
     {
         if (active.count(listed.key))
-            return;   /// owned by a committed/precommit owner — never sweep (control #8)
+            return;   /// owned by a committed or precommit owner — never sweep
 
         /// Exact-token delete: HEAD for the current token, then deleteExact. A 404 between HEAD and
         /// delete (or a TokenMismatch — a fresh owner reclaimed it) is tolerated (record-and-continue),
@@ -363,8 +354,8 @@ ManifestSweepResult sweepManifestCursorPage(
     Backend & backend = store.backend();
     const Layout & layout = store.layout();
     const ListPage page = backend.list(layout.casManifestsPrefix(), cursor, list_budget);
-    /// §0 introspection: this pass fetches exactly one page per round (the cursor advances ACROSS
-    /// rounds, not within this call) — one increment per call, not per listed key.
+    /// This pass fetches exactly one page per round (the cursor advances across rounds, not within this
+    /// call), so the metric increments once per call, not once per listed key.
     ProfileEvents::increment(ProfileEvents::CasGcEnumerationPages);
 
     std::map<String, bool> eligible_by_prefix;
@@ -401,8 +392,8 @@ ManifestSweepResult sweepManifestCursorPage(
         auto [active_it, inserted] = active_by_ns.emplace(parsed->ns.string(), std::set<String>{});
         if (inserted)
         {
-            /// A corrupt snapshot / invalid transaction throws (spec §Orphan Manifest Protection): skip the
-            /// namespace's deletions and surface the error, never substitute an empty owner set.
+            /// A corrupt snapshot or invalid transaction means the protection view is unavailable. Skip
+            /// this namespace's deletions and surface the error; never substitute an empty owner set.
             try
             {
                 active_it->second = activeManifestKeys(store, parsed->ns, dedup);
@@ -447,10 +438,9 @@ ManifestSweepResult sweepManifestCursorPage(
         else
             ++result.skipped;
 
-        /// INTROSPECTION-3 (2026-07-10): EVERY manifest-body deletion must leave an audit row. The sweep
-        /// silently deleting bodies was the blocker in diagnosing the GC-WEDGE (a live committed body
-        /// vanished with no trace). object_hash is the full raw key (namespace-qualified — no cross-ns
-        /// manifest-ref-string collision, the other diagnosis pitfall).
+        /// Every manifest-body deletion emits an audit row. The full raw key is used as `object_hash`, so
+        /// namespace-qualified keys cannot collide when different namespaces use the same manifest-ref
+        /// string.
         EventEmitter{store}.emit([&](CasEvent & e)
         {
             e.type = CasEventType::ManifestDelete;

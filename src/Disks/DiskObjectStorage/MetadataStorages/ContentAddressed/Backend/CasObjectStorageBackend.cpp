@@ -39,13 +39,11 @@ namespace DB::Cas
 {
 
 #if USE_AWS_S3
-/// See the declaration in CasObjectStorageBackend.h: `ShouldRetry` always refuses, so the AWS SDK's
-/// OWN internal retry loop (which consults THIS object, not the POD `retry_strategy.max_retries`
-/// field — that only bounds Client's ClickHouse-side network-exception wrapper) can never issue a
-/// second attempt either. Every consultation is counted: it proves the SDK believed the first attempt
-/// was inconclusive or failed, which is exactly the signal CasConditionalWriteSdkRetries exists to
-/// catch (RFC §observability) — without this the counter would be permanently and vacuously zero,
-/// since nothing would ever call it.
+/// `ShouldRetry` is the AWS SDK's polymorphic retry decision. It must refuse a second HTTP attempt;
+/// changing the POD `retry_strategy.max_retries` alone would only bound the ClickHouse-side wrapper,
+/// not this SDK loop. Every consultation is counted because it proves that the SDK considered the
+/// first attempt inconclusive or failed; otherwise the retry-consultation metric would remain zero
+/// even when the SDK reached this decision point.
 bool detail::SingleAttemptRetryStrategy::ShouldRetry(const Aws::Client::AWSError<Aws::Client::CoreErrors> &, long) const
 {
     recordConditionalWriteSdkRetryConsidered();
@@ -54,9 +52,9 @@ bool detail::SingleAttemptRetryStrategy::ShouldRetry(const Aws::Client::AWSError
 
 long detail::SingleAttemptRetryStrategy::CalculateDelayBeforeNextRetry(const Aws::Client::AWSError<Aws::Client::CoreErrors> &, long) const
 {
-    /// IS reached: AWSClient's retry loop calls this BEFORE ShouldRetry on every failed attempt (to
-    /// have a backoff ready in case ShouldRetry says yes), not after. Harmless here regardless: 0 is
-    /// never acted on as an actual sleep, since ShouldRetry (called right after) always refuses.
+    /// AWSClient prepares the delay before calling `ShouldRetry`, so this method is reached even
+    /// though no retry will be made. Returning zero avoids needless backoff computation; it is never
+    /// used as a sleep because `ShouldRetry` immediately refuses the attempt.
     return 0;
 }
 #endif
@@ -71,11 +69,11 @@ ObjectStorageBackend::ObjectStorageBackend(ObjectStoragePtr object_storage_, Mod
         native_token_type = TokenType::Generation;
 
 #if USE_AWS_S3
-    /// Build the single-attempt conditional-write client ONCE (RFC cas-s3-timeout-retry-control
-    /// §disable-transparent-conditional-write-retries). `tryGetS3StorageClient` returns null for a
-    /// non-S3 object storage (EmulatedSingleProcess/local tests) — conditionalWriteSettings then
-    /// leaves the client override unset and Native conditional writes keep the disk's own retry
-    /// policy, same as before this change.
+    /// Build the single-attempt conditional-write client once. `tryGetS3StorageClient`
+    /// returns null for non-S3 storage used by local tests; in that case `conditionalWriteSettings`
+    /// leaves the client override unset so the object-storage adapter remains constructible for
+    /// isolated tests. Writable Native mounts reject that configuration in the explicit capability
+    /// check instead of silently relying on transparent retries.
     ///
     /// Both retry knobs must be overridden: `retry_strategy.max_retries` (the POD struct) only bounds
     /// this Client's OWN network-exception wrapper loop (Client::doRequestWithRetryNetworkErrors); the
@@ -91,13 +89,11 @@ ObjectStorageBackend::ObjectStorageBackend(ObjectStoragePtr object_storage_, Mod
             cfg.retry_strategy.max_retries = 0;
             cfg.retryStrategy = std::make_shared<detail::SingleAttemptRetryStrategy>();
 
-            /// Enable `Expect: 100-continue` for CAS conditional writes on THIS client (B118). The
-            /// shared default is 0 = disabled (so non-CAS S3 traffic keeps upstream behaviour), so we
-            /// raise it here — the single-attempt client is the choke point every CAS conditional write
-            /// routes through (conditionalWriteSettings → s3_client_override). We respect an operator's
-            /// per-disk `expect_continue_min_bytes` (e.g. RustFS pools set 65536, inherited via `cfg`);
-            /// when the disk did not configure one, fall back to the historical 1 MiB gate so an
-            /// unconfigured CAS pool keeps exactly its prior behaviour.
+            /// Enable `Expect: 100-continue` only on this CAS client. A server can reject an
+            /// `If-Match` or `If-None-Match` request before accepting its body, so waiting for the
+            /// 100 response avoids uploading a large body that cannot commit; keeping the override
+            /// request-scoped leaves unrelated S3 traffic unchanged. Respect the disk's configured
+            /// `expect_continue_min_bytes`; if it is unset, retain the established 1 MiB threshold.
             static constexpr uint64_t kCasFallbackExpectContinueMinBytes = 1024 * 1024;
             if (cfg.expect_continue_min_bytes == 0)
                 cfg.expect_continue_min_bytes = kCasFallbackExpectContinueMinBytes;
@@ -204,9 +200,9 @@ std::optional<HeadResult> ObjectStorageBackend::nativeHead(const String & key)
 /// typed enum code (and no name), so the enum is matched as well as the name. The mapping is fail-safe in
 /// direction: a misread error becomes a retryable PreconditionFailed/Conflict, never a false success.
 ///
-/// HONEST NOTE: the Native conditional-write paths are exercised end-to-end only at M-W against
-/// RustFS; unit coverage is the Emulated mode, the typed-catch compile path, and the classifier
-/// itself (CasS3Signal in gtest_cas_backend.cpp — hence the detail:: exposure in the header).
+/// Native conditional writes require an S3-compatible integration environment for end-to-end
+/// coverage. Unit tests cover the emulated semantics, the typed exception path, and this classifier
+/// through the test-only `detail` declaration.
 #if USE_AWS_S3
 PutOutcome detail::finalizeConditionalWrite(WriteBuffer & buf)
 {
@@ -238,13 +234,10 @@ static PutOutcome finalizeConditionalWrite(WriteBuffer & buf)
 #endif
 }
 
-/// Instrumented wrapper shared by nativeConditionalPut and NativeStreamingSink::finalize: adds the RFC
-/// cas-s3-timeout-retry-control attempt/outcome counters around the SAME single finalize() call
-/// finalizeConditionalWrite already makes, WITHOUT changing the legacy Done/PreconditionFailed-or-
-/// rethrow contract every caller still depends on. finalizeConditionalWrite resolves a lost
-/// precondition WITHOUT throwing, so that case is counted directly as Unresolved (never Committed,
-/// never a false DefiniteFailure) rather than through the exception-classifying overload. Task 5's
-/// CasRequestController replaces this call site, consuming the full CasWriteOutcome range directly.
+/// Instrument the same single `finalize` call used by both Native write paths without changing their
+/// `Done`/`PreconditionFailed`-or-rethrow contract. A classified precondition loss is `Unresolved`,
+/// not `Committed` or a definite exception, because the response does not prove who created or
+/// replaced the object; the higher-level request controller may then resolve it with exact-key state.
 static PutOutcome finalizeConditionalWriteInstrumented(WriteBuffer & buf)
 {
     recordConditionalWriteAttemptStarted();
@@ -421,8 +414,9 @@ static bool isObjectNotFound(const std::exception & e)
 }
 
 /// Read `range` of the object at `path` as a TRUE ranged read: seek to the offset and bound the
-/// read window (spec 2026-07-02 snapshot-streaming §Backend seam). Never read-whole-then-substr —
-/// the snapshot runs this serves are GBs at scale and the caller's memory budget is O(block).
+/// read window. Seek the storage buffer to the requested offset and bound the returned bytes instead
+/// of reading a whole snapshot run and slicing it afterward; snapshot runs can be gigabytes at scale,
+/// while the caller's memory budget is O(block).
 static String readObjectRanged(IObjectStorage & object_storage, const String & path, Range range,
                                uint64_t known_size = 0)
 {
@@ -435,11 +429,12 @@ static String readObjectRanged(IObjectStorage & object_storage, const String & p
         return content;
     }
 
-    /// Clamp exactly like the old substr path: an offset at or past EOF yields an empty result.
+    /// An offset at or past EOF yields an empty result, matching the range contract of the previous
+    /// whole-read implementation.
     /// `seek` past the object size may throw depending on the storage, so fail-close the window
     /// against the known size before touching the buffer position.
-    /// M1 (final review): callers on the Native path already HEAD'ed the key — threading that size
-    /// here saves one metadata round-trip per ranged read against real S3. 0 = unknown, fetch.
+    /// Native callers already HEAD the key, so passing its size avoids another metadata round trip.
+    /// A zero size means the caller does not know it and metadata must be fetched here.
     const uint64_t object_size = known_size != 0 ? known_size
         : static_cast<uint64_t>(object_storage.getObjectMetadata(path, /*with_tags=*/false).size_bytes);
     if (range.offset >= object_size)
@@ -462,7 +457,7 @@ static String readObjectRanged(IObjectStorage & object_storage, const String & p
 }
 
 /// Open a forward-only stream over `range` of the object at `path`, positioned at the window's first
-/// byte and bounded to its last (spec 2026-07-02 snapshot-streaming §Backend seam). Mirrors
+/// byte and bounded to its last. Mirrors
 /// `readObjectRanged`'s seek + bound, but RETURNS the buffer instead of draining it — the caller reads
 /// at its own pace, so nothing is materialized whole. Returns nullptr when the offset is at or past EOF
 /// (the empty-window clamp), matching the ranged-get contract.
@@ -477,8 +472,8 @@ static std::unique_ptr<ReadBuffer> openObjectRangedStream(IObjectStorage & objec
     /// Clamp exactly like `readObjectRanged`: an offset at or past EOF yields an empty stream, and
     /// `seek` past the object size may throw depending on the storage, so fail-close against the known
     /// size before touching the buffer position.
-    /// M1 (final review): callers on the Native path already HEAD'ed the key — threading that size
-    /// here saves one metadata round-trip per ranged read against real S3. 0 = unknown, fetch.
+    /// As in `readObjectRanged`, a caller-supplied size avoids another metadata round trip; zero means
+    /// that the size is unknown and must be fetched.
     const uint64_t object_size = known_size != 0 ? known_size
         : static_cast<uint64_t>(object_storage.getObjectMetadata(path, /*with_tags=*/false).size_bytes);
     if (range.offset >= object_size)
@@ -661,7 +656,7 @@ HeadResult ObjectStorageBackend::head(const String & key)
         return HeadResult{};
 
     auto metadata = object_storage->tryGetObjectMetadata(emuPath(key), /*with_tags=*/false);
-    /// B38: a path that exists on the Local filesystem but yields NO object metadata is a DIRECTORY, not
+    /// A path that exists on the Local filesystem but yields no object metadata is a directory, not
     /// an object (`tryGetObjectMetadata` returns nullopt for a directory). HEAD must report it as
     /// not-an-object (exists=false) — otherwise existsFile/getStorageObjects treat a pool sub-dir (e.g.
     /// `store`, traversed by system.remote_data_paths) as a file and a later body read throws EISDIR.
@@ -680,11 +675,11 @@ HeadResult ObjectStorageBackend::head(const String & key)
 /// registry) are legitimately replaced by a concurrent conditional PUT between our upload and the
 /// check's HEAD - the size comparison false-positives as "a bug in S3" under perfectly normal
 /// contention (observed live against RustFS: a publish's manifest CAS raced the GC fence and the
-/// mismatch TERMINATED the server from the upload worker, M-W T13). Integrity for these keys is
+/// mismatch terminated the server from the upload worker). Integrity for these keys is
 /// the conditional PUT outcome + the observed token - a recheck adds nothing and races by design.
 ///
 /// On a generation-token store (GCS), a conditional write must ALSO never take the multipart path:
-/// GCS enforces no preconditions on CompleteMultipartUpload (measured 2026-07-03), so a lost
+/// GCS enforces no preconditions on `CompleteMultipartUpload` (measured), so a lost
 /// precondition on a multipart write would silently overwrite instead of failing. Force single-PUT
 /// and raise the single-part cap to conditional_single_put_cap (RAM-buffered) to keep the fast path
 /// available for bodies up to that size; a bigger body throws NOT_IMPLEMENTED from
@@ -704,8 +699,9 @@ WriteSettings ObjectStorageBackend::conditionalWriteSettings() const
     /// size_t field, harmless (ignored) for a non-S3 write path.
     ws.s3_max_unexpected_write_error_retries_override = 1;
 #if USE_AWS_S3
-    /// Exactly one HTTP attempt for every conditional write (RFC cas-s3-timeout-retry-control) — see
-    /// single_attempt_s3_client. Null (non-S3 object storage) leaves the disk's own client in place.
+    /// Exactly one HTTP attempt for every conditional write when the request-scoped client exists;
+    /// a null client (non-S3 object storage) leaves the disk's own client in place and is rejected for
+    /// writable Native mounts by `checkConditionalWriteSingleAttemptSupport`.
     if (single_attempt_s3_client)
         ws.s3_client_override = single_attempt_s3_client;
 #endif
@@ -864,11 +860,11 @@ PutResult ObjectStorageBackend::promoteStaged(const String & staging_key, const 
     /// WRITE-ONCE conditional server-side copy staging -> blob (`If-None-Match:*` on the destination),
     /// via `IObjectStorage::copyObjectConditional`. `created` ⇒ the destination ETag is the new
     /// incarnation token; `!created` ⇒ the destination already existed = the "lost the race" 412 signal.
-    /// Counted with the same RFC cas-s3-timeout-retry-control attempt/outcome counters as every other
-    /// conditional write (finalizeConditionalWriteInstrumented's contract): the copy is a conditional
-    /// create attempt too, and it rides `CasRequestController::conditionalCreateControlled` from
-    /// `PartWriteTxn::uploadFromSource` — an uncounted attempt would hide SDK-vs-controller retry accounting.
-    /// A resolved `!created` is counted Unresolved (the 412 does not prove WHO created the occupant),
+    /// Counted with the same attempt/outcome counters as every other conditional write
+    /// (`finalizeConditionalWriteInstrumented`'s contract): the copy is a conditional
+    /// create attempt too, and it is initiated by the controlled content-addressed upload path — an
+    /// uncounted attempt would hide SDK-versus-controller retry accounting.
+    /// A resolved `!created` is counted `Unresolved` (the 412 does not prove who created the occupant),
     /// mirroring the PUT paths.
     recordConditionalWriteAttemptStarted();
     ConditionalCopyResult res;
@@ -896,15 +892,14 @@ Token ObjectStorageBackend::resurrectStaged(const String & staging_key, const St
             "ObjectStorageBackend::resurrectStaged is Native-mode only (EmulatedSingleProcess has no "
             "server-side copy and is never selected for S3 staging)");
 
-    /// INV-NO-RETURN (S3-native staging fix 2026-07-11): the sanctioned condemned-resurrect overwrite is
-    /// NOT a verbatim server-side copy — that would reproduce the condemned incarnation's exact bytes ⇒
-    /// identical ETag ⇒ the queued exact-token delete of the condemned incarnation would kill the live
-    /// resurrection. Instead re-upload OUR OWN staging PAYLOAD (skipping the staging object's own
-    /// envelope header) under a FRESH-tagged `fresh_header`, so the resurrected body — and hence its
-    /// ETag/token — DIFFERS from the condemned incarnation regardless of edge-before-observe. The source
-    /// is ALWAYS the writer's own staging object, NEVER a read of the condemned `blob_key`
-    /// (`feedback_ca_resurrect_invariant`). The caller reached here only after a `Condemned` meta
-    /// point-read, so this overwrites a condemned body, never a live blob.
+    /// A condemned-resurrect overwrite is not a verbatim server-side copy: that would reproduce the
+    /// condemned incarnation's exact bytes and therefore its identical ETag. The queued exact-token
+    /// delete of the condemned incarnation could then delete the live resurrection. Instead re-upload
+    /// the writer's own staging payload (skipping the staging object's envelope header) under a
+    /// fresh-tagged `fresh_header`, so the resurrected body and token differ from the condemned one
+    /// (`INV-NO-RETURN`).
+    /// The source is always the writer's staging object, never the condemned `blob_key`; the caller
+    /// reaches this method only after observing `Condemned` metadata, so the overwrite targets no live blob.
     auto in = object_storage->readObject(StoredObject(staging_key), getReadSettings(), /*read_hint=*/std::nullopt);
     if (staging_payload_offset)
         in->ignore(staging_payload_offset);

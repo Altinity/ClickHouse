@@ -4,8 +4,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedExchange.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Parts/PartPathParser.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Parts/PartFolderAccess.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Parts/PartFolderAccess.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Parts/PartFolderAccess.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcScheduler.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Interpreters/Context_fwd.h>
@@ -19,45 +17,48 @@ namespace Poco::Util { class AbstractConfiguration; }
 namespace DB
 {
 
-/// Per-disk CAS staging backend selection (design `docs/superpowers/specs/2026-07-11-cas-s3-native-staging-design.md`
-/// §4, plan `docs/superpowers/plans/2026-07-11-cas-s3-native-staging.md` Task 0). `Local` (the
-/// default) is BYTE-FOR-BYTE the current write path (the local `scratchPath` write-buffer spill) —
-/// zero behavior change, no capability probe, no new code path taken (global constraint: OFF BY
-/// DEFAULT). `S3` opts in to streaming large blobs directly to an S3-native staging key; it is still
-/// subject to the mount-time conditional-copy capability probe (a later task), which can fail-close
-/// back to `Local` when the object storage does not enforce conditional writes.
+/// Selects where a content-addressed blob is staged before it is published.
+///
+/// `Local` is the default and preserves the existing local scratch-file path byte for byte; it does
+/// not run the conditional-copy probe. `S3` is opt-in and can stream large blobs to an object-store
+/// staging key. That path is usable only after the mount-time probe has demonstrated write-once
+/// conditional copy semantics. If the backend does not enforce those semantics, callers must stay
+/// on `Local`: an unconditional copy could overwrite a live content-addressed blob.
 enum class StagingBackend
 {
     Local,
     S3,
 };
 
-/// Content-addressed metadata storage — the M-W wiring (design 2026-06-11 section 4): a THIN
-/// translator between the IMetadataStorage read surface and the Cas:: core. ClickHouse path
-/// parsing (PartPathParser) + namespace mapping (D-W1) + StoredObjects construction; NO protocol
-/// state, NO internals-exposing accessors — the protocol lives in Cas::Pool/PartWriteTxn/Gc.
+/// Adapts ClickHouse's `IMetadataStorage` path-based interface to the content-addressed pool.
 ///
-/// Namespace mapping (M-W decision D-W1, shadow refined during T2; detached folded in B181):
+/// The class owns the pool and its cached part-folder facade for the lifetime of an opened disk. It
+/// parses disk paths, maps them to pool namespaces and references, and translates manifest entries
+/// into `StoredObjects` or in-memory read sources. Transaction and GC entry points are exposed here
+/// because disk lifecycle and system-query code own those operations; the CAS protocol itself stays
+/// in `Cas::Pool`, `Cas::PartWriteTxn`, and `Cas::Gc`.
+///
+/// Namespace mapping:
 ///   live part      SERVER_ID/TABLE_UUID            ref = PART_DIR
 ///   detached part  SERVER_ID/TABLE_UUID            ref = detached/DETACHED_PART_DIR
 ///   FREEZE shadow  the LITERAL shadow table dir     ref = PART_DIR
 ///                  (shadow/BACKUP/store/U3/UUID or shadow/BACKUP/data/DB/TBL — bijective with
 ///                  the disk path for both Atomic and non-Atomic layouts, so the shadow tree
-///                  enumerates from Pool::listNamespaces("shadow/..."))
+///                  enumerates from `Pool::listNamespaces("shadow/...")`)
 ///   generic files  SERVER_ID/_disk                  verbatim namespace files (access probes)
 ///
-/// Small per-part files (uuid.txt, metadata_version.txt, txn_version.txt, checksums.txt, ...) are
-/// Inline-placement manifest tree entries — no sidecar objects (all-tree-part-files Task 6/9: the
-/// former mutable-file/entry split is gone). Their bytes are served through
-/// DiskObjectStorage::prepareRead's CA branch via tryGetInManifestBytes; getStorageObjects returns a
+/// Small per-part files (`uuid.txt`, `metadata_version.txt`, `txn_version.txt`, `checksums.txt`, ...)
+/// are inline-placement manifest tree entries, not sidecar objects. Their bytes are served through
+/// `DiskObjectStorage::prepareRead`'s CA branch via `tryGetInManifestBytes`; `getStorageObjects` returns a
 /// sized placeholder with an EMPTY remote key for them (any consumer bypassing the prepareRead branch
 /// fails loudly, never reads wrong bytes).
 class ContentAddressedMetadataStorage final : public IMetadataStorage, public IContentAddressedExchange
 {
 public:
-    /// local_scratch_path_: a real server-local directory for the write-buffer spill (hash before
-    /// upload) — never derived from the object-storage key prefix. context_ non-null (the
-    /// disk-factory path) enables the background GC scheduler (M-W T10); unit tests pass nullptr.
+    /// Constructs an unopened storage adapter. `local_scratch_path_` is a real server-local
+    /// directory used when a write buffer must spill before hashing and upload; it is independent of
+    /// the object-storage key prefix. A non-null `context_` enables the background GC scheduler on
+    /// the disk-factory path; tests may pass null to disable system-log integration and scheduling.
     ContentAddressedMetadataStorage(
         ObjectStoragePtr object_storage_,
         String storage_path_prefix_,
@@ -79,76 +80,55 @@ public:
         uint64_t cas_part_folder_cache_max_entries_ = 10000,
         uint64_t cas_part_folder_cache_max_entry_bytes_ = 16ULL << 20,
         uint64_t manifest_decode_cache_bytes_ = 128ULL << 20,
-        /// Task 5: bounded pool size for GC's per-hash freshness-meta writes (condemn/spare/delete);
-        /// see `PoolConfig::gc_meta_pool_size`.
+        /// Bounds the pool used by GC's per-hash freshness-metadata writes.
         uint64_t gc_meta_pool_size_ = 16,
-        /// S3-native staging Task 0 (config plumbing, no behavior change): see `StagingBackend`
-        /// above. Trailing default keeps every existing positional call site (the disk factory,
-        /// the gtests that stop at `context_`) compiling unmodified.
+        /// Selects local or opt-in object-store staging. The trailing default preserves the existing
+        /// local write path for callers that do not configure S3 staging.
         StagingBackend staging_backend_ = StagingBackend::Local,
-        /// CAS pluggable-blob-hash Phase 1 (design 2026-07-11-cas-pluggable-blob-hash-design.md):
-        /// the pool's blob content-hash function, threaded into `Cas::PoolConfig` in `startup()`.
-        /// Trailing default (`CityHash128`, byte-for-byte today's behavior) keeps every existing
-        /// positional call site compiling unmodified.
+        /// Selects the pool's blob content-hash function. The default `CityHash128` preserves the
+        /// existing key encoding for positional callers.
         Cas::BlobHashAlgo blob_hash_algo_ = Cas::BlobHashAlgo::CityHash128,
-        /// CAS mixed-algo pools (Phase 3 T4, design 2026-07-11-cas-mixed-algo-pools-design.md §5):
-        /// opt-in for `blob_hash_algo_` to be ADMITTED into the pool's `algos_used` when it is not
-        /// already a member. Trailing default `false` (fail-closed) keeps every existing positional
-        /// call site compiling unmodified.
+        /// Allows `blob_hash_algo_` to be admitted to a pool whose persisted algorithm set does not
+        /// contain it. The default is false, so an accidental algorithm mismatch fails closed.
         bool blob_hash_allow_new_ = false,
-        /// Boot-time "start now, fix later" (see `Cas::PoolConfig::skip_access_check`): read from the
-        /// per-disk `<skip_access_check>` config directive by the factory and threaded into
-        /// `Cas::PoolConfig` in `startup()`. Trailing default `false` keeps every existing positional
-        /// call site compiling unmodified.
+        /// Passes the per-disk `<skip_access_check>` policy to `Cas::PoolConfig`. The default false
+        /// retains the normal boot-time access check.
         bool skip_access_check_ = false,
-        /// rev.6 Task 6: the conditional post-reclaim wait over an unclean predecessor, read from the
-        /// per-disk `<materialization_grace_ms>` config directive and threaded into `Cas::PoolConfig`
-        /// in `startup()`. See `Cas::PoolConfig::materialization_grace_ms`. Trailing default (the same
-        /// 30000 default as the `PoolConfig` field) keeps every existing positional call site compiling
-        /// unmodified.
+        /// Configures the grace period used when materializing after an unclean predecessor. The
+        /// default matches `Cas::PoolConfig` and preserves existing startup behavior.
         uint64_t materialization_grace_ms_ = 30000,
-        /// §3 (spec 2026-07-13-cas-memory-s3-budget-optimizations-design.md): the ForceFresh body
-        /// re-proof HEAD's validation policy, read from the per-disk `<part_folder_validate>` config
-        /// directive and threaded into the facade's `CacheParams` in `startup()`. Trailing default
-        /// (`Mode::Always`, byte-for-byte pre-§3 behavior) keeps every existing positional call site
-        /// compiling unmodified.
+        /// Configures when retained part-folder views must revalidate their manifest body. The
+        /// default `Mode::Always` retains the strict validation behavior used by existing callers.
         ContentAddressed::PartFolderValidate part_folder_validate_ = {});
 
-    /// Parse `staging_backend` from the CAS disk config (default `local` — the OFF BY DEFAULT
-    /// global constraint). Extracted as a static method (rather than inlined into
-    /// `MetadataStorageFactory.cpp` like the neighboring `scratch_path` read) so the config-parsing
-    /// logic is unit-testable without constructing the full disk factory. Throws BAD_ARGUMENTS on an
-    /// unrecognized value (fail closed rather than silently defaulting to `local`).
+    /// Parses `staging_backend`, defaulting to `local`. Throws `BAD_ARGUMENTS` for an unrecognized
+    /// value rather than silently selecting a backend.
     static StagingBackend parseStagingBackend(const Poco::Util::AbstractConfiguration & config, const std::string & config_prefix);
 
-    /// Parse `part_folder_validate` from the CAS disk config (default `always` -- byte-for-byte
-    /// pre-§3 behavior; spec 2026-07-13-cas-memory-s3-budget-optimizations-design.md §3). Extracted
-    /// as a static method (mirrors `parseStagingBackend` above) so the config-parsing logic is
-    /// unit-testable without constructing the full disk factory. Throws BAD_ARGUMENTS on an
-    /// unrecognized value OR a malformed `age` suffix (non-digit, negative, empty, or trailing
-    /// garbage) -- fail closed, never a silent fallback.
+    /// Parses `part_folder_validate`, defaulting to `always`. The `age` form accepts only a
+    /// non-negative integer number of seconds; malformed input and unknown modes throw
+    /// `BAD_ARGUMENTS` instead of silently selecting a policy.
     static ContentAddressed::PartFolderValidate parsePartFolderValidate(const Poco::Util::AbstractConfiguration & config, const std::string & config_prefix);
 
-    /// Test/diagnostics: one synchronous GC round (creates an ad-hoc scheduler when disabled).
+    /// Runs one synchronous GC round for tests and diagnostics. If the scheduler is not running,
+    /// this lazily creates one so repeated calls retain the same lease-observation history.
     void runOneGcRoundForTest();
 
-    /// SYSTEM CONTENT ADDRESSED GARBAGE COLLECTION: one synchronous GC round on the caller's thread,
-    /// emitting Start + Finish rows to system.content_addressed_garbage_collection_log. Throws
-    /// BAD_ARGUMENTS when GC is disabled (read-only disk or gc_enabled=false).
+    /// Runs one synchronous GC round on the caller's thread and emits Start and Finish rows to
+    /// `system.content_addressed_garbage_collection_log`. Throws `BAD_ARGUMENTS` when GC is disabled
+    /// by read-only mode or configuration.
     Cas::RoundReport runGarbageCollectionRoundNow();
 
-    /// SYSTEM CONTENT ADDRESSED GC REBUILD [FORCE]: the gc/state disaster-recovery command (spec
-    /// 2026-07-03). Constructs a fresh `Cas::Gc` with a freshly minted gc_id (the same one-shot
-    /// pattern as `runGarbageCollectionRoundNow`/`CasGcScheduler::runOneRoundNow`) and calls
-    /// `Gc::rebuildBaseline`. A refused rebuild (`report.performed == false`) writes nothing; the
-    /// caller (the SYSTEM interpreter) is responsible for surfacing `report.refusal` loudly. Throws
-    /// BAD_ARGUMENTS when GC is disabled (read-only disk or gc_enabled=false) — same gate as above.
+    /// Rebuilds the GC baseline for the `SYSTEM` disaster-recovery command. Each invocation uses a
+    /// fresh GC identity because `rebuildBaseline` performs its own lease check. A refused rebuild
+    /// (`report.performed == false`) writes nothing; the `SYSTEM` interpreter surfaces the refusal.
+    /// Throws `BAD_ARGUMENTS` when GC is disabled by read-only mode or configuration.
     Cas::RebuildReport runGcRebuildNow(bool force);
 
-    /// Per-disk GC health for system.content_addressed_mounts (B3). nullopt when no GC scheduler runs
-    /// on this disk (GC disabled, read-only, or not started). Holds gc_scheduler_mutex for the whole
-    /// call, which serializes it against shutdown()'s gc_scheduler.reset() under the same mutex -- an
-    /// unprivileged SELECT on the system table can otherwise race a dangling scheduler mid-teardown.
+    /// Returns per-disk GC health for `system.content_addressed_mounts`. Returns nullopt when this
+    /// disk has no scheduler because GC is disabled, the disk is read-only, or startup has not run.
+    /// Holds `gc_scheduler_mutex` for the entire call so a concurrent system-table query cannot
+    /// observe a scheduler while `shutdown` destroys it.
     std::optional<ContentAddressed::CasGcScheduler::GcHealth> gcHealth() const;
 
     MetadataStorageType getType() const override { return MetadataStorageType::ContentAddressed; }
@@ -157,66 +137,85 @@ public:
     bool supportsStat() const override { return false; }
     bool isReadOnly() const override { return read_only; }
     bool isContentAddressed() const override { return true; }
-    /// [TXN-ONE-PIPELINE] CA transactions are eager staging overlays: every mutating disk-transaction
-    /// method routes straight to the metadata transaction at call time, never into the FIFO queue.
+    /// Content-addressed transactions are eager staging overlays: each mutating disk-transaction
+    /// method reaches the metadata transaction immediately rather than entering the FIFO queue.
     bool transactionIsStagingOverlay() const override { return true; }
     bool supportsAtomicFileWrites() const override { return true; }
     bool supportsTransactionalMutableFiles() const override { return true; }
     bool areBlobPathsRandom() const override { return false; }
     uint32_t getHardlinkCount(const std::string &) const override { return 0; }
 
+    /// Creates a write transaction bound to this storage. Throws `READONLY` before allocating one
+    /// when the disk was opened read-only.
     MetadataTransactionPtr createTransaction() override;
 
-    /// Disk lifecycle (DiskObjectStorage start/stop): open/close the Cas::Pool (fail-closed probe
-    /// + pool-format check) and drive the GC scheduler.
+    /// Opens the pool, validates its format and starts the optional GC scheduler. Read-only disks
+    /// skip write probes and GC; failures in startup propagate.
     void startup() override;
+    /// Stops the GC scheduler before releasing the part-folder facade and pool. Scheduler destruction
+    /// is synchronized with `gcHealth`.
     void shutdown() override;
 
+    /// Tests whether a path is represented by an inline manifest entry, namespace file, or loose
+    /// mountpoint object.
     bool existsFile(const std::string & path) const override;
+    /// Tests whether a path names a virtual part, table, shadow, or mirrored live-tree directory.
     bool existsDirectory(const std::string & path) const override;
+    /// Tests both file and directory interpretations of a path.
     bool existsFileOrDirectory(const std::string & path) const override;
+    /// Returns the logical payload size, excluding a blob envelope.
     uint64_t getFileSize(const std::string & path) const override;
+    /// Returns the part publication time; other existing files use epoch time because their mtime is
+    /// not retained by the content-addressed namespace.
     Poco::Timestamp getLastModified(const std::string & path) const override;
+    /// Lists logical children of a virtual or mirrored directory.
     std::vector<std::string> listDirectory(const std::string & path) const override;
+    /// Iterates over `listDirectory` results with each child joined to `path`.
     DirectoryIteratorPtr iterateDirectory(const std::string & path) const override;
+    /// Reports virtual part and projection directories as empty so removal unlinks their ref; table
+    /// and container directories use their listing.
     bool isDirectoryEmpty(const std::string & path) const override;
+    /// Maps a logical path to its storage object. Inline entries return a sized empty-key placeholder
+    /// and must be served by the CA read branch.
     StoredObjects getStorageObjects(const std::string & path) const override;
-    /// Single-lookup override (spec §Method Routing): the inherited default is existsFile +
-    /// getStorageObjects — a two-read trap for CAS on the readFileIfExists path.
+    /// Performs one manifest lookup for part files instead of the inherited `existsFile` plus
+    /// `getStorageObjects` sequence.
     std::optional<StoredObjects> getStorageObjectsIfExist(const std::string & path) const override;
 
-    /// ==== IContentAddressedExchange (DataPartsExchange facade; relink lands in M-W T11) ====
+    /// ==== `IContentAddressedExchange` (interserver relinking facade) ====
     const String & getPoolUUID() const override { return pool_uuid; }
+    /// Returns the canonical encoded manifest for a committed part, or nullopt when the path is not
+    /// a committed CA part. Missing or corrupt committed state propagates as an exception.
     std::optional<String> getPartManifestBytes(const String & part_path) const override;
+    /// Adopts a peer-supplied manifest into this server's namespace without transferring blob bodies.
+    /// Returns false for decode or retryable publication failures so the caller can perform a byte
+    /// fetch; read-only disks throw `READONLY`.
     bool adoptPartFromManifest(
         const String & table_uuid, const String & part_name, const String & manifest_bytes) override;
 
     /// ==== wiring-internal surface (the transaction + the disk's prepareRead CA branch) ====
 
-    /// The opened pool. Throws LOGICAL_ERROR before startup — every caller is post-startup.
+    /// Returns the opened pool. Throws `LOGICAL_ERROR` before `startup`.
     const Cas::PoolPtr & store() const;
-    /// The facade, by REFERENCE (dot-syntax call sites — the committed-ref style guard bans raw
-    /// `->` mutation tokens in wiring). Throws LOGICAL_ERROR before startup, like store().
+    /// Returns the cached part-folder facade by reference. Throws `LOGICAL_ERROR` before `startup`.
+    /// Committed part-folder reads and mutations go through this facade so cache validation remains
+    /// centralized.
     ContentAddressed::CachedPartFolderAccess & partAccess() const;
     const std::string & serverId() const { return server_id; }
     const std::string & serverRootId() const { return server_root_id; }
     const std::string & scratchPath() const { return local_scratch_path; }
-    /// S3-native staging Task 0 accessor — pure config plumbing, no behavior change. `writeFile`
-    /// starts consulting this in a later task (Task 3/4 of the plan); today it is stored-but-unread.
+    /// Returns the configured staging backend. `Local` is the behavior-preserving default; callers
+    /// must also check `conditionalCopySupported` before using S3 promotion.
     StagingBackend stagingBackend() const { return staging_backend; }
-    /// Set by the mount-time conditional-copy capability probe (a later task). Defaults to `false`:
-    /// conditional copy is assumed UNSUPPORTED until proven otherwise (fail-close), so consulting this
-    /// accessor before the probe wiring lands can never mistakenly enable the S3 promote path.
+    /// Returns the mount-time conditional-copy capability result. It starts false and becomes true
+    /// only after the backend proves write-once copy semantics, so S3 promotion fails closed.
     bool conditionalCopySupported() const { return conditional_copy_supported; }
-    /// S3-native staging Task 4: raw access to the object storage, so `writeFile` can open a
-    /// staging-object sink directly with `object_storage->writeObject(...)` — Task 4 predates the
-    /// `Cas::Backend` seams (`Core/CasBackend.h::stageStream`) a later task adds. Only meaningful
-    /// when `stagingBackend()==StagingBackend::S3 && conditionalCopySupported()`.
+    /// Returns the underlying object storage for an S3 staging writer. It is meaningful only when
+    /// `stagingBackend` is `S3` and `conditionalCopySupported` is true.
     const ObjectStoragePtr & objectStorage() const { return object_storage; }
-    /// S3-native staging Task 4: the physical staging-key PREFIX for this pool's writer-owned staging
-    /// area — `physicalKey(pool_prefix + "/staging/" + server_root_id)`, the SAME prefix construction
-    /// the Task 3 capability probe uses for its own `<prefix>/probe` subtree (see `startup()`).
-    /// Callers append their own unique leaf, e.g. `"/" + getRandomASCIIString(32) + ".tmp"`.
+    /// Returns the physical prefix for this pool's writer-owned staging area. It is the same
+    /// `pool_prefix/staging/server_root_id` subtree used by the capability probe; callers append a
+    /// unique leaf and must not use the probe object itself.
     String stagingKeyPrefix() const;
 
     /// Bytes that live INSIDE pool metadata rather than as their own object: an Inline-placement
@@ -224,17 +223,17 @@ public:
     /// storage object).
     std::optional<String> tryGetInManifestBytes(const std::string & path) const;
 
-    /// The CA read entry, part 1 of 2, called by DiskObjectStorage::prepareRead BEFORE the generic
+    /// The CA read entry called by `DiskObjectStorage::prepareRead` before the generic
     /// storage-objects path: serves in-manifest bytes (mutable per-part files, inline entries,
     /// verbatim namespace files) from memory. Returns false when the path is not in-manifest.
     bool prepareInManifestRead(const std::string & path, const ReadSettings & settings, ReadPipeline & pipeline) const;
 
-    /// The CA read entry, part 2 of 2: a blob-backed part file translates to the physical blob
+    /// Translates a blob-backed part file to the physical blob
     /// object plus the payload WINDOW inside it (the CHCA envelope header occupies
     /// [0, payload_offset)). DiskObjectStorage::prepareRead composes the STANDARD object-storage
     /// pipeline over `object` (gather/caches/async prefetch — the same chain plain s3 disks get,
     /// so `MergeTreeReaderStream` right-mark bounds reach the object reader and its range
-    /// requests stay drainable, B116) and bounds it with the pipeline's FileView stage.
+    /// requests stay drainable) and bounds it with the pipeline's FileView stage.
     /// nullopt = the path is not a blob-backed part file (caller falls through; absent paths
     /// then fail in getStorageObjects exactly as before).
     struct BlobViewPlan
@@ -243,31 +242,32 @@ public:
         size_t payload_offset = 0;  /// view left bound inside the blob
         size_t payload_end = 0;     /// view right bound (payload_offset + payload length)
     };
+    /// Resolves a blob-backed path to its physical object and payload window. Returns nullopt for
+    /// in-manifest, loose, directory, or otherwise unresolved paths.
     std::optional<BlobViewPlan> getBlobViewPlan(const std::string & path) const;
 
-    /// A seekable reader over ONE blob payload (the object minus its envelope header) - the
-    /// transaction's in-flight read-your-writes (B59). The committed read path goes through
-    /// getBlobViewPlan + the pipeline instead.
+    /// Creates a seekable reader over one blob payload, excluding its envelope. Transactions use
+    /// this for read-your-writes; committed reads use `getBlobViewPlan` and the normal pipeline.
     std::unique_ptr<ReadBufferFromFileBase> readBlobPayload(
         const Cas::BlobLocation & location, const std::string & path, const ReadSettings & settings) const;
 
-    /// D-W1 namespace mapping (shared with the transaction — ONE definition). Detached parts (B181)
-    /// live INSIDE this same table namespace as `detached/`-prefixed refs, not a sibling namespace.
+    /// Maps a live table UUID to its pool namespace. Detached parts share that namespace and use
+    /// `detached/`-prefixed references rather than a sibling namespace.
     Cas::RootNamespace liveNamespace(const std::string & table_uuid) const;
+    /// Canonicalizes a literal shadow-table directory into the pool namespace used by freeze and
+    /// unfreeze paths. A trailing slash is ignored.
     static Cas::RootNamespace shadowNamespace(const std::string & shadow_table_dir);
 
     /// A dropped-and-not-recreated table (ref-table lifecycle durably `Removed`) is GONE for readers: its
     /// table-level namespace files — `format_version.txt` and other verbatim files — must read as absent
-    /// even while GC has not yet physically reclaimed them (deferred-GC removal, commit 318291fe5e5),
+    /// even while GC has not yet physically reclaimed them (namespace removal is deferred to GC),
     /// mirroring how its parts already vanish via the ref state. Gate every namespace-file read on this.
     /// A never-born namespace is NOT hidden (fail-closed — only a KNOWN-removed table hides its files).
     bool namespaceFilesReadable(const Cas::RootNamespace & ns) const;
 
-    /// The configured live-tree root prefix. Phase 1 makes layout identity explicit:
-    /// live/detached namespaces and verbatim live-tree files are rooted by `server_root_id`, while
-    /// `ServerUUID` remains only the mount owner token.
+    /// Returns the root prefix for mirrored live-tree objects. The persistent layout identity is
+    /// `server_root_id`; `ServerUUID` remains only the mount-owner token.
     std::string serverPrefix() const;
-    // (genericNamespace removed — loose files are plain mountpoint objects, design §5.2)
 
     /// Enumerate the children of a GENERIC intermediate live-tree directory (the disk root "",
     /// `store`, the `store/<u3>` shard dir, or any loose-file container above a table dir) via a
@@ -276,11 +276,13 @@ public:
     /// `clickhouse-disks` traversal of the live tree behave like a normal disk; concrete
     /// `store/<u3>/<uuid>/<part>/<file>` navigation is still served by the exact-shape branches.
     std::vector<std::string> listLiveTreeChildren(const std::string & path) const;
+    /// Tests whether the server-root-scoped mirrored subtree has at least one child. The disk root is
+    /// always considered present.
     bool liveTreeDirHasChildren(const std::string & path) const;
 
-    /// The route of one parsed CA path: which namespace, which ref, which in-tree file. The single
-    /// place the detached re-split (PoC B36 parser contract -> in-namespace `detached/`-prefixed
-    /// refs, B181) and the shadow mapping happen.
+    /// Resolves one parsed path to its namespace, reference, and in-tree file. Detached paths are
+    /// re-split here so their references remain in the table namespace with a `detached/` prefix;
+    /// shadow paths map to a namespace derived from the literal shadow directory.
     struct Route
     {
         Cas::RootNamespace ns{""};
@@ -292,22 +294,23 @@ public:
         /// The (ns, ref) identity subset — what the part-folder access layer keys on.
         ContentAddressed::PartRefKey refKey() const { return {ns, ref}; }
     };
+    /// Converts a parsed path into the namespace/reference/file tuple used by the part-folder
+    /// facade. Returns nullopt only when the parsed path cannot be routed.
     std::optional<Route> route(const ContentAddressed::PartFilePath & p) const;
 
-    /// Full `detached/<part>` ref names in a namespace (B181: detached parts fold into the table ns).
+    /// Returns full `detached/<part>` reference names in a namespace.
     std::vector<std::string> detachedRefNames(const Cas::RootNamespace & ns) const;
 
-    /// Full `moving/<part>` STAGING ref names in a namespace (MOVE-to-CA fix, mirrors
-    /// detachedRefNames): the mover's crash-cleanup (MergeTreeData.cpp, MOVING_DIR_NAME) enumerates
-    /// and drops these at table load if a move was interrupted mid-flight.
+    /// Returns full `moving/<part>` staging-reference names in a namespace. Move recovery enumerates
+    /// these names and removes entries left by an interrupted move.
     std::vector<std::string> movingRefNames(const Cas::RootNamespace & ns) const;
 
-    /// C4: the ONE fixed dispatch order `existsDirectory`/`listDirectory` route a path through
+    /// `existsDirectory` and `listDirectory` use one fixed dispatch order to route a path through
     /// (shadow -> atomic-shard -> table-uuid -> part -> subdir -> generic), previously implemented
     /// twice and kept in sync by hand. `classifyDirectory` (private, below) computes it once; both
-    /// callers then switch on the resulting shape. `DirShape`/`DirRoute` are nested-public only so
-    /// `classifyDirectoryForTest` can name them from the test binary (mirroring the `Route` struct
-    /// above); the classification logic itself stays private.
+    /// callers then switch on the resulting shape. `DirShape` and `DirRoute` remain public only so
+    /// `classifyDirectoryForTest` can expose the classification to wiring tests; the logic stays
+    /// private.
     enum class DirShape
     {
         ShadowPart,
@@ -336,8 +339,8 @@ public:
         std::optional<std::string> projection_prefix;
     };
 
-    /// Test-only accessor (mirrors `conditionalWriteSettingsForTest`): exposes the private
-    /// `classifyDirectory` so `gtest_ca_wiring` can pin the fixed dispatch order directly.
+    /// Test-only accessor exposing the private directory classification so wiring tests can pin the
+    /// dispatch order directly.
     DirRoute classifyDirectoryForTest(const std::string & path) const { return classifyDirectory(path); }
 
 private:
@@ -354,61 +357,54 @@ private:
     const std::chrono::seconds gc_interval;
     const uint64_t dedup_cache_bytes;            /// P1 known-present cache byte cap (0=off)
     const uint64_t dedup_head_first_min_bytes;   /// P2 HEAD-before-PUT size threshold (0=off)
-    const uint64_t gc_snap_generations_to_keep;  /// B174 gc/snap retention (0=keep all)
-    const uint64_t gc_shards;                    /// Phase 4: blob-hash-prefix reducer shard count (creation-time only)
+    const uint64_t gc_snap_generations_to_keep;  /// Number of GC snapshots retained (0 means keep all).
+    const uint64_t gc_shards;                    /// Blob-hash-prefix reducer shard count, fixed at pool creation.
     const uint64_t manifest_sweep_list_budget_keys;
     const uint64_t manifest_sweep_delete_budget_keys;
     /// GCS single-PUT budget for conditional writes (generation-token stores only): threaded into
     /// the ObjectStorageBackend construction site in startup(). Irrelevant on ETag stores (AWS et al).
     const uint64_t gcs_max_conditional_put_bytes;
-    /// Part-folder view cache settings (spec 2026-07-08-cas-part-folder-cache), threaded into the
-    /// facade construction in startup(). `cas_part_folder_cache_bytes == 0` disables retention.
+    /// Part-folder view cache settings. `cas_part_folder_cache_bytes == 0` disables retention.
     const uint64_t cas_part_folder_cache_bytes;
     const uint64_t cas_part_folder_cache_max_entries;
     const uint64_t cas_part_folder_cache_max_entry_bytes;
-    /// Phase 5 (part-folder cache spec): byte bound for the manifest DECODE cache (Cas::Pool), threaded
-    /// into PoolConfig in startup(). 0 disables decode caching entirely (diagnostic mode).
+    /// Byte bound for the manifest decode cache in `Cas::Pool`. Zero disables decode caching.
     const uint64_t manifest_decode_cache_bytes;
-    /// Task 5: bounded pool size for GC's per-hash freshness-meta writes, threaded into PoolConfig.
+    /// Bounded pool size for GC's per-hash freshness-metadata writes.
     const uint64_t gc_meta_pool_size;
-    /// S3-native staging Task 0 (config plumbing, no behavior change): see `StagingBackend` above.
+    /// Configured staging backend; `Local` preserves the existing write path.
     const StagingBackend staging_backend;
-    /// CAS pluggable-blob-hash Phase 1: the pool's blob content-hash function, threaded into
-    /// `Cas::PoolConfig` in `startup()`.
+    /// Blob content-hash function passed to `Cas::PoolConfig`.
     const Cas::BlobHashAlgo blob_hash_algo;
-    /// CAS mixed-algo pools (Phase 3 T4): opt-in for `blob_hash_algo` to be ADMITTED into the pool's
-    /// `algos_used`, threaded into `Cas::PoolConfig` in `startup()`.
+    /// Whether `blob_hash_algo` may be admitted into the pool's persisted `algos_used` set.
     const bool blob_hash_allow_new;
-    /// Boot-time "start now, fix later": the per-disk `<skip_access_check>` directive, threaded into
-    /// `Cas::PoolConfig` in `startup()`. See `Cas::PoolConfig::skip_access_check`.
+    /// Per-disk `<skip_access_check>` policy passed to `Cas::PoolConfig`.
     const bool skip_access_check;
-    /// rev.6 Task 6: the per-disk `<materialization_grace_ms>` directive, threaded into `Cas::PoolConfig`
-    /// in `startup()`. See `Cas::PoolConfig::materialization_grace_ms`.
+    /// Grace period for materialization after an unclean predecessor, passed to `Cas::PoolConfig`.
     const uint64_t materialization_grace_ms;
-    /// §3: the ForceFresh body re-proof HEAD's validation policy (part_folder_validate config key),
-    /// threaded into the facade's CacheParams in startup(). Mode::Always is byte-for-byte pre-§3
-    /// behavior.
+    /// Policy controlling when retained part-folder views revalidate their manifest body.
     const ContentAddressed::PartFolderValidate part_folder_validate;
-    /// Set later by the mount-time conditional-copy capability probe (a later task) — NOT const.
+    /// Set by the mount-time conditional-copy capability probe — not const because the result is
+    /// unavailable until startup.
     /// Defaults to false (fail-close): assumed unsupported until the probe proves otherwise.
     bool conditional_copy_supported = false;
 
     /// Set by startup (Pool::open is fail-closed; empty store == not started).
     Cas::PoolPtr cas_store;
-    /// The part-folder access facade (spec 2026-07-08-cas-part-folder-cache): the ONLY normal path
+    /// The part-folder access facade: the normal path
     /// for committed part/projection reads and committed part-ref mutations. Constructed in
     /// startup right after Pool::open; reset in shutdown before cas_store.
     std::unique_ptr<ContentAddressed::CachedPartFolderAccess> part_access;
     String pool_uuid;
     std::unique_ptr<ContentAddressed::CasGcScheduler> gc_scheduler;
-    /// Guards the lazy `gc_scheduler` creation in `runOneGcRoundForTest`/`runGarbageCollectionRoundNow`
+    /// Guards lazy scheduler creation in `runOneGcRoundForTest` and `runGarbageCollectionRoundNow`
     /// against a racing manual `SYSTEM ... GC` on another query thread; the round itself runs OUTSIDE
     /// this lock (CasGcScheduler::runOneRoundNow has its own gc_round_mutex for that). Also taken around
-    /// `shutdown()`'s `gc_scheduler.reset()` (NOT its `stop()`) and, `mutable`, for the FULL duration of
-    /// the const `gcHealth()` accessor (B3) -- together these two make an unprivileged SELECT on
+    /// `shutdown`'s `gc_scheduler.reset` (not its `stop`) and, as `mutable`, for the full duration of
+    /// `gcHealth`. Together these make an unprivileged SELECT on
     /// system.content_addressed_mounts race-free against a concurrent disk shutdown. The lazy-creation
-    /// call sites do NOT re-check for a post-shutdown state, so they can still resurrect a scheduler
-    /// after `shutdown()` has run (pre-existing, out of scope here).
+    /// call sites do not re-check for a post-shutdown state, so they can still resurrect a scheduler
+    /// after `shutdown` has run; that lifecycle behavior is outside this adapter's cleanup scope.
     mutable std::mutex gc_scheduler_mutex;
     /// Derived from object_storage->isReadOnly() at startup (the disk's <readonly> config). When set:
     /// the probe is skipped, no watermark, no GC scheduler, and the mutating surface fails closed.
@@ -418,6 +414,8 @@ private:
     /// mirrors that rule so readBlobPayload reads exactly where the backend wrote ("" for Native).
     String physical_key_prefix;
 
+    /// Adds the local-backend common prefix to a pool key when direct object-storage I/O requires
+    /// the physical key; native backends use the key unchanged.
     String physicalKey(const String & key) const
     {
         if (physical_key_prefix.empty())
@@ -427,7 +425,7 @@ private:
         return physical_key_prefix + "/" + key;
     }
 
-    /// C4: classify `path`'s directory shape by running the fixed dispatch order ONCE (shadow ->
+    /// Classifies `path`'s directory shape by running the fixed dispatch order once (shadow ->
     /// atomic-shard -> table-uuid -> part -> subdir -> generic), including the part-branch
     /// fall-through when no sub-shape matches. Pure path classification — consults no lifecycle
     /// state (e.g. `namespaceFilesReadable`); `existsDirectory`/`listDirectory` apply that gate
@@ -439,7 +437,7 @@ private:
     /// and appends it to the SystemLog (best-effort). Returns an empty sink when context is null.
     ContentAddressed::GcRoundLogger makeGcRoundLogger() const;
 
-    /// Build the per-event CAS audit sink (B170): the std::function the Pool calls on every
+    /// Builds the per-event CAS audit sink: the `std::function` the pool calls on every
     /// content-addressed decision. Captures the ContextPtr, converts the decoupled Core POD
     /// `Cas::CasEvent` into a ContentAddressedLogElement, and appends it to the SystemLog
     /// (best-effort). Returns an empty sink when context is null (unit tests).

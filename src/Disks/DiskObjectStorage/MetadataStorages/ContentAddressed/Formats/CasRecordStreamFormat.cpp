@@ -22,10 +22,9 @@ namespace
 
 UInt128 toWideChecksum(CityHash_v1_0_2::uint128 h)
 {
-    /// Same packing the retired one-shot `cityHash128` helper used (high64 << 64 | low64). The value is
-    /// only ever compared write-vs-read, both via this converter — internal consistency is all that
-    /// matters (codecs-v3 phase 5 flagged decision: the run checksum switches from one-shot to the
-    /// chained CityHash128 the Hashing{Read,Write}Buffer computes, so the reader can stream).
+    /// Keep the high and low halves in the same order for the write-side helper and the streaming
+    /// reader. The value is compared internally rather than exposed as a separately interpreted wire
+    /// field, but both paths must use the same packing for a stored run to verify successfully.
     return (static_cast<UInt128>(h.high64) << 64) | static_cast<UInt128>(h.low64);
 }
 
@@ -203,8 +202,9 @@ void SourceEdgeRunWriter::finish()
 
 UInt128 sourceEdgeRunChecksum(std::string_view stored_bytes)
 {
-    /// The IDENTICAL chained CityHash128 the reader accumulates while streaming (same class, same default
-    /// block size, same bytes) — so a run PUT here and read back by the fold agree byte-for-byte.
+    /// Use the same chained `CityHash128` and default block size as the reader. A one-shot hash would
+    /// diverge from the streaming hash for sufficiently large input, so the producer and later fold
+    /// must both process exactly the stored bytes through `HashingReadBuffer`.
     ReadBufferFromMemory mem(stored_bytes.data(), stored_bytes.size());
     HashingReadBuffer hashing(mem);
     hashing.ignoreAll();   /// drain the whole object through the hash

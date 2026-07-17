@@ -21,20 +21,18 @@
 namespace DB::Cas
 {
 
-/// The writer ref-log / ref-table subsystem (spec §Writer Algorithms / §Table State / §Decomposition),
-/// extracted from `Cas::Pool` (Phase 3.4 source-layout). It owns the whole-table ref cache
-/// (`ref_tables`), the append lane (flat-combining flush leader + wedge protocol), snapshot publication,
-/// stale-precommit sweep, cache-budget eviction, and the remount/shutdown drain coordination -- together
-/// with the two mutexes that guard them (`ref_queue_mutex` and the per-table `state_mutex`) and the
-/// CAS retry controller the ref-log writer path uses.
+/// Coordinates the writer-side ref-log and ref-table protocol for all namespaces in one mounted pool.
+/// It owns the recovered whole-table cache, the flat-combining append lane and its unresolved-`PUT`
+/// wedge, snapshot publication, stale-precommit cleanup, cache-budget eviction, and remount/shutdown
+/// draining. `ref_queue_mutex` protects cache membership and queue leadership; each table's
+/// `state_mutex` protects its decoded state and per-table lifecycle. Network I/O is deliberately performed
+/// without holding `state_mutex`, so readers and other maintenance operations are not blocked by retries.
 ///
-/// PURE relocation from `Pool` -- zero logic change. Environment is injected by reference/value (no
-/// `Pool &` back-reference): the backend, the layout, the `RefLedgerConfig` slice, the event sink, the
-/// pool-level `CasRequestBudget`, plus callbacks for the mount/watermark state that STAYS on `Pool`
-/// (live writer epoch, the append/publish fence predicate, the boot clock, `mayMutate`, the unclean-
-/// epoch-boundary high-water-mark, the impossible-interference anomaly reaction, the owner pin for the
-/// detached publish task, and the in-flight-build cancellation on namespace removal). `Pool` keeps thin
-/// public delegates for every currently-public method so wiring/tests are unchanged.
+/// The ledger receives storage, configuration, event delivery, and retry-budget dependencies directly.
+/// Mount state remains owned by `Pool` and is exposed through callbacks: the live writer epoch, append
+/// fence, clocks, mutation gate, unclean-boundary observation, anomaly reaction, owner lifetime pin, and
+/// cancellation of in-flight builds. The detached snapshot publisher uses the lifetime pin; no
+/// `Pool &` back-reference is retained. `Pool` forwards its existing public operations to this component.
 class CasRefLedger
 {
 public:
@@ -44,77 +42,128 @@ public:
         RefLedgerConfig config_,
         const CasEventSink & event_sink_,
         CasRequestBudget cas_request_budget_,
-        /// The RAW mount `boot_ms_fn` (may be empty), forwarded to the retry controller's `now_ms` seam
-        /// exactly as the pre-decomposition `Pool` ctor did (behavior-identical clock).
+        /// Monotonic mount clock used by the retry controller; it may be empty when the controller's
+        /// default clock is appropriate.
         std::function<uint64_t()> controller_boot_ms_fn,
-        /// Callbacks into mount/watermark state that stays on `Pool` (bound at construction):
-        std::function<uint64_t()> live_epoch_fn_,          /// Pool::liveWriterEpoch
-        std::function<bool()> fence_ok_fn_,                 /// Pool::refAppendFenceOk
-        std::function<uint64_t()> boot_ms_now_fn_,          /// Pool::bootMsNow
-        std::function<bool()> may_mutate_,                  /// Pool::mayMutate
-        std::function<uint64_t()> unclean_boundary_epoch_,  /// Pool::unclean_epoch_boundary_seen_at (relaxed load)
+        /// Callbacks into mount and watermark state owned by `Pool`, bound for this ledger's lifetime:
+        std::function<uint64_t()> live_epoch_fn_,
+        std::function<bool()> fence_ok_fn_,
+        std::function<uint64_t()> boot_ms_now_fn_,
+        std::function<bool()> may_mutate_,
+        std::function<uint64_t()> unclean_boundary_epoch_,
         std::function<void(const String &, const String &, const std::optional<String> &)> on_impossible_interference_,
-        std::function<std::shared_ptr<void>()> pin_owner_,  /// Pool::shared_from_this (pins owner for the detached publish task)
+        std::function<std::shared_ptr<void>()> pin_owner_,
         std::function<void(const RootNamespace &)> cancel_inflight_builds_);
 
-    /// ---- read side (spec §6) ----
+    /// Recovers `ns` on first access and resolves `ref_name` from the authoritative cached table.
+    /// The optional staleness argument remains for API compatibility; this mounted writer has no
+    /// alternate shard cache, so the recovered table is always the view used for the result.
     std::optional<Resolved> resolveRef(const RootNamespace & ns, const String & ref_name, bool allow_stale = false);
+
+    /// Recovers `ns` on first access and returns every committed ref in canonical name order. Read-side
+    /// maintenance may schedule snapshot publication and stale-precommit cleanup, but those actions do
+    /// not change the returned committed view or make a read fail when maintenance has an uncertain `PUT`.
     std::map<String, Resolved> listRefs(const RootNamespace & ns);
 
-    /// ---- ref lifecycle (Task 10, spec §Writer Algorithms) ----
+    /// Appends the transaction that removes one ref and waits for its durable result. A failed append
+    /// propagates its exception and does not apply the removal to the in-memory table.
     void dropRef(const RootNamespace & ns, const String & ref_name);
+
+    /// Builds and appends a payload update for one ref. The mutator is invoked while constructing the
+    /// transaction, and its changes become visible only after the append is durable.
     void updateRefPayload(const RootNamespace & ns, const String & ref_name,
                           std::function<void(RefPayloadUpdate &)> mutator);
+
+    /// Durably removes the complete namespace, including its current ref/precommit state, then performs
+    /// the associated cleanup and cancellation work. Repeated removal observes the cached `Removed`
+    /// state; a failed append leaves the namespace live and propagates the exception.
     DropNamespaceStats dropNamespace(const RootNamespace & ns);
+
+    /// Reports whether recovery has established the namespace's durable lifecycle as `Removed`.
     bool namespaceIsRemoved(const RootNamespace & ns);
 
-    /// ==== writer ref-log append lane (Task 10, spec §Writer Algorithms) ==== (see the Pool delegate's
-    /// doc comment for the full contract; body is verbatim here).
+    /// Queues a mutation for flat-combining with compatible callers. `build_ops` runs at most once in
+    /// the flush leader and must return operations without writing storage itself. The leader validates
+    /// the complete batch, writes one ref-log object behind the append fence, and applies the batch to the
+    /// cache only after a durable result; an unresolved conditional `PUT` wedges the table and blocks
+    /// later appends until the same object is resolved or definitely rejected.
     RefTxnId appendRefOps(const RootNamespace & ns, MutationScope scope,
                          std::function<std::vector<RefOp>(const RefTableState &)> build_ops,
                          RootMutationOrigin origin, RootMutationKind kind,
                          bool skip_stale_precommit_sweep = false);
 
+    /// Records that recovery observed the cleanup marker for `remove_txn_id`; returns whether the marker
+    /// was present. The observation is retained with the recovered table for namespace recreation gates.
     bool observedNamespaceCleanupMarker(const RootNamespace & ns, const RefTxnId & remove_txn_id);
+
+    /// Attempts one snapshot publication from a copy of the live state. The copy is made under
+    /// `state_mutex`, the conditional `PUT` is performed without that mutex, and counters are adopted
+    /// only when this attempt successfully publishes the captured snapshot.
     bool trySnapshotPublishOnce(const RootNamespace & ns);
+
+    /// Counts tables with an unresolved append `PUT`; the walk takes each table lock briefly and never
+    /// waits for the network operation that caused a wedge.
     size_t wedgedRefLaneCount();
 
-    /// ---- remount / shutdown coordination (called by the owning Pool) ----
+    /// Marks cached runtimes obsolete before a self-remount reopens the append fence. Leaders holding an
+    /// orphaned runtime therefore fail closed instead of mutating state from the previous epoch.
     void quiesceRefTablesForRemount();
+
+    /// Returns whether every cached append lane has settled sufficiently for remount. It does not
+    /// discard runtimes; `quiesceRefTablesForRemount` performs that state transition.
     bool refLanesSettledForRemount();
+
+    /// Closes admission, snapshots the current table set, and waits up to `wait_budget_ms` for queued
+    /// mutations and leaders to finish. The check and enqueue paths share `ref_queue_mutex`, so no new
+    /// mutation can appear after shutdown has taken its snapshot.
     bool drainRefLanesForShutdown(uint64_t wait_budget_ms);
 
-    /// Staging PUT wrappers for `PartWriteTxn` (design 2026-07-16 source-layout §3.4): encapsulate BOTH the
-    /// retry-controller call AND the ref-lane fence predicate (`fence_ok_fn`), so `PartWriteTxn` no longer
-    /// reaches the controller or `refAppendFenceOk` directly (the `friend class PartWriteTxn` is gone).
-    /// Behavior-identical to the previously-inlined controller+fence at `CasPartWriteTxn.cpp` stageManifest /
-    /// uploadFromSource.
+    /// Performs a staged conditional create through the ledger's retry controller and append-fence
+    /// predicate. Callers do not access either dependency directly, so every attempt observes the same
+    /// mount admission rule.
     CasWriteOutcome stagingPutIfAbsent(std::string_view key, std::string_view bytes, Token * out_token);
+
+    /// Performs a conditional staged create using `attempt`, applying the same retry controller and
+    /// append-fence policy as `stagingPutIfAbsent`.
     CasCreateResult stagingConditionalCreate(std::string_view key, const std::function<PutResult()> & attempt);
 
-    /// `EventEmitter` concept hooks (Primitives/CasEvent.h): the ledger emits `CasEvent`s through the
-    /// same `EventEmitter{*this}` helper the Pool used, and forwards a couple of direct emissions -- all
-    /// onto the injected `event_sink`. Kept as members (not bare `event_sink(...)` calls) so
-    /// `EventEmitter<CasRefLedger>` compiles unchanged and the emission idiom matches the pre-move code.
+    /// Hooks required by `EventEmitter`: events are delivered to the injected sink when one is present.
     bool hasEventSink() const noexcept { return static_cast<bool>(event_sink); }
     void emitEvent(CasEvent && e) const { if (event_sink) event_sink(std::move(e)); }
 
+    /// Replaces the retry controller's delay seam for deterministic tests; production callers leave it
+    /// untouched.
     void setCasRetrySleepForTest(std::function<void(uint64_t)> sleep_fn);
 
-    /// ---- test seams (Task 10/11/13) ----
+    /// Test-only observability and fault-injection seams for recovery, wedges, cleanup, and publication.
+    /// The counters expose recovery and publication progress; wedge methods create and inspect the
+    /// unresolved-`PUT` state; cleanup methods expose sweep eligibility; publication methods expose
+    /// settling, snapshot identity, and tail accounting.
+    /// Returns the number of LIST/GET recovery restarts recorded for `ns`.
     uint64_t refRecoveryRestartsForTest(const RootNamespace & ns);
+    /// Reports whether `ns` currently has an unresolved append `PUT`.
     bool refLaneWedgedForTest(const RootNamespace & ns);
+    /// Returns the object key retained for the unresolved append of `ns`.
     String wedgedKeyForTest(const RootNamespace & ns);
+    /// Installs a synthetic unresolved append for `ns` so callers can exercise resolution and blocking.
     void forceWedgeForTest(const RootNamespace & ns, uint64_t writer_epoch, uint64_t ref_sequence,
                            const String & key, const String & bytes);
+    /// Reports whether recovery or a prior incomplete sweep requires stale-precommit cleanup.
     bool needsStalePrecommitSweepForTest(const RootNamespace & ns);
+    /// Waits until all background snapshot publications for `ns` have completed.
     void waitForSnapshotPublishSettleForTest(const RootNamespace & ns);
+    /// Returns the number of background snapshot publications currently in flight for `ns`.
     int pendingSnapshotPublishesForTest(const RootNamespace & ns);
+    /// Returns the newest snapshot id adopted by the cached runtime, if any.
     std::optional<RefTxnId> newestPublishedSnapshotIdForTest(const RootNamespace & ns);
+    /// Returns the number of applied transactions newer than the adopted snapshot.
     size_t tailSinceSnapshotCountForTest(const RootNamespace & ns);
+    /// Returns the number of committed entries in the mutable overlay, when the COW representation has one.
     size_t committedOverlayEntriesForTest(const RootNamespace & ns);
+    /// Installs the test hook invoked immediately before the leader carves a compatible batch.
     void setRefPreCarveHookForTest(std::function<void()> hook) { ref_pre_carve_hook_for_test = std::move(hook); }
 
+    /// Returns the number of queued mutations for `ns` under the queue mutex.
     size_t refQueuePendingForTest(const RootNamespace & ns)
     {
         std::lock_guard<std::mutex> g(ref_queue_mutex);
@@ -122,6 +171,7 @@ public:
         return it == ref_tables.end() ? 0 : it->second->pending.size();
     }
 
+    /// Returns the number of callers currently waiting for `ns` recovery under its state mutex.
     uint64_t refRecoveryWaitersForTest(const RootNamespace & ns)
     {
         const auto rt = getRefTableRuntime(ns);
@@ -129,11 +179,13 @@ public:
         return rt->recovery_waiters_for_test;
     }
 
+    /// Returns the number of namespace runtimes currently retained in the cache.
     size_t refTablesCachedCountForTest()
     {
         std::lock_guard<std::mutex> g(ref_queue_mutex);
         return ref_tables.size();
     }
+    /// Reports whether `ns` has a cached runtime whose recovery completed.
     bool refTableCachedForTest(const RootNamespace & ns)
     {
         std::lock_guard<std::mutex> g(ref_queue_mutex);
@@ -142,7 +194,8 @@ public:
     }
 
 private:
-    /// ---- injected environment (no `Pool` back-reference); initialized first, in this order ----
+    /// Injected storage and mount environment. The member order is part of construction/destruction
+    /// behavior because the callbacks and references are used by the runtime owned below.
     Backend & backend;
     const Layout & layout;
     RefLedgerConfig config;
@@ -157,8 +210,8 @@ private:
     std::function<std::shared_ptr<void>()> pin_owner;
     std::function<void(const RootNamespace &)> cancel_inflight_builds;
 
-    /// At most one outstanding uncertain `PUT` per table (spec §Writer-Side Linearization). Retained
-    /// on the table's runtime until resolved durable (applied to cache first) or definitely rejected.
+    /// Describes the one conditional `PUT` whose outcome is still uncertain for a table. It remains in
+    /// the runtime until the object is confirmed durable and applied to the cache, or definitely rejected.
     struct RefAppendWedge
     {
         RefTxnId txn_id;
@@ -166,8 +219,9 @@ private:
         String bytes;
     };
 
-    /// One queued `appendRefOps` caller. `build_ops` is invoked at most once, from inside the flush,
-    /// and returns the ops it contributes rather than mutating storage directly.
+    /// One queued append caller. `build_ops` is invoked at most once by the flush leader and returns the
+    /// caller's operations rather than mutating storage directly. Completion fields are synchronized by
+    /// `ref_queue_mutex`.
     struct RefMutationItem
     {
         MutationScope scope;
@@ -179,9 +233,8 @@ private:
         RefTxnId committed_id{};                  /// written by the leader before done = true
     };
 
-    /// The whole-table runtime (spec §Startup And Recovery / §Table State): one coherent decoded
-    /// `RefTableState` per namespace, evicted only as a whole (never populated here -- Phase 1 has no
-    /// eviction trigger yet, only lazy recovery on first touch). `state_mutex` is SEPARATE from
+    /// One coherent decoded `RefTableState` and append runtime for a namespace. It is recovered lazily
+    /// and evicted only as a whole. `state_mutex` is separate from
     /// `ref_queue_mutex` (which only ever guards `pending`/`leader_active`) so a reader (resolveRef/
     /// listRefs) can observe `state` without contending with the flush leader's network round trip --
     /// the leader only holds `state_mutex` for the brief copy-out-before-validate and the
@@ -190,53 +243,36 @@ private:
     {
         std::mutex state_mutex;
         bool recovered = false;
-        /// fix-round F3 (author-review: seal encode+PUT running under `state_mutex` for up to the
-        /// ~90s retry envelope stalls every other touch of this table, plus `wedgedRefLaneCount`'s
-        /// whole-store walk). `ensureRefTableRecovered` releases `state_mutex` around the seal's
-        /// encode+PUT only (mirroring `trySnapshotPublishOnce`'s copy-under-lock/PUT-outside shape) --
-        /// this flag is what keeps a concurrent second caller for the SAME namespace, arriving during
-        /// that unlocked window, from redoing an independent LIST+replay+seal attempt that would race
-        /// the SAME seal key (a losing racer's `putIfAbsentControlled` returns `Unresolved` --
-        /// `CasWriteOutcome` has no distinguishable "someone else already created it" -- which the
-        /// existing `!= Committed -> throw ABORTED` check would misreport as a real failure). Instead
-        /// the second caller waits on `recovery_cv` and re-checks `recovered` once the first caller
-        /// finishes, exactly the concurrent-second-caller contract `ensureRefTableRecovered`'s own top
-        /// comment already promises -- just no longer implemented by holding the mutex itself for the
-        /// I/O. Both guarded by `state_mutex`.
+        /// Gates the recovery-seal I/O that runs outside `state_mutex`. A second caller waits on
+        /// `recovery_cv` and rechecks `recovered` after the first caller finishes; otherwise it could
+        /// perform a competing LIST/replay/seal and misclassify the losing conditional `PUT` as failure.
+        /// Both this flag and the condition variable are guarded by `state_mutex`.
         bool recovery_in_progress = false;
         std::condition_variable recovery_cv;
-        /// Test-only: how many callers are PARKED in the `recovery_cv` wait above, right now. A plain
-        /// count (guarded by `state_mutex`, like everything else here) -- lets a test deterministically
-        /// `yield()`-poll for "a second caller has actually reached the wait" instead of racing a
-        /// blocked backend call against thread scheduling (mirrors `refQueuePendingForTest`'s idiom).
+        /// Test-only count of callers currently waiting for recovery; guarded by `state_mutex` so tests
+        /// can observe that a concurrent caller reached the wait without depending on scheduling.
         uint64_t recovery_waiters_for_test = 0;
         RefTableState state;
-        /// Retained `_cleanup/<remove-txn-id>` markers observed at recovery (Task 11's recreation
-        /// gate consumes these via `observedNamespaceCleanupMarker`).
+        /// `_cleanup/<remove-txn-id>` markers observed at recovery, retained for namespace recreation
+        /// checks.
         std::set<RefTxnId> cleanup_markers;
         std::optional<RefAppendWedge> wedge;
         uint64_t recovery_restarts = 0;           /// diagnostic: LIST/GET restarts forced by a vanished object
-        /// Per-table admission budgets (spec §Snapshot Format): the raw hard limits minus this table's
-        /// own `4 + ns.size()` wire overhead and a fixed safety margin, computed once at recovery.
+        /// Per-table admission budgets: raw configured limits minus the table's `4 + ns.size()` wire
+        /// overhead and the fixed safety margin, computed once at recovery.
         uint64_t snapshot_budget = 0;
         uint64_t removal_budget = 0;
 
-        /// rev.6 Task 10 (spec §publish-from-live): the count and encoded-byte sum of every applied txn
-        /// strictly above `newest_snapshot_id` -- the threshold trigger's inputs, and the exact amounts
-        /// a successful publish's adoption subtracts back out. No per-entry retention any more: the live
-        /// `state` above IS the publish candidate body (`trySnapshotPublishOnce` copies it directly), so
-        /// there is nothing left to replay a candidate forward from. Both ATOMIC (relaxed) for the same
-        /// cross-lock `total`-loop read `enforceRefTableCacheBudget`'s pre-candidacy pass performs on
-        /// EVERY cached table under `ref_queue_mutex` alone -- including hot tables whose append lane
-        /// (holding only `state_mutex`) is concurrently mutating these fields. That cross-lock read is a
-        /// data race on a plain `uint64_t` (formal UB, TSan-detectable); an atomic makes it well-defined.
-        /// The gated candidate loop and every other reader/writer already hold `state_mutex`, so relaxed
-        /// ordering is sufficient (these counters carry no happens-before for other state).
+        /// Number and encoded-byte sum of applied transactions strictly newer than `newest_snapshot_id`.
+        /// The live `state` is the next snapshot candidate, so no separate tail replay is retained.
+        /// These counters are atomic because the cache-budget pass reads them while holding
+        /// `ref_queue_mutex`, whereas append and publication paths hold `state_mutex`; relaxed ordering
+        /// is sufficient because the counters do not publish any other state.
         std::atomic<uint64_t> tail_count_since_snapshot{0};
         std::atomic<uint64_t> tail_bytes_since_snapshot{0};
         std::optional<RefTxnId> newest_snapshot_id;
-        /// Task 13 (spec §Byte, Memory, And CPU Budget): whole-table cache-weight bookkeeping for
-        /// `enforceRefTableCacheBudget`. `base_snapshot_bytes` is the encoded body size of the snapshot
+        /// Whole-table cache-weight bookkeeping for `enforceRefTableCacheBudget`.
+        /// `base_snapshot_bytes` is the encoded body size of the snapshot
         /// at `newest_snapshot_id` (0 for a never-published table), captured for free from the
         /// recovered/published snapshot body -- refreshed only when that snapshot changes (recovery +
         /// each publish), never per mutation. The estimated resident weight is
@@ -247,15 +283,15 @@ private:
         /// concurrent writer there), so it stays a plain `uint64_t`.
         std::atomic<uint64_t> base_snapshot_bytes{0};
         uint64_t last_touch_tick = 0;
-        /// Set true by recovery (spec §Clean Up Old Precommits); cleared when a sweep attempt is
+        /// Set true by recovery; cleared when a sweep attempt is
         /// dispatched (so the sweep's own nested `appendRefOps` calls do not recurse) and PERMANENTLY
         /// only once an attempt completes VERIFIED CLEAN (a full pass over the live state found zero
-        /// stale bindings). S13 fix: any failed/partial attempt re-arms it (with the
+        /// stale bindings). Any failed or partial attempt re-arms it (with the
         /// `precommit_sweep_backoff_*` cooldown), so a later read/mutation trigger retries until clean --
         /// a single attempt burned in the post-restart error window must not leave a dead incarnation's
         /// precommit bindings protected from GC forever on a long-lived mount.
         bool needs_stale_precommit_sweep = false;
-        /// S13 fix: per-table retry cooldown for the stale-precommit sweep (guarded by `state_mutex`),
+        /// Per-table retry cooldown for the stale-precommit sweep (guarded by `state_mutex`),
         /// mirroring `publish_backoff_*` below: `until` is the boottime instant before which
         /// `maybeSweepStalePrecommits` refuses to re-attempt; `ms` is the current exponential interval
         /// (0 = no failure yet, or reset by the last verified-clean sweep).
@@ -266,7 +302,7 @@ private:
         /// the condvar (guarded by `state_mutex`) a test waits on via `waitForSnapshotPublishSettleForTest`.
         std::atomic<int> pending_snapshot_publishes{0};
         std::condition_variable publish_settle_cv;
-        /// C4 (spec §writer-snapshot-publication): per-table publish-dispatch backoff (guarded by
+        /// Per-table snapshot-publish dispatch backoff (guarded by
         /// `state_mutex`). `publish_backoff_until_ms` is the boottime instant before which
         /// `maybeScheduleSnapshotPublish` refuses to dispatch; `publish_backoff_ms` is the current
         /// exponential interval (0 = not backing off), doubled on each consecutive non-Committed publish
@@ -288,22 +324,20 @@ private:
         std::atomic<bool> superseded_by_remount{false};
     };
     static constexpr size_t kMaxRefBatch = 128;
-    static constexpr size_t kRefRecoveryMaxRestarts = 3;          /// spec: "bounded (3) and counted"
-    /// rev.6 Task 8 (spec §recovery-seal): a failed recovery-seal PUT (`putIfAbsentControlled` not
-    /// `Committed`) is a SEPARATE fail-closed throw -- it is not one of the restarts counted here
-    /// (those are only LIST/GET restart-on-vanish loops). It leaves `rt.recovered` false, so the table
-    /// stays unrecovered/non-writable and the NEXT touch restarts recovery from a fresh attempt 0
-    /// (re-LIST, re-replay, re-seal), never resuming this bounded loop mid-way.
-    /// Fixed Phase-1 safety margin subtracted (alongside the per-table `4 + ns.size()` overhead) from
+    /// Recovery retries at most this many times when an object selected by LIST vanishes before GET.
+    /// A failed recovery-seal `PUT` is separate: it leaves `recovered` false and the next touch starts
+    /// a fresh LIST/replay/seal attempt rather than resuming this bounded vanish-retry loop.
+    static constexpr size_t kRefRecoveryMaxRestarts = 3;
+    /// Fixed safety margin subtracted (alongside the per-table `4 + ns.size()` overhead) from
     /// the raw `ref_snapshot_max_bytes`/`ref_removal_max_bytes` hard limits before calling `admits`.
     static constexpr uint64_t kRefAdmissionSafetyMargin = 4096;
 
     std::mutex ref_queue_mutex;
     std::map<String, std::shared_ptr<RefTableRuntime>> ref_tables;
-    /// Task 13 (spec §Byte, Memory, And CPU Budget): monotonic access stamp for whole-table cache LRU
-    /// eviction; bumped on every table touch, recorded in `RefTableRuntime::last_touch_tick`.
+    /// Monotonic access stamp for whole-table cache LRU eviction, bumped on every table touch and
+    /// recorded in `RefTableRuntime::last_touch_tick`.
     std::atomic<uint64_t> ref_table_access_tick{0};
-    /// rev.6 Task 5 (spec §clean-release drain): latched by `drainRefLanesForShutdown` BEFORE it
+    /// Latched by `drainRefLanesForShutdown` before it
     /// snapshots `ref_tables`/waits on each table's queue -- every ordinary ref mutation (`appendRefOps`)
     /// checks this under the SAME `ref_queue_mutex` critical section it uses to enqueue its item, so the
     /// check-and-enqueue is atomic with the drain's snapshot-and-wait: a caller either enqueues strictly
@@ -312,45 +346,77 @@ private:
     /// this table is idle.
     std::atomic<bool> shutting_down{false};
 
-    /// Pool-wide strictly-increasing counter (spec §Ordered Ref Transaction Identifier): shared by
-    /// every table of this mounted writer; a fresh writer_epoch (a new Pool) restarts it at one.
+    /// Pool-wide strictly-increasing sequence shared by every table of this mounted writer. A new mount
+    /// epoch starts the sequence at one.
     std::atomic<uint64_t> next_ref_sequence{1};
-    /// The epoch component is the LIVE mount incarnation's writer_epoch, not the open-time
+    /// The epoch component is the live mount incarnation's writer epoch, not the open-time
     /// `process_epoch`: a self-remount allocates a strictly-greater durable writer_epoch, so every ref
     /// transaction stamped after the remount sorts strictly ABOVE any (dead-incarnation or twin) log
     /// still durable under an older epoch. `RefTxnId` compares epoch first, so the epoch bump alone
-    /// guarantees the pagination premise "a new log is never inserted at or below an already durable
-    /// table log id" (spec §Ordered Ref Transaction Identifier / §Step 1).
+    /// guarantees that a new log is never inserted at or below an already durable table log id.
     RefTxnId allocateRefTxnId() { return RefTxnId{live_epoch_fn(), next_ref_sequence.fetch_add(1)}; }
 
-    /// The CAS-owned retry controller (Task 5) this Pool's ref-log writer path uses for every
+    /// The CAS-owned retry controller this Pool's ref-log writer path uses for every
     /// conditional log/snapshot `PUT` and uncertain-result resolution. Also shared (via the PartWriteTxn
-    /// friendship) by `PartWriteTxn::stageManifest`'s part-manifest body `PUT` (chaos-tolerance-report
-    /// §Task B) and by `PartWriteTxn::uploadFromSource`'s blob-body create — both the streaming
+    /// `PartWriteTxn::stageManifest`'s part-manifest body `PUT` and by `PartWriteTxn::uploadFromSource`'s
+    /// blob-body create — both the streaming
     /// `putIfAbsentStream` PUT and `promoteStaged`'s conditional server-side copy — via
-    /// `conditionalCreateControlled` (availfix). The controller is stateless per call (immutable
+    /// `conditionalCreateControlled`. The controller is stateless per call (immutable
     /// budget/clock/sleep — the sleep fn mutates only through the test-only seam, before traffic), so
     /// concurrent lanes and builds use the one instance safely.
     std::unique_ptr<CasRequestController> ref_request_controller;
 
-    /// See `setRefPreCarveHookForTest`. Null in production (a no-op call site).
+    /// Test-only hook called before a compatible append batch is carved; null in production.
     std::function<void()> ref_pre_carve_hook_for_test;
 
-    /// ---- moved private methods (bodies verbatim in CasRefLedger.cpp) ----
+    /// Returns the cached runtime for `ns`, creating an empty unrecovered runtime when needed.
     std::shared_ptr<RefTableRuntime> getRefTableRuntime(const RootNamespace & ns);
+
+    /// Lazily recovers `ns` by listing and replaying its snapshot/log objects. It does not expose the
+    /// table as recovered until any required recovery seal is durable; concurrent callers serialize
+    /// across the unlocked seal I/O through `recovery_in_progress`.
     void ensureRefTableRecovered(const RootNamespace & ns, RefTableRuntime & rt);
+
+    /// Evicts least-recently-touched, idle whole-table runtimes until the configured cache budget is met,
+    /// retaining `keep_ns` even when it is the next candidate.
     void enforceRefTableCacheBudget(const RootNamespace & keep_ns);
+
+    /// Runs the append queue leader for `ns`, completing its own item and any compatible items carved
+    /// into the same batch. Exceptions are stored for waiters and do not leave the leader flag latched.
     void runRefQueueLeader(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt,
                            const std::shared_ptr<RefMutationItem> & own);
+
+    /// Validates, durably appends, and applies one compatible batch while preserving copy-before-commit
+    /// and apply-after-commit ordering.
     void flushRefBatch(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt);
+
+    /// Schedules best-effort background publication when tail thresholds and backoff permit. The
+    /// dispatch is fenced and the detached task retains the owner pin until it finishes.
     void maybeScheduleSnapshotPublish(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt);
+
+    /// Advances the exponential delay after a non-durable snapshot publication outcome.
     void advancePublishBackoff(RefTableRuntime & rt);
+    /// Clears the snapshot-publication delay after durable progress.
     void resetPublishBackoff(RefTableRuntime & rt);
+
+    /// Checks whether recovery or a mutation requested stale-precommit cleanup and dispatches it when
+    /// its per-table cooldown permits.
     void maybeSweepStalePrecommits(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt);
+
+    /// Performs one fenced stale-precommit sweep. A partial or failed sweep re-arms the requirement and
+    /// propagates its exception; only a verified-clean pass clears it.
     void sweepStalePrecommitsNow(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt);
+
+    /// Runs the read-triggered sweep without allowing an uncertain maintenance append to fail the read.
     void sweepStalePrecommitsForRead(const RootNamespace & ns, const std::shared_ptr<RefTableRuntime> & rt);
+
+    /// Advances the stale-precommit sweep's exponential cooldown after failure.
     void advancePrecommitSweepBackoff(RefTableRuntime & rt);
+    /// Clears the stale-precommit sweep cooldown after a verified-clean pass.
     void resetPrecommitSweepBackoff(RefTableRuntime & rt);
+
+    /// Publishes the terminal `Removed` snapshot after the namespace-removal transaction is durable;
+    /// repeated cleanup is idempotent at the object-storage boundary.
     void publishRemovedSnapshotNow(const RootNamespace & ns);
 };
 

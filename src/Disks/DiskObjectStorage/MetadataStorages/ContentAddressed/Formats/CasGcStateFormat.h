@@ -8,14 +8,25 @@
 namespace DB::Cas
 {
 
-/// gc/state control object (spec §GC State): the GC lease, snap config, and cursors. The fold cursor
-/// lives in the write-once fold seal, not here. v3 text: header line + one JSON body object.
+/// The durable lease portion of the `gc/state` control object. `owner` identifies the current GC
+/// leader and `seq` changes when that leader renews the lease. A contender compares the pair across
+/// observations before stealing a stalled lease; a zero owner means that the lease has never been
+/// held.
 struct GcLease
 {
-    UInt128 owner{};          /// gc leader id (random u128); 0 = never held
-    uint64_t seq = 0;         /// renewal counter; a steal observes a stalled (owner, seq)
+    UInt128 owner{};  /// Random GC leader identifier; zero means the lease has never been held.
+    uint64_t seq = 0; /// Renewal counter observed by contenders when deciding whether a lease stalled.
 };
 
+/// The durable control state for GC rounds and snapshot generations. It is materialized as one
+/// versioned JSON control object by `encodeGcState` and read back by `decodeGcState`.
+///
+/// `round` and the snapshot fields are publication cursors: a committed round makes its retire sets
+/// durable, while `snap_generation` and `snap_attempt` identify the fold seal whose snapshot was
+/// adopted. The fold's per-namespace and per-shard cursor lives in that write-once fold seal, not in
+/// this object. `gc_shards` is chosen once and must remain at least one; decoders reject an absent or
+/// zero value instead of silently accepting the C++ default. The manifest sweep cursor is only a
+/// best-effort orphan-manifest cleanup position and is never used for reachability decisions.
 struct GcState
 {
     uint64_t round = 0;            /// the highest GC round whose retire sets are durable
@@ -27,20 +38,34 @@ struct GcState
     GcLease lease;
 };
 
+/// Encode `state` as the canonical `cas_gc_state` text object: a versioned header line followed by
+/// one JSON body object. The writer always emits the complete field set and asserts the invariant
+/// that `gc_shards` is nonzero.
 String encodeGcState(const GcState & state);
+
+/// Decode a complete `cas_gc_state` text object. The header and size limits are checked before the
+/// body is parsed; unknown non-reserved fields are tolerated for forward evolution, but malformed
+/// input, trailing bytes, a missing `gcs`, or a zero shard count raises `CORRUPTED_DATA` rather than
+/// falling back to a default state.
 GcState decodeGcState(std::string_view data);
 
-/// Advisory GC liveness pulse (B160). A leader bumps `hb_seq` on a fast cadence independent of round
-/// progress; a follower's lease steal backs off if it sees this advance. v3 text: header line +
-/// {"by":"<owner hex>","seq":"<hb_seq>"} — the former 24-byte unversioned binary is gone (the last
-/// unversioned object; spec §control-plane).
+/// Advisory liveness state for the GC leader lease. The leader increments `hb_seq` on a fast cadence
+/// independently of round progress, because its lease renewal counter can remain unchanged during a
+/// long fold. A follower that observes the heartbeat advance backs off from stealing the lease; this
+/// prevents mistaking an alive, mid-round leader for a stalled one. The value is persisted as the
+/// versioned `cas_gc_hb` text object, whose body contains `by` and `seq` string values, replacing the
+/// former unversioned 24-byte record.
 struct GcHeartbeat
 {
     UInt128 owner{};
     uint64_t hb_seq = 0;
 };
 
+/// Encode a complete heartbeat as a canonical versioned header line and one JSON body object.
 String encodeGcHeartbeat(const GcHeartbeat & hb);
+
+/// Decode a complete `cas_gc_hb` text object, rejecting malformed input and trailing bytes with
+/// `CORRUPTED_DATA`. Unknown non-reserved fields remain skippable for forward evolution.
 GcHeartbeat decodeGcHeartbeat(std::string_view data);
 
 }

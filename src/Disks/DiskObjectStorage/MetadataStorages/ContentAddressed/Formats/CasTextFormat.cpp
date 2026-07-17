@@ -33,11 +33,10 @@ namespace
 {
 const FormatSettings & jsonWriteSettings()
 {
-    /// CAS owns the JSON escaping alphabet for its text codecs — NOT the ClickHouse-wide default.
-    /// writeJSONString consults FormatSettings::JSON::escape_forward_slashes (default true); a '/'
-    /// in a CAS string value (ref-paths, fold-seal map keys "ns/shard", run keys) must render as
-    /// '/', not '\/'. cas_fold_seal byte-determinism (putDeterministicArtifact retry-equality) and
-    /// every golden text file depend on this being independent of the global default (Phase-1 review).
+    /// CAS text is persisted and, for deterministic objects, compared byte-for-byte on retries.
+    /// Keep slash-containing values such as ref paths and fold-seal map keys rendered as `/`,
+    /// independently of the process-wide JSON setting; otherwise the same logical object could
+    /// produce different bytes and deterministic adoption would reject an equivalent artifact.
     static const FormatSettings settings = []
     {
         FormatSettings s;
@@ -332,8 +331,8 @@ std::optional<TextHeader> sniffHeaderLine(std::string_view bytes)
 
 bool looksZstd(std::string_view bytes)
 {
-    static constexpr char kMagic[4] = {'\x28', '\xB5', '\x2F', '\xFD'};
-    return bytes.size() >= 4 && memcmp(bytes.data(), kMagic, 4) == 0;
+    static constexpr char kZstdFramePrefix[4] = {'\x28', '\xB5', '\x2F', '\xFD'};
+    return bytes.size() >= 4 && memcmp(bytes.data(), kZstdFramePrefix, 4) == 0;
 }
 
 namespace

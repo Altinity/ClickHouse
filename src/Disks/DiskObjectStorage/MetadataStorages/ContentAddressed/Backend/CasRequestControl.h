@@ -10,17 +10,16 @@ namespace DB::Cas
 {
 
 /// Outcome of ONE HTTP attempt for a CAS conditional write (`If-None-Match`/`If-Match`), issued with
-/// the generic S3 client's transparent retries disabled for that attempt (RFC
-/// cas-s3-timeout-retry-control §disable-transparent-conditional-write-retries). This is the seam the
-/// full retry controller (Task 5, `CasRequestController`) is built on: it decides whether another
-/// attempt is legal and how an uncertain result is resolved.
+/// the generic S3 client's transparent retries disabled for that attempt. This is the seam the
+/// `CasRequestController` is built on: it decides whether another attempt is legal and how an
+/// uncertain result is resolved.
 ///   - Committed: the attempt's own request completed successfully (2xx) — the object is durable.
 ///   - DefiniteFailure: a synchronous rejection that PROVES the request was never applied server-side
 ///     — a WHITELISTED malformed-request / entity-too-large / access-denied error ONLY. Never
 ///     `PreconditionFailed`: a lost precondition means the key exists, not that the request failed.
 ///   - Unresolved: everything else — `PreconditionFailed`/`NoSuchKey`, a client-side timeout, a
 ///     connection loss, a 5xx, or any error this classifier does not recognize. The caller resolves
-///     the exact key (Task 5) before deciding whether another attempt is legal; ambiguity always
+///     the exact key before deciding whether another attempt is legal; ambiguity always
 ///     resolves toward Unresolved, never toward a false DefiniteFailure or a false Committed.
 enum class CasWriteOutcome : uint8_t
 {
@@ -38,7 +37,7 @@ constexpr CasWriteOutcome classifyConditionalWriteResult()
 }
 
 /// The exception path: classify what `buf.finalize()` threw for ONE CAS conditional-write HTTP
-/// attempt, per RFC cas-s3-timeout-retry-control §operation-classes. Pure — never rethrows, never
+/// attempt, according to the CAS conditional-write operation classes. Pure — never rethrows, never
 /// touches counters; see recordConditionalWriteOutcome for the counters hookup.
 CasWriteOutcome classifyConditionalWriteResult(const std::exception & e);
 
@@ -52,37 +51,37 @@ void recordConditionalWriteAttemptStarted();
 void recordConditionalWriteOutcome(CasWriteOutcome outcome);
 
 /// Records that the S3 SDK's retry strategy was consulted about issuing a SECOND (or later) HTTP
-/// attempt for a CAS conditional write (RFC cas-s3-timeout-retry-control §observability: "SDK-level
-/// retries, which must remain zero for conditional writes"). The single-attempt client's retry
+/// attempt for a CAS conditional write. SDK-level retries must remain zero for conditional writes. The
+/// single-attempt client's retry
 /// strategy (CasObjectStorageBackend.cpp) always answers no, but the consultation itself proves the
 /// first attempt did not conclusively succeed from the SDK's point of view — this is the live tripwire
 /// that makes the counter provably wired, rather than a value nothing ever touches.
 void recordConditionalWriteSdkRetryConsidered();
 
 /// The three separate limits a CAS-owned retry controller enforces for ONE logical conditional-write
-/// operation (RFC cas-s3-timeout-retry-control §required-timeout-model). Never represented by a
-/// single `request_timeout_ms` value — see `validateCasRequestBudget` for the relationship a writable
-/// mount enforces at startup, and `CasRequestController` for the runtime use.
+/// operation. Never represented by a single `request_timeout_ms` value — see `validateCasRequestBudget`
+/// for the relationship a writable mount enforces at startup, and `CasRequestController` for the
+/// runtime use.
 struct CasRequestBudget
 {
     /// Maximum client wait budgeted for one HTTP attempt. `CasRequestController` uses this ONLY as a
     /// per-attempt scheduling check (an attempt is not started unless it could still finish inside the
     /// operation deadline) — the actual socket-level wait is configured on the object storage's client
-    /// (Task 4, ObjectStorageBackend's single-attempt client), not by this struct.
+    /// (the object storage backend's single-attempt client), not by this struct.
     uint64_t attempt_timeout_ms = 5000;
     /// Maximum wall-clock time for the COMPLETE logical operation — every attempt, every exact-key
     /// resolution, and every inter-attempt backoff sleep — counted from the first call to
     /// `putIfAbsentControlled`. A DURATION, not an absolute deadline: each call establishes its own
     /// `now + operation_deadline_ms` bound.
     ///
-    /// ENVELOPE SIZING (chaos-tolerance-report §Task B follow-up): this deadline is the authoritative
-    /// bound on how long a CAS conditional write keeps riding an S3 disruption server-side before the
-    /// caller sees an abort. 90s absorbs a ~60s object-store outage with margin (see the arithmetic on
-    /// `max_attempts` below) — PROVIDED the mount fence stays alive. The fence, not this deadline, is
+    /// This deadline is the authoritative bound on how long a CAS conditional write keeps riding an S3
+    /// disruption server-side before the caller sees an abort. 90s absorbs a ~60s object-store outage
+    /// with margin (see the arithmetic on `max_attempts` below) — PROVIDED the mount fence stays alive.
+    /// The fence, not this deadline, is
     /// what binds under a TOTAL outage: lease renewals are conditional writes against the same store,
     /// so when everything is unreachable the fence deadline freezes at `last_renew + mount_lease_ttl`
     /// and `fence_ok` stops the loop ≈ TTL−attempt_timeout−margin (~23s) after the last successful
-    /// renewal — the RFC's required fail-closed behavior (never an attempt past the lease), not a
+    /// renewal — the required fail-closed behavior (never an attempt past the lease), not a
     /// budget limitation. While renewals DO land (blips, throttling, partial outages — the renewer runs
     /// on its own background thread and keeps extending the fence deadline), the op is NOT bounded by
     /// the lease TTL and rides the full deadline here.
@@ -96,8 +95,8 @@ struct CasRequestBudget
     /// TTL. Not consulted at runtime by the controller itself — the caller's `fence_ok` callback (backed
     /// by the local write fence's own deadline) is what actually gates lease-relative timing per attempt.
     uint64_t lease_safety_margin_ms = 2000;
-    /// Inter-attempt backoff (RFC cas-s3-timeout-retry-control §Configuration:
-    /// `cas_s3_retry_initial_backoff_ms` / `cas_s3_retry_max_backoff_ms`): the sleep before reissuing
+    /// Inter-attempt backoff (`cas_s3_retry_initial_backoff_ms` /
+    /// `cas_s3_retry_max_backoff_ms`): the sleep before reissuing
     /// after an ambiguous attempt whose resolve observed the key absent, capped exponential —
     /// `initial · 2^(reissues-1)`, never above `retry_max_backoff_ms`. 0 disables backoff (immediate
     /// reissue — the pre-backoff behavior, and what most exhaustion-path unit tests configure). The
@@ -106,8 +105,8 @@ struct CasRequestBudget
     uint64_t retry_max_backoff_ms = 5000;
 };
 
-/// Startup validation (RFC §required-timeout-model): a writable mount refuses to open with an
-/// inconsistent budget rather than silently falling back to an unbounded/unsafe retry policy. Throws
+/// Startup validation: a writable mount refuses to open with an inconsistent budget rather than
+/// silently falling back to an unbounded or unsafe retry policy. Throws
 /// `BAD_ARGUMENTS` unless ALL hold:
 ///   attempt_timeout_ms + lease_safety_margin_ms < mount_lease_ttl_ms
 ///   attempt_timeout_ms <= operation_deadline_ms
@@ -116,15 +115,12 @@ struct CasRequestBudget
 /// refreshed well ahead of the TTL by construction) — it is accepted only so the effective-values log
 /// line records the full picture in one place.
 ///
-/// rev.6 Task 6 handover-wait invariant (design §Late Predecessor PUT): a successor mounting over an
-/// unclean predecessor pays `observation (>= mount_lease_ttl_ms) + T_mat` (`materialization_grace_ms`,
-/// `Pool::open`) before trusting its recovery listings — long enough that ANY conditional PUT the
-/// predecessor could still have in flight has either landed or been dropped by ITS OWN exhausted retry
-/// budget. That holds by construction, with no separate check needed here: the predecessor's own
-/// budget bounds one logical operation's wall-clock life to `attempt_timeout_ms + lease_safety_margin_ms
-/// < mount_lease_ttl_ms` (the inequality this function already enforces at THAT predecessor's open), so
-/// `observation (>= mount_lease_ttl_ms) + T_mat >= all client timeouts + T_mat` is automatically
-/// satisfied for every predecessor this successor could ever reclaim from.
+/// A successor mounting over an unclean predecessor waits at least one lease TTL, plus its
+/// materialization grace period, before trusting recovery listings. This is long enough for any
+/// conditional PUT still in flight at the predecessor to either land or be abandoned by its own
+/// exhausted retry budget. The predecessor's budget is constrained by
+/// `attempt_timeout_ms + lease_safety_margin_ms < mount_lease_ttl_ms`, so no additional handover
+/// check is needed here.
 void validateCasRequestBudget(const CasRequestBudget & budget, uint64_t mount_lease_ttl_ms, uint64_t mount_renew_period_ms);
 
 /// Throw the recoverable "CAS write could not be committed, retry later" condition.
@@ -136,38 +132,38 @@ void validateCasRequestBudget(const CasRequestBudget & budget, uint64_t mount_le
 /// budget mid-outage. The right response is "abandon this attempt, try again later" --
 /// which is precisely what a transient error means.
 ///
-/// It previously threw ABORTED, which was actively harmful to background merges:
-/// ReplicatedMergeMutateTaskBase treats ABORTED as "merge deliberately cancelled
-/// (shutdown / DROP / merges-blocker), not an error", so it neither records
-/// last_exception_time_ms nor lets ReplicatedMergeTreeQueue's exponential backoff
+/// It previously threw `ABORTED`, which was actively harmful to background merges:
+/// `ReplicatedMergeMutateTaskBase` treats `ABORTED` as "merge deliberately cancelled
+/// (shutdown / `DROP` / merges-blocker), not an error", so it neither records
+/// `last_exception_time_ms` nor lets `ReplicatedMergeTreeQueue`'s exponential backoff
 /// engage. Under a sustained store outage the queue re-executed the merge roughly every
 /// 2 seconds, recomputing the whole (possibly multi-GiB) output part every time for the
 /// entire outage -- hundreds of full recomputes, and invisible in system.replication_queue.
 ///
-/// NETWORK_ERROR is the best-fitting EXISTING code:
-///   - it is NOT in the merge "retry silently, no backoff" exemption set (only ABORTED
-///     and PART_IS_TEMPORARILY_LOCKED are), so the existing backoff -- capped by
-///     max_postpone_time_for_failed_replicated_merges_ms -- engages automatically;
+/// `NETWORK_ERROR` is the best-fitting EXISTING code:
+///   - it is NOT in the merge "retry silently, no backoff" exemption set (only `ABORTED`
+///     and `PART_IS_TEMPORARILY_LOCKED` are), so the existing backoff -- capped by
+///     `max_postpone_time_for_failed_replicated_merges_ms` -- engages automatically;
 ///   - it is already in ClickHouse's transient/retryable taxonomy
-///     (checkDataPart::isRetryableException lists it beside ABORTED), so a part under
+///     (`checkDataPart::isRetryableException` lists it beside `ABORTED`), so a part under
 ///     verification is not misread as corrupted;
 ///   - nothing on the merge / insert / replication commit path special-cases it in a way
-///     that would misfire (ZooKeeper retriability keys on Coordination::Exception, a
+///     that would misfire (ZooKeeper retriability keys on `Coordination::Exception`, a
 ///     different type), and it is not caught specially on the CAS write path.
 ///
-/// Honest caveat: NETWORK_ERROR is coarser than the true condition. For the
+/// Honest caveat: `NETWORK_ERROR` is coarser than the true condition. For the
 /// throttled-store / timed-out / lost-lease cases it is accurate; for a purely logical
 /// fence loss (e.g. the namespace is being dropped) it slightly overstates "network".
 /// The precise cause is always in the exception MESSAGE, never inferred from the code.
 ///
 /// If that imprecision ever matters -- operator confusion, or a future upstream change
-/// that attaches merge-path handling to NETWORK_ERROR and reintroduces a collision --
+/// that attaches merge-path handling to `NETWORK_ERROR` and reintroduces a collision --
 /// switch to a dedicated code (e.g. CONTENT_ADDRESSED_WRITE_RETRY_LATER) by changing the
 /// single throw below. A dedicated code is honest and collision-proof by construction
-/// (backoff still engages, since only ABORTED / PART_IS_TEMPORARILY_LOCKED are exempt);
-/// the only extra work is one appended line in ErrorCodes.cpp and, optionally, adding it
-/// to checkDataPart::isRetryableException and an HTTP-status mapping for the foreground
-/// INSERT client. We deliberately kept NETWORK_ERROR for now to add zero new coupling to
+/// (backoff still engages, since only `ABORTED` / `PART_IS_TEMPORARILY_LOCKED` are exempt);
+/// the only extra work is one appended line in `ErrorCodes.cpp` and, optionally, adding it
+/// to `checkDataPart::isRetryableException` and an HTTP-status mapping for the foreground
+/// `INSERT` client. We deliberately kept `NETWORK_ERROR` for now to add zero new coupling to
 /// generic ClickHouse code, consistent with the rest of the CAS layer.
 ///
 /// SCOPE: only the ESCAPING retry-later throws route here (fence lost / write outcome
@@ -201,17 +197,20 @@ enum class CasCreateOutcome : uint8_t
     Unresolved,
 };
 
+/// Result of one `CasRequestController::conditionalCreateControlled` operation. `token` is meaningful
+/// only when `outcome` is `Committed`; it identifies the incarnation created by the successful attempt.
+/// An `Occupied` result deliberately carries no token because the caller must use its normal occupant
+/// handling, whether the occupant was created by a racing writer or by an earlier ambiguous attempt.
 struct CasCreateResult
 {
     CasCreateOutcome outcome = CasCreateOutcome::Unresolved;
     Token token;   /// set ONLY on Committed
 };
 
-/// CAS-owned retry controller (RFC cas-s3-timeout-retry-control): the ONLY place that decides whether a
-/// conditional-write attempt may be reissued, and the seam Tasks 8-11 build the ref writer's append lane
-/// on. It does not itself touch a writer cache or return ACK — RFC §ack-and-cache-rules' "update the
-/// cache and return ACK only after outcome resolution and a final fence check" is the CALLER's job,
-/// driven off the `CasWriteOutcome` this class returns.
+/// CAS-owned retry controller: the only place that decides whether a conditional-write attempt may be
+/// reissued. It does not touch a writer cache or return ACK. Callers update their cache and acknowledge
+/// the operation only after this controller has resolved the outcome and performed its final fence
+/// check, using the returned `CasWriteOutcome`.
 class CasRequestController
 {
 public:
@@ -223,18 +222,18 @@ public:
     /// with no Pool mutex held (every call site — the ref append lane's leader, `stageManifest`, blob
     /// uploads, snapshot publishes — invokes the controller outside its locks; the append lane's
     /// LEADERSHIP is deliberately held across the sleep: same-table appends must queue behind an
-    /// unresolved predecessor PUT anyway, per spec §Writer-Side Linearization).
+    /// unresolved predecessor PUT anyway, preserving the writer's per-table ordering.
     CasRequestController(BackendPtr backend_, CasRequestBudget budget_, std::function<uint64_t()> now_ms_ = {},
                          std::function<void(uint64_t)> sleep_ms_ = {});
 
-    /// Controlled `putIfAbsent` with resolve-before-reissue (RFC §resolve-before-reissuing). Performs at
+    /// Controlled `putIfAbsent` with resolve-before-reissue. Performs at
     /// most `budget.max_attempts` attempts of the exact SAME (key, bytes) — never a different key, never
     /// a different body — bounded by `budget.operation_deadline_ms` measured from this call's own start,
     /// with capped-exponential inter-attempt backoff (`retry_initial_backoff_ms`/`retry_max_backoff_ms`).
     /// `fence_ok` is consulted before EVERY attempt (a false answer sends no further attempt), before
     /// EVERY backoff sleep (a fence lost mid-loop aborts instantly, never after a pointless sleep), and
     /// once more before a `Committed` return (a false answer there means the write may have landed but
-    /// this call reports `Unresolved`, never a false `Committed` — RFC §ack-and-cache-rules). A sleep is
+    /// this call reports `Unresolved`, never a false `Committed`). A sleep is
     /// never entered when it (plus one more attempt) could not fit the operation deadline. An uncertain
     /// attempt is resolved via `resolveByExactGet` before deciding whether to reissue.
     /// Throws `CORRUPTED_DATA` if resolution ever observes DIFFERENT valid bytes at `key` — a real
@@ -247,7 +246,7 @@ public:
     CasWriteOutcome putIfAbsentControlled(std::string_view key, std::string_view bytes,
                                           const std::function<bool()> & fence_ok, Token * out_token = nullptr);
 
-    /// One-shot exact-key resolution of an uncertain immutable-create (RFC §resolve-before-reissuing):
+    /// One-shot exact-key resolution of an uncertain immutable create:
     ///   - identical bytes observed at `key`  -> Committed (the earlier attempt DID commit)
     ///   - DIFFERENT bytes observed at `key`  -> throws CORRUPTED_DATA (a real conflict, not a retry
     ///     signal — never silently treated as ambiguous)
@@ -258,7 +257,7 @@ public:
     CasWriteOutcome resolveByExactGet(std::string_view key, std::string_view expected_bytes,
                                       Token * out_token = nullptr);
 
-    /// Controlled conditional create for CONTENT-ADDRESSED write-once keys whose body CANNOT be
+    /// Controlled conditional create for content-addressed write-once keys whose body CANNOT be
     /// byte-compared across attempts — the blob-body `putIfAbsentStream` create and `promoteStaged`'s
     /// conditional server-side copy (`PartWriteTxn::uploadFromSource`). Byte-exact resolve
     /// (`resolveByExactGet`) is impossible there BY DESIGN: W-FRESH-TAG mints a fresh
@@ -281,9 +280,9 @@ public:
     /// different byte count than it declared), `NOT_IMPLEMENTED` (a mode/capability guard),
     /// `BAD_ARGUMENTS` (a deterministic encode rejection), `CORRUPTED_DATA` (integrity) — propagates
     /// unchanged too, on the FIRST attempt with no resolve and no backoff: a caller/config bug reissue
-    /// would only replay, never a wire ambiguity (availfix review M1).
+    /// would only replay, never a wire ambiguity.
     /// A Done attempt gets the final fence check before being reported Committed
-    /// (RFC §ack-and-cache-rules); Occupied needs none — it acks nothing of OUR write, and the
+    /// Occupied needs none — it acks nothing of OUR write, and the
     /// caller's occupant path gates its own adoption.
     CasCreateResult conditionalCreateControlled(std::string_view key,
                                                 const std::function<PutResult()> & attempt,

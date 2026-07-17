@@ -55,8 +55,8 @@ bool isRemovalClass(const std::vector<RefOp> & ops)
     return std::any_of(ops.begin(), ops.end(), [](const RefOp & op) { return op.kind == RefOpKind::RemoveNamespace; });
 }
 
-/// Byte budget over the encoded TEXT (codecs-v3 phase 3 re-derivation): a removal-class txn shares the
-/// larger complete-table budget and is not op-count capped.
+/// Byte budget over the encoded text. A removal-class transaction uses the larger complete-table
+/// budget; normal transactions also remain bounded by `ref_txn_max_ops`.
 void checkBudget(const std::vector<RefOp> & ops, size_t encoded_bytes)
 {
     const bool removal = isRemovalClass(ops);
@@ -271,7 +271,9 @@ RefLogTxn decodeRefLogTxn(std::string_view data, const String & expected_ns, con
     }
 
     checkTxnIdNonzero(txn.txn_id);
-    /// Key↔body binding (spec §Object Layout): a valid body copied under the wrong key is corruption.
+    /// The namespace and transaction id are duplicated in the body because the object key is the
+    /// source of truth for which transaction is being read. Reject a valid body copied under a
+    /// different key before accepting any of its operations.
     if (txn.ns != expected_ns || txn.txn_id != expected_txn_id)
         throw Exception(ErrorCodes::CORRUPTED_DATA,
             "RefLogTxn: body (ns='{}', txn_id={}-{}) does not match the key it was read from "

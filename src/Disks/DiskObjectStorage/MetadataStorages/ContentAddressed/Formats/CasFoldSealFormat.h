@@ -1,7 +1,5 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <base/types.h>
 #include <base/extended_types.h>
 #include <cstdint>
@@ -13,16 +11,14 @@
 namespace DB::Cas
 {
 
-/// A reference to one write-once run object plus its content checksum (RunFooter checksum), so a
-/// resuming round can verify it adopted the exact bytes a prior attempt sealed (spec §Resume).
+/// A reference to one write-once run object and its whole-object checksum. A retry can compare the
+/// checksum with the bytes already sealed before it adopts or consumes the run.
 ///
-/// `shard` and `generation` (2026-07-02 snapshot-streaming, T0) let consumers resolve a run through the
-/// seal's refs instead of constructing `blobTargetRunKey`: with reference-parent carry a run sealed for
-/// generation G may physically live under an OLDER generation's key namespace, so the key alone no longer
-/// implies the generation, and per-shard association must not parse the key path. `blob_target_runs`
-/// refs SET both at every write point (the fold's `foldDeltasIntoGeneration` and the ref-carry copy).
-/// Other outcome RunRefs (if any) are per-generation-local and MAY leave the defaults (0/0) — those
-/// consumers still key by construction and never resolve through the shard/generation here.
+/// `shard` and `generation` are required on `blob_target_runs`. An idle shard can carry a parent's run
+/// into a newer seal, even though the object remains under the older generation's key namespace. The
+/// explicit fields therefore preserve both the shard association and the physical generation without
+/// making consumers parse a storage key. Run references for objects that are always local to the current
+/// generation may leave these fields at their defaults because their consumers resolve them by key.
 struct RunRef
 {
     String key;
@@ -32,31 +28,30 @@ struct RunRef
     bool operator==(const RunRef &) const = default;
 };
 
-/// What a round did to ONE (namespace, shard). classification is a small enum byte:
-///   0 = Absent (shard not present / fresh-pool), 1 = Unchanged (token matched persisted; skipped),
-///   2 = Folded (records up to the shard_version were folded), 4 = Clamped (the fold was
-///   barrier/anomaly-clamped below the ref-log's current cursor: unfolded events exist or may become
-///   foldable, so the token-diff Skip is FORBIDDEN — the next round must re-read this shard regardless
-///   of an unchanged token).
-/// folded_token is the shard's observed manifest token at fold time.
+/// Records what the current round did for one namespace and shard. `classification` is a persisted byte:
+/// 0 means absent, 1 means unchanged, 2 means all records through the observed cursor were folded, and 4
+/// means folding was clamped below the ref-log cursor. A clamped entry must be read again even if its
+/// manifest token is unchanged, because an unfolded event may become foldable in the next round.
+/// `folded_token` is the manifest token observed when the entry was processed.
 struct ShardCoverage
 {
     uint8_t classification = 0;
     Token folded_token;
 
-    /// Snapshot+log ref model (spec §GC State): the durable `last_folded_ref_id` for this table -- the
-    /// greatest `RefTxnId` whose owner changes have already contributed their manifest-edge delta. Keyed
-    /// per table (one ref-log stream per namespace, shard fixed at 0). {0,0} = nothing folded yet.
+    /// The greatest `RefTxnId` whose owner changes have contributed their manifest-edge deltas. There is
+    /// one ref-log stream per namespace, so this cursor is stored in the namespace's shard-0 entry.
+    /// `{0, 0}` means that no transaction has been folded yet. A clamp leaves the cursor below the
+    /// offending transaction so the complete transaction is retried rather than partially applied.
     RefTxnId last_folded_ref_id{};
 
     bool operator==(const ShardCoverage &) const = default;
 };
 
-/// Per-gc-shard condemned-in-snapshot summary (retired-in-snapshot T4, spec §2.2). Distilled from the
-/// `kCondemned` rows this generation sealed for one gc-shard so `graduationDue` and the pure ref-carry
-/// decision are ZERO-I/O (they read only the seal, never a run). It is TOTAL over `0..gc_shards-1` in
-/// every newly written seal (folding shards compute it from their `still_retired`; pure-carry shards copy
-/// the parent's entry verbatim). A "missing" shard entry is never treated as zero — consumers fail closed.
+/// Per-shard summary of condemned rows carried in the sealed source-edge run. It lets graduation and
+/// pure reference-carry decisions inspect the seal without reading a run. Every newly written seal has
+/// an entry for every shard in `0..gc_shards-1`: a folding shard computes its entry from its remaining
+/// condemned rows, while a pure-carry shard copies the parent's entry. Missing entries are invalid and
+/// must not be interpreted as zero.
 struct CondemnedSummary
 {
     uint64_t condemned_total = 0;   /// count of `kCondemned` rows in this shard's sealed run
@@ -65,19 +60,18 @@ struct CondemnedSummary
     bool operator==(const CondemnedSummary &) const = default;
 };
 
-/// Durable state of one namespace-cleanup item (spec §Clean Old Ref Objects). Phase 1 protocol state
-/// added by the snapshot+log ref design: the two-state record of physically reclaiming a removed
-/// namespace's `@cas@` metadata. `Pending` while enumerate-and-delete passes run; terminal `Completed`
-/// once a pass observed nothing left, after which the `_cleanup` marker and `Removed` snapshot are
-/// (idempotently) published and a later `namespace_birth` may recreate the namespace.
+/// Durable state of the physical cleanup for a removed namespace's `@cas@` metadata. `Pending` remains
+/// in the seal while enumerate-and-delete passes may still find objects. `Completed` is terminal for the
+/// physical pass: the namespace was observed empty, after which the cleanup marker and `Removed` snapshot
+/// can be published idempotently before a later `namespace_birth` recreates the namespace.
 enum class RefNsCleanupState : uint8_t
 {
     Pending = 1,
     Completed = 2,
 };
 
-/// One namespace-cleanup item keyed by `{ns, remove_txn_id}` (spec §Remove Namespace / §Step 6). Carried
-/// forward in the fold seal each generation until `Completed`.
+/// One namespace-cleanup item keyed by `{ns, remove_txn_id}`. It is carried forward in each fold seal
+/// until the `Completed` state has been durably observed and its completion artifacts are present.
 struct RefNsCleanupItem
 {
     RootNamespace ns;
@@ -86,30 +80,33 @@ struct RefNsCleanupItem
     bool operator==(const RefNsCleanupItem &) const = default;
 };
 
-/// The FOLD seal for one GC generation — write-once at <prefix>/gc/gen/<generation>/attempt/<attempt>/fold_seal.
-/// The one-pass ack-floor round records everything it folded here (coarse: no object per
-/// edge/manifest/candidate). This is the sole per-generation coverage record — the resume rule and the
-/// next round's parent-cursor read both key off it.
+/// The write-once fold seal for one GC generation at
+/// `<prefix>/gc/gen/<generation>/attempt/<attempt>/fold_seal`. It is the generation's durable coverage
+/// record: it stores cursors and run references, not one record per edge, manifest, or candidate. A retry
+/// and the next round use the adopted seal to determine what was folded and which parent runs can be
+/// carried forward. Its run references and cleanup items are also the durable inputs to retention and
+/// namespace cleanup. Manifest cleanup is intentionally not represented here: those cleanups execute
+/// inline from the in-memory cleanup map, and no durable cleanup-run reader exists.
 struct CasFoldSeal
 {
     uint64_t generation = 0;
     uint64_t parent_generation = 0;
     std::map<String, ShardCoverage> per_ns_shard;   /// "ns/shard" -> coverage
     std::vector<RunRef> blob_target_runs;           /// the blob in-degree run segments this gen sealed
-    /// (`part_manifest_cleanup` removed in codecs-v3 phase 5: the cleanup RUN object had no reader —
-    /// manifest cleanups execute inline from the in-memory `mf_cleanup` map — so the durable bundle and
-    /// this seal record were dead weight.)
     std::map<uint64_t, CondemnedSummary> condemned_summary;   /// gc-shard -> summary; TOTAL over gc_shards
-    /// Namespace-cleanup items (spec §Step 6), keyed by "<ns>\n<remove-txn-render>". Carried forward each
-    /// generation until Completed. Empty on a pool that has never removed a namespace.
+    /// Namespace-cleanup items, keyed by "<ns>\n<remove-txn-render>". Carried forward until their
+    /// completion artifacts are observed. Empty on a pool that has never removed a namespace.
     std::map<String, RefNsCleanupItem> ns_cleanup_items;
     bool operator==(const CasFoldSeal &) const = default;
 };
 
-/// v3 text (spec §control-plane, DETERMINISTIC — PinnedRaw): header line + a meta line
-/// {"g","pg"} + tagged record lines (fixed section order: cov/btr/cnd/nsc, each sorted) + {"n":count}
-/// trailer. Byte-reproducible for the putDeterministicArtifact retry-equality contract.
+/// Encodes a fold seal as a strict, raw text control object. The header and meta lines are followed by
+/// tagged records in the fixed `cov`/`btr`/`cnd`/`nsc` order and a record-count trailer. Map iteration and
+/// run references are sorted so retries produce byte-identical output for write-once adoption.
 String encodeFoldSeal(const CasFoldSeal & seal);
+
+/// Decodes and validates a fold seal, rejecting unknown fields, malformed records, trailing bytes, and
+/// a trailer count that differs from the records read. Invalid persisted data raises `CORRUPTED_DATA`.
 CasFoldSeal decodeFoldSeal(std::string_view data);
 
 }

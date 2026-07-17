@@ -17,10 +17,10 @@ namespace DB::Cas
 uint64_t manifestCleanupShard(const ManifestId & id, uint64_t gc_shards)
 {
     /// gc_shards >= 1 is enforced by GcState decode (CORRUPTED_DATA on 0).
-    /// Hash the QUALIFIED id (namespace + all three ManifestRef components) using the same mixing
-    /// as `std::hash<ManifestId>`. Routing by `ManifestRef` alone would be the modeled
-    /// `SabotageKeyByRefNotId` hazard: two namespaces can legally carry the same `ManifestRef`
-    /// without addressing the same object, so their cleanup work must never be merged.
+    /// Hash the qualified id (namespace plus all three `ManifestRef` components) using the same
+    /// mixing as `std::hash<ManifestId>`. Two namespaces can legally carry the same
+    /// `ManifestRef` without addressing the same object, so their cleanup work must never be
+    /// merged.
     const size_t h = std::hash<ManifestId>{}(id);
     return static_cast<uint64_t>(h) % gc_shards;
 }
@@ -48,7 +48,7 @@ std::vector<RunRef> ShardReducer::reduce(Backend & backend, const Layout & layou
                                          const std::function<std::optional<HeadResult>(const BlobRef &)> & head_blob,
                                          const std::function<std::optional<HeadResult>(const BlobRef &)> & peek_head,
                                          RetiredMergeResult * out_retired,
-                                    bool suppress_destructive)
+                                         bool suppress_destructive)
 {
     std::vector<RunRef> out_runs;
     foldDeltasIntoGeneration(backend, layout, prior_runs, new_generation, attempt, shard,

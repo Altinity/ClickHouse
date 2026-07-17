@@ -34,8 +34,8 @@ struct GcRoundLogRecord
     UInt64 objects_absent = 0;
     UInt64 objects_replaced = 0;
     UInt64 objects_spared = 0;
-    UInt64 manifests_deleted = 0;   /// owner-removed manifest bodies deleted (B11 — distinct from blob deletes)
-    /// Ack-floor pipeline transitions (RoundReport pass-through, 2026-07-02 copy-forward Task 3).
+    UInt64 manifests_deleted = 0;   /// owner-removed manifest bodies deleted, distinct from blob deletes
+    /// Counts for the three-stage deletion pipeline reported by `Cas::RoundReport`.
     UInt64 entries_condemned = 0;   /// entries newly condemned into the retired list this round
     UInt64 entries_graduated = 0;   /// entries newly floor-passed (published delete_pending) this round
     UInt64 entries_redeleted = 0;   /// pending exact-token blob deletes executed this round
@@ -48,17 +48,16 @@ struct GcRoundLogRecord
 
 using GcRoundLogger = std::function<void(const GcRoundLogRecord &)>;
 
-/// The thin GC pacing thread (M-W T10; design section 4 "a GC scheduler thread calling
-/// Gc::runRegularRound"). All protocol safety lives in Cas::Gc - the lease makes concurrent
-/// schedulers on other mounters safe (work dedup, split-brain-safe), so this thread carries NO
-/// coordination of its own: tick, run one round, log, sleep. Round errors are logged and
-/// swallowed - every step of the round is idempotent and the next tick retries; LOGICAL_ERROR
-/// class failures surface loudly in the log.
+/// Paces regular content-addressed garbage-collection rounds for one pool. The scheduler does not
+/// implement the GC protocol: `Cas::Gc` owns lease acquisition, work deduplication, and the
+/// split-brain-safe round operations, so schedulers on different mounters may run independently.
+/// This class waits for a tick, runs one round, records its result, and retries after exceptions;
+/// round operations are idempotent, while `LOGICAL_ERROR` exceptions remain visible in the log.
 ///
-/// The pacing thread runs as a ThreadFromGlobalPool (NOT a raw std::thread): each round is wrapped
-/// in a ProfileEventsScope for the per-round ProfileEvents delta, and ProfileEventsScope requires
-/// an attached ThreadStatus (CurrentThread::get throws LOGICAL_ERROR on a bare thread).
-/// ThreadFromGlobalPool attaches one; the Manual path runs on the already-attached query thread.
+/// The background and heartbeat workers are `ThreadFromGlobalPool` instances. The background worker
+/// therefore has the attached `ThreadStatus` required by `ProfileEventsScope` for per-round
+/// `ProfileEvents` deltas. A manual round runs on the caller's thread; if that thread has no
+/// `ThreadStatus`, the per-round delta is omitted rather than making the GC round fail.
 class CasGcScheduler
 {
 public:
@@ -70,16 +69,21 @@ public:
         GcRoundLogger logger_ = {});
     ~CasGcScheduler();
 
+    /// Starts the periodic round and heartbeat workers. Calling `start` more than once while the
+    /// scheduler is running is a no-op; after `stop`, it may be started again.
     void start();
+
+    /// Stops both workers, wakes them if they are waiting, and joins them before returning. It is
+    /// safe to call `stop` when the scheduler is not running and from the destructor.
     void stop();
 
     /// Test/diagnostics hook: run ONE round synchronously on the caller's thread. Returns the round
     /// report so the SYSTEM command / tests can inspect it. Emits a Start + Finish record.
     Cas::RoundReport runOneRoundNow(GcRoundLogRecord::Trigger trigger = GcRoundLogRecord::Trigger::Manual);
 
-    /// Per-disk GC health for system.content_addressed_mounts (B3): the process-global CurrentMetrics
-    /// gauges were clobbered with >= 2 CAS disks. All fields snapshot THIS scheduler's own state;
-    /// wedged_namespace_count is read live from the store's ref lanes.
+    /// Returns per-disk GC health for `system.content_addressed_mounts`. The fields describing
+    /// rounds snapshot this scheduler's state, while `wedged_namespace_count` is read live from the
+    /// store's ref lanes; keeping the state here avoids process-global gauges colliding across disks.
     struct GcHealth
     {
         bool is_leader = false;
@@ -88,18 +92,27 @@ public:
         UInt64 last_success_age_seconds = 0;   /// seconds since the last led round (0 if never)
         UInt64 wedged_namespace_count = 0;
     };
+    /// Takes a consistent-enough atomic snapshot for diagnostics. The returned counters are local
+    /// health indicators rather than durable GC state, and the wedged-namespace count is queried
+    /// directly from the store.
     GcHealth gcHealth() const;
 
 private:
+    /// Waits for the configured interval, runs scheduled rounds while the scheduler is active, and
+    /// logs exceptions before continuing with the next tick. The round lock serializes this worker
+    /// with `runOneRoundNow` because the persistent `gc` object is not thread-safe.
     void loop();
-    void heartbeatLoop();   /// B160: bump gc/hb while we hold the lease, on a fast cadence (H <= W)
 
-    /// B160/P3-B1 acquire-time hook: fired synchronously the instant the lease is acquired/renewed,
-    /// BEFORE the round's (potentially long) fold begins — marks us leader and fires the first
-    /// advisory heartbeat pulse immediately, so neither a new automatic leader's nor a manually-
-    /// acquired lease's first (possibly long) round runs unprotected. Shared by BOTH loop() and
-    /// runOneRoundNow() so a manual `SYSTEM ... GC` acquisition is heartbeat-protected exactly like an
-    /// automatic one.
+    /// While this scheduler believes it owns the lease, periodically advances the advisory
+    /// heartbeat independently of round progress. The cadence is shorter than the lease
+    /// observation window, so a long round does not look like a dead leader to another scheduler.
+    /// Heartbeat failures are advisory and are retried on the next cadence.
+    void heartbeatLoop();
+
+    /// Runs synchronously when `Cas::Gc` acquires or renews the lease, before the round's potentially
+    /// long fold begins. It marks this scheduler as the heartbeat owner and sends the first pulse
+    /// immediately; otherwise a new leader's first round could appear inactive until it returned.
+    /// The same hook is used by scheduled and manual rounds so both acquisition paths are protected.
     void onLeaseAcquired();
 
     /// Run one round through the full logging path (Start record, ProfileEventsScope, Finish
@@ -111,7 +124,7 @@ private:
 
     const Cas::PoolPtr store;
     const std::chrono::seconds interval;
-    const std::chrono::milliseconds hb_interval;   /// B160: heartbeat cadence H = interval/4
+    const std::chrono::milliseconds hb_interval;   /// advisory heartbeat cadence, interval / 4 with a 50 ms minimum
     const LoggerPtr log;
     const UInt128 gc_id;
     const String disk_name;
@@ -130,11 +143,16 @@ private:
     std::condition_variable wake;
     bool stopping = false;
     ThreadFromGlobalPool thread;
-    std::atomic<bool> i_am_leader{false};   /// B160: set by the round thread, read by the heartbeat thread
+    /// Set by the round worker and read by the heartbeat worker. It is only an in-process hint: the
+    /// durable lease remains the authority, and a failed round clears the hint before retrying.
+    std::atomic<bool> i_am_leader{false};
     ThreadFromGlobalPool hb_thread;
 
-    std::atomic<Int64> pending_reclaim{0};     /// B3: cumulative condemned - redeleted while leading
-    std::atomic<UInt64> last_success_ms{0};    /// B3: steady-clock ms of the last led round; 0 = never
+    /// Cumulative condemned entries minus exact-token deletes completed by this scheduler while it
+    /// led. It is an approximate health gauge, not durable GC state.
+    std::atomic<Int64> pending_reclaim{0};
+    /// Steady-clock timestamp of the last round that acquired the lease; zero means never.
+    std::atomic<UInt64> last_success_ms{0};
 };
 
 }

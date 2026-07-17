@@ -1,12 +1,22 @@
 #pragma once
-#include <base/types.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasBlobHasher.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFormat.h>
+#include <base/defines.h>
 #include <base/extended_types.h>
 #include <base/hex.h>
+#include <base/types.h>
 #include <Common/Exception.h>
+#include <array>
 #include <compare>
 #include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include <functional>
+#include <fmt/format.h>
+#include <optional>
 #include <string>
+#include <string_view>
+#include <tuple>
 #include <utility>
 
 namespace DB
@@ -14,47 +24,38 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
+    extern const int LOGICAL_ERROR;
 }
 }
 
 namespace DB::Cas
 {
 
-/// Strong-typed id strings for the content-addressed core.
+/// Strongly typed value types and codecs shared by the content-addressed metadata and object paths.
 ///
-/// Each wraps a String but carries a distinct C++ type, so the compiler refuses to mix e.g. a
-/// RootNamespace (the class of bug that caused live-blob data loss: mixed identifier
-/// types made mismatched comparisons silently compile). Construction from String is explicit, there
-/// is NO implicit conversion to String, and the underlying string is reached only through the
-/// explicit string accessor — at the object-storage boundary.
+/// These types deliberately keep protocol identity, content digests, backend tokens, and their
+/// textual forms distinct. Their ordering and equality operators make them usable as ordered keys;
+/// hash specializations below support unordered containers. Conversion to a storage key or wire
+/// representation remains explicit at the boundary that owns that representation.
 ///
-/// (`BlobId` — a bare hex string — was deleted in the mixed-algo-pools refactor: a blob's identity is
-/// now ONLY the `BlobRef` pair, `CasBlobRef.h`. `TreeId` was part of the standalone-tree layer
-/// excised in 2026-07-03 (rev. 15 `PartManifest` redesign) and is no longer defined.)
-///
-/// All of them expose operator<=> and operator== (so they live in std::set / std::map) and a
-/// std::hash specialization (so they live in std::unordered_* containers).
-
-#define CAS_STRONG_STRING(NAME) \
-    class NAME \
-    { \
-    public: \
-        NAME() = default; \
-        explicit NAME(String value_) : value(std::move(value_)) {} \
-        const String & string() const { return value; } \
-        auto operator<=>(const NAME &) const = default; \
-        bool operator==(const NAME &) const = default; \
-    private: \
-        String value; \
-    };
-
 /// Opaque namespace under which root manifests live. The core never interprets its contents:
 /// the wiring composes strings like "srv1/<table_uuid>" or "shadow/<backup>/<table_uuid>".
 /// Layout only validates its shape (non-empty, no leading/trailing or empty segments,
 /// no segment equal to the reserved "_files").
-CAS_STRONG_STRING(RootNamespace)
+/// Construction from `String` is explicit, preventing unrelated identifier types from being mixed;
+/// the underlying string is exposed only through `string` at object-storage boundaries.
+class RootNamespace
+{
+public:
+    RootNamespace() = default;
+    explicit RootNamespace(String value_) : value(std::move(value_)) {}
+    const String & string() const { return value; }
+    auto operator<=>(const RootNamespace &) const = default;
+    bool operator==(const RootNamespace &) const = default;
 
-#undef CAS_STRONG_STRING
+private:
+    String value;
+};
 
 /// Returns 32 lowercase hex chars encoding `v`.
 inline String u128ToHex(const UInt128 & v)
@@ -83,60 +84,33 @@ inline UInt128 hexToU128(const String & hex)
 
 }
 
-#define CAS_STRONG_STRING_HASH(NAME) \
-    template <> \
-    struct std::hash<DB::Cas::NAME> \
-    { \
-        size_t operator()(const DB::Cas::NAME & v) const noexcept \
-        { \
-            return std::hash<std::string>{}(v.string()); \
-        } \
-    };
-
-CAS_STRONG_STRING_HASH(RootNamespace)
-
-#undef CAS_STRONG_STRING_HASH
-
-// ===== Merged from CasBlobDigest.h (merge #1) =====
-#include <base/defines.h>
-#include <base/extended_types.h>
-#include <base/hex.h>
-#include <base/types.h>
-#include <Common/Exception.h>
-#include <array>
-#include <compare>
-#include <cstdint>
-#include <cstring>
-#include <string>
-#include <string_view>
-
-namespace DB
+namespace std
 {
-namespace ErrorCodes
+
+template <>
+struct hash<DB::Cas::RootNamespace>
 {
-    extern const int BAD_ARGUMENTS;
-}
+    size_t operator()(const DB::Cas::RootNamespace & value) const noexcept
+    {
+        return std::hash<std::string>{}(value.string());
+    }
+};
+
 }
 
 namespace DB::Cas
 {
 
-/// The blob CONTENT digest (CAS pluggable-blob-hash Phase 2, design §12): an algo-scoped
-/// variable-length digest that generalizes the fixed 128-bit `UInt128` blob identity so a
-/// 256-bit hash (`sha256`) is admissible alongside the existing 128-bit hashes (`cityHash128`,
-/// `xxh3-128`). Always 32 bytes wide, big-endian; only the FIRST `blobHashLenFor(algo)` bytes
-/// (the ALGO's digest width, 16 or 32 -- Phase 3 T4 deleted the pool-wide width, a mixed-algo pool
-/// has no single one) are meaningful -- bytes beyond that are always zero. A fixed-size
-/// `std::array` (not a `String`): design §12 rejected a variable `String`
-/// because a 32-byte `sha256` digest exceeds libc++'s 22-byte SSO, forcing one heap allocation
-/// per `ManifestEntry` on the manifest-decode READ path (part-folder validate-on-hit) and costing
-/// MORE memory than the fixed array even for the 32-byte case.
+/// A content digest whose width is selected by its hash algorithm. The fixed 32-byte big-endian
+/// storage accommodates the existing 128-bit algorithms (`cityHash128` and `xxh3-128`) and
+/// `sha256`; only the first `blobHashLenFor(algo)` bytes are meaningful and the remaining bytes
+/// must be zero. A fixed array avoids a per-manifest-entry allocation that a variable `String`
+/// would require for 32-byte digests.
 ///
-/// This is the CONTENT digest ONLY (design §12 "widen ONLY the content digest"): internal
-/// 128-bit ids -- `payload_digest`, `RunRef::checksum`, `sourceEdgeId`, `GcLease::owner`,
-/// `GcHeartbeat::owner`, `manifestCleanupShard` -- stay `UInt128` and do NOT become a
-/// `BlobDigest`. This task (Phase 2 Task 1) introduces the type and its codec ONLY; no existing
-/// `UInt128 blob_hash` field is migrated yet (later tasks do that one structure at a time).
+/// This type is reserved for content hashes. Protocol identifiers such as `payload_digest`,
+/// `RunRef::checksum`, source-edge identifiers, lease owners, and cleanup shards remain
+/// `UInt128`, because widening the content digest does not change their separate wire or ordering
+/// contracts. A blob's complete identity is `BlobRef`, which pairs this digest with its algorithm.
 struct BlobDigest
 {
     std::array<uint8_t, 32> bytes{};
@@ -144,9 +118,8 @@ struct BlobDigest
     auto operator<=>(const BlobDigest &) const = default;
     bool operator==(const BlobDigest &) const = default;
 
-    /// For 128-bit pools (`cityHash128`, `xxh3-128`): the existing `UInt128` blob hash, written
-    /// big-endian into `bytes[0:16]`, tail zero. Lets later tasks migrate `UInt128 blob_hash`
-    /// fields to `BlobDigest` incrementally, one structure at a time, without a flag day.
+    /// Converts a 128-bit content hash to the common representation: big-endian in `bytes[0:16]`
+    /// and zero in the tail. This is the bridge for the 128-bit hash algorithms.
     static BlobDigest fromU128(const UInt128 & v)
     {
         BlobDigest d;
@@ -155,9 +128,8 @@ struct BlobDigest
         return d;
     }
 
-    /// Inverse of `fromU128`: reads `bytes[0:16]` as big-endian back into a `UInt128`. Only
-    /// meaningful for a digest actually produced at a 128-bit pool's width -- `bytes[16:32]` are
-    /// ignored (they are zero at a 128-bit pool's codec boundary).
+    /// Reads `bytes[0:16]` as big-endian into a `UInt128`. The conversion is meaningful only for a
+    /// 128-bit digest; the caller is responsible for selecting that width and the tail is ignored.
     UInt128 toU128() const
     {
         UInt128 v = 0;
@@ -184,24 +156,22 @@ struct BlobDigestHash
     }
 };
 
-/// The ONE algo-scoped digest<->hex/bytes codec (design §12 "len-drift" mitigation, the biggest
-/// Phase 2 risk; Phase 3 T4 relocated its width source from the deleted pool-wide `blob_hash_len`
-/// to the per-`BlobRef` algo): every digest<->hex or digest<->bytes conversion routes through an
-/// object constructed from a digest width (16 for `cityHash128`/`xxh3-128`, 32 for `sha256`) --
-/// NEVER a free function taking a bare length. Construct via `Cas::codecFor(algo)`
-/// (`CasBlobRef.h`), the ONE way to obtain one; never wire a pool-wide value in again (a mixed-algo
-/// pool has no single width). `toHex`/`fromHex` render/parse exactly `2 * digestLen()` lowercase
-/// hex chars; `toBytesBE`/`fromBytesBE` (de)serialize exactly `digestLen()` raw bytes; `shardOf`
-/// reads the first 8 bytes big-endian -- bit-identical to today's `blob_hash >> 64` for every
-/// 128-bit digest, the gate this whole refactor must never break (design §12).
+/// Converts a `BlobDigest` using one algorithm's width. A codec must be obtained from the algorithm
+/// through `codecFor`, never from a pool-wide width: a pool may contain multiple algorithms. Hex
+/// and raw-byte conversions accept and produce exactly the selected width. `shardOf` reads the
+/// first eight digest bytes in big-endian order, preserving the existing shard mapping for every
+/// 128-bit digest.
 class DigestCodec
 {
 public:
-    explicit DigestCodec(uint64_t blob_hash_len_) : len(blob_hash_len_)
+    /// Creates a codec for a supported digest width: 16 bytes for the 128-bit algorithms or
+    /// 32 bytes for `sha256`. Any other width violates the per-algorithm representation invariant.
+    explicit DigestCodec(uint64_t digest_len_) : len(digest_len_)
     {
         chassert(len == 16 || len == 32, "DigestCodec: digest length must be 16 or 32 bytes");
     }
 
+    /// Returns the algorithm-specific digest width in bytes.
     uint64_t digestLen() const { return len; }
 
     /// Renders exactly `2 * digestLen()` lowercase hex chars.
@@ -252,10 +222,9 @@ public:
         return d;
     }
 
-    /// BE-u64 of `bytes[0:8]` -- an EXPLICIT big-endian read, bit-identical to today's
-    /// `static_cast<uint64_t>(blob_hash >> 64)` for every 128-bit digest (design §12). This must
-    /// NEVER become a native-endian `memcpy` read: that would silently reshard on a
-    /// little-endian host (the `ShardReducer` misroute hazard the design calls out).
+    /// Returns the first eight digest bytes as a big-endian `uint64_t`. Keep this explicit rather
+    /// than using a native-endian `memcpy`: changing the byte order would silently remap shards on
+    /// little-endian hosts and break compatibility with the 128-bit hash mapping.
     uint64_t shardOf(const BlobDigest & d) const
     {
         uint64_t v = 0;
@@ -267,10 +236,9 @@ public:
 private:
     uint64_t len;
 
-    /// len-drift guard (design §12): bytes beyond the pool's digest width must always be zero at
-    /// a codec boundary. Debug-only (`chassert`) -- this is an internal invariant check, not a
-    /// release fail-close; a genuinely wrong-width INPUT is already rejected loudly by
-    /// `fromHex`/`fromBytesBE` above.
+    /// Checks the representation invariant that bytes beyond the selected width are zero. This is
+    /// a debug-only internal assertion; wrong-width external input is rejected by the decoding
+    /// methods above.
     void checkZeroTail(const BlobDigest & d, [[maybe_unused]] const char * what) const
     {
         for (uint64_t i = len; i < d.bytes.size(); ++i)
@@ -278,15 +246,7 @@ private:
     }
 };
 
-}
-
-// ===== Merged from CasBlobRef.h =====
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasBlobHasher.h>
-
-namespace DB::Cas
-{
-
-/// THE blob identity (mixed-algo pools, design 2026-07-11 §2): the PAIR of the hash algo and the
+/// The complete blob identity is the pair of hash algorithm and
 /// digest. A bare digest is NOT a blob identity anywhere -- `ch128` and `xxh3` digests are both
 /// 16-byte, so the same digest value under two algos names two DIFFERENT objects. BlobRef is
 /// constructed ONLY where algo and digest are born together (the write mint / the hasher) or read
@@ -312,8 +272,7 @@ struct BlobRefHash
     }
 };
 
-/// The ONE way to obtain a digest codec for an algo (replaces the deleted pool-wide
-/// `DigestCodec(PoolMeta)`): width follows the algo, never a pool-level assumption.
+/// Returns the codec whose width belongs to `algo`; callers must not substitute a pool-wide width.
 inline DigestCodec codecFor(BlobHashAlgo algo)
 {
     return DigestCodec(blobHashLenFor(algo));
@@ -333,23 +292,10 @@ inline String blobIdOf(const BlobRef & r)
     return String(blobHashAlgoName(r.algo)) + ":" + blobHexOf(r);
 }
 
-}
-
-// ===== Merged from CasManifestId.h =====
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFormat.h>
-#include <base/types.h>
-#include <base/extended_types.h>
-#include <fmt/format.h>
-#include <cstdint>
-#include <tuple>
-
-namespace DB::Cas
-{
-
-/// The compact reference a root journal stores for a part manifest (spec §Part Manifest Reference
-/// And Identity). It is NOT a string key: `CasLayout::manifestKey` derives the object key from this
-/// ref plus the owning root namespace. `root_namespace_id` is deliberately NOT a field here - it
-/// comes from the owning root context and must never be serialized into the journal ref.
+/// The compact reference a root journal stores for a part manifest. It is not a string key:
+/// `CasLayout::manifestKey` derives the object key from this reference and the owning namespace.
+/// The namespace is deliberately absent because it comes from the owning root context and must not
+/// be serialized into the journal reference.
 ///
 ///   writer_epoch         - durable monotone writer epoch allocated under the mounted `server_root_id`;
 ///                          never reused for that server root.
@@ -372,14 +318,10 @@ struct ManifestRef
     }
 };
 
-/// The protocol identity GC uses (spec §Object Identity And Ownership): namespace-qualified
-/// `ManifestId = (root_namespace_id, ManifestRef)`. It keys source edges / blob deltas / cleanup work
-/// and addressing. `ManifestId` is the protocol identity; the TLA+ model abstracts it to
-/// `ManifestSafetyId = (root_namespace, manifest ref)`, a Phase-0 model-only term that never
-/// appears in this code.
+/// The namespace-qualified protocol identity used by GC for source edges, blob deltas, cleanup work,
+/// and addressing. It is the pair `(root_namespace, ManifestRef)`.
 /// Two namespaces may legally carry the same `ManifestRef` tuple without addressing the same object;
-/// keying source edges / blob deltas / cleanup work by `ManifestRef` alone is the modeled
-/// `SabotageKeyByRefNotId` hazard. Always key by `ManifestId`.
+/// therefore those structures must use `ManifestId`, never `ManifestRef` alone.
 struct ManifestId
 {
     RootNamespace root_namespace;   /// owning namespace; NOT part of the journal ref
@@ -395,10 +337,9 @@ struct ManifestId
     }
 };
 
-/// A `{writer_epoch, build_sequence}` pair identifying the incarnation of a ref-shard (legacy
-/// mutable-shard model). `{0, 0}` is the unstamped sentinel -- a valid value, not an error. Relocated
-/// here from the removed legacy ref-shard codec (dropped with the snapshot+log ref model): it survives as
-/// the type of `ShardCoverage::incarnation` in the fold seal, which the snapshot+log model leaves unstamped.
+/// A `{writer_epoch, build_sequence}` pair identifying the incarnation recorded in shard coverage.
+/// `{0, 0}` is the unstamped sentinel and is valid; it represents a coverage record with no
+/// incarnation stamp rather than an invalid value.
 struct ShardIncarnation
 {
     uint64_t writer_epoch = 0;
@@ -423,6 +364,7 @@ inline String manifestOrdinalFileName(uint32_t manifest_ordinal)
     return fmt::format("{:06}{}", manifest_ordinal, storedSuffix(FormatId::PartManifest));
 }
 
+/// Formats a manifest reference for logs and diagnostics; this is not an object-key encoding.
 inline String manifestRefDebugString(const ManifestRef & ref)
 {
     return fmt::format("{}:{}:{}", ref.writer_epoch, ref.build_sequence, ref.manifest_ordinal);
@@ -430,9 +372,8 @@ inline String manifestRefDebugString(const ManifestRef & ref)
 
 }
 
-/// std::hash specializations so ManifestRef / ManifestId can key unordered containers (the read-path
-/// `(ManifestId, Token)` cache in Phase 1c, plus any GC-side unordered map). Equality is the
-/// `operator==` above; these hashes must agree with it (equal values => equal hash).
+/// Hash specializations for the identity types. Each combines exactly the fields used by its
+/// corresponding `operator==`, so equal keys always have equal hashes.
 namespace std
 {
 
@@ -464,13 +405,10 @@ struct hash<DB::Cas::ManifestId>
 
 }
 
-// ===== Merged from CasToken.h =====
-#include <base/types.h>
-
 namespace DB::Cas
 {
 
-/// How the backend identifies one physical incarnation of a key (protocol spec §2).
+/// How a backend identifies one physical incarnation of an object key.
 enum class TokenType : uint8_t
 {
     ETag = 1,        /// S3-family / Azure
@@ -488,31 +426,9 @@ struct Token
     bool operator==(const Token &) const = default;
 };
 
-}
-
-// ===== Merged from CasRefIds.h =====
-#include <base/types.h>
-#include <base/hex.h>
-#include <Common/Exception.h>
-#include <compare>
-#include <cstdint>
-#include <optional>
-#include <string_view>
-
-namespace DB
-{
-namespace ErrorCodes
-{
-    extern const int LOGICAL_ERROR;
-}
-}
-
-namespace DB::Cas
-{
-
-/// The ordered ref-transaction identifier (spec §Ordered Ref Transaction Identifier). A successful
+/// The ordered ref-transaction identifier. A successful
 /// writer mount establishes a strictly newer `writer_epoch`; within an epoch the mounted writer
-/// allocates `ref_sequence` from a Pool-wide strictly increasing counter at append time. Both fields
+/// allocates `ref_sequence` from a `Pool`-wide strictly increasing counter at append time. Both fields
 /// are nonzero for a valid id -- {0, 0} is never a real transaction. `writer_epoch` is the primary
 /// ordering component, so tuple order matches the intended timeline even across an epoch restart that
 /// resets `ref_sequence` back to one.

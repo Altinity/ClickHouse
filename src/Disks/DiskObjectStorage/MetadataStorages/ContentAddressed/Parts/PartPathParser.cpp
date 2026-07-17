@@ -1,9 +1,13 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Parts/PartPathParser.h>
+#include <array>
 #include <utility>
 
 namespace DB::ContentAddressed
 {
 
+/// Split a path into non-empty components, treating repeated or leading/trailing '/' characters as
+/// separators. The parser deliberately does not normalize or otherwise interpret components: path
+/// classification must be based on the names supplied by the disk layer.
 static std::vector<std::string> splitNonEmpty(const std::string & path)
 {
     std::vector<std::string> parts;
@@ -48,6 +52,9 @@ struct SplitCache
     size_t next = 0;   /// round-robin insertion cursor
     size_t misses = 0; /// underlying `splitNonEmpty` invocations (observability / test oracle)
 
+    /// Return the cached split for `path`, or replace the next round-robin slot with a newly split
+    /// value. A hit does not promote its slot, so this is a fixed-capacity FIFO-style ring rather
+    /// than an LRU. The returned reference remains valid until the next `get` call on this thread.
     const std::vector<std::string> & get(const std::string & path)
     {
         for (size_t i = 0; i < count; ++i)
@@ -68,16 +75,17 @@ thread_local SplitCache tls_split_cache;
 
 const std::vector<std::string> & splitCached(const std::string & path)
 {
+    // Every caller consumes the returned components before asking for another split on this
+    // thread, so the cache may safely reuse its ring slots between classifier invocations.
     return tls_split_cache.get(path);
 }
 
 }
 
-// Locate the <uuid[:3]>/<uuid> anchor inside a split path. ClickHouse table data paths on an Atomic
-// database look like <prefix...>/<uuid[:3]>/<uuid>/<rest...>, where <uuid[:3]> is exactly the first 3
-// characters of the following <uuid> component. The leading <prefix...> is "store" on a real server
-// but is absent in the unit tests, so anchoring on the uuid pair makes parsing robust to either
-// shape. Returns the index of the <uuid> component (so the component after it is the part dir).
+/// Locate the `<uuid[:3]>/<uuid>` anchor inside a split Atomic path. The leading prefix is normally
+/// `store`, but may be absent from a disk-relative path, so the parser identifies the pair by its
+/// shape instead of requiring a particular prefix. Return the index of the UUID component; the
+/// component immediately after it is the part directory when one exists.
 static std::optional<size_t> findTableUuidComponent(const std::vector<std::string> & p)
 {
     for (size_t i = 1; i < p.size(); ++i)
@@ -90,15 +98,12 @@ static std::optional<size_t> findTableUuidComponent(const std::vector<std::strin
     return std::nullopt;
 }
 
-// True iff a path component looks like a MergeTree part directory. A non-Atomic database (Ordinary,
-// Memory, Lazy, ...) stores a table under data/<db>/<table>/ — NOT the UUID-anchored store/ layout —
-// so the uuid anchor cannot find the table/part boundary there (B40: a uuid-only parser
-// misclassified every non-Atomic part file as a verbatim file → data loss). A part directory
-// carries the MergeTree block-range suffix _<min>_<max>_<level>[_<mutation>] (all_1_1_0,
-// 20200101_1_1_0_5) and keeps it through every temporary/operation prefix (tmp_insert_all_1_1_0,
-// tmp_merge_all_1_2_1, delete_tmp_all_1_1_0). So a component is a part dir iff its last 3
-// underscore-separated groups are all non-empty decimal numbers. Grammar-only — no Storages
-// dependency — and used only as a FALLBACK when the uuid anchor is absent.
+/// Return whether a component has the MergeTree part-directory grammar. Non-Atomic layouts do not
+/// have an Atomic UUID anchor, so their part boundary is found from the final three non-empty
+/// decimal underscore-separated groups: `_min_max_level`, optionally preceded by a mutation number.
+/// The grammar also covers temporary and operation prefixes such as `tmp_insert_all_1_1_0` and
+/// `delete_tmp_all_1_1_0`; this helper has no Storage dependency and is used only as the non-Atomic
+/// fallback.
 static bool looksLikePartDir(const std::string & name)
 {
     std::vector<std::string> groups;
@@ -133,20 +138,22 @@ static bool looksLikePartDir(const std::string & name)
     return is_number(groups[n - 1]) && is_number(groups[n - 2]) && is_number(groups[n - 3]);
 }
 
-// The table/part split of a path. table_start..part_idx are the table-identifier components; part_idx
-// is the part directory; components after it are the in-part file path. For the Atomic layout the
-// table identifier is the single <uuid> component; for the non-Atomic layout it is the full
-// data/<db>/<table> path (table_start == 0).
+/// Describes the boundary found by `findPartDirComponent`: components in [table_start, part_idx)
+/// form the table identifier, `part_idx` names the part or reserved part container, and all later
+/// components form the in-part file path. Atomic identifiers contain one UUID component; non-Atomic
+/// identifiers contain the complete `data/<db>/<tbl>` prefix.
 struct PartDirAnchor
 {
     size_t table_start;
     size_t part_idx;
 };
 
-// Locate the part-directory component. Anchor on the uuid pair first (Atomic + the unit tests); if
-// that is absent (non-Atomic data/<db>/<table>/<part>/...), fall back to the RIGHTMOST component
-// that looks like a part dir, with the whole preceding path as the table identifier. Returns
-// nullopt when the path has no part component at all (a table dir or a shallower/non-part path).
+/// Locate the part-directory component. Prefer the UUID anchor for Atomic paths. Without it, treat
+/// the first reserved `detached` or `moving` component after the table root as the boundary, then
+/// fall back to the rightmost component matching the part-directory grammar. The reserved-directory
+/// scan must precede the right-to-left grammar scan: otherwise the inner part name would be mistaken
+/// for the boundary and the reserved directory would become part of a spurious table namespace that
+/// table cleanup does not own. Return nullopt when the path has no part component.
 static std::optional<PartDirAnchor> findPartDirComponent(const std::vector<std::string> & p)
 {
     if (auto uuid_idx = findTableUuidComponent(p))
@@ -169,23 +176,19 @@ static std::optional<PartDirAnchor> findPartDirComponent(const std::vector<std::
     // Anchor on either FIRST (leftmost, index >= 1): the right-to-left part-dir scan below would
     // otherwise anchor on the INNER <part>-shaped component and fold the reserved dir into a
     // spurious table id (data/<db>/<table>/detached or .../moving) that DROP TABLE never cleans,
-    // orphaning a permanently-live ref (U#6, extended to `moving` by the MOVE-to-CA fix). Mirrors
+    // orphaning a permanently-live ref. Mirrors
     // route()'s part_name == kDetachedDirName / kMovingDirName folding.
     for (size_t i = 1; i < p.size(); ++i)
         if (p[i] == kDetachedDirName || p[i] == kMovingDirName)
             return PartDirAnchor{0, i}; // table id = the whole path before the reserved dir
 
-    // ACCEPTED LIMITATION: a non-Atomic database or table literally named `detached` is misparsed
-    // by this anchor — e.g. data/db/detached/all_1_1_0/... folds to table id "data/db" with
-    // part_name "detached" instead of table id "data/db/detached". The two shapes are structurally
-    // indistinguishable from the path string alone (there is nothing here that says whether the
-    // component is the reserved subdir or a table name that happens to collide with it); a full fix
-    // needs a structural anchor supplied by the caller (e.g. knowledge of which databases/tables
-    // exist), which is out of scope for this string-only parser. Deliberately kept: the common case
-    // (real detached dirs on Ordinary-engine tables) must parse correctly, and a table named
-    // `detached` is legal-but-exotic on a pre-release storage engine. Backlogged by the stabilization
-    // campaign. See CaPartPathParser.DetachedNamedTableIsKnownAmbiguityFoldedAsReservedDir, which
-    // pins this exact behavior so any future change here is a conscious one.
+    // A non-Atomic database or table literally named `detached` is necessarily interpreted as the
+    // reserved directory. The two shapes are indistinguishable from a path string alone; resolving
+    // the ambiguity requires caller-supplied knowledge of existing databases and tables, which this
+    // pure string parser intentionally does not have. The reserved interpretation is retained so
+    // ordinary detached-part paths continue to map into the real table namespace. The test
+    // `CaPartPathParser.DetachedNamedTableIsKnownAmbiguityFoldedAsReservedDir` pins this behavior so
+    // any future change here is a conscious one.
 
     // The table identifier must be at least one component (a real table dir, never the bare disk
     // root), so the part dir is at index >= 1. Scan right to left so a part-dir-shaped
@@ -196,8 +199,8 @@ static std::optional<PartDirAnchor> findPartDirComponent(const std::vector<std::
     return std::nullopt;
 }
 
-// Join components [start, end) with '/' into a single table identifier (one component for Atomic,
-// the data/<db>/<table> path for non-Atomic), used opaquely as a stable per-table segment.
+/// Join components [start, end) with '/' into the stable table identifier used by the routing layer:
+/// one UUID component for Atomic paths or the complete `data/<db>/<tbl>` path for non-Atomic paths.
 static std::string joinTableId(const std::vector<std::string> & p, size_t start, size_t end)
 {
     std::string id;
@@ -210,7 +213,8 @@ static std::string joinTableId(const std::vector<std::string> & p, size_t start,
     return id;
 }
 
-/// Test/observability (B1): underlying `splitNonEmpty` invocations on THIS thread.
+/// Return the number of underlying `splitNonEmpty` invocations on the current thread for cache
+/// observability and tests.
 size_t splitCacheMissesForTest()
 {
     return tls_split_cache.misses;

@@ -7,31 +7,40 @@
 namespace DB::Cas
 {
 
-/// The per-hash meta descriptor lifecycle (spec 2026-07-09 §raw-body-refinement, v3). The meta is a
-/// 2-state FRESHNESS MARKER, not a linearization point: the body's in-body incarnation_tag plus
-/// exact-token delete is the safety core, and the meta is only a point-read for the writer's dedup gate.
+/// The two states of the per-hash freshness marker used by the writer's deduplication gate and by GC.
+/// This marker is only a point-read hint, not the linearization point for blob lifetime: the body's
+/// in-body `incarnation_tag` and the body's exact-token delete provide the safety guarantee. A stale
+/// marker can therefore make a writer re-upload conservatively, but it is never authority for deleting
+/// the body.
 enum class MetaState : uint8_t
 {
-    Clean = 0,       /// referenceable; body present (INV-META-BODY)
-    Condemned = 1,   /// GC marked in-degree 0; body STILL present (a writer may resurrect by CAS)
+    Clean = 0,       /// The body is present and may be referenced.
+    Condemned = 1,   /// GC observed zero in-degree; the body remains present until exact-token deletion,
+                     /// so a writer may resurrect it by replacing the body and updating this marker.
 };
 
-/// The durable meta body. v3 text form: header line + {"st":"<state word>","cr":"<condemn_round>",
-/// "sz":"<size>"}. `size` is the raw body size (introspection/fsck/GC accounting — reads never consult
-/// the meta). The meta is CAS-swapped by its backend etag; its on-disk bytes are never compared.
+/// The durable per-hash meta record. Its text representation consists of a format header followed by
+/// one JSON object with the state word, the GC condemnation round, and the raw body size. `size` is
+/// retained for introspection, fsck, and GC accounting; reads of the blob never consult the meta.
+/// Lifecycle transitions are conditional on the backend etag, while the encoded bytes themselves are
+/// not compared. The body header's `v` is the authoritative format version, so `version` remains only
+/// for the inspection interface and is deliberately not serialized in the JSON body.
 struct BlobMeta
 {
-    /// Vestigial: the header line `v` is the authoritative format version. Kept (default 1) because
-    /// CasInspect renders it; NOT serialized to the body, and decode leaves it at 1 (was always 1).
     uint8_t version = 1;
     MetaState state = MetaState::Clean;
-    uint64_t condemn_round = 0;   /// the GC round that condemned this blob (M4: guards a
-                                  /// condemned-etag ABA after spare->re-condemn)
+    uint64_t condemn_round = 0;   /// The GC round that condemned this blob; distinguishes a stale
+                                  /// condemnation from a later spare-and-recondemn transition.
     uint64_t size = 0;
 };
 
-/// Text codec. encode is total; decode fails closed (CORRUPTED_DATA) on bad header/type/unknown state.
+/// Serialize `meta` as the header line and one JSON body line. Invalid `MetaState` values are rejected
+/// with `CORRUPTED_DATA`; the body does not contain `version` because the header owns format versioning.
 String encodeBlobMeta(const BlobMeta & meta);
+
+/// Decode a stored meta record. The header, required state, field types, and complete input are checked;
+/// malformed input, an unknown state, or trailing bytes throws `CORRUPTED_DATA`. Unknown JSON keys are
+/// tolerated so the format can add nonessential fields without breaking older readers.
 BlobMeta decodeBlobMeta(std::string_view bytes);
 
 }

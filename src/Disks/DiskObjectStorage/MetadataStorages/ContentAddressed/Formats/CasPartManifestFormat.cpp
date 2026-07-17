@@ -76,7 +76,8 @@ String bannerFor(std::string_view path, uint64_t n)
 
 String encodePartManifest(const PartManifest & m)
 {
-    /// Canonical path order + duplicate-path rejection (matches the retired binary codec's contract).
+    /// Canonical path order plus duplicate-path rejection makes the encoded record sequence
+    /// deterministic and establishes the ordering required by the lookup helpers.
     std::vector<const ManifestEntry *> sorted;
     sorted.reserve(m.entries.size());
     for (const auto & e : m.entries)
@@ -216,10 +217,10 @@ PartManifest decodePartManifest(std::string_view data)
             if (!ha || !h || !sz)
                 throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: blob entry '{}' missing ha/h/sz", e.path);
             const BlobHashAlgo algo = blobHashAlgoFromWord(*ha, "PartManifest entry");
-            /// Validate the digest hex width BEFORE calling fromHex: DigestCodec::fromHex throws
-            /// BAD_ARGUMENTS (not CORRUPTED_DATA) on a width mismatch, which would escape this
-            /// function uncaught and break the fail-closed CORRUPTED_DATA contract every other decode
-            /// error here honors (house convention established by CasRecordStreamFormat.cpp's parseB).
+            /// Validate the digest width before calling `fromHex`. A width mismatch otherwise
+            /// produces `BAD_ARGUMENTS` instead of the `CORRUPTED_DATA` required for malformed
+            /// serialized input, allowing an invalid manifest to escape the decoder's fail-closed
+            /// error contract.
             const uint64_t expected_hex_len = blobHashLenFor(algo) * 2;
             if (h->size() != expected_hex_len)
                 throw Exception(ErrorCodes::CORRUPTED_DATA,
@@ -236,8 +237,8 @@ PartManifest decodePartManifest(std::string_view data)
             inline_lens.push_back(*il);   /// bytes filled from the payload zone below
         }
 
-        /// Canonical ascending-order + no-duplicate-path enforcement (matches the retired binary
-        /// codec's decode contract): compare only against the immediately-preceding entry, requiring
+        /// Canonical ascending-order and no-duplicate-path enforcement: compare only against the
+        /// immediately preceding entry, requiring
         /// strict '<'. This is sufficient to catch a NON-adjacent duplicate too (e.g. forging entry
         /// c's path to equal entry a's path in an a<b<c stream): the forged c is compared against b,
         /// and since originally a<b, the forged c(=a) is NOT greater than b, so the strict check
@@ -272,7 +273,7 @@ PartManifest decodePartManifest(std::string_view data)
     if (!in.eof())
         throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: trailing bytes after the payload zone");
 
-    /// Recompute + verify payload_digest last, over the fully-decoded body. computePayloadDigest
+    /// Recompute and verify `payload_digest` last, over the fully-decoded body. `computePayloadDigest`
     /// builds its own probe copy with payload_digest zeroed before hashing (see below), so calling it
     /// directly here on `m` (whose payload_digest is whatever was read off the wire) is safe and
     /// matches encode's own computation exactly.

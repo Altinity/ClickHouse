@@ -11,21 +11,24 @@ namespace DB::Cas
 {
 
 /// One writer build prefix under `cas/manifests/<ns>/`: the canonical hex `<epoch-hex>-<seq-hex>/`
-/// directory (spec §Manifest Identifier).
+/// directory encoded as canonical hexadecimal epoch and sequence components.
 struct BuildPrefix
 {
     uint64_t writer_epoch = 0;
     uint64_t build_sequence = 0;
 };
 
-/// fix-round F9 (author-review: `reportLateLogsIfAny` re-emits the same `LOG_WARNING` +
-/// `RefLateLogDetected` event every sweep pass, with no dedup, until GC's ordinary covered-log cleanup
-/// finally removes the log -- which can be many rounds later). A one-shot in-memory latch, keyed by
-/// (namespace, rendered log id), OWNED BY THE LEADER (one `Gc` instance's lifetime -- a fresh leader,
-/// after a steal or a process restart, starts with an empty set, at worst re-emitting once) and passed
-/// down through `sweepNamespace`/`activeManifestKeys` to suppress a repeat report of the SAME anomaly.
+/// One-shot in-memory suppression for a late-reference-log report. The latch is keyed by namespace and
+/// rendered log id and is owned by one leader for the lifetime of its `Gc` instance. It is passed through
+/// the sweep to the LIST-only late-log detector, so a log that remains visible until ordinary covered-log
+/// cleanup catches up is reported once per leader rather than once per sweep pass. A new leader after
+/// leadership transfer or process restart starts with an empty latch and may report the same anomaly once.
 using LateLogDedup = std::set<std::pair<String, String>>;
 
+/// Counters returned by one bounded cursor page. `listed` counts keys in the backend page, `skipped`
+/// counts malformed, protected, ineligible, budget-exhausted, or race-spared keys, and `deleted` counts
+/// only successful exact-token deletions. `next_cursor` and `wrapped` describe the backend cursor; the
+/// cursor is a cleanup-progress hint and is never used as reachability authority.
 struct ManifestSweepResult
 {
     String next_cursor;
@@ -35,25 +38,25 @@ struct ManifestSweepResult
     uint64_t skipped = 0;
 };
 
-/// Per-namespace pre-precommit orphan sweep (spec rev. 15 §Orphan-Part-Manifest-Cleanup-Sweep). Deletes
+/// Per-namespace pre-precommit orphan sweep. Deletes
 /// manifest bodies written before `PrecommitAdd` and never named by any live owner, scoped to ONE
 /// namespace + ONE build prefix. Rules:
-///   - eligibility from the durable watermark fact ONLY (OQ6): the retired sentinel
+///   - eligibility from the durable watermark fact only: the retired sentinel
 ///     (`min_active == UINT64_MAX`), or `min_active > build_sequence`, or a replaced incarnation —
 ///     NEVER a frozen-seq / judged-dead heuristic alone (a missing watermark => not eligible);
 ///   - the active `ManifestId` set comes from the namespace's committed + live-precommit owner view;
 ///   - delete only bodies whose `ManifestId` is ABSENT from the active set, by exact token;
 ///   - emits NO blob deltas (a pre-precommit body never contributed `+1`);
-///   - a 404 mid-sweep is record-and-continue, never a throw (feedback_ca_gc_never_throw_on_404);
-///   - never GETs a condemned body to revive it (feedback_ca_resurrect_invariant) — eligibility +
+///   - a 404 between listing and deletion is record-and-continue, never a throw;
+///   - never GETs a condemned body to revive it — eligibility +
 ///     exact-token delete only.
 /// Returns the number of bodies actually deleted (a `DeleteClass::Deleted`-classified exact-token
 /// delete only, never a spared `NotFound`/`TokenMismatch`) — the decommission manifest-debris drain
 /// (`Core/CasDecommission.cpp`) sums this across every eligible build prefix into
 /// `DecommissionReport::manifest_debris_removed`.
 ///
-/// `warnings`, when non-null, OPTS IN to the decommission drain's tolerate-and-continue contract (spec
-/// §core "Fail-close"): a per-key transient failure (a thrown backend exception on `head`/`deleteExact`)
+/// `warnings`, when non-null, opts in to the decommission drain's tolerate-and-continue contract: a
+/// per-key transient failure (a thrown backend exception on `head`/`deleteExact`)
 /// is pushed onto `*warnings` and the sweep continues with the next key, instead of throwing out of
 /// this call; likewise a protection-view-unavailable namespace (the pre-existing corrupt-snapshot skip
 /// below) also pushes a "cannot confirm emptiness" warning, not just a `LOG_WARNING`. `warnings ==
@@ -67,13 +70,15 @@ struct ManifestSweepResult
 uint64_t sweepNamespace(Pool & store, const RootNamespace & ns, const BuildPrefix & prefix,
                         std::vector<String> * warnings = nullptr, LateLogDedup * dedup = nullptr);
 
-/// Whether `prefix` is sweep-eligible by the durable watermark fact alone (OQ6). The watermark is resolved
-/// from the namespace's server_root_id, not by parsing writer identity. No watermark => not eligible.
+/// Whether `prefix` is sweep-eligible by the durable watermark fact alone. The floor is read from the
+/// mount lease identified by the namespace's server-root prefix, not inferred from the manifest key or a
+/// judged-dead heuristic. A missing lease provides no deletion authority, so the prefix is not eligible.
 bool prefixEligible(Pool & store, const RootNamespace & ns, const BuildPrefix & prefix);
 
-/// Cursor-paced bounded orphan part-manifest sweep over `cas/manifests/`. The cursor is a best-effort
-/// cleanup cursor, never reachability authority. It deletes at most `delete_budget` keys from at most
-/// `list_budget` listed keys.
+/// Cursor-paced bounded orphan part-manifest sweep over `cas/manifests/`. It evaluates each namespace's
+/// durable protection view before deleting and uses exact-token deletion, so a concurrent owner or a
+/// changed object token is spared. The cursor is a best-effort cleanup cursor, never reachability
+/// authority. The page lists at most `list_budget` keys and deletes at most `delete_budget` of them.
 ManifestSweepResult sweepManifestCursorPage(
     Pool & store,
     const String & cursor,

@@ -1,4 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Common/Exception.h>
 #include <algorithm>
 
@@ -17,7 +18,7 @@ namespace
 {
 
 /// True iff `manifest_ref` already names an existing committed row or precommit binding under ANY
-/// ref_name (spec §Add Precommit: "no conflicting owner may name the same manifest"). Linear scan:
+/// ref_name (the add-precommit rule: "no conflicting owner may name the same manifest"). Linear scan:
 /// the state machine is not the hot path (see `admits`'s header doc), and table sizes are bounded by
 /// the same admission budget this invariant protects.
 bool manifestAlreadyOwned(const RefTableState & state, const ManifestRef & manifest_ref)
@@ -31,7 +32,7 @@ bool manifestAlreadyOwned(const RefTableState & state, const ManifestRef & manif
     return false;
 }
 
-/// The `owner_transition` op kind (spec §State Transitions): dispatches on the `(old_binding,
+/// The `owner_transition` op kind: dispatches on the `(old_binding,
 /// new_binding)` shape to one of the four legal transitions (add precommit / remove precommit /
 /// remove committed / promote). Any other shape is not a recognized transition.
 void applyOwnerTransition(RefTableState & state, const RefOp & op)
@@ -42,7 +43,7 @@ void applyOwnerTransition(RefTableState & state, const RefOp & op)
     const bool has_old = op.old_binding.has_value();
     const bool has_new = op.new_binding.has_value();
 
-    /// Add precommit (spec §Add Precommit): no old_binding, a fresh Precommit new_binding.
+    /// Add precommit: no old_binding, a fresh Precommit new_binding.
     if (!has_old && has_new && op.new_binding->kind == RefOwnerKind::Precommit)
     {
         const RefOwnerBinding & b = *op.new_binding;
@@ -56,7 +57,7 @@ void applyOwnerTransition(RefTableState & state, const RefOp & op)
         return;
     }
 
-    /// Remove precommit (spec §Remove Precommit): an exact Precommit old_binding, no new_binding.
+    /// Remove precommit: an exact Precommit old_binding, no new_binding.
     if (has_old && !has_new && op.old_binding->kind == RefOwnerKind::Precommit)
     {
         const RefOwnerBinding & b = *op.old_binding;
@@ -66,7 +67,7 @@ void applyOwnerTransition(RefTableState & state, const RefOp & op)
         return;
     }
 
-    /// Remove committed ref (spec §Remove Committed Ref): an exact Committed old_binding, no new_binding.
+    /// Remove committed ref: an exact Committed old_binding, no new_binding.
     if (has_old && !has_new && op.old_binding->kind == RefOwnerKind::Committed)
     {
         const RefOwnerBinding & b = *op.old_binding;
@@ -78,7 +79,7 @@ void applyOwnerTransition(RefTableState & state, const RefOp & op)
         return;
     }
 
-    /// Promote (spec §Promote): the SAME ref_name and manifest_ref move from Precommit to Committed
+    /// Promote: the SAME ref_name and manifest_ref move from Precommit to Committed
     /// in one atomic step; the resulting row's `published_at_ms` starts unset (installed by the
     /// companion set_payload op in the same transaction, or a later one).
     if (has_old && has_new && op.old_binding->kind == RefOwnerKind::Precommit
@@ -93,7 +94,7 @@ void applyOwnerTransition(RefTableState & state, const RefOp & op)
         /// A DIFFERENT manifest already committed under this exact ref_name must be evicted by its
         /// own explicit owner_transition(old=Committed, new=None) first (an earlier op of this same
         /// transaction, or an earlier transaction) -- never silently here. `GC`'s manifest-edge delta
-        /// (spec §Produce Manifest-Edge Delta) is read off the transaction's explicit ops, not a
+        /// is read off the transaction's explicit ops, not a
         /// before/after state diff; a promote that silently evicted a stale committed row would never
         /// emit that manifest's "-1" edge, leaking it as phantom-alive forever.
         if (state.committed.contains(b.ref_name))
@@ -111,11 +112,10 @@ void applyOwnerTransition(RefTableState & state, const RefOp & op)
         "RefTableState: owner_transition does not match any legal transition shape");
 }
 
-/// The `set_payload` op kind (spec §Update Payload): the committed ref must still name
-/// `expected_manifest_ref`; replaces the opaque `payload` blob and `published_at_ms` without touching
-/// the manifest edge. All-tree-part-files Task 9: production never populates `payload` with anything
-/// anymore (the mutable-file map it used to carry is gone) -- the op still applies whatever bytes a
-/// caller gives it (codec/state-machine test coverage keys off this).
+/// The `set_payload` op kind: the committed ref must still name `expected_manifest_ref`; replaces the
+/// opaque `payload` blob and `published_at_ms` without touching the manifest edge. Production no longer
+/// uses the payload for a mutable-file map, but the wire carrier remains general and this state machine
+/// still applies whatever bytes a caller supplies.
 void applySetPayload(RefTableState & state, const RefOp & op)
 {
     if (state.lifecycle != RefLifecycle::Live)
@@ -129,14 +129,14 @@ void applySetPayload(RefTableState & state, const RefOp & op)
     /// `RefCowMap`'s iterator is read-only (Pool/CasRefCowMap.h): a write always goes through
     /// `insert_or_assign`, never through the found iterator in place. Copy the row, apply the same
     /// two field mutations the old in-place code did, and write the whole row back -- this IS the
-    /// COW map's single-row copy-out (spec §Mechanism), not a whole-table one.
+    /// COW map's single-row copy-out, not a whole-table one.
     RefCommittedRow updated = it->second;
     updated.payload = op.payload;
     updated.published_at_ms = op.published_at_ms;
     state.committed.insert_or_assign(op.ref_name, std::move(updated));
 }
 
-/// One operation's local preconditions and effect (spec §State Transitions), shared by
+/// One operation's local preconditions and effect, shared by
 /// `applyRefLogTxn`'s per-op loop and by `admits`'s single-op preview. `txn_id` is only read by
 /// `RemoveNamespace` (it becomes the resulting `remove_txn_id`).
 void applyOpInPlace(RefTableState & state, const RefOp & op, const RefTxnId & txn_id)
@@ -145,9 +145,9 @@ void applyOpInPlace(RefTableState & state, const RefOp & op, const RefTxnId & tx
     {
         case RefOpKind::NamespaceBirth:
         {
-            /// spec §Namespace Birth: legal from never-born or Removed, never from Live. Gating
-            /// recreation on the `_cleanup` marker is the writer's recovery-time responsibility
-            /// (Task 10/11) -- the marker is not part of `RefTableState`.
+            /// Namespace birth: legal from never-born or Removed, never from Live. Gating
+            /// recreation on the `_cleanup` marker is the writer's recovery-time responsibility;
+            /// the marker is not part of `RefTableState`.
             if (state.lifecycle == RefLifecycle::Live)
                 throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableState: namespace_birth while already Live");
             state.lifecycle = RefLifecycle::Live;
@@ -162,7 +162,7 @@ void applyOpInPlace(RefTableState & state, const RefOp & op, const RefTxnId & tx
             return;
         case RefOpKind::RemoveNamespace:
         {
-            /// spec §Remove Namespace: requires Live and both owner sets already empty -- true only
+            /// Remove namespace: requires Live and both owner sets already empty -- true only
             /// if this transaction's earlier ops (checked by `checkRemoveNamespaceOrdering`) actually
             /// named every owner that existed when the transaction started.
             if (state.lifecycle != RefLifecycle::Live)
@@ -180,7 +180,7 @@ void applyOpInPlace(RefTableState & state, const RefOp & op, const RefTxnId & tx
     throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableState: unknown op kind {}", static_cast<uint8_t>(op.kind));
 }
 
-/// Txn-wide structural check (spec §Remove Namespace), NOT a per-op precondition: if `ops` contains a
+/// Txn-wide structural check, NOT a per-op precondition: if `ops` contains a
 /// `RemoveNamespace`, it must be the last element, and every earlier op must be an exact
 /// owner-removal `owner_transition` (`old_binding` set, `new_binding` empty). `CasRefLogCodec`
 /// deliberately does not check this shape -- this is the one place that does.
@@ -232,7 +232,7 @@ RefTableState stateFromSnapshot(const RefTableSnapshot & snapshot)
     return state;
 }
 
-/// The hypothetical complete-removal transaction for `state` (spec §Remove Namespace: an exact
+/// The hypothetical complete-removal transaction for `state` (an exact
 /// owner-removal op for every committed ref and precommit, then `remove_namespace`), used only to
 /// measure `admits`'s removal-budget bound -- never persisted, never applied.
 RefLogTxn buildHypotheticalRemovalTxn(const RefTableState & state, const RefTxnId & placeholder_txn_id)
@@ -340,24 +340,6 @@ bool admits(const RefTableState & state, const RefOp & op, uint64_t snapshot_bud
     return removal_bytes.size() <= removal_budget;
 }
 
-}
-
-// ===== Merged from CasRefIntake.cpp (merge #8) =====
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
-#include <Common/Exception.h>
-#include <algorithm>
-
-namespace DB
-{
-namespace ErrorCodes
-{
-    extern const int CORRUPTED_DATA;
-}
-}
-
-namespace DB::Cas
-{
-
 std::vector<RefManifestEdge> manifestEdgesOfTxn(const RefLogTxn & txn)
 {
     std::vector<RefManifestEdge> edges;
@@ -373,7 +355,7 @@ std::vector<RefManifestEdge> manifestEdgesOfTxn(const RefLogTxn & txn)
         const bool has_new = op.new_binding.has_value();
 
         /// Promote / same-manifest owner move: the owner changes kind but the manifest keeps an owner
-        /// the whole time, so there is no net edge (spec §Promote).
+        /// the whole time, so there is no net edge.
         if (has_old && has_new && op.old_binding->manifest_ref == op.new_binding->manifest_ref)
             continue;
 
@@ -449,9 +431,8 @@ RefCleanupPlan planRefCleanup(const RefTableListing & listing, const RefTxnId & 
 
     /// The coverage boundary `X` is the newest snapshot known to be durable: the newest observed in this
     /// round's scan, and -- for a namespace-cleanup item that reached `Completed` this round -- the
-    /// `Removed` snapshot the caller just made durable (spec §Namespace Removal republication path). With
-    /// neither there is no boundary, so no log is coverage-deletable and no older snapshot exists to delete
-    /// (spec §Step 6, condition 2).
+    /// `Removed` snapshot the caller just made durable. With
+    /// neither there is no boundary, so no log is coverage-deletable and no older snapshot exists to delete.
     std::optional<RefTxnId> newest_snapshot;
     if (!listing.snapshots.empty())
         newest_snapshot = listing.snapshots.back();

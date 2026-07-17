@@ -16,16 +16,17 @@ namespace DB::Cas
 namespace
 {
 
-/// Generation-1 baseline for every class. Future format changes APPEND to the matching array (and bump
-/// G_BUILD): additive => {gen, prior_min_reader}; breaking => {gen, gen}. Never edit an existing entry.
+/// Generation-1 baseline for every class. A future format change appends to that class's array and
+/// bumps `G_BUILD`: additive changes use the previous reader floor, while breaking changes use the
+/// new generation as the floor. Existing entries are immutable history.
 constexpr FormatChangePoint BASELINE[] = {{1, 1}};
 
 }
 
 std::span<const FormatChangePoint> changePoints(FormatId id)
 {
-    /// Today every class shares the gen-1 baseline. As classes diverge, give each its own static array
-    /// and switch on `id` here.
+    /// All classes currently share the generation-1 baseline. When a class evolves, give it a
+    /// class-specific static array and select it by `id` here.
     switch (id)
     {
         case FormatId::Blob:
@@ -55,7 +56,8 @@ uint32_t currentWriterVersion()
 
 uint32_t currentCompatibilityVersion()
 {
-    /// Pre-roster: stamp G_BUILD as the compatibility floor on every object written.
+    /// Until roster-based write-down is implemented, every object carries the current build as its
+    /// compatibility floor.
     return G_BUILD;
 }
 
@@ -72,21 +74,22 @@ namespace
 constexpr uint64_t kKiB = 1024;
 constexpr uint64_t kMiB = 1024 * 1024;
 
-/// Caps are 100-1000x above realistic sizes (hitting one is corrupt object or protocol bug).
-/// RefLog/RefSnapshot caps were re-derived for JSON in phase 3: object_cap 64 MiB (decompressed)
-/// comfortably covers the JSON-inflated removal-class txn / full snapshot -- the codec self-checks
-/// `ref_txn_max_bytes` = 1 MiB / `ref_removal_max_bytes` = `ref_snapshot_max_bytes` = 64 MiB over the
-/// text before sealing. line_cap == object_cap here (not a smaller streaming-style cap): these are
-/// WHOLE-READ formats (the object is fully materialized under object_cap), so a per-line cap adds no
-/// memory protection of its own -- line_cap exists to bound O(line) STREAMING formats. A line_cap
-/// below the object budget would create a write/read split: `admits` measures whole-txn text against
-/// the object budget with no per-line check, so a single ref payload near the budget would be
-/// ACCEPTED on write and then REJECTED on decode -- a persisted, undecodable, self-inflicted wedge of
-/// the ref lane. The binary codec these replace had no per-record cap either; matching that capacity
-/// is a re-encode, not a new restriction.
-/// Compression policy is per-type and deterministic (no size threshold): Always = the object can
-/// grow large and is stored under a `.zst` key suffix; PinnedRaw = deterministic byte-adoption
-/// formats; Never = always-small singletons, bare cat-able.
+/// Caps are 100-1000x above realistic sizes; hitting one indicates a corrupt object or protocol bug.
+/// `RefLog` and `RefSnapshot` objects are read whole, so their 64 MiB decompressed object cap
+/// accommodates the JSON-inflated removal-class transaction and full snapshot. Their codecs
+/// independently enforce the existing `ref_txn_max_bytes` (1 MiB) and 64 MiB removal/snapshot budgets
+/// before sealing.
+///
+/// Their `line_cap` intentionally equals `object_cap`. A smaller per-line limit would add no memory
+/// protection to a whole-read format, while creating a write/read split: admission measures the whole
+/// transaction against the object budget, so a large individual ref payload could be accepted on
+/// write and rejected on decode, leaving a persisted ref object that cannot be read. The line cap is
+/// instead meaningful for streaming formats, where it bounds the resident O(line) record. Matching
+/// `line_cap` to `object_cap` lets any individually valid record consume the available object budget.
+///
+/// Compression is per type and deterministic, with no size threshold. `Always` types can grow large
+/// and use a `.zst` key suffix; `PinnedRaw` types need stable bytes for adoption; `Never` types are
+/// small raw singletons.
 constexpr FormatTraits TRAITS[] =
 {
     {FormatId::Blob,         "cas_blob",          TextFamily::PayloadHybrid, KeyStrictness::Tolerant, CompressionPolicy::Never,     256,        256},

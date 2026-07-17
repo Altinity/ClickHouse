@@ -1,26 +1,26 @@
 #pragma once
+
 #include <base/types.h>
 #include <optional>
 
 namespace DB
 {
 
-/// Purpose-built seam for DataPartsExchange (M-W design section 4): everything replication needs
-/// from a content-addressed disk, nothing else. Implemented by ContentAddressedMetadataStorage;
-/// obtained by dynamic_cast on the disk's IMetadataStorage — to THIS interface, never to the
-/// concrete class (the design's "small purpose-built facade instead of dynamic_cast into the
-/// concrete class").
+/// Purpose-built seam for `DataPartsExchange`: it exposes everything replication needs from a
+/// content-addressed disk and nothing else. `ContentAddressedMetadataStorage` implements it, and
+/// the exchange obtains the interface by casting the disk's `IMetadataStorage` to this interface
+/// rather than depending on the concrete storage class. Keeping this boundary narrow prevents the
+/// replication path from becoming coupled to content-addressed storage internals.
 ///
-/// Relink wire contract (B7 part-manifest model, maintainer-approved part_manifest_v2 — self-contained
-/// since all-tree Task 7: no separate metadata_version wire field, the transferred manifest alone is
-/// enough to rebuild the part): the sender transmits {pool_uuid, encoded PartManifest body}; the
-/// legacy `part_id` cookie field carries the opaque manifest bytes (replica-internal wire on this
-/// branch — no protocol field changes). Sender identity in the body (ManifestRef, root_namespace_id,
-/// payload_digest) is NON-AUTHORITATIVE — the receiver uses ONLY the entries, runs a normal LOCAL
-/// build over the SHARED-pool blobs (adopted by
-/// hash; no blob body is transferred), and publishes its OWN fresh receiver-local ManifestId. A blob
-/// no longer present/condemned makes adoptPartFromManifest return false and the caller falls back to
-/// the byte fetch — exactly where the old 4-step pin protocol fell back.
+/// Relink wire contract: the sender transmits `{pool_uuid, encoded PartManifest body}`. The
+/// replica-internal `part_id` cookie carries the opaque manifest bytes, so this exchange does not
+/// add a protocol field. The manifest's sender-specific identity (`ManifestRef`, `root_namespace_id`,
+/// and `payload_digest`) is not authoritative: the receiver uses only the entries, adopts references
+/// to blobs in the shared pool by hash without reading blob bodies from the sender, and publishes a
+/// fresh manifest in its own namespace. Every per-part file is an ordinary manifest entry, so the
+/// manifest is self-contained and there is no separate sidecar or metadata-version wire field.
+/// When the local manifest cannot be committed — for example a required blob body is absent at
+/// precommit — adoption publishes nothing and the caller falls back to fetching the part bytes.
 class IContentAddressedExchange
 {
 public:
@@ -31,20 +31,24 @@ public:
     /// the storage started up.
     virtual const String & getPoolUUID() const = 0;
 
-    /// Sender side: THIS server's committed part's encoded `PartManifest` body (the opaque payload
-    /// the receiver decodes) for the given disk-relative part path. nullopt = the part is not a
-    /// committed content-addressed part here => no relink offer; the sender streams bytes.
+    /// Sender side: returns the encoded `PartManifest` body for this server's committed part at the
+    /// given disk-relative path. The body is opaque to the exchange caller and is decoded by the
+    /// receiver. `nullopt` means that the path is not a committed content-addressed part here, so
+    /// the sender must make no relink offer and streams the part bytes instead.
     virtual std::optional<String> getPartManifestBytes(const String & part_path) const = 0;
 
-    /// Receiver side: decode the transferred manifest body, run a normal LOCAL build over the
-    /// shared-pool blobs (adopt-by-hash; NO blob body read from the sender), stage a FRESH
-    /// receiver-local manifest in the RECEIVER namespace (derived from table_uuid; the sender's
-    /// root_namespace_id is ignored), precommitAdd + promote it (fail-closed blob revalidation) --
-    /// the manifest is self-contained (all-tree-part-files Task 7: every per-part file, formerly-
-    /// mutable ones included, rides in `entries`; there is no separate sidecar to transfer). Returns
-    /// true iff a local manifest was committed and the ref is live. Returns false — publishing
-    /// NOTHING — on ANY retryable failure (decode/validation/stage/precommit/promote, including a
-    /// condemned/absent blob: ABORTED); the caller falls back to a byte fetch.
+    /// Receiver side: decodes the transferred manifest, performs a normal local build from shared-
+    /// pool blob references without reading blob bodies from the sender, and stages a fresh manifest
+    /// in the receiver namespace derived from `table_uuid`. The sender's `root_namespace_id` is
+    /// ignored. The build calls `precommitAdd` and then `promote`. Promotion trusts the adopted
+    /// references through the durable manifest edge — it does not re-read each blob body — the same
+    /// interserver trust as an ordinary `ReplicatedMergeTree` fetch. Returns `true` only after the
+    /// local manifest is committed and its ref is live. Returns `false` without publishing anything on
+    /// a manifest decode failure, on a retryable promote failure (a body-absent precommit, a precommit
+    /// that is no longer the live owner, or a ref conflict, reported as `ABORTED` or `NETWORK_ERROR`),
+    /// or on any other error; the caller then falls back to fetching the part bytes. A blob that
+    /// becomes absent or condemned after adoption is not caught here; it is an fsck-detectable
+    /// invariant violation.
     virtual bool adoptPartFromManifest(
         const String & table_uuid,
         const String & part_name,

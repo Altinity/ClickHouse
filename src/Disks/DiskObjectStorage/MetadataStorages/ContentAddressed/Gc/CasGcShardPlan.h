@@ -3,12 +3,12 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <base/types.h>
 #include <base/extended_types.h>
 #include <charconv>
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -16,7 +16,7 @@
 namespace DB::Cas
 {
 
-/// Blob target shard for a blob hash (spec §Sharding Model).
+/// Blob-target shard for a blob identity.
 ///
 /// Deterministic and total over all hashes: the blob-target sharding axis uses the high 64 bits of
 /// the 128-bit blob hash modulo `gc_shards`. The high bits are taken rather than the low bits so
@@ -29,11 +29,9 @@ namespace DB::Cas
 ///   - Total: result is in [0, gc_shards).
 ///   - Single-shard equivalence: gc_shards == 1 always returns 0.
 ///
-/// Takes a `BlobRef` (Phase 3 T3 — widened from the bare `BlobDigest` overload) so the identity
-/// pair travels through the sharding axis too, even though the shard number ITSELF is derived from
-/// `ref.digest` alone (deliberately ignoring `ref.algo`): distribution comes from the digest bytes,
-/// and taking the whole `BlobRef` prevents a caller from silently discarding the algo half of the
-/// identity before routing.
+/// The argument is the complete `BlobRef`, so callers cannot silently discard its algorithm while
+/// routing. The shard number deliberately uses only `ref.digest`: distribution comes from the
+/// digest bytes, while the algorithm remains part of the identity carried through the GC pipeline.
 inline uint64_t blobShard(const BlobRef & ref, uint64_t gc_shards)
 {
     /// gc_shards >= 1 is enforced by GcState decode (CORRUPTED_DATA on 0).
@@ -48,8 +46,9 @@ inline uint64_t blobShard(const BlobRef & ref, uint64_t gc_shards)
 }
 
 /// Route a part-manifest cleanup bundle to a worker by its namespace-qualified `ManifestId`. Workers
-/// own disjoint ranges; routing by `ManifestRef` alone would merge two namespaces' cleanup work
-/// (Phase 0 `SabotageKeyByRefNotId`). `gc_shards == 1` routes every `ManifestId` to owner shard 0.
+/// own disjoint ranges; routing by `ManifestRef` alone would merge cleanup work from two namespaces
+/// that happen to reuse the same reference components. `gc_shards == 1` routes every `ManifestId`
+/// to owner shard 0.
 ///
 /// The hash mixes both the `root_namespace` string and the three `ManifestRef` components — the
 /// same mixing used by `std::hash<ManifestId>`. Two `ManifestId`s that share the same `ManifestRef`
@@ -61,7 +60,7 @@ inline uint64_t blobShard(const BlobRef & ref, uint64_t gc_shards)
 ///   - Single-shard equivalence: gc_shards == 1 always returns 0.
 uint64_t manifestCleanupShard(const ManifestId & id, uint64_t gc_shards);
 
-/// Per-shard in-degree reducer for phase 4 of the sharded GC fold (spec §Phase4).
+/// Per-shard in-degree reducer for the sharded GC fold.
 ///
 /// `ShardReducer` owns exactly ONE target shard (`shard` in [0, `gc_shards`)). It accepts the
 /// caller's per-shard slice of `BlobDelta`s — produced by `foldManifestEdges` and bucketed by
@@ -74,7 +73,7 @@ uint64_t manifestCleanupShard(const ManifestId & id, uint64_t gc_shards);
 ///
 /// The `reduce` method delegates to `foldDeltasIntoGeneration` (the same path the non-sharded fold
 /// uses with `shard == 0`), so `gc_shards == 1` with `shard == 0` reproduces the non-sharded fold
-/// byte-for-byte (Task 7 compatibility requirement).
+/// byte-for-byte. This keeps the one-shard configuration compatible with the original fold path.
 ///
 /// NOTE on durable writes: `reduce` writes the per-shard in-degree run directly via `backend`
 /// (under `blobTargetRunKey(new_generation, shard, 0)`), exactly as `foldDeltasIntoGeneration`
@@ -98,8 +97,8 @@ public:
     /// `out_runs`, and returns the `RunRef`. The call is idempotent (write-once via `putIfAbsent`).
     ///
     /// `prior_runs` are the parent generation's run segments for this shard, resolved BY THE CALLER from
-    /// the parent fold seal's `blob_target_runs` filtered to `shard` (2026-07-02 T0). An empty vector is
-    /// the fresh-pool / empty baseline.
+    /// the parent fold seal's `blob_target_runs` filtered to `shard`. An empty vector is the
+    /// fresh-pool / empty baseline.
     ///
     /// PRECONDITION: every `BlobDelta` in `shard_deltas` must be owned by this reducer
     /// (`blobShard(d.ref, gc_shards) == shard`). This is a caller contract; there is no
@@ -119,14 +118,15 @@ private:
     uint64_t gc_shards;
 };
 
-/// Coordinator policy for the sharded GC round (spec §Phase4, §Sharding Model).
+/// Coordinator policy for a sharded GC round.
 ///
 /// In a sharded round (`gc_shards > 1`) the work splits into two roles:
 ///
 ///   - COORDINATOR (exactly one per round — the lease holder): owns input-seal, round-visibility,
 ///     the single GLOBAL fence (over all LIST-discovered shards), and generation-advance. These steps span the whole
 ///     fence universe and must NOT be sharded: a publish into one root shard can protect blobs in ANY
-///     target shard, so an independent per-reducer fence is unsafe (Task 1 `SabotageReducerOwnsFence`).
+///     target shard, so an independent per-reducer fence is unsafe: a publish in one root shard can
+///     protect a blob assigned to another target shard.
 ///     `Gc::fence` therefore stays the single coordinator fence over the entire universe.
 ///
 ///   - REDUCERS / CLEANUP WORKERS (one per disjoint shard): own ONLY their shard's blob-target reduce

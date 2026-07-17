@@ -31,21 +31,20 @@ const UInt128 kZeroSourceId{0};
 
 /// Streams a shard's prior source-edge run at O(one block) resident memory: chains the run SEGMENTS the
 /// caller resolved from the parent seal (`blob_target_runs` filtered to one shard) and exposes a one-row
-/// lookahead the fold merge consumes. Two-cursor / retired-in-snapshot (spec §2.1): the prior run carries
+/// lookahead for the fold merge. The prior run carries
 /// BOTH surviving edges (`kEdgeActive`) AND the retired `kCondemned` sentinel rows at the zero source id,
 /// so the cursor stops at edges AND at condemned rows (exposing the type via `rowType`), while zero-marker
 /// sentinels are dropped on carry (per-generation, never carried forward). Row/key invariants are enforced
-/// while streaming (spec §2.1): `kEdgeActive` never at `source_id = 0`; sentinel rows (`kZeroMarker` /
+/// while streaming: `kEdgeActive` never at `source_id = 0`; sentinel rows (`kZeroMarker` /
 /// `kCondemned`) ONLY at `source_id = 0`; at most one sentinel per blob; an unknown value byte or an empty
-/// payload is CORRUPTED_DATA. Resolution is BY REF (2026-07-02 T0): the caller passes the exact object
-/// keys, so a run sealed for generation G that physically lives under an older generation's key is reached
+/// payload is `CORRUPTED_DATA`. Resolution uses the exact object references supplied by the caller, so a run
+/// sealed for generation G that physically lives under an older generation's key is reached
 /// without key construction. An empty `segments` is the fresh-pool / empty baseline. The row stream is
 /// globally sorted by (blob_hash, source_id), so `key()` values are non-decreasing.
 class PriorEdgeCursor
 {
 public:
-    /// Phase 3 T3: the codec is stateless (self-describing per-row via the algo byte), so there is no
-    /// per-segment width coherence gate anymore — a run may freely mix algos.
+    /// The key codec is stateless and self-describing, so a run may freely mix supported hash algorithms.
     PriorEdgeCursor(Backend & backend_, const std::vector<RunRef> & segments_)
         : backend(backend_), segments(segments_)
     {
@@ -66,7 +65,7 @@ public:
     {
         while (true)
         {
-            /// Pull rows from the open segment until a surviving edge / retired sentinel or the segment ends.
+            /// Pull rows from the open segment until a surviving edge, retired sentinel, or the segment ends.
             if (reader)
             {
                 String k;
@@ -98,7 +97,7 @@ public:
                         have_sentinel_blob = true;
                         sentinel_blob = bh;
                         if (v == kZeroMarker)
-                            continue;   // per-generation zero marker: dropped, not carried forward
+                            continue;   // A zero marker is per-generation and is dropped on carry.
                         /// A retired sentinel: decode and surface it (settled at close-out, not an edge).
                         current_condemned = decodeCondemnedRow(p);
                         current_key = k;
@@ -117,7 +116,7 @@ public:
                     has_current = true;
                     return;
                 }
-                /// Segment fully drained: verify its whole-file seal-checksum (codecs-v3 phase 5) against
+                /// Segment fully drained: verify its whole-file checksum against
                 /// the seal's RunRef.checksum BEFORE the fold acts on any of its rows. This is the fold —
                 /// the checksum's most important consumer (it decides deletions). Fail-closed on mismatch.
                 reader->verifyAgainst(segments[seg_idx].checksum);
@@ -131,8 +130,8 @@ public:
                 has_current = false;
                 return;
             }
-            /// Typed open: `openSourceEdgeRun` gates the NDJSON header (type == cas_run, kind ==
-            /// source_edge). Mixed-algo runs need no width gate (each record carries its own algo byte).
+            /// Typed open validates the NDJSON header before any row is consumed. Each row carries its
+            /// own algorithm byte, so no separate width gate is needed.
             reader = openSourceEdgeRun(backend, segments[seg_idx].key);
         }
     }
@@ -178,7 +177,7 @@ void assertValidSourceEdgeId(const UInt128 & source_id)
 {
     if (source_id == UInt128{0})
         throw Exception(ErrorCodes::LOGICAL_ERROR,
-            "CAS source edge: source_id 0 is the reserved sentinel key (spec §2.1)");
+            "CAS source edge: source_id 0 is the reserved sentinel key");
 }
 
 String encodeCondemnedRow(const CondemnedRow & row)
@@ -273,7 +272,7 @@ SourceEdgeRunView openSourceEdgeRun(std::string_view bytes)
 
 SourceEdgeRunView openSourceEdgeRun(Backend & backend, const String & key)
 {
-    /// Streaming (T2/T0): getStream is a forward-only read of the write-once run — nothing is
+    /// Streaming: `getStream` is a forward-only read of the write-once run — nothing is
     /// materialized whole (cas_run is object_cap = 0). Absent object => fail-closed.
     auto sr = backend.getStream(key);
     if (!sr)
@@ -356,12 +355,12 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
     RetiredMergeResult sink;
     RetiredMergeResult & rmr = out_retired ? *out_retired : sink;
 
-    // Deterministic input ordering => byte-reproducible run (OQ5 resume/adoption).
+    // Deterministic input ordering produces a byte-reproducible run for safe retry and adoption.
     // MUST be stable: for the same (ref, source_id) the journal ordering is
     // activation-before-removal; "last wins" then correctly resolves to removal (edge absent).
     // An unstable sort can put removal before activation => last=activation => false positive.
     // The comparator is exactly (ref.algo, ref.digest, source_id) == BlobRef::operator< then
-    // source_id — the SAME order the raw keys sort in (Phase 3 T3: SourceEdgeKeyCodec::key's algo
+    // source_id — the same order the raw keys sort in (`SourceEdgeKeyCodec::key`'s algo
     // byte decides before any digest byte can), so the merge below stays a plain key comparison.
     std::stable_sort(scattered.begin(), scattered.end(),
         [](const BlobDelta & a, const BlobDelta & b)
@@ -373,9 +372,9 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
     PriorEdgeCursor cursor(backend, prior_runs);
 
     DB::WriteBufferFromOwnString out;
-    SourceEdgeRunWriter writer(out);   // v3 sorted NDJSON (codecs-v3 phase 5); PinnedRaw, byte-deterministic
+    SourceEdgeRunWriter writer(out);   // sorted NDJSON; byte-deterministic for write-once adoption
 
-    // Streaming two-cursor merge over the prior run (surviving edges by 32-byte key AND retired kCondemned
+    // Streaming two-cursor merge over the prior run (surviving edges AND retired kCondemned
     // sentinel rows at the zero source id) and this round's edge deltas (by (blob_hash, source_id)). All
     // rows for one blob are adjacent in both inputs; the sentinel key (source_id 0) sorts first. We resolve
     // final presence per edge locally (idempotent: prior present + activate => present; any remove =>
@@ -405,7 +404,7 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
         if (indeg > 0)
         {
             /// A delete_pending entry recovering in-degree is structurally impossible (a published pending
-            /// blob should never be re-referenced) but IS reachable under real races (T1 TLA finding).
+            /// blob should never be re-referenced) but is reachable under real races.
             /// Spare it LOUDLY — never a fail-closed abort and never a delete of a re-referenced blob.
             if (e.delete_pending)
                 LOG_WARNING(getLogger("CasGcFold"),
@@ -441,15 +440,14 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
         /// post-merge in-degree...
         if (cur_condemned)
         {
-            /// `RetiredEntry.ref` is a native `BlobRef` (Phase 3 T3) — `cur_blob` passes straight
-            /// through, no narrowing shim.
+            /// The retired row already identifies the blob with the native `BlobRef` used by the run.
             const RetiredEntry stale = toRetiredEntry(cur_blob, *cur_condemned);
-            /// RESURRECT-REUPLOAD-ORPHAN: on a re-reference cycle (touched this window, net in-degree 0),
+            /// On a re-reference cycle (touched this window, net in-degree 0),
             /// re-observe the CURRENT token. If it differs from the retired row's token, a resurrect
             /// replaced the incarnation at this key — supersede the stale entry with a fresh condemn of the
             /// current token so the replacement enters the pipeline (the stale token's exact-token delete
             /// would only find the new token and no-op). Keyed on (hash, current token), matching GRetire.
-            /// `peek_head` (audit fix, 2026-07-08): a SIDE-EFFECT-FREE peek, deliberately NOT `head_blob` —
+            /// `peek_head` is deliberately side-effect-free and is not `head_blob` —
             /// `head_blob` is the fresh-condemn hook (emits `BlobRetire` + increments
             /// `CasGcRetiredCondemned`); calling it here would double-emit `blob_retire` alongside the
             /// `blob_retire_replaced` this supersede already produces below, and double-count the
@@ -493,7 +491,7 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
             }
         }
 
-        /// Emit AT MOST ONE sentinel row per blob (spec §2.1, invariant 4): the `kCondemned` row when the
+        /// Emit at most one sentinel row per blob: the `kCondemned` row when the
         /// blob is condemned/carried/graduated this pass (still_retired grew for it), else a per-generation
         /// `kZeroMarker` when it transitioned to zero this pass but was not condemned (redelete-dropped or
         /// absent-at-condemn). A blob with surviving edges (cur_edges > 0) emits neither — its edge rows
@@ -536,9 +534,9 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
         SourceEdgeKeyCodec::parse(key, blob_ref, source_id);   // throws CORRUPTED_DATA on a malformed key (fail-closed)
         openBlobIfNeeded(blob_ref);
 
-        /// A retired sentinel row from the prior run: stash it for close-out settlement. It is NOT an edge
+        /// A retired sentinel row from the prior run: stash it for close-out settlement. It is not an edge
         /// and NEVER a touch — a carried kCondemned row must not force a zero-marker or a peek_head HEAD
-        /// (spec §2.1, invariant 2). Deltas never key the zero source id, so no delta merges at this key.
+        /// and never a touch. Deltas never key the zero source id, so no delta merges at this key.
         if (from_prior && cursor.rowType() == kCondemned)
         {
             cur_condemned = cursor.condemnedRow();
@@ -567,7 +565,7 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
     writer.finish();
     out.finalize();
     const String run_bytes = out.str();
-    /// Whole-object streaming checksum (codecs-v3 phase 5): the SAME chained CityHash128 the reader
+    /// Whole-object streaming checksum: the same chained CityHash128 the reader
     /// accumulates on the read path, replacing the retired one-shot cityHash128. Carried by the fold
     /// seal's RunRef.checksum and verified before any consumer acts on the run.
     const UInt128 run_checksum = sourceEdgeRunChecksum(run_bytes);
@@ -582,7 +580,7 @@ std::vector<BlobCandidate> zeroInDegree(Backend & backend, const std::vector<Run
     std::vector<BlobCandidate> result;
     for (const RunRef & run : runs)
     {
-        /// Resolution is by ref (2026-07-02 T0): the caller passed the exact object key, so a run sealed
+        /// The caller passes the exact object key, so a run sealed
         /// for a later generation but physically living under an older key is reached directly. The run is
         /// streamed at O(one block) resident memory, never materialized whole. `openSourceEdgeRun` enforces
         /// the run kind + key schema; `kCondemned` sentinel rows are skipped (only `kZeroMarker` counts).
@@ -593,12 +591,12 @@ std::vector<BlobCandidate> zeroInDegree(Backend & backend, const std::vector<Run
             {
                 BlobRef bh;
                 UInt128 sid;
-                /// `parse` throws CORRUPTED_DATA on a malformed key — fail-closed (Task 4 consult
-                /// finding 5): the pre-Task-4 code silently skipped a malformed row here instead.
+                /// `parse` throws `CORRUPTED_DATA` on a malformed key; malformed rows must not be silently
+                /// treated as absent candidates.
                 SourceEdgeKeyCodec::parse(k, bh, sid);
                 result.push_back(BlobCandidate{.ref = bh});
             }
-        /// Whole-file seal-checksum (codecs-v3 phase 5): verify the drained run against the seal's
+        /// Whole-file checksum: verify the drained run against the seal's
         /// RunRef.checksum BEFORE its candidates feed a GC delete decision. Fail-closed on mismatch.
         r.verifyAgainst(run.checksum);
     }

@@ -1,5 +1,4 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Parts/PartFolderAccess.h>
-// ===== from PartFolderView.cpp (merge #7) =====
 #include <base/defines.h>
 #include <algorithm>
 #include <unordered_set>
@@ -18,7 +17,7 @@ PartFolderView::PartFolderView(PartRefKey key_, Cas::ManifestId manifest_id_, ui
     , validated_at_ms(validated_at_ms_)
 {
     chassert(manifest_body);
-    /// The binary-search contract: entries must be STRICTLY ascending by `path` (sorted AND unique) —
+    /// The binary-search contract: entries must be strictly ascending by `path` (sorted and unique) —
     /// `decodePartManifest` enforces exactly this for every decoded body, and `findEntry`'s binary
     /// search assumes uniqueness. `adjacent_find` with `!(a.path < b.path)` flags any adjacent pair
     /// that is out-of-order OR duplicate (stronger than `is_sorted`, which permits duplicates); a
@@ -76,12 +75,9 @@ std::optional<String> PartFolderView::inlineBytes(const String & path) const
 
 std::vector<String> PartFolderView::listChildren(const String & dir_prefix) const
 {
-    /// First-component collapse over entries. This is bit-identical to the pre-view code for every
-    /// real manifest: a part directory always needed first-component collapse, and a projection
-    /// directory is STRUCTURALLY FLAT in MergeTree — a projection part folder holds only
-    /// column/checksum/metadata files, never a nested subdirectory — so for a projection prefix the
-    /// collapse equals the old uncollapsed `substr(prefix)` (no further '/' to collapse). The
-    /// collapse is therefore an invariant-preserving unification, not a behavior change.
+    /// Collapse each entry to its first child component. Projection folders are structurally flat in
+    /// `MergeTree`, so this produces the same names as the old projection-specific path handling while
+    /// keeping one directory-listing rule for all manifest folders.
     std::unordered_set<String> names;
     auto add = [&](const String & full)
     {
@@ -105,14 +101,13 @@ bool PartFolderView::hasDirectory(const String & dir_prefix) const
 
 size_t PartFolderView::estimatedBytes() const
 {
-    /// Conservative cache weight (spec §Memory Bound): fixed overhead + manifest_size (deliberately
-    /// over-counts the shared decode — safe direction; Phase 5 notes).
+    /// Conservative cache weight: fixed overhead plus `manifest_size`. This deliberately over-counts
+    /// the shared decode, which is safe because eviction should happen before the budget is exceeded.
     return 256 + manifest_size;
 }
 
 }
 
-// ===== from CachedPartFolderAccess.cpp (merge #7) =====
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Common/DateLUT.h>
 #include <Common/ProfileEvents.h>
@@ -166,18 +161,18 @@ CachedPartFolderAccess::CachedPartFolderAccess(Cas::PoolPtr store_, CacheParams 
 std::shared_ptr<const PartFolderView>
 CachedPartFolderAccess::getView(const PartRefKey & key, Freshness freshness) const
 {
-    /// Step 1 (spec §Validate-On-Hit): the SAME resolve every read already pays today. Absence is
-    /// never retained.
+    /// Resolve first on every access. Absence is never retained, and the same ref-resolution result
+    /// supplies the manifest ID used to validate a retained view.
     auto resolved = resolve(key, freshness);
     if (!resolved)
         return nullptr;
 
-    /// One cache-key materialization per getView (B2): reused by the retained get/set and the journal.
+    /// Reuse one canonical key for the retained view and the optional diagnostic journal.
     const String cache_key = key.cacheKey();
 
-    /// Step 2: retained views serve ONLY CachedForLoad. ForceFresh must re-prove the manifest BODY
-    /// (a fresh ref resolve proves ref currency, not body existence — review 2026-07-08);
-    /// StrictValidate bypasses retention entirely.
+    /// Retained views serve `CachedForLoad` directly only after their manifest ID matches the fresh
+    /// resolve. `ForceFresh` must re-prove the manifest body unless the configured validation policy
+    /// explicitly permits a recent retained view; a fresh ref resolve proves ref currency, not body existence.
     if (freshness == Freshness::CachedForLoad && view_cache)
     {
         if (auto cached = view_cache->get(cache_key))
@@ -189,17 +184,14 @@ CachedPartFolderAccess::getView(const PartRefKey & key, Freshness freshness) con
                 return cached;
             }
             ProfileEvents::increment(ProfileEvents::CasPartFolderViewValidationMismatches);
-            /// fall through to rebuild — the stale entry is superseded by the insert below
+            /// Rebuild below; the stale entry is superseded by the new view when retention is enabled.
         }
     }
 
-    /// §3 (part_folder_validate): ForceFresh may serve a retained view WITHOUT the mandatory body
-    /// HEAD when the mode permits -- the ref currency is proven by `resolve` above; only the
-    /// INV-NO-DANGLE body re-proof is skipped. StrictValidate never enters here (it bypasses
-    /// retention, spec §Validate-On-Hit). A manifest_id mismatch still falls through to rebuild below
-    /// -- a genuine change under a retained view is caught exactly like CachedForLoad's mismatch path
-    /// above. All-tree-part-files Task 9: the former `mutableFiles()` comparison is gone -- every
-    /// content change is now a manifest change (`repointRef`), so `manifestId()` alone proves currency.
+    /// With a non-`Always` validation policy, `ForceFresh` may serve a retained view without another
+    /// body HEAD when its manifest ID still matches and its validation timestamp is within the age
+    /// policy. `StrictValidate` bypasses retention. A manifest-ID mismatch always rebuilds, because all
+    /// part content is represented by the manifest.
     if (freshness == Freshness::ForceFresh && view_cache && params.validate.mode != PartFolderValidate::Mode::Always)
     {
         if (auto cached = view_cache->get(cache_key);
@@ -219,12 +211,11 @@ CachedPartFolderAccess::getView(const PartRefKey & key, Freshness freshness) con
 
     auto view = buildView(key, *resolved, freshness);
 
-    /// Step 4: retain (StrictValidate never populates; oversized views are served, not retained).
-    /// `oversized` is tracked SEPARATELY from `retained`: with retention disabled (view_cache ==
-    /// nullptr), `retained` is also false, but that is not an oversized bypass — it is the ordinary
-    /// disabled-mode miss the Phase 3 baseline pins (deviation from the plan's draft, which
-    /// conflated `!retained` with oversized and mis-recorded every disabled-mode CachedForLoad
-    /// miss as OversizedBypass).
+    /// Retain eligible views. `StrictValidate` never populates the cache, and oversized views are
+    /// served but not retained.
+    /// `oversized` is tracked separately from `retained`: with retention disabled (`view_cache ==
+    /// nullptr`), `retained` is also false, but that is an ordinary disabled-mode miss rather than
+    /// an oversized bypass.
     bool retained = false;
     bool oversized = false;
     if (freshness != Freshness::StrictValidate && view_cache)
@@ -253,8 +244,8 @@ CachedPartFolderAccess::getView(const PartRefKey & key, Freshness freshness) con
 std::shared_ptr<const PartFolderView> CachedPartFolderAccess::buildView(
     const PartRefKey & key, const Cas::Resolved & resolved, Freshness freshness) const
 {
-    /// Fresh modes must not coalesce onto another caller's read (each ForceFresh/StrictValidate
-    /// call owns its mandatory HEAD); only cold CachedForLoad builds single-flight.
+    /// Fresh modes do not coalesce: each `ForceFresh`/`StrictValidate` call owns its mandatory HEAD.
+    /// Only cold `CachedForLoad` builds use single-flight.
     if (freshness != Freshness::CachedForLoad)
         return PartFolderView::make(key, resolved, store->readManifestShared(resolved.manifest_id), now_ms_fn());
 
@@ -264,7 +255,7 @@ std::shared_ptr<const PartFolderView> CachedPartFolderAccess::buildView(
     {
         std::lock_guard lock(inflight_mutex);
         if (auto it = inflight.find(key.cacheKey()); it != inflight.end())
-            future = it->second;                          /// follower: share the leader's build
+            future = it->second;                          /// Follower: share the leader's build.
         else
         {
             leader = true;
@@ -273,7 +264,7 @@ std::shared_ptr<const PartFolderView> CachedPartFolderAccess::buildView(
         }
     }
     if (!leader)
-        return future.get();                              /// rethrows the leader's failure, if any
+        return future.get();                              /// Rethrows the leader's exception, if any.
 
     SCOPE_EXIT({
         std::lock_guard lock(inflight_mutex);
@@ -287,7 +278,7 @@ std::shared_ptr<const PartFolderView> CachedPartFolderAccess::buildView(
     }
     catch (...)
     {
-        promise.set_exception(std::current_exception());  /// followers see the leader's failure
+        promise.set_exception(std::current_exception());  /// Followers see the leader's exception.
         throw;
     }
 }
@@ -324,12 +315,12 @@ void CachedPartFolderAccess::publishEntries(const PartRefKey & dst,
 {
     auto build = store->beginPartWrite(Cas::PartWriteInfo{.intended_ref = dst.ns.string() + "/" + dst.ref,
                                                   .intended_namespace = dst.ns, .op = op});
-    /// Tokenless W-EVIDENCE dep per entry — NO pool HEAD/GET before precommit; promote re-proves
-    /// each fail-closed. Inline entries record nothing (adoptEvidence skips them).
+    /// Record write evidence for each non-inline entry. No pool HEAD/GET is performed before
+    /// precommit; the promote path re-proves each dependency fail-closed. Inline entries need no evidence.
     for (const auto & entry : entries)
         build->adoptEvidence(entry);
-    /// A FRESH dst manifest over the SAME entries (only blobs are content-addressed; a part is a
-    /// single-owner ManifestId, so dst gets its own id), then move ownership in.
+    /// Stage a fresh manifest over the same entries. Blobs are content-addressed, but each part owns
+    /// its manifest ID, so `dst` receives a distinct manifest before ownership moves to it.
     const Cas::ManifestId id = build->stageManifest(entries);
     build->precommitAdd(dst.ns, dst.ref, id);
     promoteBuild(*build, dst, build->buildId(), id, allow_repoint);
@@ -337,21 +328,18 @@ void CachedPartFolderAccess::publishEntries(const PartRefKey & dst,
 
 bool CachedPartFolderAccess::republishRef(const PartRefKey & src, const PartRefKey & dst)
 {
-    /// Move a COMMITTED ref (rev. 15 §republish): content addressing has no rename. Force-fresh
-    /// source read; readManifestShared's mandatory HEAD re-proves the source body (write evidence is
-    /// never a cached view).
+    /// Content addressing has no rename, so move a committed ref by reading the source body freshly,
+    /// publishing equivalent entries at the destination, and then dropping the source. The source
+    /// body is re-proved and is never taken from a retained view.
     auto resolved = store->resolveRef(src.ns, src.ref);
     if (!resolved)
         return false;
     const auto src_manifest = store->readManifestShared(resolved->manifest_id);
 
-    /// BUG 1c: idempotent re-drive. If dst is ALREADY committed, the prior attempt's promote landed
-    /// and only dropRef(src) was interrupted. Compare CONTENT (path-sorted `entries`, not the whole
-    /// manifest — ref/namespace/digest legitimately differ): same content => finish the rename by
-    /// dropping src; a different-content dst is a genuine conflict => fail closed (never silently
-    /// drop src's content). All-tree-part-files Task 9: the former mutable_files re-sync on this path
-    /// is gone -- every per-part file is an ordinary entry now, so the `entries` compare above already
-    /// covers it (a drifted `metadata_version.txt` etc. IS a content difference, caught by the throw).
+    /// If `dst` is already committed, a previous attempt may have completed its promote before the
+    /// source drop. Compare content rather than the whole manifest, whose ref/namespace/digest
+    /// legitimately differ: equal content completes the move by dropping `src`; different content
+    /// is a conflict and leaves the source intact.
     if (auto dst_resolved = store->resolveRef(dst.ns, dst.ref))
     {
         const auto dst_manifest = store->readManifestShared(dst_resolved->manifest_id);
@@ -370,22 +358,22 @@ bool CachedPartFolderAccess::republishRef(const PartRefKey & src, const PartRefK
 
 bool CachedPartFolderAccess::repointRef(const PartRefKey & key, std::vector<Cas::ManifestEntry> entries, Cas::ProvenanceOp op)
 {
-    /// Byte-equal no-op: compare the candidate `entries` against the CURRENTLY committed manifest's
+    /// Compare the candidate `entries` against the currently committed manifest's
     /// decoded entries. This must NOT stage a candidate manifest first: `stageManifest` mints a
     /// non-content-derived `ManifestRef` (epoch/build_seq/ordinal) AND durably PUTs the encoded body
     /// on every call (CasPartWriteTxn.cpp), so staging-then-comparing IDs would itself be a pool mutation on
     /// the byte-equal path — violating the "ZERO pool mutations" contract this primitive exists to
     /// provide.
     ///
-    /// codecs-v3 phase 6: the comparison must be SYMMETRIC. `committed_manifest->entries` already went
+    /// The comparison must be symmetric. `committed_manifest->entries` already went
     /// through one `decodePartManifest` round-trip, which does not carry `blob_size` for Inline
     /// entries on the wire (it is redundant with `inline_bytes.size()`, use `ManifestEntry::size()` for
     /// the logical size instead, and it is excluded from both the canonical encoding and the payload
     /// digest — see `CasPartManifestFormat.cpp`'s `writeEntryRecord`/`decodePartManifest`). The
-    /// freshly-constructed `entries` are now built the same way (the inline write path no longer sets
+    /// freshly constructed `entries` may not have the same incidental fields (the inline write path no longer sets
     /// `blob_size`), but a straight struct compare against them is still not guaranteed byte-identical
     /// (canonical path ordering, etc.), so route the candidate through the identical encode/decode
-    /// round-trip before comparing regardless — mirrors `republishRef`'s BUG 1c compare just above,
+    /// round-trip before comparing regardless — this is the same content comparison used by `republishRef`,
     /// which is symmetric for the same reason (both sides there are already decoded).
     auto resolved = resolve(key, Freshness::ForceFresh);
     if (resolved)
@@ -400,30 +388,24 @@ bool CachedPartFolderAccess::repointRef(const PartRefKey & key, std::vector<Cas:
         if (committed_manifest->entries == canonical_candidate.entries)
             return false;
     }
-    /// `publishEntries` takes `entries` by const&, so it is read here after the call without issue.
+    /// `publishEntries` takes `entries` by const reference, so the caller-owned vector remains valid.
     publishEntries(key, entries, op, /*allow_repoint=*/true);
     ProfileEvents::increment(ProfileEvents::CasRefRepoint);
     if (resolved)
     {
-        /// Post-all-tree, a standalone write/remove on a committed part (Task 4's committed-file
-        /// write, Task 8's removal-mark resolution, Task 9's uuid.txt/metadata_version.txt/
-        /// txn_version.txt fill-ins) resolves through repoint routinely — it is the designed
-        /// mechanism, not an anomaly. WARNING here trained operators to ignore it (it fires on
-        /// every ordinary DROP/REPLACE/ATTACH/freeze); DEBUG keeps the trail without the noise. The
-        /// counter stays unconditional — it is the operator-facing signal now.
+        /// Repoint is the normal mechanism for effective standalone writes/removes on committed parts,
+        /// so this routine event is logged at debug level while the counter remains an operator-facing signal.
         LOG_DEBUG(getLogger("CachedPartFolderAccess"),
             "Repointed committed ref {}/{} ({} entries) — standalone write/remove on a committed part",
             key.ns.string(), key.ref, entries.size());
     }
     else
     {
-        /// `!resolved` means this call repointed a key with no prior committed ref to repoint —
-        /// unreachable today (every caller only invokes repointRef on an already-resolving key; see
-        /// BACKLOG "repointRef non-resolving-key audit gap"), so if it ever fires it is a genuine
-        /// anomaly, not the routine case above. Stays at WARNING.
+        /// A repoint normally targets an existing ref. Keep an unexpected create-shaped call visible
+        /// at warning level rather than silently treating it as ordinary publication.
         LOG_WARNING(getLogger("CachedPartFolderAccess"),
             "repointRef published {}/{} ({} entries) with no prior committed ref to repoint — "
-            "unexpected call shape (see BACKLOG repointRef non-resolving-key audit gap)",
+            "unexpected call shape (repointRef requires an existing committed ref)",
             key.ns.string(), key.ref, entries.size());
     }
     return true;
@@ -437,12 +419,11 @@ void CachedPartFolderAccess::dropRef(const PartRefKey & key)
 
 void CachedPartFolderAccess::dropRefIfPresent(const PartRefKey & key)
 {
-    /// resolveRef gates the common case (a tmp ref that was never committed is a no-op, not an
+    /// resolveRef gates the common case (a temporary ref that was never committed is a no-op, not an
     /// error); dropRef re-reads the shard inside its own CAS loop, so a concurrent drop can land in
     /// the window between our resolve and that re-read — surfacing as FILE_DOESNT_EXIST. Removal is
-    /// replay-safe, so an already-gone ref is success; any other error still propagates. (Moved
-    /// verbatim from ContentAddressedTransaction.) Cheap and harmless to also erase the view on the
-    /// early-return absent path (Phase 4).
+    /// replay-safe, so an already-gone ref is success; any other exception still propagates. The view
+    /// is also erased on the early-return absent path.
     if (!store->resolveRef(key.ns, key.ref, /*allow_stale=*/true))
     {
         eraseView(key);
@@ -457,7 +438,7 @@ void CachedPartFolderAccess::dropRefIfPresent(const PartRefKey & key)
         if (e.code() != ErrorCodes::FILE_DOESNT_EXIST)
             throw;
         eraseView(key);
-        return;   /// raced away between the gate and dropRef — nothing was actually dropped here
+        return;   /// Raced away between the gate and dropRef; nothing was actually dropped here.
     }
     eraseView(key);
 }
@@ -470,18 +451,15 @@ void CachedPartFolderAccess::dropRefBestEffort(const PartRefKey & key) noexcept
     }
     catch (...)
     {
-        /// Best-effort destructor/rollback cleanup: debris is GC-reclaimed, never a masked throw. But
-        /// NEVER silent — unlike every other swallow in the feature this had no log trail, so a
-        /// correlated backend outage during rollback could leave a permanently-live phantom ref with
-        /// no diagnostic (A9). Log + count it as a countable anomaly.
+        /// Best-effort destructor/rollback cleanup: debris is GC-reclaimed, but swallowing the
+        /// exception without a diagnostic could leave a live phantom ref after a backend outage.
         ProfileEvents::increment(ProfileEvents::CasRefRollbackBestEffortDropFailed);
         tryLogCurrentException(getLogger("CachedPartFolderAccess"),
             fmt::format("CA best-effort rollback dropRef failed (ns={} ref={}); the ref may remain live",
                         key.ns.string(), key.ref));
     }
-    /// eraseView(key) deliberately ALSO on the swallowed-failure path (spec §Two-Level API): in this
-    /// destructor/rollback context the ref's durable state is unknown, so dropping the view is the
-    /// conservative direction.
+    /// In destructor/rollback context the ref's durable state is unknown, so invalidate the view even
+    /// after a swallowed cleanup exception.
     eraseView(key);
 }
 
@@ -500,7 +478,7 @@ void CachedPartFolderAccess::recordDecision(const String & cache_key, LastDecisi
                                             const PartFolderView * view, bool retained) const
 {
     if (!params.explain_enabled)
-        return;   /// B2: the hit path pays neither the per-disk mutex nor a journal allocation.
+        return;   /// Disabled diagnostics keep the read path free of journal locking and allocation.
     std::lock_guard lock(explain_mutex);
     if (explain_map.size() >= EXPLAIN_MAX_ENTRIES)
         explain_map.clear();
@@ -529,12 +507,11 @@ CachedPartFolderAccess::ExplainResult CachedPartFolderAccess::explain(const Part
         if (it != explain_map.end())
             result = it->second;
     }
-    /// `retained` is reported LIVE against the cache, not from the decision snapshot: `dropNamespace`
-    /// erases every key of a namespace via one CacheBase::remove(predicate) sweep without a per-key
-    /// recordDecision call (nothing enumerates the removed keys cheaply — spec §Observability), so a
-    /// snapshot value would go stale for every key it touches except the one last read. A live
-    /// membership check is authoritative for every eraser (write-through or namespace-wide) and
-    /// costs one more CacheBase lookup on this test/log-only path.
+    /// `retained` is reported live against the cache, not from the decision snapshot: `dropNamespace`
+    /// erases every key of a namespace via one `CacheBase::remove` predicate sweep without a per-key
+    /// `recordDecision` call, so a snapshot value would go stale for every key it touches except the
+    /// one last read. A live membership check is authoritative for every eraser (write-through or
+    /// namespace-wide) and costs one more `CacheBase` lookup on this test/log-only path.
     result.retained = view_cache && view_cache->get(key.cacheKey()) != nullptr;
     return result;
 }

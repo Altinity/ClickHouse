@@ -3,6 +3,7 @@
 #include <Common/Exception.h>
 #include <Common/ProfileEvents.h>
 #include <Common/CurrentMetrics.h>
+#include <optional>
 
 namespace ProfileEvents
 {
@@ -48,12 +49,13 @@ size_t CasManifestReader::ManifestCacheKeyHash::operator()(const ManifestCacheKe
 
 std::shared_ptr<const PartManifest> CasManifestReader::readManifestShared(const ManifestId & id)
 {
-    /// A live ref naming a missing manifest body is INV-NO-DANGLE (spec §Read Path Scope: "fail-closed
-    /// behavior when a committed ref names a missing manifest"). Never substitute an empty manifest.
+    /// A live reference naming a missing manifest body is a dangling-reference violation
+    /// (`INV-NO-DANGLE`). Never substitute an empty manifest: callers must observe the missing object
+    /// as an exception.
     const String key = layout.manifestKey(id);
 
-    /// HEAD first for the current token: on a (id, token) cache hit, the immutable decode is reused
-    /// with no get and no re-decode. A missing object surfaces INV-NO-DANGLE.
+    /// `HEAD` is mandatory even on a cache hit. It proves that the live reference still names an
+    /// existing object and supplies the token that identifies the immutable bytes being reused.
     const HeadResult head = backend.head(key);
     if (!head.exists)
     {
@@ -84,8 +86,8 @@ std::shared_ptr<const PartManifest> CasManifestReader::readManifestShared(const 
 
     PartManifest body = decodePartManifest(openObject(FormatId::PartManifest, object->bytes));
 
-    /// refMatchesBody: the journal ManifestRef must equal the body's self-described `ref`. A mismatch
-    /// means the ref addresses the WRONG object (spec §Object Identity And Ownership).
+    /// The journal reference must equal the body's self-described `ref`; otherwise the reference
+    /// addresses a different object and the decoded bytes cannot be trusted.
     if (!refMatchesBody(id.ref, body))
     {
         if (event_sink)
@@ -103,8 +105,8 @@ std::shared_ptr<const PartManifest> CasManifestReader::readManifestShared(const 
             "CAS manifest at {} body ref does not match the journal ManifestRef — refMatchesBody", key);
     }
 
-    /// manifestNamespaceMatches: the body's root_namespace_id must equal the owning root namespace. A
-    /// mismatch is a cross-namespace dangle and would hand the debris sweep the wrong authority.
+    /// The body's `root_namespace_id` must equal the owning namespace. A mismatch is a
+    /// cross-namespace dangling reference and would give cleanup the wrong ownership authority.
     if (!manifestNamespaceMatches(id.root_namespace, body))
     {
         if (event_sink)
@@ -142,9 +144,9 @@ BlobLocation CasManifestReader::locate(const ManifestEntry & entry) const
     {
         case EntryPlacement::Blob:
         {
-            /// Phase 3 T2: the blob's object key is built directly from the entry's own `ref` (algo +
-            /// digest) -- no pool-scoped codec needed, since the key no longer depends on a pool-wide
-            /// width assumption.
+            /// The entry carries the complete blob reference (algorithm and digest), so the key is
+            /// derived directly from it. The payload starts at the pool's fixed envelope length;
+            /// no object-specific header read is needed before the ranged payload read.
             return BlobLocation{
                 .key = layout.blobKey(entry.ref),
                 .offset = meta.blob_header_len,

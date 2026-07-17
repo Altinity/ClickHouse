@@ -11,46 +11,66 @@
 namespace DB::Cas
 {
 
-/// The v3 text file shape (spec 2026-07-15): header line {"type":"cas_<x>","v":N}, body,
-/// optional trailer line, optionally one zstd frame around the whole object. This header is the
-/// ONLY code that knows the shape; per-object codecs are key mapping + invariants on top of it.
+/// Shared container mechanics for versioned content-addressed text objects: a header line
+/// {"type":"cas_<x>","v":N}, a body, an optional trailer line, and, for formats whose registry
+/// policy requires it, one zstd frame around the whole object. This is the only code that knows
+/// that container shape; per-object codecs add only key mappings and object-specific invariants.
 ///
-/// Canonical text: writers emit no whitespace outside JSON strings; readers reject it
-/// (CORRUPTED_DATA). Unbounded u64 values are decimal strings; hashes are 32-char lowercase hex.
+/// Writers produce canonical text without whitespace outside JSON strings, and readers reject such
+/// whitespace as `CORRUPTED_DATA`. Values that may span the full u64 range are decimal strings;
+/// hashes are 32-character lowercase hexadecimal strings. The JSON writer settings are pinned in
+/// the implementation so global `FormatSettings` changes cannot alter CAS bytes: slash-containing
+/// ref paths and deterministic artifacts must retain the same representation and golden files.
 
-/// ---- write-side JSON micro-vocabulary ----
+/// The write-side JSON primitives used by the format codecs.
 
 /// Writes '{' on the first call, ',' after, then "key": . `key` must be plain ASCII (written raw).
 void writeKey(WriteBuffer & out, std::string_view key, bool & first);
+/// Writes a JSON string using the CAS-owned escaping settings.
 void writeStringValue(WriteBuffer & out, std::string_view s);
+/// Writes a 128-bit value as a quoted, fixed-width, lowercase hexadecimal string.
 void writeHex128Value(WriteBuffer & out, const UInt128 & v);
+/// Writes a u64 as a quoted decimal string, preserving the full range of the type in JSON text.
 void writeU64StringValue(WriteBuffer & out, uint64_t v);
-/// Writes a bare JSON bool literal (true/false); pairs with JsonObjectReader::readBool.
+/// Writes a bare JSON boolean literal; the corresponding reader is `JsonObjectReader::readBool`.
 void writeBoolValue(WriteBuffer & out, bool v);
 /// Writes '}' ("{}" when no key was written).
 void closeObject(WriteBuffer & out, bool & first);
 
-/// ---- read-side pull cursor over one canonical JSON object ----
+/// Pull cursor over one canonical JSON object.
+///
+/// The reader borrows the input buffer and records the object name for exception messages. It
+/// enforces unique keys and translates the several low-level parser exceptions into the CAS
+/// `CORRUPTED_DATA` contract. Unknown keys follow the supplied evolution policy: ordinary keys
+/// may be skipped in tolerant objects, while `!`-prefixed keys always fail with
+/// `UNKNOWN_FORMAT_VERSION`.
 
 class JsonObjectReader
 {
 public:
-    /// Consumes the opening '{'.
+    /// Consumes the opening `{`; throws `CORRUPTED_DATA` when the object does not start there.
     JsonObjectReader(ReadBuffer & in_, KeyStrictness strictness_, std::string_view what_);
     /// Advances to the next key; false when the closing '}' was consumed. The caller must
     /// consume the value (one read* / skipUnknown) before the next call. Duplicate keys are
-    /// CORRUPTED_DATA.
+    /// rejected with `CORRUPTED_DATA`.
     bool nextKey(String & key);
+    /// Reads the value for the key returned by `nextKey` as a JSON string.
     String readString();
+    /// Reads a quoted 32-character lowercase hexadecimal string as a `UInt128`.
     UInt128 readHex128();
+    /// Reads a quoted decimal u64 string and rejects empty, trailing, or non-decimal text.
     uint64_t readU64String();
+    /// Reads an unquoted JSON number into a u64; low-level parse failures become `CORRUPTED_DATA`.
     uint64_t readU64Number();
+    /// Reads the bare JSON literals `true` and `false`.
     bool readBool();
-    /// The evolution rule for a key the caller does not recognize: '!'-prefixed ->
-    /// UNKNOWN_FORMAT_VERSION (critical); Strict -> CORRUPTED_DATA; Tolerant -> skip the value.
+    /// Applies the evolution rule for an unrecognized key: `!`-prefixed keys produce
+    /// `UNKNOWN_FORMAT_VERSION`; strict objects produce `CORRUPTED_DATA`; tolerant objects skip
+    /// the value.
     void skipUnknown(const String & key);
 
 private:
+    /// Runs one parser operation under the CAS error taxonomy while preserving version exceptions.
     template <typename F>
     auto guarded(F && f);
 
@@ -62,17 +82,18 @@ private:
     bool done = false;
 };
 
-/// ---- header line / trailer line / raw line access ----
+/// Header, trailer, and raw-line access for the common text container.
 
+/// Header metadata returned after parsing a self-describing CAS object header line.
 struct TextHeader
 {
     String type;
     uint32_t v = 0;
 };
 
-/// Writes line 1: {"type":"cas_<x>","v":G_BUILD}\n
+/// Writes the versioned type header line and its newline terminator.
 void writeHeaderLine(WriteBuffer & out, FormatId id);
-/// Writes a trailer line: {"n":N}\n
+/// Writes a record-count trailer line and its newline terminator.
 void writeTrailerLine(WriteBuffer & out, uint64_t n);
 /// Reads and gates line 1 against `id`'s registered type; wrong type -> CORRUPTED_DATA; v above
 /// what this build understands -> UNKNOWN_FORMAT_VERSION.
@@ -84,9 +105,9 @@ std::optional<TextHeader> sniffHeaderLine(std::string_view bytes);
 /// longer than `line_cap`.
 String readLine(ReadBuffer & in, uint64_t line_cap, std::string_view what);
 
-/// ---- the zstd arm ----
+/// Zstd detection and per-format compression policy.
 
-/// True iff `bytes` starts with the zstd frame magic (28 B5 2F FD).
+/// True iff `bytes` starts with the zstd frame prefix 28 B5 2F FD.
 bool looksZstd(std::string_view bytes);
 /// Compression per the per-type policy: `Always` -> one zstd frame (any size, checksum on);
 /// everything else -> identity (returns `text` unchanged).

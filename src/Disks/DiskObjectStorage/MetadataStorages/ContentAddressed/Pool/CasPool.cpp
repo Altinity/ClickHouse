@@ -68,10 +68,10 @@ Pool::Pool(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
     , meta(std::move(meta_))
     /// Seed the monotone admitted-algo cache from the pool state `createOrValidate` already
     /// established (fresh create, steady-state member, or a just-completed admission union) --
-    /// register-before-first-write (spec §5) means this Pool's own `writeAlgo()` is ALWAYS a
+    /// register-before-first-write means this Pool's own `writeAlgo()` is ALWAYS a
     /// member by the time the constructor runs.
     , admitted_algos(meta.algos_used)
-    /// Phase 3 T2/T3: `Layout` no longer captures a pool algo -- every blob key is built from a
+    /// `Layout` no longer captures a pool algo -- every blob key is built from a
     /// `BlobRef` (algo + digest) directly, so the constructor takes only the pool prefix.
     , pool_layout(config.pool_prefix)
     /// Plain-object surface component: binds to this Pool's own backend + layout (declared after
@@ -81,14 +81,14 @@ Pool::Pool(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
     /// later via setEventSink; the reference observes that assignment). Owns the decode cache, built
     /// from the same config bytes the Pool ctor used before.
     , manifest_reader(*pool_backend, pool_layout, meta, event_sink_, config.manifest_decode_cache_bytes)
-    /// Ref-log / ref-table subsystem (source-layout §3.4). Injected with backend/layout + the
+    /// Ref-log / ref-table subsystem. Injected with backend/layout + the
     /// RefLedgerConfig slice + the event-sink reference + the pool `cas_request_budget` + the RAW mount
     /// `boot_ms_fn` (for its retry controller), plus callbacks into the mount/watermark state that lives
     /// on `mount_runtime` (reached through Pool delegates). The callbacks capture `this`; they are
     /// invoked only at runtime (post-construction), so referencing `mount_runtime` (declared AFTER
     /// `ref_ledger`, hence constructed after it) is safe -- exactly as the pre-3.5 layout referenced the
     /// mount raw-members that also followed `ref_ledger`. Declared/constructed BEFORE `mount_runtime`,
-    /// preserving the original member order verbatim (see the header note; verification-C).
+    /// preserving the original member order verbatim (see the header note).
     , ref_ledger(
           pool_backend, pool_layout, config.refLedgerConfig(), event_sink_, config.cas_request_budget,
           config.boot_ms_fn,
@@ -101,7 +101,7 @@ Pool::Pool(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
               { reportImpossibleInterference(key, reason, offending_ns); },
           [this] { return std::static_pointer_cast<void>(shared_from_this()); },
           [this] (const RootNamespace & ns) { cancelInflightBuildsForNamespace(ns); })
-    /// Mount / write-fence / build-watermark / self-remount runtime (source-layout §3.5). Injected with
+    /// Mount / write-fence / build-watermark / self-remount runtime. Injected with
     /// backend/layout + the `MountConfig` slice + `server_root_id` + the event-sink reference + the pool
     /// `cas_request_budget` + the `remount_attempt` callback (== `Pool::tryRemountOnce`, whose claim/
     /// recovery ORCHESTRATION stays on Pool). The callback captures `this`; it is invoked only at runtime
@@ -128,7 +128,7 @@ bool Pool::isAlgoAdmitted(BlobHashAlgo algo) const
 std::vector<uint8_t> Pool::refreshAdmittedAlgos()
 {
     /// A direct GET+decode of `_pool_meta`, not a re-run of `createOrValidate`'s admission logic --
-    /// this Pool's OWN algo is already admitted (register-before-first-write, spec §5), so all this
+    /// this Pool's OWN algo is already admitted, so all this
     /// needs is the CURRENT authoritative `algos_used`, unioned into the monotone cache.
     const auto existing = pool_backend->get(pool_layout.poolMetaKey());
 
@@ -148,7 +148,7 @@ std::vector<uint8_t> Pool::refreshAdmittedAlgos()
 
 bool Pool::dedupCacheContains(const BlobRef & ref) const
 {
-    /// Task 3 (Round-B §0.3 introspection): raw lookup counters on the presence cache itself, disabled
+    /// raw lookup counters on the presence cache itself, disabled
     /// (nullptr `dedup_cache`) means neither counter moves -- the short-circuit below never reaches the
     /// probe. `PartWriteTxn::putBlob` calls this seam up to twice on a genuine hit (once to pick the
     /// HEAD-first branch, once more just to attribute `CasBlobBodyPutAvoided` to the cache -- see
@@ -173,7 +173,7 @@ void Pool::dedupCacheAdd(const BlobRef & ref)
         dedup_cache->set(ref, std::make_shared<DedupPresent>());
 }
 
-/// ==== mount-runtime delegates (source-layout §3.5) ==== The mount lease keeper, the local write
+/// ==== mount-runtime delegates ==== The mount lease keeper, the local write
 /// fence, the per-server build watermark, the live-incarnation epoch, and the self-remount recovery
 /// thread live in the `mount_runtime` member (Pool/CasMountRuntime.h); Pool keeps these thin public
 /// forwarders so the wiring, PartWriteTxn, Gc, the ref-ledger callbacks, and every test call site are unchanged.
@@ -214,12 +214,12 @@ void Pool::armMountFence(UInt128 server_uuid, uint64_t writer_epoch, uint64_t de
 
 PoolPtr Pool::open(BackendPtr backend, PoolConfig config)
 {
-    /// B168 P0: wrap the pool backend once, transparently, so EVERY CA S3 op — probe, pool-meta,
+    /// Wrap the pool backend once, transparently, so EVERY CA S3 op — probe, pool-meta,
     /// writer, GC, watermark — flows through the per-namespace/op ProfileEvents chokepoint. The
     /// decorator only delegates and counts; it changes no behavior (read-only opens stay write-free).
     backend = std::make_shared<InstrumentedBackend>(std::move(backend));
 
-    /// FAIL-CLOSED (design §6): the capability probe throws NOT_IMPLEMENTED on any failed check, and
+    /// FAIL-CLOSED: the capability probe throws NOT_IMPLEMENTED on any failed check, and
     /// PoolMeta::createOrValidate is pool-authoritative — the config constants apply only at creation.
     Layout layout(config.pool_prefix);
     /// The probe writes and deletes throwaway keys to verify conditional-op enforcement. A read-only
@@ -229,7 +229,7 @@ PoolPtr Pool::open(BackendPtr backend, PoolConfig config)
     {
         if (!config.skip_access_check)
         {
-            /// B135: give each mount a PER-MOUNT UNIQUE probe key prefix so two servers mounting the SAME
+            /// Give each mount a PER-MOUNT UNIQUE probe key prefix so two servers mounting the SAME
             /// shared pool concurrently never collide on the (formerly fixed) `<pool>/_probe/token` /
             /// `<pool>/_probe/cas` keys. Without this, the loser of the `putIfAbsent` race aborts startup
             /// with PreconditionFailed (and the winner's cleanup delete can cascade into the loser). With a
@@ -259,13 +259,13 @@ PoolPtr Pool::open(BackendPtr backend, PoolConfig config)
     /// Private ctor: make_shared cannot reach it.
     PoolPtr store(new Pool(std::move(backend), std::move(config), std::move(meta)));
 
-    /// Register-before-first-write, belt-and-braces (spec §5): `createOrValidate` above already
+    /// Register-before-first-write, belt-and-braces: `createOrValidate` above already
     /// admitted/validated the write algo, so the freshly-seeded cache must already contain it -- a
     /// violation here would mean a build/write could reach this Pool naming an algo that was never
     /// durably admitted (the invariant this whole design rests on).
     chassert(store->isAlgoAdmitted(write_algo));
 
-    /// Per-server watermark (spec 2026-06-16-ca-build-watermark): mint the random NONZERO `process_epoch`
+    /// Per-server watermark: mint the random NONZERO `process_epoch`
     /// once per Pool (GC checks it for equality only -- a different epoch == a dead incarnation). The
     /// masking/redraw detail lives in `CasMountRuntime::mintRandomProcessEpoch`.
     store->mount_runtime.mintRandomProcessEpoch();
@@ -282,14 +282,14 @@ PoolPtr Pool::open(BackendPtr backend, PoolConfig config)
 
 void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy policy)
 {
-    /// === Mount-safety startup protocol (spec §mount-safety; Phase 0 Task 7) ===
+    /// === Mount-safety startup protocol ===
     /// STRICT ORDER: validate id → claim owner (identity) → allocate durable writer_epoch → claim
     /// the mount lease (liveness) + arm the local write fence → anchor the watermark. owner / epoch
     /// / mount / watermark are BOOTSTRAP-CONTROL writes: they establish the very right to write and
     /// run BEFORE the write fence gates ordinary data/ref/manifest mutations. Fail closed throughout.
     /// Shared by `open` (`policy = WaitForExpiry`, `our_uuid = config.server_id`) and
     /// `openForDecommission` (`policy = NoWait`, `our_uuid` = the impersonated victim owner uuid;
-    /// design 2026-07-13-cas-pool-member-decommission §core) -- the two differ only in WHO they mount
+    /// -- the two differ only in WHO they mount
     /// as and whether a non-`Claimed`/`FencedSelf` mount result gets `open`'s bounded observation wait
     /// or an immediate refusal.
     const String & srid = store->config.server_root_id;
@@ -305,10 +305,10 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
     /// 3. Durable-monotone writer_epoch — CAS-bump the sticky `epoch` object. THE BRIDGE: this
     ///    durable value REPLACES the random `process_epoch` for identity, so the watermark + every
     ///    manifest ref carries it (the random mint above stays for the read-only
-    ///    path, which never reaches here). Phase 2's epoch-aware sweep reads this value.
+    ///    path, which never reaches here). The epoch-aware sweep reads this value.
     /// Mutable: a GC fence of our fresh lease during open (expiry mid-open racing a GC round) is
     /// recoverable — a fence costs an epoch, so the fence-recovery loop below re-allocates a fresh
-    /// writer_epoch and re-claims (P3.1 vector C; TLA+ `NoPermanentWedge`).
+    /// writer_epoch and re-claims (the TLA+-checked `NoPermanentWedge` invariant).
     uint64_t writer_epoch = allocateWriterEpoch(*store->pool_backend, store->pool_layout, srid);
     store->mount_runtime.setProcessEpoch(writer_epoch, std::memory_order_relaxed);
 
@@ -320,19 +320,19 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
     };
     const uint64_t ttl_ms = static_cast<uint64_t>(store->config.mount_lease_ttl_ms.count());
 
-    /// CAS request budget (RFC cas-s3-timeout-retry-control §required-timeout-model, Task 5): a
+    /// CAS request budget: a
     /// writable mount refuses to open with a budget that could let a controlled attempt outlive the
     /// mount lease it is fenced under. Throws BAD_ARGUMENTS and aborts open on an inconsistent
-    /// budget; logs the effective values once on success. The controller itself (Pool's ref
-    /// mutation paths) is wired in a later task — this validates the config invariant up front.
+    /// budget; logs the effective values once on success. The controller gates Pool's ref-mutation
+    /// paths; this validates the config invariant up front, before any attempt runs.
     validateCasRequestBudget(store->config.cas_request_budget, ttl_ms,
         static_cast<uint64_t>(store->config.mount_renew_period.count()));
 
     /// Poll twice per renew period so a live holder's renewal is always observed within the
-    /// observation window. Derived from existing config — no new knob (spec §Config).
+    /// observation window. Derived from existing config — no new knob.
     const uint64_t poll_interval_ms = std::max<uint64_t>(
         1, static_cast<uint64_t>(store->config.mount_renew_period.count()) / 2);
-    /// rev.6 Task 6: routes through `mount_runtime.waitSleep` (which itself routes through
+    /// routes through `mount_runtime.waitSleep` (which itself routes through
     /// `config.wait_sleep_fn` when a test injected one) rather than a bare `sleep_for` directly, so
     /// a test intercepting `wait_sleep_fn` observes every wait `open` can block on -- this
     /// observation poll AND the `materialization_grace_ms` wait below.
@@ -352,18 +352,18 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
             held.expires_at_ms, threshold_ms);
     };
 
-    /// Mount-slot writer audit (the P1 "foreign writer" instrument): route every mount-slot
+    /// Mount-slot writer audit (the "foreign writer" instrument): route every mount-slot
     /// write/conflict event through the Pool's own sink. `setEventSink` runs AFTER `open`
     /// returns (the `ContentAddressedMetadataStorage` wiring), so an event fired synchronously
     /// during this very `open` call is dropped by the still-null sink — the same startup window
-    /// every other B170 emission site in this file already has (`hasEventSink()`/`emitEvent()`).
+    /// every other emission site in this file already has (`hasEventSink()`/`emitEvent()`).
     /// `s` outlives the lambda: it is captured by raw pointer into the keeper, a member of
     /// `Pool` destroyed before the `Pool` itself.
     const auto emit_mount_event = [s = store.get()](CasEvent e) { s->emitEvent(std::move(e)); };
 
     Pool * raw = store.get();
 
-    /// S13 crash-recovery (`WaitForExpiry` only): a hard-killed prior incarnation leaves a stale,
+    /// Crash-recovery (`WaitForExpiry` only): a hard-killed prior incarnation leaves a stale,
     /// unreleased mount lease. Rather than aborting, OBSERVE that lease's write-token (never its
     /// stamped `expires_at_ms` against our wall clock) until it has held stable for the full
     /// rate-bound threshold, then reclaim it; a genuinely live second server keeps renewing the
@@ -371,13 +371,13 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
     /// token-guarded (see `claimMountAwaitingExpiry`), so a live twin is never stolen from.
     /// `NoWait` skips this observation entirely (see the policy branch below).
     ///
-    /// Fence-recovery loop (P3.1 vector C): if the GC fences our own fresh lease while we are opening
+    /// Fence-recovery loop: if the GC fences our own fresh lease while we are opening
     /// (the lease expired mid-open — e.g. a slow first beat — and a GC round fenced it), that is a
     /// RECOVERABLE state, not a wedge: a fence costs an epoch, so allocate a fresh writer_epoch and
     /// re-claim. Bounded so a pathological fence storm still fails closed. The fence can surface two
     /// ways: `claimMount` observes an already-fenced own slot (`FencedSelf`), or the keeper's adopt
     /// races a fence between its GET and CAS (`MountFencedException` from `start()`).
-    /// rev.6 Task 6: which certificate of death (if any) justified the reclaim FINALLY adopted below
+    /// which certificate of death (if any) justified the reclaim FINALLY adopted below
     /// (the last iteration's `claim` before `break` -- `claim` itself is loop-scoped). Read after the
     /// loop to decide the materialization-grace wait.
     MountPriorState claimed_prior = MountPriorState::None;
@@ -416,8 +416,7 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
         {
             if (policy == MountClaimPolicy::NoWait)
                 /// No FORCE variant, no wait-and-observe: the decommission gate treats any live-looking
-                /// or foreign-owner lease as an immediate refusal (design
-                /// 2026-07-13-cas-pool-member-decommission §core).
+                /// or foreign-owner lease as an immediate refusal.
                 throw Exception(ErrorCodes::ABORTED,
                     "CAS decommission '{}': pool member is alive or contended — mount lease held by "
                     "uuid={} epoch={} pid={} hostname={} (expires_at_ms={}). Refusing (no FORCE variant "
@@ -425,7 +424,7 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
                     srid, u128ToHex(claim.body.server_uuid), claim.body.writer_epoch, claim.body.pid,
                     claim.body.hostname, claim.body.expires_at_ms);
             /// LiveDoubleStart (waited out the bound → a live twin) or ForeignOwner → fail closed
-            /// with the actionable, multi-line startup error (spec §mount-safety).
+            /// with the actionable, multi-line startup error.
             throw Exception(ErrorCodes::ABORTED, "{}", mountDoubleStartMessage(srid, claim.body));
         }
         claimed_prior = claim.prior;
@@ -456,12 +455,12 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
         break;
     }
 
-    /// rev.6 Task 6 (spec §Late Predecessor PUT): a reclaim over a predecessor whose death was NOT
+    /// a reclaim over a predecessor whose death was NOT
     /// proven clean may still have a conditional PUT from that predecessor in flight when this
     /// incarnation starts trusting its recovery listings -- `Fenced` and `UncleanObserved` are
-    /// exactly the two `MountPriorState`s with no such proof (`Clean`, Task 5's drained farewell,
+    /// exactly the two `MountPriorState`s with no such proof (`Clean`, drained farewell,
     /// and `None`, a fresh mount / same-epoch refresh with nothing to hand over, pay nothing).
-    /// fix-round F2(b): an EXHAUSTIVE switch, not a positive allowlist -- a future `MountPriorState`
+    /// An EXHAUSTIVE switch, not a positive allowlist -- a future `MountPriorState`
     /// enumerator with no proof of clean death must fail the BUILD (a missing `-Wswitch` case), never
     /// silently fall through to "clean" and under-seal.
     bool unclean_reclaim;
@@ -515,7 +514,7 @@ PoolPtr Pool::openForDecommission(BackendPtr backend, PoolConfig config, const S
     Layout layout(config.pool_prefix);
 
     /// Impersonate the victim: decommission acts as "the next incarnation of that server". The claim
-    /// below is then EXACTLY the S13 reclaim semantics (`MountClaimPolicy::NoWait`): a
+    /// below is then EXACTLY the crash-recovery reclaim semantics (`MountClaimPolicy::NoWait`): a
     /// fenced/terminated/clean-farewell lease reclaims; a live lease refuses immediately (no bounded
     /// observation wait -- see `mountWritable`). Owner anchor absent + mount absent = nothing to
     /// decommission.
@@ -540,7 +539,7 @@ PoolPtr Pool::openForDecommission(BackendPtr backend, PoolConfig config, const S
     /// Private ctor: make_shared cannot reach it.
     PoolPtr store(new Pool(std::move(backend), std::move(config), std::move(meta)));
 
-    /// Register-before-first-write, belt-and-braces (spec §5): same invariant `open` asserts.
+    /// Register-before-first-write, belt-and-braces: same invariant `open` asserts.
     chassert(store->isAlgoAdmitted(write_algo));
 
     /// No random `process_epoch` mint here: `open` pays that prologue because its read-only path
@@ -554,15 +553,15 @@ PoolPtr Pool::openForDecommission(BackendPtr backend, PoolConfig config, const S
 
 Pool::~Pool()
 {
-    /// Teardown order is load-bearing and unchanged from the pre-3.5 inline sequence (source-layout §3.5
-    /// only relocated the mount/remount mechanics into `mount_runtime`):
+    /// Teardown order is load-bearing and unchanged from the pre-3.5 inline sequence (only the
+    /// mount/remount mechanics were relocated into `mount_runtime`):
     ///
     /// 1. Stop + join the self-remount recovery thread FIRST (it may otherwise re-create the keeper
     ///    below us). `stopRemountThread` latches `remount_shutting_down` under the thread mutex before
     ///    the join, so a keeper on_lost firing during teardown can never re-arm the thread after we join.
     mount_runtime.stopRemountThread();
 
-    /// 2. rev.6 Task 5 (spec §clean-release drain): the farewell marker the keeper's `stop()` writes is a
+    /// 2. The farewell marker the keeper's `stop()` writes is a
     /// certificate that no in-flight ref-log conditional PUT from this incarnation can land after it --
     /// a successor treats it as proof of a clean death (`MountPriorState::Clean`, no observation wait
     /// needed). Writing it without an actual drain would be a protocol-safety bug: an uncertain PUT this
@@ -582,7 +581,7 @@ Pool::~Pool()
 }
 
 /// The plain-object surface (namespace files + mountpoint objects) is implemented by the stateless
-/// `plain_objects` component (spec §Decomposition); these are thin delegates preserving the API.
+/// `plain_objects` component; these are thin delegates preserving the API.
 void Pool::putNamespaceFile(const RootNamespace & ns, const String & name, const String & bytes)
 {
     plain_objects.putNamespaceFile(ns, name, bytes);
@@ -665,7 +664,7 @@ bool Pool::tryRemountOnce()
             return false;
         }
 
-        /// rev.6 Task 7 (spec §Self-remount): pay `materialization_grace_ms` only when this incarnation's
+        /// pay `materialization_grace_ms` only when this incarnation's
         /// own ref lanes did NOT provably settle before the fence tripped -- an unresolved (still-wedged)
         /// ref-log conditional `PUT` from the dying epoch could still land after recovery starts trusting
         /// its listings. The common case (no in-flight `PUT` when the fence tripped) skips the wait.
@@ -688,8 +687,8 @@ bool Pool::tryRemountOnce()
         mount_runtime.installKeeper(our_uuid, writer_epoch, now_ms);
         mount_runtime.keeperStart();
 
-        /// Re-establish the ref-protocol incarnation BEFORE re-arming the fence (spec §Startup And
-        /// Recovery / §write-fence). Order is load-bearing: `keeperStart` refreshes the lease deadline
+        /// Re-establish the ref-protocol incarnation BEFORE re-arming the fence. Order is load-bearing:
+        /// `keeperStart` refreshes the lease deadline
         /// but does NOT clear `lost`, so the fence stays closed here and no append/publish can race the
         /// swap.
         /// 1. Bump the live epoch so every subsequent `allocateRefTxnId` sorts strictly above any older
@@ -766,14 +765,14 @@ PartWriteTxnPtr Pool::beginPartWrite(PartWriteInfo info)
     const UInt64 lo = thread_local_rng();
     const UInt128 build_id = (static_cast<UInt128>(hi) << 64) | lo;
 
-    /// Strictly-increasing per-process build_seq carried by the PartWriteTxn (spec 2026-06-16). The PartWriteTxn is
+    /// Strictly-increasing per-process build_seq carried by the `PartWriteTxn`. The `PartWriteTxn` is
     /// added to the active set here and retired on publish/abandon/dtor, so minActive — the GC floor
     /// the Pool-owned watermark renews — tracks in-flight builds. The build registry lives on
-    /// `mount_runtime` (source-layout §3.5).
+    /// `mount_runtime`.
     const uint64_t seq = mount_runtime.allocateBuildSeq();
 
     auto build = std::make_shared<PartWriteTxn>(shared_from_this(), build_id, seq, liveWriterEpoch(), std::move(info));
-    /// Register for `dropNamespace`'s post-durable build cancellation (spec §Namespace Removal). weak_ptr:
+    /// Register for `dropNamespace`'s post-durable build cancellation. weak_ptr:
     /// the wiring owns the returned shared_ptr; `retireBuildSeq` (publish/abandon/dtor) removes the entry.
     mount_runtime.registerInflightBuild(seq, build);
     return build;
@@ -798,7 +797,7 @@ BlobLocation Pool::locate(const ManifestEntry & entry) const
 
 namespace
 {
-/// rev.6 Task 11 (spec §anomaly-policy background diagnostics): a tolerant, read-only peek at the
+/// a tolerant, read-only peek at the
 /// `cas_ref_log` TEXT object (codecs-v3 phase 3) WITHOUT `decodeRefLogTxn`'s expected-value cross-check
 /// -- the whole point of this diagnostic is that the body is NOT expected to match this key's identity.
 /// It `openObject`s the stored `.zst`, skips the header line, and reads `ns`/`we`/`rs` off the meta
@@ -861,13 +860,13 @@ void Pool::reportImpossibleInterference(const String & key, const String & reaso
         e.detail = {{"key", key}, {"server_root_id", config.server_root_id}};
     });
 
-    /// spec §anomaly-policy: incidental-only detection, fail-closed reaction -- the SAME on_lost
+    /// Incidental-only detection has a fail-closed reaction -- the SAME on_lost
     /// mechanics a foreign/superseded lease renewal already drives (the keeper's `setFenceCallbacks`
     /// lambda). The fence + self-remount now live on `mount_runtime`.
     mount_runtime.tripMountLost();
     mount_runtime.scheduleRemount();
 
-    /// Diagnosis off the critical path (spec §anomaly-policy): a background task may spend a FEW
+    /// Diagnosis off the critical path: a background task may spend a FEW
     /// requests -- never the caller's thread, and never blocking this call's own return.
     /// `shared_from_this()` keeps the Pool alive for the thread's lifetime (mirrors
     /// `maybeScheduleSnapshotPublish`'s dispatch).
@@ -912,7 +911,7 @@ void Pool::reportImpossibleInterference(const String & key, const String & reaso
 
 uint64_t Pool::currentGcRound() const
 {
-    /// Task 5: read `gc/state` once (no CAS loop — a point-in-time read is sufficient; a concurrent
+    /// Read `gc/state` once (no CAS loop — a point-in-time read is sufficient; a concurrent
     /// GC advance only makes the returned round larger, which is strictly more conservative for the
     /// `precommitAdd` self-floor). Returns 0 when absent (pool never GC'd — no round to floor to).
     const auto state_bytes = pool_backend->get(pool_layout.gcStateKey());
@@ -948,7 +947,7 @@ void Pool::removeMountpointObject(const String & key)
 
 std::vector<String> Pool::listNamespaces(const String & prefix)
 {
-    /// LIST-based discovery authority (Task 4): enumerate distinct full namespace strings
+    /// LIST-based discovery authority: enumerate distinct full namespace strings
     /// from ref shards under `cas/refs/` UNION verbatim-file namespaces under `roots/`.
     ///
     /// Consistency requirement: the backend must give read-your-writes LIST enumeration.
@@ -1015,11 +1014,11 @@ std::vector<String> Pool::listNamespaces(const String & prefix)
 
 std::vector<String> Pool::listMirroredChildren(const String & prefix)
 {
-    /// Loose LIST of the mirrored subtree (design §5.3). Returns the distinct next-path-segment
+    /// Loose LIST of the mirrored subtree. Returns the distinct next-path-segment
     /// names. NOT authoritative — callers must re-check `listRefs` per candidate before surfacing
     /// it. GC uses LIST-based discovery (`cas/refs/` prefix) rather than a registry.
     ///
-    /// Phase 1: a namespace's presence is split across two physical subtrees — its ref-log/snapshot
+    /// A namespace's presence is split across two physical subtrees — its ref-log/snapshot
     /// objects live under `cas/refs/<ns>/_log|_snap|_cleanup/…` while its verbatim files and PLAIN
     /// mountpoint objects stay under `roots/<ns>/_files/…` / `roots/<key>`. The browse therefore
     /// UNIONs the next-segment names from BOTH subtrees so a namespace discoverable only by its ref
@@ -1054,7 +1053,7 @@ std::vector<String> Pool::listMirroredChildren(const String & prefix)
 }
 
 
-/// ==== ref-ledger delegates (source-layout §3.4) ==== The ref-log / ref-table subsystem lives in the
+/// ==== ref-ledger delegates ==== The ref-log / ref-table subsystem lives in the
 /// `ref_ledger` member (Pool/CasRefLedger.h); Pool keeps these thin public forwarders so the wiring,
 /// PartWriteTxn, Gc, and every test call site is unchanged.
 
@@ -1129,9 +1128,9 @@ CasCreateResult Pool::stagingConditionalCreate(std::string_view key, const std::
 
 void Pool::cancelInflightBuildsForNamespace(const RootNamespace & ns)
 {
-    /// Delegate to `mount_runtime` (the build registry moved there, source-layout §3.5). Invoked by
-    /// `ref_ledger` through the `cancel_inflight_builds` callback once its removal transaction is durable
-    /// (spec §Namespace Removal: "cancels local builds").
+    /// Delegate to `mount_runtime`. Invoked by
+    /// `ref_ledger` through the `cancel_inflight_builds` callback once its removal transaction is durable,
+    /// so that in-flight local builds targeting the removed namespace are cancelled.
     mount_runtime.cancelInflightBuildsForNamespace(ns);
 }
 

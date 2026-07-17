@@ -7,13 +7,13 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEvent.h>
 #include <Common/CacheBase.h>
 #include <memory>
-#include <optional>
 
 namespace DB::Cas
 {
 
-/// Blob placement inside a content object: the object key plus the ranged window (payload offset +
-/// length) that `locate` derives from a manifest entry.
+/// The object key and ranged payload window for a manifest entry stored as a separate blob. The
+/// offset is measured from the beginning of the blob object and skips its fixed envelope; `length`
+/// is the entry's raw file size. Inline entries do not have a `BlobLocation`.
 struct BlobLocation
 {
     String key;
@@ -21,50 +21,66 @@ struct BlobLocation
     uint64_t length = 0;
 };
 
-/// The manifest read path, extracted from `Pool` (spec §Decomposition): the mandatory-HEAD +
-/// fail-closed-validation + decode of a part manifest, plus the token-gated byte-weighted decode
-/// cache and blob `locate`. Environment is injected by reference (no `Pool` back-reference): the
-/// backend, the layout, the pool meta (for the fixed `blob_header_len`), and the event sink.
+/// Reads and validates part manifests, caches immutable decodes, and translates blob entries into
+/// ranged object reads. A read first obtains the object's current backend token, then reuses a
+/// decode only for the matching `(ManifestId, Token)` pair; a cache miss performs a `GET` and
+/// validates both the manifest reference and owning namespace before publication into the cache.
+/// Missing or changing objects and failed identity checks are surfaced as exceptions, never as an
+/// empty or partially trusted manifest.
 ///
-/// The decode cache is a `CacheBase` LRU — its synchronization is INTERNAL to `CacheBase`; this
-/// component owns no `Pool`-level mutex. `nullptr` <=> caching disabled
-/// (`manifest_decode_cache_bytes == 0`).
+/// The reader receives its backend, immutable layout and pool metadata, and event sink by reference;
+/// it has no `Pool` back-reference and owns no `Pool`-level mutex. The decode cache is a
+/// byte-weighted `CacheBase` LRU whose synchronization is internal to `CacheBase`; a null cache
+/// means caching is disabled (`manifest_decode_cache_bytes == 0`).
 class CasManifestReader
 {
 public:
+    /// Binds the reader to the pool environment. A positive cache budget creates the byte-weighted
+    /// LRU; zero disables caching while leaving the mandatory `HEAD` and validation sequence intact.
     CasManifestReader(
         Backend & backend_, const Layout & layout_, const PoolMeta & meta_,
         const CasEventSink & event_sink_, size_t manifest_decode_cache_bytes);
 
-    /// Fail-closed manifest read: mandatory HEAD (a missing body is INV-NO-DANGLE), (id, token) cache
-    /// hit reuses the immutable decode, else GET + decode + body/namespace validation, then cache set.
+    /// Reads a manifest by value using the fail-closed sequence described above. A missing body,
+    /// disappearance between `HEAD` and `GET`, decode failure, or either identity mismatch throws;
+    /// only a fully validated decode can enter the cache.
     PartManifest readManifest(const ManifestId & id);
-    /// Identical to `readManifest` but returns the shared decoded manifest (the cache's own value),
-    /// avoiding a copy on the part-folder read path.
+
+    /// Reads a manifest like `readManifest` but returns the immutable shared decode. This preserves
+    /// the cache's value on the part-folder path and avoids copying all manifest entries on success.
     std::shared_ptr<const PartManifest> readManifestShared(const ManifestId & id);
 
-    /// Blob placement only (no read): the object key + payload window for a Blob-placed entry.
+    /// Computes the object key and payload window for a `Blob` entry without performing I/O. An
+    /// `Inline` entry, or any unsupported placement value, throws `BAD_ARGUMENTS` because it has no
+    /// standalone object to read.
     BlobLocation locate(const ManifestEntry & entry) const;
 
     /// Test seam: retained bytes of the manifest decode cache (0 when disabled).
     size_t manifestDecodeCacheBytes() const { return manifest_cache ? manifest_cache->sizeInBytes() : 0; }
 
 private:
+    /// The cache must include the backend token: a reused manifest identifier can refer to a new
+    /// object incarnation, and its immutable decoded bytes must not be reused across incarnations.
     struct ManifestCacheKey
     {
         ManifestId manifest_id;
         Token token;
         bool operator==(const ManifestCacheKey &) const = default;
     };
+
+    /// Hashes both identity components and the token type so cache lookup uses the same complete
+    /// identity as `ManifestCacheKey::operator==`.
     struct ManifestCacheKeyHash
     {
         size_t operator()(const ManifestCacheKey & k) const;
     };
-    /// Byte-weighted so a server that reads very many parts (each decode carrying megabytes of inline
-    /// bytes) has an honest memory ceiling instead of a count-only bound. Same key, same fail-closed
-    /// token semantics.
+
+    /// Estimates retained decode memory from fixed object overhead plus entry path and inline-byte
+    /// storage. Weighting by bytes gives a server reading many parts an honest memory ceiling instead
+    /// of a count-only bound; the cache key still provides the fail-closed token semantics.
     struct PartManifestWeight
     {
+        /// Returns the approximate bytes retained for one decoded manifest by the cache.
         size_t operator()(const PartManifest & m) const
         {
             size_t bytes = 256;

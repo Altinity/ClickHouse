@@ -2,7 +2,7 @@
 
 namespace ProfileEvents
 {
-/// B168 P0: the CA per-namespace S3 op events (6 namespaces × 11 ops). Declared in ProfileEvents.cpp.
+/// The CA per-namespace and per-operation events declared in `ProfileEvents.cpp`.
 extern const Event CasBlobPut;
 extern const Event CasBlobPutDedup;
 extern const Event CasBlobOverwrite;
@@ -79,8 +79,9 @@ extern const Event CasOtherList;
 namespace DB::Cas
 {
 
-/// (CasNs, CasOp) → ProfileEvents::Event. Row-major: outer index is the namespace, inner is the op.
-/// Must stay in lockstep with the CasNs / CasOp enum orderings.
+/// Maps `(CasNs, CasOp)` to the corresponding `ProfileEvents::Event`. The table is row-major: the
+/// outer index is the namespace and the inner index is the operation. Its rows and columns must stay
+/// in lockstep with the `CasNs` and `CasOp` enum orderings.
 static const ProfileEvents::Event cas_event_table[CAS_NS_COUNT][CAS_OP_COUNT] =
 {
     /* Blob   */ {ProfileEvents::CasBlobPut, ProfileEvents::CasBlobPutDedup, ProfileEvents::CasBlobOverwrite,
@@ -113,11 +114,10 @@ CasNs classifyCasNs(const String & key)
 {
     if (key.find("/blobs/") != String::npos)
         return CasNs::Blob;
-    /// Post-relocation layout (hot/cold split): ref shards live under `cas/refs/<ns>/<shard>` and
-    /// part manifests under `cas/manifests/<ns>/...`. Without these two rules every ref-shard and
-    /// manifest request misclassified as Other — the 2026-07-03 operator-stand CREATE TABLE storm
-    /// showed up as `CasOtherHeadMiss=102` when it was really 3 all-shard ref sweeps (see
-    /// `Pool::listRefs`).
+    /// Ref logs, snapshots, and cleanup markers are immutable objects under `cas/refs/<namespace>/`;
+    /// part manifests are under `cas/manifests/<namespace>/`. These paths must be classified before
+    /// the generic `roots/` and `Other` cases, otherwise the ref and manifest operation counters
+    /// silently accumulate in the wrong namespace.
     if (key.find("/cas/refs/") != String::npos)
         return CasNs::Root;
     if (key.find("/cas/manifests/") != String::npos)
@@ -137,8 +137,9 @@ void incrementCasEvent(CasNs ns, CasOp op)
 namespace
 {
 
-/// Wraps an inner WriteSink: the Put-vs-PutDedup outcome is known only at finalize. The namespace is
-/// captured at creation. buffer()/cancel() delegate verbatim; finalize delegates then increments.
+/// Wraps an inner `WriteSink`. The namespace is captured at creation because the key is not available
+/// at `finalize`; the `Put` versus `PutDedup` outcome is emitted only after the inner sink returns.
+/// Buffer access and cancellation delegate verbatim, while exceptions from the inner sink propagate.
 class InstrumentedWriteSink final : public WriteSink
 {
 public:
@@ -146,6 +147,8 @@ public:
 
     WriteBuffer & buffer() override { return inner->buffer(); }
 
+    /// Finalize the inner upload first, then count its returned outcome. No event is emitted if the
+    /// inner operation throws.
     PutResult finalize() override
     {
         PutResult result = inner->finalize();

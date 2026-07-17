@@ -46,8 +46,10 @@ void runCapabilityProbe(Backend & backend, const String & probe_prefix)
         // ---- Step 0: store-level preconditions (backend-specific; throws = mount refused). ----
         backend.checkPoolPreconditions();
 
-        // ---- Step 0b: single-attempt conditional-write support (RFC cas-s3-timeout-retry-control;
-        // throws = mount refused). Separate from Step 0 so each is independently unit-testable. ----
+        // ---- Step 0b: conditional writes must use one underlying HTTP attempt. Transparent SDK
+        // retries can outlive the writer's mount lease and hide whether a conditional operation
+        // committed; CAS retries must instead be explicit and state-aware. Throws = mount refused.
+        // Keep this separate from Step 0 so each precondition remains independently unit-testable. ----
         backend.checkConditionalWriteSingleAttemptSupport();
 
         // ---- Step 1: putIfAbsent fresh → Done; read-after-write returns the bytes. ----
@@ -153,10 +155,8 @@ void runCapabilityProbe(Backend & backend, const String & probe_prefix)
                     "CasProbe: casPut conflicts were reported but the original bytes were altered");
         }
         // 5d: commit on current token.
-        Token ct2;
         {
             const auto res = backend.casPut(cas_key, "cas-s2", ct1);
-            ct2 = res.token;
             if (res.outcome != CasOutcome::Committed)
                 throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED,
                     "CasProbe: casPut with the current token was not committed — "

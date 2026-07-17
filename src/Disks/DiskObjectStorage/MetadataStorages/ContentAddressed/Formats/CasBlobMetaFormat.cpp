@@ -26,6 +26,9 @@ std::string_view metaStateToWord(MetaState s)
         case MetaState::Clean:     return "clean";
         case MetaState::Condemned: return "condemned";
     }
+    // The enum is persisted as a closed vocabulary. Do not silently invent a spelling for a value
+    // added without a corresponding format decision: that would make the writer emit data older
+    // readers cannot classify.
     throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS blob meta: unknown MetaState {}", static_cast<int>(s));
 }
 
@@ -42,6 +45,8 @@ String encodeBlobMeta(const BlobMeta & meta)
 {
     WriteBufferFromOwnString out;
     writeHeaderLine(out, FormatId::BlobMeta);
+    // `version` is represented by the header line. The JSON body contains only fields that describe
+    // the current marker and its accounting data.
     bool first = true;
     writeKey(out, "st", first);
     writeStringValue(out, metaStateToWord(meta.state));
@@ -63,6 +68,8 @@ BlobMeta decodeBlobMeta(std::string_view bytes)
     ReadBufferFromMemory body_in(body.data(), body.size());
     JsonObjectReader r(body_in, KeyStrictness::Tolerant, "blob meta");
 
+    // Start with the documented defaults. In particular, `version` stays at 1 because the header's
+    // version is authoritative and is not copied into the body struct.
     BlobMeta m;
     bool saw_state = false;
     String key;

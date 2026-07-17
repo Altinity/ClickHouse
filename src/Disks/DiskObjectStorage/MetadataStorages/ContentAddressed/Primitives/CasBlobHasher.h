@@ -9,12 +9,13 @@
 namespace DB::Cas
 {
 
-/// The blob content-address hash function, selectable per pool (see the CAS pluggable-blob-hash
-/// design doc, docs/superpowers/specs/2026-07-11-cas-pluggable-blob-hash-design.md). Phase 1 keeps
-/// the blob identity a fixed 128-bit `UInt128` for both `CityHash128` and `XXH3_128`. Phase 2 adds
-/// `Sha256` as a 256-bit digest (both `makeBlobHashingWriteBuffer` and `blobHashHexOneShot` below
-/// implement it); everywhere else that still assumes a fixed 128-bit blob identity is tracked as a
-/// separate part of the Phase 2 variable-length digest refactor.
+/// The content-address hash function selected for a blob pool. The numeric values are persisted as a
+/// byte in the binary source-edge run format and must remain stable; the textual name used in object
+/// paths and pool metadata is returned by `blobHashAlgoName`.
+///
+/// `CityHash128` and `XXH3_128` produce 16-byte digests, while `Sha256` produces a 32-byte digest.
+/// The digest representation and codec derive their width from this algorithm for each blob; there
+/// is no single pool-wide digest width when a pool admits more than one algorithm.
 enum class BlobHashAlgo : uint8_t
 {
     CityHash128 = 1,
@@ -26,11 +27,10 @@ enum class BlobHashAlgo : uint8_t
 /// `"sha256"`. Throws `BAD_ARGUMENTS` for an out-of-range enum value.
 std::string_view blobHashAlgoName(BlobHashAlgo algo);
 
-/// The digest byte width for `algo`: 16 for the 128-bit hashes (`CityHash128`, `XXH3_128`), 32 for
-/// the 256-bit `Sha256` (CAS pluggable-blob-hash Phase 2, design §12). Sizes `Cas::codecFor(algo)`'s
-/// `DigestCodec` (`CasBlobDigest.h`/`CasBlobRef.h`) -- Phase 3 T4 deleted the pool-wide
-/// `PoolMeta::blob_hash_len`; the width is always derived per-algo, never per-pool. Throws
-/// `BAD_ARGUMENTS` for an out-of-range enum value (same fail-closed contract as `blobHashAlgoName`).
+/// Returns the digest byte width for `algo`: 16 for `CityHash128` and `XXH3_128`, or 32 for
+/// `Sha256`. This is also the width used by `Cas::codecFor(algo)`'s `DigestCodec`; callers must
+/// derive it from the algorithm rather than from pool state. Throws `BAD_ARGUMENTS` for an
+/// out-of-range enum value, preserving the fail-closed contract of `blobHashAlgoName`.
 uint64_t blobHashLenFor(BlobHashAlgo algo);
 
 /// Parses the per-disk `blob_hash` CONFIG value: `"cityhash128"` | `"xxh3-128"` | `"sha256"`. Throws
@@ -56,22 +56,23 @@ public:
     virtual String getHashHex() = 0;
 };
 
-/// Builds the streaming hash-and-passthrough buffer for `algo` over `sink`. `sink` must outlive the
-/// returned buffer (the same lifetime contract as `HashingWriteBuffer`). `CityHash128` returns a
-/// thin adapter over the existing `HashingWriteBuffer` (chunked, `DBMS_DEFAULT_HASHING_BLOCK_SIZE`
-/// block, chained `CityHash128WithSeed`) so its hash values stay byte-identical to today -- the CAS
-/// default MUST NOT change any existing hash value. `XXH3_128` uses the xxhash library's streaming
-/// `XXH3_128bits` state. `Sha256` uses OpenSSL's streaming EVP SHA-256 digest (`EVP_DigestUpdate` per
-/// chunk) -- like `XXH3_128`, its streaming digest agrees with the one-shot digest, so there is no
-/// chunked convention to preserve.
+/// Builds a streaming hash-and-passthrough buffer for `algo` over `sink`. Every byte written to the
+/// returned buffer is forwarded unchanged to `sink` and included in its digest. `sink` must outlive
+/// the returned buffer, as with `HashingWriteBuffer`.
+///
+/// `CityHash128` is a thin adapter over the existing `HashingWriteBuffer`: it retains the
+/// `DBMS_DEFAULT_HASHING_BLOCK_SIZE` chunks and chained `CityHash128WithSeed` convention, so the
+/// default algorithm produces byte-identical blob hashes. `XXH3_128` uses the xxhash library's
+/// streaming `XXH3_128bits` state, and `Sha256` uses OpenSSL's streaming EVP SHA-256 digest. Both
+/// of those algorithms define their streaming digest to agree with their one-shot digest.
 std::unique_ptr<IHashingWriteBuffer> makeBlobHashingWriteBuffer(BlobHashAlgo algo, WriteBuffer & sink);
 
-/// One-shot hash of `bytes` for `algo`, used by the re-hash / copy-forward path (`poolContentHash` in
-/// `CasPartWriteTxn.cpp`) and by tests. `CityHash128` goes through `HashingReadBuffer` -- the SAME chunked
-/// convention the write side uses (a one-shot `CityHash128WithSeed` call diverges from the chunked
-/// hash for any payload larger than one hash block). `XXH3_128` uses the one-shot `XXH3_128bits`
-/// call, which is defined to agree with the streaming digest. `Sha256` uses OpenSSL's one-shot
-/// `encodeSHA256`, which is defined to agree with the streaming EVP digest above.
+/// Computes the lowercase-hex digest of `bytes` for `algo`. This is used by the re-hash and
+/// copy-forward path and by tests. For `CityHash128`, the implementation deliberately uses
+/// `HashingReadBuffer` so it follows the same chunked, chained convention as the streaming write
+/// path; a one-shot `CityHash128WithSeed` call would diverge for payloads larger than one hash block.
+/// The one-shot `XXH3_128bits` and OpenSSL `encodeSHA256` paths agree with their streaming
+/// counterparts.
 String blobHashHexOneShot(BlobHashAlgo algo, std::string_view bytes);
 
 }

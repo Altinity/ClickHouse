@@ -32,6 +32,9 @@ constexpr uint64_t PROGRESS_PAGES = 16;
 
 using Deadline = std::optional<std::chrono::steady_clock::time_point>;
 
+/// Enforce the optional overall scan deadline between backend operations. A timeout is propagated as
+/// `TIMEOUT_EXCEEDED`; the public `runFsck` wrapper may convert that exception into a partial report when
+/// explicitly requested.
 void checkDeadline(const Deadline & deadline, std::string_view phase)
 {
     if (deadline && std::chrono::steady_clock::now() > *deadline)
@@ -69,8 +72,8 @@ void listAll(Backend & backend, const String & prefix, std::unordered_map<String
 }
 
 /// Parse (writer_epoch, build_sequence) from a manifest object key. Delegates to the one shared
-/// `Layout::parseManifestKey` (spec §Manifest Identifier canonical hex form) instead of hand-rolling a
-/// second parser; returns false on a malformed/foreign key.
+/// `Layout::parseManifestKey` instead of hand-rolling a second parser; returns false on a
+/// malformed or foreign key.
 bool parseBuildPrefix(const Layout & layout, const String & key, BuildPrefix & out)
 {
     const auto parsed = layout.parseManifestKey(key);
@@ -81,14 +84,14 @@ bool parseBuildPrefix(const Layout & layout, const String & key, BuildPrefix & o
     return true;
 }
 
-/// B207 fix: the ref-walk (which builds `reachable_blobs`/`blob_labels`) and the HEAD-confirm below
-/// run minutes apart with no snapshot between them. A ref that gets RE-PUBLISHED (now names a
+/// The ref-walk (which builds `reachable_blobs`/`blob_labels`) and the HEAD-confirm below run minutes
+/// apart with no snapshot between them. A ref that gets republished (now names a
 /// different manifest) or DROPPED in that window, combined with a legitimate GC delete of the OLD
 /// blob, makes the stale walk look like a genuine dangle (a "phantom dangling") — this made the fsck
-/// oracle dishonest and false-failed long soaks (B185/B206/B144 were all this race).
+/// oracle dishonest and falsely report a dangle during long-running validation.
 ///
 /// Before counting a HEAD-absent blob as `Dangling`, re-resolve every `"ns/ref"` label that named it
-/// FRESH (`resolveRef` with `allow_stale=false`, never the walk's cached/stale view) and check whether
+/// freshly (`resolveRef` with `allow_stale=false`, never the walk's cached/stale view) and check whether
 /// the CURRENT manifest still lists this blob as a `Blob` entry. `label` is split on the LAST '/' —
 /// mirroring exactly how the walk built it (`ns_str + "/" + ref_name`): `ref_name` never contains '/',
 /// but `ns_str` may, so the join separator is always the rightmost one.
@@ -111,9 +114,9 @@ bool blobStillReferenced(Pool & store, const Layout & layout,
         const String ref_name = label.substr(slash + 1);
         try
         {
-            /// FRESH read via `recoverRefTable` (a full LIST + replay), NOT `store.resolveRef` -- the
-            /// mounted Pool caches its `RefTableState` and never re-recovers it, so a concurrent EXTERNAL
-            /// ref write (the B207 race) is invisible to the cache. The recovery equation sees every log.
+            /// Read freshly via `recoverRefTable` (a full LIST + replay), not `store.resolveRef`: the
+            /// mounted Pool caches its `RefTableState` and never re-recovers it, so a concurrent external
+            /// ref write is invisible to the cache. The recovery equation sees every log.
             const RootNamespace rns{ns_part};
             const RefTableState table = recoverRefTable(store.backend(), layout, rns);
             const auto rit = table.committed.find(ref_name);
@@ -136,9 +139,7 @@ bool blobStillReferenced(Pool & store, const Layout & layout,
     return false;   /// every label re-resolved away (re-published or dropped) — a stale-walk artifact
 }
 
-/// Snapshot integrity oracle (spec §Snapshot Publication: "the published object doubles as an integrity
-/// oracle: fsck recomputes the replay and compares bytes. A divergence is corruption of the cache or the
-/// codec and fails closed."). For the newest published snapshot `X` of `ns`, independently reconstruct
+/// For the newest published snapshot `X` of `ns`, independently reconstruct
 /// the table state AT `X` from an EARLIER base (the greatest snapshot below `X`, or the empty state) plus
 /// the surviving logs in `(base, X]`, re-encode it deterministically, and byte-compare to the published
 /// `X` object. Byte-determinism of the codec (canonical sort, verified in the codec's own gtests) makes
@@ -239,35 +240,39 @@ void checkSnapshotOracle(Backend & backend, const Layout & layout, const RootNam
     }
 }
 
+/// Perform the scan and accumulate into `report`. This helper owns the read-only traversal: it first
+/// recovers authoritative refs, then checks physical objects and GC labels, while preserving the
+/// distinction between a missing live object and expected in-flight cleanup. Deadline exceptions are
+/// intentionally left to `runFsck`, which decides whether partial results were requested.
 void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, const Deadline & deadline,
                   const String & namespace_prefix, FsckReport & report)
 {
     const Layout & layout = store.layout();
     Backend & backend = store.backend();
-    /// Path-derived per-object algo parsing (Phase 3 T5): every listed blob-tree key -- across EVERY
+    /// Path-derived per-object algorithm parsing: every listed blob-tree key -- across every
     /// admitted algo, not just the pool's node-local write algo -- is classified via
     /// `Layout::parseBlobKey`, which derives the `BlobRef` from the key's OWN `<algo>` path segment
     /// (and its `.meta` sibling). A foreign/malformed key (unknown algo segment, wrong-width hex, a
     /// non-`.meta`/non-blob shape) parses to `std::nullopt` and is classified as debris, never an
     /// exception.
 
-    /// OQ8 manifest audit. Reachability is recomputed from the AUTHORITATIVE refs (never from gc state):
+    /// Reachability is recomputed from the authoritative refs (never from GC state):
     /// for each namespace, each committed ref resolves to a ManifestId; read its body; a committed ref
     /// naming a MISSING body is an ERROR (Dangling); a present body whose blobs are missing is an ERROR.
     std::set<String> reachable_blobs;        /// blob object keys named by a live owner
     std::set<String> owned_manifest_keys;    /// manifest object keys named by a committed owner
     /// blob key -> "ns/ref" labels of the refs that named it. Always populated (not just under
-    /// `detail`) — the B207 HEAD-absent re-resolve below needs it in every mode.
+    /// `detail`) — the HEAD-absent re-resolve below needs it in every mode.
     std::unordered_map<String, std::vector<String>> blob_labels;
 
     uint64_t refs_walked = 0;
     for (const String & ns_str : store.listNamespaces(namespace_prefix))
     {
         const RootNamespace ns{ns_str};
-        /// FRESH recovery (LIST + replay), NOT the mounted Pool's cached `listRefs`: fsck is a read-only
+        /// Fresh recovery (LIST + replay), not the mounted Pool's cached `listRefs`: fsck is a read-only
         /// audit that must see the authoritative durable ref state, including any external write.
         const RefTableState table = recoverRefTable(backend, layout, ns);
-        /// Snapshot integrity oracle (spec §Snapshot Publication): verify this table's newest published
+        /// Snapshot integrity oracle: verify this table's newest published
         /// snapshot is byte-identical to an independent replay of its own logs. Fails closed (records a
         /// mismatch, making the report not `clean()`) on a genuine divergence; skips silently when the
         /// covered logs were already cleaned or an object vanished mid-check.
@@ -284,16 +289,13 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
             {
                 /// A committed ref naming a missing manifest body — INV-NO-DANGLE surfaced (error).
                 ++report.dangling;
-                if (detail || true)
-                {
-                    FsckObject o;
-                    o.key = mkey;
-                    o.kind = ObjectKind::Blob;   /// manifests have no ObjectKind; reuse Blob as the generic kind
-                    o.size = 0;
-                    o.cls = FsckClass::Dangling;
-                    o.reachable_from = {label};
-                    report.objects.push_back(std::move(o));
-                }
+                FsckObject o;
+                o.key = mkey;
+                o.kind = ObjectKind::Blob;   /// manifests have no ObjectKind; reuse Blob as the generic kind
+                o.size = 0;
+                o.cls = FsckClass::Dangling;
+                o.reachable_from = {label};
+                report.objects.push_back(std::move(o));
                 ++refs_walked;
                 continue;
             }
@@ -338,7 +340,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
     if (namespace_prefix.empty())
     {
     /// Physical listing: blobs + manifest bodies. The per-hash `.meta` descriptor sibling
-    /// (`blobMetaKey(id) == blobKey(id) + ".meta"`, v3 raw-body-refinement) lives under the SAME
+    /// (`blobMetaKey(id) == blobKey(id) + ".meta"`) lives under the SAME
     /// `blobsPrefix()` as the body, so partition the raw LIST into bodies vs `.meta` objects up
     /// front — a `.meta` key must never be classified as a content body (it would otherwise be
     /// misread as an unreferenced blob and fall into the dangling/pending/unaccounted pipeline
@@ -382,7 +384,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
         const auto lit = blob_labels.find(bkey);
         if (!exists)
         {
-            /// B207: before declaring a loss, re-resolve the referencing ref(s) FRESH — a ref
+            /// Before declaring a loss, re-resolve the referencing refs freshly — a ref
             /// re-published or dropped between the walk and this HEAD-confirm, combined with a
             /// legitimate GC delete of the OLD blob, must NOT surface as a phantom dangle.
             const bool still_referenced = blobStillReferenced(store, layout, bkey,
@@ -409,7 +411,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
     }
 
     /// Present-but-unreferenced blobs: classify through the GC pipeline view instead of one
-    /// suspicious "unreachable" lump (2026-07-02; the two-phase graduation keeps a nonzero churning
+    /// suspicious "unreachable" lump (the multi-stage graduation keeps a nonzero churning
     /// set here on ANY active pool, and beta testers read "unreachable" as a leak). The GC state is
     /// read for LABELING ONLY — reachability above never consults it.
     std::unordered_map<BlobRef, RetiredEntry, BlobRefHash> retired_by_hash;
@@ -430,22 +432,18 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
         {
             have_gc_state = true;
             const GcState gc_state = decodeGcState(state_got->bytes);
-            /// The adopted fold seal names the snapshot runs (T0: resolution is by ref, never by key
-            /// construction). Every row whose hash is in our candidate set marks "known to GC" —
+            /// The adopted fold seal names the snapshot runs; resolution is by ref, never by key
+            /// construction. Every row whose hash is in our candidate set marks "known to GC" —
             /// edges still counted (drop unfolded), an explicit zero-marker mid-pipeline, or a
             /// `kCondemned` sentinel row that carries the condemned state (retired-in-snapshot):
             /// the `kCondemned` rows feed `retired_by_hash` (the `PendingGc` classification) in the
             /// SAME pass, replacing the removed `retired_refs`/`decodeRetiredSet` loop.
             ///
-            /// CAS pluggable-blob-hash Phase 2 Task 5 (THE CRUX fsck silent-leak site): `unref_hashes`/
-            /// `in_run_hashes`/`retired_by_hash` are `BlobDigest`-keyed natively — the run's own row
-            /// hash (`hash_digest`, parsed by the run's OWN `SourceEdgeKeyCodec` at ITS key_schema
-            /// width) is used DIRECTLY, no `legacyBlobId128` narrowing shim. Before this port, a
-            /// 64-hex sha256 candidate's key parsed fine here (`hexToU128` operated on this run row's
-            /// hash) but `unref_hashes` itself (built from a bare `hexToU128` on the LISTED BLOB KEY,
-            /// a few lines above) would have already thrown/mis-keyed for a 64-hex key — either way a
-            /// sha256 blob's true GC-pipeline state was invisible to fsck (falsely reported Unaccounted
-            /// instead of PendingGc/AwaitingGc).
+            /// These sets are keyed by the full `BlobRef`, not a narrowed digest. The run's own
+            /// algorithm-prefixed key is parsed by `SourceEdgeKeyCodec` and compared directly with
+            /// the full identity parsed from the listed blob key. This is required for mixed-algorithm
+            /// pools: a 64-hex digest must not be truncated or compared as though it used the pool's
+            /// local write algorithm, or its true GC state could be hidden as `Unaccounted`.
             if (const auto seal_got = backend.get(layout.foldSealKey(gc_state.snap_generation, gc_state.snap_attempt)))
             {
                 uint64_t rows = 0;
@@ -482,12 +480,12 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
                         if (on_progress && ++rows % 65536 == 0)
                             on_progress("reading gc snapshot runs", in_run_hashes.size(), rows);
                     }
-                    /// Whole-file seal-checksum (codecs-v3 phase 5): compare the drained run's accumulated
-                    /// checksum to the seal's RunRef.checksum. Fsck is a read-only auditor — instead of
-                    /// throwing (which would abort the whole scan on the first corrupt run), CATALOGUE the
-                    /// mismatch as a CorruptedRun finding (with the run key) and CONTINUE so the audit
+                    /// Whole-file seal checksum: compare the drained run's accumulated
+                    /// checksum to the seal's `RunRef::checksum`. Fsck is a read-only auditor — instead of
+                    /// throwing (which would abort the whole scan on the first corrupt run), catalogue the
+                    /// mismatch as a `CorruptedRun` finding (with the run key) and continue so the audit
                     /// enumerates every problem in one pass. The deletion-deriving consumers
-                    /// (fold/zeroInDegree/previewDeletes) still fail closed on the same mismatch.
+                    /// (`fold`/`zeroInDegree`/`previewDeletes`) still fail closed on the same mismatch.
                     if (reader.accumulatedChecksum() != run.checksum)
                     {
                         ++report.corrupted_runs;
@@ -508,7 +506,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
         /// A foreign/malformed key (`parseBlobKey` -> `nullopt`) falls back to the default `BlobRef{}`,
         /// which cannot match a real `retired_by_hash`/`in_run_hashes` entry — it lands in the generic
         /// `Unaccounted` bucket below, exactly the "debris, not ours" classification `parseBlobKey`
-        /// documents (spec §9.4, `ForeignAlgoSegmentIsDebrisNotOurs`).
+        /// documents: foreign algorithm segments are debris, not pool objects.
         const BlobRef hash = layout.parseBlobKey(bkey).value_or(BlobRef{});
 
         FsckClass cls = FsckClass::Unaccounted;
@@ -559,10 +557,10 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
         }
     }
 
-    /// Meta <-> body pairing (spec 2026-07-09 §raw-body-refinement, v3): a `.meta` object with no
+    /// Meta <-> body pairing: a `.meta` object with no
     /// body is an INV-META-BODY violation (the fixed meta/body lifecycle never leaves a meta
     /// orphaned of its body) — a real ERROR, distinct from `dangling` (which is reachability-driven).
-    /// A body with no `.meta` is a benign not-yet-adopted (or crashed-birth) artifact, NOT a dangle
+    /// A body with no `.meta` is a benign not-yet-adopted (or interrupted-birth) artifact, NOT a dangle
     /// — it still classifies through the ordinary present-but-unreferenced pipeline above.
     std::unordered_set<BlobRef, BlobRefHash> present_body_hashes;
     present_body_hashes.reserve(present_blobs.size());
@@ -590,7 +588,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
             bool exists = h.exists;
             if (!exists)
             {
-                /// B207: same HEAD-absent re-resolve as the global-mode loop above.
+                /// Use the same HEAD-absent re-resolve as the global-mode loop above.
                 const bool still_referenced = blobStillReferenced(store, layout, bkey,
                     lit != blob_labels.end() ? lit->second : std::vector<String>{}, deadline);
                 if (!still_referenced)

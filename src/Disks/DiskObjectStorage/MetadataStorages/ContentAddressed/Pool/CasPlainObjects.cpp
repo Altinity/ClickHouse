@@ -20,8 +20,9 @@ namespace
 
 void CasPlainObjects::casPutObject(const String & full_key, const String & bytes)
 {
-    /// head + putIfAbsent/putOverwrite loop. Single-owner keys make a contention storm impossible;
-    /// the bound is a runaway brake.
+    /// The read determines whether this is a conditional create or replacement. The token is only
+    /// valid for the incarnation returned by that head, so a precondition failure means another
+    /// writer won the race and the loop must observe the new incarnation before trying again.
     for (size_t attempt = 0; attempt < MAX_CAS_ATTEMPTS; ++attempt)
     {
         HeadResult head = backend.head(full_key);
@@ -35,7 +36,7 @@ void CasPlainObjects::casPutObject(const String & full_key, const String & bytes
             if (backend.putOverwrite(full_key, bytes, head.token).outcome == PutOutcome::Done)
                 return;
         }
-        /// PreconditionFailed ⇒ the observed state changed under us; re-head and retry.
+        /// `PreconditionFailed` means the observed state changed under us; re-head and retry.
     }
     throw Exception(ErrorCodes::ABORTED, "object CAS contention on '{}'", full_key);
 }
@@ -50,7 +51,9 @@ std::optional<String> CasPlainObjects::casGetObject(const String & full_key)
 
 void CasPlainObjects::casRemoveObject(const String & full_key)
 {
-    /// head + deleteExact loop; no-op when absent. Single-owner keys; the bound is a runaway brake.
+    /// Delete only the incarnation observed by the preceding head. A token mismatch leaves the
+    /// replacement untouched and is retried against a fresh observation; absence is a successful
+    /// no-op.
     for (size_t attempt = 0; attempt < MAX_CAS_ATTEMPTS; ++attempt)
     {
         const HeadResult head = backend.head(full_key);
@@ -59,7 +62,7 @@ void CasPlainObjects::casRemoveObject(const String & full_key)
         const DeleteOutcome outcome = backend.deleteExact(full_key, head.token);
         if (outcome.kind == DeleteOutcome::Kind::Deleted || outcome.kind == DeleteOutcome::Kind::NotFound)
             return;
-        /// TokenMismatch: a concurrent rewrite — re-head and retry.
+        /// `TokenMismatch` means a concurrent rewrite; re-head and retry.
     }
     throw Exception(ErrorCodes::ABORTED, "object CAS contention on '{}' (runaway live-lock brake)", full_key);
 }
@@ -84,7 +87,7 @@ std::vector<String> CasPlainObjects::listNamespaceFiles(const RootNamespace & ns
         ListPage page = backend.list(prefix, cursor, /*limit*/ 1000);
         for (const ListedKey & listed : page.keys)
         {
-            /// Strip the prefix to yield the bare flat file name.
+            /// Strip the storage prefix so callers receive the bare flat file name.
             if (listed.key.size() >= prefix.size() && listed.key.compare(0, prefix.size(), prefix) == 0)
                 names.push_back(listed.key.substr(prefix.size()));
         }
@@ -92,7 +95,8 @@ std::vector<String> CasPlainObjects::listNamespaceFiles(const RootNamespace & ns
             break;
         cursor = page.next_cursor;
     }
-    /// The InMemoryBackend lists sorted, but sort explicitly to stay backend-agnostic.
+    /// Backends are not required to return pages in the same order, so make the public result
+    /// deterministic instead of relying on `InMemoryBackend` ordering.
     std::sort(names.begin(), names.end());
     return names;
 }
@@ -114,9 +118,10 @@ std::optional<String> CasPlainObjects::getMountpointObject(const String & key)
 
 bool CasPlainObjects::mountpointObjectExists(const String & key)
 {
-    /// HEAD (metadata), not a body GET: the probed path may resolve to a DIRECTORY (e.g. the `store`
-    /// pool sub-dir traversed by system.remote_data_paths). The backend's metadata path treats a
-    /// directory as not-an-object (B38), so this returns false instead of a body read throwing EISDIR.
+    /// Use metadata rather than a body GET because a path probe may resolve to a directory, such as
+    /// the `store` pool subdirectory traversed by `system.remote_data_paths`. The local backend
+    /// treats a directory as not an object, so this returns false instead of attempting a body read
+    /// that would raise a filesystem exception for a directory.
     return backend.head(layout.mountpointObjectKey(key)).exists;
 }
 

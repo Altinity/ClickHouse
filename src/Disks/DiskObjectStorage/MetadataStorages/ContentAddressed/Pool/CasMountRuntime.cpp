@@ -7,6 +7,7 @@
 #include <chrono>
 #include <ctime>
 #include <thread>
+#include <vector>
 
 namespace DB
 {
@@ -70,10 +71,8 @@ void CasMountRuntime::tripMountLost()
 
 bool CasMountRuntime::refAppendFenceOk() const
 {
-    /// RFC pre-attempt check: mount fence not lost AND now < lease_deadline AND now + attempt_timeout +
-    /// lease_safety_margin < lease_deadline -- `mayMutate` only checks the first two; this adds the
-    /// REMAINING-budget check so a controlled attempt is never even started unless it could plausibly
-    /// finish (with its own safety margin) before the lease expires.
+    /// `mayMutate` checks the latch and deadline. The additional budget check prevents starting a
+    /// controlled request that cannot plausibly finish, including its safety margin, before expiry.
     if (mount_fence.lost.load(std::memory_order_acquire))
         return false;
     const uint64_t now = bootMsNow();
@@ -111,8 +110,8 @@ uint64_t CasMountRuntime::peekNextBuildSeq()
 
 void CasMountRuntime::renewWatermarkOnce()
 {
-    /// Renew the merged heartbeat (lease + build-watermark floor). A read-only open never anchored the
-    /// keeper; there is nothing to renew (fail closed rather than fabricate one).
+    /// A read-only runtime has no heartbeat to renew. Report that misuse instead of fabricating a keeper
+    /// or silently treating the call as successful.
     if (!mount_keeper)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS heartbeat: renewWatermarkOnce on a read-only Pool");
     mount_keeper->renewOnce();
@@ -128,8 +127,8 @@ uint64_t CasMountRuntime::allocateBuildSeq()
 
 void CasMountRuntime::registerInflightBuild(uint64_t seq, const PartWriteTxnPtr & build)
 {
-    /// Register for `dropNamespace`'s post-durable build cancellation (spec §Namespace Removal). weak_ptr:
-    /// the wiring owns the returned shared_ptr; `retireBuildSeq` (publish/abandon/dtor) removes the entry.
+    /// The caller owns the build's shared pointer. Keep only a weak reference here so the registry does
+    /// not extend the build lifetime; publication, abandonment, or destruction removes the entry.
     std::lock_guard lk(builds_mutex);
     inflight_builds[seq] = build;
 }
@@ -143,10 +142,9 @@ void CasMountRuntime::retireBuildSeq(uint64_t seq)
 
 void CasMountRuntime::cancelInflightBuildsForNamespace(const RootNamespace & ns)
 {
-    /// Collect the live shared_ptrs under `builds_mutex`, cancel OUTSIDE it
-    /// (`cancelForNamespaceRemoval` only stores an atomic). Relocated verbatim from `dropNamespace`'s
-    /// tail; invoked by `ref_ledger` through the `cancel_inflight_builds` callback once its removal
-    /// transaction is durable (spec §Namespace Removal: "cancels local builds").
+    /// The removal callback is invoked only after the namespace-removal transaction is durable. Keep
+    /// cancellation outside `builds_mutex`; `cancelForNamespaceRemoval` changes the build's atomic
+    /// cancellation state and does not require the registry lock.
     std::vector<PartWriteTxnPtr> builds_to_check;
     {
         std::lock_guard lk(builds_mutex);
@@ -160,11 +158,8 @@ void CasMountRuntime::cancelInflightBuildsForNamespace(const RootNamespace & ns)
 
 void CasMountRuntime::mintRandomProcessEpoch()
 {
-    /// Per-server watermark (spec 2026-06-16-ca-build-watermark). process_epoch is a random NONZERO
-    /// value minted once per Pool: GC checks it for equality only (a different epoch == a dead
-    /// incarnation). It rides through the watermark protobuf codec (uint64 field — full range). For
-    /// safety and to avoid the 0/UINT64_MAX sentinels, mask to 52 bits (collision-safe for an
-    /// equality-only token) and re-draw on 0 (UINT64_MAX is the retired sentinel).
+    /// Mint a nonzero equality-only identity. Keep it away from the zero/unarmed and UINT64_MAX/retired
+    /// sentinels; 52 random bits are sufficient for the expected collision risk of this token.
     constexpr uint64_t EPOCH_MASK = (1ULL << 52) - 1;
     process_epoch.store(
         (thread_local_rng() ^ (static_cast<uint64_t>(thread_local_rng()) << 32)) & EPOCH_MASK,
@@ -185,10 +180,9 @@ void CasMountRuntime::setLiveWriterEpoch(uint64_t v)
 
 void CasMountRuntime::installKeeper(UInt128 our_uuid, uint64_t writer_epoch, const std::function<uint64_t()> & now_ms)
 {
-    /// The mount object now holds OUR live (uuid, epoch) body. Construct + start the keeper, which
-    /// ADOPTS that very (uuid, epoch) slot rather than self-tripping the double-start guard.
-    /// The mount keeper carries the per-server build-watermark floor (`minActive`), read off the
-    /// keeper's state lock via `prepareRenew`.
+    /// The mount object already contains this runtime's live `(uuid, epoch)` body. Construct the keeper
+    /// to adopt that exact slot rather than triggering its double-start guard. The keeper reads the
+    /// build-watermark floor through `minActive` while preparing each renewal.
     const uint64_t ttl_ms = static_cast<uint64_t>(config.mount_lease_ttl_ms.count());
     mount_keeper = std::make_unique<MountLeaseKeeper>(
         backend_ptr, layout, server_root_id, our_uuid, writer_epoch,
@@ -196,15 +190,14 @@ void CasMountRuntime::installKeeper(UInt128 our_uuid, uint64_t writer_epoch, con
         [this] { return minActive(); },
         [this](CasEvent e) { emitEvent(std::move(e)); },
         std::chrono::milliseconds(cas_request_budget.lease_safety_margin_ms));
-    /// Keeper ↔ fence coupling (spec §write-fence): on each successful background renew refresh
-    /// the monotonic deadline; on a superseded/foreign renew failure latch the fence to lost.
-    /// Set BEFORE startBackground so no renewal can fire before the callbacks are in place.
+    /// Install the fence callbacks before any background renewal can run: successful renewals extend the
+    /// local BOOTTIME deadline, while a superseded or foreign renewal latches the fence and starts recovery.
     mount_keeper->setFenceCallbacks(
         [this, ttl_ms] { setMountDeadline(bootMsNow() + ttl_ms); },
         [this]
         {
             tripMountLost();
-            /// Liveness counterpart of the fence-out: recover in place as a FRESH incarnation.
+            /// Recover as a fresh incarnation; a fenced `(uuid, writer_epoch)` pair is never resurrected.
             scheduleRemount();
         });
 }
@@ -236,20 +229,18 @@ void CasMountRuntime::setUncleanEpochBoundarySeenAt(uint64_t v)
 
 void CasMountRuntime::scheduleRemount()
 {
-    /// Task 11 review follow-up: counted unconditionally, BEFORE the `background_watermark` gate below,
-    /// so `scheduleRemountCallCountForTest` observes every entry regardless of whether a thread actually
-    /// spawns -- see that accessor's comment for why this is the seam a fast unit test should use rather
-    /// than driving a real self-remount attempt.
+    /// Count every entry before checking whether background work is enabled. Tests can therefore observe
+    /// the keeper's loss callback without depending on a recovery thread being spawned.
     schedule_remount_calls_for_test.fetch_add(1, std::memory_order_relaxed);
     if (!config.background_watermark)
-        return;   /// tests drive tryRemountOnce explicitly (the same gate as every background thread)
+        return;
     if (remount_shutting_down.load() || remount_running.load())
         return;
     std::lock_guard g(remount_thread_mutex);
     if (remount_shutting_down.load() || remount_running.load())
         return;
     if (remount_thread.joinable())
-        remount_thread.join();   /// a PREVIOUS recovery finished; reap it before starting a new one
+        remount_thread.join();   /// Reap a previous recovery before starting a new one.
     remount_running.store(true);
     remount_thread = ThreadFromGlobalPool([this]
     {
@@ -282,14 +273,13 @@ void CasMountRuntime::beginShutdownForTest()
 
 void CasMountRuntime::stopRemountThread()
 {
-    /// Refuse any further self-remount arming for the rest of teardown. Latched under the thread mutex
-    /// (paired with scheduleRemount's checks) BEFORE the join below, so a keeper on_lost firing during
-    /// teardown can never re-arm remount_thread after we join it.
+    /// Refuse further recovery arming under the same mutex used by `scheduleRemount`, before joining.
+    /// Thus a keeper callback racing with teardown cannot re-arm the recovery thread after the join.
     {
         std::lock_guard g(remount_thread_mutex);
         remount_shutting_down.store(true);
     }
-    /// Stop the self-remount recovery loop FIRST: it may otherwise re-create the keeper below us.
+    /// Stop recovery first; it could otherwise recreate the keeper while the heartbeat is being retired.
     remount_stop.store(true);
     remount_cv.notify_all();
     {
@@ -301,11 +291,10 @@ void CasMountRuntime::stopRemountThread()
 
 void CasMountRuntime::finishTeardown(bool drained)
 {
-    /// Retire the merged heartbeat on a clean Pool teardown: stop() runs the keeper's terminal op,
-    /// which stamps the lease already-expired (expires_at_ms = now) AND folds in the watermark
-    /// farewell (min_active = UINT64_MAX). Stamping it expired lets a SAME-server reopen reclaim
-    /// immediately (the durable epoch + owner stay sticky). A throw here (e.g. a foreign incarnation
-    /// touched the slot) must not escape the dtor — log and continue tearing down.
+    /// On a drained teardown, `stop` writes an already-expired lease and the watermark farewell
+    /// (`min_active = UINT64_MAX`). This lets the same server reclaim immediately while retaining the
+    /// durable owner and epoch. A failure, such as another incarnation touching the slot, must not escape
+    /// destruction; log it and continue teardown.
     if (mount_keeper)
     {
         if (drained)
@@ -321,9 +310,9 @@ void CasMountRuntime::finishTeardown(bool drained)
         }
         else
         {
-            /// Fail-closed: the drain could not certify every in-flight PUT resolved (a timeout or a
-            /// live wedge), so writing the clean farewell would be a false certificate. No terminal op --
-            /// the successor falls back to the (slower but safe) observation-based reclaim.
+            /// If draining did not certify that every in-flight PUT resolved, a clean farewell would be
+            /// false evidence. Stop background renewal without a terminal operation so the successor uses
+            /// the slower but safe observation-based reclaim path.
             LOG_WARNING(getLogger("CasPool"),
                 "CAS store shutdown with an unresolved ref-log PUT: skipping the clean-release marker; "
                 "the next mount will treat this end as unclean");
@@ -331,9 +320,8 @@ void CasMountRuntime::finishTeardown(bool drained)
         }
     }
 
-    /// Belt-and-suspenders re-join. The shutting-down flag makes scheduleRemount a no-op above, so this
-    /// is normally not joinable; it closes the residual window where a keeper on_lost between the first
-    /// join and stop() observed the flag late.
+    /// The second join closes the residual window where a keeper loss callback observed the shutdown gate
+    /// late during the heartbeat stop operation.
     {
         std::lock_guard g(remount_thread_mutex);
         if (remount_thread.joinable())

@@ -15,11 +15,12 @@ namespace DB::Cas
 ///
 /// Dispatch is by KEY SHAPE, most-specific first (`cas/manifests/.../NNNNNN.zst` before the
 /// `cas/refs/` root-shard prefix, `/mount` and `/fold_seal` suffixes, then the pool-wide `gc/state`
-/// and `blobs/` prefix). u128 / token / hash fields render as lowercase hex strings (matching
-/// `u128ToHex`), never as an array of bytes or a raw struct dump.
+/// and `blobs/` prefix). u128 and hash fields render as lowercase hex strings (matching
+/// `u128ToHex`), while backend-native `Token` values render as escaped strings. Neither is exposed
+/// as an array of bytes or a raw struct dump.
 ///
 /// Throws `ErrorCodes::BAD_ARGUMENTS` when `key` matches none of the recognized CA layouts. Any
-/// decode failure of a MATCHED key (bad magic, corrupted bytes, future format version, ...)
+/// decode failure of a matched key (invalid header, corrupted bytes, future format version, ...)
 /// propagates as-is from the underlying `decode*` function (typically `CORRUPTED_DATA` or
 /// `UNKNOWN_FORMAT_VERSION`) — this function performs no fallback decode and swallows nothing.
 String caInspectToJson(const Layout & layout, const String & key, std::string_view bytes);

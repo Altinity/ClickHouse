@@ -1,7 +1,6 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasWireVocab.h>
-#include <IO/WriteBuffer.h>
 #include <base/types.h>
 #include <cstdint>
 #include <string_view>
@@ -9,26 +8,24 @@
 namespace DB::Cas
 {
 
-/// Shared refsnaplog wire sub-types + their JSON rendering (codecs-v3 phase 3). `RefOwnerBinding` and
-/// its `RefOwnerKind` are used by BOTH ref codecs — the log (`OwnerTransition` op bindings) and the
-/// snapshot (`precommits`) — so they live here rather than in either codec, and `CasRefLogFormat` /
-/// `CasRefSnapshotFormat` both include this header (neither depends on the other). `ManifestRef` field
-/// rendering (`writeManifestRefFields`/`manifestRefFromFields`) promoted to `CasWireVocab` in phase 6
-/// (part manifest): it fit the manifest descriptor rendering exactly, so `CasRefLogFormat` /
-/// `CasRefSnapshotFormat` keep calling it unqualified via this header's transitive include of
-/// `CasWireVocab.h`. Backend-free (identifier layer only).
+/// Shared identifier vocabulary for the ref-log and ref-snapshot text formats. `RefOwnerBinding` and
+/// `RefOwnerKind` are used in log `OwnerTransition` records and snapshot `precommits`, so neither
+/// format owns a duplicate definition. This header has no backend or storage dependencies; the
+/// manifest-reference JSON helpers are shared by both ref formats and part-manifest descriptors
+/// through `CasWireVocab.h`.
 
-/// Which slot of the table an `RefOwnerBinding` occupies (spec §State Transitions). Moved verbatim from
-/// the deleted `CasRefLogCodec.h`.
+/// Identifies which ownership slot a `RefOwnerBinding` occupies. The numeric values are the
+/// in-memory discriminators; text codecs render them as the words "committed" and "precommit".
 enum class RefOwnerKind : uint8_t
 {
     Committed = 1,
     Precommit = 2,
 };
 
-/// One (ref name -> manifest) binding (spec §Transaction Log Format). Moved verbatim from the deleted
-/// `CasRefLogCodec.h`. The build identity of a precommit is {manifest_ref.writer_epoch,
-/// manifest_ref.build_sequence} -- there is no second build token.
+/// One ref-name-to-manifest ownership binding. Log transitions use it for the optional old and new
+/// owners; snapshots use it for precommit rows, whose `kind` must be `Precommit`. A precommit's build
+/// identity is the pair `{manifest_ref.writer_epoch, manifest_ref.build_sequence}`; the binding has
+/// no additional build token. `manifest_ref` is validated by the format that decodes the binding.
 struct RefOwnerBinding
 {
     RefOwnerKind kind = RefOwnerKind::Committed;
@@ -38,7 +35,13 @@ struct RefOwnerBinding
     bool operator==(const RefOwnerBinding &) const = default;
 };
 
+/// Convert an owner-kind discriminator to its canonical text word. Throws `CORRUPTED_DATA` for a
+/// value not represented by this format; accepting an unknown value would produce an ambiguous wire
+/// record.
 std::string_view refOwnerKindToWord(RefOwnerKind k);
+
+/// Parse a canonical owner-kind word. `what` identifies the containing field in the
+/// `CORRUPTED_DATA` exception. Unknown words are rejected rather than treated as a default kind.
 RefOwnerKind refOwnerKindFromWord(std::string_view w, std::string_view what);
 
 }

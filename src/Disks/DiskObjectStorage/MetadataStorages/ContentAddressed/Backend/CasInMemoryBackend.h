@@ -8,16 +8,16 @@
 namespace DB::Cas
 {
 
-/// Thread-safe, token-enforcing in-memory Backend implementation.
+/// Thread-safe, token-enforcing in-memory `Backend` implementation used by CAS tests.
 ///
-/// All successful writes mint a monotonically increasing token (TokenType::Emulated).
+/// All successful writes mint a monotonically increasing token (`TokenType::Emulated`).
 /// Tokens NEVER repeat across the lifetime of a backend instance.
 ///
-/// Also exposes fault-injection controls for use in Probe tests and CAS correctness tests:
-///   - setHoldDeletes / landPendingDelete: simulate async/delayed conditional deletes
-///   - failNextCasPut:                     inject a one-shot conflict
-///   - setEnforceTokens(false):            mimic a "dumb" backend that ignores token checks
-///   - setSimulateDeleteMarkers:           mimic S3 versioning-enabled buckets
+/// The backend also exposes fault-injection controls for probe tests and CAS correctness tests:
+///   - `setHoldDeletes` / `landPendingDelete`: simulate async/delayed conditional deletes
+///   - `failNextCasPut`:                      inject a one-shot conflict
+///   - `setEnforceTokens(false)`:             mimic a "dumb" backend that ignores token checks
+///   - `setSimulateDeleteMarkers`:            mimic S3 versioning-enabled buckets
 ///
 /// Not `final`: tests subclass it to distort single behaviors (e.g. clamp list page size to force
 /// pagination) while delegating everything else to this base.
@@ -28,56 +28,92 @@ public:
 
     // ---- Backend interface ----
 
+    /// Returns the requested byte window, current token, and metadata, or `nullopt` when the key is absent.
     std::optional<GetResult> get(const String & key, Range range = {}) override;
+
+    /// Returns a forward-only stream over the requested byte window, or `nullopt` when the key is absent.
+    /// The in-memory implementation copies the window into an owning read buffer while holding the
+    /// backend lock, so the returned stream remains independent of later backend mutations.
     std::optional<GetStreamResult> getStream(const String & key, Range range = {}) override;
+
+    /// Returns the current existence, size, token, and metadata without materializing the body.
     HeadResult head(const String & key) override;
+
     /// The in-memory backend mints a monotonic token it surfaces through `list` — TRUE.
     bool supportsListTokens() const override { return true; }
+
+    /// Creates `key` only when it is absent. On success stores `bytes` and `meta` under a new token;
+    /// on a precondition failure leaves the existing object untouched.
     PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta = {}) override;
+
+    /// Returns a single-use sink whose finalized body is published with the same atomic conditional
+    /// create semantics as `putIfAbsent`. Cancelling or destroying the sink before finalization does
+    /// not publish anything.
     WriteSinkPtr putIfAbsentStream(const String & key, const ObjectMeta & meta = {}) override;
+
+    /// Replaces the existing object only when `expected` is its current token. Token enforcement can
+    /// be disabled with `setEnforceTokens` to model a backend that incorrectly ignores this condition.
     PutResult putOverwrite(const String & key, const String & bytes, const Token & expected,
                            const ObjectMeta & meta = {}) override;
+
+    /// Performs create-if-absent when `expected` is empty, or replace-if-current-token otherwise.
+    /// Conflicts leave the store unchanged and are returned as an outcome rather than an exception.
     CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected,
                      const ObjectMeta & meta = {}) override;
+
+    /// Removes exactly the incarnation named by `token`, or queues that token check for a later
+    /// `landPendingDelete` when delete holding is enabled. A queued delete is reported as accepted,
+    /// but its token is rechecked when it is landed.
     DeleteOutcome deleteExact(const String & key, const Token & token) override;
+
+    /// Lists up to `limit` keys under `prefix` in map order. `cursor` is the last key from the previous
+    /// page; returned tokens identify the listed incarnations and `next_cursor` is set only when more
+    /// matching keys remain.
     ListPage list(const String & prefix, const String & cursor, size_t limit) override;
 
-    /// Same-store server-side copy stubs (the emulated backend models conditional create, so it can
-    /// honor the write-once / resurrect contracts a real S3 backend provides — enough for the S3
-    /// staging promote gtests). `promoteStaged` copies `staging_key`'s bytes to `blob_key` ONLY if
-    /// `blob_key` is absent (`PreconditionFailed` otherwise), minting a fresh token = the "dest ETag".
-    /// `resurrectStaged` re-uploads `staging_key`'s PAYLOAD (skipping its `staging_payload_offset`
-    /// envelope header) under `fresh_header`, writing `[fresh_header][payload]` over `blob_key`
-    /// unconditionally and minting a fresh token; it NEVER reads `blob_key` (INV
-    /// `feedback_ca_resurrect_invariant`). The fresh header makes the resurrected body DIFFER from the
-    /// condemned incarnation for the same payload (INV-NO-RETURN — the fresh-tag property).
+    /// Same-store copy operations used to exercise the S3-staging contracts in memory. `promoteStaged`
+    /// copies the complete staging object to `blob_key` only when the destination is absent and returns
+    /// `PreconditionFailed` without changing it otherwise. The new token models the destination ETag.
+    ///
+    /// `resurrectStaged` is the one sanctioned unconditional overwrite: it reads only the writer's
+    /// staging object, skips its envelope header, prepends `fresh_header`, and writes the resulting
+    /// body over `blob_key`. The fresh header makes the resurrected body and token different from the
+    /// condemned incarnation, so a delayed exact-token delete for that old incarnation cannot remove
+    /// the resurrection (`INV-NO-RETURN`). The caller must already have established that the
+    /// destination is condemned.
     PutResult promoteStaged(const String & staging_key, const String & blob_key) override;
     Token resurrectStaged(const String & staging_key, const String & blob_key,
                           const String & fresh_header, uint64_t staging_payload_offset) override;
 
     // ---- Fault-injection controls ----
 
-    /// When true, deleteExact enqueues deletes rather than applying them immediately.
-    /// The caller sees Deleted (the "send" accepted), but the object remains until landPendingDelete.
+    /// When true, `deleteExact` validates and enqueues deletes rather than applying them immediately.
+    /// The caller sees `Deleted` (the send was accepted), but the object remains until
+    /// `landPendingDelete`, where the token is checked again.
     void setHoldDeletes(bool hold);
 
-    /// Number of currently held deletes.
+    /// Returns the number of currently held deletes.
     size_t pendingDeletes() const;
 
-    /// Apply held delete at index i: re-evaluates the token against the current object at LAND time.
-    /// Erases the entry regardless (whether TokenMismatch or Deleted).
+    /// Applies and removes the held delete at index `i`. The token is evaluated against the current
+    /// object at land time; the queue entry is removed whether the result is `TokenMismatch` or
+    /// `Deleted`. An invalid index returns `NotFound`.
     DeleteOutcome landPendingDelete(size_t i);
 
-    /// Inject a one-shot artificial Conflict on the next casPut for this key.
+    /// Injects a one-shot artificial `Conflict` on the next `casPut` for `key`.
     void failNextCasPut(const String & key);
 
-    /// When false, token checks on delete/overwrite/cas are skipped (all match).
+    /// Enables or disables token checks for delete, overwrite, and CAS operations. Disabling checks
+    /// models a backend that reports every expected token as matching.
     void setEnforceTokens(bool enforce);
 
-    /// When true, successful deletes set created_delete_marker = true in the outcome.
+    /// When true, successful deletes report `created_delete_marker = true`, modelling a versioned S3
+    /// bucket whose delete creates a marker instead of reclaiming the current object.
     void setSimulateDeleteMarkers(bool simulate);
 
 private:
+    /// Complete in-memory incarnation state for one key. All fields are read or modified while
+    /// `mutex_` is held; replacing `token` marks a new incarnation even when the bytes are unchanged.
     struct Object
     {
         String bytes;
@@ -85,20 +121,27 @@ private:
         ObjectMeta meta;
     };
 
+    /// Token captured when a held delete is queued. It is intentionally checked again at land time so
+    /// a replacement between send and land produces `TokenMismatch` rather than deleting the new object.
     struct PendingDelete
     {
         String key;
         Token token;
     };
 
+    /// Mints the next process-local token. Tokens are strictly increasing and never reused by this
+    /// backend instance, which also makes token equality a safe content-cache identity check in tests.
     Token mintToken();
+
+    /// Applies an exact-token delete while `mutex_` is already held. Used by immediate deletes and by
+    /// `landPendingDelete` after its queue entry has been removed.
     DeleteOutcome applyDelete(const String & key, const Token & token);
 
     mutable std::mutex mutex_;
     std::map<String, Object> store_;
     uint64_t token_seq_ = 0;
 
-    // Fault-injection state
+    // Fault-injection state. These fields are protected by `mutex_` just like `store_`.
     bool hold_deletes_ = false;
     std::vector<PendingDelete> pending_deletes_;
     std::set<String> fail_next_cas_;

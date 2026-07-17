@@ -7,7 +7,7 @@ using namespace DB::Cas;
 
 TEST(CasIds, StrongTypingAndContainers)
 {
-    /// Test the strong-typed-string macro (`CAS_STRONG_STRING`) with RootNamespace.
+    /// Test the strong-typed-string class `RootNamespace`.
     /// (`BlobId` was deleted in the mixed-algo-pools refactor; `TreeId` was part of the
     /// standalone-tree layer excised in the rev. 15 `PartManifest` redesign.)
     RootNamespace ns1{"srv1"}, ns2{"srv1"}, ns3{"srv2"};
