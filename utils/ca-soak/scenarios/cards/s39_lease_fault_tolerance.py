@@ -105,7 +105,14 @@ class S39(Scenario):
         result.observations["proxy"] = {"healthz": hz}
         _ctl("/config", {"rate": 0.0})
 
-        sql.create_ca_table(node, _TABLE, columns="id UInt64, payload String", order_by="id", wide=True)
+        # Create the ReplicatedMergeTree on EVERY node: a replicated table materializes per-replica
+        # (each replica runs its own CREATE against the shared zk path), so creating it only on node1
+        # would leave node2 without the table entirely and the end-of-run replica-agreement check would
+        # see UNKNOWN_TABLE on node2. All the fault/write legs below still drive node1 (`node`) only --
+        # this is a single-writer mount-lease test -- but node2 must exist as a real replica so the
+        # standard replica-agreement / fsck end-checks are meaningful.
+        for n in cl.nodes():
+            sql.create_ca_table(n, _TABLE, columns="id UInt64, payload String", order_by="id", wide=True)
         sql.insert_random(node, _TABLE, rows=rows // 4, payload_bytes=payload, op_id=0)
 
         # --- Leg A: SHORT fault (< lease TTL) -- the mount lease must survive ---
@@ -239,6 +246,14 @@ class S39(Scenario):
             "" if recovered else f"no write succeeded within 90s after the fault cleared -- self-remount "
                                  f"recovery did not resume writes (last error: {last_err[:200]})"))
 
+        # node2 replicates node1's writes through the same faulted S3; after leg B it may still be
+        # fetching. Sync it deterministically before the agreement check so we compare converged state,
+        # not a mid-catch-up snapshot (the check itself only polls ~8s, too short after a long fault).
+        for n in cl.nodes():
+            try:
+                n.command(f"SYSTEM SYNC REPLICA {_TABLE}", timeout=120)
+            except Exception as e:
+                ctx.log(f"S39 SYNC REPLICA on a node before agreement check (best-effort): {e}")
         _common.assert_replicas_agree(result, cl, sql.table_checksum_query(_TABLE),
                                       name="S39 replica agreement")
         _common.standard_end(ctx, result, [_TABLE])
