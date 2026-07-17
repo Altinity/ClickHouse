@@ -549,6 +549,19 @@ class S37(Scenario):
         result.observations["ttl_move_counters"] = {
             k: int(ttl_delta.get(k, 0)) for k in ("CasBlobPut", "CasBlobPutDedup", "CasManifestPut")}
 
+        # Neutralize the (permanently-expired) TTL rule now that the TTL-driven TO-CA move is
+        # verified, BEFORE the explicit move-back and the downstream legs. The rule
+        # `ts + INTERVAL 1 SECOND TO VOLUME 'cas'` on rows with ts=now()-10 stays expired forever, so
+        # the background TTL mover keeps re-pulling the part to 'cas' on every evaluation -- which
+        # otherwise races the move-back verdict, leg-5's clean-restart placement-stability check, and
+        # the chaos leg's explicit-MOVE atomicity check (background TTL mover competing with the
+        # explicit move / restart window). This race was latent until MOVE-to-CA was fixed this round:
+        # previously the TTL move failed (Code 236 promote collision), so the part stayed stuck on
+        # local1 and those legs passed by accident on a broken feature. Issue it on node1 only -- it
+        # is a replicated ALTER, so a second REMOVE TTL on node2 would fail (BAD_ARGUMENTS: nothing to
+        # remove) once node1's removal replicates.
+        cl.node1.command(f"ALTER TABLE {ttl_table} REMOVE TTL", timeout=120)
+
         # "back": explicit MOVE off the CA volume (same both-direction lifecycle as S36, but this
         # time the TO-CA leg was policy/TTL-triggered instead of an explicit ALTER MOVE).
         errors_ttl_back = []
@@ -570,18 +583,6 @@ class S37(Scenario):
         result.add(Verdict.check(
             "explicit MOVE TO VOLUME 'hot' brings the TTL-moved part back to local",
             "disk_name=local1", placement_ttl_back, back_ok))
-
-        # Neutralize the (permanently-expired) TTL rule now that BOTH TTL-move directions are
-        # verified. The rule `ts + INTERVAL 1 SECOND TO VOLUME 'cas'` on rows with ts=now()-10 stays
-        # expired forever, so the background TTL mover keeps re-pulling the part back to 'cas' on
-        # every evaluation -- which makes leg-5's placement-stability check and the chaos leg's
-        # explicit-MOVE atomicity check racy (the background TTL mover competing with the explicit
-        # move / the restart window). This race was latent until R2 fixed TO-CA moves: previously the
-        # TTL move failed (Code 236 promote collision), so the part stayed stuck on local1 and the
-        # downstream legs passed by accident on a broken feature. Remove the rule so `s37_ttl` is a
-        # stable fixture for the remaining legs; the explicit chaos MOVE below does not need it.
-        for n in cl.nodes():
-            n.command(f"ALTER TABLE {ttl_table} REMOVE TTL", timeout=120)
 
         # --- leg 3: system.parts.disk_name / system.disks are truthful ----------------------------
         disks_summary = _disks_summary(cl.node1)
