@@ -8,6 +8,7 @@
 #include <IO/ReadPipeline.h>
 #include <IO/WriteBufferFromFileBase.h>
 #include <Interpreters/Context.h>
+#include <Common/FailPoint.h>
 #include <Common/typeid_cast.h>
 
 #include <set>
@@ -16,9 +17,15 @@
 namespace DB
 {
 
+namespace FailPoints
+{
+    extern const char part_storage_fail_commit_transaction[];
+}
+
 namespace ErrorCodes
 {
     extern const int LOGICAL_ERROR;
+    extern const int FAULT_INJECTED;
 }
 
 DataPartStorageOnDiskFull::DataPartStorageOnDiskFull(VolumePtr volume_, std::string root_path_, std::string part_dir_)
@@ -370,6 +377,14 @@ void DataPartStorageOnDiskFull::commitTransaction()
 
     if (!transaction)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "There is no uncommitted transaction");
+
+    /// Regression gate for the part-durability-before-Keeper-commit invariant: lets a test fail the
+    /// close of the PART's deferred disk transaction specifically (autocommit one-shot disk ops are
+    /// not affected, unlike disk_object_storage_fail_commit_metadata_transaction).
+    fiu_do_on(FailPoints::part_storage_fail_commit_transaction,
+    {
+        throw Exception(ErrorCodes::FAULT_INJECTED, "part_storage_fail_commit_transaction");
+    });
 
     transaction->commit();
     transaction.reset();

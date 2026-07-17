@@ -141,6 +141,7 @@ static struct InitFiu
     ONCE(smt_commit_exception_before_op) \
     ONCE(disk_object_storage_fail_commit_metadata_transaction) \
     ONCE(disk_object_storage_fail_precommit_metadata_transaction) \
+    REGULAR(part_storage_fail_commit_transaction) \
     ONCE(write_file_operation_fail_on_read) \
     REGULAR(slowdown_parallel_replicas_local_plan_read) \
     ONCE(iceberg_writes_cleanup) \
