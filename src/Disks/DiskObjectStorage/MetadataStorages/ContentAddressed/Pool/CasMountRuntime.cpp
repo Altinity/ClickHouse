@@ -194,7 +194,8 @@ void CasMountRuntime::installKeeper(UInt128 our_uuid, uint64_t writer_epoch, con
         backend_ptr, layout, server_root_id, our_uuid, writer_epoch,
         config.mount_lease_ttl_ms, now_ms,
         [this] { return minActive(); },
-        [this](CasEvent e) { emitEvent(std::move(e)); });
+        [this](CasEvent e) { emitEvent(std::move(e)); },
+        std::chrono::milliseconds(cas_request_budget.lease_safety_margin_ms));
     /// Keeper ↔ fence coupling (spec §write-fence): on each successful background renew refresh
     /// the monotonic deadline; on a superseded/foreign renew failure latch the fence to lost.
     /// Set BEFORE startBackground so no renewal can fire before the callbacks are in place.
