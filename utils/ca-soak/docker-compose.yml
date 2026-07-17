@@ -80,6 +80,9 @@ services:
       - ./configs/ca_gc_log.xml:/etc/clickhouse-server/config.d/ca_gc_log.xml:ro
       - ./configs/ca_event_log.xml:/etc/clickhouse-server/config.d/ca_event_log.xml:ro
       - ./configs/ca_server_settings.xml:/etc/clickhouse-server/config.d/ca_server_settings.xml:ro
+      # R4: 10ms query-profiler sampling so a 20-min soak yields enough system.trace_log stacks
+      # (default period is 1s, too sparse). users.d because <profiles> lives in users.xml.
+      - ./configs/profiling.xml:/etc/clickhouse-server/users.d/profiling.xml:ro
       # B165: persist server logs to the host so they survive `docker compose down -v` (the soak #7
       # OOM destroyed all in-container logs). run_24h.sh creates+chmods logs/ch1 before `up`.
       - ./logs/ch1:/var/log/clickhouse-server
@@ -121,6 +124,7 @@ services:
       - ./configs/ca_gc_log.xml:/etc/clickhouse-server/config.d/ca_gc_log.xml:ro
       - ./configs/ca_event_log.xml:/etc/clickhouse-server/config.d/ca_event_log.xml:ro
       - ./configs/ca_server_settings.xml:/etc/clickhouse-server/config.d/ca_server_settings.xml:ro
+      - ./configs/profiling.xml:/etc/clickhouse-server/users.d/profiling.xml:ro
       - ./logs/ch2:/var/log/clickhouse-server
     ports:
       - "8124:8123"

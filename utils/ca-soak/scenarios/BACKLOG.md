@@ -1952,6 +1952,41 @@ which leaves shared global state dirty. So this is a pre-existing GENERAL `unit_
 hygiene issue (a non-CAS test not resetting global state), NOT a CAS correctness bug and NOT caused by this
 campaign. The CAS gtest battery is green. No CAS action; if pursued, it belongs in general test-harness hygiene
 (the offending non-CAS test's SetUp/TearDown), out of the CAS scope.
+## S01-20260713T164402-1: scenario raised: cluster did not become healthy after reset
+
+- **Logged (UTC):** 2026-07-13T16:49:15
+- **Severity:** suspected-bug
+- **Run:** 20260713T164402_S01_seed42
+- **Observed:** scenario raised: cluster did not become healthy after reset
+
+## S07-20260713T170326-1: S07 could not trigger a manifest cap with dev-scale SQL — recorded inconclusive 
+
+- **Logged (UTC):** 2026-07-13T17:08:34
+- **Severity:** suspected-bug
+- **Run:** 20260713T170326_S07_seed42
+- **Observed:** S07 could not trigger a manifest cap with dev-scale SQL — recorded inconclusive for the direct cap trip; the indirect fail-closed property check still runs.
+
+## S13-20260713T172032-1: forced GC left 2 UNCONDEMNED orphan object(s) (unreachable/dangling blobs/_manif
+
+- **Logged (UTC):** 2026-07-13T17:27:15
+- **Severity:** suspected-bug
+- **Run:** 20260713T172032_S13_seed42
+- **Observed:** forced GC left 2 UNCONDEMNED orphan object(s) (unreachable/dangling blobs/_manifests): {'_manifests': 2}. These are NOT in the two-phase pipeline (that would be pending-gc). If explicit GC was driven concurrently with background GC (or on both replicas), this is likely the known GC-CONCURRENT-LEADER-LEAK (see BACKLOG): a divergent-fold abort orphans owner-removal events.
+
+## S13-20260713T172032-2: S13 residual unreachable=2 after forced GC; classified by prefix={}
+
+- **Logged (UTC):** 2026-07-13T17:27:15
+- **Severity:** suspected-bug
+- **Run:** 20260713T172032_S13_seed42
+- **Observed:** S13 residual unreachable=2 after forced GC; classified by prefix={}
+
+## S31-20260713T174441-1: ca-gc-dryrun previews only target shard 0; subset-oracle blind to shard>=1 under
+
+- **Logged (UTC):** 2026-07-13T17:45:15
+- **Severity:** suspected-bug
+- **Run:** 20260713T174441_S31_seed42
+- **Observed:** ca-gc-dryrun previews only target shard 0; subset-oracle blind to shard>=1 under gc_shards>1 — previewed 23 but GC reclaimed ~78 (checklist #9). previewDeletes should iterate all target shards, not just shard 0.
+
 
 ## S13-20260713T172032-3: GC-side backstop for stale live precommit bindings — open spec question
 
@@ -1972,3 +2007,143 @@ campaign. The CAS gtest battery is green. No CAS action; if pursued, it belongs 
   protocol change; the triage's Q4 recommendation 3); and (b) an actual GC-side reclaim of such
   bindings (requires a spec amendment to the responsibility boundary + fencing story for GC-authored
   ref-log transactions). Do (a) first; (b) only with a spec revision.
+## S07-20260713T181937-1: S07 could not trigger a manifest cap with dev-scale SQL — recorded inconclusive 
+
+- **Logged (UTC):** 2026-07-13T18:20:34
+- **Severity:** suspected-bug
+- **Run:** 20260713T181937_S07_seed44
+- **Observed:** S07 could not trigger a manifest cap with dev-scale SQL — recorded inconclusive for the direct cap trip; the indirect fail-closed property check still runs.
+
+## S07-20260713T183115-1: S07 could not trigger a manifest cap with dev-scale SQL — recorded inconclusive 
+
+- **Logged (UTC):** 2026-07-13T18:32:12
+- **Severity:** finding
+- **Run:** 20260713T183115_S07_seed45
+- **Observed:** S07 could not trigger a manifest cap with dev-scale SQL — recorded inconclusive for the direct cap trip; the indirect fail-closed property check still runs.
+
+## S07-20260713T185131-1: S07 could not trigger a manifest cap with dev-scale SQL — recorded inconclusive 
+
+- **Logged (UTC):** 2026-07-13T19:00:12
+- **Severity:** finding
+- **Run:** 20260713T185131_S07_seed46
+- **Observed:** S07 could not trigger a manifest cap with dev-scale SQL — recorded inconclusive for the direct cap trip; the indirect fail-closed property check still runs.
+
+## S03-20260713T200548-1: scenario raised: Node(localhost:8123) HTTP 500: Code: 236. DB::Exception: stageM
+
+- **Logged (UTC):** 2026-07-13T20:09:08
+- **Severity:** suspected-bug
+- **Run:** 20260713T200548_S03_seed46
+- **Observed:** scenario raised: Node(localhost:8123) HTTP 500: Code: 236. DB::Exception: stageManifest: part-manifest PUT at 'soak_pool/cas/manifests/ca_soak_ch1/store/89c/89ccd094-87f6-4932-94d5-cbdeef131f2a@cas@/0000000000000001-00000000000009b4/000001.proto' is UNCERTAIN (retry budget exhausted) — nothing conclusive was named; the caller re-stages with a fresh ManifestId. (ABORTED) (version 26.6.1.1) | sql=INSERT INTO s03_live SELECT 12550000 + number AS id, randomString(512) AS payload FROM numbers(50000)
+
+## S38-20260714T115429-1: quiescence failed: timed out
+
+- **Logged (UTC):** 2026-07-14T12:20:57
+- **Severity:** suspected-bug
+- **Run:** 20260714T115429_S38_seed42
+- **Observed:** quiescence failed: timed out
+
+## S38-20260714T115429-2: forced GC left 20 UNCONDEMNED orphan object(s) (unreachable/dangling blobs/_mani
+
+- **Logged (UTC):** 2026-07-14T12:20:57
+- **Severity:** suspected-bug
+- **Run:** 20260714T115429_S38_seed42
+- **Observed:** forced GC left 20 UNCONDEMNED orphan object(s) (unreachable/dangling blobs/_manifests): {'_manifests': 20}. These are NOT in the two-phase pipeline (that would be pending-gc). If explicit GC was driven concurrently with background GC (or on both replicas), this is likely the known GC-CONCURRENT-LEADER-LEAK (see BACKLOG): a divergent-fold abort orphans owner-removal events.
+
+## S38-20260714T131226-1: quiescence failed: timed out
+
+- **Logged (UTC):** 2026-07-14T13:41:38
+- **Severity:** suspected-bug
+- **Run:** 20260714T131226_S38_seed42
+- **Observed:** quiescence failed: timed out
+
+## S38-20260714T131226-2: forced GC left 24 UNCONDEMNED orphan object(s) (unreachable/dangling blobs/_mani
+
+- **Logged (UTC):** 2026-07-14T13:41:38
+- **Severity:** suspected-bug
+- **Run:** 20260714T131226_S38_seed42
+- **Observed:** forced GC left 24 UNCONDEMNED orphan object(s) (unreachable/dangling blobs/_manifests): {'_manifests': 24}. These are NOT in the two-phase pipeline (that would be pending-gc). If explicit GC was driven concurrently with background GC (or on both replicas), this is likely the known GC-CONCURRENT-LEADER-LEAK (see BACKLOG): a divergent-fold abort orphans owner-removal events.
+
+## S36-20260716T181544-1: scenario raised: cluster did not become healthy after reset
+
+- **Logged (UTC):** 2026-07-16T18:20:48
+- **Severity:** suspected-bug
+- **Run:** 20260716T181544_S36_seed1
+- **Observed:** scenario raised: cluster did not become healthy after reset
+
+## S36-20260716T200002-1: scenario raised: cluster did not become healthy after reset
+
+- **Logged (UTC):** 2026-07-16T20:05:05
+- **Severity:** suspected-bug
+- **Run:** 20260716T200002_S36_seed1
+- **Observed:** scenario raised: cluster did not become healthy after reset
+
+## S36-20260716T201906-1: scenario raised: Node(localhost:8123) HTTP 500: Code: 236. DB::Exception: promot
+
+- **Logged (UTC):** 2026-07-16T20:19:22
+- **Severity:** suspected-bug
+- **Run:** 20260716T201906_S36_seed1
+- **Observed:** scenario raised: Node(localhost:8123) HTTP 500: Code: 236. DB::Exception: promote: ref 'moving' already names a different committed manifest — refusing to overwrite (unique-ref invariant; use republishRef for an intended repoint). (ABORTED) (version 26.6.1.1) | sql=ALTER TABLE s36_move MOVE PART '0_0_0_0' TO DISK 'ca'
+
+## S37-20260717T005005-1: scenario raised: Node(localhost:8124) HTTP 400: Code: 36. DB::Exception: Table d
+
+- **Logged (UTC):** 2026-07-17T00:50:22
+- **Severity:** suspected-bug
+- **Run:** 20260717T005005_S37_seed1
+- **Observed:** scenario raised: Node(localhost:8124) HTTP 400: Code: 36. DB::Exception: Table doesn't have any table TTL expression, cannot remove. (BAD_ARGUMENTS) (version 26.6.1.1) | sql=ALTER TABLE s37_ttl REMOVE TTL
+
+## S39-20260717T015047-1: scenario raised: Node(localhost:8123) HTTP 500: Code: 210. DB::Exception: CAS wr
+
+- **Logged (UTC):** 2026-07-17T01:51:43
+- **Severity:** suspected-bug
+- **Run:** 20260717T015047_S39_seed1
+- **Observed:** scenario raised: Node(localhost:8123) HTTP 500: Code: 210. DB::Exception: CAS write could not be committed (stageManifest: part-manifest PUT at 'soak_pool/cas/manifests/ca_soak_ch1/store/c94/c945a7a9-4578-4b78-bdd0-6ec0e42ead78@cas@/0000000000000001-000000000000000b/000001.zst' is UNCERTAIN (retry budget exhausted) — nothing conclusive was named; the caller re-stages with a fresh ManifestId); retrying later. (NETWORK_ERROR) (version 26.6.1.1) | sql=INSERT INTO s39_lease SELECT 4000 + number AS id, randomString(512) AS payload FROM numbers(500)
+
+## S39-20260717T020015-1: scenario raised: Node(localhost:8123) HTTP 500: Code: 210. DB::Exception: CAS wr
+
+- **Logged (UTC):** 2026-07-17T02:02:35
+- **Severity:** suspected-bug
+- **Run:** 20260717T020015_S39_seed1
+- **Observed:** scenario raised: Node(localhost:8123) HTTP 500: Code: 210. DB::Exception: CAS write could not be committed (stageManifest: part-manifest PUT at 'soak_pool/cas/manifests/ca_soak_ch1/store/2a7/2a740e92-6007-4b67-b9f5-20062b1be4a7@cas@/0000000000000001-000000000000000d/000001.zst' is UNCERTAIN (retry budget exhausted) — nothing conclusive was named; the caller re-stages with a fresh ManifestId); retrying later. (NETWORK_ERROR) (version 26.6.1.1) | sql=INSERT INTO s39_lease SELECT 8000 + number AS id, randomString(512) AS payload FROM numbers(500)
+
+## S39-20260717T020400-1: quiescence failed: Node(localhost:8124) HTTP 404: Code: 60. DB::Exception: Table
+
+- **Logged (UTC):** 2026-07-17T02:11:50
+- **Severity:** suspected-bug
+- **Run:** 20260717T020400_S39_seed1
+- **Observed:** quiescence failed: Node(localhost:8124) HTTP 404: Code: 60. DB::Exception: Table default.s39_lease does not exist. (UNKNOWN_TABLE) (version 26.6.1.1) | sql=SYSTEM SYNC REPLICA s39_lease
+
+## S01-20260717T033430-1: S01 peak RSS grew 531 MiB during a 512 MiB blob upload — investigate Build::putB
+
+- **Logged (UTC):** 2026-07-17T03:35:04
+- **Severity:** suspected-bug
+- **Run:** 20260717T033430_S01_seed1
+- **Observed:** S01 peak RSS grew 531 MiB during a 512 MiB blob upload — investigate Build::putBlob materializing BlobSource into a String before putIfAbsentStream (README known first investigation target)
+
+## S07-20260717T035307-1: S07 could not trigger a manifest cap with dev-scale SQL — recorded inconclusive 
+
+- **Logged (UTC):** 2026-07-17T03:55:49
+- **Severity:** finding
+- **Run:** 20260717T035307_S07_seed1
+- **Observed:** S07 could not trigger a manifest cap with dev-scale SQL — recorded inconclusive for the direct cap trip; the indirect fail-closed property check still runs.
+
+## S40-20260717T090957-1: quiescence failed: <urlopen error [Errno 111] Connection refused>
+
+- **Logged (UTC):** 2026-07-17T09:14:10
+- **Severity:** finding
+- **Run:** 20260717T090957_S40_seed1
+- **Observed:** quiescence failed: <urlopen error [Errno 111] Connection refused>
+
+## S39-20260717T094921-1: scenario raised: leg A's fault window must be shorter than the renew period so i
+
+- **Logged (UTC):** 2026-07-17T09:49:38
+- **Severity:** suspected-bug
+- **Run:** 20260717T094921_S39_seed1
+- **Observed:** scenario raised: leg A's fault window must be shorter than the renew period so it can overlap AT MOST one renewal beat -- a window >= the renew period can fault two consecutive beats and (correctly) near the lease deadline, which is leg B's job, not leg A's
+
+## S37-20260717T105322-1: scenario raised: Node(localhost:8123) HTTP 500: Code: 384. DB::Exception: Cannot
+
+- **Logged (UTC):** 2026-07-17T10:53:40
+- **Severity:** suspected-bug
+- **Run:** 20260717T105322_S37_seed1
+- **Observed:** scenario raised: Node(localhost:8123) HTTP 500: Code: 384. DB::Exception: Cannot move part 'all_0_0_0' because it's participating in background process. (PART_IS_TEMPORARILY_LOCKED) (version 26.6.1.1) | sql=ALTER TABLE s37_ttl MOVE PARTITION ID 'all' TO VOLUME 'hot'
+

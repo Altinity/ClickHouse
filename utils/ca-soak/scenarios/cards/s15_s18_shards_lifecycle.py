@@ -67,7 +67,7 @@ class S15(Scenario):
     }
 
     # compose variant -> declared gc_shards (for the report / per-round memory comparison).
-    _VARIANTS = (("default", 1), ("gc_shards2", 2))
+    _VARIANTS = (("default", 1), ("gc_shards2", 2), ("gc_shards8", 8))
 
     def _run_variant(self, ctx, result, variant, gc_shards):
         """Run the identical seed/workload on the freshly-reset cluster for one compose variant.
@@ -180,10 +180,8 @@ class S15(Scenario):
                            f"(scale={ctx.scale})", "pass",
                            "dev/ci are scaled down; only --scale full approaches the spec target"))
 
-        # gc_shards=8 is NOT available in this compose -> record inconclusive (never silently skip).
-        result.add(Verdict.inconclusive(
-            "gc_shards=8 comparison", "result matches gc_shards=1/2 and reducer memory flat-or-lower",
-            "not available in compose (only default=1 and gc_shards2=2 exist)"))
+        # gc_shards=8 now runs as a real variant (docker-compose-gc_shards8.yml) — it is the third
+        # entry in _VARIANTS below, so the per-variant workload + the cross-variant comparison cover it.
 
         per_variant = {}
         last_variant = None
@@ -218,7 +216,7 @@ class S15(Scenario):
             ok = len(distinct) == 1
             result.add(Verdict.check(
                 "correctness matches across shard counts",
-                "identical oracle checksum for gc_shards=1 and gc_shards=2",
+                "identical oracle checksum across gc_shards=1/2/8",
                 checksums, ok,
                 "" if ok else "GC shard count changed the surviving data — a sharded reducer "
                               "deleted live content; investigate per-shard zeroInDegree"))
