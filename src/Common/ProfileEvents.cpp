@@ -856,7 +856,7 @@ The server successfully detected this situation and will download merged part fr
     M(CasGcRetiredGraduated,   "CA gc retired entries newly floor-passed and published delete_pending", ValueType::Number) \
     M(CasGcRetiredRedeleted,   "CA gc pending deletes executed this round (exact-token blob deletes)", ValueType::Number) \
     M(CasGcHeartbeatFenceOuts, "CA gc expired-mount fence-outs performed by the heartbeat floor", ValueType::Number) \
-    M(CasGcMetaWriteAnomaly, "CA gc per-hash freshness-meta ops (condemn/spare/delete) that threw on the bounded meta pool this round (advisory-only; never wedges the round)", ValueType::Number) \
+    M(CasGcMetaWriteAnomaly, "CA gc per-hash freshness-meta ops (condemn/spare/delete) that threw on the bounded meta pool (advisory-only; never wedges the round). A persistently non-zero rate means the writer's meta point-read gate is drifting from the ledger — an operator signal, not a protocol input.", ValueType::Number) \
     M(CasMetaPut,          "CA blob meta: conditional .meta create attempts via putMetaIfAbsent (choke-point total; counts every attempt incl. lost races — each costs one S3 conditional write; writer-path reasons partially split by CasMetaCreateClean/CasMetaAdoptBackfill/CasMetaResurrectClean, while GC condemn marks and copy-forward clean-flips count only here)", ValueType::Number) \
     M(CasMetaCas,          "CA blob meta: conditional .meta rewrite attempts via casMeta (choke-point total; counts every attempt incl. lost races — each costs one S3 conditional write)", ValueType::Number) \
     M(CasMetaDelete,       "CA blob meta: exact-token .meta delete attempts via deleteMetaExact (choke-point total; counts every attempt)", ValueType::Number) \

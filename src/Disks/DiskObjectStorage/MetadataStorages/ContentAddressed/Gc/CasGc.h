@@ -85,11 +85,6 @@ struct RoundReport
     size_t graduated = 0;         /// entries newly floor-passed (published delete_pending) this round
     size_t redeleted = 0;         /// pending deletes executed this round (exact-token blob deletes)
     size_t fence_outs = 0;        /// expired mounts fenced-out by the round's heartbeat floor
-    /// Per-hash freshness-meta write ops (condemn/spare/delete) that threw on the bounded pool
-    /// this round. Advisory-only failures (never wedge the round) but a persistently non-zero count means
-    /// the writer's meta point-read gate is drifting from the ledger -- an operator signal, not a protocol
-    /// input.
-    uint64_t meta_write_anomalies = 0;
     std::vector<RoundAnomaly> anomalies;   /// fold clamps surfaced this round (never wedge the round)
 
     /// Record a fold/recheck anomaly (a clamped cursor). Surfacing, never throwing.
@@ -353,8 +348,8 @@ private:
     void rememberObservation(const GcLease & lease);
 
     /// Submit one per-hash freshness-meta op (condemn/spare/delete) to the bounded `meta_pool`.
-    /// NEVER throws: `job` is wrapped in its own try/catch (an exception increments `meta_anomaly_count`
-    /// + a log line); if scheduling itself fails (e.g. resource
+    /// NEVER throws: `job` is wrapped in its own try/catch (an exception counts into the
+    /// `CasGcMetaWriteAnomaly` profile event + a log line); if scheduling itself fails (e.g. resource
     /// exhaustion) the op runs inline rather than being silently lost. Callers must capture every value
     /// `job` touches BY VALUE (never by reference to a loop-local like the fold's `cur_blob`, which
     /// mutates across iterations while this job may still be queued).
@@ -400,10 +395,6 @@ private:
     /// never touches a possibly-null `store` at member-init time). A `unique_ptr` (not a plain member)
     /// so construction can happen in the ctor body, after validating `store`.
     std::unique_ptr<ThreadPool> meta_pool;
-    /// Count of meta-op jobs that threw this round (reset at the top of every `runRegularRound`,
-    /// folded into `RoundReport::meta_write_anomalies` after the round's `meta_pool->wait()`). Written
-    /// from pool worker threads, so atomic.
-    std::atomic<uint64_t> meta_anomaly_count{0};
 
 public:
     /// TEST SEAM: expose LIST-based namespace/shard discovery so unit tests can assert the

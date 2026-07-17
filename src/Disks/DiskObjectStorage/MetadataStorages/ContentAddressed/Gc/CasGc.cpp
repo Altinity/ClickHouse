@@ -185,7 +185,7 @@ void Gc::scheduleMetaJob(std::function<void()> job)
     /// Wrap once: `run` is safe to invoke either on the pool or inline (the scheduling-failure fallback
     /// below), and NEVER lets an exception escape: a per-hash meta
     /// op is advisory; the ledger + exact-token body delete are the actual safety core).
-    auto run = [this, job]()
+    auto run = [job]()
     {
         /// Count one per-hash freshness-meta op EXECUTED (attempt, not success) on this
         /// bounded pool. `run` is invoked on the pool thread (the common path below) or inline on the
@@ -198,7 +198,6 @@ void Gc::scheduleMetaJob(std::function<void()> job)
         }
         catch (...)
         {
-            ++meta_anomaly_count;
             ProfileEvents::increment(ProfileEvents::CasGcMetaWriteAnomaly);
             tryLogCurrentException(getLogger("CasGc"),
                 "CAS gc: a per-hash freshness-meta op failed on the bounded pool (advisory-only; "
@@ -213,7 +212,6 @@ void Gc::scheduleMetaJob(std::function<void()> job)
     {
         /// Scheduling itself failed (e.g. resource exhaustion under a mass-DROP burst) -- run inline
         /// rather than silently lose the meta write. `run` still never throws.
-        ++meta_anomaly_count;
         ProfileEvents::increment(ProfileEvents::CasGcMetaWriteAnomaly);
         tryLogCurrentException(getLogger("CasGc"),
             "CAS gc: meta pool scheduling failed; running the op inline on the round's own thread");
@@ -236,10 +234,6 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// across two of its own ticks.
     if (on_lease_acquired)
         on_lease_acquired();
-
-    /// This round's per-hash meta-write anomaly tally starts fresh (folded into the report
-    /// after `meta_pool->wait()`, below).
-    meta_anomaly_count.store(0, std::memory_order_relaxed);
 
     /// ONE-PASS round. There is no crash-resume step anymore: the round commits everything in the
     /// SINGLE gc/state CAS at the end, so a crashed pass leaves only attempt-scoped debris that is
@@ -562,7 +556,6 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// durable no later than the ledger it is paired with. `wait()` never throws here: every scheduled job
     /// already caught its own exception (see `scheduleMetaJob`).
     meta_pool->wait();
-    report.meta_write_anomalies = meta_anomaly_count.load(std::memory_order_relaxed);
 
     /// Retired-in-snapshot — there is NO separate retired-list object to publish anymore. The
     /// round's surviving condemned entries were already sealed as `kCondemned` rows inside the fold's
