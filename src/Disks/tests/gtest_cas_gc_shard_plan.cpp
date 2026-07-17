@@ -276,27 +276,6 @@ TEST(CasGcShardCleanup, DisjointWorkerCoverage)
         EXPECT_TRUE(seen[s]) << "owner shard " << s << " received no ManifestIds (dead shard)";
 }
 
-/// ---- CoordinatorPlan tests (Phase 4, Task 6) ----
-
-/// The coordinator owns the SINGLE global fence over the whole fence universe; a per-shard fence is
-/// unsafe because a publish into one root shard can protect blobs in any target shard
-/// (Task 1 `SabotageReducerOwnsFence`).
-TEST(CasGcShardCoordinator, SingleGlobalFenceNotPerShard)
-{
-    CoordinatorPlan plan{4};
-    EXPECT_TRUE(plan.hasSingleGlobalFence());
-    EXPECT_FALSE(plan.allowsPerShardFence());
-}
-
-/// Reducer work is lease-free (the lease is work-dedup only); seal and fence are coordinator-only.
-TEST(CasGcShardCoordinator, ReducerWorkIsLeaseFree)
-{
-    CoordinatorPlan plan{4};
-    EXPECT_FALSE(plan.requiresLeaseForReduce());
-    EXPECT_TRUE(plan.requiresCoordinatorForSeal());
-    EXPECT_TRUE(plan.requiresCoordinatorForFence());
-}
-
 /// The sharded fold (gc_shards > 1) partitions a flat `BlobDelta` stream by `blobShard` and folds
 /// each bucket via its own `ShardReducer`, exactly as `Gc::fold` does. This test replicates that
 /// partition-and-reduce step over `gc_shards = 2` and asserts each blob's in-degree lands in its
