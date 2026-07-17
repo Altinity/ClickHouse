@@ -987,6 +987,73 @@ def test_partition_transform_equivalence_gate(cluster):
              "(1, 10), (2, 10)", expect_ok=False)
 
 
+def test_partition_transform_granularity_matrix(cluster):
+    """
+    Exercise the common ClickHouse temporal partition keys and the granularity relationships between
+    the source key and the destination Iceberg transform. Acceptance is data-dependent (a source
+    partition must be single-valued for every destination field), so a coarser source can still be
+    accepted when a particular partition does not actually repartition.
+    """
+    node = cluster.instances["replica1"]
+    settings = {"allow_insert_into_iceberg": 1}
+
+    def run_case(name, source_key, dest_key, rows, *, expect_ok):
+        uid = unique_suffix()
+        mt_table = f"mt_{name}_{uid}"
+        iceberg_table = f"iceberg_{name}_{uid}"
+        make_rmt(node, mt_table, "id Int64, event_time DateTime", source_key, replica_name="replica1")
+        node.query(f"INSERT INTO {mt_table} VALUES {rows}")
+        make_iceberg_s3(node, iceberg_table, "id Int64, event_time DateTime", partition_by=dest_key)
+        pid = first_partition_id(node, mt_table)
+        statement = f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{pid}' TO TABLE {iceberg_table}"
+        if expect_ok:
+            node.query(statement, settings=settings)
+        else:
+            error = node.query_and_get_error(statement, settings=settings)
+            assert "BAD_ARGUMENTS" in error, f"{name}: expected BAD_ARGUMENTS, got: {error!r}"
+
+    same_day = "(1, '2024-03-05 01:00:00'), (2, '2024-03-05 20:00:00')"
+    same_month = "(1, '2024-03-01 00:00:00'), (2, '2024-03-20 00:00:00')"
+    same_year = "(1, '2024-03-05 00:00:00'), (2, '2024-09-10 00:00:00')"
+
+    # Common temporal keys at the same granularity as the destination transform.
+    run_case("startofmonth_month", "toStartOfMonth(event_time)", "toMonthNumSinceEpoch(event_time)",
+             same_month, expect_ok=True)
+    run_case("yyyymmdd_day", "toYYYYMMDD(event_time)", "toRelativeDayNum(event_time)",
+             same_day, expect_ok=True)
+    run_case("startofday_day", "toStartOfDay(event_time)", "toRelativeDayNum(event_time)",
+             same_day, expect_ok=True)
+    run_case("toyear_year", "toYear(event_time)", "toYearNumSinceEpoch(event_time)",
+             same_year, expect_ok=True)
+    run_case("startofyear_year", "toStartOfYear(event_time)", "toYearNumSinceEpoch(event_time)",
+             same_year, expect_ok=True)
+
+    # Finer source into a coarser destination: a finer partition is contained in one coarser bucket.
+    run_case("day_into_month", "toDate(event_time)", "toMonthNumSinceEpoch(event_time)",
+             same_day, expect_ok=True)
+    run_case("day_into_year", "toDate(event_time)", "toYearNumSinceEpoch(event_time)",
+             same_day, expect_ok=True)
+    run_case("hour_into_day", "toStartOfHour(event_time)", "toRelativeDayNum(event_time)",
+             "(1, '2024-03-05 12:00:00'), (2, '2024-03-05 12:30:00')", expect_ok=True)
+    run_case("month_into_year", "toYYYYMM(event_time)", "toYearNumSinceEpoch(event_time)",
+             same_month, expect_ok=True)
+
+    # Coarser source into a finer destination: the partition spans several destination buckets.
+    run_case("year_into_month", "toYear(event_time)", "toMonthNumSinceEpoch(event_time)",
+             "(1, '2020-01-15 00:00:00'), (2, '2020-06-15 00:00:00')", expect_ok=False)
+    run_case("year_into_day", "toYear(event_time)", "toRelativeDayNum(event_time)",
+             "(1, '2020-01-01 00:00:00'), (2, '2020-12-31 00:00:00')", expect_ok=False)
+
+    # Same coarse source/fine destination pair as above, but this year partition holds a single day,
+    # so it does not repartition and is accepted - acceptance depends on the data, not the structure.
+    run_case("year_into_day_single_day", "toYear(event_time)", "toRelativeDayNum(event_time)",
+             same_day, expect_ok=True)
+
+    # Weekly has no Iceberg equivalent: a week partition holding two days cannot map to one day.
+    run_case("week_into_day", "toMonday(event_time)", "toRelativeDayNum(event_time)",
+             "(1, '2024-03-05 00:00:00'), (2, '2024-03-07 00:00:00')", expect_ok=False)
+
+
 def test_export_partition_todate_source_matches_day_metadata(cluster):
     """
     End-to-end: a source partitioned by toDate(event_time) exports into a day-partitioned Iceberg
@@ -1034,6 +1101,56 @@ def test_export_partition_todate_source_matches_day_metadata(cluster):
     meta_days = {int(_partition_scalar(p, "event_time")) for p in partitions}
     assert meta_days == {expected_day}, (
         f"Metadata day {meta_days} must equal toRelativeDayNum {expected_day}."
+    )
+
+
+def test_export_partition_day_source_into_year_metadata(cluster):
+    """
+    End-to-end: a source partitioned by toDate(event_time) (finer) exports into a year-partitioned
+    Iceberg destination (coarser). The value written to the Iceberg metadata is the year computed by
+    the destination transform over the data, not the source day.
+    """
+    node = cluster.instances["replica1"]
+
+    uid = unique_suffix()
+    mt_table = f"mt_day_year_{uid}"
+    iceberg_table = f"iceberg_day_year_{uid}"
+
+    make_rmt(node, mt_table, "id Int64, event_time DateTime", "toDate(event_time)",
+             replica_name="replica1")
+    node.query(
+        f"INSERT INTO {mt_table} VALUES "
+        f"(1, '2024-03-05 01:00:00'), (2, '2024-03-05 12:00:00'), (3, '2024-03-05 23:00:00')"
+    )
+    make_iceberg_s3(node, iceberg_table, "id Int64, event_time DateTime",
+                    partition_by="toYearNumSinceEpoch(event_time)")
+
+    pid = first_partition_id(node, mt_table)
+    node.query(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{pid}' TO TABLE {iceberg_table}",
+        settings={"allow_insert_into_iceberg": 1},
+    )
+    wait_for_export_status(node, mt_table, iceberg_table, pid, "COMPLETED")
+
+    count = int(node.query(f"SELECT count() FROM {iceberg_table}").strip())
+    assert count == 3, f"Expected 3 rows after export, got {count}"
+
+    expected_year = int(node.query(
+        f"SELECT DISTINCT toYearNumSinceEpoch(event_time) FROM {iceberg_table}"
+    ).strip())
+
+    query_id = f"day_year_{uid}"
+    node.query(
+        f"SELECT * FROM {iceberg_table}",
+        query_id=query_id,
+        settings={"iceberg_metadata_log_level": "manifest_file_entry"},
+    )
+    entries = fetch_manifest_entries(node, query_id)
+    partitions = _data_file_partition_records(entries)
+    assert partitions, "No data-file partition records found in manifest entries"
+    meta_years = {int(_partition_scalar(p, "event_time")) for p in partitions}
+    assert meta_years == {expected_year}, (
+        f"Metadata year {meta_years} must equal toYearNumSinceEpoch {expected_year}."
     )
 
 
