@@ -51,7 +51,7 @@ jobs:
             python3 -m venv venv
             source venv/bin/activate
             pip install --upgrade requests chardet urllib3 unidiff boto3 PyGithub
-            pip install testflows==$TESTFLOWS_VERSION awscli==1.33.28
+            pip install testflows==$TESTFLOWS_VERSION awscli==1.45.47
             echo PATH=$PATH >>$GITHUB_ENV
 
         - name: Set image tag if not given
