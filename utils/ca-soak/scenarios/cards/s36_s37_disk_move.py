@@ -295,6 +295,50 @@ class S36(Scenario):
             residual == 0,
             "" if residual == 0 else "content vacated by the OFF-CA move was not fully reclaimed"))
 
+        # --- dedup-on-TO-CA: moving a part whose content already exists in the pool must dedup,
+        # not re-upload -------------------------------------------------------------------------
+        dedup_table_a = "s36_dedup_a"
+        dedup_table_b = "s36_dedup_b"
+        dedup_rows = 200
+        for t in (dedup_table_a, dedup_table_b):
+            for n in cl.nodes():
+                sql.create_ca_table(n, t, columns="id UInt64, payload String", order_by="id",
+                                    extra_settings={"storage_policy": "'ca_local'"})
+        # A deterministic (non-random) payload so table B's part is BYTE-IDENTICAL to table A's
+        # part: repeat() is the same on every call, unlike randomString() (which the rest of this
+        # scenario relies on being unique per part, to keep unrelated dedup out of the other
+        # assertions above).
+        dedup_gen = (f"SELECT number AS id, repeat('cas-move-dedup-probe-', 100) AS payload "
+                    f"FROM numbers({dedup_rows})")
+        sql.insert_values(cl.node1, dedup_table_a, dedup_gen, timeout=300)
+        sql.insert_values(cl.node1, dedup_table_b, dedup_gen, timeout=300)
+        cl.node1.command(f"SYSTEM SYNC REPLICA {dedup_table_a}", timeout=120)
+        cl.node1.command(f"SYSTEM SYNC REPLICA {dedup_table_b}", timeout=120)
+
+        # Move table A's part to CA first -- pays the real upload cost. Table B's part is
+        # byte-identical, so ITS move must dedup-resolve the blobs instead of re-uploading them.
+        cl.node1.command(f"ALTER TABLE {dedup_table_a} MOVE PARTITION ID 'all' TO DISK 'ca'", timeout=300)
+
+        counters_dedup = _common.counters_window(ctx)
+        cl.node1.command(f"ALTER TABLE {dedup_table_b} MOVE PARTITION ID 'all' TO DISK 'ca'", timeout=300)
+        dedup_delta = counters_dedup().get("_total", {})
+        raw_puts = int(dedup_delta.get("CasBlobPut", 0))
+        dedup_puts = int(dedup_delta.get("CasBlobPutDedup", 0))
+        result.observations["dedup_on_to_ca_counters"] = {"CasBlobPut": raw_puts, "CasBlobPutDedup": dedup_puts}
+        dedup_ok = dedup_puts > 0 and raw_puts == 0
+        result.add(Verdict.check(
+            "MOVE TO-CA of byte-identical content dedups instead of re-uploading",
+            "CasBlobPutDedup > 0 and CasBlobPut == 0 for the second (duplicate) move",
+            f"CasBlobPut={raw_puts} CasBlobPutDedup={dedup_puts}", dedup_ok,
+            "" if dedup_ok else
+            "the second MOVE of byte-identical content re-uploaded blobs instead of dedup-resolving them"))
+
+        oracle_dedup_a = cl.node1.query(sql.table_checksum_query(dedup_table_a)).strip()
+        oracle_dedup_b = cl.node1.query(sql.table_checksum_query(dedup_table_b)).strip()
+        result.add(Verdict.check(
+            "dedup-probe tables read back identical data after the TO-CA moves",
+            oracle_dedup_a, oracle_dedup_b, oracle_dedup_a == oracle_dedup_b))
+
         # --- chaos leg: hard-kill the server mid-MOVE PART -> atomic complete-or-rollback ----------
         gen_chaos = (f"SELECT number AS id, toUInt8({self.CHAOS_PK}) AS pk, "
                     f"randomString({chaos_payload}) AS payload FROM numbers({chaos_rows})")
