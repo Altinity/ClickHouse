@@ -5,10 +5,14 @@
 #include <IO/HashingWriteBuffer.h>
 #include <IO/ReadBufferFromMemory.h>
 #include <Common/Exception.h>
-#include <Common/OpenSSLHelpers.h>
 #include <base/hex.h>
 
-#include <openssl/evp.h>
+#include "config.h"
+
+#if USE_SSL
+#    include <Common/OpenSSLHelpers.h>
+#    include <openssl/evp.h>
+#endif
 
 /// `XXH_INLINE_ALL` renames every public symbol under the `XXH_INLINE_` prefix (`XXH_NAMESPACE`) and
 /// makes the whole library a header-only, static-inline implementation local to THIS translation
@@ -26,6 +30,7 @@ namespace ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
     extern const int LOGICAL_ERROR;
+    extern const int SUPPORT_IS_DISABLED;
 }
 }
 
@@ -127,6 +132,7 @@ private:
     Xxh3Streamer state;
 };
 
+#if USE_SSL
 /// A hash-and-passthrough buffer over OpenSSL's streaming EVP SHA-256 digest. Unlike the 128-bit
 /// hashes above, `Sha256` produces a 32-byte digest (64 lowercase hex chars, see `blobHashLenFor`).
 /// Every byte written is folded into the running EVP digest (`EVP_DigestUpdate`) AND forwarded
@@ -187,6 +193,7 @@ private:
     WriteBuffer & sink;
     EVP_MD_CTX_ptr ctx;
 };
+#endif
 
 }
 
@@ -199,7 +206,12 @@ std::unique_ptr<IBlobHashingWriteBuffer> makeBlobHashingWriteBuffer(BlobHashAlgo
         case BlobHashAlgo::XXH3_128:
             return std::make_unique<Xxh3128BlobHashingWriteBuffer>(sink);
         case BlobHashAlgo::Sha256:
+#if USE_SSL
             return std::make_unique<Sha256BlobHashingWriteBuffer>(sink);
+#else
+            throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
+                "blob_hash = 'sha256' requires ClickHouse built with SSL support");
+#endif
     }
     throw Exception(ErrorCodes::BAD_ARGUMENTS, "makeBlobHashingWriteBuffer: unknown BlobHashAlgo {}", static_cast<int>(algo));
 }
@@ -228,12 +240,17 @@ String blobHashHexOneShot(BlobHashAlgo algo, std::string_view bytes)
         }
         case BlobHashAlgo::Sha256:
         {
+#if USE_SSL
             /// One-shot SHA-256 is defined to agree with the streaming EVP digest above (there is no
             /// chunked convention to preserve, unlike `CityHash128`), so this can go straight through
             /// `encodeSHA256`'s one-shot path instead of round-tripping through a streaming buffer.
             unsigned char digest[32];
             encodeSHA256(bytes.data(), bytes.size(), digest);
             return hexString(digest, sizeof(digest));
+#else
+            throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
+                "blob_hash = 'sha256' requires ClickHouse built with SSL support");
+#endif
         }
     }
     throw Exception(ErrorCodes::BAD_ARGUMENTS, "blobHashHexOneShot: unknown BlobHashAlgo {}", static_cast<int>(algo));
