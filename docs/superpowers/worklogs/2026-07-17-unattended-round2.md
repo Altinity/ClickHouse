@@ -1,0 +1,13 @@
+# Unattended worklog — ROUND 2 (2026-07-17): perf/feature fixes → soak → scenario re-sweep → sanitizers
+
+Source of truth: `.superpowers/sdd/progress.md` (round-2 head). Backlog: `docs/superpowers/cas/BACKLOG.md`. Earlier this-day worklog rotated: `2026-07-17-unattended-round2-part1.md`. Round-1 worklog: `2026-07-16-unattended-codecs-txn-sourcelayout-part{1,2,3}.md`.
+
+## Round-2 plan (user-authorized 2026-07-17)
+R1 ref-table COW map (spec b55e75bc4d5) → /writing-plans + implement. R2 MOVE-to-CA (spec 6526d1e + plan ea2a789) → implement + verify S36. R3 #37 (spec fd93aa5 + plan d292b7b) → implement + verify S37. R4 soak 20m + metrics/trace_log (confirm copies gone). R5 #38 full scenario re-sweep + results table. R6 #40 ASan/TSan.
+Rules: systematic-debugging (no handwaving), fix-or-backlog, weigh correctness/S3/resources, umbrella review BANNED.
+
+STATUS: R1+R2+R3 landed, R4 soak done. R5 PAUSED (build/r5_summary.tsv, S01-S12 recorded) for the critical data-loss investigation (user's superseding priority). R3 flagged NOT ship-ready pending the data-loss fix.
+
+## Log (append below)
+
+- **DATA-LOSS mechanism RE-TRACED + CORRECTED (user challenge). ~08:0x.** User pushed on a real contradiction in my writeup (earlier "DECISIVE" said `renameParts` publishes CA data BEFORE the Keeper multi; "SPLIT COMMIT" said the multi outlives a rolled-back data commit — can't both hold). Read the code line-by-line: the earlier DECISIVE claim was FALSE. CORRECT ordering in `ReplicatedMergeTreeSink::commitPart`: `renameParts()` (:976) = pure overlay re-key (NO publish, blobs B188-deferred) → Keeper multi (:985) commits block_id+part-znode durably (Keeper up under rustfs-pause) → `transaction.commit()` (:990) → `commitTransaction`→`publishStaging`→`uploadPendingBlobs`+`promoteBuild` = the ONLY durable point, hangs 90s on paused rustfs → THROW → txn destructor `rollback()` = "Undoing transaction … Removing parts" (local removal). So durability order is INVERTED on CA (Keeper at :985 BEFORE data at :990) = genuine split-commit window :985→:990. Answers: (Q1 successful→rollback?) split — Keeper half succeeded, DATA half failed, local part correctly rolled back but Keeper block_id not; (Q2 unsuccessful→lost?) surviving block_id (independent dedup-window lifetime) makes the byte-identical R3-driven retry a false dedup no-op (`exists_locally=false` → "already exists on other replicas as part …; ignoring it", :511-517 → INSERT_WAS_DEDUPLICATED → ack, 0 rows). R3 governs SILENCE only; split-commit is generic-CA. Report CORRECTION section committed f7d337bab5b (supersedes lines 41-46). Fix = hard product/arch decision (verify-on-dedup / gate Keeper-commit on CA durability / invalidate block_id on rollback) → BACKLOG. Cluster PRESERVED.
