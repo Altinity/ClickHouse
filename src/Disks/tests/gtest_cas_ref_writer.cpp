@@ -2390,14 +2390,14 @@ TEST(RefWriterNamespaceRemoval, DropNamespaceCancelsInFlightBuildAndNextOpThrows
 
     store->dropNamespace(ns);
 
-    /// The build is cancelled: EVERY subsequent operation fails fast at `requireAlive` with ABORTED.
-    /// `stageManifest` is the discriminator -- it has NO namespace-lifecycle gate, so an UN-cancelled
-    /// build would happily execute it (staging more debris into a dead namespace); only cancellation
-    /// stops it.
-    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { build->stageManifest({}); });
+    /// The build is cancelled: EVERY subsequent operation fails fast at `requireAlive` with
+    /// NETWORK_ERROR (fix #37 phase 2's CAS write-retry-later reroute). `stageManifest` is the
+    /// discriminator -- it has NO namespace-lifecycle gate, so an UN-cancelled build would happily
+    /// execute it (staging more debris into a dead namespace); only cancellation stops it.
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { build->stageManifest({}); });
     /// And it certainly cannot promote a fresh committed ref into the removed namespace (the important
     /// invariant -- though the old WPromote "precommit removed" guard also blocked this, less directly).
-    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { build->promote(ns, "inflight", build->buildId(), id); });
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { build->promote(ns, "inflight", build->buildId(), id); });
 
     /// The cancelled build did not resurrect anything into the removed namespace.
     EXPECT_FALSE(store->resolveRef(ns, "inflight").has_value());

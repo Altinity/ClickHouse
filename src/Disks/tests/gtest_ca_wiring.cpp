@@ -2314,6 +2314,7 @@ TEST(CaWiringOps, OrphanedPendingBlobNotUploadedAfterReplace)
 namespace DB::ErrorCodes
 {
     extern const int ABORTED;
+    extern const int NETWORK_ERROR;
 }
 
 namespace
@@ -2455,7 +2456,7 @@ TEST(CaWiringResurrect, PromoteWithoutLivePrecommitAbortsWithoutResurrect)
         ASSERT_TRUE(lm.has_value() && lm->meta.state == MetaState::Condemned);
     }
 
-    /// promote aborts at the owner-liveness check (ABORTED), before the blob gate.
+    /// promote aborts at the owner-liveness check (NETWORK_ERROR, fix #37 phase 2), before the blob gate.
     try
     {
         build->promote(ns, ref, build->buildId(), id);
@@ -2463,7 +2464,7 @@ TEST(CaWiringResurrect, PromoteWithoutLivePrecommitAbortsWithoutResurrect)
     }
     catch (const DB::Exception & e)
     {
-        EXPECT_EQ(e.code(), DB::ErrorCodes::ABORTED);
+        EXPECT_EQ(e.code(), DB::ErrorCodes::NETWORK_ERROR);
     }
 
     /// No blob work ran before the abort: the leaf's token is UNCHANGED (still the condemned one) and its

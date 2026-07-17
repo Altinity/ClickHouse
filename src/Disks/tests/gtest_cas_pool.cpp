@@ -28,6 +28,7 @@ extern const int NOT_IMPLEMENTED;
 extern const int UNKNOWN_FORMAT_VERSION;
 extern const int FILE_DOESNT_EXIST;
 extern const int LOGICAL_ERROR;
+extern const int NETWORK_ERROR;
 }
 
 namespace ProfileEvents
@@ -1247,7 +1248,7 @@ TEST(CasPoolRemount, OldEpochBuildFailsClosedAfterRemount)
     ASSERT_TRUE(store->tryRemountOnce());
 
     /// The build was minted under the superseded incarnation — every further step fails closed.
-    expectThrowsCode(DB::ErrorCodes::ABORTED,
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR,
         [&] { build->putBlob(DB::Cas::tests::idOf("x"), DB::Cas::BlobSource::fromString("x")); });
 
     /// A FRESH build under the live incarnation works.
@@ -1356,7 +1357,7 @@ TEST(CasPoolShutdown, UnresolvedWedgeSkipsFarewell)
     /// wedge tests in gtest_cas_ref_writer.cpp): the single attempt the budget allows fails ambiguously.
     backend->fault_key_substr = layout.refsNamespacePrefix(ns) + "_log/";
     backend->fault_count = 1;
-    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { store->dropRef(ns, "x"); });
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns));
 
     const String mount_key = store->layout().mountKey("test");
@@ -1541,7 +1542,7 @@ TEST(CasRemountTmat, UnresolvedWedgePaysGraceAndMarksBoundaryUnclean)
     /// ambiguously.
     backend->fault_key_substr = layout.refsNamespacePrefix(ns) + "_log/";
     backend->fault_count = 1;
-    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { store->dropRef(ns, "x"); });
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns));
 
     /// Trip the fence exactly as in `DrainedRemountSkipsGrace` above.
@@ -1600,7 +1601,7 @@ TEST(CasRemountTmat, CleanRemountAfterEarlierUncleanOneDoesNotSealALateTouchedTa
     /// `UnresolvedWedgePaysGraceAndMarksBoundaryUnclean` above).
     backend->fault_key_substr = layout.refsNamespacePrefix(ns1) + "_log/";
     backend->fault_count = 1;
-    expectThrowsCode(DB::ErrorCodes::ABORTED, [&] { store->dropRef(ns1, "x"); });
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns1, "x"); });
     ASSERT_TRUE(store->refLaneWedgedForTest(ns1));
 
     /// Self-remount #1: UNCLEAN (the wedge above). Epoch 1 -> 2.

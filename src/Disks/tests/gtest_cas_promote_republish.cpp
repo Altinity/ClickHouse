@@ -25,6 +25,7 @@
 namespace DB::ErrorCodes
 {
 extern const int ABORTED;
+extern const int NETWORK_ERROR;
 }
 
 using namespace DB::Cas;
@@ -104,11 +105,11 @@ TEST(CasPromoteRepublish, PromoteOverDifferentCommittedRefFailsClosed)
     {
         build2->promote(ns, ref, build2->buildId(), id2);
         FAIL() << "PRE-FIX: promote silently overwrote a committed ref (PROMOTE-OVER-COMMITTED-LEAK); "
-                  "POST-FIX must throw ABORTED";
+                  "POST-FIX must throw a CAS write-retry-later NETWORK_ERROR";
     }
     catch (const DB::Exception & e)
     {
-        EXPECT_EQ(e.code(), DB::ErrorCodes::ABORTED);
+        EXPECT_EQ(e.code(), DB::ErrorCodes::NETWORK_ERROR);
     }
 }
 

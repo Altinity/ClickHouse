@@ -40,6 +40,7 @@ extern const int NOT_IMPLEMENTED;
 extern const int ABORTED;
 extern const int CORRUPTED_DATA;
 extern const int LIMIT_EXCEEDED;
+extern const int NETWORK_ERROR;
 }
 
 using namespace DB::Cas;
@@ -1447,7 +1448,7 @@ TEST(CasPartWriteTxn, PromoteFailsClosedWhenPrecommitNoLongerLiveOwner)
         RootMutationOrigin::Writer, RootMutationKind::Abandon);
 
     /// promote must fail closed: the precommit is no longer the live owner, so a Δ=0 move would dangle.
-    expectThrowsCode(DB::ErrorCodes::ABORTED,
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR,
         [&] { build->promote(ns, "part_1", build->buildId(), id); });
     /// No ref committed.
     EXPECT_FALSE(s->resolveRef(ns, "part_1").has_value());
@@ -1502,8 +1503,9 @@ TEST(CasPartWriteTxnRepoint, PromoteRepointsCommittedRef)
     const ManifestId m2_id = build2->stageManifest({blobManifestEntry("data.bin", "m2"), blobManifestEntry("extra.bin", "m2x")});
     build2->precommitAdd(ns, "part_1", m2_id);
 
-    /// allow_repoint = false (the default) -> ABORTED, existing invariant untouched; M1 still resolves.
-    expectThrowsCode(DB::ErrorCodes::ABORTED,
+    /// allow_repoint = false (the default) -> NETWORK_ERROR (CAS write-retry-later), existing invariant
+    /// untouched; M1 still resolves.
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR,
         [&] { build2->promote(ns, "part_1", build2->buildId(), m2_id); });
     EXPECT_EQ(s->resolveRef(ns, "part_1")->manifest_id, m1_id);
 
@@ -1925,10 +1927,10 @@ TEST(CasPartWriteTxnStageManifestRetry, DifferentObjectAtKeyStaysLoudConflict)
 }
 
 /// Budget exhaustion: EVERY attempt is ambiguous and nothing ever lands. The controller reports
-/// Unresolved after `max_attempts` and stageManifest maps it to ABORTED — the same retryable abort
-/// class the ref-log lane's exhausted budget maps to. Nothing was durably named: the caller
-/// re-stages with a fresh ManifestId.
-TEST(CasPartWriteTxnStageManifestRetry, BudgetExhaustionMapsToAborted)
+/// Unresolved after `max_attempts` and stageManifest maps it to NETWORK_ERROR (fix #37 phase 2) —
+/// the same retryable abort class the ref-log lane's exhausted budget maps to. Nothing was durably
+/// named: the caller re-stages with a fresh ManifestId.
+TEST(CasPartWriteTxnStageManifestRetry, BudgetExhaustionMapsToNetworkError)
 {
     CasRequestBudget budget;
     budget.max_attempts = 3;
@@ -1939,7 +1941,7 @@ TEST(CasPartWriteTxnStageManifestRetry, BudgetExhaustionMapsToAborted)
 
     auto build = startBuildFor(s, ns, "part_exhausted");
     b->fault_count = 1000;
-    expectThrowsCode(DB::ErrorCodes::ABORTED, [&]
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
     {
         build->stageManifest({blobManifestEntry("a.bin", "a")});
     });
@@ -2122,11 +2124,12 @@ TEST(CasPartWriteTxnBlobPutRetry, AmbiguousLandedWriteAdoptsOccupantWithoutReupl
 }
 
 /// Budget exhaustion: EVERY attempt is ambiguous and nothing ever lands. The controller reports the
-/// uncertainty and uploadFromSource maps it to ABORTED — the same retryable abort class stageManifest
-/// and the ref-log lane map their exhausted budgets to. putBlob's own bounded condemned-churn loop
-/// (8 rounds) re-drives the upload before the ABORTED escapes, so the total attempt count is
-/// controller budget × that outer bound.
-TEST(CasPartWriteTxnBlobPutRetry, BudgetExhaustionMapsToAborted)
+/// uncertainty and uploadFromSource maps it to NETWORK_ERROR (fix #37 phase 2) -- the same retryable
+/// abort class stageManifest and the ref-log lane map their exhausted budgets to. Unlike the OLD
+/// ABORTED mapping, putBlob's bounded condemned-churn loop (8 rounds) does NOT re-drive this: it only
+/// catches ABORTED, so a NETWORK_ERROR escapes on the FIRST attempt -- desirable (no point hammering a
+/// lost fence locally 8 times; the caller's own backoff, e.g. the merge queue's, is what should retry).
+TEST(CasPartWriteTxnBlobPutRetry, BudgetExhaustionMapsToNetworkErrorAndEscapesImmediately)
 {
     auto b = std::make_shared<BlobPutFaultBackend>();
     auto s = openBlobFaultPool(b, /*max_attempts=*/3);
@@ -2147,11 +2150,12 @@ TEST(CasPartWriteTxnBlobPutRetry, BudgetExhaustionMapsToAborted)
     catch (const DB::Exception & e)
     {
         threw = true;
-        EXPECT_EQ(e.code(), DB::ErrorCodes::ABORTED);
+        EXPECT_EQ(e.code(), DB::ErrorCodes::NETWORK_ERROR);
         EXPECT_NE(e.message().find("UNCERTAIN"), String::npos) << e.message();
     }
     EXPECT_TRUE(threw);
-    EXPECT_EQ(b->stream_attempts, 3 * 8) << "3-attempt controller budget × putBlob's 8-round outer loop";
+    EXPECT_EQ(b->stream_attempts, 3) << "the 3-attempt controller budget for ONE outer attempt -- "
+                                          "putBlob's outer condemned-churn loop must NOT re-drive a NETWORK_ERROR";
 }
 
 /// promoteStaged conditional copy, ambiguous-but-landed: the copy's response is lost AFTER the
