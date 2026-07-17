@@ -323,6 +323,15 @@ public:
         return current_metadata->getColumnMapperForCurrentSchema(storage_metadata_snapshot, context);
     }
 
+    Names getIdentityPartitionColumnNames(ContextPtr context) const override
+    {
+        if (!current_metadata)
+        {
+            return {};
+        }
+        return current_metadata->getIdentityPartitionColumnNames(context);
+    }
+
     void drop(ContextPtr local_context) override
     {
         if (current_metadata)
@@ -805,6 +814,8 @@ public:
 
     ColumnMapperPtr getColumnMapperForCurrentSchema(StorageMetadataPtr storage_metadata_snapshot, ContextPtr context) const override
         { return getImpl().getColumnMapperForCurrentSchema(storage_metadata_snapshot, context); }
+
+    Names getIdentityPartitionColumnNames(ContextPtr context) const override { return getImpl().getIdentityPartitionColumnNames(context); }
 
     std::shared_ptr<DataLake::ICatalog> getCatalog(ContextPtr context, const StorageID & table_id) const override
         { return getImpl().getCatalog(context, table_id); }

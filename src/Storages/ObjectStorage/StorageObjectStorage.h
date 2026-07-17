@@ -155,6 +155,7 @@ public:
 
     void addInferredEngineArgsToCreateQuery(ASTs & args, const ContextPtr & context) const override;
 
+    void updateFileConstantColumns(ContextPtr query_context);
     void updateExternalDynamicMetadataIfExists(ContextPtr query_context) override;
 
     IDataLakeMetadata * getExternalMetadata(ContextPtr query_context);
@@ -213,6 +214,9 @@ protected:
 
     NamesAndTypesList hive_partition_columns_to_read_from_file_path;
     NamesAndTypesList file_columns;
+
+    mutable SharedMutex mutex_file_constant_columns;
+    Names file_constant_columns TSA_GUARDED_BY(mutex_file_constant_columns);
 
     LoggerPtr log;
 

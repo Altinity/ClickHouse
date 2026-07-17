@@ -1471,6 +1471,52 @@ std::optional<String> getPartitionKeyStringFromMetadata(Poco::JSON::Object::Ptr 
     return result;
 }
 
+Names getIdentityPartitionColumnsFromMetadata(Poco::JSON::Object::Ptr metadata_object)
+{
+    // @todo refactor dupli
+    if (!metadata_object->has(f_partition_specs) || !metadata_object->has(f_default_spec_id))
+        return {};
+
+    auto partition_spec_id = metadata_object->getValue<Int64>(f_default_spec_id);
+    Poco::JSON::Array::Ptr partition_specs = metadata_object->getArray(f_partition_specs);
+    std::unordered_map<Int64, String> source_id_to_column_name;
+    auto [schema, current_schema_id] = parseTableSchemaV2Method(metadata_object);
+    auto mapper = createColumnMapper(schema)->getStorageColumnEncoding();
+    for (const auto & [col_name, source_id] : mapper)
+        source_id_to_column_name[source_id] = col_name;
+
+    Poco::JSON::Object::Ptr partition_spec;
+    for (size_t i = 0; i < partition_specs->size(); ++i)
+    {
+        auto spec = partition_specs->getObject(static_cast<UInt32>(i));
+        if (spec->getValue<Int64>(f_spec_id) == partition_spec_id)
+        {
+            partition_spec = spec;
+            break;
+        }
+    }
+
+    if (!partition_spec || !partition_spec->has(f_fields))
+        return {};
+
+    auto fields = partition_spec->getArray(f_fields);
+    if (fields->size() == 0)
+        return {};
+
+    Names result;
+    std::vector<String> part_exprs;
+    for (UInt32 i = 0; i < fields->size(); ++i)
+    {
+        auto field = fields->getObject(i);
+        if (field->getValue<String>(f_transform) != "identity")
+            continue;
+
+        if (auto it = source_id_to_column_name.find(field->getValue<Int64>(f_source_id)); it != source_id_to_column_name.end())
+            result.push_back(it->second);
+    }
+    return result;
+}
+
 std::optional<String> getSortingKeyDisplayStringFromMetadata(Poco::JSON::Object::Ptr metadata_object, const NamesAndTypesList & /* ch_schema */)
 {
     if (!metadata_object->has(f_sort_orders) || !metadata_object->has(f_default_sort_order_id))

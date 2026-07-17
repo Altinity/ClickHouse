@@ -106,6 +106,8 @@ public:
 
     ColumnMapperPtr getColumnMapperForCurrentSchema(StorageMetadataPtr storage_metadata_snapshot, ContextPtr context) const override;
 
+    Names getIdentityPartitionColumnNames(ContextPtr context) const override;
+
     SinkToStoragePtr write(
         SharedHeader sample_block,
         const StorageID & table_id,

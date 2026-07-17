@@ -193,6 +193,8 @@ public:
     virtual ColumnMapperPtr getColumnMapperForObject(ObjectInfoPtr /**/) const { return nullptr; }
     virtual ColumnMapperPtr getColumnMapperForCurrentSchema(StorageMetadataPtr, ContextPtr) const { return nullptr; }
 
+    virtual Names getIdentityPartitionColumnNames(ContextPtr) const { return {}; }
+
     virtual SinkToStoragePtr write(
         SharedHeader /*sample_block*/,
         const StorageID & /*table_id*/,

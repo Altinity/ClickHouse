@@ -3,6 +3,7 @@
 
 #include <Common/Exception.h>
 #include <Common/Logger.h>
+#include <Common/UniqueLock.h>
 #include <Common/logger_useful.h>
 #include <Core/Settings.h>
 #include <Formats/FormatFactory.h>
@@ -336,7 +337,21 @@ bool StorageObjectStorage::canMoveConditionsToPrewhere() const
 
 std::optional<NameSet> StorageObjectStorage::supportedPrewhereColumns() const
 {
-    return getInMemoryMetadataPtr()->getColumnsWithoutDefaultExpressions(/*exclude=*/ hive_partition_columns_to_read_from_file_path);
+    auto exclude = hive_partition_columns_to_read_from_file_path;
+
+    const auto & cols = getInMemoryMetadataPtr()->getColumns();
+    {
+        SharedLockGuard lock(mutex_file_constant_columns);
+        for (const auto & col : file_constant_columns)
+        {
+            if (getInMemoryMetadataPtr()->getColumns().has(col))
+                // tryGetColumn
+                exclude.emplace_back(col, cols.get(col).type);
+        }
+    }
+
+    LOG_DEBUG(log, "Prewhere exclude list: [{}]", exclude.toString());
+    return getInMemoryMetadataPtr()->getColumnsWithoutDefaultExpressions(/*exclude=*/exclude);
 }
 
 IStorage::ColumnSizeByName StorageObjectStorage::getColumnSizes() const
@@ -352,6 +367,12 @@ IDataLakeMetadata * StorageObjectStorage::getExternalMetadata(ContextPtr query_c
 configuration->update(object_storage, query_context);
 
     return configuration->getExternalMetadata();
+}
+
+void StorageObjectStorage::updateFileConstantColumns(ContextPtr query_context)
+{
+    UniqueLock lock(mutex_file_constant_columns);
+    file_constant_columns = configuration->getIdentityPartitionColumnNames(query_context);
 }
 
 void StorageObjectStorage::updateExternalDynamicMetadataIfExists(ContextPtr query_context)
@@ -380,6 +401,8 @@ void StorageObjectStorage::updateExternalDynamicMetadataIfExists(ContextPtr quer
         if (auto metadata_snapshot = configuration->buildStorageMetadataFromState(*state, query_context))
             new_metadata = *metadata_snapshot;
     }
+
+    updateFileConstantColumns(query_context);
 
     setInMemoryMetadata(new_metadata);
 }
