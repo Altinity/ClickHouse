@@ -1076,12 +1076,6 @@ TEST(CasPool, ListMirroredChildren)
     EXPECT_EQ(children[1], "bk2");
 }
 
-/// (The shard-birth-incarnation tests `ShardBornCarriesIncarnation` / `RebornShardIncarnationStrictlyGreater`
-/// and the `CasShardQueue.*` shard-mutation-batching tests were removed with the snapshot+log ref model.
-/// They drove `mutateShardForTest`/`mutateShardScopedForTest` -- the LEGACY mutable per-namespace ref-shard
-/// object -- which no longer exists; incarnation ordering is now the strictly-increasing `RefTxnId`, and
-/// there is no shared shard object to co-batch mutations into. This lane is owned by Phase E (t11-fix).)
-
 namespace
 {
 

@@ -334,20 +334,6 @@ struct ManifestId
     }
 };
 
-/// A `{writer_epoch, build_sequence}` pair identifying the incarnation recorded in shard coverage.
-/// `{0, 0}` is the unstamped sentinel and is valid; it represents a coverage record with no
-/// incarnation stamp rather than an invalid value.
-struct ShardIncarnation
-{
-    uint64_t writer_epoch = 0;
-    uint64_t build_sequence = 0;
-    bool operator==(const ShardIncarnation &) const = default;
-    bool operator<(const ShardIncarnation & o) const
-    {
-        return std::tie(writer_epoch, build_sequence) < std::tie(o.writer_epoch, o.build_sequence);
-    }
-};
-
 inline constexpr uint32_t kMaxManifestOrdinal = 999999;
 
 /// Six-digit filename for a per-build part-manifest ordinal: `000001.zst` through `999999.zst`
