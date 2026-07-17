@@ -1,7 +1,6 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasSourceEdgeMarkers.h>
 #include <IO/ReadBuffer.h>
 #include <IO/WriteBuffer.h>
 #include <IO/HashingReadBuffer.h>
@@ -13,6 +12,19 @@
 
 namespace DB::Cas
 {
+
+/// Row tags for the sealed source-edge run. These byte values are part of the source-edge payload
+/// format, shared by this codec and the GC fold that interprets the rows.
+///
+/// Source-edge rows use `source_id == 0` as a sentinel key. A real active edge must never use that key;
+/// both sentinel tags are restricted to it. `kZeroMarker` describes a zero transition for the current
+/// generation and is dropped when the row is carried forward. `kCondemned` carries the condemned
+/// incarnation at the sentinel key across generations until settlement; its payload contains the full
+/// deletion token and other condemned-row state. A condemned row subsumes the zero marker for that
+/// generation.
+constexpr char kEdgeActive = 0x01;
+constexpr char kZeroMarker = 0x00;
+constexpr char kCondemned  = 0x02;
 
 /// The `cas_run` codec represents the GC source-edge in-degree data plane as sorted NDJSON. This is
 /// the `RecordStream` family

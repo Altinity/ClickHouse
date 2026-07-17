@@ -77,8 +77,7 @@ Primitives → Formats → Backend → Pool → Gc → Tools ≈ Parts → facad
 - **`Primitives/`** — the vocabulary, zero outward dependencies: `CasTypes.h`
   (identity types: `RootNamespace`, `Token`, `BlobDigest`, `BlobRef`,
   `ManifestId`, `RefTxnId`), `CasBlobHasher`, `CasXXH3`, `CasCodecUtil`
-  (identifier/varint/hex codec helpers), `CasEvent` (audit-event POD + sink),
-  `CasSourceEdgeMarkers`.
+  (identifier/varint/hex codec helpers), `CasEvent` (audit-event POD + sink).
 - **`Formats/`** — everything persisted: bytes **and** keys. The per-object
   text/format files (`CasFormat`, `CasTextFormat`, `CasPartManifestFormat`,
   `CasRefLogFormat`, …) plus `CasLayout` (the object-key schema). See
