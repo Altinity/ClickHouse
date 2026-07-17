@@ -85,7 +85,7 @@ jobs:
           id: upload_results
           env:
             S3_BUCKET: "altinity-build-artifacts"
-            COMMIT_SHA: ${{ steps.set_version.outputs.commit_sha || github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+            COMMIT_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
             PR_NUMBER: ${{ env.PR_NUMBER || github.event.pull_request.number || 0 }}
             DOCKER_IMAGE: ${{ steps.set_version.outputs.docker_image || inputs.docker_image }}
           run: |
