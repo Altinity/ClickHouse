@@ -1,6 +1,6 @@
 -- Tags: zookeeper, no-fasttest, no-parallel
 -- no-fasttest: needs an object-storage disk (storage_policy 's3_cache').
--- no-parallel: enables a server-global failpoint on the object-storage disk commit.
+-- no-parallel: enables a server-global failpoint on the part disk-transaction commit.
 
 DROP TABLE IF EXISTS t_dedup_disk_commit SYNC;
 
