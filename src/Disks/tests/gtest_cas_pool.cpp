@@ -27,7 +27,7 @@ extern const int CORRUPTED_DATA;
 extern const int NOT_IMPLEMENTED;
 extern const int UNKNOWN_FORMAT_VERSION;
 extern const int FILE_DOESNT_EXIST;
-extern const int LOGICAL_ERROR;
+extern const int UNKNOWN_EXCEPTION;
 extern const int NETWORK_ERROR;
 }
 
@@ -298,12 +298,15 @@ TEST(CasPool, BeginPartWriteRetiresBuildSeqWhenConstructionFails)
     auto store = DB::Cas::Pool::open(backend, cfg);
 
     const uint64_t failed_seq = store->peekNextBuildSeq();
+    /// UNKNOWN_EXCEPTION (not LOGICAL_ERROR): this simulates an arbitrary observer/sink callback
+    /// failing, not a CAS invariant violation -- LOGICAL_ERROR would abort the whole process under
+    /// debug/sanitizer builds instead of behaving like a catchable exception.
     store->setEventSink([](const CasEvent & e)
     {
         if (e.type == CasEventType::BuildStart)
-            throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "injected PartWriteTxn construction failure");
+            throw DB::Exception(DB::ErrorCodes::UNKNOWN_EXCEPTION, "injected PartWriteTxn construction failure");
     });
-    expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&] { store->beginPartWrite({}); });
+    expectThrowsCode(DB::ErrorCodes::UNKNOWN_EXCEPTION, [&] { store->beginPartWrite({}); });
     store->setEventSink(nullptr);
 
     EXPECT_EQ(store->peekNextBuildSeq(), failed_seq + 1);

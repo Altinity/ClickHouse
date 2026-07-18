@@ -41,6 +41,7 @@ extern const int ABORTED;
 extern const int CORRUPTED_DATA;
 extern const int LIMIT_EXCEEDED;
 extern const int NETWORK_ERROR;
+extern const int UNKNOWN_EXCEPTION;
 }
 
 using namespace DB::Cas;
@@ -990,10 +991,13 @@ TEST(CasPartWriteTxn, PromoteSwallowsPostDurableEventSinkFailure)
     const ManifestId id = build->stageManifest({entry});
     build->precommitAdd(ns, "part_1", id);
 
+    /// UNKNOWN_EXCEPTION (not LOGICAL_ERROR): this simulates an arbitrary observer/sink callback
+    /// failing, not a CAS invariant violation -- LOGICAL_ERROR would abort the whole process under
+    /// debug/sanitizer builds instead of behaving like a catchable exception.
     s->setEventSink([](const CasEvent & e)
     {
         if (e.type == CasEventType::BuildPublish)
-            throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "injected post-durable event sink failure");
+            throw DB::Exception(DB::ErrorCodes::UNKNOWN_EXCEPTION, "injected post-durable event sink failure");
     });
 
     EXPECT_NO_THROW(build->promote(ns, "part_1", build->buildId(), id));
