@@ -175,7 +175,7 @@ class S3Helper:
         if Path(local_file_path).is_dir():
             local_file_path = Path(local_file_path) / s3_path.split("/")[-1]
         try:
-            self.client.download_file(bucket, s3_path, local_file_path)
+            self.client.download_file(bucket, s3_path, str(local_file_path))
         except botocore.exceptions.ClientError as e:
             if e.response and e.response["ResponseMetadata"]["HTTPStatusCode"] == 404:
                 assert False, f"No such object [s3://{S3_BUILDS_BUCKET}/{s3_path}]"
