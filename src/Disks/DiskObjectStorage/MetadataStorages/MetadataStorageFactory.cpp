@@ -24,6 +24,7 @@ namespace ErrorCodes
     extern const int NO_ELEMENTS_IN_CONFIG;
     extern const int UNKNOWN_ELEMENT_IN_CONFIG;
     extern const int INVALID_CONFIG_PARAMETER;
+    extern const int BAD_ARGUMENTS;
     extern const int LOGICAL_ERROR;
     extern const int NOT_IMPLEMENTED;
 }
@@ -243,8 +244,8 @@ static void registerContentAddressedMetadataStorage(MetadataStorageFactory & fac
         /// single-owner claim and its allow_shared_pool opt-in are gone (M-W D-W5/D-W6).
         auto global_context = Context::getGlobalContextInstance();
         const bool gc_enabled = config.getBool(config_prefix + ".gc_enabled", true);
-        const auto gc_interval = std::chrono::seconds(
-            config.getUInt64(config_prefix + ".gc_interval_sec", 60));
+        const uint64_t gc_interval_sec = config.getUInt64(config_prefix + ".gc_interval_sec", 60);
+        const auto gc_interval = std::chrono::seconds(gc_interval_sec);
         /// CAS pluggable-blob-hash Phase 1/2 (design 2026-07-11-cas-pluggable-blob-hash-design.md §2):
         /// `blob_hash` selects the pool's blob content-hash function; default `cityhash128` keeps
         /// today's behavior byte-for-byte unchanged. `parseBlobHashAlgo` fails closed on an unknown
@@ -270,6 +271,10 @@ static void registerContentAddressedMetadataStorage(MetadataStorageFactory & fac
         /// Phase 4: blob-hash-prefix reducer sharding. Default 1 (single-shard, identical to Phase 1d).
         /// Creation-time only: the pool's persisted GcState is authoritative on reopen.
         const uint64_t gc_shards = config.getUInt64(config_prefix + ".gc_shards", 1);
+        if (gc_interval_sec == 0 || gc_shards == 0)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                "content_addressed disk '{}': gc_interval_sec and gc_shards must be >= 1 (got {}, {})",
+                name, gc_interval_sec, gc_shards);
         const uint64_t manifest_sweep_list_budget_keys = config.getUInt64(config_prefix + ".manifest_sweep_list_budget_keys", 1000);
         const uint64_t manifest_sweep_delete_budget_keys = config.getUInt64(config_prefix + ".manifest_sweep_delete_budget_keys", 100);
         /// Phase 0 (mount safety): the layout subtree identity is explicit and REQUIRED — no default,

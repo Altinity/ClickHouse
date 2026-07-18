@@ -11,6 +11,7 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int CORRUPTED_DATA;
+    extern const int LOGICAL_ERROR;
 }
 }
 
@@ -19,7 +20,8 @@ namespace DB::Cas
 
 String encodeGcState(const GcState & state)
 {
-    chassert(state.gc_shards >= 1);   /// catch a zeroed GC constant at the write site
+    if (state.gc_shards < 1)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "encodeGcState: gc_shards must be >= 1 -- refusing to persist an unreadable gc/state");
     WriteBufferFromOwnString out;
     writeHeaderLine(out, FormatId::GcState);
     bool first = true;

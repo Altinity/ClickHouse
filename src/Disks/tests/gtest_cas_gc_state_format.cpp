@@ -4,7 +4,11 @@
 
 using namespace DB::Cas;
 
-namespace DB::ErrorCodes { extern const int CORRUPTED_DATA; }
+namespace DB::ErrorCodes
+{
+    extern const int CORRUPTED_DATA;
+    extern const int LOGICAL_ERROR;
+}
 
 TEST(CasFormatBattery, GcState)
 {
@@ -83,6 +87,22 @@ TEST(CasGcStateFormat, RejectsZeroGcShards)
                        "{\"rnd\":\"0\",\"gcs\":0,\"sg\":\"0\",\"spt\":\"0\",\"sa\":\"0\",\"msc\":\"\","
                        "\"lo\":\"00000000000000000000000000000000\",\"ls\":\"0\"}\n";
     EXPECT_THROW(decodeGcState(bad), DB::Exception);
+}
+
+TEST(CasGcStateFormat, RejectsZeroGcShardsOnEncode)
+{
+    GcState state;
+    state.gc_shards = 0;
+
+    try
+    {
+        encodeGcState(state);
+        FAIL() << "expected exception code " << DB::ErrorCodes::LOGICAL_ERROR;
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::LOGICAL_ERROR);
+    }
 }
 
 TEST(CasGcStateFormat, RejectsAbsentGcShards)
