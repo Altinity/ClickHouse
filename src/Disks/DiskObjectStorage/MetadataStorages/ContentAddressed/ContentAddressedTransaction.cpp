@@ -886,7 +886,15 @@ void ContentAddressedTransaction::removeDirectory(const std::string & path)
         /// publishStaging's committed-ref repoint branch never chases an already-dropped ref, and the
         /// dominant removal path pays zero repoints (one ref-drop only).
         if (auto * st = findStaging(*r))
+        {
             st->content_removed.clear();
+            st->entries.clear();
+            if (st->build)
+            {
+                st->build->abandon();
+                st->build.reset();
+            }
+        }
         return;
     }
 }

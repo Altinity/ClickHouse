@@ -564,3 +564,16 @@ TEST(CaTransactionRemove, UnlinkStormThenDirDropIsOneRefDrop)
     const auto rep = DB::Cas::runFsck(*storage->store(), /*detail*/false);
     EXPECT_EQ(rep.dangling, 0u);
 }
+
+/// A create-then-remove of a new part in one transaction must discard both the manifest entries
+/// and the in-flight build, so commit() leaves no ref and no live precommit behind.
+TEST(CaTransactionRemove, CreateThenDirDropDoesNotPublish)
+{
+    auto storage = openTxStorage();
+    auto tx = storage->createTransaction();
+    writeFileTx(*tx, "uui/uuid-remove-3/all_1_1_0/data.bin", "created-then-removed");
+    tx->removeDirectory("uui/uuid-remove-3/all_1_1_0");
+    tx->commit(DB::NoCommitOptions{});
+
+    EXPECT_FALSE(storage->existsDirectory("uui/uuid-remove-3/all_1_1_0"));
+}
