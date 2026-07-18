@@ -407,8 +407,12 @@ TEST(CasPartWriteTxn, AdoptBeforePrecommitFailsClosed)
     const RootNamespace ns{"srv/tbl"};
     auto build = startBuildFor(s, ns, "ref_adopt");
 
-    expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR,
-        [&] { build->putBlob(id, BlobSource::fromString(payload)); });
+    EXPECT_DEATH(
+        {
+            DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
+            build->putBlob(id, BlobSource::fromString(payload));
+        },
+        "EDGE-BEFORE-OBSERVE invariant violated");
 }
 
 /// The resurrect decision (displace a condemned body) is likewise driven PURELY by the meta point-read
@@ -490,7 +494,12 @@ TEST(CasPartWriteTxn, PutBlobWrongSizeFailsClosed)
     lying.write_payload = [](DB::WriteBuffer & out) { DB::writeString(std::string_view("short"), out); };
 
     const BlobRef id = idOf("does-not-matter");
-    expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&] { build->putBlob(id, std::move(lying)); });
+    EXPECT_DEATH(
+        {
+            DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
+            build->putBlob(id, std::move(lying));
+        },
+        "source streamed");
     /// The cancelled stream created nothing.
     EXPECT_FALSE(b->head(s->layout().blobKey(id)).exists);
 }
@@ -958,7 +967,12 @@ TEST(CasPartWriteTxn, PromoteCondemnedLeafWithoutDepAbortsFailClosed)
     /// leaf), so this only confirms the fail-closed does not depend on the leaf being clean.
     condemnMeta(*b, s->layout(), hexToU128(streamingHexOf("payload-NODEP")), /*condemn_round*/ 1);
 
-    expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&] { build->promote(ns, "part_1", build->buildId(), id); });
+    EXPECT_DEATH(
+        {
+            DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
+            build->promote(ns, "part_1", build->buildId(), id);
+        },
+        "no tokened and no adopted dep");
     EXPECT_FALSE(s->resolveRef(ns, "part_1").has_value());
     /// The pool blob was never touched (no probe, no displacement).
     EXPECT_EQ(b->head(blob_key).token, t0);
@@ -982,8 +996,12 @@ TEST(CasPartWriteTxn, PromoteRevalidatesBlobPresenceFailClosed)
     build->precommitAdd(ns, "part_1", mid);
 
     /// promote must fail closed: the leaf has no tokened and no adopted dep ⇒ LOGICAL_ERROR. No ref committed.
-    expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR,
-        [&] { build->promote(ns, "part_1", build->buildId(), mid); });
+    EXPECT_DEATH(
+        {
+            DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
+            build->promote(ns, "part_1", build->buildId(), mid);
+        },
+        "no tokened and no adopted dep");
     EXPECT_FALSE(s->resolveRef(ns, "part_1").has_value());
 
     /// After uploading the blob, a fresh build's promote succeeds — the same manifest content is now
@@ -1046,10 +1064,24 @@ TEST(CasPartWriteTxn, AbandonRemovesStagedDebrisAndDisables)
         << "abandon must best-effort delete this build's staged manifest debris";
 
     /// Further operations throw via requireAlive.
-    expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR,
-        [&] { build->putBlob(idOf("after"), BlobSource::fromString("after")); });
-    expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&] { build->stageManifest({blobManifestEntry("g", "kept")}); });
-    expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&] { build->precommitAdd(ns, "ref", mid); });
+    EXPECT_DEATH(
+        {
+            DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
+            build->putBlob(idOf("after"), BlobSource::fromString("after"));
+        },
+        "has been abandoned");
+    EXPECT_DEATH(
+        {
+            DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
+            build->stageManifest({blobManifestEntry("g", "kept")});
+        },
+        "has been abandoned");
+    EXPECT_DEATH(
+        {
+            DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
+            build->precommitAdd(ns, "ref", mid);
+        },
+        "has been abandoned");
 }
 
 TEST(CasPartWriteTxn, PublishHappyPathRoundTrip)
@@ -1098,10 +1130,18 @@ TEST(CasPartWriteTxn, PromoteCrossNamespaceManifestFailsClosed)
     /// DIFFERENT namespace must fail closed.
     const ManifestId id = build->stageManifest({blobManifestEntry("data.bin", "hello world")});
 
-    expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR,
-        [&] { build->precommitAdd(other_ns, "part_1", id); });
-    expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR,
-        [&] { build->promote(other_ns, "part_1", build->buildId(), id); });
+    EXPECT_DEATH(
+        {
+            DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
+            build->precommitAdd(other_ns, "part_1", id);
+        },
+        "precommitAdd: manifest namespace");
+    EXPECT_DEATH(
+        {
+            DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
+            build->promote(other_ns, "part_1", build->buildId(), id);
+        },
+        "promote: manifest namespace");
 }
 
 /// (CasPartWriteTxn.PublishOwnThreadConflictRetries was removed with the legacy mutable ref-shard lane: it
@@ -1766,10 +1806,12 @@ TEST(CasPartWriteTxn, WDepSetCrossAlgoSatisfactionFailsClosed)
     /// satisfied by the ch128:X entry's tokened dep (same digest bytes, distinct object key). §4
     /// manifest-trust: an unsatisfied leaf is caught by the dep set (isTrustedAdopt false, not tokened) and
     /// fails closed with LOGICAL_ERROR — a staging bug — without any backend probe on the xxh3 key.
-    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&]
-    {
-        build->promote(ns, "part_mixed", build->buildId(), id);
-    });
+    EXPECT_DEATH(
+        {
+            DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
+            build->promote(ns, "part_mixed", build->buildId(), id);
+        },
+        "no tokened and no adopted dep");
 
     /// No committed ref appears — the promote aborted before installing one.
     EXPECT_FALSE(s->resolveRef(ns, "part_mixed").has_value());
