@@ -243,7 +243,8 @@ bool serverRootSubtreeEmpty(Backend & b, const Layout & l, const String & srid);
 std::optional<UInt128> readOwnerUuid(Backend & b, const Layout & l, const String & server_root_id);
 
 /// Claim (or validate) the sticky owner anchor that binds `srid` to a server UUID (identity).
-///   - owner present, equal `our_uuid` → ok (return);
+///   - owner present, equal `our_uuid`, and not tombstoned → ok (return);
+///   - owner present and tombstoned → throw `CORRUPTED_DATA` (explicitly retired — fail closed);
 ///   - owner present, different → throw `CORRUPTED_DATA` (foreign owner — fail closed);
 ///   - owner absent AND the subtree is provably empty → `putIfAbsent` the owner (claim);
 ///   - owner absent BUT the subtree is non-empty → throw `CORRUPTED_DATA` (identity lost over

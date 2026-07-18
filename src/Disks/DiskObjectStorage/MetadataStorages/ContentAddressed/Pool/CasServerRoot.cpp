@@ -38,6 +38,27 @@ bool prefixHasAnyKey(Backend & b, const String & prefix)
 {
     return !b.list(prefix, /*cursor*/ "", /*limit*/ 1).keys.empty();
 }
+
+std::optional<OwnerObject> readOwnerObject(Backend & b, const Layout & l, const String & server_root_id)
+{
+    const auto got = b.get(l.ownerKey(server_root_id));
+    if (!got)
+        return std::nullopt;
+    return decodeOwner(got->bytes);
+}
+
+void throwIfOwnerRetired(const OwnerObject & owner, const String & srid)
+{
+    if (!owner.retired_at_ms)
+        return;
+
+    throw Exception(ErrorCodes::CORRUPTED_DATA,
+        "CAS server-root '{}' was explicitly decommissioned by an operator (tombstoned at {} ms) "
+        "and is refusing to silently resume — if you genuinely intend to bring this server-root "
+        "back, manually clear the owner object's tombstone field and restart "
+        "(same manual-recovery pattern as an owner anchor lost over existing data)",
+        srid, *owner.retired_at_ms);
+}
 }
 
 bool serverRootSubtreeEmpty(Backend & b, const Layout & l, const String & srid)
@@ -56,10 +77,10 @@ bool serverRootSubtreeEmpty(Backend & b, const Layout & l, const String & srid)
 
 std::optional<UInt128> readOwnerUuid(Backend & b, const Layout & l, const String & server_root_id)
 {
-    const auto got = b.get(l.ownerKey(server_root_id));
-    if (!got)
+    const std::optional<OwnerObject> owner = readOwnerObject(b, l, server_root_id);
+    if (!owner)
         return std::nullopt;
-    return decodeOwner(got->bytes).server_uuid;
+    return owner->server_uuid;
 }
 
 void claimOwnerOrThrow(Backend & b, const Layout & l, const String & srid, UInt128 our_uuid)
@@ -68,10 +89,13 @@ void claimOwnerOrThrow(Backend & b, const Layout & l, const String & srid, UInt1
 
     /// Owner present → it is identity: equal UUID is ok, a different UUID fails closed regardless
     /// of any lease/clock state.
-    if (const std::optional<UInt128> owner_uuid = readOwnerUuid(b, l, srid))
+    if (const std::optional<OwnerObject> owner = readOwnerObject(b, l, srid))
     {
-        if (*owner_uuid == our_uuid)
+        if (owner->server_uuid == our_uuid)
+        {
+            throwIfOwnerRetired(*owner, srid);
             return;
+        }
         /// Mirror mountDoubleStartMessage's operator guidance: the by-far most common cause is a
         /// REGENERATED local ClickHouse uuid file (wiped /var/lib/clickhouse, a pod rescheduled
         /// without a persistent volume) while the pool kept the old identity — name it and the
@@ -82,7 +106,7 @@ void claimOwnerOrThrow(Backend & b, const Layout & l, const String & srid, UInt1
             "or the container/pod was recreated without a persistent volume) while the pool kept the old identity. "
             "Recover by restoring the old local uuid file; or configure a fresh <server_root_id> for this disk; "
             "or — only after verifying that NO server uses this root — manually delete the owner object '{}' and restart.",
-            srid, u128ToHex(*owner_uuid), u128ToHex(our_uuid), key);
+            srid, u128ToHex(owner->server_uuid), u128ToHex(our_uuid), key);
     }
 
     /// Owner absent. Claiming is allowed ONLY over a provably-empty subtree; an absent owner over
@@ -93,17 +117,23 @@ void claimOwnerOrThrow(Backend & b, const Layout & l, const String & srid, UInt1
             "(identity lost over existing data) — refusing to re-claim",
             srid);
 
-    const PutResult put = b.putIfAbsent(key, encodeOwner(OwnerObject{.server_uuid = our_uuid}));
+    const PutResult put = b.putIfAbsent(key, encodeOwner(OwnerObject{
+        .server_uuid = our_uuid,
+        .retired_at_ms = std::nullopt,
+    }));
     if (put.outcome == PutOutcome::Done)
         return;
 
     /// Race: another process claimed between our get and our putIfAbsent. Re-read and compare.
-    const std::optional<UInt128> reread = readOwnerUuid(b, l, srid);
+    const std::optional<OwnerObject> reread = readOwnerObject(b, l, srid);
     if (!reread)
         throw Exception(ErrorCodes::CORRUPTED_DATA,
             "CAS server-root '{}' owner anchor vanished during claim", srid);
-    if (*reread == our_uuid)
+    if (reread->server_uuid == our_uuid)
+    {
+        throwIfOwnerRetired(*reread, srid);
         return;
+    }
     throw Exception(ErrorCodes::CORRUPTED_DATA,
         "CAS server-root '{}' was claimed by a different server during our claim (foreign owner) "
         "— refusing to proceed",

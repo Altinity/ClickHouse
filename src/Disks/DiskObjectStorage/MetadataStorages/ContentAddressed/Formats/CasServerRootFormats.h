@@ -3,6 +3,7 @@
 #include <base/types.h>
 #include <base/extended_types.h>
 #include <cstdint>
+#include <optional>
 #include <string_view>
 
 namespace DB::Cas
@@ -19,12 +20,17 @@ namespace DB::Cas
 /// incarnation; its `min_active` value carries the GC acknowledgement floor, while `gc_fenced` is a
 /// terminal fence-out marker for that incarnation.
 
-/// Permanent identity anchor for one configured server root. It is created with put-if-absent and is
-/// never reassigned, so `decodeOwner` returns the UUID that the caller must compare with its local
-/// server identity before using the root.
+/// Permanent identity anchor for one configured server root. It is created with put-if-absent, never
+/// reassigned, and tombstoned in place when explicitly decommissioned, so `decodeOwner` returns both
+/// the UUID that the caller must compare with its local server identity and the retirement state.
 struct OwnerObject
 {
     UInt128 server_uuid{};
+    /// Set when this identity was explicitly decommissioned by an operator (`CasDecommission`'s
+    /// final step tombstones the owner object in place rather than deleting it, since its content
+    /// alone cannot distinguish decommissioned debris from a legitimate successor's live anchor).
+    /// A normal claim (`claimOwnerOrThrow`) must refuse to silently resume a tombstoned identity.
+    std::optional<uint64_t> retired_at_ms;
 };
 
 /// Durable counter state used to allocate unique writer epochs. The stored value is the next epoch
@@ -51,14 +57,16 @@ struct MountLease
     bool gc_fenced = false;    /// GC fence-out of an expired lease; terminal
 };
 
-/// Encode the owner anchor as canonical text with the `cas_owner` header and a final newline. This
-/// function does not perform the put-if-absent operation or validate ownership; those decisions
-/// belong to the caller that coordinates the server-root object.
+/// Encode the owner anchor as canonical text with the `cas_owner` header and a final newline. The
+/// optional retirement timestamp is omitted for a never-retired owner, preserving its historical
+/// bytes. This function does not perform the put-if-absent operation or validate ownership; those
+/// decisions belong to the caller that coordinates the server-root object.
 String encodeOwner(const OwnerObject & o);
 
-/// Decode an owner anchor, requiring its `su` field and rejecting bytes after the body line. Unknown
-/// JSON fields are skipped for forward-compatible reads; malformed input, a missing `su`, and
-/// trailing data throw `CORRUPTED_DATA`.
+/// Decode an owner anchor, requiring its `su` field, tolerating an absent optional `rt` retirement
+/// timestamp, and rejecting bytes after the body line. Unknown JSON fields are skipped for
+/// forward-compatible reads; malformed input, a missing `su`, and trailing data throw
+/// `CORRUPTED_DATA`.
 OwnerObject decodeOwner(std::string_view data);
 
 /// Encode the durable next-writer-epoch counter as canonical text with the `cas_epoch` header and a

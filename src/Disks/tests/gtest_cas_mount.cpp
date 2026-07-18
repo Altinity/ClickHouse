@@ -11,6 +11,7 @@
 namespace DB::ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
+    extern const int CORRUPTED_DATA;
 }
 
 using namespace DB::Cas;
@@ -86,6 +87,28 @@ TEST(CasServerRootClaim, OwnerStickyAndForeignFailsClosed)
     EXPECT_NO_THROW(claimOwnerOrThrow(*b, l, "r", UInt128(1)));     // fresh empty root → claim
     EXPECT_NO_THROW(claimOwnerOrThrow(*b, l, "r", UInt128(1)));     // same uuid → ok
     EXPECT_THROW(claimOwnerOrThrow(*b, l, "r", UInt128(2)), DB::Exception);  // foreign → fail closed
+}
+
+TEST(CasServerRootClaim, TombstonedSameOwnerFailsClosed)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    b->putIfAbsent(l.ownerKey("r"), encodeOwner(OwnerObject{
+        .server_uuid = UInt128(1),
+        .retired_at_ms = 1752537600000ULL,
+    }));
+
+    try
+    {
+        claimOwnerOrThrow(*b, l, "r", UInt128(1));
+        FAIL() << "expected a tombstoned owner claim to fail closed";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA);
+        EXPECT_NE(e.message().find("decommissioned"), String::npos) << e.message();
+        EXPECT_EQ(e.message().find("owned by a different server"), String::npos) << e.message();
+    }
 }
 
 TEST(CasServerRootEpoch, AllocatorIsMonotoneAndSurvivesMountConcept)

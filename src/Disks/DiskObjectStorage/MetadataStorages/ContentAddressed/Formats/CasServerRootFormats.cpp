@@ -36,6 +36,11 @@ String encodeOwner(const OwnerObject & o)
     bool first = true;
     writeKey(out, "su", first);
     writeHex128Value(out, o.server_uuid);
+    if (o.retired_at_ms)
+    {
+        writeKey(out, "rt", first);
+        writeIntText(*o.retired_at_ms, out);
+    }
     closeObject(out, first);
     writeChar('\n', out);
     out.finalize();
@@ -52,6 +57,7 @@ OwnerObject decodeOwner(std::string_view data)
 
     OwnerObject o;
     bool saw = false;
+    std::optional<uint64_t> rt;
     String key;
     while (r.nextKey(key))
     {
@@ -60,9 +66,12 @@ OwnerObject decodeOwner(std::string_view data)
             o.server_uuid = r.readHex128();
             saw = true;
         }
+        else if (key == "rt")
+            rt = r.readU64Number();
         else
             r.skipUnknown(key);
     }
+    o.retired_at_ms = rt;
     if (!saw)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS owner: missing su");
     if (!body_in.eof() || !in.eof())

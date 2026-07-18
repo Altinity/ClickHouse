@@ -9,10 +9,25 @@ TEST(CasFormatBattery, Owner)
 {
     OwnerObject o;
     o.server_uuid = hexToU128("0123456789abcdeffedcba9876543210");
+    const String golden =
+        "{\"type\":\"cas_owner\",\"v\":3}\n{\"su\":\"0123456789abcdeffedcba9876543210\"}\n";
+    EXPECT_EQ(encodeOwner(o), golden);
+    EXPECT_FALSE(decodeOwner(golden).retired_at_ms.has_value());
     runFormatBattery({FormatId::Owner,
         [&] { return sealObject(FormatId::Owner, encodeOwner(o)); },
         [](std::string_view s) { decodeOwner(std::string(openObject(FormatId::Owner, s))); },
-        "{\"type\":\"cas_owner\",\"v\":3}\n{\"su\":\"0123456789abcdeffedcba9876543210\"}\n"});
+        golden});
+}
+
+TEST(CasOwnerFormat, RetiredAtRoundTrip)
+{
+    OwnerObject o;
+    o.server_uuid = hexToU128("0123456789abcdeffedcba9876543210");
+    o.retired_at_ms = 1752537600000ULL;
+
+    const OwnerObject back = decodeOwner(encodeOwner(o));
+    EXPECT_EQ(back.server_uuid, o.server_uuid);
+    EXPECT_EQ(back.retired_at_ms, o.retired_at_ms);
 }
 
 TEST(CasFormatBattery, ServerEpoch)

@@ -6,6 +6,7 @@
 
 namespace DB::ErrorCodes
 {
+    extern const int CORRUPTED_DATA;
     extern const int S3_ERROR;
 }
 
@@ -172,14 +173,12 @@ class SuccessorReclaimAfterEpochDeleteBackend : public InMemoryBackend
 {
 public:
     using Backend::get;
+    using Backend::putOverwrite;
 
     void armForSuccessorReclaim() { armed = true; }
 
     DeleteOutcome deleteExact(const String & key, const Token & token) override
     {
-        if (key == owner_key)
-            ++owner_delete_attempts;
-
         const DeleteOutcome result = InMemoryBackend::deleteExact(key, token);
         if (armed && !successor_injected && key == epoch_key
             && classifyDeleteOutcome(result) == DeleteClass::Deleted)
@@ -190,13 +189,21 @@ public:
     }
 
     bool successorInjected() const { return successor_injected; }
-    uint64_t ownerDeleteAttempts() const { return owner_delete_attempts; }
+    uint64_t ownerRewriteAttempts() const { return owner_rewrite_attempts; }
     const Token & successorMountToken() const { return successor_mount_token; }
     const Token & successorEpochToken() const { return successor_epoch_token; }
     const String & successorMountBytes() const { return successor_mount_bytes; }
     const String & successorEpochBytes() const { return successor_epoch_bytes; }
 
 private:
+    PutResult putOverwrite(
+        const String & key, const String & bytes, const Token & expected, const ObjectMeta & meta) override
+    {
+        if (key == owner_key)
+            ++owner_rewrite_attempts;
+        return InMemoryBackend::putOverwrite(key, bytes, expected, meta);
+    }
+
     void injectSuccessor()
     {
         successor_epoch_bytes = encodeServerEpoch(ServerEpoch{.next_writer_epoch = 102});
@@ -227,11 +234,62 @@ private:
     inline static const String owner_key = "p/gc/server-roots/victim/owner";
     bool armed = false;
     bool successor_injected = false;
-    uint64_t owner_delete_attempts = 0;
+    uint64_t owner_rewrite_attempts = 0;
     Token successor_mount_token;
     Token successor_epoch_token;
     String successor_mount_bytes;
     String successor_epoch_bytes;
+};
+
+/// Rewrites the owner anchor after decommission reads it but before its conditional tombstone write.
+/// Returning the captured result gives decommission a stale owner token, deterministically modeling
+/// the successor race without threads or sleeps.
+class SuccessorOwnerRewriteBeforeTombstoneBackend : public InMemoryBackend
+{
+public:
+    using Backend::get;
+
+    void armForSuccessorRewrite() { armed = true; }
+
+    std::optional<GetResult> get(const String & key, Range range) override
+    {
+        std::optional<GetResult> result = InMemoryBackend::get(key, range);
+        if (armed && epoch_deleted && !successor_injected && key == owner_key && result)
+        {
+            successor_owner_bytes = encodeOwner(OwnerObject{
+                .server_uuid = decodeOwner(result->bytes).server_uuid,
+                .retired_at_ms = std::nullopt,
+            });
+            const PutResult put = InMemoryBackend::putOverwrite(
+                owner_key, successor_owner_bytes, result->token, {});
+            if (put.outcome != PutOutcome::Done)
+                throw std::runtime_error("owner-successor fixture: owner rewrite conflicted");
+            successor_owner_token = put.token;
+            successor_injected = true;
+        }
+        return result;
+    }
+
+    DeleteOutcome deleteExact(const String & key, const Token & token) override
+    {
+        const DeleteOutcome result = InMemoryBackend::deleteExact(key, token);
+        if (armed && key == epoch_key && classifyDeleteOutcome(result) == DeleteClass::Deleted)
+            epoch_deleted = true;
+        return result;
+    }
+
+    bool successorInjected() const { return successor_injected; }
+    const Token & successorOwnerToken() const { return successor_owner_token; }
+    const String & successorOwnerBytes() const { return successor_owner_bytes; }
+
+private:
+    inline static const String epoch_key = "p/gc/server-roots/victim/epoch";
+    inline static const String owner_key = "p/gc/server-roots/victim/owner";
+    bool armed = false;
+    bool epoch_deleted = false;
+    bool successor_injected = false;
+    Token successor_owner_token;
+    String successor_owner_bytes;
 };
 
 /// Seed one victim table with `committed` committed refs and `precommits` dangling precommit bindings,
@@ -537,10 +595,9 @@ TEST(CasDecommission, ManifestDebrisPhaseFailuresWarnAndContinue)
         << "the failing object is left behind (untouched) so a re-run can retry it";
 }
 
-/// Task 4: a clean drain (no warnings) removes the pool slot -- the three control objects
-/// (`mount`/`owner`/`epoch`) are gone -- and a re-run of the SAME srid is now `BAD_ARGUMENTS`
-/// ("unknown member"), exactly like `RefusesUnknownMember` for an srid that never existed.
-TEST(CasDecommission, RemovesSlotAndMakesRerunUnknown)
+/// A clean drain removes the mutable slot objects and tombstones the owner anchor. A re-run of the
+/// same `srid` then fails closed instead of silently resuming the explicitly retired identity.
+TEST(CasDecommission, RemovesMutableSlotAndRefusesTombstonedRerun)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     {
@@ -552,10 +609,12 @@ TEST(CasDecommission, RemovesSlotAndMakesRerunUnknown)
     EXPECT_TRUE(report.slot_removed);
     EXPECT_TRUE(report.warnings.empty());
     EXPECT_FALSE(backend->get("p/gc/server-roots/victim/mount").has_value());
-    EXPECT_FALSE(backend->get("p/gc/server-roots/victim/owner").has_value());
+    const auto owner = backend->get("p/gc/server-roots/victim/owner");
+    ASSERT_TRUE(owner.has_value());
+    EXPECT_TRUE(decodeOwner(owner->bytes).retired_at_ms.has_value());
     EXPECT_FALSE(backend->get("p/gc/server-roots/victim/epoch").has_value());
 
-    expectThrowsCode(ErrorCodes::BAD_ARGUMENTS, [&]
+    expectThrowsCode(ErrorCodes::CORRUPTED_DATA, [&]
     {
         decommissionPoolMember(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "a2"}, "victim");
     });
@@ -616,7 +675,7 @@ TEST(CasDecommission, SuccessorReclaimAfterEpochDeleteKeepsOwnerAnchor)
     ASSERT_TRUE(backend->successorInjected());
     EXPECT_FALSE(report.slot_removed);
     EXPECT_FALSE(report.warnings.empty());
-    EXPECT_EQ(backend->ownerDeleteAttempts(), 0u);
+    EXPECT_EQ(backend->ownerRewriteAttempts(), 0u);
 
     const auto owner = backend->get(owner_key);
     ASSERT_TRUE(owner.has_value());
@@ -634,9 +693,9 @@ TEST(CasDecommission, SuccessorReclaimAfterEpochDeleteKeepsOwnerAnchor)
     EXPECT_EQ(epoch->bytes, backend->successorEpochBytes());
 }
 
-/// Triage #9 control: absent a successor interleaving, the newly fenced tail still removes all three
-/// control objects and preserves the existing successful `slot_removed=1` result.
-TEST(CasDecommission, FencedSlotRetirementTailRemovesUncontendedSlot)
+/// Triage #9 control: absent a successor interleaving, the fenced tail removes both mutable control
+/// objects, tombstones the owner anchor, and preserves the existing successful `slot_removed=1` result.
+TEST(CasDecommission, FencedSlotRetirementTailRetiresUncontendedSlot)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     { auto victim = openVictim(backend); }
@@ -648,7 +707,52 @@ TEST(CasDecommission, FencedSlotRetirementTailRemovesUncontendedSlot)
     EXPECT_TRUE(report.slot_removed);
     EXPECT_FALSE(backend->get("p/gc/server-roots/victim/mount").has_value());
     EXPECT_FALSE(backend->get("p/gc/server-roots/victim/epoch").has_value());
-    EXPECT_FALSE(backend->get("p/gc/server-roots/victim/owner").has_value());
+    const auto owner = backend->get("p/gc/server-roots/victim/owner");
+    ASSERT_TRUE(owner.has_value());
+    EXPECT_TRUE(decodeOwner(owner->bytes).retired_at_ms.has_value());
+}
+
+TEST(CasDecommission, SuccessfulDecommissionLeavesTombstonedOwnerAnchor)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    { auto victim = openVictim(backend); }
+
+    const String owner_key = "p/gc/server-roots/victim/owner";
+    const auto before = backend->get(owner_key);
+    ASSERT_TRUE(before.has_value());
+    EXPECT_FALSE(decodeOwner(before->bytes).retired_at_ms.has_value());
+
+    const auto report = decommissionPoolMember(
+        backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim");
+
+    EXPECT_TRUE(report.warnings.empty());
+    EXPECT_TRUE(report.slot_removed);
+    const auto after = backend->get(owner_key);
+    ASSERT_TRUE(after.has_value());
+    EXPECT_NE(after->token, before->token);
+    EXPECT_EQ(decodeOwner(after->bytes).server_uuid, decodeOwner(before->bytes).server_uuid);
+    EXPECT_TRUE(decodeOwner(after->bytes).retired_at_ms.has_value());
+}
+
+TEST(CasDecommission, SuccessorOwnerRewriteWinsBeforeTombstone)
+{
+    auto backend = std::make_shared<SuccessorOwnerRewriteBeforeTombstoneBackend>();
+    { auto victim = openVictim(backend); }
+    backend->armForSuccessorRewrite();
+
+    const auto report = decommissionPoolMember(
+        backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim");
+
+    ASSERT_TRUE(backend->successorInjected());
+    EXPECT_FALSE(report.slot_removed);
+    ASSERT_EQ(report.warnings.size(), 1u);
+    EXPECT_NE(report.warnings.front().find("successor reclaimed"), String::npos);
+
+    const auto owner = backend->get("p/gc/server-roots/victim/owner");
+    ASSERT_TRUE(owner.has_value());
+    EXPECT_EQ(owner->token, backend->successorOwnerToken());
+    EXPECT_EQ(owner->bytes, backend->successorOwnerBytes());
+    EXPECT_FALSE(decodeOwner(owner->bytes).retired_at_ms.has_value());
 }
 
 /// Delegates every op to `inner`, except `deleteExact`: while `armed`, any key starting with
@@ -776,10 +880,10 @@ TEST(CasDecommission, ManifestDebrisFailureKeepsSlotThenResumes)
 
 /// Task 5 (Task-1 carry-forward, escalated by review): preserve recovery from the legacy partial
 /// hand-cleanup shape where owner and epoch are absent but the mount lease remains. Triage #9 changed
-/// new retirements to delete `mountKey`/`epochKey`/`ownerKey`, so the current tail no longer creates
-/// this shape, but `openForDecommission`'s owner-anchor-absent + mount-lease-present fallback ("partial
-/// hand-cleanup: adopt from the lease", `CasPool.cpp`) remains compatibility-critical for slots left by
-/// older binaries or manual repair.
+/// new retirements to delete `mountKey`/`epochKey` and tombstone `ownerKey`, so the current tail no
+/// longer creates this shape, but `openForDecommission`'s owner-anchor-absent +
+/// mount-lease-present fallback ("partial hand-cleanup: adopt from the lease", `CasPool.cpp`) remains
+/// compatibility-critical for slots left by older binaries or manual repair.
 ///
 /// `claimOwnerOrThrow` (`CasServerRoot.cpp`) gates the owner-absent path a SECOND, stricter way: it
 /// only re-claims over a PROVABLY EMPTY data subtree (`serverRootSubtreeEmpty`: `cas/refs/<srid>/`,
@@ -793,7 +897,7 @@ TEST(CasDecommission, ManifestDebrisFailureKeepsSlotThenResumes)
 /// `decommissionPoolMember`'s own first step), let it close gracefully (the mount-lease keeper's
 /// farewell stamp, same as a real `admin.reset()`), then manually strike `epochKey`+`ownerKey`, leaving
 /// `mountKey`. A `decommissionPoolMember` re-run must resolve identity via the mount-lease fallback and
-/// finish retiring the slot; a further re-run then sees no anchor at all and is refused as unknown.
+/// finish retiring the slot; a further re-run then sees the tombstone and refuses to resume it.
 TEST(CasDecommission, MidRetirementCrashResumesViaMountLeaseFallback)
 {
     auto backend = std::make_shared<InMemoryBackend>();
@@ -826,10 +930,12 @@ TEST(CasDecommission, MidRetirementCrashResumesViaMountLeaseFallback)
     EXPECT_EQ(report.namespaces_removed, 0u);
     EXPECT_TRUE(report.slot_removed);
     EXPECT_FALSE(backend->get(layout.epochKey("victim")).has_value());
-    EXPECT_FALSE(backend->get(layout.ownerKey("victim")).has_value());
+    const auto owner = backend->get(layout.ownerKey("victim"));
+    ASSERT_TRUE(owner.has_value());
+    EXPECT_TRUE(decodeOwner(owner->bytes).retired_at_ms.has_value());
     EXPECT_FALSE(backend->get(layout.mountKey("victim")).has_value());
 
-    expectThrowsCode(ErrorCodes::BAD_ARGUMENTS, [&]
+    expectThrowsCode(ErrorCodes::CORRUPTED_DATA, [&]
     {
         decommissionPoolMember(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "a3"}, "victim");
     });

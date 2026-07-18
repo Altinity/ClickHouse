@@ -6,6 +6,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
+#include <chrono>
 #include <limits>
 #include <set>
 #include <tuple>
@@ -15,6 +16,12 @@ namespace DB::Cas
 
 namespace
 {
+
+uint64_t nowMs()
+{
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count());
+}
 
 /// Delete every object listed under `prefix` by its listed (or, absent a list-token backend, HEAD'd)
 /// token. This backs the staging and roots drain phases below: the victim's writers are fenced by the
@@ -171,7 +178,7 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
 
     /// Retire the slot strictly last and only after a clean drain. Copy the layout and shared backend
     /// before `admin.reset()`: graceful close destroys the `Pool`, while the backend must remain alive to
-    /// delete the slot objects afterwards.
+    /// retire the slot objects afterwards.
     const Layout layout = admin->layout();
     const BackendPtr pool_backend = admin->poolBackendPtr();
     if (report.warnings.empty())
@@ -197,8 +204,8 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
         }
 
         /// Graceful close stamps an already-expired lease and the watermark farewell
-        /// (`min_active = UINT64_MAX`), making the slot `terminated` before its control objects are
-        /// removed.
+        /// (`min_active = UINT64_MAX`), making the slot `terminated` before its mutable control objects
+        /// are removed and its owner anchor is tombstoned.
         admin.reset();
 
         /// Read the farewell immediately after `finishTeardown` wrote it. Its exact token is the
@@ -249,7 +256,8 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
         /// its under-claim token similarly detects a successor allocation. Before touching owner, re-read
         /// both mutable objects: a same-UUID successor can recreate them after both deletes without
         /// rewriting the owner identity anchor. Mere presence proves that the slot is live again. Every
-        /// delete must be explicitly confirmed as `Deleted`.
+        /// delete must be explicitly confirmed as `Deleted`, and the final owner tombstone rewrite must
+        /// succeed against the exact token read immediately before it.
         report.slot_removed = false;
         if (captures_match && deleteSlotObject(*pool_backend, mount_key, farewell_mount->token, report.warnings)
             && deleteSlotObject(*pool_backend, epoch_key, claimed_epoch->token, report.warnings))
@@ -288,13 +296,24 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
                 try
                 {
                     if (const auto owner = pool_backend->get(owner_key))
-                        report.slot_removed = deleteSlotObject(*pool_backend, owner_key, owner->token, report.warnings);
+                    {
+                        OwnerObject tombstoned = decodeOwner(owner->bytes);
+                        tombstoned.retired_at_ms = nowMs();
+                        const PutResult put = pool_backend->putOverwrite(owner_key, encodeOwner(tombstoned), owner->token);
+                        if (put.outcome == PutOutcome::Done)
+                            report.slot_removed = true;
+                        else
+                            report.warnings.push_back(
+                                "slot tombstone failed: " + owner_key
+                                + ": successor reclaimed the owner anchor before this decommission's tombstone write");
+                    }
                     else
-                        report.warnings.push_back("slot delete failed: " + owner_key + ": object absent before delete");
+                        report.warnings.push_back(
+                            "slot tombstone failed: " + owner_key + ": object absent before tombstone write");
                 }
                 catch (...)
                 {
-                    report.warnings.push_back("slot delete failed: " + owner_key + ": "
+                    report.warnings.push_back("slot tombstone failed: " + owner_key + ": "
                                               + getCurrentExceptionMessage(/*with_stacktrace=*/false));
                 }
             }
@@ -310,7 +329,7 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
     }
 
     /// The `end` event is emitted via `sink` directly, not `EventEmitter{*admin}`: `admin` is gone by
-    /// now. This also means its `warnings` count reflects the FINAL total, including a slot-delete
+    /// now. This also means its `warnings` count reflects the FINAL total, including a slot-retirement
     /// failure appended just above -- `EventEmitter`'s own zero-cost-when-absent guard is reproduced by
     /// the `if (sink)` below.
     if (sink)

@@ -30,8 +30,8 @@ struct DecommissionReport
     uint64_t manifest_debris_removed = 0;         /// Eligible manifest objects deleted from old build prefixes.
     uint64_t staging_objects_removed = 0;         /// Objects deleted from the member's staging prefix.
     uint64_t mountpoint_objects_removed = 0;      /// Objects deleted from the member's roots/mountpoint prefix.
-    bool slot_removed = false;                    /// Whether the member's mount, owner, and epoch objects were deleted.
-    std::vector<String> warnings;                 /// Drain or slot-delete failures; a non-empty list keeps the slot.
+    bool slot_removed = false;                    /// Whether mount and epoch were deleted and the owner was tombstoned.
+    std::vector<String> warnings;                 /// Drain or slot-retirement failures; a non-empty list keeps the slot.
 };
 
 /// Erases all content owned by a permanently dead pool member. The operation first claims the member's
