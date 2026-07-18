@@ -1267,6 +1267,31 @@ TEST(CasPoolRemount, ForeignOwnerIsNeverTakenOver)
     EXPECT_FALSE(store->tryRemountOnce());
     /// The foreign body is untouched (no takeover, ever).
     EXPECT_EQ(decodeMountLease(backend->get(mount_key)->bytes).server_uuid, foreign.server_uuid);
+
+    /// Move the parent fixture to the production-recognized fenced terminal state before explicitly
+    /// destroying its superseded keeper. The unfenced foreign-release guard is covered separately below.
+    fenceOutMount(*backend, mount_key);
+    store.reset();
+
+    EXPECT_DEATH(
+        {
+            DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
+
+            auto death_backend = std::make_shared<InMemoryBackend>();
+            auto invalid_store = DB::Cas::tests::openPoolForTest(death_backend);
+            const String death_mount_key = invalid_store->layout().mountKey("test");
+            const auto death_got = death_backend->get(death_mount_key);
+            MountLease death_foreign = decodeMountLease(death_got->bytes);
+            death_foreign.server_uuid = death_foreign.server_uuid + DB::UInt128(1);
+            death_foreign.seq += 1;
+            ASSERT_EQ(
+                death_backend->putOverwrite(death_mount_key, encodeMountLease(death_foreign), death_got->token).outcome,
+                DB::Cas::PutOutcome::Done);
+
+            EXPECT_FALSE(invalid_store->tryRemountOnce());
+            invalid_store.reset();
+        },
+        "release of key.*hit a foreign incarnation");
 }
 
 TEST(CasPoolRemount, ShutdownGuardRefusesToArmRemount)

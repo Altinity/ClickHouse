@@ -1499,7 +1499,9 @@ TEST(CasGcRound, OrphanManifestCursorSweepDeletesAndPersistsCursor)
     std::shared_ptr<InMemoryBackend> backend;
     PoolConfig config;
     config.pool_prefix = "p";
-    config.server_root_id = "test";
+    /// The GC runner owns a different mount from the synthetic `test` watermark below. This keeps the
+    /// cursor-sweep assertions in the parent process without replacing its live keeper incarnation.
+    config.server_root_id = "gc-runner";
     config.manifest_sweep_list_budget_keys = 1;
     config.manifest_sweep_delete_budget_keys = 1;
     /// This test drives MANY consecutive rounds expecting each to sweep + persist the cursor; force
@@ -1529,6 +1531,21 @@ TEST(CasGcRound, OrphanManifestCursorSweepDeletesAndPersistsCursor)
     EXPECT_TRUE(after_second.manifest_sweep_cursor.empty());
     EXPECT_FALSE(manifestExists(*backend, store->layout(), ManifestId{ns, r1}));
     EXPECT_FALSE(manifestExists(*backend, store->layout(), ManifestId{ns, r2}));
+
+    /// Retain explicit coverage that replacing a live Pool's own mount with a synthetic foreign
+    /// watermark makes release fail closed. The complete invalid lifecycle is child-only.
+    EXPECT_DEATH(
+        {
+            DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
+
+            std::shared_ptr<InMemoryBackend> death_backend;
+            PoolConfig death_config = config;
+            death_config.server_root_id = "test";
+            auto invalid_store = openTestPoolWithConfig(death_backend, std::move(death_config));
+            setWatermarkMinActive(*death_backend, invalid_store->layout(), "test", r1.writer_epoch, /*min_active*/6);
+            invalid_store.reset();
+        },
+        "release of key.*hit a foreign incarnation");
 }
 
 /// Source-edge idempotency: re-folding the same blob activation does not double-count.

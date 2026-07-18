@@ -376,7 +376,12 @@ TEST(CasMountLease, KeeperStartAdoptsOurOwnClaimNotDoubleStart)
     // A keeper for the SAME uuid but a DIFFERENT live epoch must fail closed (superseded/double-start):
     MountLeaseKeeper k2(b, l, "r", UInt128(1), /*epoch*/ 8, std::chrono::milliseconds(100), [&] { return now; },
                         [] { return uint64_t{0}; });
-    EXPECT_ANY_THROW(k2.start());
+    EXPECT_DEATH(
+        {
+            DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
+            k2.start();
+        },
+        "held by a different writer_epoch");
 }
 
 TEST(CasMountFence, SupersededWriterRefusedNoS3Read)
@@ -498,9 +503,9 @@ TEST(CasMountStartup, StaleSelfMountReclaimedAfterWait)
 {
     auto b = std::make_shared<InMemoryBackend>();
 
-    /// Server A opens writable with a SHORT lease TTL and KEEPS its Pool alive with NO background
-    /// renewer (background_watermark defaults false) — i.e. it simulates a crashed process: the mount
-    /// lease survives with a future expires_at_ms but is never renewed.
+    /// Server A opens writable with a SHORT lease TTL and no background renewer (`background_watermark`
+    /// defaults false). The test captures its live mount body, destroys the real Pool cleanly, then
+    /// replays that body to simulate a crashed process whose lease survives but is never renewed.
     /// This test's short lease TTL is far below the CasRequestBudget defaults (RFC
     /// cas-s3-timeout-retry-control §required-timeout-model requires attempt_timeout + safety_margin <
     /// lease TTL), so it also scales down cas_request_budget to fit — the budget itself is not
@@ -514,10 +519,21 @@ TEST(CasMountStartup, StaleSelfMountReclaimedAfterWait)
         .cas_request_budget = tiny_budget});
     ASSERT_NE(a, nullptr);
     const uint64_t e1 = a->writerEpoch();
+    const String mount_key = a->layout().mountKey("r");
+    const auto stale_mount = b->get(mount_key);
+    ASSERT_TRUE(stale_mount.has_value());
+
+    /// Preserve A's live lease as if its process disappeared without running C++ teardown. Destroying
+    /// the real Pool first keeps the parent process valid; replaying the saved body recreates the exact
+    /// durable stale-lease state that a crashed process would leave behind.
+    a.reset();
+    const auto farewell = b->get(mount_key);
+    ASSERT_TRUE(farewell.has_value());
+    ASSERT_EQ(b->putOverwrite(mount_key, stale_mount->bytes, farewell->token).outcome, PutOutcome::Done);
 
     /// A restart of the SAME server (same uuid) must NOT abort: it waits out the stale lease (<= ~300ms)
-    /// and reclaims the mount, coming up with a strictly higher durable writer_epoch. No clean farewell
-    /// was written (Server A's Pool is still alive, never destroyed) -> the reclaim is
+    /// and reclaims the mount, coming up with a strictly higher durable writer_epoch. The replayed live
+    /// body hides A's clean farewell, so the reclaim is
     /// `MountPriorState::UncleanObserved`, so `Pool::open` (rev.6 Task 6) ALSO pays a
     /// `materialization_grace_ms` wait after the observation window; inject a fake `boot_ms_fn` +
     /// `wait_sleep_fn` (mirroring `CasMountTmat.UncleanOpenWaitsMaterializationGrace`) so BOTH waits
@@ -534,6 +550,33 @@ TEST(CasMountStartup, StaleSelfMountReclaimedAfterWait)
             .wait_sleep_fn = [&a2_fake_boot](uint64_t ms) { a2_fake_boot += ms; }}));
     ASSERT_NE(a2, nullptr);
     EXPECT_GT(a2->writerEpoch(), e1);
+
+    /// Keep explicit release-guard coverage for the original live-object overlap. The first Pool and
+    /// the reclaiming Pool, the foreign-incarnation transition, and A's destruction all stay in the
+    /// child, so no invalid owner survives to teardown in the parent process.
+    EXPECT_DEATH(
+        {
+            DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
+
+            auto death_backend = std::make_shared<InMemoryBackend>();
+            auto first = Pool::open(death_backend, PoolConfig{
+                .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r",
+                .mount_lease_ttl_ms = std::chrono::milliseconds(300),
+                .mount_renew_period = std::chrono::milliseconds(100),
+                .cas_request_budget = tiny_budget});
+
+            uint64_t fake_boot = 0;
+            auto replacement = Pool::open(death_backend, PoolConfig{
+                .pool_prefix = "p", .server_id = UInt128(1), .server_root_id = "r",
+                .mount_lease_ttl_ms = std::chrono::milliseconds(300),
+                .mount_renew_period = std::chrono::milliseconds(100),
+                .cas_request_budget = tiny_budget,
+                .boot_ms_fn = [&fake_boot] { return fake_boot; },
+                .wait_sleep_fn = [&fake_boot](uint64_t ms) { fake_boot += ms; }});
+            ASSERT_NE(replacement, nullptr);
+            first.reset();
+        },
+        "release of key.*hit a foreign incarnation");
 }
 
 TEST(CasMountLease, BodyCarriesFloorAndFence)
