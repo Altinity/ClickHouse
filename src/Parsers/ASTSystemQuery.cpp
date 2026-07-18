@@ -262,19 +262,6 @@ void ASTSystemQuery::formatImpl(WriteBuffer & ostr, const FormatSettings & setti
 
             break;
         }
-        case Type::RELOAD_DICTIONARY:
-        case Type::RELOAD_MODEL:
-        case Type::RELOAD_FUNCTION:
-        case Type::CONTENT_ADDRESSED_GARBAGE_COLLECTION:
-        {
-            /// The disk is optional here; print it only when one was given.
-            if (!disk.empty())
-            {
-                ostr << ' ';
-                print_identifier(disk);
-            }
-            break;
-        }
         case Type::CONTENT_ADDRESSED_GC_REBUILD:
         {
             /// FORCE precedes the required disk name: SYSTEM CONTENT ADDRESSED GC REBUILD
@@ -297,10 +284,16 @@ void ASTSystemQuery::formatImpl(WriteBuffer & ostr, const FormatSettings & setti
             print_keyword(" FROM DISK ") << quoteString(disk);
             break;
         }
+        case Type::RELOAD_DICTIONARY:
+        case Type::RELOAD_MODEL:
+        case Type::RELOAD_FUNCTION:
+        case Type::CONTENT_ADDRESSED_GARBAGE_COLLECTION:
         case Type::RESTART_DISK:
         case Type::WAIT_BLOBS_CLEANUP:
         case Type::CLEAR_DISK_METADATA_CACHE:
         {
+            /// RELOAD DICTIONARY prints its database/table target, RELOAD MODEL/FUNCTION their
+            /// identifier target; CONTENT ADDRESSED GARBAGE COLLECTION's disk is optional.
             if (table)
             {
                 ostr << ' ';
