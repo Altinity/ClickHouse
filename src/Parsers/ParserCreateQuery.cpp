@@ -973,7 +973,10 @@ bool ParserCreateTableQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expe
     if (to_inner_uuid)
     {
         if (!storage || !storage->engine || (storage->engine->name != "SharedSet" && storage->engine->name != "SharedJoin"))
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Storage engine {} does not inner UUID", storage->engine->name);
+        {
+            const String engine_name = (storage && storage->engine) ? storage->engine->name : "(no engine)";
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Storage engine {} does not support inner UUID", engine_name);
+        }
 
         if (targets)
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "targets are already defined {}", targets->formatForErrorMessage());
@@ -1706,6 +1709,10 @@ bool ParserCreateViewQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expec
     if (!sql_security)
         sql_security_p.parse(pos, sql_security, expected);
 
+    /// Accept COMMENT before AS SELECT for forward compatibility with newer versions
+    /// that may format views as: CREATE VIEW ... COMMENT 'text' AS SELECT ...
+    auto comment = parseComment(pos, expected);
+
     /// AS SELECT ...
     if (!s_as.ignore(pos, expected))
         return false;
@@ -1713,7 +1720,8 @@ bool ParserCreateViewQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expec
     if (!select_p.parse(pos, select, expected))
         return false;
 
-    auto comment = parseComment(pos, expected);
+    if (!comment)
+        comment = parseComment(pos, expected);
 
     auto query = std::make_shared<ASTCreateQuery>();
     node = query;

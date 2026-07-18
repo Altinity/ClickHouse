@@ -81,6 +81,7 @@ static struct InitFiu
     REGULAR(smt_outdated_parts_exception_response) \
     REGULAR(object_storage_queue_fail_in_the_middle_of_file) \
     PAUSEABLE_ONCE(replicated_merge_tree_insert_retry_pause) \
+    ONCE(replicated_merge_tree_restore_attach_retry) \
     PAUSEABLE_ONCE(finish_set_quorum_failed_parts) \
     PAUSEABLE_ONCE(finish_clean_quorum_failed_parts) \
     PAUSEABLE_ONCE(smt_wait_next_mutation) \
@@ -129,9 +130,11 @@ static struct InitFiu
     ONCE(database_iceberg_gcs) \
     REGULAR(rmt_delay_execute_drop_range) \
     REGULAR(rmt_delay_commit_part) \
+    REGULAR(patch_parts_reverse_column_order) \
     ONCE(smt_commit_exception_before_op) \
     ONCE(backup_add_empty_memory_table) \
-    REGULAR(refresh_task_stop_racing_for_running_refresh)
+    REGULAR(refresh_task_stop_racing_for_running_refresh) \
+    REGULAR(wide_part_writer_fail_in_add_streams)
 
 
 namespace FailPoints

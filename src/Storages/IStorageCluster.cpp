@@ -36,6 +36,7 @@
 #include <Analyzer/Utils.h>
 #include <Storages/StorageDistributed.h>
 #include <TableFunctions/TableFunctionFactory.h>
+#include <Poco/URI.h>
 
 #include <algorithm>
 #include <memory>
@@ -50,18 +51,18 @@ namespace Setting
     extern const SettingsBool async_query_sending_for_remote;
     extern const SettingsBool async_socket_for_remote;
     extern const SettingsBool skip_unavailable_shards;
-    extern const SettingsBool parallel_replicas_local_plan;
-    extern const SettingsString cluster_for_parallel_replicas;
     extern const SettingsNonZeroUInt64 max_parallel_replicas;
     extern const SettingsObjectStorageClusterJoinMode object_storage_cluster_join_mode;
     extern const SettingsUInt64 object_storage_max_nodes;
     extern const SettingsBool object_storage_remote_initiator;
+    extern const SettingsString object_storage_remote_initiator_cluster;
 }
 
 namespace ErrorCodes
 {
     extern const int LOGICAL_ERROR;
     extern const int NOT_IMPLEMENTED;
+    extern const int BAD_ARGUMENTS;
 }
 
 namespace ErrorCodes
@@ -310,9 +311,33 @@ void IStorageCluster::read(
     size_t num_streams)
 {
     auto cluster_name_from_settings = getClusterName(context);
+    const auto & settings = context->getSettingsRef();
+    ASTPtr query_to_send = query_info.query;
 
     if (cluster_name_from_settings.empty())
     {
+        if (settings[Setting::object_storage_remote_initiator])
+        {
+            /// rewrite query to execute `remote('remote_host', s3(...))`
+            /// remote_host can execute query itself or make on-cluster query depends on own `object_storage_cluster` setting
+            updateConfigurationIfNeeded(context);
+            updateQueryWithJoinToSendIfNeeded(query_to_send, query_info.query_tree, context);
+            updateQueryToSendIfNeeded(query_to_send, storage_snapshot, context, /*make_cluster_function*/ false);
+
+            auto remote_initiator_cluster_name = settings[Setting::object_storage_remote_initiator_cluster].value;
+            if (remote_initiator_cluster_name.empty())
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "Setting 'object_storage_remote_initiator' can be used only with 'object_storage_remote_initiator_cluster' or 'object_storage_cluster'");
+
+            auto remote_initiator_cluster = getClusterImpl(context, remote_initiator_cluster_name);
+            auto storage_and_context = convertToRemote(remote_initiator_cluster, context, remote_initiator_cluster_name, query_to_send);
+            auto src_distributed = std::dynamic_pointer_cast<StorageDistributed>(storage_and_context.storage);
+            auto modified_query_info = query_info;
+            modified_query_info.cluster = src_distributed->getCluster();
+            auto new_storage_snapshot = storage_and_context.storage->getStorageSnapshot(storage_snapshot->metadata, storage_and_context.context);
+            storage_and_context.storage->read(query_plan, column_names, new_storage_snapshot, modified_query_info, storage_and_context.context, processed_stage, max_block_size, num_streams);
+            return;
+        }
+
         readFallBackToPure(query_plan, column_names, storage_snapshot, query_info, context, processed_stage, max_block_size, num_streams);
         return;
     }
@@ -321,14 +346,9 @@ void IStorageCluster::read(
 
     storage_snapshot->check(column_names);
 
-    const auto & settings = context->getSettingsRef();
-
-    auto cluster = getClusterImpl(context, cluster_name_from_settings, settings[Setting::object_storage_max_nodes]);
-
     /// Calculate the header. This is significant, because some columns could be thrown away in some cases like query with count(*)
 
     SharedHeader sample_block;
-    ASTPtr query_to_send = query_info.query;
 
     updateQueryWithJoinToSendIfNeeded(query_to_send, query_info.query_tree, context);
 
@@ -343,11 +363,23 @@ void IStorageCluster::read(
         query_to_send = interpreter.getQueryInfo().query->clone();
     }
 
-    updateQueryToSendIfNeeded(query_to_send, storage_snapshot, context);
+    updateQueryToSendIfNeeded(query_to_send, storage_snapshot, context, /*make_cluster_function*/ true);
 
+    /// In case the current node is not supposed to initiate the clustered query
+    /// Sends this query to a remote initiator using the `remote` table function
     if (settings[Setting::object_storage_remote_initiator])
     {
-        auto storage_and_context = convertToRemote(cluster, context, cluster_name_from_settings, query_to_send);
+        /// Re-writes queries in the form of:
+        /// Input: SELECT * FROM iceberg(...) SETTINGS object_storage_cluster='swarm', object_storage_remote_initiator=1
+        /// Output: SELECT * FROM remote('remote_host', icebergCluster('swarm', ...)
+        /// Where `remote_host` is a random host from the cluster which will execute the query
+        /// This means the initiator node belongs to the same cluster that will execute the query
+        /// In case remote_initiator_cluster_name is set, the initiator might be set to a different cluster
+        auto remote_initiator_cluster_name = settings[Setting::object_storage_remote_initiator_cluster].value;
+        if (remote_initiator_cluster_name.empty())
+            remote_initiator_cluster_name = cluster_name_from_settings;
+        auto remote_initiator_cluster = getClusterImpl(context, remote_initiator_cluster_name);
+        auto storage_and_context = convertToRemote(remote_initiator_cluster, context, remote_initiator_cluster_name, query_to_send);
         auto src_distributed = std::dynamic_pointer_cast<StorageDistributed>(storage_and_context.storage);
         auto modified_query_info = query_info;
         modified_query_info.cluster = src_distributed->getCluster();
@@ -355,6 +387,8 @@ void IStorageCluster::read(
         storage_and_context.storage->read(query_plan, column_names, new_storage_snapshot, modified_query_info, storage_and_context.context, processed_stage, max_block_size, num_streams);
         return;
     }
+
+    auto cluster = getClusterImpl(context, cluster_name_from_settings, settings[Setting::object_storage_max_nodes]);
 
     RestoreQualifiedNamesVisitor::Data data;
     data.distributed_table = DatabaseAndTableWithAlias(*getTableExpression(query_to_send->as<ASTSelectQuery &>(), 0));
@@ -389,6 +423,10 @@ IStorageCluster::RemoteCallVariables IStorageCluster::convertToRemote(
     const std::string & cluster_name_from_settings,
     ASTPtr query_to_send)
 {
+    /// TODO: Allow to use secret for remote queries
+    if (!cluster->getSecret().empty())
+        throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Can't convert query to remote when cluster uses secret");
+
     auto host_addresses = cluster->getShardsAddresses();
     if (host_addresses.empty())
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Empty cluster {}", cluster_name_from_settings);
@@ -399,7 +437,8 @@ IStorageCluster::RemoteCallVariables IStorageCluster::convertToRemote(
     /// After getClusterImpl each shard must have exactly 1 replica
     if (shard_addresses.size() != 1)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Size of shard {} in cluster {} is not equal 1", shard_num, cluster_name_from_settings);
-    auto host_name = shard_addresses[0].toString();
+    std::string host_name;
+    Poco::URI::decode(shard_addresses[0].toString(), host_name);
 
     LOG_INFO(log, "Choose remote initiator '{}'", host_name);
 
@@ -408,7 +447,8 @@ IStorageCluster::RemoteCallVariables IStorageCluster::convertToRemote(
 
     /// Clean object_storage_remote_initiator setting to avoid infinite remote call
     auto new_context = Context::createCopy(context);
-    new_context->setSetting("object_storage_remote_initiator", false);
+    std::vector<std::string> settings_to_remove = {"object_storage_remote_initiator", "object_storage_remote_initiator_cluster"};
+    new_context->resetSettingsToDefaultValue(settings_to_remove);
 
     auto * select_query = query_to_send->as<ASTSelectQuery>();
     if (!select_query)
@@ -418,17 +458,33 @@ IStorageCluster::RemoteCallVariables IStorageCluster::convertToRemote(
     if (query_settings)
     {
         auto & settings_ast = query_settings->as<ASTSetQuery &>();
-        if (settings_ast.changes.removeSetting("object_storage_remote_initiator") && settings_ast.changes.empty())
-        {
+        bool settings_changed = false;
+        for (const auto & setting_to_remove : settings_to_remove)
+            settings_changed |= settings_ast.changes.removeSetting(setting_to_remove);
+        if (settings_changed && settings_ast.changes.empty())
             select_query->setExpression(ASTSelectQuery::Expression::SETTINGS, {});
-        }
     }
 
     ASTTableExpression * table_expression = extractTableExpressionASTPtrFromSelectQuery(query_to_send);
     if (!table_expression)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "Can't find table expression");
+    if (!table_expression->table_function)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Can't find table function in table expression");
 
-    auto remote_query = makeASTFunction(remote_function_name, std::make_shared<ASTLiteral>(host_name), table_expression->table_function);
+    std::shared_ptr<ASTFunction> remote_query;
+
+    if (shard_addresses[0].user_specified)
+    { // with user/password for clsuter access remote query is executed from this user, add it in query parameters
+        remote_query = makeASTFunction(remote_function_name,
+            std::make_shared<ASTLiteral>(host_name),
+            table_expression->table_function,
+            std::make_shared<ASTLiteral>(shard_addresses[0].user),
+            std::make_shared<ASTLiteral>(shard_addresses[0].password));
+    }
+    else
+    { // without specified user/password remote query is executed from default user
+        remote_query = makeASTFunction(remote_function_name, std::make_shared<ASTLiteral>(host_name), table_expression->table_function);
+    }
 
     table_expression->table_function = remote_query;
 
@@ -499,7 +555,8 @@ void ReadFromCluster::initializePipeline(QueryPipelineBuilder & pipeline, const 
             Tables(),
             processed_stage,
             nullptr,
-            RemoteQueryExecutor::Extension{.task_iterator = extension->task_iterator, .replica_info = std::move(replica_info)});
+            RemoteQueryExecutor::Extension{.task_iterator = extension->task_iterator, .replica_info = std::move(replica_info)},
+            shard_info.pool);
 
         remote_query_executor->setLogger(log);
         Pipe pipe{std::make_shared<RemoteSource>(

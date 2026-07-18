@@ -217,8 +217,10 @@ void SerializationObject::enumerateStreams(EnumerateStreamsSettings & settings, 
             {
                 shared_data_serialization_version = SerializationObjectSharedData::SerializationVersion(settings.object_shared_data_serialization_version);
                 /// Avoid creating buckets in shared data for Wide part if shared data is empty.
-                if (settings.data_part_type != MergeTreeDataPartType::Wide || !column_object->getStatistics() || !column_object->getStatistics()->shared_data_paths_statistics.empty())
+                if (settings.data_part_type != MergeTreeDataPartType::Wide || !column_object->getStatistics()
+                    || !column_object->getStatistics()->shared_data_paths_statistics.empty())
                     num_buckets = settings.object_shared_data_buckets;
+
             }
 
             shared_data_serialization = std::make_shared<SerializationObjectSharedData>(shared_data_serialization_version, dynamic_type, num_buckets);
@@ -569,6 +571,16 @@ void SerializationObject::deserializeBinaryBulkStatePrefix(
         };
 
         size_t task_size = std::max(structure_state_concrete->sorted_dynamic_paths->size() / num_tasks, 1ul);
+
+        /// Ensure all already-scheduled tasks are drained on any exit path (including exceptions),
+        /// so pool threads do not dereference dangling references to stack locals.
+        SCOPE_EXIT(
+            for (const auto & task : tasks)
+                task->tryExecute();
+            for (const auto & task : tasks)
+                task->wait();
+        );
+
         for (size_t i = 0; i != num_tasks; ++i)
         {
             auto cache_copy = cache ? std::make_unique<SubstreamsDeserializeStatesCache>(*cache) : nullptr;

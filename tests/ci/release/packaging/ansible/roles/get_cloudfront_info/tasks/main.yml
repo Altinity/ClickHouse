@@ -14,7 +14,7 @@
 
 - name: Decide on the target (blue/green)
   set_fact:
-    new_cloudfront_origin_path: "{{ '/Green' if cloudfront_origin_path == '/Blue' else '/Blue' }}"
+    new_cloudfront_origin_path: "{{ 'Green' if cloudfront_origin_path == 'Blue' else 'Blue' }}"
   when: 'not (push_to_active|default(false))'
 
 - name: Update the active site, when push_to_active is defined
@@ -24,7 +24,7 @@
 
 - name: Calculate the target S3 path
   set_fact:
-    s3_repo_target_path: "s3://{{ repo_dns_name }}{{ new_cloudfront_origin_path }}"
+    s3_repo_target_path: "s3://{{ repo_dns_name }}/{{ new_cloudfront_origin_path }}"
 
 - name: Show the source S3 path
   debug:

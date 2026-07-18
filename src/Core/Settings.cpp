@@ -2363,7 +2363,6 @@ Possible values:
 
 - 0 for turning off the timer.
 
-**Temporarily disabled in ClickHouse Cloud.**
 
 See also:
 
@@ -2383,7 +2382,6 @@ Possible values:
 
 - 0 for turning off the timer.
 
-**Temporarily disabled in ClickHouse Cloud.**
 
 See also:
 
@@ -5702,7 +5700,7 @@ Whether to use only prewhere columns size to determine reading task size.
 Hard lower limit on the task size (even when the number of granules is low and the number of available threads is high we won't allocate smaller tasks
 )", 0) \
     DECLARE(UInt64, merge_tree_compact_parts_min_granules_to_multibuffer_read, 16, R"(
-Only has an effect in ClickHouse Cloud. Number of granules in stripe of compact part of MergeTree tables to use multibuffer reader, which supports parallel reading and prefetch. In case of reading from remote fs using of multibuffer reader increases number of read request.
+Number of granules in stripe of compact part of MergeTree tables to use multibuffer reader, which supports parallel reading and prefetch. In case of reading from remote fs using of multibuffer reader increases number of read request.
 )", 0) \
     \
     DECLARE(Bool, async_insert, false, R"(
@@ -5915,9 +5913,6 @@ This setting takes a ClickHouse version number as a string, like `22.3`, `22.8`.
 
 Disabled by default.
 
-:::note
-In ClickHouse Cloud the compatibility setting must be set by ClickHouse Cloud support.  Please [open a case](https://clickhouse.cloud/support) to have it set.
-:::
 )", 0) \
     \
     DECLARE(Map, additional_table_filters, "", R"(
@@ -6016,79 +6011,79 @@ If reading `sample.csv` is successful, file will be renamed to `processed_sample
     \
     /* CLOUD ONLY */ \
     DECLARE(Bool, read_through_distributed_cache, false, R"(
-Only has an effect in ClickHouse Cloud. Allow reading from distributed cache
+Allow reading from distributed cache
 )", 0) \
     DECLARE(Bool, write_through_distributed_cache, false, R"(
-Only has an effect in ClickHouse Cloud. Allow writing to distributed cache (writing to s3 will also be done by distributed cache)
+Allow writing to distributed cache (writing to s3 will also be done by distributed cache)
 )", 0) \
     DECLARE(Bool, distributed_cache_throw_on_error, false, R"(
-Only has an effect in ClickHouse Cloud. Rethrow exception happened during communication with distributed cache or exception received from distributed cache. Otherwise fallback to skipping distributed cache on error
+Rethrow exception happened during communication with distributed cache or exception received from distributed cache. Otherwise fallback to skipping distributed cache on error
 )", 0) \
     DECLARE(DistributedCacheLogMode, distributed_cache_log_mode, DistributedCacheLogMode::LOG_ON_ERROR, R"(
-Only has an effect in ClickHouse Cloud. Mode for writing to system.distributed_cache_log
+Mode for writing to system.distributed_cache_log
 )", 0) \
     DECLARE(Bool, distributed_cache_fetch_metrics_only_from_current_az, true, R"(
-Only has an effect in ClickHouse Cloud. Fetch metrics only from current availability zone in system.distributed_cache_metrics, system.distributed_cache_events
+Fetch metrics only from current availability zone in system.distributed_cache_metrics, system.distributed_cache_events
 )", 0) \
     DECLARE(UInt64, distributed_cache_connect_max_tries, default_distributed_cache_connect_max_tries, R"(
-Only has an effect in ClickHouse Cloud. Number of tries to connect to distributed cache if unsuccessful
+Number of tries to connect to distributed cache if unsuccessful
 )", 0) \
     DECLARE(UInt64, distributed_cache_read_request_max_tries, default_distributed_cache_read_request_max_tries, R"(
-Only has an effect in ClickHouse Cloud. Number of tries to do distributed cache request if unsuccessful
+Number of tries to do distributed cache request if unsuccessful
 )", 0) \
     DECLARE(UInt64, distributed_cache_receive_response_wait_milliseconds, 60000, R"(
-Only has an effect in ClickHouse Cloud. Wait time in milliseconds to receive data for request from distributed cache
+Wait time in milliseconds to receive data for request from distributed cache
 )", 0) \
     DECLARE(UInt64, distributed_cache_receive_timeout_milliseconds, 10000, R"(
-Only has an effect in ClickHouse Cloud. Wait time in milliseconds to receive any kind of response from distributed cache
+Wait time in milliseconds to receive any kind of response from distributed cache
 )", 0) \
     DECLARE(UInt64, distributed_cache_wait_connection_from_pool_milliseconds, 100, R"(
-Only has an effect in ClickHouse Cloud. Wait time in milliseconds to receive connection from connection pool if distributed_cache_pool_behaviour_on_limit is wait
+Wait time in milliseconds to receive connection from connection pool if distributed_cache_pool_behaviour_on_limit is wait
 )", 0) \
     DECLARE(Bool, distributed_cache_bypass_connection_pool, false, R"(
-Only has an effect in ClickHouse Cloud. Allow to bypass distributed cache connection pool
+Allow to bypass distributed cache connection pool
 )", 0) \
     DECLARE(DistributedCachePoolBehaviourOnLimit, distributed_cache_pool_behaviour_on_limit, DistributedCachePoolBehaviourOnLimit::WAIT, R"(
-Only has an effect in ClickHouse Cloud. Identifies behaviour of distributed cache connection on pool limit reached
+Identifies behaviour of distributed cache connection on pool limit reached
 )", 0) \
     DECLARE(UInt64, distributed_cache_alignment, 0, R"(
-Only has an effect in ClickHouse Cloud. A setting for testing purposes, do not change it
+A setting for testing purposes, do not change it
 )", 0) \
     DECLARE(UInt64, distributed_cache_max_unacked_inflight_packets, DistributedCache::MAX_UNACKED_INFLIGHT_PACKETS, R"(
-Only has an effect in ClickHouse Cloud. A maximum number of unacknowledged in-flight packets in a single distributed cache read request
+A maximum number of unacknowledged in-flight packets in a single distributed cache read request
 )", 0) \
     DECLARE(UInt64, distributed_cache_data_packet_ack_window, DistributedCache::ACK_DATA_PACKET_WINDOW, R"(
-Only has an effect in ClickHouse Cloud. A window for sending ACK for DataPacket sequence in a single distributed cache read request
+A window for sending ACK for DataPacket sequence in a single distributed cache read request
 )", 0) \
     DECLARE(Bool, distributed_cache_discard_connection_if_unread_data, true, R"(
-Only has an effect in ClickHouse Cloud. Discard connection if some data is unread.
+Discard connection if some data is unread.
 )", 0) \
     DECLARE(UInt64, distributed_cache_min_bytes_for_seek, 0, R"(
-Only has an effect in ClickHouse Cloud. Minimum number of bytes to do seek in distributed cache.
+Minimum number of bytes to do seek in distributed cache.
 )", 0) \
     DECLARE(UInt64, distributed_cache_credentials_refresh_period_seconds, default_distributed_cache_credentials_refresh_period_seconds, R"(
-Only has an effect in ClickHouse Cloud. A period of credentials refresh.
+A period of credentials refresh.
 )", 0) \
     DECLARE(Bool, distributed_cache_read_only_from_current_az, true, R"(
-Only has an effect in ClickHouse Cloud. Allow to read only from current availability zone. If disabled, will read from all cache servers in all availability zones.
+Allow to read only from current availability zone. If disabled, will read from all cache servers in all availability zones.
 )", 0) \
     DECLARE(UInt64, write_through_distributed_cache_buffer_size, 0, R"(
-Only has an effect in ClickHouse Cloud. Set buffer size for write-through distributed cache. If 0, will use buffer size which would have been used if there was not distributed cache.
+Set buffer size for write-through distributed cache. If 0, will use buffer size which would have been used if there was not distributed cache.
 )", 0) \
     DECLARE(Bool, table_engine_read_through_distributed_cache, false, R"(
-Only has an effect in ClickHouse Cloud. Allow reading from distributed cache via table engines / table functions (s3, azure, etc)
+Allow reading from distributed cache via table engines / table functions (s3, azure, etc)
 )", 0) \
     DECLARE(UInt64, distributed_cache_connect_backoff_min_ms, default_distributed_cache_connect_backoff_min_ms, R"(
-Only has an effect in ClickHouse Cloud. Minimum backoff milliseconds for distributed cache connection creation.
+Minimum backoff milliseconds for distributed cache connection creation.
 )", 0) \
     DECLARE(UInt64, distributed_cache_connect_backoff_max_ms, default_distributed_cache_connect_backoff_max_ms, R"(
-Only has an effect in ClickHouse Cloud. Maximum backoff milliseconds for distributed cache connection creation.
+Maximum backoff milliseconds for distributed cache connection creation.
 )", 0) \
     DECLARE(Bool, filesystem_cache_enable_background_download_for_metadata_files_in_packed_storage, true, R"(
-Only has an effect in ClickHouse Cloud. Wait time to lock cache for space reservation in filesystem cache
+Wait time to lock cache for space reservation in filesystem cache
 )", 0) \
     DECLARE(Bool, filesystem_cache_enable_background_download_during_fetch, true, R"(
-Only has an effect in ClickHouse Cloud. Wait time to lock cache for space reservation in filesystem cache
+Wait time to lock cache for space reservation in filesystem cache
 )", 0) \
     \
     DECLARE(Bool, parallelize_output_from_storages, true, R"(
@@ -6470,12 +6465,12 @@ Allows to set default `DEFINER` option while creating a view. [More about SQL se
 The default value is `CURRENT_USER`.
 )", 0) \
     DECLARE(UInt64, cache_warmer_threads, 4, R"(
-Only has an effect in ClickHouse Cloud. Number of background threads for speculatively downloading new data parts into file cache, when [cache_populated_by_fetch](merge-tree-settings.md/#cache_populated_by_fetch) is enabled. Zero to disable.
+Number of background threads for speculatively downloading new data parts into file cache, when [cache_populated_by_fetch](merge-tree-settings.md/#cache_populated_by_fetch) is enabled. Zero to disable.
 )", 0) \
     DECLARE(Bool, use_async_executor_for_materialized_views, false, R"(
 Use async and potentially multithreaded execution of materialized view query, can speedup views processing during INSERT, but also consume more memory.)", 0) \
     DECLARE(Int64, ignore_cold_parts_seconds, 0, R"(
-Only has an effect in ClickHouse Cloud. Exclude new data parts from SELECT queries until they're either pre-warmed (see [cache_populated_by_fetch](merge-tree-settings.md/#cache_populated_by_fetch)) or this many seconds old. Only for Replicated-/SharedMergeTree.
+Exclude new data parts from SELECT queries until they're either pre-warmed (see [cache_populated_by_fetch](merge-tree-settings.md/#cache_populated_by_fetch)) or this many seconds old. Only for Replicated-/SharedMergeTree.
 )", 0) \
     DECLARE(Bool, short_circuit_function_evaluation_for_nulls, true, R"(
 Optimizes evaluation of functions that return NULL when any argument is NULL. When the percentage of NULL values in the function's arguments exceeds the short_circuit_function_evaluation_for_nulls_threshold, the system skips evaluating the function row-by-row. Instead, it immediately returns NULL for all rows, avoiding unnecessary computation.
@@ -6485,7 +6480,7 @@ Ratio threshold of NULL values to execute functions with Nullable arguments only
 When the ratio of rows containing NULL values to the total number of rows exceeds this threshold, these rows containing NULL values will not be evaluated.
 )", 0) \
     DECLARE(Int64, prefer_warmed_unmerged_parts_seconds, 0, R"(
-Only has an effect in ClickHouse Cloud. If a merged part is less than this many seconds old and is not pre-warmed (see [cache_populated_by_fetch](merge-tree-settings.md/#cache_populated_by_fetch)), but all its source parts are available and pre-warmed, SELECT queries will read from those parts instead. Only for Replicated-/SharedMergeTree. Note that this only checks whether CacheWarmer processed the part; if the part was fetched into cache by something else, it'll still be considered cold until CacheWarmer gets to it; if it was warmed, then evicted from cache, it'll still be considered warm.
+If a merged part is less than this many seconds old and is not pre-warmed (see [cache_populated_by_fetch](merge-tree-settings.md/#cache_populated_by_fetch)), but all its source parts are available and pre-warmed, SELECT queries will read from those parts instead. Only for Replicated-/SharedMergeTree. Note that this only checks whether CacheWarmer processed the part; if the part was fetched into cache by something else, it'll still be considered cold until CacheWarmer gets to it; if it was warmed, then evicted from cache, it'll still be considered warm.
 )", 0) \
     DECLARE(Int64, iceberg_timestamp_ms, 0, R"(
 Query Iceberg table using the snapshot that was current at a specific timestamp.
@@ -7156,6 +7151,9 @@ Allow Iceberg read optimization based on Iceberg metadata.
 )", EXPERIMENTAL) \
     DECLARE(Bool, object_storage_remote_initiator, false, R"(
 Execute request to object storage as remote on one of object_storage_cluster nodes.
+)", EXPERIMENTAL) \
+    DECLARE(String, object_storage_remote_initiator_cluster, "", R"(
+Cluster to choose remote initiator, when `object_storage_remote_initiator` is true. When empty, `object_storage_cluster` is used.
 )", EXPERIMENTAL) \
     \
     /** Experimental timeSeries* aggregate functions. */ \

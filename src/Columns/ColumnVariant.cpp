@@ -203,6 +203,8 @@ ColumnVariant::ColumnVariant(DB::MutableColumnPtr local_discriminators_, DB::Mut
             global_to_local_discriminators[local_to_global_discriminators[i]] = i;
         }
     }
+
+    validateState();
 }
 
 namespace
@@ -915,7 +917,10 @@ ColumnPtr ColumnVariant::filter(const Filter & filt, ssize_t result_size_hint) c
     /// If we have only NULLs, just filter local_discriminators column.
     if (hasOnlyNulls())
     {
-        Columns new_variants(variants.begin(), variants.end());
+        Columns new_variants;
+        new_variants.reserve(variants.size());
+        for (const auto & variant : variants)
+            new_variants.emplace_back(variant->cloneEmpty());
         auto new_discriminators = local_discriminators->filter(filt, result_size_hint);
         /// In case of all NULL values offsets doesn't contain any useful values, just resize it.
         ColumnPtr new_offsets = offsets->cloneResized(new_discriminators->size());
@@ -1757,6 +1762,36 @@ void ColumnVariant::fixDynamicStructure()
 {
     for (auto & variant : variants)
         variant->fixDynamicStructure();
+}
+
+void ColumnVariant::validateState() const
+{
+    const auto & local_discriminators_data = getLocalDiscriminators();
+    const auto & offsets_data = getOffsets();
+    if (local_discriminators_data.size() != offsets_data.size())
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "Size of discriminators and offsets should be equal, but {} and {} were given", local_discriminators_data.size(), offsets_data.size());
+
+    std::vector<size_t> actual_variant_sizes(variants.size());
+    for (size_t i = 0; i != variants.size(); ++i)
+        actual_variant_sizes[i] = variants[i]->size();
+
+    std::vector<size_t> expected_variant_sizes(variants.size(), 0);
+    for (size_t i = 0; i != local_discriminators_data.size(); ++i)
+    {
+        auto local_discr = local_discriminators_data[i];
+        if (local_discr != NULL_DISCRIMINATOR)
+        {
+            ++expected_variant_sizes[local_discr];
+            if (offsets_data[i] >= actual_variant_sizes[local_discr])
+                throw Exception(ErrorCodes::LOGICAL_ERROR, "Offset at position {} is {}, but variant {} ({}) has size {}", i, offsets_data[i], static_cast<UInt32>(local_discr), variants[local_discr]->getName(), variants[local_discr]->size());
+        }
+    }
+
+    for (size_t i = 0; i != variants.size(); ++i)
+    {
+        if (variants[i]->size() != expected_variant_sizes[i])
+            throw Exception(ErrorCodes::LOGICAL_ERROR, "Variant {} ({}) has size {}, but expected {}", i, variants[i]->getName(), variants[i]->size(), expected_variant_sizes[i]);
+    }
 }
 
 

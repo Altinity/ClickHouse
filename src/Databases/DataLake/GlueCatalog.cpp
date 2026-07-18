@@ -167,6 +167,7 @@ GlueCatalog::GlueCatalog(
         credentials_provider = std::make_shared<DB::S3::AwsAuthSTSAssumeRoleCredentialsProvider>(
             creds_config.role_arn,
             creds_config.role_session_name,
+            creds_config.external_id,
             creds_config.expiration_window_seconds,
             std::move(credentials_provider),
             poco_config,

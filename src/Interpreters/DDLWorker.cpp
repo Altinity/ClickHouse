@@ -2,13 +2,13 @@
 #include <Core/ServerSettings.h>
 #include <Core/ServerUUID.h>
 #include <Core/Settings.h>
+#include <Databases/DatabaseReplicated.h>
 #include <IO/NullWriteBuffer.h>
 #include <IO/ReadBufferFromString.h>
 #include <IO/ReadHelpers.h>
 #include <IO/WriteHelpers.h>
 #include <Interpreters/Cluster.h>
 #include <Interpreters/Context.h>
-#include <Interpreters/DDLTask.h>
 #include <Interpreters/DDLWorker.h>
 #include <Interpreters/DatabaseCatalog.h>
 #include <Interpreters/ZooKeeperLog.h>
@@ -188,6 +188,26 @@ ZooKeeperPtr DDLWorker::getAndSetZooKeeper()
     return current_zookeeper;
 }
 
+void DDLWorker::notifyHostIDsUpdated()
+{
+    LOG_INFO(log, "Host IDs updated");
+    host_ids_updated = true;
+}
+
+void DDLWorker::updateHostIDs(const std::vector<HostID> & hosts)
+{
+    std::lock_guard lock{checked_host_id_set_mutex};
+    for (const auto & host : hosts)
+    {
+        if (!checked_host_id_set.contains(host.toString()))
+        {
+            LOG_INFO(log, "Found new host ID: {}", host.toString());
+            notifyHostIDsUpdated();
+            return;
+        }
+    }
+}
+
 
 DDLTaskPtr DDLWorker::initAndCheckTask(const String & entry_name, String & out_reason, const ZooKeeperPtr & zookeeper, bool /*dry_run*/)
 {
@@ -223,6 +243,7 @@ DDLTaskPtr DDLWorker::initAndCheckTask(const String & entry_name, String & out_r
     {
         /// Stage 1: parse entry
         task->entry.parse(node_data);
+        updateHostIDs(task->entry.hosts);
     }
     catch (...)
     {
@@ -1203,18 +1224,24 @@ void DDLWorker::runMainThread()
             bool reinitialized = !initialized;
 
             /// Reinitialize DDLWorker state (including ZooKeeper connection) if required
-            if (!initialized)
+            if (reinitialized)
             {
                 /// Stopped
                 if (!initializeMainThread())
                     break;
+
                 LOG_DEBUG(log, "Initialized DDLWorker thread");
             }
+
+            if (host_ids_updated.exchange(false))
+                markReplicasActive(/*reinitialized=*/false, /*should_create_dirs=*/true);
 
             cleanup_event->set();
             try
             {
-                markReplicasActive(reinitialized);
+                /// On per-tick invocations (i.e. not reinitialized), do NOT recreate
+                /// the host_id dirs - that races with external recursive cleanup.
+                markReplicasActive(reinitialized, /*should_create_dirs=*/reinitialized);
             }
             catch (...)
             {
@@ -1277,28 +1304,19 @@ void DDLWorker::runMainThread()
 void DDLWorker::initializeReplication()
 {
     auto zookeeper = getZooKeeper();
-
     zookeeper->createAncestors(fs::path(replicas_dir) / "");
-
-    NameSet host_id_set;
-    for (const auto & it : context->getClusters())
-    {
-        auto cluster = it.second;
-        for (const auto & host_ids : cluster->getHostIDs())
-            for (const auto & host_id : host_ids)
-                host_id_set.emplace(host_id);
-    }
-
-    createReplicaDirs(zookeeper, host_id_set);
 }
 
 void DDLWorker::createReplicaDirs(const ZooKeeperPtr & zookeeper, const NameSet & host_ids)
 {
     for (const auto & host_id : host_ids)
+    {
+        LOG_INFO(log, "Creating replica dir for host id {}", host_id);
         zookeeper->createAncestors(fs::path(replicas_dir) / host_id / "");
+    }
 }
 
-void DDLWorker::markReplicasActive(bool reinitialized)
+void DDLWorker::markReplicasActive(bool reinitialized, bool should_create_dirs)
 {
     auto zookeeper = getZooKeeper();
 
@@ -1319,20 +1337,90 @@ void DDLWorker::markReplicasActive(bool reinitialized)
     const auto maybe_secure_port = context->getTCPPortSecure();
     const auto port = context->getTCPPort();
 
+    auto all_host_ids = getAllHostIDsFromClusters();
+
+    // Add interserver IO host IDs for Replicated DBs
+    try
+    {
+        auto host_port = context->getInterserverIOAddress();
+        HostID interserver_io_host_id = {host_port.first, port};
+        all_host_ids.emplace(interserver_io_host_id.toString());
+        LOG_INFO(log, "Add interserver IO host ID {}", interserver_io_host_id.toString());
+        if (maybe_secure_port)
+        {
+            HostID interserver_io_secure_host_id = {host_port.first, *maybe_secure_port};
+            all_host_ids.emplace(interserver_io_secure_host_id.toString());
+            LOG_INFO(log, "Add interserver IO secure host ID  {}", interserver_io_secure_host_id.toString());
+        }
+    }
+    catch (const Exception & e)
+    {
+        LOG_INFO(log, "Unable to get interserver IO address, error {}", e.what());
+    }
+
+    /// Only (re)create the host_id dirs on real events (initialization, reconnect,
+    /// or a freshly-observed host ID). Doing it on every main-loop tick races
+    /// against external recursive cleanup of /clickhouse and breaks
+    /// test_replication_without_zookeeper::test_startup_without_zookeeper.
+    /// See Altinity/ClickHouse#1711.
+    if (should_create_dirs)
+        createReplicaDirs(zookeeper, all_host_ids);
+
+    if (reinitialized)
+    {
+        // Reset all active_node_holders
+        for (auto & it : active_node_holders)
+        {
+            auto & active_node_holder = it.second.second;
+            if (active_node_holder)
+                active_node_holder->setAlreadyRemoved();
+            active_node_holder.reset();
+        }
+        active_node_holders.clear();
+    }
+
+
     Coordination::Stat replicas_stat;
     Strings host_ids = zookeeper->getChildren(replicas_dir, &replicas_stat);
     NameSet local_host_ids;
+    NameSet checking_host_ids;
+    checking_host_ids.reserve(host_ids.size());
     for (const auto & host_id : host_ids)
     {
+        bool is_self_host = false;
         try
         {
             HostID host = HostID::fromString(host_id);
-            if (DDLTask::isSelfHostID(log, host, maybe_secure_port, port))
-                local_host_ids.emplace(host_id);
+            checking_host_ids.insert(host.toString());
+
+            is_self_host = DDLTask::isSelfHostID(log, host, maybe_secure_port, port);
         }
         catch (const Exception & e)
         {
             LOG_WARNING(log, "Unable to check if host {} is a local address, exception: {}", host_id, e.displayText());
+            continue;
+        }
+
+        LOG_INFO(log, "Self host_id ({}) = {}", host_id, is_self_host);
+        if (is_self_host)
+        {
+            local_host_ids.emplace(host_id);
+            continue;
+        }
+
+        if (!reinitialized)
+        {
+            /// Remove this host_id from active_node_holders
+            auto it = active_node_holders.find(host_id);
+            if (it != active_node_holders.end())
+            {
+                auto & active_node_holder = it->second.second;
+                if (active_node_holder)
+                    active_node_holder->setAlreadyRemoved();
+                active_node_holder.reset();
+
+                active_node_holders.erase(it);
+            }
             continue;
         }
     }
@@ -1377,17 +1465,9 @@ void DDLWorker::markReplicasActive(bool reinitialized)
         active_node_holders[host_id] = {active_node_holder_zookeeper, active_node_holder};
     }
 
-    if (active_node_holders.empty())
     {
-        for (const auto & it : context->getClusters())
-        {
-            const auto & cluster = it.second;
-            if (!cluster->getHostIDs().empty())
-            {
-                LOG_WARNING(log, "There are clusters with host ids but no local host found for this replica.");
-                break;
-            }
-        }
+        std::lock_guard lock{checked_host_id_set_mutex};
+        checked_host_id_set = checking_host_ids;
     }
 }
 
@@ -1454,4 +1534,16 @@ void DDLWorker::runCleanupThread()
     }
 }
 
+NameSet DDLWorker::getAllHostIDsFromClusters() const
+{
+    NameSet host_id_set;
+    for (const auto & it : context->getClusters())
+    {
+        auto cluster = it.second;
+        for (const auto & host_ids : cluster->getHostIDs())
+            for (const auto & host_id : host_ids)
+                host_id_set.emplace(host_id);
+    }
+    return host_id_set;
+}
 }

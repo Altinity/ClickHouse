@@ -26,6 +26,8 @@
 #include <Poco/Util/XMLConfiguration.h>
 #include <Poco/DOM/DOMParser.h>
 
+#include <filesystem>
+
 
 namespace ProfileEvents
 {
@@ -54,13 +56,17 @@ namespace ErrorCodes
     extern const int CANNOT_RESTORE_TO_NONENCRYPTED_DISK;
     extern const int FAILED_TO_SYNC_BACKUP_OR_RESTORE;
     extern const int LOGICAL_ERROR;
+    extern const int INSECURE_PATH;
 }
+
+namespace fs = std::filesystem;
 
 namespace
 {
     const int INITIAL_BACKUP_VERSION = 1;
     /// We may use lightweight backup in version 2.
     const int CURRENT_BACKUP_VERSION = 2;
+    constexpr auto BASE_BACKUP_COPY_S3_CREDENTIALS_FROM_BACKUP = "base_backup_copy_s3_credentials_from_backup";
 
     using SizeAndChecksum = IBackup::SizeAndChecksum;
 
@@ -88,6 +94,43 @@ namespace
         if (path.starts_with('/'))
             return path.substr(1);
         return path;
+    }
+
+    /// Validate that a file name from a backup does not contain path traversal sequences.
+    /// This prevents a corrupted or tampered backup from accessing files outside the intended directories during restore.
+    void validateFileNameFromBackup(const String & file_name, const String & field_name, const String & backup_name_for_logging)
+    {
+        fs::path path(file_name);
+
+        /// Reject absolute or rooted paths.
+        if (path.is_absolute() || path.has_root_name() || path.has_root_directory())
+            throw Exception(
+                ErrorCodes::INSECURE_PATH,
+                "Backup {}: <{}> {} is an absolute path, which is not allowed",
+                backup_name_for_logging,
+                field_name,
+                quoteString(file_name));
+
+        /// Normalize the path and check that it does not escape the backup root.
+        auto normalized = path.lexically_normal();
+
+        /// Reject empty or degenerate paths.
+        if (normalized.empty() || normalized == fs::path("."))
+            throw Exception(
+                ErrorCodes::BACKUP_DAMAGED,
+                "Backup {}: <{}> {} is empty or invalid",
+                backup_name_for_logging,
+                field_name,
+                quoteString(file_name));
+
+        /// After normalization, a path that escapes the root starts with "..".
+        if (*normalized.begin() == "..")
+            throw Exception(
+                ErrorCodes::INSECURE_PATH,
+                "Backup {}: <{}> {} resolves to a path outside the backup, which is not allowed",
+                backup_name_for_logging,
+                field_name,
+                quoteString(file_name));
     }
 }
 
@@ -265,10 +308,21 @@ std::shared_ptr<const IBackup> BackupImpl::getBaseBackupUnlocked() const
 {
     if (!base_backup && base_backup_info)
     {
+        /// Copy the credentials into a local copy only used for opening the base backup.
+        /// The stored `base_backup_info` must stay unchanged because `writeBackupMetadata`
+        /// serializes it into the `.backup` file, and the copied credentials must not be persisted there.
+        BackupInfo effective_base_backup_info = *base_backup_info;
         if (params.use_same_s3_credentials_for_base_backup)
-            backup_info.copyS3CredentialsTo(*base_backup_info);
+        {
+            backup_info.copyS3CredentialsTo(effective_base_backup_info);
+        }
+        else if (base_backup_copy_s3_credentials_from_backup && backup_info.canCopyS3CredentialsTo(effective_base_backup_info))
+        {
+            /// Metadata marker asks to copy credentials from this backup locator at restore time.
+            backup_info.copyS3CredentialsTo(effective_base_backup_info);
+        }
 
-        BackupFactory::CreateParams base_params = params.getCreateParamsForBaseBackup(*base_backup_info, archive_params.password);
+        BackupFactory::CreateParams base_params = params.getCreateParamsForBaseBackup(std::move(effective_base_backup_info), archive_params.password);
         base_backup = BackupFactory::instance().createBackup(base_params);
 
         if ((open_mode == OpenMode::READ) && (base_backup_uuid != base_backup->getUUID()))
@@ -371,8 +425,27 @@ void BackupImpl::writeBackupMetadata()
 
         if (base_backup_in_use)
         {
-            *out << "<base_backup>" << xml << base_backup_info->toString() << "</base_backup>";
+            /// Persist base backup locators without inline `S3` credentials.
+            BackupInfo effective_base_backup_info = *base_backup_info;
+            if (params.use_same_s3_credentials_for_base_backup)
+                backup_info.copyS3CredentialsTo(effective_base_backup_info);
+
+            const BackupInfo base_backup_info_for_metadata = effective_base_backup_info.withoutS3Credentials(params.context);
+            const bool base_backup_credentials_were_stripped = base_backup_info_for_metadata.toString() != effective_base_backup_info.toString();
+            bool base_backup_can_use_this_backup_credentials = false;
+
+            if (base_backup_credentials_were_stripped && backup_info.canCopyS3CredentialsTo(base_backup_info_for_metadata))
+            {
+                BackupInfo base_backup_info_with_this_backup_credentials = base_backup_info_for_metadata;
+                backup_info.copyS3CredentialsTo(base_backup_info_with_this_backup_credentials);
+                base_backup_can_use_this_backup_credentials = base_backup_info_with_this_backup_credentials.toString() == effective_base_backup_info.toString();
+            }
+
+            *out << "<base_backup>" << xml << base_backup_info_for_metadata.toString() << "</base_backup>";
             *out << "<base_backup_uuid>" << getBaseBackupUnlocked()->getUUID() << "</base_backup_uuid>";
+            if (base_backup_can_use_this_backup_credentials)
+                *out << "<" << BASE_BACKUP_COPY_S3_CREDENTIALS_FROM_BACKUP << ">true</"
+                     << BASE_BACKUP_COPY_S3_CREDENTIALS_FROM_BACKUP << ">";
         }
     }
 
@@ -478,7 +551,13 @@ void BackupImpl::readBackupMetadata()
     uuid = parse<UUID>(getString(config_root, "uuid"));
 
     if (config_root->getNodeByPath("base_backup") && !base_backup_info)
+    {
         base_backup_info = BackupInfo::fromString(getString(config_root, "base_backup"));
+
+        /// The marker is honored only when the base backup locator itself comes from the metadata:
+        /// if the locator was overridden with the `base_backup` setting, the override is used as is.
+        base_backup_copy_s3_credentials_from_backup = getBool(config_root, BASE_BACKUP_COPY_S3_CREDENTIALS_FROM_BACKUP, false);
+    }
 
     if (config_root->getNodeByPath("base_backup_uuid"))
         base_backup_uuid = parse<UUID>(getString(config_root, "base_backup_uuid"));
@@ -501,6 +580,7 @@ void BackupImpl::readBackupMetadata()
             const Poco::XML::Node * file_config = child;
             BackupFileInfo info;
             info.file_name = getString(file_config, "name");
+            validateFileNameFromBackup(info.file_name, "name", backup_name_for_logging);
             info.object_key = getString(file_config, "object_key", "");
             info.size = getUInt64(file_config, "size");
             if (info.size)
@@ -532,6 +612,8 @@ void BackupImpl::readBackupMetadata()
                 if (info.size > info.base_size)
                 {
                     info.data_file_name = getString(file_config, "data_file", info.file_name);
+                    if (info.data_file_name != info.file_name)
+                        validateFileNameFromBackup(info.data_file_name, "data_file", backup_name_for_logging);
                 }
                 info.encrypted_by_disk = getBool(file_config, "encrypted_by_disk", false);
             }

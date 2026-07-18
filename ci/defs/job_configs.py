@@ -73,6 +73,7 @@ class JobConfigs:
                 "./tests/queries/0_stateless/",
                 "./tests/config/",
                 "./tests/clickhouse-test",
+                "./tests/integration/",  # NOTE (strtgbb): integration tests are gated by fast test, so need to include them
                 "./src",
                 "./contrib/",
                 "./CMakeLists.txt",
@@ -480,11 +481,15 @@ class JobConfigs:
             runs_on=RunnerLabels.FUNC_TESTER_AMD,
             requires=[ArtifactNames.CH_AMD_DEBUG],
         ),
-        Job.ParamSet(
-            parameter="amd_tsan, s3 storage, parallel",
-            runs_on=RunnerLabels.AMD_MEDIUM_CPU,
-            requires=[ArtifactNames.CH_AMD_TSAN],
-        ),
+        *[
+            Job.ParamSet(
+                parameter=f"amd_tsan, s3 storage, parallel, {batch}/{total_batches}",
+                runs_on=RunnerLabels.AMD_MEDIUM_CPU,
+                requires=[ArtifactNames.CH_AMD_TSAN],
+            )
+            for total_batches in (2,)
+            for batch in range(1, total_batches + 1)
+        ],
         *[
             Job.ParamSet(
                 parameter=f"amd_tsan, s3 storage, sequential, {batch}/{total_batches}",

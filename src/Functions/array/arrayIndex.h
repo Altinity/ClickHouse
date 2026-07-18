@@ -125,9 +125,10 @@ private:
         return left[i] >= right;
     }
 
-    static constexpr bool lessOrEqual(const IColumn & left, const Result & right, size_t i, size_t) noexcept { return left[i] >= right; }
+    static bool lessOrEqual(const IColumn & left, const Result & right, size_t i, size_t) { return left[i] >= right; }
 
-    static constexpr bool lessOrEqual(const Array& arr, const Field& rhs, size_t pos, size_t) noexcept {
+    static bool lessOrEqual(const Array & arr, const Field & rhs, size_t pos, size_t)
+    {
         return accurateLessOrEqual(rhs, arr[pos]);
     }
 
@@ -666,7 +667,7 @@ private:
      * @return {nullptr, null_map_item} if there are four arguments but the third is missing.
      * @return {null_map_data, null_map_item} if there are four arguments.
      */
-    static NullMaps getNullMaps(const ColumnsWithTypeAndName & arguments) noexcept
+    static NullMaps getNullMaps(const ColumnsWithTypeAndName & arguments)
     {
         if (arguments.size() < 3)
             return {nullptr, nullptr};
@@ -863,6 +864,15 @@ private:
         arguments_copy[0].column = std::move(array_column);
         arguments_copy[0].type = std::move(array_type);
         arguments_copy[0].name = arguments[0].name;
+
+        /// executeImpl strips LowCardinality before executeArrayImpl, but the Map path bypasses it.
+        /// Strip here too so executeArrayImpl sees a ColumnNullable lookup column and fills null_map_item,
+        /// keeping null-needle semantics identical to the plain array path.
+        for (auto & argument : arguments_copy)
+        {
+            argument.column = recursiveRemoveLowCardinality(argument.column);
+            argument.type = recursiveRemoveLowCardinality(argument.type);
+        }
 
         return executeArrayImpl(arguments_copy, result_type);
     }
