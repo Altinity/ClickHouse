@@ -95,6 +95,17 @@ TEST(CasBlobEnvelopeFormat, GatesAndCriticalKey)
     String future = head;
     future.replace(future.find("\"v\":3"), 5, "\"v\":4");
     EXPECT_THROW(decodeEnvelopeHeader(future, future.size(), ObjectKind::Blob), DB::Exception);
+    String out_of_range = head;
+    out_of_range.replace(out_of_range.find("\"v\":3"), 5, "\"v\":4294967299");
+    try
+    {
+        decodeEnvelopeHeader(out_of_range, out_of_range.size(), ObjectKind::Blob);
+        FAIL() << "expected CORRUPTED_DATA";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA);
+    }
     /// an unknown `!`-critical key fails closed.
     EnvelopeHeader hc = sampleHeader("r");
     hc.emit_unknown_critical_key = true;

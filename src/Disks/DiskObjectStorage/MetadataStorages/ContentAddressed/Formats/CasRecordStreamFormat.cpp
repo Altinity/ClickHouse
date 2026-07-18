@@ -131,7 +131,7 @@ void expectRunHeaderLine(ReadBuffer & in, std::string_view expected_kind)
 
     if (!r.nextKey(key) || key != "v")
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_run: header line must carry \"v\" second");
-    const uint32_t v = static_cast<uint32_t>(r.readU64Number());
+    const uint32_t v = r.readU32Number();
     checkCompatibility(v, t.type);
 
     if (!r.nextKey(key) || key != "kind")

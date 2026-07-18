@@ -186,7 +186,7 @@ EnvelopeHeader decodeEnvelopeHeader(std::string_view head_bytes, uint64_t /*obje
         }
         else if (key == "v")
         {
-            h.compatibility_version = static_cast<uint32_t>(r.readU64Number());
+            h.compatibility_version = r.readU32Number();
             checkCompatibility(h.compatibility_version, "blob envelope");
             saw_v = true;
         }

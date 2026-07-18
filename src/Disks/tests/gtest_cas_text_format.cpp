@@ -194,6 +194,10 @@ TEST(CasTextHeader, WriteExpectSniffGate)
     const String future = "{\"type\":\"cas_pool_meta\",\"v\":4}\n";
     DB::ReadBufferFromMemory in3(future.data(), future.size());
     expectCode(DB::ErrorCodes::UNKNOWN_FORMAT_VERSION, [&] { expectHeaderLine(in3, FormatId::PoolMeta); });
+
+    const String out_of_range = "{\"type\":\"cas_pool_meta\",\"v\":4294967299}\n";
+    DB::ReadBufferFromMemory in4(out_of_range.data(), out_of_range.size());
+    expectCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { expectHeaderLine(in4, FormatId::PoolMeta); });
 }
 
 TEST(CasTextLines, ReadLineAndTrailer)

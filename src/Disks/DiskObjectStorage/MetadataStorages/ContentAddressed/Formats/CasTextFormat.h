@@ -62,6 +62,8 @@ public:
     uint64_t readU64String();
     /// Reads an unquoted JSON number into a u64; low-level parse failures become `CORRUPTED_DATA`.
     uint64_t readU64Number();
+    /// Reads an unquoted JSON number into a u32; rejects a value that would silently narrow.
+    uint32_t readU32Number();
     /// Reads the bare JSON literals `true` and `false`.
     bool readBool();
     /// Applies the evolution rule for an unrecognized key: `!`-prefixed keys produce

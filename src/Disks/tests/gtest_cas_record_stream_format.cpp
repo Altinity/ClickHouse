@@ -236,4 +236,17 @@ TEST(CasRecordStream, HeaderGates)
             EXPECT_EQ(e.code(), DB::ErrorCodes::UNKNOWN_FORMAT_VERSION);
         }
     }
+    /// An out-of-range version must not narrow to a valid low u32 value.
+    {
+        const String s = "{\"type\":\"cas_run\",\"v\":4294967299,\"kind\":\"source_edge\"}\n{\"n\":0}\n";
+        try
+        {
+            decodeRun(s);
+            FAIL() << "expected CORRUPTED_DATA";
+        }
+        catch (const DB::Exception & e)
+        {
+            EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA);
+        }
+    }
 }

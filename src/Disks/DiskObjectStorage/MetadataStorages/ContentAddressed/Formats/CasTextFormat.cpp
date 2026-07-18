@@ -9,6 +9,7 @@
 #include <base/scope_guard.h>
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <zstd.h>
 
 namespace DB
@@ -212,6 +213,14 @@ uint64_t JsonObjectReader::readU64Number()
     });
 }
 
+uint32_t JsonObjectReader::readU32Number()
+{
+    const uint64_t v = readU64Number();
+    if (v > std::numeric_limits<uint32_t>::max())
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: value out of uint32 range", what);
+    return static_cast<uint32_t>(v);
+}
+
 bool JsonObjectReader::readBool()
 {
     return guarded([&]
@@ -289,7 +298,7 @@ TextHeader parseHeaderObject(std::string_view line, std::string_view what)
     h.type = r.readString();
     if (!r.nextKey(key) || key != "v")
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: header line must carry \"v\" second", what);
-    h.v = static_cast<uint32_t>(r.readU64Number());
+    h.v = r.readU32Number();
     while (r.nextKey(key))
         r.skipUnknown(key);
     if (!buf.eof())
