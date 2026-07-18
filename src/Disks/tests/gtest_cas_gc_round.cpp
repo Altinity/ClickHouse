@@ -12,6 +12,7 @@ namespace DB::ErrorCodes
 {
 extern const int BAD_ARGUMENTS;
 extern const int CORRUPTED_DATA;
+extern const int ABORTED;
 }
 
 namespace ProfileEvents
@@ -74,6 +75,45 @@ PoolPtr openTestPoolWithConfig(std::shared_ptr<InMemoryBackend> & out_backend, P
     out_backend = std::make_shared<InMemoryBackend>();
     return Pool::open(out_backend, std::move(config));
 }
+
+/// Fault decorator for triage #5's regression test (`CasGcRetention.LosingRoundNeverDestroysParentSealGeneration`
+/// below): the `fail_at_call`-th `casPut` against `faulted_key` returns `Conflict` instead of committing —
+/// deterministically and single-threaded reproducing "this round's own gc/state CAS lost the race to a
+/// concurrent leader," which is the only condition under which the pre-CAS wholesale prune's choice of
+/// `referenced_generations` is externally observable (a round whose own CAS SUCCEEDS reclaims the same
+/// generation moments later via the existing, unrelated post-CAS hand-off delete regardless of this fix,
+/// so faulting the CAS is required, not optional, to pin the production call site). A call count, not a
+/// one-shot arm flag: `Gc::acquireOrRenewLease` issues its OWN earlier `casPut` on the very same gc/state
+/// key to renew the lease BEFORE a round folds — that renewal must SUCCEED (so the round actually reaches
+/// the fold/prune it's meant to exercise), and only the round's LATER, final round-commit `casPut` must
+/// be the one that loses. `fail_at_call` is 1-indexed and lets the test target that specific call exactly,
+/// computed from `calls_to_faulted_key` observed so far rather than hardcoded.
+class GcStateCasFaultBackend : public InMemoryBackend
+{
+public:
+    using Backend::get;
+    using Backend::getStream;
+    using Backend::putIfAbsent;
+    using Backend::putIfAbsentStream;
+    using Backend::putOverwrite;
+    using Backend::casPut;
+
+    CasResult casPut(const String & key, const String & bytes,
+                     const std::optional<Token> & expected, const ObjectMeta & meta) override
+    {
+        if (key == faulted_key)
+        {
+            ++calls_to_faulted_key;
+            if (fail_at_call != 0 && calls_to_faulted_key == fail_at_call)
+                return CasResult{CasOutcome::Conflict, {}};
+        }
+        return InMemoryBackend::casPut(key, bytes, expected, meta);
+    }
+
+    String faulted_key;
+    size_t calls_to_faulted_key = 0;
+    size_t fail_at_call = 0;   /// 0 = never fault; else fault exactly the Nth casPut to `faulted_key`
+};
 
 GcState readState(InMemoryBackend & b, const Pool & s)
 {
@@ -1332,70 +1372,94 @@ TEST(CasGcRetention, HandOffDeletesSupersededRef)
     EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(2)), 1);
 }
 
-/// triage #5: the pre-CAS wholesale prune must never delete a generation the PARENT (currently-adopted)
-/// seal still references, even when the round's own PROPOSED seal has already moved off it. A losing
-/// leader whose fold window straddles a ref commit computes a proposed seal that no longer needs the old
-/// generation and — pre-CAS, unconditionally — wholesale-deletes it; if that leader's own gc/state CAS
-/// then loses the race, the generation it just destroyed is exactly what the WINNING leader's (already
-/// adopted, unreplaced) seal still points at, permanently wedging GC (`CasBlobInDegree.cpp` throws
-/// `CORRUPTED_DATA` resolving the dangling run). `pruneSupersededGenerations` only ever deletes what is
-/// absent from the `referenced_generations` set it is handed, so this drives that set directly: the RED
-/// half reproduces TODAY's call site (proposed generations alone) destroying the parent-referenced
-/// generation; the GREEN half is the union the fixed call site (`CasGc.cpp`, `runRegularRound`) must pass,
-/// and also proves a genuinely-superseded generation (in neither set) is still reclaimed — the fix must
-/// not turn pruning off altogether.
-TEST(CasGcRetention, PreCasPruneProtectsParentSealGeneration)
+/// triage #5, driven through the REAL call site (`Gc::runRegularRound`, not a test seam): a losing
+/// leader's pre-CAS wholesale generation-retention prune must never destroy a generation the PARENT
+/// (currently-adopted, pre-fold) seal still references, even when the round's own PROPOSED seal has
+/// already moved off it and the round's own `gc/state` CAS then loses. `GcStateCasFaultBackend` makes
+/// this round's own round-commit CAS return `Conflict` — deterministically and single-threaded standing
+/// in for a concurrent leader winning first — which is the only condition under which the fix is
+/// externally observable: a round whose own CAS SUCCEEDS reclaims the same generation moments later via
+/// the existing (unrelated, unchanged) post-CAS hand-off delete regardless of this fix, so a plain
+/// successful round cannot tell bug from fix apart.
+TEST(CasGcRetention, LosingRoundNeverDestroysParentSealGeneration)
 {
-    /// Three generations relative to a `keep = 1` retention floor of `adopted_generation - 1 = 4`:
-    ///   g_ancient(1) — referenced by NEITHER seal: genuinely superseded, must always be reclaimed.
-    ///   g_old(2)     — referenced ONLY by the PARENT (adopted-before-this-round) seal.
-    ///   g_new(3)     — referenced by the round's PROPOSED (about-to-be-CAS'd) seal.
-    const uint64_t g_ancient = 1;
-    const uint64_t g_old = 2;
-    const uint64_t g_new = 3;
-    const uint64_t adopted_generation = 5;   /// prune floor = 5 - keep(1) = 4, covers all three above.
+    auto backend = std::make_shared<GcStateCasFaultBackend>();
+    auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_snap_generations_to_keep = 1});
+    const Layout & layout = store->layout();
+    backend->faulted_key = layout.gcStateKey();
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r1 = ref(1, 0xAA);
 
-    auto populateThreeGenerations = [](InMemoryBackend & backend, const Layout & layout)
+    writeBlobBody(*backend, layout, DB::UInt128(1));
+    writeManifestRaw(*backend, layout, ns, r1, {blobEntryFor("a", DB::UInt128(1))});
+    publishCommittedTransition(*backend, layout, ns, "tbl", std::nullopt, r1);
+
+    Gc gc(store, kGc);
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);   // round 1: gen=1 adopted, referencing blob 1's run.
+    const GcState st1 = readState(*backend, *store);
+    const uint64_t g_parent = st1.snap_generation;
+
+    const auto seal1 = decodeFoldSeal(backend->get(layout.foldSealKey(st1.snap_generation, st1.snap_attempt))->bytes);
+    ASSERT_EQ(seal1.blob_target_runs.size(), 1u);
+    const String parent_run_key = seal1.blob_target_runs.front().key;
+    const String parent_gen_prefix = layout.gcGenPrefix(g_parent);
+    ASSERT_FALSE(backend->list(parent_gen_prefix, "", 1000).keys.empty());
+
+    /// A real delta: swap the ref to a new manifest naming a different blob. The next fold will move
+    /// shard 0's run OFF `g_parent` onto a fresh generation.
+    const ManifestRef r2 = ref(2, 0xBB);
+    writeBlobBody(*backend, layout, DB::UInt128(2));
+    writeManifestRaw(*backend, layout, ns, r2, {blobEntryFor("b", DB::UInt128(2))});
+    publishCommittedTransition(*backend, layout, ns, "tbl", r1, r2);
+
+    /// Arm the fault for the NEXT round's SECOND casPut on gc/state, not its first: the first is
+    /// `acquireOrRenewLease`'s own lease-renewal CAS (must SUCCEED, so the round actually folds), and the
+    /// second is the round's final round-commit CAS (the one that must LOSE, exactly as if a concurrent
+    /// leader had already committed a different seal first).
+    const size_t calls_before = backend->calls_to_faulted_key;
+    backend->fail_at_call = calls_before + 2;
+    bool threw_aborted = false;
+    try
     {
-        for (uint64_t g : {1UL, 2UL, 3UL})
-            backend.putIfAbsent(layout.gcGenPrefix(g) + "marker", "x");
-    };
-
-    /// RED: today's call site seeds `referenced_generations` from the PROPOSED seal alone.
-    {
-        auto backend = std::make_shared<InMemoryBackend>();
-        auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_snap_generations_to_keep = 1});
-        const Layout & layout = store->layout();
-        populateThreeGenerations(*backend, layout);
-
-        Gc gc(store, kGc);
-        GcState next;
-        const std::set<uint64_t> proposed_only{g_new};   /// missing g_old: the bug
-        gc.pruneSupersededGenerationsForTest(adopted_generation, /*attempt*/ 0, next, proposed_only);
-
-        EXPECT_TRUE(backend->list(layout.gcGenPrefix(g_old), "", 1000).keys.empty())
-            << "RED evidence: without the parent's generation in the protected set, the pre-CAS prune "
-               "destroys a generation the currently-adopted (parent) seal still references";
+        gc.runRegularRound();
     }
-
-    /// GREEN: the fixed call site seeds `referenced_generations` with proposed UNION parent.
+    catch (const DB::Exception & e)
     {
-        auto backend = std::make_shared<InMemoryBackend>();
-        auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_snap_generations_to_keep = 1});
-        const Layout & layout = store->layout();
-        populateThreeGenerations(*backend, layout);
-
-        Gc gc(store, kGc);
-        GcState next;
-        const std::set<uint64_t> proposed_union_parent{g_new, g_old};
-        gc.pruneSupersededGenerationsForTest(adopted_generation, /*attempt*/ 0, next, proposed_union_parent);
-
-        EXPECT_FALSE(backend->list(layout.gcGenPrefix(g_old), "", 1000).keys.empty())
-            << "the parent-referenced generation must survive once the call site protects it";
-        EXPECT_TRUE(backend->list(layout.gcGenPrefix(g_ancient), "", 1000).keys.empty())
-            << "a generation referenced by NEITHER seal must still be reclaimed — the fix must not stop "
-               "pruning altogether";
+        threw_aborted = (e.code() == DB::ErrorCodes::ABORTED);
+        if (!threw_aborted)
+            throw;
     }
+    ASSERT_TRUE(threw_aborted) << "the losing round's own gc/state CAS must fail and propagate ABORTED";
+    EXPECT_EQ(backend->calls_to_faulted_key, calls_before + 2)
+        << "the round must have made exactly the expected two gc/state casPut attempts (renew + commit)";
+
+    /// GREEN evidence: the losing round's pre-CAS prune must NOT have destroyed `g_parent` — it is still
+    /// exactly what the (unreplaced, still-adopted) parent seal references.
+    EXPECT_FALSE(backend->list(parent_gen_prefix, "", 1000).keys.empty())
+        << "a losing round must never destroy the generation the still-adopted parent seal references";
+    EXPECT_TRUE(backend->head(parent_run_key).exists)
+        << "the parent seal's exact run object must survive a losing round's pre-CAS prune";
+
+    /// GC is NOT wedged: gc/state is unchanged (the CAS never committed) and the original blob still
+    /// resolves cleanly through the surviving parent run — no `CORRUPTED_DATA` from a dangling reference.
+    EXPECT_EQ(readState(*backend, *store).snap_generation, g_parent);
+    EXPECT_TRUE(blobExists(*backend, layout, DB::UInt128(1)));
+    EXPECT_EQ(inDegreeOf(*backend, layout, DB::UInt128(1)), 1);
+
+    /// A subsequent round (fault already disarmed) must succeed normally, AND must still reclaim the
+    /// losing round's own abandoned attempt debris — a generation referenced by NEITHER the parent nor
+    /// the new proposed seal — proving the fix does not turn pruning off altogether.
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+    const uint64_t g_after = readState(*backend, *store).snap_generation;
+    ASSERT_GT(g_after, g_parent);
+    for (uint64_t g = g_parent + 1; g < g_after; ++g)
+        EXPECT_TRUE(backend->list(layout.gcGenPrefix(g), "", 1000).keys.empty())
+            << "generation " << g << " (the losing round's own abandoned attempt debris, referenced by "
+               "neither the parent nor the new proposed seal) must still be reclaimed on a successful "
+               "round — the fix must not disable pruning";
+
+    EXPECT_TRUE(blobExists(*backend, layout, DB::UInt128(2)));
+    EXPECT_EQ(inDegreeOf(*backend, layout, DB::UInt128(2)), 1);
 }
 
 /// keep == 0 is the forensics "keep ALL" mode: NO generation is pruned, snap_pruned_through stays 0.

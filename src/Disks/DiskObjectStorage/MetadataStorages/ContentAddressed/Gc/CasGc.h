@@ -452,16 +452,6 @@ public:
         runNamespaceCleanupPasses(seal, ref_tables, new_round, suppress_destructive);
     }
 
-    /// TEST SEAM: expose the pre-CAS generation-retention prune directly so a unit test can assert its
-    /// `referenced_generations` contract in isolation (triage #5): the production call site in
-    /// `runRegularRound` must seed this set with the UNION of the round's proposed seal AND the parent
-    /// (currently-adopted) seal's generations, never the proposed seal alone.
-    void pruneSupersededGenerationsForTest(uint64_t adopted_generation, uint64_t attempt, GcState & next,
-                                           const std::set<uint64_t> & referenced_generations)
-    {
-        pruneSupersededGenerations(adopted_generation, attempt, next, referenced_generations);
-    }
-
 };
 
 }
