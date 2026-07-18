@@ -928,63 +928,47 @@ def test_partition_transform_equivalence_gate(cluster):
     """
     The Iceberg partition-compatibility gate accepts a source partition key whose transform is
     equivalent to (or finer than) the destination Iceberg transform when the exported partition is
-    provably single-valued for every destination field, and rejects it otherwise. The gate runs
-    synchronously at EXPORT time: acceptance means the ALTER does not throw, rejection means it
-    throws BAD_ARGUMENTS.
+    provably single-valued for every destination field, and rejects it otherwise. Accept cases are
+    verified end-to-end (data + metadata); reject cases must throw BAD_ARGUMENTS synchronously.
     """
     node = cluster.instances["replica1"]
-    settings = {"allow_insert_into_iceberg": 1}
-
-    def run_case(name, columns, source_key, dest_key, rows, *, expect_ok):
-        uid = unique_suffix()
-        mt_table = f"mt_{name}_{uid}"
-        iceberg_table = f"iceberg_{name}_{uid}"
-        make_rmt(node, mt_table, columns, source_key, replica_name="replica1")
-        node.query(f"INSERT INTO {mt_table} VALUES {rows}")
-        make_iceberg_s3(node, iceberg_table, columns, partition_by=dest_key)
-        pid = first_partition_id(node, mt_table)
-        statement = f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{pid}' TO TABLE {iceberg_table}"
-        if expect_ok:
-            node.query(statement, settings=settings)
-        else:
-            error = node.query_and_get_error(statement, settings=settings)
-            assert "BAD_ARGUMENTS" in error, f"{name}: expected BAD_ARGUMENTS, got: {error!r}"
-
     dt = "id Int64, event_time DateTime"
+    yr = "id Int64, year Int32, region String"
 
-    # toDate -> day: rows within one day map to a single Iceberg day partition.
-    run_case("todate_day", dt, "toDate(event_time)", "toRelativeDayNum(event_time)",
-             "(1, '2024-03-05 01:00:00'), (2, '2024-03-05 20:00:00')", expect_ok=True)
-
-    # toYYYYMM -> month: different days of the same month map to a single month partition.
-    run_case("toyyyymm_month", dt, "toYYYYMM(event_time)", "toMonthNumSinceEpoch(event_time)",
-             "(1, '2024-03-01 00:00:00'), (2, '2024-03-20 00:00:00')", expect_ok=True)
-
-    # toStartOfHour -> hour.
-    run_case("startofhour_hour", dt, "toStartOfHour(event_time)", "toRelativeHourNum(event_time)",
-             "(1, '2024-03-05 12:00:00'), (2, '2024-03-05 12:59:00')", expect_ok=True)
-
-    # Finer source (day + country) into a day-partitioned destination: the extra column is allowed.
-    run_case("finer_day", "id Int64, event_time DateTime, country String",
-             "(toDate(event_time), country)", "toRelativeDayNum(event_time)",
-             "(1, '2024-03-05 01:00:00', 'US'), (2, '2024-03-05 20:00:00', 'US')", expect_ok=True)
-
-    # Compound field order reversed: matching is by column, so (year, region) into (region, year)
-    # is accepted - the destination spec defines the written tuple order.
-    run_case("reversed_order", "id Int64, year Int32, region String",
-             "(year, region)", "(region, year)", "(1, 2020, 'EU')", expect_ok=True)
-
-    # Superset source: a (year, region) source into a year-only destination is finer, so accepted.
-    run_case("superset", "id Int64, year Int32, region String",
-             "(year, region)", "year", "(1, 2020, 'EU')", expect_ok=True)
-
-    # Coarser source: a month partition spans several days, so it cannot map to one day partition.
-    run_case("coarser_day", dt, "toYYYYMM(event_time)", "toRelativeDayNum(event_time)",
-             "(1, '2024-03-01 00:00:00'), (2, '2024-03-20 00:00:00')", expect_ok=False)
-
-    # bucket is non-monotonic: an identity source cannot satisfy a bucket destination via min/max.
-    run_case("bucket_needs_structural", "id Int64, k Int64", "k", "icebergBucket(8, k)",
-             "(1, 10), (2, 10)", expect_ok=False)
+    cases = [
+        # toDate -> day: rows within one day map to a single Iceberg day partition.
+        {"name": "todate_day", "columns": dt, "source_key": "toDate(event_time)",
+         "dest_key": "toRelativeDayNum(event_time)",
+         "rows": "(1, '2024-03-05 01:00:00'), (2, '2024-03-05 20:00:00')", "expect_ok": True},
+        # toYYYYMM -> month: different days of the same month map to a single month partition.
+        {"name": "toyyyymm_month", "columns": dt, "source_key": "toYYYYMM(event_time)",
+         "dest_key": "toMonthNumSinceEpoch(event_time)",
+         "rows": "(1, '2024-03-01 00:00:00'), (2, '2024-03-20 00:00:00')", "expect_ok": True},
+        # toStartOfHour -> hour.
+        {"name": "startofhour_hour", "columns": dt, "source_key": "toStartOfHour(event_time)",
+         "dest_key": "toRelativeHourNum(event_time)",
+         "rows": "(1, '2024-03-05 12:00:00'), (2, '2024-03-05 12:59:00')", "expect_ok": True},
+        # Finer source (day + country) into a day-partitioned destination: extra column allowed.
+        {"name": "finer_day", "columns": "id Int64, event_time DateTime, country String",
+         "source_key": "(toDate(event_time), country)", "dest_key": "toRelativeDayNum(event_time)",
+         "rows": "(1, '2024-03-05 01:00:00', 'US'), (2, '2024-03-05 20:00:00', 'US')",
+         "expect_ok": True},
+        # Compound field order reversed: matching is by column; the destination defines tuple order.
+        {"name": "reversed_order", "columns": yr, "source_key": "(year, region)",
+         "dest_key": "(region, year)", "rows": "(1, 2020, 'EU')", "expect_ok": True,
+         "verify": [("region", "region"), ("year", "year")]},
+        # Superset source: (year, region) into a year-only destination is finer, so accepted.
+        {"name": "superset", "columns": yr, "source_key": "(year, region)", "dest_key": "year",
+         "rows": "(1, 2020, 'EU')", "expect_ok": True, "verify": [("year", "year")]},
+        # Coarser source: a month partition spans several days, so it cannot map to one day.
+        {"name": "coarser_day", "columns": dt, "source_key": "toYYYYMM(event_time)",
+         "dest_key": "toRelativeDayNum(event_time)",
+         "rows": "(1, '2024-03-01 00:00:00'), (2, '2024-03-20 00:00:00')", "expect_ok": False},
+        # bucket is non-monotonic: an identity source cannot satisfy a bucket destination.
+        {"name": "bucket_needs_structural", "columns": "id Int64, k Int64", "source_key": "k",
+         "dest_key": "icebergBucket(8, k)", "rows": "(1, 10), (2, 10)", "expect_ok": False},
+    ]
+    run_partition_compat_cases(node, cases)
 
 
 def test_partition_transform_granularity_matrix(cluster):
@@ -992,66 +976,75 @@ def test_partition_transform_granularity_matrix(cluster):
     Exercise the common ClickHouse temporal partition keys and the granularity relationships between
     the source key and the destination Iceberg transform. Acceptance is data-dependent (a source
     partition must be single-valued for every destination field), so a coarser source can still be
-    accepted when a particular partition does not actually repartition.
+    accepted when a particular partition does not actually repartition. Accept cases are verified
+    end-to-end (data + metadata); reject cases must throw BAD_ARGUMENTS.
     """
     node = cluster.instances["replica1"]
-    settings = {"allow_insert_into_iceberg": 1}
-
-    def run_case(name, source_key, dest_key, rows, *, expect_ok):
-        uid = unique_suffix()
-        mt_table = f"mt_{name}_{uid}"
-        iceberg_table = f"iceberg_{name}_{uid}"
-        make_rmt(node, mt_table, "id Int64, event_time DateTime", source_key, replica_name="replica1")
-        node.query(f"INSERT INTO {mt_table} VALUES {rows}")
-        make_iceberg_s3(node, iceberg_table, "id Int64, event_time DateTime", partition_by=dest_key)
-        pid = first_partition_id(node, mt_table)
-        statement = f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{pid}' TO TABLE {iceberg_table}"
-        if expect_ok:
-            node.query(statement, settings=settings)
-        else:
-            error = node.query_and_get_error(statement, settings=settings)
-            assert "BAD_ARGUMENTS" in error, f"{name}: expected BAD_ARGUMENTS, got: {error!r}"
-
+    dt = "id Int64, event_time DateTime"
     same_day = "(1, '2024-03-05 01:00:00'), (2, '2024-03-05 20:00:00')"
     same_month = "(1, '2024-03-01 00:00:00'), (2, '2024-03-20 00:00:00')"
     same_year = "(1, '2024-03-05 00:00:00'), (2, '2024-09-10 00:00:00')"
 
-    # Common temporal keys at the same granularity as the destination transform.
-    run_case("startofmonth_month", "toStartOfMonth(event_time)", "toMonthNumSinceEpoch(event_time)",
-             same_month, expect_ok=True)
-    run_case("yyyymmdd_day", "toYYYYMMDD(event_time)", "toRelativeDayNum(event_time)",
-             same_day, expect_ok=True)
-    run_case("startofday_day", "toStartOfDay(event_time)", "toRelativeDayNum(event_time)",
-             same_day, expect_ok=True)
-    run_case("toyear_year", "toYear(event_time)", "toYearNumSinceEpoch(event_time)",
-             same_year, expect_ok=True)
-    run_case("startofyear_year", "toStartOfYear(event_time)", "toYearNumSinceEpoch(event_time)",
-             same_year, expect_ok=True)
+    def case(name, source_key, dest_key, rows, expect_ok):
+        return {"name": name, "columns": dt, "source_key": source_key, "dest_key": dest_key,
+                "rows": rows, "expect_ok": expect_ok}
 
-    # Finer source into a coarser destination: a finer partition is contained in one coarser bucket.
-    run_case("day_into_month", "toDate(event_time)", "toMonthNumSinceEpoch(event_time)",
-             same_day, expect_ok=True)
-    run_case("day_into_year", "toDate(event_time)", "toYearNumSinceEpoch(event_time)",
-             same_day, expect_ok=True)
-    run_case("hour_into_day", "toStartOfHour(event_time)", "toRelativeDayNum(event_time)",
-             "(1, '2024-03-05 12:00:00'), (2, '2024-03-05 12:30:00')", expect_ok=True)
-    run_case("month_into_year", "toYYYYMM(event_time)", "toYearNumSinceEpoch(event_time)",
-             same_month, expect_ok=True)
+    cases = [
+        # Common temporal keys at the same granularity as the destination transform.
+        case("startofmonth_month", "toStartOfMonth(event_time)", "toMonthNumSinceEpoch(event_time)", same_month, True),
+        case("yyyymmdd_day", "toYYYYMMDD(event_time)", "toRelativeDayNum(event_time)", same_day, True),
+        case("startofday_day", "toStartOfDay(event_time)", "toRelativeDayNum(event_time)", same_day, True),
+        case("toyear_year", "toYear(event_time)", "toYearNumSinceEpoch(event_time)", same_year, True),
+        case("startofyear_year", "toStartOfYear(event_time)", "toYearNumSinceEpoch(event_time)", same_year, True),
+        # Finer source into a coarser destination: a finer partition sits inside one coarser bucket.
+        case("day_into_month", "toDate(event_time)", "toMonthNumSinceEpoch(event_time)", same_day, True),
+        case("day_into_year", "toDate(event_time)", "toYearNumSinceEpoch(event_time)", same_day, True),
+        case("hour_into_day", "toStartOfHour(event_time)", "toRelativeDayNum(event_time)",
+             "(1, '2024-03-05 12:00:00'), (2, '2024-03-05 12:30:00')", True),
+        case("month_into_year", "toYYYYMM(event_time)", "toYearNumSinceEpoch(event_time)", same_month, True),
+        # Coarser source into a finer destination: the partition spans several destination buckets.
+        case("year_into_month", "toYear(event_time)", "toMonthNumSinceEpoch(event_time)",
+             "(1, '2020-01-15 00:00:00'), (2, '2020-06-15 00:00:00')", False),
+        case("year_into_day", "toYear(event_time)", "toRelativeDayNum(event_time)",
+             "(1, '2020-01-01 00:00:00'), (2, '2020-12-31 00:00:00')", False),
+        # Same coarse/fine pair, but this year partition holds a single day, so it does not
+        # repartition and is accepted - acceptance depends on the data, not the structure.
+        case("year_into_day_single_day", "toYear(event_time)", "toRelativeDayNum(event_time)", same_day, True),
+        # Weekly has no Iceberg equivalent: a week partition holding two days cannot map to one day.
+        case("week_into_day", "toMonday(event_time)", "toRelativeDayNum(event_time)",
+             "(1, '2024-03-05 00:00:00'), (2, '2024-03-07 00:00:00')", False),
+    ]
+    run_partition_compat_cases(node, cases)
 
-    # Coarser source into a finer destination: the partition spans several destination buckets.
-    run_case("year_into_month", "toYear(event_time)", "toMonthNumSinceEpoch(event_time)",
-             "(1, '2020-01-15 00:00:00'), (2, '2020-06-15 00:00:00')", expect_ok=False)
-    run_case("year_into_day", "toYear(event_time)", "toRelativeDayNum(event_time)",
-             "(1, '2020-01-01 00:00:00'), (2, '2020-12-31 00:00:00')", expect_ok=False)
 
-    # Same coarse source/fine destination pair as above, but this year partition holds a single day,
-    # so it does not repartition and is accepted - acceptance depends on the data, not the structure.
-    run_case("year_into_day_single_day", "toYear(event_time)", "toRelativeDayNum(event_time)",
-             same_day, expect_ok=True)
+def test_partition_multicolumn_subset(cluster):
+    """
+    Destination partition columns must be a subset of the source partition-key columns. A wide
+    source whose partition key is a superset of the destination's is accepted (and its multi-column
+    data plus per-field metadata verified); a destination partitioning by a column absent from the
+    source partition key is rejected.
+    """
+    node = cluster.instances["replica1"]
+    wide = "id Int64, event_time DateTime, region String, tenant Int32, v1 Float64, v2 String"
 
-    # Weekly has no Iceberg equivalent: a week partition holding two days cannot map to one day.
-    run_case("week_into_day", "toMonday(event_time)", "toRelativeDayNum(event_time)",
-             "(1, '2024-03-05 00:00:00'), (2, '2024-03-07 00:00:00')", expect_ok=False)
+    cases = [
+        # Destination partition columns {event_time, region} are a strict subset of the source's
+        # {event_time, region, tenant}: accepted, with multi-column data and per-field metadata.
+        {"name": "subset_ok", "columns": wide,
+         "source_key": "(toDate(event_time), region, tenant)",
+         "dest_key": "(toRelativeDayNum(event_time), region)",
+         "rows": "(1, '2024-03-05 01:00:00', 'US', 7, 1.5, 'a'), "
+                 "(2, '2024-03-05 20:00:00', 'US', 7, 2.5, 'b')",
+         "expect_ok": True,
+         "verify": [("event_time", "toRelativeDayNum(event_time)"), ("region", "region")]},
+        # Destination partitions by 'region', which is not in the source partition key: rejected.
+        {"name": "not_subset", "columns": "id Int64, event_time DateTime, region String",
+         "source_key": "toDate(event_time)",
+         "dest_key": "(toRelativeDayNum(event_time), region)",
+         "rows": "(1, '2024-03-05 01:00:00', 'US'), (2, '2024-03-05 20:00:00', 'EU')",
+         "expect_ok": False},
+    ]
+    run_partition_compat_cases(node, cases)
 
 
 def test_export_partition_todate_source_matches_day_metadata(cluster):
@@ -1867,6 +1860,95 @@ def _partition_scalar(partition, field):
         assert len(value) == 1, f"Unexpected partition union shape for {field!r}: {value!r}"
         value = next(iter(value.values()))
     return value
+
+
+def assert_iceberg_partition_metadata(node, iceberg_table, uid, fields):
+    """Assert every data-file partition record's field equals the single DISTINCT value of the
+    corresponding expression over the exported destination data. `fields` is a list of
+    (metadata_field_name, value_expr). String-normalized so integer transforms and identity
+    string/int fields compare uniformly."""
+    query_id = f"verify_{uid}"
+    node.query(
+        f"SELECT * FROM {iceberg_table}",
+        query_id=query_id,
+        settings={"iceberg_metadata_log_level": "manifest_file_entry"},
+    )
+    entries = fetch_manifest_entries(node, query_id)
+    partitions = _data_file_partition_records(entries)
+    assert partitions, "No data-file partition records found in manifest entries"
+    for field_name, value_expr in fields:
+        expected = node.query(
+            f"SELECT DISTINCT toString({value_expr}) FROM {iceberg_table}"
+        ).strip()
+        got = {str(_partition_scalar(p, field_name)) for p in partitions}
+        assert got == {expected}, (
+            f"metadata field {field_name!r} = {got}, expected {{{expected!r}}}"
+        )
+
+
+def run_partition_compat_cases(node, cases):
+    """Run partition-compatibility cases against the Iceberg export gate.
+
+    Reject cases (``expect_ok=False``) are checked synchronously - the gate fires while scheduling,
+    so the ALTER throws immediately. Accept cases are dispatched together, then awaited, then their
+    data (full ordered row comparison against the exported source partition) and Iceberg partition
+    metadata are verified. Each case is a dict: name, columns, source_key, dest_key, rows, expect_ok,
+    and optional verify (list of (metadata_field_name, value_expr); defaults to
+    [("event_time", dest_key)])."""
+    settings = {"allow_insert_into_iceberg": 1}
+
+    def setup(case):
+        uid = unique_suffix()
+        mt_table = f"mt_{case['name']}_{uid}"
+        iceberg_table = f"iceberg_{case['name']}_{uid}"
+        make_rmt(node, mt_table, case["columns"], case["source_key"], replica_name="replica1")
+        node.query(f"INSERT INTO {mt_table} VALUES {case['rows']}")
+        make_iceberg_s3(node, iceberg_table, case["columns"], partition_by=case["dest_key"])
+        pid = first_partition_id(node, mt_table)
+        return uid, mt_table, iceberg_table, pid
+
+    for case in cases:
+        if case["expect_ok"]:
+            continue
+        _uid, mt_table, iceberg_table, pid = setup(case)
+        error = node.query_and_get_error(
+            f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{pid}' TO TABLE {iceberg_table}",
+            settings=settings,
+        )
+        assert "BAD_ARGUMENTS" in error, f"{case['name']}: expected BAD_ARGUMENTS, got: {error!r}"
+
+    dispatched = []
+    for case in cases:
+        if not case["expect_ok"]:
+            continue
+        uid, mt_table, iceberg_table, pid = setup(case)
+        node.query(
+            f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{pid}' TO TABLE {iceberg_table}",
+            settings=settings,
+        )
+        dispatched.append((case, uid, mt_table, iceberg_table, pid))
+
+    for case, uid, mt_table, iceberg_table, pid in dispatched:
+        wait_for_export_status(node, mt_table, iceberg_table, pid, "COMPLETED")
+
+    for case, uid, mt_table, iceberg_table, pid in dispatched:
+        # Export is a positional cast into the destination schema, so verify the destination equals
+        # the source cast into the destination column types. Normalizing to the destination types
+        # tolerates legitimate Iceberg type promotion (e.g. DateTime is stored as a microsecond
+        # timestamp and returns as DateTime64(6)) while preserving destination precision, so a
+        # spurious sub-second value would still surface as a mismatch.
+        col_defs = node.query(
+            f"SELECT name, type FROM system.columns "
+            f"WHERE database = currentDatabase() AND table = '{iceberg_table}' ORDER BY position"
+        ).strip().split("\n")
+        projection = ", ".join(
+            f"CAST({name} AS {ctype})" for name, ctype in (c.split("\t") for c in col_defs)
+        )
+        src = node.query(f"SELECT {projection} FROM {mt_table} ORDER BY id")
+        dst = node.query(f"SELECT {projection} FROM {iceberg_table} ORDER BY id")
+        assert src == dst, f"{case['name']}: destination rows differ from source"
+        fields = case.get("verify") or [("event_time", case["dest_key"])]
+        assert_iceberg_partition_metadata(node, iceberg_table, f"{case['name']}_{uid}", fields)
 
 
 def test_export_partition_bucket_transform_metadata_matches_data(cluster):
