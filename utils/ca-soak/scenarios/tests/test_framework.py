@@ -3,6 +3,8 @@
 Run: cd utils/ca-soak && python3 -m pytest scenarios/tests/ -q
 """
 
+import pytest
+
 from scenarios.framework import observe, base
 from scenarios.framework.report import (Verdict, ScenarioResult, worst_status,
                                          PASS, FAIL, INCONCLUSIVE, SKIPPED)
@@ -129,3 +131,60 @@ def test_assert_replicas_agree_error_value_counts_as_disagreement():
     cl2 = _FakeCluster(_FakeNode("ch1", ["ERROR: down"]), _FakeNode("ch2", ["ERROR: down"]))
     agree2 = _common.assert_replicas_agree(r2, cl2, "q", attempts=2, sleep_fn=lambda s: None)
     assert agree2 is False  # identical ERROR values are NOT agreement
+
+
+class _FakeQuiesceNode:
+    """Node stub for quiesce_cluster: command()/scalar() are no-ops, counts come from _cluster_counts."""
+
+    def __init__(self, container):
+        self.container = container
+
+    def command(self, *args, **kwargs):
+        return None
+
+    def scalar(self, *args, **kwargs):
+        return "1700000000"
+
+
+def test_quiesce_cluster_tolerates_transient_errored_entry(monkeypatch):
+    # A replication_queue entry that briefly carries a last_exception (e.g. a connection reset
+    # under a heavy-fetch burst) and clears on its own must NOT fail quiescence outright — only a
+    # PERSISTENT error past the grace window is genuine (2026-07-19 S08 false-INCONCLUSIVE finding,
+    # a single transient entry during a 20000-part creation burst tripped an instant-raise with no
+    # grace period, unlike the sibling backlog-stall check which already has one).
+    from scenarios.framework import lifecycle
+
+    counts = [
+        {"repl": 5, "mut": 0, "merges": 1, "errored": 1, "backlog": 5},
+        {"repl": 3, "mut": 0, "merges": 1, "errored": 0, "backlog": 3},
+        {"repl": 0, "mut": 0, "merges": 0, "errored": 0, "backlog": 0},
+    ]
+    monkeypatch.setattr(lifecycle, "_cluster_counts", lambda *a, **kw: counts.pop(0))
+    times = iter([0, 0, 1, 2, 3])
+    monkeypatch.setattr(lifecycle.time, "time", lambda: next(times))
+    monkeypatch.setattr(lifecycle.time, "sleep", lambda s: None)
+
+    cl = _FakeCluster(_FakeQuiesceNode("ch1"), _FakeQuiesceNode("ch2"))
+    result = lifecycle.quiesce_cluster(cl, ["t"], optimize=False, no_progress_grace_s=5)
+    assert result == 1700000000
+    assert not counts  # all three polls consumed — drain returned normally, no raise
+
+
+def test_quiesce_cluster_raises_on_persistent_errored_entry(monkeypatch):
+    # An errored entry that never clears past the grace window is a genuine error and must still
+    # fail quiescence (the tolerance above must not become a blanket suppression).
+    from scenarios.framework import lifecycle
+
+    counts = [
+        {"repl": 5, "mut": 0, "merges": 1, "errored": 1, "backlog": 5},
+        {"repl": 5, "mut": 0, "merges": 1, "errored": 1, "backlog": 5},
+        {"repl": 5, "mut": 0, "merges": 1, "errored": 1, "backlog": 5},
+    ]
+    monkeypatch.setattr(lifecycle, "_cluster_counts", lambda *a, **kw: counts.pop(0))
+    times = iter([0, 0, 1, 2, 4])
+    monkeypatch.setattr(lifecycle.time, "time", lambda: next(times))
+    monkeypatch.setattr(lifecycle.time, "sleep", lambda s: None)
+
+    cl = _FakeCluster(_FakeQuiesceNode("ch1"), _FakeQuiesceNode("ch2"))
+    with pytest.raises(RuntimeError, match="genuine error"):
+        lifecycle.quiesce_cluster(cl, ["t"], optimize=False, no_progress_grace_s=2)

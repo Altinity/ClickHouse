@@ -72,12 +72,18 @@ Collect these for every run:
 - `system.content_addressed_log`: event counts by `event_type`, `object_kind`, `outcome`, and joins by
   `object_hash`/`token` for suspicious objects.
 - `system.query_log`: elapsed time, read/write bytes, memory usage, and `ProfileEvents` for workload
-  queries and explicit `GC` commands.
+  queries and explicit `GC` commands. Also check for anomalies: any query with `exception_code != 0`,
+  and any query whose `query_duration_ms` is an outlier versus its own query class (not just an absolute
+  threshold) — both must be explained in the report, not silently dropped.
 - `system.part_log`: part creation, merge, mutation, and removal rates, plus rows/bytes per part.
 - `system.metric_log` and `system.asynchronous_metric_log`: `MemoryResident`, `MemoryTracking`, CPU, IO,
-  network, and `jemalloc` memory when present.
-- `system.trace_log`: `Real` and `CPU` samples for runs where CPU pressure or off-CPU waits are part of the
-  question.
+  network, and `jemalloc` memory when present. Report accounted (busy) time for the run's dominant
+  operations, not just point-in-time gauges — e.g. cumulative CPU-seconds and wall time spent in
+  insert/merge/GC/fsck phases, so the report can attribute where the run's wall-clock actually went.
+- `system.trace_log`: for every run where CPU pressure, off-CPU waits, or a slow/timed-out phase are part
+  of the question, pull the top stack traces (by sample count) for `CPU`, `Real`, and `Memory` trace
+  types SEPARATELY — each answers a different question (CPU = busy-spinning, Real = includes blocked/
+  off-CPU waits, Memory = allocation hot paths) and must not be conflated into one combined ranking.
 - CA operation counters from `ProfileEvents`: `CasBlobPut`, `CasBlobPutDedup`, `CasBlobHead`,
   `CasBlobHeadMiss`, `CasBlobHeadFirst`, `CasBlobBodyPutAvoided`, `CasBlobDedupCacheHit`, `CasBlobDelete`,
   `CasBlobList`, `CasRootGet`, `CasRootHead`, `CasRootCas`, `CasRootCasConflict`, `CasRootList`, `CasGcGet`,

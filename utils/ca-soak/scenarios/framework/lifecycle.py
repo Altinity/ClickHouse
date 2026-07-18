@@ -116,14 +116,21 @@ def quiesce_cluster(cluster, tables, *, table_filter: str | None = None, optimiz
         deadline = time.time() + drain_timeout_s
         last_backlog = None
         last_progress = time.time()
+        error_since = None
         while True:
             c = _cluster_counts(cluster, table_filter)
+            now = time.time()
             if c["errored"] > 0:
-                raise RuntimeError(f"quiesce {label}: {c['errored']} replication-queue entries carry a "
-                                   f"real last_exception — genuine error")
+                if error_since is None:
+                    error_since = now
+                elif (now - error_since) > no_progress_grace_s:
+                    raise RuntimeError(f"quiesce {label}: {c['errored']} replication-queue entries carry "
+                                       f"a real last_exception for over {no_progress_grace_s:.0f}s — "
+                                       f"genuine error")
+            else:
+                error_since = None
             if c["backlog"] == 0:
                 return
-            now = time.time()
             if last_backlog is None or c["backlog"] < last_backlog:
                 last_backlog = c["backlog"]
                 last_progress = now
