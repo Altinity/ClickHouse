@@ -83,10 +83,14 @@ class S23(Scenario):
             result.note_anomaly(
                 f"S23 expected an empty pool but found {len(leftover)} CA table(s): {leftover[:10]}")
 
-        # --- baseline memory before the idle window ----------------------------------------
-        mem_before = observe.cluster_memory(cl)
-        result.observations["server_memory_before"] = mem_before
-        base_rss = max([m.get("mem_resident") or 0 for m in mem_before.values()], default=0)
+        # --- baseline memory: captured AFTER the first idle GC round (see the loop) ---------
+        # A cold-boot baseline measures the generic ClickHouse warmup ramp (system-log first
+        # buffers/parts, thread pools, caches) — 2026-07-18 S23 RCA: the NotALeader node (zero
+        # fold work) grew MORE than the leader, growth decelerated asymptotically, and the pool
+        # was empty; verdict = generic warmup, not CAS. Gate on the steady-state part of the
+        # window instead: baseline after round 1, delta to end-of-window.
+        mem_before = None
+        base_rss = 0
 
         # --- idle measured phase: one explicit GC round per "minute" -----------------------
         smp = sampler_mod.MetricsSampler(sampler_mod.open_db(ctx.path("metrics.sqlite")), cl,
@@ -126,6 +130,12 @@ class S23(Scenario):
                 rest = minute_s - wall
                 if rest > 0:
                     time.sleep(rest)
+                if mem_before is None:
+                    # Post-settle baseline: first round + its rest period absorb the boot ramp.
+                    mem_before = observe.cluster_memory(cl)
+                    result.observations["server_memory_before"] = mem_before
+                    base_rss = max([m.get("mem_resident") or 0 for m in mem_before.values()],
+                                   default=0)
         finally:
             smp.stop()
         result.observations["per_minute_idle_gc"] = per_minute
@@ -197,7 +207,7 @@ class S23(Scenario):
         # across 9 runs with no GC changes; the RSS-vs-tracked gap was always allocator noise).
         # Compare PER NODE (max-across-nodes before/after can pick different nodes).
         tracked_growth = {}
-        for cont, before in mem_before.items():
+        for cont, before in (mem_before or {}).items():
             b = before.get("mem_tracking")
             a = (mem_after.get(cont) or {}).get("mem_tracking")
             if b is not None and a is not None:
