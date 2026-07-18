@@ -616,6 +616,12 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     std::set<uint64_t> referenced_generations;
     for (const RunRef & r : folded.fold_seal.blob_target_runs)
         referenced_generations.insert(r.generation);
+    /// ALSO protect every generation the PARENT (currently-adopted, pre-fold) seal references
+    /// (`parent_seal_runs`, captured above): this prune runs BEFORE the round's own gc/state CAS below, so
+    /// a losing leader must not destroy what the winning leader's already-adopted seal still points at —
+    /// pre-CAS destructive actions may only rely on PREVIOUSLY PUBLISHED state (triage #5).
+    for (const RunRef & r : parent_seal_runs)
+        referenced_generations.insert(r.generation);
     pruneSupersededGenerations(generation, attempt, next, referenced_generations);
     const CasResult res = backend.casPut(layout.gcStateKey(), encodeGcState(next), state_token);
     if (res.outcome != CasOutcome::Committed)

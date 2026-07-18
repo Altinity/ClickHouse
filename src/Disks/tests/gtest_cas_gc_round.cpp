@@ -1332,6 +1332,72 @@ TEST(CasGcRetention, HandOffDeletesSupersededRef)
     EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(2)), 1);
 }
 
+/// triage #5: the pre-CAS wholesale prune must never delete a generation the PARENT (currently-adopted)
+/// seal still references, even when the round's own PROPOSED seal has already moved off it. A losing
+/// leader whose fold window straddles a ref commit computes a proposed seal that no longer needs the old
+/// generation and — pre-CAS, unconditionally — wholesale-deletes it; if that leader's own gc/state CAS
+/// then loses the race, the generation it just destroyed is exactly what the WINNING leader's (already
+/// adopted, unreplaced) seal still points at, permanently wedging GC (`CasBlobInDegree.cpp` throws
+/// `CORRUPTED_DATA` resolving the dangling run). `pruneSupersededGenerations` only ever deletes what is
+/// absent from the `referenced_generations` set it is handed, so this drives that set directly: the RED
+/// half reproduces TODAY's call site (proposed generations alone) destroying the parent-referenced
+/// generation; the GREEN half is the union the fixed call site (`CasGc.cpp`, `runRegularRound`) must pass,
+/// and also proves a genuinely-superseded generation (in neither set) is still reclaimed — the fix must
+/// not turn pruning off altogether.
+TEST(CasGcRetention, PreCasPruneProtectsParentSealGeneration)
+{
+    /// Three generations relative to a `keep = 1` retention floor of `adopted_generation - 1 = 4`:
+    ///   g_ancient(1) — referenced by NEITHER seal: genuinely superseded, must always be reclaimed.
+    ///   g_old(2)     — referenced ONLY by the PARENT (adopted-before-this-round) seal.
+    ///   g_new(3)     — referenced by the round's PROPOSED (about-to-be-CAS'd) seal.
+    const uint64_t g_ancient = 1;
+    const uint64_t g_old = 2;
+    const uint64_t g_new = 3;
+    const uint64_t adopted_generation = 5;   /// prune floor = 5 - keep(1) = 4, covers all three above.
+
+    auto populateThreeGenerations = [](InMemoryBackend & backend, const Layout & layout)
+    {
+        for (uint64_t g : {1UL, 2UL, 3UL})
+            backend.putIfAbsent(layout.gcGenPrefix(g) + "marker", "x");
+    };
+
+    /// RED: today's call site seeds `referenced_generations` from the PROPOSED seal alone.
+    {
+        auto backend = std::make_shared<InMemoryBackend>();
+        auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_snap_generations_to_keep = 1});
+        const Layout & layout = store->layout();
+        populateThreeGenerations(*backend, layout);
+
+        Gc gc(store, kGc);
+        GcState next;
+        const std::set<uint64_t> proposed_only{g_new};   /// missing g_old: the bug
+        gc.pruneSupersededGenerationsForTest(adopted_generation, /*attempt*/ 0, next, proposed_only);
+
+        EXPECT_TRUE(backend->list(layout.gcGenPrefix(g_old), "", 1000).keys.empty())
+            << "RED evidence: without the parent's generation in the protected set, the pre-CAS prune "
+               "destroys a generation the currently-adopted (parent) seal still references";
+    }
+
+    /// GREEN: the fixed call site seeds `referenced_generations` with proposed UNION parent.
+    {
+        auto backend = std::make_shared<InMemoryBackend>();
+        auto store = Pool::open(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .gc_snap_generations_to_keep = 1});
+        const Layout & layout = store->layout();
+        populateThreeGenerations(*backend, layout);
+
+        Gc gc(store, kGc);
+        GcState next;
+        const std::set<uint64_t> proposed_union_parent{g_new, g_old};
+        gc.pruneSupersededGenerationsForTest(adopted_generation, /*attempt*/ 0, next, proposed_union_parent);
+
+        EXPECT_FALSE(backend->list(layout.gcGenPrefix(g_old), "", 1000).keys.empty())
+            << "the parent-referenced generation must survive once the call site protects it";
+        EXPECT_TRUE(backend->list(layout.gcGenPrefix(g_ancient), "", 1000).keys.empty())
+            << "a generation referenced by NEITHER seal must still be reclaimed — the fix must not stop "
+               "pruning altogether";
+    }
+}
+
 /// keep == 0 is the forensics "keep ALL" mode: NO generation is pruned, snap_pruned_through stays 0.
 TEST(CasGcSnapRetention, KeepZeroPrunesNothing)
 {
