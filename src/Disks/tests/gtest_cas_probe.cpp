@@ -181,9 +181,9 @@ namespace
 class DialectGatedCountingBackend final : public Backend
 {
 public:
-    std::optional<GetResult> get(const String & key, Range range = {}) override { return inner.get(key, range); }
+    std::optional<GetResult> get(const String & key, Range range) override { return inner.get(key, range); }
 
-    std::optional<GetStreamResult> getStream(const String & key, Range range = {}) override { return inner.getStream(key, range); }
+    std::optional<GetStreamResult> getStream(const String & key, Range range) override { return inner.getStream(key, range); }
 
     HeadResult head(const String & key) override
     {
@@ -195,7 +195,7 @@ public:
 
     bool supportsListTokens() const override { return inner.supportsListTokens(); }
 
-    PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta = {}) override
+    PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta) override
     {
         /// No `expected` token to gate -- matches production (ObjectStorageBackend::putIfAbsent has
         /// no dialect check either).
@@ -205,9 +205,9 @@ public:
         return r;
     }
 
-    WriteSinkPtr putIfAbsentStream(const String & key, const ObjectMeta & meta = {}) override { return inner.putIfAbsentStream(key, meta); }
+    WriteSinkPtr putIfAbsentStream(const String & key, const ObjectMeta & meta) override { return inner.putIfAbsentStream(key, meta); }
 
-    PutResult putOverwrite(const String & key, const String & bytes, const Token & expected, const ObjectMeta & meta = {}) override
+    PutResult putOverwrite(const String & key, const String & bytes, const Token & expected, const ObjectMeta & meta) override
     {
         if (expected.type != TokenType::ETag)
             return {PutOutcome::PreconditionFailed, {}};   /// dialect-gated: never reaches `inner`
@@ -218,7 +218,7 @@ public:
         return r;
     }
 
-    CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected, const ObjectMeta & meta = {}) override
+    CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected, const ObjectMeta & meta) override
     {
         if (expected.has_value() && expected->type != TokenType::ETag)
             return {CasOutcome::Conflict, {}};   /// dialect-gated: never reaches `inner`
