@@ -1361,7 +1361,7 @@ void ContentAddressedTransaction::replaceFile(const std::string & path_from, con
     moveFile(path_from, path_to);
 }
 
-void ContentAddressedTransaction::unlinkFile(const std::string & path, bool /*if_exists*/, bool /*should_remove_objects*/)
+void ContentAddressedTransaction::unlinkFile(const std::string & path, bool if_exists, bool /*should_remove_objects*/)
 {
     /// Part file. Two sub-cases:
     ///   1. A file STAGED in this transaction (content entry or legacy mutable bytes): drop the
@@ -1395,7 +1395,19 @@ void ContentAddressedTransaction::unlinkFile(const std::string & path, bool /*if
         /// eagerly because the same hash may still be referenced by another staged entry.
         std::erase_if(st.entries, [&](const Cas::ManifestEntry & e) { return e.path == r->file; });
         if (!staged_here)
+        {
+            const auto view = metadata_storage.partAccess().getView(r->refKey(), Cas::Freshness::ForceFresh);
+            if (!view || !view->hasFile(r->file))
+            {
+                if (if_exists)
+                    return;
+                throw Exception(
+                    ErrorCodes::FILE_DOESNT_EXIST,
+                    "ContentAddressed: unlinkFile target does not exist: {}",
+                    path);
+            }
             st.content_removed.insert(r->file);
+        }
         return;
     }
 
@@ -1403,11 +1415,31 @@ void ContentAddressedTransaction::unlinkFile(const std::string & path, bool /*if
     /// a pruned mutation entry would otherwise leak until DROP.
     if (auto tf = Cas::parseTableFilePath(path))
     {
-        metadata_storage.store()->removeNamespaceFile(metadata_storage.liveNamespace(tf->table_uuid), tf->tail);
+        const auto ns = metadata_storage.liveNamespace(tf->table_uuid);
+        if (!metadata_storage.store()->getNamespaceFile(ns, tf->tail))
+        {
+            if (if_exists)
+                return;
+            throw Exception(
+                ErrorCodes::FILE_DOESNT_EXIST,
+                "ContentAddressed: unlinkFile target does not exist: {}",
+                path);
+        }
+        metadata_storage.store()->removeNamespaceFile(ns, tf->tail);
         return;
     }
     /// Loose mountpoint file: exact-token delete of the plain object.
-    metadata_storage.store()->removeMountpointObject(metadata_storage.serverRootId() + "/" + path);
+    const String key = metadata_storage.serverRootId() + "/" + path;
+    if (!metadata_storage.store()->getMountpointObject(key))
+    {
+        if (if_exists)
+            return;
+        throw Exception(
+            ErrorCodes::FILE_DOESNT_EXIST,
+            "ContentAddressed: unlinkFile target does not exist: {}",
+            path);
+    }
+    metadata_storage.store()->removeMountpointObject(key);
 }
 
 void ContentAddressedTransaction::truncateFile(const std::string &, size_t)

@@ -284,6 +284,11 @@ TEST(CaPartPathParser, SplitCacheEvictionStaysCorrect)
 using DB::Cas::tests::idOf;
 using DB::Cas::tests::u128Of;
 
+namespace DB::ErrorCodes
+{
+    extern const int FILE_DOESNT_EXIST;
+}
+
 namespace
 {
 
@@ -966,6 +971,31 @@ TEST(CaWiringOps, VerbatimMoveAndUnlink)
     EXPECT_FALSE(storage->existsFile("uui/uuid-1/tmp_mutation_5.txt"));
     ca_tx.unlinkFile("uui/uuid-1/mutation_5.txt", false, false);
     EXPECT_FALSE(storage->existsFile("uui/uuid-1/mutation_5.txt"));
+}
+
+TEST(CaWiringOps, UnlinkHonorsIfExistsForPartFiles)
+{
+    auto storage = openWiringStorage();
+    const String path = "uui/uuid-1/all_1_1_0/data.bin";
+
+    auto missing_tx = storage->createTransaction();
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::FILE_DOESNT_EXIST,
+        [&] { missing_tx->unlinkFile(path, /*if_exists=*/false, /*should_remove_objects=*/true); });
+
+    auto ignored_tx = storage->createTransaction();
+    EXPECT_NO_THROW(ignored_tx->unlinkFile(path, /*if_exists=*/true, /*should_remove_objects=*/true));
+    EXPECT_NO_THROW(ignored_tx->commit(DB::NoCommitOptions{}));
+    EXPECT_FALSE(storage->existsFile(path));
+
+    auto create_tx = storage->createTransaction();
+    writeThroughTransaction(*create_tx, path, "payload");
+    create_tx->commit(DB::NoCommitOptions{});
+    ASSERT_TRUE(storage->existsFile(path));
+
+    auto existing_tx = storage->createTransaction();
+    EXPECT_NO_THROW(existing_tx->unlinkFile(path, /*if_exists=*/false, /*should_remove_objects=*/true));
+    EXPECT_NO_THROW(existing_tx->commit(DB::NoCommitOptions{}));
+    EXPECT_FALSE(storage->existsFile(path));
 }
 
 TEST(CaWiringOps, TableRenameMovesRefsFilesAndDetached)
