@@ -218,8 +218,14 @@ RefTableSnapshot decodeRefTableSnapshot(
         const String line = readLine(in, line_cap, "cas_ref_snap");
         ReadBufferFromMemory m(line.data(), line.size());
         JsonObjectReader r(m, KeyStrictness::Tolerant, "cas_ref_snap");
-        bool saw_ns = false, saw_we = false, saw_rs = false, saw_lc = false;
-        std::optional<uint64_t> rte, rts, sfe, sfs;
+        bool saw_ns = false;
+        bool saw_we = false;
+        bool saw_rs = false;
+        bool saw_lc = false;
+        std::optional<uint64_t> rte;
+        std::optional<uint64_t> rts;
+        std::optional<uint64_t> sfe;
+        std::optional<uint64_t> sfs;
         String key;
         while (r.nextKey(key))
         {

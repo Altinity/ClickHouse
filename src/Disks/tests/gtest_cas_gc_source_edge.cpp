@@ -19,12 +19,14 @@ TEST(CasSourceEdge, RunKeyRoundTripsAndOrdersByBlobThenSource)
 {
     const BlobRef b1{BlobHashAlgo::CityHash128, BlobDigest::fromU128(UInt128(1))};
     const BlobRef b2{BlobHashAlgo::CityHash128, BlobDigest::fromU128(UInt128(2))};
-    const UInt128 s1(10), s2(20);
+    const UInt128 s1(10);
+    const UInt128 s2(20);
 
     BlobRef gb;
     UInt128 gs;
     SourceEdgeKeyCodec::parse(SourceEdgeKeyCodec::key(b1, s1), gb, gs);
-    EXPECT_EQ(gb, b1); EXPECT_EQ(gs, s1);
+    EXPECT_EQ(gb, b1);
+    EXPECT_EQ(gs, s1);
     EXPECT_LT(SourceEdgeKeyCodec::key(b1, s2), SourceEdgeKeyCodec::key(b2, s1));   // ref is the primary sort
     EXPECT_LT(SourceEdgeKeyCodec::key(b1, s1), SourceEdgeKeyCodec::key(b1, s2));   // source_id is the secondary sort
 }

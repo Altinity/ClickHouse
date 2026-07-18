@@ -34,7 +34,7 @@ TEST(CasRefCowMap, EmptyMapHasNoEntries)
     EXPECT_TRUE(m.empty());
     EXPECT_EQ(m.size(), 0u);
     EXPECT_FALSE(m.contains("a"));
-    EXPECT_TRUE(m.find("a") == m.end());
+    EXPECT_FALSE(m.contains("a"));
 }
 
 TEST(CasRefCowMap, EmplaceThenFind)
@@ -196,7 +196,7 @@ TEST(CasRefCowMap, MaterializeOnAnEmptyOverlayIsANoOp)
     RefCowMap m;
     m.emplace("a", row(1, 1, 1));
     m.materialize();
-    const long use_count_before = m.baseUseCountForTest();
+    const int64_t use_count_before = m.baseUseCountForTest();
     m.materialize();   /// overlay is already empty
     EXPECT_EQ(m.baseUseCountForTest(), use_count_before);
     EXPECT_TRUE(m.contains("a"));
@@ -279,7 +279,7 @@ TEST(CasRefCowMap, CopySharesBaseUntilEitherSideMaterializesANewOne)
 
 TEST(CasRefCowMap, PropertyMatchesStdMapOverRandomOps)
 {
-    std::mt19937 rng(20260717);
+    std::mt19937 rng(20260717); // NOLINT(cert-msc): deterministic seed is required for reproducible property coverage.
 
     for (int trial = 0; trial < 50; ++trial)
     {

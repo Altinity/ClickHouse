@@ -40,10 +40,10 @@ class SingleAttemptRetryStrategy final : public Aws::Client::RetryStrategy
 {
 public:
     /// Record that the SDK considered retrying, then refuse the retry.
-    bool ShouldRetry(const Aws::Client::AWSError<Aws::Client::CoreErrors> &, long) const override;
+    bool ShouldRetry(const Aws::Client::AWSError<Aws::Client::CoreErrors> &, long) const override; // NOLINT(google-runtime-int): AWS SDK virtual API requires `long`.
     /// Return no delay; `ShouldRetry` rejects the attempt immediately afterward.
-    long CalculateDelayBeforeNextRetry(const Aws::Client::AWSError<Aws::Client::CoreErrors> &, long) const override;
-    long GetMaxAttempts() const override { return 1; }
+    long CalculateDelayBeforeNextRetry(const Aws::Client::AWSError<Aws::Client::CoreErrors> &, long) const override; // NOLINT(google-runtime-int): AWS SDK virtual API requires `long`.
+    long GetMaxAttempts() const override { return 1; } // NOLINT(google-runtime-int): AWS SDK virtual API requires `long`.
 };
 }
 #endif

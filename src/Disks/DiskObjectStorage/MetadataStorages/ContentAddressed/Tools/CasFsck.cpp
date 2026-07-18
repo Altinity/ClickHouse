@@ -423,7 +423,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
     bool have_gc_state = false;
 
     for (const auto & [bkey, sz] : present_blobs)
-        if (!reachable_blobs.count(bkey))
+        if (!reachable_blobs.contains(bkey))
         {
             if (const std::optional<BlobRef> ref = layout.parseBlobKey(bkey))
                 unref_hashes.insert(*ref);
@@ -464,7 +464,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
                         BlobRef ref;
                         UInt128 source_id;
                         SourceEdgeKeyCodec::parse(key, ref, source_id);   // throws CORRUPTED_DATA on malformed (fail-closed)
-                        if (unref_hashes.count(ref))
+                        if (unref_hashes.contains(ref))
                         {
                             in_run_hashes.insert(ref);
                             if (!payload.empty() && payload[0] == kCondemned)
@@ -502,7 +502,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
 
     for (const auto & [bkey, sz] : present_blobs)
     {
-        if (reachable_blobs.count(bkey))
+        if (reachable_blobs.contains(bkey))
             continue;
         ++report.unreachable;
 
@@ -526,7 +526,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
                 : "condemned at round " + std::to_string(rit->second.condemn_round)
                     + "; graduates once every writer acks past it (expected)";
         }
-        else if (in_run_hashes.count(hash))
+        else if (in_run_hashes.contains(hash))
         {
             cls = FsckClass::AwaitingGc;
             note = "edges still in the GC snapshot; the drop has not folded yet (expected)";
@@ -572,10 +572,10 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
             present_body_hashes.insert(*ref);
         /// else: foreign key shape under blobs/ — not ours to pair
     for (const BlobRef & hash : present_meta_hashes)
-        if (!present_body_hashes.count(hash))
+        if (!present_body_hashes.contains(hash))
             ++report.meta_without_body;
     for (const BlobRef & hash : present_body_hashes)
-        if (!present_meta_hashes.count(hash))
+        if (!present_meta_hashes.contains(hash))
             ++report.body_without_meta;
     }
     else
@@ -629,7 +629,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
         listAll(backend, manifests_prefix, manifest_bodies, on_progress, deadline, "listing manifests");
         for (const auto & [mkey, sz] : manifest_bodies)
         {
-            if (owned_manifest_keys.count(mkey))
+            if (owned_manifest_keys.contains(mkey))
                 continue;   /// owned by a committed ref — accounted above
             ++report.unreachable;
             if (detail)

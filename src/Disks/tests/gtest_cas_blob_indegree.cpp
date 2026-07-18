@@ -240,7 +240,8 @@ DecodedRun decodeRun(InMemoryBackend & backend, const RunRef & run)
     auto r = openSourceEdgeRun(backend, run.key);
     /// Every run this test helper decodes is CityHash128 (16-byte), so `.toU128()` is a
     /// provably-exact round trip.
-    String k, p;
+    String k;
+    String p;
     while (r.next(k, p))
     {
         BlobRef bh_ref;

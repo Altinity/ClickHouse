@@ -225,7 +225,7 @@ void ContentAddressedMetadataStorage::runOneGcRoundForTest()
     /// scheduler per call would acquire the lease on the first call and then back off forever
     /// ("incumbent alive" - its own previous incarnation). Recreating the scheduler for every call
     /// would therefore make every round after the first a silent no-op.
-    Cas::CasGcScheduler * sched;
+    Cas::CasGcScheduler * sched = nullptr;
     {
         std::lock_guard lock(gc_scheduler_mutex);
         if (!gc_scheduler)
@@ -356,7 +356,7 @@ Cas::RoundReport ContentAddressedMetadataStorage::runGarbageCollectionRoundNow()
             "Garbage collection is not enabled on this content-addressed disk");
     /// Mirror runOneGcRoundForTest: a STABLE scheduler instance across calls (the lease's
     /// observation-window steal protocol compares consecutive observations of the same gc_id).
-    Cas::CasGcScheduler * sched;
+    Cas::CasGcScheduler * sched = nullptr;
     {
         std::lock_guard lock(gc_scheduler_mutex);
         if (!gc_scheduler)

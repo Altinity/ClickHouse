@@ -26,7 +26,7 @@ TEST(GCSConditionalDialect, IfNoneMatchStarBecomesGenerationZero)
     EXPECT_EQ(r.GetHeaderValue("x-goog-if-generation-match"), "0");
 }
 
-TEST(GCSConditionalDialect, IfMatchDigitsMapped_QuotesStripped)
+TEST(GCSConditionalDialect, IfMatchDigitsMappedQuotesStripped)
 {
     auto r = makeRequest();
     r.SetHeaderValue("if-match", "\"1783078552147137\"");

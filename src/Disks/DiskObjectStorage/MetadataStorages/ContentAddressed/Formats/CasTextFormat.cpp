@@ -371,7 +371,7 @@ String openObject(FormatId id, std::string_view stored)
         throw Exception(ErrorCodes::CORRUPTED_DATA,
             "CAS {}: compressed object in a format whose policy is raw", t.type);
 
-    const unsigned long long content = ZSTD_getFrameContentSize(stored.data(), stored.size());
+    const uint64_t content = ZSTD_getFrameContentSize(stored.data(), stored.size());
     if (content == ZSTD_CONTENTSIZE_UNKNOWN || content == ZSTD_CONTENTSIZE_ERROR)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: zstd frame without a declared content size", t.type);
     if (t.object_cap != 0 && content > t.object_cap)

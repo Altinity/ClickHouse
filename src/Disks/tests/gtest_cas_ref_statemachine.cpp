@@ -742,7 +742,7 @@ TEST(CasRefStateMachine, ReplayRejectsHandBuiltSnapshotWithUnsortedPrecommits)
 /// Randomized replay equation: replay(snapshotOf(mid-state), tail) == full replay (spec §Table State).
 TEST(CasRefStateMachine, ReplayEquationPropertyTest)
 {
-    std::mt19937 rng(4242);
+    std::mt19937 rng(4242); // NOLINT(cert-msc): deterministic seed is required for reproducible property coverage.
     const std::vector<String> names{"a", "b", "c"};
 
     for (int trial = 0; trial < 30; ++trial)
@@ -787,7 +787,7 @@ TEST(CasRefStateMachine, ReplayEquationPropertyTest)
                 {
                     const size_t idx = eligible[rng() % eligible.size()];
                     const auto [name, mref] = open_precommits[idx];
-                    open_precommits.erase(open_precommits.begin() + static_cast<long>(idx));
+                    open_precommits.erase(open_precommits.begin() + static_cast<int64_t>(idx));
                     history.push_back(makeTxn(kNs, RefTxnId{1, seq++}, {promoteOp(name, mref)}));
                     open_committed.emplace_back(name, mref);
                 }
@@ -804,14 +804,14 @@ TEST(CasRefStateMachine, ReplayEquationPropertyTest)
             {
                 const size_t idx = rng() % open_precommits.size();
                 const auto [name, mref] = open_precommits[idx];
-                open_precommits.erase(open_precommits.begin() + static_cast<long>(idx));
+                open_precommits.erase(open_precommits.begin() + static_cast<int64_t>(idx));
                 history.push_back(makeTxn(kNs, RefTxnId{1, seq++}, {removePrecommitOp(name, mref)}));
             }
             else if (!open_committed.empty())
             {
                 const size_t idx = rng() % open_committed.size();
                 const auto [name, mref] = open_committed[idx];
-                open_committed.erase(open_committed.begin() + static_cast<long>(idx));
+                open_committed.erase(open_committed.begin() + static_cast<int64_t>(idx));
                 history.push_back(makeTxn(kNs, RefTxnId{1, seq++}, {removeCommittedOp(name, mref)}));
             }
         }
@@ -819,8 +819,8 @@ TEST(CasRefStateMachine, ReplayEquationPropertyTest)
         const RefTableState full = replay(std::nullopt, history);
 
         const size_t cut = rng() % (history.size() + 1);
-        const std::vector<RefLogTxn> head(history.begin(), history.begin() + static_cast<long>(cut));
-        const std::vector<RefLogTxn> tail(history.begin() + static_cast<long>(cut), history.end());
+        const std::vector<RefLogTxn> head(history.begin(), history.begin() + static_cast<int64_t>(cut));
+        const std::vector<RefLogTxn> tail(history.begin() + static_cast<int64_t>(cut), history.end());
         const RefTableState mid = replay(std::nullopt, head);
         const std::optional<RefTableSnapshot> mid_snapshot =
             cut == 0 ? std::nullopt : std::make_optional(snapshotOf(mid, kNs));
@@ -911,7 +911,7 @@ TEST(CasRefStateMachine, AdmitsRejectsGrowthPastRemovalBudget)
 /// real encoders' output, for both bounds, across randomized states and candidate growing ops.
 TEST(CasRefStateMachine, AdmitsExactnessPropertyTest)
 {
-    std::mt19937 rng(777);
+    std::mt19937 rng(777); // NOLINT(cert-msc): deterministic seed is required for reproducible property coverage.
 
     for (int trial = 0; trial < 20; ++trial)
     {

@@ -1,6 +1,5 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <unordered_set>
 
 using namespace DB::Cas;
@@ -10,7 +9,9 @@ TEST(CasIds, StrongTypingAndContainers)
     /// Test the strong-typed-string class `RootNamespace`.
     /// (`BlobId` was deleted in the mixed-algo-pools refactor; `TreeId` was part of the
     /// standalone-tree layer excised in the rev. 15 `PartManifest` redesign.)
-    RootNamespace ns1{"srv1"}, ns2{"srv1"}, ns3{"srv2"};
+    RootNamespace ns1{"srv1"};
+    RootNamespace ns2{"srv1"};
+    RootNamespace ns3{"srv2"};
     EXPECT_EQ(ns1, ns2);
     EXPECT_NE(ns1, ns3);
     std::unordered_set<RootNamespace> s{ns1, ns3};
@@ -30,7 +31,9 @@ TEST(CasIds, HexU128RoundTrip)
 
 TEST(CasToken, Basics)
 {
-    Token a{"etag-1", TokenType::ETag}, b{"etag-1", TokenType::ETag}, c{"etag-2", TokenType::ETag};
+    Token a{"etag-1", TokenType::ETag};
+    Token b{"etag-1", TokenType::ETag};
+    Token c{"etag-2", TokenType::ETag};
     EXPECT_EQ(a, b);
     EXPECT_NE(a, c);
     EXPECT_TRUE(Token{}.empty());

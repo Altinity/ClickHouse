@@ -455,8 +455,7 @@ HeartbeatFloor computeHeartbeatFloor(Backend & b, const Layout & l, uint64_t now
         {
             /// `/owner` and `/epoch` objects share the subtree — only mount bodies gate the floor.
             static constexpr std::string_view mount_suffix = "/mount";
-            if (listed.key.size() < mount_suffix.size()
-                || listed.key.compare(listed.key.size() - mount_suffix.size(), mount_suffix.size(), mount_suffix) != 0)
+            if (!listed.key.ends_with(mount_suffix))
                 continue;
 
             const String & key = listed.key;
@@ -550,7 +549,7 @@ HeartbeatFloor computeHeartbeatFloor(Backend & b, const Layout & l, uint64_t now
 
     /// Prune every `obs` entry for a srid this pass's LIST never saw at all.
     for (auto it = obs.begin(); it != obs.end(); )
-        it = seen_srids.count(it->first) ? std::next(it) : obs.erase(it);
+        it = seen_srids.contains(it->first) ? std::next(it) : obs.erase(it);
 
     return floor;
 }
@@ -1032,12 +1031,26 @@ void SingleWriterSlot::backgroundLoop(std::chrono::milliseconds period)
             /// Notify the subclass that renewal failed and the loop is stopping (off `state_mutex`).
             /// The mount-lease keeper latches its local write fence to lost here. Never let the hook's
             /// own throw escape the loop — we are already stopping.
-            try { onRenewFailed(); } catch (...) {}
+            try
+            {
+                onRenewFailed();
+            }
+            catch (...)
+            {
+                /// The renewal loop is already stopping; a hook exception must not escape it.
+            }
             return;
         }
         /// Successful renewal: notify the subclass (off `state_mutex`) before sleeping again. The
         /// mount-lease keeper refreshes the write-fence deadline here.
-        try { onRenewSucceeded(); } catch (...) {}
+        try
+        {
+            onRenewSucceeded();
+        }
+        catch (...)
+        {
+            /// A notification hook cannot be allowed to stop the already-renewed lease loop.
+        }
         lock.lock();
     }
 }

@@ -131,7 +131,7 @@ HeadResult InMemoryBackend::head(const String & key)
 PutResult InMemoryBackend::putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta)
 {
     std::lock_guard lock(mutex_);
-    if (store_.count(key))
+    if (store_.contains(key))
         return {PutOutcome::PreconditionFailed, {}};
 
     Token t = mintToken();
@@ -276,7 +276,7 @@ PutResult InMemoryBackend::promoteStaged(const String & staging_key, const Strin
             "InMemoryBackend::promoteStaged: staging object {} is absent", staging_key);
 
     /// Write-once: a present destination is the "lost the race" signal, not an overwrite.
-    if (store_.count(blob_key))
+    if (store_.contains(blob_key))
         return {PutOutcome::PreconditionFailed, {}};
 
     /// Server-side copy: the destination bytes ARE the staging bytes; a fresh monotone token stands in
@@ -332,7 +332,7 @@ ListPage InMemoryBackend::list(const String & prefix, const String & cursor, siz
     size_t count = 0;
     while (it != store_.end() && count < limit)
     {
-        if (it->first.substr(0, prefix.size()) != prefix)
+        if (!it->first.starts_with(prefix))
             break;
 
         ListedKey lk;
@@ -345,7 +345,7 @@ ListPage InMemoryBackend::list(const String & prefix, const String & cursor, siz
     }
 
     // Set next_cursor if there are more keys in this prefix
-    if (!page.keys.empty() && it != store_.end() && it->first.substr(0, prefix.size()) == prefix)
+    if (!page.keys.empty() && it != store_.end() && it->first.starts_with(prefix))
         page.next_cursor = page.keys.back().key;
 
     return page;

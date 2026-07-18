@@ -88,7 +88,7 @@ std::vector<String> CasPlainObjects::listNamespaceFiles(const RootNamespace & ns
         for (const ListedKey & listed : page.keys)
         {
             /// Strip the storage prefix so callers receive the bare flat file name.
-            if (listed.key.size() >= prefix.size() && listed.key.compare(0, prefix.size(), prefix) == 0)
+            if (listed.key.starts_with(prefix))
                 names.push_back(listed.key.substr(prefix.size()));
         }
         if (page.next_cursor.empty())

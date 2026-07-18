@@ -45,13 +45,13 @@ namespace DB::Cas
 /// not this SDK loop. Every consultation is counted because it proves that the SDK considered the
 /// first attempt inconclusive or failed; otherwise the retry-consultation metric would remain zero
 /// even when the SDK reached this decision point.
-bool detail::SingleAttemptRetryStrategy::ShouldRetry(const Aws::Client::AWSError<Aws::Client::CoreErrors> &, long) const
+bool detail::SingleAttemptRetryStrategy::ShouldRetry(const Aws::Client::AWSError<Aws::Client::CoreErrors> &, long) const // NOLINT(google-runtime-int): AWS SDK virtual API requires `long`.
 {
     recordConditionalWriteSdkRetryConsidered();
     return false;
 }
 
-long detail::SingleAttemptRetryStrategy::CalculateDelayBeforeNextRetry(const Aws::Client::AWSError<Aws::Client::CoreErrors> &, long) const
+long detail::SingleAttemptRetryStrategy::CalculateDelayBeforeNextRetry(const Aws::Client::AWSError<Aws::Client::CoreErrors> &, long) const // NOLINT(google-runtime-int): AWS SDK virtual API requires `long`.
 {
     /// AWSClient prepares the delay before calling `ShouldRetry`, so this method is reached even
     /// though no retry will be made. Returning zero avoids needless backoff computation; it is never
@@ -1027,7 +1027,7 @@ ListPage ObjectStorageBackend::list(const String & prefix, const String & cursor
         all.reserve(children.size());
         for (const auto & child : children)
         {
-            if (child->relative_path.substr(0, physical_prefix.size()) != physical_prefix)
+            if (!child->relative_path.starts_with(physical_prefix))
                 continue;
             ListedKey lk;
             lk.key = child->relative_path.substr(strip.size());
@@ -1064,7 +1064,7 @@ ListPage ObjectStorageBackend::list(const String & prefix, const String & cursor
     for (; it->isValid(); it->next())
     {
         const auto child = it->current();
-        if (child->relative_path.substr(0, physical_prefix.size()) != physical_prefix)
+        if (!child->relative_path.starts_with(physical_prefix))
             continue;
 
         ListedKey lk;

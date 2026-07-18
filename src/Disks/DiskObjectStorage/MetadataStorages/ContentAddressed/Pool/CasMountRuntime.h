@@ -182,7 +182,7 @@ public:
     {
         const String & prefix = server_root_id;
         const String & full = ns.string();
-        return full.size() > prefix.size() && full.compare(0, prefix.size(), prefix) == 0
+        return full.size() > prefix.size() && full.starts_with(prefix)
             && full[prefix.size()] == '/'
             && unclean_epoch_boundary_seen_at.load(std::memory_order_relaxed) == liveWriterEpoch();
     }

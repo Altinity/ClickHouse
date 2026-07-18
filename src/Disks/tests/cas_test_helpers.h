@@ -7,7 +7,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcStateFormat.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasBlobInDegree.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.h>
@@ -489,7 +488,8 @@ inline std::vector<DB::Cas::RetiredEntry> currentRetiredSet(
         if (run.shard != shard)
             continue;
         auto r = DB::Cas::openSourceEdgeRun(backend, run.key);
-        String k, p;
+        String k;
+        String p;
         while (r.next(k, p))
         {
             if (p.empty() || p[0] != DB::Cas::kCondemned)
@@ -687,7 +687,8 @@ inline int64_t inDegreeInRuns(
     for (const DB::Cas::RunRef & run : runs)
     {
         auto r = DB::Cas::openSourceEdgeRun(backend, run.key);
-        String k, p;
+        String k;
+        String p;
         while (r.next(k, p))
         {
             if (p.empty() || p[0] != DB::Cas::kEdgeActive)

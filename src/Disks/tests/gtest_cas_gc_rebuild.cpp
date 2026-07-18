@@ -382,7 +382,8 @@ TEST(CasGcRebuild, OrphanBlobCondemnedInRebuiltRun)
     for (const RunRef & r : seal.blob_target_runs)
     {
         auto reader = openSourceEdgeRun(*backend, r.key);
-        String k, p;
+        String k;
+        String p;
         while (reader.next(k, p))
         {
             BlobRef bh_ref;

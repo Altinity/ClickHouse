@@ -25,7 +25,7 @@ std::optional<BlobRef> Layout::parseBlobKey(std::string_view key) const
         rest.remove_suffix(kMetaSuffix.size());
 
     const String blobs_root = blobsPrefix();   /// "<prefix>/blobs/"
-    if (rest.size() <= blobs_root.size() || rest.substr(0, blobs_root.size()) != blobs_root)
+    if (rest.size() <= blobs_root.size() || !rest.starts_with(blobs_root))
         return std::nullopt;
     rest.remove_prefix(blobs_root.size());
 

@@ -252,9 +252,17 @@ bool SourceEdgeRunReader::next(SourceEdgeRecord & rec)
     }
 
     SourceEdgeRecord out;
-    String b, tv;
-    bool have_b = false, have_s = false, have_m = false;
-    bool have_pend = false, have_tt = false, have_tv = false, have_sz = false, have_cr = false, have_mc = false;
+    String b;
+    String tv;
+    bool have_b = false;
+    bool have_s = false;
+    bool have_m = false;
+    bool have_pend = false;
+    bool have_tt = false;
+    bool have_tv = false;
+    bool have_sz = false;
+    bool have_cr = false;
+    bool have_mc = false;
     TokenType tt{};
     do
     {

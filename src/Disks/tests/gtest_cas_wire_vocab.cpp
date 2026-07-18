@@ -34,7 +34,10 @@ TEST(CasWireVocab, SiblingFieldsWriteAndReadBack)
 
     DB::ReadBufferFromMemory in(out.str().data(), out.str().size());
     JsonObjectReader r(in, KeyStrictness::Tolerant, "t");
-    String key, tv, ha, h;
+    String key;
+    String tv;
+    String ha;
+    String h;
     TokenType tt{};
     while (r.nextKey(key))
     {

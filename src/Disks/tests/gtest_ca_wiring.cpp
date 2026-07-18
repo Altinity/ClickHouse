@@ -686,8 +686,6 @@ TEST(CaWiringRoute, DirShapeDispatchOrderIsStable)
 
 /// ==== M-W Task 3: the write path through IMetadataTransaction ====
 
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedTransaction.h>
-#include <IO/ReadHelpers.h>
 
 namespace
 {

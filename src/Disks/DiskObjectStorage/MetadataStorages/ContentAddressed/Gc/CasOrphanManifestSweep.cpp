@@ -310,7 +310,7 @@ uint64_t sweepNamespace(Pool & store, const RootNamespace & ns, const BuildPrefi
     uint64_t deleted = 0;
     forEachListedKey(backend, prefix_key, [&](const ListedKey & listed)
     {
-        if (active.count(listed.key))
+        if (active.contains(listed.key))
             return;   /// owned by a committed or precommit owner — never sweep
 
         /// Exact-token delete: HEAD for the current token, then deleteExact. A 404 between HEAD and
@@ -406,12 +406,12 @@ ManifestSweepResult sweepManifestCursorPage(
                 errored_namespaces.insert(parsed->ns.string());
             }
         }
-        if (errored_namespaces.count(parsed->ns.string()))
+        if (errored_namespaces.contains(parsed->ns.string()))
         {
             ++result.skipped;
             continue;
         }
-        if (active_it->second.count(parsed->key))
+        if (active_it->second.contains(parsed->key))
         {
             ++result.skipped;
             continue;

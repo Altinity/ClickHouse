@@ -74,7 +74,7 @@ RefOwnerBinding committed(const String & ref_name, const ManifestRef & r)
 ///   - GC must NOT throw.
 ///   - Blob 2 is unreferenced (r1 dropped, r2 never references it)  => collected (in-degree 0, key gone).
 ///   - Blob 1 is re-referenced by r2                                 => spared  (in-degree 1, key present).
-TEST(CasGcUndercount, H2_DropThenRepointFromSameOldIsIdempotentNoUnderflow)
+TEST(CasGcUndercount, H2DropThenRepointFromSameOldIsIdempotentNoUnderflow)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
@@ -162,7 +162,7 @@ public:
     String gc_state_key = "p/gc/state";
 };
 
-TEST(CasGcUndercount, H1_DrainAfterDeposedRemovalFoldDoesNotUnderflow)
+TEST(CasGcUndercount, H1DrainAfterDeposedRemovalFoldDoesNotUnderflow)
 {
     auto backend = std::make_shared<InterruptRoundCasBackend>();
     auto store = openPoolForTest(backend);
@@ -265,7 +265,7 @@ public:
     std::function<void()> on_commit;
 };
 
-TEST(CasGcUndercount, H1b_FenceWindowRemovalReFoldedNextRoundUnderflows)
+TEST(CasGcUndercount, H1bFenceWindowRemovalReFoldedNextRoundUnderflows)
 {
     auto backend = std::make_shared<DropAtCommitBackend>();
     /// gc_fold_max_defer_rounds=0 forces fold-every-round: the injected drop fires from `on_commit`,

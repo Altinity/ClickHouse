@@ -109,7 +109,7 @@ TEST(CasBlobEnvelopeFormat, RefEscaperAlphabetPinned)
     /// the 256-byte budget arithmetic depends on this alphabet being codec-owned and frozen.
     EnvelopeHeader h = sampleHeader(String("a/b\"c\\d") + '\x01' + "e");
     const String head = encodeEnvelopeHeader(h, L);
-    const String expected_ref_json = "\"a/b\\\"c\\\\d\\u0001e\"";
+    const String expected_ref_json = R"("a/b\"c\\d\u0001e")";
     EXPECT_NE(head.find("\"ref\":" + expected_ref_json), String::npos)
         << "escaper alphabet drifted: '/' must be verbatim, quote/backslash escaped, control -> \\uXXXX";
 }

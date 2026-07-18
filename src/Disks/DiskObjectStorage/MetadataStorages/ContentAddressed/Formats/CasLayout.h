@@ -166,7 +166,7 @@ public:
         if (ns_part.empty())
             return std::nullopt;
 
-        RefObjectKind kind;
+        RefObjectKind kind{};
         if (kind_seg == "_cleanup")
             kind = RefObjectKind::Cleanup;
         else if (kind_seg == "_log")

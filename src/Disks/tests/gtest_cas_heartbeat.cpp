@@ -216,7 +216,7 @@ TEST(CasMountAudit, KeeperForeignConflictRefusesAndNamesHolder)
     uint64_t now_ms = 1000;
 
     /// Foreign holder X claims the slot first.
-    ASSERT_EQ(claimMount(*backend, layout, srid, uuid_x, /*epoch=*/1, now_ms, /*ttl_ms=*/100).kind,
+    ASSERT_EQ(claimMount(*backend, layout, srid, uuid_x, /*our_epoch=*/1, now_ms, /*ttl_ms=*/100).kind,
               MountClaimResult::Claimed);
 
     std::vector<CasEvent> seen;

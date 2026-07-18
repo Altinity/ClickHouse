@@ -139,7 +139,9 @@ PartManifest decodePartManifest(std::string_view data)
         const String meta = readLine(in, line_cap, "cas_part_manifest");
         ReadBufferFromMemory mm(meta.data(), meta.size());
         JsonObjectReader r(mm, KeyStrictness::Tolerant, "cas_part_manifest");
-        std::optional<uint64_t> me, mb, mo;
+        std::optional<uint64_t> me;
+        std::optional<uint64_t> mb;
+        std::optional<uint64_t> mo;
         std::optional<String> ns;
         std::optional<UInt128> pd;
         String key;
@@ -195,8 +197,11 @@ PartManifest decodePartManifest(std::string_view data)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: record must start with \"p\"");
         ManifestEntry e;
         e.path = r.readString();
-        std::optional<String> pm, ha, h;
-        std::optional<uint64_t> sz, il;
+        std::optional<String> pm;
+        std::optional<String> ha;
+        std::optional<String> h;
+        std::optional<uint64_t> sz;
+        std::optional<uint64_t> il;
         while (r.nextKey(key))
         {
             if (key == "pm") pm = r.readString();

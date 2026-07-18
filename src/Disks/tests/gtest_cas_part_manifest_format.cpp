@@ -117,9 +117,9 @@ TEST(CasPartManifestFormat, PlacementWordsRenderAndRejectUnknown)
 
     /// An unknown placement word fails closed.
     String bad = text;
-    const size_t pos = bad.find("\"pm\":\"blob\"");
+    const size_t pos = bad.find(R"("pm":"blob")");
     ASSERT_NE(pos, String::npos);
-    bad.replace(pos, String("\"pm\":\"blob\"").size(), "\"pm\":\"bogus\"");
+    bad.replace(pos, String(R"("pm":"blob")").size(), R"("pm":"bogus")");
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodePartManifest(bad); });
 }
 
@@ -225,8 +225,8 @@ TEST(CasPartManifestFormat, DecodeRejectsOutOfOrderEntries)
     m.payload_digest = computePayloadDigest(m);
 
     const String text = encodePartManifest(m);
-    const size_t pos_a = text.find("\"p\":\"a/one.bin\"");
-    const size_t pos_b = text.find("\"p\":\"b/two.bin\"");
+    const size_t pos_a = text.find(R"("p":"a/one.bin")");
+    const size_t pos_b = text.find(R"("p":"b/two.bin")");
     ASSERT_NE(pos_a, String::npos);
     ASSERT_NE(pos_b, String::npos);
 
@@ -269,10 +269,10 @@ TEST(CasPartManifestFormat, DecodeRejectsNonAdjacentDuplicatePath)
     m.payload_digest = computePayloadDigest(m);
 
     String forged = encodePartManifest(m);
-    const String needle = "\"p\":\"ccc/three.bin\"";
+    const String needle = R"("p":"ccc/three.bin")";
     const size_t pos = forged.find(needle);
     ASSERT_NE(pos, String::npos);
-    forged.replace(pos, needle.size(), "\"p\":\"aaa/one.bin\"");
+    forged.replace(pos, needle.size(), R"("p":"aaa/one.bin")");
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodePartManifest(forged); });
 }
@@ -280,10 +280,10 @@ TEST(CasPartManifestFormat, DecodeRejectsNonAdjacentDuplicatePath)
 TEST(CasPartManifestFormat, UnknownEntryAlgoFailsClosed)
 {
     String bad = encodePartManifest(sample());
-    const String needle = "\"ha\":\"ch128\"";
+    const String needle = R"("ha":"ch128")";
     const size_t pos = bad.find(needle);
     ASSERT_NE(pos, String::npos);
-    bad.replace(pos, needle.size(), "\"ha\":\"bogus\"");
+    bad.replace(pos, needle.size(), R"("ha":"bogus")");
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodePartManifest(bad); });
 }
 
@@ -293,7 +293,7 @@ TEST(CasPartManifestFormat, UnknownEntryAlgoFailsClosed)
 TEST(CasPartManifestFormat, DigestHexWidthMismatchFailsClosedNotBadArguments)
 {
     String bad = encodePartManifest(sample());
-    const String key = "\"h\":\"";
+    const String key = R"("h":")";
     const size_t key_pos = bad.find(key);
     ASSERT_NE(key_pos, String::npos);
     const size_t hex_start = key_pos + key.size();

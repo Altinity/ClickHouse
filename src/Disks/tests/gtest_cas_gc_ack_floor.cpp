@@ -55,7 +55,7 @@ class TokenMismatchOnAbsentBackend : public InMemoryBackend
 public:
     DeleteOutcome deleteExact(const String & key, const Token & token) override
     {
-        if (quirk_keys.count(key) && !InMemoryBackend::head(key).exists)
+        if (quirk_keys.contains(key) && !InMemoryBackend::head(key).exists)
         {
             DeleteOutcome d;
             d.kind = DeleteOutcome::Kind::TokenMismatch;

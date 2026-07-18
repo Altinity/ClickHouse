@@ -330,7 +330,7 @@ CasWriteOutcome CasRequestController::putIfAbsentControlled(
 
         /// The committed incarnation's token, filled by whichever leg proves Committed below.
         Token committed_token;
-        CasWriteOutcome attempt_outcome;
+        CasWriteOutcome attempt_outcome{};
         try
         {
             const PutResult put = backend->putIfAbsent(key_s, bytes_s);

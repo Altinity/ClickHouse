@@ -647,7 +647,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
             /// Only generations the wholesale prune already passed AND that no live ref still pins.
             if (old_ref.generation > state.snap_pruned_through)
                 continue;   /// not yet pruned-through: the normal prune will reclaim it when it ages out
-            if (new_referenced_generations.count(old_ref.generation))
+            if (new_referenced_generations.contains(old_ref.generation))
                 continue;   /// still referenced by a (possibly different-shard) live ref: keep it
             if (!handed_off.insert(old_ref.generation).second)
                 continue;   /// already reclaimed this round via another shard's ref
@@ -1519,7 +1519,7 @@ void Gc::cleanupRefObjects(const FoldResult & folded, bool suppress_destructive)
 
         std::set<RefTxnId> removal_logs_blocked;
         for (const RefTxnId & log_id : listing.logs)
-            if (blocked_removals.count({ns_str, log_id}))
+            if (blocked_removals.contains({ns_str, log_id}))
                 removal_logs_blocked.insert(log_id);
 
         std::optional<RefTxnId> completed_removal_snapshot;
@@ -1747,7 +1747,7 @@ void Gc::pruneSupersededGenerations(uint64_t adopted_generation, uint64_t attemp
             /// reclaimed — either here (if the ref moved off before the cursor reached it, WholesalePrune*
             /// test) or by the hand-off (if the cursor passed it while still referenced, HandOffDeletes*
             /// test). Until the ref moves it persists safely (bounded: one small run per shard).
-            if (referenced_generations.count(g))
+            if (referenced_generations.contains(g))
             {
                 LOG_TRACE(getLogger("CasGc"),
                     "CAS GC prune: retaining generation {} — still referenced by the live adopted seal",
@@ -1973,7 +1973,10 @@ RebuildReport Gc::rebuildBaseline(bool force)
             {
                 max_gen = std::max(max_gen, static_cast<uint64_t>(std::stoull(k.key.substr(from, slash - from))));
             }
-            catch (...) {}   /// foreign key shape under gc/gen — debris, not a numbering input
+            catch (...)
+            {
+                /// Foreign key shape under `gc/gen` is debris, not a numbering input.
+            }
         }, 1000, onGcEnumerationPage);
     }
     const uint64_t generation = max_gen + 1;

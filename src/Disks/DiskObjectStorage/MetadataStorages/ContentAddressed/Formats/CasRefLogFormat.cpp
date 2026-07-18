@@ -255,7 +255,9 @@ RefLogTxn decodeRefLogTxn(std::string_view data, const String & expected_ns, con
         const String line = readLine(in, line_cap, "cas_ref_log");
         ReadBufferFromMemory m(line.data(), line.size());
         JsonObjectReader r(m, KeyStrictness::Tolerant, "cas_ref_log");
-        bool saw_ns = false, saw_we = false, saw_rs = false;
+        bool saw_ns = false;
+        bool saw_we = false;
+        bool saw_rs = false;
         String key;
         while (r.nextKey(key))
         {

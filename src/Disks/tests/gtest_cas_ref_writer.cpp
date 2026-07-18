@@ -249,7 +249,7 @@ public:
             /// (I1) Independent per-key blocking: every matching key parks on its OWN release, unlike
             /// `block_armed` above (one shared gate released all-at-once). Lets a test park two DISTINCT
             /// `_snap/<id>` PUTs concurrently and release them in a chosen order.
-            if (independent_block_armed && key.find(independent_block_substr) != String::npos)
+            if (independent_block_armed && key.contains(independent_block_substr))
             {
                 independent_blocked_keys.insert(key);
                 block_cv.notify_all();
@@ -899,7 +899,14 @@ TEST(RefWriterAppendLane, I1WedgeResolveCorruptionSurfacesAndKeepsWedge)
     /// out this bounded wait). This is the leg the unfixed code left blocked forever.
     auto fut2 = std::async(std::launch::async, [&]
     {
-        try { store->dropRef(ns, "y"); } catch (...) {}   /// anomaly expected; we assert only "no hang"
+        try
+        {
+            store->dropRef(ns, "y");
+        }
+        catch (...)
+        {
+            /// The anomaly is expected here; this future only verifies that the caller does not hang.
+        }
     });
     ASSERT_EQ(fut2.wait_for(std::chrono::seconds(10)), std::future_status::ready)
         << "a later same-table append hung -- the leader bookkeeping was not restored after the anomaly";
@@ -1177,7 +1184,7 @@ TEST(RefWriterSnapshotPublish, ThresholdTriggerPublishesCacheReplayEquivalentByt
 
     const auto snap_id = listGreatestSnapshotIdForTest(*backend, layout, ns);
     ASSERT_TRUE(snap_id.has_value()) << "the threshold trigger must have published a snapshot";
-    EXPECT_EQ(store->newestPublishedSnapshotIdForTest(ns), snap_id);
+    EXPECT_TRUE(store->newestPublishedSnapshotIdForTest(ns) == snap_id);
     EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), 0u) << "a snapshot covering everything prunes the whole tail";
 
     const auto got = backend->get(layout.refSnapshotKey(ns, *snap_id));
@@ -1708,7 +1715,7 @@ TEST(RefWriterSnapshotPublish, TriggerIgnoresEntriesCoveredByNewestSnapshot)
     ASSERT_EQ(global_counters[ProfileEvents::CasRefSnapshotPublishDispatched].load(), d0 + 1);
     const auto first_snap = listGreatestSnapshotIdForTest(*backend, layout, ns);
     ASSERT_TRUE(first_snap.has_value());
-    EXPECT_EQ(store->newestPublishedSnapshotIdForTest(ns), first_snap);
+    EXPECT_TRUE(store->newestPublishedSnapshotIdForTest(ns) == first_snap);
     ASSERT_EQ(store->tailSinceSnapshotCountForTest(ns), 0u);
 
     /// 2 fresh entries: 2 <= 3, while the covered history (4 entries at/below the snapshot) would push
@@ -1717,7 +1724,7 @@ TEST(RefWriterSnapshotPublish, TriggerIgnoresEntriesCoveredByNewestSnapshot)
     store->waitForSnapshotPublishSettleForTest(ns);
     EXPECT_EQ(global_counters[ProfileEvents::CasRefSnapshotPublishDispatched].load(), d0 + 1)
         << "entries covered by the newest snapshot must not count toward the trigger";
-    EXPECT_EQ(listGreatestSnapshotIdForTest(*backend, layout, ns), first_snap);
+    EXPECT_TRUE(listGreatestSnapshotIdForTest(*backend, layout, ns) == first_snap);
     EXPECT_EQ(store->tailSinceSnapshotCountForTest(ns), 2u);
 
     /// Crossing the threshold with the fresh tail alone (4 > 3) dispatches exactly one more publish,
@@ -1782,7 +1789,7 @@ TEST(RefWriterStalePrecommitSweep, BoundedBatchesAndInterruptionResumeAcrossMoun
     const RootNamespace ns{"srv1/precommit_sweep_bounded"};
     constexpr int kTotalStale = 1200;   /// > ref_txn_max_ops (1000): forces at least two removal chunks
 
-    uint64_t e1;
+    uint64_t e1 = 0;
     {
         auto predecessor = openPool(backend);
         e1 = predecessor->writerEpoch();
@@ -1798,7 +1805,7 @@ TEST(RefWriterStalePrecommitSweep, BoundedBatchesAndInterruptionResumeAcrossMoun
         {
             RefOp op;
             op.kind = RefOpKind::OwnerTransition;
-            op.new_binding = RefOwnerBinding{RefOwnerKind::Precommit, "stale_" + std::to_string(i), manifestRef(e1, static_cast<uint64_t>(i + 1), 1)};
+            op.new_binding = RefOwnerBinding{RefOwnerKind::Precommit, "stale_" + std::to_string(i), manifestRef(e1, static_cast<uint64_t>(i) + 1, 1)};
             ops1.push_back(op);
         }
         writeRefLogTxnRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{e1, 1}, ops1});
@@ -1808,7 +1815,7 @@ TEST(RefWriterStalePrecommitSweep, BoundedBatchesAndInterruptionResumeAcrossMoun
         {
             RefOp op;
             op.kind = RefOpKind::OwnerTransition;
-            op.new_binding = RefOwnerBinding{RefOwnerKind::Precommit, "stale_" + std::to_string(i), manifestRef(e1, static_cast<uint64_t>(i + 1), 1)};
+            op.new_binding = RefOwnerBinding{RefOwnerKind::Precommit, "stale_" + std::to_string(i), manifestRef(e1, static_cast<uint64_t>(i) + 1, 1)};
             ops2.push_back(op);
         }
         writeRefLogTxnRaw(*backend, layout, RefLogTxn{ns.string(), RefTxnId{e1, 2}, ops2});

@@ -101,7 +101,7 @@ public:
     /// as absent, and a successful iterator refers to the overlay row when one overrides the base.
     const_iterator find(const String & key) const;
 
-    bool contains(const String & key) const { return find(key) != end(); }
+    bool contains(const String & key) const { return find(key) != end(); }   // NOLINT(readability-container-contains): this is the container's contains implementation.
     size_t count(const String & key) const { return contains(key) ? 1 : 0; }
     /// Returns the row for `key`, or throws `std::out_of_range` when the key is absent or tombstoned.
     const RefCommittedRow & at(const String & key) const;
@@ -139,7 +139,7 @@ public:
     size_t overlayEntriesForTest() const { return overlay.size(); }
     /// Test-only: `base`'s `shared_ptr::use_count()` -- a copy that shares `base` (no per-row
     /// allocation) bumps this by exactly one.
-    long baseUseCountForTest() const { return base.use_count(); }
+    int64_t baseUseCountForTest() const { return base.use_count(); }
 
 private:
     /// Records a live overlay value and updates `net_delta` according to whether it replaces a

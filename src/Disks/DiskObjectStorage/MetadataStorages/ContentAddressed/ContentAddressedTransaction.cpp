@@ -246,7 +246,7 @@ void ContentAddressedTransaction::uploadPendingBlobs(PartStaging & st)
 
     for (const auto & pb : st.pending_blobs)         /// pool writes — uploads + 412/HEAD/resurrect
     {
-        if (!referenced_hashes.count(pb.ref))
+        if (!referenced_hashes.contains(pb.ref))
             continue;   /// The entry was removed by unlinkFile/replaceFile; skip this orphan.
         /// Each pending blob
         /// is promoted through the SAME condemn/resurrect gate in `PartWriteTxn::putBlob`. Only the upload

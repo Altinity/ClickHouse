@@ -267,11 +267,11 @@ inline std::optional<RefTxnId> parseRefTxnId(std::string_view s)
         uint64_t value = 0;
         for (char c : field)
         {
-            uint64_t digit;
+            uint64_t digit = 0;
             if (c >= '0' && c <= '9')
                 digit = static_cast<uint64_t>(c - '0');
             else if (c >= 'a' && c <= 'f')
-                digit = static_cast<uint64_t>(c - 'a' + 10);
+                digit = static_cast<uint64_t>(c - 'a') + 10;
             else
                 return std::nullopt;
             value = (value << 4) | digit;

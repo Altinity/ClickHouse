@@ -310,7 +310,7 @@ void SourceEdgeKeyCodec::parse(std::string_view key, BlobRef & ref, UInt128 & so
     if (key.empty())
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS source-edge run: empty key");
     const uint8_t algo_byte = static_cast<uint8_t>(key[0]);
-    BlobHashAlgo algo;
+    BlobHashAlgo algo{};
     switch (algo_byte)
     {
         case static_cast<uint8_t>(BlobHashAlgo::CityHash128): algo = BlobHashAlgo::CityHash128; break;

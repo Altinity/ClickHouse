@@ -463,7 +463,7 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
     /// An EXHAUSTIVE switch, not a positive allowlist -- a future `MountPriorState`
     /// enumerator with no proof of clean death must fail the BUILD (a missing `-Wswitch` case), never
     /// silently fall through to "clean" and under-seal.
-    bool unclean_reclaim;
+    bool unclean_reclaim = false;
     switch (claimed_prior)
     {
         case MountPriorState::None:
@@ -823,7 +823,9 @@ std::optional<ForeignRefLogHeaderPeek> peekForeignRefLogHeader(const String & by
         ReadBufferFromMemory m(meta.data(), meta.size());
         JsonObjectReader r(m, KeyStrictness::Tolerant, "cas_ref_log");
         ForeignRefLogHeaderPeek peek;
-        bool saw_ns = false, saw_we = false, saw_rs = false;
+        bool saw_ns = false;
+        bool saw_we = false;
+        bool saw_rs = false;
         String key;
         while (r.nextKey(key))
         {

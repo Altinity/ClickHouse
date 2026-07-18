@@ -38,7 +38,7 @@ void applyGcsConditionalDialectToRequest(Aws::Http::HttpRequest & request)
 {
     const auto query_params = request.GetUri().GetQueryStringParameters();
     const bool is_complete_multipart = request.GetMethod() == Aws::Http::HttpMethod::HTTP_POST
-        && query_params.count("uploadId") > 0 && query_params.count("partNumber") == 0;
+        && query_params.contains("uploadId") && !query_params.contains("partNumber");
 
     /// --- Conditional headers -> x-goog-if-generation-match ---
     std::optional<std::string> generation_match;

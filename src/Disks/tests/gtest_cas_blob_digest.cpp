@@ -12,7 +12,6 @@
 /// upgrade. This is load-bearing: it is what makes Phase 2 safe to land under running pools.
 
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasCodecUtil.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcShardPlan.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasInMemoryBackend.h>
@@ -51,7 +50,7 @@ UInt128 randomU128(std::mt19937_64 & rng)
 
 TEST(CasBlobDigest, ShardOfBitIdenticalToOldHighBitsOver200RandomValues)
 {
-    std::mt19937_64 rng(0xC0FFEE);
+    std::mt19937_64 rng(0xC0FFEE); // NOLINT(cert-msc): deterministic seed is required for reproducible property coverage.
     const DigestCodec codec16(/*blob_hash_len*/ 16);
 
     for (int i = 0; i < 200; ++i)
@@ -79,7 +78,7 @@ TEST(CasBlobDigest, ShardOfViaPoolMetaConstructedCodecMatchesOldBlobShard)
     ASSERT_EQ(pm.algos_used, (std::vector<uint8_t>{static_cast<uint8_t>(BlobHashAlgo::CityHash128)}));
     const DigestCodec codec = codecFor(BlobHashAlgo::CityHash128);
 
-    std::mt19937_64 rng(12345);
+    std::mt19937_64 rng(12345); // NOLINT(cert-msc): deterministic seed is required for reproducible property coverage.
     for (int i = 0; i < 200; ++i)
     {
         const UInt128 v = randomU128(rng);
@@ -96,7 +95,7 @@ TEST(CasBlobDigest, ShardOfViaPoolMetaConstructedCodecMatchesOldBlobShard)
 TEST(CasBlobDigest, HexRoundTripLen16)
 {
     const DigestCodec codec(16);
-    std::mt19937_64 rng(1);
+    std::mt19937_64 rng(1); // NOLINT(cert-msc): deterministic seed is required for reproducible property coverage.
     for (int i = 0; i < 50; ++i)
     {
         const BlobDigest d = BlobDigest::fromU128(randomU128(rng));
@@ -121,7 +120,7 @@ TEST(CasBlobDigest, HexRoundTripLen32)
 TEST(CasBlobDigest, BytesBERoundTripLen16)
 {
     const DigestCodec codec(16);
-    std::mt19937_64 rng(2);
+    std::mt19937_64 rng(2); // NOLINT(cert-msc): deterministic seed is required for reproducible property coverage.
     for (int i = 0; i < 50; ++i)
     {
         const BlobDigest d = BlobDigest::fromU128(randomU128(rng));
@@ -149,7 +148,7 @@ TEST(CasBlobDigest, BytesBERoundTripLen32)
 TEST(CasBlobDigest, BytesBEAgreesWithU128ToBytesBEAtLen16)
 {
     const DigestCodec codec(16);
-    std::mt19937_64 rng(3);
+    std::mt19937_64 rng(3); // NOLINT(cert-msc): deterministic seed is required for reproducible property coverage.
     for (int i = 0; i < 20; ++i)
     {
         const UInt128 v = randomU128(rng);
@@ -186,7 +185,7 @@ TEST(CasBlobDigest, FromBytesBERejectsWrongWidth)
 
 TEST(CasBlobDigest, U128RoundTrip)
 {
-    std::mt19937_64 rng(4);
+    std::mt19937_64 rng(4); // NOLINT(cert-msc): deterministic seed is required for reproducible property coverage.
     for (int i = 0; i < 200; ++i)
     {
         const UInt128 v = randomU128(rng);
@@ -197,7 +196,7 @@ TEST(CasBlobDigest, U128RoundTrip)
 
 TEST(CasBlobDigest, FromU128LeavesTailZero)
 {
-    std::mt19937_64 rng(5);
+    std::mt19937_64 rng(5); // NOLINT(cert-msc): deterministic seed is required for reproducible property coverage.
     const UInt128 v = randomU128(rng);
     const BlobDigest d = BlobDigest::fromU128(v);
     for (size_t i = 16; i < d.bytes.size(); ++i)
@@ -208,7 +207,7 @@ TEST(CasBlobDigest, FromU128LeavesTailZero)
 
 TEST(CasBlobDigest, UsableAsUnorderedMapKey)
 {
-    std::mt19937_64 rng(6);
+    std::mt19937_64 rng(6); // NOLINT(cert-msc): deterministic seed is required for reproducible property coverage.
     std::unordered_map<BlobDigest, int, BlobDigestHash> m;
     std::vector<BlobDigest> digests;
     for (int i = 0; i < 20; ++i)

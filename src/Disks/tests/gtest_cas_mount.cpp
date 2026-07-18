@@ -865,7 +865,7 @@ TEST(CasListMounts, ClassifiesEveryStateReadOnly)
     const uint64_t ttl_ms = 10'000;
 
     /// live: fresh claim for srid "a"
-    ASSERT_EQ(claimMount(*backend, layout, "a", UInt128{1}, /*writer_epoch=*/1, now_ms, ttl_ms).kind,
+    ASSERT_EQ(claimMount(*backend, layout, "a", UInt128{1}, /*our_epoch=*/1, now_ms, ttl_ms).kind,
               MountClaimResult::Claimed);
     /// expired: claim for "b" whose lease ran out long before now_ms
     ASSERT_EQ(claimMount(*backend, layout, "b", UInt128{2}, 1, now_ms - 100'000, ttl_ms).kind,
@@ -903,7 +903,7 @@ TEST(CasListMounts, NestedSridIsNotTruncated)
     const uint64_t now_ms = 1'000'000;
     const uint64_t ttl_ms = 10'000;
 
-    ASSERT_EQ(claimMount(*backend, layout, "shard-01/replica-a", UInt128{1}, /*writer_epoch=*/1, now_ms, ttl_ms).kind,
+    ASSERT_EQ(claimMount(*backend, layout, "shard-01/replica-a", UInt128{1}, /*our_epoch=*/1, now_ms, ttl_ms).kind,
               MountClaimResult::Claimed);
 
     auto mounts = listMounts(*backend, layout, now_ms, /*skew_margin_ms=*/ttl_ms / 2);

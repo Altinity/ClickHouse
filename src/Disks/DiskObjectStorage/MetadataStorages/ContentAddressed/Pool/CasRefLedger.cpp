@@ -377,7 +377,7 @@ void CasRefLedger::ensureRefTableRecovered(const RootNamespace & ns, RefTableRun
             /// pattern this mirrors): that precedent has no scope-exit spanning its unlocked call and
             /// no cross-caller flag to clean up -- do not weaken this by analogy to it.
             lock.unlock();
-            CasWriteOutcome outcome;
+            CasWriteOutcome outcome{};
             try
             {
                 outcome = ref_request_controller->putIfAbsentControlled(
@@ -939,7 +939,7 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
         }
         if (wedge_copy)
         {
-            CasWriteOutcome resolved;
+            CasWriteOutcome resolved{};
             try
             {
                 resolved = ref_request_controller->resolveByExactGet(wedge_copy->key, wedge_copy->bytes);
@@ -1000,7 +1000,7 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
     /// `namespace_birth` must run alone, and the flush already KNOWS the table's current lifecycle
     /// before carving (unlike a per-item property, which would need speculative undo).
     RefTableState working;
-    bool table_live;
+    bool table_live = false;
     {
         std::lock_guard lock(rt->state_mutex);
         working = rt->state;
@@ -1191,7 +1191,7 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
     }
     const String key = layout.refLogKey(ns, id);
 
-    CasWriteOutcome outcome;
+    CasWriteOutcome outcome{};
     try
     {
         outcome = ref_request_controller->putIfAbsentControlled(key, bytes, fence_ok);
