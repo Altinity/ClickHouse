@@ -770,11 +770,14 @@ PartWriteTxnPtr Pool::beginPartWrite(PartWriteInfo info)
     /// the Pool-owned watermark renews — tracks in-flight builds. The build registry lives on
     /// `mount_runtime`.
     const uint64_t seq = mount_runtime.allocateBuildSeq();
+    bool registered = false;
+    SCOPE_EXIT({ if (!registered) retireBuildSeq(seq); });
 
     auto build = std::make_shared<PartWriteTxn>(shared_from_this(), build_id, seq, liveWriterEpoch(), std::move(info));
     /// Register for `dropNamespace`'s post-durable build cancellation. weak_ptr:
     /// the wiring owns the returned shared_ptr; `retireBuildSeq` (publish/abandon/dtor) removes the entry.
     mount_runtime.registerInflightBuild(seq, build);
+    registered = true;
     return build;
 }
 

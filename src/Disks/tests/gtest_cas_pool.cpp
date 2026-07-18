@@ -287,6 +287,35 @@ TEST(CasPool, MinActiveTracksInFlightBuilds)
     ASSERT_EQ(store->minActive(), store->peekNextBuildSeq());   /// empty again
 }
 
+TEST(CasPool, BeginPartWriteRetiresBuildSeqWhenConstructionFails)
+{
+    auto backend = std::make_shared<DB::Cas::InMemoryBackend>();
+    DB::Cas::PoolConfig cfg;
+    cfg.pool_prefix = "pool";
+    cfg.server_id = DB::UInt128(1);
+    cfg.server_root_id = "test";
+    cfg.background_watermark = false;
+    auto store = DB::Cas::Pool::open(backend, cfg);
+
+    const uint64_t failed_seq = store->peekNextBuildSeq();
+    store->setEventSink([](const CasEvent & e)
+    {
+        if (e.type == CasEventType::BuildStart)
+            throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "injected PartWriteTxn construction failure");
+    });
+    expectThrowsCode(DB::ErrorCodes::LOGICAL_ERROR, [&] { store->beginPartWrite({}); });
+    store->setEventSink(nullptr);
+
+    EXPECT_EQ(store->peekNextBuildSeq(), failed_seq + 1);
+    EXPECT_EQ(store->minActive(), store->peekNextBuildSeq());
+
+    auto build = store->beginPartWrite({});
+    EXPECT_EQ(build->buildSeq(), failed_seq + 1);
+    EXPECT_EQ(store->minActive(), build->buildSeq());
+    build->abandon();
+    EXPECT_EQ(store->minActive(), store->peekNextBuildSeq());
+}
+
 TEST(CasPool, BuildSeqIsStrictlyMonotone)
 {
     auto backend = std::make_shared<DB::Cas::InMemoryBackend>();
