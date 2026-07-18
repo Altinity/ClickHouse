@@ -222,6 +222,36 @@ Spec: triage §5, §6 DEFER list. No behavior changes.
 
 ---
 
+### Task 12: S22 — blob freshness-meta writes join the CasRequestController {#t12}
+
+**Source:** R5 scenario campaign finding, NOT the codex review. Spec = RCA doc
+`docs/superpowers/reports/2026-07-18-s22-throttle-retry-rca.md` (read it first — it is the
+requirements). S22 at `fault_rate=0.2` let an S3 `SlowDown` on a blob `.meta` PUT escape to the
+client as HTTP 500 `S3_ERROR (499)`: `putMetaIfAbsent`/`casMeta`/`deleteMetaExact`
+(`src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobMeta.cpp`) call
+`backend.casPut`/`deleteExact` directly — the ONLY conditional-write class on the INSERT/merge
+hot path that bypasses the controller's budgeted resolve-and-reissue.
+
+**Files:**
+- Modify: `.../Backend/CasRequestControl.h` + `.cpp` — add a controlled If-Match overwrite
+  variant (ambiguous attempt resolves by GET: token still == expected → not applied, reissue;
+  bytes == our new bytes → Committed; anything else → real conflict, no silent collapse).
+  `putMetaIfAbsent` needs no new variant — meta bytes are deterministic (`encodeBlobMeta` is a
+  pure function of `meta`), so `putIfAbsentControlled` applies as-is.
+- Modify: `.../Pool/CasBlobMeta.{h,cpp}` — route the three writers through the controller
+  (signature gains the controller; `loadMeta` stays a plain GET).
+- Modify: call sites (find with grep: `putMetaIfAbsent|casMeta\(|deleteMetaExact`) — including
+  `CasPartWriteTxn.cpp` `writeResurrectMetaClean` (its Conflict loop STAYS; only transport
+  ambiguity is absorbed below it) and the GC condemn-meta writers.
+- Test: deterministic gtest mirroring `CasPartWriteTxn.PutBlobWrongSizeFailsClosed` shape — a
+  fault backend that throws `SlowDown` on the `.meta` key N<max_attempts times; assert the meta
+  write commits within budget and the INSERT-path caller sees no exception. Add an exhaustion
+  case: SlowDown forever → the op fails with the controller's budget signal, not a raw 499.
+
+**Steps:** failing test → run (red) → controller variant + reroute → run (green) → full battery
+(Global Constraints filter) → commit. Do NOT swallow errors as best-effort: a dropped meta write
+leaves stale freshness state (RCA §4).
+
 ## Self-Review Notes {#self-review}
 
 - Spec coverage: §6 items 1-10 → Tasks 1-10; comment wave + defers → Task 11. §4 items deliberately absent (user postponement). №18 folded into Task 2 (root fix collapses it) — the list-branch change is explicit there.
