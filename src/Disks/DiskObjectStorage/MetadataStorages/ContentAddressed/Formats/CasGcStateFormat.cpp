@@ -95,13 +95,25 @@ GcHeartbeat decodeGcHeartbeat(std::string_view data)
     JsonObjectReader r(body_in, KeyStrictness::Tolerant, "gc heartbeat");
 
     GcHeartbeat hb;
+    bool saw_by = false;
+    bool saw_seq = false;
     String key;
     while (r.nextKey(key))
     {
-        if (key == "by") hb.owner = r.readHex128();
-        else if (key == "seq") hb.hb_seq = r.readU64String();
+        if (key == "by")
+        {
+            hb.owner = r.readHex128();
+            saw_by = true;
+        }
+        else if (key == "seq")
+        {
+            hb.hb_seq = r.readU64String();
+            saw_seq = true;
+        }
         else r.skipUnknown(key);
     }
+    if (!saw_by || !saw_seq)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS gc heartbeat: missing identity field");
     if (!body_in.eof() || !in.eof())
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS gc heartbeat: trailing bytes");
     return hb;

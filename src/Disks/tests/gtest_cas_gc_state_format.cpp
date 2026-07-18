@@ -136,3 +136,24 @@ TEST(CasGcHeartbeatFormat, RoundTripAndBoundaries)
     EXPECT_EQ(decodeGcHeartbeat(encodeGcHeartbeat(z)).owner, z.owner);
     EXPECT_THROW(decodeGcHeartbeat(String("short")), DB::Exception);
 }
+
+TEST(CasGcHeartbeatFormat, RejectsMissingIdentityFields)
+{
+    const String header = "{\"type\":\"cas_gc_hb\",\"v\":3}\n";
+
+    const auto expectCorrupted = [](const String & data)
+    {
+        try
+        {
+            decodeGcHeartbeat(data);
+            FAIL() << "expected CORRUPTED_DATA";
+        }
+        catch (const DB::Exception & e)
+        {
+            EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA);
+        }
+    };
+
+    expectCorrupted(header + "{\"seq\":\"1741\"}\n");
+    expectCorrupted(header + "{\"by\":\"00000000000000000000000000000001\"}\n");
+}

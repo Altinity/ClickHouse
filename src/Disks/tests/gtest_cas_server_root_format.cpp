@@ -1,9 +1,15 @@
 #include "cas_format_test_battery.h"
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasServerRootFormats.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
+#include <Common/Exception.h>
 #include <limits>
 
 using namespace DB::Cas;
+
+namespace DB::ErrorCodes
+{
+    extern const int CORRUPTED_DATA;
+}
 
 TEST(CasFormatBattery, Owner)
 {
@@ -62,4 +68,27 @@ TEST(CasMountLeaseFormat, FarewellSentinelAndFencedSurvive)
     EXPECT_EQ(back.hostname, "h");
     EXPECT_EQ(back.writer_epoch, 7u);
     EXPECT_EQ(back.seq, 5u);
+}
+
+TEST(CasMountLeaseFormat, RejectsMissingIdentityFields)
+{
+    const String header = "{\"type\":\"cas_mount_lease\",\"v\":3}\n";
+    const String fields = "\"hn\":\"host-1\",\"pid\":4242,\"sat\":1752537600000,"
+                          "\"seq\":\"5\",\"eat\":1752537630000,\"ma\":\"9\",\"fen\":false}";
+
+    const auto expectCorrupted = [](const String & data)
+    {
+        try
+        {
+            decodeMountLease(data);
+            FAIL() << "expected CORRUPTED_DATA";
+        }
+        catch (const DB::Exception & e)
+        {
+            EXPECT_EQ(e.code(), DB::ErrorCodes::CORRUPTED_DATA);
+        }
+    };
+
+    expectCorrupted(header + "{\"we\":\"7\"," + fields + "\n");
+    expectCorrupted(header + "{\"su\":\"0123456789abcdeffedcba9876543210\"," + fields + "\n");
 }

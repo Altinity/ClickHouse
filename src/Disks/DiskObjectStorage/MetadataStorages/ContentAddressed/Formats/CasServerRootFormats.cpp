@@ -149,11 +149,21 @@ MountLease decodeMountLease(std::string_view data)
     JsonObjectReader r(body_in, KeyStrictness::Tolerant, "mount-lease");
 
     MountLease m;
+    bool saw_su = false;
+    bool saw_we = false;
     String key;
     while (r.nextKey(key))
     {
-        if (key == "su") m.server_uuid = r.readHex128();
-        else if (key == "we") m.writer_epoch = r.readU64String();
+        if (key == "su")
+        {
+            m.server_uuid = r.readHex128();
+            saw_su = true;
+        }
+        else if (key == "we")
+        {
+            m.writer_epoch = r.readU64String();
+            saw_we = true;
+        }
         else if (key == "hn") m.hostname = r.readString();
         else if (key == "pid") m.pid = r.readU64Number();
         else if (key == "sat") m.started_at_ms = r.readU64Number();
@@ -163,6 +173,8 @@ MountLease decodeMountLease(std::string_view data)
         else if (key == "fen") m.gc_fenced = r.readBool();
         else r.skipUnknown(key);
     }
+    if (!saw_su || !saw_we)
+        throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS mount-lease: missing identity field");
     if (!body_in.eof() || !in.eof())
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS mount-lease: trailing bytes");
     return m;
