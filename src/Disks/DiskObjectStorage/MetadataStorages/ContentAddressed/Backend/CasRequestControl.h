@@ -207,6 +207,35 @@ struct CasCreateResult
     Token token;   /// set ONLY on Committed
 };
 
+/// Outcome of a controlled MUTABLE conditional overwrite (`putOverwriteControlled`) -- an If-Match
+/// replace whose caller can, unlike a content-addressed create, supply the intended bytes for
+/// GET-based resolution, because the payload here is deterministic (a pure function of the
+/// caller's record), not freshly minted per attempt.
+///   - Committed: an attempt's own request completed (2xx) and the final fence check held, or
+///     resolution proved the intended bytes are already what's currently stored -- `token` names
+///     that incarnation.
+///   - Conflict: resolution proved the key's CURRENT token AND bytes both differ from what this
+///     call intended -- a genuine competing write. Returned as a value, never thrown, never
+///     collapsed into Unresolved/DefiniteFailure -- mirrors the existing uncontrolled
+///     casMeta/CasResult contract (a conflict lets the caller reload and decide).
+///   - Unresolved: budget exhausted, fence lost, or the current token still equals `expected` (the
+///     attempt provably never applied) with the resolve unable to prove either outcome yet --
+///     caller must not ACK.
+enum class CasOverwriteOutcome : uint8_t
+{
+    Committed,
+    Conflict,
+    Unresolved,
+};
+
+/// Result of one `CasRequestController::putOverwriteControlled` operation. `token` is meaningful
+/// only when `outcome` is `Committed`.
+struct CasOverwriteResult
+{
+    CasOverwriteOutcome outcome = CasOverwriteOutcome::Unresolved;
+    Token token;   /// set ONLY on Committed
+};
+
 /// CAS-owned retry controller: the only place that decides whether a conditional-write attempt may be
 /// reissued. It does not touch a writer cache or return ACK. Callers update their cache and acknowledge
 /// the operation only after this controller has resolved the outcome and performed its final fence
@@ -287,6 +316,51 @@ public:
     CasCreateResult conditionalCreateControlled(std::string_view key,
                                                 const std::function<PutResult()> & attempt,
                                                 const std::function<bool()> & fence_ok);
+
+    /// Controlled If-Match overwrite with resolve-before-reissue, for a MUTABLE marker whose bytes
+    /// are deterministic so GET-based resolution can compare them (unlike a content-addressed
+    /// create's freshly-minted-per-attempt body). Performs at most `budget.max_attempts` attempts of
+    /// the exact SAME (key, bytes, expected token), bounded by `budget.operation_deadline_ms`, with
+    /// the same fence/backoff/deadline gates as `putIfAbsentControlled`. An ambiguous attempt
+    /// (`PreconditionFailed`, or a transient exception classified `Unresolved`) is resolved with ONE
+    /// GET at `key`:
+    ///   - the current token still equals `expected`  -> the attempt provably never applied; another
+    ///     attempt of the SAME (key, bytes, expected) is legal (fence/backoff/deadline-gated)
+    ///   - the current bytes equal `bytes`             -> Committed (an earlier ambiguous attempt of
+    ///     THIS call already landed); `token` is the observed incarnation
+    ///   - neither                                      -> Conflict: a genuine competing write
+    ///     landed; returned as a value, never thrown
+    ///   - the GET itself fails                         -> still ambiguous; reissue is safe
+    /// A whitelisted `DefiniteFailure` classification, or a deterministic LOCAL failure
+    /// (`isDeterministicLocalFailure`), RETHROWS the original exception -- mirrors
+    /// `conditionalCreateControlled`'s convention, never `putIfAbsentControlled`'s (that method
+    /// predates this convention).
+    CasOverwriteResult putOverwriteControlled(std::string_view key, std::string_view bytes,
+                                              const Token & expected, const std::function<bool()> & fence_ok);
+
+    /// Controlled put-if-absent for a MUTABLE marker whose bytes are deterministic, where an
+    /// EXISTING DIFFERENT value at the key is a normal outcome (Conflict), not corruption. This is
+    /// the create-side sibling of `putOverwriteControlled` and deliberately does NOT reuse
+    /// `putIfAbsentControlled`: that method's resolve (`resolveByExactGet`) throws `CORRUPTED_DATA`
+    /// on any different bytes at the key, which is correct for the ref-log lane's immutable,
+    /// content-addressed keys (a different value there truly is impossible-by-construction) but
+    /// wrong for a mutable state marker (e.g. a blob's freshness-meta sidecar), where a
+    /// pre-existing DIFFERENT value is an expected, non-corrupt state a racing writer or GC pass
+    /// left behind. Performs at most `budget.max_attempts` attempts of the exact SAME (key, bytes),
+    /// bounded by `budget.operation_deadline_ms`, with the same fence/backoff/deadline gates as
+    /// `putIfAbsentControlled`. An ambiguous attempt (`PreconditionFailed`, or a transient exception
+    /// classified `Unresolved`) is resolved with ONE GET at `key`:
+    ///   - absent                          -> the attempt provably never applied; another attempt of
+    ///     the SAME (key, bytes) is legal (fence/backoff/deadline-gated)
+    ///   - present, bytes equal `bytes`     -> Committed (an earlier ambiguous attempt of THIS call,
+    ///     or a racing writer creating the identical value, already landed); `token` is the observed
+    ///     incarnation
+    ///   - present, bytes differ           -> Conflict: something else already occupies the key with
+    ///     a different value; returned as a value, never thrown
+    ///   - the GET itself fails            -> still ambiguous; reissue is safe
+    /// Same DefiniteFailure/deterministic-local-failure rethrow convention as `putOverwriteControlled`.
+    CasOverwriteResult putIfAbsentControlledMutable(std::string_view key, std::string_view bytes,
+                                                    const std::function<bool()> & fence_ok);
 
     /// Test-only: replace the inter-attempt backoff sleep (e.g. with a no-op) on an already-constructed
     /// controller — for tests that reach the controller only through a fully-wired Pool/disk and cannot

@@ -901,6 +901,7 @@ TEST(CasGcCondemnMarker, SwallowedMarkerWriteCarriesEntryInsteadOfDeleting)
 {
     auto backend = std::make_shared<MetaWriteFaultBackend>();
     auto store = openPoolForTest(backend);
+    store->setCasRetrySleepForTest([](uint64_t) {});
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r = ref("srv-a:1", 1, 0xAA);
     const UInt128 blob = DB::UInt128(1);
@@ -911,7 +912,7 @@ TEST(CasGcCondemnMarker, SwallowedMarkerWriteCarriesEntryInsteadOfDeleting)
 
     gc.runRegularRound();   // +1 folds; blob referenced
     dropRefTransition(*backend, store->layout(), ns, "tbl", r);
-    gc.runRegularRound();   // the condemning round; the marker write THROWS and is swallowed
+    gc.runRegularRound();   // the condemning round; the controlled marker write exhausts as Unresolved
     ASSERT_FALSE(loadMetaForTest(*backend, store->layout(), blob).has_value())
         << "precondition: the injected fault must have lost the condemn-marker write";
     ASSERT_TRUE(currentEntryFor(*backend, store->layout(), blob).has_value())

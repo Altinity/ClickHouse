@@ -468,6 +468,11 @@ public:
     /// uploadFromSource; thin delegates to `ref_ledger`.
     CasWriteOutcome stagingPutIfAbsent(std::string_view key, std::string_view bytes, Token * out_token = nullptr);
     CasCreateResult stagingConditionalCreate(std::string_view key, const std::function<PutResult()> & attempt);
+    /// Same retry/fence policy as `stagingConditionalCreate`, for a mutable If-Match overwrite.
+    CasOverwriteResult stagingConditionalOverwrite(std::string_view key, std::string_view bytes, const Token & expected);
+    /// Same retry/fence policy as `stagingPutIfAbsent`, for a mutable marker where an existing
+    /// DIFFERENT value at the key is a normal Conflict outcome, not corruption.
+    CasOverwriteResult stagingPutIfAbsentMutable(std::string_view key, std::string_view bytes);
 
     /// CAS mixed-algo pools:
     /// the NODE-LOCAL algo this Pool mints NEW content with (`PoolConfig::blob_hash_algo` -- never

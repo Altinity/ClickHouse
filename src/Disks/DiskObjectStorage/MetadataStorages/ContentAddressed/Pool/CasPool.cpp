@@ -1131,6 +1131,16 @@ CasCreateResult Pool::stagingConditionalCreate(std::string_view key, const std::
     return ref_ledger.stagingConditionalCreate(key, attempt);
 }
 
+CasOverwriteResult Pool::stagingConditionalOverwrite(std::string_view key, std::string_view bytes, const Token & expected)
+{
+    return ref_ledger.stagingConditionalOverwrite(key, bytes, expected);
+}
+
+CasOverwriteResult Pool::stagingPutIfAbsentMutable(std::string_view key, std::string_view bytes)
+{
+    return ref_ledger.stagingPutIfAbsentMutable(key, bytes);
+}
+
 void Pool::cancelInflightBuildsForNamespace(const RootNamespace & ns)
 {
     /// Delegate to `mount_runtime`. Invoked by

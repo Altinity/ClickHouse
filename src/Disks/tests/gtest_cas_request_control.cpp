@@ -290,6 +290,10 @@ public:
     std::optional<PutOutcome> put_forced_outcome;
     std::atomic<uint64_t> put_attempts{0};
 
+    std::function<void()> put_overwrite_thrower;
+    std::optional<PutOutcome> put_overwrite_forced_outcome;
+    std::atomic<uint64_t> put_overwrite_attempts{0};
+
     bool get_overridden = false;
     std::optional<GetResult> get_override_value;   /// meaningful only when get_overridden
 
@@ -307,6 +311,16 @@ public:
         if (put_forced_outcome)
             return {*put_forced_outcome, {}};
         return InMemoryBackend::putIfAbsent(key, bytes, meta);
+    }
+
+    PutResult putOverwrite(const String & key, const String & bytes, const Token & expected, const ObjectMeta & meta) override
+    {
+        ++put_overwrite_attempts;
+        if (put_overwrite_thrower)
+            put_overwrite_thrower();
+        if (put_overwrite_forced_outcome)
+            return {*put_overwrite_forced_outcome, {}};
+        return InMemoryBackend::putOverwrite(key, bytes, expected, meta);
     }
 
     std::optional<GetResult> get(const String & key, Range range) override
@@ -387,6 +401,87 @@ TEST(CasRequestController, OperationDeadlineExhaustionReturnsUnresolvedBeforeMax
     const auto outcome = controller.putIfAbsentControlled("k", "payload", [] { return true; });
     EXPECT_EQ(outcome, CasWriteOutcome::Unresolved);
     EXPECT_EQ(backend->put_attempts.load(), 2u);   /// cut off well before the 10-attempt budget
+}
+
+TEST(CasRequestController, OverwriteAmbiguousResolvesIntendedBytesAsCommitted)
+{
+    auto backend = std::make_shared<ScriptedControllerBackend>();
+    bool first_attempt = true;
+    backend->put_overwrite_thrower = [&first_attempt]
+    {
+        if (first_attempt)
+        {
+            first_attempt = false;
+            throw Poco::TimeoutException("scripted: ambiguous");
+        }
+    };
+    backend->setGetOverride(resultWithBytes("new-payload"));
+
+    CasRequestController controller(backend, CasRequestBudget{});
+    const auto result = controller.putOverwriteControlled(
+        "k", "new-payload", Token{"old", TokenType::Emulated}, [] { return true; });
+    EXPECT_EQ(result.outcome, CasOverwriteOutcome::Committed);
+    EXPECT_EQ(backend->put_overwrite_attempts.load(), 1u);
+    EXPECT_EQ(result.token, (Token{"t", TokenType::Emulated}));
+}
+
+TEST(CasRequestController, OverwriteAmbiguousResolvesExpectedTokenAndRetriesWithinBudget)
+{
+    auto backend = std::make_shared<ScriptedControllerBackend>();
+    backend->put_overwrite_thrower = [] { throw Poco::TimeoutException("scripted: ambiguous"); };
+    const Token expected{"old", TokenType::Emulated};
+    backend->setGetOverride(GetResult{.bytes = "old-payload", .token = expected, .attributes = {}});
+
+    CasRequestBudget budget;
+    budget.max_attempts = 3;
+    budget.retry_initial_backoff_ms = 0;
+    CasRequestController controller(backend, budget);
+    const auto result = controller.putOverwriteControlled("k", "new-payload", expected, [] { return true; });
+    EXPECT_EQ(result.outcome, CasOverwriteOutcome::Unresolved);
+    EXPECT_EQ(backend->put_overwrite_attempts.load(), 3u);
+}
+
+TEST(CasRequestController, OverwriteAmbiguousResolvesDifferentTokenAndBytesAsConflict)
+{
+    auto backend = std::make_shared<ScriptedControllerBackend>();
+    bool first_attempt = true;
+    backend->put_overwrite_thrower = [&first_attempt]
+    {
+        if (first_attempt)
+        {
+            first_attempt = false;
+            throw Poco::TimeoutException("scripted: ambiguous");
+        }
+    };
+    backend->setGetOverride(GetResult{
+        .bytes = "someone-elses-payload", .token = Token{"other", TokenType::Emulated}, .attributes = {}});
+
+    CasRequestController controller(backend, CasRequestBudget{});
+    const auto result = controller.putOverwriteControlled(
+        "k", "new-payload", Token{"old", TokenType::Emulated}, [] { return true; });
+    EXPECT_EQ(result.outcome, CasOverwriteOutcome::Conflict);
+    EXPECT_EQ(backend->put_overwrite_attempts.load(), 1u);
+}
+
+TEST(CasRequestController, OverwriteOperationDeadlineExhaustionReturnsUnresolvedBeforeMaxAttempts)
+{
+    auto backend = std::make_shared<ScriptedControllerBackend>();
+    backend->put_overwrite_thrower = [] { throw Poco::TimeoutException("scripted: ambiguous"); };
+    const Token expected{"old", TokenType::Emulated};
+    backend->setGetOverride(GetResult{.bytes = "old-payload", .token = expected, .attributes = {}});
+
+    uint64_t clock = 0;
+    auto now_ms = [&clock]() -> uint64_t { const uint64_t t = clock; clock += 200; return t; };
+
+    CasRequestBudget budget;
+    budget.max_attempts = 10;
+    budget.attempt_timeout_ms = 50;
+    budget.operation_deadline_ms = 450;
+    budget.retry_initial_backoff_ms = 0;
+    CasRequestController controller(backend, budget, now_ms);
+    const auto result = controller.putOverwriteControlled("k", "new-payload", expected, [] { return true; });
+    EXPECT_EQ(result.outcome, CasOverwriteOutcome::Unresolved);
+    EXPECT_EQ(backend->put_overwrite_attempts.load(), 2u);
 }
 
 TEST(CasRequestController, FenceLostBeforeAttemptSendsNoAttempt)

@@ -342,7 +342,7 @@ uint64_t PartWriteTxn::observeAndAdmit(ObjectKind kind, const BlobRef & ref, con
     if (!lm)
     {
         ProfileEvents::increment(ProfileEvents::CasMetaAdoptBackfill);
-        putMetaIfAbsent(store->backend(), store->layout(), ref,
+        putMetaIfAbsent(*store, ref,
             BlobMeta{.state = MetaState::Clean, .condemn_round = 0, .size = logical_size});
     }
 
@@ -443,7 +443,7 @@ void PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef & ref, const 
     auto writeFreshMetaClean = [&]()
     {
         ProfileEvents::increment(ProfileEvents::CasMetaCreateClean);
-        putMetaIfAbsent(store->backend(), store->layout(), ref,
+        putMetaIfAbsent(*store, ref,
             BlobMeta{.state = MetaState::Clean, .condemn_round = 0, .size = source.size});
     };
 
@@ -461,10 +461,10 @@ void PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef & ref, const 
         constexpr int max_meta_attempts = 8;
         for (int attempt = 0; attempt < max_meta_attempts; ++attempt)
         {
-            const CasResult res = lm_before
-                ? casMeta(store->backend(), store->layout(), ref, lm_before->etag, clean)
-                : putMetaIfAbsent(store->backend(), store->layout(), ref, clean);
-            if (res.outcome == CasOutcome::Committed)
+            const bool committed = lm_before
+                ? casMeta(*store, ref, lm_before->etag, clean).outcome == CasOverwriteOutcome::Committed
+                : putMetaIfAbsent(*store, ref, clean).outcome == CasOverwriteOutcome::Committed;
+            if (committed)
                 return;
             lm_before = loadMeta(store->backend(), store->layout(), ref);
         }

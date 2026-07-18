@@ -465,4 +465,167 @@ CasCreateResult CasRequestController::conditionalCreateControlled(
     return {CasCreateOutcome::Unresolved, {}};   /// attempt budget exhausted without a definite outcome
 }
 
+CasOverwriteResult CasRequestController::putOverwriteControlled(
+    std::string_view key, std::string_view bytes, const Token & expected, const std::function<bool()> & fence_ok)
+{
+    const String key_s{key};
+    const String bytes_s{bytes};
+    const uint64_t deadline_ms = now_ms() + budget.operation_deadline_ms;
+
+    for (uint32_t attempt_no = 1; attempt_no <= budget.max_attempts; ++attempt_no)
+    {
+        if (!fence_ok())
+            return {CasOverwriteOutcome::Unresolved, {}};
+        if (now_ms() + budget.attempt_timeout_ms > deadline_ms)
+            return {CasOverwriteOutcome::Unresolved, {}};
+
+        std::optional<PutResult> put;
+        try
+        {
+            put = backend->putOverwrite(key_s, bytes_s, expected);
+        }
+        catch (const std::exception & e)
+        {
+            /// Same rethrow convention as conditionalCreateControlled: a deterministic local bug or
+            /// a whitelisted synchronous rejection PROVES no retry can help -- surface it unchanged.
+            if (const auto * db_e = dynamic_cast<const Exception *>(&e); db_e && isDeterministicLocalFailure(db_e->code()))
+                throw;
+            if (classifyConditionalWriteResult(e) == CasWriteOutcome::DefiniteFailure)
+                throw;
+            /// Else ambiguous -- fall through to resolve below.
+        }
+
+        if (put && put->outcome == PutOutcome::Done)
+        {
+            if (!fence_ok())
+            {
+                ProfileEvents::increment(ProfileEvents::CasConditionalWriteFenceLostPostWrite);
+                return {CasOverwriteOutcome::Unresolved, {}};
+            }
+            return {CasOverwriteOutcome::Committed, put->token};
+        }
+
+        /// Ambiguous: either a caught transient exception, or PreconditionFailed (which alone does
+        /// NOT prove a real conflict -- it may be our own earlier attempt's write landing under a
+        /// concurrent resolve). Resolve with one GET.
+        std::optional<GetResult> got;
+        try
+        {
+            got = backend->get(key_s);
+        }
+        catch (const std::exception &)
+        {
+            got.reset();   /// GET failed: still ambiguous, fall through to retry below.
+        }
+
+        if (got && got->token == expected)
+        {
+            /// The token we CAS'd against is STILL current: our attempt never applied. Fall through
+            /// to the pause-and-reissue gate below (same key, bytes, expected).
+        }
+        else if (got && got->bytes == bytes_s)
+        {
+            if (!fence_ok())
+            {
+                ProfileEvents::increment(ProfileEvents::CasConditionalWriteFenceLostPostWrite);
+                return {CasOverwriteOutcome::Unresolved, {}};
+            }
+            return {CasOverwriteOutcome::Committed, got->token};
+        }
+        else if (got)
+        {
+            /// A DIFFERENT token AND different bytes: a genuine competing write. Real conflict --
+            /// never collapsed into Unresolved/DefiniteFailure, never thrown.
+            return {CasOverwriteOutcome::Conflict, {}};
+        }
+        /// else: the GET itself failed or the key vanished -- still ambiguous, fall through to retry.
+
+        if (attempt_no == budget.max_attempts || !pauseBeforeReissue(attempt_no, deadline_ms, fence_ok))
+            return {CasOverwriteOutcome::Unresolved, {}};
+    }
+
+    return {CasOverwriteOutcome::Unresolved, {}};   /// attempt budget exhausted without a definite outcome
+}
+
+CasOverwriteResult CasRequestController::putIfAbsentControlledMutable(
+    std::string_view key, std::string_view bytes, const std::function<bool()> & fence_ok)
+{
+    const String key_s{key};
+    const String bytes_s{bytes};
+    const uint64_t deadline_ms = now_ms() + budget.operation_deadline_ms;
+
+    for (uint32_t attempt_no = 1; attempt_no <= budget.max_attempts; ++attempt_no)
+    {
+        if (!fence_ok())
+            return {CasOverwriteOutcome::Unresolved, {}};
+        if (now_ms() + budget.attempt_timeout_ms > deadline_ms)
+            return {CasOverwriteOutcome::Unresolved, {}};
+
+        std::optional<PutResult> put;
+        try
+        {
+            put = backend->putIfAbsent(key_s, bytes_s);
+        }
+        catch (const std::exception & e)
+        {
+            /// Same rethrow convention as putOverwriteControlled/conditionalCreateControlled.
+            if (const auto * db_e = dynamic_cast<const Exception *>(&e); db_e && isDeterministicLocalFailure(db_e->code()))
+                throw;
+            if (classifyConditionalWriteResult(e) == CasWriteOutcome::DefiniteFailure)
+                throw;
+            /// Else ambiguous -- fall through to resolve below.
+        }
+
+        if (put && put->outcome == PutOutcome::Done)
+        {
+            if (!fence_ok())
+            {
+                ProfileEvents::increment(ProfileEvents::CasConditionalWriteFenceLostPostWrite);
+                return {CasOverwriteOutcome::Unresolved, {}};
+            }
+            return {CasOverwriteOutcome::Committed, put->token};
+        }
+
+        /// Ambiguous: either a caught transient exception, or PreconditionFailed (which alone does
+        /// NOT prove a real conflict -- it may be our own earlier attempt's write landing under a
+        /// concurrent resolve, or a racing writer creating the identical value). Resolve with one GET.
+        std::optional<GetResult> got;
+        try
+        {
+            got = backend->get(key_s);
+        }
+        catch (const std::exception &)
+        {
+            got.reset();   /// GET failed: still ambiguous, fall through to retry below.
+        }
+
+        if (!got)
+        {
+            /// Still absent: our attempt never applied. Fall through to the pause-and-reissue gate
+            /// below (same key, bytes).
+        }
+        else if (got->bytes == bytes_s)
+        {
+            if (!fence_ok())
+            {
+                ProfileEvents::increment(ProfileEvents::CasConditionalWriteFenceLostPostWrite);
+                return {CasOverwriteOutcome::Unresolved, {}};
+            }
+            return {CasOverwriteOutcome::Committed, got->token};
+        }
+        else
+        {
+            /// Present with DIFFERENT bytes: something else already occupies the key with a
+            /// different value. For a MUTABLE marker this is a normal outcome, not corruption --
+            /// return it as a value, never thrown.
+            return {CasOverwriteOutcome::Conflict, {}};
+        }
+
+        if (attempt_no == budget.max_attempts || !pauseBeforeReissue(attempt_no, deadline_ms, fence_ok))
+            return {CasOverwriteOutcome::Unresolved, {}};
+    }
+
+    return {CasOverwriteOutcome::Unresolved, {}};   /// attempt budget exhausted without a definite outcome
+}
+
 }

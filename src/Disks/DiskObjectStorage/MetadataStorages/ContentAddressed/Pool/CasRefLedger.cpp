@@ -101,6 +101,18 @@ CasCreateResult CasRefLedger::stagingConditionalCreate(std::string_view key, con
     return ref_request_controller->conditionalCreateControlled(key, attempt, fence_ok_fn);
 }
 
+CasOverwriteResult CasRefLedger::stagingConditionalOverwrite(std::string_view key, std::string_view bytes, const Token & expected)
+{
+    /// The supplied write is controlled by the same retry and mount-fence policy as other staged
+    /// writes.
+    return ref_request_controller->putOverwriteControlled(key, bytes, expected, fence_ok_fn);
+}
+
+CasOverwriteResult CasRefLedger::stagingPutIfAbsentMutable(std::string_view key, std::string_view bytes)
+{
+    return ref_request_controller->putIfAbsentControlledMutable(key, bytes, fence_ok_fn);
+}
+
 void CasRefLedger::setCasRetrySleepForTest(std::function<void(uint64_t)> sleep_fn)
 {
     ref_request_controller->setSleepFnForTest(std::move(sleep_fn));

@@ -605,25 +605,28 @@ inline DB::Cas::BlobRef legacyMetaTestRef(const DB::UInt128 & hash)
     return DB::Cas::BlobRef{DB::Cas::BlobHashAlgo::CityHash128, DB::Cas::BlobDigest::fromU128(hash)};
 }
 
-/// Create a Clean meta descriptor for `hash` via the shared meta-ops layer (putMetaIfAbsent).
+/// Create a Clean meta descriptor for `hash` directly in a test backend. This setup helper deliberately
+/// stays usable before a `Pool` is open; production writes use `putMetaIfAbsent` through the controller.
 inline void writeMetaClean(DB::Cas::Backend & backend, const DB::Cas::Layout & layout,
                            const DB::UInt128 & hash, uint64_t size)
 {
-    DB::Cas::putMetaIfAbsent(backend, layout, legacyMetaTestRef(hash),
-        DB::Cas::BlobMeta{.state = DB::Cas::MetaState::Clean, .condemn_round = 0, .size = size});
+    const DB::Cas::BlobRef ref = legacyMetaTestRef(hash);
+    backend.putIfAbsent(layout.blobMetaKey(ref), DB::Cas::encodeBlobMeta(
+        DB::Cas::BlobMeta{.state = DB::Cas::MetaState::Clean, .condemn_round = 0, .size = size}));
 }
 
 /// Transition an existing meta descriptor to Condemned at `condemn_round`, via a read-modify-CAS on
-/// its current etag (asserts the meta exists — a test setup helper, not production code).
+/// its current token (asserts the meta exists — a direct test setup helper, not production code).
 inline void condemnMeta(DB::Cas::Backend & backend, const DB::Cas::Layout & layout,
                         const DB::UInt128 & hash, uint64_t condemn_round)
 {
-    const auto lm = DB::Cas::loadMeta(backend, layout, legacyMetaTestRef(hash));
+    const DB::Cas::BlobRef ref = legacyMetaTestRef(hash);
+    const auto lm = DB::Cas::loadMeta(backend, layout, ref);
     ASSERT_TRUE(lm.has_value());
     DB::Cas::BlobMeta c = lm->meta;
     c.state = DB::Cas::MetaState::Condemned;
     c.condemn_round = condemn_round;
-    DB::Cas::casMeta(backend, layout, legacyMetaTestRef(hash), lm->etag, c);
+    backend.putOverwrite(layout.blobMetaKey(ref), DB::Cas::encodeBlobMeta(c), lm->etag);
 }
 
 /// Load the meta descriptor for `hash` via the shared ops layer (nullopt = absent).
@@ -975,10 +978,10 @@ private:
 };
 
 /// Fault decorator for the condemn-marker gate tests (codex-review triage 2026-07-17 §3.4): while
-/// armed, any `casPut` against a blob `.meta` key throws — exactly the failure `Gc::scheduleMetaJob`
-/// swallows, so the condemn-marker write is LOST while the round commits the retired entry regardless.
-/// Every other write passes through. Armed by default; disarm (`fail_meta_writes = false`) to model the
-/// backend healing.
+/// armed, every conditional-write attempt against a blob `.meta` key throws. The request controller
+/// exhausts its budget and reports `Unresolved`, so `writeCondemnedMeta` returns false while the round
+/// still commits the unconfirmed retired entry. Every other write passes through. Armed by default;
+/// disarm (`fail_meta_writes = false`) to model the backend healing.
 class MetaWriteFaultBackend : public DB::Cas::InMemoryBackend
 {
 public:
@@ -990,6 +993,23 @@ public:
     using DB::Cas::Backend::putIfAbsentStream;
     using DB::Cas::Backend::putOverwrite;
     using DB::Cas::Backend::casPut;
+
+    DB::Cas::PutResult putIfAbsent(
+        const String & key, const String & bytes, const DB::Cas::ObjectMeta & meta) override
+    {
+        if (fail_meta_writes.load() && key.ends_with(".meta"))
+            throw std::runtime_error("injected fault: blob meta write lost");
+        return InMemoryBackend::putIfAbsent(key, bytes, meta);
+    }
+
+    DB::Cas::PutResult putOverwrite(
+        const String & key, const String & bytes, const DB::Cas::Token & expected,
+        const DB::Cas::ObjectMeta & meta) override
+    {
+        if (fail_meta_writes.load() && key.ends_with(".meta"))
+            throw std::runtime_error("injected fault: blob meta write lost");
+        return InMemoryBackend::putOverwrite(key, bytes, expected, meta);
+    }
 
     DB::Cas::CasResult casPut(const String & key, const String & bytes,
                               const std::optional<DB::Cas::Token> & expected,

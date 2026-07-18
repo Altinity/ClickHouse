@@ -112,15 +112,14 @@ uint64_t deletePrefixWholesale(Backend & backend, const String & prefix, uint64_
 /// or an already-Condemned meta was observed. A lost CAS reports false and writes nothing further (the
 /// loser re-reads next time); a thrown backend error propagates (the scheduling wrapper swallows it) —
 /// either way the entry stays UNCONFIRMED and the graduation gate carries it (triage §3.4).
-bool writeCondemnedMeta(Backend & backend, const Layout & layout, const BlobRef & ref,
-                       uint64_t condemn_round, uint64_t size)
+bool writeCondemnedMeta(Pool & pool, const BlobRef & ref, uint64_t condemn_round, uint64_t size)
 {
-    const auto lm = loadMeta(backend, layout, ref);
+    const auto lm = loadMeta(pool.backend(), pool.layout(), ref);
     const BlobMeta desired{.state = MetaState::Condemned, .condemn_round = condemn_round, .size = size};
     if (!lm)
-        return putMetaIfAbsent(backend, layout, ref, desired).outcome == CasOutcome::Committed;
+        return putMetaIfAbsent(pool, ref, desired).outcome == CasOverwriteOutcome::Committed;
     if (lm->meta.state != MetaState::Condemned)
-        return casMeta(backend, layout, ref, lm->etag, desired).outcome == CasOutcome::Committed;
+        return casMeta(pool, ref, lm->etag, desired).outcome == CasOverwriteOutcome::Committed;
     return true;
 }
 
@@ -239,7 +238,7 @@ void Gc::scheduleCondemnMarkerWrite(const BlobRef & ref, const Token & token,
 {
     scheduleMetaJob([this, ref, token, condemn_round, size]()
     {
-        if (writeCondemnedMeta(store->backend(), store->layout(), ref, condemn_round, size))
+        if (writeCondemnedMeta(*store, ref, condemn_round, size))
             noteCondemnMarkerDurable(ref, token);
         /// A lost CAS / thrown error leaves the (ref, token) UNCONFIRMED: the graduation gate then
         /// carries the entry and retries this write on a later round (fail-safe delay, triage §3.4).
@@ -2177,7 +2176,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
         {
             try
             {
-                if (writeCondemnedMeta(backend, layout, e.ref, round, e.size))
+                if (writeCondemnedMeta(*store, e.ref, round, e.size))
                     noteCondemnMarkerDurable(e.ref, e.token);
             }
             catch (...)

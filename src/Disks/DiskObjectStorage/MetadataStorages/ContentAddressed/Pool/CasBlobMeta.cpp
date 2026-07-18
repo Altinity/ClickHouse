@@ -1,4 +1,5 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobMeta.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 
 #include <Common/ProfileEvents.h>
 
@@ -21,18 +22,18 @@ std::optional<LoadedMeta> loadMeta(Backend & backend, const Layout & layout, con
     return LoadedMeta{.meta = decodeBlobMeta(got->bytes), .etag = got->token};
 }
 
-CasResult putMetaIfAbsent(Backend & backend, const Layout & layout, const BlobRef & ref, const BlobMeta & meta)
+CasOverwriteResult putMetaIfAbsent(Pool & pool, const BlobRef & ref, const BlobMeta & meta)
 {
     ProfileEvents::increment(ProfileEvents::CasMetaPut);
-    const String key = layout.blobMetaKey(ref);
-    return backend.casPut(key, encodeBlobMeta(meta), std::nullopt);
+    const String key = pool.layout().blobMetaKey(ref);
+    return pool.stagingPutIfAbsentMutable(key, encodeBlobMeta(meta));
 }
 
-CasResult casMeta(Backend & backend, const Layout & layout, const BlobRef & ref, const Token & expected, const BlobMeta & meta)
+CasOverwriteResult casMeta(Pool & pool, const BlobRef & ref, const Token & expected, const BlobMeta & meta)
 {
     ProfileEvents::increment(ProfileEvents::CasMetaCas);
-    const String key = layout.blobMetaKey(ref);
-    return backend.casPut(key, encodeBlobMeta(meta), expected);
+    const String key = pool.layout().blobMetaKey(ref);
+    return pool.stagingConditionalOverwrite(key, encodeBlobMeta(meta), expected);
 }
 
 DeleteOutcome deleteMetaExact(Backend & backend, const Layout & layout, const BlobRef & ref, const Token & expected)

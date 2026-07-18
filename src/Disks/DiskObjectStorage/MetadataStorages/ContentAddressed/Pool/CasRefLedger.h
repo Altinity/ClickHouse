@@ -127,6 +127,15 @@ public:
     /// append-fence policy as `stagingPutIfAbsent`.
     CasCreateResult stagingConditionalCreate(std::string_view key, const std::function<PutResult()> & attempt);
 
+    /// Same retry/fence policy as `stagingPutIfAbsent`/`stagingConditionalCreate`, for a MUTABLE
+    /// If-Match overwrite whose bytes are deterministic (safe for GET-based resolution).
+    CasOverwriteResult stagingConditionalOverwrite(std::string_view key, std::string_view bytes, const Token & expected);
+
+    /// Same retry/fence policy as `stagingPutIfAbsent`, for a MUTABLE marker where an existing
+    /// DIFFERENT value at the key is a normal Conflict outcome, not corruption (see
+    /// `CasRequestController::putIfAbsentControlledMutable`).
+    CasOverwriteResult stagingPutIfAbsentMutable(std::string_view key, std::string_view bytes);
+
     /// Hooks required by `EventEmitter`: events are delivered to the injected sink when one is present.
     bool hasEventSink() const noexcept { return static_cast<bool>(event_sink); }
     void emitEvent(CasEvent && e) const { if (event_sink) event_sink(std::move(e)); }

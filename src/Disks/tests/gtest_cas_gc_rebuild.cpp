@@ -559,6 +559,7 @@ TEST(CasGcRebuild, SwallowedRebuildMarkerWriteCarriesEntryInsteadOfDeleting)
 {
     auto backend = std::make_shared<MetaWriteFaultBackend>();
     auto store = openPoolForTest(backend);
+    store->setCasRetrySleepForTest([](uint64_t) {});
     writeBlobBody(*backend, store->layout(), DB::UInt128(2));   /// orphan: present, zero edges
 
     Gc gc(store, kGc);
