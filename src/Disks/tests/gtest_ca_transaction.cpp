@@ -13,6 +13,11 @@ namespace ProfileEvents
 extern const Event CasRefRepoint;
 }
 
+namespace DB::ErrorCodes
+{
+extern const int NOT_IMPLEMENTED;
+}
+
 /// [TXN-ONE-PIPELINE] CA publish-at-commit lock-scope tests.
 /// Proves that a freshly-written part's FINAL manifest ref is published only by commit(); the
 /// tmp->final rename (moveDirectory) is a pure re-key of the transaction-private overlay and
@@ -75,6 +80,16 @@ TEST(CaTransactionLockScope, PublishHappensAtCommitNotRename)
     EXPECT_TRUE(storage->existsDirectory("uui/uuid-1/all_1_1_0"));
     EXPECT_TRUE(storage->existsFile("uui/uuid-1/all_1_1_0/data.bin"));
     EXPECT_EQ(storage->getFileSize("uui/uuid-1/all_1_1_0/data.bin"), 9u);
+}
+
+TEST(CaTransactionOps, TruncateFileIsNotSupported)
+{
+    auto storage = openTxStorage();
+    auto tx = storage->createTransaction();
+    auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
+
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NOT_IMPLEMENTED,
+        [&] { ca_tx.truncateFile("uui/uuid-1/all_1_1_0/data.bin", 0); });
 }
 
 /// [TXN-ONE-PIPELINE] An abandoned transaction (destructed without commit) never published, so the

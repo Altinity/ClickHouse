@@ -1412,8 +1412,9 @@ void ContentAddressedTransaction::unlinkFile(const std::string & path, bool /*if
 
 void ContentAddressedTransaction::truncateFile(const std::string &, size_t)
 {
-    /// No-op: content-addressed blobs are immutable; committed part files are never truncated
-    /// (whole-file rewrites replace the staged entry instead).
+    throw Exception(ErrorCodes::NOT_IMPLEMENTED,
+        "truncateFile is not supported on a content-addressed disk (blobs are immutable; "
+        "whole-file rewrites replace the staged entry instead)");
 }
 
 }
