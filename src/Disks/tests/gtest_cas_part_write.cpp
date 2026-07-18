@@ -936,6 +936,35 @@ TEST(CasPartWriteTxn, PromoteTrustsAdoptedLeafEvenIfBackendRaced)
     EXPECT_TRUE(s->resolveRef(ns, "part_1").has_value());
 }
 
+TEST(CasPartWriteTxn, PromoteSwallowsPostDurableEventSinkFailure)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = openPool(b);
+    const RootNamespace ns{"srv1/tbl"};
+    auto build = startBuildFor(s, ns, "part_1");
+
+    ManifestEntry entry;
+    entry.path = "data.bin";
+    entry.placement = EntryPlacement::Inline;
+    entry.ref = idOf("payload");
+    entry.blob_size = 7;
+    entry.inline_bytes = "payload";
+    const ManifestId id = build->stageManifest({entry});
+    build->precommitAdd(ns, "part_1", id);
+
+    s->setEventSink([](const CasEvent & e)
+    {
+        if (e.type == CasEventType::BuildPublish)
+            throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "injected post-durable event sink failure");
+    });
+
+    EXPECT_NO_THROW(build->promote(ns, "part_1", build->buildId(), id));
+    const auto resolved = s->resolveRef(ns, "part_1");
+    ASSERT_TRUE(resolved);
+    EXPECT_EQ(resolved->manifest_id, id);
+    s->setEventSink(nullptr);
+}
+
 TEST(CasPartWriteTxn, PromoteCondemnedLeafWithoutDepAbortsFailClosed)
 {
     /// A manifest blob leaf with NO recorded dep (a staging-bug shape: neither putBlob nor adoptEvidence

@@ -1065,17 +1065,24 @@ void PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
 
     precommitted = false;
     store->retireBuildSeq(build_seq);
-    EventEmitter{*store}.emit([&](CasEvent & e)
+    try
     {
-        e.type = CasEventType::BuildPublish;
-        e.namespace_ = target_ns.string();
-        e.ref_name = final_ref_name;
-        e.object_hash = manifestRefDebugString(id.ref);
-        e.token = u128ToHex(promote_build_id);
-        e.outcome = "promoted";
-        e.reason = "promote: atomic owner move precommit(build_id) -> ref(final_ref_name) after fail-closed reval";
-        e.detail = {{"build_seq", std::to_string(build_seq)}};
-    });
+        EventEmitter{*store}.emit([&](CasEvent & e)
+        {
+            e.type = CasEventType::BuildPublish;
+            e.namespace_ = target_ns.string();
+            e.ref_name = final_ref_name;
+            e.object_hash = manifestRefDebugString(id.ref);
+            e.token = u128ToHex(promote_build_id);
+            e.outcome = "promoted";
+            e.reason = "promote: atomic owner move precommit(build_id) -> ref(final_ref_name) after fail-closed reval";
+            e.detail = {{"build_seq", std::to_string(build_seq)}};
+        });
+    }
+    catch (...)
+    {
+        tryLogCurrentException(getLogger("CasPartWriteTxn"), "CAS event emission after durable promote");
+    }
 
     /// The low-level audit event for an intended repoint. The ProfileEvent counter + LOG_WARNING are
     /// owned by `CachedPartFolderAccess::repointRef`,
@@ -1084,18 +1091,25 @@ void PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
     /// into `allow_repoint`.
     if (repoint_old)
     {
-        EventEmitter{*store}.emit([&](CasEvent & e)
+        try
         {
-            e.type = CasEventType::RefRepoint;
-            e.namespace_ = target_ns.string();
-            e.ref_name = final_ref_name;
-            e.object_kind = CasEventObjectKind::Manifest;
-            e.object_hash = manifestRefDebugString(id.ref);
-            e.outcome = "repointed";
-            e.reason = "promote(allow_repoint=true): committed ref retargeted from an old manifest to a "
-                       "new one in one ref-log record -- standalone write/remove on a committed part";
-            e.detail = {{"old_manifest", manifestRefDebugString(*repoint_old)}};
-        });
+            EventEmitter{*store}.emit([&](CasEvent & e)
+            {
+                e.type = CasEventType::RefRepoint;
+                e.namespace_ = target_ns.string();
+                e.ref_name = final_ref_name;
+                e.object_kind = CasEventObjectKind::Manifest;
+                e.object_hash = manifestRefDebugString(id.ref);
+                e.outcome = "repointed";
+                e.reason = "promote(allow_repoint=true): committed ref retargeted from an old manifest to a "
+                           "new one in one ref-log record -- standalone write/remove on a committed part";
+                e.detail = {{"old_manifest", manifestRefDebugString(*repoint_old)}};
+            });
+        }
+        catch (...)
+        {
+            tryLogCurrentException(getLogger("CasPartWriteTxn"), "CAS event emission after durable promote");
+        }
     }
 }
 
