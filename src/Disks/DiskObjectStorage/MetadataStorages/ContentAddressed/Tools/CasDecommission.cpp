@@ -299,13 +299,29 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
                     {
                         OwnerObject tombstoned = decodeOwner(owner->bytes);
                         tombstoned.retired_at_ms = nowMs();
-                        const PutResult put = pool_backend->putOverwrite(owner_key, encodeOwner(tombstoned), owner->token);
-                        if (put.outcome == PutOutcome::Done)
+                        /// Controlled, not a bare putOverwrite: a transient transport error here (or
+                        /// one whose response was simply lost) must not be reported as a hard failure
+                        /// when the write actually landed. A standalone controller (decommission is an
+                        /// administrative, non-hot-path operation; no mount-lease fence applies to it
+                        /// -- the exact-token CAS itself is the safety mechanism, same as the mount/
+                        /// epoch deletes above) resolves an ambiguous attempt with one GET: unchanged
+                        /// token means the write never applied (legitimately retryable within budget);
+                        /// matching bytes means this exact tombstone already landed (Committed, not a
+                        /// failure); anything else is a genuine successor reclaim (Conflict).
+                        CasRequestController controller(pool_backend, CasRequestBudget{});
+                        const CasOverwriteResult result = controller.putOverwriteControlled(
+                            owner_key, encodeOwner(tombstoned), owner->token, [] { return true; });
+                        if (result.outcome == CasOverwriteOutcome::Committed)
                             report.slot_removed = true;
-                        else
+                        else if (result.outcome == CasOverwriteOutcome::Conflict)
                             report.warnings.push_back(
                                 "slot tombstone failed: " + owner_key
                                 + ": successor reclaimed the owner anchor before this decommission's tombstone write");
+                        else
+                            report.warnings.push_back(
+                                "slot tombstone failed: " + owner_key
+                                + ": tombstone write outcome could not be resolved (retry budget exhausted "
+                                  "or the resolve GET itself failed) -- rerun the command to retry");
                     }
                     else
                         report.warnings.push_back(

@@ -292,6 +292,36 @@ private:
     String successor_owner_bytes;
 };
 
+/// Models an "ambiguous success" on the final owner tombstone write: the conditional overwrite
+/// actually lands (InMemoryBackend applies it), but the response is then lost (a transient
+/// exception is thrown on the SAME call, exactly as a real SDK timeout after a landed write would
+/// look). Before the fix, decommission caught any exception here and reported failure
+/// unconditionally; the controlled overwrite must resolve this via a GET (the current bytes match
+/// what was intended) and report Committed instead.
+class AmbiguousOwnerTombstoneBackend : public InMemoryBackend
+{
+public:
+    using Backend::putOverwrite;
+
+    void armForAmbiguousTombstone() { armed = true; }
+
+    PutResult putOverwrite(const String & key, const String & bytes, const Token & expected, const ObjectMeta & meta) override
+    {
+        const PutResult result = InMemoryBackend::putOverwrite(key, bytes, expected, meta);
+        if (armed && !fired && key == owner_key && result.outcome == PutOutcome::Done)
+        {
+            fired = true;
+            throw std::runtime_error("ambiguous-tombstone fixture: response lost after the write landed");
+        }
+        return result;
+    }
+
+private:
+    inline static const String owner_key = "p/gc/server-roots/victim/owner";
+    bool armed = false;
+    bool fired = false;
+};
+
 /// Seed one victim table with `committed` committed refs and `precommits` dangling precommit bindings,
 /// via the raw ref-log seeding helpers (fixture idiom of e.g. `gtest_cas_gc_fold.cpp`: `writeManifestRaw`
 /// + `publishCommittedTransition`/`addPrecommitTransition` against `victim`'s own backend/layout) -- this
@@ -753,6 +783,27 @@ TEST(CasDecommission, SuccessorOwnerRewriteWinsBeforeTombstone)
     EXPECT_EQ(owner->token, backend->successorOwnerToken());
     EXPECT_EQ(owner->bytes, backend->successorOwnerBytes());
     EXPECT_FALSE(decodeOwner(owner->bytes).retired_at_ms.has_value());
+}
+
+/// Final whole-branch review finding (Important, docs/superpowers/reports/final-whole-branch-review):
+/// a transient exception on the owner tombstone write must not be reported as a hard failure when the
+/// write actually landed -- the controlled overwrite resolves this via GET (current bytes already
+/// match the intended tombstone) instead of the old bare putOverwrite's "any exception = failure".
+TEST(CasDecommission, OwnerTombstoneAmbiguousSuccessResolvesToCommitted)
+{
+    auto backend = std::make_shared<AmbiguousOwnerTombstoneBackend>();
+    { auto victim = openVictim(backend); }
+    backend->armForAmbiguousTombstone();
+
+    const auto report = decommissionPoolMember(
+        backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim");
+
+    EXPECT_TRUE(report.slot_removed) << "the ambiguous write actually landed and must resolve to Committed";
+    EXPECT_TRUE(report.warnings.empty());
+
+    const auto owner = backend->get("p/gc/server-roots/victim/owner");
+    ASSERT_TRUE(owner.has_value());
+    EXPECT_TRUE(decodeOwner(owner->bytes).retired_at_ms.has_value());
 }
 
 /// Delegates every op to `inner`, except `deleteExact`: while `armed`, any key starting with
