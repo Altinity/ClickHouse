@@ -541,11 +541,13 @@ std::pair<MergeTreeData::MutableDataPartPtr, scope_guard> Fetcher::fetchSelected
     /// and ignores `to_detached`, so a `FETCH PARTITION ... TO detached` must NOT advertise relink —
     /// not advertising forces the sender to stream bytes, which `downloadPartToDisk` writes into the
     /// `detached/` namespace. Relink-into-detached is a deferred optimization (see backlog).
+    String advertised_pool_uuid;
     if (try_zero_copy && !to_detached)
     {
         if (auto * ca_meta = tryGetContentAddressedExchange(disk))
         {
-            uri.addQueryParameter(CA_POOL_UUID_PARAM, ca_meta->getPoolUUID());
+            advertised_pool_uuid = ca_meta->getPoolUUID();
+            uri.addQueryParameter(CA_POOL_UUID_PARAM, advertised_pool_uuid);
         }
         else if (!disk)
         {
@@ -553,7 +555,8 @@ std::pair<MergeTreeData::MutableDataPartPtr, scope_guard> Fetcher::fetchSelected
             {
                 if (auto * ca_disk_meta = tryGetContentAddressedExchange(data_disk))
                 {
-                    uri.addQueryParameter(CA_POOL_UUID_PARAM, ca_disk_meta->getPoolUUID());
+                    advertised_pool_uuid = ca_disk_meta->getPoolUUID();
+                    uri.addQueryParameter(CA_POOL_UUID_PARAM, advertised_pool_uuid);
                     break;
                 }
             }
@@ -745,14 +748,18 @@ std::pair<MergeTreeData::MutableDataPartPtr, scope_guard> Fetcher::fetchSelected
             return fall_back_to_byte_fetch();
         }
 
+        auto * chosen_ca = tryGetContentAddressedExchange(disk);
+        if (!chosen_ca || chosen_ca->getPoolUUID() != advertised_pool_uuid)
+        {
+            LOG_INFO(log, "Part {} was offered by relink for content-addressed pool '{}', but reservation landed "
+                "outside the advertised pool on disk {} (chosen pool: '{}'); falling back to a byte fetch",
+                part_name, advertised_pool_uuid, disk->getName(), chosen_ca ? chosen_ca->getPoolUUID() : "<none>");
+            return fall_back_to_byte_fetch();
+        }
+
         String sender_manifest_bytes;
         readStringBinary(sender_manifest_bytes, *in);
         assertEOF(*in);
-
-        auto * ca_meta = tryGetContentAddressedExchange(disk);
-        if (!ca_meta)
-            throw Exception(ErrorCodes::LOGICAL_ERROR,
-                "Got '{}' cookie but the target disk {} is not content-addressed", CA_RELINK_COOKIE, disk->getName());
 
         auto relinked = relinkPartToDisk(part_name, tmp_prefix, disk, sender_manifest_bytes);
         if (relinked)
