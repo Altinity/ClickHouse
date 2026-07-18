@@ -247,24 +247,57 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
 
         /// Mount first: if a successor reclaimed it after the farewell capture, the stale farewell
         /// token yields `TokenMismatch` and the tail stops before touching epoch or owner. Epoch second:
-        /// its under-claim token similarly detects a successor allocation. Owner is last and is read
-        /// only after both mutable objects were confirmed deleted; same-UUID successors never rewrite
-        /// this identity anchor directly. Every delete must be explicitly confirmed as `Deleted`.
+        /// its under-claim token similarly detects a successor allocation. Before touching owner, re-read
+        /// both mutable objects: a same-UUID successor can recreate them after both deletes without
+        /// rewriting the owner identity anchor. Mere presence proves that the slot is live again. Every
+        /// delete must be explicitly confirmed as `Deleted`.
         report.slot_removed = false;
         if (captures_match && deleteSlotObject(*pool_backend, mount_key, farewell_mount->token, report.warnings)
             && deleteSlotObject(*pool_backend, epoch_key, claimed_epoch->token, report.warnings))
         {
+            std::optional<GetResult> current_mount;
+            std::optional<GetResult> current_epoch;
+            bool liveness_recheck_succeeded = true;
             try
             {
-                if (const auto owner = pool_backend->get(owner_key))
-                    report.slot_removed = deleteSlotObject(*pool_backend, owner_key, owner->token, report.warnings);
-                else
-                    report.warnings.push_back("slot delete failed: " + owner_key + ": object absent before delete");
+                current_mount = pool_backend->get(mount_key);
             }
             catch (...)
             {
-                report.warnings.push_back("slot delete failed: " + owner_key + ": "
+                report.warnings.push_back("slot liveness recheck failed: " + mount_key + ": "
                                           + getCurrentExceptionMessage(/*with_stacktrace=*/false));
+                liveness_recheck_succeeded = false;
+            }
+            try
+            {
+                current_epoch = pool_backend->get(epoch_key);
+            }
+            catch (...)
+            {
+                report.warnings.push_back("slot liveness recheck failed: " + epoch_key + ": "
+                                          + getCurrentExceptionMessage(/*with_stacktrace=*/false));
+                liveness_recheck_succeeded = false;
+            }
+
+            if (liveness_recheck_succeeded && (current_mount || current_epoch))
+            {
+                report.warnings.push_back(
+                    "slot delete aborted: successor reappeared after mutable control-object deletion; owner kept");
+            }
+            else if (liveness_recheck_succeeded)
+            {
+                try
+                {
+                    if (const auto owner = pool_backend->get(owner_key))
+                        report.slot_removed = deleteSlotObject(*pool_backend, owner_key, owner->token, report.warnings);
+                    else
+                        report.warnings.push_back("slot delete failed: " + owner_key + ": object absent before delete");
+                }
+                catch (...)
+                {
+                    report.warnings.push_back("slot delete failed: " + owner_key + ": "
+                                              + getCurrentExceptionMessage(/*with_stacktrace=*/false));
+                }
             }
         }
     }

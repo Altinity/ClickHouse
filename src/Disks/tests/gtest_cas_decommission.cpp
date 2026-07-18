@@ -165,6 +165,75 @@ private:
     String successor_epoch_bytes;
 };
 
+/// Recreates the mutable slot objects immediately after decommission successfully deletes `epoch`.
+/// This models a same-UUID successor starting in the final retirement window: `owner` remains the
+/// unchanged identity anchor, while the successor legitimately creates a fresh `epoch` and `mount`.
+class SuccessorReclaimAfterEpochDeleteBackend : public InMemoryBackend
+{
+public:
+    using Backend::get;
+
+    void armForSuccessorReclaim() { armed = true; }
+
+    DeleteOutcome deleteExact(const String & key, const Token & token) override
+    {
+        if (key == owner_key)
+            ++owner_delete_attempts;
+
+        const DeleteOutcome result = InMemoryBackend::deleteExact(key, token);
+        if (armed && !successor_injected && key == epoch_key
+            && classifyDeleteOutcome(result) == DeleteClass::Deleted)
+        {
+            injectSuccessor();
+        }
+        return result;
+    }
+
+    bool successorInjected() const { return successor_injected; }
+    uint64_t ownerDeleteAttempts() const { return owner_delete_attempts; }
+    const Token & successorMountToken() const { return successor_mount_token; }
+    const Token & successorEpochToken() const { return successor_epoch_token; }
+    const String & successorMountBytes() const { return successor_mount_bytes; }
+    const String & successorEpochBytes() const { return successor_epoch_bytes; }
+
+private:
+    void injectSuccessor()
+    {
+        successor_epoch_bytes = encodeServerEpoch(ServerEpoch{.next_writer_epoch = 102});
+        const PutResult epoch_put = InMemoryBackend::putIfAbsent(epoch_key, successor_epoch_bytes, {});
+        if (epoch_put.outcome != PutOutcome::Done)
+            throw std::runtime_error("late-successor fixture: epoch recreation conflicted");
+        successor_epoch_token = epoch_put.token;
+
+        successor_mount_bytes = encodeMountLease(MountLease{
+            .server_uuid = UInt128(0x1234),
+            .writer_epoch = 101,
+            .hostname = "successor",
+            .pid = 42,
+            .started_at_ms = 1'000,
+            .seq = 1,
+            .expires_at_ms = 31'000,
+            .min_active = 0,
+        });
+        const PutResult mount_put = InMemoryBackend::putIfAbsent(mount_key, successor_mount_bytes, {});
+        if (mount_put.outcome != PutOutcome::Done)
+            throw std::runtime_error("late-successor fixture: mount recreation conflicted");
+        successor_mount_token = mount_put.token;
+        successor_injected = true;
+    }
+
+    inline static const String mount_key = "p/gc/server-roots/victim/mount";
+    inline static const String epoch_key = "p/gc/server-roots/victim/epoch";
+    inline static const String owner_key = "p/gc/server-roots/victim/owner";
+    bool armed = false;
+    bool successor_injected = false;
+    uint64_t owner_delete_attempts = 0;
+    Token successor_mount_token;
+    Token successor_epoch_token;
+    String successor_mount_bytes;
+    String successor_epoch_bytes;
+};
+
 /// Seed one victim table with `committed` committed refs and `precommits` dangling precommit bindings,
 /// via the raw ref-log seeding helpers (fixture idiom of e.g. `gtest_cas_gc_fold.cpp`: `writeManifestRaw`
 /// + `publishCommittedTransition`/`addPrecommitTransition` against `victim`'s own backend/layout) -- this
@@ -527,6 +596,42 @@ TEST(CasDecommission, SuccessorReclaimFencesSlotRetirementTail)
     ASSERT_FALSE(seen.empty());
     EXPECT_EQ(seen.back().outcome, "end");
     EXPECT_EQ(seen.back().detail.at("slot_removed"), "0");
+}
+
+/// A successor can also restart after both stale mutable objects were deleted but before `owner` is
+/// retired. Mere presence of either freshly recreated mutable object must stop owner retirement.
+TEST(CasDecommission, SuccessorReclaimAfterEpochDeleteKeepsOwnerAnchor)
+{
+    auto backend = std::make_shared<SuccessorReclaimAfterEpochDeleteBackend>();
+    { auto victim = openVictim(backend); }
+
+    const String owner_key = "p/gc/server-roots/victim/owner";
+    const auto original_owner = backend->get(owner_key);
+    ASSERT_TRUE(original_owner.has_value());
+    backend->armForSuccessorReclaim();
+
+    const auto report = decommissionPoolMember(
+        backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim");
+
+    ASSERT_TRUE(backend->successorInjected());
+    EXPECT_FALSE(report.slot_removed);
+    EXPECT_FALSE(report.warnings.empty());
+    EXPECT_EQ(backend->ownerDeleteAttempts(), 0u);
+
+    const auto owner = backend->get(owner_key);
+    ASSERT_TRUE(owner.has_value());
+    EXPECT_EQ(owner->token, original_owner->token);
+    EXPECT_EQ(owner->bytes, original_owner->bytes);
+
+    const auto mount = backend->get("p/gc/server-roots/victim/mount");
+    ASSERT_TRUE(mount.has_value());
+    EXPECT_EQ(mount->token, backend->successorMountToken());
+    EXPECT_EQ(mount->bytes, backend->successorMountBytes());
+
+    const auto epoch = backend->get("p/gc/server-roots/victim/epoch");
+    ASSERT_TRUE(epoch.has_value());
+    EXPECT_EQ(epoch->token, backend->successorEpochToken());
+    EXPECT_EQ(epoch->bytes, backend->successorEpochBytes());
 }
 
 /// Triage #9 control: absent a successor interleaving, the newly fenced tail still removes all three
