@@ -1,6 +1,7 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
+#include <deque>
 #include <map>
 #include <mutex>
 
@@ -181,6 +182,10 @@ public:
     /// request-scoped single-attempt S3 client when available.
     WriteSettings conditionalWriteSettings() const;
     WriteSettings conditionalWriteSettingsForTest() const { return conditionalWriteSettings(); }
+    /// Override the emulated backend's wall clock for deterministic expiry tests.
+    void setEmuNowNsForTest(uint64_t now_ns);
+    /// Return the guarded per-key token-state size for expiry tests.
+    size_t emuTokenStateSizeForTest() const;
 
 private:
     const ObjectStoragePtr object_storage;
@@ -199,16 +204,22 @@ private:
     std::shared_ptr<const S3::Client> single_attempt_s3_client;
 #endif
 
-    /// EmulatedSingleProcess state: per-key {etag, disambiguator} — see emuMintToken. An entry is
-    /// retained on delete ONLY while its etag is still recent enough that an immediate delete+recreate
-    /// WITHIN this process could land in the same mtime quantum (see etagComfortablyInThePast in the
-    /// .cpp) — that is the ONLY case the guard exists to disambiguate. Once the etag is comfortably
-    /// behind "now", `deleteExact` erases the entry: EmulatedSingleProcess backs every local-CA disk,
-    /// including multi-hour soak/CI clusters with heavy GC delete churn on keys that never recur, so
-    /// this map must not grow for the lifetime of the backend instance (codex-review-triage §3.18,
-    /// Important #1).
-    std::mutex emu_mutex;
+    /// EmulatedSingleProcess state: per-key {etag, disambiguator} — see emuMintToken. A successfully
+    /// deleted entry is retained only while its etag is recent enough that an immediate recreate could
+    /// land in the same mtime quantum. `deleteExact` erases already-old entries immediately and queues
+    /// recent ones for the bounded lazy sweep in emuMintToken, so a key need not be revisited to expire.
+    /// The queue records the exact state generation deleted; a subsequent re-mint makes the record
+    /// obsolete rather than allowing it to erase the live incarnation's token state.
+    mutable std::mutex emu_mutex;
     std::map<String, std::pair<String, uint64_t>> emu_token_state;
+    struct EmuTokenExpiry
+    {
+        uint64_t queued_at_ns;
+        String key;
+        std::pair<String, uint64_t> token_state;
+    };
+    std::deque<EmuTokenExpiry> emu_token_expiry;
+    uint64_t emu_now_ns_for_test = 0;
     /// Fallback nonce for the (anomalous) case where the object storage reports an EMPTY etag: mints a
     /// fresh, unpersisted value each time — never worse than the old counter for that case, but never
     /// masquerading as a real etag-derived identity either.
@@ -246,6 +257,9 @@ private:
     /// Return the current emulated token for a key we just read/HEAD'd, reflecting its on-disk etag —
     /// does NOT advance the same-etag disambiguator (that only applies to a just-completed write).
     Token emuObserveToken(const String & key);
+    uint64_t emuNowNs() const;
+    /// Examine a fixed number of oldest deleted-state records, expiring only an exact current match.
+    void emuPruneTokenState(uint64_t now_ns);
     /// Single source of truth for minting an emulated token from an observed `etag`: the wire value IS
     /// the etag while it is the first thing minted for `key` at that etag, or `etag#N` once a SAME-etag
     /// rewrite forces a disambiguator (`just_wrote` — see the mtime-quantum note in emu_token_state's

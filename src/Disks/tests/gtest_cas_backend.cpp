@@ -789,6 +789,40 @@ DB::ObjectStoragePtr makeFixedNumericEtagStorageForTest(const String & etag)
     return std::make_shared<FixedNumericEtagLocalObjectStorage>(std::move(settings), etag);
 }
 
+class ClockEtagLocalObjectStorage final : public DB::LocalObjectStorage
+{
+public:
+    ClockEtagLocalObjectStorage(DB::LocalObjectStorageSettings settings, std::shared_ptr<std::atomic<uint64_t>> now_ns_)
+        : DB::LocalObjectStorage(std::move(settings)), now_ns(std::move(now_ns_))
+    {
+    }
+
+    std::optional<DB::ObjectMetadata> tryGetObjectMetadata(const std::string & path, bool with_tags) const override
+    {
+        auto metadata = DB::LocalObjectStorage::tryGetObjectMetadata(path, with_tags);
+        if (metadata)
+            metadata->etag = std::to_string(now_ns->load());
+        return metadata;
+    }
+
+private:
+    std::shared_ptr<std::atomic<uint64_t>> now_ns;
+};
+
+DB::ObjectStoragePtr makeClockEtagStorageForTest(const std::shared_ptr<std::atomic<uint64_t>> & now_ns)
+{
+    static std::atomic<uint64_t> counter{0};
+    const auto unique = std::to_string(::getpid()) + "_" + std::to_string(counter.fetch_add(1));
+    const auto root = (std::filesystem::temp_directory_path() / ("cas_clock_etag_unit_" + unique)).string();
+
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+    std::filesystem::create_directories(root, ec);
+
+    DB::LocalObjectStorageSettings settings("test", root, /*read_only_=*/false);
+    return std::make_shared<ClockEtagLocalObjectStorage>(std::move(settings), now_ns);
+}
+
 }
 
 /// codex-review-triage §3.18, Important #1: `emu_token_state` must be BOUNDED, not grow for the
@@ -833,6 +867,39 @@ TEST(CasObjectStorageBackend, DeleteExactErasesEmuTokenStateOnlyWhenEtagIsComfor
         EXPECT_EQ(put2.token.value, recent_etag + "#1") << "entry should have been RETAINED on delete (etag recent), "
                                                             "so the recreate is disambiguated against it";
     }
+}
+
+TEST(CasObjectStorageBackend, EmuTokenStateEventuallyPrunesDistinctShortLivedKeys)
+{
+    constexpr uint64_t start_ns = 1'700'000'000'000'000'000ULL;
+    constexpr uint64_t step_ns = 100'000'000ULL;
+    constexpr size_t key_count = 128;
+    constexpr size_t expected_recent_key_bound = 24;
+
+    auto now_ns = std::make_shared<std::atomic<uint64_t>>(start_ns);
+    ObjectStorageBackend backend(makeClockEtagStorageForTest(now_ns), ObjectStorageBackend::Mode::EmulatedSingleProcess);
+
+    for (size_t i = 0; i < key_count; ++i)
+    {
+        const uint64_t current_ns = start_ns + i * step_ns;
+        now_ns->store(current_ns);
+        backend.setEmuNowNsForTest(current_ns);
+
+        const String key = "k/short-lived-" + std::to_string(i);
+        const auto put = backend.putIfAbsent(key, "body");
+        ASSERT_EQ(put.outcome, PutOutcome::Done);
+        ASSERT_EQ(backend.deleteExact(key, put.token).kind, DeleteOutcome::Kind::Deleted);
+    }
+
+    const uint64_t sweep_ns = start_ns + key_count * step_ns + 2'000'000'000ULL;
+    now_ns->store(sweep_ns);
+    backend.setEmuNowNsForTest(sweep_ns);
+    const auto trigger = backend.putIfAbsent("k/sweep-trigger", "body");
+    ASSERT_EQ(trigger.outcome, PutOutcome::Done);
+    ASSERT_EQ(backend.deleteExact("k/sweep-trigger", trigger.token).kind, DeleteOutcome::Kind::Deleted);
+
+    EXPECT_LE(backend.emuTokenStateSizeForTest(), expected_recent_key_bound)
+        << "token state should track only the bounded recent-key window, not all " << key_count << " deleted keys";
 }
 
 namespace

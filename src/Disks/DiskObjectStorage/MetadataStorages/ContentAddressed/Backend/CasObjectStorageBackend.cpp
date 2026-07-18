@@ -510,13 +510,14 @@ namespace
 /// purpose (codex-review-triage §3.18, Important #1). 2 seconds is far above any filesystem's mtime
 /// tick coarseness while still bounding the map to the recently-deleted-key population.
 constexpr uint64_t EMU_TOKEN_STALE_AGE_NS = 2'000'000'000ULL;
+constexpr size_t EMU_TOKEN_EXPIRY_SWEEP_SIZE = 16;
 
 /// True iff `etag` parses as a plain nanosecond count (emuMintToken's `.first` is always the BARE
 /// etag, never the `etag#N` disambiguated form) that is at least EMU_TOKEN_STALE_AGE_NS behind now.
 /// An etag that fails to parse (e.g. a test double's non-numeric stub) is conservatively treated as
 /// NOT stale — never erasing is always safe, merely un-bounded, so an unparseable value must not be
 /// mistaken for a recent one.
-bool etagComfortablyInThePast(const String & etag)
+bool etagComfortablyInThePast(const String & etag, uint64_t now_ns)
 {
     if (etag.empty() || !std::all_of(etag.begin(), etag.end(), [](char c) { return c >= '0' && c <= '9'; }))
         return false;
@@ -531,8 +532,6 @@ bool etagComfortablyInThePast(const String & etag)
         return false;
     }
 
-    const auto now_ns = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
     return now_ns > etag_ns && (now_ns - etag_ns) >= EMU_TOKEN_STALE_AGE_NS;
 }
 
@@ -545,6 +544,54 @@ String ObjectStorageBackend::emuPath(const String & key) const
     if (!emu_root.empty() && emu_root.back() == '/')
         return emu_root + key;
     return emu_root + "/" + key;
+}
+
+uint64_t ObjectStorageBackend::emuNowNs() const
+{
+    if (emu_now_ns_for_test != 0)
+        return emu_now_ns_for_test;
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+}
+
+void ObjectStorageBackend::setEmuNowNsForTest(uint64_t now_ns)
+{
+    std::lock_guard lock(emu_mutex);
+    emu_now_ns_for_test = now_ns;
+}
+
+size_t ObjectStorageBackend::emuTokenStateSizeForTest() const
+{
+    std::lock_guard lock(emu_mutex);
+    return emu_token_state.size();
+}
+
+void ObjectStorageBackend::emuPruneTokenState(uint64_t now_ns)
+{
+    for (size_t checked = 0; checked < EMU_TOKEN_EXPIRY_SWEEP_SIZE && !emu_token_expiry.empty(); ++checked)
+    {
+        const auto & candidate = emu_token_expiry.front();
+        auto current = emu_token_state.find(candidate.key);
+
+        /// A later mint (including a delete+recreate in the same mtime quantum) supersedes this exact
+        /// deleted state. Its queue record can be discarded immediately without touching the map.
+        if (current == emu_token_state.end() || current->second != candidate.token_state)
+        {
+            emu_token_expiry.pop_front();
+            continue;
+        }
+
+        /// Deletion time is monotonic within this mutex-protected FIFO. If its oldest record has not
+        /// crossed the safety window, every later matching record is too recent as well.
+        if (now_ns <= candidate.queued_at_ns || now_ns - candidate.queued_at_ns < EMU_TOKEN_STALE_AGE_NS)
+            break;
+
+        /// The record has aged enough to inspect its etag. Unparseable or otherwise uncertain etags
+        /// stay in the map (fail safe), but their queue records cannot block pruning of later keys.
+        if (etagComfortablyInThePast(current->second.first, now_ns))
+            emu_token_state.erase(current);
+        emu_token_expiry.pop_front();
+    }
 }
 
 bool ObjectStorageBackend::emuExists(const String & key) const
@@ -578,6 +625,8 @@ Token ObjectStorageBackend::emuObserveToken(const String & key)
 
 Token ObjectStorageBackend::emuMintToken(const String & key, const String & etag, bool just_wrote)
 {
+    emuPruneTokenState(emuNowNs());
+
     /// Anomalous: the object storage reported no etag at all (LocalObjectStorage always does; this
     /// guards a hypothetical future/test double). Mint a fresh, UNPERSISTED value — never worse than
     /// the old counter for this case, but never masquerading as a real etag-derived identity.
@@ -934,8 +983,14 @@ DeleteOutcome ObjectStorageBackend::deleteExact(const String & key, const Token 
     /// collision with an immediate recreate is still possible (emuMintToken) — once it is
     /// comfortably old, erase it so `emu_token_state` does not grow for the lifetime of the backend
     /// instance (codex-review-triage §3.18, Important #1).
-    if (auto it = emu_token_state.find(key); it != emu_token_state.end() && etagComfortablyInThePast(it->second.first))
-        emu_token_state.erase(it);
+    if (auto it = emu_token_state.find(key); it != emu_token_state.end())
+    {
+        const uint64_t now_ns = emuNowNs();
+        if (etagComfortablyInThePast(it->second.first, now_ns))
+            emu_token_state.erase(it);
+        else
+            emu_token_expiry.push_back(EmuTokenExpiry{now_ns, key, it->second});
+    }
     d.kind = DeleteOutcome::Kind::Deleted;
     return d;
 }
