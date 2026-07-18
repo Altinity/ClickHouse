@@ -77,9 +77,9 @@ Pool::Pool(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
     /// Plain-object surface component: binds to this Pool's own backend + layout (declared after
     /// both, so this reference-holding member is constructed last and destroyed first).
     , plain_objects(*pool_backend, pool_layout)
-    /// Manifest reader component: backend/layout/meta by reference + the event-sink reference (set
-    /// later via setEventSink; the reference observes that assignment). Owns the decode cache, built
-    /// from the same config bytes the Pool ctor used before.
+    /// Manifest reader component: backend/layout/meta by reference + the event-sink reference. The
+    /// sink is installed by the factory before writable mounting starts. Owns the decode cache,
+    /// built from the same config bytes the Pool ctor used before.
     , manifest_reader(*pool_backend, pool_layout, meta, event_sink_, config.manifest_decode_cache_bytes)
     /// Ref-log / ref-table subsystem. Injected with backend/layout + the
     /// RefLedgerConfig slice + the event-sink reference + the pool `cas_request_budget` + the RAW mount
@@ -258,6 +258,7 @@ PoolPtr Pool::open(BackendPtr backend, PoolConfig config)
 
     /// Private ctor: make_shared cannot reach it.
     PoolPtr store(new Pool(std::move(backend), std::move(config), std::move(meta)));
+    store->event_sink_ = std::move(store->config.event_sink);
 
     /// Register-before-first-write, belt-and-braces: `createOrValidate` above already
     /// admitted/validated the write algo, so the freshly-seeded cache must already contain it -- a
@@ -353,10 +354,8 @@ void Pool::mountWritable(PoolPtr & store, UInt128 our_uuid, MountClaimPolicy pol
     };
 
     /// Mount-slot writer audit (the "foreign writer" instrument): route every mount-slot
-    /// write/conflict event through the Pool's own sink. `setEventSink` runs AFTER `open`
-    /// returns (the `ContentAddressedMetadataStorage` wiring), so an event fired synchronously
-    /// during this very `open` call is dropped by the still-null sink — the same startup window
-    /// every other emission site in this file already has (`hasEventSink()`/`emitEvent()`).
+    /// write/conflict event through the Pool's own sink. The factory installs the configured sink
+    /// before this mount protocol starts, including before any renewal thread can emit.
     /// `s` outlives the lambda: it is captured by raw pointer into the keeper, a member of
     /// `Pool` destroyed before the `Pool` itself.
     const auto emit_mount_event = [s = store.get()](CasEvent e) { s->emitEvent(std::move(e)); };
@@ -538,6 +537,7 @@ PoolPtr Pool::openForDecommission(BackendPtr backend, PoolConfig config, const S
 
     /// Private ctor: make_shared cannot reach it.
     PoolPtr store(new Pool(std::move(backend), std::move(config), std::move(meta)));
+    store->event_sink_ = std::move(store->config.event_sink);
 
     /// Register-before-first-write, belt-and-braces: same invariant `open` asserts.
     chassert(store->isAlgoAdmitted(write_algo));

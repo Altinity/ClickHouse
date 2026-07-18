@@ -95,9 +95,8 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
     DecommissionReport report;
     report.srid = victim_srid;
 
+    config.event_sink = sink;
     PoolPtr admin = Pool::openForDecommission(std::move(backend), std::move(config), victim_srid);
-    if (sink)
-        admin->setEventSink(sink);
 
     EventEmitter{*admin}.emit([&](CasEvent & e)
     {

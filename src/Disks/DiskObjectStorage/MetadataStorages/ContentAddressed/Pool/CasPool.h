@@ -107,6 +107,8 @@ struct PoolConfig
     /// before the round's single gc/state CAS, so the meta writes are durable before that CAS commits.
     uint64_t gc_meta_pool_size = 16;
     bool background_watermark = false;       /// tests drive renewOnce explicitly; gates the merged heartbeat's background thread
+    /// Installed on the pool before a writable mount can start its renewal thread.
+    CasEventSink event_sink = {};
 
     /// Mount-lease TTL: how long a freshly-renewed mount lease is valid. The local
     /// write fence's monotonic deadline is `renew_time + this`, so a superseded/paused writer is fenced
@@ -558,6 +560,7 @@ public:
     /// The wiring injects a sink (CasEvent -> SystemLog row) when the log is configured; null sink
     /// (unit tests, log disabled) makes emitEvent a no-op single branch. PartWriteTxn/Gc reach this via
     /// their owning Pool. `reason`/`detail` on the event carry the decision's full rationale.
+    /// Intended only for pre-open wiring or tests with no active mount thread; later installation races emitters.
     void setEventSink(CasEventSink sink) { event_sink_ = std::move(sink); }
     /// Rvalue-only: forces every call site to `std::move` its (dead-after) `CasEvent` local, so a
     /// site a future edit forgets to update is a COMPILE ERROR here rather than a silent deep copy.

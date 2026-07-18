@@ -7,6 +7,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcScheduler.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Interpreters/Context_fwd.h>
+#include <base/defines.h>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -157,8 +158,8 @@ public:
     /// Opens the pool, validates its format and starts the optional GC scheduler. Read-only disks
     /// skip write probes and GC; failures in startup propagate.
     void startup() override;
-    /// Stops the GC scheduler before releasing the part-folder facade and pool. Scheduler destruction
-    /// is synchronized with `gcHealth`.
+    /// Stops the GC scheduler before releasing the part-folder facade and pool. Their destruction is
+    /// synchronized with the accessors and synchronous GC entry points.
     void shutdown() override;
 
     /// Tests whether a path is represented by an inline manifest entry, namespace file, or loose
@@ -200,11 +201,12 @@ public:
 
     /// ==== wiring-internal surface (the transaction + the disk's prepareRead CA branch) ====
 
-    /// Returns the opened pool. Throws `LOGICAL_ERROR` before `startup`.
-    const Cas::PoolPtr & store() const;
+    /// Returns a shared-ownership snapshot of the opened pool. Throws `LOGICAL_ERROR` before `startup`.
+    Cas::PoolPtr store() const;
     /// Returns the cached part-folder facade by reference. Throws `LOGICAL_ERROR` before `startup`.
     /// Committed part-folder reads and mutations go through this facade so cache validation remains
-    /// centralized.
+    /// centralized. The disk lifecycle contract requires callers not to retain this reference across
+    /// a concurrent `shutdown`; the lifecycle mutex only serializes the pointer read with reset.
     Cas::CachedPartFolderAccess & partAccess() const;
     const std::string & serverRootId() const { return server_root_id; }
     const std::string & scratchPath() const { return local_scratch_path; }
@@ -401,15 +403,11 @@ private:
     std::unique_ptr<Cas::CachedPartFolderAccess> part_access;
     String pool_uuid;
     std::unique_ptr<Cas::CasGcScheduler> gc_scheduler;
-    /// Guards lazy scheduler creation in `runOneGcRoundForTest` and `runGarbageCollectionRoundNow`
-    /// against a racing manual `SYSTEM ... GC` on another query thread; the round itself runs OUTSIDE
-    /// this lock (CasGcScheduler::runOneRoundNow has its own gc_round_mutex for that). Also taken around
-    /// `shutdown`'s `gc_scheduler.reset` (not its `stop`) and, as `mutable`, for the full duration of
-    /// `gcHealth`. Together these make an unprivileged SELECT on
-    /// system.content_addressed_mounts race-free against a concurrent disk shutdown. The lazy-creation
-    /// call sites do not re-check for a post-shutdown state, so they can still resurrect a scheduler
-    /// after `shutdown` has run; that lifecycle behavior is outside this adapter's cleanup scope.
+    /// Shared lifecycle mutex for scheduler creation/use/destruction and for pool/facade pointer
+    /// reads versus reset. Synchronous rounds hold it for their full duration so teardown waits for a
+    /// clean round completion; `gcHealth` follows the same shape.
     mutable std::mutex gc_scheduler_mutex;
+    bool shutdown_called TSA_GUARDED_BY(gc_scheduler_mutex) = false;
     /// Derived from object_storage->isReadOnly() at startup (the disk's <readonly> config). When set:
     /// the probe is skipped, no watermark, no GC scheduler, and the mutating surface fails closed.
     bool read_only = false;

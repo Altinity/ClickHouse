@@ -225,25 +225,28 @@ void ContentAddressedMetadataStorage::runOneGcRoundForTest()
     /// scheduler per call would acquire the lease on the first call and then back off forever
     /// ("incumbent alive" - its own previous incarnation). Recreating the scheduler for every call
     /// would therefore make every round after the first a silent no-op.
-    Cas::CasGcScheduler * sched = nullptr;
+    /// Hold the lifecycle mutex for the whole round. A concurrent `shutdown` waits for the round to
+    /// finish because clean GC completion takes priority over fast shutdown.
+    std::lock_guard lock(gc_scheduler_mutex);
+    if (shutdown_called)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "Cannot run garbage collection after ContentAddressedMetadataStorage shutdown has begun");
+    if (!gc_scheduler)
     {
-        std::lock_guard lock(gc_scheduler_mutex);
-        if (!gc_scheduler)
-            gc_scheduler = std::make_unique<Cas::CasGcScheduler>(
-                store(), gc_interval, fmt::format("{}::ContentAddressedGC", storage_path_full),
-                disk_name, makeGcRoundLogger());
-        sched = gc_scheduler.get();
+        if (!cas_store)
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "ContentAddressedMetadataStorage: store accessed before startup");
+        gc_scheduler = std::make_unique<Cas::CasGcScheduler>(
+            cas_store, gc_interval, fmt::format("{}::ContentAddressedGC", storage_path_full),
+            disk_name, makeGcRoundLogger());
     }
-    sched->runOneRoundNow();
+    gc_scheduler->runOneRoundNow();
 }
 
 std::optional<Cas::CasGcScheduler::GcHealth> ContentAddressedMetadataStorage::gcHealth() const
 {
-    /// Holds gc_scheduler_mutex for the WHOLE call (unlike runOneGcRoundForTest/runGarbageCollectionRoundNow,
-    /// which only borrow the lock to snapshot the raw pointer before releasing it): this is what lets it
-    /// serialize against shutdown()'s gc_scheduler.reset() under the same mutex, so a concurrent SELECT on
-    /// system.content_addressed_mounts either completes against a live scheduler or observes null -> zeros,
-    /// never a dangling scheduler mid-teardown.
+    /// Holding the lifecycle mutex for the whole call serializes with `shutdown`, so a concurrent
+    /// system-table query either completes against a live scheduler or observes no scheduler.
     std::lock_guard lock(gc_scheduler_mutex);
     if (!gc_scheduler)
         return std::nullopt;
@@ -356,16 +359,22 @@ Cas::RoundReport ContentAddressedMetadataStorage::runGarbageCollectionRoundNow()
             "Garbage collection is not enabled on this content-addressed disk");
     /// Mirror runOneGcRoundForTest: a STABLE scheduler instance across calls (the lease's
     /// observation-window steal protocol compares consecutive observations of the same gc_id).
-    Cas::CasGcScheduler * sched = nullptr;
+    /// Hold the lifecycle mutex for the whole round. A concurrent `shutdown` waits for the round to
+    /// finish because clean GC completion takes priority over fast shutdown.
+    std::lock_guard lock(gc_scheduler_mutex);
+    if (shutdown_called)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "Cannot run garbage collection after ContentAddressedMetadataStorage shutdown has begun");
+    if (!gc_scheduler)
     {
-        std::lock_guard lock(gc_scheduler_mutex);
-        if (!gc_scheduler)
-            gc_scheduler = std::make_unique<Cas::CasGcScheduler>(
-                store(), gc_interval, fmt::format("{}::ContentAddressedGC", storage_path_full),
-                disk_name, makeGcRoundLogger());
-        sched = gc_scheduler.get();
+        if (!cas_store)
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "ContentAddressedMetadataStorage: store accessed before startup");
+        gc_scheduler = std::make_unique<Cas::CasGcScheduler>(
+            cas_store, gc_interval, fmt::format("{}::ContentAddressedGC", storage_path_full),
+            disk_name, makeGcRoundLogger());
     }
-    return sched->runOneRoundNow(Cas::GcRoundLogRecord::Trigger::Manual);
+    return gc_scheduler->runOneRoundNow(Cas::GcRoundLogRecord::Trigger::Manual);
 }
 
 Cas::RebuildReport ContentAddressedMetadataStorage::runGcRebuildNow(bool force) const
@@ -469,6 +478,7 @@ void ContentAddressedMetadataStorage::startup()
     pool_config.manifest_sweep_delete_budget_keys = manifest_sweep_delete_budget_keys;
     pool_config.gc_meta_pool_size = gc_meta_pool_size;
     pool_config.materialization_grace_ms = materialization_grace_ms;
+    pool_config.event_sink = makeCasEventSink();
     cas_store = Cas::Pool::open(std::move(backend), std::move(pool_config));
     pool_uuid = Cas::u128ToHex(cas_store->poolMeta().pool_id);
     part_access = std::make_unique<Cas::CachedPartFolderAccess>(cas_store,
@@ -477,10 +487,6 @@ void ContentAddressedMetadataStorage::startup()
             .max_entries = cas_part_folder_cache_max_entries,
             .max_entry_bytes = cas_part_folder_cache_max_entry_bytes,
             .validate = part_folder_validate});
-
-    /// Bridge per-event CAS decisions to `system.content_addressed_log` (null sink when context
-    /// is absent, e.g. unit tests — emitEvent is then a no-op single branch in the Core).
-    cas_store->setEventSink(makeCasEventSink());
 
     /// The optional mount-time capability probe for a write-once conditional server-side copy.
     /// Only relevant when this disk opted in to `staging_backend=s3`; `Local` (the default,
@@ -530,36 +536,43 @@ void ContentAddressedMetadataStorage::startup()
 
 void ContentAddressedMetadataStorage::shutdown()
 {
+    std::lock_guard lock(gc_scheduler_mutex);
+    shutdown_called = true;
     if (gc_scheduler)
     {
-        /// stop() joins the background threads and takes no lock of its own (loop()/heartbeatLoop()
-        /// never touch gc_scheduler_mutex) -- safe to run unlocked. The destructive step is
-        /// gc_scheduler.reset(): `gcHealth` (reachable from an unprivileged SELECT on
-        /// system.content_addressed_mounts, unlike the admin-only GC commands) dereferences the raw
-        /// scheduler pointer under gc_scheduler_mutex, so the reset must serialize against it under the
-        /// SAME mutex or a concurrent gcHealth() call races a use-after-free on the scheduler object.
+        /// `stop` joins the background threads without taking the lifecycle mutex. Keeping this lock
+        /// through stop and reset prevents accessors and synchronous rounds from observing teardown.
         gc_scheduler->stop();
-        std::lock_guard lock(gc_scheduler_mutex);
         gc_scheduler.reset();
     }
     part_access.reset();
     cas_store.reset();
 }
 
-const Cas::PoolPtr & ContentAddressedMetadataStorage::store() const
+Cas::PoolPtr ContentAddressedMetadataStorage::store() const
 {
-    if (!cas_store)
-        throw Exception(ErrorCodes::LOGICAL_ERROR,
-            "ContentAddressedMetadataStorage: store accessed before startup");
-    return cas_store;
+    Cas::PoolPtr snapshot;
+    {
+        std::lock_guard lock(gc_scheduler_mutex);
+        snapshot = cas_store;
+        if (!snapshot)
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "ContentAddressedMetadataStorage: store accessed before startup");
+    }
+    return snapshot;
 }
 
 Cas::CachedPartFolderAccess & ContentAddressedMetadataStorage::partAccess() const
 {
-    if (!part_access)
-        throw Exception(ErrorCodes::LOGICAL_ERROR,
-            "ContentAddressedMetadataStorage: partAccess accessed before startup");
-    return *part_access;
+    Cas::CachedPartFolderAccess * snapshot = nullptr;
+    {
+        std::lock_guard lock(gc_scheduler_mutex);
+        if (!part_access)
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "ContentAddressedMetadataStorage: partAccess accessed before startup");
+        snapshot = part_access.get();
+    }
+    return *snapshot;
 }
 
 MetadataTransactionPtr ContentAddressedMetadataStorage::createTransaction()
@@ -1177,7 +1190,12 @@ std::optional<StoredObjects> ContentAddressedMetadataStorage::getStorageObjectsI
 
 std::optional<String> ContentAddressedMetadataStorage::tryGetInManifestBytes(const std::string & path) const
 {
-    if (!cas_store)
+    Cas::PoolPtr store_snapshot;
+    {
+        std::lock_guard lock(gc_scheduler_mutex);
+        store_snapshot = cas_store;
+    }
+    if (!store_snapshot)
         return std::nullopt;
 
     if (!Cas::isPartFilePath(path))
@@ -1185,7 +1203,7 @@ std::optional<String> ContentAddressedMetadataStorage::tryGetInManifestBytes(con
         if (auto tf = Cas::parseTableFilePath(path))
         {
             const auto ns = liveNamespace(tf->table_uuid);
-            return namespaceFilesReadable(ns) ? store()->getNamespaceFile(ns, tf->tail) : std::nullopt;
+            return namespaceFilesReadable(ns) ? store_snapshot->getNamespaceFile(ns, tf->tail) : std::nullopt;
         }
         return std::nullopt;   /// loose files are plain objects, not in-manifest bytes
     }
