@@ -984,3 +984,52 @@ TEST(CasGcCondemnMarker, DurableMarkerKeepsCanonicalGraduationSchedule)
         EXPECT_FALSE(blobExists(*backend, store->layout(), blob));
     }
 }
+
+/// The leader-restart path: `condemn_markers_confirmed` is a process-local registry on `Gc`, lost on a
+/// GC leader restart. Same idiom as the crash-replay tests above (`Gc gc2(store, kGc)` -- a fresh `Gc`
+/// object under the SAME identity models a process restart that resumes its own lease, not a steal by a
+/// different owner). The fresh instance must still confirm graduation via the ONE synchronous `loadMeta`
+/// re-check: the durable `Condemned` meta observed now is sufficient evidence on its own, with no
+/// in-process (hash, token) confirmation available at all. This proves the fallback branch -- not just
+/// the in-process registry -- authorizes the delete.
+TEST(CasGcCondemnMarker, LoadMetaFallbackConfirmsGraduationAfterLeaderRestart)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r = ref("srv-a:1", 1, 0xAA);
+    const UInt128 blob = DB::UInt128(1);
+    writeBlobBody(*backend, store->layout(), blob);
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", blob)});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+
+    {
+        /// The first (soon-to-be-gone) leader: seeds the blob, condemns it, and lets the marker write
+        /// land on the healthy backend. Its `condemn_markers_confirmed` registry dies with it.
+        Gc gc(store, kGc);
+        gc.runRegularRound();
+        dropRefTransition(*backend, store->layout(), ns, "tbl", r);
+        const RoundReport rep = gc.runRegularRound();   // condemn round
+        EXPECT_EQ(rep.condemned, 1u);
+        store->renewWatermarkOnce();
+    }
+    const auto lm = loadMetaForTest(*backend, store->layout(), blob);
+    ASSERT_TRUE(lm.has_value());
+    EXPECT_EQ(lm->meta.state, MetaState::Condemned)
+        << "precondition: the durable marker must be on disk before the simulated restart";
+
+    /// A brand-new `Gc` object under the SAME identity -- an empty `condemn_markers_confirmed`, exactly
+    /// as after a process restart that resumes its own lease. It never observed the condemn round above,
+    /// so the in-process confirmation path (`condemnMarkerConfirmedInProcess`) has nothing to return true
+    /// for; only the `loadMeta` fallback can authorize graduation.
+    Gc gc2(store, kGc);
+    const RoundReport rep = gc2.runRegularRound();
+    EXPECT_EQ(rep.graduated, 1u)
+        << "the loadMeta fallback (leader-restart path) must authorize graduation from durable evidence "
+           "alone";
+    const auto e = currentEntryFor(*backend, store->layout(), blob);
+    ASSERT_TRUE(e.has_value());
+    EXPECT_TRUE(e->delete_pending);
+    EXPECT_TRUE(e->marker_confirmed) << "a delete_pending row confirmed via loadMeta still carries the bit";
+    EXPECT_TRUE(blobExists(*backend, store->layout(), blob));
+}

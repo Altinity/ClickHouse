@@ -968,6 +968,12 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
                 "the entry is carried, never wedges the round)");
         }
         ProfileEvents::increment(ProfileEvents::CasGcCondemnMarkerUnconfirmedCarry);
+        /// Accepted race: this retry writes `Condemned` per-hash, with no token check. If a writer
+        /// resurrected this exact hash under a FRESH token between the original swallowed write and this
+        /// retry, the retry stamps `Condemned` over that writer's live, uncondemned incarnation. This is
+        /// never destructive -- the eventual exact-token delete is a no-op against the fresh token
+        /// (`DeleteOutcome::TokenMismatch`/`NotFound`) -- worst case the resurrecting writer's later
+        /// same-token adopter sees a stale `Condemned` meta and re-uploads once (a spurious resurrect).
         scheduleCondemnMarkerWrite(entry.ref, entry.token, entry.condemn_round, entry.size);
         return false;
     };
