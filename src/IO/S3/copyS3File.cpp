@@ -747,6 +747,9 @@ namespace
                 {
                     if (!supports_multipart_copy || outcome.GetError().GetExceptionName() == "AccessDenied")
                     {
+                        if (if_none_match.has_value())
+                            throw S3Exception(outcome.GetError().GetMessage(), outcome.GetError().GetErrorType());
+
                         LOG_INFO(
                             log,
                             "Multipart upload using copy is not supported, will try regular upload for Bucket: {}, Key: {}, Object size: "
@@ -808,6 +811,9 @@ namespace
             catch (const S3Exception & e)
             {
                 if (e.getS3ErrorCode() != Aws::S3::S3Errors::ACCESS_DENIED)
+                    throw;
+
+                if (if_none_match.has_value())
                     throw;
 
                 tryLogCurrentException(log, "Multi part copy failed, trying with regular upload");
