@@ -156,8 +156,12 @@ public:
     MetadataTransactionPtr createTransaction() override;
 
     /// Opens the pool, validates its format and starts the optional GC scheduler. Read-only disks
-    /// skip write probes and GC; failures in startup propagate.
-    void startup() override;
+    /// skip write probes and GC; failures in startup propagate. Runs exactly once, single-threaded,
+    /// strictly before this object is exposed to any other thread (no other method can be called
+    /// concurrently with it) -- TSA_NO_THREAD_SAFETY_ANALYSIS is deliberate here, not a bypass of a
+    /// real risk: pointer_mutex/gc_scheduler_mutex exist to guard concurrent access AFTER startup,
+    /// which is definitionally impossible during it.
+    void startup() TSA_NO_THREAD_SAFETY_ANALYSIS override;
     /// Stops the GC scheduler before releasing the part-folder facade and pool. Their destruction is
     /// synchronized with the accessors and synchronous GC entry points.
     void shutdown() override;
@@ -203,11 +207,12 @@ public:
 
     /// Returns a shared-ownership snapshot of the opened pool. Throws `LOGICAL_ERROR` before `startup`.
     Cas::PoolPtr store() const;
-    /// Returns the cached part-folder facade by reference. Throws `LOGICAL_ERROR` before `startup`.
-    /// Committed part-folder reads and mutations go through this facade so cache validation remains
-    /// centralized. The disk lifecycle contract requires callers not to retain this reference across
-    /// a concurrent `shutdown`; the lifecycle mutex only serializes the pointer read with reset.
-    Cas::CachedPartFolderAccess & partAccess() const;
+    /// Returns a shared-ownership snapshot of the cached part-folder facade. Throws `LOGICAL_ERROR`
+    /// before `startup`. Committed part-folder reads and mutations go through this facade so cache
+    /// validation remains centralized. Returning a `shared_ptr` snapshot (not a reference) means the
+    /// returned handle keeps the facade alive via its own refcount even if `shutdown` concurrently
+    /// resets the member -- unlike a reference, which would dangle the instant `shutdown`'s reset runs.
+    std::shared_ptr<Cas::CachedPartFolderAccess> partAccess() const;
     const std::string & serverRootId() const { return server_root_id; }
     const std::string & scratchPath() const { return local_scratch_path; }
     /// Returns the configured staging backend. `Local` is the behavior-preserving default; callers
@@ -395,19 +400,32 @@ private:
     /// Defaults to false (fail-close): assumed unsupported until the probe proves otherwise.
     bool conditional_copy_supported = false;
 
-    /// Set by startup (Pool::open is fail-closed; empty store == not started).
-    Cas::PoolPtr cas_store;
+    /// Set by startup (Pool::open is fail-closed; empty store == not started). shared_ptr so
+    /// store()/partAccess() can return a by-value snapshot under `pointer_mutex` (see below) instead
+    /// of a reference that could dangle across a concurrent `shutdown` reset.
+    Cas::PoolPtr cas_store TSA_GUARDED_BY(pointer_mutex);
     /// The part-folder access facade: the normal path
     /// for committed part/projection reads and committed part-ref mutations. Constructed in
-    /// startup right after Pool::open; reset in shutdown before cas_store.
-    std::unique_ptr<Cas::CachedPartFolderAccess> part_access;
+    /// startup right after Pool::open; reset in shutdown before cas_store. shared_ptr for the same
+    /// snapshot-safety reason as cas_store.
+    std::shared_ptr<Cas::CachedPartFolderAccess> part_access TSA_GUARDED_BY(pointer_mutex);
     String pool_uuid;
-    std::unique_ptr<Cas::CasGcScheduler> gc_scheduler;
-    /// Shared lifecycle mutex for scheduler creation/use/destruction and for pool/facade pointer
-    /// reads versus reset. Synchronous rounds hold it for their full duration so teardown waits for a
-    /// clean round completion; `gcHealth` follows the same shape.
+    /// shared_ptr so `runGarbageCollectionRoundNow`/`runOneGcRoundForTest` can take a snapshot under
+    /// `pointer_mutex`, release it, and run the (long) round via the snapshot -- never holding
+    /// `pointer_mutex` itself for the round's duration, so `gcHealth`/`store`/`partAccess` never
+    /// block behind an in-flight round.
+    std::shared_ptr<Cas::CasGcScheduler> gc_scheduler TSA_GUARDED_BY(pointer_mutex);
+    /// Serializes ONE synchronous GC round at a time and makes `shutdown` wait for an in-flight round
+    /// to finish cleanly (clean GC completion has priority over fast shutdown) -- held for the WHOLE
+    /// round. Deliberately NOT the same mutex as `pointer_mutex` below: this one can be held for a
+    /// long time, so nothing that only needs a brief pointer snapshot may share it.
     mutable std::mutex gc_scheduler_mutex;
     bool shutdown_called TSA_GUARDED_BY(gc_scheduler_mutex) = false;
+    /// Guards ONLY reads/writes of `cas_store`/`part_access`/`gc_scheduler` themselves (snapshot,
+    /// create-if-absent, reset) -- always held briefly. Lock ordering when both are needed (the round
+    /// entry points, and `shutdown`): `gc_scheduler_mutex` first, then `pointer_mutex` nested inside,
+    /// never the reverse.
+    mutable std::mutex pointer_mutex;
     /// Derived from object_storage->isReadOnly() at startup (the disk's <readonly> config). When set:
     /// the probe is skipped, no watermark, no GC scheduler, and the mutating surface fails closed.
     bool read_only = false;

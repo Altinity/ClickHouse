@@ -303,7 +303,7 @@ bool ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
     /// per-part file that is now an ordinary tree entry, or a marks-only removal with no writes).
     if (!st.entries.empty() || !st.content_removed.empty())
     {
-        if (auto view = metadata_storage.partAccess().getView({ns, ref}, Cas::Freshness::ForceFresh))
+        if (auto view = metadata_storage.partAccess()->getView({ns, ref}, Cas::Freshness::ForceFresh))
         {
             if (st.build)
             {
@@ -334,7 +334,7 @@ bool ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
             for (auto & s : st.entries)
                 merged.push_back(std::move(s));
 
-            metadata_storage.partAccess().repointRef({ns, ref}, std::move(merged), Cas::ProvenanceOp::Other);
+            metadata_storage.partAccess()->repointRef({ns, ref}, std::move(merged), Cas::ProvenanceOp::Other);
             if (st.build)
                 st.build->abandon();   /// scratch precommit's protecting job is done; the real manifest is live
             st.published = true;
@@ -361,8 +361,8 @@ bool ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
     st.build->precommitAdd(ns, ref, id);
     uploadPendingBlobs(st);
 
-    const bool ref_existed = metadata_storage.partAccess().existsRef({ns, ref}, Cas::Freshness::ForceFresh);
-    metadata_storage.partAccess().promoteBuild(*st.build, {ns, ref}, st.build->buildId(), id);
+    const bool ref_existed = metadata_storage.partAccess()->existsRef({ns, ref}, Cas::Freshness::ForceFresh);
+    metadata_storage.partAccess()->promoteBuild(*st.build, {ns, ref}, st.build->buildId(), id);
     st.published = true;
     return !ref_existed;
 }
@@ -404,7 +404,7 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
         /// Compensating rollback. Best-effort: a ref we cannot unpublish becomes unreferenced debris
         /// (GC-reclaimed); never mask the original failure with a rollback failure.
         for (const auto & [ns, ref] : created_refs)
-            metadata_storage.partAccess().dropRefBestEffort({ns, ref});
+            metadata_storage.partAccess()->dropRefBestEffort({ns, ref});
         throw;
     }
     committed = true;
@@ -884,7 +884,7 @@ void ContentAddressedTransaction::removeDirectory(const std::string & path)
     /// storage has no real directories; tables/detached/shadow are removed via removeRecursive).
     if (auto r = routeOf(path); r && !r->ref.empty() && r->file.empty())
     {
-        metadata_storage.partAccess().dropRefIfPresent(r->refKey());
+        metadata_storage.partAccess()->dropRefIfPresent(r->refKey());
         /// This transaction's staged removal marks for the same ref (content_removed, populated by
         /// unlinkFile's per-file unlinks that the MergeTree fast-removal path issues right before this
         /// call) are superseded by the whole-part ref-drop just performed above — discard them so
@@ -916,12 +916,12 @@ void ContentAddressedTransaction::removeRecursive(const std::string & path, cons
         if (auto p = Cas::parsePartFilePath(path); p && !p->backup_name.empty() && p->file.empty())
         {
             const auto ns = ContentAddressedMetadataStorage::shadowNamespace(p->shadow_table_dir);
-            metadata_storage.partAccess().dropRefIfPresent({ns, p->part_name});
+            metadata_storage.partAccess()->dropRefIfPresent({ns, p->part_name});
             return;
         }
         if (Cas::endsWithTableUuidPair(path))
         {
-            metadata_storage.partAccess().dropNamespace(ContentAddressedMetadataStorage::shadowNamespace(path));
+            metadata_storage.partAccess()->dropNamespace(ContentAddressedMetadataStorage::shadowNamespace(path));
             return;
         }
         /// Backup root / intermediate dir (SYSTEM UNFREEZE WITH NAME): drop every shadow
@@ -930,7 +930,7 @@ void ContentAddressedTransaction::removeRecursive(const std::string & path, cons
         while (!prefix.empty() && prefix.back() == '/')
             prefix.pop_back();
         for (const auto & ns : metadata_storage.store()->listNamespaces(prefix + "/"))
-            metadata_storage.partAccess().dropNamespace(Cas::RootNamespace{ns});
+            metadata_storage.partAccess()->dropNamespace(Cas::RootNamespace{ns});
         return;
     }
 
@@ -938,7 +938,7 @@ void ContentAddressedTransaction::removeRecursive(const std::string & path, cons
     /// file go in one dropNamespace.
     if (auto uuid = Cas::parseTableUuid(path))
     {
-        metadata_storage.partAccess().dropNamespace(metadata_storage.liveNamespace(*uuid));
+        metadata_storage.partAccess()->dropNamespace(metadata_storage.liveNamespace(*uuid));
         return;
     }
 
@@ -949,7 +949,7 @@ void ContentAddressedTransaction::removeRecursive(const std::string & path, cons
         if (r && r->ref.empty() && p->part_name == Cas::kDetachedDirName)
         {
             for (const auto & ref : metadata_storage.detachedRefNames(r->ns))
-                metadata_storage.partAccess().dropRefIfPresent({r->ns, ref});
+                metadata_storage.partAccess()->dropRefIfPresent({r->ns, ref});
             return;
         }
         /// The moving CONTAINER dir (MOVE-to-CA fix, mirrors detached): the mover's crash-cleanup
@@ -958,13 +958,13 @@ void ContentAddressedTransaction::removeRecursive(const std::string & path, cons
         if (r && r->ref.empty() && p->part_name == Cas::kMovingDirName)
         {
             for (const auto & ref : metadata_storage.movingRefNames(r->ns))
-                metadata_storage.partAccess().dropRefIfPresent({r->ns, ref});
+                metadata_storage.partAccess()->dropRefIfPresent({r->ns, ref});
             return;
         }
         /// A single part dir (live or detached): drop its ref.
         if (r && !r->ref.empty() && r->file.empty())
         {
-            metadata_storage.partAccess().dropRefIfPresent(r->refKey());
+            metadata_storage.partAccess()->dropRefIfPresent(r->refKey());
             return;
         }
         /// A projection subdir: virtual (nested in the parent tree) - removal is a no-op; the
@@ -1029,7 +1029,7 @@ void ContentAddressedTransaction::createHardLink(const std::string & path_from, 
     /// record a TOKENLESS W-EVIDENCE dep for its blob (no HEAD before precommit; promote re-proves it).
     /// ForceFresh getView == resolveRef(allow_stale=false) + readManifestShared, so this is the same
     /// request pattern as before, now instrumented via the facade.
-    auto view = metadata_storage.partAccess().getView(src->refKey(), Cas::Freshness::ForceFresh);
+    auto view = metadata_storage.partAccess()->getView(src->refKey(), Cas::Freshness::ForceFresh);
     if (!view)
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
             "ContentAddressed: createHardLink source part missing: {}", path_from);
@@ -1090,11 +1090,11 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
             try
             {
                 for (const auto & [ref, _] : metadata_storage.store()->listRefs(from_ns))
-                    metadata_storage.partAccess().republishRef({from_ns, ref}, {to_ns, ref});
+                    metadata_storage.partAccess()->republishRef({from_ns, ref}, {to_ns, ref});
                 for (const auto & name : metadata_storage.store()->listNamespaceFiles(from_ns))
                     if (auto bytes = metadata_storage.store()->getNamespaceFile(from_ns, name))
                         metadata_storage.store()->putNamespaceFile(to_ns, name, *bytes);
-                metadata_storage.partAccess().dropNamespace(from_ns);
+                metadata_storage.partAccess()->dropNamespace(from_ns);
             }
             catch (...)
             {
@@ -1219,14 +1219,14 @@ void ContentAddressedTransaction::moveDirectory(const std::string & path_from, c
             /// `<part>/text_index_tmp/` files. That ref is not ours and is not staged; drop it now so the
             /// overlay we publish in commit() is the authoritative manifest. Independent of our publish
             /// timing (it targets an already-committed foreign ref), so it stays a call-time drop.
-            metadata_storage.partAccess().dropRefIfPresent(src->refKey());
+            metadata_storage.partAccess()->dropRefIfPresent(src->refKey());
             return;
         }
 
         /// Move any COMMITTED source ref (a merge/mutation result rename, DETACH, ATTACH, a
         /// delete_tmp_ rename, an early-committed child ref being renamed away). Absent = a pure
         /// staged/tmp move - nothing durable to touch.
-        metadata_storage.partAccess().republishRef(src->refKey(), dst->refKey());
+        metadata_storage.partAccess()->republishRef(src->refKey(), dst->refKey());
         return;
     }
 
@@ -1396,7 +1396,7 @@ void ContentAddressedTransaction::unlinkFile(const std::string & path, bool if_e
         std::erase_if(st.entries, [&](const Cas::ManifestEntry & e) { return e.path == r->file; });
         if (!staged_here)
         {
-            const auto view = metadata_storage.partAccess().getView(r->refKey(), Cas::Freshness::ForceFresh);
+            const auto view = metadata_storage.partAccess()->getView(r->refKey(), Cas::Freshness::ForceFresh);
             if (!view || !view->hasFile(r->file))
             {
                 if (if_exists)

@@ -225,32 +225,47 @@ void ContentAddressedMetadataStorage::runOneGcRoundForTest()
     /// scheduler per call would acquire the lease on the first call and then back off forever
     /// ("incumbent alive" - its own previous incarnation). Recreating the scheduler for every call
     /// would therefore make every round after the first a silent no-op.
-    /// Hold the lifecycle mutex for the whole round. A concurrent `shutdown` waits for the round to
-    /// finish because clean GC completion takes priority over fast shutdown.
-    std::lock_guard lock(gc_scheduler_mutex);
+    /// Hold gc_scheduler_mutex for the whole round: a concurrent `shutdown` waits for the round to
+    /// finish because clean GC completion takes priority over fast shutdown. pointer_mutex (a
+    /// separate, briefly-held mutex) only guards the scheduler snapshot/creation below, so
+    /// gcHealth/store/partAccess never block behind this round.
+    std::lock_guard round_lock(gc_scheduler_mutex);
     if (shutdown_called)
         throw Exception(ErrorCodes::LOGICAL_ERROR,
             "Cannot run garbage collection after ContentAddressedMetadataStorage shutdown has begun");
-    if (!gc_scheduler)
+    std::shared_ptr<Cas::CasGcScheduler> snapshot;
     {
-        if (!cas_store)
-            throw Exception(ErrorCodes::LOGICAL_ERROR,
-                "ContentAddressedMetadataStorage: store accessed before startup");
-        gc_scheduler = std::make_unique<Cas::CasGcScheduler>(
-            cas_store, gc_interval, fmt::format("{}::ContentAddressedGC", storage_path_full),
-            disk_name, makeGcRoundLogger());
+        std::lock_guard ptr_lock(pointer_mutex);
+        if (!gc_scheduler)
+        {
+            if (!cas_store)
+                throw Exception(ErrorCodes::LOGICAL_ERROR,
+                    "ContentAddressedMetadataStorage: store accessed before startup");
+            gc_scheduler = std::make_shared<Cas::CasGcScheduler>(
+                cas_store, gc_interval, fmt::format("{}::ContentAddressedGC", storage_path_full),
+                disk_name, makeGcRoundLogger());
+        }
+        snapshot = gc_scheduler;
     }
-    gc_scheduler->runOneRoundNow();
+    snapshot->runOneRoundNow();
 }
 
 std::optional<Cas::CasGcScheduler::GcHealth> ContentAddressedMetadataStorage::gcHealth() const
 {
-    /// Holding the lifecycle mutex for the whole call serializes with `shutdown`, so a concurrent
-    /// system-table query either completes against a live scheduler or observes no scheduler.
-    std::lock_guard lock(gc_scheduler_mutex);
-    if (!gc_scheduler)
+    /// A brief pointer_mutex snapshot only -- this must NEVER wait behind gc_scheduler_mutex (an
+    /// in-flight round can hold that for a long time; an unprivileged SELECT on
+    /// system.content_addressed_mounts must not stall behind it). The snapshot keeps the scheduler
+    /// alive via its own refcount even if `shutdown` concurrently resets the member, and
+    /// CasGcScheduler::gcHealth() is itself lock-free (atomic reads), so calling it outside any lock
+    /// here is safe.
+    std::shared_ptr<Cas::CasGcScheduler> snapshot;
+    {
+        std::lock_guard lock(pointer_mutex);
+        snapshot = gc_scheduler;
+    }
+    if (!snapshot)
         return std::nullopt;
-    return gc_scheduler->gcHealth();
+    return snapshot->gcHealth();
 }
 
 Cas::GcRoundLogger ContentAddressedMetadataStorage::makeGcRoundLogger() const
@@ -359,22 +374,29 @@ Cas::RoundReport ContentAddressedMetadataStorage::runGarbageCollectionRoundNow()
             "Garbage collection is not enabled on this content-addressed disk");
     /// Mirror runOneGcRoundForTest: a STABLE scheduler instance across calls (the lease's
     /// observation-window steal protocol compares consecutive observations of the same gc_id).
-    /// Hold the lifecycle mutex for the whole round. A concurrent `shutdown` waits for the round to
-    /// finish because clean GC completion takes priority over fast shutdown.
-    std::lock_guard lock(gc_scheduler_mutex);
+    /// Hold gc_scheduler_mutex for the whole round: a concurrent `shutdown` waits for the round to
+    /// finish because clean GC completion takes priority over fast shutdown. pointer_mutex only
+    /// guards the scheduler snapshot/creation below, so gcHealth/store/partAccess never block behind
+    /// this round.
+    std::lock_guard round_lock(gc_scheduler_mutex);
     if (shutdown_called)
         throw Exception(ErrorCodes::LOGICAL_ERROR,
             "Cannot run garbage collection after ContentAddressedMetadataStorage shutdown has begun");
-    if (!gc_scheduler)
+    std::shared_ptr<Cas::CasGcScheduler> snapshot;
     {
-        if (!cas_store)
-            throw Exception(ErrorCodes::LOGICAL_ERROR,
-                "ContentAddressedMetadataStorage: store accessed before startup");
-        gc_scheduler = std::make_unique<Cas::CasGcScheduler>(
-            cas_store, gc_interval, fmt::format("{}::ContentAddressedGC", storage_path_full),
-            disk_name, makeGcRoundLogger());
+        std::lock_guard ptr_lock(pointer_mutex);
+        if (!gc_scheduler)
+        {
+            if (!cas_store)
+                throw Exception(ErrorCodes::LOGICAL_ERROR,
+                    "ContentAddressedMetadataStorage: store accessed before startup");
+            gc_scheduler = std::make_shared<Cas::CasGcScheduler>(
+                cas_store, gc_interval, fmt::format("{}::ContentAddressedGC", storage_path_full),
+                disk_name, makeGcRoundLogger());
+        }
+        snapshot = gc_scheduler;
     }
-    return gc_scheduler->runOneRoundNow(Cas::GcRoundLogRecord::Trigger::Manual);
+    return snapshot->runOneRoundNow(Cas::GcRoundLogRecord::Trigger::Manual);
 }
 
 Cas::RebuildReport ContentAddressedMetadataStorage::runGcRebuildNow(bool force) const
@@ -481,7 +503,7 @@ void ContentAddressedMetadataStorage::startup()
     pool_config.event_sink = makeCasEventSink();
     cas_store = Cas::Pool::open(std::move(backend), std::move(pool_config));
     pool_uuid = Cas::u128ToHex(cas_store->poolMeta().pool_id);
-    part_access = std::make_unique<Cas::CachedPartFolderAccess>(cas_store,
+    part_access = std::make_shared<Cas::CachedPartFolderAccess>(cas_store,
         Cas::CachedPartFolderAccess::CacheParams{
             .cache_bytes = cas_part_folder_cache_bytes,
             .max_entries = cas_part_folder_cache_max_entries,
@@ -527,7 +549,7 @@ void ContentAddressedMetadataStorage::startup()
     /// further gating is needed because the scheduler's lease coordinates concurrent mounters.
     if (context && gc_enabled && !read_only)
     {
-        gc_scheduler = std::make_unique<Cas::CasGcScheduler>(
+        gc_scheduler = std::make_shared<Cas::CasGcScheduler>(
             cas_store, gc_interval, fmt::format("{}::ContentAddressedGC", storage_path_full),
             disk_name, makeGcRoundLogger());
         gc_scheduler->start();
@@ -536,43 +558,49 @@ void ContentAddressedMetadataStorage::startup()
 
 void ContentAddressedMetadataStorage::shutdown()
 {
-    std::lock_guard lock(gc_scheduler_mutex);
+    /// Wait for any in-flight synchronous round to finish cleanly first (gc_scheduler_mutex is held
+    /// for a round's whole duration) -- unchanged priority: clean GC completion over fast shutdown.
+    std::lock_guard round_lock(gc_scheduler_mutex);
     shutdown_called = true;
-    if (gc_scheduler)
+    std::shared_ptr<Cas::CasGcScheduler> old_scheduler;
     {
-        /// `stop` joins the background threads without taking the lifecycle mutex. Keeping this lock
-        /// through stop and reset prevents accessors and synchronous rounds from observing teardown.
-        gc_scheduler->stop();
+        std::lock_guard ptr_lock(pointer_mutex);
+        old_scheduler = std::move(gc_scheduler);
         gc_scheduler.reset();
+        part_access.reset();
+        cas_store.reset();
     }
-    part_access.reset();
-    cas_store.reset();
+    /// `stop` joins the background threads. Runs outside pointer_mutex (no reset left to race:
+    /// gc_scheduler is already null) but still inside round_lock, so a NEW round can't start here.
+    /// old_scheduler keeps the object alive regardless.
+    if (old_scheduler)
+        old_scheduler->stop();
 }
 
 Cas::PoolPtr ContentAddressedMetadataStorage::store() const
 {
     Cas::PoolPtr snapshot;
     {
-        std::lock_guard lock(gc_scheduler_mutex);
+        std::lock_guard lock(pointer_mutex);
         snapshot = cas_store;
-        if (!snapshot)
-            throw Exception(ErrorCodes::LOGICAL_ERROR,
-                "ContentAddressedMetadataStorage: store accessed before startup");
     }
+    if (!snapshot)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "ContentAddressedMetadataStorage: store accessed before startup");
     return snapshot;
 }
 
-Cas::CachedPartFolderAccess & ContentAddressedMetadataStorage::partAccess() const
+std::shared_ptr<Cas::CachedPartFolderAccess> ContentAddressedMetadataStorage::partAccess() const
 {
-    Cas::CachedPartFolderAccess * snapshot = nullptr;
+    std::shared_ptr<Cas::CachedPartFolderAccess> snapshot;
     {
-        std::lock_guard lock(gc_scheduler_mutex);
-        if (!part_access)
-            throw Exception(ErrorCodes::LOGICAL_ERROR,
-                "ContentAddressedMetadataStorage: partAccess accessed before startup");
-        snapshot = part_access.get();
+        std::lock_guard lock(pointer_mutex);
+        snapshot = part_access;
     }
-    return *snapshot;
+    if (!snapshot)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "ContentAddressedMetadataStorage: partAccess accessed before startup");
+    return snapshot;
 }
 
 MetadataTransactionPtr ContentAddressedMetadataStorage::createTransaction()
@@ -740,7 +768,7 @@ bool ContentAddressedMetadataStorage::existsFile(const std::string & path) const
     /// Safe to serve a CACHED view here: every committed-ref write that could have moved this entry
     /// (`repointRef`/`promoteBuild`) erases the cached view on success, so a stale hit is impossible
     /// by construction, not by freshness policy.
-    auto view = partAccess().getView(r->refKey(), Cas::Freshness::CachedForLoad);
+    auto view = partAccess()->getView(r->refKey(), Cas::Freshness::CachedForLoad);
     return view && view->findFile(r->file);
 }
 
@@ -845,7 +873,7 @@ bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) 
     switch (dr.shape)
     {
         case DirShape::ShadowPart:
-            return partAccess().existsRef(Route{shadowNamespace(dr.p->shadow_table_dir), dr.p->part_name, ""}.refKey(),
+            return partAccess()->existsRef(Route{shadowNamespace(dr.p->shadow_table_dir), dr.p->part_name, ""}.refKey(),
                                           Cas::Freshness::CachedForLoad);
         case DirShape::ShadowTable:
             return !store()->listRefs(shadowNamespace(path)).empty();
@@ -879,11 +907,11 @@ bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) 
             return !movingRefNames(dr.r->ns).empty();
         case DirShape::PartDir:
             /// Exists iff its ref is present.
-            return partAccess().existsRef(dr.r->refKey(), Cas::Freshness::CachedForLoad);
+            return partAccess()->existsRef(dr.r->refKey(), Cas::Freshness::CachedForLoad);
         case DirShape::ProjectionDir:
         {
             /// At least one tree entry (or mutable file) under its prefix.
-            auto view = partAccess().getView(dr.r->refKey(), Cas::Freshness::CachedForLoad);
+            auto view = partAccess()->getView(dr.r->refKey(), Cas::Freshness::CachedForLoad);
             return view && view->hasDirectory(*dr.projection_prefix);
         }
         case DirShape::TableSubdir:
@@ -914,7 +942,7 @@ bool ContentAddressedMetadataStorage::existsFileOrDirectory(const std::string & 
         auto r = p ? route(*p) : std::nullopt;
         if (r && !r->ref.empty() && !r->file.empty())
         {
-            auto view = partAccess().getView(r->refKey(), Cas::Freshness::CachedForLoad);
+            auto view = partAccess()->getView(r->refKey(), Cas::Freshness::CachedForLoad);
             if (!view)
                 return false;
             return view->hasFile(r->file) || view->hasDirectory(r->file + "/");
@@ -941,7 +969,7 @@ uint64_t ContentAddressedMetadataStorage::getFileSize(const std::string & path) 
     if (!r || r->file.empty())
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: not a part file path: {}", path);
 
-    auto view = partAccess().getView(r->refKey(), Cas::Freshness::CachedForLoad);
+    auto view = partAccess()->getView(r->refKey(), Cas::Freshness::CachedForLoad);
     if (!view)
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no ref for {}", path);
     if (auto size = view->fileSize(r->file))
@@ -958,7 +986,7 @@ Poco::Timestamp ContentAddressedMetadataStorage::getLastModified(const std::stri
     /// stamps only feed cleanup TTLs and system tables).
     auto resolve_stamp = [&](const Route & r) -> Poco::Timestamp
     {
-        auto resolved = partAccess().resolve(r.refKey(), Cas::Freshness::CachedForLoad);
+        auto resolved = partAccess()->resolve(r.refKey(), Cas::Freshness::CachedForLoad);
         if (!resolved)
             throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no ref for {}", path);
         if (resolved->published_at_ms == 0)
@@ -987,7 +1015,7 @@ std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const st
         case DirShape::ShadowPart:
         {
             /// Shadow PART dir: the frozen part's file names (first components).
-            auto view = partAccess().getView(Route{shadowNamespace(dr.p->shadow_table_dir), dr.p->part_name, ""}.refKey(),
+            auto view = partAccess()->getView(Route{shadowNamespace(dr.p->shadow_table_dir), dr.p->part_name, ""}.refKey(),
                                              Cas::Freshness::CachedForLoad);
             return view ? view->listChildren("") : std::vector<std::string>{};
         }
@@ -1056,13 +1084,13 @@ std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const st
             /// A part dir (live, detached part, shadow handled separately): logical file names,
             /// nested keys collapsed to their first component (projections surface as ONE
             /// <proj>.proj entry).
-            auto view = partAccess().getView(dr.r->refKey(), Cas::Freshness::CachedForLoad);
+            auto view = partAccess()->getView(dr.r->refKey(), Cas::Freshness::CachedForLoad);
             return view ? view->listChildren("") : std::vector<std::string>{};
         }
         case DirShape::ProjectionDir:
         {
             /// Inner names with the <proj>.proj/ prefix stripped.
-            auto view = partAccess().getView(dr.r->refKey(), Cas::Freshness::CachedForLoad);
+            auto view = partAccess()->getView(dr.r->refKey(), Cas::Freshness::CachedForLoad);
             return view ? view->listChildren(*dr.projection_prefix) : std::vector<std::string>{};
         }
         case DirShape::TableSubdir:
@@ -1145,7 +1173,7 @@ StoredObjects ContentAddressedMetadataStorage::getStorageObjects(const std::stri
     if (!r || r->file.empty())
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: not a part file path: {}", path);
 
-    auto view = partAccess().getView(r->refKey(), Cas::Freshness::CachedForLoad);
+    auto view = partAccess()->getView(r->refKey(), Cas::Freshness::CachedForLoad);
     if (!view)
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no ref for {}", path);
     if (const auto * entry = view->findFile(r->file))
@@ -1176,7 +1204,7 @@ std::optional<StoredObjects> ContentAddressedMetadataStorage::getStorageObjectsI
     if (!r || r->file.empty())
         return std::nullopt;
 
-    auto view = partAccess().getView(r->refKey(), Cas::Freshness::CachedForLoad);
+    auto view = partAccess()->getView(r->refKey(), Cas::Freshness::CachedForLoad);
     if (!view)
         return std::nullopt;
     const auto * entry = view->findFile(r->file);
@@ -1192,7 +1220,7 @@ std::optional<String> ContentAddressedMetadataStorage::tryGetInManifestBytes(con
 {
     Cas::PoolPtr store_snapshot;
     {
-        std::lock_guard lock(gc_scheduler_mutex);
+        std::lock_guard lock(pointer_mutex);
         store_snapshot = cas_store;
     }
     if (!store_snapshot)
@@ -1215,7 +1243,7 @@ std::optional<String> ContentAddressedMetadataStorage::tryGetInManifestBytes(con
     if (!r || r->file.empty())
         return std::nullopt;
 
-    auto view = partAccess().getView(r->refKey(), Cas::Freshness::CachedForLoad);
+    auto view = partAccess()->getView(r->refKey(), Cas::Freshness::CachedForLoad);
     if (!view)
         return std::nullopt;
     return view->inlineBytes(r->file);
@@ -1251,7 +1279,7 @@ std::optional<ContentAddressedMetadataStorage::BlobViewPlan> ContentAddressedMet
     auto r = route(*p);
     if (!r || r->file.empty())
         return std::nullopt;
-    auto view = partAccess().getView(r->refKey(), Cas::Freshness::CachedForLoad);
+    auto view = partAccess()->getView(r->refKey(), Cas::Freshness::CachedForLoad);
     if (!view)
         return std::nullopt;
     if (const auto * entry = view->findFile(r->file))
@@ -1288,7 +1316,7 @@ std::optional<String> ContentAddressedMetadataStorage::getPartManifestBytes(cons
     /// (route), resolve the committed ref to its ManifestId, read the immutable manifest, and re-encode
     /// it canonically. nullopt when the path is not a committed content-addressed part here (no ref =>
     /// no relink offer; the sender streams bytes). A live ref to a missing/corrupt manifest throws
-    /// (INV-NO-DANGLE surfaced, never substituted) — the same fail-loud contract as partAccess().getView.
+    /// (INV-NO-DANGLE surfaced, never substituted) — the same fail-loud contract as partAccess()->getView.
     auto p = Cas::parsePartFilePath(part_path);
     if (!p)
         return std::nullopt;
@@ -1296,7 +1324,7 @@ std::optional<String> ContentAddressedMetadataStorage::getPartManifestBytes(cons
     if (!r || r->ref.empty())
         return std::nullopt;
 
-    auto view = partAccess().getView(r->refKey(), Cas::Freshness::ForceFresh);
+    auto view = partAccess()->getView(r->refKey(), Cas::Freshness::ForceFresh);
     if (!view)
         return std::nullopt;
     return Cas::encodePartManifest(*view->manifest());
@@ -1360,7 +1388,7 @@ bool ContentAddressedMetadataStorage::adoptPartFromManifest(
         /// is in progress, but that protocol is not wired here yet; the current same-token tail remains
         /// an acknowledged fsck-detectable risk.
         /// Do NOT build a bespoke relink handshake — the Poco interserver transport is half-duplex.
-        partAccess().publishEntries({receiver_ns, part_name}, decoded.entries, Cas::ProvenanceOp::Attach);
+        partAccess()->publishEntries({receiver_ns, part_name}, decoded.entries, Cas::ProvenanceOp::Attach);
         return true;
     }
     catch (const Exception & e)
