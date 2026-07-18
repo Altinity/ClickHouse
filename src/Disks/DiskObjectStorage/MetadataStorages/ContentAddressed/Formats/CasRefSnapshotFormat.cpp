@@ -13,7 +13,6 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int CORRUPTED_DATA;
-    extern const int LOGICAL_ERROR;
 }
 }
 
@@ -94,7 +93,7 @@ void checkSnapshotInvariants(const RefTableSnapshot & snapshot)
     {
         checkTxnIdNonzero(*snapshot.sealed_from, "sealed_from");
         if (snapshot.snapshot_id < *snapshot.sealed_from)
-            throw Exception(ErrorCodes::LOGICAL_ERROR,
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
                 "RefTableSnapshot: sealed_from {}-{} exceeds snapshot_id {}-{}",
                 snapshot.sealed_from->writer_epoch, snapshot.sealed_from->ref_sequence,
                 snapshot.snapshot_id.writer_epoch, snapshot.snapshot_id.ref_sequence);

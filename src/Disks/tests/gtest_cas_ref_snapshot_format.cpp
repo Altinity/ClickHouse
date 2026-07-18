@@ -140,6 +140,10 @@ TEST(CasRefSnapshotFormat, SealedFromRoundTrips)
     EXPECT_NE(text.find("\"rs\":\"18446744073709551615\""), String::npos);
 }
 
+/// CORRUPTED_DATA (not LOGICAL_ERROR): checkSnapshotInvariants runs on BOTH encode (in-memory state)
+/// and decode (data read back from the backend, which can be corrupted) -- this is data-integrity
+/// validation, the same class as the 4 sibling checks in that function, not an internal invariant
+/// that can only be violated by a bug in this code. A catchable exception, not a process abort.
 TEST(CasRefSnapshotFormat, RejectsSnapshotIdBelowSealedFrom)
 {
     RefTableSnapshot bad;
@@ -147,12 +151,7 @@ TEST(CasRefSnapshotFormat, RejectsSnapshotIdBelowSealedFrom)
     bad.snapshot_id = RefTxnId{5, 42};
     bad.lifecycle = RefLifecycle::Live;
     bad.sealed_from = RefTxnId{5, 100};   /// > snapshot_id: the seal upper-bound invariant is violated
-    EXPECT_DEATH(
-        {
-            DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
-            encodeRefTableSnapshot(bad);
-        },
-        "sealed_from .* exceeds snapshot_id");
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { encodeRefTableSnapshot(bad); });
 }
 
 /// ===================================================================================

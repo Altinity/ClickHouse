@@ -29,7 +29,8 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
-    extern const int LOGICAL_ERROR;
+    extern const int CANNOT_ALLOCATE_MEMORY;
+    extern const int OPENSSL_ERROR;
     extern const int SUPPORT_IS_DISABLED;
 }
 }
@@ -100,7 +101,7 @@ public:
         , sink(sink_)
     {
         if (!state.valid())
-            throw Exception(ErrorCodes::LOGICAL_ERROR, "Xxh3128BlobHashingWriteBuffer: failed to allocate the xxh3 streaming state");
+            throw Exception(ErrorCodes::CANNOT_ALLOCATE_MEMORY, "Xxh3128BlobHashingWriteBuffer: failed to allocate the xxh3 streaming state");
     }
 
     void sync() override
@@ -147,11 +148,11 @@ public:
         , ctx(EVP_MD_CTX_new(), &EVP_MD_CTX_free)
     {
         if (!ctx)
-            throw Exception(ErrorCodes::LOGICAL_ERROR,
+            throw Exception(ErrorCodes::OPENSSL_ERROR,
                 "Sha256BlobHashingWriteBuffer: EVP_MD_CTX_new failed: {}", getOpenSSLErrors());
 
         if (EVP_DigestInit_ex(ctx.get(), EVP_sha256(), nullptr) != 1)
-            throw Exception(ErrorCodes::LOGICAL_ERROR,
+            throw Exception(ErrorCodes::OPENSSL_ERROR,
                 "Sha256BlobHashingWriteBuffer: EVP_DigestInit_ex failed: {}", getOpenSSLErrors());
     }
 
@@ -167,7 +168,7 @@ public:
         unsigned char digest[EVP_MAX_MD_SIZE];
         unsigned int digest_len = 0;
         if (EVP_DigestFinal_ex(ctx.get(), digest, &digest_len) != 1)
-            throw Exception(ErrorCodes::LOGICAL_ERROR,
+            throw Exception(ErrorCodes::OPENSSL_ERROR,
                 "Sha256BlobHashingWriteBuffer: EVP_DigestFinal_ex failed: {}", getOpenSSLErrors());
 
         chassert(digest_len == 32);
@@ -184,7 +185,7 @@ private:
             return;
 
         if (EVP_DigestUpdate(ctx.get(), working_buffer.begin(), len) != 1)
-            throw Exception(ErrorCodes::LOGICAL_ERROR,
+            throw Exception(ErrorCodes::OPENSSL_ERROR,
                 "Sha256BlobHashingWriteBuffer: EVP_DigestUpdate failed: {}", getOpenSSLErrors());
 
         sink.write(working_buffer.begin(), len);
