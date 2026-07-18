@@ -67,7 +67,12 @@ TEST(CasFormatTraits, CompleteUniqueAndGated)
         EXPECT_EQ(traitsForType(t.type), &t);
     }
     EXPECT_EQ(traitsForType("cas_nope"), nullptr);
+#ifndef DEBUG_OR_SANITIZER_BUILD
+    /// traitsFor(Roster) throws LOGICAL_ERROR (a reserved/unreachable FormatId), which aborts the
+    /// whole process in debug/sanitizer builds instead of behaving like a catchable exception --
+    /// CasFormatTraitsDeathTest below proves the abort positively in those builds instead.
     EXPECT_THROW(traitsFor(FormatId::Roster), DB::Exception);
+#endif
     /// Deterministic formats are pinned raw + strict; spot-check the two.
     EXPECT_EQ(traitsFor(FormatId::RunFile).compression, CompressionPolicy::PinnedRaw);
     EXPECT_EQ(traitsFor(FormatId::RunFile).strictness, KeyStrictness::Strict);
@@ -82,6 +87,16 @@ TEST(CasFormatTraits, CompleteUniqueAndGated)
     EXPECT_EQ(storedSuffix(FormatId::FoldSeal), "");
     EXPECT_EQ(storedSuffix(FormatId::RunFile), "");
 }
+
+#if defined(DEBUG_OR_SANITIZER_BUILD)
+/// Debug/sanitizer-build counterpart to CompleteUniqueAndGated's Roster check: LOGICAL_ERROR aborts
+/// the process here instead of throwing a catchable exception, so the check must be a death test
+/// (same pattern as CasBlobDigestDeathTest in gtest_cas_blob_digest.cpp).
+TEST(CasFormatTraitsDeathTest, TraitsForRosterAborts)
+{
+    EXPECT_DEATH({ (void)traitsFor(FormatId::Roster); }, "");
+}
+#endif
 
 /// ---- Task 4: JSON micro-vocabulary + JsonObjectReader ----
 

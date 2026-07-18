@@ -39,6 +39,7 @@ namespace DB::ErrorCodes
     extern const int CORRUPTED_DATA;
     extern const int BAD_ARGUMENTS;
     extern const int NOT_IMPLEMENTED;
+    extern const int UNKNOWN_EXCEPTION;
 }
 #endif
 
@@ -156,7 +157,11 @@ TEST(CasRequestControl, UnrecognizedErrorsFailSafeToUnresolved)
     DB::S3Exception unknown_named("weird service error", Aws::S3::S3Errors::UNKNOWN, "SomeFutureErrorCode");
     EXPECT_EQ(classifyConditionalWriteResult(unknown_named), CasWriteOutcome::Unresolved);
 
-    DB::Exception unrelated(DB::ErrorCodes::LOGICAL_ERROR, "not an S3 error at all");
+    /// UNKNOWN_EXCEPTION (not LOGICAL_ERROR): any arbitrary non-S3 exception type works here -- the
+    /// point is that the classifier doesn't recognize it, not which specific code it carries.
+    /// LOGICAL_ERROR would abort the whole process under debug/sanitizer builds merely by being
+    /// constructed (Exception's constructor calls handle_error_code unconditionally).
+    DB::Exception unrelated(DB::ErrorCodes::UNKNOWN_EXCEPTION, "not an S3 error at all");
     EXPECT_EQ(classifyConditionalWriteResult(unrelated), CasWriteOutcome::Unresolved);
 }
 
@@ -660,8 +665,17 @@ TEST(CasRequestControllerBackoff, DefaultBudgetRidesSixtySecondOutage)
 /// retryable ABORTED — the exact class the `PutBlobWrongSizeFailsClosed` sweep regression exposed.
 TEST(CasRequestControllerCreate, DeterministicLocalFailuresPropagateInstantly)
 {
-    for (const int code : {DB::ErrorCodes::LOGICAL_ERROR, DB::ErrorCodes::NOT_IMPLEMENTED,
-                           DB::ErrorCodes::BAD_ARGUMENTS, DB::ErrorCodes::CORRUPTED_DATA})
+    /// LOGICAL_ERROR aborts the whole process in debug/sanitizer builds instead of behaving like a
+    /// catchable exception, so it's excluded from this loop there --
+    /// CasRequestControllerCreateDeathTest below proves the same instant-propagate contract for it
+    /// positively via EXPECT_DEATH instead.
+#ifdef DEBUG_OR_SANITIZER_BUILD
+    const std::vector<int> codes = {DB::ErrorCodes::NOT_IMPLEMENTED, DB::ErrorCodes::BAD_ARGUMENTS, DB::ErrorCodes::CORRUPTED_DATA};
+#else
+    const std::vector<int> codes = {DB::ErrorCodes::LOGICAL_ERROR, DB::ErrorCodes::NOT_IMPLEMENTED,
+                                     DB::ErrorCodes::BAD_ARGUMENTS, DB::ErrorCodes::CORRUPTED_DATA};
+#endif
+    for (const int code : codes)
     {
         SCOPED_TRACE("error code " + std::to_string(code));
         auto backend = std::make_shared<ScriptedControllerBackend>();
@@ -692,6 +706,26 @@ TEST(CasRequestControllerCreate, DeterministicLocalFailuresPropagateInstantly)
         EXPECT_EQ(sleeps, 0u) << "no backoff sleep may be served for a deterministic failure";
     }
 }
+
+#if defined(DEBUG_OR_SANITIZER_BUILD)
+/// Debug/sanitizer-build counterpart to DeterministicLocalFailuresPropagateInstantly's LOGICAL_ERROR
+/// case, excluded from that loop above: LOGICAL_ERROR aborts the process here instead of throwing a
+/// catchable exception, so the check must be a death test (same pattern as CasBlobDigestDeathTest in
+/// gtest_cas_blob_digest.cpp).
+TEST(CasRequestControllerCreateDeathTest, LogicalErrorPropagatesInstantlyAborts)
+{
+    auto backend = std::make_shared<ScriptedControllerBackend>();
+    CasRequestController controller(
+        backend, CasRequestBudget{}, /*now_ms=*/[] { return static_cast<uint64_t>(0); },
+        /*sleep_ms=*/[](uint64_t) {});
+    EXPECT_DEATH(
+        {
+            controller.conditionalCreateControlled("k",
+                [&]() -> PutResult { throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "scripted deterministic local failure"); },
+                [] { return true; });
+        }, "");
+}
+#endif
 
 /// Startup validation (RFC §required-timeout-model): a consistent default budget is accepted silently;
 /// either inequality violated on its own is rejected with BAD_ARGUMENTS.

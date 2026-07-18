@@ -89,6 +89,10 @@ TEST(CasGcStateFormat, RejectsZeroGcShards)
     EXPECT_THROW(decodeGcState(bad), DB::Exception);
 }
 
+#ifndef DEBUG_OR_SANITIZER_BUILD
+/// encodeGcState(gc_shards=0) throws LOGICAL_ERROR, which aborts the whole process in debug/sanitizer
+/// builds instead of behaving like a catchable exception -- CasGcStateFormatDeathTest below proves the
+/// abort positively in those builds instead.
 TEST(CasGcStateFormat, RejectsZeroGcShardsOnEncode)
 {
     GcState state;
@@ -104,6 +108,16 @@ TEST(CasGcStateFormat, RejectsZeroGcShardsOnEncode)
         EXPECT_EQ(e.code(), DB::ErrorCodes::LOGICAL_ERROR);
     }
 }
+#endif
+
+#if defined(DEBUG_OR_SANITIZER_BUILD)
+TEST(CasGcStateFormatDeathTest, RejectsZeroGcShardsOnEncodeAborts)
+{
+    GcState state;
+    state.gc_shards = 0;
+    EXPECT_DEATH({ (void)encodeGcState(state); }, "");
+}
+#endif
 
 TEST(CasGcStateFormat, RejectsAbsentGcShards)
 {
