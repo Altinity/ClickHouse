@@ -191,22 +191,37 @@ class S23(Scenario):
         result.observations["server_memory_after"] = mem_after
         after_rss = max([m.get("mem_resident") or 0 for m in mem_after.values()], default=0)
         peak = _common.record_peak_memory(result, smp, label="peak MemoryResident while idle")
+        # Gate on MemoryTracking, not RSS: a real server-side leak (GC state, log queues) moves
+        # tracked memory, while RSS also swings with jemalloc dirty-page retention, cold-boot
+        # settling, and retry-storm buffer churn (2026-07-18 S23 RCA: RSS flip-flopped pass/fail
+        # across 9 runs with no GC changes; the RSS-vs-tracked gap was always allocator noise).
+        # Compare PER NODE (max-across-nodes before/after can pick different nodes).
+        tracked_growth = {}
+        for cont, before in mem_before.items():
+            b = before.get("mem_tracking")
+            a = (mem_after.get(cont) or {}).get("mem_tracking")
+            if b is not None and a is not None:
+                tracked_growth[cont] = a - b
         if base_rss > 0:
-            growth = after_rss - base_rss
-            result.observations["idle_rss_growth"] = growth
-            # Allow a small slack for allocator noise / log-table writes; idle RSS must not climb.
-            slack = max(64 * MIB, base_rss // 10)
-            ok = growth <= slack
+            result.observations["idle_rss_growth"] = after_rss - base_rss  # informational only
+        if tracked_growth:
+            worst_cont = max(tracked_growth, key=tracked_growth.get)
+            worst = tracked_growth[worst_cont]
+            slack = 64 * MIB
+            ok = worst <= slack
             result.add(Verdict.check(
                 "memory flat over idle window",
-                f"RSS growth <= {slack/MIB:.0f} MiB (allocator/log slack) on an idle pool",
-                f"{growth/MIB:.1f} MiB (base={base_rss/MIB:.0f} MiB -> {after_rss/MIB:.0f} MiB)", ok,
-                "" if ok else "server RSS grew over an idle window with no workload — possible leak "
-                              "in background GC / log flushing; investigate"))
+                f"per-node MemoryTracking growth <= {slack/MIB:.0f} MiB on an idle pool",
+                f"{worst/MIB:.1f} MiB on {worst_cont} "
+                f"({ {c: round(g/MIB, 1) for c, g in tracked_growth.items()} }); "
+                f"RSS delta {((after_rss - base_rss)/MIB if base_rss > 0 else 0):.1f} MiB (informational)",
+                ok,
+                "" if ok else "tracked server memory grew over an idle window with no workload — "
+                              "possible leak in background GC / log flushing; investigate"))
         else:
             result.add(Verdict.inconclusive(
-                "memory flat over idle window", "RSS growth bounded",
-                "could not read a baseline MemoryResident to compare against"))
+                "memory flat over idle window", "per-node MemoryTracking growth bounded",
+                "could not read MemoryTracking on any node before AND after the idle window"))
 
         # --- final fsck must be clean on the empty pool ------------------------------------
         # S23 creates no tables, so there is nothing to SYNC/OPTIMIZE; standard_end with an empty
