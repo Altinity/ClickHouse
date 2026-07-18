@@ -23,6 +23,13 @@ void CasPlainObjects::casPutObject(const String & full_key, const String & bytes
     /// The read determines whether this is a conditional create or replacement. The token is only
     /// valid for the incarnation returned by that head, so a precondition failure means another
     /// writer won the race and the loop must observe the new incarnation before trying again.
+    ///
+    /// SINGLE-APPENDER INVARIANT: `bytes` is frozen by the caller before this loop starts (see the
+    /// append-base note at `ContentAddressedTransaction::writeFile`'s Append branch); the loop only
+    /// re-reads the TOKEN on conflict, never the base content. This is correct only while nothing
+    /// concurrently appends to the same key — a losing retry would overwrite the winner's bytes with a
+    /// stale, pre-conflict payload (a lost update). Implement a real `casAppendObject` (re-reading the
+    /// base content, not just the token, inside the loop) before adding any concurrent appender.
     for (size_t attempt = 0; attempt < MAX_CAS_ATTEMPTS; ++attempt)
     {
         HeadResult head = backend.head(full_key);

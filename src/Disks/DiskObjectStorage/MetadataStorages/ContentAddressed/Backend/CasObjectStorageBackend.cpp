@@ -621,6 +621,17 @@ std::optional<GetResult> ObjectStorageBackend::get(const String & key, Range ran
         /// contract — callers such as `Pool::loadShardDecoded` already handle a nullopt return and
         /// treat it as "raced a deletion, absent". Any other error (network, auth, corruption)
         /// propagates unchanged — fail-closed by construction.
+        ///
+        /// A REPLACEMENT racing the same window (HEAD observes token A, GET reads the bytes of a
+        /// subsequently-written incarnation B) is likewise not a hazard: HEAD strictly precedes GET, so
+        /// the returned token is never NEWER than the returned bytes — a mixed pair is always
+        /// (bytes_newer, token_older), never the reverse. Every consumer of this token uses it as a
+        /// conditional precondition (`casPut`/`putOverwrite`/`deleteExact`), which fails closed EXACTLY
+        /// in the mixed case, so a stale token costs a retry, never lets a caller act on a
+        /// bytes/token pair that never coexisted. This also covers `known_size`: content-addressed blob
+        /// bodies are byte-identical across incarnations (a "replacement" only rotates envelope/token),
+        /// mutable control objects are read-modify-CAS loops that re-validate on conflict, and write-once
+        /// objects self-validate their contents on decode.
         GetResult gr;
         try
         {
@@ -984,6 +995,15 @@ Token ObjectStorageBackend::resurrectStaged(const String & staging_key, const St
         in->ignore(staging_payload_offset);
 
     /// Unconditional overwrite of the condemned body (plain WriteSettings — no If-Match/If-None-Match).
+    /// This is safe by three independent structural properties, not merely "no time to add a
+    /// precondition": (1) the key is content-addressed, so every incarnation ever written under it is
+    /// byte-identical — an overwrite here rotates only the envelope/token, never the payload; (2) an
+    /// adopted dependency token VALUE is never a promote gate, only `has_value()` is consulted
+    /// (tokenless-on-ref promote), so no consumer can observe or react to the specific bytes of the old
+    /// token; (3) the fresh-tagged `fresh_header` above guarantees the resurrected incarnation's token
+    /// differs from the condemned one, so every already-queued exact-token GC delete of the condemned
+    /// incarnation mismatches and misses (`INV-NO-RETURN`). An `If-Match` on the condemned token would
+    /// only save a redundant re-upload on a lost race, never prevent data loss.
     auto out = object_storage->writeObject(
         StoredObject(blob_key), WriteMode::Rewrite, /*attributes=*/std::nullopt, DBMS_DEFAULT_BUFFER_SIZE, WriteSettings{});
     out->write(fresh_header.data(), fresh_header.size());

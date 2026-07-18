@@ -684,7 +684,12 @@ std::unique_ptr<WriteBufferFromFileBase> ContentAddressedTransaction::writeFile(
     /// Non-part files are VERBATIM namespace files, durable on finalize (no commit involvement -
     /// the disk layer's autocommit contract for them rides exactly this). Append is serviced by
     /// read-modify-rewrite: the existing bytes are carried forward (the MVCC mutation-entry CSN
-    /// append depends on this).
+    /// append depends on this). The `carried` prefix below is read ONCE here, at buffer-open time, and
+    /// frozen into the write callback; `casPutObject`'s CAS loop (invoked from the callback via
+    /// `putNamespaceFile`/`putMountpointObject`) only re-reads the TOKEN on conflict, not this base
+    /// content — see the single-appender invariant documented at `CasPlainObjects::casPutObject`. Safe
+    /// only because the sole production appender (the mutation-entry CSN write) never has a second
+    /// concurrent appender on the same key.
     if (!Cas::isPartFilePath(path))
     {
         if (auto tf = Cas::parseTableFilePath(path))
@@ -860,6 +865,14 @@ void ContentAddressedTransaction::createDirectoryRecursive(const std::string &)
 
 void ContentAddressedTransaction::removeDirectory(const std::string & path)
 {
+    /// CONTRACT: `removeDirectory`/`moveDirectory` mutate durable refs at CALL TIME, not at commit —
+    /// this is the everything-immediate model, not a missed "defer to commit" opportunity. `renameParts`
+    /// is the actual commit point; anything that goes wrong after one of these calls is undone by a
+    /// COMPENSATING operation over already-committed state, the same way upstream MergeTree's own
+    /// `rollbackPartsToTemporaryState` and outdated-part cleanup run over committed disk state rather
+    /// than an in-memory intent log. Recording these as staged intents and applying them at commit would
+    /// duplicate that compensation machinery for no correctness gain.
+    ///
     /// The MergeTree fast-removal path unlinks a part's files one by one (no-ops here) and then
     /// calls removeDirectory(<part>) - the SINGLE authoritative point at which the part's ref must
     /// be unlinked. Part dirs route to dropRef; anything else is a no-op (object
@@ -1035,6 +1048,8 @@ void ContentAddressedTransaction::setReadOnly(const std::string &)
 
 void ContentAddressedTransaction::moveDirectory(const std::string & path_from, const std::string & path_to)
 {
+    /// Same call-time-durability-plus-compensation contract as `removeDirectory` above: this mutates
+    /// durable refs immediately rather than staging an intent for commit; see the contract note there.
     auto src_p = Cas::parsePartFilePath(path_from);
     auto dst_p = Cas::parsePartFilePath(path_to);
     auto src = src_p ? metadata_storage.route(*src_p) : std::nullopt;
@@ -1225,7 +1240,10 @@ void ContentAddressedTransaction::moveFile(const std::string & path_from, const 
             /// race the blind put(dst) against — the put's last-writer-wins is safe under that contract.
             /// Idempotent re-drive: if the source is already gone but the destination is present, a
             /// previous drive completed this move — treat as done (matches a re-driven FS rename, which
-            /// is an ENOENT-tolerant no-op) instead of throwing FILE_DOESNT_EXIST.
+            /// is an ENOENT-tolerant no-op) instead of throwing FILE_DOESNT_EXIST. An unrelated
+            /// pre-existing destination can never reach this branch: destination names derive
+            /// deterministically from source names, and the SINGLE-WRITER contract means only this
+            /// move's own prior drive can have produced it.
             auto bytes = metadata_storage.store()->getNamespaceFile(src_ns, src_tf.tail);
             if (!bytes)
             {
