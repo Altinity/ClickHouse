@@ -41,9 +41,24 @@ TEST(CasRefCodec, RenderCanonicalForm)
 
 TEST(CasRefCodec, RenderRejectsZeroComponent)
 {
-    EXPECT_THROW(renderRefTxnId(RefTxnId{0, 1}), DB::Exception);
-    EXPECT_THROW(renderRefTxnId(RefTxnId{1, 0}), DB::Exception);
-    EXPECT_THROW(renderRefTxnId(RefTxnId{0, 0}), DB::Exception);
+    EXPECT_DEATH(
+        {
+            DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
+            renderRefTxnId(RefTxnId{0, 1});
+        },
+        "RefTxnId: writer_epoch and ref_sequence must both be nonzero");
+    EXPECT_DEATH(
+        {
+            DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
+            renderRefTxnId(RefTxnId{1, 0});
+        },
+        "RefTxnId: writer_epoch and ref_sequence must both be nonzero");
+    EXPECT_DEATH(
+        {
+            DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
+            renderRefTxnId(RefTxnId{0, 0});
+        },
+        "RefTxnId: writer_epoch and ref_sequence must both be nonzero");
 }
 
 TEST(CasRefCodec, ParseRoundTrip)

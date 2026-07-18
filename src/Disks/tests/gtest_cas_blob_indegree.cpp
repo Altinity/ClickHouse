@@ -747,7 +747,12 @@ TEST(CasSourceEdgeRun, SourceEdgeIdZeroIsReserved)
 {
     /// The zero source_id is the sentinel namespace; producers fail closed on a zero hash
     /// (probability 2^-128 — the check documents the reservation).
-    EXPECT_THROW(DB::Cas::assertValidSourceEdgeId(UInt128{0}), DB::Exception);
+    EXPECT_DEATH(
+        {
+            DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
+            DB::Cas::assertValidSourceEdgeId(UInt128{0});
+        },
+        "source_id 0 is the reserved sentinel key");
     EXPECT_NO_THROW(DB::Cas::assertValidSourceEdgeId(UInt128{1}));
 }
 

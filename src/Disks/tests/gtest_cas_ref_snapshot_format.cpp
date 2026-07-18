@@ -147,7 +147,12 @@ TEST(CasRefSnapshotFormat, RejectsSnapshotIdBelowSealedFrom)
     bad.snapshot_id = RefTxnId{5, 42};
     bad.lifecycle = RefLifecycle::Live;
     bad.sealed_from = RefTxnId{5, 100};   /// > snapshot_id: the seal upper-bound invariant is violated
-    EXPECT_THROW(encodeRefTableSnapshot(bad), DB::Exception);
+    EXPECT_DEATH(
+        {
+            DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
+            encodeRefTableSnapshot(bad);
+        },
+        "sealed_from .* exceeds snapshot_id");
 }
 
 /// ===================================================================================

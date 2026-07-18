@@ -145,7 +145,12 @@ TEST(CasRecordStream, AppendOutOfOrderThrows)
     DB::WriteBufferFromOwnString out;
     SourceEdgeRunWriter writer(out);
     writer.append(edge(chRef(2), 1));
-    EXPECT_THROW(writer.append(edge(chRef(1), 1)), DB::Exception);   /// ref regression
+    EXPECT_DEATH(
+        {
+            DB::abort_on_logical_error.store(true, std::memory_order_relaxed);
+            writer.append(edge(chRef(1), 1));
+        },
+        "records appended out of");   /// ref regression
 }
 
 TEST(CasRecordStream, SourceIdRendersAs32Hex)
