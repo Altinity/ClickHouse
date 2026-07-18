@@ -383,3 +383,42 @@ S39's ci param row bakes in a short-fault window that violates the card's own ti
 
 ## GREEN-DEBT: local build-dir config drift — ALL localize_rust_c_* rules in build/build.ninja lost their reference-library args (found 2026-07-17 at image build)
 `ninja -C build clickhouse` now fails at `localize_rust_c_chdig` ("Error: no reference libraries given"); inspection shows EVERY localize rule (chdig, polyglot, wasmtime, delta_kernel_ffi) in the generated build.ninja carries only 4 args (lib/ar/objcopy/nm) and zero refs — while corrosion-cmake's generator only creates these targets when `_localize_ref_libs` is non-empty (contrib/corrosion-cmake/CMakeLists.txt:319-415). So some past reconfigure generated with a state where the genexprs produced nothing — latent until today because the rust targets were never dirty in recent incremental builds (T2's build passed because its cargo steps rebuilt but chdig localize did not re-run... first execution today failed). Impact: any future `ninja` touching rust contribs fails in build/. Fix on resume: full cmake re-configure of build/ (then check one localize rule has refs) — and understand WHICH configure produced the argless state (guard against recurrence). The 2026-07-17 nightly image was built from the T2 binary (10:35, all DL-fix gates ran on it) — unaffected.
+
+## FIXED 2026-07-18: `CasPartWriteTxn.ManifestCapEncodedBytesJustUnderStagesSuccessfully` real-clock/TSan speed artifact
+This boundary test (constructs a manifest just under the 256 MiB `kExpectedManifestEncodedCap` and stages it) failed deterministically under TSan (3/3 reruns, ~24-26s each) with `stageManifest: part-manifest PUT ... UNCERTAIN (retry budget exhausted)` — no `ThreadSanitizer` warning anywhere, ruling out a genuine race. Root cause: `openPool()` in `gtest_cas_part_write.cpp` did not inject a fake `boot_ms_fn` (unlike other deadline-sensitive tests in this suite), so `CasMountRuntime::refAppendFenceOk` gated every controlled attempt against the REAL wall clock (mount_lease_ttl_ms=30000, safety margin 7000ms -> fence trips ~23s after pool-open). The pre-retry-loop encode+seal of a ~256 MiB manifest body, ordinarily ~4.3-4.9s (passed reliably under plain builds and under ASan), ran long enough under TSan's per-memory-access instrumentation to approach/exceed that ~23s real-clock threshold. Verified NOT a regression at the time (none of the 2026-07-18 fix-wave + final-review commits touched `CasMountRuntime.cpp`'s fence logic or the manifest-encode path).
+**FIX** (`47ea8f3c1d9`): the test now opens its Pool with a frozen `boot_ms_fn` (`[] { return uint64_t{0}; }`) instead of the shared `openPool()` helper, decoupling both the mount-lease fence and the CAS request controller's own deadline math (both consult the same injected clock seam) from real execution speed. Verified 3/3 green under TSan (~22-23s each, real CPU time, no longer racing a lease deadline) and unchanged under ASan/plain.
+
+## GREEN-DEBT: ca-soak GC-checkpoint timeout formula assumes normal-speed GC throughput -- blows the budget under TSan (found 2026-07-18)
+`soak/checker.py:fixpoint_timeout_s` computes a backlog-scaled real-time bound as `5 * (initial_unreachable/reclaim_per_round_guess=50) * gc_interval_s`, i.e. it assumes the SERVER's own background-GC round throughput is roughly 50 reclaims/round (a normal-speed baseline). Running the standard 20-min phase-3 chaos soak against a TSan-instrumented server hits `CHECKPOINT FAILURE: GC unreachable count never stabilized within {bound}s` at the `gc_checkpoint` stage -- the unreachable-count history was clearly trending down (peak 26170 -> 12251) when the budget expired, i.e. GC was actively converging, just slower than the formula assumes; `dangling=0` and fsck stayed settled throughout. This is a harness-timing artifact, NOT a correctness bug -- TSan's severe per-memory-access instrumentation overhead drops the server's actual reclaim throughput well below the formula's baseline, so a backlog that comfortably fits the budget under a normal or ASan-instrumented binary blows through it under TSan. Same root-cause class as `CasPartWriteTxn.ManifestCapEncodedBytesJustUnderStagesSuccessfully` above (TSan overhead vs a real-time budget calibrated for normal speed; that gtest is now FIXED by freezing its clock, but this soak-harness formula is a different codepath and still needs its own fix). Fix on resume: add a sanitizer-aware multiplier to `fixpoint_timeout_s` (or an explicit CLI override) so a full TSan chaos-soak can run through the chaos window; low priority since the workload/mutation/ttl_pressure stages and the full gtest battery already validate TSan correctness with zero races found.
+
+## RESOLVED 2026-07-18: the CAS gtest battery no longer needs a known-abort exclusion list at all
+Historically, running the CAS gtest battery under ASan/TSan required a peel-and-continue script
+(`build/asan_battery.sh` etc.) that accumulated a 41-entry list of tests known to abort the whole
+process (a `LOGICAL_ERROR` throw calls `abort()` under `DEBUG_OR_SANITIZER_BUILD`, per
+`Exception.cpp`'s `handle_error_code`), excluding each by name. On the user's explicit directive
+("почини раз и навсегда, без всяких странных списков исключений" — fix it once and for all, no more
+exclusion lists), audited every test in that class and closed all of them:
+- 3 genuine stack-use-after-scope bugs (not the LOGICAL_ERROR class at all — a red herring the
+  exclusion list had been silently papering over) plus 2 latent ones of the same kind: an event-sink
+  capture vector declared after the Pool. Fixed by reordering declarations (`99879af4aca`).
+- 3 test-only fault injections that misused LOGICAL_ERROR to simulate an ordinary external/observer
+  failure (a sink callback throwing, a construction failure, an "unrecognized exception" example) —
+  swapped to `UNKNOWN_EXCEPTION` (`4efc898b951`, plus the CI-fix commit `def79031982`'s B122 case using
+  `CORRUPTED_DATA`).
+- 2 production sites that genuinely misused LOGICAL_ERROR for expected external/data failures
+  (OpenSSL/allocation faults in `CasBlobHashingWriteBuffer.cpp`, a decode-reachable data-integrity
+  check in `CasRefSnapshotFormat.cpp`) — swapped to `OPENSSL_ERROR`/`CANNOT_ALLOCATE_MEMORY` and
+  `CORRUPTED_DATA` respectively (`0e069357957`).
+- 6 tests exercising genuine production invariants that correctly throw LOGICAL_ERROR — split each
+  into the existing release-build assertion (`#ifndef DEBUG_OR_SANITIZER_BUILD`) plus a new
+  death test (`EXPECT_DEATH`, `#if DEBUG_OR_SANITIZER_BUILD`) that proves the abort positively instead,
+  matching the pre-existing `CasBlobDigestDeathTest` precedent (`99879af4aca`, `0d5f0be10c5`).
+- A second gtest-filter coverage gap (`CaWiring*`/`CaTransaction*`/etc., ~89-90 tests, matching neither
+  `Cas*` nor `CA*`) that had hidden 3 of the above bugs from every battery run this session — see
+  `reference_ca_gtest_gate_filter` memory / `def79031982`.
+
+**Result**: `unit_tests_dbms --gtest_filter='<the corrected filter>'` (no `:-exclusions` at all) now
+passes 1034/1034 under ASan, 1034/1034 under TSan, and 1030/1030 under a plain (non-sanitizer) build
+(the count differs only because 4 `#ifdef DEBUG_OR_SANITIZER_BUILD`-gated death tests exist solely in
+sanitizer builds). Any CAS gtest battery gate going forward can drop the peel-and-continue exclusion
+machinery entirely and just run the filter directly.
