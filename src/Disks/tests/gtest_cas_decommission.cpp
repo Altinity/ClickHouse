@@ -1,6 +1,7 @@
 #include "cas_test_helpers.h"
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
+#include <limits>
 #include <stdexcept>
 
 namespace DB::ErrorCodes
@@ -76,6 +77,92 @@ private:
     String throw_key;
     String mismatch_key;
     String unreadable_ns_substring;
+};
+
+/// Installs a same-UUID successor deterministically in the retirement tail's read/delete window.
+/// Once armed, the backend recognizes the admin's clean farewell `putOverwrite`. On the next read of
+/// either mutable control object it first captures the value that read observed, then bumps `epoch`
+/// and reclaims `mount` with fresh tokens before returning the captured result. Thus the caller holds
+/// exactly the stale token it would have obtained immediately before a concurrent restart reclaimed
+/// the slot, without threads or sleeps.
+class SuccessorReclaimAfterFarewellBackend : public InMemoryBackend
+{
+public:
+    using Backend::get;
+    using Backend::putOverwrite;
+
+    void armForSuccessorReclaim() { armed = true; }
+
+    std::optional<GetResult> get(const String & key, Range range) override
+    {
+        std::optional<GetResult> result = InMemoryBackend::get(key, range);
+        if (farewell_seen && !successor_injected && (key == mount_key || key == epoch_key))
+            injectSuccessor();
+        return result;
+    }
+
+    PutResult putOverwrite(
+        const String & key, const String & bytes, const Token & expected, const ObjectMeta & meta) override
+    {
+        const PutResult result = InMemoryBackend::putOverwrite(key, bytes, expected, meta);
+        if (armed && key == mount_key && result.outcome == PutOutcome::Done)
+        {
+            const MountLease mount = decodeMountLease(bytes);
+            if (mount.min_active == std::numeric_limits<uint64_t>::max())
+                farewell_seen = true;
+        }
+        return result;
+    }
+
+    bool successorInjected() const { return successor_injected; }
+    const Token & successorMountToken() const { return successor_mount_token; }
+    const Token & successorEpochToken() const { return successor_epoch_token; }
+    const String & successorMountBytes() const { return successor_mount_bytes; }
+    const String & successorEpochBytes() const { return successor_epoch_bytes; }
+
+private:
+    void injectSuccessor()
+    {
+        const auto epoch = InMemoryBackend::get(epoch_key, {});
+        const auto mount = InMemoryBackend::get(mount_key, {});
+        if (!epoch || !mount)
+            throw std::runtime_error("successor-reclaim fixture: control object disappeared before reclaim");
+
+        ServerEpoch epoch_value = decodeServerEpoch(epoch->bytes);
+        const uint64_t successor_writer_epoch = epoch_value.next_writer_epoch;
+        ++epoch_value.next_writer_epoch;
+        successor_epoch_bytes = encodeServerEpoch(epoch_value);
+        const CasResult epoch_put = InMemoryBackend::casPut(
+            epoch_key, successor_epoch_bytes, std::optional<Token>{epoch->token}, {});
+        if (epoch_put.outcome != CasOutcome::Committed)
+            throw std::runtime_error("successor-reclaim fixture: epoch bump conflicted");
+        successor_epoch_token = epoch_put.token;
+
+        MountLease mount_value = decodeMountLease(mount->bytes);
+        mount_value.writer_epoch = successor_writer_epoch;
+        ++mount_value.seq;
+        ++mount_value.started_at_ms;
+        mount_value.expires_at_ms = mount_value.started_at_ms + 30'000;
+        mount_value.min_active = 0;
+        mount_value.gc_fenced = false;
+        successor_mount_bytes = encodeMountLease(mount_value);
+        const PutResult mount_put = InMemoryBackend::putOverwrite(
+            mount_key, successor_mount_bytes, mount->token, {});
+        if (mount_put.outcome != PutOutcome::Done)
+            throw std::runtime_error("successor-reclaim fixture: mount reclaim conflicted");
+        successor_mount_token = mount_put.token;
+        successor_injected = true;
+    }
+
+    inline static const String mount_key = "p/gc/server-roots/victim/mount";
+    inline static const String epoch_key = "p/gc/server-roots/victim/epoch";
+    bool armed = false;
+    bool farewell_seen = false;
+    bool successor_injected = false;
+    Token successor_mount_token;
+    Token successor_epoch_token;
+    String successor_mount_bytes;
+    String successor_epoch_bytes;
 };
 
 /// Seed one victim table with `committed` committed refs and `precommits` dangling precommit bindings,
@@ -405,6 +492,60 @@ TEST(CasDecommission, RemovesSlotAndMakesRerunUnknown)
     });
 }
 
+/// Triage #9: a successor may reclaim the same UUID immediately after the decommission admin writes
+/// its farewell. The retirement tail must use the farewell/claimed-epoch tokens captured around that
+/// release, delete `mount` first, and stop on its `TokenMismatch`; re-reading current tokens would
+/// delete the live successor's control objects and falsely report the slot removed.
+TEST(CasDecommission, SuccessorReclaimFencesSlotRetirementTail)
+{
+    auto backend = std::make_shared<SuccessorReclaimAfterFarewellBackend>();
+    { auto victim = openVictim(backend); }
+    backend->armForSuccessorReclaim();
+
+    std::vector<CasEvent> seen;
+    const auto report = decommissionPoolMember(
+        backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim",
+        [&](const CasEvent & event) { seen.push_back(event); });
+
+    ASSERT_TRUE(backend->successorInjected());
+    EXPECT_FALSE(report.slot_removed);
+    ASSERT_EQ(report.warnings.size(), 1u);
+    EXPECT_NE(report.warnings.front().find("p/gc/server-roots/victim/mount"), String::npos);
+    EXPECT_NE(report.warnings.front().find("replaced"), String::npos);
+
+    const auto mount = backend->get("p/gc/server-roots/victim/mount");
+    ASSERT_TRUE(mount.has_value());
+    EXPECT_EQ(mount->token, backend->successorMountToken());
+    EXPECT_EQ(mount->bytes, backend->successorMountBytes());
+
+    const auto epoch = backend->get("p/gc/server-roots/victim/epoch");
+    ASSERT_TRUE(epoch.has_value());
+    EXPECT_EQ(epoch->token, backend->successorEpochToken());
+    EXPECT_EQ(epoch->bytes, backend->successorEpochBytes());
+    EXPECT_TRUE(backend->get("p/gc/server-roots/victim/owner").has_value());
+
+    ASSERT_FALSE(seen.empty());
+    EXPECT_EQ(seen.back().outcome, "end");
+    EXPECT_EQ(seen.back().detail.at("slot_removed"), "0");
+}
+
+/// Triage #9 control: absent a successor interleaving, the newly fenced tail still removes all three
+/// control objects and preserves the existing successful `slot_removed=1` result.
+TEST(CasDecommission, FencedSlotRetirementTailRemovesUncontendedSlot)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    { auto victim = openVictim(backend); }
+
+    const auto report = decommissionPoolMember(
+        backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin"}, "victim");
+
+    EXPECT_TRUE(report.warnings.empty());
+    EXPECT_TRUE(report.slot_removed);
+    EXPECT_FALSE(backend->get("p/gc/server-roots/victim/mount").has_value());
+    EXPECT_FALSE(backend->get("p/gc/server-roots/victim/epoch").has_value());
+    EXPECT_FALSE(backend->get("p/gc/server-roots/victim/owner").has_value());
+}
+
 /// Delegates every op to `inner`, except `deleteExact`: while `armed`, any key starting with
 /// `fail_prefix` throws an injected transient failure instead of deleting -- models a real backend
 /// transiently failing to delete under one whole prefix. `disarm()` clears the failure (the resume
@@ -528,14 +669,12 @@ TEST(CasDecommission, ManifestDebrisFailureKeepsSlotThenResumes)
     EXPECT_FALSE(backend->get("p/gc/server-roots/victim/mount").has_value());
 }
 
-/// Task 5 (Task-1 carry-forward, escalated by review): mid-retirement crash-safety RELIES on
-/// `openForDecommission`'s owner-anchor-absent + mount-lease-present fallback ("partial hand-cleanup:
-/// adopt from the lease", `CasPool.cpp`) -- the slot-retirement loop (Task 4) deletes
-/// `epochKey`/`ownerKey`/`mountKey` in that exact order, so a crash between the second and third delete
-/// leaves precisely this byte-state (owner anchor gone, mount lease still present). No prior test
-/// exercised this recovery path, even though it is load-bearing for every fail-and-resume scenario the
-/// drain-phase tests already cover -- those all crash EARLIER (mid-drain, warnings non-empty, slot
-/// retirement never even starts), never mid-retirement itself.
+/// Task 5 (Task-1 carry-forward, escalated by review): preserve recovery from the legacy partial
+/// hand-cleanup shape where owner and epoch are absent but the mount lease remains. Triage #9 changed
+/// new retirements to delete `mountKey`/`epochKey`/`ownerKey`, so the current tail no longer creates
+/// this shape, but `openForDecommission`'s owner-anchor-absent + mount-lease-present fallback ("partial
+/// hand-cleanup: adopt from the lease", `CasPool.cpp`) remains compatibility-critical for slots left by
+/// older binaries or manual repair.
 ///
 /// `claimOwnerOrThrow` (`CasServerRoot.cpp`) gates the owner-absent path a SECOND, stricter way: it
 /// only re-claims over a PROVABLY EMPTY data subtree (`serverRootSubtreeEmpty`: `cas/refs/<srid>/`,
@@ -563,9 +702,7 @@ TEST(CasDecommission, MidRetirementCrashResumesViaMountLeaseFallback)
         auto admin = Pool::openForDecommission(backend, PoolConfig{.pool_prefix = "p", .server_root_id = "chk"}, "victim");
     }
 
-    /// Manually strike epoch + owner, leaving the mount -- the exact aftermath of a crash between
-    /// slot-retirement's second and third delete (`CasDecommission.cpp`'s `slot_keys` order: epoch,
-    /// owner, mount).
+    /// Manually strike epoch + owner, leaving the mount -- the legacy partial hand-cleanup shape.
     for (const String & key : {layout.epochKey("victim"), layout.ownerKey("victim")})
     {
         const auto head = backend->head(key);

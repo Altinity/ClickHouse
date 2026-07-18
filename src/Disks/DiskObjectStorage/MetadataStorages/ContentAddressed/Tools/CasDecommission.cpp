@@ -1,10 +1,12 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasDecommission.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasServerRootFormats.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEvent.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
+#include <limits>
 #include <set>
 #include <tuple>
 
@@ -60,6 +62,29 @@ uint64_t deleteListedPrefix(Backend & backend, const String & prefix, std::vecto
         }
     });
     return deleted;
+}
+
+/// Delete one slot control object by a token captured at the protocol-defined fence point. Slot
+/// retirement is fail-closed: unlike the debris drains above, any non-`Deleted` outcome or exception
+/// stops the tail before it can touch the next control object.
+bool deleteSlotObject(Backend & backend, const String & key, const Token & token, std::vector<String> & warnings)
+{
+    try
+    {
+        const DeleteOutcome outcome = backend.deleteExact(key, token);
+        const DeleteClass outcome_class = classifyDeleteOutcome(outcome);
+        if (outcome_class == DeleteClass::Deleted)
+            return true;
+
+        warnings.push_back("slot delete failed: " + key + ": delete outcome "
+                           + String(deleteClassName(outcome_class)));
+    }
+    catch (...)
+    {
+        warnings.push_back("slot delete failed: " + key + ": "
+                           + getCurrentExceptionMessage(/*with_stacktrace=*/false));
+    }
+    return false;
 }
 
 }
@@ -152,35 +177,96 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
     const BackendPtr pool_backend = admin->poolBackendPtr();
     if (report.warnings.empty())
     {
+        const String mount_key = layout.mountKey(victim_srid);
+        const String epoch_key = layout.epochKey(victim_srid);
+        const String owner_key = layout.ownerKey(victim_srid);
+
+        /// Capture both the epoch value and its exact token while the decommission claim still fences
+        /// the victim. A successor can only bump this object after the farewell below releases the
+        /// claim, so this token is the epoch-side successor fence for the retirement tail.
+        std::optional<GetResult> claimed_epoch;
+        try
+        {
+            claimed_epoch = pool_backend->get(epoch_key);
+            if (!claimed_epoch)
+                report.warnings.push_back("slot capture failed: " + epoch_key + " is absent under the admin claim");
+        }
+        catch (...)
+        {
+            report.warnings.push_back("slot capture failed: " + epoch_key + ": "
+                                      + getCurrentExceptionMessage(/*with_stacktrace=*/false));
+        }
+
         /// Graceful close stamps an already-expired lease and the watermark farewell
         /// (`min_active = UINT64_MAX`), making the slot `terminated` before its control objects are
         /// removed.
         admin.reset();
 
-        /// Delete epoch and owner before the mount body. The mount body is the claim/resume anchor: a
-        /// failure between deletes must leave a still-claimable slot, never an owner/epoch-less mounted
-        /// slot. Stop after the first failure so the remaining keys, including the mount, survive retry.
-        const std::vector<String> slot_keys = {layout.epochKey(victim_srid), layout.ownerKey(victim_srid),
-                                                layout.mountKey(victim_srid)};
-        bool all_deleted = true;
-        for (const String & key : slot_keys)
+        /// Read the farewell immediately after `finishTeardown` wrote it. Its exact token is the
+        /// mount-side fence: deleting by this token can remove only THIS decommission's farewell, not
+        /// a successor reclaim. Validate the body against the epoch value captured under the claim so
+        /// a successor that completed before this GET is also recognized and left untouched.
+        std::optional<GetResult> farewell_mount;
+        try
         {
-            if (const auto got = pool_backend->get(key))
+            farewell_mount = pool_backend->get(mount_key);
+            if (!farewell_mount)
+                report.warnings.push_back("slot capture failed: " + mount_key + " farewell is absent");
+        }
+        catch (...)
+        {
+            report.warnings.push_back("slot capture failed: " + mount_key + ": "
+                                      + getCurrentExceptionMessage(/*with_stacktrace=*/false));
+        }
+
+        bool captures_match = claimed_epoch && farewell_mount;
+        if (captures_match)
+        {
+            try
             {
-                try
+                const ServerEpoch epoch_value = decodeServerEpoch(claimed_epoch->bytes);
+                const MountLease mount_value = decodeMountLease(farewell_mount->bytes);
+                captures_match = epoch_value.next_writer_epoch != 0
+                    && mount_value.writer_epoch == epoch_value.next_writer_epoch - 1
+                    && mount_value.min_active == std::numeric_limits<uint64_t>::max()
+                    && !mount_value.gc_fenced;
+                if (!captures_match)
                 {
-                    pool_backend->deleteExact(key, got->token);
-                }
-                catch (...)
-                {
-                    report.warnings.push_back("slot delete failed: " + key + ": "
-                                              + getCurrentExceptionMessage(/*with_stacktrace=*/false));
-                    all_deleted = false;
-                    break;   /// Keep the remaining keys, including the mount, so a rerun can resume.
+                    report.warnings.push_back(
+                        "slot capture failed: " + mount_key
+                        + " is not this decommission's farewell for the epoch captured under the admin claim");
                 }
             }
+            catch (...)
+            {
+                report.warnings.push_back("slot capture failed while validating " + mount_key + " and " + epoch_key + ": "
+                                          + getCurrentExceptionMessage(/*with_stacktrace=*/false));
+                captures_match = false;
+            }
         }
-        report.slot_removed = all_deleted;
+
+        /// Mount first: if a successor reclaimed it after the farewell capture, the stale farewell
+        /// token yields `TokenMismatch` and the tail stops before touching epoch or owner. Epoch second:
+        /// its under-claim token similarly detects a successor allocation. Owner is last and is read
+        /// only after both mutable objects were confirmed deleted; same-UUID successors never rewrite
+        /// this identity anchor directly. Every delete must be explicitly confirmed as `Deleted`.
+        report.slot_removed = false;
+        if (captures_match && deleteSlotObject(*pool_backend, mount_key, farewell_mount->token, report.warnings)
+            && deleteSlotObject(*pool_backend, epoch_key, claimed_epoch->token, report.warnings))
+        {
+            try
+            {
+                if (const auto owner = pool_backend->get(owner_key))
+                    report.slot_removed = deleteSlotObject(*pool_backend, owner_key, owner->token, report.warnings);
+                else
+                    report.warnings.push_back("slot delete failed: " + owner_key + ": object absent before delete");
+            }
+            catch (...)
+            {
+                report.warnings.push_back("slot delete failed: " + owner_key + ": "
+                                          + getCurrentExceptionMessage(/*with_stacktrace=*/false));
+            }
+        }
     }
     else
     {
