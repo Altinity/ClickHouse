@@ -141,7 +141,7 @@ class InterruptRoundCasBackend : public InMemoryBackend
 {
 public:
     CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected,
-                     const ObjectMeta & meta = {}) override
+                     const ObjectMeta & meta) override
     {
         if (arm_interrupt && key == gc_state_key)
         {
@@ -238,7 +238,7 @@ class DropAtCommitBackend : public InMemoryBackend
 {
 public:
     CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected,
-                     const ObjectMeta & meta = {}) override
+                     const ObjectMeta & meta) override
     {
         /// The one-pass round has a SINGLE gc/state CAS that advances snap_generation. Fire the injected
         /// drop ONCE, just before that CAS commits — so the drop event is above this round's sealed cursor.

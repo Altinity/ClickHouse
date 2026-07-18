@@ -233,18 +233,18 @@ TEST(CasSweepLateLog, LogBetweenSealedFromAndSealIdIsReportedNotRevived)
         size_t get_count = 0;
 
         HeadResult head(const String & k) override { return inner->head(k); }
-        std::optional<GetResult> get(const String & k, Range r = {}) override
+        std::optional<GetResult> get(const String & k, Range r) override
         {
             if (k == watched_key)
                 ++get_count;
             return inner->get(k, r);
         }
-        std::optional<GetStreamResult> getStream(const String & k, Range r = {}) override { return inner->getStream(k, r); }
+        std::optional<GetStreamResult> getStream(const String & k, Range r) override { return inner->getStream(k, r); }
         ListPage list(const String & p, const String & c, size_t l) override { return inner->list(p, c, l); }
-        PutResult putIfAbsent(const String & k, const String & bts, const ObjectMeta & m = {}) override { return inner->putIfAbsent(k, bts, m); }
-        WriteSinkPtr putIfAbsentStream(const String & k, const ObjectMeta & m = {}) override { return inner->putIfAbsentStream(k, m); }
-        PutResult putOverwrite(const String & k, const String & bts, const Token & e, const ObjectMeta & m = {}) override { return inner->putOverwrite(k, bts, e, m); }
-        CasResult casPut(const String & k, const String & bts, const std::optional<Token> & e, const ObjectMeta & m = {}) override { return inner->casPut(k, bts, e, m); }
+        PutResult putIfAbsent(const String & k, const String & bts, const ObjectMeta & m) override { return inner->putIfAbsent(k, bts, m); }
+        WriteSinkPtr putIfAbsentStream(const String & k, const ObjectMeta & m) override { return inner->putIfAbsentStream(k, m); }
+        PutResult putOverwrite(const String & k, const String & bts, const Token & e, const ObjectMeta & m) override { return inner->putOverwrite(k, bts, e, m); }
+        CasResult casPut(const String & k, const String & bts, const std::optional<Token> & e, const ObjectMeta & m) override { return inner->casPut(k, bts, e, m); }
         DeleteOutcome deleteExact(const String & k, const Token & tok) override { return inner->deleteExact(k, tok); }
         bool supportsListTokens() const override { return inner->supportsListTokens(); }
     private:

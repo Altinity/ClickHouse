@@ -74,7 +74,7 @@ public:
         const DB::StoredObject & object_to,
         const DB::ReadSettings & read_settings,
         const DB::WriteSettings & write_settings,
-        std::optional<DB::ObjectAttributes> object_to_attributes = {}) override
+        std::optional<DB::ObjectAttributes> object_to_attributes) override
     {
         ++call_count;
         if (mode == Mode::Enforcing && exists(object_to))

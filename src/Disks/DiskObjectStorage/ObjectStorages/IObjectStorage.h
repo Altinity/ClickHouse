@@ -316,10 +316,19 @@ public:
         const StoredObject & /*object_to*/,
         const ReadSettings & /*read_settings*/,
         const WriteSettings & /*write_settings*/,
-        std::optional<ObjectAttributes> /*object_to_attributes*/ = {})
+        std::optional<ObjectAttributes> /*object_to_attributes*/)
     {
         throw Exception(ErrorCodes::NOT_IMPLEMENTED,
             "Conditional (write-once) object copy is not implemented for {} object storage", getName());
+    }
+
+    ConditionalCopyResult copyObjectConditional(
+        const StoredObject & object_from,
+        const StoredObject & object_to,
+        const ReadSettings & read_settings,
+        const WriteSettings & write_settings)
+    {
+        return copyObjectConditional(object_from, object_to, read_settings, write_settings, {});
     }
 
     /// Copy object to another instance of object storage

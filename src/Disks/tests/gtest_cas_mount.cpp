@@ -265,19 +265,19 @@ public:
     explicit AlwaysVanishesBackend(std::shared_ptr<DB::Cas::Backend> inner_) : inner(std::move(inner_)) {}
     String watched_key;
 
-    std::optional<DB::Cas::GetResult> get(const String & k, DB::Cas::Range r = {}) override
+    std::optional<DB::Cas::GetResult> get(const String & k, DB::Cas::Range r) override
     {
         if (k == watched_key)
             return std::nullopt;
         return inner->get(k, r);
     }
-    std::optional<DB::Cas::GetStreamResult> getStream(const String & k, DB::Cas::Range r = {}) override { return inner->getStream(k, r); }
+    std::optional<DB::Cas::GetStreamResult> getStream(const String & k, DB::Cas::Range r) override { return inner->getStream(k, r); }
     DB::Cas::HeadResult head(const String & k) override { return inner->head(k); }
     DB::Cas::ListPage list(const String & p, const String & c, size_t l) override { return inner->list(p, c, l); }
-    DB::Cas::PutResult putIfAbsent(const String & k, const String & b, const DB::Cas::ObjectMeta & m = {}) override { return inner->putIfAbsent(k, b, m); }
-    DB::Cas::WriteSinkPtr putIfAbsentStream(const String & k, const DB::Cas::ObjectMeta & m = {}) override { return inner->putIfAbsentStream(k, m); }
-    DB::Cas::PutResult putOverwrite(const String & k, const String & b, const DB::Cas::Token & e, const DB::Cas::ObjectMeta & m = {}) override { return inner->putOverwrite(k, b, e, m); }
-    DB::Cas::CasResult casPut(const String & k, const String & b, const std::optional<DB::Cas::Token> & e, const DB::Cas::ObjectMeta & m = {}) override { return inner->casPut(k, b, e, m); }
+    DB::Cas::PutResult putIfAbsent(const String & k, const String & b, const DB::Cas::ObjectMeta & m) override { return inner->putIfAbsent(k, b, m); }
+    DB::Cas::WriteSinkPtr putIfAbsentStream(const String & k, const DB::Cas::ObjectMeta & m) override { return inner->putIfAbsentStream(k, m); }
+    DB::Cas::PutResult putOverwrite(const String & k, const String & b, const DB::Cas::Token & e, const DB::Cas::ObjectMeta & m) override { return inner->putOverwrite(k, b, e, m); }
+    DB::Cas::CasResult casPut(const String & k, const String & b, const std::optional<DB::Cas::Token> & e, const DB::Cas::ObjectMeta & m) override { return inner->casPut(k, b, e, m); }
     DB::Cas::DeleteOutcome deleteExact(const String & k, const DB::Cas::Token & t) override { return inner->deleteExact(k, t); }
     bool supportsListTokens() const override { return inner->supportsListTokens(); }
 
@@ -789,13 +789,13 @@ public:
     }
 
     PutResult putOverwrite(const String & key, const String & bytes, const Token & expected,
-                           const ObjectMeta & meta = {}) override
+                           const ObjectMeta & meta) override
     {
         if (key == target_key && !renewed)
         {
             renewed = true;
             /// The holder renews under the real current token: fresh far-future expiry.
-            const auto got = InMemoryBackend::get(key);
+            const auto got = InMemoryBackend::get(key, {});
             MountLease m = decodeMountLease(got->bytes);
             m.seq += 1;
             m.expires_at_ms = renewed_expires_ms;

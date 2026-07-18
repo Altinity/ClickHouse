@@ -172,6 +172,13 @@ std::optional<RefTxnId> listGreatestSnapshotIdForTest(Backend & backend, const L
 class RefWriterTestBackend : public CountingBackend
 {
 public:
+    using CountingBackend::get;
+    using CountingBackend::getStream;
+    using CountingBackend::putIfAbsent;
+    using CountingBackend::putIfAbsentStream;
+    using CountingBackend::putOverwrite;
+    using CountingBackend::casPut;
+
     std::set<String> vanish_once_keys;
     std::function<void()> on_vanish_fire;
 
@@ -190,7 +197,7 @@ public:
     int corrupt_count = 0;
     String corrupt_foreign_bytes;
 
-    std::optional<GetResult> get(const String & key, Range range = {}) override
+    std::optional<GetResult> get(const String & key, Range range) override
     {
         const auto it = vanish_once_keys.find(key);
         if (it != vanish_once_keys.end())
@@ -207,7 +214,7 @@ public:
         return CountingBackend::get(key, range);
     }
 
-    PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta = {}) override
+    PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta) override
     {
         if (corrupt_count > 0 && !corrupt_key_substr.empty() && key.find(corrupt_key_substr) != String::npos)
         {

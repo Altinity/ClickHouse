@@ -67,6 +67,15 @@ public:
 class ObjectStorageBackend final : public Backend
 {
 public:
+    /// Unhide the base convenience overloads (omitted Range/ObjectMeta/expected-token forms): the
+    /// overrides below would otherwise shadow them for callers holding a concrete backend type.
+    using Backend::get;
+    using Backend::getStream;
+    using Backend::putIfAbsent;
+    using Backend::putIfAbsentStream;
+    using Backend::putOverwrite;
+    using Backend::casPut;
+
     enum class Mode { Native, EmulatedSingleProcess };
 
     /// Construct a backend over `object_storage`. Native mode uses the storage's conditional
@@ -82,7 +91,7 @@ public:
     std::optional<GetResult> get(const String & key, Range range) override;
     /// Open a forward-only ranged stream for a write-once object. The stream is not materialized in
     /// memory; mutable objects must use `get` because their contents may change while it is open.
-    std::optional<GetStreamResult> getStream(const String & key, Range range = {}) override;
+    std::optional<GetStreamResult> getStream(const String & key, Range range) override;
     /// Return the current size, attributes, and incarnation token, or an absent `HeadResult`.
     HeadResult head(const String & key) override;
     /// S3 ETags are content-derived and surfaced in list responses — TRUE for ETag-token Native
@@ -95,19 +104,19 @@ public:
     bool supportsListTokens() const override { return native_token_type != TokenType::Generation; }
     /// Create `key` only if it is absent. On a precondition failure the object is untouched and the
     /// result has no token; on success the token identifies the newly written incarnation.
-    PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta = {}) override;
+    PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta) override;
 
     /// Native mode: true streaming — bytes flow straight into the object storage's write buffer with
     /// `If-None-Match: *` riding on the request. EmulatedSingleProcess mode: memory-buffered delegation
     /// to putIfAbsent (acceptable: this mode exists for unit tests only).
-    WriteSinkPtr putIfAbsentStream(const String & key, const ObjectMeta & meta = {}) override;
+    WriteSinkPtr putIfAbsentStream(const String & key, const ObjectMeta & meta) override;
     /// Replace `key` only when its current token exactly equals `expected`; a mismatch leaves the
     /// existing incarnation untouched. Storage exceptions propagate instead of being reported as a
     /// successful or failed precondition.
-    PutResult putOverwrite(const String & key, const String & bytes, const Token & expected, const ObjectMeta & meta = {}) override;
+    PutResult putOverwrite(const String & key, const String & bytes, const Token & expected, const ObjectMeta & meta) override;
     /// Perform a compare-and-set: `expected == nullopt` means create-if-absent. A conflict leaves the
     /// object untouched; a committed result carries the new incarnation token.
-    CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected, const ObjectMeta & meta = {}) override;
+    CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected, const ObjectMeta & meta) override;
     /// Remove only the incarnation matching `token`, preserving the object on a mismatch and exposing
     /// whether the storage created a delete marker.
     DeleteOutcome deleteExact(const String & key, const Token & token) override;

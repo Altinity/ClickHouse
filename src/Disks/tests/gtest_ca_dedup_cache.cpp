@@ -31,18 +31,18 @@ public:
     size_t stream_puts = 0;
 
     HeadResult head(const String & k) override { ++heads; return inner->head(k); }
-    WriteSinkPtr putIfAbsentStream(const String & k, const ObjectMeta & meta = {}) override
+    WriteSinkPtr putIfAbsentStream(const String & k, const ObjectMeta & meta) override
     {
         ++stream_puts;
         return inner->putIfAbsentStream(k, meta);
     }
 
-    std::optional<GetResult> get(const String & k, Range r = {}) override { return inner->get(k, r); }
-    std::optional<GetStreamResult> getStream(const String & k, Range r = {}) override { return inner->getStream(k, r); }
+    std::optional<GetResult> get(const String & k, Range r) override { return inner->get(k, r); }
+    std::optional<GetStreamResult> getStream(const String & k, Range r) override { return inner->getStream(k, r); }
     ListPage list(const String & p, const String & c, size_t l) override { return inner->list(p, c, l); }
-    PutResult putIfAbsent(const String & k, const String & b, const ObjectMeta & m = {}) override { return inner->putIfAbsent(k, b, m); }
-    PutResult putOverwrite(const String & k, const String & b, const Token & e, const ObjectMeta & m = {}) override { return inner->putOverwrite(k, b, e, m); }
-    CasResult casPut(const String & k, const String & b, const std::optional<Token> & e, const ObjectMeta & m = {}) override { return inner->casPut(k, b, e, m); }
+    PutResult putIfAbsent(const String & k, const String & b, const ObjectMeta & m) override { return inner->putIfAbsent(k, b, m); }
+    PutResult putOverwrite(const String & k, const String & b, const Token & e, const ObjectMeta & m) override { return inner->putOverwrite(k, b, e, m); }
+    CasResult casPut(const String & k, const String & b, const std::optional<Token> & e, const ObjectMeta & m) override { return inner->casPut(k, b, e, m); }
     DeleteOutcome deleteExact(const String & k, const Token & t) override { return inner->deleteExact(k, t); }
     bool supportsListTokens() const override { return inner->supportsListTokens(); }
 

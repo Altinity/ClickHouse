@@ -430,7 +430,7 @@ class TransientPutOverwriteFaultBackend final : public InMemoryBackend
 public:
     int fault_count = 0;
 
-    PutResult putOverwrite(const String & k, const String & b, const Token & e, const ObjectMeta & m = {}) override
+    PutResult putOverwrite(const String & k, const String & b, const Token & e, const ObjectMeta & m) override
     {
         if (fault_count > 0)
         {

@@ -836,6 +836,15 @@ inline std::vector<DB::Cas::RefOp> publishCommittedOps(const String & ref_name, 
 class CountingBackend : public DB::Cas::InMemoryBackend
 {
 public:
+    /// Unhide the base convenience overloads (omitted Range/ObjectMeta/expected-token forms): the
+    /// overrides below would otherwise shadow them for callers holding a concrete backend type.
+    using DB::Cas::Backend::get;
+    using DB::Cas::Backend::getStream;
+    using DB::Cas::Backend::putIfAbsent;
+    using DB::Cas::Backend::putIfAbsentStream;
+    using DB::Cas::Backend::putOverwrite;
+    using DB::Cas::Backend::casPut;
+
     DB::Cas::HeadResult head(const String & key) override
     {
         {
@@ -846,7 +855,7 @@ public:
         return InMemoryBackend::head(key);
     }
 
-    std::optional<DB::Cas::GetResult> get(const String & key, DB::Cas::Range range = {}) override
+    std::optional<DB::Cas::GetResult> get(const String & key, DB::Cas::Range range) override
     {
         {
             std::lock_guard lock(count_mutex);
@@ -867,7 +876,7 @@ public:
         return InMemoryBackend::get(key, range);
     }
 
-    std::optional<DB::Cas::GetStreamResult> getStream(const String & key, DB::Cas::Range range = {}) override
+    std::optional<DB::Cas::GetStreamResult> getStream(const String & key, DB::Cas::Range range) override
     {
         {
             std::lock_guard lock(count_mutex);
@@ -887,7 +896,7 @@ public:
         return InMemoryBackend::list(prefix, cursor, limit);
     }
 
-    DB::Cas::PutResult putIfAbsent(const String & key, const String & bytes, const DB::Cas::ObjectMeta & meta = {}) override
+    DB::Cas::PutResult putIfAbsent(const String & key, const String & bytes, const DB::Cas::ObjectMeta & meta) override
     {
         {
             std::lock_guard lock(count_mutex);
@@ -972,9 +981,18 @@ private:
 class MetaWriteFaultBackend : public DB::Cas::InMemoryBackend
 {
 public:
+    /// Unhide the base convenience overloads (omitted Range/ObjectMeta/expected-token forms): the
+    /// overrides below would otherwise shadow them for callers holding a concrete backend type.
+    using DB::Cas::Backend::get;
+    using DB::Cas::Backend::getStream;
+    using DB::Cas::Backend::putIfAbsent;
+    using DB::Cas::Backend::putIfAbsentStream;
+    using DB::Cas::Backend::putOverwrite;
+    using DB::Cas::Backend::casPut;
+
     DB::Cas::CasResult casPut(const String & key, const String & bytes,
                               const std::optional<DB::Cas::Token> & expected,
-                              const DB::Cas::ObjectMeta & meta = {}) override
+                              const DB::Cas::ObjectMeta & meta) override
     {
         if (fail_meta_writes.load() && key.ends_with(".meta"))
             throw std::runtime_error("injected fault: blob meta write lost");

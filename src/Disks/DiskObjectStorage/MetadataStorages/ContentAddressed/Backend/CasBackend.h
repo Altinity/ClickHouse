@@ -182,7 +182,8 @@ public:
 
     /// Reads the selected bytes and their token, or returns nullopt when the key is absent. For a
     /// mutable object, callers must use this materialized form so the body is fixed before parsing.
-    virtual std::optional<GetResult> get(const String & key, Range range = {}) = 0;
+    virtual std::optional<GetResult> get(const String & key, Range range) = 0;
+    std::optional<GetResult> get(const String & key) { return get(key, {}); }
 
     /// Forward-only stream over the object's `range` (default: whole object) for WRITE-ONCE objects
     /// (runs, seals). The returned `stream` yields exactly the window's bytes and nothing is
@@ -191,7 +192,8 @@ public:
     /// CAVEAT: the window END is advisory on storages where `setReadUntilPosition` is a hint
     /// (LocalObjectStorage) — the stream may yield bytes past the window; consumers MUST bound their
     /// own consumption (RunFileReader bounds to its data_end). The window START is always exact.
-    virtual std::optional<GetStreamResult> getStream(const String & key, Range range = {}) = 0;
+    virtual std::optional<GetStreamResult> getStream(const String & key, Range range) = 0;
+    std::optional<GetStreamResult> getStream(const String & key) { return getStream(key, {}); }
 
     /// Returns the current incarnation's existence, size, token, and metadata without reading its
     /// body. The result describes one point-in-time observation; a later operation must use the
@@ -201,21 +203,31 @@ public:
     /// Creates `key` only when it is absent. `PreconditionFailed` leaves the existing object intact;
     /// storage failures are reported as exceptions. On success, the returned token identifies the
     /// newly created incarnation.
-    virtual PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta = {}) = 0;
+    virtual PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta) = 0;
+    PutResult putIfAbsent(const String & key, const String & bytes) { return putIfAbsent(key, bytes, {}); }
     /// Streaming variant of putIfAbsent — see WriteSink. Large content blobs use this; whole-String
     /// ops remain for manifests, trees, probe and GC objects.
-    virtual WriteSinkPtr putIfAbsentStream(const String & key, const ObjectMeta & meta = {}) = 0;
+    virtual WriteSinkPtr putIfAbsentStream(const String & key, const ObjectMeta & meta) = 0;
+    WriteSinkPtr putIfAbsentStream(const String & key) { return putIfAbsentStream(key, {}); }
 
     /// Replaces the current object only when its token equals `expected`. A mismatch leaves the
     /// object unchanged and returns `PreconditionFailed`; the returned token is meaningful only on
     /// `Done`.
     virtual PutResult putOverwrite(const String & key, const String & bytes, const Token & expected,
-                                   const ObjectMeta & meta = {}) = 0;
+                                   const ObjectMeta & meta) = 0;
+    PutResult putOverwrite(const String & key, const String & bytes, const Token & expected)
+    {
+        return putOverwrite(key, bytes, expected, {});
+    }
     /// expected == nullopt => create-if-absent CAS (the first write of a root manifest).
     /// A non-null expected token conditionally replaces that exact current incarnation. Conflicts
     /// leave the object unchanged and are returned as an outcome rather than an exception.
     virtual CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected,
-                             const ObjectMeta & meta = {}) = 0;
+                             const ObjectMeta & meta) = 0;
+    CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected)
+    {
+        return casPut(key, bytes, expected, {});
+    }
 
     /// Deletes only the current incarnation identified by `token`. A token mismatch must leave the
     /// object untouched; the result distinguishes that case from an already absent key.

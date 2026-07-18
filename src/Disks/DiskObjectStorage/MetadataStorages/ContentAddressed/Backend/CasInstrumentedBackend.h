@@ -77,6 +77,15 @@ void incrementCasEvent(CasNs ns, CasOp op);
 class InstrumentedBackend final : public Backend
 {
 public:
+    /// Unhide the base convenience overloads (omitted Range/ObjectMeta/expected-token forms): the
+    /// overrides below would otherwise shadow them for callers holding a concrete backend type.
+    using Backend::get;
+    using Backend::getStream;
+    using Backend::putIfAbsent;
+    using Backend::putIfAbsentStream;
+    using Backend::putOverwrite;
+    using Backend::casPut;
+
     explicit InstrumentedBackend(BackendPtr inner_) : inner(std::move(inner_)) {}
 
     /// Capability checks are deliberately uninstrumented: they do not represent storage operations.
@@ -85,7 +94,7 @@ public:
 
     /// Delegate the read and count it after the inner call succeeds or returns absent. Exceptions
     /// propagate unchanged and therefore do not produce a separate outcome event.
-    std::optional<GetResult> get(const String & key, Range range = {}) override
+    std::optional<GetResult> get(const String & key, Range range) override
     {
         auto result = inner->get(key, range);
         incrementCasEvent(classifyCasNs(key), CasOp::Get);
@@ -93,7 +102,7 @@ public:
     }
 
     /// Delegate a forward-only read stream and count the request after the stream is acquired.
-    std::optional<GetStreamResult> getStream(const String & key, Range range = {}) override
+    std::optional<GetStreamResult> getStream(const String & key, Range range) override
     {
         auto result = inner->getStream(key, range);
         incrementCasEvent(classifyCasNs(key), CasOp::GetStream);
@@ -109,7 +118,7 @@ public:
     }
 
     /// Count a successful create as `Put` and an existing-key precondition result as `PutDedup`.
-    PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta = {}) override
+    PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta) override
     {
         PutResult result = inner->putIfAbsent(key, bytes, meta);
         incrementCasEvent(classifyCasNs(key), result.outcome == PutOutcome::Done ? CasOp::Put : CasOp::PutDedup);
@@ -117,12 +126,12 @@ public:
     }
 
     /// Return a sink that records the create outcome when its `finalize` is called.
-    WriteSinkPtr putIfAbsentStream(const String & key, const ObjectMeta & meta = {}) override;
+    WriteSinkPtr putIfAbsentStream(const String & key, const ObjectMeta & meta) override;
 
     /// Count a successful token-conditional overwrite as `Overwrite`; a precondition conflict is
     /// counted as `CasConflict`.
     PutResult putOverwrite(const String & key, const String & bytes, const Token & expected,
-                           const ObjectMeta & meta = {}) override
+                           const ObjectMeta & meta) override
     {
         PutResult result = inner->putOverwrite(key, bytes, expected, meta);
         incrementCasEvent(classifyCasNs(key), result.outcome == PutOutcome::Done ? CasOp::Overwrite : CasOp::CasConflict);
@@ -131,7 +140,7 @@ public:
 
     /// Count a committed compare-and-swap as `Cas`; conflicts are counted as `CasConflict`.
     CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected,
-                     const ObjectMeta & meta = {}) override
+                     const ObjectMeta & meta) override
     {
         CasResult result = inner->casPut(key, bytes, expected, meta);
         incrementCasEvent(classifyCasNs(key), result.outcome == CasOutcome::Committed ? CasOp::Cas : CasOp::CasConflict);

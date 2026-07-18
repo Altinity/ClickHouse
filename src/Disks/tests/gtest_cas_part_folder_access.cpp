@@ -75,25 +75,25 @@ class RollbackFaultBackend final : public Cas::InMemoryBackend
 public:
     std::atomic<bool> armed{false};
 
-    Cas::PutResult putIfAbsent(const String & k, const String & b, const Cas::ObjectMeta & m = {}) override
+    Cas::PutResult putIfAbsent(const String & k, const String & b, const Cas::ObjectMeta & m) override
     {
         failIfArmed();
         return InMemoryBackend::putIfAbsent(k, b, m);
     }
 
-    Cas::WriteSinkPtr putIfAbsentStream(const String & k, const Cas::ObjectMeta & m = {}) override
+    Cas::WriteSinkPtr putIfAbsentStream(const String & k, const Cas::ObjectMeta & m) override
     {
         failIfArmed();
         return InMemoryBackend::putIfAbsentStream(k, m);
     }
 
-    Cas::PutResult putOverwrite(const String & k, const String & b, const Cas::Token & e, const Cas::ObjectMeta & m = {}) override
+    Cas::PutResult putOverwrite(const String & k, const String & b, const Cas::Token & e, const Cas::ObjectMeta & m) override
     {
         failIfArmed();
         return InMemoryBackend::putOverwrite(k, b, e, m);
     }
 
-    Cas::CasResult casPut(const String & k, const String & b, const std::optional<Cas::Token> & e, const Cas::ObjectMeta & m = {}) override
+    Cas::CasResult casPut(const String & k, const String & b, const std::optional<Cas::Token> & e, const Cas::ObjectMeta & m) override
     {
         failIfArmed();
         return InMemoryBackend::casPut(k, b, e, m);

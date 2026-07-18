@@ -299,7 +299,7 @@ public:
         get_override_value = std::move(value);
     }
 
-    PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta = {}) override
+    PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta) override
     {
         ++put_attempts;
         if (put_thrower)
@@ -309,7 +309,7 @@ public:
         return InMemoryBackend::putIfAbsent(key, bytes, meta);
     }
 
-    std::optional<GetResult> get(const String & key, Range range = {}) override
+    std::optional<GetResult> get(const String & key, Range range) override
     {
         if (get_overridden)
             return get_override_value;

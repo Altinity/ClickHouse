@@ -92,7 +92,7 @@ class DeposeRoundCommitBackend : public InMemoryBackend
 {
 public:
     CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected,
-                     const ObjectMeta & meta = {}) override
+                     const ObjectMeta & meta) override
     {
         if (arm && key == "p/gc/state")
         {

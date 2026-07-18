@@ -161,7 +161,7 @@ public:
         return InMemoryBackend::list(prefix, cursor, limit);
     }
 
-    std::optional<GetResult> get(const String & key, Range range = {}) override
+    std::optional<GetResult> get(const String & key, Range range) override
     {
         if (arm)
             throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS, "injected backend get failure");

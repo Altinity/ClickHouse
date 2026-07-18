@@ -26,15 +26,24 @@ class InMemoryBackend : public Backend
 public:
     InMemoryBackend() = default;
 
+    /// Unhide the base convenience overloads (omitted Range/ObjectMeta/expected-token forms): the
+    /// overrides below would otherwise shadow them for callers holding a concrete backend type.
+    using Backend::get;
+    using Backend::getStream;
+    using Backend::putIfAbsent;
+    using Backend::putIfAbsentStream;
+    using Backend::putOverwrite;
+    using Backend::casPut;
+
     // ---- Backend interface ----
 
     /// Returns the requested byte window, current token, and metadata, or `nullopt` when the key is absent.
-    std::optional<GetResult> get(const String & key, Range range = {}) override;
+    std::optional<GetResult> get(const String & key, Range range) override;
 
     /// Returns a forward-only stream over the requested byte window, or `nullopt` when the key is absent.
     /// The in-memory implementation copies the window into an owning read buffer while holding the
     /// backend lock, so the returned stream remains independent of later backend mutations.
-    std::optional<GetStreamResult> getStream(const String & key, Range range = {}) override;
+    std::optional<GetStreamResult> getStream(const String & key, Range range) override;
 
     /// Returns the current existence, size, token, and metadata without materializing the body.
     HeadResult head(const String & key) override;
@@ -44,22 +53,22 @@ public:
 
     /// Creates `key` only when it is absent. On success stores `bytes` and `meta` under a new token;
     /// on a precondition failure leaves the existing object untouched.
-    PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta = {}) override;
+    PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta) override;
 
     /// Returns a single-use sink whose finalized body is published with the same atomic conditional
     /// create semantics as `putIfAbsent`. Cancelling or destroying the sink before finalization does
     /// not publish anything.
-    WriteSinkPtr putIfAbsentStream(const String & key, const ObjectMeta & meta = {}) override;
+    WriteSinkPtr putIfAbsentStream(const String & key, const ObjectMeta & meta) override;
 
     /// Replaces the existing object only when `expected` is its current token. Token enforcement can
     /// be disabled with `setEnforceTokens` to model a backend that incorrectly ignores this condition.
     PutResult putOverwrite(const String & key, const String & bytes, const Token & expected,
-                           const ObjectMeta & meta = {}) override;
+                           const ObjectMeta & meta) override;
 
     /// Performs create-if-absent when `expected` is empty, or replace-if-current-token otherwise.
     /// Conflicts leave the store unchanged and are returned as an outcome rather than an exception.
     CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected,
-                     const ObjectMeta & meta = {}) override;
+                     const ObjectMeta & meta) override;
 
     /// Removes exactly the incarnation named by `token`, or queues that token check for a later
     /// `landPendingDelete` when delete holding is enabled. A queued delete is reported as accepted,

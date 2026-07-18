@@ -88,7 +88,7 @@ public:
     explicit InterruptRoundCasBackend(String gc_state_key_) : gc_state_key(std::move(gc_state_key_)) {}
 
     CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected,
-                     const ObjectMeta & meta = {}) override
+                     const ObjectMeta & meta) override
     {
         if (arm_interrupt && key == gc_state_key)
         {

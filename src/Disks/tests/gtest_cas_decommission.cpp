@@ -37,6 +37,8 @@ PoolPtr openVictim(std::shared_ptr<InMemoryBackend> backend)
 class FailingDeleteBackend : public InMemoryBackend
 {
 public:
+    using InMemoryBackend::get;
+
     void failWithThrow(const String & key) { throw_key = key; }
     void failWithTokenMismatch(const String & key) { mismatch_key = key; }
     void failNamespaceReads(const String & ns_substring) { unreadable_ns_substring = ns_substring; }
@@ -52,7 +54,7 @@ public:
         return InMemoryBackend::deleteExact(key, token);
     }
 
-    std::optional<GetResult> get(const String & key, Range range = {}) override
+    std::optional<GetResult> get(const String & key, Range range) override
     {
         maybeFailUnreadable(key);
         return InMemoryBackend::get(key, range);
@@ -411,6 +413,13 @@ TEST(CasDecommission, RemovesSlotAndMakesRerunUnknown)
 class FailDeletesUnderPrefixBackend : public Backend
 {
 public:
+    using Backend::get;
+    using Backend::getStream;
+    using Backend::putIfAbsent;
+    using Backend::putIfAbsentStream;
+    using Backend::putOverwrite;
+    using Backend::casPut;
+
     FailDeletesUnderPrefixBackend(std::shared_ptr<InMemoryBackend> inner_, String fail_prefix_)
         : inner(std::move(inner_)), fail_prefix(std::move(fail_prefix_))
     {
@@ -418,22 +427,22 @@ public:
 
     void disarm() { armed = false; }
 
-    std::optional<GetResult> get(const String & key, Range range = {}) override { return inner->get(key, range); }
-    std::optional<GetStreamResult> getStream(const String & key, Range range = {}) override { return inner->getStream(key, range); }
+    std::optional<GetResult> get(const String & key, Range range) override { return inner->get(key, range); }
+    std::optional<GetStreamResult> getStream(const String & key, Range range) override { return inner->getStream(key, range); }
     HeadResult head(const String & key) override { return inner->head(key); }
-    PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta = {}) override
+    PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta) override
     {
         return inner->putIfAbsent(key, bytes, meta);
     }
-    WriteSinkPtr putIfAbsentStream(const String & key, const ObjectMeta & meta = {}) override
+    WriteSinkPtr putIfAbsentStream(const String & key, const ObjectMeta & meta) override
     {
         return inner->putIfAbsentStream(key, meta);
     }
-    PutResult putOverwrite(const String & key, const String & bytes, const Token & expected, const ObjectMeta & meta = {}) override
+    PutResult putOverwrite(const String & key, const String & bytes, const Token & expected, const ObjectMeta & meta) override
     {
         return inner->putOverwrite(key, bytes, expected, meta);
     }
-    CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected, const ObjectMeta & meta = {}) override
+    CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected, const ObjectMeta & meta) override
     {
         return inner->casPut(key, bytes, expected, meta);
     }

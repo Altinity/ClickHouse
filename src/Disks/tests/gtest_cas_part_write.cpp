@@ -135,13 +135,13 @@ public:
         return hr;
     }
 
-    std::optional<DB::Cas::GetResult> get(const String & k, DB::Cas::Range r = {}) override { return inner->get(k, r); }
-    std::optional<DB::Cas::GetStreamResult> getStream(const String & k, DB::Cas::Range r = {}) override { return inner->getStream(k, r); }
+    std::optional<DB::Cas::GetResult> get(const String & k, DB::Cas::Range r) override { return inner->get(k, r); }
+    std::optional<DB::Cas::GetStreamResult> getStream(const String & k, DB::Cas::Range r) override { return inner->getStream(k, r); }
     DB::Cas::ListPage list(const String & p, const String & c, size_t l) override { return inner->list(p, c, l); }
-    DB::Cas::PutResult putIfAbsent(const String & k, const String & b, const DB::Cas::ObjectMeta & meta = {}) override { return inner->putIfAbsent(k, b, meta); }
-    DB::Cas::WriteSinkPtr putIfAbsentStream(const String & k, const DB::Cas::ObjectMeta & meta = {}) override { return inner->putIfAbsentStream(k, meta); }
-    DB::Cas::PutResult putOverwrite(const String & k, const String & b, const DB::Cas::Token & e, const DB::Cas::ObjectMeta & meta = {}) override { return inner->putOverwrite(k, b, e, meta); }
-    DB::Cas::CasResult casPut(const String & k, const String & b, const std::optional<DB::Cas::Token> & e, const DB::Cas::ObjectMeta & meta = {}) override { return inner->casPut(k, b, e, meta); }
+    DB::Cas::PutResult putIfAbsent(const String & k, const String & b, const DB::Cas::ObjectMeta & meta) override { return inner->putIfAbsent(k, b, meta); }
+    DB::Cas::WriteSinkPtr putIfAbsentStream(const String & k, const DB::Cas::ObjectMeta & meta) override { return inner->putIfAbsentStream(k, meta); }
+    DB::Cas::PutResult putOverwrite(const String & k, const String & b, const DB::Cas::Token & e, const DB::Cas::ObjectMeta & meta) override { return inner->putOverwrite(k, b, e, meta); }
+    DB::Cas::CasResult casPut(const String & k, const String & b, const std::optional<DB::Cas::Token> & e, const DB::Cas::ObjectMeta & meta) override { return inner->casPut(k, b, e, meta); }
     DB::Cas::DeleteOutcome deleteExact(const String & k, const DB::Cas::Token & t) override { return inner->deleteExact(k, t); }
     bool supportsListTokens() const override { return inner->supportsListTokens(); }
 
@@ -164,13 +164,13 @@ public:
     size_t getCountFor(const String & k) const { auto it = get_counts.find(k); return it == get_counts.end() ? 0 : it->second; }
 
     DB::Cas::HeadResult head(const String & k) override { ++head_counts[k]; return inner->head(k); }
-    std::optional<DB::Cas::GetResult> get(const String & k, DB::Cas::Range r = {}) override { ++get_counts[k]; return inner->get(k, r); }
-    std::optional<DB::Cas::GetStreamResult> getStream(const String & k, DB::Cas::Range r = {}) override { return inner->getStream(k, r); }
+    std::optional<DB::Cas::GetResult> get(const String & k, DB::Cas::Range r) override { ++get_counts[k]; return inner->get(k, r); }
+    std::optional<DB::Cas::GetStreamResult> getStream(const String & k, DB::Cas::Range r) override { return inner->getStream(k, r); }
     DB::Cas::ListPage list(const String & pfx, const String & c, size_t l) override { return inner->list(pfx, c, l); }
-    DB::Cas::PutResult putIfAbsent(const String & k, const String & b, const DB::Cas::ObjectMeta & meta = {}) override { return inner->putIfAbsent(k, b, meta); }
-    DB::Cas::WriteSinkPtr putIfAbsentStream(const String & k, const DB::Cas::ObjectMeta & meta = {}) override { return inner->putIfAbsentStream(k, meta); }
-    DB::Cas::PutResult putOverwrite(const String & k, const String & b, const DB::Cas::Token & e, const DB::Cas::ObjectMeta & meta = {}) override { return inner->putOverwrite(k, b, e, meta); }
-    DB::Cas::CasResult casPut(const String & k, const String & b, const std::optional<DB::Cas::Token> & e, const DB::Cas::ObjectMeta & meta = {}) override { return inner->casPut(k, b, e, meta); }
+    DB::Cas::PutResult putIfAbsent(const String & k, const String & b, const DB::Cas::ObjectMeta & meta) override { return inner->putIfAbsent(k, b, meta); }
+    DB::Cas::WriteSinkPtr putIfAbsentStream(const String & k, const DB::Cas::ObjectMeta & meta) override { return inner->putIfAbsentStream(k, meta); }
+    DB::Cas::PutResult putOverwrite(const String & k, const String & b, const DB::Cas::Token & e, const DB::Cas::ObjectMeta & meta) override { return inner->putOverwrite(k, b, e, meta); }
+    DB::Cas::CasResult casPut(const String & k, const String & b, const std::optional<DB::Cas::Token> & e, const DB::Cas::ObjectMeta & meta) override { return inner->casPut(k, b, e, meta); }
     DB::Cas::DeleteOutcome deleteExact(const String & k, const DB::Cas::Token & t) override { return inner->deleteExact(k, t); }
     bool supportsListTokens() const override { return inner->supportsListTokens(); }
 
@@ -627,18 +627,18 @@ TEST(CasPartWriteTxn, PutBlobCondemnedDedupNeverGetsTheDyingObject)
         size_t get_count = 0;
 
         DB::Cas::HeadResult head(const String & k) override { return inner->head(k); }
-        std::optional<DB::Cas::GetResult> get(const String & k, DB::Cas::Range r = {}) override
+        std::optional<DB::Cas::GetResult> get(const String & k, DB::Cas::Range r) override
         {
             if (k == watched_key)
                 ++get_count;
             return inner->get(k, r);
         }
-        std::optional<DB::Cas::GetStreamResult> getStream(const String & k, DB::Cas::Range r = {}) override { return inner->getStream(k, r); }
+        std::optional<DB::Cas::GetStreamResult> getStream(const String & k, DB::Cas::Range r) override { return inner->getStream(k, r); }
         DB::Cas::ListPage list(const String & p, const String & c, size_t l) override { return inner->list(p, c, l); }
-        DB::Cas::PutResult putIfAbsent(const String & k, const String & bts, const DB::Cas::ObjectMeta & m = {}) override { return inner->putIfAbsent(k, bts, m); }
-        DB::Cas::WriteSinkPtr putIfAbsentStream(const String & k, const DB::Cas::ObjectMeta & m = {}) override { return inner->putIfAbsentStream(k, m); }
-        DB::Cas::PutResult putOverwrite(const String & k, const String & bts, const DB::Cas::Token & e, const DB::Cas::ObjectMeta & m = {}) override { return inner->putOverwrite(k, bts, e, m); }
-        DB::Cas::CasResult casPut(const String & k, const String & bts, const std::optional<DB::Cas::Token> & e, const DB::Cas::ObjectMeta & m = {}) override { return inner->casPut(k, bts, e, m); }
+        DB::Cas::PutResult putIfAbsent(const String & k, const String & bts, const DB::Cas::ObjectMeta & m) override { return inner->putIfAbsent(k, bts, m); }
+        DB::Cas::WriteSinkPtr putIfAbsentStream(const String & k, const DB::Cas::ObjectMeta & m) override { return inner->putIfAbsentStream(k, m); }
+        DB::Cas::PutResult putOverwrite(const String & k, const String & bts, const DB::Cas::Token & e, const DB::Cas::ObjectMeta & m) override { return inner->putOverwrite(k, bts, e, m); }
+        DB::Cas::CasResult casPut(const String & k, const String & bts, const std::optional<DB::Cas::Token> & e, const DB::Cas::ObjectMeta & m) override { return inner->casPut(k, bts, e, m); }
         DB::Cas::DeleteOutcome deleteExact(const String & k, const DB::Cas::Token & tok) override { return inner->deleteExact(k, tok); }
         bool supportsListTokens() const override { return inner->supportsListTokens(); }
     private:
@@ -700,18 +700,18 @@ TEST(CasPartWriteTxn, PutBlobCondemnedDedupPresentNeverGetsTheDyingObject)
         size_t get_count = 0;
 
         DB::Cas::HeadResult head(const String & k) override { return inner->head(k); }
-        std::optional<DB::Cas::GetResult> get(const String & k, DB::Cas::Range r = {}) override
+        std::optional<DB::Cas::GetResult> get(const String & k, DB::Cas::Range r) override
         {
             if (k == watched_key)
                 ++get_count;
             return inner->get(k, r);
         }
-        std::optional<DB::Cas::GetStreamResult> getStream(const String & k, DB::Cas::Range r = {}) override { return inner->getStream(k, r); }
+        std::optional<DB::Cas::GetStreamResult> getStream(const String & k, DB::Cas::Range r) override { return inner->getStream(k, r); }
         DB::Cas::ListPage list(const String & p, const String & c, size_t l) override { return inner->list(p, c, l); }
-        DB::Cas::PutResult putIfAbsent(const String & k, const String & bts, const DB::Cas::ObjectMeta & m = {}) override { return inner->putIfAbsent(k, bts, m); }
-        DB::Cas::WriteSinkPtr putIfAbsentStream(const String & k, const DB::Cas::ObjectMeta & m = {}) override { return inner->putIfAbsentStream(k, m); }
-        DB::Cas::PutResult putOverwrite(const String & k, const String & bts, const DB::Cas::Token & e, const DB::Cas::ObjectMeta & m = {}) override { return inner->putOverwrite(k, bts, e, m); }
-        DB::Cas::CasResult casPut(const String & k, const String & bts, const std::optional<DB::Cas::Token> & e, const DB::Cas::ObjectMeta & m = {}) override { return inner->casPut(k, bts, e, m); }
+        DB::Cas::PutResult putIfAbsent(const String & k, const String & bts, const DB::Cas::ObjectMeta & m) override { return inner->putIfAbsent(k, bts, m); }
+        DB::Cas::WriteSinkPtr putIfAbsentStream(const String & k, const DB::Cas::ObjectMeta & m) override { return inner->putIfAbsentStream(k, m); }
+        DB::Cas::PutResult putOverwrite(const String & k, const String & bts, const DB::Cas::Token & e, const DB::Cas::ObjectMeta & m) override { return inner->putOverwrite(k, bts, e, m); }
+        DB::Cas::CasResult casPut(const String & k, const String & bts, const std::optional<DB::Cas::Token> & e, const DB::Cas::ObjectMeta & m) override { return inner->casPut(k, bts, e, m); }
         DB::Cas::DeleteOutcome deleteExact(const String & k, const DB::Cas::Token & tok) override { return inner->deleteExact(k, tok); }
         bool supportsListTokens() const override { return inner->supportsListTokens(); }
     private:
@@ -805,19 +805,19 @@ TEST(CasPartWriteTxn, PutBlobVanishDuringRevivalReUploadsNotFatal)
             }
             return inner->head(k);
         }
-        DB::Cas::WriteSinkPtr putIfAbsentStream(const String & k, const DB::Cas::ObjectMeta & meta = {}) override
+        DB::Cas::WriteSinkPtr putIfAbsentStream(const String & k, const DB::Cas::ObjectMeta & meta) override
         {
             const bool force_412 = (k == watched_key && finalize_412_budget > 0);
             if (force_412)
                 --finalize_412_budget;
             return std::make_unique<ScriptedSink>(inner->putIfAbsentStream(k, meta), force_412);
         }
-        std::optional<DB::Cas::GetResult> get(const String & k, DB::Cas::Range r = {}) override { return inner->get(k, r); }
-        std::optional<DB::Cas::GetStreamResult> getStream(const String & k, DB::Cas::Range r = {}) override { return inner->getStream(k, r); }
+        std::optional<DB::Cas::GetResult> get(const String & k, DB::Cas::Range r) override { return inner->get(k, r); }
+        std::optional<DB::Cas::GetStreamResult> getStream(const String & k, DB::Cas::Range r) override { return inner->getStream(k, r); }
         DB::Cas::ListPage list(const String & p, const String & c, size_t l) override { return inner->list(p, c, l); }
-        DB::Cas::PutResult putIfAbsent(const String & k, const String & bts, const DB::Cas::ObjectMeta & m = {}) override { return inner->putIfAbsent(k, bts, m); }
-        DB::Cas::PutResult putOverwrite(const String & k, const String & bts, const DB::Cas::Token & e, const DB::Cas::ObjectMeta & m = {}) override { return inner->putOverwrite(k, bts, e, m); }
-        DB::Cas::CasResult casPut(const String & k, const String & bts, const std::optional<DB::Cas::Token> & e, const DB::Cas::ObjectMeta & m = {}) override { return inner->casPut(k, bts, e, m); }
+        DB::Cas::PutResult putIfAbsent(const String & k, const String & bts, const DB::Cas::ObjectMeta & m) override { return inner->putIfAbsent(k, bts, m); }
+        DB::Cas::PutResult putOverwrite(const String & k, const String & bts, const DB::Cas::Token & e, const DB::Cas::ObjectMeta & m) override { return inner->putOverwrite(k, bts, e, m); }
+        DB::Cas::CasResult casPut(const String & k, const String & bts, const std::optional<DB::Cas::Token> & e, const DB::Cas::ObjectMeta & m) override { return inner->casPut(k, bts, e, m); }
         DB::Cas::DeleteOutcome deleteExact(const String & k, const DB::Cas::Token & t) override { return inner->deleteExact(k, t); }
         bool supportsListTokens() const override { return inner->supportsListTokens(); }
 
@@ -1221,17 +1221,17 @@ TEST(CasPartWriteTxn, AdoptEvidenceNoBackendOp)
         size_t gets = 0;
 
         HeadResult head(const String & k) override { ++heads; return inner->head(k); }
-        WriteSinkPtr putIfAbsentStream(const String & k, const ObjectMeta & meta = {}) override
+        WriteSinkPtr putIfAbsentStream(const String & k, const ObjectMeta & meta) override
         {
             ++stream_puts;
             return inner->putIfAbsentStream(k, meta);
         }
-        std::optional<GetResult> get(const String & k, Range r = {}) override { ++gets; return inner->get(k, r); }
-        std::optional<GetStreamResult> getStream(const String & k, Range r = {}) override { return inner->getStream(k, r); }
+        std::optional<GetResult> get(const String & k, Range r) override { ++gets; return inner->get(k, r); }
+        std::optional<GetStreamResult> getStream(const String & k, Range r) override { return inner->getStream(k, r); }
         ListPage list(const String & p, const String & c, size_t l) override { return inner->list(p, c, l); }
-        PutResult putIfAbsent(const String & k, const String & bts, const ObjectMeta & m = {}) override { return inner->putIfAbsent(k, bts, m); }
-        PutResult putOverwrite(const String & k, const String & bts, const Token & e, const ObjectMeta & m = {}) override { return inner->putOverwrite(k, bts, e, m); }
-        CasResult casPut(const String & k, const String & bts, const std::optional<Token> & e, const ObjectMeta & m = {}) override { return inner->casPut(k, bts, e, m); }
+        PutResult putIfAbsent(const String & k, const String & bts, const ObjectMeta & m) override { return inner->putIfAbsent(k, bts, m); }
+        PutResult putOverwrite(const String & k, const String & bts, const Token & e, const ObjectMeta & m) override { return inner->putOverwrite(k, bts, e, m); }
+        CasResult casPut(const String & k, const String & bts, const std::optional<Token> & e, const ObjectMeta & m) override { return inner->casPut(k, bts, e, m); }
         DeleteOutcome deleteExact(const String & k, const Token & t) override { return inner->deleteExact(k, t); }
         bool supportsListTokens() const override { return inner->supportsListTokens(); }
     private:
@@ -1798,7 +1798,7 @@ public:
     String plant_different_on_fault;     /// a FOREIGN different body lands at the key before the fault
     int put_attempts = 0;                /// matching body-PUT attempts observed (both primitives)
 
-    PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta = {}) override
+    PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta) override
     {
         if (!isManifestBodyKey(key))
             return InMemoryBackend::putIfAbsent(key, bytes, meta);
@@ -1807,7 +1807,7 @@ public:
         return InMemoryBackend::putIfAbsent(key, bytes, meta);
     }
 
-    WriteSinkPtr putIfAbsentStream(const String & key, const ObjectMeta & meta = {}) override
+    WriteSinkPtr putIfAbsentStream(const String & key, const ObjectMeta & meta) override
     {
         if (!isManifestBodyKey(key))
             return InMemoryBackend::putIfAbsentStream(key, meta);
@@ -1846,9 +1846,9 @@ private:
             return;
         --fault_count;
         if (!plant_different_on_fault.empty())
-            InMemoryBackend::putIfAbsent(key, plant_different_on_fault);
+            InMemoryBackend::putIfAbsent(key, plant_different_on_fault, {});
         else if (land_despite_fault)
-            InMemoryBackend::putIfAbsent(key, bytes);
+            InMemoryBackend::putIfAbsent(key, bytes, {});
         throw Poco::TimeoutException("ManifestPutFaultBackend: simulated ambiguous result (response lost)");
     }
 };
@@ -1976,7 +1976,7 @@ public:
     int stream_attempts = 0;             /// blob-body streaming-PUT finalize attempts observed
     int copy_attempts = 0;               /// promoteStaged conditional-copy attempts observed
 
-    WriteSinkPtr putIfAbsentStream(const String & key, const ObjectMeta & meta = {}) override
+    WriteSinkPtr putIfAbsentStream(const String & key, const ObjectMeta & meta) override
     {
         if (!isBlobBodyKey(key))
             return InMemoryBackend::putIfAbsentStream(key, meta);
@@ -2031,7 +2031,7 @@ private:
             return;
         --fault_count;
         if (land_despite_fault)
-            InMemoryBackend::putIfAbsent(key, bytes);
+            InMemoryBackend::putIfAbsent(key, bytes, {});
         throw Poco::TimeoutException("BlobPutFaultBackend: simulated ambiguous result (response lost)");
     }
 };
