@@ -145,10 +145,14 @@ class S36(Scenario):
         "dev": {"partitions": 3, "parts_per_partition": 2, "rows_per_part": 300, "payload_bytes": 1024,
                 "chaos_rows": 300, "chaos_payload_bytes": 65536, "kill_delay_s": 0.4, "down_s": 3,
                 "heal_timeout_s": 240},
-        "ci": {"partitions": 6, "parts_per_partition": 3, "rows_per_part": 3000, "payload_bytes": 2048,
+        # Prefill parts MUST stay under the hot volume's max_data_part_size_bytes = 4 MiB or routing
+        # (correctly) sends them straight to `ca` and the "lands on local1" check fails (2026-07-18
+        # S36/S37 RCA: the old ci row's 3000x2048 = 5.86 MiB/part did exactly that). Scale part
+        # COUNT (partitions/parts_per_partition), never per-part bytes, past that cap.
+        "ci": {"partitions": 6, "parts_per_partition": 3, "rows_per_part": 3000, "payload_bytes": 1024,
                "chaos_rows": 600, "chaos_payload_bytes": 131072, "kill_delay_s": 0.6, "down_s": 4,
                "heal_timeout_s": 300},
-        "full": {"partitions": 10, "parts_per_partition": 4, "rows_per_part": 20000, "payload_bytes": 4096,
+        "full": {"partitions": 10, "parts_per_partition": 4, "rows_per_part": 2500, "payload_bytes": 1024,
                  "chaos_rows": 1200, "chaos_payload_bytes": 524288, "kill_delay_s": 1.0, "down_s": 6,
                  "heal_timeout_s": 360},
     }
@@ -477,14 +481,16 @@ class S37(Scenario):
             "small_rows": 1000, "small_payload_bytes": 2048,
             "big_rows": 80, "big_payload_bytes": 262144,       # ~20 MiB
             "ttl_rows": 1000, "ttl_payload_bytes": 2048,
-            "mixed_parts": 6, "mixed_rows": 120, "mixed_payload_bytes": 131072,
+            # mixed (leg-4) parts must stay UNDER the 4 MiB hot-volume cap to land on local1/local2
+            # (2026-07-18 RCA: 120x131072 = 15 MiB/part routed all of them to `ca`). Scale count.
+            "mixed_parts": 6, "mixed_rows": 48, "mixed_payload_bytes": 65536,
             "restart_timeout_s": 300, "kill_delay_s": 0.6, "down_s": 4,
         },
         "full": {
             "small_rows": 10000, "small_payload_bytes": 4096,
             "big_rows": 200, "big_payload_bytes": 524288,      # ~100 MiB
             "ttl_rows": 10000, "ttl_payload_bytes": 4096,
-            "mixed_parts": 10, "mixed_rows": 400, "mixed_payload_bytes": 262144,
+            "mixed_parts": 10, "mixed_rows": 56, "mixed_payload_bytes": 65536,
             "restart_timeout_s": 420, "kill_delay_s": 1.0, "down_s": 6,
         },
     }
