@@ -371,7 +371,8 @@ inline void injectRetire(
         std::vector<DB::Cas::RunRef> out;
         DB::Cas::foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{}, generation, attempt,
             shard, std::move(synth), out, /*current_round*/0, condemn_round, seed_head,
-            /*peek_head*/{}, /*out_retired*/nullptr, /*suppress_destructive*/false);
+            /*peek_head*/{}, /*confirm_condemned_marker*/{},
+            /*out_retired*/nullptr, /*suppress_destructive*/false);
 
         DB::Cas::CasFoldSeal seal;
         seal.generation = generation;
@@ -503,7 +504,8 @@ inline std::vector<DB::Cas::RetiredEntry> currentRetiredSet(
                 .token = row.token,
                 .size = row.size,
                 .condemn_round = row.condemn_round,
-                .delete_pending = row.delete_pending});
+                .delete_pending = row.delete_pending,
+                .marker_confirmed = row.marker_confirmed});
         }
     }
     return out;
@@ -960,6 +962,26 @@ private:
     uint64_t put_total = 0;
     uint64_t get_stream_total = 0;
     uint64_t list_total = 0;
+};
+
+/// Fault decorator for the condemn-marker gate tests (codex-review triage 2026-07-17 §3.4): while
+/// armed, any `casPut` against a blob `.meta` key throws — exactly the failure `Gc::scheduleMetaJob`
+/// swallows, so the condemn-marker write is LOST while the round commits the retired entry regardless.
+/// Every other write passes through. Armed by default; disarm (`fail_meta_writes = false`) to model the
+/// backend healing.
+class MetaWriteFaultBackend : public DB::Cas::InMemoryBackend
+{
+public:
+    DB::Cas::CasResult casPut(const String & key, const String & bytes,
+                              const std::optional<DB::Cas::Token> & expected,
+                              const DB::Cas::ObjectMeta & meta = {}) override
+    {
+        if (fail_meta_writes.load() && key.ends_with(".meta"))
+            throw std::runtime_error("injected fault: blob meta write lost");
+        return InMemoryBackend::casPut(key, bytes, expected, meta);
+    }
+
+    std::atomic<bool> fail_meta_writes{true};
 };
 
 }

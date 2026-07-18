@@ -184,7 +184,7 @@ String encodeCondemnedRow(const CondemnedRow & row)
 {
     String out;
     out.push_back(kCondemned);
-    out.push_back(static_cast<char>(row.delete_pending ? 1 : 0));
+    out.push_back(static_cast<char>((row.delete_pending ? 1 : 0) | (row.marker_confirmed ? 2 : 0)));
     out.push_back(static_cast<char>(row.token.type));
     auto beU64 = [&](uint64_t v) { for (int i = 7; i >= 0; --i) out += static_cast<char>((v >> (8 * i)) & 0xFF); };
     beU64(row.condemn_round);
@@ -205,9 +205,10 @@ CondemnedRow decodeCondemnedRow(std::string_view p)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS condemned row: malformed header");
     CondemnedRow row;
     const uint8_t flags = static_cast<uint8_t>(p[1]);
-    if (flags > 1)
+    if (flags > 3)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS condemned row: unknown flags 0x{:02x}", flags);
     row.delete_pending = flags & 1;
+    row.marker_confirmed = flags & 2;
     const uint8_t type = static_cast<uint8_t>(p[2]);
     if (type < 1 || type > 3)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS condemned row: unknown token_type {}", type);
@@ -246,7 +247,8 @@ bool SourceEdgeRunView::next(String & key, String & payload)
         case kCondemned:
             payload = encodeCondemnedRow(CondemnedRow{.delete_pending = rec.delete_pending,
                                                       .token = rec.token, .size = rec.size,
-                                                      .condemn_round = rec.condemn_round});
+                                                      .condemn_round = rec.condemn_round,
+                                                      .marker_confirmed = rec.marker_confirmed});
             break;
         default:
             throw Exception(ErrorCodes::CORRUPTED_DATA,
@@ -349,6 +351,7 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
                               uint64_t current_round, uint64_t condemn_round,
                               const std::function<std::optional<HeadResult>(const BlobRef &)> & head_blob,
                               const std::function<std::optional<HeadResult>(const BlobRef &)> & peek_head,
+                              const std::function<bool(const RetiredEntry &)> & confirm_condemned_marker,
                               RetiredMergeResult * out_retired,
                               bool suppress_destructive)
 {
@@ -396,6 +399,7 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
         e.size = r.size;
         e.condemn_round = r.condemn_round;
         e.delete_pending = r.delete_pending;
+        e.marker_confirmed = r.marker_confirmed;
         return e;
     };
     auto settleEntry = [&](const RetiredEntry & e, uint64_t indeg)
@@ -421,10 +425,22 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
         }
         else if (!suppress_destructive && e.condemn_round < current_round)
         {
-            RetiredEntry pending = e;           /// newly floor-passed: publish pending; delete NEXT pass
-            pending.delete_pending = true;
-            rmr.graduated.push_back(pending);
-            rmr.still_retired.push_back(std::move(pending));
+            /// Graduation gate (triage 2026-07-17 §3.4): publishing delete_pending is the one edge that
+            /// authorizes an irreversible delete, and it requires CONFIRMED durable Condemned evidence
+            /// for this exact (hash, token) — the marker is the writer's adopt gate, so an entry whose
+            /// marker write was swallowed could be same-token adopted invisibly to this fold's cut.
+            /// Unconfirmed => carry unchanged (fail-safe delay; the gate callback retries the marker so a
+            /// later pass can confirm). This gates a DELETE on missing evidence; it never throws.
+            if (e.marker_confirmed || !confirm_condemned_marker || confirm_condemned_marker(e))
+            {
+                RetiredEntry pending = e;       /// newly floor-passed: publish pending; delete NEXT pass
+                pending.delete_pending = true;
+                pending.marker_confirmed = true;
+                rmr.graduated.push_back(pending);
+                rmr.still_retired.push_back(std::move(pending));
+            }
+            else
+                rmr.still_retired.push_back(e); /// no durable condemn-marker evidence yet — carried
         }
         else
             rmr.still_retired.push_back(e);     /// carried unchanged until the floor passes it
@@ -503,7 +519,8 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
             const RetiredEntry & e = rmr.still_retired.back();
             writer.append(SourceEdgeRecord{.ref = cur_blob, .source_id = kZeroSourceId, .marker = kCondemned,
                                            .delete_pending = e.delete_pending, .token = e.token,
-                                           .size = e.size, .condemn_round = e.condemn_round});
+                                           .size = e.size, .condemn_round = e.condemn_round,
+                                           .marker_confirmed = e.marker_confirmed});
         }
         else if (cur_edges == 0 && cur_touched)
             writer.append(SourceEdgeRecord{.ref = cur_blob, .source_id = kZeroSourceId, .marker = kZeroMarker});

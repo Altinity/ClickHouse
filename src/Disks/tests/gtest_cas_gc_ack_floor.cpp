@@ -17,6 +17,7 @@
 namespace ProfileEvents
 {
 extern const Event CasMetaDelete;
+extern const Event CasGcCondemnMarkerUnconfirmedCarry;
 }
 
 using namespace DB::Cas;
@@ -881,4 +882,105 @@ TEST(CasGcAckFloor, TokenMismatchOnAbsentBlobSettlesAsAbsentAndDropsMeta)
     EXPECT_FALSE(currentEntryFor(*backend, store->layout(), blob).has_value());
     EXPECT_FALSE(loadMetaForTest(*backend, store->layout(), blob).has_value())
         << ".meta cleanup (gated on Deleted/NotFound) must still run on the disambiguated Absent outcome";
+}
+
+/// ---- condemn-marker gate suite (codex-review triage 2026-07-17 §3.4, №4) ----
+///
+/// The per-hash condemn marker is LOAD-BEARING for the delete edge: the writer's adopt gate point-reads
+/// the meta and an ABSENT meta reads as Clean, so a blob whose condemn-marker write was swallowed can be
+/// same-token adopted by a writer landing in the [discovery-LIST, deleteExact] window — invisible to the
+/// graduating fold — and the exact-token redelete then deletes a body under a live committed edge
+/// (dangling manifest). Graduation to `delete_pending` therefore requires CONFIRMED durable `Condemned`
+/// evidence for the entry; absent evidence CARRIES the entry to the next round (fail-safe delay, never a
+/// fail-open delete) and retries the marker so a healed backend restores liveness.
+
+/// A condemned entry whose marker write was swallowed must be CARRIED round after round — never
+/// graduated, never deleted — until durable `Condemned` evidence exists. Once the backend heals, the
+/// carry-time marker retry lands and the normal two-phase pipeline reclaims the blob (delay, not a leak).
+TEST(CasGcCondemnMarker, SwallowedMarkerWriteCarriesEntryInsteadOfDeleting)
+{
+    auto backend = std::make_shared<MetaWriteFaultBackend>();
+    auto store = openPoolForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r = ref("srv-a:1", 1, 0xAA);
+    const UInt128 blob = DB::UInt128(1);
+    writeBlobBody(*backend, store->layout(), blob);
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", blob)});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+    Gc gc(store, kGc);
+
+    gc.runRegularRound();   // +1 folds; blob referenced
+    dropRefTransition(*backend, store->layout(), ns, "tbl", r);
+    gc.runRegularRound();   // the condemning round; the marker write THROWS and is swallowed
+    ASSERT_FALSE(loadMetaForTest(*backend, store->layout(), blob).has_value())
+        << "precondition: the injected fault must have lost the condemn-marker write";
+    ASSERT_TRUE(currentEntryFor(*backend, store->layout(), blob).has_value())
+        << "precondition: the retired entry must have been committed despite the lost marker";
+
+    /// Rounds keep coming while the marker stays unwritable: without durable Condemned evidence the
+    /// entry must be CARRIED — a writer reading the absent meta may have adopted this exact token.
+    const auto carries_before =
+        ProfileEvents::global_counters[ProfileEvents::CasGcCondemnMarkerUnconfirmedCarry].load();
+    for (int i = 0; i < 4; ++i)
+    {
+        gc.runRegularRound();
+        store->renewWatermarkOnce();
+        EXPECT_TRUE(blobExists(*backend, store->layout(), blob))
+            << "round " << i << " after condemn: deleted without a durable condemn marker";
+    }
+    const auto e = currentEntryFor(*backend, store->layout(), blob);
+    ASSERT_TRUE(e.has_value()) << "the entry must remain retired (carried), not dropped";
+    EXPECT_FALSE(e->delete_pending) << "graduation must be refused without a confirmed marker";
+    EXPECT_FALSE(e->marker_confirmed);
+    EXPECT_GE(ProfileEvents::global_counters[ProfileEvents::CasGcCondemnMarkerUnconfirmedCarry].load()
+                  - carries_before, 4u)
+        << "every refused graduation must count one unconfirmed carry";
+
+    /// Heal the backend: the carry-time retry publishes the marker, the entry confirms + graduates, and
+    /// the pipeline reclaims the blob and drops the meta.
+    backend->fail_meta_writes.store(false);
+    EXPECT_TRUE(runRoundsUntilAbsent(store, gc, *backend, store->layout(), blob));
+    EXPECT_FALSE(currentEntryFor(*backend, store->layout(), blob).has_value());
+    EXPECT_FALSE(loadMetaForTest(*backend, store->layout(), blob).has_value());
+}
+
+/// The healthy-path counterpart: with the condemn-time marker write landing normally, the gate must not
+/// change the canonical schedule — condemned at round K, graduated (delete_pending) at K+1, deleted at
+/// K+2 — and the durable Condemned marker exists from the condemning round on.
+TEST(CasGcCondemnMarker, DurableMarkerKeepsCanonicalGraduationSchedule)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r = ref("srv-a:1", 1, 0xAA);
+    const UInt128 blob = DB::UInt128(1);
+    writeBlobBody(*backend, store->layout(), blob);
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", blob)});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+    Gc gc(store, kGc);
+
+    gc.runRegularRound();
+    dropRefTransition(*backend, store->layout(), ns, "tbl", r);
+
+    {
+        const RoundReport rep = gc.runRegularRound();   // condemn round K
+        EXPECT_EQ(rep.condemned, 1u);
+        const auto lm = loadMetaForTest(*backend, store->layout(), blob);
+        ASSERT_TRUE(lm.has_value());
+        EXPECT_EQ(lm->meta.state, MetaState::Condemned);
+    }
+    {
+        const RoundReport rep = gc.runRegularRound();   // K+1: confirmed marker => graduates on schedule
+        EXPECT_EQ(rep.graduated, 1u);
+        const auto e = currentEntryFor(*backend, store->layout(), blob);
+        ASSERT_TRUE(e.has_value());
+        EXPECT_TRUE(e->delete_pending);
+        EXPECT_TRUE(e->marker_confirmed) << "a delete_pending row must carry the confirmation bit";
+        EXPECT_TRUE(blobExists(*backend, store->layout(), blob));
+    }
+    {
+        const RoundReport rep = gc.runRegularRound();   // K+2: the pending delete executes
+        EXPECT_EQ(rep.redeleted, 1u);
+        EXPECT_FALSE(blobExists(*backend, store->layout(), blob));
+    }
 }

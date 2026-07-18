@@ -511,3 +511,72 @@ TEST(CasGcClampSuppression, LandedEdgeBehindClampNeverDeleted)
     dropRefTransition(*backend, store->layout(), ns, "tbl_c", m3, /*shard*/1);
     EXPECT_TRUE(runRoundsUntilAbsent(store, gc, *backend, store->layout(), DB::UInt128(5)));
 }
+
+/// ---- rebuild condemn markers (codex-review triage 2026-07-17 §3.4, №4) ----
+///
+/// The disaster-recovery rebuild used to write NO condemn markers at all, making the swallowed-marker
+/// hazard systematic after a rebuild rather than a race: every `zero_condemned` entry graduated and
+/// redeleted with an absent (= Clean-reading) meta a writer could adopt through. The rebuild must
+/// publish `writeCondemnedMeta` for every zero-edge entry synchronously (it is an offline
+/// administrative path) BEFORE any of them can graduate.
+
+/// After a rebuild, every zero-edge (orphan) entry carries a durable Condemned marker; edge-bearing
+/// blobs get none. The pipeline then reclaims the orphan through the normal confirmed-marker gate.
+TEST(CasGcRebuild, PublishesCondemnMarkersForZeroEdgeBlobs)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef live_r = ref(1, 0xA1);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
+    writeManifestRaw(*backend, store->layout(), ns, live_r, {blobEntryFor("a", DB::UInt128(1))});
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl_live", std::nullopt, live_r);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(2));   /// orphan: present, zero edges
+
+    Gc gc(store, kGc);
+    const RebuildReport rep = gc.rebuildBaseline(/*force*/ true);
+    ASSERT_TRUE(rep.performed) << rep.refusal;
+
+    const auto lm = loadMetaForTest(*backend, store->layout(), DB::UInt128(2));
+    ASSERT_TRUE(lm.has_value())
+        << "rebuild must publish the condemn marker for every zero-edge entry before graduation";
+    EXPECT_EQ(lm->meta.state, MetaState::Condemned);
+    EXPECT_EQ(lm->meta.condemn_round, rep.round);
+    EXPECT_FALSE(loadMetaForTest(*backend, store->layout(), DB::UInt128(1)).has_value())
+        << "an edge-bearing blob must not be marked condemned by the rebuild";
+
+    /// End-to-end: the marked orphan graduates + redeletes through regular rounds; the live blob stays.
+    EXPECT_TRUE(runRoundsUntilAbsent(store, gc, *backend, store->layout(), DB::UInt128(2)));
+    EXPECT_TRUE(backend->head(store->layout().blobKey(
+        BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::UInt128(1))})).exists);
+}
+
+/// A rebuild whose marker writes FAIL still publishes its baseline (per-entry failures never abort the
+/// administrative pass), but the affected entries enter the retired set UNCONFIRMED and are carried —
+/// not deleted — until the backend heals and a carry-time retry lands the marker.
+TEST(CasGcRebuild, SwallowedRebuildMarkerWriteCarriesEntryInsteadOfDeleting)
+{
+    auto backend = std::make_shared<MetaWriteFaultBackend>();
+    auto store = openPoolForTest(backend);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(2));   /// orphan: present, zero edges
+
+    Gc gc(store, kGc);
+    const RebuildReport rep = gc.rebuildBaseline(/*force*/ true);
+    ASSERT_TRUE(rep.performed) << rep.refusal;
+    ASSERT_FALSE(loadMetaForTest(*backend, store->layout(), DB::UInt128(2)).has_value())
+        << "precondition: the injected fault must have lost the rebuild's condemn-marker write";
+
+    /// Regular rounds with the marker still unwritable: the unconfirmed entry is carried, never deleted.
+    for (int i = 0; i < 4; ++i)
+    {
+        gc.runRegularRound();
+        store->renewWatermarkOnce();
+        EXPECT_TRUE(backend->head(store->layout().blobKey(
+            BlobRef{BlobHashAlgo::CityHash128, BlobDigest::fromU128(DB::UInt128(2))})).exists)
+            << "round " << i << " after rebuild: deleted without a durable condemn marker";
+    }
+
+    /// Heal: the carry-time retry publishes the marker and the pipeline reclaims the orphan.
+    backend->fail_meta_writes.store(false);
+    EXPECT_TRUE(runRoundsUntilAbsent(store, gc, *backend, store->layout(), DB::UInt128(2)));
+}

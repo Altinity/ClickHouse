@@ -41,7 +41,7 @@ constexpr char kCondemned  = 0x02;
 /// File shape:
 ///   {"type":"cas_run","v":3,"kind":"source_edge"}                      header line (type + v + kind gate)
 ///   {"b":"01<digest-hex>","s":"<32hex>","m":"edge"}                    an active-edge / zero-marker row
-///   {"b":"01<digest-hex>","s":"00000000000000000000000000000000","m":"condemned","pend":false,"tt":"etag","tv":"...","sz":123,"cr":"7"}
+///   {"b":"01<digest-hex>","s":"00000000000000000000000000000000","m":"condemned","pend":false,"tt":"etag","tv":"...","sz":123,"cr":"7","mc":false}
 ///   {"n":184267}                                                       trailer: record count
 ///
 /// The record key `b` is the algo BYTE as two lowercase hex chars followed by the digest hex at the
@@ -49,11 +49,12 @@ constexpr char kCondemned  = 0x02;
 /// `(algorithm, digest, source_id)` byte order (lowercase hex preserves unsigned byte order and the
 /// algorithm byte is emitted first) — the invariant the fold's two-cursor merge depends on. The row-tag word
 /// `m` maps to the `kEdgeActive`/`kZeroMarker`/`kCondemned` bytes; a `condemned` row additionally
-/// carries the retired incarnation (`pend`/`tt`/`tv`/`sz`/`cr`).
+/// carries the retired incarnation (`pend`/`tt`/`tv`/`sz`/`cr`) and the durable condemn-marker
+/// confirmation bit (`mc`).
 
 /// One decoded source-edge row. All fields are identifier-layer types so the codec stays backend-free.
-/// The condemned-only fields (`delete_pending`/`token`/`size`/`condemn_round`) are meaningful only when
-/// `marker == kCondemned`.
+/// The condemned-only fields (`delete_pending`/`token`/`size`/`condemn_round`/`marker_confirmed`) are
+/// meaningful only when `marker == kCondemned`.
 struct SourceEdgeRecord
 {
     BlobRef ref{};
@@ -63,6 +64,7 @@ struct SourceEdgeRecord
     Token token{};
     uint64_t size = 0;
     uint64_t condemn_round = 0;
+    bool marker_confirmed = false;   /// durable Condemned meta confirmed for this entry (graduation gate)
 };
 
 /// The header-line `kind` word for the only live `cas_run` kind.

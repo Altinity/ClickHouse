@@ -312,7 +312,7 @@ TEST(CasThreeCursorMerge, FloorBoundary)
     std::vector<RunRef> runs2;
     RetiredMergeResult rmr;
     foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{gen1}, 2, 0, 0, {}, runs2,
-        /*current_round*/3, /*condemn_round*/4, /*head_blob*/{}, /*peek_head*/{}, &rmr);
+        /*current_round*/3, /*condemn_round*/4, /*head_blob*/{}, /*peek_head*/{}, /*confirm_condemned_marker*/{}, &rmr);
 
     /// Two-phase graduation: the floor-passed entry is REPUBLISHED pending (still in the list);
     /// its physical delete belongs to the NEXT pass.
@@ -351,7 +351,7 @@ TEST(CasThreeCursorMerge, PendingRedeletesAndDrops)
     std::vector<RunRef> runs2;
     RetiredMergeResult rmr;
     foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{gen1}, 2, 0, 0, {}, runs2,
-        /*current_round*/9, /*condemn_round*/9, /*head_blob*/{}, /*peek_head*/{}, &rmr);
+        /*current_round*/9, /*condemn_round*/9, /*head_blob*/{}, /*peek_head*/{}, /*confirm_condemned_marker*/{}, &rmr);
 
     ASSERT_EQ(rmr.redelete.size(), 1u);
     EXPECT_EQ(rmr.redelete[0].ref, bh(1));
@@ -377,7 +377,7 @@ TEST(CasThreeCursorMerge, RecoverySpares)
     std::vector<RunRef> runs2;
     RetiredMergeResult rmr;
     foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{gen1}, 2, 0, 0, {{bh(1), s(1), false}}, runs2,
-        /*current_round*/5, /*condemn_round*/6, /*head_blob*/{}, /*peek_head*/{}, &rmr);
+        /*current_round*/5, /*condemn_round*/6, /*head_blob*/{}, /*peek_head*/{}, /*confirm_condemned_marker*/{}, &rmr);
 
     ASSERT_EQ(rmr.spared.size(), 1u);
     EXPECT_EQ(rmr.spared[0].ref, bh(1));
@@ -404,7 +404,7 @@ TEST(CasThreeCursorMerge, NewCandidateCondemned)
     std::vector<RunRef> runs2;
     RetiredMergeResult rmr;
     foldDeltasIntoGeneration(backend, layout, /*prior_runs*/runs1, 2, 0, 0, {{bh(3), s(1), true}}, runs2,
-        /*current_round*/0, /*condemn_round*/7, headPresent("t9", 42), /*peek_head*/{}, &rmr);
+        /*current_round*/0, /*condemn_round*/7, headPresent("t9", 42), /*peek_head*/{}, /*confirm_condemned_marker*/{}, &rmr);
 
     ASSERT_EQ(rmr.still_retired.size(), 1u);
     EXPECT_EQ(rmr.still_retired[0].ref, bh(3));
@@ -436,7 +436,7 @@ TEST(CasThreeCursorMerge, AbsentBlobNotCondemned)
     RetiredMergeResult rmr;
     foldDeltasIntoGeneration(backend, layout, /*prior_runs*/runs1, 2, 0, 0, {{bh(3), s(1), true}}, runs2,
         /*current_round*/0, /*condemn_round*/7,
-        [](const BlobRef &) -> std::optional<HeadResult> { return std::nullopt; }, /*peek_head*/{}, &rmr);
+        [](const BlobRef &) -> std::optional<HeadResult> { return std::nullopt; }, /*peek_head*/{}, /*confirm_condemned_marker*/{}, &rmr);
 
     EXPECT_TRUE(rmr.still_retired.empty());
     EXPECT_TRUE(rmr.graduated.empty());
@@ -470,7 +470,7 @@ TEST(CasThreeCursorMerge, SnapshotEdgesUnperturbedByRetired)
     RetiredMergeResult rmr;
     foldDeltasIntoGeneration(engaged, layout, /*prior_runs*/{prior}, 2, 0, 0,
         {{bh(1), s(1), false}, {bh(2), s(1), false}, {bh(2), s(2), true}}, r2,
-        /*current_round*/9, /*condemn_round*/3, headPresent("t", 1), /*peek_head*/{}, &rmr);
+        /*current_round*/9, /*condemn_round*/3, headPresent("t", 1), /*peek_head*/{}, /*confirm_condemned_marker*/{}, &rmr);
 
     const DecodedRun plain_run = decodeRun(plain, r1[0]);
     const DecodedRun engaged_run = decodeRun(engaged, r2[0]);
@@ -495,7 +495,7 @@ TEST(CasTwoCursorMerge, CarriedSentinelIsNotATouch)
     RetiredMergeResult rmr1;
     foldDeltasIntoGeneration(backend, layout, /*prior_runs*/{}, 1, 0, 0,
         {{bh(2), s(1), false}, {bh(2), s(1), true}}, runs1,
-        /*current_round*/0, /*condemn_round*/5, headPresent("tok", 7), /*peek_head*/{}, &rmr1);
+        /*current_round*/0, /*condemn_round*/5, headPresent("tok", 7), /*peek_head*/{}, /*confirm_condemned_marker*/{}, &rmr1);
     ASSERT_EQ(rmr1.still_retired.size(), 1u);
     {
         const DecodedRun g1 = decodeRun(backend, runs1[0]);
@@ -510,7 +510,7 @@ TEST(CasTwoCursorMerge, CarriedSentinelIsNotATouch)
     std::vector<RunRef> runs2;
     RetiredMergeResult rmr2;
     foldDeltasIntoGeneration(backend, layout, /*prior_runs*/runs1, 2, 0, 0, {}, runs2,
-        /*current_round*/1, /*condemn_round*/6, /*head_blob*/{}, peek, &rmr2);
+        /*current_round*/1, /*condemn_round*/6, /*head_blob*/{}, peek, /*confirm_condemned_marker*/{}, &rmr2);
 
     EXPECT_EQ(peek_calls, 0u);
     ASSERT_EQ(rmr2.still_retired.size(), 1u);
@@ -705,6 +705,7 @@ TEST(CasCondemnedRow, RoundTripAllTokenTypes)
     {
         DB::Cas::CondemnedRow row;
         row.delete_pending = (type == DB::Cas::TokenType::Generation);
+        row.marker_confirmed = (type == DB::Cas::TokenType::Emulated);
         row.token = DB::Cas::Token{.value = "etag-abc-123", .type = type};
         row.size = 4096;
         row.condemn_round = 7;
@@ -712,6 +713,15 @@ TEST(CasCondemnedRow, RoundTripAllTokenTypes)
         ASSERT_EQ(bytes[0], DB::Cas::kCondemned);
         EXPECT_EQ(DB::Cas::decodeCondemnedRow(bytes), row);
     }
+}
+
+TEST(CasCondemnedRow, UnknownFlagBitsFailClosed)
+{
+    DB::Cas::CondemnedRow row;
+    row.token = DB::Cas::Token{.value = "t", .type = DB::Cas::TokenType::ETag};
+    auto bytes = DB::Cas::encodeCondemnedRow(row);
+    bytes[1] = 4;   // flags byte: only bits 0 (delete_pending) and 1 (marker_confirmed) are defined
+    EXPECT_THROW(DB::Cas::decodeCondemnedRow(bytes), DB::Exception);
 }
 
 TEST(CasCondemnedRow, UnknownTokenTypeFailsClosed)
@@ -801,7 +811,7 @@ TEST(CasBlobInDegree, TwoAlgoFoldSettlesBothInOneShardRun)
     RetiredMergeResult rmr;
     foldDeltasIntoGeneration(backend, layout, /*prior_runs*/runs1, 2, /*attempt*/0, 0,
         {{ch_x, s(1), true}, {sha_y_ref, s(1), true}}, runs2,
-        /*current_round*/0, /*condemn_round*/1, headPresent("t", 1), /*peek_head*/{}, &rmr);
+        /*current_round*/0, /*condemn_round*/1, headPresent("t", 1), /*peek_head*/{}, /*confirm_condemned_marker*/{}, &rmr);
 
     ASSERT_EQ(rmr.still_retired.size(), 2u);
     std::vector<BlobRef> condemned_refs{rmr.still_retired[0].ref, rmr.still_retired[1].ref};

@@ -186,6 +186,8 @@ void SourceEdgeRunWriter::append(const SourceEdgeRecord & rec)
         writeIntText(rec.size, out);
         writeKey(out, "cr", first);
         writeU64StringValue(out, rec.condemn_round);
+        writeKey(out, "mc", first);
+        writeBoolValue(out, rec.marker_confirmed);
     }
     closeObject(out, first);
     writeChar('\n', out);
@@ -252,7 +254,7 @@ bool SourceEdgeRunReader::next(SourceEdgeRecord & rec)
     SourceEdgeRecord out;
     String b, tv;
     bool have_b = false, have_s = false, have_m = false;
-    bool have_pend = false, have_tt = false, have_tv = false, have_sz = false, have_cr = false;
+    bool have_pend = false, have_tt = false, have_tv = false, have_sz = false, have_cr = false, have_mc = false;
     TokenType tt{};
     do
     {
@@ -264,6 +266,7 @@ bool SourceEdgeRunReader::next(SourceEdgeRecord & rec)
         else if (key == "tv") { tv = r.readString(); have_tv = true; }
         else if (key == "sz") { out.size = r.readU64Number(); have_sz = true; }
         else if (key == "cr") { out.condemn_round = r.readU64String(); have_cr = true; }
+        else if (key == "mc") { out.marker_confirmed = r.readBool(); have_mc = true; }
         else r.skipUnknown(key);   /// Strict => any unknown key is CORRUPTED_DATA
     } while (r.nextKey(key));
 
@@ -272,11 +275,11 @@ bool SourceEdgeRunReader::next(SourceEdgeRecord & rec)
     out.ref = parseB(b);
     if (out.marker == kCondemned)
     {
-        if (!have_pend || !have_tt || !have_tv || !have_sz || !have_cr)
-            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_run: condemned record missing pend/tt/tv/sz/cr");
+        if (!have_pend || !have_tt || !have_tv || !have_sz || !have_cr || !have_mc)
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_run: condemned record missing pend/tt/tv/sz/cr/mc");
         out.token = Token{tv, tt};
     }
-    else if (have_pend || have_tt || have_tv || have_sz || have_cr)
+    else if (have_pend || have_tt || have_tv || have_sz || have_cr || have_mc)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS cas_run: non-condemned record carries condemned fields");
 
     if (!line_in.eof())

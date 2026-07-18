@@ -30,6 +30,7 @@ namespace ProfileEvents
     extern const Event CasGcRetiredGraduated;
     extern const Event CasGcRetiredRedeleted;
     extern const Event CasGcRetireReplaced;
+    extern const Event CasGcCondemnMarkerUnconfirmedCarry;
     extern const Event CasGcHeartbeatFenceOuts;
     extern const Event CasGcMetaWriteAnomaly;
     extern const Event CasGcMetaOps;
@@ -81,7 +82,15 @@ uint64_t deletePrefixWholesale(Backend & backend, const String & prefix, uint64_
 /// best-effort/idempotent by design. The meta is only a point-read freshness marker for the writer/
 /// promote gate; the ledger retired-set + the exact-token body delete remain the actual safety
 /// core. A lost CAS here is never a correctness problem, only a (rare,
-/// self-healing) staleness window for the NEXT point-reader.
+/// self-healing) staleness window for the NEXT point-reader — with ONE exception (triage 2026-07-17
+/// §3.4): the CONDEMN marker is load-bearing for the delete edge. The exact-token delete argument
+/// below assumes the marker was durably written before the delete fires; a swallowed condemn-marker
+/// write lets a writer observe absent/Clean meta and adopt the SAME token the graduated entry later
+/// deletes (a dangling manifest). Graduation to `delete_pending` is therefore GATED on confirmed
+/// durable Condemned evidence for the exact (hash, token) — recorded in-process when the scheduled
+/// `writeCondemnedMeta` reports success, or re-established by a synchronous `loadMeta` re-check at
+/// graduation time. An unconfirmed entry is CARRIED (fail-safe delay) and its marker write retried;
+/// the delete itself and every other meta op stay async/advisory.
 ///
 /// GC freshness meta is ADD-ONLY: GC may publish `Condemned`, and may REMOVE the meta once the exact body
 /// token is confirmed deleted/absent (`deleteConfirmedMeta`), but it NEVER transitions `Condemned ->
@@ -98,15 +107,21 @@ uint64_t deletePrefixWholesale(Backend & backend, const String & prefix, uint64_
 /// fresh zero-in-degree condemn, or a resurrect-supersede re-condemn of the current token). Absent meta
 /// is created fresh; an already-Condemned meta (a racing condemn, or a replay of this same round) is left
 /// alone rather than clobbering a possibly-newer condemn_round.
-void writeCondemnedMeta(Backend & backend, const Layout & layout, const BlobRef & ref,
+///
+/// Returns whether durable Condemned evidence exists after the call: the conditional write committed,
+/// or an already-Condemned meta was observed. A lost CAS reports false and writes nothing further (the
+/// loser re-reads next time); a thrown backend error propagates (the scheduling wrapper swallows it) —
+/// either way the entry stays UNCONFIRMED and the graduation gate carries it (triage §3.4).
+bool writeCondemnedMeta(Backend & backend, const Layout & layout, const BlobRef & ref,
                        uint64_t condemn_round, uint64_t size)
 {
     const auto lm = loadMeta(backend, layout, ref);
     const BlobMeta desired{.state = MetaState::Condemned, .condemn_round = condemn_round, .size = size};
     if (!lm)
-        putMetaIfAbsent(backend, layout, ref, desired);
-    else if (lm->meta.state != MetaState::Condemned)
-        casMeta(backend, layout, ref, lm->etag, desired);
+        return putMetaIfAbsent(backend, layout, ref, desired).outcome == CasOutcome::Committed;
+    if (lm->meta.state != MetaState::Condemned)
+        return casMeta(backend, layout, ref, lm->etag, desired).outcome == CasOutcome::Committed;
+    return true;
 }
 
 /// Drop the meta after its body was physically deleted (or already found absent) by the round's
@@ -217,6 +232,36 @@ void Gc::scheduleMetaJob(std::function<void()> job)
             "CAS gc: meta pool scheduling failed; running the op inline on the round's own thread");
         run();
     }
+}
+
+void Gc::scheduleCondemnMarkerWrite(const BlobRef & ref, const Token & token,
+                                    uint64_t condemn_round, uint64_t size)
+{
+    scheduleMetaJob([this, ref, token, condemn_round, size]()
+    {
+        if (writeCondemnedMeta(store->backend(), store->layout(), ref, condemn_round, size))
+            noteCondemnMarkerDurable(ref, token);
+        /// A lost CAS / thrown error leaves the (ref, token) UNCONFIRMED: the graduation gate then
+        /// carries the entry and retries this write on a later round (fail-safe delay, triage §3.4).
+    });
+}
+
+void Gc::noteCondemnMarkerDurable(const BlobRef & ref, const Token & token)
+{
+    std::lock_guard lock(condemn_marker_mutex);
+    condemn_markers_confirmed.emplace(ref, token.value);
+}
+
+bool Gc::condemnMarkerConfirmedInProcess(const BlobRef & ref, const Token & token)
+{
+    std::lock_guard lock(condemn_marker_mutex);
+    return condemn_markers_confirmed.contains({ref, token.value});
+}
+
+void Gc::forgetCondemnMarker(const BlobRef & ref, const Token & token)
+{
+    std::lock_guard lock(condemn_marker_mutex);
+    condemn_markers_confirmed.erase({ref, token.value});
 }
 
 RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool allow_steal)
@@ -429,6 +474,8 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
                 const BlobRef ref = entry.ref;
                 scheduleMetaJob([this, ref]() { deleteConfirmedMeta(store->backend(), store->layout(), ref); });
             }
+            /// The entry left the pipeline — drop its in-process condemn-marker confirmation.
+            forgetCondemnMarker(entry.ref, entry.token);
         }
         for (const RetiredEntry & entry : merge.spared)
         {
@@ -461,6 +508,8 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
             /// condemned token and lose the reuse to a stale exact-token redelete (INV_NO_LOSS); see
             /// The next `putBlob` self-heals
             /// the marker: `observeAndAdmit` refuses same-token adoption on `Condemned` and resurrects.
+            /// The entry left the pipeline — drop its in-process condemn-marker confirmation.
+            forgetCondemnMarker(entry.ref, entry.token);
         }
         for (const RetiredEntry & entry : merge.graduated)
         {
@@ -504,15 +553,12 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
             });
             /// The supersede is ALSO a blob entering the retired set fresh (a re-condemn of the
             /// CURRENT token) — write the meta Condemned exactly like a fresh `head_blob` condemn would,
-            /// so a NEXT writer's point-read gate sees it. `peek_head` itself stays side-effect-free (it
-            /// runs once per closed candidate, not just on a real supersede — see its own comment).
-            {
-                const BlobRef ref = entry.ref;
-                const uint64_t round = entry.condemn_round;
-                const uint64_t size = entry.size;
-                scheduleMetaJob([this, ref, round, size]()
-                { writeCondemnedMeta(store->backend(), store->layout(), ref, round, size); });
-            }
+            /// so a NEXT writer's point-read gate sees it (and the graduation gate gets its (hash, token)
+            /// confirmation on success). `peek_head` itself stays side-effect-free (it runs once per
+            /// closed candidate, not just on a real supersede — see its own comment). The SUPERSEDED
+            /// (stale) token's in-process confirmation is dropped — that entry left the pipeline.
+            scheduleCondemnMarkerWrite(entry.ref, entry.token, entry.condemn_round, entry.size);
+            forgetCondemnMarker(entry.ref, replaced.old_token);
         }
     }
 
@@ -870,11 +916,10 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         /// This candidate unconditionally becomes a fresh `RetiredEntry` in `closeBlob` (the ONLY
         /// caller of `head_blob`) whenever this lambda returns a value — so this is exactly the round's
         /// side-effecting condemn site. Write the meta Condemned so the writer's point-read gate
-        /// sees it. MUST capture `ref`/`condemn_round`/size BY VALUE (not by reference to `cur_blob`,
-        /// which the fold's tight streaming loop mutates across iterations while this job may still be
-        /// queued on the pool).
-        scheduleMetaJob([this, ref, condemn_round, size = adjusted.size]()
-        { writeCondemnedMeta(store->backend(), store->layout(), ref, condemn_round, size); });
+        /// sees it; a successful write records the in-process (hash, token) confirmation the graduation
+        /// gate consumes (`scheduleCondemnMarkerWrite` captures everything BY VALUE — never by reference
+        /// to `cur_blob`, which the fold's tight streaming loop mutates while the job is queued).
+        scheduleCondemnMarkerWrite(ref, observed.token, condemn_round, adjusted.size);
         return adjusted;
     };
 
@@ -891,6 +936,40 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             return std::nullopt;
         hr.size = retiredLogicalSize(ObjectKind::Blob, hr.size, store->poolMeta().blob_header_len);
         return hr;
+    };
+
+    /// Graduation gate (triage 2026-07-17 §3.4): the merge consults this before publishing an entry
+    /// delete_pending. Confirmation sources, in order: the in-process (hash, token) record left by a
+    /// successful `writeCondemnedMeta` completion, then ONE synchronous `loadMeta` re-check — a durable
+    /// `Condemned` meta observed NOW is sufficient evidence, because a writer that same-token adopted
+    /// must have observed a non-Condemned meta EARLIER, its edge (EDGE-BEFORE-OBSERVE) landed before the
+    /// meta turned Condemned, and the redelete only fires from a LATER fold whose cut postdates this
+    /// round — that fold sees the edge and spares. (`BlobMeta` carries no token, so the re-check is
+    /// per-hash by design; the two-phase pipeline + the exact-token delete carry the rest.) No durable
+    /// evidence => count the carry, RETRY the marker write (liveness: a swallowed write would otherwise
+    /// carry forever), and refuse — never throw (an unreadable meta is missing evidence, not a wedge).
+    const auto confirm_condemned_marker = [&](const RetiredEntry & entry) -> bool
+    {
+        if (condemnMarkerConfirmedInProcess(entry.ref, entry.token))
+            return true;
+        try
+        {
+            if (const auto lm = loadMeta(backend, layout, entry.ref); lm && lm->meta.state == MetaState::Condemned)
+            {
+                noteCondemnMarkerDurable(entry.ref, entry.token);   /// memoize for a round-CAS-abort replay
+                return true;
+            }
+        }
+        catch (...)
+        {
+            ProfileEvents::increment(ProfileEvents::CasGcMetaWriteAnomaly);
+            tryLogCurrentException(getLogger("CasGc"),
+                "CAS gc: condemn-marker re-check failed to read the meta (treated as missing evidence; "
+                "the entry is carried, never wedges the round)");
+        }
+        ProfileEvents::increment(ProfileEvents::CasGcCondemnMarkerUnconfirmedCarry);
+        scheduleCondemnMarkerWrite(entry.ref, entry.token, entry.condemn_round, entry.size);
+        return false;
     };
 
     const uint64_t new_generation = state.snap_generation + 1;
@@ -1270,6 +1349,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
                                      new_generation, attempt, /*shard*/0,
                                      std::move(deltas), result.fold_seal.blob_target_runs,
                                      current_round, condemn_round, head_blob, peek_head,
+                                     confirm_condemned_marker,
                                      &result.retired_merge[0], suppress_destructive);
             result.fold_seal.condemned_summary[0] = summarize(result.retired_merge[0].still_retired);
         }
@@ -1305,6 +1385,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
                                new_generation, attempt,
                                std::move(buckets[shard]),
                                current_round, condemn_round, head_blob, peek_head,
+                               confirm_condemned_marker,
                                &result.retired_merge[shard], suppress_destructive);
             for (RunRef & r : shard_runs)
                 result.fold_seal.blob_target_runs.push_back(std::move(r));
@@ -1915,7 +1996,8 @@ RebuildReport Gc::rebuildBaseline(bool force)
         foldDeltasIntoGeneration(backend, layout, prior_runs[shard], generation, ++attempt_of[shard],
                                  shard, std::move(buckets[shard]), out,
                                  /*current_round*/0, /*condemn_round*/condemn_round_stamp, condemn_seed_head,
-                                 /*peek_head*/{}, /*out_retired*/nullptr, /*suppress_destructive*/false);
+                                 /*peek_head*/{}, /*confirm_condemned_marker*/{},
+                                 /*out_retired*/nullptr, /*suppress_destructive*/false);
         buckets[shard].clear();
         prior_runs[shard] = std::move(out);
     };
@@ -2066,6 +2148,32 @@ RebuildReport Gc::rebuildBaseline(bool force)
     /// Numbering, part 2: the round above every surviving fence/state/generation number (also the
     /// condemn_round stamped on the full-traversal condemns folded into the runs below).
     const uint64_t round = std::max({max_fence_round, state.round, max_gen}) + 1;
+
+    /// Publish the per-hash condemn marker for EVERY full-traversal condemn SYNCHRONOUSLY (the rebuild
+    /// is an offline/administrative path — no bounded-pool async model here). The marker is the
+    /// writer's adopt gate, and graduation of these entries is gated on confirmed durable Condemned
+    /// evidence (triage 2026-07-17 §3.4): a rebuild that skipped the markers would make the
+    /// swallowed-marker hazard systematic, not a race. A failed write is recorded as an anomaly and the
+    /// entry enters the retired set UNCONFIRMED — the graduation gate then carries it (and retries the
+    /// marker) instead of fail-open deleting; a per-entry failure never aborts the rebuild.
+    for (uint64_t shard = 0; shard < gc_shards; ++shard)
+    {
+        for (const RetiredEntry & e : zero_condemned[shard])
+        {
+            try
+            {
+                if (writeCondemnedMeta(backend, layout, e.ref, round, e.size))
+                    noteCondemnMarkerDurable(e.ref, e.token);
+            }
+            catch (...)
+            {
+                ProfileEvents::increment(ProfileEvents::CasGcMetaWriteAnomaly);
+                tryLogCurrentException(getLogger("CasGc"),
+                    "CAS gc rebuild: condemn-marker write failed; the entry enters the retired set "
+                    "unconfirmed (carried at graduation, never fail-open deleted)");
+            }
+        }
+    }
 
     /// Retired-in-snapshot seeding: append each full-traversal condemn's synthetic +edge/-edge
     /// pair (reserved `source_id = UInt128{1}`, net in-degree 0 — the pair cancels) into its shard's

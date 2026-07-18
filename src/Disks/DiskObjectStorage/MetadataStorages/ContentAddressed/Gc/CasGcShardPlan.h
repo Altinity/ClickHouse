@@ -110,6 +110,7 @@ public:
                                uint64_t current_round = 0, uint64_t condemn_round = 0,
                                const std::function<std::optional<HeadResult>(const BlobRef &)> & head_blob = {},
                                const std::function<std::optional<HeadResult>(const BlobRef &)> & peek_head = {},
+                               const std::function<bool(const RetiredEntry &)> & confirm_condemned_marker = {},
                                RetiredMergeResult * out_retired = nullptr,
                                bool suppress_destructive = false);
 

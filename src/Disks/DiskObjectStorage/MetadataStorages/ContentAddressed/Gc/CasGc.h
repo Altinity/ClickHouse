@@ -13,6 +13,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <utility>
 #include <vector>
@@ -355,6 +356,18 @@ private:
     /// mutates across iterations while this job may still be queued).
     void scheduleMetaJob(std::function<void()> job);
 
+    /// Schedule the async per-hash condemn-marker write for a (ref, token) entering or being carried in
+    /// the retired set; when `writeCondemnedMeta` reports durable Condemned evidence, the in-process
+    /// confirmation for the exact (ref, token) is recorded (the graduation gate's fast path). A swallowed
+    /// write records nothing — the entry stays unconfirmed and graduation carries it (triage §3.4).
+    void scheduleCondemnMarkerWrite(const BlobRef & ref, const Token & token,
+                                    uint64_t condemn_round, uint64_t size);
+
+    /// The in-process condemn-marker confirmation registry (see `condemn_markers_confirmed`).
+    void noteCondemnMarkerDurable(const BlobRef & ref, const Token & token);
+    bool condemnMarkerConfirmedInProcess(const BlobRef & ref, const Token & token);
+    void forgetCondemnMarker(const BlobRef & ref, const Token & token);
+
     PoolPtr store;
     UInt128 gc_id{};   /// this leader's identity (random u128, never 0)
     uint64_t rebuild_edge_budget_override = 0;   /// tests force tiny batches
@@ -397,6 +410,16 @@ private:
     /// never touches a possibly-null `store` at member-init time). A `unique_ptr` (not a plain member)
     /// so construction can happen in the ctor body, after validating `store`.
     std::unique_ptr<ThreadPool> meta_pool;
+
+    /// In-process confirmations of durable condemn-marker writes, keyed (blob, exact incarnation-token
+    /// value): inserted by `scheduleCondemnMarkerWrite`'s completion (and the rebuild's synchronous
+    /// marker publish) when `writeCondemnedMeta` reports durable Condemned evidence; consulted by the
+    /// graduation gate (the delete-authorizing edge, triage §3.4); pruned when the entry settles
+    /// (redelete / spare / supersede). In-memory only — after a restart or leader change the graduation
+    /// gate falls back to a synchronous `loadMeta` re-check (the marker itself is durable). Guarded by
+    /// `condemn_marker_mutex`: meta-pool completions insert concurrently with the fold thread's reads.
+    std::mutex condemn_marker_mutex;
+    std::set<std::pair<BlobRef, String>> condemn_markers_confirmed;
 
 public:
     /// TEST SEAM: expose LIST-based namespace/shard discovery so unit tests can assert the

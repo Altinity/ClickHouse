@@ -35,6 +35,12 @@ struct RetiredEntry
                                   /// delete (pre-CAS, safe at any leader staleness) and drops the entry.
                                   /// Terminal: a pending entry is never un-pended (writers keep seeing
                                   /// it condemned and recreate).
+    bool marker_confirmed = false;   /// Durable `Condemned` meta CONFIRMED for this entry — the
+                                     /// graduation gate (triage 2026-07-17 §3.4): the per-hash condemn
+                                     /// marker is the writer's adopt gate, so graduation to
+                                     /// delete_pending requires confirmed durable evidence; an
+                                     /// unconfirmed entry is CARRIED, never fail-open deleted. Set at
+                                     /// graduation (delete_pending rows always carry it).
 };
 
 /// Backend-independent codec for source-edge keys. A key is `algo` (u8), the digest at that algorithm's
@@ -63,12 +69,14 @@ void assertValidSourceEdgeId(const UInt128 & source_id);
 /// Serialized payload of a condemned source-edge sentinel. The payload retains the full incarnation
 /// token, including its type, because deletion must remain exact-token guarded. Its fixed prefix is
 /// `[0x02][flags][token_type][round BE64][size BE64][token_len BE16]`, followed by token bytes.
+/// `flags` bit 0 is `delete_pending`, bit 1 is `marker_confirmed`.
 struct CondemnedRow
 {
     bool delete_pending = false;
     Token token;                 // {value, type} — the full token required by exact-token deletion
     uint64_t size = 0;
     uint64_t condemn_round = 0;
+    bool marker_confirmed = false;   // durable Condemned meta confirmed (graduation gate)
     bool operator==(const CondemnedRow &) const = default;
 };
 
@@ -189,7 +197,10 @@ struct RetiredMergeResult
 ///                                                 fail-closed abort;
 ///   d > 0                                       -> spared (recovery wins even past the floor);
 ///   d = 0 and condemn_round < current_round     -> graduated: REPUBLISHED as delete_pending (two-phase
-///                                                 graduation) — deleted the NEXT pass;
+///                                                 graduation) — deleted the NEXT pass. GATED on a
+///                                                 confirmed durable condemn marker (see
+///                                                 `confirm_condemned_marker` below): an unconfirmed
+///                                                 entry is carried unchanged instead;
 ///   d = 0 otherwise                             -> still_retired, carried byte-unchanged.
 /// A carried `kCondemned` row is SETTLEMENT-ONLY: it never sets the blob's `cur_touched` bit, so a
 /// generation that only carries the row emits no zero-marker and pays no `peek_head` HEAD. The surviving
@@ -218,6 +229,16 @@ struct RetiredMergeResult
 /// double-emit `blob_retire` alongside `blob_retire_replaced` and double-count the condemned counter;
 /// `peek_head` is a plain HEAD with no events and no counters. No supersede detection happens if
 /// `peek_head` is unset (default `{}`), independent of whether `head_blob` is set.
+///
+/// `confirm_condemned_marker` is the GRADUATION GATE (triage 2026-07-17 §3.4): graduation to
+/// `delete_pending` is the one edge that authorizes an irreversible delete, and the per-hash condemn
+/// marker (`writeCondemnedMeta`) is the writer's adopt gate — an entry whose marker write was silently
+/// swallowed can be same-token adopted by a writer invisible to this fold's cut, so it must NOT
+/// graduate. The callback returns whether durable `Condemned` evidence is confirmed for the entry's
+/// exact (hash, token); on false the entry is carried unchanged (fail-safe delay — the caller is
+/// expected to retry the marker so a later pass can confirm). An entry whose `marker_confirmed` bit is
+/// already set skips the callback. Unset (default `{}`) means UNGATED — the pre-gate merge semantics,
+/// for merge-mechanics unit tests only; the real GC round always passes the gate.
 /// The merge comparator is exactly `(ref.algo, ref.digest, source_id)` (that is, `BlobRef::operator<`
 /// followed by `source_id`), which is also the raw key order produced by `SourceEdgeKeyCodec`.
 void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
@@ -228,6 +249,7 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
                               uint64_t current_round = 0, uint64_t condemn_round = 0,
                               const std::function<std::optional<HeadResult>(const BlobRef &)> & head_blob = {},
                               const std::function<std::optional<HeadResult>(const BlobRef &)> & peek_head = {},
+                              const std::function<bool(const RetiredEntry &)> & confirm_condemned_marker = {},
                               RetiredMergeResult * out_retired = nullptr,
                               bool suppress_destructive = false);
 
