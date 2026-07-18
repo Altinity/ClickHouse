@@ -748,7 +748,10 @@ namespace
                     if (!supports_multipart_copy || outcome.GetError().GetExceptionName() == "AccessDenied")
                     {
                         if (if_none_match.has_value())
-                            throw S3Exception(outcome.GetError().GetMessage(), outcome.GetError().GetErrorType());
+                            throw S3Exception(
+                                outcome.GetError().GetMessage(),
+                                outcome.GetError().GetErrorType(),
+                                outcome.GetError().GetExceptionName());
 
                         LOG_INFO(
                             log,
