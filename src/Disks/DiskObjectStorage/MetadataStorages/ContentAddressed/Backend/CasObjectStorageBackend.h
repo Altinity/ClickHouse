@@ -57,8 +57,13 @@ public:
 ///
 /// EmulatedSingleProcess mode (LocalObjectStorage — tests and local development ONLY): the object
 /// storage has no conditional ops, so this adapter provides EXACT token semantics itself with a
-/// process-wide mutex and an in-memory per-key token counter (seeded lazily from the file's etag for
-/// pre-existing keys). Semantics hold within ONE process only — exactly what unit tests need.
+/// process-wide mutex and an in-memory per-key token MINTED FROM the object's own etag (mtime-ns on
+/// LocalObjectStorage) — see emuMintToken. Every emulated token IS the object's current etag (not
+/// merely "seeded" for pre-existing keys); this is what keeps token-exact semantics correct ACROSS a
+/// process restart, which a plain in-process counter cannot do (codex-review-triage §3.18, 19c): a
+/// counter restarts at 0 and can re-mint a value colliding with a persisted pre-restart delete token
+/// for a completely different incarnation, while a resurrected body's mtime is always later. Semantics
+/// otherwise hold within ONE process only — exactly what unit tests need.
 class ObjectStorageBackend final : public Backend
 {
 public:
@@ -185,9 +190,14 @@ private:
     std::shared_ptr<const S3::Client> single_attempt_s3_client;
 #endif
 
-    /// EmulatedSingleProcess state: per-key current token (monotone counter as string).
+    /// EmulatedSingleProcess state: per-key {etag, disambiguator} — see emuMintToken. NEVER erased on
+    /// delete: retaining a deleted key's last-minted etag is exactly what lets an immediate
+    /// delete+recreate WITHIN this process disambiguate a same-mtime-quantum collision.
     std::mutex emu_mutex;
-    std::map<String, uint64_t> emu_tokens;
+    std::map<String, std::pair<String, uint64_t>> emu_token_state;
+    /// Fallback nonce for the (anomalous) case where the object storage reports an EMPTY etag: mints a
+    /// fresh, unpersisted value each time — never worse than the old counter for that case, but never
+    /// masquerading as a real etag-derived identity either.
     uint64_t emu_seq = 0;
 
     /// Look up Native metadata and convert the storage ETag or generation to this backend's token.
@@ -195,6 +205,14 @@ private:
     /// Write a body with the condition already encoded in `ws`, finalize it, classify a lost
     /// precondition, and return the new token when the write succeeds.
     PutResult nativeConditionalPut(const String & key, const String & bytes, const WriteSettings & ws, const ObjectMeta & meta);
+
+    /// §3.18 №19 hardening: whether `t` is the dialect this backend itself mints (native_token_type
+    /// for Native mode, always TokenType::Emulated for EmulatedSingleProcess). Every conditional
+    /// mutation checks this BEFORE touching the wire (Native forwards only Token::value as the
+    /// If-Match/removeObjectIfTokenMatches argument, blind to Token::type) or comparing values
+    /// (Emulated) — a foreign-dialect token is rejected locally rather than trusted to the remote
+    /// backend, or to a value-space that was never designed to discriminate it.
+    bool mintingTypeMatches(TokenType t) const { return t == (mode == Mode::Native ? native_token_type : TokenType::Emulated); }
 
     /// ---- Emulated helpers (caller holds emu_mutex) ----
     ///
@@ -204,13 +222,22 @@ private:
     const String emu_root;             /// object_storage->getCommonKeyPrefix() captured at construction
     String emuPath(const String & key) const;   /// logical key -> physical object-storage path
 
-    /// The caller holds `emu_mutex` for all four helpers below, preserving the exists/read and
+    /// The caller holds `emu_mutex` for all five helpers below, preserving the exists/read and
     /// observe/write checks as one process-local operation.
     bool emuExists(const String & key) const;
     String emuRead(const String & key, Range range) const;
-    void emuWrite(const String & key, const String & bytes, const ObjectMeta & meta);
-    /// Return the current emulated token, lazily assigning one to a pre-existing object.
+    /// Write a body as the new incarnation of `key` and return its freshly minted token (the
+    /// object's own post-write etag — see emuMintToken).
+    Token emuWrite(const String & key, const String & bytes, const ObjectMeta & meta);
+    /// Return the current emulated token for a key we just read/HEAD'd, reflecting its on-disk etag —
+    /// does NOT advance the same-etag disambiguator (that only applies to a just-completed write).
     Token emuObserveToken(const String & key);
+    /// Single source of truth for minting an emulated token from an observed `etag`: the wire value IS
+    /// the etag while it is the first thing minted for `key` at that etag, or `etag#N` once a SAME-etag
+    /// rewrite forces a disambiguator (`just_wrote` — see the mtime-quantum note in emu_token_state's
+    /// declaration and codex-review-triage §3.18 19c step 4). An empty `etag` (the storage could not
+    /// report one) falls back to a fresh, UNPERSISTED monotonic value from emu_seq.
+    Token emuMintToken(const String & key, const String & etag, bool just_wrote);
 };
 
 }

@@ -518,7 +518,7 @@ String ObjectStorageBackend::emuRead(const String & key, Range range) const
     return readObjectRanged(*object_storage, emuPath(key), range);
 }
 
-void ObjectStorageBackend::emuWrite(const String & key, const String & bytes, const ObjectMeta & meta)
+Token ObjectStorageBackend::emuWrite(const String & key, const String & bytes, const ObjectMeta & meta)
 {
     std::optional<ObjectAttributes> attrs;
     if (!meta.empty())
@@ -526,19 +526,43 @@ void ObjectStorageBackend::emuWrite(const String & key, const String & bytes, co
     auto buf = object_storage->writeObject(StoredObject(emuPath(key)), WriteMode::Rewrite, attrs);
     buf->write(bytes.data(), bytes.size());
     buf->finalize();
+
+    const auto metadata = object_storage->tryGetObjectMetadata(emuPath(key), /*with_tags=*/false);
+    return emuMintToken(key, metadata ? metadata->etag : String{}, /*just_wrote=*/true);
 }
 
 Token ObjectStorageBackend::emuObserveToken(const String & key)
 {
-    auto it = emu_tokens.find(key);
-    if (it != emu_tokens.end())
-        return Token{std::to_string(it->second), TokenType::Emulated};
+    const auto metadata = object_storage->tryGetObjectMetadata(emuPath(key), /*with_tags=*/false);
+    return emuMintToken(key, metadata ? metadata->etag : String{}, /*just_wrote=*/false);
+}
 
-    /// First time we see a key that already exists on disk: seed a fresh emulated token for it so that
-    /// pre-existing objects participate in token-exact semantics within this process.
-    const uint64_t seq = ++emu_seq;
-    emu_tokens[key] = seq;
-    return Token{std::to_string(seq), TokenType::Emulated};
+Token ObjectStorageBackend::emuMintToken(const String & key, const String & etag, bool just_wrote)
+{
+    /// Anomalous: the object storage reported no etag at all (LocalObjectStorage always does; this
+    /// guards a hypothetical future/test double). Mint a fresh, UNPERSISTED value — never worse than
+    /// the old counter for this case, but never masquerading as a real etag-derived identity.
+    if (etag.empty())
+        return Token{std::to_string(++emu_seq), TokenType::Emulated};
+
+    auto it = emu_token_state.find(key);
+    if (it != emu_token_state.end() && it->second.first == etag)
+    {
+        /// The etag has not advanced since the last token we minted for this key. For a read-only
+        /// observation that is expected (the object simply has not changed) and the SAME value must be
+        /// returned. For a just-completed WRITE it means this write's mtime landed in the same quantum
+        /// as the previous incarnation's — two DIFFERENT incarnations must still never mint identical
+        /// tokens, so bump a small per-key disambiguator (mtime-quantum guard, triage §3.18 19c step 4).
+        if (just_wrote)
+            ++it->second.second;
+        const String value = it->second.second == 0 ? etag : etag + "#" + std::to_string(it->second.second);
+        return Token{value, TokenType::Emulated};
+    }
+
+    /// The etag advanced (or this key is seen for the first time): the bare etag is the token, and any
+    /// previous disambiguator is dropped — a genuinely new incarnation starts clean.
+    emu_token_state[key] = {etag, 0};
+    return Token{etag, TokenType::Emulated};
 }
 
 /// =========================================================================================
@@ -721,10 +745,7 @@ PutResult ObjectStorageBackend::putIfAbsent(const String & key, const String & b
     if (emuExists(key))
         return {PutOutcome::PreconditionFailed, {}};
 
-    emuWrite(key, bytes, meta);
-    const uint64_t seq = ++emu_seq;
-    emu_tokens[key] = seq;
-    return {PutOutcome::Done, Token{std::to_string(seq), TokenType::Emulated}};
+    return {PutOutcome::Done, emuWrite(key, bytes, meta)};
 }
 
 WriteSinkPtr ObjectStorageBackend::putIfAbsentStream(const String & key, const ObjectMeta & meta)
@@ -748,6 +769,11 @@ WriteSinkPtr ObjectStorageBackend::putIfAbsentStream(const String & key, const O
 
 PutResult ObjectStorageBackend::putOverwrite(const String & key, const String & bytes, const Token & expected, const ObjectMeta & meta)
 {
+    /// §3.18 №19: reject a wrong-dialect expected token before it ever reaches the wire (Native) or
+    /// the emu compare (Emulated) — see mintingTypeMatches.
+    if (!mintingTypeMatches(expected.type))
+        return {PutOutcome::PreconditionFailed, {}};
+
     if (mode == Mode::Native)
     {
         WriteSettings ws = conditionalWriteSettings();
@@ -761,14 +787,17 @@ PutResult ObjectStorageBackend::putOverwrite(const String & key, const String & 
     if (!tokenMatches(emuObserveToken(key), expected))
         return {PutOutcome::PreconditionFailed, {}};
 
-    emuWrite(key, bytes, meta);
-    const uint64_t seq = ++emu_seq;
-    emu_tokens[key] = seq;
-    return {PutOutcome::Done, Token{std::to_string(seq), TokenType::Emulated}};
+    return {PutOutcome::Done, emuWrite(key, bytes, meta)};
 }
 
 CasResult ObjectStorageBackend::casPut(const String & key, const String & bytes, const std::optional<Token> & expected, const ObjectMeta & meta)
 {
+    /// §3.18 №19: a create-if-absent CAS (expected == nullopt) has no token to validate; only the
+    /// swap form carries one, and it must match this backend's own minting dialect before anything
+    /// else runs.
+    if (expected.has_value() && !mintingTypeMatches(expected->type))
+        return {CasOutcome::Conflict, {}};
+
     if (mode == Mode::Native)
     {
         WriteSettings ws = conditionalWriteSettings();
@@ -801,14 +830,20 @@ CasResult ObjectStorageBackend::casPut(const String & key, const String & bytes,
             return {CasOutcome::Conflict, {}};
     }
 
-    emuWrite(key, bytes, meta);
-    const uint64_t seq = ++emu_seq;
-    emu_tokens[key] = seq;
-    return {CasOutcome::Committed, Token{std::to_string(seq), TokenType::Emulated}};
+    return {CasOutcome::Committed, emuWrite(key, bytes, meta)};
 }
 
 DeleteOutcome ObjectStorageBackend::deleteExact(const String & key, const Token & token)
 {
+    /// §3.18 №19: same local dialect guard as putOverwrite/casPut — never forward a foreign-dialect
+    /// value as the removeObjectIfTokenMatches argument.
+    if (!mintingTypeMatches(token.type))
+    {
+        DeleteOutcome d;
+        d.kind = DeleteOutcome::Kind::TokenMismatch;
+        return d;
+    }
+
     if (mode == Mode::Native)
     {
         /// `removeObjectIfTokenMatches` maps onto `DeleteOutcome` one-to-one. `NOT_IMPLEMENTED` from a
@@ -845,7 +880,9 @@ DeleteOutcome ObjectStorageBackend::deleteExact(const String & key, const Token 
     }
 
     object_storage->removeObjectIfExists(StoredObject(emuPath(key)));
-    emu_tokens.erase(key);
+    /// `emu_token_state` is deliberately NOT erased here: keeping the deleted incarnation's last-minted
+    /// etag around is exactly what lets an immediate delete+recreate within THIS process disambiguate a
+    /// same-mtime-quantum collision (emuMintToken) instead of silently re-minting the same value.
     d.kind = DeleteOutcome::Kind::Deleted;
     return d;
 }
@@ -939,6 +976,11 @@ ListPage ObjectStorageBackend::list(const String & prefix, const String & cursor
         RelativePathsWithMetadata children;
         object_storage->listObjects(physical_prefix, children, /*max_keys=*/0);
 
+        /// Hold emu_mutex across the whole scan: emuMintToken below reads/updates emu_token_state, the
+        /// same per-key state get/head/put*/delete* mutate under this lock (see the "caller holds
+        /// emu_mutex" contract on the private emu* helpers).
+        std::lock_guard lock(emu_mutex);
+
         std::vector<ListedKey> all;
         all.reserve(children.size());
         for (const auto & child : children)
@@ -948,8 +990,11 @@ ListPage ObjectStorageBackend::list(const String & prefix, const String & cursor
             ListedKey lk;
             lk.key = child->relative_path.substr(strip.size());
             lk.size = child->metadata ? child->metadata->size_bytes : 0;
+            /// §3.18 №18: mint DIRECTLY as TokenType::Emulated — do NOT call tokenForList, which always
+            /// stamps native_token_type (ETag/Generation) regardless of mode and would surface a token
+            /// of the wrong dialect for every Emulated consumer (head/get mint Emulated).
             if (child->metadata)
-                lk.token = tokenForList(child->metadata->etag);
+                lk.token = emuMintToken(lk.key, child->metadata->etag, /*just_wrote=*/false);
             all.push_back(std::move(lk));
         }
         std::sort(all.begin(), all.end(), [](const ListedKey & a, const ListedKey & b) { return a.key < b.key; });

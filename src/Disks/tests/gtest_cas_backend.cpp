@@ -625,6 +625,205 @@ TEST(CasObjectStorageBackend, RangedGetReadsOnlyTheWindow)
     EXPECT_TRUE(past->bytes.empty());
 }
 
+/// codex-review-triage §3.18, finding 19c: the `EmulatedSingleProcess` adapter used to mint tokens
+/// from a plain in-process counter (`emu_seq`), NOT actually seeded from the underlying object's etag
+/// despite the class comment's claim. After a process restart (modeled here as a fresh
+/// `ObjectStorageBackend` instance over the SAME storage) the counter restarts at 0 and can re-mint a
+/// value that TEXTUALLY collides with a token persisted before the restart (e.g. a GC condemned-delete
+/// token queued for replay), even though the two values name completely different incarnations of the
+/// key. `deleteExact` must never let a stale, pre-restart token match a freshly recreated object.
+TEST(CasObjectStorageBackend, EmuTokenSurvivesProcessRestartAcrossRecreate)
+{
+    auto storage = tests::makeLocalObjectStorageForTest();
+
+    auto backend1 = std::make_shared<ObjectStorageBackend>(storage, ObjectStorageBackend::Mode::EmulatedSingleProcess);
+    /// A throwaway prior mutation on a DIFFERENT key: with the old counter this advances backend1's
+    /// process-wide op counter to 1, so "k/restart"'s own mint below lands on 2 — chosen so it collides
+    /// with backend2's post-restart recreate mint further down (also its SECOND op; see there).
+    ASSERT_EQ(backend1->putIfAbsent("k/other", "junk").outcome, PutOutcome::Done);
+    ASSERT_EQ(backend1->putIfAbsent("k/restart", "v1").outcome, PutOutcome::Done);
+    const Token stale_token = backend1->head("k/restart").token;
+
+    /// Simulate a process restart: a brand-new `ObjectStorageBackend` instance (fresh emu state) over
+    /// the SAME underlying storage — exactly what happens when the CAS process restarts.
+    auto backend2 = std::make_shared<ObjectStorageBackend>(storage, ObjectStorageBackend::Mode::EmulatedSingleProcess);
+
+    /// Delete and recreate the key through the NEW instance — a fresh incarnation with a fresh mtime.
+    /// This is backend2's first-ever op (op 1) then a delete (no mint) then the recreate (op 2) — the
+    /// same op-index as `stale_token` above under the old counter, so the two textually collide there.
+    const Token current = backend2->head("k/restart").token;
+    ASSERT_EQ(backend2->deleteExact("k/restart", current).kind, DeleteOutcome::Kind::Deleted);
+    ASSERT_EQ(backend2->putIfAbsent("k/restart", "v2-after-restart").outcome, PutOutcome::Done);
+
+    /// The pre-restart token must NEVER match the post-restart incarnation, however coincidentally a
+    /// process-local counter would have re-minted the identical textual value.
+    const auto stale_delete = backend2->deleteExact("k/restart", stale_token);
+    EXPECT_EQ(stale_delete.kind, DeleteOutcome::Kind::TokenMismatch);
+
+    /// The live (post-restart) incarnation must be untouched by the rejected stale delete.
+    EXPECT_TRUE(backend2->head("k/restart").exists);
+}
+
+/// codex-review-triage §3.18, finding №18: `list`'s `EmulatedSingleProcess` branch minted its per-key
+/// token via `tokenForList`, which always stamps `native_token_type` (ETag) REGARDLESS of `mode` --
+/// while `head`/`get` mint `TokenType::Emulated`. `Token::operator==` compares type AND value, so a
+/// list-derived token could never satisfy an emulated `deleteExact`/`putOverwrite` expectation: a
+/// fail-safe leak (never a wrong delete), but every consumer of listed tokens (GC namespace cleanup,
+/// `deletePrefixWholesale`, orphan sweep, decommission drain) always saw `TokenMismatch` against a
+/// LOCAL pool. `list` must surface the SAME (type, value) as `head` for the same key.
+TEST(CasObjectStorageBackend, EmulatedListTokenMatchesHeadToken)
+{
+    auto backend = std::make_shared<ObjectStorageBackend>(
+        tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::EmulatedSingleProcess);
+
+    ASSERT_EQ(backend->putIfAbsent("k/listed", "body").outcome, PutOutcome::Done);
+
+    const Token head_token = backend->head("k/listed").token;
+    ASSERT_EQ(head_token.type, TokenType::Emulated);
+
+    const ListPage page = backend->list("k/", "", /*limit=*/10);
+    ASSERT_EQ(page.keys.size(), 1u);
+    ASSERT_TRUE(page.keys.front().token.has_value());
+    EXPECT_EQ(*page.keys.front().token, head_token);
+}
+
+namespace
+{
+
+/// A `LocalObjectStorage` whose reported etag never changes -- simulating a filesystem/clock whose
+/// mtime resolution is too coarse to separate two writes issued back-to-back (the "same mtime
+/// quantum" hazard flagged for the etag-seeded emu token: two DIFFERENT incarnations must still mint
+/// DIFFERENT tokens even when the storage's own etag does not advance between them).
+class FixedEtagLocalObjectStorage final : public DB::LocalObjectStorage
+{
+public:
+    using DB::LocalObjectStorage::LocalObjectStorage;
+
+    std::optional<DB::ObjectMetadata> tryGetObjectMetadata(const std::string & path, bool with_tags) const override
+    {
+        auto metadata = DB::LocalObjectStorage::tryGetObjectMetadata(path, with_tags);
+        if (metadata)
+            metadata->etag = "same-quantum";
+        return metadata;
+    }
+};
+
+DB::ObjectStoragePtr makeFixedEtagStorageForTest()
+{
+    static std::atomic<uint64_t> counter{0};
+    const auto unique = std::to_string(::getpid()) + "_" + std::to_string(counter.fetch_add(1));
+    const auto root = (std::filesystem::temp_directory_path() / ("cas_fixed_etag_unit_" + unique)).string();
+
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+    std::filesystem::create_directories(root, ec);
+
+    DB::LocalObjectStorageSettings settings("test", root, /*read_only_=*/false);
+    return std::make_shared<FixedEtagLocalObjectStorage>(std::move(settings));
+}
+
+}
+
+/// The mtime-resolution guard (codex-review-triage §3.18, 19c step 4): two writes to the same key
+/// whose underlying etag does not advance between them (stubbed here to model a coarse clock) must
+/// still mint DISTINCT emulated tokens, and a stale token from the first incarnation must not match
+/// the second.
+TEST(CasObjectStorageBackend, EmuTokenDisambiguatesSameEtagRewrite)
+{
+    ObjectStorageBackend backend(makeFixedEtagStorageForTest(), ObjectStorageBackend::Mode::EmulatedSingleProcess);
+
+    const auto put1 = backend.putIfAbsent("k/tick", "v1");
+    ASSERT_EQ(put1.outcome, PutOutcome::Done);
+    const auto put2 = backend.putOverwrite("k/tick", "v2", put1.token);
+    ASSERT_EQ(put2.outcome, PutOutcome::Done);
+
+    EXPECT_NE(put1.token.value, put2.token.value);
+    EXPECT_EQ(put1.token.type, TokenType::Emulated);
+    EXPECT_EQ(put2.token.type, TokenType::Emulated);
+
+    /// A stale delete using the FIRST incarnation's token must not match the live (second) one.
+    EXPECT_EQ(backend.deleteExact("k/tick", put1.token).kind, DeleteOutcome::Kind::TokenMismatch);
+    EXPECT_TRUE(backend.head("k/tick").exists);
+}
+
+namespace
+{
+
+/// A `LocalObjectStorage` that counts `writeObject`/`removeObjectIfTokenMatches` calls -- used to
+/// prove that a wrong-dialect expected token is rejected LOCALLY, before anything reaches the wire.
+class CallCountingObjectStorage final : public DB::LocalObjectStorage
+{
+public:
+    using DB::LocalObjectStorage::LocalObjectStorage;
+
+    std::unique_ptr<DB::WriteBufferFromFileBase> writeObject(
+        const DB::StoredObject & object,
+        DB::WriteMode mode,
+        std::optional<DB::ObjectAttributes> attributes,
+        size_t buf_size,
+        const DB::WriteSettings & write_settings) override
+    {
+        ++write_calls;
+        return DB::LocalObjectStorage::writeObject(object, mode, attributes, buf_size, write_settings);
+    }
+
+    DB::ConditionalRemoveResult removeObjectIfTokenMatches(const DB::StoredObject & object, const std::string & etag) override
+    {
+        ++remove_if_matches_calls;
+        return DB::LocalObjectStorage::removeObjectIfTokenMatches(object, etag);
+    }
+
+    std::atomic<int> write_calls{0};
+    std::atomic<int> remove_if_matches_calls{0};
+};
+
+DB::ObjectStoragePtr makeCallCountingStorageForTest()
+{
+    static std::atomic<uint64_t> counter{0};
+    const auto unique = std::to_string(::getpid()) + "_" + std::to_string(counter.fetch_add(1));
+    const auto root = (std::filesystem::temp_directory_path() / ("cas_call_counting_unit_" + unique)).string();
+
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+    std::filesystem::create_directories(root, ec);
+
+    DB::LocalObjectStorageSettings settings("test", root, /*read_only_=*/false);
+    return std::make_shared<CallCountingObjectStorage>(std::move(settings));
+}
+
+}
+
+/// codex-review-triage §3.18, finding №19: Native-mode conditional mutations forward only
+/// `Token::value` to the wire (`object_storage_write_if_match` / `removeObjectIfTokenMatches`),
+/// blind to `Token::type`. A wrong-dialect token whose VALUE happens to equal the live incarnation's
+/// must be rejected LOCALLY -- before any wire call is made -- never merely rely on the remote
+/// backend to reject a foreign-dialect value it was never designed to compare.
+TEST(CasObjectStorageBackend, NativeRejectsWrongDialectTokenBeforeTouchingTheWire)
+{
+    auto storage = std::static_pointer_cast<CallCountingObjectStorage>(makeCallCountingStorageForTest());
+    ObjectStorageBackend backend(storage, ObjectStorageBackend::Mode::Native);
+
+    ASSERT_EQ(backend.putIfAbsent("k/dialect", "v1").outcome, PutOutcome::Done);
+    const Token live = backend.head("k/dialect").token;
+    ASSERT_EQ(live.type, TokenType::ETag);
+
+    storage->write_calls = 0;
+    storage->remove_if_matches_calls = 0;
+
+    /// Same wire VALUE, wrong dialect TYPE (Emulated instead of this backend's native ETag dialect).
+    const Token wrong_type_token{live.value, TokenType::Emulated};
+
+    EXPECT_EQ(backend.putOverwrite("k/dialect", "v2", wrong_type_token).outcome, PutOutcome::PreconditionFailed);
+    EXPECT_EQ(backend.casPut("k/dialect", "v2", wrong_type_token).outcome, CasOutcome::Conflict);
+    EXPECT_EQ(backend.deleteExact("k/dialect", wrong_type_token).kind, DeleteOutcome::Kind::TokenMismatch);
+
+    EXPECT_EQ(storage->write_calls.load(), 0);
+    EXPECT_EQ(storage->remove_if_matches_calls.load(), 0);
+
+    /// The live incarnation must be untouched by all three rejected attempts.
+    EXPECT_EQ(backend.head("k/dialect").token, live);
+}
+
 /// §1 (opt round-B): the fold/point GETs read tiny bodies but a default `ReadBufferFromS3` preallocates
 /// ~1 MiB. `casSizedReadSettings` shrinks the buffer to the known body size + slack, capped at the
 /// caller's default — never larger than before, regardless of the reported size.
