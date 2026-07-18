@@ -1782,7 +1782,16 @@ ManifestEntry wideBlobManifestEntry(size_t path_len)
 TEST(CasPartWriteTxn, ManifestCapEncodedBytesJustUnderStagesSuccessfully)
 {
     auto b = std::make_shared<InMemoryBackend>();
-    auto s = openPool(b);
+    /// A frozen boot_ms_fn (not the shared openPool helper): this test's manifest sits just under the
+    /// 256 MiB cap, so encodePartManifest/sealObject do real, sizeable CPU work before the single
+    /// InMemoryBackend put (which always succeeds deterministically, no faults). Under heavy
+    /// instrumentation (TSan) that encode+seal step alone can take long enough in real wall-clock time
+    /// to cross the mount lease's fence margin (CasMountRuntime::refAppendFenceOk) and the CAS request
+    /// controller's own deadline (both consult the SAME injected clock, CasRefLedger.cpp) before the
+    /// attempt even resolves -- a sanitizer-speed artifact unrelated to what this test verifies. Freezing
+    /// the clock decouples the outcome from real execution speed: the single attempt now succeeds or
+    /// fails purely on the backend's own (deterministic) behavior, on any build.
+    auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .boot_ms_fn = [] { return uint64_t{0}; }});
     const RootNamespace ns{"srv1/tbl"};
 
     const size_t path_len_over = findManifestEncodedCapBoundaryPathLen(ns);
