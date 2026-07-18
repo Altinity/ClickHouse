@@ -150,6 +150,7 @@ private:
     /// stagings never collide.
     std::map<std::pair<std::string, std::string>, PartStaging> parts;
     bool committed = false;
+    bool failed = false;
 
     /// Stage a CONTENT part file as a blob: record the pending upload + a tokenless dependency
     /// and add/replace its manifest entry. Shared by the streaming-blob path

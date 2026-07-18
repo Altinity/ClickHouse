@@ -369,6 +369,10 @@ bool ContentAddressedTransaction::publishStaging(const Cas::RootNamespace & ns, 
 
 void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &)
 {
+    if (failed)
+        throw Exception(ErrorCodes::LOGICAL_ERROR,
+            "retrying a failed content-addressed transaction is not supported");
+
     /// Publish each staged part. [TXN-ONE-PIPELINE] This is the ONLY place a ref becomes durable — the
     /// tmp->final rename is a pure overlay re-key. Commit
     /// atomicity: there is no multi-ref atomic publish, so a publish that throws after
@@ -396,6 +400,7 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
     }
     catch (...)
     {
+        failed = true;
         /// Compensating rollback. Best-effort: a ref we cannot unpublish becomes unreferenced debris
         /// (GC-reclaimed); never mask the original failure with a rollback failure.
         for (const auto & [ns, ref] : created_refs)
