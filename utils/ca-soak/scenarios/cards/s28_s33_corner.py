@@ -587,33 +587,36 @@ class S31(Scenario):
                            if (blobs_before is not None and blobs_after is not None) else None)
         result.observations["blobs_reclaimed_by_gc"] = blobs_reclaimed
 
-        # --- the documented incompleteness verdict ------------------------------------------
-        # Compare the dryrun preview COUNT against what GC actually reclaimed. If dryrun previews
-        # FEWER candidates than GC deletes, it missed shard>=1 candidates (checklist #9).
-        gc_deleted_observable = deleted_total if deleted_total else blobs_reclaimed
-        if dry_count is None or gc_deleted_observable is None:
+        # --- dryrun completeness under gc_shards>1 ------------------------------------------
+        # previewDeletes is a SINGLE-ROUND, point-in-time preview (zero-in-degree + condemned rows
+        # in the currently-adopted fold seal, ALL shards — CasGc.cpp previewDeletes). Comparing it
+        # against the CUMULATIVE multi-round deleted_total is unsound: right after a mass DROP most
+        # blobs are still unreachable/awaiting-gc and only condemned by LATER folds, so
+        # preview < cumulative is EXPECTED (2026-07-18 S31 RCA; the old "previews only shard 0"
+        # narrative was a misdiagnosis — preview == same-instant fsck pending_gc across BOTH
+        # shards). The sound completeness contract compares the preview to the SAME-INSTANT fsck
+        # pending classes captured right after the dryrun.
+        pending_now = None
+        fsck_post_drop = result.observations.get("fsck_after_drop")
+        if isinstance(fsck_post_drop, dict):
+            pending_now = fsck_post_drop.get("pending_gc")
+        if dry_count is None or pending_now is None:
             result.add(Verdict.inconclusive(
                 "ca-gc-dryrun completeness under gc_shards>1",
-                "dryrun preview count >= what GC actually deletes",
-                f"missing a comparable count (dry_count={dry_count}, "
-                f"gc_deleted_observable={gc_deleted_observable})"))
+                "dryrun preview covers the same-instant condemned set across all shards",
+                f"missing a comparable count (dry_count={dry_count}, pending_gc={pending_now})"))
         else:
-            # The KNOWN/EXPECTED outcome under gc_shards>1 is dryrun < actual (blind to shard>=1).
-            complete = dry_count >= gc_deleted_observable
+            complete = dry_count >= int(pending_now)
             result.add(Verdict.check(
                 "ca-gc-dryrun completeness under gc_shards>1",
-                "dryrun preview count >= what GC actually deletes (subset oracle complete)",
-                f"dryrun previewed {dry_count}; GC reclaimed ~{gc_deleted_observable}",
+                "dryrun preview count >= same-instant fsck pending_gc (all shards)",
+                f"dryrun previewed {dry_count}; fsck pending_gc {pending_now} "
+                f"(cumulative multi-round reclaim ~{deleted_total or blobs_reclaimed} is "
+                f"informational, not the oracle)",
                 complete,
                 "" if complete else
-                "ca-gc-dryrun previews only target shard 0; subset-oracle blind to shard>=1 under "
-                "gc_shards>1 (checklist #9) — dryrun under-counts deletable candidates"))
-            if not complete:
-                result.note_anomaly(
-                    "ca-gc-dryrun previews only target shard 0; subset-oracle blind to shard>=1 "
-                    f"under gc_shards>1 — previewed {dry_count} but GC reclaimed "
-                    f"~{gc_deleted_observable} (checklist #9). previewDeletes should iterate all "
-                    f"target shards, not just shard 0.")
+                "dryrun previewed fewer candidates than the same-instant condemned set — a real "
+                "coverage gap (all shards should be enumerated); investigate previewDeletes"))
 
         # No live tables remain. standard_end runs the common fixpoint + fsck/dryrun + event audit.
         end31 = _common.standard_end(ctx, result, [], table_filter="table LIKE 's31_%'")
