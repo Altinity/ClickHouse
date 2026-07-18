@@ -858,6 +858,11 @@ TEST(RefWriterAppendLane, I1AppendCorruptionSurfacesAndLaneStaysUsable)
 /// rev.6 Task 11 (spec §anomaly-policy): under the mount-lease exclusivity model this is no longer a
 /// possible protocol outcome (the wedged key is exclusively ours) -- it routes through
 /// `reportImpossibleInterference` and surfaces as `LOGICAL_ERROR` (was `CORRUPTED_DATA` pre-rev.6).
+/// The second dropRef below throws LOGICAL_ERROR (from the async future), which aborts the whole
+/// process in debug/sanitizer builds instead of behaving like a catchable exception --
+/// RefWriterAppendLaneDeathTest below proves the abort positively in those builds instead (it cannot
+/// also verify the hang-freedom this test verifies, since there IS no continuation after a real abort).
+#ifndef DEBUG_OR_SANITIZER_BUILD
 TEST(RefWriterAppendLane, I1WedgeResolveCorruptionSurfacesAndKeepsWedge)
 {
     CasRequestBudget budget;
@@ -912,15 +917,10 @@ TEST(RefWriterAppendLane, I1WedgeResolveCorruptionSurfacesAndKeepsWedge)
         << "a later same-table append hung -- the leader bookkeeping was not restored after the anomaly";
     fut2.get();
 }
+#endif
 
-/// ===================================================================================
-/// rev.6 Task 11: wedge hard contract + anomaly policy (spec §anomaly-policy)
-/// ===================================================================================
-
-/// Foreign bytes at a wedge key (see `I1WedgeResolveCorruptionSurfacesAndKeepsWedge` above for the
-/// hang-freedom coverage) must ALSO trip the local write fence closed and audit a `ForeignInterference`
-/// event -- the full anomaly-policy reaction, not just the LOGICAL_ERROR throw.
-TEST(CasAnomalyPolicy, ForeignBytesAtWedgeKeyTripFenceAndRemount)
+#if defined(DEBUG_OR_SANITIZER_BUILD)
+TEST(RefWriterAppendLaneDeathTest, I1WedgeResolveCorruptionSurfacesAndKeepsWedgeAborts)
 {
     CasRequestBudget budget;
     budget.max_attempts = 1;
@@ -931,11 +931,54 @@ TEST(CasAnomalyPolicy, ForeignBytesAtWedgeKeyTripFenceAndRemount)
     auto backend = std::make_shared<RefWriterTestBackend>();
     auto store = openPool(backend, budget);
     const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/i1_wedge"};
+    publishEmptyPart(store, ns, "x");
+    publishEmptyPart(store, ns, "y");
+
+    backend->fault_key_substr = layout.refsNamespacePrefix(ns) + "_log/";
+    backend->fault_count = 1;
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
+
+    const String wedged_key = store->wedgedKeyForTest(ns);
+    ASSERT_FALSE(wedged_key.empty());
+    ASSERT_EQ(backend->putIfAbsent(wedged_key, "a-different-object").outcome, PutOutcome::Done);
+
+    /// Synchronous here (unlike the release-build test above): the async/hang-freedom coverage is that
+    /// test's concern, not this death test's -- the only thing to prove here is that the wedge-resolve
+    /// anomaly aborts.
+    EXPECT_DEATH({ store->dropRef(ns, "y"); }, "");
+}
+#endif
+
+/// ===================================================================================
+/// rev.6 Task 11: wedge hard contract + anomaly policy (spec §anomaly-policy)
+/// ===================================================================================
+
+/// Foreign bytes at a wedge key (see `I1WedgeResolveCorruptionSurfacesAndKeepsWedge` above for the
+/// hang-freedom coverage) must ALSO trip the local write fence closed and audit a `ForeignInterference`
+/// event -- the full anomaly-policy reaction, not just the LOGICAL_ERROR throw.
+///
+/// The second dropRef below throws LOGICAL_ERROR, which aborts the whole process in debug/sanitizer
+/// builds instead of behaving like a catchable exception -- CasAnomalyPolicyDeathTest below proves the
+/// abort positively in those builds instead (it cannot also re-check the post-abort state this test
+/// verifies, since there IS no post-abort state in a real debug/sanitizer build).
+#ifndef DEBUG_OR_SANITIZER_BUILD
+TEST(CasAnomalyPolicy, ForeignBytesAtWedgeKeyTripFenceAndRemount)
+{
+    CasRequestBudget budget;
+    budget.max_attempts = 1;
+    budget.attempt_timeout_ms = 100;
+    budget.operation_deadline_ms = 100;
+    budget.lease_safety_margin_ms = 100;
+
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    std::vector<CasEvent> seen;   /// declared BEFORE the Pool so it outlives the background syncer's emits (ASan 2026-07-09)
+    auto store = openPool(backend, budget);
+    const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/anomaly_wedge"};
     publishEmptyPart(store, ns, "x");
     publishEmptyPart(store, ns, "y");
 
-    std::vector<CasEvent> seen;
     store->setEventSink([&](const CasEvent & e) { seen.push_back(e); });
 
     /// Wedge the lane with an ambiguous PUT that never landed.
@@ -971,6 +1014,35 @@ TEST(CasAnomalyPolicy, ForeignBytesAtWedgeKeyTripFenceAndRemount)
         [](const CasEvent & e) { return e.type == CasEventType::ForeignInterference; });
     EXPECT_TRUE(has_event) << "a ForeignInterference CasEvent must be audited";
 }
+#endif
+
+#if defined(DEBUG_OR_SANITIZER_BUILD)
+TEST(CasAnomalyPolicyDeathTest, ForeignBytesAtWedgeKeyTripFenceAndRemountAborts)
+{
+    CasRequestBudget budget;
+    budget.max_attempts = 1;
+    budget.attempt_timeout_ms = 100;
+    budget.operation_deadline_ms = 100;
+    budget.lease_safety_margin_ms = 100;
+
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend, budget);
+    const Layout & layout = store->layout();
+    const RootNamespace ns{"srv1/anomaly_wedge"};
+    publishEmptyPart(store, ns, "x");
+    publishEmptyPart(store, ns, "y");
+
+    backend->fault_key_substr = layout.refsNamespacePrefix(ns) + "_log/";
+    backend->fault_count = 1;
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->dropRef(ns, "x"); });
+
+    const String wedged_key = store->wedgedKeyForTest(ns);
+    ASSERT_FALSE(wedged_key.empty());
+    ASSERT_EQ(backend->putIfAbsent(wedged_key, "a-different-object").outcome, PutOutcome::Done);
+
+    EXPECT_DEATH({ store->dropRef(ns, "y"); }, "");
+}
+#endif
 
 /// The wedge hard contract's release-mode guard: an internal state where `rt->wedge` is STILL set at
 /// the new-id-allocation point (provably unreachable via any legitimate control flow -- the
@@ -978,15 +1050,21 @@ TEST(CasAnomalyPolicy, ForeignBytesAtWedgeKeyTripFenceAndRemount)
 /// to allocate rather than mint an id against a lane that might still be uncertain. Simulated by forcing
 /// the wedge directly via `setRefPreCarveHookForTest`'s injection point (AFTER the top-of-flush
 /// wedge-resolution check has already run clean, BEFORE the batch is carved).
+#ifndef DEBUG_OR_SANITIZER_BUILD
+/// dropRef below throws LOGICAL_ERROR (the wedge hard contract's release-mode guard), which aborts
+/// the whole process in debug/sanitizer builds instead of behaving like a catchable exception --
+/// CasAnomalyPolicyDeathTest.WedgeContractReleaseFailClosedAborts below proves the abort positively
+/// in those builds instead (it cannot also re-check the post-abort state this test verifies, since
+/// there IS no post-abort state in a real debug/sanitizer build).
 TEST(CasAnomalyPolicy, WedgeContractReleaseFailClosed)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
+    std::vector<CasEvent> seen;   /// declared BEFORE the Pool so it outlives the background syncer's emits (ASan 2026-07-09)
     auto store = openPool(backend);
     const Layout & layout = store->layout();
     const RootNamespace ns{"srv1/wedge_contract"};
     publishEmptyPart(store, ns, "x");
 
-    std::vector<CasEvent> seen;
     store->setEventSink([&](const CasEvent & e) { seen.push_back(e); });
 
     store->setRefPreCarveHookForTest([&]
@@ -1033,6 +1111,22 @@ TEST(CasAnomalyPolicy, WedgeContractReleaseFailClosed)
         [](const CasEvent & e) { return e.type == CasEventType::ForeignInterference; });
     EXPECT_TRUE(has_event) << "a ForeignInterference CasEvent must be audited";
 }
+#endif
+
+#if defined(DEBUG_OR_SANITIZER_BUILD)
+TEST(CasAnomalyPolicyDeathTest, WedgeContractReleaseFailClosedAborts)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"srv1/wedge_contract"};
+    publishEmptyPart(store, ns, "x");
+    store->setRefPreCarveHookForTest([&]
+    {
+        store->forceWedgeForTest(ns, /*writer_epoch*/ 1, /*ref_sequence*/ 1, "bogus/_log/key", "bogus-bytes");
+    });
+    EXPECT_DEATH({ store->dropRef(ns, "x"); }, "");
+}
+#endif
 
 /// I3: a conditional write whose attempt classified Committed but whose FINAL post-write fence check
 /// failed (the mount fence was lost after the write may have landed) is counted separately, not folded
@@ -1935,9 +2029,9 @@ TEST(RefWriterStalePrecommitSweep, FailedSweepRearmsAndRetriesUntilClean)
     config.cas_request_budget = budget;
     config.mount_lease_ttl_ms = std::chrono::milliseconds(10'000'000);
     config.boot_ms_fn = fake_clock;
+    std::vector<CasEvent> seen;   /// declared BEFORE the Pool so it outlives the background syncer's emits (ASan 2026-07-09)
     auto successor = openPoolWithConfig(backend, config);
 
-    std::vector<CasEvent> seen;
     successor->setEventSink([&](const CasEvent & e) { seen.push_back(e); });
 
     backend->fault_key_substr = layout.refsNamespacePrefix(ns) + "_log/";
@@ -2004,8 +2098,8 @@ TEST(RefWriterStalePrecommitSweep, VerifiedCleanSweepClearsFlagWithoutEvents)
         publishEmptyPart(predecessor, ns, "committed_x");   /// committed work only; nothing dangles
     }
 
+    std::vector<CasEvent> seen;   /// declared BEFORE the Pool so it outlives the background syncer's emits (ASan 2026-07-09)
     auto successor = openPool(backend);
-    std::vector<CasEvent> seen;
     successor->setEventSink([&](const CasEvent & e) { seen.push_back(e); });
 
     const uint64_t deferred_before = ProfileEvents::global_counters[ProfileEvents::CasRefSweepDeferred].load();
@@ -2813,6 +2907,7 @@ TEST(RefWriterRecoverySeal, EmptyDeadRegionCarveOutStillReportsSameProcessNamesp
     auto backend = std::make_shared<RefWriterTestBackend>();
     const Layout layout("p");
     const RootNamespace ns{"test/f1_empty_carveout"};   /// matches openPoolWithConfig's own server_root_id
+    std::vector<CasEvent> events;   /// declared BEFORE the Pool so it outlives the background syncer's emits (ASan 2026-07-09)
 
     seedUncleanPredecessorMount(*backend, layout, /*epoch=*/1);   /// predecessor dies uncleanly at epoch 1
 
@@ -2845,7 +2940,6 @@ TEST(RefWriterRecoverySeal, EmptyDeadRegionCarveOutStillReportsSameProcessNamesp
                 publishCommittedOps("a", manifestRef(1, 1, 1))[1]};
     writeRefLogTxnRaw(*backend, layout, late);
 
-    std::vector<CasEvent> events;
     store->setEventSink([&](const CasEvent & e) { events.push_back(e); });
 
     /// `prefix.writer_epoch (1) < store's live epoch (2)` makes `prefixEligible` return true
