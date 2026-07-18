@@ -1067,8 +1067,15 @@ TEST(CaWiringOps, VerbatimMoveIsIdempotentOnRedrive)
 /// B124: moveDirectory's staged-merge is source-wins, and a genuine collision (the same mutable file
 /// staged under BOTH the source and destination part keys with DIFFERING bytes) fails loud instead of
 /// silently dropping a just-written file. Identical bytes are a benign idempotent re-key.
+///
+/// The "fails loud" collision throws LOGICAL_ERROR, which aborts the whole process in debug/sanitizer
+/// builds (Exception.cpp's handle_error_code) instead of behaving like a catchable exception -- so
+/// EXPECT_ANY_THROW only makes sense in a plain release build. CaWiringOpsDeathTest below proves the
+/// SAME collision positively aborts under debug/sanitizer builds instead (same pattern as the existing
+/// CasBlobDigestDeathTest precedent).
 TEST(CaWiringOps, MoveDirectoryMutableCollisionPolicy)
 {
+#ifndef DEBUG_OR_SANITIZER_BUILD
     /// Differing bytes → fail loud.
     {
         auto storage = openWiringStorage();
@@ -1078,6 +1085,7 @@ TEST(CaWiringOps, MoveDirectoryMutableCollisionPolicy)
         auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
         EXPECT_ANY_THROW(ca_tx.moveDirectory("uui/uuid-1/tmp_x", "uui/uuid-1/all_9_9_9"));
     }
+#endif
     /// Identical bytes → benign, no throw (source-wins, idempotent). Both parts carry real content so
     /// the eager publish-at-rename builds a proper ref (a mutable-only staging would instead hit
     /// updateRefPayload on a not-yet-committed ref — unrelated to the collision policy under test).
@@ -1095,6 +1103,21 @@ TEST(CaWiringOps, MoveDirectoryMutableCollisionPolicy)
         EXPECT_NO_THROW(ca_tx.moveDirectory("uui/uuid-1/tmp_y", "uui/uuid-1/all_8_8_8"));
     }
 }
+
+#if defined(DEBUG_OR_SANITIZER_BUILD)
+/// Debug/sanitizer-build counterpart to MoveDirectoryMutableCollisionPolicy's "differing bytes → fail
+/// loud" case: LOGICAL_ERROR aborts the process here instead of throwing a catchable exception, so the
+/// check must be a death test (same pattern as CasBlobDigestDeathTest in gtest_cas_blob_digest.cpp).
+TEST(CaWiringOpsDeathTest, MoveDirectoryMutableCollisionPolicyAborts)
+{
+    auto storage = openWiringStorage();
+    auto tx = storage->createTransaction();
+    writeThroughTransaction(*tx, "uui/uuid-1/tmp_x/txn_version.txt", "A");
+    writeThroughTransaction(*tx, "uui/uuid-1/all_9_9_9/txn_version.txt", "B");
+    auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
+    EXPECT_DEATH({ ca_tx.moveDirectory("uui/uuid-1/tmp_x", "uui/uuid-1/all_9_9_9"); }, "");
+}
+#endif
 
 /// D3 review pin: moveDirectory's staged-merge collision code has four (src build?, dst build?)
 /// combinations. This one — destination already holds a staged PartWriteTxn, source has none — proved
@@ -1125,9 +1148,16 @@ TEST(CaWiringOps, MoveDirectoryMutableCollisionPolicy)
 /// either way" — so a future regression that gives the source a PartWriteTxn again fails this test loudly.
 TEST(CaWiringOps, MoveDirectoryOntoExistingDestinationBuildSurvives)
 {
+    std::vector<DB::Cas::CasEvent> events;   /// declared BEFORE the Pool so it outlives the background syncer's emits (ASan 2026-07-09)
     auto storage = openWiringStorage();
-    std::vector<DB::Cas::CasEvent> events;
     storage->store()->setEventSink([&](const DB::Cas::CasEvent & e) { events.push_back(e); });
+
+    /// unlinkFile now honors if_exists=false (triage #24, 8fc0c964a5b): the target must be real. Commit
+    /// it in its own transaction first so the removal below targets a genuinely-committed file, not a
+    /// never-existed path.
+    auto setup_tx = storage->createTransaction();
+    writeThroughTransaction(*setup_tx, "uui/uuid-1/tmp_z/txn_version.txt", "creation_tid: (7,7,00000000-0000-0000-0000-000000000000)");
+    setup_tx->commit(DB::NoCommitOptions{});
 
     auto tx = storage->createTransaction();
     /// Destination already has a real blob upload staged -> a live PartWriteTxn.
@@ -1634,11 +1664,17 @@ TEST(CaWiringWrite, PartialCommitRollsBackPublishedParts)
     /// all_1_1_0 durably visible: a partial commit. PERSISTENT (`>= 2`, not one-shot): the manifest
     /// body PUT rides the CAS request controller (Task B), which absorbs a transient fault by design —
     /// only a fault that outlasts the whole attempt budget fails the publish (as ABORTED).
+    /// CORRUPTED_DATA (not LOGICAL_ERROR): `handle_error_code` (Exception.cpp) aborts the whole
+    /// process for LOGICAL_ERROR under debug/sanitizer builds, since that code means "an internal
+    /// invariant broke" there -- but this is a simulated BACKEND write failure, not an invariant
+    /// violation, so it must stay a catchable exception. CORRUPTED_DATA keeps the exact same
+    /// `isDeterministicLocalFailure` classification LOGICAL_ERROR had (CasRequestControl.cpp), so the
+    /// controller's retry/exhaustion behavior under test is unchanged.
     int manifest_writes = 0;
     faulty->on_write = [&](const std::string & path)
     {
         if (isPartManifestBodyPath(path) && ++manifest_writes >= 2)
-            throw DB::Exception(DB::ErrorCodes::LOGICAL_ERROR, "injected publish failure (B122)");
+            throw DB::Exception(DB::ErrorCodes::CORRUPTED_DATA, "injected publish failure (B122)");
     };
 
     EXPECT_THROW(tx->commit(DB::NoCommitOptions{}), DB::Exception);
