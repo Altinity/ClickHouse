@@ -1362,7 +1362,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
                                      std::move(deltas), result.fold_seal.blob_target_runs,
                                      current_round, condemn_round, head_blob, peek_head,
                                      confirm_condemned_marker,
-                                     &result.retired_merge[0], suppress_destructive);
+                                     result.retired_merge.data(), suppress_destructive);
             result.fold_seal.condemned_summary[0] = summarize(result.retired_merge[0].still_retired);
         }
     }

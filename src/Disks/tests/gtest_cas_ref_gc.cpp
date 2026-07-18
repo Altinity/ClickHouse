@@ -296,6 +296,7 @@ TEST(CasRefGc, RefObjectCleanupHonorsAllThreeConditions)
     const String old_snap_key = layout.refSnapshotKey(ns, RefTxnId{1, v1});
     const String new_snap_key = layout.refSnapshotKey(ns, RefTxnId{1, v2});
     ASSERT_TRUE(backend->head(log_v1_key).exists);
+    ASSERT_TRUE(backend->head(log_v2_key).exists);
     ASSERT_TRUE(backend->head(old_snap_key).exists);
 
     Gc gc(store, kGc);
@@ -304,6 +305,12 @@ TEST(CasRefGc, RefObjectCleanupHonorsAllThreeConditions)
     /// log v1: snapshot-covered (X=v2 >= v1) AND cursor-covered (durable cursor v2 >= v1) => DELETED.
     EXPECT_FALSE(backend->head(log_v1_key).exists)
         << "a log covered by BOTH the newest snapshot and the durable cursor must be deleted";
+    /// log v2 (the frontier log): the coverage/cursor boundary is `<=`, not `<`, so the log for the
+    /// newest committed transition is deletable too once its own snapshot is durable -- only the
+    /// SNAPSHOT boundary is strict `<` (checked below). Unlike the newest snapshot, the newest log is
+    /// NOT specially retained.
+    EXPECT_FALSE(backend->head(log_v2_key).exists)
+        << "the log for the newest committed transition must also be deleted once it is snapshot- and cursor-covered";
     /// the older snapshot (< newest) is deleted; the newest is retained.
     EXPECT_FALSE(backend->head(old_snap_key).exists) << "an older snapshot must be deleted";
     EXPECT_TRUE(backend->head(new_snap_key).exists) << "the newest snapshot must be retained";

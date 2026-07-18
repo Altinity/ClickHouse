@@ -635,8 +635,8 @@ TEST(CasHeartbeatFloor, StableTokenPastThresholdIsFenced)
     seedMount(*b, l, "s1", /*expires*/ 10, /*fenced*/ false, /*min_active*/ 0);
 
     MountObservationMap obs;
-    const HeartbeatFloor floor1 = computeHeartbeatFloor(*b, l, kNowMs, /*mono*/ 0, kStableThresholdMs, obs);
-    EXPECT_EQ(floor1.fenced_now, 0u);
+    const HeartbeatFloor floor_before = computeHeartbeatFloor(*b, l, kNowMs, /*mono*/ 0, kStableThresholdMs, obs);
+    EXPECT_EQ(floor_before.fenced_now, 0u);
 
     const MountLease before = decodeMountLease(b->get(l.mountKey("s1"))->bytes);
 
@@ -730,11 +730,11 @@ TEST(CasHeartbeatFloor, ClassifiesAndFencesOut)
     MountObservationMap obs;
 
     /// Round 1 (mono 0): first sight of every non-terminal mount — nothing is fence-eligible yet.
-    const HeartbeatFloor floor1 = computeHeartbeatFloor(*b, l, kNowMs, /*mono*/ 0, kStableThresholdMs, obs);
-    EXPECT_EQ(floor1.live, 3u);            // s1, s2, s3: observation just started
-    EXPECT_EQ(floor1.terminated, 1u);      // s5
-    EXPECT_EQ(floor1.fenced_now, 0u);
-    EXPECT_EQ(floor1.already_fenced, 1u);  // s4
+    const HeartbeatFloor floor_before = computeHeartbeatFloor(*b, l, kNowMs, /*mono*/ 0, kStableThresholdMs, obs);
+    EXPECT_EQ(floor_before.live, 3u);            // s1, s2, s3: observation just started
+    EXPECT_EQ(floor_before.terminated, 1u);      // s5
+    EXPECT_EQ(floor_before.fenced_now, 0u);
+    EXPECT_EQ(floor_before.already_fenced, 1u);  // s4
 
     /// s1 and s2 renew between rounds (as a live keeper would); s3 does not (it crashed).
     renewMount(*b, l, "s1");
@@ -823,8 +823,8 @@ TEST(CasHeartbeatFloor, FenceOutLosesTokenRaceReclassifiesLive)
     MountObservationMap obs;
     /// Round 1: first sight, observation starts — never reaches the fence-out path (the race
     /// decorator stays armed for round 2).
-    const HeartbeatFloor floor1 = computeHeartbeatFloor(*b, l, kNowMs, /*mono*/ 0, kStableThresholdMs, obs);
-    EXPECT_EQ(floor1.fenced_now, 0u);
+    const HeartbeatFloor floor_before = computeHeartbeatFloor(*b, l, kNowMs, /*mono*/ 0, kStableThresholdMs, obs);
+    EXPECT_EQ(floor_before.fenced_now, 0u);
 
     /// Round 2: the token has been stable past threshold, so the function attempts the fence-out.
     /// The decorator renews concurrently under the real token, the PUT hits PreconditionFailed, the

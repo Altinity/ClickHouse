@@ -128,7 +128,7 @@ public:
     /// fresh GC identity because `rebuildBaseline` performs its own lease check. A refused rebuild
     /// (`report.performed == false`) writes nothing; the `SYSTEM` interpreter surfaces the refusal.
     /// Throws `BAD_ARGUMENTS` when GC is disabled by read-only mode or configuration.
-    Cas::RebuildReport runGcRebuildNow(bool force);
+    Cas::RebuildReport runGcRebuildNow(bool force) const;
 
     /// Returns per-disk GC health for `system.content_addressed_mounts`. Returns nullopt when this
     /// disk has no scheduler because GC is disabled, the disk is read-only, or startup has not run.

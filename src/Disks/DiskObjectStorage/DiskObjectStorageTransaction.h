@@ -127,7 +127,6 @@ protected:
         const ReadSettings & read_settings,
         const WriteSettings & write_settings);
 
-protected:
     /// [TXN-ONE-PIPELINE] Route one metadata effect either into the FIFO replay queue (ordinary object
     /// storage) or straight to the metadata transaction at call time (eager staging overlay, e.g. CA).
     template <typename Operation>

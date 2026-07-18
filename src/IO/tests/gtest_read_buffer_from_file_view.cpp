@@ -260,6 +260,8 @@ TEST_P(ReadBufferFromFileViewTest, RandomizedOps)
                     model_until = until;
                     break;
                 }
+                default:
+                    UNREACHABLE();
             }
             ASSERT_EQ(view->getPosition(), static_cast<off_t>(model_pos)) << "seed " << seed << " step " << step;
         }

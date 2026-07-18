@@ -824,7 +824,7 @@ void DiskObjectStorage::prepareRead(
     std::optional<ContentAddressedMetadataStorage::BlobViewPlan> ca_blob_view;
     if (metadata_storage->isContentAddressed())
     {
-        auto * ca = dynamic_cast<const ContentAddressedMetadataStorage *>(metadata_storage.get());
+        const auto * ca = dynamic_cast<const ContentAddressedMetadataStorage *>(metadata_storage.get());
         if (ca)
         {
             if (ca->prepareInManifestRead(path, settings, pipeline))

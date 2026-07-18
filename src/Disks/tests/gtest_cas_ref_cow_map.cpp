@@ -335,6 +335,8 @@ TEST(CasRefCowMap, PropertyMatchesStdMapOverRandomOps)
                     actual.materialize();
                     break;
                 }
+                default:
+                    UNREACHABLE();
             }
 
             ASSERT_EQ(oracle.size(), actual.size()) << "trial " << trial << " step " << step;

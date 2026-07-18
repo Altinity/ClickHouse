@@ -1247,7 +1247,7 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
                     "hit the same failure: {}",
                     ns.string(), id.writer_epoch, id.ref_sequence, detail);
                 complete_error(survivors, std::make_exception_ptr(rethrown));
-                throw rethrown;
+                throw rethrown; /// NOLINT(cert-err09-cpp,cert-err61-cpp,misc-throw-by-value-catch-by-reference) -- reused above via make_exception_ptr, cannot be an anonymous temporary
             }
             ProfileEvents::increment(ProfileEvents::CasRefBatchFlushes);
             ProfileEvents::increment(ProfileEvents::CasRefBatchedMutations, survivors.size());

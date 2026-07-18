@@ -54,7 +54,7 @@ void signRequestGOOG4(
     std::chrono::system_clock::time_point now)
 {
     const std::time_t now_t = std::chrono::system_clock::to_time_t(now);
-    std::tm tm_utc;
+    std::tm tm_utc{};
     gmtime_r(&now_t, &tm_utc);
     const std::string timestamp = fmt::format(
         "{:04}{:02}{:02}T{:02}{:02}{:02}Z",

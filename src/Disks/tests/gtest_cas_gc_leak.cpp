@@ -34,7 +34,6 @@ using DB::Cas::tests::idOf;
 using DB::Cas::tests::u128Of;
 using DB::Cas::tests::inDegreeOf;
 using DB::Cas::tests::publishCommittedTransition;
-using DB::Cas::tests::appendOwnerEvent;
 
 namespace
 {

@@ -368,7 +368,7 @@ Cas::RoundReport ContentAddressedMetadataStorage::runGarbageCollectionRoundNow()
     return sched->runOneRoundNow(Cas::GcRoundLogRecord::Trigger::Manual);
 }
 
-Cas::RebuildReport ContentAddressedMetadataStorage::runGcRebuildNow(bool force)
+Cas::RebuildReport ContentAddressedMetadataStorage::runGcRebuildNow(bool force) const
 {
     if (read_only || !gc_enabled)
         throw Exception(ErrorCodes::BAD_ARGUMENTS,

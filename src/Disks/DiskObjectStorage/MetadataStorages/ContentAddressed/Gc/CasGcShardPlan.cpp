@@ -49,7 +49,7 @@ std::vector<RunRef> ShardReducer::reduce(Backend & backend, const Layout & layou
                                          const std::function<std::optional<HeadResult>(const BlobRef &)> & peek_head,
                                          const std::function<bool(const RetiredEntry &)> & confirm_condemned_marker,
                                          RetiredMergeResult * out_retired,
-                                         bool suppress_destructive)
+                                         bool suppress_destructive) const
 {
     std::vector<RunRef> out_runs;
     foldDeltasIntoGeneration(backend, layout, prior_runs, new_generation, attempt, shard,

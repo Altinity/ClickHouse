@@ -56,9 +56,11 @@ TEST(CasEvent, PoolEmitsToSink)
     s->emitEvent(std::move(e));
     ASSERT_EQ(seen.size(), 1u);
     EXPECT_EQ(seen[0].type, CasEventType::BlobPut);
-    /// null sink => no-op (no crash, no row)
+    /// null sink => no-op (no crash, no row); a fresh event, not the one already moved above.
     s->setEventSink(nullptr);
-    s->emitEvent(std::move(e));
+    CasEvent e2;
+    e2.type = CasEventType::BlobPut;
+    s->emitEvent(std::move(e2));
     EXPECT_EQ(seen.size(), 1u);
 }
 
@@ -84,9 +86,10 @@ TEST(CasEvent, EmitEventMovesSourceIntoSink)
     s->emitEvent(std::move(e));
     EXPECT_EQ(captured_reason, "sentinel-reason");
     EXPECT_EQ(captured_detail.at("k"), "v");
-    /// the source event must be MOVED-FROM after emit, not merely aliased/copied through
-    EXPECT_TRUE(e.reason.empty());
-    EXPECT_TRUE(e.detail.empty());
+    /// the source event must be MOVED-FROM after emit, not merely aliased/copied through -- reading
+    /// `e` here is the whole point of the test, not an oversight.
+    EXPECT_TRUE(e.reason.empty()); // NOLINT(bugprone-use-after-move, hicpp-invalid-access-moved)
+    EXPECT_TRUE(e.detail.empty()); // NOLINT(bugprone-use-after-move, hicpp-invalid-access-moved)
 }
 
 namespace

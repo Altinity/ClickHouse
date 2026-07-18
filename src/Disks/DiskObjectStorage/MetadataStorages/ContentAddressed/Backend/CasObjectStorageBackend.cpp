@@ -437,7 +437,7 @@ static String readObjectRanged(IObjectStorage & object_storage, const String & p
     /// Native callers already HEAD the key, so passing its size avoids another metadata round trip.
     /// A zero size means the caller does not know it and metadata must be fetched here.
     const uint64_t object_size = known_size != 0 ? known_size
-        : static_cast<uint64_t>(object_storage.getObjectMetadata(path, /*with_tags=*/false).size_bytes);
+        : object_storage.getObjectMetadata(path, /*with_tags=*/false).size_bytes;
     if (range.offset >= object_size)
         return {};
 
@@ -476,7 +476,7 @@ static std::unique_ptr<ReadBuffer> openObjectRangedStream(IObjectStorage & objec
     /// As in `readObjectRanged`, a caller-supplied size avoids another metadata round trip; zero means
     /// that the size is unknown and must be fetched.
     const uint64_t object_size = known_size != 0 ? known_size
-        : static_cast<uint64_t>(object_storage.getObjectMetadata(path, /*with_tags=*/false).size_bytes);
+        : object_storage.getObjectMetadata(path, /*with_tags=*/false).size_bytes;
     if (range.offset >= object_size)
         return std::make_unique<ReadBufferFromString>(std::string_view{});
 

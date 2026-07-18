@@ -216,8 +216,8 @@ RefTableSnapshot decodeRefTableSnapshot(
 
     {
         const String line = readLine(in, line_cap, "cas_ref_snap");
-        ReadBufferFromMemory m(line.data(), line.size());
-        JsonObjectReader r(m, KeyStrictness::Tolerant, "cas_ref_snap");
+        ReadBufferFromMemory meta_buf(line.data(), line.size());
+        JsonObjectReader r(meta_buf, KeyStrictness::Tolerant, "cas_ref_snap");
         bool saw_ns = false;
         bool saw_we = false;
         bool saw_rs = false;
@@ -253,7 +253,7 @@ RefTableSnapshot decodeRefTableSnapshot(
                 throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableSnapshot: sealed_from needs both sfe and sfs");
             snapshot.sealed_from = RefTxnId{*sfe, *sfs};
         }
-        if (!m.eof())
+        if (!meta_buf.eof())
             throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableSnapshot: junk after meta line");
     }
 
