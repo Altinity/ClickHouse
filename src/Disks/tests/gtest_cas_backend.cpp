@@ -18,6 +18,7 @@
 #include <IO/ReadBufferFromFileBase.h>
 #include <IO/ReadSettings.h>
 #include <IO/S3Common.h>
+#include <chrono>
 #include <filesystem>
 #include <map>
 #include <mutex>
@@ -744,6 +745,94 @@ TEST(CasObjectStorageBackend, EmuTokenDisambiguatesSameEtagRewrite)
     /// A stale delete using the FIRST incarnation's token must not match the live (second) one.
     EXPECT_EQ(backend.deleteExact("k/tick", put1.token).kind, DeleteOutcome::Kind::TokenMismatch);
     EXPECT_TRUE(backend.head("k/tick").exists);
+}
+
+namespace
+{
+
+/// A `LocalObjectStorage` that always reports a caller-supplied, fixed NUMERIC etag string — lets a
+/// test pin `emuMintToken`'s etag input to a precise, controlled nanosecond value (an old timestamp
+/// vs. one close to "now") regardless of the real filesystem clock. Used to test the
+/// `emu_token_state` erase-on-delete bound (codex-review-triage §3.18, Important #1): the entry
+/// must be erased only when the deleted incarnation's own etag is comfortably in the past.
+class FixedNumericEtagLocalObjectStorage final : public DB::LocalObjectStorage
+{
+public:
+    FixedNumericEtagLocalObjectStorage(DB::LocalObjectStorageSettings settings, String etag_)
+        : DB::LocalObjectStorage(std::move(settings)), etag(std::move(etag_))
+    {
+    }
+
+    std::optional<DB::ObjectMetadata> tryGetObjectMetadata(const std::string & path, bool with_tags) const override
+    {
+        auto metadata = DB::LocalObjectStorage::tryGetObjectMetadata(path, with_tags);
+        if (metadata)
+            metadata->etag = etag;
+        return metadata;
+    }
+
+private:
+    String etag;
+};
+
+DB::ObjectStoragePtr makeFixedNumericEtagStorageForTest(const String & etag)
+{
+    static std::atomic<uint64_t> counter{0};
+    const auto unique = std::to_string(::getpid()) + "_" + std::to_string(counter.fetch_add(1));
+    const auto root = (std::filesystem::temp_directory_path() / ("cas_fixed_numeric_etag_unit_" + unique)).string();
+
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+    std::filesystem::create_directories(root, ec);
+
+    DB::LocalObjectStorageSettings settings("test", root, /*read_only_=*/false);
+    return std::make_shared<FixedNumericEtagLocalObjectStorage>(std::move(settings), etag);
+}
+
+}
+
+/// codex-review-triage §3.18, Important #1: `emu_token_state` must be BOUNDED, not grow for the
+/// lifetime of the backend instance. `deleteExact` erases a key's entry only when its last-minted
+/// etag is comfortably (>= 2s) in the past — recent enough to still collide with an immediate
+/// same-process recreate must be RETAINED (the mtime-quantum guard stays intact).
+TEST(CasObjectStorageBackend, DeleteExactErasesEmuTokenStateOnlyWhenEtagIsComfortablyOld)
+{
+    /// An etag far in the past (nanoseconds since epoch, ~2001): delete must erase the entry, so an
+    /// immediate recreate reporting the SAME fixed etag is treated as a brand-new incarnation (bare
+    /// etag, no disambiguator) rather than a same-quantum tie with the just-consumed delete token.
+    {
+        const String old_etag = "1000000000000000000";
+        ObjectStorageBackend backend(makeFixedNumericEtagStorageForTest(old_etag), ObjectStorageBackend::Mode::EmulatedSingleProcess);
+
+        const auto put1 = backend.putIfAbsent("k/old", "v1");
+        ASSERT_EQ(put1.outcome, PutOutcome::Done);
+        ASSERT_EQ(put1.token.value, old_etag);
+        ASSERT_EQ(backend.deleteExact("k/old", put1.token).kind, DeleteOutcome::Kind::Deleted);
+
+        const auto put2 = backend.putIfAbsent("k/old", "v2");
+        ASSERT_EQ(put2.outcome, PutOutcome::Done);
+        EXPECT_EQ(put2.token.value, old_etag) << "entry should have been erased on delete (etag comfortably old), "
+                                                  "so the recreate mints the bare etag, not a disambiguated one";
+    }
+
+    /// An etag within the safety margin of "now": delete must RETAIN the entry, so the same
+    /// immediate-recreate scenario still gets disambiguated -- the guard this bound must not break.
+    {
+        const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        const String recent_etag = std::to_string(now_ns);
+        ObjectStorageBackend backend(makeFixedNumericEtagStorageForTest(recent_etag), ObjectStorageBackend::Mode::EmulatedSingleProcess);
+
+        const auto put1 = backend.putIfAbsent("k/fresh", "v1");
+        ASSERT_EQ(put1.outcome, PutOutcome::Done);
+        ASSERT_EQ(put1.token.value, recent_etag);
+        ASSERT_EQ(backend.deleteExact("k/fresh", put1.token).kind, DeleteOutcome::Kind::Deleted);
+
+        const auto put2 = backend.putIfAbsent("k/fresh", "v2");
+        ASSERT_EQ(put2.outcome, PutOutcome::Done);
+        EXPECT_EQ(put2.token.value, recent_etag + "#1") << "entry should have been RETAINED on delete (etag recent), "
+                                                            "so the recreate is disambiguated against it";
+    }
 }
 
 namespace

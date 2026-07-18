@@ -190,9 +190,14 @@ private:
     std::shared_ptr<const S3::Client> single_attempt_s3_client;
 #endif
 
-    /// EmulatedSingleProcess state: per-key {etag, disambiguator} — see emuMintToken. NEVER erased on
-    /// delete: retaining a deleted key's last-minted etag is exactly what lets an immediate
-    /// delete+recreate WITHIN this process disambiguate a same-mtime-quantum collision.
+    /// EmulatedSingleProcess state: per-key {etag, disambiguator} — see emuMintToken. An entry is
+    /// retained on delete ONLY while its etag is still recent enough that an immediate delete+recreate
+    /// WITHIN this process could land in the same mtime quantum (see etagComfortablyInThePast in the
+    /// .cpp) — that is the ONLY case the guard exists to disambiguate. Once the etag is comfortably
+    /// behind "now", `deleteExact` erases the entry: EmulatedSingleProcess backs every local-CA disk,
+    /// including multi-hour soak/CI clusters with heavy GC delete churn on keys that never recur, so
+    /// this map must not grow for the lifetime of the backend instance (codex-review-triage §3.18,
+    /// Important #1).
     std::mutex emu_mutex;
     std::map<String, std::pair<String, uint64_t>> emu_token_state;
     /// Fallback nonce for the (anomalous) case where the object storage reports an EMPTY etag: mints a

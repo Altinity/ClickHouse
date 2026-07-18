@@ -90,7 +90,14 @@ void runCapabilityProbe(Backend & backend, const String & probe_prefix)
             /// tokens must be format-valid for EVERY token kind, merely guaranteed-wrong. A huge
             /// numeric is a wrong ETag on AWS (412), a wrong generation on GCS (412), and a wrong
             /// sequence on the emulated backends (TokenMismatch).
-            Token wrong_token{"900000000000000001", TokenType::Emulated};
+            ///
+            /// The TYPE must be the LIVE dialect (t1.type, just observed from this same backend),
+            /// never a hardcoded TokenType::Emulated: a backend that mints a different dialect
+            /// (e.g. Native/ETag) rejects a foreign-dialect token locally, before the wrong VALUE
+            /// ever reaches the wire — which would make this check pass vacuously against a
+            /// non-enforcing store instead of proving enforcement (codex-review-triage §3.18,
+            /// Critical: the №19 local dialect guard must not defeat this probe).
+            Token wrong_token{"900000000000000001", t1.type};
             const auto outcome = backend.putOverwrite(key, "clobbered", wrong_token).outcome;
             if (outcome != PutOutcome::PreconditionFailed)
                 throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED,
@@ -140,7 +147,7 @@ void runCapabilityProbe(Backend & backend, const String & probe_prefix)
         }
         // 5c: conflict on stale token.
         {
-            Token stale{"900000000000000002", TokenType::Emulated};   /// numeric: see step 3
+            Token stale{"900000000000000002", ct1.type};   /// numeric + live dialect: see step 3
             const auto outcome = backend.casPut(cas_key, "cas-s1y", stale).outcome;
             if (outcome != CasOutcome::Conflict)
                 throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED,
@@ -169,7 +176,7 @@ void runCapabilityProbe(Backend & backend, const String & probe_prefix)
 
         // ---- Step 6: deleteExact wrong token → TokenMismatch AND the object still readable. ----
         {
-            Token wrong_token{"900000000000000003", TokenType::Emulated};   /// numeric: see step 3
+            Token wrong_token{"900000000000000003", t2.type};   /// numeric + live dialect: see step 3
             const auto d = backend.deleteExact(key, wrong_token);
             if (d.kind != DeleteOutcome::Kind::TokenMismatch)
                 throw DB::Exception(DB::ErrorCodes::NOT_IMPLEMENTED,

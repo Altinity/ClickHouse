@@ -25,6 +25,7 @@
 #endif
 
 #include <algorithm>
+#include <chrono>
 
 namespace DB
 {
@@ -499,6 +500,44 @@ ReadSettings casSizedReadSettings(const ReadSettings & base, uint64_t known_size
 /// Emulated helpers (caller holds emu_mutex)
 /// =========================================================================================
 
+namespace
+{
+
+/// The mtime-quantum guard (emuMintToken) only needs a key's `emu_token_state` entry while a
+/// same-quantum tie is still POSSIBLE for a FRESH recreate — i.e. while the just-deleted
+/// incarnation's own etag (mtime-ns, see emuMintToken) is recent. Once it is comfortably behind
+/// "now", no later recreate can land in the same mtime quantum, so retaining the entry serves no
+/// purpose (codex-review-triage §3.18, Important #1). 2 seconds is far above any filesystem's mtime
+/// tick coarseness while still bounding the map to the recently-deleted-key population.
+constexpr uint64_t EMU_TOKEN_STALE_AGE_NS = 2'000'000'000ULL;
+
+/// True iff `etag` parses as a plain nanosecond count (emuMintToken's `.first` is always the BARE
+/// etag, never the `etag#N` disambiguated form) that is at least EMU_TOKEN_STALE_AGE_NS behind now.
+/// An etag that fails to parse (e.g. a test double's non-numeric stub) is conservatively treated as
+/// NOT stale — never erasing is always safe, merely un-bounded, so an unparseable value must not be
+/// mistaken for a recent one.
+bool etagComfortablyInThePast(const String & etag)
+{
+    if (etag.empty() || !std::all_of(etag.begin(), etag.end(), [](char c) { return c >= '0' && c <= '9'; }))
+        return false;
+
+    uint64_t etag_ns = 0;
+    try
+    {
+        etag_ns = std::stoull(etag);
+    }
+    catch (...)
+    {
+        return false;
+    }
+
+    const auto now_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+    return now_ns > etag_ns && (now_ns - etag_ns) >= EMU_TOKEN_STALE_AGE_NS;
+}
+
+}
+
 String ObjectStorageBackend::emuPath(const String & key) const
 {
     if (emu_root.empty())
@@ -880,9 +919,12 @@ DeleteOutcome ObjectStorageBackend::deleteExact(const String & key, const Token 
     }
 
     object_storage->removeObjectIfExists(StoredObject(emuPath(key)));
-    /// `emu_token_state` is deliberately NOT erased here: keeping the deleted incarnation's last-minted
-    /// etag around is exactly what lets an immediate delete+recreate within THIS process disambiguate a
-    /// same-mtime-quantum collision (emuMintToken) instead of silently re-minting the same value.
+    /// Keep the deleted incarnation's last-minted etag around ONLY while a same-mtime-quantum
+    /// collision with an immediate recreate is still possible (emuMintToken) — once it is
+    /// comfortably old, erase it so `emu_token_state` does not grow for the lifetime of the backend
+    /// instance (codex-review-triage §3.18, Important #1).
+    if (auto it = emu_token_state.find(key); it != emu_token_state.end() && etagComfortablyInThePast(it->second.first))
+        emu_token_state.erase(it);
     d.kind = DeleteOutcome::Kind::Deleted;
     return d;
 }

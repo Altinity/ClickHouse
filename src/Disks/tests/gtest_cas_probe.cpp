@@ -165,3 +165,134 @@ TEST(CasProbe, MissingSingleAttemptClientFiresThroughInstrumentedWrapper)
     InstrumentedBackend wrapped(inner);
     EXPECT_THROW(runCapabilityProbe(wrapped, "p/.cas_probe"), DB::Exception);
 }
+
+namespace
+{
+
+/// Models the exact shape of the trust-flip this suite must catch a regression of
+/// (codex-review-triage §3.18, Critical): like the production `ObjectStorageBackend` in Native mode,
+/// this backend mints and expects tokens under a dialect (`TokenType::ETag`) OTHER than
+/// `TokenType::Emulated`, and rejects a foreign-dialect `expected`/`token` argument LOCALLY --
+/// before the value it carries ever reaches the real conditional-compare beneath the gate (`inner`,
+/// a genuinely enforcing `InMemoryBackend`, standing in for "the wire"). Every gated method counts
+/// how many times it actually delegated to `inner`, so a test can tell "rejected by the dialect
+/// gate" apart from "rejected by the real enforcement" -- the exact distinction `Cas::Probe` exists
+/// to prove, and the one the №19 hardening risked collapsing (see CasProbe.cpp step 3/5c/6).
+class DialectGatedCountingBackend final : public Backend
+{
+public:
+    std::optional<GetResult> get(const String & key, Range range = {}) override { return inner.get(key, range); }
+
+    std::optional<GetStreamResult> getStream(const String & key, Range range = {}) override { return inner.getStream(key, range); }
+
+    HeadResult head(const String & key) override
+    {
+        HeadResult r = inner.head(key);
+        if (r.exists)
+            r.token.type = TokenType::ETag;
+        return r;
+    }
+
+    bool supportsListTokens() const override { return inner.supportsListTokens(); }
+
+    PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta = {}) override
+    {
+        /// No `expected` token to gate -- matches production (ObjectStorageBackend::putIfAbsent has
+        /// no dialect check either).
+        PutResult r = inner.putIfAbsent(key, bytes, meta);
+        if (r.outcome == PutOutcome::Done)
+            r.token.type = TokenType::ETag;
+        return r;
+    }
+
+    WriteSinkPtr putIfAbsentStream(const String & key, const ObjectMeta & meta = {}) override { return inner.putIfAbsentStream(key, meta); }
+
+    PutResult putOverwrite(const String & key, const String & bytes, const Token & expected, const ObjectMeta & meta = {}) override
+    {
+        if (expected.type != TokenType::ETag)
+            return {PutOutcome::PreconditionFailed, {}};   /// dialect-gated: never reaches `inner`
+        ++overwrite_reached;
+        PutResult r = inner.putOverwrite(key, bytes, Token{expected.value, TokenType::Emulated}, meta);
+        if (r.outcome == PutOutcome::Done)
+            r.token.type = TokenType::ETag;
+        return r;
+    }
+
+    CasResult casPut(const String & key, const String & bytes, const std::optional<Token> & expected, const ObjectMeta & meta = {}) override
+    {
+        if (expected.has_value() && expected->type != TokenType::ETag)
+            return {CasOutcome::Conflict, {}};   /// dialect-gated: never reaches `inner`
+        ++casput_reached;
+        std::optional<Token> retyped;
+        if (expected.has_value())
+            retyped = Token{expected->value, TokenType::Emulated};
+        CasResult r = inner.casPut(key, bytes, retyped, meta);
+        if (r.outcome == CasOutcome::Committed)
+            r.token.type = TokenType::ETag;
+        return r;
+    }
+
+    DeleteOutcome deleteExact(const String & key, const Token & token) override
+    {
+        if (token.type != TokenType::ETag)
+        {
+            DeleteOutcome d;
+            d.kind = DeleteOutcome::Kind::TokenMismatch;   /// dialect-gated: never reaches `inner`
+            return d;
+        }
+        ++delete_reached;
+        return inner.deleteExact(key, Token{token.value, TokenType::Emulated});
+    }
+
+    ListPage list(const String & prefix, const String & cursor, size_t limit) override
+    {
+        ListPage p = inner.list(prefix, cursor, limit);
+        for (auto & k : p.keys)
+            if (k.token)
+                k.token->type = TokenType::ETag;
+        return p;
+    }
+
+    /// Number of times putOverwrite/casPut(with expected)/deleteExact actually delegated to `inner`
+    /// (i.e. reached the real enforcement) rather than being short-circuited by the dialect gate.
+    int overwrite_reached = 0;
+    int casput_reached = 0;
+    int delete_reached = 0;
+
+private:
+    InMemoryBackend inner;
+};
+
+}
+
+/// codex-review-triage §3.18, Critical: `runCapabilityProbe`'s three wrong-token sites (step 3
+/// putOverwrite, step 5c casPut, step 6 deleteExact) must send a token in the LIVE dialect this
+/// backend mints (t1.type / ct1.type / t2.type), not a hardcoded `TokenType::Emulated`. A backend
+/// whose native dialect differs from Emulated -- exactly what `ObjectStorageBackend` mints in Native
+/// mode -- would otherwise reject the old hardcoded tokens LOCALLY via a dialect gate, never
+/// exercising the real conditional enforcement those three steps exist to validate; the probe would
+/// still report success (the outcome enums match either way), so a regression here is invisible
+/// unless something counts whether the real enforcement was ever reached. `DialectGatedCountingBackend`
+/// enforces real (correct) conditional semantics AND gates on dialect exactly like the production
+/// risk, so `runCapabilityProbe` runs to completion (unlike a real Native-mode ObjectStorageBackend
+/// over LocalObjectStorage, which cannot even reach this point -- see
+/// MissingSingleAttemptClientFailsCapabilityProbe and the fact that LocalObjectStorage does not honor
+/// WriteSettings conditions at all); the exact reached-counts below pin down that every wrong-token
+/// site got past the gate: a probe that regressed to the hardcoded-Emulated construction would still
+/// pass (no throw) but under-count here by exactly one at each of the three sites, since the dialect
+/// gate would swallow that one call before `inner` ever saw it.
+TEST(CasProbe, WrongTokenAttemptsReachTheBackendPastTheDialectGate)
+{
+    DialectGatedCountingBackend b;
+    EXPECT_NO_THROW(runCapabilityProbe(b, "p/.cas_probe"));
+
+    /// putOverwrite: step 3 (wrong token) + step 4 (correct token) -- both live-dialect, both gated
+    /// through to `inner`.
+    EXPECT_EQ(b.overwrite_reached, 2);
+    /// casPut: 5a (create), 5b (conflict-on-exists, no expected token to gate), 5c (wrong token,
+    /// live-dialect), 5d (correct token) -- all four reach `inner`.
+    EXPECT_EQ(b.casput_reached, 4);
+    /// deleteExact: step 6 (wrong token, live-dialect) + step 8 (correct token) + step 9 cleanup
+    /// (correct token for cas_key) -- all three reach `inner`.
+    EXPECT_EQ(b.delete_reached, 3);
+}
