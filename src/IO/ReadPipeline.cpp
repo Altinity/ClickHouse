@@ -206,14 +206,15 @@ std::unique_ptr<ReadBufferFromFileBase> ReadPipeline::tryBuildReaderExecutor() c
     if (!settings.use_reader_executor)
         return nullptr;
 
-    /// The executor does not implement caches, decryption, async prefetch, or the
-    /// distributed cache, so fall back rather than silently drop a configured stage.
+    /// The executor does not implement caches, decryption, async prefetch, the
+    /// distributed cache, or a file_view byte window, so fall back rather than
+    /// silently drop a configured stage.
     if (distributed_cache || memory_cache || !filesystem_caches.empty()
-        || !decryption_stages.empty() || async_prefetch)
+        || !decryption_stages.empty() || async_prefetch || file_view)
     {
         LOG_DEBUG(log,
             "use_reader_executor: falling back to the legacy read path "
-            "(caches/decryption not yet supported by the executor)");
+            "(caches/decryption/file_view not yet supported by the executor)");
         return nullptr;
     }
 
