@@ -71,7 +71,7 @@ private:
     void maybeFailUnreadable(const String & key) const
     {
         if (!unreadable_ns_substring.empty() && key.find(unreadable_ns_substring) != String::npos)
-            throw Exception(ErrorCodes::LOGICAL_ERROR, "injected unreadable protection view for {}", key);
+            throw Exception(ErrorCodes::S3_ERROR, "injected unreadable protection view for {}", key);
     }
 
     String throw_key;
