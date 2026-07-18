@@ -450,7 +450,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
             if (const auto seal_got = backend.get(layout.foldSealKey(gc_state.snap_generation, gc_state.snap_attempt)))
             {
                 uint64_t rows = 0;
-                for (const RunRef & run : decodeFoldSeal(seal_got->bytes).blob_target_runs)
+                for (const RunRef & run : decodeFoldSeal(seal_got->bytes, gc_state.snap_generation).blob_target_runs)
                 {
                     checkDeadline(deadline, "reading gc snapshot runs");
                     /// Typed open: the source-edge run reader goes through openSourceEdgeRun (the NDJSON

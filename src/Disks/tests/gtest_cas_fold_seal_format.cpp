@@ -58,6 +58,18 @@ TEST(CasFoldSealFormat, RoundTripsAllFields)
     EXPECT_EQ(out, in);
 }
 
+TEST(CasFoldSealFormat, RejectsUnexpectedGeneration)
+{
+    CasFoldSeal seal;
+    seal.generation = 5;
+    const String encoded = encodeFoldSeal(seal);
+
+    cas_battery_detail::expectCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { decodeFoldSeal(encoded, /*expected_generation=*/6); }, "unexpected generation");
+    EXPECT_EQ(decodeFoldSeal(encoded, /*expected_generation=*/5).generation, 5);
+    EXPECT_EQ(decodeFoldSeal(encoded).generation, 5);
+}
+
 TEST(CasFoldSeal, EncodingIsByteDeterministic)
 {
     const CasFoldSeal in = sampleFoldSeal();

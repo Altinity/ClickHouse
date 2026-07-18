@@ -1785,7 +1785,7 @@ void Gc::pruneSupersededGenerations(uint64_t adopted_generation, uint64_t attemp
 std::optional<CasFoldSeal> Gc::readFoldSeal(uint64_t generation, uint64_t attempt)
 {
     if (const auto got = store->backend().get(store->layout().foldSealKey(generation, attempt)))
-        return decodeFoldSeal(got->bytes);
+        return decodeFoldSeal(got->bytes, generation);
     return std::nullopt;
 }
 

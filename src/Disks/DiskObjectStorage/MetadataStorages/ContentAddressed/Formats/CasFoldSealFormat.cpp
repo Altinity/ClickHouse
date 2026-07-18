@@ -127,7 +127,7 @@ String encodeFoldSeal(const CasFoldSeal & seal)
     return out.str();
 }
 
-CasFoldSeal decodeFoldSeal(std::string_view data)
+CasFoldSeal decodeFoldSeal(std::string_view data, std::optional<uint64_t> expected_generation)
 {
     ReadBufferFromMemory in(data.data(), data.size());
     expectHeaderLine(in, FormatId::FoldSeal);
@@ -169,6 +169,10 @@ CasFoldSeal decodeFoldSeal(std::string_view data)
             if (n != seen)
                 throw Exception(ErrorCodes::CORRUPTED_DATA,
                     "CAS fold seal: trailer count {} != {} records", n, seen);
+            if (expected_generation && seal.generation != *expected_generation)
+                throw Exception(ErrorCodes::CORRUPTED_DATA,
+                    "CAS fold seal: body generation {} does not match the requested generation {}",
+                    seal.generation, *expected_generation);
             return seal;
         }
         if (key != "k")

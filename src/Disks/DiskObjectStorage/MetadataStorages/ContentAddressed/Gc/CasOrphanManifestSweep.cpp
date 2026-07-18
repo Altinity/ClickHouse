@@ -97,7 +97,7 @@ RefTxnId sealedRefCursor(Pool & store, const RootNamespace & ns)
     const GcState state = decodeGcState(state_got->bytes);
     if (const auto got = store.backend().get(layout.foldSealKey(state.snap_generation, state.snap_attempt)))
     {
-        const CasFoldSeal seal = decodeFoldSeal(got->bytes);
+        const CasFoldSeal seal = decodeFoldSeal(got->bytes, state.snap_generation);
         const auto it = seal.per_ns_shard.find(cursorKey(ns, /*shard*/0));
         if (it != seal.per_ns_shard.end())
             return it->second.last_folded_ref_id;

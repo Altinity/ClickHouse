@@ -4,6 +4,7 @@
 #include <base/extended_types.h>
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -107,6 +108,6 @@ String encodeFoldSeal(const CasFoldSeal & seal);
 
 /// Decodes and validates a fold seal, rejecting unknown fields, malformed records, trailing bytes, and
 /// a trailer count that differs from the records read. Invalid persisted data raises `CORRUPTED_DATA`.
-CasFoldSeal decodeFoldSeal(std::string_view data);
+CasFoldSeal decodeFoldSeal(std::string_view data, std::optional<uint64_t> expected_generation = std::nullopt);
 
 }
