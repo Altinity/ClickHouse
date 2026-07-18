@@ -436,24 +436,20 @@ void PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef & ref, const 
         });
     };
 
-    /// Meta write for the FRESH (absent -> present) upload cases: the
-    /// body just transitioned via If-None-Match, so the freshness meta is created as Clean.
-    /// `putMetaIfAbsent` — a Conflict just means a racing writer already created it (fine; both agree
-    /// on the same Clean steady state).
-    auto writeFreshMetaClean = [&]()
-    {
-        ProfileEvents::increment(ProfileEvents::CasMetaCreateClean);
-        putMetaIfAbsent(*store, ref,
-            BlobMeta{.state = MetaState::Clean, .condemn_round = 0, .size = source.size});
-    };
-
     /// Meta write for the RESURRECT (condemned-displacement) case: flip the now-stale Condemned meta
     /// back to Clean now that a live incarnation has displaced the condemned body. `lm_before` is the
-    /// point-read taken just before the condemned decision — its etag is the CAS precondition. Bounded
-    /// retry on a racing meta writer (another resurrect, or GC re-condemning); an absent meta (raced
-    /// away between the point-read and here) falls back to putMetaIfAbsent. Best-effort: the body's
-    /// incarnation_tag + exact-token delete are already the safety core — this meta write is only a
-    /// freshness marker for the NEXT point-reader.
+    /// point-read taken just before the condemned decision — its etag is the CAS precondition (absent
+    /// when there is no prior point-read at all, the FRESH upload case below). Each outer attempt
+    /// routes through the Pool's request controller (putMetaIfAbsent/casMeta), which already absorbs
+    /// a transient transport error (SlowDown/429/5xx) within its own budget — this outer loop reacts
+    /// only to a genuine `Conflict` (the marker's current token AND bytes both differ from what this
+    /// call intended: a racing writer or GC re-condemning) by reloading and retrying against the
+    /// fresh state. `Unresolved` (the controller's own budget/fence exhausted for one attempt) is
+    /// retried the same way — reloading may simply observe the write actually landed. After
+    /// max_meta_attempts of this outer loop WITHOUT a Committed result, this is a persistent failure,
+    /// not a blip (each outer attempt already burned its own inner retry budget) — the RCA requires
+    /// this reach the caller as a controlled retry-later signal, never a silent skip: a dropped
+    /// freshness marker leaves stale state for the next point-reader.
     auto writeResurrectMetaClean = [&](std::optional<LoadedMeta> lm_before)
     {
         ProfileEvents::increment(ProfileEvents::CasMetaResurrectClean);
@@ -468,7 +464,23 @@ void PartWriteTxn::uploadFromSource(ObjectKind kind, const BlobRef & ref, const 
                 return;
             lm_before = loadMeta(store->backend(), store->layout(), ref);
         }
-        /// Exhausted retries: leave the meta as-is — best-effort (a later writer/GC pass reconciles it).
+        throwCasWriteRetryLater(fmt::format(
+            "writeResurrectMetaClean: freshness-meta transition to Clean for {} did not land within "
+            "{} attempts (each already budget-controlled) — the body incarnation is durable, but the "
+            "meta marker is stuck; retry", store->layout().blobMetaKey(ref), max_meta_attempts));
+    };
+
+    /// Meta write for the FRESH (absent -> present) upload cases: the body just transitioned via
+    /// If-None-Match, so the freshness meta is created as Clean. Delegates to writeResurrectMetaClean
+    /// with no prior point-read: a pre-existing marker there is NOT always "a racing writer creating
+    /// the same Clean state" (the retired comment this replaced assumed) -- it can be a stale
+    /// Condemned marker left over from before this exact body vanished and was freshly re-uploaded
+    /// (proven reachable by CasPartWriteTxn.PutBlobResurrectVanishedReUploadsHeldBody), which must be
+    /// reconciled to Clean the same way a resurrect does, not silently ignored.
+    auto writeFreshMetaClean = [&]()
+    {
+        ProfileEvents::increment(ProfileEvents::CasMetaCreateClean);
+        writeResurrectMetaClean(std::nullopt);
     };
 
     /// Stream header + payload into a fresh putIfAbsentStream sink WITHOUT materializing the whole blob.

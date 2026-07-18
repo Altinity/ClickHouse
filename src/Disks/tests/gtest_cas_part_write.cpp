@@ -621,6 +621,44 @@ TEST(CasPartWriteTxn, PutBlobResurrectVanishedReUploadsHeldBody)
     EXPECT_EQ(raw->bytes.substr(h.header_len), "payload-X");
 
     EXPECT_EQ(b->deleteExact(blob_key, t0).kind, DeleteOutcome::Kind::TokenMismatch);
+
+    /// The freshness meta must be reconciled to Clean too, not left stale at Condemned: the fresh
+    /// re-upload's meta write (writeFreshMetaClean) must find and fix the pre-existing Condemned
+    /// marker via the SAME reload-and-reconcile path a resurrect uses, not silently discard the
+    /// conflict (a stale Condemned marker would otherwise mislead every future point-reader).
+    const auto lm = loadMetaForTest(*b, s->layout(), u128Of("payload-X"));
+    ASSERT_TRUE(lm.has_value());
+    EXPECT_EQ(lm->meta.state, MetaState::Clean)
+        << "a fresh re-upload over a stale Condemned marker must reconcile it back to Clean";
+}
+
+/// A persistently-failing freshness-meta write (every attempt of every outer reload-retry) must
+/// surface as a controlled retry-later signal, not silently succeed with the marker left stale
+/// (RCA docs/superpowers/reports/2026-07-18-s22-throttle-retry-rca.md sec 4). The blob body PUT
+/// itself is unaffected (MetaWriteFaultBackend only faults `.meta` keys) -- only the meta write
+/// exhausts, and that exhaustion must reach putBlob's caller as NETWORK_ERROR.
+TEST(CasPartWriteTxn, PutBlobFreshMetaExhaustionThrowsRetryLater)
+{
+    /// Short budget + zero backoff: keep the test fast. Each of writeResurrectMetaClean's 8 outer
+    /// attempts calls putMetaIfAbsent, which itself retries up to max_attempts times internally —
+    /// with max_attempts=1 the controller gives up on the first faulted attempt each time.
+    CasRequestBudget budget;
+    budget.max_attempts = 1;
+    budget.retry_initial_backoff_ms = 0;
+    auto b = std::make_shared<DB::Cas::tests::MetaWriteFaultBackend>();
+    auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test", .cas_request_budget = budget});
+    auto build = s->beginPartWrite({});
+
+    const String payload = "fresh-meta-exhaustion-payload";
+    DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&]
+    {
+        build->putBlob(idOf(payload), BlobSource::fromString(payload));
+    });
+
+    /// The body itself landed (only .meta writes are faulted) -- confirming the failure is
+    /// specifically the freshness marker, not the blob body.
+    const HeadResult hr = b->head(s->layout().blobKey(idOf(payload)));
+    EXPECT_TRUE(hr.exists) << "the body PUT is unaffected by the meta-only fault";
 }
 
 /// INV-1 (revival-from-source): a condemned blob is NEVER read via GET to revive it.
