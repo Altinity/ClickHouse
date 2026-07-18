@@ -258,6 +258,15 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
         /// rewriting the owner identity anchor. Mere presence proves that the slot is live again. Every
         /// delete must be explicitly confirmed as `Deleted`, and the final owner tombstone rewrite must
         /// succeed against the exact token read immediately before it.
+        ///
+        /// ACCEPTED RESIDUAL WINDOW (final review, not closed by this recheck): a same-UUID successor
+        /// can still recreate epoch/mount in the narrow gap strictly AFTER this liveness recheck but
+        /// BEFORE the owner CAS below reads its own token -- the successor's owner anchor (same
+        /// server_uuid, not yet retired) then gets tombstoned by this decommission run. The successor's
+        /// live process is not deleted (only its owner anchor is marked retired), but a LATER restart of
+        /// that same identity would refuse to reclaim it (claimOwnerOrThrow's tombstone guard). This is
+        /// a narrow, low-probability window, not closed here per the "no big complications" scope
+        /// already set for T5's related decisions -- see docs/superpowers/specs/2026-07-18-t5-owner-tombstone-design.md.
         report.slot_removed = false;
         if (captures_match && deleteSlotObject(*pool_backend, mount_key, farewell_mount->token, report.warnings)
             && deleteSlotObject(*pool_backend, epoch_key, claimed_epoch->token, report.warnings))
