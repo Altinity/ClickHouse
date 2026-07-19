@@ -124,7 +124,7 @@ TEST(CasRefCodec, OrderMatchesLexicalOrderOfRender)
         for (uint64_t seq : values)
             ids.push_back(RefTxnId{epoch, seq});
 
-    std::mt19937 rng(42); // NOLINT(cert-msc): deterministic seed is required for reproducible property coverage.
+    std::mt19937 rng(42); // NOLINT(cert-msc32-c,cert-msc51-cpp): deterministic seed is required for reproducible property coverage.
     for (int iter = 0; iter < 200; ++iter)
     {
         const RefTxnId & a = ids[rng() % ids.size()];

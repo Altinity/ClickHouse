@@ -14,7 +14,6 @@ TEST(CasPartRefKey, CacheKeyIsUnambiguous)
     EXPECT_TRUE((k1 == Cas::PartRefKey{Cas::RootNamespace{"a"}, "b/c"}));
 }
 
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Parts/PartFolderAccess.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasPartManifestFormat.h>
 #include <algorithm>
 

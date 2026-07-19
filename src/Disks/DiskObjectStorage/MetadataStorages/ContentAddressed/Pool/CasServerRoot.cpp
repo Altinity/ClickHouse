@@ -1065,7 +1065,7 @@ void SingleWriterSlot::backgroundLoop(std::chrono::milliseconds period)
             {
                 onRenewFailed();
             }
-            catch (...)
+            catch (...) // NOLINT(bugprone-empty-catch)
             {
                 /// The renewal loop is already stopping; a hook exception must not escape it.
             }
@@ -1077,7 +1077,7 @@ void SingleWriterSlot::backgroundLoop(std::chrono::milliseconds period)
         {
             onRenewSucceeded();
         }
-        catch (...)
+        catch (...) // NOLINT(bugprone-empty-catch)
         {
             /// A notification hook cannot be allowed to stop the already-renewed lease loop.
         }

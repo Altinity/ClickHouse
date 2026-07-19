@@ -89,6 +89,6 @@ TEST(CasMountLeaseFormat, RejectsMissingIdentityFields)
         }
     };
 
-    expectCorrupted(header + "{\"we\":\"7\"," + fields + "\n");
-    expectCorrupted(header + "{\"su\":\"0123456789abcdeffedcba9876543210\"," + fields + "\n");
+    expectCorrupted(header + R"({"we":"7",)" + fields + "\n");
+    expectCorrupted(header + R"({"su":"0123456789abcdeffedcba9876543210",)" + fields + "\n");
 }

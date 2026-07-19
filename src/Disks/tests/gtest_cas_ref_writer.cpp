@@ -253,7 +253,7 @@ public:
             {
                 independent_blocked_keys.insert(key);
                 block_cv.notify_all();
-                block_cv.wait(lk, [&] { return independent_released_keys.count(key) != 0; });
+                block_cv.wait(lk, [&] { return independent_released_keys.contains(key); });
             }
             if (block_this)
             {
@@ -1285,7 +1285,7 @@ TEST(RefWriterSnapshotPublish, ThresholdTriggerPublishesCacheReplayEquivalentByt
     ASSERT_TRUE(got.has_value());
 
     /// The independent oracle: replay every `_log/` object directly, ignoring the snapshot entirely.
-    const RefTableState oracle = independentFullReplayForTest(*backend, layout, ns, *snap_id);
+    const RefTableState oracle = independentFullReplayForTest(*backend, layout, ns, snap_id);
     const String expected_bytes = encodeRefTableSnapshot(snapshotOf(oracle, ns.string()));
     EXPECT_EQ(openObject(FormatId::RefSnapshot, got->bytes), expected_bytes)
         << "published snapshot bytes must equal replay(logs through X)";
@@ -1351,7 +1351,7 @@ TEST(RefWriterSnapshotPublish, MountTimeTriggerPublishesAfterRecoveryReplaysLarg
 
     const auto got = backend->get(layout.refSnapshotKey(ns, *snap_id));
     ASSERT_TRUE(got.has_value());
-    const RefTableState oracle = independentFullReplayForTest(*backend, layout, ns, *snap_id);
+    const RefTableState oracle = independentFullReplayForTest(*backend, layout, ns, snap_id);
     EXPECT_EQ(openObject(FormatId::RefSnapshot, got->bytes), encodeRefTableSnapshot(snapshotOf(oracle, ns.string())));
 }
 
@@ -1570,7 +1570,7 @@ TEST(RefWriterSnapshotPublish, ConcurrentOutOfOrderPublishDoesNotRegressBaseNorD
     ASSERT_TRUE(snap_id.has_value());
     const auto got = backend->get(layout.refSnapshotKey(ns, *snap_id));
     ASSERT_TRUE(got.has_value());
-    const RefTableState oracle = independentFullReplayForTest(*backend, layout, ns, *snap_id);
+    const RefTableState oracle = independentFullReplayForTest(*backend, layout, ns, snap_id);
     EXPECT_EQ(openObject(FormatId::RefSnapshot, got->bytes), encodeRefTableSnapshot(snapshotOf(oracle, ns.string())))
         << "published snapshot bytes must equal replay(all logs through X) -- a regressed base drops txns";
 }

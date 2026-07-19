@@ -36,7 +36,7 @@ public:
     {
         const bool detail = options.contains("detail");
         const UInt64 timeout_sec = getValueFromCommandLineOptionsWithDefault<UInt64>(options, "timeout", 600);
-        const String namespace_prefix = options.count("namespace") ? options["namespace"].as<String>() : "";
+        const String namespace_prefix = options.contains("namespace") ? options["namespace"].as<String>() : "";
         const bool partial = options.contains("partial");
         auto disk = client.getCurrentDiskWithPath().getDisk();
 
@@ -94,7 +94,7 @@ public:
         {
             for (const auto & o : report.objects)
             {
-                const char * c = "unreachable";
+                const char * c = "unreachable"; // NOLINT(clang-analyzer-deadcode.DeadStores) - defensive fallback if the enum grows
                 switch (o.cls)
                 {
                     case Cas::FsckClass::Reachable:   c = "reachable"; break;

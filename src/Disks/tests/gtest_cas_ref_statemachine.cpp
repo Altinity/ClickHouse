@@ -742,7 +742,7 @@ TEST(CasRefStateMachine, ReplayRejectsHandBuiltSnapshotWithUnsortedPrecommits)
 /// Randomized replay equation: replay(snapshotOf(mid-state), tail) == full replay (spec §Table State).
 TEST(CasRefStateMachine, ReplayEquationPropertyTest)
 {
-    std::mt19937 rng(4242); // NOLINT(cert-msc): deterministic seed is required for reproducible property coverage.
+    std::mt19937 rng(4242); // NOLINT(cert-msc32-c,cert-msc51-cpp): deterministic seed is required for reproducible property coverage.
     const std::vector<String> names{"a", "b", "c"};
 
     for (int trial = 0; trial < 30; ++trial)
@@ -911,7 +911,7 @@ TEST(CasRefStateMachine, AdmitsRejectsGrowthPastRemovalBudget)
 /// real encoders' output, for both bounds, across randomized states and candidate growing ops.
 TEST(CasRefStateMachine, AdmitsExactnessPropertyTest)
 {
-    std::mt19937 rng(777); // NOLINT(cert-msc): deterministic seed is required for reproducible property coverage.
+    std::mt19937 rng(777); // NOLINT(cert-msc32-c,cert-msc51-cpp): deterministic seed is required for reproducible property coverage.
 
     for (int trial = 0; trial < 20; ++trial)
     {

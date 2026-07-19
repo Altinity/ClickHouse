@@ -1229,7 +1229,7 @@ void PartWriteTxn::cleanupStagedManifestDebrisBestEffort()
             if (hr.exists)
                 store->backend().deleteExact(key, hr.token);
         }
-        catch (...)
+        catch (...) // NOLINT(bugprone-empty-catch)
         {
             /// Best-effort cleanup: the GC backstop sweep is the durable guarantee.
         }

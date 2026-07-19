@@ -602,7 +602,8 @@ std::vector<BlobCandidate> zeroInDegree(Backend & backend, const std::vector<Run
         /// streamed at O(one block) resident memory, never materialized whole. `openSourceEdgeRun` enforces
         /// the run kind + key schema; `kCondemned` sentinel rows are skipped (only `kZeroMarker` counts).
         SourceEdgeRunView r = openSourceEdgeRun(backend, run.key);
-        String k, p;
+        String k;
+        String p;
         while (r.next(k, p))
             if (!p.empty() && p[0] == kZeroMarker)
             {

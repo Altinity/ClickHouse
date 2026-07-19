@@ -392,7 +392,7 @@ private:
     void finalizeImpl() override
     {
         if (to_throw)
-            throw *to_throw; /// NOLINT(cert-err09-cpp,cert-err61-cpp,misc-throw-by-value-catch-by-reference) -- the mock stores the configured exception to throw later, so it cannot be an anonymous temporary
+            throw *to_throw; /// NOLINT(cert-err09-cpp,cert-err60-cpp,cert-err61-cpp,misc-throw-by-value-catch-by-reference) -- the mock stores the configured exception to throw later, so it cannot be an anonymous temporary
     }
 
     std::optional<DB::S3Exception> to_throw;

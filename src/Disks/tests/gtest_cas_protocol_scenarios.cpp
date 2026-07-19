@@ -45,7 +45,6 @@ using namespace DB::Cas;
 using DB::Cas::tests::blobEntryFor;
 using DB::Cas::tests::condemnMeta;
 using DB::Cas::tests::displaceBlobToken;
-using DB::Cas::tests::expectThrowsCode;
 using DB::Cas::tests::idOf;
 using DB::Cas::tests::injectRetire;
 using DB::Cas::tests::loadMetaForTest;

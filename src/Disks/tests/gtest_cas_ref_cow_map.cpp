@@ -279,7 +279,7 @@ TEST(CasRefCowMap, CopySharesBaseUntilEitherSideMaterializesANewOne)
 
 TEST(CasRefCowMap, PropertyMatchesStdMapOverRandomOps)
 {
-    std::mt19937 rng(20260717); // NOLINT(cert-msc): deterministic seed is required for reproducible property coverage.
+    std::mt19937 rng(20260717); // NOLINT(cert-msc32-c,cert-msc51-cpp): deterministic seed is required for reproducible property coverage.
 
     for (int trial = 0; trial < 50; ++trial)
     {

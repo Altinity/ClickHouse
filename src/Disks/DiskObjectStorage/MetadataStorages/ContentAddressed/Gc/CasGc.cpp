@@ -1978,7 +1978,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
             {
                 max_gen = std::max(max_gen, static_cast<uint64_t>(std::stoull(k.key.substr(from, slash - from))));
             }
-            catch (...)
+            catch (...) // NOLINT(bugprone-empty-catch)
             {
                 /// Foreign key shape under `gc/gen` is debris, not a numbering input.
             }
