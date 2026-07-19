@@ -32,6 +32,7 @@ IDENTICAL effective ledger.
 import argparse
 import json
 import os
+import random
 import sys
 import threading
 import time
@@ -48,7 +49,10 @@ from soak.cluster import (
 )
 from soak.ledger import generate_ledger, Op, OpType
 from soak.model import Model
-from soak.workload import insert_values_sql, update_sql, delete_sql, truncate_sql
+from soak.rowgen import NBUCKETS, KSPACE
+from soak.workload import (
+    insert_values_sql, update_sql, delete_sql, truncate_sql, select_range_sql, select_recent_sql,
+)
 from soak.checker import (
     CheckpointFailure,
     quiesce,
@@ -1004,6 +1008,75 @@ class MetricsTicker(threading.Thread):
             log(f"METRICS thread error: {type(e).__name__}: {e}\n{traceback.format_exc()}")
 
 
+class SelectWorker(threading.Thread):
+    """Phase-3 background read workload: one of several PARALLEL threads issuing SELECT queries
+    against the live table concurrently with the INSERT/mutation workload and chaos. Each query
+    filters by bucket + a moderate k-range (or a recent ts window) -- not a full-table scan, not a
+    single-row point lookup -- and references `payload` so it pays for a real data read, giving the
+    CAS storage read path genuine pressure throughout the whole soak window (not just at
+    checkpoints, where `query_aggregates` runs one aggregate per replica).
+
+    Cooperates with `checkpoint_active` exactly like `ChaosRunner`: pauses while a checkpoint is
+    quiescing the cluster, so a concurrent scan never competes with the quiesce's own raw queries.
+    A query against a transiently-down node (chaos) or a slow/timed-out query is logged and
+    skipped -- this is best-effort read pressure, not a correctness gate (the fsck/aggregate
+    asserts at checkpoints remain the sole correctness gate)."""
+
+    def __init__(self, worker_id, cluster, table, *, interval_s, rng_seed, stop_event,
+                 checkpoint_active, stats, stats_lock):
+        super().__init__(daemon=True, name=f"select-{worker_id}")
+        self.cluster = cluster
+        self.table = table
+        self.interval_s = interval_s
+        self.rng = random.Random(rng_seed)
+        self.stop_event = stop_event
+        self.checkpoint_active = checkpoint_active
+        self.stats = stats               # shared dict: issued / errors / rows -- see run_phase3
+        self.stats_lock = stats_lock
+        self.error = None
+
+    def _next_query(self):
+        node = self.cluster.node1 if self.rng.random() < 0.5 else self.cluster.node2
+        bucket = self.rng.randrange(NBUCKETS)
+        if self.rng.random() < 0.7:
+            # Moderate k-range scan (0.2%-2% of the key space): bounded, but wide enough to touch
+            # real row/blob data -- not a full-table scan, not a single-row point lookup.
+            width = self.rng.randint(2000, 20000)
+            k_lo = self.rng.randrange(0, KSPACE - width)
+            sql = select_range_sql(self.table, bucket, k_lo, k_lo + width)
+        else:
+            # Recent-window scan: biases some reads toward hot (not-yet-TTL-expired) data.
+            seconds = self.rng.randint(60, 1800)
+            sql = select_recent_sql(self.table, bucket, seconds)
+        return node, sql
+
+    def run(self):
+        try:
+            while not self.stop_event.is_set():
+                if self.checkpoint_active.is_set():
+                    self.stop_event.wait(0.5)
+                    continue
+                node, sql = self._next_query()
+                try:
+                    result = node.query(sql, timeout=30)
+                    rows = int(result.split("\t", 1)[0])
+                    with self.stats_lock:
+                        self.stats["issued"] += 1
+                        self.stats["rows"] += rows
+                except Exception as e:   # node down/busy under chaos -- non-fatal, see docstring
+                    with self.stats_lock:
+                        self.stats["errors"] += 1
+                    log(f"SELECT workload [{self.name}] query failed (non-fatal, node likely down "
+                        f"or busy under chaos): {type(e).__name__}: {e}")
+                # Jittered pacing so parallel workers don't lock-step; keeps the read RATE "not too
+                # small, not too big" too (a handful of concurrent moderate scans, not a query storm).
+                self.stop_event.wait(self.interval_s * (0.5 + self.rng.random()))
+        except Exception as e:   # noqa: BLE001 -- surface to the main thread like chaos/ticker
+            self.error = e
+            log(f"SELECT workload [{self.name}] thread error: {type(e).__name__}: "
+                f"{e}\n{traceback.format_exc()}")
+
+
 def write_failure(path, *, seed, base_time, op_id, phase, model_expected, n1, n2, fsck, last_op,
                   error=None, chaos_seed=None, last_fault=None, until_op=None,
                   fsck_status="not-run"):
@@ -1139,6 +1212,20 @@ def run_phase3(args):
                            max_pool_bytes=max_pool_bytes, driver=driver, stop_event=metrics_stop,
                            restarts_fn=lambda: restarts["n"])
 
+    select_stop = threading.Event()
+    select_stats = {"issued": 0, "errors": 0, "rows": 0}
+    select_stats_lock = threading.Lock()
+    select_workers = [
+        SelectWorker(i, cluster, TABLE, interval_s=args.select_interval_s,
+                    rng_seed=args.seed ^ (0x5e1ec7 + i), stop_event=select_stop,
+                    checkpoint_active=checkpoint_active, stats=select_stats,
+                    stats_lock=select_stats_lock)
+        for i in range(args.select_workers)
+    ]
+    if select_workers:
+        log(f"phase-3 SELECT read-workload: {len(select_workers)} parallel worker(s), "
+            f"~{args.select_interval_s}s mean pacing each (moderate bucket+k-range / recent-ts scans)")
+
     def do_checkpoint(label):
         log(f"{label}")
         checkpoint_active.set()
@@ -1177,6 +1264,8 @@ def run_phase3(args):
     t0 = time.monotonic()
     chaos.start()
     ticker.start()
+    for w in select_workers:
+        w.start()
     last_op = None
     op_iter = iter(ledger)
     prev_stage_kind = None
@@ -1217,6 +1306,9 @@ def run_phase3(args):
                 raise chaos.error
             if ticker.error is not None:
                 raise ticker.error
+            for w in select_workers:
+                if w.error is not None:
+                    raise w.error
 
             # Backpressure: reap completed futures and bound the in-flight set so the continuous
             # time-driven producer never outruns the workers (unbounded inflight would balloon memory
@@ -1268,6 +1360,7 @@ def run_phase3(args):
     except (CheckpointFailure, QueryError, OSError) as e:
         chaos_stop.set()
         metrics_stop.set()
+        select_stop.set()
         if isinstance(e, CheckpointFailure):
             kind = "CHECKPOINT FAILURE"
         elif isinstance(e, QueryError):
@@ -1303,8 +1396,11 @@ def run_phase3(args):
     finally:
         chaos_stop.set()
         metrics_stop.set()
+        select_stop.set()
         chaos.join(timeout=30)
         ticker.join(timeout=metrics_interval + 30)
+        for w in select_workers:
+            w.join(timeout=30)
         driver.executor.shutdown(wait=True)
         try:
             conn.close()
@@ -1315,6 +1411,10 @@ def run_phase3(args):
         f"transport-retried op attempts: {driver.transport_retries}; "
         f"faults fired: {chaos.faults_fired}; restarts: {restarts['n']}; "
         f"metrics rows recorded: {ticker.recorded} (ticks={ticker.ticks})")
+    if select_workers:
+        log(f"SELECT read-workload: {select_stats['issued']} queries issued, "
+            f"{select_stats['errors']} failed (non-fatal), {select_stats['rows']} total rows "
+            f"touched across {len(select_workers)} parallel worker(s)")
     # AVAILABILITY REPORT (2026-07-13): each driver-level retry is a product-visible failure the
     # server did not absorb. Per-class counts make harness tolerance measurable instead of masking:
     # compare across runs — a healthy build keeps non-node-down classes near zero.
@@ -1391,6 +1491,15 @@ def main(argv=None):
                          "ops after the previous kept one (the rest demote to OPTIMIZE). Keeps "
                          "mutations sparse enough to materialize over the remote CA pool without "
                          "piling up a backlog that would time out the quiesced checkpoint. 0 disables.")
+    ap.add_argument("--select-workers", type=int, default=4,
+                    help="(phase 3) number of PARALLEL background SELECT-query worker threads run "
+                         "concurrently with the insert/mutation workload and chaos. Each issues "
+                         "moderate bucket+k-range (or recent-ts-window) scans against the live table "
+                         "-- not full-table scans, not point lookups -- to exercise the CAS read "
+                         "path throughout the soak, not just at checkpoints. 0 disables.")
+    ap.add_argument("--select-interval-s", type=float, default=2.0,
+                    help="(phase 3) mean pacing (s) between one SELECT worker's successive queries "
+                         "(jittered 0.5x-1.5x). Lower = more read pressure.")
     args = ap.parse_args(argv)
 
     phase2 = args.phase == 2

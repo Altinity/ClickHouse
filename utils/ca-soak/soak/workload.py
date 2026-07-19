@@ -45,3 +45,19 @@ def delete_sql(table: str, bucket: int) -> str:
 
 def truncate_sql(table: str) -> str:
     return f"TRUNCATE TABLE {table}"
+
+
+def select_range_sql(table: str, bucket: int, k_lo: int, k_hi: int) -> str:
+    """Read-workload SELECT: filters `bucket` + a `k` range (the `ORDER BY` prefix), so it is a
+    moderate bounded scan -- not a full-table scan, not a single-row point lookup. References
+    `payload` (via a hash, so the whole column is read) so the query pays for a real data read,
+    giving the CAS storage read path genuine pressure rather than just an index probe."""
+    return (f"SELECT count(), sum(v), max(version), sum(cityHash64(payload)) FROM {table} "
+            f"WHERE bucket = {bucket} AND k BETWEEN {k_lo} AND {k_hi}")
+
+
+def select_recent_sql(table: str, bucket: int, seconds: int) -> str:
+    """Read-workload SELECT: filters `bucket` + a recent `ts` window, biasing reads toward hot
+    (not-yet-TTL-expired) data instead of only the deterministic k-range shape above."""
+    return (f"SELECT count(), avg(v), max(version) FROM {table} "
+            f"WHERE bucket = {bucket} AND ts >= now() - INTERVAL {seconds} SECOND")

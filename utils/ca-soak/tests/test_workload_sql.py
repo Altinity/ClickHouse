@@ -1,4 +1,6 @@
-from soak.workload import insert_values_sql, update_sql, delete_sql, truncate_sql
+from soak.workload import (
+    insert_values_sql, update_sql, delete_sql, truncate_sql, select_range_sql, select_recent_sql,
+)
 from soak.rowgen import row_for_rid, insert_rids
 
 
@@ -22,3 +24,17 @@ def test_delete_sql():
 
 def test_truncate_sql():
     assert truncate_sql(table="ca_stress") == "TRUNCATE TABLE ca_stress"
+
+
+def test_select_range_sql_filters_bucket_and_k_range_and_touches_payload():
+    sql = select_range_sql(table="ca_stress", bucket=5, k_lo=1000, k_hi=5000)
+    assert "WHERE bucket = 5 AND k BETWEEN 1000 AND 5000" in sql
+    assert "payload" in sql   # forces a real data read, not just an index probe
+    assert sql.startswith("SELECT")
+    assert "SELECT *" not in sql   # bounded projection, not an unbounded row dump
+
+
+def test_select_recent_sql_filters_bucket_and_recent_window():
+    sql = select_recent_sql(table="ca_stress", bucket=9, seconds=600)
+    assert "WHERE bucket = 9 AND ts >= now() - INTERVAL 600 SECOND" in sql
+    assert sql.startswith("SELECT")
