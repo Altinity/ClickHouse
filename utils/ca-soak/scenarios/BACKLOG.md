@@ -2371,3 +2371,23 @@ campaign. The CAS gtest battery is green. No CAS action; if pursued, it belongs 
   flush to complete — i.e. wall-clock evidence that the admits() O(N) cost above is
   actually queueing up concurrent committers, not just a theoretical CPU concern.
 
+## NOTE (CPU, expected, not actionable) — local blob staging round-trip: open() + CityHash128 + unlink() per blob
+
+- **Logged (UTC):** 2026-07-19
+- **Severity:** note (expected cost, no fix direction — completes the CPU profiling
+  picture, not a new bug)
+- **Found via:** `system.trace_log` `CPU` top-50 (5h soak v10/v11). Completes the earlier
+  top-10 finding (`unlink() ← cleanupPendingTempFiles()`, the highest single CPU-sample
+  stack) with its paired counterpart, both real per-blob filesystem costs of the local
+  staging path (S3-native staging is opt-in, not the default here):
+  - `open() ← CaContentWriteBuffer::CaContentWriteBuffer(...) ← ContentAddressedTransaction::writeFile()
+    ← tryCreateWriteBuffer()` (~123 samples) — opens a fresh local staging file per blob.
+  - `CityHash128BlobHashingWriteBuffer::nextImpl() ← HashingWriteBuffer::nextImpl() ← __write`
+    (~188 samples) — computes the blob's content hash while flushing it to the staging
+    file — this is content-addressing's own key-derivation step, fundamentally required,
+    not wasted work.
+  Together with the earlier `unlink()` finding, the full local-staging lifecycle per blob
+  is: `open()` → hash-while-write → `unlink()` at commit. All three are genuine,
+  unavoidable costs of the local-staging design (vs. opt-in S3-native staging, which
+  skips the local file round-trip entirely). No fix direction — recorded for a complete
+  CPU-profile picture, not because it should change.
