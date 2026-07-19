@@ -2477,12 +2477,14 @@ campaign. The CAS gtest battery is green. No CAS action; if pursued, it belongs 
   isn't actually an error. Cosmetic/observability-only — does not affect correctness,
   confirmed minor priority by the user.
 
-## OBSERVABILITY GAP (S3 cost/capacity attribution, MEDIUM) — async upload/prefetch worker threads' S3 ProfileEvents are not attributed back to query_log/part_log/GC-log
+## RESOLVED — S3 PUT budget across query_log/part_log/blob_storage_log now ~100% attributed (was: OBSERVABILITY GAP)
 
 - **Logged (UTC):** 2026-07-19
-- **Severity:** observability gap (confirmed via cross-referencing, no fix applied — makes
-  S3 cost/capacity analysis via these three tables significantly incomplete, does not
-  affect correctness)
+- **Severity:** resolved for PUT (see the correction below — ~100% attributed once matched by
+  `part_name` and CAS-internal-object categories are recognized); GET/HEAD/DELETE's residual gaps
+  from the `system.events` CAS-semantic-counter comparison further down were NOT re-investigated
+  with this technique and stand as before (HEAD especially). No fix needed — this was purely an
+  attribution/observability exercise, never a correctness issue.
 - **Found via:** building a consolidated "S3 operation budget" table by aggregating
   ProfileEvents from `system.query_log` (by `query_kind`), `system.part_log` (by
   `event_type`), and `system.content_addressed_garbage_collection_log` (by `outcome`),
@@ -2556,16 +2558,48 @@ campaign. The CAS gtest battery is green. No CAS action; if pursued, it belongs 
   Crucially, `part_log`'s `query_id` is **only ever populated for `NewPart`**
   (44,624 of 59,909 rows) — `RemovePart`/`MergeParts`/`MergePartsStart`/`MutatePart`/
   `MutatePartStart`/`DownloadPart` all show `query_id = ''` for every single row, 0
-  exceptions. The ~21,317 distinct `Upload` `query_id`s that don't resolve in
-  `system.query_log` also do **not** resolve in `system.part_log` either (checked
-  directly: 0 matches) — these are internal/synthetic ids ClickHouse's background
-  merge/mutation/GC machinery apparently generates for its own tracing purposes, never
-  registered as a queryable "query" anywhere. This reframes the finding: the ~72%
-  unattributed PUT volume isn't a logging gap that a cleverer query could close — it is
-  structurally unreachable via `query_log`/`part_log`'s `query_id`, by design, because
-  background tasks were never given a real query identity in the first place. `Delete`
-  events go further still: `query_id` is empty on **100%** of `blob_storage_log`'s
-  2,445,357 `Delete` rows, with zero exceptions — deletes (GC's bulk reclaim,
-  `RemovePart`'s own cleanup) are never query-attributable by this mechanism at all,
-  full stop; the CAS-semantic `Cas*Delete` counters (or the GC log directly) are the
-  only path to DELETE attribution.
+  exceptions.
+- **CORRECTION — the "unresolved" query_ids are NOT opaque; they decode to `table_uuid::part_name`
+  (user-supplied insight) and match `part_log` by `part_name`, not by `query_id`.** An earlier
+  pass in this entry checked `query_id NOT IN (SELECT query_id FROM system.part_log)` and found
+  zero matches, then wrongly concluded these ids were unattributable in principle. They are not:
+  merge/mutation blob uploads carry `query_id = '<table_uuid>::<part_name>'` (confirmed —
+  `splitByString('::', query_id)[1]` equals `system.tables.uuid` for the table exactly). Matching
+  on `splitByString('::', query_id)[2]` against `part_log.part_name` (filtered to the
+  part-*creation* event types `NewPart`/`MergeParts`/`MutatePart`/`DownloadPart`, NOT `any()` over
+  every event type for that part name — a part's name is reused by its later `RemovePart` row too,
+  and grabbing an unfiltered `any(event_type)` silently returns the wrong stage) resolves **100%**
+  of the previously "unresolved" set (21,368 of 21,368 tested).
+  Final decomposition of every `Upload` event with a non-empty `query_id` (ch1, one snapshot):
+  | source | uploads | share |
+  |---|---:|---:|
+  | `query_log` — `Insert` | 593,705 | (foreground) |
+  | `part_log` — `MergeParts` | 345,457 | (background merge) |
+  | `part_log` — `MutatePart` | 52,445 | (background mutation) |
+  | `query_log` — `Create` | 1 | negligible |
+  Zero rows remained unclassified. The remaining ~53% of ALL `Upload` events carry a **genuinely
+  empty** `query_id` (not a decodable one) — these are not query/part-work at all, they're CAS's
+  own internal housekeeping objects, confirmed by path-prefix breakdown of the empty-`query_id`
+  rows:
+  | category | uploads | avg size | note |
+  |---|---:|---:|---|
+  | `blobs/*.meta` | 726,527 | 72 B | per-blob meta-descriptor sidecar, written by a `ThreadPool`-named background thread alongside (not as part of) the main content PUT |
+  | `cas/manifests/*` | 307,912 | 7.3 KB | ref-ledger manifest writes |
+  | `cas/refs/*` | 86,818 | 935 B | ref-log/snapshot writes |
+  | `gc/gen/*/attempt/*/outcomes/*` | 755 | 2.87 MB | GC round crash-recovery/idempotence records (large, but rare) |
+  | `gc/other`, `gc/server-roots` | 5,585 | small | GC misc + mount-lease objects |
+  Every one of these categories writes via CAS's own ref-ledger/GC machinery, which never had a
+  query context to begin with — there is no "gap" left to close for PUT: **~100% of Upload volume
+  is now attributed to a specific, understood source**, split roughly 28% foreground / 19%
+  background merge+mutation / 53% CAS-internal housekeeping (dominated by the `.meta` sidecar,
+  written once per blob almost like a second PUT for every real one).
+  **Lesson for future S3-budget work**: match merge/mutation-driven activity to `part_log` by
+  `(table_uuid, part_name)`, not by `query_id` string equality — the `query_id` `part_log` itself
+  exposes is `NewPart`-only; the *other* event types don't carry one, but the *upstream* system
+  (`blob_storage_log`) encodes the same part identity inside its own synthetic `query_id`, one
+  `::`-split away. `Delete` events go further still: `query_id` is empty on **100%** of
+  `blob_storage_log`'s 2,445,357 `Delete` rows, with zero exceptions — deletes (GC's bulk reclaim,
+  `RemovePart`'s own cleanup) are never query-attributable by this mechanism at all, full stop; the
+  CAS-semantic `Cas*Delete` counters (or the GC log directly) are the only path to DELETE
+  attribution. GET/HEAD's residual gap (per the CAS-semantic-counter comparison above) was NOT
+  re-investigated with this technique — HEAD in particular remains open.
