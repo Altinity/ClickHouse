@@ -2542,3 +2542,30 @@ campaign. The CAS gtest battery is green. No CAS action; if pursued, it belongs 
   there is no `CasMetaHead` counter at all in the CAS-kind breakdown) — worth a follow-up
   look at whether generic `DiskObjectStorage`/`MergeTreePrefetchedReadPool` existence
   checks bypass `Cas::InstrumentedBackend`'s own instrumentation entirely.
+- **Independent cross-validation, and the gap is now architecturally explained, not just
+  measured:** `system.blob_storage_log` carries its own `query_id` column, and `part_log`'s
+  `query_id` is documented as "Identifier of the INSERT query that created this data part".
+  A direct row-level `INNER JOIN` between them (no ProfileEvents delta-summing at all)
+  gives an independent count: `blob_storage_log` `Upload` rows joined to `query_log` by
+  `query_id`, grouped by `query_kind`, yield 591,706 `Insert`-attributed uploads out of
+  2,114,906 total `Upload` rows — **28.0% coverage**, matching the earlier
+  ProfileEvents-based 27.7% (query_log's `Insert` = 567,035) within measurement-timing
+  noise. Two independent methods (ProfileEvents-sum vs literal row JOIN) landing on the
+  same ~28%/72% split is strong confirmation the split is real, not a quirk of either
+  measurement technique.
+  Crucially, `part_log`'s `query_id` is **only ever populated for `NewPart`**
+  (44,624 of 59,909 rows) — `RemovePart`/`MergeParts`/`MergePartsStart`/`MutatePart`/
+  `MutatePartStart`/`DownloadPart` all show `query_id = ''` for every single row, 0
+  exceptions. The ~21,317 distinct `Upload` `query_id`s that don't resolve in
+  `system.query_log` also do **not** resolve in `system.part_log` either (checked
+  directly: 0 matches) — these are internal/synthetic ids ClickHouse's background
+  merge/mutation/GC machinery apparently generates for its own tracing purposes, never
+  registered as a queryable "query" anywhere. This reframes the finding: the ~72%
+  unattributed PUT volume isn't a logging gap that a cleverer query could close — it is
+  structurally unreachable via `query_log`/`part_log`'s `query_id`, by design, because
+  background tasks were never given a real query identity in the first place. `Delete`
+  events go further still: `query_id` is empty on **100%** of `blob_storage_log`'s
+  2,445,357 `Delete` rows, with zero exceptions — deletes (GC's bulk reclaim,
+  `RemovePart`'s own cleanup) are never query-attributable by this mechanism at all,
+  full stop; the CAS-semantic `Cas*Delete` counters (or the GC log directly) are the
+  only path to DELETE attribution.
