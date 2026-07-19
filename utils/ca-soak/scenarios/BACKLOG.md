@@ -2370,14 +2370,25 @@ campaign. The CAS gtest battery is green. No CAS action; if pursued, it belongs 
   capacity), this one is committing threads BLOCKED waiting for `appendRefOps`'s batch
   flush to complete — i.e. wall-clock evidence that the admits() O(N) cost above is
   actually queueing up concurrent committers, not just a theoretical CPU concern.
-- **Second corroborating signal (`system.parts`, same soak run, ~70min in):** `ca_stress`
-  shows 11028 outdated (`active=0`) parts against only 16 active — an ~690:1 ratio.
-  Reclaiming an outdated part requires removing its ref, which goes through the SAME
-  `CasRefLedger::appendRefOps`/`admits()` path as committing a new one — so this looks
-  like a measurable, observable consequence of the flush bottleneck: outdated-part
-  cleanup can't keep pace with the rate merges/mutations produce them. Not fully proven
-  (didn't instrument the removal path directly), but consistent with and adds to the
-  Real-trace queueing evidence above.
+- **RETRACTED second corroborating signal:** an earlier pass (same day) flagged
+  `ca_stress` showing 11028 outdated (`active=0`) parts against only 16 active
+  (~690:1) as a suspected consequence of the admits() bottleneck starving part-removal
+  via the shared `appendRefOps` path. Follow-up with `system.part_log` and a repeat
+  `system.parts` check REFUTES this: `RemovePart` events (81450 total) substantially
+  outnumber `NewPart` events (35349) over the run, the outdated count fell to 5787
+  ~20 minutes after the 11028 snapshot (shrinking, not growing), and the single OLDEST
+  outdated part was only 499s old against `old_parts_lifetime=480s` — i.e. every
+  outdated part is within its normal grace window, not stuck. The 11028 figure was
+  simply the pipeline depth of that grace window at the current creation rate, not a
+  backlog. Do not cite the outdated-parts ratio as evidence for this bug going forward.
+- **Actual part-cleanup trace_log finding (minor, separate, NOT connected to admits()):**
+  `system.trace_log` `Real` shows `MergeTreeData::clearPartsFromFilesystemImplMaybeInParallel`
+  blocked in `pthread_cond_wait` while scheduling removal work onto its own dedicated
+  runner (~254 samples) — this pool has a fixed concurrency cap
+  (`max_parts_cleaning_thread_pool_size=128`, a distinct pool from anything
+  `appendRefOps`-related), so this is the removal orchestrator briefly waiting for a
+  free slot during a burst of removals. Bounded, expected, and unrelated to the
+  ref-ledger flush bottleneck — no fix direction.
 
 ## NOTE (CPU, expected, not actionable) — local blob staging round-trip: open() + CityHash128 + unlink() per blob
 
