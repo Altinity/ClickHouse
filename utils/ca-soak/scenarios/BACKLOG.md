@@ -2196,3 +2196,64 @@ campaign. The CAS gtest battery is green. No CAS action; if pursued, it belongs 
 - **Run:** 20260719T000359_S40_seed1
 - **Observed:** quiescence failed: <urlopen error [Errno 111] Connection refused>
 
+## PRODUCT BUG (correctness/availability, HIGH) — custom CAS disk objects are never torn down on DROP TABLE/DATABASE; a leaked GC/mount-lease background thread aborts the server (LOGICAL_ERROR) once the pool's backing storage is deleted
+
+- **Logged (UTC):** 2026-07-19
+- **Severity:** suspected-bug (confirmed root cause, not yet fixed)
+- **Found via:** CI, PR#2073 (Altinity fork), `Stateless tests (amd_debug, sequential)`,
+  sha `0d18313ddbcdc30c7a57d5183bb4894672eb4bd7`. Test:
+  `tests/queries/0_stateless/04295_content_addressed_mutation_no_leftovers.sh`. This is NOT
+  a test bug and NOT a chaos-harness artifact — it reproduced on a single quiescent server,
+  sequential execution, single table create/insert/mutate/drop, no chaos/multi-server
+  involved.
+- **Confirmed root cause (from `clickhouse-server.log` timestamps + code reading):**
+  a custom disk created via the inline `disk(...)` AST function (e.g.
+  `disk(object_storage_type=local, metadata_type=content_addressed,
+  server_root_id='04295', name='04295_content_addressed_mut', path=...)`) is cached
+  forever in `Context`'s disk selector (`src/Interpreters/Context.cpp:6584`,
+  `getOrCreateDisk`) — there is no teardown hook anywhere in `DiskFromAST.cpp` or the
+  `DROP TABLE`/`DROP DATABASE` path that stops or destroys the disk's underlying
+  `CasPool` when the last (or only) table referencing it is dropped. The pool's
+  background `ContentAddressedGC` thread and `MountLeaseKeeper` renewal thread keep
+  running indefinitely against the same physical backing directory, even after every
+  table using that disk is gone.
+  The "no-leftovers" family of CAS tests (mirrors `04290_content_addressed_no_leftovers`)
+  follows the standard pattern: `DROP TABLE ... SYNC` → poll the physical pool directory
+  until background GC reclaims it to empty → `rm -rf "${POOL_DIR}"` to clean up. That
+  final `rm -rf` deletes the directory out from under the still-running, leaked
+  GC/mount-lease threads:
+  1. GC's next tick (`Gc::acquireOrRenewLease`, `CasGc.cpp:298-340`) does
+     `backend.get(gcStateKey())`; the file is gone, `has_observation` is `true` from
+     prior successful rounds, so it throws `CORRUPTED_DATA "gc/state vanished after
+     being observed"` every tick, forever (logged, non-fatal, "will retry next tick").
+  2. `MountLeaseKeeper::renewOnce()` (`CasServerRoot.cpp:942-969`) next fires
+     ~5s later: `putOverwrite(mountKey, ..., last_token)` fails (backing file absent) →
+     `onRenewMismatch` (`CasServerRoot.cpp:713-784`) re-reads the key with
+     `backend->get()` — also absent — so none of the three specific classification
+     branches (`gc_fenced` / same-uuid-different-epoch "superseded" / foreign-uuid
+     "held by a foreign server") can fire (there is nothing to classify), and it falls
+     through to the generic base-class `LOGICAL_ERROR` at
+     `CasServerRoot.cpp:965-967` ("was touched by a foreign writer — failing closed,
+     never re-minting"). In a debug/ASan build `LOGICAL_ERROR` aborts the whole process
+     (`src/Common/Exception.cpp`'s `handle_error_code`/`abortOnFailedAssertion`),
+     crashing the server and failing two unrelated tests that happened to be running at
+     the time ("Server died").
+  Both the GC error and the mount-lease abort are the SAME root cause (the leaked
+  disk object), not two independent bugs.
+  Distinct from the already-tracked `CA-ASAN-SUITE-2026-07-09` backlog item (line
+  ~1706 above): that item is about deliberately-injected GTEST negative tests aborting
+  the *unit test binary* under abort-on-logical-error builds. This is a real crash
+  during ordinary (non-adversarial) usage of a real SQL stateless test, and the same
+  leak is a live production risk any time an operator deletes/reclaims a CAS pool's
+  backing storage after dropping the tables that used it (e.g. after a decommission)
+  without an explicit disk-teardown step.
+- **Fix direction (not yet applied):** give custom CAS disks (or `CasPool` specifically)
+  a lifecycle hook tied to table/database drop — either reference-count `Pool`
+  instances per disk and stop background threads (`ContentAddressedGC`,
+  `MountLeaseKeeper`) at zero live references, or hook `DROP TABLE`/`DROP DATABASE` to
+  explicitly release the disk. As a secondary hardening (defense in depth, not a
+  substitute for the lifecycle fix): `onRenewMismatch`/GC's round should distinguish
+  "the key is genuinely absent because the backend itself is gone" from a real
+  foreign-writer conflict, and should not escalate the former to a process-aborting
+  `LOGICAL_ERROR`.
+
