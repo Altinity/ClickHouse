@@ -2260,7 +2260,20 @@ campaign. The CAS gtest battery is green. No CAS action; if pursued, it belongs 
 ## OPTIMIZATION OPPORTUNITY (CPU, LOW-MEDIUM) — ref-ledger JSON encoding writes byte-by-byte instead of bulk-copying safe runs
 
 - **Logged (UTC):** 2026-07-19
-- **Severity:** optimization-opportunity (confirmed cause, not applied — user chose backlog-only)
+- **Severity:** optimization-opportunity (confirmed cause, and now a measured delta from a
+  standalone benchmark, not applied — user chose backlog-only)
+- **Benchmark (2026-07-19):** `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/
+  benchmarks/benchmark_cas_ref_protocol.cpp` (Google Benchmark, gated behind
+  `-DENABLE_BENCHMARKS=ON`, never wired into `ninja test`/CI — pure measurement, no
+  assertions; build+run: `cmake -S . -B build -DENABLE_BENCHMARKS=ON && ninja -C build
+  benchmark_cas_ref_protocol && ./build/.../benchmark_cas_ref_protocol`):
+  - `BM_WriteJSONStringSafe` (full `writeJSONString()` on a safe ~80-char ref-ledger-key-
+    shaped string) vs `BM_RawBulkWriteSafe` (a raw `out.write()` of the same bytes): **177ns
+    vs 23.5ns — a measured 7.5×**, not just the theoretical estimate above.
+  - `BM_EncodeRefLogTxn` (the current, field-by-field `encodeRefLogTxn()` on one
+    representative promote-shaped `RefLogTxn`): **753ns/call** — the absolute baseline a
+    batch/template rewrite (option 4 below) would need to beat; no "after" implementation
+    exists yet to diff against.
 - **Found via:** `system.trace_log` `CPU` profiling of the 5h soak (v10/v11, cas-gc-rebuild
   branch). The top CPU stacks (by identical-stack sample count) were dominated by
   `CasRefLedger::flushRefBatch` → `encodeRefLogTxn`/`encodeRefTableSnapshot` →
