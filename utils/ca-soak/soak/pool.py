@@ -49,9 +49,13 @@ def pool_size(timeout_s: float = 30.0) -> tuple:
             "sh", "-c", f"timeout {int(timeout_s)} du -sb {_POOL_DIR}",
         ]
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s + 5)
-        if p.returncode != 0:
-            return (None, None)
-        # `du -sb` output: "<bytes>\t<path>" — take the leading integer.
+        # `du` exits nonzero (with "cannot access ... No such file or directory" on stderr) whenever
+        # it lists a file that a concurrent writer/GC then removes before `du` can stat it -- an
+        # expected, benign TOCTOU race against the live, actively-mutating pool, NOT a probe failure.
+        # GNU `du -sb` still prints a valid (near-exact; the missing file's bytes are simply excluded)
+        # recursive total to stdout in this case, so we do NOT gate on returncode here -- only an
+        # unparseable/empty stdout (a genuinely failed probe, e.g. the container being unreachable)
+        # falls back to (None, None).
         first_line = p.stdout.strip().splitlines()[0] if p.stdout.strip() else ""
         parts = first_line.split()
         if not parts:
