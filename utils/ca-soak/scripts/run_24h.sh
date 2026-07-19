@@ -17,6 +17,8 @@ DURATION="${DURATION:-24h}"
 WORKERS="${WORKERS:-6}"
 METRICS="${METRICS:-soak.db}"
 MAX_POOL_GB="${MAX_POOL_GB:-40}"
+SELECT_WORKERS="${SELECT_WORKERS:-4}"
+SELECT_INTERVAL_S="${SELECT_INTERVAL_S:-2.0}"
 
 LOGDIR="$(pwd)/logs"
 mkdir -p "$LOGDIR"
@@ -79,7 +81,9 @@ WATCHDOG_PID=$!
 
 PYTHONPATH="$(pwd)" python3 -m soak.run \
   --seed "$SEED" --phase 3 --duration "$DURATION" --workers "$WORKERS" \
-  --metrics "$METRICS" --max-pool-gb "$MAX_POOL_GB" ${NO_CHAOS:+--no-chaos}
+  --metrics "$METRICS" --max-pool-gb "$MAX_POOL_GB" \
+  --select-workers "$SELECT_WORKERS" --select-interval-s "$SELECT_INTERVAL_S" \
+  ${NO_CHAOS:+--no-chaos}
 rc=$?
 if [ "$rc" -ne 0 ]; then echo "PHASE3 FAILED (rc=$rc) — stack left UP for inspection (see trap)"; exit "$rc"; fi
 SOAK_OK=1   # happy finish — the EXIT trap will now tear down
