@@ -2399,3 +2399,55 @@ campaign. The CAS gtest battery is green. No CAS action; if pursued, it belongs 
   unavoidable costs of the local-staging design (vs. opt-in S3-native staging, which
   skips the local file round-trip entirely). No fix direction — recorded for a complete
   CPU-profile picture, not because it should change.
+
+## RESOLVED (benign, not a bug) — CANNOT_PARSE_INPUT_ASSERTION_FAILED in system.errors is ClickHouse's own VALUES-format fast/slow parser fallback, unrelated to CAS
+
+- **Logged (UTC):** 2026-07-19
+- **Severity:** resolved — confirmed benign via `system.errors.last_error_message` +
+  `last_error_trace` (previously flagged as unresolved in the metrics-review commit
+  above; this closes it out)
+- **Root cause:** `system.errors`'s `last_error_message` for this code read: `"Cannot
+  parse input: expected ',' before: 'toDateTime64(1784490339,3),1,-917,'a4de..."`. This
+  is `ValuesBlockInputFormat::tryReadValue` (`src/Processors/Formats/Impl/
+  ValuesBlockInputFormat.cpp:296-334`) attempting its FAST streaming-literal parser on a
+  VALUES-list cell that is actually a function-call expression (`toDateTime64(...)`, from
+  the soak workload's own generated `INSERT ... VALUES (...)` text) — the fast parser
+  can't parse a function call, throws `CANNOT_PARSE_INPUT_ASSERTION_FAILED`, and
+  `tryReadValue`'s own `catch (const Exception & e) { if (!isParseError(e.code())...)
+  throw; ... }` (line 323-334) catches it, rolls back, and falls back to the full SQL
+  expression parser for that column (`readRow`'s comment at line 239-242: "Parse value
+  using fast streaming parser for literals and slow SQL parser for expressions... will
+  be deduced [as a template], so it makes possible to parse the following rows much
+  faster"). This is a deliberate, well-established ClickHouse VALUES-format optimization
+  — entirely unrelated to CAS's own `CasTextFormat.cpp` parser (which was investigated
+  and ruled out earlier: it uses non-throwing `checkChar` for its own control flow).
+- **Not a CAS bug, no fix needed.** If the soak harness wanted to avoid the fallback's
+  minor overhead, it could generate a pre-computed timestamp literal instead of a
+  `toDateTime64(...)` call in its VALUES text — a harness-side micro-optimization, not a
+  product concern, and not pursued.
+
+## OPTIMIZATION OPPORTUNITY (observability, LOW/minor) — CAS conditional-PUT collisions inflate the generic S3_ERROR error counter
+
+- **Logged (UTC):** 2026-07-19
+- **Severity:** minor (user-identified; confirmed root cause, no fix applied)
+- **Root cause:** `system.errors`'s `last_error_message` for `S3_ERROR` (code 499) read:
+  `"Unable to parse ExceptionName: PreconditionFailed... At least one of the
+  pre-conditions you specified did not hold, bucket test, key soak_pool/blobs/..."`.
+  This is CAS's OWN deliberate collision-detection mechanism:
+  `finalizeConditionalWriteInstrumented` (`CasObjectStorageBackend.cpp:190-270`) issues a
+  conditional PUT and explicitly checks `S3Exception::isPreconditionFailed()`
+  (`CasObjectStorageBackend.cpp:216-219`), mapping it to `PutOutcome::PreconditionFailed`
+  — a normal, expected, fully-handled outcome of CAS's write-once/dedup-adopt semantics,
+  not a real error. The underlying `S3Exception` object is still CONSTRUCTED (thrown by
+  the S3 client on receiving the precondition-failed HTTP response) before CAS's code
+  catches and reclassifies it, and that construction increments the generic
+  `ErrorCodes::S3_ERROR` counter in `system.errors`/`system.error_log` regardless — so
+  every legitimate, correctly-handled CAS collision inflates a metric that reads as if it
+  were a genuine S3 error.
+- **Fix direction (not applied):** avoid the throw-then-catch-and-reclassify round trip
+  for this specific, expected response shape — e.g. if the S3 client API exposes the raw
+  HTTP status/error code before constructing a full `Exception`, check for
+  precondition-failed there and return `PutOutcome::PreconditionFailed` directly, without
+  ever constructing (and thus counting) an `S3_ERROR`-coded exception for an outcome that
+  isn't actually an error. Cosmetic/observability-only — does not affect correctness,
+  confirmed minor priority by the user.
