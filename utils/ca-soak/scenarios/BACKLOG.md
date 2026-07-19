@@ -2634,3 +2634,71 @@ campaign. The CAS gtest battery is green. No CAS action; if pursued, it belongs 
   CAS-semantic `Cas*Delete` counters (or the GC log directly) are the only path to DELETE
   attribution. GET/HEAD's residual gap (per the CAS-semantic-counter comparison above) was NOT
   re-investigated with this technique — HEAD in particular remains open.
+
+## PRODUCT BUG (availability, MEDIUM-HIGH) — a transient S3-backend NETWORK_ERROR during CAS table-startup recovery permanently strands the table until server restart; ClickHouse's async table loader never retries the failed startup job on its own
+
+- **Logged (UTC):** 2026-07-19
+- **Severity:** confirmed (root cause traced from logs + code; not yet fixed)
+- **Found via:** 5h soak `v11` (`utils/ca-soak/logs/soak_5h_20260719_v11.run.log`), `PHASE3 FAILED
+  (rc=1)`. This ended the run — not the known "session-host `SIGTERM` burst" kill artifact
+  (that one leaves no final line and a live-but-orphaned `soak.run`; this run logged a genuine
+  `WORKLOAD FAILURE` and its own `PHASE3 FAILED` trailer).
+- **Trigger (from the log's own chaos-fault trail, lines ~2774-3234):** an unusually dense burst
+  of 5 chaos faults fired back-to-back with little/no recovery gap between them over ~430s
+  (`t+13376s` to `t+13806s`): `#69 rustfs pause dur=53s`, `#70 ch1 freeze_long dur=68s`, `#71 ch1
+  freeze_long dur=84s`, `#72 rustfs pause dur=50s`, `#73 ch2 kill dur=48s`. A single
+  `BARRIER:DELETE op_id=128265` retried 39 consecutive times against transport failures
+  (`ConnectionResetError`/`URLError: Connection refused`) across this window. `rustfs`'s own
+  application log (`/logs/rustfs.log`, `rustfs::app::object_usecase`, `object_usecase.rs:1284`)
+  showed `"I/O queue congestion detected"` with `queue_utilization: 100.0%`,
+  `permits_in_use: 64/64` right in this window, plus `"HTTP connection is closed prematurely"`
+  (`http.rs:949`) and cascading `list_path_raw`/`scan_dir` cancellations
+  (`metacache_set.rs:496`, `local.rs:1528`) — `rustfs` itself was I/O-saturated, not crash-looping
+  (`docker inspect`: `RestartCount=0` for all three containers throughout; the repeated
+  "Initializing.../Starting rustfs server..." lines seen via `docker logs` are the CUMULATIVE
+  history of every past chaos-triggered container restart across the whole run, not a live loop).
+- **Root cause (confirmed by code + live re-query on the still-UP stack):** `ch1` itself came back
+  from its own `freeze_long` faults (`#70`/`#71`) needing a CAS recovery pass for `ca_stress`
+  (an unclean-boundary reload, per `CasRefLedger.cpp:340-345`'s `unclean_boundary_epoch()`
+  check). That recovery's seal `putIfAbsentControlled` (`CasRefLedger.cpp:~404`) landed exactly
+  while `rustfs` was still saturated/resetting connections from faults `#72`/`#73`, and threw
+  `NETWORK_ERROR` via `throwCasWriteRetryLater` (`CasRequestControl.cpp:218-225`,
+  message: "CAS write could not be committed (...); retrying later"). That exception propagated
+  up through the table's async startup job as `ATTACH TABLE ... failed ... (ASYNC_LOAD_WAIT_FAILED)`.
+  `CasRefLedger.cpp`'s own comment (lines ~340-345) documents that a failed seal PUT is meant to
+  leave the table "unrecovered/non-writable; the next touch restarts recovery and re-seals" — but
+  that promise is scoped to `CasRefLedger`'s *own* recovery entry point, one layer below
+  ClickHouse's core `AsyncLoader`. Once `AsyncLoader` marks a table's startup job `FAILED`, nothing
+  calls back into `CasRefLedger::recoverIfNeeded()` for that table again — confirmed empirically:
+  three manual `SELECT count() FROM ca_stress` queries against the still-running, still-UP `ch1`,
+  several minutes apart (well after `rustfs`'s congestion cleared at `22:15:38`, tested again at
+  `22:24:47` — 9 minutes of full `rustfs` quiet), all returned the byte-identical error in ~5ms
+  (`time curl ...` → `0m0.005s`) — an instant cache hit on the terminal `FAILED` job, not a fresh
+  recovery attempt. So a purely *transient* infra hiccup (a handful of seconds of `rustfs`
+  saturation) converts into a *permanent* (until server restart, or an explicit `DETACH`/`ATTACH`)
+  table outage, which is what actually killed the soak run: the workload driver's subsequent
+  queries against `ca_stress` all failed forever afterward → `WORKLOAD FAILURE` → `PHASE3 FAILED`.
+- **Not itself a bug:** the fsck at shutdown found exactly 2 `"unreachable"` (not
+  `"corrupt"`/`"orphaned-unaccounted"`) manifest keys under this table's namespace — consistent
+  with the aborted seal attempt's own manifest write never being referenced by anything, which GC
+  should reclaim normally; `fsck_status: "settled"`. `ch2 Exited (243)` was likewise expected — the
+  chaos harness's own recovery-checkpoint loop restarts killed containers, but nothing does that
+  once `soak.run` itself has exited.
+- **Open question / fix direction (not yet applied, no fix attempted):** two independent angles,
+  not mutually exclusive:
+  1. Chaos-schedule angle: 5 faults with near-zero recovery gap between them (`rustfs`
+     pause → `ch1` freeze ×2 → `rustfs` pause → `ch2` kill, all within ~430s) is denser than any
+     single fault this suite has stress-tested individually; consider a minimum inter-fault
+     recovery buffer, or explicitly keep this density as an intentional "compound fault" scenario
+     (in which case CAS's behavior under it is the actual finding, not a scheduling defect).
+  2. CAS-startup angle: `ATTACH TABLE`'s CAS-recovery path has no bounded internal retry of its own
+     before letting a `NETWORK_ERROR` become a permanent job failure — unlike, e.g., ordinary CAS
+     write/read paths which the `~90s retry envelope` mentioned in `CasRefLedger.cpp`'s comments
+     already covers. Worth deciding whether table *startup* recovery should get a similar bounded
+     retry-before-fail-permanently policy, or whether "transient infra blip during startup ⇒
+     requires an explicit reload" is accepted as by-design ClickHouse `AsyncLoader` behavior that
+     CAS inherits like any other storage engine.
+- **Soak stack state:** left UP per the run's own failure trap (as designed) — `ch1` up (13min at
+  time of writing, `SELECT 1` healthy, `ca_stress` permanently unattachable), `ch2` still
+  `Exited (243)`, `rustfs1` up and quiet since `22:15:38`. Awaiting a decision on relaunch (`v12`)
+  vs. further investigation before any teardown.
