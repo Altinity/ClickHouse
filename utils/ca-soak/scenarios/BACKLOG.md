@@ -2299,6 +2299,21 @@ campaign. The CAS gtest battery is green. No CAS action; if pursued, it belongs 
      `writeJSONString` escaping path reserved for `op.payload` only (the one field that
      is genuinely free-form). Smaller blast radius than option 1, CAS-scoped, and now has
      a precise target (3 of 4 `writeStringValue` call sites, not "most strings").
-  3. Do nothing for now (chosen): revisit if prod-scale profiling shows this becoming a
+  4. (User-suggested, likely the biggest single win) Batch/template assembly: the real
+     overhead isn't only the escaping loop — it's the SHEER NUMBER of separate
+     `WriteBuffer` calls per record (`writeChar` for each brace/comma/colon/quote,
+     `writeKey` per field, `writeStringValue`/`writeU64StringValue`/`writeHex128Value`
+     per value — ~9-12 calls for a single `ManifestRef`+prefix), each paying its own
+     `finalized`/`canceled` check + `nextIfAtEnd()` (`WriteBuffer.cpp:38-72`). Since each
+     record's key set/order/punctuation is fixed at compile time (only value bytes
+     vary in length), assemble the whole small object into a local scratch buffer
+     (`PODArray<char>`/`fmt::memory_buffer` with a reserved upper bound) via plain
+     `memcpy`-style appends of the static literal parts (as pre-known
+     `std::string_view`s) interleaved with the (already safe-by-construction, per #2)
+     value bytes, then issue ONE `out.write(scratch.data(), scratch.size())` per record
+     instead of ~10 individual small calls. Composes with #2 (skip escaping) but is
+     independently valuable even without it — collapsing call COUNT, not just the
+     per-byte escaping cost, is likely the larger win of the two.
+  5. Do nothing for now (chosen): revisit if prod-scale profiling shows this becoming a
      larger share of CPU under heavier ref-ledger flush rates.
 
