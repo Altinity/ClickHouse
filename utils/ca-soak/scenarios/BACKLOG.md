@@ -2370,6 +2370,20 @@ campaign. The CAS gtest battery is green. No CAS action; if pursued, it belongs 
   capacity), this one is committing threads BLOCKED waiting for `appendRefOps`'s batch
   flush to complete — i.e. wall-clock evidence that the admits() O(N) cost above is
   actually queueing up concurrent committers, not just a theoretical CPU concern.
+- **Decisive quantified evidence (`system.events`, same soak run, ~90min in):**
+  `CasRefQueueWaitMicroseconds` (`ProfileEvents.cpp:772`, `"CA total time appendRefOps
+  callers spent enqueued (sum over items)"`, incremented at `CasRefLedger.cpp:849-851`
+  from `enqueued_at` to when the item's flush completes) reads **388,053,047,365 μs on
+  ch1 / 387,502,949,104 μs on ch2** — i.e. ~108 cumulative hours of caller wait time.
+  Dividing by `CasRefBatchedMutations` (855,272 ops on ch1, 854,840 on ch2, the count of
+  ref-ops that went through this exact path) gives an **average wait of ~453.7ms per
+  ref-op on ch1 and ~453.25ms on ch2** — nearly identical across both replicas,
+  confirming this is a stable, reproducible effect of the flush mechanism, not noise.
+  Every committed part, mutation, or removal requires at least one ref-op through this
+  path, so this ~450ms average is a direct, concrete latency tax on ordinary CAS
+  writes. This is the strongest evidence yet for prioritizing the admits() O(N) fix
+  above — an actual named ProfileEvent built for this exact measurement, not just
+  trace_log sample counts.
 - **RETRACTED second corroborating signal:** an earlier pass (same day) flagged
   `ca_stress` showing 11028 outdated (`active=0`) parts against only 16 active
   (~690:1) as a suspected consequence of the admits() bottleneck starving part-removal
