@@ -2317,3 +2317,46 @@ campaign. The CAS gtest battery is green. No CAS action; if pursued, it belongs 
   5. Do nothing for now (chosen): revisit if prod-scale profiling shows this becoming a
      larger share of CPU under heavier ref-ledger flush rates.
 
+## OPTIMIZATION OPPORTUNITY (CPU, algorithmic, MEDIUM-HIGH) — admits() re-encodes the WHOLE ref table once per state-growing op in a flush batch
+
+- **Logged (UTC):** 2026-07-19
+- **Severity:** optimization-opportunity (confirmed cause via code reading, not applied —
+  user chose backlog-only)
+- **Found via:** following up the ref-ledger CPU findings above — `system.trace_log` `CPU`
+  profiling of the 5h soak (v10/v11) showed `RefCowMap::const_iterator::operator++()`
+  hot inside `admits()` (`CasRefLedger::flushRefBatch` → `admits()`), which is a bigger
+  concern than the byte-level write cost above because it is O(table size), not a
+  constant-factor overhead.
+- **Root cause:** `admits(state, op, snapshot_budget, removal_budget)`
+  (`CasRefProtocol.cpp:325-341`) answers "would applying this ONE op push the encoded
+  snapshot size over budget?" by doing a full O(N) rebuild+encode from scratch on EVERY
+  call, where N = the namespace's total live ref count:
+  1. `snapshotOf(scratch, "")` (`CasRefProtocol.cpp:287-306`) iterates the ENTIRE merged
+     `RefCowMap` (`for (const auto [name, row] : state.committed) snapshot.committed.push_back(row)`),
+     then `encodeRefTableSnapshot(...)` serializes the WHOLE table just to check
+     `.size() > snapshot_budget`.
+  2. `buildHypotheticalRemovalTxn(scratch, ...)` (`CasRefProtocol.cpp:238-262`) does the
+     same full committed+precommits iteration to build a hypothetical whole-namespace
+     removal transaction, then `encodeRefLogTxn(...)` encodes THAT in full too, just to
+     check its size against `removal_budget`.
+  `admits()` is called ONCE PER STATE-GROWING OP inside the per-item loop in
+  `CasRefLedger.cpp:1096-1116` (`flushRefBatch`'s batch loop), not once per flush or once
+  per item — so a flush batch with K state-growing ops against a table with N live refs
+  costs O(K×N), not O(K) or O(N).
+- **Fix directions considered (not applied):**
+  1. Maintain a running/incremental byte-size counter on `RefTableState`/`RefCowMap`,
+     updated O(1) per applied op (add the new/changed row's encoded size, subtract the
+     old one's), so `admits()` becomes `running_total + delta_for_op <= budget` — O(1)
+     instead of O(N). Same idea for the removal-budget side: track a running
+     committed+precommits row count (or running encoded-size total) instead of building
+     the full hypothetical removal transaction from scratch. Preserves the exact
+     per-op-precision semantics the current code has.
+  2. Check the budget once per item (or once per whole flush batch) instead of once per
+     state-growing op — fewer `admits()` calls, but per the code's own comments the
+     per-op ordering exists so a LATER op in the same item is validated against a state
+     that already reflects EARLIER ops in that same item; loosening this changes
+     validation granularity/ordering guarantees and needs a design review, not just a
+     perf patch.
+  3. Do nothing for now (chosen): revisit if prod-scale profiling / a larger live ref-table
+     count makes this a measurably larger share of flush latency.
+
