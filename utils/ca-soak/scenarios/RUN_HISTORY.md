@@ -378,3 +378,94 @@ Every attempted scenario run is appended here (newest at the bottom). `run_dir` 
 | 2026-07-17T10:53:40 | S37 | 1 | dev | 900s | fail | 70b360471b47 | 20260717T105322_S37_seed1 | Node(localhost:8123) HTTP 500: Code: 384. DB::Exception: Cannot move part 'all_0_0_0' because it's participating in background process. (PART_IS_TEMPORARILY_LOCKED) (version 26.6.1.1) / sql=ALTER TABLE s37_ttl MOVE PARTITION ID 'all' TO VOLUME 'hot' |
 | 2026-07-17T10:57:01 | S37 | 1 | dev | 900s | pass | 9926f38ba23d | 20260717T105454_S37_seed1 |  |
 | 2026-07-17T11:01:16 | S37 | 1 | dev | 900s | pass | 9926f38ba23d | 20260717T105908_S37_seed1 |  |
+| 2026-07-17T17:36:12 | S39 | 1 | ci | 900s | pass | 34c2d615874c | 20260717T173254_S39_seed1 |  |
+| 2026-07-17T17:38:31 | S37 | 1 | dev | 900s | pass | 34c2d615874c | 20260717T173612_S37_seed1 |  |
+| 2026-07-17T21:26:28 | S01 | 1 | ci | 900s | pass | 7a9627cd0fab | 20260717T212549_S01_seed1 |  |
+| 2026-07-17T21:27:08 | S02 | 1 | ci | 900s | pass | 7a9627cd0fab | 20260717T212628_S02_seed1 |  |
+| 2026-07-17T21:32:16 | S03 | 1 | ci | 900s | inconclusive | 7a9627cd0fab | 20260717T212708_S03_seed1 |  |
+| 2026-07-17T21:35:20 | S04 | 1 | ci | 900s | inconclusive | 7a9627cd0fab | 20260717T213216_S04_seed1 |  |
+| 2026-07-17T21:56:44 | S06 | 1 | ci | 900s | inconclusive | 7a9627cd0fab | 20260717T215021_S06_seed1 |  |
+| 2026-07-17T22:03:09 | S07 | 1 | ci | 900s | inconclusive | 7a9627cd0fab | 20260717T215644_S07_seed1 | S07 could not trigger a manifest cap with dev-scale SQL — recorded inconclusive for the direct cap trip; the indirect fail-closed property check still runs. |
+| 2026-07-17T22:19:02 | S09 | 1 | ci | 900s | pass | 7a9627cd0fab | 20260717T221809_S09_seed1 |  |
+| 2026-07-17T22:20:01 | S10 | 1 | ci | 900s | inconclusive | 7a9627cd0fab | 20260717T221902_S10_seed1 |  |
+| 2026-07-17T22:27:24 | S11 | 1 | ci | 900s | inconclusive | 7a9627cd0fab | 20260717T222001_S11_seed1 |  |
+| 2026-07-17T22:29:54 | S12 | 1 | ci | 900s | pass | 7a9627cd0fab | 20260717T222724_S12_seed1 |  |
+| 2026-07-17T23:51:15 | S14 | 1 | ci | 900s | pass | 4420b5a3498b | 20260717T234138_S14_seed1 |  |
+| 2026-07-17T23:54:44 | S15 | 1 | ci | 900s | pass | 4420b5a3498b | 20260717T235115_S15_seed1 |  |
+| 2026-07-17T23:57:13 | S16 | 1 | ci | 900s | pass | 4420b5a3498b | 20260717T235444_S16_seed1 |  |
+| 2026-07-17T23:57:56 | S17 | 1 | ci | 900s | pass | 4420b5a3498b | 20260717T235713_S17_seed1 |  |
+| 2026-07-17T23:58:49 | S18 | 1 | ci | 900s | pass | 4420b5a3498b | 20260717T235756_S18_seed1 |  |
+| 2026-07-17T23:59:28 | S19 | 1 | ci | 900s | pass | 4420b5a3498b | 20260717T235849_S19_seed1 |  |
+| 2026-07-18T00:00:11 | S20 | 1 | ci | 900s | inconclusive | 4420b5a3498b | 20260717T235928_S20_seed1 |  |
+| 2026-07-18T00:03:07 | S21 | 1 | ci | 900s | inconclusive | 4420b5a3498b | 20260718T000011_S21_seed1 |  |
+| 2026-07-18T00:04:59 | S22 | 1 | ci | 900s | fail | 4420b5a3498b | 20260718T000307_S22_seed1 |  |
+| 2026-07-18T00:07:29 | S23 | 1 | ci | 900s | fail | 4420b5a3498b | 20260718T000459_S23_seed1 |  |
+| 2026-07-18T00:08:20 | S24 | 1 | ci | 900s | pass | 4420b5a3498b | 20260718T000729_S24_seed1 |  |
+| 2026-07-18T00:09:02 | S25 | 1 | ci | 900s | pass | 4420b5a3498b | 20260718T000820_S25_seed1 |  |
+| 2026-07-18T00:09:47 | S26 | 1 | ci | 900s | pass | 4420b5a3498b | 20260718T000902_S26_seed1 |  |
+| 2026-07-18T00:13:39 | S27 | 1 | ci | 900s | pass | 4420b5a3498b | 20260718T000947_S27_seed1 |  |
+| 2026-07-18T00:15:10 | S28 | 1 | ci | 900s | pass | 4420b5a3498b | 20260718T001339_S28_seed1 |  |
+| 2026-07-18T00:15:53 | S29 | 1 | ci | 900s | inconclusive | 4420b5a3498b | 20260718T001510_S29_seed1 |  |
+| 2026-07-18T00:17:53 | S30 | 1 | ci | 900s | pass | 4420b5a3498b | 20260718T001553_S30_seed1 |  |
+| 2026-07-18T00:19:08 | S31 | 1 | ci | 900s | fail | 4420b5a3498b | 20260718T001753_S31_seed1 | ca-gc-dryrun previews only target shard 0; subset-oracle blind to shard>=1 under gc_shards>1 — previewed 72 but GC reclaimed ~406 (checklist #9). previewDeletes should iterate all target shards, not just shard 0. |
+| 2026-07-18T00:19:46 | S32 | 1 | ci | 900s | pass | 4420b5a3498b | 20260718T001908_S32_seed1 |  |
+| 2026-07-18T00:20:54 | S33 | 1 | ci | 900s | pass | 4420b5a3498b | 20260718T001946_S33_seed1 |  |
+| 2026-07-18T00:22:55 | S34 | 1 | ci | 900s | pass | b4196a7017f7 | 20260718T002054_S34_seed1 |  |
+| 2026-07-18T00:24:31 | S35 | 1 | ci | 900s | pass | b3fe10fa3fba | 20260718T002255_S35_seed1 |  |
+| 2026-07-18T00:24:48 | S36 | 1 | ci | 900s | fail | b3fe10fa3fba | 20260718T002431_S36_seed1 | Node(localhost:8123) HTTP 500: Code: 479. DB::Exception: Part '0_0_0_0' is already on disk 'ca'. (UNKNOWN_DISK) (version 26.6.1.20000.altinityantalya) / sql=ALTER TABLE s36_move MOVE PART '0_0_0_0' TO DISK 'ca' |
+| 2026-07-18T00:26:59 | S37 | 1 | ci | 900s | fail | b3fe10fa3fba | 20260718T002448_S37_seed1 |  |
+| 2026-07-18T00:33:21 | S38 | 1 | ci | 900s | fail | b3fe10fa3fba | 20260718T002659_S38_seed1 |  |
+| 2026-07-18T00:36:37 | S39 | 1 | ci | 900s | pass | b3fe10fa3fba | 20260718T003321_S39_seed1 |  |
+| 2026-07-18T00:40:39 | S40 | 1 | ci | 900s | pass | b3fe10fa3fba | 20260718T003637_S40_seed1 | quiescence failed: <urlopen error [Errno 111] Connection refused> |
+| 2026-07-18T00:49:02 | S05 | 1 | ci | 900s | inconclusive | b0da1f60f429 | 20260718T004039_S05_seed1 |  |
+| 2026-07-18T01:13:08 | S08 | 1 | ci | 900s | inconclusive | 4d457ec378af | 20260718T004902_S08_seed1 |  |
+| 2026-07-18T01:40:34 | S23 | 1 | ci | 900s | fail | 4d457ec378af | 20260718T013739_S23_seed1 |  |
+| 2026-07-18T01:41:47 | S31 | 1 | ci | 900s | pass | 4d457ec378af | 20260718T014034_S31_seed1 |  |
+| 2026-07-18T01:44:04 | S36 | 1 | ci | 900s | pass | 4d457ec378af | 20260718T014147_S36_seed1 |  |
+| 2026-07-18T01:46:16 | S37 | 1 | ci | 900s | pass | 4d457ec378af | 20260718T014404_S37_seed1 |  |
+| 2026-07-18T01:52:35 | S38 | 1 | ci | 900s | fail | 4d457ec378af | 20260718T014616_S38_seed1 |  |
+| 2026-07-18T03:13:16 | S02 | 1 | dev | 900s | pass | b27ec0816de8 | 20260718T031236_S02_seed1 |  |
+| 2026-07-18T16:17:03 | S22 | 1 | ci | 900s | pass | 08ea8d1200e4 | 20260718T161452_S22_seed1 |  |
+| 2026-07-18T16:45:59 | S13 | 3 | ci | 3600s | pass | 08ea8d1200e4 | 20260718T161945_S13_seed3 |  |
+| 2026-07-18T16:49:04 | S23 | 1 | ci | 900s | inconclusive | 08ea8d1200e4 | 20260718T164643_S23_seed1 |  |
+| 2026-07-18T21:07:50 | S01 | 1 | ci | 900s | pass | 426b3dbce2b8 | 20260718T210704_S01_seed1 |  |
+| 2026-07-18T21:08:35 | S02 | 1 | ci | 900s | pass | 426b3dbce2b8 | 20260718T210750_S02_seed1 |  |
+| 2026-07-18T21:13:11 | S03 | 1 | ci | 900s | inconclusive | 426b3dbce2b8 | 20260718T210836_S03_seed1 |  |
+| 2026-07-18T21:15:00 | S04 | 1 | ci | 900s | inconclusive | 426b3dbce2b8 | 20260718T211311_S04_seed1 |  |
+| 2026-07-18T21:23:24 | S05 | 1 | ci | 900s | inconclusive | 426b3dbce2b8 | 20260718T211500_S05_seed1 |  |
+| 2026-07-18T21:25:58 | S06 | 1 | ci | 900s | inconclusive | 426b3dbce2b8 | 20260718T212324_S06_seed1 |  |
+| 2026-07-18T21:28:46 | S07 | 1 | ci | 900s | inconclusive | 426b3dbce2b8 | 20260718T212558_S07_seed1 | S07 could not trigger a manifest cap with dev-scale SQL — recorded inconclusive for the direct cap trip; the indirect fail-closed property check still runs. |
+| 2026-07-18T21:44:41 | S09 | 1 | ci | 900s | pass | 426b3dbce2b8 | 20260718T214346_S09_seed1 |  |
+| 2026-07-18T21:45:35 | S10 | 1 | ci | 900s | inconclusive | 426b3dbce2b8 | 20260718T214441_S10_seed1 |  |
+| 2026-07-18T21:52:59 | S11 | 1 | ci | 900s | inconclusive | 426b3dbce2b8 | 20260718T214535_S11_seed1 |  |
+| 2026-07-18T21:55:32 | S12 | 1 | ci | 900s | pass | 426b3dbce2b8 | 20260718T215259_S12_seed1 |  |
+| 2026-07-18T22:35:30 | S13 | 1 | ci | 900s | pass | 426b3dbce2b8 | 20260718T221424_S13_seed1 |  |
+| 2026-07-18T23:01:31 | S08 | 1 | ci | 900s | inconclusive | 426b3dbce2b8 | 20260718T223640_S08_seed1 | quiescence failed: quiesce initial: 1 replication-queue entries carry a real last_exception — genuine error |
+| 2026-07-18T23:15:44 | S14 | 1 | ci | 900s | pass | 35faaae182c5 | 20260718T230652_S14_seed1 |  |
+| 2026-07-18T23:19:13 | S15 | 1 | ci | 900s | pass | 35faaae182c5 | 20260718T231544_S15_seed1 |  |
+| 2026-07-18T23:21:43 | S16 | 1 | ci | 900s | pass | 35faaae182c5 | 20260718T231913_S16_seed1 |  |
+| 2026-07-18T23:22:26 | S17 | 1 | ci | 900s | pass | 35faaae182c5 | 20260718T232143_S17_seed1 |  |
+| 2026-07-18T23:23:26 | S18 | 1 | ci | 900s | pass | 35faaae182c5 | 20260718T232227_S18_seed1 |  |
+| 2026-07-18T23:24:04 | S19 | 1 | ci | 900s | pass | 35faaae182c5 | 20260718T232326_S19_seed1 |  |
+| 2026-07-18T23:24:48 | S20 | 1 | ci | 900s | inconclusive | 35faaae182c5 | 20260718T232405_S20_seed1 |  |
+| 2026-07-18T23:27:30 | S21 | 1 | ci | 900s | inconclusive | 35faaae182c5 | 20260718T232448_S21_seed1 |  |
+| 2026-07-18T23:29:46 | S22 | 1 | ci | 900s | pass | 35faaae182c5 | 20260718T232730_S22_seed1 |  |
+| 2026-07-18T23:32:14 | S23 | 1 | ci | 900s | inconclusive | 35faaae182c5 | 20260718T232946_S23_seed1 |  |
+| 2026-07-18T23:33:07 | S24 | 1 | ci | 900s | pass | 35faaae182c5 | 20260718T233214_S24_seed1 |  |
+| 2026-07-18T23:33:50 | S25 | 1 | ci | 900s | pass | 35faaae182c5 | 20260718T233307_S25_seed1 |  |
+| 2026-07-18T23:34:35 | S26 | 1 | ci | 900s | pass | 35faaae182c5 | 20260718T233350_S26_seed1 |  |
+| 2026-07-18T23:38:26 | S27 | 1 | ci | 900s | pass | 35faaae182c5 | 20260718T233436_S27_seed1 |  |
+| 2026-07-18T23:40:33 | S28 | 1 | ci | 900s | pass | 35faaae182c5 | 20260718T233826_S28_seed1 |  |
+| 2026-07-18T23:41:15 | S29 | 1 | ci | 900s | inconclusive | 35faaae182c5 | 20260718T234033_S29_seed1 |  |
+| 2026-07-18T23:43:15 | S30 | 1 | ci | 900s | pass | 35faaae182c5 | 20260718T234115_S30_seed1 |  |
+| 2026-07-18T23:44:31 | S31 | 1 | ci | 900s | pass | 35faaae182c5 | 20260718T234315_S31_seed1 |  |
+| 2026-07-18T23:45:08 | S32 | 1 | ci | 900s | pass | 35faaae182c5 | 20260718T234431_S32_seed1 |  |
+| 2026-07-18T23:46:11 | S33 | 1 | ci | 900s | pass | 35faaae182c5 | 20260718T234508_S33_seed1 |  |
+| 2026-07-18T23:48:11 | S34 | 1 | ci | 900s | pass | 35faaae182c5 | 20260718T234611_S34_seed1 |  |
+| 2026-07-18T23:49:53 | S35 | 1 | ci | 900s | pass | 35faaae182c5 | 20260718T234811_S35_seed1 |  |
+| 2026-07-18T23:52:10 | S36 | 1 | ci | 900s | pass | 35faaae182c5 | 20260718T234953_S36_seed1 |  |
+| 2026-07-18T23:54:22 | S37 | 1 | ci | 900s | pass | 35faaae182c5 | 20260718T235210_S37_seed1 |  |
+| 2026-07-19T00:00:44 | S38 | 1 | ci | 900s | fail | 35faaae182c5 | 20260718T235423_S38_seed1 |  |
+| 2026-07-19T00:03:59 | S39 | 1 | ci | 900s | pass | 35faaae182c5 | 20260719T000044_S39_seed1 |  |
+| 2026-07-19T00:08:02 | S40 | 1 | ci | 900s | pass | 35faaae182c5 | 20260719T000359_S40_seed1 | quiescence failed: <urlopen error [Errno 111] Connection refused> |
+| 2026-07-19T00:31:55 | S08 | 1 | ci | 900s | inconclusive | 35faaae182c5 | 20260719T000802_S08_seed1 |  |

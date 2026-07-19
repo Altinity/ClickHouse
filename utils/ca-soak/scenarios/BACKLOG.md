@@ -2147,3 +2147,52 @@ campaign. The CAS gtest battery is green. No CAS action; if pursued, it belongs 
 - **Run:** 20260717T105322_S37_seed1
 - **Observed:** scenario raised: Node(localhost:8123) HTTP 500: Code: 384. DB::Exception: Cannot move part 'all_0_0_0' because it's participating in background process. (PART_IS_TEMPORARILY_LOCKED) (version 26.6.1.1) | sql=ALTER TABLE s37_ttl MOVE PARTITION ID 'all' TO VOLUME 'hot'
 
+## S07-20260717T215644-1: S07 could not trigger a manifest cap with dev-scale SQL — recorded inconclusive 
+
+- **Logged (UTC):** 2026-07-17T22:03:09
+- **Severity:** finding
+- **Run:** 20260717T215644_S07_seed1
+- **Observed:** S07 could not trigger a manifest cap with dev-scale SQL — recorded inconclusive for the direct cap trip; the indirect fail-closed property check still runs.
+
+## S31-20260718T001753-1: ca-gc-dryrun previews only target shard 0; subset-oracle blind to shard>=1 under
+
+- **Logged (UTC):** 2026-07-18T00:19:08
+- **Severity:** suspected-bug
+- **Run:** 20260718T001753_S31_seed1
+- **Observed:** ca-gc-dryrun previews only target shard 0; subset-oracle blind to shard>=1 under gc_shards>1 — previewed 72 but GC reclaimed ~406 (checklist #9). previewDeletes should iterate all target shards, not just shard 0.
+
+## S36-20260718T002431-1: scenario raised: Node(localhost:8123) HTTP 500: Code: 479. DB::Exception: Part '
+
+- **Logged (UTC):** 2026-07-18T00:24:48
+- **Severity:** suspected-bug
+- **Run:** 20260718T002431_S36_seed1
+- **Observed:** scenario raised: Node(localhost:8123) HTTP 500: Code: 479. DB::Exception: Part '0_0_0_0' is already on disk 'ca'. (UNKNOWN_DISK) (version 26.6.1.20000.altinityantalya) | sql=ALTER TABLE s36_move MOVE PART '0_0_0_0' TO DISK 'ca'
+
+## S40-20260718T003637-1: quiescence failed: <urlopen error [Errno 111] Connection refused>
+
+- **Logged (UTC):** 2026-07-18T00:40:39
+- **Severity:** finding
+- **Run:** 20260718T003637_S40_seed1
+- **Observed:** quiescence failed: <urlopen error [Errno 111] Connection refused>
+
+## S07-20260718T212558-1: S07 could not trigger a manifest cap with dev-scale SQL — recorded inconclusive 
+
+- **Logged (UTC):** 2026-07-18T21:28:46
+- **Severity:** finding
+- **Run:** 20260718T212558_S07_seed1
+- **Observed:** S07 could not trigger a manifest cap with dev-scale SQL — recorded inconclusive for the direct cap trip; the indirect fail-closed property check still runs.
+
+## S08-20260718T223640-1: quiescence failed: quiesce initial: 1 replication-queue entries carry a real las
+
+- **Logged (UTC):** 2026-07-18T23:01:31
+- **Severity:** finding
+- **Run:** 20260718T223640_S08_seed1
+- **Observed:** quiescence failed: quiesce initial: 1 replication-queue entries carry a real last_exception — genuine error
+
+## S40-20260719T000359-1: quiescence failed: <urlopen error [Errno 111] Connection refused>
+
+- **Logged (UTC):** 2026-07-19T00:08:02
+- **Severity:** finding
+- **Run:** 20260719T000359_S40_seed1
+- **Observed:** quiescence failed: <urlopen error [Errno 111] Connection refused>
+
