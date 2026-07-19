@@ -2359,4 +2359,15 @@ campaign. The CAS gtest battery is green. No CAS action; if pursued, it belongs 
      perf patch.
   3. Do nothing for now (chosen): revisit if prod-scale profiling / a larger live ref-table
      count makes this a measurably larger share of flush latency.
+- **Corroborating evidence (Real/wall-clock trace, same soak run):** `system.trace_log`
+  `trace_type = 'Real'` top stacks show `pthread_cond_wait` inside
+  `CasRefLedger::appendRefOps` ← `Pool::appendRefOps` ← `PartWriteTxn::promote`/
+  `precommitAdd` ← `ContentAddressedTransaction::publishStaging`/`commit` across 4 near-
+  identical stacks totaling ~741k samples on each replica — more than the background
+  schedule pool's idle time and comparable to the query executor's own reactor loop.
+  Unlike the rest of the Real-trace top stacks (query-executor async-task poll,
+  schedule-pool idle, HTTP keep-alive poll, ZK/S3 network round-trips — all healthy idle
+  capacity), this one is committing threads BLOCKED waiting for `appendRefOps`'s batch
+  flush to complete — i.e. wall-clock evidence that the admits() O(N) cost above is
+  actually queueing up concurrent committers, not just a theoretical CPU concern.
 
