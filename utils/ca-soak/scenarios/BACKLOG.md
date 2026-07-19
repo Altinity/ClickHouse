@@ -2257,3 +2257,39 @@ campaign. The CAS gtest battery is green. No CAS action; if pursued, it belongs 
   foreign-writer conflict, and should not escalate the former to a process-aborting
   `LOGICAL_ERROR`.
 
+## OPTIMIZATION OPPORTUNITY (CPU, LOW-MEDIUM) — ref-ledger JSON encoding writes byte-by-byte instead of bulk-copying safe runs
+
+- **Logged (UTC):** 2026-07-19
+- **Severity:** optimization-opportunity (confirmed cause, not applied — user chose backlog-only)
+- **Found via:** `system.trace_log` `CPU` profiling of the 5h soak (v10/v11, cas-gc-rebuild
+  branch). The top CPU stacks (by identical-stack sample count) were dominated by
+  `CasRefLedger::flushRefBatch` → `encodeRefLogTxn`/`encodeRefTableSnapshot` →
+  `writeJSONString`/`writeBindingFields`/`writeManifestRefFields` →
+  `DB::WriteBuffer::write(char)`, collectively ~470 of the top-10 rows' samples (a
+  modest, not dominant, share of total CPU samples — this is a constant-factor
+  opportunity, not a hot-path emergency).
+- **Root cause:** `writeJSONString` (`src/IO/WriteHelpers.h:182`) escapes JSON strings by
+  calling `writeChar` in a plain per-character loop, even across long runs of characters
+  that need no escaping (e.g. hex hashes, UUIDs, numeric fields — which make up most of
+  the ref-ledger's encoded fields). Each `WriteBuffer::write(char)` call
+  (`src/IO/WriteBuffer.cpp:61-72`) pays a `finalized`/`canceled` check plus a
+  `nextIfAtEnd()` call per byte, whereas the bulk `write(const char*, n)` path pays that
+  overhead once per call, amortized over `n` bytes. The codebase already has a faster
+  pattern for exactly this shape — `writeAnyEscapedString` (`WriteHelpers.h:267`) uses
+  `find_first_symbols<...>` to vector-scan for the next special character, then bulk
+  `buf.write(pos, run_length)`s the safe run in between — but `writeJSONString` does not
+  use it.
+- **Fix directions considered (not applied):**
+  1. Rewrite `writeJSONString` itself to use the `find_first_symbols` bulk-copy pattern.
+     Benefits every JSON-encoding call site in ClickHouse, not just CAS, but touches a
+     ubiquitous shared IO primitive — needs full format-test regression, out of
+     proportion to a CAS-local profiling finding.
+  2. CAS-local fast path: in `writeBindingFields`/`writeManifestRefFields`
+     (`ContentAddressed/Pool/CasRefLedger.cpp` and friends), fields that are
+     structurally already JSON-safe (hex hashes, UUIDs, plain integers) could be
+     `buf.write()`-ed directly, bypassing `writeJSONString`'s escaping machinery
+     entirely, and reserve the general-purpose escaping path only for genuinely
+     free-form strings (namespace/ref names). Smaller blast radius, CAS-scoped.
+  3. Do nothing for now (chosen): revisit if prod-scale profiling shows this becoming a
+     larger share of CPU under heavier ref-ledger flush rates.
+
