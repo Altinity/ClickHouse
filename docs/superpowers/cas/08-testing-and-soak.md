@@ -249,6 +249,140 @@ in-flight entry. A test failing because a blob is deleted *later* than
 the old protocol is expected drift; a test failing because a **referenced** blob is deleted, or an
 in-degree double-count appears, is a real bug.
 
+### 2.4 Live health-verification playbook {#health-checklist}
+
+When a CAS-backed server is running (a soak, staging, or production) and the question is "is CAS
+actually behaving correctly right now", this is the order of checks and what each one tells you —
+distilled from a full pass across every relevant `system.*` table during a 5h chaos soak on
+`cas-gc-rebuild`. Each step names the table, the query shape, and the gotcha that made an earlier
+pass over-claim or under-claim something.
+
+**1. Correctness invariants first, not performance.** Query `system.content_addressed_log`
+(`#event-log` above) for the event types the soak harness asserts must never appear:
+`read_missing`, `dangling_access`, `corrupt_dangle`, `corrupt_decode`, `snap_journal_incoherent`,
+`exception`. Also scan the free-text `reason` column broadly for `anomaly`/`clamp`/`error`/
+`corrupt`/`unexpected`/`fail` — not just inside the known-bad event types — since a genuinely new
+failure mode may not yet be in that list. Zero hits on both checks is the baseline "nothing is
+structurally wrong" signal; do this before looking at any performance number.
+
+**2. `system.errors` / `system.error_log` — read past the raw `value`.** Both tables carry
+`last_error_message` and `last_error_trace` columns; a bare error-code count with no further
+context tells you almost nothing. `system.text_log` is **not** authoritative on its own for how
+often an error fired — `LogSeriesLimiter` suppresses repeated identical log lines after the first
+few occurrences (the underlying `system.errors` counter still increments on every occurrence). A
+huge `system.errors` count alongside almost no matching `text_log` rows is the expected shape of a
+rate-limited, high-frequency error, not evidence the error is rare. Always cross-check
+`system.query_log`'s `exception_code != 0` count: if that is zero (or near-zero) despite a large
+`system.errors` total, the underlying failures are transient and being fully retried/absorbed
+before reaching the client.
+
+**3. Known-benign error codes worth recognizing on sight** (so they don't cost a fresh
+investigation every time): `S3_ERROR` / `"...PreconditionFailed..."` is CAS's own conditional-PUT
+collision-detection mechanism (`finalizeConditionalWriteInstrumented`,
+`CasObjectStorageBackend.cpp`) — every legitimate content-addressing/dedup collision throws (and
+thus counts) an `S3Exception` before being caught and reclassified as `PutOutcome::PreconditionFailed`,
+a normal outcome, not a real error (see `BACKLOG.md`'s "S3_ERROR inflates" entry for the
+observability-fix direction). `CANNOT_PARSE_INPUT_ASSERTION_FAILED` is ClickHouse's own
+`ValuesBlockInputFormat` fast-literal/slow-expression parser fallback (`ValuesBlockInputFormat.cpp`)
+firing whenever an `INSERT ... VALUES` row contains a function-call expression (e.g.
+`toDateTime64(...)`) instead of a bare literal — entirely unrelated to CAS.
+
+**4. `system.trace_log` — three `trace_type`s answer three different questions; don't conflate
+them.**
+- `CPU`: where the process spends actual processor cycles. Group by the exact `trace` array (not
+  just the leaf frame), condense to the top few frames per stack for readability, and remember the
+  single most-frequent *identical* stack may still be a small percentage of total CPU samples — it
+  is the modal repeated call path, not necessarily the dominant cost center.
+- `Real`: where threads spend wall-clock time, *including* blocking waits. Most of the top will be
+  healthy idle capacity (the query executor's async-task reactor loop, `BackgroundSchedulePool`
+  idle workers, HTTP keep-alive polls, ZooKeeper/S3 RPC round-trips) — the useful signal is a thread
+  blocked on a `pthread_cond_wait` **inside your own code's** internal queue/lock (not a generic I/O
+  wait), scaling with load.
+- `Memory`: samples allocation *events*, not resident memory. The leaf frame is always the
+  profiler's own capture routine (`StackTrace::StackTrace()`) — skip the first one or two frames
+  before reading the real allocation site. A high sample count here usually just means "this buffer
+  type gets constructed often," proportional to write/read volume, not a leak signal by itself.
+
+**5. `system.parts` — a single active-vs-outdated ratio is not a reliable signal; check the
+trend.** An extreme-looking ratio (this session saw 690:1) can be entirely normal pipeline depth
+within `old_parts_lifetime`'s grace window at the current creation rate. Before calling it a
+backlog: (a) re-check the same ratio a few minutes later — is the outdated count growing or
+shrinking; (b) check the oldest outdated part's age against the table's `old_parts_lifetime`
+setting; (c) cross-check `system.part_log`'s `RemovePart` vs `NewPart`+`MergeParts`+`MutatePart`
+event *rates* over the whole run, not a point-in-time count. In this session an earlier claim that
+a large outdated-parts ratio was evidence of a cleanup backlog turned out to be wrong once the trend
+was checked (the count was falling, and the oldest outdated part was barely past its grace window)
+— the claim was explicitly retracted in `BACKLOG.md` rather than left standing.
+
+**6. `system.part_log` — event-type breakdown plus its own `ProfileEvents` column.** Group by
+`event_type` (`NewPart`/`MergeParts`/`MutatePart`/`DownloadPart`/`RemovePart`/...) and sum
+`ProfileEvents['S3PutObject']` etc. per group to attribute S3/Cas cost to a part-lifecycle stage.
+Gotcha: `NewPart`'s `ProfileEvents` are the *same* underlying events as the originating `INSERT`
+query's `system.query_log` row (confirmed via `sumMap(ProfileEvents)` cross-checks on both tables)
+— summing them together double-counts. `MergeParts`/`MutatePart`/`DownloadPart` genuinely are
+additive on top of `query_log`, since the originating `Optimize`/`Alter` query_log rows show *zero*
+S3 `ProfileEvents` (their background execution isn't captured by query_log at all, only by
+part_log).
+
+**7. `system.query_log` — group `ProfileEvents` by `query_kind` for the synchronous/foreground
+view of cost,** and always check `countIf(exception_code != 0)` alongside any scary
+`system.errors` total (see step 2).
+
+**8. `system.blob_storage_log` — the write-path audit, with two gotchas.** (a) It does **not** log
+`Read` events by default — `enable_blob_storage_log_for_read_operations` defaults to `false`
+(requires `enable_blob_storage_log` too) — an all-zero `Read` row count is expected, not a gap to
+chase. (b) `data_size` on `Delete`-type rows is a `UInt64` sentinel
+(`18446744073709551615` = `UINT64_MAX`), not a real size — filter it out
+(`avgIf(data_size, data_size != 18446744073709551615)`) before computing size statistics, or the
+aggregate is nonsense. Aggregate by a derived path-prefix category (`blobs` vs
+`cas/manifests/<namespace>` vs `cas/refs/<namespace>` vs `gc/server-roots` vs `gc/other`) to get a
+per-object-kind cost/error/size/latency breakdown, and to spot cross-replica GC-leader asymmetry: a
+replica whose log shows `Delete`-only rows for the *other* replica's namespace, never `Upload`,
+confirms it currently holds GC leadership and is reclaiming pool-wide garbage.
+
+**9. `system.content_addressed_garbage_collection_log` — round duration by `outcome`, normalized
+by actual work done.** `outcome = 'Success'` vs `'NotALeader'` tells you which replica currently
+holds GC leadership — this can change mid-run (e.g. during a chaos-stage kill/restart), and that is
+expected, not a bug. For duration, normalize by
+`objects_deleted + candidates_marked + entries_graduated + entries_redeleted`: a big round taking a
+long time is fine if the per-item cost stays roughly constant across rounds; a round taking a long
+time while doing **zero** work is the real anomaly worth tracing. In this session, two such
+zero-work spikes both turned out to have a clean explanation once traced — an early cold-cache
+warmup at rounds 1–4 of the run, and a later spike landing almost exactly at the chaos-stage
+transition (correlating with a GC leadership handoff) — neither was dismissed without checking, but
+neither needed a new backlog entry either.
+
+**10. `system.events` — the ground-truth cumulative totals, and a second attribution axis.**
+Cross-reference the generic S3-level counters (`S3PutObject`/`S3GetObject`/`S3HeadObject`/
+`S3ListObjects`/`DiskS3DeleteObjects`) against CAS's own semantic per-object-kind counters
+(`Cas{Blob,Gc,Manifest,Meta,Root,Other}{Put,Get,Head,Delete,List}`, incremented at the S3-call site
+itself, independent of `ThreadGroup` attribution). In this session's soak, the Cas-level counters
+covered `PUT`/`GET`/`LIST` far better than the query_log/part_log/GC-log axis (77–96% vs 4–58%)
+because they don't depend on the calling thread being attributed back to a query or part-log event
+— while `HEAD` stayed persistently under-attributed on both axes (~56%), a genuine open question
+left for a follow-up rather than force-explained. See `BACKLOG.md`'s "S3 cost/capacity attribution"
+entry for the full worked comparison and `07-s3-budget.md` for the design-level S3 budget model.
+
+**11. Host/container-level context for elevated S3 error rates.** When `system.errors`/
+`system.events` show elevated S3 transport errors (`Broken pipe`, `Timeout`), check the *object
+storage backend's own* container/host CPU and memory (e.g. `docker stats`), not just the
+ClickHouse server's. A saturated local test-stand backend (a single `rustfs` container pinned above
+200% CPU was the case in this session) fully explains transient transport errors that are then
+silently absorbed by ClickHouse's own S3-client retry logic — confirmed via `system.query_log`
+showing zero real query failures. This is a test-stand characteristic, not a product bug, but it
+must be *confirmed* (backend CPU + zero query failures), not assumed.
+
+**General methodology notes.** Build a small "budget table" (cost broken down by source) whenever
+a single cumulative counter looks surprising — the counter tells you *that* something happened, not
+*where* it came from; cross-referencing two or three tables against the same-moment `system.events`
+snapshot tells you the shape of the cost. Never assert a finding from a single point-in-time
+snapshot ratio — check the trend over a few minutes before calling something a backlog item or a
+regression. When a later, more careful check contradicts an earlier claim, retract it explicitly in
+whatever document holds it, rather than let a wrong "corroborating evidence" note stand next to the
+real one. And distinguish "confirmed root cause" from "plausible, not fully proven" in the writeup
+itself — several findings in this session's `BACKLOG.md` entries carry that distinction
+deliberately.
+
 ## 3. Scenario suite (S01–S35) {#scenario-suite}
 
 Located at `utils/ca-soak/scenarios/`. Each scenario is an independent, focused run against a
