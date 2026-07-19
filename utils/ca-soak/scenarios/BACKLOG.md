@@ -2476,3 +2476,47 @@ campaign. The CAS gtest battery is green. No CAS action; if pursued, it belongs 
   ever constructing (and thus counting) an `S3_ERROR`-coded exception for an outcome that
   isn't actually an error. Cosmetic/observability-only — does not affect correctness,
   confirmed minor priority by the user.
+
+## OBSERVABILITY GAP (S3 cost/capacity attribution, MEDIUM) — async upload/prefetch worker threads' S3 ProfileEvents are not attributed back to query_log/part_log/GC-log
+
+- **Logged (UTC):** 2026-07-19
+- **Severity:** observability gap (confirmed via cross-referencing, no fix applied — makes
+  S3 cost/capacity analysis via these three tables significantly incomplete, does not
+  affect correctness)
+- **Found via:** building a consolidated "S3 operation budget" table by aggregating
+  ProfileEvents from `system.query_log` (by `query_kind`), `system.part_log` (by
+  `event_type`), and `system.content_addressed_garbage_collection_log` (by `outcome`),
+  then comparing the sum against a same-moment `system.events` snapshot (ch1, 5h soak
+  v11). Same-moment totals:
+  | op | attributed (query_log + part_log + GC-log) | system.events total | unattributed |
+  |---|---:|---:|---:|
+  | PUT | 567,035 | 2,045,424 | 1,478,389 (72%) |
+  | GET | 4,065,877 | 6,991,516 | 2,925,639 (42%) |
+  | HEAD | 7,415,849 | 13,226,618 | 5,810,769 (44%) |
+  | DELETE | 1,684,312 | 2,388,055 | 703,743 (29%) |
+  (`query_log`'s `Insert` and `part_log`'s `NewPart` were confirmed to be the SAME
+  underlying events via `sumMap(ProfileEvents)` cross-checks — not summed together to
+  avoid double-counting. `MergeParts`/`MutatePart`/`DownloadPart` are genuinely additive:
+  their originating `Optimize`/`Alter` query_log rows show zero S3 ProfileEvents, meaning
+  merge/mutation background execution isn't captured by query_log at all, only by
+  part_log.)
+- **Root cause (plausible, not fully proven):** confirmed via
+  `sumMap(ProfileEvents)` across ALL `part_log` rows (every table, not just `ca_stress`)
+  that PUT is 0 and DELETE is 0 in EVERY part_log row of EVERY table — i.e. no
+  merge/mutation part_log event ever captures a nonzero PUT, even though merges and
+  mutations clearly perform real S3 uploads for non-deduplicated content. This lines up
+  with the earlier `Real`-trace finding of `WriteBufferFromS3::finalizeImpl() →
+  TaskTracker::waitAll()`: CAS blob uploads during merge/mutation are dispatched to a
+  separate parallel upload-worker pool (`TaskTracker`), and those workers' ProfileEvents
+  apparently aren't aggregated back into the originating merge/mutation thread's
+  ProfileEvents snapshot that `part_log` records — a plausible explanation for why PUT is
+  the worst-attributed op (72%) while DELETE (mostly synchronous within a GC round's own
+  thread) is the best-attributed (only 29% missing). GET/HEAD's partial gap (42-44%) may
+  similarly trace to `MergeTreePrefetchedReadPool`'s speculative prefetch reads
+  happening outside the exact window a part_log event's ProfileEvents snapshot spans.
+- **Fix direction (not applied, needs more investigation before design):** if confirmed,
+  ensure async upload/prefetch worker threads are properly attached to the originating
+  query's/part-task's `ThreadGroup` so their ProfileEvents aggregate back correctly — or,
+  if that's architecturally awkward for a detached worker pool, document the gap
+  explicitly wherever `part_log`/`query_log` ProfileEvents are used for cost attribution,
+  so operators don't underestimate real S3 spend from these tables alone.
