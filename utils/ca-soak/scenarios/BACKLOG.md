@@ -2520,3 +2520,25 @@ campaign. The CAS gtest battery is green. No CAS action; if pursued, it belongs 
   if that's architecturally awkward for a detached worker pool, document the gap
   explicitly wherever `part_log`/`query_log` ProfileEvents are used for cost attribution,
   so operators don't underestimate real S3 spend from these tables alone.
+- **Update — a second, much-better-covering attribution axis exists:** CAS's own
+  semantic per-object-kind counters in `system.events` (`Cas{Blob,Gc,Manifest,Meta,Root,
+  Other}{Put,Get,Head,Delete,List}`, incremented at the point of the S3 call itself,
+  independent of query/part `ThreadGroup` attribution) cover the gap MUCH better than
+  the query_log/part_log/GC-log axis above. Same-moment fresh snapshot (ch1):
+  | op | sum of Cas*-kind counters | system.events total | coverage |
+  |---|---:|---:|---:|
+  | PUT | 1,625,628 | 2,095,330 | 77.6% (was 27.7% via query/part/gc-log) |
+  | GET | 5,892,747 | 7,135,763 | 82.6% (was 58.2%) |
+  | HEAD | 7,513,774 | 13,420,870 | 56.0% (was 56.0% — NOT improved) |
+  | DELETE | 3,162,288 | 2,441,327 | 129.5% — CAS-sum EXCEEDS the S3 total |
+  | LIST | 30,546 | 31,905 | 95.7% (was ~0%) |
+  `CasBlobPut` alone (746,143) already exceeds the ENTIRE query_log-attributed PUT total
+  (567,035), confirming background blob-upload workers (not query/part-scoped) are the
+  dominant PUT source — consistent with the `TaskTracker`/async-upload-pool hypothesis
+  above. DELETE's >100% coverage is plausibly explained by `DiskS3DeleteObjects` counting
+  HTTP *requests* (each potentially a batched multi-key delete) while `Cas*Delete` counts
+  logical *objects* — not yet confirmed, but a benign-looking explanation, not alarming.
+  **HEAD remains the one persistently unexplained gap** (44% missing either way, and
+  there is no `CasMetaHead` counter at all in the CAS-kind breakdown) — worth a follow-up
+  look at whether generic `DiskObjectStorage`/`MergeTreePrefetchedReadPool` existence
+  checks bypass `Cas::InstrumentedBackend`'s own instrumentation entirely.
