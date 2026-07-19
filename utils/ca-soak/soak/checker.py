@@ -1,6 +1,6 @@
 import time
 
-from soak.cluster import QueryError
+from soak.cluster import QueryError, retry_on_transport, is_transport_error
 
 
 class CheckpointFailure(Exception):
@@ -47,30 +47,42 @@ def sync_replica_with_readonly_retry(
             if attempt > 0:
                 elapsed = monotonic_fn() - (deadline - readonly_budget_s)
                 log_fn(
-                    f"recovery SYNC REPLICA on {node}: replica recovered from transient readonly "
-                    f"(chaos ZK-session recovery) after {elapsed:.0f}s / {readonly_budget_s:.0f}s budget — "
-                    f"proceeding"
+                    f"recovery SYNC REPLICA on {node}: replica recovered from transient readonly/"
+                    f"transport issue (chaos recovery) after {elapsed:.0f}s / {readonly_budget_s:.0f}s "
+                    f"budget — proceeding"
                 )
             return
         except QueryError as e:
             if not e.is_readonly:
                 raise
-            remaining = deadline - monotonic_fn()
-            backoff = min(backoff_cap_s, backoff_start_s * (2 ** attempt))
-            attempt += 1
-            log_fn(
-                f"recovery SYNC REPLICA on {node}: replica transiently readonly "
-                f"(chaos ZK-session recovery, TABLE_IS_READ_ONLY), retrying "
-                f"({remaining:.0f}s/{readonly_budget_s:.0f}s budget remaining, backoff={backoff:.1f}s)"
-            )
-            if remaining <= 0:
-                raise CheckpointFailure(
-                    f"SYNC REPLICA {table} on {node}: replica stuck TABLE_IS_READ_ONLY for "
-                    f"{readonly_budget_s:.0f}s (budget exhausted) — replica did NOT recover its "
-                    f"ZK session within the expected window; this IS a real stuck-replica finding, "
-                    f"not the expected transient chaos window. last error: {e}"
-                ) from e
-            sleep_fn(min(backoff, remaining))
+            transient_desc = "transiently readonly (chaos ZK-session recovery, TABLE_IS_READ_ONLY)"
+            last_err = e
+        except Exception as e:   # noqa: BLE001 -- reclassified below; non-transport re-raises as-is
+            # A raw transport-level error (connection reset/refused, socket timeout) can hit right
+            # after a chaos fault window closes -- even once `wait_for_healthy`'s /ping check has
+            # already passed, a node can still be settling its query-handling connections for a
+            # moment (hits hardest after `both restart`/`both pause`, where BOTH replicas are
+            # re-establishing state at once). Tolerate it with the SAME bounded budget as the
+            # TABLE_IS_READ_ONLY transient above; anything else still propagates immediately.
+            if not is_transport_error(e):
+                raise
+            transient_desc = f"hit a transient transport error ({type(e).__name__}: {e})"
+            last_err = e
+        remaining = deadline - monotonic_fn()
+        backoff = min(backoff_cap_s, backoff_start_s * (2 ** attempt))
+        attempt += 1
+        log_fn(
+            f"recovery SYNC REPLICA on {node}: replica {transient_desc}, retrying "
+            f"({remaining:.0f}s/{readonly_budget_s:.0f}s budget remaining, backoff={backoff:.1f}s)"
+        )
+        if remaining <= 0:
+            raise CheckpointFailure(
+                f"SYNC REPLICA {table} on {node}: replica stuck ({transient_desc}) for "
+                f"{readonly_budget_s:.0f}s (budget exhausted) — replica did NOT recover within the "
+                f"expected chaos-recovery window; this IS a real stuck-replica finding, not the "
+                f"expected transient chaos window. last error: {last_err}"
+            ) from last_err
+        sleep_fn(min(backoff, remaining))
 
 
 def compare_aggregates(model: dict, node1: dict, node2: dict):
@@ -400,12 +412,27 @@ def quiesce(cluster, table: str, timeout_s: int = 300, admin_timeout_s: float | 
             settings=admin_settings,
         )
 
+    def _scalar_resilient(node, sql):
+        """A backlog/merge-activity probe read, tolerant of a TRANSIENT transport error. A node can
+        still be settling its connection handling for a moment even after `wait_for_healthy`'s `/ping`
+        check has already passed -- especially right after a `both restart`/`both pause` chaos fault,
+        where BOTH replicas are re-establishing state at once. Without this, a single connection
+        reset during the drain POLL LOOP (not the workload itself) propagated straight out of
+        `quiesce()` uncaught, aborting the whole run with zero retries -- unlike every workload op,
+        which gets the same bounded transport-retry via `Driver._with_transport_retry`. A node that
+        stays genuinely unreachable past this budget still fails loudly (`retry_on_transport`
+        re-raises after its attempts are exhausted)."""
+        def on_retry(attempt_no, err):
+            log_fn(f"quiesce probe on {node} transiently failed (attempt {attempt_no}); "
+                   f"retrying: {type(err).__name__}: {err}")
+        return retry_on_transport(lambda: node.scalar(sql), attempts=10, on_retry=on_retry)
+
     def backlog():
         total = 0
         for node in cluster.nodes():
-            total += int(node.scalar(f"SELECT count() FROM system.replication_queue WHERE table='{table}'"))
-            total += int(node.scalar(f"SELECT count() FROM system.mutations WHERE table='{table}' AND NOT is_done"))
-            total += int(node.scalar(f"SELECT count() FROM system.merges WHERE table='{table}'"))
+            total += int(_scalar_resilient(node, f"SELECT count() FROM system.replication_queue WHERE table='{table}'"))
+            total += int(_scalar_resilient(node, f"SELECT count() FROM system.mutations WHERE table='{table}' AND NOT is_done"))
+            total += int(_scalar_resilient(node, f"SELECT count() FROM system.merges WHERE table='{table}'"))
         return total
 
     def merge_activity():
@@ -415,8 +442,8 @@ def quiesce(cluster, table: str, timeout_s: int = 300, admin_timeout_s: float | 
         active = 0
         max_elapsed = 0.0
         for node in cluster.nodes():
-            active += int(node.scalar(f"SELECT count() FROM system.merges WHERE table='{table}'"))
-            e = node.scalar(f"SELECT max(elapsed) FROM system.merges WHERE table='{table}'")
+            active += int(_scalar_resilient(node, f"SELECT count() FROM system.merges WHERE table='{table}'"))
+            e = _scalar_resilient(node, f"SELECT max(elapsed) FROM system.merges WHERE table='{table}'")
             try:
                 max_elapsed = max(max_elapsed, float(e))
             except (TypeError, ValueError):
@@ -428,7 +455,7 @@ def quiesce(cluster, table: str, timeout_s: int = 300, admin_timeout_s: float | 
         distinct from slowness). Any such entry fails the checkpoint FAST."""
         total = 0
         for node in cluster.nodes():
-            total += int(node.scalar(
+            total += int(_scalar_resilient(node,
                 f"SELECT count() FROM system.replication_queue "
                 f"WHERE table='{table}' AND last_exception != ''"))
         return total

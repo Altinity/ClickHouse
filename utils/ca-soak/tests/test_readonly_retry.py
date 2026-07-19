@@ -212,6 +212,57 @@ def test_backoff_is_capped_exponential():
     assert all(s <= 5.0 for s in clock.sleeps)
 
 
+def test_transient_transport_error_retries_then_recovers():
+    """A raw transport-level error (e.g. connection reset right after a chaos fault window closes,
+    even though `wait_for_healthy`'s /ping already passed) must be retried with the same bounded
+    budget as a TABLE_IS_READ_ONLY transient -- NOT propagate immediately."""
+    clock = FakeClock()
+    node = FakeNode([ConnectionResetError("[Errno 104] Connection reset by peer"), None])
+    logs = []
+    sync_replica_with_readonly_retry(
+        node, "ca_stress",
+        readonly_budget_s=120.0,
+        sleep_fn=clock.sleep, monotonic_fn=clock.monotonic, log_fn=logs.append,
+    )
+    assert node.calls == 2        # 1 failure + 1 success
+    assert len(clock.sleeps) == 1
+    assert any("recovered" in m for m in logs)
+    retry_logs = [m for m in logs if "transient transport error" in m]
+    assert len(retry_logs) == 1
+
+
+def test_persistent_transport_error_raises_checkpoint_failure():
+    """If the transport error PERSISTS past the budget, it must escalate to CheckpointFailure, same
+    as a stuck TABLE_IS_READ_ONLY -- the replica never actually recovered."""
+    clock = FakeClock()
+    node = FakeNode([ConnectionResetError("reset") for _ in range(50)])
+    with pytest.raises(CheckpointFailure) as ei:
+        sync_replica_with_readonly_retry(
+            node, "ca_stress",
+            readonly_budget_s=10.0,
+            backoff_start_s=3.0, backoff_cap_s=5.0,
+            sleep_fn=clock.sleep, monotonic_fn=clock.monotonic, log_fn=lambda m: None,
+        )
+    msg = str(ei.value)
+    assert "stuck" in msg
+    assert "budget exhausted" in msg
+
+
+def test_non_transport_non_readonly_error_still_propagates_immediately():
+    """A logic error that is neither a readonly QueryError nor a transport error must still fail
+    immediately -- the new transport tolerance must not become a blanket catch-all."""
+    clock = FakeClock()
+    node = FakeNode([ValueError("not a transport or readonly error")])
+    with pytest.raises(ValueError):
+        sync_replica_with_readonly_retry(
+            node, "ca_stress",
+            readonly_budget_s=120.0,
+            sleep_fn=clock.sleep, monotonic_fn=clock.monotonic, log_fn=lambda m: None,
+        )
+    assert node.calls == 1
+    assert clock.sleeps == []
+
+
 def test_backoff_does_not_exceed_remaining_budget():
     """The sleep is clipped to the remaining budget so we don't overshoot the deadline."""
     clock = FakeClock()
