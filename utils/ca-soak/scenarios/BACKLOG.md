@@ -2320,8 +2320,26 @@ campaign. The CAS gtest battery is green. No CAS action; if pursued, it belongs 
 ## OPTIMIZATION OPPORTUNITY (CPU, algorithmic, MEDIUM-HIGH) — admits() re-encodes the WHOLE ref table once per state-growing op in a flush batch
 
 - **Logged (UTC):** 2026-07-19
-- **Severity:** optimization-opportunity (confirmed cause via code reading, not applied —
-  user chose backlog-only)
+- **Severity:** optimization-opportunity (confirmed cause via code reading AND a standalone
+  micro-benchmark, not applied — user chose backlog-only)
+- **Benchmark (2026-07-19):** `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/
+  benchmarks/benchmark_cas_ref_protocol.cpp` (`BM_Admits`, Google Benchmark, gated behind
+  `-DENABLE_BENCHMARKS=ON`, never wired into `ninja test`/CI — pure measurement, no
+  assertions). Measured on a synthetic `RefTableState` with `N` committed rows:
+  | N | time/call |
+  |---:|---:|
+  | 100 | 48.8 μs |
+  | 1,000 | 476 μs |
+  | 10,000 | 5,018 μs |
+  | 100,000 | 55,976 μs |
+  Google Benchmark's own complexity fit across this range: **O(N log N)**, RMS error 2% (a
+  tighter, more rigorous characterization than "looks roughly linear" — the log-N component
+  is consistent with `RefCowMap`'s `std::map`-backed merged iteration). The same file also
+  benchmarks the byte-by-byte-escaping finding below (`BM_WriteJSONStringSafe` 177ns vs
+  `BM_RawBulkWriteSafe` 23.5ns, a measured 7.5× — not just a theoretical estimate) and the
+  absolute cost of the current `encodeRefLogTxn` (`BM_EncodeRefLogTxn`, 753ns/call, no "after"
+  to diff against yet). Run directly: build with `-DENABLE_BENCHMARKS=ON`, then run the
+  `benchmark_cas_ref_protocol` binary.
 - **Found via:** following up the ref-ledger CPU findings above — `system.trace_log` `CPU`
   profiling of the 5h soak (v10/v11) showed `RefCowMap::const_iterator::operator++()`
   hot inside `admits()` (`CasRefLedger::flushRefBatch` → `admits()`), which is a bigger
