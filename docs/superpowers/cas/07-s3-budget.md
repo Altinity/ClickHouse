@@ -349,6 +349,54 @@ then-widened soak fanout, not today's shipped default of 32; see §4), no chaos,
 merge amplification. A production workload's per-request ratios depend heavily on dedup hit rate,
 merge amplification factor, and GC round cadence.
 
+### 6.1 Post-fix live measurement, per operation kind (2026-07-19, `workers=6`, WITH chaos) {#cost-summary-per-kind}
+
+Re-run of §6 against the post-P1/P2/P9 pipeline, from the `cas-gc-rebuild` 5h soak (v11), ~2h45m
+in, `workers=6` insert/mutate workers + 4 SELECT workers, chaos stage active (kill/restart/pause
+faults firing). **Measured**, per operation *unit* rather than extrapolated per-day, using a
+different attribution method from §5/§6: grouping `ProfileEvents` in `system.query_log` (by
+`query_kind`), `system.part_log` (by `event_type`), and
+`system.content_addressed_garbage_collection_log` (`outcome='Success'` rounds only) — see
+`analyzing-cas-health` skill for the exact queries and the `blob_storage_log`
+`query_id` decoding technique used to attribute `MergeParts`/`MutatePart` PUTs (`part_log`'s own
+`ProfileEvents` never captures a nonzero PUT for those event types; the upload count comes from
+matching `blob_storage_log`'s synthetic `<table_uuid>::<part_name>` `query_id` against `part_log`
+by part name instead).
+
+| Unit | Count | PUT/unit | GET/unit | HEAD/unit | DELETE/unit | $/unit |
+|---|---:|---:|---:|---:|---:|---:|
+| `INSERT` | 44,753 | 13.3 | 15.8 | 30.7 | 0 | $0.000085 |
+| `MergeParts` | 16,530 | 21.0 | 23.4 | 40.6 | 0 | $0.000130 |
+| `MutatePart` | 4,964 | 10.6 | 14.0 | 33.3 | 0 | $0.000072 |
+| `DownloadPart` (replication fetch) | 44,157 | 0 | 4.0 | 5.0 | 0 | $0.0000036 |
+| GC round (`outcome='Success'`) | 416 | ~0 | 5,305 | 12,812 | 4,156 | $0.00725 |
+
+A GC round costs **~55–100× more per unit** than a single insert/merge/mutation — not from PUT (GC
+issues almost none), but from GET+HEAD volume in the retire/recheck verification pipeline (matches
+§3.2/§3.6's modeled GC-round shape). `DownloadPart` is the cheapest unit by far (~24× cheaper than
+an `INSERT`) — confirms §2.4's CAS-relink model: a replication fetch is a lightweight
+metadata-level operation reading an already-shared blob directly from S3, not a full byte transfer
+between replicas.
+
+Aggregate request cost for the measured window (request pricing only, no storage/data-transfer):
+
+| Source | PUT | GET | HEAD | DELETE | $ |
+|---|---:|---:|---:|---:|---:|
+| `INSERT` | 594,236 | 707,851 | 1,371,247 | 0 | $3.80 |
+| `MergeParts` | 346,309 | 387,304 | 671,832 | 0 | $2.16 |
+| `MutatePart` | 52,683 | 69,363 | 165,315 | 0 | $0.36 |
+| `DownloadPart` | 0 | 176,477 | 220,600 | 0 | $0.16 |
+| GC rounds (416) | 0 | 2,206,977 | 5,330,042 | 1,728,828 | $3.02 |
+| CAS-internal housekeeping (`.meta` blob sidecars, `cas/manifests`, `cas/refs`, `gc/gen` attempt/outcome records — PUT only, no query/part attribution by design) | 1,128,865 | — | — | — | $5.64 |
+| **Total (request cost only)** | | | | | **≈$15.13** |
+
+The CAS-internal housekeeping bucket is the single largest line item, larger than `INSERT` itself
+— dominated by the per-blob `.meta` sidecar object (one small PUT written alongside, not instead
+of, every real content blob's PUT). This is a distinct cost driver from anything in §1–§3's
+per-code-path models above and was not previously broken out on its own; see
+`utils/ca-soak/scenarios/BACKLOG.md`'s "S3 PUT budget" entry (2026-07-19) for the full attribution
+methodology and the query_id-decoding technique that resolved it.
+
 ---
 
 ## 7. References {#references}
@@ -359,6 +407,10 @@ merge amplification factor, and GC round cadence.
 - `docs/superpowers/reports/2026-06-15-ca-soak-opcount-and-rustfs-findings.md` — ground-fix research; instrumented soak A1b definitive attribution.
 - `docs/superpowers/reports/2026-06-15-unattended-night-opcount-fixes.md` — #1 ETag fix + #4 root_shards widen + soak #6/#7 results.
 - `docs/superpowers/reports/2026-06-17-ca-s3-opcount-optimization-proposals.md` — P0–P9 proposals + corrected cost table.
+- `utils/ca-soak/scenarios/BACKLOG.md`, "RESOLVED — S3 PUT budget..." entry (2026-07-19) — the
+  `query_id`-decoding / `part_name`-matching methodology behind §6.1.
+- `~/.claude/skills/analyzing-cas-health/SKILL.md` — the executable checklist this section's
+  measurement technique was drawn from (step 6/8/10's exact queries).
 - `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBuild.cpp` — write path; `putBlob`, `precommitAdd`, `promote`.
 - `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasStore.cpp` — `readShardDecoded`, `resolveRef`, `readManifest`, dedup-cache API.
 - `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGc.cpp` — GC round: `runRegularRound` (heartbeat floor → fold + three-cursor merge → pre-CAS deletes → single CAS), `snapPruneOldGenerations`, `discoverUniverse`, `computeDiscoverDecisions`. `computeHeartbeatFloor` in `CasServerRoot.cpp`.
