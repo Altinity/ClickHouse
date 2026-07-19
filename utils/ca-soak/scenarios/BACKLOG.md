@@ -2370,6 +2370,14 @@ campaign. The CAS gtest battery is green. No CAS action; if pursued, it belongs 
   capacity), this one is committing threads BLOCKED waiting for `appendRefOps`'s batch
   flush to complete — i.e. wall-clock evidence that the admits() O(N) cost above is
   actually queueing up concurrent committers, not just a theoretical CPU concern.
+- **Second corroborating signal (`system.parts`, same soak run, ~70min in):** `ca_stress`
+  shows 11028 outdated (`active=0`) parts against only 16 active — an ~690:1 ratio.
+  Reclaiming an outdated part requires removing its ref, which goes through the SAME
+  `CasRefLedger::appendRefOps`/`admits()` path as committing a new one — so this looks
+  like a measurable, observable consequence of the flush bottleneck: outdated-part
+  cleanup can't keep pace with the rate merges/mutations produce them. Not fully proven
+  (didn't instrument the removal path directly), but consistent with and adds to the
+  Real-trace queueing evidence above.
 
 ## NOTE (CPU, expected, not actionable) — local blob staging round-trip: open() + CityHash128 + unlink() per blob
 
