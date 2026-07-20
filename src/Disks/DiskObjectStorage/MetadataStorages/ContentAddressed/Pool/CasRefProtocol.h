@@ -253,6 +253,15 @@ RefTableSnapshot snapshotOf(const RefTableState & state, const String & ns);
 /// impossible.
 RefTableState replay(const std::optional<RefTableSnapshot> & snapshot, std::span<const RefLogTxn> tail);
 
+/// The exact encoded size of `state`'s canonical snapshot (`encodeRefTableSnapshot(snapshotOf(state,
+/// "")).size()`), computed in O(1) from the running body counter plus O(1) framing instead of a full
+/// re-encode. Used by `admits` and directly property-tested against the real encoder.
+uint64_t encodedSnapshotBudgetSize(const RefTableState & state);
+
+/// The exact encoded size of `state`'s hypothetical whole-namespace removal transaction, computed in
+/// O(1) from the running body counter plus O(1) framing. Used by `admits`.
+uint64_t encodedRemovalBudgetSize(const RefTableState & state);
+
 /// Admission budget: true iff applying `op` to a COPY of `state` (via the same
 /// per-operation validator `applyRefLogTxn` uses -- an `op` that is not itself a legal transition
 /// throws exactly as `applyRefLogTxn` would, since `admits` answers "would this legal op still fit
@@ -268,12 +277,13 @@ RefTableState replay(const std::optional<RefTableSnapshot> & snapshot, std::span
 /// layout) and pre-subtracts it, together with its own safety margin, from the raw
 /// `ref_snapshot_max_bytes` / `ref_removal_max_bytes` hard limits before calling `admits`.
 ///
-/// Implementation choice: sizes are computed non-incrementally, by literally building the hypothetical
-/// post-state's snapshot and removal transaction and calling `encodeRefTableSnapshot` /
-/// `encodeRefLogTxn` on them, rather than maintaining a separate incremental byte estimate. This can
-/// never drift from what those encoders actually produce (there is nothing to keep in sync), at the
-/// cost of doing real encode work per candidate operation -- acceptable because the state machine is
-/// not on the data path for ref contents.
+/// Implementation: sizes are computed incrementally. `RefTableState` carries running body-byte totals
+/// (`snapshot_body_bytes` / `removal_body_bytes`) maintained O(1) per applied op by `applyOpInPlace`;
+/// `admits` applies `op` to a scratch copy and reads `framing + total` via `encodedSnapshotBudgetSize`
+/// / `encodedRemovalBudgetSize`, making the whole check O(touched rows) instead of O(table size). This
+/// is byte-exact rather than a drift-prone estimate: both budget encodings are pure per-row sums, the
+/// per-row contributions come from the same codec primitives the full encoders use, and a debug-only
+/// recompute-and-compare `chassert` (`debugAssertBodyCounters`) proves equality on every applied op.
 bool admits(const RefTableState & state, const RefOp & op, uint64_t snapshot_budget, uint64_t removal_budget);
 
 /// Pure ref-log intake primitives for a GC round. None of these read a

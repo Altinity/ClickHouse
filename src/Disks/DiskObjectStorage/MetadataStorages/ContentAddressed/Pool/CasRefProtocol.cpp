@@ -255,35 +255,6 @@ RefTableState stateFromSnapshot(const RefTableSnapshot & snapshot)
     return state;
 }
 
-/// The hypothetical complete-removal transaction for `state` (an exact
-/// owner-removal op for every committed ref and precommit, then `remove_namespace`), used only to
-/// measure `admits`'s removal-budget bound -- never persisted, never applied.
-RefLogTxn buildHypotheticalRemovalTxn(const RefTableState & state, const RefTxnId & placeholder_txn_id)
-{
-    RefLogTxn txn;
-    txn.txn_id = placeholder_txn_id;
-
-    for (const auto [name, row] : state.committed)
-    {
-        RefOp op;
-        op.kind = RefOpKind::OwnerTransition;
-        op.old_binding = RefOwnerBinding{RefOwnerKind::Committed, name, row.manifest_ref};
-        txn.ops.push_back(std::move(op));
-    }
-    for (const auto & [name, manifest_ref] : state.precommits)
-    {
-        RefOp op;
-        op.kind = RefOpKind::OwnerTransition;
-        op.old_binding = RefOwnerBinding{RefOwnerKind::Precommit, name, manifest_ref};
-        txn.ops.push_back(std::move(op));
-    }
-
-    RefOp remove_op;
-    remove_op.kind = RefOpKind::RemoveNamespace;
-    txn.ops.push_back(remove_op);
-    return txn;
-}
-
 #ifdef DEBUG_OR_SANITIZER_BUILD
 /// Debug/sanitizer-only: recompute both body totals from scratch and assert the incrementally
 /// maintained values match. This is what makes the incremental counters *provably* byte-exact rather
@@ -373,22 +344,41 @@ RefTableState replay(const std::optional<RefTableSnapshot> & snapshot, std::span
     return state;
 }
 
+uint64_t encodedSnapshotBudgetSize(const RefTableState & state)
+{
+    /// snapshotOf uses snapshot_id = state.greatest_applied, empty ns, sealed_from unset, and the
+    /// state's own lifecycle/remove_txn_id -- match that framing exactly, then add the running body sum.
+    const uint64_t rows = state.committed.size() + state.precommits.size();
+    return snapshotFramingSize("", state.greatest_applied, state.lifecycle,
+                               state.remove_txn_id, /*sealed_from*/std::nullopt, rows)
+        + state.snapshot_body_bytes;
+}
+
+uint64_t encodedRemovalBudgetSize(const RefTableState & state)
+{
+    /// The hypothetical whole-namespace removal transaction uses a fixed {1,1} preview id, empty ns,
+    /// and one removal op per owner (committed + precommit) plus a terminal remove_namespace op -- so
+    /// op_count = committed + precommits + 1.
+    static constexpr RefTxnId kPreviewTxnId{1, 1};
+    const uint64_t rows = state.committed.size() + state.precommits.size();
+    return removalFramingSize("", kPreviewTxnId, rows + 1) + state.removal_body_bytes;
+}
+
 bool admits(const RefTableState & state, const RefOp & op, uint64_t snapshot_budget, uint64_t removal_budget)
 {
-    /// A fixed nonzero placeholder id: this previews `op` in isolation, never as part of a real
-    /// transaction, and the resulting scratch state plus its two hypothetical encodings are discarded
-    /// immediately after measuring their size.
+    /// A fixed nonzero placeholder id: this previews `op` in isolation and the scratch state is
+    /// discarded immediately after reading its (incrementally maintained) budget sizes.
     static constexpr RefTxnId kPreviewTxnId{1, 1};
 
     RefTableState scratch = state;
-    applyOpInPlace(scratch, op, kPreviewTxnId);
+    applyOpInPlace(scratch, op, kPreviewTxnId);   // throws exactly as before if `op` is not a legal transition
+#ifdef DEBUG_OR_SANITIZER_BUILD
+    debugAssertBodyCounters(scratch);
+#endif
 
-    const String snapshot_bytes = encodeRefTableSnapshot(snapshotOf(scratch, ""));
-    if (snapshot_bytes.size() > snapshot_budget)
+    if (encodedSnapshotBudgetSize(scratch) > snapshot_budget)
         return false;
-
-    const String removal_bytes = encodeRefLogTxn(buildHypotheticalRemovalTxn(scratch, kPreviewTxnId));
-    return removal_bytes.size() <= removal_budget;
+    return encodedRemovalBudgetSize(scratch) <= removal_budget;
 }
 
 std::vector<RefManifestEdge> manifestEdgesOfTxn(const RefLogTxn & txn)

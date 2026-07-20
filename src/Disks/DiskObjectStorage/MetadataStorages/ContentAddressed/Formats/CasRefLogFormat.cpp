@@ -322,8 +322,8 @@ RefLogTxn decodeRefLogTxn(std::string_view data, const String & expected_ns, con
 
 size_t removalOpEncodedSize(RefOwnerKind owner_kind, const String & ref_name, const ManifestRef & manifest_ref)
 {
-    /// One exact owner-removal op, exactly as `buildHypotheticalRemovalTxn` emits it: an
-    /// owner_transition with only an old binding, no new binding.
+    /// One exact owner-removal op, exactly as it appears in a hypothetical whole-namespace removal
+    /// transaction: an owner_transition with only an old binding, no new binding.
     RefOp op;
     op.kind = RefOpKind::OwnerTransition;
     op.old_binding = RefOwnerBinding{owner_kind, ref_name, manifest_ref};

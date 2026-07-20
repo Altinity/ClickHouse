@@ -88,13 +88,16 @@ String encodeRefLogTxn(const RefLogTxn & txn);
 /// transaction-id field, a body/key mismatch, and a limit violation are reported as CORRUPTED_DATA.
 RefLogTxn decodeRefLogTxn(std::string_view data, const String & expected_ns, const RefTxnId & expected_txn_id);
 
-/// Encoded byte size of exactly one exact-owner-removal op line, as `buildHypotheticalRemovalTxn` +
-/// `encodeRefLogTxn` would emit it (an owner_transition with only an old binding).
+/// Encoded byte size of exactly one exact-owner-removal op line: an `owner_transition` with only an old
+/// binding, no new binding, as it appears in a hypothetical whole-namespace removal transaction (one
+/// such op per committed ref and precommit, followed by a terminal `remove_namespace`), encoded via
+/// `encodeRefLogTxn`.
 size_t removalOpEncodedSize(RefOwnerKind owner_kind, const String & ref_name, const ManifestRef & manifest_ref);
 
 /// Encoded byte size of a removal transaction's framing (header + meta + terminal remove_namespace op +
 /// trailer) for `op_count` total ops, excluding the per-owner removal op lines. `removalFramingSize(...)
-/// + Σ removalOpEncodedSize` equals `encodeRefLogTxn(buildHypotheticalRemovalTxn(...)).size()` exactly.
+/// + Σ removalOpEncodedSize` equals `encodeRefLogTxn(...)`'s size, for the hypothetical whole-namespace
+/// removal transaction described above, exactly.
 size_t removalFramingSize(const String & ns, const RefTxnId & txn_id, uint64_t op_count);
 
 }

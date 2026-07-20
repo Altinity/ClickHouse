@@ -1079,3 +1079,42 @@ TEST(CasRefStateCounters, CountersTrackRowsThroughEveryOpKind)
     EXPECT_EQ(state.snapshot_body_bytes, 0u);
     EXPECT_EQ(state.removal_body_bytes, 0u);
 }
+
+/// ===================================================================================
+/// Budget-size accessors equal the real encoders across randomized states.
+/// ===================================================================================
+TEST(CasRefBudgetSize, AccessorsEqualFullEncodeRandomized)
+{
+    std::mt19937 rng(1234); // NOLINT(cert-msc32-c,cert-msc51-cpp): deterministic seed for reproducibility.
+    for (int trial = 0; trial < 30; ++trial)
+    {
+        RefTableState state;
+        applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1}, {birthOp()}));
+        uint64_t seq = 2;
+        uint64_t build = 1;
+        std::vector<std::pair<String, ManifestRef>> committed_names;
+
+        const int steps = 1 + static_cast<int>(rng() % 6);
+        for (int i = 0; i < steps; ++i)
+        {
+            const String name = "r" + std::to_string(rng() % 5);
+            const ManifestRef mref = manifestRef(1, build++, 1);
+            applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, seq++}, {addPrecommitOp(name, mref)}));
+            const bool already = std::any_of(committed_names.begin(), committed_names.end(),
+                [&](const auto & c) { return c.first == name; });
+            if (!already && rng() % 2 == 0)
+            {
+                applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, seq++}, {promoteOp(name, mref)}));
+                committed_names.emplace_back(name, mref);
+                if (rng() % 2 == 0)
+                    applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, seq++},
+                        {setPayloadOp(name, mref, String(rng() % 50, 's'), rng())}));
+            }
+        }
+
+        const size_t true_snapshot = encodeRefTableSnapshot(snapshotOf(state, "")).size();
+        const size_t true_removal = encodeRefLogTxn(buildRemovalTxnForTest(state, "", RefTxnId{1, 1})).size();
+        EXPECT_EQ(encodedSnapshotBudgetSize(state), true_snapshot);
+        EXPECT_EQ(encodedRemovalBudgetSize(state), true_removal);
+    }
+}
