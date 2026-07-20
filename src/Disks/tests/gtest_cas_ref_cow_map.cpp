@@ -145,6 +145,23 @@ TEST(CasRefCowMap, MergedIterationAppliesTombstonesAndOverrides)
     EXPECT_EQ(m.size(), 3u);
 }
 
+TEST(CasRefCowMap, FindOverlayOnlyKeyIteratesIntoBase)
+{
+    RefCowMap m;
+    m.emplace("A", row(1, 1, 1));
+    m.emplace("D", row(1, 4, 1));
+    m.materialize();   /// A, D now live in `base`
+
+    m.insert_or_assign("B", row(2, 2, 1));   /// overlay-only key between base keys "A" and "D"
+
+    auto it = m.find("B");
+    ASSERT_NE(it, m.end());
+    EXPECT_EQ(it->first, "B");
+    ++it;
+    ASSERT_NE(it, m.end());   /// must land on "D", not collapse straight to end()
+    EXPECT_EQ(it->first, "D");
+}
+
 TEST(CasRefCowMap, EraseByIteratorReturnsNextAndRemovesTheRow)
 {
     RefCowMap m;

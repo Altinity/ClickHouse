@@ -77,7 +77,7 @@ RefCowMap::const_iterator RefCowMap::find(const String & key) const
         if (!ov->second.has_value())
             return end();   /// tombstoned: not present
         const_iterator it;
-        it.base_it = base->find(key);   /// may or may not also exist in base; overlay wins either way
+        it.base_it = base->lower_bound(key);   /// first base key >= this one: keeps the iterator mergeable
         it.base_end = base->end();
         it.overlay_it = ov;
         it.overlay_end = overlay.end();
