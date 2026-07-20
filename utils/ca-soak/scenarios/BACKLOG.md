@@ -2799,24 +2799,37 @@ campaign. The CAS gtest battery is green. No CAS action; if pursued, it belongs 
   `_instances-gw0/node1/logs/clickhouse-server.log` from the first (over-reaching) run.
 - **What was observed:** with `lazy_load_tables=1`, a CAS `ReplicatedMergeTree` re-attaches after a
   restart as a `StorageTableProxy`; the real storage is built on first access. When the object store
-  (rustfs) is paused right as that first-access build runs, the build (`loadDataParts` over the CA
-  disk) does NOT fail fast — it blocks server-side for the ENTIRE outage (observed ~14 min,
-  `16:29:03`→`16:43:50`, ending only when rustfs was unpaused at test teardown). Notably the CAS
-  mount lease had already "stopped advancing" ~30 s in (`CasMountLeaseKeeper: the mount-lease stops
-  advancing`, fence lost), yet the build kept waiting on S3 rather than fail-closing on the lost
-  fence. The client query times out (helper's ~600 s socket timeout) but the SERVER-side build keeps
-  running, so a subsequent `DETACH TABLE` queues behind it and cannot interrupt it.
+  (rustfs) is paused right as that first-access build runs, the build does NOT fail fast — it blocks
+  server-side for the ENTIRE outage (observed ~14 min, `16:29:03`→`16:43:50`, ending only when rustfs
+  was unpaused at test teardown). The client query times out (helper's ~600 s socket timeout) but the
+  SERVER-side build keeps running, so a subsequent `DETACH TABLE` queues behind it and cannot
+  interrupt it.
+- **CORRECTION (where the block actually is):** an earlier draft of this note attributed the block to
+  `loadDataParts`. The server log is more specific: the wait is in the CAS **ref-namespace `LIST`**
+  inside `CasRefLedger::ensureRefTableRecovered` — the log shows the disk's S3 client entering its own
+  transparent retry (`... retry 1/501 ...`) on that `LIST`, and only AFTER the unpause does
+  `Loading data parts` begin and finish in milliseconds. So the blocking read is the recovery `LIST`,
+  not the part load. This matters: it is the SAME leg as the Layer 1 review finding F1 (recovery
+  LIST/GET use the disk's object-storage client, whose default `~500-attempt` transparent retry rides
+  the outage), and a mitigation aimed at `loadDataParts` would miss it.
 - **Why it is NOT the stuck-table bug (and the fix still holds):** the lazy load job is the proxy
   (always `OK`), so there is no permanently-cached `AsyncLoader` `FAILED` state. When S3 returns the
-  blocked build completes and the table becomes usable again with NO server restart — exactly the
-  Layer 2 guarantee. The integration test asserts that self-heal (it passes in ~58 s), not a
-  fast-fail or a DETACH-while-down (both of which this behaviour precludes).
-- **Open question / possible follow-up (not investigated):** should the first-access build honour the
-  lost mount fence / a bounded deadline and fail fast (letting `StorageTableProxy` retry on the next
-  access), instead of blocking the calling query for the full outage? Fast-fail would improve UX (a
-  query against a lazy CAS table during a long outage currently blocks server-side for the whole
-  outage and blocks `DETACH`), while still self-healing. The block-until-recovered path likely comes
-  from `loadDataParts`' S3 reads using the object-storage client's own retry policy rather than the
-  CAS request envelope / fence — needs confirmation before any change. Layer 1's bounded recovery
-  retry (`cas_request_budget.recovery_retry_budget_ms`) covers the ref-ledger recovery seal path, not
-  this generic `loadDataParts` read path.
+  blocked build completes and the table becomes usable again with NO server restart. The integration
+  test asserts that self-heal (it passes in ~58 s) — specifically, no permanently-cached `FAILED`
+  state after a bounded outage. It does NOT (and cannot, given block-until-recovered) assert a
+  fast-fail, a `DETACH`-while-down, or a `StorageTableProxy` retry-after-a-THROWN build; the observed
+  path is the ORIGINAL build continuing to completion on unpause, not the proxy re-driving a failed
+  build.
+- **Interaction with Layer 1's own S3 retry:** Layer 1's bounded recovery retry
+  (`ensureRefTableRecovered`, `recovery_retry_budget_ms`, default 120 s) sits ABOVE the disk client's
+  own ~500-attempt retry on the `LIST`. As long as the disk client keeps blocking-and-retrying the
+  `LIST` internally, the outage is ridden out THERE and Layer 1's outer loop never even sees a
+  transient error to bound. So today the effective first-access outage tolerance is governed by the
+  disk client's retry policy, not by `recovery_retry_budget_ms`.
+- **Open question / possible follow-up (not investigated):** should the recovery `LIST`/`GET` use a
+  bounded, fence-aware deadline (so a long outage fail-closes and lets `StorageTableProxy` retry on
+  the next access / Layer 1's budget actually bound it) instead of blocking the calling query for the
+  full outage? The fix must key on the **lost mount fence** (or a deadline ≥ Layer 1's budget), NOT a
+  short per-request deadline: fence loss requires an outage longer than the lease TTL, so a
+  fence-keyed fail-fast cannot regress the short blips Layer 1 is designed to ride out, whereas a bare
+  short deadline WOULD regress them into query failures.
