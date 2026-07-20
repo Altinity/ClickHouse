@@ -3224,3 +3224,28 @@ TEST(RefWriterRecoverySeal, WriteAfterSealSelectedAsGreatestSnapshotCommits)
     EXPECT_EQ(refs.count("c"), 1u) << "the new ref must have actually committed";
     EXPECT_EQ(refs.size(), 3u) << "the seal-recovered refs 'a' and 'b' must still be present alongside 'c'";
 }
+
+/// ===================================================================================
+/// Task 16: `hasAnyRefWithPrefix` -- pure existence probe, same recovery preamble as `listRefs` but
+/// without materializing the full ref map (an early-exit scan).
+/// ===================================================================================
+
+TEST(RefWriterListRefs, HasAnyRefWithPrefixMatchesListRefsEmptiness)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    auto store = openPool(backend);
+    const RootNamespace ns{"srv1/prefix_probe"};
+    const RootNamespace empty_ns{"srv1/prefix_probe_empty"};
+
+    EXPECT_FALSE(store->hasAnyRefWithPrefix(empty_ns, "")) << "a never-touched namespace has no refs";
+
+    publishEmptyPart(store, ns, "all_1_1_0");
+    publishEmptyPart(store, ns, "detached-x");
+
+    EXPECT_TRUE(store->hasAnyRefWithPrefix(ns, "")) << "empty prefix means \"any ref at all\"";
+    EXPECT_TRUE(store->hasAnyRefWithPrefix(ns, "detached-"));
+    EXPECT_FALSE(store->hasAnyRefWithPrefix(ns, "moving-")) << "no ref carries this prefix";
+
+    store->dropNamespace(ns);
+    EXPECT_FALSE(store->hasAnyRefWithPrefix(ns, "")) << "a tombstoned namespace has no committed refs";
+}

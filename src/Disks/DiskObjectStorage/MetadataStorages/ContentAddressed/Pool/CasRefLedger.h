@@ -65,6 +65,12 @@ public:
     /// not change the returned committed view or make a read fail when maintenance has an uncertain `PUT`.
     std::map<String, Resolved> listRefs(const RootNamespace & ns);
 
+    /// Recovers `ns` on first access and reports whether any committed ref name starts with `prefix`,
+    /// without materializing the full ref map `listRefs` returns. An empty `prefix` means "any ref at
+    /// all" and short-circuits on the first entry, so this is O(1) for that (dominant, emptiness-probe)
+    /// case; a non-empty prefix still stays a no-allocation scan.
+    bool hasAnyRefWithPrefix(const RootNamespace & ns, std::string_view prefix);
+
     /// Appends the transaction that removes one ref and waits for its durable result. A failed append
     /// propagates its exception and does not apply the removal to the in-memory table.
     void dropRef(const RootNamespace & ns, const String & ref_name);

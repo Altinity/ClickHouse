@@ -189,6 +189,22 @@ std::map<String, Resolved> CasRefLedger::listRefs(const RootNamespace & ns)
     return result;
 }
 
+bool CasRefLedger::hasAnyRefWithPrefix(const RootNamespace & ns, std::string_view prefix)
+{
+    /// Same recovery/maintenance preamble as `listRefs`; see there for why an empty or never-touched
+    /// namespace still costs exactly one `LIST` (recovery) and a warm namespace costs nothing at all.
+    const auto rt = getRefTableRuntime(ns);
+    ensureRefTableRecovered(ns, *rt);
+    sweepStalePrecommitsForRead(ns, rt);
+    maybeScheduleSnapshotPublish(ns, rt);
+
+    std::lock_guard lock(rt->state_mutex);
+    for (const auto [ref_name, row] : rt->state.committed)
+        if (prefix.empty() || std::string_view(ref_name).starts_with(prefix))
+            return true;
+    return false;
+}
+
 
 std::shared_ptr<CasRefLedger::RefTableRuntime> CasRefLedger::getRefTableRuntime(const RootNamespace & ns)
 {

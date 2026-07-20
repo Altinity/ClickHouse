@@ -345,6 +345,9 @@ public:
     std::shared_ptr<const PartManifest> readManifestShared(const ManifestId & id);
     BlobLocation locate(const ManifestEntry & entry) const;       /// Blob placement only
     std::map<String, Resolved> listRefs(const RootNamespace & ns);
+    /// Pure existence probe: whether any committed ref name starts with `prefix`, without
+    /// materializing `listRefs`'s full map. Empty `prefix` means "any ref at all".
+    bool hasAnyRefWithPrefix(const RootNamespace & ns, std::string_view prefix);
     /// Namespaces with the given prefix: a LIST of `cas/refs/` ∪ `roots/`, results are UNORDERED.
     /// A dropped namespace's ref-shard objects linger until GC reclaims them.
     std::vector<String> listNamespaces(const String & prefix);

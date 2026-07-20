@@ -907,7 +907,7 @@ bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) 
             return partAccess()->existsRef(Route{shadowNamespace(dr.p->shadow_table_dir), dr.p->part_name, ""}.refKey(),
                                           Cas::Freshness::CachedForLoad);
         case DirShape::ShadowTable:
-            return !store()->listRefs(shadowNamespace(path)).empty();
+            return store()->hasAnyRefWithPrefix(shadowNamespace(path), "");
         case DirShape::ShadowIntermediate:
         {
             /// Intermediate dir (shadow/<bk>, shadow/<bk>/store, ...): exists iff SOME shadow namespace
@@ -921,7 +921,7 @@ bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) 
             const std::string canonical = canonicalDiskPath(path);
             const std::string scope = canonical.empty() ? "shadow/" : canonical + "/";
             for (const auto & ns : store()->listNamespaces(scope))
-                if (!store()->listRefs(Cas::RootNamespace{ns}).empty())
+                if (store()->hasAnyRefWithPrefix(Cas::RootNamespace{ns}, ""))
                     return true;
             return false;
         }
@@ -929,13 +929,13 @@ bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) 
             return liveTreeDirHasChildren(path);
         case DirShape::TableDir:
             /// A table directory exists iff it has at least one committed part.
-            return !store()->listRefs(liveNamespace(*dr.uuid)).empty();
+            return store()->hasAnyRefWithPrefix(liveNamespace(*dr.uuid), "");
         case DirShape::DetachedContainer:
             /// Exists iff it has at least one reference.
-            return !detachedRefNames(dr.r->ns).empty();
+            return store()->hasAnyRefWithPrefix(dr.r->ns, Cas::kDetachedRefPrefix);
         case DirShape::MovingContainer:
             /// Exists iff it has at least one staging ref (MOVE-to-CA fix, mirrors DetachedContainer).
-            return !movingRefNames(dr.r->ns).empty();
+            return store()->hasAnyRefWithPrefix(dr.r->ns, Cas::kMovingRefPrefix);
         case DirShape::PartDir:
             /// Exists iff its ref is present.
             return partAccess()->existsRef(dr.r->refKey(), Cas::Freshness::CachedForLoad);

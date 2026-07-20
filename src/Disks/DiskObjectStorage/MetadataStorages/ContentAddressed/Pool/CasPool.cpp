@@ -1080,6 +1080,11 @@ std::map<String, Resolved> Pool::listRefs(const RootNamespace & ns)
     return ref_ledger.listRefs(ns);
 }
 
+bool Pool::hasAnyRefWithPrefix(const RootNamespace & ns, std::string_view prefix)
+{
+    return ref_ledger.hasAnyRefWithPrefix(ns, prefix);
+}
+
 void Pool::dropRef(const RootNamespace & ns, const String & ref_name)
 {
     ref_ledger.dropRef(ns, ref_name);
