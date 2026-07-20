@@ -148,6 +148,25 @@ void writePrecommitRow(WriteBuffer & out, const RefOwnerBinding & row)
     writeChar('\n', out);
 }
 
+/// The snapshot's header-object meta line (ns, snapshot_id, lifecycle, and the optional remove/sealed
+/// ids). Shared by `encodeRefTableSnapshot` and `snapshotFramingSize` so the two never disagree by a
+/// byte. Assumes the caller has already validated the snapshot (or is measuring framing only).
+void writeSnapshotMeta(WriteBuffer & out, const RefTableSnapshot & snapshot)
+{
+    bool first = true;
+    writeKey(out, "ns", first);
+    writeStringValue(out, snapshot.ns);
+    writeIdFields(out, first, "we", "rs", snapshot.snapshot_id);
+    writeKey(out, "lc", first);
+    writeStringValue(out, lifecycleToWord(snapshot.lifecycle));
+    if (snapshot.lifecycle == RefLifecycle::Removed)
+        writeIdFields(out, first, "rte", "rts", *snapshot.remove_txn_id);
+    if (snapshot.sealed_from)
+        writeIdFields(out, first, "sfe", "sfs", *snapshot.sealed_from);
+    closeObject(out, first);
+    writeChar('\n', out);
+}
+
 /// Collector for a ManifestRef's three flat fields (bare "me"/"mb"/"mo").
 struct ManifestFields
 {
@@ -175,20 +194,7 @@ String encodeRefTableSnapshot(const RefTableSnapshot & snapshot)
     WriteBufferFromOwnString out;
     writeHeaderLine(out, FormatId::RefSnapshot);
 
-    {
-        bool first = true;
-        writeKey(out, "ns", first);
-        writeStringValue(out, snapshot.ns);
-        writeIdFields(out, first, "we", "rs", snapshot.snapshot_id);
-        writeKey(out, "lc", first);
-        writeStringValue(out, lifecycleToWord(snapshot.lifecycle));
-        if (snapshot.lifecycle == RefLifecycle::Removed)
-            writeIdFields(out, first, "rte", "rts", *snapshot.remove_txn_id);
-        if (snapshot.sealed_from)
-            writeIdFields(out, first, "sfe", "sfs", *snapshot.sealed_from);
-        closeObject(out, first);
-        writeChar('\n', out);
-    }
+    writeSnapshotMeta(out, snapshot);
 
     for (const RefCommittedRow & row : snapshot.committed)
         writeCommittedRow(out, row);
@@ -338,6 +344,41 @@ RefTableSnapshot decodeRefTableSnapshot(
 
     checkSnapshotInvariants(snapshot);
     return snapshot;
+}
+
+size_t committedRowEncodedSize(const RefCommittedRow & row)
+{
+    WriteBufferFromOwnString out;
+    writeCommittedRow(out, row);
+    out.finalize();
+    return out.str().size();
+}
+
+size_t precommitRowEncodedSize(const RefOwnerBinding & binding)
+{
+    WriteBufferFromOwnString out;
+    writePrecommitRow(out, binding);
+    out.finalize();
+    return out.str().size();
+}
+
+size_t snapshotFramingSize(const String & ns, const RefTxnId & snapshot_id, RefLifecycle lifecycle,
+                           const std::optional<RefTxnId> & remove_txn_id,
+                           const std::optional<RefTxnId> & sealed_from, uint64_t row_count)
+{
+    RefTableSnapshot meta_only;
+    meta_only.ns = ns;
+    meta_only.snapshot_id = snapshot_id;
+    meta_only.lifecycle = lifecycle;
+    meta_only.remove_txn_id = remove_txn_id;
+    meta_only.sealed_from = sealed_from;
+
+    WriteBufferFromOwnString out;
+    writeHeaderLine(out, FormatId::RefSnapshot);
+    writeSnapshotMeta(out, meta_only);
+    writeTrailerLine(out, row_count);
+    out.finalize();
+    return out.str().size();
 }
 
 }

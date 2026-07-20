@@ -976,3 +976,32 @@ TEST(CasRefStateMachine, AdmitsExactnessPropertyTest)
         EXPECT_FALSE(admits(state, candidate, true_snapshot_size, true_removal_size - 1));
     }
 }
+
+/// ===================================================================================
+/// Snapshot size helpers: framing + Σ per-row must equal a full encode, byte for byte.
+/// ===================================================================================
+TEST(CasRefSnapshotSizeHelpers, FramingPlusRowsEqualsFullEncode)
+{
+    /// Build a non-trivial Live table: two committed rows (one with a payload) and one precommit.
+    RefTableState state;
+    applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1},
+        {birthOp(),
+         addPrecommitOp("alpha", manifestRef(1, 1, 1)), promoteOp("alpha", manifestRef(1, 1, 1)),
+         addPrecommitOp("beta", manifestRef(1, 2, 1)), promoteOp("beta", manifestRef(1, 2, 1))}));
+    applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 2},
+        {setPayloadOp("alpha", manifestRef(1, 1, 1), String(123, 'p'), 42)}));
+    applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 3}, {addPrecommitOp("gamma", manifestRef(1, 3, 1))}));
+
+    const RefTableSnapshot snap = snapshotOf(state, "");
+    const size_t full = encodeRefTableSnapshot(snap).size();
+
+    size_t rebuilt = snapshotFramingSize("", snap.snapshot_id, snap.lifecycle,
+                                         snap.remove_txn_id, snap.sealed_from,
+                                         snap.committed.size() + snap.precommits.size());
+    for (const RefCommittedRow & row : snap.committed)
+        rebuilt += committedRowEncodedSize(row);
+    for (const RefOwnerBinding & pc : snap.precommits)
+        rebuilt += precommitRowEncodedSize(pc);
+
+    EXPECT_EQ(rebuilt, full);
+}

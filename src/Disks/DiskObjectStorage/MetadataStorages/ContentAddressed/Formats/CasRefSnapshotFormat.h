@@ -84,4 +84,18 @@ String encodeRefTableSnapshot(const RefTableSnapshot & snapshot);
 RefTableSnapshot decodeRefTableSnapshot(
     std::string_view data, const String & expected_ns, const RefTxnId & expected_snapshot_id);
 
+/// Encoded byte size of exactly one committed row line, as `encodeRefTableSnapshot` would emit it.
+/// Reuses the same writer, so it is byte-identical to that row's contribution to a full encode.
+size_t committedRowEncodedSize(const RefCommittedRow & row);
+
+/// Encoded byte size of exactly one precommit row line, as `encodeRefTableSnapshot` would emit it.
+size_t precommitRowEncodedSize(const RefOwnerBinding & binding);
+
+/// Encoded byte size of a snapshot's framing (header + meta line + trailer) for the given metadata and
+/// row count, excluding all row lines. `snapshotFramingSize(...) + Σ committedRowEncodedSize +
+/// Σ precommitRowEncodedSize` equals `encodeRefTableSnapshot(...).size()` exactly.
+size_t snapshotFramingSize(const String & ns, const RefTxnId & snapshot_id, RefLifecycle lifecycle,
+                           const std::optional<RefTxnId> & remove_txn_id,
+                           const std::optional<RefTxnId> & sealed_from, uint64_t row_count);
+
 }
