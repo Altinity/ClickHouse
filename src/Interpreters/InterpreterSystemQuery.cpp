@@ -1000,10 +1000,10 @@ BlockIO InterpreterSystemQuery::execute()
 
             break;
         }
-        case Type::CONTENT_ADDRESSED_GARBAGE_COLLECTION:
+        case Type::CONTENT_ADDRESSED_GC_RUN:
         {
-            getContext()->checkAccess(AccessType::SYSTEM_CONTENT_ADDRESSED_GARBAGE_COLLECTION);
-            result = runContentAddressedGarbageCollection(query.disk);
+            getContext()->checkAccess(AccessType::SYSTEM_CONTENT_ADDRESSED_GC_RUN);
+            result = runContentAddressedGcRun(query.disk);
             break;
         }
         case Type::CONTENT_ADDRESSED_GC_REBUILD:
@@ -2354,7 +2354,7 @@ void appendContentAddressedGcRebuildRow(MutableColumns & res_columns, const Stri
 
 }
 
-BlockIO InterpreterSystemQuery::runContentAddressedGarbageCollection(const String & disk_name)
+BlockIO InterpreterSystemQuery::runContentAddressedGcRun(const String & disk_name)
 {
     ColumnsDescription columns = contentAddressedGcRoundColumns();
     Block sample_block;
@@ -2987,9 +2987,9 @@ AccessRightsElements InterpreterSystemQuery::getRequiredAccessForDDLOnCluster() 
             required_access.emplace_back(AccessType::SYSTEM_WAIT_BLOBS_CLEANUP);
             break;
         }
-        case Type::CONTENT_ADDRESSED_GARBAGE_COLLECTION:
+        case Type::CONTENT_ADDRESSED_GC_RUN:
         {
-            required_access.emplace_back(AccessType::SYSTEM_CONTENT_ADDRESSED_GARBAGE_COLLECTION);
+            required_access.emplace_back(AccessType::SYSTEM_CONTENT_ADDRESSED_GC_RUN);
             break;
         }
         case Type::CONTENT_ADDRESSED_GC_REBUILD:

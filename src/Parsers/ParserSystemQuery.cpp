@@ -457,9 +457,9 @@ bool ParserSystemQuery::parseImpl(IParser::Pos & pos, ASTPtr & node, Expected & 
                 return false;
             break;
         }
-        case Type::CONTENT_ADDRESSED_GARBAGE_COLLECTION:
+        case Type::CONTENT_ADDRESSED_GC_RUN:
         {
-            /// The disk is OPTIONAL: SYSTEM CONTENT ADDRESSED GARBAGE COLLECTION [<disk>] [ON CLUSTER cluster].
+            /// SYSTEM CONTENT ADDRESSED GC RUN [<disk>] [ON CLUSTER cluster]. The disk is OPTIONAL.
             /// When omitted, the empty disk means "all content-addressed disks on this node".
             /// First try the full target form (which also handles ON CLUSTER); if no disk follows,
             /// fall back to parsing just the optional ON CLUSTER clause and leave the disk empty.
@@ -477,7 +477,7 @@ bool ParserSystemQuery::parseImpl(IParser::Pos & pos, ASTPtr & node, Expected & 
         case Type::CONTENT_ADDRESSED_GC_REBUILD:
         {
             /// SYSTEM CONTENT ADDRESSED GC REBUILD [FORCE] <disk> [ON CLUSTER cluster]. Unlike the
-            /// per-round GC-collection command, REBUILD requires an EXPLICIT disk: the destructive
+            /// per-round GC RUN command, REBUILD requires an EXPLICIT disk: the destructive
             /// baseline rebuild must never fan out across every content-addressed disk from a bare
             /// command. parseQueryWithOnClusterAndTarget requires the target, so omitting the disk is a
             /// syntax error.

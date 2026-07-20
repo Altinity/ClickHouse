@@ -287,13 +287,13 @@ void ASTSystemQuery::formatImpl(WriteBuffer & ostr, const FormatSettings & setti
         case Type::RELOAD_DICTIONARY:
         case Type::RELOAD_MODEL:
         case Type::RELOAD_FUNCTION:
-        case Type::CONTENT_ADDRESSED_GARBAGE_COLLECTION:
+        case Type::CONTENT_ADDRESSED_GC_RUN:
         case Type::RESTART_DISK:
         case Type::WAIT_BLOBS_CLEANUP:
         case Type::CLEAR_DISK_METADATA_CACHE:
         {
             /// RELOAD DICTIONARY prints its database/table target, RELOAD MODEL/FUNCTION their
-            /// identifier target; CONTENT ADDRESSED GARBAGE COLLECTION's disk is optional.
+            /// identifier target; CONTENT ADDRESSED GC RUN's disk is optional.
             if (table)
             {
                 ostr << ' ';

@@ -501,7 +501,24 @@ INSTANTIATE_TEST_SUITE_P(ParserSystemQuery, ParserTest,
         {
             "SYSTEM CONTENT ADDRESSED DROP POOL MEMBER FROM DISK 'disk1'",   // missing srid
             nullptr
-        }
+        },
+        {
+            "SYSTEM CONTENT ADDRESSED GC RUN",
+            "SYSTEM CONTENT ADDRESSED GC RUN"
+        },
+        {
+            "SYSTEM CONTENT ADDRESSED GC RUN disk1",
+            "SYSTEM CONTENT ADDRESSED GC RUN disk1"
+        },
+        {
+            /// CONTENT_ADDRESSED_GC_RUN goes through the shared parseQueryWithOnClusterAndTarget
+            /// helper (like RESTART_DISK / WAIT_BLOBS_CLEANUP / CLEAR_DISK_METADATA_CACHE), whose
+            /// round-trip format always normalizes to "ON CLUSTER cluster target" -- unlike
+            /// CONTENT_ADDRESSED_DROP_POOL_MEMBER, which has its own dedicated grammar and prints
+            /// ON CLUSTER last.
+            "SYSTEM CONTENT ADDRESSED GC RUN disk1 ON CLUSTER my_cluster",
+            "SYSTEM CONTENT ADDRESSED GC RUN ON CLUSTER my_cluster disk1"
+        },
 })));
 
 static constexpr size_t kDummyMaxQuerySize = 256 * 1024;
