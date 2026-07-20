@@ -366,8 +366,8 @@ IStorageCluster::ResolvedClusterRead IStorageCluster::resolveClusterRead(Context
     ///   -> read locally (fallback_to_pure).
     /// - s3Cluster(...)/explicit *Cluster argument -> never fall back locally.
     /// - object_storage_remote_initiator=1 with object_storage_remote_initiator_cluster set
-    ///   -> defer object_storage_cluster resolution; send pure s3()/iceberg() to the remote initiator
-    ///     for alternative syntax, or when the local cluster name is empty (ENGINE without object_storage_cluster).
+    ///   -> defer object_storage_cluster resolution; fallback_to_pure when the local cluster name is empty
+    ///     or for alternative syntax (pure s3()/iceberg() sent to the remote initiator).
     /// - object_storage_remote_initiator=1 with only object_storage_cluster (no remote_initiator_cluster)
     ///   -> clustered remote path: default initiator cluster to object_storage_cluster, send *Cluster.
     /// - ENGINE/Iceberg with a local object_storage_cluster + remote_initiator_cluster
@@ -391,11 +391,8 @@ IStorageCluster::ResolvedClusterRead IStorageCluster::resolveClusterRead(Context
         = settings[Setting::object_storage_remote_initiator]
         && !settings[Setting::object_storage_remote_initiator_cluster].value.empty();
 
-    if (defer_object_storage_cluster_resolution)
-        result.fallback_to_pure
-            = cluster_name_from_settings.empty() || usePureFunctionForRemoteInitiator(context);
-    else
-        result.fallback_to_pure = cluster_name_from_settings.empty();
+    result.fallback_to_pure = cluster_name_from_settings.empty()
+        || (defer_object_storage_cluster_resolution && usePureFunctionForRemoteInitiator(context));
 
     const bool try_resolve_with_local_fallback
         = !defer_object_storage_cluster_resolution
@@ -419,8 +416,7 @@ IStorageCluster::ResolvedClusterRead IStorageCluster::resolveClusterRead(Context
         if (!remote_initiator_cluster_name.empty())
         {
             /// Allow a missing remote-initiator cluster only when we would fall back to a pure/local read anyway.
-            const bool allow_null = local_fallback
-                && (result.fallback_to_pure || usePureFunctionForRemoteInitiator(context));
+            const bool allow_null = local_fallback && result.fallback_to_pure;
             result.remote_initiator_cluster = getClusterImpl(
                 context,
                 remote_initiator_cluster_name,
@@ -456,12 +452,7 @@ void IStorageCluster::read(
     auto resolved = resolveClusterRead(context);
     ClusterPtr cluster = resolved.object_storage_cluster;
 
-    /// Pure-send only when remote_initiator_cluster was resolved (requires object_storage_remote_initiator_cluster).
-    /// Alternative syntax with only object_storage_cluster must use the clustered remote-initiator path below.
-    const bool send_pure_function_to_remote_initiator
-        = resolved.remote_initiator_cluster && usePureFunctionForRemoteInitiator(context);
-
-    if (resolved.fallback_to_pure || send_pure_function_to_remote_initiator)
+    if (resolved.fallback_to_pure)
     {
         if (settings[Setting::object_storage_remote_initiator])
         {
@@ -533,7 +524,10 @@ void IStorageCluster::read(
         auto remote_initiator_cluster_name = settings[Setting::object_storage_remote_initiator_cluster].value;
         if (remote_initiator_cluster_name.empty())
             remote_initiator_cluster_name = cluster_name_from_settings;
-        auto remote_initiator_cluster = getClusterImpl(context, remote_initiator_cluster_name);
+        /// Prefer the cluster already resolved in resolveClusterRead (when remote_initiator_cluster was set).
+        ClusterPtr remote_initiator_cluster = resolved.remote_initiator_cluster;
+        if (!remote_initiator_cluster)
+            remote_initiator_cluster = getClusterImpl(context, remote_initiator_cluster_name);
         auto storage_and_context = convertToRemote(remote_initiator_cluster, context, remote_initiator_cluster_name, query_to_send);
         auto src_distributed = std::dynamic_pointer_cast<StorageDistributed>(storage_and_context.storage);
         auto modified_query_info = query_info;

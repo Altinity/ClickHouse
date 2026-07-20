@@ -117,7 +117,7 @@ protected:
         bool fallback_to_pure = false;
         /// Pre-resolved object-storage cluster when local-fallback prefetch was done.
         ClusterPtr object_storage_cluster;
-        /// Resolved remote-initiator cluster when object_storage_remote_initiator is enabled in fallback branch.
+        /// Resolved remote-initiator cluster when object_storage_remote_initiator_cluster is set.
         ClusterPtr remote_initiator_cluster;
     };
 

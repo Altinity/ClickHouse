@@ -760,12 +760,7 @@ QueryProcessingStage::Enum StorageObjectStorageCluster::getQueryProcessingStage(
     auto resolved = resolveClusterRead(context);
     const auto & settings = context->getSettingsRef();
 
-    /// Pure-send only when remote_initiator_cluster was resolved (requires object_storage_remote_initiator_cluster).
-    /// Alternative syntax with only object_storage_cluster must use the clustered remote-initiator path.
-    const bool send_pure_function_to_remote_initiator
-        = resolved.remote_initiator_cluster && usePureFunctionForRemoteInitiator(context);
-
-    if (resolved.fallback_to_pure || send_pure_function_to_remote_initiator)
+    if (resolved.fallback_to_pure)
     {
         if (settings[Setting::object_storage_remote_initiator])
         {
