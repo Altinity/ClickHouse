@@ -4,6 +4,8 @@
 #include <base/extended_types.h>
 #include <IO/ReadBuffer.h>
 #include <IO/WriteBuffer.h>
+#include <base/hex.h>
+#include <base/itoa.h>
 #include <optional>
 #include <string_view>
 #include <vector>
@@ -21,6 +23,122 @@ namespace DB::Cas
 /// hashes are 32-character lowercase hexadecimal strings. The JSON writer settings are pinned in
 /// the implementation so global `FormatSettings` changes cannot alter CAS bytes: slash-containing
 /// ref paths and deterministic artifacts must retain the same representation and golden files.
+
+/// Bulk-append writer for canonical CAS JSON text. Replaces WriteBuffer in every CAS encode
+/// path: appends are inline stores into an owned String (no per-call finalized/canceled
+/// lifecycle, no per-byte writes, no heap allocations per record). Two usage modes:
+/// whole-object assembly (bounded formats; `take` at the end) and line-scratch (RecordStream:
+/// assemble one line, bulk-write it to the surrounding WriteBuffer, `clear` — memory stays
+/// bounded by the largest line). The JSON escaping semantics of `stringValue` are statically
+/// fixed to the CAS canon (forward slashes NOT escaped); process-wide FormatSettings cannot
+/// influence CAS bytes.
+class CasJsonWriter
+{
+public:
+    explicit CasJsonWriter(size_t reserve_hint = 256)
+    {
+        buf.reserve(reserve_hint);
+    }
+
+    void append(std::string_view s)
+    {
+        buf.append(s.data(), s.size());
+    }
+
+    void appendChar(char c)
+    {
+        buf.push_back(c);
+    }
+
+    /// '{' on the first call, ',' after, then "name": . `name` must be plain ASCII (written raw).
+    void key(std::string_view name, bool & first)
+    {
+        appendChar(first ? '{' : ',');
+        first = false;
+        appendChar('"');
+        append(name);
+        append("\":");
+    }
+
+    /// Same, for the prefixed key vocabulary ("o"/"n" + "me"/"mb"/"mo"/"bk"/"rn") — the
+    /// prefix and name are appended back to back, no composed temporary.
+    void key(std::string_view prefix, std::string_view name, bool & first)
+    {
+        appendChar(first ? '{' : ',');
+        first = false;
+        appendChar('"');
+        append(prefix);
+        append(name);
+        append("\":");
+    }
+
+    /// Quoted JSON string with full escaping (bulk-run scan). Defined in CasTextFormat.cpp.
+    void stringValue(std::string_view s);
+
+    void u64Number(uint64_t v)
+    {
+        char digits[24];
+        char * end = itoa(v, digits);
+        buf.append(digits, static_cast<size_t>(end - digits));
+    }
+
+    void u64StringValue(uint64_t v)
+    {
+        appendChar('"');
+        u64Number(v);
+        appendChar('"');
+    }
+
+    void hex128Value(const UInt128 & v)
+    {
+        char hex[32];
+        writeHexUIntLowercase(v, hex);
+        appendChar('"');
+        buf.append(hex, sizeof(hex));
+        appendChar('"');
+    }
+
+    void boolValue(bool v)
+    {
+        append(v ? std::string_view{"true"} : std::string_view{"false"});
+    }
+
+    void closeObject(bool & first)
+    {
+        if (first)
+            appendChar('{');
+        first = false;
+        appendChar('}');
+    }
+
+    void newline()
+    {
+        appendChar('\n');
+    }
+
+    size_t size() const
+    {
+        return buf.size();
+    }
+
+    std::string_view view() const
+    {
+        return buf;
+    }
+
+    void clear()
+    {
+        buf.clear();
+    }
+
+    String take() &&
+    {
+        return std::move(buf);
+    }
+
+private:
+    String buf;
+};
 
 /// The write-side JSON primitives used by the format codecs.
 

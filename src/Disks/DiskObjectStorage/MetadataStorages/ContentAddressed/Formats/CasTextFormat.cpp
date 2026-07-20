@@ -54,6 +54,16 @@ const FormatSettings::JSON & jsonReadSettings()
 }
 }
 
+/// ---- CasJsonWriter ----
+
+void CasJsonWriter::stringValue(std::string_view s)
+{
+    /// Placeholder until the bulk-escaping implementation lands (next commit); no caller yet.
+    appendChar('"');
+    append(s);
+    appendChar('"');
+}
+
 /// ---- write-side JSON micro-vocabulary ----
 
 void writeKey(WriteBuffer & out, std::string_view key, bool & first)
