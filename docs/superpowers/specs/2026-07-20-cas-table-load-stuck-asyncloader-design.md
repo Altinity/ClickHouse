@@ -1,6 +1,6 @@
 # CAS table load stuck forever in `AsyncLoader` after a transient S3 failure — two-layer fix
 
-Status: user-approved design (2026-07-20).
+Status: user-approved design (2026-07-20). Re-verified 2026-07-20 against the current branch tip after an upstream `antalya-26.6` merge (which touched `AsyncLoader`) plus new CAS work: the premises hold — `AsyncLoader` still has no FAILED-job retry and the `DETACH` catch-22 is intact. C++ line references below drifted ~+20 lines in `CasRefLedger.cpp` (`ensureRefTableRecovered` now ~222, seal block ~415-425); the implementation plan carries the current numbers.
 
 ## Background {#background}
 

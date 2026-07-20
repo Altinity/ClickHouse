@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- Branch `cas-gc-rebuild`. Never rebase or amend; add new commits only. Never commit to `master`.
+- Branch: the current tip is `cas-ref-admits-incremental-budget` (the old `cas-gc-rebuild` reference in the spec is stale — the branch was renamed/continued and an upstream `antalya-26.6` merge plus new CAS work landed on top; the spec/plan commits are ancestors of the current HEAD). This stuck-table-load work is an independent feature: create a DEDICATED branch off the current tip for it (do NOT pile it onto the unrelated `admits()` incremental-budget work in flight). Never rebase or amend; add new commits only. Never commit to `master`. Every PR targets `master` directly (no stacked PRs).
 - NO `git push` without a fresh explicit per-instance authorization from the user.
 - Allman braces in all C++ (opening brace on its own line) — enforced by CI style check.
 - Never use `sleep` in C++ to fix a race condition. (Layer 1's backoff is against external I/O failure, not a race; it is interruptible — this is allowed and is called out explicitly where it appears.)
@@ -26,13 +26,15 @@
 
 ## Task 1: Layer 1 — bounded retry inside `ensureRefTableRecovered`
 
+> **Re-verified 2026-07-20 against the current tip** (post upstream `antalya-26.6` merge + CAS changes). Line numbers below are current-as-of-re-check but drift with every merge — always locate by content (grep), not by absolute line. AsyncLoader still has NO retry/requeue for FAILED jobs and the `DETACH` catch-22 is intact (`DatabasesCommon.cpp:430` → `DatabaseOrdinary.cpp:629` `waitTableStarted` → `AsyncLoader.cpp:473` rethrow), so both layers and the upstream draft remain valid.
+
 **Files:**
-- Modify: `src/Common/ProfileEvents.cpp` (register new event `CasRefRecoveryRetries` next to `CasRefRecoveryRestarts` at line ~773)
-- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:65-106` (add three recovery-retry fields to `struct CasRequestBudget`)
-- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h` (add `recovery_retry_sleep_fn` member + declaration `extern const Event ...` is in .cpp)
-- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:35` (extern event), `:116-119` (`setCasRetrySleepForTest`), `:202-410` (`ensureRefTableRecovered` — the retry wrap)
+- Modify: `src/Common/ProfileEvents.cpp` (register new event `CasRefRecoveryRetries` next to `CasRefRecoveryRestarts` at line ~773 — NOTE the house style was recently rewritten to operator-facing, no internal citations; match it, see Step 1)
+- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasRequestControl.h:65-106` (add three recovery-retry fields to `struct CasRequestBudget`; `retry_max_backoff_ms` is at line ~105)
+- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.h` (add `recovery_retry_sleep_fn` member)
+- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLedger.cpp:35` (extern event), `:116-119` (`setCasRetrySleepForTest`), `:222-476` (`ensureRefTableRecovered` — the retry wrap)
 - Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.cpp:45` (extern event, mirror of ref-ledger)
-- Test: `src/Disks/tests/gtest_cas_ref_writer.cpp` (add 3 tests in a new `TEST(RefWriterRecoveryRetry, ...)` group near the existing `RefWriterRecoverySeal` tests at line ~2752)
+- Test: `src/Disks/tests/gtest_cas_ref_writer.cpp` — (a) UPDATE the existing `TEST(RefWriterRecoverySeal, SealPutFailureFailsRecoveryClosed)` at line ~2859 to the new retry-then-succeed contract (see Step 4b — its `fault_count=1` transient seal failure is now retried on the same touch); (b) add a new `TEST(RefWriterRecoveryRetry, ...)` group after the last seal test `WriteAfterSealSelectedAsGreatestSnapshotCommits` (~line 3175, before `TEST(RefWriterListRefs, ...)` at ~3233)
 
 **Interfaces:**
 - Consumes: existing `RefWriterTestBackend` with `fault_key_substr` (String) + `fault_count` (int) fields (throws `Poco::TimeoutException` on the next `fault_count` `putIfAbsent` calls whose key contains the substring); `PoolConfig.boot_ms_fn` (injectable `std::function<uint64_t()>` monotonic clock, reaches `CasRefLedger` as `boot_ms_now_fn`); `PoolConfig.cas_request_budget` (a `CasRequestBudget`); `store->setCasRetrySleepForTest(std::function<void(uint64_t)>)`; `ProfileEvents::global_counters[ProfileEvents::CasRefRecoverySealPublished]`.
@@ -51,11 +53,13 @@
 
 - [ ] **Step 1: Register the `CasRefRecoveryRetries` ProfileEvent**
 
-In `src/Common/ProfileEvents.cpp`, immediately after the `CasRefRecoveryRestarts` line (~773) add:
+In `src/Common/ProfileEvents.cpp`, immediately after the `CasRefRecoveryRestarts` line (~773) add. NOTE: the descriptions in this file were recently rewritten to a uniform operator-facing style (commit "rewrite ProfileEvents descriptions for operators (remove internal citations)") — no internal identifiers, no code-symbol citations, and a closing "non-zero values indicate …" clause. Match that style exactly (the neighbouring `CasRefRecoveryRestarts` now reads: *"Counts CAS ref-table recovery retries after a snapshot or log vanished during reading; non-zero values indicate concurrent cleanup or backend inconsistency."*). Use:
 
 ```cpp
-    M(CasRefRecoveryRetries, "CA ref-table recovery attempts retried after a transient NETWORK_ERROR from the object store (bounded by cas_request_budget.recovery_retry_budget_ms); distinct from CasRefRecoveryRestarts, which counts LIST/GET vanish races", ValueType::Number) \
+    M(CasRefRecoveryRetries, "Counts CAS ref-table recovery attempts retried after a transient object-store error before the table's load fails; non-zero values indicate transient object-store disruption during table startup.", ValueType::Number) \
 ```
+
+(Do NOT reword the existing `CasRefRecoveryRestarts` line — it stays as-is; the two are distinct counters: `Restarts` = snapshot/log vanished mid-read, `Retries` = a whole recovery attempt hit a transient object-store error and was re-driven.)
 
 - [ ] **Step 2: Add the extern declarations**
 
@@ -99,9 +103,35 @@ In `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefLed
     std::function<void(uint64_t)> recovery_retry_sleep_fn;
 ```
 
+- [ ] **Step 4b: Update the existing test that asserts the OLD fail-closed-on-transient behavior**
+
+`TEST(RefWriterRecoverySeal, SealPutFailureFailsRecoveryClosed)` (`gtest_cas_ref_writer.cpp:~2859`) currently seeds a SINGLE transient seal-PUT failure (`fault_count = 1`, an ambiguous/Unresolved outcome → `NETWORK_ERROR`) and asserts that the first `listRefs` THROWS `NETWORK_ERROR`, and that a SECOND manual touch then recovers. That is exactly the behavior Layer 1 intentionally changes: a transient seal failure is now retried WITHIN the same touch. After Layer 1 this test's first `listRefs` will SUCCEED (the retry re-lists and re-seals, `fault_count` having decremented to 0), so its `expectThrowsCode(NETWORK_ERROR, ...)` line will fail. Update it to the new contract — the transient failure is absorbed by the recovery retry and the FIRST touch already recovers and seals:
+
+Replace the body from the fault setup onward (the `backend->fault_count = 1;` line and everything after it, through the end of the test) with:
+
+```cpp
+    const RefTxnId seal_id{2, UINT64_MAX};
+    backend->fault_key_substr = layout.refSnapshotKey(ns, seal_id);
+    backend->fault_count = 1;   /// one transient ambiguous seal PUT -> retried within this same touch
+
+    store->setCasRetrySleepForTest([](uint64_t) {});   /// no real wait on the backoff
+
+    using ProfileEvents::global_counters;
+    const auto retries_before = global_counters[ProfileEvents::CasRefRecoveryRetries].load();
+
+    /// The transient seal failure is retried inside recovery, so the FIRST touch already recovers and
+    /// seals (previously this threw NETWORK_ERROR and only a second touch re-sealed).
+    EXPECT_EQ(store->listRefs(ns).size(), 2u);
+    EXPECT_EQ(global_counters[ProfileEvents::CasRefRecoveryRetries].load(), retries_before + 1);
+    EXPECT_TRUE(backend->get(layout.refSnapshotKey(ns, seal_id)).has_value())
+        << "recovery must have retried past the transient failure and sealed on the first touch";
+```
+
+Also update the test's doc comment (the `/// A second touch: ...` block) to describe the new single-touch retry behavior, and rename the test to `SealPutTransientFailureIsRetriedThenSeals` (update the `TEST(RefWriterRecoverySeal, ...)` name; grep the file to confirm no other reference to the old name exists). This test now becomes the fail-closed→retry contract's canonical coverage; the standalone `TransientSealFailureIsRetriedThenSucceeds` added below is complementary (it also asserts the seal-published counter and uses the fake-clock budget path).
+
 - [ ] **Step 5: Write the failing test — retry succeeds after N transient seal failures**
 
-In `src/Disks/tests/gtest_cas_ref_writer.cpp`, after the last `RefWriterRecoverySeal` test (near line ~2860, find the closing of the seal test group), add. Reuse the seal fixture helpers already in the file (`seedSealFixtureDeadEpochs`, `seedUncleanPredecessorMount`, `sealTestTinyBudget`, `openPoolWithConfig`):
+In `src/Disks/tests/gtest_cas_ref_writer.cpp`, after the last `RefWriterRecoverySeal` test `WriteAfterSealSelectedAsGreatestSnapshotCommits` (~line 3175) and before `TEST(RefWriterListRefs, ...)` (~line 3233), add a new `RefWriterRecoveryRetry` group. Reuse the seal fixture helpers already in the file (`seedSealFixtureDeadEpochs`, `seedUncleanPredecessorMount`, `sealTestTinyBudget`, `openPoolWithConfig`):
 
 ```cpp
 TEST(RefWriterRecoveryRetry, TransientSealFailureIsRetriedThenSucceeds)
@@ -203,11 +233,11 @@ In the `CasRefLedger` constructor body (`CasRefLedger.cpp`, the constructor whos
     };
 ```
 
-Ensure `#include <Common/threadPoolCallbackRunner.h>` is not needed; `sleepForMilliseconds` lives in `<base/sleep.h>` — add `#include <base/sleep.h>` to the `.cpp` includes if not already present (check the top of the file first; grep `sleepForMilliseconds` usage in the CA dir shows the include convention).
+`sleepForMilliseconds` lives in `<base/sleep.h>` — add `#include <base/sleep.h>` to the `.cpp` includes (it is not yet included in the CA dir). This raw backoff sleep is legitimate under the "never sleep in C++ to fix a race" rule and there is direct precedent: `CasRequestControl.cpp`'s own default inter-attempt backoff `threadSleepMs` (around line 138) carries the comment *"NOT a race-fix sleep: it is deliberate, bounded, ..."* and uses `std::this_thread::sleep_for`. Mirror that justification in the comment here (the slice-loop + `fence_ok_fn()` check additionally makes it interruptible, which `threadSleepMs` is not). If a reviewer or style check flags the raw sleep, point at that precedent.
 
 - [ ] **Step 9: Wrap the recovery body in the retry loop**
 
-In `ensureRefTableRecovered` (`CasRefLedger.cpp`), the "recovery body" is the ENTIRE inner restart-on-vanish loop `for (uint64_t attempt = 0; ; ++attempt) { ... }` — it starts at line ~238 and its closing brace is at line ~449 (the loop body includes the `LIST`/`GET`/`replay`/seal `PUT`, then `rt.recovered = true;` at ~421, the tail-counter seeding at ~427-447, and finally `break;` at ~448 which exits this inner loop on success). That whole inner `for` loop lives inside the `{ std::unique_lock lock(rt.state_mutex); ... }` scope whose closing brace is at line ~450. Wrap the WHOLE inner `for` loop (238-449) — NOT just its body — in an outer retry loop, keeping the wrap inside the `lock` scope so `lock` is reachable in the catch. Concretely, immediately BEFORE the `for (uint64_t attempt = 0; ...)` line (~238), insert:
+In `ensureRefTableRecovered` (`CasRefLedger.cpp`; the function now starts at line ~222), the "recovery body" is the ENTIRE inner restart-on-vanish loop `for (uint64_t attempt = 0; ; ++attempt) { ... }` — it starts at line ~258 and its closing brace is at line ~469 (the loop body includes the `LIST`/`GET`/`replay`/seal `PUT`, then `rt.recovered = true;` at ~441, the tail-counter seeding just after, and finally `break;` at ~468 which exits this inner loop on success). That whole inner `for` loop lives inside the `{ std::unique_lock lock(rt.state_mutex); ... }` scope whose closing brace is at line ~470 (with `enforceRefTableCacheBudget(ns)` at ~476, outside the lock). Wrap the WHOLE inner `for` loop (~258-469) — NOT just its body — in an outer retry loop, keeping the wrap inside the `lock` scope so `lock` is reachable in the catch. Concretely, immediately BEFORE the `for (uint64_t attempt = 0; ...)` line (~258), insert:
 
 ```cpp
         const uint64_t recovery_start_ms = boot_ms_now_fn();
@@ -223,7 +253,7 @@ In `ensureRefTableRecovered` (`CasRefLedger.cpp`), the "recovery body" is the EN
             {
 ```
 
-Then, at the inner vanish-race brake (the `if (attempt > kRefRecoveryMaxRestarts)` block at line ~242), set the latch on the line IMMEDIATELY before its `throwCasWriteRetryLater(...)` call:
+Then, at the inner vanish-race brake (the `if (attempt > kRefRecoveryMaxRestarts)` block at line ~263), set the latch on the line IMMEDIATELY before its `throwCasWriteRetryLater(...)` call:
 
 ```cpp
             if (attempt > kRefRecoveryMaxRestarts)
@@ -234,7 +264,7 @@ Then, at the inner vanish-race brake (the `if (attempt > kRefRecoveryMaxRestarts
 
 (the existing `throwCasWriteRetryLater(fmt::format(...))` call and its message stay exactly as they are — only add the `vanish_brake_tripped = true;` line and the surrounding braces if the `if` was previously brace-less; match the existing brace style).
 
-and immediately AFTER the inner `for` loop's own closing brace (line ~449, i.e. between that `}` and the `}` at ~450 that closes the `lock` scope), insert:
+and immediately AFTER the inner `for` loop's own closing brace (line ~469, i.e. between that `}` and the `}` at ~470 that closes the `lock` scope), insert:
 
 ```cpp
                 break;   /// recovery succeeded -> exit the outer retry loop
@@ -427,7 +457,7 @@ Expected: 4/4 PASS (`TransientSealFailureIsRetriedThenSucceeds`, `TransientFailu
 ./build/src/unit_tests_dbms --gtest_filter='Cas*:CA*:RefWriter*:RefLedger*' > build/test_ca_gate.log 2>&1
 ```
 
-Expected: all green (the existing seal/recovery tests still pass — the retry wrap is transparent when no fault fires). Summarize via subagent; if any red, fix before committing.
+Expected: all green. The ONLY existing test whose behavior changes is `SealPutFailureFailsRecoveryClosed` (renamed `SealPutTransientFailureIsRetriedThenSeals` in Step 4b) — it now asserts the new single-touch retry contract and must pass in its updated form. The two CORRUPTED_DATA seal tests (`SealPutConflictThrowPropagatesAndDoesNotWedgeRecovery`, `SealPutThrowsMidFlightSecondParkedCallerDoesNotHang`) are unaffected because Layer 1 only retries `NETWORK_ERROR`, never `CORRUPTED_DATA` — confirm they still pass unchanged. Summarize via subagent; if any OTHER test went red, that is a real regression — fix before committing.
 
 - [ ] **Step 14: Commit**
 
@@ -790,7 +820,7 @@ Create `docs/superpowers/reports/2026-07-20-upstream-issue-draft-asyncloader-stu
 - Title: `Table whose async load job failed is permanently stuck until server restart — even DETACH TABLE cannot recover it`.
 - Summary: with `async_load_databases=true` (default since 25.2, PR #74772), if a table's async `load table` job throws — e.g. an engine whose constructor does object-store I/O and hits a transient error — `AsyncLoader` marks the job `FAILED` terminally, and every later access rethrows the cached exception.
 - Minimal CAS-free repro sketch: a `MergeTree`/`ReplicatedMergeTree` on an S3-backed disk while the S3 endpoint is briefly unreachable during startup/`ATTACH`; the table load fails and never retries.
-- Root-cause chain with master `file:line`: `DatabaseWithOwnTablesBase::tryGetTable` (`src/Databases/DatabasesCommon.cpp:430`) → `waitTableStarted` (`src/Databases/DatabaseOrdinary.cpp:629`) → `waitLoad` → `ASYNC_LOAD_WAIT_FAILED` (`src/Common/AsyncLoader.cpp:473`). `DETACH` cannot recover it: `InterpreterDropQuery` resolves the table via `DatabaseCatalog::getDatabaseAndTable`, which calls `waitTableStarted` (`src/Interpreters/DatabaseCatalog.cpp:435`) and throws before reaching `DatabaseOrdinary::detachTableUnlocked` — where the state-erasing `eraseAsyncLoadState` actually lives. Catch-22.
+- Root-cause chain with master `file:line`: `DatabaseWithOwnTablesBase::tryGetTable` (`src/Databases/DatabasesCommon.cpp:430`) → `waitTableStarted` (`src/Databases/DatabaseOrdinary.cpp:629`) → `waitLoad` → `ASYNC_LOAD_WAIT_FAILED` (`src/Common/AsyncLoader.cpp:473`). `DETACH` cannot recover it: `InterpreterDropQuery` resolves the table via `DatabaseCatalog::getDatabaseAndTable`, which calls `waitTableStarted` (`src/Interpreters/DatabaseCatalog.cpp:434-435`, comment "Wait for table to be started because we are going to return StoragePtr") and throws before reaching `DatabaseOrdinary::detachTableUnlocked` — where the state-erasing `eraseAsyncLoadState` actually lives. Catch-22. (Re-verified 2026-07-20 against the current tip after an upstream `antalya-26.6` merge that DID touch `AsyncLoader` — none of those changes add a FAILED-job retry or break this chain.)
 - What upstream already has: `AsyncLoader` terminality is by design (`AsyncLoader.h` contract); the only retry-on-touch path is the opt-in `lazy_load_tables` (PR #96283, 26.2) via `StorageTableProxy`.
 - Related issues: #88934, #67521.
 - Suggested directions (either/both): (1) let `DETACH TABLE` of a load-`FAILED` table bypass `waitTableStarted` so it reaches `eraseAsyncLoadState`; (2) offer an explicit re-trigger (SYSTEM verb, or retry-on-touch) for a `FAILED` table load.
