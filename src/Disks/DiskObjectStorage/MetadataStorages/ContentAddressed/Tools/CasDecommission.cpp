@@ -265,8 +265,9 @@ DecommissionReport decommissionPoolMember(BackendPtr backend, PoolConfig config,
         /// server_uuid, not yet retired) then gets tombstoned by this decommission run. The successor's
         /// live process is not deleted (only its owner anchor is marked retired), but a LATER restart of
         /// that same identity would refuse to reclaim it (claimOwnerOrThrow's tombstone guard). This is
-        /// a narrow, low-probability window, not closed here per the "no big complications" scope
-        /// already set for T5's related decisions -- see docs/superpowers/specs/2026-07-18-t5-owner-tombstone-design.md.
+        /// a narrow, low-probability window, deliberately not closed here: T5's owner-tombstone design
+        /// (finding #9) intentionally stopped short of making concurrent decommission-vs-recreate
+        /// airtight to the microsecond, since that was explicitly not the priority for this fix.
         report.slot_removed = false;
         if (captures_match && deleteSlotObject(*pool_backend, mount_key, farewell_mount->token, report.warnings)
             && deleteSlotObject(*pool_backend, epoch_key, claimed_epoch->token, report.warnings))

@@ -8973,9 +8973,8 @@ void MergeTreeData::Transaction::renameParts()
     /// Ordering is load-bearing: every call site invokes renameParts BEFORE its external Keeper
     /// commit decision. A part must be durable before its block_id/part-znode is registered,
     /// otherwise a fault between the Keeper commit and the disk commit leaves a phantom part whose
-    /// surviving block_id silently dedups a byte-identical client retry (acked data loss; see
-    /// docs/superpowers/reports/2026-07-17-dataloss-traced-root-cause.md). This also keeps the
-    /// disk commit (network I/O on object storages) off the data_parts lock, which
+    /// surviving block_id silently dedups a byte-identical client retry (acked data loss). This
+    /// also keeps the disk commit (network I/O on object storages) off the data_parts lock, which
     /// Transaction::commit holds.
     for (const auto & part_need_rename : precommitted_parts_need_rename)
     {

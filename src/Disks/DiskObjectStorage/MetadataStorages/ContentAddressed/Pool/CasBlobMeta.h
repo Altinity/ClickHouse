@@ -38,8 +38,8 @@ struct LoadedMeta
 std::optional<LoadedMeta> loadMeta(Backend & backend, const Layout & layout, const BlobRef & ref);
 
 /// Creates the marker only when its key is absent, controlled: a SlowDown/429/5xx on the attempt is
-/// resolved-and-reissued within budget rather than escaping as a raw client error (triage: S22 RCA,
-/// docs/superpowers/reports/2026-07-18-s22-throttle-retry-rca.md). A precondition failure (another
+/// resolved-and-reissued within budget rather than escaping as a raw client error (triage: S22 RCA).
+/// A precondition failure (another
 /// writer already created the marker -- possibly with a DIFFERENT record, e.g. a stale `Condemned`
 /// marker still present when a vanished body is freshly re-uploaded) is reported as
 /// `CasOverwriteOutcome::Conflict`, never thrown -- this uses `putIfAbsentControlledMutable`, NOT the

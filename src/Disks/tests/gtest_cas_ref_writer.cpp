@@ -22,8 +22,7 @@
 #include <mutex>
 #include <thread>
 
-/// Task 10: the writer's ref persistence on the snapshot+log protocol (spec
-/// docs/superpowers/specs/2026-07-11-cas-ref-table-snapshot-log-design.md). Covers the plan's Task 10
+/// Task 10: the writer's ref persistence on the snapshot+log protocol. Covers the plan's Task 10
 /// failing-test list: empty+birth recovery; snapshot+tail recovery; recovery restart on a vanished
 /// object (converging on a newer snapshot); the append lane's wedge semantics (blocks the same table,
 /// leaves other tables free, applies a later-observed-durable append before unwedging); invalid batch

@@ -785,7 +785,7 @@ TEST(CasDecommission, SuccessorOwnerRewriteWinsBeforeTombstone)
     EXPECT_FALSE(decodeOwner(owner->bytes).retired_at_ms.has_value());
 }
 
-/// Final whole-branch review finding (Important, docs/superpowers/reports/final-whole-branch-review):
+/// Final whole-branch review finding (Important):
 /// a transient exception on the owner tombstone write must not be reported as a hard failure when the
 /// write actually landed -- the controlled overwrite resolves this via GET (current bytes already
 /// match the intended tombstone) instead of the old bare putOverwrite's "any exception = failure".

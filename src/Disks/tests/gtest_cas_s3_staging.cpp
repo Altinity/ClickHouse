@@ -20,8 +20,8 @@
 #include <sstream>
 #include <string>
 
-/// Task 0 of the S3-native staging plan (docs/superpowers/plans/2026-07-11-cas-s3-native-staging.md):
-/// pure config plumbing, ZERO behavior change. `staging_backend` (default `local`) is parsed
+/// Task 0 of the S3-native staging plan: pure config plumbing, ZERO behavior change.
+/// `staging_backend` (default `local`) is parsed
 /// from the CAS disk config; the parsed `StagingBackend` is exposed via
 /// `ContentAddressedMetadataStorage::stagingBackend()`. `::conditionalCopySupported()` is a stored
 /// bool, defaulting to `false` until a later task wires the mount-time capability probe.

@@ -635,7 +635,7 @@ TEST(CasPartWriteTxn, PutBlobResurrectVanishedReUploadsHeldBody)
 
 /// A persistently-failing freshness-meta write (every attempt of every outer reload-retry) must
 /// surface as a controlled retry-later signal, not silently succeed with the marker left stale
-/// (RCA docs/superpowers/reports/2026-07-18-s22-throttle-retry-rca.md sec 4). The blob body PUT
+/// (S22 RCA). The blob body PUT
 /// itself is unaffected (MetaWriteFaultBackend only faults `.meta` keys) -- only the meta write
 /// exhausts, and that exhaustion must reach putBlob's caller as NETWORK_ERROR.
 TEST(CasPartWriteTxn, PutBlobFreshMetaExhaustionThrowsRetryLater)

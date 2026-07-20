@@ -75,7 +75,6 @@ ManifestEntry blobEntry(const String & name, const String & payload)
 /// THE POSITIVE INVARIANT: the whole flow must succeed AND P must survive, because B's precommit pins
 /// P's closure across A's retire + GC (B171 two-phase commit; `checkAndResolveDeps` proves closure
 /// present at publish time).
-/// Spec: docs/superpowers/specs/2026-06-18-ca-build-root-precommit-cpp-impl.md (§F.1)
 TEST(CasPartWriteTxnRootDangle, SharedBlobSurvivesSourceDropDuringBuild)
 {
     std::shared_ptr<InMemoryBackend> backend;
@@ -139,7 +138,6 @@ TEST(CasPartWriteTxnRootDangle, SharedBlobSurvivesSourceDropDuringBuild)
 /// would) AND dropping refA, then renew the watermark and run GC to fixpoint. With P's only protection
 /// (the precommit edge) gone and its owner retired, GC deletes P. PartWriteTxn B's publish must now ABORT
 /// (`checkAndResolveDeps` finds the adopted blob absent and not re-creatable) instead of committing a dangle.
-/// Spec: docs/superpowers/specs/2026-06-18-ca-build-root-precommit-design.md (§4.4, §4.6)
 TEST(CasPartWriteTxnRootDangle, PrematureReclaimCommitFailsClosed)
 {
     std::shared_ptr<InMemoryBackend> backend;

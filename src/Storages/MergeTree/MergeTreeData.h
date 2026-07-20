@@ -374,8 +374,9 @@ public:
         /// flips in-memory visibility, and rollback compensates via new disk
         /// operations (part removal). Every caller runs this BEFORE its
         /// external Keeper commit decision: a part must be durable before its
-        /// block_id/part-znode is registered in Keeper (see
-        /// docs/superpowers/reports/2026-07-17-dataloss-traced-root-cause.md).
+        /// block_id/part-znode is registered in Keeper, otherwise a fault between the two commits
+        /// leaves a phantom part whose surviving block_id silently dedups a byte-identical client
+        /// retry (acked data loss).
         void renameParts();
 
         void addPart(MutableDataPartPtr & part, bool need_rename);
