@@ -21,6 +21,18 @@
 ///   RefTableState (see docs/superpowers/specs/2026-07-20-cas-ref-admits-incremental-budget-design.md):
 ///     N=100: 1842 ns    N=1,000: 1875 ns    N=10,000: 1864 ns    N=100,000: 1919 ns
 ///     Google Benchmark complexity fit: O(1), RMS 1-2%.
+///
+/// BM_EncodeRefLogTxn history (this binary; acceptance gate for the CasJsonWriter migration,
+/// docs/superpowers/specs/2026-07-20-cas-json-writer-bulk-encoding-design.md):
+///   Before CasJsonWriter, field-by-field WriteBuffer calls (baseline): 753 ns.
+///   After CasJsonWriter bulk-append migration (2026-07-20): 333 ns.
+///   BM_MemcpyTxnBytes floor (same bytes, plain String appends of 16-byte fragments): 30.7 ns.
+///   Ratio EncodeRefLogTxn / MemcpyTxnBytes = 333 / 30.7 ~= 10.8x -- above the 3x acceptance gate.
+///   Rung-1 contingency applied (CasJsonWriter::keyLiteral merging separator+key text for the
+///   fixed unprefixed keys in writeOp/writeCommittedRow): 325 ns / 30.9 ns ~= 10.5x -- essentially
+///   unchanged; the remaining cost is not in key-separator overhead. Per the contingency ladder,
+///   rung 2 was NOT attempted (it trades readability and needs a human decision); reported as
+///   DONE_WITH_CONCERNS. CasEncodingPins.* stayed byte-identical (green) after rung 1.
 
 using namespace DB::Cas;
 
@@ -108,6 +120,32 @@ static void BM_EncodeRefLogTxn(benchmark::State & state)
         benchmark::DoNotOptimize(encodeRefLogTxn(txn));
 }
 BENCHMARK(BM_EncodeRefLogTxn);
+
+/// The "near-memcpy" floor for BM_EncodeRefLogTxn: the SAME encoded bytes assembled from
+/// precomputed 16-byte fragments by plain String appends -- approximating the writer's append
+/// granularity with zero formatting/escaping work. Acceptance gate for the CasJsonWriter
+/// migration (docs/superpowers/specs/2026-07-20-cas-json-writer-bulk-encoding-design.md):
+/// BM_EncodeRefLogTxn must land within 3x of this floor (2x is the aspiration).
+static void BM_MemcpyTxnBytes(benchmark::State & state)
+{
+    const RefLogTxn txn = makeSamplePromoteTxn();
+    const String encoded = encodeRefLogTxn(txn);
+    std::vector<std::string_view> fragments;
+    constexpr size_t kFragment = 16;
+    for (size_t off = 0; off < encoded.size(); off += kFragment)
+        fragments.push_back(std::string_view(encoded).substr(off, kFragment));
+
+    String buf;
+    buf.reserve(encoded.size());
+    for (auto _ : state)
+    {
+        buf.clear();
+        for (const auto f : fragments)
+            buf.append(f.data(), f.size());
+        benchmark::DoNotOptimize(buf.data());
+    }
+}
+BENCHMARK(BM_MemcpyTxnBytes);
 
 /// admits() used to re-derive and re-encode the WHOLE committed-ref snapshot on every call
 /// (CasRefProtocol.cpp), showing O(N log N) growth with table size; it now maintains

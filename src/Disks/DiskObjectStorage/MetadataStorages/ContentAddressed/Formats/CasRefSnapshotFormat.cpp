@@ -116,14 +116,14 @@ void writeCommittedRow(CasJsonWriter & out, const RefCommittedRow & row)
     checkCanonicalRefName(row.ref_name, "RefTableSnapshot", "committed ref_name");
     checkManifestRef(row.manifest_ref, "RefTableSnapshot", "committed");
     bool first = true;
-    writeKey(out, "k", first);
+    out.keyLiteral("\"k\":", first);
     writeStringValue(out, "c");
-    writeKey(out, "rn", first);
+    out.keyLiteral("\"rn\":", first);
     writeStringValue(out, row.ref_name);
     writeManifestRefFields(out, first, "", row.manifest_ref);
-    writeKey(out, "pl", first);
+    out.keyLiteral("\"pl\":", first);
     writeStringValue(out, row.payload);
-    writeKey(out, "ts", first);
+    out.keyLiteral("\"ts\":", first);
     writeIntText(row.published_at_ms, out);
     closeObject(out, first);
     writeChar('\n', out);

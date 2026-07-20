@@ -83,7 +83,7 @@ void writeBindingFields(CasJsonWriter & out, bool & first, std::string_view pref
 void writeOp(CasJsonWriter & out, const RefOp & op)
 {
     bool first = true;
-    writeKey(out, "op", first);
+    out.keyLiteral("\"op\":", first);
     writeStringValue(out, opKindToWord(op.kind));
     switch (op.kind)
     {
@@ -99,12 +99,12 @@ void writeOp(CasJsonWriter & out, const RefOp & op)
         case RefOpKind::SetPayload:
             checkCanonicalRefName(op.ref_name, "RefLogTxn", "set_payload ref_name");
             checkManifestRef(op.expected_manifest_ref, "RefLogTxn", "set_payload manifest_ref");
-            writeKey(out, "rn", first);
+            out.keyLiteral("\"rn\":", first);
             writeStringValue(out, op.ref_name);
             writeManifestRefFields(out, first, "", op.expected_manifest_ref);
-            writeKey(out, "pl", first);
+            out.keyLiteral("\"pl\":", first);
             writeStringValue(out, op.payload);
-            writeKey(out, "ts", first);
+            out.keyLiteral("\"ts\":", first);
             writeIntText(op.published_at_ms, out);
             break;
     }
