@@ -173,7 +173,6 @@ namespace ErrorCodes
     extern const int ACCESS_DENIED;
     extern const int LOGICAL_ERROR;
     extern const int BAD_ARGUMENTS;
-    extern const int NOT_IMPLEMENTED;
     extern const int CANNOT_KILL;
     extern const int TIMEOUT_EXCEEDED;
     extern const int TABLE_WAS_NOT_DROPPED;
@@ -1017,29 +1016,8 @@ BlockIO InterpreterSystemQuery::execute()
         {
             getContext()->checkAccess(AccessType::SYSTEM_CONTENT_ADDRESSED_DROP_POOL_MEMBER);
 
-            /// Same content-addressed-disk detection as runContentAddressedGarbageCollection /
-            /// runContentAddressedGcRebuild: plain (non-object-storage) disks throw NOT_IMPLEMENTED
-            /// from getMetadataStorage - that simply means "not content-addressed" for our purposes.
-            auto content_addressed_storage_of = [](const DiskPtr & disk) -> ContentAddressedMetadataStorage *
-            {
-                MetadataStoragePtr md;
-                try
-                {
-                    md = disk->getMetadataStorage();
-                }
-                catch (const Exception & e)
-                {
-                    if (e.code() == ErrorCodes::NOT_IMPLEMENTED)
-                        return nullptr;
-                    throw;
-                }
-                if (!md || !md->isContentAddressed())
-                    return nullptr;
-                return dynamic_cast<ContentAddressedMetadataStorage *>(md.get());
-            };
-
             auto disk = getContext()->getDisk(query.disk);
-            auto * ca = content_addressed_storage_of(disk);
+            auto * ca = ContentAddressedMetadataStorage::tryFromDisk(disk);
             if (!ca)
                 throw Exception(ErrorCodes::BAD_ARGUMENTS,
                     "SYSTEM CONTENT ADDRESSED DROP POOL MEMBER: disk '{}' is not a content-addressed disk", query.disk);
@@ -2378,28 +2356,6 @@ void appendContentAddressedGcRebuildRow(MutableColumns & res_columns, const Stri
 
 BlockIO InterpreterSystemQuery::runContentAddressedGarbageCollection(const String & disk_name)
 {
-    /// A disk's metadata storage is content-addressed iff getMetadataStorage() yields a CA storage.
-    /// Plain (non-object-storage) disks like the local `default` do not implement getMetadataStorage
-    /// at all - it throws NOT_IMPLEMENTED. For our purposes that simply means "not content-addressed":
-    /// the named path turns it into a clear BAD_ARGUMENTS, the enumeration path skips it.
-    auto content_addressed_storage_of = [](const DiskPtr & disk) -> ContentAddressedMetadataStorage *
-    {
-        MetadataStoragePtr md;
-        try
-        {
-            md = disk->getMetadataStorage();
-        }
-        catch (const Exception & e)
-        {
-            if (e.code() == ErrorCodes::NOT_IMPLEMENTED)
-                return nullptr;
-            throw;
-        }
-        if (!md || !md->isContentAddressed())
-            return nullptr;
-        return dynamic_cast<ContentAddressedMetadataStorage *>(md.get());
-    };
-
     ColumnsDescription columns = contentAddressedGcRoundColumns();
     Block sample_block;
     for (const auto & column : columns)
@@ -2409,7 +2365,7 @@ BlockIO InterpreterSystemQuery::runContentAddressedGarbageCollection(const Strin
     if (!disk_name.empty())
     {
         auto disk = getContext()->getDisk(disk_name);
-        auto * ca = content_addressed_storage_of(disk);
+        auto * ca = ContentAddressedMetadataStorage::tryFromDisk(disk);
         if (!ca)
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Disk '{}' is not a content-addressed disk", disk_name);
         appendContentAddressedGcRoundRow(res_columns, disk_name, ca->runGarbageCollectionRoundNow());   /// synchronous, one round
@@ -2419,7 +2375,7 @@ BlockIO InterpreterSystemQuery::runContentAddressedGarbageCollection(const Strin
         size_t ran = 0;
         for (const auto & [name, disk] : getContext()->getDisksMap())
         {
-            if (auto * ca = content_addressed_storage_of(disk))
+            if (auto * ca = ContentAddressedMetadataStorage::tryFromDisk(disk))
             {
                 appendContentAddressedGcRoundRow(res_columns, name, ca->runGarbageCollectionRoundNow());   /// synchronous, one round
                 ++ran;
@@ -2438,27 +2394,6 @@ BlockIO InterpreterSystemQuery::runContentAddressedGarbageCollection(const Strin
 
 BlockIO InterpreterSystemQuery::runContentAddressedGcRebuild(const String & disk_name, bool force)
 {
-    /// Same content-addressed-disk detection as runContentAddressedGarbageCollection: plain
-    /// (non-object-storage) disks throw NOT_IMPLEMENTED from getMetadataStorage - that simply means
-    /// "not content-addressed" for our purposes.
-    auto content_addressed_storage_of = [](const DiskPtr & disk) -> ContentAddressedMetadataStorage *
-    {
-        MetadataStoragePtr md;
-        try
-        {
-            md = disk->getMetadataStorage();
-        }
-        catch (const Exception & e)
-        {
-            if (e.code() == ErrorCodes::NOT_IMPLEMENTED)
-                return nullptr;
-            throw;
-        }
-        if (!md || !md->isContentAddressed())
-            return nullptr;
-        return dynamic_cast<ContentAddressedMetadataStorage *>(md.get());
-    };
-
     /// REBUILD requires an EXPLICIT disk (E1): the destructive baseline rebuild must never fan out
     /// across every content-addressed disk on the node. The parser enforces this syntactically; this is
     /// the fail-closed backstop for a directly-constructed AST.
@@ -2467,7 +2402,7 @@ BlockIO InterpreterSystemQuery::runContentAddressedGcRebuild(const String & disk
             "SYSTEM CONTENT ADDRESSED GC REBUILD requires an explicit disk name");
 
     auto disk = getContext()->getDisk(disk_name);
-    auto * ca = content_addressed_storage_of(disk);
+    auto * ca = ContentAddressedMetadataStorage::tryFromDisk(disk);
     if (!ca)
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Disk '{}' is not a content-addressed disk", disk_name);
 

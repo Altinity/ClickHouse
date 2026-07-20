@@ -25,11 +25,6 @@
 namespace DB
 {
 
-namespace ErrorCodes
-{
-    extern const int NOT_IMPLEMENTED;
-}
-
 StorageSystemContentAddressedMounts::StorageSystemContentAddressedMounts(const StorageID & table_id_)
     : StorageWithCommonVirtualColumns(table_id_)
 {
@@ -97,25 +92,9 @@ Pipe StorageSystemContentAddressedMounts::read(
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count());
 
-    /// A disk's metadata storage is content-addressed iff getMetadataStorage() yields a CA storage.
-    /// Plain (non-object-storage) disks throw NOT_IMPLEMENTED, which simply means "not
-    /// content-addressed" here (mirrors InterpreterSystemQuery::runContentAddressedGarbageCollection).
     for (const auto & [disk_name, disk] : context->getDisksMap())
     {
-        MetadataStoragePtr md;
-        try
-        {
-            md = disk->getMetadataStorage();
-        }
-        catch (const Exception & e)
-        {
-            if (e.code() == ErrorCodes::NOT_IMPLEMENTED)
-                continue;
-            throw;
-        }
-        if (!md || !md->isContentAddressed())
-            continue;
-        auto * ca = dynamic_cast<ContentAddressedMetadataStorage *>(md.get());
+        auto * ca = ContentAddressedMetadataStorage::tryFromDisk(disk);
         if (!ca)
             continue;
 
