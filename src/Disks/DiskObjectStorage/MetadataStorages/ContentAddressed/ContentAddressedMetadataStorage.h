@@ -256,25 +256,13 @@ public:
     /// The CA read entry called by `DiskObjectStorage::prepareRead` before the generic
     /// storage-objects path: serves in-manifest bytes (mutable per-part files, inline entries,
     /// verbatim namespace files) from memory. Returns false when the path is not in-manifest.
-    bool prepareInManifestRead(const std::string & path, const ReadSettings & settings, ReadPipeline & pipeline) const;
+    /// Declared on `IContentAddressedExchange` (the narrow seam `prepareRead` casts to); `BlobViewPlan`
+    /// is likewise inherited from there.
+    bool prepareInManifestRead(const std::string & path, const ReadSettings & settings, ReadPipeline & pipeline) const override;
 
-    /// Translates a blob-backed part file to the physical blob
-    /// object plus the payload WINDOW inside it (the CHCA envelope header occupies
-    /// [0, payload_offset)). DiskObjectStorage::prepareRead composes the STANDARD object-storage
-    /// pipeline over `object` (gather/caches/async prefetch — the same chain plain s3 disks get,
-    /// so `MergeTreeReaderStream` right-mark bounds reach the object reader and its range
-    /// requests stay drainable) and bounds it with the pipeline's FileView stage.
-    /// nullopt = the path is not a blob-backed part file (caller falls through; absent paths
-    /// then fail in getStorageObjects exactly as before).
-    struct BlobViewPlan
-    {
-        StoredObject object;        /// physical blob key; logical path; readable extent (envelope + payload)
-        size_t payload_offset = 0;  /// view left bound inside the blob
-        size_t payload_end = 0;     /// view right bound (payload_offset + payload length)
-    };
     /// Resolves a blob-backed path to its physical object and payload window. Returns nullopt for
     /// in-manifest, loose, directory, or otherwise unresolved paths.
-    std::optional<BlobViewPlan> getBlobViewPlan(const std::string & path) const;
+    std::optional<BlobViewPlan> getBlobViewPlan(const std::string & path) const override;
 
     /// Creates a seekable reader over one blob payload, excluding its envelope. Transactions use
     /// this for read-your-writes; committed reads use `getBlobViewPlan` and the normal pipeline.

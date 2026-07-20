@@ -1,10 +1,14 @@
 #pragma once
 
 #include <base/types.h>
+#include <Disks/DiskObjectStorage/ObjectStorages/StoredObject.h>
 #include <optional>
 
 namespace DB
 {
+
+class ReadPipeline;
+struct ReadSettings;
 
 /// Purpose-built seam for `DataPartsExchange`: it exposes everything replication needs from a
 /// content-addressed disk and nothing else. `ContentAddressedMetadataStorage` implements it, and
@@ -53,6 +57,35 @@ public:
         const String & table_uuid,
         const String & part_name,
         const String & manifest_bytes) = 0;
+
+    /// ==== `DiskObjectStorage::prepareRead` hooks ====
+    /// The two CA-only reads `DiskObjectStorage::prepareRead` needs before it composes the standard
+    /// object-storage pipeline. Exposed on this narrow seam (rather than only on the concrete
+    /// `ContentAddressedMetadataStorage`) so `prepareRead` casts to the interface instead of coupling
+    /// to the concrete storage class.
+
+    /// The CA read entry called by `DiskObjectStorage::prepareRead` before the generic
+    /// storage-objects path: serves in-manifest bytes (mutable per-part files, inline entries,
+    /// verbatim namespace files) from memory. Returns false when the path is not in-manifest.
+    virtual bool prepareInManifestRead(const std::string & path, const ReadSettings & settings, ReadPipeline & pipeline) const = 0;
+
+    /// Translates a blob-backed part file to the physical blob
+    /// object plus the payload WINDOW inside it (the CHCA envelope header occupies
+    /// [0, payload_offset)). DiskObjectStorage::prepareRead composes the STANDARD object-storage
+    /// pipeline over `object` (gather/caches/async prefetch — the same chain plain s3 disks get,
+    /// so `MergeTreeReaderStream` right-mark bounds reach the object reader and its range
+    /// requests stay drainable) and bounds it with the pipeline's FileView stage.
+    /// nullopt = the path is not a blob-backed part file (caller falls through; absent paths
+    /// then fail in getStorageObjects exactly as before).
+    struct BlobViewPlan
+    {
+        StoredObject object;        /// physical blob key; logical path; readable extent (envelope + payload)
+        size_t payload_offset = 0;  /// view left bound inside the blob
+        size_t payload_end = 0;     /// view right bound (payload_offset + payload length)
+    };
+    /// Resolves a blob-backed path to its physical object and payload window. Returns nullopt for
+    /// in-manifest, loose, directory, or otherwise unresolved paths.
+    virtual std::optional<BlobViewPlan> getBlobViewPlan(const std::string & path) const = 0;
 };
 
 }

@@ -13,7 +13,7 @@
 #include <Common/CurrentMetrics.h>
 #include <IO/CachedInMemoryReadBufferFromFile.h>
 #include <IO/ReadPipeline.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedExchange.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/Cached/CachedObjectStorage.h>
 #include <Interpreters/FileCache/FileCache.h>
 #include <Disks/IO/ReadBufferFromRemoteFSGather.h>
@@ -821,10 +821,10 @@ void DiskObjectStorage::prepareRead(
     /// rides the STANDARD pipeline below (gather/caches/async prefetch — same chain as plain
     /// object-storage disks, so right-mark bounds reach the object reader and its range requests
     /// stay drainable, B116) and is bounded by the FileView stage at the end.
-    std::optional<ContentAddressedMetadataStorage::BlobViewPlan> ca_blob_view;
+    std::optional<IContentAddressedExchange::BlobViewPlan> ca_blob_view;
     if (metadata_storage->isContentAddressed())
     {
-        const auto * ca = dynamic_cast<const ContentAddressedMetadataStorage *>(metadata_storage.get());
+        const auto * ca = dynamic_cast<const IContentAddressedExchange *>(metadata_storage.get());
         if (ca)
         {
             if (ca->prepareInManifestRead(path, settings, pipeline))
