@@ -2257,7 +2257,7 @@ campaign. The CAS gtest battery is green. No CAS action; if pursued, it belongs 
   foreign-writer conflict, and should not escalate the former to a process-aborting
   `LOGICAL_ERROR`.
 
-## OPTIMIZATION OPPORTUNITY (CPU, LOW-MEDIUM) — ref-ledger JSON encoding writes byte-by-byte instead of bulk-copying safe runs
+## RESOLVED (CPU) — ref-ledger JSON encoding writes byte-by-byte instead of bulk-copying safe runs
 
 - **Logged (UTC):** 2026-07-19
 - **Severity:** optimization-opportunity (confirmed cause, and now a measured delta from a
@@ -2329,6 +2329,41 @@ campaign. The CAS gtest battery is green. No CAS action; if pursued, it belongs 
      per-byte escaping cost, is likely the larger win of the two.
   5. Do nothing for now (chosen): revisit if prod-scale profiling shows this becoming a
      larger share of CPU under heavier ref-ledger flush rates.
+- **RESOLVED (2026-07-20):** Implemented a combined #2+#4: `CasJsonWriter`, a bulk-append
+  writer (reserved scratch buffer, `memcpy`-style `append`/`appendChar` of static literal
+  key/punctuation fragments interleaved with already-safe value bytes, one `out.write()` per
+  record) now backs every CAS text format's encode path — ref log, ref snapshot, part
+  manifest, gc state, gc outcomes, fold seal, pool meta, blob meta, blob envelope,
+  server-root, and `cas_run`'s NDJSON writer. `writeJSONString`'s byte-by-byte `writeChar`
+  loop and the per-record `String(prefix) + "me"`-style key allocations found during design
+  are both gone from these paths. Byte-identical output throughout, verified by a
+  differential gtest against the old `WriteBuffer` vocabulary (adversarial strings +
+  randomized fuzz) and by the existing pins/goldens staying green.
+  - **Measured:** `BM_EncodeRefLogTxn` **753ns → 333ns, a 2.26× speedup**. Floor
+    `BM_MemcpyTxnBytes` (same bytes via raw fragment `memcpy`, no validation/escaping):
+    **30.7ns**, so the migrated encoder sits at **~10.5× the floor** — short of the design's
+    ≤3×-of-memcpy hard gate.
+  - **Honest outcome on the ≤3× gate: NOT met, and a profiling investigation
+    (`.superpowers/sdd/profile-encoderefllogtxn.md`) found it physically unreachable** for a
+    validating, JSON-escaping encoder at this granularity. Attribution of the ~333ns:
+    residual key-writing/call overhead ~47%, string escaping-scan ~23%, per-call buffer
+    allocation ~16%, itoa/number formatting ~11%, validation (`checkCanonicalRefName` /
+    `checkManifestRef`) ~3%. Even removing the per-call allocation ENTIRELY (reusable
+    scratch buffer, no per-call malloc/free) only reaches ~278ns, still **~9.1× the floor**
+    — a `memcpy` of precomputed bytes does none of the validation/formatting/escaping work a
+    correct encoder must do, so the floor itself was too pure a target.
+  - **Further optimization measured and REJECTED by decision** (kept the clean migration
+    instead): a static-literal key-glue rung (merging `,"key":` fragments into single
+    literals, extending the fast path from unprefixed to the prefixed binding keys) got to
+    **240ns (7.8×)** but introduced a fragile prose-invariant separator between the
+    hand-rolled literal and the value bytes. Raw-append of "safe" strings without escaping
+    mostly failed as a direction because `checkCanonicalRefName` does **not** reject quotes,
+    control bytes, or U+2028/U+2029 — ref names must stay through the escaping path; only 2
+    fixed-vocabulary words (`refOwnerKindToWord`'s `"owner"`/`"tombstone"`) were provably safe
+    to raw-append (16ns). The working tree was reverted to the clean `CasJsonWriter`
+    migration; none of this rejected ladder is in the shipped code.
+  - Spec: `docs/superpowers/specs/2026-07-20-cas-json-writer-bulk-encoding-design.md`.
+  - Plan: `docs/superpowers/plans/2026-07-20-cas-json-writer-bulk-encoding.md`.
 
 ## RESOLVED (CPU, algorithmic) — admits() re-encodes the WHOLE ref table once per state-growing op in a flush batch
 

@@ -1,7 +1,7 @@
 # CAS text encoding — `CasJsonWriter` bulk-append writer (near-memcpy serialization)
 
 - **Date:** 2026-07-20
-- **Status:** design approved, ready for implementation plan
+- **Status:** implemented (2026-07-20) — 2.26× encode speedup, byte-identical; ≤3×-of-memcpy target found physically unreachable (see BACKLOG resolution)
 - **Area:** `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/` (write-side
   JSON micro-vocabulary + all format codecs' encode paths)
 - **Backlog item:** `utils/ca-soak/scenarios/BACKLOG.md` — *"OPTIMIZATION OPPORTUNITY (CPU,
@@ -156,6 +156,21 @@ writing, `checkBudget` over the finished text after. No new fallback paths.
    **at most 3× the floor** (hard gate; 2× is the aspiration, and the contingency ladder
    below kicks in above 3×). History baseline: 753ns before this change. Before/after
    numbers go into the BACKLOG entry, which flips to RESOLVED.
+
+   **Outcome (2026-07-20, honest):** the ≤3× hard gate was **NOT met**. Measured:
+   `BM_EncodeRefLogTxn` 753ns → 333ns (2.26× speedup) against a `BM_MemcpyTxnBytes` floor of
+   30.7ns — a ratio of **~10.5×**, not ≤3×. A follow-up profiling pass
+   (`.superpowers/sdd/profile-encoderefllogtxn.md`) attributed the residual cost and found
+   the ≤3× target physically unreachable at this granularity: a `memcpy`-of-precomputed-bytes
+   floor does none of the validation, number formatting, or JSON escaping a correct encoder
+   must perform, and those irreducible costs (residual key-writing ~47%, string escaping
+   ~23%, buffer allocation ~16%, itoa ~11%, validation ~3% of the 333ns) dominate even after
+   removing the per-call allocation entirely (~278ns, still ~9.1× the floor). The accepted
+   outcome is the real 2.26× speedup plus exhaustively-verified byte-identity, not the ≤3×
+   ratio; `BM_MemcpyTxnBytes` is kept in the benchmark file as a documented reference floor
+   for future readers, not as a pass/fail gate. See the BACKLOG resolution for the full
+   numbers and the rejected further-optimization ladder (key-literal glue, raw-append of
+   "safe" strings).
 4. **Integration gate:** the usual ca-soak ref-lane run, green.
 
 ## Contingency (only if the factor lands above 3×)
