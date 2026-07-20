@@ -1,8 +1,31 @@
 #include "cas_format_test_battery.h"
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasGcOutcomesFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
+#include <Common/Exception.h>
 
 using namespace DB::Cas;
+
+namespace
+{
+
+/// Same tiny inline copy as `gtest_cas_part_manifest_format.cpp`'s `expectThrowsCode`: stays clear
+/// of `Disks/tests/cas_test_helpers.h`, which would drag in the whole CAS backend/store machinery
+/// this file otherwise has no need for.
+template <typename F>
+void expectThrowsCode(int expected_code, F && fn)
+{
+    try
+    {
+        fn();
+        FAIL() << "expected DB::Exception";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), expected_code);
+    }
+}
+
+}
 
 TEST(CasFormatBattery, GcOutcomes)
 {
@@ -64,4 +87,15 @@ TEST(CasGcOutcomesFormat, GarbageAndUnknownWordsFailClosed)
     /// A trailer count mismatch fails closed.
     const String miscount = "{\"type\":\"cas_gc_outcomes\",\"v\":3}\n{\"n\":5}\n";
     EXPECT_THROW(decodeOutcomeLog(miscount), DB::Exception);
+}
+
+TEST(CasGcOutcomesFormat, DigestWidthMismatchFailsClosedWithCorruptedData)
+{
+    /// `ch128` (CityHash128) digests are 16 bytes = 32 hex chars; here the "h" field is truncated
+    /// to 30 hex chars. Must surface as CORRUPTED_DATA (malformed serialized input), not
+    /// `fromHex`'s BAD_ARGUMENTS.
+    const String bad = "{\"type\":\"cas_gc_outcomes\",\"v\":3}\n"
+                       "{\"k\":\"blob\",\"ha\":\"ch128\",\"h\":\"00112233445566778899aabbccddee\","
+                       "\"tt\":\"etag\",\"tv\":\"x\",\"oc\":\"deleted\"}\n{\"n\":1}\n";
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodeOutcomeLog(bad); });
 }

@@ -116,6 +116,11 @@ OutcomeLog decodeOutcomeLog(std::string_view data)
         if (!have_ha || !have_h || !have_tt)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS outcome log: record missing ha/h/tt");
         const BlobHashAlgo algo = blobHashAlgoFromWord(ha, "outcome log");
+        /// Validate the digest width before `fromHex`: a width mismatch must surface as the
+        /// CORRUPTED_DATA required for malformed serialized input, not fromHex's BAD_ARGUMENTS.
+        if (hhex.size() != blobHashLenFor(algo) * 2)
+            throw Exception(ErrorCodes::CORRUPTED_DATA,
+                "CAS outcome log: digest width {} does not match algo '{}'", hhex.size(), ha);
         e.ref = BlobRef{algo, codecFor(algo).fromHex(hhex)};
         e.token = Token{tv, tt};
         if (!line_in.eof())
