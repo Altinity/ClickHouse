@@ -343,6 +343,36 @@ TEST(OAuthLogin, PKCEChallengeDerivation)
 }
 
 // ---------------------------------------------------------------------------
+// buildDeviceAuthorizationRequestBody — RFC 8628 §3.1 client authentication.
+// Regression guard for the confidential-client device flow: the device
+// authorization request must carry `client_secret` when one is configured
+// (otherwise a confidential IdP client rejects the very first request with
+// `invalid_client`), and must omit the parameter entirely for public clients.
+// ---------------------------------------------------------------------------
+
+TEST(OAuthLogin, DeviceAuthorizationBodyIncludesClientSecret)
+{
+    OAuthCredentials creds;
+    creds.client_id = "demo-confidential";
+    creds.client_secret = "t0p-s3cret";
+
+    const std::string body = buildDeviceAuthorizationRequestBody(creds, "openid");
+    EXPECT_EQ(body, "client_id=demo-confidential&scope=openid&client_secret=t0p-s3cret");
+}
+
+TEST(OAuthLogin, DeviceAuthorizationBodyOmitsSecretForPublicClient)
+{
+    OAuthCredentials creds;
+    creds.client_id = "demo-public";
+
+    const std::string body = buildDeviceAuthorizationRequestBody(creds, "openid");
+    EXPECT_EQ(body, "client_id=demo-public&scope=openid");
+    // An empty value is not equivalent to omission and is rejected by several
+    // IdPs as invalid_client — the parameter must be absent altogether.
+    EXPECT_EQ(body.find("client_secret"), std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
 // copyStreamWithLimit — bounded read of untrusted OAuth/OIDC responses.
 // Regression guard for the unbounded OIDC discovery read (memory-exhaustion
 // DoS): the browser/device login HTTP reads must cap the body size.

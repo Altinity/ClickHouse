@@ -567,16 +567,27 @@ std::string runOAuthAuthCodeFlow(const OAuthCredentials & creds)
     return resp->getValue<std::string>("id_token");
 }
 
+std::string buildDeviceAuthorizationRequestBody(const OAuthCredentials & creds, const std::string & scope)
+{
+    std::string body
+        = "client_id=" + urlEncodeOAuth(creds.client_id)
+        + "&scope=" + urlEncodeOAuth(scope);
+    /// Per RFC 8628 §3.1 a confidential client must authenticate on the
+    /// device authorization request the same way as on the token endpoint.
+    /// See runOAuthAuthCodeFlow() above: omit the parameter for public
+    /// clients, do not send an empty value.
+    if (!creds.client_secret.empty())
+        body += "&client_secret=" + urlEncodeOAuth(creds.client_secret);
+    return body;
+}
+
 std::string runOAuthDeviceFlow(OAuthCredentials creds)
 {
     auto provider_policy = IOAuthProviderPolicy::create(creds);
     if (creds.device_auth_uri.empty())
         creds.device_auth_uri = provider_policy->resolveDeviceAuthorizationEndpoint(creds);
 
-    const std::string device_scope = provider_policy->getDeviceScope();
-    const std::string device_body
-        = "client_id=" + urlEncodeOAuth(creds.client_id)
-        + "&scope=" + urlEncodeOAuth(device_scope);
+    const std::string device_body = buildDeviceAuthorizationRequestBody(creds, provider_policy->getDeviceScope());
 
     auto device_resp = postOAuthForm(creds.device_auth_uri, device_body);
 

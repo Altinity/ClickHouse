@@ -36,6 +36,13 @@ void copyStreamWithLimit(std::istream & in, std::string & out, std::size_t max_b
 
 std::string urlEncodeOAuth(const std::string & value);
 Poco::JSON::Object::Ptr postOAuthForm(const std::string & url, const std::string & body);
+
+/// Build the form body of the RFC 8628 device authorization request. Exposed
+/// (rather than kept local to `runOAuthDeviceFlow`) only so the regression
+/// tests can verify that a confidential client's `client_secret` is included
+/// (RFC 8628 §3.1) while public clients omit the parameter entirely.
+std::string buildDeviceAuthorizationRequestBody(const OAuthCredentials & creds, const std::string & scope);
+
 std::string runOAuthAuthCodeFlow(const OAuthCredentials & creds);
 std::string runOAuthDeviceFlow(OAuthCredentials creds);
 
