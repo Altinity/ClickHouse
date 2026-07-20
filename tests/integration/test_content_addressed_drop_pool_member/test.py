@@ -181,11 +181,14 @@ def test_drop_dead_pool_member_heals_the_pool():
     assert "dangling=0" in fsck, fsck
     assert "unaccounted=0" in fsck, fsck
 
-    # (10) Re-run the same command: the slot is gone, so this is now an unknown pool member.
+    # (10) Re-run the same command: decommission tombstones the owner anchor in place rather than
+    # deleting it, so the slot is not "unknown" -- the tombstone is found and the re-run is refused
+    # with CORRUPTED_DATA and a message telling the operator this server-root was explicitly
+    # decommissioned and will not silently resume.
     err = node1.query_and_get_error(
         "SYSTEM CONTENT ADDRESSED DROP POOL MEMBER '{}' FROM DISK '{}'".format(SRID2, CA_DISK)
     )
-    assert "BAD_ARGUMENTS" in err, err
+    assert "explicitly decommissioned" in err, err
 
 
 def test_drop_pool_member_rejected_on_readonly_disk():
