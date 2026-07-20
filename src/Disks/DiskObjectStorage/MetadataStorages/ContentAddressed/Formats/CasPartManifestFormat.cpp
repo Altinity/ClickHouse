@@ -197,6 +197,21 @@ PartManifest decodePartManifest(std::string_view data)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: record must start with \"p\"");
         ManifestEntry e;
         e.path = r.readString();
+
+        /// Manifest bytes arrive over the interserver relink channel: enforce the same path hygiene
+        /// as CasLayout::checkNamespace so no future consumer can inherit a traversal. Relative,
+        /// no empty/'.'/'..' segments. (Syntactic only — legal projection subdirs pass.)
+        if (e.path.empty() || e.path.front() == '/')
+            throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS part manifest: invalid entry path '{}'", e.path);
+        for (std::string_view rest = e.path; !rest.empty();)
+        {
+            const size_t slash = rest.find('/');
+            const std::string_view seg = rest.substr(0, slash);
+            if (seg.empty() || seg == "." || seg == "..")
+                throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS part manifest: invalid entry path '{}'", e.path);
+            rest = (slash == std::string_view::npos) ? std::string_view{} : rest.substr(slash + 1);
+        }
+
         std::optional<String> pm;
         std::optional<String> ha;
         std::optional<String> h;

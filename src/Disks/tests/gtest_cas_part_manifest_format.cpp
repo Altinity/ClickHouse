@@ -191,6 +191,50 @@ TEST(CasPartManifestFormat, MixedAlgoEntriesRoundTrip)
     EXPECT_EQ(got.entries[1].blob_size, 200u);
 }
 
+/// Builds a single-Blob-entry manifest whose entry path is exactly `path` -- `encodePartManifest`
+/// itself does not validate path shape (only ordering/duplicates), so this lets the negative cases
+/// below reach `decodePartManifest`'s shape check unobstructed.
+static PartManifest manifestWithSinglePath(std::string_view path)
+{
+    PartManifest m;
+    m.ref = ManifestRef{17, 66, 7};
+    m.root_namespace_id = RootNamespace("00/ff@cas@");
+
+    ManifestEntry e;
+    e.path = String(path);
+    e.placement = EntryPlacement::Blob;
+    e.ref = BlobRef{BlobHashAlgo::CityHash128,
+        codecFor(BlobHashAlgo::CityHash128).fromHex("00112233445566778899aabbccddeeff")};
+    e.blob_size = 10;
+    m.entries = {e};
+    m.payload_digest = computePayloadDigest(m);
+    return m;
+}
+
+/// T11: manifest bytes arrive over the interserver relink channel, so decode enforces the same path
+/// hygiene as CasLayout::checkNamespace -- relative, no empty/'.'/'..' segments, no leading '/'.
+/// `encodePartManifest` does not itself reject these (see `manifestWithSinglePath`), so each case
+/// must fail closed at decode time instead.
+TEST(CasPartManifestFormat, DecodeRejectsMalformedEntryPaths)
+{
+    for (const char * path : {"../evil", "/abs", "", "a//b", "a/./b"})
+    {
+        SCOPED_TRACE(path);
+        const String encoded = encodePartManifest(manifestWithSinglePath(path));
+        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { decodePartManifest(encoded); });
+    }
+}
+
+/// Legal projection subdirectories (`<projection>.proj/<file>`) must not be caught by the shape
+/// check above -- it is syntactic only, not a directory-depth restriction.
+TEST(CasPartManifestFormat, DecodeAcceptsLegalProjectionSubdirPath)
+{
+    const PartManifest m = manifestWithSinglePath("proj.proj/data.bin");
+    const PartManifest got = decodePartManifest(encodePartManifest(m));
+    ASSERT_EQ(got.entries.size(), 1u);
+    EXPECT_EQ(got.entries[0].path, "proj.proj/data.bin");
+}
+
 TEST(CasPartManifestFormat, DuplicatePathRejectedOnEncode)
 {
     PartManifest m = sample();
