@@ -150,6 +150,21 @@ struct BindingFields
     }
 };
 
+/// The log transaction's header-object meta line (ns + txn_id). Shared by `encodeRefLogTxn` and
+/// `removalFramingSize` so the two never disagree by a byte.
+void writeLogMeta(WriteBuffer & out, const String & ns, const RefTxnId & txn_id)
+{
+    bool first = true;
+    writeKey(out, "ns", first);
+    writeStringValue(out, ns);
+    writeKey(out, "we", first);
+    writeU64StringValue(out, txn_id.writer_epoch);
+    writeKey(out, "rs", first);
+    writeU64StringValue(out, txn_id.ref_sequence);
+    closeObject(out, first);
+    writeChar('\n', out);
+}
+
 RefOp readOpRecord(JsonObjectReader & r, RefOpKind kind)
 {
     RefOp op;
@@ -219,18 +234,7 @@ String encodeRefLogTxn(const RefLogTxn & txn)
     WriteBufferFromOwnString out;
     writeHeaderLine(out, FormatId::RefLog);
 
-    /// meta line
-    {
-        bool first = true;
-        writeKey(out, "ns", first);
-        writeStringValue(out, txn.ns);
-        writeKey(out, "we", first);
-        writeU64StringValue(out, txn.txn_id.writer_epoch);
-        writeKey(out, "rs", first);
-        writeU64StringValue(out, txn.txn_id.ref_sequence);
-        closeObject(out, first);
-        writeChar('\n', out);
-    }
+    writeLogMeta(out, txn.ns, txn.txn_id);
 
     for (const RefOp & op : txn.ops)
         writeOp(out, op);
@@ -314,6 +318,35 @@ RefLogTxn decodeRefLogTxn(std::string_view data, const String & expected_ns, con
 
     checkBudget(txn.ops, data.size());
     return txn;
+}
+
+size_t removalOpEncodedSize(RefOwnerKind owner_kind, const String & ref_name, const ManifestRef & manifest_ref)
+{
+    /// One exact owner-removal op, exactly as `buildHypotheticalRemovalTxn` emits it: an
+    /// owner_transition with only an old binding, no new binding.
+    RefOp op;
+    op.kind = RefOpKind::OwnerTransition;
+    op.old_binding = RefOwnerBinding{owner_kind, ref_name, manifest_ref};
+
+    WriteBufferFromOwnString out;
+    writeOp(out, op);
+    out.finalize();
+    return out.str().size();
+}
+
+size_t removalFramingSize(const String & ns, const RefTxnId & txn_id, uint64_t op_count)
+{
+    /// Header + meta + the terminal remove_namespace op + trailer(op_count). `op_count` counts every op
+    /// including the remove_namespace op (i.e. committed + precommits + 1).
+    WriteBufferFromOwnString out;
+    writeHeaderLine(out, FormatId::RefLog);
+    writeLogMeta(out, ns, txn_id);
+    RefOp remove_op;
+    remove_op.kind = RefOpKind::RemoveNamespace;
+    writeOp(out, remove_op);
+    writeTrailerLine(out, op_count);
+    out.finalize();
+    return out.str().size();
 }
 
 }

@@ -1005,3 +1005,28 @@ TEST(CasRefSnapshotSizeHelpers, FramingPlusRowsEqualsFullEncode)
 
     EXPECT_EQ(rebuilt, full);
 }
+
+/// ===================================================================================
+/// Removal-txn size helpers: framing + Σ per-owner-op must equal a full removal-txn encode.
+/// ===================================================================================
+TEST(CasRefLogSizeHelpers, FramingPlusOpsEqualsFullRemovalEncode)
+{
+    RefTableState state;
+    applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1},
+        {birthOp(),
+         addPrecommitOp("alpha", manifestRef(1, 1, 1)), promoteOp("alpha", manifestRef(1, 1, 1)),
+         addPrecommitOp("beta", manifestRef(1, 2, 1))}));
+
+    /// Ground truth: the whole-namespace removal txn this test file already builds independently.
+    const RefLogTxn removal = buildRemovalTxnForTest(state, "", RefTxnId{1, 1});
+    const size_t full = encodeRefLogTxn(removal).size();
+
+    size_t rebuilt = removalFramingSize("", RefTxnId{1, 1},
+                                        state.committed.size() + state.precommits.size() + 1);
+    for (const auto [name, row] : state.committed)
+        rebuilt += removalOpEncodedSize(RefOwnerKind::Committed, name, row.manifest_ref);
+    for (const auto & [name, mref] : state.precommits)
+        rebuilt += removalOpEncodedSize(RefOwnerKind::Precommit, name, mref);
+
+    EXPECT_EQ(rebuilt, full);
+}
