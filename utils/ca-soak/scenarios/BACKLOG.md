@@ -2698,6 +2698,27 @@ campaign. The CAS gtest battery is green. No CAS action; if pursued, it belongs 
      retry-before-fail-permanently policy, or whether "transient infra blip during startup ⇒
      requires an explicit reload" is accepted as by-design ClickHouse `AsyncLoader` behavior that
      CAS inherits like any other storage engine.
+- **Confirmed via `system.asynchronous_loader` (2026-07-19, ~1h10m after the failure, `ch1` still
+  UP):** exactly ONE row for `job = 'load table default.ca_stress'` — `status: FAILED`,
+  `schedule_time: 2026-07-19 22:14:43.433126`, `start_time: 22:14:43.433157`,
+  `finish_time: 22:15:33.467675` (`elapsed: 50.03s`), plus one dependent
+  `job = 'startup table default.ca_stress'` row, `status: CANCELED` (cancelled by the dependency
+  failure, never itself started — `start_time: NULL`). No second row, no later `schedule_time` —
+  every manual touch after `22:15:33` (several, minutes apart, up to `23:2x`) read this SAME
+  terminal row rather than creating a new load job. Cross-checked against `AsyncLoader.h`/`.cpp`
+  directly: `grep -i retry` over both files returns zero matches; `finish()` sets a job's
+  `LoadStatus` to `FAILED` unconditionally and terminally (`AsyncLoader.h:121,471`) — there is no
+  requeue/reschedule path anywhere in the class for a job already marked `FAILED`. So this is not
+  "AsyncLoader retried and kept failing" — **AsyncLoader has no retry concept at all**, for any
+  table, CAS or otherwise; a table whose startup job fails once stays `FAILED` until an explicit
+  `DETACH`/`ATTACH` (which schedules a brand-new job) or a full server restart. This is general
+  ClickHouse `AsyncLoader` behavior, not a CAS-specific defect — CAS's own ~90s retry envelope
+  (`CasRequestControl`'s internal S3-request-level retries) ran to completion INSIDE that single
+  50s-`elapsed` job execution and still came up empty; nothing above that layer schedules a second
+  attempt. This sharpens fix-direction option 2 above: since the platform gives CAS no free retry
+  at the job level, if bounded retry-before-fail-permanently is wanted for CAS table startup, CAS
+  itself would need to loop inside `ensureRefTableRecovered`/the seal-PUT call, not rely on
+  `AsyncLoader` ever giving it a second chance.
 - **Soak stack state:** left UP per the run's own failure trap (as designed) — `ch1` up (13min at
   time of writing, `SELECT 1` healthy, `ca_stress` permanently unattachable), `ch2` still
   `Exited (243)`, `rustfs1` up and quiet since `22:15:38`. Awaiting a decision on relaunch (`v12`)
