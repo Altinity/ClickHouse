@@ -7,11 +7,20 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
 
 /// Pure measurement, no pass/fail assertions -- see the ca-gc-rebuild BACKLOG.md entries
-/// "OPTIMIZATION OPPORTUNITY -- ref-ledger JSON encoding writes byte-by-byte" and
-/// "OPTIMIZATION OPPORTUNITY -- admits() re-encodes the WHOLE ref table once per state-growing
-/// op" for the investigation these benchmarks measure. Build with `-DENABLE_BENCHMARKS=ON` and
-/// run the resulting `benchmark_cas_ref_protocol` binary directly; never wired into `ninja test`
+/// "OPTIMIZATION OPPORTUNITY -- ref-ledger JSON encoding writes byte-by-byte" and the (now
+/// RESOLVED) "admits() re-encodes the WHOLE ref table once per state-growing op" entry for the
+/// investigation these benchmarks measure. Build with `-DENABLE_BENCHMARKS=ON` and run the
+/// resulting `benchmark_cas_ref_protocol` binary directly; never wired into `ninja test`
 /// or CI.
+///
+/// BM_Admits history (synthetic RefTableState, time/call, this binary):
+///   Before incremental admits() (2026-07-19) -- full O(N) rebuild+encode per call:
+///     N=100: 48.8 us    N=1,000: 476 us    N=10,000: 5,018 us    N=100,000: 55,976 us
+///     Google Benchmark complexity fit: O(N log N), RMS 2%.
+///   After incremental admits() (2026-07-20) -- O(1) via incremental body-byte counters on
+///   RefTableState (see docs/superpowers/specs/2026-07-20-cas-ref-admits-incremental-budget-design.md):
+///     N=100: 1842 ns    N=1,000: 1875 ns    N=10,000: 1864 ns    N=100,000: 1919 ns
+///     Google Benchmark complexity fit: O(1), RMS 1-2%.
 
 using namespace DB::Cas;
 
@@ -100,9 +109,11 @@ static void BM_EncodeRefLogTxn(benchmark::State & state)
 }
 BENCHMARK(BM_EncodeRefLogTxn);
 
-/// admits() re-derives and re-encodes the WHOLE committed-ref snapshot on every call
-/// (CasRefProtocol.cpp) -- this should show close to linear (O(N)) growth with table size.
-/// ->Complexity() has Google Benchmark fit and print the empirical big-O across the range.
+/// admits() used to re-derive and re-encode the WHOLE committed-ref snapshot on every call
+/// (CasRefProtocol.cpp), showing O(N log N) growth with table size; it now maintains
+/// incremental body-byte counters on RefTableState instead, so this should show flat (O(1))
+/// time/call across the range. ->Complexity() has Google Benchmark fit and print the
+/// empirical big-O across the range.
 static void BM_Admits(benchmark::State & state)
 {
     const size_t n = static_cast<size_t>(state.range(0));

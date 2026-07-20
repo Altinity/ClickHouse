@@ -2330,7 +2330,7 @@ campaign. The CAS gtest battery is green. No CAS action; if pursued, it belongs 
   5. Do nothing for now (chosen): revisit if prod-scale profiling shows this becoming a
      larger share of CPU under heavier ref-ledger flush rates.
 
-## OPTIMIZATION OPPORTUNITY (CPU, algorithmic, MEDIUM-HIGH) — admits() re-encodes the WHOLE ref table once per state-growing op in a flush batch
+## RESOLVED (CPU, algorithmic) — admits() re-encodes the WHOLE ref table once per state-growing op in a flush batch
 
 - **Logged (UTC):** 2026-07-19
 - **Severity:** optimization-opportunity (confirmed cause via code reading AND a standalone
@@ -2434,6 +2434,16 @@ campaign. The CAS gtest battery is green. No CAS action; if pursued, it belongs 
   `appendRefOps`-related), so this is the removal orchestrator briefly waiting for a
   free slot during a burst of removals. Bounded, expected, and unrelated to the
   ref-ledger flush bottleneck — no fix direction.
+- **RESOLVED (2026-07-20):** Implemented Approach A (incremental body-byte counters on
+  `RefTableState`, maintained O(1) per op by `applyOpInPlace`, byte-exact vs the full encode,
+  guarded by a debug recompute `chassert` and the existing `AdmitsExactnessPropertyTest`).
+  `admits()` is now O(touched rows); a K-op flush batch against an N-ref table is O(K) not O(K×N).
+  Spec: `docs/superpowers/specs/2026-07-20-cas-ref-admits-incremental-budget-design.md`.
+  Plan: `docs/superpowers/plans/2026-07-20-cas-ref-admits-incremental-budget.md`.
+  See the `BM_Admits` after-numbers in `benchmark_cas_ref_protocol.cpp`. Re-measured
+  (2026-07-20, same synthetic `RefTableState` harness): N=100: 1842 ns, N=1,000: 1875 ns,
+  N=10,000: 1864 ns, N=100,000: 1919 ns — flat, Google Benchmark complexity fit **O(1)**,
+  RMS 1-2% (was O(N log N), 48.8 μs → 55,976 μs across the same N range).
 
 ## NOTE (CPU, expected, not actionable) — local blob staging round-trip: open() + CityHash128 + unlink() per blob
 
