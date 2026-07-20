@@ -112,9 +112,14 @@ ContentAddressedTransaction::~ContentAddressedTransaction()
         {
             st.build->abandon();
         }
-        catch (...) // NOLINT(bugprone-empty-catch)
+        catch (...)
         {
-            /// Best-effort: destructor must not throw; lingering debris is GC-reclaimed.
+            /// A destructor must not throw. But a failed abandon can leave a LIVE-epoch precommit
+            /// binding that neither GC nor the (prior-epoch-scoped) stale-precommit sweep reclaims
+            /// until this mount remounts -- that must be diagnosable, not silently swallowed.
+            tryLogCurrentException(getLogger("ContentAddressedTransaction"),
+                                   "abandoning a build during transaction destruction "
+                                   "(a live precommit binding may persist until remount)");
         }
     }
 }
