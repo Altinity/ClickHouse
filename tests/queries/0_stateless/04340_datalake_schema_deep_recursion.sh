@@ -46,7 +46,8 @@ PYEOF
 
 # allow_experimental_delta_kernel_rs=0 selects the C++ metadata parser (the Rust kernel has its own
 # recursion limit). The deep schema must be rejected with a JSON exception, not crash the process.
-$CLICKHOUSE_LOCAL --query "DESCRIBE TABLE deltaLakeLocal('$TMP_DIR/dl') SETTINGS allow_experimental_delta_kernel_rs=0 FORMAT Null" 2>&1 \
+# allow_local_data_lakes=1 lifts the Altinity guard that otherwise disables the *Local table functions.
+$CLICKHOUSE_LOCAL --query "DESCRIBE TABLE deltaLakeLocal('$TMP_DIR/dl') SETTINGS allow_experimental_delta_kernel_rs=0, allow_local_data_lakes=1 FORMAT Null" 2>&1 \
     | expect_contains delta_depth JSONException
 
 # Iceberg parses the whole metadata JSON with Poco before any field validation, so a deeply nested
@@ -58,5 +59,5 @@ N = 2000
 open('$TMP_DIR/ice/metadata/v1.metadata.json', 'wb').write(b'{' + b'\"a\":{' * N + b'\"x\":1' + b'}' * N + b'}')
 open('$TMP_DIR/ice/metadata/version-hint.text', 'w').write('1')
 "
-$CLICKHOUSE_LOCAL --query "DESCRIBE TABLE icebergLocal('$TMP_DIR/ice') FORMAT Null" 2>&1 \
+$CLICKHOUSE_LOCAL --query "DESCRIBE TABLE icebergLocal('$TMP_DIR/ice') SETTINGS allow_local_data_lakes=1 FORMAT Null" 2>&1 \
     | expect_contains iceberg_depth JSONException
