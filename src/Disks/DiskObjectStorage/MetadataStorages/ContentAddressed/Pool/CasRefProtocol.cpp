@@ -284,10 +284,12 @@ RefLogTxn buildHypotheticalRemovalTxn(const RefTableState & state, const RefTxnI
     return txn;
 }
 
-#ifndef NDEBUG
-/// Debug-only: recompute both body totals from scratch and assert the incrementally maintained values
-/// match. This is what makes the incremental counters *provably* byte-exact rather than a drift-prone
-/// estimate -- the concern the old non-incremental admits() cited. O(N); debug builds only.
+#ifdef DEBUG_OR_SANITIZER_BUILD
+/// Debug/sanitizer-only: recompute both body totals from scratch and assert the incrementally
+/// maintained values match. This is what makes the incremental counters *provably* byte-exact rather
+/// than a drift-prone estimate -- the concern the old non-incremental admits() cited. O(N); compiled
+/// only in debug and sanitizer builds (`DEBUG_OR_SANITIZER_BUILD`, the same condition `chassert` fires
+/// under), so an ASan/TSan run exercises it too, not just a debug build.
 void debugAssertBodyCounters(const RefTableState & state)
 {
     uint64_t snap = 0;
@@ -328,7 +330,7 @@ void applyRefLogTxn(RefTableState & state, const RefLogTxn & txn)
 
     scratch.greatest_applied = txn.txn_id;
     state = std::move(scratch);
-#ifndef NDEBUG
+#ifdef DEBUG_OR_SANITIZER_BUILD
     debugAssertBodyCounters(state);
 #endif
 }
