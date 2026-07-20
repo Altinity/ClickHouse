@@ -11,34 +11,63 @@ using namespace DB::Cas;
 
 TEST(CaPartPathParser, ParsePartFilePathAtomic)
 {
-    auto file = parsePartFilePath("uui/uuid-1/all_1_1_0/columns.txt");
+    auto file = parsePartFilePath("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/columns.txt");
     ASSERT_TRUE(file.has_value());
-    EXPECT_EQ(file->table_uuid, "uuid-1");
+    EXPECT_EQ(file->table_uuid, "a11a11a1-1111-4111-8111-111111111111");
     EXPECT_EQ(file->part_name, "all_1_1_0");
     EXPECT_EQ(file->file, "columns.txt");
     EXPECT_TRUE(file->backup_name.empty());
     EXPECT_TRUE(file->shadow_table_dir.empty());
 
-    auto part_dir = parsePartFilePath("uui/uuid-1/all_1_1_0/"); // trailing slash, no file
+    auto part_dir = parsePartFilePath("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/"); // trailing slash, no file
     ASSERT_TRUE(part_dir.has_value());
     EXPECT_EQ(part_dir->part_name, "all_1_1_0");
     EXPECT_TRUE(part_dir->file.empty());
 
-    EXPECT_FALSE(parsePartFilePath("uui/uuid-1").has_value()); // table dir, not a part
+    EXPECT_FALSE(parsePartFilePath("a11/a11a11a1-1111-4111-8111-111111111111").has_value()); // table dir, not a part
     EXPECT_FALSE(parsePartFilePath("123").has_value());        // shallower
 
     // The real-server shape carries a leading store/; the uuid-pair anchor makes it equivalent.
-    auto atomic = parsePartFilePath("store/uui/uuid-1/all_1_1_0/data.bin");
+    auto atomic = parsePartFilePath("store/a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin");
     ASSERT_TRUE(atomic.has_value());
-    EXPECT_EQ(atomic->table_uuid, "uuid-1");
+    EXPECT_EQ(atomic->table_uuid, "a11a11a1-1111-4111-8111-111111111111");
     EXPECT_EQ(atomic->part_name, "all_1_1_0");
     EXPECT_EQ(atomic->file, "data.bin");
+}
+
+TEST(CaPartPathParser, ThreeCharDatabaseSharingTablePrefixDoesNotFalseAnchorAsAtomic)
+{
+    // T12: a non-Atomic 3-char database directory whose table directory happens to start with the
+    // SAME 3 characters (db "abc", table "abcxyz") used to satisfy the old loose Atomic-anchor shape
+    // check (`prefix.size() == 3 && uuid.compare(0, 3, prefix) == 0`), false-anchoring "abc" as a
+    // UUID hash-prefix and "abcxyz" as the table UUID -- even though neither looks anything like a
+    // real UUID. The anchor now additionally requires the prefix to be lowercase-hex and the
+    // candidate to have the exact 36-char dashed UUID shape, so this path falls through to the
+    // non-Atomic fallback split instead (folding the whole leading path into table_uuid, exactly like
+    // ParsePartFilePathNonAtomic's "data/memory_01069/mt" case).
+    auto d = parsePartFilePath("data/abc/abcxyz/1_1_1_0/x.bin");
+    ASSERT_TRUE(d.has_value());
+    EXPECT_EQ(d->table_uuid, "data/abc/abcxyz");
+    EXPECT_EQ(d->part_name, "1_1_1_0");
+    EXPECT_EQ(d->file, "x.bin");
+}
+
+TEST(CaPartPathParser, RealHexPrefixUuidPairStillAnchorsAsAtomic)
+{
+    // Positive control for the tightened anchor: a REAL Atomic on-disk shape --
+    // store/<uuid[:3]>/<uuid> with the UUID correctly 36-char dashed and genuinely sharing its first
+    // 3 characters with the prefix -- still anchors exactly as before.
+    auto a = parsePartFilePath("store/abc/abc12345-1234-5678-9abc-def012345678/all_1_1_0/x.bin");
+    ASSERT_TRUE(a.has_value());
+    EXPECT_EQ(a->table_uuid, "abc12345-1234-5678-9abc-def012345678");
+    EXPECT_EQ(a->part_name, "all_1_1_0");
+    EXPECT_EQ(a->file, "x.bin");
 }
 
 TEST(CaPartPathParser, ParsePartFilePathProjectionSubPath)
 {
     // A projection file keeps its FULL in-part relative path as the file (the tree entry name).
-    auto proj = parsePartFilePath("uui/uuid-1/all_1_1_0/p.proj/data.bin");
+    auto proj = parsePartFilePath("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/p.proj/data.bin");
     ASSERT_TRUE(proj.has_value());
     EXPECT_EQ(proj->part_name, "all_1_1_0");
     EXPECT_EQ(proj->file, "p.proj/data.bin");
@@ -81,57 +110,57 @@ TEST(CaPartPathParser, ParsePartFilePathNonAtomic)
 
 TEST(CaPartPathParser, ParseTableUuid)
 {
-    EXPECT_EQ(parseTableUuid("uui/uuid-1/"), std::optional<std::string>("uuid-1"));
-    EXPECT_EQ(parseTableUuid("uui/uuid-1"), std::optional<std::string>("uuid-1"));
-    EXPECT_FALSE(parseTableUuid("uui/uuid-1/all_1_1_0").has_value()); // part dir, not table dir
+    EXPECT_EQ(parseTableUuid("a11/a11a11a1-1111-4111-8111-111111111111/"), std::optional<std::string>("a11a11a1-1111-4111-8111-111111111111"));
+    EXPECT_EQ(parseTableUuid("a11/a11a11a1-1111-4111-8111-111111111111"), std::optional<std::string>("a11a11a1-1111-4111-8111-111111111111"));
+    EXPECT_FALSE(parseTableUuid("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0").has_value()); // part dir, not table dir
 
-    EXPECT_TRUE(endsWithTableUuidPair("store/uui/uuid-1"));
-    EXPECT_FALSE(endsWithTableUuidPair("store/uui/uuid-1/all_1_1_0"));
+    EXPECT_TRUE(endsWithTableUuidPair("store/a11/a11a11a1-1111-4111-8111-111111111111"));
+    EXPECT_FALSE(endsWithTableUuidPair("store/a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0"));
     EXPECT_FALSE(endsWithTableUuidPair("shadow/bk1/store"));
 }
 
 TEST(CaPartPathParser, ParseTableFilePathNested)
 {
     // The reserved deduplication_logs/ subdir is a table-level namespace, never a part dir.
-    EXPECT_FALSE(isPartFilePath("uui/uuid-1/deduplication_logs/deduplication_log_1.txt"));
-    auto tf = parseTableFilePath("uui/uuid-1/deduplication_logs/deduplication_log_1.txt");
+    EXPECT_FALSE(isPartFilePath("a11/a11a11a1-1111-4111-8111-111111111111/deduplication_logs/deduplication_log_1.txt"));
+    auto tf = parseTableFilePath("a11/a11a11a1-1111-4111-8111-111111111111/deduplication_logs/deduplication_log_1.txt");
     ASSERT_TRUE(tf.has_value());
-    EXPECT_EQ(tf->table_uuid, "uuid-1");
+    EXPECT_EQ(tf->table_uuid, "a11a11a1-1111-4111-8111-111111111111");
     EXPECT_EQ(tf->tail, "deduplication_logs/deduplication_log_1.txt");
 
-    auto flat = parseTableFilePath("uui/uuid-1/format_version.txt");
+    auto flat = parseTableFilePath("a11/a11a11a1-1111-4111-8111-111111111111/format_version.txt");
     ASSERT_TRUE(flat.has_value());
     EXPECT_EQ(flat->tail, "format_version.txt");
 
-    EXPECT_FALSE(parseTableFilePath("uui/uuid-1").has_value());
-    EXPECT_FALSE(parseTableFilePath("uui/uuid-1/").has_value());
+    EXPECT_FALSE(parseTableFilePath("a11/a11a11a1-1111-4111-8111-111111111111").has_value());
+    EXPECT_FALSE(parseTableFilePath("a11/a11a11a1-1111-4111-8111-111111111111/").has_value());
 
-    EXPECT_TRUE(isPartFilePath("uui/uuid-1/all_1_1_0/data.bin"));
+    EXPECT_TRUE(isPartFilePath("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin"));
 }
 
 TEST(CaPartPathParser, ShadowFreezePaths)
 {
-    EXPECT_TRUE(isShadowPath("shadow/bk1/store/uui/uuid-1/all_1_1_0/data.bin"));
+    EXPECT_TRUE(isShadowPath("shadow/bk1/store/a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin"));
     EXPECT_TRUE(isShadowPath("/shadow/bk1"));
-    EXPECT_FALSE(isShadowPath("store/uui/uuid-1/all_1_1_0/data.bin"));
+    EXPECT_FALSE(isShadowPath("store/a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin"));
     EXPECT_FALSE(isShadowPath("shadowy/bk1"));
 
-    auto s = parsePartFilePath("shadow/bk1/store/uui/uuid-1/all_1_1_0/data.bin");
+    auto s = parsePartFilePath("shadow/bk1/store/a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin");
     ASSERT_TRUE(s.has_value());
-    EXPECT_EQ(s->table_uuid, "uuid-1");
+    EXPECT_EQ(s->table_uuid, "a11a11a1-1111-4111-8111-111111111111");
     EXPECT_EQ(s->part_name, "all_1_1_0");
     EXPECT_EQ(s->file, "data.bin");
     EXPECT_EQ(s->backup_name, "bk1");
-    EXPECT_EQ(s->shadow_table_dir, "shadow/bk1/store/uui/uuid-1");
+    EXPECT_EQ(s->shadow_table_dir, "shadow/bk1/store/a11/a11a11a1-1111-4111-8111-111111111111");
 }
 
 TEST(CaPartPathParser, DetachedPathsReportTheSharedDetachedComponent)
 {
     // The PoC contract (B36): "detached" parses as the part_name; the real detached part dir is
     // the first component of `file`. The transaction/read routing re-splits on this shape.
-    auto d = parsePartFilePath("uui/uuid-1/detached/attaching_all_0_0_0/metadata_version.txt");
+    auto d = parsePartFilePath("a11/a11a11a1-1111-4111-8111-111111111111/detached/attaching_all_0_0_0/metadata_version.txt");
     ASSERT_TRUE(d.has_value());
-    EXPECT_EQ(d->table_uuid, "uuid-1");
+    EXPECT_EQ(d->table_uuid, "a11a11a1-1111-4111-8111-111111111111");
     EXPECT_EQ(d->part_name, std::string(kDetachedDirName));
     EXPECT_EQ(d->file, "attaching_all_0_0_0/metadata_version.txt");
 }
@@ -140,9 +169,9 @@ TEST(CaPartPathParser, MovingPathsReportTheSharedMovingComponent)
 {
     // Atomic layout: "moving" lands on part_idx for free (it is the component right after the
     // table <uuid>, same mechanism as "detached" -- no parser change needed here, only route()).
-    auto d = parsePartFilePath("uui/uuid-1/moving/all_1_1_0/data.bin");
+    auto d = parsePartFilePath("a11/a11a11a1-1111-4111-8111-111111111111/moving/all_1_1_0/data.bin");
     ASSERT_TRUE(d.has_value());
-    EXPECT_EQ(d->table_uuid, "uuid-1");
+    EXPECT_EQ(d->table_uuid, "a11a11a1-1111-4111-8111-111111111111");
     EXPECT_EQ(d->part_name, std::string(kMovingDirName));
     EXPECT_EQ(d->file, "all_1_1_0/data.bin");
 }
@@ -214,14 +243,14 @@ TEST(CaPartPathParser, RawPathSplitMemoizedAcrossClassifiers)
     // per logical file-open (existsFile -> getFileSize -> getStorageObjects). The split is a pure
     // function of the path, so all of those must split the path exactly ONCE (B1).
     resetSplitCacheForTest();
-    const std::string path = "store/uui/uuid-1/all_1_1_0/columns.txt";
+    const std::string path = "store/a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/columns.txt";
     EXPECT_TRUE(isPartFilePath(path));
     ASSERT_TRUE(parsePartFilePath(path).has_value());
     ASSERT_TRUE(parsePartFilePath(path).has_value());
     EXPECT_EQ(splitCacheMissesForTest(), 1u) << "the same raw path must be split only once";
 
     // A distinct raw path is a fresh split (miss #2); repeats of it reuse the memo.
-    const std::string other = "store/uui/uuid-2/all_1_1_0/data.bin";
+    const std::string other = "store/a22/a22a22a2-2222-4222-8222-222222222222/all_1_1_0/data.bin";
     EXPECT_TRUE(isPartFilePath(other));
     EXPECT_TRUE(isPartFilePath(other));
     EXPECT_EQ(splitCacheMissesForTest(), 2u);
@@ -229,7 +258,7 @@ TEST(CaPartPathParser, RawPathSplitMemoizedAcrossClassifiers)
     // Correctness is unchanged: the memoized parse yields the same fields the direct parse would.
     const auto parsed = parsePartFilePath(path);
     ASSERT_TRUE(parsed.has_value());
-    EXPECT_EQ(parsed->table_uuid, "uuid-1");
+    EXPECT_EQ(parsed->table_uuid, "a11a11a1-1111-4111-8111-111111111111");
     EXPECT_EQ(parsed->part_name, "all_1_1_0");
     EXPECT_EQ(parsed->file, "columns.txt");
 }
@@ -243,20 +272,32 @@ TEST(CaPartPathParser, SplitCacheEvictionStaysCorrect)
     // result (a forced re-split / cache miss on the re-parse is expected and fine here — the
     // assertion is correctness under eviction, not hit rate).
     resetSplitCacheForTest();
-    const std::string first = "store/uui/uuid-1/all_1_1_0/columns.txt";
+    const std::string first = "store/a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/columns.txt";
     ASSERT_TRUE(parsePartFilePath(first).has_value());
 
     // 8 more distinct paths churn through the ring (capacity 8), evicting `first`'s slot.
+    const std::vector<std::string> table_dirs = {
+        "",
+        "a11/a11a11a1-1111-4111-8111-111111111111",
+        "a22/a22a22a2-2222-4222-8222-222222222222",
+        "a33/a33a33a3-3333-4333-8333-333333333333",
+        "a44/a44a44a4-4444-4444-8444-444444444444",
+        "a55/a55a55a5-5555-4555-8555-555555555555",
+        "a66/a66a66a6-6666-4666-8666-666666666666",
+        "a77/a77a77a7-7777-4777-8777-777777777777",
+        "a88/a88a88a8-8888-4888-8888-888888888888",
+        "a99/a99a99a9-9999-4999-8999-999999999999",
+    };
     for (int i = 2; i <= 9; ++i)
     {
-        const std::string path = "store/uui/uuid-" + std::to_string(i) + "/all_1_1_0/columns.txt";
+        const std::string path = "store/" + table_dirs[i] + "/all_1_1_0/columns.txt";
         ASSERT_TRUE(parsePartFilePath(path).has_value());
     }
 
     const size_t misses_before_reparse = splitCacheMissesForTest();
     const auto reparsed = parsePartFilePath(first);
     ASSERT_TRUE(reparsed.has_value());
-    EXPECT_EQ(reparsed->table_uuid, "uuid-1");
+    EXPECT_EQ(reparsed->table_uuid, "a11a11a1-1111-4111-8111-111111111111");
     EXPECT_EQ(reparsed->part_name, "all_1_1_0");
     EXPECT_EQ(reparsed->file, "columns.txt");
     // Confirms the re-parse really was a forced re-split (the slot was evicted), not a lucky hit.
@@ -377,48 +418,48 @@ TEST(CaWiringCapability, SupportsAtomicFileWrites)
 TEST(CaWiringRead, ResolvesPublishedPart)
 {
     auto storage = openWiringStorage();
-    publishWiredPart(*storage, storage->liveNamespace("uuid-1"), "all_1_1_0");
+    publishWiredPart(*storage, storage->liveNamespace("a11a11a1-1111-4111-8111-111111111111"), "all_1_1_0");
 
-    EXPECT_TRUE(storage->existsFile("uui/uuid-1/all_1_1_0/data.bin"));
-    EXPECT_FALSE(storage->existsFile("uui/uuid-1/all_1_1_0/missing.bin"));
-    EXPECT_EQ(storage->getFileSize("uui/uuid-1/all_1_1_0/data.bin"), 9u);
+    EXPECT_TRUE(storage->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin"));
+    EXPECT_FALSE(storage->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/missing.bin"));
+    EXPECT_EQ(storage->getFileSize("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin"), 9u);
 
-    EXPECT_TRUE(storage->existsDirectory("uui/uuid-1"));
-    EXPECT_TRUE(storage->existsDirectory("uui/uuid-1/all_1_1_0"));
-    EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/all_9_9_9"));
-    EXPECT_FALSE(storage->existsDirectory("uui/uuid-2"));
+    EXPECT_TRUE(storage->existsDirectory("a11/a11a11a1-1111-4111-8111-111111111111"));
+    EXPECT_TRUE(storage->existsDirectory("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0"));
+    EXPECT_FALSE(storage->existsDirectory("a11/a11a11a1-1111-4111-8111-111111111111/all_9_9_9"));
+    EXPECT_FALSE(storage->existsDirectory("a22/a22a22a2-2222-4222-8222-222222222222"));
 
     /// Part dir listing: nested keys collapse to their first component; the publish stamp
     /// (published_at_ms typed field) never surfaces as a dir entry — every staged file does.
-    auto names = storage->listDirectory("uui/uuid-1/all_1_1_0");
+    auto names = storage->listDirectory("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0");
     std::sort(names.begin(), names.end());
     EXPECT_EQ(names, (std::vector<std::string>{"data.bin", "metadata_version.txt", "p.proj", "uuid.txt"}));
 
-    auto parts = storage->listDirectory("uui/uuid-1");
+    auto parts = storage->listDirectory("a11/a11a11a1-1111-4111-8111-111111111111");
     EXPECT_EQ(parts, (std::vector<std::string>{"all_1_1_0"}));
 
     /// The part dir reports EMPTY (virtual files; B45) so removeDirectory goes straight to the
     /// ref-unlink; the table dir keeps listing-based emptiness.
-    EXPECT_TRUE(storage->isDirectoryEmpty("uui/uuid-1/all_1_1_0"));
-    EXPECT_FALSE(storage->isDirectoryEmpty("uui/uuid-1"));
+    EXPECT_TRUE(storage->isDirectoryEmpty("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0"));
+    EXPECT_FALSE(storage->isDirectoryEmpty("a11/a11a11a1-1111-4111-8111-111111111111"));
 
     /// Blob-backed file: a real key, PAYLOAD-sized (the envelope header is a read-path concern).
-    auto objects = storage->getStorageObjects("uui/uuid-1/all_1_1_0/data.bin");
+    auto objects = storage->getStorageObjects("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin");
     ASSERT_EQ(objects.size(), 1u);
     EXPECT_FALSE(objects[0].remote_path.empty());
     EXPECT_EQ(objects[0].bytes_size, 9u);
 
     /// Small Inline entry: bytes live in the shard manifest, not as their own object.
-    EXPECT_TRUE(storage->existsFile("uui/uuid-1/all_1_1_0/uuid.txt"));
-    EXPECT_EQ(storage->getFileSize("uui/uuid-1/all_1_1_0/uuid.txt"), 5u);
-    EXPECT_EQ(storage->tryGetInManifestBytes("uui/uuid-1/all_1_1_0/uuid.txt"), std::optional<String>("u-123"));
-    auto mobj = storage->getStorageObjects("uui/uuid-1/all_1_1_0/uuid.txt");
+    EXPECT_TRUE(storage->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/uuid.txt"));
+    EXPECT_EQ(storage->getFileSize("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/uuid.txt"), 5u);
+    EXPECT_EQ(storage->tryGetInManifestBytes("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/uuid.txt"), std::optional<String>("u-123"));
+    auto mobj = storage->getStorageObjects("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/uuid.txt");
     ASSERT_EQ(mobj.size(), 1u);
     EXPECT_TRUE(mobj[0].remote_path.empty());   /// sized placeholder; bytes ride prepareInManifestRead
 
     /// The typed publish stamp (published_at_ms epoch ms) backs getLastModified for the part dir and its files.
-    EXPECT_EQ(storage->getLastModified("uui/uuid-1/all_1_1_0").epochTime(), 1700000000);
-    EXPECT_EQ(storage->getLastModified("uui/uuid-1/all_1_1_0/data.bin").epochTime(), 1700000000);
+    EXPECT_EQ(storage->getLastModified("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0").epochTime(), 1700000000);
+    EXPECT_EQ(storage->getLastModified("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin").epochTime(), 1700000000);
 }
 
 TEST(CaWiringRead, BlobViewPlanRidesTheStandardPipeline)
@@ -433,11 +474,11 @@ TEST(CaWiringRead, BlobViewPlanRidesTheStandardPipeline)
         object_storage, "pool", "srv1", "test",
         std::filesystem::temp_directory_path() / "ca_wiring_scratch", nullptr);
     storage->startup();
-    publishWiredPart(*storage, storage->liveNamespace("uuid-1"), "all_1_1_0");
+    publishWiredPart(*storage, storage->liveNamespace("a11a11a1-1111-4111-8111-111111111111"), "all_1_1_0");
 
     /// In-manifest file: memory source, no blob plan.
     DB::ReadPipeline manifest_pipeline;
-    ASSERT_TRUE(storage->prepareInManifestRead("uui/uuid-1/all_1_1_0/uuid.txt", DB::ReadSettings{}, manifest_pipeline));
+    ASSERT_TRUE(storage->prepareInManifestRead("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/uuid.txt", DB::ReadSettings{}, manifest_pipeline));
     String manifest_bytes;
     {
         auto buf = manifest_pipeline.build();
@@ -454,7 +495,7 @@ TEST(CaWiringRead, BlobViewPlanRidesTheStandardPipeline)
 
     /// Blob-backed file: a real physical key and a payload-sized window whose extent equals
     /// the object's readable size (a right-bounded read never overshoots the window).
-    const std::string path = "uui/uuid-1/all_1_1_0/data.bin";
+    const std::string path = "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin";
     auto plan = storage->getBlobViewPlan(path);
     ASSERT_TRUE(plan.has_value());
     EXPECT_FALSE(plan->object.remote_path.empty());
@@ -510,14 +551,14 @@ TEST(CaWiringRead, BlobViewPlanRidesTheStandardPipeline)
 TEST(CaWiringRead, ProjectionDirectory)
 {
     auto storage = openWiringStorage();
-    publishWiredPart(*storage, storage->liveNamespace("uuid-1"), "all_1_1_0");
+    publishWiredPart(*storage, storage->liveNamespace("a11a11a1-1111-4111-8111-111111111111"), "all_1_1_0");
 
-    EXPECT_TRUE(storage->existsDirectory("uui/uuid-1/all_1_1_0/p.proj"));
-    EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/all_1_1_0/q.proj"));
-    EXPECT_EQ(storage->listDirectory("uui/uuid-1/all_1_1_0/p.proj"), (std::vector<std::string>{"data.bin"}));
-    EXPECT_TRUE(storage->isDirectoryEmpty("uui/uuid-1/all_1_1_0/p.proj"));   /// B60
-    EXPECT_TRUE(storage->existsFile("uui/uuid-1/all_1_1_0/p.proj/data.bin"));
-    EXPECT_EQ(storage->getFileSize("uui/uuid-1/all_1_1_0/p.proj/data.bin"), 9u);
+    EXPECT_TRUE(storage->existsDirectory("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/p.proj"));
+    EXPECT_FALSE(storage->existsDirectory("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/q.proj"));
+    EXPECT_EQ(storage->listDirectory("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/p.proj"), (std::vector<std::string>{"data.bin"}));
+    EXPECT_TRUE(storage->isDirectoryEmpty("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/p.proj"));   /// B60
+    EXPECT_TRUE(storage->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/p.proj/data.bin"));
+    EXPECT_EQ(storage->getFileSize("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/p.proj/data.bin"), 9u);
 }
 
 TEST(CaWiringRead, DetachedFoldedIntoTableNamespace)
@@ -527,29 +568,29 @@ TEST(CaWiringRead, DetachedFoldedIntoTableNamespace)
     /// not a separate sibling namespace. Publish it that way through the core, and ALSO a live part
     /// that shares the same base name to prove the live↔detached collision is impossible (the ref
     /// names `all_1_1_0` and `detached/all_1_1_0` differ — one namespace, no re-split needed).
-    publishWiredPart(*storage, storage->liveNamespace("uuid-1"), "detached/broken_all_1_1_0");
-    publishWiredPart(*storage, storage->liveNamespace("uuid-1"), "broken_all_1_1_0");
+    publishWiredPart(*storage, storage->liveNamespace("a11a11a1-1111-4111-8111-111111111111"), "detached/broken_all_1_1_0");
+    publishWiredPart(*storage, storage->liveNamespace("a11a11a1-1111-4111-8111-111111111111"), "broken_all_1_1_0");
 
     /// The TABLE dir collapses the `detached/<part>` refs to the single `detached` subdir entry
     /// alongside the live part name.
-    auto top = storage->listDirectory("uui/uuid-1");
+    auto top = storage->listDirectory("a11/a11a11a1-1111-4111-8111-111111111111");
     std::sort(top.begin(), top.end());
     EXPECT_EQ(top, (std::vector<std::string>{"broken_all_1_1_0", "detached"}));
 
     /// The detached CONTAINER lists the detached part DIRECTORY names (B36's intent), prefix-stripped
     /// — and NOT the live part of the same base name.
-    EXPECT_TRUE(storage->existsDirectory("uui/uuid-1/detached"));
-    EXPECT_EQ(storage->listDirectory("uui/uuid-1/detached"), (std::vector<std::string>{"broken_all_1_1_0"}));
+    EXPECT_TRUE(storage->existsDirectory("a11/a11a11a1-1111-4111-8111-111111111111/detached"));
+    EXPECT_EQ(storage->listDirectory("a11/a11a11a1-1111-4111-8111-111111111111/detached"), (std::vector<std::string>{"broken_all_1_1_0"}));
     /// A single detached part dir + its files (the detached part is its own `detached/`-prefixed ref).
-    EXPECT_TRUE(storage->existsDirectory("uui/uuid-1/detached/broken_all_1_1_0"));
-    auto names = storage->listDirectory("uui/uuid-1/detached/broken_all_1_1_0");
+    EXPECT_TRUE(storage->existsDirectory("a11/a11a11a1-1111-4111-8111-111111111111/detached/broken_all_1_1_0"));
+    auto names = storage->listDirectory("a11/a11a11a1-1111-4111-8111-111111111111/detached/broken_all_1_1_0");
     std::sort(names.begin(), names.end());
     EXPECT_EQ(names, (std::vector<std::string>{"data.bin", "metadata_version.txt", "p.proj", "uuid.txt"}));
     /// The B62 shape: a detached part's mutable file resolves through the `detached/`-prefixed ref.
-    EXPECT_TRUE(storage->existsFile("uui/uuid-1/detached/broken_all_1_1_0/metadata_version.txt"));
-    EXPECT_EQ(storage->tryGetInManifestBytes("uui/uuid-1/detached/broken_all_1_1_0/metadata_version.txt"),
+    EXPECT_TRUE(storage->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/detached/broken_all_1_1_0/metadata_version.txt"));
+    EXPECT_EQ(storage->tryGetInManifestBytes("a11/a11a11a1-1111-4111-8111-111111111111/detached/broken_all_1_1_0/metadata_version.txt"),
               std::optional<String>("5"));
-    EXPECT_TRUE(storage->existsFile("uui/uuid-1/detached/broken_all_1_1_0/data.bin"));
+    EXPECT_TRUE(storage->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/detached/broken_all_1_1_0/data.bin"));
 }
 
 TEST(CaWiringRoute, DetachedFoldsIntoTableNamespaceWithPrefixedRef)
@@ -557,20 +598,20 @@ TEST(CaWiringRoute, DetachedFoldsIntoTableNamespaceWithPrefixedRef)
     /// B181: a detached part file routes to the table's OWN archive namespace under a
     /// `detached/`-prefixed ref — NOT a separate sibling namespace.
     auto storage = openWiringStorage();
-    auto p = parsePartFilePath("store/uui/uuid-1/detached/broken_all_1_1_0/data.bin");
+    auto p = parsePartFilePath("store/a11/a11a11a1-1111-4111-8111-111111111111/detached/broken_all_1_1_0/data.bin");
     ASSERT_TRUE(p.has_value());
     auto r = storage->route(*p);
     ASSERT_TRUE(r.has_value());
-    EXPECT_EQ(r->ns.string(), storage->liveNamespace("uuid-1").string());
+    EXPECT_EQ(r->ns.string(), storage->liveNamespace("a11a11a1-1111-4111-8111-111111111111").string());
     EXPECT_EQ(r->ref, "detached/broken_all_1_1_0");
     EXPECT_EQ(r->file, "data.bin");
 
     /// The detached CONTAINER dir routes to the table ns with an empty ref (filtered listing).
-    auto pc = parsePartFilePath("store/uui/uuid-1/detached/broken_all_1_1_0");
+    auto pc = parsePartFilePath("store/a11/a11a11a1-1111-4111-8111-111111111111/detached/broken_all_1_1_0");
     ASSERT_TRUE(pc.has_value());
     auto rc = storage->route(*pc);
     ASSERT_TRUE(rc.has_value());
-    EXPECT_EQ(rc->ns.string(), storage->liveNamespace("uuid-1").string());
+    EXPECT_EQ(rc->ns.string(), storage->liveNamespace("a11a11a1-1111-4111-8111-111111111111").string());
     EXPECT_EQ(rc->ref, "detached/broken_all_1_1_0");
     EXPECT_TRUE(rc->file.empty());
 }
@@ -585,23 +626,23 @@ TEST(CaWiringRoute, MovingFoldsOntoAPrefixedStagingRef)
     /// swap). The staging ref keeps the pre-swap clone un-live; the mover's rename does a real ref
     /// repoint moving/<part> -> <part>.
     auto storage = openWiringStorage();
-    auto p = parsePartFilePath("store/uui/uuid-1/moving/all_1_1_0/data.bin");
+    auto p = parsePartFilePath("store/a11/a11a11a1-1111-4111-8111-111111111111/moving/all_1_1_0/data.bin");
     ASSERT_TRUE(p.has_value());
     EXPECT_EQ(p->part_name, std::string(kMovingDirName));
     EXPECT_EQ(p->file, "all_1_1_0/data.bin");
 
     auto r = storage->route(*p);
     ASSERT_TRUE(r.has_value());
-    EXPECT_EQ(r->ns.string(), storage->liveNamespace("uuid-1").string());
+    EXPECT_EQ(r->ns.string(), storage->liveNamespace("a11a11a1-1111-4111-8111-111111111111").string());
     EXPECT_EQ(r->ref, "moving/all_1_1_0");
     EXPECT_EQ(r->file, "data.bin");
 
     /// The bare moving CONTAINER dir TABLE/moving routes to the table ns with an empty ref.
-    auto pc = parsePartFilePath("store/uui/uuid-1/moving");
+    auto pc = parsePartFilePath("store/a11/a11a11a1-1111-4111-8111-111111111111/moving");
     ASSERT_TRUE(pc.has_value());
     auto rc = storage->route(*pc);
     ASSERT_TRUE(rc.has_value());
-    EXPECT_EQ(rc->ns.string(), storage->liveNamespace("uuid-1").string());
+    EXPECT_EQ(rc->ns.string(), storage->liveNamespace("a11a11a1-1111-4111-8111-111111111111").string());
     EXPECT_TRUE(rc->ref.empty());
     EXPECT_TRUE(rc->file.empty());
 }
@@ -609,7 +650,7 @@ TEST(CaWiringRoute, MovingFoldsOntoAPrefixedStagingRef)
 TEST(CaWiringRead, ShadowFreezeTree)
 {
     auto storage = openWiringStorage();
-    publishWiredPart(*storage, DB::ContentAddressedMetadataStorage::shadowNamespace("shadow/bk1/store/uui/uuid-1"), "all_1_1_0");
+    publishWiredPart(*storage, DB::ContentAddressedMetadataStorage::shadowNamespace("shadow/bk1/store/a11/a11a11a1-1111-4111-8111-111111111111"), "all_1_1_0");
 
     /// Intermediate dirs derive from the registered shadow namespaces.
     EXPECT_TRUE(storage->existsDirectory("shadow/bk1"));
@@ -617,48 +658,48 @@ TEST(CaWiringRead, ShadowFreezeTree)
     EXPECT_FALSE(storage->existsDirectory("shadow/bk2"));
     EXPECT_EQ(storage->listDirectory("shadow"), (std::vector<std::string>{"bk1"}));
     EXPECT_EQ(storage->listDirectory("shadow/bk1"), (std::vector<std::string>{"store"}));
-    EXPECT_EQ(storage->listDirectory("shadow/bk1/store"), (std::vector<std::string>{"uui"}));
-    EXPECT_EQ(storage->listDirectory("shadow/bk1/store/uui"), (std::vector<std::string>{"uuid-1"}));
+    EXPECT_EQ(storage->listDirectory("shadow/bk1/store"), (std::vector<std::string>{"a11"}));
+    EXPECT_EQ(storage->listDirectory("shadow/bk1/store/a11"), (std::vector<std::string>{"a11a11a1-1111-4111-8111-111111111111"}));
     /// Shadow TABLE dir (strict uuid-pair anchor) and PART dir.
-    EXPECT_TRUE(storage->existsDirectory("shadow/bk1/store/uui/uuid-1"));
-    EXPECT_EQ(storage->listDirectory("shadow/bk1/store/uui/uuid-1"), (std::vector<std::string>{"all_1_1_0"}));
-    EXPECT_TRUE(storage->existsDirectory("shadow/bk1/store/uui/uuid-1/all_1_1_0"));
-    auto names = storage->listDirectory("shadow/bk1/store/uui/uuid-1/all_1_1_0");
+    EXPECT_TRUE(storage->existsDirectory("shadow/bk1/store/a11/a11a11a1-1111-4111-8111-111111111111"));
+    EXPECT_EQ(storage->listDirectory("shadow/bk1/store/a11/a11a11a1-1111-4111-8111-111111111111"), (std::vector<std::string>{"all_1_1_0"}));
+    EXPECT_TRUE(storage->existsDirectory("shadow/bk1/store/a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0"));
+    auto names = storage->listDirectory("shadow/bk1/store/a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0");
     std::sort(names.begin(), names.end());
     EXPECT_EQ(names, (std::vector<std::string>{"data.bin", "metadata_version.txt", "p.proj", "uuid.txt"}));
-    EXPECT_TRUE(storage->existsFile("shadow/bk1/store/uui/uuid-1/all_1_1_0/data.bin"));
-    EXPECT_EQ(storage->getFileSize("shadow/bk1/store/uui/uuid-1/all_1_1_0/data.bin"), 9u);
+    EXPECT_TRUE(storage->existsFile("shadow/bk1/store/a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin"));
+    EXPECT_EQ(storage->getFileSize("shadow/bk1/store/a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin"), 9u);
 }
 
 TEST(CaWiringRead, VerbatimNamespaceFiles)
 {
     auto storage = openWiringStorage();
-    EXPECT_TRUE(storage->liveNamespace("uuid-1").string().starts_with("test/"))
-        << storage->liveNamespace("uuid-1").string();
-    EXPECT_NE(storage->liveNamespace("uuid-1").string().find("/store/uui/uuid-1@cas@"), std::string::npos)
-        << storage->liveNamespace("uuid-1").string();
+    EXPECT_TRUE(storage->liveNamespace("a11a11a1-1111-4111-8111-111111111111").string().starts_with("test/"))
+        << storage->liveNamespace("a11a11a1-1111-4111-8111-111111111111").string();
+    EXPECT_NE(storage->liveNamespace("a11a11a1-1111-4111-8111-111111111111").string().find("/store/a11/a11a11a1-1111-4111-8111-111111111111@cas@"), std::string::npos)
+        << storage->liveNamespace("a11a11a1-1111-4111-8111-111111111111").string();
 
-    publishWiredPart(*storage, storage->liveNamespace("uuid-1"), "all_1_1_0");
-    storage->store()->putNamespaceFile(storage->liveNamespace("uuid-1"), "format_version.txt", "1\n");
+    publishWiredPart(*storage, storage->liveNamespace("a11a11a1-1111-4111-8111-111111111111"), "all_1_1_0");
+    storage->store()->putNamespaceFile(storage->liveNamespace("a11a11a1-1111-4111-8111-111111111111"), "format_version.txt", "1\n");
     storage->store()->putNamespaceFile(
-        storage->liveNamespace("uuid-1"), "deduplication_logs/deduplication_log_1.txt", "log-bytes");
+        storage->liveNamespace("a11a11a1-1111-4111-8111-111111111111"), "deduplication_logs/deduplication_log_1.txt", "log-bytes");
     /// Loose disk-root files are plain mountpoint objects (design §5.2), not namespace files.
     storage->store()->putMountpointObject(storage->serverRootId() + "/" + "clickhouse_access_check_xyz", "ok");
 
-    EXPECT_TRUE(storage->existsFile("uui/uuid-1/format_version.txt"));
-    EXPECT_EQ(storage->getFileSize("uui/uuid-1/format_version.txt"), 2u);
-    EXPECT_EQ(storage->tryGetInManifestBytes("uui/uuid-1/format_version.txt"), std::optional<String>("1\n"));
+    EXPECT_TRUE(storage->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/format_version.txt"));
+    EXPECT_EQ(storage->getFileSize("a11/a11a11a1-1111-4111-8111-111111111111/format_version.txt"), 2u);
+    EXPECT_EQ(storage->tryGetInManifestBytes("a11/a11a11a1-1111-4111-8111-111111111111/format_version.txt"), std::optional<String>("1\n"));
 
     /// Table dir listing merges part names + verbatim file first components.
-    auto names = storage->listDirectory("uui/uuid-1");
+    auto names = storage->listDirectory("a11/a11a11a1-1111-4111-8111-111111111111");
     std::sort(names.begin(), names.end());
     EXPECT_EQ(names, (std::vector<std::string>{"all_1_1_0", "deduplication_logs", "format_version.txt"}));
 
     /// The reserved table-level subdir.
-    EXPECT_TRUE(storage->existsDirectory("uui/uuid-1/deduplication_logs"));
-    EXPECT_EQ(storage->listDirectory("uui/uuid-1/deduplication_logs"),
+    EXPECT_TRUE(storage->existsDirectory("a11/a11a11a1-1111-4111-8111-111111111111/deduplication_logs"));
+    EXPECT_EQ(storage->listDirectory("a11/a11a11a1-1111-4111-8111-111111111111/deduplication_logs"),
               (std::vector<std::string>{"deduplication_log_1.txt"}));
-    EXPECT_TRUE(storage->existsFile("uui/uuid-1/deduplication_logs/deduplication_log_1.txt"));
+    EXPECT_TRUE(storage->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/deduplication_logs/deduplication_log_1.txt"));
 
     /// Loose disk-root files are plain objects — existsFile checks the mountpoint object, not a namespace file.
     EXPECT_TRUE(storage->existsFile("clickhouse_access_check_xyz"));
@@ -674,18 +715,18 @@ TEST(CaWiringRead, VerbatimNamespaceFiles)
 TEST(CaWiringRoute, DirShapeDispatchOrderIsStable)
 {
     auto storage = openWiringStorage();
-    publishWiredPart(*storage, storage->liveNamespace("uuid-1"), "all_1_1_0");
-    publishWiredPart(*storage, DB::ContentAddressedMetadataStorage::shadowNamespace("shadow/bk1/store/uui/uuid-1"), "all_1_1_0");
+    publishWiredPart(*storage, storage->liveNamespace("a11a11a1-1111-4111-8111-111111111111"), "all_1_1_0");
+    publishWiredPart(*storage, DB::ContentAddressedMetadataStorage::shadowNamespace("shadow/bk1/store/a11/a11a11a1-1111-4111-8111-111111111111"), "all_1_1_0");
 
     using DS = DB::ContentAddressedMetadataStorage::DirShape;
     EXPECT_EQ(storage->classifyDirectoryForTest("store/uui").shape,             DS::AtomicShard);
-    EXPECT_EQ(storage->classifyDirectoryForTest("uui/uuid-1").shape,            DS::TableDir);
-    EXPECT_EQ(storage->classifyDirectoryForTest("uui/uuid-1/all_1_1_0").shape,  DS::PartDir);
-    EXPECT_EQ(storage->classifyDirectoryForTest("uui/uuid-1/detached").shape,   DS::DetachedContainer);
-    EXPECT_EQ(storage->classifyDirectoryForTest("uui/uuid-1/moving").shape,    DS::MovingContainer);
-    EXPECT_EQ(storage->classifyDirectoryForTest("shadow/bk1/store/uui/uuid-1").shape, DS::ShadowTable);
+    EXPECT_EQ(storage->classifyDirectoryForTest("a11/a11a11a1-1111-4111-8111-111111111111").shape,            DS::TableDir);
+    EXPECT_EQ(storage->classifyDirectoryForTest("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0").shape,  DS::PartDir);
+    EXPECT_EQ(storage->classifyDirectoryForTest("a11/a11a11a1-1111-4111-8111-111111111111/detached").shape,   DS::DetachedContainer);
+    EXPECT_EQ(storage->classifyDirectoryForTest("a11/a11a11a1-1111-4111-8111-111111111111/moving").shape,    DS::MovingContainer);
+    EXPECT_EQ(storage->classifyDirectoryForTest("shadow/bk1/store/a11/a11a11a1-1111-4111-8111-111111111111").shape, DS::ShadowTable);
     EXPECT_EQ(storage->classifyDirectoryForTest("shadow/bk1").shape,            DS::ShadowIntermediate);
-    EXPECT_EQ(storage->classifyDirectoryForTest("uui/uuid-1/deduplication_logs").shape, DS::TableSubdir);
+    EXPECT_EQ(storage->classifyDirectoryForTest("a11/a11a11a1-1111-4111-8111-111111111111/deduplication_logs").shape, DS::TableSubdir);
     EXPECT_EQ(storage->classifyDirectoryForTest("store").shape,                 DS::GenericIntermediate);
 }
 
@@ -710,22 +751,22 @@ TEST(CaWiringWrite, ContentRoundTripThroughTransaction)
     auto storage = openWiringStorage();
 
     auto tx = storage->createTransaction();
-    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/data.bin", "content-A");
-    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/checksums.txt", "sums");
-    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/uuid.txt", "u-42");
+    writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin", "content-A");
+    writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/checksums.txt", "sums");
+    writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/uuid.txt", "u-42");
     /// Nothing visible before commit.
-    EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/all_1_1_0"));
+    EXPECT_FALSE(storage->existsDirectory("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0"));
     tx->commit(DB::NoCommitOptions{});
 
-    EXPECT_TRUE(storage->existsDirectory("uui/uuid-1/all_1_1_0"));
-    EXPECT_TRUE(storage->existsFile("uui/uuid-1/all_1_1_0/data.bin"));
-    EXPECT_EQ(storage->getFileSize("uui/uuid-1/all_1_1_0/data.bin"), 9u);
-    EXPECT_EQ(storage->tryGetInManifestBytes("uui/uuid-1/all_1_1_0/uuid.txt"), std::optional<String>("u-42"));
-    auto names = storage->listDirectory("uui/uuid-1/all_1_1_0");
+    EXPECT_TRUE(storage->existsDirectory("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0"));
+    EXPECT_TRUE(storage->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin"));
+    EXPECT_EQ(storage->getFileSize("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin"), 9u);
+    EXPECT_EQ(storage->tryGetInManifestBytes("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/uuid.txt"), std::optional<String>("u-42"));
+    auto names = storage->listDirectory("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0");
     std::sort(names.begin(), names.end());
     EXPECT_EQ(names, (std::vector<std::string>{"checksums.txt", "data.bin", "uuid.txt"}));
     /// The publish stamp was added automatically and is filtered from listings.
-    EXPECT_GT(storage->getLastModified("uui/uuid-1/all_1_1_0").epochTime(), 1700000000);
+    EXPECT_GT(storage->getLastModified("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0").epochTime(), 1700000000);
 }
 
 TEST(CaWiringWrite, InlineOnlyPartPublishesWithoutBuildCrash)
@@ -740,14 +781,14 @@ TEST(CaWiringWrite, InlineOnlyPartPublishesWithoutBuildCrash)
     /// feature; fix: the inline path now calls `buildFor` like the blob path.)
     auto storage = openWiringStorage();
     auto tx = storage->createTransaction();
-    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/checksums.txt", "sums");   // inline (no blob)
-    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/count.txt", "0");          // inline (no blob)
+    writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/checksums.txt", "sums");   // inline (no blob)
+    writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/count.txt", "0");          // inline (no blob)
     EXPECT_NO_THROW(tx->commit(DB::NoCommitOptions{}));
 
-    EXPECT_TRUE(storage->existsDirectory("uui/uuid-1/all_1_1_0"));
-    EXPECT_EQ(storage->tryGetInManifestBytes("uui/uuid-1/all_1_1_0/checksums.txt"), std::optional<String>("sums"));
-    EXPECT_EQ(storage->tryGetInManifestBytes("uui/uuid-1/all_1_1_0/count.txt"), std::optional<String>("0"));
-    auto names = storage->listDirectory("uui/uuid-1/all_1_1_0");
+    EXPECT_TRUE(storage->existsDirectory("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0"));
+    EXPECT_EQ(storage->tryGetInManifestBytes("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/checksums.txt"), std::optional<String>("sums"));
+    EXPECT_EQ(storage->tryGetInManifestBytes("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/count.txt"), std::optional<String>("0"));
+    auto names = storage->listDirectory("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0");
     std::sort(names.begin(), names.end());
     EXPECT_EQ(names, (std::vector<std::string>{"checksums.txt", "count.txt"}));
 }
@@ -757,15 +798,15 @@ TEST(CaWiringWrite, IdenticalContentDedupsToOneBlob)
     auto storage = openWiringStorage();
 
     auto tx = storage->createTransaction();
-    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/data.bin", "same-bytes");
+    writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin", "same-bytes");
     tx->commit(DB::NoCommitOptions{});
     auto tx2 = storage->createTransaction();
-    writeThroughTransaction(*tx2, "uui/uuid-1/all_2_2_0/data.bin", "same-bytes");
+    writeThroughTransaction(*tx2, "a11/a11a11a1-1111-4111-8111-111111111111/all_2_2_0/data.bin", "same-bytes");
     tx2->commit(DB::NoCommitOptions{});
 
     /// Identical content => the SAME blob object (the key is the content hash).
-    auto a = storage->getStorageObjects("uui/uuid-1/all_1_1_0/data.bin");
-    auto b = storage->getStorageObjects("uui/uuid-1/all_2_2_0/data.bin");
+    auto a = storage->getStorageObjects("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin");
+    auto b = storage->getStorageObjects("a11/a11a11a1-1111-4111-8111-111111111111/all_2_2_0/data.bin");
     ASSERT_EQ(a.size(), 1u);
     ASSERT_EQ(b.size(), 1u);
     EXPECT_EQ(a[0].remote_path, b[0].remote_path);
@@ -776,29 +817,29 @@ TEST(CaWiringWrite, UncommittedTransactionPublishesNothing)
     auto storage = openWiringStorage();
     {
         auto tx = storage->createTransaction();
-        writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/data.bin", "doomed");
+        writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin", "doomed");
         /// destroyed without commit => PartWriteTxn abandoned (uploads are heartbeat-gated debris)
     }
-    EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/all_1_1_0"));
-    EXPECT_FALSE(storage->existsFile("uui/uuid-1/all_1_1_0/data.bin"));
+    EXPECT_FALSE(storage->existsDirectory("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0"));
+    EXPECT_FALSE(storage->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin"));
 }
 
 TEST(CaWiringWrite, MutableOnlyUpdateOnCommittedPart)
 {
     auto storage = openWiringStorage();
     auto tx = storage->createTransaction();
-    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/data.bin", "content-A");
-    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/txn_version.txt", "v1");
+    writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin", "content-A");
+    writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/txn_version.txt", "v1");
     tx->commit(DB::NoCommitOptions{});
 
     /// The MVCC autocommit one-shot shape: a fresh transaction rewriting ONLY a mutable file of a
     /// COMMITTED part goes through updateRefPayload (no tree rebuild, no journal record).
     auto tx2 = storage->createTransaction();
-    writeThroughTransaction(*tx2, "uui/uuid-1/all_1_1_0/txn_version.txt", "v2");
+    writeThroughTransaction(*tx2, "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/txn_version.txt", "v2");
     tx2->commit(DB::NoCommitOptions{});
 
-    EXPECT_EQ(storage->tryGetInManifestBytes("uui/uuid-1/all_1_1_0/txn_version.txt"), std::optional<String>("v2"));
-    EXPECT_TRUE(storage->existsFile("uui/uuid-1/all_1_1_0/data.bin"));   /// the tree is untouched
+    EXPECT_EQ(storage->tryGetInManifestBytes("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/txn_version.txt"), std::optional<String>("v2"));
+    EXPECT_TRUE(storage->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin"));   /// the tree is untouched
 }
 
 TEST(CaWiringWrite, VerbatimFilesDurableOnFinalizeAndAppendable)
@@ -807,17 +848,17 @@ TEST(CaWiringWrite, VerbatimFilesDurableOnFinalizeAndAppendable)
     auto tx = storage->createTransaction();
     /// Verbatim files are durable on FINALIZE, with no commit (the disk layer's autocommit
     /// contract for table-level files).
-    writeThroughTransaction(*tx, "uui/uuid-1/mutation_5.txt", "commands\n");
-    EXPECT_TRUE(storage->existsFile("uui/uuid-1/mutation_5.txt"));
+    writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/mutation_5.txt", "commands\n");
+    EXPECT_TRUE(storage->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/mutation_5.txt"));
 
     /// Append = read-modify-rewrite (the MVCC mutation-entry CSN append).
     {
         auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
-        auto buf = ca_tx.writeFile("uui/uuid-1/mutation_5.txt", 65536, DB::WriteMode::Append, {});
+        auto buf = ca_tx.writeFile("a11/a11a11a1-1111-4111-8111-111111111111/mutation_5.txt", 65536, DB::WriteMode::Append, {});
         buf->write("csn 42\n", 7);
         buf->finalize();
     }
-    EXPECT_EQ(storage->tryGetInManifestBytes("uui/uuid-1/mutation_5.txt"),
+    EXPECT_EQ(storage->tryGetInManifestBytes("a11/a11a11a1-1111-4111-8111-111111111111/mutation_5.txt"),
               std::optional<String>("commands\ncsn 42\n"));
 }
 
@@ -827,106 +868,106 @@ TEST(CaWiringOps, HardLinkCarriesForwardWithoutReupload)
 {
     auto storage = openWiringStorage();
     auto tx = storage->createTransaction();
-    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/data.bin", "shared-payload");
-    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/uuid.txt", "u-1");
+    writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin", "shared-payload");
+    writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/uuid.txt", "u-1");
     tx->commit(DB::NoCommitOptions{});
 
     /// A mutation/merge carries unchanged files into the new part by hardlink.
     auto tx2 = storage->createTransaction();
-    tx2->createHardLink("uui/uuid-1/all_1_1_0/data.bin", "uui/uuid-1/all_1_1_5/data.bin");
-    tx2->createHardLink("uui/uuid-1/all_1_1_0/uuid.txt", "uui/uuid-1/all_1_1_5/uuid.txt");
+    tx2->createHardLink("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin", "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_5/data.bin");
+    tx2->createHardLink("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/uuid.txt", "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_5/uuid.txt");
     tx2->commit(DB::NoCommitOptions{});
 
-    EXPECT_TRUE(storage->existsFile("uui/uuid-1/all_1_1_5/data.bin"));
-    EXPECT_EQ(storage->getStorageObjects("uui/uuid-1/all_1_1_0/data.bin")[0].remote_path,
-              storage->getStorageObjects("uui/uuid-1/all_1_1_5/data.bin")[0].remote_path);
-    EXPECT_EQ(storage->tryGetInManifestBytes("uui/uuid-1/all_1_1_5/uuid.txt"), std::optional<String>("u-1"));
+    EXPECT_TRUE(storage->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_5/data.bin"));
+    EXPECT_EQ(storage->getStorageObjects("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin")[0].remote_path,
+              storage->getStorageObjects("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_5/data.bin")[0].remote_path);
+    EXPECT_EQ(storage->tryGetInManifestBytes("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_5/uuid.txt"), std::optional<String>("u-1"));
 }
 
 TEST(CaWiringOps, TmpToFinalRenamePublishesUnderFinalName)
 {
     auto storage = openWiringStorage();
     auto tx = storage->createTransaction();
-    writeThroughTransaction(*tx, "uui/uuid-1/tmp_insert_all_1_1_0/data.bin", "fresh");
-    tx->moveDirectory("uui/uuid-1/tmp_insert_all_1_1_0", "uui/uuid-1/all_1_1_0");
+    writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/tmp_insert_all_1_1_0/data.bin", "fresh");
+    tx->moveDirectory("a11/a11a11a1-1111-4111-8111-111111111111/tmp_insert_all_1_1_0", "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0");
     tx->commit(DB::NoCommitOptions{});
 
-    EXPECT_TRUE(storage->existsDirectory("uui/uuid-1/all_1_1_0"));
-    EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/tmp_insert_all_1_1_0"));
-    EXPECT_TRUE(storage->existsFile("uui/uuid-1/all_1_1_0/data.bin"));
+    EXPECT_TRUE(storage->existsDirectory("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0"));
+    EXPECT_FALSE(storage->existsDirectory("a11/a11a11a1-1111-4111-8111-111111111111/tmp_insert_all_1_1_0"));
+    EXPECT_TRUE(storage->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin"));
 }
 
 TEST(CaWiringOps, CommittedPartRenameMovesTheRef)
 {
     auto storage = openWiringStorage();
     auto tx = storage->createTransaction();
-    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/data.bin", "bytes");
+    writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin", "bytes");
     tx->commit(DB::NoCommitOptions{});
 
     /// MergeTree renames a part to delete_tmp_<part> before removing it.
     auto tx2 = storage->createTransaction();
-    tx2->moveDirectory("uui/uuid-1/all_1_1_0", "uui/uuid-1/delete_tmp_all_1_1_0");
+    tx2->moveDirectory("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0", "a11/a11a11a1-1111-4111-8111-111111111111/delete_tmp_all_1_1_0");
     tx2->commit(DB::NoCommitOptions{});
 
-    EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/all_1_1_0"));
-    EXPECT_TRUE(storage->existsDirectory("uui/uuid-1/delete_tmp_all_1_1_0"));
-    EXPECT_TRUE(storage->existsFile("uui/uuid-1/delete_tmp_all_1_1_0/data.bin"));
+    EXPECT_FALSE(storage->existsDirectory("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0"));
+    EXPECT_TRUE(storage->existsDirectory("a11/a11a11a1-1111-4111-8111-111111111111/delete_tmp_all_1_1_0"));
+    EXPECT_TRUE(storage->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/delete_tmp_all_1_1_0/data.bin"));
 }
 
 TEST(CaWiringOps, ProjectionTmpRenameRekeysStagedEntries)
 {
     auto storage = openWiringStorage();
     auto tx = storage->createTransaction();
-    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/data.bin", "main");
-    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/p_1.tmp_proj/data.bin", "proj");
+    writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin", "main");
+    writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/p_1.tmp_proj/data.bin", "proj");
     auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
-    ca_tx.moveDirectory("uui/uuid-1/all_1_1_0/p_1.tmp_proj", "uui/uuid-1/all_1_1_0/p.proj");
+    ca_tx.moveDirectory("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/p_1.tmp_proj", "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/p.proj");
     tx->commit(DB::NoCommitOptions{});
 
-    EXPECT_TRUE(storage->existsFile("uui/uuid-1/all_1_1_0/p.proj/data.bin"));
-    EXPECT_FALSE(storage->existsFile("uui/uuid-1/all_1_1_0/p_1.tmp_proj/data.bin"));
-    EXPECT_EQ(storage->listDirectory("uui/uuid-1/all_1_1_0/p.proj"), (std::vector<std::string>{"data.bin"}));
+    EXPECT_TRUE(storage->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/p.proj/data.bin"));
+    EXPECT_FALSE(storage->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/p_1.tmp_proj/data.bin"));
+    EXPECT_EQ(storage->listDirectory("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/p.proj"), (std::vector<std::string>{"data.bin"}));
 }
 
 TEST(CaWiringOps, DetachAttachRoundTrip)
 {
     auto storage = openWiringStorage();
     auto tx = storage->createTransaction();
-    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/data.bin", "detachable");
-    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/metadata_version.txt", "3");
+    writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin", "detachable");
+    writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/metadata_version.txt", "3");
     tx->commit(DB::NoCommitOptions{});
 
     /// DETACH: a committed part moves into the detached namespace - pure ref ops.
     auto tx2 = storage->createTransaction();
-    tx2->moveDirectory("uui/uuid-1/all_1_1_0", "uui/uuid-1/detached/all_1_1_0");
+    tx2->moveDirectory("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0", "a11/a11a11a1-1111-4111-8111-111111111111/detached/all_1_1_0");
     tx2->commit(DB::NoCommitOptions{});
-    EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/all_1_1_0"));
-    EXPECT_TRUE(storage->existsDirectory("uui/uuid-1/detached/all_1_1_0"));
-    EXPECT_EQ(storage->tryGetInManifestBytes("uui/uuid-1/detached/all_1_1_0/metadata_version.txt"),
+    EXPECT_FALSE(storage->existsDirectory("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0"));
+    EXPECT_TRUE(storage->existsDirectory("a11/a11a11a1-1111-4111-8111-111111111111/detached/all_1_1_0"));
+    EXPECT_EQ(storage->tryGetInManifestBytes("a11/a11a11a1-1111-4111-8111-111111111111/detached/all_1_1_0/metadata_version.txt"),
               std::optional<String>("3"));
 
     /// ATTACH: stage-rename within detached, then publish back into the live namespace.
     auto tx3 = storage->createTransaction();
-    tx3->moveDirectory("uui/uuid-1/detached/all_1_1_0", "uui/uuid-1/detached/attaching_all_1_1_0");
+    tx3->moveDirectory("a11/a11a11a1-1111-4111-8111-111111111111/detached/all_1_1_0", "a11/a11a11a1-1111-4111-8111-111111111111/detached/attaching_all_1_1_0");
     tx3->commit(DB::NoCommitOptions{});
     auto tx4 = storage->createTransaction();
-    tx4->moveDirectory("uui/uuid-1/detached/attaching_all_1_1_0", "uui/uuid-1/all_2_2_0");
+    tx4->moveDirectory("a11/a11a11a1-1111-4111-8111-111111111111/detached/attaching_all_1_1_0", "a11/a11a11a1-1111-4111-8111-111111111111/all_2_2_0");
     tx4->commit(DB::NoCommitOptions{});
 
-    EXPECT_TRUE(storage->existsDirectory("uui/uuid-1/all_2_2_0"));
-    EXPECT_TRUE(storage->existsFile("uui/uuid-1/all_2_2_0/data.bin"));
-    EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/detached/attaching_all_1_1_0"));
-    EXPECT_EQ(storage->listDirectory("uui/uuid-1/detached"), (std::vector<std::string>{}));
+    EXPECT_TRUE(storage->existsDirectory("a11/a11a11a1-1111-4111-8111-111111111111/all_2_2_0"));
+    EXPECT_TRUE(storage->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/all_2_2_0/data.bin"));
+    EXPECT_FALSE(storage->existsDirectory("a11/a11a11a1-1111-4111-8111-111111111111/detached/attaching_all_1_1_0"));
+    EXPECT_EQ(storage->listDirectory("a11/a11a11a1-1111-4111-8111-111111111111/detached"), (std::vector<std::string>{}));
 }
 
 TEST(CaWiringOps, RemovalsDropRefsAndNamespaces)
 {
     auto storage = openWiringStorage();
     auto tx = storage->createTransaction();
-    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/data.bin", "gone-soon");
-    writeThroughTransaction(*tx, "uui/uuid-1/all_2_2_0/data.bin", "stays");
+    writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin", "gone-soon");
+    writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_2_2_0/data.bin", "stays");
     tx->commit(DB::NoCommitOptions{});
-    storage->store()->putNamespaceFile(storage->liveNamespace("uuid-1"), "format_version.txt", "1\n");
+    storage->store()->putNamespaceFile(storage->liveNamespace("a11a11a1-1111-4111-8111-111111111111"), "format_version.txt", "1\n");
 
     /// The fast-removal path (all-tree Task 8, B123 evolution): per-file unlinks stage removal marks
     /// (`content_removed`) but nothing durable changes until commit; removeDirectory(<part>) drops the
@@ -934,16 +975,16 @@ TEST(CaWiringOps, RemovalsDropRefsAndNamespaces)
     /// zero repoints. `existsFile` below stays true because this whole sequence is one uncommitted
     /// transaction (`tx2`), not because the unlink was a no-op.
     auto tx2 = storage->createTransaction();
-    tx2->unlinkFile("uui/uuid-1/all_1_1_0/data.bin", false, false);
-    EXPECT_TRUE(storage->existsFile("uui/uuid-1/all_1_1_0/data.bin"));   /// still committed
-    tx2->removeDirectory("uui/uuid-1/all_1_1_0");
-    EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/all_1_1_0"));
-    EXPECT_TRUE(storage->existsDirectory("uui/uuid-1/all_2_2_0"));
+    tx2->unlinkFile("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin", false, false);
+    EXPECT_TRUE(storage->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin"));   /// still committed
+    tx2->removeDirectory("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0");
+    EXPECT_FALSE(storage->existsDirectory("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0"));
+    EXPECT_TRUE(storage->existsDirectory("a11/a11a11a1-1111-4111-8111-111111111111/all_2_2_0"));
 
     /// DROP TABLE: removeRecursive on the table dir drops the live + detached namespaces.
-    tx2->removeRecursive("uui/uuid-1", {});
-    EXPECT_FALSE(storage->existsDirectory("uui/uuid-1"));
-    EXPECT_FALSE(storage->existsFile("uui/uuid-1/format_version.txt"));
+    tx2->removeRecursive("a11/a11a11a1-1111-4111-8111-111111111111", {});
+    EXPECT_FALSE(storage->existsDirectory("a11/a11a11a1-1111-4111-8111-111111111111"));
+    EXPECT_FALSE(storage->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/format_version.txt"));
 }
 
 /// REMOVED (all-tree-part-files Task 6, spec 2026-07-14-cas-all-tree-part-files-design.md §4):
@@ -964,19 +1005,19 @@ TEST(CaWiringOps, VerbatimMoveAndUnlink)
 {
     auto storage = openWiringStorage();
     auto tx = storage->createTransaction();
-    writeThroughTransaction(*tx, "uui/uuid-1/tmp_mutation_5.txt", "cmds");
+    writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/tmp_mutation_5.txt", "cmds");
     auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
-    ca_tx.moveFile("uui/uuid-1/tmp_mutation_5.txt", "uui/uuid-1/mutation_5.txt");
-    EXPECT_TRUE(storage->existsFile("uui/uuid-1/mutation_5.txt"));
-    EXPECT_FALSE(storage->existsFile("uui/uuid-1/tmp_mutation_5.txt"));
-    ca_tx.unlinkFile("uui/uuid-1/mutation_5.txt", false, false);
-    EXPECT_FALSE(storage->existsFile("uui/uuid-1/mutation_5.txt"));
+    ca_tx.moveFile("a11/a11a11a1-1111-4111-8111-111111111111/tmp_mutation_5.txt", "a11/a11a11a1-1111-4111-8111-111111111111/mutation_5.txt");
+    EXPECT_TRUE(storage->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/mutation_5.txt"));
+    EXPECT_FALSE(storage->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/tmp_mutation_5.txt"));
+    ca_tx.unlinkFile("a11/a11a11a1-1111-4111-8111-111111111111/mutation_5.txt", false, false);
+    EXPECT_FALSE(storage->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/mutation_5.txt"));
 }
 
 TEST(CaWiringOps, UnlinkHonorsIfExistsForPartFiles)
 {
     auto storage = openWiringStorage();
-    const String path = "uui/uuid-1/all_1_1_0/data.bin";
+    const String path = "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin";
 
     auto missing_tx = storage->createTransaction();
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::FILE_DOESNT_EXIST,
@@ -1002,25 +1043,25 @@ TEST(CaWiringOps, TableRenameMovesRefsFilesAndDetached)
 {
     auto storage = openWiringStorage();
     auto tx = storage->createTransaction();
-    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/data.bin", "live");
+    writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin", "live");
     tx->commit(DB::NoCommitOptions{});
     auto tx2 = storage->createTransaction();
-    tx2->moveDirectory("uui/uuid-1/all_1_1_0", "uui/uuid-1/detached/all_1_1_0");   /// one detached part
+    tx2->moveDirectory("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0", "a11/a11a11a1-1111-4111-8111-111111111111/detached/all_1_1_0");   /// one detached part
     tx2->commit(DB::NoCommitOptions{});
     auto tx3 = storage->createTransaction();
-    writeThroughTransaction(*tx3, "uui/uuid-1/all_2_2_0/data.bin", "live2");
+    writeThroughTransaction(*tx3, "a11/a11a11a1-1111-4111-8111-111111111111/all_2_2_0/data.bin", "live2");
     tx3->commit(DB::NoCommitOptions{});
-    storage->store()->putNamespaceFile(storage->liveNamespace("uuid-1"), "format_version.txt", "1\n");
+    storage->store()->putNamespaceFile(storage->liveNamespace("a11a11a1-1111-4111-8111-111111111111"), "format_version.txt", "1\n");
 
     auto tx4 = storage->createTransaction();
-    tx4->moveDirectory("uui/uuid-1", "uui/uuid-2");
+    tx4->moveDirectory("a11/a11a11a1-1111-4111-8111-111111111111", "a22/a22a22a2-2222-4222-8222-222222222222");
     tx4->commit(DB::NoCommitOptions{});
 
-    EXPECT_FALSE(storage->existsDirectory("uui/uuid-1"));
-    EXPECT_TRUE(storage->existsDirectory("uui/uuid-2"));
-    EXPECT_TRUE(storage->existsFile("uui/uuid-2/all_2_2_0/data.bin"));
-    EXPECT_TRUE(storage->existsFile("uui/uuid-2/format_version.txt"));
-    EXPECT_TRUE(storage->existsDirectory("uui/uuid-2/detached/all_1_1_0"));
+    EXPECT_FALSE(storage->existsDirectory("a11/a11a11a1-1111-4111-8111-111111111111"));
+    EXPECT_TRUE(storage->existsDirectory("a22/a22a22a2-2222-4222-8222-222222222222"));
+    EXPECT_TRUE(storage->existsFile("a22/a22a22a2-2222-4222-8222-222222222222/all_2_2_0/data.bin"));
+    EXPECT_TRUE(storage->existsFile("a22/a22a22a2-2222-4222-8222-222222222222/format_version.txt"));
+    EXPECT_TRUE(storage->existsDirectory("a22/a22a22a2-2222-4222-8222-222222222222/detached/all_1_1_0"));
 }
 
 /// B126: RENAME TABLE move_namespace is idempotent — re-driving the SAME rename after it completed is a
@@ -1029,22 +1070,22 @@ TEST(CaWiringOps, TableRenameIsIdempotentOnRedrive)
 {
     auto storage = openWiringStorage();
     auto tx = storage->createTransaction();
-    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/data.bin", "live");
+    writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin", "live");
     tx->commit(DB::NoCommitOptions{});
-    storage->store()->putNamespaceFile(storage->liveNamespace("uuid-1"), "format_version.txt", "1\n");
+    storage->store()->putNamespaceFile(storage->liveNamespace("a11a11a1-1111-4111-8111-111111111111"), "format_version.txt", "1\n");
 
     auto tx2 = storage->createTransaction();
-    tx2->moveDirectory("uui/uuid-1", "uui/uuid-2");
+    tx2->moveDirectory("a11/a11a11a1-1111-4111-8111-111111111111", "a22/a22a22a2-2222-4222-8222-222222222222");
     tx2->commit(DB::NoCommitOptions{});
 
-    /// Re-drive the identical rename: uuid-1 is empty/gone, so every step no-ops; must not throw.
+    /// Re-drive the identical rename: a11a11a1-1111-4111-8111-111111111111 is empty/gone, so every step no-ops; must not throw.
     auto tx3 = storage->createTransaction();
-    EXPECT_NO_THROW(tx3->moveDirectory("uui/uuid-1", "uui/uuid-2"));
+    EXPECT_NO_THROW(tx3->moveDirectory("a11/a11a11a1-1111-4111-8111-111111111111", "a22/a22a22a2-2222-4222-8222-222222222222"));
     tx3->commit(DB::NoCommitOptions{});
 
-    EXPECT_TRUE(storage->existsFile("uui/uuid-2/all_1_1_0/data.bin"));
-    EXPECT_TRUE(storage->existsFile("uui/uuid-2/format_version.txt"));
-    EXPECT_FALSE(storage->existsDirectory("uui/uuid-1"));
+    EXPECT_TRUE(storage->existsFile("a22/a22a22a2-2222-4222-8222-222222222222/all_1_1_0/data.bin"));
+    EXPECT_TRUE(storage->existsFile("a22/a22a22a2-2222-4222-8222-222222222222/format_version.txt"));
+    EXPECT_FALSE(storage->existsDirectory("a11/a11a11a1-1111-4111-8111-111111111111"));
 }
 
 /// B123: a verbatim-file move (get->put->remove, no native rename) is idempotent on re-drive — once the
@@ -1053,15 +1094,15 @@ TEST(CaWiringOps, VerbatimMoveIsIdempotentOnRedrive)
 {
     auto storage = openWiringStorage();
     auto tx = storage->createTransaction();
-    writeThroughTransaction(*tx, "uui/uuid-1/tmp_mutation_7.txt", "cmds");
+    writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/tmp_mutation_7.txt", "cmds");
     auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
-    ca_tx.moveFile("uui/uuid-1/tmp_mutation_7.txt", "uui/uuid-1/mutation_7.txt");
-    EXPECT_TRUE(storage->existsFile("uui/uuid-1/mutation_7.txt"));
+    ca_tx.moveFile("a11/a11a11a1-1111-4111-8111-111111111111/tmp_mutation_7.txt", "a11/a11a11a1-1111-4111-8111-111111111111/mutation_7.txt");
+    EXPECT_TRUE(storage->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/mutation_7.txt"));
     /// Re-drive: source gone, destination present → no-op (no throw).
-    EXPECT_NO_THROW(ca_tx.moveFile("uui/uuid-1/tmp_mutation_7.txt", "uui/uuid-1/mutation_7.txt"));
-    EXPECT_TRUE(storage->existsFile("uui/uuid-1/mutation_7.txt"));
+    EXPECT_NO_THROW(ca_tx.moveFile("a11/a11a11a1-1111-4111-8111-111111111111/tmp_mutation_7.txt", "a11/a11a11a1-1111-4111-8111-111111111111/mutation_7.txt"));
+    EXPECT_TRUE(storage->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/mutation_7.txt"));
     /// Both source and destination absent → genuine missing source still throws.
-    EXPECT_ANY_THROW(ca_tx.moveFile("uui/uuid-1/tmp_mutation_8.txt", "uui/uuid-1/mutation_8.txt"));
+    EXPECT_ANY_THROW(ca_tx.moveFile("a11/a11a11a1-1111-4111-8111-111111111111/tmp_mutation_8.txt", "a11/a11a11a1-1111-4111-8111-111111111111/mutation_8.txt"));
 }
 
 /// B124: moveDirectory's staged-merge is source-wins, and a genuine collision (the same mutable file
@@ -1080,10 +1121,10 @@ TEST(CaWiringOps, MoveDirectoryMutableCollisionPolicy)
     {
         auto storage = openWiringStorage();
         auto tx = storage->createTransaction();
-        writeThroughTransaction(*tx, "uui/uuid-1/tmp_x/txn_version.txt", "A");
-        writeThroughTransaction(*tx, "uui/uuid-1/all_9_9_9/txn_version.txt", "B");
+        writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/tmp_x/txn_version.txt", "A");
+        writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_9_9_9/txn_version.txt", "B");
         auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
-        EXPECT_ANY_THROW(ca_tx.moveDirectory("uui/uuid-1/tmp_x", "uui/uuid-1/all_9_9_9"));
+        EXPECT_ANY_THROW(ca_tx.moveDirectory("a11/a11a11a1-1111-4111-8111-111111111111/tmp_x", "a11/a11a11a1-1111-4111-8111-111111111111/all_9_9_9"));
     }
 #endif
     /// Identical bytes → benign, no throw (source-wins, idempotent). Both parts carry real content so
@@ -1095,12 +1136,12 @@ TEST(CaWiringOps, MoveDirectoryMutableCollisionPolicy)
     {
         auto storage = openWiringStorage();
         auto tx = storage->createTransaction();
-        writeThroughTransaction(*tx, "uui/uuid-1/tmp_y/data.bin", "d1");
-        writeThroughTransaction(*tx, "uui/uuid-1/tmp_y/txn_version.txt", "SAME");
-        writeThroughTransaction(*tx, "uui/uuid-1/all_8_8_8/data.bin", "d1");
-        writeThroughTransaction(*tx, "uui/uuid-1/all_8_8_8/txn_version.txt", "SAME");
+        writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/tmp_y/data.bin", "d1");
+        writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/tmp_y/txn_version.txt", "SAME");
+        writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_8_8_8/data.bin", "d1");
+        writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_8_8_8/txn_version.txt", "SAME");
         auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
-        EXPECT_NO_THROW(ca_tx.moveDirectory("uui/uuid-1/tmp_y", "uui/uuid-1/all_8_8_8"));
+        EXPECT_NO_THROW(ca_tx.moveDirectory("a11/a11a11a1-1111-4111-8111-111111111111/tmp_y", "a11/a11a11a1-1111-4111-8111-111111111111/all_8_8_8"));
     }
 }
 
@@ -1112,10 +1153,10 @@ TEST(CaWiringOpsDeathTest, MoveDirectoryMutableCollisionPolicyAborts)
 {
     auto storage = openWiringStorage();
     auto tx = storage->createTransaction();
-    writeThroughTransaction(*tx, "uui/uuid-1/tmp_x/txn_version.txt", "A");
-    writeThroughTransaction(*tx, "uui/uuid-1/all_9_9_9/txn_version.txt", "B");
+    writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/tmp_x/txn_version.txt", "A");
+    writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_9_9_9/txn_version.txt", "B");
     auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
-    EXPECT_DEATH({ ca_tx.moveDirectory("uui/uuid-1/tmp_x", "uui/uuid-1/all_9_9_9"); }, "");
+    EXPECT_DEATH({ ca_tx.moveDirectory("a11/a11a11a1-1111-4111-8111-111111111111/tmp_x", "a11/a11a11a1-1111-4111-8111-111111111111/all_9_9_9"); }, "");
 }
 #endif
 
@@ -1156,18 +1197,18 @@ TEST(CaWiringOps, MoveDirectoryOntoExistingDestinationBuildSurvives)
     /// it in its own transaction first so the removal below targets a genuinely-committed file, not a
     /// never-existed path.
     auto setup_tx = storage->createTransaction();
-    writeThroughTransaction(*setup_tx, "uui/uuid-1/tmp_z/txn_version.txt", "creation_tid: (7,7,00000000-0000-0000-0000-000000000000)");
+    writeThroughTransaction(*setup_tx, "a11/a11a11a1-1111-4111-8111-111111111111/tmp_z/txn_version.txt", "creation_tid: (7,7,00000000-0000-0000-0000-000000000000)");
     setup_tx->commit(DB::NoCommitOptions{});
 
     auto tx = storage->createTransaction();
     /// Destination already has a real blob upload staged -> a live PartWriteTxn.
-    writeThroughTransaction(*tx, "uui/uuid-1/all_7_7_7/data.bin", "dst-content");
+    writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_7_7_7/data.bin", "dst-content");
     /// Source is staged with ONLY a removal mark (Task 8's content_removed staging) -> parts[src_key]
     /// exists, but src_st.build stays null (unlinkFile never calls buildFor).
-    tx->unlinkFile("uui/uuid-1/tmp_z/txn_version.txt", /*if_exists=*/false, /*should_remove_objects=*/true);
+    tx->unlinkFile("a11/a11a11a1-1111-4111-8111-111111111111/tmp_z/txn_version.txt", /*if_exists=*/false, /*should_remove_objects=*/true);
 
     auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
-    EXPECT_NO_THROW(ca_tx.moveDirectory("uui/uuid-1/tmp_z", "uui/uuid-1/all_7_7_7"));
+    EXPECT_NO_THROW(ca_tx.moveDirectory("a11/a11a11a1-1111-4111-8111-111111111111/tmp_z", "a11/a11a11a1-1111-4111-8111-111111111111/all_7_7_7"));
 
     /// The discriminator: no BuildAbort event means src_st.build->abandon() was never called during
     /// the re-key merge, i.e. the intended neither-branch no-op merge ran, not the two-builds
@@ -1181,9 +1222,9 @@ TEST(CaWiringOps, MoveDirectoryOntoExistingDestinationBuildSurvives)
     /// removal mark names a path never committed anywhere, so it is a harmless no-op once merged into
     /// the destination's (first-time-published) staging.
     tx->commit(DB::NoCommitOptions{});
-    EXPECT_TRUE(storage->existsDirectory("uui/uuid-1/all_7_7_7"));
-    EXPECT_EQ(storage->getFileSize("uui/uuid-1/all_7_7_7/data.bin"), 11u);   /// "dst-content"
-    EXPECT_FALSE(storage->tryGetInManifestBytes("uui/uuid-1/all_7_7_7/txn_version.txt").has_value());
+    EXPECT_TRUE(storage->existsDirectory("a11/a11a11a1-1111-4111-8111-111111111111/all_7_7_7"));
+    EXPECT_EQ(storage->getFileSize("a11/a11a11a1-1111-4111-8111-111111111111/all_7_7_7/data.bin"), 11u);   /// "dst-content"
+    EXPECT_FALSE(storage->tryGetInManifestBytes("a11/a11a11a1-1111-4111-8111-111111111111/all_7_7_7/txn_version.txt").has_value());
 
     storage->store()->setEventSink(nullptr);
 }
@@ -1192,27 +1233,27 @@ TEST(CaWiringOps, FreezeViaHardLinksIntoShadow)
 {
     auto storage = openWiringStorage();
     auto tx = storage->createTransaction();
-    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/data.bin", "frozen-bytes");
-    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/metadata_version.txt", "7");
+    writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin", "frozen-bytes");
+    writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/metadata_version.txt", "7");
     tx->commit(DB::NoCommitOptions{});
 
     /// FREEZE clones a committed part file-by-file into the shadow tree via hardlinks; the staged
     /// shadow part publishes at commit (pool-global - any replica reads the backup).
     auto tx2 = storage->createTransaction();
-    tx2->createHardLink("uui/uuid-1/all_1_1_0/data.bin", "shadow/bk1/store/uui/uuid-1/all_1_1_0/data.bin");
-    tx2->createHardLink("uui/uuid-1/all_1_1_0/metadata_version.txt",
-                        "shadow/bk1/store/uui/uuid-1/all_1_1_0/metadata_version.txt");
+    tx2->createHardLink("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin", "shadow/bk1/store/a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin");
+    tx2->createHardLink("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/metadata_version.txt",
+                        "shadow/bk1/store/a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/metadata_version.txt");
     tx2->commit(DB::NoCommitOptions{});
 
-    EXPECT_TRUE(storage->existsDirectory("shadow/bk1/store/uui/uuid-1/all_1_1_0"));
-    EXPECT_TRUE(storage->existsFile("shadow/bk1/store/uui/uuid-1/all_1_1_0/data.bin"));
-    EXPECT_EQ(storage->tryGetInManifestBytes("shadow/bk1/store/uui/uuid-1/all_1_1_0/metadata_version.txt"),
+    EXPECT_TRUE(storage->existsDirectory("shadow/bk1/store/a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0"));
+    EXPECT_TRUE(storage->existsFile("shadow/bk1/store/a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin"));
+    EXPECT_EQ(storage->tryGetInManifestBytes("shadow/bk1/store/a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/metadata_version.txt"),
               std::optional<String>("7"));
 
     /// UNFREEZE: removeRecursive of the backup root drops every shadow namespace under it.
     auto tx3 = storage->createTransaction();
     tx3->removeRecursive("shadow/bk1", {});
-    EXPECT_FALSE(storage->existsDirectory("shadow/bk1/store/uui/uuid-1/all_1_1_0"));
+    EXPECT_FALSE(storage->existsDirectory("shadow/bk1/store/a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0"));
     EXPECT_FALSE(storage->existsDirectory("shadow/bk1"));
 }
 
@@ -1222,30 +1263,30 @@ TEST(CaWiringInFlight, StagedFilesVisibleBeforeCommit)
 {
     auto storage = openWiringStorage();
     auto tx = storage->createTransaction();
-    writeThroughTransaction(*tx, "uui/uuid-1/tmp_mut_all_1_1_0/p.proj/data.bin", "proj-bytes");
-    writeThroughTransaction(*tx, "uui/uuid-1/tmp_mut_all_1_1_0/uuid.txt", "u-9");
+    writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/tmp_mut_all_1_1_0/p.proj/data.bin", "proj-bytes");
+    writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/tmp_mut_all_1_1_0/uuid.txt", "u-9");
 
     /// B188 precommit-first: content blobs are PENDING (staged locally, not yet uploaded). So
     /// tryGetInFlightStorageObjects returns {} — the pool object does not exist yet. The caller
     /// (DataPartStorageOnDiskFull::prepareRead) falls back to tryGetInFlightFileSize to get the size
     /// and then serves the content via tryReadFileInFlight (local temp file). File sizes and directory
     /// overlay still work because they are driven by the staged tree entry, not the pool.
-    auto objects = tx->tryGetInFlightStorageObjects("uui/uuid-1/tmp_mut_all_1_1_0/p.proj/data.bin");
+    auto objects = tx->tryGetInFlightStorageObjects("a11/a11a11a1-1111-4111-8111-111111111111/tmp_mut_all_1_1_0/p.proj/data.bin");
     EXPECT_FALSE(objects.has_value());
-    EXPECT_EQ(tx->tryGetInFlightFileSize("uui/uuid-1/tmp_mut_all_1_1_0/p.proj/data.bin"), std::optional<uint64_t>(10));
-    EXPECT_EQ(tx->tryGetInFlightFileSize("uui/uuid-1/tmp_mut_all_1_1_0/uuid.txt"), std::optional<uint64_t>(3));
-    EXPECT_FALSE(tx->tryGetInFlightFileSize("uui/uuid-1/tmp_mut_all_1_1_0/missing.bin").has_value());
+    EXPECT_EQ(tx->tryGetInFlightFileSize("a11/a11a11a1-1111-4111-8111-111111111111/tmp_mut_all_1_1_0/p.proj/data.bin"), std::optional<uint64_t>(10));
+    EXPECT_EQ(tx->tryGetInFlightFileSize("a11/a11a11a1-1111-4111-8111-111111111111/tmp_mut_all_1_1_0/uuid.txt"), std::optional<uint64_t>(3));
+    EXPECT_FALSE(tx->tryGetInFlightFileSize("a11/a11a11a1-1111-4111-8111-111111111111/tmp_mut_all_1_1_0/missing.bin").has_value());
 
     /// Bytes read back: a pending blob from the local temp file (B188); staged mutable bytes from memory.
     {
-        auto buf = tx->tryReadFileInFlight("uui/uuid-1/tmp_mut_all_1_1_0/p.proj/data.bin", {}, std::nullopt);
+        auto buf = tx->tryReadFileInFlight("a11/a11a11a1-1111-4111-8111-111111111111/tmp_mut_all_1_1_0/p.proj/data.bin", {}, std::nullopt);
         ASSERT_TRUE(buf);
         String read;
         readStringUntilEOF(read, *buf);
         EXPECT_EQ(read, "proj-bytes");   /// B188: served from local temp file (pending upload)
     }
     {
-        auto buf = tx->tryReadFileInFlight("uui/uuid-1/tmp_mut_all_1_1_0/uuid.txt", {}, std::nullopt);
+        auto buf = tx->tryReadFileInFlight("a11/a11a11a1-1111-4111-8111-111111111111/tmp_mut_all_1_1_0/uuid.txt", {}, std::nullopt);
         ASSERT_TRUE(buf);
         String read;
         readStringUntilEOF(read, *buf);
@@ -1254,12 +1295,12 @@ TEST(CaWiringInFlight, StagedFilesVisibleBeforeCommit)
 
     /// The directory overlay answers for INNER dirs only (the PoC contract): the part dir itself
     /// is FALSE so a rejected temporary part's removeIfNeeded takes the clean early-return path.
-    EXPECT_FALSE(tx->hasInFlightDirectory("uui/uuid-1/tmp_mut_all_1_1_0"));
-    EXPECT_TRUE(tx->hasInFlightDirectory("uui/uuid-1/tmp_mut_all_1_1_0/p.proj"));
-    EXPECT_FALSE(tx->hasInFlightDirectory("uui/uuid-1/tmp_mut_all_1_1_0/q.proj"));
-    auto top = tx->listInFlightDirectory("uui/uuid-1/tmp_mut_all_1_1_0");
+    EXPECT_FALSE(tx->hasInFlightDirectory("a11/a11a11a1-1111-4111-8111-111111111111/tmp_mut_all_1_1_0"));
+    EXPECT_TRUE(tx->hasInFlightDirectory("a11/a11a11a1-1111-4111-8111-111111111111/tmp_mut_all_1_1_0/p.proj"));
+    EXPECT_FALSE(tx->hasInFlightDirectory("a11/a11a11a1-1111-4111-8111-111111111111/tmp_mut_all_1_1_0/q.proj"));
+    auto top = tx->listInFlightDirectory("a11/a11a11a1-1111-4111-8111-111111111111/tmp_mut_all_1_1_0");
     EXPECT_EQ(top, (std::vector<std::string>{"p.proj", "uuid.txt"}));
-    EXPECT_EQ(tx->listInFlightDirectory("uui/uuid-1/tmp_mut_all_1_1_0/p.proj"),
+    EXPECT_EQ(tx->listInFlightDirectory("a11/a11a11a1-1111-4111-8111-111111111111/tmp_mut_all_1_1_0/p.proj"),
               (std::vector<std::string>{"data.bin"}));
 }
 
@@ -1274,15 +1315,15 @@ TEST(CaWiringGc, DroppedPartIsReclaimedByRounds)
 {
     auto storage = openWiringStorage();
     auto tx = storage->createTransaction();
-    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/data.bin", "reclaim-me");
+    writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin", "reclaim-me");
     tx->commit(DB::NoCommitOptions{});
 
     auto * exchange = dynamic_cast<DB::IContentAddressedExchange *>(storage.get());
     ASSERT_NE(exchange, nullptr);
-    const auto blob_key = storage->getStorageObjects("uui/uuid-1/all_1_1_0/data.bin")[0].remote_path;
+    const auto blob_key = storage->getStorageObjects("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin")[0].remote_path;
 
     auto tx2 = storage->createTransaction();
-    tx2->removeDirectory("uui/uuid-1/all_1_1_0");   /// dropRef - the part is unreachable now
+    tx2->removeDirectory("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0");   /// dropRef - the part is unreachable now
 
     /// Round 1 folds the drop and retires+deletes the part MANIFEST; the freed blob is retired+deleted
     /// by a FOLLOWING round (next-round reclamation, M-C3). The steal needs one extra observation
@@ -1292,17 +1333,17 @@ TEST(CaWiringGc, DroppedPartIsReclaimedByRounds)
     storage->runOneGcRoundForTest();
     storage->runOneGcRoundForTest();
 
-    EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/all_1_1_0"));
+    EXPECT_FALSE(storage->existsDirectory("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0"));
     /// The relink offer (B7 part_manifest_v2): a reclaimed part is no longer a committed CA part here,
     /// so getPartManifestBytes offers NOTHING and the sender streams bytes — the documented fallback.
-    EXPECT_FALSE(exchange->getPartManifestBytes("uui/uuid-1/all_1_1_0").has_value());
+    EXPECT_FALSE(exchange->getPartManifestBytes("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0").has_value());
 
     /// A fresh identical write re-CREATES the content at the same key and reads back fine.
     auto tx3 = storage->createTransaction();
-    writeThroughTransaction(*tx3, "uui/uuid-1/all_9_9_0/data.bin", "reclaim-me");
+    writeThroughTransaction(*tx3, "a11/a11a11a1-1111-4111-8111-111111111111/all_9_9_0/data.bin", "reclaim-me");
     tx3->commit(DB::NoCommitOptions{});
-    EXPECT_EQ(storage->getStorageObjects("uui/uuid-1/all_9_9_0/data.bin")[0].remote_path, blob_key);
-    EXPECT_TRUE(storage->existsFile("uui/uuid-1/all_9_9_0/data.bin"));
+    EXPECT_EQ(storage->getStorageObjects("a11/a11a11a1-1111-4111-8111-111111111111/all_9_9_0/data.bin")[0].remote_path, blob_key);
+    EXPECT_TRUE(storage->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/all_9_9_0/data.bin"));
 }
 
 /// B199 (real-path displacement reclamation, ported off the tree model to part manifests): re-writing
@@ -1334,11 +1375,11 @@ TEST(CaWiringGc, DisplacedTreeBlobsReclaimedThroughRealPath)
     /// Commit manifestA with unique content (data-A / mark-A), through the real precommit-first transaction.
     {
         auto tx = storage->createTransaction();
-        writeThroughTransaction(*tx, "uui/uuid-1/all_0_0_0/data.bin", "data-A");
-        writeThroughTransaction(*tx, "uui/uuid-1/all_0_0_0/data.cmrk3", "mark-A");
+        writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_0_0_0/data.bin", "data-A");
+        writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_0_0_0/data.cmrk3", "mark-A");
         tx->commit(DB::NoCommitOptions{});
     }
-    const auto resolved_a = storage->store()->resolveRef(storage->liveNamespace("uuid-1"), "all_0_0_0");
+    const auto resolved_a = storage->store()->resolveRef(storage->liveNamespace("a11a11a1-1111-4111-8111-111111111111"), "all_0_0_0");
     ASSERT_TRUE(resolved_a.has_value());
     const DB::Cas::ManifestId manifest_a = resolved_a->manifest_id;
 
@@ -1349,16 +1390,16 @@ TEST(CaWiringGc, DisplacedTreeBlobsReclaimedThroughRealPath)
     /// ref resolves to a DIFFERENT manifest.
     {
         auto tx = storage->createTransaction();
-        tx->removeDirectory("uui/uuid-1/all_0_0_0");
+        tx->removeDirectory("a11/a11a11a1-1111-4111-8111-111111111111/all_0_0_0");
         tx->commit(DB::NoCommitOptions{});
     }
     {
         auto tx = storage->createTransaction();
-        writeThroughTransaction(*tx, "uui/uuid-1/all_0_0_0/data.bin", "data-B");
-        writeThroughTransaction(*tx, "uui/uuid-1/all_0_0_0/data.cmrk3", "mark-B");
+        writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_0_0_0/data.bin", "data-B");
+        writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_0_0_0/data.cmrk3", "mark-B");
         tx->commit(DB::NoCommitOptions{});
     }
-    const auto resolved_b = storage->store()->resolveRef(storage->liveNamespace("uuid-1"), "all_0_0_0");
+    const auto resolved_b = storage->store()->resolveRef(storage->liveNamespace("a11a11a1-1111-4111-8111-111111111111"), "all_0_0_0");
     ASSERT_TRUE(resolved_b.has_value());
     ASSERT_FALSE(manifest_a == resolved_b->manifest_id)
         << "the second write must displace the ref to a distinct part manifest (last-op-wins)";
@@ -1387,13 +1428,13 @@ TEST(CaWiringExchange, GetPartManifestBytesReturnsBodyForCommittedPart)
 {
     auto storage = openWiringStorage();
     /// Publish a real committed part (data.bin + a projection blob + mutable per-part files).
-    publishWiredPart(*storage, storage->liveNamespace("uuid-1"), "all_1_1_0");
+    publishWiredPart(*storage, storage->liveNamespace("a11a11a1-1111-4111-8111-111111111111"), "all_1_1_0");
 
     auto * exchange = dynamic_cast<DB::IContentAddressedExchange *>(storage.get());
     ASSERT_NE(exchange, nullptr);
     EXPECT_FALSE(exchange->getPoolUUID().empty());
 
-    auto bytes = exchange->getPartManifestBytes("uui/uuid-1/all_1_1_0");
+    auto bytes = exchange->getPartManifestBytes("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0");
     ASSERT_TRUE(bytes.has_value());
     EXPECT_FALSE(bytes->empty());
 
@@ -1408,7 +1449,7 @@ TEST(CaWiringExchange, GetPartManifestBytesReturnsBodyForCommittedPart)
     EXPECT_EQ(decoded.entries[2].ref.digest.toU128(), u128Of("payload-B"));
 
     /// An absent part is not a committed CA part here -> no offer.
-    EXPECT_FALSE(exchange->getPartManifestBytes("uui/uuid-1/all_9_9_9").has_value());
+    EXPECT_FALSE(exchange->getPartManifestBytes("a11/a11a11a1-1111-4111-8111-111111111111/all_9_9_9").has_value());
 }
 
 /// B7 receiver side (the core): take a COMMITTED part's transferred manifest bytes and adopt them into
@@ -1420,13 +1461,13 @@ TEST(CaWiringExchange, GetPartManifestBytesReturnsBodyForCommittedPart)
 TEST(CaWiringExchange, AdoptPartFromManifestPublishesFreshLocalManifest)
 {
     auto storage = openWiringStorage();
-    const auto sender_ns = storage->liveNamespace("uuid-1");
+    const auto sender_ns = storage->liveNamespace("a11a11a1-1111-4111-8111-111111111111");
     publishWiredPart(*storage, sender_ns, "all_1_1_0");
 
     auto * exchange = dynamic_cast<DB::IContentAddressedExchange *>(storage.get());
     ASSERT_NE(exchange, nullptr);
 
-    auto bytes = exchange->getPartManifestBytes("uui/uuid-1/all_1_1_0");
+    auto bytes = exchange->getPartManifestBytes("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0");
     ASSERT_TRUE(bytes.has_value());
     const DB::Cas::ManifestId sender_id =
         storage->store()->resolveRef(sender_ns, "all_1_1_0")->manifest_id;
@@ -1439,13 +1480,13 @@ TEST(CaWiringExchange, AdoptPartFromManifestPublishesFreshLocalManifest)
     const auto data_tok_before = storage->store()->backend().head(data_key).token;
     const auto proj_tok_before = storage->store()->backend().head(proj_key).token;
 
-    /// Adopt into a DIFFERENT table (uuid-2). The transferred body's root_namespace_id is the sender's
-    /// (uuid-1) — the receiver must IGNORE it and use uuid-2.
-    const bool ok = exchange->adoptPartFromManifest("uuid-2", "tmp-fetch_all_1_1_0", *bytes);
+    /// Adopt into a DIFFERENT table (a22a22a2-2222-4222-8222-222222222222). The transferred body's root_namespace_id is the sender's
+    /// (a11a11a1-1111-4111-8111-111111111111) — the receiver must IGNORE it and use a22a22a2-2222-4222-8222-222222222222.
+    const bool ok = exchange->adoptPartFromManifest("a22a22a2-2222-4222-8222-222222222222", "tmp-fetch_all_1_1_0", *bytes);
     EXPECT_TRUE(ok);
 
     /// The adopted ref is live in the RECEIVER namespace and loadable.
-    const auto receiver_ns = storage->liveNamespace("uuid-2");
+    const auto receiver_ns = storage->liveNamespace("a22a22a2-2222-4222-8222-222222222222");
     auto receiver_resolved = storage->store()->resolveRef(receiver_ns, "tmp-fetch_all_1_1_0");
     ASSERT_TRUE(receiver_resolved.has_value());
     const DB::Cas::PartManifest receiver_manifest =
@@ -1479,12 +1520,12 @@ TEST(CaWiringExchange, AdoptFailsClosedAndFallsBackOnCondemnedBlob)
     /// the blobs at in-degree >= 1, so this scenario cannot arise on the real fetch path; a genuinely-absent
     /// adopted blob is an fsck finding, not an adopt-time abort.
     auto storage = openWiringStorage();
-    const auto sender_ns = storage->liveNamespace("uuid-1");
+    const auto sender_ns = storage->liveNamespace("a11a11a1-1111-4111-8111-111111111111");
     publishWiredPart(*storage, sender_ns, "all_1_1_0");
 
     auto * exchange = dynamic_cast<DB::IContentAddressedExchange *>(storage.get());
     ASSERT_NE(exchange, nullptr);
-    auto bytes = exchange->getPartManifestBytes("uui/uuid-1/all_1_1_0");
+    auto bytes = exchange->getPartManifestBytes("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0");
     ASSERT_TRUE(bytes.has_value());
 
     /// Artificially delete a referenced pool blob — the live-sender invariant excludes this on the real
@@ -1496,12 +1537,12 @@ TEST(CaWiringExchange, AdoptFailsClosedAndFallsBackOnCondemnedBlob)
               DB::Cas::DeleteOutcome::Kind::Deleted);
 
     /// §4: promote trusts the adopted leaves — no re-probe — so adopt SUCCEEDS (returns true) and publishes.
-    const bool ok = exchange->adoptPartFromManifest("uuid-2", "tmp-fetch_all_1_1_0", *bytes);
+    const bool ok = exchange->adoptPartFromManifest("a22a22a2-2222-4222-8222-222222222222", "tmp-fetch_all_1_1_0", *bytes);
     EXPECT_TRUE(ok) << "§4: adopt trusts the manifest edge; a raced pool blob is not re-probed at promote";
 
     /// The receiver ref publishes (the D4 trade-off), and the deleted pool blob surfaces via fsck's
     /// reachable-but-absent scan (the backstop — INV-NO-DANGLE-via-fsck).
-    EXPECT_TRUE(storage->store()->resolveRef(storage->liveNamespace("uuid-2"), "tmp-fetch_all_1_1_0").has_value());
+    EXPECT_TRUE(storage->store()->resolveRef(storage->liveNamespace("a22a22a2-2222-4222-8222-222222222222"), "tmp-fetch_all_1_1_0").has_value());
     const DB::Cas::FsckReport rep = DB::Cas::runFsck(*storage->store(), /*detail=*/true);
     EXPECT_GE(rep.dangling, 1u) << "§4 D4 backstop: the deleted pool blob must surface as an fsck dangling "
                                    "finding (dangling=" << rep.dangling << ")";
@@ -1516,7 +1557,7 @@ TEST(CaWiringExchange, AdoptFailsClosedAndFallsBackOnCondemnedBlob)
 TEST(CaWiringExchange, AdoptPartFromManifestSelfContainedWithoutMutableFilesSidecar)
 {
     auto storage = openWiringStorage();
-    const auto sender_ns = storage->liveNamespace("uuid-1");
+    const auto sender_ns = storage->liveNamespace("a11a11a1-1111-4111-8111-111111111111");
 
     DB::Cas::PartWriteInfo info;
     info.intended_ref = sender_ns.string() + "/all_1_1_0";
@@ -1534,17 +1575,17 @@ TEST(CaWiringExchange, AdoptPartFromManifestSelfContainedWithoutMutableFilesSide
 
     auto * exchange = dynamic_cast<DB::IContentAddressedExchange *>(storage.get());
     ASSERT_NE(exchange, nullptr);
-    auto bytes = exchange->getPartManifestBytes("uui/uuid-1/all_1_1_0");
+    auto bytes = exchange->getPartManifestBytes("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0");
     ASSERT_TRUE(bytes.has_value());
     const DB::Cas::PartManifest decoded = DB::Cas::decodePartManifest(*bytes);
     ASSERT_EQ(decoded.entries.size(), 3u) << "uuid.txt/metadata_version.txt travel as ordinary entries";
 
     /// No sidecar parameter to pass anymore — exactly what Fetcher::relinkPartToDisk's call looks like
     /// now that the manifest is self-contained (no reconstruction from a wire-transferred header).
-    const bool ok = exchange->adoptPartFromManifest("uuid-2", "tmp-fetch_all_1_1_0", *bytes);
+    const bool ok = exchange->adoptPartFromManifest("a22a22a2-2222-4222-8222-222222222222", "tmp-fetch_all_1_1_0", *bytes);
     EXPECT_TRUE(ok);
 
-    const auto receiver_ns = storage->liveNamespace("uuid-2");
+    const auto receiver_ns = storage->liveNamespace("a22a22a2-2222-4222-8222-222222222222");
     auto resolved = storage->store()->resolveRef(receiver_ns, "tmp-fetch_all_1_1_0");
     ASSERT_TRUE(resolved.has_value());
 
@@ -1656,8 +1697,8 @@ TEST(CaWiringWrite, PartialCommitRollsBackPublishedParts)
     /// before all_2_2_0). writeThroughTransaction only STAGES to local temp files here — the pool writes
     /// (manifest bodies, blob uploads, ref-log promotes) all happen later, inside commit's publishStaging.
     auto tx = storage->createTransaction();
-    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/data.bin", "content-A");
-    writeThroughTransaction(*tx, "uui/uuid-1/all_2_2_0/data.bin", "content-B");
+    writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin", "content-A");
+    writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_2_2_0/data.bin", "content-B");
 
     /// Fail the SECOND part's manifest-body write (all_2_2_0's stageManifest) — by then all_1_1_0 has
     /// fully published (its manifest body + blob + promoted ref). A pre-B122 commit() would leave
@@ -1683,8 +1724,8 @@ TEST(CaWiringWrite, PartialCommitRollsBackPublishedParts)
     /// dropRefBestEffort). Disarm first so the read-back assertions run clean — the rollback itself only
     /// writes ref-log ops, never a manifest body, so it does not re-trip the count-2 fault.
     faulty->on_write = nullptr;
-    EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/all_1_1_0"));
-    EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/all_2_2_0"));
+    EXPECT_FALSE(storage->existsDirectory("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0"));
+    EXPECT_FALSE(storage->existsDirectory("a11/a11a11a1-1111-4111-8111-111111111111/all_2_2_0"));
 }
 
 TEST(CaWiringReadOnly, ObserveOnlyOpenReadsButRejectsWrites)
@@ -1700,7 +1741,7 @@ TEST(CaWiringReadOnly, ObserveOnlyOpenReadsButRejectsWrites)
             writable_os, "pool", "srv1", "test", std::filesystem::temp_directory_path() / "ca_ro_scratch", nullptr);
         w->startup();
         auto tx = w->createTransaction();
-        writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/data.bin", "ro-bytes");
+        writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin", "ro-bytes");
         tx->commit(DB::NoCommitOptions{});
     }
 
@@ -1715,13 +1756,13 @@ TEST(CaWiringReadOnly, ObserveOnlyOpenReadsButRejectsWrites)
 
     EXPECT_TRUE(ro->isReadOnly());
     /// Reads work:
-    EXPECT_TRUE(ro->existsFile("uui/uuid-1/all_1_1_0/data.bin"));
-    EXPECT_EQ(ro->getFileSize("uui/uuid-1/all_1_1_0/data.bin"), 8u);
+    EXPECT_TRUE(ro->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin"));
+    EXPECT_EQ(ro->getFileSize("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin"), 8u);
     /// Writes fail closed:
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::READONLY,
         [&] { ro->createTransaction(); });
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::READONLY,
-        [&] { ro->adoptPartFromManifest("uuid-1", "tmp-fetch", std::string{}); });
+        [&] { ro->adoptPartFromManifest("a11a11a1-1111-4111-8111-111111111111", "tmp-fetch", std::string{}); });
 }
 
 TEST(CaWiringRead, UnsetPublishedAtMsReturnsEpoch)
@@ -1731,14 +1772,14 @@ TEST(CaWiringRead, UnsetPublishedAtMsReturnsEpoch)
     /// so a missing stamp is harmless.
     auto storage = openWiringStorage();
     auto tx = storage->createTransaction();
-    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/data.bin", "x");
+    writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin", "x");
     tx->commit(DB::NoCommitOptions{});
 
     /// Ensure published_at_ms is unset (the default is 0).
-    storage->store()->updateRefPayload(storage->liveNamespace("uuid-1"), "all_1_1_0",
+    storage->store()->updateRefPayload(storage->liveNamespace("a11a11a1-1111-4111-8111-111111111111"), "all_1_1_0",
         [](DB::Cas::RefPayloadUpdate & r) { r.published_at_ms = 0; });
 
-    EXPECT_EQ(storage->getLastModified("uui/uuid-1/all_1_1_0").epochTime(), 0);
+    EXPECT_EQ(storage->getLastModified("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0").epochTime(), 0);
 }
 
 /// ==== B188 precommit-first order invariant (Task 6) ====
@@ -1891,7 +1932,7 @@ TEST(CaWiringPrecommitOrder, NoContentPoolOpBeforePrecommit)
     /// Phase 1: publish a committed source part — this gives us a committed blob to adopt in Phase 2.
     {
         auto tx = storage->createTransaction();
-        writeThroughTransaction(*tx, "uui/uuid-1/all_0_0_0/data.bin", "source-blob");
+        writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_0_0_0/data.bin", "source-blob");
         tx->commit(DB::NoCommitOptions{});
     }
 
@@ -1902,7 +1943,7 @@ TEST(CaWiringPrecommitOrder, NoContentPoolOpBeforePrecommit)
     recording->ops.clear();
 
     auto tx = storage->createTransaction();
-    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/data.bin", "fresh-content");
+    writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin", "fresh-content");
     /// Adopt by hardlinking a PENDING blob (the file just written above) into a SECOND fresh part
     /// (all_2_2_0). This is the B188-relevant adopt: the cross-part pending-source branch copies the
     /// PendingBlob into the dst build (NO eager pool op — the blob is not durable yet, so a HEAD/GET on
@@ -1912,7 +1953,7 @@ TEST(CaWiringPrecommitOrder, NoContentPoolOpBeforePrecommit)
     /// violation (the invariant is about THIS build's own not-yet-uploaded content, never a committed
     /// object owned by a live part). Gating it would be a false positive; see the committed-source
     /// adopt coverage in CaWiringOps.HardLinkCarriesForwardWithoutReupload.
-    tx->createHardLink("uui/uuid-1/all_1_1_0/data.bin", "uui/uuid-1/all_2_2_0/extra.bin");
+    tx->createHardLink("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin", "a11/a11a11a1-1111-4111-8111-111111111111/all_2_2_0/extra.bin");
     tx->commit(DB::NoCommitOptions{});
 
     const auto & log = recording->ops;
@@ -1950,11 +1991,11 @@ TEST(CaWiringPrecommitOrder, NoContentPoolOpBeforePrecommit)
     }
 
     /// Sanity: both parts are readable after commit, with the SAME underlying blob (content identity).
-    EXPECT_TRUE(storage->existsFile("uui/uuid-1/all_1_1_0/data.bin"));
-    EXPECT_TRUE(storage->existsFile("uui/uuid-1/all_2_2_0/extra.bin"));
-    EXPECT_EQ(storage->getFileSize("uui/uuid-1/all_1_1_0/data.bin"), 13u);   /// "fresh-content"
-    EXPECT_EQ(storage->getStorageObjects("uui/uuid-1/all_1_1_0/data.bin")[0].remote_path,
-              storage->getStorageObjects("uui/uuid-1/all_2_2_0/extra.bin")[0].remote_path);
+    EXPECT_TRUE(storage->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin"));
+    EXPECT_TRUE(storage->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/all_2_2_0/extra.bin"));
+    EXPECT_EQ(storage->getFileSize("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin"), 13u);   /// "fresh-content"
+    EXPECT_EQ(storage->getStorageObjects("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin")[0].remote_path,
+              storage->getStorageObjects("a11/a11a11a1-1111-4111-8111-111111111111/all_2_2_0/extra.bin")[0].remote_path);
 
     /// Confirm at least one blob WRITE and one staged-manifest WRITE were recorded (both the upload
     /// path and the manifest-evidence path were exercised), so the gate above actually had content
@@ -1996,7 +2037,7 @@ TEST(CaWiringPrecommitOrder, CommittedSourceAdoptNoHeadBeforePrecommit)
     recording->ops.clear();
     {
         auto tx = storage->createTransaction();
-        writeThroughTransaction(*tx, "uui/uuid-1/all_0_0_0/data.bin", "committed-source-blob");
+        writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_0_0_0/data.bin", "committed-source-blob");
         tx->commit(DB::NoCommitOptions{});
     }
     std::string source_blob_key;
@@ -2017,7 +2058,7 @@ TEST(CaWiringPrecommitOrder, CommittedSourceAdoptNoHeadBeforePrecommit)
     recording->ops.clear();
     {
         auto tx = storage->createTransaction();
-        tx->createHardLink("uui/uuid-1/all_0_0_0/data.bin", "uui/uuid-1/all_5_5_0/data.bin");
+        tx->createHardLink("a11/a11a11a1-1111-4111-8111-111111111111/all_0_0_0/data.bin", "a11/a11a11a1-1111-4111-8111-111111111111/all_5_5_0/data.bin");
         tx->commit(DB::NoCommitOptions{});
     }
 
@@ -2055,9 +2096,9 @@ TEST(CaWiringPrecommitOrder, CommittedSourceAdoptNoHeadBeforePrecommit)
     EXPECT_FALSE(reuploaded) << "Committed-source adopt re-uploaded the blob — should carry by reference";
 
     /// Sanity: the new part reads back and shares the source blob object.
-    EXPECT_TRUE(storage->existsFile("uui/uuid-1/all_5_5_0/data.bin"));
-    EXPECT_EQ(storage->getStorageObjects("uui/uuid-1/all_0_0_0/data.bin")[0].remote_path,
-              storage->getStorageObjects("uui/uuid-1/all_5_5_0/data.bin")[0].remote_path);
+    EXPECT_TRUE(storage->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/all_5_5_0/data.bin"));
+    EXPECT_EQ(storage->getStorageObjects("a11/a11a11a1-1111-4111-8111-111111111111/all_0_0_0/data.bin")[0].remote_path,
+              storage->getStorageObjects("a11/a11a11a1-1111-4111-8111-111111111111/all_5_5_0/data.bin")[0].remote_path);
 }
 
 /// B188 pending-blob hardlink (Task 6 Test 2): within a SINGLE transaction, write a content file
@@ -2072,31 +2113,31 @@ TEST(CaWiringPending, HardlinkOfPendingBlobCommitsAndReadsBack)
     auto tx = storage->createTransaction();
 
     /// Write fresh content into part X — the blob is PENDING (not uploaded yet, temp-file only).
-    writeThroughTransaction(*tx, "uui/uuid-1/all_10_10_0/data.bin", "pending-payload");
+    writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_10_10_0/data.bin", "pending-payload");
 
     /// Before commit, hardlink part X's file into part Y. At this point:
     ///   - src_st = staging for all_10_10_0 (exists: contains the pending blob)
     ///   - dst_st = staging for all_11_11_0 (created fresh here)
     ///   - &dst_st != src_st => PendingBlob is COPIED into dst_st.pending_blobs
     ///   - Both builds get recordPendingBlobDep (tokenless dep — no pool op until post-precommit)
-    tx->createHardLink("uui/uuid-1/all_10_10_0/data.bin", "uui/uuid-1/all_11_11_0/data.bin");
+    tx->createHardLink("a11/a11a11a1-1111-4111-8111-111111111111/all_10_10_0/data.bin", "a11/a11a11a1-1111-4111-8111-111111111111/all_11_11_0/data.bin");
 
     /// Nothing visible yet (B188: no uploads before precommit).
-    EXPECT_FALSE(storage->existsFile("uui/uuid-1/all_10_10_0/data.bin"));
-    EXPECT_FALSE(storage->existsFile("uui/uuid-1/all_11_11_0/data.bin"));
+    EXPECT_FALSE(storage->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/all_10_10_0/data.bin"));
+    EXPECT_FALSE(storage->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/all_11_11_0/data.bin"));
 
     tx->commit(DB::NoCommitOptions{});
 
     /// Both parts must be visible and carry the same content.
-    ASSERT_TRUE(storage->existsFile("uui/uuid-1/all_10_10_0/data.bin"));
-    ASSERT_TRUE(storage->existsFile("uui/uuid-1/all_11_11_0/data.bin"));
+    ASSERT_TRUE(storage->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/all_10_10_0/data.bin"));
+    ASSERT_TRUE(storage->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/all_11_11_0/data.bin"));
 
-    EXPECT_EQ(storage->getFileSize("uui/uuid-1/all_10_10_0/data.bin"), 15u);   /// "pending-payload"
-    EXPECT_EQ(storage->getFileSize("uui/uuid-1/all_11_11_0/data.bin"), 15u);
+    EXPECT_EQ(storage->getFileSize("a11/a11a11a1-1111-4111-8111-111111111111/all_10_10_0/data.bin"), 15u);   /// "pending-payload"
+    EXPECT_EQ(storage->getFileSize("a11/a11a11a1-1111-4111-8111-111111111111/all_11_11_0/data.bin"), 15u);
 
     /// Both parts must point to the SAME underlying blob object (content-addressed identity).
-    auto objs_x = storage->getStorageObjects("uui/uuid-1/all_10_10_0/data.bin");
-    auto objs_y = storage->getStorageObjects("uui/uuid-1/all_11_11_0/data.bin");
+    auto objs_x = storage->getStorageObjects("a11/a11a11a1-1111-4111-8111-111111111111/all_10_10_0/data.bin");
+    auto objs_y = storage->getStorageObjects("a11/a11a11a1-1111-4111-8111-111111111111/all_11_11_0/data.bin");
     ASSERT_EQ(objs_x.size(), 1u);
     ASSERT_EQ(objs_y.size(), 1u);
     EXPECT_EQ(objs_x[0].remote_path, objs_y[0].remote_path)
@@ -2125,7 +2166,7 @@ TEST(CaWiringPrecommitOrder, RepublishRefNoTreeHeadBeforePrecommit)
     recording->ops.clear();
     {
         auto tx = storage->createTransaction();
-        writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/data.bin", "republish-source");
+        writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin", "republish-source");
         tx->commit(DB::NoCommitOptions{});
     }
     std::string source_blob_key;
@@ -2145,7 +2186,7 @@ TEST(CaWiringPrecommitOrder, RepublishRefNoTreeHeadBeforePrecommit)
     recording->ops.clear();
     {
         auto tx = storage->createTransaction();
-        tx->moveDirectory("uui/uuid-1/all_1_1_0", "uui/uuid-1/delete_tmp_all_1_1_0");
+        tx->moveDirectory("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0", "a11/a11a11a1-1111-4111-8111-111111111111/delete_tmp_all_1_1_0");
         tx->commit(DB::NoCommitOptions{});
     }
 
@@ -2175,9 +2216,9 @@ TEST(CaWiringPrecommitOrder, RepublishRefNoTreeHeadBeforePrecommit)
     EXPECT_FALSE(blob_touched_before_precommit);
 
     /// Sanity: the renamed part is visible under the new name and NOT under the old name.
-    EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/all_1_1_0"));
-    EXPECT_TRUE(storage->existsDirectory("uui/uuid-1/delete_tmp_all_1_1_0"));
-    EXPECT_TRUE(storage->existsFile("uui/uuid-1/delete_tmp_all_1_1_0/data.bin"));
+    EXPECT_FALSE(storage->existsDirectory("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0"));
+    EXPECT_TRUE(storage->existsDirectory("a11/a11a11a1-1111-4111-8111-111111111111/delete_tmp_all_1_1_0"));
+    EXPECT_TRUE(storage->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/delete_tmp_all_1_1_0/data.bin"));
 }
 
 /// B190-B: the adoptStagedBlob helper unifies the 6 inline pending/uploaded adopt blocks from
@@ -2200,16 +2241,16 @@ TEST(CaWiringPrecommitOrder, AdoptStagedBlobHelperUnifiesSixSites)
     /// One transaction: write a pending blob into part A, hardlink (COPY pending) into part B,
     /// and moveFile (MOVE pending) of a DIFFERENT pending blob from part A into part C.
     auto tx = storage->createTransaction();
-    writeThroughTransaction(*tx, "uui/uuid-1/all_A_A_0/data.bin", "blob-for-copy");
-    writeThroughTransaction(*tx, "uui/uuid-1/all_A_A_0/extra.bin", "blob-for-move");
+    writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_A_A_0/data.bin", "blob-for-copy");
+    writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_A_A_0/extra.bin", "blob-for-move");
 
     /// createHardLink = COPY semantics: both src and dst should see the blob after commit.
-    tx->createHardLink("uui/uuid-1/all_A_A_0/data.bin", "uui/uuid-1/all_B_B_0/data.bin");
+    tx->createHardLink("a11/a11a11a1-1111-4111-8111-111111111111/all_A_A_0/data.bin", "a11/a11a11a1-1111-4111-8111-111111111111/all_B_B_0/data.bin");
 
     /// moveFile cross-part = MOVE semantics: src loses the blob, dst gains it.
     {
         auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
-        ca_tx.moveFile("uui/uuid-1/all_A_A_0/extra.bin", "uui/uuid-1/all_C_C_0/extra.bin");
+        ca_tx.moveFile("a11/a11a11a1-1111-4111-8111-111111111111/all_A_A_0/extra.bin", "a11/a11a11a1-1111-4111-8111-111111111111/all_C_C_0/extra.bin");
     }
 
     tx->commit(DB::NoCommitOptions{});
@@ -2238,18 +2279,18 @@ TEST(CaWiringPrecommitOrder, AdoptStagedBlobHelperUnifiesSixSites)
     }
 
     /// COPY semantics: both A and B see the copied blob.
-    EXPECT_TRUE(storage->existsFile("uui/uuid-1/all_A_A_0/data.bin"));
-    EXPECT_TRUE(storage->existsFile("uui/uuid-1/all_B_B_0/data.bin"));
-    EXPECT_EQ(storage->getFileSize("uui/uuid-1/all_A_A_0/data.bin"), 13u);   /// "blob-for-copy" (13 bytes)
-    EXPECT_EQ(storage->getFileSize("uui/uuid-1/all_B_B_0/data.bin"), 13u);
-    EXPECT_EQ(storage->getStorageObjects("uui/uuid-1/all_A_A_0/data.bin")[0].remote_path,
-              storage->getStorageObjects("uui/uuid-1/all_B_B_0/data.bin")[0].remote_path)
+    EXPECT_TRUE(storage->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/all_A_A_0/data.bin"));
+    EXPECT_TRUE(storage->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/all_B_B_0/data.bin"));
+    EXPECT_EQ(storage->getFileSize("a11/a11a11a1-1111-4111-8111-111111111111/all_A_A_0/data.bin"), 13u);   /// "blob-for-copy" (13 bytes)
+    EXPECT_EQ(storage->getFileSize("a11/a11a11a1-1111-4111-8111-111111111111/all_B_B_0/data.bin"), 13u);
+    EXPECT_EQ(storage->getStorageObjects("a11/a11a11a1-1111-4111-8111-111111111111/all_A_A_0/data.bin")[0].remote_path,
+              storage->getStorageObjects("a11/a11a11a1-1111-4111-8111-111111111111/all_B_B_0/data.bin")[0].remote_path)
         << "COPY (hardlink): both parts must share the same blob object";
 
     /// MOVE semantics: A loses extra.bin, C gains it.
-    EXPECT_FALSE(storage->existsFile("uui/uuid-1/all_A_A_0/extra.bin"));
-    EXPECT_TRUE(storage->existsFile("uui/uuid-1/all_C_C_0/extra.bin"));
-    EXPECT_EQ(storage->getFileSize("uui/uuid-1/all_C_C_0/extra.bin"), 13u);   /// "blob-for-move" (13 bytes)
+    EXPECT_FALSE(storage->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/all_A_A_0/extra.bin"));
+    EXPECT_TRUE(storage->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/all_C_C_0/extra.bin"));
+    EXPECT_EQ(storage->getFileSize("a11/a11a11a1-1111-4111-8111-111111111111/all_C_C_0/extra.bin"), 13u);   /// "blob-for-move" (13 bytes)
 }
 
 /// ==== B189: orphaned pending blob must NOT be uploaded after unlinkFile / replaceFile ====
@@ -2276,17 +2317,17 @@ TEST(CaWiringOps, OrphanedPendingBlobNotUploadedAfterUnlink)
     auto tx = storage->createTransaction();
 
     /// Write blob X — this will be unlinked (orphaned) before commit.
-    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/orphan.bin", "orphan-bytes");
+    writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/orphan.bin", "orphan-bytes");
 
     /// Write blob Y — this is kept (its tree entry survives to the staged tree).
-    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/kept.bin", "kept-bytes");
+    writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/kept.bin", "kept-bytes");
 
     /// Unlink blob X — removes its tree entry; the pending_blobs record remains but is now orphaned.
-    tx->unlinkFile("uui/uuid-1/all_1_1_0/orphan.bin", false, false);
+    tx->unlinkFile("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/orphan.bin", false, false);
 
     /// Sanity: the unlinked file is no longer staged (in-flight should not report it).
-    EXPECT_FALSE(tx->tryGetInFlightFileSize("uui/uuid-1/all_1_1_0/orphan.bin").has_value());
-    EXPECT_EQ(tx->tryGetInFlightFileSize("uui/uuid-1/all_1_1_0/kept.bin"), std::optional<uint64_t>(10));
+    EXPECT_FALSE(tx->tryGetInFlightFileSize("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/orphan.bin").has_value());
+    EXPECT_EQ(tx->tryGetInFlightFileSize("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/kept.bin"), std::optional<uint64_t>(10));
 
     tx->commit(DB::NoCommitOptions{});
 
@@ -2308,9 +2349,9 @@ TEST(CaWiringOps, OrphanedPendingBlobNotUploadedAfterUnlink)
         << ". If 2, the orphaned pending blob was uploaded — B189 regression.";
 
     /// The kept file is visible after commit; the orphaned file is not.
-    EXPECT_TRUE(storage->existsFile("uui/uuid-1/all_1_1_0/kept.bin"));
-    EXPECT_EQ(storage->getFileSize("uui/uuid-1/all_1_1_0/kept.bin"), 10u);   /// "kept-bytes"
-    EXPECT_FALSE(storage->existsFile("uui/uuid-1/all_1_1_0/orphan.bin"));
+    EXPECT_TRUE(storage->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/kept.bin"));
+    EXPECT_EQ(storage->getFileSize("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/kept.bin"), 10u);   /// "kept-bytes"
+    EXPECT_FALSE(storage->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/orphan.bin"));
 }
 
 /// B189 companion: the same orphan-filter applies when the tree entry is removed by replaceFile
@@ -2329,15 +2370,15 @@ TEST(CaWiringOps, OrphanedPendingBlobNotUploadedAfterReplace)
     auto tx = storage->createTransaction();
 
     /// Write blob X into the destination slot — it will be erased by replaceFile.
-    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/data.bin", "original-bytes");
+    writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin", "original-bytes");
 
     /// Write blob Y into the source slot — it will replace the destination.
-    writeThroughTransaction(*tx, "uui/uuid-1/all_1_1_0/new.bin", "replacement-bytes");
+    writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/new.bin", "replacement-bytes");
 
     /// replaceFile: erases the dst entry (X orphaned), then moves src->dst.
     {
         auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
-        ca_tx.replaceFile("uui/uuid-1/all_1_1_0/new.bin", "uui/uuid-1/all_1_1_0/data.bin");
+        ca_tx.replaceFile("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/new.bin", "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin");
     }
 
     tx->commit(DB::NoCommitOptions{});
@@ -2356,9 +2397,9 @@ TEST(CaWiringOps, OrphanedPendingBlobNotUploadedAfterReplace)
         << ". If 2, the orphaned original blob was uploaded — B189 regression.";
 
     /// After commit the destination slot carries the replacement content.
-    EXPECT_TRUE(storage->existsFile("uui/uuid-1/all_1_1_0/data.bin"));
-    EXPECT_EQ(storage->getFileSize("uui/uuid-1/all_1_1_0/data.bin"), 17u);   /// "replacement-bytes"
-    EXPECT_FALSE(storage->existsFile("uui/uuid-1/all_1_1_0/new.bin"));
+    EXPECT_TRUE(storage->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin"));
+    EXPECT_EQ(storage->getFileSize("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin"), 17u);   /// "replacement-bytes"
+    EXPECT_FALSE(storage->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/new.bin"));
 }
 
 /// ==== Promote tokened-leaf edge-protection (spec 2026-07-09-cas-writer-gc-simplification, Phase A) ====

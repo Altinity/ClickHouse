@@ -674,17 +674,17 @@ TEST(CasS3Staging, SuccessfulCommitRemovesOrphanedS3StagingObject)
 
     /// orphan.bin forces the S3-staging blob path (a ".bin" suffix always stays a blob, per
     /// `partFileMustStayBlob`); it is unlinked below before commit.
-    writeThroughS3Transaction(ca_tx, "uui/uuid-1/all_1_1_0/orphan.bin", std::string(300, 'x'));
+    writeThroughS3Transaction(ca_tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/orphan.bin", std::string(300, 'x'));
     /// checksums.txt is small and NOT blob-forcing: an INLINE entry that gives the part's PartWriteTxn a real
     /// (non-orphaned) manifest entry, so `publishStaging` takes its normal path (not the early-return
     /// mutable-only/no-PartWriteTxn branch).
-    writeThroughS3Transaction(ca_tx, "uui/uuid-1/all_1_1_0/checksums.txt", "sums");
+    writeThroughS3Transaction(ca_tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/checksums.txt", "sums");
 
     DB::RelativePathsWithMetadata staged_before;
     object_storage->listObjects(metadata_storage->stagingKeyPrefix(), staged_before, /*max_keys=*/0);
     ASSERT_EQ(staged_before.size(), 1u) << "exactly orphan.bin's S3 staging object should exist pre-commit";
 
-    tx->unlinkFile("uui/uuid-1/all_1_1_0/orphan.bin", false, false);
+    tx->unlinkFile("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/orphan.bin", false, false);
 
     tx->commit(DB::NoCommitOptions{});
 
@@ -706,7 +706,7 @@ TEST(CasS3Staging, ReadYourWritesReturnsStagedBytesFromS3StagingObject)
     auto tx = metadata_storage->createTransaction();
     auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
 
-    const std::string path = "uui/uuid-1/all_1_1_0/data.bin";
+    const std::string path = "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin";
     const std::string payload(5000, 'z');
     writeThroughS3Transaction(ca_tx, path, payload);
 

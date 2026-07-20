@@ -1,5 +1,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Parts/PartPathParser.h>
+#include <algorithm>
 #include <array>
+#include <string_view>
 #include <utility>
 
 namespace DB::Cas
@@ -82,6 +84,29 @@ const std::vector<std::string> & splitCached(const std::string & path)
 
 }
 
+/// Whether every character of `s` is a lowercase hex digit.
+static bool isLowerHex(std::string_view s)
+{
+    return std::all_of(s.begin(), s.end(), [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); });
+}
+
+/// Whether `s` has the exact shape of a canonical UUID string: 36 characters, dashes at positions
+/// 8/13/18/23, lowercase hex everywhere else.
+static bool looksLikeUuidDirName(std::string_view s)
+{
+    if (s.size() != 36)
+        return false;
+    for (size_t i = 0; i < 36; ++i)
+    {
+        const bool dash_pos = (i == 8 || i == 13 || i == 18 || i == 23);
+        if (dash_pos != (s[i] == '-'))
+            return false;
+        if (!dash_pos && !((s[i] >= '0' && s[i] <= '9') || (s[i] >= 'a' && s[i] <= 'f')))
+            return false;
+    }
+    return true;
+}
+
 /// Locate the `<uuid[:3]>/<uuid>` anchor inside a split Atomic path. The leading prefix is normally
 /// `store`, but may be absent from a disk-relative path, so the parser identifies the pair by its
 /// shape instead of requiring a particular prefix. Return the index of the UUID component; the
@@ -92,7 +117,11 @@ static std::optional<size_t> findTableUuidComponent(const std::vector<std::strin
     {
         const auto & prefix = p[i - 1];
         const auto & uuid = p[i];
-        if (prefix.size() == 3 && uuid.size() > 3 && uuid.compare(0, 3, prefix) == 0)
+        /// Shape-based on purpose (robust to a missing `store/`), but the shape is now the REAL
+        /// Atomic one: 3 lowercase-hex chars followed by a well-formed UUID sharing that prefix —
+        /// a 3-char database named like its table (`data/abc/abcxyz/...`) no longer false-anchors.
+        if (prefix.size() == 3 && isLowerHex(prefix) && looksLikeUuidDirName(uuid)
+            && uuid.compare(0, 3, prefix) == 0)
             return i;
     }
     return std::nullopt;

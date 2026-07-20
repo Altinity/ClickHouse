@@ -156,18 +156,18 @@ TEST(CasPromoteRepublish, PromoteOverAbsentRefSucceeds)
 TEST(CasPromoteRepublish, RepublishReDriveOverCommittedDstIsIdempotent)
 {
     auto storage = openTxStorage();
-    const auto ns = storage->liveNamespace("uuid-promote-republish");
+    const auto ns = storage->liveNamespace("b09b09b0-0909-4909-8909-090909090909");
     const String src_ref = "all_1_1_0";
     const String dst_ref = "detached_all_1_1_0";
-    const String src_path = "uui/uuid-promote-republish/" + src_ref;
-    const String dst_path = "uui/uuid-promote-republish/" + dst_ref;
+    const String src_path = "b09/b09b09b0-0909-4909-8909-090909090909/" + src_ref;
+    const String dst_path = "b09/b09b09b0-0909-4909-8909-090909090909/" + dst_ref;
 
     /// 1. Publish a committed src part via the normal write flow (tmp -> final rename, B151
     ///    publish-at-rename), exactly as gtest_ca_transaction.cpp's fixtures do.
     {
         auto tx = storage->createTransaction();
-        writeFileTx(*tx, "uui/uuid-promote-republish/tmp_insert_" + src_ref + "/data.bin", "payload-A");
-        tx->moveDirectory("uui/uuid-promote-republish/tmp_insert_" + src_ref, src_path);
+        writeFileTx(*tx, "b09/b09b09b0-0909-4909-8909-090909090909/tmp_insert_" + src_ref + "/data.bin", "payload-A");
+        tx->moveDirectory("b09/b09b09b0-0909-4909-8909-090909090909/tmp_insert_" + src_ref, src_path);
         tx->commit(DB::NoCommitOptions{});
     }
     ASSERT_TRUE(storage->store()->resolveRef(ns, src_ref).has_value());
@@ -236,17 +236,17 @@ TEST(CasPromoteRepublish, RepublishReDriveOverCommittedDstIsIdempotent)
 TEST(CasPromoteRepublish, RepublishReDriveOverDifferentContentDstFailsClosed)
 {
     auto storage = openTxStorage();
-    const auto ns = storage->liveNamespace("uuid-promote-republish-conflict");
+    const auto ns = storage->liveNamespace("b0ab0ab0-0a0a-4a0a-8a0a-0a0a0a0a0a0a");
     const String src_ref = "all_2_2_0";
     const String dst_ref = "detached_all_2_2_0";
-    const String src_path = "uui/uuid-promote-republish-conflict/" + src_ref;
-    const String dst_path = "uui/uuid-promote-republish-conflict/" + dst_ref;
+    const String src_path = "b0a/b0ab0ab0-0a0a-4a0a-8a0a-0a0a0a0a0a0a/" + src_ref;
+    const String dst_path = "b0a/b0ab0ab0-0a0a-4a0a-8a0a-0a0a0a0a0a0a/" + dst_ref;
 
     /// src committed with content "payload-SRC".
     {
         auto tx = storage->createTransaction();
-        writeFileTx(*tx, "uui/uuid-promote-republish-conflict/tmp_insert_" + src_ref + "/data.bin", "payload-SRC");
-        tx->moveDirectory("uui/uuid-promote-republish-conflict/tmp_insert_" + src_ref, src_path);
+        writeFileTx(*tx, "b0a/b0ab0ab0-0a0a-4a0a-8a0a-0a0a0a0a0a0a/tmp_insert_" + src_ref + "/data.bin", "payload-SRC");
+        tx->moveDirectory("b0a/b0ab0ab0-0a0a-4a0a-8a0a-0a0a0a0a0a0a/tmp_insert_" + src_ref, src_path);
         tx->commit(DB::NoCommitOptions{});
     }
     /// dst ALREADY committed with genuinely DIFFERENT content (not a re-drive artifact -- a real

@@ -64,22 +64,22 @@ TEST(CaTransactionLockScope, PublishHappensAtCommitNotRename)
 {
     auto storage = openTxStorage();
     auto tx = storage->createTransaction();
-    writeFileTx(*tx, "uui/uuid-1/tmp_insert_all_1_1_0/data.bin", "content-A");
+    writeFileTx(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/tmp_insert_all_1_1_0/data.bin", "content-A");
 
-    EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/tmp_insert_all_1_1_0"));
-    EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/all_1_1_0"));
+    EXPECT_FALSE(storage->existsDirectory("a11/a11a11a1-1111-4111-8111-111111111111/tmp_insert_all_1_1_0"));
+    EXPECT_FALSE(storage->existsDirectory("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0"));
 
-    tx->moveDirectory("uui/uuid-1/tmp_insert_all_1_1_0", "uui/uuid-1/all_1_1_0");
+    tx->moveDirectory("a11/a11a11a1-1111-4111-8111-111111111111/tmp_insert_all_1_1_0", "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0");
 
     /// Re-key only: the final ref is NOT durable yet.
-    EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/all_1_1_0"));
+    EXPECT_FALSE(storage->existsDirectory("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0"));
 
     tx->commit(DB::NoCommitOptions{});
 
     /// Published by commit().
-    EXPECT_TRUE(storage->existsDirectory("uui/uuid-1/all_1_1_0"));
-    EXPECT_TRUE(storage->existsFile("uui/uuid-1/all_1_1_0/data.bin"));
-    EXPECT_EQ(storage->getFileSize("uui/uuid-1/all_1_1_0/data.bin"), 9u);
+    EXPECT_TRUE(storage->existsDirectory("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0"));
+    EXPECT_TRUE(storage->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin"));
+    EXPECT_EQ(storage->getFileSize("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin"), 9u);
 }
 
 TEST(CaTransactionOps, TruncateFileIsNotSupported)
@@ -89,7 +89,7 @@ TEST(CaTransactionOps, TruncateFileIsNotSupported)
     auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
 
     DB::Cas::tests::expectThrowsCode(DB::ErrorCodes::NOT_IMPLEMENTED,
-        [&] { ca_tx.truncateFile("uui/uuid-1/all_1_1_0/data.bin", 0); });
+        [&] { ca_tx.truncateFile("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin", 0); });
 }
 
 /// [TXN-ONE-PIPELINE] An abandoned transaction (destructed without commit) never published, so the
@@ -99,12 +99,12 @@ TEST(CaTransactionLockScope, AbandonedPartLeavesNoRef)
     auto storage = openTxStorage();
     {
         auto tx = storage->createTransaction();
-        writeFileTx(*tx, "uui/uuid-1/tmp_insert_all_3_3_0/data.bin", "abandoned");
-        tx->moveDirectory("uui/uuid-1/tmp_insert_all_3_3_0", "uui/uuid-1/all_3_3_0");
-        EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/all_3_3_0"));   /// not published at the rename
+        writeFileTx(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/tmp_insert_all_3_3_0/data.bin", "abandoned");
+        tx->moveDirectory("a11/a11a11a1-1111-4111-8111-111111111111/tmp_insert_all_3_3_0", "a11/a11a11a1-1111-4111-8111-111111111111/all_3_3_0");
+        EXPECT_FALSE(storage->existsDirectory("a11/a11a11a1-1111-4111-8111-111111111111/all_3_3_0"));   /// not published at the rename
         /// tx goes out of scope WITHOUT commit().
     }
-    EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/all_3_3_0"));
+    EXPECT_FALSE(storage->existsDirectory("a11/a11a11a1-1111-4111-8111-111111111111/all_3_3_0"));
 }
 
 /// [TXN-ONE-PIPELINE] commit() publishes the re-keyed part.
@@ -113,11 +113,11 @@ TEST(CaTransactionLockScope, RefPublishedByCommit)
     auto storage = openTxStorage();
     {
         auto tx = storage->createTransaction();
-        writeFileTx(*tx, "uui/uuid-1/tmp_insert_all_4_4_0/data.bin", "kept");
-        tx->moveDirectory("uui/uuid-1/tmp_insert_all_4_4_0", "uui/uuid-1/all_4_4_0");
+        writeFileTx(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/tmp_insert_all_4_4_0/data.bin", "kept");
+        tx->moveDirectory("a11/a11a11a1-1111-4111-8111-111111111111/tmp_insert_all_4_4_0", "a11/a11a11a1-1111-4111-8111-111111111111/all_4_4_0");
         tx->commit(DB::NoCommitOptions{});
     }
-    EXPECT_TRUE(storage->existsDirectory("uui/uuid-1/all_4_4_0"));
+    EXPECT_TRUE(storage->existsDirectory("a11/a11a11a1-1111-4111-8111-111111111111/all_4_4_0"));
 }
 
 /// A committed-ref rename (no staged source) must NOT spuriously publish — it goes via republishRef.
@@ -126,18 +126,18 @@ TEST(CaTransactionLockScope, CommittedRefMoveDoesNotSpuriouslyPublish)
     auto storage = openTxStorage();
     {
         auto tx = storage->createTransaction();
-        writeFileTx(*tx, "uui/uuid-1/tmp_insert_all_2_2_0/data.bin", "payload");
-        tx->moveDirectory("uui/uuid-1/tmp_insert_all_2_2_0", "uui/uuid-1/all_2_2_0");
+        writeFileTx(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/tmp_insert_all_2_2_0/data.bin", "payload");
+        tx->moveDirectory("a11/a11a11a1-1111-4111-8111-111111111111/tmp_insert_all_2_2_0", "a11/a11a11a1-1111-4111-8111-111111111111/all_2_2_0");
         tx->commit(DB::NoCommitOptions{});
     }
-    ASSERT_TRUE(storage->existsDirectory("uui/uuid-1/all_2_2_0"));
+    ASSERT_TRUE(storage->existsDirectory("a11/a11a11a1-1111-4111-8111-111111111111/all_2_2_0"));
     {
         auto tx = storage->createTransaction();
-        tx->moveDirectory("uui/uuid-1/all_2_2_0", "uui/uuid-1/delete_tmp_all_2_2_0");
+        tx->moveDirectory("a11/a11a11a1-1111-4111-8111-111111111111/all_2_2_0", "a11/a11a11a1-1111-4111-8111-111111111111/delete_tmp_all_2_2_0");
         tx->commit(DB::NoCommitOptions{});
     }
-    EXPECT_TRUE(storage->existsDirectory("uui/uuid-1/delete_tmp_all_2_2_0"));
-    EXPECT_FALSE(storage->existsDirectory("uui/uuid-1/all_2_2_0"));
+    EXPECT_TRUE(storage->existsDirectory("a11/a11a11a1-1111-4111-8111-111111111111/delete_tmp_all_2_2_0"));
+    EXPECT_FALSE(storage->existsDirectory("a11/a11a11a1-1111-4111-8111-111111111111/all_2_2_0"));
 }
 
 /// [TXN-ONE-PIPELINE] B183 migration gate: a scratch ref durably published at the part's own (tmp)
@@ -156,20 +156,20 @@ TEST(CaTransactionLockScope, StagedFinalizeDropsForeignScratchRef)
     /// the tmp BUILD path holding only a scratch file under `text_index_tmp/`.
     {
         auto scratch_tx = storage->createTransaction();
-        writeFileTx(*scratch_tx, "uui/uuid-7/tmp_merge_all_1_1_0/text_index_tmp/scratch.bin", "scratch");
+        writeFileTx(*scratch_tx, "a77/a77a77a7-7777-4777-8777-777777777777/tmp_merge_all_1_1_0/text_index_tmp/scratch.bin", "scratch");
         scratch_tx->commit(DB::NoCommitOptions{});
     }
-    ASSERT_TRUE(storage->existsDirectory("uui/uuid-7/tmp_merge_all_1_1_0"));
+    ASSERT_TRUE(storage->existsDirectory("a77/a77a77a7-7777-4777-8777-777777777777/tmp_merge_all_1_1_0"));
 
     /// The real part build: stage the authoritative data.bin under the SAME tmp path, then finalize
     /// tmp->final. The staged-source finalize drops the foreign scratch ref at the tmp path.
     auto tx = storage->createTransaction();
-    writeFileTx(*tx, "uui/uuid-7/tmp_merge_all_1_1_0/data.bin", std::string(50000, 'D'));
-    tx->moveDirectory("uui/uuid-7/tmp_merge_all_1_1_0", "uui/uuid-7/all_1_1_0");
+    writeFileTx(*tx, "a77/a77a77a7-7777-4777-8777-777777777777/tmp_merge_all_1_1_0/data.bin", std::string(50000, 'D'));
+    tx->moveDirectory("a77/a77a77a7-7777-4777-8777-777777777777/tmp_merge_all_1_1_0", "a77/a77a77a7-7777-4777-8777-777777777777/all_1_1_0");
     tx->commit(DB::NoCommitOptions{});
 
     /// The published manifest is the authoritative one (has data.bin), not the scratch ref.
-    const auto ns = storage->liveNamespace("uuid-7");
+    const auto ns = storage->liveNamespace("a77a77a7-7777-4777-8777-777777777777");
     const auto resolved = storage->store()->resolveRef(ns, "all_1_1_0");
     ASSERT_TRUE(resolved.has_value());
     const auto manifest = storage->store()->readManifest(resolved->manifest_id);
@@ -177,7 +177,7 @@ TEST(CaTransactionLockScope, StagedFinalizeDropsForeignScratchRef)
     EXPECT_FALSE(findByName(manifest.entries, "scratch.bin"));
 
     /// The foreign scratch ref at the tmp build path is gone (dropped, not carried forward).
-    EXPECT_FALSE(storage->existsDirectory("uui/uuid-7/tmp_merge_all_1_1_0"));
+    EXPECT_FALSE(storage->existsDirectory("a77/a77a77a7-7777-4777-8777-777777777777/tmp_merge_all_1_1_0"));
 }
 
 /// [TXN-ONE-PIPELINE] After a tmp->final re-key, a read THROUGH the open transaction resolves the
@@ -192,17 +192,17 @@ TEST(CaTransactionLockScope, ReadYourWritesAfterReKey)
     auto tx = storage->createTransaction();
     auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
 
-    writeFileTx(*tx, "uui/uuid-3/tmp_insert_all_1_1_0/p.proj/checksums.txt", "the-checksums");
-    tx->moveDirectory("uui/uuid-3/tmp_insert_all_1_1_0", "uui/uuid-3/all_1_1_0");
+    writeFileTx(*tx, "a33/a33a33a3-3333-4333-8333-333333333333/tmp_insert_all_1_1_0/p.proj/checksums.txt", "the-checksums");
+    tx->moveDirectory("a33/a33a33a3-3333-4333-8333-333333333333/tmp_insert_all_1_1_0", "a33/a33a33a3-3333-4333-8333-333333333333/all_1_1_0");
 
     /// The overlay answers the final path before commit (read-your-writes).
-    auto buf = ca_tx.tryReadFileInFlight("uui/uuid-3/all_1_1_0/p.proj/checksums.txt", DB::ReadSettings{}, std::nullopt);
+    auto buf = ca_tx.tryReadFileInFlight("a33/a33a33a3-3333-4333-8333-333333333333/all_1_1_0/p.proj/checksums.txt", DB::ReadSettings{}, std::nullopt);
     ASSERT_NE(buf, nullptr);
     std::string got;
     DB::readStringUntilEOF(got, *buf);
     EXPECT_EQ(got, "the-checksums");
     /// The inner-directory overlay is re-keyed too and resolves under the final path.
-    EXPECT_TRUE(ca_tx.hasInFlightDirectory("uui/uuid-3/all_1_1_0/p.proj"));
+    EXPECT_TRUE(ca_tx.hasInFlightDirectory("a33/a33a33a3-3333-4333-8333-333333333333/all_1_1_0/p.proj"));
 }
 
 /// [TXN-ONE-PIPELINE] Program order in the overlay: create -> delete -> create leaves the file PRESENT
@@ -213,16 +213,16 @@ TEST(CaTransactionLockScope, OverlayProgramOrder)
     auto tx = storage->createTransaction();
     auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
 
-    writeFileTx(*tx, "uui/uuid-5/tmp_insert_all_1_1_0/a.txt", "v1");
-    ca_tx.unlinkFile("uui/uuid-5/tmp_insert_all_1_1_0/a.txt", /*if_exists=*/false, /*should_remove_objects=*/true);
-    EXPECT_EQ(ca_tx.tryReadFileInFlight("uui/uuid-5/tmp_insert_all_1_1_0/a.txt", DB::ReadSettings{}, std::nullopt), nullptr);
+    writeFileTx(*tx, "a55/a55a55a5-5555-4555-8555-555555555555/tmp_insert_all_1_1_0/a.txt", "v1");
+    ca_tx.unlinkFile("a55/a55a55a5-5555-4555-8555-555555555555/tmp_insert_all_1_1_0/a.txt", /*if_exists=*/false, /*should_remove_objects=*/true);
+    EXPECT_EQ(ca_tx.tryReadFileInFlight("a55/a55a55a5-5555-4555-8555-555555555555/tmp_insert_all_1_1_0/a.txt", DB::ReadSettings{}, std::nullopt), nullptr);
 
-    writeFileTx(*tx, "uui/uuid-5/tmp_insert_all_1_1_0/a.txt", "v2");
-    tx->moveDirectory("uui/uuid-5/tmp_insert_all_1_1_0", "uui/uuid-5/all_1_1_0");
+    writeFileTx(*tx, "a55/a55a55a5-5555-4555-8555-555555555555/tmp_insert_all_1_1_0/a.txt", "v2");
+    tx->moveDirectory("a55/a55a55a5-5555-4555-8555-555555555555/tmp_insert_all_1_1_0", "a55/a55a55a5-5555-4555-8555-555555555555/all_1_1_0");
     tx->commit(DB::NoCommitOptions{});
 
-    ASSERT_TRUE(storage->existsFile("uui/uuid-5/all_1_1_0/a.txt"));
-    EXPECT_EQ(storage->getFileSize("uui/uuid-5/all_1_1_0/a.txt"), 2u);
+    ASSERT_TRUE(storage->existsFile("a55/a55a55a5-5555-4555-8555-555555555555/all_1_1_0/a.txt"));
+    EXPECT_EQ(storage->getFileSize("a55/a55a55a5-5555-4555-8555-555555555555/all_1_1_0/a.txt"), 2u);
 }
 
 /// [02941 root-cause] A carried-forward projection sidecar (createHardLink from a COMMITTED source part
@@ -238,34 +238,34 @@ TEST(CaTransactionLockScope, InFlightReadCarriedForwardProjectionSidecar)
     /// 1. Commit a source part with a small INLINE projection sidecar (marks-like) + a blob.
     {
         auto tx = storage->createTransaction();
-        writeFileTx(*tx, "uui/uuid-proj/tmp_insert_all_1_1_0/data.bin", "the-main-data-bytes");
-        writeFileTx(*tx, "uui/uuid-proj/tmp_insert_all_1_1_0/aaaa.proj/data.cmrk4", "PROJMARKS9");
-        tx->moveDirectory("uui/uuid-proj/tmp_insert_all_1_1_0", "uui/uuid-proj/all_1_1_0");
+        writeFileTx(*tx, "b01/b01b01b0-0101-4101-8101-010101010101/tmp_insert_all_1_1_0/data.bin", "the-main-data-bytes");
+        writeFileTx(*tx, "b01/b01b01b0-0101-4101-8101-010101010101/tmp_insert_all_1_1_0/aaaa.proj/data.cmrk4", "PROJMARKS9");
+        tx->moveDirectory("b01/b01b01b0-0101-4101-8101-010101010101/tmp_insert_all_1_1_0", "b01/b01b01b0-0101-4101-8101-010101010101/all_1_1_0");
         tx->commit(DB::NoCommitOptions{});
     }
-    ASSERT_TRUE(storage->existsFile("uui/uuid-proj/all_1_1_0/aaaa.proj/data.cmrk4"));
+    ASSERT_TRUE(storage->existsFile("b01/b01b01b0-0101-4101-8101-010101010101/all_1_1_0/aaaa.proj/data.cmrk4"));
 
     /// 2. Mutation: build a new tmp part + carry the projection sidecar forward via createHardLink.
     auto tx = storage->createTransaction();
     auto & ca_tx = dynamic_cast<DB::ContentAddressedTransaction &>(*tx);
-    writeFileTx(*tx, "uui/uuid-proj/tmp_mut_all_1_1_0_2/data.bin", "mutated-main-data");
-    ca_tx.createHardLink("uui/uuid-proj/all_1_1_0/aaaa.proj/data.cmrk4",
-                         "uui/uuid-proj/tmp_mut_all_1_1_0_2/aaaa.proj/data.cmrk4");
+    writeFileTx(*tx, "b01/b01b01b0-0101-4101-8101-010101010101/tmp_mut_all_1_1_0_2/data.bin", "mutated-main-data");
+    ca_tx.createHardLink("b01/b01b01b0-0101-4101-8101-010101010101/all_1_1_0/aaaa.proj/data.cmrk4",
+                         "b01/b01b01b0-0101-4101-8101-010101010101/tmp_mut_all_1_1_0_2/aaaa.proj/data.cmrk4");
 
     /// 2a. loadProjections timing: read the carried sidecar in-flight at the TMP build path (pre-re-key).
     {
-        auto buf = ca_tx.tryReadFileInFlight("uui/uuid-proj/tmp_mut_all_1_1_0_2/aaaa.proj/data.cmrk4", DB::ReadSettings{}, std::nullopt);
+        auto buf = ca_tx.tryReadFileInFlight("b01/b01b01b0-0101-4101-8101-010101010101/tmp_mut_all_1_1_0_2/aaaa.proj/data.cmrk4", DB::ReadSettings{}, std::nullopt);
         ASSERT_NE(buf, nullptr) << "carried-forward projection sidecar not readable in-flight at the tmp path";
         std::string got; DB::readStringUntilEOF(got, *buf);
         EXPECT_EQ(got, "PROJMARKS9");
-        EXPECT_EQ(ca_tx.tryGetInFlightFileSize("uui/uuid-proj/tmp_mut_all_1_1_0_2/aaaa.proj/data.cmrk4"),
+        EXPECT_EQ(ca_tx.tryGetInFlightFileSize("b01/b01b01b0-0101-4101-8101-010101010101/tmp_mut_all_1_1_0_2/aaaa.proj/data.cmrk4"),
                   std::optional<uint64_t>(10));
     }
 
     /// 2b. After the tmp->final re-key (Phase 1), the sidecar must still resolve at the final path.
-    tx->moveDirectory("uui/uuid-proj/tmp_mut_all_1_1_0_2", "uui/uuid-proj/all_1_1_0_2");
+    tx->moveDirectory("b01/b01b01b0-0101-4101-8101-010101010101/tmp_mut_all_1_1_0_2", "b01/b01b01b0-0101-4101-8101-010101010101/all_1_1_0_2");
     {
-        auto buf = ca_tx.tryReadFileInFlight("uui/uuid-proj/all_1_1_0_2/aaaa.proj/data.cmrk4", DB::ReadSettings{}, std::nullopt);
+        auto buf = ca_tx.tryReadFileInFlight("b01/b01b01b0-0101-4101-8101-010101010101/all_1_1_0_2/aaaa.proj/data.cmrk4", DB::ReadSettings{}, std::nullopt);
         ASSERT_NE(buf, nullptr) << "carried-forward projection sidecar not readable in-flight at the final path after re-key";
         std::string got; DB::readStringUntilEOF(got, *buf);
         EXPECT_EQ(got, "PROJMARKS9");
@@ -273,7 +273,7 @@ TEST(CaTransactionLockScope, InFlightReadCarriedForwardProjectionSidecar)
 
     /// 3. And after commit it is durable + correct.
     tx->commit(DB::NoCommitOptions{});
-    EXPECT_EQ(storage->getFileSize("uui/uuid-proj/all_1_1_0_2/aaaa.proj/data.cmrk4"), 10u);
+    EXPECT_EQ(storage->getFileSize("b01/b01b01b0-0101-4101-8101-010101010101/all_1_1_0_2/aaaa.proj/data.cmrk4"), 10u);
 }
 
 /// [TXN-ONE-PIPELINE] Audit 5: on a commit, only refs this commit CREATED are eligible for rollback;
@@ -287,22 +287,22 @@ TEST(CaTransactionLockScope, CommitRollbackSparesPreexistingRef)
     /// Pre-existing committed part.
     {
         auto tx = storage->createTransaction();
-        writeFileTx(*tx, "uui/uuid-8/tmp_insert_all_1_1_0/data.bin", "orig");
-        tx->moveDirectory("uui/uuid-8/tmp_insert_all_1_1_0", "uui/uuid-8/all_1_1_0");
+        writeFileTx(*tx, "a88/a88a88a8-8888-4888-8888-888888888888/tmp_insert_all_1_1_0/data.bin", "orig");
+        tx->moveDirectory("a88/a88a88a8-8888-4888-8888-888888888888/tmp_insert_all_1_1_0", "a88/a88a88a8-8888-4888-8888-888888888888/all_1_1_0");
         tx->commit(DB::NoCommitOptions{});
     }
-    ASSERT_TRUE(storage->existsDirectory("uui/uuid-8/all_1_1_0"));
+    ASSERT_TRUE(storage->existsDirectory("a88/a88a88a8-8888-4888-8888-888888888888/all_1_1_0"));
 
     /// A standalone write on the committed part repoints the EXISTING ref. Even if a later part in the
     /// same commit were to fail, the existing ref must survive: the repoint returns false from
     /// `publishStaging`, so it never enters `created_refs` and is never dropped on the error path.
     {
         auto tx = storage->createTransaction();
-        writeFileTx(*tx, "uui/uuid-8/all_1_1_0/metadata_version.txt", "1");
+        writeFileTx(*tx, "a88/a88a88a8-8888-4888-8888-888888888888/all_1_1_0/metadata_version.txt", "1");
         tx->commit(DB::NoCommitOptions{});
     }
-    EXPECT_TRUE(storage->existsDirectory("uui/uuid-8/all_1_1_0"));
-    EXPECT_TRUE(storage->existsFile("uui/uuid-8/all_1_1_0/data.bin"));   /// original content carried forward
+    EXPECT_TRUE(storage->existsDirectory("a88/a88a88a8-8888-4888-8888-888888888888/all_1_1_0"));
+    EXPECT_TRUE(storage->existsFile("a88/a88a88a8-8888-4888-8888-888888888888/all_1_1_0/data.bin"));   /// original content carried forward
 }
 
 /// Plan 2d: a small eager metadata file (checksums.txt) is staged INLINE — it rides the single tree
@@ -312,14 +312,14 @@ TEST(CaTransactionInlining, EagerFileInlinedDataBinBlobbed)
 {
     auto storage = openTxStorage();
     auto tx = storage->createTransaction();
-    writeFileTx(*tx, "uui/uuid-9/tmp_insert_all_1_1_0/checksums.txt", "the-checksums");
-    writeFileTx(*tx, "uui/uuid-9/tmp_insert_all_1_1_0/data.bin", std::string(50000, 'D'));
-    tx->moveDirectory("uui/uuid-9/tmp_insert_all_1_1_0", "uui/uuid-9/all_1_1_0");
+    writeFileTx(*tx, "a99/a99a99a9-9999-4999-8999-999999999999/tmp_insert_all_1_1_0/checksums.txt", "the-checksums");
+    writeFileTx(*tx, "a99/a99a99a9-9999-4999-8999-999999999999/tmp_insert_all_1_1_0/data.bin", std::string(50000, 'D'));
+    tx->moveDirectory("a99/a99a99a9-9999-4999-8999-999999999999/tmp_insert_all_1_1_0", "a99/a99a99a9-9999-4999-8999-999999999999/all_1_1_0");
     tx->commit(DB::NoCommitOptions{});
 
     /// Resolve the published part to its manifest and inspect placements (the Pool read API, as in
     /// gtest_cas_pool.cpp: resolveRef -> readManifest).
-    const auto ns = storage->liveNamespace("uuid-9");
+    const auto ns = storage->liveNamespace("a99a99a9-9999-4999-8999-999999999999");
     const auto resolved = storage->store()->resolveRef(ns, "all_1_1_0");
     ASSERT_TRUE(resolved.has_value());
     const DB::Cas::PartManifest manifest = storage->store()->readManifest(resolved->manifest_id);
@@ -333,7 +333,7 @@ TEST(CaTransactionInlining, EagerFileInlinedDataBinBlobbed)
     EXPECT_EQ(databin->placement, DB::Cas::EntryPlacement::Blob);
 
     /// And the inlined file is still readable through the normal read path.
-    EXPECT_EQ(storage->getFileSize("uui/uuid-9/all_1_1_0/checksums.txt"), 13u);
+    EXPECT_EQ(storage->getFileSize("a99/a99a99a9-9999-4999-8999-999999999999/all_1_1_0/checksums.txt"), 13u);
 }
 
 /// all-tree-part-files Task 4 (spec 2026-07-14-cas-all-tree-part-files-design.md §4): a standalone
@@ -346,27 +346,27 @@ TEST(CaTransactionRepoint, StandaloneWriteOnCommittedPartRepoints)
     /// 1. Write a part (checksums.txt inline + data.bin blob) through a normal transaction; commit.
     {
         auto tx = storage->createTransaction();
-        writeFileTx(*tx, "uui/uuid-repoint/tmp_insert_all_1_1_0/checksums.txt", "old-checksums");
-        writeFileTx(*tx, "uui/uuid-repoint/tmp_insert_all_1_1_0/data.bin", "the-data-bytes");
-        tx->moveDirectory("uui/uuid-repoint/tmp_insert_all_1_1_0", "uui/uuid-repoint/all_1_1_0");
+        writeFileTx(*tx, "b02/b02b02b0-0202-4202-8202-020202020202/tmp_insert_all_1_1_0/checksums.txt", "old-checksums");
+        writeFileTx(*tx, "b02/b02b02b0-0202-4202-8202-020202020202/tmp_insert_all_1_1_0/data.bin", "the-data-bytes");
+        tx->moveDirectory("b02/b02b02b0-0202-4202-8202-020202020202/tmp_insert_all_1_1_0", "b02/b02b02b0-0202-4202-8202-020202020202/all_1_1_0");
         tx->commit(DB::NoCommitOptions{});
     }
-    ASSERT_TRUE(storage->existsFile("uui/uuid-repoint/all_1_1_0/checksums.txt"));
-    ASSERT_TRUE(storage->existsFile("uui/uuid-repoint/all_1_1_0/data.bin"));
+    ASSERT_TRUE(storage->existsFile("b02/b02b02b0-0202-4202-8202-020202020202/all_1_1_0/checksums.txt"));
+    ASSERT_TRUE(storage->existsFile("b02/b02b02b0-0202-4202-8202-020202020202/all_1_1_0/data.bin"));
 
     const uint64_t repoints_before = ProfileEvents::global_counters[ProfileEvents::CasRefRepoint].load();
 
     /// 2. New transaction: standalone write of checksums.txt onto the ALREADY-COMMITTED part.
     {
         auto tx = storage->createTransaction();
-        writeFileTx(*tx, "uui/uuid-repoint/all_1_1_0/checksums.txt", "new-checksums-longer");
+        writeFileTx(*tx, "b02/b02b02b0-0202-4202-8202-020202020202/all_1_1_0/checksums.txt", "new-checksums-longer");
         tx->commit(DB::NoCommitOptions{});
     }
 
     /// 3. The new content is served, the untouched file is carried forward unchanged, exactly one
     /// repoint fired, and an independent fsck reachability walk finds nothing dangling.
-    EXPECT_EQ(storage->getFileSize("uui/uuid-repoint/all_1_1_0/checksums.txt"), 20u);
-    EXPECT_EQ(storage->getFileSize("uui/uuid-repoint/all_1_1_0/data.bin"), 14u)
+    EXPECT_EQ(storage->getFileSize("b02/b02b02b0-0202-4202-8202-020202020202/all_1_1_0/checksums.txt"), 20u);
+    EXPECT_EQ(storage->getFileSize("b02/b02b02b0-0202-4202-8202-020202020202/all_1_1_0/data.bin"), 14u)
         << "carry-forward: the untouched file must survive a standalone write on the same part";
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasRefRepoint].load(), repoints_before + 1);
 
@@ -388,14 +388,14 @@ TEST(CaTransactionRepoint, CombinedWriteAndUnlinkSameTxnRepointsOnce)
     /// 1. Commit a part with three files.
     {
         auto tx = storage->createTransaction();
-        writeFileTx(*tx, "uui/uuid-combo-1/tmp_insert_all_1_1_0/checksums.txt", "old-checksums");
-        writeFileTx(*tx, "uui/uuid-combo-1/tmp_insert_all_1_1_0/data.bin", "the-data-bytes");
-        writeFileTx(*tx, "uui/uuid-combo-1/tmp_insert_all_1_1_0/txn_version.txt",
+        writeFileTx(*tx, "b03/b03b03b0-0303-4303-8303-030303030303/tmp_insert_all_1_1_0/checksums.txt", "old-checksums");
+        writeFileTx(*tx, "b03/b03b03b0-0303-4303-8303-030303030303/tmp_insert_all_1_1_0/data.bin", "the-data-bytes");
+        writeFileTx(*tx, "b03/b03b03b0-0303-4303-8303-030303030303/tmp_insert_all_1_1_0/txn_version.txt",
             "creation_tid: (1,1,00000000-0000-0000-0000-000000000000)");
-        tx->moveDirectory("uui/uuid-combo-1/tmp_insert_all_1_1_0", "uui/uuid-combo-1/all_1_1_0");
+        tx->moveDirectory("b03/b03b03b0-0303-4303-8303-030303030303/tmp_insert_all_1_1_0", "b03/b03b03b0-0303-4303-8303-030303030303/all_1_1_0");
         tx->commit(DB::NoCommitOptions{});
     }
-    ASSERT_TRUE(storage->existsFile("uui/uuid-combo-1/all_1_1_0/txn_version.txt"));
+    ASSERT_TRUE(storage->existsFile("b03/b03b03b0-0303-4303-8303-030303030303/all_1_1_0/txn_version.txt"));
 
     const uint64_t repoints_before = ProfileEvents::global_counters[ProfileEvents::CasRefRepoint].load();
 
@@ -404,16 +404,16 @@ TEST(CaTransactionRepoint, CombinedWriteAndUnlinkSameTxnRepointsOnce)
     /// untouched data.bin.
     {
         auto tx = storage->createTransaction();
-        writeFileTx(*tx, "uui/uuid-combo-1/all_1_1_0/checksums.txt", "new-checksums-longer");
-        tx->unlinkFile("uui/uuid-combo-1/all_1_1_0/txn_version.txt", /*if_exists=*/false, /*should_remove_objects=*/true);
+        writeFileTx(*tx, "b03/b03b03b0-0303-4303-8303-030303030303/all_1_1_0/checksums.txt", "new-checksums-longer");
+        tx->unlinkFile("b03/b03b03b0-0303-4303-8303-030303030303/all_1_1_0/txn_version.txt", /*if_exists=*/false, /*should_remove_objects=*/true);
         tx->commit(DB::NoCommitOptions{});
     }
 
     /// 3. The written file is updated, the unlinked file is honestly gone, the untouched file survives
     /// (carry-forward), exactly ONE repoint fired (not two, not zero), and fsck finds nothing dangling.
-    EXPECT_EQ(storage->getFileSize("uui/uuid-combo-1/all_1_1_0/checksums.txt"), 20u);
-    EXPECT_FALSE(storage->existsFile("uui/uuid-combo-1/all_1_1_0/txn_version.txt"));
-    EXPECT_EQ(storage->getFileSize("uui/uuid-combo-1/all_1_1_0/data.bin"), 14u)
+    EXPECT_EQ(storage->getFileSize("b03/b03b03b0-0303-4303-8303-030303030303/all_1_1_0/checksums.txt"), 20u);
+    EXPECT_FALSE(storage->existsFile("b03/b03b03b0-0303-4303-8303-030303030303/all_1_1_0/txn_version.txt"));
+    EXPECT_EQ(storage->getFileSize("b03/b03b03b0-0303-4303-8303-030303030303/all_1_1_0/data.bin"), 14u)
         << "carry-forward: the untouched file must survive a combined write+unlink on the same part";
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasRefRepoint].load(), repoints_before + 1)
         << "one uncommitted transaction combining a write and an unlink must resolve to exactly one repoint";
@@ -429,14 +429,14 @@ TEST(CaTransactionAllTree, BuildTimeSidecarsLandInManifest)
 {
     auto storage = openTxStorage();
     auto tx = storage->createTransaction();
-    writeFileTx(*tx, "uui/uuid-alltree-1/tmp_insert_all_1_1_0/uuid.txt", "part-uuid-bytes");
-    writeFileTx(*tx, "uui/uuid-alltree-1/tmp_insert_all_1_1_0/metadata_version.txt", "3");
-    writeFileTx(*tx, "uui/uuid-alltree-1/tmp_insert_all_1_1_0/txn_version.txt", "creation_tid: (1,1,00000000-0000-0000-0000-000000000000)");
-    writeFileTx(*tx, "uui/uuid-alltree-1/tmp_insert_all_1_1_0/data.bin", "the-data-bytes");
-    tx->moveDirectory("uui/uuid-alltree-1/tmp_insert_all_1_1_0", "uui/uuid-alltree-1/all_1_1_0");
+    writeFileTx(*tx, "b04/b04b04b0-0404-4404-8404-040404040404/tmp_insert_all_1_1_0/uuid.txt", "part-uuid-bytes");
+    writeFileTx(*tx, "b04/b04b04b0-0404-4404-8404-040404040404/tmp_insert_all_1_1_0/metadata_version.txt", "3");
+    writeFileTx(*tx, "b04/b04b04b0-0404-4404-8404-040404040404/tmp_insert_all_1_1_0/txn_version.txt", "creation_tid: (1,1,00000000-0000-0000-0000-000000000000)");
+    writeFileTx(*tx, "b04/b04b04b0-0404-4404-8404-040404040404/tmp_insert_all_1_1_0/data.bin", "the-data-bytes");
+    tx->moveDirectory("b04/b04b04b0-0404-4404-8404-040404040404/tmp_insert_all_1_1_0", "b04/b04b04b0-0404-4404-8404-040404040404/all_1_1_0");
     tx->commit(DB::NoCommitOptions{});
 
-    const auto ns = storage->liveNamespace("uuid-alltree-1");
+    const auto ns = storage->liveNamespace("b04b04b0-0404-4404-8404-040404040404");
     const auto resolved = storage->store()->resolveRef(ns, "all_1_1_0");
     ASSERT_TRUE(resolved.has_value());
 
@@ -455,8 +455,8 @@ TEST(CaTransactionAllTree, BuildTimeSidecarsLandInManifest)
     /// And they are readable through the normal read path — Task 9 deleted the ForceFresh special
     /// case these reads used to go through; they now resolve purely via the manifest view like any
     /// other entry (existsFile / getFileSize / tryGetInManifestBytes).
-    EXPECT_TRUE(storage->existsFile("uui/uuid-alltree-1/all_1_1_0/metadata_version.txt"));
-    EXPECT_EQ(storage->getFileSize("uui/uuid-alltree-1/all_1_1_0/metadata_version.txt"), 1u);
+    EXPECT_TRUE(storage->existsFile("b04/b04b04b0-0404-4404-8404-040404040404/all_1_1_0/metadata_version.txt"));
+    EXPECT_EQ(storage->getFileSize("b04/b04b04b0-0404-4404-8404-040404040404/all_1_1_0/metadata_version.txt"), 1u);
 }
 
 /// A standalone one-shot write of txn_version.txt onto an ALREADY-COMMITTED part (the MVCC creation-
@@ -468,12 +468,12 @@ TEST(CaTransactionAllTree, CommittedTxnVersionStoreRepoints)
     /// 1. Commit a part WITHOUT txn_version.txt.
     {
         auto tx = storage->createTransaction();
-        writeFileTx(*tx, "uui/uuid-alltree-2/tmp_insert_all_1_1_0/checksums.txt", "cs-bytes");
-        writeFileTx(*tx, "uui/uuid-alltree-2/tmp_insert_all_1_1_0/data.bin", "the-data-bytes");
-        tx->moveDirectory("uui/uuid-alltree-2/tmp_insert_all_1_1_0", "uui/uuid-alltree-2/all_1_1_0");
+        writeFileTx(*tx, "b05/b05b05b0-0505-4505-8505-050505050505/tmp_insert_all_1_1_0/checksums.txt", "cs-bytes");
+        writeFileTx(*tx, "b05/b05b05b0-0505-4505-8505-050505050505/tmp_insert_all_1_1_0/data.bin", "the-data-bytes");
+        tx->moveDirectory("b05/b05b05b0-0505-4505-8505-050505050505/tmp_insert_all_1_1_0", "b05/b05b05b0-0505-4505-8505-050505050505/all_1_1_0");
         tx->commit(DB::NoCommitOptions{});
     }
-    ASSERT_FALSE(storage->existsFile("uui/uuid-alltree-2/all_1_1_0/txn_version.txt"));
+    ASSERT_FALSE(storage->existsFile("b05/b05b05b0-0505-4505-8505-050505050505/all_1_1_0/txn_version.txt"));
 
     const uint64_t repoints_before = ProfileEvents::global_counters[ProfileEvents::CasRefRepoint].load();
 
@@ -481,16 +481,16 @@ TEST(CaTransactionAllTree, CommittedTxnVersionStoreRepoints)
     /// the MVCC one-shot autocommit shape: no other file touched in this transaction).
     {
         auto tx = storage->createTransaction();
-        writeFileTx(*tx, "uui/uuid-alltree-2/all_1_1_0/txn_version.txt", "creation_tid: (2,2,00000000-0000-0000-0000-000000000000)");
+        writeFileTx(*tx, "b05/b05b05b0-0505-4505-8505-050505050505/all_1_1_0/txn_version.txt", "creation_tid: (2,2,00000000-0000-0000-0000-000000000000)");
         tx->commit(DB::NoCommitOptions{});
     }
 
     /// 3. Exactly one repoint; the new file is served; the original files are intact (carry-forward).
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasRefRepoint].load(), repoints_before + 1);
-    EXPECT_TRUE(storage->existsFile("uui/uuid-alltree-2/all_1_1_0/txn_version.txt"));
-    EXPECT_EQ(storage->getFileSize("uui/uuid-alltree-2/all_1_1_0/txn_version.txt"), 56u);
-    EXPECT_EQ(storage->getFileSize("uui/uuid-alltree-2/all_1_1_0/checksums.txt"), 8u);
-    EXPECT_EQ(storage->getFileSize("uui/uuid-alltree-2/all_1_1_0/data.bin"), 14u);
+    EXPECT_TRUE(storage->existsFile("b05/b05b05b0-0505-4505-8505-050505050505/all_1_1_0/txn_version.txt"));
+    EXPECT_EQ(storage->getFileSize("b05/b05b05b0-0505-4505-8505-050505050505/all_1_1_0/txn_version.txt"), 56u);
+    EXPECT_EQ(storage->getFileSize("b05/b05b05b0-0505-4505-8505-050505050505/all_1_1_0/checksums.txt"), 8u);
+    EXPECT_EQ(storage->getFileSize("b05/b05b05b0-0505-4505-8505-050505050505/all_1_1_0/data.bin"), 14u);
 
     const auto rep = DB::Cas::runFsck(*storage->store(), /*detail*/false);
     EXPECT_EQ(rep.dangling, 0u);
@@ -508,14 +508,14 @@ TEST(CaTransactionRemove, SurgicalUnlinkRepoints)
     /// 1. Commit a part with txn_version.txt among its files.
     {
         auto tx = storage->createTransaction();
-        writeFileTx(*tx, "uui/uuid-remove-1/tmp_insert_all_1_1_0/checksums.txt", "cs-bytes");
-        writeFileTx(*tx, "uui/uuid-remove-1/tmp_insert_all_1_1_0/data.bin", "the-data-bytes");
-        writeFileTx(*tx, "uui/uuid-remove-1/tmp_insert_all_1_1_0/txn_version.txt",
+        writeFileTx(*tx, "b06/b06b06b0-0606-4606-8606-060606060606/tmp_insert_all_1_1_0/checksums.txt", "cs-bytes");
+        writeFileTx(*tx, "b06/b06b06b0-0606-4606-8606-060606060606/tmp_insert_all_1_1_0/data.bin", "the-data-bytes");
+        writeFileTx(*tx, "b06/b06b06b0-0606-4606-8606-060606060606/tmp_insert_all_1_1_0/txn_version.txt",
             "creation_tid: (1,1,00000000-0000-0000-0000-000000000000)");
-        tx->moveDirectory("uui/uuid-remove-1/tmp_insert_all_1_1_0", "uui/uuid-remove-1/all_1_1_0");
+        tx->moveDirectory("b06/b06b06b0-0606-4606-8606-060606060606/tmp_insert_all_1_1_0", "b06/b06b06b0-0606-4606-8606-060606060606/all_1_1_0");
         tx->commit(DB::NoCommitOptions{});
     }
-    ASSERT_TRUE(storage->existsFile("uui/uuid-remove-1/all_1_1_0/txn_version.txt"));
+    ASSERT_TRUE(storage->existsFile("b06/b06b06b0-0606-4606-8606-060606060606/all_1_1_0/txn_version.txt"));
 
     const uint64_t repoints_before = ProfileEvents::global_counters[ProfileEvents::CasRefRepoint].load();
 
@@ -523,15 +523,15 @@ TEST(CaTransactionRemove, SurgicalUnlinkRepoints)
     /// ATTACH's removeVersionMetadata: no dir-drop in the same transaction).
     {
         auto tx = storage->createTransaction();
-        tx->unlinkFile("uui/uuid-remove-1/all_1_1_0/txn_version.txt", /*if_exists=*/false, /*should_remove_objects=*/true);
+        tx->unlinkFile("b06/b06b06b0-0606-4606-8606-060606060606/all_1_1_0/txn_version.txt", /*if_exists=*/false, /*should_remove_objects=*/true);
         tx->commit(DB::NoCommitOptions{});
     }
 
     /// 3. The file is honestly gone, the untouched files survive (carry-forward), exactly one repoint
     /// fired, and an independent fsck reachability walk finds nothing dangling.
-    EXPECT_FALSE(storage->existsFile("uui/uuid-remove-1/all_1_1_0/txn_version.txt"));
-    EXPECT_EQ(storage->getFileSize("uui/uuid-remove-1/all_1_1_0/checksums.txt"), 8u);
-    EXPECT_EQ(storage->getFileSize("uui/uuid-remove-1/all_1_1_0/data.bin"), 14u);
+    EXPECT_FALSE(storage->existsFile("b06/b06b06b0-0606-4606-8606-060606060606/all_1_1_0/txn_version.txt"));
+    EXPECT_EQ(storage->getFileSize("b06/b06b06b0-0606-4606-8606-060606060606/all_1_1_0/checksums.txt"), 8u);
+    EXPECT_EQ(storage->getFileSize("b06/b06b06b0-0606-4606-8606-060606060606/all_1_1_0/data.bin"), 14u);
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasRefRepoint].load(), repoints_before + 1);
 
     const auto rep = DB::Cas::runFsck(*storage->store(), /*detail*/false);
@@ -549,14 +549,14 @@ TEST(CaTransactionRemove, UnlinkStormThenDirDropIsOneRefDrop)
     /// 1. Commit a part with three files.
     {
         auto tx = storage->createTransaction();
-        writeFileTx(*tx, "uui/uuid-remove-2/tmp_insert_all_1_1_0/checksums.txt", "cs-bytes");
-        writeFileTx(*tx, "uui/uuid-remove-2/tmp_insert_all_1_1_0/data.bin", "the-data-bytes");
-        writeFileTx(*tx, "uui/uuid-remove-2/tmp_insert_all_1_1_0/txn_version.txt",
+        writeFileTx(*tx, "b07/b07b07b0-0707-4707-8707-070707070707/tmp_insert_all_1_1_0/checksums.txt", "cs-bytes");
+        writeFileTx(*tx, "b07/b07b07b0-0707-4707-8707-070707070707/tmp_insert_all_1_1_0/data.bin", "the-data-bytes");
+        writeFileTx(*tx, "b07/b07b07b0-0707-4707-8707-070707070707/tmp_insert_all_1_1_0/txn_version.txt",
             "creation_tid: (1,1,00000000-0000-0000-0000-000000000000)");
-        tx->moveDirectory("uui/uuid-remove-2/tmp_insert_all_1_1_0", "uui/uuid-remove-2/all_1_1_0");
+        tx->moveDirectory("b07/b07b07b0-0707-4707-8707-070707070707/tmp_insert_all_1_1_0", "b07/b07b07b0-0707-4707-8707-070707070707/all_1_1_0");
         tx->commit(DB::NoCommitOptions{});
     }
-    ASSERT_TRUE(storage->existsDirectory("uui/uuid-remove-2/all_1_1_0"));
+    ASSERT_TRUE(storage->existsDirectory("b07/b07b07b0-0707-4707-8707-070707070707/all_1_1_0"));
 
     const uint64_t repoints_before = ProfileEvents::global_counters[ProfileEvents::CasRefRepoint].load();
 
@@ -564,15 +564,15 @@ TEST(CaTransactionRemove, UnlinkStormThenDirDropIsOneRefDrop)
     /// one-by-one, THEN removeDirectory the part — all in one transaction.
     {
         auto tx = storage->createTransaction();
-        tx->unlinkFile("uui/uuid-remove-2/all_1_1_0/checksums.txt", /*if_exists=*/false, /*should_remove_objects=*/true);
-        tx->unlinkFile("uui/uuid-remove-2/all_1_1_0/data.bin", /*if_exists=*/false, /*should_remove_objects=*/true);
-        tx->unlinkFile("uui/uuid-remove-2/all_1_1_0/txn_version.txt", /*if_exists=*/false, /*should_remove_objects=*/true);
-        tx->removeDirectory("uui/uuid-remove-2/all_1_1_0");
+        tx->unlinkFile("b07/b07b07b0-0707-4707-8707-070707070707/all_1_1_0/checksums.txt", /*if_exists=*/false, /*should_remove_objects=*/true);
+        tx->unlinkFile("b07/b07b07b0-0707-4707-8707-070707070707/all_1_1_0/data.bin", /*if_exists=*/false, /*should_remove_objects=*/true);
+        tx->unlinkFile("b07/b07b07b0-0707-4707-8707-070707070707/all_1_1_0/txn_version.txt", /*if_exists=*/false, /*should_remove_objects=*/true);
+        tx->removeDirectory("b07/b07b07b0-0707-4707-8707-070707070707/all_1_1_0");
         tx->commit(DB::NoCommitOptions{});
     }
 
     /// 3. The whole part is gone via the single ref-drop; the storm of marks never repointed anything.
-    EXPECT_FALSE(storage->existsDirectory("uui/uuid-remove-2/all_1_1_0"));
+    EXPECT_FALSE(storage->existsDirectory("b07/b07b07b0-0707-4707-8707-070707070707/all_1_1_0"));
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasRefRepoint].load(), repoints_before)
         << "unlink-storm-then-dir-drop must supersede the marks, not repoint per file";
 
@@ -586,9 +586,9 @@ TEST(CaTransactionRemove, CreateThenDirDropDoesNotPublish)
 {
     auto storage = openTxStorage();
     auto tx = storage->createTransaction();
-    writeFileTx(*tx, "uui/uuid-remove-3/all_1_1_0/data.bin", "created-then-removed");
-    tx->removeDirectory("uui/uuid-remove-3/all_1_1_0");
+    writeFileTx(*tx, "b08/b08b08b0-0808-4808-8808-080808080808/all_1_1_0/data.bin", "created-then-removed");
+    tx->removeDirectory("b08/b08b08b0-0808-4808-8808-080808080808/all_1_1_0");
     tx->commit(DB::NoCommitOptions{});
 
-    EXPECT_FALSE(storage->existsDirectory("uui/uuid-remove-3/all_1_1_0"));
+    EXPECT_FALSE(storage->existsDirectory("b08/b08b08b0-0808-4808-8808-080808080808/all_1_1_0"));
 }
