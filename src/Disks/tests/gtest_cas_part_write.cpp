@@ -1705,6 +1705,112 @@ TEST(CasPartWriteTxn, AbandonStillDeletesNeverPrecommittedStagedDebris)
         << "the live precommit body must be spared";
 }
 
+/// Task 6 (review finding 2): `abandon()`'s three audit `EventEmitter{*store}.emit(...)` calls are each
+/// wrapped `try { ... } catch (...) { tryLogCurrentException(...); }`, mirroring `promote`'s own
+/// post-durable emit guard -- a throwing sink (e.g. a bad_alloc growing the system-log queue, or a
+/// Context/log-shutdown edge) must never turn an otherwise-successful abandon into a reported failure.
+TEST(CasPartWriteTxn, AbandonSwallowsThrowingEventSink)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    auto s = openPool(b);
+    const RootNamespace ns{"srv1/tbl_abandon_sink"};
+    auto build = startBuildFor(s, ns, "part_1");
+
+    build->putBlob(idOf("kept"), BlobSource::fromString("kept"));
+    const ManifestId mid = build->stageManifest({blobManifestEntry("data.bin", "kept")});
+    build->precommitAdd(ns, "part_1", mid);
+
+    /// UNKNOWN_EXCEPTION (not LOGICAL_ERROR): mirrors `PromoteSwallowsPostDurableEventSinkFailure`
+    /// above -- this simulates an arbitrary observer/sink callback failing, not a CAS invariant
+    /// violation. LOGICAL_ERROR would abort the whole process under debug/sanitizer builds instead of
+    /// behaving like a catchable exception.
+    s->setEventSink([](const CasEvent &)
+    {
+        throw DB::Exception(DB::ErrorCodes::UNKNOWN_EXCEPTION, "injected event sink failure");
+    });
+
+    EXPECT_NO_THROW(build->abandon());
+    s->setEventSink(nullptr);
+
+    /// The precommit binding is gone despite the sink failure -- proven black-box exactly like
+    /// `AbandonAppendsPrecommitRemovalAndKeepsLivePrecommitBody` above: a FRESH precommitAdd for the
+    /// SAME (ref_name, manifest_ref) must succeed (it would instead throw CORRUPTED_DATA "add
+    /// precommit ... already exists" had the throwing sink aborted the removal).
+    auto rebuild = startBuildFor(s, ns, "part_1");
+    EXPECT_NO_THROW(rebuild->precommitAdd(ns, "part_1", mid));
+}
+
+namespace
+{
+
+/// Forces the SINGLE ref-log ('_log/' key) PUT that `abandon()`'s precommit-removal `appendRefOps`
+/// issues to observe a PROVEN conflict instead of a genuine ambiguity. Mirrors
+/// `RefWriterTestBackend::corrupt_key_substr` (gtest_cas_ref_writer.cpp, reproduced locally because
+/// that class lives in a different translation unit): landing a DIFFERENT object at the intended key
+/// makes `putIfAbsentControlled`'s resolve-before-reissue observe a real conflict and throw
+/// CORRUPTED_DATA -- a CONCLUSIVE rejection (CasRefLedger.cpp's `flushRefBatch`, "do NOT wedge... the
+/// id is a safe gap, the cache is unchanged, and the lane stays usable"), unlike a genuinely-ambiguous
+/// timeout, which would instead WEDGE the whole table's append lane (`rt->wedge`) until the SAME key
+/// resolves durable -- a state a one-shot fault can never itself clear, since wedge resolution only
+/// re-GETs the intended key and never re-PUTs it (proven by
+/// `RefWriterAppendLane.WedgedLaneBlocksSameTableWhileOtherTableProceeds`). A conflict, by contrast,
+/// leaves the cached ref-table state untouched, so the SAME logical retry (abandon()'s second call)
+/// carves a fresh id and lands normally once the fault is one-shot-consumed.
+class RefLogConflictOnceBackend final : public InMemoryBackend
+{
+public:
+    String corrupt_key_substr;
+    int corrupt_count = 0;
+
+    PutResult putIfAbsent(const String & key, const String & bytes, const ObjectMeta & meta) override
+    {
+        if (corrupt_count > 0 && !corrupt_key_substr.empty() && key.find(corrupt_key_substr) != String::npos)
+        {
+            --corrupt_count;
+            /// The 3-arg qualified call bypasses virtual dispatch entirely (unlike the 2-arg
+            /// convenience overload, which would re-enter this very override through the vtable).
+            InMemoryBackend::putIfAbsent(key, bytes + String("\x01_FOREIGN_DIFFERENT"), meta);
+            throw Poco::TimeoutException("RefLogConflictOnceBackend: a foreign different object landed; response lost");
+        }
+        return InMemoryBackend::putIfAbsent(key, bytes, meta);
+    }
+};
+
+}
+
+/// Task 6 (review finding 2): `alive` now flips to false only AFTER the correctness-bearing precommit
+/// removal's `appendRefOps` succeeds, so a caller that catches an append failure can retry `abandon()`
+/// on the SAME object. Before the fix, `alive = false` ran unconditionally before that append, so a
+/// retry would hit `requireAlive`'s "has been abandoned" LOGICAL_ERROR instead.
+TEST(CasPartWriteTxn, AbandonRetryableAfterAppendFailure)
+{
+    auto b = std::make_shared<RefLogConflictOnceBackend>();
+    auto s = Pool::open(b, PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    const RootNamespace ns{"srv1/tbl_abandon_retry"};
+    auto build = startBuildFor(s, ns, "part_1");
+
+    build->putBlob(idOf("kept"), BlobSource::fromString("kept"));
+    const ManifestId mid = build->stageManifest({blobManifestEntry("data.bin", "kept")});
+    build->precommitAdd(ns, "part_1", mid);
+
+    b->corrupt_key_substr = s->layout().refsNamespacePrefix(ns) + "_log/";
+    b->corrupt_count = 1;
+
+    /// First abandon(): the precommit-removal appendRefOps' single PUT observes a foreign object at its
+    /// exact key (a proven conflict) -> CORRUPTED_DATA propagates.
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { build->abandon(); });
+
+    /// The fault was one-shot: the SAME object's second abandon() call carves a fresh id and lands
+    /// normally -- this is the retryability the fix provides (today, without it, this would instead
+    /// throw LOGICAL_ERROR "has been abandoned").
+    EXPECT_NO_THROW(build->abandon());
+
+    /// The precommit binding really is gone now: a fresh precommitAdd for the same (ref, manifest)
+    /// succeeds (it would throw CORRUPTED_DATA "already exists" had the removal never landed).
+    auto rebuild = startBuildFor(s, ns, "part_1");
+    EXPECT_NO_THROW(rebuild->precommitAdd(ns, "part_1", mid));
+}
+
 /// ------------------------------------------------------------------------------------------------
 /// OQ7 manifest-cap fail-close (S07): the scenario suite tried to reach `stageManifest`'s encoded-bytes
 /// cap through a wide-column SQL `INSERT`, but the cap sits 3+ orders of magnitude above what dev SQL

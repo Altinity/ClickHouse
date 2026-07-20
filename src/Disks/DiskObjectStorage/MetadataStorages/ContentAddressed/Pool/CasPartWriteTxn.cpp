@@ -1140,20 +1140,29 @@ void PartWriteTxn::abandon()
         precommitted = false;
         store->retireBuildSeq(build_seq);
         cleanupStagedManifestDebrisBestEffort();
-        EventEmitter{*store}.emit([&](CasEvent & e)
+        /// Audit emission is best-effort: a throwing sink (e.g. a bad_alloc growing the system-log
+        /// queue, or a Context/log-shutdown edge) must never turn the already-durable cleanup above
+        /// into a reported failure. Mirrors `promote`'s post-durable emit guard.
+        try
         {
-            e.type = CasEventType::BuildAbort;
-            e.token = u128ToHex(build_id);
-            e.outcome = "cancelled";
-            e.reason = "cancelForNamespaceRemoval: owning namespace removed (dropNamespace); best-effort "
-                       "deleted staged _manifests debris; precommit body (if any) left for GC";
-            e.detail = {{"build_seq", std::to_string(build_seq)}, {"staged", std::to_string(staged_manifests.size())}};
-        });
+            EventEmitter{*store}.emit([&](CasEvent & e)
+            {
+                e.type = CasEventType::BuildAbort;
+                e.token = u128ToHex(build_id);
+                e.outcome = "cancelled";
+                e.reason = "cancelForNamespaceRemoval: owning namespace removed (dropNamespace); best-effort "
+                           "deleted staged _manifests debris; precommit body (if any) left for GC";
+                e.detail = {{"build_seq", std::to_string(build_seq)}, {"staged", std::to_string(staged_manifests.size())}};
+            });
+        }
+        catch (...)
+        {
+            tryLogCurrentException(getLogger("CasPartWriteTxn"), "CAS event emission after durable abandon");
+        }
         return;
     }
 
     requireAlive();
-    alive = false;
 
     /// BUG 2 / TLA+ `WAbandonPrecommit`: if this build made a manifest a LIVE precommit owner input
     /// (`precommitAdd` ran), abandoning it must NOT writer-delete that body. Instead append an exact
@@ -1179,16 +1188,29 @@ void PartWriteTxn::abandon()
             RootMutationOrigin::Writer, RootMutationKind::Abandon);
         precommitted = false;
 
-        EventEmitter{*store}.emit([&](CasEvent & e)
+        try
         {
-            e.type = CasEventType::PrecommitRemoved;
-            e.namespace_ = precommit_target_ns.string();
-            e.ref_name = precommit_final_ref;
-            e.object_kind = CasEventObjectKind::Root;
-            e.object_hash = manifestRefDebugString(precommit_manifest);
-            e.reason = "abandon: precommit binding removed";
-        });
+            EventEmitter{*store}.emit([&](CasEvent & e)
+            {
+                e.type = CasEventType::PrecommitRemoved;
+                e.namespace_ = precommit_target_ns.string();
+                e.ref_name = precommit_final_ref;
+                e.object_kind = CasEventObjectKind::Root;
+                e.object_hash = manifestRefDebugString(precommit_manifest);
+                e.reason = "abandon: precommit binding removed";
+            });
+        }
+        catch (...)
+        {
+            tryLogCurrentException(getLogger("CasPartWriteTxn"), "CAS event emission after durable abandon");
+        }
     }
+
+    /// `alive` flips to false only AFTER the correctness-bearing precommit removal above is durable: if
+    /// `appendRefOps` threw, `alive` stays true and `precommitted` stays true, so a caller that catches
+    /// the failure can retry `abandon()` on this same object. A retry after an ambiguous
+    /// already-appended failure re-validates `old_binding` and errors (or no-ops) -- it never corrupts.
+    alive = false;
 
     /// No longer in-flight: retire the seq so the per-server active-build floor (`min_active`) can advance
     /// (idempotent). This runs AFTER the precommit removal above (mirrors `PartWriteTxn::promote`, which retires
@@ -1200,16 +1222,25 @@ void PartWriteTxn::abandon()
 
     cleanupStagedManifestDebrisBestEffort();
 
-    /// The build was abandoned; its uploads become GC-reclaimable debris.
-    EventEmitter{*store}.emit([&](CasEvent & e)
+    /// The build was abandoned; its uploads become GC-reclaimable debris. Best-effort audit emission:
+    /// the durable work (precommit removal + seq retire) is already done, so a throwing sink must not
+    /// propagate a failure out of a successful abandon.
+    try
     {
-        e.type = CasEventType::BuildAbort;
-        e.token = u128ToHex(build_id);
-        e.outcome = "abandoned";
-        e.reason = "abandon: appended a precommit-removal event for the live precommit (body left for GC); "
-                   "best-effort deleted the never-precommitted _manifests debris; remainder reaped by the orphan sweep";
-        e.detail = {{"build_seq", std::to_string(build_seq)}, {"staged", std::to_string(staged_manifests.size())}};
-    });
+        EventEmitter{*store}.emit([&](CasEvent & e)
+        {
+            e.type = CasEventType::BuildAbort;
+            e.token = u128ToHex(build_id);
+            e.outcome = "abandoned";
+            e.reason = "abandon: appended a precommit-removal event for the live precommit (body left for GC); "
+                       "best-effort deleted the never-precommitted _manifests debris; remainder reaped by the orphan sweep";
+            e.detail = {{"build_seq", std::to_string(build_seq)}, {"staged", std::to_string(staged_manifests.size())}};
+        });
+    }
+    catch (...)
+    {
+        tryLogCurrentException(getLogger("CasPartWriteTxn"), "CAS event emission after durable abandon");
+    }
 }
 
 void PartWriteTxn::cleanupStagedManifestDebrisBestEffort()
