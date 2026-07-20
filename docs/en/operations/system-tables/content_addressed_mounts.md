@@ -22,15 +22,15 @@ rows.
 ## Columns {#columns}
 
 - `disk` ([String](/sql-reference/data-types/string)) — Name of the content-addressed disk.
-- `srid` ([String](/sql-reference/data-types/string)) — Server root id owning the mount slot.
+- `server_root_id` ([String](/sql-reference/data-types/string)) — Server root id owning the mount slot.
 - `server_uuid` ([UUID](/sql-reference/data-types/uuid)) — UUID of the server incarnation holding the lease.
 - `hostname` ([String](/sql-reference/data-types/string)) — Hostname recorded in the lease body.
-- `pid` ([UInt64](/sql-reference/data-types/int-uint)) — Process id recorded in the lease body.
+- `process_id` ([UInt64](/sql-reference/data-types/int-uint)) — Process id recorded in the lease body.
 - `writer_epoch` ([UInt64](/sql-reference/data-types/int-uint)) — Fenced writer epoch of the incarnation.
-- `seq` ([UInt64](/sql-reference/data-types/int-uint)) — Lease renewal sequence number.
-- `started_at_ms` ([DateTime64(3)](/sql-reference/data-types/datetime64)) — Lease start.
-- `expires_at_ms` ([DateTime64(3)](/sql-reference/data-types/datetime64)) — Lease expiry.
-- `min_active` ([UInt64](/sql-reference/data-types/int-uint)) — Oldest in-flight build sequence (`UINT64_MAX` means farewell).
+- `renewal_sequence` ([UInt64](/sql-reference/data-types/int-uint)) — Lease renewal sequence number.
+- `started_at_ms` ([DateTime64(3)](/sql-reference/data-types/datetime64)) — Time when the lease started.
+- `expires_at_ms` ([DateTime64(3)](/sql-reference/data-types/datetime64)) — Time when the lease expires.
+- `min_active_build_sequence` ([UInt64](/sql-reference/data-types/int-uint)) — Oldest in-flight build sequence (`UINT64_MAX` means the mount said farewell).
 - `gc_fenced` ([UInt8](/sql-reference/data-types/int-uint)) — `1` if GC fenced this slot out (terminal).
 - `state` ([String](/sql-reference/data-types/string)) — One of `live`, `expired`, `terminated`, `fenced`, `corrupt`.
 - `is_leader` ([Nullable(UInt8)](/sql-reference/data-types/nullable)) — `1` if this server's GC scheduler currently holds this disk's leadership lease.
@@ -40,7 +40,7 @@ rows.
 
 :::note Local-only GC-health columns
 `is_leader`, `pending_reclaim`, `last_success_age_seconds`, and `wedged_namespace_count` are process-local
-facts about *this* server's own GC scheduler. They are populated **only** on the row whose `srid` matches
+facts about *this* server's own GC scheduler. They are populated **only** on the row whose `server_root_id` matches
 this server's own mount, and are `NULL` on every row describing another server's mount — stamping a local
 health fact onto a peer's row would misread as "the peer is the GC leader" during an incident. To see the
 peer's own view of these columns, query `system.content_addressed_mounts` on that server.
@@ -51,14 +51,14 @@ peer's own view of these columns, query `system.content_addressed_mounts` on tha
 ```sql
 SELECT
     disk,
-    srid,
+    server_root_id,
     state,
     writer_epoch,
     is_leader,
     pending_reclaim,
     last_success_age_seconds
 FROM system.content_addressed_mounts
-ORDER BY disk, srid
+ORDER BY disk, server_root_id
 FORMAT Vertical;
 ```
 
@@ -67,4 +67,4 @@ FORMAT Vertical;
 - [`system.content_addressed_garbage_collection_log`](/operations/system-tables/content_addressed_garbage_collection_log) — per-round GC event log.
 - [`system.content_addressed_log`](/operations/system-tables/content_addressed_log) — per-decision event log for the CA garbage collector and writer.
 - [`SYSTEM CONTENT ADDRESSED GC RUN`](/sql-reference/statements/system#content-addressed-garbage-collection) — run one GC round synchronously.
-- [`SYSTEM CONTENT ADDRESSED DROP POOL MEMBER`](/sql-reference/statements/system#system-content-addressed-drop-pool-member) — permanently decommission a dead pool member's `srid`.
+- [`SYSTEM CONTENT ADDRESSED DROP POOL MEMBER`](/sql-reference/statements/system#system-content-addressed-drop-pool-member) — permanently decommission a dead pool member's `server_root_id`.

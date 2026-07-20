@@ -1029,7 +1029,7 @@ BlockIO InterpreterSystemQuery::execute()
             /// One-row summary result set (precedent: SYNC_FILESYSTEM_CACHE's MutableColumns/
             /// SourceFromSingleChunk construction above).
             ColumnsDescription columns{NamesAndTypesList{
-                {"srid", std::make_shared<DataTypeString>()},
+                {"server_root_id", std::make_shared<DataTypeString>()},
                 {"namespaces_removed", std::make_shared<DataTypeUInt64>()},
                 {"namespaces_already_removed", std::make_shared<DataTypeUInt64>()},
                 {"committed_refs_removed", std::make_shared<DataTypeUInt64>()},

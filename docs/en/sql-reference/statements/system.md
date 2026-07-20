@@ -526,7 +526,7 @@ separately from namespaces newly removed by this invocation. Per-object drain fa
 as warnings and leave the slot in a terminated-but-not-fully-drained state that a later invocation
 can resume from, rather than raising an exception.
 
-The command returns one row with columns `srid`, `namespaces_removed`, `namespaces_already_removed`,
+The command returns one row with columns `server_root_id`, `namespaces_removed`, `namespaces_already_removed`,
 `committed_refs_removed`, `precommits_removed`, `manifest_debris_removed`, `staging_objects_removed`,
 `mountpoint_objects_removed`, `slot_removed`, and `warnings`. A non-empty `warnings` means some
 drain was not confirmed and the mount slot was left in place as a resume anchor.

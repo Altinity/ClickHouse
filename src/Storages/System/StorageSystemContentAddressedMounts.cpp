@@ -32,21 +32,21 @@ StorageSystemContentAddressedMounts::StorageSystemContentAddressedMounts(const S
     storage_metadata.setColumns(ColumnsDescription(
     {
         {"disk", std::make_shared<DataTypeString>(), "Name of the content-addressed disk."},
-        {"srid", std::make_shared<DataTypeString>(), "Server root id owning the mount slot."},
+        {"server_root_id", std::make_shared<DataTypeString>(), "Server root id owning the mount slot."},
         {"server_uuid", std::make_shared<DataTypeUUID>(), "UUID of the server incarnation holding the lease."},
         {"hostname", std::make_shared<DataTypeString>(), "Hostname recorded in the lease body."},
-        {"pid", std::make_shared<DataTypeUInt64>(), "Process id recorded in the lease body."},
+        {"process_id", std::make_shared<DataTypeUInt64>(), "Process id recorded in the lease body."},
         {"writer_epoch", std::make_shared<DataTypeUInt64>(), "Fenced writer epoch of the incarnation."},
-        {"seq", std::make_shared<DataTypeUInt64>(), "Lease renewal sequence number."},
-        {"started_at_ms", std::make_shared<DataTypeDateTime64>(3), "Lease start."},
-        {"expires_at_ms", std::make_shared<DataTypeDateTime64>(3), "Lease expiry."},
-        {"min_active", std::make_shared<DataTypeUInt64>(), "Oldest in-flight build sequence (UINT64_MAX = farewell)."},
+        {"renewal_sequence", std::make_shared<DataTypeUInt64>(), "Lease renewal sequence number."},
+        {"started_at_ms", std::make_shared<DataTypeDateTime64>(3), "Time when the lease started."},
+        {"expires_at_ms", std::make_shared<DataTypeDateTime64>(3), "Time when the lease expires."},
+        {"min_active_build_sequence", std::make_shared<DataTypeUInt64>(), "Oldest in-flight build sequence (UINT64_MAX means the mount said farewell)."},
         {"gc_fenced", std::make_shared<DataTypeUInt8>(), "1 if GC fenced this slot out (terminal)."},
-        {"state", std::make_shared<DataTypeString>(), "live | expired | terminated | fenced | corrupt."},
-        {"is_leader", std::make_shared<DataTypeNullable>(std::make_shared<DataTypeUInt8>()), "1 if THIS server's GC scheduler currently holds this disk's leadership lease (per-disk; supersedes the retired process-global CasGcIsLeader metric). NULL on rows describing OTHER servers' mounts; populated only on this server's own mount row."},
-        {"pending_reclaim", std::make_shared<DataTypeNullable>(std::make_shared<DataTypeInt64>()), "Cumulative two-phase deletion backlog observed by this process's GC on this disk (condemned entries minus executed exact-token deletes). NULL on rows describing OTHER servers' mounts; populated only on this server's own mount row."},
-        {"last_success_age_seconds", std::make_shared<DataTypeNullable>(std::make_shared<DataTypeUInt64>()), "Seconds since this disk's GC last led a round (0 if it has never led or GC is not running here). NULL on rows describing OTHER servers' mounts; populated only on this server's own mount row."},
-        {"wedged_namespace_count", std::make_shared<DataTypeNullable>(std::make_shared<DataTypeUInt64>()), "Ref-append lanes currently wedged on this disk (an uncertain PUT exhausted its retry budget). NULL on rows describing OTHER servers' mounts; populated only on this server's own mount row."},
+        {"state", std::make_shared<DataTypeString>(), "Mount slot state: live, expired, terminated, fenced or corrupt."},
+        {"is_leader", std::make_shared<DataTypeNullable>(std::make_shared<DataTypeUInt8>()), "1 if this server's GC scheduler holds this disk's leadership lease. NULL on rows describing other servers' mounts."},
+        {"pending_reclaim", std::make_shared<DataTypeNullable>(std::make_shared<DataTypeInt64>()), "Cumulative condemned-minus-deleted backlog observed by this process's GC on this disk. NULL on rows describing other servers' mounts."},
+        {"last_success_age_seconds", std::make_shared<DataTypeNullable>(std::make_shared<DataTypeUInt64>()), "Seconds since this disk's GC last led a round (0 if it never led). NULL on rows describing other servers' mounts."},
+        {"wedged_namespace_count", std::make_shared<DataTypeNullable>(std::make_shared<DataTypeUInt64>()), "Ref-append lanes currently wedged on this disk. NULL on rows describing other servers' mounts."},
     }));
     storage_metadata.setVirtuals(createVirtuals());
     setInMemoryMetadata(storage_metadata);

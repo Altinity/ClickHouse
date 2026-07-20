@@ -58,5 +58,5 @@ FORMAT Vertical;
 ## See Also {#see-also}
 
 - [`system.content_addressed_garbage_collection_log`](/operations/system-tables/content_addressed_garbage_collection_log) — per-round GC event log.
-- [`system.content_addressed_mounts`](/operations/system-tables/content_addressed_mounts) — live per-`srid` mount and GC-health state.
+- [`system.content_addressed_mounts`](/operations/system-tables/content_addressed_mounts) — live per-`server_root_id` mount and GC-health state.
 - [`system.query_log`](/operations/system-tables/query_log) — correlate via `query_id`.

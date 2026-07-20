@@ -70,6 +70,6 @@ FORMAT Vertical;
 ## See Also {#see-also}
 
 - [`SYSTEM CONTENT ADDRESSED GC RUN`](/sql-reference/statements/system#content-addressed-garbage-collection) — run one GC round synchronously.
-- [`system.content_addressed_mounts`](/operations/system-tables/content_addressed_mounts) — live per-`srid` mount and GC-health state.
+- [`system.content_addressed_mounts`](/operations/system-tables/content_addressed_mounts) — live per-`server_root_id` mount and GC-health state.
 - [`system.content_addressed_log`](/operations/system-tables/content_addressed_log) — per-decision event log for the CA garbage collector and writer.
 - [`system.part_log`](/operations/system-tables/part_log) — the analogous per-part event log.
