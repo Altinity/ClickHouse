@@ -157,6 +157,11 @@ public:
     bool supportsStat() const override { return false; }
     bool isReadOnly() const override { return read_only; }
     bool isContentAddressed() const override { return true; }
+
+    /// Fail-close gate shared by every mutating entry point (transactions, GC round, GC rebuild,
+    /// pool-member decommission): an observe-only (`<readonly>`) disk must reject them all.
+    void checkNotReadOnly(std::string_view what) const;
+
     /// Content-addressed transactions are eager staging overlays: each mutating disk-transaction
     /// method reaches the metadata transaction immediately rather than entering the FIFO queue.
     bool transactionIsStagingOverlay() const override { return true; }

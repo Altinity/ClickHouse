@@ -186,3 +186,15 @@ def test_drop_dead_pool_member_heals_the_pool():
         "SYSTEM CONTENT ADDRESSED DROP POOL MEMBER '{}' FROM DISK '{}'".format(SRID2, CA_DISK)
     )
     assert "BAD_ARGUMENTS" in err, err
+
+
+def test_drop_pool_member_rejected_on_readonly_disk():
+    # disk_ca_ro is the fail-close guard's target: an observe-only window over the SAME pool (used
+    # elsewhere in this test only for fsck). Decommission is a mutating operation, so it must be
+    # rejected on this disk exactly like `createTransaction`/GC round/GC rebuild are -- READONLY,
+    # not a silent no-op or a crash further down the call chain.
+    node1 = cluster.instances["node1"]
+    err = node1.query_and_get_error(
+        "SYSTEM CONTENT ADDRESSED DROP POOL MEMBER 'whatever' FROM DISK '{}'".format(RO_DISK)
+    )
+    assert "read-only" in err, err

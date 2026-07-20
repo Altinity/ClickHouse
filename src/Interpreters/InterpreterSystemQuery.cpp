@@ -1043,6 +1043,7 @@ BlockIO InterpreterSystemQuery::execute()
             if (!ca)
                 throw Exception(ErrorCodes::BAD_ARGUMENTS,
                     "SYSTEM CONTENT ADDRESSED DROP POOL MEMBER: disk '{}' is not a content-addressed disk", query.disk);
+            ca->checkNotReadOnly("SYSTEM CONTENT ADDRESSED DROP POOL MEMBER");
 
             const auto & host_store = ca->store();
             const auto report = Cas::decommissionPoolMember(host_store->poolBackendPtr(), host_store->poolConfig(), query.replica);

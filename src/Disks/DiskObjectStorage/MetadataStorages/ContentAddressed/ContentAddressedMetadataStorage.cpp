@@ -390,7 +390,8 @@ Cas::CasEventSink ContentAddressedMetadataStorage::makeCasEventSink() const
 
 Cas::RoundReport ContentAddressedMetadataStorage::runGarbageCollectionRoundNow()
 {
-    if (read_only || !gc_enabled)
+    checkNotReadOnly("GC round");
+    if (!gc_enabled)
         throw Exception(ErrorCodes::BAD_ARGUMENTS,
             "Garbage collection is not enabled on this content-addressed disk");
     /// Mirror runOneGcRoundForTest: a STABLE scheduler instance across calls (the lease's
@@ -422,7 +423,8 @@ Cas::RoundReport ContentAddressedMetadataStorage::runGarbageCollectionRoundNow()
 
 Cas::RebuildReport ContentAddressedMetadataStorage::runGcRebuildNow(bool force) const
 {
-    if (read_only || !gc_enabled)
+    checkNotReadOnly("GC rebuild");
+    if (!gc_enabled)
         throw Exception(ErrorCodes::BAD_ARGUMENTS,
             "Garbage collection is not enabled on this content-addressed disk");
     /// A one-shot Gc instance is fine here (unlike the scheduler's stable-instance requirement for
@@ -624,10 +626,16 @@ std::shared_ptr<Cas::CachedPartFolderAccess> ContentAddressedMetadataStorage::pa
     return snapshot;
 }
 
-MetadataTransactionPtr ContentAddressedMetadataStorage::createTransaction()
+void ContentAddressedMetadataStorage::checkNotReadOnly(std::string_view what) const
 {
     if (read_only)
-        throw Exception(ErrorCodes::READONLY, "Content-addressed disk is opened read-only: writes are rejected");
+        throw Exception(ErrorCodes::READONLY,
+            "Content-addressed disk is opened read-only: {} is rejected", what);
+}
+
+MetadataTransactionPtr ContentAddressedMetadataStorage::createTransaction()
+{
+    checkNotReadOnly("writes");
     return std::make_shared<ContentAddressedTransaction>(*this);
 }
 
