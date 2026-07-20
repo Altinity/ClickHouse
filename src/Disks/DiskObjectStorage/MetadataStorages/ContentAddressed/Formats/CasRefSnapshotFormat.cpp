@@ -3,7 +3,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasCodecUtil.h>
 #include <Common/Exception.h>
 #include <IO/ReadBufferFromMemory.h>
-#include <IO/WriteHelpers.h>
 #include <optional>
 #include <tuple>
 
@@ -116,14 +115,14 @@ void writeCommittedRow(CasJsonWriter & out, const RefCommittedRow & row)
     checkCanonicalRefName(row.ref_name, "RefTableSnapshot", "committed ref_name");
     checkManifestRef(row.manifest_ref, "RefTableSnapshot", "committed");
     bool first = true;
-    out.keyLiteral("\"k\":", first);
+    writeKey(out, "k", first);
     writeStringValue(out, "c");
-    out.keyLiteral("\"rn\":", first);
+    writeKey(out, "rn", first);
     writeStringValue(out, row.ref_name);
     writeManifestRefFields(out, first, "", row.manifest_ref);
-    out.keyLiteral("\"pl\":", first);
+    writeKey(out, "pl", first);
     writeStringValue(out, row.payload);
-    out.keyLiteral("\"ts\":", first);
+    writeKey(out, "ts", first);
     writeIntText(row.published_at_ms, out);
     closeObject(out, first);
     writeChar('\n', out);

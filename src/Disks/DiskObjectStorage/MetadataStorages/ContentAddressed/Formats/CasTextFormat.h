@@ -71,17 +71,6 @@ public:
         append("\":");
     }
 
-    /// '{' on the first call, ',' after, then `rendered` verbatim. `rendered` must be the FULLY
-    /// rendered key text including quotes and colon, e.g. "\"rn\":" -- a merged-literal fast path
-    /// for the fixed unprefixed keys in the hottest writers (one separator store + one literal
-    /// append per key, vs. the three appends `key` does to compose the same bytes).
-    void keyLiteral(std::string_view rendered, bool & first)
-    {
-        appendChar(first ? '{' : ',');
-        first = false;
-        append(rendered);
-    }
-
     /// Quoted JSON string with full escaping (bulk-run scan). Defined in CasTextFormat.cpp.
     void stringValue(std::string_view s);
 

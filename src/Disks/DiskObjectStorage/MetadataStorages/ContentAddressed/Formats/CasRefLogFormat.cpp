@@ -3,7 +3,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasCodecUtil.h>
 #include <Common/Exception.h>
 #include <IO/ReadBufferFromMemory.h>
-#include <IO/WriteHelpers.h>
 #include <algorithm>
 #include <optional>
 
@@ -83,7 +82,7 @@ void writeBindingFields(CasJsonWriter & out, bool & first, std::string_view pref
 void writeOp(CasJsonWriter & out, const RefOp & op)
 {
     bool first = true;
-    out.keyLiteral("\"op\":", first);
+    writeKey(out, "op", first);
     writeStringValue(out, opKindToWord(op.kind));
     switch (op.kind)
     {
@@ -99,12 +98,12 @@ void writeOp(CasJsonWriter & out, const RefOp & op)
         case RefOpKind::SetPayload:
             checkCanonicalRefName(op.ref_name, "RefLogTxn", "set_payload ref_name");
             checkManifestRef(op.expected_manifest_ref, "RefLogTxn", "set_payload manifest_ref");
-            out.keyLiteral("\"rn\":", first);
+            writeKey(out, "rn", first);
             writeStringValue(out, op.ref_name);
             writeManifestRefFields(out, first, "", op.expected_manifest_ref);
-            out.keyLiteral("\"pl\":", first);
+            writeKey(out, "pl", first);
             writeStringValue(out, op.payload);
-            out.keyLiteral("\"ts\":", first);
+            writeKey(out, "ts", first);
             writeIntText(op.published_at_ms, out);
             break;
     }

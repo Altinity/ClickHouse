@@ -2341,7 +2341,7 @@ campaign. The CAS gtest battery is green. No CAS action; if pursued, it belongs 
   randomized fuzz) and by the existing pins/goldens staying green.
   - **Measured:** `BM_EncodeRefLogTxn` **753ns → 333ns, a 2.26× speedup**. Floor
     `BM_MemcpyTxnBytes` (same bytes via raw fragment `memcpy`, no validation/escaping):
-    **30.7ns**, so the migrated encoder sits at **~10.5× the floor** — short of the design's
+    **30.7ns**, so the migrated encoder sits at **~10.8× the floor** — short of the design's
     ≤3×-of-memcpy hard gate.
   - **Honest outcome on the ≤3× gate: NOT met, and a profiling investigation
     (`.superpowers/sdd/profile-encoderefllogtxn.md`) found it physically unreachable** for a
@@ -2361,7 +2361,13 @@ campaign. The CAS gtest battery is green. No CAS action; if pursued, it belongs 
     control bytes, or U+2028/U+2029 — ref names must stay through the escaping path; only 2
     fixed-vocabulary words (`refOwnerKindToWord`'s `"owner"`/`"tombstone"`) were provably safe
     to raw-append (16ns). The working tree was reverted to the clean `CasJsonWriter`
-    migration; none of this rejected ladder is in the shipped code.
+    migration; none of this rejected ladder is in the shipped code. A narrower "rung-1"
+    variant was also tried and measured separately: `CasJsonWriter::keyLiteral`, merging
+    the separator and a fully-rendered key literal (e.g. `"\"rn\":"`) into one append for the
+    fixed unprefixed keys in `writeOp`/`writeCommittedRow`, moved `BM_EncodeRefLogTxn` only
+    333ns → 325ns (~2.5%, still ~10.8× the floor) — a negligible, not-worth-a-third-key-path
+    result. `keyLiteral` was removed again; the shipped encoder keeps the single `writeKey`
+    path for clarity.
   - Spec: `docs/superpowers/specs/2026-07-20-cas-json-writer-bulk-encoding-design.md`.
   - Plan: `docs/superpowers/plans/2026-07-20-cas-json-writer-bulk-encoding.md`.
 

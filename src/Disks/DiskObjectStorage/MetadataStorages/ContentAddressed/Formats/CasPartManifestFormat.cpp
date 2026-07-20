@@ -4,7 +4,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasCodecUtil.h>
 #include <Common/Exception.h>
 #include <IO/ReadBufferFromMemory.h>
-#include <IO/WriteHelpers.h>
 #include <city.h>
 #include <algorithm>
 #include <optional>

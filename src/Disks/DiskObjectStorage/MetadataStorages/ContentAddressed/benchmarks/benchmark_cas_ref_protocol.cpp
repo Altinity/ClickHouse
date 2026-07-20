@@ -25,14 +25,15 @@
 /// BM_EncodeRefLogTxn history (this binary; acceptance gate for the CasJsonWriter migration,
 /// docs/superpowers/specs/2026-07-20-cas-json-writer-bulk-encoding-design.md):
 ///   Before CasJsonWriter, field-by-field WriteBuffer calls (baseline): 753 ns.
-///   After CasJsonWriter bulk-append migration (2026-07-20): 333 ns.
+///   After CasJsonWriter bulk-append migration (2026-07-20): 333 ns -- this is the shipped code.
 ///   BM_MemcpyTxnBytes floor (same bytes, plain String appends of 16-byte fragments): 30.7 ns.
 ///   Ratio EncodeRefLogTxn / MemcpyTxnBytes = 333 / 30.7 ~= 10.8x -- above the 3x acceptance gate.
-///   Rung-1 contingency applied (CasJsonWriter::keyLiteral merging separator+key text for the
-///   fixed unprefixed keys in writeOp/writeCommittedRow): 325 ns / 30.9 ns ~= 10.5x -- essentially
-///   unchanged; the remaining cost is not in key-separator overhead. Per the contingency ladder,
-///   rung 2 was NOT attempted (it trades readability and needs a human decision); reported as
-///   DONE_WITH_CONCERNS. CasEncodingPins.* stayed byte-identical (green) after rung 1.
+///   A `keyLiteral` "rung-1" contingency variant (merging separator+key text into one literal
+///   append for the fixed unprefixed keys in writeOp/writeCommittedRow) was also measured: 325 ns
+///   ~= 10.8x -- a negligible ~2.5% move, not worth a third key-rendering path. It was NOT shipped;
+///   writeOp/writeCommittedRow keep the single `writeKey` path for clarity. Per the contingency
+///   ladder, rung 2 was NOT attempted either (it trades readability and needs a human decision);
+///   reported as DONE_WITH_CONCERNS. CasEncodingPins.* stayed byte-identical (green) throughout.
 
 using namespace DB::Cas;
 
@@ -127,7 +128,7 @@ BENCHMARK(BM_EncodeRefLogTxn);
 /// granularity with zero formatting/escaping work. Originally an acceptance gate for the
 /// CasJsonWriter migration (docs/superpowers/specs/2026-07-20-cas-json-writer-bulk-encoding-design.md);
 /// measurement showed the <=3x-of-floor target is physically unreachable for a validating,
-/// JSON-escaping encoder (BM_EncodeRefLogTxn lands at ~10.5x this floor even after the 2.26x
+/// JSON-escaping encoder (BM_EncodeRefLogTxn lands at ~10.8x this floor even after the 2.26x
 /// CasJsonWriter speedup -- see the BACKLOG resolution for the profiled breakdown). Kept as a
 /// documented reference floor, not a pass/fail gate.
 static void BM_MemcpyTxnBytes(benchmark::State & state)

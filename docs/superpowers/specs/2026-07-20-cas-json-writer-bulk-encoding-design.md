@@ -159,7 +159,7 @@ writing, `checkBudget` over the finished text after. No new fallback paths.
 
    **Outcome (2026-07-20, honest):** the ≤3× hard gate was **NOT met**. Measured:
    `BM_EncodeRefLogTxn` 753ns → 333ns (2.26× speedup) against a `BM_MemcpyTxnBytes` floor of
-   30.7ns — a ratio of **~10.5×**, not ≤3×. A follow-up profiling pass
+   30.7ns — a ratio of **~10.8×**, not ≤3×. A follow-up profiling pass
    (`.superpowers/sdd/profile-encoderefllogtxn.md`) attributed the residual cost and found
    the ≤3× target physically unreachable at this granularity: a `memcpy`-of-precomputed-bytes
    floor does none of the validation, number formatting, or JSON escaping a correct encoder
