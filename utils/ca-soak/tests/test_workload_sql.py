@@ -38,3 +38,33 @@ def test_select_recent_sql_filters_bucket_and_recent_window():
     sql = select_recent_sql(table="ca_stress", bucket=9, seconds=600)
     assert "WHERE bucket = 9 AND ts >= now() - INTERVAL 600 SECOND" in sql
     assert sql.startswith("SELECT")
+
+
+def test_lazy_database_ddl_is_emitted(monkeypatch):
+    # setup_cluster_and_table must create the CAS table inside a lazy_load_tables database so a
+    # transient S3 error at load is retried on next access instead of stranding the table.
+    from soak import run
+    captured = []
+
+    class FakeNode:
+        container = "ch1"
+
+        def command(self, sql, timeout=None):
+            captured.append(sql)
+
+        def scalar(self, sql):
+            return "0"
+
+    class FakeCluster:
+        def __init__(self, *a, **k):
+            self.node1 = FakeNode()
+
+        def nodes(self):
+            return [FakeNode()]
+
+    monkeypatch.setattr(run, "Cluster", FakeCluster)
+    run.setup_cluster_and_table(seed=1, phase="test", ops=1, workers=1, checkpoint_every=1)
+
+    joined = "\n".join(captured)
+    assert "CREATE DATABASE IF NOT EXISTS ca_soak" in joined
+    assert "lazy_load_tables = 1" in joined

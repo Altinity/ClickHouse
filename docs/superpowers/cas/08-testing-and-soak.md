@@ -560,6 +560,31 @@ between them; a server that does not recover within the bound is a correctness f
   exactly. A fault that delays TTL materialization can leave the band non-empty. Mitigation: disable
   TTL in the soak table for long chaos runs, or widen the ambiguous-band wait.
 
+### 4.7 `lazy_load_tables` for CAS databases {#lazy-load-cas-databases}
+
+Host CAS tables in a database created with `lazy_load_tables = 1`:
+
+```sql
+CREATE DATABASE ca_soak ENGINE = Atomic SETTINGS lazy_load_tables = 1;
+```
+
+Why: without it, if the object store is briefly unreachable while a CAS table's async startup runs
+its ref-table recovery, the recovery seal `PUT` throws `NETWORK_ERROR`, and ClickHouse's
+`AsyncLoader` records the table's `load table` job as `FAILED` **terminally**. Every later touch
+(`SELECT`, `ATTACH`, even `DETACH`) then rethrows the cached error, and the only recovery is a full
+server restart — a permanent outage from a transient blip. With `lazy_load_tables = 1` the table
+attaches as a lightweight proxy and its real storage is built on first access, so a failed startup
+surfaces as a per-query error and is retried on the next access instead of being cached `FAILED`.
+
+Caveat: a lazily-loaded table does not start its background activity (replication queue, merges)
+until its first access. This pairs with the CAS-side bounded recovery retry
+(`cas_request_budget.recovery_retry_budget_ms`, default 120 s) which rides out short blips within a
+single startup; `lazy_load_tables` is the backstop for a blip that outlasts that budget. The soak
+harness creates its `ca_stress` table in a `ca_soak` lazy database for exactly this reason. See
+`docs/superpowers/specs/2026-07-20-cas-table-load-stuck-asyncloader-design.md` and the BACKLOG entry
+"a transient S3-backend NETWORK_ERROR during CAS table-startup recovery permanently strands the
+table".
+
 ## 5. Standing findings and backlog {#backlog}
 
 The authoritative finding log is `utils/ca-soak/scenarios/BACKLOG.md` (newest at bottom).

@@ -232,11 +232,13 @@ class Node:
     # resurrect-vs-GC race (B137), and OPTIMIZE under merge churn is similarly slow. A tight timeout
     # turns a slow-but-progressing op into a spurious socket TimeoutError. The overall run is still
     # bounded by the `timeout` wrapping `run_phase1.sh`, so this is transient tolerance, not a hang mask.
-    def __init__(self, host: str, port: int, container: str | None = None, timeout: float = 300.0):
+    def __init__(self, host: str, port: int, container: str | None = None, timeout: float = 300.0,
+                 database: str = "default"):
         self.host = host
         self.port = port
         self.container = container
         self.timeout = timeout
+        self.database = database
 
     @property
     def url(self) -> str:
@@ -249,10 +251,13 @@ class Node:
         `settings` are passed as URL query params (ClickHouse reads per-query settings from the URL),
         used to align the SERVER-side bound (`receive_timeout`/`max_execution_time`) with the client
         socket timeout for blocking admin ops so a slow-but-progressing large-pool op is not tripped by
-        a server-side HTTP-408 `TIMEOUT_EXCEEDED`."""
-        url = self.url
+        a server-side HTTP-408 `TIMEOUT_EXCEEDED`. `self.database` is always sent as the default
+        database so bare table names resolve there (used to host the CAS table in a lazy_load_tables
+        database)."""
+        params = {"database": self.database}
         if settings:
-            url = url + "?" + urllib.parse.urlencode(settings)
+            params.update(settings)
+        url = self.url + "?" + urllib.parse.urlencode(params)
         data = sql.encode("utf-8")
         req = urllib.request.Request(url, data=data, method="POST")
         try:
@@ -482,7 +487,7 @@ class Cluster:
     scenarios such as S12 (10 replicas, docker-compose-10replicas.yml). `node1`/`node2` stay valid
     for all the 2-node callers; `nodes()` returns the full tuple so N-aware code addresses ch1..chN."""
 
-    def __init__(self, node_count: int | None = None, **kw):
+    def __init__(self, node_count: int | None = None, database: str = "default", **kw):
         def cfg(name):
             env = os.environ.get("CA_SOAK_" + name.upper())
             if env is not None:
@@ -498,7 +503,8 @@ class Cluster:
         self._nodes = [
             Node(_node_cfg(i, "host", kw.get(f"node{i}_host", "localhost")),
                  _node_cfg(i, "port", kw.get(f"node{i}_port", 8122 + i)),
-                 _node_cfg(i, "container", kw.get(f"node{i}_container", f"ca-soak-ch{i}-1")))
+                 _node_cfg(i, "container", kw.get(f"node{i}_container", f"ca-soak-ch{i}-1")),
+                 database=database)
             for i in range(1, node_count + 1)
         ]
         self.gc_interval_s = cfg("gc_interval_s")

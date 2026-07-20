@@ -68,6 +68,11 @@ from soak.pool import pool_size
 from soak.schedule import stage_plan, stage_at, chaos_window, StageKind
 
 TABLE = "ca_stress"
+# Dedicated Atomic database with lazy_load_tables=1 so a transient S3 error at CAS table load is
+# retried on next access instead of stranding the table (see
+# docs/superpowers/specs/2026-07-20-cas-table-load-stuck-asyncloader-design.md). The table name stays
+# bare; the workload connection's default database is set to DB.
+DB = "ca_soak"
 FSCK_CONTAINER = "ca-soak-ch1-1"
 
 MAX_CLIFFS = 2
@@ -1102,7 +1107,15 @@ def _last_fault_dict(chaos):
 def setup_cluster_and_table(seed, phase, ops, workers, checkpoint_every):
     """Shared bring-up for all phases: connect, capture base_time, recreate the CA table on both
     replicas, return (cluster, model, base_time)."""
-    cluster = Cluster()
+    cluster = Cluster(database=DB)
+    # CREATE DATABASE must run against the default database (DB does not exist yet on a fresh stand);
+    # a DB-scoped connection would fail UNKNOWN_DATABASE first. Use a throwaway default-scoped cluster
+    # just for the CREATE DATABASE. lazy_load_tables=1 makes a transient S3 error during CAS table
+    # startup surface per-query and retry on next access, instead of stranding the table in a
+    # permanently-FAILED AsyncLoader job until server restart.
+    bootstrap = Cluster()
+    for node in bootstrap.nodes():
+        node.command(f"CREATE DATABASE IF NOT EXISTS {DB} ENGINE = Atomic SETTINGS lazy_load_tables = 1")
     base_time = int(cluster.node1.scalar("SELECT toUnixTimestamp(now())")) - 60
     log(f"base_time={base_time} (needed for replay) seed={seed} phase={phase} "
         f"ops={ops} workers={workers} checkpoint_every={checkpoint_every}")
@@ -1119,7 +1132,7 @@ def setup_cluster_and_table(seed, phase, ops, workers, checkpoint_every):
             log(f"setup DROP {TABLE} SYNC on {node.container} took {dt:.1f}s (large CA/S3 table)")
     for node in cluster.nodes():
         node.command(ddl)
-    log(f"created {TABLE} on both replicas")
+    log(f"created {DB}.{TABLE} on both replicas (lazy_load_tables=1)")
     return cluster, model, base_time
 
 
@@ -1511,7 +1524,13 @@ def main(argv=None):
     if args.ops is None or args.checkpoint_every is None:
         ap.error("--ops and --checkpoint-every are required for phase 1/2")
 
-    cluster = Cluster()
+    cluster = Cluster(database=DB)
+    # CREATE DATABASE against the default database first (DB does not exist yet on a fresh stand);
+    # lazy_load_tables=1 => a transient S3 error at CAS table startup is retried on next access
+    # instead of stranding the table in a permanently-FAILED AsyncLoader job (see setup_cluster_and_table).
+    bootstrap = Cluster()
+    for node in bootstrap.nodes():
+        node.command(f"CREATE DATABASE IF NOT EXISTS {DB} ENGINE = Atomic SETTINGS lazy_load_tables = 1")
 
     # Capture base_time ONCE, 60s in the past, so freshly-inserted rows are NOT born expired.
     base_time = int(cluster.node1.scalar("SELECT toUnixTimestamp(now())")) - 60
@@ -1526,7 +1545,7 @@ def main(argv=None):
         node.command(f"DROP TABLE IF EXISTS {TABLE} SYNC")
     for node in cluster.nodes():
         node.command(ddl)
-    log(f"created {TABLE} on both replicas")
+    log(f"created {DB}.{TABLE} on both replicas (lazy_load_tables=1)")
 
     ledger = generate_ledger(args.seed, args.ops)
     min_gap = args.min_ops_between_cliffs if args.min_ops_between_cliffs is not None else max(1, args.ops // 4)
