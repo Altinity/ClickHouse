@@ -2,7 +2,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Common/Exception.h>
 #include <IO/ReadBufferFromMemory.h>
-#include <IO/WriteBufferFromString.h>
 #include <IO/WriteHelpers.h>
 
 namespace DB
@@ -31,7 +30,7 @@ String readBodyLine(ReadBuffer & in, FormatId id, std::string_view what)
 
 String encodeOwner(const OwnerObject & o)
 {
-    WriteBufferFromOwnString out;
+    CasJsonWriter out(256);
     writeHeaderLine(out, FormatId::Owner);
     bool first = true;
     writeKey(out, "su", first);
@@ -43,8 +42,7 @@ String encodeOwner(const OwnerObject & o)
     }
     closeObject(out, first);
     writeChar('\n', out);
-    out.finalize();
-    return out.str();
+    return std::move(out).take();
 }
 
 OwnerObject decodeOwner(std::string_view data)
@@ -81,15 +79,14 @@ OwnerObject decodeOwner(std::string_view data)
 
 String encodeServerEpoch(const ServerEpoch & e)
 {
-    WriteBufferFromOwnString out;
+    CasJsonWriter out(256);
     writeHeaderLine(out, FormatId::ServerEpoch);
     bool first = true;
     writeKey(out, "nwe", first);
     writeU64StringValue(out, e.next_writer_epoch);
     closeObject(out, first);
     writeChar('\n', out);
-    out.finalize();
-    return out.str();
+    return std::move(out).take();
 }
 
 ServerEpoch decodeServerEpoch(std::string_view data)
@@ -122,7 +119,7 @@ ServerEpoch decodeServerEpoch(std::string_view data)
 
 String encodeMountLease(const MountLease & m)
 {
-    WriteBufferFromOwnString out;
+    CasJsonWriter out(256);
     writeHeaderLine(out, FormatId::MountLease);
     bool first = true;
     writeKey(out, "su", first);  writeHex128Value(out, m.server_uuid);
@@ -136,8 +133,7 @@ String encodeMountLease(const MountLease & m)
     writeKey(out, "fen", first); writeBoolValue(out, m.gc_fenced);
     closeObject(out, first);
     writeChar('\n', out);
-    out.finalize();
-    return out.str();
+    return std::move(out).take();
 }
 
 MountLease decodeMountLease(std::string_view data)

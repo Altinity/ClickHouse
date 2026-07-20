@@ -2,7 +2,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Common/Exception.h>
 #include <IO/ReadBufferFromMemory.h>
-#include <IO/WriteBufferFromString.h>
 #include <IO/WriteHelpers.h>
 
 namespace DB
@@ -108,7 +107,7 @@ String encodeEnvelopeHeader(EnvelopeHeader & header, uint32_t blob_header_len)
     /// only truncated field, appended last so the truncation never disturbs another field.
     String json;
     {
-        WriteBufferFromOwnString buf;
+        CasJsonWriter buf(256);
         bool first = true;
         writeKey(buf, "type", first); writeStringValue(buf, kBlobType);
         writeKey(buf, "v", first);    writeIntText(currentCompatibilityVersion(), buf);
@@ -126,8 +125,7 @@ String encodeEnvelopeHeader(EnvelopeHeader & header, uint32_t blob_header_len)
         {
             writeKey(buf, "!x", first); writeStringValue(buf, "1");
         }
-        buf.finalize();
-        json = buf.str();   /// e.g. {"type":"cas_blob","v":3,...,"ch":26006001   (no ref, no closing brace)
+        json = std::move(buf).take();   /// e.g. {"type":"cas_blob","v":3,...,"ch":26006001   (no ref, no closing brace)
     }
 
     /// Optional `ref`, truncated to the exact remaining budget. Layout after this block:

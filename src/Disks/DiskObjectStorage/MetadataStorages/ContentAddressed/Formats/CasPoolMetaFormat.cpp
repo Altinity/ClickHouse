@@ -3,7 +3,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasWireVocab.h>
 #include <Common/Exception.h>
 #include <IO/ReadBufferFromMemory.h>
-#include <IO/WriteBufferFromString.h>
 #include <IO/WriteHelpers.h>
 
 namespace DB
@@ -71,7 +70,7 @@ void validatePoolAlgosUsed(const std::vector<uint8_t> & algos_used, int error_co
 
 String encodePoolMeta(const PoolMeta & pm)
 {
-    WriteBufferFromOwnString out;
+    CasJsonWriter out(256);
     writeHeaderLine(out, FormatId::PoolMeta);
 
     bool first = true;
@@ -96,8 +95,7 @@ String encodePoolMeta(const PoolMeta & pm)
     closeObject(out, first);
     writeChar('\n', out);
 
-    out.finalize();
-    return out.str();
+    return std::move(out).take();
 }
 
 PoolMeta decodePoolMeta(std::string_view data)

@@ -2,7 +2,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Common/Exception.h>
 #include <IO/ReadBufferFromMemory.h>
-#include <IO/WriteBufferFromString.h>
 #include <IO/WriteHelpers.h>
 
 namespace DB
@@ -43,7 +42,7 @@ MetaState metaStateFromWord(std::string_view w)
 
 String encodeBlobMeta(const BlobMeta & meta)
 {
-    WriteBufferFromOwnString out;
+    CasJsonWriter out(256);
     writeHeaderLine(out, FormatId::BlobMeta);
     // `version` is represented by the header line. The JSON body contains only fields that describe
     // the current marker and its accounting data.
@@ -56,8 +55,7 @@ String encodeBlobMeta(const BlobMeta & meta)
     writeU64StringValue(out, meta.size);
     closeObject(out, first);
     writeChar('\n', out);
-    out.finalize();
-    return out.str();
+    return std::move(out).take();
 }
 
 BlobMeta decodeBlobMeta(std::string_view bytes)
