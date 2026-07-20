@@ -49,20 +49,29 @@ def test_lazy_cas_table_self_heals_after_s3_recovery(start_cluster):
     # disk mounts at startup while S3 is up, the storage is built only on first access below).
     node.restart_clickhouse()
 
-    # Touch the table while S3 is unreachable: the lazy first-access build cannot complete. This is a
-    # best-effort probe -- the point is NOT how it fails, only that (unlike a non-lazy FAILED
-    # AsyncLoader job) it leaves NO permanently-cached failure. A bounded client timeout keeps the
-    # probe short; the server-side build may keep waiting on S3 until it returns, below.
+    # Touch the table while S3 is unreachable: the lazy first-access build (its CAS ref-recovery LIST
+    # over the object store) cannot complete, so the client query fails within its bounded timeout.
+    # Note: the build does NOT fail fast server-side -- it blocks on the object store's own retry until
+    # S3 returns (see the BACKLOG "block-until-recovered" note); the client-side timeout is what makes
+    # this probe short. We assert the probe DID hit the outage (raised): the build needs several object-
+    # store round-trips, so the freezer (effective within milliseconds of `pause_container` returning)
+    # reliably catches it -- if this ever flakes, the pause raced a sub-millisecond full build, not a
+    # real self-heal regression.
     with cluster.pause_container("rustfs1", wait_for_paused=False):
+        probe_raised = False
         try:
             node.query("SELECT count() FROM lazy_db.t", timeout=30)
         except Exception:
-            pass  # expected while the object store is unreachable
+            probe_raised = True  # expected while the object store is unreachable
+        assert probe_raised, "the probe should have failed while S3 was unreachable (did the pause race the build?)"
 
     # S3 is back (context exit unpaused rustfs). WITHOUT a server restart and WITHOUT any DETACH, a
-    # later access must make the table usable again -- the lazy proxy retries/completes the build. A
-    # non-lazy table whose load had failed would stay FAILED until a full restart; this is the
-    # difference the test asserts.
+    # later access must make the table usable again. This proves the key Layer 2 property: a transient
+    # object-store outage during a lazy CAS table's first-access build leaves NO permanently-cached
+    # AsyncLoader FAILED state (a non-lazy table whose load failed would stay FAILED until a full server
+    # restart). What actually recovers here is the original in-flight build completing once S3 returns
+    # (the block-until-recovered path), which is sufficient for "usable again without restart"; this
+    # test does not (and, given block-until-recovered, cannot) assert a proxy retry of a THROWN build.
     deadline = time.time() + 180
     last = None
     while time.time() < deadline:
