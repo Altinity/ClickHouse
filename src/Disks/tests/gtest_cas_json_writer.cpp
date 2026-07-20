@@ -122,27 +122,3 @@ TEST(CasJsonWriterEscaping, FuzzMatchesWriteJSONString)
         ASSERT_EQ(writerJson(s), referenceJson(s)) << "iter " << iter;
     }
 }
-
-TEST(CasJsonWriterEscaping, VectorAndScalarScansAgree)
-{
-    std::mt19937 rng(20260721);
-    for (int iter = 0; iter < 2000; ++iter)
-    {
-        const size_t len = rng() % 100;
-        String s(len, '\0');
-        for (auto & c : s)
-            c = static_cast<char>(rng() % 256);
-        const char * b = s.data();
-        const char * e = s.data() + s.size();
-        const char * pos = b;
-        while (true)
-        {
-            const char * v = DB::Cas::findNextSpecialJsonByte(pos, e);
-            const char * sc = DB::Cas::findNextSpecialJsonByteScalar(pos, e);
-            ASSERT_EQ(v, sc) << "iter " << iter << " offset " << (pos - b);
-            if (v == e)
-                break;
-            pos = v + 1;
-        }
-    }
-}

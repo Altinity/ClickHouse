@@ -8,16 +8,9 @@
 #include <base/hex.h>
 #include <base/scope_guard.h>
 #include <algorithm>
-#include <bit>
 #include <cstring>
 #include <limits>
 #include <zstd.h>
-
-#if defined(__SSE2__)
-#include <emmintrin.h>
-#elif defined(__aarch64__)
-#include <arm_neon.h>
-#endif
 
 namespace DB
 {
@@ -71,51 +64,12 @@ constexpr bool isSpecialJsonByte(unsigned char c)
 }
 }
 
-const char * findNextSpecialJsonByteScalar(const char * pos, const char * end)
+const char * findNextSpecialJsonByte(const char * pos, const char * end)
 {
     for (; pos != end; ++pos)
         if (isSpecialJsonByte(static_cast<unsigned char>(*pos)))
             return pos;
     return end;
-}
-
-const char * findNextSpecialJsonByte(const char * pos, const char * end)
-{
-#if defined(__SSE2__)
-    const __m128i quote = _mm_set1_epi8('"');
-    const __m128i backslash = _mm_set1_epi8('\\');
-    const __m128i e2 = _mm_set1_epi8('\xE2');
-    const __m128i ctl_bound = _mm_set1_epi8(0x1F);
-    for (; pos + 16 <= end; pos += 16)
-    {
-        const __m128i chunk = _mm_loadu_si128(reinterpret_cast<const __m128i *>(pos));
-        /// unsigned c <= 0x1F  <=>  min(c, 0x1F) == c
-        const __m128i is_ctl = _mm_cmpeq_epi8(_mm_min_epu8(chunk, ctl_bound), chunk);
-        const __m128i hit = _mm_or_si128(
-            _mm_or_si128(is_ctl, _mm_cmpeq_epi8(chunk, quote)),
-            _mm_or_si128(_mm_cmpeq_epi8(chunk, backslash), _mm_cmpeq_epi8(chunk, e2)));
-        if (const unsigned mask = static_cast<unsigned>(_mm_movemask_epi8(hit)))
-            return pos + std::countr_zero(mask);
-    }
-#elif defined(__aarch64__)
-    const uint8x16_t quote = vdupq_n_u8('"');
-    const uint8x16_t backslash = vdupq_n_u8('\\');
-    const uint8x16_t e2 = vdupq_n_u8(0xE2);
-    const uint8x16_t ctl_bound = vdupq_n_u8(0x20);
-    for (; pos + 16 <= end; pos += 16)
-    {
-        const uint8x16_t chunk = vld1q_u8(reinterpret_cast<const uint8_t *>(pos));
-        const uint8x16_t hit = vorrq_u8(
-            vorrq_u8(vcltq_u8(chunk, ctl_bound), vceqq_u8(chunk, quote)),
-            vorrq_u8(vceqq_u8(chunk, backslash), vceqq_u8(chunk, e2)));
-        /// Narrow each byte lane to a nibble: any hit -> nonzero nibble in the u64 mask.
-        const uint64_t mask
-            = vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(hit), 4)), 0);
-        if (mask)
-            return pos + (std::countr_zero(mask) >> 2);
-    }
-#endif
-    return findNextSpecialJsonByteScalar(pos, end);
 }
 
 void CasJsonWriter::stringValue(std::string_view s)

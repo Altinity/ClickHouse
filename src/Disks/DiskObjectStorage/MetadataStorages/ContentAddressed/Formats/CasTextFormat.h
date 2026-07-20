@@ -226,10 +226,9 @@ std::optional<TextHeader> sniffHeaderLine(std::string_view bytes);
 String readLine(ReadBuffer & in, uint64_t line_cap, std::string_view what);
 
 /// Position of the next byte `stringValue` treats specially (control byte, '"', '\\', or the
-/// 0xE2 lead byte of the U+2028/U+2029 lookahead), or `end`. The scalar variant is the
-/// reference implementation, exposed so tests can cross-check the vectorized dispatch.
+/// 0xE2 lead byte of the U+2028/U+2029 lookahead), or `end`. Scalar bulk-run scan: the win is on
+/// the short hot strings, so SIMD is deferred to a benchmark-gated contingency.
 const char * findNextSpecialJsonByte(const char * pos, const char * end);
-const char * findNextSpecialJsonByteScalar(const char * pos, const char * end);
 
 /// Zstd detection and per-format compression policy.
 
