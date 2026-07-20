@@ -102,10 +102,11 @@ TEST(CasEncodingPins, SourceEdgeRunLines)
     /// The exact "b" rendering (algo byte + digest hex) is pinned as a whole line; the point is
     /// that Task 8's line-scratch rewrite must reproduce it byte-for-byte.
     const String text = out.str();
-    EXPECT_TRUE(text.starts_with("{\"type\":\"cas_run\",\"v\":3,\"kind\":\"source_edge\"}\n")) << text;
-    EXPECT_TRUE(text.ends_with("{\"n\":1}\n")) << text;
-    /// Pin the full middle line too:
+    const String header = "{\"type\":\"cas_run\",\"v\":3,\"kind\":\"source_edge\"}\n";
     const String expected_record =
         "{\"b\":\"0100000000000000000000000000000002\",\"s\":\"00000000000000000000000000000005\",\"m\":\"edge\"}\n";
-    EXPECT_NE(text.find(expected_record), String::npos) << text;
+    const String trailer = "{\"n\":1}\n";
+    /// There is exactly one record, so the whole buffer must be byte-identical to header + record + trailer.
+    const String expected_full = header + expected_record + trailer;
+    EXPECT_EQ(text, expected_full) << text;
 }
