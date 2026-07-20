@@ -12,6 +12,10 @@ CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 #     "SYSTEM CONTENT ADDRESSED GC REBUILD" right then permits REBUILD.
 #  2) "SYSTEM CONTENT ADDRESSED GC REBUILD" with NO disk is a SYNTAX_ERROR (required disk);
 #     naming a non-content-addressed disk yields BAD_ARGUMENTS (not a silent all-disks fan-out).
+#  3) A user with ZERO grants gets ACCESS_DENIED on the plain
+#     "SYSTEM CONTENT ADDRESSED GARBAGE COLLECTION 'no_such_disk'" -- the privilege check runs
+#     before disk resolution, so denial fires even though the named disk does not exist (it would
+#     otherwise be UNKNOWN_DISK).
 # (No CA disk needs to exist: the privilege check and the grammar/required-disk check both fire
 #  before any disk I/O; assert on the specific error codes. The `default` disk always exists and is
 #  never content-addressed, so it deterministically yields BAD_ARGUMENTS once a check is passed.)
@@ -44,6 +48,19 @@ SYSTEM CONTENT ADDRESSED GC REBUILD; -- { clientError SYNTAX_ERROR }
 SYSTEM CONTENT ADDRESSED GC REBUILD default; -- { serverError BAD_ARGUMENTS }
 """
 
+# A zero-grant user is denied before the disk is even resolved: naming a disk that does not exist
+# still yields ACCESS_DENIED, not UNKNOWN_DISK.
+${CLICKHOUSE_CLIENT} --multiline -q """
+DROP USER IF EXISTS user_test_05011_zero_grants;
+CREATE USER user_test_05011_zero_grants IDENTIFIED WITH plaintext_password BY 'user_test_05011_zero_grants';
+REVOKE ALL ON *.* FROM user_test_05011_zero_grants;
+"""
+
+${CLICKHOUSE_CLIENT} --multiline --user user_test_05011_zero_grants --password user_test_05011_zero_grants -q """
+SYSTEM CONTENT ADDRESSED GARBAGE COLLECTION 'no_such_disk'; -- { serverError ACCESS_DENIED }
+"""
+
 ${CLICKHOUSE_CLIENT} --multiline -q """
 DROP USER IF EXISTS user_test_05011;
+DROP USER IF EXISTS user_test_05011_zero_grants;
 """
