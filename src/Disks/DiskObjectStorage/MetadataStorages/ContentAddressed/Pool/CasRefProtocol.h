@@ -282,8 +282,9 @@ uint64_t encodedRemovalBudgetSize(const RefTableState & state);
 /// `admits` applies `op` to a scratch copy and reads `framing + total` via `encodedSnapshotBudgetSize`
 /// / `encodedRemovalBudgetSize`, making the whole check O(touched rows) instead of O(table size). This
 /// is byte-exact rather than a drift-prone estimate: both budget encodings are pure per-row sums, the
-/// per-row contributions come from the same codec primitives the full encoders use, and a debug-only
-/// recompute-and-compare `chassert` (`debugAssertBodyCounters`) proves equality on every applied op.
+/// per-row contributions come from the same codec primitives the full encoders use, and a
+/// debug/sanitizer-only recompute-and-compare `chassert` (`debugAssertBodyCounters`) reasserts equality
+/// on every applied transaction and every `admits` preview.
 bool admits(const RefTableState & state, const RefOp & op, uint64_t snapshot_budget, uint64_t removal_budget);
 
 /// Pure ref-log intake primitives for a GC round. None of these read a
