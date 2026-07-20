@@ -31,6 +31,7 @@
 #include <Functions/CastOverloadResolver.h>
 #include <Interpreters/castColumn.h>
 #include <DataTypes/DataTypeString.h>
+#include <DataTypes/TimezoneMixin.h>
 #endif
 
 namespace ProfileEvents
@@ -145,20 +146,61 @@ namespace ExportPartitionUtils
     }
 
     Block getPartitionSourceBlockForIcebergCommit(
-        MergeTreeData & storage, const String & partition_id)
+        MergeTreeData & storage, const String & partition_id, const std::vector<String> & exported_part_names)
     {
         auto lock = storage.readLockParts();
         const auto parts = storage.getDataPartsVectorInPartitionForInternalUsage(
-            MergeTreeDataPartState::Active, partition_id, lock);
+            {MergeTreeDataPartState::Active, MergeTreeDataPartState::Outdated}, partition_id, lock);
 
-        if (parts.empty())
+        /// Derive the representative only from the exact parts that were validated and exported (recorded
+        /// in the manifest), never from unrelated parts inserted/merged after scheduling: those could map
+        /// to a different Iceberg partition and stamp metadata that does not match the exported files.
+        const std::unordered_set<String> exported(exported_part_names.begin(), exported_part_names.end());
+        MergeTreeData::DataPartsVector exported_parts;
+        for (const auto & part : parts)
+            if (exported.contains(part->name) && part->minmax_idx && part->minmax_idx->initialized)
+                exported_parts.push_back(part);
+
+        if (exported_parts.empty())
             throw Exception(ErrorCodes::NO_SUCH_DATA_PART,
-                "Cannot find active part for partition_id '{}' to derive Iceberg partition "
-                "values. Edge case: the partition may have been dropped after export started, "
-                "or this replica has not yet received any part for this partition. "
-                "The commit will be retried.",
+                "Cannot find any of the exported parts for partition_id '{}' to derive Iceberg partition "
+                "values. They may have been merged and cleaned up before this commit, or are not present "
+                "on this replica. The commit will be retried.",
                 partition_id);
-        return parts.front()->minmax_idx->getBlock(storage);
+
+        /// The gate proved the exported parts map to a single Iceberg partition, so any exported part's
+        /// values yield the same tuple; fold the global min across them as a deterministic representative.
+        const auto metadata_snapshot = storage.getInMemoryMetadataPtr();
+        const auto & partition_key = metadata_snapshot->getPartitionKey();
+        const auto minmax_column_names = MergeTreeData::getMinMaxColumnsNames(partition_key);
+        const auto minmax_column_types = MergeTreeData::getMinMaxColumnsTypes(partition_key);
+
+        Block block;
+        for (size_t i = 0; i < minmax_column_types.size(); ++i)
+        {
+            Field min_value;
+            bool found = false;
+            for (const auto & part : exported_parts)
+            {
+                if (i >= part->minmax_idx->hyperrectangle.size())
+                    continue;
+                auto range = part->minmax_idx->hyperrectangle[i];
+                range.shrinkToIncludedIfPossible();
+                if (!found || range.left < min_value)
+                {
+                    min_value = range.left;
+                    found = true;
+                }
+            }
+
+            auto column = minmax_column_types[i]->createColumn();
+            if (found)
+                column->insert(min_value);
+            else
+                column->insertDefault();
+            block.insert(ColumnWithTypeAndName(column->getPtr(), minmax_column_types[i], minmax_column_names[i]));
+        }
+        return block;
     }
 
     ContextPtr getContextCopyWithTaskSettings(const ContextPtr & context, const ExportReplicatedMergeTreePartitionManifest & manifest)
@@ -323,7 +365,7 @@ namespace ExportPartitionUtils
             iceberg_args.metadata_json_string = manifest.iceberg_metadata_json;
             if (source_storage.getInMemoryMetadataPtr()->hasPartitionKey())
                 iceberg_args.partition_source_block =
-                    getPartitionSourceBlockForIcebergCommit(source_storage, manifest.partition_id);
+                    getPartitionSourceBlockForIcebergCommit(source_storage, manifest.partition_id, manifest.parts);
         }
 
         destination_storage->commitExportPartitionTransaction(manifest.transaction_id, manifest.partition_id, exported_paths, iceberg_args, context);
@@ -668,6 +710,7 @@ namespace
         String column;
         std::optional<String> transform;
         std::optional<Int64> argument;
+        std::optional<String> time_zone;
     };
 
     std::vector<SourcePartitionTerm> parseSourcePartitionTerms(const ASTPtr & partition_key_ast)
@@ -685,7 +728,7 @@ namespace
         {
             if (const auto * ident = element->as<ASTIdentifier>())
             {
-                terms.push_back({ident->name(), std::optional<String>("identity"), std::nullopt});
+                terms.push_back({ident->name(), std::optional<String>("identity"), std::nullopt, std::nullopt});
                 return;
             }
 
@@ -695,6 +738,7 @@ namespace
 
             std::optional<String> column;
             std::optional<Int64> argument;
+            std::optional<String> time_zone;
             for (const auto & child : func->children)
             {
                 const auto * expression_list = child->as<ASTExpressionList>();
@@ -702,9 +746,12 @@ namespace
                     continue;
                 for (const auto & arg : expression_list->children)
                 {
+                    const auto * lit = arg->as<ASTLiteral>();
                     if (const auto * id = arg->as<ASTIdentifier>())
                         column = id->name();
-                    else if (const auto * lit = arg->as<ASTLiteral>(); lit && lit->value.getType() != Field::Types::String)
+                    else if (lit && lit->value.getType() == Field::Types::String)
+                        time_zone = lit->value.safeGet<String>();
+                    else if (lit)
                         argument = lit->value.safeGet<Int64>();
                 }
             }
@@ -714,7 +761,7 @@ namespace
             std::optional<String> transform;
             if (iceberg_representable.contains(func->name))
                 transform = func->name;
-            terms.push_back({*column, transform, argument});
+            terms.push_back({*column, transform, argument, time_zone});
         };
 
         if (const auto * func = partition_key_ast->as<ASTFunction>(); func && func->name == "tuple")
@@ -838,6 +885,18 @@ namespace
         const auto destination_sample = destination_metadata->getSampleBlockNonMaterialized();
         const String partition_timezone = context->getSettingsRef()[Setting::iceberg_partition_timezone];
 
+        /// year/month/day/hour depend on the timezone (for DateTime); the structural fast path is only
+        /// sound when the source and destination evaluate them in the same timezone.
+        static const std::unordered_set<String> timezone_sensitive_transforms = {
+            "toYearNumSinceEpoch", "toMonthNumSinceEpoch", "toRelativeDayNum", "toRelativeHourNum"};
+
+        auto column_explicit_time_zone = [](const DataTypePtr & type) -> String
+        {
+            if (const auto * tz = dynamic_cast<const TimezoneMixin *>(type.get()); tz && tz->hasExplicitTimeZone())
+                return tz->getTimeZone().getTimeZone();
+            return "";
+        };
+
         for (UInt32 i = 0; i < actual_size; ++i)
         {
             const auto af = actual_fields->getObject(i);
@@ -851,15 +910,48 @@ namespace
 
             /// Fast path: the source already applies the matching transform on this column, so every
             /// source partition is single-valued for this field by construction (covers bucket too).
+            /// It is only taken when the transform semantics are provably identical. identity is
+            /// exempt: an identity source partition is already a single value, so it stays single-valued
+            /// under any cast. Every other transform is applied to the destination column type, so a
+            /// structural match requires identical types (icebergTruncate/icebergBucket are numeric on
+            /// integers but byte-wise on strings, so a pre-transform cast that changes the type changes
+            /// the result); year/month/day/hour on DateTime additionally require the same effective
+            /// timezone. Mismatches fall through to the dynamic proof, which evaluates the destination
+            /// transform on the real data.
             bool matched_structurally = false;
             for (const auto & term : source_terms)
             {
-                if (term.column == column && term.transform && dest_canonical
-                    && *term.transform == dest_canonical->transform_name && term.argument == dest_argument)
+                if (term.column != column || !term.transform || !dest_canonical
+                    || *term.transform != dest_canonical->transform_name || term.argument != dest_argument)
+                    continue;
+
+                const auto & transform_name = dest_canonical->transform_name;
+                if (transform_name != "identity")
                 {
-                    matched_structurally = true;
-                    break;
+                    const auto slot_it = std::find(minmax_column_names.begin(), minmax_column_names.end(), column);
+                    if (slot_it == minmax_column_names.end() || !destination_sample.has(column))
+                        continue;
+                    const auto & structural_source_type = minmax_column_types[slot_it - minmax_column_names.begin()];
+                    const auto & structural_dest_type = destination_sample.getByName(column).type;
+                    if (!structural_source_type->equals(*structural_dest_type))
+                        continue;
+
+                    if (timezone_sensitive_transforms.contains(transform_name))
+                    {
+                        const WhichDataType which(structural_source_type);
+                        if (which.isDateTime() || which.isDateTime64())
+                        {
+                            const String source_tz = term.time_zone.value_or(column_explicit_time_zone(structural_source_type));
+                            const String dest_tz = partition_timezone.empty()
+                                ? column_explicit_time_zone(structural_dest_type) : partition_timezone;
+                            if (source_tz != dest_tz)
+                                continue;
+                        }
+                    }
                 }
+
+                matched_structurally = true;
+                break;
             }
             if (matched_structurally)
                 continue;

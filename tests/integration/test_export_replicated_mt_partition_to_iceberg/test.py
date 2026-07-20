@@ -1951,18 +1951,18 @@ def run_partition_compat_cases(node, cases):
         assert_iceberg_partition_metadata(node, iceberg_table, f"{case['name']}_{uid}", fields)
 
 
-def test_export_partition_bucket_transform_metadata_matches_data(cluster):
-    """A bucket[N] partition column whose type changes Int64 -> String records the
-    destination murmur(String) bucket in the Iceberg metadata, matching the exported
-    data rather than the source hashLong bucket."""
+def test_export_partition_bucket_type_change_rejected(cluster):
+    """A bucket[N] partition column whose type changes (Int64 -> String) is rejected. The source
+    hashLong grouping differs from the destination murmur(String) grouping, so a single source bucket
+    can fan out across several destination buckets; bucket is not order-preserving, so this cannot be
+    proven dynamically and must be rejected. This previously slipped through the structural fast path,
+    which matched on transform name and width while ignoring the pre-transform cast."""
     node = cluster.instances["replica1"]
 
     uid = unique_suffix()
     mt_table = f"mt_bucket_xform_{uid}"
     iceberg_table = f"iceberg_bucket_xform_{uid}"
 
-    # N=16, key=42 diverges: icebergBucket(16, 42::Int64)=14 (source/old hashLong) but
-    # icebergBucket(16, '42')=6 (destination/new murmur over the exported String).
     make_rmt(node, mt_table, "id Int64, key Int64", "icebergBucket(16, key)",
              replica_name="replica1")
     node.query(f"INSERT INTO {mt_table} VALUES (1, 42), (2, 42)")
@@ -1971,27 +1971,118 @@ def test_export_partition_bucket_transform_metadata_matches_data(cluster):
                     partition_by="icebergBucket(16, key)")
 
     pid = first_partition_id(node, mt_table)
-    node.query(
+    error = node.query_and_get_error(
         f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{pid}' TO TABLE {iceberg_table}",
         settings={"allow_insert_into_iceberg": 1},
     )
-    wait_for_export_status(node, mt_table, iceberg_table, pid, "COMPLETED")
-
-    count = int(node.query(f"SELECT count() FROM {iceberg_table}").strip())
-    assert count == 2, f"Expected 2 rows after export, got {count}"
-
-    string_bucket = int(node.query(
-        f"SELECT DISTINCT icebergBucket(16, key) FROM {iceberg_table}"
-    ).strip())
-    long_bucket = int(node.query(
-        f"SELECT DISTINCT icebergBucket(16, toInt64(key)) FROM {iceberg_table}"
-    ).strip())
-    assert string_bucket != long_bucket, (
-        f"Test setup invalid: String and Int64 buckets coincide ({string_bucket}); "
-        f"pick a different N/key so the transform diverges."
+    assert "BAD_ARGUMENTS" in error, (
+        f"Expected BAD_ARGUMENTS for a type-changing bucket transform, got: {error!r}"
     )
 
-    query_id = f"bucket_xform_{uid}"
+
+def test_export_partition_truncate_type_change_rejected(cluster):
+    """icebergTruncate with the same width but a changed column type (Int64 -> String) is rejected.
+    Truncate is numeric on integers (120..129 -> 120) but byte-wise on strings ('120'..'129' stay
+    distinct), so one source truncate bucket can map to several destination buckets. The structural
+    fast path must not accept it on matching transform name and width; the dynamic proof rejects it
+    because the endpoints do not collapse to a single destination value."""
+    node = cluster.instances["replica1"]
+
+    uid = unique_suffix()
+    mt_table = f"mt_trunc_xform_{uid}"
+    iceberg_table = f"iceberg_trunc_xform_{uid}"
+
+    # 120 and 129 are one Int64 truncate[10] bucket (120) but two distinct string truncations.
+    make_rmt(node, mt_table, "id Int64, key Int64", "icebergTruncate(10, key)",
+             replica_name="replica1")
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 120), (2, 129)")
+
+    make_iceberg_s3(node, iceberg_table, "id Int64, key String",
+                    partition_by="icebergTruncate(10, key)")
+
+    pid = first_partition_id(node, mt_table)
+    error = node.query_and_get_error(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{pid}' TO TABLE {iceberg_table}",
+        settings={"allow_insert_into_iceberg": 1},
+    )
+    assert "BAD_ARGUMENTS" in error, (
+        f"Expected BAD_ARGUMENTS for a type-changing truncate transform, got: {error!r}"
+    )
+
+
+def test_export_partition_timezone_mismatch_rejected(cluster):
+    """A source partitioned by day in one timezone must not be treated as structurally identical to a
+    destination day computed in another timezone. The source uses Asia/Tokyo (UTC+9) and the
+    destination UTC; the exported part spans a UTC-day boundary while staying within one Tokyo day, so
+    it maps to two destination partitions and must be rejected."""
+    node = cluster.instances["replica1"]
+
+    uid = unique_suffix()
+    mt_table = f"mt_tzmismatch_{uid}"
+    iceberg_table = f"iceberg_tzmismatch_{uid}"
+
+    make_rmt(node, mt_table, "id Int64, event_time DateTime('UTC')",
+             "toRelativeDayNum(event_time, 'Asia/Tokyo')", replica_name="replica1")
+    # Both instants are 2024-03-05 in Tokyo (UTC+9) but 2024-03-04 and 2024-03-05 in UTC.
+    node.query(
+        f"INSERT INTO {mt_table} VALUES (1, '2024-03-04 16:00:00'), (2, '2024-03-05 10:00:00')"
+    )
+
+    make_iceberg_s3(node, iceberg_table, "id Int64, event_time DateTime('UTC')",
+                    partition_by="toRelativeDayNum(event_time)")
+
+    pid = first_partition_id(node, mt_table)
+    error = node.query_and_get_error(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{pid}' TO TABLE {iceberg_table}",
+        settings={"allow_insert_into_iceberg": 1, "iceberg_partition_timezone": "UTC"},
+    )
+    assert "BAD_ARGUMENTS" in error, (
+        f"Expected BAD_ARGUMENTS for a source/destination timezone mismatch, got: {error!r}"
+    )
+
+
+def test_export_partition_commit_uses_exported_parts_not_new_inserts(cluster):
+    """The deferred commit derives the Iceberg partition value only from the exact exported parts
+    recorded in the manifest, never from parts inserted/merged into the source partition after
+    scheduling. A month-partitioned source exports one day into a day-partitioned destination (a
+    data-dependent acceptance); while the commit is wedged, an earlier day is inserted and merged in,
+    so the only active part now spans both days with its min at the new day. The commit must still
+    stamp the exported day (the exported part is found among Outdated parts by name), not the merged-in
+    earlier day, so the metadata matches the exported data files."""
+    node = cluster.instances["replica1"]
+    uid = unique_suffix()
+    mt_table = f"mt_commit_parts_{uid}"
+    iceberg_table = f"iceberg_commit_parts_{uid}"
+
+    make_rmt(node, mt_table, "id Int64, event_date Date", "toYYYYMM(event_date)", replica_name="replica1")
+    node.query(f"INSERT INTO {mt_table} VALUES (1, '2024-03-20'), (2, '2024-03-20')")
+    make_iceberg_s3(node, iceberg_table, "id Int64, event_date Date",
+                    partition_by="toRelativeDayNum(event_date)")
+
+    exported_day = int(node.query("SELECT toRelativeDayNum(toDate('2024-03-20'))").strip())
+    injected_day = int(node.query("SELECT toRelativeDayNum(toDate('2024-03-05'))").strip())
+
+    node.query("SYSTEM ENABLE FAILPOINT export_partition_commit_always_throw")
+    try:
+        node.query(
+            f"ALTER TABLE {mt_table} EXPORT PARTITION ID '202403' TO TABLE {iceberg_table}"
+            f" SETTINGS allow_insert_into_iceberg = 1"
+        )
+        # The commit is attempted only after every part is exported, so a non-zero exception count
+        # means the data files are written and the commit is now wedged by the failpoint.
+        wait_for_exception_count(node, mt_table, iceberg_table, "202403", min_exception_count=1, timeout=90)
+
+        # Insert an earlier day into the same month partition and merge: the merged active part spans
+        # both days with min = the injected (earlier) day, while the exported part becomes Outdated.
+        node.query(f"INSERT INTO {mt_table} VALUES (3, '2024-03-05')")
+        node.query(f"OPTIMIZE TABLE {mt_table} PARTITION ID '202403' FINAL")
+    finally:
+        node.query("SYSTEM DISABLE FAILPOINT export_partition_commit_always_throw")
+
+    wait_for_export_status(node, mt_table, iceberg_table, "202403", "COMPLETED", timeout=90)
+
+    # The exported data files hold only 2024-03-20; the metadata day must match them.
+    query_id = f"commit_parts_{uid}"
     node.query(
         f"SELECT * FROM {iceberg_table}",
         query_id=query_id,
@@ -2000,10 +2091,14 @@ def test_export_partition_bucket_transform_metadata_matches_data(cluster):
     entries = fetch_manifest_entries(node, query_id)
     partitions = _data_file_partition_records(entries)
     assert partitions, "No data-file partition records found in manifest entries"
-    meta_values = {int(_partition_scalar(p, "key")) for p in partitions}
-    assert meta_values == {string_bucket}, (
-        f"Metadata bucket {meta_values} must equal the destination String bucket "
-        f"{string_bucket} (not the source Int64 bucket {long_bucket})."
+    meta_days = {int(_partition_scalar(p, "event_date")) for p in partitions}
+    assert meta_days == {exported_day}, (
+        f"Metadata day {meta_days} must equal the exported day {exported_day} (2024-03-20), "
+        f"not the injected day {injected_day} (2024-03-05)."
+    )
+
+    assert int(node.query(f"SELECT count() FROM {iceberg_table}").strip()) == 2, (
+        "Only the two exported rows must be present in the destination."
     )
 
 

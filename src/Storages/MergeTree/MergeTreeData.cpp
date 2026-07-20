@@ -6702,8 +6702,6 @@ void MergeTreeData::exportPartToTable(
             "To allow its usage, enable the setting `allow_insert_into_iceberg`.");
     }
 
-    /// Positional CAST matching, like `INSERT INTO dest SELECT * FROM src`. Runs before the part
-    /// lookup so schema/type incompatibilities are reported even when the referenced part is absent.
     ExportPartitionUtils::verifyExportSchemaCastable(
         source_metadata_ptr, destination_metadata_ptr, dest_storage->getStorageID(), query_context);
 

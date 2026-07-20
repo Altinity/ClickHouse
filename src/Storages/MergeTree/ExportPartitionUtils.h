@@ -30,16 +30,20 @@ namespace ExportPartitionUtils
 
     ContextPtr getContextCopyWithTaskSettings(const ContextPtr & context, const ExportReplicatedMergeTreePartitionManifest & manifest);
 
-    /// Returns the representative source partition-key columns (the first active local part's
-    /// minmax block) for the given partition_id. The destination recomputes the Iceberg partition
-    /// tuple from this block by casting to its column types and applying the partition transform.
+    /// Returns the representative source partition-key columns (a folded global-min minmax block) for
+    /// the given partition_id, derived only from the exact parts that were validated and exported
+    /// (`exported_part_names`, looked up among Active and Outdated parts). The destination recomputes
+    /// the Iceberg partition tuple from this block by casting to its column types and applying the
+    /// partition transform. Restricting to the exported parts keeps the committed metadata consistent
+    /// with the exported files even if unrelated parts were inserted/merged into the partition after
+    /// scheduling.
     ///
-    /// Edge case: if the partition was dropped after export started, or this replica
-    /// has not yet received any part for this partition (extreme replication lag on a
-    /// recovery path), no active part will be found and the commit will fail. The task
-    /// will be retried on the next poll cycle or picked up by a different replica.
+    /// Edge case: if none of the exported parts are found (merged away and cleaned up before commit,
+    /// or not present on this replica), a NO_SUCH_DATA_PART exception is thrown; it is retryable, so
+    /// the commit is retried on the next poll cycle or picked up by a different replica, rather than
+    /// silently stamping metadata derived from unrelated parts.
     Block getPartitionSourceBlockForIcebergCommit(
-        MergeTreeData & storage, const String & partition_id);
+        MergeTreeData & storage, const String & partition_id, const std::vector<String> & exported_part_names);
 
     void commit(
         const ExportReplicatedMergeTreePartitionManifest & manifest,
