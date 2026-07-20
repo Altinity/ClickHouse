@@ -21,6 +21,14 @@
 namespace DB::Cas
 {
 
+/// Controls whether `resolveRef` emits its `RefResolve` audit event. `Emit` (the default) preserves
+/// today's behavior for every existing caller (`listRefs`, `dropRef`, GC, and ordinary reads).
+/// `Deferred` is for a caller that itself decides, after inspecting the resolve outcome, whether the
+/// access as a whole did real resolve work worth auditing — see `CachedPartFolderAccess::getView`,
+/// which re-emits the identical event on every path except a warm view-cache hit that served without
+/// re-validating anything.
+enum class ResolveAudit : uint8_t { Emit, Deferred };
+
 /// Coordinates the writer-side ref-log and ref-table protocol for all namespaces in one mounted pool.
 /// It owns the recovered whole-table cache, the flat-combining append lane and its unresolved-`PUT`
 /// wedge, snapshot publication, stale-precommit cleanup, cache-budget eviction, and remount/shutdown
@@ -58,7 +66,10 @@ public:
     /// Recovers `ns` on first access and resolves `ref_name` from the authoritative cached table.
     /// The optional staleness argument remains for API compatibility; this mounted writer has no
     /// alternate shard cache, so the recovered table is always the view used for the result.
-    std::optional<Resolved> resolveRef(const RootNamespace & ns, const String & ref_name, bool allow_stale = false);
+    /// `audit` defaults to `Emit` so every existing caller keeps emitting `RefResolve` unchanged;
+    /// `Deferred` suppresses the emit for a caller that re-emits it conditionally itself.
+    std::optional<Resolved> resolveRef(const RootNamespace & ns, const String & ref_name, bool allow_stale = false,
+                                       ResolveAudit audit = ResolveAudit::Emit);
 
     /// Recovers `ns` on first access and returns every committed ref in canonical name order. Read-side
     /// maintenance may schedule snapshot publication and stale-precommit cleanup, but those actions do

@@ -168,8 +168,12 @@ public:
     std::shared_ptr<const PartFolderView> getView(const PartRefKey & key, Freshness freshness) const;
 
     /// Ref-only resolution (per-part reads, part-dir existence, publish stamps): no
-    /// manifest is read. `CachedForLoad` = stale-tolerant; other modes force-fresh.
-    std::optional<Cas::Resolved> resolve(const PartRefKey & key, Freshness freshness) const;
+    /// manifest is read. `CachedForLoad` = stale-tolerant; other modes force-fresh. `audit` defaults to
+    /// `Emit` so every caller other than `getView` keeps emitting `RefResolve` unchanged; `getView`
+    /// passes `Deferred` and re-emits the event itself once it knows whether a warm view-cache hit
+    /// served the call without doing any real resolve work.
+    std::optional<Cas::Resolved> resolve(const PartRefKey & key, Freshness freshness,
+                                         Cas::ResolveAudit audit = Cas::ResolveAudit::Emit) const;
     bool existsRef(const PartRefKey & key, Freshness freshness) const;
 
     /// ==== committed part-ref writes ====
@@ -253,6 +257,11 @@ private:
         const PartRefKey & key, const Cas::Resolved & resolved, Freshness freshness) const;
     /// Removes a retained view and records the invalidation for diagnostics.
     void eraseView(const PartRefKey & key);
+    /// Emits the same `RefResolve` `CasEvent` `CasRefLedger::resolveRef` would have emitted for
+    /// `resolved`, a no-op when no sink is installed. Used by `getView`, which defers the emit from its
+    /// own `resolve(..., ResolveAudit::Deferred)` call so it can skip it on a warm view-cache hit that
+    /// served without any real resolve work.
+    void emitResolveEvent(const PartRefKey & key, const Cas::Resolved & resolved) const;
 
     /// Decision journal for `explain` (test/log-only). Bounded by wholesale
     /// clear — debug state, never consulted by the read/write paths.

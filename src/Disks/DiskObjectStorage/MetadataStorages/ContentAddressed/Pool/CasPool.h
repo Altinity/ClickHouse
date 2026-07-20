@@ -332,7 +332,10 @@ public:
     void retireBuildSeq(uint64_t seq);
 
     /// ---- read side ----
-    std::optional<Resolved> resolveRef(const RootNamespace & ns, const String & ref_name, bool allow_stale = false);
+    /// `audit` defaults to `Emit` so every existing caller keeps emitting `RefResolve` unchanged; see
+    /// `ResolveAudit`'s doc comment (`CasRefLedger.h`) for the one `Deferred` call site.
+    std::optional<Resolved> resolveRef(const RootNamespace & ns, const String & ref_name, bool allow_stale = false,
+                                       ResolveAudit audit = ResolveAudit::Emit);
     /// Read the single immutable part manifest named by `id`. Derives the key via CasLayout::manifestKey,
     /// decodes the body, and fails CLOSED: a committed ref naming a missing body throws FILE_DOESNT_EXIST
     /// (INV-NO-DANGLE surfaced on the read path); a body whose `ref` ≠ id.ref (refMatchesBody) or whose

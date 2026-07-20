@@ -1,5 +1,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Parts/PartFolderAccess.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEvent.h>
 #include <Common/DateLUT.h>
 #include <Common/ProfileEvents.h>
 #include <Common/logger_useful.h>
@@ -157,8 +158,10 @@ std::shared_ptr<const PartFolderView>
 CachedPartFolderAccess::getView(const PartRefKey & key, Freshness freshness) const
 {
     /// Resolve first on every access. Absence is never retained, and the same ref-resolution result
-    /// supplies the manifest ID used to validate a retained view.
-    auto resolved = resolve(key, freshness);
+    /// supplies the manifest ID used to validate a retained view. The emit is deferred: a warm
+    /// `CachedForLoad` hit below serves the call without doing any real resolve work worth auditing, so
+    /// this call site decides itself, per path, whether to re-emit the identical `RefResolve` event.
+    auto resolved = resolve(key, freshness, Cas::ResolveAudit::Deferred);
     if (!resolved)
         return nullptr;
 
@@ -174,6 +177,8 @@ CachedPartFolderAccess::getView(const PartRefKey & key, Freshness freshness) con
         {
             if (cached->manifestId() == resolved->manifest_id)
             {
+                /// The warm hit: the retained view already reflects this exact manifest, so this access
+                /// did no real resolve work beyond a cache lookup — no `RefResolve` audit row for it.
                 ProfileEvents::increment(ProfileEvents::CasPartFolderViewHits);
                 recordDecision(cache_key, LastDecision::Hit, cached.get(), /*retained=*/true);
                 return cached;
@@ -199,6 +204,7 @@ CachedPartFolderAccess::getView(const PartRefKey & key, Freshness freshness) con
                 ProfileEvents::increment(ProfileEvents::CasPartFolderViewHits);
                 ProfileEvents::increment(ProfileEvents::CasPartFolderValidateSkipped);
                 recordDecision(cache_key, LastDecision::Hit, cached.get(), /*retained=*/true);
+                emitResolveEvent(key, *resolved);
                 return cached;
             }
         }
@@ -233,7 +239,24 @@ CachedPartFolderAccess::getView(const PartRefKey & key, Freshness freshness) con
         : freshness == Freshness::ForceFresh  ? LastDecision::ForceFreshRead
                                               : LastDecision::StrictBypass,
         view.get(), retained);
+    emitResolveEvent(key, *resolved);
     return view;
+}
+
+void CachedPartFolderAccess::emitResolveEvent(const PartRefKey & key, const Cas::Resolved & resolved) const
+{
+    /// Mirrors `CasRefLedger::resolveRef`'s own (deferred-here) emit exactly: same event type and
+    /// fields, built from the `Resolved` this call already holds.
+    Cas::EventEmitter{*store}.emit([&](Cas::CasEvent & e)
+    {
+        e.type = Cas::CasEventType::RefResolve;
+        e.namespace_ = key.ns.string();
+        e.ref_name = key.ref;
+        e.object_kind = Cas::CasEventObjectKind::Manifest;
+        e.object_hash = Cas::manifestRefDebugString(resolved.manifest_id.ref);
+        e.outcome = "resolved";
+        e.reason = "read-side resolve of a ref to its part manifest";
+    });
 }
 
 std::shared_ptr<const PartFolderView> CachedPartFolderAccess::buildView(
@@ -288,9 +311,9 @@ void CachedPartFolderAccess::eraseView(const PartRefKey & key)
 }
 
 std::optional<Cas::Resolved>
-CachedPartFolderAccess::resolve(const PartRefKey & key, Freshness freshness) const
+CachedPartFolderAccess::resolve(const PartRefKey & key, Freshness freshness, Cas::ResolveAudit audit) const
 {
-    return store->resolveRef(key.ns, key.ref, /*allow_stale=*/freshness == Freshness::CachedForLoad);
+    return store->resolveRef(key.ns, key.ref, /*allow_stale=*/freshness == Freshness::CachedForLoad, audit);
 }
 
 bool CachedPartFolderAccess::existsRef(const PartRefKey & key, Freshness freshness) const

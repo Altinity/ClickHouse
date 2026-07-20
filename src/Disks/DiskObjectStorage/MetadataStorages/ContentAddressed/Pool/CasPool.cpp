@@ -1070,9 +1070,9 @@ void Pool::setCasRetrySleepForTest(std::function<void(uint64_t)> sleep_fn)
     ref_ledger.setCasRetrySleepForTest(std::move(sleep_fn));
 }
 
-std::optional<Resolved> Pool::resolveRef(const RootNamespace & ns, const String & ref_name, bool allow_stale)
+std::optional<Resolved> Pool::resolveRef(const RootNamespace & ns, const String & ref_name, bool allow_stale, ResolveAudit audit)
 {
-    return ref_ledger.resolveRef(ns, ref_name, allow_stale);
+    return ref_ledger.resolveRef(ns, ref_name, allow_stale, audit);
 }
 
 std::map<String, Resolved> Pool::listRefs(const RootNamespace & ns)

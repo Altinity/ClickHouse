@@ -119,7 +119,8 @@ void CasRefLedger::setCasRetrySleepForTest(std::function<void(uint64_t)> sleep_f
 }
 
 
-std::optional<Resolved> CasRefLedger::resolveRef(const RootNamespace & ns, const String & ref_name, bool /*allow_stale*/)
+std::optional<Resolved> CasRefLedger::resolveRef(const RootNamespace & ns, const String & ref_name, bool /*allow_stale*/,
+                                                 ResolveAudit audit)
 {
     /// The read side of the snapshot+log protocol has one authoritative cached table for this mounted
     /// writer. The `allow_stale` staleness-tolerance knob no longer selects anything: this mounted writer is the
@@ -146,7 +147,10 @@ std::optional<Resolved> CasRefLedger::resolveRef(const RootNamespace & ns, const
     const RefCommittedRow & row = it->second;
     /// A resolved ref points to its manifest (the read-path entry point). `object_hash` is the manifest
     /// instance id the ref names; pairs with a later readManifest ReadMissing if that body is gone.
-    if (hasEventSink())
+    /// `Deferred` (used only by `CachedPartFolderAccess::resolve` on the `getView` call path) skips this
+    /// emit; the caller decides, once it knows whether the access as a whole did real resolve work,
+    /// whether to emit the identical event itself — see `ResolveAudit`'s doc comment.
+    if (audit == ResolveAudit::Emit && hasEventSink())
     {
         CasEvent _ev0;
         _ev0.type = CasEventType::RefResolve;

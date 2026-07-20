@@ -1,14 +1,17 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Parts/PartFolderAccess.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasEvent.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/ProfileEvents.h>
 #include <Poco/Exception.h>
 #include <Poco/Util/XMLConfiguration.h>
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <latch>
 #include <sstream>
 #include <thread>
+#include <vector>
 
 namespace DB::ErrorCodes
 {
@@ -652,6 +655,47 @@ TEST(CasPartFolderAccess, AbsenceIsNeverRetained)
     auto view = access.getView(key, Cas::Freshness::CachedForLoad);
     ASSERT_NE(view, nullptr);
     EXPECT_EQ(view->inlineBytes("f"), std::optional<String>("y"));
+}
+
+/// Task 23 (URF plan phase 7): `getView` emits a `RefResolve` audit event only when the access does
+/// real resolve work -- a warm `CachedForLoad` hit whose retained view already matches the fresh
+/// resolve serves the call with no new information, so it must add no row. `resolveRef` itself defers
+/// the emit on this call path (`ResolveAudit::Deferred`, `CachedPartFolderAccess::resolve`), and
+/// `getView` re-emits the identical event on every OTHER path -- cold builds and `ForceFresh`.
+TEST(CasPartFolderAccess, GetViewEmitsRefResolveOnlyOnRealResolveWork)
+{
+    auto backend = std::make_shared<CountingBackend>();
+    auto store = openPoolForTest(backend);
+    const Cas::RootNamespace ns{"srv/t1"};
+    publishPart(store, ns, "part_1", {inlineEntry("checksums.txt", "cs")});
+    const Cas::PartRefKey key{ns, "part_1"};
+
+    std::vector<Cas::CasEvent> seen;
+    store->setEventSink([&](const Cas::CasEvent & e) { seen.push_back(e); });
+    Cas::CachedPartFolderAccess access(store, cacheOn());   /// retention on, validate == Always (default)
+
+    const auto refResolveCount = [&]
+    {
+        return std::count_if(seen.begin(), seen.end(),
+            [](const Cas::CasEvent & e) { return e.type == Cas::CasEventType::RefResolve; });
+    };
+
+    /// Cold CachedForLoad build: real resolve work -> exactly one RefResolve.
+    ASSERT_NE(access.getView(key, Cas::Freshness::CachedForLoad), nullptr);
+    EXPECT_EQ(refResolveCount(), 1);
+
+    /// Warm hit: the retained view still matches the fresh resolve, so this call serves the SAME
+    /// manifest with no new information -- before this fix it would emit a SECOND RefResolve
+    /// (resolveRef emitted unconditionally); after the fix it must add none.
+    ASSERT_NE(access.getView(key, Cas::Freshness::CachedForLoad), nullptr);
+    EXPECT_EQ(refResolveCount(), 1) << "a warm view-cache hit must not add a RefResolve row";
+
+    /// ForceFresh always re-proves the manifest body under the default Always validation policy, so
+    /// this is real resolve work again -> +1.
+    ASSERT_NE(access.getView(key, Cas::Freshness::ForceFresh), nullptr);
+    EXPECT_EQ(refResolveCount(), 2);
+
+    store->setEventSink(nullptr);
 }
 
 TEST(CasPartFolderAccess, OversizedViewServedNotRetained)
