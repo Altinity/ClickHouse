@@ -2874,3 +2874,81 @@ campaign. The CAS gtest battery is green. No CAS action; if pursued, it belongs 
   short per-request deadline: fence loss requires an outage longer than the lease TTL, so a
   fence-keyed fail-fast cannot regress the short blips Layer 1 is designed to ride out, whereas a bare
   short deadline WOULD regress them into query failures.
+
+## OPTIMIZATION OPPORTUNITY (write-path latency, HIGH) — CAS-on-S3 INSERT ~7.6× slower than standard S3 (170.6s vs 22.4s): three-level write-path serialization + speculative HEAD-before-PUT
+
+- **Logged (UTC):** 2026-07-21
+- **Severity:** optimization-opportunity (measured on staging from `system.query_log` ProfileEvents;
+  root cause confirmed by code reading; not applied)
+- **Found via:** comparative benchmark on staging (`26.6.1.20000.altinityantalya`), two 500-partition
+  wide-part inserts (10M rows, 30 columns, 2 replicas). CAS table `cas_compare_wide_500p_20260720`
+  (`query_id 225ec42a-94f4-41c3-989c-b316ebc50ec3`) = **170.6 s**; standard-S3 table
+  `s3_compare_wide_500p_20260720` (`query_id 7295ebc8-8942-48e8-b0e8-4979449da6f5`) = **22.4 s**. CAS
+  issued FEWER `PutObject` (2566 vs 6156 per node) yet was 7.6× slower — so the penalty is round-trip
+  COUNT + SERIALIZATION, not bandwidth. Reads (10 `clusterAllReplicas` aggregations) were 17.6%
+  FASTER on CAS, consistent with the write-only nature of the regression.
+- **Measured (CAS insert ProfileEvents, one node):** `RealTimeMicroseconds` 802.6 s → avg ~4.7
+  threads; `S3WriteMicroseconds` 117.5 s (2567 PUTs, ~46 ms each); `CasRefQueueWaitMicroseconds`
+  **36.2 s**; `S3ReadMicroseconds` 29.1 s (1015 `HeadObject` + 514 `GetObject`, ~19 ms each);
+  `OSCPUVirtualTimeMicroseconds` 16.8 s (compute). **Smoking gun:** `CasRefBatchFlushes` = 1026 ==
+  `CasRefBatchedMutations` = 1026 → ref-ledger batch size EXACTLY **1.0** (1026 = 513 precommit + 513
+  promote appends, each its own serial S3 round trip). `CasManifestGet` = 513 (one per part).
+  `CasBlobHeadFirst` = 498 == `CasBlobHeadMiss` = 498, `CasBlobBodyPutAvoided` = 0. Standard-S3 side:
+  6156 `PutObject`, 0 HEAD, 0 GET, 0 COPY.
+- **Corrections to first hypotheses (from the measured data):**
+  - **"Fewer PUTs is dedup" — WRONG here.** `CasBlobBodyPutAvoided` = 0: on this fresh insert dedup
+    avoided ZERO PUTs. Fewer PUTs is COARSER OBJECT GRANULARITY — `CasBlobPut` = 1026 ≈ 2 blobs/part
+    (content-addressed coalesced chunks) vs standard S3's ~30 separate column-file objects per part.
+  - **"Double write" — ruled out.** `S3CopyObject` = 0 confirms direct PUT; S3-native staging
+    (stage-PUT + server-side `CopyObject`) was OFF.
+- **Root causes (prioritized by serialized-latency contribution):**
+  1. **Sequential per-part commit loop** — `ContentAddressedTransaction::commit()`
+     (`ContentAddressedTransaction.cpp:396-404`) drives all ~500 parts one fully after another. Because
+     it is single-threaded, the ref-ledger (`CasRefLedger::flushRefBatch`, which CAN batch concurrent
+     same-namespace appends) has nothing to batch — hence batch size 1.0. Each part pays its own 2
+     blocking ref-lane round trips (`precommitAdd` + `promote`) ≈ 1026 serial ref-log PUTs (~47 s) +
+     36 s queue wait. This is the single biggest bottleneck.
+  2. **Sequential per-blob upload loop within a part** — `uploadPendingBlobs`
+     (`ContentAddressedTransaction.cpp:241-283`), plain `for`, no thread pool; a part's ~20-60 column
+     blobs upload one at a time. Standard `DiskObjectStorage` fans these across its I/O thread pool
+     (standard ran ~12× effective write concurrency; CAS ~4.7 threads).
+  3. **Unconditional manifest-body GET in `promote`** — `CasPartWriteTxn.cpp:914-924`, one
+     `backend().get(manifest_key)` per part (513 GETs) to re-read + validate the manifest
+     (`refMatchesBody` / `manifestNamespaceMatches`) before promoting the ref. This is a fail-closed
+     invariant guard ("a committed ref must never name a missing/mismatched manifest"), NOT pure waste
+     — it is load-bearing on the ADOPT (`Occupied`) path.
+  4. **Speculative HEAD-before-PUT for blobs ≥ 1 MiB** — `putBlob`
+     (`CasPartWriteTxn.cpp:171-198`), default `dedup_head_first_min_bytes = 1 MiB` (`CasPool.h:73`).
+     On fresh data every large-blob HEAD misses (498/498) and still PUTs: pure tax (~9.5 s serial).
+     Break-even hit rate ≈ HEAD/PUT ≈ 19/46 ≈ 41%; below that it loses. The size branch also defends
+     against a broken-pipe / retry-storm on stores that early-close a doomed conditional PUT.
+- **Proposed fixes (by risk/reward):**
+  1. **Concurrent per-part commit** (biggest win, architecturally clean): drive the commit loop with
+     a bounded shared thread pool so multiple parts' `precommitAdd`/`promote` arrive at the ref queue
+     concurrently and the ledger's existing batching collapses ~1026 batch-size-1 flushes into a
+     handful. Targets the ~47 s serial ref-PUT + 36 s `CasRefQueueWaitMicroseconds`. Correctness: the
+     per-namespace mount-lease still holds and the queue/leader serializes the actual appends —
+     concurrency only FILLS the batch; only the per-part `precommitAdd`-before-`promote` order must be
+     preserved (different parts interleave freely). Success metric: `CasRefBatchFlushes` ≪
+     `CasRefBatchedMutations`, `CasRefQueueWaitMicroseconds` drops.
+  2. **Parallel per-blob upload within a part** (low risk): fan a part's blob PUTs across the SAME
+     bounded pool (shared with #1 so it does not explode into parts×blobs threads). Targets the
+     117.5 s `S3WriteMicroseconds` currently at ~4.7× concurrency.
+  3. **Skip the promote manifest GET on the fresh-write path** (medium): when THIS txn's conditional
+     manifest PUT returned `Committed` (we created it and hold the exact bytes in memory),
+     `refMatchesBody`/`manifestNamespaceMatches` are provable from the in-memory manifest and durability
+     from the successful PUT under S3 strong read-after-write — validate in-memory, skip the remote
+     GET. KEEP the GET on the `Occupied`/adopt path (there it is a real deterministic-adoption re-read;
+     removing it would be a skip-read shortcut CAS forbids). Gate on backend read-after-write
+     guarantees if the GET was also meant as a durability fence for weaker stores.
+  4. **Make HEAD-before-PUT adaptive** (low risk, small): track the recent head-first hit rate
+     (`CasBlobBodyPutAvoided`/`CasBlobHeadFirst`) and back off speculative HEADs when it is ~0 (fresh
+     bulk load), re-enabling when hits reappear — keeps the dedup win for re-inserts, drops the tax on
+     first loads. Cheaper interim: raise/zero `dedup_head_first_min_bytes` on known low-dedup ingest.
+     Before dropping the size branch entirely, confirm whether the target S3 endpoint actually
+     early-closes doomed conditional PUTs (if not, the branch defends against a non-existent problem).
+- **Confirming metrics (per INSERT `query_id`, `system.query_log` ProfileEvents / `system.events`):**
+  `S3HeadObject`, `S3GetObject`, `CasBlobHeadFirst`/`CasBlobBodyPutAvoided`/`CasBlobDedupCacheHit`,
+  `CasRefBatchFlushes` vs `CasRefBatchedMutations`, and `CasRefQueueWaitMicroseconds` summed vs query
+  wall time (the smoking gun for #1). The full write-path code map + evidence is in the session memory
+  note `project_cas_insert_slowness_writepath`.
