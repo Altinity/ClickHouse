@@ -43,6 +43,7 @@ namespace ProfileEvents
     extern const Event CasRefBatchScopeCuts;
     extern const Event CasRefQueueWaitMicroseconds;
     extern const Event CasRefRecoveryRestarts;
+    extern const Event CasRefRecoveryRetries;
     extern const Event CasRefAppendWedged;
     extern const Event CasRefAppendUnwedged;
     extern const Event CasRefAppendDefiniteFailure;

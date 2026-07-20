@@ -10,6 +10,7 @@
 #include <Common/logger_useful.h>
 #include <Common/ProfileEvents.h>
 #include <Common/ThreadPool.h>
+#include <base/sleep.h>
 #include <fmt/format.h>
 #include <algorithm>
 #include <chrono>
@@ -23,6 +24,7 @@ namespace ErrorCodes
     extern const int FILE_DOESNT_EXIST;
     extern const int LIMIT_EXCEEDED;
     extern const int LOGICAL_ERROR;
+    extern const int NETWORK_ERROR;
 }
 }
 
@@ -33,6 +35,7 @@ namespace ProfileEvents
     extern const Event CasRefBatchScopeCuts;
     extern const Event CasRefQueueWaitMicroseconds;
     extern const Event CasRefRecoveryRestarts;
+    extern const Event CasRefRecoveryRetries;
     extern const Event CasRefAppendWedged;
     extern const Event CasRefAppendUnwedged;
     extern const Event CasRefAppendDefiniteFailure;
@@ -85,6 +88,23 @@ CasRefLedger::CasRefLedger(
     /// here rather than adding a second clock knob; both are monotonic-ms clocks and tests that need
     /// deterministic deadline behavior already inject it.
     ref_request_controller = std::make_unique<CasRequestController>(backend_ptr, cas_request_budget, controller_boot_ms_fn);
+
+    /// Default backoff sleep for the recovery retry loop (`ensureRefTableRecovered`): sleep in short
+    /// slices and stop early if the mount fence drops (shutdown / lease loss), so teardown never waits
+    /// out a full 30s backoff. This is deliberate, bounded backoff against external object-store I/O
+    /// failure -- NOT masking a race -- exactly like `CasRequestControl`'s own inter-attempt
+    /// `threadSleepMs`; the slice loop additionally makes it interruptible, which that one is not.
+    recovery_retry_sleep_fn = [this](uint64_t total_ms)
+    {
+        constexpr uint64_t slice_ms = 200;
+        uint64_t slept = 0;
+        while (slept < total_ms && fence_ok_fn())
+        {
+            const uint64_t chunk = std::min(slice_ms, total_ms - slept);
+            sleepForMilliseconds(chunk);
+            slept += chunk;
+        }
+    };
 }
 
 CasWriteOutcome CasRefLedger::stagingPutIfAbsent(std::string_view key, std::string_view bytes, Token * out_token)
@@ -115,7 +135,8 @@ CasOverwriteResult CasRefLedger::stagingPutIfAbsentMutable(std::string_view key,
 
 void CasRefLedger::setCasRetrySleepForTest(std::function<void(uint64_t)> sleep_fn)
 {
-    ref_request_controller->setSleepFnForTest(std::move(sleep_fn));
+    ref_request_controller->setSleepFnForTest(sleep_fn);
+    recovery_retry_sleep_fn = std::move(sleep_fn);
 }
 
 
@@ -255,217 +276,264 @@ void CasRefLedger::ensureRefTableRecovered(const RootNamespace & ns, RefTableRun
         rt.recovery_cv.notify_all();
     });
 
-    for (uint64_t attempt = 0; ; ++attempt)
+    /// Outer transient-retry loop (Layer 1 of the stuck-table-load fix): a whole recovery attempt
+    /// (LIST + snapshot/log GETs + seal PUT) that fails with a TRANSIENT object-store `NETWORK_ERROR`
+    /// is retried with capped-exponential backoff until `recovery_retry_budget_ms` is spent, instead of
+    /// propagating and failing this table's async load permanently. Non-transient errors fail fast; so
+    /// does the inner vanish-race brake below (which is `NETWORK_ERROR` too but DELIBERATELY terminal --
+    /// the `vanish_brake_tripped` latch keeps the outer loop from re-driving it).
+    const uint64_t recovery_start_ms = boot_ms_now_fn();
+    uint64_t recovery_retry_num = 0;
+    bool vanish_brake_tripped = false;
+    for (;;)
     {
-        if (attempt > 0)
+        try
         {
-            if (attempt > kRefRecoveryMaxRestarts)
-                throwCasWriteRetryLater(fmt::format(
-                    "CAS ref-table recovery for namespace '{}' restarted {} times (a selected snapshot or "
-                    "log object kept vanishing between its LIST and GET) — giving up; this bound is a "
-                    "runaway brake against a pathological cleanup race, not an expected steady state",
-                    ns.string(), attempt - 1));
-            ++rt.recovery_restarts;
-            ProfileEvents::increment(ProfileEvents::CasRefRecoveryRestarts);
-        }
 
-        /// One namespace `LIST` returns every surviving snapshot, log,
-        /// and `_cleanup` marker key.
-        std::optional<RefTxnId> greatest_snapshot;
-        std::vector<RefTxnId> log_ids;
-        std::set<RefTxnId> cleanup_markers;
-        const String prefix = layout.refsNamespacePrefix(ns);
-        String cursor;
-        for (;;)
-        {
-            const ListPage page = backend.list(prefix, cursor, /*limit=*/1000);
-            for (const ListedKey & lk : page.keys)
+            for (uint64_t attempt = 0; ; ++attempt)
             {
-                const auto parsed = layout.parseRefObjectKey(lk.key);
-                if (!parsed)
-                    continue;   /// not a ref-object key (for example, a legacy shard-number key)
-                /// Trust the parsed `ns` only when it names EXACTLY this
-                /// namespace -- the same checkNamespace-level guarantee the key builders enforce, not
-                /// position math (the scoped LIST prefix already implies this in practice, but a listed
-                /// key is untrusted input and is treated as such).
-                if (parsed->ns != ns)
-                    continue;
-                switch (parsed->kind)
+                if (attempt > 0)
                 {
-                    case RefObjectKind::Cleanup:
-                        cleanup_markers.insert(parsed->txn_id);
-                        break;
-                    case RefObjectKind::Log:
-                        log_ids.push_back(parsed->txn_id);
-                        break;
-                    case RefObjectKind::Snap:
-                        if (!greatest_snapshot || *greatest_snapshot < parsed->txn_id)
-                            greatest_snapshot = parsed->txn_id;
-                        break;
+                    if (attempt > kRefRecoveryMaxRestarts)
+                    {
+                        /// Terminal, NOT a transient object-store outage: latch so the outer retry loop rethrows
+                        /// immediately instead of re-driving this pathological-cleanup-race brake for the budget.
+                        vanish_brake_tripped = true;
+                        throwCasWriteRetryLater(fmt::format(
+                            "CAS ref-table recovery for namespace '{}' restarted {} times (a selected snapshot or "
+                            "log object kept vanishing between its LIST and GET) — giving up; this bound is a "
+                            "runaway brake against a pathological cleanup race, not an expected steady state",
+                            ns.string(), attempt - 1));
+                    }
+                    ++rt.recovery_restarts;
+                    ProfileEvents::increment(ProfileEvents::CasRefRecoveryRestarts);
                 }
-            }
-            if (page.next_cursor.empty())
+
+                /// One namespace `LIST` returns every surviving snapshot, log,
+                /// and `_cleanup` marker key.
+                std::optional<RefTxnId> greatest_snapshot;
+                std::vector<RefTxnId> log_ids;
+                std::set<RefTxnId> cleanup_markers;
+                const String prefix = layout.refsNamespacePrefix(ns);
+                String cursor;
+                for (;;)
+                {
+                    const ListPage page = backend.list(prefix, cursor, /*limit=*/1000);
+                    for (const ListedKey & lk : page.keys)
+                    {
+                        const auto parsed = layout.parseRefObjectKey(lk.key);
+                        if (!parsed)
+                            continue;   /// not a ref-object key (for example, a legacy shard-number key)
+                        /// Trust the parsed `ns` only when it names EXACTLY this
+                        /// namespace -- the same checkNamespace-level guarantee the key builders enforce, not
+                        /// position math (the scoped LIST prefix already implies this in practice, but a listed
+                        /// key is untrusted input and is treated as such).
+                        if (parsed->ns != ns)
+                            continue;
+                        switch (parsed->kind)
+                        {
+                            case RefObjectKind::Cleanup:
+                                cleanup_markers.insert(parsed->txn_id);
+                                break;
+                            case RefObjectKind::Log:
+                                log_ids.push_back(parsed->txn_id);
+                                break;
+                            case RefObjectKind::Snap:
+                                if (!greatest_snapshot || *greatest_snapshot < parsed->txn_id)
+                                    greatest_snapshot = parsed->txn_id;
+                                break;
+                        }
+                    }
+                    if (page.next_cursor.empty())
+                        break;
+                    cursor = page.next_cursor;
+                }
+                std::sort(log_ids.begin(), log_ids.end());
+
+                /// The greatest transaction id this attempt's `LIST` observed across
+                /// BOTH snapshots and logs -- used below to decide whether a dead-epoch region exists to seal.
+                /// Recomputed fresh on every restart-on-vanish attempt, exactly like `greatest_snapshot`/`log_ids`.
+                std::optional<RefTxnId> greatest_listed_id = greatest_snapshot;
+                if (!log_ids.empty() && (!greatest_listed_id || *greatest_listed_id < log_ids.back()))
+                    greatest_listed_id = log_ids.back();
+
+                bool vanished = false;
+                std::optional<RefTableSnapshot> snapshot;
+                uint64_t snapshot_body_bytes = 0;   /// weight of the recovered base; 0 = never-born base
+                if (greatest_snapshot)
+                {
+                    const auto got = backend.get(layout.refSnapshotKey(ns, *greatest_snapshot));
+                    if (!got)
+                        vanished = true;   /// covered by a newer snapshot published-before-delete; restart
+                    else
+                    {
+                        snapshot = decodeRefTableSnapshot(openObject(FormatId::RefSnapshot, got->bytes), ns.string(), *greatest_snapshot);
+                        snapshot_body_bytes = got->bytes.size();
+                    }
+                }
+
+                std::vector<RefLogTxn> tail;
+                std::vector<uint64_t> tail_bytes;
+                if (!vanished)
+                {
+                    for (const RefTxnId & id : log_ids)
+                    {
+                        if (greatest_snapshot && !(*greatest_snapshot < id))
+                            continue;   /// at or below the selected snapshot: already covered
+                        const auto got = backend.get(layout.refLogKey(ns, id));
+                        if (!got)
+                        {
+                            vanished = true;
+                            break;
+                        }
+                        tail.push_back(decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns.string(), id));
+                        tail_bytes.push_back(got->bytes.size());
+                    }
+                }
+
+                if (vanished)
+                    continue;   /// the selected object vanished; retry recovery from a fresh listing
+
+                rt.state = replay(snapshot, tail);
+                rt.cleanup_markers = std::move(cleanup_markers);
+
+                /// At an UNCLEAN mount, close every dead epoch this
+                /// recovery discovered with an immediate snapshot -- the seal -- published BEFORE the table is
+                /// exposed as recovered. This runs BEFORE `rt.recovered = true` below on purpose: a failed seal
+                /// PUT throws here, leaving the table unrecovered, so the NEXT touch restarts recovery from
+                /// scratch (fresh LIST, fresh replay, fresh seal attempt) rather than exposing a table whose
+                /// dead-epoch region was never actually closed; recovery therefore fails closed.
+                /// The encode and conditional `PUT` run OUTSIDE `state_mutex` (unlocked/relocked just below,
+                /// mirroring `trySnapshotPublishOnce`'s copy-under-lock/PUT-outside shape) -- it is the one part
+                /// of recovery that can run the full ~90s retry envelope, and holding the mutex across it stalls
+                /// every other touch of this table plus `wedgedRefLaneCount`'s whole-store walk (which locks each
+                /// table's `state_mutex` in turn). `recovery_in_progress` (set above), not the mutex, is what
+                /// keeps a concurrent second caller for this SAME table from redoing this same work during the
+                /// unlocked window -- see its doc comment. Nothing else can mutate `rt.state`/`rt.cleanup_markers`
+                /// meanwhile: every OTHER touch-point calls this function first and would block in the wait loop
+                /// above; `rt` itself cannot be destroyed underneath us (the caller's own `shared_ptr` keeps it
+                /// alive regardless of the mutex, which is also what protects it from `enforceRefTableCacheBudget`
+                /// -- eviction only ever considers a table at `use_count() == 1`).
+                ///
+                /// `seal_id` is the UPPER BOUND of the dead-epoch region, not the greatest listed id: the wedge
+                /// discipline places the predecessor's one possible in-flight PUT strictly above everything it
+                /// resolved, so only the epoch-closing bound is guaranteed to dominate it --
+                /// any later materialization from a dead epoch is born covered (`<=` seal_id) for every
+                /// observer, forever. `sealed_from` records the greatest id this recovery actually listed, the
+                /// observation horizon against which a later log is measured.
+                const uint64_t my_epoch = live_epoch_fn();
+                const RefTxnId seal_id{my_epoch - 1, std::numeric_limits<uint64_t>::max()};
+                const bool dead_region_nonempty =
+                    greatest_listed_id.has_value() && greatest_listed_id->writer_epoch < my_epoch;
+                const bool already_sealed = snapshot.has_value() && !(snapshot->snapshot_id < seal_id);
+                /// Compare against the SPECIFIC epoch a reclaim was marked unclean for, not a
+                /// sticky "ever" bool -- a table recovered for the first time (or reloaded after LRU eviction)
+                /// under a LATER, perfectly clean epoch boundary must not get a parasitic seal just because
+                /// SOME earlier, unrelated boundary in this incarnation's life was unclean.
+                if (unclean_boundary_epoch() == my_epoch && my_epoch >= 2
+                    && dead_region_nonempty && !already_sealed && rt.state.lifecycle == RefLifecycle::Live)
+                {
+                    RefTableSnapshot seal = snapshotOf(rt.state, ns.string());
+                    seal.snapshot_id = seal_id;                     /// upper bound of the covered region
+                    seal.sealed_from = rt.state.greatest_applied;    /// == greatest_listed_id: nothing else was applied
+                    const String seal_bytes = sealObject(FormatId::RefSnapshot, encodeRefTableSnapshot(seal));
+                    const auto fence_ok = [this] { return fence_ok_fn(); };
+                    /// The `SCOPE_EXIT` above mutates
+                    /// `recovery_in_progress` and notifies `recovery_cv`, and it MUST run with `state_mutex`
+                    /// held. `putIfAbsentControlled` can THROW (its contract: `CORRUPTED_DATA` when it
+                    /// observes DIFFERENT valid bytes at the key -- a cross-process seal conflict, which
+                    /// `recovery_in_progress` cannot serialize); if that exception escaped between `unlock`
+                    /// and `lock`, the unwind would run the `SCOPE_EXIT` UNLOCKED -- a data race on the plain
+                    /// bool and an unlocked notify. So re-acquire the lock before letting any exception
+                    /// propagate. NOTE this obligation is NEW relative to `trySnapshotPublishOnce` (the
+                    /// pattern this mirrors): that precedent has no scope-exit spanning its unlocked call and
+                    /// no cross-caller flag to clean up -- do not weaken this by analogy to it.
+                    lock.unlock();
+                    CasWriteOutcome outcome{};
+                    try
+                    {
+                        outcome = ref_request_controller->putIfAbsentControlled(
+                            layout.refSnapshotKey(ns, seal_id), seal_bytes, fence_ok);
+                    }
+                    catch (...)
+                    {
+                        lock.lock();
+                        throw;
+                    }
+                    lock.lock();
+                    if (outcome != CasWriteOutcome::Committed)
+                        throwCasWriteRetryLater(fmt::format(
+                            "CAS recovery seal PUT for namespace '{}' did not commit; failing recovery closed "
+                            "(the table stays unrecovered/non-writable; the next touch restarts recovery and "
+                            "re-seals)", ns.string()));
+                    ProfileEvents::increment(ProfileEvents::CasRefRecoverySealPublished);
+
+                    /// The seal now covers everything replayed so far: feed it into the SAME bookkeeping below
+                    /// (`rt.newest_snapshot_id`, the tail counters, cache weight) as if it were the recovered
+                    /// snapshot and the tail were empty -- exactly what a fresh recovery against the now-durable
+                    /// seal would find.
+                    snapshot = std::move(seal);
+                    tail.clear();
+                    tail_bytes.clear();
+                    snapshot_body_bytes = seal_bytes.size();
+                }
+
+                rt.recovered = true;
+
+                /// Seed the tail counters from this SAME recovery
+                /// pass -- `rt.state` above already IS `Replay(snapshot, tail)` (the mount-time trigger's
+                /// candidate body needs no separate base+tail bookkeeping any more), so only the count and byte
+                /// sum of the logs strictly above the recovered snapshot need seeding.
+                rt.newest_snapshot_id = snapshot ? std::optional<RefTxnId>(snapshot->snapshot_id) : std::nullopt;
+                rt.tail_count_since_snapshot.store(tail.size(), std::memory_order_relaxed);
+                uint64_t seeded_tail_bytes = 0;
+                for (uint64_t bytes : tail_bytes)
+                    seeded_tail_bytes += bytes;
+                rt.tail_bytes_since_snapshot.store(seeded_tail_bytes, std::memory_order_relaxed);
+                /// Stale-precommit cleanup is dispatched once, from `appendRefOps`'s top level
+                /// (never from here -- this call may itself be nested inside a queue leader's flush stack).
+                rt.needs_stale_precommit_sweep = true;
+
+                /// Per-table admission budgets pre-subtract this table's own wire
+                /// overhead (`4 + ns.size()`, repeated once in a snapshot body and once in a removal txn body)
+                /// plus a fixed safety margin from the raw hard limits, once, here.
+                const uint64_t overhead = 4 + ns.string().size() + kRefAdmissionSafetyMargin;
+                rt.snapshot_budget = overhead < ref_snapshot_max_bytes ? ref_snapshot_max_bytes - overhead : 0;
+                rt.removal_budget = overhead < ref_removal_max_bytes ? ref_removal_max_bytes - overhead : 0;
+
+                /// The cache-weight base is the encoded body size of the recovered
+                /// base snapshot, captured for free from the GET above. The tail bytes are tracked separately in
+                /// `tail_bytes_since_snapshot`; the two sum to this table's estimated resident weight.
+                rt.base_snapshot_bytes.store(snapshot_body_bytes, std::memory_order_relaxed);
                 break;
-            cursor = page.next_cursor;
-        }
-        std::sort(log_ids.begin(), log_ids.end());
-
-        /// The greatest transaction id this attempt's `LIST` observed across
-        /// BOTH snapshots and logs -- used below to decide whether a dead-epoch region exists to seal.
-        /// Recomputed fresh on every restart-on-vanish attempt, exactly like `greatest_snapshot`/`log_ids`.
-        std::optional<RefTxnId> greatest_listed_id = greatest_snapshot;
-        if (!log_ids.empty() && (!greatest_listed_id || *greatest_listed_id < log_ids.back()))
-            greatest_listed_id = log_ids.back();
-
-        bool vanished = false;
-        std::optional<RefTableSnapshot> snapshot;
-        uint64_t snapshot_body_bytes = 0;   /// weight of the recovered base; 0 = never-born base
-        if (greatest_snapshot)
-        {
-            const auto got = backend.get(layout.refSnapshotKey(ns, *greatest_snapshot));
-            if (!got)
-                vanished = true;   /// covered by a newer snapshot published-before-delete; restart
-            else
-            {
-                snapshot = decodeRefTableSnapshot(openObject(FormatId::RefSnapshot, got->bytes), ns.string(), *greatest_snapshot);
-                snapshot_body_bytes = got->bytes.size();
             }
+            break;   /// recovery succeeded -> exit the outer retry loop
         }
-
-        std::vector<RefLogTxn> tail;
-        std::vector<uint64_t> tail_bytes;
-        if (!vanished)
+        catch (const Exception & e)
         {
-            for (const RefTxnId & id : log_ids)
-            {
-                if (greatest_snapshot && !(*greatest_snapshot < id))
-                    continue;   /// at or below the selected snapshot: already covered
-                const auto got = backend.get(layout.refLogKey(ns, id));
-                if (!got)
-                {
-                    vanished = true;
-                    break;
-                }
-                tail.push_back(decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns.string(), id));
-                tail_bytes.push_back(got->bytes.size());
-            }
-        }
+            if (e.code() != ErrorCodes::NETWORK_ERROR || vanish_brake_tripped)
+                throw;   /// not a transient object-store failure (or the terminal vanish brake) -- fail fast
 
-        if (vanished)
-            continue;   /// the selected object vanished; retry recovery from a fresh listing
+            const uint64_t elapsed_ms = boot_ms_now_fn() - recovery_start_ms;
+            if (elapsed_ms >= cas_request_budget.recovery_retry_budget_ms || !fence_ok_fn())
+                throw;   /// budget spent, or mount fence lost -- permanent for this touch
 
-        rt.state = replay(snapshot, tail);
-        rt.cleanup_markers = std::move(cleanup_markers);
+            const uint64_t backoff_ms = std::min(
+                cas_request_budget.recovery_retry_max_backoff_ms,
+                cas_request_budget.recovery_retry_initial_backoff_ms << recovery_retry_num);
+            ++recovery_retry_num;
+            ProfileEvents::increment(ProfileEvents::CasRefRecoveryRetries);
+            LOG_WARNING(getLogger("CasRefLedger"),
+                "CAS ref-table recovery for namespace '{}' hit a transient object-store error "
+                "({}); retry #{} after {}ms backoff (elapsed {}ms / budget {}ms)",
+                ns.string(), e.message(), recovery_retry_num, backoff_ms, elapsed_ms,
+                cas_request_budget.recovery_retry_budget_ms);
 
-        /// At an UNCLEAN mount, close every dead epoch this
-        /// recovery discovered with an immediate snapshot -- the seal -- published BEFORE the table is
-        /// exposed as recovered. This runs BEFORE `rt.recovered = true` below on purpose: a failed seal
-        /// PUT throws here, leaving the table unrecovered, so the NEXT touch restarts recovery from
-        /// scratch (fresh LIST, fresh replay, fresh seal attempt) rather than exposing a table whose
-        /// dead-epoch region was never actually closed; recovery therefore fails closed.
-        /// The encode and conditional `PUT` run OUTSIDE `state_mutex` (unlocked/relocked just below,
-        /// mirroring `trySnapshotPublishOnce`'s copy-under-lock/PUT-outside shape) -- it is the one part
-        /// of recovery that can run the full ~90s retry envelope, and holding the mutex across it stalls
-        /// every other touch of this table plus `wedgedRefLaneCount`'s whole-store walk (which locks each
-        /// table's `state_mutex` in turn). `recovery_in_progress` (set above), not the mutex, is what
-        /// keeps a concurrent second caller for this SAME table from redoing this same work during the
-        /// unlocked window -- see its doc comment. Nothing else can mutate `rt.state`/`rt.cleanup_markers`
-        /// meanwhile: every OTHER touch-point calls this function first and would block in the wait loop
-        /// above; `rt` itself cannot be destroyed underneath us (the caller's own `shared_ptr` keeps it
-        /// alive regardless of the mutex, which is also what protects it from `enforceRefTableCacheBudget`
-        /// -- eviction only ever considers a table at `use_count() == 1`).
-        ///
-        /// `seal_id` is the UPPER BOUND of the dead-epoch region, not the greatest listed id: the wedge
-        /// discipline places the predecessor's one possible in-flight PUT strictly above everything it
-        /// resolved, so only the epoch-closing bound is guaranteed to dominate it --
-        /// any later materialization from a dead epoch is born covered (`<=` seal_id) for every
-        /// observer, forever. `sealed_from` records the greatest id this recovery actually listed, the
-        /// observation horizon against which a later log is measured.
-        const uint64_t my_epoch = live_epoch_fn();
-        const RefTxnId seal_id{my_epoch - 1, std::numeric_limits<uint64_t>::max()};
-        const bool dead_region_nonempty =
-            greatest_listed_id.has_value() && greatest_listed_id->writer_epoch < my_epoch;
-        const bool already_sealed = snapshot.has_value() && !(snapshot->snapshot_id < seal_id);
-        /// Compare against the SPECIFIC epoch a reclaim was marked unclean for, not a
-        /// sticky "ever" bool -- a table recovered for the first time (or reloaded after LRU eviction)
-        /// under a LATER, perfectly clean epoch boundary must not get a parasitic seal just because
-        /// SOME earlier, unrelated boundary in this incarnation's life was unclean.
-        if (unclean_boundary_epoch() == my_epoch && my_epoch >= 2
-            && dead_region_nonempty && !already_sealed && rt.state.lifecycle == RefLifecycle::Live)
-        {
-            RefTableSnapshot seal = snapshotOf(rt.state, ns.string());
-            seal.snapshot_id = seal_id;                     /// upper bound of the covered region
-            seal.sealed_from = rt.state.greatest_applied;    /// == greatest_listed_id: nothing else was applied
-            const String seal_bytes = sealObject(FormatId::RefSnapshot, encodeRefTableSnapshot(seal));
-            const auto fence_ok = [this] { return fence_ok_fn(); };
-            /// The `SCOPE_EXIT` above mutates
-            /// `recovery_in_progress` and notifies `recovery_cv`, and it MUST run with `state_mutex`
-            /// held. `putIfAbsentControlled` can THROW (its contract: `CORRUPTED_DATA` when it
-            /// observes DIFFERENT valid bytes at the key -- a cross-process seal conflict, which
-            /// `recovery_in_progress` cannot serialize); if that exception escaped between `unlock`
-            /// and `lock`, the unwind would run the `SCOPE_EXIT` UNLOCKED -- a data race on the plain
-            /// bool and an unlocked notify. So re-acquire the lock before letting any exception
-            /// propagate. NOTE this obligation is NEW relative to `trySnapshotPublishOnce` (the
-            /// pattern this mirrors): that precedent has no scope-exit spanning its unlocked call and
-            /// no cross-caller flag to clean up -- do not weaken this by analogy to it.
             lock.unlock();
-            CasWriteOutcome outcome{};
-            try
-            {
-                outcome = ref_request_controller->putIfAbsentControlled(
-                    layout.refSnapshotKey(ns, seal_id), seal_bytes, fence_ok);
-            }
-            catch (...)
-            {
-                lock.lock();
-                throw;
-            }
+            recovery_retry_sleep_fn(backoff_ms);
             lock.lock();
-            if (outcome != CasWriteOutcome::Committed)
-                throwCasWriteRetryLater(fmt::format(
-                    "CAS recovery seal PUT for namespace '{}' did not commit; failing recovery closed "
-                    "(the table stays unrecovered/non-writable; the next touch restarts recovery and "
-                    "re-seals)", ns.string()));
-            ProfileEvents::increment(ProfileEvents::CasRefRecoverySealPublished);
-
-            /// The seal now covers everything replayed so far: feed it into the SAME bookkeeping below
-            /// (`rt.newest_snapshot_id`, the tail counters, cache weight) as if it were the recovered
-            /// snapshot and the tail were empty -- exactly what a fresh recovery against the now-durable
-            /// seal would find.
-            snapshot = std::move(seal);
-            tail.clear();
-            tail_bytes.clear();
-            snapshot_body_bytes = seal_bytes.size();
+            /// loop: re-run recovery from a fresh LIST (fresh snapshot/log/replay/seal)
         }
-
-        rt.recovered = true;
-
-        /// Seed the tail counters from this SAME recovery
-        /// pass -- `rt.state` above already IS `Replay(snapshot, tail)` (the mount-time trigger's
-        /// candidate body needs no separate base+tail bookkeeping any more), so only the count and byte
-        /// sum of the logs strictly above the recovered snapshot need seeding.
-        rt.newest_snapshot_id = snapshot ? std::optional<RefTxnId>(snapshot->snapshot_id) : std::nullopt;
-        rt.tail_count_since_snapshot.store(tail.size(), std::memory_order_relaxed);
-        uint64_t seeded_tail_bytes = 0;
-        for (uint64_t bytes : tail_bytes)
-            seeded_tail_bytes += bytes;
-        rt.tail_bytes_since_snapshot.store(seeded_tail_bytes, std::memory_order_relaxed);
-        /// Stale-precommit cleanup is dispatched once, from `appendRefOps`'s top level
-        /// (never from here -- this call may itself be nested inside a queue leader's flush stack).
-        rt.needs_stale_precommit_sweep = true;
-
-        /// Per-table admission budgets pre-subtract this table's own wire
-        /// overhead (`4 + ns.size()`, repeated once in a snapshot body and once in a removal txn body)
-        /// plus a fixed safety margin from the raw hard limits, once, here.
-        const uint64_t overhead = 4 + ns.string().size() + kRefAdmissionSafetyMargin;
-        rt.snapshot_budget = overhead < ref_snapshot_max_bytes ? ref_snapshot_max_bytes - overhead : 0;
-        rt.removal_budget = overhead < ref_removal_max_bytes ? ref_removal_max_bytes - overhead : 0;
-
-        /// The cache-weight base is the encoded body size of the recovered
-        /// base snapshot, captured for free from the GET above. The tail bytes are tracked separately in
-        /// `tail_bytes_since_snapshot`; the two sum to this table's estimated resident weight.
-        rt.base_snapshot_bytes.store(snapshot_body_bytes, std::memory_order_relaxed);
-        break;
     }
     }
 

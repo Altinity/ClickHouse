@@ -236,6 +236,11 @@ private:
     std::function<std::shared_ptr<void>()> pin_owner;
     std::function<void(const RootNamespace &)> cancel_inflight_builds;
 
+    /// Backoff sleep used by `ensureRefTableRecovered`'s transient-retry loop. Default is an
+    /// interruptible slice-sleep (bails early if `fence_ok_fn` drops, e.g. on shutdown/lease loss);
+    /// `setCasRetrySleepForTest` overrides it (a unit test injects a clock-advancing no-op).
+    std::function<void(uint64_t)> recovery_retry_sleep_fn;
+
     /// Describes the one conditional `PUT` whose outcome is still uncertain for a table. It remains in
     /// the runtime until the object is confirmed durable and applied to the cache, or definitely rejected.
     struct RefAppendWedge

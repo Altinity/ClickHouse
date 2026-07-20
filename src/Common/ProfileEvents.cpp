@@ -771,6 +771,7 @@ The server successfully detected this situation and will download merged part fr
     M(CasRefBatchScopeCuts, "Counts CAS ref batches cut short by scope limits; growing values indicate smaller batches and more write overhead.", ValueType::Number) \
     M(CasRefQueueWaitMicroseconds, "Counts cumulative time CAS ref writers spent queued; rising values indicate ref-write contention or backend latency.", ValueType::Microseconds) \
     M(CasRefRecoveryRestarts, "Counts CAS ref-table recovery retries after a snapshot or log vanished during reading; non-zero values indicate concurrent cleanup or backend inconsistency.", ValueType::Number) \
+    M(CasRefRecoveryRetries, "Counts CAS ref-table recovery attempts retried after a transient object-store error before the table's load fails; non-zero values indicate transient object-store disruption during table startup.", ValueType::Number) \
     M(CasRefAppendWedged, "Counts CAS ref-log append lanes that exhausted retries after an uncertain PUT; non-zero values indicate ref-log progress may be stalled.", ValueType::Number) \
     M(CasRefAppendUnwedged, "Counts CAS ref-log append lanes recovered after an uncertain PUT was later observed durable; non-zero values indicate transient write uncertainty.", ValueType::Number) \
     M(CasRefAppendDefiniteFailure, "Counts CAS ref-log appends rejected with certainty; non-zero values indicate invalid requests or backend rejection requiring investigation.", ValueType::Number) \

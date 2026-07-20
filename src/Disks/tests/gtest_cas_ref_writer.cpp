@@ -49,6 +49,7 @@ extern const Event CasRefSnapshotPublishDispatched;
 extern const Event CasRefSnapshotPublishBackoff;
 extern const Event CasConditionalWriteFenceLostPostWrite;
 extern const Event CasRefRecoverySealPublished;
+extern const Event CasRefRecoveryRetries;
 }
 
 using namespace DB::Cas;
@@ -2856,7 +2857,7 @@ TEST(RefWriterRecoverySeal, CleanBoundaryDoesNotSeal)
         << "a clean predecessor boundary must not produce a seal snapshot";
 }
 
-TEST(RefWriterRecoverySeal, SealPutFailureFailsRecoveryClosed)
+TEST(RefWriterRecoverySeal, SealPutTransientFailureIsRetriedThenSeals)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
     const Layout layout("p");
@@ -2876,20 +2877,22 @@ TEST(RefWriterRecoverySeal, SealPutFailureFailsRecoveryClosed)
     ASSERT_EQ(store->liveWriterEpoch(), 3u);
     ASSERT_TRUE(store->uncleanEpochBoundarySeenForTest());
 
+    store->setCasRetrySleepForTest([](uint64_t) {});   /// no real wait on the retry backoff
+
     const RefTxnId seal_id{2, UINT64_MAX};
     backend->fault_key_substr = layout.refSnapshotKey(ns, seal_id);
-    backend->fault_count = 1;   /// the seal PUT's single attempt (max_attempts=1) fails ambiguously -> Unresolved
+    backend->fault_count = 1;   /// one transient ambiguous seal PUT -> retried within this same touch
 
-    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->listRefs(ns); });
-    EXPECT_FALSE(backend->get(layout.refSnapshotKey(ns, seal_id)).has_value())
-        << "the failed attempt must not have actually landed the seal";
+    using ProfileEvents::global_counters;
+    const auto retries_before = global_counters[ProfileEvents::CasRefRecoveryRetries].load();
 
-    /// A second touch: the table was never exposed as recovered (the seal PUT failure threw BEFORE
-    /// `rt.recovered` was set), so this restarts recovery from scratch -- LIST, replay, and reseal --
-    /// this time with the PUT succeeding.
+    /// The transient seal failure is retried inside recovery, so the FIRST touch already recovers and
+    /// seals (previously this threw NETWORK_ERROR and only a SECOND touch re-sealed -- Layer 1 of the
+    /// stuck-table-load fix changed that: a transient object-store blip no longer fails the load).
     EXPECT_EQ(store->listRefs(ns).size(), 2u);
+    EXPECT_EQ(global_counters[ProfileEvents::CasRefRecoveryRetries].load(), retries_before + 1);
     EXPECT_TRUE(backend->get(layout.refSnapshotKey(ns, seal_id)).has_value())
-        << "the second touch must have recovered and sealed";
+        << "recovery must have retried past the transient failure and sealed on the first touch";
 }
 
 /// rev.6 fix-round F1 (author-review: "seal skipped on an empty dead-region ... detector blind in
@@ -3223,6 +3226,163 @@ TEST(RefWriterRecoverySeal, WriteAfterSealSelectedAsGreatestSnapshotCommits)
     const auto refs = successor->listRefs(ns);
     EXPECT_EQ(refs.count("c"), 1u) << "the new ref must have actually committed";
     EXPECT_EQ(refs.size(), 3u) << "the seal-recovered refs 'a' and 'b' must still be present alongside 'c'";
+}
+
+/// ===================================================================================
+/// Layer 1 of the stuck-table-load fix: `ensureRefTableRecovered` retries a whole recovery attempt
+/// after a TRANSIENT object-store NETWORK_ERROR (bounded by `recovery_retry_budget_ms`), instead of
+/// failing the table's async load permanently. Non-transient errors and the terminal vanish-race
+/// brake still fail fast.
+/// ===================================================================================
+
+TEST(RefWriterRecoveryRetry, TransientSealFailureIsRetriedThenSucceeds)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/retry_ok"};
+
+    seedSealFixtureDeadEpochs(*backend, layout, ns);
+    seedUncleanPredecessorMount(*backend, layout, /*epoch=*/2);
+
+    uint64_t fake_now = 1'000'000;
+
+    PoolConfig config;
+    config.server_id = UInt128(1);
+    config.mount_lease_ttl_ms = std::chrono::milliseconds(500);
+    config.cas_request_budget = sealTestTinyBudget();
+    config.cas_request_budget.recovery_retry_budget_ms = 120000;
+    config.cas_request_budget.recovery_retry_initial_backoff_ms = 1000;
+    config.cas_request_budget.recovery_retry_max_backoff_ms = 30000;
+    config.materialization_grace_ms = 1000;
+    config.boot_ms_fn = [&fake_now] { return fake_now; };
+    config.wait_sleep_fn = [](uint64_t) {};
+    auto store = openPoolWithConfig(backend, config);
+    ASSERT_TRUE(store);
+    ASSERT_EQ(store->liveWriterEpoch(), 3u);
+
+    /// No-op backoff and a frozen clock: retries run until the transient faults are exhausted, and the
+    /// frozen clock keeps the mount fence alive across them (advancing it past the tiny lease TTL would
+    /// drop the fence and abort recovery -- exercising the fence path, which is the budget test's job).
+    store->setCasRetrySleepForTest([](uint64_t) {});
+
+    /// Fail the seal snapshot PUT twice with a transient (timeout) error; the third attempt lands.
+    const RefTxnId seal_id{2, UINT64_MAX};
+    backend->fault_key_substr = layout.refSnapshotKey(ns, seal_id);
+    backend->fault_count = 2;
+
+    using ProfileEvents::global_counters;
+    const auto retries_before = global_counters[ProfileEvents::CasRefRecoveryRetries].load();
+    const auto sealed_before = global_counters[ProfileEvents::CasRefRecoverySealPublished].load();
+
+    EXPECT_EQ(store->listRefs(ns).size(), 2u) << "recovery must succeed after retrying past the faults";
+
+    EXPECT_EQ(global_counters[ProfileEvents::CasRefRecoveryRetries].load(), retries_before + 2);
+    EXPECT_EQ(global_counters[ProfileEvents::CasRefRecoverySealPublished].load(), sealed_before + 1);
+}
+
+TEST(RefWriterRecoveryRetry, TransientFailureLongerThanBudgetPropagates)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/retry_budget"};
+
+    seedSealFixtureDeadEpochs(*backend, layout, ns);
+    seedUncleanPredecessorMount(*backend, layout, /*epoch=*/2);
+
+    uint64_t fake_now = 1'000'000;
+
+    PoolConfig config;
+    config.server_id = UInt128(1);
+    /// Lease TTL >> the recovery budget so the CLOCK-advancing backoff below trips the budget check,
+    /// not the mount fence -- this test specifically exercises the budget-exhaustion path.
+    config.mount_lease_ttl_ms = std::chrono::milliseconds(600000);
+    config.cas_request_budget = sealTestTinyBudget();
+    config.cas_request_budget.recovery_retry_budget_ms = 5000;   /// small, deterministic
+    config.cas_request_budget.recovery_retry_initial_backoff_ms = 1000;
+    config.cas_request_budget.recovery_retry_max_backoff_ms = 30000;
+    config.materialization_grace_ms = 1000;
+    config.boot_ms_fn = [&fake_now] { return fake_now; };
+    config.wait_sleep_fn = [](uint64_t) {};
+    auto store = openPoolWithConfig(backend, config);
+    ASSERT_TRUE(store);
+    store->setCasRetrySleepForTest([&fake_now](uint64_t ms) { fake_now += ms; });
+
+    const RefTxnId seal_id{2, UINT64_MAX};
+    backend->fault_key_substr = layout.refSnapshotKey(ns, seal_id);
+    backend->fault_count = 1000;   /// never stops failing within the budget
+
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->listRefs(ns); });
+}
+
+TEST(RefWriterRecoveryRetry, NonNetworkErrorIsNotRetried)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/retry_fatal"};
+
+    seedSealFixtureDeadEpochs(*backend, layout, ns);
+    seedUncleanPredecessorMount(*backend, layout, /*epoch=*/2);
+
+    PoolConfig config;
+    config.server_id = UInt128(1);
+    config.mount_lease_ttl_ms = std::chrono::milliseconds(500);
+    config.cas_request_budget = sealTestTinyBudget();
+    config.materialization_grace_ms = 1000;
+    config.wait_sleep_fn = [](uint64_t) {};
+    auto store = openPoolWithConfig(backend, config);
+    ASSERT_TRUE(store);
+
+    size_t sleep_calls = 0;
+    store->setCasRetrySleepForTest([&sleep_calls](uint64_t) { ++sleep_calls; });
+
+    /// A foreign writer lands DIFFERENT valid bytes at the seal key; resolve-before-reissue then throws
+    /// CORRUPTED_DATA (a real cross-process seal conflict), which must NOT be retried.
+    const RefTxnId seal_id{2, UINT64_MAX};
+    backend->corrupt_key_substr = layout.refSnapshotKey(ns, seal_id);
+    backend->corrupt_count = 1;
+
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { store->listRefs(ns); });
+    EXPECT_EQ(sleep_calls, 0u) << "a non-transient error must fail fast with zero backoff sleeps";
+}
+
+TEST(RefWriterRecoveryRetry, VanishBrakeStaysTerminalNotRetried)
+{
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/retry_vanish"};
+    const ManifestRef ma = manifestRef(1, 1, 1);
+
+    const RefTxnId snap_x{1, 10};
+    writeRefSnapshotRaw(*backend, layout, minimalLiveSnapshot(ns.string(), snap_x, {committedRow("a", ma)}));
+
+    auto store = openPool(backend);
+
+    size_t sleep_calls = 0;
+    store->setCasRetrySleepForTest([&sleep_calls](uint64_t) { ++sleep_calls; });
+
+    /// Re-arm the vanish so the SAME selected snapshot key keeps disappearing between LIST and GET,
+    /// past the kRefRecoveryMaxRestarts (3) inner brake.
+    const String vkey = layout.refSnapshotKey(ns, snap_x);
+    int fires = 0;
+    std::function<void()> rearm = [&]()
+    {
+        if (++fires < 5)
+        {
+            backend->vanish_once_keys.insert(vkey);
+            backend->on_vanish_fire = rearm;
+        }
+    };
+    backend->vanish_once_keys.insert(vkey);
+    backend->on_vanish_fire = rearm;
+
+    using ProfileEvents::global_counters;
+    const auto retries_before = global_counters[ProfileEvents::CasRefRecoveryRetries].load();
+
+    expectThrowsCode(DB::ErrorCodes::NETWORK_ERROR, [&] { store->listRefs(ns); });
+
+    EXPECT_EQ(global_counters[ProfileEvents::CasRefRecoveryRetries].load(), retries_before)
+        << "the vanish-race brake is terminal; the outer transient-retry loop must NOT re-drive it";
+    EXPECT_EQ(sleep_calls, 0u) << "no backoff sleep for the terminal vanish brake";
 }
 
 /// ===================================================================================
