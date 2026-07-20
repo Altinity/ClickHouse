@@ -100,6 +100,21 @@ namespace ExportPartitionUtils
         const StorageID & destination_storage_id,
         const ContextPtr & context);
 
+    /// Verifies the source MergeTree partition key is compatible with a plain (hive) object storage
+    /// destination partition key. The hive write path evaluates the destination PARTITION BY on the
+    /// source part's minmax block and writes every part row to that single directory, so each source
+    /// partition must map to exactly one destination partition. A destination term is proven either by
+    /// an exact match (identical partition keys, or the same per-column expression) or dynamically, by
+    /// checking the destination expression is constant over the column's actual [min, max] folded
+    /// across `parts` (provably-monotonic single-argument functions and bare columns only). Throws
+    /// BAD_ARGUMENTS when a term cannot be proven single-valued.
+    void verifyPlainPartitionCompatibility(
+        const StorageMetadataPtr & source_metadata,
+        const StorageMetadataPtr & destination_metadata,
+        const MergeTreeData::DataPartsVector & parts,
+        const String & partition_id,
+        const ContextPtr & context);
+
 #if USE_AVRO
     /// Verifies the source MergeTree partition key is compatible with the destination Iceberg
     /// partition spec: every destination partition field must be single-valued across the exported

@@ -41,6 +41,15 @@ Lossy partition-column casts (allowed via `export_merge_tree_part_allow_lossy_ca
 
 Each MergeTree part will become a separate file with the following name convention: `<table_directory>/<partitioning>/<data_part_name>_<merge_tree_part_checksum>.<format>`. To ensure atomicity, a commit file containing the relative paths of all exported parts is also shipped. A data file should only be considered part of the dataset if a commit file references it. The commit file will be named using the following convention: `<table_directory>/commit_<partition_id>_<transaction_id>`.
 
+#### Source partition key compatibility
+
+The export writes all rows of a part to the single directory computed from the destination `PARTITION BY` on the part's values, so - exactly like the Iceberg gate - each destination partition must be single-valued across the exported source part. A destination partition column is accepted when either:
+
+- The whole source and destination `PARTITION BY` are identical, or the source already partitions by the same expression on that column (this covers a source that adds extra partition columns on top of the destination's, in any order - for example `PARTITION BY (year, country)` into a destination partitioned by `year`).
+- Or the destination expression is proven constant over the column's actual `[min, max]` in the part. This is data-dependent and accepts equivalent or finer source keys (for example `PARTITION BY toDate(ts)` into a destination partitioned by `toYYYYMM(ts)` when a part holds a single month). Only provably-monotonic single-argument functions and bare columns are proven this way.
+
+Otherwise the export is rejected with a `BAD_ARGUMENTS` error at `EXPORT` time: this includes a destination that partitions by a column absent from the source partition key, and a source partition whose rows would span more than one destination partition (for example a monthly source partition exported into a daily destination that actually contains several days). A `Nullable` partition column is only accepted through an exact match, because a `NULL` forms its own partition. Partition-column type differences follow the same lossy-cast gate as any other column (`export_merge_tree_part_allow_lossy_cast`).
+
 ## Syntax
 
 ```sql

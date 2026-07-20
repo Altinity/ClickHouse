@@ -14,22 +14,22 @@
 #include <Core/Block.h>
 #include <Core/Settings.h>
 #include <DataTypes/Utils.h>
+#include <DataTypes/DataTypesNumber.h>
 #include <Interpreters/ActionsDAG.h>
 #include <Interpreters/Context.h>
 #include <Interpreters/ExpressionActions.h>
-
-#if USE_AVRO
 #include <Storages/MergeTree/IMergeTreeDataPart.h>
-#include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
-#include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
 #include <Parsers/ASTFunction.h>
 #include <Parsers/ASTIdentifier.h>
 #include <Parsers/ASTLiteral.h>
 #include <Parsers/ASTExpressionList.h>
 #include <Functions/FunctionFactory.h>
+
+#if USE_AVRO
+#include <Storages/ObjectStorage/DataLakes/Iceberg/Constant.h>
+#include <Storages/ObjectStorage/DataLakes/Iceberg/Utils.h>
 #include <Functions/CastOverloadResolver.h>
 #include <Interpreters/castColumn.h>
-#include <DataTypes/DataTypesNumber.h>
 #include <DataTypes/DataTypeString.h>
 #endif
 
@@ -495,6 +495,166 @@ namespace ExportPartitionUtils
         ops.emplace_back(zkutil::makeSetRequest(last_exception_path, entry.toJsonString(), -1));
     }
 
+namespace
+{
+    /// One top-level term of a MergeTree PARTITION BY: a column and, when the term is a function of a
+    /// single column, that function name and an optional integer argument. An empty function marks a
+    /// bare column (identity).
+    struct PartitionKeyTerm
+    {
+        String column;
+        String function;
+        std::optional<Int64> argument;
+
+        bool operator==(const PartitionKeyTerm & other) const
+        {
+            return column == other.column && function == other.function && argument == other.argument;
+        }
+    };
+
+    /// Parse a PARTITION BY AST into per-column terms. Returns std::nullopt if any top-level term is
+    /// not a bare column or a function of exactly one column (nested/multi-column expressions), so the
+    /// caller can only satisfy such a key by an exact match.
+    std::optional<std::vector<PartitionKeyTerm>> parsePartitionKeyTerms(const ASTPtr & partition_key_ast)
+    {
+        std::vector<PartitionKeyTerm> terms;
+        if (!partition_key_ast)
+            return terms;
+
+        bool ok = true;
+        auto parse_one = [&](const ASTPtr & element)
+        {
+            if (const auto * ident = element->as<ASTIdentifier>())
+            {
+                terms.push_back({ident->name(), "", std::nullopt});
+                return;
+            }
+
+            const auto * func = element->as<ASTFunction>();
+            if (!func)
+            {
+                ok = false;
+                return;
+            }
+
+            std::optional<String> column;
+            std::optional<Int64> argument;
+            size_t identifiers = 0;
+            for (const auto & child : func->children)
+            {
+                const auto * expression_list = child->as<ASTExpressionList>();
+                if (!expression_list)
+                    continue;
+                for (const auto & arg : expression_list->children)
+                {
+                    if (const auto * id = arg->as<ASTIdentifier>())
+                    {
+                        column = id->name();
+                        ++identifiers;
+                    }
+                    else if (const auto * lit = arg->as<ASTLiteral>())
+                    {
+                        /// A string literal is an optional timezone argument and does not affect the
+                        /// term; only an integer literal is the bucket/truncate width.
+                        if (lit->value.getType() != Field::Types::String)
+                            argument = lit->value.safeGet<Int64>();
+                    }
+                    else
+                        ok = false;
+                }
+            }
+            if (identifiers != 1)
+            {
+                ok = false;
+                return;
+            }
+            terms.push_back({*column, func->name, argument});
+        };
+
+        if (const auto * func = partition_key_ast->as<ASTFunction>(); func && func->name == "tuple")
+        {
+            for (const auto & child : func->children)
+                if (const auto * expression_list = child->as<ASTExpressionList>())
+                    for (const auto & element : expression_list->children)
+                        parse_one(element);
+        }
+        else
+            parse_one(partition_key_ast);
+
+        if (!ok)
+            return std::nullopt;
+        return terms;
+    }
+
+    /// Fold [min, max] of the partition-key column at `slot` across all parts of the partition.
+    /// Returns false if no part exposes an initialized min/max for that column.
+    bool foldPartitionColumnBounds(
+        const MergeTreeData::DataPartsVector & parts, size_t slot, Field & out_min, Field & out_max)
+    {
+        bool found = false;
+        for (const auto & part : parts)
+        {
+            if (!part->minmax_idx || !part->minmax_idx->initialized || slot >= part->minmax_idx->hyperrectangle.size())
+                continue;
+            auto range = part->minmax_idx->hyperrectangle[slot];
+            range.shrinkToIncludedIfPossible();
+            if (!found)
+            {
+                out_min = range.left;
+                out_max = range.right;
+                found = true;
+            }
+            else
+            {
+                if (range.left < out_min)
+                    out_min = range.left;
+                if (out_max < range.right)
+                    out_max = range.right;
+            }
+        }
+        return found;
+    }
+
+    /// Whether the destination partition term yields a single value across [min, max] of its source
+    /// column. A bare column is single-valued iff min == max. A single-argument function is
+    /// single-valued when it is provably monotonic over the range and maps both endpoints to the same
+    /// value. Functions carrying an integer argument (bucket/truncate and similar) are not order
+    /// preserving in general, so they can only be accepted by an exact structural match.
+    bool partitionTermIsConstantOverBounds(
+        const PartitionKeyTerm & term, const DataTypePtr & column_type,
+        const Field & min_value, const Field & max_value, const ContextPtr & context)
+    {
+        if (term.function.empty() || term.function == "identity")
+            return min_value == max_value;
+
+        if (term.argument.has_value())
+            return false;
+
+        auto resolver = FunctionFactory::instance().get(term.function, context);
+
+        auto values_column = column_type->createColumn();
+        values_column->insert(min_value);
+        values_column->insert(max_value);
+        const ColumnWithTypeAndName values{std::move(values_column), column_type, term.column};
+
+        const ColumnsWithTypeAndName arguments{values};
+        const auto result_type = resolver->getReturnType(arguments);
+        const auto function_base = resolver->build(arguments);
+
+        if (!function_base->hasInformationAboutMonotonicity())
+            return false;
+        if (!function_base->getMonotonicityForRange(*column_type, min_value, max_value).is_monotonic)
+            return false;
+
+        const auto result = function_base->execute(arguments, result_type, 2, /*dry_run=*/ false);
+        Field first;
+        Field second;
+        result->get(0, first);
+        result->get(1, second);
+        return first == second;
+    }
+}
+
 #if USE_AVRO
 namespace
 {
@@ -568,35 +728,6 @@ namespace
             parse_one(partition_key_ast);
 
         return terms;
-    }
-
-    /// Fold [min, max] of the partition-key column at `slot` across all parts of the partition.
-    /// Returns false if no part exposes an initialized min/max for that column.
-    bool foldPartitionColumnBounds(
-        const MergeTreeData::DataPartsVector & parts, size_t slot, Field & out_min, Field & out_max)
-    {
-        bool found = false;
-        for (const auto & part : parts)
-        {
-            if (!part->minmax_idx || !part->minmax_idx->initialized || slot >= part->minmax_idx->hyperrectangle.size())
-                continue;
-            auto range = part->minmax_idx->hyperrectangle[slot];
-            range.shrinkToIncludedIfPossible();
-            if (!found)
-            {
-                out_min = range.left;
-                out_max = range.right;
-                found = true;
-            }
-            else
-            {
-                if (range.left < out_min)
-                    out_min = range.left;
-                if (out_max < range.right)
-                    out_max = range.right;
-            }
-        }
-        return found;
     }
 
     /// Apply the destination Iceberg transform (rebuilt as a ClickHouse function, mirroring
@@ -805,6 +936,77 @@ namespace
         }
     }
 #endif
+
+    void verifyPlainPartitionCompatibility(
+        const StorageMetadataPtr & source_metadata,
+        const StorageMetadataPtr & destination_metadata,
+        const MergeTreeData::DataPartsVector & parts,
+        const String & partition_id,
+        const ContextPtr & context)
+    {
+        const auto source_key_ast = source_metadata->getPartitionKeyAST();
+        const auto destination_key_ast = destination_metadata->getPartitionKeyAST();
+
+        auto ast_to_string = [](const ASTPtr & ast) { return ast ? ast->formatWithSecretsOneLine() : String{}; };
+
+        /// Fast path: identical partition keys are single-valued per source partition by construction.
+        /// This also preserves acceptance of non-monotonic keys (hashes, modulo) that the dynamic proof
+        /// below cannot reason about.
+        if (ast_to_string(source_key_ast) == ast_to_string(destination_key_ast))
+            return;
+
+        const auto destination_terms = parsePartitionKeyTerms(destination_key_ast);
+        if (!destination_terms)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                "Cannot export partition: the destination partition key is not a supported per-column "
+                "expression and does not match the source partition key.");
+
+        /// Unpartitioned destination: a single output partition trivially holds every source partition.
+        if (destination_terms->empty())
+            return;
+
+        const auto source_terms = parsePartitionKeyTerms(source_key_ast).value_or(std::vector<PartitionKeyTerm>{});
+
+        const auto & source_partition_key = source_metadata->getPartitionKey();
+        const auto minmax_column_names = MergeTreeData::getMinMaxColumnsNames(source_partition_key);
+        const auto minmax_column_types = MergeTreeData::getMinMaxColumnsTypes(source_partition_key);
+
+        for (const auto & term : *destination_terms)
+        {
+            /// Fast path: the source already partitions by the same expression on this column, so every
+            /// source partition is single-valued for this destination term by construction.
+            if (std::find(source_terms.begin(), source_terms.end(), term) != source_terms.end())
+                continue;
+
+            const auto slot_it = std::find(minmax_column_names.begin(), minmax_column_names.end(), term.column);
+            if (slot_it == minmax_column_names.end())
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                    "Cannot export partition: destination partitions by column '{}', which is not part of "
+                    "the source MergeTree partition key.", term.column);
+            const size_t slot = static_cast<size_t>(slot_it - minmax_column_names.begin());
+            const auto & column_type = minmax_column_types[slot];
+
+            /// A NULL forms its own destination partition, so a nullable column may split the source
+            /// partition; min/max cannot rule that out. Require an exact match for such columns.
+            if (column_type->isNullable())
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                    "Cannot export partition: partition column '{}' is Nullable, so a NULL forms a separate "
+                    "destination partition. Partition the source by the matching expression.", term.column);
+
+            Field min_value;
+            Field max_value;
+            if (!foldPartitionColumnBounds(parts, slot, min_value, max_value))
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                    "Cannot export partition: no min/max statistics available for column '{}' in partition "
+                    "'{}'; cannot validate partitioning.", term.column, partition_id);
+
+            if (!partitionTermIsConstantOverBounds(term, column_type, min_value, max_value, context))
+                throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                    "Cannot export partition '{}': the source partition spans multiple destination "
+                    "partitions for column '{}'. A source MergeTree partition must map to a single "
+                    "destination partition.", partition_id, term.column);
+        }
+    }
 
     void verifyExportSchemaCastable(
         const StorageMetadataPtr & source_metadata,

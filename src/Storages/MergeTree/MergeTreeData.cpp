@@ -6692,13 +6692,20 @@ void MergeTreeData::exportPartToTable(
     if (!dest_storage->supportsImport(query_context))
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Destination storage {} does not support MergeTree parts or uses unsupported partitioning", dest_storage->getName());
 
-    auto query_to_string = [] (const ASTPtr & ast)
-    {
-        return ast ? ast->formatWithSecretsOneLine() : "";
-    };
-
     auto source_metadata_ptr = getInMemoryMetadataPtr();
     auto destination_metadata_ptr = dest_storage->getInMemoryMetadataPtr();
+
+    if (dest_storage->isDataLake() && !query_context->getSettingsRef()[Setting::allow_insert_into_iceberg])
+    {
+        throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
+            "Iceberg writes are experimental. "
+            "To allow its usage, enable the setting `allow_insert_into_iceberg`.");
+    }
+
+    /// Positional CAST matching, like `INSERT INTO dest SELECT * FROM src`. Runs before the part
+    /// lookup so schema/type incompatibilities are reported even when the referenced part is absent.
+    ExportPartitionUtils::verifyExportSchemaCastable(
+        source_metadata_ptr, destination_metadata_ptr, dest_storage->getStorageID(), query_context);
 
     auto part = getPartIfExists(part_name, {MergeTreeDataPartState::Active, MergeTreeDataPartState::Outdated});
 
@@ -6710,13 +6717,6 @@ void MergeTreeData::exportPartToTable(
 
     if (dest_storage->isDataLake())
     {
-        if (!query_context->getSettingsRef()[Setting::allow_insert_into_iceberg])
-        {
-            throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
-                "Iceberg writes are experimental. "
-                "To allow its usage, enable the setting `allow_insert_into_iceberg`.");
-        }
-
 #if USE_AVRO
         if (iceberg_metadata_json_)
         {
@@ -6762,17 +6762,17 @@ void MergeTreeData::exportPartToTable(
         throw Exception(ErrorCodes::NOT_IMPLEMENTED, "Data lake export requires Avro support");
 #endif
     }
-
-    /// Positional CAST matching, like `INSERT INTO dest SELECT * FROM src`.
-    ExportPartitionUtils::verifyExportSchemaCastable(
-        source_metadata_ptr, destination_metadata_ptr, dest_storage->getStorageID(), query_context);
-
-    /// Iceberg partition compatibility is checked above; here we only need the
-    /// partition-key ASTs to match (partition-column types follow the lossy-cast gate).
-    if (!dest_storage->isDataLake())
+    else
     {
-        if (query_to_string(source_metadata_ptr->getPartitionKeyAST()) != query_to_string(destination_metadata_ptr->getPartitionKeyAST()))
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Tables have different partition key");
+        /// Plain (hive) object storage writes every row of the part to the one directory computed from
+        /// the destination PARTITION BY on the part's min row, so the source partition must map to a
+        /// single destination partition. Equivalent or finer source keys are accepted.
+        ExportPartitionUtils::verifyPlainPartitionCompatibility(
+            source_metadata_ptr,
+            destination_metadata_ptr,
+            {part},
+            part->info.getPartitionId(),
+            query_context);
     }
 
     if (part->getState() == MergeTreeDataPartState::Outdated && !allow_outdated_parts)

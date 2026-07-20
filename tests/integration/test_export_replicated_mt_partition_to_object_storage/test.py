@@ -6,6 +6,7 @@ import pytest
 
 from helpers.cluster import ClickHouseCluster
 from helpers.export_partition_helpers import (
+    first_partition_id,
     wait_for_exception_count,
     wait_for_export_status,
     wait_for_export_to_start,
@@ -1724,3 +1725,150 @@ def test_export_partition_all_failure_modes(cluster):
         f"ALTER TABLE {mt_table} EXPORT PARTITION ALL TO TABLE {s3_table}"
         f" SETTINGS export_merge_tree_partition_all_on_error = 'skip_conflicts'"
     )
+
+
+# ---- Partition-key compatibility gate (unified with the Iceberg gate) --------------------------
+#
+# Plain (hive) object storage writes every row of a part to the single directory computed from the
+# destination PARTITION BY, so each source partition must map to exactly one destination partition.
+# The gate accepts equivalent or finer source keys (e.g. a source that adds partition columns on top
+# of the destination's) and rejects source partitions that would span several destination partitions
+# or that do not cover the destination partition column. Hive destinations partition by bare columns
+# only, so these cases exercise the column-subset and single-value paths.
+
+
+def _run_subset_accept(node, source_key):
+    """Export a source partitioned by *source_key* (a superset of the destination key ``year``) into a
+    hive destination partitioned by ``year``, then verify the full dataset, the hive directory layout,
+    and a round-trip back into MergeTree."""
+    uid = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"subset_mt_{uid}"
+    s3_table = f"subset_s3_{uid}"
+    roundtrip = f"subset_roundtrip_{uid}"
+
+    node.query(
+        f"CREATE TABLE {mt_table} (id UInt64, year UInt16, country String)"
+        f" ENGINE = ReplicatedMergeTree('/clickhouse/tables/{mt_table}', 'replica1')"
+        f" PARTITION BY {source_key} ORDER BY tuple()"
+    )
+    node.query(
+        f"INSERT INTO {mt_table} VALUES (1, 2020, 'US'), (2, 2020, 'FR'), (3, 2021, 'US')"
+    )
+    node.query(
+        f"CREATE TABLE {s3_table} (id UInt64, year UInt16, country String)"
+        f" ENGINE = S3(s3_conn, filename='{s3_table}', format=Parquet, partition_strategy='hive')"
+        f" PARTITION BY year"
+    )
+
+    partition_ids = node.query(
+        f"SELECT DISTINCT partition_id FROM system.parts"
+        f" WHERE database = currentDatabase() AND table = '{mt_table}' AND active"
+    ).strip().split("\n")
+    assert len(partition_ids) == 3, f"expected 3 source partitions, got {partition_ids}"
+
+    node.query(f"ALTER TABLE {mt_table} EXPORT PARTITION ALL TO TABLE {s3_table}")
+    for pid in partition_ids:
+        wait_for_export_status(node, mt_table, s3_table, pid, "COMPLETED", timeout=90)
+
+    src = node.query(f"SELECT id, year, country FROM {mt_table} ORDER BY id")
+    dst = node.query(f"SELECT id, year, country FROM {s3_table} ORDER BY id")
+    assert dst == src, f"destination rows differ from source:\nsrc={src!r}\ndst={dst!r}"
+
+    # The destination partitions by year only: rows land in the year=<value> hive directory.
+    rows_2020 = node.query(
+        f"SELECT count() FROM s3(s3_conn, filename='{s3_table}/year=2020/*.parquet', format='Parquet')"
+    ).strip()
+    rows_2021 = node.query(
+        f"SELECT count() FROM s3(s3_conn, filename='{s3_table}/year=2021/*.parquet', format='Parquet')"
+    ).strip()
+    assert rows_2020 == "2", f"expected 2 rows under year=2020, got {rows_2020}"
+    assert rows_2021 == "1", f"expected 1 row under year=2021, got {rows_2021}"
+
+    node.query(
+        f"CREATE TABLE {roundtrip} (id UInt64, year UInt16, country String)"
+        f" ENGINE = ReplicatedMergeTree('/clickhouse/tables/{roundtrip}', 'replica1')"
+        f" PARTITION BY {source_key} ORDER BY tuple()"
+    )
+    node.query(f"INSERT INTO {roundtrip} SELECT * FROM {s3_table}")
+    rt = node.query(f"SELECT id, year, country FROM {roundtrip} ORDER BY id")
+    assert rt == src, f"round-trip rows differ from source:\nsrc={src!r}\nrt={rt!r}"
+
+
+def test_export_partition_multicolumn_subset_accepted(cluster):
+    """Source partitions by (year, country); destination by year only - a coarser key that is covered
+    by the source key, so every source partition has a single year and maps to exactly one destination
+    partition. Accepted (this was rejected as a partition-key mismatch before the plain gate was
+    unified with the Iceberg one)."""
+    node = cluster.instances["replica1"]
+    _run_subset_accept(node, "(year, country)")
+
+
+def test_export_partition_subset_reversed_order_accepted(cluster):
+    """The subset match is order-independent: a source keyed by (country, year) still covers a
+    destination keyed by year."""
+    node = cluster.instances["replica1"]
+    _run_subset_accept(node, "(country, year)")
+
+
+def test_export_partition_coarser_source_rejected(cluster):
+    """Source partitions monthly (toYYYYMM(dt)); destination by the raw date. A single source part
+    holding two different days would map to two destination partitions, so the gate rejects the
+    export synchronously with BAD_ARGUMENTS and schedules nothing."""
+    node = cluster.instances["replica1"]
+
+    uid = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"coarser_mt_{uid}"
+    s3_table = f"coarser_s3_{uid}"
+
+    node.query(
+        f"CREATE TABLE {mt_table} (id UInt64, dt Date)"
+        f" ENGINE = ReplicatedMergeTree('/clickhouse/tables/{mt_table}', 'replica1')"
+        f" PARTITION BY toYYYYMM(dt) ORDER BY tuple()"
+    )
+    node.query(f"INSERT INTO {mt_table} VALUES (1, '2024-03-05'), (2, '2024-03-20')")
+    node.query(
+        f"CREATE TABLE {s3_table} (id UInt64, dt Date)"
+        f" ENGINE = S3(s3_conn, filename='{s3_table}', format=Parquet, partition_strategy='hive')"
+        f" PARTITION BY dt"
+    )
+
+    pid = first_partition_id(node, mt_table)
+    error = node.query_and_get_error(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{pid}' TO TABLE {s3_table}"
+    )
+    assert "BAD_ARGUMENTS" in error, f"expected BAD_ARGUMENTS, got: {error!r}"
+
+    scheduled = node.query(
+        f"SELECT count() FROM system.replicated_partition_exports"
+        f" WHERE source_table = '{mt_table}' AND destination_table = '{s3_table}'"
+    ).strip()
+    assert scheduled == "0", f"expected nothing scheduled after a synchronous reject, got {scheduled}"
+
+
+def test_export_partition_dest_column_not_in_source_key_rejected(cluster):
+    """Destination partitions by a column that is not part of the source partition key; the gate
+    rejects the export synchronously with BAD_ARGUMENTS naming the uncovered column."""
+    node = cluster.instances["replica1"]
+
+    uid = str(uuid.uuid4()).replace("-", "_")
+    mt_table = f"nocover_mt_{uid}"
+    s3_table = f"nocover_s3_{uid}"
+
+    node.query(
+        f"CREATE TABLE {mt_table} (id UInt64, year UInt16, country String)"
+        f" ENGINE = ReplicatedMergeTree('/clickhouse/tables/{mt_table}', 'replica1')"
+        f" PARTITION BY year ORDER BY tuple()"
+    )
+    node.query(f"INSERT INTO {mt_table} VALUES (1, 2020, 'US'), (2, 2020, 'FR')")
+    node.query(
+        f"CREATE TABLE {s3_table} (id UInt64, year UInt16, country String)"
+        f" ENGINE = S3(s3_conn, filename='{s3_table}', format=Parquet, partition_strategy='hive')"
+        f" PARTITION BY country"
+    )
+
+    pid = first_partition_id(node, mt_table)
+    error = node.query_and_get_error(
+        f"ALTER TABLE {mt_table} EXPORT PARTITION ID '{pid}' TO TABLE {s3_table}"
+    )
+    assert "BAD_ARGUMENTS" in error, f"expected BAD_ARGUMENTS, got: {error!r}"
+    assert "country" in error, f"expected the error to name column 'country', got: {error!r}"
