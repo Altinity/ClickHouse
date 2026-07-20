@@ -422,3 +422,5 @@ passes 1034/1034 under ASan, 1034/1034 under TSan, and 1030/1030 under a plain (
 (the count differs only because 4 `#ifdef DEBUG_OR_SANITIZER_BUILD`-gated death tests exist solely in
 sanitizer builds). Any CAS gtest battery gate going forward can drop the peel-and-continue exclusion
 machinery entirely and just run the filter directly.
+
+- [ ] CLEANUP (from F4a review 2026-07-21): delete dead pre-rev.6 config keys `content_addressed_allow_shared_pool` and `content_addressed_gc_grace_sec` from the ~7 integration-test XMLs that still set them, then drop both from `ContentAddressedSettings`' `non_cas_keys` skip-set so typo detection covers that namespace again. They are read nowhere in the current factory.
