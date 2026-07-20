@@ -143,60 +143,9 @@ public:
     /// `cas/refs/<ns>/<shard>`, which has no kind directory at all), a `_log`/`_snap` id missing its
     /// `.zst` suffix (both are always-compressed text), a `_cleanup` id carrying any
     /// extension, trailing garbage after the id, or a non-canonical `RefTxnId` render (delegates to
-    /// `parseRefTxnId`).
-    std::optional<ParsedRefObjectKey> parseRefObjectKey(std::string_view key) const
-    {
-        const String base = casRefsPrefix();
-        if (!key.starts_with(base))
-            return std::nullopt;
-        std::string_view rest = key;
-        rest.remove_prefix(base.size());
-
-        const size_t id_sep = rest.rfind('/');
-        if (id_sep == std::string_view::npos)
-            return std::nullopt;
-        std::string_view id_part = rest.substr(id_sep + 1);
-        std::string_view before_id = rest.substr(0, id_sep);
-
-        const size_t kind_sep = before_id.rfind('/');
-        if (kind_sep == std::string_view::npos)
-            return std::nullopt;
-        const std::string_view kind_seg = before_id.substr(kind_sep + 1);
-        const std::string_view ns_part = before_id.substr(0, kind_sep);
-        if (ns_part.empty())
-            return std::nullopt;
-
-        RefObjectKind kind{};
-        if (kind_seg == "_cleanup")
-            kind = RefObjectKind::Cleanup;
-        else if (kind_seg == "_log")
-            kind = RefObjectKind::Log;
-        else if (kind_seg == "_snap")
-            kind = RefObjectKind::Snap;
-        else
-            return std::nullopt;
-
-        std::string_view render = id_part;
-        if (kind == RefObjectKind::Snap || kind == RefObjectKind::Log)
-        {
-            /// `_log` and `_snap` are always-compressed text stored under a `.zst` suffix. `_cleanup`
-            /// stays a bare zero-byte marker and is intentionally not part of that compression family.
-            constexpr std::string_view kZstSuffix = ".zst";
-            if (!render.ends_with(kZstSuffix))
-                return std::nullopt;
-            render.remove_suffix(kZstSuffix.size());
-        }
-        else if (render.find('.') != std::string_view::npos)
-        {
-            return std::nullopt;   /// `_cleanup` ids never carry an extension
-        }
-
-        const auto txn_id = parseRefTxnId(render);
-        if (!txn_id)
-            return std::nullopt;
-
-        return ParsedRefObjectKey{RootNamespace{String(ns_part)}, kind, *txn_id};
-    }
+    /// `parseRefTxnId`). Defined out-of-line in `CasLayout.cpp`, where the key construction and
+    /// parsing helpers remain together.
+    std::optional<ParsedRefObjectKey> parseRefObjectKey(std::string_view key) const;
 
     /// Prefix that covers all part manifests of a namespace: `<prefix>/cas/manifests/<ns>/`.
     String manifestNamespacePrefix(const RootNamespace & ns) const
@@ -255,54 +204,9 @@ public:
     /// registered suffix or of the wrong width, and an out-of-range or non-canonical ordinal.
     /// Foreign/malformed keys return `std::nullopt`, never throw -- LIST sweep / fsck classify by key
     /// shape, not by validity. All manifest-path parsing (sweep, fsck) routes through this one function.
-    std::optional<ManifestId> parseManifestKey(std::string_view key) const
-    {
-        const String base = casManifestsPrefix();
-        if (!key.starts_with(base))
-            return std::nullopt;
-        std::string_view rest = key;
-        rest.remove_prefix(base.size());
-
-        const size_t file_sep = rest.rfind('/');
-        if (file_sep == std::string_view::npos)
-            return std::nullopt;
-        const std::string_view file = rest.substr(file_sep + 1);
-        const std::string_view before_file = rest.substr(0, file_sep);
-
-        const size_t build_sep = before_file.rfind('/');
-        if (build_sep == std::string_view::npos)
-            return std::nullopt;
-        const std::string_view build_seg = before_file.substr(build_sep + 1);
-        const std::string_view ns_part = before_file.substr(0, build_sep);
-        if (ns_part.empty())
-            return std::nullopt;
-
-        const auto build = parseRefTxnId(build_seg);
-        if (!build)
-            return std::nullopt;
-
-        const std::string_view kManifestSuffix = storedSuffix(FormatId::PartManifest);
-        constexpr size_t kOrdinalDigits = 6;
-        if (file.size() != kOrdinalDigits + kManifestSuffix.size() || !file.ends_with(kManifestSuffix))
-            return std::nullopt;
-        const std::string_view ordinal_str = file.substr(0, kOrdinalDigits);
-        uint32_t ordinal = 0;
-        for (char c : ordinal_str)
-        {
-            if (c < '0' || c > '9')
-                return std::nullopt;
-            ordinal = ordinal * 10 + static_cast<uint32_t>(c - '0');
-        }
-        if (ordinal == 0 || ordinal > kMaxManifestOrdinal)
-            return std::nullopt;
-
-        ManifestId parsed;
-        parsed.root_namespace = RootNamespace{String(ns_part)};
-        parsed.ref.writer_epoch = build->writer_epoch;
-        parsed.ref.build_sequence = build->ref_sequence;
-        parsed.ref.manifest_ordinal = ordinal;
-        return parsed;
-    }
+    /// Defined out-of-line in `CasLayout.cpp`, where the key construction and parsing helpers remain
+    /// together.
+    std::optional<ManifestId> parseManifestKey(std::string_view key) const;
 
     /// A plain mountpoint object is a loose, non-content-addressed file mirrored at its
     /// ClickHouse path under `roots/`, with NO namespace and NO `_files` wrapper. `key` is the
@@ -459,32 +363,9 @@ private:
     String prefix;
 
     /// A namespace must be non-empty, with no leading/trailing '/', no empty segment ("//"),
-    /// and no segment equal to the reserved "_files".
-    void checkNamespace(const RootNamespace & ns) const
-    {
-        const String & s = ns.string();
-        if (s.empty())
-            throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS, "CasLayout: namespace must be non-empty");
-
-        size_t start = 0;
-        while (true)
-        {
-            size_t end = s.find('/', start);
-            const String segment = s.substr(start, end == String::npos ? String::npos : end - start);
-            if (segment.empty())
-                throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
-                    "CasLayout: namespace '{}' has an empty segment (leading/trailing or doubled '/')", s);
-            if (segment == "_files")
-                throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
-                    "CasLayout: namespace '{}' uses the reserved segment '_files'", s);
-            if (segment == "_manifests")
-                throw DB::Exception(DB::ErrorCodes::BAD_ARGUMENTS,
-                    "CasLayout: namespace '{}' uses the reserved segment '_manifests'", s);
-            if (end == String::npos)
-                break;
-            start = end + 1;
-        }
-    }
+    /// and no segment equal to the reserved "_files". Defined out-of-line in `CasLayout.cpp`, where
+    /// the key construction and parsing helpers remain together.
+    void checkNamespace(const RootNamespace & ns) const;
 
     /// Build <prefix>/<namespace>/<first2chars>/<id>.
     /// Throws BAD_ARGUMENTS if id is shorter than 2 characters.
