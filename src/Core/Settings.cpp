@@ -7555,8 +7555,14 @@ Overwrite file if it already exists when exporting a merge tree part
     DECLARE(Bool, export_merge_tree_partition_force_export, false, R"(
 Ignore existing partition export and overwrite the zookeeper entry
 )", 0) \
-    DECLARE(UInt64, export_merge_tree_partition_max_retries, 3, R"(
-Maximum number of retries for exporting a merge tree part in an export partition task
+    DECLARE(UInt64, export_merge_tree_partition_retry_initial_backoff_seconds, 5, R"(
+Initial delay (in seconds) before retrying a failed part export in an export partition task.
+The delay grows exponentially with the per-replica retry count (capped doubling): `delay = min(initial << (attempts - 1), max)`, where `max` is `export_merge_tree_partition_retry_max_backoff_seconds`.
+The back-off is per-replica in-memory state: it only spaces this replica's retries out in time and never prevents another replica from attempting the same part. Retryable failures are retried until the task succeeds or `export_merge_tree_partition_task_timeout_seconds` elapses.
+To survive a long transient outage (e.g. object storage downtime), raise `export_merge_tree_partition_task_timeout_seconds`.
+)", 0) \
+    DECLARE(UInt64, export_merge_tree_partition_retry_max_backoff_seconds, 300, R"(
+Maximum delay (in seconds) between retries of a failed part export in an export partition task. Caps the exponential growth controlled by `export_merge_tree_partition_retry_initial_backoff_seconds`.
 )", 0) \
     DECLARE(UInt64, export_merge_tree_partition_task_timeout_seconds, 86400, R"(
 Maximum wall-clock duration (in seconds) an export partition task is allowed to remain in the PENDING state before it is auto-killed by the background cleanup loop.
@@ -7947,6 +7953,7 @@ Maximum number of WebAssembly UDF instances that can run in parallel per functio
 #define OBSOLETE_SETTINGS(M, ALIAS) \
     /** Obsolete settings which are kept around for compatibility reasons. They have no effect anymore. */ \
     MAKE_OBSOLETE(M, UInt64, export_merge_tree_partition_manifest_ttl, 86400) \
+    MAKE_OBSOLETE(M, UInt64, export_merge_tree_partition_max_retries, 3) \
     MAKE_OBSOLETE(M, Bool, query_condition_cache_store_conditions_as_plaintext, false) \
     MAKE_OBSOLETE(M, Bool, update_insert_deduplication_token_in_dependent_materialized_views, 0) \
     MAKE_OBSOLETE(M, UInt64, max_memory_usage_for_all_queries, 0) \

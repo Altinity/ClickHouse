@@ -45,6 +45,9 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"export_merge_tree_partition_task_timeout_seconds", "3600", "86400", "Increase default value to make it more realistic"},
             {"export_merge_tree_part_allow_lossy_cast", false, false, "New setting to gate lossy casts in EXPORT PART/PARTITION behind explicit acknowledgment"},
             {"object_storage_cluster_fallback_to_local_if_empty", false, false, "New setting"},
+            {"export_merge_tree_partition_retry_initial_backoff_seconds", 5, 5, "New setting for exponential back-off between failed part export retries in an export partition task"},
+            {"export_merge_tree_partition_retry_max_backoff_seconds", 300, 300, "New setting capping the exponential back-off between failed part export retries in an export partition task"},
+            {"export_merge_tree_partition_max_retries", 3, 3, "Obsolete and ignored: export partition tasks now retry retryable failures until the task timeout and fail immediately on non-retryable errors, instead of using a fixed retry budget"},
         });
         addSettingsChanges(settings_changes_history, "26.3",
         {
@@ -330,7 +333,6 @@ const VersionToSettingsChangesMap & getSettingsChangesHistory()
             {"allow_experimental_export_merge_tree_part", false, true, "Turned ON by default for Antalya."},
             {"export_merge_tree_part_overwrite_file_if_exists", false, false, "New setting."},
             {"export_merge_tree_partition_force_export", false, false, "New setting."},
-            {"export_merge_tree_partition_max_retries", 3, 3, "New setting."},
             {"export_merge_tree_partition_manifest_ttl", 180, 180, "New setting."},
             {"export_merge_tree_part_file_already_exists_policy", "skip", "skip", "New setting."},
             {"hybrid_table_auto_cast_columns", true, true, "New setting to automatically cast Hybrid table columns when segments disagree on types. Default enabled."},
