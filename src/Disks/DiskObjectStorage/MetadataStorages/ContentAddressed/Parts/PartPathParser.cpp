@@ -216,7 +216,7 @@ static std::optional<PartDirAnchor> findPartDirComponent(const std::vector<std::
     // the ambiguity requires caller-supplied knowledge of existing databases and tables, which this
     // pure string parser intentionally does not have. The reserved interpretation is retained so
     // ordinary detached-part paths continue to map into the real table namespace. The test
-    // `CaPartPathParser.DetachedNamedTableIsKnownAmbiguityFoldedAsReservedDir` pins this behavior so
+    // `CasPartPathParser.DetachedNamedTableIsKnownAmbiguityFoldedAsReservedDir` pins this behavior so
     // any future change here is a conscious one.
 
     // The table identifier must be at least one component (a real table dir, never the bare disk

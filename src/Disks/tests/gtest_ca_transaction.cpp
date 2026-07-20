@@ -60,7 +60,7 @@ const DB::Cas::ManifestEntry * findByName(const std::vector<DB::Cas::ManifestEnt
 
 /// [TXN-ONE-PIPELINE] A freshly-written part is published by commit(), NOT at the tmp->final rename.
 /// moveDirectory only re-keys the transaction overlay; the durable ref appears at commit().
-TEST(CaTransactionLockScope, PublishHappensAtCommitNotRename)
+TEST(CasTransactionLockScope, PublishHappensAtCommitNotRename)
 {
     auto storage = openTxStorage();
     auto tx = storage->createTransaction();
@@ -82,7 +82,7 @@ TEST(CaTransactionLockScope, PublishHappensAtCommitNotRename)
     EXPECT_EQ(storage->getFileSize("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin"), 9u);
 }
 
-TEST(CaTransactionOps, TruncateFileIsNotSupported)
+TEST(CasTransactionOps, TruncateFileIsNotSupported)
 {
     auto storage = openTxStorage();
     auto tx = storage->createTransaction();
@@ -94,7 +94,7 @@ TEST(CaTransactionOps, TruncateFileIsNotSupported)
 
 /// [TXN-ONE-PIPELINE] An abandoned transaction (destructed without commit) never published, so the
 /// final ref is simply absent — no early-published ref to drop.
-TEST(CaTransactionLockScope, AbandonedPartLeavesNoRef)
+TEST(CasTransactionLockScope, AbandonedPartLeavesNoRef)
 {
     auto storage = openTxStorage();
     {
@@ -108,7 +108,7 @@ TEST(CaTransactionLockScope, AbandonedPartLeavesNoRef)
 }
 
 /// [TXN-ONE-PIPELINE] commit() publishes the re-keyed part.
-TEST(CaTransactionLockScope, RefPublishedByCommit)
+TEST(CasTransactionLockScope, RefPublishedByCommit)
 {
     auto storage = openTxStorage();
     {
@@ -121,7 +121,7 @@ TEST(CaTransactionLockScope, RefPublishedByCommit)
 }
 
 /// A committed-ref rename (no staged source) must NOT spuriously publish — it goes via republishRef.
-TEST(CaTransactionLockScope, CommittedRefMoveDoesNotSpuriouslyPublish)
+TEST(CasTransactionLockScope, CommittedRefMoveDoesNotSpuriouslyPublish)
 {
     auto storage = openTxStorage();
     {
@@ -148,7 +148,7 @@ TEST(CaTransactionLockScope, CommittedRefMoveDoesNotSpuriouslyPublish)
 /// the tmp->final rename, which is exactly what `moveDirectory`'s `dropRefIfPresent(src->refKey())`
 /// drops. (The plan's destination-path scenario would not reproduce this: `publishStaging`'s
 /// repoint-merge would carry the scratch file forward.)
-TEST(CaTransactionLockScope, StagedFinalizeDropsForeignScratchRef)
+TEST(CasTransactionLockScope, StagedFinalizeDropsForeignScratchRef)
 {
     auto storage = openTxStorage();
 
@@ -185,8 +185,8 @@ TEST(CaTransactionLockScope, StagedFinalizeDropsForeignScratchRef)
 /// overlay is likewise re-keyed and answers under the final path. The staged file lives under an
 /// inner projection dir because the directory overlay tracks INNER dirs only — the part dir itself
 /// answers `hasInFlightDirectory`=false by contract (removeIfNeeded clean early-return; see
-/// `CaWiringInFlight`), so asserting the bare part dir would contradict that invariant.
-TEST(CaTransactionLockScope, ReadYourWritesAfterReKey)
+/// `CasWiringInFlight`), so asserting the bare part dir would contradict that invariant.
+TEST(CasTransactionLockScope, ReadYourWritesAfterReKey)
 {
     auto storage = openTxStorage();
     auto tx = storage->createTransaction();
@@ -207,7 +207,7 @@ TEST(CaTransactionLockScope, ReadYourWritesAfterReKey)
 
 /// [TXN-ONE-PIPELINE] Program order in the overlay: create -> delete -> create leaves the file PRESENT
 /// (no delayed delete fires after the later create); delete of a staged file makes it absent to reads.
-TEST(CaTransactionLockScope, OverlayProgramOrder)
+TEST(CasTransactionLockScope, OverlayProgramOrder)
 {
     auto storage = openTxStorage();
     auto tx = storage->createTransaction();
@@ -231,7 +231,7 @@ TEST(CaTransactionLockScope, OverlayProgramOrder)
 /// This is the exact sequence MATERIALIZE PROJECTION drives on a part that already has the projection.
 /// If the in-flight read returns empty, the mutated part's in-memory projection sub-part loads with 0
 /// marks (the 02941 "Empty marks file: 0, must be: 144" corruption on a same-session projection SELECT).
-TEST(CaTransactionLockScope, InFlightReadCarriedForwardProjectionSidecar)
+TEST(CasTransactionLockScope, InFlightReadCarriedForwardProjectionSidecar)
 {
     auto storage = openTxStorage();
 
@@ -280,7 +280,7 @@ TEST(CaTransactionLockScope, InFlightReadCarriedForwardProjectionSidecar)
 /// a repoint of an already-existing ref is NEVER dropped as compensation. `publishStaging` returns
 /// false for the repoint path (a committed ref exists), so the repoint is never recorded in
 /// `created_refs` and the pre-existing part survives with its content carried forward.
-TEST(CaTransactionLockScope, CommitRollbackSparesPreexistingRef)
+TEST(CasTransactionLockScope, CommitRollbackSparesPreexistingRef)
 {
     auto storage = openTxStorage();
 
@@ -308,7 +308,7 @@ TEST(CaTransactionLockScope, CommitRollbackSparesPreexistingRef)
 /// Plan 2d: a small eager metadata file (checksums.txt) is staged INLINE — it rides the single tree
 /// object (one-GET part open) — while per-column data (data.bin) stays a standalone Blob (preserving
 /// column-read selectivity). The inlined file is still readable through the normal read path.
-TEST(CaTransactionInlining, EagerFileInlinedDataBinBlobbed)
+TEST(CasTransactionInlining, EagerFileInlinedDataBinBlobbed)
 {
     auto storage = openTxStorage();
     auto tx = storage->createTransaction();
@@ -339,7 +339,7 @@ TEST(CaTransactionInlining, EagerFileInlinedDataBinBlobbed)
 /// all-tree-part-files Task 4 (spec 2026-07-14-cas-all-tree-part-files-design.md §4): a standalone
 /// write of ONE file onto an ALREADY-COMMITTED part must carry every other file of that part forward
 /// (a repoint, Task 3), never replace the manifest with just the touched file.
-TEST(CaTransactionRepoint, StandaloneWriteOnCommittedPartRepoints)
+TEST(CasTransactionRepoint, StandaloneWriteOnCommittedPartRepoints)
 {
     auto storage = openTxStorage();
 
@@ -381,7 +381,7 @@ TEST(CaTransactionRepoint, StandaloneWriteOnCommittedPartRepoints)
 /// `publishStaging`'s Task 4/8 merge already handles `st.entries` and `st.content_removed` together
 /// (both conditions can be true on the same staging); this pins that the combined shape actually works
 /// end to end through the real transaction, not just through each half in isolation.
-TEST(CaTransactionRepoint, CombinedWriteAndUnlinkSameTxnRepointsOnce)
+TEST(CasTransactionRepoint, CombinedWriteAndUnlinkSameTxnRepointsOnce)
 {
     auto storage = openTxStorage();
 
@@ -425,7 +425,7 @@ TEST(CaTransactionRepoint, CombinedWriteAndUnlinkSameTxnRepointsOnce)
 /// all-tree-part-files Task 6 (spec 2026-07-14-cas-all-tree-part-files-design.md §4): the mutable-
 /// per-part-file branch is deleted from `writeFile` -- uuid.txt/metadata_version.txt/txn_version.txt
 /// now flow down the ordinary content path, landing in the manifest like any other file.
-TEST(CaTransactionAllTree, BuildTimeSidecarsLandInManifest)
+TEST(CasTransactionAllTree, BuildTimeSidecarsLandInManifest)
 {
     auto storage = openTxStorage();
     auto tx = storage->createTransaction();
@@ -461,7 +461,7 @@ TEST(CaTransactionAllTree, BuildTimeSidecarsLandInManifest)
 
 /// A standalone one-shot write of txn_version.txt onto an ALREADY-COMMITTED part (the MVCC creation-
 /// CSN fill-in / removal-TID rewrite shape) must repoint (Task 4), never orphan the rest of the part.
-TEST(CaTransactionAllTree, CommittedTxnVersionStoreRepoints)
+TEST(CasTransactionAllTree, CommittedTxnVersionStoreRepoints)
 {
     auto storage = openTxStorage();
 
@@ -501,7 +501,7 @@ TEST(CaTransactionAllTree, CommittedTxnVersionStoreRepoints)
 /// same transaction — the ATTACH `removeVersionMetadata` shape) must actually delete the file via a
 /// repoint-remove, closing the pre-Task-8 fail-open (unlinkFile of a committed content file used to be
 /// an unconditional no-op).
-TEST(CaTransactionRemove, SurgicalUnlinkRepoints)
+TEST(CasTransactionRemove, SurgicalUnlinkRepoints)
 {
     auto storage = openTxStorage();
 
@@ -542,7 +542,7 @@ TEST(CaTransactionRemove, SurgicalUnlinkRepoints)
 /// fast-removal shape that unlinks every part file one by one and THEN calls removeDirectory — must
 /// stay exactly one ref-drop and pay ZERO repoints. The per-file removal marks staged by the unlink
 /// storm are superseded by the ref-drop, not individually repointed.
-TEST(CaTransactionRemove, UnlinkStormThenDirDropIsOneRefDrop)
+TEST(CasTransactionRemove, UnlinkStormThenDirDropIsOneRefDrop)
 {
     auto storage = openTxStorage();
 
@@ -582,7 +582,7 @@ TEST(CaTransactionRemove, UnlinkStormThenDirDropIsOneRefDrop)
 
 /// A create-then-remove of a new part in one transaction must discard both the manifest entries
 /// and the in-flight build, so commit() leaves no ref and no live precommit behind.
-TEST(CaTransactionRemove, CreateThenDirDropDoesNotPublish)
+TEST(CasTransactionRemove, CreateThenDirDropDoesNotPublish)
 {
     auto storage = openTxStorage();
     auto tx = storage->createTransaction();

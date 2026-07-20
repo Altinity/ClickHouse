@@ -9,7 +9,7 @@
 
 using namespace DB::Cas;
 
-TEST(CaPartPathParser, ParsePartFilePathAtomic)
+TEST(CasPartPathParser, ParsePartFilePathAtomic)
 {
     auto file = parsePartFilePath("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/columns.txt");
     ASSERT_TRUE(file.has_value());
@@ -35,7 +35,7 @@ TEST(CaPartPathParser, ParsePartFilePathAtomic)
     EXPECT_EQ(atomic->file, "data.bin");
 }
 
-TEST(CaPartPathParser, ThreeCharDatabaseSharingTablePrefixDoesNotFalseAnchorAsAtomic)
+TEST(CasPartPathParser, ThreeCharDatabaseSharingTablePrefixDoesNotFalseAnchorAsAtomic)
 {
     // T12: a non-Atomic 3-char database directory whose table directory happens to start with the
     // SAME 3 characters (db "abc", table "abcxyz") used to satisfy the old loose Atomic-anchor shape
@@ -52,7 +52,7 @@ TEST(CaPartPathParser, ThreeCharDatabaseSharingTablePrefixDoesNotFalseAnchorAsAt
     EXPECT_EQ(d->file, "x.bin");
 }
 
-TEST(CaPartPathParser, RealHexPrefixUuidPairStillAnchorsAsAtomic)
+TEST(CasPartPathParser, RealHexPrefixUuidPairStillAnchorsAsAtomic)
 {
     // Positive control for the tightened anchor: a REAL Atomic on-disk shape --
     // store/<uuid[:3]>/<uuid> with the UUID correctly 36-char dashed and genuinely sharing its first
@@ -64,7 +64,7 @@ TEST(CaPartPathParser, RealHexPrefixUuidPairStillAnchorsAsAtomic)
     EXPECT_EQ(a->file, "x.bin");
 }
 
-TEST(CaPartPathParser, ParsePartFilePathProjectionSubPath)
+TEST(CasPartPathParser, ParsePartFilePathProjectionSubPath)
 {
     // A projection file keeps its FULL in-part relative path as the file (the tree entry name).
     auto proj = parsePartFilePath("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/p.proj/data.bin");
@@ -73,7 +73,7 @@ TEST(CaPartPathParser, ParsePartFilePathProjectionSubPath)
     EXPECT_EQ(proj->file, "p.proj/data.bin");
 }
 
-TEST(CaPartPathParser, ParsePartFilePathNonAtomic)
+TEST(CasPartPathParser, ParsePartFilePathNonAtomic)
 {
     // Non-Atomic (Ordinary/Memory/Lazy) layout: data/<db>/<table>/<part>/<file> — no uuid anchor;
     // the part dir is recognized by its block-range suffix (B40).
@@ -108,7 +108,7 @@ TEST(CaPartPathParser, ParsePartFilePathNonAtomic)
     EXPECT_FALSE(parseTableUuid("clickhouse_access_check_xyz").has_value());
 }
 
-TEST(CaPartPathParser, ParseTableUuid)
+TEST(CasPartPathParser, ParseTableUuid)
 {
     EXPECT_EQ(parseTableUuid("a11/a11a11a1-1111-4111-8111-111111111111/"), std::optional<std::string>("a11a11a1-1111-4111-8111-111111111111"));
     EXPECT_EQ(parseTableUuid("a11/a11a11a1-1111-4111-8111-111111111111"), std::optional<std::string>("a11a11a1-1111-4111-8111-111111111111"));
@@ -119,7 +119,7 @@ TEST(CaPartPathParser, ParseTableUuid)
     EXPECT_FALSE(endsWithTableUuidPair("shadow/bk1/store"));
 }
 
-TEST(CaPartPathParser, ParseTableFilePathNested)
+TEST(CasPartPathParser, ParseTableFilePathNested)
 {
     // The reserved deduplication_logs/ subdir is a table-level namespace, never a part dir.
     EXPECT_FALSE(isPartFilePath("a11/a11a11a1-1111-4111-8111-111111111111/deduplication_logs/deduplication_log_1.txt"));
@@ -138,7 +138,7 @@ TEST(CaPartPathParser, ParseTableFilePathNested)
     EXPECT_TRUE(isPartFilePath("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin"));
 }
 
-TEST(CaPartPathParser, ShadowFreezePaths)
+TEST(CasPartPathParser, ShadowFreezePaths)
 {
     EXPECT_TRUE(isShadowPath("shadow/bk1/store/a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin"));
     EXPECT_TRUE(isShadowPath("/shadow/bk1"));
@@ -154,7 +154,7 @@ TEST(CaPartPathParser, ShadowFreezePaths)
     EXPECT_EQ(s->shadow_table_dir, "shadow/bk1/store/a11/a11a11a1-1111-4111-8111-111111111111");
 }
 
-TEST(CaPartPathParser, DetachedPathsReportTheSharedDetachedComponent)
+TEST(CasPartPathParser, DetachedPathsReportTheSharedDetachedComponent)
 {
     // The PoC contract (B36): "detached" parses as the part_name; the real detached part dir is
     // the first component of `file`. The transaction/read routing re-splits on this shape.
@@ -165,7 +165,7 @@ TEST(CaPartPathParser, DetachedPathsReportTheSharedDetachedComponent)
     EXPECT_EQ(d->file, "attaching_all_0_0_0/metadata_version.txt");
 }
 
-TEST(CaPartPathParser, MovingPathsReportTheSharedMovingComponent)
+TEST(CasPartPathParser, MovingPathsReportTheSharedMovingComponent)
 {
     // Atomic layout: "moving" lands on part_idx for free (it is the component right after the
     // table <uuid>, same mechanism as "detached" -- no parser change needed here, only route()).
@@ -176,7 +176,7 @@ TEST(CaPartPathParser, MovingPathsReportTheSharedMovingComponent)
     EXPECT_EQ(d->file, "all_1_1_0/data.bin");
 }
 
-TEST(CaPartPathParser, MovingPathsNonAtomicFoldIntoTheTableNamespace)
+TEST(CasPartPathParser, MovingPathsNonAtomicFoldIntoTheTableNamespace)
 {
     // Mirrors DetachedPathsNonAtomicFoldIntoTheTableNamespace (U#6): without an explicit anchor
     // the right-to-left part-dir scan would anchor on the INNER real part dir and fold "moving"
@@ -197,7 +197,7 @@ TEST(CaPartPathParser, MovingPathsNonAtomicFoldIntoTheTableNamespace)
     EXPECT_TRUE(c->file.empty());
 }
 
-TEST(CaPartPathParser, DetachedPathsNonAtomicFoldIntoTheTableNamespace)
+TEST(CasPartPathParser, DetachedPathsNonAtomicFoldIntoTheTableNamespace)
 {
     // U#6: the Ordinary/non-Atomic detached form data/<db>/<table>/detached/<part>/<file> must fold
     // into the table's OWN namespace with part_name == "detached" (mirroring the Atomic form), so
@@ -219,7 +219,7 @@ TEST(CaPartPathParser, DetachedPathsNonAtomicFoldIntoTheTableNamespace)
     EXPECT_TRUE(c->file.empty());
 }
 
-TEST(CaPartPathParser, DetachedNamedTableIsKnownAmbiguityFoldedAsReservedDir)
+TEST(CasPartPathParser, DetachedNamedTableIsKnownAmbiguityFoldedAsReservedDir)
 {
     // ACCEPTED LIMITATION (see the anchor-site comment in findPartDirComponent): a non-Atomic
     // database or TABLE literally named "detached" is structurally indistinguishable, from the path
@@ -237,7 +237,7 @@ TEST(CaPartPathParser, DetachedNamedTableIsKnownAmbiguityFoldedAsReservedDir)
     EXPECT_FALSE(parseTableUuid("data/db/detached").has_value());
 }
 
-TEST(CaPartPathParser, RawPathSplitMemoizedAcrossClassifiers)
+TEST(CasPartPathParser, RawPathSplitMemoizedAcrossClassifiers)
 {
     // The CA read path runs isPartFilePath then parsePartFilePath on the SAME raw path several times
     // per logical file-open (existsFile -> getFileSize -> getStorageObjects). The split is a pure
@@ -263,7 +263,7 @@ TEST(CaPartPathParser, RawPathSplitMemoizedAcrossClassifiers)
     EXPECT_EQ(parsed->file, "columns.txt");
 }
 
-TEST(CaPartPathParser, SplitCacheEvictionStaysCorrect)
+TEST(CasPartPathParser, SplitCacheEvictionStaysCorrect)
 {
     // The split cache is a small fixed-capacity FIFO ring, NOT an LRU/MRU: a hit never promotes its
     // slot, so a path seen recently can still be evicted by unrelated churn through the same thread.
@@ -405,7 +405,7 @@ void publishWiredPart(
 /// `supportsAtomicFileWrites` (all-tree task 5): the CA metadata storage publishes a file write in
 /// one shot, so `VersionMetadataOnDisk::storeInfoToDataPartStorage` can skip the tmp+replace dance.
 /// A plain (non-content-addressed) metadata storage keeps the base-class default of `false`.
-TEST(CaWiringCapability, SupportsAtomicFileWrites)
+TEST(CasWiringCapability, SupportsAtomicFileWrites)
 {
     auto ca_storage = openWiringStorage();
     EXPECT_TRUE(ca_storage->supportsAtomicFileWrites());
@@ -415,7 +415,7 @@ TEST(CaWiringCapability, SupportsAtomicFileWrites)
     EXPECT_FALSE(plain_storage->supportsAtomicFileWrites());
 }
 
-TEST(CaWiringRead, ResolvesPublishedPart)
+TEST(CasWiringRead, ResolvesPublishedPart)
 {
     auto storage = openWiringStorage();
     publishWiredPart(*storage, storage->liveNamespace("a11a11a1-1111-4111-8111-111111111111"), "all_1_1_0");
@@ -462,7 +462,7 @@ TEST(CaWiringRead, ResolvesPublishedPart)
     EXPECT_EQ(storage->getLastModified("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin").epochTime(), 1700000000);
 }
 
-TEST(CaWiringRead, BlobViewPlanRidesTheStandardPipeline)
+TEST(CasWiringRead, BlobViewPlanRidesTheStandardPipeline)
 {
     /// The committed read path (B116): an in-manifest file is served from memory via
     /// prepareInManifestRead; a blob-backed file translates to its physical blob object +
@@ -548,7 +548,7 @@ TEST(CaWiringRead, BlobViewPlanRidesTheStandardPipeline)
     }
 }
 
-TEST(CaWiringRead, ProjectionDirectory)
+TEST(CasWiringRead, ProjectionDirectory)
 {
     auto storage = openWiringStorage();
     publishWiredPart(*storage, storage->liveNamespace("a11a11a1-1111-4111-8111-111111111111"), "all_1_1_0");
@@ -561,7 +561,7 @@ TEST(CaWiringRead, ProjectionDirectory)
     EXPECT_EQ(storage->getFileSize("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/p.proj/data.bin"), 9u);
 }
 
-TEST(CaWiringRead, DetachedFoldedIntoTableNamespace)
+TEST(CasWiringRead, DetachedFoldedIntoTableNamespace)
 {
     auto storage = openWiringStorage();
     /// B181: a detached part is a `detached/`-prefixed ref INSIDE the table's own archive namespace,
@@ -593,7 +593,7 @@ TEST(CaWiringRead, DetachedFoldedIntoTableNamespace)
     EXPECT_TRUE(storage->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/detached/broken_all_1_1_0/data.bin"));
 }
 
-TEST(CaWiringRoute, DetachedFoldsIntoTableNamespaceWithPrefixedRef)
+TEST(CasWiringRoute, DetachedFoldsIntoTableNamespaceWithPrefixedRef)
 {
     /// B181: a detached part file routes to the table's OWN archive namespace under a
     /// `detached/`-prefixed ref — NOT a separate sibling namespace.
@@ -616,7 +616,7 @@ TEST(CaWiringRoute, DetachedFoldsIntoTableNamespaceWithPrefixedRef)
     EXPECT_TRUE(rc->file.empty());
 }
 
-TEST(CaWiringRoute, MovingFoldsOntoAPrefixedStagingRef)
+TEST(CasWiringRoute, MovingFoldsOntoAPrefixedStagingRef)
 {
     /// L1 (MOVE-to-CA fix): the mover clones a part under TABLE/moving/<part>/ before the
     /// atomic rename into place. Mirroring `detached`, a moved part resolves onto a
@@ -647,7 +647,7 @@ TEST(CaWiringRoute, MovingFoldsOntoAPrefixedStagingRef)
     EXPECT_TRUE(rc->file.empty());
 }
 
-TEST(CaWiringRead, ShadowFreezeTree)
+TEST(CasWiringRead, ShadowFreezeTree)
 {
     auto storage = openWiringStorage();
     publishWiredPart(*storage, DB::ContentAddressedMetadataStorage::shadowNamespace("shadow/bk1/store/a11/a11a11a1-1111-4111-8111-111111111111"), "all_1_1_0");
@@ -671,7 +671,7 @@ TEST(CaWiringRead, ShadowFreezeTree)
     EXPECT_EQ(storage->getFileSize("shadow/bk1/store/a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin"), 9u);
 }
 
-TEST(CaWiringRead, VerbatimNamespaceFiles)
+TEST(CasWiringRead, VerbatimNamespaceFiles)
 {
     auto storage = openWiringStorage();
     EXPECT_TRUE(storage->liveNamespace("a11a11a1-1111-4111-8111-111111111111").string().starts_with("test/"))
@@ -712,7 +712,7 @@ TEST(CaWiringRead, VerbatimNamespaceFiles)
 /// C4: the fixed dispatch order is the invariant. Pins the two ambiguous early guards that make the
 /// order load-bearing: store/<u3> (AtomicShard, ambiguous with the non-Atomic table fallback) and a
 /// shadow table dir (which also satisfies parseTableUuid). existsDirectory/listDirectory must agree.
-TEST(CaWiringRoute, DirShapeDispatchOrderIsStable)
+TEST(CasWiringRoute, DirShapeDispatchOrderIsStable)
 {
     auto storage = openWiringStorage();
     publishWiredPart(*storage, storage->liveNamespace("a11a11a1-1111-4111-8111-111111111111"), "all_1_1_0");
@@ -746,7 +746,7 @@ void writeThroughTransaction(DB::IMetadataTransaction & tx, const String & path,
 
 }
 
-TEST(CaWiringWrite, ContentRoundTripThroughTransaction)
+TEST(CasWiringWrite, ContentRoundTripThroughTransaction)
 {
     auto storage = openWiringStorage();
 
@@ -769,7 +769,7 @@ TEST(CaWiringWrite, ContentRoundTripThroughTransaction)
     EXPECT_GT(storage->getLastModified("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0").epochTime(), 1700000000);
 }
 
-TEST(CaWiringWrite, InlineOnlyPartPublishesWithoutBuildCrash)
+TEST(CasWiringWrite, InlineOnlyPartPublishesWithoutBuildCrash)
 {
     /// Regression (CRASH-CA-S3 "staged entries without a PartWriteTxn"): a part whose files are ALL inline
     /// — no `partFileMustStayBlob` file (`.bin`/`.mrk*`/`primary.idx`), e.g. an EMPTY merge output that
@@ -793,7 +793,7 @@ TEST(CaWiringWrite, InlineOnlyPartPublishesWithoutBuildCrash)
     EXPECT_EQ(names, (std::vector<std::string>{"checksums.txt", "count.txt"}));
 }
 
-TEST(CaWiringWrite, IdenticalContentDedupsToOneBlob)
+TEST(CasWiringWrite, IdenticalContentDedupsToOneBlob)
 {
     auto storage = openWiringStorage();
 
@@ -812,7 +812,7 @@ TEST(CaWiringWrite, IdenticalContentDedupsToOneBlob)
     EXPECT_EQ(a[0].remote_path, b[0].remote_path);
 }
 
-TEST(CaWiringWrite, UncommittedTransactionPublishesNothing)
+TEST(CasWiringWrite, UncommittedTransactionPublishesNothing)
 {
     auto storage = openWiringStorage();
     {
@@ -824,7 +824,7 @@ TEST(CaWiringWrite, UncommittedTransactionPublishesNothing)
     EXPECT_FALSE(storage->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin"));
 }
 
-TEST(CaWiringWrite, MutableOnlyUpdateOnCommittedPart)
+TEST(CasWiringWrite, MutableOnlyUpdateOnCommittedPart)
 {
     auto storage = openWiringStorage();
     auto tx = storage->createTransaction();
@@ -842,7 +842,7 @@ TEST(CaWiringWrite, MutableOnlyUpdateOnCommittedPart)
     EXPECT_TRUE(storage->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin"));   /// the tree is untouched
 }
 
-TEST(CaWiringWrite, VerbatimFilesDurableOnFinalizeAndAppendable)
+TEST(CasWiringWrite, VerbatimFilesDurableOnFinalizeAndAppendable)
 {
     auto storage = openWiringStorage();
     auto tx = storage->createTransaction();
@@ -864,7 +864,7 @@ TEST(CaWiringWrite, VerbatimFilesDurableOnFinalizeAndAppendable)
 
 /// ==== M-W Tasks 5-7: carry-forward, renames, removals, detached/ATTACH/FREEZE ====
 
-TEST(CaWiringOps, HardLinkCarriesForwardWithoutReupload)
+TEST(CasWiringOps, HardLinkCarriesForwardWithoutReupload)
 {
     auto storage = openWiringStorage();
     auto tx = storage->createTransaction();
@@ -884,7 +884,7 @@ TEST(CaWiringOps, HardLinkCarriesForwardWithoutReupload)
     EXPECT_EQ(storage->tryGetInManifestBytes("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_5/uuid.txt"), std::optional<String>("u-1"));
 }
 
-TEST(CaWiringOps, TmpToFinalRenamePublishesUnderFinalName)
+TEST(CasWiringOps, TmpToFinalRenamePublishesUnderFinalName)
 {
     auto storage = openWiringStorage();
     auto tx = storage->createTransaction();
@@ -897,7 +897,7 @@ TEST(CaWiringOps, TmpToFinalRenamePublishesUnderFinalName)
     EXPECT_TRUE(storage->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin"));
 }
 
-TEST(CaWiringOps, CommittedPartRenameMovesTheRef)
+TEST(CasWiringOps, CommittedPartRenameMovesTheRef)
 {
     auto storage = openWiringStorage();
     auto tx = storage->createTransaction();
@@ -914,7 +914,7 @@ TEST(CaWiringOps, CommittedPartRenameMovesTheRef)
     EXPECT_TRUE(storage->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/delete_tmp_all_1_1_0/data.bin"));
 }
 
-TEST(CaWiringOps, ProjectionTmpRenameRekeysStagedEntries)
+TEST(CasWiringOps, ProjectionTmpRenameRekeysStagedEntries)
 {
     auto storage = openWiringStorage();
     auto tx = storage->createTransaction();
@@ -929,7 +929,7 @@ TEST(CaWiringOps, ProjectionTmpRenameRekeysStagedEntries)
     EXPECT_EQ(storage->listDirectory("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/p.proj"), (std::vector<std::string>{"data.bin"}));
 }
 
-TEST(CaWiringOps, DetachAttachRoundTrip)
+TEST(CasWiringOps, DetachAttachRoundTrip)
 {
     auto storage = openWiringStorage();
     auto tx = storage->createTransaction();
@@ -960,7 +960,7 @@ TEST(CaWiringOps, DetachAttachRoundTrip)
     EXPECT_EQ(storage->listDirectory("a11/a11a11a1-1111-4111-8111-111111111111/detached"), (std::vector<std::string>{}));
 }
 
-TEST(CaWiringOps, RemovalsDropRefsAndNamespaces)
+TEST(CasWiringOps, RemovalsDropRefsAndNamespaces)
 {
     auto storage = openWiringStorage();
     auto tx = storage->createTransaction();
@@ -997,11 +997,11 @@ TEST(CaWiringOps, RemovalsDropRefsAndNamespaces)
 /// "rename FROM a committed mutable-per-part-file, source not staged in this transaction" branch is
 /// now DELETED (it had been provably unreachable since Task 5, and rebuilding it against `entries`
 /// would only add unused surface for a dead path). Coverage that remains valid: Task 5's own
-/// capability test proves no `.tmp` file is ever created; `CaTransactionAllTree.CommittedTxnVersion-
+/// capability test proves no `.tmp` file is ever created; `CasTransactionAllTree.CommittedTxnVersion-
 /// StoreRepoints` (`gtest_ca_transaction.cpp`) proves the real, live path — a standalone write of
 /// `txn_version.txt` directly onto an already-committed part — repoints correctly.
 
-TEST(CaWiringOps, VerbatimMoveAndUnlink)
+TEST(CasWiringOps, VerbatimMoveAndUnlink)
 {
     auto storage = openWiringStorage();
     auto tx = storage->createTransaction();
@@ -1014,7 +1014,7 @@ TEST(CaWiringOps, VerbatimMoveAndUnlink)
     EXPECT_FALSE(storage->existsFile("a11/a11a11a1-1111-4111-8111-111111111111/mutation_5.txt"));
 }
 
-TEST(CaWiringOps, UnlinkHonorsIfExistsForPartFiles)
+TEST(CasWiringOps, UnlinkHonorsIfExistsForPartFiles)
 {
     auto storage = openWiringStorage();
     const String path = "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin";
@@ -1039,7 +1039,7 @@ TEST(CaWiringOps, UnlinkHonorsIfExistsForPartFiles)
     EXPECT_FALSE(storage->existsFile(path));
 }
 
-TEST(CaWiringOps, TableRenameMovesRefsFilesAndDetached)
+TEST(CasWiringOps, TableRenameMovesRefsFilesAndDetached)
 {
     auto storage = openWiringStorage();
     auto tx = storage->createTransaction();
@@ -1066,7 +1066,7 @@ TEST(CaWiringOps, TableRenameMovesRefsFilesAndDetached)
 
 /// B126: RENAME TABLE move_namespace is idempotent — re-driving the SAME rename after it completed is a
 /// clean no-op (the source namespace is already gone), so a partial-failure re-drive is safe.
-TEST(CaWiringOps, TableRenameIsIdempotentOnRedrive)
+TEST(CasWiringOps, TableRenameIsIdempotentOnRedrive)
 {
     auto storage = openWiringStorage();
     auto tx = storage->createTransaction();
@@ -1090,7 +1090,7 @@ TEST(CaWiringOps, TableRenameIsIdempotentOnRedrive)
 
 /// B123: a verbatim-file move (get->put->remove, no native rename) is idempotent on re-drive — once the
 /// source is gone but the destination is present, a re-driven move is a no-op, not a FILE_DOESNT_EXIST.
-TEST(CaWiringOps, VerbatimMoveIsIdempotentOnRedrive)
+TEST(CasWiringOps, VerbatimMoveIsIdempotentOnRedrive)
 {
     auto storage = openWiringStorage();
     auto tx = storage->createTransaction();
@@ -1111,10 +1111,10 @@ TEST(CaWiringOps, VerbatimMoveIsIdempotentOnRedrive)
 ///
 /// The "fails loud" collision throws LOGICAL_ERROR, which aborts the whole process in debug/sanitizer
 /// builds (Exception.cpp's handle_error_code) instead of behaving like a catchable exception -- so
-/// EXPECT_ANY_THROW only makes sense in a plain release build. CaWiringOpsDeathTest below proves the
+/// EXPECT_ANY_THROW only makes sense in a plain release build. CasWiringOpsDeathTest below proves the
 /// SAME collision positively aborts under debug/sanitizer builds instead (same pattern as the existing
 /// CasBlobDigestDeathTest precedent).
-TEST(CaWiringOps, MoveDirectoryMutableCollisionPolicy)
+TEST(CasWiringOps, MoveDirectoryMutableCollisionPolicy)
 {
 #ifndef DEBUG_OR_SANITIZER_BUILD
     /// Differing bytes → fail loud.
@@ -1149,7 +1149,7 @@ TEST(CaWiringOps, MoveDirectoryMutableCollisionPolicy)
 /// Debug/sanitizer-build counterpart to MoveDirectoryMutableCollisionPolicy's "differing bytes → fail
 /// loud" case: LOGICAL_ERROR aborts the process here instead of throwing a catchable exception, so the
 /// check must be a death test (same pattern as CasBlobDigestDeathTest in gtest_cas_blob_digest.cpp).
-TEST(CaWiringOpsDeathTest, MoveDirectoryMutableCollisionPolicyAborts)
+TEST(CasWiringOpsDeathTest, MoveDirectoryMutableCollisionPolicyAborts)
 {
     auto storage = openWiringStorage();
     auto tx = storage->createTransaction();
@@ -1187,7 +1187,7 @@ TEST(CaWiringOpsDeathTest, MoveDirectoryMutableCollisionPolicyAborts)
 /// public test hook `gtest_cas_event_log.cpp` uses) and asserting no `BuildAbort` event fires is a
 /// genuine behavioral discriminator between the two merge branches — not just "assertions pass
 /// either way" — so a future regression that gives the source a PartWriteTxn again fails this test loudly.
-TEST(CaWiringOps, MoveDirectoryOntoExistingDestinationBuildSurvives)
+TEST(CasWiringOps, MoveDirectoryOntoExistingDestinationBuildSurvives)
 {
     std::vector<DB::Cas::CasEvent> events;   /// declared BEFORE the Pool so it outlives the background syncer's emits (ASan 2026-07-09)
     auto storage = openWiringStorage();
@@ -1229,7 +1229,7 @@ TEST(CaWiringOps, MoveDirectoryOntoExistingDestinationBuildSurvives)
     storage->store()->setEventSink(nullptr);
 }
 
-TEST(CaWiringOps, FreezeViaHardLinksIntoShadow)
+TEST(CasWiringOps, FreezeViaHardLinksIntoShadow)
 {
     auto storage = openWiringStorage();
     auto tx = storage->createTransaction();
@@ -1259,7 +1259,7 @@ TEST(CaWiringOps, FreezeViaHardLinksIntoShadow)
 
 /// ==== M-W Task 8: in-flight read-your-writes (B59) ====
 
-TEST(CaWiringInFlight, StagedFilesVisibleBeforeCommit)
+TEST(CasWiringInFlight, StagedFilesVisibleBeforeCommit)
 {
     auto storage = openWiringStorage();
     auto tx = storage->createTransaction();
@@ -1311,7 +1311,7 @@ namespace DB::ErrorCodes
 
 /// ==== M-W Task 10: the GC scheduler end-to-end through the wiring ====
 
-TEST(CaWiringGc, DroppedPartIsReclaimedByRounds)
+TEST(CasWiringGc, DroppedPartIsReclaimedByRounds)
 {
     auto storage = openWiringStorage();
     auto tx = storage->createTransaction();
@@ -1368,7 +1368,7 @@ TEST(CaWiringGc, DroppedPartIsReclaimedByRounds)
 /// removal, retires its now-zero-in-degree blobs, and the recheck cleanup deletes the owner-removed
 /// body. We do NOT pre-delete manifestA's body — only GC deletes an owner-removed body, after sealing
 /// its decrements.
-TEST(CaWiringGc, DisplacedTreeBlobsReclaimedThroughRealPath)
+TEST(CasWiringGc, DisplacedTreeBlobsReclaimedThroughRealPath)
 {
     auto storage = openWiringStorage();
 
@@ -1424,7 +1424,7 @@ TEST(CaWiringGc, DisplacedTreeBlobsReclaimedThroughRealPath)
 /// B7 sender side: getPartManifestBytes returns the COMMITTED part's encoded PartManifest body — the
 /// opaque payload the receiver decodes. The bytes must decode to the same entries the part was
 /// published with; an absent part offers nothing (the sender streams bytes — the documented fallback).
-TEST(CaWiringExchange, GetPartManifestBytesReturnsBodyForCommittedPart)
+TEST(CasWiringExchange, GetPartManifestBytesReturnsBodyForCommittedPart)
 {
     auto storage = openWiringStorage();
     /// Publish a real committed part (data.bin + a projection blob + mutable per-part files).
@@ -1458,7 +1458,7 @@ TEST(CaWiringExchange, GetPartManifestBytesReturnsBodyForCommittedPart)
 /// Asserts: success; the adopted ref is live + loadable; the receiver's ManifestId differs from the
 /// sender's (no shared identity); the ref lives in the RECEIVER namespace (no cross-namespace adoption);
 /// and NO blob body was uploaded by the receiver (the put-counter stays flat across adopt).
-TEST(CaWiringExchange, AdoptPartFromManifestPublishesFreshLocalManifest)
+TEST(CasWiringExchange, AdoptPartFromManifestPublishesFreshLocalManifest)
 {
     auto storage = openWiringStorage();
     const auto sender_ns = storage->liveNamespace("a11a11a1-1111-4111-8111-111111111111");
@@ -1510,7 +1510,7 @@ TEST(CaWiringExchange, AdoptPartFromManifestPublishesFreshLocalManifest)
 /// B7 fail-closed: if a referenced blob is absent/condemned in the pool, adoptPartFromManifest must
 /// promote-abort and return FALSE (NOT throw) so the caller byte-fetches — exactly where the old pin
 /// protocol fell back. Nothing is published (no dangling ref).
-TEST(CaWiringExchange, AdoptFailsClosedAndFallsBackOnCondemnedBlob)
+TEST(CasWiringExchange, AdoptFailsClosedAndFallsBackOnCondemnedBlob)
 {
     /// §4 manifest-trust (test name is legacy — adopt no longer fails closed on a raced pool blob):
     /// adoptPartFromManifest runs the receiver's local promote, which TRUSTS the committed-source adopted
@@ -1554,7 +1554,7 @@ TEST(CaWiringExchange, AdoptFailsClosedAndFallsBackOnCondemnedBlob)
 /// `adoptPartFromManifest` no longer even HAS a sidecar parameter (Fetcher::relinkPartToDisk's call
 /// site simply dropped the argument). This publishes a part whose per-part files are ordinary
 /// manifest entries and adopts it, mirroring the post-task-9 call site exactly.
-TEST(CaWiringExchange, AdoptPartFromManifestSelfContainedWithoutMutableFilesSidecar)
+TEST(CasWiringExchange, AdoptPartFromManifestSelfContainedWithoutMutableFilesSidecar)
 {
     auto storage = openWiringStorage();
     const auto sender_ns = storage->liveNamespace("a11a11a1-1111-4111-8111-111111111111");
@@ -1681,7 +1681,7 @@ std::shared_ptr<FaultyLocalObjectStorage> makeFaultyStorageForTest()
 
 }
 
-TEST(CaWiringWrite, PartialCommitRollsBackPublishedParts)
+TEST(CasWiringWrite, PartialCommitRollsBackPublishedParts)
 {
     auto faulty = makeFaultyStorageForTest();
     auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
@@ -1728,7 +1728,7 @@ TEST(CaWiringWrite, PartialCommitRollsBackPublishedParts)
     EXPECT_FALSE(storage->existsDirectory("a11/a11a11a1-1111-4111-8111-111111111111/all_2_2_0"));
 }
 
-TEST(CaWiringReadOnly, ObserveOnlyOpenReadsButRejectsWrites)
+TEST(CasWiringReadOnly, ObserveOnlyOpenReadsButRejectsWrites)
 {
     /// 1. Writable storage publishes a part into a fixed root.
     const auto root = (std::filesystem::temp_directory_path()
@@ -1765,7 +1765,7 @@ TEST(CaWiringReadOnly, ObserveOnlyOpenReadsButRejectsWrites)
         [&] { ro->adoptPartFromManifest("a11a11a1-1111-4111-8111-111111111111", "tmp-fetch", std::string{}); });
 }
 
-TEST(CaWiringRead, UnsetPublishedAtMsReturnsEpoch)
+TEST(CasWiringRead, UnsetPublishedAtMsReturnsEpoch)
 {
     /// A ref published without a stamp (published_at_ms == 0, the default) must return the epoch
     /// (Poco::Timestamp(0)) rather than throwing: stamps only feed cleanup TTLs and system tables,
@@ -1921,7 +1921,7 @@ int firstPrecommitWriteIdx(const std::vector<RecordingLocalObjectStorage::Record
 /// exact bug was an eager HEAD on a content blob during staging. The transaction writes a fresh
 /// content file (pending blob) AND adopts an existing committed blob via hardlink — both paths must
 /// satisfy the invariant.
-TEST(CaWiringPrecommitOrder, NoContentPoolOpBeforePrecommit)
+TEST(CasWiringPrecommitOrder, NoContentPoolOpBeforePrecommit)
 {
     auto recording = makeRecordingStorageForTest("order");
     auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
@@ -1952,7 +1952,7 @@ TEST(CaWiringPrecommitOrder, NoContentPoolOpBeforePrecommit)
     /// already-durable, ref-pinned tree during staging — a foreign-tree read that is NOT a B188
     /// violation (the invariant is about THIS build's own not-yet-uploaded content, never a committed
     /// object owned by a live part). Gating it would be a false positive; see the committed-source
-    /// adopt coverage in CaWiringOps.HardLinkCarriesForwardWithoutReupload.
+    /// adopt coverage in CasWiringOps.HardLinkCarriesForwardWithoutReupload.
     tx->createHardLink("a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin", "a11/a11a11a1-1111-4111-8111-111111111111/all_2_2_0/extra.bin");
     tx->commit(DB::NoCommitOptions{});
 
@@ -2023,7 +2023,7 @@ TEST(CaWiringPrecommitOrder, NoContentPoolOpBeforePrecommit)
 ///
 /// adoptFromTree legitimately READS the source TREE during staging (to find the entry) — that is fine
 /// and is NOT asserted here; the assertion is scoped to the adopted BLOB key alone.
-TEST(CaWiringPrecommitOrder, CommittedSourceAdoptNoHeadBeforePrecommit)
+TEST(CasWiringPrecommitOrder, CommittedSourceAdoptNoHeadBeforePrecommit)
 {
     auto recording = makeRecordingStorageForTest("committed_adopt");
     auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
@@ -2106,7 +2106,7 @@ TEST(CaWiringPrecommitOrder, CommittedSourceAdoptNoHeadBeforePrecommit)
 /// (the cross-part pending-source branch: `&dst_st != src_st`, copies the PendingBlob record so
 /// publishStaging uploads it for the dst part too). After commit both parts must read back the
 /// identical content.
-TEST(CaWiringPending, HardlinkOfPendingBlobCommitsAndReadsBack)
+TEST(CasWiringPending, HardlinkOfPendingBlobCommitsAndReadsBack)
 {
     auto storage = openWiringStorage();
 
@@ -2153,7 +2153,7 @@ TEST(CaWiringPending, HardlinkOfPendingBlobCommitsAndReadsBack)
 /// fresh dst manifest) during staging — that is the manifest-era analog of the old adoptFromTree
 /// source-tree read and is NOT a violation (see CommittedSourceAdoptNoHeadBeforePrecommit). The
 /// invariant that survives: the source BLOB key must not be touched before the first precommit write.
-TEST(CaWiringPrecommitOrder, RepublishRefNoTreeHeadBeforePrecommit)
+TEST(CasWiringPrecommitOrder, RepublishRefNoTreeHeadBeforePrecommit)
 {
     auto recording = makeRecordingStorageForTest("republish");
     auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
@@ -2227,7 +2227,7 @@ TEST(CaWiringPrecommitOrder, RepublishRefNoTreeHeadBeforePrecommit)
 /// moved (moveFile/moveDirectory), and uploaded blobs are adopted by tokenless evidence. This test
 /// exercises the non-trivial CROSS-PART pending path (createHardLink copies; moveFile moves) and
 /// verifies both a copy and a move of the SAME pending source produce the correct committed state.
-TEST(CaWiringPrecommitOrder, AdoptStagedBlobHelperUnifiesSixSites)
+TEST(CasWiringPrecommitOrder, AdoptStagedBlobHelperUnifiesSixSites)
 {
     /// Use a recording storage so we can verify no pre-precommit pool ops on own content.
     auto recording = makeRecordingStorageForTest("adopt_helper");
@@ -2304,7 +2304,7 @@ TEST(CaWiringPrecommitOrder, AdoptStagedBlobHelperUnifiesSixSites)
 /// The test uses RecordingLocalObjectStorage to capture every writeObject call. After commit it
 /// checks that the orphaned blob's pool key received NO writeObject, while a kept blob (written and
 /// NOT removed in the same transaction) IS uploaded.
-TEST(CaWiringOps, OrphanedPendingBlobNotUploadedAfterUnlink)
+TEST(CasWiringOps, OrphanedPendingBlobNotUploadedAfterUnlink)
 {
     auto recording = makeRecordingStorageForTest("b189_unlink");
     auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
@@ -2357,7 +2357,7 @@ TEST(CaWiringOps, OrphanedPendingBlobNotUploadedAfterUnlink)
 /// B189 companion: the same orphan-filter applies when the tree entry is removed by replaceFile
 /// (the destination entry erased before the move). Write blob X to dst, then replaceFile src->dst
 /// (erases X's entry, moves src's entry to dst). The orphaned X must not be uploaded.
-TEST(CaWiringOps, OrphanedPendingBlobNotUploadedAfterReplace)
+TEST(CasWiringOps, OrphanedPendingBlobNotUploadedAfterReplace)
 {
     auto recording = makeRecordingStorageForTest("b189_replace");
     auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
@@ -2473,7 +2473,7 @@ void seedCondemnBlobToken(DB::Cas::Pool & store, const DB::UInt128 & hash,
 /// BEFORE putBlob observed it, so a condemnation in this window cannot graduate to a delete (the next fold
 /// sees the edge, d >= 1, spared). promote therefore does NOT re-check or resurrect a TOKENED leaf — it
 /// commits leaving the blob's token UNCHANGED (no resurrect PUT). The premature condemn is doomed on its own.
-TEST(CaWiringResurrect, PromoteIgnoresCondemnedTokenedBlobEdgeProtected)
+TEST(CasWiringResurrect, PromoteIgnoresCondemnedTokenedBlobEdgeProtected)
 {
     using namespace DB::Cas;
     std::shared_ptr<InMemoryBackend> backend;
@@ -2531,7 +2531,7 @@ TEST(CaWiringResurrect, PromoteIgnoresCondemnedTokenedBlobEdgeProtected)
 /// (a candidate for a later dead-code review — out of scope here). The previous version of this test faked
 /// the removal with an out-of-band `appendOwnerEvent` the single-leader runtime never observes — an
 /// unreachable state that surfaced as a CORRUPTED_DATA ref-log collision, not the intended ABORTED.
-TEST(CaWiringResurrect, PromoteWithoutLivePrecommitAbortsWithoutResurrect)
+TEST(CasWiringResurrect, PromoteWithoutLivePrecommitAbortsWithoutResurrect)
 {
     using namespace DB::Cas;
     std::shared_ptr<InMemoryBackend> backend;

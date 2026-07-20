@@ -3,7 +3,7 @@
 
 using DB::Cas::partFileMustStayBlob;
 
-TEST(CaInlinePlacement, ColumnAndMarkFilesStayBlob)
+TEST(CasInlinePlacement, ColumnAndMarkFilesStayBlob)
 {
     EXPECT_TRUE(partFileMustStayBlob("data.bin"));
     EXPECT_TRUE(partFileMustStayBlob("data.mrk"));
@@ -15,7 +15,7 @@ TEST(CaInlinePlacement, ColumnAndMarkFilesStayBlob)
     EXPECT_TRUE(partFileMustStayBlob("primary.idx"));   // potentially large; stays blob (follow-up tuning)
 }
 
-TEST(CaInlinePlacement, EagerMetadataFilesAreInlineCandidates)
+TEST(CasInlinePlacement, EagerMetadataFilesAreInlineCandidates)
 {
     EXPECT_FALSE(partFileMustStayBlob("checksums.txt"));
     EXPECT_FALSE(partFileMustStayBlob("columns.txt"));

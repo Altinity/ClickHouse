@@ -61,7 +61,7 @@ PoolConfig cfg(uint64_t cache_bytes, uint64_t head_first_min_bytes)
 }
 
 /// Task 2: the cache itself — add then contains.
-TEST(CaDedupCache, AddThenContains)
+TEST(CasDedupCache, AddThenContains)
 {
     auto s = Pool::open(std::make_shared<InMemoryBackend>(), cfg(64ULL << 20, 1ULL << 20));
     const DB::UInt128 h = u128Of("x");
@@ -71,7 +71,7 @@ TEST(CaDedupCache, AddThenContains)
 }
 
 /// Task 2: dedup_cache_bytes == 0 disables the cache — add is a no-op, contains is always false.
-TEST(CaDedupCache, DisabledNeverContains)
+TEST(CasDedupCache, DisabledNeverContains)
 {
     auto s = Pool::open(std::make_shared<InMemoryBackend>(), cfg(/*cache_bytes*/ 0, 1ULL << 20));
     const DB::UInt128 h = u128Of("x");
@@ -81,7 +81,7 @@ TEST(CaDedupCache, DisabledNeverContains)
 
 /// Task 2: the cache is bounded by bytes — at 64 B/entry a 256 B ceiling holds ~4 entries, so the
 /// earliest-added hash is evicted while a recently-added one survives.
-TEST(CaDedupCache, BoundedByBytes)
+TEST(CasDedupCache, BoundedByBytes)
 {
     auto s = Pool::open(std::make_shared<InMemoryBackend>(), cfg(/*cache_bytes*/ 256, 1ULL << 20));
     const DB::UInt128 first = u128Of("k0");
@@ -95,7 +95,7 @@ TEST(CaDedupCache, BoundedByBytes)
 /// Task 5 (P1): a cache hit takes the HEAD-first path and skips the body PUT entirely.
 /// (Counters are reset right before each measured putBlob — Pool::open's probe/watermark and
 /// beginPartWrite's heartbeat issue their own backend ops that are irrelevant to the trade-off under test.)
-TEST(CaDedupCache, HitTakesHeadFirstNoBodyPut)
+TEST(CasDedupCache, HitTakesHeadFirstNoBodyPut)
 {
     auto counting = std::make_shared<CountingBackend>(std::make_shared<InMemoryBackend>());
     auto s = Pool::open(counting, cfg(64ULL << 20, 1ULL << 20));
@@ -132,7 +132,7 @@ TEST(CaDedupCache, HitTakesHeadFirstNoBodyPut)
 /// the entry). putBlob's HEAD-first branch re-checks dedupCacheContains a second time purely to
 /// attribute CasBlobBodyPutAvoided to the cache (CasPartWriteTxn.cpp), so a genuine hit can bump
 /// CasDedupCacheHits twice for one putBlob call -- hence GE, not EQ, on the hit delta below.
-TEST(CaDedupCache, HitMissCountersIncrement)
+TEST(CasDedupCache, HitMissCountersIncrement)
 {
     using ProfileEvents::global_counters;
     auto counting = std::make_shared<CountingBackend>(std::make_shared<InMemoryBackend>());
@@ -168,7 +168,7 @@ TEST(CaDedupCache, HitMissCountersIncrement)
 
 /// Task 5 (P1 safety): a STALE cache hit (hash marked present but absent in the store) must not cause a
 /// dangle — the mandatory HEAD sees 404 and the writer falls through to a real body PUT.
-TEST(CaDedupCache, StaleHitFallsThroughToPut)
+TEST(CasDedupCache, StaleHitFallsThroughToPut)
 {
     auto counting = std::make_shared<CountingBackend>(std::make_shared<InMemoryBackend>());
     auto s = Pool::open(counting, cfg(64ULL << 20, 1ULL << 20));
@@ -189,7 +189,7 @@ TEST(CaDedupCache, StaleHitFallsThroughToPut)
 /// Task 5 (P2): on a cold cache, a body at/above dedup_head_first_min_bytes still probes HEAD-first
 /// (here the size trigger fires for a tiny body because the threshold is set to 1). The miss falls
 /// through to a real PUT.
-TEST(CaDedupCache, LargeBlobMissTakesHeadFirst)
+TEST(CasDedupCache, LargeBlobMissTakesHeadFirst)
 {
     auto counting = std::make_shared<CountingBackend>(std::make_shared<InMemoryBackend>());
     auto s = Pool::open(counting, cfg(64ULL << 20, /*head_first_min_bytes*/ 1));
