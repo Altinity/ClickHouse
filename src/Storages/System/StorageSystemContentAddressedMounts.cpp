@@ -1,11 +1,13 @@
 #include <Storages/System/StorageSystemContentAddressedMounts.h>
 #include <DataTypes/DataTypesNumber.h>
 
+#include <Columns/ColumnNullable.h>
 #include <Columns/ColumnString.h>
 #include <Columns/ColumnsNumber.h>
 #include <Columns/ColumnsDateTime.h>
 #include <DataTypes/DataTypeDateTime64.h>
 #include <DataTypes/DataTypeLowCardinality.h>
+#include <DataTypes/DataTypeNullable.h>
 #include <DataTypes/DataTypeString.h>
 #include <DataTypes/DataTypeUUID.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
@@ -46,10 +48,10 @@ StorageSystemContentAddressedMounts::StorageSystemContentAddressedMounts(const S
         {"min_active", std::make_shared<DataTypeUInt64>(), "Oldest in-flight build sequence (UINT64_MAX = farewell)."},
         {"gc_fenced", std::make_shared<DataTypeUInt8>(), "1 if GC fenced this slot out (terminal)."},
         {"state", std::make_shared<DataTypeString>(), "live | expired | terminated | fenced | corrupt."},
-        {"is_leader", std::make_shared<DataTypeUInt8>(), "1 if THIS server's GC scheduler currently holds this disk's leadership lease (per-disk; supersedes the retired process-global CasGcIsLeader metric)."},
-        {"pending_reclaim", std::make_shared<DataTypeInt64>(), "Cumulative two-phase deletion backlog observed by this process's GC on this disk (condemned entries minus executed exact-token deletes)."},
-        {"last_success_age_seconds", std::make_shared<DataTypeUInt64>(), "Seconds since this disk's GC last led a round (0 if it has never led or GC is not running here)."},
-        {"wedged_namespace_count", std::make_shared<DataTypeUInt64>(), "Ref-append lanes currently wedged on this disk (an uncertain PUT exhausted its retry budget)."},
+        {"is_leader", std::make_shared<DataTypeNullable>(std::make_shared<DataTypeUInt8>()), "1 if THIS server's GC scheduler currently holds this disk's leadership lease (per-disk; supersedes the retired process-global CasGcIsLeader metric). NULL on rows describing OTHER servers' mounts; populated only on this server's own mount row."},
+        {"pending_reclaim", std::make_shared<DataTypeNullable>(std::make_shared<DataTypeInt64>()), "Cumulative two-phase deletion backlog observed by this process's GC on this disk (condemned entries minus executed exact-token deletes). NULL on rows describing OTHER servers' mounts; populated only on this server's own mount row."},
+        {"last_success_age_seconds", std::make_shared<DataTypeNullable>(std::make_shared<DataTypeUInt64>()), "Seconds since this disk's GC last led a round (0 if it has never led or GC is not running here). NULL on rows describing OTHER servers' mounts; populated only on this server's own mount row."},
+        {"wedged_namespace_count", std::make_shared<DataTypeNullable>(std::make_shared<DataTypeUInt64>()), "Ref-append lanes currently wedged on this disk (an uncertain PUT exhausted its retry budget). NULL on rows describing OTHER servers' mounts; populated only on this server's own mount row."},
     }));
     storage_metadata.setVirtuals(createVirtuals());
     setInMemoryMetadata(storage_metadata);
@@ -86,10 +88,10 @@ Pipe StorageSystemContentAddressedMounts::read(
     MutableColumnPtr col_min_active = ColumnUInt64::create();
     MutableColumnPtr col_fenced = ColumnUInt8::create();
     MutableColumnPtr col_state = ColumnString::create();
-    MutableColumnPtr col_is_leader = ColumnUInt8::create();
-    MutableColumnPtr col_pending = ColumnInt64::create();
-    MutableColumnPtr col_last_success = ColumnUInt64::create();
-    MutableColumnPtr col_wedged = ColumnUInt64::create();
+    MutableColumnPtr col_is_leader = ColumnNullable::create(ColumnUInt8::create(), ColumnUInt8::create());
+    MutableColumnPtr col_pending = ColumnNullable::create(ColumnInt64::create(), ColumnUInt8::create());
+    MutableColumnPtr col_last_success = ColumnNullable::create(ColumnUInt64::create(), ColumnUInt8::create());
+    MutableColumnPtr col_wedged = ColumnNullable::create(ColumnUInt64::create(), ColumnUInt8::create());
 
     const uint64_t now_ms = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -142,6 +144,7 @@ Pipe StorageSystemContentAddressedMounts::read(
             continue;
         }
         const auto health = ca->gcHealth();
+        const String & local_srid = store->poolConfig().server_root_id;
         for (const auto & m : mounts)
         {
             col_disk->insert(disk_name);
@@ -156,10 +159,24 @@ Pipe StorageSystemContentAddressedMounts::read(
             col_min_active->insert(m.lease.min_active);
             col_fenced->insert(static_cast<UInt8>(m.lease.gc_fenced));
             col_state->insert(m.state);
-            col_is_leader->insert(health ? static_cast<UInt8>(health->is_leader) : UInt8(0));
-            col_pending->insert(health ? health->pending_reclaim : Int64(0));
-            col_last_success->insert(health ? health->last_success_age_seconds : UInt64(0));
-            col_wedged->insert(health ? health->wedged_namespace_count : UInt64(0));
+
+            /// GC health is a process-local fact about THIS server's scheduler. Stamping it onto
+            /// peer rows misreads as "peer B is GC leader" during incidents — NULL there instead.
+            const bool is_local_row = (m.srid == local_srid);
+            if (is_local_row && health)
+            {
+                col_is_leader->insert(static_cast<UInt8>(health->is_leader));
+                col_pending->insert(health->pending_reclaim);
+                col_last_success->insert(health->last_success_age_seconds);
+                col_wedged->insert(health->wedged_namespace_count);
+            }
+            else
+            {
+                col_is_leader->insertDefault();
+                col_pending->insertDefault();
+                col_last_success->insertDefault();
+                col_wedged->insertDefault();
+            }
         }
     }
 

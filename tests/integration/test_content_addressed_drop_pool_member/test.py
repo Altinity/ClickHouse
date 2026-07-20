@@ -106,6 +106,40 @@ def test_drop_dead_pool_member_heals_the_pool():
 
     assert _count(BLOBS_PREFIX) > blobs_baseline, "expected content blobs after both nodes' inserts"
 
+    # (3b) T9: system.content_addressed_mounts scopes the GC-health columns (is_leader et al.) to the
+    #      row for THIS server's own srid; peer rows read NULL. Background GC (1s interval) should
+    #      have led at least one round on each node by now, but that is a background race, not
+    #      something this test synchronizes on directly -- poll rather than assume. For every disk
+    #      that reports any non-NULL is_leader row there must be exactly one such row, and it must
+    #      belong to the querying node's own srid -- never a peer's.
+    for node, own_srid in ((node1, SRID1), (node2, SRID2)):
+        rows = []
+        for _ in range(30):
+            rows = (
+                node.query(
+                    "SELECT disk, srid FROM system.content_addressed_mounts "
+                    "WHERE is_leader IS NOT NULL ORDER BY disk"
+                )
+                .strip()
+                .splitlines()
+            )
+            if rows:
+                break
+            time.sleep(1.0)
+        assert rows, "expected at least one GC-health row with is_leader populated on {}".format(
+            node.name
+        )
+        seen_disks = set()
+        for row in rows:
+            disk, srid = row.split("\t")
+            assert srid == own_srid, "peer srid '{}' leaked GC health on disk '{}': {}".format(
+                srid, disk, rows
+            )
+            assert disk not in seen_disks, "duplicate non-NULL is_leader row for disk '{}': {}".format(
+                disk, rows
+            )
+            seen_disks.add(disk)
+
     # (4) Hard-kill node2: SIGKILL, no graceful farewell -- node2's mount lease is left to expire
     #     naturally, exactly the scenario decommission exists for.
     node2.stop_clickhouse(kill=True)
