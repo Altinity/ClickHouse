@@ -52,7 +52,7 @@ $CLIENT -q "TRUNCATE TABLE t_ca_p9"
 # advances on the background renewer's ~1s cadence, so early rounds only mark/retire).
 deleted=0
 for _ in $(seq 1 40); do
-    $CLIENT -q "SYSTEM CONTENT ADDRESSED GARBAGE COLLECTION '${DISK}'"
+    $CLIENT -q "SYSTEM CONTENT ADDRESSED GARBAGE COLLECTION '${DISK}'" > /dev/null
     $CLIENT -q "SYSTEM FLUSH LOGS content_addressed_garbage_collection_log"
     deleted=$($CLIENT -q "
         SELECT sum(objects_deleted)

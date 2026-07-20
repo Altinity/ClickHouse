@@ -1004,13 +1004,13 @@ BlockIO InterpreterSystemQuery::execute()
         case Type::CONTENT_ADDRESSED_GARBAGE_COLLECTION:
         {
             getContext()->checkAccess(AccessType::SYSTEM_CONTENT_ADDRESSED_GARBAGE_COLLECTION);
-            runContentAddressedGarbageCollection(query.disk);
+            result = runContentAddressedGarbageCollection(query.disk);
             break;
         }
         case Type::CONTENT_ADDRESSED_GC_REBUILD:
         {
             getContext()->checkAccess(AccessType::SYSTEM_CONTENT_ADDRESSED_GC_REBUILD);
-            runContentAddressedGcRebuild(query.disk, query.content_addressed_gc_rebuild_force);
+            result = runContentAddressedGcRebuild(query.disk, query.content_addressed_gc_rebuild_force);
             break;
         }
         case Type::CONTENT_ADDRESSED_DROP_POOL_MEMBER:
@@ -2293,7 +2293,89 @@ void InterpreterSystemQuery::syncMerges()
     throw DB::Exception(DB::ErrorCodes::TIMEOUT_EXCEEDED, "SYNC MERGES {}: command timed out. See the 'max_execution_time' setting", table_id.getNameForLogs());
 }
 
-void InterpreterSystemQuery::runContentAddressedGarbageCollection(const String & disk_name)
+namespace
+{
+
+/// One-row-per-disk result-set builders for the CAS GC verbs, mirroring the SYSTEM CONTENT ADDRESSED
+/// DROP POOL MEMBER precedent (ColumnsDescription + MutableColumns + SourceFromSingleChunk; see also
+/// SYNC_FILESYSTEM_CACHE above).
+ColumnsDescription contentAddressedGcRoundColumns()
+{
+    return ColumnsDescription{NamesAndTypesList{
+        {"disk", std::make_shared<DataTypeString>()},
+        {"acquired_lease", std::make_shared<DataTypeUInt8>()},
+        {"deferred", std::make_shared<DataTypeUInt8>()},
+        {"round", std::make_shared<DataTypeUInt64>()},
+        {"candidates_marked", std::make_shared<DataTypeUInt64>()},
+        {"objects_deleted", std::make_shared<DataTypeUInt64>()},
+        {"objects_absent", std::make_shared<DataTypeUInt64>()},
+        {"objects_replaced", std::make_shared<DataTypeUInt64>()},
+        {"objects_spared", std::make_shared<DataTypeUInt64>()},
+        {"manifests_deleted", std::make_shared<DataTypeUInt64>()},
+        {"entries_condemned", std::make_shared<DataTypeUInt64>()},
+        {"entries_graduated", std::make_shared<DataTypeUInt64>()},
+        {"entries_redeleted", std::make_shared<DataTypeUInt64>()},
+        {"fence_outs", std::make_shared<DataTypeUInt64>()},
+        {"anomalies", std::make_shared<DataTypeUInt64>()},
+    }};
+}
+
+void appendContentAddressedGcRoundRow(MutableColumns & res_columns, const String & disk_name, const Cas::RoundReport & rep)
+{
+    size_t i = 0;
+    res_columns[i++]->insert(disk_name);
+    res_columns[i++]->insert(static_cast<UInt8>(rep.acquired_lease));
+    res_columns[i++]->insert(static_cast<UInt8>(rep.deferred));
+    res_columns[i++]->insert(rep.round);
+    res_columns[i++]->insert(rep.candidates);
+    res_columns[i++]->insert(rep.deleted);
+    res_columns[i++]->insert(rep.absent);
+    res_columns[i++]->insert(rep.replaced);
+    res_columns[i++]->insert(rep.spared);
+    res_columns[i++]->insert(rep.manifests_deleted);
+    res_columns[i++]->insert(rep.condemned);
+    res_columns[i++]->insert(rep.graduated);
+    res_columns[i++]->insert(rep.redeleted);
+    res_columns[i++]->insert(rep.fence_outs);
+    res_columns[i++]->insert(rep.anomalies.size());
+}
+
+ColumnsDescription contentAddressedGcRebuildColumns()
+{
+    return ColumnsDescription{NamesAndTypesList{
+        {"disk", std::make_shared<DataTypeString>()},
+        {"performed", std::make_shared<DataTypeUInt8>()},
+        {"round", std::make_shared<DataTypeUInt64>()},
+        {"generation", std::make_shared<DataTypeUInt64>()},
+        {"namespaces", std::make_shared<DataTypeUInt64>()},
+        {"shards", std::make_shared<DataTypeUInt64>()},
+        {"committed_refs", std::make_shared<DataTypeUInt64>()},
+        {"live_precommits", std::make_shared<DataTypeUInt64>()},
+        {"unowned_alive_manifests", std::make_shared<DataTypeUInt64>()},
+        {"edges", std::make_shared<DataTypeUInt64>()},
+        {"clamped_shards", std::make_shared<DataTypeUInt64>()},
+    }};
+}
+
+void appendContentAddressedGcRebuildRow(MutableColumns & res_columns, const String & disk_name, const Cas::RebuildReport & rep)
+{
+    size_t i = 0;
+    res_columns[i++]->insert(disk_name);
+    res_columns[i++]->insert(static_cast<UInt8>(rep.performed));
+    res_columns[i++]->insert(rep.round);
+    res_columns[i++]->insert(rep.generation);
+    res_columns[i++]->insert(rep.namespaces);
+    res_columns[i++]->insert(rep.shards);
+    res_columns[i++]->insert(rep.committed_refs);
+    res_columns[i++]->insert(rep.live_precommits);
+    res_columns[i++]->insert(rep.unowned_alive_manifests);
+    res_columns[i++]->insert(rep.edges);
+    res_columns[i++]->insert(rep.clamped_shards);
+}
+
+}
+
+BlockIO InterpreterSystemQuery::runContentAddressedGarbageCollection(const String & disk_name)
 {
     /// A disk's metadata storage is content-addressed iff getMetadataStorage() yields a CA storage.
     /// Plain (non-object-storage) disks like the local `default` do not implement getMetadataStorage
@@ -2317,30 +2399,43 @@ void InterpreterSystemQuery::runContentAddressedGarbageCollection(const String &
         return dynamic_cast<ContentAddressedMetadataStorage *>(md.get());
     };
 
+    ColumnsDescription columns = contentAddressedGcRoundColumns();
+    Block sample_block;
+    for (const auto & column : columns)
+        sample_block.insert({column.type->createColumn(), column.type, column.name});
+    MutableColumns res_columns = sample_block.cloneEmptyColumns();
+
     if (!disk_name.empty())
     {
         auto disk = getContext()->getDisk(disk_name);
         auto * ca = content_addressed_storage_of(disk);
         if (!ca)
             throw Exception(ErrorCodes::BAD_ARGUMENTS, "Disk '{}' is not a content-addressed disk", disk_name);
-        ca->runGarbageCollectionRoundNow();   /// synchronous, one round
-        return;
+        appendContentAddressedGcRoundRow(res_columns, disk_name, ca->runGarbageCollectionRoundNow());   /// synchronous, one round
+    }
+    else
+    {
+        size_t ran = 0;
+        for (const auto & [name, disk] : getContext()->getDisksMap())
+        {
+            if (auto * ca = content_addressed_storage_of(disk))
+            {
+                appendContentAddressedGcRoundRow(res_columns, name, ca->runGarbageCollectionRoundNow());   /// synchronous, one round
+                ++ran;
+            }
+        }
+        if (ran == 0)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "No content-addressed disks are configured on this node");
     }
 
-    size_t ran = 0;
-    for (const auto & [name, disk] : getContext()->getDisksMap())
-    {
-        if (auto * ca = content_addressed_storage_of(disk))
-        {
-            ca->runGarbageCollectionRoundNow();   /// synchronous, one round
-            ++ran;
-        }
-    }
-    if (ran == 0)
-        throw Exception(ErrorCodes::BAD_ARGUMENTS, "No content-addressed disks are configured on this node");
+    size_t num_rows = res_columns[0]->size();
+    auto source = std::make_shared<SourceFromSingleChunk>(std::make_shared<const Block>(std::move(sample_block)), Chunk(std::move(res_columns), num_rows));
+    BlockIO result;
+    result.pipeline = QueryPipeline(std::move(source));
+    return result;
 }
 
-void InterpreterSystemQuery::runContentAddressedGcRebuild(const String & disk_name, bool force)
+BlockIO InterpreterSystemQuery::runContentAddressedGcRebuild(const String & disk_name, bool force)
 {
     /// Same content-addressed-disk detection as runContentAddressedGarbageCollection: plain
     /// (non-object-storage) disks throw NOT_IMPLEMENTED from getMetadataStorage - that simply means
@@ -2363,17 +2458,6 @@ void InterpreterSystemQuery::runContentAddressedGcRebuild(const String & disk_na
         return dynamic_cast<ContentAddressedMetadataStorage *>(md.get());
     };
 
-    auto log_and_check = [&](const String & name, const Cas::RebuildReport & rep)
-    {
-        if (!rep.performed)
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "CAS GC rebuild refused: {}", rep.refusal);
-        LOG_INFO(log,
-            "CAS GC rebuild on disk '{}' completed: round={} generation={} namespaces={} shards={} "
-            "committed_refs={} live_precommits={} unowned_alive_manifests={} edges={} clamped_shards={}",
-            name, rep.round, rep.generation, rep.namespaces, rep.shards, rep.committed_refs,
-            rep.live_precommits, rep.unowned_alive_manifests, rep.edges, rep.clamped_shards);
-    };
-
     /// REBUILD requires an EXPLICIT disk (E1): the destructive baseline rebuild must never fan out
     /// across every content-addressed disk on the node. The parser enforces this syntactically; this is
     /// the fail-closed backstop for a directly-constructed AST.
@@ -2385,7 +2469,28 @@ void InterpreterSystemQuery::runContentAddressedGcRebuild(const String & disk_na
     auto * ca = content_addressed_storage_of(disk);
     if (!ca)
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Disk '{}' is not a content-addressed disk", disk_name);
-    log_and_check(disk_name, ca->runGcRebuildNow(force));   /// synchronous, one rebuild
+
+    Cas::RebuildReport rep = ca->runGcRebuildNow(force);   /// synchronous, one rebuild
+    if (!rep.performed)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "CAS GC rebuild refused: {}", rep.refusal);
+    LOG_INFO(log,
+        "CAS GC rebuild on disk '{}' completed: round={} generation={} namespaces={} shards={} "
+        "committed_refs={} live_precommits={} unowned_alive_manifests={} edges={} clamped_shards={}",
+        disk_name, rep.round, rep.generation, rep.namespaces, rep.shards, rep.committed_refs,
+        rep.live_precommits, rep.unowned_alive_manifests, rep.edges, rep.clamped_shards);
+
+    ColumnsDescription columns = contentAddressedGcRebuildColumns();
+    Block sample_block;
+    for (const auto & column : columns)
+        sample_block.insert({column.type->createColumn(), column.type, column.name});
+    MutableColumns res_columns = sample_block.cloneEmptyColumns();
+    appendContentAddressedGcRebuildRow(res_columns, disk_name, rep);
+
+    size_t num_rows = res_columns[0]->size();
+    auto source = std::make_shared<SourceFromSingleChunk>(std::make_shared<const Block>(std::move(sample_block)), Chunk(std::move(res_columns), num_rows));
+    BlockIO result;
+    result.pipeline = QueryPipeline(std::move(source));
+    return result;
 }
 
 void InterpreterSystemQuery::loadPrimaryKeys()

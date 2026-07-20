@@ -469,6 +469,8 @@ When `disk_name` is given, the round runs on that content-addressed disk only; t
 
 Each round is recorded in [`system.content_addressed_garbage_collection_log`](/operations/system-tables/content_addressed_garbage_collection_log) as a `Start` and a `Finish` row (with `trigger = 'Manual'`).
 
+The command returns one row per disk it ran on (multiple rows when `disk_name` is omitted), with columns `disk`, `acquired_lease`, `deferred`, `round`, `candidates_marked`, `objects_deleted`, `objects_absent`, `objects_replaced`, `objects_spared`, `manifests_deleted`, `entries_condemned`, `entries_graduated`, `entries_redeleted`, `fence_outs`, and `anomalies`, describing the outcome of that round.
+
 ## Managing ReplicatedMergeTree Tables {#managing-replicatedmergetree-tables}
 
 ClickHouse can manage background replication related processes in [ReplicatedMergeTree](/engines/table-engines/mergetree-family/replication) tables.
