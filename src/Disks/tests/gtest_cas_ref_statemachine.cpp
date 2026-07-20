@@ -1030,3 +1030,52 @@ TEST(CasRefLogSizeHelpers, FramingPlusOpsEqualsFullRemovalEncode)
 
     EXPECT_EQ(rebuilt, full);
 }
+
+/// ===================================================================================
+/// Body-byte counters: snapshot_body_bytes / removal_body_bytes are a pure function of the rows.
+/// ===================================================================================
+namespace
+{
+uint64_t recomputeSnapshotBody(const RefTableState & s)
+{
+    uint64_t total = 0;
+    for (const auto [name, row] : s.committed)
+        total += committedRowEncodedSize(row);
+    for (const auto & [name, mref] : s.precommits)
+        total += precommitRowEncodedSize(RefOwnerBinding{RefOwnerKind::Precommit, name, mref});
+    return total;
+}
+uint64_t recomputeRemovalBody(const RefTableState & s)
+{
+    uint64_t total = 0;
+    for (const auto [name, row] : s.committed)
+        total += removalOpEncodedSize(RefOwnerKind::Committed, name, row.manifest_ref);
+    for (const auto & [name, mref] : s.precommits)
+        total += removalOpEncodedSize(RefOwnerKind::Precommit, name, mref);
+    return total;
+}
+}
+
+TEST(CasRefStateCounters, CountersTrackRowsThroughEveryOpKind)
+{
+    RefTableState state;
+    EXPECT_EQ(state.snapshot_body_bytes, 0u);
+    EXPECT_EQ(state.removal_body_bytes, 0u);
+
+    applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1}, {birthOp()}));
+    applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 2}, {addPrecommitOp("a", manifestRef(1, 1, 1))}));
+    applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 3}, {promoteOp("a", manifestRef(1, 1, 1))}));
+    applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 4},
+        {setPayloadOp("a", manifestRef(1, 1, 1), String(77, 'x'), 5)}));
+    applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 5}, {addPrecommitOp("b", manifestRef(1, 2, 1))}));
+    EXPECT_EQ(state.snapshot_body_bytes, recomputeSnapshotBody(state));
+    EXPECT_EQ(state.removal_body_bytes, recomputeRemovalBody(state));
+
+    /// Shrink back down: remove the precommit, then the committed row.
+    applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 6}, {removePrecommitOp("b", manifestRef(1, 2, 1))}));
+    applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 7}, {removeCommittedOp("a", manifestRef(1, 1, 1))}));
+    EXPECT_EQ(state.snapshot_body_bytes, recomputeSnapshotBody(state));
+    EXPECT_EQ(state.removal_body_bytes, recomputeRemovalBody(state));
+    EXPECT_EQ(state.snapshot_body_bytes, 0u);
+    EXPECT_EQ(state.removal_body_bytes, 0u);
+}

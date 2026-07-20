@@ -54,6 +54,8 @@ void applyOwnerTransition(RefTableState & state, const RefOp & op)
             throw Exception(ErrorCodes::CORRUPTED_DATA,
                 "RefTableState: manifest already has a conflicting owner under another ref_name");
         state.precommits.emplace(b.ref_name, b.manifest_ref);
+        state.snapshot_body_bytes += precommitRowEncodedSize(RefOwnerBinding{RefOwnerKind::Precommit, b.ref_name, b.manifest_ref});
+        state.removal_body_bytes  += removalOpEncodedSize(RefOwnerKind::Precommit, b.ref_name, b.manifest_ref);
         return;
     }
 
@@ -64,6 +66,8 @@ void applyOwnerTransition(RefTableState & state, const RefOp & op)
         if (state.precommits.erase({b.ref_name, b.manifest_ref}) == 0)
             throw Exception(ErrorCodes::CORRUPTED_DATA,
                 "RefTableState: exact precommit binding '{}' to remove is absent", b.ref_name);
+        state.snapshot_body_bytes -= precommitRowEncodedSize(RefOwnerBinding{RefOwnerKind::Precommit, b.ref_name, b.manifest_ref});
+        state.removal_body_bytes  -= removalOpEncodedSize(RefOwnerKind::Precommit, b.ref_name, b.manifest_ref);
         return;
     }
 
@@ -75,7 +79,10 @@ void applyOwnerTransition(RefTableState & state, const RefOp & op)
         if (it == state.committed.end() || !(it->second.manifest_ref == b.manifest_ref))
             throw Exception(ErrorCodes::CORRUPTED_DATA,
                 "RefTableState: exact committed binding '{}' to remove is absent", b.ref_name);
+        const RefCommittedRow removed = it->second;
         state.committed.erase(it);
+        state.snapshot_body_bytes -= committedRowEncodedSize(removed);
+        state.removal_body_bytes  -= removalOpEncodedSize(RefOwnerKind::Committed, removed.ref_name, removed.manifest_ref);
         return;
     }
 
@@ -91,6 +98,8 @@ void applyOwnerTransition(RefTableState & state, const RefOp & op)
         if (state.precommits.erase({b.ref_name, b.manifest_ref}) == 0)
             throw Exception(ErrorCodes::CORRUPTED_DATA,
                 "RefTableState: exact precommit binding '{}' to promote is absent", b.ref_name);
+        state.snapshot_body_bytes -= precommitRowEncodedSize(RefOwnerBinding{RefOwnerKind::Precommit, b.ref_name, b.manifest_ref});
+        state.removal_body_bytes  -= removalOpEncodedSize(RefOwnerKind::Precommit, b.ref_name, b.manifest_ref);
         /// A DIFFERENT manifest already committed under this exact ref_name must be evicted by its
         /// own explicit owner_transition(old=Committed, new=None) first (an earlier op of this same
         /// transaction, or an earlier transaction) -- never silently here. `GC`'s manifest-edge delta
@@ -104,6 +113,8 @@ void applyOwnerTransition(RefTableState & state, const RefOp & op)
         RefCommittedRow row;
         row.ref_name = b.ref_name;
         row.manifest_ref = b.manifest_ref;
+        state.snapshot_body_bytes += committedRowEncodedSize(row);
+        state.removal_body_bytes  += removalOpEncodedSize(RefOwnerKind::Committed, row.ref_name, row.manifest_ref);
         state.committed.emplace(b.ref_name, std::move(row));
         return;
     }
@@ -131,8 +142,12 @@ void applySetPayload(RefTableState & state, const RefOp & op)
     /// two field mutations the old in-place code did, and write the whole row back -- this IS the
     /// COW map's single-row copy-out, not a whole-table one.
     RefCommittedRow updated = it->second;
+    const uint64_t old_row_bytes = committedRowEncodedSize(it->second);
     updated.payload = op.payload;
     updated.published_at_ms = op.published_at_ms;
+    state.snapshot_body_bytes -= old_row_bytes;
+    state.snapshot_body_bytes += committedRowEncodedSize(updated);
+    /// removal_body_bytes unchanged: set_payload touches neither ref_name nor manifest_ref.
     state.committed.insert_or_assign(op.ref_name, std::move(updated));
 }
 
@@ -226,9 +241,17 @@ RefTableState stateFromSnapshot(const RefTableSnapshot & snapshot)
     state.remove_txn_id = validated.remove_txn_id;
     state.greatest_applied = validated.snapshot_id;
     for (const RefCommittedRow & row : validated.committed)
+    {
         state.committed.emplace(row.ref_name, row);
+        state.snapshot_body_bytes += committedRowEncodedSize(row);
+        state.removal_body_bytes  += removalOpEncodedSize(RefOwnerKind::Committed, row.ref_name, row.manifest_ref);
+    }
     for (const RefOwnerBinding & b : validated.precommits)
+    {
         state.precommits.emplace(b.ref_name, b.manifest_ref);
+        state.snapshot_body_bytes += precommitRowEncodedSize(RefOwnerBinding{RefOwnerKind::Precommit, b.ref_name, b.manifest_ref});
+        state.removal_body_bytes  += removalOpEncodedSize(RefOwnerKind::Precommit, b.ref_name, b.manifest_ref);
+    }
     return state;
 }
 
@@ -261,6 +284,29 @@ RefLogTxn buildHypotheticalRemovalTxn(const RefTableState & state, const RefTxnI
     return txn;
 }
 
+#ifndef NDEBUG
+/// Debug-only: recompute both body totals from scratch and assert the incrementally maintained values
+/// match. This is what makes the incremental counters *provably* byte-exact rather than a drift-prone
+/// estimate -- the concern the old non-incremental admits() cited. O(N); debug builds only.
+void debugAssertBodyCounters(const RefTableState & state)
+{
+    uint64_t snap = 0;
+    uint64_t rem = 0;
+    for (const auto [name, row] : state.committed)
+    {
+        snap += committedRowEncodedSize(row);
+        rem  += removalOpEncodedSize(RefOwnerKind::Committed, name, row.manifest_ref);
+    }
+    for (const auto & [name, mref] : state.precommits)
+    {
+        snap += precommitRowEncodedSize(RefOwnerBinding{RefOwnerKind::Precommit, name, mref});
+        rem  += removalOpEncodedSize(RefOwnerKind::Precommit, name, mref);
+    }
+    chassert(state.snapshot_body_bytes == snap);
+    chassert(state.removal_body_bytes == rem);
+}
+#endif
+
 }
 
 void applyRefLogTxn(RefTableState & state, const RefLogTxn & txn)
@@ -282,6 +328,9 @@ void applyRefLogTxn(RefTableState & state, const RefLogTxn & txn)
 
     scratch.greatest_applied = txn.txn_id;
     state = std::move(scratch);
+#ifndef NDEBUG
+    debugAssertBodyCounters(state);
+#endif
 }
 
 RefTableSnapshot snapshotOf(const RefTableState & state, const String & ns)

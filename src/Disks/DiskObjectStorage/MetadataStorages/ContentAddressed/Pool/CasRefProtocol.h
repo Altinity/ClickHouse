@@ -161,6 +161,14 @@ struct RefTableState
 
     RefCowMap committed;                                              /// keyed by ref_name
     std::set<std::pair<String, ManifestRef>> precommits;             /// (ref_name, manifest_ref)
+
+    /// Running byte totals of the two admission-budget encodings' *bodies* (row/op lines only, no
+    /// header/meta/trailer framing), maintained O(1) per applied op by `applyOpInPlace` and seeded by
+    /// `stateFromSnapshot`. A pure function of `(committed, precommits)`: `admits` reads
+    /// `framing + total` instead of re-encoding the whole table. See `admits`'s doc for why this is
+    /// byte-exact rather than a drift-prone estimate.
+    uint64_t snapshot_body_bytes = 0;   /// Σ committedRowEncodedSize + Σ precommitRowEncodedSize
+    uint64_t removal_body_bytes  = 0;   /// Σ removalOpEncodedSize(one per committed + one per precommit)
 };
 
 /// Applies the COMPLETE transaction to `state`, or throws `CORRUPTED_DATA` and leaves `state`
