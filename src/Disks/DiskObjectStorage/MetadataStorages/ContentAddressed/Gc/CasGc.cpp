@@ -161,9 +161,10 @@ bool shouldDeferRound(size_t changed_shards, bool graduation_due, uint64_t round
 }
 
 Gc::Gc(PoolPtr store_, UInt128 gc_id_, std::function<uint64_t()> now_ms_fn_,
-       std::function<uint64_t()> mono_ms_fn_)
+       std::function<uint64_t()> mono_ms_fn_, LoggerPtr log_)
     : store(std::move(store_))
     , gc_id(gc_id_)
+    , logger(log_ ? std::move(log_) : getLogger("CasGc"))
     , now_ms_fn(std::move(now_ms_fn_))
     , mono_ms_fn(std::move(mono_ms_fn_))
 {
@@ -199,7 +200,9 @@ void Gc::scheduleMetaJob(std::function<void()> job)
     /// Wrap once: `run` is safe to invoke either on the pool or inline (the scheduling-failure fallback
     /// below), and NEVER lets an exception escape: a per-hash meta
     /// op is advisory; the ledger + exact-token body delete are the actual safety core).
-    auto run = [job]()
+    /// Capture the logger by value under a distinct name (the pool job may outlive nothing here, but it
+    /// must not depend on `this`; the copy also keeps the capture from shadowing the `logger` member).
+    auto run = [job, job_logger = this->logger]()
     {
         /// Count one per-hash freshness-meta op EXECUTED (attempt, not success) on this
         /// bounded pool. `run` is invoked on the pool thread (the common path below) or inline on the
@@ -213,7 +216,7 @@ void Gc::scheduleMetaJob(std::function<void()> job)
         catch (...)
         {
             ProfileEvents::increment(ProfileEvents::CasGcMetaWriteAnomaly);
-            tryLogCurrentException(getLogger("CasGc"),
+            tryLogCurrentException(job_logger,
                 "CAS gc: a per-hash freshness-meta op failed on the bounded pool (advisory-only; "
                 "never wedges the round)");
         }
@@ -227,7 +230,7 @@ void Gc::scheduleMetaJob(std::function<void()> job)
         /// Scheduling itself failed (e.g. resource exhaustion under a mass-DROP burst) -- run inline
         /// rather than silently lose the meta write. `run` still never throws.
         ProfileEvents::increment(ProfileEvents::CasGcMetaWriteAnomaly);
-        tryLogCurrentException(getLogger("CasGc"),
+        tryLogCurrentException(logger,
             "CAS gc: meta pool scheduling failed; running the op inline on the round's own thread");
         run();
     }
@@ -479,7 +482,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
         for (const RetiredEntry & entry : merge.spared)
         {
             if (entry.delete_pending)
-                LOG_WARNING(getLogger("CasGc"),
+                LOG_WARNING(logger,
                     "CAS gc: delete_pending blob {} recovered in-degree — structurally impossible under "
                     "the ack floor (spared anyway, fail-closed); investigate",
                     blobIdOf(entry.ref));
@@ -658,7 +661,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
                 continue;   /// already reclaimed this round via another shard's ref
             const uint64_t reclaimed = deletePrefixWholesale(
                 backend, layout.gcGenPrefix(old_ref.generation), std::numeric_limits<uint64_t>::max());
-            LOG_TRACE(getLogger("CasGc"),
+            LOG_TRACE(logger,
                 "CAS GC hand-off: generation {} moved out of the live seal below the retention cursor "
                 "({} objects) — post-CAS wholesale reclaim (the prune had skipped it while referenced)",
                 old_ref.generation, reclaimed);
@@ -713,7 +716,7 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     }
     catch (const Exception & e)
     {
-        LOG_WARNING(getLogger("CasGc"), "CAS gc orphan sweep skipped this round: {}", e.message());
+        LOG_WARNING(logger, "CAS gc orphan sweep skipped this round: {}", e.message());
     }
 
     return report;
@@ -841,7 +844,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         ref_folding_aborted = true;
         report.recordAnomaly(RootNamespace{}, 0, ManifestId{},
                              "malformed ref-object key: ref folding aborted this round");
-        LOG_WARNING(getLogger("CasGc"),
+        LOG_WARNING(logger,
                     "CAS GC ref intake: {} -- aborting ref folding for the round", e.message());
     }
     for (const auto & [ns_str, listing] : ref_tables)
@@ -968,7 +971,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
         catch (...)
         {
             ProfileEvents::increment(ProfileEvents::CasGcMetaWriteAnomaly);
-            tryLogCurrentException(getLogger("CasGc"),
+            tryLogCurrentException(logger,
                 "CAS gc: condemn-marker re-check failed to read the meta (treated as missing evidence; "
                 "the entry is carried, never wedges the round)");
         }
@@ -1081,7 +1084,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
                 ref_folding_aborted = true;
                 report.recordAnomaly(ns, 0, ManifestId{ns, {}},
                                      "ref log body invalid: ref folding aborted this round");
-                LOG_WARNING(getLogger("CasGc"), "CAS GC ref intake: log {} invalid: {}",
+                LOG_WARNING(logger, "CAS GC ref intake: log {} invalid: {}",
                             layout.refLogKey(ns, log_id), e.message());
                 break;
             }
@@ -1336,7 +1339,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
     if (suppress_destructive)
     {
         ProfileEvents::increment(ProfileEvents::CasGcClampSuppressedPasses);
-        LOG_WARNING(getLogger("CasGc"),
+        LOG_WARNING(logger,
             "CAS GC fold: {} clamp anomaly(ies) this pass — graduations and pending deletes are "
             "SUPPRESSED (carried) until a clamp-free pass; landed events may be unfolded behind "
             "the clamps", report.anomalies.size());
@@ -1451,7 +1454,7 @@ void Gc::runManifestSweepCursorPass(GcState & state, Token & state_token)
         return;
     }
 
-    LOG_DEBUG(getLogger("CasGc"),
+    LOG_DEBUG(logger,
         "CAS gc orphan sweep cursor progress discarded because gc/state moved (listed {}, deleted {}, skipped {})",
         result.listed, result.deleted, result.skipped);
 }
@@ -1754,7 +1757,7 @@ void Gc::pruneSupersededGenerations(uint64_t adopted_generation, uint64_t attemp
             /// test). Until the ref moves it persists safely (bounded: one small run per shard).
             if (referenced_generations.contains(g))
             {
-                LOG_TRACE(getLogger("CasGc"),
+                LOG_TRACE(logger,
                     "CAS GC prune: retaining generation {} — still referenced by the live adopted seal",
                     g);
                 continue;
@@ -2182,7 +2185,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
             catch (...)
             {
                 ProfileEvents::increment(ProfileEvents::CasGcMetaWriteAnomaly);
-                tryLogCurrentException(getLogger("CasGc"),
+                tryLogCurrentException(logger,
                     "CAS gc rebuild: condemn-marker write failed; the entry enters the retired set "
                     "unconfirmed (carried at graduation, never fail-open deleted)");
             }

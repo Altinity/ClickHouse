@@ -49,7 +49,9 @@ CasGcScheduler::CasGcScheduler(
     , gc_id((static_cast<UInt128>(thread_local_rng()) << 64) | thread_local_rng())
     , disk_name(std::move(disk_name_))
     , logger(std::move(logger_))
-    , gc(store, gc_id)
+    /// Thread this scheduler's own disk/srid-scoped logger (built from `log_name` above) into the
+    /// round engine, so `Gc`'s log lines carry the same scope as the round-outcome log records.
+    , gc(store, gc_id, {}, {}, log)
 {
 }
 

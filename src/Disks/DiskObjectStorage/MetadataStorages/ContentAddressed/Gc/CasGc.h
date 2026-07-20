@@ -8,6 +8,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasOrphanManifestSweep.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
+#include <Common/Logger.h>
 #include <Common/ThreadPool.h>
 #include <atomic>
 #include <functional>
@@ -128,8 +129,13 @@ public:
     /// gate's own fence-out threshold is measured against (mirrors `claimMountAwaitingExpiry`'s
     /// `mono_ms_fn`, but at heartbeat-gate granularity — one GC round is one observation tick).
     /// Everything else in the round stays deterministic/clock-free.
+    ///
+    /// `log_` is the logger every round-engine log line is emitted through; pass a disk/srid-scoped
+    /// logger (e.g. `CasGcScheduler`'s own `log`, built from a `fmt::format("{}::...", storage_path)`
+    /// name) so a multi-disk process's GC logs are attributable. Defaults to the process-global
+    /// `getLogger("CasGc")` for callers with no natural scope of their own (tests, one-shot commands).
     Gc(PoolPtr store_, UInt128 gc_id_, std::function<uint64_t()> now_ms_fn_ = {},
-       std::function<uint64_t()> mono_ms_fn_ = {});
+       std::function<uint64_t()> mono_ms_fn_ = {}, LoggerPtr log_ = nullptr);
 
     /// One full round. Returns acquired_lease=false (nothing else done) if another leader is alive.
     /// `on_lease_acquired`, if set, is invoked ONCE, synchronously, immediately after the lease is
@@ -370,6 +376,9 @@ private:
 
     PoolPtr store;
     UInt128 gc_id{};   /// this leader's identity (random u128, never 0)
+    /// Every round-engine log line goes through this logger (see the constructor's `log_` doc
+    /// comment) so multi-disk processes can attribute GC logs to the disk/srid that produced them.
+    LoggerPtr logger;
     uint64_t rebuild_edge_budget_override = 0;   /// tests force tiny batches
     std::function<uint64_t()> now_ms_fn;   /// wall-clock ms; injected (tests), defaults to system_clock
     /// The heartbeat gate's own observation clock —

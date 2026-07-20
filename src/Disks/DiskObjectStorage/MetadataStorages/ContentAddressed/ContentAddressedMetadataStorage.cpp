@@ -431,7 +431,9 @@ Cas::RebuildReport ContentAddressedMetadataStorage::runGcRebuildNow(bool force) 
     /// the lease's observation-window steal protocol): rebuildBaseline does its own lease
     /// acquire/steal check internally and this command runs exactly one round.
     const UInt128 gc_id = (static_cast<UInt128>(thread_local_rng()) << 64) | thread_local_rng();
-    Cas::Gc gc(store(), gc_id);
+    const auto cas_store_snapshot = store();
+    Cas::Gc gc(cas_store_snapshot, gc_id, {}, {},
+        getLogger(fmt::format("CasGc({})", cas_store_snapshot->poolConfig().server_root_id)));
     return gc.rebuildBaseline(force);
 }
 

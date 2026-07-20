@@ -359,6 +359,11 @@ public:
     /// exactly as every key-building method does.
     void validateNamespace(const RootNamespace & ns) const { checkNamespace(ns); }
 
+    /// The pool's root key prefix, i.e. the constructor's `prefix_` verbatim. Exposed for diagnostics
+    /// only (e.g. scoping a free-function's log line to the pool it operates on when no LoggerPtr is
+    /// threaded that deep) -- no key-building method needs this, they already have `prefix` in scope.
+    const String & poolPrefix() const { return prefix; }
+
 private:
     String prefix;
 

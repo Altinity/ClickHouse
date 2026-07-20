@@ -411,9 +411,14 @@ void foldDeltasIntoGeneration(Backend & backend, const Layout & layout,
             /// blob should never be re-referenced) but is reachable under real races.
             /// Spare it LOUDLY — never a fail-closed abort and never a delete of a re-referenced blob.
             if (e.delete_pending)
+                /// No LoggerPtr is threaded this deep (foldDeltasIntoGeneration is a free function
+                /// shared by the non-sharded fold and CasGcShardPlan's per-shard reduce); scope the
+                /// message with the pool's own key prefix instead so a multi-disk process's logs can
+                /// still be attributed.
                 LOG_WARNING(getLogger("CasGcFold"),
-                    "CAS gc fold: a delete_pending retired entry recovered in-degree {} — structurally "
-                    "impossible but reachable under races; sparing (never a fail-closed delete)", indeg);
+                    "CAS gc fold ({}): a delete_pending retired entry recovered in-degree {} — "
+                    "structurally impossible but reachable under races; sparing (never a fail-closed "
+                    "delete)", layout.poolPrefix(), indeg);
             rmr.spared.push_back(e);            /// recovery wins, even past the floor
         }
         else if (e.delete_pending)
