@@ -2731,6 +2731,51 @@ campaign. The CAS gtest battery is green. No CAS action; if pursued, it belongs 
   has happened. This raises the practical severity: an operator hitting this in production cannot
   self-service a fix without a restart, which is a much bigger deal for a single-digit-second S3
   hiccup than "requires an explicit reload."
+- **Proposed fix (not yet implemented — design only):** add a bounded retry-with-backoff around the
+  seal `PUT` itself, inside `CasRefLedger::ensureRefTableRecovered`
+  (`CasRefLedger.cpp:202-410`, the seal block at lines `392-407`):
+  ```cpp
+  CasWriteOutcome outcome{};
+  try
+  {
+      outcome = ref_request_controller->putIfAbsentControlled(
+          layout.refSnapshotKey(ns, seal_id), seal_bytes, fence_ok);
+  }
+  catch (...) { lock.lock(); throw; }
+  lock.lock();
+  if (outcome != CasWriteOutcome::Committed)
+      throwCasWriteRetryLater(fmt::format(
+          "CAS recovery seal PUT for namespace '{}' did not commit; failing recovery closed "
+          "(the table stays unrecovered/non-writable; the next touch restarts recovery and "
+          "re-seals)", ns.string()));
+  ```
+  Rationale for fixing exactly here rather than one layer up (`DatabaseOrdinary`/table-startup
+  code):
+  1. `ensureRefTableRecovered` is the single funnel every `CasRefLedger` touch-point calls first (13
+     call sites: lines 130, 176, 641, 664, 672, 761, 794, 904, 1437, 1445, 1453, 1486, 1864, 1882) —
+     a fix here covers every caller uniformly, not just table-open.
+  2. This exact block already runs OUTSIDE `rt.state_mutex` (unlocked just above at ~line 379,
+     relocked after) specifically so it can "run the full ~90s retry envelope" per the existing
+     comment — extending that envelope with an outer retry loop doesn't newly violate anything;
+     `recovery_in_progress` (not the mutex) already serializes concurrent callers for the SAME
+     table across this whole unlocked window (set/cleared at lines 221-234), so a longer window is
+     still safe, just longer.
+  3. `putIfAbsentControlled` is an idempotent conditional write (`If-None-Match: *`) — safe to call
+     again directly with no extra bookkeeping.
+  4. Not upstream-coupling: the fix lives entirely inside CAS's own file, touches no generic
+     `Database`/`AsyncLoader`/`Replicated` code.
+  - **Open design questions before implementing (why this isn't a 2-line hack):** how many
+    attempts / what backoff curve (this needs to meaningfully outlast a chaos-scale transient, e.g.
+    the ~1-2 minutes `rustfs` took to drain its I/O-queue congestion in this incident, without
+    blocking an `AsyncLoader` worker thread indefinitely if the backend is genuinely, durably
+    down); whether retrying is worth doing given `CasRequestControl`'s OWN internal ~90s S3-retry
+    envelope already ran once and came up empty (does one more layer of retry actually help, or
+    does it just mean waiting ~90s longer for the same outcome when the backend is really down
+    for minutes, not seconds — the answer depends on how long `rustfs`'s specific failure mode
+    (I/O-queue saturation, not a hard outage) typically takes to clear, which this one incident
+    doesn't fully establish); and whether this backoff-retry (against real external I/O flakiness,
+    not a code race) is a legitimate use of a blocking delay in C++ here, distinct from the
+    "never sleep to paper over a race condition" rule.
 - **Soak stack state:** left UP per the run's own failure trap (as designed) — `ch1` up (13min at
   time of writing, `SELECT 1` healthy, `ca_stress` permanently unattachable), `ch2` still
   `Exited (243)`, `rustfs1` up and quiet since `22:15:38`. Awaiting a decision on relaunch (`v12`)
