@@ -415,6 +415,9 @@ void ContentAddressedTransaction::commit(const TransactionCommitOptionsVariant &
     committed = true;
     /// All pending blobs have been uploaded in publishStaging; remove their staging resources now.
     cleanupPendingTempFiles();
+    /// This transaction's unlinkFile ForceFresh-proof memoization is scoped to this transaction only;
+    /// clear it alongside the other per-transaction state resets above.
+    force_fresh_validated_refs.clear();
 }
 
 TransactionCommitOutcomeVariant ContentAddressedTransaction::tryCommit(const TransactionCommitOptionsVariant & options)
@@ -1401,7 +1404,15 @@ void ContentAddressedTransaction::unlinkFile(const std::string & path, bool if_e
         std::erase_if(st.entries, [&](const Cas::ManifestEntry & e) { return e.path == r->file; });
         if (!staged_here)
         {
-            const auto view = metadata_storage.partAccess()->getView(r->refKey(), Cas::Freshness::ForceFresh);
+            /// One mandatory body-HEAD per (transaction, ref), not per file: the MergeTree fast-removal
+            /// path unlinks every file of the part through THIS transaction right before removeDirectory.
+            /// The first unlink re-proves the body ForceFresh; the rest of the burst reuses that proof.
+            const String memo_key = r->refKey().cacheKey();
+            const bool already_proven = force_fresh_validated_refs.contains(memo_key);
+            const auto view = metadata_storage.partAccess()->getView(
+                r->refKey(), already_proven ? Cas::Freshness::CachedForLoad : Cas::Freshness::ForceFresh);
+            if (view && !already_proven)
+                force_fresh_validated_refs.insert(memo_key);
             if (!view || !view->hasFile(r->file))
             {
                 if (if_exists)

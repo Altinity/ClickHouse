@@ -11,6 +11,7 @@
 namespace ProfileEvents
 {
 extern const Event CasRefRepoint;
+extern const Event CasManifestHead;
 }
 
 namespace DB::ErrorCodes
@@ -578,6 +579,50 @@ TEST(CasTransactionRemove, UnlinkStormThenDirDropIsOneRefDrop)
 
     const auto rep = DB::Cas::runFsck(*storage->store(), /*detail*/false);
     EXPECT_EQ(rep.dangling, 0u);
+}
+
+/// Task 22 (URF plan phase 7): the MergeTree fast-removal shape's per-file ForceFresh proof is
+/// memoized per (transaction, ref) in `unlinkFile` — the first unlink's `ForceFresh` `getView` re-proves
+/// the manifest body with one HEAD; the rest of the burst reuses that proof via `CachedForLoad`. This
+/// pins the HEAD-count side of `UnlinkStormThenDirDropIsOneRefDrop` above (which already pins the
+/// repoint count): before this memoization, N unlinks of the same part paid N manifest-body HEADs; now
+/// the whole storm-then-drop transaction pays exactly one.
+TEST(CasTransactionRemove, UnlinkStormMemoizesOneForceFreshHead)
+{
+    auto storage = openTxStorage();
+
+    /// 1. Commit a part with three files.
+    {
+        auto tx = storage->createTransaction();
+        writeFileTx(*tx, "b09/b09b09b0-0909-4909-8909-090909090909/tmp_insert_all_1_1_0/checksums.txt", "cs-bytes");
+        writeFileTx(*tx, "b09/b09b09b0-0909-4909-8909-090909090909/tmp_insert_all_1_1_0/data.bin", "the-data-bytes");
+        writeFileTx(*tx, "b09/b09b09b0-0909-4909-8909-090909090909/tmp_insert_all_1_1_0/txn_version.txt",
+            "creation_tid: (1,1,00000000-0000-0000-0000-000000000000)");
+        tx->moveDirectory("b09/b09b09b0-0909-4909-8909-090909090909/tmp_insert_all_1_1_0", "b09/b09b09b0-0909-4909-8909-090909090909/all_1_1_0");
+        tx->commit(DB::NoCommitOptions{});
+    }
+    ASSERT_TRUE(storage->existsDirectory("b09/b09b09b0-0909-4909-8909-090909090909/all_1_1_0"));
+
+    const uint64_t heads_before = ProfileEvents::global_counters[ProfileEvents::CasManifestHead].load();
+
+    /// 2. The MergeTree fast-removal shape: unlink every file one-by-one, THEN removeDirectory — all
+    /// in ONE transaction (mirrors UnlinkStormThenDirDropIsOneRefDrop above).
+    {
+        auto tx = storage->createTransaction();
+        tx->unlinkFile("b09/b09b09b0-0909-4909-8909-090909090909/all_1_1_0/checksums.txt", /*if_exists=*/false, /*should_remove_objects=*/true);
+        tx->unlinkFile("b09/b09b09b0-0909-4909-8909-090909090909/all_1_1_0/data.bin", /*if_exists=*/false, /*should_remove_objects=*/true);
+        tx->unlinkFile("b09/b09b09b0-0909-4909-8909-090909090909/all_1_1_0/txn_version.txt", /*if_exists=*/false, /*should_remove_objects=*/true);
+        tx->removeDirectory("b09/b09b09b0-0909-4909-8909-090909090909/all_1_1_0");
+        tx->commit(DB::NoCommitOptions{});
+    }
+
+    /// 3. The whole part is gone, and the three-file unlink storm paid exactly ONE manifest-body HEAD
+    /// (the first unlink's ForceFresh proof) — not three. removeDirectory clears the staged removal
+    /// marks, so publishStaging's own (unmemoized) ForceFresh getView never fires for this ref either
+    /// (see UnlinkStormThenDirDropIsOneRefDrop's zero-repoints assertion above).
+    EXPECT_FALSE(storage->existsDirectory("b09/b09b09b0-0909-4909-8909-090909090909/all_1_1_0"));
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasManifestHead].load(), heads_before + 1)
+        << "unlink-storm-then-dir-drop must pay exactly one ForceFresh manifest-body HEAD, not one per file";
 }
 
 /// A create-then-remove of a new part in one transaction must discard both the manifest entries

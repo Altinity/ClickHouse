@@ -13,6 +13,7 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -151,6 +152,13 @@ private:
     std::map<std::pair<std::string, std::string>, PartStaging> parts;
     bool committed = false;
     bool failed = false;
+
+    /// Memoizes, per (this transaction, ref), whether `unlinkFile` has already re-proven a committed
+    /// ref's manifest body `ForceFresh`. The MergeTree fast-removal path unlinks every file of a part
+    /// through ONE transaction right before `removeDirectory`: the first unlink's `ForceFresh` view
+    /// proves the body once; the rest of the burst reuse that proof (`Cas::Freshness::CachedForLoad`)
+    /// instead of paying one manifest-body HEAD per file. Cleared in `commit()`'s epilogue.
+    std::unordered_set<String> force_fresh_validated_refs;
 
     /// Stage a CONTENT part file as a blob: record the pending upload + a tokenless dependency
     /// and add/replace its manifest entry. Shared by the streaming-blob path
