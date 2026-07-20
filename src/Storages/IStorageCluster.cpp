@@ -366,9 +366,12 @@ IStorageCluster::ResolvedClusterRead IStorageCluster::resolveClusterRead(Context
     ///   -> read locally (fallback_to_pure).
     /// - s3Cluster(...)/explicit *Cluster argument -> never fall back locally.
     /// - object_storage_remote_initiator=1 with object_storage_remote_initiator_cluster set
-    ///   -> defer object_storage_cluster resolution; send pure s3()/iceberg() to the remote initiator.
+    ///   -> defer object_storage_cluster resolution; send pure s3()/iceberg() to the remote initiator
+    ///     for alternative syntax, or when the local cluster name is empty (ENGINE without object_storage_cluster).
     /// - object_storage_remote_initiator=1 with only object_storage_cluster (no remote_initiator_cluster)
     ///   -> clustered remote path: default initiator cluster to object_storage_cluster, send *Cluster.
+    /// - ENGINE/Iceberg with a local object_storage_cluster + remote_initiator_cluster
+    ///   -> clustered remote path (send *Cluster to the remote initiator).
     /// - writes -> never apply local fallback (see write()).
     ResolvedClusterRead result;
 
@@ -389,7 +392,8 @@ IStorageCluster::ResolvedClusterRead IStorageCluster::resolveClusterRead(Context
         && !settings[Setting::object_storage_remote_initiator_cluster].value.empty();
 
     if (defer_object_storage_cluster_resolution)
-        result.fallback_to_pure = usePureFunctionForRemoteInitiator(context);
+        result.fallback_to_pure
+            = cluster_name_from_settings.empty() || usePureFunctionForRemoteInitiator(context);
     else
         result.fallback_to_pure = cluster_name_from_settings.empty();
 

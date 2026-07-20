@@ -1734,6 +1734,44 @@ def test_object_storage_remote_initiator_without_cluster_function(started_cluste
     assert users[0] in ["c2.s0_0_0\tdefault", "c2.s0_0_1\tdefault"]
     assert users[1:] == ["s0_0_0\tdefault"]
 
+    # ENGINE table without object_storage_cluster must also take the pure remote path.
+    node.query("DROP TABLE IF EXISTS engine_remote_initiator_no_cluster")
+    node.query(
+        f"""
+        CREATE TABLE engine_remote_initiator_no_cluster
+            (name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64))))
+            ENGINE=S3('http://minio1:9001/root/data/{{clickhouse,database}}/*', 'minio', '{minio_secret_key}', 'CSV')
+        """
+    )
+
+    query_id = uuid.uuid4().hex
+    result = node.query(
+        """
+        SELECT * FROM engine_remote_initiator_no_cluster ORDER BY (name, value, polygon)
+        SETTINGS
+            object_storage_remote_initiator=1,
+            object_storage_remote_initiator_cluster='cluster_with_dots'
+        """,
+        query_id=query_id,
+    )
+
+    assert result is not None
+
+    node.query("SYSTEM FLUSH LOGS ON CLUSTER 'cluster_all'")
+    queries = node.query(
+        f"""
+        SELECT count()
+            FROM clusterAllReplicas('cluster_all', system.query_log)
+            WHERE type='QueryFinish' AND initial_query_id='{query_id}'
+            FORMAT TSV
+        """
+    ).splitlines()
+
+    # initial node + remote initiator
+    assert queries == ["2"]
+
+    node.query("DROP TABLE IF EXISTS engine_remote_initiator_no_cluster")
+
     # Remove initiator without cluster request
     # but with `object_storage_cluster` specified for user on remote cluster
     query_id = uuid.uuid4().hex
