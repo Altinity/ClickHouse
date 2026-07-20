@@ -15,6 +15,12 @@
 
 namespace Poco::Util { class AbstractConfiguration; }
 
+namespace DB
+{
+class IDisk;
+using DiskPtr = std::shared_ptr<IDisk>;
+}
+
 namespace DB::Cas
 {
 
@@ -115,6 +121,14 @@ public:
     /// non-negative integer number of seconds; malformed input and unknown modes throw
     /// `BAD_ARGUMENTS` instead of silently selecting a policy.
     static Cas::PartFolderValidate parsePartFolderValidate(const Poco::Util::AbstractConfiguration & config, const std::string & config_prefix);
+
+    /// Returns the content-addressed metadata storage backing `disk`, or nullptr if `disk` is not
+    /// content-addressed. Plain (non-object-storage) disks do not implement `getMetadataStorage` at
+    /// all and throw `NOT_IMPLEMENTED`; that is treated as "not content-addressed" rather than
+    /// propagated. Any other exception from `getMetadataStorage` is rethrown. Centralizes the
+    /// detection lambda duplicated across `InterpreterSystemQuery` and
+    /// `StorageSystemContentAddressedMounts`; callers there have not yet been migrated to it.
+    static ContentAddressedMetadataStorage * tryFromDisk(const DiskPtr & disk);
 
     /// Runs one synchronous GC round for tests and diagnostics. If the scheduler is not running,
     /// this lazily creates one so repeated calls retain the same lease-observation history.

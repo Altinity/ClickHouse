@@ -119,6 +119,7 @@ Cas::RoundReport CasGcScheduler::runRoundLogged(Cas::Gc & round_gc, GcRoundLogRe
     start.event_type = Rec::EventType::Start;
     start.trigger = trigger;
     start.disk_name = disk_name;
+    start.srid = store->poolConfig().server_root_id;
     start.gc_id = Cas::u128ToHex(gc_id);
     emit(start);
 

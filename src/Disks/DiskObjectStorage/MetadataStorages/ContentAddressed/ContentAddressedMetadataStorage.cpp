@@ -7,6 +7,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasProbe.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/StaticDirectoryIterator.h>
+#include <Disks/IDisk.h>
 #include <IO/ReadBufferFromFileView.h>
 #include <IO/ReadBufferFromMemory.h>
 #include <IO/ReadHelpers.h>
@@ -41,6 +42,7 @@ namespace ErrorCodes
     extern const int BAD_ARGUMENTS;
     extern const int ABORTED;
     extern const int NETWORK_ERROR;
+    extern const int NOT_IMPLEMENTED;
 }
 
 namespace
@@ -218,6 +220,24 @@ Cas::PartFolderValidate ContentAddressedMetadataStorage::parsePartFolderValidate
         "Unknown part_folder_validate value '{}' (expected 'always', 'never', or 'age <non-negative integer seconds>')", value);
 }
 
+ContentAddressedMetadataStorage * ContentAddressedMetadataStorage::tryFromDisk(const DiskPtr & disk)
+{
+    MetadataStoragePtr md;
+    try
+    {
+        md = disk->getMetadataStorage();
+    }
+    catch (const Exception & e)
+    {
+        if (e.code() == ErrorCodes::NOT_IMPLEMENTED)
+            return nullptr;
+        throw;
+    }
+    if (!md || !md->isContentAddressed())
+        return nullptr;
+    return dynamic_cast<ContentAddressedMetadataStorage *>(md.get());
+}
+
 void ContentAddressedMetadataStorage::runOneGcRoundForTest()
 {
     /// The pacing scheduler must be STABLE across calls: the lease's observation-window steal
@@ -290,6 +310,7 @@ Cas::GcRoundLogger ContentAddressedMetadataStorage::makeGcRoundLogger() const
             ? ContentAddressedGarbageCollectionLogElement::START
             : ContentAddressedGarbageCollectionLogElement::FINISH;
         e.disk_name = r.disk_name.empty() ? disk : r.disk_name;
+        e.srid = r.srid;
         e.gc_id = r.gc_id;
         e.trigger = r.trigger == Cas::GcRoundLogRecord::Trigger::Manual
             ? ContentAddressedGarbageCollectionLogElement::MANUAL

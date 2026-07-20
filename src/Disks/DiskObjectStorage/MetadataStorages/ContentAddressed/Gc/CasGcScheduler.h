@@ -27,6 +27,7 @@ struct GcRoundLogRecord
     Outcome outcome = Outcome::Unknown;   /// Unknown until a round finishes
     Trigger trigger = Trigger::Scheduled;
     String disk_name;
+    String srid;          /// server_root_id of the mount that ran this round (this pool's poolConfig())
     String gc_id;        /// hex of the scheduler's gc_id
     UInt64 round = 0;
     UInt64 candidates_marked = 0;

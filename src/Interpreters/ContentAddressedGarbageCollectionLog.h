@@ -18,6 +18,7 @@ struct ContentAddressedGarbageCollectionLogElement
 
     EventType event_type = START;
     String disk_name;
+    String srid;         /// server_root_id of the mount whose GC scheduler ran this round
     String gc_id;
     Trigger trigger = SCHEDULED;
 
