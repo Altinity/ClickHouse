@@ -127,7 +127,6 @@ namespace Setting
     extern const SettingsString parallel_replicas_custom_key;
     extern const SettingsUInt64 parallel_replicas_min_number_of_rows_per_replica;
     extern const SettingsBool query_plan_enable_multithreading_after_window_functions;
-    extern const SettingsBool serialize_query_plan;
     extern const SettingsBool throw_on_unsupported_query_inside_transaction;
     extern const SettingsFloat totals_auto_threshold;
     extern const SettingsTotalsMode totals_mode;
@@ -1577,16 +1576,16 @@ void Planner::buildPlanForQueryNode()
     /// but on followers the rewritten `SELECT` uses fully qualified names and the follower's current
     /// database is the initiator's user-default DB, so the filter match is unreliable. Rather than
     /// patch the match (which differs case by case), disable the combination on the analyzer path.
-    /// With `serialize_query_plan` the initiator lowers `additional_table_filters` into an explicit
-    /// `FilterStep` and ships the serialized plan, so the follower never re-resolves the setting —
-    /// the combination works there and the check is skipped.
+    /// Upstream `serialize_query_plan=1` is exempt because the initiator lowers the filter into an
+    /// explicit `FilterStep` and ships the serialized plan, but in 25.8 parallel-replicas followers
+    /// always receive the rewritten AST (see ReadFromParallelRemoteReplicasStep), so the setting
+    /// does not help here and the check applies unconditionally.
     if (query_context->canUseParallelReplicasOnInitiator()
-        && !settings[Setting::serialize_query_plan]
         && !settings[Setting::additional_table_filters].value.empty())
     {
         if (settings[Setting::allow_experimental_parallel_reading_from_replicas] >= 2)
             throw Exception(ErrorCodes::SUPPORT_IS_DISABLED,
-                "additional_table_filters is not supported with parallel and without serialize_query_plan=1");
+                "additional_table_filters is not supported with parallel replicas");
 
         auto & mutable_context = planner_context->getMutableQueryContext();
         mutable_context->setSetting("allow_experimental_parallel_reading_from_replicas", Field(0));

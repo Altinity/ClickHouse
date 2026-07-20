@@ -45,9 +45,10 @@ SELECT count() FROM atf_p SETTINGS additional_table_filters = {'atf_p': 'x <= 2'
     parallel_replicas_local_plan = 1,
     serialize_query_plan = 0;
 
--- With `serialize_query_plan = 1` the initiator lowers the additional filter into an
--- explicit `FilterStep` and ships the serialized plan, so the follower never
--- re-resolves the setting and the combination works.
+-- Upstream `serialize_query_plan = 1` makes the combination work (the initiator lowers the
+-- additional filter into an explicit `FilterStep` and ships the serialized plan), but in 25.8
+-- parallel-replicas followers always receive the rewritten AST, so the setting does not help
+-- and the combination is rejected as well.
 SYSTEM ENABLE FAILPOINT parallel_replicas_wait_for_unused_replicas;
 SELECT count() FROM atf_p SETTINGS additional_table_filters = {'atf_p': 'x <= 2'},
     enable_analyzer = 1,
@@ -56,7 +57,7 @@ SELECT count() FROM atf_p SETTINGS additional_table_filters = {'atf_p': 'x <= 2'
     cluster_for_parallel_replicas = 'test_cluster_one_shard_three_replicas_localhost',
     parallel_replicas_for_non_replicated_merge_tree = 1,
     parallel_replicas_local_plan = 1,
-    serialize_query_plan = 1;
+    serialize_query_plan = 1; -- { serverError SUPPORT_IS_DISABLED }
 
 SYSTEM DISABLE FAILPOINT parallel_replicas_wait_for_unused_replicas;
 DROP TABLE atf_p;
