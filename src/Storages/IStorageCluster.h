@@ -115,7 +115,7 @@ protected:
     {
         /// True when read() should use readFallBackToPure() or remote-initiator fallback branch.
         bool fallback_to_pure = false;
-        /// Pre-resolved object-storage cluster when object_storage_cluster_fallback_to_local_if_empty prefetch was done.
+        /// Pre-resolved object-storage cluster when local-fallback prefetch was done.
         ClusterPtr object_storage_cluster;
         /// Resolved remote-initiator cluster when object_storage_remote_initiator is enabled in fallback branch.
         ClusterPtr remote_initiator_cluster;
@@ -123,8 +123,12 @@ protected:
 
     ResolvedClusterRead resolveClusterRead(ContextPtr context) const;
 
-    /// Apply object_storage_cluster_fallback_to_local_if_empty only for storages that take cluster name from the setting.
-    virtual bool useObjectStorageClusterFallbackIfEmpty(ContextPtr /* context */) const { return false; }
+    /// Storage policy: may apply object_storage_cluster_fallback_to_local_if_empty.
+    /// True for alternative syntax / table engine settings; false for explicit *Cluster(...).
+    virtual bool allowsLocalFallbackOnEmptyObjectStorageCluster(ContextPtr /* context */) const { return false; }
+
+    /// Setting enabled and storage allows local fallback on empty/unknown object_storage_cluster.
+    bool shouldFallbackToLocalOnEmptyCluster(ContextPtr context) const;
 
     /// True for s3()/iceberg() alternative syntax (cluster name from object_storage_cluster setting, not *Cluster argument).
     virtual bool usePureFunctionForRemoteInitiator(ContextPtr /* context */) const { return false; }

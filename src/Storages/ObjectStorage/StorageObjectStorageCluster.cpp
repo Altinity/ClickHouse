@@ -45,7 +45,6 @@ namespace Setting
     extern const SettingsInt64 delta_lake_snapshot_end_version;
     extern const SettingsUInt64 lock_object_storage_task_distribution_ms;
     extern const SettingsBool allow_experimental_iceberg_read_optimization;
-    extern const SettingsBool object_storage_cluster_fallback_to_local_if_empty;
 }
 
 namespace ErrorCodes
@@ -742,11 +741,8 @@ String StorageObjectStorageCluster::getClusterName(ContextPtr context) const
     return getOriginalClusterName();
 }
 
-bool StorageObjectStorageCluster::useObjectStorageClusterFallbackIfEmpty(ContextPtr context) const
+bool StorageObjectStorageCluster::allowsLocalFallbackOnEmptyObjectStorageCluster(ContextPtr context) const
 {
-    if (!context->getSettingsRef()[Setting::object_storage_cluster_fallback_to_local_if_empty])
-        return false;
-
     if (cluster_name_from_function_argument)
         return false;
 
@@ -773,7 +769,7 @@ QueryProcessingStage::Enum StorageObjectStorageCluster::getQueryProcessingStage(
         {
             if (!resolved.remote_initiator_cluster)
             {
-                if (!settings[Setting::object_storage_cluster_fallback_to_local_if_empty])
+                if (!shouldFallbackToLocalOnEmptyCluster(context))
                     throw Exception(ErrorCodes::BAD_ARGUMENTS,
                         "Setting 'object_storage_remote_initiator' can be used only with 'object_storage_remote_initiator_cluster', 'object_storage_cluster', or cluster name in arguments");
 

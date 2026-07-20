@@ -353,8 +353,21 @@ void IStorageCluster::updateQueryWithJoinToSendIfNeeded(
     }
 }
 
+bool IStorageCluster::shouldFallbackToLocalOnEmptyCluster(ContextPtr context) const
+{
+    return context->getSettingsRef()[Setting::object_storage_cluster_fallback_to_local_if_empty]
+        && allowsLocalFallbackOnEmptyObjectStorageCluster(context);
+}
+
 IStorageCluster::ResolvedClusterRead IStorageCluster::resolveClusterRead(ContextPtr context) const
 {
+    /// Decision matrix for object_storage_cluster_fallback_to_local_if_empty:
+    /// - s3()/iceberg() (or ENGINE ... SETTINGS object_storage_cluster) + empty/unknown cluster + setting
+    ///   -> read locally (fallback_to_pure).
+    /// - s3Cluster(...)/explicit *Cluster argument -> never fall back locally.
+    /// - object_storage_remote_initiator=1 with object_storage_remote_initiator_cluster set
+    ///   -> defer object_storage_cluster resolution to the remote initiator.
+    /// - writes -> never apply this fallback (see write()).
     ResolvedClusterRead result;
 
     if (!isClusterSupported())
@@ -365,6 +378,7 @@ IStorageCluster::ResolvedClusterRead IStorageCluster::resolveClusterRead(Context
 
     auto cluster_name_from_settings = getClusterName(context);
     const auto & settings = context->getSettingsRef();
+    const bool local_fallback = shouldFallbackToLocalOnEmptyCluster(context);
 
     /// When both remote-initiator settings are set, object_storage_cluster may be defined only on the remote node.
     /// In this case object_storage_cluster must not be resolved locally.
@@ -377,9 +391,12 @@ IStorageCluster::ResolvedClusterRead IStorageCluster::resolveClusterRead(Context
     else
         result.fallback_to_pure = cluster_name_from_settings.empty();
 
-    if (!defer_object_storage_cluster_resolution
+    const bool try_resolve_with_local_fallback
+        = !defer_object_storage_cluster_resolution
         && !result.fallback_to_pure
-        && useObjectStorageClusterFallbackIfEmpty(context))
+        && local_fallback;
+
+    if (try_resolve_with_local_fallback)
     {
         result.object_storage_cluster = getClusterImpl(
             context,
@@ -395,7 +412,8 @@ IStorageCluster::ResolvedClusterRead IStorageCluster::resolveClusterRead(Context
         auto remote_initiator_cluster_name = settings[Setting::object_storage_remote_initiator_cluster].value;
         if (!remote_initiator_cluster_name.empty())
         {
-            const bool allow_null = settings[Setting::object_storage_cluster_fallback_to_local_if_empty]
+            /// Allow a missing remote-initiator cluster only when we would fall back to a pure/local read anyway.
+            const bool allow_null = local_fallback
                 && (result.fallback_to_pure || usePureFunctionForRemoteInitiator(context));
             result.remote_initiator_cluster = getClusterImpl(
                 context,
@@ -441,7 +459,7 @@ void IStorageCluster::read(
         {
             if (!resolved.remote_initiator_cluster)
             {
-                if (settings[Setting::object_storage_cluster_fallback_to_local_if_empty])
+                if (shouldFallbackToLocalOnEmptyCluster(context))
                 {
                     readFallBackToPure(query_plan, column_names, storage_snapshot, query_info, context, processed_stage, max_block_size, num_streams);
                     return;

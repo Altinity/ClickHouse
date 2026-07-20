@@ -203,7 +203,7 @@ private:
         ContextPtr context,
         bool async_insert) override;
 
-    bool useObjectStorageClusterFallbackIfEmpty(ContextPtr context) const override;
+    bool allowsLocalFallbackOnEmptyObjectStorageCluster(ContextPtr context) const override;
 
     bool usePureFunctionForRemoteInitiator(ContextPtr /* context */) const override { return cluster_name_in_settings; }
 
