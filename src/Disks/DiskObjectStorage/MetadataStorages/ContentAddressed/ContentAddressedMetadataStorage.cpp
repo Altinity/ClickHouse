@@ -183,10 +183,8 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
 {
 }
 
-Cas::StagingBackend ContentAddressedMetadataStorage::parseStagingBackend(
-    const Poco::Util::AbstractConfiguration & config, const std::string & config_prefix)
+Cas::StagingBackend ContentAddressedMetadataStorage::parseStagingBackend(const std::string & value)
 {
-    const std::string value = config.getString(config_prefix + ".staging_backend", "local");
     if (value == "local")
         return Cas::StagingBackend::Local;
     if (value == "s3")
@@ -195,11 +193,15 @@ Cas::StagingBackend ContentAddressedMetadataStorage::parseStagingBackend(
         "Unknown staging_backend value '{}' (expected 'local' or 's3')", value);
 }
 
-Cas::PartFolderValidate ContentAddressedMetadataStorage::parsePartFolderValidate(
+Cas::StagingBackend ContentAddressedMetadataStorage::parseStagingBackend(
     const Poco::Util::AbstractConfiguration & config, const std::string & config_prefix)
 {
+    return parseStagingBackend(config.getString(config_prefix + ".staging_backend", "local"));
+}
+
+Cas::PartFolderValidate ContentAddressedMetadataStorage::parsePartFolderValidate(const std::string & value)
+{
     using PartFolderValidate = Cas::PartFolderValidate;
-    const std::string value = config.getString(config_prefix + ".part_folder_validate", "always");
     if (value == "always")
         return {PartFolderValidate::Mode::Always, 0};
     if (value == "never")
@@ -218,6 +220,12 @@ Cas::PartFolderValidate ContentAddressedMetadataStorage::parsePartFolderValidate
     }
     throw Exception(ErrorCodes::BAD_ARGUMENTS,
         "Unknown part_folder_validate value '{}' (expected 'always', 'never', or 'age <non-negative integer seconds>')", value);
+}
+
+Cas::PartFolderValidate ContentAddressedMetadataStorage::parsePartFolderValidate(
+    const Poco::Util::AbstractConfiguration & config, const std::string & config_prefix)
+{
+    return parsePartFolderValidate(config.getString(config_prefix + ".part_folder_validate", "always"));
 }
 
 ContentAddressedMetadataStorage * ContentAddressedMetadataStorage::tryFromDisk(const DiskPtr & disk)

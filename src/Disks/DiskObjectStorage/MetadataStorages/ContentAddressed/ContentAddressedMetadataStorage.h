@@ -113,13 +113,21 @@ public:
         /// default `Mode::Always` retains the strict validation behavior used by existing callers.
         Cas::PartFolderValidate part_folder_validate_ = {});
 
-    /// Parses `staging_backend`, defaulting to `local`. Throws `BAD_ARGUMENTS` for an unrecognized
+    /// Parses a `staging_backend` value (`local` | `s3`). Throws `BAD_ARGUMENTS` for an unrecognized
     /// value rather than silently selecting a backend.
+    static Cas::StagingBackend parseStagingBackend(const std::string & value);
+
+    /// Reads `staging_backend` from `config`, defaulting to `local`, and parses it. Kept only as a
+    /// thin wrapper around the string-taking overload for callers that still hold a config reference.
     static Cas::StagingBackend parseStagingBackend(const Poco::Util::AbstractConfiguration & config, const std::string & config_prefix);
 
-    /// Parses `part_folder_validate`, defaulting to `always`. The `age` form accepts only a
-    /// non-negative integer number of seconds; malformed input and unknown modes throw
+    /// Parses a `part_folder_validate` value (`always` | `never` | `age <seconds>`). The `age` form
+    /// accepts only a non-negative integer number of seconds; malformed input and unknown modes throw
     /// `BAD_ARGUMENTS` instead of silently selecting a policy.
+    static Cas::PartFolderValidate parsePartFolderValidate(const std::string & value);
+
+    /// Reads `part_folder_validate` from `config`, defaulting to `always`, and parses it. Kept only as
+    /// a thin wrapper around the string-taking overload for callers that still hold a config reference.
     static Cas::PartFolderValidate parsePartFolderValidate(const Poco::Util::AbstractConfiguration & config, const std::string & config_prefix);
 
     /// Returns the content-addressed metadata storage backing `disk`, or nullptr if `disk` is not
