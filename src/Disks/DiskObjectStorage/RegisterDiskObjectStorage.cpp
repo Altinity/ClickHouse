@@ -6,11 +6,18 @@
 #include <Disks/ReadOnlyDiskWrapper.h>
 #include <Disks/DiskFactory.h>
 #include <Disks/IDisk.h>
+#include <Common/Exception.h>
+#include <base/EnumReflection.h>
 
 #include <fmt/ranges.h>
 
 namespace DB
 {
+
+namespace ErrorCodes
+{
+    extern const int BAD_ARGUMENTS;
+}
 
 void registerObjectStorages();
 void registerMetadataStorages();
@@ -84,6 +91,13 @@ void registerDiskObjectStorage(DiskFactory & factory, bool global_skip_access_ch
         const auto metadata_type = metadata_storage->getType();
         const bool needs_real_transaction = metadata_type == MetadataStorageType::Keeper
             || metadata_type == MetadataStorageType::ContentAddressed;
+        /// An explicit `use_fake_transaction=true` on a metadata type that requires deferred
+        /// transactions would silently break the atomic manifest/ref publish (per-file autocommit,
+        /// no commit point). Reject it instead of honoring it.
+        if (needs_real_transaction && config.getBool(config_prefix + ".use_fake_transaction", false))
+            throw Exception(ErrorCodes::BAD_ARGUMENTS,
+                "Disk '{}': `use_fake_transaction` cannot be enabled for metadata type '{}'",
+                name, magic_enum::enum_name(metadata_type));
         bool use_fake_transaction = config.getBool(config_prefix + ".use_fake_transaction", !needs_real_transaction);
         DiskPtr disk = std::make_shared<DiskObjectStorage>(
             name,
