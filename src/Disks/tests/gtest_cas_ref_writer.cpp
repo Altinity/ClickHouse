@@ -36,6 +36,7 @@ extern const int FILE_DOESNT_EXIST;
 extern const int CORRUPTED_DATA;
 extern const int LOGICAL_ERROR;
 extern const int NETWORK_ERROR;
+extern const int S3_ERROR;
 }
 
 namespace ProfileEvents
@@ -196,6 +197,21 @@ public:
     String corrupt_key_substr;
     int corrupt_count = 0;
     String corrupt_foreign_bytes;
+
+    /// Force the recovery namespace LIST to throw a transient object-store error (S3_ERROR) a bounded
+    /// number of times -- exercises Layer 1's transient-retry over the LIST leg of recovery (not just
+    /// the seal PUT). Mirrors what a real object-storage backend surfaces for a network/throttle blip.
+    int list_fault_count = 0;
+
+    ListPage list(const String & prefix, const String & cursor, size_t limit) override
+    {
+        if (list_fault_count > 0)
+        {
+            --list_fault_count;
+            throw DB::Exception(DB::ErrorCodes::S3_ERROR, "RefWriterTestBackend: simulated transient LIST failure");
+        }
+        return CountingBackend::list(prefix, cursor, limit);
+    }
 
     std::optional<GetResult> get(const String & key, Range range) override
     {
@@ -3280,6 +3296,47 @@ TEST(RefWriterRecoveryRetry, TransientSealFailureIsRetriedThenSucceeds)
     EXPECT_EQ(global_counters[ProfileEvents::CasRefRecoverySealPublished].load(), sealed_before + 1);
 }
 
+TEST(RefWriterRecoveryRetry, TransientListFailureIsRetriedThenSucceeds)
+{
+    /// The recovery namespace LIST (not just the seal PUT) fails transiently. LIST/GET call the backend
+    /// directly and surface a raw S3_ERROR, NOT the NETWORK_ERROR the seal controller mints -- this test
+    /// guards that Layer 1's transient classifier covers the LIST leg (the path the motivating stuck-load
+    /// incident actually hit), not only the seal PUT.
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/retry_list"};
+
+    seedSealFixtureDeadEpochs(*backend, layout, ns);
+    seedUncleanPredecessorMount(*backend, layout, /*epoch=*/2);
+
+    uint64_t fake_now = 1'000'000;
+
+    PoolConfig config;
+    config.server_id = UInt128(1);
+    config.mount_lease_ttl_ms = std::chrono::milliseconds(500);
+    config.cas_request_budget = sealTestTinyBudget();
+    config.cas_request_budget.recovery_retry_budget_ms = 120000;
+    config.materialization_grace_ms = 1000;
+    config.boot_ms_fn = [&fake_now] { return fake_now; };
+    config.wait_sleep_fn = [](uint64_t) {};
+    auto store = openPoolWithConfig(backend, config);
+    ASSERT_TRUE(store);
+    ASSERT_EQ(store->liveWriterEpoch(), 3u);
+
+    store->setCasRetrySleepForTest([](uint64_t) {});
+
+    /// Fail the recovery LIST twice with a transient S3_ERROR; the third attempt lists cleanly and seals.
+    backend->list_fault_count = 2;
+
+    using ProfileEvents::global_counters;
+    const auto retries_before = global_counters[ProfileEvents::CasRefRecoveryRetries].load();
+    const auto sealed_before = global_counters[ProfileEvents::CasRefRecoverySealPublished].load();
+
+    EXPECT_EQ(store->listRefs(ns).size(), 2u) << "recovery must retry past the transient LIST failures";
+    EXPECT_EQ(global_counters[ProfileEvents::CasRefRecoveryRetries].load(), retries_before + 2);
+    EXPECT_EQ(global_counters[ProfileEvents::CasRefRecoverySealPublished].load(), sealed_before + 1);
+}
+
 TEST(RefWriterRecoveryRetry, TransientFailureLongerThanBudgetPropagates)
 {
     auto backend = std::make_shared<RefWriterTestBackend>();
@@ -3383,6 +3440,49 @@ TEST(RefWriterRecoveryRetry, VanishBrakeStaysTerminalNotRetried)
     EXPECT_EQ(global_counters[ProfileEvents::CasRefRecoveryRetries].load(), retries_before)
         << "the vanish-race brake is terminal; the outer transient-retry loop must NOT re-drive it";
     EXPECT_EQ(sleep_calls, 0u) << "no backoff sleep for the terminal vanish brake";
+}
+
+TEST(RefWriterRecoveryRetry, ThrowingBackoffSleepDoesNotWedgeRecovery)
+{
+    /// If the backoff sleep itself throws (e.g. a clock syscall failure), the retry loop must re-acquire
+    /// state_mutex before unwinding so the SCOPE_EXIT that clears `recovery_in_progress` runs LOCKED --
+    /// otherwise a later touch would hang forever on the never-cleared flag. This drives that path and
+    /// then proves a second touch can still recover (the lane is not wedged).
+    auto backend = std::make_shared<RefWriterTestBackend>();
+    const Layout layout("p");
+    const RootNamespace ns{"srv1/retry_sleep_throw"};
+
+    seedSealFixtureDeadEpochs(*backend, layout, ns);
+    seedUncleanPredecessorMount(*backend, layout, /*epoch=*/2);
+
+    PoolConfig config;
+    config.server_id = UInt128(1);
+    config.mount_lease_ttl_ms = std::chrono::milliseconds(500);
+    config.cas_request_budget = sealTestTinyBudget();
+    config.cas_request_budget.recovery_retry_budget_ms = 120000;
+    config.materialization_grace_ms = 1000;
+    config.wait_sleep_fn = [](uint64_t) {};
+    auto store = openPoolWithConfig(backend, config);
+    ASSERT_TRUE(store);
+
+    /// First touch: the seal PUT fails transiently -> the loop enters backoff -> the sleep THROWS.
+    bool sleep_should_throw = true;
+    store->setCasRetrySleepForTest([&sleep_should_throw](uint64_t)
+    {
+        if (sleep_should_throw)
+            throw std::runtime_error("injected backoff-sleep failure");
+    });
+    const RefTxnId seal_id{2, UINT64_MAX};
+    backend->fault_key_substr = layout.refSnapshotKey(ns, seal_id);
+    backend->fault_count = 1;
+
+    EXPECT_ANY_THROW(store->listRefs(ns));   /// the sleep failure propagates
+
+    /// The lane must NOT be wedged: with the fault now spent and the sleep no longer throwing, a second
+    /// touch recovers cleanly. If recovery_in_progress had leaked (SCOPE_EXIT run unlocked / not run), a
+    /// concurrent-safe second recovery would deadlock or mis-behave.
+    sleep_should_throw = false;
+    EXPECT_EQ(store->listRefs(ns).size(), 2u) << "a second touch must recover; the retry lane is not wedged";
 }
 
 /// ===================================================================================

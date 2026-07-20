@@ -25,6 +25,11 @@ namespace ErrorCodes
     extern const int LIMIT_EXCEEDED;
     extern const int LOGICAL_ERROR;
     extern const int NETWORK_ERROR;
+    extern const int S3_ERROR;
+    extern const int POCO_EXCEPTION;
+    extern const int SOCKET_TIMEOUT;
+    extern const int CANNOT_READ_FROM_SOCKET;
+    extern const int TIMEOUT_EXCEEDED;
 }
 }
 
@@ -52,6 +57,27 @@ namespace ProfileEvents
 
 namespace DB::Cas
 {
+
+namespace
+{
+/// Classifies whether an exception thrown out of a ref-table recovery attempt (namespace LIST,
+/// snapshot/log GETs, or the seal PUT) is a TRANSIENT object-store transport failure worth retrying,
+/// vs. a terminal condition (corruption, decode failure, logic error, resource limit) that must fail
+/// fast. The recovery reads call the backend directly (not through `ref_request_controller`), so a
+/// transient blip surfaces as the object storage's native code -- `S3_ERROR` for the S3 backend, or a
+/// socket/timeout/Poco transport code -- NOT the `NETWORK_ERROR` that only the seal PUT's controller
+/// re-mints. Retrying only `NETWORK_ERROR` would leave the LIST/GET legs unprotected, which is exactly
+/// the path the motivating stuck-load incident hit.
+bool isTransientRecoveryError(int code)
+{
+    return code == ErrorCodes::NETWORK_ERROR
+        || code == ErrorCodes::S3_ERROR
+        || code == ErrorCodes::POCO_EXCEPTION
+        || code == ErrorCodes::SOCKET_TIMEOUT
+        || code == ErrorCodes::CANNOT_READ_FROM_SOCKET
+        || code == ErrorCodes::TIMEOUT_EXCEEDED;
+}
+}
 
 CasRefLedger::CasRefLedger(
     BackendPtr backend_ptr,
@@ -277,11 +303,13 @@ void CasRefLedger::ensureRefTableRecovered(const RootNamespace & ns, RefTableRun
     });
 
     /// Outer transient-retry loop (Layer 1 of the stuck-table-load fix): a whole recovery attempt
-    /// (LIST + snapshot/log GETs + seal PUT) that fails with a TRANSIENT object-store `NETWORK_ERROR`
-    /// is retried with capped-exponential backoff until `recovery_retry_budget_ms` is spent, instead of
-    /// propagating and failing this table's async load permanently. Non-transient errors fail fast; so
-    /// does the inner vanish-race brake below (which is `NETWORK_ERROR` too but DELIBERATELY terminal --
-    /// the `vanish_brake_tripped` latch keeps the outer loop from re-driving it).
+    /// (LIST + snapshot/log GETs + seal PUT) that fails with a TRANSIENT object-store transport error
+    /// (`isTransientRecoveryError` -- `S3_ERROR`/socket/timeout from the direct LIST/GET backend calls,
+    /// or the seal PUT's controller `NETWORK_ERROR`) is retried with capped-exponential backoff until
+    /// `recovery_retry_budget_ms` is spent, instead of propagating and failing this table's async load
+    /// permanently. Non-transient errors (corruption, decode, logic, resource limits) fail fast; so does
+    /// the inner vanish-race brake below (which is `NETWORK_ERROR` too but DELIBERATELY terminal -- the
+    /// `vanish_brake_tripped` latch keeps the outer loop from re-driving it).
     const uint64_t recovery_start_ms = boot_ms_now_fn();
     uint64_t recovery_retry_num = 0;
     bool vanish_brake_tripped = false;
@@ -509,29 +537,62 @@ void CasRefLedger::ensureRefTableRecovered(const RootNamespace & ns, RefTableRun
             }
             break;   /// recovery succeeded -> exit the outer retry loop
         }
-        catch (const Exception & e)
+        catch (...)
         {
-            if (e.code() != ErrorCodes::NETWORK_ERROR || vanish_brake_tripped)
-                throw;   /// not a transient object-store failure (or the terminal vanish brake) -- fail fast
+            /// `catch (...)`, not `catch (const Exception &)`: recovery LIST/GET failures can surface as
+            /// a raw object-storage transport exception (even a non-`DB::Exception` Poco timeout), which
+            /// a `catch (const Exception &)` would not even see. `getCurrentExceptionCode()` normalises
+            /// every exception (DB, Poco, std) to a code so the transient classifier can decide.
+            const int code = getCurrentExceptionCode();
+            if (vanish_brake_tripped || !isTransientRecoveryError(code))
+                throw;   /// the terminal vanish brake, or a non-transient failure -- fail fast
 
             const uint64_t elapsed_ms = boot_ms_now_fn() - recovery_start_ms;
-            if (elapsed_ms >= cas_request_budget.recovery_retry_budget_ms || !fence_ok_fn())
-                throw;   /// budget spent, or mount fence lost -- permanent for this touch
+            /// Fail closed BEFORE sleeping: budget spent, mount fence lost, or this runtime superseded by
+            /// a self-remount (mirrors `appendRefOps`' fence gate -- recovery must not re-drive on an
+            /// orphaned, pre-remount runtime).
+            if (elapsed_ms >= cas_request_budget.recovery_retry_budget_ms
+                || !fence_ok_fn()
+                || rt.superseded_by_remount.load(std::memory_order_acquire))
+                throw;
 
-            const uint64_t backoff_ms = std::min(
-                cas_request_budget.recovery_retry_max_backoff_ms,
-                cas_request_budget.recovery_retry_initial_backoff_ms << recovery_retry_num);
+            /// Saturating `initial << recovery_retry_num` (mirrors `CasRequestController::backoffBefore
+            /// Attempt`): `initial > cap >> n` implies the unshifted product already exceeds the cap, so
+            /// return the cap without ever computing an overflowing/UB shift for large retry counts.
+            const uint64_t init_backoff = cas_request_budget.recovery_retry_initial_backoff_ms;
+            const uint64_t cap_backoff = cas_request_budget.recovery_retry_max_backoff_ms;
+            const uint64_t backoff_ms = (recovery_retry_num >= 63 || init_backoff > (cap_backoff >> recovery_retry_num))
+                ? cap_backoff
+                : std::min(cap_backoff, init_backoff << recovery_retry_num);
             ++recovery_retry_num;
             ProfileEvents::increment(ProfileEvents::CasRefRecoveryRetries);
             LOG_WARNING(getLogger("CasRefLedger"),
                 "CAS ref-table recovery for namespace '{}' hit a transient object-store error "
-                "({}); retry #{} after {}ms backoff (elapsed {}ms / budget {}ms)",
-                ns.string(), e.message(), recovery_retry_num, backoff_ms, elapsed_ms,
-                cas_request_budget.recovery_retry_budget_ms);
+                "(code {}: {}); retry #{} after {}ms backoff (elapsed {}ms / budget {}ms)",
+                ns.string(), code, getCurrentExceptionMessage(/*with_stacktrace=*/false),
+                recovery_retry_num, backoff_ms, elapsed_ms, cas_request_budget.recovery_retry_budget_ms);
 
             lock.unlock();
-            recovery_retry_sleep_fn(backoff_ms);
+            /// Re-acquire the lock before letting any exception from the sleep unwind, so the SCOPE_EXIT
+            /// (which mutates `recovery_in_progress` + notifies `recovery_cv` and MUST run under
+            /// `state_mutex`) never runs unlocked -- same obligation as the seal-PUT window above.
+            try
+            {
+                recovery_retry_sleep_fn(backoff_ms);
+            }
+            catch (...)
+            {
+                lock.lock();
+                throw;
+            }
             lock.lock();
+            /// The fence/supersession/budget can all change during the unlocked sleep -- re-check before
+            /// starting the next full attempt so we never re-drive recovery on an orphaned runtime, past
+            /// the budget, or under a lost fence (the sliced sleep may have woken early on fence loss).
+            if (boot_ms_now_fn() - recovery_start_ms >= cas_request_budget.recovery_retry_budget_ms
+                || !fence_ok_fn()
+                || rt.superseded_by_remount.load(std::memory_order_acquire))
+                throw;
             /// loop: re-run recovery from a fresh LIST (fresh snapshot/log/replay/seal)
         }
     }
