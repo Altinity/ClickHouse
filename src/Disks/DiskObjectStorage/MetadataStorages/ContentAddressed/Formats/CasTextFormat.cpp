@@ -339,6 +339,27 @@ void writeTrailerLine(WriteBuffer & out, uint64_t n)
     writeChar('\n', out);
 }
 
+void writeHeaderLine(CasJsonWriter & out, FormatId id)
+{
+    const FormatTraits & t = traitsFor(id);
+    bool first = true;
+    writeKey(out, "type", first);
+    writeStringValue(out, t.type);
+    writeKey(out, "v", first);
+    writeIntText(currentCompatibilityVersion(), out);
+    closeObject(out, first);
+    writeChar('\n', out);
+}
+
+void writeTrailerLine(CasJsonWriter & out, uint64_t n)
+{
+    bool first = true;
+    writeKey(out, "n", first);
+    writeIntText(n, out);
+    closeObject(out, first);
+    writeChar('\n', out);
+}
+
 String readLine(ReadBuffer & in, uint64_t line_cap, std::string_view what)
 {
     String line;

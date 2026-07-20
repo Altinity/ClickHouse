@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasWireVocab.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasBlobDigest.h>
 #include <IO/WriteBufferFromString.h>
 #include <IO/WriteHelpers.h>
 #include <Formats/FormatSettings.h>
@@ -121,4 +123,88 @@ TEST(CasJsonWriterEscaping, FuzzMatchesWriteJSONString)
         }
         ASSERT_EQ(writerJson(s), referenceJson(s)) << "iter " << iter;
     }
+}
+
+/// ---- CasJsonWriter overloads of the shared vocabulary (Task 4) ----
+///
+/// Both the WriteBuffer and CasJsonWriter overload sets coexist until Task 9, so the reference
+/// for these tests is the production WriteBuffer vocabulary itself.
+
+TEST(CasJsonWriterVocab, MatchesWriteBufferVocabulary)
+{
+    using namespace DB::Cas;
+    const UInt128 h = (UInt128(0xdeadbeefULL) << 64) | UInt128(42);
+
+    DB::WriteBufferFromOwnString ref;
+    CasJsonWriter w;
+    bool rf = true;
+    bool wf = true;
+
+    writeKey(ref, "a", rf);           writeKey(w, "a", wf);
+    writeStringValue(ref, "x/\"y");   writeStringValue(w, "x/\"y");
+    writeKey(ref, "h", rf);           writeKey(w, "h", wf);
+    writeHex128Value(ref, h);         writeHex128Value(w, h);
+    writeKey(ref, "u", rf);           writeKey(w, "u", wf);
+    writeU64StringValue(ref, UINT64_MAX); writeU64StringValue(w, UINT64_MAX);
+    writeKey(ref, "b", rf);           writeKey(w, "b", wf);
+    writeBoolValue(ref, false);       writeBoolValue(w, false);
+    writeKey(ref, "n", rf);           writeKey(w, "n", wf);
+    DB::writeIntText(uint64_t(12345), ref); writeIntText(uint64_t(12345), w);
+    closeObject(ref, rf);             closeObject(w, wf);
+    DB::writeChar('\n', ref);         writeChar('\n', w);
+    ref.finalize();
+    EXPECT_EQ(std::move(w).take(), ref.str());
+}
+
+TEST(CasJsonWriterVocab, HeaderTrailerAndManifestFieldsMatch)
+{
+    using namespace DB::Cas;
+    DB::WriteBufferFromOwnString ref;
+    CasJsonWriter w;
+
+    writeHeaderLine(ref, FormatId::RefLog);   writeHeaderLine(w, FormatId::RefLog);
+    bool rf = true;
+    bool wf = true;
+    writeManifestRefFields(ref, rf, "o", ManifestRef{1, 2, 3});
+    writeManifestRefFields(w, wf, "o", ManifestRef{1, 2, 3});
+    closeObject(ref, rf);                     closeObject(w, wf);
+    DB::writeChar('\n', ref);                 writeChar('\n', w);
+    writeTrailerLine(ref, 9);                 writeTrailerLine(w, 9);
+    ref.finalize();
+    EXPECT_EQ(std::move(w).take(), ref.str());
+}
+
+TEST(CasJsonWriterVocab, TokenFieldsMatch)
+{
+    using namespace DB::Cas;
+    DB::WriteBufferFromOwnString ref;
+    CasJsonWriter w;
+    bool rf = true;
+    bool wf = true;
+
+    const Token t{"opaque-etag-value", TokenType::ETag};
+    writeTokenFields(ref, rf, t);
+    writeTokenFields(w, wf, t);
+    closeObject(ref, rf);
+    closeObject(w, wf);
+    ref.finalize();
+    EXPECT_EQ(std::move(w).take(), ref.str());
+}
+
+TEST(CasJsonWriterVocab, BlobRefFieldsMatch)
+{
+    using namespace DB::Cas;
+    DB::WriteBufferFromOwnString ref;
+    CasJsonWriter w;
+    bool rf = true;
+    bool wf = true;
+
+    const UInt128 h = (UInt128(0x1122334455667788ULL) << 64) | UInt128(0x99aabbccddeeff00ULL);
+    const BlobRef r{BlobHashAlgo::XXH3_128, BlobDigest::fromU128(h)};
+    writeBlobRefFields(ref, rf, r);
+    writeBlobRefFields(w, wf, r);
+    closeObject(ref, rf);
+    closeObject(w, wf);
+    ref.finalize();
+    EXPECT_EQ(std::move(w).take(), ref.str());
 }

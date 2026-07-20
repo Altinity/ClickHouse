@@ -155,6 +155,20 @@ void writeBoolValue(WriteBuffer & out, bool v);
 /// Writes '}' ("{}" when no key was written).
 void closeObject(WriteBuffer & out, bool & first);
 
+/// CasJsonWriter overloads of the same vocabulary. During the WriteBuffer->CasJsonWriter
+/// migration both sets coexist; the WriteBuffer set is deleted once the last codec migrates.
+inline void writeKey(CasJsonWriter & out, std::string_view key, bool & first) { out.key(key, first); }
+inline void writeStringValue(CasJsonWriter & out, std::string_view s) { out.stringValue(s); }
+inline void writeHex128Value(CasJsonWriter & out, const UInt128 & v) { out.hex128Value(v); }
+inline void writeU64StringValue(CasJsonWriter & out, uint64_t v) { out.u64StringValue(v); }
+inline void writeBoolValue(CasJsonWriter & out, bool v) { out.boolValue(v); }
+inline void closeObject(CasJsonWriter & out, bool & first) { out.closeObject(first); }
+/// Argument order mirrors the IO helpers so migrated codecs keep their call shapes.
+inline void writeChar(char c, CasJsonWriter & out) { out.appendChar(c); }
+inline void writeIntText(uint64_t v, CasJsonWriter & out) { out.u64Number(v); }
+void writeHeaderLine(CasJsonWriter & out, FormatId id);
+void writeTrailerLine(CasJsonWriter & out, uint64_t n);
+
 /// Pull cursor over one canonical JSON object.
 ///
 /// The reader borrows the input buffer and records the object name for exception messages. It

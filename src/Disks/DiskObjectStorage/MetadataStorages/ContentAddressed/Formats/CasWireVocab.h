@@ -2,6 +2,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasBlobDigest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <IO/WriteBuffer.h>
 #include <cstdint>
 #include <string_view>
@@ -50,6 +51,13 @@ void writeBlobRefFields(WriteBuffer & out, bool & first, const BlobRef & r);
 /// empty prefix. The two unbounded `uint64_t` values are decimal JSON strings; the bounded ordinal
 /// is a JSON number. All consumers use this exact spelling and representation.
 void writeManifestRefFields(WriteBuffer & out, bool & first, std::string_view prefix, const ManifestRef & r);
+
+/// CasJsonWriter overloads of the same three field-writers, added alongside the WriteBuffer set
+/// during the WriteBuffer->CasJsonWriter migration (see CasTextFormat.h). Byte-for-byte identical
+/// to their WriteBuffer counterparts.
+void writeTokenFields(CasJsonWriter & out, bool & first, const Token & t);
+void writeBlobRefFields(CasJsonWriter & out, bool & first, const BlobRef & r);
+void writeManifestRefFields(CasJsonWriter & out, bool & first, std::string_view prefix, const ManifestRef & r);
 
 /// Construct a `ManifestRef` from decoded field values and validate the complete domain range:
 /// nonzero `writer_epoch` and `build_sequence`, and `manifest_ordinal` in

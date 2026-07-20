@@ -88,6 +88,34 @@ void writeManifestRefFields(WriteBuffer & out, bool & first, std::string_view pr
     writeIntText(r.manifest_ordinal, out);
 }
 
+void writeTokenFields(CasJsonWriter & out, bool & first, const Token & t)
+{
+    writeKey(out, "tt", first);
+    writeStringValue(out, tokenTypeToWord(t.type));
+    writeKey(out, "tv", first);
+    writeStringValue(out, t.value);
+}
+
+void writeBlobRefFields(CasJsonWriter & out, bool & first, const BlobRef & r)
+{
+    writeKey(out, "ha", first);
+    writeStringValue(out, blobHashAlgoName(r.algo));
+    writeKey(out, "h", first);
+    writeStringValue(out, codecFor(r.algo).toHex(r.digest));
+}
+
+void writeManifestRefFields(CasJsonWriter & out, bool & first, std::string_view prefix, const ManifestRef & r)
+{
+    /// Unlike the WriteBuffer overload, the two-part key() form appends the prefix and name back
+    /// to back with no composed String(prefix) + "..." temporary.
+    out.key(prefix, "me", first);
+    out.u64StringValue(r.writer_epoch);
+    out.key(prefix, "mb", first);
+    out.u64StringValue(r.build_sequence);
+    out.key(prefix, "mo", first);
+    out.u64Number(r.manifest_ordinal);
+}
+
 ManifestRef manifestRefFromFields(uint64_t writer_epoch, uint64_t build_sequence, uint64_t manifest_ordinal,
                                   std::string_view caller, std::string_view what)
 {
