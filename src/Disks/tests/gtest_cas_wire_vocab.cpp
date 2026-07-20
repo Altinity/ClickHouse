@@ -3,7 +3,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <IO/ReadBufferFromMemory.h>
-#include <IO/WriteBufferFromString.h>
 
 using namespace DB::Cas;
 
@@ -22,17 +21,17 @@ TEST(CasWireVocab, EnumWordsRoundTrip)
 
 TEST(CasWireVocab, SiblingFieldsWriteAndReadBack)
 {
-    DB::WriteBufferFromOwnString out;
+    CasJsonWriter out;
     bool first = true;
     writeTokenFields(out, first, Token{"etag-abc\"x", TokenType::ETag});
     const BlobRef ref{BlobHashAlgo::CityHash128, BlobDigest::fromU128(hexToU128("00112233445566778899aabbccddeeff"))};
     writeBlobRefFields(out, first, ref);
     closeObject(out, first);
-    out.finalize();
-    EXPECT_EQ(out.str(),
+    const String rendered = std::move(out).take();
+    EXPECT_EQ(rendered,
         R"({"tt":"etag","tv":"etag-abc\"x","ha":"ch128","h":"00112233445566778899aabbccddeeff"})");
 
-    DB::ReadBufferFromMemory in(out.str().data(), out.str().size());
+    DB::ReadBufferFromMemory in(rendered.data(), rendered.size());
     JsonObjectReader r(in, KeyStrictness::Tolerant, "t");
     String key;
     String tv;

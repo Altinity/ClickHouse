@@ -4,8 +4,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Common/Exception.h>
 #include <IO/ReadBufferFromMemory.h>
-#include <IO/WriteBufferFromString.h>
-#include <IO/WriteHelpers.h>
 #include <algorithm>
 #include <set>
 
@@ -102,21 +100,21 @@ TEST(CasFormatTraitsDeathTest, TraitsForRosterAborts)
 
 TEST(CasJsonVocab, WriteAndReadBack)
 {
-    DB::WriteBufferFromOwnString out;
+    CasJsonWriter out;
     bool first = true;
     writeKey(out, "tag", first);
     writeHex128Value(out, hexToU128("000102030405060708090a0b0c0d0e0f"));
     writeKey(out, "seq", first);
     writeU64StringValue(out, 18446744073709551615ULL);
     writeKey(out, "n", first);
-    DB::writeIntText(7, out);
+    writeIntText(7, out);
     writeKey(out, "ref", first);
     writeStringValue(out, "t-1/all_1_2_0\n\"quoted\"");
     closeObject(out, first);
-    out.finalize();
-    EXPECT_EQ(out.str().substr(0, 45), R"({"tag":"000102030405060708090a0b0c0d0e0f","se)");
+    const String rendered = std::move(out).take();
+    EXPECT_EQ(rendered.substr(0, 45), R"({"tag":"000102030405060708090a0b0c0d0e0f","se)");
 
-    DB::ReadBufferFromMemory in(out.str().data(), out.str().size());
+    DB::ReadBufferFromMemory in(rendered.data(), rendered.size());
     JsonObjectReader r(in, KeyStrictness::Strict, "test");
     String key;
     ASSERT_TRUE(r.nextKey(key)); EXPECT_EQ(key, "tag");
@@ -186,18 +184,18 @@ TEST(CasJsonVocab, FailClosedRules)
 
 TEST(CasTextHeader, WriteExpectSniffGate)
 {
-    DB::WriteBufferFromOwnString out;
+    CasJsonWriter out;
     writeHeaderLine(out, FormatId::PoolMeta);
-    out.finalize();
-    EXPECT_EQ(out.str(), "{\"type\":\"cas_pool_meta\",\"v\":3}\n");
+    const String rendered = std::move(out).take();
+    EXPECT_EQ(rendered, "{\"type\":\"cas_pool_meta\",\"v\":3}\n");
 
-    DB::ReadBufferFromMemory in(out.str().data(), out.str().size());
+    DB::ReadBufferFromMemory in(rendered.data(), rendered.size());
     const TextHeader h = expectHeaderLine(in, FormatId::PoolMeta);
     EXPECT_EQ(h.type, "cas_pool_meta");
     EXPECT_EQ(h.v, 3u);
     EXPECT_TRUE(in.eof());
 
-    const auto sniffed = sniffHeaderLine(out.str());
+    const auto sniffed = sniffHeaderLine(rendered);
     ASSERT_TRUE(sniffed.has_value());
     EXPECT_EQ(sniffed->type, "cas_pool_meta");
     EXPECT_FALSE(sniffHeaderLine("PAR1 not a cas object").has_value());
@@ -217,10 +215,9 @@ TEST(CasTextHeader, WriteExpectSniffGate)
 
 TEST(CasTextLines, ReadLineAndTrailer)
 {
-    DB::WriteBufferFromOwnString out;
+    CasJsonWriter out;
     writeTrailerLine(out, 42);
-    out.finalize();
-    EXPECT_EQ(out.str(), "{\"n\":42}\n");
+    EXPECT_EQ(std::move(out).take(), "{\"n\":42}\n");
 
     const String two = "abc\ndef\n";
     DB::ReadBufferFromMemory in(two.data(), two.size());
@@ -279,8 +276,7 @@ TEST(CasTextValueEscaping, ForwardSlashPinnedUnescaped)
     /// Goes RED if the global escape_forward_slashes default ever leaks back into CAS string values.
     /// CAS values are dense with '/' (ref-paths, fold-seal keys); their bytes must be CAS-owned so
     /// cas_fold_seal byte-determinism and every golden text file are independent of the global default.
-    DB::WriteBufferFromOwnString out;
+    CasJsonWriter out;
     writeStringValue(out, "ns/shard/all_1_2_0");
-    out.finalize();
-    EXPECT_EQ(out.str(), "\"ns/shard/all_1_2_0\"");
+    EXPECT_EQ(std::move(out).take(), "\"ns/shard/all_1_2_0\"");
 }

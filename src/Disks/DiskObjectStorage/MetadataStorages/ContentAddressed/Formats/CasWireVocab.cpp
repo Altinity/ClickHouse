@@ -2,7 +2,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasCodecUtil.h>
 #include <Common/Exception.h>
-#include <IO/WriteHelpers.h>
 
 namespace DB
 {
@@ -55,37 +54,6 @@ ObjectKind objectKindFromWord(std::string_view w, std::string_view what)
 {
     if (w == "blob") return ObjectKind::Blob;
     throw Exception(ErrorCodes::CORRUPTED_DATA, "CAS {}: unknown object kind '{}'", what, w);
-}
-
-void writeTokenFields(WriteBuffer & out, bool & first, const Token & t)
-{
-    writeKey(out, "tt", first);
-    writeStringValue(out, tokenTypeToWord(t.type));
-    writeKey(out, "tv", first);
-    writeStringValue(out, t.value);
-}
-
-void writeBlobRefFields(WriteBuffer & out, bool & first, const BlobRef & r)
-{
-    writeKey(out, "ha", first);
-    writeStringValue(out, blobHashAlgoName(r.algo));
-    writeKey(out, "h", first);
-    writeStringValue(out, codecFor(r.algo).toHex(r.digest));
-}
-
-void writeManifestRefFields(WriteBuffer & out, bool & first, std::string_view prefix, const ManifestRef & r)
-{
-    /// Concatenate the prefix into each key name. Keys stay 2-5 characters ("me"/"mb"/"mo", or
-    /// "ome"/"nmo"), preserving the flat JSON shape used by the ref codecs and part manifests.
-    const String me = String(prefix) + "me";
-    const String mb = String(prefix) + "mb";
-    const String mo = String(prefix) + "mo";
-    writeKey(out, me, first);
-    writeU64StringValue(out, r.writer_epoch);
-    writeKey(out, mb, first);
-    writeU64StringValue(out, r.build_sequence);
-    writeKey(out, mo, first);
-    writeIntText(r.manifest_ordinal, out);
 }
 
 void writeTokenFields(CasJsonWriter & out, bool & first, const Token & t)

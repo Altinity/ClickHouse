@@ -3,7 +3,6 @@
 #include <base/types.h>
 #include <base/extended_types.h>
 #include <IO/ReadBuffer.h>
-#include <IO/WriteBuffer.h>
 #include <base/hex.h>
 #include <base/itoa.h>
 #include <optional>
@@ -140,23 +139,9 @@ private:
     String buf;
 };
 
-/// The write-side JSON primitives used by the format codecs.
-
-/// Writes '{' on the first call, ',' after, then "key": . `key` must be plain ASCII (written raw).
-void writeKey(WriteBuffer & out, std::string_view key, bool & first);
-/// Writes a JSON string using the CAS-owned escaping settings.
-void writeStringValue(WriteBuffer & out, std::string_view s);
-/// Writes a 128-bit value as a quoted, fixed-width, lowercase hexadecimal string.
-void writeHex128Value(WriteBuffer & out, const UInt128 & v);
-/// Writes a u64 as a quoted decimal string, preserving the full range of the type in JSON text.
-void writeU64StringValue(WriteBuffer & out, uint64_t v);
-/// Writes a bare JSON boolean literal; the corresponding reader is `JsonObjectReader::readBool`.
-void writeBoolValue(WriteBuffer & out, bool v);
-/// Writes '}' ("{}" when no key was written).
-void closeObject(WriteBuffer & out, bool & first);
-
-/// CasJsonWriter overloads of the same vocabulary. During the WriteBuffer->CasJsonWriter
-/// migration both sets coexist; the WriteBuffer set is deleted once the last codec migrates.
+/// The write-side JSON primitives used by the format codecs. `CasJsonWriter` is the only CAS
+/// text writer; every codec assembles its object in one before handing bytes to the underlying
+/// `WriteBuffer`.
 inline void writeKey(CasJsonWriter & out, std::string_view key, bool & first) { out.key(key, first); }
 inline void writeStringValue(CasJsonWriter & out, std::string_view s) { out.stringValue(s); }
 inline void writeHex128Value(CasJsonWriter & out, const UInt128 & v) { out.hex128Value(v); }
@@ -225,10 +210,6 @@ struct TextHeader
     uint32_t v = 0;
 };
 
-/// Writes the versioned type header line and its newline terminator.
-void writeHeaderLine(WriteBuffer & out, FormatId id);
-/// Writes a record-count trailer line and its newline terminator.
-void writeTrailerLine(WriteBuffer & out, uint64_t n);
 /// Reads and gates line 1 against `id`'s registered type; wrong type -> CORRUPTED_DATA; v above
 /// what this build understands -> UNKNOWN_FORMAT_VERSION.
 TextHeader expectHeaderLine(ReadBuffer & in, FormatId id);

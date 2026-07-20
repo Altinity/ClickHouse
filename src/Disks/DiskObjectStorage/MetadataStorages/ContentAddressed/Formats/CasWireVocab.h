@@ -3,7 +3,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasBlobDigest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
-#include <IO/WriteBuffer.h>
 #include <cstdint>
 #include <string_view>
 
@@ -39,24 +38,17 @@ ObjectKind objectKindFromWord(std::string_view w, std::string_view what);
 
 /// Append the sibling fields `tt` and `tv` to an in-progress JSON object. The caller owns `first`,
 /// which must describe the fields already written to that object; the token value is JSON-escaped.
-void writeTokenFields(WriteBuffer & out, bool & first, const Token & t);
+void writeTokenFields(CasJsonWriter & out, bool & first, const Token & t);
 
 /// Append the sibling fields `ha` and `h` to an in-progress JSON object. The algorithm word and
 /// lowercase digest are canonical, and the digest is rendered at the width required by `r.algo`.
-void writeBlobRefFields(WriteBuffer & out, bool & first, const BlobRef & r);
+void writeBlobRefFields(CasJsonWriter & out, bool & first, const BlobRef & r);
 
 /// Append the three flat `ManifestRef` fields `me`, `mb`, and `mo` to an in-progress JSON object.
 /// `prefix` is prepended to each key, allowing the ref codecs to distinguish old and new owner
 /// bindings (`ome`/`omb`/`omo` and `nme`/`nmb`/`nmo`) while part manifests and ordinary rows use an
 /// empty prefix. The two unbounded `uint64_t` values are decimal JSON strings; the bounded ordinal
 /// is a JSON number. All consumers use this exact spelling and representation.
-void writeManifestRefFields(WriteBuffer & out, bool & first, std::string_view prefix, const ManifestRef & r);
-
-/// CasJsonWriter overloads of the same three field-writers, added alongside the WriteBuffer set
-/// during the WriteBuffer->CasJsonWriter migration (see CasTextFormat.h). Byte-for-byte identical
-/// to their WriteBuffer counterparts.
-void writeTokenFields(CasJsonWriter & out, bool & first, const Token & t);
-void writeBlobRefFields(CasJsonWriter & out, bool & first, const BlobRef & r);
 void writeManifestRefFields(CasJsonWriter & out, bool & first, std::string_view prefix, const ManifestRef & r);
 
 /// Construct a `ManifestRef` from decoded field values and validate the complete domain range:

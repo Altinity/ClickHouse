@@ -4,7 +4,6 @@
 #include <Formats/FormatSettings.h>
 #include <IO/ReadBufferFromMemory.h>
 #include <IO/ReadHelpers.h>
-#include <IO/WriteHelpers.h>
 #include <base/hex.h>
 #include <base/scope_guard.h>
 #include <algorithm>
@@ -32,21 +31,6 @@ namespace DB::Cas
 
 namespace
 {
-const FormatSettings & jsonWriteSettings()
-{
-    /// CAS text is persisted and, for deterministic objects, compared byte-for-byte on retries.
-    /// Keep slash-containing values such as ref paths and fold-seal map keys rendered as `/`,
-    /// independently of the process-wide JSON setting; otherwise the same logical object could
-    /// produce different bytes and deterministic adoption would reject an equivalent artifact.
-    static const FormatSettings settings = []
-    {
-        FormatSettings s;
-        s.json.escape_forward_slashes = false;
-        return s;
-    }();
-    return settings;
-}
-
 const FormatSettings::JSON & jsonReadSettings()
 {
     static const FormatSettings::JSON settings;
@@ -123,51 +107,6 @@ void CasJsonWriter::stringValue(std::string_view s)
         }
     }
     appendChar('"');
-}
-
-/// ---- write-side JSON micro-vocabulary ----
-
-void writeKey(WriteBuffer & out, std::string_view key, bool & first)
-{
-    writeChar(first ? '{' : ',', out);
-    first = false;
-    writeChar('"', out);
-    out.write(key.data(), key.size());
-    writeChar('"', out);
-    writeChar(':', out);
-}
-
-void writeStringValue(WriteBuffer & out, std::string_view s)
-{
-    writeJSONString(s, out, jsonWriteSettings());
-}
-
-void writeHex128Value(WriteBuffer & out, const UInt128 & v)
-{
-    writeChar('"', out);
-    const String hex = u128ToHex(v);
-    out.write(hex.data(), hex.size());
-    writeChar('"', out);
-}
-
-void writeU64StringValue(WriteBuffer & out, uint64_t v)
-{
-    writeChar('"', out);
-    writeIntText(v, out);
-    writeChar('"', out);
-}
-
-void writeBoolValue(WriteBuffer & out, bool v)
-{
-    writeCString(v ? "true" : "false", out);
-}
-
-void closeObject(WriteBuffer & out, bool & first)
-{
-    if (first)
-        writeChar('{', out);
-    first = false;
-    writeChar('}', out);
 }
 
 /// ---- read-side pull cursor ----
@@ -317,27 +256,6 @@ void JsonObjectReader::skipUnknown(const String & key)
 }
 
 /// ---- header line / trailer line / raw line access ----
-
-void writeHeaderLine(WriteBuffer & out, FormatId id)
-{
-    const FormatTraits & t = traitsFor(id);
-    bool first = true;
-    writeKey(out, "type", first);
-    writeStringValue(out, t.type);
-    writeKey(out, "v", first);
-    writeIntText(currentCompatibilityVersion(), out);
-    closeObject(out, first);
-    writeChar('\n', out);
-}
-
-void writeTrailerLine(WriteBuffer & out, uint64_t n)
-{
-    bool first = true;
-    writeKey(out, "n", first);
-    writeIntText(n, out);
-    closeObject(out, first);
-    writeChar('\n', out);
-}
 
 void writeHeaderLine(CasJsonWriter & out, FormatId id)
 {
