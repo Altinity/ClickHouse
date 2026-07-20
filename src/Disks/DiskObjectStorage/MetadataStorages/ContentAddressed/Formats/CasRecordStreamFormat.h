@@ -1,5 +1,6 @@
 #pragma once
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <IO/ReadBuffer.h>
 #include <IO/WriteBuffer.h>
@@ -110,6 +111,10 @@ private:
     BlobRef prev_ref{};
     UInt128 prev_source_id{};
     bool finished = false;
+    /// Reused line-scratch: each record is assembled here, then bulk-written to `out` in one call.
+    /// `clear` keeps the buffer's capacity, so memory stays bounded by the largest line ever
+    /// assembled, never by record count.
+    CasJsonWriter scratch;
 };
 
 /// The whole-object seal-checksum (`RunRef.checksum`) of a stored `cas_run`: the chained CityHash128 a

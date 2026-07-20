@@ -104,15 +104,17 @@ char markerFromWord(std::string_view w)
 void writeRunHeaderLine(WriteBuffer & out, std::string_view kind)
 {
     const FormatTraits & t = traitsFor(FormatId::RunFile);
+    CasJsonWriter line(64);
     bool first = true;
-    writeKey(out, "type", first);
-    writeStringValue(out, t.type);
-    writeKey(out, "v", first);
-    writeIntText(currentCompatibilityVersion(), out);
-    writeKey(out, "kind", first);
-    writeStringValue(out, kind);
-    closeObject(out, first);
-    writeChar('\n', out);
+    writeKey(line, "type", first);
+    writeStringValue(line, t.type);
+    writeKey(line, "v", first);
+    writeIntText(currentCompatibilityVersion(), line);
+    writeKey(line, "kind", first);
+    writeStringValue(line, kind);
+    closeObject(line, first);
+    writeChar('\n', line);
+    out.write(line.view().data(), line.size());
 }
 
 void expectRunHeaderLine(ReadBuffer & in, std::string_view expected_kind)
@@ -170,27 +172,29 @@ void SourceEdgeRunWriter::append(const SourceEdgeRecord & rec)
     prev_ref = rec.ref;
     prev_source_id = rec.source_id;
 
+    scratch.clear();
     bool first = true;
-    writeKey(out, "b", first);
-    writeStringValue(out, renderB(rec.ref));
-    writeKey(out, "s", first);
-    writeHex128Value(out, rec.source_id);
-    writeKey(out, "m", first);
-    writeStringValue(out, markerToWord(rec.marker));
+    writeKey(scratch, "b", first);
+    writeStringValue(scratch, renderB(rec.ref));
+    writeKey(scratch, "s", first);
+    writeHex128Value(scratch, rec.source_id);
+    writeKey(scratch, "m", first);
+    writeStringValue(scratch, markerToWord(rec.marker));
     if (rec.marker == kCondemned)
     {
-        writeKey(out, "pend", first);
-        writeBoolValue(out, rec.delete_pending);
-        writeTokenFields(out, first, rec.token);   /// tt + tv
-        writeKey(out, "sz", first);
-        writeIntText(rec.size, out);
-        writeKey(out, "cr", first);
-        writeU64StringValue(out, rec.condemn_round);
-        writeKey(out, "mc", first);
-        writeBoolValue(out, rec.marker_confirmed);
+        writeKey(scratch, "pend", first);
+        writeBoolValue(scratch, rec.delete_pending);
+        writeTokenFields(scratch, first, rec.token);   /// tt + tv
+        writeKey(scratch, "sz", first);
+        writeIntText(rec.size, scratch);
+        writeKey(scratch, "cr", first);
+        writeU64StringValue(scratch, rec.condemn_round);
+        writeKey(scratch, "mc", first);
+        writeBoolValue(scratch, rec.marker_confirmed);
     }
-    closeObject(out, first);
-    writeChar('\n', out);
+    closeObject(scratch, first);
+    writeChar('\n', scratch);
+    out.write(scratch.view().data(), scratch.size());
     ++count;
 }
 
@@ -198,7 +202,9 @@ void SourceEdgeRunWriter::finish()
 {
     if (finished)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "CAS cas_run: finish called twice");
-    writeTrailerLine(out, count);
+    scratch.clear();
+    writeTrailerLine(scratch, count);
+    out.write(scratch.view().data(), scratch.size());
     finished = true;
 }
 
