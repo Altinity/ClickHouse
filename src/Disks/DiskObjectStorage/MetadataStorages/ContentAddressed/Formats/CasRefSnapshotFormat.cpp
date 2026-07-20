@@ -3,7 +3,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasCodecUtil.h>
 #include <Common/Exception.h>
 #include <IO/ReadBufferFromMemory.h>
-#include <IO/WriteBufferFromString.h>
 #include <IO/WriteHelpers.h>
 #include <optional>
 #include <tuple>
@@ -103,7 +102,7 @@ void checkSnapshotInvariants(const RefTableSnapshot & snapshot)
     checkPrecommitsSorted(snapshot.precommits);
 }
 
-void writeIdFields(WriteBuffer & out, bool & first, std::string_view epoch_key, std::string_view seq_key, const RefTxnId & id)
+void writeIdFields(CasJsonWriter & out, bool & first, std::string_view epoch_key, std::string_view seq_key, const RefTxnId & id)
 {
     /// Both fields decimal STRINGS: ref_sequence reaches UINT64_MAX for a recovery seal.
     writeKey(out, epoch_key, first);
@@ -112,7 +111,7 @@ void writeIdFields(WriteBuffer & out, bool & first, std::string_view epoch_key, 
     writeU64StringValue(out, id.ref_sequence);
 }
 
-void writeCommittedRow(WriteBuffer & out, const RefCommittedRow & row)
+void writeCommittedRow(CasJsonWriter & out, const RefCommittedRow & row)
 {
     checkCanonicalRefName(row.ref_name, "RefTableSnapshot", "committed ref_name");
     checkManifestRef(row.manifest_ref, "RefTableSnapshot", "committed");
@@ -130,7 +129,7 @@ void writeCommittedRow(WriteBuffer & out, const RefCommittedRow & row)
     writeChar('\n', out);
 }
 
-void writePrecommitRow(WriteBuffer & out, const RefOwnerBinding & row)
+void writePrecommitRow(CasJsonWriter & out, const RefOwnerBinding & row)
 {
     if (row.kind != RefOwnerKind::Precommit)
         throw Exception(ErrorCodes::CORRUPTED_DATA,
@@ -151,7 +150,7 @@ void writePrecommitRow(WriteBuffer & out, const RefOwnerBinding & row)
 /// The snapshot's header-object meta line (ns, snapshot_id, lifecycle, and the optional remove/sealed
 /// ids). Shared by `encodeRefTableSnapshot` and `snapshotFramingSize` so the two never disagree by a
 /// byte. Assumes the caller has already validated the snapshot (or is measuring framing only).
-void writeSnapshotMeta(WriteBuffer & out, const RefTableSnapshot & snapshot)
+void writeSnapshotMeta(CasJsonWriter & out, const RefTableSnapshot & snapshot)
 {
     bool first = true;
     writeKey(out, "ns", first);
@@ -191,7 +190,7 @@ String encodeRefTableSnapshot(const RefTableSnapshot & snapshot)
 {
     checkSnapshotInvariants(snapshot);
 
-    WriteBufferFromOwnString out;
+    CasJsonWriter out(256 + 128 * (snapshot.committed.size() + snapshot.precommits.size()));
     writeHeaderLine(out, FormatId::RefSnapshot);
 
     writeSnapshotMeta(out, snapshot);
@@ -202,8 +201,7 @@ String encodeRefTableSnapshot(const RefTableSnapshot & snapshot)
         writePrecommitRow(out, row);
 
     writeTrailerLine(out, snapshot.committed.size() + snapshot.precommits.size());
-    out.finalize();
-    const String text = out.str();
+    String text = std::move(out).take();
     if (text.size() > ref_snapshot_max_bytes)
         throw Exception(ErrorCodes::CORRUPTED_DATA,
             "RefTableSnapshot: encoded size {} exceeds the snapshot byte limit {}", text.size(), ref_snapshot_max_bytes);
@@ -348,18 +346,16 @@ RefTableSnapshot decodeRefTableSnapshot(
 
 size_t committedRowEncodedSize(const RefCommittedRow & row)
 {
-    WriteBufferFromOwnString out;
+    CasJsonWriter out(256);
     writeCommittedRow(out, row);
-    out.finalize();
-    return out.str().size();
+    return out.size();
 }
 
 size_t precommitRowEncodedSize(const RefOwnerBinding & binding)
 {
-    WriteBufferFromOwnString out;
+    CasJsonWriter out(256);
     writePrecommitRow(out, binding);
-    out.finalize();
-    return out.str().size();
+    return out.size();
 }
 
 size_t snapshotFramingSize(const String & ns, const RefTxnId & snapshot_id, RefLifecycle lifecycle,
@@ -373,12 +369,11 @@ size_t snapshotFramingSize(const String & ns, const RefTxnId & snapshot_id, RefL
     meta_only.remove_txn_id = remove_txn_id;
     meta_only.sealed_from = sealed_from;
 
-    WriteBufferFromOwnString out;
+    CasJsonWriter out(256);
     writeHeaderLine(out, FormatId::RefSnapshot);
     writeSnapshotMeta(out, meta_only);
     writeTrailerLine(out, row_count);
-    out.finalize();
-    return out.str().size();
+    return out.size();
 }
 
 }

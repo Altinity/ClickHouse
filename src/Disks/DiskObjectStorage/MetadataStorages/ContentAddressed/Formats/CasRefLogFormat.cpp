@@ -3,7 +3,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasCodecUtil.h>
 #include <Common/Exception.h>
 #include <IO/ReadBufferFromMemory.h>
-#include <IO/WriteBufferFromString.h>
 #include <IO/WriteHelpers.h>
 #include <algorithm>
 #include <optional>
@@ -70,18 +69,18 @@ void checkBudget(const std::vector<RefOp> & ops, size_t encoded_bytes)
             "RefLogTxn: {} operations exceeds the normal-class op-count limit {}", ops.size(), ref_txn_max_ops);
 }
 
-void writeBindingFields(WriteBuffer & out, bool & first, std::string_view prefix, const RefOwnerBinding & b)
+void writeBindingFields(CasJsonWriter & out, bool & first, std::string_view prefix, const RefOwnerBinding & b)
 {
     checkCanonicalRefName(b.ref_name, "RefLogTxn", "owner binding ref_name");
     checkManifestRef(b.manifest_ref, "RefLogTxn", "owner binding manifest_ref");
-    writeKey(out, String(prefix) + "bk", first);
+    out.key(prefix, "bk", first);
     writeStringValue(out, refOwnerKindToWord(b.kind));
-    writeKey(out, String(prefix) + "rn", first);
+    out.key(prefix, "rn", first);
     writeStringValue(out, b.ref_name);
     writeManifestRefFields(out, first, prefix, b.manifest_ref);
 }
 
-void writeOp(WriteBuffer & out, const RefOp & op)
+void writeOp(CasJsonWriter & out, const RefOp & op)
 {
     bool first = true;
     writeKey(out, "op", first);
@@ -152,7 +151,7 @@ struct BindingFields
 
 /// The log transaction's header-object meta line (ns + txn_id). Shared by `encodeRefLogTxn` and
 /// `removalFramingSize` so the two never disagree by a byte.
-void writeLogMeta(WriteBuffer & out, const String & ns, const RefTxnId & txn_id)
+void writeLogMeta(CasJsonWriter & out, const String & ns, const RefTxnId & txn_id)
 {
     bool first = true;
     writeKey(out, "ns", first);
@@ -231,7 +230,7 @@ String encodeRefLogTxn(const RefLogTxn & txn)
 {
     checkTxnIdNonzero(txn.txn_id);
 
-    WriteBufferFromOwnString out;
+    CasJsonWriter out(512);
     writeHeaderLine(out, FormatId::RefLog);
 
     writeLogMeta(out, txn.ns, txn.txn_id);
@@ -240,8 +239,7 @@ String encodeRefLogTxn(const RefLogTxn & txn)
         writeOp(out, op);
 
     writeTrailerLine(out, txn.ops.size());
-    out.finalize();
-    const String text = out.str();
+    String text = std::move(out).take();
     checkBudget(txn.ops, text.size());
     return text;
 }
@@ -328,25 +326,23 @@ size_t removalOpEncodedSize(RefOwnerKind owner_kind, const String & ref_name, co
     op.kind = RefOpKind::OwnerTransition;
     op.old_binding = RefOwnerBinding{owner_kind, ref_name, manifest_ref};
 
-    WriteBufferFromOwnString out;
+    CasJsonWriter out(256);
     writeOp(out, op);
-    out.finalize();
-    return out.str().size();
+    return out.size();
 }
 
 size_t removalFramingSize(const String & ns, const RefTxnId & txn_id, uint64_t op_count)
 {
     /// Header + meta + the terminal remove_namespace op + trailer(op_count). `op_count` counts every op
     /// including the remove_namespace op (i.e. committed + precommits + 1).
-    WriteBufferFromOwnString out;
+    CasJsonWriter out(256);
     writeHeaderLine(out, FormatId::RefLog);
     writeLogMeta(out, ns, txn_id);
     RefOp remove_op;
     remove_op.kind = RefOpKind::RemoveNamespace;
     writeOp(out, remove_op);
     writeTrailerLine(out, op_count);
-    out.finalize();
-    return out.str().size();
+    return out.size();
 }
 
 }
