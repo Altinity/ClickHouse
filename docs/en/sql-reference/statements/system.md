@@ -471,6 +471,66 @@ Each round is recorded in [`system.content_addressed_garbage_collection_log`](/o
 
 The command returns one row per disk it ran on (multiple rows when `disk_name` is omitted), with columns `disk`, `acquired_lease`, `deferred`, `round`, `candidates_marked`, `objects_deleted`, `objects_absent`, `objects_replaced`, `objects_spared`, `manifests_deleted`, `entries_condemned`, `entries_graduated`, `entries_redeleted`, `fence_outs`, and `anomalies`, describing the outcome of that round.
 
+### SYSTEM CONTENT ADDRESSED GC REBUILD {#system-content-addressed-gc-rebuild}
+
+Disaster-recovery command for the content-addressed (CA) MergeTree garbage collector. It rebuilds a
+CA disk's `gc/state` baseline from scratch, by re-discovering the whole ref universe and re-folding
+manifest edges into a fresh generation. It writes only the GC plane (`gc/state` and the `gc/gen/*`
+artifacts) and never touches ref shards, manifests, or blobs, and it never deletes anything itself —
+but the rebuilt baseline drives every subsequent GC round's retire decisions, so this is a
+**destructive disaster-recovery tool**, not something to run routinely: a rebuild performed against
+a state that was not actually corrupted discards live bookkeeping, and an incorrect rebuild can make
+a later round delete objects that are still referenced.
+
+```sql
+SYSTEM CONTENT ADDRESSED GC REBUILD [FORCE] [ON CLUSTER cluster_name] disk_name
+```
+
+Unlike `SYSTEM CONTENT ADDRESSED GARBAGE COLLECTION`, `disk_name` is **required**: the destructive
+baseline rebuild must never fan out across every content-addressed disk on the node from a bare
+command; targeting a non-content-addressed disk raises an exception.
+
+By default the command refuses to run when the disk's existing `gc/state` and every artifact it
+references decode successfully and are present — a rebuild would needlessly discard healthy live
+bookkeeping. Add `FORCE` to rebuild deliberately even though the existing state looks healthy. The
+command also refuses (regardless of `FORCE`) when another GC leader currently holds the disk's
+lease. In both refusal cases it raises an exception instead of returning a row.
+
+On success it returns one row with columns `disk`, `performed`, `round`, `generation`, `namespaces`,
+`shards`, `committed_refs`, `live_precommits`, `unowned_alive_manifests`, `edges`, and
+`clamped_shards`, describing the freshly rebuilt baseline.
+
+### SYSTEM CONTENT ADDRESSED DROP POOL MEMBER {#system-content-addressed-drop-pool-member}
+
+Permanently decommissions a dead member (`server_root_id`, or `srid`) of a content-addressed disk
+pool. It claims the member's mount slot as an administrative writer — fencing that `srid` from ever
+writing again — then drops every table namespace the member owned, drains eligible manifest debris,
+staging objects, and mountpoint objects belonging to it, and retires the mount slot once all drains
+are confirmed. This is a **destructive, irreversible** operation: only run it once the `srid` is
+confirmed permanently dead, since it fences the member out even if it later comes back online, and
+it deletes namespace and drain state that cannot be recovered.
+
+It is a writer operation, not GC: it emits ordinary ref-edge deltas rather than inventing GC
+transitions, and it does not synchronously reclaim shared blob content — removing the ref edges only
+makes the now-unreferenced blobs eligible for an ordinary GC round to reclaim later.
+
+```sql
+SYSTEM CONTENT ADDRESSED DROP POOL MEMBER 'srid' FROM DISK 'disk_name' [ON CLUSTER cluster_name]
+```
+
+Both `srid` and `disk_name` are required string literals (an `srid` is an opaque server-root path
+that may contain `/`, not a plain identifier, so it cannot be written unquoted).
+
+The operation is resumable: a rerun skips namespaces already marked `Removed` and reports them
+separately from namespaces newly removed by this invocation. Per-object drain failures are recorded
+as warnings and leave the slot in a terminated-but-not-fully-drained state that a later invocation
+can resume from, rather than raising an exception.
+
+The command returns one row with columns `srid`, `namespaces_removed`, `namespaces_already_removed`,
+`committed_refs_removed`, `precommits_removed`, `manifest_debris_removed`, `staging_objects_removed`,
+`mountpoint_objects_removed`, `slot_removed`, and `warnings`. A non-empty `warnings` means some
+drain was not confirmed and the mount slot was left in place as a resume anchor.
+
 ## Managing ReplicatedMergeTree Tables {#managing-replicatedmergetree-tables}
 
 ClickHouse can manage background replication related processes in [ReplicatedMergeTree](/engines/table-engines/mergetree-family/replication) tables.
