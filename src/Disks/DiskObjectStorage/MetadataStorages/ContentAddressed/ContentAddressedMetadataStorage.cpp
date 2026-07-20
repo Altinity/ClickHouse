@@ -1370,8 +1370,7 @@ std::optional<String> ContentAddressedMetadataStorage::getPartManifestBytes(cons
 bool ContentAddressedMetadataStorage::adoptPartFromManifest(
     const String & table_uuid, const String & part_name, const String & manifest_bytes)
 {
-    if (read_only)
-        throw Exception(ErrorCodes::READONLY, "Content-addressed disk is opened read-only: adoptPartFromManifest is rejected");
+    checkNotReadOnly("adoptPartFromManifest (interserver relink receiver)");
 
     /// Receiver side. Sender identity is non-authoritative: we ignore the decoded
     /// ManifestRef, root_namespace_id and payload_digest, and use ONLY the entries. We run a normal
