@@ -26,13 +26,13 @@ Categories:
 | 6 | Orphan-sweep protection-view cache per pass | perf minor (45) | DEFERRED | If GC-round wall-clock or LIST budgets become a problem on large pools |
 | 7 | `SingleWriterSlot::renewOnce` lock restructuring | concurrency (35) | REJECTED (comment lands instead) | Reopen if any new `state_mutex`-guarded accessor is ever added |
 | 8 | `promote()` setting `alive = false` (lifecycle symmetry) | deep-audit nit (15) | REJECTED (document-only) | Reopen if `PartWriteTxn` ever gets a second caller pattern that reuses objects |
-| 9 | `srid` column in the GC round log | operability note under finding 5 | FEATURE | Next CAS observability batch |
-| 10 | Prometheus-scrapeable GC health (`AsynchronousMetrics`) | operability (42) | FEATURE | Next CAS observability batch; before first production-like deployment |
-| 11 | Result sets for `GARBAGE COLLECTION` / `GC REBUILD` | ux (45) | FEATURE | Next UX pass over the SYSTEM verbs |
+| 9 | `srid` column in the GC round log | operability note under finding 5 | ~~FEATURE~~ **DONE 2026-07-20** (`3b2c9abb822`) | — |
+| 10 | Prometheus-scrapeable GC health (`AsynchronousMetrics`) | operability (42) | ~~FEATURE~~ **DONE 2026-07-20** (`3b2c9abb822`) | — |
+| 11 | Result sets for `GARBAGE COLLECTION` / `GC REBUILD` | ux (45) | ~~FEATURE~~ **DONE 2026-07-20** (`cb111510c1a`) | — |
 | 12 | Upstream diff split (4 separable changes) | compat finding 11 | UPSTREAM-PREP | When drafting upstream PRs |
 | 13 | Non-CA regression coverage for `renameParts` durability reorder | compat finding 11 | UPSTREAM-PREP + VERIFY | MUST precede the upstream PR of that hunk; ideally sooner |
-| 14 | `docs/superpowers/` worklog-path citations in permanent comments | ockham (25) | UPSTREAM-PREP | When drafting upstream PRs |
-| 15 | `CasLayout.h` parsers out-of-line move | headers (30) | DEFERRED | Fold into the next CAS-wide mechanical cleanup |
+| 14 | `docs/superpowers/` worklog-path citations in permanent comments | ockham (25) | ~~UPSTREAM-PREP~~ **DONE 2026-07-20** (`11bf17fbf66`) | — |
+| 15 | `CasLayout.h` parsers out-of-line move | headers (30) | ~~DEFERRED~~ **DONE 2026-07-20** (`4fafb4edb28`) | — |
 | 16 | GCS end-to-end integration test (emulator) | tests (25) | DEFERRED | Before GCS is promoted out of experimental |
 | 17 | Decommission owner-anchor tombstone race | security #4 (25) | DEFERRED (design exists) | Covered by `2026-07-18-t5-owner-tombstone-design.md`; execute with the next decommission work |
 | 18 | `~Pool()` teardown vs `object_storage->shutdown()` ordering | concurrency #2 (25, low conf) | VERIFY | One-off investigation; escalate to fix only if the ordering guarantee is absent |
@@ -91,14 +91,18 @@ Categories:
 **Why rejected:** the "symmetric" fix has hidden call-path risk: `publishStaging`'s repoint branch and the transaction destructor legitimately call `abandon()` on builds after promote-adjacent flows, relying on today's exact no-op/soft-fail semantics; flipping `alive` in `promote` converts some of those into new throw paths through a destructor. The hazard it guards against (a future caller reusing one `PartWriteTxn` across two builds) does not exist in the current call graph.
 **Return condition:** if `PartWriteTxn` ever gains a caller that holds instances long-term, add the guard *together with* an audit of every `abandon()` call site.
 
-### 9–10. GC-log `srid` column; Prometheus GC-health metrics — FEATURE {#observability-features}
+### 9–10. GC-log `srid` column; Prometheus GC-health metrics — DONE 2026-07-20, `3b2c9abb822` {#observability-features}
+
+> Executed same-day on user request: `srid` on both `Start`/`Finish` GC-log rows; `CasGCIsLeader_<disk>` / `CasGCPendingReclaim_<disk>` / `CasGCLastSuccessAgeSeconds_<disk>` / `CasGCWedgedNamespaces_<disk>` in asynchronous metrics; `tryFromDisk` helper added (existing 4 detection copies migrate in fix-plan Task 13). Original entry kept below for context.
 
 **What:** (9) the GC round log has no `srid`, so rounds can't be durably attributed to a mount slot; (10) "GC stuck" / "mount lease lost" exist only as SQL-queryable state, invisible to standard `/metrics`-based alerting.
 **Why not in the fix plan:** both are additive surface — a system-log schema extension and new `AsynchronousMetrics` entries — i.e. small features with naming/compat decisions, not fixes.
 **Deferral risk:** operators of a production-like deployment cannot alert on the single most important CAS health signal without a custom SQL exporter.
 **Return condition:** next CAS observability batch; item 10 should precede the first deployment anyone monitors with standard dashboards. Note Task 9 of the fix plan (local-row scoping in `system.content_addressed_mounts`) partially mitigates the triage confusion in the meantime.
 
-### 11. Result sets for `GARBAGE COLLECTION` / `GC REBUILD` — FEATURE {#verb-result-sets}
+### 11. Result sets for `GARBAGE COLLECTION` / `GC REBUILD` — DONE 2026-07-20, `cb111510c1a` {#verb-result-sets}
+
+> Executed same-day on user request. Note learned during implementation: `runGarbageCollectionRoundNow`/`runGcRebuildNow` already returned `Cas::RoundReport`/`Cas::RebuildReport` (the interpreter was discarding them), and `SYSTEM` queries cannot take `FORMAT`, so tests invoking GC mid-script moved to `.sh` + `/dev/null` (05007, 05010 converted; 05008 redirect added). Original entry kept below for context.
 
 **What:** `DROP POOL MEMBER` returns a 10-column report; the other two verbs return nothing (`RebuildReport` goes to `LOG_INFO` only).
 **Why not in the fix plan:** additive client-visible output; harmless but zero-risk-budget was reserved for actual defects.
@@ -109,11 +113,11 @@ Categories:
 **What:**
 - (12) Four changes bundled in this branch are independently reviewable and should be separate upstream PRs: GCS conditional-write support (`GCSConditionalDialect`/`GOOG4Signer`/HMAC client), the `renameParts` disk-transaction-close durability fix, the `ReadBufferFromFileView` B115 position fix + gtests, and the global S3 412-no-retry policy.
 - (13) The `renameParts` reorder is unconditional for ALL `DiskObjectStorage`-backed MergeTree writes and is currently validated only by CAS-side soaks; it needs dedicated non-CA regression coverage (plain S3 + `ReplicatedMergeTree`, cached object storage, zero-copy) — this doubles as a VERIFY item and should not wait for the upstream draft if cheap to run.
-- (14) Permanent source comments (e.g. `MergeTreeData.h:378`) cite dated `docs/superpowers/` worklog paths that will dangle outside this branch; the inline prose is self-sufficient — drop or stabilize the citations.
+- (14) **DONE 2026-07-20, `11bf17fbf66`**: all ten `docs/superpowers/` citations removed from `src/` (nine files); essential rationale folded into the prose, stable tags (B37/R3/S22/T5) kept.
 **Why not in the fix plan:** none of this changes behavior on this branch; it is packaging work for the upstream submission.
 **Return condition:** when drafting upstream PRs — except the non-CA `renameParts` test run (13), which is worth doing at the next convenient CI window.
 
-### 15. `CasLayout.h` parsers out-of-line {#caslayout-inline}
+### 15. `CasLayout.h` parsers out-of-line — DONE 2026-07-20, `4fafb4edb28` {#caslayout-inline}
 
 **What:** `parseRefObjectKey`/`parseManifestKey`/`checkNamespace` (~50 lines each) live inline in a header with 26 direct includers, against the file's own out-of-line precedent.
 **Why deferred:** CAS-internal build-time cost only; zero runtime impact; pure churn best batched with other mechanical moves.
