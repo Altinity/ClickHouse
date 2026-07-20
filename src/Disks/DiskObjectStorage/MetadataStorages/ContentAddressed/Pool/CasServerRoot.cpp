@@ -945,6 +945,10 @@ void SingleWriterSlot::renewOnce()
     /// across the subclass callback.
     const RenewPayload payload = prepareRenew();
 
+    /// INVARIANT: holding `state_mutex` across the PUT below is safe ONLY because (a) doTerminate
+    /// joins the renewal thread before taking this mutex and (b) renewOnce has a single driver.
+    /// Do NOT add new `state_mutex`-guarded accessors without revisiting this (they would stall for
+    /// a full network round trip); the prepareRenew pattern above shows the lock-free alternative.
     std::lock_guard lock(state_mutex);
     /// Reset BEFORE the guards below: a `dead`/`seq==0` throw (a programming-bug guard, not a backend
     /// outcome) must not be misread as a CONFIRMED mismatch by `backgroundLoop` -- it falls into the

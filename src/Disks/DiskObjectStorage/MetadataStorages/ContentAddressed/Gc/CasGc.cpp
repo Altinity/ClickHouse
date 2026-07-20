@@ -624,6 +624,11 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     /// pre-CAS destructive actions may only rely on PREVIOUSLY PUBLISHED state (triage #5).
     for (const RunRef & r : parent_seal_runs)
         referenced_generations.insert(r.generation);
+    /// Retention floor uses THIS round's (post-fold) `generation`, so `gc_snap_generations_to_keep`
+    /// keeps exactly that many generations back from the current one. If this round's `gc/state` CAS
+    /// then LOSES, the prune reclaimed one generation deeper than the durably-adopted generation would
+    /// imply -- an accepted forensics-window slack, not a data-loss risk: every still-reachable
+    /// run/blob is independently protected via `referenced_generations` (captured pre-fold above).
     pruneSupersededGenerations(generation, attempt, next, referenced_generations);
     const CasResult res = backend.casPut(layout.gcStateKey(), encodeGcState(next), state_token);
     if (res.outcome != CasOutcome::Committed)
