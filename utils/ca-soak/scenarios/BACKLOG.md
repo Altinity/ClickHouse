@@ -2719,6 +2719,18 @@ campaign. The CAS gtest battery is green. No CAS action; if pursued, it belongs 
   at the job level, if bounded retry-before-fail-permanently is wanted for CAS table startup, CAS
   itself would need to loop inside `ensureRefTableRecovered`/the seal-PUT call, not rely on
   `AsyncLoader` ever giving it a second chance.
+- **Tried the obvious in-session workaround (manual `DETACH`/`ATTACH`) — it does not work either:**
+  plain `ATTACH TABLE default.ca_stress` (no prior `DETACH`) returns the identical cached error
+  instantly, as expected (the table is already registered in `DatabaseOrdinary`). The prerequisite
+  `DETACH TABLE default.ca_stress` was then tried on its own — it ALSO returns the byte-identical
+  cached error in `0.003s`: `DETACH` itself must wait on the table's `AsyncLoader` job to obtain
+  the live storage object before it can detach it, and that job is the same permanently-`FAILED`
+  one. So there is no way, from SQL alone, to clear this table's stuck state — not even the
+  standard `DETACH`+`ATTACH` recovery recipe works. A full server restart (which schedules a
+  brand-new `AsyncLoader` job set from scratch) is, empirically, the ONLY recovery path once this
+  has happened. This raises the practical severity: an operator hitting this in production cannot
+  self-service a fix without a restart, which is a much bigger deal for a single-digit-second S3
+  hiccup than "requires an explicit reload."
 - **Soak stack state:** left UP per the run's own failure trap (as designed) — `ch1` up (13min at
   time of writing, `SELECT 1` healthy, `ca_stress` permanently unattachable), `ch2` still
   `Exited (243)`, `rustfs1` up and quiet since `22:15:38`. Awaiting a decision on relaunch (`v12`)
