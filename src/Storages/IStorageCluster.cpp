@@ -64,7 +64,7 @@ namespace Setting
     extern const SettingsBool object_storage_remote_initiator;
     extern const SettingsString object_storage_remote_initiator_cluster;
     extern const SettingsObjectStorageClusterJoinMode object_storage_cluster_join_mode;
-    extern const SettingsBool object_storage_cluster_fallback_if_empty;
+    extern const SettingsBool object_storage_cluster_fallback_to_local_if_empty;
 }
 
 namespace ErrorCodes
@@ -378,9 +378,8 @@ IStorageCluster::ResolvedClusterRead IStorageCluster::resolveClusterRead(Context
         result.fallback_to_pure = cluster_name_from_settings.empty();
 
     if (!defer_object_storage_cluster_resolution
-        && useObjectStorageClusterFallbackIfEmpty(context)
         && !result.fallback_to_pure
-        && settings[Setting::object_storage_cluster_fallback_if_empty])
+        && useObjectStorageClusterFallbackIfEmpty(context))
     {
         result.object_storage_cluster = getClusterImpl(
             context,
@@ -396,7 +395,7 @@ IStorageCluster::ResolvedClusterRead IStorageCluster::resolveClusterRead(Context
         auto remote_initiator_cluster_name = settings[Setting::object_storage_remote_initiator_cluster].value;
         if (!remote_initiator_cluster_name.empty())
         {
-            const bool allow_null = settings[Setting::object_storage_cluster_fallback_if_empty]
+            const bool allow_null = settings[Setting::object_storage_cluster_fallback_to_local_if_empty]
                 && (result.fallback_to_pure || usePureFunctionForRemoteInitiator(context));
             result.remote_initiator_cluster = getClusterImpl(
                 context,
@@ -442,7 +441,7 @@ void IStorageCluster::read(
         {
             if (!resolved.remote_initiator_cluster)
             {
-                if (settings[Setting::object_storage_cluster_fallback_if_empty])
+                if (settings[Setting::object_storage_cluster_fallback_to_local_if_empty])
                 {
                     readFallBackToPure(query_plan, column_names, storage_snapshot, query_info, context, processed_stage, max_block_size, num_streams);
                     return;
@@ -646,7 +645,7 @@ SinkToStoragePtr IStorageCluster::write(
 {
     auto cluster_name_from_settings = getClusterName(context);
 
-    // Intentionally do not apply object_storage_cluster_fallback_if_empty here.
+    // Intentionally do not apply object_storage_cluster_fallback_to_local_if_empty here.
     // Cluster write is not supported; applying fallback would make INSERT depend on cluster availability.
     if (cluster_name_from_settings.empty())
         return writeFallBackToPure(query, metadata_snapshot, context, async_insert);

@@ -328,7 +328,7 @@ def test_wrong_cluster(started_cluster):
     assert "not found" in error
 
 
-def test_object_storage_cluster_fallback_if_empty(started_cluster):
+def test_object_storage_cluster_fallback_to_local_if_empty(started_cluster):
     node = started_cluster.instances["s0_0_0"]
 
     pure_s3 = node.query(
@@ -345,7 +345,7 @@ def test_object_storage_cluster_fallback_if_empty(started_cluster):
         'http://minio1:9001/root/data/{{clickhouse,database}}/*',
         'minio', '{minio_secret_key}', 'CSV',
         'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))')
-    SETTINGS object_storage_cluster = 'non_existing_cluster', object_storage_cluster_fallback_if_empty = 1
+    SETTINGS object_storage_cluster = 'non_existing_cluster', object_storage_cluster_fallback_to_local_if_empty = 1
     """
     )
 
@@ -365,7 +365,7 @@ def test_object_storage_cluster_fallback_if_empty(started_cluster):
         'http://minio1:9001/root/data/{{clickhouse,database}}/*',
         'minio', '{minio_secret_key}', 'CSV',
         'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))')
-    SETTINGS object_storage_cluster = 'non_existing_cluster', object_storage_cluster_fallback_if_empty = 1
+    SETTINGS object_storage_cluster = 'non_existing_cluster', object_storage_cluster_fallback_to_local_if_empty = 1
     """
     )
 
@@ -381,7 +381,7 @@ def test_object_storage_cluster_fallback_if_empty(started_cluster):
             object_storage_remote_initiator=1,
             object_storage_cluster='hidden_cluster_with_username_and_password',
             object_storage_remote_initiator_cluster='cluster_with_dots',
-            object_storage_cluster_fallback_if_empty=1
+            object_storage_cluster_fallback_to_local_if_empty=1
         """,
         query_id=query_id,
     )
@@ -420,7 +420,7 @@ def test_object_storage_cluster_fallback_if_empty(started_cluster):
         object_storage_remote_initiator=1,
         object_storage_cluster='non_existing_cluster',
         object_storage_remote_initiator_cluster='cluster_with_dots_and_user',
-        object_storage_cluster_fallback_if_empty=1
+        object_storage_cluster_fallback_to_local_if_empty=1
     """,
         query_id=query_id,
     )
@@ -451,7 +451,7 @@ def test_object_storage_cluster_fallback_if_empty(started_cluster):
             object_storage_remote_initiator=1,
             object_storage_cluster='non_existing_cluster',
             object_storage_remote_initiator_cluster='cluster_with_dots',
-            object_storage_cluster_fallback_if_empty=1
+            object_storage_cluster_fallback_to_local_if_empty=1
         """,
         query_id=query_id,
     )
