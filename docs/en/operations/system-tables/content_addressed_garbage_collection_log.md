@@ -16,7 +16,7 @@ of objects marked and deleted, the round duration, the outcome, and a per-round 
 delta.
 
 Rounds are emitted both by the background GC scheduler (`trigger = 'Scheduled'`) and by the
-synchronous [`SYSTEM CONTENT ADDRESSED GARBAGE COLLECTION`](/sql-reference/statements/system#content-addressed-garbage-collection)
+synchronous [`SYSTEM CONTENT ADDRESSED GC RUN`](/sql-reference/statements/system#content-addressed-garbage-collection)
 command (`trigger = 'Manual'`).
 
 The table is created only if the `content_addressed_garbage_collection_log` server setting is
@@ -69,7 +69,7 @@ FORMAT Vertical;
 
 ## See Also {#see-also}
 
-- [`SYSTEM CONTENT ADDRESSED GARBAGE COLLECTION`](/sql-reference/statements/system#content-addressed-garbage-collection) — run one GC round synchronously.
+- [`SYSTEM CONTENT ADDRESSED GC RUN`](/sql-reference/statements/system#content-addressed-garbage-collection) — run one GC round synchronously.
 - [`system.content_addressed_mounts`](/operations/system-tables/content_addressed_mounts) — live per-`srid` mount and GC-health state.
 - [`system.content_addressed_log`](/operations/system-tables/content_addressed_log) — per-decision event log for the CA garbage collector and writer.
 - [`system.part_log`](/operations/system-tables/part_log) — the analogous per-part event log.

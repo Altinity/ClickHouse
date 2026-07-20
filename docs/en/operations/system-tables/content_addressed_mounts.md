@@ -66,5 +66,5 @@ FORMAT Vertical;
 
 - [`system.content_addressed_garbage_collection_log`](/operations/system-tables/content_addressed_garbage_collection_log) — per-round GC event log.
 - [`system.content_addressed_log`](/operations/system-tables/content_addressed_log) — per-decision event log for the CA garbage collector and writer.
-- [`SYSTEM CONTENT ADDRESSED GARBAGE COLLECTION`](/sql-reference/statements/system#content-addressed-garbage-collection) — run one GC round synchronously.
+- [`SYSTEM CONTENT ADDRESSED GC RUN`](/sql-reference/statements/system#content-addressed-garbage-collection) — run one GC round synchronously.
 - [`SYSTEM CONTENT ADDRESSED DROP POOL MEMBER`](/sql-reference/statements/system#system-content-addressed-drop-pool-member) — permanently decommission a dead pool member's `srid`.

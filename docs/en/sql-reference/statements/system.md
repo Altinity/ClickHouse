@@ -457,12 +457,12 @@ Wait until all asynchronously loading data parts of a table (outdated data parts
 SYSTEM WAIT LOADING PARTS [ON CLUSTER cluster_name] [db.]merge_tree_family_table_name
 ```
 
-### SYSTEM CONTENT ADDRESSED GARBAGE COLLECTION {#content-addressed-garbage-collection}
+### SYSTEM CONTENT ADDRESSED GC RUN {#content-addressed-garbage-collection}
 
 Runs one garbage-collection round of the content-addressed (CA) MergeTree garbage collector synchronously and node-local: it reclaims content-addressed objects that are no longer referenced by any part. This is the on-demand counterpart of the background GC scheduler; it is useful for tests and diagnostics.
 
 ```sql
-SYSTEM CONTENT ADDRESSED GARBAGE COLLECTION [ON CLUSTER cluster_name] [disk_name]
+SYSTEM CONTENT ADDRESSED GC RUN [ON CLUSTER cluster_name] [disk_name]
 ```
 
 When `disk_name` is given, the round runs on that content-addressed disk only; targeting a non-content-addressed disk raises an exception. When `disk_name` is omitted, one round runs on every content-addressed disk configured on the node; if none are configured, the command raises an exception.
@@ -486,7 +486,7 @@ a later round delete objects that are still referenced.
 SYSTEM CONTENT ADDRESSED GC REBUILD [FORCE] [ON CLUSTER cluster_name] disk_name
 ```
 
-Unlike `SYSTEM CONTENT ADDRESSED GARBAGE COLLECTION`, `disk_name` is **required**: the destructive
+Unlike `SYSTEM CONTENT ADDRESSED GC RUN`, `disk_name` is **required**: the destructive
 baseline rebuild must never fan out across every content-addressed disk on the node from a bare
 command; targeting a non-content-addressed disk raises an exception.
 

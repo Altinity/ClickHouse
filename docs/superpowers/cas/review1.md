@@ -72,7 +72,7 @@ Evidence: For an Ordinary DB (no UUID anchor), the rightmost part-dir-shaped com
 part detached at drop time is a permanently orphaned live ref keeping its blobs reachable forever.
 Proposed fix: In the non-Atomic fallback, special-case kDetachedDirName — anchor on detached when scanning right-to-left. (Ordinary engine is deprecated; still supported, s
 
-7. SYSTEM CONTENT ADDRESSED GARBAGE COLLECTION builds a fresh Cas::Gc per call — can't recover a dead-incumbent lease, and runs unsynchronized against the background loop
+7. SYSTEM CONTENT ADDRESSED GC RUN builds a fresh Cas::Gc per call — can't recover a dead-incumbent lease, and runs unsynchronized against the background loop
 Risk score: 55 · Sources: concurrency, code-quality-integration, tests · Confidence: high
 Files/lines: CasGcScheduler.cpp:170-174 (runOneRoundNow) vs :176-244 (loop), CasGc.h:118-119,342-358.
 Evidence: loop() keeps one Gc instance for the thread's life specifically because the lease-steal protocol needs a stable observer across consecutive rounds. runOneRoundNowc(store, gc_id) every call, so its has_observation/last_seen_owner reset each time — re-issuing the SQL command can never accumulate the two observations needed to steal astuck lease from a dead peer's gc_id. Separately, runOneRoundNow takes no lock against the live loop() thread, so a manual round and a scheduled round run concurrently under the same gc_id — the class comment calls this unsupported ("duplicate ids make two leaders indistinguishable"). CAS-token safety likely caps damage to duplicated work, but it's a documented-contract
@@ -144,7 +144,7 @@ ContentAddressedTransaction.cpp:1320-1336.
 - Two new system logs ship enabled-by-default yet SystemLog.h:20-21 documents content_addressed_log as "off by default" — reconcile comment vs config.xml.
 - server_root_id missing-key error throws a raw Poco NotFoundException instead of a ClickHouse Exception (compare the metadata_type check 3 lines up). MetadataStorageFactor
 - Stale notYet message points at cache-over-CA as "not supported yet," but that was fixed earlier in this range. ContentAddressedTransaction.cpp:61-71.
-- cas_-prefix inconsistency across ~4 of ~20 disk config keys; verb-less SYSTEM CONTENT ADDRESSED GARBAGE COLLECTION is the only SYSTEM command with no leading verb.
+- cas_-prefix inconsistency across ~4 of ~20 disk config keys; the command had no verb at all (a bare `GARBAGE COLLECTION` noun phrase) — fixed by the later F1 rename to `SYSTEM CONTENT ADDRESSED GC RUN`.
 - CAS relink advertises the wrong disk's pool UUID in a tiered CA+non-CA policy → LOGICAL_ERROR instead of graceful byte-fetch fallback (code-quality-integration, risk 55,  to be a supported config). DataPartsExchange.cpp:534-551,715-718.
 - CasLayout.h is 527 lines fully inline across 27 TUs — move the non-trivial parsers to a .cpp (header-hygiene, contained to the CAS module; no shared-header leakage found  clean).
 

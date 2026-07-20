@@ -458,7 +458,7 @@ Setting `metadata_type` to `content_addressed` turns a disk into a content-addre
 object is addressed by the hash of its content rather than by a randomly generated blob name, so
 identical content written by different parts (or different tables) is stored once and shared. A
 background garbage collector reclaims objects once no part references them anymore; see
-[`SYSTEM CONTENT ADDRESSED GARBAGE COLLECTION`](/sql-reference/statements/system#content-addressed-garbage-collection),
+[`SYSTEM CONTENT ADDRESSED GC RUN`](/sql-reference/statements/system#content-addressed-garbage-collection),
 [`SYSTEM CONTENT ADDRESSED GC REBUILD`](/sql-reference/statements/system#system-content-addressed-gc-rebuild),
 [`SYSTEM CONTENT ADDRESSED DROP POOL MEMBER`](/sql-reference/statements/system#system-content-addressed-drop-pool-member),
 and the [`system.content_addressed_garbage_collection_log`](/operations/system-tables/content_addressed_garbage_collection_log),

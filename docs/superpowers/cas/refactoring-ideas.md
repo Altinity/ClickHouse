@@ -380,7 +380,7 @@ meta) lands and soaks.
    `existsFile` and `getStorageObjects` probe presence via the HEAD-based `Store::mountpointObjectExists`
    (no body read).
 2. **01271_show_privileges — stale reference. RESOLVED (`79db187695a`, 2026-07-10).** Reference regenerated
-   with the `SYSTEM CONTENT ADDRESSED GARBAGE COLLECTION` row.
+   with the `SYSTEM CONTENT ADDRESSED GC RUN` row.
 3. **05008_ca_gc_snap_prune — test/schema mismatch. RESOLVED (`79db187695a`, 2026-07-10).**
    `forgotten_on_delete` never existed on this branch, and the P9 `GcSnap::forget` counter was removed with
    the source-edge-set GC model — so the test now asserts the ack-floor invariant

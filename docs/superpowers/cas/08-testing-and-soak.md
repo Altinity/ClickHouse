@@ -139,7 +139,7 @@ One `Start` row and one `Finish` row per GC round, emitted by `CasGcScheduler` v
 | `event_type` | `'Start'` or `'Finish'` |
 | `disk_name` | the CA pool the round ran on |
 | `gc_id` | random `u128` hex identifying the scheduler instance (which mounter led) |
-| `trigger` | `'Scheduled'` (background tick) or `'Manual'` (`SYSTEM CONTENT ADDRESSED GARBAGE COLLECTION`) |
+| `trigger` | `'Scheduled'` (background tick) or `'Manual'` (`SYSTEM CONTENT ADDRESSED GC RUN`) |
 | `round` | monotone round counter |
 | `outcome` | `'Success'`, `'NotALeader'`, or `'Error'` |
 | `candidates_marked` | refs retired/marked this round |

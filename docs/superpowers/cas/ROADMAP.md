@@ -130,7 +130,7 @@ See [`04-gc-protocol.md`](04-gc-protocol.md) for full detail.
 | Common-shard-prefix for GC discovery (IDEA-COMMON-SHARD-PREFIX-SINGLE-LIST) | **DONE / realized** | Shard (ref) objects already live in ONE flat prefix `cas/refs/<ns>/<shard>` since the Phase-1 relocation (`f5f96dce01a`), so GC discovery IS a single paged `LIST(cas/refs/)`. The idea's goal is met; nothing further to relocate |
 | Run-file O(buffer) streaming | **DONE** (T2, 2026-07-02) | `RunFileReader` streaming mode (borrowed-memory + streaming); true ranged reads in `CasObjectStorageBackend` + `getStream` seam; the whole-run `full` member is gone. See the T2 row under [GC protocol](#area-gc) |
 | `inDegreeInGeneration` O(candidates × runsize) | **RESOLVED** by the ack-floor round | The per-candidate recheck whole-run re-read is gone — the retired cursor rides the single three-cursor merge; the function remains only for preview/tests |
-| `SYSTEM CONTENT ADDRESSED GARBAGE COLLECTION [<disk>]` command | **DONE** | Synchronous explicit GC trigger; logs to `system.content_addressed_garbage_collection_log` |
+| `SYSTEM CONTENT ADDRESSED GC RUN [<disk>]` command | **DONE** | Synchronous explicit GC trigger; logs to `system.content_addressed_garbage_collection_log` |
 | GC S3 budget: HEAD storm (B148) — `resolveRef` HEAD per warm hit + condemn HEAD per **new** candidate | **PARTIAL** | The retire/recheck O(universe) HEAD+GET phases are gone (ack-floor round); the remaining condemn HEAD is bounded by newly-condemned candidates, and the discovery LIST is now the dominant scale item (see the O(N²)-LIST row) |
 | B168 op-count reduction program (P4/P7: fewer metadata writes) | **PARTIAL** | Some items done; the fence-related items (P6 dirty-only fence) are moot — the fence is gone (ack-floor round). Remainder tracked in `07-s3-budget.md §reduction-history` |
 
@@ -209,7 +209,7 @@ See [`09-read-protocol.md`](09-read-protocol.md) for full detail.
 | `clickhouse-disks fsck` | **DONE** | Independent pool reachability verification |
 | `clickhouse-disks ca-gc-dryrun` | **DONE** | GC delete preview (zero writes) |
 | Read-only disk mode (WORM deployment) | **DONE** | |
-| `SYSTEM CONTENT ADDRESSED GARBAGE COLLECTION` command | **DONE** | |
+| `SYSTEM CONTENT ADDRESSED GC RUN` command | **DONE** | |
 | Capability gate: reject unsupported ops at `CREATE`/`ATTACH` with clear error (B31) | **DONE (2026-07-13 verified)** | `supportZeroCopyReplication()==false` for CA (B31 comment, `DiskObjectStorage.h:54`); `supportsHardLinks()==true` deliberately (mutations route through a whole-part transaction); unsupported ops rejected by independent gates (ALTER PARTITION throws `not supported on a content_addressed disk`; BACKUP restore routes through a whole-part transaction) |
 | `SYSTEM` control commands: START/STOP GC, POOL READONLY, CHECK (B197) | **TODO** (HARD) | |
 | `system.*` views for pool/blob/part refcounts + GC status + frozen snapshots (B15/B99/B169/B159) | **PARTIAL** | GC log + event log + fsck/dryrun/rebuild CLI done; per-part/ref views and a `clickhouse-disks` decode/introspect (top-down traversal) surface not yet |
