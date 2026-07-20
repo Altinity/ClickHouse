@@ -310,15 +310,35 @@ void CachedPartFolderAccess::publishEntries(const PartRefKey & dst,
 {
     auto build = store->beginPartWrite(Cas::PartWriteInfo{.intended_ref = dst.ns.string() + "/" + dst.ref,
                                                   .intended_namespace = dst.ns, .op = op});
-    /// Record write evidence for each non-inline entry. No pool HEAD/GET is performed before
-    /// precommit; the promote path re-proves each dependency fail-closed. Inline entries need no evidence.
-    for (const auto & entry : entries)
-        build->adoptEvidence(entry);
-    /// Stage a fresh manifest over the same entries. Blobs are content-addressed, but each part owns
-    /// its manifest ID, so `dst` receives a distinct manifest before ownership moves to it.
-    const Cas::ManifestId id = build->stageManifest(entries);
-    build->precommitAdd(dst.ns, dst.ref, id);
-    promoteBuild(*build, dst, build->buildId(), id, allow_repoint);
+    try
+    {
+        /// Record write evidence for each non-inline entry. No pool HEAD/GET is performed before
+        /// precommit; the promote path re-proves each dependency fail-closed. Inline entries need no evidence.
+        for (const auto & entry : entries)
+            build->adoptEvidence(entry);
+        /// Stage a fresh manifest over the same entries. Blobs are content-addressed, but each part owns
+        /// its manifest ID, so `dst` receives a distinct manifest before ownership moves to it.
+        const Cas::ManifestId id = build->stageManifest(entries);
+        build->precommitAdd(dst.ns, dst.ref, id);
+        promoteBuild(*build, dst, build->buildId(), id, allow_repoint);
+    }
+    catch (...)
+    {
+        /// A failed publish must not leak a live-epoch precommit binding: only `abandon` removes it
+        /// (the build destructor merely retires the build seq; the stale-precommit sweep is
+        /// prior-epoch-scoped and GC never touches a live precommit). `abandon` may itself fail on the
+        /// same broken backend -- log and let the original error stay primary.
+        try
+        {
+            build->abandon();
+        }
+        catch (...)
+        {
+            tryLogCurrentException(getLogger("CachedPartFolderAccess"),
+                                   "abandoning the build of a failed publishEntries");
+        }
+        throw;
+    }
 }
 
 bool CachedPartFolderAccess::republishRef(const PartRefKey & src, const PartRefKey & dst)

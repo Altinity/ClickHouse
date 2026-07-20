@@ -3,6 +3,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Disks/tests/cas_test_helpers.h>
 #include <Common/ProfileEvents.h>
+#include <Poco/Exception.h>
 #include <Poco/Util/XMLConfiguration.h>
 #include <gtest/gtest.h>
 #include <latch>
@@ -14,6 +15,7 @@ namespace DB::ErrorCodes
     extern const int FILE_DOESNT_EXIST;
     extern const int ABORTED;
     extern const int BAD_ARGUMENTS;
+    extern const int CORRUPTED_DATA;
 }
 
 namespace ProfileEvents
@@ -110,6 +112,41 @@ private:
     {
         if (armed.load())
             throw Exception(ErrorCodes::ABORTED, "injected backend outage");
+    }
+};
+
+/// Task 7 (`publishEntries` abandons its build on exception): forces publishEntries's PROMOTE step
+/// specifically -- not the earlier stageManifest/precommitAdd writes -- to observe a proven ref-log
+/// conflict. `skip` lets the FIRST matching '_log/' PUT (precommitAdd's OwnerTransition-to-Precommit)
+/// land normally; the fault then fires on the SECOND (promote's atomic precommit->committed move).
+/// Mirrors `RefWriterTestBackend::corrupt_key_substr` (gtest_cas_ref_writer.cpp, reproduced locally
+/// because that class lives in a different translation unit): landing a DIFFERENT object at the
+/// intended key makes `putIfAbsentControlled`'s resolve-before-reissue observe a proven conflict
+/// (CORRUPTED_DATA) rather than the ambiguous-timeout shape, which would instead wedge the whole
+/// table's append lane.
+class PromoteConflictOnceBackend final : public Cas::InMemoryBackend
+{
+public:
+    String fault_key_substr;
+    int skip = 0;
+    int fault_count = 0;
+
+    Cas::PutResult putIfAbsent(const String & key, const String & bytes, const Cas::ObjectMeta & meta) override
+    {
+        if (!fault_key_substr.empty() && key.find(fault_key_substr) != String::npos)
+        {
+            if (skip > 0)
+                --skip;
+            else if (fault_count > 0)
+            {
+                --fault_count;
+                /// The 3-arg qualified call bypasses virtual dispatch entirely (unlike a 2-arg
+                /// convenience overload, which would re-enter this very override through the vtable).
+                InMemoryBackend::putIfAbsent(key, bytes + String("\x01_FOREIGN_DIFFERENT"), meta);
+                throw Poco::TimeoutException("PromoteConflictOnceBackend: a foreign different object landed; response lost");
+            }
+        }
+        return InMemoryBackend::putIfAbsent(key, bytes, meta);
     }
 };
 
@@ -285,6 +322,39 @@ TEST(CasPartFolderAccess, RepublishRefIdempotentRedriveAndConflict)
     publishPart(store, ns, "dst2", {inlineEntry("f", "two")});
     expectThrowsCode(ErrorCodes::ABORTED, [&] { access.republishRef({ns, "src2"}, {ns, "dst2"}); });
     EXPECT_TRUE(access.existsRef({ns, "src2"}, Cas::Freshness::ForceFresh));
+}
+
+/// Task 7: `publishEntries`'s `catch (...) { build->abandon(); throw; }` must leave no live-epoch
+/// precommit binding behind when its promote fails -- only `abandon()` removes it (the build
+/// destructor merely retires the build seq; GC never touches a live precommit). Drives the failure
+/// through `republishRef` -> `publishEntries`, with the fault isolated to promote's own ref-log
+/// append (precommitAdd's own append is let through first via `skip`).
+TEST(CasPartFolderAccess, PublishEntriesAbandonsBuildOnPromoteFailure)
+{
+    auto backend = std::make_shared<PromoteConflictOnceBackend>();
+    auto store = Cas::Pool::open(backend, Cas::PoolConfig{.pool_prefix = "p", .server_root_id = "test"});
+    const Cas::RootNamespace ns{"srv/t1"};
+    Cas::CachedPartFolderAccess access(store);
+
+    publishPart(store, ns, "src", {inlineEntry("f", "same")});
+
+    backend->fault_key_substr = store->layout().refsNamespacePrefix(ns) + "_log/";
+    backend->skip = 1;         /// let precommitAdd's own ref-log append land normally
+    backend->fault_count = 1;  /// fault exactly promote's ref-log append
+
+    /// republishRef(src, dst) drives publishEntries(dst, ...): precommitAdd succeeds, promote's
+    /// appendRefOps observes a proven conflict and throws CORRUPTED_DATA -- publishEntries's catch must
+    /// abandon() the build before rethrowing.
+    expectThrowsCode(ErrorCodes::CORRUPTED_DATA, [&] { access.republishRef({ns, "src"}, {ns, "dst"}); });
+    EXPECT_FALSE(access.existsRef({ns, "dst"}, Cas::Freshness::ForceFresh)) << "the failed promote never committed dst";
+
+    /// No live precommit binding was leaked for dst: a fresh build can precommitAdd the SAME (ns, "dst")
+    /// ref without hitting "add precommit ... already exists" -- proven exactly like
+    /// CasPartWriteTxn.AbandonAppendsPrecommitRemovalAndKeepsLivePrecommitBody (gtest_cas_part_write.cpp).
+    auto rebuild = store->beginPartWrite(Cas::PartWriteInfo{.intended_ref = ns.string() + "/dst",
+                                                  .intended_namespace = ns, .op = Cas::ProvenanceOp::Other});
+    const Cas::ManifestId rebuild_id = rebuild->stageManifest({inlineEntry("f", "same")});
+    EXPECT_NO_THROW(rebuild->precommitAdd(ns, "dst", rebuild_id));
 }
 
 TEST(CasPartFolderAccess, ExplainRecordsDecisions)
