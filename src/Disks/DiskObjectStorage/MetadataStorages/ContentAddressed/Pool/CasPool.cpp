@@ -509,6 +509,9 @@ PoolPtr Pool::openForDecommission(BackendPtr backend, PoolConfig config, const S
     config.server_root_id = victim_srid;
     config.read_only = false;
     config.skip_access_check = true;   /// the pool exists (the calling disk validated it); no probe writes
+    /// The admin claim must be RENEWED like any writable mount: the host disk may be observe-only
+    /// (background_watermark=false), but an unrenewed claim (TTL ~30s) aborts any long drain midway.
+    config.background_watermark = true;
 
     Layout layout(config.pool_prefix);
 

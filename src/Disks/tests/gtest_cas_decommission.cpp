@@ -398,6 +398,23 @@ TEST(CasDecommission, ClaimsDeadMemberAndBumpsEpoch)
     EXPECT_EQ(admin->poolConfig().server_root_id, "victim");
 }
 
+TEST(CasDecommission, AlwaysRenewsAdminClaimEvenWhenHostDiskIsObserveOnly)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    {
+        auto victim = openVictim(backend);
+    }   /// graceful close: lease stamped already-expired + farewell — the slot is claimable
+
+    /// The calling (host) disk may be observe-only, i.e. its own PoolConfig carries
+    /// background_watermark = false. The decommission admin claim must renew its lease
+    /// regardless -- a long drain must not expire midway just because the host mount doesn't
+    /// run a background renewer for its OWN mount.
+    auto admin = Pool::openForDecommission(
+        backend, PoolConfig{.pool_prefix = "p", .server_root_id = "admin", .background_watermark = false}, "victim");
+    ASSERT_TRUE(admin != nullptr);
+    EXPECT_TRUE(admin->poolConfig().background_watermark);
+}
+
 TEST(CasDecommission, RefusesUnknownMember)
 {
     auto backend = std::make_shared<InMemoryBackend>();
