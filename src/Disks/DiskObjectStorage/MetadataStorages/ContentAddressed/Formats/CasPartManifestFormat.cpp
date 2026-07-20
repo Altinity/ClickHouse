@@ -4,7 +4,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasCodecUtil.h>
 #include <Common/Exception.h>
 #include <IO/ReadBufferFromMemory.h>
-#include <IO/WriteBufferFromString.h>
 #include <IO/WriteHelpers.h>
 #include <city.h>
 #include <algorithm>
@@ -42,7 +41,7 @@ EntryPlacement placementFromWord(std::string_view w)
 }
 
 /// One entry-record line: {"p","pm", then either the Blob's "ha"/"h"/"sz" or the Inline's "il"}.
-void writeEntryRecord(WriteBuffer & out, const ManifestEntry & e)
+void writeEntryRecord(CasJsonWriter & out, const ManifestEntry & e)
 {
     bool first = true;
     writeKey(out, "p", first);
@@ -88,7 +87,7 @@ String encodePartManifest(const PartManifest & m)
         if (sorted[i]->path == sorted[i - 1]->path)
             throw Exception(ErrorCodes::CORRUPTED_DATA, "PartManifest: duplicate path '{}'", sorted[i]->path);
 
-    WriteBufferFromOwnString out;
+    CasJsonWriter out(256);
     writeHeaderLine(out, FormatId::PartManifest);
 
     /// descriptor meta line: ManifestRef (me/mb/mo, shared rendering with refsnaplog) + root
@@ -116,14 +115,13 @@ String encodePartManifest(const PartManifest & m)
         if (e->placement != EntryPlacement::Inline)
             continue;
         const String banner = bannerFor(e->path, e->inline_bytes.size());
-        out.write(banner.data(), banner.size());
+        out.append(banner);
         writeChar('\n', out);
-        out.write(e->inline_bytes.data(), e->inline_bytes.size());
+        out.append(e->inline_bytes);
         writeChar('\n', out);
     }
 
-    out.finalize();
-    return out.str();
+    return std::move(out).take();
 }
 
 PartManifest decodePartManifest(std::string_view data)

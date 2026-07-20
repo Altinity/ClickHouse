@@ -2,7 +2,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasTextFormat.h>
 #include <Common/Exception.h>
 #include <IO/ReadBufferFromMemory.h>
-#include <IO/WriteBufferFromString.h>
 #include <IO/WriteHelpers.h>
 #include <base/defines.h>
 
@@ -22,7 +21,7 @@ String encodeGcState(const GcState & state)
 {
     if (state.gc_shards < 1)
         throw Exception(ErrorCodes::LOGICAL_ERROR, "encodeGcState: gc_shards must be >= 1 -- refusing to persist an unreadable gc/state");
-    WriteBufferFromOwnString out;
+    CasJsonWriter out(256);
     writeHeaderLine(out, FormatId::GcState);
     bool first = true;
     writeKey(out, "rnd", first); writeU64StringValue(out, state.round);
@@ -35,8 +34,7 @@ String encodeGcState(const GcState & state)
     writeKey(out, "ls", first);  writeU64StringValue(out, state.lease.seq);
     closeObject(out, first);
     writeChar('\n', out);
-    out.finalize();
-    return out.str();
+    return std::move(out).take();
 }
 
 GcState decodeGcState(std::string_view data)
@@ -75,15 +73,14 @@ GcState decodeGcState(std::string_view data)
 
 String encodeGcHeartbeat(const GcHeartbeat & hb)
 {
-    WriteBufferFromOwnString out;
+    CasJsonWriter out(256);
     writeHeaderLine(out, FormatId::GcHeartbeat);
     bool first = true;
     writeKey(out, "by", first);  writeHex128Value(out, hb.owner);
     writeKey(out, "seq", first); writeU64StringValue(out, hb.hb_seq);
     closeObject(out, first);
     writeChar('\n', out);
-    out.finalize();
-    return out.str();
+    return std::move(out).take();
 }
 
 GcHeartbeat decodeGcHeartbeat(std::string_view data)

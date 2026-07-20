@@ -3,7 +3,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasWireVocab.h>
 #include <Common/Exception.h>
 #include <IO/ReadBufferFromMemory.h>
-#include <IO/WriteBufferFromString.h>
 #include <IO/WriteHelpers.h>
 
 namespace DB
@@ -45,7 +44,7 @@ OutcomeKind outcomeKindFromWord(std::string_view w)
 
 String encodeOutcomeLog(const OutcomeLog & log)
 {
-    WriteBufferFromOwnString out;
+    CasJsonWriter out(256);
     writeHeaderLine(out, FormatId::GcOutcomes);
     for (const OutcomeEntry & e : log.entries)
     {
@@ -60,8 +59,7 @@ String encodeOutcomeLog(const OutcomeLog & log)
         writeChar('\n', out);
     }
     writeTrailerLine(out, log.entries.size());
-    out.finalize();
-    return out.str();
+    return std::move(out).take();
 }
 
 OutcomeLog decodeOutcomeLog(std::string_view data)

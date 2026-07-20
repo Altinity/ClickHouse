@@ -3,7 +3,6 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasWireVocab.h>
 #include <Common/Exception.h>
 #include <IO/ReadBufferFromMemory.h>
-#include <IO/WriteBufferFromString.h>
 #include <IO/WriteHelpers.h>
 #include <algorithm>
 
@@ -39,7 +38,7 @@ RefNsCleanupState nsCleanupStateFromWord(std::string_view w)
 }
 
 /// Emit one run record (`k` = "btr"); the caller sorts the vector by key first.
-void writeRun(WriteBuffer & out, std::string_view kind, const RunRef & r)
+void writeRun(CasJsonWriter & out, std::string_view kind, const RunRef & r)
 {
     bool first = true;
     writeKey(out, "k", first);     writeStringValue(out, kind);
@@ -51,7 +50,7 @@ void writeRun(WriteBuffer & out, std::string_view kind, const RunRef & r)
     writeChar('\n', out);
 }
 
-void writeSortedRuns(WriteBuffer & out, std::string_view kind, std::vector<RunRef> runs)
+void writeSortedRuns(CasJsonWriter & out, std::string_view kind, std::vector<RunRef> runs)
 {
     std::sort(runs.begin(), runs.end(), [](const RunRef & a, const RunRef & b) { return a.key < b.key; });
     for (const RunRef & r : runs)
@@ -62,7 +61,7 @@ void writeSortedRuns(WriteBuffer & out, std::string_view kind, std::vector<RunRe
 
 String encodeFoldSeal(const CasFoldSeal & seal)
 {
-    WriteBufferFromOwnString out;
+    CasJsonWriter out(256);
     writeHeaderLine(out, FormatId::FoldSeal);
 
     /// meta line
@@ -123,8 +122,7 @@ String encodeFoldSeal(const CasFoldSeal & seal)
     }
 
     writeTrailerLine(out, n);
-    out.finalize();
-    return out.str();
+    return std::move(out).take();
 }
 
 CasFoldSeal decodeFoldSeal(std::string_view data, std::optional<uint64_t> expected_generation)
