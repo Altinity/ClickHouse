@@ -1037,6 +1037,12 @@ BlockIO InterpreterSystemQuery::execute()
             contentAddressedMount(query.disk);
             break;
         }
+        case Type::CONTENT_ADDRESSED_FSCK:
+        {
+            getContext()->checkAccess(AccessType::SYSTEM_CONTENT_ADDRESSED_FSCK);
+            result = runContentAddressedFsck(query.disk);
+            break;
+        }
         case Type::CONTENT_ADDRESSED_DROP_POOL_MEMBER:
         {
             getContext()->checkAccess(AccessType::SYSTEM_CONTENT_ADDRESSED_DROP_POOL_MEMBER);
@@ -2324,6 +2330,12 @@ ColumnsDescription contentAddressedGcRoundColumns()
         {"entries_redeleted", std::make_shared<DataTypeUInt64>()},
         {"fence_outs", std::make_shared<DataTypeUInt64>()},
         {"anomalies", std::make_shared<DataTypeUInt64>()},
+        /// Task 7: the retire pipeline's REMAINING (not this-round-delta) sizes, read from the gc/state
+        /// this round's single CAS just published -- see `Cas::RoundReport`'s field comments. Zero on a
+        /// non-authoritative row (!acquired_lease or deferred), same as every other counter above.
+        {"pending_candidates", std::make_shared<DataTypeUInt64>()},
+        {"pending_condemned", std::make_shared<DataTypeUInt64>()},
+        {"pending_retired", std::make_shared<DataTypeUInt64>()},
     }};
 }
 
@@ -2345,6 +2357,9 @@ void appendContentAddressedGcRoundRow(MutableColumns & res_columns, const String
     res_columns[i++]->insert(rep.redeleted);
     res_columns[i++]->insert(rep.fence_outs);
     res_columns[i++]->insert(rep.anomalies.size());
+    res_columns[i++]->insert(rep.pending_candidates);
+    res_columns[i++]->insert(rep.pending_condemned);
+    res_columns[i++]->insert(rep.pending_retired);
 }
 
 ColumnsDescription contentAddressedGcRebuildColumns()
@@ -2378,6 +2393,43 @@ void appendContentAddressedGcRebuildRow(MutableColumns & res_columns, const Stri
     res_columns[i++]->insert(rep.unowned_alive_manifests);
     res_columns[i++]->insert(rep.edges);
     res_columns[i++]->insert(rep.clamped_shards);
+}
+
+/// SYSTEM CONTENT ADDRESSED FSCK's one-row-per-disk summary (Task 7). Per the brief: named UInt64
+/// columns only, no DETAIL keyword yet (YAGNI -- the offline `clickhouse-disks fsck --detail` applet
+/// already covers per-object listing). Field order/names mirror `Cas::FsckReport` exactly, restricted
+/// to the subset the brief calls out (see also `CommandFsck.cpp`'s summary line for the same fields).
+ColumnsDescription contentAddressedFsckColumns()
+{
+    return ColumnsDescription{NamesAndTypesList{
+        {"disk", std::make_shared<DataTypeString>()},
+        {"reachable", std::make_shared<DataTypeUInt64>()},
+        {"dangling", std::make_shared<DataTypeUInt64>()},
+        {"unreachable", std::make_shared<DataTypeUInt64>()},
+        {"pending_gc", std::make_shared<DataTypeUInt64>()},
+        {"awaiting_gc", std::make_shared<DataTypeUInt64>()},
+        {"unaccounted", std::make_shared<DataTypeUInt64>()},
+        {"physical_bytes", std::make_shared<DataTypeUInt64>()},
+        {"referenced_logical_bytes", std::make_shared<DataTypeUInt64>()},
+        {"distinct_blobs", std::make_shared<DataTypeUInt64>()},
+        {"total_blob_refs", std::make_shared<DataTypeUInt64>()},
+    }};
+}
+
+void appendContentAddressedFsckRow(MutableColumns & res_columns, const String & disk_name, const Cas::FsckReport & rep)
+{
+    size_t i = 0;
+    res_columns[i++]->insert(disk_name);
+    res_columns[i++]->insert(rep.reachable);
+    res_columns[i++]->insert(rep.dangling);
+    res_columns[i++]->insert(rep.unreachable);
+    res_columns[i++]->insert(rep.pending_gc);
+    res_columns[i++]->insert(rep.awaiting_gc);
+    res_columns[i++]->insert(rep.unaccounted);
+    res_columns[i++]->insert(rep.physical_bytes);
+    res_columns[i++]->insert(rep.referenced_logical_bytes);
+    res_columns[i++]->insert(rep.distinct_blobs);
+    res_columns[i++]->insert(rep.total_blob_refs);
 }
 
 }
@@ -2489,6 +2541,35 @@ void InterpreterSystemQuery::contentAddressedMount(const String & disk_name)
     if (!ca)
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Disk '{}' is not a content-addressed disk", disk_name);
     ca->mountExplicitly();
+}
+
+BlockIO InterpreterSystemQuery::runContentAddressedFsck(const String & disk_name)
+{
+    /// Dormant-only: a live mount stays serving normal traffic; FSCK requires the operator to
+    /// `SYSTEM CONTENT ADDRESSED UNMOUNT` first (quiesced pool). The disk is REQUIRED, enforced by
+    /// the parser -- there is no fan-out form.
+    if (disk_name.empty())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "SYSTEM CONTENT ADDRESSED FSCK requires an explicit disk name");
+
+    auto disk = getContext()->getDisk(disk_name);
+    auto * ca = ContentAddressedMetadataStorage::tryFromDisk(disk);
+    if (!ca)
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Disk '{}' is not a content-addressed disk", disk_name);
+
+    const Cas::FsckReport rep = ca->runFsckOnDormant(/* detail= */ false);   /// summary only (no DETAIL keyword yet)
+
+    ColumnsDescription columns = contentAddressedFsckColumns();
+    Block sample_block;
+    for (const auto & column : columns)
+        sample_block.insert({column.type->createColumn(), column.type, column.name});
+    MutableColumns res_columns = sample_block.cloneEmptyColumns();
+    appendContentAddressedFsckRow(res_columns, disk_name, rep);
+
+    size_t num_rows = res_columns[0]->size();
+    auto source = std::make_shared<SourceFromSingleChunk>(std::make_shared<const Block>(std::move(sample_block)), Chunk(std::move(res_columns), num_rows));
+    BlockIO result;
+    result.pipeline = QueryPipeline(std::move(source));
+    return result;
 }
 
 void InterpreterSystemQuery::loadPrimaryKeys()
@@ -3072,6 +3153,11 @@ AccessRightsElements InterpreterSystemQuery::getRequiredAccessForDDLOnCluster() 
         case Type::CONTENT_ADDRESSED_MOUNT:
         {
             required_access.emplace_back(AccessType::SYSTEM_CONTENT_ADDRESSED_MOUNT);
+            break;
+        }
+        case Type::CONTENT_ADDRESSED_FSCK:
+        {
+            required_access.emplace_back(AccessType::SYSTEM_CONTENT_ADDRESSED_FSCK);
             break;
         }
         case Type::UNFREEZE:

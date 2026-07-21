@@ -7,6 +7,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Parts/PartFolderAccess.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcScheduler.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Tools/CasFsck.h>
 #include <Interpreters/Context_fwd.h>
 #include <base/defines.h>
 #include <cstdint>
@@ -125,6 +126,15 @@ public:
     /// (`report.performed == false`) writes nothing; the `SYSTEM` interpreter surfaces the refusal.
     /// Throws `BAD_ARGUMENTS` when GC is disabled by read-only mode or configuration.
     Cas::RebuildReport runGcRebuildNow(bool force) const;
+
+    /// The `SYSTEM CONTENT ADDRESSED FSCK` handler (Task 7): dormant-only, read-only independent
+    /// reachability audit. Requires `mount_state == Dormant` (else `INVALID_STATE`, directing the
+    /// operator to `SYSTEM CONTENT ADDRESSED UNMOUNT` first) -- a live mount keeps serving traffic that
+    /// an FSCK scan must never race against. Opens a TEMPORARY observe-only pool view via
+    /// `openPoolView(/* observe_only= */ true)` (no probe, no watermark, no GC scheduler -- exactly the
+    /// existing `read_only` startup path), runs `Cas::runFsck` over it, and destroys the view before
+    /// returning: nothing from this scan is published to `cas_store`/`part_access`/`mount_state`.
+    Cas::FsckReport runFsckOnDormant(bool detail) const;
 
     /// Returns per-disk GC health for `system.content_addressed_mounts`. Returns nullopt when this
     /// disk has no scheduler because GC is disabled, the disk is read-only, or startup has not run.
@@ -513,6 +523,33 @@ private:
     /// SQL-reachable operational state). Callers must already hold `pointer_mutex` and pass the
     /// `mount_state` they read under it.
     [[noreturn]] void throwNotMounted(MountState state) const;
+
+    /// A pool opened as a standalone, UNPUBLISHED view: never touches `cas_store`/`part_access`/
+    /// `gc_scheduler`/`mount_state` -- the caller owns it entirely and drops it when done.
+    struct PoolView
+    {
+        Cas::PoolPtr pool;
+        /// The direct-object-storage key prefix for this view's backend (see `physicalKey`'s own
+        /// doc comment): populated for the Emulated (Local) backend, empty ("") for Native. Returned
+        /// rather than written to the `physical_key_prefix` member so this helper stays side-effect-free
+        /// and callable from a `const` method (`runFsckOnDormant`).
+        String physical_key_prefix;
+        /// The resolved (bucket-relative, trailing-slash-trimmed) pool prefix passed into
+        /// `Cas::PoolConfig::pool_prefix` -- `startup()`'s S3-staging capability probe below needs the
+        /// SAME resolved value to build its own probe key, so it is returned here rather than
+        /// recomputed a second time.
+        String pool_prefix;
+    };
+
+    /// Builds the backend + `Cas::PoolConfig` and opens a pool exactly as `startup()` does, shared by
+    /// its live-mount path and `runFsckOnDormant`'s TEMPORARY observe-only scan. `observe_only` forces
+    /// `PoolConfig::read_only` and disables the background watermark regardless of the disk's own
+    /// `<readonly>` config -- an FSCK scan must never probe/schedule against a pool it does not own the
+    /// lifecycle of, exactly like the `read_only` disk path startup() already has (no probe, no
+    /// watermark, no GC). Never touches `cas_store`/`part_access`/`gc_scheduler`/`mount_state`/
+    /// `physical_key_prefix`/`pool_uuid`/`conditional_copy_supported`; `startup()` applies its own
+    /// result to those members itself, in its single publish step.
+    PoolView openPoolView(bool observe_only) const;
 
     /// Classifies `path`'s directory shape by running the fixed dispatch order once (shadow ->
     /// atomic-shard -> table-uuid -> part -> subdir -> generic), including the part-branch

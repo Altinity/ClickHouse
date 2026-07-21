@@ -455,15 +455,8 @@ Cas::RebuildReport ContentAddressedMetadataStorage::runGcRebuildNow(bool force) 
     return gc.rebuildBaseline(force);
 }
 
-void ContentAddressedMetadataStorage::startup()
+ContentAddressedMetadataStorage::PoolView ContentAddressedMetadataStorage::openPoolView(bool observe_only) const
 {
-    if (cas_store)
-        return;
-
-    /// Observe-only mode (the disk's <readonly> config): skip the probe (a probe write would fail on
-    /// a read-only backend), run no watermark, start no GC, and fail the mutating surface closed.
-    read_only = object_storage->isReadOnly();
-
     /// Native mode rides real conditional ops (probed fail-closed by Pool::open); Local object
     /// storage has none, so the backend emulates exact token semantics in-process (single server).
     const auto mode = object_storage->getType() == ObjectStorageType::Local
@@ -503,12 +496,13 @@ void ContentAddressedMetadataStorage::startup()
     /// Some backends reject such prefixes while others merely tolerate them).
     while (!pool_prefix.empty() && pool_prefix.back() == '/')
         pool_prefix.pop_back();
+    String physical_key_prefix_local;
     if (mode == Cas::ObjectStorageBackend::Mode::EmulatedSingleProcess)
     {
-        physical_key_prefix = object_storage->getCommonKeyPrefix();
+        physical_key_prefix_local = object_storage->getCommonKeyPrefix();
         /// Slash-tolerant strip: the common prefix usually ends with '/', the pool prefix was
         /// just trimmed of trailing slashes - compare canonical forms.
-        String common_trimmed = physical_key_prefix;
+        String common_trimmed = physical_key_prefix_local;
         while (!common_trimmed.empty() && common_trimmed.back() == '/')
             common_trimmed.pop_back();
         if (!common_trimmed.empty())
@@ -526,8 +520,11 @@ void ContentAddressedMetadataStorage::startup()
     pool_config.pool_prefix = pool_prefix;
     pool_config.server_id = serverIdToU128(server_id);
     pool_config.server_root_id = server_root_id;
-    pool_config.background_watermark = (context != nullptr) && !read_only;
-    pool_config.read_only = read_only;
+    /// `observe_only` (the FSCK TEMPORARY view) forces the same no-watermark/read-only posture as a
+    /// persistently read-only disk, regardless of this disk's own `read_only` member -- a scan must
+    /// never probe/schedule against a pool it does not own the lifecycle of.
+    pool_config.background_watermark = (context != nullptr) && !read_only && !observe_only;
+    pool_config.read_only = read_only || observe_only;
     pool_config.skip_access_check = skip_access_check;
     /// The node-local write algorithm: `PoolMeta::createOrValidate` accepts it with no write once
     /// it is a member of the pool's `algos_used`; a not-yet-admitted algo is admitted via
@@ -545,12 +542,30 @@ void ContentAddressedMetadataStorage::startup()
     pool_config.materialization_grace_ms = materialization_grace_ms;
     pool_config.event_sink = makeCasEventSink();
 
+    PoolView view;
+    view.physical_key_prefix = physical_key_prefix_local;
+    view.pool_prefix = pool_prefix;
+    view.pool = Cas::Pool::open(std::move(backend), std::move(pool_config));
+    return view;
+}
+
+void ContentAddressedMetadataStorage::startup()
+{
+    if (cas_store)
+        return;
+
+    /// Observe-only mode (the disk's <readonly> config): skip the probe (a probe write would fail on
+    /// a read-only backend), run no watermark, start no GC, and fail the mutating surface closed.
+    read_only = object_storage->isReadOnly();
+
     /// Everything below builds into LOCALS -- nothing is published to `cas_store`/`part_access`/
     /// `gc_scheduler`/`pool_uuid`/`conditional_copy_supported` until the single publish step at the
     /// very end. This makes a mid-startup throw leave the object exactly as unstarted as it was on
     /// entry (the `if (cas_store) return;` head above still sees an empty pool), so a caller can
     /// retry `startup` after a transient failure instead of being stuck with a half-built mount.
-    auto pool = Cas::Pool::open(std::move(backend), std::move(pool_config));
+    PoolView view = openPoolView(/* observe_only= */ false);
+    physical_key_prefix = view.physical_key_prefix;
+    auto pool = std::move(view.pool);
     auto uuid = Cas::u128ToHex(pool->poolMeta().pool_id);
     auto facade = std::make_shared<Cas::CachedPartFolderAccess>(pool,
         Cas::CachedPartFolderAccess::CacheParams{
@@ -572,7 +587,7 @@ void ContentAddressedMetadataStorage::startup()
     bool copy_supported = false;
     if (staging_backend == Cas::StagingBackend::S3 && !read_only)
     {
-        const String probe_prefix = physicalKey(pool_prefix + "/staging/" + server_root_id + "/probe");
+        const String probe_prefix = physicalKey(view.pool_prefix + "/staging/" + server_root_id + "/probe");
         copy_supported = Cas::probeConditionalCopy(*object_storage, probe_prefix);
         if (!copy_supported)
             LOG_INFO(
@@ -587,14 +602,14 @@ void ContentAddressedMetadataStorage::startup()
         /// S3 staging objects under this prefix in the first place. LEASE-FENCE: the prefix below is
         /// keyed by THIS mount's own `server_root_id` (the SAME prefix construction the probe above
         /// and every staging key this mount ever mints use -- and the same formula `stagingKeyPrefix()`
-        /// uses post-startup; computed from the local `pool_prefix` here rather than via
+        /// uses post-startup; computed from `view.pool_prefix` here rather than via
         /// `stagingKeyPrefix()` itself, because that helper calls `store()`, which is fail-closed and
         /// would throw before the pool is published), so this sweep can never reach a different
         /// mount's in-flight staging (`Cas::sweepOwnMountStaging`'s own doc comment). GC excludes
         /// `staging/` entirely (a distinct top-level prefix from `blobs/` — see `CasLayout.h`), so this
         /// sweeper is the ONLY reclaimer of `staging/` debris.
         if (copy_supported)
-            Cas::sweepOwnMountStaging(*object_storage, physicalKey(pool_prefix + "/staging/" + server_root_id) + "/");
+            Cas::sweepOwnMountStaging(*object_storage, physicalKey(view.pool_prefix + "/staging/" + server_root_id) + "/");
     }
 
     /// The background GC scheduler runs only on the disk-factory path (context non-null) and when
@@ -746,6 +761,26 @@ void ContentAddressedMetadataStorage::mountExplicitly()
     /// alone -- an explicit remount is a normal, repeatable lifecycle transition, not a server
     /// restart.
     startup();                                             /// atomic publish (Task 3) sets Mounted
+}
+
+Cas::FsckReport ContentAddressedMetadataStorage::runFsckOnDormant(bool detail) const
+{
+    /// Outermost lock (see its own doc comment): held for the WHOLE scan, so a concurrent MOUNT/UNMOUNT
+    /// cannot race a Dormant disk out from under an in-flight FSCK.
+    std::lock_guard lifecycle(lifecycle_mutex);
+    {
+        std::lock_guard lock(pointer_mutex);
+        if (mount_state != MountState::Dormant)
+            throw Exception(ErrorCodes::INVALID_STATE,
+                "content-addressed disk '{}' is mounted — run SYSTEM CONTENT ADDRESSED UNMOUNT first "
+                "(FSCK requires a quiesced pool)", disk_name);
+    }
+    /// TEMPORARY observe-only view: no probe, no watermark, no GC scheduler -- exactly the existing
+    /// `read_only` startup path (see `openPoolView`'s own doc comment). Never published to
+    /// `cas_store`/`part_access`/`mount_state`; destroyed (and its lease/background state torn down)
+    /// when `view` goes out of scope at the end of this call.
+    PoolView view = openPoolView(/* observe_only= */ true);
+    return Cas::runFsck(*view.pool, detail);
 }
 
 ContentAddressedMetadataStorage::PoolAccessSnapshot ContentAddressedMetadataStorage::poolAccess() const

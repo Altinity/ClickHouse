@@ -638,6 +638,16 @@ RoundReport Gc::runRegularRound(std::function<void()> on_lease_acquired, bool al
     state_token = res.token;
     report.round = state.round;
 
+    /// Task 7: the retire pipeline's REMAINING sizes, read from the seal this round's CAS just
+    /// committed (`folded.fold_seal.condemned_summary` is TOTAL over every gc-shard -- see its own doc
+    /// comment in `CasFoldSealFormat.h`). Zero-shard pools (never folded) leave these at 0.
+    for (const auto & [shard, summary] : folded.fold_seal.condemned_summary)
+    {
+        report.pending_retired += summary.pending_total;
+        report.pending_candidates += summary.condemned_total - summary.pending_total;
+        report.pending_condemned += summary.condemned_total;
+    }
+
     /// Post-CAS reference-parent HAND-OFF DELETE. `pruneSupersededGenerations` SKIPS a
     /// generation the live seal still references AND advances `snap_pruned_through` PAST it
     /// (CasGc.cpp:1066 computes the cursor as `g - 1` after the loop increments `g` over every skipped

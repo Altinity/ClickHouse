@@ -89,6 +89,17 @@ struct RoundReport
     size_t fence_outs = 0;        /// expired mounts fenced-out by the round's heartbeat floor
     std::vector<RoundAnomaly> anomalies;   /// fold clamps surfaced this round (never wedge the round)
 
+    /// Retire-pipeline REMAINING sizes as of the gc/state this round's single CAS just published --
+    /// unlike `condemned`/`graduated`/`redeleted` above (this round's DELTAs), these are the pipeline's
+    /// current outstanding totals, summed over every gc-shard's sealed `CondemnedSummary`
+    /// (`Formats/CasFoldSealFormat.h`). `pending_retired` = still delete_pending (graduated, awaiting the
+    /// exact-token delete next pass); `pending_candidates` = condemned but not yet floor-passed;
+    /// `pending_condemned` = their total (candidates + retired), the overall pipeline gauge. Left at 0 on
+    /// a `!acquired_lease`/`deferred` round -- those flags already mark the row non-authoritative.
+    size_t pending_candidates = 0;
+    size_t pending_condemned = 0;
+    size_t pending_retired = 0;
+
     /// Record a fold/recheck anomaly (a clamped cursor). Surfacing, never throwing.
     void recordAnomaly(const RootNamespace & ns_, uint64_t shard_, const ManifestId & id_, const char * reason_)
     {
