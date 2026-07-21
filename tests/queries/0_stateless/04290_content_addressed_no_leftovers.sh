@@ -14,10 +14,13 @@
 #   (2) CREATE a MergeTree on the CA disk and INSERT several distinct batches to make many blobs,
 #   (3) assert the count rose above baseline,
 #   (4) DROP TABLE ... SYNC so the refs are unlinked and the blobs/footers become GC fodder,
-#   (5) bounded-poll (hard ~60s cap, re-check each second; NOT a fixed sleep) until blobs/ + parts/
-#       are reclaimed back to empty.
+#   (5) drain the retire pipeline deterministically via `SYSTEM CONTENT ADDRESSED GC RUN` (bounded
+#       loop on the `pending_*` gauges, NOT a fixed sleep), then `UNMOUNT` the disk (this
+#       synchronously drains and joins every CAS background thread) and run a dormant `FSCK`: a
+#       clean reachability audit reading back zero `unreachable`/`dangling` is a strictly stronger
+#       no-leftovers oracle than polling the pool directory ever was.
 # `_pool_meta` (durable single-owner marker) and the `store/` metadata tree are expected to remain;
-# we only assert that blobs/ and parts/ are emptied.
+# `rm -rf` only happens once `UNMOUNT` has quiesced the disk.
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=../shell_config.sh
@@ -37,12 +40,13 @@ count_pool_objects() {
     echo $(( n_blobs + n_parts ))
 }
 
+DISK_NAME='04290_content_addressed'
 DISK_DEF="disk(
     type = object_storage,
     object_storage_type = local,
     metadata_type = content_addressed,
     server_root_id = '04290',
-    name = '04290_content_addressed',
+    name = '${DISK_NAME}',
     path = '${POOL_DIR}/',
     gc_enabled = 1,
     gc_interval_sec = 1)"
@@ -78,25 +82,34 @@ fi
 # (4) Drop: refs unlinked synchronously, blobs/footers become unreferenced GC fodder.
 $CLICKHOUSE_CLIENT --query "DROP TABLE t_cas_leftovers SYNC"
 
-# (5) Bounded-poll the on-disk pool until the background GC reclaims blobs+parts back to empty.
-#     Hard ~60s cap, re-checking each second. This waits on a known background process
-#     (grace=2s, interval=1s), it is not a fixed sleep papering over a race.
-FINAL=$AFTER_INSERT
+# (5) Drain GC deterministically: loop `SYSTEM CONTENT ADDRESSED GC RUN` rounds until the retire
+#     pipeline's `pending_*` gauges (Task 7) read back to empty. Bounded (~60 rounds, half-second
+#     spacing), not a fixed sleep; column values are looked up BY HEADER NAME (not position) so the
+#     loop keeps working if the result set gains columns.
+PENDING=1
 for _ in $(seq 1 60); do
-    FINAL=$(count_pool_objects)
-    if [ "$FINAL" -eq 0 ]; then
-        break
-    fi
-    sleep 1
+    PENDING=$($CLICKHOUSE_CLIENT --query "SYSTEM CONTENT ADDRESSED GC RUN '${DISK_NAME}'" --format TSVWithNames \
+        | awk -F'\t' 'NR==1 { for (i = 1; i <= NF; i++) col[$i] = i; next }
+                      { print $col["pending_candidates"] + $col["pending_condemned"] + $col["pending_retired"] }')
+    [ "${PENDING}" = "0" ] && break
+    sleep 0.5
 done
 
-if [ "$FINAL" -eq 0 ]; then
-    echo "no_leftovers 1"
-else
-    echo "no_leftovers 0 (baseline=${BASELINE} after_insert=${AFTER_INSERT} final=${FINAL})"
-    echo "--- remaining objects ---"
-    find "${POOL_DIR}/ca/blobs" "${POOL_DIR}/ca/trees" "${POOL_DIR}/ca/packs" -type f 2>/dev/null | head
+if [ "${PENDING}" != "0" ]; then
+    echo "FAIL: GC did not drain the retire pipeline within the bounded loop (pending=${PENDING})" >&2
+    exit 1
 fi
+
+# (6) UNMOUNT: synchronously drains and joins every CAS background thread for this disk (the
+#     table is already dropped above, so the live-table guard does not block it).
+$CLICKHOUSE_CLIENT --query "SYSTEM CONTENT ADDRESSED UNMOUNT '${DISK_NAME}'"
+
+# (7) FSCK is dormant-only: a reachability audit that must read back zero unreachable/dangling
+#     objects. This is a strictly stronger no-leftovers oracle than the old dir-poll, since a
+#     dormant FSCK also proves every CAS background thread for the disk has been joined.
+$CLICKHOUSE_CLIENT --query "SYSTEM CONTENT ADDRESSED FSCK '${DISK_NAME}'" --format TSVWithNames \
+    | awk -F'\t' 'NR==1 { for (i = 1; i <= NF; i++) col[$i] = i; next }
+                  { print "fsck_unreachable", $col["unreachable"]; print "fsck_dangling", $col["dangling"] }'
 
 # _pool_meta must still be present (durable single-owner marker is never GC'd).
 if [ -f "${POOL_DIR}/ca/_pool_meta" ]; then
@@ -105,4 +118,4 @@ else
     echo "pool_meta_present 0"
 fi
 
-rm -rf "${POOL_DIR:?}"
+rm -rf "${POOL_DIR:?}"   # safe now: UNMOUNT drained and joined every CAS thread for this disk

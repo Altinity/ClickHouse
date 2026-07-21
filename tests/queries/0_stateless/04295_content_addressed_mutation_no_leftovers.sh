@@ -9,7 +9,8 @@
 # shell can inspect directly. Mirrors 04290 but adds heavy mutations and a patch-part lightweight
 # DELETE before the drop: a mutation supersedes the source part (its uniquely-owned blobs become
 # unreachable) and writes a new part; carried-forward columns stay referenced. We assert that after
-# DROP the background reachability GC reclaims blobs/ + parts/ back to empty (no mutated-away or
+# DROP, draining the retire pipeline via `SYSTEM CONTENT ADDRESSED GC RUN` then `UNMOUNT`-ing the
+# disk leaves a dormant `FSCK` reading back zero `unreachable`/`dangling` objects (no mutated-away or
 # patch-part blobs left behind), and that `_pool_meta` survives.
 
 CUR_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -28,12 +29,13 @@ count_pool_objects() {
     echo $(( n_blobs + n_parts ))
 }
 
+DISK_NAME='04295_content_addressed_mut'
 DISK_DEF="disk(
     type = object_storage,
     object_storage_type = local,
     metadata_type = content_addressed,
     server_root_id = '04295',
-    name = '04295_content_addressed_mut',
+    name = '${DISK_NAME}',
     path = '${POOL_DIR}/',
     gc_enabled = 1,
     gc_interval_sec = 1)"
@@ -81,24 +83,34 @@ FROM t_cas_mut_leftovers"
 # Drop: every ref (original, mutated, and patch parts) is unlinked; all blobs/footers become GC fodder.
 $CLICKHOUSE_CLIENT --query "DROP TABLE t_cas_mut_leftovers SYNC"
 
-# Bounded-poll the on-disk pool until the background GC reclaims blobs+parts back to empty
-# (hard ~60s cap, re-checking each second; grace=2s, interval=1s — waits on a real background process).
-FINAL=$AFTER_INSERT
+# Drain GC deterministically: loop `SYSTEM CONTENT ADDRESSED GC RUN` rounds until the retire
+# pipeline's `pending_*` gauges (Task 7) read back to empty. Bounded (~60 rounds, half-second
+# spacing), not a fixed sleep; column values are looked up BY HEADER NAME (not position) so the
+# loop keeps working if the result set gains columns.
+PENDING=1
 for _ in $(seq 1 60); do
-    FINAL=$(count_pool_objects)
-    if [ "$FINAL" -eq 0 ]; then
-        break
-    fi
-    sleep 1
+    PENDING=$($CLICKHOUSE_CLIENT --query "SYSTEM CONTENT ADDRESSED GC RUN '${DISK_NAME}'" --format TSVWithNames \
+        | awk -F'\t' 'NR==1 { for (i = 1; i <= NF; i++) col[$i] = i; next }
+                      { print $col["pending_candidates"] + $col["pending_condemned"] + $col["pending_retired"] }')
+    [ "${PENDING}" = "0" ] && break
+    sleep 0.5
 done
 
-if [ "$FINAL" -eq 0 ]; then
-    echo "no_leftovers 1"
-else
-    echo "no_leftovers 0 (baseline=${BASELINE} after_insert=${AFTER_INSERT} final=${FINAL})"
-    echo "--- remaining objects ---"
-    find "${POOL_DIR}/ca/blobs" "${POOL_DIR}/ca/trees" "${POOL_DIR}/ca/packs" -type f 2>/dev/null | head
+if [ "${PENDING}" != "0" ]; then
+    echo "FAIL: GC did not drain the retire pipeline within the bounded loop (pending=${PENDING})" >&2
+    exit 1
 fi
+
+# UNMOUNT: synchronously drains and joins every CAS background thread for this disk (the table
+# is already dropped above, so the live-table guard does not block it).
+$CLICKHOUSE_CLIENT --query "SYSTEM CONTENT ADDRESSED UNMOUNT '${DISK_NAME}'"
+
+# FSCK is dormant-only: a reachability audit that must read back zero unreachable/dangling
+# objects. This is a strictly stronger no-leftovers oracle than the old dir-poll, since a
+# dormant FSCK also proves every CAS background thread for the disk has been joined.
+$CLICKHOUSE_CLIENT --query "SYSTEM CONTENT ADDRESSED FSCK '${DISK_NAME}'" --format TSVWithNames \
+    | awk -F'\t' 'NR==1 { for (i = 1; i <= NF; i++) col[$i] = i; next }
+                  { print "fsck_unreachable", $col["unreachable"]; print "fsck_dangling", $col["dangling"] }'
 
 if [ -f "${POOL_DIR}/ca/_pool_meta" ]; then
     echo "pool_meta_present 1"
@@ -106,4 +118,4 @@ else
     echo "pool_meta_present 0"
 fi
 
-rm -rf "${POOL_DIR:?}"
+rm -rf "${POOL_DIR:?}"   # safe now: UNMOUNT drained and joined every CAS thread for this disk
