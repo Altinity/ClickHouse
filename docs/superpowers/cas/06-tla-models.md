@@ -311,11 +311,12 @@ Results are recorded inside `CaB140DangleMerge_RESULTS.md`.
 ### `CaB140Dangle.tla` — Phase-1 B140 reproduction (superseded as producer) {#cab140dangle}
 
 **Files:** `CaB140Dangle.tla`, `CaB140Dangle_adopt.cfg`, `CaB140Dangle_blob.cfg`,
-`CaB140Dangle_loss.cfg`, `CaB140Dangle_producer.cfg`, `CaB140Dangle_safe.cfg`
+`CaB140Dangle_loss.cfg`, `CaB140Dangle_producer.cfg`, `CaB140Dangle_safe.cfg` — **removed
+2026-07-21** (full text in git history).
 
-An initial Phase-1 reproduction with unfaithful producers (marker-retaining strip, field-mixed generation adoption). Superseded as a producer model by `CaB140DangleFaithful.tla`. Kept as a record of the Phase-1 investigation.
+An initial Phase-1 reproduction with unfaithful producers (marker-retaining strip, field-mixed generation adoption). Superseded as a producer model by `CaB140DangleFaithful.tla`.
 
-**Code currency:** SUPERSEDED as producer. Kept as historical record.
+**Code currency:** SUPERSEDED as producer; files removed 2026-07-21.
 
 ---
 
@@ -741,7 +742,7 @@ counterexamples found during EBR model development encoded the four load-bearing
 | `CaCasMountCore.tla` | Mount | **CURRENT** | `NoTwoServerUuids…`, `ForeignUuid…`, `WriterEpochMonotoneUnique`, `SupersededWriter…` | 3 | sticky owner, monotone epoch, lost-actor write block |
 | `CaB140DangleMerge.tla` | B140 fix proof | **CURRENT** (history record) | `INV_NO_LOSS` | 2×2 matrix | trim-gate + cursor-in-snap jointly necessary |
 | `CaB140DangleFaithful.tla` | B140 history | **CURRENT** (history record) | `INV_NO_LOSS` | — | Phase-1 mechanism clean with faithful producers |
-| `CaB140Dangle.tla` | B140 history | **SUPERSEDED** (unfaithful producers) | — | — | Phase-1 investigation record |
+| `CaB140Dangle.tla` | B140 history | **REMOVED 2026-07-21** (unfaithful producers) | — | — | Phase-1 investigation record |
 | `CaResurrectLiveness.tla` | Resurrect/B167 | **STALE** (deferred M-F guard) | `<>published` | 1 | upload→publish span not atomic; heartbeat guard load-bearing |
 | `CaBuildWatermark.tla` | Watermark/B167 | **STALE** (blob-guard removed by B171) | `Inv_ProtectedNeverCondemned`, `Inv_NoDangle`, liveness | 3 | monotone `build_seq`, exact min active set, sound crash detection |
 | `CaBuildWatermarkNum.tla` | Watermark numeric | **STALE** (blob-guard removed by B171) | `Inv_ProtectedNeverCondemned`, `Inv_NoDangle` | 2 | monotone `build_seq` (not just unique), per-server scoping |
