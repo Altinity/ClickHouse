@@ -1879,11 +1879,11 @@ TEST(RefWriterStalePrecommitSweep, SweepsOnlyStaleEpochPrecommitsKeepsCurrentEpo
     build->precommitAdd(ns, "fresh_x", fresh_id);   /// this call's own appendRefOps hoists the sweep first
 
     const RefTableState replayed = independentFullReplayForTest(*backend, successor->layout(), ns);
-    EXPECT_EQ(replayed.lifecycle, RefLifecycle::Live);
-    EXPECT_TRUE(replayed.committed.empty());
-    ASSERT_EQ(replayed.precommits.size(), 1u);
-    EXPECT_EQ(replayed.precommits.begin()->first, "fresh_x");
-    EXPECT_EQ(replayed.precommits.begin()->second, fresh_id.ref);
+    EXPECT_EQ(replayed.getLifecycle(), RefLifecycle::Live);
+    EXPECT_TRUE(replayed.getCommitted().empty());
+    ASSERT_EQ(replayed.getPrecommits().size(), 1u);
+    EXPECT_EQ(replayed.getPrecommits().begin()->first, "fresh_x");
+    EXPECT_EQ(replayed.getPrecommits().begin()->second, fresh_id.ref);
 }
 
 /// The sweep chunks its removal to `ref_txn_max_ops` (1000) stale precommits per transaction (spec
@@ -1975,8 +1975,8 @@ TEST(RefWriterStalePrecommitSweep, BoundedBatchesAndInterruptionResumeAcrossMoun
     EXPECT_NO_THROW(resumer->listRefs(ns));
 
     const RefTableState final_state = independentFullReplayForTest(*backend, layout, ns);
-    EXPECT_EQ(final_state.lifecycle, RefLifecycle::Live);
-    EXPECT_TRUE(final_state.precommits.empty()) << "every stale precommit must eventually be swept";
+    EXPECT_EQ(final_state.getLifecycle(), RefLifecycle::Live);
+    EXPECT_TRUE(final_state.getPrecommits().empty()) << "every stale precommit must eventually be swept";
 
     /// Bounded batches: exactly two NEW removal transactions (epoch > e1) were needed for kTotalStale
     /// items -- never one (would violate the 1000-op cap) and never kTotalStale individual ones.
@@ -2085,9 +2085,9 @@ TEST(RefWriterStalePrecommitSweep, FailedSweepRearmsAndRetriesUntilClean)
 
     /// Ground truth: every stale binding reclaimed; the successor's own committed work intact.
     const RefTableState final_state = independentFullReplayForTest(*backend, layout, ns);
-    EXPECT_EQ(final_state.lifecycle, RefLifecycle::Live);
-    EXPECT_TRUE(final_state.precommits.empty());
-    EXPECT_TRUE(final_state.committed.contains("fresh"));
+    EXPECT_EQ(final_state.getLifecycle(), RefLifecycle::Live);
+    EXPECT_TRUE(final_state.getPrecommits().empty());
+    EXPECT_TRUE(final_state.getCommitted().contains("fresh"));
 
     /// Audit (INTROSPECTION-1): exactly ONE `precommit_reclaim` event per reclaimed stale binding --
     /// this is what makes the S13 card's "abandoned precommits reclaimed" counter falsifiable.
@@ -2642,8 +2642,8 @@ TEST(RefWriterNamespaceBirth, BirthFromRemovedRejectedWithoutMarkerAcceptedWithM
         EXPECT_EQ(resolved->manifest_id.ref, id.ref);
 
         const RefTableState replayed = independentFullReplayForTest(*backend, layout, ns);
-        EXPECT_EQ(replayed.lifecycle, RefLifecycle::Live);
-        EXPECT_GT(replayed.greatest_applied, remove_id) << "the reborn timeline continues strictly above the old removal";
+        EXPECT_EQ(replayed.getLifecycle(), RefLifecycle::Live);
+        EXPECT_GT(replayed.getGreatestApplied(), remove_id) << "the reborn timeline continues strictly above the old removal";
     }
 }
 
@@ -2836,9 +2836,9 @@ TEST(RefWriterRecoverySeal, LateLogBelowSealIsInvisibleToRecoveryAndFold)
     /// A fresh, independent recovery (the free function, not a `Pool`) must find the seal covers the
     /// late log: "c" must NOT appear.
     const RefTableState recovered = recoverRefTable(*backend, layout, ns);
-    ASSERT_EQ(recovered.committed.count("a"), 1u);
-    ASSERT_EQ(recovered.committed.count("b"), 1u);
-    EXPECT_EQ(recovered.committed.count("c"), 0u)
+    ASSERT_EQ(recovered.getCommitted().count("a"), 1u);
+    ASSERT_EQ(recovered.getCommitted().count("b"), 1u);
+    EXPECT_EQ(recovered.getCommitted().count("c"), 0u)
         << "a log at or below the seal id must be treated as covered, regardless of when it materialized";
 }
 

@@ -2074,13 +2074,13 @@ RebuildReport Gc::rebuildBaseline(bool force)
 
         ShardCoverage cov;
         cov.classification = 2;   /// Folded (full coverage) unless a bodiless precommit clamps
-        cov.last_folded_ref_id = st.greatest_applied;
+        cov.last_folded_ref_id = st.getGreatestApplied();
 
         std::vector<BlobDelta> deltas;
 
         /// Committed owners: a missing/invalid body under a committed ref is DATA LOSS the rebuild must
         /// not bless (INV_NO_DANGLE) -- refuse.
-        for (const auto [ref_name, row] : st.committed)
+        for (const auto [ref_name, row] : st.getCommitted())
         {
             const ManifestId id{ns, row.manifest_ref};
             owned_manifest_keys.insert(layout.manifestKey(id));
@@ -2096,7 +2096,7 @@ RebuildReport Gc::rebuildBaseline(bool force)
 
         /// Live precommits: a present body contributes edges; a bodiless one is non-activating and clamps
         /// (the fold barrier -- the first regular round folds it once the body lands).
-        for (const auto & [ref_name, manifest_ref] : st.precommits)
+        for (const auto & [ref_name, manifest_ref] : st.getPrecommits())
         {
             const ManifestId id{ns, manifest_ref};
             owned_manifest_keys.insert(layout.manifestKey(id));

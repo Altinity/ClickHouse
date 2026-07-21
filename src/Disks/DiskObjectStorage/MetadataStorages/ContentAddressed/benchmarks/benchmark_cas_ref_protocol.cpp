@@ -144,7 +144,7 @@ RefTableSnapshot makeSyntheticSnapshot(size_t n)
 RefTableState makeSyntheticState(size_t n)
 {
     RefTableState state = replay(makeSyntheticSnapshot(n), {});
-    state.committed.materialize();
+    state.materializeCommitted();
     return state;
 }
 
@@ -340,9 +340,9 @@ static void BM_ScratchCopy(benchmark::State & state)
 {
     const size_t n = static_cast<size_t>(state.range(0));
     RefTableState table = makeSyntheticState(n);
-    table.committed.materialize();   /// makeSyntheticState already materializes; repeated here
-                                      /// defensively (a no-op on an empty overlay) so this benchmark's
-                                      /// floor claim does not silently depend on that helper's internals.
+    table.materializeCommitted();   /// makeSyntheticState already materializes; repeated here
+                                     /// defensively (a no-op on an empty overlay) so this benchmark's
+                                     /// floor claim does not silently depend on that helper's internals.
 
     for (auto _ : state)
     {
@@ -368,15 +368,27 @@ static void BM_SnapshotEncode(benchmark::State & state)
 }
 BENCHMARK(BM_SnapshotEncode)->RangeMultiplier(10)->Range(100, 100000)->Complexity();
 
-/// Full merged iteration with a 10% overlay (post-copy, pre-materialize shape): `table` starts
-/// from makeSyntheticState's materialized N-row base (a state as it sits between flushes), then the
-/// overlay rows added below land in a fresh overlay -- materialize() is deliberately not called
-/// again -- so iteration must merge base and overlay in sorted order the way the cold full-scan
-/// paths (snapshotOf, listRefs, dropNamespace) do against an in-flight batch.
+/// Full merged iteration with a 10% overlay (post-copy, pre-materialize shape): an N-row
+/// materialized base, then a fresh overlay of N/10 rows layered on top with `materialize()`
+/// deliberately not called again -- so iteration must merge base and overlay in sorted order the
+/// way the cold full-scan paths (snapshotOf, listRefs, dropNamespace) do against an in-flight batch.
+/// Benchmarks `RefCowMap` directly (like `BM_Materialize` below) rather than through
+/// `RefTableState::getCommitted()`: this isolates the merge-iteration primitive itself, and building
+/// the overlay via `RefTableState`'s promote/precommit transactions would additionally measure the
+/// state machine's own per-op bookkeeping, which is not what this benchmark is about.
 static void BM_MergedIteration(benchmark::State & state)
 {
     const size_t n = static_cast<size_t>(state.range(0));
-    RefTableState table = makeSyntheticState(n);
+
+    RefCowMap map;
+    for (size_t i = 0; i < n; ++i)
+    {
+        RefCommittedRow row;
+        row.ref_name = "part_" + std::to_string(i) + "_20260719_0_1000_1";
+        row.manifest_ref = ManifestRef{1, 1, static_cast<uint32_t>(i + 1)};
+        map.emplace(row.ref_name, row);
+    }
+    map.materialize();
 
     const size_t overlay_n = std::max<size_t>(1, n / 10);
     for (size_t i = 0; i < overlay_n; ++i)
@@ -384,13 +396,13 @@ static void BM_MergedIteration(benchmark::State & state)
         RefCommittedRow row;
         row.ref_name = "overlay_part_" + std::to_string(i) + "_20260719_0_1000_1";
         row.manifest_ref = ManifestRef{2, 1, static_cast<uint32_t>(i + 1)};
-        table.committed.insert_or_assign(row.ref_name, row);
+        map.insert_or_assign(row.ref_name, row);
     }
 
     for (auto _ : state)
     {
         size_t total = 0;
-        for (const auto [ref_name, row] : table.committed)
+        for (const auto [ref_name, row] : map)
             total += row.ref_name.size();
         benchmark::DoNotOptimize(total);
     }

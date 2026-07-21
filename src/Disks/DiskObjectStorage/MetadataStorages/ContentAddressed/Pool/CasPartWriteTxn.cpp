@@ -850,12 +850,12 @@ void PartWriteTxn::precommitAdd(const RootNamespace & target_ns, const String & 
             /// live -- see `promote`'s matching no-op guard). Nothing to append: re-adding a precommit
             /// for an already-owned manifest would violate "no conflicting owner may name the same
             /// manifest", which the state machine enforces for every OTHER case.
-            if (const auto it = state.committed.find(final_ref_name);
-                it != state.committed.end() && it->second.manifest_ref == id.ref)
+            if (const auto it = state.getCommitted().find(final_ref_name);
+                it != state.getCommitted().end() && it->second.manifest_ref == id.ref)
                 return {};
 
             std::vector<RefOp> ops;
-            if (state.lifecycle != RefLifecycle::Live)
+            if (state.getLifecycle() != RefLifecycle::Live)
             {
                 /// Recreating a `Removed` namespace requires the
                 /// EXACT `_cleanup/<remove_txn_id>` completion marker from this table's own recovery --
@@ -867,11 +867,11 @@ void PartWriteTxn::precommitAdd(const RootNamespace & target_ns, const String & 
                 /// `PartFolderAccess.cpp`) as `stageManifest`/`promote`, its immediate neighbors, both
                 /// already rerouted -- leaving this one ABORTED would let it defeat the merge backoff
                 /// mid-sequence, exactly the Fix-2 defect.
-                if (state.remove_txn_id.has_value()
-                    && !store->observedNamespaceCleanupMarker(target_ns, *state.remove_txn_id))
+                if (state.getRemoveTxnId().has_value()
+                    && !store->observedNamespaceCleanupMarker(target_ns, *state.getRemoveTxnId()))
                     throwCasWriteRetryLater(fmt::format(
                         "namespace '{}' recreation pending GC cleanup-marker (remove_txn_id {}-{})",
-                        target_ns.string(), state.remove_txn_id->writer_epoch, state.remove_txn_id->ref_sequence));
+                        target_ns.string(), state.getRemoveTxnId()->writer_epoch, state.getRemoveTxnId()->ref_sequence));
                 RefOp birth;
                 birth.kind = RefOpKind::NamespaceBirth;
                 ops.push_back(birth);
@@ -943,8 +943,8 @@ void PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
             /// follow-up, or a direct repeat call) that must complete as a no-op, not require a live
             /// precommit that a first successful call already consumed. Mirrors precommitAdd's matching
             /// guard; the DIFFERENT-manifest case below remains the BUG-1a fail-closed leak guard.
-            if (const auto it = state.committed.find(final_ref_name);
-                it != state.committed.end() && it->second.manifest_ref == id.ref)
+            if (const auto it = state.getCommitted().find(final_ref_name);
+                it != state.getCommitted().end() && it->second.manifest_ref == id.ref)
                 return {};
 
             /// NO writer-side view refresh here:
@@ -957,10 +957,10 @@ void PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
             /// precommit is STILL the live owner of the ref: if an abandon or GC reclaim already appended
             /// a removal of the precommit binding, the blobs' in-degree was already decremented and a Δ=0
             /// move would re-publish a committed ref over to-be-deleted blobs ⇒ a dangling committed
-            /// manifest (INV_NO_DANGLE). `RefTableState.precommits` materializes live ownership directly:
+            /// manifest (INV_NO_DANGLE). `RefTableState::getPrecommits` materializes live ownership directly:
             /// `id.ref` alone identifies the build (there is no second
             /// build token"), so an exact-binding lookup answers the same question directly.
-            if (!state.precommits.contains({final_ref_name, id.ref}))
+            if (!state.getPrecommits().contains({final_ref_name, id.ref}))
                 throwCasWriteRetryLater(fmt::format(
                     "promote: precommit owner binding for ref '{}' (build {}) was removed (abandon or GC "
                     "reclaim) and is no longer the live owner — failing closed; the build must restart "
@@ -1023,8 +1023,8 @@ void PartWriteTxn::promote(const RootNamespace & target_ns, const String & final
             /// idempotent republish skips this call — see `republishRef`). Fail-closed with ABORTED (not
             /// LOGICAL_ERROR): a conflicting durable state the caller handles, never a must-not-happen
             /// invariant.
-            if (const auto it = state.committed.find(final_ref_name);
-                it != state.committed.end() && !(it->second.manifest_ref == id.ref))
+            if (const auto it = state.getCommitted().find(final_ref_name);
+                it != state.getCommitted().end() && !(it->second.manifest_ref == id.ref))
             {
                 if (!allow_repoint)
                     throwCasWriteRetryLater(fmt::format(

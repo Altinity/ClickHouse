@@ -101,3 +101,61 @@ This binary, `--benchmark_repetitions=3 --benchmark_report_aggregates_only=true`
 CAS unit gate (`unit_tests_dbms`, filter
 `Cas*:CaLifecycle*:CaWiring*:ContentAddressed*:CountingBackendShape*:RefSnapshotCodec*:RefTableCacheEviction*:RefWriter*`):
 1,077 tests passed, 0 failures.
+
+## Post-encapsulation (t2) {#post-encapsulation-t2}
+
+Task 2 (Phase A) converted `RefTableState` from a plain struct to a closed class: private fields,
+public getters (`getLifecycle`, `getRemoveTxnId`, `getGreatestApplied`, `getCommitted`,
+`getPrecommits`, `getSnapshotBodyBytes`, `getRemovalBodyBytes`), mutation only through
+`applyRefLogTxn`/`replay`/`stateFromSnapshot`/`materializeCommitted`. This suite was re-run
+unchanged (`makeSyntheticState`'s materialize call now goes through the new
+`state.materializeCommitted()`; `BM_MergedIteration` was rewritten to build and iterate a raw
+`RefCowMap` directly instead of reaching through `RefTableState`, since it benchmarks the merge
+primitive itself, not the state machine — see the code comment at its definition) to check the
+refactor is zero-cost. Same binary and flags as the baseline run above; medians reported, delta vs.
+the baseline median in the table's own column.
+
+| Benchmark | N | Baseline (median) | Post-encapsulation (median) | Delta |
+|---|---|---|---|---|
+| `BM_Admits` | 100 | 963 ns | 1,008 ns | +4.7% |
+| `BM_Admits` | 1,000 | 979 ns | 1,040 ns | +6.2% |
+| `BM_Admits` | 10,000 | 988 ns | 1,053 ns | +6.6% |
+| `BM_Admits` | 100,000 | 1,029 ns | 1,067 ns | +3.7% |
+| `BM_AdmitsAddPrecommit` | 100 | 995 ns | 1,020 ns | +2.5% |
+| `BM_AdmitsAddPrecommit` | 1,000 | 4,266 ns | 4,301 ns | +0.8% |
+| `BM_AdmitsAddPrecommit` | 10,000 | 38,771 ns | 39,166 ns | +1.0% |
+| `BM_AdmitsAddPrecommit` | 100,000 | 400,222 ns | 434,903 ns | +8.7% |
+| `BM_ApplyRefLogTxn` | 100 | 724 ns | 764 ns | +5.5% |
+| `BM_ApplyRefLogTxn` | 1,000 | 738 ns | 783 ns | +6.1% |
+| `BM_ApplyRefLogTxn` | 10,000 | 784 ns | 803 ns | +2.4% |
+| `BM_ApplyRefLogTxn` | 100,000 | 788 ns | 834 ns | +5.8% |
+| `BM_ReplayHistory` | 100 | 6.15 ms | 6.19 ms | +0.6% |
+| `BM_ReplayHistory` | 1,000 | 46.1 ms | 46.26 ms | +0.3% |
+| `BM_ReplayHistory` | 10,000 | 454.0 ms | 453.28 ms | -0.2% |
+| `BM_ReplayHistory` | 100,000 | 4.93 s | 4.79 s | -2.8% |
+| `BM_ScratchCopy` | 100 | 45.7 ns | 46.2 ns | +1.1% |
+| `BM_ScratchCopy` | 1,000 | 46.0 ns | 46.6 ns | +1.3% |
+| `BM_ScratchCopy` | 10,000 | 46.7 ns | 46.1 ns | -1.3% |
+| `BM_ScratchCopy` | 100,000 | 46.8 ns | 45.8 ns | -2.1% |
+| `BM_SnapshotEncode` | 100 | 14,955 ns | 15,504 ns | +3.7% |
+| `BM_SnapshotEncode` | 1,000 | 150,061 ns | 158,807 ns | +5.8% |
+| `BM_SnapshotEncode` | 10,000 | 1,508,586 ns | 1,629,810 ns | +8.0% |
+| `BM_SnapshotEncode` | 100,000 | 15,885,841 ns | 16,726,370 ns | +5.3% |
+| `BM_MergedIteration` | 100 | 759 ns | 754 ns | -0.7% |
+| `BM_MergedIteration` | 1,000 | 7,719 ns | 7,711 ns | -0.1% |
+| `BM_MergedIteration` | 10,000 | 81,073 ns | 82,035 ns | +1.2% |
+| `BM_MergedIteration` | 100,000 | 864,552 ns | 903,707 ns | +4.5% |
+| `BM_Materialize` | 100 | 12,069 ns | 12,137 ns | +0.6% |
+| `BM_Materialize` | 1,000 | 126,687 ns | 127,216 ns | +0.4% |
+| `BM_Materialize` | 10,000 | 1,296,326 ns | 1,297,018 ns | +0.05% |
+| `BM_Materialize` | 100,000 | 18,145,559 ns | 17,923,253 ns | -1.2% |
+
+Every point is within the ±10% acceptance band; the largest single delta is
+`BM_AdmitsAddPrecommit` at N=100,000 (+8.7%), still comfortably inside tolerance and consistent
+with that benchmark's own higher run-to-run variance (baseline RMS 4%). `BM_Admits` and
+`BM_ApplyRefLogTxn` show a small but consistent +2-7% shift across every N, plausibly measurement
+noise from this being an unoptimized/debug-flavored `build` directory rather than a systematic
+encapsulation cost (both stay flat in N either way — the O(1)/O(N) shape the encapsulation was
+required to preserve is intact). `BM_ScratchCopy` (the pure copy-cost floor, entirely unrelated to
+the getter surface) also moves within the same ±1-2% band, supporting the noise explanation.
+Gate re-run: 1,077 tests passed, 0 failures (identical set to the baseline run).

@@ -188,8 +188,8 @@ std::optional<Resolved> CasRefLedger::resolveRef(const RootNamespace & ns, const
     maybeScheduleSnapshotPublish(ns, rt);
 
     std::lock_guard lock(rt->state_mutex);
-    const auto it = rt->state.committed.find(ref_name);
-    if (it == rt->state.committed.end())
+    const auto it = rt->state.getCommitted().find(ref_name);
+    if (it == rt->state.getCommitted().end())
         return std::nullopt;
 
     const RefCommittedRow & row = it->second;
@@ -232,7 +232,7 @@ std::map<String, Resolved> CasRefLedger::listRefs(const RootNamespace & ns)
 
     std::map<String, Resolved> result;
     std::lock_guard lock(rt->state_mutex);
-    for (const auto [ref_name, row] : rt->state.committed)
+    for (const auto [ref_name, row] : rt->state.getCommitted())
         result.emplace(ref_name, Resolved{
             .manifest_id = ManifestId{.root_namespace = ns, .ref = row.manifest_ref},
             .manifest_size = 0,
@@ -251,7 +251,7 @@ bool CasRefLedger::hasAnyRefWithPrefix(const RootNamespace & ns, std::string_vie
     maybeScheduleSnapshotPublish(ns, rt);
 
     std::lock_guard lock(rt->state_mutex);
-    for (const auto [ref_name, row] : rt->state.committed)
+    for (const auto [ref_name, row] : rt->state.getCommitted())
         if (prefix.empty() || std::string_view(ref_name).starts_with(prefix))
             return true;
     return false;
@@ -460,11 +460,11 @@ void CasRefLedger::ensureRefTableRecovered(const RootNamespace & ns, RefTableRun
                 /// under a LATER, perfectly clean epoch boundary must not get a parasitic seal just because
                 /// SOME earlier, unrelated boundary in this incarnation's life was unclean.
                 if (unclean_boundary_epoch() == my_epoch && my_epoch >= 2
-                    && dead_region_nonempty && !already_sealed && rt.state.lifecycle == RefLifecycle::Live)
+                    && dead_region_nonempty && !already_sealed && rt.state.getLifecycle() == RefLifecycle::Live)
                 {
                     RefTableSnapshot seal = snapshotOf(rt.state, ns.string());
                     seal.snapshot_id = seal_id;                     /// upper bound of the covered region
-                    seal.sealed_from = rt.state.greatest_applied;    /// == greatest_listed_id: nothing else was applied
+                    seal.sealed_from = rt.state.getGreatestApplied();    /// == greatest_listed_id: nothing else was applied
                     const String seal_bytes = sealObject(FormatId::RefSnapshot, encodeRefTableSnapshot(seal));
                     const auto fence_ok = [this] { return fence_ok_fn(); };
                     /// The `SCOPE_EXIT` above mutates
@@ -1166,7 +1166,7 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
     {
         std::lock_guard lock(rt->state_mutex);
         working = rt->state;
-        table_live = rt->state.lifecycle == RefLifecycle::Live;
+        table_live = rt->state.getLifecycle() == RefLifecycle::Live;
     }
 
     std::vector<std::shared_ptr<RefMutationItem>> batch;
@@ -1214,8 +1214,8 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
     /// persisted or compared outside this loop.
     RefTxnId trial_id;
     trial_id.writer_epoch = live_epoch_fn();
-    trial_id.ref_sequence = (working.greatest_applied.writer_epoch == trial_id.writer_epoch)
-        ? working.greatest_applied.ref_sequence
+    trial_id.ref_sequence = (working.getGreatestApplied().writer_epoch == trial_id.writer_epoch)
+        ? working.getGreatestApplied().ref_sequence
         : 0;
     for (const auto & it : batch)
     {
@@ -1285,7 +1285,7 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
             std::lock_guard<std::mutex> g(ref_queue_mutex);
             for (const auto & it : survivors)
             {
-                it->committed_id = working.greatest_applied;
+                it->committed_id = working.getGreatestApplied();
                 it->done = true;
             }
             rt->cv.notify_all();
@@ -1377,11 +1377,11 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
                 applyRefLogTxn(rt->state, final_txn);
                 /// COW-map materialization: fold this flush's overlay into a fresh immutable base HERE,
                 /// under the SAME state_mutex critical section as the install above, so
-                /// `rt->state.committed` is back to "base + empty overlay" before the next flush's
+                /// `rt->state.getCommitted()` is back to "base + empty overlay" before the next flush's
                 /// trial copies (`working = rt->state`, CasRefLedger.cpp:1006) begin -- an O(n) fold
                 /// once per flush, replacing what used to be an implicit O(n) copy on every trial
                 /// anyway.
-                rt->state.committed.materialize();
+                rt->state.materializeCommitted();
                 /// This commit's own transaction joins the
                 /// applied-above-newest-snapshot tail counters -- the live `rt->state` just mutated
                 /// above IS the next publish candidate's body, so there is no per-entry log to retain.
@@ -1473,7 +1473,7 @@ void CasRefLedger::maybeScheduleSnapshotPublish(const RootNamespace & ns, const 
     {
         std::lock_guard lock(rt->state_mutex);
         const uint64_t now = boot_ms_now_fn();
-        if (rt->state.lifecycle == RefLifecycle::Live
+        if (rt->state.getLifecycle() == RefLifecycle::Live
             /// Single-in-flight gate: at most one background publish per table. A dropped trigger is
             /// re-evaluated on the next trigger (post-flush / mount-time / the next read), so no snapshot
             /// is permanently skipped -- compaction is best-effort, not a staleness bound.
@@ -1603,7 +1603,7 @@ size_t CasRefLedger::committedOverlayEntriesForTest(const RootNamespace & ns)
     const auto rt = getRefTableRuntime(ns);
     ensureRefTableRecovered(ns, *rt);
     std::lock_guard lock(rt->state_mutex);
-    return rt->state.committed.overlayEntriesForTest();
+    return rt->state.getCommitted().overlayEntriesForTest();
 }
 
 namespace
@@ -1645,12 +1645,12 @@ bool CasRefLedger::trySnapshotPublishOnce(const RootNamespace & ns)
     uint64_t captured_bytes = 0;
     {
         std::lock_guard lock(rt->state_mutex);
-        if (rt->state.lifecycle != RefLifecycle::Live)
+        if (rt->state.getLifecycle() != RefLifecycle::Live)
             return false;   /// nothing to (re)publish here; dropNamespace publishes its own Removed snapshot
-        if (rt->newest_snapshot_id && !(*rt->newest_snapshot_id < rt->state.greatest_applied))
+        if (rt->newest_snapshot_id && !(*rt->newest_snapshot_id < rt->state.getGreatestApplied()))
             return false;   /// nothing above the newest snapshot
         candidate_state = rt->state;
-        candidate_x = rt->state.greatest_applied;
+        candidate_x = rt->state.getGreatestApplied();
         captured_count = rt->tail_count_since_snapshot.load(std::memory_order_relaxed);
         captured_bytes = rt->tail_bytes_since_snapshot.load(std::memory_order_relaxed);
     }
@@ -1838,7 +1838,7 @@ void CasRefLedger::sweepStalePrecommitsNow(const RootNamespace & ns, const std::
         std::vector<std::pair<String, ManifestRef>> chunk;
         {
             std::lock_guard lock(rt->state_mutex);
-            for (const auto & [ref_name, mref] : rt->state.precommits)
+            for (const auto & [ref_name, mref] : rt->state.getPrecommits())
             {
                 if (mref.writer_epoch >= live_epoch)
                     continue;
@@ -1855,7 +1855,7 @@ void CasRefLedger::sweepStalePrecommitsNow(const RootNamespace & ns, const std::
             {
                 std::vector<RefOp> ops;
                 for (const auto & [ref_name, mref] : chunk)
-                    if (state.precommits.contains({ref_name, mref}))
+                    if (state.getPrecommits().contains({ref_name, mref}))
                     {
                         RefOp op;
                         op.kind = RefOpKind::OwnerTransition;
@@ -1878,7 +1878,7 @@ void CasRefLedger::sweepStalePrecommitsNow(const RootNamespace & ns, const std::
         {
             std::lock_guard lock(rt->state_mutex);
             for (const auto & [ref_name, mref] : chunk)
-                if (!rt->state.precommits.contains({ref_name, mref}))
+                if (!rt->state.getPrecommits().contains({ref_name, mref}))
                     reclaimed.emplace_back(ref_name, mref);
         }
         ProfileEvents::increment(ProfileEvents::CasRefStalePrecommitsReclaimed, reclaimed.size());
@@ -1907,9 +1907,9 @@ void CasRefLedger::publishRemovedSnapshotNow(const RootNamespace & ns)
     RefTxnId remove_id;
     {
         std::lock_guard lock(rt->state_mutex);
-        if (rt->state.lifecycle != RefLifecycle::Removed || !rt->state.remove_txn_id)
+        if (rt->state.getLifecycle() != RefLifecycle::Removed || !rt->state.getRemoveTxnId())
             return;
-        remove_id = *rt->state.remove_txn_id;
+        remove_id = *rt->state.getRemoveTxnId();
         if (rt->newest_snapshot_id && *rt->newest_snapshot_id == remove_id)
             return;   /// already published this exact Removed snapshot
     }
@@ -1942,8 +1942,8 @@ void CasRefLedger::dropRef(const RootNamespace & ns, const String & ref_name)
     const RefTxnId txn_id = appendRefOps(ns, MutationScope::ref(ref_name),
         [&](const RefTableState & state) -> std::vector<RefOp>
         {
-            const auto it = state.committed.find(ref_name);
-            if (it == state.committed.end())
+            const auto it = state.getCommitted().find(ref_name);
+            if (it == state.getCommitted().end())
                 /// Fail-closed (no silent no-op): this item's own exception, the batch survives.
                 throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
                     "dropRef: no such ref {} in namespace {}", ref_name, ns.string());
@@ -1985,8 +1985,8 @@ void CasRefLedger::updateRefPayload(const RootNamespace & ns, const String & ref
     appendRefOps(ns, MutationScope::ref(ref_name),
         [&](const RefTableState & state) -> std::vector<RefOp>
         {
-            const auto it = state.committed.find(ref_name);
-            if (it == state.committed.end())
+            const auto it = state.getCommitted().find(ref_name);
+            if (it == state.getCommitted().end())
                 throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
                     "updateRefPayload: no such ref {} in namespace {}", ref_name, ns.string());
 
@@ -2017,8 +2017,8 @@ bool CasRefLedger::namespaceIsRemoved(const RootNamespace & ns)
     /// A genuinely-removed namespace is `Removed` WITH a `remove_txn_id` (RemoveNamespace sets both). The
     /// never-born default is also `Removed` but carries no `remove_txn_id`, and a recreated one is `Live`
     /// (NamespaceBirth resets the marker) — so `remove_txn_id.has_value()` is the exact born-then-removed
-    /// discriminator, matching promote's own `state.remove_txn_id` recreation guard.
-    return rt->state.lifecycle != RefLifecycle::Live && rt->state.remove_txn_id.has_value();
+    /// discriminator, matching promote's own `state.getRemoveTxnId()` recreation guard.
+    return rt->state.getLifecycle() != RefLifecycle::Live && rt->state.getRemoveTxnId().has_value();
 }
 
 
@@ -2038,7 +2038,7 @@ DropNamespaceStats CasRefLedger::dropNamespace(const RootNamespace & ns)
         /// `RefTableState`), so a never-touched namespace's drop is ALSO a harmless no-op here, which
         /// is the correct behavior either way (nothing to remove).
         std::lock_guard lock(rt->state_mutex);
-        if (rt->state.lifecycle != RefLifecycle::Live)
+        if (rt->state.getLifecycle() != RefLifecycle::Live)
             return {};
     }
 
@@ -2050,18 +2050,18 @@ DropNamespaceStats CasRefLedger::dropNamespace(const RootNamespace & ns)
     appendRefOps(ns, MutationScope::wholeShard(),
         [&](const RefTableState & state) -> std::vector<RefOp>
         {
-            if (state.lifecycle != RefLifecycle::Live)
+            if (state.getLifecycle() != RefLifecycle::Live)
                 return {};   /// raced: another caller already removed it since our check above
 
             std::vector<RefOp> ops;
-            for (const auto [ref_name, row] : state.committed)
+            for (const auto [ref_name, row] : state.getCommitted())
             {
                 RefOp op;
                 op.kind = RefOpKind::OwnerTransition;
                 op.old_binding = RefOwnerBinding{RefOwnerKind::Committed, ref_name, row.manifest_ref};
                 ops.push_back(op);
             }
-            for (const auto & [ref_name, mref] : state.precommits)
+            for (const auto & [ref_name, mref] : state.getPrecommits())
             {
                 RefOp op;
                 op.kind = RefOpKind::OwnerTransition;
@@ -2072,15 +2072,15 @@ DropNamespaceStats CasRefLedger::dropNamespace(const RootNamespace & ns)
             remove.kind = RefOpKind::RemoveNamespace;
             ops.push_back(remove);
 
-            stats.committed_refs = state.committed.size();
-            stats.precommits = state.precommits.size();
+            stats.committed_refs = state.getCommitted().size();
+            stats.precommits = state.getPrecommits().size();
             return ops;
         },
         RootMutationOrigin::Writer, RootMutationKind::DropNamespace,
         /// The operations above already name (and remove) every current precommit
         /// binding regardless of epoch, making the ordinary stale-precommit maintenance sweep redundant
         /// for THIS call -- and, left enabled, a race: the hoisted sweep runs first and would reclaim an
-        /// epoch-stale binding in its OWN transaction, so `state.precommits` above would already be
+        /// epoch-stale binding in its OWN transaction, so `state.getPrecommits()` above would already be
         /// missing it and undercount `stats.precommits`. See `appendRefOps`'s doc comment.
         /*skip_stale_precommit_sweep=*/true);
 

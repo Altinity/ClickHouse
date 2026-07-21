@@ -98,15 +98,15 @@ RefOp removeNamespaceOp()
     return op;
 }
 
-/// Field-by-field comparison rather than a `RefTableState::operator==` addition: the struct is the
-/// plan's verbatim-normative interface and gains no member beyond what it specifies.
+/// Field-by-field comparison (via getters) rather than a `RefTableState::operator==` addition: the
+/// class is the plan's verbatim-normative interface and gains no member beyond what it specifies.
 void expectStatesEqual(const RefTableState & a, const RefTableState & b)
 {
-    EXPECT_EQ(a.lifecycle, b.lifecycle);
-    EXPECT_EQ(a.remove_txn_id, b.remove_txn_id);
-    EXPECT_EQ(a.greatest_applied, b.greatest_applied);
-    EXPECT_EQ(a.committed, b.committed);
-    EXPECT_EQ(a.precommits, b.precommits);
+    EXPECT_EQ(a.getLifecycle(), b.getLifecycle());
+    EXPECT_EQ(a.getRemoveTxnId(), b.getRemoveTxnId());
+    EXPECT_EQ(a.getGreatestApplied(), b.getGreatestApplied());
+    EXPECT_EQ(a.getCommitted(), b.getCommitted());
+    EXPECT_EQ(a.getPrecommits(), b.getPrecommits());
 }
 
 /// The spec's own construction for a hypothetical `remove_namespace` transaction (§Remove Namespace):
@@ -117,9 +117,9 @@ void expectStatesEqual(const RefTableState & a, const RefTableState & b)
 RefLogTxn buildRemovalTxnForTest(const RefTableState & state, const String & ns, RefTxnId id)
 {
     std::vector<RefOp> ops;
-    for (const auto [name, row] : state.committed)
+    for (const auto [name, row] : state.getCommitted())
         ops.push_back(removeCommittedOp(name, row.manifest_ref));
-    for (const auto & [name, mref] : state.precommits)
+    for (const auto & [name, mref] : state.getPrecommits())
         ops.push_back(removePrecommitOp(name, mref));
     ops.push_back(removeNamespaceOp());
     return makeTxn(ns, id, std::move(ops));
@@ -137,9 +137,9 @@ TEST(CasRefStateMachine, BirthFromNeverBornAccepts)
 {
     RefTableState state;
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1}, {birthOp()}));
-    EXPECT_EQ(state.lifecycle, RefLifecycle::Live);
-    EXPECT_FALSE(state.remove_txn_id.has_value());
-    EXPECT_EQ(state.greatest_applied, (RefTxnId{1, 1}));
+    EXPECT_EQ(state.getLifecycle(), RefLifecycle::Live);
+    EXPECT_FALSE(state.getRemoveTxnId().has_value());
+    EXPECT_EQ(state.getGreatestApplied(), (RefTxnId{1, 1}));
 }
 
 TEST(CasRefStateMachine, BirthWhileLiveRejectedAndStateUnchanged)
@@ -158,12 +158,12 @@ TEST(CasRefStateMachine, BirthAfterRemovalAccepts)
     RefTableState state;
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1}, {birthOp()}));
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 2}, {removeNamespaceOp()}));
-    ASSERT_EQ(state.lifecycle, RefLifecycle::Removed);
-    ASSERT_TRUE(state.remove_txn_id.has_value());
+    ASSERT_EQ(state.getLifecycle(), RefLifecycle::Removed);
+    ASSERT_TRUE(state.getRemoveTxnId().has_value());
 
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 3}, {birthOp()}));
-    EXPECT_EQ(state.lifecycle, RefLifecycle::Live);
-    EXPECT_FALSE(state.remove_txn_id.has_value());
+    EXPECT_EQ(state.getLifecycle(), RefLifecycle::Live);
+    EXPECT_FALSE(state.getRemoveTxnId().has_value());
 }
 
 /// ===================================================================================
@@ -221,7 +221,7 @@ TEST(CasRefStateMachine, AddPrecommitAccepts)
 {
     RefTableState state;
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1}, {birthOp(), addPrecommitOp("a", manifestRef(1, 1, 1))}));
-    EXPECT_TRUE(state.precommits.contains({"a", manifestRef(1, 1, 1)}));
+    EXPECT_TRUE(state.getPrecommits().contains({"a", manifestRef(1, 1, 1)}));
 }
 
 TEST(CasRefStateMachine, AddPrecommitRejectsExactDuplicate)
@@ -252,7 +252,7 @@ TEST(CasRefStateMachine, AddPrecommitRejectsManifestAlreadyCommittedElsewhere)
     RefTableState state;
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1},
         {birthOp(), addPrecommitOp("a", manifestRef(1, 1, 1)), promoteOp("a", manifestRef(1, 1, 1))}));
-    ASSERT_TRUE(state.committed.contains("a"));
+    ASSERT_TRUE(state.getCommitted().contains("a"));
     const RefTableState before = state;
 
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
@@ -268,8 +268,8 @@ TEST(CasRefStateMachine, AddPrecommitAllowsDifferentManifestsRacingForSameName)
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1},
         {birthOp(), addPrecommitOp("same", manifestRef(1, 1, 1))}));
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 2}, {addPrecommitOp("same", manifestRef(1, 2, 1))}));
-    EXPECT_TRUE(state.precommits.contains({"same", manifestRef(1, 1, 1)}));
-    EXPECT_TRUE(state.precommits.contains({"same", manifestRef(1, 2, 1)}));
+    EXPECT_TRUE(state.getPrecommits().contains({"same", manifestRef(1, 1, 1)}));
+    EXPECT_TRUE(state.getPrecommits().contains({"same", manifestRef(1, 2, 1)}));
 }
 
 /// ===================================================================================
@@ -281,7 +281,7 @@ TEST(CasRefStateMachine, RemovePrecommitAccepts)
     RefTableState state;
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1}, {birthOp(), addPrecommitOp("a", manifestRef(1, 1, 1))}));
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 2}, {removePrecommitOp("a", manifestRef(1, 1, 1))}));
-    EXPECT_TRUE(state.precommits.empty());
+    EXPECT_TRUE(state.getPrecommits().empty());
 }
 
 TEST(CasRefStateMachine, RemovePrecommitRejectsAbsentBinding)
@@ -312,7 +312,7 @@ TEST(CasRefStateMachine, RemoveCommittedAccepts)
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1},
         {birthOp(), addPrecommitOp("a", manifestRef(1, 1, 1)), promoteOp("a", manifestRef(1, 1, 1))}));
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 2}, {removeCommittedOp("a", manifestRef(1, 1, 1))}));
-    EXPECT_TRUE(state.committed.empty());
+    EXPECT_TRUE(state.getCommitted().empty());
 }
 
 TEST(CasRefStateMachine, RemoveCommittedRejectsAbsentRef)
@@ -362,10 +362,10 @@ TEST(CasRefStateMachine, PromoteAtomicityNoOwnerlessIntermediateEmptyPayload)
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1}, {birthOp(), addPrecommitOp("a", manifestRef(1, 1, 1))}));
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 2}, {promoteOp("a", manifestRef(1, 1, 1))}));
 
-    EXPECT_FALSE(state.precommits.contains({"a", manifestRef(1, 1, 1)}));
-    ASSERT_TRUE(state.committed.contains("a"));
-    EXPECT_EQ(state.committed.at("a").manifest_ref, manifestRef(1, 1, 1));
-    EXPECT_EQ(state.committed.at("a").payload, "");
+    EXPECT_FALSE(state.getPrecommits().contains({"a", manifestRef(1, 1, 1)}));
+    ASSERT_TRUE(state.getCommitted().contains("a"));
+    EXPECT_EQ(state.getCommitted().at("a").manifest_ref, manifestRef(1, 1, 1));
+    EXPECT_EQ(state.getCommitted().at("a").payload, "");
 }
 
 TEST(CasRefStateMachine, PromoteWithPayloadInSameTxnInstallsPayload)
@@ -375,9 +375,9 @@ TEST(CasRefStateMachine, PromoteWithPayloadInSameTxnInstallsPayload)
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 2},
         {promoteOp("a", manifestRef(1, 1, 1)), setPayloadOp("a", manifestRef(1, 1, 1), "initial-payload", 42)}));
 
-    ASSERT_TRUE(state.committed.contains("a"));
-    EXPECT_EQ(state.committed.at("a").payload, "initial-payload");
-    EXPECT_EQ(state.committed.at("a").published_at_ms, 42u);
+    ASSERT_TRUE(state.getCommitted().contains("a"));
+    EXPECT_EQ(state.getCommitted().at("a").payload, "initial-payload");
+    EXPECT_EQ(state.getCommitted().at("a").published_at_ms, 42u);
 }
 
 TEST(CasRefStateMachine, PromoteRejectsDisplacingAnotherCommittedManifest)
@@ -409,9 +409,9 @@ TEST(CasRefStateMachine, PromoteAcceptsAfterExplicitRemovalOfStaleCommitted)
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 3},
         {removeCommittedOp("a", manifestRef(1, 1, 1)), promoteOp("a", manifestRef(1, 2, 1))}));
 
-    ASSERT_TRUE(state.committed.contains("a"));
-    EXPECT_EQ(state.committed.at("a").manifest_ref, manifestRef(1, 2, 1));
-    EXPECT_FALSE(state.precommits.contains({"a", manifestRef(1, 2, 1)}));
+    ASSERT_TRUE(state.getCommitted().contains("a"));
+    EXPECT_EQ(state.getCommitted().at("a").manifest_ref, manifestRef(1, 2, 1));
+    EXPECT_FALSE(state.getPrecommits().contains({"a", manifestRef(1, 2, 1)}));
 }
 
 TEST(CasRefStateMachine, OwnerTransitionRejectsInvalidCombinations)
@@ -487,9 +487,9 @@ TEST(CasRefStateMachine, SetPayloadAcceptsAndReplacesPayload)
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 2}, {setPayloadOp("a", manifestRef(1, 1, 1), "v1", 10)}));
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 3}, {setPayloadOp("a", manifestRef(1, 1, 1), "v2", 20)}));
 
-    EXPECT_EQ(state.committed.at("a").payload, "v2");
-    EXPECT_EQ(state.committed.at("a").published_at_ms, 20u);
-    EXPECT_EQ(state.committed.at("a").manifest_ref, manifestRef(1, 1, 1));   /// unchanged: no edge move
+    EXPECT_EQ(state.getCommitted().at("a").payload, "v2");
+    EXPECT_EQ(state.getCommitted().at("a").published_at_ms, 20u);
+    EXPECT_EQ(state.getCommitted().at("a").manifest_ref, manifestRef(1, 1, 1));   /// unchanged: no edge move
 }
 
 /// ===================================================================================
@@ -501,9 +501,9 @@ TEST(CasRefStateMachine, RemoveNamespaceAloneOnEmptyTableAccepted)
     RefTableState state;
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1}, {birthOp()}));
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 2}, {removeNamespaceOp()}));
-    EXPECT_EQ(state.lifecycle, RefLifecycle::Removed);
-    ASSERT_TRUE(state.remove_txn_id.has_value());
-    EXPECT_EQ(*state.remove_txn_id, (RefTxnId{1, 2}));
+    EXPECT_EQ(state.getLifecycle(), RefLifecycle::Removed);
+    ASSERT_TRUE(state.getRemoveTxnId().has_value());
+    EXPECT_EQ(*state.getRemoveTxnId(), (RefTxnId{1, 2}));
 }
 
 TEST(CasRefStateMachine, RemoveNamespaceDrainingOwnersInSameTxnAccepted)
@@ -512,15 +512,15 @@ TEST(CasRefStateMachine, RemoveNamespaceDrainingOwnersInSameTxnAccepted)
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1},
         {birthOp(), addPrecommitOp("a", manifestRef(1, 1, 1)), addPrecommitOp("b", manifestRef(1, 2, 1)),
          promoteOp("b", manifestRef(1, 2, 1))}));
-    ASSERT_TRUE(state.precommits.contains({"a", manifestRef(1, 1, 1)}));
-    ASSERT_TRUE(state.committed.contains("b"));
+    ASSERT_TRUE(state.getPrecommits().contains({"a", manifestRef(1, 1, 1)}));
+    ASSERT_TRUE(state.getCommitted().contains("b"));
 
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 2},
         {removePrecommitOp("a", manifestRef(1, 1, 1)), removeCommittedOp("b", manifestRef(1, 2, 1)),
          removeNamespaceOp()}));
-    EXPECT_EQ(state.lifecycle, RefLifecycle::Removed);
-    EXPECT_TRUE(state.committed.empty());
-    EXPECT_TRUE(state.precommits.empty());
+    EXPECT_EQ(state.getLifecycle(), RefLifecycle::Removed);
+    EXPECT_TRUE(state.getCommitted().empty());
+    EXPECT_TRUE(state.getPrecommits().empty());
 }
 
 TEST(CasRefStateMachine, RemoveNamespaceRejectsWhenOwnersRemain)
@@ -588,7 +588,7 @@ TEST(CasRefStateMachine, WholeTxnAtomicityLastOpFailureLeavesStateUntouched)
             {addPrecommitOp("a", manifestRef(1, 1, 1)), removePrecommitOp("b", manifestRef(9, 9, 9))})); });
 
     expectStatesEqual(before, state);
-    EXPECT_FALSE(state.precommits.contains({"a", manifestRef(1, 1, 1)}));
+    EXPECT_FALSE(state.getPrecommits().contains({"a", manifestRef(1, 1, 1)}));
 }
 
 /// ===================================================================================
@@ -615,7 +615,7 @@ TEST(CasRefStateMachine, StrictlyIncreasingTxnIdsRejectsEqualAndLower)
 
     /// A gap is fine -- only strict increase is required (spec §Ordered Ref Transaction Identifier).
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 100}, {addPrecommitOp("a", manifestRef(1, 1, 1))}));
-    EXPECT_EQ(state.greatest_applied, (RefTxnId{1, 100}));
+    EXPECT_EQ(state.getGreatestApplied(), (RefTxnId{1, 100}));
 }
 
 /// ===================================================================================
@@ -669,9 +669,9 @@ TEST(CasRefStateMachine, ReplayFromNoSnapshot)
         makeTxn(kNs, RefTxnId{1, 2}, {promoteOp("a", manifestRef(1, 1, 1))}),
     };
     const RefTableState state = replay(std::nullopt, tail);
-    EXPECT_EQ(state.lifecycle, RefLifecycle::Live);
-    EXPECT_TRUE(state.committed.contains("a"));
-    EXPECT_EQ(state.greatest_applied, (RefTxnId{1, 2}));
+    EXPECT_EQ(state.getLifecycle(), RefLifecycle::Live);
+    EXPECT_TRUE(state.getCommitted().contains("a"));
+    EXPECT_EQ(state.getGreatestApplied(), (RefTxnId{1, 2}));
 }
 
 TEST(CasRefStateMachine, ReplayFromSnapshotPlusTail)
@@ -682,8 +682,8 @@ TEST(CasRefStateMachine, ReplayFromSnapshotPlusTail)
 
     std::vector<RefLogTxn> tail{makeTxn(kNs, RefTxnId{1, 2}, {promoteOp("a", manifestRef(1, 1, 1))})};
     const RefTableState state = replay(snap, tail);
-    EXPECT_TRUE(state.committed.contains("a"));
-    EXPECT_EQ(state.greatest_applied, (RefTxnId{1, 2}));
+    EXPECT_TRUE(state.getCommitted().contains("a"));
+    EXPECT_EQ(state.getGreatestApplied(), (RefTxnId{1, 2}));
 }
 
 TEST(CasRefStateMachine, ReplayRejectsTailNsMismatchAgainstSnapshot)
@@ -878,8 +878,8 @@ TEST(CasRefStateMachine, AdmitsRejectsGrowthPastSnapshotBudgetPromoteWithPayload
     RefTableState state;
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1}, {birthOp(), addPrecommitOp("a", manifestRef(1, 1, 1))}));
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 2}, {promoteOp("a", manifestRef(1, 1, 1))}));
-    ASSERT_TRUE(state.committed.contains("a"));
-    ASSERT_EQ(state.committed.at("a").payload, "");
+    ASSERT_TRUE(state.getCommitted().contains("a"));
+    ASSERT_EQ(state.getCommitted().at("a").payload, "");
 
     const RefOp op = setPayloadOp("a", manifestRef(1, 1, 1), String(500, 'y'), 99);
     RefTableState scratch = state;
@@ -1022,10 +1022,10 @@ TEST(CasRefLogSizeHelpers, FramingPlusOpsEqualsFullRemovalEncode)
     const size_t full = encodeRefLogTxn(removal).size();
 
     size_t rebuilt = removalFramingSize("", RefTxnId{1, 1},
-                                        state.committed.size() + state.precommits.size() + 1);
-    for (const auto [name, row] : state.committed)
+                                        state.getCommitted().size() + state.getPrecommits().size() + 1);
+    for (const auto [name, row] : state.getCommitted())
         rebuilt += removalOpEncodedSize(RefOwnerKind::Committed, name, row.manifest_ref);
-    for (const auto & [name, mref] : state.precommits)
+    for (const auto & [name, mref] : state.getPrecommits())
         rebuilt += removalOpEncodedSize(RefOwnerKind::Precommit, name, mref);
 
     EXPECT_EQ(rebuilt, full);
@@ -1039,18 +1039,18 @@ namespace
 uint64_t recomputeSnapshotBody(const RefTableState & s)
 {
     uint64_t total = 0;
-    for (const auto [name, row] : s.committed)
+    for (const auto [name, row] : s.getCommitted())
         total += committedRowEncodedSize(row);
-    for (const auto & [name, mref] : s.precommits)
+    for (const auto & [name, mref] : s.getPrecommits())
         total += precommitRowEncodedSize(RefOwnerBinding{RefOwnerKind::Precommit, name, mref});
     return total;
 }
 uint64_t recomputeRemovalBody(const RefTableState & s)
 {
     uint64_t total = 0;
-    for (const auto [name, row] : s.committed)
+    for (const auto [name, row] : s.getCommitted())
         total += removalOpEncodedSize(RefOwnerKind::Committed, name, row.manifest_ref);
-    for (const auto & [name, mref] : s.precommits)
+    for (const auto & [name, mref] : s.getPrecommits())
         total += removalOpEncodedSize(RefOwnerKind::Precommit, name, mref);
     return total;
 }
@@ -1059,8 +1059,8 @@ uint64_t recomputeRemovalBody(const RefTableState & s)
 TEST(CasRefStateCounters, CountersTrackRowsThroughEveryOpKind)
 {
     RefTableState state;
-    EXPECT_EQ(state.snapshot_body_bytes, 0u);
-    EXPECT_EQ(state.removal_body_bytes, 0u);
+    EXPECT_EQ(state.getSnapshotBodyBytes(), 0u);
+    EXPECT_EQ(state.getRemovalBodyBytes(), 0u);
 
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1}, {birthOp()}));
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 2}, {addPrecommitOp("a", manifestRef(1, 1, 1))}));
@@ -1068,16 +1068,16 @@ TEST(CasRefStateCounters, CountersTrackRowsThroughEveryOpKind)
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 4},
         {setPayloadOp("a", manifestRef(1, 1, 1), String(77, 'x'), 5)}));
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 5}, {addPrecommitOp("b", manifestRef(1, 2, 1))}));
-    EXPECT_EQ(state.snapshot_body_bytes, recomputeSnapshotBody(state));
-    EXPECT_EQ(state.removal_body_bytes, recomputeRemovalBody(state));
+    EXPECT_EQ(state.getSnapshotBodyBytes(), recomputeSnapshotBody(state));
+    EXPECT_EQ(state.getRemovalBodyBytes(), recomputeRemovalBody(state));
 
     /// Shrink back down: remove the precommit, then the committed row.
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 6}, {removePrecommitOp("b", manifestRef(1, 2, 1))}));
     applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 7}, {removeCommittedOp("a", manifestRef(1, 1, 1))}));
-    EXPECT_EQ(state.snapshot_body_bytes, recomputeSnapshotBody(state));
-    EXPECT_EQ(state.removal_body_bytes, recomputeRemovalBody(state));
-    EXPECT_EQ(state.snapshot_body_bytes, 0u);
-    EXPECT_EQ(state.removal_body_bytes, 0u);
+    EXPECT_EQ(state.getSnapshotBodyBytes(), recomputeSnapshotBody(state));
+    EXPECT_EQ(state.getRemovalBodyBytes(), recomputeRemovalBody(state));
+    EXPECT_EQ(state.getSnapshotBodyBytes(), 0u);
+    EXPECT_EQ(state.getRemovalBodyBytes(), 0u);
 }
 
 /// ===================================================================================

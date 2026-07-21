@@ -122,8 +122,8 @@ bool blobStillReferenced(Pool & store, const Layout & layout,
             /// ref write is invisible to the cache. The recovery equation sees every log.
             const RootNamespace rns{ns_part};
             const RefTableState table = recoverRefTable(store.backend(), layout, rns);
-            const auto rit = table.committed.find(ref_name);
-            if (rit == table.committed.end())
+            const auto rit = table.getCommitted().find(ref_name);
+            if (rit == table.getCommitted().end())
                 continue;   /// the ref was DROPPED since the walk — this label no longer applies
             const PartManifest body = store.readManifest(ManifestId{rns, rit->second.manifest_ref});
             for (const ManifestEntry & e : body.entries)
@@ -280,7 +280,7 @@ void runFsckImpl(Pool & store, bool detail, const FsckProgress & on_progress, co
         /// mismatch, making the report not `clean()`) on a genuine divergence; skips silently when the
         /// covered logs were already cleaned or an object vanished mid-check.
         checkSnapshotOracle(backend, layout, ns, detail, deadline, report);
-        for (const auto [ref_name, row] : table.committed)
+        for (const auto [ref_name, row] : table.getCommitted())
         {
             const ManifestId id{ns, row.manifest_ref};
             const String mkey = layout.manifestKey(id);

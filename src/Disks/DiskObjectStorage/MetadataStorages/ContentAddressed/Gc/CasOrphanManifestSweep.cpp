@@ -211,9 +211,9 @@ std::set<String> activeManifestKeys(Pool & store, const RootNamespace & ns, Late
     /// Current owners = snapshot + replayed tail (committed rows + live precommits).
     const RecoveredRefTable recovered = recoverRefTableDetailed(backend, layout, ns, onGcEnumerationPage);
     const RefTableState & state = recovered.state;
-    for (const auto [ref_name, row] : state.committed)
+    for (const auto [ref_name, row] : state.getCommitted())
         active.insert(layout.manifestKey(ManifestId{ns, row.manifest_ref}));
-    for (const auto & [ref_name, manifest_ref] : state.precommits)
+    for (const auto & [ref_name, manifest_ref] : state.getPrecommits())
         active.insert(layout.manifestKey(ManifestId{ns, manifest_ref}));
 
     /// Tail-removal protection: every manifest removed by a log ABOVE the durable fold cursor stays active

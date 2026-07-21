@@ -138,7 +138,7 @@ struct RefLedgerConfig
     uint64_t ref_table_cache_bytes = 256ULL << 20;
 };
 
-/// The in-memory table state: `TableState = Replay(S_X.state, tail(X))`. This struct, `applyRefLogTxn`, `snapshotOf`, and
+/// The in-memory table state: `TableState = Replay(S_X.state, tail(X))`. This class, `applyRefLogTxn`, `snapshotOf`, and
 /// `replay` are the ONE shared implementation of that equation -- used verbatim by the writer, its
 /// own recovery path, `fsck`, and snapshot construction, so every consumer agrees on what a
 /// transaction sequence means. "Namespace" and "table" name the same entity throughout this file
@@ -147,14 +147,30 @@ struct RefLedgerConfig
 /// Representation note (never-born vs removed): there is no separate "first birth" flag. Both
 /// "never born" and "Removed" default `lifecycle` to `RefLifecycle::Removed`; they are told apart by
 /// `remove_txn_id`: absent means the namespace has never completed a `remove_namespace` transaction
-/// (either truly never born, or -- from this struct's point of view -- indistinguishable from it,
+/// (either truly never born, or -- from this class's point of view -- indistinguishable from it,
 /// which is fine because a `namespace_birth` op is legal from EITHER case and nothing else is legal
 /// from either). Present means a real removal happened and recorded its `RefTxnId`. `committed` and
 /// `precommits` are always empty while `lifecycle == Removed` (an invariant `applyRefLogTxn`
 /// maintains: `remove_namespace` only fires once both are already empty, and no other operation is
 /// legal until the next `namespace_birth`).
-struct RefTableState
+class RefTableState
 {
+public:
+    RefTableState() = default;
+
+    RefLifecycle getLifecycle() const { return lifecycle; }
+    const std::optional<RefTxnId> & getRemoveTxnId() const { return remove_txn_id; }
+    const RefTxnId & getGreatestApplied() const { return greatest_applied; }
+    const RefCowMap & getCommitted() const { return committed; }
+    const std::set<std::pair<String, ManifestRef>> & getPrecommits() const { return precommits; }
+    uint64_t getSnapshotBodyBytes() const { return snapshot_body_bytes; }
+    uint64_t getRemovalBodyBytes() const { return removal_body_bytes; }
+
+    /// State-install point only (once per ref-log flush, never per batch item): folds the committed
+    /// map's COW overlay into a fresh shared base.
+    void materializeCommitted() { committed.materialize(); }
+
+private:
     RefLifecycle lifecycle = RefLifecycle::Removed;   /// see representation note above
     std::optional<RefTxnId> remove_txn_id;
     RefTxnId greatest_applied{};                       /// {0, 0} = no transaction applied yet
@@ -163,13 +179,58 @@ struct RefTableState
     std::set<std::pair<String, ManifestRef>> precommits;             /// (ref_name, manifest_ref)
 
     /// Running byte totals of the two admission-budget encodings' *bodies* (row/op lines only, no
-    /// header/meta/trailer framing), maintained O(1) per applied op by `applyOpInPlace` and seeded by
+    /// header/meta/trailer framing), maintained O(1) per applied op by `applyOp` and seeded by
     /// `stateFromSnapshot`. A pure function of `(committed, precommits)`: `admits` reads
     /// `framing + total` instead of re-encoding the whole table. See `admits`'s doc for why this is
     /// byte-exact rather than a drift-prone estimate.
     uint64_t snapshot_body_bytes = 0;   /// Σ committedRowEncodedSize + Σ precommitRowEncodedSize
     uint64_t removal_body_bytes  = 0;   /// Σ removalOpEncodedSize(one per committed + one per precommit)
+
+    /// One operation's local preconditions and effect, shared by `applyRefLogTxn`'s per-op loop and by
+    /// `admits`'s single-op preview. `txn_id` is only read by `RemoveNamespace` (it becomes the
+    /// resulting `remove_txn_id`). Was free `applyOpInPlace`.
+    void applyOp(const RefOp & op, const RefTxnId & txn_id);
+
+    /// The `owner_transition` op kind: dispatches on the `(old_binding, new_binding)` shape to one of
+    /// the four legal transitions (add precommit / remove precommit / remove committed / promote). Any
+    /// other shape is not a recognized transition. Was free.
+    void applyOwnerTransition(const RefOp & op);
+
+    /// The `set_payload` op kind: the committed ref must still name `expected_manifest_ref`; replaces
+    /// the opaque `payload` blob and `published_at_ms` without touching the manifest edge. Was free.
+    void applySetPayload(const RefOp & op);
+
+    /// True iff `manifest_ref` already names an existing committed row or precommit binding under ANY
+    /// ref_name (the add-precommit rule: "no conflicting owner may name the same manifest"). Was free.
+    bool manifestAlreadyOwned(const ManifestRef & manifest_ref) const;
+
+#ifdef DEBUG_OR_SANITIZER_BUILD
+    /// Debug/sanitizer-only: recompute both body totals from scratch and assert the incrementally
+    /// maintained values match. Was free.
+    void debugAssertBodyCounters() const;
+#endif
+
+    friend void applyRefLogTxn(RefTableState & state, const RefLogTxn & txn);
+    friend RefTableState stateFromSnapshot(const RefTableSnapshot & snapshot);
+    friend bool admits(const RefTableState & state, const RefOp & op,
+                       uint64_t snapshot_budget, uint64_t removal_budget);
 };
+
+/// The inverse of `snapshotOf`: state from a snapshot's rows. `replay` may receive a hand-built
+/// `RefTableSnapshot` that never passed through `decodeRefTableSnapshot`, so this round-trips it
+/// through the codec's own `encodeRefTableSnapshot`/`decodeRefTableSnapshot` rather than
+/// re-implementing a second, independently-maintained copy of its validation (sortedness, no
+/// duplicates, canonical names, nonzero ids, `manifest_ref` field validity, lifecycle/remove_txn_id
+/// coupling) that could silently miss a case. Concretely: a hand-built snapshot with two committed
+/// rows sharing one `ref_name` would otherwise DROP the second row via `RefCowMap::emplace` below
+/// (same no-overwrite-on-existing-key semantics as `std::map::emplace`) -- the same phantom-alive
+/// class of bug as a promote's silent displacement (see `applyOwnerTransition` above), just reached
+/// through snapshot loading instead of a transaction.
+///
+/// Promoted from `CasRefProtocol.cpp`'s anonymous namespace to the public protocol API: the ONE
+/// validated way to construct a state from rows -- tests and benchmarks use it instead of poking
+/// fields.
+RefTableState stateFromSnapshot(const RefTableSnapshot & snapshot);
 
 /// Applies the COMPLETE transaction to `state`, or throws `CORRUPTED_DATA` and leaves `state`
 /// byte-for-byte unchanged (each transition shape below has exactly one precondition enforced
@@ -268,7 +329,7 @@ uint64_t encodedRemovalBudgetSize(const RefTableState & state);
 /// the budget", not "is this op legal") keeps BOTH the resulting table snapshot and the resulting
 /// hypothetical complete-removal transaction within their respective byte budgets.
 ///
-/// `RefTableState` carries no `ns` (it is per-table but not one of this struct's fields), so both
+/// `RefTableState` carries no `ns` (it is per-table but not one of this class's fields), so both
 /// hypothetical encodings are measured with an empty `ns`. `ns` is constant for one table for its
 /// entire lifetime, so a caller computes its own table's `ns.size()` overhead once (the wire layout's
 /// `u32` length prefix itself is present in BOTH the empty-`ns` measurement here and the real encoding,
@@ -278,13 +339,13 @@ uint64_t encodedRemovalBudgetSize(const RefTableState & state);
 /// `ref_snapshot_max_bytes` / `ref_removal_max_bytes` hard limits before calling `admits`.
 ///
 /// Implementation: sizes are computed incrementally. `RefTableState` carries running body-byte totals
-/// (`snapshot_body_bytes` / `removal_body_bytes`) maintained O(1) per applied op by `applyOpInPlace`;
+/// (`snapshot_body_bytes` / `removal_body_bytes`) maintained O(1) per applied op by `RefTableState::applyOp`;
 /// `admits` applies `op` to a scratch copy and reads `framing + total` via `encodedSnapshotBudgetSize`
 /// / `encodedRemovalBudgetSize`, making the whole check O(touched rows) instead of O(table size). This
 /// is byte-exact rather than a drift-prone estimate: both budget encodings are pure per-row sums, the
 /// per-row contributions come from the same codec primitives the full encoders use, and a
-/// debug/sanitizer-only recompute-and-compare `chassert` (`debugAssertBodyCounters`) reasserts equality
-/// on every applied transaction and every `admits` preview.
+/// debug/sanitizer-only recompute-and-compare `chassert` (`RefTableState::debugAssertBodyCounters`)
+/// reasserts equality on every applied transaction and every `admits` preview.
 bool admits(const RefTableState & state, const RefOp & op, uint64_t snapshot_budget, uint64_t removal_budget);
 
 /// Pure ref-log intake primitives for a GC round. None of these read a
