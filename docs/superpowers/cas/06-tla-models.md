@@ -705,7 +705,8 @@ heartbeat ack.
 
 ### `CaGcCore.tla` — EBR epoch/generation design (superseded) {#cagccore}
 
-**Files:** `CaGcCore.tla`, `CaGcCore_stage*.cfg`
+**Files:** `CaGcCore.tla`, `CaGcCore_stage*.cfg` — **removed 2026-07-21** (superseded design; this
+section stays as the historical record, full text in git history).
 
 The original GC core, based on Epoch-Based Reclamation (EBR) with a monotone `epoch_current` counter,
 per-writer `O_W` pins, and a `+`/`-` event fold. Checked at stages 1–4 (full adversarial: expiry gap,
@@ -725,9 +726,7 @@ counterexamples found during EBR model development encoded the four load-bearing
   `[t_expire, t_aware]` session-expiry gap. A self-fence on a local elapsed-time deadline strictly
   inside `T_session` is required.
 
-The prose files `README.md` and `RESULTS.md` in this directory are this model's documentation.
-
-**Code currency:** SUPERSEDED. Replaced by the incarnation-token design. Kept as historical record.
+**Code currency:** SUPERSEDED. Replaced by the incarnation-token design; files removed 2026-07-21.
 
 ---
 
@@ -751,7 +750,7 @@ The prose files `README.md` and `RESULTS.md` in this directory are this model's 
 | `CaGcShardIncarnationCore.tla` | Registry removal D1 | **CURRENT** | `INV_NO_DANGLING`, `INV_NO_ORPHAN_EDGE` | 4 | two-coordinate replacement (incarnation + round self-floor) for registry; per-shard monotonicity |
 | `CaGcAckFloorCore.tla` | Ack-floor round core | **CURRENT** (minor drift; writer-heartbeat half superseded — v3) | `INV_NO_DANGLE`, `INV_NO_RETURN`, `INV_ACK_LE_VIEW` | 11 | causal floor gates graduation; ack after drain + view load; expired ⇒ fence-out; recreate not adopt; rebuild discards retired list + mints round above all acks; clamp suppression gates graduation |
 | `CaGcAckFloorZombie.tla` | Ack-floor two-leader | **CURRENT** (minor drift; writer-heartbeat half superseded — v3) | `INV_NO_DANGLE`, `INV_NO_RETURN` | 1 | `delete_pending` two-phase graduation load-bearing; floor latched ≤ fold cut (order invariant) |
-| `CaGcCore.tla` | EBR GC core | **SUPERSEDED** | `INV_NO_LOSS`, `INV_NO_DANGLE`, `INV_NO_ABA` | 4 CEs during dev | EBR design record; replaced by incarnation-token |
+| `CaGcCore.tla` | EBR GC core | **REMOVED 2026-07-21** (superseded) | `INV_NO_LOSS`, `INV_NO_DANGLE`, `INV_NO_ABA` | 4 CEs during dev | EBR design record; replaced by incarnation-token |
 | `CaGcRoundDeferCore.tla` | GC round DEFER/skip-unchanged | **CURRENT** | `NoOverDelete`, `NoDangle`; `EventuallyFolded` | 2 | a due graduation force-folds first (no destructive decision on a not-fully-folded snapshot); deferral bounded (`deferCount < MaxDefer`) |
 | `CaEdgeBeforeObserve.tla` | Writer/GC simplification Gate A | **CURRENT** | `NoOverDelete`-shaped safety (implicit) | 4 | with EDGE-BEFORE-OBSERVE + same-pass decided-delete, promote-time revalidation of TOKENED leaves is redundant; K1/K3Head/K3AdoptCheck + the order itself stay load-bearing |
 | `CaMetaDescriptor.tla` | Writer/GC simplification Gate B (meta descriptor, v1) | **CURRENT** (predates the v3 2-state trim) | `INV-META-BODY` | 7 | create bottom-up (body, then meta); delete top-down (meta at captured etag, then body at condemn-time token) |
