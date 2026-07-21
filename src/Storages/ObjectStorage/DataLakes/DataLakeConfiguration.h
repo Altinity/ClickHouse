@@ -680,11 +680,20 @@ public:
     {
         getImpl().mutate(commands, context, storage_id, metadata_snapshot, catalog, format_settings);
     }
-    void checkMutationIsPossible(const MutationCommands & commands) override { getImpl().checkMutationIsPossible(commands); }
+    void checkMutationIsPossible(ObjectStoragePtr object_storage, ContextPtr context, const MutationCommands & commands) override
+    {
+        getImpl().checkMutationIsPossible(object_storage, context, commands);
+    }
 
-    void checkAlterIsPossible(const AlterCommands & commands) override { getImpl().checkAlterIsPossible(commands); }
+    void checkAlterIsPossible(ObjectStoragePtr object_storage, ContextPtr context, const AlterCommands & commands) override
+    {
+        getImpl().checkAlterIsPossible(object_storage, context, commands);
+    }
 
-    void alter(const AlterCommands & params, ContextPtr context) override { getImpl().alter(params, context); }
+    void alter(ObjectStoragePtr object_storage, const AlterCommands & params, ContextPtr context) override
+    {
+        getImpl().alter(object_storage, params, context);
+    }
 
     const DataLakeStorageSettings & getDataLakeSettings() const override { return getImpl().getDataLakeSettings(); }
 
@@ -809,8 +818,10 @@ public:
     std::shared_ptr<DataLake::ICatalog> getCatalog(ContextPtr context, const StorageID & table_id) const override
         { return getImpl().getCatalog(context, table_id); }
 
-    bool optimize(const StorageMetadataPtr & metadata_snapshot, ContextPtr context, const std::optional<FormatSettings> & format_settings) override
-        { return getImpl().optimize(metadata_snapshot, context, format_settings); }
+    bool optimize(ObjectStoragePtr object_storage, const StorageMetadataPtr & metadata_snapshot, ContextPtr context, const std::optional<FormatSettings> & format_settings) override
+    {
+        return getImpl().optimize(object_storage, metadata_snapshot, context, format_settings);
+    }
 
     bool supportsPrewhere() const override { return getImpl().supportsPrewhere(); }
 

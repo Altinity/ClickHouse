@@ -1028,7 +1028,7 @@ StorageObjectStorageSource::ReaderHolder StorageObjectStorageSource::createReade
             /// tables (e.g. Iceberg with Parquet + ORC files), table-level PREWHERE support
             /// may not match the individual file's format capabilities.
             /// See https://github.com/ClickHouse/ClickHouse/issues/96829
-            const auto actual_format = object_info->getFileFormat().value_or(configuration->format);
+            const auto actual_format = object_info->getFileFormat().value_or(configuration->getFormat());
             const bool format_supports_prewhere =
                 FormatFactory::instance().checkIfFormatSupportsPrewhere(actual_format, context_, format_settings);
 
