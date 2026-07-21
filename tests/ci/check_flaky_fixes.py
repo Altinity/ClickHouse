@@ -159,9 +159,14 @@ def parse_args() -> argparse.Namespace:
         help="upstream branch or ref to scan",
     )
     parser.add_argument(
-        "--output-file",
+        "--md-output",
         metavar="PATH",
         help="write markdown report to this file (default: stdout)",
+    )
+    parser.add_argument(
+        "--json-output",
+        metavar="PATH",
+        help="write machine-readable JSON report to this file",
     )
     return parser.parse_args()
 
@@ -186,12 +191,26 @@ def main() -> None:
         missing=missing,
     )
 
-    if args.output_file:
-        with open(args.output_file, "w", encoding="utf-8") as f:
+    if args.md_output:
+        with open(args.md_output, "w", encoding="utf-8") as f:
             f.write(report)
-        print(f"Report written to {args.output_file}", file=sys.stderr)
+        print(f"Markdown report written to {args.md_output}", file=sys.stderr)
     else:
         print(report)
+
+    if args.json_output:
+        payload = {
+            "branch": branch,
+            "upstream_repo": args.upstream_repo,
+            "upstream_ref": args.upstream_ref,
+            "missing": [
+                {"sha": sha, "subject": subj, "date": date}
+                for sha, subj, date in missing
+            ],
+        }
+        with open(args.json_output, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        print(f"JSON report written to {args.json_output}", file=sys.stderr)
 
     if missing:
         print(f"\n{len(missing)} missing flaky-fix commit(s) found.", file=sys.stderr)
