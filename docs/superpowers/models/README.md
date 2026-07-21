@@ -55,7 +55,6 @@ Status legend:
 | `CaGcRootLocalPartManifestCore.tla` | root-local part-manifest GC: fold, manifest cleanup, orphan sweep, attempt scoping | CURRENT (partial: fence/recheck phases superseded by the ack-floor round) | `run_gc_partmanifest.sh` |
 | `CaGcAckFloorCore.tla` | one-pass GC round, clamp suppression, disaster-recovery rebuild | CURRENT (partial: the writer-heartbeat floor was later removed) | `run_ackfloor.sh` |
 | `CaGcAckFloorZombie.tla` | two-leader `delete_pending` two-phase graduation | CURRENT (partial: same caveat) | `run_ackfloor_zombie.sh` |
-| `CaGcIndegRefoldCore.tla` | completion-seal cursor must advance past what recheck already folded (in-degree re-fold undercount) | CURRENT | (inline TLC) |
 | `CaGcShardIncarnationCore.tla` | namespace-registry removal: per-shard incarnation + newborn round self-floor | CURRENT | (inline TLC) |
 | `CaGcRoundDeferCore.tla` | GC round may skip an unchanged snapshot only if no destructive decision is due; deferral bounded | CURRENT | (inline TLC) |
 | `CaGcCondemnMarkerGate.tla` | graduation gated on confirmed durable condemn marker | CURRENT | `run_condemnmarker.sh` |
@@ -112,12 +111,6 @@ Status legend:
   liveness half: without an advisory heartbeat, a steal can fire against an alive leader whose
   sequence number is legitimately frozen for the duration of a long round; the heartbeat is the
   minimal addition that eliminates such false steals.
-- **`CaGcIndegRefoldCore.tla`** — the C++ accumulates blob in-degree as a non-idempotent integer
-  delta stream, so re-folding an already-absorbed removal drives the counter negative (a
-  `CORRUPTED_DATA` exception). The completion seal must therefore persist its cursor past
-  everything the recheck already folded, not at the pre-window fold position. The big part-manifest
-  model cannot catch this class (it recomputes in-degree from an edge set, which is idempotent);
-  this minimal model targets the integer-delta implementation directly.
 - **`CaGcShardIncarnationCore.tla`** — proves the namespace registry could be deleted: its safety
   role is fully replaced by two coordinates — a durable, never-reused per-shard incarnation
   (prevents ABA confusion of a delete-and-recreate at the same path) and a newborn shard born
@@ -268,4 +261,5 @@ history:
 | `CaManifestSweepWindow.tla` (+ `run_sweepwindow.sh`) | proved the orphan sweep must skip a committed body whose removal record is not yet sealed by the fold (deleting it early wedges the removal-fold forever); the interleaving space is tiny and the deterministic unit test `CasOrphanManifestSweep.PendingCommittedRemovalBodyIsSkipped` (plus ten sibling sweep tests) covers the same scenarios — the model added no assurance beyond them |
 | `CaGcResurrectReuploadOrphan.tla` | reproduced a real leak (a condemned blob replaced by a resurrect re-upload was never re-condemned, because the fold keyed the decision on hash alone and only revisits blobs touched in the current window) and proved the fix: settle the stale entry AND re-condemn the current token. The fix landed in `closeBlob` (`CasBlobInDegree.cpp`) and is pinned by the deterministic `CasGcLeak.ResurrectReplaced*` unit tests; at 194 distinct states the model explored essentially that one scenario, adding nothing beyond the tests |
 | `CaIncarnationProofCore.tla` (+ `Apalache.tla`, `run_apalache.sh`) | an Apalache-checked inductive invariant for the single-leader, token-only fragment of the GC core; stale (predated the namespace-registry and evidence-staleness amendments — those are covered by `CaIncarnationCore.tla`) AND unverifiable here (no Apalache binary installed). A stale inductive proof of a superseded fragment that cannot be re-checked is false comfort; to revive it, install Apalache and re-derive the invariant against the current `CaIncarnationCore.tla` |
+| `CaGcIndegRefoldCore.tla` | proved the completion-seal cursor must advance past what recheck already folded, to stop a **non-idempotent integer** in-degree stream going negative. The shipped fold (`CasBlobInDegree.cpp:380-389`) computes in-degree by an **idempotent** two-cursor presence-set merge (a `uint64_t` surviving-edge count that cannot underflow), so the integer-underflow hazard is structurally impossible and the model describes a design the code abandoned — retired like the EBR `CaGcCore.tla` |
 | `CaIncarnationCore.pdf`, `CaIncarnationCore.toolbox/` | generated TLA+ Toolbox pretty-print artifacts (regenerable from the module) |

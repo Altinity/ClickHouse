@@ -531,9 +531,21 @@ window that the just-landed dangling-precommit fix made more frequent). Unit tes
 
 ### `CaGcIndegRefoldCore.tla` — in-degree re-fold undercount {#cagcindegrefoldcore}
 
-**Files:** `CaGcIndegRefoldCore.tla`, `CaGcIndegRefoldCore_fix.cfg`, `CaGcIndegRefoldCore_sab.cfg`
+**Files:** `CaGcIndegRefoldCore.tla`, `CaGcIndegRefoldCore_fix.cfg`, `CaGcIndegRefoldCore_sab.cfg` —
+**removed 2026-07-22** (models a superseded integer-accumulation design; full text in git history).
 
-**What it proves.** The minimal model of the bug H1b: the completion-seal cursor must be persisted at
+> **Removed — the shipped in-degree design is no longer a non-idempotent integer stream.** The
+> `cas-gc-rebuild` fold computes in-degree by an **idempotent two-cursor presence-set merge** keyed
+> by `(blob_hash, source_id)` (`CasBlobInDegree.cpp:380-389`: "prior present + activate ⇒ present;
+> any remove ⇒ absent"); the surviving-edge count is a `uint64_t` that structurally cannot go
+> negative, and there is no `merged < 0 → CORRUPTED_DATA` guard. This model existed precisely to
+> catch the integer-underflow that the idempotent edge-set recompute cannot express — but the code
+> adopted exactly that idempotent recompute, so the hazard is now structurally impossible and the
+> model describes a design the code abandoned (its three code citations had all drifted). Not a
+> CODE-RISK: the property it guarded holds by construction. Retired for the same reason as the EBR
+> `CaGcCore.tla` — a superseded-design model.
+
+**What it proved.** The minimal model of the bug H1b: the completion-seal cursor must be persisted at
 `max(foldCursor, fenceVersion)` (past what recheck already folded), not at `foldCursor` (the
 pre-window fold-time cursor). If the seal persists `foldCursor`, the next round's fold reconstructs its
 parent cursor from that seal and re-folds the fence-window removal, driving the integer in-degree
@@ -556,7 +568,7 @@ implementation class directly.
 **Design decision:** the `Seal` action must advance `persistedCursor` to `fenceVersion` (not remain at
 `foldCursor`) so the next round's `parentCursor` starts past the events recheck already consumed.
 
-**Code currency:** CURRENT.
+**Code currency:** REMOVED 2026-07-22 — superseded integer-accumulation design (see the note above).
 
 ---
 
@@ -756,7 +768,7 @@ counterexamples found during EBR model development encoded the four load-bearing
 | `CaBuildWatermark.tla` | Watermark/B167 | **REMOVED 2026-07-21** (blob-guard removed by B171) | `Inv_ProtectedNeverCondemned`, `Inv_NoDangle`, liveness | 3 | monotone `build_seq`, exact min active set, sound crash detection |
 | `CaBuildWatermarkNum.tla` | Watermark numeric | **REMOVED 2026-07-21** (blob-guard removed by B171) | `Inv_ProtectedNeverCondemned`, `Inv_NoDangle` | 2 | monotone `build_seq` (not just unique), per-server scoping |
 | `CaGcRootLocalPartManifestCore.tla` | Part-manifest GC R0 | **CURRENT** (fold/manifest/attempt-scoping); fence/recheck phases SUPERSEDED by Area 11 | `INV_NO_DANGLE/LOSS/RETURN`, 10 more; liveness | 28 | all-shard fresh fence (superseded), single coordinator fence (superseded), scatter deltas, stale-token-no-over-delete, attempt-scoped visibility |
-| `CaGcIndegRefoldCore.tla` | Indeg re-fold | **CURRENT** | `INV_INDEG_NONNEG` | 1 | seal cursor at `max(foldCursor, fenceVersion)`, not `foldCursor` |
+| `CaGcIndegRefoldCore.tla` | Indeg re-fold | **REMOVED 2026-07-22** (superseded integer-delta design) | `INV_INDEG_NONNEG` | 1 | seal cursor at `max(foldCursor, fenceVersion)`, not `foldCursor` |
 | `CaGcShardIncarnationCore.tla` | Registry removal D1 | **CURRENT** | `INV_NO_DANGLING`, `INV_NO_ORPHAN_EDGE` | 4 | two-coordinate replacement (incarnation + round self-floor) for registry; per-shard monotonicity |
 | `CaGcAckFloorCore.tla` | Ack-floor round core | **CURRENT** (minor drift; writer-heartbeat half superseded — v3) | `INV_NO_DANGLE`, `INV_NO_RETURN`, `INV_ACK_LE_VIEW` | 11 | causal floor gates graduation; ack after drain + view load; expired ⇒ fence-out; recreate not adopt; rebuild discards retired list + mints round above all acks; clamp suppression gates graduation |
 | `CaGcAckFloorZombie.tla` | Ack-floor two-leader | **CURRENT** (minor drift; writer-heartbeat half superseded — v3) | `INV_NO_DANGLE`, `INV_NO_RETURN` | 1 | `delete_pending` two-phase graduation load-bearing; floor latched ≤ fold cut (order invariant) |
