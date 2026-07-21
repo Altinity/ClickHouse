@@ -737,3 +737,33 @@ Gate: 1,096 tests, 0 failures (unchanged from t5 -- no new tests this round; the
 footer is the same pre-existing pair E2/E3 already noted).
 
 **Controller verdict (post-T6): REVERT.** Two of the three target benchmarks never reach the plan's 2x bar (`BM_MergedIteration` +11-22%, `BM_SnapshotEncode` noise-level); `BM_Materialize`'s O(N log N) -> O(N) class win is real but materialize runs once per flush, has never appeared in a production trace, and table size is bounded by the admission budget -- the asymptotic tail is theoretical. Simplicity wins; the full implementation and numbers stay recorded here and in git history (revert of `93eb9957cc2`), one revert away if `BM_Materialize` ever surfaces in a soak profile.
+
+## Final comparison table (t7) {#final-comparison-table}
+
+Final tree = Phase A (closed class) + E1 (`ApplyMode::TrustedReplay` validation elision) + E2
+(owned-manifest COW index) + E3 (in-place trusted replay). E4 reverted (numbers above, §E4).
+"Final" figures are from the t5 tree (`build/bench_t5_e3.log`), which is bench-identical to the
+shipped tree after the E4 revert.
+
+| Benchmark | Baseline (t1) | Final | Change | Driver |
+|---|---|---|---|---|
+| `BM_AdmitsAddPrecommit` @ N=100k | 400,222 ns, O(N) | 701 ns, O(1) | **~571× faster** | E2 index |
+| `BM_ReplayHistory` @ N=100k (256 txns) | 4.93 s | 172.1 ms | **~28.6× faster** | E1+E3 |
+| `BM_ReplayHistory` per-row constant | 48,859 ns/row | 1,725.58 ns/row | −96.5% | E1+E3 |
+| `BM_Admits` (promote) @ 100k | 1,029 ns | 1,056 ns | +2.6% (noise) | — |
+| `BM_ApplyRefLogTxn` @ 100k | 788 ns | 822 ns | +4.3% (noise) | — |
+| `BM_ScratchCopy` | 46.8 ns | ~58 ns | +24% (~11 ns abs) | E2 index copy; accepted |
+| `BM_SnapshotEncode` / `BM_MergedIteration` / `BM_Materialize` | — | unchanged | — | E4 reverted |
+
+### Experiment verdicts {#experiment-verdicts}
+
+| Experiment | Verdict | One-line rationale |
+|---|---|---|
+| E1 relaxed replay (`TrustedReplay` validation elision) | KEEP | −25% replay for ~20 lines; trust-based, chassert-guarded in debug |
+| E2 owned-manifest COW index | KEEP | The uniqueness invariant as a structure; add-precommit O(N)→O(1) |
+| E3 in-place trusted replay (poison-on-throw) | KEEP | Replay −96.6% with zero new machinery; welded `ApplyMode` makes misuse inexpressible |
+| E4 flat-vector `RefCowMap` base | REVERT | Only `BM_Materialize` cleared 2× (and only at N=100k); per-flush, never trace-visible |
+
+Post-round: two parallel adversarial consults (Fable max-depth; `gpt-5.6-sol` high) + whole-branch
+final review run before the 20-minute validation soak; their outcomes are appended below when
+concluded.
