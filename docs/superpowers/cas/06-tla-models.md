@@ -330,7 +330,7 @@ kept as a record of the investigation and as documentation of the B167 livelock 
 ### `CaResurrectLiveness.tla` — abstract resurrect-liveness (B167) {#caresurrectliveness}
 
 **Files:** `CaResurrectLiveness.tla`, `CaResurrectLiveness_guard.cfg`,
-`CaResurrectLiveness_noguard.cfg`
+`CaResurrectLiveness_noguard.cfg` — **removed 2026-07-21** (full text in git history).
 
 **What it proves.** The abstract `HeartbeatGuard` boolean is load-bearing for resurrect liveness:
 guard ON → `<>published` holds (4 states); guard OFF → livelock lasso (7 states).
@@ -339,7 +339,7 @@ guard ON → `<>published` holds (4 states); guard OFF → livelock lasso (7 sta
 
 **Design decision:** writer-side re-upload alone is starvable; a guard that blocks GC from condemning a freshly-owned incarnation is required.
 
-**Code currency:** STALE vs shipped. Models the deferred M-F `HeartbeatGuard` (condemn-time guard on live `build_id`). The shipped protection is precommit-first reachability (`CaBuildRootPrecommit.tla`).
+**Code currency:** STALE vs shipped; files removed 2026-07-21. Modeled the deferred M-F `HeartbeatGuard` (condemn-time guard on live `build_id`). The shipped protection is precommit-first reachability (`CaBuildRootPrecommit.tla`).
 
 ---
 
@@ -743,7 +743,7 @@ counterexamples found during EBR model development encoded the four load-bearing
 | `CaB140DangleMerge.tla` | B140 fix proof | **CURRENT** (history record) | `INV_NO_LOSS` | 2×2 matrix | trim-gate + cursor-in-snap jointly necessary |
 | `CaB140DangleFaithful.tla` | B140 history | **CURRENT** (history record) | `INV_NO_LOSS` | — | Phase-1 mechanism clean with faithful producers |
 | `CaB140Dangle.tla` | B140 history | **REMOVED 2026-07-21** (unfaithful producers) | — | — | Phase-1 investigation record |
-| `CaResurrectLiveness.tla` | Resurrect/B167 | **STALE** (deferred M-F guard) | `<>published` | 1 | upload→publish span not atomic; heartbeat guard load-bearing |
+| `CaResurrectLiveness.tla` | Resurrect/B167 | **REMOVED 2026-07-21** (stale, deferred M-F guard) | `<>published` | 1 | upload→publish span not atomic; heartbeat guard load-bearing |
 | `CaBuildWatermark.tla` | Watermark/B167 | **STALE** (blob-guard removed by B171) | `Inv_ProtectedNeverCondemned`, `Inv_NoDangle`, liveness | 3 | monotone `build_seq`, exact min active set, sound crash detection |
 | `CaBuildWatermarkNum.tla` | Watermark numeric | **STALE** (blob-guard removed by B171) | `Inv_ProtectedNeverCondemned`, `Inv_NoDangle` | 2 | monotone `build_seq` (not just unique), per-server scoping |
 | `CaGcRootLocalPartManifestCore.tla` | Part-manifest GC R0 | **CURRENT** (fold/manifest/attempt-scoping); fence/recheck phases SUPERSEDED by Area 11 | `INV_NO_DANGLE/LOSS/RETURN`, 10 more; liveness | 28 | all-shard fresh fence (superseded), single coordinator fence (superseded), scatter deltas, stale-token-no-over-delete, attempt-scoped visibility |
