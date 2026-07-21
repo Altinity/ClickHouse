@@ -347,7 +347,7 @@ guard ON → `<>published` holds (4 states); guard OFF → livelock lasso (7 sta
 
 **Files:** `CaBuildWatermark.tla`, `CaBuildWatermark_guard.cfg`, `CaBuildWatermark_noguard.cfg`,
 `CaBuildWatermark_staleactive.cfg`, `CaBuildWatermark_unsounddetect.cfg`,
-`CaBuildWatermark_crash.cfg`
+`CaBuildWatermark_crash.cfg` — **removed 2026-07-21** (full text in git history).
 
 **What it proves.** The concrete `min_active` scalar watermark oracle converges (safety: `Inv_ProtectedNeverCondemned`, `Inv_NoDangle` hold in all five configs; liveness: `<>(published=Builds)` holds with guard ON and crashes are leak-free). Three negative controls show the three independent failure modes each reproduce the B167 starvation lasso: no guard, stale active set (floor advances past in-flight builds), unsound crash detection (false-positive `gcDead`).
 
@@ -356,7 +356,7 @@ guard ON → `<>published` holds (4 states); guard OFF → livelock lasso (7 sta
 - The active-set floor (`min_active`) must be the exact minimum of in-flight build sequences.
 - Crash detection must be sound (frozen-seq-across-K-passes discipline; false-positive death is fatal to liveness).
 
-**Code currency:** STALE vs shipped. The per-candidate blob-guard (`protectedByLiveBuild`) was removed by B171 (replaced by precommit-first reachability). The watermark floor lemma (`monotone build_seq`) survives for precommit-ref reclaim (`CasGc.cpp:1877`), not blob protection.
+**Code currency:** STALE vs shipped; files removed 2026-07-21. The per-candidate blob-guard (`protectedByLiveBuild`) was removed by B171 (replaced by precommit-first reachability). The watermark floor lemma (`monotone build_seq`) survives for precommit-ref reclaim (`Gc::prefixEligible` / the `BuildPrefix` watermark floor in `CasGc.cpp`), not blob protection.
 
 ---
 
@@ -744,7 +744,7 @@ counterexamples found during EBR model development encoded the four load-bearing
 | `CaB140DangleFaithful.tla` | B140 history | **CURRENT** (history record) | `INV_NO_LOSS` | — | Phase-1 mechanism clean with faithful producers |
 | `CaB140Dangle.tla` | B140 history | **REMOVED 2026-07-21** (unfaithful producers) | — | — | Phase-1 investigation record |
 | `CaResurrectLiveness.tla` | Resurrect/B167 | **REMOVED 2026-07-21** (stale, deferred M-F guard) | `<>published` | 1 | upload→publish span not atomic; heartbeat guard load-bearing |
-| `CaBuildWatermark.tla` | Watermark/B167 | **STALE** (blob-guard removed by B171) | `Inv_ProtectedNeverCondemned`, `Inv_NoDangle`, liveness | 3 | monotone `build_seq`, exact min active set, sound crash detection |
+| `CaBuildWatermark.tla` | Watermark/B167 | **REMOVED 2026-07-21** (blob-guard removed by B171) | `Inv_ProtectedNeverCondemned`, `Inv_NoDangle`, liveness | 3 | monotone `build_seq`, exact min active set, sound crash detection |
 | `CaBuildWatermarkNum.tla` | Watermark numeric | **STALE** (blob-guard removed by B171) | `Inv_ProtectedNeverCondemned`, `Inv_NoDangle` | 2 | monotone `build_seq` (not just unique), per-server scoping |
 | `CaGcRootLocalPartManifestCore.tla` | Part-manifest GC R0 | **CURRENT** (fold/manifest/attempt-scoping); fence/recheck phases SUPERSEDED by Area 11 | `INV_NO_DANGLE/LOSS/RETURN`, 10 more; liveness | 28 | all-shard fresh fence (superseded), single coordinator fence (superseded), scatter deltas, stale-token-no-over-delete, attempt-scoped visibility |
 | `CaGcIndegRefoldCore.tla` | Indeg re-fold | **CURRENT** | `INV_INDEG_NONNEG` | 1 | seal cursor at `max(foldCursor, fenceVersion)`, not `foldCursor` |
