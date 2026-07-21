@@ -37,6 +37,8 @@ jobs:
           python-version: '3.x'
 
       - name: Check for missing flaky-fix backports
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           python3 tests/ci/check_flaky_fix_backports.py \
             --since-days "${{ inputs.since_days || '7' }}" \

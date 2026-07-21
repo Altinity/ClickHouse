@@ -10,6 +10,7 @@ git log by subject line.
 
 import argparse
 import json
+import os
 import sys
 import urllib.error
 import urllib.request
@@ -27,6 +28,13 @@ def since_iso(days: int) -> str:
 
 def github_commits(repo: str, ref: str, since: str) -> list:
     """Fetch all commits on repo/ref since the given ISO timestamp, paginating as needed."""
+    token = os.environ.get("GITHUB_TOKEN")
+    headers = {"User-Agent": "check_flaky_fix_backports"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    else:
+        print("Warning: GITHUB_TOKEN not set; using unauthenticated API (60 req/hour limit)", file=sys.stderr)
+
     commits = []
     url = (
         f"{GITHUB_API}/repos/{repo}/commits"
@@ -34,7 +42,7 @@ def github_commits(repo: str, ref: str, since: str) -> list:
     )
     while url:
         print(f"Fetching {url} ...", file=sys.stderr)
-        req = urllib.request.Request(url, headers={"User-Agent": "check_flaky_fix_backports"})
+        req = urllib.request.Request(url, headers=headers)
         try:
             with urllib.request.urlopen(req) as resp:
                 commits.extend(json.loads(resp.read()))
