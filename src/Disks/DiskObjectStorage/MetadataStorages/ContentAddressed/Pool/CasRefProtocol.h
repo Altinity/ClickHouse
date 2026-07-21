@@ -139,21 +139,26 @@ struct RefLedgerConfig
     uint64_t ref_table_cache_bytes = 256ULL << 20;
 };
 
-/// How much admission re-checking a transaction application performs, AND -- coupled to it, see below
-/// -- how `applyRefLogTxn` behaves on a mid-transaction throw. `Full` is the writer's append-time
-/// contract. `TrustedHistory` is for replaying transactions that already passed `Full` validation when
-/// they were durably appended (recovery, GC fold, fsck, protection views): the O(N) cross-owner
-/// uniqueness scan is elided in release builds and kept as a `chassert` in debug/sanitizer builds
-/// (same policy as `debugAssertBodyCounters`). Every exact-binding precondition (cheap, keyed) is
-/// enforced in BOTH modes -- a corrupted log object still fails closed in either mode.
-///
-/// Abort behaviour (E3): the two modes also select `applyRefLogTxn`'s apply strategy, because the two
-/// concerns share one caller intent. `Full` applies two-phase against a scratch copy and leaves
-/// `state` byte-for-byte unchanged on any throw (the writer's live state must survive a rejected
-/// mutation). `TrustedHistory` applies IN PLACE with no copy and, on a throw, leaves `state` partially
-/// applied ("poisoned") -- sound only because its sole caller, `replay`, builds the state locally and
-/// discards it on any throw. Do not pass `TrustedHistory` for a state that must survive a rejection.
-enum class TxnValidation : uint8_t { Full, TrustedHistory };
+/// How `applyRefLogTxn` treats a call: how much admission re-checking it performs, AND -- welded to
+/// that, not a separate axis -- what it does to `state` on a mid-transaction throw. The two concerns
+/// always co-occur because both are derived from one caller intent. `LiveAppend` means "this is the
+/// FIRST time this transaction is being validated, against a state that must survive a rejection": the
+/// writer's append-time contract and every trial/shape-check preview. It re-checks every precondition,
+/// including the O(N) cross-owner uniqueness scan, and applies two-phase against a scratch copy so
+/// `state` is byte-for-byte unchanged on any throw. `TrustedReplay` means "I am replaying
+/// already-committed, already-validated history into a local state I own and discard on any error":
+/// `replay`'s tail, and only `replay`'s tail (recovery, GC fold, fsck, protection views all inherit it
+/// through `replay`). Because the transaction already passed `LiveAppend` validation when it was
+/// durably appended, the O(N) cross-owner scan is elided in release builds and kept as a `chassert` in
+/// debug/sanitizer builds (same policy as `debugAssertBodyCounters`) -- every exact-binding
+/// precondition (cheap, keyed) is still enforced in BOTH modes, so a corrupted log object still fails
+/// closed either way. And because the state is thrown away on any error, `TrustedReplay` applies IN
+/// PLACE with no scratch copy (E3 -- eliminates the per-transaction deep-copy of the replay tail's
+/// unbounded COW overlays); a throw leaves `state` PARTIALLY APPLIED ("poisoned"), which is sound only
+/// because its sole caller discards it on any throw. Welding the two axes into one enum keeps the
+/// dangerous fourth combination -- trusted validation applied to a state that must survive a throw --
+/// inexpressible. Do not pass `TrustedReplay` for a state that must survive a rejection.
+enum class ApplyMode : uint8_t { LiveAppend, TrustedReplay };
 
 /// The in-memory table state: `TableState = Replay(S_X.state, tail(X))`. This class, `applyRefLogTxn`, `snapshotOf`, and
 /// `replay` are the ONE shared implementation of that equation -- used verbatim by the writer, its
@@ -213,13 +218,13 @@ private:
     /// `admits`'s single-op preview. `txn_id` is only read by `RemoveNamespace` (it becomes the
     /// resulting `remove_txn_id`). `validation` is threaded down to `applyOwnerTransition`, the only
     /// arm that consults it. Was free `applyOpInPlace`.
-    void applyOp(const RefOp & op, const RefTxnId & txn_id, TxnValidation validation);
+    void applyOp(const RefOp & op, const RefTxnId & txn_id, ApplyMode validation);
 
     /// The `owner_transition` op kind: dispatches on the `(old_binding, new_binding)` shape to one of
     /// the four legal transitions (add precommit / remove precommit / remove committed / promote). Any
     /// other shape is not a recognized transition. `validation` is consulted only by the add-precommit
     /// arm's cross-owner uniqueness check. Was free.
-    void applyOwnerTransition(const RefOp & op, TxnValidation validation);
+    void applyOwnerTransition(const RefOp & op, ApplyMode validation);
 
     /// The `set_payload` op kind: the committed ref must still name `expected_manifest_ref`; replaces
     /// the opaque `payload` blob and `published_at_ms` without touching the manifest edge. Was free.
@@ -235,7 +240,7 @@ private:
     void debugAssertBodyCounters() const;
 #endif
 
-    friend void applyRefLogTxn(RefTableState & state, const RefLogTxn & txn, TxnValidation validation);
+    friend void applyRefLogTxn(RefTableState & state, const RefLogTxn & txn, ApplyMode validation);
     friend RefTableState stateFromSnapshot(const RefTableSnapshot & snapshot);
     friend bool admits(const RefTableState & state, const RefOp & op,
                        uint64_t snapshot_budget, uint64_t removal_budget);
@@ -262,17 +267,17 @@ RefTableState stateFromSnapshot(const RefTableSnapshot & snapshot);
 /// (strictly-increasing `txn_id`, `remove_namespace` ordering) are checked before any mutation, so
 /// they never leave `state` half-applied under either strategy below.
 ///
-/// Apply strategy is selected by `validation` (see `TxnValidation`):
-///  - `Full` (writer append-time + previews): two-phase against a scratch copy; every op is validated
+/// Apply strategy is selected by `validation` (see `ApplyMode`):
+///  - `LiveAppend` (writer append-time + previews): two-phase against a scratch copy; every op is validated
 ///    and applied, in array order, to the scratch first, and `state` is replaced by it only once the
 ///    WHOLE transaction has succeeded. A throw anywhere leaves `state` byte-for-byte unchanged, and no
 ///    intra-transaction intermediate state (e.g. a manifest with its precommit already gone but its
 ///    committed binding not yet installed) is ever observable to a caller -- matching the promote
 ///    rule: "There is no moment at which the manifest has no owner."
-///  - `TrustedHistory` (replay only): applies IN PLACE with no scratch copy (E3 -- eliminates the
+///  - `TrustedReplay` (replay only): applies IN PLACE with no scratch copy (E3 -- eliminates the
 ///    per-transaction deep-copy of the replay tail's unbounded COW overlays). A throw leaves `state`
 ///    PARTIALLY APPLIED; this is sound only because `replay`, its sole caller, discards the state on
-///    any throw (its result reaches a caller only on full success). See `TxnValidation`'s doc.
+///    any throw (its result reaches a caller only on full success). See `ApplyMode`'s doc.
 ///
 /// Enforced preconditions:
 ///  - `txn.txn_id` must be strictly greater than `state.greatest_applied`
@@ -322,13 +327,13 @@ RefTableState stateFromSnapshot(const RefTableSnapshot & snapshot);
 /// framing; a writer that wants a friendlier user-facing rejection for an ordinary attempted mutation
 /// (e.g. "ref already exists") checks its own business state before ever building the op.
 ///
-/// `validation` (default `TxnValidation::Full`, the writer's append-time contract): pass
-/// `TxnValidation::TrustedHistory` only when `txn` already passed `Full` validation at the time it was
+/// `validation` (default `ApplyMode::LiveAppend`, the writer's append-time contract): pass
+/// `ApplyMode::TrustedReplay` only when `txn` already passed `LiveAppend` validation at the time it was
 /// durably appended -- `replay`'s tail is the one caller that does. Every OTHER caller (the writer's
 /// own trial/shape-check previews and its post-PUT state install, all in `CasRefLedger.cpp`) keeps the
-/// default `Full`, because those calls are the FIRST time the transaction is validated, not a replay of
+/// default `LiveAppend`, because those calls are the FIRST time the transaction is validated, not a replay of
 /// already-validated history.
-void applyRefLogTxn(RefTableState & state, const RefLogTxn & txn, TxnValidation validation = TxnValidation::Full);
+void applyRefLogTxn(RefTableState & state, const RefLogTxn & txn, ApplyMode validation = ApplyMode::LiveAppend);
 
 /// The canonical snapshot of `state` under `ns`: `committed` sorted by
 /// bytewise `ref_name` (guaranteed by `RefCowMap`'s sorted merge-iteration order,

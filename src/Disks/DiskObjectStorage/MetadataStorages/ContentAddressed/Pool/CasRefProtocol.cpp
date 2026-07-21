@@ -59,7 +59,7 @@ bool RefTableState::manifestAlreadyOwned(const ManifestRef & manifest_ref) const
 /// The `owner_transition` op kind: dispatches on the `(old_binding,
 /// new_binding)` shape to one of the four legal transitions (add precommit / remove precommit /
 /// remove committed / promote). Any other shape is not a recognized transition.
-void RefTableState::applyOwnerTransition(const RefOp & op, TxnValidation validation)
+void RefTableState::applyOwnerTransition(const RefOp & op, ApplyMode validation)
 {
     if (lifecycle != RefLifecycle::Live)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableState: owner_transition while namespace is not Live");
@@ -74,7 +74,7 @@ void RefTableState::applyOwnerTransition(const RefOp & op, TxnValidation validat
         if (precommits.contains({b.ref_name, b.manifest_ref}))
             throw Exception(ErrorCodes::CORRUPTED_DATA,
                 "RefTableState: add precommit '{}' already exists for this exact manifest", b.ref_name);
-        if (validation == TxnValidation::Full)
+        if (validation == ApplyMode::LiveAppend)
         {
             if (manifestAlreadyOwned(b.manifest_ref))
                 throw Exception(ErrorCodes::CORRUPTED_DATA,
@@ -82,7 +82,7 @@ void RefTableState::applyOwnerTransition(const RefOp & op, TxnValidation validat
         }
         else
         {
-            /// Trusted replay: the append-time Full validation already proved uniqueness; re-prove it
+            /// Trusted replay: the append-time LiveAppend validation already proved uniqueness; re-prove it
             /// only where chassert is active. Same policy as `debugAssertBodyCounters`: a debug/sanitizer
             /// re-verification of a construction-guaranteed invariant, not a release-mode gate.
             chassert(!manifestAlreadyOwned(b.manifest_ref));
@@ -197,7 +197,7 @@ void RefTableState::applySetPayload(const RefOp & op)
 /// `applyRefLogTxn`'s per-op loop and by `admits`'s single-op preview. `txn_id` is only read by
 /// `RemoveNamespace` (it becomes the resulting `remove_txn_id`). `validation` is threaded down to
 /// `applyOwnerTransition`, the only arm that consults it.
-void RefTableState::applyOp(const RefOp & op, const RefTxnId & txn_id, TxnValidation validation)
+void RefTableState::applyOp(const RefOp & op, const RefTxnId & txn_id, ApplyMode validation)
 {
     switch (op.kind)
     {
@@ -305,7 +305,7 @@ void RefTableState::debugAssertBodyCounters() const
 }
 #endif
 
-void applyRefLogTxn(RefTableState & state, const RefLogTxn & txn, TxnValidation validation)
+void applyRefLogTxn(RefTableState & state, const RefLogTxn & txn, ApplyMode validation)
 {
     if (!(state.greatest_applied < txn.txn_id))
         throw Exception(ErrorCodes::CORRUPTED_DATA,
@@ -315,13 +315,13 @@ void applyRefLogTxn(RefTableState & state, const RefLogTxn & txn, TxnValidation 
 
     checkRemoveNamespaceOrdering(txn.ops);
 
-    if (validation == TxnValidation::TrustedHistory)
+    if (validation == ApplyMode::TrustedReplay)
     {
         /// Trusted-history replay (E3): apply IN PLACE, with no scratch copy. `replay` -- the sole
-        /// `TrustedHistory` caller (grep-enforced) -- builds its `RefTableState` locally and returns it
+        /// `TrustedReplay` caller (grep-enforced) -- builds its `RefTableState` locally and returns it
         /// only after its WHOLE tail has succeeded; any throw propagates out of `replay` and the
         /// half-applied local state is destroyed during stack unwinding, so no consumer ever observes
-        /// it. That makes the two-phase scratch copy that guards the writer's live state (the `Full`
+        /// it. That makes the two-phase scratch copy that guards the writer's live state (the `LiveAppend`
         /// arm below) pure overhead here -- and a ruinous one: `replay` never materializes between tail
         /// transactions, so the committed-map and owned-manifest COW overlays grow along the entire
         /// tail and the old per-transaction `scratch = state` deep-copied BOTH, making a K-transaction
@@ -329,21 +329,21 @@ void applyRefLogTxn(RefTableState & state, const RefLogTxn & txn, TxnValidation 
         /// per-transaction cost to O(ops touched), independent of tail position.
         ///
         /// CONTRACT (do not weaken): a throw here leaves `state` PARTIALLY APPLIED ("poisoned"). This
-        /// is sound ONLY because every `TrustedHistory` caller discards the state on any throw. Never
-        /// pass `TrustedHistory` for a state that must survive a rejection intact -- that is the `Full`
+        /// is sound ONLY because every `TrustedReplay` caller discards the state on any throw. Never
+        /// pass `TrustedReplay` for a state that must survive a rejection intact -- that is the `LiveAppend`
         /// arm's job, and why the writer's live-state install and every first-time-validation preview
-        /// in `CasRefLedger.cpp` keep the default `Full` (see the `applyRefLogTxn` header doc).
+        /// in `CasRefLedger.cpp` keep the default `LiveAppend` (see the `applyRefLogTxn` header doc).
         for (const RefOp & op : txn.ops)
             state.applyOp(op, txn.txn_id, validation);
         state.greatest_applied = txn.txn_id;
     }
     else
     {
-        /// Full validation -- the writer's append-time contract and its trial/shape-check previews.
+        /// LiveAppend validation -- the writer's append-time contract and its trial/shape-check previews.
         /// Two-phase: validate and apply every op, in order, against a scratch copy; `state` is
         /// replaced only once the whole transaction succeeds, so a throw anywhere leaves it
         /// byte-for-byte unchanged and no intra-transaction intermediate state is ever observable. This
-        /// copy is cheap on every `Full` caller: each applies against a materialized (empty-overlay)
+        /// copy is cheap on every `LiveAppend` caller: each applies against a materialized (empty-overlay)
         /// live state or a small bounded-overlay batch scratch, never the unbounded replay tail the arm
         /// above handles.
         RefTableState scratch = state;
@@ -393,11 +393,11 @@ RefTableState replay(const std::optional<RefTableSnapshot> & snapshot, std::span
                 "RefTableState::replay: transaction ns '{}' does not match the table's ns '{}'",
                 txn.ns, *expected_ns);
         expected_ns = &txn.ns;
-        /// This tail already passed `Full` validation when each transaction was durably appended
+        /// This tail already passed `LiveAppend` validation when each transaction was durably appended
         /// (the writer never persists an object that failed `applyRefLogTxn`'s checks) -- `replay` is
         /// re-deriving the state those durable transactions already proved legal, not validating them
         /// for the first time, so the O(N) cross-owner scan is elided in release builds (E1).
-        applyRefLogTxn(state, txn, TxnValidation::TrustedHistory);
+        applyRefLogTxn(state, txn, ApplyMode::TrustedReplay);
     }
     return state;
 }
@@ -428,10 +428,10 @@ bool admits(const RefTableState & state, const RefOp & op, uint64_t snapshot_bud
     /// discarded immediately after reading its (incrementally maintained) budget sizes.
     static constexpr RefTxnId kPreviewTxnId{1, 1};
 
-    /// `Full`: this previews an op that has not yet been validated or durably appended anywhere, so it
+    /// `LiveAppend`: this previews an op that has not yet been validated or durably appended anywhere, so it
     /// gets the writer's full append-time check, same as before E1.
     RefTableState scratch = state;
-    scratch.applyOp(op, kPreviewTxnId, TxnValidation::Full);   // throws exactly as before if `op` is not a legal transition
+    scratch.applyOp(op, kPreviewTxnId, ApplyMode::LiveAppend);   // throws exactly as before if `op` is not a legal transition
 #ifdef DEBUG_OR_SANITIZER_BUILD
     scratch.debugAssertBodyCounters();
 #endif

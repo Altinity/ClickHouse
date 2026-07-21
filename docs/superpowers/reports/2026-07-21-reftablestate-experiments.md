@@ -460,6 +460,15 @@ trade to document -- the design the brief flagged as the default. The whole chan
 inside `applyRefLogTxn` (`CasRefProtocol.cpp`) plus doc updates on `TxnValidation` and
 `applyRefLogTxn` (`CasRefProtocol.h`). `admits` was left untouched (see below).
 
+**Post-review rename note:** after this section was written, `TxnValidation { Full, TrustedHistory }`
+was renamed to `ApplyMode { LiveAppend, TrustedReplay }` -- the two semantics (skip the cross-owner
+re-scan; apply in place and poison `state` on throw) intrinsically co-occur, both derived from one
+caller intent ("I am replaying already-committed, already-validated history into a local state I own
+and discard on any error"), and the old name advertised only the validation axis. The rest of this
+section (and the E1/E2 sections above it) keeps the original names, since they describe what shipped
+under those names at the time; some E1-era test names cited above were also renamed to match and no
+longer appear verbatim in the current source.
+
 ### Why the regression existed, and why in-place kills it
 
 `replay` never materializes between tail transactions (it is the pure state-machine equation;
@@ -486,9 +495,10 @@ so even a copy that shares a base with the live state is safe to mutate in place
 | `CasRefLedger.cpp:1377` `applyRefLogTxn(rt->state, final)` | LIVE `rt->state` | under `state_mutex` (l.1376) | exclusive |
 | `CasRefLedger.cpp:426` `replay(…)` (recovery) | fresh local; assigned to `rt.state` only on success | detached | exclusive |
 | `CasFsck.cpp:226` `replay(…)` (oracle) | fresh local | detached | exclusive |
+| `CasRefProtocol.cpp:638` `replay(snapshot, tail)` inside `recoverRefTableDetailed` | fresh local; `RecoveredRefTable` value-returned, constructed only on success | detached | exclusive |
 
-`TrustedHistory` is passed at exactly one place (`CasRefProtocol.cpp:369`, inside `replay`;
-grep-enforced). No `admits` call site is disqualifying either -- but `admits` was NOT changed to
+`TrustedHistory` (post-review: `ApplyMode::TrustedReplay`) is passed at exactly one place
+(`CasRefProtocol.cpp:400`, inside `replay`; grep-enforced). No `admits` call site is disqualifying either -- but `admits` was NOT changed to
 in-place, because it is not a regression source: its only production call (`item_scratch`, a
 detached local with a batch-bounded overlay) copies an O(batch) overlay, not an O(N) one. Making it
 in-place would be unmeasured complexity for no win, so per the round's default it was left as the
@@ -547,8 +557,8 @@ caveat -- and would still allocate a journal per tail transaction, i.e. strictly
 applying in place with nothing). The one real cost is a sharpened contract: `TrustedHistory` now also
 means "in-place, poison-on-throw", coupled onto the existing validation-mode enum. That coupling is
 documented loudly (enum doc + `applyRefLogTxn` doc + the in-place branch comment), grep-enforced to a
-single caller (`replay`), and pinned by a test that the poisoned internal state never escapes a failed
-`replay`. It is a genuine footgun-of-last-resort if a future author adds a `TrustedHistory` caller that
+single caller (`replay`), and a test pins poison-containment (for the existing caller; single-caller
+exclusivity is enforced by grep+comment, not testable). It is a genuine footgun-of-last-resort if a future author adds a `TrustedHistory` caller that
 keeps state after a throw -- called out here so the reviewer weighs it deliberately.
 
 ### Tests
@@ -558,17 +568,21 @@ Gate: **1,096 tests, 0 failures** (`build/test_gate_t5.log`) -- t4/E2's 1,091 pl
 `gtest_cas_protocol_scenarios.cpp`), unrelated to this task.
 
 New tests (`gtest_cas_ref_statemachine.cpp`):
-- `E3FullLaterOpThrowLeavesPopulatedStateByteIdentical` -- `Full` path, 3-op txn whose first two ops
-  touch committed+precommits+index+counters and whose third is illegal; live state byte-identical
+- `E3FullLaterOpThrowLeavesPopulatedStateByteIdentical` (post-review rename:
+  `E3LiveAppendLaterOpThrowLeavesPopulatedStateByteIdentical`) -- `Full` path, 3-op txn whose first two
+  ops touch committed+precommits+index+counters and whose third is illegal; live state byte-identical
   after (getters + encoded-snapshot bytes). The populated / later-op-throw abort path.
-- `E3FullFirstOpThrowLeavesPopulatedStateByteIdentical` -- the symmetric empty / first-op-throw abort
-  path (nothing applied before the throw).
+- `E3FullFirstOpThrowLeavesPopulatedStateByteIdentical` (post-review rename:
+  `E3LiveAppendFirstOpThrowLeavesPopulatedStateByteIdentical`) -- the symmetric empty / first-op-throw
+  abort path (nothing applied before the throw).
 - `E3AdmitsPreviewLeavesStateByteIdentical` -- `admits` leaves the state byte-identical for both the
   accept and the reject verdict.
-- `E3TrustedHistoryInPlaceMatchesFullAcrossAllArms` -- the test only the in-place machinery can fail:
-  a tail exercising every `applyOp` arm (birth/add/promote/set_payload/remove-committed/remove-precommit/
+- `E3TrustedHistoryInPlaceMatchesFullAcrossAllArms` (post-review rename:
+  `E3TrustedReplayInPlaceMatchesLiveAppendAcrossAllArms`) -- the test only the in-place machinery can
+  fail: a tail exercising every `applyOp` arm (birth/add/promote/set_payload/remove-committed/remove-precommit/
   replace/remove-namespace) replayed in place produces a state byte-identical (getters + encoded bytes)
   to the same tail applied op-by-op through `Full`.
-- `E3TrustedHistoryPoisonOnBadTailIsInternal` -- a tail whose last txn is illegal makes `replay` throw
+- `E3TrustedHistoryPoisonOnBadTailIsInternal` (post-review rename:
+  `E3TrustedReplayPoisonOnBadTailIsInternal`) -- a tail whose last txn is illegal makes `replay` throw
   `CORRUPTED_DATA`; an independent replay of the valid prefix is unaffected, pinning that the in-place
   poison never escapes the failed call.

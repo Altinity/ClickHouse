@@ -128,7 +128,7 @@ RefLogTxn buildRemovalTxnForTest(const RefTableState & state, const String & ns,
 constexpr const char * kNs = "srv1/db/table@cas@";
 
 /// Task 3 (E1): a validated state with "a" committed to manifest (1,1,1) -- the base every
-/// TrustedHistory-relaxed-replay test below reuses to build a tail whose add-precommit op would
+/// TrustedReplay-relaxed-replay test below reuses to build a tail whose add-precommit op would
 /// collide cross-owner (name the SAME manifest under a DIFFERENT ref_name).
 RefTableSnapshot buildCollidingBaseSnapshotForTest()
 {
@@ -842,19 +842,19 @@ TEST(CasRefStateMachine, ReplayEquationPropertyTest)
 }
 
 /// ===================================================================================
-/// E1: TrustedHistory relaxed replay -- `replay`'s tail already passed `Full` validation when it was
-/// durably appended, so the O(N) `manifestAlreadyOwned` cross-owner scan is redundant on that path and
-/// becomes debug-only (a `chassert`) instead of a release-mode throw.
+/// E1: TrustedReplay relaxed replay -- `replay`'s tail already passed `LiveAppend` validation when it
+/// was durably appended, so the O(N) `manifestAlreadyOwned` cross-owner scan is redundant on that path
+/// and becomes debug-only (a `chassert`) instead of a release-mode throw.
 /// ===================================================================================
 
-TEST(CasRefStateMachine, TrustedHistoryReplaySkipsCrossOwnerScanInRelease)
+TEST(CasRefStateMachine, TrustedReplaySkipsCrossOwnerScanInRelease)
 {
     const RefTableSnapshot snap = buildCollidingBaseSnapshotForTest();
     const RefLogTxn colliding_txn = makeTxn(kNs, RefTxnId{1, 2}, {addPrecommitOp("b", manifestRef(1, 1, 1))});
 
-    /// Full (the default, unspecified argument): the writer's append-time contract still rejects the
-    /// cross-owner collision, unchanged from before E1. Applied directly rather than through `replay`,
-    /// since `replay` now uses TrustedHistory for its whole tail.
+    /// LiveAppend (the default, unspecified argument): the writer's append-time contract still rejects
+    /// the cross-owner collision, unchanged from before E1. Applied directly rather than through
+    /// `replay`, since `replay` now uses TrustedReplay for its whole tail.
     {
         RefTableState full_state = stateFromSnapshot(snap);
         const RefTableState before = full_state;
@@ -864,12 +864,12 @@ TEST(CasRefStateMachine, TrustedHistoryReplaySkipsCrossOwnerScanInRelease)
     }
 
 #ifndef DEBUG_OR_SANITIZER_BUILD
-    /// TrustedHistory, release build: the chassert re-proving `manifestAlreadyOwned` is compiled out,
-    /// so the same op that Full rejects is instead applied -- proving the O(N) scan really is elided on
-    /// this path, not merely downgraded to a silent no-op.
+    /// TrustedReplay, release build: the chassert re-proving `manifestAlreadyOwned` is compiled out,
+    /// so the same op that LiveAppend rejects is instead applied -- proving the O(N) scan really is
+    /// elided on this path, not merely downgraded to a silent no-op.
     {
         RefTableState trusted_state = stateFromSnapshot(snap);
-        EXPECT_NO_THROW(applyRefLogTxn(trusted_state, colliding_txn, TxnValidation::TrustedHistory));
+        EXPECT_NO_THROW(applyRefLogTxn(trusted_state, colliding_txn, ApplyMode::TrustedReplay));
         EXPECT_TRUE(trusted_state.getPrecommits().contains({"b", manifestRef(1, 1, 1)}));
         EXPECT_TRUE(trusted_state.getCommitted().contains("a"));
         EXPECT_EQ(trusted_state.getGreatestApplied(), (RefTxnId{1, 2}));
@@ -878,23 +878,23 @@ TEST(CasRefStateMachine, TrustedHistoryReplaySkipsCrossOwnerScanInRelease)
 }
 
 #if defined(DEBUG_OR_SANITIZER_BUILD)
-/// Debug/sanitizer-build counterpart: the chassert in TrustedHistory's add-precommit arm is active
+/// Debug/sanitizer-build counterpart: the chassert in TrustedReplay's add-precommit arm is active
 /// there, so the same cross-owner collision aborts the process instead of returning a catchable
 /// exception -- same pattern as CasWiringOpsDeathTest.MoveDirectoryMutableCollisionPolicyAborts in
 /// gtest_ca_wiring.cpp.
-TEST(CasRefStateMachineDeathTest, TrustedHistoryReplayAbortsOnCrossOwnerCollision)
+TEST(CasRefStateMachineDeathTest, TrustedReplayAbortsOnCrossOwnerCollision)
 {
     const RefTableSnapshot snap = buildCollidingBaseSnapshotForTest();
     const RefLogTxn colliding_txn = makeTxn(kNs, RefTxnId{1, 2}, {addPrecommitOp("b", manifestRef(1, 1, 1))});
     RefTableState trusted_state = stateFromSnapshot(snap);
-    EXPECT_DEATH({ applyRefLogTxn(trusted_state, colliding_txn, TxnValidation::TrustedHistory); }, "");
+    EXPECT_DEATH({ applyRefLogTxn(trusted_state, colliding_txn, ApplyMode::TrustedReplay); }, "");
 }
 #endif
 
-/// Positive equivalence: a VALID tail replayed via `replay` (TrustedHistory) produces a state
-/// byte-identical (getters + encoded snapshot) to the same tail applied via `Full` -- TrustedHistory
+/// Positive equivalence: a VALID tail replayed via `replay` (TrustedReplay) produces a state
+/// byte-identical (getters + encoded snapshot) to the same tail applied via `LiveAppend` -- TrustedReplay
 /// changes only what gets re-checked, never what a legal transaction produces.
-TEST(CasRefStateMachine, TrustedHistoryReplayEquivalentToFullOnValidTail)
+TEST(CasRefStateMachine, TrustedReplayEquivalentToLiveAppendOnValidTail)
 {
     const std::vector<RefLogTxn> tail{
         makeTxn(kNs, RefTxnId{1, 1}, {birthOp(), addPrecommitOp("a", manifestRef(1, 1, 1))}),
@@ -906,9 +906,9 @@ TEST(CasRefStateMachine, TrustedHistoryReplayEquivalentToFullOnValidTail)
 
     RefTableState full_state;
     for (const RefLogTxn & txn : tail)
-        applyRefLogTxn(full_state, txn);   // Full (default)
+        applyRefLogTxn(full_state, txn);   // LiveAppend (default)
 
-    const RefTableState trusted_state = replay(std::nullopt, tail);   // replay uses TrustedHistory internally
+    const RefTableState trusted_state = replay(std::nullopt, tail);   // replay uses TrustedReplay internally
 
     expectStatesEqual(full_state, trusted_state);
     EXPECT_EQ(encodeRefTableSnapshot(snapshotOf(full_state, kNs)),
@@ -917,15 +917,15 @@ TEST(CasRefStateMachine, TrustedHistoryReplayEquivalentToFullOnValidTail)
 
 /// ===================================================================================
 /// E3: apply strategy per validation mode
-///   - Full: two-phase scratch copy, "throw => state byte-for-byte unchanged"
-///   - TrustedHistory (replay): in-place, poison-on-throw, discarded by the sole caller
+///   - LiveAppend: two-phase scratch copy, "throw => state byte-for-byte unchanged"
+///   - TrustedReplay (replay): in-place, poison-on-throw, discarded by the sole caller
 /// ===================================================================================
 
 namespace
 {
 /// A populated, MATERIALIZED Live state -- committed "a"->(1,1,1) plus a pending precommit
-/// ("p",(1,2,1)) -- built through the public Full path, then materialized so its COW overlays are
-/// empty (exactly the shape the writer's live state has at each flush boundary). The E3 Full-path
+/// ("p",(1,2,1)) -- built through the public LiveAppend path, then materialized so its COW overlays are
+/// empty (exactly the shape the writer's live state has at each flush boundary). The E3 LiveAppend-path
 /// tests mutate a COPY of this and assert the original-equivalent captured bytes/getters are intact
 /// after a rejected transaction.
 RefTableState buildPopulatedLiveState()
@@ -939,11 +939,11 @@ RefTableState buildPopulatedLiveState()
 }
 }
 
-/// Full-path atomicity, LATER-op throw ("populated" abort path): the first two ops touch committed,
+/// LiveAppend-path atomicity, LATER-op throw ("populated" abort path): the first two ops touch committed,
 /// precommits, the owned-manifest index and the body counters; the third is illegal. The whole
 /// transaction is rejected and `state` is byte-for-byte unchanged -- getters AND encoded-snapshot
-/// bytes. This is the writer's live-state contract, preserved verbatim by E3's `Full` arm.
-TEST(CasRefStateMachine, E3FullLaterOpThrowLeavesPopulatedStateByteIdentical)
+/// bytes. This is the writer's live-state contract, preserved verbatim by E3's `LiveAppend` arm.
+TEST(CasRefStateMachine, E3LiveAppendLaterOpThrowLeavesPopulatedStateByteIdentical)
 {
     RefTableState state = buildPopulatedLiveState();
     const RefTableState before = state;
@@ -963,10 +963,10 @@ TEST(CasRefStateMachine, E3FullLaterOpThrowLeavesPopulatedStateByteIdentical)
     EXPECT_TRUE(state.getCommitted().contains("a"));
 }
 
-/// Full-path atomicity, FIRST-op throw ("empty" abort path -- nothing applied before the throw): the
+/// LiveAppend-path atomicity, FIRST-op throw ("empty" abort path -- nothing applied before the throw): the
 /// symmetric guarantee still holds. Distinct from the case above because no op ever mutated the
 /// scratch, exercising the throw-before-any-effect branch.
-TEST(CasRefStateMachine, E3FullFirstOpThrowLeavesPopulatedStateByteIdentical)
+TEST(CasRefStateMachine, E3LiveAppendFirstOpThrowLeavesPopulatedStateByteIdentical)
 {
     RefTableState state = buildPopulatedLiveState();
     const RefTableState before = state;
@@ -1007,13 +1007,13 @@ TEST(CasRefStateMachine, E3AdmitsPreviewLeavesStateByteIdentical)
     EXPECT_EQ(before_bytes, encodeRefTableSnapshot(snapshotOf(state, kNs)));
 }
 
-/// TrustedHistory in-place apply, SUCCESS path across every `applyOp` arm: a tail that births, adds,
+/// TrustedReplay in-place apply, SUCCESS path across every `applyOp` arm: a tail that births, adds,
 /// promotes, replaces a committed manifest, removes a committed and a precommit, restamps a payload,
-/// and finally removes the namespace, replayed via `replay` (TrustedHistory, in place) must produce a
-/// state byte-identical to the SAME tail applied op-by-op through `Full` (scratch copy). This is the
+/// and finally removes the namespace, replayed via `replay` (TrustedReplay, in place) must produce a
+/// state byte-identical to the SAME tail applied op-by-op through `LiveAppend` (scratch copy). This is the
 /// test only E3's in-place machinery can fail: a mis-maintained counter, a dropped owned-manifest
 /// index entry, or a lost `greatest_applied` update on the no-copy path would diverge here.
-TEST(CasRefStateMachine, E3TrustedHistoryInPlaceMatchesFullAcrossAllArms)
+TEST(CasRefStateMachine, E3TrustedReplayInPlaceMatchesLiveAppendAcrossAllArms)
 {
     const std::vector<RefLogTxn> tail{
         makeTxn(kNs, RefTxnId{1, 1}, {birthOp(),
@@ -1033,9 +1033,9 @@ TEST(CasRefStateMachine, E3TrustedHistoryInPlaceMatchesFullAcrossAllArms)
 
     RefTableState full_state;
     for (const RefLogTxn & txn : tail)
-        applyRefLogTxn(full_state, txn);   // Full (default): two-phase scratch copy
+        applyRefLogTxn(full_state, txn);   // LiveAppend (default): two-phase scratch copy
 
-    const RefTableState replayed = replay(std::nullopt, tail);   // TrustedHistory in-place
+    const RefTableState replayed = replay(std::nullopt, tail);   // TrustedReplay in-place
 
     expectStatesEqual(full_state, replayed);
     EXPECT_EQ(encodeRefTableSnapshot(snapshotOf(full_state, kNs)),
@@ -1044,11 +1044,11 @@ TEST(CasRefStateMachine, E3TrustedHistoryInPlaceMatchesFullAcrossAllArms)
     EXPECT_EQ(replayed.getRemoveTxnId(), std::make_optional(RefTxnId{1, 5}));
 }
 
-/// TrustedHistory in-place apply, THROW path: a tail whose LAST transaction is illegal makes `replay`
+/// TrustedReplay in-place apply, THROW path: a tail whose LAST transaction is illegal makes `replay`
 /// throw `CORRUPTED_DATA`. The in-place apply poisons a state that is entirely internal to the failed
 /// `replay` call (it is never assigned to a caller on a throw), so an INDEPENDENT replay of just the
 /// valid prefix is completely unaffected -- pinning that the poison never escapes.
-TEST(CasRefStateMachine, E3TrustedHistoryPoisonOnBadTailIsInternal)
+TEST(CasRefStateMachine, E3TrustedReplayPoisonOnBadTailIsInternal)
 {
     const std::vector<RefLogTxn> good_prefix{
         makeTxn(kNs, RefTxnId{1, 1}, {birthOp(), addPrecommitOp("a", manifestRef(1, 1, 1))}),
@@ -1062,7 +1062,7 @@ TEST(CasRefStateMachine, E3TrustedHistoryPoisonOnBadTailIsInternal)
     expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { replay(std::nullopt, bad_tail); });
 
     /// The failed replay's poisoned internal state never leaked: a fresh replay of the valid prefix is
-    /// byte-identical to one built entirely via Full, and reflects exactly the prefix.
+    /// byte-identical to one built entirely via LiveAppend, and reflects exactly the prefix.
     const RefTableState from_prefix = replay(std::nullopt, good_prefix);
     RefTableState full_prefix;
     for (const RefLogTxn & txn : good_prefix)
