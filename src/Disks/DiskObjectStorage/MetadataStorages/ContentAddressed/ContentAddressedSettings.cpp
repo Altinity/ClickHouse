@@ -24,28 +24,31 @@ namespace ErrorCodes
 /// keys are consumed elsewhere (`ObjectStorageFactory`, `S3Settings`, `MetadataStorageFactory`'s
 /// `getObjectKeyCompatiblePrefix`, `IDisk`, `DiskFromAST` for the inline SQL `disk(...)` form,
 /// `RegisterDiskObjectStorage`'s fake-transaction gate) and must be skipped here rather than rejected
-/// as unknown. Enumerated from the real CAS disk configs, scoped to the disk-block level (not whole
-/// files, which pull in unrelated sections like `keeper_server`/`logger`):
-///   rg -o "<([a-z_0-9]+)>" -r '$1' utils/ca-soak/configs/storage_conf*.xml utils/ca-soak/configs/storage_overrides*.xml
-/// plus the equivalent scan over every CAS integration-test disk config (found via
-/// `git grep -l content_addressed tests/integration | grep -E '\.xml$'`), plus every CAS disk config
-/// under `tests/config/config.d/content_addressed_*.xml` (the stateless-lane XML configs -- these are
-/// the only place in the tree with a LOCAL `object_storage_type` CAS disk, so they are the only
-/// source of the generic `path` key below; a scan that skips this directory will miss it), plus every
-/// inline `disk(...)` SQL construct in the `05002`-`05015` `content_addressed`/`ca_gc`/`cas_*`
-/// stateless tests -- those supply `name` (read by `DiskFromAST` to derive the ad-hoc disk's name)
-/// and `use_fake_transaction` (validated generically in `RegisterDiskObjectStorage.cpp` against
-/// EVERY metadata type that needs a real transaction, not a CAS-specific check -- exercised by
-/// `05015_cas_reject_fake_transaction` deliberately setting it to assert the REJECTION, which needs
-/// the key to reach that check rather than being rejected earlier as unknown), neither of which any
-/// XML config exercises. This scan has NOT been repeated over the older `04278`-`04300`
-/// `content_addressed` stateless tests (pre-dating this settings struct) or the CAS integration
-/// suite's inline-`disk()` uses, if any -- do that before trusting this list against those. All
-/// sources so far are filtered down to the keys that are direct children of an actual
-/// `metadata_type=content_addressed` disk block (the raw `rg -o` output also contains disk-name and
-/// policy/volume wrapper tags, which are not config keys at all). Any new CAS config FAMILY --
-/// including a new inline-`disk()` test pattern -- added to the tree needs the same scan repeated
-/// against it. `content_addressed_allow_shared_pool` and `content_addressed_gc_grace_sec`
+/// as unknown. As of 2026-07-21 this list covers ALL in-repo CAS disk configs and inline `disk(...)`
+/// definitions, enumerated from four sources, each filtered down to the keys that are direct
+/// children of an actual `metadata_type=content_addressed` disk block (the raw `rg -o` output below
+/// also contains disk-name and policy/volume wrapper tags, which are not config keys at all):
+///   1) `rg -o "<([a-z_0-9]+)>" -r '$1' utils/ca-soak/configs/storage_conf*.xml utils/ca-soak/configs/storage_overrides*.xml`
+///   2) every CAS integration-test disk config, both the `storage_conf.xml` bodies and the
+///      per-node `server_root_id_node*.xml` overrides (`git grep -l content_addressed
+///      tests/integration | grep -E '\.xml$'`) -- and every integration `test.py`
+///      (`git ls-files 'tests/integration/*/test.py' | xargs grep -l
+///      'metadata_type.*content_addressed'`) confirmed EMPTY: no integration test builds a CAS disk
+///      via inline SQL `disk(...)`, only via these XML configs.
+///   3) every CAS disk config under `tests/config/config.d/content_addressed_*.xml` (the
+///      stateless-lane XML configs) -- these are the only place in the tree with a LOCAL
+///      `object_storage_type` CAS disk, so they are the only source of the generic `path` key below.
+///   4) every inline `disk(...)` SQL construct across ALL `content_addressed`/`ca_gc`/`cas_*`
+///      stateless tests, `04278`-`04300` (pre-dating this settings struct) through `05002`-`05015`
+///      (current) -- these supply `name` (read by `DiskFromAST` to derive the ad-hoc disk's name)
+///      and `use_fake_transaction` (validated generically in `RegisterDiskObjectStorage.cpp` against
+///      EVERY metadata type that needs a real transaction, not a CAS-specific check -- exercised by
+///      `05015_cas_reject_fake_transaction` deliberately setting it to assert the REJECTION, which
+///      needs the key to reach that check rather than being rejected earlier as unknown). The
+///      `04278`-`04300` range turned up no keys beyond what `05002`-`05015` already required.
+/// Any new CAS config FAMILY -- a new XML config directory or a new inline-`disk()` test pattern --
+/// added to the tree needs the same four-way scan repeated against it and this note updated.
+/// `content_addressed_allow_shared_pool` and `content_addressed_gc_grace_sec`
 /// are legacy keys from the pre-rev.6 single-owner-pool design: the incarnation-token pool is
 /// multi-writer by design (spec section 2) -- the publish gate + fence/recheck handshake make shared
 /// pools safe, and the GC lease dedups leaders -- so the old single-owner claim and its
