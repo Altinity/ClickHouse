@@ -1195,16 +1195,21 @@
     -->
 
     <!-- Query log. Used only for queries with setting log_queries = 1. -->
-    <!-- Per-event audit log of the content-addressed (CAS) storage layer: every blob/manifest/ref
-         decision with its rationale. The CAS disk feature is EXPERIMENTAL, therefore this log is
-         enabled by default and we recommend KEEPING it enabled — it is the primary forensic
-         instrument when reporting a CAS issue, and it costs nothing when no CAS disk is configured
-         (events are emitted only by content-addressed disks). Remove the section to disable. -->
+    <!-- Per-event audit log of the content-addressed (CAS) storage layer. Enabled by default while
+         the feature is experimental (events are emitted only by content-addressed disks; it costs
+         nothing otherwise). Remove the section to disable. -->
     <content_addressed_log>
         <database>system</database>
         <table>content_addressed_log</table>
+        <partition_by>toYYYYMM(event_date)</partition_by>
         <flush_interval_milliseconds>7500</flush_interval_milliseconds>
+        <max_size_rows>1048576</max_size_rows>
+        <reserved_size_rows>8192</reserved_size_rows>
+        <buffer_size_rows_flush_threshold>524288</buffer_size_rows_flush_threshold>
+        <flush_on_crash>false</flush_on_crash>
+        <!-- example of a retention policy; disabled by default like every other log's TTL
         <ttl>event_date + INTERVAL 7 DAY DELETE</ttl>
+        -->
     </content_addressed_log>
 
     <query_log>
