@@ -376,6 +376,40 @@ materialized-state promote: copy + validate + apply + install) stays flat and wi
 band throughout, confirming the new field costs nothing extra on the single-op live-writer path once
 materialized.
 
+### Full-suite confirmation: everything else is untouched {#e2-full-suite}
+
+The four benchmarks above were run under a filter during the main investigation. A full,
+un-filtered `--benchmark_repetitions=3 --benchmark_report_aggregates_only=true` pass
+(`build/bench_t4_e2_full.log`) confirms the four benchmarks E2 does not touch (`owned_manifests` is
+never read or written by any of them) stay within ordinary run-to-run noise of their t2 baselines:
+
+| Benchmark | N | t2 (median) | t4/E2 (median) | Delta |
+|---|---|---|---|---|
+| `BM_Admits` (promote preview -- never calls `manifestAlreadyOwned`) | 100 | 1,008 ns | 983 ns | -2.5% |
+| `BM_Admits` | 1,000 | 1,040 ns | 1,010 ns | -2.9% |
+| `BM_Admits` | 10,000 | 1,053 ns | 1,016 ns | -3.5% |
+| `BM_Admits` | 100,000 | 1,067 ns | 1,088 ns | +2.0% |
+| `BM_SnapshotEncode` | 100 | 15,504 ns | 14,802 ns | -4.5% |
+| `BM_SnapshotEncode` | 1,000 | 158,807 ns | 150,318 ns | -5.3% |
+| `BM_SnapshotEncode` | 10,000 | 1,629,810 ns | 1,542,519 ns | -5.4% |
+| `BM_SnapshotEncode` | 100,000 | 16,726,370 ns | 16,296,900 ns | -2.6% |
+| `BM_MergedIteration` | 100 | 754 ns | 767 ns | +1.7% |
+| `BM_MergedIteration` | 1,000 | 7,711 ns | 7,790 ns | +1.0% |
+| `BM_MergedIteration` | 10,000 | 82,035 ns | 81,207 ns | -1.0% |
+| `BM_MergedIteration` | 100,000 | 903,707 ns | 961,586 ns | +6.4% |
+| `BM_Materialize` | 100 | 12,137 ns | 12,192 ns | +0.5% |
+| `BM_Materialize` | 1,000 | 127,216 ns | 126,510 ns | -0.6% |
+| `BM_Materialize` | 10,000 | 1,297,018 ns | 1,305,734 ns | +0.7% |
+| `BM_Materialize` | 100,000 | 17,923,253 ns | 18,687,275 ns | +4.3% |
+
+All within the ±10% band every prior round used. One cosmetic note: `BM_MergedIteration`'s
+`->Complexity()` fit picked `0.58 NlgN` this run versus the original baseline's `O(N), ~8.6 ns/row`
+label -- both are `->Complexity()`'s auto-selected best least-squares fit (`oAuto`) among candidate
+curves over near-identical per-N timings (deltas above are all ≤6.4%), so this is the fit selector
+picking a different label for the same numbers, not a behavior change; `BM_MergedIteration` doesn't
+read or write `owned_manifests` at all (it benchmarks `RefCowMap` directly, per its own doc comment).
+`BM_Admits` and `BM_Materialize` keep the same complexity class and RMS as their baselines.
+
 ### Verdict
 
 DONE_WITH_CONCERNS. The headline result lands exactly as designed: `BM_AdmitsAddPrecommit` is flat
@@ -388,6 +422,13 @@ regression that doubles a pre-existing, already-accepted, already-deferred cost 
 write-up. Neither affects the live-writer append/flush path this task targeted, and neither is a new
 asymptotic class -- both are follow-up-experiment material ("materialize periodically during a long
 replay" would fix both `committed`'s and `owned_manifests`' versions of the same underlying issue at
-once), tracked here rather than folded silently into "flat and green."
+once), tracked here rather than folded silently into "flat and green." The full-suite run above
+confirms the two costs are localized to exactly the two benchmarks that touch `owned_manifests`;
+nothing else in the suite moved outside noise.
 
-Gate: 1,091 tests passed, 0 failures (t3's 1,079 + 12 new E2 container tests).
+Gate: 1,091 tests passed, 0 failures (t3's 1,079 + 12 new E2 container tests). The gate log's "YOU
+HAVE 2 DISABLED TESTS" footer is pre-existing and unrelated to E2: both are `DISABLED_`-prefixed
+tests in `gtest_cas_protocol_scenarios.cpp` (`DISABLED_RevalidateAbsentTreeDepRecreates`,
+`DISABLED_AdoptTreeOfReclaimedTreeFailsClosedAtAdoptTime`), predating this task. E2's own death tests
+use `#if defined(DEBUG_OR_SANITIZER_BUILD)` gating (per the brief), not `DISABLED_`, so they don't
+compile into this release build at all rather than showing up as disabled.
