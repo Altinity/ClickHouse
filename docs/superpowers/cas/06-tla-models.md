@@ -13,10 +13,16 @@ This document indexes every TLA+ model in `docs/superpowers/models/` for the con
 MergeTree feature. For each model it records: the file(s), what the model proves (key invariants), the
 counterexamples or sabotage traces that drove concrete design decisions, and a code-currency note.
 
-The `.tla` and `.cfg` source files are **not modified**; this doc supersedes the per-model prose files
-(`*_RESULTS.md`, `*_README.md`, `INDEX.md`, `README.md`, `RESULTS.md`,
-`MODEL_CURRENCY_REVIEW_2026-06-22.md`). All bounded-model-checking runs use TLC v2.19 / OpenJDK 21;
-Apalache 0.58.0 is used for inductive-invariant checking.
+The `.tla` and `.cfg` source files are **not modified**; this doc superseded the older per-model prose
+files (`*_README.md`, `INDEX.md`, `RESULTS.md`, `MODEL_CURRENCY_REVIEW_2026-06-22.md`). All
+bounded-model-checking runs use TLC v2.19 / OpenJDK 21; Apalache 0.58.0 is used for
+inductive-invariant checking.
+
+> **Directory index.** The complete, up-to-date inventory of `docs/superpowers/models/` — including
+> models added after this doc's last full refresh (the ref snapshot+log family `CaRef*`,
+> `CaRetiredInRun*`, `CaGcCondemnMarkerGate`, and the rev.6 `CaCasMountCore` configs) and the list
+> of removed obsolete models — is `docs/superpowers/models/README.md`. When this doc and the README
+> disagree on a model's config set or currency, the README (audit date 2026-07-21) wins.
 
 ---
 
