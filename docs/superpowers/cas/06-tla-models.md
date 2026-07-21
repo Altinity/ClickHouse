@@ -519,12 +519,19 @@ Full table in `CaGcRootLocalPartManifestCore_RESULTS.md`.
 > `CaGcAckFloorZombie.tla` (Area 11). The fold, manifest-cleanup, orphan-sweep, source-edge, and
 > attempt-scoping results above are unaffected by the redesign and stay CURRENT.
 >
-> **Audit note (2026-07-22): two of these fence-era sabotage configs no longer run** —
-> `sab_reducerownsfence` (#26) and `sab_crosssharddisplacement` (#27) now throw a TLC
-> `RuntimeException` (`CHOOSE m ∈ {}` at `TheM`, `.tla:113`) in the `EnableSharding` reducer arm
-> instead of cleanly violating their invariant. They are part of the fence/recheck half a future
-> realignment should excise (see §area-ackfloor); until then they are broken, not merely superseded.
-> The conclusions they once demonstrated for the fence mechanism stand in git history.
+> **Audit note (2026-07-22): the `EnableSharding` arm no longer runs — a regression, not just
+> supersession.** All three sharding configs — the POSITIVE stage `stage5_sharding` (historically
+> 983.9M states, now crashes at 158) and the sabotages `sab_reducerownsfence` (#26) and
+> `sab_crosssharddisplacement` (#27) — throw a TLC `RuntimeException` (`CHOOSE m ∈ {}` at `TheM`,
+> `.tla:113`, reached from the `GReduceShard`/scatter path): a both-empty edge (`e.old = e.new = {}`)
+> reaches the `IF e.old # {} THEN TheM(e.old) ELSE TheM(e.new)` extraction and applies `CHOOSE` to an
+> empty set. So the sharded scatter/reduce machinery currently has NO working positive gate in this
+> model, and its two fence-era sabotages crash rather than cleanly violate. The sharding correctness
+> is still exercised by the C++ `gtest_cas_gc_shard_plan.cpp`; fixing the model's sharding arm (guard
+> or repair the both-empty edge in the scatter) is proof-model surgery folded into the deferred
+> fence/recheck-and-sharding realignment (see §area-ackfloor), not an unattended edit. The
+> non-sharding stages (`stage0..4`, `stage5_tokendiff`/`_lazytrim`/`_retiretoken`,
+> `stage6_attemptscoping`, `live`) and their sabotages are unaffected.
 
 **Code currency:** CURRENT for the fold/manifest/attempt-scoping machinery the ack-floor round reuses;
 the fence/recheck phases it models are SUPERSEDED by Area 11 (controls kept as historical evidence).

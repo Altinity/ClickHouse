@@ -62,8 +62,10 @@ superseded), `CaGcAckFloorCore` (writer-ack graduation floor superseded by round
 `GRebuild` + clamp-suppression still match), `CaBuildRootPrecommit` (inline-closure + per-blob
 presence mechanisms drifted to lazy-fold-with-clamp-barrier + owner-liveness), `CaEdgeBeforeObserve`
 (the tokenless-leaf `K3Head`/`K3AdoptCheck` half superseded by manifest-trust), and the
-fence/recheck half of `CaGcRootLocalPartManifestCore` (two of its fence-era sabotages now crash TLC
-rather than cleanly violate). Realigning these — trimming the ack apparatus, excising the
+sharding/fence half of `CaGcRootLocalPartManifestCore` (its `EnableSharding` arm — the positive
+`stage5_sharding` gate *and* two fence-era sabotages — now crashes TLC with `CHOOSE m ∈ {}` at
+`TheM` rather than running, a regression from the historical 983.9M-state run; the non-sharding
+stages are unaffected and its sharding correctness is covered by `gtest_cas_gc_shard_plan.cpp`). Realigning these — trimming the ack apparatus, excising the
 fence/recheck half, recasting the tokenless leaf / closure mechanism — is **deferred**: each is a
 rewrite of a concurrency proof model where a modeling slip yields a false-green, so it belongs to a
 careful pass with adversarial review, not an unattended edit. The current GC round's safety IS
