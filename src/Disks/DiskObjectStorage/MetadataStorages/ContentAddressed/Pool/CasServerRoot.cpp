@@ -6,6 +6,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Common/Exception.h>
+#include <Common/ProfileEvents.h>
 #include <Common/setThreadName.h>
 #include <base/getFQDNOrHostName.h>
 #include <fmt/format.h>
@@ -16,11 +17,17 @@
 #include <string_view>
 #include <unistd.h>
 
+namespace ProfileEvents
+{
+    extern const Event CasMountLeaseLost;
+}
+
 namespace DB
 {
 namespace ErrorCodes
 {
     extern const int CORRUPTED_DATA;
+    extern const int FILE_DOESNT_EXIST;
     extern const int LOGICAL_ERROR;
 }
 }
@@ -836,6 +843,7 @@ void MountLeaseKeeper::onRenewMismatch(const String & mismatched_key)
 
         if (current.server_uuid == server_uuid && current.writer_epoch != writer_epoch)
         {
+            ProfileEvents::increment(ProfileEvents::CasMountLeaseLost);
             emitMountEvent(event_sink, CasEventType::MountConflict, srid, "superseded", &current,
                 "own mount slot is held by a different writer_epoch — superseded by a newer incarnation");
             throw Exception(ErrorCodes::LOGICAL_ERROR,
@@ -845,12 +853,27 @@ void MountLeaseKeeper::onRenewMismatch(const String & mismatched_key)
 
         if (current.server_uuid != server_uuid)
         {
+            ProfileEvents::increment(ProfileEvents::CasMountLeaseLost);
             emitMountEvent(event_sink, CasEventType::MountConflict, srid, "foreign_writer", &current,
                 "mount slot is held by a foreign server — failing closed, never taking over");
             throw Exception(ErrorCodes::LOGICAL_ERROR,
                 "CAS mount-lease: key '{}' is held by a foreign server ({}) — failing closed, never taking over",
                 mismatched_key, describeMountHolder(current));
         }
+    }
+    else
+    {
+        /// The mount slot object VANISHED (backing store deleted under a live mount -- e.g. an
+        /// operator or test rm -rf'd the pool dir). This is an ENVIRONMENTAL condition, not a logic
+        /// error: there is no foreign writer to fail closed against. Stop renewing (fail-closed: the
+        /// write fence latches to lost, we never re-mint) WITHOUT aborting the server --
+        /// LOGICAL_ERROR here aborts debug/ASan builds at exception construction.
+        ProfileEvents::increment(ProfileEvents::CasMountLeaseLost);
+        emitMountEvent(event_sink, CasEventType::MountConflict, srid, "vanished", nullptr,
+            "mount slot object vanished (backing store deleted under a live mount) -- stopping renewal, fail-closed");
+        throw Exception(ErrorCodes::FILE_DOESNT_EXIST,
+            "CAS mount-lease: key '{}' vanished (backing store deleted under a live mount) -- "
+            "stopping renewal, fail-closed (never re-minting)", mismatched_key);
     }
 
     SingleWriterSlot::onRenewMismatch(mismatched_key);

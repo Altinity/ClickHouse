@@ -2,6 +2,7 @@
 #include "cas_test_helpers.h"
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
+#include <Common/ProfileEvents.h>
 
 #include <chrono>
 #include <limits>
@@ -12,6 +13,13 @@ namespace DB::ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
     extern const int CORRUPTED_DATA;
+    extern const int FILE_DOESNT_EXIST;
+    extern const int LOGICAL_ERROR;
+}
+
+namespace ProfileEvents
+{
+    extern const Event CasMountLeaseLost;
 }
 
 using namespace DB::Cas;
@@ -150,6 +158,41 @@ TEST(CasMountLease, AbsentClaimThenRenewBumpsSeq)
     EXPECT_EQ(decodeMountLease(b->get(l.mountKey("r"))->bytes).seq, 1u);
     k.renewOnce();
     EXPECT_EQ(decodeMountLease(b->get(l.mountKey("r"))->bytes).seq, 2u);
+}
+
+/// STID 3982-3b48: `rm -rf` of the pool dir under a live mount deletes the mount slot object out from
+/// under a running keeper. The next background renewal must fail closed (stop renewing, latch the
+/// write fence to lost) WITHOUT constructing a `LOGICAL_ERROR` -- that aborts debug/ASan builds at
+/// exception construction, and there is no foreign writer here to fail closed against, only an
+/// environmental condition.
+TEST(CasMountLease, VanishedBackingStoreStopsRenewalWithoutLogicalError)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    uint64_t now = 1000;
+    ASSERT_EQ(claimMount(*b, l, "r", UInt128(1), /*epoch*/ 7, now, /*ttl*/ 100).kind, MountClaimResult::Claimed);
+    MountLeaseKeeper k(b, l, "r", UInt128(1), 7, std::chrono::milliseconds(100), [&] { return now; },
+                       [] { return uint64_t{0}; });
+    k.start();
+
+    const String mount_key = l.mountKey("r");
+    const auto lost_before = ProfileEvents::global_counters[ProfileEvents::CasMountLeaseLost].load();
+
+    /// Simulate `rm -rf` of the backing store: the mount slot object is gone, but the keeper still
+    /// holds a (now stale) token for it.
+    ASSERT_EQ(b->deleteExact(mount_key, b->head(mount_key).token).kind, DeleteOutcome::Kind::Deleted);
+
+    try
+    {
+        k.renewOnce();
+        FAIL() << "renew against a vanished mount object must throw";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::FILE_DOESNT_EXIST) << e.message();
+        EXPECT_NE(e.code(), DB::ErrorCodes::LOGICAL_ERROR);
+    }
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasMountLeaseLost].load(), lost_before + 1);
 }
 
 /// rev.6: a bare `claimMount` (no `proven_dead_token`) NEVER reclaims a same-uuid, different-epoch
