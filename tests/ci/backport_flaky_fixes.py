@@ -62,13 +62,18 @@ def git_out(*args) -> str:
 
 
 def fetch_commit(upstream_repo: str, sha: str) -> bool:
-    """Fetch a single commit object by SHA from the upstream repo.
+    """Fetch a commit and its parent from upstream so cherry-pick can compute the diff.
     Returns True on success, False on failure."""
     url = UPSTREAM_GIT_URL.format(repo=upstream_repo)
     result = run_git("fetch", "--no-tags", "--no-recurse-submodules", url, sha, check=False)
     if result.returncode != 0:
         print(f"Failed to fetch {sha[:12]} from upstream:\n{result.stderr}", file=sys.stderr)
         return False
+    # cherry-pick needs the parent's tree objects to compute the diff; fetch it too.
+    parent_result = run_git("rev-parse", "FETCH_HEAD^", check=False)
+    if parent_result.returncode == 0:
+        parent_sha = parent_result.stdout.strip()
+        run_git("fetch", "--no-tags", "--no-recurse-submodules", "--depth=1", url, parent_sha, check=False)
     return True
 
 
