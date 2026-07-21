@@ -3,7 +3,6 @@
 
 #include <Common/Exception.h>
 #include <Common/Logger.h>
-#include <Common/UniqueLock.h>
 #include <Common/logger_useful.h>
 #include <Core/Settings.h>
 #include <Formats/FormatFactory.h>
@@ -52,6 +51,7 @@ namespace Setting
     extern const SettingsInt64 delta_lake_snapshot_start_version;
     extern const SettingsInt64 delta_lake_snapshot_end_version;
     extern const SettingsUInt64 max_streams_for_files_processing_in_cluster_functions;
+    extern const SettingsBool allow_experimental_iceberg_read_optimization;
 }
 
 namespace ErrorCodes
@@ -285,6 +285,12 @@ StorageObjectStorage::StorageObjectStorage(
                 if (auto metadata_snapshot = configuration->buildStorageMetadataFromState(*state, context))
                     metadata = *metadata_snapshot;
             }
+
+            /// Table functions bypass updateExternalDynamicMetadataIfExists (see above),
+            /// so identity-partition columns must be resolved here as well -- otherwise
+            /// PREWHERE could be built over a column that gets erased from the read set
+            /// as file-constant (see StorageObjectStorageSource's constant-column handling).
+            updateIdentityPartitionColumns(metadata, configuration, *state, context);
         }
     }
 
@@ -339,19 +345,15 @@ std::optional<NameSet> StorageObjectStorage::supportedPrewhereColumns() const
 {
     auto exclude = hive_partition_columns_to_read_from_file_path;
 
-    const auto & cols = getInMemoryMetadataPtr()->getColumns();
+    const auto metadata = getInMemoryMetadataPtr();
+    for (const auto & identity_partition_column : metadata->identity_partition_columns)
     {
-        SharedLockGuard lock(mutex_file_constant_columns);
-        for (const auto & col : file_constant_columns)
-        {
-            if (getInMemoryMetadataPtr()->getColumns().has(col))
-                // tryGetColumn
-                exclude.emplace_back(col, cols.get(col).type);
-        }
+        if (metadata->getColumns().has(identity_partition_column))
+            exclude.emplace_back(identity_partition_column, metadata->getColumns().get(identity_partition_column).type);
     }
 
     LOG_DEBUG(log, "Prewhere exclude list: [{}]", exclude.toString());
-    return getInMemoryMetadataPtr()->getColumnsWithoutDefaultExpressions(/*exclude=*/exclude);
+    return metadata->getColumnsWithoutDefaultExpressions(/*exclude=*/exclude);
 }
 
 IStorage::ColumnSizeByName StorageObjectStorage::getColumnSizes() const
@@ -369,10 +371,14 @@ configuration->update(object_storage, query_context);
     return configuration->getExternalMetadata();
 }
 
-void StorageObjectStorage::updateFileConstantColumns(ContextPtr query_context)
+void StorageObjectStorage::updateIdentityPartitionColumns(
+    StorageInMemoryMetadata & metadata,
+    const StorageObjectStorageConfigurationPtr & configuration,
+    const DataLakeTableStateSnapshot & state,
+    ContextPtr context)
 {
-    UniqueLock lock(mutex_file_constant_columns);
-    file_constant_columns = configuration->getIdentityPartitionColumnNames(query_context);
+    if (context->getSettingsRef()[Setting::allow_experimental_iceberg_read_optimization])
+        metadata.setIdentityPartitionColumns(configuration->getIdentityPartitionColumnNames(state, context));
 }
 
 void StorageObjectStorage::updateExternalDynamicMetadataIfExists(ContextPtr query_context)
@@ -402,7 +408,8 @@ void StorageObjectStorage::updateExternalDynamicMetadataIfExists(ContextPtr quer
             new_metadata = *metadata_snapshot;
     }
 
-    updateFileConstantColumns(query_context);
+    /// Resolved from the same pinned `state` above -- no second state resolution.
+    updateIdentityPartitionColumns(new_metadata, configuration, *state, query_context);
 
     setInMemoryMetadata(new_metadata);
 }

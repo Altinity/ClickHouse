@@ -1436,12 +1436,13 @@ ColumnMapperPtr IcebergMetadata::getColumnMapperForCurrentSchema(StorageMetadata
     return persistent_components.schema_processor->getColumnMapperById(iceberg_table_state->schema_id);
 }
 
-Names IcebergMetadata::getIdentityPartitionColumnNames(ContextPtr local_context) const
+Names IcebergMetadata::getIdentityPartitionColumnNames(const DataLakeTableStateSnapshot & state, ContextPtr local_context) const
 {
-    // check getPartitionKey
-    auto [data_snapshot, table_state_snapshot] = getRelevantState(local_context);
+    // @todo
+    chassert(std::holds_alternative<Iceberg::TableStateSnapshot>(state));
+    const auto & iceberg_state = std::get<Iceberg::TableStateSnapshot>(state);
     auto metadata_object = getMetadataJSONObject(
-        table_state_snapshot.metadata_file_path,
+        iceberg_state.metadata_file_path,
         object_storage,
         persistent_components.metadata_cache,
         local_context,

@@ -1508,7 +1508,8 @@ Names getIdentityPartitionColumnsFromMetadata(Poco::JSON::Object::Ptr metadata_o
     for (UInt32 i = 0; i < fields->size(); ++i)
     {
         auto field = fields->getObject(i);
-        if (field->getValue<String>(f_transform) != "identity")
+
+        if (Poco::toLower(field->getValue<String>(f_transform)) != "identity")
             continue;
 
         if (auto it = source_id_to_column_name.find(field->getValue<Int64>(f_source_id)); it != source_id_to_column_name.end())

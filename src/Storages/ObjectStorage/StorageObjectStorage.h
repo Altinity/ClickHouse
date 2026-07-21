@@ -155,7 +155,17 @@ public:
 
     void addInferredEngineArgsToCreateQuery(ASTs & args, const ContextPtr & context) const override;
 
-    void updateFileConstantColumns(ContextPtr query_context);
+    /// Resolves identity-partition column names for the given already-pinned table
+    /// state snapshot (no extra state resolution) and stores them into `metadata`,
+    /// gated by the `allow_experimental_iceberg_read_optimization` setting. Shared by
+    /// the table-function constructor, `updateExternalDynamicMetadataIfExists`, and
+    /// `StorageObjectStorageCluster`.
+    static void updateIdentityPartitionColumns(
+        StorageInMemoryMetadata & metadata,
+        const StorageObjectStorageConfigurationPtr & configuration,
+        const DataLakeTableStateSnapshot & state,
+        ContextPtr context);
+
     void updateExternalDynamicMetadataIfExists(ContextPtr query_context) override;
 
     IDataLakeMetadata * getExternalMetadata(ContextPtr query_context);
@@ -214,9 +224,6 @@ protected:
 
     NamesAndTypesList hive_partition_columns_to_read_from_file_path;
     NamesAndTypesList file_columns;
-
-    mutable SharedMutex mutex_file_constant_columns;
-    Names file_constant_columns TSA_GUARDED_BY(mutex_file_constant_columns);
 
     LoggerPtr log;
 

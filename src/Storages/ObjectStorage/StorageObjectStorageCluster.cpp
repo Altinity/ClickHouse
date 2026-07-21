@@ -566,13 +566,16 @@ void StorageObjectStorageCluster::updateExternalDynamicMetadataIfExists(ContextP
             new_metadata = *metadata_snapshot;
     }
 
+    /// Resolved from the same pinned `state` above -- no second state resolution.
+    /// Stored directly in `new_metadata` so it reaches `pure_storage` (and, through
+    /// it, distributed workers constructed via the rewritten table function) via the
+    /// same setInMemoryMetadata propagation below, with no separate call needed.
+    StorageObjectStorage::updateIdentityPartitionColumns(new_metadata, configuration, *state, query_context);
+
     setInMemoryMetadata(new_metadata);
 
     if (pure_storage)
-    {
         pure_storage->setInMemoryMetadata(IStorageCluster::getInMemoryMetadata());
-        pure_storage->updateFileConstantColumns(query_context);
-    }
 }
 
 class TaskDistributor : public TaskIterator
