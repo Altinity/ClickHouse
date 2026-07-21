@@ -138,6 +138,15 @@ struct RefLedgerConfig
     uint64_t ref_table_cache_bytes = 256ULL << 20;
 };
 
+/// How much admission re-checking a transaction application performs. `Full` is the writer's
+/// append-time contract. `TrustedHistory` is for replaying transactions that already passed
+/// `Full` validation when they were durably appended (recovery, GC fold, fsck, protection
+/// views): the O(N) cross-owner uniqueness scan is elided in release builds and kept as a
+/// `chassert` in debug/sanitizer builds (same policy as `debugAssertBodyCounters`). Every
+/// exact-binding precondition (cheap, keyed) is enforced in BOTH modes -- a corrupted log
+/// object still fails closed in either mode.
+enum class TxnValidation : uint8_t { Full, TrustedHistory };
+
 /// The in-memory table state: `TableState = Replay(S_X.state, tail(X))`. This class, `applyRefLogTxn`, `snapshotOf`, and
 /// `replay` are the ONE shared implementation of that equation -- used verbatim by the writer, its
 /// own recovery path, `fsck`, and snapshot construction, so every consumer agrees on what a
@@ -188,13 +197,15 @@ private:
 
     /// One operation's local preconditions and effect, shared by `applyRefLogTxn`'s per-op loop and by
     /// `admits`'s single-op preview. `txn_id` is only read by `RemoveNamespace` (it becomes the
-    /// resulting `remove_txn_id`). Was free `applyOpInPlace`.
-    void applyOp(const RefOp & op, const RefTxnId & txn_id);
+    /// resulting `remove_txn_id`). `validation` is threaded down to `applyOwnerTransition`, the only
+    /// arm that consults it. Was free `applyOpInPlace`.
+    void applyOp(const RefOp & op, const RefTxnId & txn_id, TxnValidation validation);
 
     /// The `owner_transition` op kind: dispatches on the `(old_binding, new_binding)` shape to one of
     /// the four legal transitions (add precommit / remove precommit / remove committed / promote). Any
-    /// other shape is not a recognized transition. Was free.
-    void applyOwnerTransition(const RefOp & op);
+    /// other shape is not a recognized transition. `validation` is consulted only by the add-precommit
+    /// arm's cross-owner uniqueness check. Was free.
+    void applyOwnerTransition(const RefOp & op, TxnValidation validation);
 
     /// The `set_payload` op kind: the committed ref must still name `expected_manifest_ref`; replaces
     /// the opaque `payload` blob and `published_at_ms` without touching the manifest edge. Was free.
@@ -210,7 +221,7 @@ private:
     void debugAssertBodyCounters() const;
 #endif
 
-    friend void applyRefLogTxn(RefTableState & state, const RefLogTxn & txn);
+    friend void applyRefLogTxn(RefTableState & state, const RefLogTxn & txn, TxnValidation validation);
     friend RefTableState stateFromSnapshot(const RefTableSnapshot & snapshot);
     friend bool admits(const RefTableState & state, const RefOp & op,
                        uint64_t snapshot_budget, uint64_t removal_budget);
@@ -287,7 +298,14 @@ RefTableState stateFromSnapshot(const RefTableSnapshot & snapshot);
 /// and `fsck` -- the primary callers replaying persisted logs -- want exactly that fail-closed
 /// framing; a writer that wants a friendlier user-facing rejection for an ordinary attempted mutation
 /// (e.g. "ref already exists") checks its own business state before ever building the op.
-void applyRefLogTxn(RefTableState & state, const RefLogTxn & txn);
+///
+/// `validation` (default `TxnValidation::Full`, the writer's append-time contract): pass
+/// `TxnValidation::TrustedHistory` only when `txn` already passed `Full` validation at the time it was
+/// durably appended -- `replay`'s tail is the one caller that does. Every OTHER caller (the writer's
+/// own trial/shape-check previews and its post-PUT state install, all in `CasRefLedger.cpp`) keeps the
+/// default `Full`, because those calls are the FIRST time the transaction is validated, not a replay of
+/// already-validated history.
+void applyRefLogTxn(RefTableState & state, const RefLogTxn & txn, TxnValidation validation = TxnValidation::Full);
 
 /// The canonical snapshot of `state` under `ns`: `committed` sorted by
 /// bytewise `ref_name` (guaranteed by `RefCowMap`'s sorted merge-iteration order,

@@ -127,6 +127,17 @@ RefLogTxn buildRemovalTxnForTest(const RefTableState & state, const String & ns,
 
 constexpr const char * kNs = "srv1/db/table@cas@";
 
+/// Task 3 (E1): a validated state with "a" committed to manifest (1,1,1) -- the base every
+/// TrustedHistory-relaxed-replay test below reuses to build a tail whose add-precommit op would
+/// collide cross-owner (name the SAME manifest under a DIFFERENT ref_name).
+RefTableSnapshot buildCollidingBaseSnapshotForTest()
+{
+    RefTableState state;
+    applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1},
+        {birthOp(), addPrecommitOp("a", manifestRef(1, 1, 1)), promoteOp("a", manifestRef(1, 1, 1))}));
+    return snapshotOf(state, kNs);
+}
+
 }
 
 /// ===================================================================================
@@ -828,6 +839,80 @@ TEST(CasRefStateMachine, ReplayEquationPropertyTest)
 
         expectStatesEqual(full, resumed);
     }
+}
+
+/// ===================================================================================
+/// E1: TrustedHistory relaxed replay -- `replay`'s tail already passed `Full` validation when it was
+/// durably appended, so the O(N) `manifestAlreadyOwned` cross-owner scan is redundant on that path and
+/// becomes debug-only (a `chassert`) instead of a release-mode throw.
+/// ===================================================================================
+
+TEST(CasRefStateMachine, TrustedHistoryReplaySkipsCrossOwnerScanInRelease)
+{
+    const RefTableSnapshot snap = buildCollidingBaseSnapshotForTest();
+    const RefLogTxn colliding_txn = makeTxn(kNs, RefTxnId{1, 2}, {addPrecommitOp("b", manifestRef(1, 1, 1))});
+
+    /// Full (the default, unspecified argument): the writer's append-time contract still rejects the
+    /// cross-owner collision, unchanged from before E1. Applied directly rather than through `replay`,
+    /// since `replay` now uses TrustedHistory for its whole tail.
+    {
+        RefTableState full_state = stateFromSnapshot(snap);
+        const RefTableState before = full_state;
+        expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+            [&] { applyRefLogTxn(full_state, colliding_txn); });
+        expectStatesEqual(before, full_state);
+    }
+
+#ifndef DEBUG_OR_SANITIZER_BUILD
+    /// TrustedHistory, release build: the chassert re-proving `manifestAlreadyOwned` is compiled out,
+    /// so the same op that Full rejects is instead applied -- proving the O(N) scan really is elided on
+    /// this path, not merely downgraded to a silent no-op.
+    {
+        RefTableState trusted_state = stateFromSnapshot(snap);
+        EXPECT_NO_THROW(applyRefLogTxn(trusted_state, colliding_txn, TxnValidation::TrustedHistory));
+        EXPECT_TRUE(trusted_state.getPrecommits().contains({"b", manifestRef(1, 1, 1)}));
+        EXPECT_TRUE(trusted_state.getCommitted().contains("a"));
+        EXPECT_EQ(trusted_state.getGreatestApplied(), (RefTxnId{1, 2}));
+    }
+#endif
+}
+
+#if defined(DEBUG_OR_SANITIZER_BUILD)
+/// Debug/sanitizer-build counterpart: the chassert in TrustedHistory's add-precommit arm is active
+/// there, so the same cross-owner collision aborts the process instead of returning a catchable
+/// exception -- same pattern as CasWiringOpsDeathTest.MoveDirectoryMutableCollisionPolicyAborts in
+/// gtest_ca_wiring.cpp.
+TEST(CasRefStateMachineDeathTest, TrustedHistoryReplayAbortsOnCrossOwnerCollision)
+{
+    const RefTableSnapshot snap = buildCollidingBaseSnapshotForTest();
+    const RefLogTxn colliding_txn = makeTxn(kNs, RefTxnId{1, 2}, {addPrecommitOp("b", manifestRef(1, 1, 1))});
+    RefTableState trusted_state = stateFromSnapshot(snap);
+    EXPECT_DEATH({ applyRefLogTxn(trusted_state, colliding_txn, TxnValidation::TrustedHistory); }, "");
+}
+#endif
+
+/// Positive equivalence: a VALID tail replayed via `replay` (TrustedHistory) produces a state
+/// byte-identical (getters + encoded snapshot) to the same tail applied via `Full` -- TrustedHistory
+/// changes only what gets re-checked, never what a legal transaction produces.
+TEST(CasRefStateMachine, TrustedHistoryReplayEquivalentToFullOnValidTail)
+{
+    const std::vector<RefLogTxn> tail{
+        makeTxn(kNs, RefTxnId{1, 1}, {birthOp(), addPrecommitOp("a", manifestRef(1, 1, 1))}),
+        makeTxn(kNs, RefTxnId{1, 2},
+            {promoteOp("a", manifestRef(1, 1, 1)), addPrecommitOp("b", manifestRef(1, 2, 1))}),
+        makeTxn(kNs, RefTxnId{1, 3}, {setPayloadOp("a", manifestRef(1, 1, 1), "payload")}),
+        makeTxn(kNs, RefTxnId{1, 4}, {promoteOp("b", manifestRef(1, 2, 1))}),
+    };
+
+    RefTableState full_state;
+    for (const RefLogTxn & txn : tail)
+        applyRefLogTxn(full_state, txn);   // Full (default)
+
+    const RefTableState trusted_state = replay(std::nullopt, tail);   // replay uses TrustedHistory internally
+
+    expectStatesEqual(full_state, trusted_state);
+    EXPECT_EQ(encodeRefTableSnapshot(snapshotOf(full_state, kNs)),
+              encodeRefTableSnapshot(snapshotOf(trusted_state, kNs)));
 }
 
 /// ===================================================================================

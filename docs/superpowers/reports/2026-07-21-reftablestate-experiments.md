@@ -159,3 +159,88 @@ encapsulation cost (both stay flat in N either way — the O(1)/O(N) shape the e
 required to preserve is intact). `BM_ScratchCopy` (the pure copy-cost floor, entirely unrelated to
 the getter surface) also moves within the same ±1-2% band, supporting the noise explanation.
 Gate re-run: 1,077 tests passed, 0 failures (identical set to the baseline run).
+
+## E1 relaxed replay (t3) {#e1-relaxed-replay-t3}
+
+Task 3 attacks `BM_AdmitsAddPrecommit`'s O(N) `manifestAlreadyOwned` cross-owner scan — but only on
+the ONE path where re-checking it is provably redundant: `replay`'s tail, whose transactions
+already passed `Full` validation when they were durably appended (recovery, `fsck`, GC's owner-set
+rebuild, the writer's own recovery-on-open). A new `TxnValidation` enum (`Full` | `TrustedHistory`)
+threads through `applyRefLogTxn` → `applyOp` → `applyOwnerTransition`; only the add-precommit arm
+consults it. Under `Full` (the default, unchanged for every writer append-time caller) the scan
+still runs and throws `CORRUPTED_DATA` on a cross-owner collision, exactly as before. Under
+`TrustedHistory` the scan becomes a `chassert` — compiled out entirely in release builds (this
+`build/` directory has `NDEBUG` defined, no sanitizer), kept as a debug/sanitizer re-verification of
+a construction-guaranteed invariant, same policy as `debugAssertBodyCounters`. Every exact-binding
+precondition (the cheap, keyed checks) stays enforced in BOTH modes.
+
+### Caller audit
+
+`replay`'s tail loop is the only caller that now passes `TrustedHistory`; every other caller of
+`applyRefLogTxn` keeps the `Full` default by omission (no edit needed):
+
+| Caller | Location | Mode | Why |
+|---|---|---|---|
+| `replay`'s tail loop | `Pool/CasRefProtocol.cpp` (`replay`) | `TrustedHistory` (explicit) | Tail already passed `Full` validation at append time — recovery, `fsck`, GC rebuild, writer recovery-on-open all inherit this via `replay`/`recoverRefTableDetailed`. |
+| Wedge-resolution apply | `Pool/CasRefLedger.cpp:1138` | `Full` (default) | First-time fold of a transaction this leader itself just confirmed committed, not a replay of pre-validated history. |
+| Whole-item shape-check trial | `Pool/CasRefLedger.cpp:1243` | `Full` (default) | Validates a not-yet-persisted candidate transaction before any object is created. |
+| Per-op trial preview | `Pool/CasRefLedger.cpp:1265` | `Full` (default) | Pre-persist per-op validation of a candidate transaction. |
+| Post-PUT commit-time state install | `Pool/CasRefLedger.cpp:1377` | `Full` (default) | The writer's append-time contract itself — the FIRST validation of `final_txn`. |
+| `admits`'s single-op preview | `Pool/CasRefProtocol.cpp` (`admits`) | `Full` (explicit) | Previews a hypothetical op never durably appended anywhere. |
+| `independentFullReplayForTest` oracle | `gtest_cas_ref_writer.cpp:138` | `Full` (default) | Deliberately independent ground-truth oracle, unrelated to E1. |
+| `BM_ApplyRefLogTxn` | `benchmark_cas_ref_protocol.cpp:286` | `Full` (default) | Benchmarks the writer's per-txn apply cost, unaffected by E1. |
+
+### Tests
+
+Two new tests in `gtest_cas_ref_statemachine.cpp` (plus a third, death-test variant, gated
+`#if defined(DEBUG_OR_SANITIZER_BUILD)` and not compiled into this release-flavored `build/`):
+`CasRefStateMachine.TrustedHistoryReplaySkipsCrossOwnerScanInRelease` (proves `Full` still throws
+`CORRUPTED_DATA` on a cross-owner collision, and that `TrustedHistory` applies it instead in a
+release build) and `CasRefStateMachine.TrustedHistoryReplayEquivalentToFullOnValidTail` (a valid
+tail replayed via `replay`/`TrustedHistory` produces a state byte-identical, getters and encoded
+snapshot, to the same tail applied via `Full`). RED was reconstructed explicitly (implementation
+temporarily reverted via a saved patch + `git checkout --`, confirming a compile failure —
+`use of undeclared identifier 'TxnValidation'` — before restoring it) since both edits were written
+in one pass. Gate (same filter as the baseline): **1,079 tests passed, 0 failures** (1,077 + 2; the
+death test doesn't compile into this build).
+
+### Benchmark delta vs t2 {#e1-benchmark-delta}
+
+Same binary/flags as the baseline and t2 runs; medians reported.
+
+| Benchmark | N | t2 (median) | t3/E1 (median) | Delta |
+|---|---|---|---|---|
+| `BM_ReplayHistory` | 100 | 6.19 ms | 4.85 ms | **-21.6%** |
+| `BM_ReplayHistory` | 1,000 | 46.26 ms | 35.82 ms | **-22.6%** |
+| `BM_ReplayHistory` | 10,000 | 453.28 ms | 350.57 ms | **-22.7%** |
+| `BM_ReplayHistory` | 100,000 | 4.79 s | 3.67 s | **-23.4%** |
+| `BM_ReplayHistory` complexity fit | — | ~48,859 ns/row, O(N), RMS 3% | 36,679 ns/row, O(N), RMS 1% | **-24.9%** |
+| `BM_AdmitsAddPrecommit` | 100 | 1,020 ns | 1,013 ns | -0.7% |
+| `BM_AdmitsAddPrecommit` | 1,000 | 4,301 ns | 4,281 ns | -0.5% |
+| `BM_AdmitsAddPrecommit` | 10,000 | 39,166 ns | 38,747 ns | -1.1% |
+| `BM_AdmitsAddPrecommit` | 100,000 | 434,903 ns | 410,636 ns | -5.6% |
+
+`BM_AdmitsAddPrecommit` is unchanged (`admits` always passes explicit `Full`) — all four deltas sit
+inside the benchmark's own run-to-run noise. `BM_ReplayHistory` dropped ~22-25% across every N and
+in its complexity fit: a real, verified win, and `manifestAlreadyOwned` genuinely stops being
+called at all on this path in a release build (`chassert` compiles to `(void)sizeof(...)`, no
+runtime evaluation).
+
+It is worth being precise about what did NOT happen: `BM_ReplayHistory` stayed O(N) overall — it
+did not flatten. That is because it measures a SECOND, pre-existing O(N) cost that E1 was never
+scoped to touch: it builds its base state via `makeSyntheticSnapshot(n)` + `replay(snapshot,
+tail)`, not `makeSyntheticState` (which explicitly calls `.materializeCommitted()` — the earlier
+"benchmark-methodology bug" section above documents the general pattern). `replay` internally calls
+`stateFromSnapshot`, which loads every committed row into the `committed` `RefCowMap`'s OVERLAY
+(the map's `base` starts as an empty shared pointer) and never materializes. Every one of the 256
+tail transactions' `RefTableState scratch = state;` copy inside `applyRefLogTxn` therefore
+deep-copies that up-to-N-entry overlay `std::map` — a genuine O(N) cost, repeated 256 times, wholly
+unrelated to `manifestAlreadyOwned`. Unlike the other benchmarks, this is not a benchmark artifact
+to fix: `BM_ReplayHistory` deliberately models the fold/recovery profile, and production
+replay-from-snapshot genuinely never materializes mid-fold (`applyRefLogTxn` never calls
+`materializeCommitted()`; only the writer's live-table flush loop does, once per flush) — so this
+remaining O(N) term is real production cost, confirmed out of scope for E1, and a candidate for a
+follow-up experiment (materialize periodically during a long recovery replay, or avoid copying an
+un-materialized overlay).
+
+Gate: 1,079 tests passed, 0 failures (t2's 1,077 + 2 new E1 tests).
