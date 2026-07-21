@@ -916,6 +916,163 @@ TEST(CasRefStateMachine, TrustedHistoryReplayEquivalentToFullOnValidTail)
 }
 
 /// ===================================================================================
+/// E3: apply strategy per validation mode
+///   - Full: two-phase scratch copy, "throw => state byte-for-byte unchanged"
+///   - TrustedHistory (replay): in-place, poison-on-throw, discarded by the sole caller
+/// ===================================================================================
+
+namespace
+{
+/// A populated, MATERIALIZED Live state -- committed "a"->(1,1,1) plus a pending precommit
+/// ("p",(1,2,1)) -- built through the public Full path, then materialized so its COW overlays are
+/// empty (exactly the shape the writer's live state has at each flush boundary). The E3 Full-path
+/// tests mutate a COPY of this and assert the original-equivalent captured bytes/getters are intact
+/// after a rejected transaction.
+RefTableState buildPopulatedLiveState()
+{
+    RefTableState state;
+    applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 1},
+        {birthOp(), addPrecommitOp("a", manifestRef(1, 1, 1)), promoteOp("a", manifestRef(1, 1, 1)),
+         addPrecommitOp("p", manifestRef(1, 2, 1))}));
+    state.materializeCommitted();
+    return state;
+}
+}
+
+/// Full-path atomicity, LATER-op throw ("populated" abort path): the first two ops touch committed,
+/// precommits, the owned-manifest index and the body counters; the third is illegal. The whole
+/// transaction is rejected and `state` is byte-for-byte unchanged -- getters AND encoded-snapshot
+/// bytes. This is the writer's live-state contract, preserved verbatim by E3's `Full` arm.
+TEST(CasRefStateMachine, E3FullLaterOpThrowLeavesPopulatedStateByteIdentical)
+{
+    RefTableState state = buildPopulatedLiveState();
+    const RefTableState before = state;
+    const String before_bytes = encodeRefTableSnapshot(snapshotOf(state, kNs));
+
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 2}, {
+            addPrecommitOp("q", manifestRef(1, 3, 1)),       // touches precommits + index + counters
+            removeCommittedOp("a", manifestRef(1, 1, 1)),     // touches committed + index + counters
+            removePrecommitOp("absent", manifestRef(9, 9, 9)) // ILLEGAL: exact binding absent -> throws
+        })); });
+
+    expectStatesEqual(before, state);
+    EXPECT_EQ(before_bytes, encodeRefTableSnapshot(snapshotOf(state, kNs)));
+    /// Neither surviving-looking earlier op leaked into the live state.
+    EXPECT_FALSE(state.getPrecommits().contains({"q", manifestRef(1, 3, 1)}));
+    EXPECT_TRUE(state.getCommitted().contains("a"));
+}
+
+/// Full-path atomicity, FIRST-op throw ("empty" abort path -- nothing applied before the throw): the
+/// symmetric guarantee still holds. Distinct from the case above because no op ever mutated the
+/// scratch, exercising the throw-before-any-effect branch.
+TEST(CasRefStateMachine, E3FullFirstOpThrowLeavesPopulatedStateByteIdentical)
+{
+    RefTableState state = buildPopulatedLiveState();
+    const RefTableState before = state;
+    const String before_bytes = encodeRefTableSnapshot(snapshotOf(state, kNs));
+
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA,
+        [&] { applyRefLogTxn(state, makeTxn(kNs, RefTxnId{1, 2}, {
+            removeCommittedOp("absent", manifestRef(9, 9, 9)), // ILLEGAL first op
+            addPrecommitOp("q", manifestRef(1, 3, 1))
+        })); });
+
+    expectStatesEqual(before, state);
+    EXPECT_EQ(before_bytes, encodeRefTableSnapshot(snapshotOf(state, kNs)));
+}
+
+/// `admits` previews an op against `state` and must leave it byte-for-byte unchanged whether the op
+/// fits (true) or overflows (false) -- it is a pure query. Verified against both getters and encoded
+/// bytes, for both the accept and the reject verdicts.
+TEST(CasRefStateMachine, E3AdmitsPreviewLeavesStateByteIdentical)
+{
+    RefTableState state = buildPopulatedLiveState();
+    const RefTableState before = state;
+    const String before_bytes = encodeRefTableSnapshot(snapshotOf(state, kNs));
+
+    const RefOp grow = addPrecommitOp("q", manifestRef(1, 3, 1));
+
+    /// Accept verdict (ample budget): state untouched.
+    EXPECT_TRUE(admits(state, grow, 1'000'000, 1'000'000));
+    expectStatesEqual(before, state);
+    EXPECT_EQ(before_bytes, encodeRefTableSnapshot(snapshotOf(state, kNs)));
+
+    /// Reject verdict (snapshot budget one byte short of the grown size): state STILL untouched.
+    RefTableState grown = state;
+    applyRefLogTxn(grown, makeTxn(kNs, RefTxnId{1, 2}, {grow}));
+    const size_t grown_size = encodeRefTableSnapshot(snapshotOf(grown, "")).size();
+    EXPECT_FALSE(admits(state, grow, grown_size - 1, 1'000'000));
+    expectStatesEqual(before, state);
+    EXPECT_EQ(before_bytes, encodeRefTableSnapshot(snapshotOf(state, kNs)));
+}
+
+/// TrustedHistory in-place apply, SUCCESS path across every `applyOp` arm: a tail that births, adds,
+/// promotes, replaces a committed manifest, removes a committed and a precommit, restamps a payload,
+/// and finally removes the namespace, replayed via `replay` (TrustedHistory, in place) must produce a
+/// state byte-identical to the SAME tail applied op-by-op through `Full` (scratch copy). This is the
+/// test only E3's in-place machinery can fail: a mis-maintained counter, a dropped owned-manifest
+/// index entry, or a lost `greatest_applied` update on the no-copy path would diverge here.
+TEST(CasRefStateMachine, E3TrustedHistoryInPlaceMatchesFullAcrossAllArms)
+{
+    const std::vector<RefLogTxn> tail{
+        makeTxn(kNs, RefTxnId{1, 1}, {birthOp(),
+            addPrecommitOp("a", manifestRef(1, 1, 1)), addPrecommitOp("b", manifestRef(1, 2, 1))}),
+        makeTxn(kNs, RefTxnId{1, 2}, {
+            promoteOp("a", manifestRef(1, 1, 1)),                     // precommit -> committed
+            setPayloadOp("a", manifestRef(1, 1, 1), "hello", 42)}),   // restamp payload
+        makeTxn(kNs, RefTxnId{1, 3}, {removePrecommitOp("b", manifestRef(1, 2, 1))}),   // drop precommit
+        makeTxn(kNs, RefTxnId{1, 4}, {
+            removeCommittedOp("a", manifestRef(1, 1, 1)),             // evict stale committed...
+            addPrecommitOp("a", manifestRef(1, 9, 1)),                // ...then re-add under same name
+            promoteOp("a", manifestRef(1, 9, 1))}),                   // and promote the replacement
+        makeTxn(kNs, RefTxnId{1, 5}, {
+            removeCommittedOp("a", manifestRef(1, 9, 1)),             // drain the last owner...
+            removeNamespaceOp()}),                                     // ...then remove the namespace
+    };
+
+    RefTableState full_state;
+    for (const RefLogTxn & txn : tail)
+        applyRefLogTxn(full_state, txn);   // Full (default): two-phase scratch copy
+
+    const RefTableState replayed = replay(std::nullopt, tail);   // TrustedHistory in-place
+
+    expectStatesEqual(full_state, replayed);
+    EXPECT_EQ(encodeRefTableSnapshot(snapshotOf(full_state, kNs)),
+              encodeRefTableSnapshot(snapshotOf(replayed, kNs)));
+    EXPECT_EQ(replayed.getLifecycle(), RefLifecycle::Removed);
+    EXPECT_EQ(replayed.getRemoveTxnId(), std::make_optional(RefTxnId{1, 5}));
+}
+
+/// TrustedHistory in-place apply, THROW path: a tail whose LAST transaction is illegal makes `replay`
+/// throw `CORRUPTED_DATA`. The in-place apply poisons a state that is entirely internal to the failed
+/// `replay` call (it is never assigned to a caller on a throw), so an INDEPENDENT replay of just the
+/// valid prefix is completely unaffected -- pinning that the poison never escapes.
+TEST(CasRefStateMachine, E3TrustedHistoryPoisonOnBadTailIsInternal)
+{
+    const std::vector<RefLogTxn> good_prefix{
+        makeTxn(kNs, RefTxnId{1, 1}, {birthOp(), addPrecommitOp("a", manifestRef(1, 1, 1))}),
+        makeTxn(kNs, RefTxnId{1, 2}, {promoteOp("a", manifestRef(1, 1, 1))}),
+    };
+    std::vector<RefLogTxn> bad_tail = good_prefix;
+    /// A third txn whose op removes an absent precommit -- legal txn_id ordering, illegal effect, so it
+    /// throws mid-apply AFTER the good prefix has already been applied in place to the internal state.
+    bad_tail.push_back(makeTxn(kNs, RefTxnId{1, 3}, {removePrecommitOp("absent", manifestRef(9, 9, 9))}));
+
+    expectThrowsCode(DB::ErrorCodes::CORRUPTED_DATA, [&] { replay(std::nullopt, bad_tail); });
+
+    /// The failed replay's poisoned internal state never leaked: a fresh replay of the valid prefix is
+    /// byte-identical to one built entirely via Full, and reflects exactly the prefix.
+    const RefTableState from_prefix = replay(std::nullopt, good_prefix);
+    RefTableState full_prefix;
+    for (const RefLogTxn & txn : good_prefix)
+        applyRefLogTxn(full_prefix, txn);
+    expectStatesEqual(full_prefix, from_prefix);
+    EXPECT_TRUE(from_prefix.getCommitted().contains("a"));
+    EXPECT_EQ(from_prefix.getGreatestApplied(), (RefTxnId{1, 2}));
+}
+
+/// ===================================================================================
 /// admits(): dual-bound admission budget (spec §Snapshot Format)
 /// ===================================================================================
 

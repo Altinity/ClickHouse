@@ -139,13 +139,20 @@ struct RefLedgerConfig
     uint64_t ref_table_cache_bytes = 256ULL << 20;
 };
 
-/// How much admission re-checking a transaction application performs. `Full` is the writer's
-/// append-time contract. `TrustedHistory` is for replaying transactions that already passed
-/// `Full` validation when they were durably appended (recovery, GC fold, fsck, protection
-/// views): the O(N) cross-owner uniqueness scan is elided in release builds and kept as a
-/// `chassert` in debug/sanitizer builds (same policy as `debugAssertBodyCounters`). Every
-/// exact-binding precondition (cheap, keyed) is enforced in BOTH modes -- a corrupted log
-/// object still fails closed in either mode.
+/// How much admission re-checking a transaction application performs, AND -- coupled to it, see below
+/// -- how `applyRefLogTxn` behaves on a mid-transaction throw. `Full` is the writer's append-time
+/// contract. `TrustedHistory` is for replaying transactions that already passed `Full` validation when
+/// they were durably appended (recovery, GC fold, fsck, protection views): the O(N) cross-owner
+/// uniqueness scan is elided in release builds and kept as a `chassert` in debug/sanitizer builds
+/// (same policy as `debugAssertBodyCounters`). Every exact-binding precondition (cheap, keyed) is
+/// enforced in BOTH modes -- a corrupted log object still fails closed in either mode.
+///
+/// Abort behaviour (E3): the two modes also select `applyRefLogTxn`'s apply strategy, because the two
+/// concerns share one caller intent. `Full` applies two-phase against a scratch copy and leaves
+/// `state` byte-for-byte unchanged on any throw (the writer's live state must survive a rejected
+/// mutation). `TrustedHistory` applies IN PLACE with no copy and, on a throw, leaves `state` partially
+/// applied ("poisoned") -- sound only because its sole caller, `replay`, builds the state locally and
+/// discards it on any throw. Do not pass `TrustedHistory` for a state that must survive a rejection.
 enum class TxnValidation : uint8_t { Full, TrustedHistory };
 
 /// The in-memory table state: `TableState = Replay(S_X.state, tail(X))`. This class, `applyRefLogTxn`, `snapshotOf`, and
@@ -250,13 +257,22 @@ private:
 /// fields.
 RefTableState stateFromSnapshot(const RefTableSnapshot & snapshot);
 
-/// Applies the COMPLETE transaction to `state`, or throws `CORRUPTED_DATA` and leaves `state`
-/// byte-for-byte unchanged (each transition shape below has exactly one precondition enforced
-/// here). Two-phase: every op is validated and applied, in array order, against a scratch
-/// copy first; `state` is replaced by the scratch only once the whole transaction has succeeded, so
-/// no intra-transaction intermediate state (e.g. a manifest with its precommit already gone but its
-/// committed binding not yet installed) is ever observable to a caller -- matching the promote rule:
-/// "There is no moment at which the manifest has no owner."
+/// Applies the COMPLETE transaction to `state`, or throws `CORRUPTED_DATA` (each transition shape
+/// below has exactly one precondition enforced here). The two txn-wide preconditions
+/// (strictly-increasing `txn_id`, `remove_namespace` ordering) are checked before any mutation, so
+/// they never leave `state` half-applied under either strategy below.
+///
+/// Apply strategy is selected by `validation` (see `TxnValidation`):
+///  - `Full` (writer append-time + previews): two-phase against a scratch copy; every op is validated
+///    and applied, in array order, to the scratch first, and `state` is replaced by it only once the
+///    WHOLE transaction has succeeded. A throw anywhere leaves `state` byte-for-byte unchanged, and no
+///    intra-transaction intermediate state (e.g. a manifest with its precommit already gone but its
+///    committed binding not yet installed) is ever observable to a caller -- matching the promote
+///    rule: "There is no moment at which the manifest has no owner."
+///  - `TrustedHistory` (replay only): applies IN PLACE with no scratch copy (E3 -- eliminates the
+///    per-transaction deep-copy of the replay tail's unbounded COW overlays). A throw leaves `state`
+///    PARTIALLY APPLIED; this is sound only because `replay`, its sole caller, discards the state on
+///    any throw (its result reaches a caller only on full success). See `TxnValidation`'s doc.
 ///
 /// Enforced preconditions:
 ///  - `txn.txn_id` must be strictly greater than `state.greatest_applied`

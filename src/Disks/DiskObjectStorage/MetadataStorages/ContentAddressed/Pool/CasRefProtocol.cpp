@@ -315,16 +315,47 @@ void applyRefLogTxn(RefTableState & state, const RefLogTxn & txn, TxnValidation 
 
     checkRemoveNamespaceOrdering(txn.ops);
 
-    /// Two-phase: validate and apply every op, in order, against a scratch copy; `state` is replaced
-    /// only once the whole transaction succeeds, so a throw anywhere above leaves it untouched and no
-    /// intra-transaction intermediate state is ever observable.
-    RefTableState scratch = state;
-    for (const RefOp & op : txn.ops)
-        scratch.applyOp(op, txn.txn_id, validation);
+    if (validation == TxnValidation::TrustedHistory)
+    {
+        /// Trusted-history replay (E3): apply IN PLACE, with no scratch copy. `replay` -- the sole
+        /// `TrustedHistory` caller (grep-enforced) -- builds its `RefTableState` locally and returns it
+        /// only after its WHOLE tail has succeeded; any throw propagates out of `replay` and the
+        /// half-applied local state is destroyed during stack unwinding, so no consumer ever observes
+        /// it. That makes the two-phase scratch copy that guards the writer's live state (the `Full`
+        /// arm below) pure overhead here -- and a ruinous one: `replay` never materializes between tail
+        /// transactions, so the committed-map and owned-manifest COW overlays grow along the entire
+        /// tail and the old per-transaction `scratch = state` deep-copied BOTH, making a K-transaction
+        /// replay over an N-row base O(K*N) instead of O(K + N). Applying in place drops the
+        /// per-transaction cost to O(ops touched), independent of tail position.
+        ///
+        /// CONTRACT (do not weaken): a throw here leaves `state` PARTIALLY APPLIED ("poisoned"). This
+        /// is sound ONLY because every `TrustedHistory` caller discards the state on any throw. Never
+        /// pass `TrustedHistory` for a state that must survive a rejection intact -- that is the `Full`
+        /// arm's job, and why the writer's live-state install and every first-time-validation preview
+        /// in `CasRefLedger.cpp` keep the default `Full` (see the `applyRefLogTxn` header doc).
+        for (const RefOp & op : txn.ops)
+            state.applyOp(op, txn.txn_id, validation);
+        state.greatest_applied = txn.txn_id;
+    }
+    else
+    {
+        /// Full validation -- the writer's append-time contract and its trial/shape-check previews.
+        /// Two-phase: validate and apply every op, in order, against a scratch copy; `state` is
+        /// replaced only once the whole transaction succeeds, so a throw anywhere leaves it
+        /// byte-for-byte unchanged and no intra-transaction intermediate state is ever observable. This
+        /// copy is cheap on every `Full` caller: each applies against a materialized (empty-overlay)
+        /// live state or a small bounded-overlay batch scratch, never the unbounded replay tail the arm
+        /// above handles.
+        RefTableState scratch = state;
+        for (const RefOp & op : txn.ops)
+            scratch.applyOp(op, txn.txn_id, validation);
 
-    scratch.greatest_applied = txn.txn_id;
-    state = std::move(scratch);
+        scratch.greatest_applied = txn.txn_id;
+        state = std::move(scratch);
+    }
 #ifdef DEBUG_OR_SANITIZER_BUILD
+    /// Reached only on success (either arm), where `state` is fully applied and its incremental
+    /// body counters and owned-manifest index are consistent -- the invariant this cross-check defends.
     state.debugAssertBodyCounters();
 #endif
 }

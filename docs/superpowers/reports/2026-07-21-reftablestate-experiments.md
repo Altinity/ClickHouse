@@ -432,3 +432,143 @@ tests in `gtest_cas_protocol_scenarios.cpp` (`DISABLED_RevalidateAbsentTreeDepRe
 `DISABLED_AdoptTreeOfReclaimedTreeFailsClosedAtAdoptTime`), predating this task. E2's own death tests
 use `#if defined(DEBUG_OR_SANITIZER_BUILD)` gating (per the brief), not `DISABLED_`, so they don't
 compile into this release build at all rather than showing up as disabled.
+
+## E3 undo-journal / no-copy apply (t5) {#e3-undo-journal-t5}
+
+Decisive experiment for this round: recover the `BM_ReplayHistory` regression E2 introduced (and that
+E1 had already half-introduced), on the recovery/GC-fold replay path.
+
+### What shipped (not the undo journal)
+
+The task was scoped as "replace `applyRefLogTxn`'s scratch copy with an in-place apply + a bounded
+undo journal". The undo journal was **not** shipped. The brief explicitly invited the simpler variant
+it sketched -- "in `replay` the state is local and discarded on any throw, so a throw-away path needs
+NO rollback at all" -- and that variant is both simpler and strictly faster, so it is what shipped:
+
+- **`Full` (writer live-state + every trial/shape-check preview in `CasRefLedger.cpp`)**: keeps the
+  existing two-phase scratch copy verbatim -- "throw ⇒ state byte-for-byte unchanged". This copy was
+  never the regression: every `Full` caller applies against a **materialized** (empty-overlay) live
+  state or a small bounded-overlay batch scratch, so the copy is O(1) shared-base pointer bumps. E2's
+  `BM_ApplyRefLogTxn` (flat) already proved this.
+- **`TrustedHistory` (replay only, the sole caller)**: applies **in place, no copy**. On a throw the
+  state is left partially applied ("poisoned"); this is sound because `replay` builds its state
+  locally and its result reaches a caller only on full success -- any throw destroys the local state
+  during unwinding. This deletes the entire cost class that was regressing.
+
+No new type, no `RefStateUndo`, no reverse-order rollback, no `noexcept`-terminate-on-alloc-failure
+trade to document -- the design the brief flagged as the default. The whole change is one `if/else`
+inside `applyRefLogTxn` (`CasRefProtocol.cpp`) plus doc updates on `TxnValidation` and
+`applyRefLogTxn` (`CasRefProtocol.h`). `admits` was left untouched (see below).
+
+### Why the regression existed, and why in-place kills it
+
+`replay` never materializes between tail transactions (it is the pure state-machine equation;
+`stateFromSnapshot` loads every row through `emplace`, which only touches the overlay). So across a
+K-transaction tail the committed-map **and** the owned-manifest COW overlays grow monotonically, and
+the old per-transaction `RefTableState scratch = state` deep-copied **both** overlays every time --
+O(K·N). E2 added the second overlay, doubling that per-copy constant (E1: 36.7k ns/row → E2: 50.1k
+ns/row, worse than the pre-E1 48.9k baseline). Applying in place removes the per-transaction copy
+outright: each tail transaction now costs O(ops touched), independent of tail position.
+
+### Step 0 exclusivity audit (gate before any code)
+
+Every production call site of `admits` / `applyRefLogTxn` / `replay` runs either under the ledger's
+`state_mutex` or on a detached/local copy -- no concurrent reader can observe a state mid-mutation, so
+in-place apply is safe. (COW writes touch only the per-copy overlay, never the shared immutable base,
+so even a copy that shares a base with the live state is safe to mutate in place.)
+
+| Site | Target state | Protection | Verdict |
+|---|---|---|---|
+| `CasRefLedger.cpp:1138` `applyRefLogTxn(rt->state, wedged)` | LIVE `rt->state` | under `state_mutex` (l.1130) | exclusive |
+| `CasRefLedger.cpp:1243` `applyRefLogTxn(shape_check, …)` | local copy | stack-local | exclusive |
+| `CasRefLedger.cpp:1255` `admits(item_scratch, …)` | local copy | stack-local | exclusive |
+| `CasRefLedger.cpp:1265` `applyRefLogTxn(item_scratch, …)` | local copy | stack-local | exclusive |
+| `CasRefLedger.cpp:1377` `applyRefLogTxn(rt->state, final)` | LIVE `rt->state` | under `state_mutex` (l.1376) | exclusive |
+| `CasRefLedger.cpp:426` `replay(…)` (recovery) | fresh local; assigned to `rt.state` only on success | detached | exclusive |
+| `CasFsck.cpp:226` `replay(…)` (oracle) | fresh local | detached | exclusive |
+
+`TrustedHistory` is passed at exactly one place (`CasRefProtocol.cpp:369`, inside `replay`;
+grep-enforced). No `admits` call site is disqualifying either -- but `admits` was NOT changed to
+in-place, because it is not a regression source: its only production call (`item_scratch`, a
+detached local with a batch-bounded overlay) copies an O(batch) overlay, not an O(N) one. Making it
+in-place would be unmeasured complexity for no win, so per the round's default it was left as the
+scratch-copy preview.
+
+### Benchmark results (`build/bench_t5_e3.log`, `--benchmark_repetitions=3 --benchmark_report_aggregates_only=true`, medians; baseline = t4/E2)
+
+| Benchmark | N | t4/E2 (median) | t5/E3 (median) | Delta |
+|---|---|---|---|---|
+| `BM_ReplayHistory` | 100 | 7.43 ms | **0.431 ms** | **-94.2%** (17.2× faster) |
+| `BM_ReplayHistory` | 1,000 | 48.85 ms | **1.776 ms** | **-96.4%** (27.5×) |
+| `BM_ReplayHistory` | 10,000 | 473.76 ms | **15.92 ms** | **-96.6%** (29.8×) |
+| `BM_ReplayHistory` | 100,000 | 4.98 s | **0.172 s** | **-96.5%** (28.9×) |
+| `BM_ReplayHistory` complexity fit | — | 50,082 ns/row | **1,725.58 ns/row** | **-96.6%** |
+| `BM_ApplyRefLogTxn` | 100 | 752 ns | 778 ns | +3.5% |
+| `BM_ApplyRefLogTxn` | 1,000 | 772 ns | 788 ns | +2.1% |
+| `BM_ApplyRefLogTxn` | 10,000 | 792 ns | 797 ns | +0.6% |
+| `BM_ApplyRefLogTxn` | 100,000 | 858 ns | 822 ns | -4.2% |
+| `BM_Admits` | 100 | 983 ns | 996 ns | +1.3% |
+| `BM_Admits` | 1,000 | 1,010 ns | 1,014 ns | +0.4% |
+| `BM_Admits` | 10,000 | 1,016 ns | 1,029 ns | +1.3% |
+| `BM_Admits` | 100,000 | 1,088 ns | 1,057 ns | -2.8% |
+| `BM_AdmitsAddPrecommit` | 100 | 713 ns | 692 ns | -2.9% |
+| `BM_AdmitsAddPrecommit` | 1,000 | 716 ns | 708 ns | -1.1% |
+| `BM_AdmitsAddPrecommit` | 10,000 | 726 ns | 714 ns | -1.7% |
+| `BM_AdmitsAddPrecommit` | 100,000 | 720 ns | 701 ns | -2.6% |
+| `BM_ScratchCopy` | 100 | 60.0 ns | 58.0 ns | -3.3% |
+| `BM_ScratchCopy` | 1,000 | 60.1 ns | 59.2 ns | -1.5% |
+| `BM_ScratchCopy` | 10,000 | 59.0 ns | 56.7 ns | -3.9% |
+| `BM_ScratchCopy` | 100,000 | 59.6 ns | 59.1 ns | -0.8% |
+
+`BM_ReplayHistory` is recovered and crushed: 29× below the t4 regression, ~21× below t3's 36.7k
+success bar, and ~28× below the original pre-E1 48.9k baseline. The four benchmarks E3 does not touch
+(`BM_ApplyRefLogTxn` -- `Full`-mode scratch copy, unchanged code; `BM_Admits` / `BM_AdmitsAddPrecommit`
+-- `admits`, unchanged; `BM_ScratchCopy` -- the copy primitive itself) all stay within the ±10% noise
+band every prior round used. E2's O(1) `BM_AdmitsAddPrecommit` win is fully preserved.
+
+**On the residual O(N) fit.** `BM_ReplayHistory`'s `->Complexity()` still labels the curve O(N) (now
+1,725.58 ns/row). That residual N-term is **not** the per-transaction cost E3 targeted -- it is the
+one-time `stateFromSnapshot` load of the size-N base at the start of `replay` (which round-trips the
+whole snapshot through `encodeRefTableSnapshot`/`decodeRefTableSnapshot`, a separate cost E4's
+snapshot-encoding work owns). The thing this experiment attacked -- the per-tail-transaction cost --
+is now genuinely independent of N and tail position: the 256-transaction tail is O(1) per transaction,
+which is exactly why the constant collapsed 29×. At small N the tail dominates the wall time (N=100:
+~1.7 µs/tail-txn, flat in N); at large N the snapshot base-load dominates. Both are correct and expected.
+
+### Elegance self-assessment and verdict
+
+Recommendation: **KEEP**. This is a regression **recovery** (the round's decisive requirement), not a
+speculative optimization, and the win is ~29× on the affected benchmark -- an order of magnitude past
+the round's 2× keep-bar. On the elegance axis the shipped variant is the simplest option on the table:
+it adds zero new types and zero new machinery, is a single `if/else` in one function, and removes a
+cost rather than trading one complexity for another (the undo journal would have recovered the same
+regression but with a reversible-entry type, reverse-order rollback, and an alloc-failure-terminate
+caveat -- and would still allocate a journal per tail transaction, i.e. strictly more work than
+applying in place with nothing). The one real cost is a sharpened contract: `TrustedHistory` now also
+means "in-place, poison-on-throw", coupled onto the existing validation-mode enum. That coupling is
+documented loudly (enum doc + `applyRefLogTxn` doc + the in-place branch comment), grep-enforced to a
+single caller (`replay`), and pinned by a test that the poisoned internal state never escapes a failed
+`replay`. It is a genuine footgun-of-last-resort if a future author adds a `TrustedHistory` caller that
+keeps state after a throw -- called out here so the reviewer weighs it deliberately.
+
+### Tests
+
+Gate: **1,096 tests, 0 failures** (`build/test_gate_t5.log`) -- t4/E2's 1,091 plus 5 new E3 tests. The
+"2 DISABLED TESTS" footer is the same pre-existing pair E2 noted (`DISABLED_`-prefixed in
+`gtest_cas_protocol_scenarios.cpp`), unrelated to this task.
+
+New tests (`gtest_cas_ref_statemachine.cpp`):
+- `E3FullLaterOpThrowLeavesPopulatedStateByteIdentical` -- `Full` path, 3-op txn whose first two ops
+  touch committed+precommits+index+counters and whose third is illegal; live state byte-identical
+  after (getters + encoded-snapshot bytes). The populated / later-op-throw abort path.
+- `E3FullFirstOpThrowLeavesPopulatedStateByteIdentical` -- the symmetric empty / first-op-throw abort
+  path (nothing applied before the throw).
+- `E3AdmitsPreviewLeavesStateByteIdentical` -- `admits` leaves the state byte-identical for both the
+  accept and the reject verdict.
+- `E3TrustedHistoryInPlaceMatchesFullAcrossAllArms` -- the test only the in-place machinery can fail:
+  a tail exercising every `applyOp` arm (birth/add/promote/set_payload/remove-committed/remove-precommit/
+  replace/remove-namespace) replayed in place produces a state byte-identical (getters + encoded bytes)
+  to the same tail applied op-by-op through `Full`.
+- `E3TrustedHistoryPoisonOnBadTailIsInternal` -- a tail whose last txn is illegal makes `replay` throw
+  `CORRUPTED_DATA`; an independent replay of the valid prefix is unaffected, pinning that the in-place
+  poison never escapes the failed call.
