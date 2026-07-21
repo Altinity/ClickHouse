@@ -242,31 +242,59 @@ atomic single-CAS steal + `fence_seq` epoch isolation is safe regardless of timi
 
 ### `CaCasMountCore.tla` — mount ownership safety gate {#cacasmountcore}
 
-**Files:** `CaCasMountCore.tla`, `CaCasMountCore_stage1.cfg`, `CaCasMountCore_sab_epochreset.cfg`,
-`CaCasMountCore_sab_foreigntakeover.cfg`, `CaCasMountCore_sab_supersededwrites.cfg`,
-`CaCasMountCore_witness_reclaim.cfg`
+**Files:** `CaCasMountCore.tla`, `CaCasMountCore_stage1.cfg`, `CaCasMountCore_rev6_observe.cfg`,
+`CaCasMountCore_sab_adoptwedge.cfg`, `CaCasMountCore_sab_epochreset.cfg`,
+`CaCasMountCore_sab_fenceresurrect.cfg`, `CaCasMountCore_sab_foreigntakeover.cfg`,
+`CaCasMountCore_sab_wallclockreclaim.cfg`, `CaCasMountCore_witness_reclaim.cfg`,
+`CaCasMountCore_witness_observedreclaim.cfg`,
+`CaCasMountCore_witness_recoveryafterobservedreclaim.cfg`,
+`CaCasMountCore_witness_remountafterfence.cfg`
 
-**What it proves.** Five invariants over the sticky-owner / durable-monotone-epoch / TTL-lease
-three-object mount protocol: `NoTwoServerUuidsOwnSameServerRoot` (owner is sticky),
-`ForeignUuidNeverAutoTakesOver` (mount is never held by a non-owner), `WriterEpochMonotoneUnique`
-(no two actors share a written epoch; the durable counter is a monotone ceiling),
-`SupersededWriterMakesNoMutation` (a superseded actor makes no new mutations).
+**What it proves.** The sticky-owner / durable-monotone-epoch / TTL-lease mount protocol over a shared
+server-root, extended (2026-07-14) with the lease-boundary-exclusivity mechanism the shipped code
+uses: `NoTwoServerUuidsOwnSameServerRoot` (owner is sticky), `ForeignUuidNeverAutoTakesOver` (mount is
+never held by a non-owner), `WriterEpochMonotoneUnique` (the durable epoch counter is a monotone
+ceiling, never reset), `GlobalSupersededWriterMakesNoMutation` (a fenced/superseded actor makes no
+mutation — now a *knowledge* witness, not a per-write body-read guard), plus the observation-based
+reclaim safety of the exclusivity extension.
 
-| Config | Sabotage | Invariant | States | Result |
-|---|---|---|---|---|
-| `stage1` | none | all 5 | 6,085 | PASS |
-| `sab_foreigntakeover` | owner guard dropped on expired branch | `ForeignUuidNeverAutoTakesOver` | 933 (to CE) | VIOLATED |
-| `sab_epochreset` | epoch reset to 0 after allocation | `WriterEpochMonotoneUnique` | 653 (to CE) | VIOLATED |
-| `sab_supersededwrites` | lost-actor epoch/not-lost conjunct dropped | `SupersededWriterMakesNoMutation` | 681 (to CE) | VIOLATED |
-| `witness_reclaim` | none | `W_SameUuidReclaimsExpired` (reachability) | 811 | VIOLATED (expected — state reachable) |
+The exclusivity extension is the load-bearing current mechanism: reclaiming an expired mount is
+**observation-based** — the reclaimer must observe a *stable holder token* over a full `TTL + Drift`
+window measured on its **own** monotonic clock (never trusting the wall-clock timestamp in the foreign
+mount body), and the reclaim installs the **successor's own body**. This matches the shipped
+`claimMountAwaitingExpiry` (`CasServerRoot.cpp:395-470`, threshold `ttl + ttl/20 + cadence` on
+`mono_ms_fn` only) and the same-uuid/different-epoch reclaim that installs `makeMountBody(our_uuid,
+our_epoch, …)` (`CasServerRoot.cpp:331-332`). The durable epoch is a separate CAS-bumped
+`ServerEpoch` object that fails closed rather than reset (`allocateWriterEpoch`,
+`CasServerRoot.cpp:151-195`). The per-write path is a **pure local** check
+(`CasMountRuntime::mayMutate` = `!lost ∧ now < deadline`, `CasMountRuntime.cpp:62-66`) — the old
+per-write epoch/body-read guard was correctly removed.
+
+| Config | Kind | Invariant / witness | Result |
+|---|---|---|---|
+| `stage1` | positive | sticky-owner / epoch-monotone / superseded-no-mutation | PASS |
+| `rev6_observe` | positive (main green gate) | observation-based reclaim safety | PASS |
+| `sab_foreigntakeover` | sabotage | `ForeignUuidNeverAutoTakesOver` | VIOLATED |
+| `sab_epochreset` | sabotage | `WriterEpochMonotoneUnique` | VIOLATED |
+| `sab_wallclockreclaim` | sabotage — reclaim trusts the foreign wall-clock timestamp | reclaim-exclusivity safety | VIOLATED |
+| `sab_adoptwedge` | sabotage | reclaim/adopt exclusivity | VIOLATED |
+| `sab_fenceresurrect` | sabotage | fence-out exclusivity | VIOLATED |
+| `witness_reclaim`, `witness_observedreclaim`, `witness_recoveryafterobservedreclaim`, `witness_remountafterfence` | reachability | the reclaim/fence-recovery states are reachable | VIOLATED (expected) |
 
 **Design decisions driven by this model:**
-- An expired-mount reclaim branch must still check `owner = uuid` — dropping it lets a foreign actor
-  install a mount on another server's root object.
+- An expired-mount reclaim branch must still check `owner = uuid`, and must wait out `TTL + Drift` on
+  the reclaimer's **own** clock observing a stable token — never trust the foreign body's wall-clock
+  timestamp (`sab_wallclockreclaim` is the permanent negative control for that mistake).
+- The reclaim installs the successor's own body, not a copy of the foreign one.
 - The epoch object must never be reset; the durable counter is a strict monotone ceiling.
-- A `localLost` actor is blocked from all mutations by the epoch/not-lost conjunct.
+- The per-write guard is a pure-local liveness check; a superseded actor is blocked by latching
+  `lost` (knowledge), not by a per-write shared-state read.
 
-**Code currency:** CURRENT.
+**Code currency:** CURRENT (model faithful; audited 2026-07-22). Note: the earlier
+`sab_supersededwrites` config and the `SupersededWriterMakesNoMutation` per-write invariant were
+retired when the per-write body-read guard was removed; the exclusivity extension (observation-based
+reclaim, `Drift`, `sab_wallclockreclaim`, the `witness_observedreclaim*` / `witness_remountafterfence`
+reachability checks) is the current mechanism above.
 
 ---
 
@@ -760,7 +788,7 @@ counterexamples found during EBR model development encoded the four load-bearing
 | `CaIncarnationProofCore.tla` | GC core (Apalache) | **REMOVED 2026-07-22** (stale pre-B91; unverifiable — no Apalache) | `IndInv` (19 conjuncts) inductive at fixed bounds | 5 negative controls | `W-REVALIDATE` is load-bearing (F1 machine-checked); `InflightCurrentUnreferenced` is irredundant |
 | `CaBuildRootPrecommit.tla` | Precommit/B140/B199-S2 | **CURRENT** | `INV_NO_DANGLE_COMMITTED`, `INV_BUILDROOT_PROTECTS`, `INV_COMMIT_FAILCLOSED`, `INV_NO_LEAK` | 2 + 1 liveness | build-root + fail-closed commit jointly necessary; inline closure at precommit time |
 | `CaGcLeaseCore.tla` | Lease/B160 | **CURRENT** | `NoEpochCollision`, `NoFalseSteal` | 1 | advisory heartbeat eliminates false steals; safety independent of heartbeat |
-| `CaCasMountCore.tla` | Mount | **CURRENT** | `NoTwoServerUuids…`, `ForeignUuid…`, `WriterEpochMonotoneUnique`, `SupersededWriter…` | 3 | sticky owner, monotone epoch, lost-actor write block |
+| `CaCasMountCore.tla` | Mount | **CURRENT** (rev.6 observation-reclaim; audited 2026-07-22) | `NoTwoServerUuids…`, `ForeignUuid…`, `WriterEpochMonotoneUnique`, `GlobalSupersededWriter…` | 5 (incl. `sab_wallclockreclaim`) | sticky owner, monotone epoch, observation-based reclaim on own clock (not foreign wall clock), pure-local per-write guard |
 | `CaB140DangleMerge.tla` | B140 fix proof | **CURRENT** (history record) | `INV_NO_LOSS` | 2×2 matrix | trim-gate + cursor-in-snap jointly necessary |
 | `CaB140DangleFaithful.tla` | B140 history | **REMOVED 2026-07-22** (dead-mechanism refutation) | `INV_NO_LOSS` | — | Phase-1 mechanism clean with faithful producers |
 | `CaB140Dangle.tla` | B140 history | **REMOVED 2026-07-21** (unfaithful producers) | — | — | Phase-1 investigation record |
