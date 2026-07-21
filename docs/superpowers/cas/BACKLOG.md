@@ -491,3 +491,83 @@ and `tmp/consult-gpt56sol-answer.md`.
   overlay, a path `BM_FlushInstall` does not model; measure wedge-resolution-followed-by-flush
   before changing anything (naive post-durable materialize would add an allocation failure mode
   between apply and unwedge).
+
+## Disk-error (ENOSPC / inode-exhaustion) audit follow-ups (8-agent sweep + controller verification, 2026-07-21) {#disk-error-audit-followups-2026-07-21}
+
+Findings of the staging/target/GC disk-error audit (staging `cas_scratch`, Native S3 target,
+`EmulatedSingleProcess` local target, GC round, read path). Overall verdict held: staging ENOSPC is
+fail-loud with no pool side effects; Native S3 stays corruption-free (atomic PUTs, fail-safe error
+classification in `finalizeConditionalWrite`, bounded `CasRequestControl` retries, fail-closed
+fencing); GC is decision-durable-before-delete with `suppress_destructive` on every corruption-
+tolerant fold branch. The items below are the residual gaps, ordered by value.
+
+- [ ] **HARD: size guard at dedup-admit** — `PartWriteTxn::observeAndAdmit` (4-arg overload,
+  `CasPartWriteTxn.cpp:276-288`) checks only `hr.size >= blob_header_len`; it never compares
+  `hr.size - header_len` against the caller's expected `source.size`, and `putBlob`'s dedup-hit
+  result is discarded by the transaction (`ContentAddressedTransaction.cpp:281`). A truncated
+  object sitting at a content-addressed key (possible on the emulated/local backend, see next item)
+  is admitted as a dedup hit and produces a durably unreadable part. One cheap comparison closes
+  the whole truncation-admit class on every backend (the HEAD-first path, the post-412 revive
+  observe, and the 3-arg gate path all funnel through this overload).
+- [ ] **HARD: temp-file + rename in the local blob write path** — `emuWrite`
+  (`CasObjectStorageBackend.cpp:546-557`) streams through
+  `LocalObjectStorage::writeObject`, which opens a plain `WriteBufferFromFile` directly on the
+  final key with `O_TRUNC` (`LocalObjectStorage.cpp:250-277`). ENOSPC or a kill mid-write leaves a
+  partial file at the final content-addressed key; the next `putIfAbsent` sees `emuExists == true`
+  and returns `PreconditionFailed` = "already present" (`:776-780`), so the writer dedups against
+  the truncated body. Presence-only admission + non-atomic local write is the ONLY corruption
+  window the audit found. Native/S3 mode is not affected (`If-None-Match` + atomic completion).
+  Fix: write to a sibling temp name and `rename` into place (or fix it inside
+  `LocalObjectStorage`), paired with the size guard above as defense-in-depth.
+- [ ] **DESIRABLE: fsck physical-size check for blob bodies** — `runFsck` HEADs every blob but
+  never compares the physical size against `blob_header_len + entry.blob_size`, so a truncated
+  blob passes as `Reachable` (`CasFsck.cpp:371-414`). The listing already carries the sizes — the
+  check adds zero extra requests. Payload re-hash against the content address stays a separate,
+  opt-in deep mode (today NOTHING re-hashes on read by design — blob-body integrity is delegated
+  entirely to MergeTree `checksums.txt` / compressed-block checksums / `CHECK TABLE`).
+- [ ] **DESIRABLE: free-space guard + orphan sweeper for `scratch_path`** — the local staging write
+  path has no `IDisk::reserve`, no `statvfs` check, and MergeTree reservations cannot see the
+  scratch filesystem (the CA disk is object-backed, the scratch dir lives on the server data
+  path). Peak scratch usage = whole-part size × concurrent part writes (all pending blobs of a
+  part are held until `commit`). Also: orphaned `<rand>.tmp` files survive an unclean restart
+  forever — disk init only does `fs::create_directories`
+  (`MetadataStorageFactory.cpp:238`); the S3 staging prefix has `sweepOwnMountStaging`, the local
+  scratch dir has no sweeper at all. Minimum: document the sizing rule; better: a pre-write
+  free-space check plus a startup sweep of stale `*.tmp`.
+- [ ] **MINOR: wrap the GC post-CAS cleanup in try/catch** — the post-CAS owner-removed
+  manifest-body `deleteExact` loop (`CasGc.cpp:691`) and the hand-off `deletePrefixWholesale`
+  (`:677`) are not wrapped; a genuine backend error (5xx / storage-full) there escapes
+  `runRegularRound` AFTER the round's `gc/state` CAS committed. Data-safe (decision durable;
+  leaked bodies reclaimed by the orphan-manifest sweep) but it skips the rest of that round's
+  post-CAS cleanup and reddens the round. The orphan sweep itself is already wrapped
+  (`:728-735`) — extend the same containment to its two siblings.
+- [ ] **DESIRABLE: GC scheduler backoff + a distinct storage-full signal** — the pacing loop
+  retries a failing round at a fixed interval forever with no backoff, no failure counter, no
+  circuit breaker (`CasGcScheduler.cpp:255-261`); the only operator surface is
+  `last_success_age_seconds` in `system.content_addressed_mounts`. And no ProfileEvent
+  distinguishes "target storage full" (S3 507 / `XMinioStorageFull` / local ENOSPC) from generic
+  instability — both look like `CasConditionalWriteUnresolved` + rising staleness. Add
+  capped-exponential backoff on consecutive failed rounds, an alert-friendly health surface, and
+  a dedicated storage-full counter. Note the recovery asymmetry worth a runbook line: on a 100%
+  full target a round whose fold must write runs/seals dies BEFORE the pre-CAS delete phase, so
+  GC may need externally-freed headroom before it can reclaim anything.
+- [ ] **VERIFY: late-landing conditional PUT after fence loss** — a fenced mount never REPORTS
+  success (`CasRequestControl.cpp:330-334` post-write fence check), but the physical PUT may have
+  landed before the fence latched. Confirm the successor-side `writer_epoch` gating in
+  `CasRefProtocol`/`CasRefLedger` rejects such a late ref-log object. This is the same hazard
+  class as §1 "[Late Predecessor PUT]" and should be closed by rev.6 lease-boundary exclusivity —
+  this audit re-flagged it from the backend side; fold the confirmation into the rev.6 work rather
+  than tracking it separately.
+- [ ] **MINOR: destructor-`abandon` live-epoch precommit debris** — if `abandon` fails while a
+  failed transaction is being destroyed (e.g. the same backend outage that failed the commit), the
+  LIVE-epoch precommit binding persists and is reclaimed only on REMOUNT — neither GC nor the
+  (prior-epoch) stale-precommit sweep takes it (`ContentAddressedTransaction.cpp:117-123`, logged
+  loudly). Bounded, but under a persistently broken backend it accumulates; consider a
+  same-epoch periodic re-`abandon` retry or folding these into the mount-lease sweeper.
+- [ ] **DOC: runbook notes from the audit** — (a) `CHECK TABLE` is the ONLY detector of silent
+  same-length blob-body corruption (the CA layer never re-hashes payloads and never parses the
+  envelope header on reads — sole `decodeEnvelopeHeader` caller is `CasInspect.cpp:491`); (b) a
+  truncated blob surfaces as a premature-EOF read error via MergeTree size/checksum validation,
+  not as a CAS-layer exception (`ReadBufferFromFileView.cpp:78-102` signals early EOF, no
+  `physical size >= offset + length` check exists); (c) persistent target-full ends in a fenced
+  mount + bounded-failing INSERTs — reads stay unaffected.
