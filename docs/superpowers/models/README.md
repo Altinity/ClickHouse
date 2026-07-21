@@ -59,7 +59,6 @@ Status legend:
 | `CaGcRoundDeferCore.tla` | GC round may skip an unchanged snapshot only if no destructive decision is due; deferral bounded | CURRENT | (inline TLC) |
 | `CaGcCondemnMarkerGate.tla` | graduation gated on confirmed durable condemn marker | CURRENT | `run_condemnmarker.sh` |
 | `CaEdgeBeforeObserve.tla` | with edge-before-observe write order, promote-time revalidation of tokened leaves is redundant | CURRENT | `run_ebo.sh` |
-| `CaMetaDescriptor.tla` | per-hash freshness meta: create bottom-up, delete top-down | CURRENT (predates the final two-state codec trim) | `run_meta.sh` |
 | `CaRetiredInRun.tla` | retired list folded into the snapshot run (two-cursor merge, coverage coherence) | CURRENT | `run_retiredinrun.sh` |
 | `CaRetiredInRunFoldAbortWitness.tla` | GC freshness meta is add-only: a spare never clears a condemned marker | CURRENT | `run_foldabort_witness.sh` |
 | `CaRefTableSnapshotLogCore.tla` | ref-table snapshot + append-only log protocol; coverage-at-birth mount seal | CURRENT | `run_refsnaplog.sh` |
@@ -147,15 +146,6 @@ Status legend:
   removed from the code. The dedup-adoption check, the presence HEAD for tokenless leaves, the
   condemned check on tokenless adoption, and the order itself each remain load-bearing — dropping
   any one of them dangles.
-- **`CaMetaDescriptor.tla`** — the per-hash freshness-meta design that shipped: a small marker
-  object per content hash records whether the blob is clean or condemned (with the condemn round),
-  while the body keeps an in-body incarnation tag and deletes stay exact-token. The model proves
-  the pairing discipline: create bottom-up (body first, then meta, conditional create), delete
-  top-down (meta at the captured etag first, then body at the condemn-time token), resurrect as
-  two explicit steps; 7 sabotages cover each wrong ordering, blind adoption over a condemned
-  marker, and deleting the body at whatever token it currently holds. The model predates one final
-  simplification of the marker codec (a trim to two states) and has not been re-run against it.
-
 ### Retired-in-run family {#group-retired-in-run}
 
 The separate durable retired list was folded into the snapshot run itself: condemned state rides
@@ -262,4 +252,5 @@ history:
 | `CaGcResurrectReuploadOrphan.tla` | reproduced a real leak (a condemned blob replaced by a resurrect re-upload was never re-condemned, because the fold keyed the decision on hash alone and only revisits blobs touched in the current window) and proved the fix: settle the stale entry AND re-condemn the current token. The fix landed in `closeBlob` (`CasBlobInDegree.cpp`) and is pinned by the deterministic `CasGcLeak.ResurrectReplaced*` unit tests; at 194 distinct states the model explored essentially that one scenario, adding nothing beyond the tests |
 | `CaIncarnationProofCore.tla` (+ `Apalache.tla`, `run_apalache.sh`) | an Apalache-checked inductive invariant for the single-leader, token-only fragment of the GC core; stale (predated the namespace-registry and evidence-staleness amendments — those are covered by `CaIncarnationCore.tla`) AND unverifiable here (no Apalache binary installed). A stale inductive proof of a superseded fragment that cannot be re-checked is false comfort; to revive it, install Apalache and re-derive the invariant against the current `CaIncarnationCore.tla` |
 | `CaGcIndegRefoldCore.tla` | proved the completion-seal cursor must advance past what recheck already folded, to stop a **non-idempotent integer** in-degree stream going negative. The shipped fold (`CasBlobInDegree.cpp:380-389`) computes in-degree by an **idempotent** two-cursor presence-set merge (a `uint64_t` surviving-edge count that cannot underflow), so the integer-underflow hazard is structurally impossible and the model describes a design the code abandoned — retired like the EBR `CaGcCore.tla` |
+| `CaMetaDescriptor.tla` (+ `run_meta.sh`) | Gate B v1 per-hash freshness meta. Its headline invariant `INV-META-BODY` (meta ⇒ body, meta as the lifecycle linearizer, meta-first delete) is contradicted by the shipped code: `CasBlobMetaFormat.h` states the marker is "only a point-read hint, not the linearization point … reads never consult the meta"; GC deletes the body first and drops the meta advisorily, absent ≡ Clean (no tombstone), so a Condemned meta legitimately outlives its deleted body — a state the model forbids. Keeping a model whose headline invariant is false in the code is false comfort. The meta's real role is gated by `CaEdgeBeforeObserve` (K1 adopt-gate) + `CaGcCondemnMarkerGate`. (Also had a config defect: its 8 cfgs omit `CHECK_DEADLOCK FALSE`, so five of seven sabotages silently reported a spurious deadlock instead of the intended violation — verified by re-running with deadlock checking off.) |
 | `CaIncarnationCore.pdf`, `CaIncarnationCore.toolbox/` | generated TLA+ Toolbox pretty-print artifacts (regenerable from the module) |

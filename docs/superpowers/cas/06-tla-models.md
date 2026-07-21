@@ -775,7 +775,7 @@ counterexamples found during EBR model development encoded the four load-bearing
 | `CaGcCore.tla` | EBR GC core | **REMOVED 2026-07-21** (superseded) | `INV_NO_LOSS`, `INV_NO_DANGLE`, `INV_NO_ABA` | 4 CEs during dev | EBR design record; replaced by incarnation-token |
 | `CaGcRoundDeferCore.tla` | GC round DEFER/skip-unchanged | **CURRENT** | `NoOverDelete`, `NoDangle`; `EventuallyFolded` | 2 | a due graduation force-folds first (no destructive decision on a not-fully-folded snapshot); deferral bounded (`deferCount < MaxDefer`) |
 | `CaEdgeBeforeObserve.tla` | Writer/GC simplification Gate A | **CURRENT** | `NoOverDelete`-shaped safety (implicit) | 4 | with EDGE-BEFORE-OBSERVE + same-pass decided-delete, promote-time revalidation of TOKENED leaves is redundant; K1/K3Head/K3AdoptCheck + the order itself stay load-bearing |
-| `CaMetaDescriptor.tla` | Writer/GC simplification Gate B (meta descriptor, v1) | **CURRENT** (predates the v3 2-state trim) | `INV-META-BODY` | 7 | create bottom-up (body, then meta); delete top-down (meta at captured etag, then body at condemn-time token) |
+| `CaMetaDescriptor.tla` | Writer/GC simplification Gate B (meta descriptor, v1) | **REMOVED 2026-07-22** (`INV-META-BODY` linearizer framing false vs shipped advisory meta) | `INV-META-BODY` | 7 | create bottom-up (body, then meta); delete top-down (meta at captured etag, then body at condemn-time token) |
 | `CaMetaDescriptorRaw.tla` | Gate B raw-body / terminal-tombstone | **REMOVED 2026-07-21** (rejected by v3) | `INV_NO_LOSS`, `INV_NO_DANGLE`, `INV_META_BODY` | 5 | raw immutable bodies force a terminal tombstone + writer-waits-on-GC coupling; rejected in favor of keeping the in-body incarnation tag |
 | `CaMetaIncarnationKey.tla` | Gate B Option B (per-incarnation body keys) | **REMOVED 2026-07-21** (rejected) | `INV_NO_DANGLE` (implicit) | 1 | removes the tombstone/wait but reintroduces the already-rejected generation-in-key design (404→LIST, manifest carries incarnation) |
 | `CaManifestSweepWindow.tla` | Orphan-sweep vs removal-fold wedge | **REMOVED 2026-07-22** (gtest covers) | `INV_FOLD_PROGRESS` | 1 | the orphan sweep must skip a committed body with a pending (unsealed) removal — the removal-fold still needs the body to emit its decrement |
@@ -972,10 +972,34 @@ dangle: `sab_late_edge` (adoption allowed before the durable closure — the pre
 `CaMetaDescriptor_sab_a_meta_first.cfg`, `CaMetaDescriptor_sab_b_body_first.cfg`,
 `CaMetaDescriptor_sab_c_blind_adopt.cfg`, `CaMetaDescriptor_sab_d_uncond_body.cfg`,
 `CaMetaDescriptor_sab_e_no_claim_sweep.cfg`, `CaMetaDescriptor_sab_f_birth_adopt.cfg`,
-`CaMetaDescriptor_sab_g_fresh_head.cfg` (Gate B of `2026-07-09-cas-writer-gc-simplification-design.md`,
-Phase B — the first Gate B attempt, envelope-bodies kept, a per-hash meta `{gen, inc, condemned}`).
+`CaMetaDescriptor_sab_g_fresh_head.cfg`, `run_meta.sh` — **removed 2026-07-22** (its central invariant
+is contradicted by the shipped code; full text in git history).
 
-**What it proves.** `INV-META-BODY` (meta present ⇒ body present) across create-bottom-up
+> **Removed — the shipped meta is an advisory freshness hint, not the lifecycle linearizer this
+> model assumes.** The model's headline invariant `INV-META-BODY` (meta present ⇒ body present, with
+> the meta as *the* linearization point and delete-top-down = meta-first) is directly contradicted
+> by the code: `Formats/CasBlobMetaFormat.h` states the marker "is only a point-read hint, **not the
+> linearization point** for blob lifetime … reads of the blob never consult the meta," the body's
+> in-body `incarnation_tag` + exact-token delete is the real linearizer, GC deletes the **body
+> first** (`CasGc.cpp:419`) and drops the meta only advisorily afterwards, and absent reads
+> identically to `Clean` (no tombstone). So a `Condemned` meta legitimately outlives its deleted
+> body — a state the model forbids. Keeping a model whose headline invariant holds in the model but
+> is false in the code is misleading (false comfort). The meta's real behavior is already gated by
+> CURRENT models: the writer adopt-gate point-read (`Condemned` ⇒ re-upload) by `CaEdgeBeforeObserve`
+> (K1), and the GC condemn-marker graduation gate by `CaGcCondemnMarkerGate`; the settled v3
+> freshness argument is discharged in the design against `CaIncarnationCore`. Not a CODE-RISK — the
+> meta is advisory and never authority for deletion. Also removed alongside the two earlier-rejected
+> meta variants (`CaMetaDescriptorRaw`, `CaMetaIncarnationKey`) and the false-green
+> `CaMetaAbsenceClean`.
+>
+> (The model additionally had a config defect the audit surfaced: its eight `.cfg` files omit
+> `CHECK_DEADLOCK FALSE`, so a spurious terminal-state deadlock in a shallow BFS branch halted TLC
+> before the sabotage counterexample was reached — five of the seven negative controls silently
+> reported a deadlock instead of the intended violation. Confirmed by re-running with deadlock
+> checking off: `reduced` GREEN, all seven sabotages VIOLATE. Moot now that the model is removed,
+> but recorded because the same omission should be checked in any surviving small model.)
+
+**What it proved.** `INV-META-BODY` (meta present ⇒ body present) across create-bottom-up
 (body then meta, If-None-Match) / delete-top-down (meta at the captured etag, then body at the
 condemn-time token) discipline, with a resurrect modeled as two steps (meta CAS, then body re-upload)
 and a no-claim sweep sabotage modeled as two steps (observe, then blind delete) so the crash/race
@@ -984,13 +1008,11 @@ condemned, unconditional body delete after losing the meta-delete CAS, no-claim 
 completion adopting the orphan body instead of resurrect-from-source, GC deleting the body at whatever
 token it currently holds instead of the condemn-time token) all dangle as required.
 
-**Code currency:** CURRENT as the first Gate B model (predates the v3 2-state trim: this model's meta
-carries a 3-field `{gen, inc, condemned}` register, not yet the final 2-state `{clean, condemned}` +
-`condemn_round` codec of `docs/superpowers/plans/2026-07-10-cas-freshness-meta-v3.md` Task 1). Its
-create-bottom-up/delete-top-down and meta⟺body pairing results are the closest existing formal evidence
-to the settled v3 layout (one key per hash, meta as freshness marker); it has not been re-run against
-the v3 Task 1 codec change. The v3 plan's own Task 0 discharges the meta-freshness obligation with a
-written argument (citing `CaIncarnationCore`), not a re-derivation of this model.
+**Code currency:** REMOVED 2026-07-22 — the shipped meta is advisory (absent ≡ `Clean`, body-first
+delete, never the linearization point), so the model's `INV-META-BODY` linearizer framing is false
+against the code (see the note above). Its create-bottom-up and exact-token-body-delete results did
+match code, but the advisory-meta behavior is covered by `CaEdgeBeforeObserve` (K1) +
+`CaGcCondemnMarkerGate`.
 
 ---
 
