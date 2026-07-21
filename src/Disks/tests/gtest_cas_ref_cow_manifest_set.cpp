@@ -140,6 +140,67 @@ TEST(CasRefCowManifestSet, TombstoneThenReinsertAcrossMaterializedBase)
 }
 
 /// ===================================================================================
+/// materialize() fast path: fold into a uniquely-owned base IN PLACE, no O(N) copy (E5).
+/// ===================================================================================
+
+TEST(CasRefCowManifestSet, MaterializeReusesBaseWhenUniquelyOwned)
+{
+    RefCowManifestSet s;
+    s.insert(mref(1, 1, 1));
+    s.materialize();                    /// mref(1,1,1) now in base; base is uniquely owned
+    const void * base_before = s.baseIdentityForTest();
+    ASSERT_EQ(s.baseUseCountForTest(), 1);
+
+    s.insert(mref(2, 2, 2));            /// pure-overlay addition
+    s.erase(mref(1, 1, 1));            /// tombstone a base member
+    s.materialize();
+
+    EXPECT_EQ(s.baseIdentityForTest(), base_before);   /// folded in place: same base allocation
+    EXPECT_EQ(s.overlayEntriesForTest(), 0u);
+    EXPECT_FALSE(s.contains(mref(1, 1, 1)));            /// tombstone erased from base
+    EXPECT_TRUE(s.contains(mref(2, 2, 2)));
+    EXPECT_EQ(s.size(), 1u);                            /// net_delta reset, size still exact
+}
+
+TEST(CasRefCowManifestSet, MaterializeBuildsFreshBaseWhenBaseIsShared)
+{
+    RefCowManifestSet original;
+    original.insert(mref(1, 1, 1));
+    original.materialize();
+    const void * shared_base = original.baseIdentityForTest();
+
+    RefCowManifestSet writer = original;   /// shares the base (use_count 2)
+    ASSERT_EQ(writer.baseUseCountForTest(), 2);
+    writer.insert(mref(9, 9, 9));
+    writer.erase(mref(1, 1, 1));
+    writer.materialize();                  /// base is shared -> must build a fresh one, mutate nothing shared
+
+    /// Load-bearing correctness pin: the OTHER holder's view is byte-unchanged.
+    EXPECT_EQ(original.baseIdentityForTest(), shared_base);
+    EXPECT_TRUE(original.contains(mref(1, 1, 1)));
+    EXPECT_FALSE(original.contains(mref(9, 9, 9)));
+    EXPECT_EQ(original.size(), 1u);
+
+    /// The writer folded its overlay into a fresh base of its own.
+    EXPECT_NE(writer.baseIdentityForTest(), shared_base);
+    EXPECT_FALSE(writer.contains(mref(1, 1, 1)));
+    EXPECT_TRUE(writer.contains(mref(9, 9, 9)));
+    EXPECT_EQ(writer.size(), 1u);
+}
+
+TEST(CasRefCowManifestSet, MaterializeEmptyOverlayIsANoOpEvenWhenUniquelyOwned)
+{
+    RefCowManifestSet s;
+    s.insert(mref(1, 1, 1));
+    s.materialize();
+    ASSERT_EQ(s.baseUseCountForTest(), 1);
+    const void * base_before = s.baseIdentityForTest();
+    s.materialize();   /// overlay already empty: no fold, no reallocation
+    EXPECT_EQ(s.baseIdentityForTest(), base_before);
+    EXPECT_TRUE(s.contains(mref(1, 1, 1)));
+}
+
+/// ===================================================================================
 /// Copy-on-write isolation + O(1)-copy assertion.
 /// ===================================================================================
 

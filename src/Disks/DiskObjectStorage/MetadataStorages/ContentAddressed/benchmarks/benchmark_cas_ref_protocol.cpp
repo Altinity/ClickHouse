@@ -350,6 +350,58 @@ static void BM_FlushInstall(benchmark::State & state)
 }
 BENCHMARK(BM_FlushInstall)->RangeMultiplier(10)->Range(100, 100000)->Complexity();
 
+/// Same flush-install as `BM_FlushInstall`, but exercising the E5 uniquely-owned-base fast path that
+/// production actually hits. `BM_FlushInstall` copies a shared fixture (`working = table`), so at
+/// `materializeCommitted()` the base still has `use_count() == 2` and the fold must build a fresh
+/// base -- O(N). Production's live table has NO outstanding scratch copy at the install point (the
+/// trial copies are dropped before the commit critical section), so its base is uniquely owned and
+/// the fold happens in place -- O(overlay). This variant models that by rebuilding a private,
+/// materialized state each iteration (its base `use_count()` is 1), timing only the apply + in-place
+/// materialize. The per-iteration rebuild AND the prior iteration's O(N) teardown are excluded from
+/// the measurement by hoisting `working` out of the loop and rebuilding it via move-assignment under
+/// Pause/ResumeTiming (the reassignment both destroys the previous grown state and installs a fresh
+/// materialized one, all untimed). The residual per-iteration Pause/Resume overhead is a constant
+/// floor, so the signal to read is FLATNESS across N (O(overlay)), not the absolute small-N number.
+static void BM_FlushInstallUniqueOwner(benchmark::State & state)
+{
+    const size_t n = static_cast<size_t>(state.range(0));
+
+    RefLogTxn txn;
+    txn.ns = "roots/bench";
+    txn.txn_id = RefTxnId{1, 2};
+    RefOp add;
+    add.kind = RefOpKind::OwnerTransition;
+    add.new_binding = RefOwnerBinding{RefOwnerKind::Precommit, "flush_install_new_part", ManifestRef{4, 1, 1}};
+    txn.ops.push_back(add);
+    RefOp promote;
+    promote.kind = RefOpKind::OwnerTransition;
+    promote.old_binding = RefOwnerBinding{RefOwnerKind::Precommit, "flush_install_new_part", ManifestRef{4, 1, 1}};
+    promote.new_binding = RefOwnerBinding{RefOwnerKind::Committed, "flush_install_new_part", ManifestRef{4, 1, 1}};
+    txn.ops.push_back(promote);
+
+    /// Hoisted out of the loop so the O(N) teardown of the previous iteration's grown state is folded
+    /// into the untimed move-assignment below, not charged to the timed apply + materialize region.
+    RefTableState working;
+    for (auto _ : state)
+    {
+        state.PauseTiming();
+        working = makeSyntheticState(n);   // private, materialized: base use_count() == 1
+        state.ResumeTiming();
+
+        applyRefLogTxn(working, txn);      // O(ops): bounded overlay
+        working.materializeCommitted();    // O(overlay): uniquely-owned base folded IN PLACE (the E5 win)
+        benchmark::DoNotOptimize(&working);
+    }
+
+    state.SetComplexityN(static_cast<int64_t>(n));
+}
+/// Fixed iteration count: the E5 fast path makes the timed apply + in-place-materialize region tiny
+/// and N-independent, so google-benchmark's default min-time targeting would demand millions of
+/// iterations at every N -- each paying an untimed O(N) `makeSyntheticState` rebuild, which explodes
+/// at large N. A fixed, modest count keeps every point cheap while still averaging enough samples to
+/// read the flatness across N (the whole point of this variant).
+BENCHMARK(BM_FlushInstallUniqueOwner)->RangeMultiplier(10)->Range(100, 100000)->Iterations(500)->Complexity();
+
 /// The fold/recovery profile: K transactions replayed over a size-N snapshot. Each txn creates
 /// and promotes one new ref (two ops), so each add pays today's `manifestAlreadyOwned` scan.
 /// K fixed at 256; complexity fit is over N.

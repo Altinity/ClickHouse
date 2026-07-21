@@ -130,9 +130,27 @@ public:
     /// representation of base and overlay storage does not affect the result.
     bool operator==(const RefCowMap & other) const;
 
-    /// Folds `overlay` into a fresh immutable `base` (O(current size)) and clears the overlay.
-    /// Call this after installing a completed state, once per ref-log flush and never once per
-    /// batch item. If the overlay is already empty, this is a no-op.
+    /// Folds `overlay` into `base` and clears the overlay. Call this after installing a completed
+    /// state, once per ref-log flush and never once per batch item. If the overlay is already empty,
+    /// this is a no-op.
+    ///
+    /// When `base` is uniquely owned (`use_count() == 1`, the production flush case: the live table's
+    /// base is not shared with any outstanding scratch copy at the install point), the overlay is
+    /// folded into `*base` IN PLACE -- O(overlay), no O(N) base copy. When a copy still shares `base`
+    /// (`use_count() > 1`), a fresh merged base is built and swapped in, so the shared holder's view
+    /// stays byte-unchanged. Both paths leave an empty overlay and `net_delta == 0`.
+    ///
+    /// The in-place path is sound because this container is not thread-safe by contract (Pool/
+    /// CasRefProtocol.h: callers serialize all access through the state lock, or own a detached copy).
+    /// A `use_count()` of 1 observed by the sole owner cannot concurrently rise: every other holder of
+    /// a copy reached it by copying THIS container, which needs access the caller's exclusivity denies
+    /// for the duration of `materialize`. So the pointee has no other observer to disturb. `base` is a
+    /// `shared_ptr<Base>` (non-const) so the in-place fold needs no `const_cast`: the pointee was never
+    /// const-qualified at construction, so mutating it is defined. The shared base is still never
+    /// mutated while shared -- the `use_count() > 1` branch is what guarantees that. Iterators handed
+    /// out by `begin`/`find` are read-only and short-lived by contract (see the class-level note on
+    /// iterator validity); `materialize` runs at the install point where no iterator into `base` is
+    /// live, so an in-place fold cannot invalidate an outstanding one.
     void materialize();
 
     /// Test-only: current overlay row count (0 right after `materialize()`).
@@ -140,13 +158,20 @@ public:
     /// Test-only: `base`'s `shared_ptr::use_count()` -- a copy that shares `base` (no per-row
     /// allocation) bumps this by exactly one.
     int64_t baseUseCountForTest() const { return base.use_count(); }
+    /// Test-only: identity of the current `base` allocation. `materialize()` on a uniquely-owned base
+    /// folds the overlay in place and leaves this unchanged; on a base still shared with a copy it
+    /// swaps in a fresh base, changing it. Lets a test tell the fast (in-place) path from the copy path.
+    const void * baseIdentityForTest() const { return base.get(); }
 
 private:
     /// Records a live overlay value and updates `net_delta` according to whether it replaces a
     /// tombstone, overrides the base, or introduces a key absent from both sources.
     void insertLive(const String & key, RefCommittedRow row);
 
-    std::shared_ptr<const Base> base = std::make_shared<const Base>();
+    /// Non-const so `materialize()` can fold the overlay into `*base` in place when it is the sole
+    /// owner (see `materialize`'s doc for the safety argument). It is never mutated while shared:
+    /// every write goes to `overlay`, and only the uniquely-owned branch of `materialize` touches it.
+    std::shared_ptr<Base> base = std::make_shared<Base>();
     Overlay overlay;
     /// size() = base->size() + net_delta, maintained in lock-step by every overlay-mutating op so
     /// size()/empty() stay O(1). `net_delta` counts live overlay changes relative to `base`.

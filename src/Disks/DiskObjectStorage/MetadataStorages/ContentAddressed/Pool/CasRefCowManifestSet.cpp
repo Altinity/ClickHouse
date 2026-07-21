@@ -67,15 +67,20 @@ void RefCowManifestSet::materialize()
 {
     if (overlay.empty())
         return;
-    auto merged = std::make_shared<Base>(*base);
+    /// Uniquely-owned base (the production flush case): fold into it in place -- O(overlay), no O(N)
+    /// `unordered_set` copy. Otherwise a copy still shares this base, so fold into a fresh one and
+    /// swap, leaving the shared holder untouched. `target = base` in the sole-owner branch is a
+    /// `shared_ptr` bump, not a `Base` copy; the `std::move` below hands it straight back. See the
+    /// header for the full safety argument.
+    std::shared_ptr<Base> target = (base.use_count() == 1) ? base : std::make_shared<Base>(*base);
     for (const auto & [m, present] : overlay)
     {
         if (present)
-            merged->insert(m);
+            target->insert(m);
         else
-            merged->erase(m);
+            target->erase(m);
     }
-    base = std::move(merged);
+    base = std::move(target);
     overlay.clear();
     net_delta = 0;
 }

@@ -72,9 +72,18 @@ public:
     size_t size() const { return static_cast<size_t>(static_cast<int64_t>(base->size()) + net_delta); }
     bool empty() const { return size() == 0; }
 
-    /// Folds `overlay` into a fresh immutable `base` (O(current size)) and clears the overlay. Call
-    /// this at the same state-install point `RefCowMap::materialize()` is called from (once per
-    /// ref-log flush, never once per batch item). If the overlay is already empty, this is a no-op.
+    /// Folds `overlay` into `base` and clears the overlay. Call this at the same state-install point
+    /// `RefCowMap::materialize()` is called from (once per ref-log flush, never once per batch item).
+    /// If the overlay is already empty, this is a no-op.
+    ///
+    /// When `base` is uniquely owned (`use_count() == 1`, the production flush case), the overlay is
+    /// folded into `*base` IN PLACE -- O(overlay), no O(N) `unordered_set` copy. When a copy still
+    /// shares `base`, a fresh merged base is built and swapped in, so the shared holder's view stays
+    /// byte-unchanged. The safety argument is the same as `RefCowMap::materialize` -- this container is
+    /// not thread-safe by contract; a `use_count()` of 1 seen by the sole owner cannot concurrently
+    /// rise, so the in-place fold has no other observer to disturb, and `base` is a non-const
+    /// `shared_ptr` so the fold needs no `const_cast`. Both paths leave an empty overlay and
+    /// `net_delta == 0`.
     void materialize();
 
     /// Test-only: current overlay entry count (0 right after `materialize()`).
@@ -82,9 +91,15 @@ public:
     /// Test-only: `base`'s `shared_ptr::use_count()` -- a copy that shares `base` (no per-element
     /// allocation) bumps this by exactly one.
     int64_t baseUseCountForTest() const { return base.use_count(); }
+    /// Test-only: identity of the current `base` allocation. `materialize()` on a uniquely-owned base
+    /// folds the overlay in place and leaves this unchanged; on a base still shared with a copy it
+    /// swaps in a fresh base, changing it. Lets a test tell the fast (in-place) path from the copy path.
+    const void * baseIdentityForTest() const { return base.get(); }
 
 private:
-    std::shared_ptr<const Base> base = std::make_shared<const Base>();
+    /// Non-const so `materialize()` can fold the overlay into `*base` in place when it is the sole
+    /// owner (see `materialize`'s doc for the safety argument). It is never mutated while shared.
+    std::shared_ptr<Base> base = std::make_shared<Base>();
     /// `true` = an overlay addition (present, whether or not `base` also has it); `false` = a
     /// tombstone shadowing a `base` member. An overlay-only member that is erased is removed from
     /// this map outright rather than tombstoned (nothing left to shadow), mirroring `RefCowMap`.
