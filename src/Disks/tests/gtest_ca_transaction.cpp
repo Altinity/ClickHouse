@@ -779,3 +779,52 @@ TEST(CaLifecycle, RemountAfterBackingWipeMintsFreshPool)
     EXPECT_NO_THROW(storage->mountExplicitly());
     EXPECT_NE(storage->getPoolUUID(), uuid_before) << "a wiped backing store must remount as a brand-new pool";
 }
+
+/// [Task 8a] A not-`Mounted` (Dormant) CA disk answers the READ-ONLY existence/enumeration surface as
+/// absent/empty instead of throwing `INVALID_STATE`. Generic server sweeps iterate ALL disks and probe
+/// each with an existence call: `DatabaseCatalog::dropTableFinally` calls `existsDirectory` on every
+/// disk, and before this fix a Dormant CA disk threw `INVALID_STATE` there, wedging every server-wide
+/// `DROP TABLE` while any CA disk was Dormant. The content/size/mutation surface stays fail-close and
+/// must STILL throw: a bare `getFileSize`/`getStorageObjects` on an unmounted disk should fail loudly,
+/// and guarding only the enumeration entry points is sufficient because a sweep that enumerates nothing
+/// never reaches those asserting getters.
+TEST(CaLifecycle, DormantDiskAnswersExistenceProbesAsAbsent)
+{
+    auto storage = openTxStorage();
+    storage->unmountSynchronously();   /// Mounted -> Dormant
+
+    const std::string file = "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin";
+    const std::string part_dir = "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0";
+
+    /// Benign-absent surface: no throw, absent/empty answer while Dormant.
+    EXPECT_FALSE(storage->existsDirectory("store"));
+    EXPECT_FALSE(storage->existsFile(file));
+    EXPECT_FALSE(storage->existsFileOrDirectory(part_dir));
+    EXPECT_TRUE(storage->isDirectoryEmpty("store"));
+    EXPECT_TRUE(storage->listDirectory("store").empty());
+    EXPECT_FALSE(storage->getStorageObjectsIfExist(file).has_value());
+    EXPECT_NO_THROW({
+        auto it = storage->iterateDirectory("store");
+        EXPECT_FALSE(it->isValid());
+    });
+
+    /// Fail-close surface: content/size getters must STILL throw `INVALID_STATE` when Dormant.
+    try
+    {
+        storage->getFileSize(file);
+        FAIL() << "getFileSize must fail closed on a Dormant disk";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::INVALID_STATE) << e.message();
+    }
+    try
+    {
+        storage->getStorageObjects(file);
+        FAIL() << "getStorageObjects must fail closed on a Dormant disk";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::INVALID_STATE) << e.message();
+    }
+}

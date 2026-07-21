@@ -832,6 +832,12 @@ std::shared_ptr<Cas::CachedPartFolderAccess> ContentAddressedMetadataStorage::pa
     return poolAccess().part_access;
 }
 
+bool ContentAddressedMetadataStorage::isMounted() const
+{
+    std::lock_guard lock(pointer_mutex);
+    return mount_state == MountState::Mounted && cas_store != nullptr;
+}
+
 void ContentAddressedMetadataStorage::checkNotReadOnly(std::string_view what) const
 {
     if (read_only)
@@ -977,6 +983,9 @@ std::vector<std::string> ContentAddressedMetadataStorage::movingRefNames(const C
 
 bool ContentAddressedMetadataStorage::existsFile(const std::string & path) const
 {
+    /// [Task 8a] A not-Mounted disk answers this read-only probe as absent, before any `store()`.
+    if (!isMounted())
+        return false;
     if (!Cas::isPartFilePath(path))
     {
         if (auto tf = Cas::parseTableFilePath(path))
@@ -1104,6 +1113,9 @@ ContentAddressedMetadataStorage::DirRoute ContentAddressedMetadataStorage::class
 
 bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) const
 {
+    /// [Task 8a] A not-Mounted disk answers this read-only probe as absent, before any `store()`.
+    if (!isMounted())
+        return false;
     const DirRoute dr = classifyDirectory(path);
     switch (dr.shape)
     {
@@ -1171,6 +1183,9 @@ bool ContentAddressedMetadataStorage::existsDirectory(const std::string & path) 
 
 bool ContentAddressedMetadataStorage::existsFileOrDirectory(const std::string & path) const
 {
+    /// [Task 8a] A not-Mounted disk answers this read-only probe as absent, before any `store()`.
+    if (!isMounted())
+        return false;
     if (Cas::isPartFilePath(path))
     {
         auto p = Cas::parsePartFilePath(path);
@@ -1244,6 +1259,9 @@ Poco::Timestamp ContentAddressedMetadataStorage::getLastModified(const std::stri
 
 std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const std::string & path) const
 {
+    /// [Task 8a] A not-Mounted disk enumerates as empty, before any `store()`.
+    if (!isMounted())
+        return {};
     const DirRoute dr = classifyDirectory(path);
     switch (dr.shape)
     {
@@ -1351,6 +1369,10 @@ std::vector<std::string> ContentAddressedMetadataStorage::listDirectory(const st
 
 DirectoryIteratorPtr ContentAddressedMetadataStorage::iterateDirectory(const std::string & path) const
 {
+    /// [Task 8a] A not-Mounted disk iterates as empty, before any `store()` — the SAME empty
+    /// `StaticDirectoryIterator` the mounted path produces for a directory with no children.
+    if (!isMounted())
+        return std::make_unique<StaticDirectoryIterator>(std::vector<fs::path>{});
     /// Mirror MetadataStorageFromPlainObjectStorage: iterateDirectory includes the path.
     auto names = listDirectory(path);
     std::vector<fs::path> fs_paths;
@@ -1362,6 +1384,9 @@ DirectoryIteratorPtr ContentAddressedMetadataStorage::iterateDirectory(const std
 
 bool ContentAddressedMetadataStorage::isDirectoryEmpty(const std::string & path) const
 {
+    /// [Task 8a] A not-Mounted disk reports every directory empty, before any `store()`.
+    if (!isMounted())
+        return true;
     /// A part directory's files are virtual (derived from the tree): report it EMPTY so
     /// DiskObjectStorage::removeDirectory proceeds straight to the ref-unlink instead of throwing
     /// CANNOT_RMDIR per removal. The same applies to a projection subdirectory. The detached
@@ -1427,6 +1452,10 @@ StoredObjects ContentAddressedMetadataStorage::getStorageObjects(const std::stri
 
 std::optional<StoredObjects> ContentAddressedMetadataStorage::getStorageObjectsIfExist(const std::string & path) const
 {
+    /// [Task 8a] A not-Mounted disk answers this read-only "if exists" probe as absent, before any
+    /// `store()`. The non-`IfExist` `getStorageObjects` stays fail-close (still throws).
+    if (!isMounted())
+        return std::nullopt;
     /// Non-part shapes (verbatim table files, loose mountpoint objects) are rare paths — the
     /// generic two-step is fine for them.
     if (!Cas::isPartFilePath(path))

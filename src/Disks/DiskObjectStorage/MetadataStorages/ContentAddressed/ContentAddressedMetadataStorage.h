@@ -524,6 +524,16 @@ private:
     /// `mount_state` they read under it.
     [[noreturn]] void throwNotMounted(MountState state) const;
 
+    /// Non-throwing counterpart to `poolAccess()`'s mount check, used ONLY by the read-only
+    /// existence/enumeration surface (`existsFile`/`existsDirectory`/`existsFileOrDirectory`/
+    /// `isDirectoryEmpty`/`listDirectory`/`iterateDirectory`/`getStorageObjectsIfExist`). A generic
+    /// server sweep iterates ALL disks and probes each with an existence call (e.g.
+    /// `DatabaseCatalog::dropTableFinally` calls `existsDirectory` on every disk); a Dormant CA disk
+    /// answering that surface as absent/empty — rather than throwing `INVALID_STATE` via `store()` —
+    /// keeps those CA-agnostic sweeps from wedging while any CA disk is unmounted. Content/size/mutation
+    /// entry points deliberately do NOT consult this and stay fail-close (they still throw).
+    bool isMounted() const;
+
     /// A pool opened as a standalone, UNPUBLISHED view: never touches `cas_store`/`part_access`/
     /// `gc_scheduler`/`mount_state` -- the caller owns it entirely and drops it when done.
     struct PoolView
