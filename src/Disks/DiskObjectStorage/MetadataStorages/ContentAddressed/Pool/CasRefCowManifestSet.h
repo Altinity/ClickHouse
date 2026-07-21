@@ -42,19 +42,12 @@ namespace DB::Cas
 /// exists to catch, and this set's chasserts extend that same cross-check to manifest ownership.
 class RefCowManifestSet
 {
-private:
-    /// Hashes `ManifestRef` for `base`'s `unordered_set` buckets only, by delegating to the existing
-    /// `std::hash<ManifestRef>` specialization (Primitives/CasTypes.h) instead of re-deriving the
-    /// same three-field combine a second time. Membership hashing only -- this set is never exposed
-    /// to attacker-chosen keys, only to manifest refs this process itself allocated, so adversarial
-    /// collision resistance is not a concern here.
-    struct Hash
-    {
-        size_t operator()(const ManifestRef & m) const { return std::hash<ManifestRef>{}(m); }
-    };
-
 public:
-    using Base = std::unordered_set<ManifestRef, Hash>;
+    /// Bucket hashing comes from the existing `std::hash<ManifestRef>` specialization
+    /// (Primitives/CasTypes.h), picked up by default. Membership hashing only -- this set is never
+    /// exposed to attacker-chosen keys, only to manifest refs this process itself allocated, so
+    /// adversarial collision resistance is not a concern here.
+    using Base = std::unordered_set<ManifestRef>;
 
     RefCowManifestSet() = default;
 

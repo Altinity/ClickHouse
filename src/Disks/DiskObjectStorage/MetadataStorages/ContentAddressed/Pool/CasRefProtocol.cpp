@@ -59,7 +59,7 @@ bool RefTableState::manifestAlreadyOwned(const ManifestRef & manifest_ref) const
 /// The `owner_transition` op kind: dispatches on the `(old_binding,
 /// new_binding)` shape to one of the four legal transitions (add precommit / remove precommit /
 /// remove committed / promote). Any other shape is not a recognized transition.
-void RefTableState::applyOwnerTransition(const RefOp & op, ApplyMode validation)
+void RefTableState::applyOwnerTransition(const RefOp & op, ApplyMode mode)
 {
     if (lifecycle != RefLifecycle::Live)
         throw Exception(ErrorCodes::CORRUPTED_DATA, "RefTableState: owner_transition while namespace is not Live");
@@ -74,7 +74,7 @@ void RefTableState::applyOwnerTransition(const RefOp & op, ApplyMode validation)
         if (precommits.contains({b.ref_name, b.manifest_ref}))
             throw Exception(ErrorCodes::CORRUPTED_DATA,
                 "RefTableState: add precommit '{}' already exists for this exact manifest", b.ref_name);
-        if (validation == ApplyMode::LiveAppend)
+        if (mode == ApplyMode::LiveAppend)
         {
             if (manifestAlreadyOwned(b.manifest_ref))
                 throw Exception(ErrorCodes::CORRUPTED_DATA,
@@ -195,9 +195,9 @@ void RefTableState::applySetPayload(const RefOp & op)
 
 /// One operation's local preconditions and effect, shared by
 /// `applyRefLogTxn`'s per-op loop and by `admits`'s single-op preview. `txn_id` is only read by
-/// `RemoveNamespace` (it becomes the resulting `remove_txn_id`). `validation` is threaded down to
+/// `RemoveNamespace` (it becomes the resulting `remove_txn_id`). `mode` is threaded down to
 /// `applyOwnerTransition`, the only arm that consults it.
-void RefTableState::applyOp(const RefOp & op, const RefTxnId & txn_id, ApplyMode validation)
+void RefTableState::applyOp(const RefOp & op, const RefTxnId & txn_id, ApplyMode mode)
 {
     switch (op.kind)
     {
@@ -213,7 +213,7 @@ void RefTableState::applyOp(const RefOp & op, const RefTxnId & txn_id, ApplyMode
             return;
         }
         case RefOpKind::OwnerTransition:
-            applyOwnerTransition(op, validation);
+            applyOwnerTransition(op, mode);
             return;
         case RefOpKind::SetPayload:
             applySetPayload(op);
@@ -305,7 +305,7 @@ void RefTableState::debugAssertBodyCounters() const
 }
 #endif
 
-void applyRefLogTxn(RefTableState & state, const RefLogTxn & txn, ApplyMode validation)
+void applyRefLogTxn(RefTableState & state, const RefLogTxn & txn, ApplyMode mode)
 {
     if (!(state.greatest_applied < txn.txn_id))
         throw Exception(ErrorCodes::CORRUPTED_DATA,
@@ -315,7 +315,7 @@ void applyRefLogTxn(RefTableState & state, const RefLogTxn & txn, ApplyMode vali
 
     checkRemoveNamespaceOrdering(txn.ops);
 
-    if (validation == ApplyMode::TrustedReplay)
+    if (mode == ApplyMode::TrustedReplay)
     {
         /// Trusted-history replay (E3): apply IN PLACE, with no scratch copy. `replay` -- the sole
         /// `TrustedReplay` caller (grep-enforced) -- builds its `RefTableState` locally and returns it
@@ -334,7 +334,7 @@ void applyRefLogTxn(RefTableState & state, const RefLogTxn & txn, ApplyMode vali
         /// arm's job, and why the writer's live-state install and every first-time-validation preview
         /// in `CasRefLedger.cpp` keep the default `LiveAppend` (see the `applyRefLogTxn` header doc).
         for (const RefOp & op : txn.ops)
-            state.applyOp(op, txn.txn_id, validation);
+            state.applyOp(op, txn.txn_id, mode);
         state.greatest_applied = txn.txn_id;
     }
     else
@@ -348,7 +348,7 @@ void applyRefLogTxn(RefTableState & state, const RefLogTxn & txn, ApplyMode vali
         /// above handles.
         RefTableState scratch = state;
         for (const RefOp & op : txn.ops)
-            scratch.applyOp(op, txn.txn_id, validation);
+            scratch.applyOp(op, txn.txn_id, mode);
 
         scratch.greatest_applied = txn.txn_id;
         state = std::move(scratch);

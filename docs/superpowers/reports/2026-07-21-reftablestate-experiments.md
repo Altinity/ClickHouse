@@ -259,9 +259,10 @@ untouched on promote -- the manifest keeps an owner throughout, so there is noth
 reinsert) plus `stateFromSnapshot`'s row-loading loops (seed) and `materializeCommitted` (folds its
 overlay alongside `committed`'s). `manifestAlreadyOwned` becomes `return
 owned_manifests.contains(manifest_ref);` -- O(1) in BOTH `TxnValidation` modes, so E1's
-`TrustedHistory` `chassert(!manifestAlreadyOwned(...))` is now an O(1) check too: debug-build replay
-stops being O(K×N) (K applied ops over an N-row table) and becomes O(K), composing with E1 exactly as
-the task brief predicted.
+`TrustedHistory` `chassert(!manifestAlreadyOwned(...))` is now an O(1) check too. (Correction from
+the final review: debug/sanitizer replay overall REMAINS O(K×N), because `debugAssertBodyCounters`'s
+O(N) rebuild-and-compare still runs after every applied transaction there; only the E1 chassert
+itself became O(1). Release-build replay is unaffected by either.)
 
 ### Tests
 
@@ -414,7 +415,8 @@ read or write `owned_manifests` at all (it benchmarks `RefCowMap` directly, per 
 
 DONE_WITH_CONCERNS. The headline result lands exactly as designed: `BM_AdmitsAddPrecommit` is flat
 O(1) across five orders of magnitude in N (RMS 1%), and E1's debug-build `TrustedHistory` chassert is
-now O(1) too, so debug/sanitizer replay stops being O(K×N). Two costs were found, root-caused, and are
+now O(1) too (though debug/sanitizer replay overall remains O(K×N) via `debugAssertBodyCounters`'s
+per-txn rebuild -- see the correction above). Two costs were found, root-caused, and are
 reported rather than hidden: a small (~13 ns, ~28%), architecturally-irreducible-within-this-design
 `BM_ScratchCopy` tax (one more `shared_ptr` copy per `RefTableState` copy -- negligible against the
 benchmark it feeds), and a real (~35%, `BM_ReplayHistory`-constant-level) recovery/GC-fold-replay

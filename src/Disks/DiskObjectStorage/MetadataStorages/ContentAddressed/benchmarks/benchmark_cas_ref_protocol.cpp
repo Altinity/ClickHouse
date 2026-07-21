@@ -48,7 +48,8 @@
 ///     N=100: 963 ns    N=1,000: 979 ns    N=10,000: 988 ns    N=100,000: 1,029 ns
 ///     Complexity fit: O(1), RMS 2%.
 ///   BM_AdmitsAddPrecommit (add op -- THE production hotspot shape: `manifestAlreadyOwned`'s linear
-///   value scan, not yet fixed):
+///   value scan AT THIS BASELINE; O(1) via the owned-manifest index since E2 -- see the Final block
+///   below):
 ///     N=100: 995 ns    N=1,000: 4,266 ns    N=10,000: 38,771 ns    N=100,000: 400,222 ns
 ///     Complexity fit: O(N), ~4.0 ns/row, RMS 2%.
 ///   BM_ApplyRefLogTxn (scratch copy + validate + apply + install of one promote):
@@ -69,6 +70,15 @@
 ///   BM_Materialize (RefCowMap::materialize after one overlay insert on an N-row base):
 ///     N=100: 12,069 ns    N=1,000: 126,687 ns    N=10,000: 1,296,326 ns    N=100,000: 18,145,559 ns
 ///     Complexity fit: O(N log N), RMS 2%.
+///
+/// Final, 2026-07-21, shipped tree (post E1+E2+E3; E4 tried and REVERTED -- full per-phase tables in
+/// docs/superpowers/reports/2026-07-21-reftablestate-experiments.md, `bench_t5_e3.log`):
+///   BM_AdmitsAddPrecommit: ~692-714 ns FLAT across N=100..100,000 -- O(1), RMS 1%
+///     (the owned-manifest index replaced the linear scan; ~571x at N=100k).
+///   BM_ReplayHistory: 1,725.58 ns/row (was 48,859) -- in-place `TrustedReplay` apply, -96.5%.
+///   BM_ApplyRefLogTxn: ~778-822 ns O(1). BM_Admits (promote): ~996-1,056 ns O(1).
+///   BM_ScratchCopy: ~58 ns O(1) (+~11 ns vs baseline: one more shared_ptr copy for the index).
+///   BM_SnapshotEncode / BM_MergedIteration / BM_Materialize: unchanged from baseline (E4 reverted).
 ///
 /// Implementation note for later phases: `makeSyntheticState` calls `RefCowMap::materialize()`
 /// after `replay` (which never does -- it is the pure state-machine equation, and

@@ -217,15 +217,15 @@ private:
 
     /// One operation's local preconditions and effect, shared by `applyRefLogTxn`'s per-op loop and by
     /// `admits`'s single-op preview. `txn_id` is only read by `RemoveNamespace` (it becomes the
-    /// resulting `remove_txn_id`). `validation` is threaded down to `applyOwnerTransition`, the only
+    /// resulting `remove_txn_id`). `mode` is threaded down to `applyOwnerTransition`, the only
     /// arm that consults it. Was free `applyOpInPlace`.
-    void applyOp(const RefOp & op, const RefTxnId & txn_id, ApplyMode validation);
+    void applyOp(const RefOp & op, const RefTxnId & txn_id, ApplyMode mode);
 
     /// The `owner_transition` op kind: dispatches on the `(old_binding, new_binding)` shape to one of
     /// the four legal transitions (add precommit / remove precommit / remove committed / promote). Any
-    /// other shape is not a recognized transition. `validation` is consulted only by the add-precommit
+    /// other shape is not a recognized transition. `mode` is consulted only by the add-precommit
     /// arm's cross-owner uniqueness check. Was free.
-    void applyOwnerTransition(const RefOp & op, ApplyMode validation);
+    void applyOwnerTransition(const RefOp & op, ApplyMode mode);
 
     /// The `set_payload` op kind: the committed ref must still name `expected_manifest_ref`; replaces
     /// the opaque `payload` blob and `published_at_ms` without touching the manifest edge. Was free.
@@ -241,7 +241,7 @@ private:
     void debugAssertBodyCounters() const;
 #endif
 
-    friend void applyRefLogTxn(RefTableState & state, const RefLogTxn & txn, ApplyMode validation);
+    friend void applyRefLogTxn(RefTableState & state, const RefLogTxn & txn, ApplyMode mode);
     friend RefTableState stateFromSnapshot(const RefTableSnapshot & snapshot);
     friend bool admits(const RefTableState & state, const RefOp & op,
                        uint64_t snapshot_budget, uint64_t removal_budget);
@@ -268,7 +268,7 @@ RefTableState stateFromSnapshot(const RefTableSnapshot & snapshot);
 /// (strictly-increasing `txn_id`, `remove_namespace` ordering) are checked before any mutation, so
 /// they never leave `state` half-applied under either strategy below.
 ///
-/// Apply strategy is selected by `validation` (see `ApplyMode`):
+/// Apply strategy is selected by `mode` (see `ApplyMode`):
 ///  - `LiveAppend` (writer append-time + previews): two-phase against a scratch copy; every op is validated
 ///    and applied, in array order, to the scratch first, and `state` is replaced by it only once the
 ///    WHOLE transaction has succeeded. A throw anywhere leaves `state` byte-for-byte unchanged, and no
@@ -328,13 +328,13 @@ RefTableState stateFromSnapshot(const RefTableSnapshot & snapshot);
 /// framing; a writer that wants a friendlier user-facing rejection for an ordinary attempted mutation
 /// (e.g. "ref already exists") checks its own business state before ever building the op.
 ///
-/// `validation` (default `ApplyMode::LiveAppend`, the writer's append-time contract): pass
+/// `mode` (default `ApplyMode::LiveAppend`, the writer's append-time contract): pass
 /// `ApplyMode::TrustedReplay` only when `txn` already passed `LiveAppend` validation at the time it was
 /// durably appended -- `replay`'s tail is the one caller that does. Every OTHER caller (the writer's
 /// own trial/shape-check previews and its post-PUT state install, all in `CasRefLedger.cpp`) keeps the
 /// default `LiveAppend`, because those calls are the FIRST time the transaction is validated, not a replay of
 /// already-validated history.
-void applyRefLogTxn(RefTableState & state, const RefLogTxn & txn, ApplyMode validation = ApplyMode::LiveAppend);
+void applyRefLogTxn(RefTableState & state, const RefLogTxn & txn, ApplyMode mode = ApplyMode::LiveAppend);
 
 /// The canonical snapshot of `state` under `ns`: `committed` sorted by
 /// bytewise `ref_name` (guaranteed by `RefCowMap`'s sorted merge-iteration order,

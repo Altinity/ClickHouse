@@ -107,6 +107,10 @@ void expectStatesEqual(const RefTableState & a, const RefTableState & b)
     EXPECT_EQ(a.getGreatestApplied(), b.getGreatestApplied());
     EXPECT_EQ(a.getCommitted(), b.getCommitted());
     EXPECT_EQ(a.getPrecommits(), b.getPrecommits());
+    /// Also compare the incremental budget counters: in release builds (no `debugAssertBodyCounters`)
+    /// this is the only cross-check that catches counter drift between two equal-looking states.
+    EXPECT_EQ(a.getSnapshotBodyBytes(), b.getSnapshotBodyBytes());
+    EXPECT_EQ(a.getRemovalBodyBytes(), b.getRemovalBodyBytes());
 }
 
 /// The spec's own construction for a hypothetical `remove_namespace` transaction (§Remove Namespace):
