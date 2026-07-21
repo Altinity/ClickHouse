@@ -343,16 +343,22 @@ std::unique_ptr<WriteBufferFromFileBase> S3ObjectStorage::writeObject( /// NOLIN
     if (blob_storage_log)
         blob_storage_log->local_path = object.local_path;
 
-    /// The SingleAttempt profile rides on WriteSettings instead of changing this disk's shared
-    /// client — every other write keeps using client.get() and its normal retry policy unchanged.
-    auto used_client = write_settings.object_storage_retry_profile == ObjectStorageRetryProfile::SingleAttempt
-        ? getSingleAttemptClient()
-        : client.get();
-
     /// A per-request client override (e.g. CAS conditional writes forcing a single HTTP attempt, the
-    /// predecessor of the profile above — see WriteSettings) takes priority when set.
+    /// predecessor of the profile below — see WriteSettings) takes priority when set; the two are not
+    /// expected to be set simultaneously (Task 8 removes the override). The SingleAttempt profile
+    /// rides on WriteSettings instead of changing this disk's shared client — every other write keeps
+    /// using client.get() and its normal retry policy unchanged. getSingleAttemptClient() is only
+    /// invoked when actually selected, so a plain write never pays for building/locking the clone.
+    std::shared_ptr<const S3::Client> used_client;
+    if (write_settings.s3_client_override)
+        used_client = write_settings.s3_client_override;
+    else if (write_settings.object_storage_retry_profile == ObjectStorageRetryProfile::SingleAttempt)
+        used_client = getSingleAttemptClient();
+    else
+        used_client = client.get();
+
     return std::make_unique<WriteBufferFromS3>(
-        write_settings.s3_client_override ? write_settings.s3_client_override : used_client,
+        used_client,
         uri.bucket,
         object.remote_path,
         write_settings.use_adaptive_write_buffer ? write_settings.adaptive_write_buffer_initial_size : buf_size,
@@ -891,7 +897,7 @@ std::shared_ptr<const S3::Client> S3ObjectStorage::getSingleAttemptClient() cons
 {
     auto base = client.get();
     std::lock_guard lock(single_attempt_client_mutex);
-    if (single_attempt_client && single_attempt_client_base == base.get())
+    if (single_attempt_client && single_attempt_client_base == base)
         return single_attempt_client;
 
     auto cfg = base->getClientConfiguration();
@@ -906,7 +912,7 @@ std::shared_ptr<const S3::Client> S3ObjectStorage::getSingleAttemptClient() cons
         cfg.expect_continue_min_bytes = fallback_expect_continue_min_bytes;
 
     single_attempt_client = base->cloneWithConfigurationOverride(cfg);
-    single_attempt_client_base = base.get();
+    single_attempt_client_base = base;
     return single_attempt_client;
 }
 

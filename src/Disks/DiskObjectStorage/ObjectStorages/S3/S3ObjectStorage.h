@@ -204,7 +204,14 @@ private:
 
     mutable std::mutex single_attempt_client_mutex;
     mutable std::shared_ptr<const S3::Client> single_attempt_client;
-    mutable const S3::Client * single_attempt_client_base = nullptr;
+    /// The base client the cached clone above was built from. Deliberately held as a shared_ptr (not
+    /// a raw pointer): a raw pointer would be compared for identity AFTER the object it once pointed
+    /// to could have been freed and a new client reallocated at the same address by an unrelated
+    /// rotation (ABA), which would false-match and serve a stale clone (e.g. built from retired
+    /// credentials) indefinitely. Holding the shared_ptr pins at most one retired client version —
+    /// released as soon as the next rotation is observed and the clone is rebuilt — which is what
+    /// makes the identity comparison in getSingleAttemptClient sound.
+    mutable std::shared_ptr<const S3::Client> single_attempt_client_base;
 };
 
 }
