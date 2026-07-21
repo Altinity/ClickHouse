@@ -727,17 +727,15 @@ def wait_for_healthy(cluster, *, timeout_s: float = 180.0, settle_s: float = 2.0
     not something to swallow."""
     deadline = monotonic_fn() + timeout_s
     def tables_loaded(node) -> bool:
-        # /ping turns 200 BEFORE async table load completes; SYSTEM SYNC REPLICA against a
-        # still-loading table transiently fails with "is not replicated" (observed 2026-07-21,
-        # f1f11 soak: ch1 restart after the high-churn stage made the CA table load slow enough
-        # for the checkpoint to win the race). Gate on the workload table being fully loaded AS
-        # a Replicated* storage, not just on the HTTP port.
+        # /ping turns 200 BEFORE async table load completes. The `ca_soak` database is created
+        # with `lazy_load_tables = 1`, so a freshly (re)started node keeps `ca_stress` wrapped in
+        # an unmaterialized StorageTableProxy until first access: the `system.tables` engine
+        # column never flips to `Replicated%` on its own, so gating on it here would spin until
+        # the timeout even on a perfectly healthy node. A real read both materializes the proxy
+        # (by design) and proves the table is actually functional, so use that as the gate instead.
         try:
-            out = node.query(
-                "SELECT count() FROM system.tables "
-                "WHERE database = 'ca_soak' AND name = 'ca_stress' AND engine LIKE 'Replicated%'",
-                timeout=5.0)
-            return out.strip() == "1"
+            node.query("SELECT count() >= 0 FROM ca_soak.ca_stress", timeout=5.0)
+            return True
         except Exception:
             return False
 
@@ -1258,11 +1256,7 @@ def run_phase3(args):
         log(f"{label}")
         checkpoint_active.set()
         try:
-            # 900s, not the default 180s: a killed node's CA table load after a high-churn stage
-            # takes minutes (observed 2026-07-21 f1f11 attempt-2: >180s, completed within ~15 min —
-            # ref-LIST recovery cost; tracked as a product finding in docs/superpowers/cas/BACKLOG.md).
-            # The bound still FAILS LOUDLY on a genuinely stuck load (AsyncLoader terminal-FAILED class).
-            wait_for_healthy(cluster, timeout_s=900.0)
+            wait_for_healthy(cluster)
             # Entry gate only needs dangling/exit_code -> cheap summary fsck (detail=False).
             # Each poll is bounded at 180s; FsckTimeout degrades to a logged skip (B146/B154).
             try:
