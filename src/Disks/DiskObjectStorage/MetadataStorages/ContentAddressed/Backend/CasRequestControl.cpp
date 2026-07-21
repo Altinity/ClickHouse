@@ -22,7 +22,6 @@ namespace ProfileEvents
     extern const Event CasConditionalWriteCommitted;
     extern const Event CasConditionalWriteDefiniteFailure;
     extern const Event CasConditionalWriteUnresolved;
-    extern const Event CasConditionalWriteSdkRetries;
     extern const Event CasConditionalWriteFenceLostPostWrite;
 }
 
@@ -119,11 +118,6 @@ void recordConditionalWriteOutcome(CasWriteOutcome outcome)
             ProfileEvents::increment(ProfileEvents::CasConditionalWriteUnresolved);
             return;
     }
-}
-
-void recordConditionalWriteSdkRetryConsidered()
-{
-    ProfileEvents::increment(ProfileEvents::CasConditionalWriteSdkRetries);
 }
 
 namespace

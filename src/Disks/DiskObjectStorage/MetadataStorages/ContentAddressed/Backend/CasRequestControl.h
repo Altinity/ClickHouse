@@ -50,14 +50,6 @@ void recordConditionalWriteAttemptStarted();
 /// throwing — see ObjectStorageBackend::nativeConditionalPut).
 void recordConditionalWriteOutcome(CasWriteOutcome outcome);
 
-/// Records that the S3 SDK's retry strategy was consulted about issuing a SECOND (or later) HTTP
-/// attempt for a CAS conditional write. SDK-level retries must remain zero for conditional writes. The
-/// single-attempt client's retry
-/// strategy (CasObjectStorageBackend.cpp) always answers no, but the consultation itself proves the
-/// first attempt did not conclusively succeed from the SDK's point of view — this is the live tripwire
-/// that makes the counter provably wired, rather than a value nothing ever touches.
-void recordConditionalWriteSdkRetryConsidered();
-
 /// The three separate limits a CAS-owned retry controller enforces for ONE logical conditional-write
 /// operation. Never represented by a single `request_timeout_ms` value — see `validateCasRequestBudget`
 /// for the relationship a writable mount enforces at startup, and `CasRequestController` for the

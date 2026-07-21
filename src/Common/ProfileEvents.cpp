@@ -877,7 +877,6 @@ The server successfully detected this situation and will download merged part fr
     M(CasConditionalWriteCommitted, "Counts CAS conditional writes completed successfully; growth indicates successful conditional-update activity.", ValueType::Number) \
     M(CasConditionalWriteDefiniteFailure, "Counts CAS conditional writes rejected with certainty before applying; non-zero values indicate invalid requests, oversized entities, or access denial.", ValueType::Number) \
     M(CasConditionalWriteUnresolved, "Counts CAS conditional writes with an unknown outcome after conflict, timeout, connection loss, or server error; non-zero values indicate backend instability or state requiring resolution.", ValueType::Number) \
-    M(CasConditionalWriteSdkRetries, "Counts SDK retry consultations for CAS conditional writes; MUST stay zero. Non-zero values mean the single-attempt policy was bypassed and need immediate investigation.", ValueType::Number) \
     M(CasConditionalWriteFenceLostPostWrite, "Counts CAS writes that succeeded but lost the final mount-fence check; non-zero values indicate late responses after the mount lifecycle changed.", ValueType::Number) \
     M(CasDedupCacheHits, "Counts CAS presence-cache lookups that found a known-present hash; growth indicates cache reuse and more HEAD-first deduplication checks.", ValueType::Number) \
     M(CasDedupCacheMisses, "Counts CAS presence-cache lookups without an entry; growing values indicate a cold cache or increasing new-content uploads.", ValueType::Number) \

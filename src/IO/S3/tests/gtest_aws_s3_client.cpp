@@ -234,6 +234,10 @@ TEST(IOTestAwsS3Client, DoesNotRetryPreconditionFailed)
     EXPECT_FALSE(DB::S3Exception("boom", Aws::S3::S3Errors::NO_SUCH_KEY, "NoSuchKey").isPreconditionFailed());
 }
 
+/// Every consultation is counted, not just the first: simulating two retryable 5xx decisions in a row
+/// proves the counter tracks each SDK consultation rather than being fixed/clamped at 1, which is what
+/// makes it a live tripwire ("SDK-level retries must remain zero for conditional writes") rather than a
+/// value nothing ever touches.
 TEST(IOTestAwsS3Client, SingleAttemptRetryStrategyRefusesAndCounts)
 {
     using ProfileEvents::global_counters;
@@ -242,8 +246,9 @@ TEST(IOTestAwsS3Client, SingleAttemptRetryStrategyRefusesAndCounts)
     const Aws::Client::AWSError<Aws::Client::CoreErrors> retryable_5xx(
         Aws::Client::CoreErrors::INTERNAL_FAILURE, /*isRetryable=*/true);
     EXPECT_FALSE(strategy.ShouldRetry(retryable_5xx, /*attempted=*/0));
+    EXPECT_FALSE(strategy.ShouldRetry(retryable_5xx, /*attempted=*/1));
     EXPECT_EQ(strategy.GetMaxAttempts(), 1);
-    EXPECT_EQ(global_counters[ProfileEvents::S3SingleAttemptRetryConsultations].load() - before, 1u);
+    EXPECT_EQ(global_counters[ProfileEvents::S3SingleAttemptRetryConsultations].load() - before, 2u);
 }
 
 /// Drive a single-part conditional PUT (`If-None-Match: *`) with `body_size` bytes through a real

@@ -29,7 +29,6 @@ namespace ProfileEvents
     extern const Event CasConditionalWriteCommitted;
     extern const Event CasConditionalWriteDefiniteFailure;
     extern const Event CasConditionalWriteUnresolved;
-    extern const Event CasConditionalWriteSdkRetries;
 }
 
 #if USE_AWS_S3
@@ -217,44 +216,18 @@ TEST(CasRequestControl, NativeConditionalPutCountsOneAttemptAndCommitted)
 /// actually reachable from a unit-test binary: NO live/fake S3 endpoint is available here (the Native
 /// conditional-write path is exercised end-to-end only at M-W against RustFS — see the HONEST NOTE in
 /// CasObjectStorageBackend.cpp), so driving a real socket-level retry against a real client is not
-/// reachable from this binary. What IS reachable and asserted here: the single-attempt client override
-/// is populated ONLY when the underlying object storage actually exposes an S3 client
-/// (IObjectStorage::tryGetS3StorageClient), and stays null — leaving the disk's own client and retry
-/// policy untouched — for a non-S3 backend such as LocalObjectStorage. This is the same property
-/// BackupIO_S3.cpp's per-operation client override relies on (Client::cloneWithConfigurationOverride
-/// reusing the base client's connection pool/credentials).
-TEST(CasRequestControl, ClientOverrideAbsentOverNonS3ObjectStorage)
+/// reachable from this binary. What IS reachable and asserted here: every Native conditional write
+/// selects the SingleAttempt object-storage retry profile, and a non-S3 backend such as
+/// LocalObjectStorage reports it as UNSUPPORTED via IObjectStorage::supportsRetryProfile — the property
+/// checkConditionalWriteSingleAttemptSupport's fail-closed mount-time gate relies on.
+TEST(CasRequestControl, SingleAttemptProfileRequestedAndLocalBackendRejected)
 {
     auto b = std::make_shared<ObjectStorageBackend>(
         DB::Cas::tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::Native);
     const auto ws = b->conditionalWriteSettingsForTest();
-    EXPECT_EQ(ws.s3_client_override, nullptr);
-}
-
-/// The SDK-retry tripwire itself (RFC §observability: "SDK-level retries, which must remain zero for
-/// conditional writes"): detail::SingleAttemptRetryStrategy is exactly what the single-attempt
-/// client's `retryStrategy` is set to (CasObjectStorageBackend.cpp ctor). Simulating a retryable 5xx
-/// the AWS SDK would normally retry proves BOTH halves of the property directly at the seam that
-/// decides it — refusal (ShouldRetry returns false, GetMaxAttempts is 1) AND that
-/// CasConditionalWriteSdkRetries is a LIVE tripwire, not a counter nothing ever touches.
-TEST(CasRequestControl, SingleAttemptRetryStrategyRefusesAndCountsEveryConsultation)
-{
-    using ProfileEvents::global_counters;
-    const auto before = global_counters[ProfileEvents::CasConditionalWriteSdkRetries].load();
-
-    DB::Cas::detail::SingleAttemptRetryStrategy strategy;
-    EXPECT_EQ(strategy.GetMaxAttempts(), 1);
-
-    Aws::Client::AWSError<Aws::Client::CoreErrors> retryable_error(
-        Aws::Client::CoreErrors::INTERNAL_FAILURE, /*isRetryable=*/true);
-    EXPECT_FALSE(strategy.ShouldRetry(retryable_error, /*attemptedRetries=*/0));
-    EXPECT_FALSE(strategy.ShouldRetry(retryable_error, /*attemptedRetries=*/1));
-
-#if !WITH_COVERAGE
-    EXPECT_EQ(global_counters[ProfileEvents::CasConditionalWriteSdkRetries].load() - before, 2u);
-#else
-    (void)before;
-#endif
+    EXPECT_EQ(ws.object_storage_retry_profile, DB::ObjectStorageRetryProfile::SingleAttempt);
+    /// LocalObjectStorage does not implement the profile — the capability check must say no.
+    EXPECT_FALSE(DB::Cas::tests::makeLocalObjectStorageForTest()->supportsRetryProfile(DB::ObjectStorageRetryProfile::SingleAttempt));
 }
 
 /// The SECOND retry-affecting layer above the S3 client (review finding): WriteBufferFromS3's OWN

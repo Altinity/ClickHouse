@@ -3,19 +3,9 @@
 #include <Common/IThrottler.h>
 #include <Common/Scheduler/ResourceLink.h>
 #include <IO/DistributedCacheSettings.h>
-#include <memory>
-
-#include "config.h"
 
 namespace DB
 {
-
-#if USE_AWS_S3
-namespace S3
-{
-class Client;
-}
-#endif
 
 /// Per-write retry-behavior selector, resolved by the object storage that executes the write.
 /// SingleAttempt: exactly one HTTP attempt, no SDK-transparent retries — for conditional writes
@@ -82,15 +72,6 @@ struct WriteSettings
     /// Selects the retry profile the object storage should execute this write under; see
     /// ObjectStorageRetryProfile.
     ObjectStorageRetryProfile object_storage_retry_profile = ObjectStorageRetryProfile::Default;
-
-#if USE_AWS_S3
-    /// Per-request S3 client override: when set, S3ObjectStorage::writeObject issues THIS write with
-    /// the given client instead of the disk's shared one. Lets ONE write path (e.g. a CAS conditional
-    /// write, RFC cas-s3-timeout-retry-control) run with a different retry policy (a cheap
-    /// Client::cloneWithConfigurationOverride, same connection pool/credentials) without touching the
-    /// disk-wide client used by every other operation.
-    std::shared_ptr<const S3::Client> s3_client_override;
-#endif
 
     bool operator==(const WriteSettings & other) const = default;
 };

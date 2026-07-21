@@ -39,27 +39,6 @@ namespace ErrorCodes
 namespace DB::Cas
 {
 
-#if USE_AWS_S3
-/// `ShouldRetry` is the AWS SDK's polymorphic retry decision. It must refuse a second HTTP attempt;
-/// changing the POD `retry_strategy.max_retries` alone would only bound the ClickHouse-side wrapper,
-/// not this SDK loop. Every consultation is counted because it proves that the SDK considered the
-/// first attempt inconclusive or failed; otherwise the retry-consultation metric would remain zero
-/// even when the SDK reached this decision point.
-bool detail::SingleAttemptRetryStrategy::ShouldRetry(const Aws::Client::AWSError<Aws::Client::CoreErrors> &, long) const // NOLINT(google-runtime-int): AWS SDK virtual API requires `long`.
-{
-    recordConditionalWriteSdkRetryConsidered();
-    return false;
-}
-
-long detail::SingleAttemptRetryStrategy::CalculateDelayBeforeNextRetry(const Aws::Client::AWSError<Aws::Client::CoreErrors> &, long) const // NOLINT(google-runtime-int): AWS SDK virtual API requires `long`.
-{
-    /// AWSClient prepares the delay before calling `ShouldRetry`, so this method is reached even
-    /// though no retry will be made. Returning zero avoids needless backoff computation; it is never
-    /// used as a sleep because `ShouldRetry` immediately refuses the attempt.
-    return 0;
-}
-#endif
-
 ObjectStorageBackend::ObjectStorageBackend(ObjectStoragePtr object_storage_, Mode mode_, uint64_t conditional_single_put_cap_)
     : object_storage(std::move(object_storage_))
     , mode(mode_)
@@ -68,41 +47,6 @@ ObjectStorageBackend::ObjectStorageBackend(ObjectStoragePtr object_storage_, Mod
 {
     if (mode == Mode::Native && object_storage->conditionalOpsUseGenerationTokens())
         native_token_type = TokenType::Generation;
-
-#if USE_AWS_S3
-    /// Build the single-attempt conditional-write client once. `tryGetS3StorageClient`
-    /// returns null for non-S3 storage used by local tests; in that case `conditionalWriteSettings`
-    /// leaves the client override unset so the object-storage adapter remains constructible for
-    /// isolated tests. Writable Native mounts reject that configuration in the explicit capability
-    /// check instead of silently relying on transparent retries.
-    ///
-    /// Both retry knobs must be overridden: `retry_strategy.max_retries` (the POD struct) only bounds
-    /// this Client's OWN network-exception wrapper loop (Client::doRequestWithRetryNetworkErrors); the
-    /// AWS SDK's internal per-request retry (5xx, throttling, ...) is driven entirely through the
-    /// polymorphic `retryStrategy` object, which `getClientConfiguration` copies BY POINTER — so
-    /// leaving it in place would still consult the DISK'S retry strategy (max_retries=500, fixed at
-    /// its OWN construction time, unaffected by mutating the POD copy here) for that path.
-    if (mode == Mode::Native)
-    {
-        if (auto base_client = object_storage->tryGetS3StorageClient())
-        {
-            auto cfg = base_client->getClientConfiguration();
-            cfg.retry_strategy.max_retries = 0;
-            cfg.retryStrategy = std::make_shared<detail::SingleAttemptRetryStrategy>();
-
-            /// Enable `Expect: 100-continue` only on this CAS client. A server can reject an
-            /// `If-Match` or `If-None-Match` request before accepting its body, so waiting for the
-            /// 100 response avoids uploading a large body that cannot commit; keeping the override
-            /// request-scoped leaves unrelated S3 traffic unchanged. Respect the disk's configured
-            /// `expect_continue_min_bytes`; if it is unset, retain the established 1 MiB threshold.
-            static constexpr uint64_t kCasFallbackExpectContinueMinBytes = 1024 * 1024;
-            if (cfg.expect_continue_min_bytes == 0)
-                cfg.expect_continue_min_bytes = kCasFallbackExpectContinueMinBytes;
-
-            single_attempt_s3_client = base_client->cloneWithConfigurationOverride(cfg);
-        }
-    }
-#endif
 }
 
 /// See Backend::checkPoolPreconditions. Only the Native, generation-dialect (GCS) combination has
@@ -140,31 +84,26 @@ void ObjectStorageBackend::checkPoolPreconditions()
 }
 
 /// See Backend::checkConditionalWriteSingleAttemptSupport. This is a MOUNT-TIME gate, deliberately
-/// separate from the ctor: the ctor stays silent (single_attempt_s3_client best-effort null) so
-/// narrow, targeted unit tests can keep constructing a raw Native-mode backend over a non-S3
-/// IObjectStorage (LocalObjectStorage) to exercise OTHER behaviors in isolation — the established
-/// convention throughout this test suite (see e.g. gtest_cas_backend_generation.cpp). A REAL writable
-/// mount, by contrast, always reaches this check: runCapabilityProbe (CasProbe.cpp) calls it for
-/// every non-read-only Pool::open, so production never silently runs Native-mode conditional writes
-/// under the disk's default (~500-attempt) transparent retry policy.
+/// separate from the ctor: narrow, targeted unit tests can keep constructing a raw Native-mode backend
+/// over a non-S3 IObjectStorage (LocalObjectStorage) to exercise OTHER behaviors in isolation — the
+/// established convention throughout this test suite (see e.g. gtest_cas_backend_generation.cpp). A
+/// REAL writable mount, by contrast, always reaches this check: runCapabilityProbe (CasProbe.cpp) calls
+/// it for every non-read-only Pool::open, so production never silently runs Native-mode conditional
+/// writes under the disk's default (~500-attempt) transparent retry policy.
 void ObjectStorageBackend::checkConditionalWriteSingleAttemptSupport()
 {
     if (mode != Mode::Native)
         return;
 
-    /// Without AWS S3 support at all, Native mode inherently has no single-attempt machinery — always
-    /// fail closed. With it, the ctor's best-effort client build (see single_attempt_s3_client) is
-    /// what must have actually succeeded.
-#if USE_AWS_S3
-    const bool has_single_attempt_client = static_cast<bool>(single_attempt_s3_client);
-#else
-    const bool has_single_attempt_client = false;
-#endif
-    if (!has_single_attempt_client)
+    /// The property checked is now backend CAPABILITY, not client presence: whether this object
+    /// storage can honor the SingleAttempt retry profile at all (S3ObjectStorage always can; a non-S3
+    /// object storage like LocalObjectStorage cannot).
+    const bool single_attempt_supported = object_storage->supportsRetryProfile(ObjectStorageRetryProfile::SingleAttempt);
+    if (!single_attempt_supported)
         throw Exception(ErrorCodes::NOT_IMPLEMENTED,
-            "CAS Native-mode conditional writes require a single-attempt S3 client (RFC "
-            "cas-s3-timeout-retry-control) but none could be built for this object storage "
-            "(IObjectStorage::tryGetS3StorageClient returned null, or this build has no AWS S3 "
+            "CAS Native-mode conditional writes require an object storage that supports the "
+            "SingleAttempt retry profile (RFC cas-s3-timeout-retry-control), but this one does not "
+            "(IObjectStorage::supportsRetryProfile returned false, or this build has no AWS S3 "
             "support) — refusing to mount writable. Native mode is designed for an S3-like "
             "conditional dialect only; a non-S3 object storage should use EmulatedSingleProcess.");
 }
@@ -821,13 +760,10 @@ WriteSettings ObjectStorageBackend::conditionalWriteSettings() const
     /// (conditional!) request on NO_SUCH_KEY — a client-level override alone does not bound it. Plain
     /// size_t field, harmless (ignored) for a non-S3 write path.
     ws.s3_max_unexpected_write_error_retries_override = 1;
-#if USE_AWS_S3
-    /// Exactly one HTTP attempt for every conditional write when the request-scoped client exists;
-    /// a null client (non-S3 object storage) leaves the disk's own client in place and is rejected for
-    /// writable Native mounts by `checkConditionalWriteSingleAttemptSupport`.
-    if (single_attempt_s3_client)
-        ws.s3_client_override = single_attempt_s3_client;
-#endif
+    /// Exactly one HTTP attempt for every conditional write: the object storage resolves the
+    /// profile to its own single-attempt client. A backend that cannot honor it is rejected for
+    /// writable Native mounts by checkConditionalWriteSingleAttemptSupport (fail closed).
+    ws.object_storage_retry_profile = ObjectStorageRetryProfile::SingleAttempt;
     return ws;
 }
 

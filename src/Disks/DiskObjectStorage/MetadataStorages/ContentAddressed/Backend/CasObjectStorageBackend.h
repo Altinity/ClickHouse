@@ -7,10 +7,6 @@
 
 #include "config.h"
 
-#if USE_AWS_S3
-#include <IO/S3/Client.h>
-#endif
-
 namespace DB::Cas
 {
 
@@ -30,22 +26,6 @@ namespace detail
 /// typed `S3Exception` signal; exposed here for unit tests only — production callers go through
 /// `ObjectStorageBackend`. See the definition for the exact matching rules.
 PutOutcome finalizeConditionalWrite(WriteBuffer & buf);
-
-/// Retry strategy for the client used by conditional writes. `ShouldRetry` always refuses a second
-/// HTTP attempt: an uncertain conditional write must be resolved by CAS code, where the mount fence,
-/// operation budget, and exact-key state are visible, rather than by the generic SDK. Each consultation
-/// is counted because it proves that the SDK considered the first attempt inconclusive or failed.
-/// Exposed here for unit tests; production callers receive it through `ObjectStorageBackend`'s
-/// constructor.
-class SingleAttemptRetryStrategy final : public Aws::Client::RetryStrategy
-{
-public:
-    /// Record that the SDK considered retrying, then refuse the retry.
-    bool ShouldRetry(const Aws::Client::AWSError<Aws::Client::CoreErrors> &, long) const override; // NOLINT(google-runtime-int): AWS SDK virtual API requires `long`.
-    /// Return no delay; `ShouldRetry` rejects the attempt immediately afterward.
-    long CalculateDelayBeforeNextRetry(const Aws::Client::AWSError<Aws::Client::CoreErrors> &, long) const override; // NOLINT(google-runtime-int): AWS SDK virtual API requires `long`.
-    long GetMaxAttempts() const override { return 1; } // NOLINT(google-runtime-int): AWS SDK virtual API requires `long`.
-};
 }
 #endif
 
@@ -139,11 +119,12 @@ public:
     /// bucket has object versioning enabled — see Backend::checkPoolPreconditions.
     void checkPoolPreconditions() override;
 
-    /// Fail-closed precondition for writable Native mode: require the request-scoped client that
-    /// disables transparent conditional-write retries. Without it, an SDK retry could cross the
-    /// mount lease boundary or turn an uncertain result into a misleading precondition failure.
-    /// The constructor may leave the client absent for test construction over non-S3 storage; this
-    /// check is the mount-time gate. No-op for `EmulatedSingleProcess`.
+    /// Fail-closed precondition for writable Native mode: require that the object storage supports the
+    /// SingleAttempt retry profile (ObjectStorageRetryProfile), which disables transparent
+    /// conditional-write retries. Without it, an SDK retry could cross the mount lease boundary or turn
+    /// an uncertain result into a misleading precondition failure. A non-S3 object storage used for
+    /// test construction reports no support; this check is the mount-time gate. No-op for
+    /// `EmulatedSingleProcess`.
     void checkConditionalWriteSingleAttemptSupport() override;
 
     /// The token kind this backend's object storage mints: TokenType::ETag for AWS-compatible
@@ -179,7 +160,7 @@ public:
 
     /// Build settings shared by every Native conditional write. They skip the racy post-upload
     /// existence/size check, force single-part uploads for generation-token stores, and select the
-    /// request-scoped single-attempt S3 client when available.
+    /// SingleAttempt object-storage retry profile.
     WriteSettings conditionalWriteSettings() const;
     WriteSettings conditionalWriteSettingsForTest() const { return conditionalWriteSettings(); }
     /// Override the emulated backend's wall clock for deterministic expiry tests.
@@ -193,16 +174,6 @@ private:
     TokenType native_token_type = TokenType::ETag;
     /// GCS single-PUT budget for conditional writes (generation-token stores only); see ctor.
     const uint64_t conditional_single_put_cap;
-
-#if USE_AWS_S3
-    /// Single-attempt S3 client for conditional writes: a cheap clone of the underlying shared client
-    /// with the same connection pool and credentials, but with SDK retries disabled. This ensures a
-    /// lost response reaches CAS as an uncertain result instead of being hidden by the generic retry
-    /// policy after the mount lease may have expired. Built once for Native mode; absent for non-S3
-    /// storage used by local tests. `conditionalWriteSettings` leaves the disk's client in place in
-    /// that case, while the mount-time capability check rejects writable Native mode.
-    std::shared_ptr<const S3::Client> single_attempt_s3_client;
-#endif
 
     /// EmulatedSingleProcess state: per-key {etag, disambiguator} — see emuMintToken. A successfully
     /// deleted entry is retained only while its etag is recent enough that an immediate recreate could

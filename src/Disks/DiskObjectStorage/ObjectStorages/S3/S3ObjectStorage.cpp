@@ -343,16 +343,12 @@ std::unique_ptr<WriteBufferFromFileBase> S3ObjectStorage::writeObject( /// NOLIN
     if (blob_storage_log)
         blob_storage_log->local_path = object.local_path;
 
-    /// A per-request client override (e.g. CAS conditional writes forcing a single HTTP attempt, the
-    /// predecessor of the profile below — see WriteSettings) takes priority when set; the two are not
-    /// expected to be set simultaneously (Task 8 removes the override). The SingleAttempt profile
-    /// rides on WriteSettings instead of changing this disk's shared client — every other write keeps
-    /// using client.get() and its normal retry policy unchanged. getSingleAttemptClient() is only
-    /// invoked when actually selected, so a plain write never pays for building/locking the clone.
+    /// The SingleAttempt profile (e.g. CAS conditional writes, RFC cas-s3-timeout-retry-control) rides
+    /// on WriteSettings instead of changing this disk's shared client — every other write keeps using
+    /// client.get() and its normal retry policy unchanged. getSingleAttemptClient() is only invoked
+    /// when actually selected, so a plain write never pays for building/locking the clone.
     std::shared_ptr<const S3::Client> used_client;
-    if (write_settings.s3_client_override)
-        used_client = write_settings.s3_client_override;
-    else if (write_settings.object_storage_retry_profile == ObjectStorageRetryProfile::SingleAttempt)
+    if (write_settings.object_storage_retry_profile == ObjectStorageRetryProfile::SingleAttempt)
         used_client = getSingleAttemptClient();
     else
         used_client = client.get();

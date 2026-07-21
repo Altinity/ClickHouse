@@ -128,12 +128,13 @@ TEST(CasProbe, PoolPreconditionsFireThroughInstrumentedWrapper)
     EXPECT_TRUE(inner->list("p/.cas_probe", "", 10).keys.empty());
 }
 
-/// RFC cas-s3-timeout-retry-control: a Native-mode mount without a working single-attempt S3 client
-/// (ObjectStorageBackend::single_attempt_s3_client) must never silently proceed under the disk's
-/// default (~500-attempt) transparent retry policy — see Backend::checkConditionalWriteSingleAttemptSupport.
-/// LocalObjectStorage never exposes an S3 client (IObjectStorage::tryGetS3StorageClient returns null),
-/// so Native mode over it is exactly the case this must refuse. EmulatedSingleProcess is exempt: it
-/// never claims single-attempt S3 semantics in the first place (PassesOnEmulatedLocal above).
+/// RFC cas-s3-timeout-retry-control: a Native-mode mount over an object storage that does not support
+/// the SingleAttempt retry profile must never silently proceed under the disk's default (~500-attempt)
+/// transparent retry policy — see Backend::checkConditionalWriteSingleAttemptSupport.
+/// LocalObjectStorage never supports the profile (IObjectStorage::supportsRetryProfile's default
+/// implementation only answers true for Default), so Native mode over it is exactly the case this must
+/// refuse. EmulatedSingleProcess is exempt: it never claims single-attempt S3 semantics in the first
+/// place (PassesOnEmulatedLocal above).
 TEST(CasProbe, FailsClosedOnMissingSingleAttemptClient)
 {
     auto native = std::make_shared<ObjectStorageBackend>(
