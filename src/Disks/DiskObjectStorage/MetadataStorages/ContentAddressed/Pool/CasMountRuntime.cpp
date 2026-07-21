@@ -2,6 +2,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPartWriteTxn.h>
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
+#include <Common/setThreadName.h>
 #include <Common/thread_local_rng.h>
 #include <algorithm>
 #include <chrono>
@@ -244,6 +245,7 @@ void CasMountRuntime::scheduleRemount()
     remount_running.store(true);
     remount_thread = ThreadFromGlobalPool([this]
     {
+        setThreadName(ThreadName::CAS_REMOUNT);
         uint64_t backoff_ms = 1000;
         while (!remount_stop.load())
         {

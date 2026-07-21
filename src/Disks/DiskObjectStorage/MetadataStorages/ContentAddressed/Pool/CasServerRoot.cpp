@@ -6,6 +6,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasLayout.h>
 #include <Common/Exception.h>
+#include <Common/setThreadName.h>
 #include <base/getFQDNOrHostName.h>
 #include <fmt/format.h>
 
@@ -1030,6 +1031,7 @@ void SingleWriterSlot::stopBackground()
 
 void SingleWriterSlot::backgroundLoop(std::chrono::milliseconds period)
 {
+    setThreadName(ThreadName::CAS_LEASE_KEEPER);
     /// A CONFIRMED mismatch, or a TRANSIENT failure once `shouldFenceOnTransientRenewFailure` says the
     /// lease deadline has neared, stops the loop for good: the slot's seq stops
     /// advancing and GC observes the frozen seq. No retry, no re-mint. A TRANSIENT failure while the

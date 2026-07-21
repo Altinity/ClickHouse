@@ -6,6 +6,7 @@
 #include <Common/ProfileEvents.h>
 #include <Common/ProfileEventsScope.h>
 #include <Common/logger_useful.h>
+#include <Common/setThreadName.h>
 #include <Common/thread_local_rng.h>
 #include <algorithm>
 #include <optional>
@@ -202,6 +203,7 @@ Cas::RoundReport CasGcScheduler::runOneRoundNow(GcRoundLogRecord::Trigger trigge
 
 void CasGcScheduler::loop()
 {
+    setThreadName(ThreadName::CAS_GC_SCHEDULER);
     size_t consecutive_backoffs = 0;
     while (true)
     {
@@ -262,6 +264,7 @@ void CasGcScheduler::loop()
 
 void CasGcScheduler::heartbeatLoop()
 {
+    setThreadName(ThreadName::CAS_GC_HEARTBEAT);
     /// Advance the advisory heartbeat independently of round progress. A long round updates the
     /// durable lease only when it completes, so without these pulses a follower could mistake a
     /// live leader for a dead one during the observation window. A missed pulse is harmless because

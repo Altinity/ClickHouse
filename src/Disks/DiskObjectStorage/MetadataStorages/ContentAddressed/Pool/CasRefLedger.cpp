@@ -9,6 +9,7 @@
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
 #include <Common/ProfileEvents.h>
+#include <Common/setThreadName.h>
 #include <Common/ThreadPool.h>
 #include <base/sleep.h>
 #include <fmt/format.h>
@@ -1513,6 +1514,7 @@ void CasRefLedger::maybeScheduleSnapshotPublish(const RootNamespace & ns, const 
     {
         ThreadFromGlobalPool([owner, this, ns, rt]
         {
+            setThreadName(ThreadName::CAS_REF_SNAPSHOT_PUBLISH);
             try
             {
                 trySnapshotPublishOnce(ns);

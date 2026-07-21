@@ -12,6 +12,7 @@
 #include <IO/WriteHelpers.h>
 #include <Common/Exception.h>
 #include <Common/logger_useful.h>
+#include <Common/setThreadName.h>
 #include <Common/thread_local_rng.h>
 #include <base/scope_guard.h>
 #include <fmt/format.h>
@@ -884,6 +885,7 @@ void Pool::reportImpossibleInterference(const String & key, const String & reaso
     {
         ThreadFromGlobalPool([self, key]
         {
+            setThreadName(ThreadName::CAS_ANOMALY_DIAG);
             try
             {
                 const auto got = self->pool_backend->get(key);
