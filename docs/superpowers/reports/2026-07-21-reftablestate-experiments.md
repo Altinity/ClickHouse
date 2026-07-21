@@ -735,3 +735,5 @@ flat percentage table alone conveys.
 
 Gate: 1,096 tests, 0 failures (unchanged from t5 -- no new tests this round; the "2 DISABLED TESTS"
 footer is the same pre-existing pair E2/E3 already noted).
+
+**Controller verdict (post-T6): REVERT.** Two of the three target benchmarks never reach the plan's 2x bar (`BM_MergedIteration` +11-22%, `BM_SnapshotEncode` noise-level); `BM_Materialize`'s O(N log N) -> O(N) class win is real but materialize runs once per flush, has never appeared in a production trace, and table size is bounded by the admission budget -- the asymptotic tail is theoretical. Simplicity wins; the full implementation and numbers stay recorded here and in git history (revert of `93eb9957cc2`), one revert away if `BM_Materialize` ever surfaces in a soak profile.

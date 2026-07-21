@@ -7,15 +7,13 @@
 #include <memory>
 #include <optional>
 #include <utility>
-#include <vector>
 
 namespace DB::Cas
 {
 
 /// A value-semantic ordered map from `ref_name` to `RefCommittedRow`, designed as a drop-in
-/// replacement for the `std::map<String, RefCommittedRow>` previously held directly by
-/// `RefTableState::committed`. Copies share an immutable ordered base and copy only a per-copy
-/// overlay, so the
+/// replacement for the `std::map<String, RefCommittedRow>` held by `RefTableState::committed`.
+/// Copies share an immutable ordered base and copy only a per-copy overlay, so the
 /// copy-then-mutate-then-swap operations used by `CasRefLedger` and `CasRefProtocol` cost
 /// O(touched rows), rather than copying every committed reference. The shared base is immutable,
 /// but the map itself is not thread-safe; callers retain the same state lock or detached-copy
@@ -40,14 +38,7 @@ namespace DB::Cas
 class RefCowMap
 {
 public:
-    /// Sorted by `.first` (bytewise `String` order, matching `std::map<String, ...>`'s default
-    /// comparator exactly). Kept as a flat vector rather than a node-based tree so ordered/merged
-    /// iteration walks contiguous memory and `materialize()` can rebuild it with a single linear
-    /// merge pass instead of repeated tree insert/erase; keyed lookups pay `std::lower_bound`'s
-    /// O(log n) comparisons (no pointer-chasing tree descent) in exchange for O(n) insert/erase,
-    /// which is fine here because `base` is only ever rebuilt whole, in `materialize()` -- nothing
-    /// mutates it row-by-row.
-    using Base = std::vector<std::pair<String, RefCommittedRow>>;
+    using Base = std::map<String, RefCommittedRow>;
 
 private:
     using Overlay = std::map<String, std::optional<RefCommittedRow>>;
