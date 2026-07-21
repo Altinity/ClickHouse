@@ -1,9 +1,13 @@
 #include <benchmark/benchmark.h>
 
+#include <algorithm>
+#include <vector>
+
 #include <Common/PODArray.h>
 #include <IO/WriteBufferFromVector.h>
 #include <IO/WriteHelpers.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefLogFormat.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCowMap.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefProtocol.h>
 
 /// Pure measurement, no pass/fail assertions -- see the ca-gc-rebuild BACKLOG.md entries
@@ -34,6 +38,48 @@
 ///   writeOp/writeCommittedRow keep the single `writeKey` path for clarity. Per the contingency
 ///   ladder, rung 2 was NOT attempted either (it trades readability and needs a human decision);
 ///   reported as DONE_WITH_CONCERNS. CasEncodingPins.* stayed byte-identical (green) throughout.
+///
+/// Phase B baselines, 2026-07-21, pre-encapsulation (this binary; `--benchmark_repetitions=3
+/// --benchmark_report_aggregates_only=true`; medians reported). Recorded ahead of the
+/// `RefTableState` encapsulation refactor so later phases can re-run this exact suite unchanged and
+/// diff against these numbers. Full comparison table:
+/// docs/superpowers/reports/2026-07-21-reftablestate-experiments.md.
+///   BM_Admits (promote op; stays O(1) via the incremental budget counters, untouched by this round):
+///     N=100: 963 ns    N=1,000: 979 ns    N=10,000: 988 ns    N=100,000: 1,029 ns
+///     Complexity fit: O(1), RMS 2%.
+///   BM_AdmitsAddPrecommit (add op -- THE production hotspot shape: `manifestAlreadyOwned`'s linear
+///   value scan, not yet fixed):
+///     N=100: 995 ns    N=1,000: 4,266 ns    N=10,000: 38,771 ns    N=100,000: 400,222 ns
+///     Complexity fit: O(N), ~4.0 ns/row, RMS 2%.
+///   BM_ApplyRefLogTxn (scratch copy + validate + apply + install of one promote):
+///     N=100: 724 ns    N=1,000: 738 ns    N=10,000: 784 ns    N=100,000: 788 ns
+///     Complexity fit: O(1), RMS 4%.
+///   BM_ReplayHistory (fold/recovery profile: snapshot of size N, 256 tail txns, 2 ops each):
+///     N=100: 6.15 ms    N=1,000: 46.1 ms    N=10,000: 454.0 ms    N=100,000: 4.93 s
+///     Complexity fit: O(N), ~48,859 ns/row, RMS 3%.
+///   BM_ScratchCopy (one full RefTableState copy off a materialized state -- the isolation floor):
+///     N=100: 45.7 ns    N=1,000: 46.0 ns    N=10,000: 46.7 ns    N=100,000: 46.8 ns
+///     Complexity fit: O(1), RMS 1%.
+///   BM_SnapshotEncode (encodeRefTableSnapshot(snapshotOf(state))):
+///     N=100: 14,955 ns    N=1,000: 150,061 ns    N=10,000: 1,508,586 ns    N=100,000: 15,885,841 ns
+///     Complexity fit: O(N), ~159 ns/row, RMS 1%.
+///   BM_MergedIteration (full base + 10%-overlay merged iteration, post-copy pre-materialize shape):
+///     N=100: 759 ns    N=1,000: 7,719 ns    N=10,000: 81,073 ns    N=100,000: 864,552 ns
+///     Complexity fit: O(N), ~8.6 ns/row, RMS 4%.
+///   BM_Materialize (RefCowMap::materialize after one overlay insert on an N-row base):
+///     N=100: 12,069 ns    N=1,000: 126,687 ns    N=10,000: 1,296,326 ns    N=100,000: 18,145,559 ns
+///     Complexity fit: O(N log N), RMS 2%.
+///
+/// Implementation note for later phases: `makeSyntheticState` calls `RefCowMap::materialize()`
+/// after `replay` (which never does -- it is the pure state-machine equation, and
+/// `stateFromSnapshot` loads every row through `emplace`, which only ever touches the overlay).
+/// Skipping that call makes every `RefTableState` copy in this suite (including `admits`'s and
+/// `applyRefLogTxn`'s own internal scratch copies) an O(N) deep-copy of an un-materialized overlay
+/// map instead of an O(1) shared-base copy -- this was caught during this round because it made
+/// BM_Admits regress from the documented O(1) to visibly O(N log N), contradicting its own history
+/// above. Production never hits the un-materialized shape (RefCowMap::materialize's own doc: the
+/// state-install point materializes once per flush, before any batch item runs against the
+/// result), so the fix was to materialize in the helper, not to accept the contaminated numbers.
 
 using namespace DB::Cas;
 
@@ -58,22 +104,47 @@ RefLogTxn makeSamplePromoteTxn()
     return txn;
 }
 
-/// A synthetic committed-ref table of `n` rows, plus one pending precommit ready to promote --
-/// exactly the shape `admits()` previews on every state-growing ref op.
-RefTableState makeSyntheticState(size_t n)
+/// A synthetic snapshot of `n` committed rows plus one pending precommit ready to promote.
+/// Built as a RefTableSnapshot and materialized via the public `replay` entry point, so this
+/// helper keeps compiling unchanged when RefTableState's fields become private (Phase A).
+RefTableSnapshot makeSyntheticSnapshot(size_t n)
 {
-    RefTableState state;
-    state.lifecycle = RefLifecycle::Live;
-    state.greatest_applied = RefTxnId{1, 1};   /// snapshotOf() rejects an all-zero snapshot_id
+    RefTableSnapshot snapshot;
+    snapshot.ns = "roots/bench";
+    snapshot.snapshot_id = RefTxnId{1, 1};
+    snapshot.lifecycle = RefLifecycle::Live;
     for (size_t i = 0; i < n; ++i)
     {
         RefCommittedRow row;
         row.ref_name = "part_" + std::to_string(i) + "_20260719_0_1000_1";
         row.manifest_ref = ManifestRef{1, 1, static_cast<uint32_t>(i + 1)};
-        state.committed.emplace(row.ref_name, row);
+        snapshot.committed.push_back(row);
     }
+    std::sort(snapshot.committed.begin(), snapshot.committed.end(),
+              [](const auto & a, const auto & b) { return a.ref_name < b.ref_name; });
+    snapshot.precommits.push_back(RefOwnerBinding{RefOwnerKind::Precommit, "new_part_x", ManifestRef{1, 1, 999999}});
+    return snapshot;
+}
+
+/// A synthetic committed-ref table of `n` rows, plus one pending precommit ready to promote --
+/// exactly the shape `admits()` previews on every state-growing ref op. Rebuilt through `replay`
+/// (the public state-machine entry point) rather than by poking `RefTableState` fields directly,
+/// so this helper survives Phase A's encapsulation of `RefTableState`.
+///
+/// `replay` (the pure state-machine equation) never materializes: `stateFromSnapshot` loads every
+/// committed row through `RefCowMap::emplace`, which only ever touches the overlay. Left alone,
+/// every subsequent `RefTableState` copy here (`admits`'s and `applyRefLogTxn`'s own internal
+/// scratch copies, and every benchmark's own scratch copy below) would deep-copy an N-row overlay
+/// map instead of sharing an immutable base pointer -- silently turning "the cost of the operation
+/// under test" into "the cost of copying an un-materialized map" and swamping the O(1) `admits`
+/// result the header history documents. Production never observes this shape: `RefCowMap::materialize`'s
+/// own doc says the state-install point materializes once per flush, before any batch item runs
+/// against the result. So this helper does the same, matching what every real caller does
+/// immediately after building or replaying a state.
+RefTableState makeSyntheticState(size_t n)
+{
+    RefTableState state = replay(makeSyntheticSnapshot(n), {});
     state.committed.materialize();
-    state.precommits.emplace("new_part_x", ManifestRef{1, 1, 999999});
     return state;
 }
 
@@ -172,5 +243,190 @@ static void BM_Admits(benchmark::State & state)
     state.SetComplexityN(static_cast<int64_t>(n));
 }
 BENCHMARK(BM_Admits)->RangeMultiplier(10)->Range(100, 100000)->Complexity();
+
+/// THE production hotspot shape: add-precommit runs `manifestAlreadyOwned` (a linear value scan
+/// today). Expected O(N) before the experiments, O(1) after the winning combination. Unlike
+/// BM_Admits (a promote, which never calls `manifestAlreadyOwned`), this previews a pure add --
+/// the op every part publication starts with -- so it is the shape production traces show as
+/// linear even after the incremental-budget fix landed for BM_Admits' promote shape.
+static void BM_AdmitsAddPrecommit(benchmark::State & state)
+{
+    const size_t n = static_cast<size_t>(state.range(0));
+    const RefTableState table = makeSyntheticState(n);
+    RefOp op;
+    op.kind = RefOpKind::OwnerTransition;
+    op.new_binding = RefOwnerBinding{RefOwnerKind::Precommit, "brand_new_part", ManifestRef{2, 1, 1}};
+
+    for (auto _ : state)
+        benchmark::DoNotOptimize(admits(table, op, 1ull << 40, 1ull << 40));
+
+    state.SetComplexityN(static_cast<int64_t>(n));
+}
+BENCHMARK(BM_AdmitsAddPrecommit)->RangeMultiplier(10)->Range(100, 100000)->Complexity();
+
+/// One transaction end-to-end: scratch copy + validate + apply + install (a promote of the
+/// staged precommit). The copy is part of the measured cost on purpose -- it is what E3 attacks.
+static void BM_ApplyRefLogTxn(benchmark::State & state)
+{
+    const size_t n = static_cast<size_t>(state.range(0));
+    const RefTableState table = makeSyntheticState(n);
+
+    RefLogTxn txn;
+    txn.ns = "roots/bench";
+    txn.txn_id = RefTxnId{1, 2};
+    RefOp promote;
+    promote.kind = RefOpKind::OwnerTransition;
+    promote.old_binding = RefOwnerBinding{RefOwnerKind::Precommit, "new_part_x", ManifestRef{1, 1, 999999}};
+    promote.new_binding = RefOwnerBinding{RefOwnerKind::Committed, "new_part_x", ManifestRef{1, 1, 999999}};
+    txn.ops.push_back(promote);
+
+    for (auto _ : state)
+    {
+        RefTableState scratch = table;
+        applyRefLogTxn(scratch, txn);
+        benchmark::DoNotOptimize(&scratch);
+    }
+
+    state.SetComplexityN(static_cast<int64_t>(n));
+}
+BENCHMARK(BM_ApplyRefLogTxn)->RangeMultiplier(10)->Range(100, 100000)->Complexity();
+
+/// The fold/recovery profile: K transactions replayed over a size-N snapshot. Each txn creates
+/// and promotes one new ref (two ops), so each add pays today's `manifestAlreadyOwned` scan.
+/// K fixed at 256; complexity fit is over N.
+static void BM_ReplayHistory(benchmark::State & state)
+{
+    const size_t n = static_cast<size_t>(state.range(0));
+    const RefTableSnapshot snapshot = makeSyntheticSnapshot(n);
+
+    constexpr size_t kTailTxns = 256;
+    std::vector<RefLogTxn> tail;
+    tail.reserve(kTailTxns);
+    for (size_t k = 0; k < kTailTxns; ++k)
+    {
+        RefLogTxn txn;
+        txn.ns = "roots/bench";
+        txn.txn_id = RefTxnId{1, 2 + k};
+
+        /// Refs unique per k, and namespaced under writer_epoch 3 so they collide with nothing in
+        /// the snapshot's own {1,1,i} committed series or its {1,1,999999} precommit.
+        const String ref_name = "replay_part_" + std::to_string(k);
+        const ManifestRef manifest_ref{3, 1, static_cast<uint32_t>(k + 1)};
+
+        RefOp add;
+        add.kind = RefOpKind::OwnerTransition;
+        add.new_binding = RefOwnerBinding{RefOwnerKind::Precommit, ref_name, manifest_ref};
+        txn.ops.push_back(add);
+
+        RefOp promote;
+        promote.kind = RefOpKind::OwnerTransition;
+        promote.old_binding = RefOwnerBinding{RefOwnerKind::Precommit, ref_name, manifest_ref};
+        promote.new_binding = RefOwnerBinding{RefOwnerKind::Committed, ref_name, manifest_ref};
+        txn.ops.push_back(promote);
+
+        tail.push_back(std::move(txn));
+    }
+
+    for (auto _ : state)
+        benchmark::DoNotOptimize(replay(snapshot, tail));
+
+    state.SetComplexityN(static_cast<int64_t>(n));
+}
+BENCHMARK(BM_ReplayHistory)->RangeMultiplier(10)->Range(100, 100000)->Complexity();
+
+/// The isolation primitive on its own: one full state copy (COW committed + std::set precommits
+/// + counters). Overlay is empty (state fresh from replay+materialize), so this is the floor.
+static void BM_ScratchCopy(benchmark::State & state)
+{
+    const size_t n = static_cast<size_t>(state.range(0));
+    RefTableState table = makeSyntheticState(n);
+    table.committed.materialize();   /// makeSyntheticState already materializes; repeated here
+                                      /// defensively (a no-op on an empty overlay) so this benchmark's
+                                      /// floor claim does not silently depend on that helper's internals.
+
+    for (auto _ : state)
+    {
+        RefTableState copy = table;
+        benchmark::DoNotOptimize(&copy);
+    }
+
+    state.SetComplexityN(static_cast<int64_t>(n));
+}
+BENCHMARK(BM_ScratchCopy)->RangeMultiplier(10)->Range(100, 100000)->Complexity();
+
+/// Canonical snapshot encoding for size N (per-flush cost, expected O(N) -- the question is the
+/// constant, which E4's contiguous scan attacks).
+static void BM_SnapshotEncode(benchmark::State & state)
+{
+    const size_t n = static_cast<size_t>(state.range(0));
+    const RefTableState table = makeSyntheticState(n);
+
+    for (auto _ : state)
+        benchmark::DoNotOptimize(encodeRefTableSnapshot(snapshotOf(table, "roots/bench")));
+
+    state.SetComplexityN(static_cast<int64_t>(n));
+}
+BENCHMARK(BM_SnapshotEncode)->RangeMultiplier(10)->Range(100, 100000)->Complexity();
+
+/// Full merged iteration with a 10% overlay (post-copy, pre-materialize shape): `table` starts
+/// from makeSyntheticState's materialized N-row base (a state as it sits between flushes), then the
+/// overlay rows added below land in a fresh overlay -- materialize() is deliberately not called
+/// again -- so iteration must merge base and overlay in sorted order the way the cold full-scan
+/// paths (snapshotOf, listRefs, dropNamespace) do against an in-flight batch.
+static void BM_MergedIteration(benchmark::State & state)
+{
+    const size_t n = static_cast<size_t>(state.range(0));
+    RefTableState table = makeSyntheticState(n);
+
+    const size_t overlay_n = std::max<size_t>(1, n / 10);
+    for (size_t i = 0; i < overlay_n; ++i)
+    {
+        RefCommittedRow row;
+        row.ref_name = "overlay_part_" + std::to_string(i) + "_20260719_0_1000_1";
+        row.manifest_ref = ManifestRef{2, 1, static_cast<uint32_t>(i + 1)};
+        table.committed.insert_or_assign(row.ref_name, row);
+    }
+
+    for (auto _ : state)
+    {
+        size_t total = 0;
+        for (const auto [ref_name, row] : table.committed)
+            total += row.ref_name.size();
+        benchmark::DoNotOptimize(total);
+    }
+
+    state.SetComplexityN(static_cast<int64_t>(n));
+}
+BENCHMARK(BM_MergedIteration)->RangeMultiplier(10)->Range(100, 100000)->Complexity();
+
+/// RefCowMap::materialize after one overlay insert on an N-row base (per-flush install cost).
+/// Benchmarks RefCowMap directly -- it is a public class.
+static void BM_Materialize(benchmark::State & state)
+{
+    const size_t n = static_cast<size_t>(state.range(0));
+    RefCowMap base_map;
+    for (size_t i = 0; i < n; ++i)
+    {
+        RefCommittedRow row;
+        row.ref_name = "part_" + std::to_string(i) + "_20260719_0_1000_1";
+        row.manifest_ref = ManifestRef{1, 1, static_cast<uint32_t>(i + 1)};
+        base_map.emplace(row.ref_name, row);
+    }
+    base_map.materialize();
+
+    for (auto _ : state)
+    {
+        RefCowMap copy = base_map;
+        RefCommittedRow new_row;
+        new_row.ref_name = "brand_new_part_20260719_0_1000_1";
+        new_row.manifest_ref = ManifestRef{2, 1, 1};
+        copy.insert_or_assign(new_row.ref_name, new_row);
+        copy.materialize();
+        benchmark::DoNotOptimize(&copy);
+    }
+
+    state.SetComplexityN(static_cast<int64_t>(n));
+}
+BENCHMARK(BM_Materialize)->RangeMultiplier(10)->Range(100, 100000)->Complexity();
 
 BENCHMARK_MAIN();
