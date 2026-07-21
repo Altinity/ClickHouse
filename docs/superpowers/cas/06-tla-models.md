@@ -132,9 +132,12 @@ code path.
 ### `CaIncarnationProofCore.tla` — Apalache inductive invariant {#caincarnationproofcore}
 
 **Files:** `CaIncarnationProofCore.tla`, `Apalache.tla`, `CaIncarnationProofCore_tlc.cfg`,
-`CaIncarnationProofCore_tlc2h.cfg`
+`CaIncarnationProofCore_tlc2h.cfg`, `run_apalache.sh` — **removed 2026-07-22** (stale AND
+unverifiable here — no Apalache binary; full text in git history). It modeled a superseded fragment
+of the core and could not be re-checked, let alone re-derived, in this environment. If an inductive
+proof is wanted, install Apalache and re-derive `IndInv` against the current `CaIncarnationCore.tla`.
 
-**What it proves.** An inductive invariant `IndInv` (19 conjuncts) for the pre-B91, `W-REVALIDATE`
+**What it proved.** An inductive invariant `IndInv` (19 conjuncts) for the pre-B91, `W-REVALIDATE`
 token-only fragment (single leader, no trees/debris/evidence/split-brain). Apalache 0.58.0 verified
 base case (`Init => IndInv`, 1 s) and step check (`IndInv => IndInv'`, 45–73 s) — both `NoError`. This
 is stronger than TLC bounded-checking: the step check quantifies over ALL states satisfying `IndInv` at
@@ -151,8 +154,11 @@ Negative controls: dropping `InflightHeld` or `InflightVsRefs` each leave the st
 `W-REVALIDATE` re-observation conjunct from `WPublish` (`NextNoReval`) produces a counterexample
 breaking `NoDangle` — machine-checking the F1 re-observation requirement.
 
-**Code currency:** STALE (self-flagged). Predates the B91 amendments (namespace registry,
-evidence staleness, `ViewableRound`). Re-derivation is an open follow-up.
+**Code currency:** STALE and REMOVED 2026-07-22. Predated the B91 amendments (namespace registry,
+evidence staleness, `ViewableRound`); the canonical current-design coverage is
+`CaIncarnationCore.tla` (bounded TLC, CURRENT). A stale inductive proof of a superseded fragment
+that cannot be re-verified in this environment is false comfort, so it was removed rather than kept
+as speculative groundwork.
 
 ---
 
@@ -739,7 +745,7 @@ counterexamples found during EBR model development encoded the four load-bearing
 | Model | Area | Status | Key invariant(s) | Sabotages | Design decisions |
 |---|---|---|---|---|---|
 | `CaIncarnationCore.tla` | GC core | **CURRENT** (minor drift) | `INV_NO_DANGLE`, `INV_NO_LOSS`, `INV_NO_RETURN`, `INV_JOURNAL_COVERAGE` | 11 | fence, recheck, exact-token delete, atomic cascade, registry fence-time universe, evidence re-observation |
-| `CaIncarnationProofCore.tla` | GC core (Apalache) | **STALE** (pre-B91; re-derive needed) | `IndInv` (19 conjuncts) inductive at fixed bounds | 5 negative controls | `W-REVALIDATE` is load-bearing (F1 machine-checked); `InflightCurrentUnreferenced` is irredundant |
+| `CaIncarnationProofCore.tla` | GC core (Apalache) | **REMOVED 2026-07-22** (stale pre-B91; unverifiable — no Apalache) | `IndInv` (19 conjuncts) inductive at fixed bounds | 5 negative controls | `W-REVALIDATE` is load-bearing (F1 machine-checked); `InflightCurrentUnreferenced` is irredundant |
 | `CaBuildRootPrecommit.tla` | Precommit/B140/B199-S2 | **CURRENT** | `INV_NO_DANGLE_COMMITTED`, `INV_BUILDROOT_PROTECTS`, `INV_COMMIT_FAILCLOSED`, `INV_NO_LEAK` | 2 + 1 liveness | build-root + fail-closed commit jointly necessary; inline closure at precommit time |
 | `CaGcLeaseCore.tla` | Lease/B160 | **CURRENT** | `NoEpochCollision`, `NoFalseSteal` | 1 | advisory heartbeat eliminates false steals; safety independent of heartbeat |
 | `CaCasMountCore.tla` | Mount | **CURRENT** | `NoTwoServerUuids…`, `ForeignUuid…`, `WriterEpochMonotoneUnique`, `SupersededWriter…` | 3 | sticky owner, monotone epoch, lost-actor write block |
@@ -817,8 +823,9 @@ java -XX:+UseParallelGC -cp ../../../tmp/tla2tools.jar tlc2.TLC -workers auto \
   -config CaGcIndegRefoldCore_sab.cfg CaGcIndegRefoldCore.tla  # MUST violate INV_INDEG_NONNEGATIVE
 
 # Apalache inductive invariant (proof core)
-./run_apalache.sh base check --cinit=CInit --init=Init --inv=IndInv --length=0 CaIncarnationProofCore.tla
-./run_apalache.sh step check --cinit=CInit --init=IndInvInit --inv=IndInv --length=1 CaIncarnationProofCore.tla
+# (CaIncarnationProofCore.tla + Apalache.tla + run_apalache.sh were removed 2026-07-22 — stale
+#  pre-B91 fragment, unverifiable without an Apalache binary. To revive: install Apalache and
+#  re-derive IndInv against the current CaIncarnationCore.tla.)
 ```
 
 ## Clamp + destruction-suppression extension (2026-07-03) {#area-clamp-suppression}

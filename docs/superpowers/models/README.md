@@ -49,7 +49,6 @@ Status legend:
 | Model | Proves / gates | Status | Runner |
 |---|---|---|---|
 | `CaIncarnationCore.tla` | canonical incarnation-token GC core (fold → retire → fence → recheck → exact-token delete → cascade → trim) | CURRENT | `run_tlc.sh` |
-| `CaIncarnationProofCore.tla` (+ `Apalache.tla`) | machine-checked inductive invariant for the single-leader, token-only fragment of the core | STALE (kept) | `run_apalache.sh` |
 | `CaBuildRootPrecommit.tla` | adopted-blob dangle fix: precommit-first build-root reachability + fail-closed commit + inline closure recording | CURRENT | (inline TLC) |
 | `CaGcLeaseCore.tla` | GC leader lease: epoch-fence safety, advisory heartbeat against false steals | CURRENT | (inline TLC) |
 | `CaCasMountCore.tla` | mount ownership: sticky owner, monotone epoch, observation-based lease reclaim | CURRENT | `run_mount.sh` |
@@ -85,12 +84,6 @@ Status legend:
   atomic with the delete; the registry fence must use the committed (not fold-time) namespace
   universe; stale dependency evidence must be re-observed before publish. Configs: `_stage1..6*`,
   `_hunt_*`, `_reval_stage2`, `_sab_*`.
-- **`CaIncarnationProofCore.tla`** + **`Apalache.tla`** — an Apalache-checked inductive invariant
-  (19 conjuncts) for the single-leader, token-only fragment of the core: stronger than bounded
-  model checking at its fixed bounds, since the step check quantifies over ALL states satisfying
-  the invariant. STALE: it predates the namespace-registry and evidence-staleness amendments to
-  the core; kept as the groundwork (counterexample-to-induction journal) for a future parametric
-  proof. Configs: `_tlc.cfg`, `_tlc2h.cfg`.
 - **`CaGcAckFloorCore.tla`** / **`CaGcAckFloorZombie.tla`** — the one-pass GC round and its
   two-leader hardening. The round pipeline (`GBegin`/`GFold`/`GComplete`), the clamp-suppression
   guard (a pass that had to hold back an unreadable shard makes no destructive decision), the
@@ -274,4 +267,5 @@ history:
 | `CaMetaAbsenceClean.tla` (+ `run_metaabsence.sh`) | gated a "meta absence means clean" tombstone-only variant whose heal transition clears a condemned marker in place; blocked — that is exactly the marker-clearing shown unsafe by `CaRetiredInRunFoldAbortWitness.tla` (add-only meta), and the model's own green run rested on a premise refuted by the code's token-preserving adoption path; no such code landed |
 | `CaManifestSweepWindow.tla` (+ `run_sweepwindow.sh`) | proved the orphan sweep must skip a committed body whose removal record is not yet sealed by the fold (deleting it early wedges the removal-fold forever); the interleaving space is tiny and the deterministic unit test `CasOrphanManifestSweep.PendingCommittedRemovalBodyIsSkipped` (plus ten sibling sweep tests) covers the same scenarios — the model added no assurance beyond them |
 | `CaGcResurrectReuploadOrphan.tla` | reproduced a real leak (a condemned blob replaced by a resurrect re-upload was never re-condemned, because the fold keyed the decision on hash alone and only revisits blobs touched in the current window) and proved the fix: settle the stale entry AND re-condemn the current token. The fix landed in `closeBlob` (`CasBlobInDegree.cpp`) and is pinned by the deterministic `CasGcLeak.ResurrectReplaced*` unit tests; at 194 distinct states the model explored essentially that one scenario, adding nothing beyond the tests |
+| `CaIncarnationProofCore.tla` (+ `Apalache.tla`, `run_apalache.sh`) | an Apalache-checked inductive invariant for the single-leader, token-only fragment of the GC core; stale (predated the namespace-registry and evidence-staleness amendments — those are covered by `CaIncarnationCore.tla`) AND unverifiable here (no Apalache binary installed). A stale inductive proof of a superseded fragment that cannot be re-checked is false comfort; to revive it, install Apalache and re-derive the invariant against the current `CaIncarnationCore.tla` |
 | `CaIncarnationCore.pdf`, `CaIncarnationCore.toolbox/` | generated TLA+ Toolbox pretty-print artifacts (regenerable from the module) |
