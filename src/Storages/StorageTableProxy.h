@@ -54,14 +54,14 @@ public:
     StoragePolicyPtr getStoragePolicy() const override { return nullptr; }
     bool isView() const override { return false; }
 
-    /// `IStorage`'s default is a silent no-op, but nested engines override it to REJECT (e.g.
-    /// `StorageReplicatedMergeTree`, `StorageKeeperMap`) -- without this forward a lazy table's
-    /// rename silently bypasses the nested engine's restriction. Deliberately on this class and
-    /// NOT on the generic `StorageProxy`: `StorageTableFunctionProxy` must not instantiate its
-    /// underlying storage for a metadata-only rename. Materializing a lazy table here is the
-    /// point -- an authoritative check outweighs laziness.
-    void checkTableCanBeRenamed(const StorageID & new_name) const override { getNested()->checkTableCanBeRenamed(new_name); }
-
+    /// NOTE: this proxy deliberately does NOT forward `checkTableCanBeRenamed` to the nested engine.
+    /// Doing so would materialize the lazy table (`getNested`) while `DatabaseAtomic` holds its
+    /// non-recursive database mutex, and a schema-inferred lazy `Buffer` resolves its destination via
+    /// `DatabaseCatalog::getTable` in its constructor -- re-entering the same database and self-
+    /// deadlocking. Bypassing the nested engine's rename restriction for a lazy (never-accessed) table
+    /// is a pre-existing gap tracked in docs/superpowers/cas/BACKLOG.md; the correct fix is to
+    /// materialize before the database mutex is taken, at the interpreter level.
+    ///
     /// Startup is deferred until first access via `getNested`.
     void startup() override { }
 

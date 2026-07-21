@@ -597,3 +597,16 @@ implemented is net-negative — disable/quarantine rather than fix one virtual a
 - [ ] If the feature stays: forward at least `backupData`/`restoreDataFromBackup`/
   `supportsBackupPartition`/`finalizeRestoreFromBackup`, `onActionLockRemove`,
   `supportsOptimizationToSubcolumns` (the audit's three most-urgent), then the rest of class B.
+- [ ] FOURTH bug of the class + a REVERT (2026-07-22, xhigh review): the `checkTableCanBeRenamed`
+  forward added on `StorageTableProxy` (7ab1fc15f4c) was REVERTED — it materializes the lazy table
+  (`getNested`) while `DatabaseAtomic` holds its non-recursive database mutex (DatabaseAtomic.cpp:321/346),
+  and a schema-inferred lazy `Buffer` resolves its destination via `DatabaseCatalog::getTable` in its
+  constructor (StorageBuffer.cpp:180), re-entering the same database and self-deadlocking (cross-database
+  RENAME/EXCHANGE can hold two database mutexes across the same work). So the nested engine's rename
+  restriction is once again bypassed for a lazy (never-accessed) table — the pre-existing gap is REOPENED,
+  not newly introduced. Correct fix (same shape as the other class-C bugs): materialize the proxy BEFORE
+  any database mutex is taken, at the interpreter level, then re-fetch/verify identities under the lock and
+  run the check on the materialized storage. NOTE for any upstream PR: the KEPT generic `checkMutationIsPossible`
+  forward on `StorageProxy` also changes `StorageTableFunctionProxy` semantics (a table-function proxy now
+  answers the mutation-possibility check from its nested storage rather than the `IStorage` default) — sound,
+  but call it out explicitly (codex F5).
