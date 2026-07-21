@@ -415,13 +415,12 @@ IStorageCluster::ResolvedClusterRead IStorageCluster::resolveClusterRead(Context
         auto remote_initiator_cluster_name = settings[Setting::object_storage_remote_initiator_cluster].value;
         if (!remote_initiator_cluster_name.empty())
         {
-            /// Allow a missing remote-initiator cluster only when we would fall back to a pure/local read anyway.
-            const bool allow_null = local_fallback && result.fallback_to_pure;
+            /// Never soft-fail a missing/empty remote-initiator cluster via
+            /// object_storage_cluster_fallback_to_local_if_empty: that setting applies only to object_storage_cluster.
             result.remote_initiator_cluster = getClusterImpl(
                 context,
                 remote_initiator_cluster_name,
-                /*max_hosts*/ 0,
-                allow_null);
+                /*max_hosts*/ 0);
         }
     }
 

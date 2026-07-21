@@ -471,6 +471,22 @@ def test_object_storage_cluster_fallback_to_local_if_empty(started_cluster):
     # initial node + remote initiator.
     assert queries == ["2"]
 
+    # A missing remote-initiator cluster must not be masked by local OSC fallback.
+    error = node.query_and_get_error(
+        f"""
+        SELECT count(*) from s3(
+            'http://minio1:9001/root/data/{{clickhouse,database}}/*',
+            'minio', '{minio_secret_key}', 'CSV',
+            'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))')
+        SETTINGS
+            object_storage_remote_initiator=1,
+            object_storage_cluster='cluster_remote',
+            object_storage_remote_initiator_cluster='non_existing_remote_initiator_cluster',
+            object_storage_cluster_fallback_to_local_if_empty=1
+        """
+    )
+    assert "not found" in error or "CLUSTER_DOESNT_EXIST" in error or "doesn't exist" in error.lower()
+
 
 def test_ambiguous_join(started_cluster):
     node = started_cluster.instances["s0_0_0"]

@@ -49,6 +49,14 @@ SETTINGS
     object_storage_remote_initiator = 1,
     object_storage_remote_initiator_cluster = 'test_shard_localhost';
 
+SELECT 'remote initiator cluster missing does not use local fallback';
+SELECT count() FROM s3('http://localhost:11111/test/04303_object_storage_cluster_fallback.tsv', 'TSV', 'x UInt32')
+SETTINGS
+    object_storage_cluster = 'test_shard_localhost',
+    object_storage_cluster_fallback_to_local_if_empty = 1,
+    object_storage_remote_initiator = 1,
+    object_storage_remote_initiator_cluster = 'non_existent_remote_initiator_04303'; -- { serverError CLUSTER_DOESNT_EXIST }
+
 SELECT 'aggregate with fallback';
 SELECT sum(x * x) FROM s3('http://localhost:11111/test/04303_object_storage_cluster_fallback.tsv', 'TSV', 'x UInt32')
 SETTINGS object_storage_cluster = 'non_existent_cluster_04303', object_storage_cluster_fallback_to_local_if_empty = 1;
