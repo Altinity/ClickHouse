@@ -431,3 +431,37 @@ machinery entirely and just run the filter directly.
 
 - [x] RESOLVED as misdiagnosis + REAL FIX LANDED (f1f11 soak 2026-07-21): the "post-kill CA table load takes minutes" finding was an artifact — the table sits in a lazy_load_tables=1 DB (706095958ea) and materializes in ~18 ms on first touch; nothing touched it post-kill, while SYSTEM SYNC REPLICA misreported the unmaterialized StorageTableProxy as "is not replicated". Fixed in 2ba28ac4b6f (unwrapTableProxy across single-table SYSTEM verbs + stateless test 05017). OPEN EMPIRICAL TAIL: measure post-fault getNested cost under churn at the next soak's first chaos checkpoint — if genuinely minutes, that is the real availability item.
 - [ ] lazy_load_tables follow-ups (from T15 review, pre-existing): whole-db DROP REPLICA safety scan (InterpreterSystemQuery.cpp:~1687) and RESTART REPLICAS iteration skip unmaterialized proxies — a stale remote replica in ZK may stay uncleaned for lazy tables; STOP/START <action> on a single lazy table parks the ActionLock on the PROXY, invisible to the later-materialized nested storage.
+
+## Ref-ledger follow-ups from the two-model adversarial consult (Fable max-depth + gpt-5.6-sol high, 2026-07-21) {#ref-ledger-consult-followups-2026-07-21}
+
+Companion of the fail-closed restore (un-elided cross-owner check + snapshot validation + container
+hardening + `ApplyMode` privatization) that landed the same night. The three items below were
+consult-flagged, controller-verified, and deliberately DEFERRED with measurement/design gates —
+per-item severity and evidence in `docs/superpowers/reports/2026-07-21-reftablestate-experiments.md`
+and `tmp/consult-gpt56sol-answer.md`.
+
+- [ ] **HARD (design): post-durable-PUT allocation window in the ref-lane flush** (gpt-5.6-sol F2).
+  After the object store confirms the ref-log PUT `Committed`, the leader still performs allocating
+  work (`applyRefLogTxn` live install, `materializeCommitted` copying both COW containers) inside the
+  same critical section; a `std::bad_alloc` there is reported by the catch as "permanently
+  unreplayable history" and completes every waiter with an error for a transaction that IS durable —
+  a retry then legitimately observes "already exists"/"absent" splits. Pre-existing shape (predates
+  this round; E2's second container widened the window marginally). Fix direction (consult-endorsed):
+  construct + fully materialize the exact candidate state BEFORE the PUT; after durability, install
+  via a verified no-throw move under `state_mutex` (static_assert on noexcept), then update tail
+  counters. Touches the ledger flush ordering — needs its own spec + soak gate.
+- [ ] **DESIRABLE (measured, est. 2-3× recovery/GC-rebuild cut): recovery re-runs 3-4 codec passes per
+  snapshot row** (Fable F5). `recoverRefTableDetailed` decodes the snapshot, then `stateFromSnapshot`
+  re-encodes + re-decodes it (hand-built-snapshot defense), then per-row size helpers re-encode
+  fragments; the E3 report's "residual O(N)" replay constant is mostly this. Fix direction: a
+  validated-witness type produced by `decodeRefTableSnapshot` that `stateFromSnapshot` accepts
+  without the round-trip (hand-built callers keep the round-trip path); micro-bonus: seed
+  `snapshot_body_bytes` from `bytes.size() - snapshotFramingSize(...)`. Gate: benchmark
+  recovery-then-first-append before/after.
+- [ ] **VERIFY-then-maybe (measured): `precommits` is a plain `std::set`, deep-copied per state copy**
+  (both consults, independently). Every `RefTableState` scratch copy is O(P) string copies; P is
+  bounded only by the admission byte budget (up to ~64 MiB encoded), not by the 1,000-op txn cap;
+  every shipped "copy O(1) ~58 ns" number used a ONE-precommit fixture. BOTH consults: do NOT build
+  a third COW container without a number. First step: extend `BM_ScratchCopy`/`BM_Admits` with a
+  P-sweep (P=1/100/10,000) and check a precommit-heavy soak phase; only a real measured cliff
+  justifies a `RefCowPrecommitSet`.
