@@ -424,3 +424,7 @@ sanitizer builds). Any CAS gtest battery gate going forward can drop the peel-an
 machinery entirely and just run the filter directly.
 
 - [ ] CLEANUP (from F4a review 2026-07-21): delete dead pre-rev.6 config keys `content_addressed_allow_shared_pool` and `content_addressed_gc_grace_sec` from the ~7 integration-test XMLs that still set them, then drop both from `ContentAddressedSettings`' `non_cas_keys` skip-set so typo detection covers that namespace again. They are read nowhere in the current factory.
+
+- [ ] CLEANUP (from final-review polish 2026-07-21): unify `content_addressed_garbage_collection_log`'s own `srid` column (and the `SYSTEM CONTENT ADDRESSED DROP POOL MEMBER` input-arg shorthand docs) with the spelled-out `server_root_id` naming F3 landed for `system.content_addressed_mounts`.
+- [ ] DOC POLISH (from final-review polish 2026-07-21): `review1.md:147`'s bare "F1" tag collides with that same doc's own "finding N" numbering convention used everywhere else in it; and `refactoring-ideas.md:383` now anachronistically says the 2026-07-10 `01271_show_privileges` fix used the `SYSTEM CONTENT ADDRESSED GC RUN` row name, but that rename only landed in the 2026-07-21 F1 sweep — on 2026-07-10 the command was still `GARBAGE COLLECTION`.
+- [ ] CHANGELOG (from final-review polish 2026-07-21): write the release-note/changelog line for the now-live unknown-CAS-config-key rejection (fails disk startup on a typo'd key; was previously a silent no-op) once the feature ships.

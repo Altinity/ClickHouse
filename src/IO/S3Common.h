@@ -98,8 +98,9 @@ inline bool isPreconditionFailedError(const Aws::Client::AWSError<ErrorType> & e
         || error.GetMessage().find("PreconditionFailed") != std::string::npos;
 }
 
-/// Error-name classifiers shared by S3Exception::isRetryableError and the CAS conditional-write
-/// outcome mapping — one maintained list per family, so the two consumers cannot drift.
+/// Error-name classifiers factored out of the CAS conditional-write outcome mapping
+/// (`CasRequestControl.cpp`), so the name lists live next to the other S3 error classifiers here
+/// and are available for reuse.
 bool isMalformedRequestError(const S3Exception & e);
 bool isEntityTooLargeError(const S3Exception & e);
 bool isAccessDeniedError(const S3Exception & e);

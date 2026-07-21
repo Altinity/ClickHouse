@@ -135,7 +135,7 @@ TEST(CasProbe, PoolPreconditionsFireThroughInstrumentedWrapper)
 /// implementation only answers true for Default), so Native mode over it is exactly the case this must
 /// refuse. EmulatedSingleProcess is exempt: it never claims single-attempt S3 semantics in the first
 /// place (PassesOnEmulatedLocal above).
-TEST(CasProbe, FailsClosedOnMissingSingleAttemptClient)
+TEST(CasProbe, FailsClosedOnUnsupportedSingleAttemptProfile)
 {
     auto native = std::make_shared<ObjectStorageBackend>(
         DB::Cas::tests::makeLocalObjectStorageForTest(), ObjectStorageBackend::Mode::Native);
