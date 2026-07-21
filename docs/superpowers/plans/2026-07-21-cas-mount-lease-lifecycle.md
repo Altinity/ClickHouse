@@ -573,3 +573,30 @@ Note: the bare-identifier disk target may not accept a leading-digit name unquot
 - Every gtest sketch above marked "harness as in the file" REQUIRES reading the target test file first and reusing its real fixtures — the sketches fix the assertions and semantics, not the fixture spelling.
 - After Task 6+, `SYSTEM` verb changes require rebuilding the full `clickhouse` binary for stateless runs (`ninja -C build clickhouse`), not just `unit_tests_dbms`.
 - The debug/ASan e2e validation of the original crash (04295 under a debug build) happens in CI on the next PR#2073 push — flag it in the final report; local debug-build verification is optional (`build_debug` exists) but slow.
+
+---
+
+### Task 8a: Dormant CA disk answers existence/enumeration probes as absent (Part 6)
+
+Ordering: this is a PRODUCT-CODE fix that must land BEFORE Task 8's parallel no-leftovers rewrite
+can pass (Task 8 exposed the bug). Insert between Task 7 and Task 8's commit.
+
+**Files:**
+- Modify: `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.{h,cpp}`
+  — add a private non-throwing `bool isMounted() const` (reads `mount_state == Mounted && cas_store`
+  under `pointer_mutex`); add a top-of-method early-return guard to the READ-ONLY existence/enumeration
+  overrides.
+- Test: `src/Disks/tests/gtest_ca_transaction.cpp` (extend the `CaLifecycle` suite).
+
+**Benign-absent set** (early return BEFORE any `store()`/`partAccess()`): `existsFile`→false,
+`existsDirectory`→false, `existsFileOrDirectory`→false, `isDirectoryEmpty`→true, `listDirectory`→{},
+`iterateDirectory`→empty iterator, `getStorageObjectsIfExist`→nullopt.
+**Still-throw set** (unchanged, fail-close): `getFileSize`, `getLastModified`, `getStorageObjects`
+(non-IfExist), all mutating/transaction ops.
+
+- [ ] Step 1: gtest (RED): startup → unmountSynchronously → assert `existsDirectory("store")`==false,
+  `existsFile(...)`==false, `listDirectory(...)`.empty(), `isDirectoryEmpty(...)`==true,
+  `getStorageObjectsIfExist(...)`==nullopt; AND assert `getFileSize(...)` / `getStorageObjects(...)`
+  still throw `INVALID_STATE`. (RED: today they all throw.)
+- [ ] Step 2: add `isMounted()` + the early-return guards; verify GREEN + full CA gate.
+- [ ] Step 3: commit (`cas: a dormant CA disk answers existence/enumeration probes as absent, not INVALID_STATE`).

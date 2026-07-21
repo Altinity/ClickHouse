@@ -297,3 +297,34 @@ deprecation note to stderr.
   FSCK asserting zero leftovers.
 - `ca-fsck` works; `fsck` alias works with a deprecation note; all tracked callers updated.
 - Full CA gtest gate green.
+
+## Part 6: a Dormant disk answers existence/enumeration probes as absent (post-mortem addition)
+
+**Why (real bug found by Task 8's parallel run):** Task 4's gate makes every operation that
+routes through `poolAccess`/`store` throw `INVALID_STATE` when the disk is not `Mounted`. But the
+server has generic sweeps that iterate `Context::getDisksMap()` (ALL disks) and probe each with an
+existence/enumeration call — notably `DatabaseCatalog::dropTableFinally`
+(`DatabaseCatalog.cpp:1657`, "even if table is not loaded, try remove its data from disks") which
+calls `disk->existsDirectory(data_path)` on every disk to reap orphaned table data. A Dormant CA
+disk is not `isReadOnly()`, so it is eligible, and `existsDirectory` → `store()` → `throwNotMounted`
+→ `INVALID_STATE`. The finalizer fails, `DatabaseCatalog` logs "Will retry later" and retries
+forever, `TablesToDropQueueSize` never drains, and **every `DROP TABLE` server-wide hangs while any
+CA disk is Dormant.** Other all-disk sweeps (`MergeTreeData` orphaned-parts search, `Freeze`,
+`system.remote_data_paths`) have the same shape.
+
+**Fix (keeps generic code CA-agnostic; fail-safe):** a not-`Mounted` CA disk answers the READ-ONLY
+existence/enumeration surface as *absent/empty* instead of throwing — a top-of-method early return
+before any `store()`/`partAccess()` call:
+
+- `existsFile` / `existsDirectory` / `existsFileOrDirectory` → `false`
+- `isDirectoryEmpty` → `true`
+- `listDirectory` → `{}` ; `iterateDirectory` → empty iterator
+- `getStorageObjectsIfExist` → `std::nullopt`
+
+Content/size/mutation stay fail-close (still throw `INVALID_STATE` when not `Mounted`):
+`getFileSize`, `getLastModified`, `getStorageObjects` (non-`IfExist`), and every mutating/transaction
+entry point. Guarding the enumeration entry points is sufficient: a sweep that finds nothing to
+enumerate never reaches the asserting getters. This is fail-safe — a false "absent" makes a sweep
+SKIP (never `removeRecursive`), and the Task-6 live-table guard already forbids unmounting while a
+live table's data is on the disk, so no reachable data is ever hidden. The check is a non-throwing
+`isMounted()` reading `mount_state`/`cas_store` under `pointer_mutex`.
