@@ -63,7 +63,6 @@ Status legend:
 | `CaGcCondemnMarkerGate.tla` | graduation gated on confirmed durable condemn marker | CURRENT | `run_condemnmarker.sh` |
 | `CaEdgeBeforeObserve.tla` | with edge-before-observe write order, promote-time revalidation of tokened leaves is redundant | CURRENT | `run_ebo.sh` |
 | `CaMetaDescriptor.tla` | per-hash freshness meta: create bottom-up, delete top-down | CURRENT (predates the final two-state codec trim) | `run_meta.sh` |
-| `CaManifestSweepWindow.tla` | orphan sweep must skip a committed body with a pending unsealed removal | CURRENT | `run_sweepwindow.sh` |
 | `CaRetiredInRun.tla` | retired list folded into the snapshot run (two-cursor merge, coverage coherence) | CURRENT | `run_retiredinrun.sh` |
 | `CaRetiredInRunFoldAbortWitness.tla` | GC freshness meta is add-only: a spare never clears a condemned marker | CURRENT | `run_foldabort_witness.sh` |
 | `CaRefTableSnapshotLogCore.tla` | ref-table snapshot + append-only log protocol; coverage-at-birth mount seal | CURRENT | `run_refsnaplog.sh` |
@@ -178,11 +177,6 @@ Status legend:
   two explicit steps; 7 sabotages cover each wrong ordering, blind adoption over a condemned
   marker, and deleting the body at whatever token it currently holds. The model predates one final
   simplification of the marker codec (a trim to two states) and has not been re-run against it.
-- **`CaManifestSweepWindow.tla`** — when a committed manifest reference is dropped, its removal
-  record sits in the shard journal until the GC fold seals it; in that window the orphan sweep is
-  already allowed to reclaim by the build watermark. The sweep must skip a committed body whose
-  removal is still unsealed — the removal-fold needs the body present to emit its in-degree
-  decrement, and deleting it early wedges the fold permanently.
 
 ### Retired-in-run family {#group-retired-in-run}
 
@@ -286,4 +280,5 @@ history:
 | `CaMetaDescriptorRaw.tla` (+ `run_metaraw.sh`) | explored raw immutable write-once bodies with a three-state meta as sole linearizer; rejected — a fixed-etag raw body cannot be displaced by a resurrect, forcing a terminal-tombstone handshake that couples writer liveness to GC |
 | `CaMetaIncarnationKey.tla` (+ `run_inckey.sh`) | explored per-incarnation body keys; rejected — reintroduces the incarnation-in-the-key design rejected earlier in the project (a 404-then-LIST read path, incarnation leaking into manifests, breaking pure-content manifests) |
 | `CaMetaAbsenceClean.tla` (+ `run_metaabsence.sh`) | gated a "meta absence means clean" tombstone-only variant whose heal transition clears a condemned marker in place; blocked — that is exactly the marker-clearing shown unsafe by `CaRetiredInRunFoldAbortWitness.tla` (add-only meta), and the model's own green run rested on a premise refuted by the code's token-preserving adoption path; no such code landed |
+| `CaManifestSweepWindow.tla` (+ `run_sweepwindow.sh`) | proved the orphan sweep must skip a committed body whose removal record is not yet sealed by the fold (deleting it early wedges the removal-fold forever); the interleaving space is tiny and the deterministic unit test `CasOrphanManifestSweep.PendingCommittedRemovalBodyIsSkipped` (plus ten sibling sweep tests) covers the same scenarios — the model added no assurance beyond them |
 | `CaIncarnationCore.pdf`, `CaIncarnationCore.toolbox/` | generated TLA+ Toolbox pretty-print artifacts (regenerable from the module) |

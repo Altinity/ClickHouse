@@ -760,7 +760,7 @@ counterexamples found during EBR model development encoded the four load-bearing
 | `CaMetaDescriptor.tla` | Writer/GC simplification Gate B (meta descriptor, v1) | **CURRENT** (predates the v3 2-state trim) | `INV-META-BODY` | 7 | create bottom-up (body, then meta); delete top-down (meta at captured etag, then body at condemn-time token) |
 | `CaMetaDescriptorRaw.tla` | Gate B raw-body / terminal-tombstone | **REMOVED 2026-07-21** (rejected by v3) | `INV_NO_LOSS`, `INV_NO_DANGLE`, `INV_META_BODY` | 5 | raw immutable bodies force a terminal tombstone + writer-waits-on-GC coupling; rejected in favor of keeping the in-body incarnation tag |
 | `CaMetaIncarnationKey.tla` | Gate B Option B (per-incarnation body keys) | **REMOVED 2026-07-21** (rejected) | `INV_NO_DANGLE` (implicit) | 1 | removes the tombstone/wait but reintroduces the already-rejected generation-in-key design (404→LIST, manifest carries incarnation) |
-| `CaManifestSweepWindow.tla` | Orphan-sweep vs removal-fold wedge | **CURRENT** | `INV_FOLD_PROGRESS` | 1 | the orphan sweep must skip a committed body with a pending (unsealed) removal — the removal-fold still needs the body to emit its decrement |
+| `CaManifestSweepWindow.tla` | Orphan-sweep vs removal-fold wedge | **REMOVED 2026-07-22** (gtest covers) | `INV_FOLD_PROGRESS` | 1 | the orphan sweep must skip a committed body with a pending (unsealed) removal — the removal-fold still needs the body to emit its decrement |
 
 ---
 
@@ -1023,7 +1023,8 @@ removed 2026-07-21; this section stays as the explored-and-rejected record.
 ### `CaManifestSweepWindow.tla` — orphan-sweep vs removal-fold wedge {#camanifestsweepwindow}
 
 **Files:** `CaManifestSweepWindow.tla`, `CaManifestSweepWindow_reduced.cfg`,
-`CaManifestSweepWindow_sab_sweep_committed.cfg` (Task 0 of
+`CaManifestSweepWindow_sab_sweep_committed.cfg`, `run_sweepwindow.sh` — **removed 2026-07-22**
+(covered by the deterministic gtest, see below; full text in git history). (Task 0 of
 `docs/superpowers/plans/2026-07-10-cas-freshness-meta-v3.md`; the wedge gate for the committed-removal-
 scoping debt behind `gtest_cas_orphan_manifest_sweep.cpp::PendingCommittedRemovalBodyIsSkipped`).
 
@@ -1035,5 +1036,7 @@ present to emit its decrement. `reduced` is clean; `sab_sweep_committed` (sweep 
 pending-committed-removal protection) deletes the body, so the fold can never decrement and
 `INV_FOLD_PROGRESS` is violated forever.
 
-**Code currency:** CURRENT (`8606ab382aa`; the live gate for the wedge fix — a small, standalone
-prerequisite kept regardless of which Phase-B meta design landed).
+**Code currency:** the wedge fix is CURRENT (`8606ab382aa`); the model files were removed
+2026-07-22 — the interleaving space is small enough that the deterministic gtest
+(`gtest_cas_orphan_manifest_sweep.cpp::PendingCommittedRemovalBodyIsSkipped`, plus ten sibling
+sweep tests) covers the same scenarios, so the model added no assurance beyond the unit test.
