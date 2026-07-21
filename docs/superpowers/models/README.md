@@ -43,22 +43,49 @@ Status legend:
 - **STALE** — proves the current design family but predates later amendments; kept deliberately.
 - **HISTORICAL** — record of a real production-shaped bug and its fix proof; the surrounding
   mechanism has since evolved.
+- **MIXED** — part of the model matches the code and part models a superseded mechanism; the entry
+  says which is which.
+
+## Audit note (2026-07-22) {#audit-2026-07-22}
+
+Every model was checked against the shipped `cas-gc-rebuild` code (TLC health: positive configs
+GREEN, sabotages VIOLATE; plus a per-model code-correspondence read). **Headline result: no
+CODE-RISK** — there is no model whose proven-necessary rule the shipped code violates; wherever a
+model and the code diverge, the code upholds the same safety conclusion via an equal-or-stronger
+mechanism.
+
+The `cas-gc-rebuild` branch rearchitected GC and the writer (separate ref-log objects, source-edge
+runs, round-only graduation pacing, advisory freshness meta). Consequently a cluster of models that
+gate *pre-rebuild concrete mechanisms* is now **MIXED or drifted** even though their safety
+conclusions still hold: `CaIncarnationCore` (safety spine intact, concrete journal/fence structure
+superseded), `CaGcAckFloorCore` (writer-ack graduation floor superseded by round-only pacing; its
+`GRebuild` + clamp-suppression still match), `CaBuildRootPrecommit` (inline-closure + per-blob
+presence mechanisms drifted to lazy-fold-with-clamp-barrier + owner-liveness), `CaEdgeBeforeObserve`
+(the tokenless-leaf `K3Head`/`K3AdoptCheck` half superseded by manifest-trust), and the
+fence/recheck half of `CaGcRootLocalPartManifestCore` (two of its fence-era sabotages now crash TLC
+rather than cleanly violate). Realigning these — trimming the ack apparatus, excising the
+fence/recheck half, recasting the tokenless leaf / closure mechanism — is **deferred**: each is a
+rewrite of a concurrency proof model where a modeling slip yields a false-green, so it belongs to a
+careful pass with adversarial review, not an unattended edit. The current GC round's safety IS
+gated by CURRENT models regardless: `CaGcRoundDeferCore`, `CaGcCondemnMarkerGate`,
+`CaGcAckFloorZombie` (two-phase graduation), `CaRetiredInRun`, and the fold/orphan/attempt machinery
+of `CaGcRootLocalPartManifestCore`.
 
 ## Summary table {#summary-table}
 
 | Model | Proves / gates | Status | Runner |
 |---|---|---|---|
-| `CaIncarnationCore.tla` | canonical incarnation-token GC core (fold → retire → fence → recheck → exact-token delete → cascade → trim) | CURRENT | `run_tlc.sh` |
-| `CaBuildRootPrecommit.tla` | adopted-blob dangle fix: precommit-first build-root reachability + fail-closed commit + inline closure recording | CURRENT | (inline TLC) |
+| `CaIncarnationCore.tla` | canonical incarnation-token GC core (fold → retire → fence → recheck → exact-token delete → cascade → trim) | CURRENT (safety spine; concrete journal/fence structure superseded) | `run_tlc.sh` |
+| `CaBuildRootPrecommit.tla` | adopted-blob dangle fix: precommit-first build-root reachability + fail-closed commit + inline closure recording | CURRENT conclusion (inline-closure + presence-gate mechanisms drifted → lazy-fold+clamp-barrier + owner-liveness) | (inline TLC) |
 | `CaGcLeaseCore.tla` | GC leader lease: epoch-fence safety, advisory heartbeat against false steals | CURRENT | (inline TLC) |
 | `CaCasMountCore.tla` | mount ownership: sticky owner, monotone epoch, observation-based lease reclaim | CURRENT | `run_mount.sh` |
 | `CaGcRootLocalPartManifestCore.tla` | root-local part-manifest GC: fold, manifest cleanup, orphan sweep, attempt scoping | CURRENT (partial: fence/recheck phases superseded by the ack-floor round) | `run_gc_partmanifest.sh` |
-| `CaGcAckFloorCore.tla` | one-pass GC round, clamp suppression, disaster-recovery rebuild | CURRENT (partial: the writer-heartbeat floor was later removed) | `run_ackfloor.sh` |
+| `CaGcAckFloorCore.tla` | one-pass GC round, clamp suppression, disaster-recovery rebuild | MIXED: graduation gate (writer-ack floor) superseded by round-only pacing; `GRebuild` + clamp-suppression still match | `run_ackfloor.sh` |
 | `CaGcAckFloorZombie.tla` | two-leader `delete_pending` two-phase graduation | CURRENT (partial: same caveat) | `run_ackfloor_zombie.sh` |
 | `CaGcShardIncarnationCore.tla` | namespace-registry removal: per-shard incarnation + newborn round self-floor | CURRENT | (inline TLC) |
 | `CaGcRoundDeferCore.tla` | GC round may skip an unchanged snapshot only if no destructive decision is due; deferral bounded | CURRENT | (inline TLC) |
 | `CaGcCondemnMarkerGate.tla` | graduation gated on confirmed durable condemn marker | CURRENT | `run_condemnmarker.sh` |
-| `CaEdgeBeforeObserve.tla` | with edge-before-observe write order, promote-time revalidation of tokened leaves is redundant | CURRENT | `run_ebo.sh` |
+| `CaEdgeBeforeObserve.tla` | with edge-before-observe write order, promote-time revalidation of tokened leaves is redundant | CURRENT for order + K1; K3Head/K3AdoptCheck drifted (tokenless leaf now manifest-trusted) | `run_ebo.sh` |
 | `CaRetiredInRun.tla` | retired list folded into the snapshot run (two-cursor merge, coverage coherence) | CURRENT | `run_retiredinrun.sh` |
 | `CaRetiredInRunFoldAbortWitness.tla` | GC freshness meta is add-only: a spare never clears a condemned marker | CURRENT | `run_foldabort_witness.sh` |
 | `CaRefTableSnapshotLogCore.tla` | ref-table snapshot + append-only log protocol; coverage-at-birth mount seal | CURRENT | `run_refsnaplog.sh` |
