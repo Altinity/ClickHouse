@@ -284,6 +284,15 @@ void ASTSystemQuery::formatImpl(WriteBuffer & ostr, const FormatSettings & setti
             print_keyword(" FROM DISK ") << quoteString(disk);
             break;
         }
+        case Type::CONTENT_ADDRESSED_UNMOUNT:
+        case Type::CONTENT_ADDRESSED_MOUNT:
+        {
+            /// SYSTEM CONTENT ADDRESSED UNMOUNT/MOUNT <disk> -- the disk is REQUIRED (unlike GC RUN's
+            /// optional disk): each lifecycle transition targets exactly one disk, never a fan-out.
+            ostr << ' ';
+            print_identifier(disk);
+            break;
+        }
         case Type::RELOAD_DICTIONARY:
         case Type::RELOAD_MODEL:
         case Type::RELOAD_FUNCTION:

@@ -503,6 +503,17 @@ private:
     /// once unmount/mount (Task 5) can change `cas_store`/`part_access` after startup.
     PoolAccessSnapshot poolAccess() const;
 
+    /// Builds and throws the `INVALID_STATE` "disk is not mounted" exception `poolAccess()` throws,
+    /// naming `state` and directing the operator to `SYSTEM CONTENT ADDRESSED MOUNT`. Shared with the
+    /// synchronous GC round entry points (`runOneGcRoundForTest`/`runGarbageCollectionRoundNow`):
+    /// since `SYSTEM CONTENT ADDRESSED UNMOUNT` (Task 6) makes `Dormant` reachable from SQL, a GC
+    /// round dispatched at an unmounted disk must surface this same operator-facing refusal instead
+    /// of the `LOGICAL_ERROR` those entry points threw before this existed (which aborts the process
+    /// under debug/ASan builds -- a programming-invariant response to what is now a normal,
+    /// SQL-reachable operational state). Callers must already hold `pointer_mutex` and pass the
+    /// `mount_state` they read under it.
+    [[noreturn]] void throwNotMounted(MountState state) const;
+
     /// Classifies `path`'s directory shape by running the fixed dispatch order once (shadow ->
     /// atomic-shard -> table-uuid -> part -> subdir -> generic), including the part-branch
     /// fall-through when no sub-shape matches. Pure path classification — consults no lifecycle

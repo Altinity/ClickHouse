@@ -486,6 +486,17 @@ bool ParserSystemQuery::parseImpl(IParser::Pos & pos, ASTPtr & node, Expected & 
                 return false;
             break;
         }
+        case Type::CONTENT_ADDRESSED_UNMOUNT:
+        case Type::CONTENT_ADDRESSED_MOUNT:
+        {
+            /// SYSTEM CONTENT ADDRESSED UNMOUNT/MOUNT <disk> [ON CLUSTER cluster]. Unlike GC RUN, the
+            /// disk is REQUIRED -- mirrors CONTENT_ADDRESSED_GC_REBUILD (minus the FORCE keyword):
+            /// parseQueryWithOnClusterAndTarget requires the target, so omitting the disk is a syntax
+            /// error rather than a silent fan-out across every content-addressed disk.
+            if (!parseQueryWithOnClusterAndTarget(res, pos, expected, SystemQueryTargetType::Disk))
+                return false;
+            break;
+        }
         case Type::CONTENT_ADDRESSED_DROP_POOL_MEMBER:
         {
             /// SYSTEM CONTENT ADDRESSED DROP POOL MEMBER <srid> FROM DISK <disk> [ON CLUSTER cluster].

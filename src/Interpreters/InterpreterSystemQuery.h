@@ -77,6 +77,9 @@ private:
     BlockIO runContentAddressedGcRun(const String & disk_name);
     BlockIO runContentAddressedGcRebuild(const String & disk_name, bool force);
 
+    void contentAddressedUnmount(const String & disk_name);
+    void contentAddressedMount(const String & disk_name);
+
     void loadPrimaryKeys();
     void unloadPrimaryKeys();
     void loadOrUnloadPrimaryKeysImpl(bool load);

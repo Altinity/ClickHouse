@@ -271,9 +271,12 @@ void ContentAddressedMetadataStorage::runOneGcRoundForTest()
         std::lock_guard ptr_lock(pointer_mutex);
         if (!gc_scheduler)
         {
+            /// A Dormant/Unmounting disk here is a normal operational state (from Task 6 on, reachable
+            /// via `SYSTEM CONTENT ADDRESSED UNMOUNT`), not a programming invariant -- surface the same
+            /// `INVALID_STATE` refusal `poolAccess()` gives, never `LOGICAL_ERROR` (which would abort
+            /// under debug/ASan builds).
             if (!cas_store)
-                throw Exception(ErrorCodes::LOGICAL_ERROR,
-                    "ContentAddressedMetadataStorage: store accessed before startup");
+                throwNotMounted(mount_state);
             gc_scheduler = std::make_shared<Cas::CasGcScheduler>(
                 cas_store, gc_interval, fmt::format("{}::ContentAddressedGC", storage_path_full),
                 disk_name, makeGcRoundLogger());
@@ -422,9 +425,11 @@ Cas::RoundReport ContentAddressedMetadataStorage::runGarbageCollectionRoundNow()
         std::lock_guard ptr_lock(pointer_mutex);
         if (!gc_scheduler)
         {
+            /// Same Dormant/Unmounting-is-normal reasoning as `runOneGcRoundForTest` above: this is the
+            /// entry point `SYSTEM CONTENT ADDRESSED GC RUN <disk>` reaches directly, so an unmounted
+            /// disk here must be a normal `INVALID_STATE` refusal, never a `LOGICAL_ERROR` abort.
             if (!cas_store)
-                throw Exception(ErrorCodes::LOGICAL_ERROR,
-                    "ContentAddressedMetadataStorage: store accessed before startup");
+                throwNotMounted(mount_state);
             gc_scheduler = std::make_shared<Cas::CasGcScheduler>(
                 cas_store, gc_interval, fmt::format("{}::ContentAddressedGC", storage_path_full),
                 disk_name, makeGcRoundLogger());
@@ -758,25 +763,28 @@ ContentAddressedMetadataStorage::PoolAccessSnapshot ContentAddressedMetadataStor
     /// condition (there is no valid combination where `mount_state == Mounted` and `cas_store` is
     /// null -- the publish step in `startup` sets both together).
     if (state != MountState::Mounted || !snap.pool)
-    {
-        const char * state_name = "Unknown";
-        switch (state)
-        {
-            case MountState::Mounted:
-                state_name = "Mounted";
-                break;
-            case MountState::Unmounting:
-                state_name = "Unmounting";
-                break;
-            case MountState::Dormant:
-                state_name = "Dormant";
-                break;
-        }
-        throw Exception(ErrorCodes::INVALID_STATE,
-            "content-addressed disk '{}' is not mounted (state: {}) — run SYSTEM CONTENT ADDRESSED MOUNT",
-            disk_name, state_name);
-    }
+        throwNotMounted(state);
     return snap;
+}
+
+void ContentAddressedMetadataStorage::throwNotMounted(MountState state) const
+{
+    const char * state_name = "Unknown";
+    switch (state)
+    {
+        case MountState::Mounted:
+            state_name = "Mounted";
+            break;
+        case MountState::Unmounting:
+            state_name = "Unmounting";
+            break;
+        case MountState::Dormant:
+            state_name = "Dormant";
+            break;
+    }
+    throw Exception(ErrorCodes::INVALID_STATE,
+        "content-addressed disk '{}' is not mounted (state: {}) — run SYSTEM CONTENT ADDRESSED MOUNT",
+        disk_name, state_name);
 }
 
 Cas::PoolPtr ContentAddressedMetadataStorage::store() const
