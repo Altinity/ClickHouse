@@ -27,12 +27,19 @@ extern const int NOT_IMPLEMENTED;
 namespace
 {
 
-std::shared_ptr<DB::ContentAddressedMetadataStorage> openTxStorage()
+/// Constructs the storage but deliberately does NOT call `startup()` -- used by tests that need to
+/// control when/how startup runs (e.g. injecting a late fault before the atomic publish step).
+std::shared_ptr<DB::ContentAddressedMetadataStorage> makeUnstartedTxStorage()
 {
     auto settings = DB::Cas::tests::makeSettingsForTest(
         "test", std::filesystem::temp_directory_path() / "ca_tx_lockscope_scratch");
-    auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
+    return std::make_shared<DB::ContentAddressedMetadataStorage>(
         DB::Cas::tests::makeLocalObjectStorageForTest(), "pool", "srv1", "", nullptr, settings);
+}
+
+std::shared_ptr<DB::ContentAddressedMetadataStorage> openTxStorage()
+{
+    auto storage = makeUnstartedTxStorage();
     storage->startup();
     return storage;
 }
@@ -668,4 +675,25 @@ TEST(CasTransactionRemove, CreateThenDirDropDoesNotPublish)
     tx->commit(DB::NoCommitOptions{});
 
     EXPECT_FALSE(storage->existsDirectory("b08/b08b08b0-0808-4808-8808-080808080808/all_1_1_0"));
+}
+
+/// [Task 3] `startup()` publishes `cas_store`/`part_access`/`gc_scheduler` (and sets
+/// `pool_uuid`/`conditional_copy_supported`) atomically as its LAST action. Everything before that
+/// point -- opening the pool, building the part-folder facade, the capability probe, starting the GC
+/// scheduler -- happens into locals first, so a throw anywhere along the way (here simulated via
+/// `startup_fault_injection_for_test`, injected right before the publish step) must leave nothing
+/// published: `store()` still reports "before startup" even though `Pool::open` and everything else
+/// already succeeded. Clearing the hook and retrying `startup()` must then succeed cleanly.
+TEST(CasTransactionLifecycle, StartupFailureLatePublishesNothing)
+{
+    auto storage = makeUnstartedTxStorage();
+
+    storage->startup_fault_injection_for_test = [] { throw std::runtime_error("injected late-startup failure"); };
+    EXPECT_ANY_THROW(storage->startup());
+    /// Nothing was published by the failed attempt: store() must still say "before startup".
+    EXPECT_ANY_THROW(storage->store());
+
+    storage->startup_fault_injection_for_test = {};
+    EXPECT_NO_THROW(storage->startup());
+    EXPECT_NO_THROW(storage->store());
 }

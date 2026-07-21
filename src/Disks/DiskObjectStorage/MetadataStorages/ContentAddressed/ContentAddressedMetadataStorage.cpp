@@ -536,9 +536,15 @@ void ContentAddressedMetadataStorage::startup()
     pool_config.gc_meta_pool_size = gc_meta_pool_size;
     pool_config.materialization_grace_ms = materialization_grace_ms;
     pool_config.event_sink = makeCasEventSink();
-    cas_store = Cas::Pool::open(std::move(backend), std::move(pool_config));
-    pool_uuid = Cas::u128ToHex(cas_store->poolMeta().pool_id);
-    part_access = std::make_shared<Cas::CachedPartFolderAccess>(cas_store,
+
+    /// Everything below builds into LOCALS -- nothing is published to `cas_store`/`part_access`/
+    /// `gc_scheduler`/`pool_uuid`/`conditional_copy_supported` until the single publish step at the
+    /// very end. This makes a mid-startup throw leave the object exactly as unstarted as it was on
+    /// entry (the `if (cas_store) return;` head above still sees an empty pool), so a caller can
+    /// retry `startup` after a transient failure instead of being stuck with a half-built mount.
+    auto pool = Cas::Pool::open(std::move(backend), std::move(pool_config));
+    auto uuid = Cas::u128ToHex(pool->poolMeta().pool_id);
+    auto facade = std::make_shared<Cas::CachedPartFolderAccess>(pool,
         Cas::CachedPartFolderAccess::CacheParams{
             .cache_bytes = cas_part_folder_cache_bytes,
             .max_entries = cas_part_folder_cache_max_entries,
@@ -555,11 +561,12 @@ void ContentAddressedMetadataStorage::startup()
     /// Fail-close, never fail-open: an unsupported or non-enforcing backend just falls back to local
     /// staging (`conditional_copy_supported` stays `false`) — this is NOT a mount failure, unlike the
     /// mandatory battery, because `local` staging remains fully functional.
+    bool copy_supported = false;
     if (staging_backend == Cas::StagingBackend::S3 && !read_only)
     {
         const String probe_prefix = physicalKey(pool_prefix + "/staging/" + server_root_id + "/probe");
-        conditional_copy_supported = Cas::probeConditionalCopy(*object_storage, probe_prefix);
-        if (!conditional_copy_supported)
+        copy_supported = Cas::probeConditionalCopy(*object_storage, probe_prefix);
+        if (!copy_supported)
             LOG_INFO(
                 getLogger("ContentAddressedMetadataStorage"),
                 "staging_backend=s3 requested but the object storage does not enforce conditional "
@@ -569,26 +576,56 @@ void ContentAddressedMetadataStorage::startup()
         /// ran, or an aborted transaction's never-promoted staging object — see
         /// `cleanupPendingTempFiles`) at mount start. Only runs when the S3 path is actually usable
         /// (`conditional_copy_supported`) — an unsupported/fail-closed-to-local mount never wrote any
-        /// S3 staging objects under this prefix in the first place. LEASE-FENCE: `stagingKeyPrefix()`
-        /// is keyed by THIS mount's own `server_root_id` (the SAME prefix construction the probe above
-        /// and every staging key this mount ever mints use), so this sweep can never reach a different
+        /// S3 staging objects under this prefix in the first place. LEASE-FENCE: the prefix below is
+        /// keyed by THIS mount's own `server_root_id` (the SAME prefix construction the probe above
+        /// and every staging key this mount ever mints use -- and the same formula `stagingKeyPrefix()`
+        /// uses post-startup; computed from the local `pool_prefix` here rather than via
+        /// `stagingKeyPrefix()` itself, because that helper calls `store()`, which is fail-closed and
+        /// would throw before the pool is published), so this sweep can never reach a different
         /// mount's in-flight staging (`Cas::sweepOwnMountStaging`'s own doc comment). GC excludes
         /// `staging/` entirely (a distinct top-level prefix from `blobs/` — see `CasLayout.h`), so this
         /// sweeper is the ONLY reclaimer of `staging/` debris.
-        if (conditional_copy_supported)
-            Cas::sweepOwnMountStaging(*object_storage, stagingKeyPrefix() + "/");
+        if (copy_supported)
+            Cas::sweepOwnMountStaging(*object_storage, physicalKey(pool_prefix + "/staging/" + server_root_id) + "/");
     }
 
     /// The background GC scheduler runs only on the disk-factory path (context non-null) and when
     /// enabled - the lease makes concurrent schedulers across mounters safe (work dedup), so no
     /// further gating is needed because the scheduler's lease coordinates concurrent mounters.
+    /// `CasGcScheduler` holds its own `PoolPtr` (see its `store` member), so starting it against the
+    /// LOCAL `pool` before publish is safe -- the scheduler keeps the pool alive on its own. It is
+    /// also safe on the unwind path below: `scheduler` here is a local `shared_ptr`, so if something
+    /// after this point throws (only the fault-injection hook can, in production nothing does),
+    /// its destructor runs during stack unwinding, which drops the last reference and destroys the
+    /// `CasGcScheduler`; its destructor calls `stop()`, which joins both worker threads before the
+    /// exception continues propagating. No explicit `SCOPE_EXIT` is needed for that.
+    std::shared_ptr<Cas::CasGcScheduler> scheduler;
     if (context && gc_enabled && !read_only)
     {
-        gc_scheduler = std::make_shared<Cas::CasGcScheduler>(
-            cas_store, gc_interval, fmt::format("{}::ContentAddressedGC", storage_path_full),
+        scheduler = std::make_shared<Cas::CasGcScheduler>(
+            pool, gc_interval, fmt::format("{}::ContentAddressedGC", storage_path_full),
             disk_name, makeGcRoundLogger());
-        gc_scheduler->start();
+        scheduler->start();
     }
+
+    /// Test-only: lets a test prove that a failure here (after everything above has succeeded, but
+    /// before publish) leaves nothing published and a retry can still succeed. A no-op in production.
+    if (startup_fault_injection_for_test)
+        startup_fault_injection_for_test();
+
+    /// The single publish step: as the LAST action of `startup`, atomically hand the fully-built
+    /// pool, part-folder facade, and GC scheduler to the members other threads observe through
+    /// `store`/`partAccess`/the GC entry points. Everything above only ever touched locals, so any
+    /// throw before this point (including from the fault-injection hook above) leaves those members
+    /// exactly as they were on entry.
+    {
+        std::lock_guard lock(pointer_mutex);
+        cas_store = std::move(pool);
+        part_access = std::move(facade);
+        gc_scheduler = std::move(scheduler);
+    }
+    pool_uuid = std::move(uuid);
+    conditional_copy_supported = copy_supported;
 }
 
 void ContentAddressedMetadataStorage::shutdown()

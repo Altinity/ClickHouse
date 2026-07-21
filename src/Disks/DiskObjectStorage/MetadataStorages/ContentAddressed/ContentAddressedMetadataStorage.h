@@ -9,6 +9,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Interpreters/Context_fwd.h>
 #include <base/defines.h>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -163,6 +164,14 @@ public:
     /// Stops the GC scheduler before releasing the part-folder facade and pool. Their destruction is
     /// synchronized with the accessors and synchronous GC entry points.
     void shutdown() override;
+
+    /// Test-only fault-injection hook. When set, `startup` invokes it right before it publishes
+    /// `cas_store`/`part_access`/`gc_scheduler`/`pool_uuid`/`conditional_copy_supported` -- everything
+    /// up to that point (opening the pool, building the part-folder facade, running the capability
+    /// probe, starting the GC scheduler) has already happened into locals, so throwing here proves a
+    /// late startup failure publishes nothing and a retry can still succeed. Left empty (a no-op) in
+    /// production.
+    std::function<void()> startup_fault_injection_for_test;
 
     /// Tests whether a path is represented by an inline manifest entry, namespace file, or loose
     /// mountpoint object.
