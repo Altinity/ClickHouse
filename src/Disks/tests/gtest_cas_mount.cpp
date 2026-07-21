@@ -195,6 +195,38 @@ TEST(CasMountLease, VanishedBackingStoreStopsRenewalWithoutLogicalError)
     EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasMountLeaseLost].load(), lost_before + 1);
 }
 
+/// STID 3982-3b48 (part 1b): the terminal/clean-release counterpart to the renewal fix above. When
+/// the backing store vanishes (`rm -rf` of the pool dir), the renewal side already stops non-fatally
+/// (see the previous test); teardown then runs the terminal release (`stop()` -> `terminate()`),
+/// which used to unconditionally throw `LOGICAL_ERROR` once the token-guarded farewell PUT observed
+/// an absent object. The desired end state of a release ("no live lease object") is already true, so
+/// this must be a no-op, never a `LOGICAL_ERROR` (which aborts debug/ASan builds).
+///
+/// Driven WITHOUT a prior failed renew, so the count is deterministic: this is the only place along
+/// this path that increments `CasMountLeaseLost`, so we expect exactly +1 (not +2, since renewal was
+/// never invoked here).
+TEST(CasMountLease, TerminateAfterVanishedBackingStoreIsNoOpRelease)
+{
+    auto b = std::make_shared<InMemoryBackend>();
+    Layout l("p");
+    uint64_t now = 1000;
+    ASSERT_EQ(claimMount(*b, l, "r", UInt128(1), /*epoch*/ 7, now, /*ttl*/ 100).kind, MountClaimResult::Claimed);
+    MountLeaseKeeper k(b, l, "r", UInt128(1), 7, std::chrono::milliseconds(100), [&] { return now; },
+                       [] { return uint64_t{0}; });
+    k.start();
+
+    const String mount_key = l.mountKey("r");
+    const auto lost_before = ProfileEvents::global_counters[ProfileEvents::CasMountLeaseLost].load();
+
+    /// Simulate `rm -rf` of the backing store: the mount slot object is gone before we ever attempt
+    /// a renewal, so `terminate()`'s token-guarded farewell PUT is the first thing to observe it.
+    ASSERT_EQ(b->deleteExact(mount_key, b->head(mount_key).token).kind, DeleteOutcome::Kind::Deleted);
+
+    EXPECT_NO_THROW(k.stop())
+        << "clean release against a vanished store must be a no-op, not a LOGICAL_ERROR abort";
+    EXPECT_EQ(ProfileEvents::global_counters[ProfileEvents::CasMountLeaseLost].load(), lost_before + 1);
+}
+
 /// rev.6: a bare `claimMount` (no `proven_dead_token`) NEVER reclaims a same-uuid, different-epoch
 /// lease off a wall-clock-looking-expired stamp — only `claimMountAwaitingExpiry`'s observation loop
 /// can turn that into a reclaim. Renamed from `...ExpiredReclaims` to describe the corrected behavior.

@@ -913,9 +913,19 @@ void MountLeaseKeeper::terminate()
                     "CAS mount-lease: '{}' was fenced out by GC (expired lease); release is a no-op", key);
                 return;
             }
+            throw Exception(ErrorCodes::LOGICAL_ERROR,
+                "CAS mount-lease: release of key '{}' hit a foreign incarnation — the world is broken", key);
         }
-        throw Exception(ErrorCodes::LOGICAL_ERROR,
-            "CAS mount-lease: release of key '{}' hit a foreign incarnation — the world is broken", key);
+        /// The lease object is ABSENT: the backing store was deleted under us (rm -rf of the pool
+        /// dir -- the same environmental condition the renewal path classifies as "vanished").
+        /// The desired end state of a release is "no live lease object", which is already true, so
+        /// this is a clean no-op release, never a LOGICAL_ERROR (which aborts debug/ASan builds).
+        ProfileEvents::increment(ProfileEvents::CasMountLeaseLost);
+        emitMountEvent(event_sink, CasEventType::MountRelease, srid, "vanished", nullptr,
+            "mount slot object already gone at release (backing store deleted) -- no-op release");
+        LOG_INFO(getLogger("CasMountLeaseKeeper"),
+            "CAS mount-lease: '{}' is already gone at release (backing store deleted); release is a no-op", key);
+        return;
     }
     emitMountEvent(event_sink, CasEventType::MountRelease, srid, "farewell", nullptr,
         "graceful release — lease stamped already-expired, watermark farewell folded in");
