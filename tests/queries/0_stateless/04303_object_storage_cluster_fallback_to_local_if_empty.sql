@@ -7,6 +7,7 @@
 --   2) OSC non-empty but unknown/empty cluster, RI=1, RI-cluster empty -> local instead of error
 --   3) local OSC empty, RI=1, valid RI-cluster; remote OSC unknown/empty -> remote non-distributed instead of error
 -- Other cases must keep pre-setting behavior.
+-- Covered for both s3() table function and S3 table engine.
 
 SET enable_analyzer = 1;
 
@@ -73,6 +74,44 @@ SETTINGS
     object_storage_cluster_fallback_to_local_if_empty = 1,
     object_storage_remote_initiator = 1,
     object_storage_remote_initiator_cluster = 'non_existent_remote_initiator_04303'; -- { serverError CLUSTER_DOESNT_EXIST }
+
+DROP TABLE IF EXISTS engine_osc_fallback_04303;
+CREATE TABLE engine_osc_fallback_04303 (x UInt32)
+ENGINE = S3('http://localhost:11111/test/04303_object_storage_cluster_fallback.tsv', 'TSV')
+SETTINGS object_storage_cluster = 'non_existent_cluster_04303';
+
+SELECT 'engine case1 unknown OSC without fallback still errors';
+SELECT count() FROM engine_osc_fallback_04303; -- { serverError CLUSTER_DOESNT_EXIST }
+
+SELECT 'engine case1 unknown OSC with fallback runs locally';
+SELECT count(), sum(x) FROM engine_osc_fallback_04303
+SETTINGS object_storage_cluster_fallback_to_local_if_empty = 1;
+
+SELECT 'engine case2 unknown OSC + RI without RI-cluster with fallback runs locally';
+SELECT count(), sum(x) FROM engine_osc_fallback_04303
+SETTINGS
+    object_storage_cluster_fallback_to_local_if_empty = 1,
+    object_storage_remote_initiator = 1;
+
+SELECT 'engine case3-like unknown OSC + RI-cluster with fallback';
+SELECT count(), sum(x) FROM engine_osc_fallback_04303
+SETTINGS
+    object_storage_cluster_fallback_to_local_if_empty = 1,
+    object_storage_remote_initiator = 1,
+    object_storage_remote_initiator_cluster = 'test_shard_localhost';
+
+DROP TABLE IF EXISTS engine_no_osc_04303;
+CREATE TABLE engine_no_osc_04303 (x UInt32)
+ENGINE = S3('http://localhost:11111/test/04303_object_storage_cluster_fallback.tsv', 'TSV');
+
+SELECT 'engine empty OSC + RI without RI-cluster with fallback still BAD_ARGUMENTS';
+SELECT count() FROM engine_no_osc_04303
+SETTINGS
+    object_storage_remote_initiator = 1,
+    object_storage_cluster_fallback_to_local_if_empty = 1; -- { serverError BAD_ARGUMENTS }
+
+DROP TABLE engine_no_osc_04303;
+DROP TABLE engine_osc_fallback_04303;
 
 SELECT 'aggregate with fallback';
 SELECT sum(x * x) FROM s3('http://localhost:11111/test/04303_object_storage_cluster_fallback.tsv', 'TSV', 'x UInt32')
