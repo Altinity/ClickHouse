@@ -74,6 +74,7 @@
 #include <Storages/MergeTree/MergeTreeSettings.h>
 #include <Storages/StorageMaterializedView.h>
 #include <Storages/StorageReplicatedMergeTree.h>
+#include <Storages/StorageTableProxy.h>
 #include <Storages/StorageURL.h>
 #include <base/coverage.h>
 #include <Common/CoverageCollection.h>
@@ -267,6 +268,18 @@ AccessType getRequiredAccessType(StorageActionBlockType action_type)
 }
 
 constexpr std::string_view table_is_not_replicated = "Table {} is not replicated";
+
+/// A table in a database created with `lazy_load_tables = 1` stays wrapped in a `StorageTableProxy`
+/// until its first access, so a `dynamic_cast` to the real engine (e.g. `StorageReplicatedMergeTree`)
+/// fails and a `SYSTEM` verb that targets one specific named table misreports it as not replicated.
+/// Materialize the proxy before such a cast; generic query paths already materialize on read by
+/// design and must not go through this helper.
+StoragePtr unwrapTableProxy(const StoragePtr & storage)
+{
+    if (const auto * proxy = dynamic_cast<const StorageTableProxy *>(storage.get()))
+        return proxy->getNested();
+    return storage;
+}
 
 }
 
@@ -1324,7 +1337,7 @@ void InterpreterSystemQuery::restoreReplica()
 {
     getContext()->checkAccess(AccessType::SYSTEM_RESTORE_REPLICA, table_id);
 
-    const StoragePtr table_ptr = DatabaseCatalog::instance().getTable(table_id, getContext());
+    const StoragePtr table_ptr = unwrapTableProxy(DatabaseCatalog::instance().getTable(table_id, getContext()));
 
     auto * const table_replicated_ptr = dynamic_cast<StorageReplicatedMergeTree *>(table_ptr.get());
 
@@ -1399,7 +1412,9 @@ StoragePtr InterpreterSystemQuery::doRestartReplica(const StorageID & replica, C
         return nullptr;
     }
 
-    if (!dynamic_cast<const StorageReplicatedMergeTree *>(table.get()))
+    /// Only the type check needs the materialized (unwrapped) storage; the possibly-still-proxied
+    /// `table` is what actually stays registered in `database` and is what gets locked/detached below.
+    if (!dynamic_cast<const StorageReplicatedMergeTree *>(unwrapTableProxy(table).get()))
     {
         if (throw_on_error)
             throw Exception(ErrorCodes::BAD_ARGUMENTS, table_is_not_replicated.data(), replica.getNameForLogs());
@@ -1608,7 +1623,7 @@ void InterpreterSystemQuery::dropReplica(ASTSystemQuery & query)
     if (!table_id.empty())
     {
         getContext()->checkAccess(AccessType::SYSTEM_DROP_REPLICA, table_id);
-        StoragePtr table = DatabaseCatalog::instance().getTable(table_id, getContext());
+        StoragePtr table = unwrapTableProxy(DatabaseCatalog::instance().getTable(table_id, getContext()));
 
         if (!dropStorageReplica(query.replica, table))
             throw Exception(ErrorCodes::BAD_ARGUMENTS, table_is_not_replicated.data(), table_id.getNameForLogs());
@@ -2086,7 +2101,7 @@ bool InterpreterSystemQuery::trySyncReplica(StoragePtr table, SyncReplicaMode sy
             break;
     }
 
-    if (auto * storage_replicated = dynamic_cast<StorageReplicatedMergeTree *>(table.get()))
+    if (auto * storage_replicated = dynamic_cast<StorageReplicatedMergeTree *>(unwrapTableProxy(table).get()))
     {
         auto log = getLogger("InterpreterSystemQuery");
         LOG_TRACE(log, "Synchronizing entries in replica's queue with table's log and waiting for current last entry to be processed");
@@ -2132,7 +2147,7 @@ void InterpreterSystemQuery::syncReplica(ASTSystemQuery & query)
 void InterpreterSystemQuery::waitLoadingParts()
 {
     getContext()->checkAccess(AccessType::SYSTEM_WAIT_LOADING_PARTS, table_id);
-    StoragePtr table = DatabaseCatalog::instance().getTable(table_id, getContext());
+    StoragePtr table = unwrapTableProxy(DatabaseCatalog::instance().getTable(table_id, getContext()));
 
     if (auto * merge_tree = dynamic_cast<MergeTreeData *>(table.get()))
     {
@@ -2204,11 +2219,12 @@ namespace
 
 MergeTreeData & getMergeTreeWithManualSelector(const StoragePtr & table, const StorageID & table_id, const char * action)
 {
-    auto * merge_tree = dynamic_cast<MergeTreeData *>(table.get());
+    const StoragePtr unwrapped = unwrapTableProxy(table);
+    auto * merge_tree = dynamic_cast<MergeTreeData *>(unwrapped.get());
     if (!merge_tree)
         throw Exception(ErrorCodes::BAD_ARGUMENTS,
             "Command {} is supported only for MergeTree-family tables, but got: {}",
-            action, table->getName());
+            action, unwrapped->getName());
 
     const auto algorithm = (*merge_tree->getSettings())[MergeTreeSetting::merge_selector_algorithm].value;
     if (algorithm != MergeSelectorAlgorithm::MANUAL)
@@ -2444,7 +2460,7 @@ void InterpreterSystemQuery::loadOrUnloadPrimaryKeysImpl(bool load)
     if (!table_id.empty())
     {
         getContext()->checkAccess(load ? AccessType::SYSTEM_LOAD_PRIMARY_KEY : AccessType::SYSTEM_UNLOAD_PRIMARY_KEY, table_id.database_name, table_id.table_name);
-        StoragePtr table = DatabaseCatalog::instance().getTable(table_id, getContext());
+        StoragePtr table = unwrapTableProxy(DatabaseCatalog::instance().getTable(table_id, getContext()));
 
         if (auto * merge_tree = dynamic_cast<MergeTreeData *>(table.get()))
         {
@@ -2590,7 +2606,7 @@ void InterpreterSystemQuery::flushDistributed(ASTSystemQuery & query)
     if (query.query_settings)
         settings_changes = query.query_settings->as<ASTSetQuery>()->changes;
 
-    if (auto * storage_distributed = dynamic_cast<StorageDistributed *>(DatabaseCatalog::instance().getTable(table_id, getContext()).get()))
+    if (auto * storage_distributed = dynamic_cast<StorageDistributed *>(unwrapTableProxy(DatabaseCatalog::instance().getTable(table_id, getContext())).get()))
         storage_distributed->flushClusterNodesAllData(getContext(), settings_changes);
     else
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Table {} is not distributed", table_id.getNameForLogs());
@@ -2604,7 +2620,7 @@ void InterpreterSystemQuery::flushObjectStorageQueue(ASTSystemQuery & query)
     if (query.queue_path.empty())
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "PATH must be specified for SYSTEM FLUSH OBJECT STORAGE QUEUE");
 
-    auto table = DatabaseCatalog::instance().getTable(table_id, context);
+    auto table = unwrapTableProxy(DatabaseCatalog::instance().getTable(table_id, context));
     auto * queue = dynamic_cast<StorageObjectStorageQueue *>(table.get());
     if (!queue)
         throw Exception(ErrorCodes::BAD_ARGUMENTS,
@@ -2631,7 +2647,7 @@ void InterpreterSystemQuery::prewarmMarkCache()
 
     getContext()->checkAccess(AccessType::SYSTEM_PREWARM_MARK_CACHE, table_id);
 
-    auto table_ptr = DatabaseCatalog::instance().getTable(table_id, getContext());
+    auto table_ptr = unwrapTableProxy(DatabaseCatalog::instance().getTable(table_id, getContext()));
     auto * merge_tree = dynamic_cast<MergeTreeData *>(table_ptr.get());
     if (!merge_tree)
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Command PREWARM MARK CACHE is supported only for MergeTree table, but got: {}", table_ptr->getName());
@@ -2655,7 +2671,7 @@ void InterpreterSystemQuery::prewarmPrimaryIndexCache()
 
     getContext()->checkAccess(AccessType::SYSTEM_PREWARM_PRIMARY_INDEX_CACHE, table_id);
 
-    auto table_ptr = DatabaseCatalog::instance().getTable(table_id, getContext());
+    auto table_ptr = unwrapTableProxy(DatabaseCatalog::instance().getTable(table_id, getContext()));
     auto * merge_tree = dynamic_cast<MergeTreeData *>(table_ptr.get());
     if (!merge_tree)
         throw Exception(ErrorCodes::BAD_ARGUMENTS, "Command PREWARM PRIMARY INDEX CACHE is supported only for MergeTree table, but got: {}", table_ptr->getName());
