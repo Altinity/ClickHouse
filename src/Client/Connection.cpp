@@ -22,6 +22,7 @@
 #include <Common/DNSResolver.h>
 #include <Common/StringUtils.h>
 #include <Common/OpenSSLHelpers.h>
+#include <Common/formatReadable.h>
 #include <Common/randomSeed.h>
 #include <Core/Block.h>
 #include <Core/ProtocolDefines.h>
