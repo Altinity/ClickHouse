@@ -59,7 +59,6 @@ Status legend:
 | `CaGcIndegRefoldCore.tla` | completion-seal cursor must advance past what recheck already folded (in-degree re-fold undercount) | CURRENT | (inline TLC) |
 | `CaGcShardIncarnationCore.tla` | namespace-registry removal: per-shard incarnation + newborn round self-floor | CURRENT | (inline TLC) |
 | `CaGcRoundDeferCore.tla` | GC round may skip an unchanged snapshot only if no destructive decision is due; deferral bounded | CURRENT | (inline TLC) |
-| `CaGcResurrectReuploadOrphan.tla` | re-condemn the current token when settling a replaced retired entry (resurrect-orphan leak) | CURRENT | (inline TLC) |
 | `CaGcCondemnMarkerGate.tla` | graduation gated on confirmed durable condemn marker | CURRENT | `run_condemnmarker.sh` |
 | `CaEdgeBeforeObserve.tla` | with edge-before-observe write order, promote-time revalidation of tokened leaves is redundant | CURRENT | `run_ebo.sh` |
 | `CaMetaDescriptor.tla` | per-hash freshness meta: create bottom-up, delete top-down | CURRENT (predates the final two-state codec trim) | `run_meta.sh` |
@@ -137,13 +136,6 @@ Status legend:
   first (no physical delete while an unfolded delta could still touch the blob), and deferral is
   bounded so an unfolded delta is never skipped forever. Raw TLC evidence:
   `CaGcRoundDeferCore_RESULTS.md`.
-- **`CaGcResurrectReuploadOrphan.tla`** — a leak found in a create/drop churn soak run: when a
-  condemned blob is replaced by a resurrect re-upload (new token, same content hash), the old
-  token's exact-token delete correctly skips, but a fold keyed on hash alone then never
-  re-condemns the new token, which leaks forever because the fold only revisits blobs touched in
-  the current window. The fix — settle the stale entry AND re-condemn the current token — is what
-  the canonical core model always did; this model is the faithful-to-code variant that exposes the
-  divergence and now serves as the regression gate.
 - **`CaGcCondemnMarkerGate.tla`** — found by an external code review (2026-07-17): the GC swallows
   failures of the asynchronous condemn-marker write, while the round commits the retired entry
   regardless. The per-hash marker is the writer's adopt gate, so a lost marker lets a writer adopt
@@ -281,4 +273,5 @@ history:
 | `CaMetaIncarnationKey.tla` (+ `run_inckey.sh`) | explored per-incarnation body keys; rejected — reintroduces the incarnation-in-the-key design rejected earlier in the project (a 404-then-LIST read path, incarnation leaking into manifests, breaking pure-content manifests) |
 | `CaMetaAbsenceClean.tla` (+ `run_metaabsence.sh`) | gated a "meta absence means clean" tombstone-only variant whose heal transition clears a condemned marker in place; blocked — that is exactly the marker-clearing shown unsafe by `CaRetiredInRunFoldAbortWitness.tla` (add-only meta), and the model's own green run rested on a premise refuted by the code's token-preserving adoption path; no such code landed |
 | `CaManifestSweepWindow.tla` (+ `run_sweepwindow.sh`) | proved the orphan sweep must skip a committed body whose removal record is not yet sealed by the fold (deleting it early wedges the removal-fold forever); the interleaving space is tiny and the deterministic unit test `CasOrphanManifestSweep.PendingCommittedRemovalBodyIsSkipped` (plus ten sibling sweep tests) covers the same scenarios — the model added no assurance beyond them |
+| `CaGcResurrectReuploadOrphan.tla` | reproduced a real leak (a condemned blob replaced by a resurrect re-upload was never re-condemned, because the fold keyed the decision on hash alone and only revisits blobs touched in the current window) and proved the fix: settle the stale entry AND re-condemn the current token. The fix landed in `closeBlob` (`CasBlobInDegree.cpp`) and is pinned by the deterministic `CasGcLeak.ResurrectReplaced*` unit tests; at 194 distinct states the model explored essentially that one scenario, adding nothing beyond the tests |
 | `CaIncarnationCore.pdf`, `CaIncarnationCore.toolbox/` | generated TLA+ Toolbox pretty-print artifacts (regenerable from the module) |
