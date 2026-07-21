@@ -371,6 +371,9 @@ def test_object_storage_cluster_fallback_to_local_if_empty(started_cluster):
 
     assert TSV(pure_sum) == TSV(fallback_sum)
 
+    # Asymmetric OSC: cluster name exists only on the remote initiator nodes (hidden_clusters.xml).
+    # Initiator must send plain s3() with object_storage_cluster as a query setting (not s3Cluster),
+    # so the remote can resolve the swarm even though the local node does not know that cluster.
     query_id = uuid.uuid4().hex
     result = node.query(
         f"""

@@ -113,7 +113,7 @@ protected:
 
     struct ResolvedClusterRead
     {
-        /// True when read() should use readFallBackToPure() or remote-initiator fallback branch.
+        /// True for local pure read, or for pure s3()/iceberg() sent to a remote initiator (not *Cluster).
         bool fallback_to_pure = false;
         /// Cached shouldFallbackToLocalOnEmptyCluster(context).
         bool local_fallback = false;

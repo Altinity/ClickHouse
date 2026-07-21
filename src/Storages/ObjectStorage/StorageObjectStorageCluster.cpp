@@ -413,8 +413,8 @@ bool StorageObjectStorageCluster::updateQueryForDistributedEngineIfNeeded(ASTPtr
         return false;
     }
 
-    /// Inject OSC into SETTINGS for both pure and *Cluster rewrite paths.
-    /// Pure send must preserve ENGINE object_storage_cluster so the remote can distribute or fall back.
+    /// Inject OSC into SELECT SETTINGS (query setting, not a table-function argument).
+    /// On the pure remote-initiator path this preserves ENGINE OSC so the remote can distribute or fall back.
     auto settings = select_query->settings();
     if (settings)
     {
@@ -483,8 +483,10 @@ void StorageObjectStorageCluster::updateQueryToSendIfNeeded(
 
         if (make_cluster_function)
         {
-            /// Convert to old-stype *Cluster table function.
-            /// This allows to use old clickhouse versions in cluster.
+            /// Convert to *Cluster for the non-deferred clustered path (initiator belongs to the
+            /// object-storage cluster). Not used under remote_initiator_cluster deferral, which must
+            /// keep plain s3()/iceberg() with object_storage_cluster as a query setting.
+            /// *Cluster also helps older ClickHouse versions that lack the object_storage_cluster setting.
             static std::unordered_map<std::string, std::string> function_to_cluster_function = {
                 {"s3", "s3Cluster"},
                 {"azureBlobStorage", "azureBlobStorageCluster"},

@@ -386,8 +386,12 @@ IStorageCluster::ResolvedClusterRead IStorageCluster::resolveClusterRead(Context
     ///   -> read locally (fallback_to_pure).
     /// - s3Cluster(...)/explicit *Cluster argument -> never fall back locally.
     /// - object_storage_remote_initiator=1 with object_storage_remote_initiator_cluster set
-    ///   -> defer object_storage_cluster resolution; fallback_to_pure when the local cluster name is empty
-    ///     or for non-*Cluster forms (pure s3()/iceberg()/ENGINE sent to the remote initiator).
+    ///   -> defer object_storage_cluster resolution on the initiator. For setting-syntax / ENGINE,
+    ///     always send plain s3()/iceberg() to the remote initiator with object_storage_cluster as a
+    ///     query SETTINGS value (not *Cluster). OSC may be unknown locally and defined only on the
+    ///     remote (or the reverse); *Cluster would bake the name into the function argument and
+    ///     would also ignore object_storage_cluster_fallback_to_local_if_empty on the remote.
+    ///     Empty local OSC is omitted so the remote can supply its own.
     /// - object_storage_remote_initiator=1 with only object_storage_cluster (no remote_initiator_cluster)
     ///   -> clustered remote path: default initiator cluster to object_storage_cluster, send *Cluster.
     /// - writes -> never apply local fallback (see write()).
@@ -403,12 +407,13 @@ IStorageCluster::ResolvedClusterRead IStorageCluster::resolveClusterRead(Context
     const auto & settings = context->getSettingsRef();
     result.local_fallback = shouldFallbackToLocalOnEmptyCluster(context);
 
-    /// When both remote-initiator settings are set, object_storage_cluster may be defined only on the remote node.
-    /// In this case object_storage_cluster must not be resolved locally.
+    /// Defer OSC resolution when a separate remote-initiator cluster is set: the initiator must not
+    /// require a locally known object_storage_cluster (it may exist only on the remote node).
     const bool defer_object_storage_cluster_resolution
         = settings[Setting::object_storage_remote_initiator]
         && !settings[Setting::object_storage_remote_initiator_cluster].value.empty();
 
+    /// Under deferral, setting-syntax / ENGINE always take the pure remote path (plain s3() + query SETTINGS).
     result.fallback_to_pure = cluster_name_from_settings.empty()
         || (defer_object_storage_cluster_resolution && usesObjectStorageClusterSettingSyntax());
 
@@ -501,14 +506,14 @@ void IStorageCluster::read(
 
         auto remote_initiator_cluster_name = settings[Setting::object_storage_remote_initiator_cluster].value;
 
-        /// rewrite query to execute `remote('remote_host', s3(...))`
-        /// remote_host can execute query itself or make on-cluster query depends on own `object_storage_cluster` setting
+        /// Send remote('host', s3(...)) with object_storage_cluster in query SETTINGS (not s3Cluster).
+        /// The remote may resolve OSC, fall back locally, or use its own OSC when local OSC is empty.
         updateConfigurationIfNeeded(context);
         updateQueryWithJoinToSendIfNeeded(query_to_send, query_info, context);
         updateQueryToSendIfNeeded(query_to_send, storage_snapshot, context, /*make_cluster_function*/ false);
 
         /// ENGINE tables keep object_storage_cluster on the storage, not in the initiator query context.
-        /// Propagate it into the context copied for remote() so the remote node sees the same OSC as alt-syntax.
+        /// Propagate it into the context copied for remote() so the remote sees the same OSC as alt-syntax.
         auto context_for_remote = context;
         if (!cluster_name_from_settings.empty()
             && context->getSettingsRef()[Setting::object_storage_cluster].value.empty())

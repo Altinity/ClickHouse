@@ -208,14 +208,15 @@ private:
     /*
     In case the table was created with `object_storage_cluster` setting,
     modify the AST query object so that it uses the table function implementation
-    by mapping the engine name to table function name and setting `object_storage_cluster`.
+    by mapping the engine name to table function name and setting `object_storage_cluster`
+    as a query SETTINGS value (not a table-function argument).
     For table like
     CREATE TABLE table ENGINE=S3(...) SETTINGS object_storage_cluster='cluster'
     converts request
     SELECT * FROM table
     to
     SELECT * FROM s3(...) SETTINGS object_storage_cluster='cluster'
-    (and optionally to s3Cluster when make_cluster_function is true).
+    (and optionally to s3Cluster when make_cluster_function is true on the non-deferred path).
     Returns true if cluster name was added to settings.
     */
     bool updateQueryForDistributedEngineIfNeeded(ASTPtr & query, ContextPtr context, bool make_cluster_function);
