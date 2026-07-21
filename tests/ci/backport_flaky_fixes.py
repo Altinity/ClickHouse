@@ -232,7 +232,7 @@ def main() -> None:
         run_git("branch", "-D", backport_branch)
         sys.exit(0)
 
-    pr_title = f"Backport flaky-fix commits from upstream ({date_tag})"
+    pr_title = f"{base_branch.title()} - Backport flaky-fix commits from upstream ({date_tag})"
     pr_body = build_pr_body(upstream_repo, applied, conflicted, fetch_failed)
     pr_labels = labels_for_branch(base_branch)
 
