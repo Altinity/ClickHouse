@@ -1,7 +1,7 @@
-# CAS write path — parallel per-part commit + parallel per-blob upload
+# CAS write path — bounded-concurrency per-part commit
 
 - **Date:** 2026-07-22
-- **Status:** design approved, ready for implementation plan
+- **Status:** design approved (revised after two independent concurrency reviews), ready for implementation plan
 - **Area:** `src/Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/` (`ContentAddressedTransaction` commit path)
 - **Backlog item:** `utils/ca-soak/scenarios/BACKLOG.md` — *"OPTIMIZATION OPPORTUNITY (write-path
   latency, HIGH) — CAS-on-S3 INSERT ~7.6× slower than standard S3"* (logged 2026-07-21), root causes
@@ -12,127 +12,166 @@
 A CAS-on-S3 INSERT of a 500-partition wide part (10M rows, 30 columns) measured **170.6 s** versus
 **22.4 s** for the same insert on a standard S3 `ReplicatedMergeTree` — 7.6× slower despite issuing
 FEWER `PutObject` (2566 vs 6156 per node). Confirmed from `system.query_log` ProfileEvents, the
-slowdown is serialization, not bandwidth: `RealTimeMicroseconds` 802.6 s over ~4.7 threads,
-`S3WriteMicroseconds` 117.5 s, `CasRefQueueWaitMicroseconds` 36.2 s, and the smoking gun
-`CasRefBatchFlushes` = 1026 == `CasRefBatchedMutations` = 1026 (ref-ledger batch size exactly **1.0**).
+cause is serialization, not bandwidth: `S3WriteMicroseconds` 117.5 s over ~4.7 threads,
+`CasRefQueueWaitMicroseconds` 36.2 s, and the smoking gun `CasRefBatchFlushes` = 1026 ==
+`CasRefBatchedMutations` = 1026 (ref-ledger batch size exactly **1.0**).
 
-Two nested serial loops in `ContentAddressedTransaction` cause it:
+`ContentAddressedTransaction::commit()` (`ContentAddressedTransaction.cpp:396-404`) drives all ~500
+parts through `publishStaging` in a single-threaded `for` loop. Being single-threaded, it feeds the
+ref-ledger one item at a time, so `CasRefLedger::appendRefOps`' leader/follower batching (which
+collapses concurrent same-namespace appends into one S3 round trip, up to `kMaxRefBatch`) has nothing
+to batch. Each part pays its own two blocking ref-lane round trips (`precommitAdd` + `promote`) — ~1026
+serial ref-log PUTs plus 36 s of queue wait — and its blob uploads (`uploadPendingBlobs`,
+`ContentAddressedTransaction.cpp:241-283`) run one at a time.
 
-1. **Sequential per-part commit** — `commit()` (`ContentAddressedTransaction.cpp:396-404`) drives all
-   ~500 parts through `publishStaging` one fully after another. Being single-threaded, it feeds the
-   ref-ledger one item at a time, so `CasRefLedger::appendRefOps`' leader/follower batching (which
-   collapses concurrent same-namespace appends into one S3 round trip) has nothing to batch — hence
-   batch size 1.0, ~1026 serial ref-log PUTs (513 `precommitAdd` + 513 `promote`) plus 36 s of queue
-   wait.
-2. **Sequential per-blob upload** — `uploadPendingBlobs` (`ContentAddressedTransaction.cpp:241-283`),
-   a plain `for` over a part's ~20-60 column blobs, each `putBlob` blocking. The standard
-   `DiskObjectStorage` path fans column uploads across its I/O thread pool.
+## What the standard S3 write path teaches us
+
+The standard path reaches ~12× write concurrency without deadlocking, and its structure is the model
+to copy:
+
+- **Concurrency comes from the coarse level plus async leaf I/O, not from nested orchestration.** The
+  INSERT thread streams columns; each `WriteBufferFromS3` fires multipart part-uploads asynchronously
+  onto `getThreadPoolWriter()` (`REMOTE_FS_WRITE_THREAD_POOL`, size 100) and keeps going;
+  `finalize()`/`waitAll()` blocks on the **caller's own thread**, never a pool worker, and a leaf
+  upload task never re-enqueues onto its own pool. **The waiter is never a member of the pool it
+  waits on** — the documented anti-deadlock rule (`threadPoolCallbackRunner.h:363-380`).
+- **The commit loop itself is sequential per part** (even `ReplicatedMergeTree` does one Keeper
+  `multi()` per part serially) — cheap only because Keeper is sub-millisecond in-cluster. CAS's
+  per-part ref-append is an S3-latency PUT (~46 ms), so **batching is CAS's unique lever**; the
+  standard path never needed it.
+
+Two independent concurrency reviews (Fable, Codex/gpt-5.6-sol) refuted an earlier draft of this design
+that nested per-part *and* per-blob tasks on the same pool — a deterministic deadlock of the shared IO
+pool, because `ThreadPool` backpressure is queue-fullness (`ThreadPool.cpp:333`), not thread-busyness,
+so an "inline fallback" never fires while 100 workers park waiting on queued children. The revised
+design below removes all nested same-pool waits.
 
 ## Goal and non-goals
 
-Parallelize both loops so that (a) concurrent parts fill the ref-ledger batch queue (engaging the
-existing batching — the largest win) and (b) blob uploads overlap. Output must stay byte-identical
-and every CAS invariant must hold — this is purely a scheduling change.
+Engage the ref-ledger's batching and overlap blob uploads by committing parts with **bounded
+concurrency**, mirroring the standard path: coarse-grained workers plus the async multipart I/O that
+`WriteBufferFromS3` already provides, with strict no-nested-wait pool layering. Output stays
+logically equivalent and every CAS invariant holds.
 
-Non-goals (separate BACKLOG items, not touched here): the unconditional promote manifest GET
-(root cause #3), the 1 MiB HEAD-before-PUT gate (root cause #4), and any change to the ref-ledger
-internals or the intra-part ordering protocol.
-
-## Constraints
-
-- **Byte-identical, invariant-preserving.** No change to encoded bytes, manifest content, ref
-  protocol, or the EDGE-BEFORE-OBSERVE ordering. The output durable state must be independent of
-  scheduling order.
-- **Intra-part ordering is a hard invariant.** Within each part the sequence
-  `stageManifest → precommitAdd → uploadPendingBlobs → promote` (EDGE-BEFORE-OBSERVE, TLA+-guarded
-  "Gate A") must be preserved exactly. Parallelism is only *within* the blob-upload phase and
-  *across* parts — never a reorder of a part's four steps.
-- **No hand-rolled concurrency limiter.** Reuse ClickHouse's shared IO thread pool; the pool's
-  thread count bounds concurrency. Submit tasks via a callback-runner that runs inline under
-  backpressure, which also avoids the nested-pool deadlock (a part task waiting on its blob tasks on
-  the same pool).
-- Branch: a new task branch off the current work; never commit to `master`; no rebase/amend.
+Non-goals (separate BACKLOG items, not touched here): explicit intra-part blob fan-out (see "Deferred"
+below), the unconditional promote manifest GET (root cause #3), the 1 MiB HEAD-before-PUT gate (root
+cause #4), and any change to the ref-ledger internals or the intra-part ordering protocol.
 
 ## Design
 
-### Two-level parallelism over the shared IO pool
+### Bounded-concurrency part commit
 
-Both loops fan out onto ClickHouse's shared IO thread pool through a callback-runner
-(`ThreadPoolCallbackRunner`-style: `scheduleOrThrow` with inline execution under backpressure). The
-join for each fan-out happens on the *submitting* thread, not on a pool thread, so the only nested
-case — a per-part task's blob fan-out — is made deadlock-safe by the runner's inline fallback rather
-than by a semaphore.
+Replace the sequential `for (auto & [key, st] : parts)` in `commit()` with a bounded pool of workers,
+each running one whole part's `publishStaging` **synchronously and unchanged** (`stageManifest →
+precommitAdd → uploadPendingBlobs → promote`). Concurrency bound = a new setting
+(`cas_commit_concurrency`, default modest, e.g. 16 — enough to make ref batches meaningful while
+bounding how many threads block on ref-lane round trips). The commit loop dispatches the parts,
+snapshotting the part keys first (the `parts` map is not mutated during commit), and joins on the
+calling thread.
 
-1. **Per-part** (`commit()`): replace the sequential `for (auto & [key, st] : parts)` with a
-   snapshot of the part keys dispatched as per-part `publishStaging` tasks, joined on the calling
-   thread. Each task runs the unchanged four-step `publishStaging` internally.
-2. **Per-blob** (`uploadPendingBlobs`): replace the sequential `for (const auto & pb :
-   st.pending_blobs)` with per-blob `putBlob` tasks, joined before the function returns (so the
-   part's `promote` still runs strictly after all its blobs land).
+Why this hits both root causes:
+- **Ref-ledger batching engages.** Up to `cas_commit_concurrency` workers reach `precommitAdd`/
+  `promote` concurrently; their items pile into `rt->pending` and one worker becomes leader and
+  `flushRefBatch`-es them all in one append. Batch size goes from 1.0 toward the worker count
+  (capped at `kMaxRefBatch`). Workers block in `appendRefOps` as leader/follower — safe, because
+  `appendRefOps` runs its leader on the calling thread and never schedules onto the commit pool.
+- **Blob uploads overlap for free.** Each worker's `putBlob` streams through `WriteBufferFromS3`,
+  which already multiparts onto `getThreadPoolWriter()`. So N workers give N-way cross-part blob
+  overlap, and each blob still gets its own multipart parallelism — without any intra-part fan-out.
 
-### Correctness surface
+### Pool-layering discipline (the anti-deadlock rule)
 
-- **Ref-ledger batching engages for free.** Concurrent parts call `precommitAdd`/`promote`
-  simultaneously; `appendRefOps` enqueues each into `rt->pending` and one caller becomes leader and
-  `flushRefBatch`-es all pending same-namespace items in one append. `appendRefOps` does not submit
-  to the IO pool (it has its own leader/queue), so ref appends never nest into the pool.
-- **The one genuinely new race: the per-build `deps` map.** Every `putBlob` records
-  `deps[ref] = DepEntry{...}` on the shared `PartWriteTxn` (`CasPartWriteTxn.cpp`, `observeAndAdmit`
-  and the `uploadFromSource` success path). `deps` is a `std::map`; concurrent inserts — even at
-  distinct keys — are a data race. Resolution (chosen): keep the S3 HEAD/PUT (the slow 99%) fully
-  parallel and guard only the trivial `deps` write with a per-build mutex; contention is negligible
-  because the write is nanoseconds while every thread spends its time in the S3 round trip. (A
-  post-join merge of per-task `DepEntry` results is an equivalent alternative if a profile ever shows
-  lock contention, which it should not.) Per-part tasks (#1) do **not** share a `deps` map — each
-  part owns its own `PartWriteTxn` — so this race is unique to #2.
-- **Cross-part shared mutable state:** `created_refs` (rollback tracking) is written from multiple
-  part tasks and must be guarded (mutex or concurrent collection).
-- **Store-level shared components** — the dedup cache (`dedupCacheContains`/`dedupCacheAdd`), the
-  event log (`EventEmitter`), per-hash meta ops (`loadMeta`/`putMetaIfAbsent`), the ref-ledger, and
-  the S3 backend — are shared across all parts and blobs. These are almost certainly already
-  thread-safe because concurrent INSERTs into CAS tables already exercise them (two queries = two
-  concurrent transactions against one store). The design must **explicitly verify** the dedup-cache
-  and event-log locking rather than assume it; if either is not thread-safe, add the minimal lock.
+- The commit-worker pool **must be disjoint from `getThreadPoolWriter()`**. A worker blocks in
+  `WriteBufferFromS3::finalize` waiting on `getThreadPoolWriter`; if the worker were itself a
+  `getThreadPoolWriter` thread, that is the same deadlock one level down. Preferred: a bounded
+  `ThreadPoolCallbackRunner` over `getIOThreadPool()` (already disjoint from the writer pool, no new
+  global pool), with `cas_commit_concurrency` as the real bound; a dedicated CAS commit pool is an
+  acceptable alternative if isolating the blocking ref-lane waits from other IO proves necessary. The
+  hard requirement is only "disjoint from `getThreadPoolWriter`".
+- **No worker ever waits on work queued to its own pool.** Blobs run serially inside a worker, so a
+  worker never fans out onto the commit pool.
+- The commit-worker tasks **must propagate the query `ThreadGroup`** (via the standard runner
+  mechanism, `threadPoolCallbackRunner.h:33-38`), or the CAS ProfileEvents (`CasRefBatchFlushes` /
+  `CasRefBatchedMutations` / `CasRefQueueWaitMicroseconds`) and `content_addressed_log.query_id` lose
+  attribution to the INSERT. Capture the group without extending its lifetime past the query
+  (the B90 freed-ThreadGroup precedent).
+
+### Correctness surface (much smaller than the nested design)
+
+- **No new intra-build race.** Each part owns its own `PartWriteTxn` (`buildFor`,
+  `ContentAddressedTransaction.cpp:133-141`), and blobs run serially within its worker, so the build's
+  `deps` map is touched by a single thread. (The `deps`-map mutex from the earlier draft is
+  unnecessary here; it returns only if intra-part fan-out is ever added — see Deferred.)
+- **Cross-part shared state:** `created_refs` is written by concurrent workers and is mutex-guarded.
+  Its contents change per the rollback rework below.
+- **Store-level components are thread-safe** (verified in review, not assumed): the dedup cache is a
+  locked `CacheBase`; `getRefTableRuntime`/recovery/stale-precommit-sweep are guarded by
+  `ref_queue_mutex`/`state_mutex`; `CasRequestController` state is per-call; `EventEmitter` emits into
+  a `SystemLog` sink installed before traffic. Concurrent same-namespace `appendRefOps` is already
+  exercised by concurrent INSERTs.
+- **EDGE-BEFORE-OBSERVE is preserved.** Each worker keeps the durable
+  `stageManifest → precommitAdd → uploadPendingBlobs → promote` order internally; parts are
+  independent (each adopt is protected by that part's own durable precommit).
 
 ## Error handling / rollback
 
-Preserve the existing partial-commit rollback contract (`commit()`'s try/catch: on failure,
-best-effort `dropRef` the refs this commit created that were absent before, then rethrow; pre-existing
-refs are never dropped). Under concurrency:
+The reviews found the existing rollback is fragile and that concurrency makes late failures — after
+many parts already published — far more likely. Rework it:
 
-- A blob-task exception propagates to its part (the blob join surfaces the first error, the part
-  fails); a part-task exception propagates to `commit()`.
-- **Wait-all, then roll back.** On the first part failure, `commit()` does not abort in-flight parts
-  mid-step (a half-completed `promote` could leave inconsistent state). It waits for every dispatched
-  part task to finish (each completing or failing cleanly), then collects the full `created_refs` set
-  and best-effort `dropRef`s the absent-before subset. This keeps the existing property that each
-  publish is individually gate-checked and journalled and that leftover uploads are GC-reclaimable
-  debris.
-- **First-exception-wins:** the first captured exception is rethrown; subsequent exceptions are
-  logged and swallowed so they never mask the original. `created_refs` collection is mutex-guarded.
-- The bounded per-blob retry loop in `putBlob` (`ABORTED`/condemned, max 8 attempts) stays per-blob,
-  unchanged.
+- **Part-level wait-all on every path.** `commit()` installs a `SCOPE_EXIT` that joins **every
+  dispatched worker** (success or failure, including the dispatch-failure-partway case) before it
+  rolls back or returns. No worker ever runs concurrently with rollback or with
+  `~ContentAddressedTransaction`'s `abandon()`. This is the single hard rule that keeps the design
+  safe.
+- **Exact-manifest rollback (`dropRefIfMatches`).** Today `created_refs` stores only `(ns, ref)` and
+  rollback `dropRef`s whatever manifest currently occupies that name — which can delete another
+  transaction's legitimate `repointRef(R, M2)` or a reincarnated ref, and the repoint path can
+  *create* a ref yet return `false`, escaping `created_refs` entirely. Fix: `promoteBuild`/`repointRef`
+  return the exact committed outcome `(ns, ref, manifest_id, created?)` derived inside the ref-ledger
+  mutation; the commit records that tuple in a preallocated, no-throw slot; rollback calls a
+  conditional `dropRefIfMatches` that removes the ref only if its current committed binding still
+  equals this transaction's exact `manifest_id`, and otherwise leaves it and reports the conflict.
+  This also covers the repoint-that-created case (tracked because the outcome carries `created?`).
+- **First-exception-wins:** the first captured worker exception is rethrown after wait-all; subsequent
+  ones are logged and swallowed so they never mask the original. `created_refs` collection is
+  mutex-guarded.
+- **Pre-existing residuals stated, not silently inherited:** a wedged/`Unresolved` `promote` that later
+  resolves Committed leaves a ref outside `created_refs` (identical in today's sequential code); the
+  repoint path should reset `st.build` after `abandon` so a late failure does not double-abandon.
+- The bounded per-blob retry loop in `putBlob` (`ABORTED`/condemned, max 8) is unchanged.
 
 ## Testing
 
-- **Invariant safety net (primary):** because this is a scheduling-only change, the full CA gtest
-  battery (the corrected comprehensive filter) and the CA soak must stay green. Any failing invariant
-  test means the parallelization broke ordering or shared state.
-- **ThreadSanitizer gate (key new test):** run a representative multi-part CAS insert under TSan to
-  catch data races on the `deps` map, `created_refs`, and the store-level dedup cache / event log.
-  This is a required new gate.
-- **Determinism:** a multi-part insert must produce byte-identical durable state (refs, manifests,
-  meta) regardless of scheduling — assert the parallel commit yields the same refs/manifests as a
-  forced-sequential run.
-- **Failure-injection rollback:** inject a `promote` failure in one part of a multi-part commit and
-  assert, under concurrency, that the absent-before refs are dropped and pre-existing refs are
-  untouched (the wait-all-then-roll-back path).
+- **Invariant safety net (primary):** this is a scheduling change, so the full CA gtest battery (the
+  corrected comprehensive filter) and the CA soak must stay green. Any failing invariant means the
+  concurrency broke ordering or shared state.
+- **Deadlock / saturation gate (catches the class TSan cannot see):** run a multi-part parallel commit
+  against a commit pool of size `N` with at least `N+1` parts and ≥1 blob each; assert bounded
+  completion. Deterministically proves no worker starves waiting on its own pool.
+- **ThreadSanitizer gate:** a representative multi-part CAS insert under TSan for `created_refs` and
+  the cross-part store-level components.
+- **Determinism = semantic equivalence, NOT byte-identical.** Batching intentionally changes ref-log
+  packing, `RefTxnId`s, `published_at_ms`, and incarnation tags. Assert the parallel commit yields the
+  same *folded logical state* (committed ref→manifest bindings, decoded manifest entries, blob
+  payloads, in-degree, clean meta) as a forced-sequential run — explicitly excluding encoding, IDs,
+  audit ordering, and timestamps.
+- **Rollback correctness tests:** (a) inject a `promote` failure in one part of a multi-part commit and
+  assert absent-before refs are dropped and pre-existing refs untouched, under wait-all; (b) T1
+  promotes `R`, T2 legitimately `repointRef(R, M2)`, then T1 rolls back → assert T2's binding
+  survives (`dropRefIfMatches`); (c) a scratch-`getView` then concurrent `dropRef` so the repoint
+  creates a ref → assert it is tracked and rolled back; (d) a scheduling failure partway through
+  dispatch → assert all already-submitted workers are joined.
 - **Performance validation (success metric):** re-run the 500-partition benchmark. Success =
   `CasRefBatchFlushes` ≪ `CasRefBatchedMutations` (batching engaged; was 1026 == 1026),
-  `CasRefQueueWaitMicroseconds` drops sharply, and wall-clock approaches the standard-S3 baseline.
-  Additionally a single-wide-partition insert to validate #2 (intra-part blob parallelism) on its own.
+  `CasRefQueueWaitMicroseconds` drops sharply, wall-clock approaches the standard-S3 baseline, and the
+  metrics attribute to the INSERT's `query_log` row (ThreadGroup propagation).
 
-## Out of scope
+## Deferred (not in this spec)
 
+- **Explicit intra-part blob fan-out** (for a wide *single-partition* insert, where bounded per-part
+  concurrency gives little overlap). If added, blob tasks go on a *third* pool disjoint from both the
+  commit pool and `getThreadPoolWriter`, the `deps`-map write is mutexed, and a blob-level wait-all
+  with an atomic `alive` guard is required. Deferred because bounded per-part concurrency already
+  covers the measured 500-partition case; revisit only if profiling shows a single-part bottleneck.
 - Root causes #3 (promote manifest GET) and #4 (1 MiB HEAD-before-PUT) — separate BACKLOG items.
 - Ref-ledger internals, the intra-part ordering protocol, and any encoded-byte/format change.
