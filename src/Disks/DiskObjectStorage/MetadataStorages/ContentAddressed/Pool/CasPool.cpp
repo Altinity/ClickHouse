@@ -61,6 +61,12 @@ namespace ProfileEvents
     extern const Event CasDedupCacheMisses;
 }
 
+namespace CurrentMetrics
+{
+    extern const Metric CasDedupCacheBytes;
+    extern const Metric CasDedupCacheEntries;
+}
+
 namespace DB::Cas
 {
 
@@ -116,7 +122,7 @@ Pool::Pool(BackendPtr backend_, PoolConfig config_, PoolMeta meta_)
 {
     if (config.dedup_cache_bytes > 0)
         dedup_cache = std::make_unique<DedupCache>(
-            "LRU", CurrentMetrics::end(), CurrentMetrics::end(),
+            "LRU", CurrentMetrics::CasDedupCacheBytes, CurrentMetrics::CasDedupCacheEntries,
             config.dedup_cache_bytes, DedupCache::NO_MAX_COUNT, DedupCache::DEFAULT_SIZE_RATIO);
 }
 

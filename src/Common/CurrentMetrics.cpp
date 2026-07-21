@@ -232,6 +232,10 @@
     \
     M(CasPartFolderCacheBytes, "Estimated bytes retained by the CA part-folder view cache") \
     M(CasPartFolderCacheEntries, "Entries retained by the CA part-folder view cache") \
+    M(CasManifestDecodeCacheBytes, "Bytes retained by the CA manifest decode cache") \
+    M(CasManifestDecodeCacheEntries, "Entries retained by the CA manifest decode cache") \
+    M(CasDedupCacheBytes, "Bytes retained by the CA blob presence (dedup) cache") \
+    M(CasDedupCacheEntries, "Entries retained by the CA blob presence (dedup) cache") \
     \
     M(MergeTreeFetchPartitionThreads, "Number of threads for ALTER TABLE FETCH PARTITION") \
     M(MergeTreeFetchPartitionThreadsActive, "Number of threads for ALTER TABLE FETCH PARTITION fetching part") \
