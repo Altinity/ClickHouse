@@ -72,7 +72,6 @@ Status legend:
 | `CaRefNsCleanupStaleLeaderCore.tla` | stale-leader namespace-cleanup pass aborts on completed-marker observation | CURRENT | `run_nscleanup_staleleader.sh` |
 | `CaRefWriterCleanupCore.tla` | ref-table writer ownership lifecycle: precommit, promote, fence, successor cleanup | CURRENT | `run_refwcleanup.sh` |
 | `CaB140DangleMerge.tla` (+ `m_*.cfg`) | journal-trim dangle across a lease handoff: trim-gate + cursor-in-snap jointly necessary | HISTORICAL | (inline TLC) |
-| `CaB140DangleFaithful.tla` | faithful-producer refutation of the first-phase dangle mechanism | HISTORICAL | (inline TLC) |
 
 ## Model groups {#model-groups}
 
@@ -258,30 +257,29 @@ ordered scan and cleanup deletes only what it observed durable. The migration is
 
 ### Historical records (kept) {#group-historical}
 
-Both models document one real incident from the era when GC state lived in a mutable per-shard
-manifest with a separately committed fold cursor: a leader folded a new part's edge into its
-in-memory state, trimmed the journal against that in-memory cursor before the snapshot was
-durable, then lost its lease — the successor rebuilt from the empty committed snapshot, gap-skipped
-the trimmed journal entry, and deleted a blob a live part still referenced.
-
 - **`CaB140DangleMerge.tla`** (+ `m_both_buggy.cfg`, `m_cursorskip.cfg`, `m_trimonly.cfg`,
-  `m_merged.cfg`) — the 2×2 fix proof: the journal may be trimmed only up to the cursor carried
-  INSIDE the committed snapshot (trim-gate), and the cursor must be committed atomically with the
-  edges (cursor-in-snap); each half alone still loses data, both together are clean. The
+  `m_merged.cfg`) — documents one real incident from the era when GC state lived in a mutable
+  per-shard manifest with a separately committed fold cursor: a leader folded a new part's edge
+  into its in-memory state, trimmed the journal against that in-memory cursor before the snapshot
+  was durable, then lost its lease — the successor rebuilt from the empty committed snapshot,
+  gap-skipped the trimmed journal entry, and deleted a blob a live part still referenced. The 2×2
+  fix proof: the journal may be trimmed only up to the cursor carried INSIDE the committed
+  snapshot (trim-gate), and the cursor must be committed atomically with the edges
+  (cursor-in-snap); each half alone still loses data, both together are clean. The
   cursor-inside-the-snapshot principle carries forward into the ref snapshot + log design.
-- **`CaB140DangleFaithful.tla`** — the companion refutation: with producers faithful to what the
-  first-phase code actually did, the first-phase fix mechanism itself is clean — the dangle needed
-  the unfaithful behaviors, pinpointing the real culprit before the fix above was designed.
 
 ## Removed models {#removed-models}
 
-The following models gated superseded or rejected designs and were removed on 2026-07-21 — one
-commit per model, motivation in each commit message; full text remains in git history:
+The following models gated superseded or rejected designs, or added no assurance beyond the
+deterministic C++ unit tests covering the same scenarios, and were removed during the 2026-07
+model audit — one commit per model, motivation in each commit message; full text remains in git
+history:
 
 | Model | Why removed |
 |---|---|
 | `CaGcCore.tla` | the original epoch-based-reclamation GC design (a global epoch counter with per-writer pins); superseded by the incarnation-token design (`CaIncarnationCore.tla`); no epoch machinery exists in code |
-| `CaB140Dangle.tla` | first reproduction of the journal-trim dangle, built with producer behaviors the real code never had; superseded by `CaB140DangleFaithful.tla` |
+| `CaB140Dangle.tla` | first reproduction of the journal-trim dangle, built with producer behaviors the real code never had |
+| `CaB140DangleFaithful.tla` | refutation companion of the incident above: with faithful producers the first-phase mechanism is clean — a negative result about a mechanism that no longer exists at all; the incident record and fix proof live in `CaB140DangleMerge.tla` |
 | `CaResurrectLiveness.tla` | modeled a condemn-time guard blocking GC from re-condemning a build's freshly-owned incarnation; that guard was never implemented — the shipped protection is precommit-first reachability (`CaBuildRootPrecommit.tla`) |
 | `CaBuildWatermark.tla` | modeled a per-candidate blob-guard (a minimum-active-build watermark protecting in-flight builds' blobs from condemnation); that whole mechanism was replaced by precommit-first reachability; the surviving lemma — build sequence numbers must come from a monotone counter — lives on in precommit reclaim (`CasGc.cpp`) |
 | `CaBuildWatermarkNum.tla` | numeric companion of `CaBuildWatermark.tla`, same supersession |

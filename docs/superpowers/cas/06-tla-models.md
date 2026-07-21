@@ -266,7 +266,9 @@ three-object mount protocol: `NoTwoServerUuidsOwnSameServerRoot` (owner is stick
 
 ## Area 5 — B140 dangle: faithful reproduction and fix proof {#area-b140}
 
-Three models form a deliberate progression from initial reproduction to fix proof.
+Three models formed a deliberate progression from initial reproduction to fix proof. The fix-proof
+model (`CaB140DangleMerge.tla`) is the kept survivor; the two reproduction models were removed
+during the 2026-07 model audit (sections kept as the record).
 
 ### `CaB140DangleMerge.tla` — faithful B140 reproduction + fix proof {#cab140danglemerge}
 
@@ -298,13 +300,12 @@ trim-before-durable dangle across a GC lease handoff.
 
 ### `CaB140DangleFaithful.tla` — faithful refutation of Phase-1 mechanism {#cab140danglefaithful}
 
-**Files:** `CaB140DangleFaithful.tla`, `CaB140DangleFaithful_shared.cfg`
+**Files:** `CaB140DangleFaithful.tla`, `CaB140DangleFaithful_shared.cfg` — **removed 2026-07-22**
+(full text in git history).
 
-**What it proves.** Clean over 9.1M states — the Phase-1 B140 fix (faithful producers: no marker-retaining strip, no field-mixed generation adoption) does not exhibit the dangle under the original Phase-1 mechanism. Supersedes `CaB140Dangle.tla` as the faithful producer model.
+**What it proved.** Clean over 9.1M states — the Phase-1 B140 fix (faithful producers: no marker-retaining strip, no field-mixed generation adoption) does not exhibit the dangle under the original Phase-1 mechanism. Superseded `CaB140Dangle.tla` as the faithful producer model.
 
-Results are recorded inside `CaB140DangleMerge_RESULTS.md`.
-
-**Code currency:** CURRENT as historical record.
+**Code currency:** historical record only (a refutation about the long-gone Phase-1 mechanism); files removed 2026-07-22.
 
 ---
 
@@ -743,7 +744,7 @@ counterexamples found during EBR model development encoded the four load-bearing
 | `CaGcLeaseCore.tla` | Lease/B160 | **CURRENT** | `NoEpochCollision`, `NoFalseSteal` | 1 | advisory heartbeat eliminates false steals; safety independent of heartbeat |
 | `CaCasMountCore.tla` | Mount | **CURRENT** | `NoTwoServerUuids…`, `ForeignUuid…`, `WriterEpochMonotoneUnique`, `SupersededWriter…` | 3 | sticky owner, monotone epoch, lost-actor write block |
 | `CaB140DangleMerge.tla` | B140 fix proof | **CURRENT** (history record) | `INV_NO_LOSS` | 2×2 matrix | trim-gate + cursor-in-snap jointly necessary |
-| `CaB140DangleFaithful.tla` | B140 history | **CURRENT** (history record) | `INV_NO_LOSS` | — | Phase-1 mechanism clean with faithful producers |
+| `CaB140DangleFaithful.tla` | B140 history | **REMOVED 2026-07-22** (dead-mechanism refutation) | `INV_NO_LOSS` | — | Phase-1 mechanism clean with faithful producers |
 | `CaB140Dangle.tla` | B140 history | **REMOVED 2026-07-21** (unfaithful producers) | — | — | Phase-1 investigation record |
 | `CaResurrectLiveness.tla` | Resurrect/B167 | **REMOVED 2026-07-21** (stale, deferred M-F guard) | `<>published` | 1 | upload→publish span not atomic; heartbeat guard load-bearing |
 | `CaBuildWatermark.tla` | Watermark/B167 | **REMOVED 2026-07-21** (blob-guard removed by B171) | `Inv_ProtectedNeverCondemned`, `Inv_NoDangle`, liveness | 3 | monotone `build_seq`, exact min active set, sound crash detection |
