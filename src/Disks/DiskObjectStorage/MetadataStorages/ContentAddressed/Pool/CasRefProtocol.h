@@ -144,12 +144,13 @@ struct RefLedgerConfig
 /// always co-occur because both are derived from one caller intent. `LiveAppend` means "this is the
 /// FIRST time this transaction is being validated, against a state that must survive a rejection": the
 /// writer's append-time contract and every trial/shape-check preview. It re-checks every precondition,
-/// including the O(N) cross-owner uniqueness scan, and applies two-phase against a scratch copy so
+/// including the cross-owner uniqueness check (O(1) via `owned_manifests` since E2), and applies
+/// two-phase against a scratch copy so
 /// `state` is byte-for-byte unchanged on any throw. `TrustedReplay` means "I am replaying
 /// already-committed, already-validated history into a local state I own and discard on any error":
 /// `replay`'s tail, and only `replay`'s tail (recovery, GC fold, fsck, protection views all inherit it
 /// through `replay`). Because the transaction already passed `LiveAppend` validation when it was
-/// durably appended, the O(N) cross-owner scan is elided in release builds and kept as a `chassert` in
+/// durably appended, the cross-owner re-check is elided in release builds and kept as a `chassert` in
 /// debug/sanitizer builds (same policy as `debugAssertBodyCounters`) -- every exact-binding
 /// precondition (cheap, keyed) is still enforced in BOTH modes, so a corrupted log object still fails
 /// closed either way. And because the state is thrown away on any error, `TrustedReplay` applies IN
