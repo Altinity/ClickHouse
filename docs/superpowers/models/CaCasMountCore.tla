@@ -64,7 +64,7 @@
 (* The root cause both passes converged on: the model's reclaim was        *)
 (* BODY-INVISIBLE while the product's reclaim is a token-guarded           *)
 (* `putOverwrite` that installs the SUCCESSOR'S BODY                       *)
-(* (`CasServerRoot.cpp:405-414`). Round 8 makes the reclaim install that    *)
+(* (`CasServerRoot.cpp:331-332`). Round 8 makes the reclaim install that    *)
 (* body (P1) and lets the model's PRE-EXISTING body classification         *)
 (* (`Renew`/`ClaimMount`/`AdoptRead`, all present since round 0/P3.1) do    *)
 (* the re-arm-blocking work -- no compensating field needed, so `heldToken` *)
@@ -656,7 +656,7 @@ StartObservation ==
 \*
 \* rev.6 round 8 (P1, consult/review-reconciled -- FIXES review C1, replaces round-7's
 \* `heldToken` compensating field): INSTALLS THE SUCCESSOR'S BODY, exactly like the real
-\* token-guarded `putOverwrite` reclaim (`CasServerRoot.cpp:405-414`: same uuid, the
+\* token-guarded `putOverwrite` reclaim (`CasServerRoot.cpp:331-332`: same uuid, the
 \* successor's freshly-allocated `writer_epoch`, `gc_fenced=false`, fresh `expires_at_ms`,
 \* fresh token). `mount.uuid` stays `owner` (only the sticky owner ever legitimately holds
 \* this slot); `mount.epoch` becomes the JUST-bumped `epoch'` (GLOBAL truth, a separate

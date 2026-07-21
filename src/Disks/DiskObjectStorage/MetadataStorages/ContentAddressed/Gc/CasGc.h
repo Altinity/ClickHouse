@@ -117,7 +117,7 @@ struct RoundReport
 };
 
 /// Leader-paced regular GC: one pass per round — heartbeat
-/// ack floor -> fold (three-cursor merge) -> pre-CAS deletes of previously-published pending
+/// ack floor -> fold (two-cursor merge) -> pre-CAS deletes of previously-published pending
 /// entries -> single `gc/state` CAS -> post-CAS cleanup/trim, over the root-local part-manifest model. The lease is work deduplication only —
 /// every step is idempotent and split-brain-safe (monotone `gc/state`, append-by-unique-path retire and
 /// outcome logs, exact-token deletes). These properties mean that a stale leader can duplicate work but
@@ -266,7 +266,7 @@ private:
     /// On success `state` carries the committed snap_generation and `state_token` the committed gc/state
     /// token. The committed pair is THREADED into retire, never re-read (zombie-steal protection).
     /// Round-paced graduation: `current_round` (= state.round + 1, the SAME basis condemn_round is
-    /// stamped at) is the threshold the fold's three-cursor merge graduates/condemns against — an entry
+    /// stamped at) is the threshold the fold's two-cursor merge graduates/condemns against — an entry
     /// graduates once `condemn_round < current_round`, i.e. it survived at least one full round after
     /// being condemned. The fold no longer CASes gc/state — it sets (snap_generation, snap_attempt)
     /// in-memory; the SINGLE round CAS commits them.
