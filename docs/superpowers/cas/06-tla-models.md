@@ -757,7 +757,7 @@ counterexamples found during EBR model development encoded the four load-bearing
 | `CaGcRoundDeferCore.tla` | GC round DEFER/skip-unchanged | **CURRENT** | `NoOverDelete`, `NoDangle`; `EventuallyFolded` | 2 | a due graduation force-folds first (no destructive decision on a not-fully-folded snapshot); deferral bounded (`deferCount < MaxDefer`) |
 | `CaEdgeBeforeObserve.tla` | Writer/GC simplification Gate A | **CURRENT** | `NoOverDelete`-shaped safety (implicit) | 4 | with EDGE-BEFORE-OBSERVE + same-pass decided-delete, promote-time revalidation of TOKENED leaves is redundant; K1/K3Head/K3AdoptCheck + the order itself stay load-bearing |
 | `CaMetaDescriptor.tla` | Writer/GC simplification Gate B (meta descriptor, v1) | **CURRENT** (predates the v3 2-state trim) | `INV-META-BODY` | 7 | create bottom-up (body, then meta); delete top-down (meta at captured etag, then body at condemn-time token) |
-| `CaMetaDescriptorRaw.tla` | Gate B raw-body / terminal-tombstone | **SUPERSEDED** (rejected by v3) | `INV_NO_LOSS`, `INV_NO_DANGLE`, `INV_META_BODY` | 5 | raw immutable bodies force a terminal tombstone + writer-waits-on-GC coupling; rejected in favor of keeping the in-body incarnation tag |
+| `CaMetaDescriptorRaw.tla` | Gate B raw-body / terminal-tombstone | **REMOVED 2026-07-21** (rejected by v3) | `INV_NO_LOSS`, `INV_NO_DANGLE`, `INV_META_BODY` | 5 | raw immutable bodies force a terminal tombstone + writer-waits-on-GC coupling; rejected in favor of keeping the in-body incarnation tag |
 | `CaMetaIncarnationKey.tla` | Gate B Option B (per-incarnation body keys) | **SUPERSEDED** (rejected) | `INV_NO_DANGLE` (implicit) | 1 | removes the tombstone/wait but reintroduces the already-rejected generation-in-key design (404→LIST, manifest carries incarnation) |
 | `CaManifestSweepWindow.tla` | Orphan-sweep vs removal-fold wedge | **CURRENT** | `INV_FOLD_PROGRESS` | 1 | the orphan sweep must skip a committed body with a pending (unsealed) removal — the removal-fold still needs the body to emit its decrement |
 
@@ -975,7 +975,8 @@ written argument (citing `CaIncarnationCore`), not a re-derivation of this model
 **Files:** `CaMetaDescriptorRaw.tla`, `CaMetaDescriptorRaw_reduced.cfg`,
 `CaMetaDescriptorRaw_sab_meta_first.cfg`, `CaMetaDescriptorRaw_sab_blind_adopt.cfg`,
 `CaMetaDescriptorRaw_sab_adopt_tomb.cfg`, `CaMetaDescriptorRaw_sab_del_notomb.cfg`,
-`CaMetaDescriptorRaw_sab_resurrect_tomb.cfg`.
+`CaMetaDescriptorRaw_sab_resurrect_tomb.cfg`, `run_metaraw.sh` — **removed 2026-07-21** (full text
+in git history).
 
 **What it proves.** A Gate B variant that drops the envelope to RAW, immutable, write-once bodies and
 makes the per-hash meta the SOLE three-state linearizer (`clean, condemned, tombstone`), with the meta
@@ -990,8 +991,8 @@ delete-without-tombstone-claim, resurrect-from-tombstone) each dangle.
 body by itself, which is exactly what forced the terminal-tombstone handshake — a writer↔GC liveness
 coupling. REJECTED by the v3 design (`docs/superpowers/plans/2026-07-10-cas-freshness-meta-v3.md`,
 superseding `docs/superpowers/plans/2026-07-10-cas-meta-descriptor-raw-body.md`), which keeps the
-settled one-key-per-hash + in-body `incarnation_tag` + exact-token BODY delete instead. Kept as
-explored-and-rejected evidence.
+settled one-key-per-hash + in-body `incarnation_tag` + exact-token BODY delete instead. Files
+removed 2026-07-21; this section stays as the explored-and-rejected record.
 
 ---
 
