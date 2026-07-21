@@ -16,10 +16,16 @@
 /// source-edge SET: re-folding a fence-window removal across generations is a set-difference no-op,
 /// so the underflow cannot occur (NOT by patching the sealed cursor — that approach was rejected).
 ///
-/// H2 (DropThenRepointIdempotent) guards against the duplicate-remove undercount that existed when
+/// H2 (DuplicateRemovalIdempotent) guards against the duplicate-remove undercount that existed when
 /// in-degree was a persisted integer: two events both carrying `old=committed(r1)` subtracted -1
-/// twice from blob 2's count, driving it to -1. Same fix — the second removal of an already-absent
-/// edge is a no-op.
+/// twice from a blob's count, driving it to -1. Same fix — the second removal of an already-absent
+/// edge is a no-op. (Formerly staged the second event as a `{old=committed(r1),
+/// new=committed(r2)}` "repoint" -- a single op naming DIFFERENT manifests in its old/new bindings.
+/// Post-classifier (see Pool/CasRefProtocol.cpp's `classifyOwnerTransitionShape`) that single-op shape
+/// is not representable at all: `manifestEdgesOfTxn` now throws `CORRUPTED_DATA` on it, same as the
+/// state machine always has. The ACTUALLY representable duplicate-removal hazard -- two SEPARATE
+/// remove-committed events both naming `old=committed(r1)`, which the GC fold extracts blindly without
+/// replaying the state machine -- is what this test exercises instead.)
 
 using namespace DB::Cas;
 using namespace DB::Cas::tests;
@@ -50,8 +56,13 @@ bool blobExists(InMemoryBackend & b, const Layout & layout, const UInt128 & hash
 /// A committed `RefOwnerBinding` for a raw `owner_transition` op. The raw appender is now
 /// `tests::appendOwnerEvent`, which writes ONE `owner_transition` ref-log transaction via
 /// `writeRefLogTxnRaw` at the next `RefTxnId` -- the GC fold EXTRACTS edges from each log
-/// (`manifestEdgesOfTxn`) and never replays them, so an `old_binding` that does not correspond to the
-/// table's current committed owner is folded verbatim (exactly the "drop THEN repoint-from-r1" hazard).
+/// (`manifestEdgesOfTxn`) and never replays them through the state machine, so a SHAPE-legal
+/// `old_binding` (an exact `remove committed` op) that no longer names the table's current committed
+/// owner is still folded -- it is not caught until (and unless) the full state machine replays the
+/// log. That is exactly the "duplicate removal of an already-removed committed ref" hazard H2 below
+/// exercises: two SEPARATE remove-committed events for the same `(ref_name, manifest_ref)`, each
+/// individually shape-legal (`classifyOwnerTransitionShape` accepts every one), but the second is a
+/// stale repeat the idempotent source-edge set must absorb rather than double-subtract.
 RefOwnerBinding committed(const String & ref_name, const ManifestRef & r)
 {
     return RefOwnerBinding{RefOwnerKind::Committed, ref_name, r};
@@ -59,35 +70,35 @@ RefOwnerBinding committed(const String & ref_name, const ManifestRef & r)
 
 }
 
-/// ============================ H2: DROP-THEN-REPOINT FROM SAME OLD IS IDEMPOTENT (REGRESSION GUARD) ====
+/// ============================ H2: DUPLICATE COMMITTED REMOVAL IS IDEMPOTENT (REGRESSION GUARD) ========
 ///
-/// Two DISTINCT journal events each carry `old = committed(r1)`:
-///   v2: DROP r1        {old=committed(r1), new=none}          => removes r1's source-edge to {1,2}
-///   v3: REPOINT r1->r2 {old=committed(r1), new=committed(r2)} => removes r1's source-edge to {1,2} (again),
-///                                                                  adds r2's source-edge to {1}
+/// Two SEPARATE journal events both carry the EXACT same `old = committed(r1)` removal:
+///   v2: DROP r1              {old=committed(r1), new=none}  => removes r1's source-edge to {1,2}
+///   v3: DUPLICATE DROP r1    {old=committed(r1), new=none}  => removes r1's source-edge to {1,2} AGAIN
 ///
-/// Under the OLD integer in-degree model this drove blob 2 to prior(1) + (-1) + (-1) = -1 and threw
-/// CORRUPTED_DATA. Under the FIXED idempotent source-edge SET model the second removal of r1's edge to
-/// blob 2 is a no-op: each source edge is present or absent, and removing an already-absent edge is silent.
+/// Each event is individually SHAPE-legal (`classifyOwnerTransitionShape` accepts a bare
+/// `old=Committed, new=none` removal unconditionally; it has no state to check that the removal is
+/// still live). The GC fold extracts edges from each log directly, without replaying the state machine
+/// (which alone would notice the second removal names an owner that is no longer bound), so both
+/// events fold. Under the OLD integer in-degree model this drove blob 2 to prior(1) + (-1) + (-1) = -1
+/// and threw CORRUPTED_DATA. Under the FIXED idempotent source-edge SET model the second removal of
+/// r1's edge to a blob is a no-op: each source edge is present or absent, and removing an
+/// already-absent edge is silent.
 ///
-/// Correct post-fix behaviour:
-///   - GC must NOT throw.
-///   - Blob 2 is unreferenced (r1 dropped, r2 never references it)  => collected (in-degree 0, key gone).
-///   - Blob 1 is re-referenced by r2                                 => spared  (in-degree 1, key present).
-TEST(CasGcUndercount, H2DropThenRepointFromSameOldIsIdempotentNoUnderflow)
+/// Correct post-fix behaviour: GC must NOT throw, and both blobs -- owned only by r1, which has no
+/// live owner after the (idempotent) drop -- become collectible (in-degree 0, keys gone).
+TEST(CasGcUndercount, H2DuplicateCommittedRemovalIsIdempotentNoUnderflow)
 {
     auto backend = std::make_shared<InMemoryBackend>();
     auto store = openPoolForTest(backend);
     const RootNamespace ns{"00/aa@cas@"};
     const ManifestRef r1 = ref(1, 0xB1);
-    const ManifestRef r2 = ref(2, 0xB2);
 
-    /// r1 pins blobs {1,2}; r2 (staged, present) pins only blob 1.
+    /// r1 pins blobs {1,2}.
     writeBlobBody(*backend, store->layout(), DB::UInt128(1));
     writeBlobBody(*backend, store->layout(), DB::UInt128(2));
     writeManifestRaw(*backend, store->layout(), ns, r1,
         {blobEntryFor("a", DB::UInt128(1)), blobEntryFor("b", DB::UInt128(2))});
-    writeManifestRaw(*backend, store->layout(), ns, r2, {blobEntryFor("a", DB::UInt128(1))});
 
     /// v1: publish r1 (owner: none -> committed(r1)). Fold it so blobs 1 and 2 are each pinned at 1.
     publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r1);
@@ -96,33 +107,34 @@ TEST(CasGcUndercount, H2DropThenRepointFromSameOldIsIdempotentNoUnderflow)
     ASSERT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 1);
     ASSERT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(2)), 1);
 
-    /// Stage TWO distinct removal-carrying events for r1 in ONE fold window (r1's body is NOT deleted
-    /// until recheck, so both events are resolved at fold time):
-    ///   v2: DROP r1        {old=committed(r1), new=none}
-    ///   v3: REPOINT r1->r2 {old=committed(r1), new=committed(r2)}
-    /// The second removal of r1's edge to blob 2 is a no-op under the idempotent set model.
+    /// Stage TWO distinct transactions, each carrying the SAME removal event for r1, in ONE fold window
+    /// (r1's body is NOT deleted until recheck, so both events are resolved at fold time):
+    ///   v2: DROP r1           {old=committed(r1), new=none}
+    ///   v3: DUPLICATE DROP r1 {old=committed(r1), new=none}
+    /// The second removal of r1's edges is a no-op under the idempotent set model.
     appendOwnerEvent(*backend, store->layout(), ns, 0, committed("tbl", r1), std::nullopt);
-    appendOwnerEvent(*backend, store->layout(), ns, 0, committed("tbl", r1), committed("tbl", r2));
+    appendOwnerEvent(*backend, store->layout(), ns, 0, committed("tbl", r1), std::nullopt);
 
     /// Drive GC to fixpoint (advancing the mount ack each round so the ack floor graduates the condemned
-    /// blob 2): must complete without throwing, collect blob 2, spare blob 1.
+    /// blobs): must complete without throwing and collect both blobs.
     ASSERT_NO_THROW({
         for (int i = 0; i < 12; ++i)
         {
             gc.runRegularRound();
             store->renewWatermarkOnce();
         }
-    }) << "H2 regression: drop-then-repoint-from-same-old must NOT underflow; idempotent edge set absorbs the duplicate removal";
+    }) << "H2 regression: duplicate removal of an already-removed committed ref must NOT underflow; "
+       << "the idempotent edge set absorbs the duplicate removal";
+
+    EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 0)
+        << "blob 1 is unreferenced (r1 dropped) and must be collected";
+    EXPECT_FALSE(blobExists(*backend, store->layout(), DB::UInt128(1)))
+        << "blob 1 must be physically removed from the store";
 
     EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(2)), 0)
-        << "blob 2 is unreferenced (r1 dropped, r2 does not reference it) and must be collected";
+        << "blob 2 is unreferenced (r1 dropped) and must be collected";
     EXPECT_FALSE(blobExists(*backend, store->layout(), DB::UInt128(2)))
         << "blob 2 must be physically removed from the store";
-
-    EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 1)
-        << "blob 1 is re-referenced by r2 and must be spared";
-    EXPECT_TRUE(blobExists(*backend, store->layout(), DB::UInt128(1)))
-        << "blob 1 must remain present in the store";
 }
 
 /// ============================ H1: CURSOR RE-FOLD UNDER ABORT ============================
@@ -313,4 +325,81 @@ TEST(CasGcUndercount, H1bFenceWindowRemovalReFoldedNextRoundUnderflows)
     EXPECT_FALSE(blobExists(*backend, store->layout(), DB::UInt128(1)))
         << "the concurrently-dropped blob must be reclaimed";
     EXPECT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(1)), 0);
+}
+
+/// ============== UNRECOGNIZED owner_transition SHAPE ABORTS THE ROUND, NEVER DELETES =================
+///
+/// A decodable ref log whose `owner_transition` op is SHAPE-illegal (here: neither `old_binding` nor
+/// `new_binding` set) is exactly what `classifyOwnerTransitionShape` (Pool/CasRefProtocol.cpp) throws
+/// `CORRUPTED_DATA` on. `writeRefLogTxnRaw` -- the same codec real writers use -- never checks op-shape
+/// legality at encode/decode time, so this body is perfectly decodable; only `manifestEdgesOfTxn`'s
+/// shape classification rejects it, at GC fold time.
+///
+/// `Gc::fold` extracts edges inside the SAME try-block as `decodeRefLogTxn`
+/// (Gc/CasGc.cpp), so the throw gets the identical "ref log body invalid: ref folding aborted this
+/// round" treatment as an undecodable body: no cursor advance for ANY table (not just the corrupt
+/// one), no ref delta lands, and the recorded anomaly drives `suppress_destructive`, which gates OFF
+/// every graduated/pending blob delete for the WHOLE round -- including a blob in a namespace the
+/// corrupt log never touched.
+TEST(CasGcUndercount, UnrecognizedOwnerTransitionShapeAbortsRoundNeverDeletes)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const RootNamespace corrupt_ns{"00/bb@cas@"};
+    const ManifestRef r1 = ref(1, 0xC1);
+
+    writeBlobBody(*backend, store->layout(), DB::UInt128(9));
+    writeManifestRaw(*backend, store->layout(), ns, r1, {blobEntryFor("a", DB::UInt128(9))});
+
+    /// Publish r1 (pins blob 9) and drop it again -- an ordinary, LEGAL removal that, absent
+    /// corruption, condemns blob 9 and (over a few more rounds, matching H1/H2 above) physically
+    /// deletes it.
+    publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r1);
+    Gc gc(store, kGc);
+    ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+    store->renewWatermarkOnce();
+    ASSERT_EQ(inDegreeOf(*backend, store->layout(), DB::UInt128(9)), 1);
+    dropRefTransition(*backend, store->layout(), ns, "tbl", r1);
+
+    /// Drive rounds until blob 9 first reaches in-degree 0 (condemned) -- still physically present:
+    /// deletion is two-phase (a later round graduates it to `delete_pending`, a later round still
+    /// executes the delete), so a freshly condemned blob is never deleted in the same round.
+    bool condemned = false;
+    for (int i = 0; i < 12 && !condemned; ++i)
+    {
+        ASSERT_TRUE(gc.runRegularRound().acquired_lease);
+        store->renewWatermarkOnce();
+        condemned = (inDegreeOf(*backend, store->layout(), DB::UInt128(9)) == 0);
+    }
+    ASSERT_TRUE(condemned) << "setup: blob 9 must reach in-degree 0 (condemned) before injecting corruption";
+    ASSERT_TRUE(blobExists(*backend, store->layout(), DB::UInt128(9)))
+        << "setup: a freshly condemned blob must still be physically present";
+
+    const uint64_t cursor_before = foldCursorOf(*backend, store->layout(), ns, /*shard*/0);
+
+    /// A decodable but SHAPE-illegal owner_transition (neither binding) in an UNRELATED table.
+    appendRefLogSeed(*backend, store->layout(), corrupt_ns, {ownerTransitionOp(std::nullopt, std::nullopt)});
+
+    /// Drive MANY more rounds with the corrupt log present. Absent corruption blob 9 -- already
+    /// condemned -- would graduate and be physically deleted within a handful more rounds (exactly
+    /// what H1/H2 above demonstrate for an equivalent drop). Every round here must instead: not throw,
+    /// leave every table's cursor exactly where it was (including `ns`, which the corrupt log never
+    /// touched -- ref-folding abort is round-wide, never per-table), record the anomaly, and never
+    /// physically delete blob 9.
+    for (int i = 0; i < 20; ++i)
+    {
+        RoundReport rep;
+        ASSERT_NO_THROW(rep = gc.runRegularRound())
+            << "round " << i << ": an unrecognized owner_transition shape must abort ref folding, "
+               "never throw out of the round";
+        store->renewWatermarkOnce();
+        EXPECT_FALSE(rep.anomalies.empty())
+            << "round " << i << ": the round must record the unrecognized-shape anomaly";
+        EXPECT_EQ(foldCursorOf(*backend, store->layout(), ns, /*shard*/0), cursor_before)
+            << "round " << i << ": ns's cursor must not advance on a round whose ref folding aborted";
+        ASSERT_TRUE(blobExists(*backend, store->layout(), DB::UInt128(9)))
+            << "round " << i << ": a previously-eligible (condemned) blob must NOT be deleted while "
+               "ref folding is aborted -- destructive work is suppressed for the whole round";
+    }
 }

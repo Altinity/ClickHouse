@@ -1090,9 +1090,17 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             }
             ProfileEvents::increment(ProfileEvents::CasRefLogBodyGets);   /// one body GET per new log
             RefLogTxn txn;
+            std::vector<RefManifestEdge> edges;
             try
             {
                 txn = decodeRefLogTxn(openObject(FormatId::RefLog, got->bytes), ns_str, log_id);
+                /// Extraction shares the decode try-block: an unrecognized owner_transition shape
+                /// (`manifestEdgesOfTxn` -> `classifyOwnerTransitionShape`, Pool/CasRefProtocol.cpp) is
+                /// exactly as untrustworthy as an undecodable body -- both mean this log cannot be
+                /// folded -- so both get the SAME "ref folding aborted this round" treatment below. Do
+                /// NOT widen this catch over `foldManifestEdges` -- only intake, not the fold itself,
+                /// shares this discipline.
+                edges = manifestEdgesOfTxn(txn);
             }
             catch (const Exception & e)
             {
@@ -1115,7 +1123,7 @@ Gc::FoldResult Gc::fold(GcState & state, Token & /*state_token*/, RoundReport & 
             /// round. A removed precommit whose body never existed emitted no edge -- skip, no clamp.
             std::vector<BlobDelta> log_deltas;
             std::map<ManifestId, Token> log_mf_cleanup;
-            for (const RefManifestEdge & edge : manifestEdgesOfTxn(txn))
+            for (const RefManifestEdge & edge : edges)
             {
                 ProfileEvents::increment(ProfileEvents::CasRefEmittedEdges);   /// one manifest-edge event
                 if (foldManifestEdges(edge.manifest_id, edge.change, log_deltas, log_mf_cleanup))

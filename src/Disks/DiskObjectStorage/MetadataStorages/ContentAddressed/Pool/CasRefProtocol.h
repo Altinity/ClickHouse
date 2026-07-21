@@ -417,24 +417,26 @@ struct RefManifestEdge
 };
 
 /// The manifest edges of ONE decoded transaction, in operation order, reading NO manifest body.
-/// Rules per operation:
-///   - `owner_transition` with only a new binding (add owner)            => `+1` for `new.manifest_ref`
-///   - `owner_transition` with only an old binding (remove owner)        => `-1` for `old.manifest_ref`
-///   - `owner_transition` old+new naming the SAME manifest (promote)     => no edge (net zero)
-///   - `owner_transition` old+new naming DIFFERENT manifests (replace)   => `-1` old then `+1` new
-///     -- NOT dead surface (correction of an earlier annotation): `applyOwnerTransition` recognizes an
-///     old+new `owner_transition` ONLY as a promote (which REQUIRES `old.manifest_ref ==
-///     new.manifest_ref`), and the writer never emits the different-manifest shape (an atomic replace
-///     is TWO ops -- an explicit `owner_transition(old=Committed, new=None)` then a same-manifest
-///     promote) -- but the GC fold consumes ref logs through THIS function WITHOUT replaying them
-///     through the state machine (`CasGc.cpp` ref intake; `gtest_cas_gc_undercount_repro.cpp`
-///     deliberately feeds this shape as the stale-removal hazard the idempotent in-degree set-merge
-///     must tolerate). So this branch is live for the fold consumer even though the state machine
-///     rejects the shape; do NOT "fix" the state machine to accept it, and see the CAS backlog's
-///     "GC semantic-validation of folded logs" item for the fold-side trust question.
-///   - `owner_transition` with neither binding                          => no edge (degenerate; a
-///     transition shape the writer never produces and `applyRefLogTxn` rejects at replay)
+/// `owner_transition` recognizes EXACTLY the four shapes `classifyOwnerTransitionShape`
+/// (Pool/CasRefProtocol.cpp) also uses to drive `RefTableState::applyOwnerTransition` -- the SAME
+/// classification, not a second copy of the shape knowledge:
+///   - add precommit (no old_binding, new_binding.kind == Precommit)     => `+1` for `new.manifest_ref`
+///   - remove precommit / remove committed (old_binding set, no new_binding)
+///                                                                       => `-1` for `old.manifest_ref`
+///   - promote (old_binding.kind == Precommit, new_binding.kind == Committed, SAME ref_name and
+///     manifest_ref)                                                    => no edge (net zero: the
+///     manifest keeps an owner the whole time)
 ///   - `namespace_birth` / `set_payload` / `remove_namespace`           => no edge
+/// Any other `owner_transition` shape -- neither binding, old+new naming DIFFERENT manifests, a
+/// promote whose old/new ref_name disagree, or any other kind combination -- throws `CORRUPTED_DATA`.
+/// These are exactly the shapes `applyRefLogTxn`/`replay` already reject at the state-machine layer, so
+/// a hand-corrupted or adversarial log body is the only way this branch is reached; a legitimately
+/// written log never produces one. The GC fold (`CasGc.cpp`) extracts edges inside the same try-block
+/// as `decodeRefLogTxn`, so the throw gets the identical "ref log body invalid: ref folding aborted
+/// this round" treatment as an undecodable body -- no cursor advance, no deletions, an anomaly
+/// recorded. The orphan sweep (`CasOrphanManifestSweep.cpp`) catches it around the whole
+/// `activeManifestKeys` construction and skips (or marks errored) that namespace's deletions rather
+/// than trusting an incomplete protection view.
 /// The `remove_namespace` operation changes lifecycle only; the exact owner removals that must precede
 /// it in the same transaction already emit their own `-1` edges.
 std::vector<RefManifestEdge> manifestEdgesOfTxn(const RefLogTxn & txn);

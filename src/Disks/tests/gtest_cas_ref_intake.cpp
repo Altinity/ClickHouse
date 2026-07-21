@@ -43,6 +43,17 @@ RefOp promote(const String & ref, const ManifestRef & manifest)
     return op;
 }
 
+/// A raw `owner_transition` op from explicit optional bindings, bypassing every shape-builder above --
+/// used by the rejection tests to construct shapes `classifyOwnerTransitionShape` does not recognize.
+RefOp rawOwnerTransition(std::optional<RefOwnerBinding> old_binding, std::optional<RefOwnerBinding> new_binding)
+{
+    RefOp op;
+    op.kind = RefOpKind::OwnerTransition;
+    op.old_binding = std::move(old_binding);
+    op.new_binding = std::move(new_binding);
+    return op;
+}
+
 RefLogTxn txn(const String & ns, RefTxnId id, std::vector<RefOp> ops)
 {
     RefLogTxn t;
@@ -73,6 +84,15 @@ TEST(CasRefIntake, ManifestEdgesPerOperationShape)
         EXPECT_EQ(edges[0].change, -1);
         EXPECT_EQ(edges[0].manifest_id, (ManifestId{RootNamespace{"db/t"}, mr(1, 5)}));
     }
+    /// Remove precommit => one -1 (the fourth classified shape, distinct from remove committed only by
+    /// `old_binding.kind`).
+    {
+        const auto edges = manifestEdgesOfTxn(txn("db/t", rid(1, 25), {removeOwner(RefOwnerKind::Precommit, "p", mr(1, 5))}));
+        ASSERT_EQ(edges.size(), 1u);
+        EXPECT_EQ(edges[0].change, -1);
+        EXPECT_EQ(edges[0].owner_kind, RefOwnerKind::Precommit);
+        EXPECT_EQ(edges[0].manifest_id, (ManifestId{RootNamespace{"db/t"}, mr(1, 5)}));
+    }
     /// Promote same manifest => no net edge (spec §Promote).
     {
         const auto edges = manifestEdgesOfTxn(txn("db/t", rid(1, 3), {promote("p", mr(1, 5))}));
@@ -100,6 +120,40 @@ TEST(CasRefIntake, ManifestEdgesPerOperationShape)
         EXPECT_EQ(edges[1].change, 1);
         EXPECT_EQ(edges[1].manifest_id.ref, mr(1, 6));
     }
+}
+
+/// `manifestEdgesOfTxn` rejects every `owner_transition` shape outside the four `classifyOwnerTransitionShape`
+/// recognizes (Pool/CasRefProtocol.cpp) -- it must never silently assign edge meaning to a shape the
+/// writer/replay state machine would refuse to apply. Each case throws `CORRUPTED_DATA`.
+TEST(CasRefIntake, ManifestEdgesRejectsUnrecognizedShapes)
+{
+    /// Neither binding: a degenerate owner_transition that names no owner change at all.
+    EXPECT_THROW(manifestEdgesOfTxn(txn("db/t", rid(1, 1), {rawOwnerTransition(std::nullopt, std::nullopt)})),
+                 DB::Exception);
+
+    /// old+new naming DIFFERENT manifests in ONE op (the never-legal "replace" shape; an atomic
+    /// manifest replace is always two ops -- an explicit removal then a same-manifest promote).
+    EXPECT_THROW(manifestEdgesOfTxn(txn("db/t", rid(1, 2),
+        {rawOwnerTransition(RefOwnerBinding{RefOwnerKind::Committed, "p", mr(1, 5)},
+                             RefOwnerBinding{RefOwnerKind::Precommit, "p", mr(1, 6)})})),
+                 DB::Exception);
+
+    /// Promote-shaped kinds (old=Precommit, new=Committed) but with MISMATCHED ref_names.
+    EXPECT_THROW(manifestEdgesOfTxn(txn("db/t", rid(1, 3),
+        {rawOwnerTransition(RefOwnerBinding{RefOwnerKind::Precommit, "p", mr(1, 5)},
+                             RefOwnerBinding{RefOwnerKind::Committed, "q", mr(1, 5)})})),
+                 DB::Exception);
+
+    /// Add with new.kind == Committed (only Precommit is a legal add target).
+    EXPECT_THROW(manifestEdgesOfTxn(txn("db/t", rid(1, 4),
+        {rawOwnerTransition(std::nullopt, RefOwnerBinding{RefOwnerKind::Committed, "p", mr(1, 5)})})),
+                 DB::Exception);
+
+    /// old+new both Committed, same manifest: not a promote (promote requires old.kind == Precommit).
+    EXPECT_THROW(manifestEdgesOfTxn(txn("db/t", rid(1, 5),
+        {rawOwnerTransition(RefOwnerBinding{RefOwnerKind::Committed, "p", mr(1, 5)},
+                             RefOwnerBinding{RefOwnerKind::Committed, "p", mr(1, 5)})})),
+                 DB::Exception);
 }
 
 /// Namespaces are edge-distinct even with identical ManifestRef tuples (spec §gc-inputs-and-output).
