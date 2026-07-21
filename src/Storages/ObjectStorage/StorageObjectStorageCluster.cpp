@@ -398,19 +398,23 @@ bool StorageObjectStorageCluster::updateQueryForDistributedEngineIfNeeded(ASTPtr
     table_expression->table_function = function_ast_ptr;
     table_expression->children[0] = function_ast_ptr;
 
-    if (!make_cluster_function)
-        return false;
-
     auto cluster_name = getClusterName(context);
 
     if (cluster_name.empty())
     {
-        throw Exception(
-            ErrorCodes::LOGICAL_ERROR,
-            "Can't be here without cluster name, no cluster name in query {}",
-            query->formatForLogging());
+        /// Pure remote path without a local object_storage_cluster (remote may define it).
+        if (make_cluster_function)
+        {
+            throw Exception(
+                ErrorCodes::LOGICAL_ERROR,
+                "Can't be here without cluster name, no cluster name in query {}",
+                query->formatForLogging());
+        }
+        return false;
     }
 
+    /// Inject OSC into SETTINGS for both pure and *Cluster rewrite paths.
+    /// Pure send must preserve ENGINE object_storage_cluster so the remote can distribute or fall back.
     auto settings = select_query->settings();
     if (settings)
     {

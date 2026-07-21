@@ -63,6 +63,7 @@ namespace Setting
     extern const SettingsUInt64 object_storage_max_nodes;
     extern const SettingsBool object_storage_remote_initiator;
     extern const SettingsString object_storage_remote_initiator_cluster;
+    extern const SettingsString object_storage_cluster;
     extern const SettingsObjectStorageClusterJoinMode object_storage_cluster_join_mode;
     extern const SettingsBool object_storage_cluster_fallback_to_local_if_empty;
 }
@@ -367,11 +368,9 @@ IStorageCluster::ResolvedClusterRead IStorageCluster::resolveClusterRead(Context
     /// - s3Cluster(...)/explicit *Cluster argument -> never fall back locally.
     /// - object_storage_remote_initiator=1 with object_storage_remote_initiator_cluster set
     ///   -> defer object_storage_cluster resolution; fallback_to_pure when the local cluster name is empty
-    ///     or for alternative syntax (pure s3()/iceberg() sent to the remote initiator).
+    ///     or for non-*Cluster forms (pure s3()/iceberg()/ENGINE sent to the remote initiator).
     /// - object_storage_remote_initiator=1 with only object_storage_cluster (no remote_initiator_cluster)
     ///   -> clustered remote path: default initiator cluster to object_storage_cluster, send *Cluster.
-    /// - ENGINE/Iceberg with a local object_storage_cluster + remote_initiator_cluster
-    ///   -> clustered remote path (send *Cluster to the remote initiator).
     /// - writes -> never apply local fallback (see write()).
     ResolvedClusterRead result;
 
@@ -474,7 +473,19 @@ void IStorageCluster::read(
             updateQueryWithJoinToSendIfNeeded(query_to_send, query_info, context);
             updateQueryToSendIfNeeded(query_to_send, storage_snapshot, context, /*make_cluster_function*/ false);
 
-            auto storage_and_context = convertToRemote(resolved.remote_initiator_cluster, context, remote_initiator_cluster_name, query_to_send);
+            /// ENGINE tables keep object_storage_cluster on the storage, not in the initiator query context.
+            /// Propagate it into the context copied for remote() so the remote node sees the same OSC as alt-syntax.
+            auto context_for_remote = context;
+            const auto object_storage_cluster_name = getClusterName(context);
+            if (!object_storage_cluster_name.empty()
+                && context->getSettingsRef()[Setting::object_storage_cluster].value.empty())
+            {
+                auto ctx = Context::createCopy(context);
+                ctx->setSetting("object_storage_cluster", object_storage_cluster_name);
+                context_for_remote = ctx;
+            }
+
+            auto storage_and_context = convertToRemote(resolved.remote_initiator_cluster, context_for_remote, remote_initiator_cluster_name, query_to_send);
             auto src_distributed = std::dynamic_pointer_cast<StorageDistributed>(storage_and_context.storage);
             auto modified_query_info = query_info;
             modified_query_info.cluster = src_distributed->getCluster();

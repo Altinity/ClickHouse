@@ -205,7 +205,8 @@ private:
 
     bool allowsLocalFallbackOnEmptyObjectStorageCluster(ContextPtr context) const override;
 
-    bool usePureFunctionForRemoteInitiator(ContextPtr /* context */) const override { return cluster_name_in_settings; }
+    /// Pure s3()/iceberg() (not *Cluster) for remote initiator: alternative syntax and table engines.
+    bool usePureFunctionForRemoteInitiator(ContextPtr /* context */) const override { return !cluster_name_from_function_argument; }
 
     /*
     In case the table was created with `object_storage_cluster` setting,
@@ -213,11 +214,11 @@ private:
     by mapping the engine name to table function name and setting `object_storage_cluster`.
     For table like
     CREATE TABLE table ENGINE=S3(...) SETTINGS object_storage_cluster='cluster'
-    coverts request
+    converts request
     SELECT * FROM table
     to
     SELECT * FROM s3(...) SETTINGS object_storage_cluster='cluster'
-    to make distributed request over cluster 'cluster'.
+    (and optionally to s3Cluster when make_cluster_function is true).
     Returns true if cluster name was added to settings.
     */
     bool updateQueryForDistributedEngineIfNeeded(ASTPtr & query, ContextPtr context, bool make_cluster_function);

@@ -471,6 +471,21 @@ def test_object_storage_cluster_fallback_to_local_if_empty(started_cluster):
     # initial node + remote initiator.
     assert queries == ["2"]
 
+    # Without fallback, unknown OSC + RI-cluster still errors on remote (table function).
+    error = node.query_and_get_error(
+        f"""
+        SELECT count(*) from s3(
+            'http://minio1:9001/root/data/{{clickhouse,database}}/*',
+            'minio', '{minio_secret_key}', 'CSV',
+            'name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64)))')
+        SETTINGS
+            object_storage_remote_initiator=1,
+            object_storage_cluster='non_existing_cluster',
+            object_storage_remote_initiator_cluster='cluster_with_dots'
+        """
+    )
+    assert "not found" in error or "CLUSTER_DOESNT_EXIST" in error or "doesn't exist" in error.lower()
+
     # A missing remote-initiator cluster must not be masked by local OSC fallback.
     error = node.query_and_get_error(
         f"""
@@ -521,6 +536,75 @@ def test_object_storage_cluster_fallback_to_local_if_empty(started_cluster):
         """
     )
     assert TSV(pure_count) == TSV(engine_fallback_count)
+
+    # Case 2 for ENGINE: unknown OSC + RI without RI-cluster + fallback -> local.
+    engine_case2_count = node.query(
+        """
+        SELECT count(*) FROM engine_osc_fallback
+        SETTINGS
+            object_storage_remote_initiator=1,
+            object_storage_cluster_fallback_to_local_if_empty=1
+        """
+    )
+    assert TSV(pure_count) == TSV(engine_case2_count)
+
+    # ENGINE empty OSC + RI without RI-cluster + fallback must keep BAD_ARGUMENTS.
+    node.query("DROP TABLE IF EXISTS engine_no_osc_ri")
+    node.query(
+        f"""
+        CREATE TABLE engine_no_osc_ri
+            (name String, value UInt32, polygon Array(Array(Tuple(Float64, Float64))))
+            ENGINE=S3('http://minio1:9001/root/data/{{clickhouse,database}}/*', 'minio', '{minio_secret_key}', 'CSV')
+        """
+    )
+    error = node.query_and_get_error(
+        """
+        SELECT count(*) FROM engine_no_osc_ri
+        SETTINGS
+            object_storage_remote_initiator=1,
+            object_storage_cluster_fallback_to_local_if_empty=1
+        """
+    )
+    assert "BAD_ARGUMENTS" in error or "object_storage_remote_initiator" in error
+    node.query("DROP TABLE IF EXISTS engine_no_osc_ri")
+
+    # Case 3-like for ENGINE: unknown OSC + RI-cluster + fallback -> pure send, remote local.
+    query_id = uuid.uuid4().hex
+    engine_case3_count = node.query(
+        """
+        SELECT count(*) FROM engine_osc_fallback
+        SETTINGS
+            object_storage_remote_initiator=1,
+            object_storage_remote_initiator_cluster='cluster_with_dots',
+            object_storage_cluster_fallback_to_local_if_empty=1
+        """,
+        query_id=query_id,
+    )
+    assert TSV(pure_count) == TSV(engine_case3_count)
+
+    node.query("SYSTEM FLUSH LOGS ON CLUSTER 'cluster_all'")
+    queries = node.query(
+        f"""
+        SELECT count()
+            FROM clusterAllReplicas('cluster_all', system.query_log)
+            WHERE type='QueryFinish' AND initial_query_id='{query_id}'
+            FORMAT TSV
+        """
+    ).splitlines()
+    # initial node + remote initiator (remote cannot distribute: OSC unknown, fallback local)
+    assert queries == ["2"]
+
+    # Without fallback, ENGINE unknown OSC + RI-cluster still errors on remote.
+    error = node.query_and_get_error(
+        """
+        SELECT count(*) FROM engine_osc_fallback
+        SETTINGS
+            object_storage_remote_initiator=1,
+            object_storage_remote_initiator_cluster='cluster_with_dots'
+        """
+    )
+    assert "not found" in error or "CLUSTER_DOESNT_EXIST" in error or "doesn't exist" in error.lower()
+
     node.query("DROP TABLE IF EXISTS engine_osc_fallback")
 
 

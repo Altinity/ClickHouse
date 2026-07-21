@@ -130,7 +130,7 @@ protected:
     /// Setting enabled and storage allows local fallback on empty/unknown object_storage_cluster.
     bool shouldFallbackToLocalOnEmptyCluster(ContextPtr context) const;
 
-    /// True for s3()/iceberg() alternative syntax (cluster name from object_storage_cluster setting, not *Cluster argument).
+    /// True for non-*Cluster forms (alternative syntax and table engines): send pure s3()/iceberg() to the remote initiator.
     virtual bool usePureFunctionForRemoteInitiator(ContextPtr /* context */) const { return false; }
 
 private:
