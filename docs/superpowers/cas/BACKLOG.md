@@ -571,3 +571,23 @@ tolerant fold branch. The items below are the residual gaps, ordered by value.
   not as a CAS-layer exception (`ReadBufferFromFileView.cpp:78-102` signals early EOF, no
   `physical size >= offset + length` check exists); (c) persistent target-full ends in a fenced
   mount + bounded-failing INSERTs — reads stay unaffected.
+
+## `lazy_load_tables` / `StorageTableProxy` — feature-level decision needed (consult audit 2026-07-21) {#lazy-load-tables-decision-2026-07-21}
+
+Third incident of the same class (unforwarded `IStorage` virtual / direct cast through the proxy):
+SYSTEM verbs (fixed, 05017), action-lock parking (open), mutations (`checkMutationIsPossible`,
+fixed + 05021). A commissioned audit
+(`docs/superpowers/reports/2026-07-21-storageproxy-forwarding-audit.md`) found **~60 unforwarded
+virtuals, ~45 of class "must forward"**, including a critical one: `backupData`'s no-op default
+means a BACKUP of a not-yet-materialized lazy table silently contributes NO data. Design findings:
+no compile-time guard exists for "new virtual not forwarded"; swap-on-materialize does NOT fix the
+class (escaped `StoragePtr`s in the UUID map/action locks + two lock domains); the clean long-term
+shape is catalog-entry laziness (real refactor). Consultant recommendation: the feature as
+implemented is net-negative — disable/quarantine rather than fix one virtual at a time.
+
+- [ ] **USER DECISION**: quarantine/disable `lazy_load_tables` vs fund the full remediation
+  (complete forwarding sweep + Clang-AST CI guard + backup regression test) vs catalog-entry
+  laziness refactor. Until decided: treat every new lazy-table symptom as this class first.
+- [ ] If the feature stays: forward at least `backupData`/`restoreDataFromBackup`/
+  `supportsBackupPartition`/`finalizeRestoreFromBackup`, `onActionLockRemove`,
+  `supportsOptimizationToSubcolumns` (the audit's three most-urgent), then the rest of class B.
