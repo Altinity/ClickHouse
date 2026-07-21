@@ -1470,6 +1470,26 @@ void ContentAddressedTransaction::truncateFile(const std::string &, size_t)
 namespace DB::Cas
 {
 
+namespace
+{
+/// Ceiling for a CAS write-buffer allocation. An extreme `max_compress_block_size` (or any other
+/// out-of-range buffer-size setting -- fuzzed or misconfigured) flows into `writeFile`'s `buf_size` /
+/// `adaptive_write_buffer_initial_size` and, unclamped, reaches `Memory::alloc` where the allocator's
+/// `checkSize` (>= 0x8000000000000000) fires a `LOGICAL_ERROR` and aborts the server in
+/// debug/sanitizer builds. The ordinary MergeTree writers clamp compress-block sizes to 256 MiB
+/// (`MergeTreeWriterSettings::MAX_COMPRESS_BLOCK_SIZE`) for exactly this reason; the CAS write path
+/// received the value unclamped. Mirror that ceiling here, at the allocation site, so no caller can
+/// pass an absurd size to the allocator. 256 MiB is duplicated (not #included) to keep the Disks layer
+/// free of a Storages/MergeTree dependency; the regression guard is
+/// `04070_no_crash_extreme_compress_block_size` run on a content-addressed storage policy.
+constexpr size_t kMaxCasWriteBufferBytes = 256ULL * 1024 * 1024;
+
+size_t clampCasWriteBufferSize(size_t size)
+{
+    return std::min(size, kMaxCasWriteBufferBytes);
+}
+}
+
 CaContentWriteBuffer::CaContentWriteBuffer(
     std::string temp_dir,
     Cas::BlobHashAlgo hash_algo,
@@ -1477,7 +1497,7 @@ CaContentWriteBuffer::CaContentWriteBuffer(
     bool use_adaptive_buffer_size,
     size_t adaptive_buffer_initial_size,
     OnFinalized on_finalized_)
-    : WriteBufferFromFileBase(use_adaptive_buffer_size ? adaptive_buffer_initial_size : buf_size, nullptr, 0)
+    : WriteBufferFromFileBase(clampCasWriteBufferSize(use_adaptive_buffer_size ? adaptive_buffer_initial_size : buf_size), nullptr, 0)
     , on_finalized(std::move(on_finalized_))
 {
     fs::create_directories(temp_dir);
@@ -1487,14 +1507,14 @@ CaContentWriteBuffer::CaContentWriteBuffer(
     /// wide part keeps its footprint small. Its IO is a local temp file, not the remote stream.
     sink = std::make_unique<WriteBufferFromFile>(
         temp_path,
-        buf_size,
+        clampCasWriteBufferSize(buf_size),
         /*flags=*/-1,
         /*throttler=*/nullptr,
         /*mode=*/0666,
         /*existing_memory=*/nullptr,
         /*alignment=*/0,
         use_adaptive_buffer_size,
-        adaptive_buffer_initial_size);
+        clampCasWriteBufferSize(adaptive_buffer_initial_size));
     hashing = Cas::makeBlobHashingWriteBuffer(hash_algo, *sink);
 }
 
@@ -1507,7 +1527,7 @@ CaContentWriteBuffer::CaContentWriteBuffer(
     bool use_adaptive_buffer_size,
     size_t adaptive_buffer_initial_size,
     OnFinalized on_finalized_)
-    : WriteBufferFromFileBase(use_adaptive_buffer_size ? adaptive_buffer_initial_size : buf_size, nullptr, 0)
+    : WriteBufferFromFileBase(clampCasWriteBufferSize(use_adaptive_buffer_size ? adaptive_buffer_initial_size : buf_size), nullptr, 0)
     , on_finalized(std::move(on_finalized_))
     , temp_path(std::move(object_key))
     , is_s3_staging(true)

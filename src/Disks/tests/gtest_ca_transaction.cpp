@@ -60,6 +60,37 @@ const DB::Cas::ManifestEntry * findByName(const std::vector<DB::Cas::ManifestEnt
 
 }
 
+/// Regression for STID 0883 on the CAS write path: an extreme `max_compress_block_size` (the exact
+/// 2^63-1 the `04070_no_crash_extreme_compress_block_size` stateless test sets) flows into
+/// `writeFile`'s `buf_size` and, unclamped, reaches `Memory::alloc` -- where the allocator's
+/// `checkSize` (>= 0x8000000000000000) fires a `LOGICAL_ERROR` and aborts the server. The ordinary
+/// MergeTree writers clamp compress-block sizes to 256 MiB; the CAS write buffer must do the same at
+/// its own allocation site. Building the buffer with the extreme size must NOT throw/abort, and the
+/// resulting buffer must be clamped -- never allocated at the extreme size.
+TEST(CasContentWriteBuffer, ExtremeBufferSizeIsClampedNotPassedToAllocator)
+{
+    const auto scratch = std::filesystem::temp_directory_path() / "ca_extreme_bufsize_scratch";
+
+    constexpr size_t extreme = 0x7FFFFFFFFFFFFFFFULL;   /// 2^63 - 1; unclamped this crashes the allocator
+    constexpr size_t max_clamped = 256ULL * 1024 * 1024;
+
+    std::unique_ptr<DB::Cas::CaContentWriteBuffer> buf;
+    ASSERT_NO_THROW(
+        buf = std::make_unique<DB::Cas::CaContentWriteBuffer>(
+            scratch.string(),
+            DB::Cas::BlobHashAlgo::CityHash128,
+            /*buf_size=*/extreme,
+            /*use_adaptive_buffer_size=*/false,
+            /*adaptive_buffer_initial_size=*/extreme,
+            [](const std::string &, size_t, const std::string &) {}));
+    ASSERT_TRUE(buf);
+    EXPECT_LE(buf->internalBuffer().size(), max_clamped)
+        << "the CAS write buffer must be clamped, never allocated at the extreme compress-block size";
+
+    buf.reset();
+    std::filesystem::remove_all(scratch);
+}
+
 /// [TXN-ONE-PIPELINE] A freshly-written part is published by commit(), NOT at the tmp->final rename.
 /// moveDirectory only re-keys the transaction overlay; the durable ref appears at commit().
 TEST(CasTransactionLockScope, PublishHappensAtCommitNotRename)
