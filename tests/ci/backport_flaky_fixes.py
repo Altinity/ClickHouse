@@ -6,18 +6,13 @@ missing commit onto a new branch, push it, and open a single PR.
 
 import argparse
 import json
-import os
 import re
 import subprocess
 import sys
-import tempfile
-import urllib.request
-import urllib.error
 from datetime import datetime, timezone
 
 
 UPSTREAM_COMMIT_URL = "https://github.com/{repo}/commit/{sha}"
-UPSTREAM_PATCH_URL = "https://github.com/{repo}/commit/{sha}.patch"
 
 # Branches like antalya-26.3 or stable-25.8 → family label + version label.
 _BRANCH_LABEL_RE = re.compile(r'^([a-z]+)-(\d+\.\d+)$')
@@ -65,40 +60,30 @@ def git_out(*args) -> str:
     return run_git(*args).stdout.strip()
 
 
-def download_patch(upstream_repo: str, sha: str) -> bytes:
-    """Download the commit patch from GitHub over HTTPS. Much faster than git fetch."""
-    url = UPSTREAM_PATCH_URL.format(repo=upstream_repo, sha=sha)
-    token = os.environ.get("GITHUB_TOKEN")
-    headers = {"User-Agent": "backport_flaky_fixes"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    req = urllib.request.Request(url, headers=headers)
-    try:
-        with urllib.request.urlopen(req) as resp:
-            return resp.read()
-    except urllib.error.HTTPError as e:
-        print(f"Failed to download patch for {sha[:12]}: {e}", file=sys.stderr)
-        return b""
+def prefetch_upstream_objects(shas: list) -> None:
+    """Blobless-fetch the target commits and their parents from the 'upstream'
+    promisor remote (configured by the workflow) so `git cherry-pick` has the
+    commit and its merge base locally and can resolve blobs on demand.
+    --depth=2 pulls each commit plus its parent without the full ancestry (a plain
+    fetch into a shallow clone drags the entire history), in a single cheap
+    negotiation. No-op when no 'upstream' remote exists (e.g. local runs on a full
+    clone)."""
+    if not shas or "upstream" not in git_out("remote").split():
+        print("No 'upstream' remote; skipping prefetch (assuming objects are local).", file=sys.stderr)
+        return
+    run_git("fetch", "--depth=2", "--no-tags", "upstream", *shas, check=False)
 
 
-def apply_commit(upstream_repo: str, sha: str) -> bool:
-    """Download the patch from GitHub and apply it with git am --3way.
-    Returns True on success, False on conflict or failure."""
-    patch = download_patch(upstream_repo, sha)
-    if not patch:
-        return False
-    with tempfile.NamedTemporaryFile(suffix=".patch", delete=False) as f:
-        f.write(patch)
-        patch_file = f.name
-    try:
-        result = run_git("am", "--3way", patch_file, check=False)
-        if result.returncode == 0:
-            return True
-        print(f"  git am failed for {sha[:12]}, aborting.", file=sys.stderr)
-        run_git("am", "--abort", check=False)
-        return False
-    finally:
-        os.unlink(patch_file)
+def cherry_pick(sha: str) -> bool:
+    """Cherry-pick a commit. Blobs are lazily fetched from the upstream promisor
+    remote by full sha via the parent trees pulled by prefetch_upstream_objects.
+    Returns True on success, False on conflict or failure (which is aborted)."""
+    result = run_git("cherry-pick", "-x", sha, check=False)
+    if result.returncode == 0:
+        return True
+    print(f"  cherry-pick of {sha[:12]} failed, aborting:\n{result.stdout}{result.stderr}", file=sys.stderr)
+    run_git("cherry-pick", "--abort", check=False)
+    return False
 
 
 def build_pr_body(
@@ -121,7 +106,7 @@ def build_pr_body(
         lines.append("")
 
     if conflicted:
-        lines.append("### Skipped (conflict or download failure — manual backport needed)")
+        lines.append("### Skipped (cherry-pick conflict — manual backport needed)")
         lines.append("")
         for sha, subject, date in conflicted:
             url = UPSTREAM_COMMIT_URL.format(repo=upstream_repo, sha=sha)
@@ -201,6 +186,8 @@ def main() -> None:
     # Sort oldest-first so cherry-picks apply in chronological order.
     missing.sort(key=lambda c: c["date"])
 
+    prefetch_upstream_objects([c["sha"] for c in missing])
+
     date_tag = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     backport_branch = f"flaky-fix-backport/{base_branch}/{date_tag}"
 
@@ -218,16 +205,16 @@ def main() -> None:
         sha = commit["sha"]
         subject = commit["subject"]
         date = commit["date"]
-        print(f"Applying {sha[:12]}: {subject}", file=sys.stderr)
-        if apply_commit(upstream_repo, sha):
+        print(f"Cherry-picking {sha[:12]}: {subject}", file=sys.stderr)
+        if cherry_pick(sha):
             applied.append((sha, subject, date))
             print(f"  Applied {sha[:12]}", file=sys.stderr)
         else:
             conflicted.append((sha, subject, date))
-            print(f"  Skipped {sha[:12]} (conflict or download failed)", file=sys.stderr)
+            print(f"  Skipped {sha[:12]} (conflict)", file=sys.stderr)
 
     if not applied:
-        print("No commits could be applied (all conflicted or failed to fetch). Cleaning up.", file=sys.stderr)
+        print("No commits could be applied (all conflicted). Cleaning up.", file=sys.stderr)
         run_git("checkout", base_branch)
         run_git("branch", "-D", backport_branch)
         sys.exit(0)
