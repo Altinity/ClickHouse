@@ -71,7 +71,7 @@ These are recorded as `inconclusive` with a reason — never silently skipped or
 The primary correctness oracle is **all-replicas-agree** on a deterministic order-independent
 aggregate (`count() + sum(sipHash64(*))`), plus, where the workload is deterministic (`INSERT ...
 SELECT ... FROM numbers(N)`), an absolute Python-side count/aggregate prediction. Structural
-correctness uses `clickhouse-disks fsck` (`dangling==0`) and the `ca-gc-dryrun ⊆ unreachable` subset
+correctness uses `clickhouse-disks ca-fsck` (`dangling==0`) and the `ca-gc-dryrun ⊆ unreachable` subset
 oracle, asserted only at **quiesced** checkpoints (mid-write precommit-vs-promote windows are not used
 as a hard verdict, per the README's structural-inspection caveat).
 

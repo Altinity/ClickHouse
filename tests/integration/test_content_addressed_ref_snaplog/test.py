@@ -105,7 +105,7 @@ def test_ref_snaplog_lifecycle_reclaims_and_fsck_clean():
 
     # Read-only consumers agree while data is present: fsck finds no missing objects (dangling) and the
     # snapshot integrity oracle finds no divergence between any published snapshot and its log replay.
-    live_fsck = _disks(node, "fsck")
+    live_fsck = _disks(node, "ca-fsck")
     assert "dangling=0" in live_fsck, live_fsck
     assert "snapshot_oracle_mismatches=0" in live_fsck, live_fsck
 
@@ -151,7 +151,7 @@ def test_ref_snaplog_lifecycle_reclaims_and_fsck_clean():
     # (6) Read-only consumers on the reclaimed pool: fsck still reports no dangling and no snapshot-oracle
     #     divergence (the lingering ref logs are debris, never a dangle or an oracle mismatch), and
     #     ca-gc-dryrun runs and reports no pending content deletes.
-    final_fsck = _disks(node, "fsck")
+    final_fsck = _disks(node, "ca-fsck")
     assert "dangling=0" in final_fsck, final_fsck
     assert "snapshot_oracle_mismatches=0" in final_fsck, final_fsck
 

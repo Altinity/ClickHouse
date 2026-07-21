@@ -83,7 +83,7 @@ METRICS_INTERVAL_S = 60
 GB = 1024 ** 3
 
 # search_orphaned_parts_disks='local' (B143): the harness config defines a SECOND CA disk `ca_ro`
-# (a read-only alias of the SAME RustFS pool, used by the offline `clickhouse disks fsck` applet)
+# (a read-only alias of the SAME RustFS pool, used by the offline `clickhouse disks ca-fsck` applet)
 # which is NOT in the `ca` storage policy. On a server RESTART (Phase-2 chaos), MergeTreeData's
 # orphaned-parts scan (`loadDataParts`, default `search_orphaned_parts_disks=any`) iterates EVERY
 # disk in the context map -- including the remote `ca_ro` -- finds the policy parts under its

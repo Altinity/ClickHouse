@@ -1,5 +1,5 @@
 ---
-description: 'Testing and validation for the content-addressed (CAS) MergeTree: the adversarial scenario suite (S01–S35), the 24h soak harness, clickhouse-disks fsck and ca-gc-dryrun introspection, the event and GC audit logs, and the standing findings and backlog pointers.'
+description: 'Testing and validation for the content-addressed (CAS) MergeTree: the adversarial scenario suite (S01–S35), the 24h soak harness, clickhouse-disks ca-fsck and ca-gc-dryrun introspection, the event and GC audit logs, and the standing findings and backlog pointers.'
 sidebar_label: 'Testing and soak'
 sidebar_position: 8
 slug: /superpowers/cas/testing-and-soak
@@ -11,7 +11,7 @@ doc_type: 'guide'
 
 This document covers how the CAS MergeTree feature is empirically validated: the standalone
 adversarial scenario suite (S01–S35 in `utils/ca-soak/scenarios/`), the deterministic 24h soak
-harness (`utils/ca-soak/`), the independent pool-inspection tooling (`clickhouse-disks fsck` and
+harness (`utils/ca-soak/`), the independent pool-inspection tooling (`clickhouse-disks ca-fsck` and
 `ca-gc-dryrun`), and the two in-server audit log tables.
 
 Related documents: `04-gc-protocol.md` (GC protocol), `07-s3-budget.md` (S3 op budgets).
@@ -35,9 +35,10 @@ Spec sources: `specs/2026-06-13-ca-soak-test-design.md`, `specs/2026-06-13-ca-fs
 Read-only mode is also the basis for a **WORM deployment** (one writer server, multiple
 read-only mounters sharing the pool).
 
-### 1.2 `clickhouse-disks fsck` {#fsck}
+### 1.2 `clickhouse-disks ca-fsck` {#ca-fsck}
 
-`clickhouse-disks fsck --disk <ca_disk_name>` opens the target CA disk read-only and verifies
+`clickhouse-disks ca-fsck --disk <ca_disk_name>` (the deprecated alias `fsck` still works, printing
+a stderr deprecation note) opens the target CA disk read-only and verifies
 pool reachability:
 
 1. **Reachable set**: walks every namespace → every ref → every tree entry, collecting the physical
@@ -83,8 +84,8 @@ of objects the next GC round **would** delete, from the durable `gc/snap` (in-de
 
 The key assertion (verified by the soak harness at every quiesced checkpoint):
 
-> **`{preview deletes} ⊆ {fsck unreachable}`** — GC must never plan to delete an object that
-> `fsck` can still reach from a live ref.
+> **`{preview deletes} ⊆ {ca-fsck unreachable}`** — GC must never plan to delete an object that
+> `ca-fsck` can still reach from a live ref.
 
 Note: `ca-gc-dryrun` currently previews `zeroInDegree` only for target shard 0 when
 `gc_shards > 1`. This is a known gap (S31 regression guard; see BACKLOG section below).
@@ -109,7 +110,7 @@ in this state — the guard is fail-closed by design.
    on any server that mounts the affected disk. Omit `<disk>` to rebuild every content-addressed disk
    on that node. The command throws with the refusal text if the rebuild itself refuses (e.g. another
    leader holds the lease, or a committed ref names a missing manifest — real data loss that needs
-   `fsck` forensics before reaching for `FORCE`). On success it logs the rebuilt `round`, `generation`,
+   `ca-fsck` forensics before reaching for `FORCE`). On success it logs the rebuilt `round`, `generation`,
    `namespaces`, `shards`, `committed_refs`, `live_precommits`, `unowned_alive_manifests`, `edges`, and
    `clamped_shards` counters.
 
@@ -118,13 +119,13 @@ in this state — the guard is fail-closed by design.
    clickhouse-disks --disk <ca_disk_name> ca-gc-rebuild [--force]
    ```
    Requires the disk to be configured `<readonly>true</readonly>` in the `clickhouse-disks` config —
-   same rule as `fsck`/`ca-gc-dryrun`: this tool must never claim a live server's mount. It prints the
+   same rule as `ca-fsck`/`ca-gc-dryrun`: this tool must never claim a live server's mount. It prints the
    report as `key=value` pairs and exits nonzero (with a `refusal=` line) if the rebuild refuses.
 
-**After the rebuild:** regular GC rounds resume; `fsck` converges to `dangling=0` over the next few
+**After the rebuild:** regular GC rounds resume; `ca-fsck` converges to `dangling=0` over the next few
 rounds as the ack-floor pipeline drains `pending-gc`/`awaiting-gc`. A rebuilt baseline is
 conservative — it may over-protect a trimmed-but-live build's manifest (design delta 2 in
-`04-gc-protocol.md §gc-rebuild`), so a small, bounded, `fsck`-visible `unaccounted`/leaked set settling
+`04-gc-protocol.md §gc-rebuild`), so a small, bounded, `ca-fsck`-visible `unaccounted`/leaked set settling
 over a rebuild-to-rebuild window is expected, not a regression.
 
 ## 2. Audit log tables {#audit-logs}
@@ -394,8 +395,8 @@ fresh pool prefix. The common run contract, hard assertions, and recommended obs
 Every positive scenario must satisfy:
 
 - **SQL correctness**: all replicas return the same aggregates as the scenario oracle.
-- **Storage correctness**: `clickhouse-disks fsck --detail` reports `dangling = 0`.
-- **GC safety**: `ca-gc-dryrun` delete candidates are a subset of the `fsck` unreachable set at
+- **Storage correctness**: `clickhouse-disks ca-fsck --detail` reports `dangling = 0`.
+- **GC safety**: `ca-gc-dryrun` delete candidates are a subset of the `ca-fsck` unreachable set at
   quiescence.
 - **Event audit**: `system.content_addressed_log` contains no `read_missing`, `dangling_access`,
   `corrupt_dangle`, `corrupt_decode`, `snap_journal_incoherent`, or `exception` rows.
@@ -481,7 +482,7 @@ Location: `utils/ca-soak/` (Python + docker-compose; nothing ships in the server
 
 Two `ReplicatedMergeTree` replicas (`ch1`, `ch2`) share one CA pool on `rustfs1`, coordinated via
 `keeper1`. RustFS runs with `RUSTFS_SCANNER_ENABLED=false RUSTFS_HEAL_ENABLED=false` (stability
-fix from B93). `clickhouse-disks fsck` runs read-only against the same pool from a node
+fix from B93). `clickhouse-disks ca-fsck` runs read-only against the same pool from a node
 container at quiesced checkpoints.
 
 `docker-compose.yml` is the default RustFS-backed topology. A second compose,
@@ -490,8 +491,8 @@ real-S3 GC validation; it uses named Docker volumes for state and reads bucket c
 the git-ignored `configs/aws.env`. The live-AWS variant was validated 2026-07-03.
 The live-GCS variant (`docker-compose-gcs.yml`, `storage_conf_gcs_*.xml` with
 `<http_client>gcs_hmac</http_client>`, HMAC pair in git-ignored `configs/gcs.env`) was validated
-the same day: probe + replication + two-phase reclaim + DROP-to-zero + fsck all green. NOTE: the
-read-only fsck disk lives in the standalone `configs/fsck_only_gcs.xml` passed only to
+the same day: probe + replication + two-phase reclaim + DROP-to-zero + ca-fsck all green. NOTE: the
+read-only ca-fsck disk lives in the standalone `configs/fsck_only_gcs.xml` passed only to
 `clickhouse-disks -C` — a `ca_ro` disk in the SERVER config breaks table load on restart
 (`UNKNOWN_DISK`; ROADMAP prod-gate row).
 
@@ -516,7 +517,7 @@ Before any checkpoint assertion:
 2. `SYSTEM SYNC REPLICA` on both nodes; wait `system.replication_queue` empty on both.
 3. Wait every `system.mutations` row `is_done`; no active `system.merges`.
 4. `OPTIMIZE TABLE ca_stress FINAL` + `ALTER TABLE ca_stress MATERIALIZE TTL`.
-5. Drive CA GC to **fixpoint** — poll until pool object set and `fsck.unreachable` stop changing
+5. Drive CA GC to **fixpoint** — poll until pool object set and `ca-fsck`'s `unreachable` field stop changing
    across successive GC rounds (bounded retries, fail loudly on timeout).
 
 TTL boundary handling: checkpoint timing is arranged so no row sits within ±ε of its TTL boundary.
@@ -526,9 +527,9 @@ If the ambiguous band is non-empty, the checkpoint fails (a scheduling bug, not 
 
 At every quiesced checkpoint:
 - SQL oracle match on **both** replicas (`count`, `sum(row_fp)`, `uniqExact`, `sum(v)`, `min/max(op_id)`).
-- `clickhouse-disks fsck --detail`: `dangling = 0` (INV-NO-LOSS, hard fail).
-- `clickhouse-disks fsck`: `unreachable = 0` (GC drained to fixpoint).
-- `clickhouse-disks ca-gc-dryrun`: `{preview} ⊆ {fsck unreachable}` (GC safety direction).
+- `clickhouse-disks ca-fsck --detail`: `dangling = 0` (INV-NO-LOSS, hard fail).
+- `clickhouse-disks ca-fsck`: `unreachable = 0` (GC drained to fixpoint).
+- `clickhouse-disks ca-gc-dryrun`: `{preview} ⊆ {ca-fsck unreachable}` (GC safety direction).
 - `system.content_addressed_log`: no error-class event types.
 - `system.content_addressed_garbage_collection_log`: no `'Error'` finish rows.
 
@@ -552,7 +553,7 @@ between them; a server that does not recover within the bound is a correctness f
   bring-up failure with the scanner was the unpinned `mc`, since pinned) — the scanner stays off.
   Mitigations: `WORKERS=2`; durable fix = lower ref-shard `casPut` rate (journal batching, B157
   family) and/or shard bodies under the 128 KiB inline threshold, or the upstream fix.
-- **Large-pool fsck timeout**: `fsck` at ~150 GB pool times out (>180 s) because
+- **Large-pool ca-fsck timeout**: `ca-fsck` at ~150 GB pool times out (>180 s) because
   `ObjectStorageBackend::list` re-enumerates the whole `roots/` prefix per page (O(N²) in the
   manifest backlog). Fix: paginate at source; separate shard objects into a dedicated prefix.
   Tracked in the backlog below.
@@ -641,7 +642,7 @@ The authoritative finding log is `utils/ca-soak/scenarios/BACKLOG.md` (newest at
   wrong engine type, per-node counter scoping — to be fixed in the harness (not product bugs).
 - **Ack-floor round soak validation** (TODO): the one-pass ack-floor round (`04 §gc-round`) is
   implemented and unit/TLA+-covered but not yet soak-validated. Needed: hard-KILL a writer
-  mid-commit-burst and verify the next rounds spare-then-recondemn correctly (no dangle in `fsck`);
+  mid-commit-burst and verify the next rounds spare-then-recondemn correctly (no dangle in `ca-fsck`);
   a paused (SIGSTOP) writer holds the floor, then resumes, acks, and the floor advances; a scenario
   asserting per-round request counts stay O(delta)+O(servers) — a regression guard against
   reintroducing a universe sweep of GET/PUTs. Deletion latency is now condemn → pending (first

@@ -402,7 +402,7 @@ The destination is a **real CAS pool**: the daemon mounts it as an ordinary writ
 `server_root_id`, epoch, mount lease) and runs the **standard GC** there to reclaim thinned
 snapshots — a single-writer pool whose only "tables" are shadow namespaces. No special
 "streaming GC" exists; there is no coexistence problem on either side (on the source the daemon
-is a pure reader of pinned closures). Verification comes for free: `clickhouse-disks fsck` on
+is a pure reader of pinned closures). Verification comes for free: `clickhouse-disks ca-fsck` on
 the destination *is* backup verification, and a scheduled rehearsal mode (mount r/o → attach a
 snapshot → `CHECK TABLE`/sample queries → report) makes restore testing routine and free.
 
@@ -460,7 +460,7 @@ to the backup pool; restore writes only to the fresh pool.
    cadence, at the cost of partial-restore semantics in the runbook). Leaning:
    consolidated-only in v1. Related: the default age threshold `A` for the trickle warmer, if
    built.
-3. **Daemon packaging.** `clickhouse-disks ca-backup-pull` subcommand (precedent: `fsck`,
+3. **Daemon packaging.** `clickhouse-disks ca-backup-pull` subcommand (precedent: `ca-fsck`,
    `ca-gc-dryrun`, `ca-gc-rebuild`, with the same readonly-mount discipline) vs a standalone
    service. v1 leaning: `clickhouse-disks` + cron.
 4. **Snapshot metadata format** (DDL capture, mutable per-part payload granularity, versioning)
@@ -479,7 +479,7 @@ to the backup pool; restore writes only to the fresh pool.
   in-degree model (`BAK-EDGE-DRIVEN-MANIFESTS` hardens it into a permanent commitment).
 - `05-formats-and-backend.md §layout-keys` — `_snap`/`_log` objects the snapshot binding
   copies; the `@cas@` verbatim boundary behind the same-CA-disk `BACKUP` trap.
-- `08-testing-and-soak.md` — `fsck` (backup verification), `ca-gc-rebuild` (restore step),
+- `08-testing-and-soak.md` — `ca-fsck` (backup verification), `ca-gc-rebuild` (restore step),
   S18 (shadow reachability).
 - `BACKLOG.md` — B198 (this document is its design base), "out-of-band staging adoption via
   verified copy-forward" (the fetch/adoption primitive), B180 format-version breadcrumb (the

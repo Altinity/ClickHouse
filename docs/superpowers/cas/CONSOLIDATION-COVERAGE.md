@@ -213,7 +213,7 @@ by `03`/`04`/`05`; the milestone sequencing itself is ephemeral.
 | Old doc | Durable content captured | New target |
 |---------|--------------------------|------------|
 | `specs/2026-06-13-ca-soak-test-design.md` + `plans/2026-06-13-ca-soak-test.md` | Soak topology, workload/oracle, quiescence, chaos, checkpoint assertions | `08 §soak-harness` (all subsections) |
-| `specs/2026-06-13-ca-fsck-readonly-design.md` + `plans/2026-06-13-ca-fsck-readonly.md` | Read-only mode; fsck reachability classify; dedup_ratio | `08 §read-only-mode`, `§fsck` |
+| `specs/2026-06-13-ca-fsck-readonly-design.md` + `plans/2026-06-13-ca-fsck-readonly.md` | Read-only mode; fsck reachability classify; dedup_ratio | `08 §read-only-mode`, `§ca-fsck` |
 | `specs/2026-06-15-ca-fsck-timeout-progress-design.md` | fsck per-LIST timeout + progress; large-pool O(N²) | `08 §soak-limitations` (large-pool fsck timeout) |
 | `specs/2026-06-19-ca-vfs-contract.md` | VFS contract (which files CA vs verbatim; path rules) | `05 §layout-keys`, `03 §mutable-vs-immutable` |
 | `specs/2026-06-19-ca-vfs-path-mapping-design.md` + `plans/2026-06-19-ca-vfs-path-mapping.md` | VFS path mapping (store/<uuid> → pool namespaces) | `05 §layout-keys`, `03 §server-root-id`, `§mutable-vs-immutable` |

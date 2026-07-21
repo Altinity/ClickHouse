@@ -211,7 +211,7 @@ def test_drop_dead_pool_member_heals_the_pool():
         )
     )
 
-    fsck = _disks(node1, "fsck")
+    fsck = _disks(node1, "ca-fsck")
     assert "dangling=0" in fsck, fsck
     assert "unaccounted=0" in fsck, fsck
 

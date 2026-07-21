@@ -66,7 +66,7 @@ raw = subprocess.run(
      "clickhouse", "disks",
      "--config-file", "/etc/clickhouse-server/config.xml",
      "--disk", "ca_ro",
-     "--query", "fsck"],
+     "--query", "ca-fsck"],
     capture_output=True, text=True,
 )
 summary_line = next(

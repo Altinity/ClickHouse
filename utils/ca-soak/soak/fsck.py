@@ -19,7 +19,7 @@ class FsckTimeout(RuntimeError):
 # ---------------------------------------------------------------------------
 
 def parse_fsck_summary(line: str) -> dict:
-    """Parse the single summary line emitted by `clickhouse-disks fsck`.
+    """Parse the single summary line emitted by `clickhouse-disks ca-fsck`.
 
     The line has the form:
         reachable=N dangling=N unreachable=N physical_bytes=N
@@ -100,10 +100,10 @@ _CLICKHOUSE_DISKS = [
 
 def run_fsck(container: str, disk: str = "ca_ro", detail: bool = True,
              timeout_s: float = 600.0) -> dict:
-    """Run `clickhouse disks --disk <disk> --query "fsck [--detail]"` in the container.
+    """Run `clickhouse disks --disk <disk> --query "ca-fsck [--detail]"` in the container.
 
     Uses the read-only disk (``ca_ro`` by default) so the mutating capability probe is
-    skipped.  ``fsck`` exits nonzero when ``dangling > 0`` (invariant INV-NO-LOSS).
+    skipped.  ``ca-fsck`` exits nonzero when ``dangling > 0`` (invariant INV-NO-LOSS).
 
     Returns a dict with:
     - all fields from the summary line (``reachable``, ``dangling``, ``unreachable``, …)
@@ -116,7 +116,7 @@ def run_fsck(container: str, disk: str = "ca_ro", detail: bool = True,
     (an O(pool) scan can take 40+ minutes under load — B146/B154).  ``subprocess.run``
     kills the child process automatically on ``TimeoutExpired`` in Python 3.x.
     """
-    query = "fsck --detail" if detail else "fsck"
+    query = "ca-fsck --detail" if detail else "ca-fsck"
     cmd = [
         "docker", "exec", container,
         *_CLICKHOUSE_DISKS,

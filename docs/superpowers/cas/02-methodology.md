@@ -34,7 +34,7 @@ Four interlocking practices governed every phase of development:
    relevant TLA+ model is green; the gate is not advisory.
 4. **Scenario/soak suite as an empirical oracle** — a 24-hour deterministic chaos soak (two replicas,
    shared CA pool, seeded workload + seeded fault injection, quiesced checkpoints with `clickhouse-disks
-   fsck` + `ca-gc-dryrun`) as the runtime invariant check.
+   ca-fsck` + `ca-gc-dryrun`) as the runtime invariant check.
 
 The design reviews (`reports/2026-06-07-ca-spec-review-milovidov*.md` and
 `reports/2026-06-07-ca-spec-review-distributed*.md`) played a fifth role: external adversarial scrutiny
@@ -242,7 +242,7 @@ kill/restart/pause faults at scheduled windows. At quiesced checkpoints (writers
 queues drained, merges idle, GC at a fixpoint), the harness asserts:
 
 - SQL results match an independent model oracle on **both** replicas.
-- `clickhouse-disks fsck` reports `dangling=0` (INV-NO-LOSS: every reachable object exists).
+- `clickhouse-disks ca-fsck` reports `dangling=0` (INV-NO-LOSS: every reachable object exists).
 - `ca-gc-dryrun` cross-checks: GC would delete only genuinely-unreachable objects.
 - `unreachable=N (M-F debris)` is a known-acceptable residual (abandoned builds — Full GC M-F, deferred).
 
@@ -276,7 +276,7 @@ over S3 was misidentified as a hang), setup DROP timeout under accumulated data 
 on each run), and compose startup ordering. Fixing harness fragilities is itself a design output —
 the harness's behavior under load directly shapes what the soak can prove.
 
-**`fsck`/`ca-gc-dryrun` as an independent read path.** The `fsck` command opens the CA disk in a
+**`ca-fsck`/`ca-gc-dryrun` as an independent read path.** The `ca-fsck` command opens the CA disk in a
 **read-only mode** that does not require the server to be running. It recomputes the full reachability
 graph independently (traversing roots → shard manifests → refs → trees → blobs), compares against the
 physical pool content, and reports `dangling` / `orphan` / `unreachable` counts. The `ca-gc-dryrun`
@@ -361,6 +361,6 @@ models, preserving the proof history.
 | TLA+ gate (D1 registry removal) | **DONE** — `CaGcShardIncarnationCore` green (724,944 states, two-coordinate proof) | Implementation landed 2026-07-01/02 (`gc/registry`/`RootsRegistry` deleted, discovery via `LIST(cas/refs/)`, shard incarnation stamped); status note updated 2026-07-03 |
 | Scenario suite | **DONE** (S01–S35 cards) | S33 concurrent-leader scenario now PASSES as a real regression guard (attempt-scoped generation landed 2026-06-28); see `08-testing-and-soak.md §5.1` |
 | 24h deterministic soak | **DESIRABLE** — blocked on conformant backend | rustfs 412 vs. write-error confound needs harness-side fsck retry; currently 4-hour runs |
-| `fsck`/`ca-gc-dryrun` | **DONE** — shipped, used in every soak checkpoint | |
+| `ca-fsck`/`ca-gc-dryrun` | **DONE** — shipped, used in every soak checkpoint | |
 | Model currency review | **DONE** — 2026-06-22 audit; dispositions recorded | Three stale models identified; `CaGcCore.tla` HISTORICAL |
 | Full GC (M-F) | **TODO** — deferred; soak's `unreachable=N` residual is this | Spec slot reserved in `CaIncarnationCore.tla` |

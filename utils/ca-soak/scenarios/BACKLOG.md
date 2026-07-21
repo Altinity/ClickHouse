@@ -679,7 +679,7 @@ Impact: real deployments cannot auto-restart a crashed CA server. High priority 
   `docker kill -s KILL` one writer mid-burst (its lease stops renewing; it holds a stale `observed_gc_round`).
   Wait past `mount_lease_ttl_ms + skew_margin` and drive GC: assert the round FENCES OUT the dead writer
   (`RoundReport::fence_outs == 1`, a `gc_fence_out` audit row, its mount body `gc_fenced = true`), the floor
-  advances past its stale ack, and condemned blobs drain. Then run `clickhouse-disks fsck`: assert
+  advances past its stale ack, and condemned blobs drain. Then run `clickhouse-disks ca-fsck`: assert
   `dangling == 0` throughout — the fence-out must never let GC delete a blob a still-live writer references
   (the surviving writer's fresh incarnations are spared). Guards the safety half of fence-out.
 

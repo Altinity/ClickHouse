@@ -9,7 +9,7 @@ while continuously verifying that both replicas agree with an in-process integer
 A single `--seed` integer drives everything. From it a `splitmix64`-based stream produces a
 deterministic op ledger that feeds both the SQL workload and the in-memory model oracle. Checkpoints
 quiesce all writes, then assert exact integer aggregates match on both replicas and match the oracle,
-followed by a `clickhouse-disks fsck` on the content-addressed disk. Re-running with the same seed
+followed by a `clickhouse-disks ca-fsck` on the content-addressed disk. Re-running with the same seed
 and the same ClickHouse binary must reproduce the same sequence of operations and the same assertions.
 
 ## Usage

@@ -21,9 +21,10 @@ class CommandFsck final : public ICommand
 public:
     CommandFsck() : ICommand("CommandFsck")
     {
-        command_name = "fsck";
+        command_name = "ca-fsck";
         description = "Independently verify content-addressed pool reachability (read-only). "
-                      "Exits nonzero if any reachable object is missing (dangling).";
+                      "Exits nonzero if any reachable object is missing (dangling). "
+                      "(`fsck` is a deprecated alias for this command.)";
         options_description.add_options()("detail", "list per-object rows (class, key, size, reachable_from)")(
             "timeout", po::value<UInt64>(), "abort the scan after N seconds with a clear error instead of hanging (default 600; 0 = unbounded)")(
             "namespace", po::value<String>(), "scope the scan to namespaces with this prefix (skips the pool-wide "
@@ -42,23 +43,23 @@ public:
 
         auto * dos = dynamic_cast<DiskObjectStorage *>(disk.get());
         if (!dos)
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "fsck: '{}' is not an object-storage disk", disk->getName());
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "ca-fsck: '{}' is not an object-storage disk", disk->getName());
 
         auto * ca = dynamic_cast<ContentAddressedMetadataStorage *>(dos->getMetadataStorage().get());
         if (!ca)
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "fsck: disk '{}' is not content-addressed", disk->getName());
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "ca-fsck: disk '{}' is not content-addressed", disk->getName());
 
         if (!ca->isReadOnly())
             throw Exception(
                 ErrorCodes::BAD_ARGUMENTS,
-                "fsck: open the CA disk read-only (<readonly>true</readonly>) so inspection never probes/schedules a live pool");
+                "ca-fsck: open the CA disk read-only (<readonly>true</readonly>) so inspection never probes/schedules a live pool");
 
         /// Progress to stderr so a long scan is visibly working (the reachable=… summary stays on
         /// stdout, machine-parseable). The deadline bounds a slow-but-progressing scan with a clear
         /// error; for a single LIST page stuck in S3-client retries, lower the disk's S3 retry budget.
         Cas::FsckProgress on_progress = [](std::string_view phase, uint64_t objects, uint64_t pages)
         {
-            std::cerr << "fsck: " << phase << " — " << objects << " objects, " << pages << " pages\n";
+            std::cerr << "ca-fsck: " << phase << " — " << objects << " objects, " << pages << " pages\n";
         };
         std::optional<std::chrono::steady_clock::time_point> deadline;
         if (timeout_sec > 0)
@@ -87,7 +88,7 @@ public:
         if (report.unaccounted > 0)
             std::cout << "note: " << report.unaccounted
                       << " object(s) are outside the current GC view — normal only as a transient "
-                         "(created+dropped between GC rounds); re-run fsck after the next round and "
+                         "(created+dropped between GC rounds); re-run ca-fsck after the next round and "
                          "investigate any that persist\n";
 
         if (detail)
@@ -115,11 +116,11 @@ public:
 
         if (report.dangling > 0)
             throw Exception(
-                ErrorCodes::BAD_ARGUMENTS, "fsck: {} reachable object(s) MISSING (INV-NO-LOSS violation)", report.dangling);
+                ErrorCodes::BAD_ARGUMENTS, "ca-fsck: {} reachable object(s) MISSING (INV-NO-LOSS violation)", report.dangling);
         if (report.snapshot_oracle_mismatches > 0)
             throw Exception(
                 ErrorCodes::BAD_ARGUMENTS,
-                "fsck: {} table snapshot(s) diverge from an independent replay of their logs "
+                "ca-fsck: {} table snapshot(s) diverge from an independent replay of their logs "
                 "(cache/codec corruption, spec §Snapshot Publication oracle)", report.snapshot_oracle_mismatches);
     }
 };
@@ -127,6 +128,35 @@ public:
 CommandPtr makeCommandFsck()
 {
     return std::make_shared<DB::CommandFsck>();
+}
+
+/// Deprecated alias: `fsck` was the original name of `ca-fsck`. Kept working so existing scripts
+/// don't break, but prints a one-line deprecation note on every invocation. The framework doesn't
+/// expose the invoked argv-name to executeImpl, so this wraps a real `ca-fsck` command instance
+/// instead of teaching it to guess its own alias.
+class CommandFsckDeprecated final : public ICommand
+{
+public:
+    CommandFsckDeprecated() : ICommand("CommandFsckDeprecated"), inner(std::make_shared<CommandFsck>())
+    {
+        command_name = "fsck";
+        description = "Deprecated alias for `ca-fsck`; use `ca-fsck` instead. " + inner->description;
+        options_description.add(inner->options_description);
+    }
+
+    void executeImpl(const CommandLineOptions & options, DisksClient & client) override
+    {
+        std::cerr << "fsck: this command has been renamed to `ca-fsck`; `fsck` is a deprecated alias and may be removed in the future\n";
+        inner->executeImpl(options, client);
+    }
+
+private:
+    std::shared_ptr<CommandFsck> inner;
+};
+
+CommandPtr makeCommandFsckDeprecated()
+{
+    return std::make_shared<DB::CommandFsckDeprecated>();
 }
 
 }

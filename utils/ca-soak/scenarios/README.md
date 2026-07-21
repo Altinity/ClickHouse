@@ -34,15 +34,15 @@ The exact entry point can change during implementation, but the contract should 
 
 Recommended default runtime is 15 minutes. Scale tests may have a separate prefill phase that is not
 counted in the 15 minute measurement window, but the prefilled pool must be validated with
-`clickhouse-disks fsck` before the measured phase starts.
+`clickhouse-disks ca-fsck` before the measured phase starts.
 
 ## Common hard assertions
 
 These assertions apply to every positive scenario unless a scenario explicitly states a stricter rule:
 
 - SQL correctness: all replicas return the same aggregates as the scenario oracle.
-- Storage correctness: `clickhouse-disks fsck --detail` reports `dangling = 0`.
-- `GC` safety: `clickhouse-disks ca-gc-dryrun` delete candidates are a subset of the `fsck` unreachable
+- Storage correctness: `clickhouse-disks ca-fsck --detail` reports `dangling = 0`.
+- `GC` safety: `clickhouse-disks ca-gc-dryrun` delete candidates are a subset of the `ca-fsck` unreachable
   set at quiescence.
 - Event audit: `system.content_addressed_log` contains no `read_missing`, `dangling_access`,
   `corrupt_dangle`, `corrupt_decode`, `snap_journal_incoherent`, or `exception` rows unless the scenario is
