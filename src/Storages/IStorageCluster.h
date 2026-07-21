@@ -115,6 +115,8 @@ protected:
     {
         /// True when read() should use readFallBackToPure() or remote-initiator fallback branch.
         bool fallback_to_pure = false;
+        /// Cached shouldFallbackToLocalOnEmptyCluster(context).
+        bool local_fallback = false;
         /// Pre-resolved object-storage cluster when local-fallback prefetch was done.
         ClusterPtr object_storage_cluster;
         /// Resolved remote-initiator cluster when object_storage_remote_initiator_cluster is set.
@@ -123,15 +125,28 @@ protected:
 
     ResolvedClusterRead resolveClusterRead(ContextPtr context) const;
 
-    /// Storage policy: may apply object_storage_cluster_fallback_to_local_if_empty.
-    /// True for alternative syntax / table engine settings; false for explicit *Cluster(...).
-    virtual bool allowsLocalFallbackOnEmptyObjectStorageCluster(ContextPtr /* context */) const { return false; }
+    /// True for alternative syntax / table engines (object_storage_cluster setting path).
+    /// False for explicit *Cluster(...) and for non-object-storage IStorageCluster subclasses.
+    virtual bool usesObjectStorageClusterSettingSyntax() const { return false; }
 
-    /// Setting enabled and storage allows local fallback on empty/unknown object_storage_cluster.
+    /// Setting enabled, setting-syntax storage, and non-empty object_storage_cluster.
     bool shouldFallbackToLocalOnEmptyCluster(ContextPtr context) const;
 
-    /// True for non-*Cluster forms (alternative syntax and table engines): send pure s3()/iceberg() to the remote initiator.
-    virtual bool usePureFunctionForRemoteInitiator(ContextPtr /* context */) const { return false; }
+    /// Shared by read() and getQueryProcessingStage: local pure path vs throw vs remote pure send.
+    bool shouldReadLocallyOnFallbackToPure(const ResolvedClusterRead & resolved, ContextPtr context) const;
+
+    void readFromRemoteInitiator(
+        QueryPlan & query_plan,
+        const Names & column_names,
+        const StorageSnapshotPtr & storage_snapshot,
+        SelectQueryInfo & query_info,
+        ContextPtr context,
+        QueryProcessingStage::Enum processed_stage,
+        size_t max_block_size,
+        size_t num_streams,
+        ASTPtr query_to_send,
+        ClusterPtr remote_initiator_cluster,
+        const String & remote_initiator_cluster_name);
 
 private:
     // With 'allow_null=true' returns nullptr when cluster does not exist or empty

@@ -157,6 +157,7 @@ StoragePtr TableFunctionObjectStorageClusterFallback<Definition, Base>::executeI
         if (auto storage = typeid_cast<std::shared_ptr<StorageObjectStorageCluster>>(result))
         {
             storage->setClusterNameInSettings(true);
+            /// BaseCluster marks the storage as *Cluster; alternative syntax must clear that flag.
             storage->setClusterNameFromFunctionArgument(false);
         }
         return result;

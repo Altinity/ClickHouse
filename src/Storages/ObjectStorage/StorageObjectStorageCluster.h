@@ -203,10 +203,7 @@ private:
         ContextPtr context,
         bool async_insert) override;
 
-    bool allowsLocalFallbackOnEmptyObjectStorageCluster(ContextPtr context) const override;
-
-    /// Pure s3()/iceberg() (not *Cluster) for remote initiator: alternative syntax and table engines.
-    bool usePureFunctionForRemoteInitiator(ContextPtr /* context */) const override { return !cluster_name_from_function_argument; }
+    bool usesObjectStorageClusterSettingSyntax() const override { return !cluster_name_from_function_argument; }
 
     /*
     In case the table was created with `object_storage_cluster` setting,

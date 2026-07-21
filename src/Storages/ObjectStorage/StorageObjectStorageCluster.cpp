@@ -745,16 +745,6 @@ String StorageObjectStorageCluster::getClusterName(ContextPtr context) const
     return getOriginalClusterName();
 }
 
-bool StorageObjectStorageCluster::allowsLocalFallbackOnEmptyObjectStorageCluster(ContextPtr context) const
-{
-    if (cluster_name_from_function_argument)
-        return false;
-
-    /// Only when a non-empty object_storage_cluster was requested (query setting or table engine).
-    /// Empty OSC + remote_initiator without remote_initiator_cluster must keep BAD_ARGUMENTS.
-    return !getClusterName(context).empty();
-}
-
 QueryProcessingStage::Enum StorageObjectStorageCluster::getQueryProcessingStage(
     ContextPtr context, QueryProcessingStage::Enum to_stage, const StorageSnapshotPtr & storage_snapshot, SelectQueryInfo & query_info) const
 {
@@ -762,28 +752,9 @@ QueryProcessingStage::Enum StorageObjectStorageCluster::getQueryProcessingStage(
         return QueryProcessingStage::Enum::FetchColumns;
 
     auto resolved = resolveClusterRead(context);
-    const auto & settings = context->getSettingsRef();
+    if (shouldReadLocallyOnFallbackToPure(resolved, context))
+        return QueryProcessingStage::Enum::FetchColumns;
 
-    if (resolved.fallback_to_pure)
-    {
-        if (settings[Setting::object_storage_remote_initiator])
-        {
-            if (!resolved.remote_initiator_cluster)
-            {
-                if (!shouldFallbackToLocalOnEmptyCluster(context))
-                    throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                        "Setting 'object_storage_remote_initiator' can be used only with 'object_storage_remote_initiator_cluster', 'object_storage_cluster', or cluster name in arguments");
-
-                return QueryProcessingStage::Enum::FetchColumns;
-            }
-        }
-        else
-        {
-            return QueryProcessingStage::Enum::FetchColumns;
-        }
-    }
-
-    /// Distributed storage.
     return IStorageCluster::getQueryProcessingStage(context, to_stage, storage_snapshot, query_info);
 }
 
