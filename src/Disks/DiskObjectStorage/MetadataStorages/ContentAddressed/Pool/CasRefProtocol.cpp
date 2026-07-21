@@ -46,18 +46,14 @@ void checkRemoveNamespaceOrdering(const std::vector<RefOp> & ops)
 }
 
 /// True iff `manifest_ref` already names an existing committed row or precommit binding under ANY
-/// ref_name (the add-precommit rule: "no conflicting owner may name the same manifest"). Linear scan:
-/// the state machine is not the hot path (see `admits`'s header doc), and table sizes are bounded by
-/// the same admission budget this invariant protects.
+/// ref_name (the add-precommit rule: "no conflicting owner may name the same manifest"). O(1) via
+/// `owned_manifests`, a COW membership index (Pool/CasRefCowManifestSet.h) that every ownership-
+/// changing arm below (and `stateFromSnapshot`) maintains in lock-step with `committed` and
+/// `precommits`. The old linear scan lives on, in debug/sanitizer builds only, as
+/// `debugAssertBodyCounters`'s cross-check that the index has not drifted from those two containers.
 bool RefTableState::manifestAlreadyOwned(const ManifestRef & manifest_ref) const
 {
-    for (const auto [name, row] : committed)
-        if (row.manifest_ref == manifest_ref)
-            return true;
-    for (const auto & [name, ref] : precommits)
-        if (ref == manifest_ref)
-            return true;
-    return false;
+    return owned_manifests.contains(manifest_ref);
 }
 
 /// The `owner_transition` op kind: dispatches on the `(old_binding,
@@ -94,6 +90,7 @@ void RefTableState::applyOwnerTransition(const RefOp & op, TxnValidation validat
         precommits.emplace(b.ref_name, b.manifest_ref);
         snapshot_body_bytes += precommitRowEncodedSize(RefOwnerBinding{RefOwnerKind::Precommit, b.ref_name, b.manifest_ref});
         removal_body_bytes  += removalOpEncodedSize(RefOwnerKind::Precommit, b.ref_name, b.manifest_ref);
+        owned_manifests.insert(b.manifest_ref);
         return;
     }
 
@@ -106,6 +103,7 @@ void RefTableState::applyOwnerTransition(const RefOp & op, TxnValidation validat
                 "RefTableState: exact precommit binding '{}' to remove is absent", b.ref_name);
         snapshot_body_bytes -= precommitRowEncodedSize(RefOwnerBinding{RefOwnerKind::Precommit, b.ref_name, b.manifest_ref});
         removal_body_bytes  -= removalOpEncodedSize(RefOwnerKind::Precommit, b.ref_name, b.manifest_ref);
+        owned_manifests.erase(b.manifest_ref);
         return;
     }
 
@@ -121,6 +119,7 @@ void RefTableState::applyOwnerTransition(const RefOp & op, TxnValidation validat
         committed.erase(it);
         snapshot_body_bytes -= committedRowEncodedSize(removed);
         removal_body_bytes  -= removalOpEncodedSize(RefOwnerKind::Committed, removed.ref_name, removed.manifest_ref);
+        owned_manifests.erase(removed.manifest_ref);
         return;
     }
 
@@ -138,6 +137,11 @@ void RefTableState::applyOwnerTransition(const RefOp & op, TxnValidation validat
                 "RefTableState: exact precommit binding '{}' to promote is absent", b.ref_name);
         snapshot_body_bytes -= precommitRowEncodedSize(RefOwnerBinding{RefOwnerKind::Precommit, b.ref_name, b.manifest_ref});
         removal_body_bytes  -= removalOpEncodedSize(RefOwnerKind::Precommit, b.ref_name, b.manifest_ref);
+        /// `owned_manifests` is deliberately left untouched by a promote: `b.manifest_ref` moves from
+        /// precommit ownership to committed ownership without ever giving it up in between -- the
+        /// same "there is no moment at which the manifest has no owner" invariant this function's
+        /// header doc states for promote generally. The index tracks "does ANY owner currently name
+        /// this manifest", not which kind, so an erase-then-insert pair here would be pure overhead.
         /// A DIFFERENT manifest already committed under this exact ref_name must be evicted by its
         /// own explicit owner_transition(old=Committed, new=None) first (an earlier op of this same
         /// transaction, or an earlier transaction) -- never silently here. `GC`'s manifest-edge delta
@@ -224,6 +228,10 @@ void RefTableState::applyOp(const RefOp & op, const RefTxnId & txn_id, TxnValida
             if (!committed.empty() || !precommits.empty())
                 throw Exception(ErrorCodes::CORRUPTED_DATA,
                     "RefTableState: remove_namespace with nonempty owner sets");
+            /// `committed`/`precommits` empty implies `owned_manifests` empty too -- every entry in
+            /// the index is put there by an ownership change to one of those two containers. A
+            /// mismatch here means the index has drifted, not that this transaction is invalid.
+            chassert(owned_manifests.size() == 0);
             lifecycle = RefLifecycle::Removed;
             remove_txn_id = txn_id;
             return;
@@ -248,12 +256,14 @@ RefTableState stateFromSnapshot(const RefTableSnapshot & snapshot)
         state.committed.emplace(row.ref_name, row);
         state.snapshot_body_bytes += committedRowEncodedSize(row);
         state.removal_body_bytes  += removalOpEncodedSize(RefOwnerKind::Committed, row.ref_name, row.manifest_ref);
+        state.owned_manifests.insert(row.manifest_ref);
     }
     for (const RefOwnerBinding & b : validated.precommits)
     {
         state.precommits.emplace(b.ref_name, b.manifest_ref);
         state.snapshot_body_bytes += precommitRowEncodedSize(RefOwnerBinding{RefOwnerKind::Precommit, b.ref_name, b.manifest_ref});
         state.removal_body_bytes  += removalOpEncodedSize(RefOwnerKind::Precommit, b.ref_name, b.manifest_ref);
+        state.owned_manifests.insert(b.manifest_ref);
     }
     return state;
 }
@@ -264,22 +274,34 @@ RefTableState stateFromSnapshot(const RefTableSnapshot & snapshot)
 /// than a drift-prone estimate -- the concern the old non-incremental admits() cited. O(N); compiled
 /// only in debug and sanitizer builds (`DEBUG_OR_SANITIZER_BUILD`, the same condition `chassert` fires
 /// under), so an ASan/TSan run exercises it too, not just a debug build.
+///
+/// Also rebuilds the expected `owned_manifests` membership by scanning `committed` + `precommits`
+/// (the same linear walk `manifestAlreadyOwned` used to do directly) and cross-checks it against the
+/// COW index: every scanned manifest must be present in the index, and the index's total size must
+/// equal the number of rows scanned -- together those two checks catch both a missing entry and a
+/// stale/extra one, which a size-only or membership-only check could each miss on their own.
 void RefTableState::debugAssertBodyCounters() const
 {
     uint64_t snap = 0;
     uint64_t rem = 0;
+    size_t owned_scanned = 0;
     for (const auto [name, row] : committed)
     {
         snap += committedRowEncodedSize(row);
         rem  += removalOpEncodedSize(RefOwnerKind::Committed, name, row.manifest_ref);
+        chassert(owned_manifests.contains(row.manifest_ref));
+        ++owned_scanned;
     }
     for (const auto & [name, mref] : precommits)
     {
         snap += precommitRowEncodedSize(RefOwnerBinding{RefOwnerKind::Precommit, name, mref});
         rem  += removalOpEncodedSize(RefOwnerKind::Precommit, name, mref);
+        chassert(owned_manifests.contains(mref));
+        ++owned_scanned;
     }
     chassert(snapshot_body_bytes == snap);
     chassert(removal_body_bytes == rem);
+    chassert(owned_manifests.size() == owned_scanned);
 }
 #endif
 

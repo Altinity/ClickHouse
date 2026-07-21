@@ -244,3 +244,150 @@ follow-up experiment (materialize periodically during a long recovery replay, or
 un-materialized overlay).
 
 Gate: 1,079 tests passed, 0 failures (t2's 1,077 + 2 new E1 tests).
+
+## E2 owned-manifest index (t4) {#e2-owned-manifest-index-t4}
+
+Task 4 attacks `BM_AdmitsAddPrecommit`'s O(N) cost directly rather than eliding it on one path (E1):
+`manifestAlreadyOwned` now answers "does any owner already name this `ManifestRef`" from a new COW
+membership index, `RefCowManifestSet` (`Pool/CasRefCowManifestSet.h`), instead of scanning
+`committed` + `precommits`. Same copy-on-write shape as `RefCowMap`: an immutable `shared_ptr`-shared
+`base` (a `std::unordered_set<ManifestRef>`, O(1) lookup) plus a per-copy `overlay`, so a
+`RefTableState` scratch copy stays O(overlay), never O(table size). `RefTableState` gained one new
+private field, `owned_manifests`, maintained by every arm of `applyOwnerTransition` that changes
+ownership (`insert` on add-precommit, `erase` on remove-precommit and remove-committed, deliberately
+untouched on promote -- the manifest keeps an owner throughout, so there is nothing to erase-then-
+reinsert) plus `stateFromSnapshot`'s row-loading loops (seed) and `materializeCommitted` (folds its
+overlay alongside `committed`'s). `manifestAlreadyOwned` becomes `return
+owned_manifests.contains(manifest_ref);` -- O(1) in BOTH `TxnValidation` modes, so E1's
+`TrustedHistory` `chassert(!manifestAlreadyOwned(...))` is now an O(1) check too: debug-build replay
+stops being O(K×N) (K applied ops over an N-row table) and becomes O(K), composing with E1 exactly as
+the task brief predicted.
+
+### Tests
+
+TDD was compile-failure RED in practice: the container (`Pool/CasRefCowManifestSet.h/.cpp`) and its
+dedicated gtest suite (`gtest_cas_ref_cow_manifest_set.cpp`, 12 tests -- contains/insert/erase across
+base and overlay, tombstone-then-reinsert both purely-in-overlay and across a materialized base,
+`materialize` folding and no-op-on-empty-overlay behavior, copy isolation, `baseUseCountForTest`
+copy-shares-base, and a `net_delta` correctness walk through a longer mixed op sequence) were written
+together in one pass, so RED was reconstructed by temporarily removing the container header (a
+compile failure -- `use of undeclared identifier 'RefCowManifestSet'`) before restoring it, the same
+pattern E1 used for its own single-pass edit. Four death tests (`insert` aborting on an
+already-present member in either the overlay or a materialized base, `erase` aborting on an absent or
+already-tombstoned member) are gated `#if defined(DEBUG_OR_SANITIZER_BUILD)` and do not compile into
+this release-flavored `build/` directory. `debugAssertBodyCounters` gained a full rebuild-and-compare
+of `owned_manifests`: every scanned `committed`/`precommits` entry must be present in the index
+(`chassert(owned_manifests.contains(...))`), and the index's total `size()` must equal the number of
+rows scanned -- catching both a missing entry and a stale/extra one, which a size-only or
+membership-only check could each miss alone. Gate (same filter as every prior round): **1,091 tests
+passed, 0 failures** (1,079 + 12 new container tests; the 4 death tests don't compile into this
+build, so 1,079 + 12 = 1,091 checks out exactly).
+
+### Investigation: an `unordered_map` overlay taxes every scratch copy {#e2-scratchcopy-investigation}
+
+The brief's acceptance gate calls for investigating `BM_ScratchCopy` before committing if it regresses
+more than 10% (the container's copy must stay cheap, or the whole exercise reintroduces the cost E2
+exists to remove). The first implementation followed the task brief's class sketch literally --
+`std::unordered_map<ManifestRef, bool, Hash> overlay` -- and `BM_ScratchCopy` regressed **+37 to +42%**
+(t3-equivalent ~46 ns → ~59-66 ns across N). That is well outside tolerance, so it was investigated
+before anything was committed, per instructions.
+
+Isolated measurement via `.claude/tools/cppexpr.sh` (`--plain -b 3000000`, copying a small struct with
+one vs. two `shared_ptr`-plus-overlay members, five reps) pinned the cause: libstdc++'s
+`std::unordered_map` copy constructor allocates a real bucket array even when copying an **empty**
+source map (~30 ns/copy measured), whereas copying an empty `std::map` is close to free (~15 ns/copy,
+indistinguishable from the cost of one more `shared_ptr` refcount bump alone). `RefCowMap`'s own
+`overlay` is a `std::map`, not an `unordered_map`, for exactly this reason -- E2's first draft
+reintroduced the cost `RefCowMap` had already sidestepped, just in a sibling container. Fix:
+`RefCowManifestSet::overlay` is `std::map<ManifestRef, bool>` (using `ManifestRef::operator<`, already
+defined); `base` stays `std::unordered_set<ManifestRef, Hash>` for O(1) large-table lookups, since
+`base` is shared via `shared_ptr` and is never itself deep-copied. After the fix, `BM_ScratchCopy`
+lands at ~59-60 ns across N -- a real, understood, and now-irreducible-within-this-design ~13 ns
+(~28%) over the t2/t3 baseline (~46 ns): exactly the cost of one additional `shared_ptr` copy (the
+second COW container's `base` pointer), confirmed by the same isolated measurement. Removing it
+entirely would require merging `owned_manifests`'s and `committed`'s `base` pointers into one shared
+control block -- an architecture change out of scope for "add a container," not attempted here. In
+absolute terms this residual is noise against the benchmark it actually feeds: `BM_ScratchCopy` is one
+component of `BM_AdmitsAddPrecommit`'s ~720 ns total (below), so the ~13 ns addition is under 2% of
+the number this task was optimizing, dwarfed by the ~99.8%-at-N=100,000 win on that same benchmark.
+
+### An honest regression: `BM_ReplayHistory` gets WORSE, not better {#e2-replayhistory-regression}
+
+The brief's own expectation was "`BM_ReplayHistory` may improve a little (each add's scan gone)".
+Measured result is the opposite: `BM_ReplayHistory`'s per-row constant goes from t3/E1's 36,679 ns/row
+back up to **50,082 ns/row** -- worse than t3, and marginally worse than the *original pre-E1*
+baseline's 48,859 ns/row. E1's ~22-25% win on this benchmark is essentially erased.
+
+Root cause is the same one the E1 section already flagged as "confirmed out of scope... a candidate
+for a follow-up experiment": `BM_ReplayHistory` calls `replay(snapshot, tail)` directly (not
+`makeSyntheticState`, which explicitly materializes) to model the fold/recovery profile, where
+production genuinely never materializes mid-replay (`applyRefLogTxn` never calls
+`materializeCommitted()`; only the writer's live flush loop does, once per flush, after which E2's
+`owned_manifests` folds in lockstep with `committed`). Across `BM_ReplayHistory`'s 256-transaction
+tail, `committed`'s `RefCowMap` overlay was already known to grow unboundedly and get deep-copied
+whole on every one of the 256 `RefTableState scratch = state` copies inside `applyRefLogTxn` -- an
+accepted, documented, out-of-scope-for-E1 cost. `owned_manifests`'s `overlay` now grows in lockstep
+with it (every add-precommit across the tail inserts one entry that nothing in this benchmark ever
+removes, since promote deliberately leaves the index alone) and pays the same uncapped per-copy cost a
+second time, roughly doubling the pre-existing, already-accepted overhead. This is a genuine
+production-relevant cost -- real recovery/GC-fold replay of a long uncommitted tail hits the identical
+shape -- not a benchmark artifact; it does not change `BM_ReplayHistory`'s O(N) classification (still
+`RangeMultiplier(10)` scaling `~1000x` in N producing `~670x` in time, consistent with O(N) both before
+and after), only its constant.
+
+This was not fixed in this task: the fix is "materialize periodically during a long recovery replay
+(or otherwise avoid copying an un-materialized overlay)," which the E1 section already scoped as a
+follow-up affecting `committed` generally, not something to improvise piecemeal onto one new field.
+Flagging it here, unsmoothed, rather than reporting only the benchmarks that moved the right direction
+-- the live-writer append/flush path (`BM_AdmitsAddPrecommit`, `BM_ApplyRefLogTxn`, `BM_ScratchCopy`,
+all benchmarked against a `materializeCommitted()`-called, fully-materialized state) is unaffected and
+gets the full O(1) win; only the never-materializes-mid-fold recovery/GC path pays this doubled
+already-known cost.
+
+### Benchmark deltas
+
+Same binary/flags as every prior round (`--benchmark_repetitions=3
+--benchmark_report_aggregates_only=true`, medians reported), post-fix (`std::map` overlay).
+
+| Benchmark | N | Before (source) | t4/E2 (median) | Delta |
+|---|---|---|---|---|
+| `BM_AdmitsAddPrecommit` | 100 | 1,013 ns (t3) | 713 ns | **-29.6%** |
+| `BM_AdmitsAddPrecommit` | 1,000 | 4,281 ns (t3) | 716 ns | **-83.3%** |
+| `BM_AdmitsAddPrecommit` | 10,000 | 38,747 ns (t3) | 726 ns | **-98.1%** |
+| `BM_AdmitsAddPrecommit` | 100,000 | 410,636 ns (t3) | 720 ns | **-99.8%** |
+| `BM_AdmitsAddPrecommit` complexity fit | — | O(N), ~4.0 ns/row (baseline) | O(1), RMS 1% | **O(N) → O(1)** |
+| `BM_ScratchCopy` | 100 | 46.2 ns (t2) | 60.0 ns | +29.9% |
+| `BM_ScratchCopy` | 1,000 | 46.6 ns (t2) | 60.1 ns | +29.0% |
+| `BM_ScratchCopy` | 10,000 | 46.1 ns (t2) | 59.0 ns | +28.0% |
+| `BM_ScratchCopy` | 100,000 | 45.8 ns (t2) | 59.6 ns | +30.1% |
+| `BM_ApplyRefLogTxn` | 100 | 764 ns (t2) | 752 ns | -1.6% |
+| `BM_ApplyRefLogTxn` | 1,000 | 783 ns (t2) | 772 ns | -1.4% |
+| `BM_ApplyRefLogTxn` | 10,000 | 803 ns (t2) | 792 ns | -1.4% |
+| `BM_ApplyRefLogTxn` | 100,000 | 834 ns (t2) | 858 ns | +2.9% |
+| `BM_ReplayHistory` | 100 | 4.85 ms (t3) | 7.43 ms | **+53.2%** |
+| `BM_ReplayHistory` | 1,000 | 35.82 ms (t3) | 48.85 ms | **+36.4%** |
+| `BM_ReplayHistory` | 10,000 | 350.57 ms (t3) | 473.76 ms | **+35.2%** |
+| `BM_ReplayHistory` | 100,000 | 3.67 s (t3) | 4.98 s | **+35.7%** |
+| `BM_ReplayHistory` complexity fit | — | 36,679 ns/row (t3) | 50,082 ns/row | **+36.6%** (worse than the original 48,859 ns/row baseline too) |
+
+`BM_ScratchCopy`'s +28-30% and `BM_ReplayHistory`'s regression are both understood and explained
+above (§Investigation, §An honest regression), not unexplained noise. `BM_ApplyRefLogTxn` (one
+materialized-state promote: copy + validate + apply + install) stays flat and within the ±10% noise
+band throughout, confirming the new field costs nothing extra on the single-op live-writer path once
+materialized.
+
+### Verdict
+
+DONE_WITH_CONCERNS. The headline result lands exactly as designed: `BM_AdmitsAddPrecommit` is flat
+O(1) across five orders of magnitude in N (RMS 1%), and E1's debug-build `TrustedHistory` chassert is
+now O(1) too, so debug/sanitizer replay stops being O(K×N). Two costs were found, root-caused, and are
+reported rather than hidden: a small (~13 ns, ~28%), architecturally-irreducible-within-this-design
+`BM_ScratchCopy` tax (one more `shared_ptr` copy per `RefTableState` copy -- negligible against the
+benchmark it feeds), and a real (~35%, `BM_ReplayHistory`-constant-level) recovery/GC-fold-replay
+regression that doubles a pre-existing, already-accepted, already-deferred cost from E1's own
+write-up. Neither affects the live-writer append/flush path this task targeted, and neither is a new
+asymptotic class -- both are follow-up-experiment material ("materialize periodically during a long
+replay" would fix both `committed`'s and `owned_manifests`' versions of the same underlying issue at
+once), tracked here rather than folded silently into "flat and green."
+
+Gate: 1,091 tests passed, 0 failures (t3's 1,079 + 12 new E2 container tests).

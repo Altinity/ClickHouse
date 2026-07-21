@@ -5,6 +5,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasRefSnapshotFormat.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCowMap.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasRefCowManifestSet.h>
 #include <base/types.h>
 #include <cstdint>
 #include <functional>
@@ -176,8 +177,8 @@ public:
     uint64_t getRemovalBodyBytes() const { return removal_body_bytes; }
 
     /// State-install point only (once per ref-log flush, never per batch item): folds the committed
-    /// map's COW overlay into a fresh shared base.
-    void materializeCommitted() { committed.materialize(); }
+    /// map's and the owned-manifest index's COW overlays into a fresh shared base each.
+    void materializeCommitted() { committed.materialize(); owned_manifests.materialize(); }
 
 private:
     RefLifecycle lifecycle = RefLifecycle::Removed;   /// see representation note above
@@ -186,6 +187,12 @@ private:
 
     RefCowMap committed;                                              /// keyed by ref_name
     std::set<std::pair<String, ManifestRef>> precommits;             /// (ref_name, manifest_ref)
+
+    /// COW membership index of every `ManifestRef` with a current owner (a `committed` row or a
+    /// `precommits` binding), maintained O(1) per applied op by every arm of `applyOwnerTransition`
+    /// and `stateFromSnapshot` that changes ownership. Gives `manifestAlreadyOwned` O(1) instead of
+    /// a linear scan over `committed` + `precommits`. See Pool/CasRefCowManifestSet.h.
+    RefCowManifestSet owned_manifests;
 
     /// Running byte totals of the two admission-budget encodings' *bodies* (row/op lines only, no
     /// header/meta/trailer framing), maintained O(1) per applied op by `applyOp` and seeded by

@@ -1,0 +1,102 @@
+#pragma once
+
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasTypes.h>
+#include <base/defines.h>
+#include <cstdint>
+#include <map>
+#include <memory>
+#include <unordered_set>
+
+namespace DB::Cas
+{
+
+/// A copy-cheap membership set of every `ManifestRef` that currently has an owner (a committed row
+/// or a precommit binding). `RefTableState` (Pool/CasRefProtocol.h) uses it to hold the
+/// add-precommit uniqueness invariant ("no conflicting owner may name the same manifest") as a
+/// structure instead of `manifestAlreadyOwned`'s old linear scan over `committed` + `precommits`.
+///
+/// Same copy-on-write shape as `RefCowMap` (Pool/CasRefCowMap.h): copies share an immutable `base`
+/// set (a `shared_ptr` refcount bump, no per-element copy) and differ only in a per-copy `overlay`,
+/// so the copy-then-mutate-then-swap pattern `applyRefLogTxn`'s scratch copy uses stays O(overlay
+/// size), never O(table size) -- exactly the regression `RefCowMap` was already built to avoid, and
+/// a plain `std::set<ManifestRef>` member would have reintroduced here. Membership-only: unlike
+/// `RefCowMap` there is no ordered (or any) iteration, because nothing in `RefTableState` ever needs
+/// to enumerate owned manifests, only ask "does any owner already name this one". Not thread-safe;
+/// same ownership rules as `RefCowMap` (callers retain the state lock or detached-copy ownership
+/// rules of the state that contains it).
+///
+/// `base` is `std::unordered_set` (O(1) lookup, the point of this class at large table size), but
+/// `overlay` is deliberately `std::map`, not `std::unordered_map`, even though it holds the exact
+/// same key type: `overlay` is copied on EVERY `RefTableState` scratch copy (unlike `base`, which is
+/// shared), and libstdc++'s `unordered_map` copy constructor allocates a real bucket array even for
+/// an empty source (measured ~30ns/copy via `.claude/tools/cppexpr.sh`, versus effectively free for
+/// an empty `std::map` -- the same reason `RefCowMap`'s own `overlay` is a `std::map`, not an
+/// `unordered_map`). The common case is an empty-or-few-entries overlay between flushes, so this
+/// keeps the added cost of `owned_manifests` on `BM_ScratchCopy` to roughly one more `shared_ptr`
+/// copy, not one more `shared_ptr` copy plus a hidden allocation.
+///
+/// `insert`/`erase` chassert their precondition (absence / presence, respectively) rather than
+/// silently tolerating a violation: the ref table's own uniqueness invariant already guarantees
+/// both, so a violation here means the index itself has drifted from `committed`/`precommits`, not
+/// that the invariant failed -- exactly the class of bug `RefTableState::debugAssertBodyCounters`
+/// exists to catch, and this set's chasserts extend that same cross-check to manifest ownership.
+class RefCowManifestSet
+{
+private:
+    /// Hashes `ManifestRef` for `base`'s `unordered_set` buckets only, by delegating to the existing
+    /// `std::hash<ManifestRef>` specialization (Primitives/CasTypes.h) instead of re-deriving the
+    /// same three-field combine a second time. Membership hashing only -- this set is never exposed
+    /// to attacker-chosen keys, only to manifest refs this process itself allocated, so adversarial
+    /// collision resistance is not a concern here.
+    struct Hash
+    {
+        size_t operator()(const ManifestRef & m) const { return std::hash<ManifestRef>{}(m); }
+    };
+
+public:
+    using Base = std::unordered_set<ManifestRef, Hash>;
+
+    RefCowManifestSet() = default;
+
+    /// True iff `m` currently has an owner: present in the merged base+overlay view. An overlay
+    /// tombstone reports absent even when `base` still has `m`.
+    bool contains(const ManifestRef & m) const;
+
+    /// Records `m` as owned. `m` must be absent from the merged view (chassert) -- the caller's own
+    /// uniqueness check is what actually enforces the invariant; this only guards against the index
+    /// drifting away from it.
+    void insert(const ManifestRef & m);
+
+    /// Records `m` as no longer owned. `m` must be present in the merged view (chassert), same
+    /// rationale as `insert`.
+    void erase(const ManifestRef & m);
+
+    /// `base->size() + net_delta`, O(1).
+    size_t size() const { return static_cast<size_t>(static_cast<int64_t>(base->size()) + net_delta); }
+    bool empty() const { return size() == 0; }
+
+    /// Folds `overlay` into a fresh immutable `base` (O(current size)) and clears the overlay. Call
+    /// this at the same state-install point `RefCowMap::materialize()` is called from (once per
+    /// ref-log flush, never once per batch item). If the overlay is already empty, this is a no-op.
+    void materialize();
+
+    /// Test-only: current overlay entry count (0 right after `materialize()`).
+    size_t overlayEntriesForTest() const { return overlay.size(); }
+    /// Test-only: `base`'s `shared_ptr::use_count()` -- a copy that shares `base` (no per-element
+    /// allocation) bumps this by exactly one.
+    int64_t baseUseCountForTest() const { return base.use_count(); }
+
+private:
+    std::shared_ptr<const Base> base = std::make_shared<const Base>();
+    /// `true` = an overlay addition (present, whether or not `base` also has it); `false` = a
+    /// tombstone shadowing a `base` member. An overlay-only member that is erased is removed from
+    /// this map outright rather than tombstoned (nothing left to shadow), mirroring `RefCowMap`.
+    /// `std::map`, not `std::unordered_map`: see the class doc comment above -- this is what keeps an
+    /// empty overlay's copy cost negligible.
+    std::map<ManifestRef, bool> overlay;
+    /// `size() = base->size() + net_delta`, maintained in lock-step by `insert`/`erase` so
+    /// `size()`/`empty()` stay O(1). Counts live overlay changes relative to `base`.
+    int64_t net_delta = 0;
+};
+
+}
