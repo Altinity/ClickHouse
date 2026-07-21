@@ -17,6 +17,17 @@ class Client;
 }
 #endif
 
+/// Per-write retry-behavior selector, resolved by the object storage that executes the write.
+/// SingleAttempt: exactly one HTTP attempt, no SDK-transparent retries — for conditional writes
+/// whose retry loop lives above the storage client (it must resolve an uncertain PUT before
+/// reissuing). Backends without a SingleAttempt implementation report it via
+/// IObjectStorage::supportsRetryProfile; writers must fail closed rather than fall through.
+enum class ObjectStorageRetryProfile : uint8_t
+{
+    Default,
+    SingleAttempt,
+};
+
 /// Settings to be passed to IDisk::writeFile()
 struct WriteSettings
 {
@@ -64,9 +75,13 @@ struct WriteSettings
     /// WriteBufferFromS3::makeSinglepartUpload/completeMultipartUpload run their OWN retry loop above
     /// the S3 client that reissues the identical request (WITH its If-None-Match/If-Match condition)
     /// on a NO_SUCH_KEY response — a second retry-affecting layer a client-level override
-    /// (s3_client_override below) does not reach. A CAS conditional write sets this to 1 for exactly
-    /// one attempt at this layer too (RFC cas-s3-timeout-retry-control). 0 = no override.
+    /// (a client-level profile override) does not reach. A CAS conditional write sets this to 1 for
+    /// exactly one attempt at this layer too (RFC cas-s3-timeout-retry-control). 0 = no override.
     size_t s3_max_unexpected_write_error_retries_override = 0;
+
+    /// Selects the retry profile the object storage should execute this write under; see
+    /// ObjectStorageRetryProfile.
+    ObjectStorageRetryProfile object_storage_retry_profile = ObjectStorageRetryProfile::Default;
 
 #if USE_AWS_S3
     /// Per-request S3 client override: when set, S3ObjectStorage::writeObject issues THIS write with

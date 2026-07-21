@@ -23,6 +23,7 @@
 #include <aws/core/http/HttpResponse.h>
 #include <aws/core/http/URI.h>
 
+#include <Common/ProfileEvents.h>
 #include <Common/RemoteHostFilter.h>
 #include <IO/ReadBufferFromS3.h>
 #include <IO/ReadHelpers.h>
@@ -42,6 +43,11 @@ namespace DB::S3RequestSetting
 {
     extern const S3RequestSettingsUInt64 max_single_read_retries;
     extern const S3RequestSettingsUInt64 max_unexpected_write_error_retries;
+}
+
+namespace ProfileEvents
+{
+    extern const Event S3SingleAttemptRetryConsultations;
 }
 
 /*
@@ -226,6 +232,18 @@ TEST(IOTestAwsS3Client, DoesNotRetryPreconditionFailed)
     /// Typed-exception surface (the conditional copy / finalize catch an S3Exception): name and message.
     EXPECT_TRUE(DB::S3Exception("boom", Aws::S3::S3Errors::UNKNOWN, "PreconditionFailed").isPreconditionFailed());
     EXPECT_FALSE(DB::S3Exception("boom", Aws::S3::S3Errors::NO_SUCH_KEY, "NoSuchKey").isPreconditionFailed());
+}
+
+TEST(IOTestAwsS3Client, SingleAttemptRetryStrategyRefusesAndCounts)
+{
+    using ProfileEvents::global_counters;
+    const auto before = global_counters[ProfileEvents::S3SingleAttemptRetryConsultations].load();
+    DB::S3::SingleAttemptRetryStrategy strategy;
+    const Aws::Client::AWSError<Aws::Client::CoreErrors> retryable_5xx(
+        Aws::Client::CoreErrors::INTERNAL_FAILURE, /*isRetryable=*/true);
+    EXPECT_FALSE(strategy.ShouldRetry(retryable_5xx, /*attempted=*/0));
+    EXPECT_EQ(strategy.GetMaxAttempts(), 1);
+    EXPECT_EQ(global_counters[ProfileEvents::S3SingleAttemptRetryConsultations].load() - before, 1u);
 }
 
 /// Drive a single-part conditional PUT (`If-None-Match: *`) with `body_size` bytes through a real

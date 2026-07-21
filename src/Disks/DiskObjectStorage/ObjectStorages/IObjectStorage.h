@@ -390,6 +390,11 @@ public:
     /// a token-exact DELETE archives a noncurrent generation instead of reclaiming storage.
     virtual std::optional<bool> isBucketVersioningEnabled() const { return std::nullopt; }
 
+    /// True when this object storage can execute writes under the given retry profile.
+    /// A caller that sets a non-Default profile on WriteSettings MUST check this first and
+    /// fail closed if unsupported (the profile is advisory only to backends that opt in).
+    virtual bool supportsRetryProfile(ObjectStorageRetryProfile profile) const { return profile == ObjectStorageRetryProfile::Default; }
+
     virtual ReadSettings patchSettings(const ReadSettings & read_settings) const;
 
     virtual WriteSettings patchSettings(const WriteSettings & write_settings) const;

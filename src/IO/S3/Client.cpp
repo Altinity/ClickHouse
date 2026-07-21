@@ -67,6 +67,8 @@ namespace ProfileEvents
 
     extern const Event S3Clients;
     extern const Event TinyS3Clients;
+
+    extern const Event S3SingleAttemptRetryConsultations;
 }
 
 namespace CurrentMetrics
@@ -188,6 +190,13 @@ void Client::RetryStrategy::RequestBookkeeping(
             static_cast<size_t>(lastError.GetResponseCode()),
             lastError.GetMessage());
     RequestBookkeeping(httpResponseOutcome);
+}
+
+/// NOLINTNEXTLINE(google-runtime-int)
+bool SingleAttemptRetryStrategy::ShouldRetry(const Aws::Client::AWSError<Aws::Client::CoreErrors> &, long) const
+{
+    ProfileEvents::increment(ProfileEvents::S3SingleAttemptRetryConsultations);
+    return false;
 }
 
 namespace

@@ -892,6 +892,7 @@ The server successfully detected this situation and will download merged part fr
     M(S3CompleteMultipartUpload, "Number of S3 API CompleteMultipartUpload calls.", ValueType::Number) \
     M(S3PutObject, "Number of S3 API PutObject calls.", ValueType::Number) \
     M(S3GetObject, "Number of S3 API GetObject calls.", ValueType::Number) \
+    M(S3SingleAttemptRetryConsultations, "Number of AWS SDK retry consultations refused by the single-attempt S3 retry profile. Non-zero means the SDK attempted a transparent retry on a write that must make exactly one HTTP attempt.", ValueType::Number) \
     \
     M(DiskS3DeleteObjects, "Number of DiskS3 API DeleteObject(s) calls.", ValueType::Number) \
     M(DiskS3CopyObject, "Number of DiskS3 API CopyObject calls.", ValueType::Number) \

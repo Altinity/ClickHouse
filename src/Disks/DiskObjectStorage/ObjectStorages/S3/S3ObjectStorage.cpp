@@ -329,8 +329,8 @@ std::unique_ptr<WriteBufferFromFileBase> S3ObjectStorage::writeObject( /// NOLIN
     {
         /// WriteBufferFromS3's OWN retry loop (makeSinglepartUpload/completeMultipartUpload) reissues
         /// the identical request — WITH its If-None-Match/If-Match condition — on a NO_SUCH_KEY
-        /// response; this sits ABOVE the S3 client, so a client-level retry override
-        /// (s3_client_override) does not bound it. See WriteSettings.
+        /// response; this sits ABOVE the S3 client, so a client-level profile override does not bound
+        /// it. See WriteSettings.
         request_settings[S3RequestSetting::max_unexpected_write_error_retries]
             = write_settings.s3_max_unexpected_write_error_retries_override;
     }
@@ -343,11 +343,16 @@ std::unique_ptr<WriteBufferFromFileBase> S3ObjectStorage::writeObject( /// NOLIN
     if (blob_storage_log)
         blob_storage_log->local_path = object.local_path;
 
-    /// A per-request client override (e.g. CAS conditional writes forcing a single HTTP attempt) rides
-    /// on WriteSettings instead of changing this disk's shared client — every other write keeps using
-    /// `client.get()` and its normal retry policy unchanged.
+    /// The SingleAttempt profile rides on WriteSettings instead of changing this disk's shared
+    /// client — every other write keeps using client.get() and its normal retry policy unchanged.
+    auto used_client = write_settings.object_storage_retry_profile == ObjectStorageRetryProfile::SingleAttempt
+        ? getSingleAttemptClient()
+        : client.get();
+
+    /// A per-request client override (e.g. CAS conditional writes forcing a single HTTP attempt, the
+    /// predecessor of the profile above — see WriteSettings) takes priority when set.
     return std::make_unique<WriteBufferFromS3>(
-        write_settings.s3_client_override ? write_settings.s3_client_override : client.get(),
+        write_settings.s3_client_override ? write_settings.s3_client_override : used_client,
         uri.bucket,
         object.remote_path,
         write_settings.use_adaptive_write_buffer ? write_settings.adaptive_write_buffer_initial_size : buf_size,
@@ -880,6 +885,29 @@ std::shared_ptr<const S3::Client> S3ObjectStorage::getS3StorageClient()
 std::shared_ptr<const S3::Client> S3ObjectStorage::tryGetS3StorageClient()
 {
     return client.get();
+}
+
+std::shared_ptr<const S3::Client> S3ObjectStorage::getSingleAttemptClient() const
+{
+    auto base = client.get();
+    std::lock_guard lock(single_attempt_client_mutex);
+    if (single_attempt_client && single_attempt_client_base == base.get())
+        return single_attempt_client;
+
+    auto cfg = base->getClientConfiguration();
+    cfg.retry_strategy.max_retries = 0;
+    cfg.retryStrategy = std::make_shared<S3::SingleAttemptRetryStrategy>();
+
+    /// A server can reject an If-Match/If-None-Match request before accepting its body; waiting for
+    /// the 100-continue response avoids uploading a large body that cannot commit. Respect the
+    /// disk's configured expect_continue_min_bytes; if unset, use the established 1 MiB floor.
+    static constexpr uint64_t fallback_expect_continue_min_bytes = 1024 * 1024;
+    if (cfg.expect_continue_min_bytes == 0)
+        cfg.expect_continue_min_bytes = fallback_expect_continue_min_bytes;
+
+    single_attempt_client = base->cloneWithConfigurationOverride(cfg);
+    single_attempt_client_base = base.get();
+    return single_attempt_client;
 }
 
 bool S3ObjectStorage::tryRefreshCredentialsViaCallback()

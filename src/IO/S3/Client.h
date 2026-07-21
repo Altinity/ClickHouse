@@ -352,6 +352,17 @@ private:
     LoggerPtr log;
 };
 
+/// Refuses every SDK-transparent retry and counts each consultation. Used by the
+/// ObjectStorageRetryProfile::SingleAttempt per-write profile (conditional writes whose retry
+/// decisions live ABOVE the SDK: the caller must resolve an uncertain PUT before reissuing).
+class SingleAttemptRetryStrategy final : public Aws::Client::RetryStrategy
+{
+public:
+    bool ShouldRetry(const Aws::Client::AWSError<Aws::Client::CoreErrors> &, long) const override; // NOLINT(google-runtime-int)
+    long CalculateDelayBeforeNextRetry(const Aws::Client::AWSError<Aws::Client::CoreErrors> &, long) const override { return 0; } // NOLINT(google-runtime-int)
+    long GetMaxAttempts() const override { return 1; } // NOLINT(google-runtime-int)
+};
+
 class ClientFactory
 {
 public:

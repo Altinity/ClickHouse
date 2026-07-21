@@ -6,6 +6,7 @@
 
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <memory>
+#include <mutex>
 #include <IO/S3/S3Capabilities.h>
 #include <IO/S3Settings.h>
 #include <Common/MultiVersion.h>
@@ -167,6 +168,8 @@ public:
 
     std::optional<bool> isBucketVersioningEnabled() const override;
 
+    bool supportsRetryProfile(ObjectStorageRetryProfile) const override { return true; }
+
     std::shared_ptr<const S3::Client> getS3StorageClient() override;
     std::shared_ptr<const S3::Client> tryGetS3StorageClient() override;
 
@@ -174,6 +177,12 @@ public:
 
     S3::URI getURI() const { return uri; }
     S3Settings getS3Settings() const { return *s3_settings.get(); }
+
+    /// Lazily-built clone of the current disk client with the single-attempt retry profile
+    /// (SingleAttemptRetryStrategy, max_retries=0, Expect:100-continue floor). Rebuilt whenever the
+    /// disk client rotates (applyNewSettings/credentials refresh) — the cached clone is keyed by the
+    /// base client's identity, so a stale clone can never outlive a rotation.
+    std::shared_ptr<const S3::Client> getSingleAttemptClient() const;
 private:
     void removeObjectImpl(const StoredObject & object, bool if_exists);
     void removeObjectsImpl(const StoredObjects & objects, bool if_exists);
@@ -192,6 +201,10 @@ private:
 
     const bool for_disk_s3;
     S3CredentialsRefreshCallback credentials_refresh_callback;
+
+    mutable std::mutex single_attempt_client_mutex;
+    mutable std::shared_ptr<const S3::Client> single_attempt_client;
+    mutable const S3::Client * single_attempt_client_base = nullptr;
 };
 
 }
