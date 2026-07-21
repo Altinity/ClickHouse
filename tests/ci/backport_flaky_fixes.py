@@ -6,6 +6,7 @@ missing commit onto a new branch, push it, and open a single PR.
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -13,6 +14,35 @@ from datetime import datetime, timezone
 
 UPSTREAM_GIT_URL = "https://github.com/{repo}.git"
 UPSTREAM_COMMIT_URL = "https://github.com/{repo}/commit/{sha}"
+
+# Branches like antalya-26.3 or stable-25.8 → family label + version label.
+_BRANCH_LABEL_RE = re.compile(r'^([a-z]+)-(\d+\.\d+)$')
+
+
+def labels_for_branch(branch: str) -> list:
+    labels = ["cicd"]
+    m = _BRANCH_LABEL_RE.match(branch)
+    if m:
+        labels.append(m.group(1))   # e.g. "antalya" or "stable"
+        labels.append(branch)        # e.g. "antalya-26.3" or "stable-25.8"
+    return labels
+
+
+def existing_labels(repo: str, labels: list) -> list:
+    """Return the subset of labels that already exist in the repo."""
+    result = subprocess.run(
+        ["gh", "label", "list", "--repo", repo, "--json", "name", "--limit", "1000"],
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        print(f"Warning: could not fetch labels from {repo}, skipping labels", file=sys.stderr)
+        return []
+    known = {entry["name"] for entry in json.loads(result.stdout)}
+    skipped = [l for l in labels if l not in known]
+    if skipped:
+        print(f"Skipping non-existent labels: {', '.join(skipped)}", file=sys.stderr)
+    return [l for l in labels if l in known]
 
 
 def run_git(*args, check=True, capture=True) -> subprocess.CompletedProcess:
@@ -91,26 +121,29 @@ def build_pr_body(
     return "\n".join(lines)
 
 
-def create_pr(repo: str, branch: str, base: str, title: str, body: str, dry_run: bool) -> None:
+def create_pr(repo: str, branch: str, base: str, title: str, body: str, labels: list, dry_run: bool) -> None:
     if dry_run:
         print(f"DRY RUN: would open PR in {repo}:", file=sys.stderr)
-        print(f"  title: {title}", file=sys.stderr)
-        print(f"  base:  {base}", file=sys.stderr)
-        print(f"  head:  {branch}", file=sys.stderr)
+        print(f"  title:  {title}", file=sys.stderr)
+        print(f"  base:   {base}", file=sys.stderr)
+        print(f"  head:   {branch}", file=sys.stderr)
+        print(f"  labels: {', '.join(labels)}", file=sys.stderr)
         return
 
-    result = subprocess.run(
-        [
-            "gh", "pr", "create",
-            "--repo", repo,
-            "--base", base,
-            "--head", branch,
-            "--title", title,
-            "--body", body,
-        ],
-        text=True,
-        capture_output=False,
-    )
+    labels = existing_labels(repo, labels)
+
+    cmd = [
+        "gh", "pr", "create",
+        "--repo", repo,
+        "--base", base,
+        "--head", branch,
+        "--title", title,
+        "--body", body,
+    ]
+    for label in labels:
+        cmd += ["--label", label]
+
+    result = subprocess.run(cmd, text=True, capture_output=False)
     if result.returncode != 0:
         print("gh pr create failed", file=sys.stderr)
         sys.exit(1)
@@ -194,9 +227,9 @@ def main() -> None:
         run_git("branch", "-D", backport_branch)
         sys.exit(0)
 
-    pr_title = f"{base_branch.title()} - Backport flaky-fix commits from upstream ({date_tag})"
+    pr_title = f"Backport flaky-fix commits from upstream ({date_tag})"
     pr_body = build_pr_body(upstream_repo, applied, conflicted, fetch_failed)
-    print(f"\n--- PR title ---\n{pr_title}\n--- PR body ---\n{pr_body}---")
+    pr_labels = labels_for_branch(base_branch)
 
     if args.dry_run:
         print(
@@ -204,6 +237,8 @@ def main() -> None:
             file=sys.stderr,
         )
         print(f"  Applied: {len(applied)}  Conflicted: {len(conflicted)}  Fetch failed: {len(fetch_failed)}", file=sys.stderr)
+        print(f"\n--- PR title ---\n{pr_title}\n--- PR body ---\n{pr_body}---")
+        create_pr(repo=args.repo, branch=backport_branch, base=base_branch, title=pr_title, body=pr_body, labels=pr_labels, dry_run=True)
         run_git("checkout", base_branch)
         run_git("branch", "-D", backport_branch)
         return
@@ -216,6 +251,7 @@ def main() -> None:
         base=base_branch,
         title=pr_title,
         body=pr_body,
+        labels=pr_labels,
         dry_run=False,
     )
 
