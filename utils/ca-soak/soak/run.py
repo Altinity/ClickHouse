@@ -1123,12 +1123,18 @@ def setup_cluster_and_table(seed, phase, ops, workers, checkpoint_every):
     cluster = Cluster(database=DB)
     # CREATE DATABASE must run against the default database (DB does not exist yet on a fresh stand);
     # a DB-scoped connection would fail UNKNOWN_DATABASE first. Use a throwaway default-scoped cluster
-    # just for the CREATE DATABASE. lazy_load_tables=1 makes a transient S3 error during CAS table
-    # startup surface per-query and retry on next access, instead of stranding the table in a
-    # permanently-FAILED AsyncLoader job until server restart.
+    # just for the CREATE DATABASE.
+    #
+    # lazy_load_tables is DELIBERATELY OFF (2026-07-22): the StorageTableProxy wrapper is under a
+    # quarantine decision after three unforwarded-virtual product bugs (SYSTEM verbs, mutations,
+    # TTL metadata -- see docs/superpowers/reports/2026-07-21-storageproxy-forwarding-audit.md and
+    # the CAS backlog's lazy_load_tables item). Cost of turning it off: a transient S3 error during
+    # CAS table load once again strands the table in a permanently-FAILED AsyncLoader job until
+    # restart (the property lazy_load_tables=1 was added for) -- outage-at-load scenarios lose that
+    # coverage until the feature decision lands.
     bootstrap = Cluster()
     for node in bootstrap.nodes():
-        node.command(f"CREATE DATABASE IF NOT EXISTS {DB} ENGINE = Atomic SETTINGS lazy_load_tables = 1")
+        node.command(f"CREATE DATABASE IF NOT EXISTS {DB} ENGINE = Atomic")
     base_time = int(cluster.node1.scalar("SELECT toUnixTimestamp(now())")) - 60
     log(f"base_time={base_time} (needed for replay) seed={seed} phase={phase} "
         f"ops={ops} workers={workers} checkpoint_every={checkpoint_every}")
