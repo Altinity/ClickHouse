@@ -6,14 +6,18 @@ missing commit onto a new branch, push it, and open a single PR.
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
+import tempfile
+import urllib.request
+import urllib.error
 from datetime import datetime, timezone
 
 
-UPSTREAM_GIT_URL = "https://github.com/{repo}.git"
 UPSTREAM_COMMIT_URL = "https://github.com/{repo}/commit/{sha}"
+UPSTREAM_PATCH_URL = "https://github.com/{repo}/commit/{sha}.patch"
 
 # Branches like antalya-26.3 or stable-25.8 → family label + version label.
 _BRANCH_LABEL_RE = re.compile(r'^([a-z]+)-(\d+\.\d+)$')
@@ -61,37 +65,46 @@ def git_out(*args) -> str:
     return run_git(*args).stdout.strip()
 
 
-def fetch_commit(upstream_repo: str, sha: str) -> bool:
-    """Fetch a commit and its parent from upstream so cherry-pick can compute the diff.
-    Returns True on success, False on failure."""
-    url = UPSTREAM_GIT_URL.format(repo=upstream_repo)
-    result = run_git("fetch", "--no-tags", "--no-recurse-submodules", url, sha, check=False)
-    if result.returncode != 0:
-        print(f"Failed to fetch {sha[:12]} from upstream:\n{result.stderr}", file=sys.stderr)
+def download_patch(upstream_repo: str, sha: str) -> bytes:
+    """Download the commit patch from GitHub over HTTPS. Much faster than git fetch."""
+    url = UPSTREAM_PATCH_URL.format(repo=upstream_repo, sha=sha)
+    token = os.environ.get("GITHUB_TOKEN")
+    headers = {"User-Agent": "backport_flaky_fixes"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return resp.read()
+    except urllib.error.HTTPError as e:
+        print(f"Failed to download patch for {sha[:12]}: {e}", file=sys.stderr)
+        return b""
+
+
+def apply_commit(upstream_repo: str, sha: str) -> bool:
+    """Download the patch from GitHub and apply it with git am --3way.
+    Returns True on success, False on conflict or failure."""
+    patch = download_patch(upstream_repo, sha)
+    if not patch:
         return False
-    # cherry-pick needs the parent's tree objects to compute the diff; fetch it too.
-    parent_result = run_git("rev-parse", "FETCH_HEAD^", check=False)
-    if parent_result.returncode == 0:
-        parent_sha = parent_result.stdout.strip()
-        run_git("fetch", "--no-tags", "--no-recurse-submodules", "--depth=1", url, parent_sha, check=False)
-    return True
-
-
-def cherry_pick(sha: str) -> bool:
-    """Attempt cherry-pick. Returns True on success, False on conflict."""
-    result = run_git("cherry-pick", "-x", sha, check=False)
-    if result.returncode == 0:
-        return True
-    print(f"Cherry-pick of {sha[:12]} failed (conflict), aborting.", file=sys.stderr)
-    run_git("cherry-pick", "--abort", check=False)
-    return False
+    with tempfile.NamedTemporaryFile(suffix=".patch", delete=False) as f:
+        f.write(patch)
+        patch_file = f.name
+    try:
+        result = run_git("am", "--3way", patch_file, check=False)
+        if result.returncode == 0:
+            return True
+        print(f"  git am failed for {sha[:12]}, aborting.", file=sys.stderr)
+        run_git("am", "--abort", check=False)
+        return False
+    finally:
+        os.unlink(patch_file)
 
 
 def build_pr_body(
     upstream_repo: str,
     applied: list,
     conflicted: list,
-    fetch_failed: list,
 ) -> str:
     lines = []
     lines.append("Automated backport of upstream flaky-fix commits.")
@@ -100,7 +113,7 @@ def build_pr_body(
     lines.append("")
 
     if applied:
-        lines.append("### Cherry-picked")
+        lines.append("### Applied")
         lines.append("")
         for sha, subject, date in applied:
             url = UPSTREAM_COMMIT_URL.format(repo=upstream_repo, sha=sha)
@@ -108,17 +121,9 @@ def build_pr_body(
         lines.append("")
 
     if conflicted:
-        lines.append("### Skipped (cherry-pick conflict — manual backport needed)")
+        lines.append("### Skipped (conflict or download failure — manual backport needed)")
         lines.append("")
         for sha, subject, date in conflicted:
-            url = UPSTREAM_COMMIT_URL.format(repo=upstream_repo, sha=sha)
-            lines.append(f"- [`{sha[:12]}`]({url}) {subject}  _(committed {date})_")
-        lines.append("")
-
-    if fetch_failed:
-        lines.append("### Skipped (fetch failed — commit may not be reachable)")
-        lines.append("")
-        for sha, subject, date in fetch_failed:
             url = UPSTREAM_COMMIT_URL.format(repo=upstream_repo, sha=sha)
             lines.append(f"- [`{sha[:12]}`]({url}) {subject}  _(committed {date})_")
         lines.append("")
@@ -208,23 +213,18 @@ def main() -> None:
 
     applied = []
     conflicted = []
-    fetch_failed = []
 
     for commit in missing:
         sha = commit["sha"]
         subject = commit["subject"]
         date = commit["date"]
-        print(f"Fetching {sha[:12]}: {subject}", file=sys.stderr)
-        if not fetch_commit(upstream_repo, sha):
-            fetch_failed.append((sha, subject, date))
-            print(f"  Skipped {sha[:12]} (fetch failed)", file=sys.stderr)
-            continue
-        if cherry_pick(sha):
+        print(f"Applying {sha[:12]}: {subject}", file=sys.stderr)
+        if apply_commit(upstream_repo, sha):
             applied.append((sha, subject, date))
             print(f"  Applied {sha[:12]}", file=sys.stderr)
         else:
             conflicted.append((sha, subject, date))
-            print(f"  Skipped {sha[:12]} (conflict)", file=sys.stderr)
+            print(f"  Skipped {sha[:12]} (conflict or download failed)", file=sys.stderr)
 
     if not applied:
         print("No commits could be applied (all conflicted or failed to fetch). Cleaning up.", file=sys.stderr)
@@ -233,7 +233,7 @@ def main() -> None:
         sys.exit(0)
 
     pr_title = f"{base_branch.title()} - Backport flaky-fix commits from upstream ({date_tag})"
-    pr_body = build_pr_body(upstream_repo, applied, conflicted, fetch_failed)
+    pr_body = build_pr_body(upstream_repo, applied, conflicted)
     pr_labels = labels_for_branch(base_branch)
 
     if args.dry_run:
@@ -241,7 +241,7 @@ def main() -> None:
             f"DRY RUN: would push {backport_branch} and open PR against {base_branch}.",
             file=sys.stderr,
         )
-        print(f"  Applied: {len(applied)}  Conflicted: {len(conflicted)}  Fetch failed: {len(fetch_failed)}", file=sys.stderr)
+        print(f"  Applied: {len(applied)}  Conflicted/failed: {len(conflicted)}", file=sys.stderr)
         print(f"\n--- PR title ---\n{pr_title}\n--- PR body ---\n{pr_body}---")
         create_pr(repo=args.repo, branch=backport_branch, base=base_branch, title=pr_title, body=pr_body, labels=pr_labels, dry_run=True)
         run_git("checkout", base_branch)
