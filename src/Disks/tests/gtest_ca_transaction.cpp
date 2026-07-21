@@ -17,6 +17,7 @@ extern const Event CasManifestHead;
 namespace DB::ErrorCodes
 {
 extern const int NOT_IMPLEMENTED;
+extern const int INVALID_STATE;
 }
 
 /// [TXN-ONE-PIPELINE] CA publish-at-commit lock-scope tests.
@@ -678,22 +679,44 @@ TEST(CasTransactionRemove, CreateThenDirDropDoesNotPublish)
 }
 
 /// [Task 3] `startup()` publishes `cas_store`/`part_access`/`gc_scheduler` (and sets
-/// `pool_uuid`/`conditional_copy_supported`) atomically as its LAST action. Everything before that
-/// point -- opening the pool, building the part-folder facade, the capability probe, starting the GC
-/// scheduler -- happens into locals first, so a throw anywhere along the way (here simulated via
-/// `startup_fault_injection_for_test`, injected right before the publish step) must leave nothing
-/// published: `store()` still reports "before startup" even though `Pool::open` and everything else
-/// already succeeded. Clearing the hook and retrying `startup()` must then succeed cleanly.
+/// `pool_uuid`/`conditional_copy_supported`/`mount_state`) atomically as its LAST action. Everything
+/// before that point -- opening the pool, building the part-folder facade, the capability probe,
+/// starting the GC scheduler -- happens into locals first, so a throw anywhere along the way (here
+/// simulated via `startup_fault_injection_for_test`, injected right before the publish step) must
+/// leave nothing published: `store()` still refuses (still `Dormant`, [Task 4]'s `INVALID_STATE`)
+/// even though `Pool::open` and everything else already succeeded. Clearing the hook and retrying
+/// `startup()` must then succeed cleanly.
 TEST(CasTransactionLifecycle, StartupFailureLatePublishesNothing)
 {
     auto storage = makeUnstartedTxStorage();
 
     storage->startup_fault_injection_for_test = [] { throw std::runtime_error("injected late-startup failure"); };
     EXPECT_ANY_THROW(storage->startup());
-    /// Nothing was published by the failed attempt: store() must still say "before startup".
+    /// Nothing was published by the failed attempt: store() must still refuse (still Dormant).
     EXPECT_ANY_THROW(storage->store());
 
     storage->startup_fault_injection_for_test = {};
     EXPECT_NO_THROW(storage->startup());
     EXPECT_NO_THROW(storage->store());
+}
+
+/// [Task 4] The mount lifecycle gate: `store()` (and every other caller of `poolAccess()`) must
+/// refuse with `INVALID_STATE` -- an operational condition, not a programming invariant -- whenever
+/// the disk is not `Mounted`. This is a deliberate behavior change from the previous
+/// `LOGICAL_ERROR "accessed before startup"`, which would abort a debug/sanitizer build on a
+/// mis-sequenced access instead of surfacing a catchable, operator-actionable error.
+TEST(CaWiring, OperationsRefuseWhenNotMounted)
+{
+    auto storage = openTxStorage();
+    storage->shutdown();   /// today's terminal path resets cas_store and settles mount_state to Dormant
+
+    try
+    {
+        storage->store();
+        FAIL() << "store() must refuse once the disk is no longer mounted";
+    }
+    catch (const DB::Exception & e)
+    {
+        EXPECT_EQ(e.code(), DB::ErrorCodes::INVALID_STATE) << e.message();
+    }
 }

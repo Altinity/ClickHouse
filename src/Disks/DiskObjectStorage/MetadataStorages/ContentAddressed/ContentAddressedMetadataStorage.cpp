@@ -43,6 +43,7 @@ namespace ErrorCodes
     extern const int ABORTED;
     extern const int NETWORK_ERROR;
     extern const int NOT_IMPLEMENTED;
+    extern const int INVALID_STATE;
 }
 
 namespace ContentAddressedSetting
@@ -615,14 +616,17 @@ void ContentAddressedMetadataStorage::startup()
 
     /// The single publish step: as the LAST action of `startup`, atomically hand the fully-built
     /// pool, part-folder facade, and GC scheduler to the members other threads observe through
-    /// `store`/`partAccess`/the GC entry points. Everything above only ever touched locals, so any
-    /// throw before this point (including from the fault-injection hook above) leaves those members
-    /// exactly as they were on entry.
+    /// `store`/`partAccess`/the GC entry points, and flip the mount lifecycle to `Mounted` in the
+    /// SAME acquisition -- so no caller of `poolAccess()` can ever observe a published pool paired
+    /// with a stale (pre-mount) state, or vice versa. Everything above only ever touched locals, so
+    /// any throw before this point (including from the fault-injection hook above) leaves those
+    /// members, and `mount_state`, exactly as they were on entry.
     {
         std::lock_guard lock(pointer_mutex);
         cas_store = std::move(pool);
         part_access = std::move(facade);
         gc_scheduler = std::move(scheduler);
+        mount_state = MountState::Mounted;
     }
     pool_uuid = std::move(uuid);
     conditional_copy_supported = copy_supported;
@@ -641,6 +645,11 @@ void ContentAddressedMetadataStorage::shutdown()
         gc_scheduler.reset();
         part_access.reset();
         cas_store.reset();
+        /// Terminal server-shutdown semantics are unchanged: this is a one-way trip (there is no
+        /// server-lifecycle "remount" after shutdown). Setting `Dormant` here only makes `poolAccess()`
+        /// report the same operational refusal post-shutdown as it does pre-startup, instead of the
+        /// stale (and now-published-nothing) `Mounted` value lingering on a reset-but-not-relabeled object.
+        mount_state = MountState::Dormant;
     }
     /// `stop` joins the background threads. Runs outside pointer_mutex (no reset left to race:
     /// gc_scheduler is already null) but still inside round_lock, so a NEW round can't start here.
@@ -649,30 +658,50 @@ void ContentAddressedMetadataStorage::shutdown()
         old_scheduler->stop();
 }
 
-Cas::PoolPtr ContentAddressedMetadataStorage::store() const
+ContentAddressedMetadataStorage::PoolAccessSnapshot ContentAddressedMetadataStorage::poolAccess() const
 {
-    Cas::PoolPtr snapshot;
+    PoolAccessSnapshot snap;
+    MountState state;
     {
         std::lock_guard lock(pointer_mutex);
-        snapshot = cas_store;
+        state = mount_state;
+        snap.pool = cas_store;
+        snap.part_access = part_access;
     }
-    if (!snapshot)
-        throw Exception(ErrorCodes::LOGICAL_ERROR,
-            "ContentAddressedMetadataStorage: store accessed before startup");
-    return snapshot;
+    /// `mount_state != Mounted` covers before-first-startup and after-shutdown/unmount uniformly (both
+    /// start/settle at `Dormant`); `!snap.pool` is a defensive belt-and-braces check for the same
+    /// condition (there is no valid combination where `mount_state == Mounted` and `cas_store` is
+    /// null -- the publish step in `startup` sets both together).
+    if (state != MountState::Mounted || !snap.pool)
+    {
+        const char * state_name = "Unknown";
+        switch (state)
+        {
+            case MountState::Mounted:
+                state_name = "Mounted";
+                break;
+            case MountState::Unmounting:
+                state_name = "Unmounting";
+                break;
+            case MountState::Dormant:
+                state_name = "Dormant";
+                break;
+        }
+        throw Exception(ErrorCodes::INVALID_STATE,
+            "content-addressed disk '{}' is not mounted (state: {}) — run SYSTEM CONTENT ADDRESSED MOUNT",
+            disk_name, state_name);
+    }
+    return snap;
+}
+
+Cas::PoolPtr ContentAddressedMetadataStorage::store() const
+{
+    return poolAccess().pool;
 }
 
 std::shared_ptr<Cas::CachedPartFolderAccess> ContentAddressedMetadataStorage::partAccess() const
 {
-    std::shared_ptr<Cas::CachedPartFolderAccess> snapshot;
-    {
-        std::lock_guard lock(pointer_mutex);
-        snapshot = part_access;
-    }
-    if (!snapshot)
-        throw Exception(ErrorCodes::LOGICAL_ERROR,
-            "ContentAddressedMetadataStorage: partAccess accessed before startup");
-    return snapshot;
+    return poolAccess().part_access;
 }
 
 void ContentAddressedMetadataStorage::checkNotReadOnly(std::string_view what) const
@@ -692,7 +721,7 @@ String ContentAddressedMetadataStorage::stagingKeyPrefix() const
 {
     /// Mirrors the probe's own prefix construction (`startup`'s `probe_prefix` above), minus
     /// the probe's own `/probe` leaf — this is the writer-owned sibling subtree of the SAME
-    /// `staging/<server_root_id>/` area. `store()` throws LOGICAL_ERROR before startup; every caller
+    /// `staging/<server_root_id>/` area. `store()` throws INVALID_STATE when not mounted; every caller
     /// (writeFile, via a transaction) runs post-startup.
     return physicalKey(store()->poolConfig().pool_prefix + "/staging/" + server_root_id);
 }
@@ -1251,12 +1280,15 @@ StoredObjects ContentAddressedMetadataStorage::getStorageObjects(const std::stri
     if (!r || r->file.empty())
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: not a part file path: {}", path);
 
-    auto view = partAccess()->getView(r->refKey(), Cas::Freshness::CachedForLoad);
+    /// ONE snapshot for both the facade lookup and the pool `locate` below, so the two can never
+    /// straddle two different mount generations (see `poolAccess()`).
+    const auto snap = poolAccess();
+    auto view = snap.part_access->getView(r->refKey(), Cas::Freshness::CachedForLoad);
     if (!view)
         throw Exception(ErrorCodes::FILE_DOESNT_EXIST, "ContentAddressed: no ref for {}", path);
     if (const auto * entry = view->findFile(r->file))
     {
-        const auto location = store()->locate(*entry);
+        const auto location = snap.pool->locate(*entry);
         /// StoredObject carries no range (the recorded upstream delta) — the PAYLOAD length is the
         /// size (what every size consumer wants); the header offset is applied by
         /// getBlobViewPlan's view window, the only byte-reading path.
@@ -1282,7 +1314,9 @@ std::optional<StoredObjects> ContentAddressedMetadataStorage::getStorageObjectsI
     if (!r || r->file.empty())
         return std::nullopt;
 
-    auto view = partAccess()->getView(r->refKey(), Cas::Freshness::CachedForLoad);
+    /// ONE snapshot for both the facade lookup and the pool `locate` below (see `poolAccess()`).
+    const auto snap = poolAccess();
+    auto view = snap.part_access->getView(r->refKey(), Cas::Freshness::CachedForLoad);
     if (!view)
         return std::nullopt;
     const auto * entry = view->findFile(r->file);
@@ -1290,26 +1324,34 @@ std::optional<StoredObjects> ContentAddressedMetadataStorage::getStorageObjectsI
         return std::nullopt;
     if (entry->placement == Cas::EntryPlacement::Inline)
         return StoredObjects{StoredObject("", path, entry->size())};
-    const auto location = store()->locate(*entry);
+    const auto location = snap.pool->locate(*entry);
     return StoredObjects{StoredObject(location.key, path, location.length)};
 }
 
 std::optional<String> ContentAddressedMetadataStorage::tryGetInManifestBytes(const std::string & path) const
 {
-    Cas::PoolPtr store_snapshot;
+    /// This site is deliberately NON-THROWING: `DiskObjectStorage::prepareRead`/`getStorageObjects`
+    /// call it speculatively before falling back to a real storage-object lookup, and both already
+    /// treat "not in-manifest" (`std::nullopt`) as a normal outcome. Unlike every other caller of
+    /// `poolAccess()`, an unmounted disk here must also read as `std::nullopt`, not propagate
+    /// `INVALID_STATE` -- so wrap the ONE snapshot acquisition in a try/catch instead of the manual
+    /// unchecked `cas_store` copy this used to take on its own.
+    PoolAccessSnapshot snap;
+    try
     {
-        std::lock_guard lock(pointer_mutex);
-        store_snapshot = cas_store;
+        snap = poolAccess();
     }
-    if (!store_snapshot)
+    catch (const Exception &)
+    {
         return std::nullopt;
+    }
 
     if (!Cas::isPartFilePath(path))
     {
         if (auto tf = Cas::parseTableFilePath(path))
         {
             const auto ns = liveNamespace(tf->table_uuid);
-            return namespaceFilesReadable(ns) ? store_snapshot->getNamespaceFile(ns, tf->tail) : std::nullopt;
+            return namespaceFilesReadable(ns) ? snap.pool->getNamespaceFile(ns, tf->tail) : std::nullopt;
         }
         return std::nullopt;   /// loose files are plain objects, not in-manifest bytes
     }
@@ -1321,7 +1363,7 @@ std::optional<String> ContentAddressedMetadataStorage::tryGetInManifestBytes(con
     if (!r || r->file.empty())
         return std::nullopt;
 
-    auto view = partAccess()->getView(r->refKey(), Cas::Freshness::CachedForLoad);
+    auto view = snap.part_access->getView(r->refKey(), Cas::Freshness::CachedForLoad);
     if (!view)
         return std::nullopt;
     return view->inlineBytes(r->file);
@@ -1357,12 +1399,16 @@ std::optional<ContentAddressedMetadataStorage::BlobViewPlan> ContentAddressedMet
     auto r = route(*p);
     if (!r || r->file.empty())
         return std::nullopt;
-    auto view = partAccess()->getView(r->refKey(), Cas::Freshness::CachedForLoad);
+    /// ONE snapshot for both the facade lookup and the pool `locate` below, instead of the previous
+    /// `partAccess()` then `store()` pair (each an independent `pointer_mutex` acquisition) -- see
+    /// `poolAccess()`.
+    const auto snap = poolAccess();
+    auto view = snap.part_access->getView(r->refKey(), Cas::Freshness::CachedForLoad);
     if (!view)
         return std::nullopt;
     if (const auto * entry = view->findFile(r->file))
     {
-        const auto location = store()->locate(*entry);
+        const auto location = snap.pool->locate(*entry);
         BlobViewPlan plan;
         /// bytes_size is the readable extent of THIS file's window, NOT the whole blob: a
         /// right-bounded read stops at payload_end, and a shared blob's bytes beyond it belong

@@ -9,6 +9,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasPool.h>
 #include <Interpreters/Context_fwd.h>
 #include <base/defines.h>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -212,13 +213,16 @@ public:
 
     /// ==== wiring-internal surface (the transaction + the disk's prepareRead CA branch) ====
 
-    /// Returns a shared-ownership snapshot of the opened pool. Throws `LOGICAL_ERROR` before `startup`.
+    /// Returns a shared-ownership snapshot of the opened pool. Throws `INVALID_STATE` when the disk
+    /// is not mounted (before the first `startup`, after `shutdown`, or -- from Task 5 on -- during
+    /// or after an explicit `SYSTEM CONTENT ADDRESSED UNMOUNT`). A thin wrapper over `poolAccess()`.
     Cas::PoolPtr store() const;
-    /// Returns a shared-ownership snapshot of the cached part-folder facade. Throws `LOGICAL_ERROR`
-    /// before `startup`. Committed part-folder reads and mutations go through this facade so cache
-    /// validation remains centralized. Returning a `shared_ptr` snapshot (not a reference) means the
-    /// returned handle keeps the facade alive via its own refcount even if `shutdown` concurrently
-    /// resets the member -- unlike a reference, which would dangle the instant `shutdown`'s reset runs.
+    /// Returns a shared-ownership snapshot of the cached part-folder facade. Throws `INVALID_STATE`
+    /// under the same not-mounted condition as `store()`. Committed part-folder reads and mutations
+    /// go through this facade so cache validation remains centralized. Returning a `shared_ptr`
+    /// snapshot (not a reference) means the returned handle keeps the facade alive via its own
+    /// refcount even if `shutdown` concurrently resets the member -- unlike a reference, which would
+    /// dangle the instant `shutdown`'s reset runs. A thin wrapper over `poolAccess()`.
     std::shared_ptr<Cas::CachedPartFolderAccess> partAccess() const;
     const std::string & serverRootId() const { return server_root_id; }
     const std::string & scratchPath() const { return local_scratch_path; }
@@ -395,6 +399,28 @@ private:
     /// Defaults to false (fail-close): assumed unsupported until the probe proves otherwise.
     bool conditional_copy_supported = false;
 
+    /// Explicit disk lifecycle. `startup()` moves `Dormant -> Mounted` as the last step of its single
+    /// publish section; `shutdown()` moves back to `Dormant` where it resets the pointers. From Task 5
+    /// on, `unmountSynchronously`/`mountExplicitly` drive `Mounted <-> Unmounting <-> Dormant` too.
+    /// `poolAccess()` is the ONE place that checks this against `Mounted` before handing out a
+    /// snapshot, so every operation on the pool or part-folder facade is gated the same way.
+    enum class MountState : uint8_t
+    {
+        Mounted,
+        Unmounting,
+        Dormant,
+    };
+
+    /// A single coherent snapshot of the pool and its cached part-folder facade, taken under ONE
+    /// `pointer_mutex` acquisition (see `poolAccess()`) so no caller can observe `pool` from one mount
+    /// generation and `part_access` from another -- the two used to be fetched by two separate calls
+    /// to `store()`/`partAccess()` at some call sites, each taking its own `pointer_mutex` snapshot.
+    struct PoolAccessSnapshot
+    {
+        Cas::PoolPtr pool;
+        std::shared_ptr<Cas::CachedPartFolderAccess> part_access;
+    };
+
     /// Set by startup (Pool::open is fail-closed; empty store == not started). shared_ptr so
     /// store()/partAccess() can return a by-value snapshot under `pointer_mutex` (see below) instead
     /// of a reference that could dangle across a concurrent `shutdown` reset.
@@ -404,22 +430,33 @@ private:
     /// startup right after Pool::open; reset in shutdown before cas_store. shared_ptr for the same
     /// snapshot-safety reason as cas_store.
     std::shared_ptr<Cas::CachedPartFolderAccess> part_access TSA_GUARDED_BY(pointer_mutex);
+    /// The mount lifecycle state; see `MountState` above. Starts `Dormant` (nothing published yet) --
+    /// this makes the pre-`startup` `poolAccess()` refusal uniform with the post-`shutdown`/unmounted
+    /// one: an access before/without a mount is an operational condition, not a programming invariant.
+    MountState mount_state TSA_GUARDED_BY(pointer_mutex) = MountState::Dormant;
     String pool_uuid;
     /// shared_ptr so `runGarbageCollectionRoundNow`/`runOneGcRoundForTest` can take a snapshot under
     /// `pointer_mutex`, release it, and run the (long) round via the snapshot -- never holding
     /// `pointer_mutex` itself for the round's duration, so `gcHealth`/`store`/`partAccess` never
     /// block behind an in-flight round.
     std::shared_ptr<Cas::CasGcScheduler> gc_scheduler TSA_GUARDED_BY(pointer_mutex);
+    /// Outermost lock, taken only by the explicit lifecycle operations: `mountExplicitly`,
+    /// `unmountSynchronously` (Task 5), and the FSCK handler (Task 7). Not acquired anywhere yet in
+    /// this task -- declared now so its place in the lock order is fixed before those operations
+    /// exist. Lock order when nested locks are needed: `lifecycle_mutex` -> `gc_scheduler_mutex` ->
+    /// `pointer_mutex`, never the reverse.
+    mutable std::mutex lifecycle_mutex;
     /// Serializes ONE synchronous GC round at a time and makes `shutdown` wait for an in-flight round
     /// to finish cleanly (clean GC completion has priority over fast shutdown) -- held for the WHOLE
     /// round. Deliberately NOT the same mutex as `pointer_mutex` below: this one can be held for a
     /// long time, so nothing that only needs a brief pointer snapshot may share it.
     mutable std::mutex gc_scheduler_mutex;
     bool shutdown_called TSA_GUARDED_BY(gc_scheduler_mutex) = false;
-    /// Guards ONLY reads/writes of `cas_store`/`part_access`/`gc_scheduler` themselves (snapshot,
-    /// create-if-absent, reset) -- always held briefly. Lock ordering when both are needed (the round
-    /// entry points, and `shutdown`): `gc_scheduler_mutex` first, then `pointer_mutex` nested inside,
-    /// never the reverse.
+    /// Guards ONLY reads/writes of `cas_store`/`part_access`/`gc_scheduler`/`mount_state` themselves
+    /// (snapshot, create-if-absent, reset) -- always held briefly. Lock ordering when more than one of
+    /// these is needed (the round entry points, `shutdown`, and -- outermost -- `lifecycle_mutex`):
+    /// `lifecycle_mutex` first (if held at all), then `gc_scheduler_mutex`, then `pointer_mutex`
+    /// nested inside, never the reverse.
     mutable std::mutex pointer_mutex;
     /// Derived from object_storage->isReadOnly() at startup (the disk's <readonly> config). When set:
     /// the probe is skipped, no watermark, no GC scheduler, and the mutating surface fails closed.
@@ -439,6 +476,16 @@ private:
             return physical_key_prefix + key;
         return physical_key_prefix + "/" + key;
     }
+
+    /// The one place that takes a `{pool, facade}` snapshot under a SINGLE `pointer_mutex`
+    /// acquisition and checks it against `MountState::Mounted`. Throws `INVALID_STATE` when the disk
+    /// is not mounted (`mount_state != Mounted`, including a not-yet-started or a `!cas_store`
+    /// pre-publish window) or unmounted (no `cas_store`). `store()`/`partAccess()` are thin wrappers
+    /// over this; every other caller that needs BOTH the pool and the facade for one logical
+    /// operation must call this ONCE and use both fields from the same snapshot, rather than calling
+    /// `store()` and `partAccess()` separately -- otherwise it could straddle two mount generations
+    /// once unmount/mount (Task 5) can change `cas_store`/`part_access` after startup.
+    PoolAccessSnapshot poolAccess() const;
 
     /// Classifies `path`'s directory shape by running the fixed dispatch order once (shadow ->
     /// atomic-shard -> table-uuid -> part -> subdir -> generic), including the part-branch
