@@ -422,13 +422,16 @@ struct RefManifestEdge
 ///   - `owner_transition` with only an old binding (remove owner)        => `-1` for `old.manifest_ref`
 ///   - `owner_transition` old+new naming the SAME manifest (promote)     => no edge (net zero)
 ///   - `owner_transition` old+new naming DIFFERENT manifests (replace)   => `-1` old then `+1` new
-///     -- DEAD SURFACE, defensive-only: `applyOwnerTransition` recognizes an old+new `owner_transition`
-///     ONLY as a promote (which REQUIRES `old.manifest_ref == new.manifest_ref`); an old+new pair
-///     naming DIFFERENT manifests matches no legal transition shape and is rejected there, and the
-///     writer never emits it (an atomic replace is expressed as TWO ops -- an explicit
-///     `owner_transition(old=Committed, new=None)` then a same-manifest promote). This branch exists so
-///     the edge function stays a total function over op shapes; do NOT "fix" the state machine to
-///     accept this shape to match it.
+///     -- NOT dead surface (correction of an earlier annotation): `applyOwnerTransition` recognizes an
+///     old+new `owner_transition` ONLY as a promote (which REQUIRES `old.manifest_ref ==
+///     new.manifest_ref`), and the writer never emits the different-manifest shape (an atomic replace
+///     is TWO ops -- an explicit `owner_transition(old=Committed, new=None)` then a same-manifest
+///     promote) -- but the GC fold consumes ref logs through THIS function WITHOUT replaying them
+///     through the state machine (`CasGc.cpp` ref intake; `gtest_cas_gc_undercount_repro.cpp`
+///     deliberately feeds this shape as the stale-removal hazard the idempotent in-degree set-merge
+///     must tolerate). So this branch is live for the fold consumer even though the state machine
+///     rejects the shape; do NOT "fix" the state machine to accept it, and see the CAS backlog's
+///     "GC semantic-validation of folded logs" item for the fold-side trust question.
 ///   - `owner_transition` with neither binding                          => no edge (degenerate; a
 ///     transition shape the writer never produces and `applyRefLogTxn` rejects at replay)
 ///   - `namespace_birth` / `set_payload` / `remove_namespace`           => no edge

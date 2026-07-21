@@ -465,3 +465,29 @@ and `tmp/consult-gpt56sol-answer.md`.
   a third COW container without a number. First step: extend `BM_ScratchCopy`/`BM_Admits` with a
   P-sweep (P=1/100/10,000) and check a precommit-heavy soak phase; only a real measured cliff
   justifies a `RefCowPrecommitSet`.
+
+- [ ] **DESIRABLE (defense-in-depth; MANDATORY before any multi-writer or rolling-upgrade-skew
+  milestone): GC per-table recovery gate before ref-log fold** (round-2 consult disagreement,
+  resolved by two-model refutation 2026-07-21). The GC fold extracts manifest edges from decoded
+  logs without state-machine replay (`CasGc.cpp` ref intake; designed intake model, pinned by
+  `gtest_cas_gc_undercount_repro.cpp`); a codec-valid but semantically-fabricated removal of a LIVE
+  edge would fold a wrong `-1` and can premature-delete (source-edge identity carries no ref owner).
+  REFUTED as a live defect for the current branch: the single lease-holding writer structurally
+  cannot mint such history (validated-prefix argument), raw appenders are test-only, S3 tamper is
+  out of trust model — and the 2026-07-21 fail-closed fix NARROWED this surface (recovery now
+  rejects any history no valid state machine could produce) and is the prerequisite for the gate.
+  Fix shape (consult-endorsed): per-table `recoverRefTable(ns)` BEFORE folding that table's new
+  logs; on `CORRUPTED_DATA` clamp the table (no cursor advance, no delta merge, anomaly recorded —
+  same per-table clamp discipline as missing bodies), continue other tables. Abort-only ⇒ fold
+  determinism preserved. Cursor-aligned witness replay (the other proposed shape) is INFEASIBLE:
+  snapshots publish independently of the GC cursor and are routinely ahead of it. Cost: one
+  recovery per table per round (orphan sweep already pays exactly this; share the GETs).
+- [ ] AMEND the "post-durable-PUT allocation window" item above with two round-2 nuances: (a) the
+  catch's "provably unreachable / permanently unreplayable" framing is an over-claim — the covered
+  region includes `materializeCommitted`, which CAN throw in production via `MemoryTracker` limits,
+  yielding a wrong LOGICAL_ERROR diagnosis for a durable+applied transaction (narrow the framing to
+  the apply step when restructuring); (b) wedge resolution applies to the retained state without
+  materializing either COW container — bounded, but a post-wedge flush copies an unmaterialized
+  overlay, a path `BM_FlushInstall` does not model; measure wedge-resolution-followed-by-flush
+  before changing anything (naive post-durable materialize would add an allocation failure mode
+  between apply and unwedge).

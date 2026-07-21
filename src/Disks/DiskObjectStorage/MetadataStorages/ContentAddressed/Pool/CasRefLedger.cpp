@@ -1144,6 +1144,14 @@ void CasRefLedger::flushRefBatch(const RootNamespace & ns, const std::shared_ptr
                 {
                     const RefLogTxn wedged_txn = decodeRefLogTxn(openObject(FormatId::RefLog, wedge_copy->bytes), ns.string(), wedge_copy->txn_id);
                     applyRefLogTxn(rt->state, wedged_txn);
+                    /// A wedge-resolved transaction is a commit like any other: it must join the
+                    /// applied-above-newest-snapshot tail counters exactly as the ordinary Committed
+                    /// arm's does, or the snapshot-publish threshold and the resident-weight estimate
+                    /// undercount by one transaction per resolved wedge until the next recovery
+                    /// reseeds (the invariant stated at the publish check: "maintained by every
+                    /// commit and every adoption").
+                    rt->tail_count_since_snapshot.fetch_add(1, std::memory_order_relaxed);
+                    rt->tail_bytes_since_snapshot.fetch_add(wedge_copy->bytes.size(), std::memory_order_relaxed);
                     rt->wedge.reset();
                 }
                 ProfileEvents::increment(ProfileEvents::CasRefAppendUnwedged);

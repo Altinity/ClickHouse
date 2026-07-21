@@ -841,3 +841,20 @@ iterated once and dropped, so they are deliberately left unmaterialized. (3) `ap
 single private member shared by the public scratch-wrapper and `replay`; the poison-on-throw property is
 a consequence of `replay` calling it directly on a discard-on-throw local, and is unreachable from
 outside the translation unit.
+
+## Round-2 consults: closure verification + one disagreement resolved (t7) {#round-2-consults-t7}
+
+Both round-1 consultants re-ran on the post-fix tree. Fable: all four findings CLOSED with
+structural guarantees, sound to soak and merge; residuals = wedge-resolution tail-counter skip
+(fixed, this commit) and the post-PUT catch over-claim (folded into the backlog item).
+`gpt-5.6-sol`: three findings CLOSED, but raised a claimed BLOCKER — the GC fold extracts manifest
+edges without state-machine replay, so codec-valid-but-fabricated removals of live edges would fold
+wrong `-1`s. Resolved by the two-model refutation protocol: Fable conceded every mechanical step,
+then REFUTED exploitability (the single lease-holding writer structurally cannot mint such history
+— validated-prefix argument; raw appenders are test-only; S3 tamper out of trust model), showed
+this round NARROWED the surface and is prerequisite to the proper gate, and showed the proposed
+cursor-aligned-witness fix infeasible (snapshots publish ahead of the GC cursor). Outcome: BACKLOG
+"GC per-table recovery gate before fold" (abort-only clamp; MANDATORY before multi-writer /
+rolling-upgrade-skew milestones); the round's false "dead surface" annotation on
+`manifestEdgesOfTxn`'s replace rule corrected in place. Soak validity retained — the attack
+requires forged durable traffic no soak component can produce.
