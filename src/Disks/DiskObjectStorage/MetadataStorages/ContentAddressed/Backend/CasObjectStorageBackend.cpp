@@ -732,13 +732,10 @@ HeadResult ObjectStorageBackend::head(const String & key)
     return hr;
 }
 
-/// Base WriteSettings for every Native conditional write. The post-upload existence/size HEAD
-/// (check_objects_after_upload) is SKIPPED: CAS-mutable keys (shard manifests, gc/state, the
-/// registry) are legitimately replaced by a concurrent conditional PUT between our upload and the
-/// check's HEAD - the size comparison false-positives as "a bug in S3" under perfectly normal
-/// contention (observed live against RustFS: a publish's manifest CAS raced the GC fence and the
-/// mismatch terminated the server from the upload worker). Integrity for these keys is
-/// the conditional PUT outcome + the observed token - a recheck adds nothing and races by design.
+/// Base WriteSettings for every Native conditional write. CAS-mutable keys (shard manifests,
+/// gc/state, the registry) override check_objects_after_upload to `false` (see WriteSettings.h);
+/// this was observed live against RustFS: a publish's manifest CAS raced the GC fence and the
+/// mismatch terminated the server from the upload worker.
 ///
 /// On a generation-token store (GCS), a conditional write must ALSO never take the multipart path:
 /// GCS enforces no preconditions on `CompleteMultipartUpload` (measured), so a lost
@@ -749,7 +746,7 @@ HeadResult ObjectStorageBackend::head(const String & key)
 WriteSettings ObjectStorageBackend::conditionalWriteSettings() const
 {
     WriteSettings ws;
-    ws.s3_skip_check_objects_after_upload = true;
+    ws.s3_check_objects_after_upload_override = false;
     if (native_token_type == TokenType::Generation)
     {
         ws.s3_force_single_part_upload = true;

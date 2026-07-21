@@ -312,8 +312,8 @@ std::unique_ptr<WriteBufferFromFileBase> S3ObjectStorage::writeObject( /// NOLIN
         request_settings.updateFromSettings(settings, /* if_changed */ true, settings[Setting::s3_validate_request_settings]);
     }
 
-    if (write_settings.s3_skip_check_objects_after_upload)
-        request_settings[S3RequestSetting::check_objects_after_upload] = false;
+    if (write_settings.s3_check_objects_after_upload_override)
+        request_settings[S3RequestSetting::check_objects_after_upload] = *write_settings.s3_check_objects_after_upload_override;
 
     if (write_settings.s3_single_part_upload_max_bytes_override)
     {

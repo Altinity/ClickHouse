@@ -4,6 +4,8 @@
 #include <Common/Scheduler/ResourceLink.h>
 #include <IO/DistributedCacheSettings.h>
 
+#include <optional>
+
 namespace DB
 {
 
@@ -34,12 +36,12 @@ struct WriteSettings
     size_t filesystem_cache_reserve_space_wait_lock_timeout_milliseconds = 1000;
 
     bool s3_allow_parallel_part_upload = true;
-    /// Skip the post-upload existence/size HEAD (check_objects_after_upload) for this write. Set
-    /// by writers of CAS-MUTABLE keys (the content-addressed shard manifests): such a key is
-    /// legitimately replaced by a concurrent conditional PUT between this upload and the check's
-    /// HEAD, so the size comparison false-positives ("it's a bug in S3") under normal contention.
-    /// Integrity for these keys is the conditional PUT outcome + token, not a recheck.
-    bool s3_skip_check_objects_after_upload = false;
+    /// Overrides S3RequestSetting::check_objects_after_upload for this write (nullopt = no
+    /// override). Writers of CAS-MUTABLE keys (content-addressed shard manifests) set `false`:
+    /// such a key is legitimately replaced by a concurrent conditional PUT between this upload and
+    /// the check's HEAD, so the size comparison false-positives ("it's a bug in S3") under normal
+    /// contention. Integrity for those keys is the conditional PUT outcome + token, not a recheck.
+    std::optional<bool> s3_check_objects_after_upload_override;
     bool azure_allow_parallel_part_upload = true;
 
     bool use_adaptive_write_buffer = false;
