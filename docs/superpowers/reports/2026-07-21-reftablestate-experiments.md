@@ -761,7 +761,7 @@ shipped tree after the E4 revert.
 
 | Experiment | Verdict | One-line rationale |
 |---|---|---|
-| E1 relaxed replay (`TrustedReplay` validation elision) | KEEP | −25% replay for ~20 lines; trust-based, chassert-guarded in debug |
+| E1 relaxed replay (`TrustedReplay` validation elision) | SUBSUMED by E2 | Validation un-elided post-consult (fail-open hole); the apply-strategy split kept from E3. See §Adversarial consults + fix (t7). |
 | E2 owned-manifest COW index | KEEP | The uniqueness invariant as a structure; add-precommit O(N)→O(1) |
 | E3 in-place trusted replay (poison-on-throw) | KEEP | Replay −96.6% with zero new machinery; welded `ApplyMode` makes misuse inexpressible |
 | E4 flat-vector `RefCowMap` base | REVERT | Only `BM_Materialize` cleared 2× (and only at N=100k); per-flush, never trace-visible |
@@ -769,3 +769,75 @@ shipped tree after the E4 revert.
 Post-round: two parallel adversarial consults (Fable max-depth; `gpt-5.6-sol` high) + whole-branch
 final review run before the 20-minute validation soak; their outcomes are appended below when
 concluded.
+
+## Adversarial consults + fix (t7) {#adversarial-consults-fix-t7}
+
+Both consults (Fable max-depth + `gpt-5.6-sol` high) converged on ONE core defect and returned the same
+verdict: **do not merge as shipped**. The convergent finding: E1's `TrustedReplay` validation elision
+made corrupted history/snapshots **fail OPEN**. Post-E2 the cross-owner uniqueness check is O(1), so
+eliding it on the replay path bought nothing measurable — but a double-owner input (a manifest named by
+two owners) would then apply silently in a release build, drifting `owned_manifests` (a later `erase`
+can hide a still-live owner) and letting ordinary `LiveAppend` writes append fresh invariant-violating
+durable history, with GC's `+1/-1` edge accounting double-counting the escaped collision. The release
+test `TrustedReplaySkipsCrossOwnerScanInRelease` even pinned the fail-open behavior as *desired*. Both
+consults also flagged (5) that `ApplyMode` being public made the poison-on-throw path expressible by any
+caller, and (3) that "writer path flat" excluded the O(N) `materializeCommitted` install held under
+`state_mutex`.
+
+Fix (A–H): the cross-owner check now runs **unconditionally** in every apply strategy (A), so `replay`
+fails **closed** on a collision; `stateFromSnapshot` rejects a snapshot naming one manifest under two
+owners, committed/committed, committed/precommit, or precommit/precommit (C — the codec never enforced
+this); `RefCowManifestSet::insert`/`erase` throw `CORRUPTED_DATA` on drift in every build instead of a
+release-elided `chassert`, so `net_delta` can never drift (D); `ApplyMode` was **deleted** — the public
+`applyRefLogTxn` is always the strong guarantee, and the poison-on-throw in-place strategy moved to a
+private `RefTableState::applyTxnInPlace` reachable only via `replay` (its `friend`), making misuse
+structurally inexpressible rather than conventional (B). Tests pivoted: the fail-open pin was deleted and
+replaced with six fail-closed pins (replay + snapshot, all three collision kinds); the container's
+`#if DEBUG`-gated death tests became plain `EXPECT_THROW` in all builds (E). A recovery-latency fix (G):
+the recovery-install site in `CasRefLedger.cpp` now `materializeCommitted()`s the replayed state before
+retaining it (it previously installed an unmaterialized N-row-overlay state, so the first flush deep-
+copied it). `manifestEdgesOfTxn`'s "replace" rule is annotated defensive-only dead surface (H).
+
+**Gate:** 1105 tests, 0 failures (`build/test_gate_consultfix.log`). Arithmetic: t6's 1096 − 1 deleted
+release test (`TrustedReplaySkipsCrossOwnerScanInRelease`) + 6 new state-machine pins + 4 container tests
+now compiled in every build (were `#if DEBUG_OR_SANITIZER_BUILD`-gated, 0 in this release `build/`) =
+1096 + 5 + 4 = 1105.
+
+**Benchmarks** (`build/bench_consultfix.log`, `--benchmark_repetitions=3
+--benchmark_report_aggregates_only=true`, medians):
+
+- **Un-elide cost on `BM_ReplayHistory` (<2%, as predicted).** Measured same-session A/B
+  (`build/bench_abtest_elided.log`, the check elided via a runtime flag vs. shipped): un-elided is
+  **+0.91%** @N=100, **+0.91%** @N=1,000, **+0.21%** @N=10,000, **−1.0%** @N=100,000 (noise). Confirms
+  the consults' prediction: post-E2 the check is O(1), so running it 256×/replay is negligible. A
+  cross-*session* comparison against the t5 report numbers shows +6% at N=100k, but the same-session A/B
+  isolates that as machine noise, not the un-elide (the check cannot slow the base-load-dominated large-N
+  case by 6%).
+- **`BM_FlushInstall` (new, finding 3).** End-to-end per-flush install (add+promote apply +
+  `materializeCommitted`, folding BOTH the committed map and the owned-manifest index) — the O(N)
+  critical section production holds `state_mutex` for, once per flush:
+
+  | N | median |
+  |---|---|
+  | 100 | 17,108 ns |
+  | 1,000 | 170,016 ns |
+  | 10,000 | 1,710,345 ns |
+  | 100,000 | 21,565,274 ns |
+
+  O(N) (fit label `12.97 NlgN`, RMS 1%). This is the honest writer-latency number the "writer path flat"
+  claim (drawn from `BM_ApplyRefLogTxn`, which stops before install) must be weighed against: the
+  admission win is ~700 ns, but a large table's flush install is milliseconds. It sits ~15% above the
+  shipped-report `BM_Materialize` (map-only) 100k number, i.e. roughly the added `owned_manifests` copy.
+- **Nothing else moved >10%.** `BM_AdmitsAddPrecommit` ~703–706 ns flat O(1); `BM_ApplyRefLogTxn`
+  753–823 ns; `BM_Admits` 995–1,057 ns; `BM_ScratchCopy` ~57–59 ns — all within noise of the t5/E3
+  Final figures. E2's O(1) add-precommit win and E3's ~28× replay win are fully preserved.
+
+**Judgment calls.** (1) Consult findings 2 (post-durable-PUT allocation window) and 4's precommit-COW
+half are real but explicitly OUT OF SCOPE for A–H (they need a candidate-materialize-before-PUT
+restructuring and a measured precommit-COW decision respectively); recorded here, not fixed in this
+patch. (2) G materializes only the ONE retained recovery-adopt site (`CasRefLedger.cpp:426`); the
+fsck/GC `replay`/`recoverRefTable` locals (`CasFsck.cpp`, `CasOrphanManifestSweep.cpp`, `CasGc.cpp`) are
+iterated once and dropped, so they are deliberately left unmaterialized. (3) `applyTxnInPlace` is a
+single private member shared by the public scratch-wrapper and `replay`; the poison-on-throw property is
+a consequence of `replay` calling it directly on a discard-on-throw local, and is unreachable from
+outside the translation unit.

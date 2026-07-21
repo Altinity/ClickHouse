@@ -87,9 +87,12 @@
 /// `applyRefLogTxn`'s own internal scratch copies) an O(N) deep-copy of an un-materialized overlay
 /// map instead of an O(1) shared-base copy -- this was caught during this round because it made
 /// BM_Admits regress from the documented O(1) to visibly O(N log N), contradicting its own history
-/// above. Production never hits the un-materialized shape (RefCowMap::materialize's own doc: the
-/// state-install point materializes once per flush, before any batch item runs against the
-/// result), so the fix was to materialize in the helper, not to accept the contaminated numbers.
+/// above. Production's RETAINED states are all materialized before reuse (the live table materializes
+/// once per flush; post-consult the recovery-install site in CasRefLedger.cpp materializes the
+/// replayed state before retaining it -- it previously did not, which is the recovery-latency cliff
+/// BM_FlushInstall now measures against), so the fix was to materialize in the helper, not to accept
+/// the contaminated numbers. (replay's own internal per-txn states are never materialized mid-fold;
+/// BM_ReplayHistory models that path on purpose.)
 
 using namespace DB::Cas;
 
@@ -147,10 +150,15 @@ RefTableSnapshot makeSyntheticSnapshot(size_t n)
 /// scratch copies, and every benchmark's own scratch copy below) would deep-copy an N-row overlay
 /// map instead of sharing an immutable base pointer -- silently turning "the cost of the operation
 /// under test" into "the cost of copying an un-materialized map" and swamping the O(1) `admits`
-/// result the header history documents. Production never observes this shape: `RefCowMap::materialize`'s
-/// own doc says the state-install point materializes once per flush, before any batch item runs
-/// against the result. So this helper does the same, matching what every real caller does
-/// immediately after building or replaying a state.
+/// result the header history documents. The RETAINED long-lived states production keeps are all
+/// materialized: the writer's live table materializes once per flush, and -- post-consult -- the
+/// recovery-install site in `CasRefLedger.cpp` now calls `materializeCommitted()` on the replayed
+/// state before retaining it (it previously did NOT, so the first flush copied an N-row overlay --
+/// exactly the cliff this fix removed and the reason `BM_FlushInstall` below measures the fully
+/// materialized flush cost). So this helper materializes too, matching what every real caller does
+/// immediately after building or replaying a state it will keep. (Note that `replay`'s own INTERNAL
+/// per-transaction states are never materialized mid-fold -- `BM_ReplayHistory` deliberately models
+/// that, feeding `replay(snapshot, tail)` an un-materialized base on purpose.)
 RefTableState makeSyntheticState(size_t n)
 {
     RefTableState state = replay(makeSyntheticSnapshot(n), {});
@@ -300,6 +308,47 @@ static void BM_ApplyRefLogTxn(benchmark::State & state)
     state.SetComplexityN(static_cast<int64_t>(n));
 }
 BENCHMARK(BM_ApplyRefLogTxn)->RangeMultiplier(10)->Range(100, 100000)->Complexity();
+
+/// End-to-end FLUSH-INSTALL cost: apply one state-growing transaction (add a fresh precommit, then
+/// promote it -- touching BOTH the committed map AND the owned-manifest index) and then
+/// `materializeCommitted()`, which folds BOTH COW overlays into fresh shared bases. THIS is the O(N)
+/// critical section production holds `state_mutex` for, once per ref-log flush -- the number the
+/// "writer path is flat" claim (drawn from `BM_ApplyRefLogTxn`, which stops before materialize) must be
+/// weighed against. `BM_ApplyRefLogTxn` measures apply-without-install; the shipped-report
+/// `BM_Materialize` measures only `RefCowMap`'s half; this measures the whole install including the
+/// second (`owned_manifests`) container the index added, over the same N range.
+static void BM_FlushInstall(benchmark::State & state)
+{
+    const size_t n = static_cast<size_t>(state.range(0));
+    const RefTableState table = makeSyntheticState(n);   // materialized, as a live table is at a flush boundary
+
+    /// add + promote of a fresh ref: the add inserts into `owned_manifests`, the promote grows
+    /// `committed` -- so materialize below folds a nonempty overlay in BOTH containers. Manifest {4,1,1}
+    /// and ref name are unique against the synthetic snapshot's {1,1,*} rows and "new_part_x" precommit.
+    RefLogTxn txn;
+    txn.ns = "roots/bench";
+    txn.txn_id = RefTxnId{1, 2};
+    RefOp add;
+    add.kind = RefOpKind::OwnerTransition;
+    add.new_binding = RefOwnerBinding{RefOwnerKind::Precommit, "flush_install_new_part", ManifestRef{4, 1, 1}};
+    txn.ops.push_back(add);
+    RefOp promote;
+    promote.kind = RefOpKind::OwnerTransition;
+    promote.old_binding = RefOwnerBinding{RefOwnerKind::Precommit, "flush_install_new_part", ManifestRef{4, 1, 1}};
+    promote.new_binding = RefOwnerBinding{RefOwnerKind::Committed, "flush_install_new_part", ManifestRef{4, 1, 1}};
+    txn.ops.push_back(promote);
+
+    for (auto _ : state)
+    {
+        RefTableState working = table;   // O(1): shared base
+        applyRefLogTxn(working, txn);     // O(ops): bounded overlay
+        working.materializeCommitted();   // O(N): the critical-section fold this benchmark exists to measure
+        benchmark::DoNotOptimize(&working);
+    }
+
+    state.SetComplexityN(static_cast<int64_t>(n));
+}
+BENCHMARK(BM_FlushInstall)->RangeMultiplier(10)->Range(100, 100000)->Complexity();
 
 /// The fold/recovery profile: K transactions replayed over a size-N snapshot. Each txn creates
 /// and promotes one new ref (two ops), so each add pays today's `manifestAlreadyOwned` scan.

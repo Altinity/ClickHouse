@@ -424,6 +424,14 @@ void CasRefLedger::ensureRefTableRecovered(const RootNamespace & ns, RefTableRun
                     continue;   /// the selected object vanished; retry recovery from a fresh listing
 
                 rt.state = replay(snapshot, tail);
+                /// `replay` (the pure state-machine equation) never materializes: `stateFromSnapshot`
+                /// loads every committed row and owned-manifest entry into the COW OVERLAY, and no tail
+                /// transaction materializes either. This state is retained as the table's long-lived
+                /// working state, so materialize ONCE here -- folding both `committed` and
+                /// `owned_manifests` into fresh shared bases -- rather than making the first flush's
+                /// scratch copy (and every per-item/shape-check copy on it) deep-copy an N-row overlay.
+                /// The O(N) fold rides inside recovery, which is already O(N).
+                rt.state.materializeCommitted();
                 rt.cleanup_markers = std::move(cleanup_markers);
 
                 /// At an UNCLEAN mount, close every dead epoch this
