@@ -726,16 +726,31 @@ def wait_for_healthy(cluster, *, timeout_s: float = 180.0, settle_s: float = 2.0
     returns within the bound -- a restarted node that never comes back IS a crash-recovery failure,
     not something to swallow."""
     deadline = monotonic_fn() + timeout_s
+    def tables_loaded(node) -> bool:
+        # /ping turns 200 BEFORE async table load completes; SYSTEM SYNC REPLICA against a
+        # still-loading table transiently fails with "is not replicated" (observed 2026-07-21,
+        # f1f11 soak: ch1 restart after the high-churn stage made the CA table load slow enough
+        # for the checkpoint to win the race). Gate on the workload table being fully loaded AS
+        # a Replicated* storage, not just on the HTTP port.
+        try:
+            out = node.query(
+                "SELECT count() FROM system.tables "
+                "WHERE database = 'ca_soak' AND name = 'ca_stress' AND engine LIKE 'Replicated%'",
+                timeout=5.0)
+            return out.strip() == "1"
+        except Exception:
+            return False
+
     while True:
-        if all(node.ping() for node in cluster.nodes()):
+        if all(node.ping() for node in cluster.nodes()) and all(tables_loaded(n) for n in cluster.nodes()):
             sleep_fn(settle_s)
-            if all(node.ping() for node in cluster.nodes()):
+            if all(node.ping() for node in cluster.nodes()) and all(tables_loaded(n) for n in cluster.nodes()):
                 return
         if monotonic_fn() > deadline:
-            states = {repr(n): n.ping() for n in cluster.nodes()}
+            states = {repr(n): (n.ping(), tables_loaded(n)) for n in cluster.nodes()}
             raise CheckpointFailure(
-                f"node(s) never returned HTTP-healthy within {timeout_s:.0f}s after a fault window "
-                f"(crash-recovery failure): ping states={states}")
+                f"node(s) never returned healthy-with-tables-loaded within {timeout_s:.0f}s after a "
+                f"fault window (crash-recovery failure): (ping, table_loaded) states={states}")
         sleep_fn(1.0)
 
 
