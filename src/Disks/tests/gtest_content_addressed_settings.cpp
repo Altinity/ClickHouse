@@ -1,10 +1,17 @@
 #include <gtest/gtest.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedSettings.h>
+#include <Common/Exception.h>
 #include <Poco/Util/XMLConfiguration.h>
 #include <Poco/AutoPtr.h>
 #include <sstream>
 
 using namespace DB;
+
+namespace DB::ErrorCodes
+{
+    extern const int NO_ELEMENTS_IN_CONFIG;
+    extern const int BAD_ARGUMENTS;
+}
 
 /// Per-TU extern declarations for the `ContentAddressedSetting` entries this file uses -- the
 /// established pattern for `BaseSettings`-derived classes in this codebase (see e.g.
@@ -59,10 +66,33 @@ TEST(ContentAddressedSettings, ObjectStorageKeysSkipped)
 
 TEST(ContentAddressedSettings, ValidateFailsClosed)
 {
-    {   /// missing server_root_id
+    {   /// missing server_root_id: ABSENT key -> typed NO_ELEMENTS_IN_CONFIG (distinct from a
+        /// present-but-invalid value, checked below), mirroring the pre-F4b factory behavior.
         auto cfg = makeConfig("<gc_shards>1</gc_shards>");
         ContentAddressedSettings s;
-        EXPECT_THROW(s.loadFromConfig(*cfg, "disk", "/scratch", identity_macros), Exception);
+        try
+        {
+            s.loadFromConfig(*cfg, "disk", "/scratch", identity_macros);
+            FAIL() << "expected an exception";
+        }
+        catch (const Exception & e)
+        {
+            EXPECT_EQ(e.code(), ErrorCodes::NO_ELEMENTS_IN_CONFIG);
+        }
+    }
+    {   /// present but invalid (empty) server_root_id -> BAD_ARGUMENTS from
+        /// `Cas::validateServerRootId`, not NO_ELEMENTS_IN_CONFIG.
+        auto cfg = makeConfig("<server_root_id></server_root_id>");
+        ContentAddressedSettings s;
+        try
+        {
+            s.loadFromConfig(*cfg, "disk", "/scratch", identity_macros);
+            FAIL() << "expected an exception";
+        }
+        catch (const Exception & e)
+        {
+            EXPECT_EQ(e.code(), ErrorCodes::BAD_ARGUMENTS);
+        }
     }
     {   /// zero gc_shards
         auto cfg = makeConfig("<server_root_id>srv1</server_root_id><gc_shards>0</gc_shards>");

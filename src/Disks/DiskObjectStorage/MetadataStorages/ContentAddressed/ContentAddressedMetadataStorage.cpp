@@ -45,6 +45,29 @@ namespace ErrorCodes
     extern const int NOT_IMPLEMENTED;
 }
 
+namespace ContentAddressedSetting
+{
+    extern const ContentAddressedSettingsString scratch_path;
+    extern const ContentAddressedSettingsString server_root_id;
+    extern const ContentAddressedSettingsBool gc_enabled;
+    extern const ContentAddressedSettingsUInt64 gc_interval_sec;
+    extern const ContentAddressedSettingsUInt64 dedup_cache_bytes;
+    extern const ContentAddressedSettingsUInt64 dedup_head_first_min_bytes;
+    extern const ContentAddressedSettingsUInt64 gc_snap_generations_to_keep;
+    extern const ContentAddressedSettingsUInt64 gc_shards;
+    extern const ContentAddressedSettingsUInt64 manifest_sweep_list_budget_keys;
+    extern const ContentAddressedSettingsUInt64 manifest_sweep_delete_budget_keys;
+    extern const ContentAddressedSettingsUInt64 gcs_max_conditional_put_bytes;
+    extern const ContentAddressedSettingsUInt64 part_folder_cache_bytes;
+    extern const ContentAddressedSettingsUInt64 part_folder_cache_max_entries;
+    extern const ContentAddressedSettingsUInt64 part_folder_cache_max_entry_bytes;
+    extern const ContentAddressedSettingsUInt64 manifest_decode_cache_bytes;
+    extern const ContentAddressedSettingsUInt64 gc_meta_pool_size;
+    extern const ContentAddressedSettingsBool blob_hash_allow_new;
+    extern const ContentAddressedSettingsBool skip_access_check;
+    extern const ContentAddressedSettingsUInt64 materialization_grace_ms;
+}
+
 namespace
 {
 
@@ -128,58 +151,37 @@ ContentAddressedMetadataStorage::ContentAddressedMetadataStorage(
     ObjectStoragePtr object_storage_,
     String storage_path_prefix_,
     String server_id_,
-    String server_root_id_,
-    String local_scratch_path_,
-    ContextPtr context_,
-    bool gc_enabled_,
-    std::chrono::seconds gc_interval_,
     String disk_name_,
-    uint64_t dedup_cache_bytes_,
-    uint64_t dedup_head_first_min_bytes_,
-    uint64_t gc_snap_generations_to_keep_,
-    uint64_t gc_shards_,
-    uint64_t manifest_sweep_list_budget_keys_,
-    uint64_t manifest_sweep_delete_budget_keys_,
-    uint64_t gcs_max_conditional_put_bytes_,
-    uint64_t cas_part_folder_cache_bytes_,
-    uint64_t cas_part_folder_cache_max_entries_,
-    uint64_t cas_part_folder_cache_max_entry_bytes_,
-    uint64_t manifest_decode_cache_bytes_,
-    uint64_t gc_meta_pool_size_,
-    Cas::StagingBackend staging_backend_,
-    Cas::BlobHashAlgo blob_hash_algo_,
-    bool blob_hash_allow_new_,
-    bool skip_access_check_,
-    uint64_t materialization_grace_ms_,
-    Cas::PartFolderValidate part_folder_validate_)
+    ContextPtr context_,
+    const ContentAddressedSettings & settings_)
     : object_storage(std::move(object_storage_))
     , storage_path_prefix(std::move(storage_path_prefix_))
     , storage_path_full(fs::path(object_storage->getRootPrefix()) / storage_path_prefix)
     , server_id(std::move(server_id_))
-    , server_root_id(std::move(server_root_id_))
+    , server_root_id(settings_[ContentAddressedSetting::server_root_id].value)
     , disk_name(!disk_name_.empty() ? disk_name_ : storage_path_prefix)
-    , local_scratch_path(std::move(local_scratch_path_))
+    , local_scratch_path(settings_[ContentAddressedSetting::scratch_path].value)
     , context(context_)
-    , gc_enabled(gc_enabled_)
-    , gc_interval(gc_interval_)
-    , dedup_cache_bytes(dedup_cache_bytes_)
-    , dedup_head_first_min_bytes(dedup_head_first_min_bytes_)
-    , gc_snap_generations_to_keep(gc_snap_generations_to_keep_)
-    , gc_shards(gc_shards_)
-    , manifest_sweep_list_budget_keys(manifest_sweep_list_budget_keys_)
-    , manifest_sweep_delete_budget_keys(manifest_sweep_delete_budget_keys_)
-    , gcs_max_conditional_put_bytes(gcs_max_conditional_put_bytes_)
-    , cas_part_folder_cache_bytes(cas_part_folder_cache_bytes_)
-    , cas_part_folder_cache_max_entries(cas_part_folder_cache_max_entries_)
-    , cas_part_folder_cache_max_entry_bytes(cas_part_folder_cache_max_entry_bytes_)
-    , manifest_decode_cache_bytes(manifest_decode_cache_bytes_)
-    , gc_meta_pool_size(gc_meta_pool_size_)
-    , staging_backend(staging_backend_)
-    , blob_hash_algo(blob_hash_algo_)
-    , blob_hash_allow_new(blob_hash_allow_new_)
-    , skip_access_check(skip_access_check_)
-    , materialization_grace_ms(materialization_grace_ms_)
-    , part_folder_validate(part_folder_validate_)
+    , gc_enabled(settings_[ContentAddressedSetting::gc_enabled].value)
+    , gc_interval(std::chrono::seconds(settings_[ContentAddressedSetting::gc_interval_sec].value))
+    , dedup_cache_bytes(settings_[ContentAddressedSetting::dedup_cache_bytes].value)
+    , dedup_head_first_min_bytes(settings_[ContentAddressedSetting::dedup_head_first_min_bytes].value)
+    , gc_snap_generations_to_keep(settings_[ContentAddressedSetting::gc_snap_generations_to_keep].value)
+    , gc_shards(settings_[ContentAddressedSetting::gc_shards].value)
+    , manifest_sweep_list_budget_keys(settings_[ContentAddressedSetting::manifest_sweep_list_budget_keys].value)
+    , manifest_sweep_delete_budget_keys(settings_[ContentAddressedSetting::manifest_sweep_delete_budget_keys].value)
+    , gcs_max_conditional_put_bytes(settings_[ContentAddressedSetting::gcs_max_conditional_put_bytes].value)
+    , cas_part_folder_cache_bytes(settings_[ContentAddressedSetting::part_folder_cache_bytes].value)
+    , cas_part_folder_cache_max_entries(settings_[ContentAddressedSetting::part_folder_cache_max_entries].value)
+    , cas_part_folder_cache_max_entry_bytes(settings_[ContentAddressedSetting::part_folder_cache_max_entry_bytes].value)
+    , manifest_decode_cache_bytes(settings_[ContentAddressedSetting::manifest_decode_cache_bytes].value)
+    , gc_meta_pool_size(settings_[ContentAddressedSetting::gc_meta_pool_size].value)
+    , staging_backend(settings_.stagingBackend())
+    , blob_hash_algo(settings_.blobHashAlgo())
+    , blob_hash_allow_new(settings_[ContentAddressedSetting::blob_hash_allow_new].value)
+    , skip_access_check(settings_[ContentAddressedSetting::skip_access_check].value)
+    , materialization_grace_ms(settings_[ContentAddressedSetting::materialization_grace_ms].value)
+    , part_folder_validate(settings_.partFolderValidate())
 {
 }
 

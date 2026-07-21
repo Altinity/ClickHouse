@@ -62,10 +62,11 @@ struct ContentAddressedSettings
         const std::string & default_scratch_path,
         const MacroExpander & expand_macros);
 
-    /// Fail-closed checks: `gc_interval_sec` and `gc_shards` must both be >= 1, `server_root_id`
-    /// must pass `Cas::validateServerRootId`, and the three enum-valued string settings
-    /// (`blob_hash`, `staging_backend`, `part_folder_validate`) must parse. The parsed enum values
-    /// are cached for the typed accessors below.
+    /// Fail-closed checks: `gc_interval_sec` and `gc_shards` must both be >= 1; `server_root_id` must
+    /// be present (an ABSENT key throws a typed `NO_ELEMENTS_IN_CONFIG`, distinct from a
+    /// PRESENT-but-invalid value, which throws `Cas::validateServerRootId`'s `BAD_ARGUMENTS`); and the
+    /// three enum-valued string settings (`blob_hash`, `staging_backend`, `part_folder_validate`) must
+    /// parse. The parsed enum values are cached for the typed accessors below.
     void validate();
 
     /// Typed accessors for the enum-valued string settings, parsed and cached by `validate`.

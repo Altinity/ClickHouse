@@ -29,6 +29,11 @@
 /// The global constraint (OFF BY DEFAULT) is the DEFAULT arm below: absent config keys must parse to
 /// `StagingBackend::Local` with `conditionalCopySupported()==false`.
 
+namespace DB::ContentAddressedSetting
+{
+    extern const ContentAddressedSettingsString staging_backend;
+}
+
 namespace
 {
 
@@ -259,9 +264,10 @@ TEST(CasS3Staging, DefaultConstructedStorageReportsLocalAndNoConditionalCopy)
     /// Constructed with no staging-related args at all (mirrors the existing gtest call sites, e.g.
     /// gtest_ca_wiring.cpp, which stop at `context_`): the accessors must reflect the same
     /// byte-for-byte-current-behavior defaults the config parser produces above.
+    auto settings = DB::Cas::tests::makeSettingsForTest(
+        "test", std::filesystem::temp_directory_path() / "cas_s3_staging_default_scratch");
     auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
-        DB::Cas::tests::makeLocalObjectStorageForTest(), "pool", "srv1", "test",
-        std::filesystem::temp_directory_path() / "cas_s3_staging_default_scratch", nullptr);
+        DB::Cas::tests::makeLocalObjectStorageForTest(), "pool", "srv1", "", nullptr, settings);
 
     EXPECT_EQ(storage->stagingBackend(), DB::Cas::StagingBackend::Local);
     EXPECT_FALSE(storage->conditionalCopySupported());
@@ -617,9 +623,9 @@ namespace
 {
 
 /// Construct a `ContentAddressedMetadataStorage` with `staging_backend=s3` over `object_storage`,
-/// mirroring `DefaultConstructedStorageReportsLocalAndNoConditionalCopy`'s positional defaults for every
-/// parameter this test suite does not care about — only `server_root_id` (the mount identity that names
-/// the staging prefix) and the trailing `StagingBackend::S3` differ.
+/// mirroring `DefaultConstructedStorageReportsLocalAndNoConditionalCopy`'s settings defaults for every
+/// field this test suite does not care about — only `server_root_id` (the mount identity that names
+/// the staging prefix) and `staging_backend` differ.
 std::shared_ptr<DB::ContentAddressedMetadataStorage> makeS3StagingMetadataStorageForTest(
     const DB::ObjectStoragePtr & object_storage, const std::string & server_root_id)
 {
@@ -627,25 +633,11 @@ std::shared_ptr<DB::ContentAddressedMetadataStorage> makeS3StagingMetadataStorag
     const auto unique = std::to_string(::getpid()) + "_" + std::to_string(counter.fetch_add(1));
     const auto scratch = std::filesystem::temp_directory_path()
         / ("cas_s3_staging_wiring_" + server_root_id + "_" + unique);
+    auto settings = DB::Cas::tests::makeSettingsForTest(server_root_id, scratch);
+    settings[DB::ContentAddressedSetting::staging_backend] = "s3";
+    settings.validate();
     return std::make_shared<DB::ContentAddressedMetadataStorage>(
-        object_storage, "pool", "srv1", server_root_id, scratch,
-        /*context_=*/nullptr,
-        /*gc_enabled_=*/true,
-        /*gc_interval_=*/std::chrono::seconds(60),
-        /*disk_name_=*/std::string{},
-        /*dedup_cache_bytes_=*/64ULL << 20,
-        /*dedup_head_first_min_bytes_=*/1ULL << 20,
-        /*gc_snap_generations_to_keep_=*/3,
-        /*gc_shards_=*/1,
-        /*manifest_sweep_list_budget_keys_=*/1000,
-        /*manifest_sweep_delete_budget_keys_=*/100,
-        /*gcs_max_conditional_put_bytes_=*/1ULL << 30,
-        /*cas_part_folder_cache_bytes_=*/64ULL << 20,
-        /*cas_part_folder_cache_max_entries_=*/10000,
-        /*cas_part_folder_cache_max_entry_bytes_=*/16ULL << 20,
-        /*manifest_decode_cache_bytes_=*/128ULL << 20,
-        /*gc_meta_pool_size_=*/16,
-        DB::Cas::StagingBackend::S3);
+        object_storage, "pool", "srv1", /*disk_name_=*/"", /*context_=*/nullptr, settings);
 }
 
 /// Mirrors gtest_ca_wiring.cpp's helper of the same shape.

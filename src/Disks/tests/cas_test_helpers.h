@@ -2,6 +2,7 @@
 
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/Local/LocalObjectStorage.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedSettings.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Backend/CasBackend.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasBlobMeta.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Formats/CasBlobEnvelopeFormat.h>
@@ -37,8 +38,34 @@
 #include <unistd.h>
 #include <vector>
 
+/// Per-TU extern declarations for the `ContentAddressedSetting` entries this header's helpers use --
+/// the established pattern for `BaseSettings`-derived classes in this codebase (see e.g.
+/// `RegisterDiskCache.cpp`'s `namespace FileCacheSetting` block): the entries are DEFINED once in
+/// `ContentAddressedSettings.cpp`, and each consumer TU declares only the ones it references.
+namespace DB::ContentAddressedSetting
+{
+    extern const ContentAddressedSettingsString server_root_id;
+    extern const ContentAddressedSettingsString scratch_path;
+}
+
 namespace DB::Cas::tests
 {
+
+/// Minimal `ContentAddressedSettings` for a direct-construction gtest fixture: sets only
+/// `server_root_id` and `scratch_path` (the two values every positional-ctor call site used to pass
+/// explicitly) and validates, so the cached enum-valued accessors (`stagingBackend`, `blobHashAlgo`,
+/// `partFolderValidate`) are populated from their (default) string settings exactly as the disk-factory
+/// path would populate them. Callers that need a non-default setting (e.g. `staging_backend=s3`) apply
+/// the override via `settings[ContentAddressedSetting::x] = value;` and re-run `settings.validate()`
+/// themselves before constructing.
+inline DB::ContentAddressedSettings makeSettingsForTest(const std::string & server_root_id, const std::filesystem::path & scratch_path)
+{
+    DB::ContentAddressedSettings settings;
+    settings[DB::ContentAddressedSetting::server_root_id] = server_root_id;
+    settings[DB::ContentAddressedSetting::scratch_path] = scratch_path.string();
+    settings.validate();
+    return settings;
+}
 
 /// Run `fn`, expect a DB::Exception with EXACTLY `expected_code` (CORRUPTED_DATA-vs-NOT_IMPLEMENTED
 /// is part of the fail-closed contract: an unknown future format must be NOT_IMPLEMENTED, never

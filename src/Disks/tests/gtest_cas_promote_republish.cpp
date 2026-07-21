@@ -68,9 +68,10 @@ ManifestId publishCommitted(const PoolPtr & s, const RootNamespace & ns, const S
 /// since `republishRef` itself is private.
 std::shared_ptr<DB::ContentAddressedMetadataStorage> openTxStorage()
 {
+    auto settings = DB::Cas::tests::makeSettingsForTest(
+        "test", std::filesystem::temp_directory_path() / "ca_tx_promote_republish_scratch");
     auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
-        DB::Cas::tests::makeLocalObjectStorageForTest(), "pool", "srv1", "test",
-        std::filesystem::temp_directory_path() / "ca_tx_promote_republish_scratch", nullptr);
+        DB::Cas::tests::makeLocalObjectStorageForTest(), "pool", "srv1", "", nullptr, settings);
     storage->startup();
     return storage;
 }

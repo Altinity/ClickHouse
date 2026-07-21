@@ -2,6 +2,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/IMetadataStorage.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedExchange.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedSettings.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Parts/PartPathParser.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Parts/PartFolderAccess.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Gc/CasGcScheduler.h>
@@ -67,51 +68,21 @@ namespace DB
 class ContentAddressedMetadataStorage final : public IMetadataStorage, public IContentAddressedExchange
 {
 public:
-    /// Constructs an unopened storage adapter. `local_scratch_path_` is a real server-local
-    /// directory used when a write buffer must spill before hashing and upload; it is independent of
-    /// the object-storage key prefix. A non-null `context_` enables the background GC scheduler on
-    /// the disk-factory path; tests may pass null to disable system-log integration and scheduling.
+    /// Constructs an unopened storage adapter. `settings_` carries every tunable that used to be a
+    /// positional parameter (see `ContentAddressedSettings`) -- it is the single source of defaults, so
+    /// the constructor itself declares none. `server_root_id`/`scratch_path` (the local-scratch
+    /// directory used when a write buffer must spill before hashing and upload, independent of the
+    /// object-storage key prefix) are read from `settings_` rather than taken as their own parameters. A
+    /// non-null `context_` enables the background GC scheduler on the disk-factory path; tests may pass
+    /// null to disable system-log integration and scheduling. `disk_name_` falls back to
+    /// `storage_path_prefix_` when empty, exactly as before this constructor collapsed.
     ContentAddressedMetadataStorage(
         ObjectStoragePtr object_storage_,
         String storage_path_prefix_,
         String server_id_,
-        String server_root_id_,
-        String local_scratch_path_,
-        ContextPtr context_ = nullptr,
-        bool gc_enabled_ = true,
-        std::chrono::seconds gc_interval_ = std::chrono::seconds(60),
-        String disk_name_ = {},
-        uint64_t dedup_cache_bytes_ = 64ULL << 20,
-        uint64_t dedup_head_first_min_bytes_ = 1ULL << 20,
-        uint64_t gc_snap_generations_to_keep_ = 3,
-        uint64_t gc_shards_ = 1,
-        uint64_t manifest_sweep_list_budget_keys_ = 1000,
-        uint64_t manifest_sweep_delete_budget_keys_ = 100,
-        uint64_t gcs_max_conditional_put_bytes_ = 1ULL << 30,
-        uint64_t cas_part_folder_cache_bytes_ = 64ULL << 20,
-        uint64_t cas_part_folder_cache_max_entries_ = 10000,
-        uint64_t cas_part_folder_cache_max_entry_bytes_ = 16ULL << 20,
-        uint64_t manifest_decode_cache_bytes_ = 128ULL << 20,
-        /// Bounds the pool used by GC's per-hash freshness-metadata writes.
-        uint64_t gc_meta_pool_size_ = 16,
-        /// Selects local or opt-in object-store staging. The trailing default preserves the existing
-        /// local write path for callers that do not configure S3 staging.
-        Cas::StagingBackend staging_backend_ = Cas::StagingBackend::Local,
-        /// Selects the pool's blob content-hash function. The default `CityHash128` preserves the
-        /// existing key encoding for positional callers.
-        Cas::BlobHashAlgo blob_hash_algo_ = Cas::BlobHashAlgo::CityHash128,
-        /// Allows `blob_hash_algo_` to be admitted to a pool whose persisted algorithm set does not
-        /// contain it. The default is false, so an accidental algorithm mismatch fails closed.
-        bool blob_hash_allow_new_ = false,
-        /// Passes the per-disk `<skip_access_check>` policy to `Cas::PoolConfig`. The default false
-        /// retains the normal boot-time access check.
-        bool skip_access_check_ = false,
-        /// Configures the grace period used when materializing after an unclean predecessor. The
-        /// default matches `Cas::PoolConfig` and preserves existing startup behavior.
-        uint64_t materialization_grace_ms_ = 30000,
-        /// Configures when retained part-folder views must revalidate their manifest body. The
-        /// default `Mode::Always` retains the strict validation behavior used by existing callers.
-        Cas::PartFolderValidate part_folder_validate_ = {});
+        String disk_name_,
+        ContextPtr context_,
+        const ContentAddressedSettings & settings_);
 
     /// Parses a `staging_backend` value (`local` | `s3`). Throws `BAD_ARGUMENTS` for an unrecognized
     /// value rather than silently selecting a backend.

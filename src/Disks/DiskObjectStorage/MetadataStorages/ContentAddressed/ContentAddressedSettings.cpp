@@ -17,6 +17,7 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int BAD_ARGUMENTS;
+    extern const int NO_ELEMENTS_IN_CONFIG;
 }
 
 /// The `content_addressed` disk block is shared with the generic object-storage/disk layer, whose
@@ -30,12 +31,14 @@ namespace ErrorCodes
 /// the keys that are direct children of an actual `metadata_type=content_addressed` disk block
 /// (the raw `rg -o` output also contains disk-name and policy/volume wrapper tags, which are not
 /// config keys at all). `content_addressed_allow_shared_pool` and `content_addressed_gc_grace_sec`
-/// are legacy keys from the pre-rev.6 single-owner-pool design (see the multi-writer-pool comment
-/// in `MetadataStorageFactory.cpp`'s `registerContentAddressedMetadataStorage`); the current factory
-/// never reads them, but several integration-test configs still set them, so they must stay
-/// skip-listed rather than rejected. `skip_access_check` is deliberately NOT in this set: it is
-/// registered as a CAS setting below (the same config key also has meaning to `IDisk::startupImpl`,
-/// which drops it before `metadata_storage->startup()` runs, but that does not make it foreign here).
+/// are legacy keys from the pre-rev.6 single-owner-pool design: the incarnation-token pool is
+/// multi-writer by design (spec section 2) -- the publish gate + fence/recheck handshake make shared
+/// pools safe, and the GC lease dedups leaders -- so the old single-owner claim and its
+/// `allow_shared_pool` opt-in are gone (M-W D-W5/D-W6). The current factory never reads either key,
+/// but several integration-test configs still set them, so they must stay skip-listed rather than
+/// rejected. `skip_access_check` is deliberately NOT in this set: it is registered as a CAS setting
+/// below (the same config key also has meaning to `IDisk::startupImpl`, which drops it before
+/// `metadata_storage->startup()` runs, but that does not make it foreign here).
 static const std::set<std::string> non_cas_keys = {
     "type", "object_storage_type", "metadata_type",
     "endpoint", "access_key_id", "secret_access_key", "region", "use_environment_credentials",
@@ -43,6 +46,9 @@ static const std::set<std::string> non_cas_keys = {
     "content_addressed_allow_shared_pool", "content_addressed_gc_grace_sec",
 };
 
+/// Config-key convention: the `content_addressed` block already scopes every key to this disk, so no
+/// key below carries a redundant `cas_`/`ca_` prefix (e.g. `part_folder_cache_bytes`, not
+/// `cas_part_folder_cache_bytes`).
 #define LIST_OF_CONTENT_ADDRESSED_SETTINGS(DECLARE, ALIAS) \
     DECLARE(String, scratch_path, "", "Server-local scratch dir for the write-buffer spill; a relative value is anchored to the server data path", 0) \
     DECLARE(Bool,   gc_enabled, true, "Run the background GC scheduler on this disk", 0) \
@@ -133,9 +139,12 @@ void ContentAddressedSettings::loadFromConfig(
     /// (`ObjectStorageFactory`): on a multi-replica stand every replica mounts ONE shared pool
     /// (same endpoint) and must own a DISTINCT subtree, so the natural single-template config is
     /// `<server_root_id>{replica}</server_root_id>`. An unknown macro throws (fail closed, via the
-    /// caller-supplied `expand_macros`). A missing key is simply the empty default, which
-    /// `validate`'s `Cas::validateServerRootId` call rejects below.
-    settings[ContentAddressedSetting::server_root_id] = expand_macros(settings[ContentAddressedSetting::server_root_id].value);
+    /// caller-supplied `expand_macros`). Gated on `.changed`: assigning unconditionally would mark the
+    /// field changed even when the key was ABSENT from config, defeating `validate`'s `.changed` check
+    /// below (the ABSENT-vs-invalid `NO_ELEMENTS_IN_CONFIG`-vs-`BAD_ARGUMENTS` distinction) -- a missing
+    /// key must reach `validate` still unchanged, not silently expanded-in-place to the same empty string.
+    if (settings[ContentAddressedSetting::server_root_id].changed)
+        settings[ContentAddressedSetting::server_root_id] = expand_macros(settings[ContentAddressedSetting::server_root_id].value);
 
     validate();
 }
@@ -148,6 +157,15 @@ void ContentAddressedSettings::validate()
         throw Exception(ErrorCodes::BAD_ARGUMENTS,
             "content_addressed disk: gc_interval_sec and gc_shards must be >= 1 (got {}, {})",
             settings[ContentAddressedSetting::gc_interval_sec].value, settings[ContentAddressedSetting::gc_shards].value);
+
+    /// The layout subtree identity is explicit and REQUIRED — no default, so an ABSENT key throws a
+    /// typed `NO_ELEMENTS_IN_CONFIG` (mirroring the `metadata_type` check in `MetadataStorageFactory`),
+    /// distinct from a PRESENT-but-invalid value, which falls through to `validateServerRootId`'s
+    /// `BAD_ARGUMENTS` below. `.changed` is exactly "the config had this key" (or a caller set it
+    /// explicitly via the subscript operator); an unset field never reaches here as anything but empty.
+    if (!settings[ContentAddressedSetting::server_root_id].changed)
+        throw Exception(ErrorCodes::NO_ELEMENTS_IN_CONFIG,
+            "Expected `server_root_id` in config for a content-addressed disk");
 
     Cas::validateServerRootId(settings[ContentAddressedSetting::server_root_id].value);
 

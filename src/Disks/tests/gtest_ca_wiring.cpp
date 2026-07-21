@@ -361,9 +361,10 @@ DB::Cas::ManifestEntry wiringInlineEntry(const String & path, const String & byt
 
 std::shared_ptr<DB::ContentAddressedMetadataStorage> openWiringStorage()
 {
+    auto settings = DB::Cas::tests::makeSettingsForTest(
+        "test", std::filesystem::temp_directory_path() / "ca_wiring_scratch");
     auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
-        DB::Cas::tests::makeLocalObjectStorageForTest(), "pool", "srv1", "test",
-        std::filesystem::temp_directory_path() / "ca_wiring_scratch", nullptr);
+        DB::Cas::tests::makeLocalObjectStorageForTest(), "pool", "srv1", "", nullptr, settings);
     storage->startup();
     return storage;
 }
@@ -470,9 +471,10 @@ TEST(CasWiringRead, BlobViewPlanRidesTheStandardPipeline)
     /// bounded by the FileView stage — composed here the way DiskObjectStorage::prepareRead
     /// composes it.
     auto object_storage = DB::Cas::tests::makeLocalObjectStorageForTest();
+    auto settings = DB::Cas::tests::makeSettingsForTest(
+        "test", std::filesystem::temp_directory_path() / "ca_wiring_scratch");
     auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
-        object_storage, "pool", "srv1", "test",
-        std::filesystem::temp_directory_path() / "ca_wiring_scratch", nullptr);
+        object_storage, "pool", "srv1", "", nullptr, settings);
     storage->startup();
     publishWiredPart(*storage, storage->liveNamespace("a11a11a1-1111-4111-8111-111111111111"), "all_1_1_0");
 
@@ -1684,8 +1686,10 @@ std::shared_ptr<FaultyLocalObjectStorage> makeFaultyStorageForTest()
 TEST(CasWiringWrite, PartialCommitRollsBackPublishedParts)
 {
     auto faulty = makeFaultyStorageForTest();
+    auto settings = DB::Cas::tests::makeSettingsForTest(
+        "test", std::filesystem::temp_directory_path() / "ca_b122_scratch");
     auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
-        faulty, "pool", "srv1", "test", std::filesystem::temp_directory_path() / "ca_b122_scratch", nullptr);
+        faulty, "pool", "srv1", "", nullptr, settings);
     storage->startup();
     /// The manifest-body PUT rides the CAS request controller, whose inter-attempt backoff would
     /// otherwise serve the REAL capped-exponential sleeps (~56s at the default budget) while the
@@ -1737,8 +1741,10 @@ TEST(CasWiringReadOnly, ObserveOnlyOpenReadsButRejectsWrites)
     auto writable_os = std::make_shared<DB::LocalObjectStorage>(
         DB::LocalObjectStorageSettings("test", root, /*read_only_=*/false));
     {
+        auto w_settings = DB::Cas::tests::makeSettingsForTest(
+            "test", std::filesystem::temp_directory_path() / "ca_ro_scratch");
         auto w = std::make_shared<DB::ContentAddressedMetadataStorage>(
-            writable_os, "pool", "srv1", "test", std::filesystem::temp_directory_path() / "ca_ro_scratch", nullptr);
+            writable_os, "pool", "srv1", "", nullptr, w_settings);
         w->startup();
         auto tx = w->createTransaction();
         writeThroughTransaction(*tx, "a11/a11a11a1-1111-4111-8111-111111111111/all_1_1_0/data.bin", "ro-bytes");
@@ -1750,8 +1756,10 @@ TEST(CasWiringReadOnly, ObserveOnlyOpenReadsButRejectsWrites)
         DB::LocalObjectStorageSettings("test", root, /*read_only_=*/true));
     /// Same `server_root_id` as the writer: live namespaces are rooted by configured layout identity, so an
     /// observe-only mount reads the same server-root's data — the WORM scenario.
+    auto ro_settings = DB::Cas::tests::makeSettingsForTest(
+        "test", std::filesystem::temp_directory_path() / "ca_ro_scratch2");
     auto ro = std::make_shared<DB::ContentAddressedMetadataStorage>(
-        ro_os, "pool", "srv1", "test", std::filesystem::temp_directory_path() / "ca_ro_scratch2", nullptr);
+        ro_os, "pool", "srv1", "", nullptr, ro_settings);
     ro->startup();   /// must NOT throw (probe skipped — a probe write would fail on a read-only os)
 
     EXPECT_TRUE(ro->isReadOnly());
@@ -1924,9 +1932,10 @@ int firstPrecommitWriteIdx(const std::vector<RecordingLocalObjectStorage::Record
 TEST(CasWiringPrecommitOrder, NoContentPoolOpBeforePrecommit)
 {
     auto recording = makeRecordingStorageForTest("order");
+    auto settings = DB::Cas::tests::makeSettingsForTest(
+        "test", std::filesystem::temp_directory_path() / "ca_b188_order_scratch");
     auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
-        recording, "pool", "srv1", "test",
-        std::filesystem::temp_directory_path() / "ca_b188_order_scratch", nullptr);
+        recording, "pool", "srv1", "", nullptr, settings);
     storage->startup();
 
     /// Phase 1: publish a committed source part — this gives us a committed blob to adopt in Phase 2.
@@ -2026,9 +2035,10 @@ TEST(CasWiringPrecommitOrder, NoContentPoolOpBeforePrecommit)
 TEST(CasWiringPrecommitOrder, CommittedSourceAdoptNoHeadBeforePrecommit)
 {
     auto recording = makeRecordingStorageForTest("committed_adopt");
+    auto settings = DB::Cas::tests::makeSettingsForTest(
+        "test", std::filesystem::temp_directory_path() / "ca_b188_committed_adopt_scratch");
     auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
-        recording, "pool", "srv1", "test",
-        std::filesystem::temp_directory_path() / "ca_b188_committed_adopt_scratch", nullptr);
+        recording, "pool", "srv1", "", nullptr, settings);
     storage->startup();
 
     /// Phase 1: commit a source part with a content blob. Capture the source blob's logical key from
@@ -2156,9 +2166,10 @@ TEST(CasWiringPending, HardlinkOfPendingBlobCommitsAndReadsBack)
 TEST(CasWiringPrecommitOrder, RepublishRefNoTreeHeadBeforePrecommit)
 {
     auto recording = makeRecordingStorageForTest("republish");
+    auto settings = DB::Cas::tests::makeSettingsForTest(
+        "test", std::filesystem::temp_directory_path() / "ca_b190_republish_scratch");
     auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
-        recording, "pool", "srv1", "test",
-        std::filesystem::temp_directory_path() / "ca_b190_republish_scratch", nullptr);
+        recording, "pool", "srv1", "", nullptr, settings);
     storage->startup();
 
     /// Phase 1: commit a source part. Capture its BLOB key from the /blobs/ write (republishRef must
@@ -2231,9 +2242,10 @@ TEST(CasWiringPrecommitOrder, AdoptStagedBlobHelperUnifiesSixSites)
 {
     /// Use a recording storage so we can verify no pre-precommit pool ops on own content.
     auto recording = makeRecordingStorageForTest("adopt_helper");
+    auto settings = DB::Cas::tests::makeSettingsForTest(
+        "test", std::filesystem::temp_directory_path() / "ca_b190_adopt_scratch");
     auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
-        recording, "pool", "srv1", "test",
-        std::filesystem::temp_directory_path() / "ca_b190_adopt_scratch", nullptr);
+        recording, "pool", "srv1", "", nullptr, settings);
     storage->startup();
 
     recording->ops.clear();
@@ -2307,9 +2319,10 @@ TEST(CasWiringPrecommitOrder, AdoptStagedBlobHelperUnifiesSixSites)
 TEST(CasWiringOps, OrphanedPendingBlobNotUploadedAfterUnlink)
 {
     auto recording = makeRecordingStorageForTest("b189_unlink");
+    auto settings = DB::Cas::tests::makeSettingsForTest(
+        "test", std::filesystem::temp_directory_path() / "ca_b189_unlink_scratch");
     auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
-        recording, "pool", "srv1", "test",
-        std::filesystem::temp_directory_path() / "ca_b189_unlink_scratch", nullptr);
+        recording, "pool", "srv1", "", nullptr, settings);
     storage->startup();
 
     recording->ops.clear();
@@ -2360,9 +2373,10 @@ TEST(CasWiringOps, OrphanedPendingBlobNotUploadedAfterUnlink)
 TEST(CasWiringOps, OrphanedPendingBlobNotUploadedAfterReplace)
 {
     auto recording = makeRecordingStorageForTest("b189_replace");
+    auto settings = DB::Cas::tests::makeSettingsForTest(
+        "test", std::filesystem::temp_directory_path() / "ca_b189_replace_scratch");
     auto storage = std::make_shared<DB::ContentAddressedMetadataStorage>(
-        recording, "pool", "srv1", "test",
-        std::filesystem::temp_directory_path() / "ca_b189_replace_scratch", nullptr);
+        recording, "pool", "srv1", "", nullptr, settings);
     storage->startup();
 
     recording->ops.clear();

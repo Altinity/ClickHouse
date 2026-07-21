@@ -8,8 +8,7 @@
 #include <Disks/DiskObjectStorage/MetadataStorages/Plain/MetadataStorageFromPlainObjectStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/PlainRewritable/MetadataStorageFromPlainRewritableObjectStorage.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedMetadataStorage.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Primitives/CasBlobDigest.h>
-#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/Pool/CasServerRoot.h>
+#include <Disks/DiskObjectStorage/MetadataStorages/ContentAddressed/ContentAddressedSettings.h>
 #include <Disks/DiskObjectStorage/MetadataStorages/Web/MetadataStorageFromStaticFilesWebServer.h>
 #include <Disks/DiskLocal.h>
 #include <Core/ServerUUID.h>
@@ -24,9 +23,13 @@ namespace ErrorCodes
     extern const int NO_ELEMENTS_IN_CONFIG;
     extern const int UNKNOWN_ELEMENT_IN_CONFIG;
     extern const int INVALID_CONFIG_PARAMETER;
-    extern const int BAD_ARGUMENTS;
     extern const int LOGICAL_ERROR;
     extern const int NOT_IMPLEMENTED;
+}
+
+namespace ContentAddressedSetting
+{
+    extern const ContentAddressedSettingsString scratch_path;
 }
 
 namespace
@@ -225,110 +228,17 @@ static void registerContentAddressedMetadataStorage(MetadataStorageFactory & fac
         const auto local_object_storage = object_storages->takePointingTo(cluster->getLocalLocation());
         std::string key_compatibility_prefix = getObjectKeyCompatiblePrefix(local_object_storage, config, config_prefix);
 
-        /// Server-local scratch dir for the write-buffer spill. Mirrors how other metadata storages
-        /// compute their local working dir (see the `local` registration above): it is a real
-        /// filesystem path under the server data path, NEVER the object-storage key prefix (which for
-        /// a remote object storage such as s3 is a remote key prefix and not a usable local path).
-        auto local_scratch_path = config.getString(config_prefix + ".scratch_path",
-                                                    fs::path(Context::getGlobalContextInstance()->getPath()) / "disks" / name / "cas_scratch" / "");
-        /// A configured RELATIVE scratch path must be anchored to the server data path, NOT the
-        /// process CWD (which varies by launch method) — otherwise the write-buffer spill lands in an
-        /// unpredictable directory and orphans across restarts (review #1). The default is already
-        /// absolute; only an explicit relative override needs anchoring.
-        if (fs::path(local_scratch_path).is_relative())
-            local_scratch_path = fs::path(Context::getGlobalContextInstance()->getPath()) / local_scratch_path;
-        fs::create_directories(local_scratch_path);
-
-        /// The incarnation-token pool is multi-writer by design (spec section 2): the publish gate +
-        /// fence/recheck handshake make shared pools safe, and the GC lease dedups leaders — the old
-        /// single-owner claim and its allow_shared_pool opt-in are gone (M-W D-W5/D-W6).
         auto global_context = Context::getGlobalContextInstance();
-        const bool gc_enabled = config.getBool(config_prefix + ".gc_enabled", true);
-        const uint64_t gc_interval_sec = config.getUInt64(config_prefix + ".gc_interval_sec", 60);
-        const auto gc_interval = std::chrono::seconds(gc_interval_sec);
-        /// CAS pluggable-blob-hash Phase 1/2 (design 2026-07-11-cas-pluggable-blob-hash-design.md §2):
-        /// `blob_hash` selects the pool's blob content-hash function; default `cityhash128` keeps
-        /// today's behavior byte-for-byte unchanged. `parseBlobHashAlgo` fails closed on an unknown
-        /// spelling. `sha256` is now fully usable (Phase 2 Task 6 finished the variable-length digest
-        /// write path: `objectKey`/`Build`'s dep map/`putBlob`/`logical_hash`/the event-log hash render/
-        /// the inline-candidate hash all route through the pool-scoped `DigestCodec` at the pool's real
-        /// width). The choice is fixed at pool creation; `PoolMeta::createOrValidate` is pool-authoritative
-        /// on reopen and fails closed (BAD_ARGUMENTS) when this disagrees with the recorded algo.
-        const Cas::BlobHashAlgo blob_hash_algo = Cas::parseBlobHashAlgo(config.getString(config_prefix + ".blob_hash", "cityhash128"));
-        /// CAS mixed-algo pools (Phase 3 T4, design 2026-07-11-cas-mixed-algo-pools-design.md §5):
-        /// admission of a NEW algo into an existing pool's `algos_used` is explicit opt-in -- a
-        /// reopen whose `blob_hash` disagrees with the pool's recorded set fails closed
-        /// (BAD_ARGUMENTS) unless this is set. Default 0 (fail-closed): a changed config alone must
-        /// never silently turn a pool mixed.
-        const bool blob_hash_allow_new = config.getBool(config_prefix + ".blob_hash_allow_new", false);
-        /// Boot-time "start now, fix later" (see `Cas::PoolConfig::skip_access_check`): unlike the
-        /// generic `IDisk::startup(bool)` global flag, this per-disk directive is read directly here
-        /// because `IDisk::startupImpl()` drops the flag before `metadata_storage->startup()` runs.
-        const bool skip_access_check = config.getBool(config_prefix + ".skip_access_check", false);
-        const uint64_t dedup_cache_bytes = config.getUInt64(config_prefix + ".dedup_cache_bytes", 64ULL << 20);
-        const uint64_t dedup_head_first_min_bytes = config.getUInt64(config_prefix + ".dedup_head_first_min_bytes", 1ULL << 20);
-        const uint64_t gc_snap_generations_to_keep = config.getUInt64(config_prefix + ".gc_snap_generations_to_keep", 3);
-        /// Phase 4: blob-hash-prefix reducer sharding. Default 1 (single-shard, identical to Phase 1d).
-        /// Creation-time only: the pool's persisted GcState is authoritative on reopen.
-        const uint64_t gc_shards = config.getUInt64(config_prefix + ".gc_shards", 1);
-        if (gc_interval_sec == 0 || gc_shards == 0)
-            throw Exception(ErrorCodes::BAD_ARGUMENTS,
-                "content_addressed disk '{}': gc_interval_sec and gc_shards must be >= 1 (got {}, {})",
-                name, gc_interval_sec, gc_shards);
-        const uint64_t manifest_sweep_list_budget_keys = config.getUInt64(config_prefix + ".manifest_sweep_list_budget_keys", 1000);
-        const uint64_t manifest_sweep_delete_budget_keys = config.getUInt64(config_prefix + ".manifest_sweep_delete_budget_keys", 100);
-        /// Phase 0 (mount safety): the layout subtree identity is explicit and REQUIRED — no default,
-        /// so a missing key throws a typed NO_ELEMENTS_IN_CONFIG exception (mirroring the `metadata_type`
-        /// check above). `ServerUUID` is demoted to an owner token; the subtree a server owns is named
-        /// by `server_root_id`. Validated immediately (fail closed). Macros expand here exactly as in
-        /// the s3 `endpoint` (ObjectStorageFactory): on a multi-replica stand every replica mounts ONE
-        /// shared pool (same endpoint) and must own a DISTINCT subtree, so the natural single-template
-        /// config is `<server_root_id>{replica}</server_root_id>`. An unknown macro throws (fail closed).
-        if (!config.has(config_prefix + ".server_root_id"))
-            throw Exception(ErrorCodes::NO_ELEMENTS_IN_CONFIG,
-                "Expected `server_root_id` in config for a content-addressed disk");
-        const std::string server_root_id = global_context->getMacros()->expand(
-            config.getString(config_prefix + ".server_root_id"));
-        Cas::validateServerRootId(server_root_id);
-        /// GCS single-PUT budget for conditional writes (generation-token stores only): the body
-        /// is RAM-buffered up to this size; a bigger conditional write throws NOT_IMPLEMENTED
-        /// (the compose-based path is a follow-up). Irrelevant on ETag stores (AWS et al).
-        const uint64_t gcs_max_conditional_put_bytes = config.getUInt64(config_prefix + ".gcs_max_conditional_put_bytes", 1ULL << 30);
-        /// Part-folder view cache (spec 2026-07-08-cas-part-folder-cache): ON by default;
-        /// `part_folder_cache_bytes = 0` disables retention — a supported permanent
-        /// operational configuration (the runbook disable switch), not only a debug aid.
-        /// Config-key convention: the `content_addressed` block already scopes every key to this disk,
-        /// so no key carries a redundant `cas_`/`ca_` prefix.
-        const uint64_t part_folder_cache_bytes = config.getUInt64(config_prefix + ".part_folder_cache_bytes", 64ULL << 20);
-        const uint64_t part_folder_cache_max_entries = config.getUInt64(config_prefix + ".part_folder_cache_max_entries", 10000);
-        const uint64_t part_folder_cache_max_entry_bytes = config.getUInt64(config_prefix + ".part_folder_cache_max_entry_bytes", 16ULL << 20);
-        /// §3 (spec 2026-07-13-cas-memory-s3-budget-optimizations-design.md): the ForceFresh body
-        /// re-proof HEAD validation policy. Default `always` is byte-for-byte pre-§3 behavior --
-        /// EVERY ForceFresh re-proves the manifest body via the mandatory HEAD.
-        const auto part_folder_validate = ContentAddressedMetadataStorage::parsePartFolderValidate(config, config_prefix);
-        /// Phase-5 (part-folder cache spec): byte bound for the manifest DECODE cache (Cas::Pool).
-        /// `manifest_decode_cache_bytes = 0` disables decode caching entirely (diagnostic mode).
-        const uint64_t manifest_decode_cache_bytes = config.getUInt64(config_prefix + ".manifest_decode_cache_bytes", 128ULL << 20);
-        /// Task 5: bounded pool size for GC's per-hash freshness-meta writes (condemn/spare/delete) —
-        /// a mass-DROP condemning ~1M blobs sequentially would take hours; see `PoolConfig::gc_meta_pool_size`.
-        const uint64_t gc_meta_pool_size = config.getUInt64(config_prefix + ".gc_meta_pool_size", 16);
-        /// rev.6 Task 6 (spec §Late Predecessor PUT): the conditional post-reclaim wait `Pool::open`
-        /// pays over an unclean predecessor; see `Cas::PoolConfig::materialization_grace_ms`.
-        const uint64_t materialization_grace_ms = config.getUInt64(config_prefix + ".materialization_grace_ms", 30000);
-        /// S3-native staging (design 2026-07-11-cas-s3-native-staging-design.md §4, plan Task 0):
-        /// `staging_backend` defaults to `local` — BYTE-FOR-BYTE the current write path, zero
-        /// behavior change, no probe, no new code path taken (global constraint: OFF BY DEFAULT).
-        const auto staging_backend = ContentAddressedMetadataStorage::parseStagingBackend(config, config_prefix);
-        auto metadata_storage = std::make_shared<ContentAddressedMetadataStorage>(
-            local_object_storage, key_compatibility_prefix, toString(ServerUUID::get()), server_root_id, local_scratch_path,
-            global_context, gc_enabled, gc_interval, name, dedup_cache_bytes, dedup_head_first_min_bytes,
-            gc_snap_generations_to_keep, gc_shards, manifest_sweep_list_budget_keys, manifest_sweep_delete_budget_keys,
-            gcs_max_conditional_put_bytes,
-            part_folder_cache_bytes, part_folder_cache_max_entries, part_folder_cache_max_entry_bytes,
-            manifest_decode_cache_bytes, gc_meta_pool_size, staging_backend, blob_hash_algo, blob_hash_allow_new,
-            skip_access_check, materialization_grace_ms, part_folder_validate);
+        ContentAddressedSettings settings;
+        settings.loadFromConfig(
+            config, config_prefix,
+            /*default_scratch_path=*/ fs::path(global_context->getPath()) / "disks" / name / "cas_scratch" / "",
+            [&](const std::string & s) { return global_context->getMacros()->expand(s); });
+        fs::create_directories(settings[ContentAddressedSetting::scratch_path].value);
 
-        return metadata_storage;
+        return std::make_shared<ContentAddressedMetadataStorage>(
+            local_object_storage, key_compatibility_prefix, toString(ServerUUID::get()),
+            name, global_context, settings);
     });
 }
 
